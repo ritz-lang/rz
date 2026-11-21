@@ -174,6 +174,15 @@ def test_at_baseline_has_no_findings():
     assert compare(m, m) == []
 
 
+def test_milestone_ptr_len_param_pair_target_is_met():
+    """M1.3 (#1830) sets ptr_len_param_pair <= 40.  AGAST #4449 converted the
+    ritz1 `(*u8, len)` parameter pairs to StrView, so the real tree must stay
+    at or under that target — the ratchet's one-way baseline alone would only
+    hold it at the old 923."""
+    measured = measure()
+    assert measured["scalars"]["ptr_len_param_pair"] <= 40
+
+
 def test_worse_scalar_regresses_and_names_metric_baseline_measured():
     m = _baseline(scalars={"ptr_len_param_pair": 917})
     findings = compare(m, _baseline())

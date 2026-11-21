@@ -35,9 +35,13 @@ def _token_new() -> str:
 def test_token_new_takes_the_source_pointer():
     fn = _token_new()
     sig = fn.splitlines()[0]
+    # AGAST #4449: the (pointer, len) parameter pair is a StrView, so the
+    # generated signature no longer carries a raw `*u8, len: i32` pair.
     assert (
         sig
-        == "pub fn token_new(kind: i32, start: *u8, len: i32, line: i64, col: i64) -> Token"
+        == "pub fn token_new(kind: i32, start_sv: StrView, line: i64, col: i64) -> Token"
     )
+    assert "    var start: *u8 = start_sv.ptr" in fn
+    assert "    var len: i32 = start_sv.len as i32" in fn
     assert "        start: start," in fn
     assert "pos" not in fn

@@ -67,25 +67,29 @@ struct LetPlace
     shape: *ArrayShape
     depth: i32
 
-fn let_find_struct(env: *LetEnv, name: *u8, len: i32) -> *StructDef
+fn let_find_struct(env: *LetEnv, name_sv: StrView) -> *StructDef
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     if env.s != null
-        return find_struct(env.s, name, len)
-    sema_find_struct(env.sm, name, len)
+        return find_struct(env.s, StrView { ptr: (name), len: (len) as i64 })
+    sema_find_struct(env.sm, StrView { ptr: (name), len: (len) as i64 })
 
 # AGAST #3325: a module `const A: [N]T = [...]` is read-only data
 # (`internal constant`), so a write into it (`A[i] = v`, `A[i].f = v`) or a
 # mutable borrow of it faulted at run time.  It is a place like a `let`'s,
 # under its own message.  A local or global of the name is what it names.
-fn let_place_const(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
+fn let_place_const(env: *LetEnv, name_sv: StrView, out: *LetPlace) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     var ce: *ConstEntry = null
     if env.s != null
-        if find_global(env.s, name, len) != null
+        if find_global(env.s, StrView { ptr: (name), len: (len) as i64 }) != null
             return 0
-        ce = find_const_entry(env.s, name, len)
+        ce = find_const_entry(env.s, StrView { ptr: (name), len: (len) as i64 })
     else
-        if sbk_global(env.sm, name, len) != null
+        if sbk_global(env.sm, StrView { ptr: (name), len: (len) as i64 }) != null
             return 0
-        ce = sbk_const(env.sm, name, len)
+        ce = sbk_const(env.sm, StrView { ptr: (name), len: (len) as i64 })
     if ce == null or (ce.const_type != TYPE_ARRAY and ce.const_type != TYPE_STRUCT)
         return 0
     out.name = ce.name
@@ -116,7 +120,9 @@ fn let_nd_shape(sh: *ArrayShape) -> *ArrayShape
     sh
 
 # 1 and fill `out` when `name` is currently bound by a `let`.
-fn let_place_root(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
+fn let_place_root(env: *LetEnv, name_sv: StrView, out: *LetPlace) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     out.is_const = 0
     out.pointee = TYPE_VOID
     out.inner = TYPE_VOID
@@ -129,9 +135,9 @@ fn let_place_root(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
     out.elem_name = null
     out.elem_name_len = 0
     if env.s == null
-        let v: *SemaVar = sema_find_local(env.sm, name, len)
+        let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (name), len: (len) as i64 })
         if v == null
-            return let_place_const(env, name, len, out)
+            return let_place_const(env, StrView { ptr: (name), len: (len) as i64 }, out)
         if v.is_let != 1
             return 0
         out.name = v.name
@@ -151,9 +157,9 @@ fn let_place_root(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
         if v.let_kind == TYPE_ARRAY
             out.shape = let_nd_shape(v.shape)
         return 1
-    let idx: i32 = find_local_idx(env.s, name, len)
+    let idx: i32 = find_local_idx(env.s, StrView { ptr: (name), len: (len) as i64 })
     if idx < 0
-        return let_place_const(env, name, len, out)
+        return let_place_const(env, StrView { ptr: (name), len: (len) as i64 }, out)
     let loc: *LocalVar = local_at(env.s, idx)
     if loc.is_let != 1
         return 0
@@ -169,7 +175,9 @@ fn let_place_root(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
 
 # Step `out` into field `field` of a by-value struct.  0 when the place is
 # not a struct value (a pointer, say), so the field lives outside the `let`.
-fn let_place_member(env: *LetEnv, out: *LetPlace, field: *u8, field_len: i32) -> i32
+fn let_place_member(env: *LetEnv, out: *LetPlace, field_sv: StrView) -> i32
+    var field: *u8 = field_sv.ptr
+    var field_len: i32 = field_sv.len as i32
     if out.kind == TYPE_STRUCT and out.tuple == 1
         # `p.0` of `let p = (1, 2)`: the emitter names the tuple's struct
         # only as it lowers it, and Sema's own (`(tuple)N`, AGAST #4251) is
@@ -181,10 +189,10 @@ fn let_place_member(env: *LetEnv, out: *LetPlace, field: *u8, field_len: i32) ->
         return 1
     if out.kind != TYPE_STRUCT or out.type_name_len <= 0
         return 0
-    let st: *StructDef = let_find_struct(env, out.type_name, out.type_name_len)
+    let st: *StructDef = let_find_struct(env, StrView { ptr: (out.type_name), len: (out.type_name_len) as i64 })
     if st == null
         return 0
-    let fidx: i32 = find_field_index(st, field, field_len)
+    let fidx: i32 = find_field_index(st, StrView { ptr: (field), len: (field_len) as i64 })
     if fidx < 0
         return 0
     let fld: *StructField = get_field_type(st, fidx)
@@ -241,18 +249,20 @@ fn let_place(env: *LetEnv, e: *Expr, out: *LetPlace) -> i32
     if e == null
         return 0
     if e.kind == EXPR_IDENT
-        return let_place_root(env, e.ident_ptr, e.ident_len, out)
+        return let_place_root(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, out)
     if e.kind == EXPR_MEMBER
         if let_place(env, e.left, out) == 0
             return 0
-        return let_place_member(env, out, e.ident_ptr, e.ident_len)
+        return let_place_member(env, out, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if e.kind == EXPR_INDEX
         if let_place(env, e.left, out) == 0
             return 0
         return let_place_index(out)
     return 0
 
-fn let_eprint_name(name: *u8, len: i32)
+fn let_eprint_name(name_sv: StrView)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     var i: i32 = 0
     while i < len
         eprint_char(*(name + i))
@@ -260,33 +270,35 @@ fn let_eprint_name(name: *u8, len: i32)
 
 # `<file>:<line>:<col>: error: <head>`<name>`<tail>`, counted on the env's
 # pass.  Sema names the input file, as the emitter did.
-fn let_error(env: *LetEnv, line: i32, col: i32, head: *u8, name: *u8, len: i32, tail: *u8)
+fn let_error(env: *LetEnv, line: i32, col: i32, head: *u8, name_sv: StrView, tail: *u8)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     if env.s != null
         diag_error_at(emitter_source_file(), diag_span(line, col))   # AGAST #3621
         env.s.error_count = env.s.error_count + 1
     else
         sema_error_at(env.sm, line, col)
     eprints_cstr(head)
-    let_eprint_name(name, len)
+    let_eprint_name(StrView { ptr: (name), len: (len) as i64 })
     eprints_cstr(tail)
 
 fn let_error_assign_through(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
     if pl.is_const == 1
-        let_error(env, line, col, c"cannot assign through const `", pl.name, pl.name_len, c"`; it is read-only data\n")
+        let_error(env, line, col, c"cannot assign through const `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, c"`; it is read-only data\n")
         return
-    let_error(env, line, col, c"cannot assign through `let` binding `", pl.name, pl.name_len, c"`; declare it `var`\n")
+    let_error(env, line, col, c"cannot assign through `let` binding `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, c"`; declare it `var`\n")
 
 fn let_error_assign_whole(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
     if pl.is_const == 1
-        let_error(env, line, col, c"cannot assign to const `", pl.name, pl.name_len, c"`; it is read-only data\n")
+        let_error(env, line, col, c"cannot assign to const `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, c"`; it is read-only data\n")
         return
-    let_error(env, line, col, c"cannot assign to `let` binding `", pl.name, pl.name_len, c"`; declare it `var`\n")
+    let_error(env, line, col, c"cannot assign to `let` binding `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, c"`; declare it `var`\n")
 
 fn let_error_borrow(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
     if pl.is_const == 1
-        let_error(env, line, col, c"cannot borrow const `", pl.name, pl.name_len, c"` as mutable; it is read-only data\n")
+        let_error(env, line, col, c"cannot borrow const `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, c"` as mutable; it is read-only data\n")
         return
-    let_error(env, line, col, c"cannot borrow `let` binding `", pl.name, pl.name_len, c"` as mutable; declare it `var`\n")
+    let_error(env, line, col, c"cannot borrow `let` binding `", StrView { ptr: (pl.name), len: (pl.name_len) as i64 }, c"` as mutable; declare it `var`\n")
 
 fn let_sema_env(sm: *Sema, env: *LetEnv)
     env.s = null
@@ -332,7 +344,9 @@ fn let_tuple_lit(e: *Expr) -> i32
         return 0
     1
 
-fn let_set_value(kind: i32, name: *u8, name_len: i32, out_kind: *i32, out_name: **u8, out_len: *i32) -> i32
+fn let_set_value(kind: i32, name_sv: StrView, out_kind: *i32, out_name: **u8, out_len: *i32) -> i32
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
     if kind == TYPE_STRUCT and name_len <= 0
         return 0
     if kind == TYPE_STRUCT or kind == TYPE_BOOL or kind == TYPE_F32 or kind == TYPE_F64 or sema_is_int_kind(kind) == 1
@@ -356,21 +370,21 @@ fn let_value_ty(sm: *Sema, e: *Expr, out_kind: *i32, out_name: **u8, out_len: *i
     var t: SemaTy
     let k: i32 = sema_expr_ty(sm, e, @t)
     if k != TYPE_UNKNOWN
-        return let_set_value(k, t.name, t.name_len, out_kind, out_name, out_len)
+        return let_set_value(k, StrView { ptr: (t.name), len: (t.name_len) as i64 }, out_kind, out_name, out_len)
     if e.kind == EXPR_METHOD
         # StrView.as_bytes() is a `Span$u8` (resolve_expr_struct_name).
-        if name_eq(e.ident_ptr, e.ident_len, c"as_bytes", 8) == 1
-            return let_set_value(TYPE_STRUCT, c"Span$u8", 7, out_kind, out_name, out_len)
-        if e.args == null and name_eq(e.ident_ptr, e.ident_len, c"unwrap", 6) == 1
+        if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"as_bytes"), len: (8) as i64 }) == 1
+            return let_set_value(TYPE_STRUCT, StrView { ptr: (c"Span$u8"), len: (7) as i64 }, out_kind, out_name, out_len)
+        if e.args == null and name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap"), len: (6) as i64 }) == 1
             # `r.unwrap()` of an Option$S / Result$S$E is an S.
             var un: *u8 = null
             var ul: i32 = 0
             sbk_receiver(sm, e, @un, @ul)
-            return let_set_value(TYPE_STRUCT, un, ul, out_kind, out_name, out_len)
+            return let_set_value(TYPE_STRUCT, StrView { ptr: (un), len: (ul) as i64 }, out_kind, out_name, out_len)
         let fd: *FnDef = sbk_method_def(sm, e)
         if fd == null
             return 0
-        return let_set_value(fd.return_type, fd.return_type_name, fd.return_type_name_len, out_kind, out_name, out_len)
+        return let_set_value(fd.return_type, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }, out_kind, out_name, out_len)
     if e.kind == EXPR_INDEX
         if e.right != null and e.right.kind == EXPR_RANGE
             return 0
@@ -378,25 +392,25 @@ fn let_value_ty(sm: *Sema, e: *Expr, out_kind: *i32, out_name: **u8, out_len: *i
         if b == null
             return 0
         if b.kind == EXPR_IDENT
-            let lv: *SemaVar = sema_find_local(sm, b.ident_ptr, b.ident_len)
+            let lv: *SemaVar = sema_find_local(sm, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
             if lv != null
                 if lv.let_kind != TYPE_ARRAY or lv.let_elem == TYPE_ARRAY
                     return 0
-                return let_set_value(lv.let_elem, lv.let_name, lv.let_name_len, out_kind, out_name, out_len)
-            let g: *GlobalVarDef = sbk_global(sm, b.ident_ptr, b.ident_len)
+                return let_set_value(lv.let_elem, StrView { ptr: (lv.let_name), len: (lv.let_name_len) as i64 }, out_kind, out_name, out_len)
+            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
             if g != null and g.var_type == TYPE_ARRAY and g.array_elem_type != TYPE_ARRAY
-                return let_set_value(g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len, out_kind, out_name, out_len)
+                return let_set_value(g.array_elem_type, StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 }, out_kind, out_name, out_len)
             return 0
         if b.kind == EXPR_MEMBER
             let f: *StructField = sbk_member_field(sm, b)
             if f != null and f.field_type == TYPE_ARRAY and f.array_elem_type != TYPE_ARRAY
-                return let_set_value(f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, out_kind, out_name, out_len)
+                return let_set_value(f.array_elem_type, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 }, out_kind, out_name, out_len)
         return 0
     if e.kind == EXPR_MEMBER
         let f: *StructField = sbk_member_field(sm, e)
         if f == null
             return 0
-        return let_set_value(f.field_type, f.field_type_name, f.field_type_name_len, out_kind, out_name, out_len)
+        return let_set_value(f.field_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, out_kind, out_name, out_len)
     if e.kind == EXPR_IF or e.kind == EXPR_MATCH
         # The first arm with a value says what the merged value is.
         var arm: *MatchArm = e.args as *MatchArm
@@ -411,7 +425,7 @@ fn let_value_ty(sm: *Sema, e: *Expr, out_kind: *i32, out_name: **u8, out_len: *i
 # the emitter types it anyway (an array literal, a tuple).
 pub fn let_note_decl(sm: *Sema, st: *Stmt)
     let v: *SemaVar = let_last(sm)
-    if v == null or name_eq(v.name, v.name_len, st.var_name, st.var_name_len) == 0
+    if v == null or name_eq(StrView { ptr: (v.name), len: (v.name_len) as i64 }, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }) == 0
         return
     if st.var_declared_type != TYPE_VOID
         if st.var_type == TYPE_ARRAY
@@ -457,7 +471,9 @@ pub fn let_note_param(sm: *Sema, p: *Param)
 # `name`, through its buffer field as the emitter indexes it: 1 and the
 # element's kind (and struct name) in *out_*, else 0.
 # Sema's one element typer answers it (sema_buffer_ty, AGAST #4259).
-pub fn let_through_elem(sm: *Sema, kind: i32, pointee: i32, name: *u8, len: i32, out_kind: *i32, out_name: **u8, out_len: *i32) -> i32
+pub fn let_through_elem(sm: *Sema, kind: i32, pointee: i32, name_sv: StrView, out_kind: *i32, out_name: **u8, out_len: *i32) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     if name == null or len <= 0
         return 0
     var bt: SemaTy
@@ -496,7 +512,7 @@ pub fn let_note_for(sm: *Sema, st: *Stmt)
     var name_len: i32 = 0
     var sh: *ArrayShape = null
     if e != null and e.kind == EXPR_IDENT
-        let lv: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+        let lv: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if lv != null
             sh = lv.shape
             if lv.let_kind == TYPE_ARRAY and lv.let_elem != TYPE_ARRAY
@@ -505,9 +521,9 @@ pub fn let_note_for(sm: *Sema, st: *Stmt)
                 name_len = lv.let_name_len
             else
                 # A Vec<S> / Span<S> local (#2389's iterables): its element.
-                let_through_elem(sm, lv.let_kind, lv.let_pointee, lv.let_name, lv.let_name_len, @kind, @name, @name_len)
+                let_through_elem(sm, lv.let_kind, lv.let_pointee, StrView { ptr: (lv.let_name), len: (lv.let_name_len) as i64 }, @kind, @name, @name_len)
         else
-            let g: *GlobalVarDef = sbk_global(sm, e.ident_ptr, e.ident_len)
+            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
             if g != null and g.var_type == TYPE_ARRAY
                 sh = g.array_shape
                 if g.array_elem_type != TYPE_ARRAY
@@ -523,7 +539,7 @@ pub fn let_note_for(sm: *Sema, st: *Stmt)
                 name = f.array_elem_type_name
                 name_len = f.array_elem_type_name_len
         else if f != null
-            let_through_elem(sm, f.field_type, f.ptr_pointee, f.field_type_name, f.field_type_name_len, @kind, @name, @name_len)
+            let_through_elem(sm, f.field_type, f.ptr_pointee, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, @kind, @name, @name_len)
     sm.scope_top = sm.scope_top + 1
     # AGAST #2410 / #3379: over an N-D `[N][M]..T` each turn binds a row, an
     # `[M]T` local, or a plane, whose elements are arrays.
@@ -555,7 +571,7 @@ fn let_call_fn(sm: *Sema, e: *Expr) -> *FnDef
     if e.func_name_len == 0
         return sbk_value_fn_sig(sm, e.left)
     if e.call_type_suffix_len <= 0
-        let v: *SemaVar = sema_find_local(sm, e.func_name, e.func_name_len)
+        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
         if v != null and v.fn_sig != null and v.let_kind != TYPE_ARRAY
             return v.fn_sig
     sema_call_fn(sm, e)
@@ -564,9 +580,9 @@ fn let_call_fn(sm: *Sema, e: *Expr) -> *FnDef
 fn let_recv_is_type(sm: *Sema, recv: *Expr) -> i32
     if recv == null or recv.kind != EXPR_IDENT
         return 0
-    if sema_find_local(sm, recv.ident_ptr, recv.ident_len) != null
+    if sema_find_local(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 }) != null
         return 0
-    (sbk_global(sm, recv.ident_ptr, recv.ident_len) == null) as i32
+    (sbk_global(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 }) == null) as i32
 
 # The type a method receiver names, as the emitter's method_recv_type: a
 # local's or global's type name, a static call's type, a field's type, an
@@ -576,11 +592,11 @@ fn let_method_recv_type(sm: *Sema, recv: *Expr, out_len: *i32) -> *u8
     if recv == null
         return null
     if recv.kind == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, recv.ident_ptr, recv.ident_len)
+        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
         if v != null
             *out_len = v.let_name_len
             return v.let_name
-        let g: *GlobalVarDef = sbk_global(sm, recv.ident_ptr, recv.ident_len)
+        let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
         if g != null
             *out_len = g.type_name_len
             return g.type_name
@@ -593,15 +609,15 @@ fn let_method_recv_type(sm: *Sema, recv: *Expr, out_len: *i32) -> *u8
             var en: i32 = 0
             let es: *u8 = let_index_struct(sm, recv.left, @en)
             if es != null
-                f = sbk_struct_field(sm, es, en, recv.ident_ptr, recv.ident_len)
+                f = sbk_struct_field(sm, StrView { ptr: (es), len: (en) as i64 }, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
         if f == null
             return null
         *out_len = f.field_type_name_len
         return f.field_type_name
     # AGAST #3360: `PS[i].m()` of a const struct array.
     if recv.kind == EXPR_INDEX and recv.left != null and recv.left.kind == EXPR_IDENT
-        if sema_find_local(sm, recv.left.ident_ptr, recv.left.ident_len) == null and sbk_global(sm, recv.left.ident_ptr, recv.left.ident_len) == null
-            let ce: *ConstEntry = sbk_const(sm, recv.left.ident_ptr, recv.left.ident_len)
+        if sema_find_local(sm, StrView { ptr: (recv.left.ident_ptr), len: (recv.left.ident_len) as i64 }) == null and sbk_global(sm, StrView { ptr: (recv.left.ident_ptr), len: (recv.left.ident_len) as i64 }) == null
+            let ce: *ConstEntry = sbk_const(sm, StrView { ptr: (recv.left.ident_ptr), len: (recv.left.ident_len) as i64 })
             if ce != null and ce.const_type == TYPE_ARRAY and ce.array_elem_type == TYPE_STRUCT
                 *out_len = ce.array_elem_type_name_len
                 return ce.array_elem_type_name
@@ -636,11 +652,11 @@ fn let_index_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
         return null
     var sh: *ArrayShape = null
     if at.kind == EXPR_IDENT
-        let lv: *SemaVar = sema_find_local(sm, at.ident_ptr, at.ident_len)
+        let lv: *SemaVar = sema_find_local(sm, StrView { ptr: (at.ident_ptr), len: (at.ident_len) as i64 })
         if lv != null
             sh = lv.shape
         else
-            let g: *GlobalVarDef = sbk_global(sm, at.ident_ptr, at.ident_len)
+            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (at.ident_ptr), len: (at.ident_len) as i64 })
             if g != null and g.var_type == TYPE_ARRAY
                 sh = g.array_shape
     else if at.kind == EXPR_MEMBER
@@ -658,7 +674,7 @@ fn let_method_call_def(sm: *Sema, e: *Expr) -> *FnDef
     let tname: *u8 = let_method_recv_type(sm, e.left, @tlen)
     if tname == null or tlen <= 0
         return null
-    sema_method_fn(sm, tname, tlen, e.ident_ptr, e.ident_len)
+    sema_method_fn(sm, StrView { ptr: (tname), len: (tlen) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
 
 # =============================================================================
 # `let` immutability
@@ -706,7 +722,7 @@ fn let_ptr_place_lent(pl: *LetPlace, p: *Param) -> i32
     if want == TYPE_ARRAY and p.param_pointee_array_size > 0
         return (pl.pointee == TYPE_ARRAY) as i32
     if want == TYPE_STRUCT or pl.pointee == TYPE_STRUCT
-        return (want == pl.pointee and name_eq(p.param_type_name, p.param_type_name_len, pl.type_name, pl.type_name_len) == 1) as i32
+        return (want == pl.pointee and name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (pl.type_name), len: (pl.type_name_len) as i64 }) == 1) as i32
     (want == pl.pointee) as i32
 
 # 1 when an `[a..b]` slice is on `e`'s path: no place (arg_is_place).
@@ -824,7 +840,7 @@ fn let_check_write(sm: *Sema, stmt: *Stmt)
     if k == STMT_ASSIGN
         if stmt.assign_target_len > 0
             # `x = v` / `x op= v`: the whole binding.
-            if let_place_root(@env, stmt.assign_target, stmt.assign_target_len, @pl) == 1
+            if let_place_root(@env, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, @pl) == 1
                 let_error_assign_whole(@env, line, col, @pl)
             return
         # `expr = v`; the target expr is in if_cond.  `*p = v` (EXPR_UNARY)
@@ -833,7 +849,7 @@ fn let_check_write(sm: *Sema, stmt: *Stmt)
         if target == null
             return
         if target.kind == EXPR_IDENT
-            if let_place_root(@env, target.ident_ptr, target.ident_len, @pl) == 1
+            if let_place_root(@env, StrView { ptr: (target.ident_ptr), len: (target.ident_len) as i64 }, @pl) == 1
                 let_error_assign_whole(@env, line, col, @pl)
             return
         if target.kind == EXPR_MEMBER or target.kind == EXPR_INDEX
@@ -842,20 +858,20 @@ fn let_check_write(sm: *Sema, stmt: *Stmt)
         return
     if k == STMT_INDEX_ASSIGN
         # `name[i] = v`
-        if let_place_root(@env, stmt.assign_target, stmt.assign_target_len, @pl) == 1
+        if let_place_root(@env, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, @pl) == 1
             if let_place_index(@pl) == 1
                 let_error_assign_through(@env, line, col, @pl)
         return
     if k == STMT_LOCAL_FIELD_ASSIGN
         # `name.f = v`
-        if let_place_root(@env, stmt.var_name, stmt.var_name_len, @pl) == 1
-            if let_place_member(@env, @pl, stmt.assign_target, stmt.assign_target_len) == 1
+        if let_place_root(@env, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, @pl) == 1
+            if let_place_member(@env, @pl, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }) == 1
                 let_error_assign_through(@env, line, col, @pl)
         return
     if k == STMT_LOCAL_FIELD_INDEX_ASSIGN
         # `name.f[i] = v`
-        if let_place_root(@env, stmt.var_name, stmt.var_name_len, @pl) == 1
-            if let_place_member(@env, @pl, stmt.assign_target, stmt.assign_target_len) == 1
+        if let_place_root(@env, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, @pl) == 1
+            if let_place_member(@env, @pl, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }) == 1
                 if let_place_index(@pl) == 1
                     let_error_assign_through(@env, line, col, @pl)
         return
@@ -883,34 +899,34 @@ fn let_struct_name(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
         # AGAST #3004: `r as C` through a reference reads the `C` itself.
         var t: SemaTy
         let k: i32 = sema_expr_ty(sm, e.left, @t)
-        if (k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF) and t.pointee == TYPE_STRUCT and name_eq(t.name, t.name_len, e.ident_ptr, e.ident_len) == 1
+        if (k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF) and t.pointee == TYPE_STRUCT and name_eq(StrView { ptr: (t.name), len: (t.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
             *out_name = e.ident_ptr
             *out_len = e.ident_len
             return
         let_struct_name(sm, e.left, out_name, out_len)
         return
     if e.kind == EXPR_METHOD
-        if name_eq(e.ident_ptr, e.ident_len, c"as_bytes", 8) == 1
+        if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"as_bytes"), len: (8) as i64 }) == 1
             *out_name = c"Span$u8"
             *out_len = 7
             return
         # AGAST #1466: a qualified variant ctor `Opt.Holds(x)` is the enum.
         let q: *Expr = e.left
-        if q != null and q.kind == EXPR_IDENT and sema_find_local(sm, q.ident_ptr, q.ident_len) == null and sbk_global(sm, q.ident_ptr, q.ident_len) == null
-            let ei: i32 = enum_find(q.ident_ptr, q.ident_len)
-            if ei >= 0 and enum_variant_index(q.ident_ptr, q.ident_len, e.ident_ptr, e.ident_len) >= 0 and enum_is_generic(ei) != 1
+        if q != null and q.kind == EXPR_IDENT and sema_find_local(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }) == null and sbk_global(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }) == null
+            let ei: i32 = enum_find(StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 })
+            if ei >= 0 and enum_variant_index(StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0 and enum_is_generic(ei) != 1
                 *out_name = enum_name_at(ei, out_len)
                 return
         # An impl method on a local receiver: its struct return.
         if q != null and q.kind == EXPR_IDENT
-            let v: *SemaVar = sema_find_local(sm, q.ident_ptr, q.ident_len)
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 })
             if v != null and v.let_name_len > 0
                 var ib: *ImplBlock = sm.module.impls
                 while ib != null
-                    if name_eq(ib.type_name, ib.type_name_len, v.let_name, v.let_name_len) == 1
+                    if name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (v.let_name), len: (v.let_name_len) as i64 }) == 1
                         var m: *FnDef = ib.methods
                         while m != null
-                            if name_eq(m.name, m.name_len, e.ident_ptr, e.ident_len) == 1
+                            if name_eq(StrView { ptr: (m.name), len: (m.name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
                                 if m.return_type == TYPE_STRUCT and m.return_type_name_len > 0
                                     *out_name = m.return_type_name
                                     *out_len = m.return_type_name_len
@@ -920,25 +936,25 @@ fn let_struct_name(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
                     ib = ib.next
         return
     if e.kind == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if v != null and v.let_name_len > 0 and v.let_kind == TYPE_STRUCT
             *out_name = v.let_name
             *out_len = v.let_name_len
             return
         # AGAST #189: a struct const (`const FOO: StrView = "..."`).
-        let ce: *ConstEntry = sbk_const(sm, e.ident_ptr, e.ident_len)
+        let ce: *ConstEntry = sbk_const(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if ce != null and ce.const_type == TYPE_STRUCT and ce.type_name_len > 0
             *out_name = ce.type_name
             *out_len = ce.type_name_len
             return
         # AGAST #1600: a bare unit variant `B` is a value of its enum.
-        if ce != null or is_builtin_const(e.ident_ptr, e.ident_len) == 1 or v != null
+        if ce != null or is_builtin_const(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1 or v != null
             return
-        if sbk_global(sm, e.ident_ptr, e.ident_len) != null or sema_find_fn(sm, e.ident_ptr, e.ident_len) != null
+        if sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null or sema_find_fn(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
             return
         var vi: i32 = 0
         var other: i32 = 0
-        let ei: i32 = enum_of_variant_unique(e.ident_ptr, e.ident_len, @vi, @other)
+        let ei: i32 = enum_of_variant_unique(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, @vi, @other)
         if ei >= 0 and enum_variant_kind(ei, vi) == ENUM_VARIANT_UNIT
             *out_name = enum_name_at(ei, out_len)
         return
@@ -959,7 +975,9 @@ fn let_struct_name(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
 
 # 1 when `init` is a known struct of another type than the known struct `want`,
 # with its name in `*out` / `*out_len` (AGAST #2293, #3293).
-fn another_struct_source(sm: *Sema, init: *Expr, want: *u8, want_len: i32, out: **u8, out_len: *i32) -> i32
+fn another_struct_source(sm: *Sema, init: *Expr, want_sv: StrView, out: **u8, out_len: *i32) -> i32
+    var want: *u8 = want_sv.ptr
+    var want_len: i32 = want_sv.len as i32
     if init == null or init.kind == EXPR_CAST
         return 0
     if want == null or want_len <= 0
@@ -970,7 +988,7 @@ fn another_struct_source(sm: *Sema, init: *Expr, want: *u8, want_len: i32, out: 
     # A `c:& C` param holds its referent (#2250).
     var lent: *SemaVar = null
     if init.kind == EXPR_IDENT
-        let lv: *SemaVar = sema_find_local(sm, init.ident_ptr, init.ident_len)
+        let lv: *SemaVar = sema_find_local(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 })
         if lv != null and lv.let_lent == 1
             lent = lv
     if src == null and lent != null and lent.let_kind == TYPE_MUT_REF
@@ -982,27 +1000,33 @@ fn another_struct_source(sm: *Sema, init: *Expr, want: *u8, want_len: i32, out: 
     # `... as StrView` or to another such local is a StrView value, as in
     # ritz0: Sema binds it so (sema_expr_ty), where the emitter's local is the
     # literal's `Span$u8` it marks str_view.
-    if name_eq(src, src_len, want, want_len) == 1
+    if name_eq(StrView { ptr: (src), len: (src_len) as i64 }, StrView { ptr: (want), len: (want_len) as i64 }) == 1
         return 0
     # AGAST #3441 (R49): of the StrView / Span$u8 pair only a `"..."` converts,
     # either way, and it reads as a `Span$u8` here.  A StrView value never fits
     # a `Span<u8>` slot, nor a `Span<u8>` value a StrView one (#3564).
-    if init.kind == EXPR_STRING_LIT and is_layout_equiv_pair(src, src_len, want, want_len) == 1
+    if init.kind == EXPR_STRING_LIT and is_layout_equiv_pair(StrView { ptr: (src), len: (src_len) as i64 }, StrView { ptr: (want), len: (want_len) as i64 }) == 1
         return 0
-    if sema_find_struct(sm, src, src_len) == null or sema_find_struct(sm, want, want_len) == null
+    if sema_find_struct(sm, StrView { ptr: (src), len: (src_len) as i64 }) == null or sema_find_struct(sm, StrView { ptr: (want), len: (want_len) as i64 }) == null
         return 0
     *out = src
     *out_len = src_len
     return 1
 
 # `<head>`<name>` is declared `<want>` but <what> is a `<src>``, at (line, col).
-fn let_error_another(sm: *Sema, line: i32, col: i32, head: *u8, name: *u8, len: i32, want: *u8, want_len: i32, what: *u8, src: *u8, src_len: i32)
+fn let_error_another(sm: *Sema, line: i32, col: i32, head: *u8, name_sv: StrView, want_sv: StrView, what: *u8, src_sv: StrView)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    var want: *u8 = want_sv.ptr
+    var want_len: i32 = want_sv.len as i32
+    var src: *u8 = src_sv.ptr
+    var src_len: i32 = src_sv.len as i32
     var env: LetEnv
     let_sema_env(sm, @env)
-    let_error(@env, line, col, head, name, len, c"` is declared `")
-    let_eprint_name(want, want_len)
+    let_error(@env, line, col, head, StrView { ptr: (name), len: (len) as i64 }, c"` is declared `")
+    let_eprint_name(StrView { ptr: (want), len: (want_len) as i64 })
     eprints_cstr(what)
-    let_eprint_name(src, src_len)
+    let_eprint_name(StrView { ptr: (src), len: (src_len) as i64 })
     eprints_cstr(c"`\n")
 
 # AGAST #2293: `let d: D = c` / `var d: D = c` with `c` a struct of another
@@ -1017,9 +1041,9 @@ fn let_check_another_struct(sm: *Sema, stmt: *Stmt)
         return
     var src: *u8 = null
     var src_len: i32 = 0
-    if another_struct_source(sm, stmt.var_init, stmt.var_type_name, stmt.var_type_name_len, @src, @src_len) == 0
+    if another_struct_source(sm, stmt.var_init, StrView { ptr: (stmt.var_type_name), len: (stmt.var_type_name_len) as i64 }, @src, @src_len) == 0
         return
-    let_error_another(sm, stmt.span.line, stmt.span.col, c"`", stmt.var_name, stmt.var_name_len, stmt.var_type_name, stmt.var_type_name_len, c"` but its initialiser is a `", src, src_len)
+    let_error_another(sm, stmt.span.line, stmt.span.col, c"`", StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, StrView { ptr: (stmt.var_type_name), len: (stmt.var_type_name_len) as i64 }, c"` but its initialiser is a `", StrView { ptr: (src), len: (src_len) as i64 })
 
 # `let s: String = "abc"`: 1 when it reported one.  With no `String` in scope
 # (no `import ritzlib.string`, AGAST #3347) the literal has nothing to become:
@@ -1033,16 +1057,16 @@ fn let_check_string_lit(sm: *Sema, stmt: *Stmt) -> i32
     let init: *Expr = stmt.var_init
     if init == null or init.kind != EXPR_STRING_LIT
         return 0
-    if name_eq(stmt.var_type_name, stmt.var_type_name_len, c"String", 6) == 0
+    if name_eq(StrView { ptr: (stmt.var_type_name), len: (stmt.var_type_name_len) as i64 }, StrView { ptr: (c"String"), len: (6) as i64 }) == 0
         return 0
     var env: LetEnv
     let_sema_env(sm, @env)
-    if sema_find_struct(sm, c"String", 6) != null
-        let_error(@env, init.span.line, init.span.col, c"", null, 0, c"a string literal is not a `String`: write `string_from(")
+    if sema_find_struct(sm, StrView { ptr: (c"String"), len: (6) as i64 }) != null
+        let_error(@env, init.span.line, init.span.col, c"", StrView { ptr: (null), len: (0) as i64 }, c"a string literal is not a `String`: write `string_from(")
         let_eprint_source_quote(init.string_ptr, init.string_len)
         eprints_cstr(c")`\n")
         return 1
-    let_error(@env, init.span.line, init.span.col, c"", null, 0, c"`String` is not built in: `import ritzlib.string` to make one from a string literal\n")
+    let_error(@env, init.span.line, init.span.col, c"", StrView { ptr: (null), len: (0) as i64 }, c"`String` is not built in: `import ritzlib.string` to make one from a string literal\n")
     return 1
 
 # A literal's bytes as the "..." that writes them: `"`, `\\`, newline, tab, CR
@@ -1081,12 +1105,12 @@ pub fn return_check_another_struct(sm: *Sema, e: *Expr, line: i32, col: i32) -> 
         return 0
     var src: *u8 = null
     var src_len: i32 = 0
-    if another_struct_source(sm, e, f.return_type_name, f.return_type_name_len, @src, @src_len) == 0
+    if another_struct_source(sm, e, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }, @src, @src_len) == 0
         return 0
     var env: LetEnv
     let_sema_env(sm, @env)
-    let_error(@env, line, col, c"the fn is declared `-> ", f.return_type_name, f.return_type_name_len, c"` but its return value is a `")
-    let_eprint_name(src, src_len)
+    let_error(@env, line, col, c"the fn is declared `-> ", StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }, c"` but its return value is a `")
+    let_eprint_name(StrView { ptr: (src), len: (src_len) as i64 })
     eprints_cstr(c"`\n")
     return 1
 
@@ -1100,19 +1124,19 @@ fn let_check_another_struct_store(sm: *Sema, stmt: *Stmt)
     if stmt.kind == STMT_ASSIGN
         if stmt.assign_target_len <= 0
             return
-        let loc: *SemaVar = sema_find_local(sm, stmt.assign_target, stmt.assign_target_len)
+        let loc: *SemaVar = sema_find_local(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
         if loc == null or loc.let_kind != TYPE_STRUCT
             return
         want = loc.let_name
         want_len = loc.let_name_len
     else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
-        let base: *SemaVar = sema_find_local(sm, stmt.var_name, stmt.var_name_len)
+        let base: *SemaVar = sema_find_local(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
         if base == null
             return
-        let st: *StructDef = sema_find_struct(sm, base.let_name, base.let_name_len)
+        let st: *StructDef = sema_find_struct(sm, StrView { ptr: (base.let_name), len: (base.let_name_len) as i64 })
         if st == null
             return
-        let idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
+        let idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
         if idx < 0
             return
         let f: *StructField = get_field_type(st, idx)
@@ -1124,12 +1148,12 @@ fn let_check_another_struct_store(sm: *Sema, stmt: *Stmt)
         return
     var src: *u8 = null
     var src_len: i32 = 0
-    if another_struct_source(sm, stmt.assign_value, want, want_len, @src, @src_len) == 0
+    if another_struct_source(sm, stmt.assign_value, StrView { ptr: (want), len: (want_len) as i64 }, @src, @src_len) == 0
         return
     var head: *u8 = c"`"
     if stmt.kind != STMT_ASSIGN
         head = c"field `"
-    let_error_another(sm, stmt.span.line, stmt.span.col, head, stmt.assign_target, stmt.assign_target_len, want, want_len, c"` but the value assigned is a `", src, src_len)
+    let_error_another(sm, stmt.span.line, stmt.span.col, head, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, StrView { ptr: (want), len: (want_len) as i64 }, c"` but the value assigned is a `", StrView { ptr: (src), len: (src_len) as i64 })
 
 # AGAST #3294: argument `a` for by-value param `p`, a struct of another type.
 # It reached clang as a `%C` passed to the `%D`.  let_another_struct_call /
@@ -1140,9 +1164,9 @@ pub fn let_check_another_struct_arg(sm: *Sema, p: *Param, a: *Expr)
         return
     var src: *u8 = null
     var src_len: i32 = 0
-    if another_struct_source(sm, a, p.param_type_name, p.param_type_name_len, @src, @src_len) == 0
+    if another_struct_source(sm, a, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, @src, @src_len) == 0
         return
-    let_error_another(sm, a.span.line, a.span.col, c"parameter `", p.name, p.name_len, p.param_type_name, p.param_type_name_len, c"` but its argument is a `", src, src_len)
+    let_error_another(sm, a.span.line, a.span.col, c"parameter `", StrView { ptr: (p.name), len: (p.name_len) as i64 }, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, c"` but its argument is a `", StrView { ptr: (src), len: (src_len) as i64 })
 
 fn let_another_struct_args(sm: *Sema, params: *Param, args: *Expr)
     var p: *Param = params
@@ -1162,7 +1186,7 @@ var g_let_sizeof: i32 = 0
 pub fn let_check_sizeof_of(e: *Expr) -> i32
     if e.kind != EXPR_CALL or e.func_name_len == 0
         return 0
-    name_eq(e.func_name, e.func_name_len, c"sizeof", 6)
+    name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sizeof"), len: (6) as i64 })
 
 pub fn let_check_sizeof(delta: i32)
     g_let_sizeof = g_let_sizeof + delta
@@ -1170,7 +1194,7 @@ pub fn let_check_sizeof(delta: i32)
 pub fn let_another_struct_call(sm: *Sema, e: *Expr)
     if e.func_name_len == 0 or g_let_sizeof > 0
         return
-    let v: *SemaVar = sema_find_local(sm, e.func_name, e.func_name_len)
+    let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
     if v != null
         if v.fn_sig != null
             let_another_struct_args(sm, v.fn_sig.params, e.args)
@@ -1187,7 +1211,7 @@ pub fn let_another_struct_method(sm: *Sema, e: *Expr)
     let fd: *FnDef = sbk_method_def(sm, e)
     if fd == null or fd.params == null
         return
-    if name_eq(fd.params.name, fd.params.name_len, c"self", 4) == 1
+    if name_eq(StrView { ptr: (fd.params.name), len: (fd.params.name_len) as i64 }, StrView { ptr: (c"self"), len: (4) as i64 }) == 1
         let_another_struct_args(sm, fd.params.next, e.args)
     else
         let_another_struct_args(sm, fd.params, e.args)

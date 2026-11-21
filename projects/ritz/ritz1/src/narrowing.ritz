@@ -104,7 +104,9 @@ pub fn narrow_note_decl(s: *EmitterState, stmt: *Stmt)
 # emitted (the caller truncates the table to its mark after the arm), so
 # `let a: f64 = match o / Some(x) => x` over a u64 is refused as the plain
 # `let a: f64 = x` is.  `t` 0 or a non-integer records an unknown.
-pub fn narrow_note_binding(s: *EmitterState, name: *u8, len: i32, t: i32)
+pub fn narrow_note_binding(s: *EmitterState, name_sv: StrView, t: i32)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     if s.narrow_decl_count >= 256
         s.narrow_decl_overflow = 1
         return
@@ -124,7 +126,9 @@ pub fn narrow_note_binding(s: *EmitterState, name: *u8, len: i32, t: i32)
 # sema_walk binds a name, then notes here the integer type it was written
 # with, on that binding.  An unnamed bind (sema_bind_ty skips it) is no note.
 
-fn narrow_sema_note(sm: *Sema, name: *u8, len: i32, t: i32)
+fn narrow_sema_note(sm: *Sema, name_sv: StrView, t: i32)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     if sm.scope_top <= 0
         return
     let v: *SemaVar = @sm.scope[sm.scope_top - 1]
@@ -135,14 +139,14 @@ fn narrow_sema_note(sm: *Sema, name: *u8, len: i32, t: i32)
         v.narrow = t
 
 pub fn narrow_sema_param(sm: *Sema, p: *Param)
-    narrow_sema_note(sm, p.name, p.name_len, p.param_type)
+    narrow_sema_note(sm, StrView { ptr: (p.name), len: (p.name_len) as i64 }, p.param_type)
 
 # A `let` / `var`: its annotation, else (AGAST #1688) its initialiser's
 # type, as ritz0 sizes an unannotated local's slot from the value it emits.
 # A bare literal is an i64 there: `let a = 5` then `let n: i32 = a` is refused.
 pub fn narrow_sema_decl(sm: *Sema, st: *Stmt)
     if st.var_declared_type != TYPE_VOID
-        narrow_sema_note(sm, st.var_name, st.var_name_len, st.var_declared_type)
+        narrow_sema_note(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, st.var_declared_type)
         return
     if sm.scope_top <= 0
         return
@@ -158,19 +162,19 @@ pub fn narrow_sema_decl(sm: *Sema, st: *Stmt)
     sm.scope_top = sm.scope_top + 1
     if t == NARROW_LIT
         t = TYPE_I64
-    narrow_sema_note(sm, st.var_name, st.var_name_len, t)
+    narrow_sema_note(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, t)
 
 # A match arm's binding (AGAST #3345 / #3358, as the emitter's
 # narrow_note_binding): a payload `Some(x)` has the payload's integer type, a
 # catch-all name `n` the scrutinee's.  `scrut` is null for if-expression arms.
 pub fn narrow_sema_arm(sm: *Sema, scrut: *Expr, arm: *MatchArm)
     if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
-        narrow_sema_note(sm, arm.pattern_inner_name, arm.pattern_inner_name_len, narrow_sema_payload(sm, scrut, arm))
+        narrow_sema_note(sm, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, narrow_sema_payload(sm, scrut, arm))
     else if arm.pattern_kind == PAT_IDENT and scrut != null
         var env: NarrowEnv
         env.s = null
         env.sm = sm
-        narrow_sema_note(sm, arm.pattern_name, arm.pattern_name_len, narrow_src_type_in(@env, scrut, 0))
+        narrow_sema_note(sm, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, narrow_src_type_in(@env, scrut, 0))
 
 # The payload's integer type of `arm`'s variant of the enum `scrut` is, as
 # emit_match_arm_body picks the variant (`Some` / `Ok` tag 0, else 1; a user
@@ -185,13 +189,13 @@ fn narrow_sema_payload(sm: *Sema, scrut: *Expr, arm: *MatchArm) -> i32
     if sema_expr_ty(sm, e, @t) != TYPE_STRUCT or t.name == null or t.name_len <= 0
         return 0
     var variant: i32 = 1
-    if name_eq(arm.pattern_name, arm.pattern_name_len, c"Some", 4) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"Ok", 2) == 1
+    if name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Some"), len: (4) as i64 }) == 1 or name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Ok"), len: (2) as i64 }) == 1
         variant = 0
-    if user_enum_index(t.name, t.name_len) >= 0
-        let uvi: i32 = arm_variant_sel(t.name, t.name_len, arm)   # AGAST #1295: the selected field
+    if user_enum_index(StrView { ptr: (t.name), len: (t.name_len) as i64 }) >= 0
+        let uvi: i32 = arm_variant_sel(StrView { ptr: (t.name), len: (t.name_len) as i64 }, arm)   # AGAST #1295: the selected field
         if uvi >= 0
             variant = uvi
-    tagged_enum_int_type_in(@sm.struct_map, sm.module, t.name, t.name_len, variant)
+    tagged_enum_int_type_in(@sm.struct_map, sm.module, StrView { ptr: (t.name), len: (t.name_len) as i64 }, variant)
 
 # =============================================================================
 # Types
@@ -206,13 +210,15 @@ pub fn narrow_known(t: i32) -> i32
 # The const named `name`.  Sema runs before emit_module resolves a const
 # that named one not yet parsed (resolve_const_values), so it resolves the
 # one it reads, as the emitter's own lookup would find it resolved.
-fn narrow_env_const(env: *NarrowEnv, name: *u8, len: i32) -> *ConstEntry
+fn narrow_env_const(env: *NarrowEnv, name_sv: StrView) -> *ConstEntry
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     if env.s != null
-        return find_const_entry(env.s, name, len)
+        return find_const_entry(env.s, StrView { ptr: (name), len: (len) as i64 })
     let consts: *ConstEntry = env.sm.module.constants
     var c: *ConstEntry = consts
     while c != null
-        if name_eq(c.name, c.name_len, name, len) == 1
+        if name_eq(StrView { ptr: (c.name), len: (c.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             if c.fold_state == CONST_FOLD_PENDING
                 const_resolve(consts, c)
             return c
@@ -222,23 +228,27 @@ fn narrow_env_const(env: *NarrowEnv, name: *u8, len: i32) -> *ConstEntry
 # Ritz type of an identifier, or NARROW_UNKNOWN.  Same precedence as
 # emission: constants shadow locals.
 pub fn narrow_ident_type(s: *EmitterState, e: *Expr) -> i32
-    narrow_name_type(s, e.ident_ptr, e.ident_len)
+    narrow_name_type(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
 
-pub fn narrow_name_type(s: *EmitterState, name: *u8, len: i32) -> i32
+pub fn narrow_name_type(s: *EmitterState, name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     var env: NarrowEnv
     env.s = s
     env.sm = null
-    narrow_env_name_type(@env, name, len)
+    narrow_env_name_type(@env, StrView { ptr: (name), len: (len) as i64 })
 
-fn narrow_env_name_type(env: *NarrowEnv, name: *u8, len: i32) -> i32
-    let ce: *ConstEntry = narrow_env_const(env, name, len)
+fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let ce: *ConstEntry = narrow_env_const(env, StrView { ptr: (name), len: (len) as i64 })
     if ce != null
         if ce.fold_state != CONST_FOLD_DONE
             return NARROW_UNKNOWN
         return narrow_known(ce.const_type)
     if env.s == null
         # Sema: the innermost binding of the name, else a global.
-        let v: *SemaVar = sema_find_local(env.sm, name, len)
+        let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (name), len: (len) as i64 })
         if v != null
             if v.narrow == 0
                 return NARROW_UNKNOWN
@@ -247,7 +257,7 @@ fn narrow_env_name_type(env: *NarrowEnv, name: *u8, len: i32) -> i32
         # #3375), so an i64 / u64 global is trusted here (AGAST #1688).
         var sg: *GlobalVarDef = env.sm.module.globals
         while sg != null
-            if name_eq(sg.name, sg.name_len, name, len) == 1
+            if name_eq(StrView { ptr: (sg.name), len: (sg.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
                 if ty_is_int(sg.var_type) == 1
                     return sg.var_type
                 return NARROW_UNKNOWN
@@ -263,7 +273,7 @@ fn narrow_env_name_type(env: *NarrowEnv, name: *u8, len: i32) -> i32
     var i: i32 = s.narrow_decl_count - 1
     while i >= 0
         let d: *NarrowDecl = @s.narrow_decls[i]
-        if name_eq(d.name, d.name_len, name, len) == 1
+        if name_eq(StrView { ptr: (d.name), len: (d.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             if found == 0
                 found = 1
                 t = d.decl_type
@@ -274,10 +284,10 @@ fn narrow_env_name_type(env: *NarrowEnv, name: *u8, len: i32) -> i32
         return t
     var p: *Param = s.narrow_params
     while p != null
-        if name_eq(p.name, p.name_len, name, len) == 1
+        if name_eq(StrView { ptr: (p.name), len: (p.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             return narrow_known(p.param_type)
         p = p.next
-    let g: *GlobalVarDef = find_global(s, name, len)
+    let g: *GlobalVarDef = find_global(s, StrView { ptr: (name), len: (len) as i64 })
     if g != null
         return narrow_global_type(g)
     NARROW_UNKNOWN
@@ -292,11 +302,13 @@ fn narrow_global_type(g: *GlobalVarDef) -> i32
 
 # A name's and a `local.field`'s written type from Sema's scope, for
 # enum_as_int's targets (AGAST #3511).
-pub fn narrow_sema_name_type(sm: *Sema, name: *u8, len: i32) -> i32
+pub fn narrow_sema_name_type(sm: *Sema, name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     var env: NarrowEnv
     env.s = null
     env.sm = sm
-    narrow_env_name_type(@env, name, len)
+    narrow_env_name_type(@env, StrView { ptr: (name), len: (len) as i64 })
 
 pub fn narrow_sema_member_type(sm: *Sema, e: *Expr) -> i32
     var env: NarrowEnv
@@ -311,13 +323,13 @@ fn narrow_env_member_type(env: *NarrowEnv, e: *Expr) -> i32
     var tn: *u8 = null
     var tl: i32 = 0
     if env.s != null
-        let local: *LocalVar = find_local_struct_name(env.s, e.left.ident_ptr, e.left.ident_len)
+        let local: *LocalVar = find_local_struct_name(env.s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
         if local == null
             return NARROW_UNKNOWN
         tn = local.type_name
         tl = local.type_name_len
     else
-        let v: *SemaVar = sema_find_local(env.sm, e.left.ident_ptr, e.left.ident_len)
+        let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
         if v == null
             return NARROW_UNKNOWN
         tn = v.type_name
@@ -326,12 +338,12 @@ fn narrow_env_member_type(env: *NarrowEnv, e: *Expr) -> i32
         return NARROW_UNKNOWN
     var st: *StructDef = null
     if env.s != null
-        st = find_struct(env.s, tn, tl)
+        st = find_struct(env.s, StrView { ptr: (tn), len: (tl) as i64 })
     else
-        st = sema_find_struct(env.sm, tn, tl)
+        st = sema_find_struct(env.sm, StrView { ptr: (tn), len: (tl) as i64 })
     if st == null
         return NARROW_UNKNOWN
-    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if idx < 0
         return NARROW_UNKNOWN
     let field: *StructField = get_field_type(st, idx)
@@ -355,7 +367,7 @@ pub fn narrow_sema_call_fn(sm: *Sema, e: *Expr) -> *FnDef
     if e.func_name_len == 0
         return null
     if e.call_type_suffix_len <= 0
-        let v: *SemaVar = sema_find_local(sm, e.func_name, e.func_name_len)
+        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
         if v != null and v.fn_sig != null and v.kind != TYPE_ARRAY
             return v.fn_sig
     sema_call_fn(sm, e)
@@ -379,7 +391,7 @@ fn narrow_sema_place_type(sm: *Sema, e: *Expr) -> i32
         return NARROW_UNKNOWN
     if k == EXPR_METHOD
         # `.unwrap()` / `.unwrap_or(d)` is the carrier's intrinsic, no FnDef.
-        if name_eq(e.ident_ptr, e.ident_len, c"unwrap", 6) == 1 or name_eq(e.ident_ptr, e.ident_len, c"unwrap_or", 9) == 1
+        if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap"), len: (6) as i64 }) == 1 or name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap_or"), len: (9) as i64 }) == 1
             return narrow_sema_payload_of(sm, e.left)
         let fd: *FnDef = sbk_method_def(sm, e)
         if fd == null
@@ -394,9 +406,9 @@ fn narrow_sema_payload_of(sm: *Sema, carrier: *Expr) -> i32
     var name: *u8 = null
     var len: i32 = 0
     sbk_receiver(sm, carrier, @name, @len)
-    if name == null or len <= 0 or is_tagged_enum_type(name, len) == 0
+    if name == null or len <= 0 or is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
         return NARROW_UNKNOWN
-    narrow_known(tagged_enum_int_type_in(@sm.struct_map, sm.module, name, len, 0))
+    narrow_known(tagged_enum_int_type_in(@sm.struct_map, sm.module, StrView { ptr: (name), len: (len) as i64 }, 0))
 
 # The type ritz0 would give an arithmetic result: the wider operand, with a
 # bare literal adopting the other side (#1396).  Two literals stay i64 in
@@ -590,7 +602,7 @@ fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
     if k == EXPR_CHAR_LIT
         return TYPE_U8
     if k == EXPR_IDENT
-        return narrow_env_name_type(env, e.ident_ptr, e.ident_len)
+        return narrow_env_name_type(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if k == EXPR_CALL
         return narrow_call_type(env, e)
     if k == EXPR_CAST
@@ -741,7 +753,7 @@ fn narrow_const_value(env: *NarrowEnv, e: *Expr, whole: i32, out: *i64) -> i32
         *out = e.int_val
         return 1
     if e.kind == EXPR_IDENT
-        let ce: *ConstEntry = narrow_env_const(env, e.ident_ptr, e.ident_len)
+        let ce: *ConstEntry = narrow_env_const(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if ce == null or ce.fold_state != CONST_FOLD_DONE
             return 0
         let w: i32 = ty_bits(ce.const_type)
@@ -965,13 +977,15 @@ pub fn narrow_sema_for(sm: *Sema, st: *Stmt)
     if lit_e == 0
         te = narrow_src_type_in(@env, st.for_end, 1)
     sm.scope_top = sm.scope_top + 1
-    narrow_sema_note(sm, st.for_var, st.for_var_len, for_range_type(ts, lit_s, sv, te, lit_e, ev))
+    narrow_sema_note(sm, StrView { ptr: (st.for_var), len: (st.for_var_len) as i64 }, for_range_type(ts, lit_s, sv, te, lit_e, ev))
 
 # =============================================================================
 # The check
 # =============================================================================
 
-pub fn narrow_eprint_name(name: *u8, len: i32)
+pub fn narrow_eprint_name(name_sv: StrView)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     var i: i32 = 0
     while i < len
         eprint_char(*(name + i))
@@ -1068,7 +1082,7 @@ fn narrow_report(sm: *Sema, stmt: *Stmt, decl: i32, src: i32)
     eprint_char(':')
     eprint_i64(stmt.span.col as i64)
     eprints_cstr(c": error: implicit narrowing: `")
-    narrow_eprint_name(stmt.var_name, stmt.var_name_len)
+    narrow_eprint_name(StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
     eprints_cstr(c"` is declared `")
     eprints_cstr(ty_name(decl))
     eprints_cstr(c"` but its initialiser has type `")
@@ -1076,7 +1090,7 @@ fn narrow_report(sm: *Sema, stmt: *Stmt, decl: i32, src: i32)
     eprints_cstr(c"`, and the compiler cannot prove the value fits. Write `<expr> as ")
     eprints_cstr(ty_name(decl))
     eprints_cstr(c"` if truncation is intended, or declare `")
-    narrow_eprint_name(stmt.var_name, stmt.var_name_len)
+    narrow_eprint_name(StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
     eprints_cstr(c"` as `")
     eprints_cstr(ty_name(src))
     eprints_cstr(c"`\n")

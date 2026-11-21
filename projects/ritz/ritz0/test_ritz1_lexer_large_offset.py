@@ -67,7 +67,7 @@ fn probe(buf: *u8, n: i64, want_kind: i32) -> i64
     var lex: Lexer
     let big: i64 = 4294967296
     let base: *u8 = ((buf as i64) - big) as *u8
-    lexer_init(@lex, base, big + n)
+    lexer_init(@lex, StrView {{ ptr: (base), len: (big + n) }})
     lex.pos = big
     lex.at_line_start = 0
     var tok: Token = lexer_next(@lex)

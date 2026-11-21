@@ -166,6 +166,8 @@ class RitzGenerator:
         self._emit('#')
         self._emit('# This is auto-generated code. Do not edit.')
         self._emit('')
+        self._emit('import ritzlib.strview')  # token_new takes its pointer/len as a StrView
+        self._emit('')
 
         # Built-in token types
         self._emit('# Built-in token types')
@@ -277,7 +279,9 @@ class RitzGenerator:
         # null for every token the lexer did not patch (AGAST #3888).
         self._emit('# A Token of `kind` whose `len` bytes start at `start` in the source')
         self._emit('# (zero-length layout and EOF tokens point at the byte they stand on).')
-        self._emit('pub fn token_new(kind: i32, start: *u8, len: i32, line: i64, col: i64) -> Token')
+        self._emit('pub fn token_new(kind: i32, start_sv: StrView, line: i64, col: i64) -> Token')
+        self._emit('    var start: *u8 = start_sv.ptr')
+        self._emit('    var len: i32 = start_sv.len as i32')
         self._emit('    Token {')
         self._emit('        kind: kind,')
         self._emit('        start: start,')

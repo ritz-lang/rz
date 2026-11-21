@@ -32,12 +32,18 @@ import diag
 import monomorph
 import sema
 
-fn tb_eq(a: *u8, alen: i32, b: *u8, blen: i32) -> i32
+fn tb_eq(a_sv: StrView, b_sv: StrView) -> i32
+    var a: *u8 = a_sv.ptr
+    var alen: i32 = a_sv.len as i32
+    var b: *u8 = b_sv.ptr
+    var blen: i32 = b_sv.len as i32
     if alen != blen
         return 0
     (memcmp(a, b, alen as i64) == 0) as i32
 
-fn tb_write(s: *u8, len: i32)
+fn tb_write(s_sv: StrView)
+    var s: *u8 = s_sv.ptr
+    var len: i32 = s_sv.len as i32
     sys_write(2, s, len as i64)
 
 fn tb_file(sm: *Sema, file: *u8) -> *u8
@@ -45,7 +51,9 @@ fn tb_file(sm: *Sema, file: *u8) -> *u8
         return sm.file
     file
 
-fn tb_dollar(s: *u8, len: i32) -> i32
+fn tb_dollar(s_sv: StrView) -> i32
+    var s: *u8 = s_sv.ptr
+    var len: i32 = s_sv.len as i32
     var k: i32 = 0
     while k < len and *(s + k) != 36   # '$'
         k = k + 1
@@ -63,8 +71,10 @@ fn tb_has_bounds(tps: *TypeParam) -> i32
 # Unknown traits, at the bound
 # ----------------------------------------------------------------------------
 
-fn tb_trait_known(name: *u8, len: i32) -> i32
-    if trait_declared(name, len) == 1 or is_compiler_trait(name, len) == 1
+fn tb_trait_known(name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if trait_declared(StrView { ptr: (name), len: (len) as i64 }) == 1 or is_compiler_trait(StrView { ptr: (name), len: (len) as i64 }) == 1
         return 1
     0
 
@@ -73,12 +83,12 @@ fn tb_unknown_in(sm: *Sema, tps: *TypeParam)
     while tp != null
         var b: *TraitBound = tp.bounds
         while b != null
-            if tb_trait_known(b.name, b.name_len) == 0
+            if tb_trait_known(StrView { ptr: (b.name), len: (b.name_len) as i64 }) == 0
                 diag_error_at(tb_file(sm, b.file), b.span)
                 eprints_cstr(c"unknown trait `")
-                tb_write(b.name, b.name_len)
+                tb_write(StrView { ptr: (b.name), len: (b.name_len) as i64 })
                 eprints_cstr(c"` in the bound on `")
-                tb_write(tp.name, tp.name_len)
+                tb_write(StrView { ptr: (tp.name), len: (tp.name_len) as i64 })
                 eprints_cstr(c"`\n")
                 sm.error_count = sm.error_count + 1
             b = b.next
@@ -110,26 +120,30 @@ fn tb_unknown_check(sm: *Sema)
 # one-argument suffix `$ai` (split_mangled_args).  One parameter takes the
 # whole suffix (`Bag$Bag$Nope`), as monomorph's own split does.  Returns the
 # count, or -1 when the suffix doesn't split into `n`.
-fn tb_split(m: *Module, n: i32, suffix: *u8, suffix_len: i32, starts: *i32, lens: *i32) -> i32
+fn tb_split(m: *Module, n: i32, suffix_sv: StrView, starts: *i32, lens: *i32) -> i32
+    var suffix: *u8 = suffix_sv.ptr
+    var suffix_len: i32 = suffix_sv.len as i32
     if n == 1
         *starts = 0
         *lens = suffix_len
         return 1
-    if split_mangled_args(m, suffix, suffix_len, starts, lens) != n
+    if split_mangled_args(m, StrView { ptr: (suffix), len: (suffix_len) as i64 }, starts, lens) != n
         return -1
     n
 
 # The first (param index, bound) of `tps` that the args of `suffix` miss, as
 # `*out_bound`; -1 when every bound is met or the suffix doesn't split.
-fn tb_unmet(m: *Module, tps: *TypeParam, suffix: *u8, suffix_len: i32, out_bound: **TraitBound) -> i32
+fn tb_unmet(m: *Module, tps: *TypeParam, suffix_sv: StrView, out_bound: **TraitBound) -> i32
+    var suffix: *u8 = suffix_sv.ptr
+    var suffix_len: i32 = suffix_sv.len as i32
     let n: i32 = count_type_params(tps)
     if n == 0 or tb_has_bounds(tps) == 0
         return -1
-    let cap: i64 = 4 * (mangled_arg_capacity(suffix, suffix_len) + 1) as i64
+    let cap: i64 = 4 * (mangled_arg_capacity(StrView { ptr: (suffix), len: (suffix_len) as i64 }) + 1) as i64
     let starts: *i32 = malloc(cap) as *i32
     let lens: *i32 = malloc(cap) as *i32
     var miss: i32 = -1
-    if tb_split(m, n, suffix, suffix_len, starts, lens) == n
+    if tb_split(m, n, StrView { ptr: (suffix), len: (suffix_len) as i64 }, starts, lens) == n
         var tp: *TypeParam = tps
         var i: i32 = 0
         while tp != null and miss < 0
@@ -138,7 +152,7 @@ fn tb_unmet(m: *Module, tps: *TypeParam, suffix: *u8, suffix_len: i32, out_bound
             let arg_len: i32 = *(lens + i) - 1
             var b: *TraitBound = tp.bounds
             while b != null and miss < 0
-                if tb_implements(m, arg, arg_len, b.name, b.name_len) == 0
+                if tb_implements(m, StrView { ptr: (arg), len: (arg_len) as i64 }, StrView { ptr: (b.name), len: (b.name_len) as i64 }) == 0
                     miss = i
                     *out_bound = b
                 b = b.next
@@ -152,16 +166,20 @@ fn tb_unmet(m: *Module, tps: *TypeParam, suffix: *u8, suffix_len: i32, out_bound
 # Exactly, by a non-generic impl for its name, or through a generic impl of
 # its generic type whose own bounds its args meet (§12.2: an impl covers
 # every instantiation).  A pointer, reference, array or primitive has none.
-fn tb_implements(m: *Module, arg: *u8, arg_len: i32, tname: *u8, tname_len: i32) -> i32
-    let k: i32 = tb_dollar(arg, arg_len)
+fn tb_implements(m: *Module, arg_sv: StrView, tname_sv: StrView) -> i32
+    var arg: *u8 = arg_sv.ptr
+    var arg_len: i32 = arg_sv.len as i32
+    var tname: *u8 = tname_sv.ptr
+    var tname_len: i32 = tname_sv.len as i32
+    let k: i32 = tb_dollar(StrView { ptr: (arg), len: (arg_len) as i64 })
     var ib: *ImplBlock = m.impls
     while ib != null
-        if ib.trait_name != null and tb_eq(ib.trait_name, ib.trait_name_len, tname, tname_len) == 1 and tb_eq(ib.type_name, ib.type_name_len, arg, k) == 1
+        if ib.trait_name != null and tb_eq(StrView { ptr: (ib.trait_name), len: (ib.trait_name_len) as i64 }, StrView { ptr: (tname), len: (tname_len) as i64 }) == 1 and tb_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (arg), len: (k) as i64 }) == 1
             if k == arg_len and ib.type_params == null
                 return 1
             if k < arg_len and ib.type_params != null
                 var unused: *TraitBound = null
-                if tb_unmet(m, ib.type_params, arg + k, arg_len - k, @unused) < 0
+                if tb_unmet(m, ib.type_params, StrView { ptr: (arg + k), len: (arg_len - k) as i64 }, @unused) < 0
                     return 1
                 return 0
         ib = ib.next
@@ -171,38 +189,40 @@ fn tb_implements(m: *Module, arg: *u8, arg_len: i32, tname: *u8, tname_len: i32)
 # Spelling a mangled type as written: `Bag$Nope` is `Bag<Nope>`
 # ----------------------------------------------------------------------------
 
-fn tb_eprint_type(m: *Module, s: *u8, len: i32)
+fn tb_eprint_type(m: *Module, s_sv: StrView)
+    var s: *u8 = s_sv.ptr
+    var len: i32 = s_sv.len as i32
     if len > 7 and memcmp(s, c"refmut_", 7) == 0
         eprints_cstr(c"@&")
-        tb_eprint_type(m, s + 7, len - 7)
+        tb_eprint_type(m, StrView { ptr: (s + 7), len: (len - 7) as i64 })
         return
     if len > 4 and memcmp(s, c"ref_", 4) == 0
         eprint_char('@')
-        tb_eprint_type(m, s + 4, len - 4)
+        tb_eprint_type(m, StrView { ptr: (s + 4), len: (len - 4) as i64 })
         return
     if len > 4 and memcmp(s, c"ptr_", 4) == 0
         eprint_char('*')
-        tb_eprint_type(m, s + 4, len - 4)
+        tb_eprint_type(m, StrView { ptr: (s + 4), len: (len - 4) as i64 })
         return
-    let k: i32 = tb_dollar(s, len)
-    tb_write(s, k)
+    let k: i32 = tb_dollar(StrView { ptr: (s), len: (len) as i64 })
+    tb_write(StrView { ptr: (s), len: (k) as i64 })
     if k >= len
         return
-    let arity: i32 = mangled_component_arity(m, s, k)
+    let arity: i32 = mangled_component_arity(m, StrView { ptr: (s), len: (k) as i64 })
     if arity <= 0
-        tb_write(s + k, len - k)   # no template to say how it nests
+        tb_write(StrView { ptr: (s + k), len: (len - k) as i64 })   # no template to say how it nests
         return
-    let cap: i64 = 4 * (mangled_arg_capacity(s + k, len - k) + 1) as i64
+    let cap: i64 = 4 * (mangled_arg_capacity(StrView { ptr: (s + k), len: (len - k) as i64 }) + 1) as i64
     let starts: *i32 = malloc(cap) as *i32
     let lens: *i32 = malloc(cap) as *i32
-    if tb_split(m, arity, s + k, len - k, starts, lens) != arity
-        tb_write(s + k, len - k)
+    if tb_split(m, arity, StrView { ptr: (s + k), len: (len - k) as i64 }, starts, lens) != arity
+        tb_write(StrView { ptr: (s + k), len: (len - k) as i64 })
     else
         eprint_char('<')
         for i in 0..arity
             if i > 0
                 eprints_cstr(c", ")
-            tb_eprint_type(m, s + k + *(starts + i) + 1, *(lens + i) - 1)
+            tb_eprint_type(m, StrView { ptr: (s + k + *(starts + i) + 1), len: (*(lens + i) - 1) as i64 })
         eprint_char('>')
     free(starts as *u8)
     free(lens as *u8)
@@ -214,7 +234,9 @@ fn tb_eprint_type(m: *Module, s: *u8, len: i32)
 # Is the instance's argument still a parameter (`W$T`, a template's own
 # spelling of its type, or `total$U` inside another generic)?  Such a
 # spelling is no instance: the one its parameters become is judged.
-fn tb_has_free_param(m: *Module, suffix: *u8, suffix_len: i32) -> i32
+fn tb_has_free_param(m: *Module, suffix_sv: StrView) -> i32
+    var suffix: *u8 = suffix_sv.ptr
+    var suffix_len: i32 = suffix_sv.len as i32
     var pos: i32 = 0
     while pos < suffix_len
         var end: i32 = pos + 1
@@ -228,7 +250,7 @@ fn tb_has_free_param(m: *Module, suffix: *u8, suffix_len: i32) -> i32
             j = j - 1
         c = c + j + 1
         clen = clen - j - 1
-        if clen > 0 and *c >= 65 and *c <= 90 and module_declares_type(m, c, clen) == 0 and find_generic_struct(m, c, clen) == null and trait_declared(c, clen) == 0
+        if clen > 0 and *c >= 65 and *c <= 90 and module_declares_type(m, StrView { ptr: (c), len: (clen) as i64 }) == 0 and find_generic_struct(m, StrView { ptr: (c), len: (clen) as i64 }) == null and trait_declared(StrView { ptr: (c), len: (clen) as i64 }) == 0
             return 1
         pos = end
     0
@@ -236,11 +258,13 @@ fn tb_has_free_param(m: *Module, suffix: *u8, suffix_len: i32) -> i32
 # A transitive instance (`total$Nope` from `outer<Nope>`'s `total<U>(x)`) was
 # never written as such: its first use is the generic one, `total<U>`, whose
 # argument ritz0 reports at too (its monomorph substitutes into that call).
-fn tb_use_in_generic(m: *Module, name: *u8, name_len: i32) -> *GenericUse
+fn tb_use_in_generic(m: *Module, name_sv: StrView) -> *GenericUse
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
     var found: *GenericUse = null
     var u: *GenericUse = generic_use_list()
     while u != null
-        if tb_eq(u.name, u.name_len, name, name_len) == 1 and tb_has_free_param(m, u.suffix, u.suffix_len) == 1
+        if tb_eq(StrView { ptr: (u.name), len: (u.name_len) as i64 }, StrView { ptr: (name), len: (name_len) as i64 }) == 1 and tb_has_free_param(m, StrView { ptr: (u.suffix), len: (u.suffix_len) as i64 }) == 1
             found = u
         u = u.next
     found
@@ -248,12 +272,18 @@ fn tb_use_in_generic(m: *Module, name: *u8, name_len: i32) -> *GenericUse
 # Judge one instance `name` + `suffix` of a generic whose parameters are
 # `tps`, named `owner` (with `impl ` before it when `is_impl`).  Reports the
 # first unmet bound; returns 1 if it did.
-fn tb_check_instance(sm: *Sema, owner: *u8, owner_len: i32, is_impl: i32, tps: *TypeParam, name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) -> i32
+fn tb_check_instance(sm: *Sema, owner_sv: StrView, is_impl: i32, tps: *TypeParam, name_sv: StrView, suffix_sv: StrView) -> i32
+    var owner: *u8 = owner_sv.ptr
+    var owner_len: i32 = owner_sv.len as i32
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    var suffix: *u8 = suffix_sv.ptr
+    var suffix_len: i32 = suffix_sv.len as i32
     let m: *Module = sm.module
-    if tb_has_bounds(tps) == 0 or tb_has_free_param(m, suffix, suffix_len) == 1
+    if tb_has_bounds(tps) == 0 or tb_has_free_param(m, StrView { ptr: (suffix), len: (suffix_len) as i64 }) == 1
         return 0
     var bound: *TraitBound = null
-    let i: i32 = tb_unmet(m, tps, suffix, suffix_len, @bound)
+    let i: i32 = tb_unmet(m, tps, StrView { ptr: (suffix), len: (suffix_len) as i64 }, @bound)
     if i < 0
         return 0
     var tp: *TypeParam = tps
@@ -263,9 +293,9 @@ fn tb_check_instance(sm: *Sema, owner: *u8, owner_len: i32, is_impl: i32, tps: *
     # transitive instance the generic call it came from; else the bound.
     var file: *u8 = bound.file
     var at: SrcSpan = bound.span
-    var u: *GenericUse = generic_use_first(name, name_len, suffix, suffix_len)
+    var u: *GenericUse = generic_use_first(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (suffix), len: (suffix_len) as i64 })
     if u == null
-        u = tb_use_in_generic(m, name, name_len)
+        u = tb_use_in_generic(m, StrView { ptr: (name), len: (name_len) as i64 })
     if u != null
         var ga: *GenericArg = u.args
         for k in 0..i
@@ -277,43 +307,49 @@ fn tb_check_instance(sm: *Sema, owner: *u8, owner_len: i32, is_impl: i32, tps: *
         else if u.at.line > 0
             file = u.file
             at = u.at
-    let cap: i64 = 4 * (mangled_arg_capacity(suffix, suffix_len) + 1) as i64
+    let cap: i64 = 4 * (mangled_arg_capacity(StrView { ptr: (suffix), len: (suffix_len) as i64 }) + 1) as i64
     let starts: *i32 = malloc(cap) as *i32
     let lens: *i32 = malloc(cap) as *i32
-    tb_split(m, count_type_params(tps), suffix, suffix_len, starts, lens)
+    tb_split(m, count_type_params(tps), StrView { ptr: (suffix), len: (suffix_len) as i64 }, starts, lens)
     diag_error_at(tb_file(sm, file), at)
     eprint_char('`')
-    tb_eprint_type(m, suffix + *(starts + i) + 1, *(lens + i) - 1)
+    tb_eprint_type(m, StrView { ptr: (suffix + *(starts + i) + 1), len: (*(lens + i) - 1) as i64 })
     eprints_cstr(c"` doesn't implement `")
-    tb_write(bound.name, bound.name_len)
+    tb_write(StrView { ptr: (bound.name), len: (bound.name_len) as i64 })
     eprints_cstr(c"`, which `")
-    tb_write(tp.name, tp.name_len)
+    tb_write(StrView { ptr: (tp.name), len: (tp.name_len) as i64 })
     eprints_cstr(c"` of `")
     if is_impl == 1
         eprints_cstr(c"impl ")
-    tb_write(owner, owner_len)
+    tb_write(StrView { ptr: (owner), len: (owner_len) as i64 })
     eprints_cstr(c"` requires\n")
     sm.error_count = sm.error_count + 1
     free(starts as *u8)
     free(lens as *u8)
     1
 
-fn tb_generic_fn(m: *Module, name: *u8, len: i32) -> *FnDef
+fn tb_generic_fn(m: *Module, name_sv: StrView) -> *FnDef
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
     var f: *FnDef = m.functions
     while f != null
-        if f.type_params != null and tb_eq(f.name, f.name_len, name, len) == 1
+        if f.type_params != null and tb_eq(StrView { ptr: (f.name), len: (f.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             return f
         f = f.next
     null
 
 # A generic type's instance: its own bounds, then each generic impl's.
-fn tb_check_type_instance(sm: *Sema, tps: *TypeParam, name: *u8, name_len: i32, suffix: *u8, suffix_len: i32)
-    if tps != null and tb_check_instance(sm, name, name_len, 0, tps, name, name_len, suffix, suffix_len) == 1
+fn tb_check_type_instance(sm: *Sema, tps: *TypeParam, name_sv: StrView, suffix_sv: StrView)
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    var suffix: *u8 = suffix_sv.ptr
+    var suffix_len: i32 = suffix_sv.len as i32
+    if tps != null and tb_check_instance(sm, StrView { ptr: (name), len: (name_len) as i64 }, 0, tps, StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (suffix), len: (suffix_len) as i64 }) == 1
         return
     var ib: *ImplBlock = sm.module.impls
     while ib != null
-        if ib.type_params != null and tb_eq(ib.type_name, ib.type_name_len, name, name_len) == 1
-            if tb_check_instance(sm, name, name_len, 1, ib.type_params, name, name_len, suffix, suffix_len) == 1
+        if ib.type_params != null and tb_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (name), len: (name_len) as i64 }) == 1
+            if tb_check_instance(sm, StrView { ptr: (name), len: (name_len) as i64 }, 1, ib.type_params, StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (suffix), len: (suffix_len) as i64 }) == 1
                 return
         ib = ib.next
 
@@ -327,22 +363,22 @@ pub fn trait_bound_check(sm: *Sema)
         let name: *u8 = get_struct_instantiation_name(i)
         let name_len: i32 = get_struct_instantiation_name_len(i)
         var tps: *TypeParam = null
-        let st: *StructDef = find_generic_struct(m, name, name_len)
+        let st: *StructDef = find_generic_struct(m, StrView { ptr: (name), len: (name_len) as i64 })
         if st != null
             tps = st.type_params
-        tb_check_type_instance(sm, tps, name, name_len, get_struct_instantiation_suffix(i), get_struct_instantiation_suffix_len(i))
+        tb_check_type_instance(sm, tps, StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (get_struct_instantiation_suffix(i)), len: (get_struct_instantiation_suffix_len(i)) as i64 })
     # A generic enum's instances (`Slot$Nope`) are recorded as enums.
     for ei in 0..enum_count()
         var len: i32 = 0
         let ename: *u8 = enum_name_at(ei, @len)
-        let k: i32 = tb_dollar(ename, len)
+        let k: i32 = tb_dollar(StrView { ptr: (ename), len: (len) as i64 })
         if k < len
-            let base: i32 = enum_find(ename, k)
+            let base: i32 = enum_find(StrView { ptr: (ename), len: (k) as i64 })
             if base >= 0 and enum_is_generic(base) == 1
-                tb_check_instance(sm, ename, k, 0, generic_enum_params(base), ename, k, ename + k, len - k)
+                tb_check_instance(sm, StrView { ptr: (ename), len: (k) as i64 }, 0, generic_enum_params(base), StrView { ptr: (ename), len: (k) as i64 }, StrView { ptr: (ename + k), len: (len - k) as i64 })
     for i in 0..get_instantiation_count()
         let name: *u8 = get_instantiation_name(i)
         let name_len: i32 = get_instantiation_name_len(i)
-        let f: *FnDef = tb_generic_fn(m, name, name_len)
+        let f: *FnDef = tb_generic_fn(m, StrView { ptr: (name), len: (name_len) as i64 })
         if f != null
-            tb_check_instance(sm, name, name_len, 0, f.type_params, name, name_len, get_instantiation_suffix(i), get_instantiation_suffix_len(i))
+            tb_check_instance(sm, StrView { ptr: (name), len: (name_len) as i64 }, 0, f.type_params, StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (get_instantiation_suffix(i)), len: (get_instantiation_suffix_len(i)) as i64 })

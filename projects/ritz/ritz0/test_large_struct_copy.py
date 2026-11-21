@@ -504,7 +504,7 @@ def _scan_program() -> str:
         "        li -= 1",
         "    let last: *u8 = text + li",
         "    var cp: LlCopy",
-        "    let got: i32 = ll_find_copy(text, last, n - li, @cp)",
+        "    let got: i32 = ll_find_copy(text, StrView { ptr: (last), len: (n - li) }, @cp)",
         "    if got != expect",
         "        return 0",
         "    if got == 1",
