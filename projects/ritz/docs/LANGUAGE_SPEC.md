@@ -7131,8 +7131,7 @@ and a block has a value only when it is used as one (LARB R69): any statement
 but the last of a block, the last statement of a fn that returns nothing, and
 the last line of an arm of a statement `match`, a branch of a statement `if`
 or a loop body. A statement `match` or `if` is one whose own value is not
-used. Both compilers reject it, located at the call (AGAST #2137; ritz1 does
-not yet see the arm, branch and loop-body cases, AGAST #3997):
+used. Both compilers reject it, located at the call (AGAST #2137):
 
 ```
 t.ritz:<line>:<col>: result of [[must_use]] fn '<fn>' is discarded

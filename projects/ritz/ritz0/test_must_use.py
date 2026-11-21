@@ -139,8 +139,6 @@ fn main() -> i32
     0
 """, 9, 9),
 }
-# ritz1's half of R69 is AGAST #3997; each row there is a strict xfail.
-RITZ1_STMT_TAIL_GAP = "AGAST #3997: ritz1 keeps a statement arm's value"
 
 USED = CHECK + """\
 fn first() -> i32
@@ -222,10 +220,7 @@ def test_discard_before_if_expression_arm_value(request, tmp_path, compiler):
     _assert_located_error(compiler, tmp_path, IN_IF_EXPR_ARM, 10, 9, RULE)
 
 
-@pytest.mark.parametrize("compiler", [
-    "ritz0",
-    pytest.param("ritz1", marks=pytest.mark.xfail(strict=True, reason=RITZ1_STMT_TAIL_GAP)),
-])
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
 @pytest.mark.parametrize("name", sorted(STMT_TAILS))
 def test_statement_tail_discards(request, tmp_path, compiler, name):
     # A statement match/if or a loop body has no value: its tail call is
