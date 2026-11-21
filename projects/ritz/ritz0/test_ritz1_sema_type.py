@@ -348,3 +348,68 @@ def test_sema_types_agree_with_the_emitter_on_the_matrix_corpus(request, tmp_pat
     assert not unsummarised, f"{compiler}: compiled without a probe summary: {unsummarised}"
     assert compared >= CORPUS_FLOOR, f"{compiler}: only {compared} expressions compared"
     assert bk_gaps <= BK_GAP_CEILING, f"{compiler}: {bk_gaps} bool-kind gaps, more than {BK_GAP_CEILING}"
+
+
+# AGAST #4428: the emitter's array views ported onto Sema -- the element
+# record (array_elem_pointee_kind), nd_index_shape, ptr_levels_of and
+# addr_of_elem_levels.  The rows that pinned them in
+# test_ritz1_array_ptr_element.py multiply holders by scalar widths; the rule
+# is one row per shape here, and both probes must agree on every node.  The
+# array-element `let` bindings are the ones the emitter's own views cannot
+# record for a `& [N]**T` borrow param.
+_ELEM_SETUP = """\
+    var x: [3]i16
+    x[0] = 1
+    x[1] = 2
+    x[2] = 3
+    var a: [2]*i16
+    a[0] = @x[1]
+    a[1] = @x[0]
+"""
+
+_PTR_PTR_SETUP = "    var q: *i16 = @x[0]\n    var b: [2]**i16\n    b[1] = @q\n"
+
+ELEMENT_SHAPES = {
+    # `[N]**T`: the element is a `**T`, `*b[1]` a `*T`, `**b[1]` a T.
+    "ptr_ptr_element": _PTR_PTR_SETUP + "    if **b[1] != 1\n        return 1\n    return 0\n",
+    "ptr_ptr_inferred": _PTR_PTR_SETUP + "    let r = b[1]\n    if **r != 1\n        return 2\n    return 0\n",
+    # `@a[i]` with `a: [N]*T` is the same `**T`.
+    "ptr_ptr_address": "    let r = @a[1]\n    if **r != 1\n        return 3\n    return 0\n",
+    # `[N][M]*T`: its full-rank leaf is a `*T`.
+    "nd_ptr_leaf": "    var b: [2][2]*i16\n    b[1][1] = @x[0]\n    if *b[1][1] != 1\n        return 4\n    return 0\n",
+    "nd_ptr_leaf_inferred": "    var b: [2][2]*i16\n    b[1][1] = @x[0]\n    let q = b[1][1]\n    if *q != 1\n        return 5\n    return 0\n",
+    "nd_ptr_leaf_address": "    var b: [2][2]*i16\n    b[1][1] = @x[0]\n    let r = @b[1][1]\n    if **r != 1\n        return 6\n    return 0\n",
+    # `@a[i][j]` over `a: [N]*T` is `a[i] + j`, a `*T`.
+    "elem_address_sum": "    let r = @a[1][1]\n    if *r != 2\n        return 7\n    return 0\n",
+    # A `& [N]**T` borrow param: its array is the param's, not a LocalVar
+    # view, so the `let` binding came from Sema's annotation alone.
+    "borrow_ptr_ptr": _PTR_PTR_SETUP + (
+        "    return f(b)\n\nfn f(b:& [2]**i16) -> i32\n"
+        "    let r = b[1]\n    if **r != 1\n        return 8\n    return 0\n"),
+}
+
+SLOT_SUMMARY = re.compile(r"sema-probe-slot: (\d+) compared, (\d+) mismatched, (\d+) lenient")
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("shape", sorted(ELEMENT_SHAPES))
+def test_element_shapes_agree_with_the_emitter(request, tmp_path, compiler, shape):
+    request.getfixturevalue("ritz1_bin")
+    binary = RITZ1_BUILD / compiler
+    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+    src = tmp_path / f"{shape}.ritz"
+    src.write_text("pub fn main() -> i32\n" + _ELEM_SETUP + ELEMENT_SHAPES[shape])
+    comp = subprocess.run([str(binary), str(src), "-o", str(tmp_path / f"{shape}.ll")],
+                          cwd=tmp_path, env=_probe_env("1"), capture_output=True, text=True,
+                          timeout=120)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode == 0, f"{compiler} refused {shape}:\n{out}"
+    # The type, slot and bool rules are this port's.  A `mismatch bk` is
+    # bool_kind's own rule and stays out of scope (#4428 leaves its call
+    # sites alone), so it may appear; nothing else may.
+    bad = [ln for ln in out.splitlines()
+           if ln.startswith("sema-probe: mismatch") and not ln.startswith("sema-probe: mismatch bk")]
+    assert not bad and "slot at " not in out, \
+        f"{compiler}/{shape}: Sema and the emitter disagree:\n{out}"
+    slot = SLOT_SUMMARY.search(out)
+    assert slot and slot.group(2) == "0", f"{compiler}/{shape}: slot:\n{out}"

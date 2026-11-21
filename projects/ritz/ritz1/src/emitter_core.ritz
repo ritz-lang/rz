@@ -4902,7 +4902,7 @@ pub fn expr_is_pointer(s: *EmitterState, x: *Expr) -> i32
         return 0
     if array_elem_pointee_kind(s, x) != TYPE_VOID or ptr_arith_elem_size(s, x) != 0
         return 1
-    let t: i32 = get_expr_type(s, x)
+    let t: i32 = expr_slot_ty(x)
     (t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF) as i32
 
 # AGAST #2332: 1 when `e` is `a[i][j]` over an `a: [N]*T` element.  That's a
@@ -4942,7 +4942,7 @@ pub fn ptr_local_struct_index(s: *EmitterState, e: *Expr, out_name: **u8, out_le
 
 # Fill `sum` and `deref` with `*(a[i] + j)` for `e` = `a[i][j]`, so the load and
 # the store take the `*` paths: one width and one stride, struct T included.
-pub fn elem_index_as_deref(e: *Expr, sum: *Expr, deref: *Expr)
+pub fn elem_index_as_deref(s: *EmitterState, e: *Expr, sum: *Expr, deref: *Expr)
     sum.kind = EXPR_BINARY
     sum.slot_type = TYPE_VOID      # AGAST #3225: no wider slot yet
     sum.span = e.span
@@ -4955,6 +4955,15 @@ pub fn elem_index_as_deref(e: *Expr, sum: *Expr, deref: *Expr)
     deref.op = OP_DEREF
     deref.operand = sum
     deref.next = null
+    # AGAST #4410: these nodes never meet Sema's walk, so note the slots the
+    # emit path reads: the `+` keeps its left operand's pointer slot, and the
+    # deref is the element `e` names (formerly get_expr_type's answer).
+    if e.left != null
+        expr_note_sema_ty(sum, expr_slot_ty(e.left))
+    # The deref is its element: array_elem_pointee_kind on the `+ k` operand
+    # (formerly get_expr_type's answer); i64 is its default.
+    let dpt: i32 = array_elem_pointee_kind(s, sum)
+    expr_note_sema_ty(deref, dpt)
 
 # AGAST #1924: the static pointer type of `x`, as a level count plus the
 # innermost pointee.  Returns the levels (1 = `*T`, 2 = `**T`, 3 = `***T`)
@@ -5467,7 +5476,7 @@ fn index_elem_size(s: *EmitterState, idx: *Expr) -> i64
         return ptr_pointee_size(s, through.pointee_type, through.type_name, through.type_name_len)   # #2329
     if through != null
         var th: ThroughIndex
-        index_through_fill(idx, through, @th)
+        index_through_fill(s, idx, through, @th)
         return ptr_arith_elem_size(s, @th.sum)
     # `@p[i]` for a pointer `p`: the element is p's pointee.
     return ptr_arith_elem_size(s, base)
@@ -5584,7 +5593,7 @@ pub fn get_deref_store_type(s: *EmitterState, ptr_expr: *Expr) -> i32
 # or 0 when it is not a float.  An `f32` local can surface as TYPE_STRUCT
 # with declared type name "f32", which is_float_type also accepts.
 pub fn binop_operand_float_ty(s: *EmitterState, x: *Expr) -> i32
-    let t: i32 = get_expr_type(s, x)
+    let t: i32 = expr_slot_ty(x)
     if t == TYPE_F32 or t == TYPE_F64
         return t
     if x.kind == EXPR_IDENT
@@ -5871,7 +5880,7 @@ fn inline_ptr_pointee(s: *EmitterState, p: *Expr) -> i32
         let lent: *LocalVar = lent_ptr_local(s, p.operand)
         if lent != null
             return lent.pointee_type   # AGAST #2286: it reads as the pointer
-        return get_expr_type(s, p.operand)
+        return expr_slot_ty(p.operand)
     TYPE_VOID
 
 # The element type of `arr[i]` over an inline array (local, global or
@@ -5919,12 +5928,13 @@ pub fn mem_builtin_pointee(s: *EmitterState, arg: *Expr) -> i32
     let inl: i32 = inline_ptr_pointee(s, arg)
     if inl != TYPE_VOID
         return inl
-    let d: *Expr = calloc(1, sizeof(Expr)) as *Expr
-    d.kind = EXPR_UNARY
-    d.op = OP_DEREF
-    d.operand = arg
-    d.span = arg.span
-    get_expr_type(s, d)
+    # AGAST #4410: get_deref_store_type reports TYPE_VOID for a pointee it
+    # cannot name; get_expr_type's `*arg` default (and its i64 miss value)
+    # was i64, which is also the atomic default width.
+    let dst: i32 = get_deref_store_type(s, arg)
+    if dst != TYPE_VOID
+        return dst
+    TYPE_I64
 
 # `<file>:<line>:<col>: error: <builtin name> <msg>` (AGAST #1879).
 pub fn mem_builtin_error(s: *EmitterState, e: *Expr, msg: *u8)
@@ -5957,7 +5967,7 @@ fn mem_builtin_result_type(s: *EmitterState, e: *Expr, id: i32) -> i32
         return TYPE_VOID
     mem_builtin_pointee(s, e.args)
 
-pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
+pub fn synth_slot_ty(s: *EmitterState, e: *Expr) -> i32
     # Returns the Ritz type of an expression
     # AGAST #4404 (#1816): a literal's slot type is decided by the node
     # itself, so Sema annotates it (sema_walk -> sema_note_expr_ty) and the
@@ -6003,8 +6013,8 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             return through.pointee_type   # the element of `h.r[i]`, `g[i]`, `h(p)[i]` (#2329)
         if through != null
             var th: ThroughIndex
-            index_through_fill(e, through, @th)
-            return get_expr_type(s, @th.deref)
+            index_through_fill(s, e, through, @th)
+            return synth_slot_ty(s, @th.deref)
         # AGAST #2537: `(*r)[i]` with `r: **T` is a T, as `*(*r + i)` is.
         let dix: i32 = deref_index_elem(s, e)
         if dix != TYPE_VOID
@@ -6018,6 +6028,10 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         let nd_sh: *ArrayShape = nd_index_shape(s, e, @nd_depth)
         if nd_sh != null and nd_depth == nd_sh.rank and (e.right == null or e.right.kind != EXPR_RANGE)
             if nd_sh.leaf_type == TYPE_F32 or nd_sh.leaf_type == TYPE_F64
+                return nd_sh.leaf_type
+            # AGAST #4428: a full-rank index over an N-D array of pointers is
+            # that pointer (Sema's array view types it so).
+            if nd_sh.leaf_type == TYPE_PTR or nd_sh.leaf_type == TYPE_PTR_PTR
                 return nd_sh.leaf_type
         # Indexing: result type depends on base type.
         # AGAST #1328: resolve the base through locals THEN globals — the old
@@ -6123,7 +6137,7 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             # typed as a `**`.
             if dl_levels == 1 and elem_rooted(e.operand) == 1
                 return TYPE_PTR
-            let inner_type: i32 = get_expr_type(s, e.operand)
+            let inner_type: i32 = synth_slot_ty(s, e.operand)
             if inner_type == TYPE_PTR_PTR
                 return TYPE_PTR  # Deref **T gives *T
             else if inner_type == TYPE_PTR
@@ -6182,7 +6196,7 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                 return TYPE_I64
             else
                 return TYPE_I64  # Deref *T gives value
-        return get_expr_type(s, e.operand)
+        return synth_slot_ty(s, e.operand)
     else if e.kind == EXPR_BINARY
         # AGAST #1965: float arithmetic is computed at binop_float_width
         # (`y * 2.0` is f32, `y * x` with `x: f64` is f64), not the left type.
@@ -6196,7 +6210,7 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         # types it TYPE_BOOL.  Sema annotates the slot (AGAST #4404).
         if e.op >= OP_EQ and e.op <= OP_GE
             return expr_slot_ty(e)
-        return get_expr_type(s, e.left)  # Binary ops preserve left type (simplified)
+        return synth_slot_ty(s, e.left)  # Binary ops preserve left type (simplified)
     else if e.kind == EXPR_MEMBER
         # Look up the field type through the whole receiver chain.  Without
         # nesting, get_expr_type returns TYPE_I64 for `e.left.ident_ptr`, so

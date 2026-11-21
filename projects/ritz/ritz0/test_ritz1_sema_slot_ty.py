@@ -1,24 +1,31 @@
-"""AGAST #4404 (#1816): Sema annotates the slot type the emitter reads.
+"""AGAST #4404 / #4410 (#1816): Sema annotates the slot type the emitter reads.
 
 THE CHANGE
 
-`get_expr_type` (emitter_core.ritz) is the emitter's typer; it reads
-EmitterState mid-lowering.  #1816 moves typing onto Sema.  This first slice
-takes the arms whose answer the node alone decides -- literals, a cast's
-written target, a comparison's i64 bool slot (#1646), and `@` / `@&` / `not`
-/ `~` -- and moves their rule to `expr_local_slot_ty` (ast_query.ritz).
-sema_walk records it on every expression it reaches in `Expr.sema_ty`
-(`sema_note_expr_ty`), and get_expr_type's arms now read that annotation
-through `expr_slot_ty` instead of carrying their own copy.  A node built
-after the walk (a print placeholder's parsed expression) has no record, so
-`expr_slot_ty` falls back to the same node-local rule: no EmitterState either
-way.
+`get_expr_type` (emitter_core.ritz) was the emitter's typer; it read
+EmitterState mid-lowering.  #4404 moved the arms whose answer the node alone
+decides -- literals, a cast's written target, a comparison's i64 bool slot
+(#1646), and `@` / `@&` / `not` / `~` -- to `expr_local_slot_ty`
+(ast_query.ritz).  #4410 moved the rest onto Sema: identifiers, indexing,
+deref, arithmetic, member access, calls and method calls are typed by
+`sema_slot_ty` (sema_type.ritz) from Sema's typed scope.  sema_walk records
+the answer on every expression it reaches in `Expr.sema_ty`
+(`sema_note_expr_ty`), and every former call site reads it through
+`expr_slot_ty`.
 
-Byte-identical IR is the load-bearing requirement: the three tests below pin
+`get_expr_type` is gone.  The one emitter-side typer left is
+`synth_slot_ty`, which types only nodes built after the walk -- a print
+placeholder's parsed expression -- and notes their slots at construction.
+`expr_slot_ty` still falls back to `expr_local_slot_ty` for any node with no
+record.
+
+Byte-identical IR is the load-bearing requirement: the tests below pin
 (a) which nodes Sema annotates and with what, (b) that an annotation never
-changes the emitted IR, and (c) the emit-time nodes that only the fallback
-can type (the `ritzlib/iovec.ritz` regression this slice hit: a print
-placeholder's `{x as i64}` parsed after the walk printed as `?`).
+changes the emitted IR, (c) the emit-time nodes the construction-time typer
+covers (the `ritzlib/iovec.ritz` regression: a print placeholder's
+`{x as i64}` parsed after the walk printed as `?`), (d) Sema's slot agrees
+with the emitter's typer on the whole matrix corpus, and (e) `get_expr_type`
+and its call sites are gone.
 """
 
 import os
@@ -36,10 +43,10 @@ COMPILERS = ["ritz1", "ritz1_selfhosted"]
 
 # TYPE_* and EXPR_* (ritz1/src/ast.ritz).
 UNKNOWN, I32, I64, U8, BOOL, PTR, MUT_REF = -1, 1, 2, 3, 4, 5, 103
-STRUCT, F64 = 100, 13
+STRUCT, ARRAY, F64 = 100, 101, 13
 E_INT, E_STRING, E_NIL, E_IDENT, E_BINARY = 1, 2, 3, 4, 5
 E_UNARY, E_CALL, E_CAST, E_INDEX, E_MEMBER = 6, 7, 8, 9, 10
-E_CHAR, E_CSTRING, E_FLOAT = 13, 16, 20
+E_STRUCT_LIT, E_CHAR, E_CSTRING, E_FLOAT = 11, 13, 16, 20
 
 SHAPES = """\
 struct P
@@ -50,6 +57,7 @@ fn id(n: i64) -> i64
 
 fn main() -> i32
     var v: i32 = 3
+    var w: i32 = 5
     let b: bool = v < 4
     var p: P = P { x: 5 }
     let q: *P = @p
@@ -66,6 +74,10 @@ fn main() -> i32
     let st = "x"
     let m: i32 = p.x
     let call: i64 = id(nb)
+    let pw: *i32 = @w
+    let dw: i32 = *pw
+    let fa: f64 = 1.0 + 2.0
+    let ia: u8 = u8v + 1
     ((r as i64) * 0 + (q as i64 as *P as i64) * 0) as i32
 """
 
@@ -79,13 +91,18 @@ SLOTS = {
     E_CSTRING: {PTR},
     E_NIL: {PTR},
     E_CAST: {I32, I64, U8, PTR},
-    E_UNARY: {PTR, MUT_REF, I64},   # @, @&, not / ~ -- never a deref
-    E_BINARY: {I64},                # a comparison's bool slot; arithmetic stays unknown
+    E_UNARY: {I32, PTR, MUT_REF, I64},  # @, @&, not / ~, and a scalar deref
+    E_BINARY: {I64, F64, U8},            # comparison, float / narrow arithmetic
+    E_IDENT: {I32, I64, U8, PTR, STRUCT, ARRAY, MUT_REF},
+    E_CALL: {I64},
+    E_INDEX: {I64},
+    E_MEMBER: {I32},
+    E_STRUCT_LIT: {I64},                # the emitter's default
 }
 
-# Kinds whose slot needs Sema's scope: the rest of #4404.  They are annotated
-# (TYPE_UNKNOWN) but must not print a slot, and the emitter still types them.
-NO_SLOT = {E_IDENT, E_CALL, E_INDEX, E_MEMBER}
+# Kinds whose slot needed Sema's scope: the rest of #4404.  They all print a
+# slot now (AGAST #4410), so none is left here.
+NO_SLOT = set()
 
 SLOT = re.compile(r"^sema-slot: (\d+):(\d+) e(\d+) (-?\d+)$", re.M)
 
@@ -103,7 +120,7 @@ fn main() -> i32
 
 
 def _probe(value):
-    return dict(os.environ, RITZ1_SEMA_PROBE=value)
+    return dict(os.environ, RITZ_PATH=str(RITZ_ROOT), RITZ1_SEMA_PROBE=value)
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
@@ -155,3 +172,50 @@ def test_a_print_placeholder_still_prints(request, tmp_path, compiler):
     out = comp.stdout + comp.stderr
     assert comp.returncode == 0 and ll.exists(), \
         f"{compiler}: a placeholder's post-walk cast lost its slot:\n{out}"
+
+
+SLOT_SUMMARY = re.compile(r"sema-probe-slot: (\d+) compared, (\d+) mismatched, "
+                          r"(\d+) lenient")
+SLOT_CORPUS_FLOOR = 15000
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_sema_slot_agrees_with_the_emitter_on_the_matrix_corpus(request, tmp_path, compiler):
+    """The whole former get_expr_type rule, checked against the emitter's own
+    typer on every expression it lowers.  This is the slot half of the probe's
+    coverage; test_ritz1_sema_type.py holds the source-type half."""
+    request.getfixturevalue("ritz1_bin")
+    binary = RITZ1_BUILD / compiler
+    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+    # A private cache: the corpus is also run by test_ritz1_sema_type.py with
+    # the same probe, and a shared cache would skip the second run and print
+    # no summary.
+    env = dict(_probe("1"), RITZ_CACHE_DIR=str(tmp_path / "slot-cache"))
+    compared = 0
+    mismatches = []
+    unsummarised = []
+    for src in sorted((RITZ_ROOT / "ritz0" / "test").glob("*.ritz")):
+        comp = subprocess.run([str(binary), str(src), "-o", str(tmp_path / "out.ll")],
+                              cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
+        out = comp.stdout + comp.stderr
+        mismatches += [ln for ln in out.splitlines() if ln.startswith("slot at ")]
+        summary = SLOT_SUMMARY.search(out)
+        if summary:
+            compared += int(summary.group(1))
+            assert summary.group(2) == "0", f"{compiler}: {src.name}\n{summary.group(0)}"
+        elif comp.returncode == 0:
+            unsummarised.append(src.name)
+    assert not mismatches, f"{compiler}: Sema's slot and the emitter disagree:\n" + "\n".join(mismatches)
+    assert not unsummarised, f"{compiler}: compiled without a probe summary: {unsummarised}"
+    assert compared >= SLOT_CORPUS_FLOOR, f"{compiler}: only {compared} slots compared"
+
+
+def test_get_expr_type_and_its_call_sites_are_gone():
+    src = RITZ_ROOT / "ritz1" / "src"
+    hits = []
+    for path in src.glob("*.ritz"):
+        for i, line in enumerate(path.read_text().splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if "get_expr_type" in code:
+                hits.append(f"{path.name}:{i}: {line.strip()}")
+    assert not hits, "get_expr_type is gone; these still name it:\n" + "\n".join(hits)

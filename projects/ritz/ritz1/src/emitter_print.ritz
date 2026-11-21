@@ -287,6 +287,28 @@ fn fmt_method_expr(recv: *Expr, name: *u8, name_len: i32, args: *Expr, span: Src
     e.span = span
     e
 
+# AGAST #4410: a placeholder's expression is parsed *after* the Sema walk, so
+# no node in it carries Sema's slot annotation.  Note the emitter's slot type
+# on each node here, at construction, so the emit path's expr_slot_ty reads a
+# real type instead of the node-local fallback (the `?` an unannotated
+# identifier printed, ritzlib/iovec.ritz's regression under #4404).
+fn fmt_note_slots(s: *EmitterState, e: *Expr)
+    if e == null
+        return
+    expr_note_sema_ty(e, synth_slot_ty(s, e))
+    fmt_note_slots(s, e.left)
+    fmt_note_slots(s, e.right)
+    fmt_note_slots(s, e.operand)
+    fmt_note_slots(s, e.args)
+    fmt_note_slots(s, e.next)
+
+# interp_parse_expr, with the parsed nodes' slot types noted.
+fn fmt_parse(s: *EmitterState, text: *u8, len: i32, line: i32, col: i32) -> *Expr
+    let e: *Expr = interp_parse_expr(text, len, line, col)
+    if e != null
+        fmt_note_slots(s, e)
+    e
+
 # The Ritz type of `e`'s value and the name a Display/Debug impl for it would
 # be registered under (null when none is derivable).
 struct FmtType
@@ -324,7 +346,7 @@ fn fmt_type_of(s: *EmitterState, e: *Expr, out: *FmtType)
         out.name_len = 4
         out.is_bool = 1
         return
-    let t: i32 = get_expr_type(s, e)
+    let t: i32 = expr_slot_ty(e)
     if t == TYPE_REF or t == TYPE_MUT_REF
         out.kind = t
         if e.kind == EXPR_IDENT
@@ -696,7 +718,7 @@ fn fmt_explicit_writer(s: *EmitterState, writer_expr: *Expr, sink: *PrintSink, s
     let st: *StructDef = fmt_writer_shape(s, span, @isink, @ifd, @ilen)
     if st == null
         return 0
-    let t: i32 = get_expr_type(s, writer_expr)
+    let t: i32 = expr_slot_ty(writer_expr)
     if t != TYPE_MUT_REF and t != TYPE_REF and t != TYPE_PTR and t != TYPE_PTR_PTR
         fmt_error_at(s, span, c"write/writeln needs a Writer as its first argument (`write(@&w, \"...\")`)")
         return 0
@@ -1198,7 +1220,7 @@ fn emit_interp_print(s: *EmitterState, sink: *PrintSink, lit: *Expr, newline: i3
                 let spec: *u8 = ptext + colon + 1
                 let slen: i32 = plen - colon - 1
                 if slen == 1 and *spec == 63
-                    let e: *Expr = interp_parse_expr(ptext, colon, lit.span.line, lit.span.col)
+                    let e: *Expr = fmt_parse(s, ptext, colon, lit.span.line, lit.span.col)
                     if e == null
                         emit_print_error(s, lit, c"invalid interpolation expression: a `{...}` placeholder must hold exactly one expression (write `{{` for a literal brace)")
                     else
@@ -1206,7 +1228,7 @@ fn emit_interp_print(s: *EmitterState, sink: *PrintSink, lit: *Expr, newline: i3
                 else
                     emit_spec_error(s, lit, ptext, colon, spec, slen)
             else
-                let e: *Expr = interp_parse_expr(ptext, plen, lit.span.line, lit.span.col)
+                let e: *Expr = fmt_parse(s, ptext, plen, lit.span.line, lit.span.col)
                 if e == null
                     emit_print_error(s, lit, c"invalid interpolation expression: a `{...}` placeholder must hold exactly one expression (write `{{` for a literal brace)")
                 else
@@ -1327,7 +1349,7 @@ fn emit_interp_literal(s: *EmitterState, fd: i64, k: *FmtSink, lit: *Expr) -> i3
             if colon >= 0
                 emit_spec_error(s, lit, ptext, colon, ptext + colon + 1, plen - colon - 1)
             else
-                let e: *Expr = interp_parse_expr(ptext, plen, lit.span.line, lit.span.col)
+                let e: *Expr = fmt_parse(s, ptext, plen, lit.span.line, lit.span.col)
                 if e == null
                     emit_print_error(s, lit, c"invalid interpolation expression: a `{...}` placeholder must hold exactly one expression (write `{{` for a literal brace)")
                 else
@@ -1501,9 +1523,9 @@ fn assert_write_own_loc(s: *EmitterState, line: i32)
     assert_write_val(s, 0, line as i64, ASSERT_V_SIGNED)
     assert_write_c(s, c": ")
 
-# How a failing assert prints an operand of type get_expr_type(e); -1: not.
+# How a failing assert prints an operand of type expr_slot_ty(e); -1: not.
 fn assert_operand_kind(s: *EmitterState, e: *Expr) -> i32
-    let t: i32 = get_expr_type(s, e)
+    let t: i32 = expr_slot_ty(e)
     if t == TYPE_BOOL
         return ASSERT_V_BOOL
     if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF
@@ -2038,7 +2060,7 @@ fn fmt_push_value(s: *EmitterState, k: *FmtSink, lit: *Expr, e: *Expr) -> i32
         fmt_push(s, k, ptr, len, 0)
         return 1
 
-    let ty: i32 = get_expr_type(s, e)
+    let ty: i32 = expr_slot_ty(e)
     if interp_is_bool(s, e) == 1
         let v: i32 = emit_expr(s, e)
         let b: i32 = next_reg(s)

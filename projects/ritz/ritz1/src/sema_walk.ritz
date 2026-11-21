@@ -379,7 +379,69 @@ fn sema_bind_decl(sm: *Sema, st: *Stmt)
         if t.fn_sig == null and init != null and init.kind == EXPR_IDENT and sema_find_local(sm, init.ident_ptr, init.ident_len) == null
             t.fn_sig = sema_find_fn(sm, init.ident_ptr, init.ident_len)
     sema_bind_ty(sm, st.var_name, st.var_name_len, @t, st.var_is_let)
+    # AGAST #4410: `let r = @q` with `q` a scalar `*T` is a `**T` held as a
+    # PTR_PTR local (the emitter's infer_ref_to_scalar_pointer_let), so `**r`
+    # reads a T.  Sema's source typer has only the `@`'s PTR.
+    if st.var_declared_type == TYPE_VOID and sm.scope_top > 0 and st.var_init != null
+        if st.var_init.kind == EXPR_UNARY and (st.var_init.op == OP_ADDR or st.var_init.op == OP_ADDR_MUT) and st.var_init.operand != null and st.var_init.operand.kind == EXPR_IDENT
+            let src: *SemaVar = sema_find_local(sm, st.var_init.operand.ident_ptr, st.var_init.operand.ident_len)
+            if src != null and (src.kind == TYPE_PTR or src.kind == TYPE_PTR_PTR) and src.type_name_len == 0
+                var inner: i32 = src.pointee
+                if src.kind == TYPE_PTR_PTR
+                    inner = src.inner
+                let leaf: i32 = inner % PTR_DEPTH_UNIT
+                if leaf >= TYPE_I32 and leaf <= TYPE_F64 and leaf != TYPE_PTR and leaf != TYPE_PTR_PTR
+                    if src.kind == TYPE_PTR_PTR
+                        inner = inner + PTR_DEPTH_UNIT
+                    let lv0: *SemaVar = @sm.scope[sm.scope_top - 1]
+                    lv0.kind = TYPE_PTR_PTR
+                    lv0.pointee = TYPE_PTR
+                    lv0.inner = inner
+    # AGAST #4410: an unannotated local's slot is its initialiser's, which
+    # emit_var_decl infers (a float method's width, else i64).  The initialiser
+    # has been walked and annotated, so read that here.
+    if st.var_declared_type == TYPE_VOID and sm.scope_top > 0
+        let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
+        let af: i32 = sema_arm_float_slot(sm, st.var_init)
+        if af != 0
+            lv.init_slot = af     # a float if / match slot (last_match_float_ty)
+        else
+            lv.init_slot = expr_sema_ty(st.var_init)
+            # AGAST #4410: Sema's source typer leaves a deref init unknown, but
+            # emit_var_decl infers its pointee (`let v = **r` is a T).  The slot
+            # typer resolves it; an if / match / array literal keeps its own
+            # rule above.
+            if lv.init_slot == TYPE_UNKNOWN and st.var_init != null
+                let ik: i32 = st.var_init.kind
+                if ik != EXPR_IF and ik != EXPR_MATCH and ik != EXPR_ARRAY_LIT and ik != EXPR_ARRAY_FILL
+                    lv.init_slot = sema_slot_ty(sm, st.var_init)
+            # AGAST #4410: `let q = a[1]` with `a:& [N]*T` is the emitter's
+            # element (`a *T`).  Only the borrow-param array view needs this:
+            # other bases keep Sema's source typing (and the emitter's own
+            # inference mirrors it).
+            if st.var_init != null and st.var_init.kind == EXPR_INDEX and st.var_init.left != null and st.var_init.left.kind == EXPR_IDENT and st.var_init.right != null and st.var_init.right.kind != EXPR_RANGE
+                let src: *SemaVar = sema_find_local(sm, st.var_init.left.ident_ptr, st.var_init.left.ident_len)
+                if src != null and src.kind == TYPE_UNKNOWN and src.lent != null and src.lent.param_pointee_type == TYPE_ARRAY
+                    lv.init_slot = src.lent.param_pointee_array_elem_type
+                    if src.lent.param_pointee_array_elem_pointee != TYPE_VOID
+                        lv.pointee = src.lent.param_pointee_array_elem_pointee
+        # AGAST #4410: an untyped `let a = [@p, ..]` is an `[N]*T`; keep the
+        # element's pointee T so `*a[i]` loads its width.
+        if st.var_init != null and (st.var_init.kind == EXPR_ARRAY_LIT or st.var_init.kind == EXPR_ARRAY_FILL)
+            var first: *Expr = st.var_init.args
+            if st.var_init.kind == EXPR_ARRAY_FILL
+                first = st.var_init.left
+            if first != null
+                var ft: SemaTy
+                sema_expr_ty(sm, first, @ft)
+                if ft.kind == TYPE_PTR or ft.kind == TYPE_REF or ft.kind == TYPE_MUT_REF
+                    lv.pointee = ft.pointee
     sema_index_note_decl(sm, st)   # its element, for sema_elem_ty (AGAST #3943)
+    # AGAST #4428: an unannotated `let q = <array element>` / `@<element>` /
+    # `*<**T>` takes the emitter's inferred type (infer_array_elem_let /
+    # infer_elem_ptr_ptr_let), so `*q` / `**q` read the element's width.
+    # After sema_index_note_decl, whose pointer-copy arm clears index_elem.
+    sema_note_elem_init(sm, st)
 
 # `for x in it`: x is an element of `it` (or of what `@it` / `@&it` points
 # at), read outside the loop's binding; a range's x is left unknown.
@@ -392,6 +454,27 @@ fn sema_bind_for(sm: *Sema, st: *Stmt)
             it = it.operand
         sema_elem_ty(sm, it, @t)
     sema_bind_ty(sm, st.for_var, st.for_var_len, @t, 0)
+    # AGAST #4410: an element of a `[N]*U` array (`for p in w.a`, `for p in T`)
+    # is a `*U`; record U so `*p` keeps its width (the emitter's
+    # LocalVar.pointee_type).  An array-literal iterable (`for x in [1.5, ..]`)
+    # takes its element's slot.
+    if st.for_end == null and sm.scope_top > 0
+        let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
+        var itv: *Expr = st.for_start
+        if itv != null and itv.kind == EXPR_UNARY and (itv.op == OP_ADDR or itv.op == OP_ADDR_MUT)
+            itv = itv.operand
+        if itv != null
+            let ep: i32 = sema_iter_pointee(sm, itv)
+            if ep != TYPE_VOID
+                lv.pointee = ep
+            let es: i32 = sema_iter_elem_slot(sm, itv)
+            if es != TYPE_UNKNOWN
+                lv.init_slot = es
+    # AGAST #4410: a range's variable is the bound's slot (the emitter takes it
+    # from `0..n`'s n), which sema_elem_ty leaves unknown for a range.
+    if st.for_end != null and sm.scope_top > 0
+        let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
+        lv.init_slot = expr_sema_ty(st.for_end)
 
 # `let (a, b, ..) = init`: each binding is its field of init's tuple struct,
 # typed before any is bound.
@@ -401,16 +484,30 @@ fn sema_bind_tuple(sm: *Sema, st: *Stmt)
     var t: SemaTy
     sema_tuple_field_ty(sm, @tup, 0, @t)
     sema_bind_ty(sm, st.var_name, st.var_name_len, @t, 0)
+    sema_tuple_inner_note(sm, @tup, 0)
     sema_tuple_field_ty(sm, @tup, 1, @t)
     sema_bind_ty(sm, st.assign_target, st.assign_target_len, @t, 0)
+    sema_tuple_inner_note(sm, @tup, 1)
     bool_note_tuple(sm, st)
     var i: i32 = 2
     var tn: *TupleName = st.tuple_more   # AGAST #109
     while tn != null
         sema_tuple_field_ty(sm, @tup, i, @t)
         sema_bind_ty(sm, tn.name, tn.len, @t, 0)
+        sema_tuple_inner_note(sm, @tup, i)
         tn = tn.next
         i += 1
+
+# AGAST #4428: a `**T` tuple element binds with its packed inner, so `**w`
+# (a `let (w, ..)` of a `(**u8, i32)`) loads a u8, as the emitter's binding
+# records it.
+fn sema_tuple_inner_note(sm: *Sema, tup: *SemaTy, i: i32)
+    if sm.scope_top <= 0
+        return
+    let inner: i32 = sema_tuple_field_inner(sm, tup, i)
+    if inner != TYPE_VOID
+        let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
+        lv.inner = inner
 
 fn sema_bind_param(sm: *Sema, p: *Param)
     var t: SemaTy

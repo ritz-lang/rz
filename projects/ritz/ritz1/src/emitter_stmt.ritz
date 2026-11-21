@@ -654,7 +654,7 @@ fn infer_array_elem_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     var ei_sum: Expr
     var ei_deref: Expr
     if init.kind == EXPR_UNARY and (init.op == OP_ADDR or init.op == OP_ADDR_MUT) and is_array_elem_index(s, init.operand) == 1
-        elem_index_as_deref(init.operand, @ei_sum, @ei_deref)
+        elem_index_as_deref(s, init.operand, @ei_sum, @ei_deref)
         init = @ei_sum
     var name: *u8 = null
     var name_len: i32 = 0
@@ -686,7 +686,7 @@ fn infer_elem_ptr_ptr_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     var ei_sum: Expr
     var ei_deref: Expr
     if is_ptr_ptr_elem_index(s, init) == 1
-        elem_index_as_deref(init, @ei_sum, @ei_deref)
+        elem_index_as_deref(s, init, @ei_sum, @ei_deref)
         init = @ei_deref
     let levels: i32 = ptr_levels_of(s, init, @inner, @name, @name_len)
     if levels == 0 or inner == TYPE_VOID
@@ -776,7 +776,7 @@ fn inferred_int_init(s: *EmitterState, stmt: *Stmt, int_kind: i32) -> i32
         return TYPE_VOID
     if stmt.var_init.kind == EXPR_INT_LIT
         return TYPE_VOID
-    let t: i32 = get_expr_type(s, stmt.var_init)
+    let t: i32 = expr_slot_ty(stmt.var_init)
     if t == TYPE_F32 or t == TYPE_F64
         return TYPE_VOID
     var uns: i32 = 0
@@ -2091,6 +2091,25 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     if infer_field_ref_let(s, stmt, @dt) == 1   # #2400: `@&p.f`, a scalar field
         var_type = dt.var_type
 
+    # AGAST #4428: an array-element / element-address initialiser Sema typed
+    # (sema_note_elem_init).  The arms above need a base their own views
+    # record, which a `& [N]**T` borrow param is not, so `let r = b[i]` stayed
+    # an i64 and `**r` stored through garbage.  Applied only when nothing
+    # above typed the binding.
+    if var_type == TYPE_I64 and dt.var_type == TYPE_I64 and dt.var_type_name_len == 0 and stmt.var_init != null and stmt.var_init.sema_levels > 0
+        let lvls: i32 = stmt.var_init.sema_levels
+        if lvls == 1
+            var_type = TYPE_PTR
+            dt.var_type = TYPE_PTR
+            dt.var_pointee_type = stmt.var_init.sema_inner
+        else
+            var_type = TYPE_PTR_PTR
+            dt.var_type = TYPE_PTR_PTR
+            dt.var_pointee_type = TYPE_PTR
+            dt.var_inner_pointee_type = stmt.var_init.sema_inner + (lvls - 2) * PTR_DEPTH_UNIT
+        dt.var_type_name = stmt.var_init.sema_ptr_name
+        dt.var_type_name_len = stmt.var_init.sema_ptr_name_len
+
     # `let task = @member.field[i]` — when the indexed field is an array
     # of struct, infer the local as `*ElementStruct` so subsequent
     # `task.state` member access resolves.  Without this, the local was
@@ -2153,7 +2172,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     # `store i64 <float>`.  A pre-emitted match / if already published its
     # phi type above, so it is not re-typed here.
     if var_type == TYPE_I64 and dt.var_type_name_len == 0 and stmt.var_init != null and pre_emitted == 0
-        let init_fty: i32 = get_expr_type(s, stmt.var_init)
+        let init_fty: i32 = expr_slot_ty(stmt.var_init)
         if init_fty == TYPE_F32 or init_fty == TYPE_F64
             var_type = init_fty
             dt.var_type = init_fty
@@ -2470,7 +2489,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             # narrow to f32 via fptrunc when the binding is f32-typed.
             # The init reg is `double` — same alloca slot is `float`.
             var stored_reg: i32 = int_to_float_slot(s, init_reg, TYPE_F32, stmt.var_init)
-            let init_ty: i32 = get_expr_type(s, stmt.var_init)
+            let init_ty: i32 = expr_slot_ty(stmt.var_init)
             if init_ty == TYPE_F64
                 stored_reg = next_reg(s)
                 emit_str(s, c"  ")
@@ -2586,7 +2605,7 @@ fn emit_through_index_assign(s: *EmitterState, stmt: *Stmt) -> i32
     if through == null
         return 0
     var th: ThroughIndex
-    index_through_fill(@target, through_spill(s, through), @th)
+    index_through_fill(s, @target, through_spill(s, through), @th)
     var store: Stmt
     memset(@store as *u8, 0, sizeof(Stmt))
     store.kind = STMT_ASSIGN
@@ -2671,14 +2690,14 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         var ei_deref: Expr
         # AGAST #3058: so is `b[i][j] = v` with `b: [N]**T`, a store to a `*T`.
         if is_array_elem_index(s, target_expr) == 1 or is_ptr_ptr_elem_index(s, target_expr) == 1
-            elem_index_as_deref(target_expr, @ei_sum, @ei_deref)
+            elem_index_as_deref(s, target_expr, @ei_sum, @ei_deref)
             target_expr = @ei_deref
 
         # AGAST #2440: `(*p)[i] = v`, as `p[i] = v`.
         var th: ThroughIndex
         let through: *LocalVar = index_through(s, target_expr)
         if through != null
-            index_through_fill(target_expr, through_spill(s, through), @th)
+            index_through_fill(s, target_expr, through_spill(s, through), @th)
             target_expr = @th.deref
 
         # AGAST #2545: `(*r)[i] = v` with `r: **T` GEPs and stores T, as
@@ -3504,7 +3523,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             var ret_th: ThroughIndex
             let ret_through: *LocalVar = index_through(s, ret_val)
             if ret_through != null and ret_through.array_view == 1
-                index_through_fill(ret_val, through_spill(s, ret_through), @ret_th)
+                index_through_fill(s, ret_val, through_spill(s, ret_through), @ret_th)
                 ret_val = @ret_th.deref
             # Check if return value is a dereference (e.g., *ptr or *(ptr + offset))
             if ret_val.kind == EXPR_UNARY and ret_val.op == OP_DEREF
@@ -4017,7 +4036,7 @@ fn scalar_elem_kind(s: *EmitterState, first: *Expr) -> i32
     let k: i32 = bool_kind(s, first)
     if k == BK_BOOL
         return TYPE_BOOL
-    let t: i32 = get_expr_type(s, first)
+    let t: i32 = expr_slot_ty(first)
     if k == BK_FLOAT
         if t == TYPE_F32
             return TYPE_F32
