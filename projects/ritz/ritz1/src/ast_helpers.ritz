@@ -5318,7 +5318,7 @@ fn tuple_split_pair(e: *Expr, n: i32) -> i32
 # pattern_span) never does.
 fn tuple_split_arm_binds_none(arm: *MatchArm) -> i32
     let k: i32 = arm.pattern_kind
-    if k == PAT_INT_LIT or k == PAT_WILDCARD or k == PAT_BOOL or k == PAT_STR
+    if k == PAT_INT_LIT or k == PAT_WILDCARD or k == PAT_BOOL or k == PAT_STR or k == PAT_CHAR
         return 1
     if k == PAT_VARIANT
         return (arm.pattern_inner_kind != PAT_IDENT) as i32
@@ -7016,23 +7016,26 @@ pub fn expr_string(p: *Parser, tok: Token) -> *Expr
     e.next = null
     return e
 
+# The byte a TOK_CHAR token denotes, its escapes cooked.  One reader for both
+# a char expression and a char pattern, so `'\x41' =>` is the int `'A' =>` is.
+pub fn char_token_value(tok: Token) -> i64
+    # Token format: 'x' or '\n' etc.
+    let src: *u8 = tok.start
+    if tok.len == 3
+        # Simple char: 'x'
+        return *(src + 1) as i64
+    if tok.len >= 4
+        # Escaped char: '\n', '\\', '\e', '\x1B' ...  The lexer already rejected
+        # a bad escape (AGAST #1978, #1872), so the shared table always cooks.
+        return lexer_cook_escape_at(src + 2, (tok.len - 3) as i64, 1) as i64
+    0
+
 pub fn expr_char(p: *Parser, tok: Token) -> *Expr
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     e.kind = EXPR_CHAR_LIT
     e.span.line = tok.line
     e.span.col = tok.col
-    # Character value: either raw char or escaped
-    # Token format: 'x' or '\n' etc.
-    let src: *u8 = tok.start
-    var c: i64 = 0
-    if tok.len == 3
-        # Simple char: 'x'
-        c = *(src + 1) as i64
-    else if tok.len >= 4
-        # Escaped char: '\n', '\\', '\e', '\x1B' ...  The lexer already rejected
-        # a bad escape (AGAST #1978, #1872), so the shared table always cooks.
-        c = lexer_cook_escape_at(src + 2, (tok.len - 3) as i64, 1) as i64
-    e.int_val = c
+    e.int_val = char_token_value(tok)
     e.next = null
     return e
 
@@ -8240,6 +8243,15 @@ pub fn match_arm_set_block_tail(p: *Parser, arm: *MatchArm, stmts: *Stmt) -> *Ma
 # parse it into an i64 here so the action stays a single function call.
 pub fn pattern_lit_int(p: *Parser, start: *u8, len: i32) -> *MatchArm
     return match_arm_int(p, parse_int(start, len))
+
+# pattern : CHAR  →  PAT_CHAR, its byte in pattern_int.  A char literal is u8
+# (§2.6), so its pattern is an integer literal pattern typed u8 (LANGUAGE_SPEC
+# §8.2, LARB R72, AGAST #4196): it compares as PAT_INT_LIT does, and only a u8
+# scrutinee takes it (match_check_reachable).
+pub fn pattern_char(p: *Parser, tok: Token) -> *MatchArm
+    let a: *MatchArm = match_arm_int(p, char_token_value(tok))
+    a.pattern_kind = PAT_CHAR
+    return a
 
 # pattern : TRUE | FALSE  →  PAT_BOOL.  A PAT_INT_LIT of 1 or 0 would not do:
 # a bool match must be covered by `true` and `false`, not by the integers they

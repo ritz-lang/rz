@@ -614,8 +614,14 @@ class IdentPattern(Pattern):
 
 @dataclass
 class LitPattern(Pattern):
-    """Literal pattern: 42, "hello", true."""
+    """Literal pattern: 42, "hello", true, '('.
+
+    `is_char` marks a pattern written as a char literal (`'(' =>`): it is an
+    integer literal pattern typed u8 (§2.6, LARB R72, AGAST #4196), so it
+    compares exactly as `40` does and only a u8 scrutinee takes it.
+    """
     value: Any
+    is_char: bool = False
 
 
 @dataclass

@@ -3800,6 +3800,34 @@ fn main() -> i32
     0
 ```
 
+A character literal is `u8` (§2.6), so a character literal pattern is an
+integer literal pattern typed `u8` (LARB R72): it tests a `u8` scrutinee
+exactly as the integer its byte denotes would, under the same catch-all and
+repeated-arm rules. `'(' => …` and `40 => …` are the same test, so one after
+the other is an unreachable arm. A character pattern on any other scrutinee —
+an `i32`, `i64`, `bool`, `StrView` or enum — is a compile error at the pattern.
+
+```ritz
+fn kind(c: u8) -> i32
+    match c
+        '(' => 1
+        ')' => 2
+        _ => 0
+
+fn main() -> i32
+    kind('(') * 10 + kind(')')
+```
+
+```ritz expect-error="a character pattern needs a u8 scrutinee"
+fn f(n: i64) -> i32
+    match n
+        '(' => 1
+        _ => 0
+
+fn main() -> i32
+    f(40)
+```
+
 A string literal pattern compares a `StrView` scrutinee, byte for byte: the
 lengths are equal and so is every byte (AGAST #1876). Like an integer, a
 `StrView` needs a catch-all, and a repeated literal is an unreachable arm

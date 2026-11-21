@@ -16681,6 +16681,10 @@ class LLVMEmitter:
         if isinstance(match_val.type, ir.IntType):
             return self._emit_integer_match(expr, match_val)
 
+        # A char pattern is refused on every scrutinee but a u8 (LARB R72,
+        # #4196); a type none of the above took (a pointer, say) says so at
+        # the pattern rather than with the generic "not supported" below.
+        self._refuse_char_arms(expr, False)
         raise NotImplementedError(f"Match on type {match_val.type} not yet supported")
 
     # The builtin constructors: (generic enum, which type argument the payload
@@ -17191,6 +17195,8 @@ class LLVMEmitter:
         """
         enum_type, variants = self.enum_types[enum_name]
         variant_names = {variant.name for variant in variants}
+        # A char pattern's own error, ahead of the generic literal one.
+        self._refuse_char_arms(expr, False)
         self._refuse_pattern_kind(expr, rast.LitPattern)
         self._refuse_arm_names(expr, lambda name: name in variant_names)
         names = [variant.name for variant in variants]
@@ -17408,6 +17414,21 @@ class LLVMEmitter:
         rast.VariantPattern: "a variant pattern needs an enum scrutinee",
         rast.LitPattern: "a literal pattern needs an integer scrutinee"}
 
+    # A char literal is u8 (§2.6), so only a u8 scrutinee takes its pattern
+    # (LARB R72, AGAST #4196). On anything else — a wider integer, bool,
+    # StrView or enum — it is an error at the pattern.
+    CHAR_PATTERN_NEEDS_U8 = "a character pattern needs a u8 scrutinee"
+
+    def _refuse_char_arms(self, expr: rast.Match, allow_u8: bool) -> None:
+        """Refuse a `'(' =>` pattern unless the scrutinee is a u8."""
+        if allow_u8:
+            return
+        for arm in expr.arms:
+            pattern = arm.pattern
+            if isinstance(pattern, rast.LitPattern) and pattern.is_char:
+                raise EmitError(self.CHAR_PATTERN_NEEDS_U8,
+                                pattern.span or arm.span)
+
     def _refuse_pattern_kind(self, expr: rast.Match, *kinds: type) -> None:
         """Refuse an arm whose pattern can't test this scrutinee (AGAST #2409).
 
@@ -17581,6 +17602,7 @@ class LLVMEmitter:
         """
         int_type = match_val.type
         is_bool = int_type == self.i1
+        self._refuse_char_arms(expr, int_type == ir.IntType(8))
         for arm in expr.arms:
             if (not is_bool and isinstance(arm.pattern, rast.LitPattern)
                     and isinstance(arm.pattern.value, bool)):
@@ -17694,6 +17716,7 @@ class LLVMEmitter:
         an integer, so every name binds the StrView. ritz1's twin is
         emit_str_pattern_test in emitter_match.ritz.
         """
+        self._refuse_char_arms(expr, False)
         for arm in expr.arms:
             pattern = arm.pattern
             if isinstance(pattern, rast.LitPattern) and not isinstance(pattern.value, str):

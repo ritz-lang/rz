@@ -1729,6 +1729,12 @@ class Parser:
         if self._at(TokenType.STRING):
             val = self._advance().value
             return rast.LitPattern(span, val)
+        # A char literal is u8 (§2.6), so a char pattern is an integer literal
+        # pattern typed u8 (LARB R72, AGAST #4196). It keeps the mark so the
+        # emitter can refuse it on a non-u8 scrutinee.
+        if self._at(TokenType.CHAR):
+            val = self._advance().value
+            return rast.LitPattern(span, val, is_char=True)
         if self._at(TokenType.TRUE):
             self._advance()
             return rast.LitPattern(span, True)
