@@ -2091,6 +2091,13 @@ own. For many concurrent tasks, use [async.tasks](#asynctasks).
 ```ritz
 import ritzlib.uring
 
+struct SpawnTask
+    f: @&Future
+    user_data: i64
+    state: i32
+    io_result: i32
+    io_ready: i32
+
 struct Runtime
     ring: IoUring
     initialized: i32
@@ -2100,6 +2107,9 @@ struct Runtime
     waker_io_ready: i32
     waker_active: i32
     took_pending_code: i32
+    spawn_tasks: [64]SpawnTask
+    spawn_count: i32
+    current_task: i32
 ```
 
 `waker_io_ready`, not the value of `waker_io_result`, says whether a completion
@@ -2107,6 +2117,15 @@ is waiting, so a read at EOF returns 0 rather than being resubmitted. A
 hand-written poll function that returns an -EPERM result it was handed is
 Ready(-1); the legacy poll-fn driver the examples and tests keep until #4009
 returns -1 instead of reading it as Pending (AGAST #2328).
+
+`spawn`/`run_spawned` queue several held futures on one runtime (LARB R79).
+Each queued task has its own waker slot (`SpawnTask`): while a task's poll
+runs, `current_task` names it, so `runtime_poll_*` records the operation's
+`user_data` and result in that task rather than the runtime's single waker.
+With `current_task` at -1 — `block_on` and the legacy poll-fn drivers — the
+single waker behaves exactly as before. `run_spawned` fails loudly (exit 101),
+as `block_on` does, when a poll reports Pending without suspending on the ring
+(LARB R78).
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -2116,6 +2135,8 @@ returns -1 instead of reading it as Pending (AGAST #2328).
 | `runtime_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> Result<i64, Errno>` | Write, waiting for the result |
 | `runtime_close` | `fn(rt: *Runtime, fd: i32) -> Result<(), Errno>` | Close, waiting for the result |
 | `block_on` | `fn(rt: *Runtime, f: @&Future)` | Poll a future to completion; read the result with `await p` (LARB R79) |
+| `spawn` | `fn(rt: *Runtime, f: @&Future)` | Queue a held future for `run_spawned`; the caller keeps it alive until the drain returns |
+| `run_spawned` | `fn(rt: *Runtime) -> i32` | Poll every spawned future until finished, waiting on the ring; 0 once the queue is drained |
 | `runtime_poll_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a read and return Pending, then return its result |
 | `runtime_poll_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a write and return Pending, then return its result |
 | `runtime_wait_for_io` | `fn(rt: *Runtime) -> i32` | Wait for a completion and record it for the waker |
