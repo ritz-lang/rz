@@ -531,7 +531,14 @@ vouches for that exact commit.
    A gate fix on `main` reaches you only when you rebase. No room reads
    `~/dev/ritz-lang/rz` any more, so it works unchanged under Borque's hostd.
    Run the wait in the foreground and repeat it on exit 124, which only means
-   the slice ran out. It runs a clean `make -C projects/ritz ci-local` over CI's `build-all`
+   the slice ran out. A budget-only verdict is terminal, not a retry, and must
+   not be conflated with the exit-124 wait: if the only failing step is
+   `[bootstrap] ritz0 unit tests`, the log prints a `test budget: … breach(es)`
+   line and pytest reports `0 failed`, then push, REAP quoting `EXIT=2
+   budget-only: <raw> / factor <f> = <norm> vs cap`, and do not re-gate or wait
+   for another slot (`rz` accepts that REAP). A `test budget: no calibration at
+   <path>` line is not this case: it is a host setup error, so fix the machine
+   and re-gate. It runs a clean `make -C projects/ritz ci-local` over CI's `build-all`
    and `bootstrap` jobs (#2141), one gate machine-wide, and exits with the
    gate's code (98 = no verdict, 99 = HEAD moved; neither passes). A
    `SETUP ERROR` line means a missing tool on this machine (e.g. lld-link
@@ -544,7 +551,7 @@ vouches for that exact commit.
    (#3568). Builds never go through it. If you touched packages
    outside `projects/ritz`, also `./rz build <pkg>` and run their tests;
    compare failures against `origin/main` before calling them pre-existing.
-   **Only exit 0 passes.**
+   **Only exit 0 passes, except the terminal budget-only verdict above.**
    Otherwise fix, re-squash, re-run.
 7. **Don't chase `main`.** REAP the commit you gated. `rz` usually lands it
    by cherry-picking it onto `main` in a batch with other rooms' commits and
@@ -576,7 +583,8 @@ vouches for that exact commit.
 mutation run or subagent finishes (#1533). Wait in the foreground, in slices
 under 10 minutes, for anything long. The harness ends a turn after 600s of
 silence on a background wait, and a `Monitor` or wakeup can be lost with it
-(#2333). The gate is detached, so `timeout` only ends the wait.
+(#2333). The gate is detached, so `timeout` only ends the wait. Polling a gate
+in the foreground is a legitimate wait, not a wedged room (AGAST #4423).
 
 **Writing under `.claude/` asks a human** for the `Write` tool and any `rm`,
 whatever your permissions say (#3568). Nobody answers a room, so you stall.
@@ -724,6 +732,16 @@ So:
 | `test-all` (`./rz test --all`) | yes (#3969, Aaron 2026-11-18) | yes |
 | `bootstrap` (matrix-full, regression.sh, ...) | yes | yes |
 | `read-set-audit` (strace of the two scoped regression steps) | no (#4315: ~15 min traced; it checks the gate's own skip rule, not the change) | yes |
+
+**A budget-only gate verdict is terminal, and `rz` accepts that REAP.** A gate
+can end `EXIT=2` with the only failing step `[bootstrap] ritz0 unit tests`, the
+log printing a `test budget: … breach(es)` line, and pytest reporting `0
+failed`: correctness passed and only the CPU budget cap was exceeded. The room
+pushes and REAPs quoting `EXIT=2 budget-only: <raw> / factor <f> = <norm> vs
+cap`; it must not re-gate or wait for another gate slot, and `rz` lands the
+commit like any other. Distinguish `test budget: no calibration at <path>`:
+that is a host setup error (fix the machine and re-gate), not this verdict.
+Polling a gate in the foreground is a legitimate wait, not a wedged room.
 
 `read-set-audit` is the one job the gate does not run. It traces
 "Regression harness self-tests" and "Differential corpus regression" and

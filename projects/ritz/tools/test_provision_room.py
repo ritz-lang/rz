@@ -403,3 +403,25 @@ def test_briefing_tells_rooms_to_script_rm_plus_background_kill():
     # ... and the two phrasings measured not to ask.
     assert "bash /tmp/" in para
     assert "own call" in para
+
+
+@pytest.mark.unit
+def test_briefing_says_budget_only_gate_verdict_is_terminal():
+    """AGAST #4423: a budget-only verdict is final, not a reason to re-queue."""
+    text = SKILL.read_text()
+    # The briefing template (fenced block through the remote additions).
+    brief_at = text.index("### The briefing (send verbatim")
+    brief_end = text.index("**Remote additions to the briefing**", brief_at)
+    briefing = text[brief_at:brief_end]
+    # Normalise the prose: it is hard-wrapped, so phrases straddle lines.
+    flat = " ".join(briefing.split())
+    # The terminal case, stated next to the exit-124 rule it is confused with.
+    assert "budget-only" in flat
+    assert "terminal" in flat
+    assert "0 failed" in flat
+    assert "do not re-gate" in flat
+    # The gate section must name it too, and say rz accepts such a REAP.
+    gate_at = text.index("### Gate coverage: what runs before a merge")
+    gate = " ".join(text[gate_at:].split())
+    assert "budget-only" in gate
+    assert "`rz` accepts" in gate
