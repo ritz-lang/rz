@@ -153,6 +153,11 @@
 #     Tests: test-run-gate.sh (section 22), test-train.sh (6b).
 #   * EXIT line always written, and --wait reports a unit that died without
 #     one (exit 98): "no verdict" must never read as "passed".
+#   * the identity (UNIT=, SHA=) is written again as a trailer immediately
+#     before EXIT=, and readers take its last occurrence (AGAST #4430): an
+#     operator session once truncated a live log mid-run and lost the header,
+#     making a valid EXIT=0 unusable.  --wait on a log with no UNIT= and no
+#     verdict says so (98) instead of reading "" as an inactive unit.
 #   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
 #     passed a bootstrap-only gate, and main's build-all was red for 9 runs.
 #     `rz build --all` honours the `build` known-failures.  A missing
@@ -165,7 +170,7 @@ GATES="${RZ_GATE_DIR:-$HOME/dev/ritz-lang/gate-logs}"
 
 if [[ "${1:-}" == "--wait" ]]; then
     LOG="${2:?usage: $0 --wait <log>}"
-    UNIT="$(sed -n 's/^UNIT=//p' "$LOG" | head -1)"
+    UNIT="$(sed -n 's/^UNIT=//p' "$LOG" | tail -1)"
     # The worktree this log gated, if the log is new enough to name it
     # (AGAST #4420; see the header).
     WT="$(sed -n 's/^WT=//p' "$LOG" | head -1)"
@@ -180,6 +185,15 @@ if [[ "${1:-}" == "--wait" ]]; then
     }
     trap 'scratch_clean' EXIT
     trap 'scratch_clean; exit 124' TERM INT
+    # An empty unit is not a live unit (AGAST #4430): with no UNIT= anywhere
+    # and no verdict, systemctl would read "" as inactive and this would call
+    # a possibly-live gate dead.  Say the log is headerless instead.  The
+    # gate writes the identity again as a trailer before EXIT=, so a header
+    # truncated mid-run still names the unit and SHA once it ends.
+    if [[ -z "$UNIT" ]] && ! grep -q '^EXIT=' "$LOG"; then
+        echo "GATE LOG HAS NO UNIT= (truncated?): $LOG" >&2
+        exit 98
+    fi
     while ! grep -q '^EXIT=' "$LOG"; do
         if ! systemctl --user is-active -q "$UNIT"; then
             sleep 2
@@ -538,6 +552,11 @@ if [ "$RZ_TRAIN" = 1 ]; then
     { date +%s > "$RES.$$" && mv -f "$RES.$$" "$RES"; } 2>/dev/null \
         || echo "warning: could not reserve the gate slot ($RES)" >> "$RZ_LOG"
 fi
+# The identity again, next to the verdict (AGAST #4430): a live log truncated
+# mid-run by an operator session lost its header, and a valid EXIT=0 was
+# refused for want of SHA=.  The trailer is authoritative; readers take the
+# last occurrence.  Written on every path that writes EXIT=.
+printf 'UNIT=%s\nSHA=%s\n' "$RZ_UNIT" "$RZ_SHA" >> "$RZ_LOG"
 echo "EXIT=$rc" >> "$RZ_LOG"
 EOF
 # By path, never as `bash -c "$INNER"` (AGAST #3567; see the header).

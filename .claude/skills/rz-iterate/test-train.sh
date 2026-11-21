@@ -913,6 +913,23 @@ rm -f "$T/queued-polls" "$T/rsystemctl-state"; grep -q '^EXIT=' "$rlog" || echo 
 bash "$TR" wait "$llog" >/dev/null 2>&1
 bash "$TR" land "$log1" >/dev/null 2>&1
 out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "^MERGED +eb2 " "the queued-then-passed remote verdict lands"
+
+# 11j. A remote gate log truncated mid-run keeps its identity in a trailer
+# next to the verdict (AGAST #4430): wait's SHA check and land read the LAST
+# SHA=, so a valid EXIT=0 isn't REFUSED for a lost header.  The stale first
+# SHA= stands for a header that survived the truncation.
+fetch; git -C "$M" checkout -q main
+two ja s/ja; bash "$TR" build "ja1:$c1" "ja2:$c2" >/dev/null 2>&1
+t="$(git -C "$T/train" rev-parse HEAD)"
+llog="$(bash "$TR" gate --next 2>/dev/null)"; rlog="$(specof | cut -d' ' -f3)"
+printf 'SHA=%s\nok Stage 1 output is identical with 1 and 8 jobs\nUNIT=%s\nSHA=%s\nEXIT=0\n' \
+    "$(git -C "$M" rev-parse origin/main)" "rz-test-4430-unit" "$t" > "$rlog"
+out="$(bash "$TR" wait "$llog" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && has "$out" "SHA=${t:0:12} EXIT=0$" \
+    "wait reads a truncated remote log's trailer SHA= (AGAST #4430)" \
+    || { bad "wait reads a truncated remote log's trailer SHA= (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+out="$(bash "$TR" land "$llog" 2>&1)"
+has "$out" "^MERGED +ja2 " "land reads a truncated log's trailer SHA="
 # 12. A passed train k lands trains 1..k at once (AGAST #4151, #4130): train
 # k is built on train k-1's tail, so its green gate tested every car of
 # trains 1..k.  The covered trains' gates are cancelled: the local unit

@@ -58,6 +58,10 @@ check '[[ "$(ls "$RZ_GATE_DIR"/t1-"$S12"*.log | wc -l)" -eq 2 ]]' "the gate dir 
 check 'grep -qx "EXIT=2" "$log1" && grep -qx "first run" "$log1"' "first log keeps its output and EXIT=2"
 check 'grep -qx "EXIT=0" "$log2" && ! grep -q "first run" "$log2"' "second log has only its own run"
 check '[[ "$(grep -c "^EXIT=" "$log1")" -eq 1 && "$(grep -c "^EXIT=" "$log2")" -eq 1 ]]' "one EXIT line per log"
+# 1b. The verdict trailer repeats the identity before EXIT=, so a reader whose
+# header was truncated still names the unit and commit (AGAST #4430).
+check '[[ "$(tail -3 "$log2" | tr "\n" " ")" == "UNIT=ritz-gate-t1 SHA=$SHA EXIT=0 " ]]' \
+    "the log ends with a UNIT=/SHA= trailer then EXIT="
 
 # 2. Names: <name>-<sha12>-<n>.log, so the REAP quote names one log and its SHA.
 check '[[ "$(basename "$log1")" =~ ^t1-${S12}-[0-9]+\.log$ ]]' "log name is <name>-<sha12>-<n>.log"
@@ -83,6 +87,32 @@ logm="$(RZ_GATE_CMD='echo b > b && git add b && git commit -qm move' gate "$W" t
 gate --wait "$logm" >/dev/null 2>&1; rc=$?
 check '[[ $rc -eq 99 ]]' "--wait exits 99 when HEAD moved, got $rc"
 check '[[ "$(basename "$logm")" =~ ^t2-${S12}-[0-9]+\.log$ ]]' "log is named for the SHA gated, not the moved HEAD"
+
+# 4b. A gate log truncated mid-run loses its header but keeps the identity in
+# a trailer next to the verdict (AGAST #4430: an operator session truncated a
+# live huburght log, and a valid EXIT=0 was refused for want of SHA=).  --wait
+# reads the LAST UNIT=, so the trailer still names the unit.
+tunit="ritz-gate-trunc-$S12"
+trunc="$RZ_GATE_DIR/truncated-$S12.log"
+printf 'ok Stage 1 output is identical with 1 and 8 jobs\nUNIT=%s\nSHA=%s\nEXIT=0\n' \
+    "$tunit" "$SHA" > "$trunc"
+out="$(gate --wait "$trunc" 2>&1)"; rc=$?
+check '[[ $rc -eq 0 ]]' "--wait reports a truncated log's trailer verdict (EXIT=0, got $rc)"
+# 4c. ... and finds its unit: the trailer is authoritative, so a stale first
+# UNIT= doesn't make a dead gate report itself as headerless.
+trunc2="$RZ_GATE_DIR/truncated-noexit-$S12.log"
+printf 'UNIT=ritz-gate-stale\nok Stage 1 output is identical with 1 and 8 jobs\nUNIT=%s\nSHA=%s\n' \
+    "$tunit" "$SHA" > "$trunc2"
+out="$(gate --wait "$trunc2" 2>&1)"; rc=$?
+check '[[ $rc -eq 98 && "$out" == *"GATE DIED WITHOUT A VERDICT: $tunit"* ]]' \
+    "--wait finds the last UNIT= in a truncated log (rc=$rc)"
+# 4d. A headerless, verdict-less log is a clear diagnostic, not an empty-unit
+# liveness check that would misread a live gate as dead.
+gone="$RZ_GATE_DIR/headerless-$S12.log"
+printf 'ok Stage 1 output is identical with 1 and 8 jobs\n' > "$gone"
+out="$(gate --wait "$gone" 2>&1)"; rc=$?
+check '[[ $rc -eq 98 && "$out" == *"GATE LOG HAS NO UNIT="* ]]' \
+    "a headerless, verdict-less log exits 98 with a clear diagnostic (rc=$rc)"
 
 # 5. An unwritable gate dir fails at once instead of looping for a free name.
 if [[ "$(id -u)" -ne 0 ]]; then

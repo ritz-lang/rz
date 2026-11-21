@@ -324,7 +324,7 @@ gate_of() { if [ "$2" = - ]; then echo "$1/.claude/skills/rz-iterate/run-gate.sh
 # run-gate.sh) names a live pid: queued for a slot.
 alive() {
     local unit q u p rest
-    unit="$(sed -n 's/^UNIT=//p' "$1" | head -1)"
+    unit="$(sed -n 's/^UNIT=//p' "$1" | tail -1)"
     [ -n "$unit" ] || return 1
     systemctl --user is-active -q "$unit" 2>/dev/null && return 0
     q="$(dirname "$1")/.gate-queue"
@@ -338,7 +338,7 @@ alive() {
 # with no UNIT= line, "unknown" if systemctl can't say (no user bus).
 ustate() {
     local unit s
-    unit="$(sed -n 's/^UNIT=//p' "$1" | head -1)"
+    unit="$(sed -n 's/^UNIT=//p' "$1" | tail -1)"
     [ -n "$unit" ] || { echo none; return; }
     s="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null)" || s=""
     echo "${s:-unknown}"
@@ -386,7 +386,7 @@ main() {
             echo "no verdict yet, gate still running: $why (--wait exit $rc)" >&2
             exit 124
         fi
-        echo "unit stopped: $(sed -n 's/^UNIT=//p' "$3" | head -1) is $st, its log not growing, and no EXIT= (--wait exit $rc)" >&2
+        echo "unit stopped: $(sed -n 's/^UNIT=//p' "$3" | tail -1) is $st, its log not growing, and no EXIT= (--wait exit $rc)" >&2
         exit 98 ;;
     cat) cat "$1" ;;
     stop) systemctl --user stop "ritz-gate-$1" 2>/dev/null || true ;;
@@ -883,7 +883,7 @@ verdict() {
     local log sha rc; log="$(gate_log)"
     [[ -n "$log" ]] || { echo none; return; }
     [[ -f "$log" ]] || { echo running; return; }
-    sha="$(sed -n 's/^SHA=//p' "$log" | head -1)"
+    sha="$(sed -n 's/^SHA=//p' "$log" | tail -1)"
     if [[ -n "$sha" && "$sha" != "$(field TIP "$(state)")" ]]; then echo none; return; fi
     rc="$(sed -n 's/^EXIT=//p' "$log" | tail -1)"
     case "$rc" in "") echo running ;; 0) echo pass ;; *) echo red ;; esac
@@ -1129,8 +1129,8 @@ cmd_wait() {
         echo "gate $(basename "$llog") SHA=${tip:0:12} EXIT=none — no verdict, $why"
         exit 98
     fi
-    if [[ "$(sed -n 's/^SHA=//p' "$llog" | head -1)" != "$tip" ]]; then
-        echo "REFUSED: $host's verdict is for $(sed -n 's/^SHA=//p' "$llog" | head -1 | cut -c1-12), not the train tip ${tip:0:12}" >&2
+    if [[ "$(sed -n 's/^SHA=//p' "$llog" | tail -1)" != "$tip" ]]; then
+        echo "REFUSED: $host's verdict is for $(sed -n 's/^SHA=//p' "$llog" | tail -1 | cut -c1-12), not the train tip ${tip:0:12}" >&2
         exit 3
     fi
     rc="$(sed -n 's/^EXIT=//p' "$llog" | tail -1)"
@@ -1299,7 +1299,7 @@ cmd_land() {
     [[ ${#q[@]} -gt 0 ]] || die "no train built"
     if [[ -n "$log" ]]; then
         [[ -f "$log" ]] || die "no such gate log: $log"
-        lsha="$(sed -n 's/^SHA=//p' "$log" | head -1)"
+        lsha="$(sed -n 's/^SHA=//p' "$log" | tail -1)"
         for i in "${!q[@]}"; do
             use_slot "${q[$i]}"
             if [[ -n "$lsha" && "$(field TIP "$(state)")" == "$lsha" ]]; then k=$((i + 1)); break; fi
@@ -1396,7 +1396,7 @@ cmd_land() {
 cmd_fail() {
     local log="${1:?usage: $0 fail <log>}" lsha q i k=0 items=() b room new s tip
     [[ -f "$log" ]] || die "no such gate log: $log"
-    lsha="$(sed -n 's/^SHA=//p' "$log" | head -1)"
+    lsha="$(sed -n 's/^SHA=//p' "$log" | tail -1)"
     [[ "$(sed -n 's/^EXIT=//p' "$log" | tail -1)" != 0 ]] || die "that gate passed: land it"
     mapfile -t q < <(queue)
     for i in "${!q[@]}"; do
