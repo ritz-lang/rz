@@ -35,11 +35,44 @@ class EmitError(Exception):
             super().__init__(message)
 
 
+class UnknownFunction(EmitError, ValueError):
+    """A call to a name nothing declares (AGAST #3243: that includes `write`,
+    `read`, `open`, `close` and `nanosleep`, no longer builtins). Located like
+    any EmitError; still a ValueError, so a route that only tries a call for
+    an address falls back as it did before the location was added."""
+
+
 class InternalError(ValueError):
     """An emitter invariant broke: a layout not computed, an operator the
     parser cannot produce. A compiler bug, never the user's, so it is *not*
     an EmitError: it still surfaces as a traceback (AGAST #1390). A
     ValueError for the same fallback reason as SourceError."""
+
+
+# Volatile / atomic memory builtins (AGAST #1879): name -> (arity, rmw op).
+MEM_BUILTINS = {
+    'volatile_load': (1, None),
+    'volatile_store': (2, None),
+    'atomic_load': (1, None),
+    'atomic_store': (2, None),
+    'atomic_xchg': (2, 'xchg'),
+    'atomic_cmpxchg': (3, None),
+    'atomic_fetch_add': (2, 'add'),
+    'atomic_fetch_sub': (2, 'sub'),
+    'atomic_fetch_and': (2, 'and'),
+    'atomic_fetch_or': (2, 'or'),
+    'atomic_fetch_xor': (2, 'xor'),
+    'fence': (0, None),
+}
+
+
+def _llvm_callconv(callconv: Optional[str]) -> Optional[str]:
+    """LLVM's name for a `[[callconv]]` value (LANGUAGE_SPEC §17.7), None for C."""
+    if callconv is None or callconv == 'c':
+        return None
+    if callconv == 'win64':
+        return 'win64cc'
+    raise InternalError(f"unknown calling convention '{callconv}'")
 
 
 def qualified_access_removed(expr: rast.QualifiedIdent) -> str:
