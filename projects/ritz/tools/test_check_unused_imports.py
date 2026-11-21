@@ -1,17 +1,15 @@
-"""Tests for check_unused_imports.py (AGAST #3458, LARB review/5 harland F4).
+"""Tests for check_unused_imports.py (AGAST #3458, #4174, LARB review/5 harland F4).
 
 The rule: a brace-imported name the file never mentions outside imports,
-comments and strings is an error, unless the allowlist names it; an
-allowlist entry that is no longer an unused import is an error too, so the
-list only shrinks.
+comments and strings is an error. There is no allowlist: #3458 added one so
+the pre-existing offenders could ratchet down, and #4174 burned it to zero
+and deleted it.
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -51,40 +49,24 @@ class TestRule:
         assert names("import io\nfn f() -> i32\n    0\n") == []
 
 
-class TestAllowlist:
-    @pytest.fixture
-    def tree(self, tmp_path):
-        (tmp_path / "src").mkdir()
-        (tmp_path / "src" / "a.ritz").write_text("import io { inb, outb }\nfn f() -> i32\n    outb(1, 2)\n")
-        return tmp_path
-
-    def test_unlisted_unused_is_red(self, tree):
-        assert main([str(tree / "src")]) == 1
-
-    def test_listed_unused_is_green(self, tree):
-        (tree / "allow").write_text("# comment\nsrc/a.ritz inb\n")
-        assert main(["--allow", str(tree / "allow"), str(tree / "src")]) == 0
-
-    def test_stale_entry_is_red(self, tree, capsys):
-        (tree / "allow").write_text("src/a.ritz inb\nsrc/a.ritz outb\n")
-        assert main(["--allow", str(tree / "allow"), str(tree / "src")]) == 1
-        assert "stale" in capsys.readouterr().out
-
-
 class TestHarlandKernel:
     def test_main_ritz_has_no_unused_imports(self):
         assert unused_imports((KERNEL / "src" / "main.ritz").read_text()) == []
 
     def test_planted_unused_import_in_main_is_red(self, tmp_path):
         planted = tmp_path / "main.ritz"
-        planted.write_text("import io { cpu_pause }\n" + (KERNEL / "src" / "main.ritz").read_text())
+        planted.write_text(
+            "import io { cpu_pause }\n" + (KERNEL / "src" / "main.ritz").read_text()
+        )
         assert main([str(planted)]) == 1
 
-    def test_main_ritz_is_not_allowlisted(self):
-        assert "src/main.ritz" not in ALLOW.read_text()
+    def test_unused_import_allowlist_is_gone(self):
+        """AGAST #4174: the list ratcheted to empty; keeping the file would
+        let a new unused import be papered over again."""
+        assert not ALLOW.exists(), f"{ALLOW} is empty and must be deleted"
 
-    def test_kernel_tree_clean_against_allowlist(self, capsys):
-        rc = main(["--allow", str(ALLOW), str(KERNEL / "src")])
+    def test_kernel_tree_has_no_unused_imports(self, capsys):
+        rc = main([str(KERNEL / "src")])
         assert rc == 0, capsys.readouterr().out
 
 

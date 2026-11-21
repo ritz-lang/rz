@@ -15,13 +15,12 @@ import statements, comments and string literals. Asm blocks count: their
 Bare `import mod` is not checked (it names no symbols).
 
 Usage:
-    python3 tools/check_unused_imports.py [--allow FILE] PATH [PATH...]
+    python3 tools/check_unused_imports.py PATH [PATH...]
 
-PATH is a .ritz file or a directory (searched recursively). FILE lists
-known offenders, one `relpath name` per line (relpath relative to FILE's
-directory); an entry that is no longer an unused import is itself an
-error, so the list can only shrink. Exits 0 when clean, 1 on an unused
-name or stale entry, 2 on a bad path.
+PATH is a .ritz file or a directory (searched recursively). Exits 0 when
+clean, 1 on an unused name, 2 on a bad path. There is no allowlist: one
+existed to ratchet the kernel's pre-existing offenders down (#3458), and
+#4174 burned it to zero and deleted it.
 """
 
 from __future__ import annotations
@@ -77,46 +76,22 @@ def collect(paths: list[Path]) -> list[Path]:
     return files
 
 
-def load_allow(path: Path) -> set[tuple[str, str]]:
-    """`relpath name` per line, relpath relative to the allowlist's
-    directory; `#` starts a comment."""
-    allow: set[tuple[str, str]] = set()
-    for line in path.read_text().splitlines():
-        line = line.split("#", 1)[0].strip()
-        if line:
-            rel, name = line.split()
-            allow.add((rel, name))
-    return allow
-
-
 def main(argv: list[str]) -> int:
-    allow_path: Path | None = None
-    if argv[:1] == ["--allow"] and len(argv) >= 2:
-        allow_path = Path(argv[1])
-        argv = argv[2:]
-    if not argv or (allow_path is not None and not allow_path.exists()):
-        print("usage: check_unused_imports.py [--allow FILE] PATH [PATH...]", file=sys.stderr)
+    if not argv:
+        print("usage: check_unused_imports.py PATH [PATH...]", file=sys.stderr)
         return 2
     paths = [Path(a) for a in argv]
     for p in paths:
         if not p.exists():
             print(f"check_unused_imports.py: {p} does not exist", file=sys.stderr)
             return 2
-    allow = load_allow(allow_path) if allow_path else set()
-    base = allow_path.resolve().parent if allow_path else None
-    seen: set[tuple[str, str]] = set()
     total = 0
     for f in collect(paths):
-        rel = f.resolve().relative_to(base).as_posix() if base and f.resolve().is_relative_to(base) else ""
-        for ln, mod, name in unused_imports(f.read_text(encoding="utf-8", errors="replace")):
-            if (rel, name) in allow:
-                seen.add((rel, name))
-                continue
+        for ln, mod, name in unused_imports(
+            f.read_text(encoding="utf-8", errors="replace")
+        ):
             print(f"{f}:{ln}: unused import `{name}` from {mod}")
             total += 1
-    for rel, name in sorted(allow - seen):
-        print(f"{allow_path}: stale entry `{rel} {name}` is no longer an unused import; delete it")
-        total += 1
     if total:
         print(f"{total} unused-import problem(s).")
         return 1
