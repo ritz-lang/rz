@@ -6,6 +6,7 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.option
+import ritzlib.fmt.digits { fmt_i64_into }
 
 import lib.m7m_types
 import lib.page
@@ -17,21 +18,53 @@ import lib.recovery
 # Test Helpers
 # ============================================================================
 
+# Every invocation gets its own base path: "/tmp/m7m_recovery_test_<pid>_
+# <tag>_<seq>".  The pid separates concurrent test processes (a gate checkout
+# and another room's `rz test mausoleum`, AGAST #4466); the sequence separates
+# two calls inside one process.  Never a fixed path: one run's checkpoint
+# truncates the WAL another run is still reading.
+var g_test_path_seq: i64 = 0
+
+fn append_cstr(buf: *u8, pos: i64, s: *u8) -> i64
+    var i: i64 = 0
+    while *(s + i) != 0
+        *(buf + pos + i) = *(s + i)
+        i += 1
+    return pos + i
+
 fn make_test_path(suffix: *u8) -> *u8
-    var path: *u8 = malloc(64)
-    let base: *u8 = c"/tmp/m7m_recovery_test_"
-    memcpy(path, base, strlen(base))
-    memcpy(path + strlen(base), suffix, strlen(suffix) + 1)
+    var path: *u8 = malloc(128)
+    if path == null
+        return null
+    var pos: i64 = append_cstr(path, 0, c"/tmp/m7m_recovery_test_")
+    pos += fmt_i64_into(path + pos, sys_getpid() as i64)
+    pos = append_cstr(path, pos, c"_")
+    pos = append_cstr(path, pos, suffix)
+    pos = append_cstr(path, pos, c"_")
+    pos += fmt_i64_into(path + pos, g_test_path_seq)
+    g_test_path_seq += 1
+    *(path + pos) = 0
     return path
 
+# Remove every "<base>.wal.<segment>", not just segment 0: WAL segments left
+# behind by a crashed run must not poison the next one (AGAST #4466).  Each
+# segment is 16MB (WAL_FILE_SIZE), so 64 covers 1GB of scrap.
 fn cleanup_test_files(base_path: *u8)
-    # Remove WAL files
     var path_buf: [256]u8
     let base_len: i64 = strlen(base_path)
     memcpy(@path_buf[0], base_path, base_len)
-    let suffix: *u8 = c".wal.000000"
-    memcpy(@path_buf[base_len], suffix, 12)
-    sys_unlink(@path_buf[0])
+    memcpy(@path_buf[base_len], c".wal.", 5)
+    var seg: i32 = 0
+    while seg < 64
+        var div: i32 = 100000
+        var i: i64 = 0
+        while div > 0
+            path_buf[base_len + 5 + i] = (48 + ((seg / div) % 10)) as u8
+            div = div / 10
+            i += 1
+        path_buf[base_len + 11] = 0
+        sys_unlink(@path_buf[0])
+        seg += 1
 
 # ============================================================================
 # Recovery Manager Creation Tests
@@ -756,5 +789,29 @@ fn test_recovery_null_manager() -> i32
 fn test_recovery_checkpoint_null() -> i32
     let result: i32 = recovery_checkpoint(null)
     if result != ERR_INVALID
+        return 1
+    return 0
+
+# AGAST #4466: a fixed "/tmp/m7m_recovery_test_<tag>" base path let two
+# concurrent `rz test mausoleum` runs share one WAL, so one run's checkpoint
+# truncated records the other was still counting (test_recovery_after_checkpoint
+# failed with txns_committed < 2).  Every invocation must hand out its own
+# base path, even within one process.
+[[test]]
+fn test_recovery_test_paths_are_unique() -> i32
+    let a: *u8 = make_test_path(c"unique")
+    let b: *u8 = make_test_path(c"unique")
+    if a == null or b == null
+        if a != null
+            free(a)
+        if b != null
+            free(b)
+        return 99
+    let same: bool = strcmp(a, b) == 0
+    cleanup_test_files(a)
+    cleanup_test_files(b)
+    free(a)
+    free(b)
+    if same
         return 1
     return 0

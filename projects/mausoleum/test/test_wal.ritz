@@ -6,6 +6,7 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
+import ritzlib.fmt.digits { fmt_i64_into }
 
 import lib.m7m_types
 import lib.page
@@ -15,26 +16,61 @@ import lib.wal
 # Helper Functions
 # ============================================================================
 
-# Create a temporary test file path
+# Create a temporary test file path: "/tmp/m7m_test_wal_<pid>_<seq>_<suffix>".
+# The pid separates concurrent test processes; the sequence separates two
+# calls inside one process.  A fixed path let two runs share one WAL
+# (AGAST #4466).
+var g_test_path_seq: i64 = 0
+
+fn append_cstr(buf: *u8, pos: i64, s: *u8) -> i64
+    var i: i64 = 0
+    while *(s + i) != 0
+        *(buf + pos + i) = *(s + i)
+        i += 1
+    return pos + i
+
 fn get_test_path(suffix: i32) -> *u8
-    # Use /tmp for test files
-    var path: *u8 = malloc(64)
+    var path: *u8 = malloc(128)
     if path == null
         return null
 
-    let base: *u8 = c"/tmp/m7m_test_wal_"
-    memcpy(path, base, 18)
-
-    # Add suffix as digit
-    path[18] = (48 + suffix) as u8  # '0' + suffix
-    path[19] = 0
+    var pos: i64 = append_cstr(path, 0, c"/tmp/m7m_test_wal_")
+    pos += fmt_i64_into(path + pos, sys_getpid() as i64)
+    pos = append_cstr(path, pos, c"_")
+    pos += fmt_i64_into(path + pos, g_test_path_seq)
+    g_test_path_seq += 1
+    pos = append_cstr(path, pos, c"_")
+    path[pos] = (48 + suffix) as u8  # '0' + suffix
+    path[pos + 1] = 0
 
     return path
 
-# Clean up test file
-fn cleanup_test_file(path: *u8)
-    sys_unlink(path)
-    free(path)
+# "<path>.wal.000000" into buf (NUL-terminated).  Never a fixed offset: the
+# base path length varies with pid and sequence (AGAST #4466).
+fn build_wal_path(buf: *u8, path: *u8) -> *u8
+    let n: i64 = strlen(path)
+    memcpy(buf, path, n)
+    memcpy(buf + n, c".wal.000000", 12)
+    return buf
+
+# Remove every "<path>.wal.<segment>", not just segment 0: WAL segments left
+# behind by a crashed run must not poison the next one (AGAST #4466).
+fn cleanup_test_wal(path: *u8)
+    var wal_path: [128]u8
+    let n: i64 = strlen(path)
+    memcpy(@wal_path[0], path, n)
+    memcpy(@wal_path[n], c".wal.", 5)
+    var seg: i32 = 0
+    while seg < 64
+        var div: i32 = 100000
+        var i: i64 = 0
+        while div > 0
+            wal_path[n + 5 + i] = (48 + ((seg / div) % 10)) as u8
+            div = div / 10
+            i += 1
+        wal_path[n + 11] = 0
+        sys_unlink(@wal_path[0])
+        seg += 1
 
 # ============================================================================
 # WAL Writer Creation Tests
@@ -76,11 +112,7 @@ fn test_wal_writer_open() -> i32
     wal_writer_destroy(writer)
 
     # Clean up WAL file
-    var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    let suffix: *u8 = c".wal.000000"
-    memcpy(@wal_path[19], suffix, 12)
-    sys_unlink(@wal_path[0])
+    cleanup_test_wal(path)
     free(path)
     0
 
@@ -117,10 +149,7 @@ fn test_wal_write_begin() -> i32
     wal_writer_destroy(writer)
 
     # Cleanup
-    var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    memcpy(@wal_path[19], c".wal.000000", 12)
-    sys_unlink(@wal_path[0])
+    cleanup_test_wal(path)
     free(path)
     0
 
@@ -145,10 +174,7 @@ fn test_wal_write_commit() -> i32
     wal_writer_destroy(writer)
 
     # Cleanup
-    var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    memcpy(@wal_path[19], c".wal.000000", 12)
-    sys_unlink(@wal_path[0])
+    cleanup_test_wal(path)
     free(path)
     0
 
@@ -169,10 +195,7 @@ fn test_wal_write_abort() -> i32
     wal_writer_destroy(writer)
 
     # Cleanup
-    var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    memcpy(@wal_path[19], c".wal.000000", 12)
-    sys_unlink(@wal_path[0])
+    cleanup_test_wal(path)
     free(path)
     0
 
@@ -199,10 +222,7 @@ fn test_wal_write_insert() -> i32
     wal_writer_destroy(writer)
 
     # Cleanup
-    var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    memcpy(@wal_path[19], c".wal.000000", 12)
-    sys_unlink(@wal_path[0])
+    cleanup_test_wal(path)
     free(path)
     0
 
@@ -227,10 +247,7 @@ fn test_wal_write_page() -> i32
     wal_writer_destroy(writer)
 
     # Cleanup
-    var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    memcpy(@wal_path[19], c".wal.000000", 12)
-    sys_unlink(@wal_path[0])
+    cleanup_test_wal(path)
     free(path)
     0
 
@@ -249,10 +266,7 @@ fn test_wal_write_checkpoint() -> i32
     wal_writer_destroy(writer)
 
     # Cleanup
-    var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    memcpy(@wal_path[19], c".wal.000000", 12)
-    sys_unlink(@wal_path[0])
+    cleanup_test_wal(path)
     free(path)
     0
 
@@ -285,8 +299,7 @@ fn test_wal_write_then_read() -> i32
 
     # Build WAL file path
     var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    memcpy(@wal_path[19], c".wal.000000", 12)
+    build_wal_path(@wal_path[0], path)
 
     # Read them back
     var reader: *WalReader = wal_reader_new()
@@ -387,10 +400,7 @@ fn test_wal_writer_lsn() -> i32
     wal_writer_destroy(writer)
 
     # Cleanup
-    var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    memcpy(@wal_path[19], c".wal.000000", 12)
-    sys_unlink(@wal_path[0])
+    cleanup_test_wal(path)
     free(path)
     0
 
@@ -439,9 +449,25 @@ fn test_wal_full_transaction() -> i32
     wal_writer_destroy(writer)
 
     # Cleanup
-    var wal_path: [64]u8
-    memcpy(@wal_path[0], path, 20)
-    memcpy(@wal_path[19], c".wal.000000", 12)
-    sys_unlink(@wal_path[0])
+    cleanup_test_wal(path)
     free(path)
     0
+
+# AGAST #4466: two calls must not share a base path, or concurrent runs share
+# one WAL file.
+[[test]]
+fn test_wal_test_paths_are_unique() -> i32
+    let a: *u8 = get_test_path(0)
+    let b: *u8 = get_test_path(0)
+    if a == null or b == null
+        if a != null
+            free(a)
+        if b != null
+            free(b)
+        return 99
+    let same: bool = strcmp(a, b) == 0
+    free(a)
+    free(b)
+    if same
+        return 1
+    return 0
