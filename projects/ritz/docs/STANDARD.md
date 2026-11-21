@@ -308,9 +308,10 @@ Choose a parameter's type by what the function does with it:
 
 A raw `*T` parameter is right only at a boundary that is raw by nature: a
 syscall or foreign ABI, an allocator, or the private functions of a type that
-owns raw memory. Mark it `standard-exempt` with that reason. Don't write the
-`:=` parameter modifier: LANGUAGE_SPEC doesn't define it, and a by-value
-parameter of a move-only type already moves (AGAST #4062).
+owns raw memory. Mark it `standard-exempt` with that reason. The `:=`
+parameter modifier (`x:= T`) is accepted and lowers exactly as `x: T`: the
+sigil records ownership intent but adds nothing, so write `x: T` (§13.2,
+AGAST #4062).
 
 Report: `raw-ptr-param`. Counts each `*T` parameter of an API fn.
 
