@@ -465,6 +465,48 @@ fn emit_struct_const_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrRe
     result.field = get_field_type(st, field_idx)
     result.success = 1
 
+# AGAST #4469: a field read straight off an `unwrap()` of a POINTER payload:
+# `o.unwrap().f` with Option<@T> / <@&T> / <*T>, or the Result forms (prism's
+# `comp.get_window(win1).unwrap().state`, `get_window(..) -> Option<@&Window>`).
+# The intrinsic has no FnDef, and call_result_struct_name's unwrap arm names
+# only a by-value struct payload, so this base fell to "unhandled
+# EXPR_MEMBER" even after #4458 typed the `let` form.  The unwrap loads the
+# payload as an i64 holding the pointer; inttoptr it (one load more for a
+# `**T` payload) and GEP the pointee's field, as a local of the same kind
+# does.  Returns 1 when it resolved the field.
+fn unwrap_pointer_payload_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult) -> i32
+    if e.left == null
+        return 0
+    var uw_kind: i32 = TYPE_VOID
+    var uw_name: *u8 = null
+    var uw_len: i32 = 0
+    var uw_pointee: i32 = TYPE_VOID
+    if unwrap_payload_pointer_type(s, e.left, @uw_kind, @uw_name, @uw_len, @uw_pointee) == 0 or uw_len == 0
+        return 0
+    let uw_st: *StructDef = find_struct(s, StrView { ptr: (uw_name), len: (uw_len) as i64 })
+    if uw_st == null
+        return 0
+    let uw_idx: i32 = find_field_index(uw_st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    if uw_idx < 0
+        return 0
+    let uw_val: i32 = emit_expr(s, e.left)
+    let uw_ptr: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, uw_ptr)
+    emit_str(s, IR_INTTOPTR)
+    emit_reg(s, uw_val)
+    emit_str(s, c" to ptr  ; unwrap pointer payload member\n")
+    # The payload register already holds the pointer the let-declaration
+    # path stores in its slot, so one level fewer than local_struct_levels.
+    var uw_levels: i32 = 1
+    if uw_kind == TYPE_PTR_PTR
+        uw_levels = 2
+    else if (uw_kind == TYPE_REF or uw_kind == TYPE_MUT_REF) and uw_pointee == TYPE_PTR
+        uw_levels = 2
+    let uw_base: i32 = emit_load_levels(s, uw_ptr, uw_levels - 1)
+    emit_member_gep_from_ptr(s, result, uw_base, uw_st, uw_idx, get_field_type(uw_st, uw_idx))
+    1
+
 pub fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     result.reg = 0
     result.field = null
@@ -639,6 +681,9 @@ fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                 emit_str(s, c" to ptr  ; *S call-result member\n")
                 emit_member_gep_from_ptr(s, result, cp_ptr, cp_st, cp_idx, get_field_type(cp_st, cp_idx))
                 return
+        # AGAST #4469: a pointer payload's field, `o.unwrap().f`.
+        if unwrap_pointer_payload_member_ptr(s, e, result) == 1
+            return
 
     # Dereference case: ptr.field - e.left is EXPR_UNARY with OP_DEREF
     # Also: address-of-then-member case: (@expr).field — when the inner

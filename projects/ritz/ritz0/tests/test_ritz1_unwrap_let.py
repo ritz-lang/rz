@@ -237,3 +237,118 @@ def _ptr_program(carrier: str, payload: str) -> str:
 def test_unwrap_let_takes_pointer_payload_type(run_with, carrier, payload, compiler):
     name = f"unwrap_ptr_{carrier}_{payload}"
     assert run_with(compiler, name, _ptr_program(carrier, payload)) == 0
+
+
+# AGAST #4469: the field read straight off the unwrap, `r.unwrap().size`,
+# with the same pointer payloads.  #4458 typed the `let` form, but the
+# member path resolves its base through `call_result_struct_name`, whose
+# unwrap arm names only a BY-VALUE struct payload; a pointer payload named
+# nothing, so the chain fell to "unhandled EXPR_MEMBER".  prism's
+# test_compositor.ritz:256 reads `comp.get_window(win1).unwrap().state`
+# (`get_window(..) -> Option<@&Window>`).
+_CHAIN_TYPES = """\
+struct Holder
+    n: i32
+
+impl Holder
+    pub fn get(self: @Holder, f: @&Font) -> Option<@&Font>
+        Some(f)
+    pub fn get_res(self: @Holder, f: @&Font) -> Result<@&Font, i32>
+        Ok(f)
+
+"""
+
+
+def _ptr_chain_program(carrier: str, payload: str) -> str:
+    arg, _ = _PTR_PAYLOADS[payload]
+    return (
+        _PTR_TYPES
+        + _CHAIN_TYPES
+        + "pub fn main() -> i32\n"
+        + "    var f: Font = Font { size: 7 }\n"
+        + f"    let r = mk_{carrier}_{payload}({arg})\n"
+        + "    if r.unwrap().size != 7\n"
+        + "        return 1\n"
+        + "    0\n"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("carrier", ["opt", "res"])
+@pytest.mark.parametrize("payload", sorted(_PTR_PAYLOADS))
+def test_unwrap_chain_field_takes_pointer_payload(run_with, carrier, payload, compiler):
+    name = f"unwrap_chain_{carrier}_{payload}"
+    assert run_with(compiler, name, _ptr_chain_program(carrier, payload)) == 0
+
+
+# The ticket's own shape: the unwrap's receiver is a method call
+# (`comp.get_window(win1).unwrap().state`), not a local.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("carrier", ["get", "get_res"])
+def test_unwrap_chain_field_method_receiver(run_with, carrier, compiler):
+    program = (
+        _PTR_TYPES
+        + _CHAIN_TYPES
+        + "pub fn main() -> i32\n"
+        + "    var f: Font = Font { size: 7 }\n"
+        + "    let h = Holder { n: 1 }\n"
+        + f"    if h.{carrier}(@&f).unwrap().size != 7\n"
+        + "        return 1\n"
+        + "    0\n"
+    )
+    assert run_with(compiler, f"unwrap_chain_mrecv_{carrier}", program) == 0
+
+
+# The minimal shape from the ticket, unchanged.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_unwrap_chain_field_minimal(run_with, compiler):
+    program = """\
+struct Font
+    size: i32
+
+fn mk(p: @&Font) -> Option<@&Font>
+    Some(p)
+
+pub fn main() -> i32
+    var f: Font = Font { size: 7 }
+    let o = mk(@&f)
+    if o.unwrap().size != 7
+        return 1
+    0
+"""
+    assert run_with(compiler, "unwrap_chain_minimal", program) == 0
+
+
+# A `**T` payload (mangled `ptr_ptr_T`): the unwrap's i64 register holds a
+# pointer to the `*T`, so the member path loads down one level before the
+# GEP, as a `**T` local's slot does.
+_PP_ROWS = [
+    ("opt", "Option<**Font>", "Some"),
+    ("res", "Result<**Font, i32>", "Ok"),
+]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("carrier,ret,ctor", _PP_ROWS)
+def test_unwrap_chain_field_ptrptr_payload(run_with, carrier, ret, ctor, compiler):
+    program = (
+        _PTR_TYPES
+        + f"""\
+fn mk_{carrier}_pp(pp: **Font) -> {ret}
+    {ctor}(pp)
+
+pub fn main() -> i32
+    var f: Font = Font {{ size: 7 }}
+    var p: *Font = @f
+    var pp: **Font = @p
+    let o = mk_{carrier}_pp(pp)
+    if o.unwrap().size != 7
+        return 1
+    0
+"""
+    )
+    assert run_with(compiler, f"unwrap_chain_pp_{carrier}", program) == 0
