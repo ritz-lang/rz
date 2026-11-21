@@ -189,8 +189,10 @@ pub fn lit_fits_check(sm: *Sema, e: *Expr, t: i32)
 # A block's tail naming one of the block's own `let`s, landing in a float
 # slot: the walk reaches the tail after the block's scope ends, so its type is
 # read off the declaration's annotation, as the emitter's table had it.  1 if
-# `e` is such a tail.
-fn lit_block_local_into_float(sm: *Sema, stmts: *Stmt, e: *Expr, t: i32) -> i32
+# `e` is such a tail.  `line` > 0 is the match arm Block ritz0 reports a
+# narrowing at, its first line with the column reset to 1 (AGAST #4439); in
+# every other context the check is as it was.
+fn lit_block_local_into_float(sm: *Sema, stmts: *Stmt, e: *Expr, t: i32, line: i32) -> i32
     if e == null or e.kind != EXPR_IDENT
         return 0
     var decl: *Stmt = null
@@ -217,9 +219,12 @@ fn lit_block_local_into_float(sm: *Sema, stmts: *Stmt, e: *Expr, t: i32) -> i32
         float_slot_pointer_to(sm, e, pointee, t)
         return 1
     var src: i32 = NARROW_UNKNOWN
-    if ty_bits(decl.var_declared_type) > 0
+    if ty_bits(decl.var_declared_type) > 0 or ty_is_float(decl.var_declared_type) == 1
         src = decl.var_declared_type
-    float_slot_judge(sm, e, src, t)
+    if line > 0
+        float_slot_judge_at(sm, e, src, t, line)
+    else
+        float_slot_judge(sm, e, src, t)
     1
 
 fn lit_is_float(t: i32) -> i32
@@ -235,42 +240,56 @@ fn lit_tail_block(sm: *Sema, stmts: *Stmt, t: i32, pointee: i32, fit: i32)
         if lit_block_local_into_ptr(sm, stmts, last.expr) == 1
             return
     if last.kind == STMT_EXPR and fit == 1 and lit_is_float(t) == 1
-        if lit_block_local_into_float(sm, stmts, last.expr, t) == 1
+        if lit_block_local_into_float(sm, stmts, last.expr, t, 0) == 1
             return
     lit_tail_stmt(sm, last, t, pointee, fit)
 
 fn lit_tail_stmt(sm: *Sema, stmt: *Stmt, t: i32, pointee: i32, fit: i32)
     if stmt.kind == STMT_EXPR
-        lit_tails(sm, stmt.expr, t, pointee, fit)
+        lit_tails(sm, stmt.expr, t, pointee, fit, 0)
     else if stmt.kind == STMT_IF
         lit_tail_block(sm, stmt.if_then, t, pointee, fit)
         lit_tail_block(sm, stmt.if_else, t, pointee, fit)
     else if stmt.kind == STMT_MATCH
-        lit_tail_arms(sm, stmt.if_then as *MatchArm, t, pointee, fit)
+        lit_tail_arms(sm, stmt.if_then as *MatchArm, t, pointee, fit, 1)
 
-fn lit_tail_arms(sm: *Sema, arms: *MatchArm, t: i32, pointee: i32, fit: i32)
+# The line ritz0 reports a match arm's Block at (AGAST #4439): its first
+# statement's, else its bare tail's, with the column reset to 1.
+fn lit_arm_block_line(arm: *MatchArm) -> i32
+    if arm.body_stmts != null
+        return arm.body_stmts.span.line
+    if arm.body != null
+        return arm.body.span.line
+    0
+
+# `block` 1: `arms` are a match's, so a float narrowing is reported at the
+# arm's Block (lit_arm_block_line); 0: an if's, reported as before.
+fn lit_tail_arms(sm: *Sema, arms: *MatchArm, t: i32, pointee: i32, fit: i32, block: i32)
     var arm: *MatchArm = arms
     while arm != null
         if arm.is_pass == 0 and arm.body != null
+            var line: i32 = lit_arm_block_line(arm)
+            if block == 0
+                line = 0
             var local: i32 = 0
             if t == TYPE_PTR and pointee == TYPE_U8
                 local = lit_block_local_into_ptr(sm, arm.body_stmts, arm.body)
             else if fit == 1 and lit_is_float(t) == 1
-                local = lit_block_local_into_float(sm, arm.body_stmts, arm.body, t)
+                local = lit_block_local_into_float(sm, arm.body_stmts, arm.body, t, line)
             if local == 0
-                lit_tails(sm, arm.body, t, pointee, fit)
+                lit_tails(sm, arm.body, t, pointee, fit, line)
         arm = arm.next
 
-fn lit_tails(sm: *Sema, e: *Expr, t: i32, pointee: i32, fit: i32)
+fn lit_tails(sm: *Sema, e: *Expr, t: i32, pointee: i32, fit: i32, line: i32)
     if e == null
         return
     if e.kind == EXPR_IF or e.kind == EXPR_MATCH
-        lit_tail_arms(sm, e.args as *MatchArm, t, pointee, fit)
+        lit_tail_arms(sm, e.args as *MatchArm, t, pointee, fit, (e.kind == EXPR_MATCH) as i32)
         return
     if t == TYPE_PTR and pointee == TYPE_U8
         lit_into_ptr(sm, e)
     else if fit == 1 and (t == TYPE_F32 or t == TYPE_F64)
-        float_slot_defer(e, t)   # an integer into a float slot (#2945)
+        float_slot_defer_at(e, t, line)   # an integer into a float slot (#2945)
     else if fit == 1
         lit_fits_check(sm, e, t)
     # A cast (fit 0) isn't a slot: `(m + o) / 2 as i64` divides the u32 sum.
@@ -311,7 +330,7 @@ fn lit_slot_arith(e: *Expr, t: i32)
 
 # `e` lands in a slot of kind `t`, pointing at `pointee` if it's a pointer.
 pub fn literal_slot(sm: *Sema, e: *Expr, t: i32, pointee: i32)
-    lit_tails(sm, e, t, pointee, 1)
+    lit_tails(sm, e, t, pointee, 1, 0)
 
 # The value of `stmt`, the last of a fn, lands in the fn's return slot.
 pub fn literal_tail(sm: *Sema, stmt: *Stmt, t: i32, pointee: i32)
@@ -385,7 +404,7 @@ pub fn literal_ret_pointee(name: *u8, len: i32) -> i32
 # `e as T`: a literal takes `*u8` here too, and a StrView still doesn't.  The cast
 # says it means to truncate, so nothing else is checked.
 pub fn literal_cast(sm: *Sema, e: *Expr)
-    lit_tails(sm, e.left, e.op, e.cast_pointee, 0)
+    lit_tails(sm, e.left, e.op, e.cast_pointee, 0, 0)
 
 # One element of a `[N]T` literal: literals fit, and the rest narrow only as a
 # `let` would.

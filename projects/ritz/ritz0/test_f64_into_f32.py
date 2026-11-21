@@ -21,6 +21,11 @@ refusal rows run on every compiler; the accepted program runs on every
 compiler, which both accept.  The widening rows (WIDENED, below) were ritz0's
 alone for two separate ritz1 bugs, #4028 and #4029; they run on every
 compiler.
+
+AGAST #4439: a match arm's tail ident, typed by a `let` inside that arm, is a
+block-local f64 into an f32 slot too.  ritz1 judged it against a type it could
+no longer see the block scope for, so it accepted; the rows pin ritz0's
+location too, which is the arm Block's first line with the column reset to 1.
 """
 
 import pytest
@@ -104,6 +109,32 @@ fn f(x: f64, y: f32) -> f32
     let d: f32 = ^y * x
     d
 """,
+    # AGAST #4439: a block-local tail (a match arm's tail ident, typed by a
+    # `let` inside the arm) reaches the slot after the block's scope closes.
+    # ritz0 reports the arm's Block span: its first line, column reset to 1.
+    # The declaration is the arm block's first statement here: 4:1.
+    "match_block": """\
+fn f(x: f64, c: bool) -> f32
+    let d: f32 = match c
+        true =>
+^            let y: f64 = x
+            y
+        false =>
+            0.0
+    d
+""",
+    # The declaration is the fn's own `let` (2:13), out of the slot's reach;
+    # the arm block is one bare expression, so ritz0 reports its line: 5:1.
+    "match_tail_only": """\
+fn f(x: f64, c: bool) -> f32
+    let y: f64 = x
+    let d: f32 = match c
+        true =>
+^            y
+        false =>
+            0.0
+    d
+""",
 }
 
 
@@ -172,6 +203,51 @@ pub fn main() -> i32
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_literals_as_and_widening_still_convert(tmp_path, compiler):
     assert _run(compiler, tmp_path, "f64_f32_accepted", ACCEPTED) == 0
+
+
+# AGAST #4439: the two block tails above become errors, so this pins what an
+# arm may still say: `y as f32`, an f32 local typed by a cast, and a literal
+# tail.  All three compilers accept and run it.
+MATCH_TAILS_ACCEPTED = """\
+fn f(x: f64, c: bool) -> f32
+    let d: f32 = match c
+        true =>
+            let y: f64 = x
+            y as f32
+        false =>
+            0.0
+    d
+
+fn g(x: f64, c: bool) -> f32
+    let d: f32 = match c
+        true =>
+            let y: f32 = x as f32
+            y
+        false =>
+            0.0
+    d
+
+fn h(c: bool) -> f32
+    let d: f32 = match c
+        true =>
+            1.5
+        false =>
+            0.0
+    d
+
+pub fn main() -> i32
+    let a: f32 = f(2.5, true)
+    let b: f32 = g(2.5, true)
+    let e: f32 = h(true)
+    if a != (2.5 as f32) or b != (2.5 as f32) or e != (1.5 as f32)
+        return 1
+    0
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_match_tail_exemptions_still_compile(tmp_path, compiler):
+    assert _run(compiler, tmp_path, "f64_f32_match_tails", MATCH_TAILS_ACCEPTED) == 0
 
 
 # AGAST #4028 (was RITZ0_ONLY here, "separate ritz1 bugs"): f32 into f64 stays
