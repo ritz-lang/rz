@@ -6,7 +6,7 @@
 two compilers' tests were wrong on different forms. With `a: u64` holding
 2^64 - 8 and `z: u64 = 0`:
 
-    (a ^ z) > 1     ritz0: false, as `_infer_unsigned_expr` has no operator arm
+    (a ^ z) > 1     ritz0: false, as the emitter had no operator arm
     (a ^ z) / 2     ritz0: -4 (sdiv)
     K[0] / 2        ritz1: sdiv, as `get_expr_type` says i64 for a u64 element,
                     const, user method's return or `x[i].f`

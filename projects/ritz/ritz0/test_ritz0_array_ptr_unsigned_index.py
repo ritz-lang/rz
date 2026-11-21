@@ -6,7 +6,7 @@
     if q[1] != 201      # ritz0: sext i8 -> -55, so this was true
         return 1
 
-_infer_unsigned_expr's Index arm asked whether `*[3]u8`'s pointee was unsigned,
+the old Index rule asked whether `*[3]u8`'s pointee was unsigned,
 and an array isn't, so every read through a pointer to an unsigned array was
 signed: compares, casts, `/` and `>>`.  ritz1 was already right; the matrix runs
 all three compilers so they stay in agreement.

@@ -105,7 +105,7 @@ pub fn main() -> i32
     return mkn().c * 6
 """,
     # AGAST #2042: a u8 field with its top bit set, read off a call result.
-    # ritz0 sign-extended it (200 -> -56) because _infer_unsigned_expr only
+    # ritz0 sign-extended it (200 -> -56) because its old rule only
     # resolved `ident.field`.
     "call_unsigned_high_bit": STRUCTS
     + """\

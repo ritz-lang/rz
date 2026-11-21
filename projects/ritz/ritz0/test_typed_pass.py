@@ -518,7 +518,97 @@ def test_the_emitter_takes_the_types_of_the_kinds_it_reads_from_the_table():
     em = _emitter_over(table)
     assert [_name(em._infer_ritz_type(n)) for n, _ in rows] == [ty for _, ty in rows]
     # Signedness of a cast and a char comes from the table too.
-    assert [em._infer_unsigned_expr(n) for n in (cast, char)] == [False, False]
+    assert [em._expr_unsigned(n) for n in (cast, char)] == [False, False]
+
+
+KINDS_WITH_AN_EMITTER_RULE = """
+struct S
+    v: i64
+
+fn pick(p: *i64) -> i64
+    *p
+
+fn main() -> i32
+    var x: i64 = 1
+    let s = S { v: 2 }
+    let c = pick(@x)
+    let n = x + 1
+    let d = *@x
+    let f = s.v
+    let a = [x]
+    let i = a[0]
+    let lt = x < 2
+    (c + n + d + f + i + (lt as i64)) as i32
+"""
+
+
+def _signedness_emitter(table):
+    """The emitter the signedness helpers need: the table, and empty state so
+    a rule of its own has nothing to answer with."""
+    em = _emitter_over(table)
+    em.ritz_types = {}
+    em.constants = {}
+    em.const_ritz_types = {}
+    em.locals = set()
+    em.params = set()
+    em.struct_fields = {}
+    em.functions = {}
+    return em
+
+
+def test_the_remaining_kinds_take_their_signedness_from_the_table():
+    """#4067: Ident, BinOp, UnaryOp, Field, Index and Call answered signedness
+    from the emitter's own rules; they now answer `_is_unsigned_type(<the
+    table's type>)`.  Retype each in the table to `u64` and the emitter says
+    unsigned, though its empty state says nothing."""
+    from llvmlite import ir
+    module = parse(KINDS_WITH_AN_EMITTER_RULE)
+    table = typed.type_module(module)
+    (binop,) = [n for n in _nodes(module, rast.BinOp) if n.op == '<']
+    ident = [n for n in _nodes(module, rast.Ident) if n.name == 'x'][0]
+    (unary,) = [n for n in _nodes(module, rast.UnaryOp)
+                if n.op == '*' and isinstance(n.operand, rast.UnaryOp)
+                and n.operand.op == '@']
+    (field,) = [n for n in _nodes(module, rast.Field) if n.field == 'v']
+    (index,) = _nodes(module, rast.Index)
+    (call,) = [n for n in _nodes(module, rast.Call)
+               if isinstance(n.func, rast.Ident) and n.func.name == 'pick']
+    i64 = ir.IntType(64)
+    value = ir.Constant(i64, 0)
+    for kind_name, node in (("Ident", ident), ("BinOp", binop), ("UnaryOp", unary),
+                            ("Field", field), ("Index", index), ("Call", call)):
+        table.record(node, rast.NamedType(None, "u64", []))
+        em = _signedness_emitter(table)
+        assert em._expr_unsigned(node), kind_name
+        assert em._int_shape(node, False)[1], kind_name
+        assert em._assert_value_kind(value, node) == em._ASSERT_UNSIGNED, kind_name
+        table.record(node, rast.NamedType(None, "i64", []))
+        assert not em._expr_unsigned(node), kind_name
+
+
+def test_signedness_is_looked_up_in_the_body_being_emitted():
+    """Monomorph shares a generic instance's unchanged subtrees, so the
+    unqualified lookup keeps the last instance's type (#3553): a shared `a`
+    was `u8` in one instance and `i32` in another.  The emitter asks in the
+    body it is emitting."""
+    module = parse(KINDS_WITH_AN_EMITTER_RULE)
+    table = typed.type_module(module)
+    fns = {fn.name: fn for fn in _nodes(module, rast.FnDef)}
+    ident = [n for n in _nodes(module, rast.Ident) if n.name == 'x'][0]
+    table.record(ident, rast.NamedType(None, "u8", []), within=fns["main"])
+    table.record(ident, rast.NamedType(None, "i64", []), within=fns["pick"])
+    em = _signedness_emitter(table)
+    em.current_fn_def = fns["main"]
+    assert em._expr_unsigned(ident)
+    em.current_fn_def = fns["pick"]
+    assert not em._expr_unsigned(ident)
+
+
+def test_the_emitter_has_no_infer_unsigned_expr():
+    """Its answer is `_is_unsigned_type(self._typed_type(expr))` (#4067):
+    the function and its own rules are gone."""
+    from emitter_llvmlite import LLVMEmitter
+    assert not hasattr(LLVMEmitter, "_infer_unsigned_expr")
 
 
 CALL_METHOD_ARRAY = """

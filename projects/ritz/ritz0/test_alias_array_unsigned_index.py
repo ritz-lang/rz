@@ -9,7 +9,7 @@
 
 _infer_ritz_type's Index arm asked whether the indexed value's type was an
 `ArrayType`, and `A` is a `NamedType` until its alias is resolved, so the element
-type came back None and _infer_unsigned_expr said signed.  Compares, casts, `/`
+type came back None and the emitter said signed.  Compares, casts, `/`
 and `>>` all went wrong.  No literal or store is involved: the element is
 written one index at a time.
 

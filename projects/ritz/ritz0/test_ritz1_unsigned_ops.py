@@ -13,7 +13,7 @@ top bit set is negative as an i64, so
     a / 16           # ritz1: sdiv, a negative quotient
 
 ritz0 picks the unsigned op when either operand is unsigned
-(_infer_unsigned_expr). ritz1 now does the same whenever either operand is u64.
+(_int_shape). ritz1 now does the same whenever either operand is u64.
 
 Oracle: ritz0 compiles every program, and both binaries exit 42 (each failing
 check returns its own code, so a mismatch names the check). The IR test

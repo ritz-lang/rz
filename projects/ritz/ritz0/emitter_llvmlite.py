@@ -2035,7 +2035,7 @@ class LLVMEmitter(exprs.ExprEmitter):
         if want >= 64:
             return None
 
-        unsigned = self._infer_unsigned_expr(other_expr)
+        unsigned = self._expr_unsigned(other_expr)
         if not self._int_literal_fits(lit_val, want, unsigned):
             # The literal cannot be represented at the declared width. Leave
             # it alone rather than truncating it here; `_check_let_annotation`
@@ -2061,13 +2061,33 @@ class LLVMEmitter(exprs.ExprEmitter):
         return rast.FnType(span, [p.type for p in fn_def.params], fn_def.ret_type,
                            getattr(fn_def, 'callconv', None), lent)
 
-    def _typed_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+    def _typed_type(self, expr: rast.Expr,
+                    within: Optional[rast.FnDef] = None) -> Optional[rast.Type]:
         """`expr`'s type as the typing pass found it (typed.py), or None
-        where it found none: an expression it never typed, or `unknown`."""
-        ty = self.typed.type_of(expr)
+        where it found none: an expression it never typed, or `unknown`.
+        `within`, if given, is the body being emitted (Typed.type_of)."""
+        ty = self.typed.type_of(expr, within=within)
         if isinstance(ty, rast.NamedType) and ty.name == 'unknown' and not ty.args:
             return None
         return ty
+
+    def _expr_unsigned(self, expr: rast.Expr) -> bool:
+        """Is `expr` of an unsigned integer type?  The typing pass's answer
+        (`_typed_type`), not a rule of the emitter's own (#4067): the kinds it
+        used to infer itself, Ident, BinOp, UnaryOp, Field, Index, Call and
+        MethodCall, read the table here as CharLit and Cast have since #3555.
+
+        Look it up in the body being emitted first: monomorph shares each
+        subtree an instance leaves unchanged, so an unqualified `type_of`
+        answers with the last instance's type (Typed.type_of, #3553), and a
+        generic helper's `a` is `u8` in one instance and `i32` in another.
+        """
+        body = getattr(self, 'current_fn_def', None)
+        if body is not None:
+            ty = self._typed_type(expr, within=body)
+            if ty is not None:
+                return self._is_unsigned_type(ty)
+        return self._is_unsigned_type(self._typed_type(expr))
 
     def _infer_ritz_type(self, expr: rast.Expr, llvm_val: ir.Value = None) -> Optional[rast.Type]:
         """Infer a Ritz type from an expression, for signedness tracking.
@@ -2181,7 +2201,7 @@ class LLVMEmitter(exprs.ExprEmitter):
             if base_type:
                 # `b[i]` on `b: A` with `type A = [4]u8` is a u8 (AGAST #2365).
                 # Unresolved, `A` is a NamedType, the element came back None and
-                # _infer_unsigned_expr read it signed: 200 compared as -56.
+                # the emitter read it signed: 200 compared as -56.
                 base_type = resolve_alias_in(base_type, self.type_aliases)
                 # A reference to a Vec auto-derefs on index (AGAST #1968), so
                 # `d[i]` on `d: @Vec<T>` is a T, mirroring _emit_index.
@@ -4691,35 +4711,6 @@ class LLVMEmitter(exprs.ExprEmitter):
             # Also check pointer to struct
             if isinstance(ty, ir.PointerType) and ty.pointee == struct_ty:
                 return name
-        return None
-
-    def _get_field_type(self, field_expr: rast.Field) -> Optional[rast.Type]:
-        """Get the Ritz type of a struct field expression.
-
-        Given a field access expression like `s.data`, returns the Ritz type
-        of the `data` field in struct `s`. Used by _infer_unsigned_expr to
-        determine signedness for struct field array indexing (Issue #98).
-        """
-        if not isinstance(field_expr.expr, rast.Ident):
-            return None
-
-        base_name = field_expr.expr.name
-        if base_name not in self.ritz_types:
-            return None
-
-        struct_type = self.ritz_types[base_name]
-        struct_name = None
-
-        if isinstance(struct_type, rast.NamedType):
-            struct_name = struct_type.name
-        elif isinstance(struct_type, rast.PtrType) and isinstance(struct_type.inner, rast.NamedType):
-            struct_name = struct_type.inner.name
-
-        if struct_name and struct_name in self.struct_fields:
-            for field_name, field_type in self.struct_fields[struct_name]:
-                if field_name == field_expr.field:
-                    return field_type
-
         return None
 
     def _struct_has_field(self, struct_name: str, field_name: str) -> bool:
@@ -10082,7 +10073,7 @@ class LLVMEmitter(exprs.ExprEmitter):
         if isinstance(value.type, ir.IntType):
             if value.type.width == 1:
                 return self._ASSERT_BOOL
-            if self._infer_unsigned_expr(expr):
+            if self._expr_unsigned(expr):
                 return self._ASSERT_UNSIGNED
             return self._ASSERT_SIGNED
         if isinstance(value.type, ir.PointerType):
@@ -15845,14 +15836,15 @@ class LLVMEmitter(exprs.ExprEmitter):
         """`(bits, unsigned)` of integer expression `expr`, for `>>` (#2356) and
         for `/`, `%` and the ordered compares (#2361).
 
-        _infer_unsigned_expr has no arm for an operator, so `(h ^ x) >> 33` on a
-        u64 sign-filled. The wider operand wins, at equal width the unsigned one
-        does, and a shift keeps its left operand's signedness. A literal is an
-        i64, unless only a u64 can hold it, or `narrowed` says the emitted value
-        is narrower than 64 bits: then the literal took its sibling's type
-        (LARB R21, _literal_takes_operand_type) or, on a shift's left, the
-        slot's (_retype_literal_operand). ritz1's int_operand_shape is this,
-        with R21's rule spelled out, as ritz1 holds every integer in an i64.
+        The emitter's old signedness rule had no arm for an operator, so
+        `(h ^ x) >> 33` on a u64 sign-filled. The wider operand wins, at equal
+        width the unsigned one does, and a shift keeps its left operand's
+        signedness. A literal is an i64, unless only a u64 can hold it, or
+        `narrowed` says the emitted value is narrower than 64 bits: then the
+        literal took its sibling's type (LARB R21, _literal_takes_operand_type)
+        or, on a shift's left, the slot's (_retype_literal_operand). ritz1's
+        int_operand_shape is this, with R21's rule spelled out, as ritz1 holds
+        every integer in an i64.
         """
         if isinstance(expr, rast.IntLit):
             return 64, expr.value >= 1 << 63
@@ -15881,7 +15873,7 @@ class LLVMEmitter(exprs.ExprEmitter):
             if isinstance(callee, rast.FnType):
                 ty = callee.ret
         name = ty.name if isinstance(ty, rast.NamedType) else None
-        unsigned = self._is_unsigned_type(ty) or self._infer_unsigned_expr(expr)
+        unsigned = self._is_unsigned_type(ty) or self._expr_unsigned(expr)
         return self._INT_TYPE_WIDTHS.get(name, 64), unsigned
 
     def _operands_unsigned(self, expr: rast.BinOp, left: ir.Value) -> bool:
@@ -15893,118 +15885,6 @@ class LLVMEmitter(exprs.ExprEmitter):
         narrowed = isinstance(left.type, ir.IntType) and left.type.width < 64
         return (self._int_shape(expr.left, narrowed)[1]
                 or self._int_shape(expr.right, narrowed)[1])
-
-    def _infer_unsigned_expr(self, expr: rast.Expr) -> bool:
-        """Check if an expression produces an unsigned integer type.
-
-        This is used to determine whether to use zext (unsigned) or sext (signed)
-        when widening integers, and whether to use icmp_unsigned vs icmp_signed
-        for comparisons.
-        """
-        # A char or a cast: the typing pass's type (a char is a u8, a cast is
-        # its target).
-        if isinstance(expr, (rast.CharLit, rast.Cast)):
-            return self._is_unsigned_type(self._typed_type(expr))
-
-        # Identifier - check stored type
-        if isinstance(expr, rast.Ident):
-            if expr.name in self.ritz_types:
-                return self._is_unsigned_type(self.ritz_types[expr.name])
-            # A scalar const: its declared type, as for a local (#2170).
-            if expr.name in self.constants and expr.name in self.const_ritz_types:
-                return self._is_unsigned_type(self.const_ritz_types[expr.name])
-            return False
-
-        # Dereference of pointer to unsigned type
-        if isinstance(expr, rast.UnaryOp) and expr.op == '*':
-            # Check inner expression type
-            inner = expr.operand
-            if isinstance(inner, rast.Ident):
-                if inner.name in self.ritz_types:
-                    ritz_type = self.ritz_types[inner.name]
-                    if isinstance(ritz_type, rast.PtrType):
-                        return self._is_unsigned_type(ritz_type.inner)
-            # Pointer arithmetic: (ptr + offset) where ptr is *u8
-            if isinstance(inner, rast.BinOp) and inner.op == '+':
-                if isinstance(inner.left, rast.Ident):
-                    if inner.left.name in self.ritz_types:
-                        ritz_type = self.ritz_types[inner.left.name]
-                        if isinstance(ritz_type, rast.PtrType):
-                            return self._is_unsigned_type(ritz_type.inner)
-            # Any other pointer operand: an inline cast `*(@b[0] as *u16)` /
-            # `*((base + 2) as *u16)` or an address-of `*@b[0]` / `*@g`
-            # (AGAST #2146). The load already has the pointee's width, but
-            # without this a u16/u32 pointee widened with sext (65535 -> -1).
-            # _infer_ritz_type resolves `as *T` to *T and `@x` to *typeof(x),
-            # and its '*' arm strips the pointer.
-            return self._is_unsigned_type(self._infer_ritz_type(expr))
-
-        # Index into unsigned array or pointer
-        if isinstance(expr, rast.Index):
-            through = self._index_through(expr)
-            if through is not None:
-                return self._is_unsigned_type(self._infer_ritz_type(through))
-            if isinstance(expr.expr, rast.Ident):
-                if expr.expr.name in self.ritz_types:
-                    ritz_type = self.ritz_types[expr.expr.name]
-                    if isinstance(ritz_type, rast.ArrayType):
-                        return self._is_unsigned_type(ritz_type.inner)
-                    # Also handle pointer indexing: ptr[idx] where ptr is *u8.
-                    # Through a `*[N]T` the element is T, not the array
-                    # (AGAST #2541): asking about `[N]u8` said signed, so
-                    # 201u8 widened with sext to -55. _infer_ritz_type sees
-                    # through the array (#2330).
-                    if isinstance(ritz_type, rast.PtrType):
-                        return self._is_unsigned_type(self._infer_ritz_type(expr))
-            # Handle struct field array indexing: s.data[0] where data is [N]u8
-            # Issue #98: This case was missing, causing sext instead of zext
-            elif isinstance(expr.expr, rast.Field):
-                field_type = self._get_field_type(expr.expr)
-                if field_type:
-                    if isinstance(field_type, rast.ArrayType):
-                        return self._is_unsigned_type(field_type.inner)
-                    if isinstance(field_type, rast.PtrType):
-                        # `s.p[i]` with `p: *[N]u8` is a u8, as above (#2541).
-                        pointee = resolve_alias_in(field_type.inner, self.type_aliases)
-                        if isinstance(pointee, rast.ArrayType):
-                            return self._is_unsigned_type(pointee.inner)
-                        return self._is_unsigned_type(field_type.inner)
-            # Anything else, notably the Vec index sugar `v[i]` / `d[i]` on a
-            # `@Vec<T>` (AGAST #1979): vec_get$T returns a bare i8/i16, so
-            # ask _infer_ritz_type for the element type.
-            return self._is_unsigned_type(self._infer_ritz_type(expr))
-
-        # Field access - check struct field type
-        if isinstance(expr, rast.Field):
-            if isinstance(expr.expr, rast.Ident):
-                if expr.expr.name in self.ritz_types:
-                    struct_type = self.ritz_types[expr.expr.name]
-                    struct_name = None
-                    if isinstance(struct_type, rast.NamedType):
-                        struct_name = struct_type.name
-                    elif isinstance(struct_type, rast.PtrType) and isinstance(struct_type.inner, rast.NamedType):
-                        struct_name = struct_type.inner.name
-                    if struct_name and struct_name in self.struct_fields:
-                        for field_name, field_type in self.struct_fields[struct_name]:
-                            if field_name == expr.field:
-                                return self._is_unsigned_type(field_type)
-            # Any other base: an indexed element `a[i].f` (AGAST #2036), a
-            # call result `mk().f` (#2042), a nested `a[i].inner.f`. These
-            # lower to extractvalue on a loaded/returned aggregate, which
-            # carries no signedness, so without this a u8/u16/u32 field with
-            # its top bit set was widened with sext (202 -> -54).
-            # _infer_ritz_type resolves the base recursively.
-            return self._is_unsigned_type(self._infer_ritz_type(expr))
-
-        # Call / method call - the callee's declared return type (AGAST
-        # #1963). Without this a `-> u32` result with bit 31 set was widened
-        # with sext and compared signed, so `bits(..) != 0xC0100000` was
-        # always true. _infer_ritz_type already resolves free functions,
-        # static `Type.method(..)` and `recv.method(..)` to the declaration.
-        if isinstance(expr, (rast.Call, rast.MethodCall)):
-            return self._is_unsigned_type(self._infer_ritz_type(expr))
-
-        return False
 
     def _is_float_type(self, llvm_ty: ir.Type) -> bool:
         """Check if an LLVM type is a floating-point type."""
@@ -17704,7 +17584,7 @@ class LLVMEmitter(exprs.ExprEmitter):
         # `x: u8`, `(x + 1) as i64` zero-extends the u8 sum (LARB R21, #3112).
         src_unsigned = (self._int_shape(expr.expr, val.type.width < 64)[1]
                         if isinstance(val.type, ir.IntType)
-                        else self._infer_unsigned_expr(expr.expr))
+                        else self._expr_unsigned(expr.expr))
         use_zext = src_unsigned or self._is_unsigned_type(expr.target)
 
         # Handle integer widening with proper sign extension
