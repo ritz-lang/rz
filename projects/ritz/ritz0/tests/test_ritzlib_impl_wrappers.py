@@ -71,6 +71,10 @@ STRING_METHODS = STRING_STATIC | {
 }
 
 
+# Methods whose raw (ptr, len) shape is the print-sink protocol.
+PROTOCOL_METHODS = {"push_bytes"}
+
+
 def _impl_methods(path: Path, type_name: str) -> dict:
     """name -> FnDef of the non-trait `impl` of `type_name` in `path`."""
     src = path.read_text()
@@ -107,6 +111,13 @@ def test_impl_string_wraps_each_free_fn():
     for name, fn in sorted(methods.items()):
         assert fn.is_pub, f"String.{name} must be `pub` (#3418)"
         params = [p.name for p in fn.params]
+        if name in PROTOCOL_METHODS:
+            # The print-sink protocol (LANGUAGE_SPEC §2.6): the compiler emits
+            # `sink.push_bytes(data: *u8, len: i64)`, so the wrapper cannot
+            # forward the Span the free fn now takes.
+            assert params == ["self", "bytes", "len"], (
+                f"String.{name}: params {params!r}, want the protocol form")
+            continue
         want = f"string_{name}({', '.join(params)})"
         if fn.ret_type is not None:
             want = f"return {want}"
@@ -128,7 +139,7 @@ fn main() -> i32
     var u: String = String.with_cap(8)
     let a: String = String.from("ab")
     let b: String = String.from_cstr(c"cd")
-    let c: String = String.from_bytes(c"ef", 2)
+    let c: String = String.from_bytes(Span<u8> { ptr: (c"ef"), len: (2) as i64 })
     let d: String = String.from_strview("gh")
     let e: String = String.from_i64(42)
     let f: String = String.from_hex(255)

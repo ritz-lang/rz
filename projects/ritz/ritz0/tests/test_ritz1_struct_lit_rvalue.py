@@ -332,7 +332,7 @@ fn make() -> Option<Point>
 
 fn main() -> i32
     var o: Option<Point> = make()
-    return option_is_some<Point>(@o) - 1
+    return (option_is_some<Point>(@o) as i32) - 1
 """
 
 PKG_CASES = {

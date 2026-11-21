@@ -26,7 +26,8 @@ call's result (plain fn, or `vec_new<i32>()`) and a method's
 THE TESTS
 
   * each impl holds exactly the methods listed here, each `pub`, each a
-    single `return <prefix>_<method><T>(...)` of its own free fn.
+    single `return <prefix>_<method><T>(...)` of its own free fn -- except
+    `push_bytes`, whose raw `(data, len)` form is the print-sink protocol.
   * every wrapper's name, by method syntax, runs right on each compiler.
   * each receiver shape above, beside a `Vec<Res>` / `Option<Res>` whose
     `get` / `unwrap_or` would be refused, compiles and runs.
@@ -62,6 +63,9 @@ VEC_METHODS = {
 }
 OPTION_METHODS = {"is_some", "is_none", "unwrap_or"}
 
+# Methods whose raw (data, len) shape is the print-sink protocol.
+PROTOCOL_METHODS = {"push_bytes"}
+
 
 @pytest.mark.unit
 @pytest.mark.parametrize("path,type_name,prefix,want", [
@@ -78,6 +82,13 @@ def test_impl_wraps_each_free_fn(path, type_name, prefix, want):
         assert fn.is_pub, f"{type_name}.{name} must be `pub` (#3418)"
         params = [p.name for p in fn.params]
         assert params and params[0] == "self", f"{type_name}.{name} takes self"
+        if name in PROTOCOL_METHODS:
+            # The print-sink protocol (LANGUAGE_SPEC §2.6): the compiler emits
+            # `sink.push_bytes(data: *T, len: i64)`, so the wrapper cannot
+            # forward the Span the free fn now takes.
+            assert params == ["self", "data", "len"], (
+                f"{type_name}.{name}: params {params!r}, want the protocol form")
+            continue
         call = f"{prefix}_{name}<T>({', '.join(params)})"
         want_body = f"return {call}" if fn.ret_type is not None else call
         body = _body_text(path, fn)
@@ -159,7 +170,7 @@ pub fn main() -> i32
     v.set(0, 7)
     v.swap(1, 2)
     var t: i64 = v.len() + v.cap() / v.cap()
-    if v.is_empty() != 0
+    if v.is_empty()
         return 1
     t = t + (v.get(0) + v.first() + v.last() + *v.get_ptr(1) + *v.as_ptr()) as i64
     let s: Vec<i32> = v.slice(1, 3)

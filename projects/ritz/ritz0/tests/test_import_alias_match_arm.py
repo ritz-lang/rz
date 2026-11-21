@@ -108,14 +108,14 @@ def _assert_exit(
 
 @pytest.mark.integration
 def test_alias_import_with_expression_arms_in_an_imported_module(tmp_path):
-    # option.ritz's option_is_some is `Some(_) => 1` / `None => 0`.
+    # option.ritz's option_is_some returns bool (S-BOOL-2).
     result = _run(tmp_path, (
         "import ritzlib.sys as sys\n"
         "import ritzlib.option\n"
         "\n"
         "fn main() -> i32\n"
         "    let o: Option<i32> = Some(5)\n"
-        "    option_is_some<i32>(@o) + 6\n"
+        "    (option_is_some<i32>(@o) as i32) + 6\n"
     ))
     assert "has no attribute 'stmts'" not in result.stderr + result.stdout
     assert result.returncode == 7, result.stderr + result.stdout

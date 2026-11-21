@@ -202,7 +202,7 @@ fn divide(a: i32, b: i32) -> Result<i32, i32>
 pub fn main() -> i32
     var ok: Result<i32, i32> = divide(14, 2)
     var bad: Result<i32, i32> = divide(1, 0)
-    if result_is_err<i32, i32>(@bad) != 1
+    if not result_is_err<i32, i32>(@bad)
         return 1
     result_unwrap_or<i32, i32>(@ok, -1)
 """,

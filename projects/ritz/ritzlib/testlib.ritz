@@ -33,29 +33,31 @@ import ritzlib.errno
 # Buffer primitives
 # ============================================================================
 
-# Compare two byte buffers up to len bytes.  Returns 1 if equal, else 0.
-pub fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
+# Compare two byte spans.  true when they are the same length and bytes.
+pub fn buf_eq(a: Span<u8>, b: Span<u8>) -> bool
+    if a.len != b.len
+        return false
     var i: i64 = 0
-    while i < len
-        if *(a + i) != *(b + i)
-            return 0
+    while i < a.len
+        if *(a.ptr + i) != *(b.ptr + i)
+            return false
         i += 1
-    return 1
+    return true
 
-# Find needle (needle_len bytes) anywhere in [hay, hay+hay_len).
+# Find needle anywhere in hay.
 # Empty needle always matches (mirrors strstr/grep semantics).
-# Returns 1 if found, else 0.
-pub fn buf_contains(hay: *u8, hay_len: i64, needle: *u8, needle_len: i64) -> i32
-    if needle_len == 0
-        return 1
-    if needle_len > hay_len
-        return 0
+# true if found, else false.
+pub fn buf_contains(hay: Span<u8>, needle: Span<u8>) -> bool
+    if needle.len == 0
+        return true
+    if needle.len > hay.len
+        return false
     var i: i64 = 0
-    while i <= hay_len - needle_len
-        if buf_eq(hay + i, needle, needle_len) == 1
-            return 1
+    while i <= hay.len - needle.len
+        if buf_eq(Span<u8> { ptr: hay.ptr + i, len: needle.len }, needle)
+            return true
         i += 1
-    return 0
+    return false
 
 # Length of a null-terminated cstring (excluding the terminator).
 pub fn cstr_len(s: *u8) -> i64
@@ -108,14 +110,14 @@ pub fn make_sandbox_path(dst: *u8, prefix: *u8, suffix: *u8) -> i64
 # File I/O
 # ============================================================================
 
-# Write content (len bytes) to path, creating/truncating with 0o600 perms.
+# Write content to path, creating/truncating with 0o600 perms.
 # true when every byte was written (false on open or write failure).
-pub fn write_file(path: *u8, content: *u8, len: i64) -> bool
+pub fn write_file(path: *u8, content: Span<u8>) -> bool
     let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 384)
     if fd < 0
         return false
-    if len > 0
-        let w: i64 = sys_write(fd, content, len)
+    if content.len > 0
+        let w: i64 = sys_write(fd, content.ptr, content.len)
         if w < 0
             sys_close(fd)
             return false
@@ -166,10 +168,8 @@ pub fn exec_capture(
     bin: *u8,
     argv: **u8,
     envp: **u8,
-    stdin_data: *u8,
-    stdin_len: i64,
-    out_buf: *u8,
-    out_max: i64,
+    stdin: Span<u8>,
+    out: Span<u8>,
     out_len: *i64,
 ) -> i32
     # Stage stdin via temp file if requested.  We use a fixed "in" suffix
@@ -180,13 +180,13 @@ pub fn exec_capture(
     # nonsensical.
     var stdin_path: [128]u8
     var fd_r: i32 = -1
-    if stdin_data != null
+    if stdin.ptr != null
         make_sandbox_path(@stdin_path[0], c"stdin", c"in")
         let fd_w: i32 = sys_open3(@stdin_path[0], O_WRONLY + O_CREAT + O_TRUNC, 384)
         if fd_w < 0
             return -1
-        if stdin_len > 0
-            sys_write(fd_w, stdin_data, stdin_len)
+        if stdin.len > 0
+            sys_write(fd_w, stdin.ptr, stdin.len)
         sys_close(fd_w)
         fd_r = sys_open(@stdin_path[0], O_RDONLY)
         if fd_r < 0
@@ -230,8 +230,8 @@ pub fn exec_capture(
         sys_close(fd_r)
 
     var total: i64 = 0
-    while total < out_max
-        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, out_max - total)
+    while total < out.len
+        let r: i64 = sys_read(stdout_pipe[0], out.ptr + total, out.len - total)
         if r <= 0
             break
         total += r
@@ -240,7 +240,7 @@ pub fn exec_capture(
 
     var status: i32 = 0
     sys_wait4(pid, @status, 0, null)
-    if stdin_data != null
+    if stdin.ptr != null
         sys_unlink(@stdin_path[0])
     # POSIX wait status: high byte is exit code.
     return (status >> 8) & 0xFF

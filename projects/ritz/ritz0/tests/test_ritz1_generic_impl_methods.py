@@ -35,7 +35,7 @@ pub fn main() -> i32
     var b: Box<i32> = box_new<i32>(7)
     let v: i32 = b.get()
     b.drop()
-    return v + b.valid()
+    return v + (b.valid() as i32)
 """,
     # A user-defined inherent generic impl, used at two type arguments.
     "inherent_two_args": """\

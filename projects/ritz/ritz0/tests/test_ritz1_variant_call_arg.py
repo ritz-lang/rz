@@ -173,7 +173,7 @@ import ritzlib.option
 import ritzlib.strview
 
 fn g(o: Option<StrView>) -> i32
-    if option_is_some<StrView>(@o) != 0
+    if option_is_some<StrView>(@o)
         return 7
     0
 """
