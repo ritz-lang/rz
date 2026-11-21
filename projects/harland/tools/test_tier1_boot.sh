@@ -362,17 +362,20 @@ powered_off() {
 }
 
 # preempted NAME: pass only if the kernel calibrated its LAPIC tick and init's
-# two /bin/busy children (Tier-1 `preempt`, #3629) both finished all their
-# steps with their progress lines interleaved: the run of one child's lines
-# broken by the other's at least twice (A..B..A or B..A..B). Neither child
-# makes a syscall between lines, so without timer preemption the first runs
-# to its end before the second starts: exactly two runs.
+# two /bin/busy children (Tier-1 `preempt`, #3629) both ran side by side with
+# their progress lines interleaved. Neither child makes a syscall between
+# lines, so without timer preemption the first runs to its end before the
+# second starts: A..A..B..B, exactly two runs.
 #
-# The bar is 10 runs, not 3 (AGAST #4332). A healthy pair alternates almost
-# every step (14..16 runs); the two runs of an un-preempted pair (or of the
-# ritz1/ritz1 bug that made one child ~14x slower, BBBBBBBABAAAAAAA) are 2..4.
-# A threshold of 3 let that regression pass as 4 runs; 10 is far above both
-# failure shapes and below every measured healthy pairing.
+# The bar is 6 runs, not 10 (AGAST #4438). The run count is a relative-speed
+# measure: 16 lines alternating gives 16 runs, but a loaded host may give each
+# child two steps per timeslice, pairing the lines ABBAABBA... for 9 runs
+# (#4438's CI failure: 9 runs, preemption healthy). The genuine failure shapes
+# are 2 runs (no preemption) and 4 (#4332's starved child, caught by the
+# ratio below). 6 sits between them: two clear of 4, three below the measured
+# CI tail of 9, seven below the 13..16 healthy pair (39 boots, load 2..23).
+# The ratio check is the primary invariant: it measures preemption directly
+# and is scale-invariant under host load.
 preempted() {
     local log="$WORK/$1.log"
     if ! grep -aqE '\[timer\] LAPIC timer [0-9]+ Hz .*periodic [0-9]+ Hz tick' "$log"; then
@@ -392,7 +395,7 @@ order = "".join(seq)
 if done != {"A", "B"}:
     print(f"FAIL ({name}): busy children did not both finish (progress: {order or 'none'})")
     sys.exit(1)
-if runs < 10:
+if runs < 6:
     print(f"FAIL ({name}): busy children barely interleaved, not preempted each step ({order}, {runs} runs)")
     sys.exit(1)
 # The interleave count is timing-sensitive, so also read the scheduler's own
@@ -400,7 +403,8 @@ if runs < 10:
 # that interrupts ring 3, so the tick:preemption ratio is ~1.1..1.5 whichever
 # compiler built kernel and userland. The bug left one child running alone
 # for hundreds of ticks (911 ticks, 195 preemptions, ratio 4.7) while the fix
-# gives 356/233 (1.5). The ratio is scale-invariant: a loaded host slows the
+# gives 356/233 (1.5). Measured over 39 boots at load 2..23 (AGAST #4438):
+# 1.10..1.23. The ratio is scale-invariant: a loaded host slows the
 # guest and inflates ticks and preemptions together. 3 leaves margin on both
 # sides, and the run count above must pass as well, so neither a lone green
 # boot nor a lucky preemption can wave the regression through.

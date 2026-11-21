@@ -286,15 +286,19 @@ def test_tier1_boot_requires_the_busy_lines_to_interleave():
     script = TIER1.read_text()
     fn = script[script.index("preempted() {"):]
     fn = fn[:fn.index("\n}\n")]
-    # The bar is 10 runs, not 3 (AGAST #4332): a healthy pair alternates most
-    # steps (14..16), while the two runs of an un-preempted pair, or of the
-    # ritz1/ritz1 regression (BBBBBBBABAAAAAAA), are 2..4. The old threshold
-    # of 3 let that regression pass as 4 runs.
-    assert "runs < 10" in fn and 'done != {"A", "B"}' in fn
+    # The run count only has to show both children were alive at once: 16
+    # lines alternating gives 16 runs, but a loaded host can give each child
+    # two steps per timeslice (ABBAABBA..., 9 runs) while the scheduler
+    # preempts normally (AGAST #4438). The genuine failure shapes are 2 runs
+    # (no preemption: A..A..B..B) and 4 (#4332's starved child, caught by the
+    # ratio below). 6 sits between: two clear of 4, three below the measured
+    # CI tail of 9, seven below the 13..16 healthy pair.
+    assert "runs < 6" in fn and 'done != {"A", "B"}' in fn
     # The interleave count alone is timing-sensitive, so the script must also
     # read the scheduler's counters: the regression left one child running
     # alone for hundreds of ticks (911 ticks / 195 preemptions, ratio 4.7)
-    # where a healthy pair is 1.1..1.5.
+    # where a healthy pair measured 1.10..1.23 on an idle and a loaded host
+    # (AGAST #4438, 39 boots at load 2..23).
     assert r"\[sched\]" in fn and "preemptions * 3" in fn
     assert r"\[timer\] LAPIC timer" in fn
     for boot in ("native", "grub"):
