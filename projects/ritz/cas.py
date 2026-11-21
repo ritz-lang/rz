@@ -45,9 +45,18 @@ objects (build.cas_object), and ritz1/Makefile's ritzlib objects through
 `cas.py get-or-build SRC OUT.o`. All share build.cas_module_key, so one
 compile of a module serves all of them, in every worktree.
 
-Size: `rz cache gc` (`cas.py gc`) trims least-recently-used entries to
-$RITZ_CACHE_MAX_BYTES (default DEFAULT_GC_BYTES); every ci_local gate ends
-with that trim.
+Size: `rz cache gc` (`cas.py gc`) does two passes (AGAST #4421):
+
+* trims least-recently-used objects to $RITZ_CACHE_MAX_BYTES (default
+  DEFAULT_GC_BYTES); every ci_local gate ends with that trim. `--max-bytes`
+  takes a byte count or a binary suffix (`3GiB`, `4G`, `1.5MiB`).
+* evicts *age-stale* sandbox working sets that the object store never owned:
+  repo copies under `<cache>/<compiler>/home/**/ritz-lang/*` (and
+  `<cache>/home/**/ritz-lang/*`), plus entries in `<compiler>/tmp`, older
+  than GC_MAX_AGE_SECONDS. Anything with a recent mtime is a live gate's
+  working set: it is skipped and every skip is logged. Biggest win first.
+  That is where the space actually goes: 7.5 G of stale clones on chungus
+  against 75 M of `<compiler>/tmp` (AGAST #4421).
 
 Stats: `RITZ_CAS_STATS=1` prints hits/misses/bytes for the process to stderr
 at exit, and apart from them ritz0's module-interface hits/misses (a miss is
@@ -67,6 +76,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -86,6 +96,10 @@ KEY_SCHEMA = "ritz-cas-v1"
 # compiler fingerprint's worth of ritzlib, ritz1 and test closures), so 4 GiB
 # keeps several compiler versions -- other worktrees, a bisect -- warm.
 DEFAULT_GC_BYTES = 4 * 1024 ** 3
+# A sandbox repo copy or a `<compiler>/tmp` entry older than this is stale and
+# goes; anything younger may belong to a live gate and is left alone
+# (AGAST #4421, the `-mtime +1` pass that reclaimed 7.5 G on chungus).
+GC_MAX_AGE_SECONDS = 24 * 60 * 60
 # ArtifactStore.fetch: hits lost to a concurrent gc before giving up. Each
 # retry after the first rebuilds under the key's lock, so 2 is the norm.
 _FETCH_ATTEMPTS = 5
@@ -104,6 +118,34 @@ def default_root() -> Path:
     if env:
         return Path(env).expanduser()
     return Path.home() / ".cache" / "ritz" / "cas"
+
+
+# `--max-bytes` spellings. Bare numbers are bytes; K/M/G/T and KiB/MiB/GiB/TiB
+# (and the KB/MB/... spelling, treated as binary too) are powers of 1024. The
+# refusal in .claude/provision-room.sh prints a `rz cache gc` recipe, and a
+# suffix is what people type, so the CLI accepts one (AGAST #4421).
+_SIZE_UNITS = {
+    "": 1, "b": 1,
+    "k": 1024, "kb": 1024, "kib": 1024,
+    "m": 1024 ** 2, "mb": 1024 ** 2, "mib": 1024 ** 2,
+    "g": 1024 ** 3, "gb": 1024 ** 3, "gib": 1024 ** 3,
+    "t": 1024 ** 4, "tb": 1024 ** 4, "tib": 1024 ** 4,
+}
+_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*$")
+
+
+def parse_size(text: str) -> int:
+    """A byte count: `3221225472`, `3GiB`, `4G`, `1.5MiB`, `0`.
+
+    Raises ValueError naming the accepted forms. The CLI wraps that in
+    argparse.ArgumentTypeError."""
+    m = _SIZE_RE.match(str(text))
+    unit = m.group(2).lower() if m else None
+    if not m or unit not in _SIZE_UNITS:
+        raise ValueError(
+            f"not a byte count: {text!r} "
+            f"(use bytes, or a K/M/G/T or KiB/MiB/GiB/TiB suffix, e.g. 3GiB)")
+    return int(float(m.group(1)) * _SIZE_UNITS[unit])
 
 
 # ============================================================================
@@ -459,12 +501,29 @@ class ArtifactStore:
             pass
         return p
 
-    def gc(self, max_bytes: int) -> tuple:
-        """Delete least-recently-used entries until the store fits `max_bytes`.
+    def gc(self, max_bytes: int, *,
+           max_age_seconds: float = GC_MAX_AGE_SECONDS,
+           log: Optional[Callable[[str], None]] = None) -> tuple:
+        """Free space from the store and from stale sandbox working sets.
 
-        Returns (files removed, bytes freed). Never removes everything just
-        because it can: only the oldest files beyond the cap go.
+        Returns (files removed, bytes freed).
+
+        Object pass: least-recently-used entries go until the store fits
+        `max_bytes`; it never removes everything just because it can, only
+        the oldest files beyond the cap.
+
+        Age pass (AGAST #4421): sandbox repo copies under
+        `<cache>/<compiler>/home/**/ritz-lang/*` (and `<cache>/home/**/...`)
+        and entries in `<compiler>/tmp` older than `max_age_seconds` are
+        evicted, biggest first. Anything younger is a live gate's working
+        set: it is skipped, never touched, and `log` receives the reason.
         """
+        removed, freed = self._gc_objects(max_bytes)
+        r, f = self._gc_stale_workdirs(max_age_seconds=max_age_seconds, log=log)
+        return removed + r, freed + f
+
+    def _gc_objects(self, max_bytes: int) -> tuple:
+        """The CAS-only pass: LRU trim of `objects/` to `max_bytes`."""
         files = []
         total = 0
         objects = self.root / "objects"
@@ -499,10 +558,147 @@ class ArtifactStore:
             removed += 1
         return removed, freed
 
+    def _sandbox_copies(self) -> Iterable[Path]:
+        """Sandbox repo copies: children of every `ritz-lang` dir under a
+        sandbox home. Handles both `<cache>/<compiler>/home/...` (starbux,
+        chungus) and `<cache>/home/...` (the layout the ticket describes).
+
+        A bounded walk that stops at each `ritz-lang`: descending into a repo
+        copy would stat a hundred thousand files just to find nothing. Scratch
+        trees under a sandbox `tmp` are not repo copies and are never entered
+        past the depth cap.
+        """
+        parent = self.root.parent
+        homes: List[Path] = []
+        direct = parent / "home"
+        if direct.is_dir():
+            homes.append(direct)
+        try:
+            children = sorted(parent.iterdir())
+        except OSError:
+            children = []
+        for c in children:
+            home = c / "home"
+            if c.is_dir() and home.is_dir():
+                homes.append(home)
+        seen = set()
+        for home in homes:
+            base = len(home.parts)
+            for dirpath, dirnames, _files in os.walk(home, onerror=lambda e: None):
+                d = Path(dirpath)
+                if d.name == "ritz-lang":
+                    for name in sorted(dirnames):
+                        p = d / name
+                        if p.is_symlink() or p in seen:
+                            continue
+                        seen.add(p)
+                        yield p
+                    dirnames[:] = []  # a repo copy is the boundary
+                elif len(d.parts) - base >= 5:
+                    dirnames[:] = []
+
+    def _compiler_tmp_entries(self) -> Iterable[Path]:
+        """Entries in `<compiler>/tmp`, where a compiler's cache dir is one
+        holding a sandbox `home` (ritz0, ritz1, ritz1_selfhosted, ...)."""
+        parent = self.root.parent
+        try:
+            children = sorted(parent.iterdir())
+        except OSError:
+            return
+        for c in children:
+            if not c.is_dir() or not (c / "home").is_dir():
+                continue
+            tmp = c / "tmp"
+            if not tmp.is_dir():
+                continue
+            try:
+                entries = sorted(tmp.iterdir())
+            except OSError:
+                continue
+            yield from entries
+
+    def _gc_stale_workdirs(self, *, max_age_seconds: float,
+                           log: Optional[Callable[[str], None]]) -> tuple:
+        """Age pass: evict stale sandbox repo copies and `<compiler>/tmp`
+        entries, biggest win first. A recent mtime means a live gate is using
+        it: skip, log, never touch."""
+        now = time.time()
+        candidates = [(p, "sandbox repo copy") for p in self._sandbox_copies()]
+        candidates += [(p, "tmp entry") for p in self._compiler_tmp_entries()]
+        stale = []
+        seen = set()
+        for p, kind in candidates:
+            if p in seen:
+                continue
+            seen.add(p)
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            age = now - st.st_mtime
+            if age <= max_age_seconds:
+                _emit(log, f"[ritz-cas] gc: skip {kind} {p}: "
+                          f"{_fmt_age(age)} old, younger than "
+                          f"{_fmt_age(max_age_seconds)} -- a live gate's "
+                          f"working set")
+                continue
+            if p.is_dir() and not p.is_symlink():
+                files, size = _tree_usage(p)
+            else:
+                files, size = 1, st.st_size
+            stale.append((size, files, p, kind))
+        stale.sort(key=lambda t: t[0], reverse=True)
+        removed = freed = 0
+        for size, files, p, kind in stale:
+            try:
+                if p.is_dir() and not p.is_symlink():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+            except OSError as exc:
+                _emit(log, f"[ritz-cas] gc: skip {kind} {p}: {exc}")
+                continue
+            removed += files
+            freed += size
+            _emit(log, f"[ritz-cas] gc: evict {kind} {p} "
+                      f"({size} bytes, {files} files)")
+        return removed, freed
+
 
 # ============================================================================
 # CLI
 # ============================================================================
+
+def _emit(log: Optional[Callable[[str], None]], message: str) -> None:
+    if log is not None:
+        log(message)
+
+
+def _tree_usage(path: Path) -> tuple:
+    """(files, apparent bytes) under `path`, without following symlinks.
+
+    Apparent size (st_size), like the object pass: a sparse file counts its
+    full logical length, which is what it costs in a full checkout and what
+    the acceptance ticket measures."""
+    files = 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path, onerror=lambda e: None):
+        for name in filenames:
+            try:
+                st = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            files += 1
+            total += st.st_size
+    return files, total
+
+
+def _fmt_age(seconds: float) -> str:
+    if seconds >= 86400:
+        return f"{seconds / 86400:.1f}d"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds:.0f}s"
 
 def summarise(log: Path) -> dict:
     """Aggregate a RITZ_CAS_STATS_LOG over a whole gate."""
@@ -577,12 +773,26 @@ def get_or_build(src: Path, out: Path, project_root: Path) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     import argparse
+
+    def _size_arg(text: str) -> int:
+        try:
+            return parse_size(text)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc))
+
     ap = argparse.ArgumentParser(description="Ritz content-addressed artifact store")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("path", help="print the store directory")
-    g = sub.add_parser("gc", help="trim least-recently-used entries")
-    g.add_argument("--max-bytes", type=int, default=None,
-                   help=f"cap (default ${MAX_BYTES_ENV}, else {DEFAULT_GC_BYTES})")
+    g = sub.add_parser(
+        "gc", help="trim the store to a cap and evict stale sandbox working sets",
+        description="Two passes: LRU-trim objects to --max-bytes, then evict "
+                    "sandbox repo copies and <compiler>/tmp entries older than "
+                    f"{GC_MAX_AGE_SECONDS // 86400} day(s), biggest first. A "
+                    "recent mtime means a live gate: it is skipped, never touched.")
+    g.add_argument("--max-bytes", type=_size_arg, default=None,
+                   help="cap in bytes; K/M/G/T or KiB/MiB/GiB/TiB suffixes are "
+                        f"accepted (e.g. 3GiB). Default ${MAX_BYTES_ENV}, else "
+                        f"{DEFAULT_GC_BYTES} (4 GiB)")
     b = sub.add_parser("get-or-build", help="ritz0 --no-runtime object of SRC, via the store")
     b.add_argument("src")
     b.add_argument("out")
@@ -595,7 +805,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(store.root)
     elif args.cmd == "gc":
         cap = args.max_bytes if args.max_bytes is not None else default_max_bytes()
-        removed, freed = store.gc(cap)
+        removed, freed = store.gc(cap, log=print)
         print(f"removed {removed} files, freed {freed} bytes from {store.root}")
     elif args.cmd == "get-or-build":
         return get_or_build(Path(args.src), Path(args.out), Path(args.project_root))

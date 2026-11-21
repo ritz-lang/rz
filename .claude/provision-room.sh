@@ -342,6 +342,23 @@ if [[ $MODE == check || "${RZ_PROVISION_HOST_CHECKS:-1}" != 0 ]]; then
     problems="$(host_problems)"
     if [[ -n "$problems" ]]; then
         echo "provision-room: host can't gate a room: $problems" >&2
+        # "Clear Ritz caches" did nothing when the CAS was empty: the space is
+        # stale sandbox working sets, which `rz cache gc` now evicts by age
+        # (AGAST #4421). Print the recipe that actually reclaims it. stdout,
+        # so the one-line refusal on stderr stays one line.
+        if [[ "$problems" == *"free disk "* ]]; then
+            cat <<'EOF'
+provision-room: free disk is below the gate floor (RZ_MIN_DISK_GB, default 20 GB). Reclaim it with:
+provision-room:   rz cache gc
+provision-room:     evicts sandbox repo copies and <compiler>/tmp older than 1 day, biggest first
+provision-room:   sandbox repo copies live in ~/.cache/ritz/*/home/*/dev/ritz-lang/*
+provision-room:     (and ~/.cache/ritz/home/*/dev/ritz-lang/*); each child is one stale clone
+provision-room:   ~/tmp orphans: remove a dir only when no live systemd unit, worktree, or open
+provision-room:     file (lsof) owns it -- e.g. `systemctl list-units`, `git worktree list`, `lsof +D DIR`
+provision-room:   never delete anything under a live gate: a sandbox copy or ~/tmp dir with a
+provision-room:     recent mtime is that gate's working set, and rz cache gc leaves it alone
+EOF
+        fi
         exit 1
     fi
 fi
