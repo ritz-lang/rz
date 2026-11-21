@@ -6446,6 +6446,25 @@ fn twice(x: i32) -> i32
     v + v
 ```
 
+"The same `E`" is type-name identity after alias resolution: a signature
+spelling `u8` matches one spelling `type Code = u8`, and two distinct names
+whose layouts happen to agree are different `E`s. A `Result` operand in a
+function returning a `Result` with a different `E` fails, as does one in a
+function that returns some other enum:
+
+```ritz expect-error="Try operator on a Result used in a function returning a Result with a different error type"
+import ritzlib.result
+
+fn parse(x: i32) -> Result<i32, i32>
+    if x > 0
+        return Ok(x)
+    return Err(1)
+
+fn double(x: i32) -> Result<i32, u8>
+    let v = parse(x)?
+    Ok((v + v) as u8)
+```
+
 ### 14.3 Pattern Matching
 
 ```ritz

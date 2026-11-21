@@ -15761,8 +15761,20 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter):
                 # Simple named type (already monomorphized)
                 fn_ret_type_name = ret_ritz_type.name
 
-        if not fn_ret_type_name or fn_ret_type_name not in self.enum_types:
+        # LANGUAGE_SPEC §14.2: the enclosing fn must return a Result, not
+        # just any enum.  `not in self.enum_types` let an Option-returning fn
+        # compile `Err` as `None` and an unrelated user enum reach
+        # `_get_enum_data_index` ("Enum X has no data buffer", AGAST #4467).
+        if not fn_ret_type_name or not fn_ret_type_name.startswith("Result$"):
             raise self._err(f"Try operator used in function not returning Result type (got {fn_ret_type_name})")
+
+        # §14.2 also requires the same E.  The message names no type: ritz0
+        # and ritz1 spell instantiations differently (`Result$A_B` vs
+        # `Result$A$B`), and the refusal must read identically on both.
+        if not self._same_result_error_type(enum_name, fn_ret_type_name):
+            raise self._err(
+                "Try operator on a Result used in a function returning a"
+                " Result with a different error type")
 
         fn_ret_enum_type, _ = self.enum_types[fn_ret_type_name]
 
@@ -15812,6 +15824,38 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter):
         phi.add_incoming(ok_val, ok_exit)
 
         return phi
+
+    def _same_result_error_type(self, operand_name: str,
+                                fn_ret_name: str) -> bool:
+        """§14.2: do these two `Result` instantiations carry the same `E`?
+
+        Canonical type-name equality after alias resolution — the spelling
+        `_type_to_name_suffix` gives, which is also how the monomorphizer
+        names instantiations.  Layout equality is *not* the rule (AGAST
+        #4467): `Result<i32, CodeA>` and `Result<i32, CodeB>` are different
+        `E`s even when `CodeA` and `CodeB` lay out identically.
+
+        The `Err` variant of a specialised `Result$...` carries the resolved
+        field type, so `type Code = u8` in one signature and `u8` in the
+        other compare equal.
+        """
+        def error_type(name: str) -> Optional[rast.Type]:
+            variants = self.enum_types[name][1]
+            err = next((v for v in variants if v.name == "Err"), None)
+            if err is None or not err.fields:
+                return None
+            return err.fields[0]
+
+        operand_e = error_type(operand_name)
+        fn_ret_e = error_type(fn_ret_name)
+        if operand_e is None or fn_ret_e is None:
+            return False
+        try:
+            return (self._type_to_name_suffix(operand_e)
+                    == self._type_to_name_suffix(fn_ret_e))
+        except TypeError:
+            # An unspellable type is not silently assumed equal.
+            return False
 
     def _resolve_fn_return_enum_name(self) -> Optional[str]:
         """Name of the enum the enclosing function returns, if it returns one."""
