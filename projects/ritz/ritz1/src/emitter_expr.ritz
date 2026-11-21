@@ -1383,15 +1383,76 @@ pub fn try_method_carrier(s: *EmitterState, inner: *Expr, out_name: **u8, out_le
     *out_len = md.return_type_name_len
     1
 
+# AGAST #4455: the name ritz0 prints for the enclosing fn's return type after
+# `(got ` — `_resolve_fn_return_enum_name`'s enum name, else `None`.  Only a
+# registered enum (a user enum or a Result$/Option$ instantiation) names
+# itself; a struct, pointer, ref or absent return is `None`.
+fn try_ret_enum_name(s: *EmitterState) -> StrView
+    if s.fn_ret_type == TYPE_STRUCT and s.ret_type_name != null and s.ret_type_name_len > 0
+        let ret_sv: StrView = StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }
+        if is_enum_type(ret_sv) == 1 or is_tagged_enum_type(ret_sv) == 1
+            return ret_sv
+    StrView { ptr: (c"None"), len: (4) as i64 }
+
+# ritz0's `fn_ret_type_name` for the Result message: a struct or enum's name,
+# a primitive's keyword (`got i32` for a scalar fn), else `None`.
+fn try_ret_type_name(s: *EmitterState) -> StrView
+    if s.fn_ret_type == TYPE_STRUCT and s.ret_type_name != null and s.ret_type_name_len > 0
+        return StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }
+    let pn: *u8 = primitive_name_from_type(s.fn_ret_type)
+    if pn != null
+        return StrView { ptr: (pn), len: (primitive_name_len(s.fn_ret_type)) as i64 }
+    StrView { ptr: (c"None"), len: (4) as i64 }
+
+# AGAST #4455 (LANGUAGE_SPEC §14.2): `?` requires the enclosing function's
+# return carrier to match the operand's — an Option for an Option, a Result
+# for a Result.  Nothing upstream enforced it: with a scalar-returning fn the
+# early return lowered to `ret % %.N` (an empty type name), clang rejected the
+# IR, and the compiler exited 0, so check_doc_examples counted the program as
+# COMPILED.  ritz0 refuses at the emitter; this mirrors its messages, located
+# at the `?` operand as ritz0's are.
+#
+# ritz0's conditions are kept, including the weak Result one: it accepts any
+# enum-returning fn (no E comparison — tracked out of scope in AGAST #4467).
+# 1 when refused (the diagnostic is emitted), 0 when the carriers agree.
+fn try_carrier_refused(s: *EmitterState, e: *Expr, carrier: *u8, carrier_len: i32) -> i32
+    if carrier == null or carrier_len <= 0
+        return 0
+    let carrier_sv: StrView = StrView { ptr: (carrier), len: (carrier_len) as i64 }
+    let ret_sv: StrView = StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }
+
+    if name_eq(carrier_sv, StrView { ptr: (c"Option"), len: (6) as i64 }) == 1 or starts_with(carrier_sv, StrView { ptr: (c"Option$"), len: (7) as i64 }) == 1
+        # ritz0: the fn must itself return an Option.
+        if name_eq(ret_sv, StrView { ptr: (c"Option"), len: (6) as i64 }) == 1 or starts_with(ret_sv, StrView { ptr: (c"Option$"), len: (7) as i64 }) == 1
+            return 0
+        emit_nd_error_begin(s, e.span.line, e.span.col)
+        eprints("Try operator on an Option used in a function that does not return an Option (got ")
+        eprints(try_ret_enum_name(s))
+        eprints(")\n")
+        return 1
+
+    if starts_with(carrier_sv, StrView { ptr: (c"Result$"), len: (7) as i64 }) == 1
+        # ritz0: any enum return satisfies the Result check (see above).
+        if s.fn_ret_type == TYPE_STRUCT and s.ret_type_name != null and s.ret_type_name_len > 0
+            if is_enum_type(ret_sv) == 1 or is_tagged_enum_type(ret_sv) == 1
+                return 0
+        emit_nd_error_begin(s, e.span.line, e.span.col)
+        eprints("Try operator used in function not returning Result type (got ")
+        eprints(try_ret_type_name(s))
+        eprints(")\n")
+        return 1
+    return 0
+
 # Lower `expr?`:
 #   * On Some/Ok: extract payload from the carrier struct, continue with it.
 #   * On None/Err: early-return the whole struct back to the caller.
 #
 # Post-task-133 layout: Result$/Option$ is `{ i8 tag, [N x i8] payload }` with
 # tag 0 = Ok/Some (carrier) and tag 1 = Err/None.  The enclosing function's
-# return type must also be Result$/Option$ with a matching error variant —
-# the briefing for `?` already ensures that.  Because the Err/None encoding
-# is byte-identical we can return the struct verbatim without a rebuild.
+# return type must carry the same carrier (§14.2); try_carrier_refused checks
+# that and refuses otherwise (AGAST #4455 — the briefing does not ensure it).
+# Because the Err/None encoding is byte-identical we can return the struct
+# verbatim without a rebuild.
 fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
     # Evaluate the inner Result/Option (yields a struct SSA register).
     let value: i32 = emit_expr(s, e.left)
@@ -1409,6 +1470,12 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
     if have_inner == 0
         enum_name = s.ret_type_name
         enum_name_len = s.ret_type_name_len
+
+    # AGAST #4455: refuse before lowering anything that assumes the enclosing
+    # fn can receive the early return.  An unlocated empty type name used to
+    # reach the IR and only clang noticed.
+    if try_carrier_refused(s, e, enum_name, enum_name_len) == 1
+        return 0
 
     # Spill the struct so we can GEP for tag + payload.
     let slot: i32 = next_reg(s)
