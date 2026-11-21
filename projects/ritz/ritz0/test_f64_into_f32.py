@@ -26,6 +26,10 @@ AGAST #4439: a match arm's tail ident, typed by a `let` inside that arm, is a
 block-local f64 into an f32 slot too.  ritz1 judged it against a type it could
 no longer see the block scope for, so it accepted; the rows pin ritz0's
 location too, which is the arm Block's first line with the column reset to 1.
+
+AGAST #4441: the same tail in an `if` branch.  ritz0 reports the `if`
+expression's own span there (line and column), so an if's rows pin 2:18 and
+2:5 while an f32 block-local tail still merges to f32 (the ACCEPTED program).
 """
 
 import pytest
@@ -135,6 +139,27 @@ fn f(x: f64, c: bool) -> f32
             0.0
     d
 """,
+    # AGAST #4441: the same block-local tail in an `if` branch.  ritz0 reports
+    # the `if` expression's own span, not a Block: its line and column (2:18).
+    "if_block": """\
+fn f(x: f64, c: bool) -> f32
+    let d: f32 = ^if c
+        let y: f64 = x
+        y
+    else
+        0.0
+    d
+""",
+    # As a fn tail the `if` is a statement, which ritz0 reports at the `if`
+    # itself: 2:5.
+    "if_tail": """\
+fn f(x: f64, c: bool) -> f32
+    ^if c
+        let y: f64 = x
+        y
+    else
+        0.0
+""",
 }
 
 
@@ -156,6 +181,14 @@ fn g(d: f32) -> f32
 
 fn lit_return() -> f32
     return 0.1
+
+fn if32(x: f64, c: bool) -> f32
+    let d: f32 = if c
+        let y: f32 = x as f32
+        y
+    else
+        0.0
+    d
 
 fn f(x: f64, y: f32, c: bool) -> i32
     let a: f32 = 0.1
@@ -191,6 +224,8 @@ fn f(x: f64, y: f32, c: bool) -> i32
         return 5
     if r != (1.5 as f32) or t32 != 0.0
         return 6
+    if if32(x, true) != (2.5 as f32)
+        return 7
     0
 
 pub fn main() -> i32

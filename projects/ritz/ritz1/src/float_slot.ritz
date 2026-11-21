@@ -157,11 +157,15 @@ fn fs_float_merge(sm: *Sema, arm: *MatchArm) -> i32
 
 # `value`, of wider number type `src`, lands in float slot `dst`: the located
 # error both rules share, in ritz0's words (float_rules).  `line` > 0 reports
-# at `line:1` -- a match arm's Block span in ritz0 (AGAST #4439) -- else at the
-# value.
-fn fs_report_narrow_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32)
+# at `line:col`, else `line:1` (an arm's Block, whose span ritz0 reports as its
+# first line, column 1, AGAST #4439); with no line, at the value.  An `if`
+# expression is reported at itself, column and all (AGAST #4441).
+fn fs_report_narrow_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32, col: i32)
     if line > 0
-        if bool_sema_report_line(sm, line) == 0
+        if col > 0
+            if bool_sema_report_pos(sm, line, col) == 0
+                return
+        else if bool_sema_report_line(sm, line) == 0
             return
     else if bool_sema_report_at(sm, fs_report_at(value)) == 0
         return
@@ -174,30 +178,23 @@ fn fs_report_narrow_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32)
     eprints_cstr(c"`\n")
 
 fn fs_report_narrow(sm: *Sema, value: *Expr, src: i32, dst: i32)
-    fs_report_narrow_at(sm, value, src, dst, 0)
+    fs_report_narrow_at(sm, value, src, dst, 0, 0)
 
 # `value`, of float type where narrow_sema_src_type answered NARROW_UNKNOWN,
 # lands in float slot `dst`: refuse an f64 value in an f32 slot (LARB R70).
-fn fs_float_narrow_check(sm: *Sema, value: *Expr, dst: i32)
+# `src` is the type a block tail's declaration gave it (#4439, #4441), or
+# NARROW_* when only the value can say.  `line` > 0 is the place to report at,
+# as fs_report_narrow_at takes it.
+fn fs_float_narrow_check_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32, col: i32)
     if dst != TYPE_F32 or fs_float_literal_only(value) == 1
         return
-    if float_slot_src(sm, value) == TYPE_F64
-        fs_report_narrow(sm, value, TYPE_F64, TYPE_F32)
-
-# fs_float_narrow_check with `value`'s type already known: from the declaration
-# its block tail names (`src`), which `float_slot_src` cannot recover once the
-# block scope has closed (#4439).  `line` > 0 is the arm Block to report at.
-fn fs_float_narrow_check_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32)
-    if line == 0
-        fs_float_narrow_check(sm, value, dst)
-        return
-    if dst != TYPE_F32 or fs_float_literal_only(value) == 1
-        return
+    # A known source decides it; only when Sema has none (NARROW_*) does the
+    # value have to answer for itself, which it can't once its scope closes.
     var w: i32 = src
     if w != TYPE_F64
         w = float_slot_src(sm, value)
     if w == TYPE_F64
-        fs_report_narrow_at(sm, value, TYPE_F64, TYPE_F32, line)
+        fs_report_narrow_at(sm, value, TYPE_F64, TYPE_F32, line, col)
 
 # Sema's annotation: the values landing in a float slot whose source type is
 # an unsigned integer exact there (u8 / u16 / u32), keyed by the Expr, mapped
@@ -221,29 +218,30 @@ pub fn float_slot_unsigned(value: *Expr) -> i32
 # `value` lands in an f32 / f64 slot of type `dst` (a Sema check, AGAST #3510):
 # refuse an inexact integer source (see the header), and note an unsigned one.
 pub fn float_slot_check(sm: *Sema, value: *Expr, dst: i32)
-    float_slot_check_at(sm, value, dst, 0)
+    float_slot_check_at(sm, value, dst, 0, 0)
 
-# float_slot_check, with a `line` > 0 to report a float narrowing at (a match
-# arm's Block, AGAST #4439).
-pub fn float_slot_check_at(sm: *Sema, value: *Expr, dst: i32, line: i32)
+# float_slot_check, with a `line` > 0 to report a float narrowing at: an arm's
+# Block (AGAST #4439), or an `if` expression's own line and column (#4441).
+pub fn float_slot_check_at(sm: *Sema, value: *Expr, dst: i32, line: i32, col: i32)
     if value == null or float_slot_pointer(sm, value, dst) == 1 or fs_literal_only(value) == 1
         return
-    float_slot_judge_at(sm, value, narrow_sema_src_type(sm, value), dst, line)
+    float_slot_judge_at(sm, value, narrow_sema_src_type(sm, value), dst, line, col)
 
 # `value`, of integer type `src` (or NARROW_*), lands in a float slot `dst`.
 pub fn float_slot_judge(sm: *Sema, value: *Expr, src: i32, dst: i32)
-    float_slot_judge_at(sm, value, src, dst, 0)
+    float_slot_judge_at(sm, value, src, dst, 0, 0)
 
 # float_slot_judge, with a `line` > 0 to report a float narrowing at: the
-# match arm's Block whose tail named a block-local declaration (#4439).
-pub fn float_slot_judge_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32)
+# match arm's Block whose tail named a block-local declaration (#4439), or the
+# `if` expression itself, column and all (#4441).
+pub fn float_slot_judge_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32, col: i32)
     # A float source narrows only from f64 to f32 (LARB R70, AGAST #3998);
     # narrow_sema_src_type types integers alone, so a float reaches the first
     # arm as NARROW_UNKNOWN and is typed here.
     if src == TYPE_F32
         return
     if src == TYPE_F64 or src == NARROW_UNKNOWN or src == NARROW_LIT or ty_bits(src) <= 1
-        fs_float_narrow_check_at(sm, value, src, dst, line)
+        fs_float_narrow_check_at(sm, value, src, dst, line, col)
         return
     if fs_exact(src, dst) == 0
         fs_report_narrow(sm, value, src, dst)
@@ -259,22 +257,25 @@ pub fn float_slot_judge_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i3
 var g_fs_pending: *HashMapI64 = null
 var g_fs_pending_ready: i32 = 0
 
-# A deferred slot packs its type in the low bits and, above them, the match
-# arm Block line to report at (AGAST #4439; 0 reports at the value).
+# A deferred slot packs its type in the low bits and, above them, the place to
+# report a narrowing at: the line, then the column (0 for either meaning "as
+# before": no line reports at the value, no column at the line's column 1).
+# AGAST #4439, #4441.
 const FS_DST_MASK: i64 = 65535
 const FS_LINE_SHIFT: i64 = 16
+const FS_COL_SHIFT: i64 = 32
 
 pub fn float_slot_defer(value: *Expr, dst: i32)
-    float_slot_defer_at(value, dst, 0)
+    float_slot_defer_at(value, dst, 0, 0)
 
-pub fn float_slot_defer_at(value: *Expr, dst: i32, line: i32)
+pub fn float_slot_defer_at(value: *Expr, dst: i32, line: i32, col: i32)
     if value == null
         return
     if g_fs_pending_ready == 0
         g_fs_pending = malloc(sizeof(HashMapI64)) as *HashMapI64
         *g_fs_pending = hashmap_i64_with_cap(256)
         g_fs_pending_ready = 1
-    let key: i64 = (dst as i64) | ((line as i64) << FS_LINE_SHIFT)
+    let key: i64 = (dst as i64) | ((line as i64) << FS_LINE_SHIFT) | ((col as i64) << FS_COL_SHIFT)
     hashmap_i64_insert(@&(*g_fs_pending), value as i64, key)
 
 # `e` is about to be walked: run the check deferred to it, if any.
@@ -285,8 +286,9 @@ pub fn float_slot_due(sm: *Sema, e: *Expr)
     if key != 0
         hashmap_i64_remove(@&(*g_fs_pending), e as i64)
         let dst: i32 = (key & FS_DST_MASK) as i32
-        let line: i32 = (key >> FS_LINE_SHIFT) as i32
-        float_slot_check_at(sm, e, dst, line)
+        let line: i32 = ((key >> FS_LINE_SHIFT) & FS_DST_MASK) as i32
+        let col: i32 = ((key >> FS_COL_SHIFT) & FS_DST_MASK) as i32
+        float_slot_check_at(sm, e, dst, line, col)
 
 # `val_reg`, the i64 register integer expression `value` was emitted into,
 # converted for an f32 / f64 slot of type `dst_ty` (see emit_int_into_float_slot
