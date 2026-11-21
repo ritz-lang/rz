@@ -27,6 +27,7 @@ import ritzlib.span
 import ritzlib.os.env
 import ritzlib.string
 import ritzlib.strview
+import ritzlib.timer   # RITZ1_PARSE_ONLY's wall clock (AGAST #4379)
 
 # Lexer and parser infrastructure
 import tokens_gen
@@ -968,6 +969,10 @@ fn merge_module_into(m: *Module, other: *Module)
 # RITZ1_PARSE_LOG=<file> appends the path of every *source* this process
 # lexes and parses (the main file included, interface texts not), like
 # ritz0's RITZ0_PARSE_LOG.
+#
+# RITZ1_PARSE_ONLY=1 (or `--parse-only`, AGAST #4379) stops after the parse
+# and its alias second pass, before any check reads the AST, and reports the
+# lex and parse wall time to stderr.  See fn main.
 
 # The stored interface text of a module with these bytes (NUL-terminated,
 # like read_file), or an empty Vec when none is stored.
@@ -1001,6 +1006,16 @@ fn parse_log_note(path: *u8)
     sys_write(fd, string_as_ptr(@&line), string_len(@line) as i64)
     string_drop(@&line)
     sys_close(fd)
+
+# 1 when environment variable `name` holds a truthy value; 0 when it is
+# unset, empty or "0".  (RITZ1_PARSE_ONLY, AGAST #4379.)
+fn env_flag(name: StrView) -> i32
+    let v: StrView = env_get_or(name, strview_empty())
+    if v.len == 0
+        return 0
+    if v.len == 1 and *v.ptr == '0'
+        return 0
+    1
 
 # The offset of each line of buf[0..len) (malloc'd, freed by the caller), and
 # their count in *out_count.  Line n (1-based) starts at starts[n - 1].
@@ -1287,6 +1302,9 @@ struct CliArgs
     # output path instead of compiling it (ritz0/test_interface_text.py
     # compares it with ritz0's over the corpus).
     iface_text: i32
+    # `--parse-only` (AGAST #4379): lex and parse, report the wall time, then
+    # stop before anything reads the AST.  RITZ1_PARSE_ONLY=1 does the same.
+    parse_only: i32
     # `--stack-protector` (AGAST #2590): every fn but a [[naked]] one gets
     # LLVM's sspstrong, as ritz0's --stack-protector does.
     stack_protector: i32
@@ -1364,6 +1382,7 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
     args.target_os = strview_from_cstr(c"linux")
     args.test_table = 0
     args.iface_text = 0
+    args.parse_only = 0
     args.stack_protector = 0
     args.no_red_zone = 0
     args.deps_ptr = null
@@ -1400,6 +1419,7 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
     #   --target-os <os>   see CliArgs.target_os.
     #   --test-table       see CliArgs.test_table.
     #   --iface-text       see CliArgs.iface_text.
+    #   --parse-only       see CliArgs.parse_only.
     #   --stack-protector  see CliArgs.stack_protector.
     #   --no-red-zone      see CliArgs.no_red_zone.
     #   --dep <name>=<dir> repeatable; see try_open_import.
@@ -1418,6 +1438,9 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
             i = i + 1
         else if strview_eq_cstr(opt, c"--iface-text")
             args.iface_text = 1
+            i = i + 1
+        else if strview_eq_cstr(opt, c"--parse-only")
+            args.parse_only = 1
             i = i + 1
         else if strview_eq_cstr(opt, c"--stack-protector")
             args.stack_protector = 1
@@ -1507,7 +1530,7 @@ fn drop_local_main(m: *Module)
         f = next
 
 fn print_usage()
-    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>] [--target-os <os>] [--test-table] [--iface-text] [--stack-protector] [--no-red-zone] [--dep <name>=<dir>]...")
+    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>] [--target-os <os>] [--test-table] [--iface-text] [--parse-only] [--stack-protector] [--no-red-zone] [--dep <name>=<dir>]...")
     eprintln("       ritz1 -- <input.ritz>")
 
 # Parse the main file's tokens, mark its fns local, and resolve (parse and
@@ -1617,13 +1640,21 @@ fn main(argc: i32, argv: **u8) -> i32
             return 1
         return 0
 
+    # RITZ1_PARSE_ONLY=1 or `--parse-only` (AGAST #4379): lex and parse, then
+    # stop before the first check reads the AST.  It reports lex/parse wall
+    # time on stderr, so a #4374-style parse regression can be measured with
+    # the compiler's own clock instead of an external one.  The mode neither
+    # reads nor writes the sig cache (that fast path skips the parse it is
+    # meant to measure) and writes no .ll.  Unset or "0": a no-op.
+    let parse_only: i32 = if args.parse_only == 1 then 1 else env_flag(strview_from_cstr(c"RITZ1_PARSE_ONLY"))
+
     # File-level fast path: if the sig records this source, this compiler
     # identity and unchanged imports, and the .ll is current (or can be
     # spliced from the sig), skip lex/parse/emit entirely.  This is the single biggest win for
     # no-op rebuilds (full-stack 12m30s → ~30s).
     # Test mode's IR is not the module's: it neither reads nor writes the sig
     # (ritz0 skips its fn cache in test mode too).
-    if args.test_table == 0 and check_source_unchanged(args.input_path, src.data, src.len - 1, args.output_path, cache_fp) == 1
+    if parse_only == 0 and args.test_table == 0 and check_source_unchanged(args.input_path, src.data, src.len - 1, args.output_path, cache_fp) == 1
         var skip_msg: String = string_from("Skipped (unchanged): ")
         string_push_cstr(@&skip_msg, args.input_path)
         println_string(@skip_msg)
@@ -1634,7 +1665,9 @@ fn main(argc: i32, argv: **u8) -> i32
     # bigger files realloc organically.
     parse_log_note(args.input_path)
     var tokens: Vec<Token> = vec_with_cap<Token>(24000)
+    let lex_start: i64 = if parse_only == 1 then now_nanos() else 0
     let lex_errors: i32 = tokenize(args.input_path, src.data, src.len - 1, @tokens)
+    let lex_end: i64 = if parse_only == 1 then now_nanos() else 0
     if lex_errors > 0
         var msg: String = string_from("Lexer errors: ")
         string_push_i64(@&msg, lex_errors as i64)
@@ -1647,6 +1680,7 @@ fn main(argc: i32, argv: **u8) -> i32
     let ritz_path: StrView = normalize_ritz_path(args.ritz_path)
 
     # Parse this file and everything it imports.
+    let parse_start: i64 = if parse_only == 1 then now_nanos() else 0
     var m: *Module = parse_program(@tokens, args.input_path, source_dir, ritz_path)
     if m == null
         return 1
@@ -1677,6 +1711,20 @@ fn main(argc: i32, argv: **u8) -> i32
         m = parse_program(@tokens, args.input_path, source_dir2, ritz_path2)
         if m == null
             return 1
+    let parse_end: i64 = if parse_only == 1 then now_nanos() else 0
+
+    # RITZ1_PARSE_ONLY (AGAST #4379): the parse phase, alias second pass
+    # included, is done; every phase after this point reads the AST.  Report
+    # the wall time and stop with success, writing neither IR nor a sig.
+    if parse_only == 1
+        eprints_cstr(c"ritz1 parse-only: path=")
+        eprints_cstr(args.input_path)
+        eprints_cstr(c" lex_ns=")
+        eprint_int(lex_end - lex_start)
+        eprints_cstr(c" parse_ns=")
+        eprint_int(parse_end - parse_start)
+        eprints_cstr(c"\n")
+        return 0
 
     # AGAST #3994: the program's enum nodes are the merged Module.enums; the
     # accessors every later pass calls (sema, emitter, monomorph) index that

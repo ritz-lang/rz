@@ -148,6 +148,49 @@ per cycle" and "30 s per cycle."
 
 ---
 
+## Measuring the parse phase
+
+`RITZ1_PARSE_ONLY=1` (or `--parse-only` on the command line) lexes and parses
+the input and its imports -- including the type-alias second pass -- then
+stops before anything reads the AST. It prints the wall time to stderr and
+exits 0, writing no `.ll` and no sig:
+
+```sh
+RITZ1_PARSE_ONLY=1 ritz1/build/ritz1 ritz1/src/main.ritz -o /tmp/parse-only.ll
+# ritz1 parse-only: path=ritz1/src/main.ritz lex_ns=1546251 parse_ns=353743151
+```
+
+Both numbers come from `ritzlib.timer`'s `CLOCK_MONOTONIC` clock. `lex_ns` is
+`tokenize` on the input file; `parse_ns` is `parse_program` plus, when an alias
+or a pending array length forces it, the second parse. Imported sources are
+parsed inside that call, so the number covers the whole import closure.
+
+To reproduce a #4374-style before/after measurement:
+
+```sh
+cd projects/ritz
+# Build ritz1 at the base commit and at the change (two worktrees, or
+# `git checkout` one at a time), then run the same command under each:
+for i in 1 2 3; do
+  RITZ1_PARSE_ONLY=1 ritz1/build/ritz1 ritz1/src/main.ritz -o /tmp/parse-only.ll
+done
+```
+
+Compare the medians of `parse_ns`; `lex_ns` isolates the lexer. Because the
+mode is off unless the variable or flag is set, it cannot affect a normal
+build.
+
+Two details make the measurement repeatable:
+
+* The mode **skips the sig fast path** (`check_source_unchanged`), so an
+  unchanged source is parsed rather than reported as `Skipped (unchanged)`.
+  It writes no sig either, so measuring cannot perturb the next build.
+* A source that parses but would be refused later (by a Sema check, say)
+  exits 0 here. That is the point: the post-parse phases are not measured.
+  The behaviour is pinned by `ritz0/test_ritz1_parse_only.py`.
+
+---
+
 ## Common pitfalls
 
 ### "I added debug `eprint` statements and the matrix takes 50 minutes"

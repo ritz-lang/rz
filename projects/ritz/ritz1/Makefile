@@ -96,8 +96,9 @@ SOURCES = \
 #   (AGAST #1750).  A nested module is named with `_` for `/`: see the
 #   explicit ritzlib_os_env rules below, since the ritzlib_% pattern only
 #   reaches top-level ritzlib/*.ritz.
+# - timer (ritzlib/timer.ritz): RITZ1_PARSE_ONLY's clock (AGAST #4379).
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str fmt_digits string strview hash hashmap memory gvec drop option result json span os_env
+RITZLIB_MODULES = sys io str fmt_digits string strview hash hashmap memory gvec drop option result json span os_env timer
 
 # Build artifacts
 BUILD_DIR = build
