@@ -552,6 +552,41 @@ fn sema_tagged_primitive_payload(name: *u8, len: i32, is_err: i32) -> i32
         cut += 1
     TYPE_VOID
 
+# AGAST #4448: the primitive `T` a one-level pointer payload points at, for a
+# mangled `ptr_T` argument; TYPE_VOID otherwise.  As the emitter's
+# carrier_payload_ptr_primitive reads it.
+fn sema_ptr_primitive_name(name: *u8, len: i32) -> i32
+    if len <= 4 or memcmp(name, c"ptr_", 4) != 0
+        return TYPE_VOID
+    primitive_type_from_name(name + 4, len - 4)
+
+# AGAST #4448: the primitive pointer kind `Option<*T>` / `Result<*T, E>`
+# carries in its Some / Ok (is_err 0) or Err (is_err 1) payload, or
+# TYPE_VOID.  The emitter binds such an arm's `n` as a `*T` local; without
+# this, Sema left the binding unknown and the checks read it as an i64.
+fn sema_tagged_pointer_payload(name: *u8, len: i32, is_err: i32) -> i32
+    var d: i32 = 0
+    while d < len and *(name + d) != '$'
+        d += 1
+    if d >= len
+        return TYPE_VOID
+    let sfx: *u8 = name + d + 1
+    let sfx_len: i32 = len - d - 1
+    if name_eq(name, d, c"Option", 6) == 1
+        if is_err == 1
+            return TYPE_VOID
+        return sema_ptr_primitive_name(sfx, sfx_len)
+    if name_eq(name, d, c"Result", 6) == 0
+        return TYPE_VOID
+    var cut: i32 = 0
+    while cut < sfx_len
+        if *(sfx + cut) == '$'
+            if is_err == 0
+                return sema_ptr_primitive_name(sfx, cut)
+            return sema_ptr_primitive_name(sfx + cut + 1, sfx_len - cut - 1)
+        cut += 1
+    TYPE_VOID
+
 # A match arm's binding `V(x)` on `scrut`: V's payload.  Unknown for a
 # catch-all name, as the emitter left it: a `match` on a struct value is
 # refused (by ritz0 too), and typing one only lets `.` reach unlowerable IR.
@@ -576,6 +611,11 @@ pub fn sema_arm_payload_ty(sm: *Sema, arm: *MatchArm, scrut: *Expr, t: *SemaTy) 
         let en: *u8 = sema_tagged_enum_payload(s.name, s.name_len, is_err, @en_len)
         if en != null
             return sema_ty_set(t, TYPE_STRUCT, en, en_len, TYPE_VOID, null)
+        # AGAST #4448: a one-level pointer payload (`Option<*u8>`'s
+        # `Some(n)`) is that `*T`, as the emitter binds the local.
+        let pk_ptr: i32 = sema_tagged_pointer_payload(s.name, s.name_len, is_err)
+        if pk_ptr != TYPE_VOID
+            return sema_ty_set(t, TYPE_PTR, null, 0, pk_ptr, null)
         # AGAST #4410: a primitive payload (`Option<f64>`'s `Some(v)`,
         # `Result$i32$T`'s `Err(e)`) is that scalar.  The emitter binds the
         # name as its slot, so `.` and the checks need it typed.

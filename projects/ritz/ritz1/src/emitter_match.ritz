@@ -304,9 +304,11 @@ fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum
 # or `P(@&Pair)` variant), fills (out_name, out_len) with the struct and
 # returns the binding's var_type (TYPE_PTR, or TYPE_REF / TYPE_MUT_REF for a
 # user enum's `@T` / `@&T`).  Otherwise returns 0 and the caller keeps the
-# i64 binding.  That i64 had no pointee, so `v.a` and `(*v).a` were
-# "unhandled EXPR_MEMBER".  AGAST #3047: a `**T` payload (`Option<**Pair>`,
-# a user enum's `P(**Pair)`) returns TYPE_PTR_PTR, still naming the struct.
+# i64 binding: a pointer to a primitive is #4448's
+# carrier_payload_ptr_primitive below.  That i64 had no pointee, so `v.a` and
+# `(*v).a` were "unhandled EXPR_MEMBER".  AGAST #3047: a `**T` payload
+# (`Option<**Pair>`, a user enum's `P(**Pair)`) returns TYPE_PTR_PTR, still
+# naming the struct.
 fn carrier_payload_ptr_struct(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32, out_name: **u8, out_len: *i32) -> i32
     *out_name = null
     *out_len = 0
@@ -376,6 +378,55 @@ fn emit_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_n
         set_local_inner_pointee(s, arm.pattern_inner_name, arm.pattern_inner_name_len, TYPE_STRUCT)
         return
     add_local_full(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, var_type, st_name, st_name_len, TYPE_STRUCT, 0, 0)
+
+# AGAST #4448: the primitive `T` a one-level pointer payload points at
+# (`Some(n)` over `Option<*u8>`, `Ok(p)` over `Result<*u8, E>`, `P(p)` over a
+# user enum's `P(*u8)`), or TYPE_VOID for every other payload.  A pointer to a
+# struct is carrier_payload_ptr_struct's, and a `**T` / `@T` stays as it was.
+# `n` used to be bound as an i64, so print's Display dispatch printed the
+# address and `*n` had no pointee.
+fn carrier_payload_ptr_primitive(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32) -> i32
+    if enum_name == null or enum_name_len <= 0
+        return TYPE_VOID
+    if is_tagged_enum_type(enum_name, enum_name_len) == 0
+        let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, user_arm_variant(enum_name, enum_name_len, arm))
+        if uf == null or uf.field_type != TYPE_PTR
+            return TYPE_VOID
+        let p: i32 = uf.ptr_pointee
+        # A struct pointee (or a deeper pointer, or an array) is not primitive.
+        if p < TYPE_I32 or p > TYPE_F64 or p == TYPE_PTR or p == TYPE_PTR_PTR
+            return TYPE_VOID
+        return p
+    var decl_len: i32 = 0
+    let decl: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len), @decl_len)
+    if decl == null or decl_len <= 4 or memcmp(decl, c"ptr_", 4) != 0
+        return TYPE_VOID
+    primitive_type_from_name(decl + 4, decl_len - 4)
+
+# AGAST #4448: bind a pointer-to-primitive payload as the pointer local a
+# `let n: *T` registers (emitter_stmt.ritz), so Display and the arithmetic /
+# deref paths see the pointer, not an i64.
+fn emit_primitive_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: *u8, enum_name_len: i32, pointee: i32)
+    var sel: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
+    let uvi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
+    if uvi >= 0
+        sel = uvi
+    let raw: i32 = emit_variant_payload(s, slot_reg, enum_name, enum_name_len, sel)
+    let ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, raw)
+    emit_str(s, c" to ptr\n")
+    let alloca_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c" = alloca ptr  ; match pointer payload bind\n  store ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c", ptr ")
+    emit_reg(s, alloca_reg)
+    emit_str(s, c"\n")
+    add_local_ptr(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, TYPE_PTR, pointee)
 
 # AGAST #1515: bind `Some(p)` / `Ok(s)` to a copy of a struct payload.  The
 # payload sits at field 2 of the spilled scrutinee (#1898); copy it into its own
@@ -805,9 +856,12 @@ fn emit_arm_payload_bind(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut
             var ptr_struct: *u8 = null
             var ptr_struct_len: i32 = 0
             var ptr_kind: i32 = 0
+            var ptr_prim: i32 = TYPE_VOID
             if is_wildcard == 0 and scrut_slot != 0
                 carrier_payload_struct(s, arm, enum_name, enum_name_len, @pay_struct, @pay_struct_len)
                 ptr_kind = carrier_payload_ptr_struct(s, arm, enum_name, enum_name_len, @ptr_struct, @ptr_struct_len)
+                if ptr_kind == 0 and pay_struct == null
+                    ptr_prim = carrier_payload_ptr_primitive(s, arm, enum_name, enum_name_len)   # AGAST #4448
             if is_wildcard == 0 and pay_struct == null and ptr_kind == 0 and scrut_slot != 0 and emit_array_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len) == 1
                 is_wildcard = 1   # AGAST #3029: bound, as the `[N]T` it is
             if is_wildcard == 0 and ptr_kind != 0
@@ -818,6 +872,10 @@ fn emit_arm_payload_bind(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut
                     ptr_variant = puvi
                 emit_ptr_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, ptr_variant, ptr_kind, ptr_struct, ptr_struct_len)
                 bool_note_binding(s, payload_bool_kind(s, arm, enum_name, enum_name_len))   # AGAST #2342
+            else if is_wildcard == 0 and ptr_prim != TYPE_VOID
+                # AGAST #4448: `Some(n)` over `Option<*u8>`: n is a `*u8`.
+                emit_primitive_ptr_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, ptr_prim)
+                bool_note_binding(s, payload_bool_kind(s, arm, enum_name, enum_name_len))
             else if is_wildcard == 0 and pay_struct != null
                 emit_struct_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, pay_struct, pay_struct_len)
                 # AGAST #2174: it owns the payload of a scrutinee the

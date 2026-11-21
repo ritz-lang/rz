@@ -256,6 +256,15 @@ def _write_baseline(path, base):
     path.write_text(json.dumps(base, indent=1))
 
 
+def _empty_accept(tmp_path):
+    """A private acceptance dir: this test's verdict must not move when a
+    ticket in the repo's own tools/ratchet_accept raises the metric it
+    measures (AGAST #4448: a room's acceptance is part of the default
+    allowance, so the default dir is not a fixture an isolated test can use).
+    """
+    return str(tmp_path / "no-accept")
+
+
 def test_main_exit_1_on_regression(tmp_path):
     base = _baseline()
     bpath = tmp_path / "baseline.json"
@@ -264,7 +273,8 @@ def test_main_exit_1_on_regression(tmp_path):
     mpath = tmp_path / "measured.json"
     mpath.write_text(json.dumps(measured))
     before = bpath.read_text()
-    assert main(["--measured", str(mpath), "--baseline", str(bpath)]) == 1
+    assert main(["--measured", str(mpath), "--baseline", str(bpath),
+                 "--accept-dir", _empty_accept(tmp_path)]) == 1
     assert bpath.read_text() == before  # never rewritten by a failing run
 
 
@@ -274,7 +284,8 @@ def test_main_exit_0_on_improvement_without_touching_baseline(tmp_path):
     mpath = tmp_path / "measured.json"
     mpath.write_text(json.dumps(_baseline(scalars={"ptr_len_param_pair": 900})))
     before = bpath.read_text()
-    assert main(["--measured", str(mpath), "--baseline", str(bpath)]) == 0
+    assert main(["--measured", str(mpath), "--baseline", str(bpath),
+                 "--accept-dir", _empty_accept(tmp_path)]) == 0
     assert bpath.read_text() == before
 
 
