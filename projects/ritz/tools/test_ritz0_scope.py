@@ -779,33 +779,62 @@ def test_the_harness_glob_is_in_its_read_set(real_scopes):
                  real_scopes) is None
 
 
-def test_the_regression_lists_the_ritz0_test_directory(real_scopes):
-    """AGAST #4385: every build.py run computes cache.py's ritz0 hash, which
-    loads ritz0/compiler_identity.py; its resolver os.walks ritz0/ (one walk
-    instead of a stat per candidate module), so the corpus regression lists
-    ritz0/test — an entry added to or removed from it changes that walk.
-    The listing is declared rather than the subtree read: a test file's
+@pytest.mark.parametrize("dir", ("test", "tests"))
+def test_the_regression_lists_the_ritz0_test_directories(real_scopes, dir):
+    """AGAST #4385, #4482: every build.py run computes cache.py's ritz0 hash,
+    which loads ritz0/compiler_identity.py; its resolver os.walks ritz0/ (one
+    walk instead of a stat per candidate module), so the corpus regression
+    lists ritz0/test and, since #4373 renamed the Python tests in, ritz0/tests
+    — an entry added to or removed from either changes that walk.  The
+    listings are declared rather than the subtrees read: a test file's
     contents are still never opened, so a modification still skips."""
     sc = real_scopes[ritz0_scope.REGRESSION.name]
-    changed = frozenset({"projects/ritz/ritz0/test/test_new.ritz"})
-    assert ritz0_scope.why_safe("A", "projects/ritz/ritz0/test/test_new.ritz",
-                                sc, ritz0_scope.REGRESSION, changed) is None
-    assert _real(ritz0_scope.REGRESSION, "M",
-                 "projects/ritz/ritz0/test/test_parser.ritz", real_scopes) is not None
-    # The parent's listing covers that directory only: a new entry one level
+    new, old = (f"projects/ritz/ritz0/{dir}/test_new.ritz",
+                f"projects/ritz/ritz0/{dir}/test_parser.ritz")
+    changed = frozenset({new})
+    assert ritz0_scope.why_safe("A", new, sc, ritz0_scope.REGRESSION, changed) is None
+    assert _real(ritz0_scope.REGRESSION, "M", old, real_scopes) is not None
+    # A directory's listing covers that directory only: a new entry one level
     # deeper changes the listing of a directory the trace never listed.
-    nested = frozenset({"projects/ritz/ritz0/test/fixtures/x.py"})
-    assert ritz0_scope.why_safe("A", "projects/ritz/ritz0/test/fixtures/x.py",
-                                sc, ritz0_scope.REGRESSION, nested) is not None
+    nested = frozenset({f"projects/ritz/ritz0/{dir}/fixtures/x.py"})
+    assert ritz0_scope.why_safe(
+        "A", f"projects/ritz/ritz0/{dir}/fixtures/x.py",
+        sc, ritz0_scope.REGRESSION, nested) is not None
+
+
+def test_every_declared_ritz0_listing_still_exists():
+    """AGAST #4482: a renaming of a declared ritz0 directory would otherwise
+    leave a stale entry that covers nothing (the #4373 `test/` -> `tests/`
+    drift), which the trace audit only catches on the next push to main."""
+    for d in ritz0_scope.REGRESSION.lists:
+        if d.startswith("projects/ritz/ritz0/"):
+            assert (REAL / d).is_dir(), f"{d}: declared listing, not a directory"
+
+
+def test_the_regression_audit_covers_every_ritz0_directory_the_walk_lists():
+    """AGAST #4482: compiler_identity's resolver os.walks ritz0/ and opens
+    every directory under it, so the read set must cover each listing — an
+    excluded tree (ritz0's tests) needs a declared entry, while a directory
+    under an unexcluded read is covered by `reads`.  Replaying one listing
+    per directory in the real tree makes a rename fail here, not in CI."""
+    pkg = REAL / "projects/ritz/ritz0"
+    log = "".join(
+        f'1 openat(AT_FDCWD</x>, "{p}", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<{p}>\n'
+        for p in sorted(x for x in pkg.rglob("*") if x.is_dir()))
+    assert log, "no ritz0 directories found"
+    assert ritz0_scope.audit(REAL, ritz0_scope.REGRESSION, log) == []
 
 
 def test_the_regression_audit_covers_the_ritz0_test_listing():
-    """The exact trace shape CI rejected (AGAST #4385): the walk opens
-    ritz0/ and ritz0/test as directories; both listings are in the read set."""
+    """The exact trace shape CI rejected (AGAST #4385, #4482): the walk opens
+    ritz0/ and each test directory as directories; all listings are in the
+    read set.  #4373 moved the Python tests from test/ to tests/, so the
+    latter is the entry that drifted."""
     log = _trace(
         REAL,
         '1 openat(AT_FDCWD<@/projects/ritz>, "ritz0", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<@/projects/ritz/ritz0>',
         '1 openat(AT_FDCWD<@/projects/ritz/ritz0>, "test", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<@/projects/ritz/ritz0/test>',
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0>, "tests", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<@/projects/ritz/ritz0/tests>',
     )
     assert ritz0_scope.audit(REAL, ritz0_scope.REGRESSION, log) == []
 
