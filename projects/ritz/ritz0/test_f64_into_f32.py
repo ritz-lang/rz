@@ -15,10 +15,12 @@ The rows are sized to the code paths (TESTING.md "What a ritz0 pytest case
 costs"): one refusal per slot kind, since each reaches the conversion from
 its own emitter site; one row for the f32*f64 product and one for an if
 whose f64 arm is not a literal; and one accepted program holding every
-exemption, including an if whose other arm is a literal (it merges at f32).  ritz1's half is #3998, so the refusal rows
-are ritz0's alone; the accepted program runs on every compiler, which both
-accept today.  The widening rows (WIDENED, below) were ritz0's alone for two
-separate ritz1 bugs, #4028 and #4029; they run on every compiler.
+exemption, including an if whose other arm is a literal (it merges at f32).
+AGAST #3998 put the same refusal on ritz1's Sema (float_slot.ritz), so the
+refusal rows run on every compiler; the accepted program runs on every
+compiler, which both accept.  The widening rows (WIDENED, below) were ritz0's
+alone for two separate ritz1 bugs, #4028 and #4029; they run on every
+compiler.
 """
 
 import pytest
@@ -105,10 +107,11 @@ fn f(x: f64, y: f32) -> f32
 }
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(REFUSED))
-def test_f64_into_f32_is_refused(tmp_path, name):
+def test_f64_into_f32_is_refused(tmp_path, compiler, name):
     marked = REFUSED[name] + "\npub fn main() -> i32\n    0\n"
-    _assert_refused("ritz0", tmp_path, f"f64_f32_{name}", marked, NARROW)
+    _assert_refused(compiler, tmp_path, f"f64_f32_{name}", marked, NARROW)
 
 
 # Every exemption, and `as f32`, in one program.  Exit n names the first
@@ -129,6 +132,7 @@ fn f(x: f64, y: f32, c: bool) -> i32
     let e: f32 = -(1.0 / 4.0)
     let h: f32 = x as f32
     let k: f32 = (y * x) as f32
+    let w: f64 = x
     let m: f32 = if c then 1.5 else 2.5
     let p = P { d: 0.25 }
     let arr: [2]f32 = [0.5, 1.0 / 8.0]
@@ -148,7 +152,7 @@ fn f(x: f64, y: f32, c: bool) -> i32
         return 1
     if b != (0.0 - 7.5) as f32 or e != (0.0 - 0.25) as f32
         return 2
-    if h != (2.5 as f32) or k != (7.5 as f32)
+    if h != (2.5 as f32) or k != (7.5 as f32) or w != 2.5
         return 3
     if m != (1.5 as f32) or p.d != (0.25 as f32) or arr[1] != (0.125 as f32)
         return 4

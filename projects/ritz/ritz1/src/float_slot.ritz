@@ -1,4 +1,4 @@
-# ritz1/src/float_slot.ritz - an integer into a float slot: only where exact
+# ritz1/src/float_slot.ritz - a number into a float slot: only where exact
 #
 # AGAST #2945, LANGUAGE_SPEC §7.5 "Integer and float conversions".
 #
@@ -75,6 +75,107 @@ fn fs_exact(src: i32, dst: i32) -> i32
         return if bits <= 32 then 1 else 0
     if bits <= 16 then 1 else 0
 
+# ---- An f64 into an f32 slot (LARB R70, AGAST #3998) ----
+#
+# §7.5 "Float narrowing": an f64 value into an f32 slot is the same error as
+# an inexact integer into a float, asking for `as f32` (the message below is
+# ritz0's float_rules.f64_into_f32).  Exempt: a float literal, and a constant
+# expression of them (`0.1`, `0.0 - 7.5`, `-(1.0 / 4.0)`), evaluated as f64
+# and rounded once.  f32 into f64 stays implicit.  Where Sema cannot type the
+# value it accepts rather than guesses (§7.5, as the integer rule above).
+
+# Is `e` a float literal, or a constant expression of float literals?  ritz0's
+# _float_literal_only, including an if / match whose every arm is one.  An
+# integer literal counts: it is a float's when the other operand is.
+fn fs_float_literal_only(e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_FLOAT_LIT or e.kind == EXPR_INT_LIT
+        return 1
+    if e.kind == EXPR_UNARY and e.op == OP_NEG
+        return fs_float_literal_only(e.operand)
+    if e.kind == EXPR_BINARY
+        if e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV or e.op == OP_MOD
+            if fs_float_literal_only(e.left) == 1 and fs_float_literal_only(e.right) == 1
+                return 1
+        return 0
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        return fs_float_arms_literal_only(e.args as *MatchArm)
+    0
+
+# 1 when every value arm of `arm` is a float literal / constant expression.
+# An if / match expression always has one, and no arms at all is read as
+# literal too: that misses a refusal rather than inventing one.
+fn fs_float_arms_literal_only(arm: *MatchArm) -> i32
+    var a: *MatchArm = arm
+    while a != null
+        if a.is_pass == 0 and a.body != null
+            if fs_float_literal_only(a.body) == 0
+                return 0
+        a = a.next
+    1
+
+# The float width (TYPE_F32 / TYPE_F64) of `e` as a value, or 0 when Sema
+# cannot say.  An if / match takes the width of its non-literal arms: a float
+# literal arm takes the other sides' width (§7.1), so it is a wildcard.
+pub fn float_slot_src(sm: *Sema, e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        return fs_float_merge(sm, e.args as *MatchArm)
+    if e.kind == EXPR_IDENT
+        let v: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+        if v != null
+            if v.kind == TYPE_F32 or v.kind == TYPE_F64
+                return v.kind
+            if v.float_src == TYPE_F32 or v.float_src == TYPE_F64
+                return v.float_src
+    # An integer literal operand leaves the expression untyped here (`y * 2`),
+    # and that is a gap, not a guess; a float literal is exempt above.
+    let t: i32 = sema_expr_type(sm, e)
+    if t == TYPE_F32 or t == TYPE_F64
+        return t
+    0
+
+# The float width an if / match yields, from its non-literal arms (f32 with
+# f64 widens to f64).  0 when none is a typed float.
+fn fs_float_merge(sm: *Sema, arm: *MatchArm) -> i32
+    var merged: i32 = TYPE_VOID
+    var a: *MatchArm = arm
+    while a != null
+        if a.is_pass == 0 and a.body != null
+            if fs_float_literal_only(a.body) == 0
+                let w: i32 = float_slot_src(sm, a.body)
+                if w == 0
+                    return 0
+                if merged == TYPE_VOID
+                    merged = w
+                else if merged != w
+                    merged = TYPE_F64
+        a = a.next
+    merged
+
+# `value`, of wider number type `src`, lands in float slot `dst`: the located
+# error both rules share, in ritz0's words (float_rules).
+fn fs_report_narrow(sm: *Sema, value: *Expr, src: i32, dst: i32)
+    if bool_sema_report_at(sm, fs_report_at(value)) == 0
+        return
+    eprints_cstr(c"implicit conversion from `")
+    eprints_cstr(ty_name(src))
+    eprints_cstr(c"` to `")
+    eprints_cstr(c_float_name(dst))
+    eprints_cstr(c"` can lose precision: write `<expr> as ")
+    eprints_cstr(c_float_name(dst))
+    eprints_cstr(c"`\n")
+
+# `value`, of float type where narrow_sema_src_type answered NARROW_UNKNOWN,
+# lands in float slot `dst`: refuse an f64 value in an f32 slot (LARB R70).
+fn fs_float_narrow_check(sm: *Sema, value: *Expr, dst: i32)
+    if dst != TYPE_F32 or fs_float_literal_only(value) == 1
+        return
+    if float_slot_src(sm, value) == TYPE_F64
+        fs_report_narrow(sm, value, TYPE_F64, TYPE_F32)
+
 # Sema's annotation: the values landing in a float slot whose source type is
 # an unsigned integer exact there (u8 / u16 / u32), keyed by the Expr, mapped
 # to that type.  Absent means signed or unknown: `sitofp`, as before.
@@ -103,17 +204,16 @@ pub fn float_slot_check(sm: *Sema, value: *Expr, dst: i32)
 
 # `value`, of integer type `src` (or NARROW_*), lands in a float slot `dst`.
 pub fn float_slot_judge(sm: *Sema, value: *Expr, src: i32, dst: i32)
-    if src == NARROW_UNKNOWN or src == NARROW_LIT or ty_bits(src) <= 1
+    # A float source narrows only from f64 to f32 (LARB R70, AGAST #3998);
+    # narrow_sema_src_type types integers alone, so a float reaches the first
+    # arm as NARROW_UNKNOWN and is typed here.
+    if src == TYPE_F32
+        return
+    if src == TYPE_F64 or src == NARROW_UNKNOWN or src == NARROW_LIT or ty_bits(src) <= 1
+        fs_float_narrow_check(sm, value, dst)
         return
     if fs_exact(src, dst) == 0
-        if bool_sema_report_at(sm, fs_report_at(value)) == 1
-            eprints_cstr(c"implicit conversion from `")
-            eprints_cstr(ty_name(src))
-            eprints_cstr(c"` to `")
-            eprints_cstr(c_float_name(dst))
-            eprints_cstr(c"` can lose precision: write `<expr> as ")
-            eprints_cstr(c_float_name(dst))
-            eprints_cstr(c"`\n")
+        fs_report_narrow(sm, value, src, dst)
         return
     if ty_is_unsigned(src) == 1
         float_slot_note(value, src)
