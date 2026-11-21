@@ -32,6 +32,12 @@
 #     huburght, AGAST #2998; format in .claude/host-env.sh).  Not above 2 on
 #     12 cores, for the timed tests' sake.  An RZ_GATE_SLOTS in the
 #     environment still wins over the file.
+#   * machine-wide kills (AGAST #4468): a room that starts ci_local.py or
+#     make ci-local outside this script bypasses the slot and ends up with a
+#     pytest tree it cannot safely stop.  `pkill -f` and `kill -- -PGID` then
+#     match every other room's gated pytest on the host: on chungus,
+#     2026-11-21, that killed ritz-task-4295's run 31m18s in.  Run the suite
+#     only here, and kill only the PIDs you spawned.
 #   * ritz-gate.slice at CPUWeight=100: the slot protects gates from gates,
 #     not from room builds.  Task rooms run in ritz-rooms.slice at
 #     CPUWeight=20 under a memory cap (.claude/host-budget.sh, AGAST #1811),

@@ -205,6 +205,15 @@ stays here; remote hosts only run rooms.
   gate. Waiting gates get a free slot first come, first served (#3364); the
   train gate goes ahead of room gates (#3317). A gate log's `WAITING` lines
   show its queue position.
+- **Never kill anything you did not start.** Run the full suite only
+  through `run-gate.sh`: starting `ci_local.py` or `make ci-local` in the
+  background bypasses the one gate slot and leaves a tree you cannot
+  safely stop. On 2026-11-21 a room on chungus did that, then ran
+  `pkill -f` and a negative-PGID `kill`, which killed ritz-task-4295's
+  gated pytest 31m18s in (`4295-…-1.log`, mid-pytest); a slot and half an
+  hour were burned. Kill only the exact PIDs you spawned; if you cannot
+  identify them, tell `rz` instead of widening the kill to another room's
+  `ci_local.py` or `pytest` (AGAST #4468).
 - **Which host a room is on is recorded in AGAST, in the claim's agent
   name:** `ritz-task-<id>` on omegalisk, `ritz-task-<id>@<host>` on a remote
   host. To see what's running where, list `executing` tickets and read
@@ -558,6 +567,14 @@ vouches for that exact commit.
    outside `projects/ritz`, also `./rz build <pkg>` and run their tests;
    compare failures against `origin/main` before calling them pre-existing.
    **Only exit 0 passes, except the terminal budget-only verdict above.**
+
+   Run the full suite only through `run-gate.sh` (one machine-wide slot).
+   Never start `ci_local.py` or `make ci-local` in the background yourself:
+   that creates the duplicate pytest trees that invite a machine-wide kill.
+   Never `pkill -f`, `kill -- -PGID` or any pattern that can match another
+   room's `ci_local.py` or `pytest`; kill only the exact PIDs you spawned,
+   and if you cannot identify them, tell `rz` instead of widening the kill.
+
    Otherwise fix, re-squash, re-run.
 7. **Don't chase `main`.** REAP the commit you gated. `rz` usually lands it
    by cherry-picking it onto `main` in a batch with other rooms' commits and

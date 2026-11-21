@@ -425,3 +425,35 @@ def test_briefing_says_budget_only_gate_verdict_is_terminal():
     gate = " ".join(text[gate_at:].split())
     assert "budget-only" in gate
     assert "`rz` accepts" in gate
+
+
+@pytest.mark.unit
+def test_briefing_bans_machine_wide_kills_and_direct_ci_local():
+    """AGAST #4468: the full suite runs only through run-gate.sh, and a room
+    may stop only the PIDs it spawned -- never pkill -f or a negative PGID."""
+    text = SKILL.read_text()
+    # 1. The briefing template, step 6, where the gate is explained.
+    brief_at = text.index("### The briefing (send verbatim")
+    brief_end = text.index("**Remote additions to the briefing**", brief_at)
+    # Normalise the hard-wrapped prose so phrases can straddle lines.
+    flat = " ".join(text[brief_at:brief_end].split())
+    # Gate-slot-only builds: no hand-started ci_local.py/make ci-local.
+    assert "only through `run-gate.sh`" in flat
+    assert "ci_local.py" in flat
+    assert "make ci-local" in flat
+    # No machine-wide kill may reach another room's pytest.
+    assert "pkill -f" in flat
+    assert "kill -- -PGID" in flat
+    # 2. The gate section (## Hosts) carries the rule and its evidence.
+    hosts_at = text.index("## Hosts")
+    hosts_end = text.index("\n## ", hosts_at + 1)
+    hosts = " ".join(text[hosts_at:hosts_end].split())
+    assert "pkill -f" in hosts
+    assert "ci_local.py" in hosts
+    assert "run-gate.sh" in hosts
+    assert "4295" in hosts and "31m18s" in hosts
+    assert "AGAST #4468" in hosts
+    # 3. run-gate.sh's header says it, where a room opening the script reads.
+    gate_sh = (SKILL.parent / "run-gate.sh").read_text()
+    assert "AGAST #4468" in gate_sh
+    assert "pkill -f" in gate_sh
