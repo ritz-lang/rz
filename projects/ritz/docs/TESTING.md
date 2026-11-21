@@ -490,7 +490,12 @@ Rules:
    c.json --calibration cal.json`.  A host whose live reading is noisy
    fixes its factor instead (host.env's `RZ_CPU_FACTOR`, AGAST #4172;
    measure it idle with `cpu_calibrate.py --runs 5`): the step passes
-   `--factor` and nothing is timed.  Over budget?  Batch and resize
+   `--factor` and nothing is timed.  The workload EXECs the linked binary,
+   so the scratch dir must be on an exec mount: where `/tmp` is `noexec`
+   (bangerang was) the tool probes `--scratch`, `$TMPDIR` and
+   `~/.cache/ritz/exec-tmp` and uses the first that runs a file (AGAST
+   #4431), so `--runs 5` works as printed; pass `--scratch DIR` to choose
+   another exec-capable dir.  Over budget?  Batch and resize
    the matrix; raising the number or adding an override needs a ticket.
 8. **A nested pytest loads only what it tests.**  Set
    `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` and name what it needs with `-p`

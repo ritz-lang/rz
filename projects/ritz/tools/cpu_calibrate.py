@@ -48,6 +48,15 @@ factor instead, as host.env's RZ_CPU_FACTOR:
 * `--runs N` is how to find F, once, on an idle box: N whole calibrations,
   each over the budget's reference_cpu_s, and their median, printed as the
   RZ_CPU_FACTOR= line to copy into host.env.
+
+`--scratch DIR` is where the copies work; with none it is $TMPDIR (or /tmp).
+The workload EXECs the linked binary, so the dir must be on a filesystem
+mounted exec: where /tmp is `noexec` (bangerang was) the default died with
+`Permission denied` (exit 126), which reads as a broken tool (AGAST #4431).
+So the candidates are probed -- `--scratch`, then $TMPDIR, then
+$XDG_CACHE_HOME/ritz/exec-tmp (~/.cache/ritz/exec-tmp) -- and the first that
+can write and run a file is used, with a line saying why it moved on.  Gates
+are unaffected: run-gate.sh gives each gate its own exec-capable TMPDIR.
 """
 
 from __future__ import annotations
@@ -63,7 +72,11 @@ import sys
 import tempfile
 import threading
 import tomllib
+from collections.abc import Callable
 from pathlib import Path
+from typing import TextIO
+
+import exec_tmpdir  # AGAST #3704: the one exec-capable-dir probe
 
 DEFAULT_BUDGET = Path(__file__).resolve().parent / "test_budget.toml"
 
@@ -137,6 +150,51 @@ done:
     return "\n".join(out)
 
 
+def scratch_candidates(scratch: Path | None = None) -> list[Path]:
+    """Where a copy may work, best first: `--scratch`, $TMPDIR, then the cache
+    fallback exec_tmpdir already uses for the gate (AGAST #4431)."""
+    candidates = [] if scratch is None else [Path(scratch)]
+    candidates.append(Path(tempfile.gettempdir()))
+    candidates.append(exec_tmpdir.default_fallback())
+    out, seen = [], set()
+    for c in candidates:
+        key = os.path.abspath(c)
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
+def resolve_scratch(scratch: Path | None = None,
+                    probe_fn: Callable[[str], str | None] | None = None,
+                    out: TextIO = sys.stderr) -> Path:
+    """The first scratch candidate that can create and EXEC a file (AGAST #4431).
+
+    A noexec mount makes the linked binary exit 126, which reads as a broken
+    tool, so probe each candidate and use the first that runs.  Missing dirs
+    are created (the fallback usually does not exist yet).  Raises
+    exec_tmpdir.SetupError naming every candidate when none can run a file.
+    """
+    probe = exec_tmpdir.probe if probe_fn is None else probe_fn
+    candidates = scratch_candidates(scratch)
+    failed: list[str] = []
+    for n, d in enumerate(candidates):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            failed.append(f"{d}: cannot create it: {e}")
+            continue
+        why = probe(str(d))
+        if why is None:
+            if n:
+                print(f"# scratch {candidates[0]} can't run binaries "
+                      f"({failed[0]}); using {d}", file=out, flush=True)
+            return d
+        failed.append(f"{d}: {why}")
+    raise exec_tmpdir.SetupError(
+        "no scratch dir can run binaries: " + "; ".join(failed))
+
+
 def default_jobs() -> int:
     """The suite's worker count: xdist's own `-n auto`, capped at --maxprocesses.
 
@@ -173,13 +231,14 @@ def _one_copy(work: Path, ir: str) -> None:
 
 def measure(jobs: int, rounds: int, scratch: Path | None = None) -> dict:
     """{"cpu_s": median round's CPU-s per copy, "jobs", "rounds", "samples"}."""
+    work = resolve_scratch(scratch)
     ir = reference_ir()
     samples = []
     # Round 0 is a warm-up and is not counted: it pays for cold page cache
     # (python, clang) and a CPU still ramping its clock, and on toffee it read
     # up to 25% over the rounds after it.
     for n in range(rounds + 1):
-        dirs = [Path(tempfile.mkdtemp(prefix="cpu-cal-", dir=scratch)) for _ in range(jobs)]
+        dirs = [Path(tempfile.mkdtemp(prefix="cpu-cal-", dir=work)) for _ in range(jobs)]
         errors: list[BaseException] = []
 
         def copy(d: Path) -> None:
@@ -238,7 +297,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="copies at once (default: the suite's xdist worker count)")
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--scratch", type=Path, default=None,
-                    help="where the copies work (default: $TMPDIR)")
+                    help="where the copies work (default: $TMPDIR, probed for "
+                         "exec; else ~/.cache/ritz/exec-tmp)")
     ap.add_argument("--factor", type=positive_factor, default=None,
                     help="this host's fixed factor (host.env's RZ_CPU_FACTOR, "
                          "AGAST #4172): written as is, nothing is timed")
@@ -251,8 +311,13 @@ def main(argv: list[str] | None = None) -> int:
     if a.runs is not None:
         if a.runs < 1 or a.factor is not None:
             ap.error("--runs takes N >= 1 and no --factor")
+        try:
+            work = resolve_scratch(a.scratch)
+        except exec_tmpdir.SetupError as e:
+            print(f"SETUP ERROR: {e}", file=sys.stderr)
+            return exec_tmpdir.EXIT_SETUP
         factors, med = host_factor_runs(a.runs, a.jobs or default_jobs(), a.rounds,
-                                        a.scratch, a.budget)
+                                        work, a.budget)
         print(f"cpu factor: {' '.join(f'{f:.3f}' for f in factors)}, "
               f"median of {a.runs} runs")
         print(f"RZ_CPU_FACTOR={med:.3f}")
@@ -265,7 +330,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cpu calibration: fixed factor {a.factor:.3f} (RZ_CPU_FACTOR), "
               f"not measured -> {a.out}")
         return 0
-    r = measure(a.jobs or default_jobs(), a.rounds, a.scratch)
+    try:
+        work = resolve_scratch(a.scratch)
+    except exec_tmpdir.SetupError as e:
+        print(f"SETUP ERROR: {e}", file=sys.stderr)
+        return exec_tmpdir.EXIT_SETUP
+    r = measure(a.jobs or default_jobs(), a.rounds, work)
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(r) + "\n")
     print(f"cpu calibration: {r['cpu_s']:.3f} CPU-s per copy, {r['jobs']} at once, "

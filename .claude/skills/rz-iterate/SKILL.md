@@ -162,8 +162,11 @@ stays here; remote hosts only run rooms.
   must be a number > 0, checked like the scale. Measure it once, on an idle
   box, from `projects/ritz/ritz0`:
   `python ../tools/cpu_calibrate.py --runs 5`. It prints each run's factor
-  and a last line `RZ_CPU_FACTOR=<median>` to copy into `host.env`. Measure
-  again after a CPU, kernel, Python or clang change.
+  and a last line `RZ_CPU_FACTOR=<median>` to copy into `host.env`. It EXECs
+  the linked binary, so a `noexec` `/tmp` used to give exit 126 on
+  bangerang; it now probes `--scratch`, `$TMPDIR` and
+  `~/.cache/ritz/exec-tmp` and uses the first that runs a file (AGAST
+  #4431). Measure again after a CPU, kernel, Python or clang change.
   `run-gate.sh` puts the value in the unit's environment and logs its source
   in the header: `CPU_FACTOR=1.67 (host.env)`, `(environment)` or
   `CPU_FACTOR=(measured)`. main.yml's ritz0 step passes it to
