@@ -107,6 +107,15 @@ tools-unit:
 arch-report:
 	@$(PYTHON) tools/ritz1_arch.py
 
+# M1.3's thresholds as a one-way ratchet over the numbers arch-report prints
+# (tools/ritz1_metrics_baseline.json): a metric may improve, not worsen.
+# Runs in tools-unit (tools/test_ritz1_ratchet.py); this target is for humans.
+# Refresh the baseline only with an explicit --update, in the commit that
+# earned the improvement.
+.PHONY: arch-ratchet
+arch-ratchet:
+	@$(PYTHON) tools/ritz1_ratchet.py
+
 # Every examples/**/test/*.ritz [[test]] suite, with ritz0 (AGAST #3729).
 # rz.toml keeps examples out of `rz test --all`, and regression.sh runs each
 # example's test.sh but never its test/*.ritz, so until this target nothing
