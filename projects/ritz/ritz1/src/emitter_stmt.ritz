@@ -1758,6 +1758,15 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 dt.var_type = TYPE_STRUCT
                 dt.var_type_name = src_sg.type_name
                 dt.var_type_name_len = src_sg.type_name_len
+            # LARB R60 / R48: `let q = C` with `const C: S = S {...}` -- the
+            # slot is `alloca %S`, as for a struct global above, so `q.f`
+            # resolves and the init copies the read-only data.
+            else if src_loc == null and stmt.var_declared_type == TYPE_VOID and const_struct_named(s, stmt.var_init) != null
+                let src_sc: *ConstEntry = const_struct_named(s, stmt.var_init)
+                var_type = TYPE_STRUCT
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = src_sc.type_name
+                dt.var_type_name_len = src_sc.type_name_len
             # AGAST #1754: `let q = s` with `s: @&S` / `@S` -- `q` takes `s`'s
             # reference type and pointee, so `q.a` resolves and the slot holds
             # the same `ptr` / i64 `s` loads as.  (Was i64 with no struct name:
@@ -4996,6 +5005,22 @@ fn global_struct_named(s: *EmitterState, e: *Expr) -> *GlobalVarDef
     if g == null or g.var_type != TYPE_STRUCT or g.type_name_len <= 0
         return null
     return g
+
+# LARB R60 / R48: the module struct const `e` names when it is read-only data
+# (`const C: S = S {...}`), or null.  A bare `C` is its `@S` value (the
+# emitter loads `%S` from `@C`), so `let q = C` copies it as `let q: S = C`
+# does.  A local or global of the name wins, as everywhere else.
+fn const_struct_named(s: *EmitterState, e: *Expr) -> *ConstEntry
+    if e == null or e.kind != EXPR_IDENT
+        return null
+    if find_local_struct_name(s, e.ident_ptr, e.ident_len) != null
+        return null
+    if find_global(s, e.ident_ptr, e.ident_len) != null
+        return null
+    let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+    if ce == null or ce.const_type != TYPE_STRUCT or ce.type_name_len <= 0 or ce.value_expr == null
+        return null
+    return ce
 
 # The address of global array `g`, in a register.
 fn emit_global_array_ptr(s: *EmitterState, g: *GlobalVarDef) -> i32

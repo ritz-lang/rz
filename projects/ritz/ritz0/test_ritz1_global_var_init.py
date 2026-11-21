@@ -17,14 +17,15 @@ The fix lowers a constant initializer (int / bool / char / float literal,
 unary minus or `~` of one, `null`, or a cast of any of those) to the LLVM
 initializer, and gives anything else a located error instead of a zero.
 AGAST #1540 adds a reference to a module integer (or bool) const, folded to
-the const's value.
+the const's value.  LARB R60 (#3480) widens the rule to ritz0's: arithmetic,
+a float const, array and struct literals, and unit variants; an f64 global is
+typed `double` (an f32 `float`), no longer an i64 slot holding a bitcast.
 
 Every runnable program returns 3 when the global held the right value at
 startup and something else otherwise; ritz0 is run as the oracle (it lowers
-bool, char and float initializers, and `N as *T`, since AGAST #1539).  Storage
-width is left as ritz1 already had it (narrow ints and floats live in an i64
-slot; a bool is an i1 since AGAST #3001), so the IR-shape tests pin the
-initializer in that storage type.
+bool, char and float initializers, and `N as *T`, since AGAST #1539).  A bool
+is the one i1 byte every access is (AGAST #3001); the IR-shape tests pin the
+initializer in each global's declared type.
 """
 
 import os
@@ -246,6 +247,7 @@ FORMS_1539 = (
     "ptr_int_cast",
     "ptr_int_bare",
     "bool_false",
+    "f32_nonzero",
 )
 
 # --- forms that already worked: zero / null initializers and no initializer --
@@ -316,22 +318,19 @@ pub fn main() -> i32
     return (*g as i32) - 62
 """
 
-ALL_RUNNABLE = {**BROKEN_FORMS, **WORKING_FORMS}
-
-# The #1540 forms, also run on ritz1_selfhosted.
-FORMS_1540 = ("const_ident", "const_negative", "const_later_derived", "const_bool")
-
-# --- ritz0-only forms --------------------------------------------------------
-# ritz1 refuses a non-zero f32 (see NON_CONSTANT_FORMS); ritz0 lowers it.
-
-RITZ0_ONLY_FORMS = {
-    "f32_nonzero": """\
+# LARB R60 (#3480): ritz1 lowers a non-zero f32 too, its bits computed as the
+# rule has it for f64; ritz0 always did.
+BROKEN_FORMS["f32_nonzero"] = """\
 var g: f32 = 1.5
 
 pub fn main() -> i32
     return (g * 2.0) as i32
-""",
-}
+"""
+
+ALL_RUNNABLE = {**BROKEN_FORMS, **WORKING_FORMS}
+
+# The #1540 forms, also run on ritz1_selfhosted.
+FORMS_1540 = ("const_ident", "const_negative", "const_later_derived", "const_bool")
 
 # --- emitted initializer, in ritz1's existing storage type -----------------
 
@@ -344,19 +343,28 @@ IR_FORMS = {
     "bool_false": ("var g: bool = false\n", "i1 0"),
     "u8": ("var g: u8 = 200\n", "i64 200"),
     "bit_not": ("var g: i32 = ~0\n", "i32 -1"),
-    "f64": ("var g: f64 = 1.5\n", "i64 bitcast (double 1.5 to i64)"),
-    "f64_negative": ("var g: f64 = -0.75\n", "i64 bitcast (double -0.75 to i64)"),
-    "f64_from_int": ("var g: f64 = 2\n", "i64 bitcast (double 2.0 to i64)"),
-    "f32_zero": ("var g: f32 = 0.0\n", "i64 zeroinitializer"),
+    # LARB R60 (#3480): an f64 global is typed `double` now, not an i64 slot
+    # holding a bitcast; an f32 is `float`.  LLVM prints a float constant as
+    # the double-width hex of its value.
+    "f64": ("var g: f64 = 1.5\n", "double 0x3FF8000000000000"),
+    "f64_negative": ("var g: f64 = -0.75\n", "double 0xBFE8000000000000"),
+    "f64_from_int": ("var g: f64 = 2\n", "double 0x4000000000000000"),
+    "f32_zero": ("var g: f32 = 0.0\n", "float 0x0000000000000000"),
+    "f32_nonzero": ("var g: f32 = 1.1\n", "float 0x3FF19999A0000000"),
     "ptr_null": ("var g: *u8 = null\n", "ptr null"),
     "ptr_int_cast": ("var g: *u8 = 4096 as *u8\n", "ptr inttoptr (i64 4096 to ptr)"),
     "no_initializer": ("var g: i32\n", "i32 zeroinitializer"),
     # AGAST #1540: an integer const is written as its value, in g's storage.
     "const_ident": ("const K: i32 = 5\nvar g: i32 = K\n", "i32 5"),
     "const_negative": ("const K: i32 = -7\nvar g: i32 = K\n", "i32 -7"),
-    "f64_from_int_const": ("const K: i32 = 2\nvar g: f64 = K\n", "i64 bitcast (double 2.0 to i64)"),
+    "f64_from_int_const": ("const K: i32 = 2\nvar g: f64 = K\n", "double 0x4000000000000000"),
     # Indexing a global array is AGAST #1504; only the declaration is pinned.
     "array_no_initializer": ("var g: [4]i32\n", "[4 x i32] zeroinitializer"),
+    # LARB R60 (#3480): regex-free constant initialisers go through the shared
+    # evaluator, so the declaration is the value ritz0 writes.
+    "binary": ("var g: i32 = 2 + 3\n", "i32 5"),
+    "array_literal": ("var g: [2]i32 = [1, 2]\n", "[2 x i32] [i32 1, i32 2]"),
+    "float_const": ("const F: f64 = 1.5\nvar g: f64 = F\n", "double 0x3FF8000000000000"),
 }
 
 # --- initializers ritz1 cannot fold: a located error, never a silent zero ---
@@ -385,48 +393,9 @@ pub fn main() -> i32
 """,
         2,
     ),
-    "binary": (
-        """\
-var g: i32 = 2 + 3
-
-pub fn main() -> i32
-    return g
-""",
-        1,
-    ),
-    # Aggregate initializers are not lowered yet; refuse rather than zero.
-    "array_literal": (
-        """\
-var g: [2]i32 = [1, 2]
-
-pub fn main() -> i32
-    return 3
-""",
-        1,
-    ),
-    # A non-zero f32 needs its float bit pattern computed by ritz1, and LLVM
-    # rejects `float 1.1` and fptrunc constexprs; refuse rather than guess.
-    "f32_nonzero": (
-        """\
-var g: f32 = 1.1
-
-pub fn main() -> i32
-    return 3
-""",
-        1,
-    ),
-    # AGAST #1540 folds only integer consts: a float const's `value` is not
-    # its value (it would read as 0).
-    "float_const": (
-        """\
-const F: f64 = 1.5
-var g: f64 = F
-
-pub fn main() -> i32
-    return 3
-""",
-        2,
-    ),
+    # LARB R60 (#3480) moved `binary` (`2 + 3`), `array_literal`, `f32_nonzero`
+    # and `float_const` (a float const) out of this table: they are constant
+    # initialisers now, and run in test_const_init_r60.py under all compilers.
     # A const that does not fold has its own error; the global naming it
     # must be refused too, not written as the const's placeholder 0.
     "bad_const": (
@@ -542,12 +511,6 @@ def test_ritz1_selfhosted_global_starts_at_initializer(ritz1_bin, tmp_path, name
 def test_ritz1_selfhosted_global_from_const(ritz1_bin, tmp_path, name):
     """AGAST #1540's const-identifier forms on the third compiler."""
     assert _run("ritz1_selfhosted", tmp_path, name, ALL_RUNNABLE[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ0_ONLY_FORMS))
-def test_ritz0_only_global_starts_at_initializer(tmp_path, name):
-    assert _run("ritz0", tmp_path, name, RITZ0_ONLY_FORMS[name]) == 3
 
 
 @pytest.mark.integration

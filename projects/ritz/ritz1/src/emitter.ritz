@@ -2479,6 +2479,8 @@ const GINIT_INT: i32 = 1     # integer/bool/char value in int_val
 const GINIT_FLOAT: i32 = 2   # float literal text in text/text_len, sign in neg
 const GINIT_NULL: i32 = 3    # null / nil
 const GINIT_STR: i32 = 4     # c"..." (or a "..." literal_slot retyped): text/text_len
+const GINIT_FCONST: i32 = 5  # LARB R60: folded `double` bits in int_val
+const GINIT_AGGR: i32 = 6    # LARB R60: emitted by the shared const evaluator
 
 struct GlobalInit
     kind: i32
@@ -2561,6 +2563,140 @@ fn global_init_float_is_pos_zero(gi: *GlobalInit) -> i32
         i += 1
     1
 
+# LARB R60: the `f64` nearest the decimal literal `text[0..len]` (`digits`,
+# optional `.digits`, optional exponent).  A literal with no arithmetic is
+# emitted verbatim instead (LLVM rounds it), so this is only read when the
+# value is folded.  The mantissa is accumulated exactly while it fits a
+# `double`; scaling by ten is the arithmetic the run-time folder does.
+fn const_parse_f64(text: *u8, len: i32, out: *f64) -> i32
+    var i: i32 = 0
+    var neg: i32 = 0
+    if i < len and *(text + i) == '-'
+        neg = 1
+        i += 1
+    else if i < len and *(text + i) == '+'
+        i += 1
+    var m: f64 = 0.0
+    var digits: i32 = 0
+    var frac: i32 = 0
+    var any: i32 = 0
+    while i < len
+        let ch: u8 = *(text + i)
+        if ch == '.'
+            i += 1
+            while i < len
+                let fc: u8 = *(text + i)
+                if fc < 48 or fc > 57
+                    break
+                if digits < 19
+                    m = m * 10.0 + (fc - 48) as f64
+                    digits += 1
+                frac += 1
+                any = 1
+                i += 1
+            break
+        if ch < 48 or ch > 57
+            break
+        if digits < 19
+            m = m * 10.0 + (ch - 48) as f64
+            digits += 1
+        any = 1
+        i += 1
+    if any == 0
+        return 0
+    var e10: i32 = 0
+    if i < len and (*(text + i) == 'e' or *(text + i) == 'E')
+        i += 1
+        var eneg: i32 = 0
+        if i < len and *(text + i) == '-'
+            eneg = 1
+            i += 1
+        else if i < len and *(text + i) == '+'
+            i += 1
+        var ex: i32 = 0
+        while i < len and *(text + i) >= 48 and *(text + i) <= 57
+            ex = ex * 10 + (*(text + i) - 48) as i32
+            if ex > 400
+                return 0
+            i += 1
+        if eneg == 1
+            e10 = 0 - ex
+        else
+            e10 = ex
+    e10 = e10 - frac
+    var x: f64 = m
+    if e10 > 0
+        for j in 0..e10
+            x = x * 10.0
+    else if e10 < 0
+        for j in 0..(0 - e10)
+            x = x / 10.0
+    if neg == 1
+        x = 0.0 - x
+    *out = x
+    1
+
+# LARB R60: fold a constant-folding float expression to its `double`: a float
+# or integer literal, a numeric const, unary `-`, `+ - * /` and casts of
+# those.  A string / bool / call / global is not one (0).
+fn const_fold_float(s: *EmitterState, e: *Expr, out: *f64) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_FLOAT_LIT
+        return const_parse_f64(e.string_ptr, e.string_len, out)
+    if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
+        *out = e.int_val as f64
+        return 1
+    if e.kind == EXPR_IDENT
+        let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+        if ce == null
+            return 0
+        if is_int_const_type(ce.const_type) == 1
+            if ce.fold_state != CONST_FOLD_DONE
+                return 0
+            *out = ce.value as f64
+            return 1
+        if ce.const_type == TYPE_F64 or ce.const_type == TYPE_F32
+            return const_fold_float(s, ce.value_expr, out)
+        return 0
+    if e.kind == EXPR_CAST
+        return const_fold_float(s, e.left, out)
+    if e.kind == EXPR_UNARY
+        if e.op != OP_NEG
+            return 0
+        if const_fold_float(s, e.operand, out) == 0
+            return 0
+        *out = 0.0 - *out
+        return 1
+    if e.kind == EXPR_BINARY
+        var a: f64 = 0.0
+        var b: f64 = 0.0
+        if const_fold_float(s, e.left, @a) == 0
+            return 0
+        if const_fold_float(s, e.right, @b) == 0
+            return 0
+        if e.op == OP_ADD
+            *out = a + b
+            return 1
+        if e.op == OP_SUB
+            *out = a - b
+            return 1
+        if e.op == OP_MUL
+            *out = a * b
+            return 1
+        if e.op == OP_DIV
+            if b == 0.0
+                return 0
+            *out = a / b
+            return 1
+        return 0
+    0
+
+# The words every R60 refusal ends with (LANGUAGE_SPEC §4.3), ritz0's
+# _GLOBAL_NON_CONSTANT tail.
+fn global_non_constant_why() -> *u8
+    c"has a non-constant initializer: a constant initialiser is a literal, a const, arithmetic or a cast of those, a unit enum variant, or an array or struct literal of them (§4.3)"
+
 # "<file>:<line>:<col>: error: global '<name>' <why>" on stderr, an IR marker,
 # and a counted error so main refuses to write the output.  line:col is the
 # declaration's, or the initializer's for a fault in the initializer (#3043).
@@ -2595,10 +2731,61 @@ fn emit_cstring_const(s: *EmitterState, text: *u8, len: i32)
     emit_str(s, c"@.str.")
     emit_int(s, add_string(s, text, len) as i64)
 
+# LARB R60: build the ConstEntry context and StructField slot that let a
+# global's initialiser be lowered by the same evaluator as a const's value
+# (emit_const_value), so `const` and global `var` are one rule.  The context
+# is marked is_global so errors read `global 'g'` and strings use the pool;
+# the slot is the declared type, exactly as `var g: T` writes it.
+fn global_const_ctx(g: *GlobalVarDef, c: *ConstEntry, f: *StructField)
+    memzero(c as *u8, sizeof(ConstEntry) as i64)
+    c.name = g.name
+    c.name_len = g.name_len
+    c.const_type = g.var_type
+    c.value_expr = g.init_expr
+    c.array_size = g.array_size
+    c.array_elem_type = g.array_elem_type
+    c.array_elem_type_name = g.array_elem_type_name
+    c.array_elem_type_name_len = g.array_elem_type_name_len
+    c.array_elem_pointee = g.array_elem_pointee
+    c.ptr_pointee = g.pointee_type
+    c.type_name = g.type_name
+    c.type_name_len = g.type_name_len
+    c.src_file = g.src_file
+    c.def_file = g.src_file
+    c.line = g.line
+    c.col = g.col
+    c.is_global = 1
+    memzero(f as *u8, sizeof(StructField) as i64)
+    f.field_type = g.var_type
+    f.field_type_name = g.type_name
+    f.field_type_name_len = g.type_name_len
+    f.array_size = g.array_size
+    f.array_elem_type = g.array_elem_type
+    f.array_elem_type_name = g.array_elem_type_name
+    f.array_elem_type_name_len = g.array_elem_type_name_len
+    f.array_elem_pointee = g.array_elem_pointee
+    f.array_shape = g.array_shape
+    f.ptr_pointee = g.pointee_type
+
 # Write " <initializer>" for g, whose storage type has just been emitted.
 fn emit_global_init(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
     if gi.kind == GINIT_BAD
         emit_str(s, c" zeroinitializer")
+        return
+    # LARB R60: an array or struct literal (or a const naming one) is lowered
+    # by the shared const evaluator, in the global's declared type.
+    if gi.kind == GINIT_AGGR
+        var c: ConstEntry
+        var f: StructField
+        var root: ConstFieldPath
+        global_const_ctx(g, @c, @f)
+        root.fi = null
+        root.up = null
+        root.idx = 0
+        root.at = g.init_expr
+        root.root = 1
+        emit_str(s, c" ")
+        emit_const_value(s, @c, 0 - 1, @f, g.init_expr, @root)
         return
     # Storage `ptr`.
     if g.var_type == TYPE_PTR
@@ -2612,21 +2799,12 @@ fn emit_global_init(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
             emit_int(s, gi.int_val)
             emit_str(s, c" to ptr)")
         return
-    # f64 lives in an i64 slot and is loaded as `double`: store its bits.
-    if g.var_type == TYPE_F64
-        emit_str(s, c" bitcast (double ")
-        if gi.kind == GINIT_FLOAT
-            if gi.neg != 0
-                emit_str(s, c"-")
-            emit_name(s, gi.text, gi.text_len)
-        else
-            emit_int(s, gi.int_val)
-            emit_str(s, c".0")
-        emit_str(s, c" to i64)")
-        return
-    # f32: only +0 reaches here (anything else was rejected up front).
-    if g.var_type == TYPE_F32
-        emit_str(s, c" zeroinitializer")
+    # LARB R60: a float global is typed `double` / `float` (not an i64 slot)
+    # and its folded bits are the initializer, exactly as a run-time literal
+    # rounds.  gi.int_val holds the bits of the widened `double`.
+    if g.var_type == TYPE_F64 or g.var_type == TYPE_F32
+        emit_str(s, c" ")
+        emit_double_bits(s, gi.int_val)
         return
     # Every other storage type is an LLVM integer.
     emit_str(s, c" ")
@@ -2638,40 +2816,66 @@ fn emit_global_init(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
 # Fold g.init_expr into gi, reporting a located error when it cannot be
 # lowered.  An absent initializer leaves gi.kind == GINIT_BAD with no error,
 # which emit_global_init writes as zeroinitializer.
+#
+# LARB R60: a module-level value's initialiser is a *constant initialiser*,
+# one rule for `const` and global `var`: a literal, a const, arithmetic or a
+# cast of those, a unit enum variant, or an array / struct literal of them.
+# Scalars fold here (integer arithmetic through const_fold_int, floats through
+# const_fold_float); aggregates are marked GINIT_AGGR and lowered by the same
+# evaluator that lowers a const's data (emit_const_value), so there is one
+# rule, not a parallel one.
 fn global_init_check(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
     gi.kind = GINIT_BAD
     if g.init_expr == null
         return
     if g.var_type == TYPE_STRUCT or g.var_type == TYPE_ARRAY
-        global_init_error(s, g, g.line, g.col, c"has an aggregate initializer; ritz1 only lowers scalar constants")
+        gi.kind = GINIT_AGGR
         return
-    global_init_fold(s, g.init_expr, gi)
-    if gi.kind == GINIT_BAD
-        global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"has a non-constant initializer; ritz1 lowers only literals, integer consts, unary -/~/! of one, null and casts of those")
-        return
-    if gi.kind == GINIT_STR and g.var_type != TYPE_PTR
+    if g.var_type != TYPE_PTR and (g.init_expr.kind == EXPR_STRING_LIT or g.init_expr.kind == EXPR_CSTRING_LIT)
         global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a pointer but has a string initializer")
-        gi.kind = GINIT_BAD
         return
-    let is_float: i32 = is_float_type(g.var_type, g.type_name, g.type_name_len)
-    if gi.kind == GINIT_FLOAT and is_float == 0
-        global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a float type but has a float initializer")
-        gi.kind = GINIT_BAD
+    # A float slot: a float or integer literal, a numeric const, `-`, `+ - *
+    # /` and casts of those.  f32 is the `double` rounded to float, then
+    # widened for the hex spelling, exactly as a run-time f32 literal is.
+    if g.var_type == TYPE_F64 or g.var_type == TYPE_F32
+        var d: f64 = 0.0
+        if const_fold_float(s, g.init_expr, @d) == 0
+            # LARB R60: `null` fits a pointer slot only, under ritz0's words.
+            if g.init_expr.kind == EXPR_NIL_LIT
+                global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a pointer but has a null initializer")
+                return
+            global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
+            return
+        if g.var_type == TYPE_F32
+            let narrow: f32 = d as f32
+            d = narrow as f64
+        gi.kind = GINIT_FCONST
+        gi.int_val = *(@d as *i64)
         return
-    if gi.kind == GINIT_NULL and is_float == 1
-        global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is a float type but has a null initializer")
-        gi.kind = GINIT_BAD
-        return
-    if g.var_type == TYPE_F32
-        var zero: i32 = 0
-        if gi.kind == GINIT_INT and gi.int_val == 0
-            zero = 1
+    if g.var_type == TYPE_PTR
+        global_init_fold(s, g.init_expr, gi)
+        if gi.kind == GINIT_BAD
+            global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
         else if gi.kind == GINIT_FLOAT
-            zero = global_init_float_is_pos_zero(gi)
-        if zero == 0
-            global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is f32 with a non-zero initializer, which ritz1 cannot lower yet")
+            global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a float type but has a float initializer")
             gi.kind = GINIT_BAD
         return
+    # An integer / bool / char slot.
+    if g.init_expr.kind == EXPR_NIL_LIT
+        # ritz1 has always stored `null` in an integer global as 0.
+        gi.kind = GINIT_INT
+        gi.int_val = 0
+        return
+    var v: i64 = 0
+    if const_fold_int(s.module.constants, g.init_expr, 1, @v) == 0
+        var d: f64 = 0.0
+        if const_fold_float(s, g.init_expr, @d) == 1
+            global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a float type but has a float initializer")
+        else
+            global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
+        return
+    gi.kind = GINIT_INT
+    gi.int_val = v
 
 # =============================================================================
 # Integer const resolution (AGAST #1502)
@@ -2717,6 +2921,15 @@ fn resolve_const_values(s: *EmitterState)
 # The LLVM type a defined global is emitted with.  Narrow scalars live in an
 # i64 slot (accesses use their own width).
 fn emit_global_llvm_type(s: *EmitterState, g: *GlobalVarDef)
+    # LARB R60 (AGAST #3480): a float global is stored at its own type, so
+    # `@g = global double` / `global float`, not an i64 slot holding a
+    # `bitcast (double …)`.
+    if g.var_type == TYPE_F64
+        emit_str(s, c"double")
+        return
+    if g.var_type == TYPE_F32
+        emit_str(s, c"float")
+        return
     # Emit the type
     if g.var_type == TYPE_STRUCT
         emit_str(s, c"%")
@@ -2772,6 +2985,75 @@ fn emit_extern_global_llvm_type(s: *EmitterState, g: *GlobalVarDef)
     else
         emit_global_llvm_type(s, g)
 
+# LARB R60: a const or global `var` of a type with Drop, or holding one, is an
+# error (§4.3): nothing drops it — it lives until the process exits.  A global
+# that needs one is a pointer (`var g: *T`), allocated in its init path.
+fn module_drop_error(s: *EmitterState, is_global: i32, name: *u8, name_len: i32, arr_size: i32, ty: *u8, ty_len: i32, file: *u8, line: i32, col: i32)
+    var f: *u8 = file
+    if f == null
+        f = emitter_source_file()
+    diag_error_at(f, diag_span(line, col))
+    if is_global == 1
+        eprints_cstr(c"global '")
+    else
+        eprints_cstr(c"const '")
+    eprint_bytes(name, name_len)
+    eprints_cstr(c"' has type `")
+    if arr_size >= 0
+        eprint_char('[')
+        eprint_i64(arr_size as i64)
+        eprint_char(']')
+    eprint_bytes(ty, ty_len)
+    eprints_cstr(c"`, which has Drop: a module-level value is never dropped\n")
+    s.error_count = s.error_count + 1
+
+# 1 when `g`'s declared type has Drop (nothing drops it): reported, 1.
+fn global_drop_refused(s: *EmitterState, g: *GlobalVarDef) -> i32
+    var n: *u8 = null
+    var nl: i32 = 0
+    var arr: i32 = 0 - 1
+    if g.var_type == TYPE_STRUCT
+        n = g.type_name
+        nl = g.type_name_len
+    else if g.var_type == TYPE_ARRAY
+        arr = g.array_size
+        if g.array_elem_type == TYPE_STRUCT
+            n = g.array_elem_type_name
+            nl = g.array_elem_type_name_len
+        else if g.array_shape != null and g.array_shape.leaf_type == TYPE_STRUCT
+            n = g.array_shape.leaf_name
+            nl = g.array_shape.leaf_name_len
+            arr = g.array_shape.dims[0]
+    if n == null or nl <= 0
+        return 0
+    if own_type_is_move_only(s, n, nl) == 0
+        return 0
+    module_drop_error(s, 1, g.name, g.name_len, arr, n, nl, g.src_file, g.line, g.col)
+    1
+
+# 1 when `c`'s declared type has Drop (nothing drops it): reported, 1.
+fn const_drop_refused(s: *EmitterState, c: *ConstEntry) -> i32
+    var n: *u8 = null
+    var nl: i32 = 0
+    var arr: i32 = 0 - 1
+    if c.const_type == TYPE_STRUCT
+        n = c.type_name
+        nl = c.type_name_len
+    else if c.const_type == TYPE_ARRAY
+        arr = c.array_size
+        if c.array_elem_type == TYPE_STRUCT
+            n = c.array_elem_type_name
+            nl = c.array_elem_type_name_len
+    if n == null or nl <= 0
+        return 0
+    if own_type_is_move_only(s, n, nl) == 0
+        return 0
+    var file: *u8 = c.def_file
+    if file == null
+        file = c.src_file
+    module_drop_error(s, 0, c.name, c.name_len, arr, n, nl, file, c.line, c.col)
+    1
+
 fn emit_global_vars(s: *EmitterState)
     var g: *GlobalVarDef = s.module.globals
     while g != null
@@ -2791,6 +3073,7 @@ fn emit_global_vars(s: *EmitterState)
             continue
         # Fold (and diagnose) the initializer before the declaration line so
         # any IR error marker lands on its own line.
+        global_drop_refused(s, g)   # LARB R60: reported, then lowered anyway
         if g.array_shape != null and g.init_expr != null
             # AGAST #1509: a global N-D initializer is not lowered (a local one is, #3377).
             emit_nd_error(s, g.line, g.col, c"an initializer on a multi-dimensional array is not supported in ritz1")
@@ -2889,23 +3172,58 @@ fn emit_const_struct_literal(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st
     emit_str(s, c"%")
     emit_name(s, c.array_elem_type_name, c.array_elem_type_name_len)
     emit_str(s, c" ")
-    emit_const_struct_body(s, c, elem_idx, st, elem.args as *FieldInit, null)
+    # The element's own site, so a missing field reads `const 'A' element 0`
+    # and is located at the element (LARB R60).
+    var at: ConstFieldPath
+    at.fi = null
+    at.up = null
+    at.idx = 0
+    at.at = elem
+    at.root = 1
+    emit_const_struct_body(s, c, elem_idx, st, elem.args as *FieldInit, @at)
 
 # A field's place inside a const struct element: its FieldInit and the
 # enclosing struct literal's field (null at the element's top level), so an
 # error can name `inn.a` (AGAST #3651).  An element of an array field has
 # fi null and its index in `idx`, so the path reads `a[1].k` (AGAST #3673).
-# `at` is the value, where an error is reported.
+# `at` is the value, where an error is reported.  `root` marks the sentinel a
+# struct const's or a global's whole initialiser sits at: it prints no path of
+# its own and tells a top-level array element (`element N`) from an array in a
+# field (`field 'a[1]'`) as ritz0's _ConstSite does (LARB R60).
 struct ConstFieldPath
     fi: *FieldInit
     up: *ConstFieldPath
     idx: i32
     at: *Expr
+    root: i32
+
+# LARB R60: how deep a const's value is being inlined into another's
+# (`const D: In = C`).  A chain that returns to itself is a circular
+# definition, reported rather than recursed forever.
+var g_const_inline_depth: i32 = 0
 
 # `{ <field>, ... }` of a struct literal whose fields are `fields`.  Walks the
 # struct definition in field order (canonical) and emits each field's value
 # using `emit_const_field_value`; `up` is where this literal sits.
 fn emit_const_struct_body(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *StructDef, fields: *FieldInit, up: *ConstFieldPath)
+    # LARB R60: a field the type does not have is a located error, as ritz0's
+    # _const_init_struct gives it.  A root sentinel's value locates it.
+    var given: *FieldInit = fields
+    while given != null
+        if find_field_index(st, given.name, given.name_len) < 0
+            var bad: ConstFieldPath
+            bad.fi = given
+            bad.up = up
+            bad.idx = 0
+            bad.at = given.value
+            bad.root = 0
+            const_field_error_head(s, c, elem_idx, @bad)
+            eprints_cstr(c"names field '")
+            eprint_bytes(given.name, given.name_len)
+            eprints_cstr(c"', which `")
+            eprint_bytes(st.name, st.name_len)
+            eprints_cstr(c"` doesn't have\n")
+        given = given.next
     emit_str(s, c"{ ")
     var field: *StructField = st.fields
     var first: i32 = 1
@@ -2914,7 +3232,32 @@ fn emit_const_struct_body(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *
             emit_str(s, c", ")
         first = 0
         let fi: *FieldInit = find_field_init(fields, field.name, field.name_len)
-        emit_const_field_value(s, c, elem_idx, field, fi, up)
+        if fi == null or fi.value == null
+            # LARB R60: every field needs a value (`global 'g' has no value
+            # for field 'k'`).  ritz0 reports it at the struct literal's own
+            # site (this literal, `up`), not at the missing field's.  A typed
+            # zero keeps the line well-formed.
+            var miss: FieldInit
+            miss.name = field.name
+            miss.name_len = field.name_len
+            miss.value = null
+            miss.next = null
+            var site: ConstFieldPath
+            var sp: *ConstFieldPath = up
+            if sp == null
+                site.fi = null
+                site.up = null
+                site.idx = 0
+                site.at = c.value_expr
+                site.root = 1
+                sp = @site
+            emit_const_field_value(s, c, elem_idx, field, @miss, up)
+            const_field_error_head(s, c, elem_idx, sp)
+            eprints_cstr(c"has no value for field '")
+            eprint_bytes(field.name, field.name_len)
+            eprints_cstr(c"'\n")
+        else
+            emit_const_field_value(s, c, elem_idx, field, fi, up)
         field = field.next
     emit_str(s, c" }")
 
@@ -2932,6 +3275,7 @@ fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
     here.up = up
     here.idx = 0
     here.at = fi.value
+    here.root = 0
     emit_field_llvm_type(s, field)
     emit_str(s, c" ")
     emit_const_value(s, c, elem_idx, field, fi.value, @here)
@@ -2948,6 +3292,31 @@ fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
 # operand is still written, typed, so the line stays well-formed.
 fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, v: *Expr, path: *ConstFieldPath)
     let ft: i32 = field.field_type
+    # LARB R60: a const is a constant initialiser.  A struct, enum or array
+    # const is read-only data (R48); its value is its own initialiser, inlined
+    # here as ritz0's _const_init does (`const D: In = C`, `var g: In = C`).
+    # A struct or enum slot takes a const of its own type; an array slot a
+    # const array of it.
+    if v.kind == EXPR_IDENT and (ft == TYPE_STRUCT or ft == TYPE_ARRAY)
+        let src: *ConstEntry = find_const_entry(s, v.ident_ptr, v.ident_len)
+        if src != null and src.const_type == ft and src.value_expr != null
+            if ft == TYPE_STRUCT and name_eq(src.type_name, src.type_name_len, field.field_type_name, field.field_type_name_len) == 0
+                emit_str(s, c"zeroinitializer")
+                const_field_error_head(s, c, elem_idx, path)
+                eprints_cstr(c"names const `")
+                eprint_bytes(v.ident_ptr, v.ident_len)
+                eprints_cstr(c"`, which is not a `")
+                eprint_bytes(field.field_type_name, field.field_type_name_len)
+                eprints_cstr(c"`\n")
+                return
+            if g_const_inline_depth > 64
+                emit_str(s, c"zeroinitializer")
+                const_field_error(s, c, elem_idx, path, c"value is not a constant expression (circular definition)")
+                return
+            g_const_inline_depth += 1
+            emit_const_value(s, c, elem_idx, field, src.value_expr, path)
+            g_const_inline_depth -= 1
+            return
     if ft == TYPE_STRUCT and v.kind == EXPR_STRING_LIT
         # Treat target struct as StrView-shaped: { ptr, i64 len }.
         emit_str(s, c"{ ptr ")
@@ -2978,6 +3347,16 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
             if v.kind != EXPR_STRUCT_LIT
                 emit_str(s, c"zeroinitializer")
                 const_field_error(s, c, elem_idx, path, c"is not a struct literal")
+                return
+            # LARB R60: a struct literal names the declared type.
+            if v.ident_len > 0 and name_eq(v.ident_ptr, v.ident_len, field.field_type_name, field.field_type_name_len) == 0
+                emit_str(s, c"zeroinitializer")
+                const_field_error_head(s, c, elem_idx, path)
+                eprints_cstr(c"is a `")
+                eprint_bytes(v.ident_ptr, v.ident_len)
+                eprints_cstr(c"` literal for a `")
+                eprint_bytes(field.field_type_name, field.field_type_name_len)
+                eprints_cstr(c"`\n")
                 return
             emit_const_struct_body(s, c, elem_idx, st, v.args as *FieldInit, path)
             return
@@ -3084,20 +3463,45 @@ fn emit_const_array_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
 
 # Dimension `d` of an array field's value (sh null: a one-dimensional `[n]T`):
 # an array literal of `n` elements, each the next dimension's literal or,
-# at the last one, a leaf `el`.
+# at the last one, a leaf `el`; or the fill `[v; N]` (LARB R60).
 fn emit_const_array_dim(s: *EmitterState, c: *ConstEntry, elem_idx: i32, sh: *ArrayShape, d: i32, n: i32, el: *StructField, v: *Expr, path: *ConstFieldPath)
     var count: i32 = 0
+    var fill: *Expr = null
     if v.kind == EXPR_ARRAY_LIT
         var ce: *Expr = v.args
         while ce != null
             count += 1
             ce = ce.next
-    if v.kind != EXPR_ARRAY_LIT or count != n
+    else if v.kind == EXPR_ARRAY_FILL
+        fill = v.left
+        count = v.int_val as i32
+    if (v.kind != EXPR_ARRAY_LIT and v.kind != EXPR_ARRAY_FILL) or count != n
         emit_str(s, c"zeroinitializer")
         const_field_error_head(s, c, elem_idx, path)
-        eprints_cstr(c"is not an array literal of ")
-        eprint_i64(n as i64)
-        eprints_cstr(c" elements\n")
+        if c.is_global == 1 or elem_idx < 0
+            # LARB R60: ritz0's _const_init_array wording, against the slot's
+            # type (`is an array literal of 2 elements for a [3]i32`).
+            if v.kind == EXPR_ARRAY_FILL
+                eprints_cstr(c"is a fill of ")
+                eprint_i64(count as i64)
+                eprints_cstr(c" elements for a `")
+            else if v.kind == EXPR_ARRAY_LIT
+                eprints_cstr(c"is an array literal of ")
+                eprint_i64(count as i64)
+                eprints_cstr(c" elements for a `")
+            else
+                eprints_cstr(global_non_constant_why())
+                eprints_cstr(c"\n")
+                return
+            eprint_char('[')
+            eprint_i64(n as i64)
+            eprint_char(']')
+            eprint_array_leaf_type(el)
+            eprints_cstr(c"`\n")
+        else
+            eprints_cstr(c"is not an array literal of ")
+            eprint_i64(n as i64)
+            eprints_cstr(c" elements\n")
         return
     var inner: i32 = 0
     if sh != null and d + 1 < sh.rank
@@ -3105,32 +3509,55 @@ fn emit_const_array_dim(s: *EmitterState, c: *ConstEntry, elem_idx: i32, sh: *Ar
     emit_str(s, c"[")
     var e: *Expr = v.args
     var i: i32 = 0
-    while e != null
+    while i < n and (fill != null or e != null)
         if i > 0
             emit_str(s, c", ")
+        var val: *Expr = e
+        if fill != null
+            val = fill
         var at: ConstFieldPath
         at.fi = null
         at.up = path
         at.idx = i
-        at.at = e
+        at.at = val
+        at.root = 0
         if inner == 1
             emit_array_shape_llvm(s, sh, d + 1)
             emit_str(s, c" ")
-            emit_const_array_dim(s, c, elem_idx, sh, d + 1, sh.dims[d + 1], el, e, @at)
+            emit_const_array_dim(s, c, elem_idx, sh, d + 1, sh.dims[d + 1], el, val, @at)
         else
             emit_field_llvm_type(s, el)
             emit_str(s, c" ")
-            emit_const_value(s, c, elem_idx, el, e, @at)
+            emit_const_value(s, c, elem_idx, el, val, @at)
         i += 1
-        e = e.next
+        if fill == null
+            e = e.next
     emit_str(s, c"]")
+
+# The Ritz spelling of an array's leaf element (`i32`, `*u8`, `P`) for an
+# error naming its type (LARB R60).
+fn eprint_array_leaf_type(el: *StructField)
+    if el.field_type == TYPE_STRUCT and el.field_type_name_len > 0
+        eprint_bytes(el.field_type_name, el.field_type_name_len)
+        return
+    if el.field_type == TYPE_PTR
+        eprint_char('*')
+        if el.ptr_pointee == TYPE_STRUCT or el.ptr_pointee == TYPE_VOID
+            return
+        eprints_cstr(ty_name(el.ptr_pointee))
+        return
+    eprints_cstr(ty_name(el.field_type))
 
 # A string literal's bytes as a constant `ptr` operand.  A `"..."` directly in
 # an element has its own `@.const.NAME.ELEM.FIELD` (emitted up front by
 # emit_const_array_entry); one in a nested literal, and any `c"..."`, comes
 # from the string pool.
 fn emit_const_string_ref(s: *EmitterState, c: *ConstEntry, elem_idx: i32, v: *Expr, path: *ConstFieldPath)
-    if path.up == null and v.kind == EXPR_STRING_LIT
+    # A const struct-table element's direct `"..."` field has its own backing
+    # global.  A global's initialiser, and a whole struct const's value, use
+    # the string pool (LARB R60): the pool is emitted after every global, so a
+    # global may name an entry before its definition.
+    if c.is_global == 0 and elem_idx >= 0 and path != null and path.up == null and path.fi != null and v.kind == EXPR_STRING_LIT
         emit_str(s, c"@.const.")
         emit_name(s, c.name, c.name_len)
         emit_str(s, c".")
@@ -3178,6 +3605,18 @@ fn emit_const_float_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ft: i
             emit_double_bits(s, *(@wide as *i64))
         return
     if e.kind != EXPR_FLOAT_LIT
+        # LARB R60: a const, arithmetic or a cast of constant initialisers is
+        # one too — in a whole struct const's field and in a global's, which
+        # route here with elem_idx -1 / is_global (ritz0's _const_init).  A
+        # const table's field keeps its older literal-only rule.
+        if c.is_global == 1 or elem_idx < 0
+            var d: f64 = 0.0
+            if const_fold_float(s, v, @d) == 1
+                if ft == TYPE_F32
+                    let narrow: f32 = d as f32
+                    d = narrow as f64
+                emit_double_bits(s, *(@d as *i64))
+                return
         emit_str(s, c"0.0")
         const_field_error(s, c, elem_idx, path, c"is not a float literal or an integer literal")
         return
@@ -3270,14 +3709,15 @@ fn const_field_error(s: *EmitterState, c: *ConstEntry, elem_idx: i32, path: *Con
     eprints_cstr(why)
     eprints_cstr(c"\n")
 
-# `file:line:col: error: const 'NAME' element N field 'PATH' `: the caller
-# writes the rest of the line.  Counts the error.
+# `file:line:col: error: const 'NAME' element N field 'PATH' ` (a const) or
+# `... global 'NAME' field 'PATH' ` / `... global 'NAME' element N ` (LARB
+# R60): the caller writes the rest of the line.  Counts the error.
 fn const_field_error_head(s: *EmitterState, c: *ConstEntry, elem_idx: i32, path: *ConstFieldPath)
-    var line: i32 = path.at.span.line
-    var col: i32 = path.at.span.col
-    if line == 0
-        line = c.line
-        col = c.col
+    var line: i32 = c.line
+    var col: i32 = c.col
+    if path != null and path.at != null and path.at.span.line != 0
+        line = path.at.span.line
+        col = path.at.span.col
     var file: *u8 = c.def_file
     if file == null
         file = c.src_file
@@ -3290,20 +3730,37 @@ fn const_field_error_head(s: *EmitterState, c: *ConstEntry, elem_idx: i32, path:
     eprint_i64(line as i64)
     eprint_char(':')
     eprint_i64(col as i64)
-    eprints_cstr(c": error: const '")
+    if c.is_global == 1
+        eprints_cstr(c": error: global '")
+    else
+        eprints_cstr(c": error: const '")
     var i: i32 = 0
     while i < c.name_len
         eprint_char(*(c.name + i))
         i += 1
-    eprints_cstr(c"' element ")
-    eprint_i64(elem_idx as i64)
-    eprints_cstr(c" field '")
-    eprint_field_path(path)
-    eprints_cstr(c"' ")
+    eprints_cstr(c"'")
+    # A struct const's whole value has no element (elem_idx < 0): ritz0's
+    # `const 'C' field 's'`, not `const 'C' element -1 field 's'`.
+    if c.is_global == 0 and elem_idx >= 0
+        eprints_cstr(c" element ")
+        eprint_i64(elem_idx as i64)
+    if path != null and path.root == 0
+        if path.fi == null and path.up != null and path.up.root == 1
+            # A top-level array element: ritz0's `global 'g' element 2`.
+            eprints_cstr(c" element ")
+            eprint_i64(path.idx as i64)
+        else
+            eprints_cstr(c" field '")
+            eprint_field_path(path)
+            eprint_char('\'')
+    eprints_cstr(c" ")
     s.error_count = s.error_count + 1
 
-# `inn.leaf.v`: the field names from the element down to `path`.
+# `inn.leaf.v`: the field names from the element down to `path`.  A root
+# sentinel (a struct const's or global's whole value) prints nothing.
 fn eprint_field_path(path: *ConstFieldPath)
+    if path == null or path.root == 1
+        return
     if path.fi == null
         # An array field's element (AGAST #3673).
         eprint_field_path(path.up)
@@ -3311,7 +3768,7 @@ fn eprint_field_path(path: *ConstFieldPath)
         eprint_i64(path.idx as i64)
         eprint_char(']')
         return
-    if path.up != null
+    if path.up != null and path.up.root == 0
         eprint_field_path(path.up)
         eprint_char('.')
     var i: i32 = 0
@@ -3519,6 +3976,55 @@ fn emit_const_strview_fill(s: *EmitterState, c: *ConstEntry)
         i += 1
     emit_str(s, c"]\n")
 
+# LARB R60 / R75: a const array whose elements are not plain integers, a
+# struct table, a pointer table or a StrView (all lowered by the older paths
+# below) goes through the shared const evaluator: a float table
+# (`[1.0e1, 0.1]`), an enum table (`[Color.Red, Color.Blue]`), a nested
+# array, and any of their fills.  The evaluator emits the same
+# `[N x T] [T v, ...]` an integer table gets.
+fn const_array_shared(c: *ConstEntry) -> i32
+    if c.array_elem_type == TYPE_F32 or c.array_elem_type == TYPE_F64
+        return 1
+    if c.array_elem_type == TYPE_ARRAY
+        return 1
+    if c.array_elem_type == TYPE_STRUCT and c.array_elem_type_name_len > 0
+        if user_enum_index(c.array_elem_type_name, c.array_elem_type_name_len) >= 0
+            return 1
+    return 0
+
+# `@NAME = internal constant [N x T] ` followed by the evaluator's value.
+fn emit_const_array_shared_entry(s: *EmitterState, c: *ConstEntry)
+    if was_global_emitted(s, c.name, c.name_len) == 1
+        return
+    mark_global_emitted(s, c.name, c.name_len)
+    var f: StructField
+    memzero(@f as *u8, sizeof(StructField) as i64)
+    f.field_type = TYPE_ARRAY
+    f.array_size = c.array_size
+    f.array_elem_type = c.array_elem_type
+    f.array_elem_type_name = c.array_elem_type_name
+    f.array_elem_type_name_len = c.array_elem_type_name_len
+    f.array_elem_pointee = c.array_elem_pointee
+    var root: ConstFieldPath
+    root.fi = null
+    root.up = null
+    root.idx = 0
+    root.at = c.value_expr
+    root.root = 1
+    emit_str(s, c"@")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, c" = internal constant [")
+    emit_int(s, c.array_size as i64)
+    emit_str(s, c" x ")
+    if c.array_elem_type == TYPE_STRUCT and c.array_elem_type_name_len > 0
+        emit_str(s, c"%")
+        emit_name(s, c.array_elem_type_name, c.array_elem_type_name_len)
+    else
+        emit_str(s, elem_mem_llvm(c.array_elem_type))
+    emit_str(s, c"] ")
+    emit_const_array_field(s, c, 0 - 1, @f, c.value_expr, @root)
+    emit_str(s, c"\n")
+
 # Emit a single ConstEntry as an LLVM global constant (if applicable).
 fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     if c.const_type != TYPE_ARRAY
@@ -3529,6 +4035,9 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     if c.value_expr.kind == EXPR_ARRAY_FILL
         is_fill = 1
     if c.value_expr.kind != EXPR_ARRAY_LIT and is_fill == 0
+        return
+    if const_array_shared(c) == 1
+        emit_const_array_shared_entry(s, c)
         return
     # AGAST #1606: the fill form `const Z: [N]T = [v; N]` of a primitive
     # array.  It used to emit no global, so `Z[i]` indexed through
@@ -3679,6 +4188,14 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
 # observed in the codebase (mausoleum/storage.ritz, lexis/dom/attribute.ritz,
 # prism/test/test_text_rendering.ritz).  Other struct shapes fall through
 # to the legacy `add i64 0, 0` path, matching previous behaviour.
+# LARB R60: any other struct or enum const is read-only data too (R48), its
+# whole value lowered by the same evaluator as a global's initialiser:
+#
+#   const C: P = P { a: 5, ... }
+#   @C = internal constant %P { i32 5, ... }
+#
+# `@C` is then `@P` and `C.f` a GEP into it, as a const array's are.  A const
+# may name another (`const D: In = C`): its value is inlined.
 fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
     if c.const_type != TYPE_STRUCT
         return
@@ -3688,12 +4205,30 @@ fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
         return
     if c.value_expr == null
         return
-    if c.value_expr.kind != EXPR_STRING_LIT
-        return
     # Dedup across imports — same const may be reached via multiple paths.
     if was_global_emitted(s, c.name, c.name_len) == 1
         return
     mark_global_emitted(s, c.name, c.name_len)
+    if c.value_expr.kind != EXPR_STRING_LIT
+        var f: StructField
+        memzero(@f as *u8, sizeof(StructField) as i64)
+        f.field_type = c.const_type
+        f.field_type_name = c.type_name
+        f.field_type_name_len = c.type_name_len
+        var root: ConstFieldPath
+        root.fi = null
+        root.up = null
+        root.idx = 0
+        root.at = c.value_expr
+        root.root = 1
+        emit_str(s, c"@")
+        emit_name(s, c.name, c.name_len)
+        emit_str(s, c" = internal constant %")
+        emit_name(s, c.type_name, c.type_name_len)
+        emit_str(s, c" ")
+        emit_const_value(s, c, 0 - 1, @f, c.value_expr, @root)
+        emit_str(s, c"\n")
+        return
 
     let strlen: i32 = c.value_expr.string_len
 
@@ -3723,11 +4258,14 @@ fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
 fn emit_const_arrays(s: *EmitterState)
     var c: *ConstEntry = s.module.constants
     while c != null
-        emit_const_array_entry(s, c)
-        # AGAST #189 — also lower scalar struct consts (`const FOO: StrView
-        # = "..."`).  Distinct from the array path: const_type is
-        # TYPE_STRUCT here, not TYPE_ARRAY.
-        emit_const_struct_entry(s, c)
+        # LARB R60: a const of a type with Drop is never dropped; refuse it
+        # rather than lower data nothing will release.
+        if const_drop_refused(s, c) == 0
+            emit_const_array_entry(s, c)
+            # AGAST #189 — also lower scalar struct consts (`const FOO: StrView
+            # = "..."`).  Distinct from the array path: const_type is
+            # TYPE_STRUCT here, not TYPE_ARRAY.
+            emit_const_struct_entry(s, c)
         c = c.next
     emit_str(s, c"\n")
 

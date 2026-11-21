@@ -8,11 +8,11 @@ global of a type with `Drop` is an error.  A struct const is read-only data
 like a const array (R48): `@C` is `@S`, `@&C` and a write through it are
 errors, and it isn't a pattern.
 
-ritz0 only: ritz1's half is #3480 (until then ritz1 still refuses these
-programs; test_global_init_rejected.py pins that).  Each run row is a program
-that exits 3 when every value it reads is right, and a distinct code
-otherwise; the rows are cut by code path, not by the cross product (TESTING.md,
-"What a ritz0 pytest case costs").
+ritz0 wrote the rule first; ritz1 and ritz1_selfhosted run the same rows
+(AGAST #3480), so one rule reads the same under all three compilers.  Each
+run row is a program that exits 3 when every value it reads is right, and a
+distinct code otherwise; the rows are cut by code path, not by the cross
+product (TESTING.md, "What a ritz0 pytest case costs").
 """
 
 import os
@@ -28,6 +28,12 @@ from ritz0_inproc import run_ritz0
 pytestmark = pytest.mark.integration
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
+RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
+# Build product, not a tracked file — see test_ritz1_ptr_arith_chain.py.
+RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
+
+# The same rows under each compiler.
+COMPILERS = ("ritz0", "ritz1", "ritz1_selfhosted")
 
 # Shared declarations: a struct with every field kind the rule lowers, a
 # unit-only enum and an enum with a payload (its unit variant has a data
@@ -183,6 +189,24 @@ pub fn main() -> i32
         return 13
     3
 """,
+    # A const is a whole value a `match` can read, as the §4.3 example does
+    # (`const MODE: Mode = Mode.Safe` then `match MODE`).  A global beside it
+    # is the control: it was typed already.
+    "match_const": """\
+const E: Color = Color.Blue
+var g: Color = Color.Blue
+
+pub fn main() -> i32
+    let a: i32 = match E
+        Color.Red => 10
+        Color.Blue => 11
+    let b: i32 = match g
+        Color.Red => 20
+        Color.Blue => 21
+    if a != 11 or b != 21
+        return 10
+    3
+""",
     # A const table of f64 literals, each the double nearest its literal
     # (ritz-task-2787's sage POW10, which works around it with u64 bits).
     "float_table": """\
@@ -227,25 +251,39 @@ pub fn main() -> i32
 }
 
 
-def _compile(tmp_path, name, src):
-    work = tmp_path / name
+def _compile(compiler, tmp_path, name, src):
+    work = tmp_path / f"{name}_{compiler}"
     work.mkdir()
     path = work / "main.ritz"
     path.write_text(src)
     ll = work / "main.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = run_ritz0([str(path), "-o", str(ll)], cwd=work, env=env, timeout=300)
+    if compiler == "ritz0":
+        proc = run_ritz0([str(path), "-o", str(ll)], cwd=work, env=env, timeout=300)
+    else:
+        cmd = [str(RITZ1_BIN.parent / compiler), str(path), "-o", str(ll)]
+        proc = subprocess.run(cmd, cwd=work, env=env,
+                              capture_output=True, text=True, timeout=300)
     return proc, ll, work
 
 
+def _link(compiler, ll, exe, work):
+    """Link the emitted IR, with ritz1's runtime start object (ritz0 emits its own)."""
+    cmd = ["clang"]
+    if compiler != "ritz0":
+        cmd.append(str(RITZ_START))
+    cmd += ["-Wno-override-module", str(ll), "-o", str(exe), "-nostdlib", "-no-pie"]
+    return fast_link.clang(cmd, cwd=work, capture_output=True, text=True)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(RUN))
-def test_a_constant_initialiser_runs(tmp_path, name):
-    proc, ll, work = _compile(tmp_path, name, _DECLS + RUN[name])
+def test_a_constant_initialiser_runs(ritz1_bin, tmp_path, compiler, name):
+    proc, ll, work = _compile(compiler, tmp_path, name, _DECLS + RUN[name])
     out = proc.stdout + proc.stderr
-    assert proc.returncode == 0 and ll.exists(), f"ritz0 refused {name}:\n{out[-2000:]}"
+    assert proc.returncode == 0 and ll.exists(), f"{compiler} refused {name}:\n{out[-2000:]}"
     exe = work / "main"
-    link = fast_link.clang(["clang", "-Wno-override-module", str(ll), "-o", str(exe),
-                            "-nostdlib", "-no-pie"], cwd=work, capture_output=True, text=True)
+    link = _link(compiler, ll, exe, work)
     assert link.returncode == 0, link.stderr[-2000:]
     assert subprocess.run([str(exe)], timeout=60, check=False).returncode == 3
 
@@ -304,15 +342,16 @@ def _located(text):
     return text.replace("^", "", 1), f"{line}:{len(before) - before.rfind(chr(10))}"
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(REFUSED))
-def test_a_non_constant_initialiser_is_a_located_error(tmp_path, name):
+def test_a_non_constant_initialiser_is_a_located_error(ritz1_bin, tmp_path, compiler, name):
     marked, message = REFUSED[name]
     src, where = _located(_DECLS + marked)
-    proc, ll, _ = _compile(tmp_path, name, src)
+    proc, ll, _ = _compile(compiler, tmp_path, name, src)
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"ritz0 accepted {name}:\n{src}"
+    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{src}"
     assert "Traceback" not in out and "ValueError" not in out, out[-2000:]
     assert "Parse error" not in out, out[-2000:]
     hits = re.findall(rf"main\.ritz:{where}: (?:error: )?{re.escape(message)}", out)
-    assert len(hits) == 1, f"{name}: want {message!r} at {where}:\n{out[-2000:]}"
+    assert len(hits) == 1, f"{compiler} {name}: want {message!r} at {where}:\n{out[-2000:]}"
     assert not ll.exists()

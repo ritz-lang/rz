@@ -91,10 +91,10 @@ def test_ritz0_null_into_an_integer_global_is_a_located_error(request, tmp_path)
 
 
 # LARB R60 (§4.3): arithmetic and a float const are constant initialisers.
-# ritz0 lowers them since #3479 (test_const_init_r60.py runs them); ritz1 and
-# ritz1_selfhosted still refuse them, located, until #3480.
+# ritz0 lowered them since #3479; ritz1 and ritz1_selfhosted since #3480.
+# test_const_init_r60.py runs their values on every compiler.
 # name -> (source, line, column)
-_R60_RITZ1_REFUSES = {
+_R60_FORMS = {
     "binary": ("var g: i32 = 1 + 2\n" + _MAIN, 1, 14),
     "cast_of_binary": ("var g: i64 = (1 + 2) as i64\n" + _MAIN, 1, 15),
     "float_const": ("const F: f64 = 1.5\nvar g: f64 = F\n" + _MAIN, 2, 14),
@@ -103,32 +103,26 @@ _R60_RITZ1_REFUSES = {
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(_R60_RITZ1_REFUSES))
-def test_r60_initializer_is_ritz0s_until_ritz1_lands_it(request, tmp_path, compiler, name):
-    source, line, col = _R60_RITZ1_REFUSES[name]
+@pytest.mark.parametrize("name", sorted(_R60_FORMS))
+def test_r60_initializer_is_accepted_by_every_compiler(request, tmp_path, compiler, name):
+    source, line, col = _R60_FORMS[name]
     proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
-    if compiler == "ritz0":
-        assert proc.returncode == 0 and ll.exists(), f"ritz0 refused {name}:\n{out[-1500:]}"
-        return
-    assert proc.returncode != 0, f"{compiler} accepted {name}: #3480 landed, run it instead"
-    hits = re.findall(rf"unit\.ritz:{line}:{col}: (?:error: )?{re.escape(_NON_CONST)}", out)
-    assert len(hits) == 1, f"{compiler}, {name}:\n{out[-1500:]}"
+    assert proc.returncode == 0 and ll.exists(), f"{compiler} refused {name}:\n{out[-1500:]}"
 
 
-# ritz1-only: ritz0 lowers a non-zero f32 global, and calls `null` in a
-# float global "not a pointer".  Located at the initializer too (AGAST #3680).
+# `null` fits a pointer slot only.  ritz0's words, at the initializer under
+# every compiler since LARB R60 (#3480); ritz1 used to say "is a float type
+# but has a null initializer" for an f64.  (Non-zero f32 is lowered now too.)
 # name -> (source, line, column, message)
 _RITZ1_ONLY = {
     "null_into_float": ("var g: f64 = null\n" + _MAIN, 1, 14,
-                        "global 'g' is a float type but has a null initializer"),
-    "nonzero_f32": ("var g: f32 = 1.5\n" + _MAIN, 1, 14,
-                    "global 'g' is f32 with a non-zero initializer, which ritz1 cannot lower yet"),
+                        "global 'g' is not a pointer but has a null initializer"),
 }
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(_RITZ1_ONLY))
 def test_ritz1_a_misfit_float_global_is_located_at_the_initializer(request, tmp_path, compiler, name):
     source, line, col, message = _RITZ1_ONLY[name]
@@ -174,15 +168,17 @@ def test_an_untyped_global_var_is_an_error_at_the_eq(request, tmp_path, compiler
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("source", ["let g = true\n", "let g: bool = true\n"])
-def test_ritz0_a_module_level_let_is_refused(request, tmp_path, source):
+def test_a_module_level_let_is_refused(request, tmp_path, compiler, source):
     """No compiler has a module-level `let` (R38 names one; it isn't an item),
-    so typed or not it stays a located refusal at the `let`: since LARB R60
-    (#3479) ritz0's says so, where it was the parse error "Expected item"."""
-    proc, ll = _compile(request, "ritz0", tmp_path, source + _MAIN)
+    so typed or not it stays a located refusal at the `let`, under one message:
+    ritz0's since LARB R60 (#3479), ritz1's since #3480 (it was the parse error
+    "cannot parse item starting at 'let g'")."""
+    proc, ll = _compile(request, compiler, tmp_path, source + _MAIN)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out[-1500:]
     assert "Traceback" not in out, out[-1500:]
-    assert re.search(r"unit\.ritz:1:1: there is no module-level `let`", out), out[-1500:]
+    assert re.search(r"unit\.ritz:1:1: (?:error: )?there is no module-level `let`", out), out[-1500:]
     assert "Parse error" not in out, out[-1500:]
     assert not ll.exists()

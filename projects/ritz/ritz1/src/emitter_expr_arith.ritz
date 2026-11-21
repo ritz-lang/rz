@@ -1644,7 +1644,9 @@ fn const_scalar_addr_refused(s: *EmitterState, e: *Expr) -> i32
     if op == null or op.kind != EXPR_IDENT
         return 0
     let ce: *ConstEntry = unshadowed_const(s, op.ident_ptr, op.ident_len)
-    if ce == null or ce.const_type == TYPE_ARRAY
+    # LARB R48 / R60: a struct or enum const is read-only data, so `@C` is
+    # `@S`; only a scalar const has no storage to point at.
+    if ce == null or ce.const_type == TYPE_ARRAY or ce.const_type == TYPE_STRUCT
         return 0
     emit_str(s, c"  ; ERROR: address of a const scalar\n")
     diag_error_at(emitter_source_file(), e.span)
@@ -1699,6 +1701,17 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
     if emit_nd_index_ptr(s, op, @nd_addr) == 1
         return nd_addr.reg
     if op.kind == EXPR_IDENT
+        # LARB R48 / R60: `@C` of a struct or enum const is `@S`, a pointer
+        # into its read-only data (emit_const_struct_entry).
+        let dce: *ConstEntry = unshadowed_const(s, op.ident_ptr, op.ident_len)
+        if dce != null and dce.const_type == TYPE_STRUCT and dce.type_name_len > 0 and dce.value_expr != null
+            let dres: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, dres)
+            emit_str(s, c" = getelementptr i8, ptr @")
+            emit_name(s, dce.name, dce.name_len)
+            emit_str(s, c", i64 0\n")
+            return dres
         let loc: i32 = find_local(s, op.ident_ptr, op.ident_len)
         if loc >= 0
             # AGAST #2286: `@c` of `c:& C` is the borrow's pointer.  The slot's
