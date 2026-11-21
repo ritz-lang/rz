@@ -212,7 +212,9 @@ empty. A note that belongs to a move goes on that check's own entry.
   mid-lowering (#3892).
 
 - `fn_slot` — a fn value fits the fn-typed slot it lands in: arity, each
-  param and the return, as ritz0's `_types_compatible` (#4310).
+  param and the return, as ritz0's `_types_compatible` (#4310).  A global's
+  fn signature and a fn type's `-> *T` / `-> @T` pointee are kept in the AST,
+  so those slots are judged too (#4324).
 
 - `generic_method` — a free call to a generic impl's method (R37, §5.4).
 

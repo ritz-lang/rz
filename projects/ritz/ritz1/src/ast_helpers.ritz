@@ -1779,6 +1779,23 @@ pub fn trait_decl_refused(name: *u8, len: i32, line: i32, col: i32) -> i32
 # Global variable helpers
 # =============================================================================
 
+# AGAST #4324: a global's fn signature, latched between its type and
+# global_var_new.  global_var_new runs after the initializer expression is
+# parsed, by which time fresh_fn_sig (which hands out p.last_fn_sig only at
+# the very token the fn type ended on) has moved on; capture_global_fn_sig
+# takes it from that token.  A global is never nested in another, so one slot
+# is enough.
+var g_global_fn_sig: *FnDef = null
+
+# Grammar action around a global's type, where fresh_fn_sig still answers.
+pub fn capture_global_fn_sig(p: *Parser, ty: i32) -> i32
+    g_global_fn_sig = null
+    if ty == TYPE_PTR or ty == TYPE_ARRAY
+        # A fn type lowers to TYPE_PTR; `[N]fn(..) -> T` latches the element's
+        # signature, as capture_var_type does for a local (#1671 / #1747).
+        g_global_fn_sig = fresh_fn_sig(p)
+    ty
+
 # Grammar signature: global_var_new(p, name, len, var_type, init_expr, line, col)
 pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr: *Expr, line: i32, col: i32) -> *GlobalVarDef
     array_lit_length_decl(p, var_type, init_expr)   # AGAST #3383 (LARB R42)
@@ -1791,6 +1808,12 @@ pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr:
     g.name = name as *u8
     g.name_len = len
     g.var_type = var_type
+    # AGAST #4324: `var g: fn(..) -> T` keeps the signature capture_global_fn_sig
+    # latched; every other type has none.
+    g.fn_sig = null
+    if var_type == TYPE_PTR or var_type == TYPE_ARRAY
+        g.fn_sig = g_global_fn_sig
+    g_global_fn_sig = null
     # For struct types, get the type name from parser state (set by parse_type_spec)
     if var_type == TYPE_STRUCT
         g.type_name = p.last_type_name
@@ -3333,6 +3356,53 @@ fn fn_ret_array_param(ret: i32) -> *Param
         return g_ret_array_param
     return null
 
+# The name a `-> T` return gives the fn, from the parser state its type_spec
+# just left: a struct, the pointee of a `-> *T` / `-> **U` / `-> @T`, or
+# nothing where a name would be stale.  Shared by capture_fn_return_type (a
+# named fn writes p.fn_return_type_name) and type_fn (a fn type writes
+# FnDef.return_type_name), so the two spellings can't drift (AGAST #4324).
+fn ret_name_of_last(p: *Parser, ret: i32, out: **u8, out_len: *i32)
+    if ret == TYPE_STRUCT
+        *out = p.last_type_name
+        *out_len = p.last_type_name_len
+    else if (ret == TYPE_REF or ret == TYPE_MUT_REF) and p.last_ref_inner_type != TYPE_STRUCT
+        # AGAST #1453: `-> @i64` leaves last_type_name stale (from an earlier
+        # `@P` param, say).  Only a struct referent names itself; var-decl
+        # narrowing trusts this name for `let m = get(...)`.
+        *out = null
+        *out_len = 0
+    else if ret == TYPE_PTR and primitive_name_len(p.last_pointee_type) > 0
+        # AGAST #1984: `-> *i32` / `-> *u64`.  last_type_name is null (or
+        # stale from an earlier `*S` param), so name the primitive pointee
+        # itself, as monomorph does for a specialised `-> *T` (#1980);
+        # emit_var_decl maps it to var_pointee_type for `let p = f()`.
+        *out = primitive_name_from_type(p.last_pointee_type)
+        *out_len = primitive_name_len(p.last_pointee_type)
+    else if ret == TYPE_PTR_PTR
+        # AGAST #2791: `-> **U` names U as monomorph names a `*T` at T = *U:
+        # the primitive, or the struct.  A `***U` (packed inner) or an unknown
+        # U names nothing, so a stale last_type_name can't type `let p = f()`.
+        let inner: i32 = ptr_ptr_inner_pointee(p, ret)
+        if primitive_name_len(inner) > 0
+            *out = primitive_name_from_type(inner)
+            *out_len = primitive_name_len(inner)
+        else if inner == TYPE_STRUCT and p.last_type_name != null and p.last_type_name_len > 0
+            *out = p.last_type_name
+            *out_len = p.last_type_name_len
+        else
+            *out = null
+            *out_len = 0
+    else if ret == TYPE_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
+        if p.last_type_name != null and p.last_type_name_len > 0
+            *out = p.last_type_name
+            *out_len = p.last_type_name_len
+        else
+            *out = null
+            *out_len = 0
+    else
+        *out = null
+        *out_len = 0
+
 pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
     # AGAST #3634: a `-> [N][M]T` keeps its shape on g_ret_array_param.
     g_ret_fn_sig = fresh_fn_sig(p)   # the type_spec just ended here
@@ -3345,46 +3415,7 @@ pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
     g_ret_ptr_array = ptr_array_of_last(p, ret)   # AGAST #2329
     if ret == TYPE_REF or ret == TYPE_MUT_REF
         g_ret_ref = param_of_type(p, null, 0, ret)
-    if ret == TYPE_STRUCT
-        p.fn_return_type_name = p.last_type_name
-        p.fn_return_type_name_len = p.last_type_name_len
-    else if (ret == TYPE_REF or ret == TYPE_MUT_REF) and p.last_ref_inner_type != TYPE_STRUCT
-        # AGAST #1453: `-> @i64` leaves last_type_name stale (from an earlier
-        # `@P` param, say).  Only a struct referent names itself; var-decl
-        # narrowing trusts this name for `let m = get(...)`.
-        p.fn_return_type_name = null
-        p.fn_return_type_name_len = 0
-    else if ret == TYPE_PTR and primitive_name_len(p.last_pointee_type) > 0
-        # AGAST #1984: `-> *i32` / `-> *u64`.  last_type_name is null (or
-        # stale from an earlier `*S` param), so name the primitive pointee
-        # itself, as monomorph does for a specialised `-> *T` (#1980);
-        # emit_var_decl maps it to var_pointee_type for `let p = f()`.
-        p.fn_return_type_name = primitive_name_from_type(p.last_pointee_type)
-        p.fn_return_type_name_len = primitive_name_len(p.last_pointee_type)
-    else if ret == TYPE_PTR_PTR
-        # AGAST #2791: `-> **U` names U as monomorph names a `*T` at T = *U:
-        # the primitive, or the struct.  A `***U` (packed inner) or an unknown
-        # U names nothing, so a stale last_type_name can't type `let p = f()`.
-        let inner: i32 = ptr_ptr_inner_pointee(p, ret)
-        if primitive_name_len(inner) > 0
-            p.fn_return_type_name = primitive_name_from_type(inner)
-            p.fn_return_type_name_len = primitive_name_len(inner)
-        else if inner == TYPE_STRUCT and p.last_type_name != null and p.last_type_name_len > 0
-            p.fn_return_type_name = p.last_type_name
-            p.fn_return_type_name_len = p.last_type_name_len
-        else
-            p.fn_return_type_name = null
-            p.fn_return_type_name_len = 0
-    else if ret == TYPE_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
-        if p.last_type_name != null and p.last_type_name_len > 0
-            p.fn_return_type_name = p.last_type_name
-            p.fn_return_type_name_len = p.last_type_name_len
-        else
-            p.fn_return_type_name = null
-            p.fn_return_type_name_len = 0
-    else
-        p.fn_return_type_name = null
-        p.fn_return_type_name_len = 0
+    ret_name_of_last(p, ret, @p.fn_return_type_name, @p.fn_return_type_name_len)
     return ret
 
 # Capture the variable type name after parsing type_spec but before parsing initializer expr.
@@ -3584,25 +3615,41 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
 # that can't be lowered is refused there.
 pub fn type_fn(p: *Parser, params: *Param, ret: i32, line: i32, col: i32) -> i32
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
+    # AGAST #4324: the return side as capture_fn_return_type records it for a
+    # named fn, from the same state (the return type_spec is the last thing
+    # parsed).  Without these a slot `fn(..) -> *T` / `-> @T` / `-> [N]T` could
+    # be neither spelled nor judged (fn_slot was silent on it).
+    #
+    # ret_fn_sig stays null (AGAST #2120), unlike capture_fn_return_type: a fn
+    # type is re-parsed on every backtracked attempt, and each attempt ends on
+    # the same token, so fresh_fn_sig here returns the previous attempt's own
+    # FnDef -- a self-chain that spells `fn(i32) -> fn(i32) -> fn(i32) -> ..`.
+    # A `-> fn(..)` return is therefore still unjudged; guessing would be worse.
+    f.ret_fn_sig = null
+    f.ret_ref = null
+    f.ret_array = null
+    f.ret_ptr_array = ptr_array_of_last(p, ret)   # AGAST #2329
+    f.ret_array_param = null
+    if ret == TYPE_ARRAY
+        f.ret_array = array_elem_of_last(p)   # AGAST #2343
+        f.ret_array_param = param_of_type(p, null, 0, ret)   # AGAST #2302
+    if ret == TYPE_REF or ret == TYPE_MUT_REF
+        f.ret_ref = param_of_type(p, null, 0, ret)   # AGAST #2308
     f.name = null
     f.name_len = 0
     f.params = params
     f.return_type = ret
-    f.return_type_name = null
-    f.return_type_name_len = 0
-    # A struct return names itself in last_type_name, which the return
-    # type_spec just set (it is the last thing parsed before this action).
-    if ret == TYPE_STRUCT
-        f.return_type_name = p.last_type_name as *u8
-        f.return_type_name_len = p.last_type_name_len
-        # AGAST #3286: `fn(..) -> void` returns nothing, as fn_def_new
-        # normalises `-> void` for a named fn, so fn_is_procedure(sig)
-        # refuses a use of its call's value instead of `%r = call void`.
-        let rt: *u8 = f.return_type_name
-        if f.return_type_name_len == 4 and rt != null and *rt == 118 and *(rt + 1) == 111 and *(rt + 2) == 105 and *(rt + 3) == 100
-            f.return_type = TYPE_VOID
-            f.return_type_name = null
-            f.return_type_name_len = 0
+    # A `-> *T` / `-> @T` names its pointee as a named fn's return does, so a
+    # fn-type slot spells and judges it (AGAST #4324).
+    ret_name_of_last(p, ret, @f.return_type_name, @f.return_type_name_len)
+    # AGAST #3286: `fn(..) -> void` returns nothing, as fn_def_new
+    # normalises `-> void` for a named fn, so fn_is_procedure(sig)
+    # refuses a use of its call's value instead of `%r = call void`.
+    let rt: *u8 = f.return_type_name
+    if f.return_type == TYPE_STRUCT and f.return_type_name_len == 4 and rt != null and *rt == 118 and *(rt + 1) == 111 and *(rt + 2) == 105 and *(rt + 3) == 100
+        f.return_type = TYPE_VOID
+        f.return_type_name = null
+        f.return_type_name_len = 0
     f.body = null
     f.line = line
     f.next = null
@@ -3614,15 +3661,6 @@ pub fn type_fn(p: *Parser, params: *Param, ret: i32, line: i32, col: i32) -> i32
     f.is_pub = 0
     f.col = col
     f.extern_decl = 0
-    f.ret_fn_sig = null
-    f.ret_ref = null
-    f.ret_array = null
-    f.ret_ptr_array = null
-    # AGAST #2302: a call through a `fn() -> [N]T` value spells `[N x T]` too.
-    # The return type_spec is the last thing parsed, so last_array_* are its.
-    f.ret_array_param = null
-    if ret == TYPE_ARRAY
-        f.ret_array_param = param_of_type(p, null, 0, ret)
     p.last_fn_sig = f
     p.last_fn_sig_pos = p.pos
     return TYPE_PTR

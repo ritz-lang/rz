@@ -268,9 +268,9 @@ def test_another_struct_is_no_future(tmp_path):
 # arity, each param fitting as `_types_compatible`'s FnType branch rules it
 # (a `:&` param fits a `@T` / `@&T` / `*T` slot; arrays agree, #4278) and a
 # return that fits.  ritz1 and ritz1_selfhosted judged none: each row below
-# compiled there, and the array rows read a `[3]i32` as a `[2]i32`.  ritz1
-# leaves unjudged what its AST doesn't keep: a global's fn type, and the
-# pointee of a fn type's `-> *T` (AGAST #4324).
+# compiled there, and the array rows read a `[3]i32` as a `[2]i32`.  #4324
+# gave ritz1's AST what it was missing: a global's fn signature and a fn
+# type's `-> *T` / `-> @T` pointee.
 TWO = "fn f(a: i32, b: i32) -> i32\n    a\n\n"
 FN_SLOT_REFUSED = {
     "let_arity": (TWO + "fn main() -> i32\n    let h: fn(i32) -> i32 = f\n    h(1)\n",
@@ -301,6 +301,21 @@ FN_SLOT_REFUSED = {
     "assign_local": (TWO + "fn g(a: i32) -> i32\n    a\n\n"
                      "fn main() -> i32\n    var h: fn(i32) -> i32 = g\n    h = f\n    h(1)\n",
                      9, 5, "cannot assign fn(i32, i32) -> i32 to fn(i32) -> i32"),
+    "assign_global": ("var g_h: fn(i32) -> i32 = null\n\n" + TWO
+                      + "fn main() -> i32\n    g_h = f\n    0\n",
+                      7, 5, "cannot assign fn(i32, i32) -> i32 to fn(i32) -> i32"),
+    "let_global_value": ("var g_h: fn(i32) -> i32 = null\n\n"
+                         "fn main() -> i32\n    let h: fn(i32, i32) -> i32 = g_h\n    0\n",
+                         4, 5, "cannot initialize fn(i32, i32) -> i32 with fn(i32) -> i32"),
+    # AGAST #4324: a fn type's `-> *T` / `-> @T` return names its pointee, so
+    # the slot spells and judges it as a named fn's does.
+    "let_ptr_return": ("fn f(a: i32, b: i32) -> *u8\n    null\n\n"
+                       "fn main() -> i32\n    let h: fn(i32) -> *u8 = f\n    0\n",
+                       5, 5, "cannot initialize fn(i32) -> *u8 with fn(i32, i32) -> *u8"),
+    "let_ref_return": ("var x: i32 = 1\n\n"
+                       "fn f(a: i32, b: i32) -> @i32\n    @x\n\n"
+                       "fn main() -> i32\n    let h: fn(i32) -> @i32 = f\n    0\n",
+                       7, 5, "cannot initialize fn(i32) -> @i32 with fn(i32, i32) -> @i32"),
     "argument": (TWO + "fn call(h: fn(i32) -> i32) -> i32\n    h(1)\n\n"
                  "fn main() -> i32\n    call(f)\n",
                  8, 10, "argument 1 ('h'): expected fn(i32) -> i32, got fn(i32, i32) -> i32"),
@@ -325,6 +340,15 @@ for _param in ("a:& [2]i32", "a: @[2]i32"):
 # fn in a `fn(..)` slot, a `:&` param in a by-value slot, a method's argument).
 FN_SLOT_ACCEPTED = {
     "lent_as_ref": LENT_AS_VALUE,
+    # AGAST #4324: the shapes the two captures above must keep accepting.
+    "global_fits": ("var g_h: fn(i32) -> i32 = null\n\n"
+                    "fn f(a: i32) -> i32\n    a\n\n"
+                    "fn main() -> i32\n    let j: fn(i32) -> i32 = g_h\n    g_h = f\n    0\n"),
+    "ptr_return_fits": ("fn f(a: i32) -> *u8\n    null\n\n"
+                        "fn main() -> i32\n    let h: fn(i32) -> *u8 = f\n    0\n"),
+    "ref_return_fits": ("var x: i32 = 1\n\n"
+                        "fn f(a: i32) -> @i32\n    @x\n\n"
+                        "fn main() -> i32\n    let h: fn(i32) -> @i32 = f\n    0\n"),
     "fits_everywhere": ("struct S\n    h: fn(i32) -> i32\n\n"
                         "fn f(a: i32) -> i32\n    a\n\n"
                         "fn call(h: fn(i32) -> i32) -> i32\n    h(1)\n\n"
