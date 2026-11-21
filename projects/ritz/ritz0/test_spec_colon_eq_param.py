@@ -132,7 +132,7 @@ def test_positive_block_covers_all_three_shapes():
 
 @pytest.mark.unit
 def test_struct_field_colon_eq_is_documented_as_not_a_feature():
-    """ritz0 accepts `pos:= i64` but ritz1 refuses it; the spec must say so."""
+    """All three compilers refuse `pos:= i64`; the spec must say so."""
     text = SPEC.read_text()
     assert "struct field" in text.lower(), (
         "LANGUAGE_SPEC must mention the struct-field `:=` position"

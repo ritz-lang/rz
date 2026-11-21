@@ -5009,10 +5009,9 @@ by-value receiver. The form exists because shipped code writes it — angelo's
 `fn load_font_data(data:= Vec<u8>)`, plus prism and lexis, failed to parse in
 ritz1 without it (AGAST #1527, #3249). New code should write `name: T`.
 
-`:=` on a struct field (`pos:= i64`) is **not a language feature**. ritz0
-parses it as a no-op, but ritz1 and ritz1_selfhosted refuse it with
-`unexpected ':='; expected one of: :, :&`; a field is written `pos: i64`
-(AGAST #4062).
+`:=` on a struct field (`pos:= i64`) is **not a language feature**. All three
+compilers refuse it with `unexpected ':='` located at the `:=`; a field is
+written `pos: i64` (AGAST #4062, #4456).
 
 ```ritz
 struct Contour

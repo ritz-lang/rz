@@ -2518,16 +2518,18 @@ class Parser:
 
             while not self._at(TokenType.DEDENT, TokenType.EOF):
                 field_name = self._expect(TokenType.IDENT)
-                # Support :& and := for struct fields
-                # :& wraps the type in a RefType (mutable reference)
-                # := is for move semantics (currently just parse normally)
+                # Support :& for struct fields: it wraps the type in a RefType
+                # (mutable reference).  `:=` is a parameter modifier, not a
+                # field form, and is refused here at the `:=` like ritz1
+                # (#4456); a field is written `pos: i64`.
                 wrap_ref = False
                 if self._at(TokenType.COLON_AMP):
                     self._advance()
                     wrap_ref = True
                 elif self._at(TokenType.COLON_EQ):
-                    self._advance()
-                    # Move semantics - just parse the type normally for now
+                    tok = self._current()
+                    text = tok.raw if tok.raw is not None else tok.value
+                    raise ParseError(f"unexpected '{text}'", tok.span)
                 elif self._at(TokenType.COLON):
                     self._advance()
                 else:
@@ -2613,17 +2615,25 @@ class Parser:
                     while not self._at(TokenType.DEDENT, TokenType.EOF):
                         field_name = self._expect(TokenType.IDENT)
                         # `name:& T` is a borrow field, wrapped in a RefType
-                        # exactly as in a struct body (#2040). ritz1 has no
-                        # `:=` field form, so unlike struct bodies it is not
-                        # accepted here.
+                        # exactly as in a struct body (#2040).  `:=` is not a
+                        # field form and is refused at the `:=` like ritz1,
+                        # same shape as a struct body (#4456).
                         wrap_ref = self._at(TokenType.COLON_AMP)
-                        if not (wrap_ref or self._at(TokenType.COLON)):
+                        if wrap_ref:
+                            self._advance()
+                        elif self._at(TokenType.COLON_EQ):
+                            tok = self._current()
+                            text = tok.raw if tok.raw is not None else tok.value
+                            raise ParseError(
+                                f"unexpected '{text}'", tok.span)
+                        elif self._at(TokenType.COLON):
+                            self._advance()
+                        else:
                             raise ParseError(
                                 f"Expected ':' after field name "
                                 f"'{field_name.value}' in enum variant "
                                 f"'{var_name.value}'",
                                 field_name.span)
-                        self._advance()
                         field_type = self.parse_type()
                         if wrap_ref:
                             field_type = rast.RefType(
