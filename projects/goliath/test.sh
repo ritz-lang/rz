@@ -134,6 +134,31 @@ expect ls_tmp_taken  0     ' late$'          -- "$BIN" ls /late
 # from a BlockDevice.
 HOSTED_OK="main.ritz hosted.ritz file_store.ritz"
 core=0
+declare -A seen=() via=()
+# closure_walk MODULE IMPORTER marks MODULE and everything it imports as
+# reachable from the core, remembering the importer that pulled each one in so
+# a violation can print the path.
+closure_walk() {
+    local mod=$1 from=$2 rel dir file dep
+    [ -n "${seen[$mod]+x}" ] && return 0
+    seen[$mod]=1; via[$mod]=$from
+    case $mod in
+        goliath.*)   rel=${mod#goliath.};   dir=src ;;
+        ritzlib.*)   rel=${mod#ritzlib.};   dir=../ritz/ritzlib ;;
+        cryptosec.*) rel=${mod#cryptosec.}; dir=../cryptosec/lib ;;
+        # An unknown package could hide a path to ritzlib.sys, so it is a
+        # failure: teach this function the package, don't assume it is safe.
+        *) fail "core import closure: cannot resolve $mod (imported by ${from:-?})"; return 0 ;;
+    esac
+    file="$dir/${rel//.//}.ritz"
+    if [ ! -f "$file" ]; then
+        fail "core import closure: $mod has no file at $file (imported by ${from:-?})"
+        return 0
+    fi
+    while read -r dep; do
+        [ -n "$dep" ] && closure_walk "$dep" "$mod"
+    done < <(sed -nE 's/^[[:space:]]*(pub[[:space:]]+)?import[[:space:]]+([A-Za-z_][A-Za-z0-9_.]*).*/\2/p' "$file")
+}
 for f in src/*.ritz; do
     case " $HOSTED_OK " in *" $(basename "$f") "*) continue;; esac
     core=$((core+1))
@@ -142,8 +167,28 @@ for f in src/*.ritz; do
     hits=$(grep -nE '^import ritzlib\.(sys|memory|io|fs|process)\b|\bsys_[a-z]' "$f" \
         | grep -vE '^[0-9]+:import ritzlib\.memory \{ Allocator \}$')
     [ -z "$hits" ] || fail "$f is goliath core but uses the hosted ritzlib: $hits"
+    closure_walk "goliath.$(basename "$f" .ritz)" ""
 done
 [ "$core" -ge 8 ] && echo "ok: freestanding_core ($core modules)" || fail "freestanding check saw only $core core modules"
+# The whole closure, not just direct imports (AGAST #4227): a kernel that links
+# goliath links every module the core reaches, e.g. blob_id -> cryptosec.sha256
+# -> ritzlib.strview -> ritzlib.memory -> ritzlib.str. Once #4119 made the
+# ritzlib core freestanding, none of those paths may reach ritzlib.sys, or the
+# kernel links syscall wrappers it never calls.
+if [ -n "${seen[ritzlib.sys]+x}" ]; then
+    chain=ritzlib.sys p=${via[ritzlib.sys]:-}
+    while [ -n "$p" ]; do
+        chain="$p -> $chain"
+        p=${via[$p]:-}
+    done
+    fail "core import closure reaches ritzlib.sys: $chain"
+elif [ -z "${seen[ritzlib.strview]+x}" ] || [ -z "${seen[ritzlib.memory]+x}" ]; then
+    # A vacuous pass would hide a broken walk (a moved ritzlib, a new import
+    # spelling) rather than a clean tree: the core is known to reach both.
+    fail "core import closure is broken, not clean: reached only ${#seen[@]} modules, no ritzlib.strview/ritzlib.memory"
+else
+    echo "ok: freestanding_closure (${#seen[@]} modules, no ritzlib.sys)"
+fi
 # cryptosec's SHA-256 (BlobIds) is part of that core
 grep -qE '^import ritzlib\.sys\b' ../cryptosec/lib/sha256.ritz && fail "cryptosec/lib/sha256.ritz imports ritzlib.sys"
 
