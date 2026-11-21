@@ -10,8 +10,8 @@
 # stays here is lowering: which bindings own a value (Sema's annotation,
 # FnDef.own_binds), the flags a move clears, and the drops.
 #
-# Drops.  Each owned binding gets an `i1` drop flag (an alloca, hoisted to
-# the entry block and zeroed there).  Declaring the binding with a value, or
+# Drops.  Each owned binding gets an `i1` drop flag (an alloca, written into
+# the fn's entry-block buffer and zeroed there).  Declaring the binding with a value, or
 # assigning to it, sets the flag; moving it clears it (own_walk, as each
 # statement is emitted).  A drop is `if flag { flag = 0; glue(binding) }`,
 # so a binding moved on only some paths is dropped exactly on the others.
@@ -791,16 +791,14 @@ fn own_emit_value_glue(s: *EmitterState, ptr: i32, name_sv: StrView, count: i32)
         own_emit_glue(s, ptr, StrView { ptr: (name), len: (len) as i64 }, 0)
 
 # Drop `n` elements of type `name` from `ptr` on, in index order, with a
-# loop (its counter alloca is hoisted to the entry block).
+# loop (its counter alloca is written into the entry-block buffer).
 fn own_emit_array_glue(s: *EmitterState, ptr: i32, n: i32, name_sv: StrView, depth: i32)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if n <= 0 or depth > OWN_MAX_DEPTH
         return
-    let ctr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, ctr)
-    emit_str(s, c" = alloca i64  ; array drop index\n  store i64 0, ptr ")
+    let ctr: i32 = entry_alloca(s, c"i64", c"array drop index")
+    emit_str(s, c"  store i64 0, ptr ")
     emit_reg(s, ctr)
     emit_str(s, c"\n")
     let head: i32 = next_label(s)
@@ -1150,12 +1148,11 @@ pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
     if count > 0
         own_note_array_call_temp(s, e, reg, StrView { ptr: (name), len: (len) as i64 }, count)
         return
-    let slot: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, slot)
-    emit_str(s, c" = alloca ")
+    let slot: i32 = entry_alloca_begin(s)
     emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c"  ; temporary\n  store ")
+    emit_str(s, c"  ; temporary\n")
+    entry_alloca_end(s)
+    emit_str(s, c"  store ")
     emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (name), len: (len) as i64 })
     emit_str(s, c" ")
     emit_reg(s, reg)
@@ -1176,12 +1173,11 @@ fn own_note_array_call_temp(s: *EmitterState, e: *Expr, reg: i32, name_sv: StrVi
     let ra: *Param = call_ret_array(s, e)
     var slot: i32 = reg
     if array_param_uses_byval(s, ra) == 0
-        slot = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, slot)
-        emit_str(s, c" = alloca ")
+        slot = entry_alloca_begin(s)
         emit_array_value_llvm_type(s, ra)
-        emit_str(s, c"  ; temporary\n  store ")
+        emit_str(s, c"  ; temporary\n")
+        entry_alloca_end(s)
+        emit_str(s, c"  store ")
         emit_array_value_llvm_type(s, ra)
         emit_str(s, c" ")
         emit_reg(s, reg)
@@ -1246,10 +1242,7 @@ fn own_push_temp(s: *EmitterState, slot: i32, name_sv: StrView, count: i32)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let o: *OwnState = s.own
-    let flag: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, flag)
-    emit_str(s, c" = alloca i1  ; drop flag\n")
+    let flag: i32 = entry_alloca(s, c"i1", c"drop flag")
     if o.temp_count >= o.temp_cap
         let cap: i32 = o.temp_cap * 2
         o.temps = realloc(o.temps as *u8, (cap as i64) * sizeof(OwnBinding)) as *OwnBinding
@@ -1523,10 +1516,7 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
             own_clear_mask(s, lb)
             return
         i += 1
-    let flag: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, flag)
-    emit_str(s, c" = alloca i1  ; drop flag\n")
+    let flag: i32 = entry_alloca(s, c"i1", c"drop flag")
     # AGAST #2168: a struct with no drop of its own can be partly moved.
     var fmask: i32 = 0
     var paths: *OwnPath = null
@@ -1534,12 +1524,11 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
     if count == 0 and own_partly_movable(s, StrView { ptr: (name), len: (len) as i64 }) == 1
         paths = own_build_paths(s, StrView { ptr: (name), len: (len) as i64 }, @path_count)
         # One bit per path, in whole 32-bit words (own_mask_width).
-        fmask = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, fmask)
-        emit_str(s, c" = alloca i")
+        fmask = entry_alloca_begin(s)
+        emit_str(s, c"i")
         emit_int(s, ((path_count + 31) / 32 * 32) as i64)
         emit_str(s, c"  ; moved fields\n")
+        entry_alloca_end(s)
     own_grow_live(o)
     let b: *OwnBinding = own_live_at(o, o.live_count)
     b.name = loc.name
@@ -2447,12 +2436,10 @@ pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: 
     emit_reg(s, b.flag)
     emit_str(s, c"\n")
     let m: i32 = own_load_mask(s, b)
-    let tmp: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, tmp)
-    emit_str(s, c" = alloca ")
+    let tmp: i32 = entry_alloca_begin(s)
     own_emit_binding_type(s, b)
     emit_str(s, c"\n")
+    entry_alloca_end(s)
     let v: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, v)
@@ -2528,12 +2515,10 @@ fn own_field_store_begin(s: *EmitterState, stmt: *Stmt, cond: i32, out_old: *i32
         ptr = own_place_ptr(s, stmt.if_cond as *Expr, @f, @b)
     if ptr == 0 or f == null or b == null
         return null
-    let tmp: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, tmp)
-    emit_str(s, c" = alloca ")
+    let tmp: i32 = entry_alloca_begin(s)
     emit_field_llvm_type(s, f)
     emit_str(s, c"\n")
+    entry_alloca_end(s)
     let v: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, v)
@@ -2683,10 +2668,7 @@ pub fn own_match_begin(s: *EmitterState, e: *Expr, slot: i32, name_sv: StrView) 
     if own_scrutinee_moved(s, e) == 0
         return old
     own_push_scope(s)
-    let flag: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, flag)
-    emit_str(s, c" = alloca i1  ; drop flag (match scrutinee)\n")
+    let flag: i32 = entry_alloca(s, c"i1", c"drop flag (match scrutinee)")
     own_grow_live(o)
     let b: *OwnBinding = own_live_at(o, o.live_count)
     b.name = null

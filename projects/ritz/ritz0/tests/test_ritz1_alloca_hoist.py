@@ -16,11 +16,15 @@ argument is refused) and emit_array_fill_into's counter.
 
 THE FIX
 
-emit_fn / emit_impl_method remember where the body starts (just after
-`entry:`) and, once the body is emitted, move every fixed-size
-`%r = alloca <type>` line up to that point (hoist_entry_allocas).  A
-`__builtin_alloca(n)` stays where it is: its size is a runtime value and its
-per-call semantics are the point.
+Each fixed-size alloca is written into a per-function entry-block buffer as
+the emitter emits it (entry_alloca / entry_alloca_begin, AGAST #4460), and
+emit_fn / emit_impl_method splice that buffer in just after `entry:` once
+the body is complete.  There is no text pass over the finished body: the
+line's (buffer offset, source span) is recorded where it is emitted, and the
+frame-limit marks are rebuilt from those records by the splice.  Register
+numbering and line order are emission order, so the IR is unchanged by the
+move.  A `__builtin_alloca(n)` stays where it is: its size is a runtime value
+and its per-call semantics are the point.
 
 THE TESTS
 
@@ -283,6 +287,46 @@ def _misplaced_allocas(ll_text: str) -> list:
     return bad
 
 
+def _entry_alloca_interleaving(ll_text: str) -> list:
+    """Return `(fn header, line)` for every function whose entry block is not
+    a contiguous alloca prefix.
+
+    The entry-block buffer is spliced in at the offset just after `entry:`,
+    so every static alloca must come before the body's first instruction.
+    An implementation that inserted the buffer at the wrong offset (or wrote
+    a non-alloca line into it) still passes the "no alloca outside entry"
+    check: the allocas are in `entry:`, just after the first instruction.
+    This is the assertion that catches that.
+    """
+    bad = []
+    header = None
+    in_entry = False
+    seen_non_alloca = False
+    for line in ll_text.splitlines():
+        if _DEFINE.match(line):
+            header = line
+            in_entry = False
+            seen_non_alloca = False
+            continue
+        if header is None:
+            continue
+        if line.startswith("}"):
+            header = None
+            continue
+        if _LABEL.match(line):
+            in_entry = line.startswith("entry:")
+            seen_non_alloca = False
+            continue
+        if not in_entry:
+            continue
+        if _ALLOCA.match(line):
+            if seen_non_alloca:
+                bad.append((header, line.strip()))
+        else:
+            seen_non_alloca = True
+    return bad
+
+
 # --- tests -------------------------------------------------------------------
 
 
@@ -297,6 +341,11 @@ def test_ritz1_allocas_in_entry_block(ritz1_bin, tmp_path, name):
     bad = _misplaced_allocas(text)
     assert not bad, f"{name}: allocas outside the entry block:\n" + "\n".join(
         f"  {h}\n    {line}" for h, line in bad
+    )
+    interleaved = _entry_alloca_interleaving(text)
+    assert not interleaved, (
+        f"{name}: entry-block allocas are not a contiguous prefix:\n"
+        + "\n".join(f"  {h}\n    {line}" for h, line in interleaved)
     )
 
 
@@ -598,3 +647,42 @@ def test_ritz1_dynamic_alloca_stays_in_place(ritz1_bin, tmp_path):
     )
     exe_rc = _run("ritz1", tmp_path, "dyn", DYNAMIC_ALLOCA)
     assert exe_rc == 21
+
+
+# A function with no static alloca at all: `splice_entry_allocas` must leave
+# the body byte-for-byte alone (the buffer is empty).  A splice that always
+# wrote something -- a newline, say -- breaks every alloca-free fn, and no
+# corpus of alloca-heavy programs need show it.
+ALLOCA_FREE = """\
+fn seven() -> i32
+    return 7
+
+pub fn main() -> i32
+    return seven()
+"""
+
+
+@pytest.mark.integration
+def test_ritz1_splice_is_a_no_op_without_allocas(ritz1_bin, tmp_path):
+    ll = _compile("ritz1", tmp_path, "allocafree", ALLOCA_FREE)
+    text = ll.read_text()
+    assert "alloca" not in text
+    assert "entry:\n\n" not in text, "splice inserted a blank line into an empty body"
+    # The first instruction after each `entry:` is on the very next line.
+    assert re.search(r"^entry:\n  \S", text, re.M), text
+
+
+# The ticket deletes the text re-parse pass.  Behaviour alone cannot tell the
+# two mechanisms apart, so pin the source: no pass over the finished body, and
+# the emission-time buffer present.
+@pytest.mark.integration
+def test_ritz1_has_no_text_reparse_hoist_pass():
+    src = (RITZ_ROOT / "ritz1" / "src" / "emitter.ritz").read_text()
+    for gone in (
+        "hoist_entry_allocas",
+        "hoist_line_is_static_alloca",
+        "hoist_line_len",
+    ):
+        assert gone not in src, f"the deleted re-parse pass is back: {gone}"
+    assert "splice_entry_allocas" in src
+    assert "entry_allocas" in src

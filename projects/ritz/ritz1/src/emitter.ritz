@@ -390,16 +390,18 @@ fn bind_array_param(s: *EmitterState, param: *Param) -> i32
     if param.param_type != TYPE_ARRAY
         return 0
     let slot: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, slot)
     if array_param_uses_byval(s, param) == 1
+        emit_str(s, IR_INDENT)
+        emit_reg(s, slot)
         emit_str(s, c" = getelementptr i8, ptr %")
         emit_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
         emit_str(s, c".arg, i64 0  ; #2306 byval array param\n")
     else
-        emit_str(s, IR_ALLOCA)
+        entry_alloca_reg_begin(s, slot)
         emit_array_value_llvm_type(s, param)
-        emit_str(s, c"\n  store ")
+        emit_str(s, c"\n")
+        entry_alloca_reg_end(s)
+        emit_str(s, c"  store ")
         emit_array_value_llvm_type(s, param)
         emit_str(s, c" %")
         emit_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
@@ -422,10 +424,7 @@ fn bind_array_param(s: *EmitterState, param: *Param) -> i32
 # the prologue makes a param read exactly like a bool local: condition sites
 # `icmp ne i64` it, and bool call args / bool returns `trunc` it back to i1.
 fn emit_bool_param_spill(s: *EmitterState, param: *Param)
-    let alloca_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, alloca_reg)
-    emit_str(s, c" = alloca i64\n")
+    let alloca_reg: i32 = entry_alloca(s, c"i64", null)
     let wide: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, wide)
@@ -445,64 +444,82 @@ fn emit_bool_param_spill(s: *EmitterState, param: *Param)
         let bool_loc: *LocalVar = local_at(s, s.local_count - 1)
         bool_loc.is_bool = 1
 
-# AGAST #1685 — hoist every fixed-size alloca into the entry block.
+# AGAST #1685, #4460 — every fixed-size alloca belongs in the entry block.
 #
-# The emitter writes `%r = alloca T` wherever a local or temp first appears:
-# emit_var_decl, the rvalue struct-literal temp, the method-receiver slot,
-# the variant-ctor slot, the newtype arg box, emit_array_fill_into's
-# counter, match payload binds, sret result slots, ...  Inside a loop body
-# that is a FRESH stack slot every iteration — LLVM treats a non-entry
-# alloca as dynamic and never hoists or reclaims it — so a 10M-iteration
-# loop with a 16-byte `let` in it needed 160 MB of stack and segfaulted.
+# The emitter writes a static `%r = alloca T` into EmitterState.entry_allocas
+# as it emits it (entry_alloca / entry_alloca_begin in emitter_core) instead
+# of into the body, and emit_fn / emit_impl_method call this once the body is
+# complete to insert that buffer just after `entry:`.  The buffer is in
+# emission order, which is exactly the order the old stable text partition
+# produced, so the emitted IR is unchanged.  A DYNAMIC alloca
+# (`alloca i8, i64 %.N` from `__builtin_alloca(n)`) is left in place: its size
+# register is defined later than `entry:`, and its per-call allocation is the
+# point of the builtin.
 #
-# Rather than teach ~30 emission sites to write into a separate prologue
-# buffer (and every future site to remember to), emit_fn / emit_impl_method
-# record where the body starts (just after `entry:`) and call this once the
-# body is complete.  It stably partitions the body's lines: every fixed-size
-# alloca moves up to `body_start` in its original order, everything else
-# follows in its original order.  A fixed-size alloca has no operands, so
-# moving it above the code that precedes it cannot break dominance.
+# Why this matters: a non-entry alloca is dynamic to LLVM and is never
+# reclaimed until the fn returns, so a 16-byte `let` in a loop body needed
+# 160 MB of stack over 10M iterations and segfaulted (#1685).
 #
-# A DYNAMIC alloca — `alloca i8, i64 %.N` from `__builtin_alloca(n)` — is
-# left in place: its size register is defined later than `entry:`, and its
-# per-call allocation is the point of the builtin.
-fn hoist_line_is_static_alloca(p_sv: StrView) -> i32
-    var p: *u8 = p_sv.ptr
-    var len: i64 = p_sv.len
-    # `  %<name> = alloca <operand>[  ; comment]`
-    if len < 4
-        return 0
-    if *p != 32 or *(p + 1) != 32 or *(p + 2) != 37
-        return 0
-    var i: i64 = 3
-    while i < len and *(p + i) != 32
+# The frame-limit check (#3739) runs after the splice and locates the largest
+# alloca from EmitterState.fm.  Splicing shifts every body line, so the marks
+# are rebuilt here: the buffer's allocas carry the (line, col) in force when
+# each was emitted (ea_marks), and the original marks past `entry:` move up by
+# the buffer's length.  Its diagnostics keep their exact source spans.
+fn splice_entry_allocas(s: *EmitterState, body_start: i64)
+    let n: i64 = s.entry_allocas.len
+    if n <= 0
+        return
+    let old_len: i64 = s.out.len
+    let new_len: i64 = old_len + n
+    let base: *u8 = malloc(new_len)
+    memcpy(base, s.out.data, body_start)
+    memcpy(base + body_start, s.entry_allocas.data, n)
+    memcpy(base + body_start + n, s.out.data + body_start, old_len - body_start)
+    free(s.out.data)
+    s.out.data = base
+    s.out.len = new_len
+    s.out.cap = new_len
+    # Rebuild the frame-limit marks.  They are sorted by offset; the buffer's
+    # lines now start at body_start (in emission order), and every original
+    # mark at or after body_start shifted up by n.
+    let cap: i32 = s.fm_count + s.ea_count
+    let marks: *FrameMark = malloc((cap as i64) * sizeof(FrameMark)) as *FrameMark
+    var w: i32 = 0
+    var i: i32 = 0
+    while i < s.fm_count
+        let m: *FrameMark = s.fm + (i as i64)
+        if m.off >= body_start
+            break
+        let d: *FrameMark = marks + (w as i64)
+        d.off = m.off
+        d.line = m.line
+        d.col = m.col
+        w += 1
         i += 1
-    let kw: *u8 = c" = alloca "
-    var k: i64 = 0
-    while k < 10
-        if i + k >= len or *(p + i + k) != *(kw + k)
-            return 0
-        k += 1
-    i += 10
-    # Reject an operand that names a register (`%.N`): a runtime size.
-    # Type names (`%P`, `%Option$i64`) never start with `%.`.  Stop at `;`
-    # so a trailing comment cannot influence the decision.
-    while i < len and *(p + i) != 59
-        if *(p + i) == 37 and i + 1 < len and *(p + i + 1) == 46
-            return 0
+    var e: i32 = 0
+    while e < s.ea_count
+        let em: *FrameMark = s.ea_marks + (e as i64)
+        let d2: *FrameMark = marks + (w as i64)
+        d2.off = body_start + em.off
+        d2.line = em.line
+        d2.col = em.col
+        w += 1
+        e += 1
+    while i < s.fm_count
+        let m2: *FrameMark = s.fm + (i as i64)
+        let d3: *FrameMark = marks + (w as i64)
+        d3.off = m2.off + n
+        d3.line = m2.line
+        d3.col = m2.col
+        w += 1
         i += 1
-    1
-
-# Length of the line starting at `p` (up to `end`), including its '\n'.
-fn hoist_line_len(p: *u8, end: *u8) -> i64
-    var q: *u8 = p
-    var len: i64 = 0
-    while q < end and *q != 10
-        q = q + 1
-        len += 1
-    if q < end
-        len += 1
-    len
+    free(s.fm as *u8)
+    s.fm = marks
+    s.fm_count = w
+    s.fm_cap = cap
+    # The next fn starts empty (grows are kept for reuse).
+    s.entry_allocas.len = 0
+    s.ea_count = 0
 
 # AGAST #1732 — copy large structs pointer-to-pointer, never first-class.
 #
@@ -517,7 +534,8 @@ fn hoist_line_len(p: *u8, end: *u8) -> i64
 # InstCombine splits such a load/store into one scalar per leaf, and for a
 # 22 KB struct (~21k leaves) it grows without bound.
 #
-# Like hoist_entry_allocas, this runs once over the finished body rather
+# Like align_packed_accesses below, this runs once over the finished body
+# rather
 # than at the dozens of sites that emit a struct store.  A store of a
 # struct %T at the sret threshold, whose value register is `load %T, ptr
 # SRC` with nothing that can write memory in between, is rewritten to
@@ -757,33 +775,6 @@ fn align_packed_accesses(s: *EmitterState, body_start: i64)
         p = p + ll
     free(base)
     free(marks)
-
-fn hoist_entry_allocas(s: *EmitterState, body_start: i64)
-    let n: i64 = s.out.len - body_start
-    if n <= 0
-        return
-    let base: *u8 = s.out.data + body_start
-    let end: *u8 = base + n
-    let tmp: *u8 = malloc(n)
-    # Pass 1: the allocas, in order.
-    var w: i64 = 0
-    var p: *u8 = base
-    while p < end
-        let ll: i64 = hoist_line_len(p, end)
-        if hoist_line_is_static_alloca(StrView { ptr: (p), len: (ll) }) == 1
-            memcpy(tmp + w, p, ll)
-            w = w + ll
-        p = p + ll
-    # Pass 2: everything else, in order.
-    p = base
-    while p < end
-        let ll2: i64 = hoist_line_len(p, end)
-        if hoist_line_is_static_alloca(StrView { ptr: (p), len: (ll2) }) == 0
-            memcpy(tmp + w, p, ll2)
-            w = w + ll2
-        p = p + ll2
-    memcpy(base, tmp, n)
-    free(tmp)
 
 # AGAST #1737 — the CPU features an x86 ISA-extension intrinsic needs.
 #
@@ -1038,7 +1029,8 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         emit_str(s, c" comdat")   # AGAST #201: see emit_odr_comdat_start
     emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
-    # AGAST #1685: allocas emitted below this point are hoisted back here.
+    # AGAST #1685, #4460: static allocas emitted below this point are
+    # buffered and spliced back here when the body is complete.
     let body_start: i64 = s.out.len
 
     var param3: *Param = f.params
@@ -1053,12 +1045,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         if bind_array_param(s, param3) == 1   # AGAST #2287
             param3 = param3.next
             continue
-        let alloca_reg: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, alloca_reg)
-        emit_str(s, IR_ALLOCA)
+        let alloca_reg: i32 = entry_alloca_begin(s)
         emit_llvm_type_struct(s, param3.param_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 })
         emit_str(s, IR_NL)
+        entry_alloca_end(s)
         emit_str(s, IR_STORE_IND)
         emit_llvm_type_struct(s, param3.param_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 })
         emit_str(s, c" %")
@@ -1119,11 +1109,10 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             else if stmt.expr.kind == EXPR_STRUCT_LIT and f.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
                 let alloca_reg: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, alloca_reg)
-                emit_str(s, IR_ALLOCA_NAMED)
+                entry_alloca_reg_begin_named(s, alloca_reg)
                 emit_name(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
                 emit_str(s, IR_NL)
+                entry_alloca_reg_end(s)
                 emit_struct_lit_to_alloca(s, stmt.expr, alloca_reg)
                 if s.ret_sret == 1
                     emit_sret_ret_from_ptr(s, alloca_reg)   # AGAST #1730
@@ -1257,11 +1246,11 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         stmt = stmt.next
 
     emit_implicit_return_tail(s, has_explicit_return, f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }, body_tail_span(f.body))
+    splice_entry_allocas(s, body_start)          # AGAST #4460: static allocas into entry:
     refuse_huge_frame(s, f, body_start)          # AGAST #3739: before any rewrite
     own_end_fn(s)                                # AGAST #2158, #3508
     rewrite_large_struct_copies(s, body_start)   # AGAST #1732
     align_packed_accesses(s, body_start)         # AGAST #1918
-    hoist_entry_allocas(s, body_start)
     tag_intrinsic_target_features(s, attr_pos)   # AGAST #1737
     emit_str(s, c"}\n\n")
 
@@ -1394,7 +1383,8 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         emit_str(s, c" comdat")   # AGAST #201: see emit_odr_comdat_start
     emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
-    # AGAST #1685: allocas emitted below this point are hoisted back here.
+    # AGAST #1685, #4460: static allocas emitted below this point are
+    # buffered and spliced back here when the body is complete.
     let body_start: i64 = s.out.len
 
     var param2: *Param = method.params
@@ -1415,15 +1405,13 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         if p2_is_self == 0 and bind_array_param(s, param2) == 1   # AGAST #2287
             param2 = param2.next
             continue
-        let alloca_reg: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, alloca_reg)
-        emit_str(s, IR_ALLOCA)
+        let alloca_reg: i32 = entry_alloca_begin(s)
         if p2_self_ptr == 1
             emit_str(s, c"ptr")
         else
             emit_llvm_type_struct(s, param2.param_type, StrView { ptr: (param2.param_type_name), len: (param2.param_type_name_len) as i64 })
         emit_str(s, IR_NL)
+        entry_alloca_end(s)
         emit_str(s, IR_STORE_IND)
         if p2_self_ptr == 1
             emit_str(s, c"ptr")
@@ -1509,11 +1497,10 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             else if stmt.expr.kind == EXPR_STRUCT_LIT and method.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
                 let alloca_reg: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, alloca_reg)
-                emit_str(s, IR_ALLOCA_NAMED)
+                entry_alloca_reg_begin_named(s, alloca_reg)
                 emit_name(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
                 emit_str(s, IR_NL)
+                entry_alloca_reg_end(s)
                 emit_struct_lit_to_alloca(s, stmt.expr, alloca_reg)
                 if s.ret_sret == 1
                     emit_sret_ret_from_ptr(s, alloca_reg)   # AGAST #1730
@@ -1640,11 +1627,11 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # AGAST #1573 — same tail as emit_fn: close the final block if the body
     # did not already end in a `ret`.
     emit_implicit_return_tail(s, has_explicit_return, method.return_type, StrView { ptr: (method.return_type_name), len: (method.return_type_name_len) as i64 }, body_tail_span(method.body))
+    splice_entry_allocas(s, body_start)          # AGAST #4460: static allocas into entry:
     refuse_huge_frame(s, method, body_start)     # AGAST #3739: before any rewrite
     own_end_fn(s)                                # AGAST #2158, #3508
     rewrite_large_struct_copies(s, body_start)   # AGAST #1732
     align_packed_accesses(s, body_start)         # AGAST #1918
-    hoist_entry_allocas(s, body_start)
     tag_intrinsic_target_features(s, attr_pos)   # AGAST #1737
     emit_str(s, c"}\n\n")
 
@@ -4685,6 +4672,11 @@ pub fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     # splittable struct to be written field by field (AGAST #4328).
     var s: EmitterState = EmitterState {
         out: out,
+        entry_allocas: Vec<u8> { data: null, len: 0, cap: 0 },   # AGAST #4460
+        ea_marks: null,
+        ea_count: 0,
+        ea_cap: 0,
+        entry_out_saved: null,
         reg_counter: 1,
         label_counter: 0,
         locals: null,

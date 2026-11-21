@@ -22,6 +22,7 @@ import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
 pub import ast_query
 import index_through # index_through (AGAST #2440)
 import tokens_gen
+import emitter_ir      # ir_alloca (AGAST #4460)
 import emitter_expr
 import emitter_expr_arith
 import emitter_expr_call
@@ -110,6 +111,17 @@ struct NarrowDecl
 
 struct EmitterState
     out: *Vec<u8>
+    # AGAST #4460 — this fn's STATIC allocas, in emission order, and the
+    # (buffer offset, source span) of each (frame_limit still locates the
+    # largest one).  Written by entry_alloca_begin / entry_alloca and spliced
+    # after `entry:` by splice_entry_allocas when the body is complete; a
+    # DYNAMIC alloca (`alloca i8, i64 %.N`) is still written to s.out.
+    # entry_out_saved is s.out while a redirect is in effect.
+    entry_allocas: Vec<u8>
+    ea_marks: *FrameMark
+    ea_count: i32
+    ea_cap: i32
+    entry_out_saved: *Vec<u8>
     reg_counter: i32
     label_counter: i32
     # Heap array of `locals_cap` LocalVars (AGAST #1905); index it with
@@ -753,6 +765,97 @@ pub fn next_reg(s: *EmitterState) -> i32
     let r: i32 = s.reg_counter
     s.reg_counter = s.reg_counter + 1
     r
+
+# =============================================================================
+# Entry-block alloca buffer (AGAST #4460)
+# =============================================================================
+#
+# Every fixed-size alloca goes to the entry block: a non-entry alloca is a
+# dynamic alloca to LLVM and is never reclaimed until the fn returns, so one
+# inside a loop is a fresh stack slot per iteration (#1685).  That used to be
+# a text pass over the finished body (hoist_entry_allocas); now the emitter
+# writes each static alloca into this per-fn buffer as it emits it, and
+# splice_entry_allocas (emitter.ritz) inserts the buffer after `entry:`.  The
+# order is emission order, exactly what the old stable partition produced.
+#
+# A runtime-sized ALLOCA — `alloca i8, i64 %.N` from __builtin_alloca(n) — is
+# NOT buffered: its size register is defined later than `entry:` and its
+# per-call semantics are the point.
+
+# Record where the next alloca line starts in the entry buffer and the source
+# span in force, so frame_limit can still name/bound the largest alloca.
+pub fn entry_alloca_mark(s: *EmitterState)
+    if s.ea_count >= s.ea_cap
+        var cap: i32 = 64
+        if s.ea_cap > 0
+            cap = s.ea_cap * 2
+        s.ea_marks = realloc(s.ea_marks as *u8, (cap as i64) * sizeof(FrameMark)) as *FrameMark
+        s.ea_cap = cap
+    let m: *FrameMark = s.ea_marks + (s.ea_count as i64)
+    m.off = s.entry_allocas.len
+    m.line = s.fm_line
+    m.col = s.fm_col
+    s.ea_count = s.ea_count + 1
+
+# Begin a static alloca whose type the caller emits itself (a compound array
+# or struct type through emit_llvm_type_struct and friends): redirect the
+# emitter to the entry buffer, allocate the register, and write the
+# `  %.{r} = alloca ` prefix.  The caller writes the type and the line end,
+# then calls entry_alloca_end.
+pub fn entry_alloca_begin(s: *EmitterState) -> i32
+    entry_alloca_mark(s)
+    s.entry_out_saved = s.out
+    s.out = @s.entry_allocas
+    let r: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, r)
+    emit_str(s, IR_ALLOCA)
+    r
+
+pub fn entry_alloca_end(s: *EmitterState)
+    s.out = s.entry_out_saved
+
+# A whole static alloca line whose LLVM type is a C string, with an optional
+# `  ; <comment>` suffix (null for none).
+pub fn entry_alloca(s: *EmitterState, ty: *u8, comment: *u8) -> i32
+    entry_alloca_mark(s)
+    if comment == null
+        ir_alloca(@s.entry_allocas, @s.reg_counter, ty)
+    else
+        ir_alloca_c(@s.entry_allocas, @s.reg_counter, ty, comment)
+
+# The same line for a register the caller already took with next_reg.  The
+# sites that allocate early (one slot for every branch of a type switch, say)
+# keep their next_reg exactly where it was; only the line's destination moves.
+pub fn entry_alloca_reg(s: *EmitterState, r: i32, ty: *u8, comment: *u8)
+    entry_alloca_mark(s)
+    if comment == null
+        ir_alloca_at(@s.entry_allocas, r, ty)
+    else
+        ir_alloca_at_c(@s.entry_allocas, r, ty, comment)
+
+# entry_alloca_begin for a register already taken: redirect, write the
+# `  %.{r} = alloca ` prefix with no new register, then entry_alloca_reg_end.
+pub fn entry_alloca_reg_begin(s: *EmitterState, r: i32)
+    entry_alloca_mark(s)
+    s.entry_out_saved = s.out
+    s.out = @s.entry_allocas
+    emit_str(s, IR_INDENT)
+    emit_reg(s, r)
+    emit_str(s, IR_ALLOCA)
+
+# entry_alloca_reg_begin when the type starts with a bare struct name
+# (`emit_name` emits no `%`): the prefix is `  %.{r} = alloca %`.
+pub fn entry_alloca_reg_begin_named(s: *EmitterState, r: i32)
+    entry_alloca_mark(s)
+    s.entry_out_saved = s.out
+    s.out = @s.entry_allocas
+    emit_str(s, IR_INDENT)
+    emit_reg(s, r)
+    emit_str(s, IR_ALLOCA_NAMED)
+
+pub fn entry_alloca_reg_end(s: *EmitterState)
+    s.out = s.entry_out_saved
 
 # AGAST #1335 — the value of `current_label` inside a function's entry block.
 #
@@ -1438,10 +1541,8 @@ pub fn through_spill(s: *EmitterState, view: *LocalVar) -> *LocalVar
     if view == null or view.array_base == null
         return view
     let val: i32 = emit_expr(s, view.array_base)
-    let slot: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, slot)
-    emit_str(s, c" = alloca i64\n  store i64 ")
+    let slot: i32 = entry_alloca(s, c"i64", null)
+    emit_str(s, c"  store i64 ")
     emit_reg(s, val)
     emit_str(s, IR_PTR_SEP)
     emit_reg(s, slot)
@@ -3428,11 +3529,10 @@ pub fn fn_sret_array(s: *EmitterState, f: *FnDef) -> *Param
 # which is also the call's value (a `ptr`; emit_call_array_store copies it).
 fn emit_sret_array_call_slot(s: *EmitterState, ra: *Param) -> i32
     let slot: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, slot)
-    emit_str(s, IR_ALLOCA)
+    entry_alloca_reg_begin(s, slot)
     emit_array_value_llvm_type(s, ra)
     emit_str(s, c"  ; #3181 sret array\n")
+    entry_alloca_reg_end(s)
     slot
 
 # A call's sret slot, when callee `f` returns `[N]T` through one (AGAST #3181);
@@ -3624,11 +3724,11 @@ pub fn emit_sret_ret_value(s: *EmitterState, val: i32)
         emit_sret_ret_from_ptr(s, s.sret_last_slot)
         return
     let tmp: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, tmp)
-    emit_str(s, IR_ALLOCA_NAMED)
+    entry_alloca_reg_begin_named(s, tmp)
     emit_name(s, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
-    emit_str(s, c"\n  store %")
+    emit_str(s, c"\n")
+    entry_alloca_reg_end(s)
+    emit_str(s, c"  store %")
     emit_name(s, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
     emit_str(s, IR_SP)
     emit_reg(s, val)
@@ -3643,11 +3743,10 @@ pub fn emit_sret_call_slot(s: *EmitterState, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let slot: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, slot)
-    emit_str(s, IR_ALLOCA_NAMED)
+    entry_alloca_reg_begin_named(s, slot)
     emit_name(s, StrView { ptr: (name), len: (len) as i64 })
     emit_str(s, IR_NL)
+    entry_alloca_reg_end(s)
     slot
 
 # Caller side, after the call: load the result into `result` as the

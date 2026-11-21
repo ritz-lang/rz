@@ -1057,11 +1057,11 @@ fn tuple_bind_array_field(s: *EmitterState, fld: *StructField, val: i32, name_sv
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     let slot: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, slot)
-    emit_str(s, IR_ALLOCA)
+    entry_alloca_reg_begin(s, slot)
     emit_field_llvm_type(s, fld)
-    emit_str(s, c"\n  store ")
+    emit_str(s, c"\n")
+    entry_alloca_reg_end(s)
+    emit_str(s, c"  store ")
     emit_field_llvm_type(s, fld)
     emit_str(s, IR_SP)
     emit_reg(s, val)
@@ -1116,14 +1116,14 @@ fn tuple_bind_field(s: *EmitterState, fld: *StructField, sname_sv: StrView, init
         emit_reg(s, val)
         emit_str(s, IR_TO_I64)
     let slot: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, slot)
-    emit_str(s, IR_ALLOCA)
+    entry_alloca_reg_begin(s, slot)
     if ft == TYPE_STRUCT
         emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 })
     else
         emit_str(s, ty_value_llvm(slot_type))
-    emit_str(s, c"\n  store ")
+    emit_str(s, c"\n")
+    entry_alloca_reg_end(s)
+    emit_str(s, c"  store ")
     if ft == TYPE_STRUCT
         emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 })
     else
@@ -1150,21 +1150,15 @@ fn tuple_bind_field(s: *EmitterState, fld: *StructField, sname_sv: StrView, init
 # error count already stops any output being written.
 fn tuple_decl_placeholders(s: *EmitterState, stmt: *Stmt)
     let a: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, a)
-    emit_str(s, c" = alloca i64\n")
+    entry_alloca_reg(s, a, c"i64", null)
     add_local(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, a, TYPE_I64)
     let b: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, b)
-    emit_str(s, c" = alloca i64\n")
+    entry_alloca_reg(s, b, c"i64", null)
     add_local(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, b, TYPE_I64)
     var tn: *TupleName = stmt.tuple_more   # AGAST #109
     while tn != null
         let c: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, c)
-        emit_str(s, c" = alloca i64\n")
+        entry_alloca_reg(s, c, c"i64", null)
         add_local(s, StrView { ptr: (tn.name), len: (tn.len) as i64 }, c, TYPE_I64)
         tn = tn.next
 
@@ -2219,9 +2213,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             dt.var_type = init_int
 
     let alloca_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, alloca_reg)
-    emit_str(s, IR_ALLOCA)
+    entry_alloca_reg_begin(s, alloca_reg)
     if var_type == TYPE_ARRAY and dt.var_array_shape != null
         # AGAST #1509: `var g: [N][M]T` -> `alloca [N x [M x T]]` (it was
         # `[N x i64]`: the inner array lost, every access miscompiled).
@@ -2241,6 +2233,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     else
         emit_llvm_type_struct(s, var_type, StrView { ptr: (dt.var_type_name), len: (dt.var_type_name_len) as i64 })
     emit_str(s, IR_NL)
+    entry_alloca_reg_end(s)
 
     # AGAST #2330: `p#`, the `*T` view of a `*[N]T` local, before `p` itself.
     var view_name_len: i32 = 0
@@ -3435,11 +3428,10 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # Check if return value is a struct literal (e.g., return NFAFragment { start: s0, end: s0 })
             if stmt.return_value.kind == EXPR_STRUCT_LIT
                 let alloca_reg: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, alloca_reg)
-                emit_str(s, IR_ALLOCA_NAMED)
+                entry_alloca_reg_begin_named(s, alloca_reg)
                 emit_name(s, StrView { ptr: (stmt.return_value.ident_ptr), len: (stmt.return_value.ident_len) as i64 })
                 emit_str(s, IR_NL)
+                entry_alloca_reg_end(s)
                 emit_struct_lit_to_alloca(s, stmt.return_value, alloca_reg)
                 if s.ret_sret == 1
                     emit_sret_ret_from_ptr(s, alloca_reg)   # AGAST #1730
@@ -3670,14 +3662,14 @@ fn emit_for_elem_llvm(s: *EmitterState, elem: i32, name_sv: StrView)
 
 # AGAST #2388: a slot for the header value `val`, which has no place of its own:
 # a call's result, a literal or a const.  Nothing else can write to it.  The alloca
-# is static, so hoist_entry_allocas takes it out of any enclosing loop.
+# is static, so it is written into the fn's entry-block buffer, out of any enclosing loop.
 fn emit_for_header_spill(s: *EmitterState, st: *StructDef, val: i32) -> i32
     let slot: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, slot)
-    emit_str(s, IR_ALLOCA_NAMED)
+    entry_alloca_reg_begin_named(s, slot)
     emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-    emit_str(s, c"\n  store %")
+    emit_str(s, c"\n")
+    entry_alloca_reg_end(s)
+    emit_str(s, c"  store %")
     emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
     emit_str(s, IR_SP)
     emit_reg(s, val)
@@ -4000,8 +3992,8 @@ fn scalar_elem_kind(s: *EmitterState, first: *Expr) -> i32
         return TYPE_I64
     TYPE_VOID
 
-# AGAST #2410: the literal `e` in a slot of its own, a static alloca that
-# hoist_entry_allocas takes out of any enclosing loop; 0 for a literal ritz1
+# AGAST #2410: the literal `e` in a slot of its own, a static alloca written
+# into the entry-block buffer, out of any enclosing loop; 0 for a literal ritz1
 # can't type.
 fn emit_for_literal(s: *EmitterState, e: *Expr, elem: *i32, size: *i32, name: **u8, name_len: *i32) -> i32
     let t: i32 = array_init_elem(s, e, name, name_len)
@@ -4013,13 +4005,13 @@ fn emit_for_literal(s: *EmitterState, e: *Expr, elem: *i32, size: *i32, name: **
         n = n + 1
         it = it.next
     let slot: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, slot)
-    emit_str(s, c" = alloca [")
+    entry_alloca_reg_begin(s, slot)
+    emit_str(s, c"[")
     emit_int(s, n as i64)
     emit_str(s, IR_X)
     emit_for_elem_llvm(s, t, StrView { ptr: (*name), len: (*name_len) as i64 })
     emit_str(s, c"]\n")
+    entry_alloca_reg_end(s)
     emit_array_lit_into(s, slot, n, t, StrView { ptr: (*name), len: (*name_len) as i64 }, e)
     # AGAST #3297: the move check marked a literal of a Drop T a temporary
     # (nothing takes it: `x` is a copy), dropped per element after the loop.
@@ -4289,18 +4281,14 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
     # Index storage (i64 counter).
     let idx_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, idx_reg)
-    emit_str(s, c" = alloca i64\n")
+    entry_alloca_reg(s, idx_reg, c"i64", null)
     emit_str(s, c"  store i64 0, ptr ")
     emit_reg(s, idx_reg)
     emit_str(s, IR_NL)
 
     # Loop variable — typed to elem_type so body reads get the right width.
     let var_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, var_reg)
-    emit_str(s, IR_ALLOCA)
+    entry_alloca_reg_begin(s, var_reg)
     # A bool local is an i64 slot, as emit_var_decl has it, and `elem_type` an
     # `i1` in the array.  The body reads the binding as any other bool local.
     # A bool row or plane (AGAST #3379) stays `i1`s, as a bool array local is.
@@ -4310,6 +4298,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     else
         emit_for_slot_llvm(s, elem_type, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, row_size, plane)
     emit_str(s, IR_NL)
+    entry_alloca_reg_end(s)
 
     if plane != null
         # AGAST #3379: a plane is a `[M][N]..T` local, as emit_var_decl has it.
@@ -5020,11 +5009,10 @@ pub fn emit_call_array_temp(s: *EmitterState, value: *Expr, ra: *Param) -> i32
         # 0 only when the call itself failed to emit, already an error.
         return own_temp_slot_of(s, emit_expr(s, value))
     let tmp: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, tmp)
-    emit_str(s, IR_ALLOCA)
+    entry_alloca_reg_begin(s, tmp)
     emit_array_value_llvm_type(s, ra)
     emit_str(s, c"  ; #2302 call result\n")
+    entry_alloca_reg_end(s)
     emit_call_array_store(s, value, ra, tmp)
     tmp
 
@@ -5296,11 +5284,10 @@ fn emit_nd_plane_store(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, value: *
         emit_nd_error(s, value.span.line, value.span.col, c"whole-plane store through a pointer to a plane of a multi-dimensional array is not supported by ritz1 from this value (only a nested literal or fill, or a whole N-D array or plane)")
         return
     let tmp: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, tmp)
-    emit_str(s, IR_ALLOCA)
+    entry_alloca_reg_begin(s, tmp)
     emit_array_shape_llvm(s, sh, 0)
     emit_str(s, IR_NL)
+    entry_alloca_reg_end(s)
     if emit_nd_array_init_into(s, sh, 0, tmp, value) == 1
         emit_nd_plane_copy(s, sh, 0, dst_ptr, tmp)
 
@@ -5436,11 +5423,10 @@ pub fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i
             emit_array_fill_into(s, dst_ptr, dst_size, dst_et, StrView { ptr: (dst_name), len: (dst_name_len) as i64 }, value.left)
             return
         let tmp: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, tmp)
-        emit_str(s, IR_ALLOCA)
+        entry_alloca_reg_begin(s, tmp)
         emit_local_array_llvm_type(s, dst_size, dst_et, StrView { ptr: (dst_name), len: (dst_name_len) as i64 })
         emit_str(s, IR_NL)
+        entry_alloca_reg_end(s)
         emit_array_lit_into(s, tmp, dst_size, dst_et, StrView { ptr: (dst_name), len: (dst_name_len) as i64 }, value)
         emit_local_array_copy(s, dst_size, dst_et, StrView { ptr: (dst_name), len: (dst_name_len) as i64 }, tmp, dst_ptr)
         return
@@ -5669,14 +5655,13 @@ pub fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *S
     if value.kind == EXPR_ARRAY_FILL
         emit_array_fill_into(s, field_ptr, field.array_size, et, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }, value.left)
         return
-    # Build in a temporary (a fixed-size alloca, hoisted to the entry block),
-    # then copy the whole aggregate over the field.
+    # Build in a temporary (a fixed-size alloca, written into the entry-block
+    # buffer), then copy the whole aggregate over the field.
     let tmp: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, tmp)
-    emit_str(s, IR_ALLOCA)
+    entry_alloca_reg_begin(s, tmp)
     emit_array_field_llvm_type(s, field)
     emit_str(s, IR_NL)
+    entry_alloca_reg_end(s)
     emit_array_lit_into(s, tmp, field.array_size, et, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }, value)
     emit_array_field_copy(s, field, tmp, field_ptr)
 
@@ -6530,11 +6515,10 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
         # Allocate loop variable
         let var_reg: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, var_reg)
-        emit_str(s, IR_ALLOCA)
+        entry_alloca_reg_begin(s, var_reg)
         emit_str(s, var_llvm)
         emit_str(s, IR_NL)
+        entry_alloca_reg_end(s)
 
         # Register the loop variable
         add_local(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, var_type)

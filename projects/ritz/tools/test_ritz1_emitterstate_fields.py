@@ -46,7 +46,11 @@ SEMA_TYPE = SRC / "sema_type.ritz"
 # Measured on `8f62d1af` (2026-11-21): 91 fields, unchanged from #1816's
 # 026c732b measurement despite the Sema-annotation work landed between them.
 # The count is the ticket: the side-channel fields were never there to delete.
-MEASURED_FIELDS = 91
+#
+# #4460 added five, all lowering state: entry_allocas and its saved out/reg
+# (the entry-block buffer and the swap), plus ea_marks/ea_count/ea_cap (the
+# frame-limit marks each buffered alloca records as it is emitted).
+MEASURED_FIELDS = 96
 
 # The three names the superseded acceptance grep counted (101 hits on main).
 # They are lowering state: every file that touches them is emitter-side.
