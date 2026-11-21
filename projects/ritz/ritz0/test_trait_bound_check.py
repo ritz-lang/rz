@@ -160,6 +160,46 @@ def test_failed_bound_is_located(request, tmp_path, compiler, row):
     _assert_refused(compiler, tmp_path, row, PRELUDE + body, message)
 
 
+# The real ritzlib bounds (#4295): `fmt_show` and `fmt_show_with` need
+# `Display`, `fmt_show_debug` needs `Debug`.  A `T` without the trait is an
+# error at the call, not inside ritzlib/fmt/display.ritz: a whole program,
+# not PRELUDE + body, because the imports come first.
+FMT_BOUNDS = {
+    "fmt_show": (
+        "^fmt_show(@n, @&w) as i32",
+        "`Nope` doesn't implement `Display`, which `T` of `fmt_show` requires"),
+    "fmt_show_debug": (
+        "^fmt_show_debug(@n, @&w) as i32",
+        "`Nope` doesn't implement `Debug`, which `T` of `fmt_show_debug` requires"),
+    "fmt_show_with": (
+        '^fmt_show_with(@n, @&w, "x") as i32',
+        "`Nope` doesn't implement `Display`, which `T` of `fmt_show_with` requires"),
+}
+
+FMT_PROGRAM = """\
+import ritzlib.fmt.display
+import ritzlib.fmt.writer
+
+struct Nope
+    x: i64
+
+fn main() -> i32
+    let n = Nope { x: 1 }
+    var w: Writer = null_writer()
+    {call}
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("row", sorted(FMT_BOUNDS))
+def test_fmt_bound_is_located_at_the_call(request, tmp_path, compiler, row):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    call, message = FMT_BOUNDS[row]
+    marked = FMT_PROGRAM.replace("{call}", call)
+    _assert_refused(compiler, tmp_path, f"fmt_{row}", marked, message)
+
+
 # Satisfied bounds compile and run: exact impls, a generic impl (with its
 # own bound met), a compiler trait, inferred and explicit, and a method
 # called on `T` through the bound.

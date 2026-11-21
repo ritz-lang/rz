@@ -440,9 +440,9 @@ wins.
   for the `_with` spec forms. Phase 3 lowers `{x}` to `show` / `fmt_show<T>`
   by `x`'s type. An inherent impl, an impl outside the trait's file, and
   Option/Result remain refused (§12.2, R36 / R26).
-- **No bounds yet.** The generics are `<T>`, not `<T: Display>`: ritz1 can't
-  parse a bound until #3469. A bound is a check only (R55), so lookup is the
-  same; the bounds go on with #3469 (#4295).
+- **Bounds.** The generics are `<T: Display>` (and `<T: Debug>` for
+  `fmt_show_debug`): a `T` without the trait is an error at the call, not
+  inside the instance (#4295). A bound is a check only (R55).
 - **Trait impl methods are reachable.** §15.2 says they need no `pub`; ritz0
   refused a call from a generic in another file and ritz1 gave them internal
   linkage. Both now mark a trait impl's methods `pub` at the parse
@@ -539,11 +539,11 @@ forms work. Phase 5 removes the old ones in one commit.
    `self: @Self` with `w: @&Writer`, the shape §11.5 and §12 already use.
 
 2. **Generic Display impls** (`impl<T: Display> Display for Span<T>`, …).
-   **Moved to LARB: #4017.** Phase 2 shipped no generic impls, and ritz1
-   can't parse a bound (#3469). The concrete `impl Display for Span<u8>` and
+   **Moved to LARB: #4017.** Phase 2 shipped no generic impls; bounds parse
+   now (#3469). The concrete `impl Display for Span<u8>` and
    `impl Display for i64` (and the like) now exist in `ritzlib.fmt.display`
-   (R36's revisit, #4294); `impl<T> ... for Span<T>` still waits on the
-   bound.
+   (R36's revisit, #4294); `impl<T: Display> ... for Span<T>` still waits on
+   #4017.
 
 3. **`fn main` not `pub` is silently accepted.** **RESOLVED (Phase 1):** both
    compilers special-case `main`'s linkage by name, so it widens nothing else.
