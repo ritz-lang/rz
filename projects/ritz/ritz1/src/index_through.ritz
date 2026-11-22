@@ -68,17 +68,17 @@ fn through_root(base: *Expr) -> *Expr
 
 # 1 when `loc` is a Vec, Span or String itself (#2442).
 fn indexes_itself(loc: *LocalVar) -> i32
-    if loc.var_type != TYPE_STRUCT
+    if lv_var_type(loc) != TYPE_STRUCT
         return 0
-    name_is_indexable(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+    name_is_indexable(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
 
 # 1 when `loc` is a pointer or reference, at one level, to a struct of an indexable name.
 fn sees_through(loc: *LocalVar) -> i32
-    if loc.var_type != TYPE_PTR and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+    if lv_var_type(loc) != TYPE_PTR and lv_var_type(loc) != TYPE_REF and lv_var_type(loc) != TYPE_MUT_REF
         return 0
-    if loc.pointee_type != TYPE_STRUCT
+    if lv_pointee_type(loc) != TYPE_STRUCT
         return 0
-    name_is_indexable(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+    name_is_indexable(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
 
 # AGAST #2331: 1 when `loc` is a `**T`, `@*T` or `@&*T` with T a Vec, Span or
 # String, one level further out than sees_through: `(*q)[i]` is `*((*q).data + i)`.
@@ -86,7 +86,7 @@ fn sees_through(loc: *LocalVar) -> i32
 fn sees_through_deref(loc: *LocalVar) -> i32
     if ptr_to_struct_ptr(loc) == 0
         return 0
-    name_is_indexable(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+    name_is_indexable(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
 
 # What an element that is itself a Vec, Span or String is, for `v[i][j]`: only its
 # type_name and var_type are read, and every caller has done with it before it emits.
@@ -134,7 +134,7 @@ pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
             return dv
         if sees_through_deref(loc) == 1   # `(*q)[i]` with `q: **Vec<T>` (#2331)
             return loc
-    if loc.pointee_type == TYPE_ARRAY
+    if lv_pointee_type(loc) == TYPE_ARRAY
         return array_view_of(s, root)
     if sees_through(loc) == 0
         return null
@@ -163,13 +163,7 @@ fn vec_field_through(s: *EmitterState, base: *Expr) -> *LocalVar
     if name_is_indexable(StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == 0
         return null
     let v: *LocalVar = malloc(sizeof(LocalVar)) as *LocalVar
-    memset(v as *u8, 0, sizeof(LocalVar))
-    v.var_type = TYPE_STRUCT
-    v.type_name = f.field_type_name
-    v.type_name_len = f.field_type_name_len
-    v.inner_pointee_type = TYPE_VOID
-    v.pointee_array_elem_type = TYPE_VOID
-    v.pointee_array_elem_pointee = TYPE_VOID
+    lv_loc_init(v, StrView { ptr: (null), len: (0) as i64 }, TYPE_STRUCT, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, TYPE_I64, 0, 0)
     v
 
 # AGAST #2726: `base`, a call that returns a Vec or Span by value, as the view of
@@ -207,9 +201,7 @@ fn call_ref_view(s: *EmitterState, base: *Expr, name_sv: StrView) -> *LocalVar
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     var probe: LocalVar
-    memset(@probe as *u8, 0, sizeof(LocalVar))
-    probe.type_name = name
-    probe.type_name_len = name_len
+    lv_loc_init(@probe, StrView { ptr: (null), len: (0) as i64 }, TYPE_STRUCT, StrView { ptr: (name), len: (name_len) as i64 }, TYPE_I64, 0, 0)
     let buf: *Expr = malloc(sizeof(Expr)) as *Expr
     memset(buf as *u8, 0, sizeof(Expr))
     if name_starts(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"Span$"), len: (5) as i64 }) == 1
@@ -261,7 +253,7 @@ fn array_view_named(s: *EmitterState, name_sv: StrView) -> *LocalVar
         return null
     let loc: *LocalVar = local_at(s, idx)
     let view: *LocalVar = local_at(s, idx - 1)
-    if view.array_view == 0 or view.reg != loc.reg
+    if lv_is_array_view(view) == 0 or view.reg != loc.reg
         return null
     if view_lacks_pointee(view) == 1
         return null
@@ -290,10 +282,7 @@ fn index_through_element(s: *EmitterState, inner: *Expr) -> *LocalVar
         if held == TYPE_PTR_PTR
             return unscoped_array_view(s, inner, TYPE_STRUCT, StrView { ptr: (name), len: (name_len) as i64 }, TYPE_VOID)
         return null
-    memset(@g_through_elem as *u8, 0, sizeof(LocalVar))
-    g_through_elem.var_type = TYPE_STRUCT
-    g_through_elem.type_name = name
-    g_through_elem.type_name_len = name_len
+    lv_loc_init(@g_through_elem, StrView { ptr: (null), len: (0) as i64 }, TYPE_STRUCT, StrView { ptr: (name), len: (name_len) as i64 }, TYPE_I64, 0, 0)
     @g_through_elem
 
 # AGAST #2995: `b` = `pg[i]`, an element of a `var pg: [N]*[M]T` local, as the view
@@ -307,10 +296,10 @@ fn element_array_view(s: *EmitterState, b: *Expr) -> *LocalVar
     if b.right == null or b.right.kind == EXPR_RANGE
         return null
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (b.left.ident_ptr), len: (b.left.ident_len) as i64 })
-    if loc == null or loc.var_type != TYPE_ARRAY or loc.array_rec == null
+    if loc == null or lv_var_type(loc) != TYPE_ARRAY or lv_array_rec(loc) == null
         return null
-    let pa: *ArrayElem = loc.array_rec.ptr_array
-    if pa == null or loc.array_rec.ptr_array_size <= 0
+    let pa: *ArrayElem = lv_array_rec(loc).ptr_array
+    if pa == null or lv_array_rec(loc).ptr_array_size <= 0
         return null
     unscoped_array_view(s, b, pa.elem, StrView { ptr: (pa.name), len: (pa.name_len) as i64 }, pa.pointee)
 
@@ -337,13 +326,13 @@ pub fn index_through_fill(s: *EmitterState, e: *Expr, loc: *LocalVar, t: *Throug
     memset(t as *u8, 0, sizeof(ThroughIndex))
     let root: *Expr = through_root(e.left)
     var buffer: *Expr = @t.field
-    if loc.array_view == 1
+    if lv_is_array_view(loc) == 1
         through_view(@t.field, root, loc)   # `*(p# + i)` (#2330)
-    else if name_starts(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }, StrView { ptr: (c"Span$"), len: (5) as i64 }) == 1
+    else if name_starts(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, StrView { ptr: (c"Span$"), len: (5) as i64 }) == 1
         through_member(@t.field, e, root, StrView { ptr: (c"ptr"), len: (3) as i64 })
     else
         through_member(@t.field, e, root, StrView { ptr: (c"data"), len: (4) as i64 })
-    if through_is_string(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }) == 1
+    if through_is_string(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
         through_member(@t.bytes, e, @t.field, StrView { ptr: (c"data"), len: (4) as i64 })
         buffer = @t.bytes
     t.sum.kind = EXPR_BINARY
@@ -361,7 +350,7 @@ pub fn index_through_fill(s: *EmitterState, e: *Expr, loc: *LocalVar, t: *Throug
     # for the `+` and the buffer, and a Vec for a String's `.data`.
     expr_note_sema_ty(@t.sum, TYPE_PTR)
     expr_note_sema_ty(@t.deref, through_elem_kind(s, loc))
-    if through_is_string(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }) == 1
+    if through_is_string(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
         expr_note_sema_ty(@t.field, TYPE_STRUCT)
         expr_note_sema_ty(@t.bytes, TYPE_PTR)
     else
@@ -370,8 +359,8 @@ pub fn index_through_fill(s: *EmitterState, e: *Expr, loc: *LocalVar, t: *Throug
 # The field of a Vec or Span that points at its elements, or null: a String's is
 # a Vec, so it has none here.
 fn through_buffer(s: *EmitterState, loc: *LocalVar) -> *StructField
-    let st: *StructDef = find_struct(s, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
-    if st == null or through_is_string(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }) == 1
+    let st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+    if st == null or through_is_string(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
         return null
     var idx: i32 = find_field_index(st, StrView { ptr: (c"data"), len: (4) as i64 })
     if idx < 0
@@ -382,9 +371,9 @@ fn through_buffer(s: *EmitterState, loc: *LocalVar) -> *StructField
 
 # The kind of an element of `loc`, which sees through, for the slot checks.
 pub fn through_elem_kind(s: *EmitterState, loc: *LocalVar) -> i32
-    if loc.array_view == 1
-        return loc.pointee_type
-    if through_is_string(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }) == 1
+    if lv_is_array_view(loc) == 1
+        return lv_pointee_type(loc)
+    if through_is_string(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
         return TYPE_U8
     let f: *StructField = through_buffer(s, loc)
     if f == null
@@ -413,12 +402,12 @@ pub fn through_named_elem(s: *EmitterState, name_sv: StrView) -> i32
 fn through_elem_struct(s: *EmitterState, loc: *LocalVar, out_name: **u8, out_len: *i32) -> i32
     *out_name = null
     *out_len = 0
-    if loc.array_view == 1
+    if lv_is_array_view(loc) == 1
         # A struct T, named by the view's type_name, is held in the array.
-        if loc.pointee_type != TYPE_STRUCT
+        if lv_pointee_type(loc) != TYPE_STRUCT
             return TYPE_VOID
-        *out_name = loc.type_name
-        *out_len = loc.type_name_len
+        *out_name = lv_type_name(loc)
+        *out_len = lv_type_name_len(loc)
         return TYPE_PTR
     let f: *StructField = through_buffer(s, loc)
     if f == null or f.field_type_name_len <= 0 or find_struct(s, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == null

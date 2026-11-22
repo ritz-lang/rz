@@ -677,104 +677,539 @@ pub fn tagged_enum_arg_in(structs: *HashMapI64, m: *Module, name_sv: StrView, va
 # an `@*U` / `@&*U` binding's pointee -- are gone; Sema keeps them on
 # ref_check's RsNote (caller_place, ptr_pointee).
 
+# AGAST #4528: an emitter array view.  A non-null `LocalVar.view` marks one:
+# the `p#` / `#k` binding that shares a slot holding a `[N]T`'s address.
+# `base` is the place an unscoped view (base_array_view) reads; null for a
+# view a binding owns.
+struct ArrayView
+    base: *Expr
+
+# AGAST #4035/#4528: the emitter's record of a local is its name, its slot and
+# its `*TypeRef`; only the binding-mode/refinement state lowering mutates is
+# kept beside them.  Every type fact is answered from the chain by the `lv_*`
+# getters below, which are the LocalVar form of the `tr_*` accessors
+# (types.ritz / ast_helpers.ritz).
 struct LocalVar
     name: *u8
     name_len: i32
     reg: i32
-    var_type: i32
-    type_name: *u8       # Struct name when var_type == TYPE_STRUCT
-    type_name_len: i32
-    pointee_type: i32    # Element type for pointers (e.g., TYPE_U8 for *u8)
-    array_size: i32      # Array size when var_type == TYPE_ARRAY
-    array_elem_type: i32 # Element type when var_type == TYPE_ARRAY
+    # The local's type: built from the flat facts add_local_full receives.
+    # 17 flat facts lived here until #4528; tr_*/lv_* answer them now.
+    ty: *TypeRef
     # AGAST #1521: 1 for a local declared `: bool`. emit_var_decl stores bools
-    # in an i64 slot and records var_type TYPE_I64, so this is the only place
-    # that remembers the declared type (print interpolation prints a bool as
-    # true/false).
+    # in an i64 slot, so the chain alone cannot say (its kind is TYPE_I64).
     is_bool: i32
-    # AGAST #2341: T for a local `[N]*T`; TYPE_VOID otherwise.
-    array_elem_pointee: i32
-    # AGAST #2342: 1 for an unannotated `let x = init` whose init bool_kind can't
-    # type.  var_type then says nothing: the parser defaulted it to TYPE_I64.
-    bk_unsure: i32
-    # AGAST #4280: 1 for a pattern binding bool_note_binding knows is a pointer
-    # (`Some(p)` of an `Option<*T>`): its slot is an i64, so var_type can't say.
-    # bk_unsure stays 1 for it, as the checks reading that flag expect.
-    bk_ptr: i32
-    # AGAST #1671: signature of a `fn(...) -> T`-typed local or param (null
-    # otherwise); emit_call uses it for `call <ret> %f(<params>)`.
-    fn_sig: *FnDef
-    # AGAST #1815: innermost pointee of a `**T` local/param (TYPE_U8 for
-    # `**u8`); TYPE_VOID otherwise.  pointee_type is TYPE_PTR for every **T.
-    inner_pointee_type: i32
-    # AGAST #2028: 1 for a `let` binding (set by emit_stmt from
-    # Stmt.var_is_let).  add_local_full clears it, so a `var`, param, range loop
-    # or match binding that shadows a `let` is mutable.  A `for x in <iterable>`
-    # binding is a `let`, as in ritz0 (AGAST #2389).  See let_check.ritz.
+    # AGAST #2342/#4280 refinement bits, see LV_BK_*.
+    bk: i32
+    # AGAST #2028: 1 for a `let` binding (set by emit_stmt from Stmt.var_is_let).
+    # add_local_full clears it, so a `var`, param, range loop or match binding
+    # that shadows a `let` is mutable.  See let_check.ritz.
     is_let: i32
-    # AGAST #2399: Param.param_inner_ref / Stmt.var_inner_ref.
-    inner_ref: i32
-    # AGAST #1953: for a `*[N]T` local or param (pointee_type == TYPE_ARRAY),
-    # N and T; 0 / TYPE_VOID otherwise.  A struct T is named by type_name.
-    # Read by emit_array_field_copy_from for `x.f = *src`.
-    pointee_array_size: i32
-    pointee_array_elem_type: i32
-    pointee_array_elem_pointee: i32   # AGAST #2343: U for `*[N]*U`
-    # AGAST #2543: S for a `*[N]S` / `**[N]S` local, and (#2548) a `*[N]S`,
-    # `@[N]S` or `@&[N]S` param.  Not type_name: that makes `p.f` and `(*r).f` a
-    # `*S`'s field.  And (#2553) a `**[N]S` param.
-    pointee_array_elem_name: *u8
-    pointee_array_elem_name_len: i32
-    # AGAST #1509: every dimension of a `var g: [N][M]..T` local (array_size
-    # and array_elem_type then hold N and TYPE_ARRAY); null otherwise.
-    array_shape: *ArrayShape
-    # AGAST #2570: for a pointer to a plane of an N-D array (an inferred
-    # `let q = @x[i]` leaving `[M][N]..T`, or a copy of one), that
-    # `[M][N]..T`; null otherwise.  pointee_array_size holds the flat count
-    # M*N.., so `q + k` strides whole planes; nd_index_shape reads this one,
-    # so `q[i][j]` is one GEP over it from q's value (emit_nd_index_ptr).
-    pointee_array_shape: *ArrayShape
-    # AGAST #2995: what a `var a: [N]T` local's element is (Stmt.var_array); null
-    # otherwise.  Its ptr_array says what a `*[M]T` element points at.
-    array_rec: *ArrayElem
-    # AGAST #2250: 1 for a `name:& T` param whose T is an integer, a struct or
-    # an array (#2279), which ritz0's `_borrow_referent_slot` covers.  `@&T`
-    # params stay 0.  add_local_full clears it: the next function reuses these
-    # entries.
-    # An integer T binds as a plain T local (bind_scalar_borrow_param), as a
-    # bool or float T does without is_lent (#2994, #1668), and any other T
-    # reads as the pointer, so the slot a value goes to decides what to
-    # do; see emit_lent_referent and lent_array_local.
-    is_lent: i32
-    # AGAST #2286: 1 for a `:&` param whose slot holds the borrow's pointer, so
-    # the place `@x` names is behind that pointer, not the slot.  Not is_lent:
-    # that covers an integer, whose slot IS the caller's variable, and leaves
-    # out `:& f64`, `:& bool` and `:& **C`.  `p:& *T` stays 0 as well: its slot
-    # is the caller's pointer variable.  See mark_lent_param.
-    holds_lent_ptr: i32
-    # AGAST #2278: 1 for a `self:& T` / bare `self:&` receiver whose T is a
-    # struct (Param.is_self_borrow).  Not is_lent, which would change every read
-    # of `self`: only emit_lent_referent's by-value slots read the referent.
-    # In an impl it's a `*T` local (an i64 value); in a free fn a `:&` one.
-    is_lent_self: i32
-    # AGAST #2407: 1 when the binding certainly holds no fn value (a typed one
-    # that isn't a fn type or pointer, or one bound to a literal), so a call
-    # of its name is an error, not a jump.  0 when it may hold one: ritz1
-    # types an untyped `let h = t.h` as an i64.
+    # AGAST #2250/#2286/#2278 binding-mode bits, see LV_LENT_*.
+    lent: i32
+    # AGAST #2407: 1 when the binding certainly holds no fn value.
     not_fn: i32
-    # AGAST #2330: 1 for the `*T` view of a `*[N]T`, `@[N]T` or `@&[N]T` local `p`,
-    # named `p#`.  It shares p's slot, which holds the address of element 0, so
-    # `p[i]` is `*(p# + i)`: element i at stride T in every position (LARB R9).
-    # See add_array_view and index_through.
-    array_view: i32
-    # AGAST #2329: for the view index_through makes of a base that isn't a local,
-    # `h.r`, `g` or `h(p)`, that base; null otherwise.  It's in no scope: an
-    # emitting site has through_spill bind it, the type-only ones read it as is.
-    array_base: *Expr
-    # AGAST #3579: 1 for an unannotated `let v = "..."` / `var v = "..."`.  ritz1
-    # lowers it to a `%Span$u8` (type_name), but it is a StrView value: only the
-    # literal itself fits a `Span<u8>` slot (#3441).  See another_struct_source.
+    # AGAST #2330/#2329: non-null for an array view (p# / #k); see ArrayView.
+    view: *ArrayView
+    # AGAST #3579: 1 for an unannotated `let v = "..."` / `var v = "..."`.
     str_view: i32
+
+# AGAST #4280: bk bits.
+const LV_BK_UNSURE: i32 = 1
+const LV_BK_PTR: i32 = 2
+# AGAST #2250/#2286/#2278: lent bits.
+const LV_LENT: i32 = 1
+const LV_LENT_HOLDS_PTR: i32 = 2
+const LV_LENT_SELF: i32 = 4
+
+pub fn lv_bk_unsure(v: *LocalVar) -> i32
+    ((v.bk & LV_BK_UNSURE) != 0) as i32
+
+pub fn lv_bk_ptr(v: *LocalVar) -> i32
+    ((v.bk & LV_BK_PTR) != 0) as i32
+
+pub fn lv_set_bk_unsure(v: *LocalVar, x: i32)
+    if x != 0
+        v.bk = v.bk | LV_BK_UNSURE
+    else
+        v.bk = v.bk & (0 - 1 - LV_BK_UNSURE)
+
+pub fn lv_set_bk_ptr(v: *LocalVar, x: i32)
+    if x != 0
+        v.bk = v.bk | LV_BK_PTR
+    else
+        v.bk = v.bk & (0 - 1 - LV_BK_PTR)
+
+pub fn lv_is_lent(v: *LocalVar) -> i32
+    ((v.lent & LV_LENT) != 0) as i32
+
+pub fn lv_holds_lent_ptr(v: *LocalVar) -> i32
+    ((v.lent & LV_LENT_HOLDS_PTR) != 0) as i32
+
+pub fn lv_is_lent_self(v: *LocalVar) -> i32
+    ((v.lent & LV_LENT_SELF) != 0) as i32
+
+pub fn lv_set_is_lent(v: *LocalVar, x: i32)
+    if x != 0
+        v.lent = v.lent | LV_LENT
+    else
+        v.lent = v.lent & (0 - 1 - LV_LENT)
+
+pub fn lv_set_holds_lent_ptr(v: *LocalVar, x: i32)
+    if x != 0
+        v.lent = v.lent | LV_LENT_HOLDS_PTR
+    else
+        v.lent = v.lent & (0 - 1 - LV_LENT_HOLDS_PTR)
+
+pub fn lv_set_is_lent_self(v: *LocalVar, x: i32)
+    if x != 0
+        v.lent = v.lent | LV_LENT_SELF
+    else
+        v.lent = v.lent & (0 - 1 - LV_LENT_SELF)
+
+# =============================================================================
+# The LocalVar type facts, answered from `ty` (AGAST #4528)
+# =============================================================================
+
+fn lv_tyref(kind: i32) -> *TypeRef
+    let t: *TypeRef = malloc(sizeof(TypeRef)) as *TypeRef
+    memset(t as *u8, 0, sizeof(TypeRef))
+    t.kind = kind
+    t.ref_inner = TYPE_VOID
+    return t
+
+# 1 for a kind a pointer chain continues through.
+fn lv_is_ptr_kind(k: i32) -> i32
+    (k == TYPE_PTR or k == TYPE_PTR_PTR or k == TYPE_REF or k == TYPE_MUT_REF) as i32
+
+# The name the just-built array element `e` carries, from a flat type name.
+# A `[N]S` names S on the element; a `[N]*S` / `[N]@S` names it on the
+# pointee, which is what tr_elem_name reads.
+fn lv_name_into_elem(e: *TypeRef, name: *u8, name_len: i32)
+    if e == null or name == null or name_len <= 0
+        return
+    if e.kind == TYPE_STRUCT
+        e.name = name
+        e.name_len = name_len
+        return
+    if lv_is_ptr_kind(e.kind) == 1
+        if e.pointee == null
+            e.pointee = lv_tyref(TYPE_STRUCT)
+        e.pointee.name = name
+        e.pointee.name_len = name_len
+        return
+    e.name = name
+    e.name_len = name_len
+
+# Build the chain an add_local_full's flat arguments describe.  Depth is kept
+# at the two levels the flat model had (`**T` is PTR_PTR -> PTR), so
+# tr_ptr_ptr_inner_pointee reads the leaf kind exactly as the flat field did.
+pub fn lv_ty_from_flat(var_type: i32, type_name_sv: StrView, pointee: i32, arr_size: i32, arr_elem: i32) -> *TypeRef
+    var name: *u8 = type_name_sv.ptr
+    var name_len: i32 = type_name_sv.len as i32
+    let t: *TypeRef = lv_tyref(var_type)
+    # AGAST #4528: the flat type_name is carried on the top node, whatever its
+    # kind.  It is a fact the flat model kept even when the kind was the
+    # parser's default (a generic's `V` at `*E` names E but has pointee I64),
+    # and the checks read it as such.
+    t.name = name
+    t.name_len = name_len
+    if var_type == TYPE_ARRAY
+        t.count = arr_size as i64
+        t.elem = lv_tyref(arr_elem)
+        # The flat pointee_type of an array local: TYPE_I64 for a plain
+        # `[N]T`, TYPE_ARRAY for a `a:& [N]T` borrow bound as an array local.
+        # The whole-array lowering reads it (`array_ptr_local`, #2305).
+        t.pointee = lv_tyref(pointee)
+        return t
+    if lv_is_ptr_kind(var_type) == 1
+        t.pointee = lv_tyref(pointee)
+        if var_type == TYPE_REF or var_type == TYPE_MUT_REF
+            t.ref_inner = pointee
+        if var_type == TYPE_PTR_PTR and pointee == TYPE_PTR
+            t.pointee.pointee = lv_tyref(TYPE_VOID)
+        else if (var_type == TYPE_REF or var_type == TYPE_MUT_REF) and pointee == TYPE_PTR
+            t.pointee.pointee = lv_tyref(TYPE_VOID)
+        else if pointee == TYPE_ARRAY
+            t.pointee.elem = lv_tyref(TYPE_VOID)
+        return t
+    return t
+
+# The LocalVar add_local_full makes, and the image ref_check builds for a Sema
+# binding (AGAST #4391).  Clears every field, then records the name and type.
+pub fn lv_loc_init(loc: *LocalVar, name_sv: StrView, var_type: i32, type_name_sv: StrView, pointee: i32, arr_size: i32, arr_elem: i32)
+    memset(loc as *u8, 0, sizeof(LocalVar))
+    loc.name = name_sv.ptr
+    loc.name_len = name_sv.len as i32
+    loc.ty = lv_ty_from_flat(var_type, type_name_sv, pointee, arr_size, arr_elem)
+
+# The flat kind of the local (was LocalVar.var_type).
+pub fn lv_var_type(v: *LocalVar) -> i32
+    tr_flat(v.ty)
+
+# The local's own array node (a by-value `[N]T`), null otherwise.
+fn lv_own_array(v: *LocalVar) -> *TypeRef
+    if v.ty != null and v.ty.kind == TYPE_ARRAY
+        return v.ty
+    null
+
+pub fn lv_array_size(v: *LocalVar) -> i32
+    let a: *TypeRef = lv_own_array(v)
+    if a == null
+        return 0
+    tr_count(a) as i32
+
+pub fn lv_array_elem_type(v: *LocalVar) -> i32
+    let a: *TypeRef = lv_own_array(v)
+    if a == null
+        return TYPE_VOID
+    tr_elem_kind(a)
+
+pub fn lv_array_elem_pointee(v: *LocalVar) -> i32
+    let a: *TypeRef = lv_own_array(v)
+    if a == null
+        return TYPE_VOID
+    tr_elem_pointee(a)
+
+pub fn lv_array_shape(v: *LocalVar) -> *ArrayShape
+    let a: *TypeRef = lv_own_array(v)
+    if a == null
+        return null
+    tr_shape(a)
+
+pub fn lv_array_rec(v: *LocalVar) -> *ArrayElem
+    let a: *TypeRef = lv_own_array(v)
+    if a == null
+        return null
+    a.array_rec
+
+# The name / length the flat type_name(_len) pair held: the top node's name.
+pub fn lv_name(v: *LocalVar, out_len: *i32) -> *u8
+    if v.ty == null
+        *out_len = 0
+        return null
+    *out_len = v.ty.name_len
+    v.ty.name
+
+pub fn lv_name_len(v: *LocalVar) -> i32
+    if v.ty == null
+        return 0
+    v.ty.name_len
+
+# The pointer-only forms, for the many sites that read name and length as a
+# pair without an out-parameter.
+pub fn lv_type_name(v: *LocalVar) -> *u8
+    if v.ty == null
+        return null
+    v.ty.name
+
+pub fn lv_type_name_len(v: *LocalVar) -> i32
+    lv_name_len(v)
+
+pub fn lv_pointee_array_elem_name0(v: *LocalVar) -> *u8
+    var l: i32 = 0
+    lv_pointee_array_elem_name(v, @l)
+
+pub fn lv_pointee_array_elem_name_len(v: *LocalVar) -> i32
+    var l: i32 = 0
+    lv_pointee_array_elem_name(v, @l)
+    l
+
+pub fn lv_pointee_type(v: *LocalVar) -> i32
+    if v.ty == null
+        return TYPE_VOID
+    # A reference records its referent's flat kind in ref_inner (`@T` -> T,
+    # `@*T` -> TYPE_PTR); the flat pointee_type was that value.  A pointer's
+    # is its immediate pointee.
+    if v.ty.kind == TYPE_REF or v.ty.kind == TYPE_MUT_REF
+        return tr_ref_inner(v.ty)
+    tr_pointee_kind(v.ty)
+
+pub fn lv_inner_pointee_type(v: *LocalVar) -> i32
+    tr_var_inner_pointee(v.ty)
+
+pub fn lv_inner_ref(v: *LocalVar) -> i32
+    tr_inner_ref(v.ty)
+
+# The fn signature of the local's type (was LocalVar.fn_sig).
+pub fn lv_fn_sig(v: *LocalVar) -> *FnDef
+    var t: *TypeRef = v.ty
+    while t != null
+        if t.fn_sig != null
+            return t.fn_sig
+        if t.elem != null
+            t = t.elem
+        else
+            t = t.pointee
+    null
+
+# The `[N]T` a pointer / reference names (`*[N]T`, `**[N]T`, `@*[N]T`,
+# `@[N]T`), or null.  The flat pointee_array_* facts described this node.
+fn lv_pa_node(v: *LocalVar, create: i32) -> *TypeRef
+    let t: *TypeRef = v.ty
+    if t == null
+        return null
+    # A by-value array local records its flat pointee_type too: a `:& [N]T`
+    # borrow is bound as an array local whose pointee is the array (#2305).
+    if t.kind == TYPE_ARRAY
+        if t.pointee != null and t.pointee.kind == TYPE_ARRAY
+            return t.pointee
+        return null
+    if t.kind == TYPE_PTR
+        if t.pointee == null
+            if create == 0
+                return null
+            t.pointee = lv_tyref(TYPE_ARRAY)
+        if t.pointee.kind == TYPE_ARRAY
+            return t.pointee
+        return null
+    if t.kind == TYPE_PTR_PTR
+        if t.pointee == null
+            if create == 0
+                return null
+            t.pointee = lv_tyref(TYPE_PTR)
+        if t.pointee.kind == TYPE_PTR
+            if t.pointee.pointee == null
+                if create == 0
+                    return null
+                t.pointee.pointee = lv_tyref(TYPE_ARRAY)
+            if t.pointee.pointee.kind == TYPE_ARRAY
+                return t.pointee.pointee
+        return null
+    if t.kind == TYPE_REF or t.kind == TYPE_MUT_REF
+        if t.pointee != null and t.pointee.kind == TYPE_ARRAY
+            return t.pointee
+        if t.ref_inner == TYPE_PTR
+            if t.pointee == null
+                if create == 0
+                    return null
+                t.pointee = lv_tyref(TYPE_PTR)
+            if t.pointee.kind == TYPE_PTR
+                if t.pointee.pointee == null
+                    if create == 0
+                        return null
+                    t.pointee.pointee = lv_tyref(TYPE_ARRAY)
+                if t.pointee.pointee.kind == TYPE_ARRAY
+                    return t.pointee.pointee
+        return null
+    null
+
+pub fn lv_pointee_array_size(v: *LocalVar) -> i32
+    let a: *TypeRef = lv_pa_node(v, 0)
+    if a == null
+        return 0
+    tr_count(a) as i32
+
+pub fn lv_pointee_array_elem_type(v: *LocalVar) -> i32
+    let a: *TypeRef = lv_pa_node(v, 0)
+    if a == null
+        return TYPE_VOID
+    tr_elem_kind(a)
+
+pub fn lv_pointee_array_elem_pointee(v: *LocalVar) -> i32
+    let a: *TypeRef = lv_pa_node(v, 0)
+    if a == null
+        return TYPE_VOID
+    tr_elem_pointee(a)
+
+pub fn lv_pointee_array_elem_name(v: *LocalVar, out_len: *i32) -> *u8
+    let a: *TypeRef = lv_pa_node(v, 0)
+    if a == null
+        *out_len = 0
+        return null
+    tr_elem_name(a, out_len)
+
+pub fn lv_pointee_array_shape(v: *LocalVar) -> *ArrayShape
+    let a: *TypeRef = lv_pa_node(v, 0)
+    if a == null
+        return null
+    tr_shape(a)
+
+# =============================================================================
+# The setters lowering uses where it used to assign a flat field (AGAST #4528)
+# =============================================================================
+
+pub fn lv_set_var_type(v: *LocalVar, k: i32)
+    if v.ty == null
+        v.ty = lv_tyref(k)
+    else
+        v.ty.kind = k
+
+# Set the name tr_name answers: the first struct node, else the deepest node's.
+pub fn lv_set_type_name(v: *LocalVar, name: *u8, name_len: i32)
+    if v.ty == null
+        return
+    v.ty.name = name
+    v.ty.name_len = name_len
+
+pub fn lv_set_pointee_type(v: *LocalVar, k: i32)
+    if v.ty == null
+        v.ty = lv_tyref(TYPE_PTR)
+    if v.ty.pointee == null
+        v.ty.pointee = lv_tyref(k)
+    else
+        v.ty.pointee.kind = k
+    if v.ty.kind == TYPE_REF or v.ty.kind == TYPE_MUT_REF
+        v.ty.ref_inner = k
+
+pub fn lv_set_array_size(v: *LocalVar, n: i32)
+    let a: *TypeRef = lv_own_array(v)
+    if a != null
+        a.count = n as i64
+
+pub fn lv_set_array_elem_type(v: *LocalVar, k: i32)
+    let a: *TypeRef = lv_own_array(v)
+    if a == null
+        return
+    if a.elem == null
+        a.elem = lv_tyref(k)
+    else
+        a.elem.kind = k
+
+# E for `[N]*E` and its kin: the element's pointee fact tr_elem_pointee reads.
+pub fn lv_set_array_elem_pointee(v: *LocalVar, k: i32)
+    let a: *TypeRef = lv_own_array(v)
+    if a == null or a.elem == null
+        return
+    let e: *TypeRef = a.elem
+    if e.kind == TYPE_PTR
+        if e.pointee == null
+            e.pointee = lv_tyref(k)
+        else
+            e.pointee.kind = k
+    else if e.kind == TYPE_PTR_PTR
+        if e.pointee == null
+            e.pointee = lv_tyref(TYPE_PTR)
+        if e.pointee.pointee == null
+            e.pointee.pointee = lv_tyref(k)
+        else
+            e.pointee.pointee.kind = k
+    else if e.kind == TYPE_REF or e.kind == TYPE_MUT_REF
+        e.ref_inner = k
+
+pub fn lv_set_array_shape(v: *LocalVar, sh: *ArrayShape)
+    let a: *TypeRef = lv_own_array(v)
+    if a != null
+        a.shape = sh
+
+pub fn lv_set_array_rec(v: *LocalVar, rec: *ArrayElem)
+    let a: *TypeRef = lv_own_array(v)
+    if a != null
+        a.array_rec = rec
+
+# The innermost pointee of a `**T` (the flat inner_pointee_type).  The chain
+# is kept at two pointer levels, so the leaf kind is exactly the flat value.
+pub fn lv_set_inner_pointee_type(v: *LocalVar, k: i32)
+    if v.ty == null
+        return
+    var slot: *TypeRef = v.ty
+    if slot.kind == TYPE_REF or slot.kind == TYPE_MUT_REF
+        # `@*T` / `@&*T` records T as a `**T` does: it is the pointee of the
+        # pointer the reference wraps (tr_pointee_kind(ty.pointee)).
+        if slot.ref_inner == TYPE_PTR
+            if slot.pointee == null
+                slot.pointee = lv_tyref(TYPE_PTR)
+            if slot.pointee.pointee == null
+                slot.pointee.pointee = lv_tyref(k)
+            else
+                slot.pointee.pointee.kind = k
+            return
+        if slot.ref_inner == TYPE_PTR_PTR
+            slot = slot.pointee
+        else
+            return
+    if slot == null or slot.kind != TYPE_PTR_PTR
+        return
+    # The flat inner_pointee_type is independent of the flat pointee_type, and
+    # an inferred copy (`let z = p`, p: ***C) left the latter at its parser
+    # default.  The chain needs the PTR level for tr_ptr_ptr_inner_pointee to
+    # read the leaf back, so make it here.
+    if slot.pointee == null
+        slot.pointee = lv_tyref(TYPE_PTR)
+    else if slot.pointee.kind != TYPE_PTR
+        slot.pointee.kind = TYPE_PTR
+    if slot.pointee.pointee == null
+        slot.pointee.pointee = lv_tyref(k)
+    else
+        slot.pointee.pointee.kind = k
+
+pub fn lv_set_inner_ref(v: *LocalVar, r: i32)
+    if v.ty != null
+        v.ty.inner_ref = r
+
+pub fn lv_set_fn_sig(v: *LocalVar, sig: *FnDef)
+    if v.ty != null
+        v.ty.fn_sig = sig
+
+# Ensure the `[N]T` node the pointee_array_* facts describe exists.
+fn lv_pa_ensure(v: *LocalVar) -> *TypeRef
+    let a: *TypeRef = lv_pa_node(v, 1)
+    if a != null and a.elem == null
+        a.elem = lv_tyref(TYPE_VOID)
+    a
+
+pub fn lv_set_pointee_array_size(v: *LocalVar, n: i32)
+    let a: *TypeRef = lv_pa_ensure(v)
+    if a != null
+        a.count = n as i64
+
+pub fn lv_set_pointee_array_elem_type(v: *LocalVar, k: i32)
+    let a: *TypeRef = lv_pa_ensure(v)
+    if a == null
+        return
+    if a.elem == null
+        a.elem = lv_tyref(k)
+    else
+        a.elem.kind = k
+
+pub fn lv_set_pointee_array_elem_pointee(v: *LocalVar, k: i32)
+    let a: *TypeRef = lv_pa_ensure(v)
+    if a == null or a.elem == null
+        return
+    let e: *TypeRef = a.elem
+    if e.kind == TYPE_PTR
+        if e.pointee == null
+            e.pointee = lv_tyref(k)
+        else
+            e.pointee.kind = k
+    else if e.kind == TYPE_PTR_PTR
+        if e.pointee == null
+            e.pointee = lv_tyref(TYPE_PTR)
+        if e.pointee.pointee == null
+            e.pointee.pointee = lv_tyref(k)
+        else
+            e.pointee.pointee.kind = k
+    else if e.kind == TYPE_REF or e.kind == TYPE_MUT_REF
+        e.ref_inner = k
+
+pub fn lv_set_pointee_array_elem_name(v: *LocalVar, name: *u8, name_len: i32)
+    let a: *TypeRef = lv_pa_ensure(v)
+    if a == null or a.elem == null
+        return
+    lv_name_into_elem(a.elem, name, name_len)
+
+pub fn lv_set_pointee_array_shape(v: *LocalVar, sh: *ArrayShape)
+    let a: *TypeRef = lv_pa_ensure(v)
+    if a != null
+        a.shape = sh
+
+# AGAST #2330/#2329: the view flag and base (was array_view / array_base).
+pub fn lv_is_array_view(v: *LocalVar) -> i32
+    (v.view != null) as i32
+
+pub fn lv_array_base(v: *LocalVar) -> *Expr
+    if v.view == null
+        return null
+    v.view.base
+
+pub fn lv_set_array_view(v: *LocalVar, base: *Expr)
+    if v.view == null
+        v.view = malloc(sizeof(ArrayView)) as *ArrayView
+        v.view.base = null
+    v.view.base = base
+
+pub fn lv_mark_array_view(v: *LocalVar)
+    lv_set_array_view(v, null)
 
 # AGAST #2242 — a path a binding's value can be moved out along: a move-only
 # field of it, or of a field of it that can itself be partly moved.  A path's
@@ -843,11 +1278,12 @@ pub fn is_borrow_scalar_kind(t: i32) -> i32
 # #2548: every reader of a `*[N]S`'s element name asks here, not type_name, which
 # a `*[N]S` or `**[N]S` local or param leaves empty (#2553).
 pub fn array_ptr_elem_name(loc: *LocalVar, out_len: *i32) -> *u8
-    if loc.pointee_array_elem_name_len > 0
-        *out_len = loc.pointee_array_elem_name_len
-        return loc.pointee_array_elem_name
-    *out_len = loc.type_name_len
-    loc.type_name
+    var plen: i32 = 0
+    let pn: *u8 = lv_pointee_array_elem_name(loc, @plen)
+    if plen > 0
+        *out_len = plen
+        return pn
+    lv_name(loc, out_len)
 
 # =========================================================================
 # The variant-constructor queries (AGAST #4391; moved from emitter_core).
@@ -1085,12 +1521,12 @@ pub fn name_array_ptr_param_loc(loc: *LocalVar, param: *Param)
         let ref_ptr: bool = (param.param_type == TYPE_REF or param.param_type == TYPE_MUT_REF) and param.param_pointee_type == TYPE_PTR
         if ref_ptr == false and (param.param_type != TYPE_PTR_PTR or param.param_inner_pointee_type != TYPE_ARRAY)
             return
-    if loc == null or loc.type_name_len <= 0
+    if loc == null or lv_name_len(loc) <= 0
         return
-    loc.pointee_array_elem_name = loc.type_name
-    loc.pointee_array_elem_name_len = loc.type_name_len
-    loc.type_name = null
-    loc.type_name_len = 0
+    var tn_len: i32 = 0
+    let tn: *u8 = lv_name(loc, @tn_len)
+    lv_set_pointee_array_elem_name(loc, tn, tn_len)
+    lv_set_type_name(loc, null, 0)
 
 # AGAST #3074: 1 when the array behind `stmt`'s local holds S or `*S`.
 pub fn names_array_elem_struct(stmt: *Stmt) -> i32
@@ -1112,32 +1548,32 @@ pub fn names_array_elem_struct(stmt: *Stmt) -> i32
 pub fn name_array_ptr_local(loc: *LocalVar, stmt: *Stmt, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let deep_ptr: bool = ref_to_ptr(loc) == 1 or loc.var_type == TYPE_PTR_PTR
-    if loc.type_name_len > 0 and deep_ptr and names_array_elem_struct(stmt) == 1
-        loc.pointee_array_elem_name = loc.type_name
-        loc.pointee_array_elem_name_len = loc.type_name_len
-        loc.type_name = null
-        loc.type_name_len = 0
+    let deep_ptr: bool = ref_to_ptr(loc) == 1 or lv_var_type(loc) == TYPE_PTR_PTR
+    if lv_name_len(loc) > 0 and deep_ptr and names_array_elem_struct(stmt) == 1
+        var dn: i32 = 0
+        let dname: *u8 = lv_name(loc, @dn)
+        lv_set_pointee_array_elem_name(loc, dname, dn)
+        lv_set_type_name(loc, null, 0)
         return
-    if loc.type_name_len > 0 or name == null or len <= 0
+    if lv_name_len(loc) > 0 or name == null or len <= 0
         return
     if stmt.var_pointee_array_size <= 0 or stmt.var_pointee_array_elem_type != TYPE_STRUCT
         return
-    let t: i32 = loc.var_type
+    let t: i32 = lv_var_type(loc)
     let one: bool = (t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF) and stmt.var_pointee_type == TYPE_ARRAY
     # AGAST #3079: an `@*[N]S` / `@&*[N]S` (`let r = @q`) is as deep as a `**[N]S`.
     let deep: bool = t == TYPE_PTR_PTR or ((t == TYPE_REF or t == TYPE_MUT_REF) and stmt.var_pointee_type == TYPE_PTR)
     let two: bool = deep and stmt.var_inner_pointee_type == TYPE_ARRAY
     if one or two
-        loc.pointee_array_elem_name = name
-        loc.pointee_array_elem_name_len = len
+        lv_set_pointee_array_elem_name(loc, name, len)
 
 # AGAST #2331: 1 for an `@*T` or `@&*T` local.  It records N and U when T is
 # `[N]U`: `*r` reads that `*[N]U`, as it does through a `**[N]U`.
 pub fn ref_to_ptr(loc: *LocalVar) -> i32
-    if loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+    let t: i32 = lv_var_type(loc)
+    if t != TYPE_REF and t != TYPE_MUT_REF
         return 0
-    (loc.pointee_type == TYPE_PTR) as i32
+    (lv_pointee_type(loc) == TYPE_PTR) as i32
 
 # AGAST #2403: pointers between a `self` param and its struct, as
 # local_struct_levels counts a local's: 2 for `**S` and `@*S`.

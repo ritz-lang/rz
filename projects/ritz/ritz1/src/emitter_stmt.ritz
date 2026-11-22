@@ -99,27 +99,27 @@ fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     if init.operand == null or init.operand.kind != EXPR_IDENT
         return 0
     let src: *LocalVar = find_local_struct_name(s, StrView { ptr: (init.operand.ident_ptr), len: (init.operand.ident_len) as i64 })
-    if src != null and src.pointee_array_shape != null
+    if src != null and lv_pointee_array_shape(src) != null
         # AGAST #2570: `let rr = @q`, q a plane pointer.  A `**` keeps N and T
         # only, so `(*rr)[i]` would read a flat element where ritz0 reads a row.
         emit_nd_error(s, stmt.span.line, stmt.span.col, c"a multi-dimensional array type is not supported as the pointee of an inferred binding in ritz1 (this `@` takes the address of a pointer to a plane of an N-D array: index it, `q[i][j]`, or copy it, `let r = q`)")
         return 0
-    if src == null or (src.var_type != TYPE_PTR and src.var_type != TYPE_PTR_PTR)
+    if src == null or (lv_var_type(src) != TYPE_PTR and lv_var_type(src) != TYPE_PTR_PTR)
         return 0
-    if src.var_type == TYPE_PTR and src.pointee_type == TYPE_ARRAY
+    if lv_var_type(src) == TYPE_PTR and lv_pointee_type(src) == TYPE_ARRAY
         return infer_ref_to_array_pointer_let(dt, src)
-    if src.type_name_len > 0 and is_enum_type(StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 }) == 1
+    if lv_type_name_len(src) > 0 and is_enum_type(StrView { ptr: (lv_type_name(src)), len: (lv_type_name_len(src)) as i64 }) == 1
         return infer_ref_to_enum_pointer_let(dt, src)
-    if find_struct(s, StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 }) == null
+    if find_struct(s, StrView { ptr: (lv_type_name(src)), len: (lv_type_name_len(src)) as i64 }) == null
         return infer_ref_to_scalar_pointer_let(dt, src)
     dt.var_type = TYPE_REF
     if init.op == OP_ADDR_MUT
         dt.var_type = TYPE_MUT_REF
-    dt.var_type_name = src.type_name
-    dt.var_type_name_len = src.type_name_len
-    dt.var_pointee_type = src.var_type
-    dt.var_inner_pointee_type = src.inner_pointee_type
-    dt.var_inner_ref = src.inner_ref   # AGAST #2399: `@q` of a `*@S`
+    dt.var_type_name = lv_type_name(src)
+    dt.var_type_name_len = lv_type_name_len(src)
+    dt.var_pointee_type = lv_var_type(src)
+    dt.var_inner_pointee_type = lv_inner_pointee_type(src)
+    dt.var_inner_ref = lv_inner_ref(src)   # AGAST #2399: `@q` of a `*@S`
     1
 
 # AGAST #3114: `let w = *v` with `v` a `**S` local (typed, or a `Some(v)` over
@@ -153,21 +153,21 @@ fn ptr_arm_struct(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
         return ptr_arms_struct(s, e.args as *MatchArm, out_len)
     if e.kind == EXPR_IDENT
         let rl: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if rl == null or rl.var_type != TYPE_MUT_REF or rl.pointee_type != TYPE_STRUCT or rl.type_name_len == 0
+        if rl == null or lv_var_type(rl) != TYPE_MUT_REF or lv_pointee_type(rl) != TYPE_STRUCT or lv_type_name_len(rl) == 0
             return null
-        *out_len = rl.type_name_len
-        return rl.type_name
+        *out_len = lv_type_name_len(rl)
+        return lv_type_name(rl)
     if e.kind != EXPR_UNARY or e.op != OP_ADDR_MUT or e.operand == null
         return null
     let o: *Expr = e.operand
     if o.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (o.ident_ptr), len: (o.ident_len) as i64 })
-        if loc == null or loc.type_name_len == 0
+        if loc == null or lv_type_name_len(loc) == 0
             return null
-        if loc.var_type != TYPE_STRUCT and lent_struct_local(s, o) == null
+        if lv_var_type(loc) != TYPE_STRUCT and lent_struct_local(s, o) == null
             return null
-        *out_len = loc.type_name_len
-        return loc.type_name
+        *out_len = lv_type_name_len(loc)
+        return lv_type_name(loc)
     if o.kind == EXPR_MEMBER
         let f: *StructField = resolve_member_chain_field(s, o)
         if f == null or f.field_type != TYPE_STRUCT or f.field_type_name_len == 0
@@ -209,13 +209,13 @@ fn ptr_phi_let_struct(s: *EmitterState, init: *Expr, out_len: *i32) -> *u8
 # `let r: **T` / `***T` does, as #2376 types `let r = @a[i]`.  It was an i64,
 # so `**r` loaded and stored 8 bytes and `*r + 1` strode by one.
 fn infer_ref_to_scalar_pointer_let(dt: *DeclTy, src: *LocalVar) -> i32
-    var inner: i32 = src.pointee_type
-    if src.var_type == TYPE_PTR_PTR
-        inner = src.inner_pointee_type
+    var inner: i32 = lv_pointee_type(src)
+    if lv_var_type(src) == TYPE_PTR_PTR
+        inner = lv_inner_pointee_type(src)
     let leaf: i32 = inner % PTR_DEPTH_UNIT
-    if src.type_name_len != 0 or leaf < TYPE_I32 or leaf > TYPE_F64 or leaf == TYPE_PTR or leaf == TYPE_PTR_PTR
+    if lv_type_name_len(src) != 0 or leaf < TYPE_I32 or leaf > TYPE_F64 or leaf == TYPE_PTR or leaf == TYPE_PTR_PTR
         return 0
-    if src.var_type == TYPE_PTR_PTR
+    if lv_var_type(src) == TYPE_PTR_PTR
         inner = inner + PTR_DEPTH_UNIT
     dt.var_type = TYPE_PTR_PTR
     dt.var_pointee_type = TYPE_PTR
@@ -240,9 +240,9 @@ fn infer_ref_to_scalar_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     var pointee: i32 = TYPE_VOID
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (o.ident_ptr), len: (o.ident_len) as i64 })
     if loc != null
-        if loc.is_lent != 0 or loc.type_name_len != 0 or scalar_pointee(loc.var_type) == 0
+        if lv_is_lent(loc) != 0 or lv_type_name_len(loc) != 0 or scalar_pointee(lv_var_type(loc)) == 0
             return 0
-        pointee = loc.var_type
+        pointee = lv_var_type(loc)
     # AGAST #3129: `@g` of a scalar module-level global is the same `@T`.  It
     # stayed an i64: `*p = 1` through an `@` compiled, and through an `@&` of
     # an i32 / u8 it stored an i64 that clang refused.
@@ -265,14 +265,14 @@ fn scalar_pointee(t: i32) -> i32
 # `let r: **E` / `***E` does: the name, so `**r` loads and stores an %E.  It
 # was an i64: `**r = E.V` stored an i64 of a %E and clang refused it.
 fn infer_ref_to_enum_pointer_let(dt: *DeclTy, src: *LocalVar) -> i32
-    var inner: i32 = src.pointee_type
-    if src.var_type == TYPE_PTR_PTR
-        inner = src.inner_pointee_type + PTR_DEPTH_UNIT
+    var inner: i32 = lv_pointee_type(src)
+    if lv_var_type(src) == TYPE_PTR_PTR
+        inner = lv_inner_pointee_type(src) + PTR_DEPTH_UNIT
     dt.var_type = TYPE_PTR_PTR
     dt.var_pointee_type = TYPE_PTR
     dt.var_inner_pointee_type = inner
-    dt.var_type_name = src.type_name
-    dt.var_type_name_len = src.type_name_len
+    dt.var_type_name = lv_type_name(src)
+    dt.var_type_name_len = lv_type_name_len(src)
     1
 
 # AGAST #2539: `let r = @q` with `q: *[N]T` holds what `let r: **[N]T` does: a
@@ -280,13 +280,13 @@ fn infer_ref_to_enum_pointer_let(dt: *DeclTy, src: *LocalVar) -> i32
 # `*[N]T` again.  It was an i64: `p[1]` strode one byte, and a store crashed.
 # Checked before the struct arm: a `*[N]S` names S, and isn't a `*S`.
 fn infer_ref_to_array_pointer_let(dt: *DeclTy, src: *LocalVar) -> i32
-    if src.pointee_array_size <= 0
+    if lv_pointee_array_size(src) <= 0
         return 0
     dt.var_type = TYPE_PTR_PTR
     dt.var_pointee_type = TYPE_PTR
     dt.var_inner_pointee_type = TYPE_ARRAY
-    dt.var_pointee_array_size = src.pointee_array_size
-    dt.var_pointee_array_elem_type = src.pointee_array_elem_type
+    dt.var_pointee_array_size = lv_pointee_array_size(src)
+    dt.var_pointee_array_elem_type = lv_pointee_array_elem_type(src)
     1
 
 # AGAST #2539: the `**[N]T` local that `*e` reads a `*[N]T` out of, or null.
@@ -295,9 +295,9 @@ fn array_ptr_ptr_deref_base(s: *EmitterState, e: *Expr) -> *LocalVar
     if e == null or e.kind != EXPR_UNARY or e.op != OP_DEREF or e.operand == null or e.operand.kind != EXPR_IDENT
         return null
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
-    if loc == null or loc.pointee_array_size <= 0
+    if loc == null or lv_pointee_array_size(loc) <= 0
         return null
-    if ref_to_ptr(loc) == 0 and (loc.var_type != TYPE_PTR_PTR or loc.inner_pointee_type != TYPE_ARRAY)
+    if ref_to_ptr(loc) == 0 and (lv_var_type(loc) != TYPE_PTR_PTR or lv_inner_pointee_type(loc) != TYPE_ARRAY)
         return null
     loc
 
@@ -343,14 +343,14 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
         src = array_ptr_index_base(s, init.left)
     let pp: *LocalVar = array_ptr_ptr_deref_base(s, init)   # #2539: `let p = *r`
     if src != null
-        kind = src.var_type
-        size = src.pointee_array_size
-        elem = src.pointee_array_elem_type
-        dt.var_pointee_array_shape = src.pointee_array_shape   # #2570: a plane's copy
+        kind = lv_var_type(src)
+        size = lv_pointee_array_size(src)
+        elem = lv_pointee_array_elem_type(src)
+        dt.var_pointee_array_shape = lv_pointee_array_shape(src)   # #2570: a plane's copy
     else if pp != null
         kind = TYPE_PTR
-        size = pp.pointee_array_size
-        elem = pp.pointee_array_elem_type
+        size = lv_pointee_array_size(pp)
+        elem = lv_pointee_array_elem_type(pp)
     else if init.kind == EXPR_UNARY and (init.op == OP_ADDR or init.op == OP_ADDR_MUT) and init.operand != null
         let oper: *Expr = init.operand
         kind = TYPE_REF
@@ -378,9 +378,9 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
         else if oper.kind == EXPR_IDENT
             let arr: *LocalVar = find_local_struct_name(s, StrView { ptr: (oper.ident_ptr), len: (oper.ident_len) as i64 })
             if arr != null
-                if arr.var_type == TYPE_ARRAY
-                    size = arr.array_size
-                    elem = arr.array_elem_type
+                if lv_var_type(arr) == TYPE_ARRAY
+                    size = lv_array_size(arr)
+                    elem = lv_array_elem_type(arr)
             else
                 let garr: *GlobalVarDef = global_array_named(s, oper)
                 if garr != null
@@ -410,8 +410,8 @@ fn full_scalar_elem_type(s: *EmitterState, e: *Expr) -> i32
     else if e.left.kind == EXPR_IDENT
         let arr: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
         if arr != null
-            if arr.var_type == TYPE_ARRAY and arr.array_shape == null
-                leaf = arr.array_elem_type
+            if lv_var_type(arr) == TYPE_ARRAY and lv_array_shape(arr) == null
+                leaf = lv_array_elem_type(arr)
         else
             let garr: *GlobalVarDef = global_array_named(s, e.left)
             if garr != null and garr.array_shape == null
@@ -513,9 +513,9 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, out_len:
     else if oper.kind == EXPR_IDENT
         let arr: *LocalVar = find_local_struct_name(s, StrView { ptr: (oper.ident_ptr), len: (oper.ident_len) as i64 })
         if arr != null
-            if arr.var_type == TYPE_ARRAY
-                *out_len = arr.type_name_len
-                return arr.type_name
+            if lv_var_type(arr) == TYPE_ARRAY
+                *out_len = lv_type_name_len(arr)
+                return lv_type_name(arr)
             # #2543: `let r = @q` with `q: *[N]S`, for name_array_ptr_local.
             if array_ptr_index_base(s, oper) != null
                 return array_ptr_elem_name(arr, out_len)
@@ -1070,8 +1070,8 @@ fn tuple_bind_array_field(s: *EmitterState, fld: *StructField, val: i32, name_sv
     emit_str(s, IR_NL)
     add_local_full(s, StrView { ptr: (name), len: (name_len) as i64 }, slot, TYPE_ARRAY, StrView { ptr: (fld.array_elem_type_name), len: (fld.array_elem_type_name_len) as i64 }, TYPE_I64, fld.array_size, fld.array_elem_type)
     let loc: *LocalVar = local_at(s, s.local_count - 1)
-    loc.array_elem_pointee = fld.array_elem_pointee
-    loc.array_shape = fld.array_shape
+    lv_set_array_elem_pointee(loc, fld.array_elem_pointee)
+    lv_set_array_shape(loc, fld.array_shape)
 
 # AGAST #2574: bind field `idx` of the struct value `init_reg` to `name`, at
 # the field's own type: the slot and local an annotated `let a: T = p.f`
@@ -1136,7 +1136,7 @@ fn tuple_bind_field(s: *EmitterState, fld: *StructField, sname_sv: StrView, init
     if ft == TYPE_PTR or ft == TYPE_PTR_PTR
         add_local_full(s, StrView { ptr: (name), len: (name_len) as i64 }, slot, ft, StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 }, fld.ptr_pointee, 0, 0)
         let ploc: *LocalVar = local_at(s, s.local_count - 1)
-        ploc.inner_pointee_type = fld.inner_pointee_type
+        lv_set_inner_pointee_type(ploc, fld.inner_pointee_type)
     else if ft == TYPE_STRUCT
         add_local_struct(s, StrView { ptr: (name), len: (name_len) as i64 }, slot, ft, StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 })
     else
@@ -1246,25 +1246,22 @@ fn decl_pointee_array_elem_struct(dt: *DeclTy) -> i32
 fn decl_name_array_ptr_local(loc: *LocalVar, dt: *DeclTy, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let deep_ptr: bool = ref_to_ptr(loc) == 1 or loc.var_type == TYPE_PTR_PTR
-    if loc.type_name_len > 0 and deep_ptr and decl_pointee_array_elem_struct(dt) == 1
-        loc.pointee_array_elem_name = loc.type_name
-        loc.pointee_array_elem_name_len = loc.type_name_len
-        loc.type_name = null
-        loc.type_name_len = 0
+    let deep_ptr: bool = ref_to_ptr(loc) == 1 or lv_var_type(loc) == TYPE_PTR_PTR
+    if lv_type_name_len(loc) > 0 and deep_ptr and decl_pointee_array_elem_struct(dt) == 1
+        lv_set_pointee_array_elem_name(loc, lv_type_name(loc), lv_type_name_len(loc))
+        lv_set_type_name(loc, null, 0)
         return
-    if loc.type_name_len > 0 or name == null or len <= 0
+    if lv_type_name_len(loc) > 0 or name == null or len <= 0
         return
     if dt.var_pointee_array_size <= 0 or dt.var_pointee_array_elem_type != TYPE_STRUCT
         return
-    let t: i32 = loc.var_type
+    let t: i32 = lv_var_type(loc)
     let one: bool = (t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF) and dt.var_pointee_type == TYPE_ARRAY
     # AGAST #3079: an `@*[N]S` / `@&*[N]S` (`let r = @q`) is as deep as a `**[N]S`.
     let deep: bool = t == TYPE_PTR_PTR or ((t == TYPE_REF or t == TYPE_MUT_REF) and dt.var_pointee_type == TYPE_PTR)
     let two: bool = deep and dt.var_inner_pointee_type == TYPE_ARRAY
     if one or two
-        loc.pointee_array_elem_name = name
-        loc.pointee_array_elem_name_len = len
+        lv_set_pointee_array_elem_name(loc, name, len)
 
 # AGAST #2417: the signature of an un-annotated `let f = mb`, a bare fn
 # name: mb's own.  Without it a call `f(..)` was the untyped `call i64` and
@@ -1734,30 +1731,30 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             # ritz0 does.  It took the reference below, so writes to `d` reached
             # the caller.  Annotate `@C` to keep the reference.  `a:& [N]T` is
             # an array local, so the array arm below copies it (#2290).
-            if lent_local(s, stmt.var_init) != null and src_loc.var_type == TYPE_MUT_REF
+            if lent_local(s, stmt.var_init) != null and lv_var_type(src_loc) == TYPE_MUT_REF
                 var_type = TYPE_STRUCT
                 dt.var_type = TYPE_STRUCT
-                dt.var_type_name = src_loc.type_name
-                dt.var_type_name_len = src_loc.type_name_len
-            else if src_loc != null and src_loc.var_type == TYPE_STRUCT and src_loc.type_name_len > 0
+                dt.var_type_name = lv_type_name(src_loc)
+                dt.var_type_name_len = lv_type_name_len(src_loc)
+            else if src_loc != null and lv_var_type(src_loc) == TYPE_STRUCT and lv_type_name_len(src_loc) > 0
                 var_type = TYPE_STRUCT
                 dt.var_type = TYPE_STRUCT
-                dt.var_type_name = src_loc.type_name
-                dt.var_type_name_len = src_loc.type_name_len
+                dt.var_type_name = lv_type_name(src_loc)
+                dt.var_type_name_len = lv_type_name_len(src_loc)
             # AGAST #2169: `var b = a` with `a: [N]T` -- `b` is `[N]T` too, and
             # the init copies the whole array (it was an i64 slot holding
             # a's first 8 bytes).  A multi-dimensional `a` keeps its shape
             # (#1509), so the initializer check below fails it closed.
             # AGAST #2322: only when `b` has no type of its own.  `var x: i64 = a`
             # became an array copy, ignoring the `i64`; ritz0 refuses it.
-            else if src_loc != null and src_loc.var_type == TYPE_ARRAY and stmt.var_declared_type == TYPE_VOID
+            else if src_loc != null and lv_var_type(src_loc) == TYPE_ARRAY and stmt.var_declared_type == TYPE_VOID
                 var_type = TYPE_ARRAY
                 dt.var_type = TYPE_ARRAY
-                dt.var_array_size = src_loc.array_size
-                dt.var_array_elem_type = src_loc.array_elem_type
-                dt.var_array_shape = src_loc.array_shape
-                dt.var_type_name = src_loc.type_name
-                dt.var_type_name_len = src_loc.type_name_len
+                dt.var_array_size = lv_array_size(src_loc)
+                dt.var_array_elem_type = lv_array_elem_type(src_loc)
+                dt.var_array_shape = lv_array_shape(src_loc)
+                dt.var_type_name = lv_type_name(src_loc)
+                dt.var_type_name_len = lv_type_name_len(src_loc)
             # AGAST #2287: `var b = G` with `G: [N]T`, as for a local.
             else if src_loc == null and global_array_named(s, stmt.var_init) != null and stmt.var_declared_type == TYPE_VOID
                 let src_g: *GlobalVarDef = global_array_named(s, stmt.var_init)
@@ -1794,34 +1791,34 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             # "unhandled EXPR_MEMBER".)
             # AGAST #2352: and `p: @&i32` / `@i32`, a scalar pointee and no name.
             # AGAST #3079: and `p: @*i32` (`let p = @q`, q: *i32).
-            else if src_loc != null and (src_loc.var_type == TYPE_MUT_REF or src_loc.var_type == TYPE_REF) and (src_loc.type_name_len > 0 or scalar_pointee(src_loc.pointee_type) == 1 or src_loc.pointee_type == TYPE_PTR)
-                var_type = src_loc.var_type
-                dt.var_type = src_loc.var_type
-                dt.var_type_name = src_loc.type_name
-                dt.var_type_name_len = src_loc.type_name_len
-                dt.var_pointee_type = src_loc.pointee_type
-                dt.var_inner_pointee_type = src_loc.inner_pointee_type   # AGAST #2372: `s: @**S`
-                dt.var_inner_ref = src_loc.inner_ref   # AGAST #2399: `s: @@S`
+            else if src_loc != null and (lv_var_type(src_loc) == TYPE_MUT_REF or lv_var_type(src_loc) == TYPE_REF) and (lv_type_name_len(src_loc) > 0 or scalar_pointee(lv_pointee_type(src_loc)) == 1 or lv_pointee_type(src_loc) == TYPE_PTR)
+                var_type = lv_var_type(src_loc)
+                dt.var_type = lv_var_type(src_loc)
+                dt.var_type_name = lv_type_name(src_loc)
+                dt.var_type_name_len = lv_type_name_len(src_loc)
+                dt.var_pointee_type = lv_pointee_type(src_loc)
+                dt.var_inner_pointee_type = lv_inner_pointee_type(src_loc)   # AGAST #2372: `s: @**S`
+                dt.var_inner_ref = lv_inner_ref(src_loc)   # AGAST #2399: `s: @@S`
                 # AGAST #2321: `s: @[N]S`, so `q[i]` is what `s[i]` is.
-                dt.var_pointee_array_size = src_loc.pointee_array_size
-                dt.var_pointee_array_elem_type = src_loc.pointee_array_elem_type
+                dt.var_pointee_array_size = lv_pointee_array_size(src_loc)
+                dt.var_pointee_array_elem_type = lv_pointee_array_elem_type(src_loc)
             # AGAST #1938: `let pp = q` with `q: **S` -- `pp` takes `q`'s
             # TYPE_PTR_PTR and struct name, so the #1933
             # registration below keeps S and `(**pp).f` resolves.  (Was i64
             # with no struct name: "unhandled EXPR_MEMBER".)
-            else if src_loc != null and src_loc.var_type == TYPE_PTR_PTR and src_loc.type_name_len > 0
+            else if src_loc != null and lv_var_type(src_loc) == TYPE_PTR_PTR and lv_type_name_len(src_loc) > 0
                 var_type = TYPE_PTR_PTR
                 dt.var_type = TYPE_PTR_PTR
-                dt.var_type_name = src_loc.type_name
-                dt.var_type_name_len = src_loc.type_name_len
+                dt.var_type_name = lv_type_name(src_loc)
+                dt.var_type_name_len = lv_type_name_len(src_loc)
                 # AGAST #1941: and q's inner pointee, so `*pp + 1` strides
                 # sizeof(S) (ptr_levels_of reads it).
-                dt.var_inner_pointee_type = src_loc.inner_pointee_type
-                dt.var_inner_ref = src_loc.inner_ref   # AGAST #2399: `q: *@S`
+                dt.var_inner_pointee_type = lv_inner_pointee_type(src_loc)
+                dt.var_inner_ref = lv_inner_ref(src_loc)   # AGAST #2399: `q: *@S`
             # AGAST #2596: `let e = p` with `p: *S` / `*T` -- `e` is a `*S` /
             # `*T` too.  It was an i64 with no pointee: `e.b` "unhandled
             # EXPR_MEMBER", `@e.b` "cannot take address".
-            else if src_loc != null and src_loc.var_type == TYPE_PTR
+            else if src_loc != null and lv_var_type(src_loc) == TYPE_PTR
                 var cp_name: *u8 = null
                 var cp_len: i32 = 0
                 let cp_kind: i32 = ptr_root_pointee(s, stmt.var_init, @cp_name, @cp_len)
@@ -2022,9 +2019,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                     if addr_oper.kind == EXPR_IDENT
                         let aloc: *LocalVar = find_local_struct_name(s, StrView { ptr: (addr_oper.ident_ptr), len: (addr_oper.ident_len) as i64 })
                         if aloc != null
-                            if (aloc.var_type == TYPE_STRUCT and aloc.type_name_len > 0) or lent_struct_local(s, addr_oper) != null
-                                addr_pointee = aloc.type_name
-                                addr_pointee_len = aloc.type_name_len
+                            if (lv_var_type(aloc) == TYPE_STRUCT and lv_type_name_len(aloc) > 0) or lent_struct_local(s, addr_oper) != null
+                                addr_pointee = lv_type_name(aloc)
+                                addr_pointee_len = lv_type_name_len(aloc)
                         # AGAST #3026: `@g` of a module-level struct global
                         # is a `*G` too.  It stayed i64, so `p.ptr[0]` /
                         # `p.ptr.k` was "unhandled EXPR_MEMBER".
@@ -2038,9 +2035,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                         if addr_oper.left.kind == EXPR_IDENT
                             let aarr: *LocalVar = find_local_struct_name(s, StrView { ptr: (addr_oper.left.ident_ptr), len: (addr_oper.left.ident_len) as i64 })
                             if aarr != null
-                                if aarr.var_type == TYPE_ARRAY and aarr.array_elem_type == TYPE_STRUCT and aarr.type_name_len > 0
-                                    addr_pointee = aarr.type_name
-                                    addr_pointee_len = aarr.type_name_len
+                                if lv_var_type(aarr) == TYPE_ARRAY and lv_array_elem_type(aarr) == TYPE_STRUCT and lv_type_name_len(aarr) > 0
+                                    addr_pointee = lv_type_name(aarr)
+                                    addr_pointee_len = lv_type_name_len(aarr)
                             # AGAST #3129: `@ga[i]` of a global struct array
                             # is a `*S` too, as #3026 does `@g`.  It stayed i64,
                             # so `p.x` was "unhandled EXPR_MEMBER".
@@ -2162,17 +2159,17 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                     var rcv_tn_a_len: i32 = 0
                     if mb.left != null and mb.left.kind == EXPR_IDENT
                         let rloc: *LocalVar = find_local_struct_name(s, StrView { ptr: (mb.left.ident_ptr), len: (mb.left.ident_len) as i64 })
-                        if rloc != null and rloc.type_name_len > 0
-                            rcv_tn_a = rloc.type_name
-                            rcv_tn_a_len = rloc.type_name_len
+                        if rloc != null and lv_type_name_len(rloc) > 0
+                            rcv_tn_a = lv_type_name(rloc)
+                            rcv_tn_a_len = lv_type_name_len(rloc)
                     else if mb.left != null and mb.left.kind == EXPR_MEMBER
                         # Walk one extra level: outer.middle.field[i]
                         let mb_outer: *Expr = mb.left  # outer.middle
                         if mb_outer.left != null and mb_outer.left.kind == EXPR_IDENT
                             let rloc2: *LocalVar = find_local_struct_name(s, StrView { ptr: (mb_outer.left.ident_ptr), len: (mb_outer.left.ident_len) as i64 })
-                            if rloc2 != null and rloc2.type_name_len > 0
+                            if rloc2 != null and lv_type_name_len(rloc2) > 0
                                 # Resolve the inner field (`outer.middle`) to its struct
-                                let outer_st: *StructDef = find_struct(s, StrView { ptr: (rloc2.type_name), len: (rloc2.type_name_len) as i64 })
+                                let outer_st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(rloc2)), len: (lv_type_name_len(rloc2)) as i64 })
                                 if outer_st != null
                                     let mid_idx: i32 = find_field_index(outer_st, StrView { ptr: (mb_outer.ident_ptr), len: (mb_outer.ident_len) as i64 })
                                     if mid_idx >= 0
@@ -2290,25 +2287,25 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         else
             add_local_array(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, alloca_reg, dt.var_array_size, dt.var_array_elem_type)
         let arr_loc: *LocalVar = local_at(s, s.local_count - 1)
-        arr_loc.array_elem_pointee = dt.var_array_elem_pointee   # AGAST #2341
-        arr_loc.array_rec = dt.var_array   # AGAST #2995
+        lv_set_array_elem_pointee(arr_loc, dt.var_array_elem_pointee)   # AGAST #2341
+        lv_set_array_rec(arr_loc, dt.var_array)   # AGAST #2995
         if dt.var_array_shape != null and s.local_count > 0
             let nd_loc: *LocalVar = local_at(s, s.local_count - 1)
-            nd_loc.array_shape = dt.var_array_shape  # AGAST #1509
+            lv_set_array_shape(nd_loc, dt.var_array_shape)   # AGAST #1509
     else
         add_local(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, alloca_reg, var_type)
     set_local_fn_sig(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, fn_sig)  # AGAST #1671, #2417
     let declared: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
     if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
-        declared.inner_ref = dt.var_inner_ref   # AGAST #2399
+        lv_set_inner_ref(declared, dt.var_inner_ref)   # AGAST #2399
         set_local_pointee_array(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, dt.var_pointee_array_size, dt.var_pointee_array_elem_type)  # AGAST #1953, #2308, #2539 (`**[N]T`)
         set_local_pointee_elem(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, dt.var_pointee_array_elem_pointee)
-        if declared.pointee_type == TYPE_ARRAY
-            declared.pointee_array_shape = dt.var_pointee_array_shape   # AGAST #2570
-        else if var_type == TYPE_PTR_PTR and declared.pointee_type == TYPE_PTR
-            declared.pointee_array_shape = dt.var_pointee_array_shape   # AGAST #3635: `**[N][M]T`
-        else if (var_type == TYPE_REF or var_type == TYPE_MUT_REF) and declared.pointee_type == TYPE_PTR
-            declared.pointee_array_shape = dt.var_pointee_array_shape   # AGAST #4122: `@*[N][M]T`
+        if lv_pointee_type(declared) == TYPE_ARRAY
+            lv_set_pointee_array_shape(declared, dt.var_pointee_array_shape)   # AGAST #2570
+        else if var_type == TYPE_PTR_PTR and lv_pointee_type(declared) == TYPE_PTR
+            lv_set_pointee_array_shape(declared, dt.var_pointee_array_shape)   # AGAST #3635: `**[N][M]T`
+        else if (var_type == TYPE_REF or var_type == TYPE_MUT_REF) and lv_pointee_type(declared) == TYPE_PTR
+            lv_set_pointee_array_shape(declared, dt.var_pointee_array_shape)   # AGAST #4122: `@*[N][M]T`
         decl_name_array_ptr_local(declared, @dt, StrView { ptr: (view_name), len: (view_name_len) as i64 })   # AGAST #2543
     # An unannotated local takes its initialiser's kind; var_type can't say.
     var inferred_bool: i32 = 0
@@ -2321,9 +2318,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         bool_loc.is_bool = 1
     if inferred_unsure == 1 and s.local_count > 0
         let unsure_loc: *LocalVar = local_at(s, s.local_count - 1)
-        unsure_loc.bk_unsure = 1
+        lv_set_bk_unsure(unsure_loc, 1)
     if init_int == TYPE_U64 and var_type == TYPE_I64
-        declared.var_type = TYPE_U64
+        lv_set_var_type(declared, TYPE_U64)
 
     if stmt.var_init != null and dt.var_array_shape != null
         # AGAST #3299: a whole N-D place (`h.m`, `p.m`, a local or global
@@ -2608,19 +2605,19 @@ fn emit_through_index_assign(s: *EmitterState, stmt: *Stmt) -> i32
 # Returns 1 when it emitted the store.
 fn emit_lent_whole_store(s: *EmitterState, stmt: *Stmt, slot: i32) -> i32
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-    if loc == null or loc.var_type != TYPE_MUT_REF or loc.holds_lent_ptr == 0
+    if loc == null or lv_var_type(loc) != TYPE_MUT_REF or lv_holds_lent_ptr(loc) == 0
         return 0
-    let pt: i32 = loc.pointee_type
-    if pt == TYPE_STRUCT and loc.type_name_len > 0
+    let pt: i32 = lv_pointee_type(loc)
+    if pt == TYPE_STRUCT and lv_type_name_len(loc) > 0
         # Evaluated before the pointer is loaded: the value may read `r`.
-        let raw: i32 = emit_expr_into_slot(s, stmt.assign_value, TYPE_STRUCT, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+        let raw: i32 = emit_expr_into_slot(s, stmt.assign_value, TYPE_STRUCT, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
         # A bare "..." is a %Span$u8; `r:& StrView` wants it as a %StrView.
-        let val: i32 = coerce_struct_ret_value(s, stmt.assign_value, raw, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+        let val: i32 = coerce_struct_ret_value(s, stmt.assign_value, raw, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
         let dst: i32 = emit_load_ptr(s, slot)
         # LARB R58 (§13.6): `h = v` on a `h:& T` borrow stores the caller's
         # T, so the old value drops after v, before the store.
-        own_drop_old_ref_value(s, dst, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
-        emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }, val, dst)
+        own_drop_old_ref_value(s, dst, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+        emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, val, dst)
         return 1
     if pt == TYPE_F32 or pt == TYPE_F64
         let fval: i32 = emit_expr(s, stmt.assign_value)
@@ -2649,7 +2646,7 @@ fn deref_store_into_declared_i64(s: *EmitterState, ptr_expr: *Expr) -> i32
         return 0
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
     if loc != null
-        if loc.var_type == TYPE_PTR and loc.pointee_type == TYPE_I64
+        if lv_var_type(loc) == TYPE_PTR and lv_pointee_type(loc) == TYPE_I64
             return 1
         return 0
     let glob: *GlobalVarDef = find_global(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
@@ -2877,11 +2874,11 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         # Prefer the destination's pointee type when available
         if target_expr.kind == EXPR_IDENT
             let dst_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.ident_ptr), len: (target_expr.ident_len) as i64 })
-            if dst_loc != null and dst_loc.pointee_type != TYPE_I64
-                value_type = dst_loc.pointee_type
-                if dst_loc.pointee_type == TYPE_STRUCT
-                    struct_name = dst_loc.type_name
-                    struct_name_len = dst_loc.type_name_len
+            if dst_loc != null and lv_pointee_type(dst_loc) != TYPE_I64
+                value_type = lv_pointee_type(dst_loc)
+                if lv_pointee_type(dst_loc) == TYPE_STRUCT
+                    struct_name = lv_type_name(dst_loc)
+                    struct_name_len = lv_type_name_len(dst_loc)
         else if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
             # AGAST #1304: this is now the ONLY shape stmt_assign_deref
             # produces.  Resolve the destination slot's width so `*p = v`
@@ -2904,7 +2901,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             var rhs_is_named_type: i32 = 0
             if stmt.assign_value.kind == EXPR_IDENT
                 let rhs_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.assign_value.ident_ptr), len: (stmt.assign_value.ident_len) as i64 })
-                if rhs_loc != null and rhs_loc.var_type == TYPE_STRUCT
+                if rhs_loc != null and lv_var_type(rhs_loc) == TYPE_STRUCT
                     rhs_is_named_type = 1
             let dst_type: i32 = get_deref_store_type(s, target_expr.operand)
             if dst_type != TYPE_VOID and dst_type != TYPE_I64 and rhs_is_named_type == 0
@@ -2930,10 +2927,10 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             # find_struct rejects; emit_llvm_type_struct maps it to i16.
             else if target_expr.operand.kind == EXPR_IDENT
                 let dst_loc2: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.operand.ident_ptr), len: (target_expr.operand.ident_len) as i64 })
-                if dst_loc2 != null and dst_loc2.pointee_type == TYPE_STRUCT
+                if dst_loc2 != null and lv_pointee_type(dst_loc2) == TYPE_STRUCT
                     value_type = TYPE_STRUCT
-                    struct_name = dst_loc2.type_name
-                    struct_name_len = dst_loc2.type_name_len
+                    struct_name = lv_type_name(dst_loc2)
+                    struct_name_len = lv_type_name_len(dst_loc2)
 
         # Fall back to value's type if destination pointee was unknown (TYPE_I64 default)
         if value_type == TYPE_I64 and dst_is_i64 == 0
@@ -2941,10 +2938,10 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             if stmt.assign_value.kind == EXPR_IDENT
                 let local: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.assign_value.ident_ptr), len: (stmt.assign_value.ident_len) as i64 })
                 if local != null
-                    value_type = local.var_type
-                    if local.var_type == TYPE_STRUCT
-                        struct_name = local.type_name
-                        struct_name_len = local.type_name_len
+                    value_type = lv_var_type(local)
+                    if lv_var_type(local) == TYPE_STRUCT
+                        struct_name = lv_type_name(local)
+                        struct_name_len = lv_type_name_len(local)
             # Check if value is a function call - look up the function's return type
             else if stmt.assign_value.kind == EXPR_CALL
                 let fn_def: *FnDef = find_fn(s, StrView { ptr: (stmt.assign_value.func_name), len: (stmt.assign_value.func_name_len) as i64 })
@@ -2975,13 +2972,13 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         var addr_is_ptr: bool = false
         if target_expr.kind == EXPR_IDENT
             let opd_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.ident_ptr), len: (target_expr.ident_len) as i64 })
-            if opd_loc != null and opd_loc.var_type == TYPE_MUT_REF
+            if opd_loc != null and lv_var_type(opd_loc) == TYPE_MUT_REF
                 addr_is_ptr = true
             addr = emit_expr(s, target_expr)
         else if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
             if target_expr.operand.kind == EXPR_IDENT
                 let opd_loc2: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.operand.ident_ptr), len: (target_expr.operand.ident_len) as i64 })
-                if opd_loc2 != null and opd_loc2.var_type == TYPE_MUT_REF
+                if opd_loc2 != null and lv_var_type(opd_loc2) == TYPE_MUT_REF
                     addr_is_ptr = true
             # `*@&x = v`: `@&` is a `ptr` where `@` is an i64 (AGAST #2338).
             if target_expr.operand.kind == EXPR_UNARY and target_expr.operand.op == OP_ADDR_MUT
@@ -3092,14 +3089,14 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             let _saved_simd_a: *u8 = s.ctx_simd_name
             let _saved_simd_a_len: i32 = s.ctx_simd_name_len
             let local: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-            if local != null and is_simd_vector_type_name(StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 }) == 1
-                s.ctx_simd_name = local.type_name
-                s.ctx_simd_name_len = local.type_name_len
+            if local != null and is_simd_vector_type_name(StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }) == 1
+                s.ctx_simd_name = lv_type_name(local)
+                s.ctx_simd_name_len = lv_type_name_len(local)
             # For function call or other expression returning struct.
             # AGAST #2142: `held = Some(..)` builds the local's enum.
             var val: i32 = 0
             if local != null
-                val = emit_expr_into_slot(s, stmt.assign_value, var_type, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
+                val = emit_expr_into_slot(s, stmt.assign_value, var_type, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
             else
                 val = emit_expr(s, stmt.assign_value)
             s.ctx_simd_name = _saved_simd_a
@@ -3112,14 +3109,14 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 var src_name: *u8 = null
                 var src_len: i32 = 0
                 resolve_expr_struct_name(s, stmt.assign_value, @src_name, @src_len)
-                if is_layout_equiv_pair(StrView { ptr: (src_name), len: (src_len) as i64 }, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 }) == 1
-                    stored_reg = rebuild_layout_equiv(s, val, StrView { ptr: (src_name), len: (src_len) as i64 }, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
+                if is_layout_equiv_pair(StrView { ptr: (src_name), len: (src_len) as i64 }, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }) == 1
+                    stored_reg = rebuild_layout_equiv(s, val, StrView { ptr: (src_name), len: (src_len) as i64 }, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
                 # AGAST #167: emit_llvm_type_struct routes `v4i32`/`v16i8`
                 # etc. to `<N x iM>` so the store width matches the
                 # inline-SIMD call's vector result; primitive type names
                 # ("i32", "f32", …) lower to their LLVM scalar type for
                 # the post-monomorph TYPE_STRUCT-with-primitive-name shape.
-                emit_struct_store_or_copy(s, var_type, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 }, stored_reg, loc)
+                emit_struct_store_or_copy(s, var_type, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, stored_reg, loc)
             else
                 emit_store_typed(s, IR_TY_I64, val, loc)
             return
@@ -3127,8 +3124,8 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         # array into local `a`.
         if var_type == TYPE_ARRAY
             let aloc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-            if aloc != null and aloc.array_shape == null
-                emit_array_local_whole_assign(s, loc, aloc.array_size, aloc.array_elem_type, StrView { ptr: (aloc.type_name), len: (aloc.type_name_len) as i64 }, stmt.assign_value)
+            if aloc != null and lv_array_shape(aloc) == null
+                emit_array_local_whole_assign(s, loc, lv_array_size(aloc), lv_array_elem_type(aloc), StrView { ptr: (lv_type_name(aloc)), len: (lv_type_name_len(aloc)) as i64 }, stmt.assign_value)
                 return
         # AGAST #1652: `p = s` (`s: @&S`) into a `*S` local.  `let` only;
         # see the #1755 note in emit_fn.
@@ -3327,7 +3324,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             var ret_val: *Expr = stmt.return_value
             var ret_th: ThroughIndex
             let ret_through: *LocalVar = index_through(s, ret_val)
-            if ret_through != null and ret_through.array_view == 1
+            if ret_through != null and lv_is_array_view(ret_through) == 1
                 index_through_fill(s, ret_val, through_spill(s, ret_through), @ret_th)
                 ret_val = @ret_th.deref
             # Check if return value is a dereference (e.g., *ptr or *(ptr + offset))
@@ -3523,7 +3520,7 @@ fn for_call_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i3
     if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"as_bytes"), len: (8) as i64 }) == 0
         return
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-    if loc != null and name_eq(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1
+    if loc != null and name_eq(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1
         *out_name = c"Span$u8"
         *out_len = 7
 
@@ -3532,13 +3529,13 @@ fn for_call_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i3
 fn emit_for_ident_header(s: *EmitterState, e: *Expr, out: **StructDef) -> i32
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if loc != null
-        let st: *StructDef = for_header_struct(s, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+        let st: *StructDef = for_header_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
         if st == null
             return 0
-        if loc.var_type == TYPE_STRUCT
+        if lv_var_type(loc) == TYPE_STRUCT
             *out = st
             return loc.reg
-        if local_struct_levels(loc) == 1 and loc.pointee_type == TYPE_STRUCT
+        if local_struct_levels(loc) == 1 and lv_pointee_type(loc) == TYPE_STRUCT
             *out = st
             return emit_load_ptr(s, loc.reg)
         return 0
@@ -3577,16 +3574,16 @@ fn emit_for_addr_header(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, out: *
         # that pointer (#2286), not the slot's address.
         let lent: *LocalVar = lent_struct_local(s, op)
         if lent != null
-            let lst: *StructDef = for_header_struct(s, StrView { ptr: (lent.type_name), len: (lent.type_name_len) as i64 })
+            let lst: *StructDef = for_header_struct(s, StrView { ptr: (lv_type_name(lent)), len: (lv_type_name_len(lent)) as i64 })
             if lst == null
                 return 0
             *out = lst
             return emit_load_ptr(s, lent.reg)
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (op.ident_ptr), len: (op.ident_len) as i64 })
         if loc != null
-            if loc.var_type != TYPE_STRUCT
+            if lv_var_type(loc) != TYPE_STRUCT
                 return 0
-            let st: *StructDef = for_header_struct(s, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+            let st: *StructDef = for_header_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
             if st != null
                 *out = st
                 return loc.reg
@@ -3757,13 +3754,13 @@ fn emit_for_slot_llvm(s: *EmitterState, elem: i32, name_sv: StrView, row: i32, p
 # AGAST #2410: the array a `*[N]T` / `@[N]T` / `@&[N]T` local points at, read once,
 # with its N and T in the outs.  (`*[N][M]T` doesn't parse on ritz1.)
 fn for_array_ptr(s: *EmitterState, loc: *LocalVar, elem: *i32, size: *i32, name: **u8, name_len: *i32, pointee: *i32, p_name: **u8, p_name_len: *i32) -> i32
-    *elem = loc.pointee_array_elem_type
-    *size = loc.pointee_array_size
+    *elem = lv_pointee_array_elem_type(loc)
+    *size = lv_pointee_array_size(loc)
     var en_len: i32 = 0
     let en: *u8 = array_ptr_elem_name(loc, @en_len)
     *name = en
     *name_len = en_len
-    *pointee = elem_recorded_pointee(s, *elem, loc.pointee_array_elem_pointee, StrView { ptr: (en), len: (en_len) as i64 }, p_name, p_name_len)
+    *pointee = elem_recorded_pointee(s, *elem, lv_pointee_array_elem_pointee(loc), StrView { ptr: (en), len: (en_len) as i64 }, p_name, p_name_len)
     emit_load_ptr(s, loc.reg)
 
 # AGAST #2410: the element type of the literal `e`, from its first element as
@@ -3797,12 +3794,12 @@ fn array_init_ptr_pointee(s: *EmitterState, e: *Expr, name: **u8, name_len: *i32
     if o == null or o.kind != EXPR_IDENT
         return TYPE_VOID
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (o.ident_ptr), len: (o.ident_len) as i64 })
-    if loc == null or loc.is_bool == 1 or loc.bk_unsure == 1
+    if loc == null or loc.is_bool == 1 or lv_bk_unsure(loc) == 1
         return TYPE_VOID
-    let t: i32 = loc.var_type
-    if t == TYPE_STRUCT and loc.type_name_len > 0
-        *name = loc.type_name
-        *name_len = loc.type_name_len
+    let t: i32 = lv_var_type(loc)
+    if t == TYPE_STRUCT and lv_type_name_len(loc) > 0
+        *name = lv_type_name(loc)
+        *name_len = lv_type_name_len(loc)
         return TYPE_STRUCT
     if ty_is_int(t) == 1 or t == TYPE_F32 or t == TYPE_F64
         return t
@@ -3962,20 +3959,20 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         if arr_ident.kind == EXPR_IDENT
             let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
             if loc != null
-                if loc.var_type == TYPE_ARRAY and loc.array_shape != null
+                if lv_var_type(loc) == TYPE_ARRAY and lv_array_shape(loc) != null
                     # AGAST #1509: a multi-dimensional array yields rows.  It
                     # used to GEP the alloca as `[N x i64]` and load garbage.
-                    nd_shape = loc.array_shape
+                    nd_shape = lv_array_shape(loc)
                     iter_kind = 1
                     data_reg = loc.reg
-                else if loc.var_type == TYPE_ARRAY
+                else if lv_var_type(loc) == TYPE_ARRAY
                     iter_kind = 1
-                    elem_type = loc.array_elem_type
-                    arr_size = loc.array_size
+                    elem_type = lv_array_elem_type(loc)
+                    arr_size = lv_array_size(loc)
                     data_reg = loc.reg
-                    elem_name = loc.type_name
-                    elem_name_len = loc.type_name_len
-                    bind_pointee = elem_recorded_pointee(s, elem_type, loc.array_elem_pointee, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }, @bind_name, @bind_name_len)
+                    elem_name = lv_type_name(loc)
+                    elem_name_len = lv_type_name_len(loc)
+                    bind_pointee = elem_recorded_pointee(s, elem_type, lv_array_elem_pointee(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, @bind_name, @bind_name_len)
                 else if via_addr == 0 and array_ptr_named(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 }) != null
                     # AGAST #2410: `a: *[N]T` / `@[N]T` / `@&[N]T` walks the array
                     # it points at.
@@ -4138,12 +4135,12 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # AGAST #3379: a plane is a `[M][N]..T` local, as emit_var_decl has it.
         add_local_array(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, plane.dims[0], TYPE_ARRAY)
         let plane_loc: *LocalVar = local_at(s, s.local_count - 1)
-        plane_loc.array_shape = plane
+        lv_set_array_shape(plane_loc, plane)
     else if row_size > 0
         # AGAST #2410: a row is a `[M]T` local.
         add_local_full(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, TYPE_ARRAY, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, TYPE_I64, row_size, elem_type)
         let row_loc: *LocalVar = local_at(s, s.local_count - 1)
-        row_loc.array_elem_pointee = bind_pointee
+        lv_set_array_elem_pointee(row_loc, bind_pointee)
     else if bind_pointee != TYPE_VOID
         add_local_full(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, elem_type, StrView { ptr: (bind_name), len: (bind_name_len) as i64 }, bind_pointee, 0, 0)
     else if elem_type == TYPE_STRUCT and elem_name_len > 0
@@ -4603,7 +4600,7 @@ pub fn array_ptr_local(s: *EmitterState, e: *Expr) -> *LocalVar
     if e == null or e.kind != EXPR_IDENT
         return null
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    if loc == null or loc.pointee_type != TYPE_ARRAY or loc.pointee_array_size <= 0
+    if loc == null or lv_pointee_type(loc) != TYPE_ARRAY or lv_pointee_array_size(loc) <= 0
         return null
     if lent_array_ident(s, e) != null
         return loc
@@ -4611,7 +4608,7 @@ pub fn array_ptr_local(s: *EmitterState, e: *Expr) -> *LocalVar
 
 # The address of the array behind array_ptr_local's `loc`.
 fn emit_array_ptr_base(s: *EmitterState, loc: *LocalVar) -> i32
-    if loc.var_type == TYPE_ARRAY
+    if lv_var_type(loc) == TYPE_ARRAY
         return loc.reg
     return emit_load_ptr(s, loc.reg)
 
@@ -4627,7 +4624,7 @@ pub fn array_ptr_shape(s: *EmitterState, e: *Expr, out: *ArraySrc) -> i32
     if loc != null
         var en_len: i32 = 0
         let en: *u8 = array_ptr_elem_name(loc, @en_len)   # #2548
-        return array_src_set(out, loc.pointee_array_size, loc.pointee_array_elem_type, StrView { ptr: (en), len: (en_len) as i64 })
+        return array_src_set(out, lv_pointee_array_size(loc), lv_pointee_array_elem_type(loc), StrView { ptr: (en), len: (en_len) as i64 })
     if e.kind == EXPR_BINARY
         if e.op != OP_ADD and e.op != OP_SUB
             return 0
@@ -4661,7 +4658,7 @@ fn array_ptr_steps(s: *EmitterState, e: *Expr) -> i32
         return 0
     let loc: *LocalVar = array_ptr_local(s, e)
     if loc != null
-        if loc.var_type == TYPE_PTR
+        if lv_var_type(loc) == TYPE_PTR
             return 1
         return 0
     if base_ptr_array_row_size(s, e) > 0
@@ -4684,8 +4681,8 @@ pub fn array_place_shape(s: *EmitterState, value: *Expr, out: *ArraySrc) -> i32
     if value.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (value.ident_ptr), len: (value.ident_len) as i64 })
         if loc != null
-            if loc.var_type == TYPE_ARRAY and loc.array_shape == null
-                return array_src_set(out, loc.array_size, loc.array_elem_type, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+            if lv_var_type(loc) == TYPE_ARRAY and lv_array_shape(loc) == null
+                return array_src_set(out, lv_array_size(loc), lv_array_elem_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
             return 0
         let g: *GlobalVarDef = find_global(s, StrView { ptr: (value.ident_ptr), len: (value.ident_len) as i64 })
         if g != null and g.var_type == TYPE_ARRAY and g.array_shape == null
@@ -5646,8 +5643,8 @@ fn if_stmt_arm_agg(s: *EmitterState, list: *Stmt, out_name: **u8, out_len: *i32)
     let e: *Expr = last.expr
     let lent: *LocalVar = lent_referent_local(s, e)
     if lent != null   # AGAST #2288: emit_if_stmt_arm read the referent
-        *out_name = lent.type_name
-        *out_len = lent.type_name_len
+        *out_name = lv_type_name(lent)
+        *out_len = lv_type_name_len(lent)
         return
     resolve_expr_struct_name(s, e, out_name, out_len)
     if *out_name == null
@@ -6470,7 +6467,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             let lent: *LocalVar = lent_referent_local(s, stmt.expr)
             if stmt == s.if_arm_value and lent != null
                 # AGAST #2288: an if arm's value (emit_if_stmt_arm).
-                expr_reg = emit_lent_referent(s, stmt.expr, StrView { ptr: (lent.type_name), len: (lent.type_name_len) as i64 })
+                expr_reg = emit_lent_referent(s, stmt.expr, StrView { ptr: (lv_type_name(lent)), len: (lv_type_name_len(lent)) as i64 })
             else if builtin_tagged_ctor(s, stmt.expr) == 1
                 expr_reg = emit_ctor_stmt(s, stmt.expr)   # AGAST #2454
             else
@@ -6499,7 +6496,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         var lfa_done: bool = false
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
         if loc != null
-            let st: *StructDef = find_struct(s, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+            let st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
             if st != null
                 let field_idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
                 if field_idx >= 0
@@ -6602,7 +6599,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         var lfia_done: i32 = 0
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
         if loc != null
-            let st: *StructDef = find_struct(s, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+            let st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
             if st != null
                 let field_idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
                 # AGAST #1596: a pointer field is not an inline array — the
@@ -6701,17 +6698,17 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             if base_type == TYPE_ARRAY and local != null
                 # Array local - use GEP [0, index] to get element
                 let idx_reg: i32 = emit_expr(s, stmt.while_cond)
-                let val_reg: i32 = emit_store_into_slot(s, stmt.assign_value, local.array_elem_type, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })   # AGAST #2454, #2390
+                let val_reg: i32 = emit_store_into_slot(s, stmt.assign_value, lv_array_elem_type(local), StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })   # AGAST #2454, #2390
                 let elem_ptr: i32 = next_reg(s)
                 emit_str(s, IR_INDENT)
                 emit_reg(s, elem_ptr)
                 emit_str(s, IR_GEP_ARRAY)
-                emit_int(s, local.array_size as i64)
+                emit_int(s, lv_array_size(local) as i64)
                 emit_str(s, IR_X)
                 # AGAST #1564: every non-struct element uses the alloca's own
                 # spelling (array_elem_llvm); u32/u16/i16 used to fall to i64.
-                let elem_ty: *u8 = elem_mem_llvm(local.array_elem_type)
-                if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
+                let elem_ty: *u8 = elem_mem_llvm(lv_array_elem_type(local))
+                if lv_array_elem_type(local) == TYPE_STRUCT and lv_type_name_len(local) > 0
                     # AGAST #190: struct-array LHS — emit `[N x %T]` so the
                     # GEP and the store agree with the actual element layout.
                     # Mirrors #188's STMT_LOCAL_FIELD_INDEX_ASSIGN fix but on
@@ -6719,7 +6716,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     # struct member).  Surfaces in nexus encode_page where
                     # `var fields: [2]DbField; fields[i] = db_field(...)`
                     # was emitting `[2 x i64]` GEP / `store i64 %DbField`.
-                    emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
+                    emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
                 else
                     emit_str(s, elem_ty)
                 emit_str(s, IR_RBRACK_PTR)
@@ -6727,7 +6724,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_str(s, IR_I64_ZERO)
                 emit_reg(s, idx_reg)
                 emit_str(s, IR_NL)
-                if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
+                if lv_array_elem_type(local) == TYPE_STRUCT and lv_type_name_len(local) > 0
                     # AGAST #3377 (LARB R39): the old element drops first.
                     var ia_place: Expr
                     memset(@ia_place as *u8, 0, sizeof(Expr))
@@ -6735,24 +6732,24 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     ia_place.span = stmt.span
                     ia_place.ident_ptr = stmt.assign_target
                     ia_place.ident_len = stmt.assign_target_len
-                    own_drop_old_elem(s, @ia_place, elem_ptr, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
+                    own_drop_old_elem(s, @ia_place, elem_ptr, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
                     # AGAST #190: struct-array element store — `store %T %val`
                     # matches the value loaded/returned as the element struct
                     # type (e.g. `%DbField` from `call %DbField @db_field(..)`).
-                    emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 }, val_reg, elem_ptr)
+                    emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, val_reg, elem_ptr)
                 else
                     # Store at the element width: narrow ints truncate, pointers
                     # convert back to ptr, i64 stores as-is; an f64 value into
                     # an f32 element is fptrunc'd (#1966).
                     var store_val: i32 = val_reg
-                    if array_elem_typed_scalar(local.array_elem_type) == 1
-                        store_val = emit_field_elem_narrow(s, val_reg, local.array_elem_type, stmt.assign_value)
-                    else if local.array_elem_type == TYPE_REF or local.array_elem_type == TYPE_MUT_REF
+                    if array_elem_typed_scalar(lv_array_elem_type(local)) == 1
+                        store_val = emit_field_elem_narrow(s, val_reg, lv_array_elem_type(local), stmt.assign_value)
+                    else if lv_array_elem_type(local) == TYPE_REF or lv_array_elem_type(local) == TYPE_MUT_REF
                         store_val = ptr_value_to_i64(s, stmt.assign_value, val_reg)   # AGAST #2369: `a[i] = @&x`
-                    else if (local.array_elem_type == TYPE_PTR or local.array_elem_type == TYPE_PTR_PTR) and expr_is_ptr_valued(s, stmt.assign_value) == 1
+                    else if (lv_array_elem_type(local) == TYPE_PTR or lv_array_elem_type(local) == TYPE_PTR_PTR) and expr_is_ptr_valued(s, stmt.assign_value) == 1
                         store_val = val_reg   # AGAST #3036: `a[i] = @&x` into `[N]*T`: a `ptr` already
                     else
-                        store_val = emit_array_elem_narrow(s, val_reg, local.array_elem_type, elem_ty)
+                        store_val = emit_array_elem_narrow(s, val_reg, lv_array_elem_type(local), elem_ty)
                     emit_str(s, IR_STORE_IND)
                     emit_str(s, elem_ty)
                     emit_str(s, IR_SP)
@@ -6772,9 +6769,9 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 var pst_name: *u8 = null
                 var pst_len: i32 = 0
                 if local != null
-                    pointee = local.pointee_type
-                    pst_name = local.type_name
-                    pst_len = local.type_name_len
+                    pointee = lv_pointee_type(local)
+                    pst_name = lv_type_name(local)
+                    pst_len = lv_type_name_len(local)
                 emit_index_assign_ptr_store(s, stmt, base_ptr, base_type, pointee, StrView { ptr: (pst_name), len: (pst_len) as i64 })
         else
             # AGAST #1332: GLOBAL pointer base.  Previously `base_reg >= 0`

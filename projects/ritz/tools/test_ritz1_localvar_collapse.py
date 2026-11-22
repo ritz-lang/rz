@@ -5,18 +5,9 @@ This is the third invariant of #4035:
     LocalVar (ast_query.ritz) keeps only `name` + `*TypeRef` + the binding
     mode/refinement flags the emitter mutates, <= 12 fields.
 
-It is staged separately from the parser half (test_ritz1_typeref.py) because
-the flat facts on LocalVar are read ~850 times inside `emitter*.ritz` --
-`emitter_stmt`, `emitter_expr_call`, `emitter_expr`, `emitter_expr_arith`,
-`emitter_expr_access`, `emitter_match`, `emitter_print` and `emitter_core`.
-`ritz-task-1817` is rewriting those same files (+2755/-3269 unmerged) into
-typed `emitter_ir` builders, so a field-by-field rewrite of them here would
-collide on nearly every changed line.  The room's brief keeps this diff off
-`emitter*.ritz`.
-
-The test is written and skipped against `ast_query.ritz`, not deleted, so the
-invariant is executable the moment the emitter rewrite lands: drop the skip,
-replace each flat read with the accessor in ast_query.ritz, and this passes.
+#4035 shipped the parser half; #4528 attached the `*TypeRef` to
+Stmt.var_ty / Param.param_ty, populated LocalVar.ty in add_local_full and
+rewrote the flat reads to the lv_* accessors, so this test is live.
 
 The `ty` field arrives with the parser half and is asserted there
 (test_ritz1_typeref.py); the Sema-side facts already moved to RsNote
@@ -72,8 +63,6 @@ def _struct_fields(path: Path, name: str) -> dict[str, str]:
 
 
 @pytest.mark.unit
-@pytest.mark.skip(
-    reason="staged after ritz-task-1817 rewrites emitter*.ritz; see module docstring")
 def test_localvar_is_name_ty_and_binding_flags():
     fields = _struct_fields(AST_QUERY, "LocalVar")
     assert len(fields) <= LOCALVAR_LIMIT, (

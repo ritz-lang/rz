@@ -125,3 +125,21 @@ def test_types_answers_from_a_typeref():
                "tr_is_ptr", "tr_depth"):
         assert re.search(r"^(?:pub )?fn " + fn + r"\(", text, re.MULTILINE), \
             f"types.ritz: {fn} (the *TypeRef form) is missing"
+
+
+# AGAST #4528: the binder nodes carry the chain lowering registers a local
+# from, and LocalVar's 17 flat type facts are gone (test_ritz1_localvar_collapse
+# holds the LocalVar shape; this holds the AST side).
+@pytest.mark.unit
+def test_stmt_and_param_carry_the_typeref():
+    stmt_fields = _struct_fields(AST, "Stmt")
+    param_fields = _struct_fields(AST, "Param")
+    assert re.search(r"var_ty\s*:\s*\*TypeRef", stmt_fields.get("var_ty", "")), \
+        "ast.ritz: Stmt.var_ty is missing or not *TypeRef"
+    assert re.search(r"param_ty\s*:\s*\*TypeRef", param_fields.get("param_ty", "")), \
+        "ast.ritz: Param.param_ty is missing or not *TypeRef"
+    helpers = AST_HELPERS.read_text()
+    assert re.search(r"^\s*s\.var_ty = tr\b", helpers, re.MULTILINE), \
+        "ast_helpers.ritz: stmt_var_decl does not record Stmt.var_ty"
+    assert re.search(r"^\s*param\.param_ty = ty\b", helpers, re.MULTILINE), \
+        "ast_helpers.ritz: param_of_type does not record Param.param_ty"

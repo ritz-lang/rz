@@ -161,7 +161,7 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
     let loc: i32 = find_local(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if loc >= 0
         let local_var: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        let var_type: i32 = local_var.var_type
+        let var_type: i32 = lv_var_type(local_var)
         # AGAST #2287: this path has no array value to give; loading the slot
         # read the first 8 bytes as an i64.  Whatever takes a whole array has
         # its own path (emit_array_local_whole_assign, emit_call_arg).
@@ -174,7 +174,7 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
             emit_whole_array_error(s, e)
             return 0
         let result: i32 = next_reg(s)
-        emit_struct_load_or_defer(s, var_type, result, StrView { ptr: (local_var.type_name), len: (local_var.type_name_len) as i64 }, loc, null, 0)
+        emit_struct_load_or_defer(s, var_type, result, StrView { ptr: (lv_type_name(local_var)), len: (lv_type_name_len(local_var)) as i64 }, loc, null, 0)
 
         if var_type == TYPE_I32
             let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, result)
@@ -498,7 +498,7 @@ fn emit_array_ptr_index(s: *EmitterState, e: *Expr, out: *i32) -> i32
     let loc: *LocalVar = array_ptr_index_base(s, e.left)
     if loc == null
         return 0
-    let elem: i32 = loc.pointee_array_elem_type
+    let elem: i32 = lv_pointee_array_elem_type(loc)
     if e.right != null and e.right.kind == EXPR_RANGE
         emit_nd_error(s, e.span.line, e.span.col, c"a pointer to an array can't be sliced (only String, Vec and Span can)")
         return 1
@@ -519,7 +519,7 @@ fn emit_array_ptr_index(s: *EmitterState, e: *Expr, out: *i32) -> i32
     emit_str(s, IR_INDENT)
     emit_reg(s, elem_ptr)
     emit_str(s, IR_GEP_ARRAY)
-    emit_int(s, loc.pointee_array_size as i64)
+    emit_int(s, lv_pointee_array_size(loc) as i64)
     emit_str(s, IR_X)
     emit_str(s, elem_ty)
     emit_str(s, IR_RBRACK_PTR)
@@ -705,7 +705,7 @@ pub fn index_store_root_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_
     else if x.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
         if loc != null
-            pp = (loc.var_type == TYPE_PTR_PTR) as i32
+            pp = (lv_var_type(loc) == TYPE_PTR_PTR) as i32
         else
             let glob: *GlobalVarDef = find_global(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
             if glob == null
@@ -815,7 +815,7 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         # copy, `let s: S = p[i]` or `g(p[i])`, doesn't come here, and its fields
         # don't either.  This was #2321's located refusal, and `*(q + i)` failed
         # at clang for `p[i] + 1`, `p[i] as i64` and `return p[i]`.
-        if through.array_view == 1 and through.pointee_type == TYPE_STRUCT and whole_struct_elem_refused(s, e) == 1
+        if lv_is_array_view(through) == 1 and lv_pointee_type(through) == TYPE_STRUCT and whole_struct_elem_refused(s, e) == 1
             return 0
         var th: ThroughIndex
         index_through_fill(s, e, through_spill(s, through), @th)
@@ -954,21 +954,21 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 # default rather than letting TYPE_UNKNOWN leak downstream.
                 base_type = TYPE_PTR
         else if local != null
-            elem_pointee = local.pointee_type
+            elem_pointee = lv_pointee_type(local)
 
     # A range index `a[lo..hi]` slices a Vec, Span or String only, and monomorph
     # rewrites one into `v.slice(lo, hi)` (AGAST #2451).  What reaches here is
     # refused, located (#2521).
     if e.right != null and e.right.kind == EXPR_RANGE
         # AGAST #2290: ritz0 slices no array, so a borrowed one isn't either.
-        if local != null and base_type == TYPE_ARRAY and local.is_lent == 1
+        if local != null and base_type == TYPE_ARRAY and lv_is_lent(local) == 1
             emit_nd_error(s, e.span.line, e.span.col, c"an `a:& [N]T` param can't be sliced (only String, Vec and Span can)")
             return 0
         # AGAST #2451: a Vec, Span or String local was sliced here into a bare
         # address, so `t[1]` read bytes and `t.len` had no struct.  What
         # monomorph didn't rewrite is refused rather than read as an address.
         if base_type == TYPE_STRUCT and local != null
-            if is_sliceable_name(StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 }) == 1
+            if is_sliceable_name(StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }) == 1
                 emit_nd_error(s, e.span.line, e.span.col, c"this slice of a Vec, Span or String isn't lowered by ritz1 (`let t = v[lo..hi]` is)")
             else
                 emit_nd_error(s, e.span.line, e.span.col, c"a struct can't be sliced (only String, Vec and Span can)")
@@ -984,7 +984,7 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         emit_nd_error(s, e.span.line, e.span.col, unsliceable_message(named))
         return 0
 
-    if base_type == TYPE_ARRAY and local != null and local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
+    if base_type == TYPE_ARRAY and local != null and lv_array_elem_type(local) == TYPE_STRUCT and lv_type_name_len(local) > 0
         # AGAST #2592: a whole struct element of a `[N]P` local is a `%P`
         # value, as the global (#1553) and field (#188) arms load it.  It was
         # read as a `[N x i64]` slot, so `let p: P = ps[1]` stored an i64 into
@@ -996,16 +996,16 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, IR_INDENT)
         emit_reg(s, sptr)
         emit_str(s, IR_GEP_ARRAY)
-        emit_int(s, local.array_size as i64)
+        emit_int(s, lv_array_size(local) as i64)
         emit_str(s, IR_X)
-        emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
+        emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
         emit_str(s, IR_RBRACK_PTR)
         emit_reg(s, local.reg)
         emit_str(s, IR_I64_ZERO)
         emit_reg(s, sidx)
         emit_str(s, IR_NL)
         let sval: i32 = next_reg(s)
-        emit_struct_load_or_defer(s, TYPE_STRUCT, sval, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 }, sptr, null, 0)
+        emit_struct_load_or_defer(s, TYPE_STRUCT, sval, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, sptr, null, 0)
         return sval
 
     if base_type == TYPE_ARRAY and local != null
@@ -1013,13 +1013,13 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         # AGAST #1564: at the alloca's own element type (local_array_elem_llvm);
         # u32/u16/i16 used to fall to `[N x i64]` over a narrower alloca.
         # A float / double element is the value itself (#1966): no widen.
-        let elem_ty: *u8 = elem_mem_llvm(local.array_elem_type)
+        let elem_ty: *u8 = elem_mem_llvm(lv_array_elem_type(local))
         let idx: i32 = emit_expr(s, e.right)
         let elem_ptr: i32 = next_reg(s)
         emit_str(s, IR_INDENT)
         emit_reg(s, elem_ptr)
         emit_str(s, IR_GEP_ARRAY)
-        emit_int(s, local.array_size as i64)
+        emit_int(s, lv_array_size(local) as i64)
         emit_str(s, IR_X)
         emit_str(s, elem_ty)
         emit_str(s, IR_RBRACK_PTR)
@@ -1035,7 +1035,7 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, IR_PTR_SEP)
         emit_reg(s, elem_ptr)
         emit_str(s, IR_NL)
-        return emit_array_elem_widen(s, result, local.array_elem_type, elem_ty)
+        return emit_array_elem_widen(s, result, lv_array_elem_type(local), elem_ty)
 
     # AGAST #1504: a GLOBAL `[N]T` array. The branch above covers only an
     # array local, so a global array fell through to the pointer fallback
@@ -1090,27 +1090,27 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # `s.vec_field[i]` shape but not bare-local `v[i]`.  Without this,
     # vec_push_u16_method's `v[0] == 3` lowers to `inttoptr i64 %vec_struct`
     # which clang rejects (struct → ptr not allowed).
-    if e.left.kind == EXPR_IDENT and local != null and local.var_type == TYPE_STRUCT and local.type_name_len > 4
-        if *(local.type_name + 0) == 'V' and *(local.type_name + 1) == 'e' and *(local.type_name + 2) == 'c' and *(local.type_name + 3) == '$'
-            return emit_vec_ptr_index(s, local.reg, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 }, e.right)
+    if e.left.kind == EXPR_IDENT and local != null and lv_var_type(local) == TYPE_STRUCT and lv_type_name_len(local) > 4
+        if *(lv_type_name(local) + 0) == 'V' and *(lv_type_name(local) + 1) == 'e' and *(lv_type_name(local) + 2) == 'c' and *(lv_type_name(local) + 3) == '$'
+            return emit_vec_ptr_index(s, local.reg, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, e.right)
 
-    if e.left.kind == EXPR_IDENT and local != null and local.var_type == TYPE_STRUCT and local.type_name_len >= 5
-        if *(local.type_name + 0) == 'S' and *(local.type_name + 1) == 'p' and *(local.type_name + 2) == 'a' and *(local.type_name + 3) == 'n' and *(local.type_name + 4) == '$'
+    if e.left.kind == EXPR_IDENT and local != null and lv_var_type(local) == TYPE_STRUCT and lv_type_name_len(local) >= 5
+        if *(lv_type_name(local) + 0) == 'S' and *(lv_type_name(local) + 1) == 'p' and *(lv_type_name(local) + 2) == 'a' and *(lv_type_name(local) + 3) == 'n' and *(lv_type_name(local) + 4) == '$'
             let idx_s: i32 = emit_expr(s, e.right)
             # GEP to data ptr field (index 0 of Span struct)
             let data_ptr_ptr: i32 = next_reg(s)
             emit_str(s, IR_INDENT)
             emit_reg(s, data_ptr_ptr)
             emit_str(s, IR_GEP_NAMED)
-            emit_name(s, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
+            emit_name(s, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
             emit_str(s, IR_PTR_SEP)
             emit_reg(s, local.reg)
             emit_str(s, c", i32 0, i32 0\n")
             let data_ptr: i32 = next_reg(s)
             emit_load_into(s, IR_TY_PTR, data_ptr, data_ptr_ptr)
             # Decode element type from suffix after "Span$"
-            let elem_name_s: *u8 = local.type_name + 5
-            let elem_len_s: i32 = local.type_name_len - 5
+            let elem_name_s: *u8 = lv_type_name(local) + 5
+            let elem_len_s: i32 = lv_type_name_len(local) - 5
             var elem_ty_s3: *u8 = c"i64"
             var elem_kind_s: i32 = TYPE_I64
             if elem_len_s == 2 and *(elem_name_s + 0) == 'u' and *(elem_name_s + 1) == '8'
@@ -1696,9 +1696,9 @@ fn unknown_field_refused(s: *EmitterState, e: *Expr) -> i32
     if e.left == null or e.left.kind != EXPR_IDENT
         return 0
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-    if loc == null or loc.var_type != TYPE_STRUCT or loc.type_name == null
+    if loc == null or lv_var_type(loc) != TYPE_STRUCT or lv_type_name(loc) == null
         return 0
-    let st: *StructDef = find_struct(s, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+    let st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
     if st == null
         return 0
     var f: *StructField = st.fields
@@ -1723,11 +1723,11 @@ fn unknown_struct_member_refused(s: *EmitterState, e: *Expr) -> i32
     if e.left == null or e.left.kind != EXPR_IDENT
         return 0
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-    if loc == null or loc.var_type != TYPE_STRUCT or loc.type_name == null or loc.type_name_len <= 0
+    if loc == null or lv_var_type(loc) != TYPE_STRUCT or lv_type_name(loc) == null or lv_type_name_len(loc) <= 0
         return 0
-    if find_struct(s, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }) != null
+    if find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) != null
         return 0
-    if s.error_count > 0 and name_eq(StrView { ptr: (s.unknown_struct_name), len: (s.unknown_struct_name_len) as i64 }, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 }) == 1
+    if s.error_count > 0 and name_eq(StrView { ptr: (s.unknown_struct_name), len: (s.unknown_struct_name_len) as i64 }, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
         return 1
     let file: *u8 = emitter_source_file()
     if file != null
@@ -1741,13 +1741,13 @@ fn unknown_struct_member_refused(s: *EmitterState, e: *Expr) -> i32
     eprints_cstr(c": error: `")
     eprint_bytes(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
     eprints_cstr(c"` is a `")
-    eprint_bytes(StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
+    eprint_bytes(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
     eprints_cstr(c"`, which names no declared struct: it has no field `")
     eprint_bytes(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     eprints_cstr(c"` (is an import missing?)\n")
     s.error_count = s.error_count + 1
-    s.unknown_struct_name = loc.type_name
-    s.unknown_struct_name_len = loc.type_name_len
+    s.unknown_struct_name = lv_type_name(loc)
+    s.unknown_struct_name_len = lv_type_name_len(loc)
     return 1
 
 # AGAST #4263: `o.expect("x").v` / `o.frob().v`, a field of a method call the
@@ -1774,14 +1774,14 @@ pub fn primitive_member_refused(s: *EmitterState, e: *Expr) -> i32
     if e.left == null or e.left.kind != EXPR_IDENT
         return 0
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-    if loc == null or loc.bk_unsure == 1 or loc.type_name_len > 0
+    if loc == null or lv_bk_unsure(loc) == 1 or lv_type_name_len(loc) > 0
         return 0
     var sigil: *u8 = c""
-    var scalar: i32 = loc.var_type
-    if loc.var_type == TYPE_PTR
+    var scalar: i32 = lv_var_type(loc)
+    if lv_var_type(loc) == TYPE_PTR
         sigil = c"*"
-        scalar = loc.pointee_type
-    else if loc.var_type == TYPE_I64 and loc.is_bool == 1
+        scalar = lv_pointee_type(loc)
+    else if lv_var_type(loc) == TYPE_I64 and loc.is_bool == 1
         scalar = TYPE_BOOL
     let name: *u8 = primitive_name_from_type(scalar)
     if name == null
