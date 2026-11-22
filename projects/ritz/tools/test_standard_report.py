@@ -8,6 +8,10 @@ makes them more than opinion is that each one names a counting rule here, so
 
 One row per counting rule, each with the shape it must catch and the nearest
 shape it must not; then the exemption syntax and the tree walk.
+
+The per-module pins (the counts each converted module must hold) live in
+test_standard_pins/, one file per module.  Add a new module pin as its own
+new file there — never append it here (AGAST #4551).
 """
 
 import json
@@ -269,66 +273,9 @@ def test_cli_json_and_list(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Converted module groups (#1347).  Each group that has been driven to zero is
-# pinned here, so a new raw `*T` parameter has to be converted or exempted with
-# a reason deliberately rather than landing quietly.  The whole tree is still
-# being converted, so the pin is per module, not tree-wide.
+# The report itself is held to docs/STANDARD.md.  Per-module pins live in
+# tools/test_standard_pins/, one file per module (AGAST #4551).
 # ---------------------------------------------------------------------------
-
-RITZ_ROOT = Path(__file__).resolve().parent.parent
-
-
-def test_json_module_has_no_raw_pointer_parameters():
-    """AGAST #4446: json's API takes references, Span and StrView."""
-    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "json.ritz"]))
-    assert summary["raw-ptr-param"] == {"violations": 0, "exempt": 0}
-    assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
-
-
-def test_str_module_has_no_raw_pointer_parameters():
-    """AGAST #4534: str is C-string interop only; every raw *u8 is a C ABI.
-
-    The two functions with a StrView/String equivalent and no callers
-    (strrchr, strncpy) were deleted; the remaining 25 raw pointer parameters
-    across 15 functions are exempted against the C ABI they exist to serve.
-    strchr and strstr stay because nexus/zeus test suites still call them.
-    """
-    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "str.ritz"]))
-    assert summary["raw-ptr-param"] == {"violations": 0, "exempt": 25}
-    assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
-
-
-# AGAST #4539: the remaining module groups (#1347 continuation).  Each
-# parameter that is not a raw boundary takes a reference or a span; the rest
-# are exempt against the C/allocator/sink ABI they exist to serve.  A new raw
-# `*T` here must be converted or exempted with a reason deliberately.
-RAW_PTR_PARAM_FREE_MODULES = {
-    "async/blocking_fs.ritz": 4,  # NUL-terminated paths handed to open(2)
-    "async/tasks.ritz": 0,
-    "async_net.ritz": 0,
-    "box.ritz": 1,  # allocator
-    "elf.ritz": 7,  # ELF image / .strtab / callback ABI
-    "fmt/digits.ritz": 4,  # fixed-size digit buffer sink
-    "fmt/impls.ritz": 3,  # NUL-terminated C string Display impls
-    "fmt/writer.ritz": 2,  # compiler-emitted sink protocol
-    "hashmap.ritz": 4,  # allocator
-    "io.ritz": 4,  # NUL-terminated C string printers
-    "iovec.ritz": 0,
-    "memory.ritz": 8,  # the allocator itself
-    "os/env.ritz": 1,  # execve(2) envp
-    "process.ritz": 0,
-    "ptr.ritz": 1,  # the raw-pointer primitive
-    "testlib.ritz": 9,  # C strings / execve(2) ABI
-    "timer.ritz": 0,
-}
-
-
-@pytest.mark.parametrize("module,exempt", sorted(RAW_PTR_PARAM_FREE_MODULES.items()))
-def test_module_has_no_raw_pointer_parameters(module, exempt):
-    """AGAST #4539: every raw *T parameter is converted or exempted with a reason."""
-    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / module]))
-    assert summary["raw-ptr-param"] == {"violations": 0, "exempt": exempt}
-    assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
 
 
 def test_every_counting_rule_names_a_rule_in_the_standard():
@@ -337,18 +284,4 @@ def test_every_counting_rule_names_a_rule_in_the_standard():
     for key, (rule_id, _) in RULES.items():
         assert f"#### {rule_id} " in doc, f"{key}: {rule_id} is not a rule in STANDARD.md"
         assert f"`{key}`" in doc, f"{key} is not named in STANDARD.md"
-
-
-def test_string_and_strview_modules_have_no_free_fn_methods():
-    """AGAST #4533: String/StrView APIs live on their impls, not free fns."""
-    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "string.ritz",
-                                   RITZ_ROOT / "ritzlib" / "strview.ritz"]))
-    assert summary["free-fn-method"] == {"violations": 0, "exempt": 0}
-
-
-def test_hashmap_module_has_no_null_returning_get():
-    """AGAST #4540: a missing key is None, not null (S-OPTION-1)."""
-    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "hashmap.ritz"]))
-    assert summary["null-return"] == {"violations": 0, "exempt": 0}
-    assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
 
