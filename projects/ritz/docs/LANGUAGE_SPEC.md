@@ -6910,21 +6910,27 @@ fn main() -> i32
     r - 11
 ```
 
-A `defer` among the statements the machine splits into states is refused at
-the `defer`, until it is lowered (AGAST #4013):
+A `defer` in a block the machine splits into states runs at every exit of
+that block, not at the end of a state (AGAST #4191): falling off the end
+(after the block's value), `return`, and `break` / `continue`, innermost
+block first and in reverse order within one.  As §13.7 says, the statement is
+evaluated at the exit, so it sees the values its names hold then:
 
-```ritz expect-error="`defer` in an async fn that awaits is not supported yet (AGAST #4013)"
+```ritz
 async fn dbl(x: i32) -> i32
     x * 2
 
 async fn go(n: i32) -> i32
-    defer n = 0
+    defer n = 0                  # runs after the tail's value is stored
     await dbl(n)
 
 fn main() -> i32
-    let r: i32 = await go(1)
+    let r: i32 = await go(1)     # 2; then the defer sets n to 0
     r - 2
 ```
+
+A deferred statement that itself awaits is refused at the `await`, until it
+is lowered (AGAST #4013).
 
 ### 16.3 Executors
 

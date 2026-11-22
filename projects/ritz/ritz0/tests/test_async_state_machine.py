@@ -207,6 +207,88 @@ RUNS = {
     "pending_inner_future_kept": (_LATER + "async fn mid() -> i32\n    CALLS += 1\n    let v: i32 = await later()\n"
                                   "    v\n\nasync fn go() -> i32\n    let v: i32 = await mid()\n"
                                   "    v + CALLS * 10\n\n" + _POLL_GO, 215),
+    # AGAST #4191: a `defer` in a block the machine splits runs at every exit
+    # edge of that block, not at the end of a state.  G counts its runs, so a
+    # row that doesn't run it (or runs it twice) exits differently.
+    # Falling off the end: the tail value is evaluated first (G is 0 there),
+    # the deferred body runs (G is 1), then Ready; main reads G back.
+    "defer_fallthrough": ("var G: i32 = 0\n\n" + _DBL +
+                          "async fn go(n: i32) -> i32\n    defer G = G + 1\n"
+                          "    let v: i32 = await dbl(n)\n    v * 10 + G\n\n"
+                          "pub fn main() -> i32\n    let r: i32 = await go(3)\n    G * 100 + r\n", 160),
+    # `return` in the block: the value is computed (6 + G, G still 0), then
+    # the defer runs (G is 10), then Ready.
+    "defer_on_return": ("var G: i32 = 0\n\n" + _DBL +
+                        "async fn go(n: i32) -> i32\n    defer G = G + 10\n"
+                        "    let v: i32 = await dbl(n)\n    if v > 0\n        return v + G\n    v\n\n"
+                        "pub fn main() -> i32\n    let r: i32 = await go(3)\n    G + r\n", 16),
+    # `break` leaves the loop body: its defer runs once per pass, including
+    # the pass that breaks.
+    "defer_loop_break": ("var G: i32 = 0\n\n" + _DBL +
+                         "async fn go(n: i32) -> i32\n    var s: i32 = 0\n    var i: i32 = 0\n"
+                         "    while i < n\n        i += 1\n        defer G = G + 1\n"
+                         "        let d: i32 = await dbl(i)\n        if d > 4\n            break\n"
+                         "        s += d\n    s * 10 + G\n\n"
+                         "pub fn main() -> i32\n    await go(3)\n", 63),
+    # `continue` leaves the loop body too: the deferred body runs on that pass.
+    "defer_loop_continue": ("var G: i32 = 0\n\n" + _DBL +
+                            "async fn go(n: i32) -> i32\n    var s: i32 = 0\n    var i: i32 = 0\n"
+                            "    while i < n\n        i += 1\n        defer G = G + 1\n"
+                            "        if i == 2\n            continue\n"
+                            "        s += await dbl(i)\n    s * 10 + G\n\n"
+                            "pub fn main() -> i32\n    await go(4)\n", 164),
+    # Two defers in one block run in reverse order (LIFO).
+    "defer_lifo": ("var G: i32 = 0\n\n" + _DBL +
+                   "async fn go(n: i32) -> i32\n    defer G = G * 10 + 1\n    defer G = G * 10 + 2\n"
+                   "    let v: i32 = await dbl(n)\n    v\n\n"
+                   "pub fn main() -> i32\n    let r: i32 = await go(3)\n    G * 10 + r\n", 216),
+    # A defer in an arm of an awaiting `if`, after its await: the arm's exit
+    # runs it, then the fn's tail reads it.
+    "defer_in_awaiting_arm_taken": ("var G: i32 = 0\n\n" + _DBL +
+                                    "async fn go(c: bool, n: i32) -> i32\n    var x: i32 = 0\n"
+                                    "    if c\n        let v: i32 = await dbl(n)\n        defer G = G + 10\n"
+                                    "        x = v\n    else\n        x = 1\n    x * 10 + G\n\n"
+                                    "pub fn main() -> i32\n    await go(true, 3)\n", 70),
+    "defer_in_awaiting_arm_not_taken": ("var G: i32 = 0\n\n" + _DBL +
+                                        "async fn go(c: bool, n: i32) -> i32\n    var x: i32 = 0\n"
+                                        "    if c\n        let v: i32 = await dbl(n)\n        defer G = G + 10\n"
+                                        "        x = v\n    else\n        x = 1\n    x * 10 + G\n\n"
+                                        "pub fn main() -> i32\n    await go(false, 3)\n", 10),
+    # A no-await arm of an awaiting `if` holding a defer: ritz0 keeps the arm
+    # whole, so ritz1 must lower the same defer (AGAST #4191, al_lower_arm).
+    "defer_in_no_await_arm": ("var G: i32 = 0\n\n" + _DBL +
+                              "async fn go(c: bool, n: i32) -> i32\n    var x: i32 = 0\n"
+                              "    if c\n        x = await dbl(n)\n"
+                              "    else\n        defer G = G + 10\n        x = 1\n    x * 10 + G\n\n"
+                              "pub fn main() -> i32\n    await go(false, 3)\n", 20),
+    # A `return` leaves two blocks: the loop body's defer, then the fn's,
+    # innermost first; the return value is computed before either (G is 1
+    # there, 2 once the body's defer runs, 12 once the fn's does too).
+    "defer_nested_return": ("var G: i32 = 0\n\n" + _DBL +
+                            "async fn go(n: i32) -> i32\n    defer G = G + 10\n    var i: i32 = 0\n"
+                            "    while i < n\n        i += 1\n        defer G = G + 1\n"
+                            "        let d: i32 = await dbl(i)\n        if d > 2\n"
+                            "            return i * 10 + G\n    G\n\n"
+                            "pub fn main() -> i32\n    let r: i32 = await go(3)\n    G * 10 + r\n", 141),
+    # The deferred statement is evaluated at exit, seeing its names' values
+    # then: n is 13 by the tail's await, and the defer reads that 13.
+    "defer_evaluated_at_exit": ("var G: i32 = 0\n\n" + _DBL +
+                                "async fn go(n: i32) -> i32\n    defer G = G + n\n    n = n + 10\n"
+                                "    await dbl(n)\n\n"
+                                "pub fn main() -> i32\n    let r: i32 = await go(3)\n    r + G\n", 39),
+    # The block form of `defer`: its statements run in source order at exit.
+    "defer_block_form": ("var G: i32 = 0\n\n" + _DBL +
+                         "async fn go(n: i32) -> i32\n    defer\n        G = G + 1\n        G = G + 2\n"
+                         "    await dbl(n)\n\n"
+                         "pub fn main() -> i32\n    let r: i32 = await go(3)\n    G * 10 + r\n", 36),
+    # `break` leaves the loop body, not the fn: the body's defer runs, the
+    # fn's does not (it waits for the tail's Ready).
+    "defer_break_skips_outer": ("var G: i32 = 0\n\n" + _DBL +
+                                "async fn go(n: i32) -> i32\n    defer G = G + 10\n    var i: i32 = 0\n"
+                                "    while i < n\n        i += 1\n        defer G = G + 1\n"
+                                "        let d: i32 = await dbl(i)\n        if d > 4\n            break\n"
+                                "    i * 10 + G\n\n"
+                                "pub fn main() -> i32\n    let r: i32 = await go(3)\n    r + G * 10\n", 163),
 }
 
 
@@ -261,10 +343,11 @@ REFUSALS = {
                            "pub fn main() -> i32\n    var p: P = P { n: 3 }\n    await go(@p, true)\n",
                            "cannot infer the type of the `if`'s value, which `go`'s future holds across "
                            "an `await`: cast an arm (`x as i32`)"),
-    # A defer the machine would split: refused at the `defer` itself.
-    "defer_among_states": (_DBL + "async fn go(n: i32) -> i32\n    ^defer n = 0\n    await dbl(n)\n\n"
-                           "pub fn main() -> i32\n    await go(3)\n",
-                           "`defer` in an async fn that awaits is not supported yet (AGAST #4013)"),
+    # A deferred statement that itself awaits would need its own states on
+    # every exit edge: refused at the `await` (AGAST #4191).
+    "defer_body_awaits": (_DBL + "async fn go(n: i32) -> i32\n    defer ^await dbl(n)\n    n\n\n"
+                          "pub fn main() -> i32\n    await go(3)\n",
+                          "`await` inside a `defer` in an async fn is not supported yet (AGAST #4013)"),
 }
 
 # An awaiting `match` that is an operand is refused, as is a jump out of the

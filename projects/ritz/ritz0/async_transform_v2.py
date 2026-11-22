@@ -493,6 +493,14 @@ def _has_await(node) -> bool:
     return _first_await(node) is not None
 
 
+def _has_return(node) -> bool:
+    """Whether `node` holds a `return` (which leaves the whole fn, and so
+    runs every active `defer`, however deeply it sits)."""
+    if isinstance(node, (rast.ReturnStmt, rast.ReturnExpr)):
+        return True
+    return any(_has_return(child) for child in _child_nodes(node))
+
+
 class _IfTyper(AsyncAnalyzer):
     """_infer_type that also reads through a value `if` and a block's tail,
     for an awaiting `if` operand's `__if_K` field (AGAST #4190).  ritz1's
@@ -716,6 +724,7 @@ class SimpleBodyTransformer:
 class _Loop:
     head: int   # the state that tests the condition: `continue` goes here
     exit: int   # the state after the loop: `break` goes here
+    scope: int = 0  # the loop body's defer-scope index: `break`/`continue` run from it
 
 
 class _CfgBuilder:
@@ -748,6 +757,11 @@ class _CfgBuilder:
         self.n_ifs = 0
         self.n_fors = 0
         self.n_matches = 0
+        # The `defer`s registered so far in each enclosing block, innermost
+        # last.  A deferred body runs on every exit edge of its block: the
+        # state machine can't leave that to the emitter, whose drop scopes
+        # don't span the states the block's exit does (AGAST #4191).
+        self.defer_scopes: List[List[rast.DeferStmt]] = []
         # Fields the lowering adds: awaited futures, await results,
         # short-circuit values, range-`for` vars and ends and binding
         # `match`es' scrutinees, in the order lowering meets them.
@@ -789,7 +803,52 @@ class _CfgBuilder:
         self._close(rast.ExprStmt(span=self.span, expr=jump), rast.ContinueStmt(span=self.span))
 
     def ret(self, value: Optional[rast.Expr], span):
-        self._close(self.rw.ready(value, span))
+        """Return Ready from the poll.  A Ready leaves every block, so every
+        active `defer` runs, innermost first, after `value` is stored."""
+        if not self._has_active_defers():
+            self._close(self.rw.ready(value, span))
+            return
+        self._emit_ready_value(value, span)
+        self._run_exit_defers(0)
+        self._close(self.abi.finish(span),
+                    rast.ReturnStmt(span=span, value=rast.BoolLit(span=span, value=True)))
+
+    def _emit_ready_value(self, value: Optional[rast.Expr], span):
+        """Store a Ready's value in `__result`, without finishing: PollAbi's
+        `_store_then_true` minus the finish, so defers can run in between."""
+        if value is None:
+            return
+        result = self.rw.result(span)
+        if result is not None:
+            self.emit(rast.AssignStmt(span=span, target=result, value=value,
+                                      lowered_return=self.abi.fn_name))
+        elif not isinstance(value, (rast.IntLit, rast.BoolLit, rast.Ident, rast.Field)):
+            self.emit(rast.ExprStmt(span=span, expr=value))
+
+    def _has_active_defers(self) -> bool:
+        return any(self.defer_scopes)
+
+    def _run_exit_defers(self, from_index: int):
+        """Run the defers of every block from `from_index` inward, innermost
+        block first and, within one, in reverse order (LARB §13.7).  Each
+        deferred block is rewritten afresh: the same body runs at several
+        exits, and a rewrite must not be shared between them."""
+        for scope in reversed(self.defer_scopes[from_index:]):
+            for defer in reversed(scope):
+                for stmt in self.rw.rewrite(defer.body).stmts:
+                    self.emit(stmt)
+
+    def _lower_return_tail(self, tail: rast.Expr, loop: Optional[_Loop]):
+        """The body's (or a block's) tail value when a `defer` is active: the
+        value is evaluated and stored, then the defers run, then Ready."""
+        if self.gen.fn_def.ret_type is not None:
+            self.lower_value(tail, ('result', tail.span), loop)
+        else:
+            self.lower_value(tail, None, loop)
+        if self.cur is not None:
+            self._run_exit_defers(0)
+            self._close(self.abi.finish(self.span),
+                        rast.ReturnStmt(span=tail.span, value=rast.BoolLit(span=tail.span, value=True)))
 
     def _add_field(self, name: str, ty: rast.Type) -> str:
         self.extra_fields.append((name, ty))
@@ -800,26 +859,51 @@ class _CfgBuilder:
 
     def lower_body(self, body: rast.Block):
         self.cur = self.new_block()  # state 0
-        self.lower_stmts(body.stmts, None)
-        if body.expr is not None:
-            self.lower_value(body.expr, ('return',), None)
-        if self.cur is not None:
-            # Off the end: a unit fn's Ready.
-            self.ret(None, self.span)
+        # The function body is a block like any other: a defer in it runs at
+        # its exits, which include the tail's Ready.
+        self._lower_block(body, None, ('return',))
 
-    def lower_stmts(self, stmts: List[rast.Stmt], loop: Optional[_Loop]):
+    def _lower_block(self, block: rast.Block, loop: Optional[_Loop], dest):
+        """A whole block: its statements, its tail value into `dest`, then its
+        fall-through defers.  A tail going to `return` stores its value before
+        the defers run, and then leaves every enclosing block's defers to run:
+        the fn's Ready."""
+
+        self.defer_scopes.append([])
+        self._lower_stmts(block.stmts, loop)
+        if block.expr is not None:
+            if dest == ('return',) and self._has_active_defers():
+                self._lower_return_tail(block.expr, loop)
+            else:
+                self.lower_value(block.expr, dest, loop)
+        elif dest == ('return',) and self.cur is not None:
+            self.ret(None, block.span)  # leaves the fn: every defer runs
+        if self.cur is not None:
+            self._run_exit_defers(len(self.defer_scopes) - 1)
+        self.defer_scopes.pop()
+
+    def _lower_stmts(self, stmts: List[rast.Stmt], loop: Optional[_Loop]):
         for stmt in stmts:
             self.lower_stmt(stmt, loop)
 
     def _needs_lowering(self, node, loop: Optional[_Loop]) -> bool:
-        return _has_await(node) or (loop is not None and _escaping_jump(node) is not None)
+        if _has_await(node) or (loop is not None and _escaping_jump(node) is not None):
+            return True
+        # A `return` runs every active defer, which the emitter can't see
+        # across states: lower the statement that holds it.
+        return self._has_active_defers() and _has_return(node)
 
     def lower_stmt(self, stmt: rast.Stmt, loop: Optional[_Loop]):
         if isinstance(stmt, rast.DeferStmt):
-            # Its block's exit is spread over states: it would run as its
-            # state ends, not as the block does.
-            raise AsyncLoweringError(
-                "`defer` in an async fn that awaits is not supported yet (AGAST #4013)", stmt.span)
+            # Nothing runs at the `defer`: its body runs at each exit of this
+            # block, which _run_exit_defers places on every edge.
+            jump = _first_await(stmt.body)
+            if jump is not None:
+                raise AsyncLoweringError(
+                    "`await` inside a `defer` in an async fn is not supported yet (AGAST #4013)",
+                    jump.span)
+            self.defer_scopes[-1].append(stmt)
+            return
         if not self._needs_lowering(stmt, loop):
             self.emit(self.rw.rewrite(stmt))
             if isinstance(stmt, rast.ReturnStmt):
@@ -842,8 +926,10 @@ class _CfgBuilder:
         elif isinstance(stmt, rast.WhileStmt):
             self._lower_while(stmt)
         elif isinstance(stmt, rast.BreakStmt):
+            self._run_exit_defers(loop.scope)
             self.goto(loop.exit)
         elif isinstance(stmt, rast.ContinueStmt):
+            self._run_exit_defers(loop.scope)
             self.goto(loop.head)
         elif isinstance(stmt, rast.UnsafeBlock):
             self.lower_value(stmt.body, None, loop)
@@ -864,9 +950,8 @@ class _CfgBuilder:
         body, exit_b = self.new_block(), self.new_block()
         self.branch(cond, body, exit_b)
         self.cur = body
-        self.lower_stmts(stmt.body.stmts, _Loop(head, exit_b))
-        if stmt.body.expr is not None:
-            self.lower_value(stmt.body.expr, None, _Loop(head, exit_b))
+        # `break` / `continue` leave the body block: its defers run from there.
+        self._lower_block(stmt.body, _Loop(head, exit_b, len(self.defer_scopes)), None)
         if self.cur is not None:
             self.goto(head)
         self.cur = exit_b
@@ -910,10 +995,8 @@ class _CfgBuilder:
         self.cur = body
         # A nested `for` can't reuse the name, so no outer rename is hidden.
         self.rw.renames[stmt.var] = var
-        loop = _Loop(incr, exit_b)
-        self.lower_stmts(stmt.body.stmts, loop)
-        if stmt.body.expr is not None:
-            self.lower_value(stmt.body.expr, None, loop)
+        loop = _Loop(incr, exit_b, len(self.defer_scopes))
+        self._lower_block(stmt.body, loop, None)
         del self.rw.renames[stmt.var]
         if self.cur is not None:
             self.goto(incr)
@@ -928,6 +1011,7 @@ class _CfgBuilder:
 
     def lower_value(self, expr: rast.Expr, dest, loop: Optional[_Loop]):
         """Evaluate `expr` into `dest`: None (discarded), ('return',),
+        ('result', span) (a Ready's value, before its defers and finish),
         ('field', local, span) or ('assign', stmt, target)."""
         while isinstance(expr, rast.Grouped):
             expr = expr.expr
@@ -954,16 +1038,14 @@ class _CfgBuilder:
                 self.goto(join)
             self.cur = join
         elif isinstance(expr, rast.Block):
-            self.lower_stmts(expr.stmts, loop)
-            if expr.expr is not None:
-                self.lower_value(expr.expr, dest, loop)
-            elif dest == ('return',) and self.cur is not None:
-                self.ret(None, expr.span)
+            self._lower_block(expr, loop, dest)
         elif isinstance(expr, rast.Match) and any(self._needs_lowering(arm.body, loop) for arm in expr.arms):
             self._lower_match(expr, dest, loop)
         elif isinstance(expr, rast.BreakExpr) and loop is not None:
+            self._run_exit_defers(loop.scope)
             self.goto(loop.exit)  # an arm's `break` (#4189)
         elif isinstance(expr, rast.ContinueExpr) and loop is not None:
+            self._run_exit_defers(loop.scope)
             self.goto(loop.head)
         elif isinstance(expr, rast.Await):
             self.lower_await(expr, dest)
@@ -1048,6 +1130,11 @@ class _CfgBuilder:
                 self.emit(rast.ExprStmt(span=value.span, expr=value))
         elif dest[0] == 'return':
             self.ret(value, value.span)
+        elif dest[0] == 'result':
+            # A Ready's value store on its own: the defers run after it, so
+            # the finish and return true come later (AGAST #4191).
+            self.emit(rast.AssignStmt(span=dest[1], target=self.rw.result(dest[1]), value=value,
+                                      lowered_return=self.abi.fn_name))
         elif dest[0] == 'field':
             _, name, span, *let = dest
             self.emit(rast.AssignStmt(span=span, target=self.rw.self_field(name, span), value=value,
