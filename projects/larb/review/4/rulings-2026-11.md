@@ -1733,7 +1733,9 @@ passed where `Tag { value: u32 }` goes, because a const can't have a struct
 type. The limit was there to catch an unexpected kind of site, and this isn't
 one. Each site becomes `Tag { value: TAG_X }`. Changing angelo's API to take
 `u32` would remove the type check R47 protects. Struct consts are a separate
-question, filed as #3412 (`pending`, blocks nothing).
+question, filed as #3412 (`closed`; decided by R60). The cleanup is #3481:
+angelo's `TAG_*` are whole `Tag` consts and callers pass them directly, with
+no `Tag { value: TAG_X }` wrapper.
 
 ### R47b: every non-struct arg for a by-value struct param (#3420)
 §9.2's "nothing converts to a struct" covers every argument that isn't the
@@ -1964,6 +1966,16 @@ evaluator shared by const and var, spec), ritz1 (reuse `emit_const_array_entry`,
 covers #3398, f64 globals typed `double`), optional cleanup (angelo TAG_*,
 harland eth/dhcp, the ROADMAP row).
 
+**Cleanup (#3481, after #3479/#3480).** `net/eth.ritz` now initialises
+`broadcast_mac: [6]u8 = [0xFF; 6]` in place and `eth_get_broadcast_mac` only
+returns it; angelo's `TAG_*` are whole `Tag` consts. harland dhcp's globals
+already conform (`dhcp_xid`/`dhcp_state` have initialisers; the `offered_*`
+buffers and their fallbacks are runtime data, not constants). The harland boot
+GUIDs stay hand-filled for now: ritz1 lowers a `[[packed]]` struct global
+initialiser as an unpacked LLVM struct (#4544), while ritz0 handles it. The
+canonical `broadcast_mac` site and angelo's 16 `Tag { value: TAG_X }` wrappers
+are gone; the 5 boot GUIDs (55 fields) wait on #4544.
+
 ### R61: `a[i] = v` order (#3432): LEFT TO RIGHT, CONFIRMED
 **Measured.** ritz0's plain store evaluates `v` before the place (`a[idx()] =
 val()` gives 87; `g[i][j] = v` gives 877). ritz1 goes place first (78, 778).
@@ -2103,7 +2115,7 @@ on #1816. Other edges are listed under "Then".
 | R57 | | #3472 | #3473 | #2159 depends on both |
 | R58 | | #3474 | #3475 | #2159 depends on both; dropping needs the phase's reference kinds |
 | R59 | #3476 library migration | #3477 | #3478 | both after #3476; #2159 depends on both |
-| R60 | | #3479 | #3480 (covers #3398) | #3481 cleanup after both |
+| R60 | | #3479 | #3480 (covers #3398) | #3481 cleanup after both — done for angelo `TAG_*` and harland eth; boot GUIDs wait on #4544 (`[[packed]]` globals under ritz1) |
 | R61 | #3482 ritz0 evaluation order + §13.6 | | | ritz1 already conforms |
 | R62 | #3483 spec + tests, #3484 ritzlib cleanup | | | bugs #3440, #3441 |
 | R63 | | #3485 `+%` ops, #3488 traps | #3486 `+%` ops, #3489 traps | #3485 and #3486, then #3487 migration, then #3488, then #3489 |
