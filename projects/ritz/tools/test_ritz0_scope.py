@@ -547,7 +547,6 @@ def test_every_scoped_step_is_a_step_main_yml_declares():
 
 @pytest.mark.parametrize("status, path", [
     ("M", "projects/ritz/tools/ci_local.py"),
-    ("M", "projects/ritz/tools/ritz0_scope.py"),
     ("M", "projects/ritz/docs/TESTING.md"),
     ("M", "projects/ritz/ritz0/tests/test_parser.py"),
     ("M", "projects/ritz/ritzlib/tests/test_argspec_errors.ritz"),
@@ -561,17 +560,34 @@ def test_a_compiler_free_change_skips_both_regression_steps(real_scopes, status,
         assert _real(step, status, path, real_scopes) is not None, (step.name, path)
 
 
+def test_the_scope_tool_is_a_harness_input(real_scopes):
+    """AGAST #4552: harness self-tests now start pytest, whose ritz0 conftest
+    loads read_guard, which imports tools/ritz0_scope.py.  A change to the
+    tool can change the harness step, so it is a harness input; the corpus
+    regression still never opens it."""
+    assert _real(ritz0_scope.HARNESS, "M",
+                 "projects/ritz/tools/ritz0_scope.py", real_scopes) is None
+    assert _real(ritz0_scope.REGRESSION, "M",
+                 "projects/ritz/tools/ritz0_scope.py", real_scopes) is not None
+
+
 @pytest.mark.parametrize("path, harness, regression", [
     ("projects/ritz/scripts/regression.sh", True, True),
     ("projects/ritz/scripts/test-regression-xpass.sh", True, True),
     ("projects/ritz/scripts/regression_baseline_keys.py", True, True),
     ("projects/ritz/tools/known_failures.py", True, True),
+    ("projects/ritz/tools/ritz0_scope.py", True, False),
     ("projects/ritz/cache.py", True, True),
     ("projects/ritz/Makefile", True, True),
     ("projects/ritz/examples/tier1_basics/01_hello/src/main.ritz", True, True),
     ("projects/ritz/examples/tier1_basics/01_hello/test.sh", True, True),
     ("known-failures/4000.toml", True, True),
     ("projects/ritz/ritz0/parser.py", False, True),
+    ("projects/ritz/ritz0/conftest.py", True, True),
+    ("projects/ritz/ritz0/read_guard.py", True, True),
+    ("projects/ritz/ritz0/harness/spawn_guard.py", True, True),
+    ("projects/ritz/ritz0/tests/test_reject_parity.py", True, False),
+    ("projects/ritz/ritz0/tests/test_implicit_narrowing.py", True, False),
     ("projects/ritz/ritz0/compiler_identity.py", True, True),
     ("projects/ritz/ritz1/src/main.ritz", False, True),
     ("projects/ritz/ritzlib/io.ritz", False, True),
@@ -660,6 +676,24 @@ def test_audit_names_a_listing_or_probe_an_add_would_change(narrow):
     )
     assert ritz0_scope.audit(r, NARROW, log) == [
         "projects/ritz/ritz0/ (listed)", "projects/ritz/runtime/gone.ll (probed)"]
+
+
+def test_audit_ignores_a_probe_below_a_regular_file(narrow):
+    """AGAST #4552: pytest probes `<every collected path>/pyvenv.cfg` and
+    `<path>/conda-meta/history`; when the path is a module file the kernel
+    answers ENOTDIR.  The probed path cannot exist without replacing the
+    file, and a change to the file is judged on its own, so it is no read.
+    An ENOENT probe under a directory is still a finding."""
+    r, _ = narrow
+    log = _trace(
+        r,
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz0/parser.py/pyvenv.cfg", 0x0, 0) = -1 ENOTDIR (Not a directory)',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz0/parser.py/conda-meta/history", 0x0, 0) = -1 ENOTDIR (Not a directory)',
+        '1 openat(AT_FDCWD</x>, "@/projects/ritz/ritz0/parser.py/pyvenv.cfg", O_RDONLY) = -1 ENOTDIR (Not a directory)',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz0/newdir/pyvenv.cfg", 0x0, 0) = -1 ENOENT (No such file or directory)',
+    )
+    assert ritz0_scope.audit(r, NARROW, log) == [
+        "projects/ritz/ritz0/newdir/pyvenv.cfg (probed)"]
 
 
 def test_audit_ignores_generated_paths(narrow):
@@ -768,6 +802,34 @@ def test_the_harness_audit_covers_compiler_identity_and_the_listing():
         REAL,
         '1 openat(AT_FDCWD<@/projects/ritz>, "ritz0", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<@/projects/ritz/ritz0>',
         '1 openat(AT_FDCWD<@/projects/ritz>, "ritz0/compiler_identity.py", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/ritz0/compiler_identity.py>',
+    )
+    assert ritz0_scope.audit(REAL, ritz0_scope.HARNESS, log) == []
+
+
+def test_the_harness_audit_covers_the_reject_parity_pytest_run():
+    """The exact trace shape CI rejected after #4541 (AGAST #4552): the
+    reject-parity self-test runs pytest, which loads ritz0/conftest.py and its
+    plugins (read_guard imports tools/ritz0_scope.py), imports the two corpus
+    tables, lists ritz0/tests and ritz0/harness, stats every test file, and
+    probes `<path>/pyvenv.cfg`/`conda-meta/history` (ENOTDIR when `path` is a
+    file) and `pyvenv.cfg`/`__init__.py` in the directories it walks."""
+    log = _trace(
+        REAL,
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0>, "conftest.py", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/ritz0/conftest.py>',
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0>, "read_guard.py", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/ritz0/read_guard.py>',
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0/harness>, "spawn_guard.py", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/ritz0/harness/spawn_guard.py>',
+        '1 openat(AT_FDCWD<@/projects/ritz/tools>, "ritz0_scope.py", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/tools/ritz0_scope.py>',
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0/tests>, "test_reject_parity.py", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/ritz0/tests/test_reject_parity.py>',
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0/tests>, "test_implicit_narrowing.py", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/ritz0/tests/test_implicit_narrowing.py>',
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0>, "tests", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<@/projects/ritz/ritz0/tests>',
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0>, "harness", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<@/projects/ritz/ritz0/harness>',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz0/tests/test_parser.py", {st_mode=S_IFREG|0644, ...}, 0) = 0',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz0/tests/__init__.py", 0x0, 0) = -1 ENOENT (No such file or directory)',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz0/tests/pyvenv.cfg", 0x0, 0) = -1 ENOENT (No such file or directory)',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/docs/pyvenv.cfg", 0x0, 0) = -1 ENOENT (No such file or directory)',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz0/read_guard.py/pyvenv.cfg", 0x0, 0) = -1 ENOTDIR (Not a directory)',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/tools/ritz0_scope.py/conda-meta/history", 0x0, 0) = -1 ENOTDIR (Not a directory)',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz0/emitter/__init__.py", {st_mode=S_IFREG|0644, ...}, 0) = 0',
     )
     assert ritz0_scope.audit(REAL, ritz0_scope.HARNESS, log) == []
 

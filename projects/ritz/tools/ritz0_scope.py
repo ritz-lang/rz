@@ -42,8 +42,9 @@ CI on main passes no base, so main keeps running the step on every push.
 
 "ritz0-step sources" are the tracked text files under projects/ritz except
 docs/, tools/smoke_stack/ (the smoke step runs it), tools/test_*.py (those run
-in the tools step, not this one) and this file (it names what it allows; the
-step never runs it), plus the manifests of the packages they name.  A source
+in the tools step, not this one) and this file (it names what it allows, so
+its text is never taken as a step naming anything), plus the manifests of the
+packages they name.  A source
 names a package by a path to it ("pkg", /pkg, pkg/...) or a Ritz import of it
 (`import pkg.x`, also inside a Python string holding a program).  Comments
 and docstrings don't name anything: in Python only string literals that are
@@ -172,6 +173,16 @@ RITZ0 = Step(STEP)
 # change the key the self-test computes, so the harness declares them
 # rather than skipping.  #3915 moved the harness out of the package and
 # introduced the import, which the first measurement predated.
+#
+# Re-measured 2026-11-22 (AGAST #4541, #4552), same recipe: the reject-parity
+# self-test runs pytest on ritz0/tests/test_reject_parity.py, which loads
+# ritz0/conftest.py and the plugins it names (spawn_guard, cost_meter,
+# only_files, read_guard; read_guard imports tools/ritz0_scope.py), the two
+# corpus tables the test imports, and lists ritz0/tests, ritz0/harness and
+# every top-level directory it walks looking for the test (adding a
+# pyvenv.cfg/conda-meta marker or an __init__.py changes what it collects or
+# ignores).  Only those pytest inputs are reads: modifying any other test
+# file still skips the harness.
 HARNESS = Step(
     "Regression harness self-tests",
     reads=("projects/ritz/scripts/",
@@ -179,8 +190,26 @@ HARNESS = Step(
            "projects/ritz/Makefile",
            "projects/ritz/cache.py",
            "projects/ritz/tools/known_failures.py",
-           "projects/ritz/ritz0/compiler_identity.py"),
-    lists=("projects/ritz", "projects/ritz/tools", "projects/ritz/ritz0"),
+           "projects/ritz/tools/ritz0_scope.py",
+           "projects/ritz/ritz0/compiler_identity.py",
+           "projects/ritz/ritz0/conftest.py",
+           "projects/ritz/ritz0/cost_meter.py",
+           "projects/ritz/ritz0/only_files.py",
+           "projects/ritz/ritz0/read_guard.py",
+           "projects/ritz/ritz0/harness/batching.py",
+           "projects/ritz/ritz0/harness/fast_link.py",
+           "projects/ritz/ritz0/harness/ritz0_inproc.py",
+           "projects/ritz/ritz0/harness/spawn_guard.py",
+           "projects/ritz/ritz0/tests/test_reject_parity.py",
+           "projects/ritz/ritz0/tests/test_if_expression_requires_else.py",
+           "projects/ritz/ritz0/tests/test_implicit_narrowing.py"),
+    lists=("projects/ritz", "projects/ritz/tools", "projects/ritz/ritz0",
+           "projects/ritz/ritz0/tests", "projects/ritz/ritz0/harness",
+           "projects/ritz/ritz0/emitter", "projects/ritz/ritz0/test",
+           "projects/ritz/benchmarks", "projects/ritz/docs",
+           "projects/ritz/grammars", "projects/ritz/ritz1",
+           "projects/ritz/ritzlib", "projects/ritz/runtime",
+           "projects/ritz/test"),
     label="harness-step")
 
 # Measured 2026-11-19 (AGAST #4206), as HARNESS, over a cold
@@ -324,6 +353,11 @@ def _source_files(repo: Path, step: Step = RITZ0) -> list[tuple[str, str]]:
     files = []
     for rel in step_files(repo, step):
         p = PurePosixPath(rel)
+        if p.name == _SELF:
+            # This tool's literals are the allowlist itself (TOP_DIRS names
+            # `.claude`, ...).  Reading it must not turn those constants into
+            # the step naming every path they enumerate (AGAST #4552).
+            continue
         if p.suffix not in _SOURCE_SUFFIXES and p.name not in _SOURCE_NAMES:
             continue
         try:
@@ -661,7 +695,15 @@ def _kind(call: str, rest: str) -> str | None:
     args, _, result = rest.rpartition("=")
     if call in _OPENS and _WRITE_FLAGS.search(args) and "O_RDONLY" not in args:
         return None  # an output
-    if re.match(r"\s*-1 E(NOENT|NOTDIR)\b", result):
+    if re.match(r"\s*-1 ENOTDIR\b", result):
+        # A prefix of the path is a regular file, so the path itself cannot
+        # exist: adding it would mean replacing that file with a directory.
+        # A change to the file is already judged on its own (if it is in the
+        # read set) or is an output, so the probe reads nothing.  pytest does
+        # this for every path it collects: `<file>/pyvenv.cfg` and
+        # `<file>/conda-meta/history` (AGAST #4552).
+        return None
+    if re.match(r"\s*-1 ENOENT\b", result):
         return "probe"
     if re.match(r"\s*-1 ", result):
         return None  # refused (EACCES, ...): nothing learnt
