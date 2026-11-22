@@ -8,7 +8,7 @@
 
 instantiates `impl<T> Span<T>`'s `get` (a method is specialised only once
 called: AGAST #3617), and `get`'s `return *(self.ptr + idx)` moves a T out of
-a pointer.  ritz0 reports it at `.../ritzlib/span.ritz:145:16`; ritz1 and
+a pointer.  ritz0 reports it at `.../ritzlib/span.ritz:147:16`; ritz1 and
 ritz1_selfhosted printed `main.ritz:92:12`, a line main.ritz doesn't have,
 because ref_check located every error in the driver's input file.
 
@@ -95,7 +95,7 @@ CASES = {
         f"import ritzlib.span\n\n{DROP_T}\nfn f(p: @Span<T>) -> i32\n    let x: T = p.get(0)\n    return 0\n",
         {},
         str(RITZ_ROOT / "ritzlib" / "span.ritz"),
-        "145:16",
+        "147:16",
         MOVE_OUT,
     ),
     "user_module": (

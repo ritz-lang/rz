@@ -720,7 +720,7 @@ struct Span<T>
 |----------|-----------|-------------|
 | `span_empty` | `fn<T>() -> Span<T>` | Create empty span |
 | `span_from_ptr` | `fn<T>(ptr: *T, len: i64) -> Span<T>` | From raw pointer |
-| `span_from_vec` | `fn<T>(v: *Vec<T>) -> Span<T>` | From Vec |
+| `span_from_vec` | `fn<T>(v: @Vec<T>) -> Span<T>` | From Vec |
 | `span_from_cstr` | `fn(cstr: *u8) -> Span<u8>` | From C string |
 | `span_literal` | `fn(ptr: *u8, len: i64) -> Span<u8>` | From literal with known length |
 
@@ -737,11 +737,11 @@ struct Span<T>
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `span_slice` | `fn<T>(s: *Span<T>, start: i64, end: i64) -> Span<T>` | Sub-span |
+| `span_slice` | `fn<T>(s: @Span<T>, start: i64, end: i64) -> Span<T>` | Sub-span |
 | `span_from` | `fn<T>(s: *Span<T>, start: i64) -> Span<T>` | From start to end |
 | `span_to` | `fn<T>(s: *Span<T>, end: i64) -> Span<T>` | From beginning to end |
-| `span_take` | `fn(s: *Span<u8>, n: i64) -> Span<u8>` | First n bytes |
-| `span_skip` | `fn(s: *Span<u8>, n: i64) -> Span<u8>` | Skip first n bytes |
+| `span_take` | `fn(s: @Span<u8>, n: i64) -> Span<u8>` | First n bytes |
+| `span_skip` | `fn(s: @Span<u8>, n: i64) -> Span<u8>` | Skip first n bytes |
 
 **String Operations** (for `Span<u8>`):
 
@@ -750,14 +750,14 @@ the same name, and `span_as_strview` / `span_from_strview` convert between the t
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `span_as_strview` | `fn(s: *Span<u8>) -> StrView` | View the same bytes as a StrView |
-| `span_eq` | `fn(a: *Span<u8>, b: *Span<u8>) -> bool` | Compare equality |
-| `span_eq_cstr` | `fn(s: *Span<u8>, cstr: *u8) -> bool` | Compare to C string |
-| `span_contains` | `fn(haystack: *Span<u8>, needle: *Span<u8>) -> bool` | Contains check |
-| `span_starts_with` | `fn(s: *Span<u8>, prefix: *Span<u8>) -> bool` | Prefix check |
-| `span_ends_with` | `fn(s: *Span<u8>, suffix: *Span<u8>) -> bool` | Suffix check |
-| `span_find` | `fn(haystack: *Span<u8>, needle: *Span<u8>) -> i64` | Find substring |
-| `span_find_byte` | `fn(s: *Span<u8>, c: u8) -> i64` | Find byte |
+| `span_as_strview` | `fn(s: @Span<u8>) -> StrView` | View the same bytes as a StrView |
+| `span_eq` | `fn(a: @Span<u8>, b: @Span<u8>) -> bool` | Compare equality |
+| `span_eq_cstr` | `fn(s: @Span<u8>, cstr: *u8) -> bool` | Compare to C string |
+| `span_contains` | `fn(haystack: @Span<u8>, needle: @Span<u8>) -> bool` | Contains check |
+| `span_starts_with` | `fn(s: @Span<u8>, prefix: @Span<u8>) -> bool` | Prefix check |
+| `span_ends_with` | `fn(s: @Span<u8>, suffix: @Span<u8>) -> bool` | Suffix check |
+| `span_find` | `fn(haystack: @Span<u8>, needle: @Span<u8>) -> i64` | Find substring |
+| `span_find_byte` | `fn(s: @Span<u8>, c: u8) -> i64` | Find byte |
 
 ---
 
