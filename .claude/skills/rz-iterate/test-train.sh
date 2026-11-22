@@ -1637,5 +1637,43 @@ out="$(cd "$T" && bash "$TR" wait gates/train-000000000000-1@hostx.log 2>&1)"; r
 [[ $rc -eq 1 ]] && has "$out" "discarded by a rebuild" "wait refuses an unknown remote log with exit 1 (#4525)" \
     || bad "wait refuses an unknown remote log with exit 1 (#4525) (rc=$rc)"
 
+# 19b. #4526: after `land` reserves the local slot, a next gate dispatched to a
+# remote host releases it at once: no train gate is coming here, so the slot
+# belongs to room gates.
+fetch; git -C "$M" checkout -q main
+s="$(room wr s/wr WR)"; fetch; git -C "$M" checkout -q main
+rm -f "$RES"; bash "$TR" build "wr:$s" >/dev/null 2>&1
+bash "$TR" land >/dev/null 2>&1
+[[ -e "$RES" ]] && ok "land writes .train-reserved before the next gate" \
+    || bad "land writes .train-reserved before the next gate"
+two wb s/wb; bash "$TR" build "wb1:$c1" "wb2:$c2" >/dev/null 2>&1
+llog="$(bash "$TR" gate --next hostx 2>/dev/null)"; rc=$?
+[[ $rc -eq 0 && ! -e "$RES" ]] \
+    && ok "a remote next gate releases land's local reservation (#4526)" \
+    || { bad "a remote next gate releases land's local reservation (#4526) (rc=$rc, reserved: $( [[ -e "$RES" ]] && echo yes || echo no ))"; }
+bash "$TR" wait "$llog" >/dev/null 2>&1; bash "$TR" land "$llog" >/dev/null 2>&1; rm -f "$RES"
+# The local fallback is the case the reservation exists for: with no remote
+# host free, the gate runs here and the reservation must survive.
+fetch; git -C "$M" checkout -q main
+s="$(room ws s/ws WS)"; fetch; git -C "$M" checkout -q main
+rm -f "$RES"; bash "$TR" build "ws:$s" >/dev/null 2>&1
+bash "$TR" land >/dev/null 2>&1
+[[ -e "$RES" ]] && ok "land writes .train-reserved for the local fallback too" \
+    || bad "land writes .train-reserved for the local fallback too"
+two wl s/wl; bash "$TR" build "wl1:$c1" "wl2:$c2" >/dev/null 2>&1
+wl_tip="$(bash "$TR" show 2>/dev/null | sed -n 's/^TIP=//p' | head -1)"
+printf 'RZ_GATE_SLOTS=1\nRZ_TRAIN_SLOTS=1\n' > "$T/host-hostx.env"
+mkdir -p "$T/gates-hostx"
+exec 8>>"$T/gates-hostx/.gate-slot-0"; flock -n 8
+wl="$(bash "$TR" gate --next 2>"$T/err")"; rc=$?
+exec 8>&-; rm -f "$T/host-hostx.env"
+[[ $rc -eq 0 && -e "$RES" ]] \
+    && ok "a local fallback gate keeps land's reservation (#4526)" \
+    || { bad "a local fallback gate keeps land's reservation (#4526) (rc=$rc, reserved: $( [[ -e "$RES" ]] && echo yes || echo no ))"; sed 's/^/     | /' "$T/err"; }
+has "$(cat "$wl" 2>/dev/null)" "^SHA=$wl_tip$" "the local fallback ran the train"
+lout="$(bash "$TR" land "$wl" 2>&1)"
+has "$lout" "^MERGED " "the local fallback verdict lands"
+rm -f "$RES"
+
 unset RZ_TRAIN_DEBOUNCE; export RZ_TRAIN_MAX=8
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

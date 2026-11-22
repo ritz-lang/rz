@@ -1045,6 +1045,11 @@ gate_next() {
     fi
     llog="$GATES/$(basename "${rlog%.log}")@$host.log"
     printf 'SPEC=%s %s %s %s\n' "$host" "$ref" "$rlog" "$llog" >> "$st"
+    # The next gate is on another host, so no train gate will come here to
+    # take over land's reservation: release the local slot for room gates at
+    # once (AGAST #4526).  Only after the remote gate has started, and never
+    # on the local branch above, whose fallback gate the reservation protects.
+    rm -f "$RESERVED"
     echo "SPEC train $k tip=${tip:0:12} on $host: $rlog" >&2
     echo "$llog"
 }
