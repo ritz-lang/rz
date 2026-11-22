@@ -105,8 +105,8 @@ def test_spawn_env_takes_views():
 RESULT_SIGNATURES = [
     "pub fn spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>",
     "pub fn write_all(self: @&Process, data: StrView) -> Result<i64, Errno>",
-    "pub fn read_stdout(self: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>",
-    "pub fn read_stderr(self: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>",
+    "pub fn read_stdout(self: @&Process, buf: Span<u8>) -> Result<i64, Errno>",
+    "pub fn read_stderr(self: @&Process, buf: Span<u8>) -> Result<i64, Errno>",
     "pub fn wait(self: @&Process) -> Result<ProcessResult, Errno>",
 ]
 

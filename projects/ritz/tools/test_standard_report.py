@@ -298,6 +298,39 @@ def test_str_module_has_no_raw_pointer_parameters():
     assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
 
 
+# AGAST #4539: the remaining module groups (#1347 continuation).  Each
+# parameter that is not a raw boundary takes a reference or a span; the rest
+# are exempt against the C/allocator/sink ABI they exist to serve.  A new raw
+# `*T` here must be converted or exempted with a reason deliberately.
+RAW_PTR_PARAM_FREE_MODULES = {
+    "async/blocking_fs.ritz": 4,  # NUL-terminated paths handed to open(2)
+    "async/tasks.ritz": 0,
+    "async_net.ritz": 0,
+    "box.ritz": 1,  # allocator
+    "elf.ritz": 7,  # ELF image / .strtab / callback ABI
+    "fmt/digits.ritz": 4,  # fixed-size digit buffer sink
+    "fmt/impls.ritz": 3,  # NUL-terminated C string Display impls
+    "fmt/writer.ritz": 2,  # compiler-emitted sink protocol
+    "hashmap.ritz": 4,  # allocator
+    "io.ritz": 4,  # NUL-terminated C string printers
+    "iovec.ritz": 0,
+    "memory.ritz": 8,  # the allocator itself
+    "os/env.ritz": 1,  # execve(2) envp
+    "process.ritz": 0,
+    "ptr.ritz": 1,  # the raw-pointer primitive
+    "testlib.ritz": 9,  # C strings / execve(2) ABI
+    "timer.ritz": 0,
+}
+
+
+@pytest.mark.parametrize("module,exempt", sorted(RAW_PTR_PARAM_FREE_MODULES.items()))
+def test_module_has_no_raw_pointer_parameters(module, exempt):
+    """AGAST #4539: every raw *T parameter is converted or exempted with a reason."""
+    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / module]))
+    assert summary["raw-ptr-param"] == {"violations": 0, "exempt": exempt}
+    assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
+
+
 def test_every_counting_rule_names_a_rule_in_the_standard():
     """A key here points at a rule ID in docs/STANDARD.md, and the doc names the key."""
     doc = STANDARD.read_text()
