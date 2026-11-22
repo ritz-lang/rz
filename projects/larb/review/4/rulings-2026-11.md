@@ -1971,10 +1971,11 @@ harland eth/dhcp, the ROADMAP row).
 returns it; angelo's `TAG_*` are whole `Tag` consts. harland dhcp's globals
 already conform (`dhcp_xid`/`dhcp_state` have initialisers; the `offered_*`
 buffers and their fallbacks are runtime data, not constants). The harland boot
-GUIDs stay hand-filled for now: ritz1 lowers a `[[packed]]` struct global
-initialiser as an unpacked LLVM struct (#4544), while ritz0 handles it. The
+GUIDs were then migrated too (#4550, after #4544): each of the five is one
+in-place `EfiGuid { … }` constant initialiser, `init_guids()` and its two call
+sites are gone, and both compilers emit the same packed 16-byte images. The
 canonical `broadcast_mac` site and angelo's 16 `Tag { value: TAG_X }` wrappers
-are gone; the 5 boot GUIDs (55 fields) wait on #4544.
+are gone; so are the 55 hand-filled boot GUID fields.
 
 ### R61: `a[i] = v` order (#3432): LEFT TO RIGHT, CONFIRMED
 **Measured.** ritz0's plain store evaluates `v` before the place (`a[idx()] =
@@ -2115,7 +2116,7 @@ on #1816. Other edges are listed under "Then".
 | R57 | | #3472 | #3473 | #2159 depends on both |
 | R58 | | #3474 | #3475 | #2159 depends on both; dropping needs the phase's reference kinds |
 | R59 | #3476 library migration | #3477 | #3478 | both after #3476; #2159 depends on both |
-| R60 | | #3479 | #3480 (covers #3398) | #3481 cleanup after both — done for angelo `TAG_*` and harland eth; boot GUIDs wait on #4544 (`[[packed]]` globals under ritz1) |
+| R60 | | #3479 | #3480 (covers #3398) | #3481 cleanup after both — done for angelo `TAG_*` and harland eth, then the 5 boot GUIDs in #4550 (after #4544 fixed `[[packed]]` globals under ritz1) |
 | R61 | #3482 ritz0 evaluation order + §13.6 | | | ritz1 already conforms |
 | R62 | #3483 spec + tests, #3484 ritzlib cleanup | | | bugs #3440, #3441 |
 | R63 | | #3485 `+%` ops, #3488 traps | #3486 `+%` ops, #3489 traps | #3485 and #3486, then #3487 migration, then #3488, then #3489 |
