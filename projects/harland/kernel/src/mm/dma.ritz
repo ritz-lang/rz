@@ -6,7 +6,7 @@
 # - Non-cacheable (for cache coherency with devices)
 # - Registered with memory management for tracking
 
-import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
+import mm.pmm { pmm_alloc_contig, pmm_free_page, PAGE_SIZE }
 import mm.heap { kalloc, kfree }
 import mm.vmm { phys_to_virt }
 
@@ -37,6 +37,26 @@ var dma_next_id: u32 = 1
 # DMA Allocation and Deallocation
 # ============================================================================
 
+# Allocate `num_pages` physically contiguous pages for a DMA region.
+# Returns the first page's physical address, or 0 on failure. Physical page
+# 0 is never handed out, so 0 is an unambiguous failure sentinel.
+pub fn dma_alloc_pages(num_pages: u32) -> u64
+    if num_pages == 0
+        return 0
+    # One contiguous run, or nothing. pmm_alloc_contig returns 0 if no run
+    # of num_pages is free, so a fragmented PMM fails the request instead of
+    # handing back pages that are not adjacent (AGAST #4427).
+    return pmm_alloc_contig(num_pages as u64)
+
+# Free the contiguous run at `first_phys`. dma_free only ever passes a run
+# dma_alloc_pages returned, so these are exactly the pages that were
+# allocated, never an assumed-contiguous neighbour.
+pub fn dma_free_pages(first_phys: u64, num_pages: u32)
+    var i: u32 = 0
+    while i < num_pages
+        pmm_free_page(first_phys + ((i as u64) * PAGE_SIZE))
+        i = i + 1
+
 # Allocate physically contiguous DMA memory
 # Returns region ID, or error code if negative
 pub fn dma_alloc(size: u64) -> i64
@@ -51,32 +71,15 @@ pub fn dma_alloc(size: u64) -> i64
     if region == 0 as *DmaRegion
         return DMA_OUT_OF_MEMORY as i64
 
-    # Allocate physically contiguous pages
-    # For simplicity, we'll allocate individual pages and hope they're contiguous
-    # A real implementation would use a buddy allocator or physical memory defragmentation
-    
-    var first_phys: u64 = 0
-    var is_contiguous: u8 = 1
-    var i: u32 = 0
-    
-    while i < num_pages
-        let phys_page: u64 = pmm_alloc_page()
-        if phys_page == 0
-            # Free already-allocated pages
-            var j: u32 = 0
-            while j < i
-                pmm_free_page(first_phys + ((j as u64) * PAGE_SIZE))
-                j = j + 1
-            kfree(region as *u8)
-            return DMA_OUT_OF_MEMORY as i64
-        
-        if i == 0
-            first_phys = phys_page
-        else if phys_page != first_phys + ((i as u64) * PAGE_SIZE)
-            # Pages not contiguous - mark flag
-            is_contiguous = 0
-        
-        i = i + 1
+    # Allocate one physically contiguous run. A DMA region is advertised to
+    # the device as a single physical range (dma_get_phys), so pages stitched
+    # together from a fragmented PMM would make the device DMA over unrelated
+    # memory. If no run of num_pages is free, fail the whole request rather
+    # than hand back a non-contiguous region (AGAST #4427).
+    let first_phys: u64 = dma_alloc_pages(num_pages)
+    if first_phys == 0
+        kfree(region as *u8)
+        return DMA_OUT_OF_MEMORY as i64
 
     # Initialize region structure
     (*region).id = dma_next_id
@@ -116,12 +119,9 @@ pub fn dma_free(region_id: u32) -> i32
     if region == 0 as *DmaRegion
         return DMA_NOT_FOUND
     
-    # Free physical pages
-    var i: u32 = 0
-    while i < (*region).num_pages
-        pmm_free_page((*region).phys + ((i as u64) * PAGE_SIZE))
-        i = i + 1
-    
+    # Free exactly the contiguous run dma_alloc_pages returned.
+    dma_free_pages((*region).phys, (*region).num_pages)
+
     # Free region structure
     let idx: u32 = (*region).id % DMA_MAX_REGIONS
     dma_regions[idx as i32] = 0 as *DmaRegion

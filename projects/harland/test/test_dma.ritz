@@ -1,0 +1,126 @@
+# Harland DMA allocation tests (AGAST #4427)
+#
+# dma_alloc used to allocate pages one-by-one with pmm_alloc_page() and set
+# an is_contiguous flag that nothing ever read. On a fragmented PMM a
+# multi-page request came back as a stitched-together "region": dma_get_phys
+# advertised it as one physical range, and dma_free then freed
+# first_phys + i*PAGE_SIZE — unrelated pages — leaking the ones it actually
+# took and letting a device DMA over whatever lived at the assumed addresses.
+#
+# These tests drive the page allocator dma_alloc uses against a fragmented
+# PMM: a multi-page request must fail (return 0) instead of handing back a
+# non-contiguous run, and freeing must return exactly the pages allocated.
+#
+# The page-level helpers are tested rather than dma_alloc() itself because
+# dma_alloc() allocates its descriptor with kalloc(), and the kernel heap
+# cannot be initialised in a hosted test (kheap_init maps pages through the
+# VMM at kernel virtual addresses). dma_alloc() uses these helpers directly,
+# so the contiguity and free-exactly guarantees hold for it unchanged.
+
+import mm.dma { dma_alloc_pages, dma_free_pages }
+import mm.pmm { PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_mark_region_used, pmm_get_free_pages, pmm_range_has_free, pmm_alloc_contig }
+
+const TEST_PAGES: u64 = 64
+var g_bitmap: [8]u8     # (TEST_PAGES + 7) / 8 bytes
+
+# Fresh PMM with every page used; tests free the pages they need.
+fn fresh_pmm()
+    pmm_init(@g_bitmap as *u8, TEST_PAGES)
+
+fn free_page(page: u64)
+    pmm_mark_region_free(page * PAGE_SIZE, PAGE_SIZE)
+
+# A fragmented PMM (only even pages free: 2, 4, ... 30) must never yield a
+# multi-page DMA region. The old one-by-one allocator returned the address of
+# page 2 here — pages 2 and 4 are neither adjacent nor a real run.
+[[test]]
+fn test_fragmented_pmm_rejects_multipage_dma() -> i32
+    fresh_pmm()
+    var page: u64 = 2
+    while page <= 30
+        free_page(page)
+        page = page + 2
+
+    # 15 isolated free pages, but no two adjacent: dma_alloc_pages(2) must
+    # refuse rather than stitch pages 2 and 4 together.
+    if pmm_get_free_pages() != 15
+        return 1
+    let phys: u64 = dma_alloc_pages(2)
+    if phys != 0
+        return 2
+    # A refused request allocates nothing.
+    if pmm_get_free_pages() != 15
+        return 3
+    return 0
+
+# A real contiguous run is allocated as one range, and every page taken is
+# between the returned base and base + n*PAGE_SIZE.
+[[test]]
+fn test_contiguous_multipage_dma_is_one_run() -> i32
+    fresh_pmm()
+    free_page(10)
+    free_page(11)
+    free_page(12)
+    free_page(13)
+
+    if pmm_get_free_pages() != 4
+        return 1
+    let phys: u64 = dma_alloc_pages(4)
+    if phys != 10 * PAGE_SIZE
+        return 2
+    # Exactly four pages spent.
+    if pmm_get_free_pages() != 0
+        return 3
+    # The whole run is now in use, so nothing in it is free.
+    if pmm_range_has_free(phys, 4 * PAGE_SIZE)
+        return 4
+    return 0
+
+# dma_free_pages must return exactly the pages dma_alloc_pages took: the
+# free-page count comes back by exactly n, and a neighbour just past the run
+# stays used.
+[[test]]
+fn test_dma_free_returns_exactly_allocated_pages() -> i32
+    fresh_pmm()
+    free_page(10)
+    free_page(11)
+    free_page(12)
+    free_page(13)
+    # Page 14 is the neighbour just past the run and must stay used.
+
+    let phys: u64 = dma_alloc_pages(4)
+    if phys != 10 * PAGE_SIZE
+        return 1
+    if pmm_get_free_pages() != 0
+        return 2
+
+    dma_free_pages(phys, 4)
+
+    # Exactly four pages came back.
+    if pmm_get_free_pages() != 4
+        return 3
+    # Every page in the run is free again.
+    if not pmm_range_has_free(phys, 4 * PAGE_SIZE)
+        return 4
+    # The neighbour past the run was never touched: a 5-page run still does
+    # not exist.
+    if pmm_range_has_free(14 * PAGE_SIZE, PAGE_SIZE)
+        return 5
+    if pmm_alloc_contig(5) != 0
+        return 6
+    # A second 4-page allocation gets the same run back.
+    if dma_alloc_pages(4) != 10 * PAGE_SIZE
+        return 7
+    return 0
+
+# The mark_region_used import keeps the test's "all pages start used"
+# assumption honest: a page is used (not free) until a test frees it.
+[[test]]
+fn test_pmm_starts_fully_used() -> i32
+    fresh_pmm()
+    if pmm_get_free_pages() != 0
+        return 1
+    pmm_mark_region_used(5 * PAGE_SIZE, PAGE_SIZE)
+    if pmm_range_has_free(5 * PAGE_SIZE, PAGE_SIZE)
+        return 2
+    return 0
