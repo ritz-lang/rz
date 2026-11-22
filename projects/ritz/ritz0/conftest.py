@@ -177,6 +177,7 @@ pytest_plugins = ["spawn_guard", "cost_meter", "only_files", "read_guard"]
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
+RITZ1_SELFHOSTED = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
 # Build product, not a tracked file — see test_ritz1_ptr_arith_chain.py.
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
@@ -211,7 +212,7 @@ SMOKE_FILES = (
 )
 _SMOKE_PATHS = frozenset((Path(__file__).resolve().parent / f) for f in SMOKE_FILES)
 # Fixtures that build ritz1; a test that asks for one is not smoke.
-_BUILD_FIXTURES = ("ritz1_bin", "ritz_start")
+_BUILD_FIXTURES = ("ritz1_bin", "ritz_start", "ritz1_selfhosted")
 
 
 def is_smoke_item(item) -> bool:
@@ -385,6 +386,22 @@ def ritz1_bin(request) -> Path:
 def ritz_start(ritz1_bin) -> Path:
     """Path to the runtime start object; built alongside ritz1 by `ritz1_bin`."""
     return RITZ_START
+
+
+@pytest.fixture(scope="session")
+def ritz1_selfhosted() -> Path:
+    """The compiler ritz1 built from its own source (AGAST #4541).
+
+    `make -C ritz1 bootstrap` builds it; the gate's "Build ritz1 +
+    ritz1_selfhosted" step runs that before the ritz0 unit tests.  Fails,
+    never skips, when it is absent: a skipped parity test is
+    indistinguishable from a passing one in aggregate output (#1327).
+    """
+    if not RITZ1_SELFHOSTED.exists():
+        pytest.fail(
+            f"{RITZ1_SELFHOSTED} is missing; run `make -C ritz1 bootstrap` "
+            f"(the gate's bootstrap step does)")
+    return RITZ1_SELFHOSTED
 
 
 @pytest.fixture(scope="session")
