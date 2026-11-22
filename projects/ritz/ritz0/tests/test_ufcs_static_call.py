@@ -70,7 +70,7 @@ fn main() -> i32
 
 
 def test_receiver_ufcs_still_works(tmp_path):
-    """`s.len()` -> `string_len(@s)` must be unaffected."""
+    """`s.len()` must still resolve through `impl String`."""
     result = _compile(tmp_path, RECEIVER_UFCS)
     assert result.returncode == 0, (
         f"receiver-style UFCS call regressed:\n{result.stderr}"

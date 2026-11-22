@@ -59,7 +59,7 @@ pub fn kmain() -> i32
     m.insert(1, 2)
     let s: String = string_from("core")
     free(p)
-    return (m[1] + vec_get(@v, 0) + string_len(@s)) as i32
+    return (m[1] + vec_get(@v, 0) + s.len()) as i32
 """
 
 

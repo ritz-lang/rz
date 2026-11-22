@@ -260,10 +260,10 @@ import ritzlib.string
 
 fn main() -> i32
     var s: String = string_new()
-    string_push(@&s, 65)
-    string_push(@&s, 66)
-    let n: i64 = string_len(@s)
-    let b: u8 = string_get(@s, 1)
+    s.push(65)
+    s.push(66)
+    let n: i64 = s.len()
+    let b: u8 = s.get(1)
     return n as i32 + b as i32 - 26
 """
 

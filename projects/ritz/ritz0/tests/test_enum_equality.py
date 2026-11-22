@@ -211,6 +211,6 @@ def test_strview_equality_still_rejected(tmp_path):
         "`StrView == StrView` compiled again — narrowing the aggregate-compare "
         "guard to exempt enums must not exempt every struct."
     )
-    assert "strview_eq" in (result.stdout + result.stderr), (
+    assert "a.eq(b)" in (result.stdout + result.stderr), (
         "the StrView rejection lost its remediation hint"
     )

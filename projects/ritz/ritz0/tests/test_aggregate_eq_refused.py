@@ -10,7 +10,7 @@
 
 ritz0 refuses both at the comparison (_reject_aggregate_compare); ritz1 and
 ritz1_selfhosted now do too, with the same hint: tags-only for a payload enum,
-strview_eq / string_eq_string for a StrView / String.
+`a.eq(b)` / `a.eq_string(@b)` for a StrView / String.
 
 What still compiles: a fieldless enum's tags (#1660), pointers to structs, and
 a payload enum's variant tested with `match`.  Their exit codes come from what
@@ -43,7 +43,7 @@ def _main(*lines, pre=""):
 
 
 _TAGS = "a variant carries a payload, so `==` would compare tags only; use `match` to test the variant"
-_STRVIEW = "use strview_eq(a, b) from ritzlib.strview"
+_STRVIEW = "use a.eq(b) from ritzlib.strview"
 
 # Each row: the source, the type the refusal names, and the hint it gives ("" for none).
 # The refusal is at the comparison's left operand, the token after `if `.

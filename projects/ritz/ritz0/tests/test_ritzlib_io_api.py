@@ -6,7 +6,7 @@ io is the bottom rung of the idiomatic-ritzlib ladder (io -> str/strview/string
 it establishes, following ritzlib/argspec.ritz (#1448):
 
 * a String is taken as `@String` (a borrow), never as a raw `*String` --
-  matching every other String API (string_len(s: @String), ...);
+  matching every other String API (`s.len()`, ...);
 * the only raw pointers in io's public surface are the four `*_cstr`
   functions, which exist for C-string interop and say so in their doc
   comment, pointing callers at prints/println(StrView) instead.

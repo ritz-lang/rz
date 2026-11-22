@@ -129,7 +129,7 @@ ADDR_SLOTS = {
 }
 
 # A method of a ritzlib type, dispatched to a free fn that takes the receiver
-# as its first param (`a.cmp(b)`, `strview_cmp(a, b)` on ritz1, `StrView_cmp`
+# as its first param (`a.cmp(b)` lowers to `StrView_cmp` on ritz1;
 # on ritz0), judges its arguments as that free fn's call does (AGAST #3154).
 # One row per receiver kind each compiler resolves its own way.
 UFCS = "import ritzlib.strview\nimport ritzlib.string\nimport ritzlib.gvec\n\n" + COPY

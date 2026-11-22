@@ -4,10 +4,10 @@ THE CHANGE
 
 `s.push_str(x)` on a ritzlib `String` found its free fn (`string_push_str`)
 through a name table, ritz0's `ufcs.py` and ritz1's `ufcs_non_generic_prefix`.
-R66 replaces the table with impl blocks in the type's own file, each method a
-one-line `pub` wrapper of the free fn, as `span.ritz`'s `impl<T> Span<T>`
-already is. The tables themselves went later, one ticket per compiler
-(#3496, #3497).
+R66 replaces the table with impl blocks in the type's own file, as
+`span.ritz`'s `impl<T> Span<T>` already is. AGAST #4533 then moved each free
+fn's body into its impl method and deleted the free fn. The tables themselves
+went separately, one ticket per compiler (#3496, #3497).
 
 ONLY String HERE
 
@@ -22,9 +22,9 @@ though nothing called them. This step's first gate measured 272 failures.
 
 THE TESTS
 
-  * `impl String` holds exactly the methods listed here, each `pub`, each a
-    single `return string_<method>(...)` of its own free fn. A missing,
-    extra, private or misrouted wrapper fails here by name.
+  * `impl String` holds exactly the methods listed here, each `pub`, each
+    instance method taking `self`. Since AGAST #4533 the methods carry the
+    implementation themselves; the free fns they used to wrap are gone.
   * one program calling every wrapper by method syntax compiles: with the
     table gone (#3496), every call resolves through the impl.
   * literal arguments, end to end on ritz0 and ritz1: ritz1 now reaches its
@@ -64,11 +64,11 @@ STRING_STATIC = {
 }
 STRING_METHODS = STRING_STATIC | {
     "len", "cap", "is_empty", "as_ptr", "as_view", "get", "push", "push_str",
-    "push_cstr", "push_string", "push_bytes", "clear", "pop", "eq",
+    "push_cstr", "push_string", "push_bytes", "push_span", "clear", "pop", "eq",
     "eq_string", "hash", "eq_cstr", "clone", "starts_with_string",
     "ends_with_string", "contains_string", "find", "slice", "char_at",
     "set_char", "starts_with", "ends_with", "contains", "push_i64",
-    "to_lower", "eq_strview",
+    "to_lower", "eq_strview", "deinit",
 }
 
 
@@ -103,7 +103,7 @@ def _body_text(path: Path, fn: rast.FnDef) -> str:
 
 
 @pytest.mark.unit
-def test_impl_string_wraps_each_free_fn():
+def test_impl_string_holds_each_method():
     path = RITZLIB / "string.ritz"
     methods = _impl_methods(path, "String")
     assert set(methods) == STRING_METHODS, (
@@ -114,20 +114,21 @@ def test_impl_string_wraps_each_free_fn():
         params = [p.name for p in fn.params]
         if name in PROTOCOL_METHODS:
             # The print-sink protocol (LANGUAGE_SPEC §2.6): the compiler emits
-            # `sink.push_bytes(data: *u8, len: i64)`, so the wrapper cannot
-            # forward the Span the free fn now takes.
+            # `sink.push_bytes(data: *u8, len: i64)`, so this one keeps the
+            # raw (ptr, len) shape; `push_span` takes the Span.
             assert params == ["self", "bytes", "len"], (
                 f"String.{name}: params {params!r}, want the protocol form")
             continue
-        want = f"string_{name}({', '.join(params)})"
-        if fn.ret_type is not None:
-            want = f"return {want}"
-        body = _body_text(path, fn)
-        assert body == want, f"String.{name}: body {body!r}, want {want!r}"
         if name in STRING_STATIC:
             assert "self" not in params, f"String.{name} is a constructor"
         else:
             assert params and params[0] == "self", f"String.{name} takes self"
+    # The free fns these methods replaced are gone (AGAST #4533).
+    src = path.read_text()
+    for name in STRING_METHODS - STRING_STATIC:
+        free = "push_bytes" if name == "push_span" else name
+        assert re.search(rf"^pub fn string_{re.escape(free)}\b", src, re.M) is None, (
+            f"free fn string_{free} still declared")
 
 
 # Every wrapper, by method syntax (constructors as `String.m(...)`).

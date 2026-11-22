@@ -7,7 +7,7 @@ literal is stored NUL-terminated. Before this `take("A")` worked but `let p: *u8
 "A"`, `return` and a field did not, while `take(sv)` compiled with no NUL promise.
 
 A non-literal StrView (`sv as *u8` too) and a String never fit `*u8`: write `.ptr`
-or `string_as_ptr`. A literal that doesn't fit its element or scalar type is an
+or `s.as_ptr()`. A literal that doesn't fit its element or scalar type is an
 error wherever it is, and a non-literal array element narrows only under section
 7.5. `[1, 300]` into `[2]u8` was a silent 44 on both compilers.
 
@@ -54,7 +54,7 @@ _MAIN = "fn main() -> i32\n    0\n"
 _SV = "struct Holder\n    p: *u8\n"
 _STRVIEW = ("a StrView is not a `*u8`: only a string literal converts; "
             "write `.ptr` if you know it is NUL-terminated")
-_STRING = "a String is not a `*u8`: write `string_as_ptr(@&s)`"
+_STRING = "a String is not a `*u8`: write `s.as_ptr()`"
 _IMPORT_STRING = "import ritzlib.string\n"
 _MAKE_STRING = 'var s: String = string_from("A")'
 
@@ -348,12 +348,12 @@ REJECTED.update({
                         4, 20, _not_a("Span<u8>")),
     "cstr_strview_let": (_fn("", 'let s: StrView = c"abc"\ns.len'), 2, 22, _not_a("StrView")),
     # AGAST #3766: a UFCS helper's receiver is its first param, so the literal
-    # meets the one after it: `strview_cmp(self, other: StrView)`'s `other`.
+    # meets the one after it: `StrView.cmp(self, other: StrView)`'s `other`.
     "cstr_strview_ufcs_arg": (_fn("v: StrView", 'v.cmp(c"abc") as i64'), 2, 11, _not_a("StrView")),
 })
 
 # AGAST #3766: ritz1 matched a UFCS method's arguments from the helper's first
-# param when it wasn't named `self`, so `strview_cmp_cstr(s: StrView, cstr: *u8)`
+# param when it wasn't named `self`, so `StrView.cmp_cstr(s: StrView, cstr: *u8)`
 # met `c"abc"` with its StrView receiver param and refused it, failing all of
 # ritzlib/tests/test_strview.ritz. Compiled, not run: a one-file link has no
 # ritzlib.strview, and ritz0 resolves no free `strview_*` helper of a test's own.
@@ -450,7 +450,7 @@ RITZ0_ACCEPTED = {
 _ASYNC_ARG = 'async fn g(p: *u8) -> i32\n    *p as i32\nfn main() -> i32\n    await g("A")\n'
 _EXTERN_ARG = 'extern fn take(p: *u8) -> i32\nfn main() -> i32\n    take("A")\n'
 _STRING_AS_PTR = (_IMPORT_STRING + 'fn main() -> i32\n    var s: String = string_from("A")\n'
-                  "    let p: *u8 = string_as_ptr(@&s)\n    *p as i32\n")
+                  "    let p: *u8 = s.as_ptr()\n    *p as i32\n")
 
 
 def _emit(compiler, src, ll, work, roots):

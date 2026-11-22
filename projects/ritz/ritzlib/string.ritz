@@ -9,7 +9,7 @@
 # Usage:
 #   var s: String = string_from("hello")
 #   s.push_str(" world")
-#   prints(string_as_ptr(@s))
+#   prints(s.as_ptr())
 #   # Automatic cleanup when s goes out of scope (Drop trait)
 
 import ritzlib.memory
@@ -40,93 +40,6 @@ struct String
 impl Drop for String
     fn drop(self: @&String)
         vec_drop<u8>(@&self.data)
-#
-# ============================================================================
-# Method syntax support - enables s.len(), s.push(c), etc.
-# ============================================================================
-#
-# impl String
-#     # Get the length of the string (not including null terminator).
-#     fn len(self: @String) -> i64
-#         return self.data.len
-#
-#     # Get the capacity of the string.
-#     fn cap(self: @String) -> i64
-#         return self.data.cap
-#
-#     # Check if the string is empty.
-#     fn is_empty(self: @String) -> bool
-#         if self.data.len == 0
-#             return 1
-#         return 0
-#
-#     # Get a byte at the given index.
-#     fn get(self: @String, idx: i64) -> u8
-#         return vec_get<u8>(@self.data, idx)
-#
-#     # Push a single byte onto the string.
-#     fn push(self: @&String, b: u8) -> i32
-#         return vec_push<u8>(@self.data, b)
-#
-#     # Push another String onto this string.
-#     fn push_string(self: @&String, other: @String) -> i32
-#         return string_push_string(self, other)
-#
-#     # Push a C string onto this string.
-#     fn push_str(self: @&String, sv: StrView) -> i32
-#         return string_push_str(self, sv)
-#
-#     # Push an i64 value onto the string.
-#     fn push_i64(self: @&String, n: i64) -> i32
-#         return string_push_i64(self, n)
-#
-#     # Clear the string (keeps capacity).
-#     fn clear(self: @&String)
-#         vec_clear<u8>(@self.data)
-#
-#     # Pop the last byte.
-#     fn pop(self: @&String) -> u8
-#         return vec_pop<u8>(@self.data)
-#
-#     # Clone the string (deep copy).
-#     fn clone(self: @String) -> String
-#         return string_clone(self)
-#
-#     # Get character at index (returns 0 for out of bounds).
-#     fn char_at(self: @String, idx: i64) -> u8
-#         return string_char_at(self, idx)
-#
-#     # Set character at index.
-#     fn set_char(self: @&String, idx: i64, c: u8) -> i32
-#         return string_set_char(self, idx, c)
-#
-#     # Extract a substring.
-#     fn slice(self: @String, start: i64, end: i64) -> String
-#         return string_slice(self, start, end)
-#
-#     # Find substring. Returns index or -1.
-#     fn find(self: @String, needle: @String) -> i64
-#         return string_find(self, needle)
-#
-#     # Check if starts with prefix.
-#     fn starts_with(self: @String, prefix: @String) -> bool
-#         return string_starts_with_string(self, prefix)
-#
-#     # Check if ends with suffix.
-#     fn ends_with(self: @String, suffix: @String) -> bool
-#         return string_ends_with_string(self, suffix)
-#
-#     # Check if contains substring.
-#     fn contains(self: @String, needle: @String) -> bool
-#         return string_contains_string(self, needle)
-#
-#     # Compare for equality.
-#     fn eq(self: @String, other: @String) -> i32
-#         return string_eq_string(self, other)
-#
-#     # Hash the string.
-#     fn hash(self: @String) -> u64
-#         return string_hash(self)
 
 # ============================================================================
 # Constructors
@@ -162,7 +75,7 @@ pub fn string_from(sv: StrView) -> String
 
     # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
     if vec_ensure_cap<u8>(@&s.data, sv.len + 1)
-        string_push_bytes(@&s, Span<u8> { ptr: sv.ptr, len: sv.len })
+        s.push_span(Span<u8> { ptr: sv.ptr, len: sv.len })
 
     return s
 
@@ -175,7 +88,7 @@ pub fn string_from_cstr(cstr: *u8) -> String
     # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
     let len: i64 = strlen(cstr)
     if vec_ensure_cap<u8>(@&s.data, len + 1)
-        string_push_bytes(@&s, Span<u8> { ptr: cstr, len: len })
+        s.push_span(Span<u8> { ptr: cstr, len: len })
 
     return s
 
@@ -185,7 +98,7 @@ pub fn string_from_bytes(bytes: Span<u8>) -> String
 
     # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
     if vec_ensure_cap<u8>(@&s.data, bytes.len + 1)
-        string_push_bytes(@&s, bytes)
+        s.push_span(bytes)
 
     return s
 
@@ -195,349 +108,6 @@ pub fn string_from_bytes(bytes: Span<u8>) -> String
 pub fn string_from_strview(sv: StrView) -> String
     return string_from_bytes(Span<u8> { ptr: (sv.ptr), len: (sv.len) as i64 })
 
-# Drop (free) the string.
-pub fn string_drop(s: @&String)
-    vec_drop<u8>(@&s.data)
-
-# ============================================================================
-# Accessors
-# ============================================================================
-
-# Get the length of the string (not including null terminator).
-pub fn string_len(s: @String) -> i64
-    return s.data.len
-
-# Get the capacity of the string.
-pub fn string_cap(s: @String) -> i64
-    return s.data.cap
-
-# Check if the string is empty.
-pub fn string_is_empty(s: @String) -> bool
-    if s.data.len == 0
-        return true
-    return false
-
-# Get a null-terminated C string pointer.
-# The pointer is valid until the String is modified or dropped.
-# If the byte for the NUL can't be allocated, nothing is written: an empty
-# String reads as c"", a non-empty one returns null (AGAST #3551).
-# standard-exempt: null-return: raw pointer to the String's own buffer; null only when the NUL slot allocation fails (allocator boundary)
-pub fn string_as_ptr(s: @&String) -> *u8
-    # Ensure null-terminated
-    let len: i64 = s.data.len
-    if not vec_ensure_cap<u8>(@&s.data, len + 1)
-        if len == 0
-            return c""
-        return null
-    let ptr: *u8 = s.data.data
-    *(ptr + len) = 0  # Null terminate
-    return ptr
-
-# Borrow the string's bytes as a StrView (no copy, no NUL needed).
-# The view is valid until the String is modified or dropped. This is how a
-# String prints in an interpolation: print("s={string_as_view(@s)}") (#1641),
-# and how it reaches a StrView-taking API: path_exists(string_as_view(@s)).
-pub fn string_as_view(s: @String) -> StrView
-    return StrView { ptr: s.data.data, len: s.data.len }
-
-# Get a byte at the given index.
-pub fn string_get(s: @String, idx: i64) -> u8
-    return vec_get<u8>(@s.data, idx)
-
-# ============================================================================
-# Modification
-# ============================================================================
-
-# Push a single byte onto the string.
-pub fn string_push(s: @&String, b: u8) -> bool
-    return vec_push<u8>(@&s.data, b)
-
-# Push a StrView onto the string. A "..." literal is a StrView, so it passes
-# straight in. For a NUL-terminated C string use string_push_cstr.
-pub fn string_push_str(s: @&String, sv: StrView) -> bool
-    return string_push_bytes(s, Span<u8> { ptr: sv.ptr, len: sv.len })
-
-# Push a NUL-terminated C string onto the string (FFI / *u8 interop).
-# The length is measured first, so cstr may be string_as_ptr(s) itself.
-pub fn string_push_cstr(s: @&String, cstr: *u8) -> bool
-    return string_push_bytes(s, Span<u8> { ptr: cstr, len: strlen(cstr) })
-
-# Push another String onto this string. `other` may be `s` itself.
-pub fn string_push_string(s: @&String, other: @String) -> bool
-    return string_push_bytes(s, Span<u8> { ptr: other.data.data, len: other.data.len })
-
-# Push a slice of bytes (explicit length, no null-termination required).
-#
-# The one bulk append every other push_*, constructor and clone goes through
-# (AGAST #1931): reserve the whole length once, then memcpy. true on success,
-# false if the reserve fails, in which case the String is left untouched.
-# len <= 0 appends nothing. `bytes` may point into s's own buffer: it is
-# re-derived after the reserve, which can move that buffer.
-pub fn string_push_bytes(s: @&String, bytes_sv: Span<u8>) -> bool
-    let bytes: *u8 = bytes_sv.ptr
-    let len: i64 = bytes_sv.len
-    if len <= 0
-        return true
-    let old_len: i64 = s.data.len
-    # Keep old_len + len (and vec_ensure_cap's doubling of it) from overflowing.
-    if len > 4611686018427387904 - old_len
-        return false
-
-    # Is the source inside our own buffer? Remember its offset if so.
-    let base: i64 = s.data.data as i64
-    let src: i64 = bytes as i64
-    var own: bool = false
-    if base != 0 and src >= base and src < base + s.data.cap
-        own = true
-
-    if not vec_ensure_cap<u8>(@&s.data, old_len + len)
-        return false
-
-    var from: *u8 = bytes
-    if own
-        from = s.data.data + (src - base)
-    memcpy(s.data.data + old_len, from, len)
-    s.data.len = old_len + len
-    return true
-
-# Clear the string (keeps capacity).
-pub fn string_clear(s: @&String)
-    vec_clear<u8>(@&s.data)
-
-# Pop the last byte.
-pub fn string_pop(s: @&String) -> u8
-    return vec_pop<u8>(@&s.data)
-
-# ============================================================================
-# Comparison
-# ============================================================================
-
-# Compare a String with a StrView for equality. A "..." literal is a StrView:
-#     if string_eq(@s, "hello")
-pub fn string_eq(s: @String, other: StrView) -> bool
-    return string_eq_strview(s, other)
-
-# Compare two Strings for equality.
-pub fn string_eq_string(a: @String, b: @String) -> bool
-    return string_eq_strview(a, string_as_view(b))
-
-# Hash a string (for use in HashMap).
-pub fn string_hash(s: @String) -> u64
-    var h: u64 = fnv1a_init()
-    let len: i64 = s.data.len
-    for i in 0..len
-        h = fnv1a_byte(h, vec_get<u8>(@s.data, i))
-    return h
-
-# Compare a String to a C string.
-pub fn string_eq_cstr(s: @String, cstr: *u8) -> bool
-    let len: i64 = s.data.len
-
-    var i: i64 = 0
-    while i < len
-        if *(cstr + i) == 0
-            return false  # cstr is shorter
-        if vec_get<u8>(@s.data, i) != *(cstr + i)
-            return false
-        i += 1
-
-    # Check that cstr ends here
-    if *(cstr + len) != 0
-        return false
-
-    return true
-
-# ============================================================================
-# Utility
-# ============================================================================
-
-# Clone a string (deep copy).
-pub fn string_clone(s: @String) -> String
-    # One bulk copy; on a failed reserve the clone is empty.
-    var clone: String = string_new()
-    string_push_bytes(@&clone, Span<u8> { ptr: s.data.data, len: s.data.len })
-    return clone
-
-# ============================================================================
-# Predicates (String-to-String, length-based - no null termination)
-# ============================================================================
-
-# Check if string starts with a prefix String.
-pub fn string_starts_with_string(s: @String, prefix: @String) -> bool
-    let len: i64 = s.data.len
-    let prefix_len: i64 = prefix.data.len
-
-    if prefix_len > len
-        return false
-
-    var i: i64 = 0
-    while i < prefix_len
-        if vec_get<u8>(@s.data, i) != vec_get<u8>(@prefix.data, i)
-            return false
-        i += 1
-
-    return true
-
-# Check if string ends with a suffix String.
-pub fn string_ends_with_string(s: @String, suffix: @String) -> bool
-    let len: i64 = s.data.len
-    let suffix_len: i64 = suffix.data.len
-
-    if suffix_len > len
-        return false
-
-    let start: i64 = len - suffix_len
-    var i: i64 = 0
-    while i < suffix_len
-        if vec_get<u8>(@s.data, start + i) != vec_get<u8>(@suffix.data, i)
-            return false
-        i += 1
-
-    return true
-
-# Check if string contains a substring String.
-pub fn string_contains_string(s: @String, needle: @String) -> bool
-    let len: i64 = s.data.len
-    let needle_len: i64 = needle.data.len
-
-    if needle_len == 0
-        return true  # Empty needle always matches
-
-    if needle_len > len
-        return false
-
-    let search_end: i64 = len - needle_len + 1
-    for i in 0..search_end
-        var j: i64 = 0
-        var found: i32 = 1
-        while j < needle_len
-            if vec_get<u8>(@s.data, i + j) != vec_get<u8>(@needle.data, j)
-                found = 0
-                j = needle_len  # Break
-            j += 1
-        if found == 1
-            return true
-
-    return false
-
-# Index of the first occurrence of needle in s, or s.data.len when there is
-# none (S-RESULT-1's sanctioned index-or-length form, not an error). Compare
-# `i < s.data.len`.
-pub fn string_find(s: @String, needle: @String) -> i64
-    let len: i64 = s.data.len
-    let needle_len: i64 = needle.data.len
-
-    if needle_len == 0
-        return 0  # Empty needle at start
-
-    if needle_len > len
-        return len
-
-    let search_end: i64 = len - needle_len + 1
-    for i in 0..search_end
-        var j: i64 = 0
-        var found: i32 = 1
-        while j < needle_len
-            if vec_get<u8>(@s.data, i + j) != vec_get<u8>(@needle.data, j)
-                found = 0
-                j = needle_len  # Break
-            j += 1
-        if found == 1
-            return i
-
-    return len
-
-# Extract a substring from start (inclusive) to end (exclusive).
-pub fn string_slice(s: @String, start: i64, end: i64) -> String
-    let len: i64 = s.data.len
-    var result: String = string_new()
-
-    # Clamp bounds
-    var st: i64 = start
-    var en: i64 = end
-    if st < 0
-        st = 0
-    if en > len
-        en = len
-    if st >= en
-        return result
-
-    # Copy bytes
-    for i in st..en
-        string_push(@&result, vec_get<u8>(@s.data, i))
-
-    return result
-
-# Get character at index (returns 0 for out of bounds).
-pub fn string_char_at(s: @String, idx: i64) -> u8
-    if idx < 0 or idx >= s.data.len
-        return 0
-    return vec_get<u8>(@s.data, idx)
-
-# Set character at index. true on success, false if out of bounds.
-pub fn string_set_char(s: @&String, idx: i64, c: u8) -> bool
-    if idx < 0 or idx >= s.data.len
-        return false
-    vec_set<u8>(@&s.data, idx, c)
-    return true
-
-# ============================================================================
-# StrView predicates (a "..." literal is a StrView)
-# ============================================================================
-
-# Check if string starts with a prefix.
-pub fn string_starts_with(s: @String, prefix: StrView) -> bool
-    if prefix.len > s.data.len
-        return false
-    var i: i64 = 0
-    while i < prefix.len
-        if vec_get<u8>(@s.data, i) != *(prefix.ptr + i)
-            return false
-        i += 1
-
-    return true
-
-# Check if string ends with a suffix.
-pub fn string_ends_with(s: @String, suffix: StrView) -> bool
-    let suffix_len: i64 = suffix.len
-    let len: i64 = s.data.len
-    if suffix_len > len
-        return false
-
-    let start: i64 = len - suffix_len
-    var i: i64 = 0
-    while i < suffix_len
-        if vec_get<u8>(@s.data, start + i) != *(suffix.ptr + i)
-            return false
-        i += 1
-
-    return true
-
-# Check if string contains a substring.
-pub fn string_contains(s: @String, needle: StrView) -> bool
-    let needle_len: i64 = needle.len
-
-    if needle_len == 0
-        return true  # Empty needle always matches
-
-    let len: i64 = s.data.len
-    if needle_len > len
-        return false
-
-    let search_end: i64 = len - needle_len + 1
-    for i in 0..search_end
-        var j: i64 = 0
-        var found: i32 = 1
-        while j < needle_len
-            if vec_get<u8>(@s.data, i + j) != *(needle.ptr + j)
-                found = 0
-                j = needle_len  # Break
-            j += 1
-        if found == 1
-            return true
-
-    return false
-
 # ============================================================================
 # Number to String conversion
 # ============================================================================
@@ -545,41 +115,21 @@ pub fn string_contains(s: @String, needle: StrView) -> bool
 # Convert an i64 to a String.
 pub fn string_from_i64(n: i64) -> String
     var s: String = string_new()
-    string_push_i64(@&s, n)
+    s.push_i64(n)
     return s
-
-# Push an i64 value onto the string in decimal: the String replacement for
-# str.itoa, with no caller-sized buffer. true on success.
-pub fn string_push_i64(s: @&String, n: i64) -> bool
-    var buf: [20]u8
-    let len: i64 = fmt_i64_into(@buf[0], n)
-    return string_push_bytes(s, Span<u8> { ptr: @buf[0], len: len })
 
 # Convert a u64 to a hex string (with 0x prefix).
 pub fn string_from_hex(n: u64) -> String
     var s: String = string_new()
-    string_push_str(@&s, "0x")
+    s.push_str("0x")
     var buf: [16]u8
     let len: i64 = fmt_u64_hex_into(@buf[0], n)
-    string_push_bytes(@&s, Span<u8> { ptr: @buf[0], len: len })
+    s.push_span(Span<u8> { ptr: @buf[0], len: len })
     return s
 
 # ============================================================================
 # Case conversion (ASCII)
 # ============================================================================
-
-# Return a new String with ASCII uppercase letters lowered.
-# Bytes outside 'A'..'Z' are copied unchanged (no Unicode awareness).
-pub fn string_to_lower(s: @String) -> String
-    var out: String = string_with_cap(string_len(s))
-    var i: i64 = 0
-    while i < string_len(s)
-        var b: u8 = string_get(s, i)
-        if b >= 65 and b <= 90
-            b = b + 32
-        string_push(@&out, b)
-        i += 1
-    return out
 
 # Return a new String with the view's ASCII uppercase letters lowered.
 # Allocates: a StrView cannot own the rewritten bytes.
@@ -590,22 +140,17 @@ pub fn strview_to_lower(sv: StrView) -> String
         var b: u8 = *(sv.ptr + i)
         if b >= 65 and b <= 90
             b = b + 32
-        string_push(@&out, b)
+        out.push(b)
         i += 1
     return out
-
-# Compare a String's bytes to a StrView's, without allocating.
-pub fn string_eq_strview(s: @String, sv: StrView) -> bool
-    let mine: StrView = string_as_view(s)
-    return strview_eq(mine, sv)
 
 # ============================================================================
 # Method syntax (LARB R66, AGAST #3495)
 # ============================================================================
-# One-line `pub` wrappers of the free fns above, so `s.push_str(x)` resolves
-# through a real impl, as span.ritz's `impl<T> Span<T>` does.  Constructors
-# are static: `String.from("x")`.  `drop` is not wrapped: ritz0 takes any
-# `drop` method as the type's destructor.
+# The instance methods carry the implementation; the free fns they used to
+# wrap are gone (AGAST #4533). Constructors are static: `String.from("x")`.
+# `drop` is not defined here: ritz0 takes any `drop` method as the type's
+# destructor, so explicit early freeing is `s.deinit()` instead.
 impl String
     pub fn new() -> String
         return string_new()
@@ -631,96 +176,350 @@ impl String
     pub fn from_hex(n: u64) -> String
         return string_from_hex(n)
 
+    # Drop (free) the string.
+    pub fn deinit(self: @&String)
+        vec_drop<u8>(@&self.data)
+
+    # Get the length of the string (not including null terminator).
     pub fn len(self: @String) -> i64
-        return string_len(self)
+        return self.data.len
 
+    # Get the capacity of the string.
     pub fn cap(self: @String) -> i64
-        return string_cap(self)
+        return self.data.cap
 
+    # Check if the string is empty.
     pub fn is_empty(self: @String) -> bool
-        return string_is_empty(self)
+        if self.data.len == 0
+            return true
+        return false
 
+    # Get a null-terminated C string pointer.
+    # The pointer is valid until the String is modified or dropped.
+    # If the byte for the NUL can't be allocated, nothing is written: an empty
+    # String reads as c"", a non-empty one returns null (AGAST #3551).
+    # standard-exempt: null-return: raw pointer to the String's own buffer; null only when the NUL slot allocation fails (allocator boundary)
     pub fn as_ptr(self: @&String) -> *u8
-        return string_as_ptr(self)
+        # Ensure null-terminated
+        let len: i64 = self.data.len
+        if not vec_ensure_cap<u8>(@&self.data, len + 1)
+            if len == 0
+                return c""
+            return null
+        let ptr: *u8 = self.data.data
+        *(ptr + len) = 0  # Null terminate
+        return ptr
 
+    # Borrow the string's bytes as a StrView (no copy, no NUL needed).
+    # The view is valid until the String is modified or dropped. This is how a
+    # String prints in an interpolation: print("s={s.as_view()}") (#1641),
+    # and how it reaches a StrView-taking API: path_exists(s.as_view()).
     pub fn as_view(self: @String) -> StrView
-        return string_as_view(self)
+        return StrView { ptr: self.data.data, len: self.data.len }
 
+    # Get a byte at the given index.
     pub fn get(self: @String, idx: i64) -> u8
-        return string_get(self, idx)
+        return vec_get<u8>(@self.data, idx)
 
+    # Push a single byte onto the string.
     pub fn push(self: @&String, b: u8) -> bool
-        return string_push(self, b)
+        return vec_push<u8>(@&self.data, b)
 
+    # Push a StrView onto the string. A "..." literal is a StrView, so it passes
+    # straight in. For a NUL-terminated C string use s.push_cstr.
     pub fn push_str(self: @&String, sv: StrView) -> bool
-        return string_push_str(self, sv)
+        return self.push_span(Span<u8> { ptr: sv.ptr, len: sv.len })
 
+    # Push a NUL-terminated C string onto the string (FFI / *u8 interop).
+    # The length is measured first, so cstr may be s.as_ptr() itself.
     pub fn push_cstr(self: @&String, cstr: *u8) -> bool
-        return string_push_cstr(self, cstr)
+        return self.push_span(Span<u8> { ptr: cstr, len: strlen(cstr) })
 
+    # Push another String onto this string. `other` may be `s` itself.
     pub fn push_string(self: @&String, other: @String) -> bool
-        return string_push_string(self, other)
+        return self.push_span(Span<u8> { ptr: other.data.data, len: other.data.len })
+
+    # Push a slice of bytes (explicit length, no null-termination required).
+    #
+    # The one bulk append every other push_*, constructor and clone goes through
+    # (AGAST #1931): reserve the whole length once, then memcpy. true on success,
+    # false if the reserve fails, in which case the String is left untouched.
+    # len <= 0 appends nothing. `bytes` may point into the string's own buffer: it is
+    # re-derived after the reserve, which can move that buffer.
+    pub fn push_span(self: @&String, bytes_sv: Span<u8>) -> bool
+        let bytes: *u8 = bytes_sv.ptr
+        let len: i64 = bytes_sv.len
+        if len <= 0
+            return true
+        let old_len: i64 = self.data.len
+        # Keep old_len + len (and vec_ensure_cap's doubling of it) from overflowing.
+        if len > 4611686018427387904 - old_len
+            return false
+
+        # Is the source inside our own buffer? Remember its offset if so.
+        let base: i64 = self.data.data as i64
+        let src: i64 = bytes as i64
+        var own: bool = false
+        if base != 0 and src >= base and src < base + self.data.cap
+            own = true
+
+        if not vec_ensure_cap<u8>(@&self.data, old_len + len)
+            return false
+
+        var from: *u8 = bytes
+        if own
+            from = self.data.data + (src - base)
+        memcpy(self.data.data + old_len, from, len)
+        self.data.len = old_len + len
+        return true
 
     # standard-exempt: ptr-len-param: print sink protocol (LANGUAGE_SPEC §2.6): compiler-emitted call site
     pub fn push_bytes(self: @&String, bytes: *u8, len: i64) -> bool
-        return string_push_bytes(self, Span<u8> { ptr: bytes, len: len })
+        return self.push_span(Span<u8> { ptr: bytes, len: len })
 
+    # Clear the string (keeps capacity).
     pub fn clear(self: @&String)
-        string_clear(self)
+        vec_clear<u8>(@&self.data)
 
+    # Pop the last byte.
     pub fn pop(self: @&String) -> u8
-        return string_pop(self)
+        return vec_pop<u8>(@&self.data)
 
+    # Compare a String with a StrView for equality. A "..." literal is a StrView:
+    #     if s.eq("hello")
     pub fn eq(self: @String, other: StrView) -> bool
-        return string_eq(self, other)
+        return self.eq_strview(other)
 
+    # Compare two Strings for equality.
     pub fn eq_string(self: @String, b: @String) -> bool
-        return string_eq_string(self, b)
+        return self.eq_strview(b.as_view())
 
+    # Hash a string (for use in HashMap).
     pub fn hash(self: @String) -> u64
-        return string_hash(self)
+        var h: u64 = fnv1a_init()
+        let len: i64 = self.data.len
+        for i in 0..len
+            h = fnv1a_byte(h, vec_get<u8>(@self.data, i))
+        return h
 
+    # Compare a String to a C string.
     pub fn eq_cstr(self: @String, cstr: *u8) -> bool
-        return string_eq_cstr(self, cstr)
+        let len: i64 = self.data.len
 
+        var i: i64 = 0
+        while i < len
+            if *(cstr + i) == 0
+                return false  # cstr is shorter
+            if vec_get<u8>(@self.data, i) != *(cstr + i)
+                return false
+            i += 1
+
+        # Check that cstr ends here
+        if *(cstr + len) != 0
+            return false
+
+        return true
+
+    # Clone a string (deep copy).
     pub fn clone(self: @String) -> String
-        return string_clone(self)
+        # One bulk copy; on a failed reserve the clone is empty.
+        var clone: String = string_new()
+        clone.push_span(Span<u8> { ptr: self.data.data, len: self.data.len })
+        return clone
 
+    # Check if string starts with a prefix String.
     pub fn starts_with_string(self: @String, prefix: @String) -> bool
-        return string_starts_with_string(self, prefix)
+        let len: i64 = self.data.len
+        let prefix_len: i64 = prefix.data.len
 
+        if prefix_len > len
+            return false
+
+        var i: i64 = 0
+        while i < prefix_len
+            if vec_get<u8>(@self.data, i) != vec_get<u8>(@prefix.data, i)
+                return false
+            i += 1
+
+        return true
+
+    # Check if string ends with a suffix String.
     pub fn ends_with_string(self: @String, suffix: @String) -> bool
-        return string_ends_with_string(self, suffix)
+        let len: i64 = self.data.len
+        let suffix_len: i64 = suffix.data.len
 
+        if suffix_len > len
+            return false
+
+        let start: i64 = len - suffix_len
+        var i: i64 = 0
+        while i < suffix_len
+            if vec_get<u8>(@self.data, start + i) != vec_get<u8>(@suffix.data, i)
+                return false
+            i += 1
+
+        return true
+
+    # Check if string contains a substring String.
     pub fn contains_string(self: @String, needle: @String) -> bool
-        return string_contains_string(self, needle)
+        let len: i64 = self.data.len
+        let needle_len: i64 = needle.data.len
 
+        if needle_len == 0
+            return true  # Empty needle always matches
+
+        if needle_len > len
+            return false
+
+        let search_end: i64 = len - needle_len + 1
+        for i in 0..search_end
+            var j: i64 = 0
+            var found: i32 = 1
+            while j < needle_len
+                if vec_get<u8>(@self.data, i + j) != vec_get<u8>(@needle.data, j)
+                    found = 0
+                    j = needle_len  # Break
+                j += 1
+            if found == 1
+                return true
+
+        return false
+
+    # Index of the first occurrence of needle in self, or self.data.len when there
+    # is none (S-RESULT-1's sanctioned index-or-length form, not an error).
+    # Compare `i < self.data.len`.
     pub fn find(self: @String, needle: @String) -> i64
-        return string_find(self, needle)
+        let len: i64 = self.data.len
+        let needle_len: i64 = needle.data.len
 
+        if needle_len == 0
+            return 0  # Empty needle at start
+
+        if needle_len > len
+            return len
+
+        let search_end: i64 = len - needle_len + 1
+        for i in 0..search_end
+            var j: i64 = 0
+            var found: i32 = 1
+            while j < needle_len
+                if vec_get<u8>(@self.data, i + j) != vec_get<u8>(@needle.data, j)
+                    found = 0
+                    j = needle_len  # Break
+                j += 1
+            if found == 1
+                return i
+
+        return len
+
+    # Extract a substring from start (inclusive) to end (exclusive).
     pub fn slice(self: @String, start: i64, end: i64) -> String
-        return string_slice(self, start, end)
+        let len: i64 = self.data.len
+        var result: String = string_new()
 
+        # Clamp bounds
+        var st: i64 = start
+        var en: i64 = end
+        if st < 0
+            st = 0
+        if en > len
+            en = len
+        if st >= en
+            return result
+
+        # Copy bytes
+        for i in st..en
+            result.push(vec_get<u8>(@self.data, i))
+
+        return result
+
+    # Get character at index (returns 0 for out of bounds).
     pub fn char_at(self: @String, idx: i64) -> u8
-        return string_char_at(self, idx)
+        if idx < 0 or idx >= self.data.len
+            return 0
+        return vec_get<u8>(@self.data, idx)
 
+    # Set character at index. true on success, false if out of bounds.
     pub fn set_char(self: @&String, idx: i64, c: u8) -> bool
-        return string_set_char(self, idx, c)
+        if idx < 0 or idx >= self.data.len
+            return false
+        vec_set<u8>(@&self.data, idx, c)
+        return true
 
+    # Check if string starts with a prefix.
     pub fn starts_with(self: @String, prefix: StrView) -> bool
-        return string_starts_with(self, prefix)
+        if prefix.len > self.data.len
+            return false
+        var i: i64 = 0
+        while i < prefix.len
+            if vec_get<u8>(@self.data, i) != *(prefix.ptr + i)
+                return false
+            i += 1
 
+        return true
+
+    # Check if string ends with a suffix.
     pub fn ends_with(self: @String, suffix: StrView) -> bool
-        return string_ends_with(self, suffix)
+        let suffix_len: i64 = suffix.len
+        let len: i64 = self.data.len
+        if suffix_len > len
+            return false
 
+        let start: i64 = len - suffix_len
+        var i: i64 = 0
+        while i < suffix_len
+            if vec_get<u8>(@self.data, start + i) != *(suffix.ptr + i)
+                return false
+            i += 1
+
+        return true
+
+    # Check if string contains a substring.
     pub fn contains(self: @String, needle: StrView) -> bool
-        return string_contains(self, needle)
+        let needle_len: i64 = needle.len
 
+        if needle_len == 0
+            return true  # Empty needle always matches
+
+        let len: i64 = self.data.len
+        if needle_len > len
+            return false
+
+        let search_end: i64 = len - needle_len + 1
+        for i in 0..search_end
+            var j: i64 = 0
+            var found: i32 = 1
+            while j < needle_len
+                if vec_get<u8>(@self.data, i + j) != *(needle.ptr + j)
+                    found = 0
+                    j = needle_len  # Break
+                j += 1
+            if found == 1
+                return true
+
+        return false
+
+    # Push an i64 value onto the string in decimal: the String replacement for
+    # str.itoa, with no caller-sized buffer. true on success.
     pub fn push_i64(self: @&String, n: i64) -> bool
-        return string_push_i64(self, n)
+        var buf: [20]u8
+        let len: i64 = fmt_i64_into(@buf[0], n)
+        return self.push_span(Span<u8> { ptr: @buf[0], len: len })
 
+    # Return a new String with ASCII uppercase letters lowered.
+    # Bytes outside 'A'..'Z' are copied unchanged (no Unicode awareness).
     pub fn to_lower(self: @String) -> String
-        return string_to_lower(self)
+        var out: String = string_with_cap(self.len())
+        var i: i64 = 0
+        while i < self.len()
+            var b: u8 = self.get(i)
+            if b >= 65 and b <= 90
+                b = b + 32
+            out.push(b)
+            i += 1
+        return out
 
+    # Compare a String's bytes to a StrView's, without allocating.
     pub fn eq_strview(self: @String, sv: StrView) -> bool
-        return string_eq_strview(self, sv)
+        let mine: StrView = self.as_view()
+        return mine.eq(sv)

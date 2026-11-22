@@ -458,7 +458,7 @@ What a placeholder prints depends on the value's type:
 | `StrView`, `@StrView`, `*StrView` | exactly `len` bytes from `ptr` (no NUL needed, none past `len`) |
 | other pointers (`*u8`, ...) | the NUL-terminated bytes they point at |
 
-A `String` prints through its view: `print("s = {string_as_view(@s)}\n")`
+A `String` prints through its view: `print("s = {s.as_view()}\n")`
 (`ritzlib.string`). Every other type, including floats and other structs, is a
 compile error. ritz0 and ritz1 follow the same rules and print the same bytes
 (AGAST #1521, #1641).
@@ -527,7 +527,7 @@ fn main() -> i32
     var ir: String = string_new()
     emit_trunc(@&ir, 4, 2, "i32")
     format_into(@&ir, "  ret i32 %{4}\n")
-    print("{string_as_view(@ir)}")
+    print("{ir.as_view()}")
     return 0
 ```
 
@@ -542,14 +542,14 @@ fn main() -> i32
     var c: String = string_new()
     let n: i64 = 3
     format_into(@&c, "\"={{rax}},{{rax}},{{rdi}},~{{rcx}}\" ; {n} operands\n")
-    print("{string_as_view(@c)}")
+    print("{c.as_view()}")
     return 0
 ```
 
 **The sink** is a pointer to a struct (`@&buf`, or a `*T` / `@&T` value)
 whose method `push_bytes(data: *u8, len: i64)` resolves statically, exactly
 as `sink.push_bytes(data, len)` would (§12.2). `String`, `GrowBuf` and
-`Vec<u8>` provide it (`string_push_bytes`, `GrowBuf.push_bytes`,
+`Vec<u8>` provide it (`String.push_bytes`, `GrowBuf.push_bytes`,
 `vec_push_bytes`), and any type can by implementing it:
 
 ```ritz
@@ -1085,7 +1085,7 @@ fn main() -> i32
 `a[lo..hi]` slices a `Vec`, `Span` or `String`: elements `lo` up to but not
 including `hi`, and `a[lo..=hi]` includes `hi`. A slice of a `Span` is a `Span`
 over the same elements, so a write through it lands in `a`. A slice of a `Vec` or
-`String` is a new `Vec` or `String`, a copy (`vec_slice`, `string_slice`), unless a
+`String` is a new `Vec` or `String`, a copy (`vec_slice`, `String.slice`), unless a
 `Span` is expected, where it is a view like a `Span`'s: a `Span<T>` (or `[T]`)
 `let`, return value, argument, or variant payload (`Some(v[0..1])` into an
 `Option<[T]>`).
@@ -1138,7 +1138,7 @@ import ritzlib.strview
 
 fn main() -> i32
     var s: String = string_from("hello")
-    let n = string_len(@s)
+    let n = s.len()
     n as i32
 ```
 
@@ -1157,7 +1157,7 @@ fn main() -> i32
 A string literal fits a `*u8` slot ([§2.6](#26-literals)). Nothing else converts,
 because a `StrView` may be a slice with no terminator and a `String` has to be
 asked for one. `sv as *u8` is refused too. Write `.ptr` if you know the view is
-NUL-terminated, and `string_as_ptr` for a `String`:
+NUL-terminated, and `s.as_ptr()` for a `String`:
 
 ```ritz body expect-error="a StrView is not a `*u8`"
 let s: StrView = "hello"
@@ -1181,7 +1181,7 @@ fn main() -> i32
     let view: StrView = "hello"
     let a: *u8 = view.ptr              # You know this view is terminated
     var s: String = string_from("hello")
-    let b: *u8 = string_as_ptr(@&s)
+    let b: *u8 = s.as_ptr()
     let same: bool = *a == *b
     if same
         return 0
@@ -1234,7 +1234,7 @@ fn main() -> i32
 ```
 
 Ask for the conversion by name: `span_from_strview` for a `StrView` (via
-`string_as_view` for a `String`) and `span_from_cstr` for a `*u8`:
+`s.as_view()` for a `String`) and `span_from_cstr` for a `*u8`:
 
 ```ritz
 import ritzlib.span
@@ -1246,7 +1246,7 @@ fn main() -> i32
     let a: Span<u8> = span_from_strview(v)
     let b: Span<u8> = span_from_cstr(c"abc")
     var t: String = string_from("abc")
-    let c: Span<u8> = span_from_strview(string_as_view(@t))
+    let c: Span<u8> = span_from_strview(t.as_view())
     let n = a.len + b.len + c.len
     if n == 9
         return 0
@@ -3892,7 +3892,7 @@ fn main() -> i32
 
 Only a `StrView` takes a string pattern. A `*u8` or a `String` scrutinee is
 a compile error at the pattern: convert it first, with `strview_from_cstr(p)`
-or `string_as_view(@s)`. A `StrView` takes no integer, `bool` or variant
+or `s.as_view()`. A `StrView` takes no integer, `bool` or variant
 pattern.
 
 ```ritz expect-error="a string pattern needs a StrView scrutinee"
@@ -5001,16 +5001,16 @@ to heap memory. Only `Drop` makes it move-only.
 
 `String` and `Vec<T>` own heap buffers and implement `Drop` (§13.6, AGAST
 #2159), so they are move-only: the compiler frees the buffer when the owning
-binding's scope ends (§13.6). Don't call `string_drop` or `vec_drop` on an
-owning binding; the free functions remain for a `String` or `Vec<T>` held in
-raw memory and reached through a pointer:
+binding's scope ends (§13.6). Don't call `s.deinit()` or `vec_drop` on an
+owning binding; `String.deinit` and `vec_drop` remain for a `String` or
+`Vec<T>` held in raw memory and reached through a pointer:
 
 ```ritz
 import ritzlib.string
 
 fn main() -> i32
     var s = string_from("hello")    # s owns the buffer
-    string_len(@s) as i32           # freed once, when main returns
+    s.len() as i32                  # freed once, when main returns
 ```
 
 ### 13.2 Move Semantics
@@ -5237,7 +5237,7 @@ import ritzlib.string
 fn main() -> i32
     let s1 = string_from("hello")
     var s2 = s1                     # moves the buffer to s2; s1 is moved-from
-    string_len(@s2) as i32          # freed once, when main returns
+    s2.len() as i32                 # freed once, when main returns
 ```
 
 ### 13.3 Borrowing
@@ -5249,7 +5249,7 @@ import ritzlib.string
 
 fn main() -> i32
     var s = string_from("hello")
-    let n = string_len(@s)          # borrow for the call
+    let n = s.len()                 # borrow for the call
     n as i32
 ```
 
@@ -5404,12 +5404,12 @@ caller's place: `name` is an alias of it, so it has type `T` in the whole body.
 import ritzlib.string
 
 fn append(s: @&String) -> bool
-    string_push_str(s, " world")
+    s.push_str(" world")
 
 fn main() -> i32
     var s = string_from("hello")
     append(@&s)
-    let n = string_len(@s)
+    let n = s.len()
     n as i32
 ```
 
@@ -6580,8 +6580,8 @@ impl's `drop` at the end of a scope in another file (AGAST #3386).
 
 **Removed in RERITZ.** There is no `module::item` or `module.item` access
 form. An imported `pub` name lands in a single flat namespace, which is why the
-standard library uses long, prefixed free-function names (`strview_find`,
-`vec_push`, `string_from`) instead of short names behind a module path. A
+standard library gives types their own methods (`s.find(t)`, `v.push(x)`)
+and keeps long, prefixed names for free functions (`string_from`, `vec_new`). A
 private (non-`pub`) name is visible only in its own module (§15.2): it does not
 land in the importer's namespace, and two modules may each define a private
 `fn be16` [AGAST #1858].

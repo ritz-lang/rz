@@ -178,7 +178,7 @@ import ritzlib.result
 import ritzlib.strview
 
 fn parse_int(s: StrView) -> Result<i64, i32>
-    match strview_parse_i64(s)
+    match s.parse_i64()
         Some(n) => Ok(n)
         None => Err(1)             # error code: not a whole decimal number
 ```
@@ -493,185 +493,76 @@ struct Box<T>
     ptr: *T    # Pointer to heap-allocated T
 ```
 
-**Constructors**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `box_new` | `fn<T>(value: T) -> Box<T>` | Create box containing value |
-| `box_new_in` | `fn<T>(a: *Allocator, value: T) -> Box<T>` | `box_new` with the value in memory from `a`; empty if `a` is out of memory |
-
-**Operations** are methods (AGAST #4445):
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `b.get()` | `fn() -> T` | Get value (returns copy) |
-| `b.as_ptr()` | `fn() -> *T` | Get pointer to value |
-| `b.set(value)` | `fn(value: T)` | Set new value |
-| `b.valid()` | `fn() -> bool` | Check if valid |
-| `b.drop()` | `fn()` | Free the box now (`Box` implements `Drop`: it also runs at scope end) |
-
-**The `heap` keyword is not a `Box`.** `heap 42` is a raw allocation
-expression of type `*i64`: dereference it with `*p` and free it with
-`free(p as *u8)`. `box_new<i64>(42)` returns a `Box<i64>`, which is what
-`b.get` / `b.set` / `b.drop()` and the `Drop` impl operate on. Passing a
-`heap`-keyword pointer to `b.get` is a type error.
-
-```ritz
-import ritzlib.box
-
-fn heap_vs_box() -> i64
-    var p = heap 42            # `heap` keyword: a bare *i64, deref with `*p`
-    var q = box_new<i64>(42)   # constructor: a Box<i64> wrapper
-    *p + q.get()
-```
-
-ritzlib once also had `ritzlib.heap`, a `Heap<T>` identical to `Box<T>` with a
-`heap_` prefix; it was folded into `box` (AGAST #3916).
-
----
-
----
-
-## Collections
-
-### gvec
-
-**Module**: `ritzlib.gvec`
-
-Generic dynamic array (growable vector).
-
-```ritz
-struct Vec<T>
-    data: *T       # Pointer to heap-allocated array
-    len: i64       # Current number of elements
-    cap: i64       # Allocated capacity
-```
-
-**Constructors**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `vec_new` | `fn<T>() -> Vec<T>` | Create empty Vec |
-| `vec_with_cap` | `fn<T>(cap: i64) -> Vec<T>` | Create with pre-allocated capacity |
-
-**Core Operations**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `vec_push` | `fn<T>(v: @&Vec<T>, item: T) -> bool` | Push element (true on success) |
-| `vec_pop` | `fn<T>(v: @&Vec<T>) -> T` | Pop last element |
-| `vec_get` | `fn<T>(v: @Vec<T>, idx: i64) -> T` | Get element by index |
-| `vec_get_ptr` | `fn<T>(v: @&Vec<T>, idx: i64) -> *T` | Get pointer to element |
-| `vec_set` | `fn<T>(v: @&Vec<T>, idx: i64, item: T) -> i32` | Set element |
-| `vec_len` | `fn<T>(v: @Vec<T>) -> i64` | Get length |
-| `vec_cap` | `fn<T>(v: @Vec<T>) -> i64` | Get capacity |
-| `vec_is_empty` | `fn<T>(v: @Vec<T>) -> i32` | Check if empty |
-| `vec_clear` | `fn<T>(v: @&Vec<T>)` | Clear (keeps capacity) |
-| `vec_drop` | `fn<T>(v: @&Vec<T>)` | Free the Vec now, for one in raw memory; an owned Vec is freed by its `Drop` impl at scope end (AGAST #2159) |
-
-A zero-size element (a field-less struct) allocates nothing: `len` and `cap`
-count elements as usual, and `data` is a non-null dangling pointer that
-`vec_drop` never frees.
-
-**Utilities**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `vec_first` | `fn<T>(v: @Vec<T>) -> T` | Get first element |
-| `vec_last` | `fn<T>(v: @Vec<T>) -> T` | Get last element |
-| `vec_as_ptr` | `fn<T>(v: @Vec<T>) -> *T` | Get raw pointer |
-| `vec_slice` | `fn<T>(v: @Vec<T>, start: i64, end: i64) -> Vec<T>` | Create slice copy |
-| `vec_clone` | `fn<T>(v: @Vec<T>) -> Vec<T>` | Copy every element (`v.clone()`); shallow, so a heap-owning `T` ends up owned twice |
-| `vec_swap` | `fn<T>(v: @&Vec<T>, i: i64, j: i64) -> i32` | Swap elements |
-| `vec_push_bytes` | `fn<T>(v: @&Vec<T>, data: *T, len: i64) -> bool` | Push multiple (true on success) |
-| `vec_push_str` | `fn(v: @&Vec<u8>, s: *u8) -> bool` | Push C string (true on success) |
-| `vec_as_str` | `fn(v: @&Vec<u8>) -> *u8` | Get null-terminated string |
-
-**Line Utilities** (to read a whole fd into a `Vec<u8>`, use `vec_read_all_fd` in [io](#io)):
-
-```ritz
-struct LineBounds
-    start: i64      # Start offset in buffer
-    length: i64     # Length in bytes
-```
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `vec_find_lines` | `fn(buf: @Vec<u8>, lines: @&Vec<LineBounds>) -> i32` | Find line boundaries |
-
----
-
-### string
-
-**Module**: `ritzlib.string`
-
-Owned, growable UTF-8 string. Always null-terminated for C interop.
-
-```ritz
-import ritzlib.gvec
-
-struct String
-    data: Vec<u8>    # Underlying byte storage
-```
-
-**Constructors**:
+**Constructors** (free fns; also reachable as `String.new(...)`, `String.from(...)`, ...):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `string_new` | `fn() -> String` | Create empty string |
 | `string_with_cap` | `fn(cap: i64) -> String` | Create with capacity |
 | `string_from` | `fn(sv: StrView) -> String` | Create from a StrView (`"text"` literal) |
-| `string_from_bytes` | `fn(bytes: *u8, len: i64) -> String` | Create from raw bytes |
+| `string_from_bytes` | `fn(bytes: Span<u8>) -> String` | Create from a byte span |
 
-**Accessors**:
+**Methods** (`impl String`; call `s.method(...)`):
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `string_len` | `fn(s: @String) -> i64` | Get length |
-| `string_cap` | `fn(s: @String) -> i64` | Get capacity |
-| `string_is_empty` | `fn(s: @String) -> bool` | Check if empty |
-| `string_as_ptr` | `fn(s: @&String) -> *u8` | Get null-terminated C string |
-| `string_as_view` | `fn(s: @String) -> StrView` | Borrow the bytes as a StrView (no copy), valid until `s` is modified or dropped; how a String prints in `print`/`eprint` interpolation or reaches a StrView API |
-| `string_get` | `fn(s: @String, idx: i64) -> u8` | Get byte at index |
-| `string_char_at` | `fn(s: @String, idx: i64) -> u8` | Get char at index |
+Accessors:
 
-**Modification**:
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.len()` | `fn() -> i64` | Get length |
+| `s.cap()` | `fn() -> i64` | Get capacity |
+| `s.is_empty()` | `fn() -> bool` | Check if empty |
+| `s.as_ptr()` | `fn() -> *u8` | Get null-terminated C string |
+| `s.as_view()` | `fn() -> StrView` | Borrow the bytes as a StrView (no copy), valid until `s` is modified or dropped; how a String prints in `print`/`eprint` interpolation or reaches a StrView API |
+| `s.get(idx)` | `fn(idx: i64) -> u8` | Get byte at index |
+| `s.char_at(idx)` | `fn(idx: i64) -> u8` | Get char at index |
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `string_push` | `fn(s: @&String, b: u8) -> bool` | Push byte |
-| `string_push_str` | `fn(s: @&String, sv: StrView) -> bool` | Push StrView (a `"..."` literal) |
-| `string_push_cstr` | `fn(s: @&String, cstr: *u8) -> bool` | Push NUL-terminated C string |
-| `string_push_string` | `fn(s: @&String, other: @String) -> bool` | Push String |
-| `string_push_bytes` | `fn(s: @&String, bytes: *u8, len: i64) -> bool` | Push bytes; what `format_into(@&s, "...")` appends through (AGAST #1824) |
-| `string_push_i64` | `fn(s: @&String, n: i64) -> bool` | Push an integer in decimal (all of i64); replaces `itoa` |
-| `string_clear` | `fn(s: @&String)` | Clear string |
-| `string_pop` | `fn(s: @&String) -> u8` | Pop last byte |
-| `string_set_char` | `fn(s: @&String, idx: i64, c: u8) -> i32` | Set char at index |
-| `string_drop` | `fn(s: @&String)` | Free the string now, for one in raw memory; an owned String is freed by its `Drop` impl at scope end (AGAST #2159) |
+Modification:
 
-**Comparison**:
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.push(b)` | `fn(b: u8) -> bool` | Push byte |
+| `s.push_str(sv)` | `fn(sv: StrView) -> bool` | Push StrView (a `"..."` literal) |
+| `s.push_cstr(cstr)` | `fn(cstr: *u8) -> bool` | Push NUL-terminated C string |
+| `s.push_string(other)` | `fn(other: @String) -> bool` | Push String |
+| `s.push_span(bytes)` | `fn(bytes: Span<u8>) -> bool` | Push a byte span |
+| `s.push_bytes(bytes, len)` | `fn(bytes: *u8, len: i64) -> bool` | Push raw bytes; the print-sink protocol `format_into(@&s, "...")` appends through (AGAST #1824) |
+| `s.push_i64(n)` | `fn(n: i64) -> bool` | Push an integer in decimal (all of i64); replaces `itoa` |
+| `s.clear()` | `fn()` | Clear string |
+| `s.pop()` | `fn() -> u8` | Pop last byte |
+| `s.set_char(idx, c)` | `fn(idx: i64, c: u8) -> bool` | Set char at index |
+| `s.deinit()` | `fn()` | Free the string now, for one in raw memory; an owned String is freed by its `Drop` impl at scope end (AGAST #2159) |
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `string_eq` | `fn(s: @String, other: StrView) -> bool` | Compare to a StrView (a `"..."` literal) |
-| `string_eq_string` | `fn(a: @String, b: @String) -> bool` | Compare two Strings |
-| `string_eq_strview` | `fn(s: @String, sv: StrView) -> bool` | Same as `string_eq` |
-| `string_eq_cstr` | `fn(s: @String, cstr: *u8) -> bool` | Compare to C string |
-| `string_hash` | `fn(s: @String) -> u64` | Hash the string |
+Comparison:
 
-**Search/Slice**:
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.eq(other)` | `fn(other: StrView) -> bool` | Compare to a StrView (a `"..."` literal) |
+| `s.eq_string(b)` | `fn(b: @String) -> bool` | Compare two Strings |
+| `s.eq_strview(sv)` | `fn(sv: StrView) -> bool` | Same as `s.eq` |
+| `s.eq_cstr(cstr)` | `fn(cstr: *u8) -> bool` | Compare to C string |
+| `s.hash()` | `fn() -> u64` | Hash the string |
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `string_starts_with` | `fn(s: @String, prefix: StrView) -> bool` | Check prefix |
-| `string_ends_with` | `fn(s: @String, suffix: StrView) -> bool` | Check suffix |
-| `string_contains` | `fn(s: @String, needle: StrView) -> bool` | Check contains |
-| `string_find` | `fn(s: @String, needle: @String) -> i64` | Find substring (-1 if not found) |
-| `string_slice` | `fn(s: @String, start: i64, end: i64) -> String` | Extract substring |
-| `string_clone` | `fn(s: @String) -> String` | Deep copy |
+Search/Slice:
 
-**Conversion**:
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.starts_with(prefix)` | `fn(prefix: StrView) -> bool` | Check prefix |
+| `s.starts_with_string(prefix)` | `fn(prefix: @String) -> bool` | Check prefix String |
+| `s.ends_with(suffix)` | `fn(suffix: StrView) -> bool` | Check suffix |
+| `s.ends_with_string(suffix)` | `fn(suffix: @String) -> bool` | Check suffix String |
+| `s.contains(needle)` | `fn(needle: StrView) -> bool` | Check contains |
+| `s.contains_string(needle)` | `fn(needle: @String) -> bool` | Check contains String |
+| `s.find(needle)` | `fn(needle: @String) -> i64` | Find substring; index, or `len` when absent |
+| `s.slice(start, end)` | `fn(start: i64, end: i64) -> String` | Extract substring |
+| `s.clone()` | `fn() -> String` | Deep copy |
+
+Conversion:
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.to_lower()` | `fn() -> String` | ASCII lowercase copy |
+
+Free conversion constructors:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -879,81 +770,65 @@ the same name, and `span_as_strview` / `span_from_strview` convert between the t
 `StrView` is a borrowed `{ ptr: *u8, len: i64 }` view of UTF-8 bytes, and the
 type of a bare `"..."` literal. It never allocates or frees, is not
 NUL-terminated, and must not outlive the bytes it points at. Use `String`
-(`ritzlib.string`) when you need to own or grow the text. Every function takes
+(`ritzlib.string`) when you need to own or grow the text. Every method takes
 the view by value; slicing returns a new view of the same bytes.
 
-**Construction / Access**:
+**Construction** (free fns; no method form):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `strview_empty` | `fn() -> StrView` | Empty view (`ptr` null, `len` 0) |
 | `strview_from_ptr` | `fn(ptr: *u8, len: i64) -> StrView` | View `len` bytes at `ptr` |
 | `strview_from_cstr` | `fn(cstr: *u8) -> StrView` | View a NUL-terminated string, without the NUL |
-| `strview_len` | `fn(s: StrView) -> i64` | Length in bytes |
-| `strview_is_empty` | `fn(s: StrView) -> bool` | `len == 0` |
-| `strview_get` | `fn(s: StrView, idx: i64) -> u8` | Byte at `idx` (unchecked) |
-| `strview_as_ptr` | `fn(s: StrView) -> *u8` | Pointer to the first byte |
 
-**Comparison**:
+**Methods** (`impl StrView`; call `s.method(...)`, the view by value):
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `strview_eq` | `fn(a: StrView, b: StrView) -> bool` | Same length and bytes |
-| `strview_eq_cstr` | `fn(s: StrView, cstr: *u8) -> bool` | Equal to a C string |
-| `strview_cmp` | `fn(a: StrView, b: StrView) -> i32` | Bytewise order: -1, 0 or 1; a prefix sorts first |
-| `strview_cmp_cstr` | `fn(s: StrView, cstr: *u8) -> i32` | `strview_cmp` against a C string |
+Access / conversion:
 
-**Slicing** (no allocation):
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.len()` | `fn() -> i64` | Length in bytes |
+| `s.is_empty()` | `fn() -> bool` | `len == 0` |
+| `s.get(idx)` | `fn(idx: i64) -> u8` | Byte at `idx` (unchecked) |
+| `s.as_ptr()` | `fn() -> *u8` | Pointer to the first byte |
+| `s.to_cstr()` | `fn() -> *u8` | `malloc`ed NUL-terminated copy; caller `free`s it |
+| `s.as_cstr_unchecked()` | `fn() -> *u8` | The pointer as a C string. Only sound if the bytes after the view hold a NUL, as they do for a whole literal; a slice usually doesn't |
+| `s.parse_i64()` | `fn() -> Option<i64>` | The whole view as decimal, optional `+`/`-`: `None` for empty, a bare sign, whitespace, junk or overflow. Trim first if needed |
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `strview_slice` | `fn(s: StrView, start: i64, end: i64) -> StrView` | Bytes `[start, end)`, bounds clamped to `[0, len]`; empty if `start >= end` |
-| `strview_take` | `fn(s: StrView, n: i64) -> StrView` | First `n` bytes (all if `n >= len`) |
-| `strview_skip` | `fn(s: StrView, n: i64) -> StrView` | Everything after the first `n` bytes |
-| `strview_trim_start` | `fn(s: StrView) -> StrView` | Drop leading space, `\t`, `\n`, `\r` |
-| `strview_trim_end` | `fn(s: StrView) -> StrView` | Drop trailing whitespace |
-| `strview_trim` | `fn(s: StrView) -> StrView` | Both ends |
-| `strview_split_once` | `fn(s: StrView, delim: u8, before:& StrView, after:& StrView) -> i32` | Split at the first `delim` (excluded): 1 if found; 0 and `before = s`, `after` empty if not. Call as `strview_split_once(s, '=', @&k, @&v)` |
+Comparison:
 
-**Search**:
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.eq(t)` | `fn(t: StrView) -> bool` | Same length and bytes |
+| `s.eq_cstr(c)` | `fn(c: *u8) -> bool` | Equal to a C string |
+| `s.cmp(t)` | `fn(t: StrView) -> i32` | Bytewise order: -1, 0 or 1; a prefix sorts first |
+| `s.cmp_cstr(c)` | `fn(c: *u8) -> i32` | `s.cmp` against a C string |
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `strview_starts_with` | `fn(s: StrView, prefix: StrView) -> bool` | Prefix test |
-| `strview_starts_with_cstr` | `fn(s: StrView, prefix: *u8) -> bool` | Prefix test against a C string |
-| `strview_ends_with` | `fn(s: StrView, suffix: StrView) -> bool` | Suffix test |
-| `strview_contains` | `fn(haystack: StrView, needle: StrView) -> bool` | Substring test; an empty needle is always found |
-| `strview_find` | `fn(haystack: StrView, needle: StrView) -> i64` | First index of `needle`, or -1 (0 for an empty needle) |
-| `strview_rfind` | `fn(haystack: StrView, needle: StrView) -> i64` | Last index of `needle`, or -1 (`len` for an empty needle) |
-| `strview_find_byte` | `fn(s: StrView, c: u8) -> i64` | First index of byte `c`, or -1 |
+Slicing (no allocation):
 
-**Conversion**:
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.slice(start, end)` | `fn(start: i64, end: i64) -> StrView` | Bytes `[start, end)`, bounds clamped to `[0, len]`; empty if `start >= end` |
+| `s.take(n)` | `fn(n: i64) -> StrView` | First `n` bytes (all if `n >= len`) |
+| `s.skip(n)` | `fn(n: i64) -> StrView` | Everything after the first `n` bytes |
+| `s.trim_start()` | `fn() -> StrView` | Drop leading space, `\t`, `\n`, `\r` |
+| `s.trim_end()` | `fn() -> StrView` | Drop trailing whitespace |
+| `s.trim()` | `fn() -> StrView` | Both ends |
+| `s.split_once(delim, before, after)` | `fn(delim: u8, before:& StrView, after:& StrView) -> i32` | Split at the first `delim` (excluded): 1 if found; 0 and `before = s`, `after` empty if not. Call as `s.split_once('=', @&k, @&v)` |
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `strview_parse_i64` | `fn(s: StrView) -> Option<i64>` | The whole view as decimal, optional `+`/`-`: `None` for empty, a bare sign, whitespace, junk or overflow. Trim first if needed |
-| `strview_to_cstr` | `fn(s: StrView) -> *u8` | `malloc`ed NUL-terminated copy; caller `free`s it |
-| `strview_as_cstr_unchecked` | `fn(s: StrView) -> *u8` | The pointer as a C string. Only sound if the bytes after the view hold a NUL, as they do for a whole literal; a slice usually doesn't |
+Search:
 
-**Methods** (`impl StrView`; each calls the `strview_*` function of the same name):
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.starts_with(p)` | `fn(p: StrView) -> bool` | Prefix test |
+| `s.starts_with_cstr(p)` | `fn(p: *u8) -> bool` | Prefix test against a C string |
+| `s.ends_with(p)` | `fn(p: StrView) -> bool` | Suffix test |
+| `s.contains(t)` | `fn(t: StrView) -> bool` | Substring test; an empty needle is always found |
+| `s.find(t)` | `fn(t: StrView) -> i64` | First index of `t`, or `len` when absent (0 for an empty needle) |
+| `s.rfind(t)` | `fn(t: StrView) -> i64` | Last index of `t`, or `len` when absent |
+| `s.find_byte(c)` | `fn(c: u8) -> i64` | First index of byte `c`, or `len` when absent |
 
-| Method | Function |
-|--------|----------|
-| `s.len()`, `s.is_empty()`, `s.get(i)`, `s.as_ptr()` | `strview_len`, `strview_is_empty`, `strview_get`, `strview_as_ptr` |
-| `s.eq(t)`, `s.eq_cstr(c)`, `s.cmp(t)`, `s.cmp_cstr(c)` | `strview_eq`, `strview_eq_cstr`, `strview_cmp`, `strview_cmp_cstr` |
-| `s.slice(start, end)`, `s.take(n)`, `s.skip(n)` | `strview_slice`, `strview_take`, `strview_skip` |
-| `s.trim()`, `s.trim_start()`, `s.trim_end()` | `strview_trim`, `strview_trim_start`, `strview_trim_end` |
-| `s.starts_with(p)`, `s.ends_with(p)`, `s.contains(t)` | `strview_starts_with`, `strview_ends_with`, `strview_contains` |
-| `s.find(t)`, `s.rfind(t)`, `s.find_byte(c)` | `strview_find`, `strview_rfind`, `strview_find_byte` |
-| `s.to_cstr()`, `s.as_cstr_unchecked()` | `strview_to_cstr`, `strview_as_cstr_unchecked` |
-| `s.parse_i64()` | `strview_parse_i64` |
-
-Method syntax reaches only these: a `strview_*` function with no method here
-(`strview_from_cstr`, `strview_empty`) is called as a function (LARB R66).
-
-`s.as_bytes()` is not in this table: it is a compiler built-in, with no
-`strview_*` function behind it, and works without importing this module. It is
-a `Span<u8>` of the view's bytes, with no copy (LANGUAGE_SPEC §3.5).
+The constructors stay free functions: they have no method form (LARB R66).
 
 **Example**:
 ```ritz
@@ -964,11 +839,11 @@ import ritzlib.strview
 fn config_int(line: StrView, key: StrView) -> Option<i64>
     var k: StrView = strview_empty()
     var v: StrView = strview_empty()
-    if strview_split_once(line, '=', @&k, @&v) == 0
+    if line.split_once('=', @&k, @&v) == 0
         return None
     if not k.trim().eq(key)
         return None
-    strview_parse_i64(v.trim())
+    (v.trim()).parse_i64()
 
 [[test]]
 fn test_strview_example() -> i32
@@ -978,11 +853,11 @@ fn test_strview_example() -> i32
     assert port == 8080
     assert config_int("port = 80x", "port").is_none()
     let path = strview_from_cstr(c"/usr/lib/libc.so")
-    let base = strview_skip(path, path.rfind("/") + 1)
+    let base = path.skip(path.rfind("/") + 1)
     assert base.eq("libc.so")
     assert path.starts_with("/usr") and path.ends_with(".so")
-    assert strview_cmp("abc", "abd") < 0
-    assert strview_find_byte(path, 'l') == 5
+    assert ("abc").cmp("abd") < 0
+    assert path.find_byte('l') == 5
     assert path.len() == 16
     0
 ```
@@ -999,16 +874,16 @@ New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
 
 | `str` | Use instead |
 |-------|-------------|
-| `strlen` | `strview_len` / `string_len` |
-| `streq`, `strneq` | `strview_eq`, `strview_eq_cstr`; `strview_take` then `strview_eq` |
-| `strcmp` | `strview_cmp` |
-| `strchr` | `strview_find_byte` |
-| `strrchr` | `strview_rfind` |
-| `strstr` | `strview_find`, `strview_contains` |
-| `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `strview_take` to bound it |
-| `strcat` | `string_push_str`, `string_push_string` |
-| `atoi` | `strview_parse_i64(s: StrView) -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |
-| `itoa` | `string_push_i64(s: @&String, n: i64) -> bool` / `string_from_i64`: no caller-sized buffer |
+| `strlen` | `s.len()` on a `StrView` or `String` |
+| `streq`, `strneq` | `s.eq(t)` / `s.eq_cstr(c)`; `s.take(n)` then `s.eq(t)` |
+| `strcmp` | `s.cmp(t)` |
+| `strchr` | `s.find_byte(c)` |
+| `strrchr` | `s.rfind(t)` |
+| `strstr` | `s.find(t)`, `s.contains(t)` |
+| `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `s.take(n)` to bound it |
+| `strcat` | `s.push_str(v)`, `s.push_string(other)` |
+| `atoi` | `s.parse_i64() -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |
+| `itoa` | `s.push_i64(n) -> bool` / `string_from_i64`: no caller-sized buffer |
 
 The byte predicates (`isdigit` .. `tolower`) take a `u8`, not a C string, and
 are fine to use. `memset`/`memcpy`/`memcmp`/`bcmp`/`memmove` stay here because
@@ -1074,7 +949,7 @@ the compiler emits calls to those symbols.
 **Module**: `ritzlib.fmt.digits` (core)
 
 The one integer digit routine. Every ritzlib integer formatter (`print_int`,
-`eprint_int`, `print_hex`, `itoa`, `string_push_i64`, `string_from_hex`,
+`eprint_int`, `print_hex`, `itoa`, `String.push_i64`, `string_from_hex`,
 `iovec_append_int`/`_uint`, `ritzlib.fmt`'s Display) calls it, so all of them
 handle i64's minimum (AGAST #1856). Each writes into a caller buffer, returns
 the byte count, and writes no NUL. It has no imports, so freestanding code can
@@ -1714,7 +1589,7 @@ fn read_if_present(path: StrView) -> i32
 High-level filesystem operations.
 
 There is one path API, and every path is a `StrView`. A `"..."` literal is
-already a StrView; a `String` passes `string_as_view(@s)`; a C string passes
+already a StrView; a `String` passes `s.as_view()`; a C string passes
 `strview_from_cstr(p)`. Every `Err` is an `Errno` (see [errno](#errno), which
 fs re-exports): `NoEnt`, `Exist`, ..., or `Other(n)`; no fs function returns
 a `-1` / `null` sentinel. A path of 4096 bytes or more fails with
@@ -1855,7 +1730,7 @@ fn save(dir: StrView, name: StrView, text: StrView) -> i32
             Ok(_) => pass
             Err(e) => return e.code()
     var path: String = path_join(dir, name)
-    var r: Result<i64, Errno> = write_file(string_as_view(@path), text)
+    var r: Result<i64, Errno> = write_file(path.as_view(), text)
     match r
         Ok(_) => 0
         Err(e) => e.code()

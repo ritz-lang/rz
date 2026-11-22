@@ -3,7 +3,7 @@
 1. A static-style call on a builtin type with no `impl` method,
    `String.new()` / `String.from(x)`, is the UFCS free fn `string_new()` /
    `string_from(x)` with plain arguments (ritz0, #1321).  ritz1 had only the
-   instance fallback (`s.push(c)` -> `string_push(@s, c)`) and refused the
+   instance fallback (`s.push(c)` -> `String_push(@s, c)`) and refused the
    static one: "cannot determine receiver type for method call".
 
 2. An un-annotated `let e = vec_as_ptr<E>(@v) + 1` lost its `*E`: `e.b` was

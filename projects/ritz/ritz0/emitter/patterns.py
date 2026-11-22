@@ -1089,7 +1089,7 @@ class PatternEmitter:
     def _refuse_string_arms(self, expr: rast.Match) -> None:
         """A `"..."` arm compares a StrView, so on anything else it is an error
         at the arm (AGAST #1876). A `*u8` or `String` scrutinee converts first:
-        `strview_from_cstr(p)`, `string_as_view(@s)`."""
+        `StrView.from_cstr(p)`, `s.as_view()`."""
         for arm in expr.arms:
             pattern = arm.pattern
             if isinstance(pattern, rast.LitPattern) and isinstance(pattern.value, str):

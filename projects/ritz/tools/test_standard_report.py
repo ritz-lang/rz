@@ -338,3 +338,10 @@ def test_every_counting_rule_names_a_rule_in_the_standard():
         assert f"#### {rule_id} " in doc, f"{key}: {rule_id} is not a rule in STANDARD.md"
         assert f"`{key}`" in doc, f"{key} is not named in STANDARD.md"
 
+
+def test_string_and_strview_modules_have_no_free_fn_methods():
+    """AGAST #4533: String/StrView APIs live on their impls, not free fns."""
+    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "string.ritz",
+                                   RITZ_ROOT / "ritzlib" / "strview.ritz"]))
+    assert summary["free-fn-method"] == {"violations": 0, "exempt": 0}
+

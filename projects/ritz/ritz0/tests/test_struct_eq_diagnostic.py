@@ -8,7 +8,7 @@ AGAST #1321 (angelo hinting/instructions.ritz):
 Both sides are StrView structs. The emitter emitted `icmp eq %StrView`,
 which LLVM rejects at link time ("icmp requires integer operands") — a
 red herring pointing at generated IR instead of the source. Zero corpus
-usage: `==` is not defined for aggregates; the user needs `strview_eq`
+usage: `==` is not defined for aggregates; the user needs `a.eq(b)`
 (or a field-wise comparison). The diagnostic must say so and point at
 the source line.
 """
@@ -53,8 +53,8 @@ def test_struct_eq_is_located_diagnostic(tmp_path):
     assert "==" in err and "StrView" in err, (
         f"diagnostic does not name the operator and type:\n{err}"
     )
-    assert "strview_eq" in err, (
-        f"diagnostic does not suggest strview_eq:\n{err}"
+    assert "a.eq(b)" in err, (
+        f"diagnostic does not suggest a.eq(b):\n{err}"
     )
 
 

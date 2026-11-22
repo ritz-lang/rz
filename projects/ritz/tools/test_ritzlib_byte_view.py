@@ -38,35 +38,18 @@ def test_exactly_one_struct_strview_in_ritzlib():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("fn", ["string_eq", "string_eq_string", "string_eq_strview"])
-def test_string_eq_family_returns_bool(fn):
+@pytest.mark.parametrize("method", ["eq", "eq_string", "eq_strview"])
+def test_string_eq_family_returns_bool(method):
     src = (RITZLIB / "string.ritz").read_text()
-    m = re.search(rf"^pub fn {fn}\([^)]*\)\s*->\s*(\w+)", src, re.M)
-    assert m, f"{fn} not found in string.ritz"
-    assert m.group(1) == "bool", f"{fn} returns {m.group(1)}"
+    m = re.search(rf"^\s+pub fn {method}\([^)]*\)\s*->\s*(\w+)", src, re.M)
+    assert m, f"String.{method} not found in string.ritz"
+    assert m.group(1) == "bool", f"String.{method} returns {m.group(1)}"
 
 
 # AGAST #1943: the rest of the predicate family follows string_eq to bool.
+# Since #4533 the String/StrView predicates are impl methods; Span's are free
+# fns in this file still.
 PREDICATES = {
-    "string.ritz": [
-        "string_eq_cstr",
-        "string_is_empty",
-        "string_starts_with",
-        "string_starts_with_string",
-        "string_ends_with",
-        "string_ends_with_string",
-        "string_contains",
-        "string_contains_string",
-    ],
-    "strview.ritz": [
-        "strview_is_empty",
-        "strview_eq",
-        "strview_eq_cstr",
-        "strview_starts_with",
-        "strview_starts_with_cstr",
-        "strview_ends_with",
-        "strview_contains",
-    ],
     "span.ritz": [
         "span_eq",
         "span_eq_cstr",
@@ -76,9 +59,16 @@ PREDICATES = {
     ],
 }
 
-# impl-block methods that wrap the predicates above.
 PREDICATE_METHODS = {
-    "strview.ritz": ["is_empty", "starts_with", "ends_with", "contains", "eq", "eq_cstr"],
+    "string.ritz": [
+        "eq", "eq_string", "eq_strview", "eq_cstr", "is_empty",
+        "starts_with", "starts_with_string", "ends_with",
+        "ends_with_string", "contains", "contains_string",
+    ],
+    "strview.ritz": [
+        "is_empty", "eq", "eq_cstr", "starts_with", "starts_with_cstr",
+        "ends_with", "contains",
+    ],
     "span.ritz": ["is_empty"],
 }
 
@@ -105,6 +95,23 @@ def test_predicate_methods_return_bool(fname, method):
     assert m.group(1) == "bool", f"{fname} {method} returns {m.group(1)}"
 
 
+def _method_body(src, method):
+    """The indented body of the first `fn method` in `src`, or None."""
+    lines = src.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(rf"^(\s+)(?:pub )?fn {method}\(", line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        body = []
+        for nxt in lines[i + 1:]:
+            if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
+                break
+            body.append(nxt)
+        return "\n".join(body)
+    return None
+
+
 @pytest.mark.unit
 def test_predicate_bodies_return_no_int_literals():
     """A bool predicate saying `return 1` compiles (silent coercion) but is the
@@ -118,14 +125,27 @@ def test_predicate_bodies_return_no_int_literals():
             for line in m.group(0).splitlines():
                 if re.match(r"\s*return\s+[01]\b", line):
                     bad.append(f"{fname}:{fn}: {line.strip()}")
+    for fname, methods in PREDICATE_METHODS.items():
+        src = (RITZLIB / fname).read_text()
+        for meth in methods:
+            body = _method_body(src, meth)
+            assert body is not None, f"{fname}: method {meth} not found"
+            for line in body.splitlines():
+                if re.match(r"\s*return\s+[01]\b", line):
+                    bad.append(f"{fname}:{meth}: {line.strip()}")
     assert bad == [], bad
 
 
 @pytest.mark.integration
 def test_no_int_comparisons_against_predicates():
     """Callers must not compare a (now bool) predicate against 1 / 0."""
-    names = "|".join(fn for fns in PREDICATES.values() for fn in fns)
-    pat = re.compile(rf"\b({names})(<\w+>)?\([^()]*(\([^()]*\)[^()]*)*\)\s*[!=]=\s*[01]\b")
+    free = [fn for fns in PREDICATES.values() for fn in fns]
+    meth = [m for ms in PREDICATE_METHODS.values() for m in ms]
+    free_pat = "|".join(re.escape(x) for x in free)
+    meth_pat = "|".join(re.escape(x) for x in meth)
+    pat = re.compile(
+        rf"(?:\b(?:{free_pat})(?:<\w+>)?|\.(?:{meth_pat}))\("
+        rf"[^()]*(\([^()]*\)[^()]*)*\)\s*[!=]=\s*[01]\b")
     tracked = subprocess.run(
         ["git", "ls-files", "*.ritz"],
         cwd=REPO_ROOT,

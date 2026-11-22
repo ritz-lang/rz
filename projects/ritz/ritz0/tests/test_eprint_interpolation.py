@@ -20,7 +20,7 @@ THE FIX
 * A StrView placeholder (including the `%Span$u8` a bare `"..."` produces, and
   an `@StrView` / `*StrView`) writes its `len` bytes from `ptr`. It does not
   stop at a NUL, and it does not run past `len`.
-* A String prints through its view, `string_as_view(@s)` (ritzlib.string);
+* A String prints through its view, `s.as_view()` (ritzlib.string);
   that case lives in the matrix file test/test_eprint_interpolation.ritz.
 
 ORACLE

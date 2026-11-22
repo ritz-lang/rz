@@ -57,443 +57,338 @@ pub fn strview_from_cstr(cstr: *u8) -> StrView
     return s
 
 # ============================================================================
-# Accessors
-# ============================================================================
-
-# Get the length of the string view
-pub fn strview_len(s: StrView) -> i64
-    return s.len
-
-# Check if the string view is empty
-pub fn strview_is_empty(s: StrView) -> bool
-    if s.len == 0
-        return true
-    return false
-
-# Get a byte at the given index (unchecked)
-pub fn strview_get(s: StrView, idx: i64) -> u8
-    return *(s.ptr + idx)
-
-# Get raw pointer to the data
-pub fn strview_as_ptr(s: StrView) -> *u8
-    return s.ptr
-
-# ============================================================================
-# FFI Support
-# ============================================================================
-
-# Convert to a null-terminated C string.
-# WARNING: This allocates a new buffer and copies the string!
-# The caller is responsible for freeing the returned pointer with free().
-# For zero-cost FFI, ensure your StrView points to null-terminated data.
-pub fn strview_to_cstr(s: StrView) -> *u8
-    let buf: *u8 = malloc(s.len + 1)
-    memcpy(buf, s.ptr, s.len)
-    *(buf + s.len) = 0
-    return buf
-
-# Get a pointer suitable for C FFI.
-# If the original data is null-terminated (like string literals),
-# this returns the pointer directly. Otherwise, behavior is undefined
-# if passed to C functions expecting null termination.
-# Use strview_to_cstr() for guaranteed null-termination.
-pub fn strview_as_cstr_unchecked(s: StrView) -> *u8
-    return s.ptr
-
-# ============================================================================
-# Comparison
-# ============================================================================
-
-# Compare two StrViews for equality
-pub fn strview_eq(a: StrView, b: StrView) -> bool
-    if a.len != b.len
-        return false
-    if a.len == 0
-        return true
-    for i in 0..a.len
-        if *(a.ptr + i) != *(b.ptr + i)
-            return false
-    return true
-
-# Compare a StrView to a null-terminated C string
-pub fn strview_eq_cstr(s: StrView, cstr: *u8) -> bool
-    var i: i64 = 0
-    while i < s.len
-        if *(cstr + i) == 0
-            return false  # cstr is shorter
-        if *(s.ptr + i) != *(cstr + i)
-            return false
-        i += 1
-    # Check that cstr ends here
-    if *(cstr + i) != 0
-        return false
-    return true
-
-# Lexicographic comparison of two StrViews
-# Returns: -1 if a < b, 0 if a == b, 1 if a > b
-# standard-exempt: sentinel-return: three-way ordering, not an error (lexicographic compare)
-pub fn strview_cmp(a: StrView, b: StrView) -> i32
-    # Compare byte by byte up to the shorter length
-    var min_len: i64 = a.len
-    if b.len < min_len
-        min_len = b.len
-
-    for i in 0..min_len
-        let ca: u8 = *(a.ptr + i)
-        let cb: u8 = *(b.ptr + i)
-        if ca < cb
-            return -1
-        if ca > cb
-            return 1
-
-    # All compared bytes are equal, shorter string is "less than"
-    if a.len < b.len
-        return -1
-    if a.len > b.len
-        return 1
-    return 0
-
-# Lexicographic comparison of StrView to C string (for FFI interop)
-# Returns: -1 if s < cstr, 0 if s == cstr, 1 if s > cstr
-# standard-exempt: sentinel-return: three-way ordering, not an error (lexicographic compare)
-pub fn strview_cmp_cstr(s: StrView, cstr: *u8) -> i32
-    var i: i64 = 0
-    while i < s.len
-        let cc: u8 = *(cstr + i)
-        if cc == 0
-            # cstr ended early, s is longer -> s > cstr
-            return 1
-        let cs: u8 = *(s.ptr + i)
-        if cs < cc
-            return -1
-        if cs > cc
-            return 1
-        i += 1
-    # All s bytes matched, check if cstr has more
-    if *(cstr + i) != 0
-        # cstr is longer -> s < cstr
-        return -1
-    return 0
-
-# ============================================================================
-# Slicing (creates new views, no allocation)
-# ============================================================================
-
-# Create a sub-view [start:end)
-pub fn strview_slice(s: StrView, start: i64, end: i64) -> StrView
-    var result: StrView
-    var st: i64 = start
-    var en: i64 = end
-    if st < 0
-        st = 0
-    if en > s.len
-        en = s.len
-    if st >= en
-        result.ptr = null
-        result.len = 0
-        return result
-    result.ptr = s.ptr + st
-    result.len = en - st
-    return result
-
-# Get first n bytes as new view
-pub fn strview_take(s: StrView, n: i64) -> StrView
-    var result: StrView
-    result.ptr = s.ptr
-    if n < s.len
-        result.len = n
-    else
-        result.len = s.len
-    return result
-
-# Skip first n bytes and return rest as new view
-pub fn strview_skip(s: StrView, n: i64) -> StrView
-    var result: StrView
-    if n >= s.len
-        result.ptr = s.ptr + s.len
-        result.len = 0
-    else
-        result.ptr = s.ptr + n
-        result.len = s.len - n
-    return result
-
-# ============================================================================
-# Search
-# ============================================================================
-
-# Check if view starts with prefix
-pub fn strview_starts_with(s: StrView, prefix: StrView) -> bool
-    if prefix.len > s.len
-        return false
-    for i in 0..prefix.len
-        if *(s.ptr + i) != *(prefix.ptr + i)
-            return false
-    return true
-
-# Check if view starts with a C string prefix
-pub fn strview_starts_with_cstr(s: StrView, prefix: *u8) -> bool
-    var i: i64 = 0
-    while *(prefix + i) != 0
-        if i >= s.len
-            return false
-        if *(s.ptr + i) != *(prefix + i)
-            return false
-        i += 1
-    return true
-
-# Check if view ends with suffix
-pub fn strview_ends_with(s: StrView, suffix: StrView) -> bool
-    if suffix.len > s.len
-        return false
-    let offset: i64 = s.len - suffix.len
-    for i in 0..suffix.len
-        if *(s.ptr + offset + i) != *(suffix.ptr + i)
-            return false
-    return true
-
-# Check if view contains needle
-pub fn strview_contains(haystack: StrView, needle: StrView) -> bool
-    if needle.len == 0
-        return true
-    if haystack.len < needle.len
-        return false
-
-    var pos: i64 = 0
-    let max_pos: i64 = haystack.len - needle.len + 1
-    while pos < max_pos
-        var found: i32 = 1
-        var i: i64 = 0
-        while i < needle.len and found == 1
-            if *(haystack.ptr + pos + i) != *(needle.ptr + i)
-                found = 0
-            i += 1
-        if found == 1
-            return true
-        pos += 1
-    return false
-
-# Index of the first occurrence of needle, or haystack.len when there is none
-# (S-RESULT-1's sanctioned "index of the first match, or the length when there
-# is none" form: the value is not an error). Compare `i < haystack.len`.
-pub fn strview_find(haystack: StrView, needle: StrView) -> i64
-    if needle.len == 0
-        return 0
-    if haystack.len < needle.len
-        return haystack.len
-
-    var pos: i64 = 0
-    let max_pos: i64 = haystack.len - needle.len + 1
-    while pos < max_pos
-        var found: i32 = 1
-        var i: i64 = 0
-        while i < needle.len and found == 1
-            if *(haystack.ptr + pos + i) != *(needle.ptr + i)
-                found = 0
-            i += 1
-        if found == 1
-            return pos
-        pos += 1
-    return haystack.len
-
-# Index of the last occurrence of needle, or haystack.len when there is none
-# (S-RESULT-1's sanctioned index-or-length form, not an error). Compare
-# `i < haystack.len`.
-pub fn strview_rfind(haystack: StrView, needle: StrView) -> i64
-    if needle.len == 0
-        return haystack.len
-    if haystack.len < needle.len
-        return haystack.len
-
-    var pos: i64 = haystack.len - needle.len
-    while pos >= 0
-        var found: i32 = 1
-        var i: i64 = 0
-        while i < needle.len and found == 1
-            if *(haystack.ptr + pos + i) != *(needle.ptr + i)
-                found = 0
-            i += 1
-        if found == 1
-            return pos
-        pos -= 1
-    return haystack.len
-
-# Index of the first `c` in s, or s.len when there is none (S-RESULT-1's
-# sanctioned index-or-length form, not an error). Compare `i < s.len`.
-pub fn strview_find_byte(s: StrView, c: u8) -> i64
-    for i in 0..s.len
-        if *(s.ptr + i) == c
-            return i
-    return s.len
-
-# ============================================================================
-# Iteration helpers
-# ============================================================================
-
-# Split on first occurrence of delimiter byte
-# Returns (before, after) where 'after' excludes the delimiter
-# If delimiter not found, returns (full string, empty)
-# Uses mutable borrows for output parameters
-pub fn strview_split_once(s: StrView, delim: u8, before:& StrView, after:& StrView) -> i32
-    let idx: i64 = strview_find_byte(s, delim)
-    if idx >= s.len
-        before.ptr = s.ptr
-        before.len = s.len
-        after.ptr = s.ptr + s.len
-        after.len = 0
-        return 0  # Delimiter not found
-
-    before.ptr = s.ptr
-    before.len = idx
-    after.ptr = s.ptr + idx + 1
-    after.len = s.len - idx - 1
-    return 1  # Delimiter found
-
-# ============================================================================
-# Trim whitespace
-# ============================================================================
-
-# Trim leading whitespace
-pub fn strview_trim_start(s: StrView) -> StrView
-    var result: StrView
-    var start: i64 = 0
-    while start < s.len
-        let c: u8 = *(s.ptr + start)
-        if c != ' ' and c != '\t' and c != '\n' and c != '\r'
-            break
-        start += 1
-    result.ptr = s.ptr + start
-    result.len = s.len - start
-    return result
-
-# Trim trailing whitespace
-pub fn strview_trim_end(s: StrView) -> StrView
-    var result: StrView
-    var end: i64 = s.len
-    while end > 0
-        let c: u8 = *(s.ptr + end - 1)
-        if c != ' ' and c != '\t' and c != '\n' and c != '\r'
-            break
-        end -= 1
-    result.ptr = s.ptr
-    result.len = end
-    return result
-
-# Trim both leading and trailing whitespace
-pub fn strview_trim(s: StrView) -> StrView
-    var trimmed: StrView = strview_trim_start(s)
-    return strview_trim_end(trimmed)
-
-# ============================================================================
-# Numbers
-# ============================================================================
-
-# The whole view as a decimal i64: an optional '-' or '+', then digits only,
-# range-checked. Anything else (empty, a bare sign, whitespace, trailing junk,
-# overflow) is None. This replaces str.atoi, which reads "abc" as 0.
-pub fn strview_parse_i64(s: StrView) -> Option<i64>
-    var i: i64 = 0
-    var negative: bool = false
-    if s.len > 0
-        let c0 = strview_get(s, 0)
-        if c0 == '-' or c0 == '+'
-            negative = c0 == '-'
-            i = 1
-    if i >= s.len
-        return None
-    # Accumulate as a negative number so i64's minimum is representable.
-    let min: i64 = -9223372036854775807 - 1
-    var n: i64 = 0
-    while i < s.len
-        let c = strview_get(s, i)
-        if c < '0' or c > '9'
-            return None
-        let d = (c - '0') as i64
-        # n * 10 - d would drop below min (sdiv truncates toward zero, so this
-        # is the exact bound).
-        if n < (min + d) / 10
-            return None
-        n = n * 10 - d
-        i += 1
-    if negative
-        return Some(n)
-    if n == min
-        return None
-    Some(0 - n)
-
-# ============================================================================
 # Method syntax support (impl block)
 # ============================================================================
 
 impl StrView
+    # Get the length of the string view
     pub fn len(self: StrView) -> i64
-        return strview_len(self)
+        return self.len
 
+    # Check if the string view is empty
     pub fn is_empty(self: StrView) -> bool
-        return strview_is_empty(self)
+        if self.len == 0
+            return true
+        return false
 
+    # Get a byte at the given index (unchecked)
     pub fn get(self: StrView, idx: i64) -> u8
-        return strview_get(self, idx)
+        return *(self.ptr + idx)
 
+    # Get raw pointer to the data
     pub fn as_ptr(self: StrView) -> *u8
-        return strview_as_ptr(self)
+        return self.ptr
 
-    pub fn slice(self: StrView, start: i64, end: i64) -> StrView
-        return strview_slice(self, start, end)
-
-    pub fn take(self: StrView, n: i64) -> StrView
-        return strview_take(self, n)
-
-    pub fn skip(self: StrView, n: i64) -> StrView
-        return strview_skip(self, n)
-
-    pub fn starts_with(self: StrView, prefix: StrView) -> bool
-        return strview_starts_with(self, prefix)
-
-    pub fn ends_with(self: StrView, suffix: StrView) -> bool
-        return strview_ends_with(self, suffix)
-
-    pub fn contains(self: StrView, needle: StrView) -> bool
-        return strview_contains(self, needle)
-
-    pub fn find(self: StrView, needle: StrView) -> i64
-        return strview_find(self, needle)
-
-    pub fn find_byte(self: StrView, c: u8) -> i64
-        return strview_find_byte(self, c)
-
-    pub fn rfind(self: StrView, needle: StrView) -> i64
-        return strview_rfind(self, needle)
-
-    pub fn trim(self: StrView) -> StrView
-        return strview_trim(self)
-
-    pub fn trim_start(self: StrView) -> StrView
-        return strview_trim_start(self)
-
-    pub fn trim_end(self: StrView) -> StrView
-        return strview_trim_end(self)
-
-    pub fn eq(self: StrView, other: StrView) -> bool
-        return strview_eq(self, other)
-
-    pub fn eq_cstr(self: StrView, cstr: *u8) -> bool
-        return strview_eq_cstr(self, cstr)
-
-    # Lexicographic comparison (-1, 0, 1)
-    pub fn cmp(self: StrView, other: StrView) -> i32
-        return strview_cmp(self, other)
-
-    pub fn cmp_cstr(self: StrView, cstr: *u8) -> i32
-        return strview_cmp_cstr(self, cstr)
-
-    # Convert to owned C string (allocates, caller must free())
+    # Convert to a null-terminated C string.
+    # WARNING: This allocates a new buffer and copies the string!
+    # The caller is responsible for freeing the returned pointer with free().
+    # For zero-cost FFI, ensure your StrView points to null-terminated data.
     pub fn to_cstr(self: StrView) -> *u8
-        return strview_to_cstr(self)
+        let buf: *u8 = malloc(self.len + 1)
+        memcpy(buf, self.ptr, self.len)
+        *(buf + self.len) = 0
+        return buf
 
-    # Get raw pointer (assumes underlying data is null-terminated!)
+    # Get a pointer suitable for C FFI.
+    # If the original data is null-terminated (like string literals),
+    # this returns the pointer directly. Otherwise, behavior is undefined
+    # if passed to C functions expecting null termination.
+    # Use strview_to_cstr() for guaranteed null-termination.
     pub fn as_cstr_unchecked(self: StrView) -> *u8
-        return strview_as_cstr_unchecked(self)
+        return self.ptr
 
-    # The whole view as a decimal i64, else None (strview_parse_i64).
+    # Compare two StrViews for equality
+    pub fn eq(self: StrView, b: StrView) -> bool
+        if self.len != b.len
+            return false
+        if self.len == 0
+            return true
+        for i in 0..self.len
+            if *(self.ptr + i) != *(b.ptr + i)
+                return false
+        return true
+
+    # Compare a StrView to a null-terminated C string
+    pub fn eq_cstr(self: StrView, cstr: *u8) -> bool
+        var i: i64 = 0
+        while i < self.len
+            if *(cstr + i) == 0
+                return false  # cstr is shorter
+            if *(self.ptr + i) != *(cstr + i)
+                return false
+            i += 1
+        # Check that cstr ends here
+        if *(cstr + i) != 0
+            return false
+        return true
+
+    # Lexicographic comparison of two StrViews
+    # Returns: -1 if a < b, 0 if a == b, 1 if a > b
+    # standard-exempt: sentinel-return: three-way ordering, not an error (lexicographic compare)
+    pub fn cmp(self: StrView, b: StrView) -> i32
+        # Compare byte by byte up to the shorter length
+        var min_len: i64 = self.len
+        if b.len < min_len
+            min_len = b.len
+
+        for i in 0..min_len
+            let ca: u8 = *(self.ptr + i)
+            let cb: u8 = *(b.ptr + i)
+            if ca < cb
+                return -1
+            if ca > cb
+                return 1
+
+        # All compared bytes are equal, shorter string is "less than"
+        if self.len < b.len
+            return -1
+        if self.len > b.len
+            return 1
+        return 0
+
+    # Lexicographic comparison of StrView to C string (for FFI interop)
+    # Returns: -1 if s < cstr, 0 if s == cstr, 1 if s > cstr
+    # standard-exempt: sentinel-return: three-way ordering, not an error (lexicographic compare)
+    pub fn cmp_cstr(self: StrView, cstr: *u8) -> i32
+        var i: i64 = 0
+        while i < self.len
+            let cc: u8 = *(cstr + i)
+            if cc == 0
+                # cstr ended early, self is longer -> self > cstr
+                return 1
+            let cs: u8 = *(self.ptr + i)
+            if cs < cc
+                return -1
+            if cs > cc
+                return 1
+            i += 1
+        # All self bytes matched, check if cstr has more
+        if *(cstr + i) != 0
+            # cstr is longer -> self < cstr
+            return -1
+        return 0
+
+    # Create a sub-view [start:end)
+    pub fn slice(self: StrView, start: i64, end: i64) -> StrView
+        var result: StrView
+        var st: i64 = start
+        var en: i64 = end
+        if st < 0
+            st = 0
+        if en > self.len
+            en = self.len
+        if st >= en
+            result.ptr = null
+            result.len = 0
+            return result
+        result.ptr = self.ptr + st
+        result.len = en - st
+        return result
+
+    # Get first n bytes as new view
+    pub fn take(self: StrView, n: i64) -> StrView
+        var result: StrView
+        result.ptr = self.ptr
+        if n < self.len
+            result.len = n
+        else
+            result.len = self.len
+        return result
+
+    # Skip first n bytes and return rest as new view
+    pub fn skip(self: StrView, n: i64) -> StrView
+        var result: StrView
+        if n >= self.len
+            result.ptr = self.ptr + self.len
+            result.len = 0
+        else
+            result.ptr = self.ptr + n
+            result.len = self.len - n
+        return result
+
+    # Check if view starts with prefix
+    pub fn starts_with(self: StrView, prefix: StrView) -> bool
+        if prefix.len > self.len
+            return false
+        for i in 0..prefix.len
+            if *(self.ptr + i) != *(prefix.ptr + i)
+                return false
+        return true
+
+    # Check if view starts with a C string prefix
+    pub fn starts_with_cstr(self: StrView, prefix: *u8) -> bool
+        var i: i64 = 0
+        while *(prefix + i) != 0
+            if i >= self.len
+                return false
+            if *(self.ptr + i) != *(prefix + i)
+                return false
+            i += 1
+        return true
+
+    # Check if view ends with suffix
+    pub fn ends_with(self: StrView, suffix: StrView) -> bool
+        if suffix.len > self.len
+            return false
+        let offset: i64 = self.len - suffix.len
+        for i in 0..suffix.len
+            if *(self.ptr + offset + i) != *(suffix.ptr + i)
+                return false
+        return true
+
+    # Check if view contains needle
+    pub fn contains(self: StrView, needle: StrView) -> bool
+        if needle.len == 0
+            return true
+        if self.len < needle.len
+            return false
+
+        var pos: i64 = 0
+        let max_pos: i64 = self.len - needle.len + 1
+        while pos < max_pos
+            var found: i32 = 1
+            var i: i64 = 0
+            while i < needle.len and found == 1
+                if *(self.ptr + pos + i) != *(needle.ptr + i)
+                    found = 0
+                i += 1
+            if found == 1
+                return true
+            pos += 1
+        return false
+
+    # Index of the first occurrence of needle, or haystack.len when there is none
+    # (S-RESULT-1's sanctioned "index of the first match, or the length when there
+    # is none" form: the value is not an error). Compare `i < haystack.len`.
+    pub fn find(self: StrView, needle: StrView) -> i64
+        if needle.len == 0
+            return 0
+        if self.len < needle.len
+            return self.len
+
+        var pos: i64 = 0
+        let max_pos: i64 = self.len - needle.len + 1
+        while pos < max_pos
+            var found: i32 = 1
+            var i: i64 = 0
+            while i < needle.len and found == 1
+                if *(self.ptr + pos + i) != *(needle.ptr + i)
+                    found = 0
+                i += 1
+            if found == 1
+                return pos
+            pos += 1
+        return self.len
+
+    # Index of the last occurrence of needle, or haystack.len when there is none
+    # (S-RESULT-1's sanctioned index-or-length form, not an error). Compare
+    # `i < haystack.len`.
+    pub fn rfind(self: StrView, needle: StrView) -> i64
+        if needle.len == 0
+            return self.len
+        if self.len < needle.len
+            return self.len
+
+        var pos: i64 = self.len - needle.len
+        while pos >= 0
+            var found: i32 = 1
+            var i: i64 = 0
+            while i < needle.len and found == 1
+                if *(self.ptr + pos + i) != *(needle.ptr + i)
+                    found = 0
+                i += 1
+            if found == 1
+                return pos
+            pos -= 1
+        return self.len
+
+    # Index of the first `c` in self, or self.len when there is none (S-RESULT-1's
+    # sanctioned index-or-length form, not an error). Compare `i < self.len`.
+    pub fn find_byte(self: StrView, c: u8) -> i64
+        for i in 0..self.len
+            if *(self.ptr + i) == c
+                return i
+        return self.len
+
+    # Split on first occurrence of delimiter byte
+    # Returns (before, after) where 'after' excludes the delimiter
+    # If delimiter not found, returns (full string, empty)
+    # Uses mutable borrows for output parameters
+    pub fn split_once(self: StrView, delim: u8, before:& StrView, after:& StrView) -> i32
+        let idx: i64 = self.find_byte(delim)
+        if idx >= self.len
+            before.ptr = self.ptr
+            before.len = self.len
+            after.ptr = self.ptr + self.len
+            after.len = 0
+            return 0  # Delimiter not found
+
+        before.ptr = self.ptr
+        before.len = idx
+        after.ptr = self.ptr + idx + 1
+        after.len = self.len - idx - 1
+        return 1  # Delimiter found
+
+    # Trim leading whitespace
+    pub fn trim_start(self: StrView) -> StrView
+        var result: StrView
+        var start: i64 = 0
+        while start < self.len
+            let c: u8 = *(self.ptr + start)
+            if c != ' ' and c != '\t' and c != '\n' and c != '\r'
+                break
+            start += 1
+        result.ptr = self.ptr + start
+        result.len = self.len - start
+        return result
+
+    # Trim trailing whitespace
+    pub fn trim_end(self: StrView) -> StrView
+        var result: StrView
+        var end: i64 = self.len
+        while end > 0
+            let c: u8 = *(self.ptr + end - 1)
+            if c != ' ' and c != '\t' and c != '\n' and c != '\r'
+                break
+            end -= 1
+        result.ptr = self.ptr
+        result.len = end
+        return result
+
+    # Trim both leading and trailing whitespace
+    pub fn trim(self: StrView) -> StrView
+        var trimmed: StrView = self.trim_start()
+        return trimmed.trim_end()
+
+    # The whole view as a decimal i64: an optional '-' or '+', then digits only,
+    # range-checked. Anything else (empty, a bare sign, whitespace, trailing junk,
+    # overflow) is None. This replaces str.atoi, which reads "abc" as 0.
     pub fn parse_i64(self: StrView) -> Option<i64>
-        return strview_parse_i64(self)
+        var i: i64 = 0
+        var negative: bool = false
+        if self.len > 0
+            let c0 = self.get(0)
+            if c0 == '-' or c0 == '+'
+                negative = c0 == '-'
+                i = 1
+        if i >= self.len
+            return None
+        # Accumulate as a negative number so i64's minimum is representable.
+        let min: i64 = -9223372036854775807 - 1
+        var n: i64 = 0
+        while i < self.len
+            let c = self.get(i)
+            if c < '0' or c > '9'
+                return None
+            let d = (c - '0') as i64
+            # n * 10 - d would drop below min (sdiv truncates toward zero, so this
+            # is the exact bound).
+            if n < (min + d) / 10
+                return None
+            n = n * 10 - d
+            i += 1
+        if negative
+            return Some(n)
+        if n == min
+            return None
+        Some(0 - n)

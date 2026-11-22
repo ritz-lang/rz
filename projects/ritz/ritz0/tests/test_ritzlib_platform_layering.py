@@ -188,7 +188,7 @@ fn main() -> i32
     var v: Vec<i64> = vec_new<i64>()
     vec_push<i64>(@&v, 7)
     var s: String = string_new()
-    string_push(@&s, 65)
+    s.push(65)
     var m: HashMapI64 = hashmap_i64_new()
     m.insert(1, 2)
     return v.len as i32

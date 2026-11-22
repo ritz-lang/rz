@@ -31,8 +31,8 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
-import ritzlib.strview { StrView, strview_from_ptr, strview_is_empty, strview_len, strview_eq, strview_starts_with, strview_ends_with }
-import ritzlib.string { String, string_new, string_len, string_as_ptr, string_push_cstr, string_push_i64 }
+import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.string { String, string_new }
 
 import zeus.worker { WorkerContext }
 import zeus.worker { worker_init, worker_destroy }
@@ -194,19 +194,19 @@ fn arena_copy(ctx: *WorkerContext, src: *u8, len: i64) -> *u8
 # arena cannot hold them, or the headers overflow the slot's u16 length, the
 # response degrades to a bare 500 with no body rather than a truncated page.
 fn send_raw(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, headers: @&String, body: @&String) -> i32
-    let headers_len: i64 = string_len(headers)
-    let body_len: i64 = string_len(body)
+    let headers_len: i64 = headers.len()
+    let body_len: i64 = body.len()
     var h: *u8 = null
     var b: *u8 = null
     var ok: i32 = 1
     if headers_len > 65535 or body_len > 4294967295
         ok = 0
     if ok == 1
-        h = arena_copy(ctx, string_as_ptr(headers), headers_len)
+        h = arena_copy(ctx, headers.as_ptr(), headers_len)
         if h == null
             ok = 0
     if ok == 1 and body_len > 0
-        b = arena_copy(ctx, string_as_ptr(body), body_len)
+        b = arena_copy(ctx, body.as_ptr(), body_len)
         if b == null
             ok = 0
 
@@ -230,14 +230,14 @@ fn send_raw(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, headers: @&St
 # Send `body` with status and content type, then free it.
 fn send_body(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, content_type: *u8, body: @&String) -> i32
     var headers: String = string_new()
-    push_headers(@&headers, status, content_type, string_len(body))
+    push_headers(@&headers, status, content_type, body.len())
     let rc: i32 = send_raw(ctx, resp, status, @&headers, body)
     return rc
 
 
 fn send_text(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, text: *u8) -> i32
     var body: String = string_new()
-    string_push_cstr(@&body, text)
+    body.push_cstr(text)
     return send_body(ctx, resp, status, c"text/plain", @&body)
 
 
@@ -315,7 +315,7 @@ fn handle_not_found(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot)
 # 503 (src/presenters/page_presenter.ritz).
 fn handle_wiki_view(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let slug: StrView = slug_from_path(request_path(ctx, req))
-    if strview_is_empty(slug)
+    if slug.is_empty()
         return handle_not_found(ctx, req, resp)
 
     var body: String = string_new()
@@ -372,7 +372,7 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
 # the URL.  Replaying it overwrites with the same bytes.
 fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let slug_view: StrView = slug_from_path(request_path(ctx, req))
-    if strview_is_empty(slug_view)
+    if slug_view.is_empty()
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9] or '-', in segments separated by '/'.")
 
     let body_ptr: *u8 = worker_get_request_body(ctx, req)
@@ -397,7 +397,7 @@ fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
 # a plain 404.
 fn handle_wiki_edit_form(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
     let slug: StrView = slug_from_path(request_path(ctx, req))
-    if strview_is_empty(slug)
+    if slug.is_empty()
         return handle_not_found(ctx, req, resp)
 
     var body: String = string_new()
@@ -410,7 +410,7 @@ fn handle_wiki_edit_form(ctx: *WorkerContext, req: *RequestSlot, resp: *Response
 # to the page view, not the edit form.
 fn path_ends_with_edit(path: StrView) -> bool
     # /wiki/x/edit is the shortest edit route.
-    strview_len(path) >= 11 and strview_ends_with(path, "/edit")
+    path.len() >= 11 and path.ends_with("/edit")
 
 
 # ============================================================================
@@ -422,34 +422,34 @@ fn route_request(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) ->
     let method: u8 = req.method
 
     # GET /
-    if method == HTTP_METHOD_GET and strview_eq(path, "/")
+    if method == HTTP_METHOD_GET and path.eq("/")
         return handle_index(ctx, req, resp)
 
     # GET /health
-    if method == HTTP_METHOD_GET and strview_starts_with(path, "/health")
+    if method == HTTP_METHOD_GET and path.starts_with("/health")
         return handle_health(ctx, req, resp)
 
     # GET /wiki/new — must come before /wiki/:slug so "new" isn't treated as
     # a slug (the slug rule reserves it).  Exactly /wiki/new: /wiki/news is a
     # page.
-    if method == HTTP_METHOD_GET and strview_eq(path, "/wiki/new")
+    if method == HTTP_METHOD_GET and path.eq("/wiki/new")
         return handle_wiki_new(ctx, req, resp)
 
     # POST /wiki — create a new page from the form on /wiki/new.  Must
     # be checked before the longer-prefix POST below.
-    if method == HTTP_METHOD_POST and strview_eq(path, "/wiki")
+    if method == HTTP_METHOD_POST and path.eq("/wiki")
         return handle_wiki_create(ctx, req, resp)
 
     # POST /wiki/:slug — update an existing page (called by the edit form).
-    if method == HTTP_METHOD_POST and strview_starts_with(path, "/wiki/")
+    if method == HTTP_METHOD_POST and path.starts_with("/wiki/")
         return handle_wiki_update(ctx, req, resp)
 
     # GET /wiki/:slug/edit — render the edit form, pre-populated.
-    if method == HTTP_METHOD_GET and strview_starts_with(path, "/wiki/") and path_ends_with_edit(path)
+    if method == HTTP_METHOD_GET and path.starts_with("/wiki/") and path_ends_with_edit(path)
         return handle_wiki_edit_form(ctx, req, resp)
 
     # GET /wiki/:slug — view a wiki page
-    if method == HTTP_METHOD_GET and strview_starts_with(path, "/wiki/")
+    if method == HTTP_METHOD_GET and path.starts_with("/wiki/")
         return handle_wiki_view(ctx, req, resp)
 
     return handle_not_found(ctx, req, resp)
@@ -508,13 +508,13 @@ pub fn main(argc: i32, argv: **u8) -> i32
     # One write per line: workers share stdout (src/log.ritz).
     log_set_worker(worker_id)
     var line: String = log_begin()
-    string_push_cstr(@&line, c"Nexus Wiki Worker starting: worker ")
-    string_push_i64(@&line, worker_id as i64)
-    string_push_cstr(@&line, c" of ")
-    string_push_i64(@&line, worker_count as i64)
-    string_push_cstr(@&line, c", SHM ")
-    string_push_i64(@&line, shm_size)
-    string_push_cstr(@&line, c" bytes")
+    line.push_cstr(c"Nexus Wiki Worker starting: worker ")
+    line.push_i64(worker_id as i64)
+    line.push_cstr(c" of ")
+    line.push_i64(worker_count as i64)
+    line.push_cstr(c", SHM ")
+    line.push_i64(shm_size)
+    line.push_cstr(c" bytes")
     log_end(@&line)
 
     # Open the page store: mausoleum at MAUSOLEUM_HOST:MAUSOLEUM_PORT (default
@@ -533,9 +533,9 @@ pub fn main(argc: i32, argv: **u8) -> i32
     if wiki_app_open(g_repo, @cfg, worker_count) != APP_UNAVAILABLE
         let pages: i64 = wiki_app_seed(@g_svc)
         var count_line: String = log_begin()
-        string_push_cstr(@&count_line, c"Store initialized with ")
-        string_push_i64(@&count_line, pages)
-        string_push_cstr(@&count_line, c" pages")
+        count_line.push_cstr(c"Store initialized with ")
+        count_line.push_i64(pages)
+        count_line.push_cstr(c" pages")
         log_end(@&count_line)
 
     # Initialize zeus worker context

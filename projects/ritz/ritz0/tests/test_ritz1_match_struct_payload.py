@@ -112,7 +112,7 @@ import ritzlib.string
 import ritzlib.result
 
 fn take(s: String) -> i32
-    return string_len(@s) as i32 + 3
+    return s.len() as i32 + 3
 
 pub fn main() -> i32
     let r: Result<String, i32> = Ok(string_new())
@@ -126,7 +126,7 @@ import ritzlib.string
 import ritzlib.result
 
 fn take(s: String) -> i32
-    return string_len(@s) as i32 + 3
+    return s.len() as i32 + 3
 
 fn mk() -> Result<String, i32>
     return Err(9)

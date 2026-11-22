@@ -246,7 +246,7 @@ pub fn main() -> i32
     var w: Writer = string_writer(@&s)
     let p: Point = Point { x: 3, y: 4 }
     let n: i64 = writeln(@&w, "p={p} x={p.x}")
-    let v: StrView = string_as_view(@s)
+    let v: StrView = s.as_view()
     print("[{v}] {n}\\n")
     0
 """

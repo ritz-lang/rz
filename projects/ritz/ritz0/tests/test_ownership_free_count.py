@@ -3867,18 +3867,18 @@ fn build(a: *Allocator) -> i64
     "string_scope_end": _vec_case("""\
 fn build(a: *Allocator) -> i64
     var s: String = string_with_cap_in(a, 10)
-    string_push_str(@&s, "hi")
-    return string_len(@s)
+    s.push_str("hi")
+    return s.len()
 """, 2, 1, 1),
 
     # String moves into a callee like any other move-only type.
     "string_move_into_callee": _vec_case("""\
 fn consume_string(s: String) -> i64
-    return string_len(@s)
+    return s.len()
 
 fn build(a: *Allocator) -> i64
     var s: String = string_with_cap_in(a, 10)
-    string_push_str(@&s, "hi")
+    s.push_str("hi")
     return consume_string(s)
 """, 2, 1, 1),
 
@@ -3886,12 +3886,12 @@ fn build(a: *Allocator) -> i64
     "string_return_from_fn": _vec_case("""\
 fn make_string(a: *Allocator) -> String
     var s: String = string_with_cap_in(a, 10)
-    string_push_str(@&s, "ok")
+    s.push_str("ok")
     return s
 
 fn build(a: *Allocator) -> i64
     var got: String = make_string(a)
-    return string_len(@got)
+    return got.len()
 """, 2, 1, 1),
 
     # An arm body is an assignment expression (`found = path`), not an
@@ -3908,7 +3908,7 @@ fn build(a: *Allocator) -> i64
     match pick(a)
         Some(path) => found = path
         None => return -1
-    return string_len(@found)
+    return found.len()
 """, 0, 2, 2),
 
     # `.unwrap()` hands the Some/Ok payload to the caller, so the carrier is
@@ -3921,7 +3921,7 @@ fn pick(a: *Allocator) -> Option<String>
 fn build(a: *Allocator) -> i64
     var o: Option<String> = pick(a)
     let s: String = o.unwrap()
-    return string_len(@s)
+    return s.len()
 """, 0, 1, 1),
 
     # `e?` consumes its carrier even as a statement: the Err payload moves
@@ -3938,7 +3938,7 @@ fn outer(a: *Allocator) -> Result<i32, String>
 fn build(a: *Allocator) -> i64
     match outer(a)
         Ok(v) => return v as i64
-        Err(e) => return string_len(@e)
+        Err(e) => return e.len()
 """, 0, 1, 1),
 }
 

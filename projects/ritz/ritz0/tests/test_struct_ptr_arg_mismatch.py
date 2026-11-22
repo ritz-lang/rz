@@ -139,7 +139,7 @@ fn main() -> i32
     return b.bump(@&a)
 """
 
-# UFCS: `s.push_string(x)` lowers to string_push_string(@s, x), which takes
+# UFCS: `s.push_string(x)` lowers to String_push_string(@s, x), which takes
 # `other: @String`.  GrowBuf has String's layout ({ptr, len, cap}).
 UFCS = """\
 import ritzlib.sys

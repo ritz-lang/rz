@@ -177,7 +177,7 @@ def span_empty_needs_slot(method: str) -> str:
 _STR_AS_PTR = {
     'StrView': ("a StrView is not a `*u8`: only a string literal converts; "
                 "write `.ptr` if you know it is NUL-terminated"),
-    'String': "a String is not a `*u8`: write `string_as_ptr(@&s)`",
+    'String': "a String is not a `*u8`: write `s.as_ptr()`",
 }
 
 # An initializer that isn't a constant initialiser (LANGUAGE_SPEC §4.3, LARB
@@ -9308,7 +9308,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                     return self.builder.load(ptr)
 
         # Check if this is a Vec or String type - provide index sugar
-        # v[i] becomes vec_get(&v, i), s[i] becomes string_get(&s, i)
+        # v[i] becomes vec_get(&v, i), s[i] becomes String_get(&s, i)
         if isinstance(expr.expr, rast.Ident):
             name = expr.expr.name
             if name in self.ritz_types:
@@ -9342,11 +9342,15 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                             index = self.builder.sext(index, self.i64)
                         return self.builder.call(fn, [vec_ptr, index])
 
-                    # Handle String indexing: s[i] -> string_get(&s, i)
+                    # Handle String indexing: s[i] -> String_get(&s, i)
+                    # (AGAST #4533: the free `string_get` is gone; resolve the
+                    # impl method the way every other method call does.)
                     elif type_name == 'String':
-                        fn_name = "string_get"
-                        if fn_name not in self.functions:
-                            raise self._err(f"String indexing requires {fn_name} to be defined")
+                        fn_name = self.method_lookup.get(('String', 'get'))
+                        if fn_name is None or fn_name not in self.functions:
+                            raise self._err("String indexing requires `impl String` "
+                                            "with `get` to be defined "
+                                            "(import ritzlib.string)")
 
                         fn, _ = self.functions[fn_name]
                         # Get pointer to string
@@ -9502,7 +9506,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         """Emit a slice operation: a[start:end].
 
         This is zero-cost syntax sugar that translates to method/function calls:
-        - String: s[1:5] → string_slice(&s, 1, 5)
+        - String: s[1:5] → s.slice(1, 5)
         - Vec<T>: v[1:5] → vec_slice_T(&v, 1, 5)
 
         For missing bounds:
@@ -9629,11 +9633,12 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         return out
 
     def _emit_string_slice(self, expr: rast.SliceExpr) -> ir.Value:
-        """Emit string slice: s[1:5] → string_slice(&s, 1, 5)."""
-        fn_name = "string_slice"
-        if fn_name not in self.functions:
-            raise self._err(f"String slicing requires {fn_name} to be defined "
-                             "(import ritzlib.string)")
+        """Emit string slice: s[1:5] → String_slice(&s, 1, 5)."""
+        # AGAST #4533: the free fns are gone; use the impl methods.
+        fn_name = self.method_lookup.get(('String', 'slice'))
+        if fn_name is None or fn_name not in self.functions:
+            raise self._err("String slicing requires `impl String` with `slice` "
+                            "to be defined (import ritzlib.string)")
 
         fn, _ = self.functions[fn_name]
         str_ptr = self._emit_lvalue_addr(expr.expr)
@@ -9652,10 +9657,11 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if end.type != self.i64:
                 end = self.builder.sext(end, self.i64)
         else:
-            # Get length via string_len
-            len_fn_name = "string_len"
-            if len_fn_name not in self.functions:
-                raise self._err(f"String slicing requires {len_fn_name} to be defined")
+            # Get length via impl String's `len` (AGAST #4533).
+            len_fn_name = self.method_lookup.get(('String', 'len'))
+            if len_fn_name is None or len_fn_name not in self.functions:
+                raise self._err("String slicing requires `impl String` with "
+                                "`len` to be defined (import ritzlib.string)")
             len_fn, _ = self.functions[len_fn_name]
             end = self.builder.call(len_fn, [str_ptr])
 
@@ -13905,9 +13911,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             type_name = getattr(ty, 'name', None) or str(ty)
             hint = ""
             if type_name == 'StrView' or str(type_name).startswith('StrView'):
-                hint = " — use strview_eq(a, b) from ritzlib.strview"
+                hint = " — use a.eq(b) from ritzlib.strview"
             elif type_name == 'String':
-                hint = " — use string_eq_string(@a, @b) from ritzlib.string"
+                hint = " — use a.eq_string(@b) from ritzlib.string"
             elif any(getattr(t, 'name', None) == type_name
                      for t, _ in self.enum_types.values()):
                 # A payload-less enum never reaches here (tag comparison

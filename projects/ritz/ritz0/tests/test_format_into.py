@@ -79,7 +79,7 @@ import ritzlib.buf
 import ritzlib.gvec
 
 fn show(s: @String)
-    print("{string_as_view(s)}")
+    print("{s.as_view()}")
 
 """
 

@@ -404,7 +404,7 @@ fn reset(p: @Point)
 **Status: ENFORCED**
 
 Only a string literal fits a `*u8` slot. A `StrView` or a `String` is passed
-to a C-string API as `.ptr` or `string_as_ptr(@s)`, which makes its NUL
+to a C-string API as `.ptr` or `s.as_ptr()`, which makes its NUL
 assumption visible (LARB R3, #2341).
 
 ```ritz body expect-error="a StrView is not a `*u8`"
@@ -535,17 +535,17 @@ doesn't free it. A function that returns it hands ownership to the caller.
 
 `String` and `Vec<T>` implement `Drop` (AGAST #2159, LANGUAGE_SPEC §13.6), so
 they are move-only and S-OWN-3 enforces this: the compiler frees the buffer
-at the owner's scope end. Don't call `string_drop` / `vec_drop` on an owning
-binding; those functions remain for a value reached through a raw pointer,
-which the compiler never drops.
+at the owner's scope end. Don't call `s.deinit()` / `vec_drop` on an owning
+binding; `deinit` and `vec_drop` remain for a value reached through a raw
+pointer, which the compiler never drops.
 
 ```ritz
 import ritzlib.string
 
 fn greeting_len() -> i64
     var s = string_from("hello")
-    string_push_str(@&s, ", world")
-    string_len(@s)                  # freed once, when the function returns
+    s.push_str(", world")
+    s.len()                  # freed once, when the function returns
 ```
 
 #### S-OWN-2 Raw allocation stays inside the owning type

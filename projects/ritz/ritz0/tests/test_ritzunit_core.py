@@ -73,7 +73,7 @@ import ritzlib.os.env
 fn probe_env() -> i32
     if env_iter().len == 0
         return 30
-    if not strview_eq(env_get_or("RITZUNIT_ENV_PROBE", ""), "seen")
+    if not env_get_or("RITZUNIT_ENV_PROBE", "").eq("seen")
         return 31
     if *env_raw_envp() == null
         return 32
