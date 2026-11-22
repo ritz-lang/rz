@@ -345,3 +345,10 @@ def test_string_and_strview_modules_have_no_free_fn_methods():
                                    RITZ_ROOT / "ritzlib" / "strview.ritz"]))
     assert summary["free-fn-method"] == {"violations": 0, "exempt": 0}
 
+
+def test_hashmap_module_has_no_null_returning_get():
+    """AGAST #4540: a missing key is None, not null (S-OPTION-1)."""
+    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "hashmap.ritz"]))
+    assert summary["null-return"] == {"violations": 0, "exempt": 0}
+    assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
+

@@ -597,7 +597,7 @@ Operations are methods (AGAST #4445):
 |--------|-----------|-------------|
 | `m.insert(key, value)` | `fn(key: K, value: V)` | Insert or overwrite |
 | `m.get(key)` | `fn(key: K) -> Option<V>` | The value, or `None` |
-| `m.get_ptr(key)` | `fn(key: K) -> *V` | The value, borrowed (for a move-only `V`), or null |
+| `m.get_ptr(key)` | `fn(key: K) -> Option<*V>` | The value, borrowed (for a move-only `V`), or `None` |
 | `m.contains(key)` | `fn(key: K) -> bool` | Whether the key is present |
 | `m.remove(key)` | `fn(key: K) -> bool` | Remove key (true if it was there) |
 | `m.len()` | `fn() -> i64` | The number of keys |
