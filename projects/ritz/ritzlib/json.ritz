@@ -108,7 +108,13 @@ pub fn json_alloc_value() -> Option<*JsonValue>
         return None
     return Some(v)
 
-pub fn json_free(v: *JsonValue)
+# Free `v`; the caller's `*JsonValue` from json_parse fits `@&JsonValue`.
+pub fn json_free(v: @&JsonValue)
+    json_free_raw(v)
+
+# The tree's own recursion: a private raw entry point, as S-PTR-1 allows for
+# the memory a type owns.  json_free above is the API.
+fn json_free_raw(v: *JsonValue)
     if v == null
         return
 
@@ -119,7 +125,7 @@ pub fn json_free(v: *JsonValue)
     # Free array/object items recursively
     if v.items != null
         for i in 0..v.count
-            json_free(*(v.items + i))
+            json_free_raw(*(v.items + i))
         free(v.items as *u8)
 
     # Free object keys
@@ -657,7 +663,7 @@ pub fn json_error_message(code: i32) -> StrView
 
 # The value of `key` in object `obj`; None if `obj` is null, not an object,
 # or has no such key.  Keys compare byte-for-byte.
-pub fn json_get_field(obj: *JsonValue, key: StrView) -> Option<*JsonValue>
+pub fn json_get_field(obj: @JsonValue, key: StrView) -> Option<*JsonValue>
     if obj == null
         return None
     if obj.kind != JSON_OBJECT
@@ -671,7 +677,7 @@ pub fn json_get_field(obj: *JsonValue, key: StrView) -> Option<*JsonValue>
 
 # Element `idx` of array `arr`; None if `arr` is null, not an array, or
 # `idx` is out of range.
-pub fn json_get_index(arr: *JsonValue, idx: i64) -> Option<*JsonValue>
+pub fn json_get_index(arr: @JsonValue, idx: i64) -> Option<*JsonValue>
     if arr == null
         return None
     if arr.kind != JSON_ARRAY
@@ -681,40 +687,40 @@ pub fn json_get_index(arr: *JsonValue, idx: i64) -> Option<*JsonValue>
     return Some(*(arr.items + idx))
 
 # A view of a string value's bytes, borrowed from `v` (valid until json_free).
-pub fn json_get_string(v: *JsonValue) -> Option<StrView>
+pub fn json_get_string(v: @JsonValue) -> Option<StrView>
     if v == null
         return None
     if v.kind != JSON_STRING
         return None
     return Some(strview_from_ptr(v.str_val, v.str_len))
 
-pub fn json_get_number(v: *JsonValue) -> Option<i64>
+pub fn json_get_number(v: @JsonValue) -> Option<i64>
     if v == null
         return None
     if v.kind != JSON_NUMBER
         return None
     return Some(v.num_val)
 
-pub fn json_get_bool(v: *JsonValue) -> Option<bool>
+pub fn json_get_bool(v: @JsonValue) -> Option<bool>
     if v == null
         return None
     if v.kind != JSON_BOOL
         return None
     return Some(v.bool_val != 0)
 
-pub fn json_is_null(v: *JsonValue) -> bool
+pub fn json_is_null(v: @JsonValue) -> bool
     if v == null
         return true
     return v.kind == JSON_NULL
 
-pub fn json_array_len(v: *JsonValue) -> i64
+pub fn json_array_len(v: @JsonValue) -> i64
     if v == null
         return 0
     if v.kind != JSON_ARRAY
         return 0
     return v.count
 
-pub fn json_object_len(v: *JsonValue) -> i64
+pub fn json_object_len(v: @JsonValue) -> i64
     if v == null
         return 0
     if v.kind != JSON_OBJECT
@@ -725,7 +731,7 @@ pub fn json_object_len(v: *JsonValue) -> i64
 # JSON Emitter
 # =============================================================================
 
-pub fn json_emit_value(v: *JsonValue, buf: *Vec<u8>) -> i32
+pub fn json_emit_value(v: @JsonValue, buf: @&Vec<u8>) -> i32
     if v == null
         vec_push_str(buf, c"null")
         return 0
@@ -755,7 +761,11 @@ pub fn json_emit_value(v: *JsonValue, buf: *Vec<u8>) -> i32
         for i in 0..v.count
             if i > 0
                 vec_push_str(buf, c", ")
-            json_emit_string(*(v.keys + i), buf)
+            let key: *u8 = *(v.keys + i)
+            var key_view: StrView = strview_empty()
+            if key != null
+                key_view = strview_from_cstr(key)
+            json_emit_string(key_view, buf)
             vec_push_str(buf, c": ")
             json_emit_value(*(v.items + i), buf)
         vec_push<u8>(buf, 125)  # '}'
@@ -765,7 +775,7 @@ pub fn json_emit_value(v: *JsonValue, buf: *Vec<u8>) -> i32
 # (a decoded \u0000) is written as \u0000 rather than ending the string.
 # Control characters U+0000-U+001F, which RFC 8259 forbids raw inside a
 # string, are written as \n \t \r \b \f or \u00XX.
-pub fn json_emit_bytes(s_sv: Span<u8>, buf: *Vec<u8>) -> i32
+pub fn json_emit_bytes(s_sv: Span<u8>, buf: @&Vec<u8>) -> i32
     let s: *u8 = s_sv.ptr
     let len: i64 = s_sv.len
     vec_push<u8>(buf, 34)  # '"'
@@ -810,16 +820,14 @@ fn jp_hex_digit(d: u8) -> u8
         return d + 48   # '0'
     return d + 87       # 'a' - 10
 
-# Emit NUL-terminated `s` as a JSON string literal (see json_emit_bytes).
-pub fn json_emit_string(s: *u8, buf: *Vec<u8>) -> i32
-    if s == null
-        return json_emit_bytes(Span<u8> { ptr: s, len: 0 }, buf)
-    return json_emit_bytes(Span<u8> { ptr: s, len: strlen(s) }, buf)
+# Emit `s` as a JSON string literal (see json_emit_bytes).
+pub fn json_emit_string(s: StrView, buf: @&Vec<u8>) -> i32
+    return json_emit_bytes(Span<u8> { ptr: s.ptr, len: s.len }, buf)
 
 # The JSON text of `v`; the caller owns the String (string_drop).
-pub fn json_to_string(v: *JsonValue) -> String
+pub fn json_to_string(v: @JsonValue) -> String
     var buf: Vec<u8> = vec_with_cap<u8>(256)
-    json_emit_value(v, @buf)
+    json_emit_value(v, @&buf)
     let out: String = string_from_bytes(Span<u8> { ptr: (buf.data), len: (buf.len) as i64 })
     vec_drop<u8>(@&buf)
     return out

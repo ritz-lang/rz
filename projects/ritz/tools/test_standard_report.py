@@ -268,6 +268,23 @@ def test_cli_json_and_list(tmp_path):
     assert "a.ritz:1" in listing and "lookup" in listing
 
 
+# ---------------------------------------------------------------------------
+# Converted module groups (#1347).  Each group that has been driven to zero is
+# pinned here, so a new raw `*T` parameter has to be converted or exempted with
+# a reason deliberately rather than landing quietly.  The whole tree is still
+# being converted, so the pin is per module, not tree-wide.
+# ---------------------------------------------------------------------------
+
+RITZ_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_json_module_has_no_raw_pointer_parameters():
+    """AGAST #4446: json's API takes references, Span and StrView."""
+    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "json.ritz"]))
+    assert summary["raw-ptr-param"] == {"violations": 0, "exempt": 0}
+    assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
+
+
 def test_every_counting_rule_names_a_rule_in_the_standard():
     """A key here points at a rule ID in docs/STANDARD.md, and the doc names the key."""
     doc = STANDARD.read_text()
