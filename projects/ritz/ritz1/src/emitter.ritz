@@ -9,6 +9,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.strview    # strview_starts_with_cstr (was scan_starts_with)
 import ritzlib.gvec
 import ritzlib.memory
 import diag              # diag_error_at (AGAST #1866)
@@ -523,9 +524,9 @@ fn splice_entry_allocas(s: *EmitterState, body_start: i64)
     s.ea_count = 0
 
 # AGAST #4461: the generic line scanners the packed-align pass below and the
-# deferred-load splice use live in emitter_core (scan_starts_with and
-# friends); they were the deleted copy-scan module's, and the copy rewrite
-# that drove it is gone.
+# deferred-load splice use live in emitter_core (scan_find and friends); they
+# were the deleted copy-scan module's, and the copy rewrite that drove it is
+# gone.
 
 # AGAST #1918 — packed-field loads and stores say `align 1`.
 #
@@ -566,7 +567,7 @@ fn ll_last_ptr_operand(p_sv: StrView) -> i64
     var len: i64 = p_sv.len
     var i: i64 = len - 8
     while i >= 0
-        if scan_starts_with(StrView { ptr: (p + i), len: (len - i) }, c", ptr %.") == 1
+        if strview_starts_with_cstr(StrView { ptr: (p + i), len: (len - i) }, c", ptr %.")
             return i + 6
         i -= 1
     0 - 1
@@ -577,7 +578,7 @@ fn ll_has_align(p_sv: StrView) -> i32
     var len: i64 = p_sv.len
     var i: i64 = 0
     while i + 5 <= len
-        if scan_starts_with(StrView { ptr: (p + i), len: (len - i) }, c"align") == 1
+        if strview_starts_with_cstr(StrView { ptr: (p + i), len: (len - i) }, c"align")
             return 1
         i += 1
     0
@@ -596,10 +597,10 @@ fn packed_mark_gep(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
     let dst: i32 = ll_dot_reg_at(StrView { ptr: (p), len: (len) }, 2, @e)
     if dst < 0 or dst >= cap
         return
-    if scan_starts_with(StrView { ptr: (p + e), len: (len - e) }, c" = getelementptr ") == 0
+    if not strview_starts_with_cstr(StrView { ptr: (p + e), len: (len - e) }, c" = getelementptr ")
         return
     var t: i64 = e + 17
-    if scan_starts_with(StrView { ptr: (p + t), len: (len - t) }, c"inbounds ") == 1
+    if strview_starts_with_cstr(StrView { ptr: (p + t), len: (len - t) }, c"inbounds ")
         t += 9
     let comma: i64 = scan_find(StrView { ptr: (p), len: (len) }, t, 44)
     if comma < 0
@@ -609,7 +610,7 @@ fn packed_mark_gep(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
         if st != null and struct_is_packed(st) == 1
             *(marks + dst) = 1
             return
-    if scan_starts_with(StrView { ptr: (p + comma), len: (len - comma) }, c", ptr ") == 0
+    if not strview_starts_with_cstr(StrView { ptr: (p + comma), len: (len - comma) }, c", ptr ")
         return
     var be: i64 = 0
     if ll_is_packed_reg(marks, cap, ll_dot_reg_at(StrView { ptr: (p), len: (len) }, comma + 6, @be)) == 1
@@ -619,10 +620,10 @@ fn packed_mark_gep(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
 fn packed_emit_line(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
     var p: *u8 = p_sv.ptr
     var len: i64 = p_sv.len
-    var is_access: i32 = scan_starts_with(StrView { ptr: (p), len: (len) }, c"  store ")
-    if is_access == 0 and scan_starts_with(StrView { ptr: (p), len: (len) }, c"  %.") == 1
+    var is_access: i32 = (strview_starts_with_cstr(StrView { ptr: (p), len: (len) }, c"  store ")) as i32
+    if is_access == 0 and strview_starts_with_cstr(StrView { ptr: (p), len: (len) }, c"  %.")
         let sp: i64 = scan_find(StrView { ptr: (p), len: (len) }, 4, 32)
-        if sp > 0 and scan_starts_with(StrView { ptr: (p + sp), len: (len - sp) }, c" = load ") == 1
+        if sp > 0 and strview_starts_with_cstr(StrView { ptr: (p + sp), len: (len - sp) }, c" = load ")
             is_access = 1
     if is_access == 1 and ll_has_align(StrView { ptr: (p), len: (len) }) == 0
         let at: i64 = ll_last_ptr_operand(StrView { ptr: (p), len: (len) })
@@ -1589,16 +1590,8 @@ fn is_local_function(m: *Module, name_sv: StrView) -> i32
         # files carry is_local == 0 and must NOT short-circuit the
         # extern-declare path here — otherwise call sites in the
         # current .ll would reference unresolved symbols.
-        if f.body != null and f.is_local == 1 and f.name_len == len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < len
-                if *(f.name + j) != *(name + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return 1
+        if f.body != null and f.is_local == 1 and name_eq(StrView { ptr: (f.name), len: (f.name_len) as i64 }, name_sv) == 1
+            return 1
         f = f.next
     # Also check impl block methods (mangled as Type_method). Without this,
     # emit_extern_declarations emits a conflicting `declare` for any impl
@@ -2963,20 +2956,10 @@ fn emit_global_vars(s: *EmitterState)
 # and EXPR_STRUCT_LIT stores the list head in `e.args` (see ident_or_struct).
 # We iterate the list directly — there is no boxed StructLit struct.
 fn find_field_init(fields: *FieldInit, name_sv: StrView) -> *FieldInit
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     var fi: *FieldInit = fields
     while fi != null
-        if fi.name_len == len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < len
-                if *(fi.name + j) != *(name + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return fi
+        if name_eq(StrView { ptr: (fi.name), len: (fi.name_len) as i64 }, name_sv) == 1
+            return fi
         fi = fi.next
     return null
 

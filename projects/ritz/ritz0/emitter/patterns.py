@@ -8,7 +8,7 @@ in the same order, so the emitted IR is byte-identical; the corpus replay
 against the train-tail worktree is the evidence for that.
 """
 
-from typing import List, Optional
+from typing import ClassVar, List, Optional
 
 from llvmlite import ir
 
