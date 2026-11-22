@@ -17,8 +17,8 @@ both sides, keep the check from refusing what fits.
 A pointer *value* of another pointee (LARB R71, AGAST #3684) is refused the
 same way at a `let`, an assignment, an argument and a `return`: `*[4]i32`
 into `*[3]i32`, another element type, `*C` into `*D`, `@C` into `@D`. Those
-rows run on ritz0 only until ritz1's half lands (#3999). The byte pointer is
-the way between, so `*[3]i32` through a `*u8` and back runs on all three.
+rows run on ritz0, ritz1 and ritz1_selfhosted (AGAST #3999). The byte pointer
+is the way between, so `*[3]i32` through a `*u8` and back runs on all three.
 """
 
 import pytest
@@ -38,7 +38,7 @@ REFUSED = {
     "flat_element": "pub fn main() -> i32\n    var g: [3]i64\n    var r: *[3]i32 = null\n    r = ^@g\n    return 0\n",
 }
 
-# A pointer value of another pointee (LARB R71). ritz0 only: ritz1's is #3999.
+# A pointer value of another pointee (LARB R71). All three compilers refuse it.
 _STRUCTS = "struct C\n    x: i32\n\nstruct D\n    y: i64\n\n"
 VALUE_REFUSED = {
     "let_size": (
@@ -88,6 +88,15 @@ ACCEPTED = {
         "pub fn main() -> i32\n    var g: [3]i32\n    g[2] = 42\n    var q: *[3]i32 = @g\n"
         "    let b: *u8 = q\n    let r: *[3]i32 = b\n    return r[2]\n"
     ),
+    # A generic's `T = *S` keeps S's name and a defaulted scalar kind: both
+    # pointees are the same struct, not one type for another (#3999).
+    "generic_pointer": (
+        "struct Entry\n    x: i32\n\nstruct Box<T>\n    val: T\n\n"
+        "fn put<T>(b: @&Box<T>, x: T)\n    b.val = x\n\n"
+        "pub fn main() -> i32\n    var b: Box<*Entry> = Box<*Entry> { val: null }\n"
+        "    var n: Entry = Entry { x: 42 }\n    put<*Entry>(@&b, @n)\n"
+        "    return (*b.val).x\n"
+    ),
 }
 
 
@@ -107,9 +116,9 @@ def test_an_address_of_the_same_array_is_taken(tmp_path, name, compiler):
     assert _run(compiler, tmp_path, name, ACCEPTED[name]) == 42
 
 
-@pytest.mark.parametrize("name", _ids(VALUE_REFUSED))
-def test_a_pointer_value_of_another_pointee_is_refused(tmp_path, name):
-    _assert_refused("ritz0", tmp_path, name, VALUE_REFUSED[name], REF_TO_OTHER_TYPE)
+@pytest.mark.parametrize("name,compiler", list(_params(VALUE_REFUSED)))
+def test_a_pointer_value_of_another_pointee_is_refused(tmp_path, name, compiler):
+    _assert_refused(compiler, tmp_path, name, VALUE_REFUSED[name], REF_TO_OTHER_TYPE)
 
 
 def test_a_struct_pointer_at_a_call_keeps_its_wrong_type_words(tmp_path):

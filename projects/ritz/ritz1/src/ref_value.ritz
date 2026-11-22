@@ -34,6 +34,14 @@
 # has the wording, and ritz0/test_ref_into_value.py and test_value_into_ref.py
 # hold all three compilers to it.
 #
+# LARB R71 (LANGUAGE_SPEC §3.2, AGAST #3999): a pointer or reference *value*
+# fits a pointer or reference slot only when the pointees are the same type, at
+# a `let`/`var`, an `=` and a `return` as at an argument.  The byte pointer is
+# the way between (a `*T` or `@T` into a `*u8`, a `*u8` into any `*T`), `null`
+# fits any pointer, and a cast is the escape hatch.  ritz0's twin is
+# TypeChecker._check_other_pointee; ritz0/test_array_pointee_assign.py holds all
+# three compilers to it.
+#
 # LANGUAGE_SPEC §3.3, LARB R5 / R42: a non-literal `[N]T1` fits `[N]T2` only if
 # T1 is T2, at the same slots and under `as`, and a literal is its slot's N
 # long (AGAST #2343, #3383); a whole array is not a pointer (#3054); `[v; n]`
@@ -83,6 +91,10 @@ var RV_LAST_COL: i32 = 0
 var RV_LOOPS: i32 = 0
 # What the fn returns; `returned` is 1 when it leaves as a pointer or reference.
 var RV_RET: RefTy
+# A `-> *[N]T` return as a param would carry it, which ref_of_fn keeps no N and T
+# for; ok only when the fn has one (AGAST #3999, LARB R71).
+var RV_RET_ARRAY: RefTy
+var RV_RET_ARRAY_OK: i32 = 0
 # A tail and the slot it lands in.
 struct RvTail
     e: *Expr
@@ -95,6 +107,9 @@ var RV_TAIL_COUNT: i32 = 0
 var RV_TAIL_CAP: i32 = 0
 # The argument rv_args is walking: an `@` that is it is lent to the call.
 var RV_ARG_EXPR: *Expr = null
+# >0 while rv_args judges an argument against its param's slot (LARB R71,
+# AGAST #3999): a call's pointer and reference words there are #1948's.
+var RV_IN_ARG: i32 = 0
 # A declaration's root, its type, the reference kind its binding takes, and its
 # initialiser's type, until ref_value_after can give them to the binding.
 var RV_DECL_ROOT: *u8 = null
@@ -419,6 +434,19 @@ fn rv_check_return(sm: *Sema, e: *Expr)
     eprint_bytes(StrView { ptr: (root), len: (len) as i64 })
     eprints_cstr(c"`: it ends with the fn\n")
 
+# LARB R71 (AGAST #3999): a pointer value returned from a `-> *[N]T` fn, whose
+# slot ref_of_fn keeps no N and T for, judged against the return type a param
+# would carry.  Only a pointer value: an array value's own words are elsewhere
+# (`a whole array is not a value here`), and `@x` is the stricter §3.2 rule's.
+fn rv_return_pointee(sm: *Sema, e: *Expr)
+    if rv_judges_value(sm, e) == 0
+        return
+    var a: RefTy
+    if rv_ty(sm, e, @a) == 0 or ref_is_pointer(a.kind) == 0
+        return
+    if rv_other_value_pointee(sm, @a, @RV_RET_ARRAY) == 1
+        rv_error_other_type(sm, e)
+
 # --- Slot errors ---------------------------------------------------------------------
 
 fn rv_error_slot(sm: *Sema, e: *Expr)
@@ -497,6 +525,27 @@ fn rv_is_written(e: *Expr) -> i32
     if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
         return 1
     0
+
+# 1 when R71 judges `e` as a pointer or reference value.  Not a written `@x`
+# (the stricter §3.2 rule's), not a cast (the escape hatch R71 itself names), and
+# not arithmetic on an `@x` the tables can't vouch for (rv_unsure_pointer_arith).
+fn rv_judges_value(sm: *Sema, e: *Expr) -> i32
+    if rv_is_written(e) == 1 or e.kind == EXPR_CAST
+        return 0
+    if rv_unsure_pointer_arith(sm, e) == 1
+        return 0
+    1
+
+# 1 when `e` is pointer arithmetic whose pointer operand is `@x` of an element
+# through a Vec, Span or String: ref_ty_in types that address as the container's
+# (its `[i]` runs through to the element only at the emitter), so the pointee
+# it names is no element (AGAST #3999, rv_unsure_referent).
+fn rv_unsure_pointer_arith(sm: *Sema, e: *Expr) -> i32
+    if e == null or e.kind != EXPR_BINARY
+        return 0
+    if rv_unsure_referent(sm, e.left) == 1
+        return 1
+    rv_unsure_pointer_arith(sm, e.left)
 
 # `a` goes to the `name:& T` param `p`: `@x` / `@&x` of another type than T
 # would be reinterpreted (#2367, #2368).  A bare place is check_lent_ref_arg's
@@ -640,6 +689,74 @@ fn rv_is_referent(a: *RefTy, slot: *RefTy) -> i32
         return 1
     name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
 
+# LARB R71 (AGAST #3999): 1 when `a`, a pointer or reference *value*, is known
+# not to fit pointer or reference `slot`, into which it lands.  0 when it fits:
+# the byte pointer bridges both ways (a `*T` or `@T` value into a plain `*u8`
+# slot, and a plain `*u8` value into any `*T` slot), the pointees are the same
+# type, or what the tables can't name stays unjudged.  `null` isn't a pointer
+# type here, so it fits.  `@x` is the stricter §3.2 rule's (rv_other_written),
+# never this; the caller tests that.  At a call, a struct for another struct
+# keeps #1948's "argument N ... has the wrong type", as does a pointee of
+# another LLVM type in a reference param; only a pointee a sign apart is
+# R71's.  ritz0's twin is TypeChecker._check_other_pointee.
+fn rv_other_value_pointee(sm: *Sema, a: *RefTy, slot: *RefTy) -> i32
+    if ref_is_pointer(a.kind) == 0 or ref_is_pointer(slot.kind) == 0
+        return 0
+    # The byte pointer, both ways: a plain `*u8` slot, or a plain `*u8` value in
+    # any `*T` slot.  `@u8` is neither (`@x` keeps §3.2), and a `@T` slot takes
+    # only a byte pointee, never the bridge.
+    if slot.kind == TYPE_PTR
+        if slot.pointee == TYPE_U8
+            return 0
+        if a.kind == TYPE_PTR and a.pointee == TYPE_U8
+            return 0
+    # A struct for another struct at a call is #1948's words, as for `@x`.
+    if RV_IN_ARG > 0 and a.pointee == TYPE_STRUCT and slot.pointee == TYPE_STRUCT
+        return 0
+    # A generic's `T = *S` / `*[N]E` keeps the type's name (a struct's, or the
+    # mangled array spelling `arrN_E`) while the tables default the pointee kind
+    # to a scalar.  A plain scalar names nothing, so such a contradictory record
+    # is unjudged (AGAST #3999: ritzlib's HashMap<_, *Entry>, `id<*[2]i32>`).
+    if a.name_len > 0 and rv_is_scalar_kind(a.pointee) == 1
+        return 0
+    # A generic's `[N]S` arrives as the struct S on one side and the array [N]S
+    # on the other (the pointer value lost its shape).  With one name, the names
+    # decide; where they don't speak, it's unjudged.
+    if a.pointee == TYPE_STRUCT and slot.pointee == TYPE_ARRAY or a.pointee == TYPE_ARRAY and slot.pointee == TYPE_STRUCT
+        if a.name_len == 0 or slot.name_len == 0
+            return 0
+        return 1 - name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
+    if rv_other_referent(sm, a, slot) == 0
+        return 0
+    # Into a reference param, a pointee of another LLVM type is #1948's too: the
+    # emitter compares the pointer types.  What passes that, a pointee a sign
+    # apart (`@i32` into an `@u32` param), is R71's.
+    if RV_IN_ARG > 0 and (slot.kind == TYPE_REF or slot.kind == TYPE_MUT_REF) and rv_signed_kind(a.pointee) != rv_signed_kind(slot.pointee)
+        return 0
+    1
+
+# `k`'s LLVM integer type: an unsigned kind as the signed one it shares bits with,
+# so a difference only in sign reads as no difference (R71's #1948 exemption).
+fn rv_signed_kind(k: i32) -> i32
+    if k == TYPE_U32
+        return TYPE_I32
+    if k == TYPE_U64
+        return TYPE_I64
+    if k == TYPE_U16
+        return TYPE_I16
+    if k == TYPE_U8
+        return TYPE_I8
+    k
+
+# 1 for a scalar pointee kind (a number, bool or float): the kind the tables give
+# a generic's pointer pointee when they didn't carry it (R71's name-vs-kind fixup).
+fn rv_is_scalar_kind(k: i32) -> i32
+    if k == TYPE_VOID or k == TYPE_UNKNOWN or k == TYPE_STRUCT or k == TYPE_ARRAY
+        return 0
+    if k == TYPE_PTR or k == TYPE_PTR_PTR
+        return 0
+    1
+
 # `e`, of type `a`, lands in reference or pointer `slot`.  Only a pointer fits:
 # a `T` never does, and `@T` and `@&T` take nothing else.  `*U` is a `T` too, for
 # an `@*U`.  A plain integer into a `*U` of another `U` is a pointer as an
@@ -652,7 +769,13 @@ fn rv_value_into_ref(sm: *Sema, e: *Expr, a: *RefTy, slot: *RefTy)
         if rv_is_ptr_ptr_referent(a, slot) == 1
             rv_error_value(sm, e, slot)
             return
+        # A plain pointer slot, or a reference to a non-pointer: a pointer or
+        # reference value of another pointee doesn't fit (LARB R71).  `@x` is
+        # the stricter §3.2 rule's, above; a reference to a pointer is the
+        # branch below's.
         if slot.pointee != TYPE_PTR or slot.kind == TYPE_PTR
+            if rv_judges_value(sm, e) == 1 and rv_other_value_pointee(sm, a, slot) == 1
+                rv_error_other_type(sm, e)
             return
         if a.kind == TYPE_PTR and a.pointee != TYPE_PTR
             rv_error_value(sm, e, slot)
@@ -803,6 +926,8 @@ fn rv_into(sm: *Sema, e: *Expr, slot: *RefTy)
         rv_shared_into_mut(sm, e)
     if slot.returned == 1
         rv_check_return(sm, e)
+        if RV_RET_ARRAY_OK == 1
+            rv_return_pointee(sm, e)
     if slot.kind == TYPE_VOID
         return
     if slot.kind == TYPE_ARRAY
@@ -1210,7 +1335,9 @@ fn rv_args(sm: *Sema, a0: *Expr, f: *FnDef, p0: *Param)
                 rv_addr_into_mut(sm, a)
                 rv_lent_referent(sm, a, p)
             else if ref_of_param(p, @slot) == 1
+                RV_IN_ARG = RV_IN_ARG + 1
                 rv_into(sm, a, @slot)
+                RV_IN_ARG = RV_IN_ARG - 1
             if p.is_borrow == 1 or f != null and rl_param_lends(sm, f, p) == 1
                 rv_forget(sm, a)
             p = p.next
@@ -1838,6 +1965,7 @@ pub fn ref_value_begin_fn(sm: *Sema, f: *FnDef)
     RV_LOOPS = 0
     RV_TAIL_COUNT = 0
     RV_ARG_EXPR = null
+    RV_IN_ARG = 0
     RV_DECL_ROOT = null
     rs_notes_clear()
     rv_note_params(sm, f)
@@ -1850,6 +1978,11 @@ pub fn ref_value_begin_fn(sm: *Sema, f: *FnDef)
     # LARB R57: a `-> Span<T>` return leaves with a view the caller holds.
     if rv_is_span(@RV_RET) == 1
         RV_RET.returned = 1
+    # AGAST #2329/#3999: a `-> *[N]T` return, as a param would carry it, so a
+    # returned pointer value is judged against its N and T (LARB R71).
+    RV_RET_ARRAY_OK = 0
+    if f.ret_ptr_array != null and ref_of_param(f.ret_ptr_array, @RV_RET_ARRAY) == 1
+        RV_RET_ARRAY_OK = 1
     if RV_RET.kind != TYPE_VOID or RV_RET.returned == 1
         rv_note_stmts(f.body, @RV_RET)
 
