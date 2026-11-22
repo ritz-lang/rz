@@ -83,49 +83,6 @@ pub fn lstat(path: StrView) -> Result<Stat, Errno>
     fs_stat_impl(path, 0)
 
 # ============================================================================
-# Stat buffer accessors (legacy)
-# ============================================================================
-# Kept for code that still stats into a raw [144]u8. They read through the
-# Stat struct, so the field offsets live in one place (sys.ritz).
-# New code: `stat(path)` / `lstat(path)` and the Stat fields.
-
-pub fn stat_get_dev(statbuf: *u8) -> i64
-    let st: *Stat = statbuf as *Stat
-    st.st_dev
-
-pub fn stat_get_ino(statbuf: *u8) -> i64
-    let st: *Stat = statbuf as *Stat
-    st.st_ino
-
-pub fn stat_get_nlink(statbuf: *u8) -> i64
-    let st: *Stat = statbuf as *Stat
-    st.st_nlink
-
-pub fn stat_get_mode(statbuf: *u8) -> i32
-    let st: *Stat = statbuf as *Stat
-    st.st_mode
-
-pub fn stat_get_uid(statbuf: *u8) -> i32
-    let st: *Stat = statbuf as *Stat
-    st.st_uid
-
-pub fn stat_get_gid(statbuf: *u8) -> i32
-    let st: *Stat = statbuf as *Stat
-    st.st_gid
-
-pub fn stat_get_size(statbuf: *u8) -> i64
-    let st: *Stat = statbuf as *Stat
-    st.st_size
-
-pub fn stat_get_blksize(statbuf: *u8) -> i64
-    let st: *Stat = statbuf as *Stat
-    st.st_blksize
-
-pub fn stat_get_blocks(statbuf: *u8) -> i64
-    let st: *Stat = statbuf as *Stat
-    st.st_blocks
-
-# ============================================================================
 # File type helpers
 # ============================================================================
 
@@ -218,30 +175,6 @@ pub struct DirEntry
     name: StrView        # entry name, without the trailing NUL
 
 const DIRENT_NAME_OFFSET: i64 = 19
-
-# Decode the linux_dirent64 record at `entry`.
-pub fn dirent_entry(entry: *u8) -> DirEntry
-    let d: *Dirent64 = entry as *Dirent64
-    let name: *u8 = entry + DIRENT_NAME_OFFSET
-    DirEntry { ino: d.d_ino, kind: d.d_type, name: strview_from_cstr(name) }
-
-pub fn dirent_get_ino(entry: *u8) -> i64
-    let d: *Dirent64 = entry as *Dirent64
-    d.d_ino
-
-pub fn dirent_get_reclen(entry: *u8) -> i32
-    let d: *Dirent64 = entry as *Dirent64
-    d.d_reclen as i32
-
-# Legacy: prefer dirent_entry(entry).kind.
-pub fn dirent_get_type(entry: *u8) -> u8
-    let d: *Dirent64 = entry as *Dirent64
-    d.d_type
-
-# Legacy: prefer dirent_entry(entry).name (a StrView). Same pointer, but this
-# form skips the strlen that building the view costs.
-pub fn dirent_get_name(entry: *u8) -> *u8
-    entry + DIRENT_NAME_OFFSET
 
 # Note: DT_* constants are defined in ritzlib/sys.ritz
 
@@ -492,7 +425,8 @@ fn dir_advance(dir: @&DirIter) -> bool
     dir.entry = @dir.buf[0] + dir.buf_pos
 
     # Advance position for next call
-    let reclen: i32 = dirent_get_reclen(dir.entry)
+    let d: *Dirent64 = dir.entry as *Dirent64
+    let reclen: i32 = d.d_reclen as i32
     dir.buf_pos = dir.buf_pos + reclen as i64
 
     true
@@ -510,7 +444,9 @@ impl DirIter
     pub fn entry(self: @DirIter) -> DirEntry
         if self.entry == null
             return DirEntry { ino: 0, kind: DT_UNKNOWN, name: strview_empty() }
-        dirent_entry(self.entry)
+        let d: *Dirent64 = self.entry as *Dirent64
+        let name: *u8 = self.entry + DIRENT_NAME_OFFSET
+        DirEntry { ino: d.d_ino, kind: d.d_type, name: strview_from_cstr(name) }
 
     # Advance and return the next entry, or None when the directory is exhausted
     # (or was never opened). The entry's name borrows the iterator's buffer.
@@ -523,14 +459,17 @@ impl DirIter
         # A closed iterator (fd < 0) ends here too: getdents64 fails, buf_len <= 0.
         if not dir_advance(self)
             return None
-        Some(dirent_entry(self.entry))
+        let d: *Dirent64 = self.entry as *Dirent64
+        let name: *u8 = self.entry + DIRENT_NAME_OFFSET
+        Some(DirEntry { ino: d.d_ino, kind: d.d_type, name: strview_from_cstr(name) })
 
     # Type of the current entry: Some(DT_REG), Some(DT_DIR), etc. from sys.ritz;
     # None when there is no current entry (before next(), or after the end).
     pub fn entry_type(self: *DirIter) -> Option<u8>
         if self.entry == null
             return None
-        Some(dirent_get_type(self.entry))
+        let d: *Dirent64 = self.entry as *Dirent64
+        Some(d.d_type)
 
     # Check if current entry is a directory.
     pub fn entry_is_dir(self: *DirIter) -> bool

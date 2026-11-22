@@ -1781,7 +1781,6 @@ fn size_or_minus_one(path: StrView) -> i64
 | `dir_entry_is_dir` | `fn(dir: *DirIter) -> bool` | Is the current entry a directory? |
 | `dir_entry_is_file` | `fn(dir: *DirIter) -> bool` | Is the current entry a regular file? |
 | `dir_entry_is_link` | `fn(dir: *DirIter) -> bool` | Is the current entry a symlink? |
-| `dirent_entry` | `fn(entry: *u8) -> DirEntry` | Decode one raw `linux_dirent64` record |
 
 ```ritz
 import ritzlib.sys
@@ -1805,19 +1804,7 @@ fn count_files(path: StrView) -> i64
 `DirEntry.name` points into the iterator's buffer and doesn't include the NUL.
 It is valid until the next `dir_next`/`dir_next_entry` or `dir_close` call.
 
-**Stat Buffer Accessors** (legacy; use `stat`/`lstat` and the `Stat` fields):
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `stat_get_mode` | `fn(statbuf: *u8) -> i32` | Get mode from stat |
-| `stat_get_size` | `fn(statbuf: *u8) -> i64` | Get size from stat |
-| `stat_get_uid` | `fn(statbuf: *u8) -> i32` | Get UID |
-| `stat_get_gid` | `fn(statbuf: *u8) -> i32` | Get GID |
-
-These and `stat_get_dev/ino/nlink/blksize/blocks` read through `*Stat`, so
-the field offsets are defined only in `ritzlib.sys`.
-
-**Dirent Helpers** (legacy; use `DirEntry`):
+**The raw `linux_dirent64` record** (what `DirIter` decodes):
 
 ```ritz
 struct Dirent64
@@ -1828,13 +1815,6 @@ struct Dirent64
 ```
 
 **Dirent Types**: `DT_UNKNOWN`, `DT_FIFO`, `DT_CHR`, `DT_DIR`, `DT_BLK`, `DT_REG`, `DT_LNK`, `DT_SOCK`
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `dirent_get_ino` | `fn(entry: *u8) -> i64` | Get inode |
-| `dirent_get_reclen` | `fn(entry: *u8) -> i32` | Get record length |
-| `dirent_get_type` | `fn(entry: *u8) -> u8` | Get type |
-| `dirent_get_name` | `fn(entry: *u8) -> *u8` | Get name pointer |
 
 **Path Utilities** (pure string work, no syscalls):
 

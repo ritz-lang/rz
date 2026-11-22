@@ -70,43 +70,34 @@ fn remove_file(path: *u8, opts: *RmOptions) -> i32
     return 0
 
 fn remove_dir_recursive(path: *u8, opts: *RmOptions) -> i32
-    let fd: i32 = sys_open(path, O_DIRECTORY)
-    if fd < 0
-        if opts.force == 0
-            rm_err2("rm: cannot open directory '", path, "'")
-        return 1
+    var dir: DirIter = match dir_open(strview_from_cstr(path))
+        Ok(it) => it
+        Err(_) =>
+            if opts.force == 0
+                rm_err2("rm: cannot open directory '", path, "'")
+            return 1
 
     var result: i32 = 0
-    var buf: [8192]u8
 
-    loop
-        let nread: i64 = sys_getdents64(fd, @buf[0], 8192)
-        if nread <= 0
-            break
+    while dir.next()
+        let e: DirEntry = dir.entry()
+        let name: *u8 = e.name.ptr
 
-        var pos: i64 = 0
-        while pos < nread
-            let entry: *u8 = @buf[0] + pos
-            let reclen: i32 = dirent_get_reclen(entry)
-            let name: *u8 = dirent_get_name(entry)
+        # Skip . and ..
+        if not streq(name, c".") and not streq(name, c"..")
+            var child: String = path_join(strview_from_cstr(path), e.name)
+            let child_path: *u8 = string_as_ptr(@&child)
 
-            # Skip . and ..
-            if not streq(name, c".") and not streq(name, c"..")
-                var child: String = path_join(strview_from_cstr(path), strview_from_cstr(name))
-                let child_path: *u8 = string_as_ptr(@&child)
+            if is_dir(string_as_view(@child))
+                let r: i32 = remove_dir_recursive(child_path, opts)
+                if r != 0
+                    result = 1
+            else
+                let r: i32 = remove_file(child_path, opts)
+                if r != 0
+                    result = 1
 
-                if is_dir(string_as_view(@child))
-                    let r: i32 = remove_dir_recursive(child_path, opts)
-                    if r != 0
-                        result = 1
-                else
-                    let r: i32 = remove_file(child_path, opts)
-                    if r != 0
-                        result = 1
-
-            pos += reclen as i64
-
-    sys_close(fd)
+    dir.close()
 
     # Now remove the empty directory
     let r: i32 = sys_rmdir(path)

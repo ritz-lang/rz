@@ -113,10 +113,10 @@ fn chmod_file(path: *u8, opts: *ChmodOptions) -> i32
 
     # Handle symbolic modes
     if opts.mode_add != 0 or opts.mode_remove != 0
-        var statbuf: [144]u8
-        if sys_lstat(path, @statbuf[0]) != 0
-            return chmod_err2("chmod: cannot access '", path, "'")
-        let current: i32 = stat_get_mode(@statbuf[0]) % 4096
+        var current: i32 = 0
+        match lstat(strview_from_cstr(path))
+            Ok(st) => current = st.st_mode % 4096
+            Err(_) => return chmod_err2("chmod: cannot access '", path, "'")
         new_mode = current
         new_mode += opts.mode_add
         # Remove bits by ANDing with complement
@@ -155,33 +155,22 @@ fn chmod_recursive(path: *u8, opts: *ChmodOptions) -> i32
     if not is_dir(strview_from_cstr(path))
         return result
 
-    let fd: i32 = sys_open(path, O_DIRECTORY)
-    if fd < 0
-        return 1
+    var dir: DirIter = match dir_open(strview_from_cstr(path))
+        Ok(it) => it
+        Err(_) => return 1
 
-    var buf: [8192]u8
+    while dir.next()
+        let e: DirEntry = dir.entry()
+        let name: *u8 = e.name.ptr
 
-    loop
-        let nread: i64 = sys_getdents64(fd, @buf[0], 8192)
-        if nread <= 0
-            break
+        if not streq(name, c".") and not streq(name, c"..")
+            var child: String = path_join(strview_from_cstr(path), e.name)
 
-        var pos: i64 = 0
-        while pos < nread
-            let entry: *u8 = @buf[0] + pos
-            let reclen: i32 = dirent_get_reclen(entry)
-            let name: *u8 = dirent_get_name(entry)
+            let r: i32 = chmod_recursive(string_as_ptr(@&child), opts)
+            if r != 0
+                result = 1
 
-            if not streq(name, c".") and not streq(name, c"..")
-                var child: String = path_join(strview_from_cstr(path), strview_from_cstr(name))
-
-                let r: i32 = chmod_recursive(string_as_ptr(@&child), opts)
-                if r != 0
-                    result = 1
-
-            pos += reclen as i64
-
-    sys_close(fd)
+    dir.close()
     return result
 
 # ============================================================================

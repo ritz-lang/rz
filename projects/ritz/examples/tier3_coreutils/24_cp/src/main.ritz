@@ -94,9 +94,9 @@ fn cp_copy_file(src: *u8, dst: *u8, opts: *CpOptions) -> i32
     # Get source mode for preserve
     var src_mode: i32 = 420  # 0644 default
     if opts.preserve != 0
-        var statbuf: [144]u8
-        if sys_lstat(src, @statbuf[0]) == 0
-            src_mode = stat_get_mode(@statbuf[0]) % 4096  # Lower 12 bits
+        match lstat(strview_from_cstr(src))
+            Ok(st) => src_mode = st.st_mode % 4096  # Lower 12 bits
+            Err(_) => src_mode = 420
 
     # Open source
     let src_fd: i32 = sys_open(src, O_RDONLY)
@@ -131,9 +131,9 @@ fn copy_dir(src: *u8, dst: *u8, opts: *CpOptions) -> i32
     # Create destination directory
     var src_mode: i32 = 493  # 0755 default
     if opts.preserve != 0
-        var statbuf: [144]u8
-        if sys_lstat(src, @statbuf[0]) == 0
-            src_mode = stat_get_mode(@statbuf[0]) % 4096
+        match lstat(strview_from_cstr(src))
+            Ok(st) => src_mode = st.st_mode % 4096
+            Err(_) => src_mode = 493
 
     if not path_exists(strview_from_cstr(dst))
         let r: i32 = sys_mkdir(dst, src_mode)
@@ -144,43 +144,33 @@ fn copy_dir(src: *u8, dst: *u8, opts: *CpOptions) -> i32
             cp_verbose_link(src, dst)
 
     # Open source directory
-    let fd: i32 = sys_open(src, O_DIRECTORY)
-    if fd < 0
-        return cp_err2("cp: cannot open directory '", src, "'")
+    var dir: DirIter = match dir_open(strview_from_cstr(src))
+        Ok(it) => it
+        Err(_) => return cp_err2("cp: cannot open directory '", src, "'")
 
     var result: i32 = 0
-    var buf: [8192]u8
 
-    loop
-        let nread: i64 = sys_getdents64(fd, @buf[0], 8192)
-        if nread <= 0
-            break
+    while dir.next()
+        let e: DirEntry = dir.entry()
+        let name: *u8 = e.name.ptr
 
-        var pos: i64 = 0
-        while pos < nread
-            let entry: *u8 = @buf[0] + pos
-            let reclen: i32 = dirent_get_reclen(entry)
-            let name: *u8 = dirent_get_name(entry)
+        # Skip . and ..
+        if not streq(name, c".") and not streq(name, c"..")
+            var src_child: String = path_join(strview_from_cstr(src), e.name)
+            var dst_child: String = path_join(strview_from_cstr(dst), e.name)
+            let src_path: *u8 = string_as_ptr(@&src_child)
+            let dst_path: *u8 = string_as_ptr(@&dst_child)
 
-            # Skip . and ..
-            if not streq(name, c".") and not streq(name, c"..")
-                var src_child: String = path_join(strview_from_cstr(src), strview_from_cstr(name))
-                var dst_child: String = path_join(strview_from_cstr(dst), strview_from_cstr(name))
-                let src_path: *u8 = string_as_ptr(@&src_child)
-                let dst_path: *u8 = string_as_ptr(@&dst_child)
+            if is_dir(string_as_view(@src_child))
+                let r: i32 = copy_dir(src_path, dst_path, opts)
+                if r != 0
+                    result = 1
+            else
+                let r: i32 = cp_copy_file(src_path, dst_path, opts)
+                if r != 0
+                    result = 1
 
-                if is_dir(string_as_view(@src_child))
-                    let r: i32 = copy_dir(src_path, dst_path, opts)
-                    if r != 0
-                        result = 1
-                else
-                    let r: i32 = cp_copy_file(src_path, dst_path, opts)
-                    if r != 0
-                        result = 1
-
-            pos += reclen as i64
-
-    sys_close(fd)
+    dir.close()
     return result
 
 fn copy_path(src: *u8, dst: *u8, opts: *CpOptions) -> i32

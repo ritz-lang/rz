@@ -118,9 +118,9 @@ fn matches_filter(path: *u8, d_type: u8, opts: *FindOptions) -> i32
         else if d_type == DT_LNK
             type_char = 108  # 'l'
         else if d_type == DT_UNKNOWN  # need to stat
-            var statbuf: [144]u8
-            if sys_lstat(path, @statbuf[0]) == 0
-                type_char = get_file_type_char(stat_get_mode(@statbuf[0]))
+            match lstat(strview_from_cstr(path))
+                Ok(st) => type_char = get_file_type_char(st.st_mode)
+                Err(_) => pass
 
         if type_char != opts.type_filter
             return 0
@@ -141,12 +141,12 @@ fn find_path(path: *u8, depth: i32, opts: *FindOptions)
     if opts.maxdepth >= 0 and depth > opts.maxdepth
         return
 
-    var statbuf: [144]u8
-    if sys_lstat(path, @statbuf[0]) != 0
-        find_warn2("find: '", path, "': No such file or directory")
-        return
-
-    let mode: i32 = stat_get_mode(@statbuf[0])
+    var mode: i32 = 0
+    match lstat(strview_from_cstr(path))
+        Ok(st) => mode = st.st_mode
+        Err(_) =>
+            find_warn2("find: '", path, "': No such file or directory")
+            return
     let type_bits: i32 = mode / 4096
     var d_type: u8 = 0
     if type_bits == 4
@@ -168,31 +168,19 @@ fn find_path(path: *u8, depth: i32, opts: *FindOptions)
     if opts.maxdepth >= 0 and depth >= opts.maxdepth
         return
 
-    let fd: i32 = sys_open(path, O_DIRECTORY)
-    if fd < 0
-        return
+    var dir: DirIter = match dir_open(strview_from_cstr(path))
+        Ok(it) => it
+        Err(_) => return
 
-    var buf: [8192]u8
+    while dir.next()
+        let e: DirEntry = dir.entry()
+        let name: *u8 = e.name.ptr
 
-    loop
-        let nread: i64 = sys_getdents64(fd, @buf[0], 8192)
-        if nread <= 0
-            break
+        if not streq(name, c".") and not streq(name, c"..")
+            var child: String = path_join(strview_from_cstr(path), e.name)
+            find_path(string_as_ptr(@&child), depth + 1, opts)
 
-        var pos: i64 = 0
-        while pos < nread
-            let entry: *u8 = @buf[0] + pos
-            let reclen: i32 = dirent_get_reclen(entry)
-            let entry_type: u8 = dirent_get_type(entry)
-            let name: *u8 = dirent_get_name(entry)
-
-            if not streq(name, c".") and not streq(name, c"..")
-                var child: String = path_join(strview_from_cstr(path), strview_from_cstr(name))
-                find_path(string_as_ptr(@&child), depth + 1, opts)
-
-            pos += reclen as i64
-
-    sys_close(fd)
+    dir.close()
 
 # ============================================================================
 # Main

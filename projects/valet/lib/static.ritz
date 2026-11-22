@@ -18,7 +18,7 @@ import ritzlib.fs
 import ritzlib.memory
 import ritzlib.fmt.digits
 import ritzlib.option
-import ritzlib.strview { StrView, strview_from_ptr, strview_parse_i64 }
+import ritzlib.strview { StrView, strview_from_cstr, strview_from_ptr, strview_parse_i64 }
 
 import lib.log
 
@@ -801,17 +801,14 @@ pub fn static_is_directory(path: *u8) -> i32
 # Returns: bytes sent on success, negative on error
 pub fn static_serve_directory(fd: i32, path: *u8, url_path: *u8, url_path_len: i32, keep_alive: i32) -> i64
     # Open directory
-    let dir_fd: i32 = sys_open(path, O_RDONLY | O_DIRECTORY)
-    if dir_fd < 0
-        return -1
-
-    # Buffer for directory entries
-    var dirent_buf: [4096]u8
+    var dir: DirIter = match dir_open(strview_from_cstr(path))
+        Ok(it) => it
+        Err(_) => return -1
 
     # Buffer for building HTML response (max 64KB)
     let html_buf: *u8 = malloc(65536)
     if html_buf == null
-        sys_close(dir_fd)
+        dir.close()
         return -2
     var html_pos: i64 = 0
 
@@ -847,63 +844,55 @@ pub fn static_serve_directory(fd: i32, path: *u8, url_path: *u8, url_path_len: i
         html_pos += 48
 
     # Read and list directory entries
-    var bytes_read: i64 = sys_getdents64(dir_fd, @dirent_buf[0], 4096)
-    while bytes_read > 0
-        var offset: i64 = 0
-        while offset < bytes_read
-            let entry: *u8 = @dirent_buf[0] + offset
-            let reclen: i32 = dirent_get_reclen(entry)
-            let d_type: u8 = dirent_get_type(entry)
-            let name: *u8 = dirent_get_name(entry)
-            let name_len: i64 = strlen(name)
+    while dir.next()
+        let e: DirEntry = dir.entry()
+        let name: *u8 = e.name.ptr
+        let d_type: u8 = e.kind
+        let name_len: i64 = strlen(name)
 
-            # Skip . and ..
-            if !(name_len == 1 && *name == '.') && !(name_len == 2 && *name == '.' && *(name + 1) == '.')
-                # Check buffer space (need ~200 bytes per entry max)
-                if html_pos + 200 + name_len * 2 > 65000
-                    break
+        # Skip . and ..
+        if !(name_len == 1 && *name == '.') && !(name_len == 2 && *name == '.' && *(name + 1) == '.')
+            # Check buffer space (need ~200 bytes per entry max)
+            if html_pos + 200 + name_len * 2 > 65000
+                break
 
-                # <li><a href="
-                let li_start = c"<li><a href=\""
-                memcpy(html_buf + html_pos, li_start, 13)
-                html_pos += 13
+            # <li><a href="
+            let li_start = c"<li><a href=\""
+            memcpy(html_buf + html_pos, li_start, 13)
+            html_pos += 13
 
-                # Copy filename (URL-safe chars only for now)
-                for i in 0..name_len
-                    *(html_buf + html_pos) = *(name + i)
-                    html_pos += 1
-
-                # Add trailing slash for directories
-                if d_type == DT_DIR
-                    *(html_buf + html_pos) = '/'
-                    html_pos += 1
-
-                # ">
-                *(html_buf + html_pos) = '"'
-                html_pos += 1
-                *(html_buf + html_pos) = '>'
+            # Copy filename (URL-safe chars only for now)
+            for i in 0..name_len
+                *(html_buf + html_pos) = *(name + i)
                 html_pos += 1
 
-                # Copy filename again for display
-                for i in 0..name_len
-                    *(html_buf + html_pos) = *(name + i)
-                    html_pos += 1
+            # Add trailing slash for directories
+            if d_type == DT_DIR
+                *(html_buf + html_pos) = '/'
+                html_pos += 1
 
-                # Add / suffix for directories in display
-                if d_type == DT_DIR
-                    *(html_buf + html_pos) = '/'
-                    html_pos += 1
+            # ">
+            *(html_buf + html_pos) = '"'
+            html_pos += 1
+            *(html_buf + html_pos) = '>'
+            html_pos += 1
 
-                # </a></li>\n
-                let li_end = c"</a></li>\n"
-                memcpy(html_buf + html_pos, li_end, 10)
-                html_pos += 10
+            # Copy filename again for display
+            for i in 0..name_len
+                *(html_buf + html_pos) = *(name + i)
+                html_pos += 1
 
-            offset += reclen as i64
+            # Add / suffix for directories in display
+            if d_type == DT_DIR
+                *(html_buf + html_pos) = '/'
+                html_pos += 1
 
-        bytes_read = sys_getdents64(dir_fd, @dirent_buf[0], 4096)
+            # </a></li>\n
+            let li_end = c"</a></li>\n"
+            memcpy(html_buf + html_pos, li_end, 10)
+            html_pos += 10
 
-    sys_close(dir_fd)
+    dir.close()
 
     # End HTML document (61 bytes including trailing newline)
     let html_end = c"</ul>\n<hr>\n<p><em>Valet HTTP Server</em></p>\n</body>\n</html>\n"
