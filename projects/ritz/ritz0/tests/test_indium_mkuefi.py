@@ -1,11 +1,10 @@
 """indium builds its UEFI boot disk with tools/mkuefi.py, never dd (AGAST #2748, from #1844).
 
-The `$(UEFI_DISK)` recipe in projects/indium/Makefile and harland's
-boot/test.sh zero-filled images with `dd if=/dev/zero`. On origin/harland-main
-those dd steps hung the image build and the boot test (24879891), so the branch
-replaced them: indium's disk comes from tools/mkuefi.py (sparse truncate +
-mkfs.vfat + mtools, each step logged and time-limited) and test.sh uses
-truncate/cp.
+The `$(UEFI_DISK)` recipe in projects/indium/Makefile zero-filled images with
+`dd if=/dev/zero`. On origin/harland-main those dd steps hung the image build
+and the boot test (24879891), so the branch replaced them: indium's disk comes
+from tools/mkuefi.py (sparse truncate + mkfs.vfat + mtools, each step logged
+and time-limited). (harland's own dd-using boot script is gone, #1886.)
 
 These tests pin that down:
 
@@ -15,7 +14,7 @@ These tests pin that down:
   mistake a half-built disk for an up-to-date one;
 * mkfs.vfat is found in /usr/sbin or /sbin when they are not on PATH (the
   usual case for a non-root shell);
-* the Makefile recipe and test.sh no longer call dd.
+* the Makefile recipe no longer calls dd.
 """
 
 import os
@@ -31,7 +30,6 @@ RITZ0_DIR = Path(__file__).resolve().parents[1]
 PROJECTS = RITZ0_DIR.parent.parent
 MKUEFI = PROJECTS / "indium" / "tools" / "mkuefi.py"
 INDIUM_MAKEFILE = PROJECTS / "indium" / "Makefile"
-HARLAND_BOOT_TEST = PROJECTS / "harland" / "boot" / "test.sh"
 
 
 def _have(tool):
@@ -222,9 +220,3 @@ def test_indium_uefi_disk_recipe_uses_mkuefi_not_dd():
     recipe = _recipe(INDIUM_MAKEFILE.read_text(), "$(UEFI_DISK)")
     assert "tools/mkuefi.py" in recipe
     assert "dd " not in recipe and "mkfs.vfat" not in recipe and "mcopy" not in recipe
-
-
-def test_harland_boot_test_has_no_dd():
-    code = [l for l in HARLAND_BOOT_TEST.read_text().splitlines() if not l.lstrip().startswith("#")]
-    hits = [l for l in code if l.lstrip().startswith("dd ") or " dd if=" in l]
-    assert not hits, "boot/test.sh still calls dd:\n" + "\n".join(hits)

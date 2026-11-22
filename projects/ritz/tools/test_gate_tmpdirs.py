@@ -44,7 +44,6 @@ SHARED_HOST_SCRATCH_SCRIPTS = [
     SCRIPTS / "prove-stage5-divergence.sh",
     REPO / "bench" / "run.sh",
     REPO / "projects" / "mausoleum" / "tools" / "concurrent_test.sh",
-    REPO / "projects" / "harland" / "tools" / "test_boot.sh",
     REPO / "projects" / "nexus" / "test" / "e2e_large_page.sh",
 ]
 SHARED_HOST_SHELL = SHARED_HOST_SCRATCH_SCRIPTS + [

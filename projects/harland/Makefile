@@ -21,7 +21,7 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all build clean test test-boot test-smp test-tier1 test-uefi-boot test-uefi-gui run-gui kernel iso help inventory-img test-inventory
+.PHONY: all build clean test test-smp test-tier1 kernel iso help inventory-img test-inventory
 
 all: kernel
 
@@ -38,10 +38,11 @@ build: kernel
 kernel:
 	@echo "=== Building Harland Kernel ==="
 	../../rz build harland
-	@# Copy to expected locations for test scripts
+	@# Copy to expected locations for test scripts. No `|| true`: a missing
+	@# image is a build failure, not something to discover in a boot timeout.
 	@mkdir -p $(BUILD_DIR)
-	@cp build/debug/harland.elf $(KERNEL) 2>/dev/null || true
-	@cp build/debug/BOOTX64.EFI $(BOOTLOADER) 2>/dev/null || true
+	@cp build/debug/harland.elf $(KERNEL)
+	@cp build/debug/BOOTX64.EFI $(BOOTLOADER)
 
 # Build bootable ISO with GRUB (for kernel testing)
 # NOTE: For distribution ISO, use indium project
@@ -59,17 +60,14 @@ iso: kernel
 # Test targets
 # ============================================================================
 
-test: test-boot
-
-# Boot the GRUB ISO under legacy BIOS with the real initramfs. Fails on a
-# KERNEL PANIC or EXCEPTION and needs init's Tier-1 suite to report ALL TESTS
-# PASSED (#3437: it used to boot a blank disk and pass on the banner alone).
-test-boot: iso
-	@echo "=== Testing Kernel Boot (GRUB) ==="
-	./tools/test_boot.sh
+# One boot-test script (#1845's): tools/test_tier1_boot.sh. It boots under
+# OVMF, fails on a KERNEL PANIC or EXCEPTION, and requires init's Tier-1 suite
+# to report ALL TESTS PASSED. The legacy-BIOS and vvfat UEFI scripts it
+# replaces (#1886) are gone rather than left to rot.
+test: test-tier1
 
 # AGAST #4192: two CPUs in a ring-3 SYSCALL at once, each on its own per-CPU
-# stack. The acceptance boot; test-boot also checks the verdict at -smp 4.
+# stack. The acceptance boot.
 test-smp:
 	@echo "=== Testing per-CPU syscall stacks (-smp 2) ==="
 	QEMU_SMP=2 ./tools/test_tier1_boot.sh native
@@ -78,21 +76,6 @@ test-smp:
 # and check init's Tier-1 suite: the spawn -> exit -> parent resume path (#2132)
 test-tier1:
 	./tools/test_tier1_boot.sh
-
-# UEFI bootloader test (headless)
-test-uefi-boot: kernel
-	@echo "=== Testing UEFI Bootloader ==="
-	cd boot && ./test.sh
-
-# UEFI bootloader test with GUI display (shows framebuffer)
-test-uefi-gui: kernel
-	@echo "=== Testing UEFI Bootloader (GUI) ==="
-	cd boot && ./test.sh --gui
-
-# Interactive run with GUI (no timeout, kill QEMU manually)
-run-gui: kernel
-	@echo "=== Running Harland (GUI, interactive) ==="
-	cd boot && ./test.sh --gui --interactive
 
 # Hardware-inventory USB stick (AGAST #3406): HWINV.EFI on a GPT + FAT32
 # image for `dd` or Etcher. See inventory/README.md.
@@ -125,16 +108,12 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  kernel       - Build the kernel (default)"
-	@echo "  iso          - Create test ISO with GRUB"
-	@echo "  test         - Run kernel boot test (= test-boot)"
-	@echo "  test-boot    - Boot the ISO (BIOS/GRUB) with the initramfs; needs ALL TESTS PASSED"
+	@echo "  iso          - Create a GRUB test ISO"
+	@echo "  test         - Run the boot test (= test-tier1)"
 	@echo "  test-smp     - Boot with -smp 2 and check two CPUs in SYSCALL at once (#4192)"
-	@echo "  test-tier1   - Boot with indium, check init Tier-1 suite (OVMF)"
-	@echo "  test-uefi-boot - Test UEFI bootloader (headless)"
-	@echo "  test-uefi-gui  - Test UEFI bootloader with display"
+	@echo "  test-tier1   - Boot with indium under OVMF, check init Tier-1 suite"
 	@echo "  inventory-img  - Build the hardware-inventory USB stick image (build/hwinv.img)"
 	@echo "  test-inventory - Boot the inventory stick in QEMU and check its dump"
-	@echo "  run-gui        - Interactive run (no timeout, kill QEMU manually)"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  help         - Show this help"
 	@echo ""

@@ -17,7 +17,7 @@ The behaviour test compiles the real cpu_map.ritz (it has no imports and no
 hardware access) into a host program with sparse APIC IDs up to 255; its exit
 code names the failed claim. The source-level tests pin that apic.ritz and the
 ACPI tables go through cpu_map. The runtime check is the
-boot with -smp 4 (tools/test_boot.sh, tools/test_tier1_boot.sh).
+boot with -smp 4 (tools/test_tier1_boot.sh).
 """
 
 import os

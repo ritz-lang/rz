@@ -43,14 +43,10 @@ make -C projects/harland kernel
 
 ```
 kernel          Build the kernel (default)
-iso             Create test ISO with GRUB
-test            Run kernel boot test (= test-boot)
-test-boot       Boot the ISO (BIOS/GRUB) with the initramfs; needs ALL TESTS PASSED
+iso             Create a GRUB test ISO
+test            Run the boot test (= test-tier1)
 test-smp        Boot with -smp 2 and check two CPUs in SYSCALL at once (#4192)
-test-tier1      Boot with indium, check init Tier-1 suite (OVMF)
-test-uefi-boot  Test UEFI bootloader (headless)
-test-uefi-gui   Test UEFI bootloader with display
-run-gui         Interactive run (no timeout, kill QEMU manually)
+test-tier1      Boot with indium under OVMF, check init Tier-1 suite
 inventory-img   Build the hardware-inventory USB stick image (build/hwinv.img; inventory/README.md)
 test-inventory  Boot the inventory stick in QEMU and check its dump
 clean           Remove build artifacts

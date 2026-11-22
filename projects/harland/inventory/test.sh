@@ -85,7 +85,8 @@ boot_and_check() {
     python3 "$SCRIPT_DIR/esp_image.py" build "$img" --efi "$EFI" || { echo "FAIL: esp_image.py build"; return 1; }
     echo "=== Boot: q35 + OVMF, USB stick, SMBIOS entry point $ep-bit (${TIMEOUT}s max) ==="
     : > "$serial"
-    # Haswell, as boot/test.sh: LLVM may emit BMI1 instructions qemu64 lacks.
+    # Haswell, as tools/test_tier1_boot.sh: LLVM may emit BMI1 instructions
+    # qemu64 lacks.
     timeout "$TIMEOUT" qemu-system-x86_64 \
         -machine "q35,smbios-entry-point-type=$ep" -cpu Haswell -smp "$CPUS" -m "${MEM_MIB}M" \
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \

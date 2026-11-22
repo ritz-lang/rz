@@ -44,7 +44,6 @@ MAIN = SRC / "main.ritz"
 NUMBERS = SRC / "syscall" / "numbers.ritz"
 ENTRY = SRC / "syscall" / "runtime" / "entry.ritz"
 TIER1 = HARLAND / "tools" / "test_tier1_boot.sh"
-BOOT = HARLAND / "tools" / "test_boot.sh"
 
 
 def _code(path):
@@ -190,8 +189,6 @@ def test_the_verdict_is_wired_into_the_boot_suites():
     for name in ("native", "grub", "grub-reboot"):
         assert f"smp_stacks {name} || rc=1" in tier1, name
     assert "[smp] syscall stacks OK: $SMP_NCPUS CPUs" in tier1
-    # The acceptance boot at -smp 2.
-    assert "[smp] syscall stacks OK: $NCPUS CPUs" in BOOT.read_text()
     makefile = (HARLAND / "Makefile").read_text()
     assert "test-smp:" in makefile
     assert "QEMU_SMP=2 ./tools/test_tier1_boot.sh native" in makefile

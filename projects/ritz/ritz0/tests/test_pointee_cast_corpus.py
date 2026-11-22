@@ -39,7 +39,6 @@ GROUPS = {
         "kernel/src/drivers/virtio/common.ritz",
         "kernel/src/drivers/virtio/input.ritz",
         "kernel/src/mm/dma.ritz",
-        "kernel/src/mm/shm.ritz",
     ]),
     "ritz1_struct_lit": (RITZ1, ["src", ".."], "x86_64-unknown-linux-gnu", [
         "src/parser_gen.ritz",

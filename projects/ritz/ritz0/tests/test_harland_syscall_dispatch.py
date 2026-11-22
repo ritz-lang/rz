@@ -335,8 +335,10 @@ def test_no_second_kernel_syscall_table():
     """The dead arch/x86_64/syscall.ritz (SYS_MMAP = 10 against numbers.ritz's 9)
     is gone, and nothing points readers at it."""
     assert not (KERNEL_SRC / "arch" / "x86_64" / "syscall.ritz").exists()
-    for p in [HARLAND / "kernel" / "user_program.s", HARLAND / "build.py"]:
-        assert "arch/x86_64/syscall.ritz" not in p.read_text(), p
+    # harland has one build system (#1886): the old build.py is gone too.
+    assert not (HARLAND / "build.py").exists()
+    program = (HARLAND / "kernel" / "user_program.s").read_text()
+    assert "arch/x86_64/syscall.ritz" not in program
 
 
 # --- indium user programs speak the same ABI (AGAST #2133) ----------------------

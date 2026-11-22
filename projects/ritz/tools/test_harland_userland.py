@@ -138,12 +138,11 @@ def test_no_program_imports_open_from_libharland():
 
 
 def test_harland_has_no_userland():
-    """Acceptance (b): harland/user is gone, and harland/build.py no longer
-    builds it."""
+    """Acceptance (b): harland/user and its second build system are both
+    gone; indium owns userspace and the Makefile uses `rz build`."""
     assert not (HARLAND / "user").exists()
-    build_py = (HARLAND / "build.py").read_text()
-    assert "USER_DIR" not in build_py
-    assert "build_userspace" not in build_py
+    assert not (HARLAND / "build.py").exists()
+    assert not (HARLAND / "ritz").exists()
 
 
 def test_rzsh_dead_mains_deleted():

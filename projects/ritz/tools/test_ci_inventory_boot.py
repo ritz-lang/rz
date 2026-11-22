@@ -10,8 +10,9 @@ devices). It boots twice: SMBIOS entry point 64-bit and 32-bit.
 
 These tests pin, as test_ci_esp_initramfs_boot.py does for its boot:
 
-  * the wiring: the step exists after test-uefi-boot and before the log
-    upload, gates for real, has a timeout and keeps its work for upload;
+  * the wiring: the step exists after the Tier-1 boot (#1845) and before
+    the log upload, gates for real, has a timeout and keeps its work for
+    upload;
   * the verdicts: a missing tool is a SETUP ERROR (exit 3); no "HWINV: DONE"
     or no dump on the stick is exit 1; QEMU boots the image from USB
     storage, writable, never a vvfat directory. The script runs against a
@@ -40,7 +41,7 @@ import ci_local  # noqa: E402
 
 REPO = ci_local.REPO_ROOT
 SCRIPT = "projects/harland/inventory/test.sh"
-UEFI_BOOT = "projects/harland/boot/test.sh"
+BOOT_STEP = "projects/harland/tools/test_tier1_boot.sh"
 
 # Writes $FAKE_SERIAL to the `-serial file:PATH` it was given, logs its
 # argv, then idles until killed (as QEMU does after the app's DONE).
@@ -65,12 +66,12 @@ def _step_indices(steps: list[dict], script: str) -> list[int]:
     return [i for i, s in enumerate(steps) if script in str(s.get("run", ""))]
 
 
-def test_inventory_boot_runs_after_test_uefi_boot_and_before_the_log_upload():
+def test_inventory_boot_runs_after_the_tier1_boot_and_before_the_log_upload():
     assert (REPO / SCRIPT).is_file()
     steps = _build_all()
     [inv] = _step_indices(steps, SCRIPT)
-    [uefi] = _step_indices(steps, UEFI_BOOT)
-    assert inv > uefi
+    [boot] = _step_indices(steps, BOOT_STEP)
+    assert inv > boot
     uploads = [i for i, s in enumerate(steps) if "upload-artifact" in str(s.get("uses", ""))]
     assert uploads and min(uploads) > inv, "the inventory serial logs must be uploaded too"
 

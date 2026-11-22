@@ -208,8 +208,8 @@ def test_init_unmaps_the_guard_page_and_checks_it():
 
 def test_vmm_unmap_kernel_page_splits_a_2mib_page():
     unmap = _body(VMM.read_text(), "vmm_unmap_kernel_page")
-    # The kernel image is mapped with 2 MiB pages (boot_highhalf.s, the UEFI
-    # loader): split the one holding the page into a page table first.
+    # The kernel image is mapped with 2 MiB pages (boot.s, the UEFI loader):
+    # split the one holding the page into a page table first.
     assert "PTE_HUGE" in unmap and "vmm_split_huge_pd_entry(" in unmap
     split = _body(VMM.read_text(), "vmm_split_huge_pd_entry")
     assert "vmm_alloc_table()" in split and "while" in split

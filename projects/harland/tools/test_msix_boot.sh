@@ -154,8 +154,9 @@ fi
 SERIAL="$WORK/msix.log"
 : > "$SERIAL"
 # romfile= drops the NIC's iPXE option ROM, so OVMF never tries a network
-# boot before the ESP. The legacy virtio-net path stays covered by
-# boot/test.sh (test-uefi-boot), whose NIC is QEMU's transitional default.
+# boot before the ESP. The legacy virtio-net path is covered by
+# tools/test_tier1_boot.sh's grub boot, whose NIC is QEMU's transitional
+# default.
 timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m 2G \
     -display none -no-reboot -monitor none \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
