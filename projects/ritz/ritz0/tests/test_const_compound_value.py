@@ -233,6 +233,42 @@ pub fn main() -> i32
         return 3
     return 1
 """,
+    # LARB R63 (#4050): the `%` forms are const-evaluable and wrap at the
+    # expression's inferred type. u64-shaped here, so a `+%` size wraps at 64
+    # bits: 2^64-1 + 2 is 1, giving a one-element array.
+    "wrapping_const_as_array_size": """\
+const N: u64 = 18446744073709551615 +% 2
+
+pub fn main() -> i32
+    var a: [N]i32
+    a[0] = 3
+    if sizeof(a) != 4
+        return 1
+    return a[0]
+""",
+    # `-%` and `*%` wrap at the same i64 width as `+%` at 2^63.
+    "wrapping_sub_and_mul_at_i64_width": """\
+const A: i64 = 9223372036854775807 +% 1
+const B: i64 = (0 - 9223372036854775807 - 1) -% 1
+const C: i64 = 4611686018427387904 *% 2
+
+pub fn main() -> i32
+    if A == 0 - 9223372036854775807 - 1 and B == 9223372036854775807 and C == A
+        return 3
+    return 1
+""",
+    # A u64-shaped expression wraps at 64 bits, not 63.
+    "wrapping_u64_shape": """\
+const MAX: u64 = 18446744073709551615
+const A: u64 = MAX +% 2
+const B: u64 = MAX -% 1
+const C: u64 = MAX *% 2
+
+pub fn main() -> i32
+    if A == 1 and B == 18446744073709551614 and C == B
+        return 3
+    return 1
+""",
     # Resolved at emit time (names a later const), so it takes the other
     # folding path, which must wrap too.
     "wraps_when_resolved_late": """\

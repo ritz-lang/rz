@@ -10,6 +10,7 @@ from const_eval import (
     ConstEvalError,
     evaluate_const_expr,
     evaluate_array_sizes,
+    fold_literal_i64,
 )
 import ritz_ast as rast
 
@@ -162,6 +163,65 @@ class TestConstEvaluator:
         assert evaluator.evaluate(expr) == 14
 
 
+I64_MIN = -(1 << 63)
+I64_MAX = (1 << 63) - 1
+U64_MAX = (1 << 64) - 1
+
+
+class TestWrappingConstEvaluation:
+    """LARB R63 (#4050): `+%` `-%` `*%` in constant expressions wrap.
+
+    The wrap is at the expression's inferred type: i64 by default, u64 when
+    `_is_u64` is true. A plain `+` keeps its unwrapped value; only the `%`
+    forms wrap.
+    """
+
+    def test_add_wraps_at_i64(self):
+        assert ConstEvaluator().evaluate(
+            parse_expr("9223372036854775807 +% 1")) == I64_MIN
+
+    def test_sub_wraps_at_i64(self):
+        assert ConstEvaluator().evaluate(
+            parse_expr("(0 - 9223372036854775807 - 1) -% 1")) == I64_MAX
+
+    def test_mul_wraps_at_i64(self):
+        assert ConstEvaluator().evaluate(
+            parse_expr("4611686018427387904 *% 2")) == I64_MIN
+
+    @pytest.mark.parametrize("src,want", [
+        ("18446744073709551615 +% 2", 1),
+        ("18446744073709551615 -% 1", U64_MAX - 1),
+        ("18446744073709551615 *% 2", U64_MAX - 1),
+    ])
+    def test_u64_shaped_wraps_at_64_bits(self, src, want):
+        assert ConstEvaluator().evaluate(parse_expr(src)) == want
+
+    def test_nested_wraps_step_by_step(self):
+        assert ConstEvaluator().evaluate(
+            parse_expr("(9223372036854775807 +% 1) +% 1")) == I64_MIN + 1
+
+    def test_plain_add_is_not_wrapped(self):
+        """The flag, not the magnitude, decides: `+` keeps its exact value."""
+        assert ConstEvaluator().evaluate(
+            parse_expr("9223372036854775807 + 1")) == (1 << 63)
+
+    def test_fold_wraps_all_literal_add(self):
+        assert fold_literal_i64(
+            parse_expr("9223372036854775807 +% 1")) == I64_MIN
+
+    def test_fold_wraps_all_literal_sub(self):
+        assert fold_literal_i64(
+            parse_expr("(0 - 9223372036854775807 - 1) -% 1")) == I64_MAX
+
+    def test_fold_wraps_all_literal_mul(self):
+        assert fold_literal_i64(
+            parse_expr("4611686018427387904 *% 2")) == I64_MIN
+
+    def test_fold_still_refuses_plain_add_overflow(self):
+        """A plain `+` outside i64 is not folded (it is emitted as before)."""
+        assert fold_literal_i64(parse_expr("9223372036854775807 + 1")) is None
+
+
 class TestArraySizeParsing:
     """Tests for parsing array types with const expression sizes."""
 
@@ -195,6 +255,34 @@ class TestArraySizeParsing:
         ty = parse_type("[SIZE * 2]u8")
         assert isinstance(ty, rast.ArrayType)
         assert isinstance(ty.size, rast.BinOp)
+
+    @pytest.mark.parametrize("src,op", [
+        ("[A +% B]u8", '+'),
+        ("[A -% B]u8", '-'),
+        ("[A *% B]u8", '*'),
+    ])
+    def test_wrapping_operator_size(self, src, op):
+        """LARB R63 (#4050): the const parser accepts `+%` `-%` `*%`.
+
+        They become the plain operator with `wrapping=True`, exactly as
+        `parse_expr` builds them, so const evaluation can wrap at the
+        expression's inferred type.
+        """
+        ty = parse_type(src)
+        assert isinstance(ty, rast.ArrayType)
+        assert isinstance(ty.size, rast.BinOp)
+        assert ty.size.op == op
+        assert ty.size.wrapping is True
+
+    def test_wrapping_precedence_in_size(self):
+        """`*%` binds tighter than `+%`, as `*` does over `+`."""
+        ty = parse_type("[A +% B *% C]u8")
+        assert isinstance(ty.size, rast.BinOp)
+        assert ty.size.op == '+'
+        assert ty.size.wrapping is True
+        assert isinstance(ty.size.right, rast.BinOp)
+        assert ty.size.right.op == '*'
+        assert ty.size.right.wrapping is True
 
     def test_slice_type_still_works(self):
         """Slice types [T] still parse correctly - as their `Span<T>` sugar."""
@@ -345,6 +433,30 @@ fn f() -> void
         errors = evaluate_array_sizes(module)
         assert len(errors) == 1
         assert "Unknown constant" in str(errors[0])
+
+    def test_wrapping_expression_in_array(self):
+        """A `+%` size folds wrapped, at its inferred (u64) width."""
+        source = """
+fn f() -> void
+    var buf: [18446744073709551615 +% 2]u8
+"""
+        module = parse_module(source)
+        errors = evaluate_array_sizes(module)
+        assert errors == []
+        fn = module.items[0]
+        assert fn.body.stmts[0].type.size == 1
+
+    def test_plain_add_overflow_in_array_is_not_wrapped(self):
+        """The control: without `%`, the value is the exact sum."""
+        source = """
+fn f() -> void
+    var buf: [9223372036854775807 + 1]u8
+"""
+        module = parse_module(source)
+        errors = evaluate_array_sizes(module)
+        assert errors == []
+        fn = module.items[0]
+        assert fn.body.stmts[0].type.size == 1 << 63
 
 
 class TestEvaluateConstExpr:

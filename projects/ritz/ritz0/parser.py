@@ -701,7 +701,7 @@ class Parser:
         Supports a limited set of constant expressions:
         - Integer literals: 512
         - Named constants: SIZE
-        - Binary ops: SIZE * 2, 1 << 9
+        - Binary ops: SIZE * 2, 1 << 9, N +% 1 (LARB R63)
         - Unary ops: -1, ~0
         - Parenthesized: (SIZE + 1)
         """
@@ -726,7 +726,10 @@ class Parser:
             TokenType.RSHIFT: 8,    # >>
             TokenType.PLUS: 9,      # +
             TokenType.MINUS: 9,     # -
+            TokenType.PLUSPCT: 9,   # +% (wrapping, LARB R63)
+            TokenType.MINUSPCT: 9,  # -%
             TokenType.STAR: 10,     # *
+            TokenType.STARPCT: 10,  # *%
             TokenType.SLASH: 10,    # /
             TokenType.PERCENT: 10,  # %
         }
@@ -739,7 +742,11 @@ class Parser:
             op = tok.value
             self._advance()
             right = self._parse_const_expr(prec + 1)
-            left = rast.BinOp(left.span, op, left, right)
+            wrap_op = _WRAPPING_OPS.get(tok.type)
+            if wrap_op is not None:
+                left = rast.BinOp(left.span, wrap_op, left, right, wrapping=True)
+            else:
+                left = rast.BinOp(left.span, op, left, right)
 
         return left
 

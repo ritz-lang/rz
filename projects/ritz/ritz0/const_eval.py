@@ -25,6 +25,8 @@ class ConstEvaluator:
     - Integer literals
     - Named constants
     - Binary operations: +, -, *, /, %, <<, >>, &, |, ^
+      (`+%`, `-%`, `*%` are the same operators with `BinOp.wrapping`, and
+      wrap at the inferred type: i64, or u64 for a `_is_u64` expression)
     - Unary operations: -, ~, ! (logical: 0 -> 1, nonzero -> 0)
     - Char and bool literals, `as` casts (the value is kept; the target's
       own type governs its use), parenthesized expressions
@@ -65,6 +67,22 @@ class ConstEvaluator:
                 return self._is_u64(expr.left)
             return self._is_u64(expr.left) or self._is_u64(expr.right)
         return False
+
+    def _wrap_if_requested(self, expr: rast.BinOp, value: int) -> int:
+        """Wrap a `+%`/`-%`/`*%` result at its inferred type (LARB R63, #4050).
+
+        The width is the one the operator runs at: i64 by default, u64 when
+        `_is_u64(expr)` is true. A plain `+`, `-` or `*` keeps its exact value
+        and never comes through here, so its overflow still refuses to fold
+        (`_fold_i64`) rather than wrapping silently.
+        """
+        if not expr.wrapping:
+            return value
+        if self._is_u64(expr):
+            return value & ((1 << 64) - 1)
+        # Two's complement at 64 bits, kept in the signed form the emitter
+        # uses: ((v + 2**63) mod 2**64) - 2**63.
+        return ((value + (1 << 63)) & ((1 << 64) - 1)) - (1 << 63)
 
     def evaluate(self, expr: rast.Expr) -> int:
         """Evaluate a constant expression to an integer.
@@ -120,11 +138,11 @@ class ConstEvaluator:
                 left &= (1 << 64) - 1
                 right &= (1 << 64) - 1
             if op == '+':
-                return left + right
+                return self._wrap_if_requested(expr, left + right)
             elif op == '-':
-                return left - right
+                return self._wrap_if_requested(expr, left - right)
             elif op == '*':
-                return left * right
+                return self._wrap_if_requested(expr, left * right)
             elif op == '/':
                 if right == 0:
                     raise ConstEvalError("Division by zero in constant expression")
@@ -195,6 +213,11 @@ _I64_MIN, _I64_MAX = -(1 << 63), (1 << 63) - 1
 _FOLD_BINOPS = frozenset(('+', '-', '*', '/', '%', '<<', '>>', '&', '|', '^'))
 
 
+def _wrap_i64(value: int) -> int:
+    """`value` in two's complement at 64 bits, in the signed form folds use."""
+    return ((value + (1 << 63)) & ((1 << 64) - 1)) - (1 << 63)
+
+
 def fold_literal_i64(expr: rast.Expr) -> Optional[int]:
     """The value of an ALL-LITERAL integer operator expression, or None.
 
@@ -208,9 +231,11 @@ def fold_literal_i64(expr: rast.Expr) -> Optional[int]:
     it is exact and refuses rather than wraps: any step outside i64 (a u64-only
     literal, `(1 << 63) >> 60`, an overflowing `+`), a zero divisor or a shift
     count outside 0..63 returns None and the expression is emitted as before.
-    Inside i64, `>>` is arithmetic and `/`, `%` truncate toward zero, as
-    ashr / sdiv / srem. Folding at a narrower width instead would change a
-    `>>`, `/` or `%` (#1396): `(1 << 40) >> 38` is 4, not 0.
+    A `+%`/`-%`/`*%` step (LARB R63, #4050) is the exception: the writer asked
+    it to wrap, so the fold wraps that step at i64 and it folds. Inside i64,
+    `>>` is arithmetic and `/`, `%` truncate toward zero, as ashr / sdiv /
+    srem. Folding at a narrower width instead would change a `>>`, `/` or `%`
+    (#1396): `(1 << 40) >> 38` is 4, not 0.
     """
     if not isinstance(expr, (rast.BinOp, rast.UnaryOp, rast.Grouped)):
         return None
@@ -251,6 +276,11 @@ def _fold_i64(expr: rast.Expr) -> Optional[int]:
             value = {'+': left + right, '-': left - right, '*': left * right,
                      '&': left & right, '|': left | right,
                      '^': left ^ right}[op]
+            # `+%` `-%` `*%` wrap at i64 on request (LARB R63, #4050); a plain
+            # `+`/`-`/`*` leaves `value` exact, so an i64 overflow refuses
+            # below instead of wrapping silently.
+            if expr.wrapping and op in ('+', '-', '*'):
+                value = _wrap_i64(value)
     else:
         return None
     return value if _I64_MIN <= value <= _I64_MAX else None
