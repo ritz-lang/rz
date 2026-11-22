@@ -448,15 +448,86 @@ def _source_struct_names() -> set[str]:
 @pytest.mark.unit
 def test_emitter_has_no_hardcoded_source_layouts():
     """A `%Name = type {...}` string for a struct that has a source definition
-    is a second copy of that layout, and the two drift (#1436, #1440)."""
+    is a second copy of that layout, and the two drift (#1436, #1440).
+
+    Scans all of ritz1/src, not just emitter*.ritz: the pattern is a layout
+    only wherever it is written (#4546)."""
     defined = _source_struct_names()
     # Generic templates count too: `Vec$u8` is a copy of `struct Vec<T>`.
     offenders = []
-    for path in sorted(RITZ1_SRC.glob("emitter*.ritz")):
+    for path in sorted(RITZ1_SRC.rglob("*.ritz")):
         for m in re.finditer(r'c"%(\w+)(?:\$\w+)? = type \{', path.read_text()):
             if m.group(1) in defined:
-                offenders.append(f"{path.name}: {m.group(0)}")
+                offenders.append(f"{path.relative_to(RITZ1_SRC)}: {m.group(0)}")
     assert not offenders, "hard-coded struct layouts in ritz1:\n" + "\n".join(offenders)
+
+
+# --- static: no programmatic second copy of a source layout (#4546) --------
+# The literal scan above only sees `%Name = type { ... }` strings.  A layout
+# built by hand as a StructDef in code -- sema's view, monomorph's Span<T>,
+# register_builtin_structs' ~20 copies all began that way -- was invisible to
+# it.  Every place ritz1 allocates a StructDef is a place a layout can be
+# hard-coded, so each is allowlisted here with the number of layout structs it
+# legitimately builds.  Anything else fails, including a second allocation
+# inside an allowlisted builder.  The ratchet only shrinks: an entry whose
+# builder no longer allocates fails too.
+
+_STRUCTDEF_BUILDERS = {
+    # The parser's declarations: the layout is the source it parsed.
+    ("ast_helpers.ritz", "struct_def_new"): 1,
+    ("ast_helpers.ritz", "generic_struct_def_new"): 1,
+    # The one compiler-supplied view, `{ ptr, len }` (#4545).
+    ("types.ritz", "view_struct_new"): 1,
+    # Tuple structs: nameless literals the source cannot spell.
+    ("sema.ritz", "sema_tuple_new"): 1,
+    ("emitter_expr.ritz", "tuple_struct_new"): 1,
+    ("monomorph.ritz", "tuple_subst"): 1,
+    # A generic specialisation clones its fields from the source template.
+    ("monomorph.ritz", "clone_and_specialize_struct"): 2,
+    # The async lowering's per-coroutine and root `Future` structs.
+    ("async_lower.ritz", "al_future_struct"): 1,
+    ("async_lower.ritz", "al_inject_future"): 1,
+}
+
+_FN_RE = re.compile(r"^(?:pub\s+)?(?:async\s+)?fn\s+(\w+)", re.M)
+
+
+def _enclosing_fn(src: str, offset: int) -> str | None:
+    name = None
+    for m in _FN_RE.finditer(src, 0, offset):
+        name = m.group(1)
+    return name
+
+
+@pytest.mark.unit
+def test_ritz1_builds_no_hardcoded_struct_layouts():
+    """Every StructDef built in ritz1/src is a compiler-synthesized layout,
+    allowlisted above.  A new one is a hand-written copy until it is not."""
+    found: dict[tuple[str, str], int] = {}
+    for path in sorted(RITZ1_SRC.rglob("*.ritz")):
+        src = path.read_text()
+        rel = path.relative_to(RITZ1_SRC).as_posix()
+        for m in re.finditer(r"sizeof\(StructDef\)", src):
+            fn = _enclosing_fn(src, m.start())
+            assert fn is not None, f"{rel}: StructDef allocated outside a function"
+            found[(rel, fn)] = found.get((rel, fn), 0) + 1
+
+    unexpected = sorted(set(found) - set(_STRUCTDEF_BUILDERS))
+    stale = sorted(set(_STRUCTDEF_BUILDERS) - set(found))
+    drifted = [
+        f"{rel}: {fn}() builds {found[(rel, fn)]}, expected {n}"
+        for (rel, fn), n in sorted(_STRUCTDEF_BUILDERS.items())
+        if (rel, fn) in found and found[(rel, fn)] != n
+    ]
+    assert not unexpected, (
+        "unallowlisted StructDef construction in ritz1/src (a layout built by "
+        "hand):\n" + "\n".join(f"{rel}: {fn}()" for rel, fn in unexpected)
+    )
+    assert not stale, (
+        "allowlisted StructDef builders that no longer construct one (shrink "
+        "the ratchet):\n" + "\n".join(f"{rel}: {fn}()" for rel, fn in stale)
+    )
+    assert not drifted, "StructDef builder counts drifted:\n" + "\n".join(drifted)
 
 
 # --- the compiler-supplied view has one definition (#4545) ----------------
