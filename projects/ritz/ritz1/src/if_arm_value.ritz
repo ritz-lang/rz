@@ -76,6 +76,14 @@ fn if_arm_last(arm: *MatchArm) -> *Stmt
         last = last.next
     last
 
+# ritz0's #1406 wording at `line:col`, and the marker sema_walk reads so the
+# same `if` is not also reported as a statement with no effect (LARB R64/R69).
+fn if_arm_no_else_report(sm: *Sema, line: i32, col: i32)
+    if_arm_no_else_line = line
+    if_arm_no_else_col = col
+    sema_error_at(sm, line, col)
+    eprints_cstr(c"an `if` with no `else` has no value when its condition is false, so it cannot be used as a value here; add an `else` arm\n")
+
 fn if_arm_check_one(sm: *Sema, e: *Expr, arm: *MatchArm)
     if arm == null or arm.is_pass == 0
         return
@@ -83,10 +91,7 @@ fn if_arm_check_one(sm: *Sema, e: *Expr, arm: *MatchArm)
     if last != null and (last.kind == STMT_RETURN or last.kind == STMT_BREAK or last.kind == STMT_CONTINUE)
         return
     if last != null and last.kind == STMT_IF
-        if_arm_no_else_line = last.span.line
-        if_arm_no_else_col = last.span.col
-        sema_error_at(sm, last.span.line, last.span.col)
-        eprints_cstr(c"an `if` with no `else` has no value when its condition is false, so it cannot be used as a value here; add an `else` arm\n")
+        if_arm_no_else_report(sm, last.span.line, last.span.col)
     else
         sema_error_at(sm, e.span.line, e.span.col)
         eprints_cstr(c"an `if` expression arm does not end in a value\n")
@@ -98,5 +103,25 @@ pub fn if_arm_check(sm: *Sema, e: *Expr)
     let then_arm: *MatchArm = e.args as *MatchArm
     if then_arm == null
         return
+    # AGAST #4543: an else-less block `if` used as a value (`let x = if c` +
+    # its body).  The grammar builds the one-arm node instead of failing the
+    # parse at the next token, so the error lands where ritz0 puts it: at
+    # this `if`, with #1406's wording.
+    if then_arm.next == null or then_arm.next.else_missing != 0
+        if_arm_no_else_report(sm, e.span.line, e.span.col)
+        return
     if_arm_check_one(sm, e, then_arm)
     if_arm_check_one(sm, e, then_arm.next)
+
+# AGAST #4543: a value-wanted match arm whose block tail is an else-less
+# `if` has no value, the same #1406 shape one result path in (`let x = match`
+# with an arm ending in `if c` + its body).  ritz0's _find_valueless_if walks
+# a used match's arm bodies and reports at that `if`; sema_walk calls this
+# before walking the arm, and the report marks the `if` so its body is not
+# also "a statement with no effect".
+pub fn if_arm_check_match_arm(sm: *Sema, arm: *MatchArm)
+    if arm == null or arm.is_pass == 0
+        return
+    let last: *Stmt = if_arm_last(arm)
+    if last != null and last.kind == STMT_IF and last.if_else == null
+        if_arm_no_else_report(sm, last.span.line, last.span.col)

@@ -7984,6 +7984,34 @@ pub fn block_ended_check(p: *Parser) -> i32
         p.error = 1
     0
 
+# AGAST #4543: where the last else-less block `if` built as an expression
+# ended (the token index after its DEDENT), or -1.  A statement whose value
+# expression ends in that `if` has no NEWLINE after it — the block consumed
+# the DEDENT — so the statement's terminator is `open_if_ended`, not
+# `expr NEWLINE`.  Keyed by position, so a node built by a speculative
+# alternative over different tokens cannot satisfy it.
+var g_open_if_end: i32 = 0 - 1
+
+pub fn open_if_note(end: i32)
+    g_open_if_end = end
+
+# The grammar's open_if_ended: matches nothing and fails unless this is
+# exactly where expr_if_open's block ended.  A block operand (`5 + if c` +
+# its body, AGAST #4543) ends the statement here.
+pub fn open_if_ended_check(p: *Parser) -> i32
+    if p.pos != g_open_if_end or p.pos == 0 or (p.tokens + (p.pos - 1)).kind != TOK_DEDENT
+        p.error = 1
+    0
+
+# The grammar's else_absent: fails when an `else` follows, so the else-less
+# alternatives in if_expr_rhs / primary_expr do not claim a block `if` that
+# has one.  The form with an `else` is the first alternative and wins when it
+# parses; this keeps a malformed one failing where it did (AGAST #4543).
+pub fn else_absent_check(p: *Parser) -> i32
+    if p.pos < p.token_count and (p.tokens + p.pos).kind == TOK_ELSE
+        p.error = 1
+    0
+
 # AGAST #3124: the grammar's cast_type_end.  A cast's type is never followed
 # by an operand, so one there means the type ran on into a comparison
 # (`a as Sz < b, c > d` read as `Sz<b, c>`): fail, and cast_type retries the
@@ -8831,6 +8859,32 @@ pub fn expr_if(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line
     e.left = cond
     e.args = then_arm as *Expr  # Reinterpret arm list as Expr* slot
     e.next = null
+    return e
+
+# Create EXPR_IF for an else-less block form used as a value (AGAST #4543):
+# `let x = if c` + then body, or `5 + if c` + then body.  The missing `else`
+# is #1406's error, reported by if_arm_value at the `if` when the value is
+# wanted — exactly where ritz0 points — instead of failing the parse at the
+# next token.  The missing arm is a `pass` arm: every reader of an EXPR_IF
+# already handles one (narrowing, bool_check, float_slot, ...), and
+# if_arm_check tells it apart by the arm's `else_missing` marker.  Only the
+# refused program reaches it, since every value-wanted else-less `if` is an
+# error before emit.  `open_if_note` records where the block ended so the
+# statement terminator (open_if_ended) can accept it.
+pub fn expr_if_open(p: *Parser, cond: *Expr, then_body: *Stmt, line: i32, col: i32) -> *Expr
+    let then_arm: *MatchArm = if_arm_from_block(p, then_body)
+    let else_arm: *MatchArm = match_arm_wildcard(p)
+    match_arm_set_body(else_arm, null, 1)
+    else_arm.else_missing = 1
+    then_arm.next = else_arm
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = EXPR_IF
+    e.span.line = line
+    e.span.col = col
+    e.left = cond
+    e.args = then_arm as *Expr  # Reinterpret arm list as Expr* slot
+    e.next = null
+    open_if_note(p.pos)
     return e
 
 # Create EXPR_IF for the inline form `if cond then a else b` (AGAST #1753).

@@ -117,26 +117,29 @@ for _name, _stmt in NARROWING.REJECTED.items():
     )
 
 # #1406/#1429/#1435's else-less-if shapes.  Positions measured with ritz0 at
-# 0ae161b9; `gap` marks the 14 whose ritz1-family refusal lands elsewhere
-# (AGAST #4543).  A new entry here without an entry in this table fails
+# 0ae161b9.  All three compilers now agree on `line:col` for every row: the
+# 14 rows whose ritz1-family refusal used to land elsewhere were AGAST #4543,
+# fixed in ritz1's front end (it parses the else-less block `if` and Sema
+# refuses it at the `if`, as ritz0 does).  Any new disagreement reintroduces a
+# `gap` here.  A new entry without an entry in this table fails
 # test_every_else_less_if_row_is_in_the_corpus below, which is the point.
 ELSE_AT: dict[str, tuple[tuple[int, int], int | None]] = {
-    "else/value/assignment": ((3, 9), 4543),
+    "else/value/assignment": ((3, 9), None),
     "else/value/inside_if_arm": ((3, 9), None),
-    "else/value/inside_match_arm": ((4, 13), 4543),
-    "else/value/let_annotated": ((2, 18), 4543),
-    "else/value/let_inferred": ((2, 13), 4543),
+    "else/value/inside_match_arm": ((4, 13), None),
+    "else/value/let_annotated": ((2, 18), None),
+    "else/value/let_inferred": ((2, 13), None),
     "else/value/open_else_if_chain": ((4, 10), None),
-    "else/value/return_value": ((2, 12), 4543),
-    "else/value/var_initialiser": ((2, 13), 4543),
-    "else/operand/binop_right": ((2, 17), 4543),
-    "else/operand/binop_right_in_return": ((2, 16), 4543),
-    "else/operand/operand_in_a_procedure_tail": ((2, 15), 4543),
-    "else/operand/operand_in_a_statement_if_arm": ((3, 19), 4543),
-    "else/operand/operand_in_a_while_body_tail": ((3, 19), 4543),
-    "else/operand/operand_inside_a_value_arm": ((3, 13), 4543),
-    "else/operand/operand_of_an_expr_stmt": ((2, 15), 4543),
-    "else/operand/unary_operand": ((2, 14), 4543),
+    "else/value/return_value": ((2, 12), None),
+    "else/value/var_initialiser": ((2, 13), None),
+    "else/operand/binop_right": ((2, 17), None),
+    "else/operand/binop_right_in_return": ((2, 16), None),
+    "else/operand/operand_in_a_procedure_tail": ((2, 15), None),
+    "else/operand/operand_in_a_statement_if_arm": ((3, 19), None),
+    "else/operand/operand_in_a_while_body_tail": ((3, 19), None),
+    "else/operand/operand_inside_a_value_arm": ((3, 13), None),
+    "else/operand/operand_of_an_expr_stmt": ((2, 15), None),
+    "else/operand/unary_operand": ((2, 14), None),
 }
 for _label, _table in (("value", ELSE.VALUE_POSITIONS), ("operand", ELSE.OPERAND_POSITIONS)):
     for _name, _program in _table.items():

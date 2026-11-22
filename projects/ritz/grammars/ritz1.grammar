@@ -1010,6 +1010,12 @@ let_stmt -> *Stmt
       { stmt_named(stmt_let_decl(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, $4, $6, $1.line, $1.col), $2.line, $2.col) }
     | LET binding_name ASSIGN expr NEWLINE
       { stmt_named(stmt_let_decl(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, 0, $4, $1.line, $1.col), $2.line, $2.col) }
+    # AGAST #4543: the value expression ends in an else-less block `if`, whose
+    # DEDENT replaces the NEWLINE.  Parser success; Sema refuses at that `if`.
+    | LET binding_name COLON var_type ASSIGN expr open_if_ended
+      { stmt_named(stmt_let_decl(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, $4, $6, $1.line, $1.col), $2.line, $2.col) }
+    | LET binding_name ASSIGN expr open_if_ended
+      { stmt_named(stmt_let_decl(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, 0, $4, $1.line, $1.col), $2.line, $2.col) }
     ;
 
 # A tuple destructure's names after its second (AGAST #109), `, c, d` of
@@ -1039,6 +1045,12 @@ match_expr_rhs -> *Expr
 # expr_if / if_arm_from_block.
 if_expr_rhs -> *Expr
     : IF expr block ELSE block { expr_if(p, $2, $3, $5, $1.line, $1.col) }
+    # AGAST #4543: the else-less form still PARSES here — one arm, no value.
+    # `else_absent` fails it when an `else` follows (already claimed above),
+    # so it only takes the `if c` + body shape.  Sema refuses it at this
+    # `if` with ritz0's #1406 wording (if_arm_check), rather than the parser
+    # failing at whatever token comes next.
+    | IF expr block else_absent { expr_if_open(p, $2, $3, $1.line, $1.col) }
     ;
 
 var_stmt -> *Stmt
@@ -1067,6 +1079,11 @@ var_stmt -> *Stmt
     | VAR binding_name COLON type_spec NEWLINE
       { stmt_named(stmt_var_decl(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, $4, 0 as *Expr, $1.line, $1.col), $2.line, $2.col) }
     | VAR binding_name ASSIGN expr NEWLINE
+      { stmt_named(stmt_var_decl(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, 0, $4, $1.line, $1.col), $2.line, $2.col) }
+    # AGAST #4543: else-less block `if` as the value (see let_stmt).
+    | VAR binding_name COLON var_type ASSIGN expr open_if_ended
+      { stmt_named(stmt_var_decl(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, $4, $6, $1.line, $1.col), $2.line, $2.col) }
+    | VAR binding_name ASSIGN expr open_if_ended
       { stmt_named(stmt_var_decl(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, 0, $4, $1.line, $1.col), $2.line, $2.col) }
     ;
 
@@ -1098,6 +1115,8 @@ return_stmt -> *Stmt
     # `return if c` + arms + `else` (#1613); same DEDENT reason.
     | RETURN if_expr_rhs { stmt_return(p, $2, $1.line, $1.col) }
     | RETURN expr NEWLINE { stmt_return(p, $2, $1.line, $1.col) }
+    # AGAST #4543: else-less block `if` as the returned value (see let_stmt).
+    | RETURN expr open_if_ended { stmt_return(p, $2, $1.line, $1.col) }
     | RETURN NEWLINE { stmt_return(p, 0 as *Expr, $1.line, $1.col) }
     ;
 
@@ -1268,6 +1287,8 @@ assign_rhs -> *Expr
     : match_expr_rhs { $1 }
     | if_expr_rhs { $1 }
     | expr NEWLINE { $1 }
+    # AGAST #4543: else-less block `if` as the assigned value (see let_stmt).
+    | expr open_if_ended { $1 }
     ;
 
 # Compound assignment operators: +=, -=, *=, /=, and their wrapping forms
@@ -1286,6 +1307,9 @@ compound_op -> i32
 
 expr_stmt -> *Stmt
     : expr NEWLINE { stmt_expr(p, $1, $1.span.line, $1.span.col) }
+    # AGAST #4543: a statement whose operand is an else-less block `if`
+    # (`*p + if c` + its body) ends at that block's DEDENT.
+    | expr open_if_ended { stmt_expr(p, $1, $1.span.line, $1.span.col) }
     ;
 
 # Expression grammar (left-factored to avoid exponential backtracking)
@@ -1317,6 +1341,22 @@ op_nl -> i32
 # a DEDENT, so the tail ends there.
 block_ended -> i32
     : { block_ended_check(p) }
+    ;
+
+# AGAST #4543: the statement terminator when its value expression ended in an
+# else-less block `if` (expr_if_open).  Such a block consumes the DEDENT and
+# leaves no NEWLINE, so `expr NEWLINE` cannot match; this matches nothing and
+# fails unless p.pos is exactly where that `if` ended.  Position-keyed, not
+# `block_ended`: a `match` block operand ends at the same DEDENT but must stay
+# unparseable (#4049), and only the `if` path records its end.
+open_if_ended -> i32
+    : { open_if_ended_check(p) }
+    ;
+
+# AGAST #4543: fails (matches nothing) when an `else` follows, so an
+# else-less alternative does not claim a block `if` that has one.
+else_absent -> i32
+    : { else_absent_check(p) }
     ;
 
 or_expr -> *Expr
@@ -1652,6 +1692,13 @@ primary_expr -> *Expr
     # (no block) and expr_stmt picks this up.
     | IF expr THEN expr ELSE expr
       { expr_if_inline(p, $2, $4, $6, $1.line, $1.col) }
+    # AGAST #4543: a block `if` as an operand (`5 + if c` + its body).  One
+    # arm, no value; Sema refuses it at this `if` (#1406), so the parser no
+    # longer fails at the operand's end.  `else_absent` keeps a block `if`
+    # WITH an `else` failing here exactly as before (that form is still not
+    # an operand of ritz1's grammar).
+    | IF expr block else_absent
+      { expr_if_open(p, $2, $3, $1.line, $1.col) }
     # Array fill literal: `[value; N]` — produces an array of size N where
     # each element is `value`.  Mirrors ritz0; squeeze/cryptosec rely on
     # this for inflate/sbox table init and valet's link step would
