@@ -1078,15 +1078,25 @@ pick_train_host() {
 # The remote wait runs in the train's own slot tree, $(rwt) (AGAST #4247).
 cmd_wait() {
     local log="${1:?usage: $0 wait <log>}" s st="" spec="" host ref rlog llog rc tries=0 nov=0 tip
+    # The caller often pastes the local copy `gate --next` printed relative to
+    # the repo root, while SPEC records it absolutely (AGAST #4525).  realpath
+    # -m resolves a path that does not exist yet (the verdict is fetched
+    # later).  The basename fallback is safe too: the copy always ends
+    # `@<host>.log`, so it is unique within a state file.
+    local want; want="$(realpath -m -- "$log")"
     for s in $(queue); do
         use_slot "$s"
         spec="$(field SPEC "$(state)")"
-        if [[ -n "$spec" && "${spec##* }" == "$log" ]]; then st="$(state)"; break; fi
+        if [[ -n "$spec" ]] \
+            && { [[ "$(realpath -m -- "${spec##* }")" == "$want" ]] \
+                || [[ "$(basename "${spec##* }")" == "$(basename "$log")" ]]; }; then
+            st="$(state)"; break
+        fi
         spec=""
     done
     if [[ -z "$spec" ]]; then
         [[ "$log" != *@*.log ]] || die "no train has a remote gate with log $log: discarded by a rebuild?"
-        exec bash "$GATE" --wait "$log"
+        exec bash "$GATE" --wait "$want"
     fi
     read -r host ref rlog llog <<<"$spec"
     # A speculative gate on this host (AGAST #4031): its log is local.

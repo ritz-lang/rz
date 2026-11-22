@@ -1616,5 +1616,26 @@ has "$out" "^SKIP zdrop2: gate live \(host STATUS\); not rebasing mid-gate" \
     "a room on a dropped tail but mid-gate is skipped, not rewound"
 ! grep -q '^BOUNCE zdrop2' <<<"$out" && ok "a gating room is never bounced" || bad "a gating room is never bounced"
 
+# 19. Coordinator-tooling defects from the rz loop, 2026-11-22.
+# 19a. #4525: `gate --next` prints the local copy of a remote gate's log, and
+# the operator may paste it relative to the repo root.  The SPEC records it
+# absolutely, so `wait` must normalise before deciding no train owns it.
+fetch; git -C "$M" checkout -q main
+bash "$TR" land >/dev/null 2>&1; rm -f "$RES"
+two wa s/wa; bash "$TR" build "wa1:$c1" "wa2:$c2" >/dev/null 2>&1
+llog="$(bash "$TR" gate --next hostx 2>/dev/null)"
+bash "$TR" wait "$llog" >/dev/null 2>&1
+rel="${llog#"$T"/}"
+out="$(cd "$T" && bash "$TR" wait "$rel" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] \
+    && ok "wait finds the train given its remote log as a relative path (#4525)" \
+    || { bad "wait finds the train given its remote log as a relative path (#4525) (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+bash "$TR" land "$llog" >/dev/null 2>&1; rm -f "$RES"
+# The refusal half: a log no train owns is still refused, and the exit code is
+# 1, not 0 (a caller's pipeline can mask this; check it cleanly).
+out="$(cd "$T" && bash "$TR" wait gates/train-000000000000-1@hostx.log 2>&1)"; rc=$?
+[[ $rc -eq 1 ]] && has "$out" "discarded by a rebuild" "wait refuses an unknown remote log with exit 1 (#4525)" \
+    || bad "wait refuses an unknown remote log with exit 1 (#4525) (rc=$rc)"
+
 unset RZ_TRAIN_DEBOUNCE; export RZ_TRAIN_MAX=8
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }
