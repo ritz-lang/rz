@@ -1,0 +1,77 @@
+# ritz1/test/test_view_layout.ritz - the one `{ ptr, len }` view (AGAST #4545)
+#
+# types.ritz's view_struct_new is the only construction of the shape a string
+# literal and `v[lo..hi]` lower to; view_ptr_name / view_len_name are the only
+# spelling of its field names.  These pin the layout and the names, so a drift
+# fails here instead of miscompiling a program.  Run by `make ritz1-unit`
+# (tools/ritz1_unit.py), a bootstrap gate step.
+
+import ritzlib.str
+import ritzlib.strview
+import ast
+import types
+
+# 1 if the field is named `name`, as a string literal/`v[lo..hi]` lowering
+# would spell it.
+fn name_is(f: *StructField, name: *u8, len: i32) -> i32
+    if f == null or f.name == null
+        return 0
+    if f.name_len != len
+        return 0
+    if memcmp(f.name, name, len as i64) != 0
+        return 0
+    1
+
+# `{ ptr: *u8, len: i64 }`, the shape string literals and `Span$u8` /
+# `StrView` have.  The ptr field's pointee is u8 for the `ptr + i` stride.
+[[test]]
+fn test_concrete_view_is_ptr_then_i64() -> i32
+    let st: *StructDef = view_struct_new(StrView { ptr: (c"StrView"), len: (7) as i64 }, 0)
+    assert st != null
+    assert st.name_len == 7
+    let f1: *StructField = st.fields
+    assert name_is(f1, view_ptr_name(), VIEW_PTR_NAME_LEN) == 1
+    assert f1.field_type == TYPE_PTR
+    assert f1.array_elem_type == TYPE_U8
+    let f2: *StructField = f1.next
+    assert name_is(f2, view_len_name(), VIEW_LEN_NAME_LEN) == 1
+    assert f2.field_type == TYPE_I64
+    assert f2.next == null
+    assert st.type_params == null
+    assert st.next == null
+    assert view_layout_ok(st) == 1
+    0
+
+# `Span<T>`'s template: the ptr field's pointee is the unsubstituted type
+# parameter `T`, which clone_struct_fields substitutes at instantiation.
+[[test]]
+fn test_generic_view_pointee_is_type_parameter() -> i32
+    let st: *StructDef = view_struct_new(StrView { ptr: (c"Span"), len: (4) as i64 }, 1)
+    let f1: *StructField = st.fields
+    assert name_is(f1, view_ptr_name(), VIEW_PTR_NAME_LEN) == 1
+    assert f1.field_type == TYPE_PTR
+    assert f1.ptr_pointee == TYPE_STRUCT
+    assert f1.field_type_name_len == 1
+    assert memcmp(f1.field_type_name, c"T", 1) == 0
+    assert name_is(f1.next, view_len_name(), VIEW_LEN_NAME_LEN) == 1
+    assert f1.next.field_type == TYPE_I64
+    0
+
+# A source layout string literals cannot honour is refused, not shadowed.
+[[test]]
+fn test_validator_rejects_a_reordered_layout() -> i32
+    var len_f: StructField
+    len_f.field_type = TYPE_I64
+    len_f.next = null
+    var ptr_f: StructField
+    ptr_f.field_type = TYPE_PTR
+    ptr_f.next = @len_f
+    var st: StructDef
+    st.fields = @ptr_f
+    assert view_layout_ok(@st) == 1
+    # `len` first: the literal lowering hard-codes `{ ptr, i64 }`.
+    len_f.next = @ptr_f
+    ptr_f.next = null
+    st.fields = @len_f
+    assert view_layout_ok(@st) == 0
+    0

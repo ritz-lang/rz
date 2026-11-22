@@ -1,4 +1,5 @@
-# ritz1/src/types.ritz - the ONE table of primitive type facts
+# ritz1/src/types.ritz - the ONE table of primitive type facts, plus the one
+# compiler-supplied struct layout: the `{ ptr, len }` view (AGAST #4545)
 #
 # AGAST #1889 (#1814 FIX step 2, review ritz1.md F2).  Every fact ritz1 needs
 # about a primitive type kind (TYPE_* from ast.ritz) is answered here, and
@@ -32,6 +33,7 @@
 # guess for a fact.
 
 import ast
+import ritzlib.memory   # calloc for the view layout below (AGAST #4545)
 
 # 1 for the eight integer kinds (not bool).
 pub fn ty_is_int(t: i32) -> i32
@@ -268,3 +270,82 @@ pub fn tr_name(tr: *TypeRef, out_len: *i32) -> *u8
     if tr.elem != null
         return tr_name(tr.elem, out_len)
     null
+
+# =============================================================================
+# The compiler-supplied `{ ptr, len }` view (AGAST #4545)
+#
+# A bare string literal lowers to a `%Span$u8` aggregate of type StrView, and
+# `v[lo..hi]` lowers to a `Span$T { ptr, len }`.  That one shape used to be
+# built three times — Sema's static view, the emitter's string-literal
+# fallback, and monomorph's `Span<T>` template — and its field names assumed
+# in a fourth place (monomorph's span_view_in_place).  They drifted
+# independently.  It is built here, once, and its names are exposed so
+# lowering and validation cannot spell them differently from the layout.
+#
+# `view_struct_new` is the only place the StructDef and its fields are made.
+# Callers keep their own ordering: the emitter APPENDS the struct, monomorph
+# PREPENDS its template, and each arranges that (order is semantic).
+# `view_layout_ok` is the only check of a source layout against the literal's.
+# =============================================================================
+
+pub const VIEW_PTR_NAME_LEN: i32 = 3
+pub const VIEW_LEN_NAME_LEN: i32 = 3
+
+# The view's field names, in declaration order.
+pub fn view_ptr_name() -> *u8
+    c"ptr"
+
+pub fn view_len_name() -> *u8
+    c"len"
+
+# A fresh StructField of the view: named, typed, and every specialization
+# field at its TYPE_VOID / null default (calloc zeroes them).
+fn view_field_new(name: *u8, name_len: i32, ty: i32) -> *StructField
+    let f: *StructField = calloc(1, sizeof(StructField)) as *StructField
+    f.name = name
+    f.name_len = name_len
+    f.field_type = ty
+    f.inner_pointee_type = TYPE_VOID
+    f.field_ref_ptr_pointee = TYPE_VOID
+    f
+
+# The `{ ptr: *P, len: i64 }` StructDef named `name_sv`.  `generic` = 1 makes
+# the pointee the unsubstituted type parameter `T` (monomorph's template,
+# whose fields clone_struct_fields substitutes); `generic` = 0 makes it the
+# concrete `u8` view a string literal / `Span$u8` / `StrView` has.  `next`,
+# `type_params` and `def_file` stay null: the caller links it into the module
+# and, for the template, adds its `<T>`.
+pub fn view_struct_new(name_sv: StrView, generic: i32) -> *StructDef
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let ptr_f: *StructField = view_field_new(view_ptr_name(), VIEW_PTR_NAME_LEN, TYPE_PTR)
+    if generic == 1
+        ptr_f.ptr_pointee = TYPE_STRUCT
+        ptr_f.field_type_name = c"T"
+        ptr_f.field_type_name_len = 1
+    else
+        ptr_f.array_elem_type = TYPE_U8   # the pointee, for `span.ptr + i` stride
+    ptr_f.next = view_field_new(view_len_name(), VIEW_LEN_NAME_LEN, TYPE_I64)
+    let st: *StructDef = calloc(1, sizeof(StructDef)) as *StructDef
+    st.name = name
+    st.name_len = len
+    st.fields = ptr_f
+    st
+
+# 1 if `st` has exactly the `{ ptr, i64 }` shape string literals are lowered
+# to: two fields, a pointer then an i64.  A source layout that differs cannot
+# honour the hard-coded literal lowering and is an error, not a shadow.
+pub fn view_layout_ok(st: *StructDef) -> i32
+    let f1: *StructField = st.fields
+    if f1 == null
+        return 0
+    if f1.field_type != TYPE_PTR
+        return 0
+    let f2: *StructField = f1.next
+    if f2 == null
+        return 0
+    if f2.field_type != TYPE_I64
+        return 0
+    if f2.next != null
+        return 0
+    1

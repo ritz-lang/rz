@@ -457,3 +457,35 @@ def test_emitter_has_no_hardcoded_source_layouts():
             if m.group(1) in defined:
                 offenders.append(f"{path.name}: {m.group(0)}")
     assert not offenders, "hard-coded struct layouts in ritz1:\n" + "\n".join(offenders)
+
+
+# --- the compiler-supplied view has one definition (#4545) ----------------
+# `{ ptr, len }` used to be built three times (sema's static view, the
+# emitter's string-literal fallback, monomorph's `Span<T>` template) and its
+# field names assumed in a fourth place (span_view_in_place).  The three
+# builders drifted independently.  One constructor in types.ritz builds the
+# shape and exposes its field names; every site reads it from there.
+
+
+def test_view_layout_is_built_once():
+    src = {p.name: p.read_text() for p in RITZ1_SRC.glob("*.ritz")}
+    types_rz = src["types.ritz"]
+    assert "pub fn view_struct_new(" in types_rz, "no shared view constructor"
+    assert "pub fn view_layout_ok(" in types_rz, "no shared view validator"
+    assert "pub fn view_ptr_name(" in types_rz, "field names not exposed"
+    assert "pub fn view_len_name(" in types_rz, "field names not exposed"
+
+    # All three former builders now go through the one constructor...
+    for mod in ("sema.ritz", "emitter.ritz", "monomorph.ritz"):
+        assert "view_struct_new(" in src[mod], (
+            f"{mod} still builds the {{ ptr, len }} layout itself"
+        )
+    # ...and the emitter validates a source layout through the shared check.
+    assert "view_layout_ok(" in src["emitter.ritz"]
+
+    # No private copy of the shape, its names, or its validator survives.
+    assert "g_sema_view_ptr" not in src["sema.ritz"]
+    assert "string_literal_field" not in src["emitter.ritz"]
+    assert "is_string_literal_layout" not in src["emitter.ritz"]
+    assert "view_ptr_name(" in src["monomorph.ritz"]
+    assert "view_len_name(" in src["monomorph.ritz"]
