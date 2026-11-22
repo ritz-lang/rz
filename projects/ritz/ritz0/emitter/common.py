@@ -11,6 +11,8 @@ EmitError` and friends keep working (AGAST #1826).
 
 from typing import Optional
 
+from llvmlite import ir
+
 import ritz_ast as rast
 
 
@@ -47,6 +49,66 @@ class InternalError(ValueError):
     parser cannot produce. A compiler bug, never the user's, so it is *not*
     an EmitError: it still surfaces as a traceback (AGAST #1390). A
     ValueError for the same fallback reason as SourceError."""
+
+
+class SourceError(EmitError, ValueError):
+    """A source error found by an emitter helper (AGAST #1390): an unknown
+    struct, field, variant or variable, a builtin's arity, `?` on a non-Result.
+
+    These were 129 bare ValueError raises that reached the user as a
+    Python traceback naming no file. Raised through `Emitter._err`, which
+    locates them at the innermost expression being emitted. Still a
+    ValueError, so a route that only *tries* (an lvalue address before
+    spilling an rvalue, a type lookup that says nothing on failure) falls
+    back exactly as it did before the location was added."""
+
+
+MATCH_HAS_NO_VALUE = (
+    "this match has no value: its arms don't yield one value type, "
+    "so it can't be used where a value is wanted")
+
+
+class MatchHasNoValue(EmitError, AttributeError):
+    """A `NoValue` read as a value (AGAST #1357), located at its match.
+
+    Also an AttributeError, so `hasattr(v, 'type')` / `getattr(v, 'type',
+    None)` probes still answer "no value" as they did for ir.Undefined; only
+    a consumer that really reads the value's type gets the located error."""
+
+    def __init__(self, span: Optional[rast.Span]):
+        super().__init__(MATCH_HAS_NO_VALUE, span)
+
+
+class NoValue:
+    """What a match with no value yields: its live arms' types can't merge, or
+    an arm ends in a statement (#1321).  Fine as a statement.  It was the bare
+    ir.Undefined, so a consumer in value position (a `let`, an assignment, a
+    `return`, an operand...) died with a raw `'_Undefined' object has no
+    attribute 'type'`.  This carries the match's span, and any attribute read
+    (`.type`, `.get_reference()`...) raises MatchHasNoValue there (#1357)."""
+
+    __slots__ = ("span",)
+
+    def __init__(self, span: Optional[rast.Span]):
+        self.span = span
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise MatchHasNoValue(self.span)
+
+    def __repr__(self):
+        return "NoValue"
+
+
+# A `pass` arm's place in a match's arm values (_fill_pass_arms).
+_PASS_ARM = object()
+
+
+def has_no_value(val) -> bool:
+    """Whether `val` is an expression's "no value": ir.Undefined (a block
+    ending in a statement, a diverging `break` / `return`) or a NoValue."""
+    return val is ir.Undefined or isinstance(val, NoValue)
 
 
 # Volatile / atomic memory builtins (AGAST #1879): name -> (arity, rmw op).
