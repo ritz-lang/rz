@@ -87,7 +87,7 @@ fn body_tail_span(body: *Stmt) -> SrcSpan
 #
 # `tail` is the body's last statement (body_tail_span), where an error about
 # the implicit return's value is reported (AGAST #3445).
-fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_type: i32, ret_type_name_sv: StrView, tail: SrcSpan)
+fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: bool, ret_type: i32, ret_type_name_sv: StrView, tail: SrcSpan)
     var ret_type_name: *u8 = ret_type_name_sv.ptr
     var ret_type_name_len: i32 = ret_type_name_sv.len as i32
     # A TYPE_STRUCT return that lost its name is declared through emit_llvm_type
@@ -104,7 +104,7 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
     # loop-exit block, where the body does not dominate the ret on the
     # zero-iteration path.  `last_expr_here` returns 0 in that case, and
     # Sema's tail_value_check (AGAST #2236, #3511) has already rejected a fn that ends there.
-    if has_explicit_return == 0 and ret_type != TYPE_VOID
+    if not has_explicit_return and ret_type != TYPE_VOID
         var ival: i32 = last_expr_here(s)
         # AGAST #2950: a tail `if` / `match` whose phi is an i64 in a `-> @&T`
         # fn (an arm `q` with `q: *C`), or a `ptr` in a `-> *T` / `-> @T` one.
@@ -177,7 +177,7 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
             # its scrutinee (#2245, #2344): this is the merge after arms that
             # all left, or the exit of a `while true`.
             emit_str(s, c"  unreachable\n")
-    else if ret_type == TYPE_VOID and has_explicit_return == 0
+    else if ret_type == TYPE_VOID and not has_explicit_return
         emit_str(s, c"  ret void\n")
 
 # AGAST #3421: a statement `if` ending a fn body.  In an `-> f64` / `-> f32`
@@ -590,14 +590,14 @@ fn tag_intrinsic_target_features(s: *EmitterState, attr_pos: i64)
     free(tail)
 
 # 1 when fn_linkage gives the fn an ODR linkage (linkonce_odr / weak_odr).
-fn fn_is_odr(is_main: i32, is_monomorph: i32, is_pub: i32, from_generated: i32) -> i32
-    if is_main == 1
-        return 0
-    if is_monomorph == 1
-        return 1
+fn fn_is_odr(is_main: bool, is_monomorph: bool, is_pub: i32, from_generated: i32) -> bool
+    if is_main
+        return false
+    if is_monomorph
+        return true
     if is_pub == 1 and from_generated == 1
-        return 1
-    0
+        return true
+    false
 
 # AGAST #201: an ODR *function* goes in its own same-named comdat, as clang
 # does for every C++ inline/template function.  On ELF a linkonce definition
@@ -641,11 +641,11 @@ fn emit_odr_comdat_start(s: *EmitterState, name_sv: StrView, suffix_sv: StrView)
 #     external with its file in the symbol (fn_symbol), like ritz0, so a
 #     generic's instance in another object can call it.  A private impl
 #     method still lands here: `T_m` cannot clash.
-fn fn_linkage(is_main: i32, is_monomorph: i32, is_pub: i32, from_generated: i32) -> *u8
-    if is_main == 1
+fn fn_linkage(is_main: bool, is_monomorph: bool, is_pub: i32, from_generated: i32) -> *u8
+    if is_main
         return c"define "
-    if fn_is_odr(is_main, is_monomorph, is_pub, from_generated) == 1
-        if is_monomorph == 1
+    if fn_is_odr(is_main, is_monomorph, is_pub, from_generated)
+        if is_monomorph
             return c"define linkonce_odr "
         return c"define weak_odr "
     if is_pub == 1
@@ -701,15 +701,15 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     s.sret_last_slot = 0
 
     # Linkage follows visibility (AGAST #3386, LARB R45); see fn_linkage.
-    var is_main: i32 = 0
+    var is_main: bool = false
     if f.name_len == 4
         if *(f.name + 0) == 'm' and *(f.name + 1) == 'a' and *(f.name + 2) == 'i' and *(f.name + 3) == 'n'
-            is_main = 1
-    var is_monomorph: i32 = 0
+            is_main = true
+    var is_monomorph: bool = false
     var name_i: i32 = 0
     while name_i < f.name_len
         if *(f.name + name_i) == '$'   # '$' marks a monomorph instantiation suffix
-            is_monomorph = 1
+            is_monomorph = true
             name_i = f.name_len
         else
             name_i = name_i + 1
@@ -723,7 +723,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             # so a generic's instance emitted in another object can call it.
             emit_str(s, c"define ")
         else
-            if fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated) == 1
+            if fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated)
                 emit_odr_comdat_start(s, StrView { ptr: (f.name), len: (f.name_len) as i64 }, StrView { ptr: (null), len: (0) as i64 })
             emit_str(s, fn_linkage(is_main, is_monomorph, f.is_pub, f.from_generated))
     emit_str(s, fn_callconv_kw(f))   # [[callconv = "win64"]] (AGAST #1879)
@@ -775,7 +775,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     emit_str(s, fn_inline_attr(f))   # [[inline]] / [[always_inline]] / [[noinline]] (#1847)
     let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
     # After attr_pos: an attribute inserted there must precede `comdat`.
-    if f.is_local == 1 and fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated) == 1
+    if f.is_local == 1 and fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated)
         emit_str(s, c" comdat")   # AGAST #201: see emit_odr_comdat_start
     emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
@@ -833,16 +833,16 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     clear_last_expr(s)  # Reset before processing function body (ritz-task-1309)
     own_begin_fn(s, f.params)   # AGAST #2158: by-value move-only params
     ref_begin_fn(s, f)          # AGAST #2336
-    var has_explicit_return: i32 = 0
+    var has_explicit_return: bool = false
     var stmt: *Stmt = f.body
     while stmt != null
         # AGAST #2279: a `c:& C` tail in a `-> C` fn returns the referent.
         if stmt.next == null and emit_array_return_if_stmt(s, stmt, ret_array_of(f)) == 1
-            has_explicit_return = 1   # AGAST #2305: a tail `if` / `else` of arrays
+            has_explicit_return = true   # AGAST #2305: a tail `if` / `else` of arrays
             stmt = stmt.next
             continue
         if stmt.next == null and stmt.kind == STMT_EXPR and emit_lent_return(s, stmt.expr, f.return_type) == 1
-            has_explicit_return = 1
+            has_explicit_return = true
             stmt = stmt.next
             continue
         # Check if this is the last statement and it's an expression (implicit return).
@@ -850,11 +850,11 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         # expression statement: its value is a temporary, dropped (§13.6)
         # before the defers run, and emit_implicit_return_tail emits `ret void`.
         if stmt.next == null and stmt.kind == STMT_EXPR and f.return_type != TYPE_VOID
-            has_explicit_return = 1
+            has_explicit_return = true
             struct_return_as_int_refused(s, stmt.expr, f.return_type)   # AGAST #3008
             own_tail_moves(s, stmt.expr)   # AGAST #2158: the tail is moved out
             if emit_array_return(s, stmt.expr, ret_array_of(f)) == 1
-                has_explicit_return = 1   # AGAST #2302: a `-> [N]T` tail is returned whole
+                has_explicit_return = true   # AGAST #2302: a `-> [N]T` tail is returned whole
             # Special handling for struct literal returns
             else if stmt.expr.kind == EXPR_STRUCT_LIT and f.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
@@ -977,9 +977,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             # AGAST #2823: only the LAST statement decides.  A `return` followed
             # by dead code (an `if` that returns, say) leaves the final block
             # open, and it needs the implicit tail's terminator.
-            has_explicit_return = 0
+            has_explicit_return = false
             if stmt.kind == STMT_RETURN
-                has_explicit_return = 1
+                has_explicit_return = true
             if stmt.next == null and stmt.kind == STMT_MATCH
                 set_match_agg_hint(s, f.return_type)   # AGAST #3205: the tail match
                 # LARB R43 (#3385): and in an `-> f64` fn it is a float slot.
@@ -1057,11 +1057,11 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # instantiation (`Vec$u8_push`: '$' in the type name) is a monomorph.
     # Only the module declaring the impl defines a method (is_local, above),
     # so a non-generic method needs no cross-module dedup (AGAST #3386).
-    var im_is_monomorph: i32 = 0
+    var im_is_monomorph: bool = false
     var im_i: i32 = 0
     while im_i < ib.type_name_len
         if *(ib.type_name + im_i) == '$'   # '$'
-            im_is_monomorph = 1
+            im_is_monomorph = true
             im_i = ib.type_name_len
         else
             im_i = im_i + 1
@@ -1071,9 +1071,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     var im_pub: i32 = method.is_pub
     if ib.trait_name != null
         im_pub = 1
-    if fn_is_odr(0, im_is_monomorph, im_pub, 0) == 1
+    if fn_is_odr(false, im_is_monomorph, im_pub, 0)
         emit_odr_comdat_start(s, StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (method.name), len: (method.name_len) as i64 })
-    emit_str(s, fn_linkage(0, im_is_monomorph, im_pub, 0))
+    emit_str(s, fn_linkage(false, im_is_monomorph, im_pub, 0))
     # For struct-returning impl methods (where `method.return_type_name`
     # is set), emit `%Type` so call sites that walk the impl table can
     # match the signature.  Other return types route through
@@ -1092,19 +1092,19 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     emit_str(s, c"(")
 
     var param: *Param = method.params
-    var first: i32 = 1
+    var first: bool = true
     if s.ret_sret == 1
         emit_sret_attr(s, StrView { ptr: (method.return_type_name), len: (method.return_type_name_len) as i64 })
         emit_str(s, c"%ret.sret")
-        first = 0
+        first = false
     if fn_sret_array(s, method) != null
         emit_sret_array_attr(s, fn_sret_array(s, method))   # AGAST #3181
         emit_str(s, c"%ret.sret")
-        first = 0
+        first = false
     while param != null
-        if first == 0
+        if not first
             emit_str(s, IR_COMMA)
-        first = 0
+        first = false
         # A lent `self` (task-99 cluster #1): callers pass the receiver as
         # `ptr <reg>`.  A by-value one is a by-value param (AGAST #2393).
         if param_self_is_ptr(param) == 1
@@ -1123,7 +1123,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # emit_fn_attrs.
     emit_fn_attrs(s)
     let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
-    if fn_is_odr(0, im_is_monomorph, im_pub, 0) == 1
+    if fn_is_odr(false, im_is_monomorph, im_pub, 0)
         emit_str(s, c" comdat")   # AGAST #201: see emit_odr_comdat_start
     emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
@@ -1219,24 +1219,24 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     own_begin_fn(s, method.params)   # AGAST #2158
     ref_begin_fn(s, method)          # AGAST #2336
-    var has_explicit_return: i32 = 0
+    var has_explicit_return: bool = false
     var stmt: *Stmt = method.body
     while stmt != null
         if stmt.next == null and emit_array_return_if_stmt(s, stmt, ret_array_of(method)) == 1
-            has_explicit_return = 1   # AGAST #2305: a tail `if` / `else` of arrays
+            has_explicit_return = true   # AGAST #2305: a tail `if` / `else` of arrays
             stmt = stmt.next
             continue
         if stmt.next == null and stmt.kind == STMT_EXPR and emit_lent_return(s, stmt.expr, method.return_type) == 1
-            has_explicit_return = 1   # AGAST #2279, as in emit_fn
+            has_explicit_return = true   # AGAST #2279, as in emit_fn
             stmt = stmt.next
             continue
         # Check if this is the last statement and it's an expression (implicit return)
         if stmt.next == null and stmt.kind == STMT_EXPR and method.return_type != TYPE_VOID
-            has_explicit_return = 1   # AGAST #4072: a procedure's tail is a statement
+            has_explicit_return = true   # AGAST #4072: a procedure's tail is a statement
             struct_return_as_int_refused(s, stmt.expr, method.return_type)   # AGAST #3008
             own_tail_moves(s, stmt.expr)   # AGAST #2158
             if emit_array_return(s, stmt.expr, ret_array_of(method)) == 1
-                has_explicit_return = 1   # AGAST #2302: a `-> [N]T` tail is returned whole
+                has_explicit_return = true   # AGAST #2302: a `-> [N]T` tail is returned whole
             # Special handling for struct literal returns
             else if stmt.expr.kind == EXPR_STRUCT_LIT and method.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
@@ -1356,9 +1356,9 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             # AGAST #2823: only the LAST statement decides.  A `return` followed
             # by dead code (an `if` that returns, say) leaves the final block
             # open, and it needs the implicit tail's terminator.
-            has_explicit_return = 0
+            has_explicit_return = false
             if stmt.kind == STMT_RETURN
-                has_explicit_return = 1
+                has_explicit_return = true
             if stmt.next == null and stmt.kind == STMT_MATCH
                 set_match_agg_hint(s, method.return_type)   # AGAST #3205: the tail match
                 # LARB R43 (#3385): and in an `-> f64` fn it is a float slot.
@@ -1616,22 +1616,22 @@ fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name_sv: StrView, i
     emit_str(s, c" @")
     emit_name(s, StrView { ptr: (name), len: (name_len) as i64 })
     emit_str(s, c"(")
-    var first: i32 = 1
+    var first: bool = true
     if sret == 1
         emit_str(s, c"ptr sret(%")
         emit_name(s, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
         emit_str(s, c")")
-        first = 0
+        first = false
     if fn_sret_array(s, f) != null
         emit_str(s, c"ptr sret(")   # AGAST #3181
         emit_array_value_llvm_type(s, fn_sret_array(s, f))
         emit_str(s, c")")
-        first = 0
+        first = false
     var p: *Param = f.params
     while p != null
-        if first == 0
+        if not first
             emit_str(s, IR_COMMA)
-        first = 0
+        first = false
         if is_method == 1 and param_self_is_ptr(p) == 1
             emit_str(s, c"ptr")
         else
@@ -1756,12 +1756,12 @@ fn emit_one_struct_type(s: *EmitterState, st: *StructDef)
         emit_str(s, c" = type <{")
     else
         emit_str(s, c" = type {")
-    var first: i32 = 1
+    var first: bool = true
     var field: *StructField = st.fields
     while field != null
-        if first == 0
+        if not first
             emit_str(s, IR_COMMA)
-        first = 0
+        first = false
         emit_field_llvm_type(s, field)
         field = field.next
     if packed == 1
@@ -2920,11 +2920,11 @@ fn emit_const_struct_body(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *
         given = given.next
     emit_str(s, c"{ ")
     var field: *StructField = st.fields
-    var first: i32 = 1
+    var first: bool = true
     while field != null
-        if first == 0
+        if not first
             emit_str(s, IR_COMMA)
-        first = 0
+        first = false
         let fi: *FieldInit = find_field_init(fields, StrView { ptr: (field.name), len: (field.name_len) as i64 })
         if fi == null or fi.value == null
             # LARB R60: every field needs a value (`global 'g' has no value

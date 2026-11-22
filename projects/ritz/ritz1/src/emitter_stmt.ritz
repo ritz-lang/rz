@@ -2972,26 +2972,26 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         # while TYPE_PTR/TYPE_REF still load as i64. Without this guard,
         # `*out = v` for `out: @&i64` emits `inttoptr i64 %p to ptr` where
         # %p is already `ptr` — LLVM rejects (AGAST #173).
-        var addr_is_ptr: i32 = 0
+        var addr_is_ptr: bool = false
         if target_expr.kind == EXPR_IDENT
             let opd_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.ident_ptr), len: (target_expr.ident_len) as i64 })
             if opd_loc != null and opd_loc.var_type == TYPE_MUT_REF
-                addr_is_ptr = 1
+                addr_is_ptr = true
             addr = emit_expr(s, target_expr)
         else if target_expr.kind == EXPR_UNARY and target_expr.op == OP_DEREF
             if target_expr.operand.kind == EXPR_IDENT
                 let opd_loc2: *LocalVar = find_local_struct_name(s, StrView { ptr: (target_expr.operand.ident_ptr), len: (target_expr.operand.ident_len) as i64 })
                 if opd_loc2 != null and opd_loc2.var_type == TYPE_MUT_REF
-                    addr_is_ptr = 1
+                    addr_is_ptr = true
             # `*@&x = v`: `@&` is a `ptr` where `@` is an i64 (AGAST #2338).
             if target_expr.operand.kind == EXPR_UNARY and target_expr.operand.op == OP_ADDR_MUT
-                addr_is_ptr = 1
+                addr_is_ptr = true
             addr = emit_expr(s, target_expr.operand)
         else
             addr = emit_expr(s, target_expr)
         # Convert i64 address to ptr (skip when source is already ptr)
         var ptr: i32 = 0
-        if addr_is_ptr == 1
+        if addr_is_ptr
             ptr = addr
         else
             ptr = next_reg(s)
@@ -5474,16 +5474,16 @@ pub fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *S
 # element is dropped when a binding owns it (own_drop_old_elem, AGAST #3377).
 fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructField, idx: i32, val: i32, val_expr: *Expr, place: *Expr)
     let et: i32 = field.array_elem_type
-    var is_struct: i32 = 0
+    var is_struct: bool = false
     if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
-        is_struct = 1
+        is_struct = true
     let elem_ptr: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, elem_ptr)
     emit_str(s, IR_GEP_ARRAY)
     emit_int(s, field.array_size as i64)
     emit_str(s, IR_X)
-    if is_struct == 1
+    if is_struct
         # AGAST #188: struct-array LHS — `[N x %T]` so the GEP and the store
         # agree with the struct value being stored.
         emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })
@@ -5496,7 +5496,7 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
     emit_str(s, IR_NL)
     var sty: *u8 = c"i64"
     var sval: i32 = val
-    if is_struct == 1
+    if is_struct
         own_drop_old_elem(s, place, elem_ptr, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })
         # AGAST #188: `store %T %val` matches the `load %T` of the RHS.
         # AGAST #4461: an sret-sized struct copied from a held load becomes a
@@ -6496,7 +6496,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # stmt.var_name = variable name
         # stmt.assign_target = field name
         # stmt.assign_value = value expression
-        var lfa_done: i32 = 0
+        var lfa_done: bool = false
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
         if loc != null
             let st: *StructDef = find_struct(s, StrView { ptr: (loc.type_name), len: (loc.type_name_len) as i64 })
@@ -6504,7 +6504,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 let field_idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
                 if field_idx >= 0
                     let field: *StructField = get_field_type(st, field_idx)
-                    lfa_done = 1
+                    lfa_done = true
                     # Get the base pointer - differs for TYPE_PTR/TYPE_REF/TYPE_MUT_REF vs TYPE_STRUCT
                     var base_ptr_reg: i32 = loc.reg
                     let lfa_levels: i32 = local_struct_levels(loc)
@@ -6559,7 +6559,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     #
                     # AGAST #2048: f32 / f64 fields store float / double.
                     if emit_float_field_store(s, field_ptr, field.field_type, val_reg, stmt.assign_value) == 1
-                        lfa_done = 1
+                        lfa_done = true
                     else if ty_int_bits(field.field_type) == 32
                         let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, val_reg)
                         emit_store_typed(s, IR_TY_I32, trunc, field_ptr)
@@ -6587,7 +6587,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     else
                         emit_store_typed(s, IR_TY_I64, val_reg, field_ptr)
         # AGAST #1439: unresolved here -> shared member-store path.
-        if lfa_done == 0
+        if not lfa_done
             emit_local_field_store_fallback(s, stmt, 0)
     else if stmt.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN and local_field_nd_shape(s, stmt) != null
         # AGAST #2097: `s.m[i] = v` with m an N-D field assigns a whole row
