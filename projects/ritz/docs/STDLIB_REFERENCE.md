@@ -1447,7 +1447,7 @@ struct Stat
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `sys_stat` | `fn(path: *u8, statbuf: *u8) -> i32` | Get file status |
-| `sys_stat2` | `fn(path: *u8, statbuf: *Stat) -> i32` | Typed stat |
+| `sys_stat2` | `fn(path: *u8, statbuf: @&Stat) -> i32` | Typed stat |
 | `sys_fstat` | `fn(fd: i32, statbuf: *u8) -> i32` | fstat |
 | `sys_lstat` | `fn(path: *u8, statbuf: *u8) -> i32` | lstat (no follow) |
 | `sys_chmod` | `fn(path: *u8, mode: i32) -> i32` | Change mode |
@@ -2031,7 +2031,7 @@ struct EpollEvent
 | `epoll_add` | `fn(epfd: i32, fd: i32, events: u32) -> Result<(), Errno>` | Watch fd; `Err(Exist)` if already watched |
 | `epoll_del` | `fn(epfd: i32, fd: i32) -> Result<(), Errno>` | Stop watching fd; `Err(NoEnt)` if not watched |
 | `epoll_mod` | `fn(epfd: i32, fd: i32, events: u32) -> Result<(), Errno>` | Change events; `Err(NoEnt)` if not watched |
-| `epoll_wait_events` | `fn(epfd: i32, events: *EpollEvent, maxevents: i32, timeout_ms: i32) -> Result<i32, Errno>` | Wait: `Ok(ready fds)`, `Ok(0)` on timeout, `Err(errno)` e.g. `Intr` |
+| `epoll_wait_events` | `fn(epfd: i32, events: @&EpollEvent, maxevents: i32, timeout_ms: i32) -> Result<i32, Errno>` | Wait: `Ok(ready fds)`, `Ok(0)` on timeout, `Err(errno)` e.g. `Intr` |
 
 ---
 
@@ -2310,7 +2310,7 @@ struct IoUring
 | `uring_submit_and_wait` | `fn(ring: *IoUring, min_complete: i32) -> i32` | Submit and wait |
 | `uring_peek_cqe` | `fn(ring: *IoUring) -> Option<*IoUringCqe>` | Peek CQE (None when none is ready) |
 | `uring_wait_cqe` | `fn(ring: *IoUring) -> Option<*IoUringCqe>` | Wait for CQE |
-| `uring_cqe_seen` | `fn(ring: *IoUring, cqe: *IoUringCqe)` | Mark CQE consumed |
+| `uring_cqe_seen` | `fn(ring: *IoUring, cqe: @IoUringCqe)` | Mark CQE consumed |
 
 **SQE Preparation**:
 

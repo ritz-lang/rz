@@ -119,7 +119,7 @@ SIGNATURES = [
     "pub fn epoll_add(epfd: i32, fd: i32, events: u32) -> Result<(), Errno>",
     "pub fn epoll_del(epfd: i32, fd: i32) -> Result<(), Errno>",
     "pub fn epoll_mod(epfd: i32, fd: i32, events: u32) -> Result<(), Errno>",
-    "pub fn epoll_wait_events(epfd: i32, events: *EpollEvent, maxevents: i32, timeout_ms: i32) -> Result<i32, Errno>",
+    "pub fn epoll_wait_events(epfd: i32, events: @&EpollEvent, maxevents: i32, timeout_ms: i32) -> Result<i32, Errno>",
 ]
 
 
