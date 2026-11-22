@@ -495,9 +495,9 @@ def test_briefing_bans_machine_wide_kills_and_direct_ci_local():
 
 
 @pytest.mark.unit
-def test_briefing_teardown_proves_land_by_patch_identity_not_ancestry():
-    """AGAST #4470: after a rebase the gated SHA is an expected non-ancestor,
-    so ancestry of it proves nothing; patch identity is the proof."""
+def test_briefing_teardown_proves_land_by_the_commits_own_changes():
+    """AGAST #4549: a rebase changes the SHA and can flip `git cherry` to `+`,
+    so the land is proven by the commit's own changed lines and file set."""
     text = SKILL.read_text()
     # The **Remote room:** paragraph has no blank line before item 6, so the
     # _briefing_paragraph() helper would run into the next step and let these
@@ -505,10 +505,17 @@ def test_briefing_teardown_proves_land_by_patch_identity_not_ancestry():
     at = text.index("**Remote room:**")
     end = text.index("6. **Gate fails", at)
     flat = " ".join(text[at:end].split())
-    # After a rebase the gated SHA is expected to be a non-ancestor.
-    assert "non-ancestor" in flat
-    # Ancestry is checked on the landed main SHA, not on the gated SHA.
-    assert "landed" in flat
-    assert "do not check ancestry" in flat
-    # The proof is patch identity: the `-` line, or a subject match for `+`.
-    assert "patch identity" in flat
+    # The SHA is expected to differ after the rebase; say so.
+    assert "legitimately" in flat and "differs" in flat
+    # The proof is the commit's own changes, byte-identical, at zero context.
+    assert "unified=0" in flat
+    assert "byte-identical" in flat
+    assert "range-diff" in flat
+    # Context makes hunk line numbers move and yields a false DIFFERS.
+    assert "false DIFFERS" in flat
+    # Subject/sibling matching is corroboration, never the proof.
+    assert "corroboration only" in flat and "never the proof" in flat
+    # The retired patch-identity claim must not creep back.
+    assert "patch identity" not in flat
+    # The room rm guard is the actual safety gate.
+    assert "room rm" in flat

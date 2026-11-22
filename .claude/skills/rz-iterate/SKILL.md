@@ -1143,16 +1143,23 @@ one to train 1.
    context, so the first stacked train whose cars touch adjacent lines gets a
    false `is not the patch ... introduced` refusal (AGAST #4394). If it has
    already been deleted, re-push the room's sha to the branch, run plain
-   `room rm`, then delete it again. Spell out in the message that the commit
-   was cherry-picked,
-   so `git cherry origin/main ritz-task-<id>` prints `- <sha>` (same patch),
-   not nothing; a `+` line is fine only if `<main sha12>`'s subject matches
-   the branch tip's. Proof of the land is patch identity, not ancestry: after
-   a rebase the gated SHA is *expected* to be a non-ancestor, so
-   `merge-base --is-ancestor` of it exits 1 even though the work is on `main`.
-   Check ancestry only on the *landed* `main` SHA, and do not check ancestry
-   of the gated SHA (AGAST #4470). The slot is free once the host answers
-   `TORNDOWN`.
+   `room rm`, then delete it again. Spell out in the message that the gated
+   commit was rebased and landed as `<main sha12>`, so **its SHA legitimately
+   differs from the landed one**; never claim the SHA is the same, and never
+   require `git cherry origin/main ritz-task-<id>` to print `- <sha>` — after
+   a rebase it prints `+` for a car whose context moved, and
+   `merge-base --is-ancestor <gated> main` exits 1 even though the work is on
+   `main`. Prove the land by the commit's own changes: strip the
+   `+++`/`---`/`@@` headers from `git show <gated> --format= --unified=0`
+   and from the same for the landed `main` SHA — the remaining `[+-]` lines
+   and the touched file set (`--name-only`) must be byte-identical (AGAST
+   #4549). `git range-diff <gated-parent>..<gated> <landed-parent>..<landed>`
+   is the equivalent check. The `--unified=0` is load-bearing: with context,
+   moved hunk line numbers differ and the check reports a false DIFFERS. A
+   `git cherry` `+` line with a matching subject, or a sibling commit
+   carrying the same subject, is corroboration only, never the proof; the
+   host's `room rm` guard (which needs the branch intact) is the actual
+   safety gate. The slot is free once the host answers `TORNDOWN`.
 6. **Gate fails: reason first, then bisect.** Read the failing lines
    (`train.sh wait` / `run-gate.sh --wait` prints them; a remote gate's
    whole log is the fetched `...@<host>.log`) against each car's diff
