@@ -980,15 +980,19 @@ class Target:
     and `__stack_chk_fail`.
     `no_red_zone` passes the compiler's --no-red-zone (AGAST #4308): the IR
     gets `noredzone`. The `-mno-red-zone` in `clang_flags` is a frontend
-    flag that does nothing for .ll input, and the compiler is never given
-    the [[bin]]'s triple, so without this harland's functions used the red
-    zone.
+    flag that does nothing for .ll input, so without this harland's functions
+    used the red zone.  A freestanding module's `triple` also goes to the
+    compiler as --target (AGAST #3488): it has to know a kernel from a hosted
+    program to choose a trap's stop (ritz_platform_fatal, not exit).
     """
     freestanding: bool = False
     clang_flags: Tuple[str, ...] = ()
     target_os: str = ""
     stack_protector: bool = False
     no_red_zone: bool = False
+    # ritz0's --target, so the compiler knows the triple (AGAST #3488): the
+    # kernel's traps must reach ritz_platform_fatal, not an exit syscall.
+    triple: str = ""
 
     @property
     def obj_flags(self) -> List[str]:
@@ -1013,6 +1017,8 @@ class Target:
             flags["stack_protector"] = True
         if self.no_red_zone:
             flags["no_red_zone"] = True
+        if self.triple:
+            flags["target"] = self.triple
         return flags
 
     def compiler_args(self) -> List[str]:
@@ -1191,6 +1197,12 @@ def module_compile_cmd(compiler: str, src: Path, ll_path: Path, target: Target, 
             return None
     else:
         cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
+        # The triple, when the build has one (AGAST #3488): the emitter reads
+        # it to know a kernel's traps stop through ritz_platform_fatal.
+        # ritz1's own compiler_args carry no --target; it ignores unknown
+        # options and its traps are #3489.
+        if target.triple:
+            cmd.extend(["--target", target.triple])
         # Pass dependencies if any (RFC #109 Phase 2)
         if dependencies:
             cmd.extend(["--deps", _deps_json(dependencies)])
@@ -1666,7 +1678,8 @@ def freestanding_target(bin_config: BinaryConfig) -> Target:
     return Target(freestanding=True, clang_flags=tuple(clang_flags),
                   target_os=bin_config.target_os or "",
                   stack_protector=bool(bin_config.stack_protector),
-                  no_red_zone=bool(bin_config.no_red_zone))
+                  no_red_zone=bool(bin_config.no_red_zone),
+                  triple=target)
 
 
 _INCBIN = re.compile(r'\.incbin\s+"([^"]+)"')

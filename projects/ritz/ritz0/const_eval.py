@@ -69,14 +69,23 @@ class ConstEvaluator:
         return False
 
     def _wrap_if_requested(self, expr: rast.BinOp, value: int) -> int:
-        """Wrap a `+%`/`-%`/`*%` result at its inferred type (LARB R63, #4050).
+        """`+%`/`-%`/`*%` wrap at the inferred type; a plain operator's
+        overflow is a compile error (LARB R63, #3488).
 
         The width is the one the operator runs at: i64 by default, u64 when
-        `_is_u64(expr)` is true. A plain `+`, `-` or `*` keeps its exact value
-        and never comes through here, so its overflow still refuses to fold
-        (`_fold_i64`) rather than wrapping silently.
+        `_is_u64(expr)` is true.  `+%`/`-%`/`*%` wrap the value there.  A
+        plain `+`, `-` or `*` has no defined result outside it, so "overflow
+        in a constant expression is a compile error" rather than a fold to a
+        value no run could produce.
         """
+        if self._is_u64(expr):
+            lo, hi = 0, (1 << 64) - 1
+        else:
+            lo, hi = -(1 << 63), (1 << 63) - 1
         if not expr.wrapping:
+            if not lo <= value <= hi:
+                raise ConstEvalError(
+                    f"integer overflow in `{expr.op}` in constant expression")
             return value
         if self._is_u64(expr):
             return value & ((1 << 64) - 1)
@@ -146,20 +155,34 @@ class ConstEvaluator:
             elif op == '/':
                 if right == 0:
                     raise ConstEvalError("Division by zero in constant expression")
+                # LARB R63: the signed minimum by -1 overflows its type.
+                if (not self._is_u64(expr)
+                        and left == -(1 << 63) and right == -1):
+                    raise ConstEvalError(
+                        "integer overflow in `/` in constant expression")
                 quotient = abs(left) // abs(right)
                 return quotient if (left < 0) == (right < 0) else -quotient
             elif op == '%':
                 if right == 0:
                     raise ConstEvalError("Modulo by zero in constant expression")
+                if (not self._is_u64(expr)
+                        and left == -(1 << 63) and right == -1):
+                    raise ConstEvalError(
+                        "integer overflow in `%` in constant expression")
                 remainder = abs(left) % abs(right)
                 return -remainder if left < 0 else remainder
             elif op == '<<':
-                if right < 0:
-                    raise ConstEvalError("Negative shift amount in constant expression")
+                # A count outside 0..63 stops the program (LARB R63, §7.4);
+                # in a constant expression that is this error.  Bits shifted
+                # out are fine: `<<` does not trap for them.
+                if not 0 <= right < 64:
+                    raise ConstEvalError(
+                        "shift count out of range in constant expression")
                 return left << right
             elif op == '>>':
-                if right < 0:
-                    raise ConstEvalError("Negative shift amount in constant expression")
+                if not 0 <= right < 64:
+                    raise ConstEvalError(
+                        "shift count out of range in constant expression")
                 # A folded u64 is kept in its signed form (#2356).
                 if self._is_u64(expr.left):
                     left &= (1 << 64) - 1

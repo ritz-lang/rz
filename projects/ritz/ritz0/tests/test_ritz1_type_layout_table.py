@@ -387,7 +387,7 @@ pub fn main() -> i32
     if sizeof(usize) != 8 or sizeof(isize) != 8
         return 1
     let u: usize = 0
-    let v: usize = u - 1
+    let v: usize = u -% 1
     if v < u
         return 2
     a.x

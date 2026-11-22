@@ -417,6 +417,10 @@ class ExprEmitter:
                 return self.builder.gep(right, [left])
             if is_float:
                 return self.builder.fadd(left, right)
+            if isinstance(left.type, ir.IntType):
+                if expr.wrapping:            # `+%` asked to wrap (LARB R63)
+                    return self.builder.add(left, right)
+                return self._emit_checked_int_arith(expr, left, right, wider_slot)
             return self.builder.add(left, right)
         elif op == '-':
             # Handle pointer arithmetic: ptr - int -> GEP with negated offset
@@ -430,28 +434,34 @@ class ExprEmitter:
                 return self._pointer_difference(left, right, expr)
             if is_float:
                 return self.builder.fsub(left, right)
+            if isinstance(left.type, ir.IntType):
+                if expr.wrapping:            # `-%` asked to wrap (LARB R63)
+                    return self.builder.sub(left, right)
+                return self._emit_checked_int_arith(expr, left, right, wider_slot)
             return self.builder.sub(left, right)
         elif op == '*':
             if is_float:
                 return self.builder.fmul(left, right)
+            if isinstance(left.type, ir.IntType):
+                if expr.wrapping:            # `*%` asked to wrap (LARB R63)
+                    return self.builder.mul(left, right)
+                return self._emit_checked_int_arith(expr, left, right, wider_slot)
             return self.builder.mul(left, right)
         elif op == '/':
             if is_float:
                 return self.builder.fdiv(left, right)
-            # Use unsigned division for unsigned types
-            if (wider_slot[1] if wider_slot is not None
-                    else self._operands_unsigned(expr, left)):
-                return self.builder.udiv(left, right)
-            return self.builder.sdiv(left, right)
+            unsigned = self._arith_unsigned(expr, left, wider_slot)
+            if isinstance(left.type, ir.IntType):
+                self._guard_division(expr, left, right, unsigned, "/")
+            return self.builder.udiv(left, right) if unsigned else self.builder.sdiv(left, right)
         elif op == '%':
             if is_float:
                 # Not `frem`: it lowers to a libm fmod call (AGAST #3817).
                 return self.builder.call(self._fmod_helper(left.type), [left, right])
-            # Use unsigned remainder for unsigned types
-            if (wider_slot[1] if wider_slot is not None
-                    else self._operands_unsigned(expr, left)):
-                return self.builder.urem(left, right)
-            return self.builder.srem(left, right)
+            unsigned = self._arith_unsigned(expr, left, wider_slot)
+            if isinstance(left.type, ir.IntType):
+                self._guard_division(expr, left, right, unsigned, "%")
+            return self.builder.urem(left, right) if unsigned else self.builder.srem(left, right)
         elif op == '==':
             if is_float:
                 return self.builder.fcmp_ordered('==', left, right)
@@ -505,13 +515,165 @@ class ExprEmitter:
             # Bitwise XOR: left ^ right
             return self.builder.xor(left, right)
         elif op == '<<':
-            # Left shift: left << right
+            # Left shift: left << right.  Bits shifted out don't trap; the
+            # count outside 0..width-1 does (LARB R63, §7.4).
+            if isinstance(left.type, ir.IntType):
+                self._guard_shift_count(expr, left, right)
             return self.builder.shl(left, right)
         elif op == '>>':
             # Logical on an unsigned left operand, arithmetic on a signed
-            # one; the count has no say (#2356).
+            # one; the count has no say (#2356).  The count still traps when
+            # it is outside 0..width-1 (LARB R63, §7.4).
+            if isinstance(left.type, ir.IntType):
+                self._guard_shift_count(expr, left, right)
             if self._int_shape(expr.left, left.type.width < 64)[1]:
                 return self.builder.lshr(left, right)
             return self.builder.ashr(left, right)
         else:
             raise InternalError(f"Unknown operator: {op}")
+
+    # --- integer overflow traps (LARB R63, AGAST #3488) ---------------------
+    #
+    # `+`, `-` and `*` stop the program on overflow at their type; the `%`
+    # forms wrap and never reach here.  So do signed `/` and `%` of the
+    # minimum by -1, division by zero, and a shift count outside 0..width-1.
+    # Each check branches to a cold block that writes a located message to
+    # stderr and exits 1 (freestanding: calls ritz_platform_fatal); the value
+    # path continues in a fresh block.
+
+    _OVERFLOW_INTRINSICS = {
+        '+': ('llvm.sadd.with.overflow', 'llvm.uadd.with.overflow'),
+        '-': ('llvm.ssub.with.overflow', 'llvm.usub.with.overflow'),
+        '*': ('llvm.smul.with.overflow', 'llvm.umul.with.overflow'),
+    }
+
+    def _arith_unsigned(self, expr, left, wider_slot) -> bool:
+        """Is this operation unsigned?  The wider slot's type decides one
+        that runs there (#3225); otherwise the operands' type does, as for
+        `/` and `%` (#2361)."""
+        if wider_slot is not None:
+            return wider_slot[1]
+        return self._operands_unsigned(expr, left)
+
+    def _emit_checked_int_arith(self, expr, left, right, wider_slot) -> ir.Value:
+        """`left op right` at `left`'s type, stopping on overflow.
+
+        The operands are already unified and widened.  `llvm.*.with.overflow`
+        yields the wrapped result and the flag; on the flag we trap.  Two
+        constant operands would make that trap unconditional, so an overflow
+        they expose is a compile error instead (LARB R63: "overflow in a
+        constant expression is a compile error").
+        """
+        ty = left.type
+        unsigned = self._arith_unsigned(expr, left, wider_slot)
+        if isinstance(left, ir.Constant) and isinstance(right, ir.Constant):
+            self._check_constant_arith(expr, left, right, unsigned)
+        name = self._OVERFLOW_INTRINSICS[expr.op][1 if unsigned else 0]
+        pair_ty = ir.LiteralStructType([ty, ir.IntType(1)])
+        fn = self.module.declare_intrinsic(
+            name, [ty], fnty=ir.FunctionType(pair_ty, [ty, ty]))
+        pair = self.builder.call(fn, [left, right])
+        result = self.builder.extract_value(pair, 0)
+        self._guard(expr, self.builder.extract_value(pair, 1),
+                    f"integer overflow in `{expr.op}`")
+        return result
+
+    def _check_constant_arith(self, expr, left, right, unsigned) -> None:
+        """Refuse a constant `+`, `-` or `*` whose value leaves its type."""
+        width = left.type.width
+        mask = (1 << width) - 1
+        if unsigned:
+            lv, rv = left.constant & mask, right.constant & mask
+            lo, hi = 0, mask
+        else:
+            lv, rv = left.constant, right.constant
+            lo, hi = -(1 << (width - 1)), (1 << (width - 1)) - 1
+        value = {'+': lv + rv, '-': lv - rv, '*': lv * rv}[expr.op]
+        if not lo <= value <= hi:
+            raise self._err(f"integer overflow in `{expr.op}`", expr.span)
+
+    def _guard_division(self, expr, left, right, unsigned, op) -> None:
+        """Stop on division by zero, and on signed MIN / -1."""
+        ty = left.type
+        width = ty.width
+        if isinstance(left, ir.Constant) and isinstance(right, ir.Constant):
+            mask = (1 << width) - 1
+            rv = right.constant & mask if unsigned else right.constant
+            if rv == 0:
+                raise self._err(f"division by zero in `{op}`", expr.span)
+            if not unsigned and left.constant == -(1 << (width - 1)):
+                raise self._err(f"integer overflow in `{op}`", expr.span)
+        zero = ir.Constant(ty, 0)
+        self._guard(expr, self.builder.icmp_unsigned('==', right, zero),
+                    f"division by zero in `{op}`")
+        if not unsigned:
+            minimum = ir.Constant(ty, -(1 << (width - 1)))
+            minus_one = ir.Constant(ty, -1)
+            both = self.builder.and_(
+                self.builder.icmp_signed('==', left, minimum),
+                self.builder.icmp_signed('==', right, minus_one))
+            self._guard(expr, both, f"integer overflow in `{op}`")
+
+    def _guard_shift_count(self, expr, left, right) -> None:
+        """Stop unless the count is in 0..width-1.
+
+        An unsigned compare catches a negative count too: as unsigned it is
+        far above the width.
+        """
+        width = left.type.width
+        if isinstance(right, ir.Constant):
+            count = right.constant & ((1 << right.type.width) - 1)
+            if count >= width:
+                raise self._err(
+                    f"shift count out of range in `{expr.op}`", expr.span)
+        limit = ir.Constant(right.type, width)
+        self._guard(
+            expr, self.builder.icmp_unsigned('>=', right, limit),
+            f"shift count out of range in `{expr.op}`")
+
+    def _guard(self, expr, condition: ir.Value, message: str) -> None:
+        """Branch to a trap block on `condition`; leave the builder in the
+        block where the operation's value is live."""
+        ok = self.current_fn.append_basic_block("arith.ok")
+        bad = self.current_fn.append_basic_block("arith.trap")
+        self.builder.cbranch(condition, bad, ok)
+        self.builder.position_at_end(bad)
+        self._emit_trap(expr, message)
+        self.builder.position_at_end(ok)
+
+    def _emit_trap(self, expr, message: str) -> None:
+        """Write `<file>:<line>:<col>: <message>` to stderr and exit 1.
+
+        A freestanding target has no exit syscall: it stops through
+        `ritz_platform_fatal(msg, len, 1)` instead (AGAST #4119)."""
+        span = getattr(expr, "span", None)
+        if span is not None:
+            where = f"{self._assert_basename(span.file)}:{span.line}:{span.column}: "
+        else:
+            where = ""
+        text = f"{where}{message}\n"
+        buf = self._get_string_constant(text)
+        zero = ir.Constant(self.i64, 0)
+        ptr = self.builder.gep(buf, [zero, zero])
+        length = ir.Constant(self.i64, len(text.encode("utf-8")))
+        if getattr(self, "is_freestanding", False):
+            # A kernel's stop is its own: ritz_platform_fatal (the hook the
+            # core already declares, AGAST #4119), never an exit syscall, or
+            # freestanding IR would hold one.
+            fn = self.module.globals.get("ritz_platform_fatal")
+            if fn is None:
+                fn = ir.Function(
+                    self.module,
+                    ir.FunctionType(self.void, [self.i8_ptr, self.i64, self.i32]),
+                    name="ritz_platform_fatal")
+            self.builder.call(fn, [ptr, length, ir.Constant(self.i32, 1)])
+            self.builder.unreachable()
+            return
+        self._emit_write_syscall(ir.Constant(self.i64, 2), ptr, length)
+        asm_ty = ir.FunctionType(self.i64, [self.i64, self.i64])
+        asm_ir = ir.InlineAsm(asm_ty, "syscall",
+                              "={rax},{rax},{rdi},~{rcx},~{r11},~{memory}",
+                              side_effect=True)
+        self.builder.call(asm_ir, [ir.Constant(self.i64, 60),
+                                   ir.Constant(self.i64, 1)])
+        self.builder.unreachable()

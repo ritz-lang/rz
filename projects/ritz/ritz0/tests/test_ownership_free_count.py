@@ -84,7 +84,7 @@ struct Tracked
 impl Drop for Tracked
     fn drop(self: @&Tracked)
         DROPS = DROPS + 1
-        ORDER = ORDER * 10 + self.id
+        ORDER = ORDER *% 10 +% self.id  # wraps by request (R63)
 
 # Move-only without a Drop impl of its own: it has a Tracked field.
 struct Holder
@@ -653,7 +653,7 @@ fn f() -> i32
 
 pub fn main() -> i32
     f()
-    return DROPS * 100 + ORDER
+    return DROPS *% 100 +% ORDER
 """, 212, {}),
 
     # A copy-typed struct literal gets its element type too, and copies.
@@ -1202,11 +1202,11 @@ fn f() -> i32
                 break
             _ =>
                 pass
-    return DROPS * 100 + ORDER
+    return DROPS *% 100 +% ORDER
 
 pub fn main() -> i32
     f()
-    return DROPS * 100 + ORDER
+    return DROPS *% 100 +% ORDER
 """, 221, {}),
 
     # The same shape through `continue` (AGAST #4387).
@@ -1223,11 +1223,11 @@ fn f() -> i32
                 continue
             _ =>
                 pass
-    return DROPS * 100 + ORDER
+    return DROPS *% 100 +% ORDER
 
 pub fn main() -> i32
     f()
-    return DROPS * 100 + ORDER
+    return DROPS *% 100 +% ORDER
 """, 221, {}),
 
     # A `defer` registered after the statement's temporary runs before it

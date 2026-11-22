@@ -113,7 +113,7 @@ def _typed_forms(ty, bits, signed):
         "or": ("", a, "(a | z)", v),
         "add": ("", a, "(a + z)", v),
         "not": ("", f"let s: {ty} = 7\n", "(~s)", ~7),
-        "wrap_add": ("", a, "(a + a)", 2 * v),
+        "wrap_add": ("", a, "(a +% a)", 2 * v),
     }
 
 

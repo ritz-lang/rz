@@ -200,10 +200,10 @@ class TestWrappingConstEvaluation:
         assert ConstEvaluator().evaluate(
             parse_expr("(9223372036854775807 +% 1) +% 1")) == I64_MIN + 1
 
-    def test_plain_add_is_not_wrapped(self):
-        """The flag, not the magnitude, decides: `+` keeps its exact value."""
-        assert ConstEvaluator().evaluate(
-            parse_expr("9223372036854775807 + 1")) == (1 << 63)
+    def test_plain_add_overflow_is_an_error(self):
+        """A plain `+` outside i64 is not a value: overflow is an error (R63)."""
+        with pytest.raises(ConstEvalError, match=r"integer overflow in `\+`"):
+            ConstEvaluator().evaluate(parse_expr("9223372036854775807 + 1"))
 
     def test_fold_wraps_all_literal_add(self):
         assert fold_literal_i64(
@@ -218,7 +218,8 @@ class TestWrappingConstEvaluation:
             parse_expr("4611686018427387904 *% 2")) == I64_MIN
 
     def test_fold_still_refuses_plain_add_overflow(self):
-        """A plain `+` outside i64 is not folded (it is emitted as before)."""
+        """A plain `+` outside i64 is not folded; the emitter refuses it
+        instead, as an overflow in a constant expression (LARB R63)."""
         assert fold_literal_i64(parse_expr("9223372036854775807 + 1")) is None
 
 
@@ -446,17 +447,16 @@ fn f() -> void
         fn = module.items[0]
         assert fn.body.stmts[0].type.size == 1
 
-    def test_plain_add_overflow_in_array_is_not_wrapped(self):
-        """The control: without `%`, the value is the exact sum."""
+    def test_plain_add_overflow_in_array_is_an_error(self):
+        """The control: without `%`, an overflowing expression is refused."""
         source = """
 fn f() -> void
     var buf: [9223372036854775807 + 1]u8
 """
         module = parse_module(source)
         errors = evaluate_array_sizes(module)
-        assert errors == []
-        fn = module.items[0]
-        assert fn.body.stmts[0].type.size == 1 << 63
+        assert len(errors) == 1
+        assert "integer overflow in `+` in constant expression" in str(errors[0])
 
 
 class TestEvaluateConstExpr:

@@ -109,11 +109,11 @@ def _forms(ty, bits, signed):
         "compare_sign": ("", f"{a}var q: i64 = 0\nif (a >> 1) < 0\n    q = 1\nq", int(e < 0)),
 
         # Past the type's range, which an i64 register can hold and T cannot.
-        "wrap_add": ("", f"{a}{let_r}(a + a) >> 1{ret}", _shr(v + v, 1, bits, signed)),
+        "wrap_add": ("", f"{a}{let_r}(a +% a) >> 1{ret}", _shr(v + v, 1, bits, signed)),
         "wrap_not": ("", f"{a}{let_r}(~a) >> 1{ret}", _shr(~v, 1, bits, signed)),
-        "wrap_sub": ("", f"let a: {ty} = 1\nlet c: {ty} = 2\n{let_r}(a - c) >> 1{ret}",
+        "wrap_sub": ("", f"let a: {ty} = 1\nlet c: {ty} = 2\n{let_r}(a -% c) >> 1{ret}",
                      _shr(-1, 1, bits, signed)),
-        "overflow": ("", f"let a: {ty} = {top_int}\n{let_r}(a + a) >> 1{ret}",
+        "overflow": ("", f"let a: {ty} = {top_int}\n{let_r}(a +% a) >> 1{ret}",
                      _shr(2 * top_int, 1, bits, signed)),
     }
     # Beside an i64 the expression is an i64, unless this is a u64: at equal
@@ -238,8 +238,10 @@ def _slot_forms():
     """A literal under a narrow slot, masked so the slot accepts it (#2360).
 
     The value is the one the expression has anywhere: a literal operand is the
-    other operand's type (LARB R21, #3112), so `a << 4` and `a + 1` are a's
+    other operand's type (LARB R21, #3112), so `a << 4` and `a +% 1` are a's
     type and wrap there before the `>>`; the slot below gives them nothing.
+    (The `%` forms are explicit: since LARB R63 plain `+`/`-` stop the program
+    on that overflow.)
     Before R21 the literal was an i64 and they were computed at 64 bits
     (248, 128, 127 and 8).
     """
@@ -247,8 +249,8 @@ def _slot_forms():
         return ("", f"let a: {ty} = {a}\nlet r: {ty} = ({expr}) & {mask}\nr as i64", want)
     return {
         "shl_u8": form("u8", 248, "(a << 4) >> 4", 255, _shr((248 << 4) & 255, 4, 8, False)),
-        "add_u8": form("u8", 255, "(a + 1) >> 1", 255, _shr(256 & 255, 1, 8, False)),
-        "sub_u8": form("u8", 1, "(a - 2) >> 1", 255, _shr(-1 & 255, 1, 8, False)),
+        "add_u8": form("u8", 255, "(a +% 1) >> 1", 255, _shr(256 & 255, 1, 8, False)),
+        "sub_u8": form("u8", 1, "(a -% 2) >> 1", 255, _shr(-1 & 255, 1, 8, False)),
         # The sign-extension idiom: `8 << 4` is -128 in an i8, so `>> 4` fills
         # with ones: -8, masked to 120.
         "shl_i8": form("i8", 8, "(a << 4) >> 4", 127, _shr(-128, 4, 8, True) & 127),

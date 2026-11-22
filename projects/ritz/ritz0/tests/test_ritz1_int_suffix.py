@@ -19,29 +19,30 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 # name -> (program, expected exit status)
 FORMS = {
-    # A u8 local wraps at 256: 200 + 100 is 44, not 300.
+    # A u8 local wraps at 256: 200 +% 100 is 44, not 300.  (`+%`: since R63,
+    # plain `+` stops the program on overflow; the suffix still types `b`.)
     "u8_local_wraps": ("""\
 pub fn main() -> i32
     let a = 200u8
-    let b = a + 100
+    let b = a +% 100
     if b < 100
         return 7
     return 1
 """, 7),
-    # An i8 local is signed at 8 bits: 127 + 1 is -128.
+    # An i8 local is signed at 8 bits: 127 +% 1 is -128.
     "i8_local_wraps": ("""\
 pub fn main() -> i32
     let a = 127i8
-    let b = a + 1
+    let b = a +% 1
     if b < 0
         return 6
     return 1
 """, 6),
-    # A u32 local wraps below 0 and compares unsigned.
+    # A u32 local wraps below 0 (`-%`) and compares unsigned.
     "u32_local_wraps": ("""\
 pub fn main() -> i32
     let a = 0u32
-    let b = a - 1
+    let b = a -% 1
     if b == 4294967295
         return 5
     return 1
@@ -50,7 +51,7 @@ pub fn main() -> i32
     "hex_u8": ("""\
 pub fn main() -> i32
     let a = 0xFFu8
-    let b = a + 1
+    let b = a +% 1
     if b == 0
         return 4
     return 1

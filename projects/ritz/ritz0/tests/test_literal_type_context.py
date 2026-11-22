@@ -117,6 +117,22 @@ def _ops(ir_text, fn_name):
     return found
 
 
+def _has_op(body, mnemonic, width):
+    """Is there a `mnemonic i<width>` on the value path?
+
+    Since LARB R63 (#3488) `+`, `-` and `*` emit
+    `call {iN, i1} @llvm.[su]<mnemonic>.with.overflow.iN` and trap on the
+    flag; the operation's width is the intrinsic's.  Bitwise ops are plain.
+    """
+    for line in body:
+        if re.search(rf"\b{mnemonic} i{width}\b", line):
+            return True
+        if mnemonic in ("add", "sub", "mul") and re.search(
+                rf'@"llvm\.[su]{mnemonic}\.with\.overflow\.i{width}"', line):
+            return True
+    return False
+
+
 # --------------------------------------------------------------------------
 # The defect itself: a literal must not widen its neighbours.
 # --------------------------------------------------------------------------
@@ -136,7 +152,7 @@ def test_literal_operand_does_not_force_a_64_bit_round_trip(tmp_path):
     assert "trunc" not in ops, (
         f"result truncated back down: {_body(ir_text, 'lit')}"
     )
-    assert any("add i32" in line for line in _body(ir_text, "lit")), (
+    assert _has_op(_body(ir_text, "lit"), "add", 32), (
         f"expected a 32-bit add: {_body(ir_text, 'lit')}"
     )
 
@@ -155,7 +171,7 @@ def test_literal_free_expression_is_the_control(tmp_path):
     ))
     ops = _ops(ir_text, "clean")
     assert "zext" not in ops and "trunc" not in ops
-    assert any("add i32" in line for line in _body(ir_text, "clean"))
+    assert _has_op(_body(ir_text, "clean"), "add", 32)
 
 
 @pytest.mark.unit
@@ -177,7 +193,7 @@ def test_each_wrapping_operator_stays_at_the_declared_width(
     ))
     body = _body(ir_text, "f")
     assert "zext" not in _ops(ir_text, "f"), f"{op} widened: {body}"
-    assert any(f"{mnemonic} i32" in line for line in body), \
+    assert _has_op(body, mnemonic, 32), \
         f"expected 32-bit {mnemonic}: {body}"
 
 
@@ -220,8 +236,8 @@ def test_a_widening_target_keeps_64_bit_arithmetic(tmp_path):
         "    return big\n"
     ))
     body = _body(ir_text, "widen_mul")
-    assert any("mul i64" in line for line in body), f"an i64 slot multiplies in 64 bits: {body}"
-    assert not any("mul i32" in line for line in body), body
+    assert _has_op(body, "mul", 64), f"an i64 slot multiplies in 64 bits: {body}"
+    assert not _has_op(body, "mul", 32), body
     assert any(re.search(r"\bzext i32 .* to i64", line) for line in body), (
         f"the u32 operand is zero-extended before the multiply: {body}"
     )
@@ -236,8 +252,8 @@ def test_without_a_wider_slot_r21_wraps(tmp_path):
         "    return n\n"
     ))
     body = _body(ir_text, "bump")
-    assert any("add i32" in line for line in body), f"m + 1 is a u32 add: {body}"
-    assert not any("add i64" in line for line in body), body
+    assert _has_op(body, "add", 32), f"m + 1 is a u32 add: {body}"
+    assert not _has_op(body, "add", 64), body
 
 
 @pytest.mark.unit
@@ -272,8 +288,8 @@ def test_a_call_argument_is_its_parameters_slot(tmp_path):
         "    return q\n"
     ))
     body = _body(ir_text, "leak")
-    assert any("mul i64" in line for line in body), f"the i64 parameter multiplies in 64 bits: {body}"
-    assert not any("mul i32" in line for line in body), f"the declared u32 leaked in: {body}"
+    assert _has_op(body, "mul", 64), f"the i64 parameter multiplies in 64 bits: {body}"
+    assert not _has_op(body, "mul", 32), f"the declared u32 leaked in: {body}"
     assert not any(re.search(r"\bsext i32", line) for line in body), (
         f"a u32 operand is widened unsigned: {body}"
     )
@@ -379,8 +395,15 @@ def test_a_literal_too_large_for_its_context_is_a_located_error(tmp_path):
 # where today it does so at 64.
 
 def _no_round_trip(body):
-    """No i64 value and no truncation anywhere in a function body."""
-    return not any(re.search(r"\bi64\b|\btrunc\b", line) for line in body)
+    """No i64 value and no truncation on the value path.
+
+    A trap block (#3488) writes through i64 syscall arguments by construction;
+    it is not part of the arithmetic these tests type.
+    """
+    trap = re.compile(r'arith\.trap:|\basm\b|ptrtoint|getelementptr \[|'
+                      r'unreachable|br i1 .*arith\.trap')
+    return not any(re.search(r"\bi64\b|\btrunc\b", line)
+                   for line in body if not trap.search(line))
 
 
 @pytest.mark.unit

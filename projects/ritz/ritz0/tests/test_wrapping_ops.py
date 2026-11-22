@@ -113,10 +113,11 @@ RUNS = {
     # ... but the plain `*` above it still runs in the slot: (200 +% 100) * 10.
     "wider_slot_outer_plain": _f("u8", "    let r: u16 = (a +% b) * 10\n", "200, 100", 440),
     # The walk stops at the wrapping node too: the `/` below it stays a u8
-    # divide, so `b * c` wraps to 144 before it (14, not 400 / 10 = 40).
+    # divide, so `b *% c` wraps to 144 before it (14, not 400 / 10 = 40).
+    # (`*%` rather than `*`: since R63, plain `*` traps on that overflow.)
     "wider_slot_stops_below": (
         "fn f(a: u8, b: u8, c: u8) -> i32\n"
-        "    let r: u16 = a +% ((b * c) / 10)\n"
+        "    let r: u16 = a +% ((b *% c) / 10)\n"
         "    if r == 15\n        return 3\n    return 4\n"
         "\npub fn main() -> i32\n    f(1, 200, 2)\n"),
     # A generic's instance is rebuilt by monomorph, and keeps the wrap.

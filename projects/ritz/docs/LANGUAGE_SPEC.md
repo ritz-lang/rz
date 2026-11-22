@@ -2288,8 +2288,8 @@ record):
   So `-1..m` with `m: u32` is an `i64` range that compares signed and runs
   from `-1` (AGAST #4261), as does `a..m` with `a: i64`.
 
-The variable's arithmetic is at that width: with `m: u32`, `i - 2` in
-`for i in 1..m` wraps as a `u32` does.
+The variable's arithmetic is at that width: with `m: u32`, `i -% 2` in
+`for i in 1..m` wraps as a `u32` does (plain `-` stops the program, §7.1).
 
 ```ritz
 fn take(v: i32) -> i32
@@ -2466,8 +2466,8 @@ let rem = a % b
 
 An integer literal has no type until its context gives it one (LARB R1). In an
 arithmetic or bitwise operation that context is the other operand (LARB R21):
-with `m: u32`, `m + 1` is a `u32`, exactly as `m + o` is with `o: u32`, so it
-wraps at 32 bits and `var n = m + 1` is a `u32`. Two literals are an `i64`. A
+with `m: u32`, `m + 1` is a `u32`, exactly as `m + o` is with `o: u32`, so
+`var n = m + 1` is a `u32`. Two literals are an `i64`. A
 literal that doesn't fit the other operand's type is an error, as it is in a
 slot. A shift is the exception (§7.4): its count has no say, and a literal on its
 left is an `i64`.
@@ -2479,7 +2479,14 @@ one literal of that value (AGAST #4082). So with `w: i32`, `w ^ (0 - 1)` is an
 or computing it leaves `i64`, the operand stays an `i64`. That is not an error,
 because nothing about it was written as a literal of the wrong type.
 
-`+`, `-` and `*` wrap on overflow at their type, except in a wider slot.
+`+`, `-` and `*` stop the program on overflow at their type (LARB R63): they
+write `<file>:<line>:<col>: integer overflow in `<op>`` to stderr and exit 1.
+Overflow in a constant expression is a compile error. In a wider slot (§ below)
+the operation runs at the slot's type, so it stops only if the result leaves
+that type. `/` and `%` stop the program, likewise, on division or remainder by
+zero and on the signed minimum divided by -1. `+%`, `-%` and `*%` wrap instead,
+by request (§ Wrapping operators); `as` truncates, and bits shifted out by `<<`
+are not an overflow.
 
 #### Wider slots
 
@@ -2500,7 +2507,7 @@ let m: u32 = 4294967295
 let big: i64 = m * 1000           # 4294967295000: an i64 multiply
 let sum: i64 = m + 1              # 4294967296
 let neg: i64 = (m - m) - 1        # -1: subtracted in the i64
-let n = m + 1                     # 0: no wider slot, a u32
+let n = m +% 1                    # 0: no wider slot, a u32 (`+` would stop it)
 let cast = (m + 1) as i64         # 0: a cast isn't a slot
 let x: u8 = 200
 let w: u16 = x * x                # 40000: a u16 multiply
@@ -2509,11 +2516,11 @@ let w: u16 = x * x                # 40000: a u16 multiply
 ```ritz body
 let m: u32 = 4294967295
 let o: u32 = 1
-let n = m + 1               # 0, a u32
-let p = m + o               # 0
+let n = m +% 1              # 0, a u32: `+` stops the program here
+let p = m +% o              # 0
 let wide = (m as i64) + 1   # 4294967296
 let x: u8 = 200
-let y = x * 2               # 144
+let y = x *% 2              # 144
 let z = 4294967295 + 1      # 4294967296: two literals are an i64
 ```
 
@@ -2735,7 +2742,8 @@ shift is an `i64`, unless its value only fits a `u64`:
 `0xF000000000000000 >> 60` is `15`. A constant expression shifts by the same rule.
 
 The left operand is a value of its type, so with `a: u8` the sums in
-`(a + a) >> 1` and `(a + 1) >> 1` wrap at 8 bits first, and in `(a << 4) >> 4`
+`(a +% a) >> 1` and `(a +% 1) >> 1` wrap at 8 bits first (plain `+` would stop
+the program), and in `(a << 4) >> 4`
 the high nibble is gone before the `>>`: at `a = 248` the result is `8`. A wider
 slot (§7.1) widens `<<` but stops at `>>`, which reads its left operand at that
 operand's type, so `let w: i64 = (a << 4) >> 4` is `8` too. Say a wider width
@@ -2756,7 +2764,10 @@ let r: u8 = (a << 4) >> 4
 ```
 
 A count that is negative, or not less than the bit width of the left operand's
-type, has no defined result.
+type, stops the program (LARB R63): it writes
+`<file>:<line>:<col>: shift count out of range in `<op>`` to stderr and exits 1.
+A constant count outside that range is a compile error. Bits shifted out by `<<`
+are not an overflow: `255 << 4` is `240` in a `u8`.
 
 Bitwise operators bind looser than `==`, so `x & 1 == 1` is `x & (1 == 1)`, which
 is an error. Parenthesise it:
@@ -7522,8 +7533,8 @@ loop, so it needs no compiler support of its own. An `llvm.memset` with
 | `atomic_store(p, v)` | writes `v` to `*p` | nothing |
 | `atomic_xchg(p, v)` | writes `v` to `*p` | the old value |
 | `atomic_cmpxchg(p, expected, new)` | writes `new` to `*p` if `*p == expected` | the old value |
-| `atomic_fetch_add(p, v)` | `*p = *p + v` (wrapping) | the old value |
-| `atomic_fetch_sub(p, v)` | `*p = *p - v` (wrapping) | the old value |
+| `atomic_fetch_add(p, v)` | `*p = *p +% v` (wraps) | the old value |
+| `atomic_fetch_sub(p, v)` | `*p = *p -% v` (wraps) | the old value |
 | `atomic_fetch_and(p, v)` | `*p = *p & v` | the old value |
 | `atomic_fetch_or(p, v)` | `*p = *p \| v` | the old value |
 | `atomic_fetch_xor(p, v)` | `*p = *p ^ v` | the old value |

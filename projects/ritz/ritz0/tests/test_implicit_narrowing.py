@@ -92,8 +92,6 @@ REJECTED = {
     "negative_into_unsigned": "let n: u8 = 0 - 1",
     # A negative mask bounds nothing: `e & -1` is `e`.
     "negative_mask":          "let n: i8 = big() & (0 - 1)",
-    # `x << 64` is poison in LLVM, not 0, so it is not a known constant.
-    "shift_by_64_is_poison":  "let n: u8 = 0 << 64",
     # A sub-64-bit named constant is only trusted as the WHOLE initialiser;
     # inside an expression it is computed at its own width and could wrap.
     "narrow_const_in_expr":   "let n: i8 = SMALL32 + 1",
@@ -102,10 +100,6 @@ REJECTED = {
     "shift_right_too_big_u8": "let n: u8 = 1024 >> 1",
     "negative_shift_right":   "let n: i8 = (0 - 16) >> 2",
     "negative_division":      "let n: i8 = (0 - 16) / 4",
-    "division_by_zero":       "let n: u8 = 8 / 0",
-    # 16 in exact arithmetic, but the multiply wraps to 0 at 64 bits first.
-    "shift_right_by_64":      "let n: u8 = 1 >> 64",
-    "wrapped_before_shift":   "let n: u8 = (1 << 62) * 4 >> 60",
     "match_one_arm_runtime":  ("let n: u8 = match o\n"
                                "        Gray => 0\n"
                                "        RGB => five()\n"
@@ -133,8 +127,6 @@ REJECTED = {
     # it takes the sibling's type only if that value fits it ...
     "all_literal_operand_too_big":   "let n: i32 = x ^ (1 << 40)",
     "all_literal_unary_too_big":     "let n: i32 = x & ~(1 << 40)",
-    # ... and only if it folds inside i64: `(1 << 62) * 4` wraps there.
-    "all_literal_operand_wraps_i64": "let n: i32 = x + ((1 << 62) * 4 >> 60)",
 }
 
 
@@ -149,6 +141,34 @@ def test_unprovable_narrowing_is_rejected(tmp_path, name):
     # traceback through _check_implicit_narrowing and must not count.
     assert "implicit narrowing:" in r.stderr and "Traceback" not in r.stderr, (
         f"{name}: rejected, but not by the narrowing diagnostic:\n{r.stderr[-1500:]}")
+
+
+# These narrow too, but LARB R63 (#3488) rejects the RHS at compile time
+# first: an invalid constant expression is a located error of its own, and the
+# narrowing check never runs.  They stay here so the row's source is still
+# covered, with the diagnostic it really gets.
+REJECTED_R63 = {
+    # `x << 64` and `1 >> 64`: the count is outside 0..63.
+    "shift_by_64":            ("let n: u8 = 0 << 64", "shift count out of range in `<<`"),
+    "shift_right_by_64":      ("let n: u8 = 1 >> 64", "shift count out of range in `>>`"),
+    "division_by_zero":       ("let n: u8 = 8 / 0", "division by zero in `/`"),
+    # 16 in exact arithmetic, but the multiply overflows i64 first.
+    "wrapped_before_shift":   ("let n: u8 = (1 << 62) * 4 >> 60",
+                               "integer overflow in `*`"),
+    "all_literal_operand_wraps_i64": ("let n: i32 = x + ((1 << 62) * 4 >> 60)",
+                                      "integer overflow in `*`"),
+}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", sorted(REJECTED_R63))
+def test_an_invalid_constant_expression_is_rejected_before_narrowing(
+        tmp_path, name):
+    stmt, message = REJECTED_R63[name]
+    r = _compile(tmp_path, _fn(stmt))
+    assert r.returncode != 0, f"{name}: `{stmt}` compiled"
+    assert message in r.stderr and "Traceback" not in r.stderr, (
+        f"{name}: expected {message!r}:\n{r.stderr[-1500:]}")
 
 
 @pytest.mark.unit

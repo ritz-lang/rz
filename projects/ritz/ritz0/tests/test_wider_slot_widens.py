@@ -83,10 +83,11 @@ RUNS = {
     # An arm's tail lands in the slot too.
     "arm": _f("(x: u32, c: bool) -> i32", "    let w: i64 = if c\n        x * 1000\n    else\n        0\n"
               + _is("w", 5000000000), "5000000, true"),
-    # Controls: no wider slot, so R21 stands and the u32 wraps.
-    "control_untyped": _f("(m: u32) -> i32", "    var n = m + 1\n" + _is("n", 0), MAX),
-    "control_same_width": _f("(m: u32) -> i32", "    let n: u32 = m + 1\n" + _is("n", 0), MAX),
-    "control_cast": _f("(m: u32) -> i32", "    let w: i64 = (m + 1) as i64\n" + _is("w", 0), MAX),
+    # Controls: no wider slot, so R21 stands and the u32 wraps.  `+%` because
+    # R63 stops a plain `+` that does; the typing under test is unchanged.
+    "control_untyped": _f("(m: u32) -> i32", "    var n = m +% 1\n" + _is("n", 0), MAX),
+    "control_same_width": _f("(m: u32) -> i32", "    let n: u32 = m +% 1\n" + _is("n", 0), MAX),
+    "control_cast": _f("(m: u32) -> i32", "    let w: i64 = (m +% 1) as i64\n" + _is("w", 0), MAX),
     "control_tilde": _f("(m: u32) -> i32", "    let w: i64 = ~m\n" + _is("w", MAX), 0),
     # `~m` is a leaf of the sum that runs in the slot: 4294967295 + 1.
     "control_tilde_sum": _f("(m: u32) -> i32", "    let w: i64 = ~m + 1\n" + _is("w", 4294967296), 0),

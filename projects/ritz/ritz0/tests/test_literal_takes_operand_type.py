@@ -1,7 +1,7 @@
 """An integer literal takes the other operand's type (LARB R21, AGAST #3112).
 
     fn f(m: u32) -> i64
-        var n = m + 1          # a u32: `+ 1` wraps as `+ o` does, `@&n` is an `@&u32`
+        var n = m +% 1         # a u32: `+% 1` wraps as `+% o` does, `@&n` is an `@&u32`
 
 In a binary arithmetic or bitwise operation an untyped integer literal is the
 other operand's type, as it would be in a slot (R1's first exception). Two
@@ -14,9 +14,12 @@ gave `n` an i64 slot, and ritz1 followed the emitter: `m + 1` and `m + o` (with
 `o: u32 = 1`) gave different answers. Each row is one row of R21's table
 (projects/larb/review/4/rulings-2026-11.md), on all three compilers.
 
-Overflow itself isn't this rule's business (#3197): `+ - *` wrap, silently.
-Except in a WIDER integer slot, where the operation runs at the slot's type
-(AGAST #3225, test_wider_slot_widens.py): `let w: i64 = m + 1` doesn't wrap.
+Overflow itself isn't this rule's business. Since LARB R63 (#3488) a plain
+`+`, `-` or `*` STOPS the program on overflow at its type, so the rows whose
+point is the wrapped value use `+%`, `-%` and `*%`, which type as `+` does and
+wrap by request. Except in a WIDER integer slot, where the operation runs at the
+slot's type (AGAST #3225, test_wider_slot_widens.py): `let w: i64 = m + 1`
+doesn't wrap.
 """
 
 import pytest
@@ -31,26 +34,26 @@ MAX = "4294967295"
 # name -> (program, exit code). Each `main` returns 3 when the row holds, unless
 # the row's answer is a value of its own.
 RUNS = {
-    # `m + 1` wraps, as a u32 does.
-    "wraps": (f"fn f(m: u32) -> i32\n    var n = m + 1\n    if n == 0\n        return 3\n    return 4\n\n"
+    # `m +% 1` wraps, as a u32 does.
+    "wraps": (f"fn f(m: u32) -> i32\n    var n = m +% 1\n    if n == 0\n        return 3\n    return 4\n\n"
               f"pub fn main() -> i32\n    f({MAX})\n", 3),
     # The literal `1` and a u32 named `o` holding 1 give the same answer.
-    "literal_or_name": (f"fn f(m: u32, o: u32) -> i32\n    let a = m + 1\n    let b = m + o\n    if a == b\n        return 3\n"
+    "literal_or_name": (f"fn f(m: u32, o: u32) -> i32\n    let a = m +% 1\n    let b = m +% o\n    if a == b\n        return 3\n"
                         f"    return 4\n\npub fn main() -> i32\n    f({MAX}, 1)\n", 3),
-    # In an operand, not only a local: `m + 1 > m` is false at the top.
-    "compared": (f"fn f(m: u32) -> i32\n    if m + 1 > m\n        return 4\n    return 3\n\n"
+    # In an operand, not only a local: `m +% 1 > m` is false at the top.
+    "compared": (f"fn f(m: u32) -> i32\n    if m +% 1 > m\n        return 4\n    return 3\n\n"
                  f"pub fn main() -> i32\n    f({MAX})\n", 3),
     # Unsigned subtraction below 0 is a big u32, never negative.
-    "unsigned_minus": ("fn f(m: u32) -> i32\n    var n = m - 2\n    if n < 0\n        return 4\n"
+    "unsigned_minus": ("fn f(m: u32) -> i32\n    var n = m -% 2\n    if n < 0\n        return 4\n"
                        f"    if n == {MAX}\n        return 3\n    return 5\n\npub fn main() -> i32\n    f(1)\n", 3),
     # An i8 wraps to -128.
-    "signed_wraps": ("fn f(k: i8) -> i32\n    let c = k + 1\n    if c < 0\n        return 3\n    return 4\n\n"
+    "signed_wraps": ("fn f(k: i8) -> i32\n    let c = k +% 1\n    if c < 0\n        return 3\n    return 4\n\n"
                      "pub fn main() -> i32\n    f(127)\n", 3),
     # 200 * 2 is 144 in a u8 (exit codes are mod 256, so it's compared), and a
     # literal on the left is the same.
-    "u8_multiply": ("fn f(x: u8) -> i32\n    let y = x * 2\n    if y == 144\n        return 3\n    return 4\n\n"
+    "u8_multiply": ("fn f(x: u8) -> i32\n    let y = x *% 2\n    if y == 144\n        return 3\n    return 4\n\n"
                     "pub fn main() -> i32\n    f(200)\n", 3),
-    "literal_left": ("fn f(x: u8) -> i32\n    let y = 2 * x\n    if y == 144\n        return 3\n    return 4\n\n"
+    "literal_left": ("fn f(x: u8) -> i32\n    let y = 2 *% x\n    if y == 144\n        return 3\n    return 4\n\n"
                      "pub fn main() -> i32\n    f(200)\n", 3),
     # `~x + 1` on a u8 of 200 is 56, read at the u8's width.
     "bitwise": ("fn f(x: u8) -> i32\n    if ~x + 1 == 56\n        return 3\n    return 4\n\n"

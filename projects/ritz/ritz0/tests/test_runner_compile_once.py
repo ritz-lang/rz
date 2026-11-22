@@ -164,7 +164,7 @@ def test_binary_runs_once_and_ritzunit_forks_per_test(run):
 
     runs = [
         c for c in recorded_commands
-        if c and c[0] not in ("clang", "ld", "objcopy")
+        if c and c[0] not in ("clang", "ld", "objcopy", "readelf")
         and not c[0].endswith(("python", "python3")) and c[0] != sys.executable
     ]
     assert len(runs) == 1, f"expected one run of the test binary, got {runs}"

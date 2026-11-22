@@ -124,7 +124,7 @@ pub fn main() -> i32
     # u8: the store must truncate to one byte (255 + 1 wraps to 0).
     "borrow_u8_wraps": """\
 fn inc(b:& u8)
-    b = b + 1
+    b = b +% 1
 
 pub fn main() -> i32
     var b: u8 = 255

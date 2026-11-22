@@ -22,8 +22,9 @@ and `k..10` (n, k: i32) bind an i32, `1..m` (m: u32) a u32. A literal that
 doesn't fit (`-129..m`, m: i8) widens, as it did. Two literals are an i64. Otherwise the
 wider bound's width, unsigned when a bound is (#1636 / #3328).
 
-The variable's arithmetic is at that width, so `i - 2` with `i: u32 = 1`
-wraps. The #4080 corpus IR diff found no loop whose result that changes.
+The variable's arithmetic is at that width, so `i -% 2` with `i: u32 = 1`
+wraps (plain `-` would stop the program, LARB R63). The #4080 corpus IR diff
+found no loop whose result that changes.
 
 THE TESTS
 
@@ -82,7 +83,7 @@ for i in k..10
 if s != 24
     return 1
 0""",
-    # An unsigned bound gives its type: `i - 2` at i = 1 wraps in u32 (it was
+    # An unsigned bound gives its type: `i -% 2` at i = 1 wraps in u32 (it was
     # -1 at i64).
     "literal_start_unsigned": """\
 let m: u32 = 3
@@ -90,7 +91,7 @@ var s: u32 = 0
 var big: i64 = 0
 for i in 1..m
     s = s + take_u(i)
-    if i - 2 > 100
+    if i -% 2 > 100
         big = big + 1
 if s != 3
     return 1

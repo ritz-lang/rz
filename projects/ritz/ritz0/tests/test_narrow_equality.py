@@ -6,12 +6,15 @@ A register holds an i64, so with `a: u8 = 200` the sum `a + a` sits in it as
 compares on ritz1; `==` and `!=` still read the whole register, so
 `(a + a) == 144` was false there (ritz0 says true, as the spec does).
 
-One row per operator that can leave the type's range (`+`, `-`, `*`, `<<`) on
-operands of one narrow type, compared both ways (`==`, `!=`) against a
+One row per operator that can leave the type's range (`+%`, `-%`, `*%`, `<<`)
+on operands of one narrow type, compared both ways (`==`, `!=`) against a
 literal, against a narrow value on either side, and against another operator
-form. Expected
-values come from `_wrap`, the type's value on Python integers, which is also
-what ritz0 answers.
+form. Expected values come from `_wrap`, the type's value on Python integers,
+which is also what ritz0 answers.
+
+Since LARB R63 (#3488) a plain `+`, `-` or `*` stops the program on overflow,
+so the rows whose point is the wrapped value say `+%`, `-%` or `*%`: they type
+as the plain operators do and wrap at the operand type.
 """
 
 import pytest
@@ -31,9 +34,9 @@ def _forms(bits, signed):
     else:
         a, c = (1 << bits) - 56, 56                              # u8: 200, 56
     return a, c, {
-        "sum": ("(a + a)", a + a),
-        "difference": ("(c - a)", c - a),
-        "product": ("(a * k)", a * 3),
+        "sum": ("(a +% a)", a + a),
+        "difference": ("(c -% a)", c - a),
+        "product": ("(a *% k)", a * 3),
         "shift": ("(a << n)", a << 1),
     }
 
@@ -46,7 +49,7 @@ def _rows():
         for name, (x, raw) in forms.items():
             want = _wrap(raw, bits, signed)
             other = _wrap(want + 1, bits, signed)
-            # `w + d + d` is w once brought back, and outside the range before.
+            # `w +% d +% d` is w once brought back, and outside the range before.
             half = -(1 << (bits - 1)) if signed else 1 << (bits - 1)
             decl = (f"let a: {ty} = {a}\nlet c: {ty} = {c}\nlet k: {ty} = 3\n"
                     f"let n: {ty} = 1\nlet w: {ty} = {want}\nlet d: {ty} = {half}\n")
@@ -61,13 +64,13 @@ def _rows():
                 (f"{tag}.value_eq", decl, f"w == {x}", True),
                 (f"{tag}.value_ne", decl, f"w != {x}", False),
                 # Both sides operator forms out of range, by different amounts.
-                (f"{tag}.eq_form", decl, f"{x} == (w + d + d)", True),
-                (f"{tag}.ne_form", decl, f"{x} != (w + d + d)", False),
+                (f"{tag}.eq_form", decl, f"{x} == (w +% d +% d)", True),
+                (f"{tag}.ne_form", decl, f"{x} != (w +% d +% d)", False),
             ]
         # A literal operand is the other operand's type (LARB R21, #3112), so
-        # this form wraps as `a * k` does; it was an i64 and didn't.
+        # this form wraps as `a *% k` does; it was an i64 and didn't.
         rows.append((f"{ty}.literal_wraps", f"let a: {ty} = {a}\n",
-                     f"(a * 3) == {_wrap(a * 3, bits, signed)}", True))
+                     f"(a *% 3) == {_wrap(a * 3, bits, signed)}", True))
     return rows
 
 
@@ -94,7 +97,7 @@ def test_narrow_operator_forms_compare_at_their_type(request, compiler, tmp_path
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_ticket(request, compiler, tmp_path):
-    source = "fn main() -> i32\n" + _indent("let a: u8 = 200\nif (a + a) == 144\n    return 3\n4")
+    source = "fn main() -> i32\n" + _indent("let a: u8 = 200\nif (a +% a) == 144\n    return 3\n4")
     assert _run(request, compiler, tmp_path, source) == 3
 
 

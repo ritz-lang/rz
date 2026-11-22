@@ -737,12 +737,23 @@ def build_runner_objects(tmpdir: str, ll_cache: dict, test_modules=(),
 
     Every module the runner needs and the test does not (`test_modules`:
     the test's own dependency sources) is combined with `ld -r`, and every
-    symbol but `main` is made local (`objcopy -G main`). Dependency objects
-    are compiled with external linkage throughout, and the runner brings
-    names the program may define too: its own `run_tests`, `parse_args`,
-    `json_record_pass`, `g_verbose` (spire, http), and the ritzlib modules
-    only it imports (ritzlib.string's `string_contains`; mausoleum defines
-    one). Localized, none of them can clash with the program.
+    entity but `main` and the COMDAT members is made local (`objcopy -G`,
+    see `_weak_defined_symbols`). Dependency objects are compiled with
+    external linkage throughout, and the runner brings names the program may
+    define too: its own `run_tests`, `parse_args`, `json_record_pass`,
+    `g_verbose` (spire, http), and the ritzlib modules only it imports
+    (ritzlib.string's `string_contains`; mausoleum defines one). Localized,
+    none of them can clash with the program.
+
+    Weak definitions stay global because they are COMDAT groups
+    (`linkonce_odr`), and two objects may hold the same group: the runner's
+    copy and the shared dependency's. The final link keeps one and discards
+    the other, but a reference from the runner's merged `.text` can only
+    reach the survivor if the name is global. Localized, the reference points
+    at a discarded group and the link fails ("`vec_push$u8' referenced in
+    section `.text' ... defined in discarded section"). Localizing a COMDAT
+    member is never needed: duplicates are supposed to collapse, and a weak
+    name that also exists in the program resolves the same way.
 
     A module the test imports as well stays an ordinary global object, linked
     once and shared: `ll_cache` is shared with the test's dependencies, so it
@@ -773,12 +784,51 @@ def build_runner_objects(tmpdir: str, ll_cache: dict, test_modules=(),
             shared.append(out)
 
     runner = os.path.join(tmpdir, "ritzunit_runner.o")
-    for cmd in (["ld", "-r", "-o", runner, *own],
-                ["objcopy", "--keep-global-symbol=main", runner]):
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            return [], f"ritzunit: {cmd[0]} failed: {result.stderr}"
+    result = subprocess.run(["ld", "-r", "-o", runner, *own],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return [], f"ritzunit: ld failed: {result.stderr}"
+
+    keep, error = _keep_global_symbols(runner)
+    if error:
+        return [], f"ritzunit: {error}"
+    keep_file = os.path.join(tmpdir, "ritzunit_keep_global.txt")
+    Path(keep_file).write_text("\n".join(keep) + "\n")
+    result = subprocess.run(
+        ["objcopy", f"--keep-global-symbols={keep_file}", runner],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        return [], f"ritzunit: objcopy failed: {result.stderr}"
     return shared + [runner], None
+
+
+def _keep_global_symbols(obj: str) -> Tuple[List[str], Optional[str]]:
+    """`main` plus every weak symbol `obj` defines: the names objcopy keeps
+    global in the merged runner (see build_runner_objects).
+
+    A `linkonce_odr` instantiation is WEAK in its object; one that LLVM
+    inlines away leaves no symbol at all. Reading the list from the merged
+    object rather than naming the generic functions keeps this independent
+    of which ones the optimiser decided to keep.
+    """
+    result = subprocess.run(["readelf", "-sW", obj],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return [], f"readelf failed: {result.stderr}"
+    keep = ["main"]
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 8 or not parts[0].endswith(":"):
+            continue
+        try:
+            int(parts[0][:-1])
+        except ValueError:
+            continue
+        # Num: Value Size Type Bind Vis Ndx Name
+        typ, bind, ndx, name = parts[3], parts[4], parts[6], " ".join(parts[7:])
+        if bind == "WEAK" and ndx != "UND" and typ != "SECTION" and name:
+            keep.append(name)
+    return list(dict.fromkeys(keep)), None
 
 
 def build_test_binary(source_path: str, tmpdir: str,

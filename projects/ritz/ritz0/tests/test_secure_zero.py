@@ -139,7 +139,12 @@ def test_plain_wipe_is_elided_at_O2(compiler, tmp_path):
     is measuring something."""
     plain = _o2(compiler, tmp_path, DEAD_KEY.replace("{wipe}", PLAIN_WIPE), "plain")
     body = _fn_body(plain, "derive")
-    assert not re.search(r"\bstore\b|memset", body), (
+    # The wipe is stores of zero; those must be gone.  Since LARB R63 the
+    # sum loop's `+` carries an overflow guard, so LLVM no longer folds the
+    # loop away and the key's initialising stores (3..39) stay -- they are
+    # not the wipe, and their presence does not weaken the control.
+    assert not re.search(
+        r"store (i8 0\b|<[^>]*> zeroinitializer|zeroinitializer)|memset", body), (
         f"{compiler}: -O2 kept the plain wipe; the DSE control no longer holds:\n{body}")
 
 

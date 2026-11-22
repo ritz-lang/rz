@@ -40,7 +40,7 @@ pytestmark = pytest.mark.integration
 # deterministic.  `fold` mixes the halves (see the docstring) to a byte.
 _TEMPLATE = """\
 fn fold(p: *i64) -> i32
-    var v: i64 = p[0] ^ (p[1] * 7)
+    var v: i64 = p[0] ^ (p[1] *% 7)
     v = v ^ (v >> 32)
     v = v ^ (v >> 16)
     v = v ^ (v >> 8)

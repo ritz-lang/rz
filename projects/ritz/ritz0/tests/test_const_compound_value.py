@@ -192,20 +192,21 @@ pub fn main() -> i32
     g.cells[C - 1] = 1
     return m[1][2] + g.cells[2]
 """,
-    # A folded value wraps to the const's declared width, as runtime
+    # A folded `+%` wraps to the const's declared width, as runtime
     # arithmetic at that width would (AGAST #2154): ritz1 used to keep the
-    # unwrapped i64, so `M == 44` compared 300 with 44.
+    # unwrapped i64, so `M == 44` compared 300 with 44. Since LARB R63 plain
+    # `+` stops an overflowing const with a compile error.
     "wraps_to_width": """\
-const M: u8 = 200 + 100
+const M: u8 = 200 +% 100
 
 pub fn main() -> i32
     if M == 44
         return 3
     return 1
 """,
-    # Signed sign-extends: 100 + 100 in i8 is -56.
+    # Signed sign-extends: 100 +% 100 in i8 is -56.
     "signed_wraps_negative": """\
-const M: i8 = 100 + 100
+const M: i8 = 100 +% 100
 
 pub fn main() -> i32
     if M == -56 and (M as i32) == -56
@@ -213,9 +214,9 @@ pub fn main() -> i32
     return 1
 """,
     "u16_u32_and_i32_wrap": """\
-const A: u16 = 65535 + 2
-const B: i32 = 2147483647 + 1
-const C: u32 = 4294967295 + 4
+const A: u16 = 65535 +% 2
+const B: i32 = 2147483647 +% 1
+const C: u32 = 4294967295 +% 4
 
 pub fn main() -> i32
     if A == 1 and (B as i64) == -2147483648 and C == 3
@@ -225,7 +226,7 @@ pub fn main() -> i32
     # A const naming a wrapped one sees the wrapped value: 44 + 1, not 301.
     # (Compared, not returned: 301 - 42 exits 3 too, modulo 256.)
     "wrapped_const_as_operand": """\
-const M: u8 = 200 + 100
+const M: u8 = 200 +% 100
 const K: i32 = M + 1
 
 pub fn main() -> i32
@@ -272,7 +273,7 @@ pub fn main() -> i32
     # Resolved at emit time (names a later const), so it takes the other
     # folding path, which must wrap too.
     "wraps_when_resolved_late": """\
-const M: u8 = L + 100
+const M: u8 = L +% 100
 
 const L: i32 = 200
 

@@ -53,6 +53,10 @@ def _compile(tmp_path, source, name="unit"):
     return proc, out
 
 
+_TRAP = re.compile(r'arith\.trap:|\basm\b|ptrtoint|getelementptr \[|'
+                   r'unreachable|br i1 .*arith\.trap')
+
+
 def _body(ir_text, fn_name):
     """A function's instruction lines, debug metadata stripped."""
     m = re.search(r'define [^\n]*' + test_ir.symbol(fn_name) + r'[^\n]*\n\{\n(.*?)\n\}',
@@ -98,7 +102,10 @@ def test_the_ticket_rows_compile_at_the_sibling_width(tmp_path):
     ir_text = out.read_text()
     for fn in ("let_binop", "let_unary", "assign_shift", "nested_left", "arg_slot"):
         body = _body(ir_text, fn)
-        wide = [l for l in body if re.search(r"\bi64\b|\btrunc\b", l)]
+        # A trap block (#3488) is i64 by construction; only the value path
+        # must stay at the operand's width.
+        wide = [l for l in body
+                if re.search(r"\bi64\b|\btrunc\b", l) and not _TRAP.search(l)]
         assert not wide, f"{fn}: the all-literal operand was computed in i64: {wide}"
 
 
@@ -111,7 +118,8 @@ def test_a_folded_value_that_does_not_fit_keeps_the_old_path(tmp_path):
         "    return big\n"
     ))
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert any("add i64" in l for l in _body(out.read_text(), "f"))
+    body = _body(out.read_text(), "f")
+    assert any("add i64" in l or "with.overflow.i64" in l for l in body), body
 
 
 @pytest.mark.unit

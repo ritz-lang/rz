@@ -173,13 +173,13 @@ pub fn main() -> i32
 # 32-bit wrap-around, copied element-wise into a second local array.
 CHACHA_SHAPE = """\
 fn qr(x: *u32, a: i64, b: i64, c: i64, d: i64) -> void
-    x[a] = x[a] + x[b]
+    x[a] = x[a] +% x[b]
     x[d] = (x[d] ^ x[a]).rotl(16)
-    x[c] = x[c] + x[d]
+    x[c] = x[c] +% x[d]
     x[b] = (x[b] ^ x[c]).rotl(12)
-    x[a] = x[a] + x[b]
+    x[a] = x[a] +% x[b]
     x[d] = (x[d] ^ x[a]).rotl(8)
-    x[c] = x[c] + x[d]
+    x[c] = x[c] +% x[d]
     x[b] = (x[b] ^ x[c]).rotl(7)
 
 pub fn main() -> i32
@@ -187,7 +187,7 @@ pub fn main() -> i32
     var working: [16]u32
     var i: i64 = 0
     while i < 16
-        state[i] = 0x9e3779b9 * (i as u32 + 1)
+        state[i] = 0x9e3779b9 *% (i as u32 + 1)
         i = i + 1
     i = 0
     while i < 16
@@ -198,7 +198,7 @@ pub fn main() -> i32
     var acc: u32 = 0
     i = 0
     while i < 16
-        acc = acc ^ (working[i] + state[i])
+        acc = acc ^ (working[i] +% state[i])
         i = i + 1
     if working[2] != state[2]
         return 1

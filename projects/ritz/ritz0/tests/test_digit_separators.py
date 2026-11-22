@@ -55,10 +55,11 @@ def hex_groups():
 
 
 # A u64 past i64's range: ritz1 reads the text again for its 2^64 check.
+# `+%` because the row wraps at 2^64, and R63 stops a plain `+` that does.
 @case()
 def hex_past_i64():
     return Run("pub fn main() -> i32\n    let m: u64 = 0xFFFF_FFFF_FFFF_FFF8\n"
-               "    if m + 8 == 0\n        return 42\n    1\n", 42)
+               "    if m +% 8 == 0\n        return 42\n    1\n", 42)
 
 
 @case()
