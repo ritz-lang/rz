@@ -75,7 +75,19 @@ pub const IR_ALLOCA_NAMED: *u8 = c" = alloca %"
 pub const IR_ALLOCA: *u8 = c" = alloca "
 pub const IR_RBRACK_PTR: *u8 = c"], ptr "
 pub const IR_PCT: *u8 = c"%"
+pub const IR_AT: *u8 = c"@"
 pub const IR_CALL: *u8 = c" = call "
+# LLVM type spellings the load/store builders take (AGAST #4464).  A call
+# site names one of these instead of its own `c"i64"`, so the spelling is
+# written once; `IR_LOAD_PTR` below is the two-fragment equivalent.
+pub const IR_TY_I1: *u8 = c"i1"
+pub const IR_TY_I8: *u8 = c"i8"
+pub const IR_TY_I16: *u8 = c"i16"
+pub const IR_TY_I32: *u8 = c"i32"
+pub const IR_TY_I64: *u8 = c"i64"
+pub const IR_TY_PTR: *u8 = c"ptr"
+pub const IR_TY_SPAN_U8: *u8 = c"%Span$u8"
+pub const IR_TY_STRVIEW: *u8 = c"%StrView"
 
 # =============================================================================
 # Emitter State
@@ -1993,11 +2005,7 @@ pub fn through_spill(s: *EmitterState, view: *LocalVar) -> *LocalVar
         return view
     let val: i32 = emit_expr(s, view.array_base)
     let slot: i32 = entry_alloca(s, c"i64", null)
-    emit_str(s, c"  store i64 ")
-    emit_reg(s, val)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, slot)
-    emit_str(s, IR_NL)
+    emit_store_typed(s, IR_TY_I64, val, slot)
     g_base_spills = g_base_spills + 1
     let name: *u8 = malloc(BASE_SPILL_NAME_BUF)
     *name = 35   # '#': no identifier has one
@@ -2827,11 +2835,7 @@ pub fn ptr_field_struct_elem(s: *EmitterState, f: *StructField) -> i32
 # slot itself as an inline `[0 x T]` array, writing into the struct.
 pub fn emit_ptr_field_elem_addr(s: *EmitterState, field_slot: i32, field: *StructField, kind: i32, idx: i32) -> i32
     let base: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, base)
-    emit_str(s, IR_LOAD_PTR)
-    emit_reg(s, field_slot)
-    emit_str(s, IR_NL)
+    emit_load_into(s, IR_TY_PTR, base, field_slot)
     let elem_ptr: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, elem_ptr)
@@ -5107,18 +5111,10 @@ pub fn emit_plane_ptr(s: *EmitterState, e: *Expr) -> i32
         let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
         if lv != null
             var r: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, r)
-            emit_str(s, IR_LOAD_PTR)
-            emit_reg(s, lv.reg)
-            emit_str(s, IR_NL)
+            emit_load_into(s, IR_TY_PTR, r, lv.reg)
             if local_holds_plane_ptr(lv) == 1   # AGAST #4122: a ref too
                 let r2: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, r2)
-                emit_str(s, IR_LOAD_PTR)
-                emit_reg(s, r)
-                emit_str(s, IR_NL)
+                emit_load_into(s, IR_TY_PTR, r2, r)
                 r = r2
             return r
     let v: i32 = emit_expr(s, x)
@@ -5131,11 +5127,7 @@ pub fn emit_plane_ptr(s: *EmitterState, e: *Expr) -> i32
     # AGAST #4122: `*s.q` / `*gq` / `*f()` loads the `*[N][M]T` the `**` holds.
     if x != e and base_plane_ptr_ptr(s, x) != null
         let held: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, held)
-        emit_str(s, IR_LOAD_PTR)
-        emit_reg(s, ptr)
-        emit_str(s, IR_NL)
+        emit_load_into(s, IR_TY_PTR, held, ptr)
         return held
     ptr
 
@@ -5297,23 +5289,76 @@ pub fn try_emit_span_to_i64_arg(s: *EmitterState, arg_e: *Expr, param_type: i32,
 # load either i64 or ptr from the same `alloca i64` slot.
 # =============================================================================
 
+# Emit `  %.dst = load <ty>, ptr %.ptr` for a destination the site has
+# already allocated with next_reg.  The instruction shape lives here rather
+# than in emitter_ir.ritz's ir_load because the pointer operand must go
+# through emit_reg: #4462 appends `, align 1` for a packed-derived register
+# and #4461 notes a deferred load's use.  A leaf builder writing raw bytes
+# would silently drop both, so the state-aware spelling is emitter_core's.
+pub fn emit_load_into(s: *EmitterState, ty: *u8, dst: i32, ptr: i32)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, dst)
+    emit_str(s, IR_LOAD)
+    emit_str(s, ty)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, ptr)
+    emit_str(s, IR_NL)
+
+# As emit_load_into, allocating the destination: `%.N = load <ty>, ptr %.ptr`.
+pub fn emit_load_new(s: *EmitterState, ty: *u8, ptr: i32) -> i32
+    let dst: i32 = next_reg(s)
+    emit_load_into(s, ty, dst, ptr)
+    dst
+
+# Emit `  store <ty> %.val, ptr %.ptr`.
+pub fn emit_store_typed(s: *EmitterState, ty: *u8, val: i32, ptr: i32)
+    emit_str(s, IR_STORE_IND)
+    emit_str(s, ty)
+    emit_str(s, IR_SP)
+    emit_reg(s, val)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, ptr)
+    emit_str(s, IR_NL)
+
+# Emit `  store <ty> <imm>, ptr %.ptr` (a constant store).
+pub fn emit_store_imm(s: *EmitterState, ty: *u8, imm: i64, ptr: i32)
+    emit_str(s, IR_STORE_IND)
+    emit_str(s, ty)
+    emit_str(s, IR_SP)
+    emit_int(s, imm)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, ptr)
+    emit_str(s, IR_NL)
+
+# Emit `  %.dst = load <ty>, ptr @<name>` (a global's storage).
+pub fn emit_load_global(s: *EmitterState, ty: *u8, dst: i32, name_sv: StrView)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, dst)
+    emit_str(s, IR_LOAD)
+    emit_str(s, ty)
+    emit_str(s, IR_PTR_SEP)
+    emit_str(s, IR_AT)
+    emit_name(s, name_sv)
+    emit_str(s, IR_NL)
+
+# Emit `  store <ty> %.val, ptr @<name>` (a global's storage).
+pub fn emit_store_global(s: *EmitterState, ty: *u8, val: i32, name_sv: StrView)
+    emit_str(s, IR_STORE_IND)
+    emit_str(s, ty)
+    emit_str(s, IR_SP)
+    emit_reg(s, val)
+    emit_str(s, IR_PTR_SEP)
+    emit_str(s, IR_AT)
+    emit_name(s, name_sv)
+    emit_str(s, IR_NL)
+
 # Emit `%result = load ptr, ptr %slot_reg` and return the new register index.
 pub fn emit_load_ptr(s: *EmitterState, slot_reg: i32) -> i32
-    let result: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, result)
-    emit_str(s, IR_LOAD_PTR)
-    emit_reg(s, slot_reg)
-    emit_str(s, IR_NL)
-    result
+    emit_load_new(s, IR_TY_PTR, slot_reg)
 
 # Emit `store ptr %val_reg, ptr %slot_reg`.
 fn emit_store_ptr(s: *EmitterState, val_reg: i32, slot_reg: i32)
-    emit_str(s, c"  store ptr ")
-    emit_reg(s, val_reg)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, slot_reg)
-    emit_str(s, IR_NL)
+    emit_store_typed(s, IR_TY_PTR, val_reg, slot_reg)
 
 pub fn add_string(s: *EmitterState, data_sv: StrView) -> i32
     var data: *u8 = data_sv.ptr
