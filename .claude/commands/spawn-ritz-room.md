@@ -69,6 +69,13 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
 
    **Location convention:** `~/dev/ritz-lang/rz-task-<id>` — sibling to `rz/`.
 
+   **This path is not named for the room.** Because it is `rz-task-<id>`, not
+   the default `rz-ritz-task-<id>`, teardown's `room rm` refuses with
+   `workspace_not_ours` unless it is given `--repo ~/dev/ritz-lang/rz`. The
+   same applies to the guarded dry run. Either use the default worktree name,
+   or make the TEARDOWN message spell out `--repo ~/dev/ritz-lang/rz` (seen on
+   bangerang, starbux and huburght, 2026-11-22).
+
 4. **Provision room permissions — MANDATORY, and it is not optional plumbing:**
    ```bash
    .claude/provision-room.sh ~/dev/ritz-lang/rz-task-<id>
