@@ -2106,7 +2106,6 @@ struct Runtime
     waker_io_result: i32
     waker_io_ready: i32
     waker_active: i32
-    took_pending_code: i32
     spawn_tasks: [64]SpawnTask
     spawn_count: i32
     current_task: i32
@@ -2115,8 +2114,7 @@ struct Runtime
 `waker_io_ready`, not the value of `waker_io_result`, says whether a completion
 is waiting, so a read at EOF returns 0 rather than being resubmitted. A
 hand-written poll function that returns an -EPERM result it was handed is
-Ready(-1); the legacy poll-fn driver the examples and tests keep until #4009
-returns -1 instead of reading it as Pending (AGAST #2328).
+Ready(-1) rather than being read as Pending (AGAST #2328).
 
 `spawn`/`run_spawned` queue several held futures on one runtime (LARB R79).
 Each queued task has its own waker slot (`SpawnTask`): while a task's poll
