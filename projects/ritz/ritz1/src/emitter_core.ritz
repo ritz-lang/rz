@@ -350,9 +350,13 @@ struct EmitterState
     # AGAST #1824 — 1 once a format_into has called @__ritz_fmt_int /
     # @__ritz_fmt_strlen; emit_module then defines them.
     fmt_helpers_used: i32
-    # AGAST #1918 — 1 once a `[[packed]]` struct type is emitted; only then
-    # does align_packed_accesses scan each fn body.
-    packed_types_emitted: i32
+    # AGAST #4462 — per-register packed provenance (index = register), 1 when
+    # the register is a pointer derived from a `[[packed]]` struct: a
+    # getelementptr whose source type is packed, or whose base is itself
+    # packed-derived.  A load/store through a marked register says `align 1`.
+    # Grown for reuse across fns and zeroed at each fn's start.
+    packed_marks: *u8
+    packed_marks_cap: i32
     # AGAST #1364 — per-function table of written integer types
     # (narrowing.ritz), for the codegen paths that read narrowing's rule
     # mid-lowering (enum_as_int, sizeof).  The check
@@ -543,6 +547,101 @@ pub fn emit_no_red_zone_attr(s: *EmitterState)
     if g_no_red_zone == 1
         emit_str(s, c" noredzone")
 
+# =============================================================================
+# Packed-struct pointer provenance (AGAST #4462)
+# =============================================================================
+#
+# A `[[packed]]` struct is `<{ ... }>`: its fields sit at any byte offset, so
+# `p.b: u64` at offset 1 is 1-aligned.  A `load i64, ptr %f` with no `align`
+# operand claims ABI alignment 8 instead -- UB that -O2 may exploit.
+#
+# #1918 answered this with a pass over the finished fn body: scan every
+# getelementptr, mark its result when the source type is packed or the base is
+# marked, then splice `, align 1` onto loads/stores through a marked register.
+# The facts are available as the instruction is emitted, so #4462 records them
+# there instead:
+#
+#   * emit_name, when it emits the source type of a `getelementptr %<name>`
+#     line, marks the GEP's result if find_struct(<name>) is packed;
+#   * emit_reg, when it emits the base of a getelementptr, marks the result if
+#     the base register is marked (so `p.inner.x` propagates: `p.inner` is
+#     packed, `Inner` itself is not);
+#   * emit_reg, when it emits the pointer operand of a load/store, appends
+#     `, align 1` if that register is marked.
+#
+# A pointer LOADED from memory is a new register and starts afresh, exactly as
+# the old pass treated it.  The marks are per fn (register numbers are too).
+
+# Start offset of the line currently being built in s.out.
+fn packed_line_start(s: *EmitterState) -> i64
+    var i: i64 = s.out.len - 1
+    while i >= 0 and *(s.out.data + i) != 10   # '\n'
+        i -= 1
+    i + 1
+
+# The partial line currently being built (no trailing newline yet).
+fn packed_line(s: *EmitterState) -> StrView
+    let start: i64 = packed_line_start(s)
+    StrView { ptr: (s.out.data + start), len: (s.out.len - start) }
+
+# Does the partial line end with `, ptr ` -- i.e. is a pointer operand next?
+fn packed_line_at_ptr_sep(s: *EmitterState) -> i32
+    let line: StrView = packed_line(s)
+    if line.len < 6
+        return 0
+    if strview_ends_with(line, strview_from_cstr(c", ptr "))
+        return 1
+    0
+
+# `%.N` at the start of the current line -> N, or -1.  Only called on a line
+# already known to be a getelementptr, whose result is always `  %.N`.
+fn packed_gep_dst(s: *EmitterState) -> i32
+    let line: StrView = packed_line(s)
+    if line.len < 4
+        return 0 - 1
+    if *(line.ptr + 0) != 32 or *(line.ptr + 1) != 32   # "  "
+        return 0 - 1
+    if *(line.ptr + 2) != 37 or *(line.ptr + 3) != 46   # "%."
+        return 0 - 1
+    var i: i64 = 4
+    var n: i32 = 0
+    var any: i32 = 0
+    while i < line.len and *(line.ptr + i) >= 48 and *(line.ptr + i) <= 57
+        n = n * 10 + ((*(line.ptr + i) as i32) - 48)
+        any = 1
+        i += 1
+    if any == 0
+        return 0 - 1
+    n
+
+# Mark register `reg` as packed-derived, growing the mark array as needed.
+pub fn packed_mark(s: *EmitterState, reg: i32)
+    if reg < 0
+        return
+    if reg >= s.packed_marks_cap
+        var cap: i32 = s.packed_marks_cap
+        if cap < 64
+            cap = 64
+        while cap <= reg
+            cap = cap * 2
+        let old: i32 = s.packed_marks_cap
+        let grown: *u8 = realloc(s.packed_marks, cap as i64)
+        s.packed_marks = grown
+        memzero(grown + old, (cap - old) as i64)
+        s.packed_marks_cap = cap
+    *(s.packed_marks + reg) = 1
+
+# 1 when `reg` is a pointer derived from a packed struct.
+pub fn packed_marked(s: *EmitterState, reg: i32) -> i32
+    if reg < 0 or s.packed_marks == null or reg >= s.packed_marks_cap
+        return 0
+    *(s.packed_marks + reg) as i32
+
+# Start a new fn: no register carries provenance from the previous one.
+pub fn packed_marks_reset(s: *EmitterState)
+    if s.packed_marks != null and s.packed_marks_cap > 0
+        memzero(s.packed_marks, s.packed_marks_cap as i64)
+
 pub fn emit_str(s: *EmitterState, text: *u8)
     # AGAST #1625, #3508: every way out of a fn is a `ret`, written from
     # dozens of sites once the return value is computed.  The live owned
@@ -584,6 +683,12 @@ fn emit_str_is_ret(text: *u8) -> i32
 # never, `tuple_i32_i64` always), so the `_` form cannot be split back.  The
 # flattening is therefore one-way and happens only here, on the way out.
 pub fn emit_name(s: *EmitterState, name_sv: StrView)
+    # AGAST #4462: the source type of `  %.N = getelementptr %<name>` decides
+    # whether N is a pointer into packed memory.
+    let line: StrView = packed_line(s)
+    if strview_ends_with(line, strview_from_cstr(c" = getelementptr %"))
+        if struct_is_packed(find_struct(s, name_sv)) == 1
+            packed_mark(s, packed_gep_dst(s))
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var i: i32 = 0
@@ -793,8 +898,30 @@ pub fn emit_reg(s: *EmitterState, reg: i32)
     # AGAST #4461: any use of a deferred load's register means the copy
     # rewrite cannot fire; the load is written back at fn end.
     dload_note_use(s, reg)
+    # AGAST #4462: a register emitted right after `, ptr ` is either a GEP's
+    # base or a load/store's pointer operand.  Both decisions are made here,
+    # before the register's text is appended.
+    let at_ptr: i32 = packed_line_at_ptr_sep(s)
+    var is_gep: i32 = 0
+    var is_access: i32 = 0
+    if at_ptr == 1
+        let line: StrView = packed_line(s)
+        if strview_contains(line, strview_from_cstr(c" = getelementptr "))
+            is_gep = 1
+        else if strview_starts_with_cstr(line, c"  store ")
+            is_access = 1
+        else if strview_contains(line, strview_from_cstr(c" = load "))
+            is_access = 1
+    let marked: i32 = packed_marked(s, reg)
     emit_str(s, c"%.")
     emit_int(s, reg as i64)
+    if at_ptr == 1 and marked == 1
+        if is_gep == 1
+            # `getelementptr ... ptr %.reg`: the result inherits provenance.
+            packed_mark(s, packed_gep_dst(s))
+        else if is_access == 1
+            emit_str(s, c", align 1")
+
 
 pub fn next_reg(s: *EmitterState) -> i32
     let r: i32 = s.reg_counter

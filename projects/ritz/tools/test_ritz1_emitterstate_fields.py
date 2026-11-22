@@ -55,7 +55,12 @@ SEMA_TYPE = SRC / "sema_type.ritz"
 # whole-struct loads this fn deferred (the sret copy choice is made at the
 # store site now), so they are the emitter's own buffer and counters, exactly
 # like entry_allocas and its marks -- not a fact Sema knows.
-MEASURED_FIELDS = 99
+#
+# #4462 removed one and added two: packed_types_emitted went (the module-wide
+# "run the align pass" flag), and packed_marks/packed_marks_cap arrived -- the
+# per-register packed provenance each GEP records as it is emitted, which the
+# load/store sites consult.  Both are lowering state, like the buffers above.
+MEASURED_FIELDS = 100
 
 # The three names the superseded acceptance grep counted (101 hits on main).
 # They are lowering state: every file that touches them is emitter-side.

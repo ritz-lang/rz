@@ -9,7 +9,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
-import ritzlib.strview    # strview_starts_with_cstr (was scan_starts_with)
+import ritzlib.strview    # StrView (the type; #4462 moved the scanners out)
 import ritzlib.gvec
 import ritzlib.memory
 import diag              # diag_error_at (AGAST #1866)
@@ -523,140 +523,11 @@ fn splice_entry_allocas(s: *EmitterState, body_start: i64)
     s.entry_allocas.len = 0
     s.ea_count = 0
 
-# AGAST #4461: the generic line scanners the packed-align pass below and the
-# deferred-load splice use live in emitter_core (scan_find and friends); they
-# were the deleted copy-scan module's, and the copy rewrite that drove it is
-# gone.
-
-# AGAST #1918 — packed-field loads and stores say `align 1`.
-#
-# A `[[packed]]` struct is `<{ ... }>`: its fields sit at any byte offset, so
-# `p.b: u64` at offset 1 is 1-aligned.  A `load i64, ptr %f` with no `align`
-# operand claims ABI alignment 8 instead — UB that -O2 may exploit.
-#
-# Like the two passes around it, this runs once over the finished body
-# rather than at the ~30 sites that emit a field load or store.  A register
-# is "packed" when it is defined by a `getelementptr` whose source type is a
-# packed struct, or whose base is itself packed (`o.p.b`, and `p.inner.x`
-# for a normal Inner inside packed P).  A pointer LOADED from memory is a
-# new register and starts afresh.  Every `load` / `store` through a packed
-# register that carries no `align` yet gets `, align 1`.
-#
-# The emitter writes defs before uses within straight-line field-access
-# code, so one forward scan sees each GEP before the accesses through it.
-
-# `%.N` at p[i..len) → N, with *out_end just past the digits; -1 otherwise.
-fn ll_dot_reg_at(p_sv: StrView, i: i64, out_end: *i64) -> i32
-    var p: *u8 = p_sv.ptr
-    var len: i64 = p_sv.len
-    if i + 2 >= len or *(p + i) != 37 or *(p + i + 1) != 46
-        return 0 - 1
-    var j: i64 = i + 2
-    var n: i64 = 0
-    while j < len and *(p + j) >= 48 and *(p + j) <= 57
-        n = n * 10 + (*(p + j) as i64) - 48
-        j += 1
-    if j == i + 2
-        return 0 - 1
-    *out_end = j
-    n as i32
-
-# Offset of the last `, ptr %.` in the line, or -1.
-fn ll_last_ptr_operand(p_sv: StrView) -> i64
-    var p: *u8 = p_sv.ptr
-    var len: i64 = p_sv.len
-    var i: i64 = len - 8
-    while i >= 0
-        if strview_starts_with_cstr(StrView { ptr: (p + i), len: (len - i) }, c", ptr %.")
-            return i + 6
-        i -= 1
-    0 - 1
-
-# 1 when the line mentions `align` anywhere (atomic accesses, SIMD paths).
-fn ll_has_align(p_sv: StrView) -> i32
-    var p: *u8 = p_sv.ptr
-    var len: i64 = p_sv.len
-    var i: i64 = 0
-    while i + 5 <= len
-        if strview_starts_with_cstr(StrView { ptr: (p + i), len: (len - i) }, c"align")
-            return 1
-        i += 1
-    0
-
-fn ll_is_packed_reg(marks: *u8, cap: i32, r: i32) -> i32
-    if r < 0 or r >= cap
-        return 0
-    *(marks + r) as i32
-
-# `  %.N = getelementptr <ty>, ptr <base>, ...`: mark N when <ty> is a packed
-# struct or <base> is a packed register.
-fn packed_mark_gep(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
-    var p: *u8 = p_sv.ptr
-    var len: i64 = p_sv.len
-    var e: i64 = 0
-    let dst: i32 = ll_dot_reg_at(StrView { ptr: (p), len: (len) }, 2, @e)
-    if dst < 0 or dst >= cap
-        return
-    if not strview_starts_with_cstr(StrView { ptr: (p + e), len: (len - e) }, c" = getelementptr ")
-        return
-    var t: i64 = e + 17
-    if strview_starts_with_cstr(StrView { ptr: (p + t), len: (len - t) }, c"inbounds ")
-        t += 9
-    let comma: i64 = scan_find(StrView { ptr: (p), len: (len) }, t, 44)
-    if comma < 0
-        return
-    if *(p + t) == 37 and *(p + t + 1) != 46
-        let st: *StructDef = find_struct(s, StrView { ptr: (p + t + 1), len: ((comma - t - 1) as i32) as i64 })
-        if st != null and struct_is_packed(st) == 1
-            *(marks + dst) = 1
-            return
-    if not strview_starts_with_cstr(StrView { ptr: (p + comma), len: (len - comma) }, c", ptr ")
-        return
-    var be: i64 = 0
-    if ll_is_packed_reg(marks, cap, ll_dot_reg_at(StrView { ptr: (p), len: (len) }, comma + 6, @be)) == 1
-        *(marks + dst) = 1
-
-# Emit one line, adding `, align 1` to a load/store through a packed register.
-fn packed_emit_line(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
-    var p: *u8 = p_sv.ptr
-    var len: i64 = p_sv.len
-    var is_access: i32 = (strview_starts_with_cstr(StrView { ptr: (p), len: (len) }, c"  store ")) as i32
-    if is_access == 0 and strview_starts_with_cstr(StrView { ptr: (p), len: (len) }, c"  %.")
-        let sp: i64 = scan_find(StrView { ptr: (p), len: (len) }, 4, 32)
-        if sp > 0 and strview_starts_with_cstr(StrView { ptr: (p + sp), len: (len - sp) }, c" = load ")
-            is_access = 1
-    if is_access == 1 and ll_has_align(StrView { ptr: (p), len: (len) }) == 0
-        let at: i64 = ll_last_ptr_operand(StrView { ptr: (p), len: (len) })
-        if at >= 0
-            var re: i64 = 0
-            if ll_is_packed_reg(marks, cap, ll_dot_reg_at(StrView { ptr: (p), len: (len) }, at, @re)) == 1
-                vec_push_bytes<u8>(s.out, Span<u8> { ptr: (p), len: (re) as i64 })
-                emit_str(s, c", align 1")
-                vec_push_bytes<u8>(s.out, Span<u8> { ptr: (p + re), len: (len - re) as i64 })
-                return
-    vec_push_bytes<u8>(s.out, Span<u8> { ptr: (p), len: (len) as i64 })
-
-fn align_packed_accesses(s: *EmitterState, body_start: i64)
-    if s.packed_types_emitted == 0
-        return   # no packed struct in this module: nothing to do
-    let n: i64 = s.out.len - body_start
-    if n <= 0
-        return
-    let cap: i32 = s.reg_counter + 1
-    let marks: *u8 = malloc(cap as i64)
-    memzero(marks, cap as i64)
-    let base: *u8 = malloc(n)
-    memcpy(base, s.out.data + body_start, n)
-    let end: *u8 = base + n
-    s.out.len = body_start
-    var p: *u8 = base
-    while p < end
-        let ll: i64 = scan_line_len(p, end)
-        packed_mark_gep(s, marks, cap, StrView { ptr: (p), len: (ll) })
-        packed_emit_line(s, marks, cap, StrView { ptr: (p), len: (ll) })
-        p = p + ll
-    free(base)
-    free(marks)
+# AGAST #4461: the generic line scanners the deferred-load splice uses live in
+# emitter_core (scan_find and friends); they were the deleted copy-scan
+# module's, and the copy rewrite that drove it is gone.  Packed-struct
+# alignment (#1918) is decided at instruction-emission time now (#4462); see
+# packed_mark / packed_marked in emitter_core.
 
 # AGAST #1737 — the CPU features an x86 ISA-extension intrinsic needs.
 #
@@ -812,6 +683,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     frame_begin_fn(s, f.line, f.col)   # AGAST #3739
     s.fn_assert_kind = assert_fn_kind(f)   # AGAST #1869
     s.reg_counter = 1
+    packed_marks_reset(s)   # AGAST #4462: register numbers restart per fn
     s.label_counter = 0
     # AGAST #1335 — the entry block is unlabelled; see ENTRY_BLOCK_LABEL.
     s.current_label = ENTRY_BLOCK_LABEL
@@ -1125,8 +997,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     splice_entry_allocas(s, body_start)          # AGAST #4460: static allocas into entry:
     refuse_huge_frame(s, f, body_start)          # AGAST #3739: before any rewrite
     own_end_fn(s)                                # AGAST #2158, #3508
-    splice_deferred_struct_loads(s)              # AGAST #4461: before align
-    align_packed_accesses(s, body_start)         # AGAST #1918
+    splice_deferred_struct_loads(s)              # AGAST #4461
     tag_intrinsic_target_features(s, attr_pos)   # AGAST #1737
     emit_str(s, c"}\n\n")
 
@@ -1155,6 +1026,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     frame_begin_fn(s, method.line, method.col)   # AGAST #3739
     s.fn_assert_kind = ASSERT_FN_PLAIN   # AGAST #1869: methods take no attributes
     s.reg_counter = 1
+    packed_marks_reset(s)   # AGAST #4462: register numbers restart per fn
     s.label_counter = 0
     # AGAST #1335 — the entry block is unlabelled; see ENTRY_BLOCK_LABEL.
     # Set BEFORE clear_last_expr below, which stamps last_expr_label with it.
@@ -1506,8 +1378,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     splice_entry_allocas(s, body_start)          # AGAST #4460: static allocas into entry:
     refuse_huge_frame(s, method, body_start)     # AGAST #3739: before any rewrite
     own_end_fn(s)                                # AGAST #2158, #3508
-    splice_deferred_struct_loads(s)              # AGAST #4461: before align
-    align_packed_accesses(s, body_start)         # AGAST #1918
+    splice_deferred_struct_loads(s)              # AGAST #4461
     tag_intrinsic_target_features(s, attr_pos)   # AGAST #1737
     emit_str(s, c"}\n\n")
 
@@ -1886,7 +1757,6 @@ fn emit_one_struct_type(s: *EmitterState, st: *StructDef)
     # `[[packed]]` (AGAST #1847): an LLVM packed struct, no padding.
     let packed: i32 = struct_is_packed(st)
     if packed == 1
-        s.packed_types_emitted = 1   # AGAST #1918: align_packed_accesses runs
         emit_str(s, c" = type <{")
     else
         emit_str(s, c" = type {")
@@ -4603,7 +4473,8 @@ pub fn emit_module(m: *Module, out: *Vec<u8>) -> i32
         wanted_cap: 0,
         print_helpers_used: 0,   # AGAST #1521 — see emit_print_helpers
         fmt_helpers_used: 0,   # AGAST #1824 — see emit_format_helpers
-        packed_types_emitted: 0,   # AGAST #1918 — see align_packed_accesses
+        packed_marks: null,   # AGAST #4462 — see packed_mark / packed_marked
+        packed_marks_cap: 0,
         narrow_params: null,
         narrow_decls: [NarrowDecl { name: null, name_len: 0, decl_type: 0, declared: 0, init: null }; 256],
         narrow_decl_count: 0,
