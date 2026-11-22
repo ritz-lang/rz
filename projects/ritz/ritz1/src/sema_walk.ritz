@@ -503,6 +503,7 @@ fn sema_bind_for(sm: *Sema, st: *Stmt)
 fn sema_bind_tuple(sm: *Sema, st: *Stmt)
     var tup: SemaTy
     sema_expr_ty(sm, st.var_init, @tup)
+    sema_tuple_pattern_check(sm, st, @tup)   # LARB R67, AGAST #3500
     var t: SemaTy
     sema_tuple_field_ty(sm, @tup, 0, @t)
     sema_bind_ty(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, @t, 0)
@@ -519,6 +520,40 @@ fn sema_bind_tuple(sm: *Sema, st: *Stmt)
         sema_tuple_inner_note(sm, @tup, i)
         tn = tn.next
         i += 1
+
+# LARB R67 (AGAST #3500): a `(…)` pattern destructures tuples only.  A named
+# struct is read by its fields: binding them by position silently rebinds
+# every name after a field is added.  A tuple's fields are named "0", "1", …,
+# so a struct-typed initialiser whose first field is not "0" is a named struct.
+# Reported at the `(`, worded as ritz0's let_rules.tuple_pattern_on_struct
+# (#3499); a generic's mangled `Pair$i32` names `Pair`.
+#
+# Sema can't type every initialiser (an Option/Result payload's `unwrap`, say):
+# the receiver sbk_receiver resolves still names the struct, and the emitter
+# binds by it.  Unjudged when that names none (a missed refusal, a parity gap).
+fn sema_tuple_pattern_check(sm: *Sema, st: *Stmt, tup: *SemaTy)
+    var name: *u8 = tup.name
+    var name_len: i32 = tup.name_len
+    var sd: *StructDef = null
+    if tup.kind == TYPE_STRUCT and name != null and name_len > 0
+        sd = sema_recv_struct(sm, tup)
+        if sd == null
+            return   # an enum, not a named struct
+    else
+        sbk_receiver(sm, st.var_init, @name, @name_len)
+        if name == null or name_len <= 0
+            return
+        sd = sema_find_struct(sm, StrView { ptr: (name), len: (name_len) as i64 })
+        if sd == null
+            return
+    if sd.fields != null and sd.fields.name_len == 1 and *sd.fields.name == '0'
+        return   # a tuple: its elements are fields "0", "1", ...
+    var len: i32 = name_len
+    var i: i32 = 0
+    while i < len and *(name + i) != '$'
+        i += 1
+    sm.error_count = sm.error_count + 1
+    diag_error_name(sema_file(sm), st.paren_span, c"`", StrView { ptr: (name), len: (i) as i64 }, c"` is a struct, not a tuple: read its fields")
 
 # AGAST #4428: a `**T` tuple element binds with its packed inner, so `**w`
 # (a `let (w, ..)` of a `(**u8, i32)`) loads a u8, as the emitter's binding

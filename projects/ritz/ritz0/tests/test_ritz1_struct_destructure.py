@@ -1,48 +1,67 @@
-"""AGAST #2574: `let (a, b) = <call>` destructures the struct the call returns.
+"""AGAST #2574/#3500: `let (a, b) = <named struct>` is refused (LARB R67).
 
     struct P / x: i16 / y: i16
     impl C
         pub fn tp(self: @C, a: i16) -> P
     let (a, b) = c.tp(3)        # ritz1: "cannot emit: unknown identifier 'a'"
 
-ritz1 took the struct's name from a FREE fn's return type only, so a method
-or static method call (`c.tp(3)`, `C.sm(5)`) found no struct and bound
-nothing: every later use of `a` / `b` was "unknown identifier", unlocated.
-On a free fn it bound both names as i64 but widened only i32 / u32 fields,
-so an i16 (or i8, f32, ...) field was stored into the i64 slot as it was and
-clang refused the IR.  angelo's font.ritz:112 hits both.
+#2574 taught ritz1 to bind each destructured name at its field's own type,
+from a free fn, a method, a static method, a local, a field, a global, a
+pointer's pointee, an array element, an `Option` payload, or an if / match
+block -- angelo's font.ritz:112 used the method form.
 
-Each name now gets its field's own type, the slot an annotated
-`let a: i16 = p.x` would get.  Each program returns the number of the
-first check that failed, so a red cell names the path.
+LARB R67 (LANGUAGE_SPEC §4.1) refuses the whole class: a `(…)` pattern
+destructures tuples only.  Binding a named struct's fields by position
+silently rebinds every name after a field is added to the struct.  ritz0
+refuses it at the `(` (#3499, test_tuple_pattern_tuples_only.py, and
+ritz0/let_rules.py's tuple_pattern_on_struct); #3500 makes ritz1 and
+ritz1_selfhosted say the same:
 
-LARB R67 refuses all of this: a `(…)` pattern destructures tuples only.
-ritz0 refuses it (test_tuple_pattern_tuples_only.py, AGAST #3499), so these
-rows run on ritz1 and ritz1_selfhosted alone, and the "ritz0 gives N" notes
-below are what it gave before.  #3500 turns them into ritz1's refusal rows.
+    `P` is a struct, not a tuple: read its fields
 
-The tuple return type `-> (i32, i32)` is #1526, not this ticket.
+Each row below is one of the paths above, now a located refusal at the `(`.
+A tuple still destructures: `test_a_tuple_still_destructures` is the boundary
+control here, and test_ritz1_tuple_destructure_n.py / test_ritz1_tuple_type.py
+hold the exhaustive tuple rows.
 """
+
+import re
 
 import pytest
 
 from test_ritz1_array_ptr_element import (  # noqa: F401  (fixtures)
     RITZ1S, compile_with, run_with)
 
-# (field type, k, v).  P is built as { x: v + k, y: v }.  The values differ
-# above the low byte and are negative where the type is signed, so a field
-# read at the wrong width or with the wrong extension fails a check.
-TYPES = {
-    "i8": ("-5", "-3"),
-    "u8": ("100", "50"),
-    "i16": ("-2", "-300"),
-    "u16": ("1000", "40000"),
-    "i32": ("-1", "-70000"),
-    "u32": ("1", "3000000000"),
-    "i64": ("-1", "-5000000000"),
-    "f32": ("0.25", "1.5"),
-    "f64": ("0.25", "-2.5"),
-}
+
+def _paren(program: str):
+    """1-based line and column of the first `let (`'s `(`."""
+    for line, text in enumerate(program.split("\n"), 1):
+        at = text.find("let (")
+        if at >= 0:
+            return line, at + len("let ") + 1
+    raise AssertionError("no `let (` in the program")
+
+
+def _refused(compile_with, compiler, name, program, structs):
+    """`program` is refused at the `(`, naming each struct in `structs`."""
+    comp, ll, _work = compile_with(compiler, name, program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted {name}:\n{out[-800:]}"
+    for struct in structs:
+        msg = f"`{struct}` is a struct, not a tuple: read its fields"
+        assert msg in out, f"{compiler} did not name `{struct}` for {name}:\n{out[-800:]}"
+    # The first refusal is at the first pattern's `(`.
+    line, col = _paren(program)
+    first = (rf"main\.ritz:{line}:{col}: error: `{re.escape(structs[0])}` "
+             rf"is a struct, not a tuple: read its fields")
+    assert re.search(first, out, re.M), f"{compiler} {name} not located at the `(`:\n{out[-800:]}"
+    assert "Traceback" not in out and "ValueError" not in out, out[-800:]
+    assert not ll.exists(), f"{compiler} wrote IR for {name}"
+
+
+# The initialiser's type no longer changes the outcome (every named struct is
+# refused), so one field type covers all four ways main gets its P.
+_TYPE = ("i16", "-2", "-300")   # (t, k, v): P is { x: v + k, y: v }
 
 # How main gets its P.  `c` is a C with k in it; the static method and the
 # free fn take k as an argument.
@@ -96,22 +115,20 @@ pub fn main() -> i32
 """
 
 
-def _program(ty: str, source: str) -> str:
-    k, v = TYPES[ty]
-    src = SOURCES[source].format(k=k, v=v)
-    return _PROGRAM.format(t=ty, k=k, v=v, src=src)
+def _program(source: str) -> str:
+    t, k, v = _TYPE
+    return _PROGRAM.format(t=t, k=k, v=v, src=SOURCES[source].format(k=k, v=v))
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("ty", sorted(TYPES))
 @pytest.mark.parametrize("source", sorted(SOURCES))
-def test_destructure_binds_each_field_at_its_type(run_with, source, ty, compiler):
-    assert run_with(compiler, f"{source}_{ty}", _program(ty, source)) == 0
+def test_destructuring_a_named_struct_is_refused(compile_with, source, compiler):
+    _refused(compile_with, compiler, f"{source}_{_TYPE[0]}", _program(source), ["P"])
 
 
 # The ticket's program, verbatim apart from the static method and free fn
-# rows: ritz0 prints 43 for the method form.
+# rows: ritz0 printed 43 for the method form.  All three patterns are refused.
 TICKET = """\
 struct P
     x: i16
@@ -141,13 +158,15 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-def test_ticket_program(run_with, compiler):
-    assert run_with(compiler, "ticket", TICKET) == 43 + 15 + 15
+def test_ticket_program(compile_with, compiler):
+    _refused(compile_with, compiler, "ticket", TICKET, ["P"])
+    comp, _ll, _work = compile_with(compiler, "ticket_count", TICKET)
+    out = comp.stdout + comp.stderr
+    assert out.count("`P` is a struct, not a tuple: read its fields") == 3, out[-800:]
 
 
-# Fields of different types: each name takes its own field's type, not the
-# first field's.  A struct field binds the struct, a pointer field its
-# pointee, and a bool field still reads as a condition.
+# Fields of different types; a struct field, a pointer field and a bool field.
+# M, N and B are each a named struct: each is refused, at its own `(`.
 MIXED = """\
 struct In
     u: i32
@@ -201,12 +220,12 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-def test_mixed_field_types(run_with, compiler):
-    assert run_with(compiler, "mixed", MIXED) == 0
+def test_mixed_field_types(compile_with, compiler):
+    _refused(compile_with, compiler, "mixed", MIXED, ["M", "N", "B"])
 
 
 # Places the struct lives other than a call: a field (through a chain, an
-# element and a call), a global, and a pointer's pointee.  ritz0 gives 20.
+# element and a call), a global, and a pointer's pointee.  Each is a P.
 PLACES = """\
 struct P
     x: i16
@@ -238,18 +257,15 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-def test_struct_from_a_field_global_or_pointer(run_with, compiler):
-    assert run_with(compiler, "places", PLACES) == 20
+def test_struct_from_a_field_global_or_pointer(compile_with, compiler):
+    _refused(compile_with, compiler, "places", PLACES, ["P"])
 
 
-# Inits whose struct is named by more than a call's or a local's type.  Each
-# was refused, located ("can't tell which struct"), or for the block forms did
-# not parse at all (#2594); ritz0 gives 7 for each.
-#   unwrap          an Option<P>'s payload, read at %P, not as an i64
-#   unwrap_or       a None's default: the select is on %P, not i64 (#2863)
+# Inits whose struct is named by more than a call's or a local's type.
+#   unwrap          an Option<P>'s payload (sema types it through the receiver)
+#   unwrap_or       a None's default, whose select is on %P
 #   chained_method  `c.me()` names the C `.tp(3)` is dispatched on
-#   match / if      a block init (angelo raster/fill.ritz:59): the arms' phi
-#                   names it; the grammar took a one-line init only
+#   match / if      a block init: the arms' phi names it
 _NAMED_PRE = """\
 import ritzlib.option
 
@@ -286,14 +302,13 @@ NAMED = {
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("name", sorted(NAMED))
-def test_named_struct_runs_like_ritz0(run_with, name, compiler):
+def test_named_struct_init_is_refused(compile_with, name, compiler):
     prog = _NAMED_PRE + NAMED[name] + "    return a + b\n"
-    assert run_with(compiler, f"named_{name}", prog) == 7
+    _refused(compile_with, compiler, f"named_{name}", prog, ["P"])
 
 
-# #2592: an element of a `[N]P` local, field or global is a `%P`, so it
-# destructures like any struct value.  These were refused ("can't tell which
-# struct") while the element read as an i64.  ritz0 gives 7 for each.
+# An element of a `[N]P` local, field or global is a `%P`, so it is refused
+# like any other struct value.
 INDEXED = {
     "local": "    var ps: [2]P\n    ps[1] = P { x: 1, y: 6 }\n"
              "    let (a, b) = ps[1]\n",
@@ -320,14 +335,12 @@ pub fn main() -> i32
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("name", sorted(INDEXED))
-def test_array_element_destructures(run_with, name, compiler):
+def test_array_element_destructures_is_refused(compile_with, name, compiler):
     prog = _INDEXED_PRE + INDEXED[name] + "    return a + b\n"
-    assert run_with(compiler, f"indexed_{name}", prog) == 7
+    _refused(compile_with, compiler, f"indexed_{name}", prog, ["P"])
 
 
-# #2594: an array field binds an array local, a copy of the field, indexed at
-# its element's width.  Field 0 from a call's result; field 1, an i16 array
-# with a value negative above the low byte, from a local.  ritz0 gives 7.
+# An array field, from a call's result and from a local.
 ARRAY_FIELD = """\
 struct P
     x: [2]i32
@@ -357,12 +370,12 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-def test_array_field_runs_like_ritz0(run_with, compiler):
-    assert run_with(compiler, "array_field", ARRAY_FIELD) == 7
+def test_array_field_runs_like_ritz0(compile_with, compiler):
+    _refused(compile_with, compiler, "array_field", ARRAY_FIELD, ["Q", "P"])
 
 
-# A field ritz1 still can't bind (`@` here; `@&` and fn-typed are refused
-# the same way) is refused, located.  ritz0 ran it (7) before R67.
+# A `@` field was refused by the emitter before R67; the pattern is now
+# refused earlier, at the `(`, like every other named struct.
 REF_FIELD = """\
 struct Q
     r: @i32
@@ -379,17 +392,11 @@ pub fn main() -> i32
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 def test_ref_field_is_a_located_error(compile_with, compiler):
-    comp, _ll, _work = compile_with(compiler, "ref_field", REF_FIELD)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, out
-    assert ":8:5: error: ritz1 can't destructure a field of this type" in out, out
+    _refused(compile_with, compiler, "ref_field", REF_FIELD, ["Q"])
 
 
-# #3217: a destructured field widens by its field's type.  ritz0 bound each
-# name at its bare LLVM type, so a u8 (or u16) field widened signed: 200 read
-# as -56.  An i8 must still widen signed (-5, not 251).  Each value has its
-# top bit set, so a wrong extension changes it.  `G<T>` is a generic struct,
-# whose fields live under the specialization's mangled name.
+# A generic struct: the refusal names the struct without its type arguments
+# (`G`, not `G$u8`).  `G<T>` is specialised by monomorph before sema sees it.
 _WIDEN = """\
 struct P
     a: {t}
@@ -418,9 +425,9 @@ WIDEN = {"u8": "200", "i8": "-5", "u16": "40000"}
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("ty", sorted(WIDEN))
-def test_destructured_field_widens_by_its_type(run_with, ty, compiler):
+def test_destructured_field_widens_by_its_type(compile_with, ty, compiler):
     prog = _WIDEN.format(t=ty, v=WIDEN[ty])
-    assert run_with(compiler, f"widen_{ty}", prog) == 13
+    _refused(compile_with, compiler, f"widen_{ty}", prog, ["P", "G"])
 
 
 # The ticket's program, verbatim.
@@ -440,5 +447,53 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-def test_ticket_3217_program(run_with, compiler):
-    assert run_with(compiler, "ticket_3217", TICKET_3217) == 11
+def test_ticket_3217_program(compile_with, compiler):
+    _refused(compile_with, compiler, "ticket_3217", TICKET_3217, ["P"])
+
+
+# The boundary: a tuple (a nameless tuple literal, a fn's tuple return, and a
+# tuple whose element is a named struct) still destructures and runs.
+TUPLE_CONTROLS = {
+    "literal_pair": """\
+pub fn main() -> i32
+    let (a, b) = (1, 2)
+    if (a + b) as i32 != 3
+        return 1
+    0
+""",
+    "call_pair": """\
+fn two() -> (i32, i64)
+    (3, -5000000000)
+
+pub fn main() -> i32
+    let (a, b) = two()
+    if a != 3
+        return 1
+    if b != -5000000000
+        return 2
+    0
+""",
+    "named_element": """\
+struct P
+    x: i32
+    y: i32
+
+fn two() -> (P, u8)
+    (P { x: 1, y: 2 }, 200)
+
+pub fn main() -> i32
+    let (p, k) = two()
+    if p.y != 2
+        return 1
+    if k != 200
+        return 2
+    0
+""",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("name", sorted(TUPLE_CONTROLS))
+def test_a_tuple_still_destructures(run_with, name, compiler):
+    assert run_with(compiler, f"tuple_{name}", TUPLE_CONTROLS[name]) == 0

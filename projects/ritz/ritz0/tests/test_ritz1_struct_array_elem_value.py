@@ -10,18 +10,21 @@ emit_expr_index's local-array arm read every element as `[N x i64]` /
 `load i64`, so an annotated copy stored an i64 into a %P slot and an
 inferred `let` had no struct type to bind.  The global (#1553) and field
 (#188) arms already loaded `%P`; the local one now does too, and an inferred
-`let` takes the element's struct.  `let (a, b) = ps[1]` (#2574) names its
+`let` takes the element's struct.  `let (a, b) = ps[1]` (#2574) named its
 struct through index_elem_struct_name.
 
-ritz0 is the oracle: every row runs on all three compilers and must exit 0,
-except the destructure form, which ritz0 refuses under LARB R67.  Each
+ritz0 is the oracle: each read-by-value row runs on all three compilers and
+must exit 0.  The destructure form is refused on every compiler under LARB
+R67 (#3499 / #3500): a `(…)` pattern destructures tuples only, so the
+element's `let (a, b)` is a located refusal at its `(`, not a read.  Each
 program returns the number of the first check that failed.
 """
 
 import pytest
 
 from test_ritz1_array_ptr_element import (  # noqa: F401  (fixtures)
-    COMPILERS, run_with)
+    COMPILERS, RITZ1S, compile_with, run_with)
+from test_ritz1_struct_destructure import _refused
 
 # (field type, v0, v1).  Distinct above the low byte and negative where the
 # type is signed, so a read at the wrong width or stride fails a check.
@@ -63,14 +66,17 @@ FORMS = {
     let p = {a}[1]
     let q = {a}[k]
 """,
-    # #2574's destructure, rebuilt into a P so the checks below are shared.
-    "destructure": """\
+}
+
+# #2574's destructure, rebuilt into a P so the checks below are shared.  LARB
+# R67 now refuses it (see test_destructure_form_is_refused), so it is not a
+# read row.
+DESTRUCTURE_FORM = """\
     let (px, py) = {a}[1]
     let (qx, qy) = {a}[k]
     let p = P {{ x: px, y: py }}
     let q = P {{ x: qx, y: qy }}
-""",
-}
+"""
 
 _CHECKS = """\
     if p.x != {v1}
@@ -88,17 +94,18 @@ _CHECKS = """\
 
 
 def _program(holder: str, ty: str, form: str) -> str:
+    return _with_body(holder, ty, FORMS[form])
+
+
+def _with_body(holder: str, ty: str, body_tmpl: str) -> str:
     a, pre, setup = HOLDERS[holder]
     v0, v1 = TYPES[ty]
-    body = (FORMS[form] + _CHECKS).format(a=a, v0=v0, v1=v1)
+    body = (body_tmpl + _CHECKS).format(a=a, v0=v0, v1=v1)
     return _PROGRAM.format(t=ty, a=a, pre=pre, setup=setup, v0=v0, v1=v1,
                            body=body)
 
 
-# LARB R67: ritz0 refuses the destructure form (a `(…)` pattern on a struct,
-# test_tuple_pattern_tuples_only.py); ritz1 still runs it until #3500.
-FORM_ROWS = [(form, compiler) for form in sorted(FORMS) for compiler in COMPILERS
-             if (form, compiler) != ("destructure", "ritz0")]
+FORM_ROWS = [(form, compiler) for form in sorted(FORMS) for compiler in COMPILERS]
 
 
 @pytest.mark.integration
@@ -108,6 +115,17 @@ FORM_ROWS = [(form, compiler) for form in sorted(FORMS) for compiler in COMPILER
 def test_struct_element_by_value(run_with, holder, ty, form, compiler):
     assert run_with(compiler, f"{holder}_{ty}_{form}",
                     _program(holder, ty, form)) == 0
+
+
+# LARB R67 (#3500): `let (a, b) = ps[1]` destructures the element P by
+# position, which is refused at the `(` now that it is a named struct.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("ty", sorted(TYPES))
+@pytest.mark.parametrize("holder", sorted(HOLDERS))
+def test_destructure_form_is_refused(compile_with, holder, ty, compiler):
+    _refused(compile_with, compiler, f"{holder}_{ty}_destructure",
+             _with_body(holder, ty, DESTRUCTURE_FORM), ["P"])
 
 
 # Fields of mixed widths: i8, i16 and f32 in one struct, so the element's

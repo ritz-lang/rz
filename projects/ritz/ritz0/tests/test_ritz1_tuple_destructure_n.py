@@ -26,9 +26,8 @@ One per path that reads the names, each able to fail on its own:
   * a call's tuple, by the emitter, with a u8 element (widened unsigned) and
     four names (a tail of two);
   * `_` among them, in the tail and before it;
-  * a tuple local and a named struct (positional; ritz0 refuses the
-    struct under LARB R67, so that row is ritz1's until #3500);
-  * a literal, and if / match arms of literals: tuple_split_decl;
+  * a tuple local, a literal, and if / match arms of literals:
+    tuple_split_decl;
   * an if arm with a statement before its tuple: the emitter's if path;
   * a generic fn's `(T, T, T)`;
   * refusals: a name repeated in the tail (binder_check), and a tuple with
@@ -70,7 +69,6 @@ RUNS = {
     "placeholders": ("let (_, w) = g()\nlet (_, _, q) = g3(5)\nlet (v, _, _) = g3(3)\n"
                      "return w + q as i32 + v", 207),
     "tuple_local": ("let t: (i32, i32, i32) = (4, 5, 6)\nlet (a, b, c) = t\nreturn a * 100 + b * 10 + c", 456 % 256),
-    "named_struct": ("let p: P = P { a: 1, b: 2, c: 3 }\nlet (pa, pb, pc) = p\nreturn pa * 100 + pb * 10 + pc", 123),
     "literal": ("let (m0, m1, m2) = (1, 2, 3)\nreturn (m0 * 100 + m1 * 10 + m2) as i32", 123),
     "if_literals": ("let k: i32 = 1\nlet (a, _, c) = if k == 1\n    (10, 20, 30)\nelse\n    (40, 50, 60)\n"
                     "return (a + c) as i32", 40),
@@ -97,10 +95,10 @@ def _program(body: str) -> str:
     return FNS + EXTRA + "pub fn main() -> i32\n" + "".join(f"    {ln}\n" for ln in body.splitlines())
 
 
-# LARB R67: ritz0 refuses `named_struct` (a `(…)` pattern on a struct,
-# test_tuple_pattern_tuples_only.py); ritz1 still runs it until #3500.
-RUN_ROWS = [(compiler, name) for compiler in COMPILERS for name in sorted(RUNS)
-            if (compiler, name) != ("ritz0", "named_struct")]
+# LARB R67: every compiler refuses a `(…)` pattern on a named struct
+# (test_tuple_pattern_tuples_only.py for ritz0, test_ritz1_struct_destructure.py
+# for ritz1 and ritz1_selfhosted since #3500).  This file's rows are tuples.
+RUN_ROWS = [(compiler, name) for compiler in COMPILERS for name in sorted(RUNS)]
 
 
 @pytest.mark.integration
@@ -142,3 +140,14 @@ def test_more_names_than_elements_is_refused(compile_with, compiler):
                    "a field for each name", (1, 1))
     # Every name is still bound (a placeholder), so `c` is no second error.
     assert out.count("error") == 1, out[-1000:]
+
+
+# LARB R67 (AGAST #3500): a named struct is read by its fields, not by
+# position; the refusal is at the pattern's `(`.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+def test_a_named_struct_is_refused(compile_with, compiler):
+    _refused(compile_with, compiler, "named_struct",
+             "let p: P = P { a: 1, b: 2, c: 3 }\nlet (pa, pb, pc) = p\n"
+             "return pa * 100 + pb * 10 + pc",
+             "`P` is a struct, not a tuple: read its fields", (2, 5))

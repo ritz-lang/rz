@@ -14,32 +14,35 @@ registered or specialised, and the emitter found no `mk$i16`. `let p = ...`
 worked because LetStmt was walked. ritz1 ran the tuple form.
 
 Each program checks a generic free fn and a generic impl's method with i16,
-i64 and f32, and returns 0 or the failing check.  Under LARB R67 ritz0
-refuses them (a `(…)` pattern on a struct), so they run on ritz1 and
-ritz1_selfhosted only; ritz0's #2593 path is test_tuple_pattern_tuples_only.py's
-`three_in_generic` row, a generic call returning a tuple.
+i64 and f32, and returns 0 or the failing check.  Under LARB R67 every one of
+them is refused: the initialiser is a `Pair<T>` / `Tagged<T>`, a named
+struct, and a `(…)` pattern destructures tuples only.  ritz0 refused them
+since #3499 (test_tuple_pattern_tuples_only.py); #3500 makes ritz1 and
+ritz1_selfhosted refuse them too, at the `(`, so these rows pin that refusal.
+The generic call's own path is still exercised as a tuple by
+test_tuple_pattern_tuples_only.py's `three_in_generic` row.
 """
 
 from pathlib import Path
 
 import pytest
 
-from test_borrow_param_ref_field import _run
+from test_borrow_param_ref_field import _compile
+from test_ritz1_struct_destructure import _refused
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
-# LARB R67: every program here destructures a struct, which ritz0 now refuses
-# (test_tuple_pattern_tuples_only.py covers its generic and tuple paths).
-# ritz1 still runs them until #3500 refuses them too.
+# LARB R67: every program here destructures a named struct, refused on ritz1
+# and ritz1_selfhosted since #3500 (ritz0 since #3499).
 COMPILERS = ["ritz1", "ritz1_selfhosted"]
 
 
 @pytest.fixture
-def run_with(ritz1_bin, tmp_path):
+def compile_with(ritz1_bin, tmp_path):
     bins = {"ritz1": ritz1_bin, "ritz1_selfhosted": SELFHOSTED_BIN}
 
     def go(compiler, name, program):
-        return _run("ritz1", bins[compiler], tmp_path, name, program)
+        return _compile("ritz1", bins[compiler], tmp_path, name, program)
     return go
 
 
@@ -149,9 +152,15 @@ PROGRAMS["briefing"] = PRELUDE + (
     "    let (a, b) = mk<i16>(-300, 2)\n"
     "    if (a + b + 400) as i32 != 102\n        return 1\n    return 0\n")
 
+# The struct each refusal names: `tag()` returns a Tagged<T>, the rest a
+# Pair<T>.  A generic's mangled name is reported without its arguments.
+STRUCT = {"chained_other_struct_i16": "Tagged", "chained_other_struct_i64": "Tagged",
+          "chained_other_struct_f32": "Tagged"}
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_let_tuple_of_generic_call(run_with, compiler, name):
-    assert run_with(compiler, name, PROGRAMS[name]) == 0
+def test_let_tuple_of_generic_call(compile_with, compiler, name):
+    _refused(compile_with, compiler, name, PROGRAMS[name],
+             [STRUCT.get(name, "Pair")])
