@@ -6,10 +6,11 @@ ritz0's lowering (ritz0/async_transform_v2.py, emitter_llvmlite.py
 _transform_async_functions / _emit_await) as ritz1/src/async_lower.ritz, an
 AST-to-AST pass the driver runs once before any check:
 
-  * `async fn f(p..) -> T` becomes `struct f_Future { __state, p.., the
-    locals }`, a constructor `f(p..) -> f_Future` and `f_poll(self:
-    *f_Future) -> i32` (-1 is Pending);
-  * `async fn main` becomes `__main_future` + `main_poll`, and a sync `main`
+  * `async fn f(p..) -> T` becomes `struct f$Future { __state, p.., the
+    locals }`, a constructor `f(p..) -> f$Future` and `f$poll(self:
+    *f$Future) -> i32` (-1 is Pending); `$` is not an identifier character
+    (AGAST #3606), so no source can name either;
+  * `async fn main` becomes `main$Future` + `main$poll`, and a sync `main`
     polls it to completion;
   * `await g(..)` outside an async fn drives g's future to completion in place;
   * a bare call to an async fn is refused (LANGUAGE_SPEC §16.2, #1395).
@@ -97,8 +98,8 @@ RUNS = {
                                   "    a * 10 + b\n"), 114),
     # Pending propagates out of the poll (false); the executor polls again,
     # and reads the value from the future once the poll is true (R78, #3728).
-    "pending_polled_by_hand": (_TICK + _main("    var f: waits_Future = waits()\n    var polls: i32 = 1\n"
-                                             "    while !waits_poll(@f)\n        polls = polls + 1\n"
+    "pending_polled_by_hand": (_TICK + _main("    var f = waits()\n    var polls: i32 = 1\n"
+                                             "    while !future_poll(@&f)\n        polls = polls + 1\n"
                                              "    f.__result + polls * 50\n"), 181),
     # `await` in a sync fn polls until Ready.
     "pending_awaited_in_sync_fn": (_TICK + _main("    let v: i32 = await waits()\n    v + g_n\n"), 34),
@@ -130,7 +131,8 @@ RUNS = {
     "pub_and_attributed": ("pub async fn f() -> i32\n    1\n\n[[inline]]\nasync fn a() -> i32\n    2\n\n"
                            + _main("    let x: i32 = await f()\n    let y: i32 = await a()\n    x + y\n"), 3),
     # The future is a value: an executor keeps it and polls it.
-    "future_kept": ("async fn f()\n    pass\n\n" + _main("    var p: f_Future = f()\n    f_poll(@p)\n    5\n"), 5),
+    "future_kept": ("async fn f()\n    pass\n\n"
+                    + _main("    var p = f()\n    future_poll(@&p)\n    5\n"), 5),
     # `await` of a sync fn is its call, in a sync fn, and in a match arm.
     "await_sync_fn": ("fn h() -> i32\n    1\n\nfn k() -> i32\n    let v: i32 = await h()\n    v\n\n"
                       "fn m() -> i32\n    match h()\n        1 => 3\n        _ => await h()\n\n"
@@ -155,7 +157,7 @@ REFUSALS = {
     "bare_call_in_typed_let": (
         "async fn ready() -> i32\n    42\n\nfn main() -> i32\n    let v: i32 = ready()\n    v\n", (5, 5),
         "`v` is declared `i32` but `ready(...)` is an async fn call, which without `await` "
-        "is its future `ready_Future`: write `await ready(...)`"),
+        "is its future: write `await ready(...)`"),
 }
 
 
@@ -189,39 +191,70 @@ def test_bare_async_call_refused_as_ritz0(ritz1_bin, tmp_path, name):
             assert re.search(rf":{line}:{col}: error: ", errors[0]), res.stderr
 
 
+IMPORTED_A = ("pub async fn fetch(x: i32) -> i32\n    x + 1\n\n"
+              "pub async fn go(x: i32) -> i32\n    let a: i32 = await fetch(x)\n"
+              "    let b: i32 = await fetch(a)\n    b\n")
+IMPORTED_MAIN = "import a\n\nasync fn main() -> i32\n    let r: i32 = await go(40)\n    r\n"
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 def test_imported_async_fn_runs_as_ritz0(ritz1_bin, tmp_path, compiler):
     """#3726: an imported async fn is declared in its importer, defined in its
-    file.  The importer allocates its future, so it lays it out from the fn's
-    body as the defining file does: `go_Future` holds the header (__poll,
+    file; awaiting it across the import answers 42."""
+    assert _run_pkg(compiler, tmp_path, "imp_async", IMPORTED_MAIN,
+                    {"a.ritz": IMPORTED_A}) == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+def test_imported_async_fn_future_layout_matches_definition(ritz1_bin, tmp_path, compiler):
+    """The importer allocates the imported future, so it lays `go$Future` out
+    from the fn's body as the defining file does: the header (__poll,
     __state; LARB R79), __result (R78, #3728), x, a and b, and the two
-    `fetch_Future`s it awaits (#3727), each the header, __result and x (80
-    bytes), which an import stripped to its interface would not know."""
-    extra = {"a.ritz": "pub async fn fetch(x: i32) -> i32\n    x + 1\n\n"
-                       "pub async fn go(x: i32) -> i32\n    let a: i32 = await fetch(x)\n"
-                       "    let b: i32 = await fetch(a)\n    b\n"}
-    program = "import a\n\nasync fn main() -> i32\n    let r: i32 = await go(40)\n    r + sizeof(go_Future) as i32\n"
-    assert _run_pkg(compiler, tmp_path, "imp_async", program, extra) == 122
+    `fetch$Future`s it awaits (#3727), each the header, __result and x, which
+    an import stripped to its interface would not know."""
+    (tmp_path / "a.ritz").write_text(IMPORTED_A)
+    (tmp_path / "main.ritz").write_text(IMPORTED_MAIN)
+    env = dict(os.environ, RITZ_PATH=f"{tmp_path}:{RITZ_ROOT}")
+    irs = {}
+    for src, tag in (("a.ritz", "defining"), ("main.ritz", "importer")):
+        out = tmp_path / f"{tag}.ll"
+        if compiler == "ritz0":
+            res = run_ritz0([src, "-o", str(out), "--no-runtime"],
+                            cwd=tmp_path, env=env, timeout=300)
+        else:
+            res = subprocess.run(
+                [str(RITZ1_BIN), src, "-o", str(out), "-I", str(tmp_path),
+                 "-I", str(RITZ_ROOT)], cwd=tmp_path, env=env,
+                capture_output=True, text=True, timeout=300)
+        assert res.returncode == 0, (compiler, res.stderr)
+        irs[tag] = out.read_text()
+    assert _future_fields(irs["defining"], "go$Future") == \
+        _future_fields(irs["importer"], "go$Future")
 
 
 def _future_fields(ll: str, name: str) -> list:
-    """`name`'s LLVM struct fields, module prefixes dropped: ritz1 names a
-    struct `%"struct.ritz_module_1.X"`, ritz0 `%X`.  A fn pointer is `ptr`
+    """`name`'s LLVM struct fields, module prefixes dropped: ritz0 names a
+    struct `%"struct.ritz_module_1.X"`, ritz1 `%X`.  A fn pointer is `ptr`
     in ritz1 (opaque pointers) and spelled out in ritz0's IR, so both are
-    reduced to `ptr`."""
-    m = re.search(rf'^%"?(?:struct\.\w+\.)?{name}"? = type \{{(.*)\}}$', ll, re.MULTILINE)
+    reduced to `ptr`.  A generated name's `$` must not act as a regex anchor,
+    hence `re.escape`."""
+    m = re.search(rf'^%"?(?:struct\.\w+\.)?{re.escape(name)}"? = type \{{(.*)\}}$',
+                  ll, re.MULTILINE)
     assert m, f"no {name} in the module"
-    return [re.sub(r'i1 \(i8\*\)\*', 'ptr',
-                   re.sub(r'%"?(?:struct\.\w+\.)?(\w+)"?', r"%\1", f.strip()))
-            for f in m.group(1).split(",")]
+    fields = []
+    for f in m.group(1).split(","):
+        f = re.sub(r'%"?(?:struct\.\w+\.)?', "%", f.strip()).replace('"', "")
+        fields.append(re.sub(r'i1 \(i8\*\)\*', 'ptr', f))
+    return fields
 
 
 @pytest.mark.integration
 def test_if_operand_future_layout_as_ritz0(ritz1_bin, tmp_path):
     """#4190: an awaiting `if` operand's `__if_K` field comes after its
     condition's fields, as the arms' do after it, in both compilers: the
-    same `go_Future`, field for field, beside `__for_K` and `__short_K`."""
+    same `go$Future`, field for field, beside `__for_K` and `__short_K`."""
     program = (_DBL + "async fn go(n: i32) -> i32\n    var s: i32 = 0\n    for i in 0..n\n"
                "        s += 1 + if i > 0 && (await dbl(i)) > 2 then "
                "100 + (if i == 2 then await dbl(5) else await dbl(20)) else 0\n    s\n\n"
@@ -230,7 +263,7 @@ def test_if_operand_future_layout_as_ritz0(ritz1_bin, tmp_path):
     for compiler in ("ritz0", "ritz1"):
         res = _compile(compiler, tmp_path, program)
         assert res.returncode == 0, (compiler, res.stdout, res.stderr)
-        layouts.append(_future_fields((tmp_path / f"m_{compiler}_{compiler}.ll").read_text(), "go_Future"))
+        layouts.append(_future_fields((tmp_path / f"m_{compiler}_{compiler}.ll").read_text(), "go$Future"))
     assert layouts[0] == layouts[1]
 
 
@@ -239,8 +272,9 @@ PRIVATE_ASYNC_CALLERS = {
     "await": ("import a\n\nasync fn main() -> i32\n    let v: i32 = await fetch(41)\n    v\n",
               "4:24"),
     # A bare call is the constructor; ritz0 crashed on its dummy span (#3925).
-    "bare": ("import a\n\nfn main() -> i32\n    let f: fetch_Future = fetch(41)\n    0\n",
-             "4:27"),
+    # The generated future is unspellable (#3606), so it is held untyped.
+    "bare": ("import a\n\nfn main() -> i32\n    var f = fetch(41)\n    0\n",
+             "4:13"),
 }
 
 
@@ -275,18 +309,20 @@ def test_private_async_fn_refused_once(ritz1_bin, tmp_path, caller):
 
 
 @pytest.mark.integration
-def test_private_async_fn_poll_is_exempt(ritz1_bin, tmp_path):
-    """The generated `fetch_poll` has no declaration of its own: neither
-    compiler refuses a cross-file call to it, and ritz0 no longer crashes
-    on its spanless definition (#3925)."""
+def test_private_async_fn_poll_is_not_callable(ritz1_bin, tmp_path):
+    """`fetch_poll` is unspellable now (AGAST #3606), so a cross-file call to
+    it is an ordinary undefined function in both compilers, not a privacy
+    refusal for a generated fn."""
     pkg = tmp_path / "priv"
     (pkg / "src").mkdir(parents=True)
     (pkg / "src" / "a.ritz").write_text("async fn fetch(x: i32) -> i32\n    x + 1\n")
     (pkg / "src" / "main.ritz").write_text(
-        "import a\n\nfn main() -> i32\n    fetch_poll(0 as *fetch_Future) as i32\n")
+        "import a\n\nfn main() -> i32\n    fetch_poll(0) as i32\n")
     for compiler in ("ritz0", "ritz1"):
         res = _compile_file(compiler, tmp_path, pkg / "src" / "main.ritz")
-        assert res.returncode == 0, (compiler, res.stderr)
+        assert res.returncode != 0, (compiler, res.stderr)
+        assert re.search(r"(?i)(undefined|unknown) function:? `?fetch_poll", res.stderr), \
+            (compiler, res.stderr)
 
 
 @pytest.mark.integration

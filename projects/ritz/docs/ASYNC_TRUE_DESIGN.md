@@ -58,6 +58,10 @@ An async function becomes:
 - A struct holding state and locals
 - A `poll()` function that switches on state
 
+> AGAST #3606: the real generated names are `add_values$Future` and
+> `add_values$poll`. `$` is not an identifier character, so they are
+> unspellable in source; this historical sketch writes `_` for readability.
+
 ```ritz
 # Source:
 async fn add_values(x: i32) -> i32

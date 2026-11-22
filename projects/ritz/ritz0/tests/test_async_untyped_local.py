@@ -3,7 +3,7 @@
 In an `async fn` with an `await`, every local lives in the fn's future struct
 (async_transform_v2).  An untyped local's type was None, so the struct got no
 field for it while the constructor still set one, and ritz0 died with a Python
-traceback, `ValueError: Unknown field y in struct go_Future`.  #1318 typed only
+traceback, `ValueError: Unknown field y in struct go$Future`.  #1318 typed only
 `let v = await f(x)`, as the poll's i32.
 
 The transform runs before emission, so it infers the local's type from what it
@@ -31,7 +31,7 @@ _FETCH = "async fn fetch(x: i32) -> i32\n    x\n\n"
 _TWICE = "fn twice(n: i32) -> i32\n    n * 2\n\n"
 _PAIR = "struct Pair\n    a: i32\n    b: i32\n\n"
 # One poll: true with the value in `__result` (LARB R78, #3728); 99 if Pending.
-_MAIN = ("pub fn main() -> i32\n    var f: go_Future = go(7)\n    if go_poll(@f)\n"
+_MAIN = ("pub fn main() -> i32\n    var f = go(7)\n    if future_poll(@&f)\n"
          "        return f.__result\n    99\n")
 
 
@@ -48,7 +48,7 @@ def _type_name(ty) -> str:
 
 
 def _future_fields(body: str, params: str = "x: i32") -> dict:
-    """go_Future's fields, name -> type, as the emitter's transform builds it."""
+    """go$Future's fields, name -> type, as the emitter's transform builds it."""
     module = parse(_go(body, params), "main.ritz")
     fns = {item.name: item for item in module.items if isinstance(item, rast.FnDef)}
     sm = generate_state_machine(fns["go"], {"fetch", "go"}, fns)
@@ -77,7 +77,7 @@ TYPES = {
     "cast": ("    let y = x as u8\n" + _AWAIT, "y", "u8"),
     "call_return_type": ("    let y = twice(x)\n" + _AWAIT, "y", "i32"),
     # A bare async call is the callee's future (AGAST #1395).
-    "async_call_is_future": ("    var y = fetch(x)\n" + _AWAIT, "y", "fetch_Future"),
+    "async_call_is_future": ("    var y = fetch(x)\n" + _AWAIT, "y", "fetch$Future"),
     # An earlier untyped local's inferred type flows on.
     "local_of_local": ("    let y = x as u16\n    let z = y\n" + _AWAIT, "z", "u16"),
     "param_pointer": ("    let y = p\n    let v: i32 = await fetch(0)\n    v\n", "y", "*i32", "p: *i32"),
@@ -92,7 +92,7 @@ TYPES = {
 def test_untyped_async_local_takes_its_values_type(name):
     body, local, want, *params = TYPES[name]
     fields = _future_fields(body, *params)
-    assert fields.get(local) == want, f"{name}: go_Future fields {fields}"
+    assert fields.get(local) == want, f"{name}: go$Future fields {fields}"
 
 
 @pytest.mark.unit
@@ -102,7 +102,7 @@ def test_untyped_local_without_an_await_needs_no_type():
     assert "y" not in _future_fields("    let y = p.a\n    y\n", "p: Pair")
 
 
-# The ticket's program now compiles: go_Future has its `y`.
+# The ticket's program now compiles: go$Future has its `y`.
 @pytest.mark.integration
 @pytest.mark.batched
 def test_ticket_program_compiles(tmp_path):

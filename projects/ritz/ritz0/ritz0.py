@@ -467,7 +467,7 @@ def _fn_cache(ctx: _Compile) -> tuple:
         # consulted the cache for it (source fns carry `source_file` and
         # are always emitted).  Its body was skipped, `_splice_cached_ir`
         # failed to match the `... "no-builtins"` declare, and a warm
-        # recompile shipped `f_poll` with `f` only declared — a link
+        # recompile shipped `f$poll` with `f` only declared — a link
         # failure that build.py's shared CAS then kept for every worktree.
         # Splicing can't be byte-identical to a cold compile in any case:
         # a cached block's `!dbg !N` ids belong to the compile that wrote

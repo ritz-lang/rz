@@ -3,13 +3,16 @@ True Async Function Transformation for ritz0 (v2)
 
 An async fn becomes three items:
 
-    struct fetch_Future             # the header (FUTURE_HEADER: the poll fn
+    struct fetch$Future             # the header (FUTURE_HEADER: the poll fn
         __poll: fn(*u8) -> bool     # first, then the state, -1 once finished),
         __state: i32                # __result (the fn's declared type; none
         __result: i32               # for a unit fn), the params, every local,
         ...                         # and each awaited future / await result
-    fn fetch(x: i32) -> fetch_Future             # the future in state 0
-    fn fetch_poll(self: *fetch_Future) -> bool   # true once Ready
+    fn fetch(x: i32) -> fetch$Future             # the future in state 0
+    fn fetch$poll(self: *fetch$Future) -> bool   # true once Ready
+
+(`$` is not an identifier character, so no source can spell these names:
+AGAST #3606.  The doc's examples write them as the compiler does.)
 
 A poll answers `bool` (LARB R78, AGAST #3728): false while Pending, true once
 the body has finished, having stored its value in `__result`.  `await` polls
@@ -33,7 +36,7 @@ dispatch loop over them:
             i += 1
         s
 
-    fn sum_to_poll(self: *sum_to_Future) -> bool
+    fn sum_to$poll(self: *sum_to$Future) -> bool
         while true
             if (*self).__state == 0           # entry
                 (*self).s = 0
@@ -48,7 +51,7 @@ dispatch loop over them:
                 (*self).__state = 3
                 continue
             if (*self).__state == 3           # resume point: poll it
-                if !dbl_poll(@(*self).__future_0)
+                if !dbl$poll(@(*self).__future_0)
                     return false              # Pending: resume here next poll
                 (*self).s = (*self).s + (*self).__future_0.__result
                 (*self).i = (*self).i + 1
@@ -67,6 +70,33 @@ from dataclasses import dataclass, field, fields
 from typing import List, Dict, Set, Optional, Tuple
 import ritz_ast as rast
 from const_eval import fold_literal_i64
+
+
+# The names of the items an async fn generates.  `$` is not an identifier
+# character (lexer.py: DOLLAR_OUTSIDE_ASM), so no Ritz source can spell them:
+# they are the compiler's alone and can't clash with a user's `fetch_poll` or
+# `fetch_Future` (AGAST #3606).  The spelling lives here and nowhere else.
+FUTURE_SUFFIX = '$Future'
+POLL_SUFFIX = '$poll'
+
+
+def future_type_name(fn_name: str) -> str:
+    """`async fn fetch`'s generated future type: `fetch$Future`."""
+    return fn_name + FUTURE_SUFFIX
+
+
+def poll_fn_name(fn_name: str) -> str:
+    """`async fn fetch`'s generated poll fn: `fetch$poll`."""
+    return fn_name + POLL_SUFFIX
+
+
+def async_fn_of_future_type(name: str) -> Optional[str]:
+    """The async fn whose generated future `name` is, or None.
+
+    Only this module's own inferences produce such a name; no source can."""
+    if name.endswith(FUTURE_SUFFIX):
+        return name[:-len(FUTURE_SUFFIX)]
+    return None
 
 
 @dataclass
@@ -125,9 +155,12 @@ def held_future_fn(expr: rast.Expr, local_types: Dict[str, Optional[rast.Type]],
     if not isinstance(expr, rast.Ident):
         return None
     ty = local_types.get(expr.name)
-    if not isinstance(ty, rast.NamedType) or ty.args or not ty.name.endswith('_Future'):
+    if not isinstance(ty, rast.NamedType) or ty.args:
         return None
-    fn = fn_sigs.get(ty.name[:-len('_Future')])
+    fn_name = async_fn_of_future_type(ty.name)
+    if fn_name is None:
+        return None
+    fn = fn_sigs.get(fn_name)
     return fn if fn is not None and fn.is_async else None
 
 
@@ -195,7 +228,7 @@ class AsyncAnalyzer:
                 return None
             if fn.is_async:
                 # A bare call is the fn's future (AGAST #1395).
-                return rast.NamedType(span, f"{fn.name}_Future")
+                return rast.NamedType(span, future_type_name(fn.name))
             return fn.ret_type
         return None
 
@@ -1272,15 +1305,15 @@ class _CfgBuilder:
             return
         if self.gen._is_async_call(inner):
             fn_name = inner.func.name
-            fut = self._add_field(f"__future_{k}", self.gen._make_named_type(f"{fn_name}_Future"))
+            fut = self._add_field(f"__future_{k}", self.gen._make_named_type(future_type_name(fn_name)))
             args = [self.hoist(a) for a in inner.args]
             # The call keeps its source spans: it is the user's call of `foo`,
             # so a private `foo` of another file is refused here, at `foo`
-            # (#3925, LARB R45a).  `foo_poll` is the compiler's own call.
+            # (#3925, LARB R45a).  `foo$poll` is the compiler's own call.
             # The build takes the await's span: the emitter locates code per
             # statement, and a call with no !dbg location makes LLVM strip
             # the module's debug info (#3800).  The resume state is emitted
-            # next, so `foo_poll` inherits the location.
+            # next, so `foo$poll` inherits the location.
             self.emit(rast.AssignStmt(
                 span=aw.span, target=self.rw.self_field(fut, self.span),
                 value=rast.Call(span=inner.span, func=rast.Ident(span=inner.func.span, name=fn_name), args=args)))
@@ -1302,7 +1335,7 @@ class _CfgBuilder:
     def _resume_on(self, fn_name: str, fut: rast.Expr, aw: rast.Await, dest):
         """A resume state polling `fn_name`'s future, the place `fut`, until
         true (Pending until then), then `fut.__result` into `dest`."""
-        polled = rast.Call(span=self.span, func=rast.Ident(span=self.span, name=f"{fn_name}_poll"),
+        polled = rast.Call(span=self.span, func=rast.Ident(span=self.span, name=poll_fn_name(fn_name)),
                            args=[rast.UnaryOp(span=self.span, op='@', operand=fut)])
         resume = self.new_block()
         self.goto(resume)
@@ -1343,11 +1376,11 @@ class TrueAsyncGenerator:
     """
     Generates the state machine for an async function: its future struct
     (state, params, locals, inner futures), a constructor that stands for the
-    fn, and `NAME_poll`, which runs the body from its current state to the
+    fn, and `NAME$poll`, which runs the body from its current state to the
     next Pending await or to its end (Ready).
 
     When async_functions is provided, recognizes calls to async functions
-    and generates proper foo() + foo_poll() sequences.
+    and generates proper foo() + foo$poll() sequences.
     """
 
     def __init__(self, analysis: AsyncFnAnalysis, async_functions: Optional[Set[str]] = None,
@@ -1391,7 +1424,7 @@ class TrueAsyncGenerator:
             if ty is not None:
                 fields_.append((name, ty))
         fields_ += extra
-        future_name = f"{self.fn_def.name}_Future"
+        future_name = future_type_name(self.fn_def.name)
         future_struct = rast.StructDef(span=self.dummy_span, name=future_name, fields=fields_)
 
         return AsyncStateMachine(
@@ -1455,7 +1488,7 @@ class TrueAsyncGenerator:
 
         stmts: List[rast.Stmt] = [rast.VarStmt(span=span, name=fut, type=self._make_named_type(future_name), value=None)]
         stmts.append(rast.AssignStmt(span=span, target=fut_field(PollAbi.POLL),
-                                     value=self._make_ident(f"{self.fn_def.name}_poll")))
+                                     value=self._make_ident(poll_fn_name(self.fn_def.name))))
         stmts.append(rast.AssignStmt(span=span, target=fut_field('__state'), value=rast.IntLit(span=span, value=0)))
         for param in self.fn_def.params:
             stmts.append(rast.AssignStmt(span=span, target=fut_field(param.name), value=self._make_ident(param.name)))
@@ -1472,7 +1505,7 @@ class TrueAsyncGenerator:
         )
 
     def _generate_poll_fn(self, future_name: str, body: rast.Block) -> rast.FnDef:
-        """`NAME_poll(self: *NAME_Future)`, answering as PollAbi says."""
+        """`NAME$poll(self: *NAME$Future)`, answering as PollAbi says."""
         self_param = rast.Param(
             span=self.dummy_span,
             name='self',
@@ -1482,7 +1515,7 @@ class TrueAsyncGenerator:
                           expr=body.expr)
         return rast.FnDef(
             span=self.dummy_span,
-            name=f"{self.fn_def.name}_poll",
+            name=poll_fn_name(self.fn_def.name),
             params=[self_param],
             ret_type=self._make_named_type(PollAbi.RET_TYPE),
             body=body,
@@ -1548,9 +1581,9 @@ async fn simple(x: i32) -> i32
 
     sm = generate_state_machine(fn)
 
-    assert sm.future_struct.name == "simple_Future"
+    assert sm.future_struct.name == "simple$Future"
     assert sm.constructor_fn.name == "simple"
-    assert sm.poll_fn.name == "simple_poll"
+    assert sm.poll_fn.name == "simple$poll"
     print("✓ Basic test passed")
 
 

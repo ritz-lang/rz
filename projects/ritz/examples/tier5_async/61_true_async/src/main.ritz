@@ -5,7 +5,8 @@
 # - block_on() polls in a loop until Ready
 # - await actually suspends on Pending
 #
-# These tests should FAIL until we implement true async.
+# Tests 1-3 implement the poll contract by hand; tests 4-5 use the
+# compiler's own `async fn` lowering and drive it with `future_poll`.
 
 import ritzlib.sys
 import ritzlib.io
@@ -171,41 +172,31 @@ fn test_block_on_countdown() -> i32
 # Test 4: Compiler-generated async function
 # ============================================================================
 
-# This is what an async fn should generate:
+# The compiler turns
 #
 # async fn add_one(x: i32) -> i32
 #     x + 1
 #
-# Should become:
+# into `add_one$Future` and `add_one$poll`.  `$` is not an identifier
+# character, so neither name can be written in source (AGAST #3606): an
+# executor holds the future untyped and drives it through `future_poll`.
 
-struct add_one_Future
-    state: i32
-    x: i32
-
-fn add_one(x: i32) -> add_one_Future
-    var future: add_one_Future
-    future.state = 0
-    future.x = x
-    return future
-
-fn add_one_poll(self: *add_one_Future) -> i32
-    # No await points, so always Ready
-    return self.x + 1
+async fn add_one(x: i32) -> i32
+    x + 1
 
 fn test_generated_async() -> i32
     prints("test_generated_async... ")
 
     # Create the future
-    var future: add_one_Future = add_one(10)
+    var future = add_one(10)
 
-    # Poll should return Ready(11)
-    let result: i32 = add_one_poll(@future)
-
-    if is_ready(result) == 0
+    # The poll is true once Ready, the value in the future (LARB R78)
+    if !future_poll(@&future)
         prints("FAIL: expected Ready\n")
         return 1
+    let result: i32 = future.__result
 
-    if unwrap_ready(result) != 11
+    if result != 11
         prints("FAIL: expected 11, got ")
         print_int(result as i64)
         prints("\n")
@@ -218,76 +209,34 @@ fn test_generated_async() -> i32
 # Test 5: Async with one await point
 # ============================================================================
 
-# This is what should be generated for:
+# One await point, no I/O: the awaited helper is ready at once, so the
+# future's first poll is Ready.
 #
 # async fn double_countdown(n: i32) -> i32
 #     let x = await countdown_value(n)
 #     x * 2
-#
-# Where countdown_value returns a CountdownFuture
 
-struct double_countdown_Future
-    state: i32
-    n: i32
-    inner: CountdownFuture
-    x: i32  # Result of first await
+async fn countdown_value(n: i32) -> i32
+    n
 
-fn double_countdown(n: i32) -> double_countdown_Future
-    var future: double_countdown_Future
-    future.state = 0
-    future.n = n
-    future.inner.remaining = 0
-    future.inner.value = 0
-    future.x = 0
-    return future
-
-fn double_countdown_poll(self: *double_countdown_Future) -> i32
-    if self.state == 0
-        # State 0: Initialize inner future and transition
-        self.inner.remaining = 2
-        self.inner.value = self.n
-        self.state = 1
-        # Fall through to poll inner
-
-    if self.state == 1
-        # State 1: Polling inner future
-        let inner_result: i32 = countdown_poll(@self.inner)
-        if is_ready(inner_result) == 0
-            # Inner is Pending, so we're Pending
-            return poll_pending()
-        # Inner is Ready, save result and transition
-        self.x = unwrap_ready(inner_result)
-        self.state = 2
-        # Fall through to final state
-
-    # State 2: Compute final result
-    return self.x * 2
+async fn double_countdown(n: i32) -> i32
+    let x: i32 = await countdown_value(n)
+    x * 2
 
 fn test_async_with_await() -> i32
     prints("test_async_with_await... ")
 
-    var future: double_countdown_Future = double_countdown(5)
+    var future = double_countdown(5)
 
-    # Should take 3 polls: 2 Pending + 1 Ready
-    let poll1: i32 = double_countdown_poll(@future)
-    if is_ready(poll1) != 0
-        prints("FAIL: poll 1 should be Pending\n")
-        return 1
-
-    let poll2: i32 = double_countdown_poll(@future)
-    if is_ready(poll2) != 0
-        prints("FAIL: poll 2 should be Pending\n")
-        return 1
-
-    let poll3: i32 = double_countdown_poll(@future)
-    if is_ready(poll3) == 0
-        prints("FAIL: poll 3 should be Ready\n")
+    # Nothing suspends, so one poll is Ready with the value (LARB R78)
+    if !future_poll(@&future)
+        prints("FAIL: poll 1 should be Ready\n")
         return 1
 
     # 5 * 2 = 10
-    if unwrap_ready(poll3) != '\n'
+    if future.__result != 10
         prints("FAIL: expected 10, got ")
-        print_int(poll3 as i64)
+        print_int(future.__result as i64)
         prints("\n")
         return 1
 

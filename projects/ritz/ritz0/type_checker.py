@@ -290,21 +290,6 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             is_async=getattr(fn, 'is_async', False),
             lent=self._lent_params(fn)
         )
-        if getattr(fn, 'is_async', False):
-            self._register_poll(fn)
-
-    def _register_poll(self, fn: rast.FnDef):
-        """An async fn's generated `<fn>_poll(self: *<fn>_Future) -> bool`
-        (async_transform_v2, PollAbi), which a program may call itself
-        (AGAST #3556).  A fn the module declares of that name is its own."""
-        name = f"{fn.name}_poll"
-        if name in self.functions:
-            return
-        span = fn.span
-        future = rast.PtrType(span=span, inner=rast.NamedType(span, f"{fn.name}_Future", []),
-                              mutable=True)
-        self.functions[name] = FnSig(name=name, params=[('self', future)],
-                                     ret_type=rast.NamedType(span, 'bool', []))
 
     def _register_extern(self, fn: rast.ExternFn):
         """Register extern function signature."""
@@ -1009,7 +994,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 self.current_type_params = caller_params
 
             if fn_sig.is_async:
-                # The call makes a `<fn>_Future`; only `.await` gives ret_type.
+                # The call makes a `<fn>$Future`; only `.await` gives ret_type.
                 return rast.NamedType(expr.span, 'unknown', [])
             if fn_sig.ret_type is None:
                 return rast.NamedType(expr.span, 'void', [])
@@ -1470,15 +1455,6 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             self._error(f"cannot access field on {self._type_str(base_type)}", expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
 
-        # `f.__result` on an `async fn f`'s future, which the async transform
-        # generates after checking: the fn's declared type (LARB R78, #3728).
-        # Not an undeclared struct's member for #3404's rule.
-        future_of = self._future_fn(inner_type)
-        if future_of is not None:
-            if expr.field == '__result' and future_of.ret_type is not None:
-                return future_of.ret_type
-            return rast.NamedType(expr.span, 'unknown', [])
-
         if self._refuse_unknown_struct_member(expr, base_type):
             return rast.NamedType(expr.span, 'unknown', [])
 
@@ -1507,16 +1483,6 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
 
         self._error(f"struct '{struct_info.name}' has no field '{expr.field}'", expr.span)
         return rast.NamedType(expr.span, 'unknown', [])
-
-    def _future_fn(self, ty: rast.Type):
-        """The async fn whose generated `<fn>_Future` `ty` names, when it is
-        one and the module declares no struct of that name; else None."""
-        if not isinstance(ty, rast.NamedType) or ty.args or not ty.name.endswith('_Future'):
-            return None
-        if ty.name in self.structs:
-            return None
-        fn = self.functions.get(ty.name[:-len('_Future')])
-        return fn if fn is not None and fn.is_async else None
 
     def _undeclared_struct(self, ty: rast.Type) -> Optional[str]:
         """The name `ty` gives, when it names no type at all: no struct, enum

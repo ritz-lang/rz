@@ -38,7 +38,7 @@ import type_order
 import match_coverage
 from metadata import type_to_string
 from async_transform_v2 import (generate_state_machine, AsyncStateMachine, UntypedAsyncLocal, AsyncLoweringError,
-                                PollAbi)
+                                PollAbi, future_type_name, poll_fn_name, async_fn_of_future_type)
 from const_eval import ConstEvaluator, ConstEvalError, fold_literal_i64
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
 from type_checker import TypeChecker
@@ -878,7 +878,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         self.struct_registry = StructRegistry()
 
         # Async function registry: tracks which functions are async
-        # Used during await transformation to know when to call foo_poll vs foo
+        # Used during await transformation to know when to call foo$poll vs foo
         self.async_functions: Set[str] = set()
 
         # Context for current async function being emitted (if any)
@@ -3103,8 +3103,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
         Generates (LARB R78: the poll answers bool, the value is the future's):
             fn main() -> i32
-                var future: main_Future = __main_future()
-                while !main_poll(&future)
+                var future: main$Future = __main_future()
+                while !main$poll(&future)
                     pass
                 future.__result                 # 0 for a unit main
         """
@@ -3114,9 +3114,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             return rast.Ident(span=span, name='future')
 
         future_init = rast.VarStmt(
-            span=span, name='future', type=rast.NamedType(span=span, name='main_Future'),
+            span=span, name='future', type=rast.NamedType(span=span, name=future_type_name('main')),
             value=rast.Call(span=span, func=rast.Ident(span=span, name='__main_future'), args=[]))
-        poll = rast.Call(span=span, func=rast.Ident(span=span, name='main_poll'),
+        poll = rast.Call(span=span, func=rast.Ident(span=span, name=poll_fn_name('main')),
                          args=[rast.UnaryOp(span=span, op='&', operand=future())])
         poll_loop = rast.WhileStmt(
             span=span, cond=rast.UnaryOp(span=span, op='!', operand=poll),
@@ -5395,7 +5395,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         known. A note line gives the declaration: a basename alone is
         ambiguous across packages.
 
-        An async fn's poll fn (`fetch_poll`) has no source position of its
+        An async fn's poll fn (`fetch$poll`) has no source position of its
         own (async_transform_v2's dummy span): it is unchecked, so a private
         async fn is refused once, at the call of `fetch` -- its constructor,
         which keeps the declaration's span -- as ritz1 does (#3925)."""
@@ -10546,22 +10546,22 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         Equivalent to (LARB R78: the poll answers bool, the value is the
         future's `__result`):
             var future = fn_name(args)
-            while !fn_name_poll(&future)
+            while !fn_name$poll(&future)
                 pass
             future.__result                     # i32 0 for a unit fn
         """
-        future_type_name = f"{fn_name}_Future"
-        poll_fn_name = f"{fn_name}_poll"
+        future_ty_name = future_type_name(fn_name)
+        poll_ty_name = poll_fn_name(fn_name)
 
         # Get LLVM types
-        future_llvm_type = self.struct_types.get(future_type_name)
+        future_llvm_type = self.struct_types.get(future_ty_name)
         if future_llvm_type is None:
-            raise InternalError(f"Unknown Future type: {future_type_name}")
+            raise InternalError(f"Unknown Future type: {future_ty_name}")
 
         # Get the poll function
-        if poll_fn_name not in self.functions:
-            raise InternalError(f"Unknown poll function: {poll_fn_name}")
-        poll_fn, _ = self.functions[poll_fn_name]
+        if poll_ty_name not in self.functions:
+            raise InternalError(f"Unknown poll function: {poll_ty_name}")
+        poll_fn, _ = self.functions[poll_ty_name]
 
         # Get the constructor function
         if fn_name not in self.functions:
@@ -10588,9 +10588,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         if not isinstance(expr, rast.Ident):
             return None
         ty = self._infer_ritz_type(expr)
-        if not isinstance(ty, rast.NamedType) or ty.args or not ty.name.endswith('_Future'):
+        if not isinstance(ty, rast.NamedType) or ty.args:
             return None
-        fn_name = ty.name[:-len('_Future')]
+        fn_name = async_fn_of_future_type(ty.name)
         return fn_name if fn_name in self.async_functions else None
 
     def _emit_future_poll(self, call: rast.Call) -> ir.Value:
@@ -10609,8 +10609,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
     def _emit_poll_until_ready(self, fn_name: str, future_ptr: ir.Value) -> ir.Value:
         """Poll `fn_name`'s future at `future_ptr` until true, then its
         result (i32 0 for a unit fn)."""
-        future_type_name = f"{fn_name}_Future"
-        poll_fn, _ = self.functions[f"{fn_name}_poll"]
+        future_ty_name = future_type_name(fn_name)
+        poll_fn, _ = self.functions[poll_fn_name(fn_name)]
 
         # Create loop blocks
         loop_block = self.current_fn.append_basic_block("poll_loop")
@@ -10622,16 +10622,16 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # Poll loop body
         self.builder.position_at_end(loop_block)
 
-        # Call poll: ready = fn_name_poll(&future)
+        # Call poll: ready = fn_name$poll(&future)
         ready = self.builder.call(poll_fn, [future_ptr], name="poll_ready")
         is_ready = self.builder.icmp_unsigned('!=', ready, ir.Constant(ready.type, 0), name="is_ready")
         self.builder.cbranch(is_ready, done_block, loop_block)
 
         # Done: the value is the future's result field; a unit fn has none.
         self.builder.position_at_end(done_block)
-        if PollAbi.RESULT not in [name for name, _ in self.struct_fields.get(future_type_name, [])]:
+        if PollAbi.RESULT not in [name for name, _ in self.struct_fields.get(future_ty_name, [])]:
             return ir.Constant(self.i32, 0)
-        idx = self._get_struct_field_index(future_type_name, PollAbi.RESULT)
+        idx = self._get_struct_field_index(future_ty_name, PollAbi.RESULT)
         result_ptr = self.builder.gep(future_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
         return self.builder.load(result_ptr, name="await_result")
 
@@ -13300,7 +13300,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 or (self._is_scalar(actual) and self._is_aggregate(declared_ty))):
             return
         # AGAST #1395: `let r: i32 = g()` for an async g is the missing
-        # `await`; naming only `g_Future` kept 53/54/55_async on the
+        # `await`; naming only the internal future kept 53/54/55_async on the
         # known-failures list as "unmigrated async" for months.
         call = stmt.value
         if (isinstance(call, rast.Call) and isinstance(call.func, rast.Ident)
@@ -13310,7 +13310,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             raise EmitError(
                 f"`{stmt.name}` is declared `{self._format_ritz_type(stmt.type)}` but "
                 f"`{fn}(...)` is an async fn call, which without `await` is its "
-                f"future `{fn}_Future`: write `await {fn}(...)`",
+                f"future: write `await {fn}(...)`",
                 getattr(stmt, "span", None),
             )
         raise EmitError(

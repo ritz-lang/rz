@@ -1,11 +1,11 @@
 """AGAST #3728 / LARB R78: a poll answers `bool`; the result lives in the future.
 
-Every generated `NAME_poll` returned `i32`, with -1 meaning Pending.  So an
+Every generated poll returned `i32`, with -1 meaning Pending.  So an
 `async fn -> i64` (or a pointer, or a struct) was squeezed through i32, and an
 async fn whose genuine result was -1 could not be told from Pending: `await`
 spun forever on it.
 
-R78: every poll is `fn(*u8) -> bool` (typed `*NAME_Future` here), true once
+R78: every poll is `fn(*u8) -> bool` (its first header field), true once
 the body has finished, having written the result into the future's
 `__result` field, of the fn's declared type (a unit fn has none).  `await`
 polls until true, then reads the field.
@@ -55,17 +55,17 @@ RUNS = {
                       "pub fn main() -> i32\n    let p: Pair = await go()\n"
                       "    if p.a == 5000000000 and p.b == 0 - 1\n        return 0\n    1\n", 0),
     # The poll itself: false while Pending, then true with `__result` set.
-    "poll_is_bool_result_in_future": (_NEG + "pub fn main() -> i32\n    var f: neg_Future = neg()\n"
-                                      "    if neg_poll(@f)\n        return f.__result + 1\n    9\n", 0),
+    "poll_is_bool_result_in_future": (_NEG + "pub fn main() -> i32\n    var f = neg()\n"
+                                      "    if future_poll(@&f)\n        return f.__result + 1\n    9\n", 0),
     # The checker knows a generated future's fields: `f.__result` on a local
     # of one is not an undeclared struct's member (#3404's rule).
-    "result_field_read_in_helper": (_BIG + "fn drive() -> i64\n    var f: big_Future = big()\n"
-                                    "    while !big_poll(@f)\n        pass\n    f.__result\n\n"
+    "result_field_read_in_helper": (_BIG + "fn drive() -> i64\n    var f = big()\n"
+                                    "    while !future_poll(@&f)\n        pass\n    f.__result\n\n"
                                     "pub fn main() -> i32\n    if drive() == 5000000000\n        return 0\n    1\n", 0),
     # A unit fn's poll is true when done; its future has no result field.
     "unit_poll_true": ("var RAN: i32 = 0\n\nasync fn u()\n    RAN = 4\n\n"
-                       "pub fn main() -> i32\n    var f: u_Future = u()\n"
-                       "    if u_poll(@f)\n        return RAN\n    9\n", 4),
+                       "pub fn main() -> i32\n    var f = u()\n"
+                       "    if future_poll(@&f)\n        return RAN\n    9\n", 4),
 }
 
 

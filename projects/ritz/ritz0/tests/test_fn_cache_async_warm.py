@@ -14,7 +14,7 @@ named ``add_one``, the same name as the source fn, so it was the only hit
 honoured.  Its body was skipped, and the splice regex (which wants the
 declare line to end at ``)``) never matched the ``... "no-builtins"`` declare
 the emitter writes.  The warm compile therefore only *declared* ``@add_one``
-while defining ``@add_one_poll``, and the object failed to link with
+while defining ``@add_one$poll``, and the object failed to link with
 ``undefined reference to add_one``.  build.py's machine-wide CAS (#1808) then
 kept that bad object for every worktree building the same key.
 
@@ -92,7 +92,7 @@ def test_cold_compile_defines_async_constructor(example_62, cache_dir, tmp_path)
     _compile(example_62, out, cache_dir)
     defined = _defined(out.read_text())
     assert "add_one" in defined
-    assert "add_one_poll" in defined
+    assert "add_one$poll" in defined
 
 
 @pytest.mark.integration
@@ -126,7 +126,7 @@ def test_repeated_warm_recompiles_stay_identical(example_62, cache_dir, tmp_path
 def test_warm_recompile_defines_every_async_constructor(
     example_62, cache_dir, tmp_path
 ):
-    """Every `X_poll` this module defines comes with its constructor `X` defined.
+    """Every `X$poll` this module defines comes with its constructor `X` defined.
 
     This is the scan used to find the poisoned CAS objects: a defined poll fn
     with a merely declared constructor is exactly the #2019 link failure.
@@ -136,7 +136,7 @@ def test_warm_recompile_defines_every_async_constructor(
     _compile(example_62, warm, cache_dir)
     ir = warm.read_text()
     defined, declared = _defined(ir), _declared(ir)
-    polls = {n[: -len("_poll")] for n in defined if n.endswith("_poll")}
+    polls = {n[: -len("$poll")] for n in defined if n.endswith("$poll")}
     assert polls, "62 should define async poll fns"
     missing = sorted(c for c in polls if c not in defined and c in declared)
     assert not missing, f"async constructors only declared on warm recompile: {missing}"

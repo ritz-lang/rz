@@ -4,8 +4,8 @@
         await fetch(x)
 
 async_transform_v2 recorded the await, but `_generate_final_return` rebuilt the
-tail by lowering `await fetch(x)` to plain `fetch(x)`: go_poll returned the
-`fetch_Future` struct from an `i32` fn, which ritz0 refuses since #2999 ("a struct
+tail by lowering `await fetch(x)` to plain `fetch(x)`: go$poll returned the
+`fetch$Future` struct from an `i32` fn, which ritz0 refuses since #2999 ("a struct
 is not an integer").  `(await fetch(x)) + 1` failed the same way, at `+`, and
 `return await fetch(x)` answered 0.  The final state now reads each await's
 stored result.
@@ -21,10 +21,10 @@ pytestmark = pytest.mark.batched
 # fetch is Ready with its argument on the first poll; main polls go once.
 _FETCH = "async fn fetch(x: i32) -> i32\n    x\n\n"
 # One poll: true with the value in `__result` (LARB R78, #3728); 99 if Pending.
-_MAIN = ("pub fn main() -> i32\n    var f: go_Future = go(7)\n    if go_poll(@f)\n"
+_MAIN = ("pub fn main() -> i32\n    var f = go(7)\n    if future_poll(@&f)\n"
          "        return f.__result\n    99\n")
 
-# name -> (go's body, go_poll's value for x = 7)
+# name -> (go's body, go$poll's value for x = 7)
 ROWS = {
     # The ticket's rows.
     "tail": ("    await fetch(x)\n", 7),
@@ -43,7 +43,7 @@ ROWS = {
     "return_await": ("    return await fetch(x)\n", 7),
     "statement": ("    await fetch(x)\n    x + 2\n", 9),
     # AGAST #1318: an untyped binding takes the poll's i32.  Its None type kept
-    # `v` out of go_Future while the constructor still set it: "Unknown field v".
+    # `v` out of go$Future while the constructor still set it: "Unknown field v".
     "untyped_let": ("    let v = await fetch(x)\n    v + 1\n", 8),
     # AGAST #3821: only a let whose value IS the await binds its result.  One
     # nested in the value took `v` as its result var, so the state stored the

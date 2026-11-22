@@ -241,16 +241,16 @@ def test_other_pointees_still_differ(tmp_path):
     assert r.returncode != 0 and "Type error: " in r.stderr, r.stdout + r.stderr
 
 
-# LARB R79: any async fn's generated future (`u_Future`) fits a reference to a
-# `Future`, at a user fn's `@&Future` param too, not just `future_poll`'s
-# (test_async_future_ref's named_future_and_unit_fn).
+# LARB R79: any async fn's generated future (an unspellable `u$Future`, AGAST
+# #3606) fits a reference to a `Future`, at a user fn's `@&Future` param too,
+# not just `future_poll`'s (test_async_future_ref's named_future_and_unit_fn).
 DRIVE = "fn drive(f: @&Future) -> i32\n    var n: i32 = 1\n    while !future_poll(f)\n        n = n + 1\n    n\n\n"
 
 
 def test_an_async_fn_s_future_fits_a_future_ref(tmp_path, capsys):
     ok, out, _, _ = _compile(tmp_path, capsys,
                              "var DONE: i32 = 0\n\nasync fn u()\n    DONE = 5\n\n" + DRIVE
-                             + "pub fn main() -> i32\n    var p: u_Future = u()\n    drive(@&p)\n    DONE\n")
+                             + "pub fn main() -> i32\n    var p = u()\n    drive(@&p)\n    DONE\n")
     assert ok is True, out
 
 

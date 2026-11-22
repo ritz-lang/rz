@@ -6,7 +6,7 @@
                                           await fetch(41)
 
 `_transform_async_functions` runs over the merged module, imports included.
-The constructor (`fetch`) and poll fn (`fetch_poll`) it generated for an
+The constructor (`fetch`) and poll fn (`fetch$poll`) it generated for an
 imported async fn did not carry the original's `source_file`, so the importer
 emitted their bodies as well as a.ritz's own object did: the link failed with
 "multiple definition of `fetch'".  (54_async_fs, the corpus' only importer of
@@ -51,8 +51,8 @@ def test_imported_async_fn_links_and_runs(tmp_path):
 
     # The importer declares fetch's constructor and poll fn; a.ritz defines them.
     lines = main_ll.read_text().splitlines()
-    for sym in ("fetch", "fetch_poll"):
-        heads = [l for l in lines if re.search(rf'@"?{sym}"?\(', l)
+    for sym in ("fetch", "fetch$poll"):
+        heads = [l for l in lines if re.search(rf'@"?{re.escape(sym)}"?\(', l)
                  and l.startswith(("define", "declare"))]
         assert heads and all(l.startswith("declare") for l in heads), (sym, heads)
 

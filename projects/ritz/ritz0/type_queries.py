@@ -8,7 +8,6 @@ from typing import Optional, Tuple
 
 import array_rules
 import float_rules
-import future_rules
 import ritz_ast as rast
 from monomorph import mangle_generic_name
 from tail_value import slot_tails
@@ -459,14 +458,6 @@ class TypeQueriesMixin:
         # an `extern fn addr(..) -> *u8` is the way into one
         if isinstance(expected, rast.FnType) and isinstance(actual, rast.PtrType) \
                 and self._is_u8(actual.inner):
-            return True
-
-        # Any async fn's generated future (`NAME_Future`) is a `Future` behind
-        # a reference (LARB R79, as type_refs._other_referent; AGAST #4260)
-        if isinstance(actual, (rast.PtrType, rast.RefType)) \
-                and isinstance(expected, (rast.PtrType, rast.RefType)) \
-                and future_rules.is_future(self._resolve_alias(expected.inner)) \
-                and self._future_fn(self._resolve_alias(actual.inner)) is not None:
             return True
 
         # Pointer types

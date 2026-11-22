@@ -48,8 +48,8 @@ input.ritz
 [named]     named_variants: a struct variant's named pattern and literal
   │         become their positional forms (#4187)
   ▼
-[async]     async_lower: each `async fn` becomes ritz0's `<f>_Future` struct,
-  │         constructor and `<f>_poll` state machine; every `await` is lowered;
+[async]     async_lower: each `async fn` becomes ritz0's `<f>$Future` struct,
+  │         constructor and `<f>$poll` state machine; every `await` is lowered;
   │         a bare call to an async fn is refused (§16.2)
   ▼
 [pre-mono checks]  impls on unknown/built-in types (main), binder_check,
@@ -136,7 +136,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | `ast_query` | Pure queries over the AST, the enum tables and the type table (`name_eq`, `find_field_index`, `user_enum_index`, `mem_builtin_id`, ...): no `EmitterState`, no Sema. Moved out of `emitter_core` by #3513 so Sema and the checks import no emitter module; `emitter_core` `pub import`s it. Also the data-only types the Sema checks type their places from (`LocalVar`, `OwnPath`, `ArrayDims`) and the pure helpers that fill them (array dims, local placement, struct pointer levels), moved there by #4319 and #4391. |
 | `types` | The one table of primitive type facts (AGAST #1889): LLVM spelling in memory and as a value, store size, alignment, bit width, signedness, Ritz name, name→kind. Struct/enum kinds answer "unknown"; the emitter's struct table sizes them. |
 | `diag` | Located diagnostics: one `<file>:<line>:<col>: error: <message>` line per error, and the input-file global (`diag_source_file`, #4319) that locates them. |
-| `async_lower` | `async fn` / `await` lowered, AST to AST, to ritz0's state machine (`<f>_Future`, `<f>`, `<f>_poll`; `async fn main` polled by a sync `main`), and a bare call to an async fn refused (§16.2). Run by main once, after imports merge. |
+| `async_lower` | `async fn` / `await` lowered, AST to AST, to ritz0's state machine (`<f>$Future`, `<f>`, `<f>$poll`; `async fn main` polled by a sync `main`), and a bare call to an async fn refused (§16.2). Run by main once, after imports merge. |
 | `named_variants` | A struct variant's named forms (§10.3, #4187): `V { b, a } =>` gets its bindings in field order and the literal `V { a: 1, b: 2 }` becomes the call `V(1, 2)`, in place, from the forms the parser noted (`named_form_note`); a missing, unknown or repeated field is refused at the name. Run by main once, after imports merge. |
 | `interp` | Reads `{expr}` placeholders in print strings; re-enters the lexer/parser for each placeholder expression. |
 

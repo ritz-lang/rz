@@ -1,13 +1,16 @@
-"""The typing pass knows an async fn's poll fn (AGAST #3556).
+"""AGAST #3606: an async fn's generated names are unspellable.
 
-`async fn f` makes `f_Future` and `fn f_poll(self: *f_Future) -> bool`
-(async_transform_v2.PollAbi, LARB R78).  The emitter calls and accepts
-`f_poll`; the typing pass answered "undefined function: f_poll", which
-refused examples/tier5_async/62_async_compiler, 64_async_io and
-75_async_reference once its errors are always reported.
+`async fn f` makes `f$Future` and `fn f$poll(...) -> bool` (async_transform_v2,
+PollAbi / LARB R78).  `$` is not an identifier character in either lexer, so no
+source can spell either name.  The typing pass therefore knows nothing about
+them (AGAST #3556's `_register_poll` is gone): a rename-era `f_Future` is an
+ordinary unknown type and an `f_poll(...)` call is an ordinary undefined
+function.  An executor drives a held future through the API instead, with
+`future_poll(@&f)`.
 """
 
 import pytest
+from name_resolver import resolve_names
 from parser import parse
 from type_checker import TypeChecker
 
@@ -24,36 +27,27 @@ def types(source: str) -> list:
     return [str(e) for e in TypeChecker().check(parse(source))]
 
 
-def test_poll_of_an_async_fn_is_defined():
+def names(source: str) -> list:
+    return [str(e) for e in resolve_names(parse(source))]
+
+
+def test_generated_future_type_is_unknown():
     src = ADD_ONE + (
         "fn main() -> i32\n"
         "    var future: add_one_Future = add_one(10)\n"
+        "    0\n")
+    errors = names(src)
+    assert len(errors) == 1 and "Unknown type: add_one_Future" in errors[0], errors
+
+
+def test_generated_poll_fn_is_undefined():
+    src = ADD_ONE + (
+        "fn main() -> i32\n"
+        "    var future = add_one(10)\n"
         "    if !add_one_poll(@future)\n"
         "        return 1\n"
         "    future.__result\n")
-    assert types(src) == []
-
-
-def test_poll_answers_bool():
-    # PollAbi.RET_TYPE: true once Ready, not the fn's own i32.
-    src = ADD_ONE + (
-        "fn main() -> i32\n"
-        "    var future: add_one_Future = add_one(10)\n"
-        "    let ready: i32 = add_one_poll(@future)\n"
-        "    ready\n")
-    errors = types(src)
-    assert len(errors) == 1 and "bool" in errors[0], errors
-
-
-def test_poll_takes_its_own_future():
-    src = ADD_ONE + (
-        "fn main() -> i32\n"
-        "    let x: i32 = 3\n"
-        "    if !add_one_poll(@x)\n"
-        "        return 1\n"
-        "    0\n")
-    errors = types(src)
-    assert any("expected *add_one_Future, got @i32" in e for e in errors), errors
+    assert any("undefined function: add_one_poll" in e for e in types(src)), types(src)
 
 
 def test_a_plain_fn_has_no_poll():
@@ -66,11 +60,18 @@ def test_a_plain_fn_has_no_poll():
     assert any("undefined function: add_one_poll" in e for e in types(src))
 
 
-def test_a_declared_fn_of_the_poll_name_keeps_its_own_signature():
-    # Nothing is generated over a fn the module declares itself, declared
-    # before the async fn or after it.
-    src = "fn add_one_poll(n: i64) -> i64\n    n\n\n" + ADD_ONE + (
-        "fn main() -> i32\n"
-        "    let r: i64 = add_one_poll(4)\n"
-        "    0\n")
-    assert types(src) == []
+def test_the_old_names_are_ordinary_user_names():
+    # Nothing is generated over a name the module declares itself: `fetch_poll`
+    # and `fetch_Future` are plain user names, so they coexist with `fetch`.
+    src = ("struct fetch_Future\n    tag: i32\n\n"
+           "fn fetch_poll(n: i64) -> i64\n    n\n\n"
+           + ADD_ONE.replace("add_one", "fetch") + (
+               "fn main() -> i32\n"
+               "    let f = fetch_Future { tag: 5 }\n"
+               "    let r: i64 = fetch_poll(4)\n"
+               "    if f.tag == 5 and r == 4\n"
+               "        return 0\n"
+               "    var p = fetch(10)\n"
+               "    let v: i32 = await p\n"
+               "    v\n"))
+    assert types(src) == [], types(src)

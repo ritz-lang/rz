@@ -8,7 +8,6 @@ from typing import Optional
 
 import array_rules
 import enum_rules
-import future_rules
 import ref_rules
 import ritz_ast as rast
 from monomorph import mangle_generic_name
@@ -293,11 +292,7 @@ class RefChecksMixin:
 
     def _other_referent(self, held: rast.Type, inner: rast.Type) -> bool:
         """`held` is known not to be `inner`: exactly, not by width. What the
-        checker can't name stays unjudged.  Any async fn's future is a
-        `Future` (LARB R79)."""
-        if future_rules.is_future(self._resolve_alias(inner)) \
-                and self._future_fn(self._resolve_alias(held)) is not None:
-            return False
+        checker can't name stays unjudged."""
         a, b = self._referent_key(held), self._referent_key(inner)
         return a is not None and b is not None and a != b
 

@@ -1,6 +1,6 @@
 """AGAST #3727: an async fn's poll is a state machine over its whole body.
 
-ritz0's lowering (ritz0/async_transform_v2.py) built `NAME_poll` as one
+ritz0's lowering (ritz0/async_transform_v2.py) built the poll as one
 `if state == N` block per await, each running its awaited expression once,
 then a final state that evaluated only the body's TAIL.  So every statement
 that wasn't `let x = await ...` was dropped (`sum = await f()`, `sum += await
@@ -41,8 +41,8 @@ _LATER = ("var TICKS: i32 = 0\nvar CALLS: i32 = 0\n\n"
           "fn later() -> i32\n    TICKS += 1\n    if TICKS <= 2\n        return 0 - 1\n    5\n\n")
 # main polls go by hand, counting Pending answers into the exit code.  A poll
 # is false while Pending, and true with the value in `__result` (R78, #3728).
-_POLL_GO = ("pub fn main() -> i32\n    var f: go_Future = go()\n    var pends: i32 = 0\n"
-            "    while !go_poll(@f)\n        pends += 1\n    f.__result + pends * 100\n")
+_POLL_GO = ("pub fn main() -> i32\n    var f = go()\n    var pends: i32 = 0\n"
+            "    while !future_poll(@&f)\n        pends += 1\n    f.__result + pends * 100\n")
 
 # A and B count their runs; each is Ready at once.
 _AB = ("var A: i32 = 0\nvar B: i32 = 0\n\n"

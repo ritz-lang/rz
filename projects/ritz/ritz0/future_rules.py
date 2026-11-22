@@ -6,14 +6,15 @@ reference to any of them is a reference to a `Future`, and
 `future_poll(f: @&Future) -> bool` polls one through its header.  Its size is
 the async fn's, which `Future` doesn't say: only a reference to one is a value.
 
-The rules here are the typing pass's (type_checker.TypeChecker.check):
+The rule here is the typing pass's (type_checker.TypeChecker.check): `Future`
+by value, in a `let`/`var`, a field, a param, an array element or a return, is
+refused at the `Future`.
 
-* `Future` by value, in a `let`/`var`, a field, a param, an array element
-  or a return, is refused at the `Future`;
-* any async fn's generated future (`NAME_Future`) fits a reference to a
-  `Future` (type_refs._other_referent).
-
-ritz1 mirrors them in #4007.
+That a generated future fits an `@&Future` slot is not judged here: ritz0
+transforms async after typing and its generated names are unspellable
+(`NAME$Future`, AGAST #3606), so the checker never meets one.  ritz1 lowers
+before its checks and mirrors the fit in sema_type.sema_future_ref_fits
+(#4007).
 """
 
 from dataclasses import fields, is_dataclass

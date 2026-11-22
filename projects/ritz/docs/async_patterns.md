@@ -20,8 +20,12 @@ async fn my_func(x: i32) -> i32
 ```
 
 The compiler generates:
-- `my_func_Future` struct (holds parameters and state)
-- `my_func_poll(*my_func_Future) -> i32` function (state machine)
+- a `my_func$Future` struct (holds parameters and state)
+- a `my_func$poll(*my_func$Future) -> i32` function (state machine)
+
+`$` is not an identifier character, so neither name can be written in Ritz
+source (AGAST #3606). They are implementation details: hold a future untyped
+and drive it through the executor API (`future_poll(@&f)`, `block_on`).
 
 ## Pattern 1: Simple Async Function
 
@@ -30,10 +34,11 @@ async fn add_values(a: i32, b: i32) -> i32
     a + b
 ```
 
-Usage:
+Usage (the future's type is unspellable, so hold it untyped):
 ```ritz
-var future: add_values_Future = add_values(10, 32)
-let result: i32 = add_values_poll(&future)
+var future = add_values(10, 32)
+if future_poll(@&future)
+    let result: i32 = future.__result
 ```
 
 ## Pattern 2: Async Calling Async (Chaining)
@@ -167,7 +172,7 @@ async fn connection_handler(state: *ConnectionState) -> i32
 
 ## Key Differences from Rust
 
-1. **No Future trait** - Ritz uses generated `_Future` structs and `_poll` functions
+1. **No Future trait** - Ritz uses generated `NAME$Future` structs and `NAME$poll` functions, which no source can name (AGAST #3606)
 2. **No Pin** - Futures are regular stack values
 3. **No async runtime** - Use `block_on` with `Runtime` directly
 4. **Poll encoding** - Uses i32 (-1 = Pending, >= 0 = Ready) not enum

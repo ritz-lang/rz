@@ -1,8 +1,9 @@
 """AGAST #1395: calling an `async fn` needs `await`, whatever its body does.
 
 Decided 2026-09-09: an `async fn` with no suspension point is NOT callable
-synchronously.  A bare call `g()` builds g's future (`g_Future`) and runs none
-of g's body; only `await g()` (or polling the future yourself) runs it.  So:
+synchronously.  A bare call `g()` builds g's future (an internal type no
+source can spell, AGAST #3606) and runs none of g's body; only `await g()` (or
+polling the future yourself) runs it.  So:
 
   * `await f()` compiles and runs f, even for `async fn f()` with an empty
     body.  It did not: a unit `async fn` lowered to an `i32` `f_poll` whose
@@ -10,10 +11,11 @@ of g's body; only `await g()` (or polling the future yourself) runs it.  So:
     a return type but can reach its end without producing a value").
   * `f()` as a statement is refused, located at the call.  It compiled
     silently and did nothing: the future was built and dropped.
-  * `let r: i32 = g()` is refused naming the missing `await` (it named only
-    `g_Future`, which is what kept 53/54/55 on the known-failures list).
-  * Keeping the future is still allowed: `var p: g_Future = g()` is how an
-    executor gets one to poll (62/64/75_async_*).
+  * `let r: i32 = g()` is refused naming the missing `await` (it once named
+    only the internal future type, which is what kept 53/54/55 on the
+    known-failures list).
+  * Keeping the future is still allowed: `var p = g()` is how an executor
+    gets one to poll, through `future_poll(@&p)` (62/64/75_async_*).
 
 Value uses of a bare call (`take(g())`, `g() + 1`, `return g()`) were already
 refused at the call by the struct-is-not-an-integer checks; they are not
@@ -57,7 +59,7 @@ RUNS = {
     "awaited_from_async": (_FORTY_TWO + "async fn h() -> i32\n    let v: i32 = await g()\n    v + 1\n\n"
                            + _main("    await h()\n"), 43),
     # The future itself is still a value: an executor's way in.
-    "future_kept": (_EMPTY + _main("    var p: f_Future = f()\n    f_poll(@p)\n    5\n"), 5),
+    "future_kept": (_EMPTY + _main("    var p = f()\n    future_poll(@&p)\n    5\n"), 5),
 }
 
 
@@ -84,7 +86,7 @@ def test_await_in_a_loop_reruns_each_iteration(tmp_path):
 
 
 _DISCARDED = "calling async fn `{fn}` without `await` builds its future and drops it; its body never runs: write `await {fn}(...)`"
-_LET = "`r` is declared `i32` but `g(...)` is an async fn call, which without `await` is its future `g_Future`: write `await g(...)`"
+_LET = "`r` is declared `i32` but `g(...)` is an async fn call, which without `await` is its future: write `await g(...)`"
 
 # name -> (program with `^` at the diagnostic, message)
 REFUSALS = {

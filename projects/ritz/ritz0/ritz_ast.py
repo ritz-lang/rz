@@ -917,7 +917,7 @@ class FnDef(Item):
     attrs: List[Attr] = None
     is_extern: bool = False
     is_async: bool = False  # async fn
-    # Generated `NAME_poll` of an async fn (async_transform_v2). Its Ready
+    # Generated `NAME$poll` of an async fn (async_transform_v2). Its Ready
     # `return` squeezes the result through PollAbi's i32 until #3728 (LARB
     # R78) stores it in the future instead, so §7.5's return check (#1444)
     # leaves it alone: R78's store is an assignment, which that check covers.

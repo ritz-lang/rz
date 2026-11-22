@@ -2,7 +2,7 @@
 
 Every generated future starts with a fixed header, poll fn first:
 
-    struct NAME_Future
+    struct NAME$Future
         __poll: fn(*u8) -> bool     # NAME_poll, set by the constructor
         __state: i32                # -1 once finished (a later poll is true at once)
         __result: T                 # none for a unit fn (R78)
@@ -69,9 +69,10 @@ RUNS = {
                                  "    let v: i64 = await p\n    v + 1\n\n"
                                  "pub fn main() -> i32\n    let v: i64 = await go()\n"
                                  "    if v == 5000000001 and RUNS == 1\n" + _OK, 0),
-    # A future of a named generated type fits too, and so does a unit fn's.
+    # A unit fn's future fits too.  The future's type is unspellable (AGAST
+    # #3606), so an executor holds it untyped.
     "named_future_and_unit_fn": ("var DONE: i32 = 0\n\nasync fn u()\n    DONE = 5\n\n" + _DRIVE
-                                 + "pub fn main() -> i32\n    var p: u_Future = u()\n    drive(@&p)\n    DONE\n", 5),
+                                 + "pub fn main() -> i32\n    var p = u()\n    drive(@&p)\n    DONE\n", 5),
     # An `@&Future` field to a future held elsewhere.
     "future_ref_field": (_SLOW + "struct Task\n    f: @&Future\n\n"
                          "fn run(t: @&Task) -> i32\n    var n: i32 = 1\n    while !future_poll(t.f)\n        n = n + 1\n    n\n\n"

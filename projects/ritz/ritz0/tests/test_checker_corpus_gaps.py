@@ -287,9 +287,12 @@ class TestRoundThree:
         with pytest.raises(ParseError, match=r"`fs\.kblob\.K`: there is no `module\.item` access"):
             parse(src)
 
-    def test_async_fn_future_type(self):
+    def test_async_fn_future_type_is_unnameable(self):
+        # AGAST #3606: the generated future's type is unspellable (`get$Future`),
+        # so a rename-era `get_Future` annotation is an ordinary unknown type.
         src = "async fn get() -> i32\n    1\n\nfn f(p: get_Future) -> i32\n    0\n"
-        assert names(src) == []
+        got = names(src)
+        assert len(got) == 1 and "Unknown type: get_Future" in got[0], got
 
     def test_builtin_variant_pattern_binds(self):
         src = ("fn g(n: i32) -> i32\n    n\n\n"
@@ -297,10 +300,14 @@ class TestRoundThree:
                "        Ok(v) => g(v)\n        Err(e) => g(e)\n")
         assert names(src) == [] and types(src) == []
 
-    def test_async_call_yields_a_future_not_its_return_type(self):
+    def test_held_async_future_is_held_untyped(self):
+        # AGAST #3606: a bare async call yields its future, whose type no source
+        # can spell, so an executor holds it untyped (`var p = get()`).  The
+        # emitter refuses a mismatched annotation (`var p: i32 = get()`); the
+        # checker leaves the opaque call alone, as it always has.
         src = ("async fn get() -> i32\n    1\n\n"
-               "fn f() -> i32\n    var p: get_Future = get()\n    0\n")
-        assert types(src) == []
+               "fn f() -> i32\n    var p = get()\n    0\n")
+        assert names(src) == [] and types(src) == []
 
 
 class TestMutationSurvivors:

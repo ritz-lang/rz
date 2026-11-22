@@ -395,7 +395,8 @@ class CallEmitter:
                     # Argument is already a pointer type - just emit it
                     val = self._emit_expr(arg)
                     # Any async fn's future is a `Future` (LARB R79): the
-                    # checker judged the referent, the pointer is cast.
+                    # generated `NAME$Future` is unspellable (AGAST #3606),
+                    # so a pointer argument is cast to the slot's type.
                     if (future_rules.is_future(resolve_alias_in(param_def.type.inner, self.type_aliases))
                             and isinstance(val.type, ir.PointerType)):
                         val = self.builder.bitcast(val, expected_type)
