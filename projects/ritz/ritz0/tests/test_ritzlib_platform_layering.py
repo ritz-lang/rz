@@ -190,7 +190,7 @@ fn main() -> i32
     var s: String = string_new()
     string_push(@&s, 65)
     var m: HashMapI64 = hashmap_i64_new()
-    hashmap_i64_insert(@&m, 1, 2)
+    m.insert(1, 2)
     return v.len as i32
 """
 

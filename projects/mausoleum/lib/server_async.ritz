@@ -29,16 +29,6 @@ import ritzlib.async.tasks {
     TaskPool,
     TaskServer,
     task_server_create,
-    task_server_free,
-    task_server_run,
-    task_server_set_idle_timeout,
-    task_server_set_max_connections,
-    task_server_set_shutdown_hook,
-    task_submit_recv,
-    task_submit_send,
-    task_submit_send_buf,
-    task_submit_recv_buf,
-    task_reset_for_recv,
     TASK_BUFFER_SIZE,
     TASK_WAITING,
     get_current_time
@@ -457,7 +447,7 @@ fn get_storage() -> *Storage
 # a configurable buffer offset.
 fn m7sp_submit_recv_at(task: *Task, offset: i32) -> i32
     let pool: *TaskPool = task.user_data as *TaskPool
-    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+    let sqe: *IoUringSqe = match pool.ring.get_sqe()
         Some(p) => p
         None => return -12  # ENOMEM
 
@@ -466,8 +456,8 @@ fn m7sp_submit_recv_at(task: *Task, offset: i32) -> i32
     if remaining <= 0
         return -1  # buffer exhausted — message larger than 8 KiB
 
-    uring_prep_recv(sqe, task.fd, buf_ptr, remaining as u64, 0, task.id)
-    uring_sqe_submit(pool.ring)
+    sqe.prep_recv(task.fd, buf_ptr, remaining as u64, 0, task.id)
+    pool.ring.sqe_submit()
     task.state = TASK_WAITING
     return 0
 
@@ -513,7 +503,7 @@ fn m7sp_recv_more(task: *Task, session: *M7SPSession) -> i32
         # Exactly the rest of this message: what follows is the next one's.
         let pool: *TaskPool = task.user_data as *TaskPool
         let rest: *u8 = (session.big_recv as *u8) + session.have
-        if task_submit_recv_buf(pool, task, Span<u8> { ptr: (rest), len: (session.msg_len - session.have) as i64 })
+        if pool.submit_recv_buf(task, Span<u8> { ptr: (rest), len: (session.msg_len - session.have) as i64 })
             return 0
         return -12  # ENOMEM
     return m7sp_submit_recv_at(task, session.have)
@@ -525,7 +515,7 @@ fn m7sp_submit_out(task: *Task, session: *M7SPSession, out: *u8, len: i32) -> i3
     session.send_len = len
     session.send_pos = 0
     let pool: *TaskPool = task.user_data as *TaskPool
-    if task_submit_send_buf(pool, task, Span<u8> { ptr: (out), len: (len) as i64 })
+    if pool.submit_send_buf(task, Span<u8> { ptr: (out), len: (len) as i64 })
         return 0
     return -12  # ENOMEM
 
@@ -567,7 +557,7 @@ pub fn m7sp_send_progress(task: *Task, session: *M7SPSession) -> i32
         return 0
     let pool: *TaskPool = task.user_data as *TaskPool
     let rest: *u8 = (session.send_ptr as *u8) + session.send_pos
-    if not task_submit_send_buf(pool, task, Span<u8> { ptr: (rest), len: (session.send_len - session.send_pos) as i64 })
+    if not pool.submit_send_buf(task, Span<u8> { ptr: (rest), len: (session.send_len - session.send_pos) as i64 })
         return -1
     return 1
 
@@ -1074,23 +1064,23 @@ fn shutdown_submit_signal_read()
     if g_signal_fd < 0 or g_srv == 0
         return
     let srv: *TaskServer = g_srv as *TaskServer
-    let sqe: *IoUringSqe = match uring_get_sqe(@srv.ring)
+    let sqe: *IoUringSqe = match srv.ring.get_sqe()
         Some(p) => p
         None => return
     # Offset -1: read at the file position (a signalfd has none to seek).
-    uring_prep_read(sqe, g_signal_fd, @g_sig_buf[0], 128, -1, SHUTDOWN_SIGNAL_UD)
-    uring_sqe_submit(@srv.ring)
+    sqe.prep_read(g_signal_fd, @g_sig_buf[0], 128, -1, SHUTDOWN_SIGNAL_UD)
+    srv.ring.sqe_submit()
 
 
 fn shutdown_wake_loop()
     if g_srv == 0
         return
     let srv: *TaskServer = g_srv as *TaskServer
-    let sqe: *IoUringSqe = match uring_get_sqe(@srv.ring)
+    let sqe: *IoUringSqe = match srv.ring.get_sqe()
         Some(p) => p
         None => return
-    uring_prep_nop(sqe, SHUTDOWN_WAKE_UD)
-    uring_sqe_submit(@srv.ring)
+    sqe.prep_nop(SHUTDOWN_WAKE_UD)
+    srv.ring.sqe_submit()
 
 
 # Between requests: nothing of a next request received, no SCAN pending,
@@ -1111,13 +1101,13 @@ fn shutdown_begin_drain()
     # that refuses IORING_OP_TIMEOUT completes it at once with -EINVAL;
     # then only a second signal cuts a stalled drain short.
     let srv: *TaskServer = g_srv as *TaskServer
-    let sqe: *IoUringSqe = match uring_get_sqe(@srv.ring)
+    let sqe: *IoUringSqe = match srv.ring.get_sqe()
         Some(p) => p
         None => return
     g_drain_ts.tv_sec = DRAIN_GRACE_SECS
     g_drain_ts.tv_nsec = 0
-    uring_prep_timeout(sqe, @g_drain_ts, 0, 0, SHUTDOWN_TIMER_UD)
-    uring_sqe_submit(@srv.ring)
+    sqe.prep_timeout(@g_drain_ts, 0, 0, SHUTDOWN_TIMER_UD)
+    srv.ring.sqe_submit()
 
 
 # One drain pass: count busy sessions.  Returns 1 when none is (the loop
@@ -1164,7 +1154,7 @@ fn shutdown_install(srv: *TaskServer)
     if g_signal_fd < 0
         prints("Warning: Failed to create signalfd, shutdown may not be graceful\n")
         return
-    task_server_set_shutdown_hook(srv, shutdown_hook)
+    srv.set_shutdown_hook(shutdown_hook)
     shutdown_submit_signal_read()
 
 
@@ -1210,7 +1200,7 @@ fn handle_task_event(task: *Task) -> i32
             return 1    # shutting down: close a new connection unserved
         m7sp_session_init(idx)
         let pool: *TaskPool = task.user_data as *TaskPool
-        if not task_submit_recv(pool, task)
+        if not pool.submit_recv(task)
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1284,7 +1274,7 @@ fn handle_task_event(task: *Task) -> i32
         session.msg_len = 0
         session.recv_big = 0
 
-        if not task_reset_for_recv(task)
+        if not task.reset_for_recv()
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1401,7 +1391,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
             return 1    # shutting down: close a new connection unserved
         m7sp_session_init_encrypted(idx)
         let pool: *TaskPool = task.user_data as *TaskPool
-        if not task_submit_recv(pool, task)
+        if not pool.submit_recv(task)
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1418,7 +1408,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
         session.parse_state = PARSE_NEED_HEADER
         session.have = 0
         session.msg_len = 0
-        if not task_reset_for_recv(task)
+        if not task.reset_for_recv()
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1496,7 +1486,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
         session.have = 0
         session.msg_len = 0
         session.recv_big = 0
-        if not task_reset_for_recv(task)
+        if not task.reset_for_recv()
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1655,15 +1645,15 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
     srv.pool.ring = @srv.ring
 
     # Reasonable defaults; tunable later.
-    task_server_set_idle_timeout(srv, 60)
-    task_server_set_max_connections(srv, 1000)
+    srv.set_idle_timeout(60)
+    srv.set_max_connections(1000)
     shutdown_install(srv)
 
-    let ret: i32 = task_server_run(srv, handle_task_event)
+    let ret: i32 = srv.run(handle_task_event)
 
     prints("Mausoleum (async): shutting down\n")
     shutdown_uninstall()
-    task_server_free(srv)
+    srv.free()
     registry_destroy(@g_registry)
     return ret
 
@@ -1698,14 +1688,14 @@ pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storag
 
     srv.pool.ring = @srv.ring
 
-    task_server_set_idle_timeout(srv, 60)
-    task_server_set_max_connections(srv, 1000)
+    srv.set_idle_timeout(60)
+    srv.set_max_connections(1000)
     shutdown_install(srv)
 
-    let ret: i32 = task_server_run(srv, handle_task_event_encrypted)
+    let ret: i32 = srv.run(handle_task_event_encrypted)
 
     prints("Mausoleum (async, encrypted): shutting down\n")
     shutdown_uninstall()
-    task_server_free(srv)
+    srv.free()
     registry_destroy(@g_registry)
     return ret

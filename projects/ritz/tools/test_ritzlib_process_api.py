@@ -37,16 +37,16 @@ WORKSPACE = RITZ_ROOT.parent.parent
 PROCESS = RITZ_ROOT / "ritzlib" / "process.ritz"
 
 MUTATING = [
-    "process_close_stdin",
-    "process_read_stdout",
-    "process_read_stdout_all",
-    "process_read_line",
-    "process_read_stderr",
-    "process_read_stderr_all",
-    "process_wait",
-    "process_kill",
-    "process_close_pipes",
-    "process_cleanup",
+    "close_stdin",
+    "read_stdout",
+    "read_stdout_all",
+    "read_line",
+    "read_stderr",
+    "read_stderr_all",
+    "wait",
+    "kill",
+    "close_pipes",
+    "cleanup",
 ]
 
 DELETED = [
@@ -64,16 +64,16 @@ SKIP_PARTS = {"build", ".git", "node_modules", "__pycache__", "out"}
 
 
 def _signature(name: str) -> str:
-    """The `pub fn name(...) -> T` line of `name` in process.ritz."""
+    """The `pub fn name(...)` line of method `name` in process.ritz."""
     text = PROCESS.read_text()
-    m = re.search(rf"^pub fn {name}\((.*)$", text, re.MULTILINE)
+    m = re.search(rf"^\s*pub fn {name}\((.*)$", text, re.MULTILINE)
     assert m, f"process.ritz has no `pub fn {name}(`"
-    return m.group(0)
+    return m.group(0).lstrip()
 
 
 def _first_param_type(name: str) -> str:
     sig = _signature(name)
-    m = re.match(rf"pub fn {name}\(\s*\w+\s*:\s*([^,)]+)", sig)
+    m = re.match(rf"\s*pub fn {name}\(\s*\w+\s*:\s*([^,)]+)", sig)
     assert m, f"cannot read the first parameter of: {sig}"
     return m.group(1).strip()
 
@@ -84,12 +84,12 @@ def test_mutating_fn_takes_mut_ref(name):
 
 
 def test_process_valid_takes_shared_ref():
-    assert _first_param_type("process_valid") == "@Process"
+    assert _first_param_type("valid") == "@Process"
 
 
 def test_result_success_returns_bool():
-    sig = _signature("result_success")
-    assert _first_param_type("result_success") == "@ProcessResult"
+    sig = _signature("success")
+    assert _first_param_type("success") == "@ProcessResult"
     assert sig.rstrip().endswith("-> bool"), sig
 
 
@@ -104,10 +104,10 @@ def test_spawn_env_takes_views():
 
 RESULT_SIGNATURES = [
     "pub fn spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>",
-    "pub fn process_write_all(p: @&Process, data: StrView) -> Result<i64, Errno>",
-    "pub fn process_read_stdout(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>",
-    "pub fn process_read_stderr(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>",
-    "pub fn process_wait(p: @&Process) -> Result<ProcessResult, Errno>",
+    "pub fn write_all(self: @&Process, data: StrView) -> Result<i64, Errno>",
+    "pub fn read_stdout(self: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>",
+    "pub fn read_stderr(self: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>",
+    "pub fn wait(self: @&Process) -> Result<ProcessResult, Errno>",
 ]
 
 
@@ -121,7 +121,7 @@ def _pub_fn_bodies():
     lines = PROCESS.read_text().splitlines()
     out = []
     for i, line in enumerate(lines):
-        m = re.match(r"^pub fn (\w+)\(", line)
+        m = re.match(r"^\s*pub fn (\w+)\(", line)
         if not m:
             continue
         body = []

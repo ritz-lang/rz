@@ -303,38 +303,36 @@ fn spawn_fork(path: *u8, argv: **u8, envp: **u8) -> Result<Process, Errno>
 # Process validity check
 # ============================================================================
 
-pub fn process_valid(p: @Process) -> bool
-    if p.pid > 0
-        return true
-    return false
+# Methods (S-IMPL-1): a Process is the subject of every operation on it.
+impl Process
+    pub fn valid(self: @Process) -> bool
+        if self.pid > 0
+            return true
+        return false
 
-# ============================================================================
-# Writing to process stdin
-# ============================================================================
+    # Write all of `data` to stdin, retrying short writes and EINTR.
+    # Ok(bytes written: data.len unless the pipe stopped taking bytes), or
+    # Err(BadF) once stdin is closed, Err(Pipe) once the child closed it, ...
+    pub fn write_all(self: @&Process, data: StrView) -> Result<i64, Errno>
+        if self.stdin_fd < 0
+            return Err(Errno.BadF)
+        var done: i64 = 0
+        while done < data.len
+            let n: i64 = sys_write(self.stdin_fd, data.ptr + done, data.len - done)
+            if n == -(EINTR as i64)
+                continue
+            if n < 0
+                return Err(errno_from_raw(n as i32))
+            if n == 0
+                break
+            done += n
+        Ok(done)
 
-# Write all of `data` to stdin, retrying short writes and EINTR.
-# Ok(bytes written: data.len unless the pipe stopped taking bytes), or
-# Err(BadF) once stdin is closed, Err(Pipe) once the child closed it, ...
-pub fn process_write_all(p: @&Process, data: StrView) -> Result<i64, Errno>
-    if p.stdin_fd < 0
-        return Err(Errno.BadF)
-    var done: i64 = 0
-    while done < data.len
-        let n: i64 = sys_write(p.stdin_fd, data.ptr + done, data.len - done)
-        if n == -(EINTR as i64)
-            continue
-        if n < 0
-            return Err(errno_from_raw(n as i32))
-        if n == 0
-            break
-        done += n
-    Ok(done)
-
-# Close stdin (signals EOF to child)
-pub fn process_close_stdin(p: @&Process)
-    if p.stdin_fd >= 0
-        sys_close(p.stdin_fd)
-        p.stdin_fd = -1
+    # Close stdin (signals EOF to child)
+    pub fn close_stdin(self: @&Process)
+        if self.stdin_fd >= 0
+            sys_close(self.stdin_fd)
+            self.stdin_fd = -1
 
 # ============================================================================
 # Reading from process stdout
@@ -350,106 +348,109 @@ fn pipe_read(fd: i32, buf: *u8, max: i64) -> Result<i64, Errno>
         return Err(errno_from_raw(n as i32))
     Ok(n)
 
-# Read up to `max` bytes of the child's stdout into `buf`: Ok(bytes read,
-# 0 at EOF), Err(BadF) once the pipe is closed, else Err(errno).
-pub fn process_read_stdout(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>
-    pipe_read(p.stdout_fd, buf, max)
+impl Process
+    # Read up to `max` bytes of the child's stdout into `buf`: Ok(bytes read,
+    # 0 at EOF), Err(BadF) once the pipe is closed, else Err(errno).
+    pub fn read_stdout(self: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>
+        pipe_read(self.stdout_fd, buf, max)
 
-# Read all stdout into a Vec<u8> (caller owns the Vec)
-pub fn process_read_stdout_all(p: @&Process) -> Vec<u8>
-    var output: Vec<u8> = vec_new<u8>()
+    # Read all stdout into a Vec<u8> (caller owns the Vec)
+    pub fn read_stdout_all(self: @&Process) -> Vec<u8>
+        var output: Vec<u8> = vec_new<u8>()
 
-    if p.stdout_fd < 0
+        if self.stdout_fd < 0
+            return output
+
+        var temp: [4096]u8
+
+        loop
+            let n: i64 = sys_read(self.stdout_fd, @temp[0], 4096)
+            if n <= 0
+                break
+            vec_push_bytes<u8>(@&output, Span<u8> { ptr: (@temp[0]), len: (n) as i64 })
+
         return output
 
-    var temp: [4096]u8
+    # Read one line from stdout (up to newline or EOF)
+    pub fn read_line(self: @&Process) -> Vec<u8>
+        var line: Vec<u8> = vec_new<u8>()
 
-    loop
-        let n: i64 = sys_read(p.stdout_fd, @temp[0], 4096)
-        if n <= 0
-            break
-        vec_push_bytes<u8>(@&output, Span<u8> { ptr: (@temp[0]), len: (n) as i64 })
+        if self.stdout_fd < 0
+            return line
 
-    return output
+        var c: u8 = 0
 
-# Read one line from stdout (up to newline or EOF)
-pub fn process_read_line(p: @&Process) -> Vec<u8>
-    var line: Vec<u8> = vec_new<u8>()
+        loop
+            let n: i64 = sys_read(self.stdout_fd, @c, 1)
+            if n <= 0
+                break
+            vec_push<u8>(@&line, c)
+            if c == '\n'
+                break
 
-    if p.stdout_fd < 0
         return line
-
-    var c: u8 = 0
-
-    loop
-        let n: i64 = sys_read(p.stdout_fd, @c, 1)
-        if n <= 0
-            break
-        vec_push<u8>(@&line, c)
-        if c == '\n'
-            break
-
-    return line
 
 # ============================================================================
 # Reading from process stderr
 # ============================================================================
 
-# process_read_stdout for the child's stderr.
-pub fn process_read_stderr(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>
-    pipe_read(p.stderr_fd, buf, max)
+impl Process
+    # read_stdout for the child's stderr.
+    pub fn read_stderr(self: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>
+        pipe_read(self.stderr_fd, buf, max)
 
-pub fn process_read_stderr_all(p: @&Process) -> Vec<u8>
-    var output: Vec<u8> = vec_new<u8>()
+    pub fn read_stderr_all(self: @&Process) -> Vec<u8>
+        var output: Vec<u8> = vec_new<u8>()
 
-    if p.stderr_fd < 0
+        if self.stderr_fd < 0
+            return output
+
+        var temp: [4096]u8
+
+        loop
+            let n: i64 = sys_read(self.stderr_fd, @temp[0], 4096)
+            if n <= 0
+                break
+            vec_push_bytes<u8>(@&output, Span<u8> { ptr: (@temp[0]), len: (n) as i64 })
+
         return output
-
-    var temp: [4096]u8
-
-    loop
-        let n: i64 = sys_read(p.stderr_fd, @temp[0], 4096)
-        if n <= 0
-            break
-        vec_push_bytes<u8>(@&output, Span<u8> { ptr: (@temp[0]), len: (n) as i64 })
-
-    return output
 
 # ============================================================================
 # Waiting for process
 # ============================================================================
 
-# Close stdin (EOF for the child), then block until it exits: Ok(how it
-# exited), Err(Child) if there is nothing to wait for (never spawned, or
-# already waited), or Err(errno) from wait4(2).  Before #4298 every failure
-# was a ProcessResult whose exit_code was -1.
-pub fn process_wait(p: @&Process) -> Result<ProcessResult, Errno>
-    if p.pid < 0 or p.waited != 0
-        return Err(Errno.Child)
+impl Process
+    # Close stdin (EOF for the child), then block until it exits: Ok(how it
+    # exited), Err(Child) if there is nothing to wait for (never spawned, or
+    # already waited), or Err(errno) from wait4(2).  Before #4298 every failure
+    # was a ProcessResult whose exit_code was -1.
+    pub fn wait(self: @&Process) -> Result<ProcessResult, Errno>
+        if self.pid < 0 or self.waited != 0
+            return Err(Errno.Child)
 
-    # Close stdin to signal EOF if not already closed
-    process_close_stdin(p)
+        # Close stdin to signal EOF if not already closed
+        self.close_stdin()
 
-    var status: i32 = 0
-    let ret: i32 = sys_wait4(p.pid, @status, 0, null)
+        var status: i32 = 0
+        let ret: i32 = sys_wait4(self.pid, @status, 0, null)
 
-    if ret < 0
-        return Err(errno_from_raw(ret))
+        if ret < 0
+            return Err(errno_from_raw(ret))
 
-    p.waited = 1
-    Ok(status_result(status))
+        self.waited = 1
+        Ok(status_result(status))
 
-# The child's result if it has exited (reaping it, as process_wait does), or
-# None if it is still running or there is nothing to wait for.  Never blocks:
-# for a caller with a deadline (AGAST #3883).
-pub fn process_try_wait(p: @&Process) -> Option<ProcessResult>
-    if p.pid < 0 or p.waited != 0
-        return None
-    var status: i32 = 0
-    if sys_wait4(p.pid, @status, WNOHANG, null) <= 0
-        return None
-    p.waited = 1
-    Some(status_result(status))
+    # The child's result if it has exited (reaping it, as wait does), or
+    # None if it is still running or there is nothing to wait for.  Never blocks:
+    # for a caller with a deadline (AGAST #3883).
+    pub fn try_wait(self: @&Process) -> Option<ProcessResult>
+        if self.pid < 0 or self.waited != 0
+            return None
+        var status: i32 = 0
+        if sys_wait4(self.pid, @status, WNOHANG, null) <= 0
+            return None
+        self.waited = 1
+        Some(status_result(status))
 
 # A wait4 status as a ProcessResult.
 fn status_result(status: i32) -> ProcessResult
@@ -482,52 +483,54 @@ fn status_result(status: i32) -> ProcessResult
 # ============================================================================
 
 # Exited normally with code 0.  The code itself is r.exit_code.
-pub fn result_success(r: @ProcessResult) -> bool
-    r.signaled == 0 and r.exit_code == 0
+impl ProcessResult
+    pub fn success(self: @ProcessResult) -> bool
+        self.signaled == 0 and self.exit_code == 0
 
 # ============================================================================
 # Process cleanup
 # ============================================================================
 
-# Kill the process (if still running)
-pub fn process_kill(p: @&Process)
-    if p.pid > 0 and p.waited == 0
-        sys_kill(p.pid, SIGKILL)
+impl Process
+    # Kill the process (if still running)
+    pub fn kill(self: @&Process)
+        if self.pid > 0 and self.waited == 0
+            sys_kill(self.pid, SIGKILL)
 
-# Close all pipe file descriptors
-pub fn process_close_pipes(p: @&Process)
-    if p.stdin_fd >= 0
-        sys_close(p.stdin_fd)
-        p.stdin_fd = -1
-    if p.stdout_fd >= 0
-        sys_close(p.stdout_fd)
-        p.stdout_fd = -1
-    if p.stderr_fd >= 0
-        sys_close(p.stderr_fd)
-        p.stderr_fd = -1
+    # Close all pipe file descriptors
+    pub fn close_pipes(self: @&Process)
+        if self.stdin_fd >= 0
+            sys_close(self.stdin_fd)
+            self.stdin_fd = -1
+        if self.stdout_fd >= 0
+            sys_close(self.stdout_fd)
+            self.stdout_fd = -1
+        if self.stderr_fd >= 0
+            sys_close(self.stderr_fd)
+            self.stderr_fd = -1
 
-# Full cleanup: wait for child if needed, close pipes
-pub fn process_cleanup(p: @&Process)
-    if p.pid > 0 and p.waited == 0
-        # Try to wait non-blocking first
-        var status: i32 = 0
-        let ret: i32 = sys_wait4(p.pid, @status, WNOHANG, null)
-        if ret == 0
-            # Still running - kill it
-            sys_kill(p.pid, SIGTERM)
-            # Brief pause
-            var ts: [2]i64
-            ts[0] = 0
-            ts[1] = 10000000  # 10ms
-            sys_nanosleep(@ts[0], null)
-            # Check again
-            let ret2: i32 = sys_wait4(p.pid, @status, WNOHANG, null)
-            if ret2 == 0
-                # Still alive - SIGKILL
-                sys_kill(p.pid, SIGKILL)
-                sys_wait4(p.pid, @status, 0, null)
+    # Full cleanup: wait for child if needed, close pipes
+    pub fn cleanup(self: @&Process)
+        if self.pid > 0 and self.waited == 0
+            # Try to wait non-blocking first
+            var status: i32 = 0
+            let ret: i32 = sys_wait4(self.pid, @status, WNOHANG, null)
+            if ret == 0
+                # Still running - kill it
+                sys_kill(self.pid, SIGTERM)
+                # Brief pause
+                var ts: [2]i64
+                ts[0] = 0
+                ts[1] = 10000000  # 10ms
+                sys_nanosleep(@ts[0], null)
+                # Check again
+                let ret2: i32 = sys_wait4(self.pid, @status, WNOHANG, null)
+                if ret2 == 0
+                    # Still alive - SIGKILL
+                    sys_kill(self.pid, SIGKILL)
+                    sys_wait4(self.pid, @status, 0, null)
 
-    process_close_pipes(p)
+        self.close_pipes()
 
 # ============================================================================
 # Drop trait implementation (for automatic cleanup)

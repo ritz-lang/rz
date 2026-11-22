@@ -562,7 +562,7 @@ fn main() -> i32
         Ok(_) => t = t + 100
         Err(e) => t = t - e
     let r: Result<(), i32> = f(1)
-    if result_is_ok<(), i32>(@r)
+    if r.is_ok()
         t = t + 20
     t
 """

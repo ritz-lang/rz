@@ -11,7 +11,7 @@ push 4: valid=1
 push 1: valid=1
 push 5: valid=1
 pushed: 5
-sum via box_get: 14
+sum via .get: 14
 pop 0: 3 (valid after drop: 0)
 pop 1: 1 (valid after drop: 0)
 pop 2: 4 (valid after drop: 0)

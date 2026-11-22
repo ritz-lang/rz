@@ -56,7 +56,7 @@ pub fn kmain() -> i32
     var v: Vec<i64> = vec_new<i64>()
     vec_push(@&v, 7)
     var m: HashMapI64 = hashmap_i64_new()
-    hashmap_i64_insert(@&m, 1, 2)
+    m.insert(1, 2)
     let s: String = string_from("core")
     free(p)
     return (m[1] + vec_get(@v, 0) + string_len(@s)) as i32

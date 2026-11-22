@@ -235,7 +235,7 @@ CONTAINERS = {
         "    let bx = box_new<P>(P { a: 1, b: 2, c: 90 })\n"
         "    if hdr(b) != before\n"
         "        return 1\n"
-        "    let q = box_get<P>(@bx)\n"
+        "    let q = bx.get()\n"
         "    if q.a != 1 or q.b != 2 or q.c != 90\n"
         "        return 2\n"
         "    0\n"

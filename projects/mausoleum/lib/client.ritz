@@ -148,19 +148,19 @@ pub fn client_connect(client: *Client, host: StrView, port: i32, collection: Str
     match socket_tcp()
         Ok(s) => client.sock = s
         Err(e) =>
-            client.last_errno = errno_code(e)
+            client.last_errno = e.code()
             client.last_error = PROTO_ERR_DISCONNECTED
             return -3
 
     # Set TCP_NODELAY
-    socket_set_nodelay(@&client.sock)
+    client.sock.set_nodelay()
 
     # Connect to server with a bounded timeout.  An Err carries the errno
     # (ETIMEDOUT, ECONNREFUSED, EINVAL for a host that isn't a dotted quad).
     let connect_errno: i32 = connect_bounded(@&client.sock, host, port)
     if connect_errno != 0
         client.last_errno = connect_errno
-        socket_close(@&client.sock)
+        client.sock.close()
         client.sock.fd = -1
         client.last_error = PROTO_ERR_DISCONNECTED
         return -4
@@ -170,7 +170,7 @@ pub fn client_connect(client: *Client, host: StrView, port: i32, collection: Str
     # handshake below to block forever in recv_message.  Bound recv/send
     # via SO_RCVTIMEO / SO_SNDTIMEO too so the whole client_connect call
     # is wall-clock-bounded.
-    socket_set_io_timeout(@&client.sock, DEFAULT_CONNECT_TIMEOUT_MS)
+    client.sock.set_io_timeout(DEFAULT_CONNECT_TIMEOUT_MS)
 
     # Send CONNECT message
     let req_id: i32 = client.next_request_id
@@ -179,7 +179,7 @@ pub fn client_connect(client: *Client, host: StrView, port: i32, collection: Str
 
     let send_result: i32 = send_message(client)
     if send_result < 0
-        socket_close(@&client.sock)
+        client.sock.close()
         client.sock.fd = -1
         client.last_error = PROTO_ERR_DISCONNECTED
         return -5
@@ -188,7 +188,7 @@ pub fn client_connect(client: *Client, host: StrView, port: i32, collection: Str
     var reader: MessageReader
     let recv_result: i32 = recv_message(client, @reader)
     if recv_result < 0
-        socket_close(@&client.sock)
+        client.sock.close()
         client.sock.fd = -1
         client.last_error = PROTO_ERR_DISCONNECTED
         return -6
@@ -198,13 +198,13 @@ pub fn client_connect(client: *Client, host: StrView, port: i32, collection: Str
     if msg_type == MSG_ERROR
         let error_code: i32 = msgreader_read_i32(@reader)
         client.last_error = error_code
-        socket_close(@&client.sock)
+        client.sock.close()
         client.sock.fd = -1
         return -7
 
     if msg_type != MSG_CONNECTED
         client.last_error = PROTO_ERR_PROTOCOL
-        socket_close(@&client.sock)
+        client.sock.close()
         client.sock.fd = -1
         return -8
 
@@ -214,7 +214,7 @@ pub fn client_connect(client: *Client, host: StrView, port: i32, collection: Str
     # Handshake done — clear the recv/send timeouts so subsequent
     # operations (which may legitimately be long-running, e.g. big
     # scans) aren't constrained to the connect timeout.
-    socket_set_io_timeout(@&client.sock, 0)
+    client.sock.set_io_timeout(0)
     return 0
 
 # Connect to an encrypted server.  Mirrors client_connect except for the
@@ -245,21 +245,21 @@ pub fn client_connect_encrypted(client: *Client, host: StrView, port: i32, colle
     match socket_tcp()
         Ok(s) => client.sock = s
         Err(e) =>
-            client.last_errno = errno_code(e)
+            client.last_errno = e.code()
             client.last_error = PROTO_ERR_DISCONNECTED
             return -3
 
-    socket_set_nodelay(@&client.sock)
+    client.sock.set_nodelay()
 
     let connect_errno: i32 = connect_bounded(@&client.sock, host, port)
     if connect_errno != 0
         client.last_errno = connect_errno
-        socket_close(@&client.sock)
+        client.sock.close()
         client.sock.fd = -1
         client.last_error = PROTO_ERR_DISCONNECTED
         return -4
 
-    socket_set_io_timeout(@&client.sock, DEFAULT_CONNECT_TIMEOUT_MS)
+    client.sock.set_io_timeout(DEFAULT_CONNECT_TIMEOUT_MS)
 
     # Initialize the encrypted channel.  channel_init_client allocates a
     # 64K recv buffer and generates an ephemeral X25519 keypair.  We pass
@@ -267,7 +267,7 @@ pub fn client_connect_encrypted(client: *Client, host: StrView, port: i32, colle
     # we keep `client.sock` as the canonical record and only ever close
     # the fd once (in client_free / client_disconnect).
     if channel_init_client(@client.channel, client.sock) < 0
-        socket_close(@&client.sock)
+        client.sock.close()
         client.sock.fd = -1
         client.last_error = PROTO_ERR_DISCONNECTED
         return -5
@@ -329,7 +329,7 @@ pub fn client_connect_encrypted(client: *Client, host: StrView, port: i32, colle
     # Drop the connect-bound IO timeout for steady-state ops.  Note that
     # socket_set_io_timeout works on the original fd; the channel's
     # internal `ch.sock` shares it, so this lifts the timeout for both.
-    socket_set_io_timeout(@&client.sock, 0)
+    client.sock.set_io_timeout(0)
     return 0
 
 # Disconnect from server
@@ -358,7 +358,7 @@ pub fn client_disconnect(client: *Client) -> i32
         client.sock.fd = -1
         client.encrypted = 0
     else
-        socket_close(@&client.sock)
+        client.sock.close()
         client.sock.fd = -1
 
     client.connected = 0
@@ -401,17 +401,17 @@ pub fn client_last_errno(client: *Client) -> i32
 # Connect `sock` to `host`:`port` within DEFAULT_CONNECT_TIMEOUT_MS: 0 once
 # connected, else the errno from socket_connect_timeout.
 fn connect_bounded(sock: @&Socket, host: StrView, port: i32) -> i32
-    match socket_connect_timeout(sock, host, port, DEFAULT_CONNECT_TIMEOUT_MS)
+    match sock.connect_timeout(host, port, DEFAULT_CONNECT_TIMEOUT_MS)
         Ok(_) => 0
-        Err(e) => errno_code(e)
+        Err(e) => e.code()
 
 # One read into the free tail of recv_buf (plaintext path): bytes read,
 # 0 at end of stream, or -errno.
 fn recv_some(client: *Client) -> i64
     let room: i64 = CLIENT_BUFFER_SIZE as i64 - client.recv_buf.len
-    match socket_recv_into(@&client.sock, @&client.recv_buf, room)
+    match client.sock.recv_into(@&client.recv_buf, room)
         Ok(n) => n
-        Err(e) => 0 - errno_code(e) as i64
+        Err(e) => 0 - e.code() as i64
 
 # Send the message in send_buf.  Routes through the encrypted channel
 # when client.encrypted == 1; otherwise socket_send_all.
@@ -428,7 +428,7 @@ fn send_message(client: *Client) -> i32
             return -1
         return 0
 
-    match socket_send_all(@&client.sock, span_from_ptr<u8>(data, len as i64))
+    match client.sock.send_all(span_from_ptr<u8>(data, len as i64))
         Ok(_) => 0
         Err(_) => -1
 

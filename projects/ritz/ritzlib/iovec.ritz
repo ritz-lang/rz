@@ -36,15 +36,15 @@ struct InlineSlot
 #
 # Usage (valet/lib/response.ritz builds its responses this way):
 #   var builder: IoVecBuilder
-#   iovec_builder_init(@builder)
-#   iovec_append_span(@builder, status_line)     # a Span<u8>: pre-computed length
-#   iovec_append_bytes(@builder, Span<u8> { ptr: c"Content-Length: ", len: 16 })
-#   iovec_append_int(@builder, 13)
-#   iovec_append_crlf(@builder)
-#   iovec_append_crlf(@builder)
-#   iovec_append_span(@builder, body)
-#   let count = iovec_count(@builder)
-#   writev(fd, iovec_ptr(@builder), count)
+#   builder.init()
+#   builder.append_span(status_line)     # a Span<u8>: pre-computed length
+#   builder.append_bytes(Span<u8> { ptr: c"Content-Length: ", len: 16 })
+#   builder.append_int(13)
+#   builder.append_crlf()
+#   builder.append_crlf()
+#   builder.append_span(body)
+#   let count = builder.count()
+#   writev(fd, builder.ptr(), count)
 
 const MAX_IOVECS: i32 = 32
 const POOL_SIZE: i32 = 512   # Bytes for dynamic strings
@@ -56,173 +56,152 @@ struct IoVecBuilder
     pool_used: i32          # Bytes used in pool
 
 
-# Initialize builder
-pub fn iovec_builder_init(b: *IoVecBuilder)
-    b.count = 0
-    b.pool_used = 0
-
-
-# Reset builder for reuse (keeps memory)
-pub fn iovec_builder_reset(b: *IoVecBuilder)
-    b.count = 0
-    b.pool_used = 0
-
-
-# Get pointer to iovec array (for writev)
-pub fn iovec_ptr(b: *IoVecBuilder) -> *Iovec
-    return @b.iovecs[0]
-
-
-# Get number of iovecs
-pub fn iovec_count(b: *IoVecBuilder) -> i32
-    return b.count
-
-
-# ============================================================================
-# Append operations
-# ============================================================================
-#
 # Each append is Ok(the number of bytes it added) or Err(IovecError) when
 # there is no room: the builder holds at most MAX_IOVECS entries and the
 # pool at most POOL_SIZE bytes.  Ok(len) is a real value (the tests compare
 # it), so the failure cannot be an in-band length.
-
 pub enum IovecError
     TooManyVecs
     PoolFull
 
-# Append a Span<u8> slice (zero-copy, length already known - NO strlen!)
-# This is the preferred method for Ritz strings.
-pub fn iovec_append_span(b: *IoVecBuilder, s: Span<u8>) -> Result<i32, IovecError>
-    if b.count >= MAX_IOVECS
-        return Err(IovecError.TooManyVecs)
 
-    b.iovecs[b.count].base = s.ptr
-    b.iovecs[b.count].len = s.len as u64
-    b.count += 1
-    return Ok(s.len as i32)
+# Methods (S-IMPL-1): an IoVecBuilder is the subject of every operation on it.
+impl IoVecBuilder
+    # Initialize builder
+    pub fn init(self: *IoVecBuilder)
+        self.count = 0
+        self.pool_used = 0
 
+    # Reset builder for reuse (keeps memory)
+    pub fn reset(self: *IoVecBuilder)
+        self.count = 0
+        self.pool_used = 0
 
-# Append a static string (zero-copy - points directly to the string literal)
-# NOTE: This calls strlen() - prefer iovec_append_span() with Span<u8> slices!
-pub fn iovec_append_static(b: *IoVecBuilder, s: *u8) -> Result<i32, IovecError>
-    if b.count >= MAX_IOVECS
-        return Err(IovecError.TooManyVecs)
+    # Get pointer to iovec array (for writev)
+    pub fn ptr(self: *IoVecBuilder) -> *Iovec
+        return @self.iovecs[0]
 
-    let slen: u64 = strlen(s)
-    b.iovecs[b.count].base = s
-    b.iovecs[b.count].len = slen
-    b.count += 1
-    return Ok(slen as i32)
+    # Get number of iovecs
+    pub fn count(self: *IoVecBuilder) -> i32
+        return self.count
 
+    # Append a Span<u8> slice (zero-copy, length already known - NO strlen!)
+    # This is the preferred method for Ritz strings.
+    pub fn append_span(self: *IoVecBuilder, s: Span<u8>) -> Result<i32, IovecError>
+        if self.count >= MAX_IOVECS
+            return Err(IovecError.TooManyVecs)
 
-# Append a static string with explicit length (for binary data)
-pub fn iovec_append_bytes(b: *IoVecBuilder, data: Span<u8>) -> Result<i32, IovecError>
-    if b.count >= MAX_IOVECS
-        return Err(IovecError.TooManyVecs)
+        self.iovecs[self.count].base = s.ptr
+        self.iovecs[self.count].len = s.len as u64
+        self.count += 1
+        return Ok(s.len as i32)
 
-    b.iovecs[b.count].base = data.ptr
-    b.iovecs[b.count].len = data.len as u64
-    b.count += 1
-    return Ok(data.len as i32)
+    # Append a static string (zero-copy - points directly to the string literal)
+    # NOTE: This calls strlen() - prefer append_span() with Span<u8> slices!
+    pub fn append_static(self: *IoVecBuilder, s: *u8) -> Result<i32, IovecError>
+        if self.count >= MAX_IOVECS
+            return Err(IovecError.TooManyVecs)
 
+        let slen: u64 = strlen(s)
+        self.iovecs[self.count].base = s
+        self.iovecs[self.count].len = slen
+        self.count += 1
+        return Ok(slen as i32)
 
-# Append a Str slice (zero-copy - uses pre-computed length)
-# This is the preferred method for static strings with known lengths
-# Note: Works with Span<u8> since Str and Span<u8> are structurally identical
-pub fn iovec_append_str(b: *IoVecBuilder, s: Span<u8>) -> Result<i32, IovecError>
-    if b.count >= MAX_IOVECS
-        return Err(IovecError.TooManyVecs)
+    # Append a static string with explicit length (for binary data)
+    pub fn append_bytes(self: *IoVecBuilder, data: Span<u8>) -> Result<i32, IovecError>
+        if self.count >= MAX_IOVECS
+            return Err(IovecError.TooManyVecs)
 
-    b.iovecs[b.count].base = s.ptr
-    b.iovecs[b.count].len = s.len as u64
-    b.count += 1
-    return Ok(s.len as i32)
+        self.iovecs[self.count].base = data.ptr
+        self.iovecs[self.count].len = data.len as u64
+        self.count += 1
+        return Ok(data.len as i32)
 
+    # Append a Str slice (zero-copy - uses pre-computed length)
+    # This is the preferred method for static strings with known lengths
+    # Note: Works with Span<u8> since Str and Span<u8> are structurally identical
+    pub fn append_str(self: *IoVecBuilder, s: Span<u8>) -> Result<i32, IovecError>
+        if self.count >= MAX_IOVECS
+            return Err(IovecError.TooManyVecs)
 
-# Append a dynamic string (copies to pool)
-pub fn iovec_append_copy(b: *IoVecBuilder, s: *u8) -> Result<i32, IovecError>
-    if b.count >= MAX_IOVECS
-        return Err(IovecError.TooManyVecs)
+        self.iovecs[self.count].base = s.ptr
+        self.iovecs[self.count].len = s.len as u64
+        self.count += 1
+        return Ok(s.len as i32)
 
-    let slen: i32 = strlen(s) as i32
-    if b.pool_used + slen > POOL_SIZE
-        return Err(IovecError.PoolFull)  # Pool exhausted
+    # Append a dynamic string (copies to pool)
+    pub fn append_copy(self: *IoVecBuilder, s: *u8) -> Result<i32, IovecError>
+        if self.count >= MAX_IOVECS
+            return Err(IovecError.TooManyVecs)
 
-    # Copy to pool
-    let dest: *u8 = @b.pool[b.pool_used]
-    for i in 0..slen
-        *(dest + i) = *(s + i)
+        let slen: i32 = strlen(s) as i32
+        if self.pool_used + slen > POOL_SIZE
+            return Err(IovecError.PoolFull)  # Pool exhausted
 
-    b.iovecs[b.count].base = dest
-    b.iovecs[b.count].len = slen as u64
-    b.count += 1
-    b.pool_used += slen
-    return Ok(slen)
+        # Copy to pool
+        let dest: *u8 = @self.pool[self.pool_used]
+        for i in 0..slen
+            *(dest + i) = *(s + i)
 
+        self.iovecs[self.count].base = dest
+        self.iovecs[self.count].len = slen as u64
+        self.count += 1
+        self.pool_used += slen
+        return Ok(slen)
 
-# Append an integer as decimal string (uses pool)
-# standard-exempt: ptr-len-param: false positive: `n` is the integer to encode, not a buffer length
-pub fn iovec_append_int(b: *IoVecBuilder, n: i64) -> Result<i32, IovecError>
-    if b.count >= MAX_IOVECS
-        return Err(IovecError.TooManyVecs)
+    # Append an integer as decimal string (uses pool)
+    # standard-exempt: ptr-len-param: false positive: `n` is the integer to encode, not a buffer length
+    pub fn append_int(self: *IoVecBuilder, n: i64) -> Result<i32, IovecError>
+        if self.count >= MAX_IOVECS
+            return Err(IovecError.TooManyVecs)
 
-    # i64 min is 19 digits + sign (fmt_i64_into)
-    if b.pool_used + 21 > POOL_SIZE
-        return Err(IovecError.PoolFull)
+        # i64 min is 19 digits + sign (fmt_i64_into)
+        if self.pool_used + 21 > POOL_SIZE
+            return Err(IovecError.PoolFull)
 
-    let dest: *u8 = @b.pool[b.pool_used]
-    let len: i32 = fmt_i64_into(dest, n) as i32
+        let dest: *u8 = @self.pool[self.pool_used]
+        let len: i32 = fmt_i64_into(dest, n) as i32
 
-    b.iovecs[b.count].base = dest
-    b.iovecs[b.count].len = len as u64
-    b.count += 1
-    b.pool_used += len
-    return Ok(len)
+        self.iovecs[self.count].base = dest
+        self.iovecs[self.count].len = len as u64
+        self.count += 1
+        self.pool_used += len
+        return Ok(len)
 
+    # Append unsigned integer
+    # standard-exempt: ptr-len-param: false positive: `n` is the integer to encode, not a buffer length
+    pub fn append_uint(self: *IoVecBuilder, n: u64) -> Result<i32, IovecError>
+        if self.count >= MAX_IOVECS
+            return Err(IovecError.TooManyVecs)
 
-# Append unsigned integer
-# standard-exempt: ptr-len-param: false positive: `n` is the integer to encode, not a buffer length
-pub fn iovec_append_uint(b: *IoVecBuilder, n: u64) -> Result<i32, IovecError>
-    if b.count >= MAX_IOVECS
-        return Err(IovecError.TooManyVecs)
+        if self.pool_used + 20 > POOL_SIZE
+            return Err(IovecError.PoolFull)
 
-    if b.pool_used + 20 > POOL_SIZE
-        return Err(IovecError.PoolFull)
+        let dest: *u8 = @self.pool[self.pool_used]
+        let len: i32 = fmt_u64_into(dest, n) as i32
 
-    let dest: *u8 = @b.pool[b.pool_used]
-    let len: i32 = fmt_u64_into(dest, n) as i32
+        self.iovecs[self.count].base = dest
+        self.iovecs[self.count].len = len as u64
+        self.count += 1
+        self.pool_used += len
+        return Ok(len)
 
-    b.iovecs[b.count].base = dest
-    b.iovecs[b.count].len = len as u64
-    b.count += 1
-    b.pool_used += len
-    return Ok(len)
+    # Convenience: append CRLF
+    pub fn append_crlf(self: *IoVecBuilder) -> Result<i32, IovecError>
+        return self.append_static(c"\r\n")
 
+    # Total bytes across all iovecs
+    pub fn total_len(self: *IoVecBuilder) -> i64
+        var total: i64 = 0
+        for i in 0..self.count
+            total += self.iovecs[i].len as i64
+        return total
 
-# ============================================================================
-# Convenience: append CRLF
-# ============================================================================
+    # For debugging: print all iovecs
+    pub fn debug_print(self: *IoVecBuilder)
+        let total = self.total_len()
+        print("IoVecBuilder: {self.count} iovecs, {self.pool_used} pool bytes, {total} total bytes\n")
 
-pub fn iovec_append_crlf(b: *IoVecBuilder) -> Result<i32, IovecError>
-    return iovec_append_static(b, c"\r\n")
-
-
-# ============================================================================
-# io_uring / writev integration
-# ============================================================================
-
-# Total bytes across all iovecs
-pub fn iovec_total_len(b: *IoVecBuilder) -> i64
-    var total: i64 = 0
-    for i in 0..b.count
-        total += b.iovecs[i].len as i64
-    return total
-
-
-# For debugging: print all iovecs
-pub fn iovec_debug_print(b: *IoVecBuilder)
-    print("IoVecBuilder: {b.count} iovecs, {b.pool_used} pool bytes, {iovec_total_len(b)} total bytes\n")
-
-    for i in 0..b.count
-        print("  [{i}] len={b.iovecs[i].len as i64}\n")
+        for i in 0..self.count
+            print("  [{i}] len={self.iovecs[i].len as i64}\n")

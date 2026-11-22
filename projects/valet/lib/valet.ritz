@@ -959,10 +959,10 @@ pub fn valet_proxy_arm_yield(task: *Task, micros: i64) -> i32
         if idx >= 0
             let ts: *KernelTimespec = @g_proxy_yield_ts[idx]
             proxy_yield_timespec(ts, micros)
-            if task_submit_timeout(pool, task, ts)
+            if pool.submit_timeout(task, ts)
                 return 0
             return -12
-    if task_submit_nop(pool, task)
+    if pool.submit_nop(task)
         return 0
     return -12
 
@@ -1106,7 +1106,7 @@ pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
     # a reused task's stale write_pos/write_len (AGAST #3678).
     task.write_len = 0
     task.write_pos = 0
-    if not task_send_buf(task, Span<u8> { ptr: (b.ptr), len: (len as i32) as i64 })
+    if not task.send_buf(Span<u8> { ptr: (b.ptr), len: (len as i32) as i64 })
         bigbuf_release_task(task)
         return 1
     return -1
@@ -1201,10 +1201,10 @@ pub fn valet_try_static_raw(app: *Valet, task: *Task, path: *u8, path_len: i32, 
 pub fn valet_task_send(task: *Task, len: i32) -> i32
     let app: *Valet = get_g_app()
     if app.use_send_zc != 0
-        if task_send_zc(task, len)
+        if task.send_zc(len)
             return 0
         return -12
-    if task_send(task, len)
+    if task.send(len)
         return 0
     return -12
 
@@ -1302,7 +1302,7 @@ fn valet_next_request(task: *Task) -> i32
             bigbuf_release(b)
     let rest: i32 = task.read_len - consumed
     if rest <= 0
-        if task_reset_for_recv(task)
+        if task.reset_for_recv()
             return 0
         return -12
     memmove(@task.read_buf[0], @task.read_buf[consumed], rest as i64)
@@ -1310,7 +1310,7 @@ fn valet_next_request(task: *Task) -> i32
     task.write_len = 0
     task.write_pos = 0
     task.handler_state = CONN_STATE_PIPELINE
-    if task_yield(task)
+    if task.yield()
         return 0
     return -12
 
@@ -1325,7 +1325,7 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
             log_warn(c"Request too large, closing connection")
             bigbuf_release(big)
             return valet_send_413(task)
-        if not task_recv_buf(task, Span<u8> { ptr: (big.ptr + big.len), len: (room as i32) as i64 })
+        if not task.recv_buf(Span<u8> { ptr: (big.ptr + big.len), len: (room as i32) as i64 })
             bigbuf_release(big)
             return 1
         return -1
@@ -1338,7 +1338,7 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
         if task.read_len >= VALET_READ_BUF
             log_warn(c"Request headers exceed the read buffer")
             return valet_send_413(task)
-        if not task_recv_buf(task, Span<u8> { ptr: (@task.read_buf[task.read_len]), len: (VALET_READ_BUF - task.read_len) as i64 })
+        if not task.recv_buf(Span<u8> { ptr: (@task.read_buf[task.read_len]), len: (VALET_READ_BUF - task.read_len) as i64 })
             return 1
         return -1
 
@@ -1353,7 +1353,7 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
         log_warn(c"Request too large, closing connection")
         return valet_send_413(task)
     if (f.total >= 0 and want <= VALET_READ_BUF as i64) or (f.total < 0 and task.read_len < VALET_READ_BUF)
-        if not task_recv_buf(task, Span<u8> { ptr: (@task.read_buf[task.read_len]), len: (VALET_READ_BUF - task.read_len) as i64 })
+        if not task.recv_buf(Span<u8> { ptr: (@task.read_buf[task.read_len]), len: (VALET_READ_BUF - task.read_len) as i64 })
             return 1
         return -1
     let nb: *BigBuf = bigbuf_acquire(bigbuf_for(task), want, BIGBUF_RECV)
@@ -1362,7 +1362,7 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
     memcpy(nb.ptr, @task.read_buf[0], task.read_len as i64)
     nb.len = task.read_len as i64
     task.read_len = 0
-    if not task_recv_buf(task, Span<u8> { ptr: (nb.ptr + nb.len), len: ((nb.cap - nb.len) as i32) as i64 })
+    if not task.recv_buf(Span<u8> { ptr: (nb.ptr + nb.len), len: ((nb.cap - nb.len) as i32) as i64 })
         bigbuf_release(nb)
         return 1
     return -1
@@ -1387,7 +1387,7 @@ pub fn valet_handle_connection(task: *Task) -> i32
             # this pool slot may have died mid-request; drop its buffer.
             bigbuf_release_task(task)
             valet_set_consumed(task, 0)
-            let ret: bool = task_recv(task)
+            let ret: bool = task.recv()
             if not ret
                 return 1
             return -1
@@ -1671,7 +1671,7 @@ pub fn valet_handle_connection(task: *Task) -> i32
                 b.pos = b.pos + task.io_result as i64
                 if b.pos < b.len
                     # Short send: resume from where the kernel stopped.
-                    if not task_send_buf(task, Span<u8> { ptr: (b.ptr + b.pos), len: ((b.len - b.pos) as i32) as i64 })
+                    if not task.send_buf(Span<u8> { ptr: (b.ptr + b.pos), len: ((b.len - b.pos) as i32) as i64 })
                         bigbuf_release_task(task)
                         return 1
                     return -1
@@ -1689,7 +1689,7 @@ pub fn valet_handle_connection(task: *Task) -> i32
                 return 1
             task.write_pos = task.write_pos + task.io_result
             if task.write_pos < task.write_len
-                if not task_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+                if not task.send_buf(Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
                     return 1
                 return -1
 
@@ -1767,19 +1767,19 @@ pub fn tls_task_data_free(data: *TlsTaskData)
 
 # TLS-specific I/O helpers that use the pool from TlsTaskData
 pub fn tls_task_recv(task: *Task, tls_data: *TlsTaskData) -> i32
-    if task_submit_recv(tls_data.pool, task)
+    if tls_data.pool.submit_recv(task)
         return 0
     return -12
 
 pub fn tls_task_send(task: *Task, tls_data: *TlsTaskData, len: i32) -> i32
-    if task_submit_send(tls_data.pool, task, len)
+    if tls_data.pool.submit_send(task, len)
         return 0
     return -12
 
 # Receive application data in behind the ciphertext already buffered.
 fn tls_task_recv_app(task: *Task, tls_data: *TlsTaskData) -> i32
     let room: i64 = TLS_RX_CAP - tls_data.rx_len
-    if task_submit_recv_buf(tls_data.pool, task, Span<u8> { ptr: (@tls_data.rx[tls_data.rx_len]), len: (room as i32) as i64 })
+    if tls_data.pool.submit_recv_buf(task, Span<u8> { ptr: (@tls_data.rx[tls_data.rx_len]), len: (room as i32) as i64 })
         return 0
     return -12
 
@@ -2008,7 +2008,7 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
         # flight it hasn't all got, so finish it before waiting on a recv.
         task.write_pos = task.write_pos + task.io_result
         if task.write_pos < task.write_len
-            if not task_submit_send_buf(tls_data.pool, task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+            if not tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
                 tls_task_data_free(tls_data)
                 task.user_data = null
                 return 1
@@ -2142,7 +2142,7 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
         # item 5). Nothing touches write_buf until the whole record is out.
         task.write_pos = task.write_pos + task.io_result
         if task.write_pos < task.write_len
-            if not task_submit_send_buf(tls_data.pool, task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+            if not tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
                 tls_task_data_free(tls_data)
                 task.user_data = null
                 return 1
@@ -2188,7 +2188,7 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
         if task.io_result > 0
             task.write_pos = task.write_pos + task.io_result
             if task.write_pos < task.write_len
-                if task_submit_send_buf(tls_data.pool, task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+                if tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
                     return -1
         tcp_shutdown(task.fd, SHUT_WR)
         tls_task_data_free(tls_data)
@@ -2287,15 +2287,15 @@ pub fn valet_run(app: *Valet) -> i32
     srv.pool.ring = @srv.ring
 
     # Set up shutdown hook to check global shutdown flag
-    task_server_set_shutdown_hook(srv, valet_check_shutdown)
+    srv.set_shutdown_hook(valet_check_shutdown)
 
     # Set idle timeout if configured
     if app.idle_timeout > 0
-        task_server_set_idle_timeout(srv, app.idle_timeout)
+        srv.set_idle_timeout(app.idle_timeout)
 
     # Set max connections limit if configured
     if app.max_connections > 0
-        task_server_set_max_connections(srv, app.max_connections)
+        srv.set_max_connections(app.max_connections)
 
     # Run event loop - use TLS handler if enabled
     var ret: i32
@@ -2303,16 +2303,16 @@ pub fn valet_run(app: *Valet) -> i32
         # Store pool reference for TLS handler
         set_tls_pool(@srv.pool)
         if app.multishot != 0
-            ret = task_server_run_multishot(srv, valet_handle_tls_connection)
+            ret = srv.run_multishot(valet_handle_tls_connection)
         else
-            ret = task_server_run(srv, valet_handle_tls_connection)
+            ret = srv.run(valet_handle_tls_connection)
     else
         if app.multishot != 0
-            ret = task_server_run_multishot(srv, valet_handle_connection)
+            ret = srv.run_multishot(valet_handle_connection)
         else
-            ret = task_server_run(srv, valet_handle_connection)
+            ret = srv.run(valet_handle_connection)
 
     prints("Server shutting down...\n")
-    task_server_free(srv)
+    srv.free()
     sys_close(server_fd)
     return ret

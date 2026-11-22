@@ -63,7 +63,7 @@ def _pub_fns():
 def test_pub_fn_scan_sees_the_api():
     """The guard below is only as good as its scan: it must see real fns."""
     names = {name for name, _ in _pub_fns()}
-    assert {"socket_bind", "socket_connect_timeout", "sys_bind", "send"} <= names
+    assert {"bind", "connect_timeout", "sys_bind", "send"} <= names
 
 
 def test_no_raw_u8_parameter_outside_syscall_shims():
@@ -82,7 +82,7 @@ def test_no_raw_socket_pointer_parameter_outside_syscall_shims():
     """#3880: no fn in net.ritz, impl methods and private fns included, takes
     a raw `*Socket`; a Socket is borrowed as `@Socket` or `@&Socket`."""
     fns = [(m.group(1), m.group(2)) for m in ANY_FN.finditer(NET.read_text())]
-    assert {"socket_close", "close", "accept"} <= {name for name, _ in fns}
+    assert {"close", "accept", "bind"} <= {name for name, _ in fns}
     offenders = [
         f"{name}({params})"
         for name, params in fns
@@ -95,26 +95,26 @@ def test_no_raw_socket_pointer_parameter_outside_syscall_shims():
 # (#3835 connect_timeout, #3880 the rest).  No 0-or-negative-errno i32 and no
 # Socket with fd < 0 standing for an error.
 SIGNATURES = [
-    "pub fn socket_connect_timeout(sock: @&Socket, addr: StrView, port: i32, "
+    "pub fn connect_timeout(self: @&Socket, addr: StrView, port: i32, "
     "timeout_ms: i32) -> Result<(), Errno>",
-    "pub fn socket_close(sock: @&Socket) -> Result<(), Errno>",
-    "pub fn socket_set_opt_int(sock: @&Socket, level: i32, optname: i32, "
+    "pub fn close(self: @&Socket) -> Result<(), Errno>",
+    "pub fn set_opt_int(self: @&Socket, level: i32, optname: i32, "
     "value: i32) -> Result<(), Errno>",
-    "pub fn socket_set_reuseaddr(sock: @&Socket) -> Result<(), Errno>",
-    "pub fn socket_set_reuseport(sock: @&Socket) -> Result<(), Errno>",
-    "pub fn socket_set_nodelay(sock: @&Socket) -> Result<(), Errno>",
-    "pub fn socket_set_io_timeout(sock: @&Socket, timeout_ms: i32) -> Result<(), Errno>",
-    "pub fn socket_listen(sock: @&Socket, backlog: i32) -> Result<(), Errno>",
-    "pub fn socket_accept(sock: @&Socket) -> Result<Socket, Errno>",
-    "pub fn socket_accept_nonblock(sock: @&Socket) -> Result<Socket, Errno>",
+    "pub fn set_reuseaddr(self: @&Socket) -> Result<(), Errno>",
+    "pub fn set_reuseport(self: @&Socket) -> Result<(), Errno>",
+    "pub fn set_nodelay(self: @&Socket) -> Result<(), Errno>",
+    "pub fn set_io_timeout(self: @&Socket, timeout_ms: i32) -> Result<(), Errno>",
+    "pub fn listen(self: @&Socket, backlog: i32) -> Result<(), Errno>",
+    "pub fn accept(self: @&Socket) -> Result<Socket, Errno>",
+    "pub fn accept_nonblock(self: @&Socket) -> Result<Socket, Errno>",
     "pub fn socket_tcp() -> Result<Socket, Errno>",
     "pub fn socket_tcp_nonblock() -> Result<Socket, Errno>",
     "pub fn socket_udp() -> Result<Socket, Errno>",
-    "pub fn socket_bind(sock: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>",
-    "pub fn socket_connect(sock: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>",
-    "pub fn socket_send_all(sock: @&Socket, data: Span<u8>) -> Result<i64, Errno>",
-    "pub fn socket_send_str(sock: @&Socket, s: StrView) -> Result<i64, Errno>",
-    "pub fn socket_recv_into(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, Errno>",
+    "pub fn bind(self: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>",
+    "pub fn connect(self: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>",
+    "pub fn send_all(self: @&Socket, data: Span<u8>) -> Result<i64, Errno>",
+    "pub fn send_str(self: @&Socket, s: StrView) -> Result<i64, Errno>",
+    "pub fn recv_into(self: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, Errno>",
     "pub fn epoll_create() -> Result<i32, Errno>",
     "pub fn epoll_add(epfd: i32, fd: i32, events: u32) -> Result<(), Errno>",
     "pub fn epoll_del(epfd: i32, fd: i32) -> Result<(), Errno>",
@@ -126,9 +126,9 @@ SIGNATURES = [
 @pytest.mark.parametrize("sig", SIGNATURES, ids=lambda s: s.split("(")[0][7:])
 def test_signature(sig):
     head = sig.split("(")[0]
-    m = re.search(rf"^{re.escape(head)}\(.*$", NET.read_text(), re.MULTILINE)
+    m = re.search(rf"^\s*{re.escape(head)}\(.*$", NET.read_text(), re.MULTILINE)
     assert m, f"net.ritz has no `{head}(`"
-    assert m.group(0).rstrip() == sig
+    assert m.group(0).strip() == sig
 
 
 def _pub_fn_bodies(path):

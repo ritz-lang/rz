@@ -17,26 +17,26 @@ import ritzlib.async.runtime
 [[test]]
 fn test_task_pool_init() -> i32
     var ring: IoUring
-    let ret = uring_init(@ring, 64)
+    let ret = ring.init(64)
     if ret < 0
         prints("FAIL: uring_init failed\n")
         return 1
 
     var pool: TaskPool
-    task_pool_init(@pool, @ring)
+    pool.init(@ring)
 
     # Verify initial state
     if pool.active_count != 0
         prints("FAIL: active_count should be 0\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
     if pool.next_id != 1
         prints("FAIL: next_id should be 1\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
-    uring_destroy(@ring)
+    ring.destroy()
     prints("OK: task_pool_init\n")
     return 0
 
@@ -51,43 +51,43 @@ fn dummy_handler(task: *Task) -> i32
 [[test]]
 fn test_task_alloc() -> i32
     var ring: IoUring
-    uring_init(@ring, 64)
+    ring.init(64)
 
     var pool: TaskPool
-    task_pool_init(@pool, @ring)
+    pool.init(@ring)
 
     # Spawn a task
-    let ret = spawn_task(@pool, 99, dummy_handler)
+    let ret = pool.spawn(99, dummy_handler)
     if not ret
         prints("FAIL: spawn_task failed\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
     if pool.active_count != 1
         prints("FAIL: active_count should be 1\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
     # Find the task
     var task: *Task = null
-    match task_pool_find(@pool, 1)  # First task gets ID 1
+    match pool.find(1)  # First task gets ID 1
         Some(t) => task = t
         None =>
             prints("FAIL: task not found\n")
-            uring_destroy(@ring)
+            ring.destroy()
             return 1
 
     if task.fd != 99
         prints("FAIL: task.fd should be 99\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
     if task.state != TASK_READY
         prints("FAIL: task.state should be TASK_READY\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
-    uring_destroy(@ring)
+    ring.destroy()
     prints("OK: task_alloc\n")
     return 0
 
@@ -99,42 +99,42 @@ fn test_task_alloc() -> i32
 [[test]]
 fn test_task_complete() -> i32
     var ring: IoUring
-    uring_init(@ring, 64)
+    ring.init(64)
 
     var pool: TaskPool
-    task_pool_init(@pool, @ring)
+    pool.init(@ring)
 
     # Spawn a task (use -1 for fd so sys_close doesn't fail)
-    spawn_task(@pool, -1, dummy_handler)
+    pool.spawn(-1, dummy_handler)
 
     if pool.active_count != 1
         prints("FAIL: active_count should be 1 after spawn\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
     # Complete the task
     var task: *Task = null
-    match task_pool_find(@pool, 1)
+    match pool.find(1)
         Some(t) => task = t
         None =>
             prints("FAIL: task not found\n")
-            uring_destroy(@ring)
+            ring.destroy()
             return 1
     task.fd = -1  # Prevent close attempt
-    task_complete(@pool, task)
+    pool.complete(task)
 
     if pool.active_count != 0
         prints("FAIL: active_count should be 0 after complete\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
     # Task should now be idle
     if task.state != TASK_IDLE
         prints("FAIL: task.state should be TASK_IDLE\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
-    uring_destroy(@ring)
+    ring.destroy()
     prints("OK: task_complete\n")
     return 0
 
@@ -149,23 +149,23 @@ fn yield_once_handler(task: *Task) -> i32
     g_yield_polls = g_yield_polls + 1
     if task.handler_state == 0
         task.handler_state = 1
-        task_yield(task)
+        task.yield()
         return -1
     return 0
 
 [[test]]
 fn test_run_tasks_resumes_after_yield() -> i32
     var ring: IoUring
-    uring_init(@ring, 64)
+    ring.init(64)
 
     var pool: TaskPool
-    task_pool_init(@pool, @ring)
+    pool.init(@ring)
 
     g_yield_polls = 0
-    spawn_task(@pool, -1, yield_once_handler)
+    pool.spawn(-1, yield_once_handler)
 
-    let ret = run_tasks(@pool)
-    uring_destroy(@ring)
+    let ret = pool.run()
+    ring.destroy()
 
     if ret != 0
         prints("FAIL: run_tasks failed\n")
@@ -195,11 +195,11 @@ struct PipeOp
 # is no hand-written adapter to cast to *Future (LARB R79, AGAST #4009).
 fn pipe_read_source(op: *PipeOp) -> i32
     op.polls = op.polls + 1
-    return runtime_poll_read(op.rt, op.fd, Span<u8> { ptr: (op.buf), len: (op.len) as i64 }, 0)
+    return op.rt.poll_read(op.fd, Span<u8> { ptr: (op.buf), len: (op.len) as i64 }, 0)
 
 fn pipe_write_source(op: *PipeOp) -> i32
     op.polls = op.polls + 1
-    return runtime_poll_write(op.rt, op.fd, Span<u8> { ptr: (op.buf), len: (op.len) as i64 }, 0)
+    return op.rt.poll_write(op.fd, Span<u8> { ptr: (op.buf), len: (op.len) as i64 }, 0)
 
 async fn pipe_read(op: *PipeOp) -> i32
     let result: i32 = await pipe_read_source(op)
@@ -218,7 +218,7 @@ fn test_block_on_read_suspends_then_returns_the_io_result() -> i32
     sys_write(fds[1], c"hello", 5)
 
     var rt: Runtime
-    if runtime_init(@rt) < 0
+    if rt.init() < 0
         prints("FAIL: runtime_init failed\n")
         return 1
 
@@ -231,11 +231,11 @@ fn test_block_on_read_suspends_then_returns_the_io_result() -> i32
     op.polls = 0
 
     var p = pipe_read(@op)
-    block_on(@rt, @&p)
+    rt.block_on(@&p)
     let result: i32 = await p
     let leftover: i32 = rt.waker_io_ready
     let armed: i32 = rt.waker_active
-    runtime_destroy(@rt)
+    rt.destroy()
     sys_close(fds[0])
     sys_close(fds[1])
 
@@ -264,7 +264,7 @@ fn test_block_on_write_reaches_the_fd() -> i32
         return 1
 
     var rt: Runtime
-    if runtime_init(@rt) < 0
+    if rt.init() < 0
         prints("FAIL: runtime_init failed\n")
         return 1
 
@@ -276,9 +276,9 @@ fn test_block_on_write_reaches_the_fd() -> i32
     op.polls = 0
 
     var p = pipe_write(@op)
-    block_on(@rt, @&p)
+    rt.block_on(@&p)
     let result: i32 = await p
-    runtime_destroy(@rt)
+    rt.destroy()
 
     var buf: [4]u8
     let n: i64 = sys_read(fds[0], @buf[0], 4)
@@ -314,7 +314,7 @@ fn test_block_on_read_at_eof_returns_zero() -> i32
     sys_close(fds[1])   # closed and empty: the read completes with 0
 
     var rt: Runtime
-    if runtime_init(@rt) < 0
+    if rt.init() < 0
         prints("FAIL: runtime_init failed\n")
         return 1
 
@@ -327,10 +327,10 @@ fn test_block_on_read_at_eof_returns_zero() -> i32
     op.polls = 0
 
     var p = pipe_read(@op)
-    block_on(@rt, @&p)
+    rt.block_on(@&p)
     let result: i32 = await p
     let leftover: i32 = rt.waker_io_ready
-    runtime_destroy(@rt)
+    rt.destroy()
     sys_close(fds[0])
 
     if result != 0
@@ -352,7 +352,7 @@ fn test_block_on_zero_length_write_returns_zero() -> i32
         return 1
 
     var rt: Runtime
-    if runtime_init(@rt) < 0
+    if rt.init() < 0
         prints("FAIL: runtime_init failed\n")
         return 1
 
@@ -364,9 +364,9 @@ fn test_block_on_zero_length_write_returns_zero() -> i32
     op.polls = 0
 
     var p = pipe_write(@op)
-    block_on(@rt, @&p)
+    rt.block_on(@&p)
     let result: i32 = await p
-    runtime_destroy(@rt)
+    rt.destroy()
     sys_close(fds[0])
     sys_close(fds[1])
 
@@ -391,7 +391,7 @@ fn test_poll_source_eperm_result_is_not_pending() -> i32
         return 1
 
     var rt: Runtime
-    if runtime_init(@rt) < 0
+    if rt.init() < 0
         prints("FAIL: runtime_init failed\n")
         return 1
 
@@ -408,7 +408,7 @@ fn test_poll_source_eperm_result_is_not_pending() -> i32
 
     let result: i32 = pipe_read_source(@op)
     let cleared: i32 = rt.waker_io_ready
-    runtime_destroy(@rt)
+    rt.destroy()
     sys_close(fds[0])
     sys_close(fds[1])
 
@@ -454,10 +454,10 @@ fn test_block_on_pending_without_a_waker_fails_loudly() -> i32
         sys_close(err_pipe[1])
 
         var rt: Runtime
-        if runtime_init(@rt) < 0
+        if rt.init() < 0
             sys_exit(2)
         var p = never_ready()
-        block_on(@rt, @&p)
+        rt.block_on(@&p)
         sys_exit(0)   # reached only if the failure was not loud
 
     sys_close(err_pipe[1])
@@ -493,29 +493,29 @@ fn test_block_on_pending_without_a_waker_fails_loudly() -> i32
 # ============================================================================
 
 fn submit_nop(rt: *Runtime, user_data: i64)
-    let sqe: *IoUringSqe = match uring_get_sqe(@rt.ring)
+    let sqe: *IoUringSqe = match rt.ring.get_sqe()
         Some(p) => p
         None => return
-    uring_prep_nop(sqe, user_data)
-    uring_sqe_submit(@rt.ring)
+    sqe.prep_nop(user_data)
+    rt.ring.sqe_submit()
 
 [[test]]
 fn test_waker_ignores_another_operations_completion() -> i32
     var rt: Runtime
-    if runtime_init(@rt) < 0
+    if rt.init() < 0
         prints("FAIL: runtime_init failed\n")
         return 1
 
-    runtime_waker_register(@rt, 500)
+    rt.waker_register(500)
 
     submit_nop(@rt, 600)
-    runtime_wait_for_io(@rt)
+    rt.wait_for_io()
     let after_stray: i32 = rt.waker_active
 
     submit_nop(@rt, 500)
-    runtime_wait_for_io(@rt)
+    rt.wait_for_io()
     let after_match: i32 = rt.waker_active
-    runtime_destroy(@rt)
+    rt.destroy()
 
     if after_stray != 1
         prints("FAIL: a stray completion disarmed the waker\n")
@@ -533,30 +533,30 @@ fn test_waker_ignores_another_operations_completion() -> i32
 [[test]]
 fn test_uring_writev() -> i32
     var ring: IoUring
-    uring_init(@ring, 64)
+    ring.init(64)
 
     var sqe: *IoUringSqe = null
-    match uring_get_sqe(@ring)
+    match ring.get_sqe()
         Some(p) => sqe = p
         None =>
             prints("FAIL: uring_get_sqe failed\n")
-            uring_destroy(@ring)
+            ring.destroy()
             return 1
 
     # Just verify the function compiles and can be called
     var buf: [16]u8
-    uring_prep_writev(sqe, 1, @buf[0], 1, 0, 123)
+    sqe.prep_writev(1, @buf[0], 1, 0, 123)
 
     if sqe.opcode != IORING_OP_WRITEV
         prints("FAIL: opcode should be IORING_OP_WRITEV\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
     if sqe.user_data != 123
         prints("FAIL: user_data should be 123\n")
-        uring_destroy(@ring)
+        ring.destroy()
         return 1
 
-    uring_destroy(@ring)
+    ring.destroy()
     prints("OK: uring_writev\n")
     return 0

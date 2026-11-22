@@ -400,7 +400,7 @@ HASHMAP = _program("import ritzlib.hashmap\n\n", """\
     m[1] = 10
     m[1] += 5
     m[2] = 1
-    if hashmap_i64_len(@m) != 2
+    if m.len() != 2
         return 1
     let p: @i64 = @m[1]
     let v: i64 = *p - 15

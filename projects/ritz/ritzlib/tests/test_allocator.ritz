@@ -23,7 +23,7 @@ struct CountingArena
 
 fn counting_alloc(ctx: *u8, len: i64) -> *u8
     let c: *CountingArena = ctx as *CountingArena
-    let p: *u8 = arena_alloc(@c.arena, len)
+    let p: *u8 = c.arena.alloc(len)
     if p != null
         c.allocs += 1
         c.live_bytes += len
@@ -89,7 +89,7 @@ fn test_vec_on_arena_and_global_heap_coexist() -> i32
     let again: *u8 = malloc(1024)
     assert again == g_global_vec_data
     free(again)
-    arena_destroy(@c.arena)
+    c.arena.destroy()
     0
 
 [[test_helper]]
@@ -113,7 +113,7 @@ fn test_vec_with_cap_in_reserves_from_the_allocator() -> i32
         return 1
     assert c.frees == 1
     assert c.live_bytes == 0
-    arena_destroy(@c.arena)
+    c.arena.destroy()
     0
 
 [[test_helper]]
@@ -149,7 +149,7 @@ fn test_string_on_an_allocator() -> i32
     if use_cap_string(@a) != 0
         return 1
     assert c.allocs == c.frees
-    arena_destroy(@c.arena)
+    c.arena.destroy()
     0
 
 struct Pt
@@ -185,7 +185,7 @@ fn test_hashmap_on_an_allocator_grows_in_it() -> i32
     assert c.frees == 4
     for i in 0..100
         assert get_or(@m, Pt { x: i, y: 0 - i }, -1) == i * 10
-    hashmap_drop<Pt, i64>(@&m)
+    m.free()
     assert c.allocs == c.frees
     assert c.live_bytes == 0
 
@@ -193,9 +193,9 @@ fn test_hashmap_on_an_allocator_grows_in_it() -> i32
     for i in 0..100
         g.insert(Pt { x: i, y: i }, i)
     assert allocator_of(g.slots.data as *u8) == null
-    hashmap_drop<Pt, i64>(@&g)
+    g.free()
     assert c.allocs == c.frees
-    arena_destroy(@c.arena)
+    c.arena.destroy()
     0
 
 # The low-level interface: malloc_in / realloc / free on a tagged block.
@@ -203,7 +203,7 @@ fn test_hashmap_on_an_allocator_grows_in_it() -> i32
 fn test_malloc_in_realloc_free_route_to_the_owner() -> i32
     var c: CountingArena
     var a: Allocator = counting_new(@c, 65536)
-    let p: *u8 = malloc_in(@a, 24)
+    let p: *u8 = a.malloc(24)
     assert p != null
     assert c.allocs == 1
     for i in 0..24
@@ -224,16 +224,17 @@ fn test_malloc_in_realloc_free_route_to_the_owner() -> i32
     assert c.frees == 2
     assert c.live_bytes == 0
     # realloc(p, 0) frees into the owner too.
-    let r: *u8 = malloc_in(@a, 8)
+    let r: *u8 = a.malloc(8)
     assert realloc(r, 0) == null
     assert c.allocs == c.frees
     # A null allocator is the global heap.
-    let h: *u8 = malloc_in(null, 64)
+    let no_alloc: *Allocator = null
+    let h: *u8 = no_alloc.malloc(64)
     assert h != null
     assert allocator_of(h) == null
     free(h)
     assert allocator_of(null) == null
-    arena_destroy(@c.arena)
+    c.arena.destroy()
     0
 
 # An allocator that is out of memory makes the _in constructors fail empty.
@@ -246,7 +247,7 @@ fn none_free(ctx: *u8, p: *u8, len: i64) -> i32
 [[test]]
 fn test_exhausted_allocator_returns_null() -> i32
     var a: Allocator = Allocator { ctx: null, alloc: none_alloc, free: none_free }
-    assert malloc_in(@a, 16) == null
+    assert a.malloc(16) == null
     var v: Vec<i64> = vec_with_cap_in<i64>(@a, 10)
     assert v.data == null
     assert vec_cap<i64>(@v) == 0
@@ -265,18 +266,18 @@ fn use_arena_vec(a: *Allocator, ar: *Arena) -> i32
     assert v.data as i64 >= lo and v.data as i64 < lo + ar.size
     for i in 0..300
         assert vec_get<i64>(@v, i) == i
-    let used: i64 = arena_used(ar)
-    assert arena_used(ar) == used
+    let used: i64 = ar.used()
+    assert ar.used() == used
     return 0
 
 [[test]]
 fn test_arena_allocator_backs_a_vec() -> i32
     var ar: Arena = arena_new(65536)
-    var a: Allocator = arena_allocator(@ar)
+    var a: Allocator = ar.allocator()
     # The Vec drops at the helper's return, before its arena is destroyed.
     if use_arena_vec(@a, @ar) != 0
         return 1
-    arena_destroy(@ar)
+    ar.destroy()
     0
 
 # pages_allocator: every block is its own mapping from the given PageSource,
@@ -314,13 +315,14 @@ fn build_pages_vec(a: *Allocator) -> i32
 [[test]]
 fn test_pages_allocator_frees_to_its_own_source() -> i32
     var src: PageSource = PageSource { map: pa_map, unmap: pa_unmap }
-    var a: Allocator = pages_allocator(@src)
+    var a: Allocator = src.allocator()
     # Swap the global page source for one that can't map or unmap: the Vec's
     # memory still goes back to its own source while this is installed.
-    let prev: PageSource = page_source_set(PageSource { map: enomem_map, unmap: never_unmap })
+    var page_src: PageSource = PageSource { map: enomem_map, unmap: never_unmap }
+    let prev: PageSource = page_src.set()
     if build_pages_vec(@a) != 0
         return 1
-    page_source_set(prev)
+    prev.set()
     assert g_pa_unmaps == g_pa_maps
     0
 
@@ -360,20 +362,21 @@ fn hp_reset()
 fn test_heap_allocator_packs_small_vecs_into_slabs() -> i32
     hp_reset()
     var h: Heap
-    heap_init(@h, PageSource { map: hp_map, unmap: hp_unmap })
-    var a: Allocator = heap_allocator(@h)
+    h.init(PageSource { map: hp_map, unmap: hp_unmap })
+    var a: Allocator = h.allocator()
     assert g_hp_maps == 0
     # The Vec headers live on the global heap, allocated before the swap.
     let vs: *Vec<u8> = calloc(1000, sizeof(Vec<u8>)) as *Vec<u8>
     assert vs != null
-    let prev: PageSource = page_source_set(PageSource { map: enomem_map, unmap: never_unmap })
+    var page_src: PageSource = PageSource { map: enomem_map, unmap: never_unmap }
+    let prev: PageSource = page_src.set()
     for i in 0..1000
         let vp: *Vec<u8> = vs + i
         *vp = vec_new_in<u8>(@a)
         for j in 0..12
             assert vec_push<u8>(@&*vp, (i + j) as u8)
         assert allocator_of(vp.data as *u8) == @a
-    page_source_set(prev)
+    prev.set()
     # 1000 live 16-byte blocks plus their freed 8-byte first blocks: a slab
     # or two per size class.
     assert g_hp_maps >= 1
@@ -398,7 +401,7 @@ fn test_heap_allocator_packs_small_vecs_into_slabs() -> i32
         *vp = vec_with_cap_in<u8>(@a, 16)
         assert vp.data != null
     assert g_hp_maps == maps
-    heap_destroy(@h)
+    h.destroy()
     assert g_hp_unmaps == g_hp_maps
     assert g_hp_live == 0
     free(vs as *u8)
@@ -410,9 +413,9 @@ fn test_heap_allocator_packs_small_vecs_into_slabs() -> i32
 fn test_heap_allocator_large_blocks_use_its_source() -> i32
     hp_reset()
     var h: Heap
-    heap_init(@h, PageSource { map: hp_map, unmap: hp_unmap })
-    var a: Allocator = heap_allocator(@h)
-    let p: *u8 = malloc_in(@a, 10000)
+    h.init(PageSource { map: hp_map, unmap: hp_unmap })
+    var a: Allocator = h.allocator()
+    let p: *u8 = a.malloc(10000)
     assert p != null
     assert g_hp_maps == 1
     assert allocator_of(p) == @a
@@ -425,17 +428,17 @@ fn test_heap_allocator_large_blocks_use_its_source() -> i32
     assert g_hp_unmaps == 1
     for i in 0..10000
         assert *(q + i) == (i % 199) as u8
-    let r: *u8 = malloc_in(@a, 5000)
+    let r: *u8 = a.malloc(5000)
     assert r != null
     assert g_hp_maps == 3
     free(r)
     assert g_hp_unmaps == 2
     # One small block too, so there is a slab to give back.
-    let s: *u8 = malloc_in(@a, 40)
+    let s: *u8 = a.malloc(40)
     assert s != null
     assert g_hp_maps == 4
     # q and the slab are still live: destroy unmaps both.
-    heap_destroy(@h)
+    h.destroy()
     assert g_hp_unmaps == 4
     assert g_hp_live == 0
     0
@@ -446,21 +449,21 @@ fn test_heap_allocator_large_blocks_use_its_source() -> i32
 fn test_heaps_keep_their_own_bins() -> i32
     hp_reset()
     var h1: Heap
-    heap_init(@h1, PageSource { map: hp_map, unmap: hp_unmap })
+    h1.init(PageSource { map: hp_map, unmap: hp_unmap })
     var h2: Heap
-    heap_init(@h2, PageSource { map: hp_map, unmap: hp_unmap })
-    var a1: Allocator = heap_allocator(@h1)
-    var a2: Allocator = heap_allocator(@h2)
-    let p: *u8 = malloc_in(@a1, 24)
+    h2.init(PageSource { map: hp_map, unmap: hp_unmap })
+    var a1: Allocator = h1.allocator()
+    var a2: Allocator = h2.allocator()
+    let p: *u8 = a1.malloc(24)
     free(p)
-    let q: *u8 = malloc_in(@a2, 24)
+    let q: *u8 = a2.malloc(24)
     assert q != p
     assert allocator_of(q) == @a2
     # h1 hands its own freed block back out.
-    let r: *u8 = malloc_in(@a1, 24)
+    let r: *u8 = a1.malloc(24)
     assert r == p
-    heap_destroy(@h1)
-    heap_destroy(@h2)
+    h1.destroy()
+    h2.destroy()
     assert g_hp_unmaps == g_hp_maps
     assert g_hp_live == 0
     0
@@ -478,32 +481,32 @@ fn test_hashmap_i64_on_an_allocator_grows_in_it() -> i32
     assert c.allocs == 1
     assert allocator_of(m.entries as *u8) == @a
     for i in 0..100
-        hashmap_i64_insert(@&m, i * 7, i)
+        m.insert(i * 7, i)
     # 16 entries -> 32 -> 64 -> 128 -> 256.
-    assert hashmap_i64_cap(@m) == 256
+    assert m.cap() == 256
     assert allocator_of(m.entries as *u8) == @a
     assert c.allocs == 5
     assert c.frees == 4
     for i in 0..100
-        assert hashmap_i64_get(@m, i * 7) == i
-    hashmap_i64_drop(@&m)
+        assert m.get(i * 7) == i
+    m.free()
     assert c.allocs == c.frees
     assert c.live_bytes == 0
 
     var w: HashMapI64 = hashmap_i64_with_cap_in(@a, 100)
-    assert hashmap_i64_cap(@w) == 128
+    assert w.cap() == 128
     assert allocator_of(w.entries as *u8) == @a
-    hashmap_i64_drop(@&w)
+    w.free()
     assert c.allocs == c.frees
 
     # The plain constructor stays on the global heap.
     var g: HashMapI64 = hashmap_i64_new()
     for i in 0..100
-        hashmap_i64_insert(@&g, i, i)
+        g.insert(i, i)
     assert allocator_of(g.entries as *u8) == null
-    hashmap_i64_drop(@&g)
+    g.free()
     assert c.allocs == c.frees
-    arena_destroy(@c.arena)
+    c.arena.destroy()
     0
 
 struct BoxPayload
@@ -516,25 +519,25 @@ fn test_box_on_an_allocator() -> i32
     var c: CountingArena
     var a: Allocator = counting_new(@c, 65536)
     var b: Box<BoxPayload> = box_new_in<BoxPayload>(@a, BoxPayload { a: 1, b: 2, c: 3 })
-    assert box_valid<BoxPayload>(@b)
+    assert b.valid()
     assert c.allocs == 1
     assert allocator_of(b.ptr as *u8) == @a
     assert in_arena(@c, b.ptr as *u8)
-    let v: BoxPayload = box_get<BoxPayload>(@b)
+    let v: BoxPayload = b.get()
     assert v.a == 1 and v.b == 2 and v.c == 3
-    box_drop<BoxPayload>(@&b)
+    b.drop()
     assert c.frees == 1
     assert c.live_bytes == 0
 
     # Out of memory: an empty Box.
     var none: Allocator = Allocator { ctx: null, alloc: none_alloc, free: none_free }
     var e: Box<i64> = box_new_in<i64>(@none, 5)
-    assert not box_valid<i64>(@e)
+    assert not e.valid()
 
     # The plain constructor stays on the global heap.
     var g: Box<i64> = box_new<i64>(7)
     assert allocator_of(g.ptr as *u8) == null
-    box_drop<i64>(@&g)
+    g.drop()
     assert c.frees == 1
-    arena_destroy(@c.arena)
+    c.arena.destroy()
     0

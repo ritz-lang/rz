@@ -6950,16 +6950,16 @@ async fn ready() -> i32
 
 fn main() -> i32
     var rt: Runtime
-    if runtime_init(@rt) < 0
+    if rt.init() < 0
         return 1
     var p = ready()
-    block_on(@rt, @&p)
+    rt.block_on(@&p)
     let v: i32 = await p
-    runtime_destroy(@rt)
+    rt.destroy()
     v - 42
 ```
 
-`block_on(rt, f: @&Future)` returns nothing: it polls `f` until it is ready,
+`rt.block_on(f: @&Future)` returns nothing: it polls `f` until it is ready,
 then the caller reads the result with `await p` (above).  A poll that answers
 `false` must have suspended on an operation it will be woken by; otherwise the
 future can never finish, so `block_on` fails loudly rather than spin.

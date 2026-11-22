@@ -40,17 +40,14 @@ RETIRED_FILES = [
     "async/task.ritz",
 ]
 
-# Each of these was defined by at least two runtimes.
+# Each of these was defined by at least two runtimes.  The operations that
+# used to be free functions (spawn_task, run_tasks, task_server_run*) are
+# methods on these structs now, so the structs are the unique definitions.
 ONE_DEFINITION = [
     ("struct", "Task"),
     ("struct", "TaskPool"),
     ("struct", "TaskServer"),
     ("struct", "Runtime"),
-    ("fn", "spawn_task"),
-    ("fn", "run_tasks"),
-    ("fn", "task_server_run"),
-    ("fn", "task_server_run_multishot"),
-    ("fn", "block_on"),
 ]
 
 RETIRED_IMPORT = re.compile(

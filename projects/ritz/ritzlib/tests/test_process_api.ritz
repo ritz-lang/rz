@@ -3,12 +3,12 @@
 #   find_command_in(name: StrView, path: StrView) -> Option<String>
 #   find_command(name: StrView) -> Option<String>        ($PATH, or a default)
 #   spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>
-#   process_write_all(p: @&Process, data: StrView) -> Result<i64, Errno>
+#   p.write_all(data: StrView) -> Result<i64, Errno>
 #   process_read_stdout / process_read_stderr -> Result<i64, Errno>
-#   process_wait(p: @&Process) -> Result<ProcessResult, Errno>
-#   process_valid(p: @Process) and the other fns on a live Process (#3750)
+#   p.wait() -> Result<ProcessResult, Errno>
+#   p.valid() and the other methods on a live Process (#3750)
 #   Every Err is a ritzlib.errno Errno (AGAST #4298).
-#   result_success(r: @ProcessResult) -> bool
+#   r.success() -> bool
 #
 # A StrView carries no terminator, so every test that matters here hands the
 # API a view whose bytes run on past its length (a slice of a longer
@@ -39,19 +39,19 @@ fn is_none(o: *Option<String>) -> bool
 fn spawn_err(r: *Result<Process, Errno>) -> i32
     match *r
         Ok(_) => 0
-        Err(e) => errno_code(e)
+        Err(e) => e.code()
 
 # The count of an Ok, -1000 - errno for an Err (so a test sees which).
 fn count_of(r: Result<i64, Errno>) -> i64
     match r
         Ok(n) => n
-        Err(e) => -1000 - errno_code(e) as i64
+        Err(e) => -1000 - e.code() as i64
 
-# process_wait's exit code, or -1000 - errno if it failed.
+# p.wait()'s exit code, or -1000 - errno if it failed.
 fn wait_code(p: @&Process) -> i32
-    match process_wait(p)
+    match p.wait()
         Ok(res) => res.exit_code
-        Err(e) => -1000 - errno_code(e)
+        Err(e) => -1000 - e.code()
 
 # Run the spawned process to completion: stdout into *out, the exit code back
 # (-1 if spawn failed).
@@ -59,9 +59,9 @@ fn run(r: *Result<Process, Errno>, out: *Vec<u8>) -> i32
     match *r
         Ok(p) =>
             var q: Process = p
-            *out = process_read_stdout_all(@&q)
+            *out = q.read_stdout_all()
             let code: i32 = wait_code(@&q)
-            process_cleanup(@&q)
+            q.cleanup()
             code
         Err(_) => -1
 
@@ -150,12 +150,12 @@ fn test_spawn_no_args_cat_echoes_stdin() -> i32
     match r
         Ok(p) =>
             var q: Process = p
-            assert count_of(process_write_all(@&q, "hello\n")) == 6
-            process_close_stdin(@&q)
-            var out: Vec<u8> = process_read_stdout_all(@&q)
+            assert count_of(q.write_all("hello\n")) == 6
+            q.close_stdin()
+            var out: Vec<u8> = q.read_stdout_all()
             assert bytes_are(@out, "hello\n") == 1
             assert wait_code(@&q) == 0
-            process_cleanup(@&q)
+            q.cleanup()
         Err(_) =>
             assert false
     0
@@ -234,7 +234,7 @@ fn test_spawn_not_executable_is_eacces() -> i32
     0
 
 # ============================================================================
-# process_write_all(p, StrView)
+# p.write_all(StrView)
 # ============================================================================
 
 [[test]]
@@ -243,12 +243,12 @@ fn test_process_write_all_writes_view_length() -> i32
     match r
         Ok(p) =>
             var q: Process = p
-            assert count_of(process_write_all(@&q, strview_slice("abcNOPE", 0, 3))) == 3
-            process_close_stdin(@&q)
-            var out: Vec<u8> = process_read_stdout_all(@&q)
+            assert count_of(q.write_all(strview_slice("abcNOPE", 0, 3))) == 3
+            q.close_stdin()
+            var out: Vec<u8> = q.read_stdout_all()
             assert bytes_are(@out, "abc") == 1
             assert wait_code(@&q) == 0
-            process_cleanup(@&q)
+            q.cleanup()
         Err(_) =>
             assert false
     0
@@ -259,8 +259,8 @@ fn test_process_write_all_after_close_is_badf() -> i32
     match r
         Ok(p) =>
             var q: Process = p
-            process_close_stdin(@&q)
-            match process_write_all(@&q, "x")
+            q.close_stdin()
+            match q.write_all("x")
                 Ok(_) =>
                     assert false
                 Err(e) => match e
@@ -268,7 +268,7 @@ fn test_process_write_all_after_close_is_badf() -> i32
                     _ =>
                         assert false
             assert wait_code(@&q) == 0
-            process_cleanup(@&q)
+            q.cleanup()
         Err(_) =>
             assert false
     0
@@ -286,13 +286,13 @@ fn test_process_read_stdout_reads_then_eof() -> i32
         Ok(p) =>
             var q: Process = p
             var buf: [16]u8
-            assert count_of(process_read_stdout(@&q, @buf[0], 16)) == 3
+            assert count_of(q.read_stdout(@buf[0], 16)) == 3
             assert strview_eq(strview_from_ptr(@buf[0], 3), "out")
-            assert count_of(process_read_stdout(@&q, @buf[0], 16)) == 0
-            assert count_of(process_read_stderr(@&q, @buf[0], 16)) == 3
+            assert count_of(q.read_stdout(@buf[0], 16)) == 0
+            assert count_of(q.read_stderr(@buf[0], 16)) == 3
             assert strview_eq(strview_from_ptr(@buf[0], 3), "err")
             assert wait_code(@&q) == 0
-            process_cleanup(@&q)
+            q.cleanup()
         Err(_) =>
             assert false
     0
@@ -303,19 +303,19 @@ fn test_process_read_after_close_is_badf() -> i32
     match r
         Ok(p) =>
             var q: Process = p
-            process_kill(@&q)
+            q.kill()
             assert wait_code(@&q) == 128 + 9
-            process_close_pipes(@&q)
+            q.close_pipes()
             var buf: [4]u8
-            assert count_of(process_read_stdout(@&q, @buf[0], 4)) == -1000 - EBADF as i64
-            assert count_of(process_read_stderr(@&q, @buf[0], 4)) == -1000 - EBADF as i64
-            process_cleanup(@&q)
+            assert count_of(q.read_stdout(@buf[0], 4)) == -1000 - EBADF as i64
+            assert count_of(q.read_stderr(@buf[0], 4)) == -1000 - EBADF as i64
+            q.cleanup()
         Err(_) =>
             assert false
     0
 
 # ============================================================================
-# process_valid(p: @Process), result_success(r: @ProcessResult) -> bool
+# p.valid(), r.success() -> bool
 # ============================================================================
 
 # Spawn `sh -c script`, wait for it, and return its ProcessResult; the
@@ -329,20 +329,20 @@ fn sh_result(script: StrView) -> ProcessResult
     match spawn("sh", span_from_ptr<StrView>(@args[0], 2))
         Ok(p) =>
             var q: Process = p
-            assert process_valid(@q)
+            assert q.valid()
             var res: ProcessResult = bad
-            match process_wait(@&q)
+            match q.wait()
                 Ok(w) => res = w
                 Err(_) =>
                     assert false
-            process_cleanup(@&q)
+            q.cleanup()
             res
         Err(_) => bad
 
 [[test]]
 fn test_result_success_is_true_on_exit_0() -> i32
     let r: ProcessResult = sh_result("exit 0")
-    let ok: bool = result_success(@r)
+    let ok: bool = r.success()
     assert ok
     assert r.exit_code == 0
     0
@@ -350,7 +350,7 @@ fn test_result_success_is_true_on_exit_0() -> i32
 [[test]]
 fn test_result_success_is_false_on_nonzero_exit() -> i32
     let r: ProcessResult = sh_result("exit 3")
-    assert not result_success(@r)
+    assert not r.success()
     assert r.exit_code == 3
     0
 
@@ -360,7 +360,7 @@ fn test_result_success_is_false_when_signaled() -> i32
     let r: ProcessResult = sh_result("kill -9 $$")
     assert r.signaled == 1
     assert r.signal == 9
-    assert not result_success(@r)
+    assert not r.success()
     0
 
 [[test]]
@@ -371,9 +371,9 @@ fn test_result_success_rule() -> i32
     let ok: ProcessResult = ProcessResult { exit_code: 0, signaled: 0, signal: 0 }
     let code: ProcessResult = ProcessResult { exit_code: 1, signaled: 0, signal: 0 }
     let sig: ProcessResult = ProcessResult { exit_code: 0, signaled: 1, signal: 9 }
-    assert result_success(@ok)
-    assert not result_success(@code)
-    assert not result_success(@sig)
+    assert ok.success()
+    assert not code.success()
+    assert not sig.success()
     0
 
 [[test]]
@@ -382,8 +382,8 @@ fn test_process_kill_then_wait_reports_signal() -> i32
     match r
         Ok(p) =>
             var q: Process = p
-            process_kill(@&q)
-            match process_wait(@&q)
+            q.kill()
+            match q.wait()
                 Ok(res) =>
                     assert res.signaled == 1
                     assert res.exit_code == 128 + 9
@@ -391,20 +391,20 @@ fn test_process_kill_then_wait_reports_signal() -> i32
                     assert false
             # A second wait finds nothing to wait for: Err(Child), not a
             # ProcessResult whose exit_code -1 stands for "failed".
-            match process_wait(@&q)
+            match q.wait()
                 Ok(_) =>
                     assert false
                 Err(e) => match e
                     Child => pass
                     _ =>
                         assert false
-            process_cleanup(@&q)
+            q.cleanup()
         Err(_) =>
             assert false
     0
 
 # ============================================================================
-# process_try_wait(p: @&Process) -> Option<ProcessResult>  (AGAST #3883)
+# p.try_wait() -> Option<ProcessResult>  (AGAST #3883)
 # ============================================================================
 
 [[test_helper]]
@@ -420,27 +420,27 @@ fn test_process_try_wait_is_none_while_running_then_reaps() -> i32
         Ok(p) =>
             var q: Process = p
             # cat blocks on its open stdin: still running, nothing reaped.
-            var o: Option<ProcessResult> = process_try_wait(@&q)
+            var o: Option<ProcessResult> = q.try_wait()
             assert try_wait_code(@o) == -100
             assert q.waited == 0
-            process_close_stdin(@&q)
+            q.close_stdin()
             var tries: i32 = 0
             var ts: [2]i64
             ts[0] = 0
             ts[1] = 10000000
-            o = process_try_wait(@&q)
+            o = q.try_wait()
             # Up to 30 s: only a cap, since the loop ends as soon as cat
             # exits.  It was 5 s, which a loaded host can use up (#3942).
             while try_wait_code(@o) == -100 and tries < 3000
                 sys_nanosleep(@ts[0], null)
-                o = process_try_wait(@&q)
+                o = q.try_wait()
                 tries += 1
             assert try_wait_code(@o) == 0
             assert q.waited == 1
             # Reaped once: a second call finds nothing.
-            o = process_try_wait(@&q)
+            o = q.try_wait()
             assert try_wait_code(@o) == -100
-            process_cleanup(@&q)
+            q.cleanup()
         Err(_) =>
             assert false
     0

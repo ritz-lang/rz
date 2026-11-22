@@ -190,7 +190,7 @@ pub fn main() -> i32
     p.b
 """,
     # The ticket's full test_level35 shape: ritzlib.result's two-parameter
-    # helpers, called with explicit `<i32, i32>`.
+    # helpers, reached through their generic `Result<T, E>` methods.
     "result_helpers": """\
 import ritzlib.result
 
@@ -202,9 +202,9 @@ fn divide(a: i32, b: i32) -> Result<i32, i32>
 pub fn main() -> i32
     var ok: Result<i32, i32> = divide(14, 2)
     var bad: Result<i32, i32> = divide(1, 0)
-    if not result_is_err<i32, i32>(@bad)
+    if not bad.is_err()
         return 1
-    result_unwrap_or<i32, i32>(@ok, -1)
+    ok.unwrap_or(-1)
 """,
 }
 

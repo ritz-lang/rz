@@ -9,7 +9,7 @@
 # - Arena is the primary allocator for compilers, parsers, etc.
 # - Arenas are cheap to create and destroy (single mmap/munmap)
 # - No per-allocation tracking needed - just bump the offset
-# - Call arena_reset() to reuse memory, arena_destroy() to free
+# - Call m.reset() to reuse memory, m.destroy() to free
 #
 # standard-exempt-file: raw-alloc: ritzlib.memory IS the process allocator; S-OWN-2 sanctions allocator modules
 import ritzlib.str  # For memcpy, memset, memcmp
@@ -76,13 +76,6 @@ pub fn page_source_get() -> PageSource
         return g_page_source
     return PageSource { map: page_map_default, unmap: page_unmap_default }
 
-# Install `src` as the page source; returns the one it replaces.
-pub fn page_source_set(src: PageSource) -> PageSource
-    let prev: PageSource = page_source_get()
-    g_page_source = src
-    g_page_source_installed = true
-    return prev
-
 fn page_map(len: i64) -> *u8
     if not g_page_source_installed
         return ritz_platform_page_map(len)
@@ -121,71 +114,6 @@ pub fn arena_new(size: i64) -> Arena
 # Create a new arena with default size (1 MB)
 pub fn arena_default() -> Arena
     return arena_new(ARENA_DEFAULT_SIZE)
-
-# Allocate `size` bytes from the arena
-# Returns pointer to allocated memory, or nil on failure
-# standard-exempt: null-return: arena bump allocation is the raw allocator boundary: null is out-of-memory (S-OWN-2 sanctions allocator modules)
-# standard-exempt: ptr-len-param: allocator: raw memory primitive below the span layer
-pub fn arena_alloc(a: *Arena, size: i64) -> *u8
-    if size <= 0
-        return null
-
-    # Align to 8 bytes for safety
-    let aligned_size: i64 = (size + 7) & (0 - 8)
-
-    if a.offset + aligned_size > a.size
-        # Out of space
-        return null
-
-    let ptr: *u8 = a.base + a.offset
-    a.offset = a.offset + aligned_size
-    return ptr
-
-# Allocate and zero-initialize `size` bytes
-# standard-exempt: ptr-len-param: allocator: raw memory primitive below the span layer
-pub fn arena_alloc_zero(a: *Arena, size: i64) -> *u8
-    let ptr: *u8 = arena_alloc(a, size)
-    if ptr == null
-        return ptr
-
-    # Zero the memory
-    var i: i64 = 0
-    while i < size
-        *(ptr + i) = 0
-        i += 1
-
-    return ptr
-
-# Allocate space for `count` elements of `elem_size` bytes each
-# standard-exempt: ptr-len-param: allocator: raw memory primitive below the span layer
-pub fn arena_alloc_array(a: *Arena, count: i64, elem_size: i64) -> *u8
-    return arena_alloc(a, count * elem_size)
-
-# Reset the arena (free all allocations, keep the memory)
-pub fn arena_reset(a: *Arena)
-    a.offset = 0
-
-# Destroy the arena (free the underlying memory)
-pub fn arena_destroy(a: *Arena)
-    if a.base != null and a.size > 0
-        page_unmap(a.base, a.size)
-    a.base = null
-    a.size = 0
-    a.offset = 0
-
-# Get the current usage of the arena
-pub fn arena_used(a: *Arena) -> i64
-    return a.offset
-
-# Get the remaining capacity of the arena
-pub fn arena_remaining(a: *Arena) -> i64
-    return a.size - a.offset
-
-# Check if arena is valid (successfully allocated)
-pub fn arena_valid(a: *Arena) -> bool
-    if a.base != null
-        return true
-    return false
 
 # ============================================================================
 # Process Heap
@@ -306,7 +234,7 @@ const HEADER_SIZE: i64 = 16  # Block header (size + padding for alignment)
 # Block header stored before each allocation
 # For size-class: stores class index (0-8)
 # For large: stores actual mmap size (negative to indicate large)
-# For a block from malloc_in(a, ..): owner is a, and size_class is the whole
+# For a block from a.alloc(..): owner is a, and size_class is the whole
 # block's length (header included) as a.alloc handed it out.
 struct BlockHeader
     size_class: i64   # 0-8 for bins, negative for mmap size, length if owned
@@ -659,10 +587,10 @@ pub fn calloc(count: i64, size: i64) -> *u8
 # This is the shape goliath's allocator had (AGAST #1881) plus a ctx, so one
 # alloc fn can serve many instances; goliath now uses this type.
 #
-# malloc_in(a, size) takes size + HEADER_SIZE bytes from a, and the header
+# a.alloc(size) takes size + HEADER_SIZE bytes from a, and the header
 # names a as the block's owner. Plain free and realloc read that header, so
 # collection code calls them unchanged and a block never goes back to the
-# wrong allocator; a null owner is the global heap (malloc_in(null, n) is
+# wrong allocator; a null owner is the global heap (a null Allocator.alloc(n) is
 # malloc(n)). An Allocator must stay where it is (a global, or a var that
 # outlives the blocks) while any block it gave out is live: the header points
 # at it.
@@ -670,28 +598,6 @@ pub struct Allocator
     ctx: *u8
     alloc: fn(*u8, i64) -> *u8
     free: fn(*u8, *u8, i64) -> i32
-
-# size bytes owned by `a`; free/realloc route them back there. A null `a` is
-# the global heap.
-# standard-exempt: null-return: allocation through an Allocator is the raw allocator boundary: null is out-of-memory
-# standard-exempt: ptr-len-param: allocator: raw memory primitive below the span layer
-pub fn malloc_in(a: *Allocator, size: i64) -> *u8
-    if a == null
-        return malloc(size)
-    if size <= 0
-        return null
-    let total: i64 = size + HEADER_SIZE
-    # size near i64 max wraps total; refuse rather than ask for a tiny block.
-    if total <= size
-        return null
-    let f: fn(*u8, i64) -> *u8 = a.alloc
-    let block: *u8 = f(a.ctx, total)
-    if block == null
-        return null
-    let header: *BlockHeader = block as *BlockHeader
-    header.size_class = total
-    header.owner = a
-    return block + HEADER_SIZE
 
 # The Allocator that owns p (a block from malloc, malloc_in or realloc), or
 # null for the global heap and for a null p.
@@ -712,7 +618,7 @@ fn allocator_release(a: *Allocator, block: *u8, len: i64)
 fn realloc_owned(a: *Allocator, ptr: *u8, usable: i64, new_size: i64) -> *u8
     if new_size <= usable
         return ptr
-    let new_ptr: *u8 = malloc_in(a, new_size)
+    let new_ptr: *u8 = a.malloc(new_size)
     if new_ptr == null
         return null
     memcpy(new_ptr, ptr, usable)
@@ -722,16 +628,10 @@ fn realloc_owned(a: *Allocator, ptr: *u8, usable: i64, new_size: i64) -> *u8
 # ---- Allocators over ritzlib's own sources ----
 
 fn arena_allocator_alloc(ctx: *u8, len: i64) -> *u8
-    return arena_alloc(ctx as *Arena, len)
+    return (ctx as *Arena).alloc(len)
 
 fn arena_allocator_free(ctx: *u8, p: *u8, len: i64) -> i32
     return 0
-
-# An Allocator over `arena`: blocks are bumped out of it, and free gives
-# nothing back: the memory returns on arena_reset / arena_destroy, which must
-# not happen while a collection on it is still in use.
-pub fn arena_allocator(arena: *Arena) -> Allocator
-    return Allocator { ctx: arena as *u8, alloc: arena_allocator_alloc, free: arena_allocator_free }
 
 fn pages_allocator_alloc(ctx: *u8, len: i64) -> *u8
     let src: *PageSource = ctx as *PageSource
@@ -749,26 +649,7 @@ fn pages_allocator_free(ctx: *u8, p: *u8, len: i64) -> i32
 fn pages_round(len: i64) -> i64
     return (len + MEM_PAGE_SIZE - 1) / MEM_PAGE_SIZE * MEM_PAGE_SIZE
 
-# An Allocator whose every block is its own whole-page mapping from `src`,
-# given back to `src` on free, whichever PageSource page_source_set has
-# installed by then. Every small block costs a page: heap_allocator, below,
-# packs them into slabs from the source instead.
-pub fn pages_allocator(src: *PageSource) -> Allocator
-    return Allocator { ctx: src as *u8, alloc: pages_allocator_alloc, free: pages_allocator_free }
-
 # ---- Heap: a size-class layer over a PageSource (AGAST #4326) ----
-
-# Fill `h` as a Heap whose slabs and large blocks map from `src` and unmap to
-# it, whatever page_source_set installs later. Nothing is mapped until the
-# first block. Fills in place rather than returning a Heap: a Heap is large,
-# and ritz0 emits an internal sret-copy helper for a large by-value return.
-# `h` must stay at this address while its Allocator or any block from it is
-# live.
-pub fn heap_init(h: *Heap, src: PageSource)
-    heap_init_bins(h)
-    h.own_source = true
-    h.source = src
-    heap_bind(h)
 
 # The size class heap_allocator serves a len-byte request (header included)
 # from, or -1 for a large block.
@@ -817,30 +698,157 @@ fn heap_allocator_free(ctx: *u8, p: *u8, len: i64) -> i32
         link.next.prev = link.prev
     return heap_page_unmap(h, link as *u8, link.map_len)
 
-# An Allocator over `h`: small blocks come out of h's size-class slabs and
-# free puts them back in its bins; a block over 2 KiB is its own mapping from
-# h's source. h must stay where it is while the Allocator or any block from
-# it is live. Binds h's bins to h: this is where a Heap's address is final.
-pub fn heap_allocator(h: *Heap) -> Allocator
-    heap_bind(h)
-    return Allocator { ctx: h as *u8, alloc: heap_allocator_alloc, free: heap_allocator_free }
+# ============================================================================
+# Methods (S-IMPL-1): each type is the subject of every operation on it.
+# ============================================================================
 
-# Unmap every slab and every live large block of h to its source, and leave
-# h empty, ready for reuse. Every block from h is gone with them: nothing
-# allocated from it may be used, or freed, afterwards. The global heap is
-# never destroyed (a no-op on it).
-pub fn heap_destroy(h: *Heap)
-    if h == @g_alloc
-        return
-    var s: *FreeNode = h.slabs
-    while s != null
-        let next: *FreeNode = s.next
-        heap_page_unmap(h, s as *u8, SLAB_SIZE)
-        s = next
-    var l: *LargeLink = h.large
-    while l != null
-        let next: *LargeLink = l.next
-        heap_page_unmap(h, l as *u8, l.map_len)
-        l = next
-    heap_init_bins(h)
-    heap_bind(h)
+impl PageSource
+    # Install `src` as the page source; returns the one it replaces.
+    pub fn set(self: PageSource) -> PageSource
+        let prev: PageSource = page_source_get()
+        g_page_source = self
+        g_page_source_installed = true
+        return prev
+
+    # An Allocator whose every block is its own whole-page mapping from `src`,
+    # given back to `src` on free, whichever PageSource page_source_set has
+    # installed by then. Every small block costs a page: heap_allocator, below,
+    # packs them into slabs from the source instead.
+    pub fn allocator(self: *PageSource) -> Allocator
+        return Allocator { ctx: self as *u8, alloc: pages_allocator_alloc, free: pages_allocator_free }
+
+impl Arena
+    # Allocate `size` bytes from the arena
+    # Returns pointer to allocated memory, or nil on failure
+    # standard-exempt: null-return: arena bump allocation is the raw allocator boundary: null is out-of-memory (S-OWN-2 sanctions allocator modules)
+    # standard-exempt: ptr-len-param: allocator: raw memory primitive below the span layer
+    pub fn alloc(self: *Arena, size: i64) -> *u8
+        if size <= 0
+            return null
+
+        # Align to 8 bytes for safety
+        let aligned_size: i64 = (size + 7) & (0 - 8)
+
+        if self.offset + aligned_size > self.size
+            # Out of space
+            return null
+
+        let ptr: *u8 = self.base + self.offset
+        self.offset = self.offset + aligned_size
+        return ptr
+
+    # Allocate and zero-initialize `size` bytes
+    # standard-exempt: ptr-len-param: allocator: raw memory primitive below the span layer
+    pub fn alloc_zero(self: *Arena, size: i64) -> *u8
+        let ptr: *u8 = self.alloc(size)
+        if ptr == null
+            return ptr
+
+        # Zero the memory
+        var i: i64 = 0
+        while i < size
+            *(ptr + i) = 0
+            i += 1
+
+        return ptr
+
+    # Allocate space for `count` elements of `elem_size` bytes each
+    # standard-exempt: ptr-len-param: allocator: raw memory primitive below the span layer
+    pub fn alloc_array(self: *Arena, count: i64, elem_size: i64) -> *u8
+        return self.alloc(count * elem_size)
+
+    # Reset the arena (free all allocations, keep the memory)
+    pub fn reset(self: *Arena)
+        self.offset = 0
+
+    # Destroy the arena (free the underlying memory)
+    pub fn destroy(self: *Arena)
+        if self.base != null and self.size > 0
+            page_unmap(self.base, self.size)
+        self.base = null
+        self.size = 0
+        self.offset = 0
+
+    # Get the current usage of the arena
+    pub fn used(self: *Arena) -> i64
+        return self.offset
+
+    # Get the remaining capacity of the arena
+    pub fn remaining(self: *Arena) -> i64
+        return self.size - self.offset
+
+    # Check if arena is valid (successfully allocated)
+    pub fn valid(self: *Arena) -> bool
+        if self.base != null
+            return true
+        return false
+
+    # An Allocator over `arena`: blocks are bumped out of it, and free gives
+    # nothing back: the memory returns on arena_reset / arena_destroy, which must
+    # not happen while a collection on it is still in use.
+    pub fn allocator(self: *Arena) -> Allocator
+        return Allocator { ctx: self as *u8, alloc: arena_allocator_alloc, free: arena_allocator_free }
+
+impl Allocator
+    # size bytes owned by `a`; free/realloc route them back there. A null `a` is
+    # the global heap.
+    # standard-exempt: null-return: allocation through an Allocator is the raw allocator boundary: null is out-of-memory
+    # standard-exempt: ptr-len-param: allocator: raw memory primitive below the span layer
+    pub fn malloc(self: *Allocator, size: i64) -> *u8
+        if self == null
+            return malloc(size)
+        if size <= 0
+            return null
+        let total: i64 = size + HEADER_SIZE
+        # size near i64 max wraps total; refuse rather than ask for a tiny block.
+        if total <= size
+            return null
+        let f: fn(*u8, i64) -> *u8 = self.alloc
+        let block: *u8 = f(self.ctx, total)
+        if block == null
+            return null
+        let header: *BlockHeader = block as *BlockHeader
+        header.size_class = total
+        header.owner = self
+        return block + HEADER_SIZE
+
+impl Heap
+    # Fill `h` as a Heap whose slabs and large blocks map from `src` and unmap to
+    # it, whatever page_source_set installs later. Nothing is mapped until the
+    # first block. Fills in place rather than returning a Heap: a Heap is large,
+    # and ritz0 emits an internal sret-copy helper for a large by-value return.
+    # `h` must stay at this address while its Allocator or any block from it is
+    # live.
+    pub fn init(self: *Heap, src: PageSource)
+        heap_init_bins(self)
+        self.own_source = true
+        self.source = src
+        heap_bind(self)
+
+    # An Allocator over `h`: small blocks come out of h's size-class slabs and
+    # free puts them back in its bins; a block over 2 KiB is its own mapping from
+    # h's source. h must stay where it is while the Allocator or any block from
+    # it is live. Binds h's bins to h: this is where a Heap's address is final.
+    pub fn allocator(self: *Heap) -> Allocator
+        heap_bind(self)
+        return Allocator { ctx: self as *u8, alloc: heap_allocator_alloc, free: heap_allocator_free }
+
+    # Unmap every slab and every live large block of h to its source, and leave
+    # h empty, ready for reuse. Every block from h is gone with them: nothing
+    # allocated from it may be used, or freed, afterwards. The global heap is
+    # never destroyed (a no-op on it).
+    pub fn destroy(self: *Heap)
+        if self == @g_alloc
+            return
+        var s: *FreeNode = self.slabs
+        while s != null
+            let next: *FreeNode = s.next
+            heap_page_unmap(self, s as *u8, SLAB_SIZE)
+            s = next
+        var l: *LargeLink = self.large
+        while l != null
+            let next: *LargeLink = l.next
+            heap_page_unmap(self, l as *u8, l.map_len)
+            l = next
+        heap_init_bins(self)
+        heap_bind(self)

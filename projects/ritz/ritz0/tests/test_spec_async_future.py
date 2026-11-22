@@ -59,7 +59,7 @@ def test_section_16_3_documents_the_executor_interface():
         "§16.3 must document `future_poll(f: @&Future) -> bool` (LARB R79, R78)"
     )
     assert "block_on" in section and "@&p" in section, (
-        "§16.3 must show ritzlib's `block_on(rt, @&p)` (LARB R79)"
+        "§16.3 must show ritzlib's `rt.block_on(@&p)` (LARB R79)"
     )
     assert "stored by value" in section, (
         "§16.3 must name what isn't covered: a future stored by value"

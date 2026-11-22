@@ -145,7 +145,7 @@ pub fn main() -> i32
     var r: i32 = 0
     match s.set_reuseaddr()
         Ok(_) => r = 0
-        Err(e) => r = errno_code(e)
+        Err(e) => r = e.code()
     if s.fd < -1000
         match s.accept()
             Ok(c) =>

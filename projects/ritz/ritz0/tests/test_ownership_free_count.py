@@ -3772,7 +3772,7 @@ struct CountingArena
 
 fn counting_alloc(ctx: *u8, len: i64) -> *u8
     let c: *CountingArena = ctx as *CountingArena
-    let p: *u8 = arena_alloc(@c.arena, len)
+    let p: *u8 = c.arena.alloc(len)
     if p != null
         c.allocs += 1
         c.live_bytes += len

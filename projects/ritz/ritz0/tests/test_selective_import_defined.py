@@ -256,14 +256,15 @@ pub fn main() -> i32
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_tempest_network_hashmap_list_is_refused(tmp_path, compiler):
-    """AGAST #4307: tempest/lib/network.ritz's old list. `HashMap`,
-    `hashmap_new` and `hashmap_get` exist since #4306; `hashmap_set`
-    never did (it is `hashmap_insert`)."""
+    """AGAST #4307: tempest/lib/network.ritz's old list. `HashMap` and
+    `hashmap_new` exist since #4306; `hashmap_set` never did (it is
+    `hashmap_insert`, now `HashMap.insert`).  #4445 moved `hashmap_get`
+    to `HashMap.get` too, so it no longer names a hashmap item."""
     main = """\
-import ritzlib.hashmap { HashMap, hashmap_new, hashmap_get, hashmap_set }
+import ritzlib.hashmap { HashMap, hashmap_new, hashmap_set }
 
 pub fn main() -> i32
     0
 """
     assert _errors(compiler, tmp_path, "", main) == [
-        "main.ritz:1:61: `hashmap_set` is not defined in ritzlib.hashmap"]
+        "main.ritz:1:48: `hashmap_set` is not defined in ritzlib.hashmap"]

@@ -68,7 +68,6 @@ PREDICATES = {
         "strview_contains",
     ],
     "span.ritz": [
-        "span_is_empty",
         "span_eq",
         "span_eq_cstr",
         "span_contains",

@@ -66,7 +66,7 @@ fn run_server(port: i32, max_handled: i32)
 
     # Initialize io_uring
     var ring: IoUring
-    if uring_init(@ring, 64) < 0
+    if ring.init(64) < 0
         prints("Failed to init io_uring\n")
         sys_close(server_fd)
         return
@@ -86,36 +86,36 @@ fn run_server(port: i32, max_handled: i32)
 
     # Submit initial accept (user_data is last param)
     var accept_sqe: *IoUringSqe = null
-    match uring_get_sqe(@ring)
+    match ring.get_sqe()
         Some(p) => accept_sqe = p
         None =>
             prints("FAIL: could not get accept SQE\n")
             return
     let accept_ud: i64 = encode_user_data(0, OP_ACCEPT)
-    uring_prep_accept(accept_sqe, server_fd, null, null, 0, accept_ud)
-    uring_sqe_submit(@ring)
-    uring_submit(@ring)
+    accept_sqe.prep_accept(server_fd, null, null, 0, accept_ud)
+    ring.sqe_submit()
+    ring.submit()
     accept_pending = 1
 
     # Event loop
     while total_handled < max_handled or active_conns > 0
-        let completed: i32 = uring_submit_and_wait(@ring, 1)
+        let completed: i32 = ring.submit_and_wait(1)
         if completed < 0
             prints("io_uring wait error\n")
             break
 
         # Process completions
         loop
-            let cqe: *IoUringCqe = match uring_peek_cqe(@ring)
+            let cqe: *IoUringCqe = match ring.peek_cqe()
                 Some(p) => p
                 None => break
 
-            let user_data: i64 = uring_cqe_get_data64(cqe)
+            let user_data: i64 = cqe.get_data64()
             let result: i32 = cqe.res
             let slot: i32 = decode_slot(user_data)
             let op: i64 = decode_op(user_data)
 
-            uring_cqe_seen(@ring, cqe)
+            ring.cqe_seen(cqe)
 
             if op == OP_ACCEPT
                 accept_pending = 0
@@ -132,24 +132,24 @@ fn run_server(port: i32, max_handled: i32)
                         active_conns += 1
 
                         # Submit recv (user_data is last param)
-                        match uring_get_sqe(@ring)
+                        match ring.get_sqe()
                             Some(p) =>
                                 let recv_sqe: *IoUringSqe = p
                                 let recv_ud: i64 = encode_user_data(found_slot, OP_RECV)
-                                uring_prep_recv(recv_sqe, result, conn_bufs[found_slot], BUF_SIZE as u64, 0, recv_ud)
-                                uring_sqe_submit(@ring)
+                                recv_sqe.prep_recv(result, conn_bufs[found_slot], BUF_SIZE as u64, 0, recv_ud)
+                                ring.sqe_submit()
                             None => pass
                     else
                         sys_close(result)
 
                 # Re-submit accept if we want more connections
                 if total_handled < max_handled
-                    match uring_get_sqe(@ring)
+                    match ring.get_sqe()
                         Some(p) =>
                             let new_accept: *IoUringSqe = p
                             let new_accept_ud: i64 = encode_user_data(0, OP_ACCEPT)
-                            uring_prep_accept(new_accept, server_fd, null, null, 0, new_accept_ud)
-                            uring_sqe_submit(@ring)
+                            new_accept.prep_accept(server_fd, null, null, 0, new_accept_ud)
+                            ring.sqe_submit()
                             accept_pending = 1
                         None => pass
 
@@ -162,12 +162,12 @@ fn run_server(port: i32, max_handled: i32)
                     total_handled += 1
                 else
                     # Echo back (user_data is last param)
-                    match uring_get_sqe(@ring)
+                    match ring.get_sqe()
                         Some(p) =>
                             let send_sqe: *IoUringSqe = p
                             let send_ud: i64 = encode_user_data(slot, OP_SEND)
-                            uring_prep_send(send_sqe, conn_fds[slot], conn_bufs[slot], result as u64, 0, send_ud)
-                            uring_sqe_submit(@ring)
+                            send_sqe.prep_send(conn_fds[slot], conn_bufs[slot], result as u64, 0, send_ud)
+                            ring.sqe_submit()
                         None => pass
 
             else if op == OP_SEND
@@ -179,12 +179,12 @@ fn run_server(port: i32, max_handled: i32)
                     total_handled += 1
                 else
                     # Submit another recv
-                    match uring_get_sqe(@ring)
+                    match ring.get_sqe()
                         Some(p) =>
                             let next_recv: *IoUringSqe = p
                             let next_recv_ud: i64 = encode_user_data(slot, OP_RECV)
-                            uring_prep_recv(next_recv, conn_fds[slot], conn_bufs[slot], BUF_SIZE as u64, 0, next_recv_ud)
-                            uring_sqe_submit(@ring)
+                            next_recv.prep_recv(conn_fds[slot], conn_bufs[slot], BUF_SIZE as u64, 0, next_recv_ud)
+                            ring.sqe_submit()
                         None => pass
 
     # Cleanup
@@ -195,7 +195,7 @@ fn run_server(port: i32, max_handled: i32)
     free(conn_fds as *u8)
     free(conn_bufs as *u8)
 
-    uring_cleanup(@ring)
+    ring.cleanup()
     sys_close(server_fd)
 
     prints("Server finished after ")

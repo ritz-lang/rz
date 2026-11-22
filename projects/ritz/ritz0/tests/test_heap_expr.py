@@ -52,7 +52,7 @@ import ritzlib.box
 fn heap_vs_box() -> i64
     var p = heap 42
     var q = box_new<i64>(42)
-    *p + box_get<i64>(@q)
+    *p + q.get()
 
 pub fn main() -> i32
     heap_vs_box() as i32

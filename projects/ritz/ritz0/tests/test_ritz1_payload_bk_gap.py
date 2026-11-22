@@ -134,7 +134,7 @@ fn main() -> i32
     var r: Result<i32, Errno> = unlink("/nonexistent/ritz-4265")
     let code: i64 = match r
         Ok(v) => -1
-        Err(e) => errno_code(e) as i64
+        Err(e) => e.code() as i64
     if code != 2
         return 1
     0

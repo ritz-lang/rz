@@ -7,7 +7,7 @@
 #   match m.get("one")       # Option<i64>: a missing key is None
 #       Some(v) => v
 #       None => 0
-#   hashmap_drop(@&m)
+#   m.free()
 # A primitive key works where the trait's file impls Hash/Eq for it: hash.ritz
 # carries i64 (R36 revisit, #4294), so HashMap<i64, V> is legal too.
 #
@@ -17,8 +17,8 @@
 #
 # Usage:
 #   var m: HashMapI64 = hashmap_i64_new()
-#   hashmap_i64_insert(@&m, 42, 100)
-#   let val: i64 = hashmap_i64_get(@m, 42)
+#   m.insert(42, 100)
+#   let val: i64 = m.get(42)
 #
 # Or by index (LANGUAGE_SPEC §7.8): `m[42] = 100` inserts, and `m[42]` reads,
 # ending the program on a missing key.
@@ -100,7 +100,7 @@ pub fn hashmap_i64_with_cap_in(a: *Allocator, cap: i64) -> HashMapI64
         actual_cap *= 2
 
     let size: i64 = actual_cap * sizeof(HashMapEntryI64)
-    m.entries = malloc_in(a, size) as *HashMapEntryI64
+    m.entries = a.malloc(size) as *HashMapEntryI64
     if m.entries == null
         return m
     m.cap = actual_cap
@@ -129,59 +129,170 @@ impl HashMapI64
     pub fn is_empty(self: @HashMapI64) -> bool
         self.len == 0
 
+    # Drop (free) the hashmap - prefer automatic Drop via scope exit.
+    pub fn free(self: @&HashMapI64)
+        let ptr: *u8 = self.entries as *u8
+        if ptr != null
+            free(ptr)
+        self.entries = null
+        self.cap = 0
+        self.len = 0
+        self.tombstones = 0
+
+    # Clear all entries without freeing the backing allocation — used when a
+    # scope owns the map for its lifetime but wants to reuse the slab between
+    # logical phases (e.g. emit_fn resetting the per-function locals map at
+    # function start).  Cheaper than drop + new for the common `cap` case.
+    pub fn clear(self: @&HashMapI64)
+        if self.entries == null
+            return
+        var i: i64 = 0
+        while i < self.cap
+            let entry: *HashMapEntryI64 = self.entries + i
+            entry.state = Slot.Empty
+            i = i + 1
+        self.len = 0
+        self.tombstones = 0
+
+    # The one lookup probe: the index of the Full slot holding key, or None.  It
+    # stops at the first Empty slot and steps over Tomb ones.  get, value_ptr,
+    # contains and remove are all wrappers over it.
+    pub fn find(self: @HashMapI64, key: i64) -> Option<i64>
+        let mask: i64 = self.cap - 1
+        var idx: i64 = hashmap_i64_home(self, key)
+        var i: i64 = 0
+        while i < self.cap
+            let entry: *HashMapEntryI64 = self.entries + idx
+            if entry.state == Slot.Empty
+                return None
+            if entry.state == Slot.Full and entry.key == key
+                return Some(idx)
+            idx = (idx + 1) & mask
+            i += 1
+        None
+
+    # The slot insert writes key to: key's own slot if present, else the first
+    # Tomb on its chain, else the Empty slot ending the chain; -1 if the table is
+    # full with neither.
+    pub fn find_slot(self: @HashMapI64, key: i64) -> i64
+        let mask: i64 = self.cap - 1
+        var idx: i64 = hashmap_i64_home(self, key)
+        var first_tomb: i64 = -1
+        var i: i64 = 0
+        while i < self.cap
+            let entry: *HashMapEntryI64 = self.entries + idx
+            if entry.state == Slot.Empty
+                if first_tomb >= 0
+                    return first_tomb
+                return idx
+            if entry.state == Slot.Tomb
+                if first_tomb < 0
+                    first_tomb = idx
+            else if entry.key == key
+                return idx
+            idx = (idx + 1) & mask
+            i += 1
+        first_tomb
+
     # Insert or update a key-value pair.
     pub fn insert(self: @&HashMapI64, key: i64, value: i64)
-        hashmap_i64_insert(self, key, value)
+        # An empty table (dropped, or its allocator was out of memory) gets one.
+        if self.cap == 0
+            self.grow()
+            if self.cap == 0
+                return
+        # Check load factor and resize if needed (> 75%)
+        let load: i64 = (self.len + self.tombstones + 1) * 100 / self.cap
+        if load > 75
+            self.grow()
 
-    # Get value for key (returns 0 if not found).
+        let idx: i64 = self.find_slot(key)
+        if idx < 0
+            # Table full - should not happen after resize
+            return
+
+        let entry: *HashMapEntryI64 = self.entries + idx
+
+        if entry.state == Slot.Full  # key is present - update
+            entry.value = value
+        else
+            if entry.state == Slot.Tomb
+                self.tombstones = self.tombstones - 1
+            entry.key = key
+            entry.value = value
+            entry.state = Slot.Full
+            self.len = self.len + 1
+
+    # Get value for key (returns 0 if not found - use contains to check).
     pub fn get(self: @HashMapI64, key: i64) -> i64
-        return hashmap_i64_get(self, key)
+        match self.find(key)
+            Some(idx) =>
+                let entry: *HashMapEntryI64 = self.entries + idx
+                entry.value
+            None => 0
+
+    # The value slot for key, or None when the key is missing.
+    pub fn value_ptr(self: @HashMapI64, key: i64) -> Option<*i64>
+        match self.find(key)
+            Some(idx) =>
+                let entry: *HashMapEntryI64 = self.entries + idx
+                Some(@entry.value)
+            None => None
 
     # Check if key exists.
     pub fn contains(self: @HashMapI64, key: i64) -> bool
-        return hashmap_i64_contains(self, key)
+        match self.find(key)
+            Some(_) => true
+            None => false
 
-    # Remove a key (returns 1 if removed, 0 if not found).
+    # Remove a key (returns 1 if removed, 0 if not found).  Its slot becomes a
+    # Tomb so the chains of keys probed past it still reach them.
     pub fn remove(self: @&HashMapI64, key: i64) -> i32
-        return hashmap_i64_remove(self, key)
+        let idx: i64 = match self.find(key)
+            Some(idx) => idx
+            None => return 0
+        let entry: *HashMapEntryI64 = self.entries + idx
+        entry.state = Slot.Tomb
+        self.len = self.len - 1
+        self.tombstones = self.tombstones + 1
+        1
+
+    # Grow the table (double capacity)
+    pub fn grow(self: @&HashMapI64)
+        let old_entries: *HashMapEntryI64 = self.entries
+        let old_cap: i64 = self.cap
+
+        # Allocate new table with double capacity
+        # The new table comes from the same Allocator as the old one.
+        var new_cap: i64 = old_cap * 2
+        if new_cap == 0
+            new_cap = 16
+        let size: i64 = new_cap * sizeof(HashMapEntryI64)
+        let new_entries: *HashMapEntryI64 = allocator_of(old_entries as *u8).malloc(size) as *HashMapEntryI64
+        if new_entries == null
+            return  # Out of memory: keep the old table
+        self.entries = new_entries
+        self.cap = new_cap
+        self.len = 0
+        self.tombstones = 0
+
+        # Initialize new entries to empty
+        for i in 0..new_cap
+            let entry: *HashMapEntryI64 = self.entries + i
+            entry.state = Slot.Empty
+
+        # Rehash all occupied entries from old table
+        for i in 0..old_cap
+            let old_entry: *HashMapEntryI64 = old_entries + i
+            if old_entry.state == Slot.Full
+                self.insert(old_entry.key, old_entry.value)
+
+        # Free old table (free(null) is a no-op)
+        free(old_entries as *u8)
 
 # ============================================================================
 # Core operations (standalone functions)
 # ============================================================================
-
-pub fn hashmap_i64_len(m: @HashMapI64) -> i64
-    return m.len
-
-pub fn hashmap_i64_cap(m: @HashMapI64) -> i64
-    return m.cap
-
-pub fn hashmap_i64_is_empty(m: @HashMapI64) -> bool
-    m.len == 0
-
-# Drop (free) the hashmap - prefer automatic Drop via scope exit.
-pub fn hashmap_i64_drop(m: @&HashMapI64)
-    let ptr: *u8 = m.entries as *u8
-    if ptr != null
-        free(ptr)
-    m.entries = null
-    m.cap = 0
-    m.len = 0
-    m.tombstones = 0
-
-# Clear all entries without freeing the backing allocation — used when a
-# scope owns the map for its lifetime but wants to reuse the slab between
-# logical phases (e.g. emit_fn resetting the per-function locals map at
-# function start).  Cheaper than drop + new for the common `cap` case.
-pub fn hashmap_i64_clear(m: @&HashMapI64)
-    if m.entries == null
-        return
-    var i: i64 = 0
-    while i < m.cap
-        let entry: *HashMapEntryI64 = m.entries + i
-        entry.state = Slot.Empty
-        i = i + 1
-    m.len = 0
-    m.tombstones = 0
 
 # ============================================================================
 # Find, Insert, Get, Contains, Remove
@@ -191,94 +302,9 @@ pub fn hashmap_i64_clear(m: @&HashMapI64)
 fn hashmap_i64_home(m: @HashMapI64, key: i64) -> i64
     (hash_i64(key) as i64) & (m.cap - 1)
 
-# The one lookup probe: the index of the Full slot holding key, or None.  It
-# stops at the first Empty slot and steps over Tomb ones.  get, value_ptr,
-# contains and remove are all wrappers over it.
-pub fn hashmap_i64_find(m: @HashMapI64, key: i64) -> Option<i64>
-    let mask: i64 = m.cap - 1
-    var idx: i64 = hashmap_i64_home(m, key)
-    var i: i64 = 0
-    while i < m.cap
-        let entry: *HashMapEntryI64 = m.entries + idx
-        if entry.state == Slot.Empty
-            return None
-        if entry.state == Slot.Full and entry.key == key
-            return Some(idx)
-        idx = (idx + 1) & mask
-        i += 1
-    None
-
-# The slot insert writes key to: key's own slot if present, else the first
-# Tomb on its chain, else the Empty slot ending the chain; -1 if the table is
-# full with neither.
-pub fn hashmap_i64_find_slot(m: @HashMapI64, key: i64) -> i64
-    let mask: i64 = m.cap - 1
-    var idx: i64 = hashmap_i64_home(m, key)
-    var first_tomb: i64 = -1
-    var i: i64 = 0
-    while i < m.cap
-        let entry: *HashMapEntryI64 = m.entries + idx
-        if entry.state == Slot.Empty
-            if first_tomb >= 0
-                return first_tomb
-            return idx
-        if entry.state == Slot.Tomb
-            if first_tomb < 0
-                first_tomb = idx
-        else if entry.key == key
-            return idx
-        idx = (idx + 1) & mask
-        i += 1
-    first_tomb
-
-# Insert or update a key-value pair
-pub fn hashmap_i64_insert(m: @&HashMapI64, key: i64, value: i64)
-    # An empty table (dropped, or its allocator was out of memory) gets one.
-    if m.cap == 0
-        hashmap_i64_grow(m)
-        if m.cap == 0
-            return
-    # Check load factor and resize if needed (> 75%)
-    let load: i64 = (m.len + m.tombstones + 1) * 100 / m.cap
-    if load > 75
-        hashmap_i64_grow(m)
-
-    let idx: i64 = hashmap_i64_find_slot(m, key)
-    if idx < 0
-        # Table full - should not happen after resize
-        return
-
-    let entry: *HashMapEntryI64 = m.entries + idx
-
-    if entry.state == Slot.Full  # key is present - update
-        entry.value = value
-    else
-        if entry.state == Slot.Tomb
-            m.tombstones = m.tombstones - 1
-        entry.key = key
-        entry.value = value
-        entry.state = Slot.Full
-        m.len = m.len + 1
-
-# Get value for key (returns 0 if not found - use contains to check)
-pub fn hashmap_i64_get(m: @HashMapI64, key: i64) -> i64
-    match hashmap_i64_find(m, key)
-        Some(idx) =>
-            let entry: *HashMapEntryI64 = m.entries + idx
-            entry.value
-        None => 0
-
-# The value slot for key, or None when the key is missing.
-pub fn hashmap_i64_value_ptr(m: @HashMapI64, key: i64) -> Option<*i64>
-    match hashmap_i64_find(m, key)
-        Some(idx) =>
-            let entry: *HashMapEntryI64 = m.entries + idx
-            Some(@entry.value)
-        None => None
-
 # `m[key]` on a key the map doesn't hold (LANGUAGE_SPEC §7.8): a reference can't be
 # empty, so `index` and `index_mut` end the program here, with status 101.
-# Test for a key with hashmap_i64_contains, or read it with hashmap_i64_get.
+# Test for a key with m.contains(k), or read it with m.get(k).
 pub fn hashmap_i64_missing_key(key: i64)
     let prefix: StrView = "HashMapI64: key not found: "
     var buf: [48]u8
@@ -293,7 +319,7 @@ pub fn hashmap_i64_missing_key(key: i64)
 # A shared use of `m[k]`: a read, `.f`, `@m[k]`.
 impl Index for HashMapI64
     pub fn index(self: @HashMapI64, key: i64) -> @i64
-        let p: *i64 = match hashmap_i64_value_ptr(self, key)
+        let p: *i64 = match self.value_ptr(key)
             Some(p) => p
             None =>
                 hashmap_i64_missing_key(key)
@@ -303,7 +329,7 @@ impl Index for HashMapI64
 # A mutable use of `m[k]`: `@&m[k]`, `m[k] += x`.
 impl IndexMut for HashMapI64
     pub fn index_mut(self: @&HashMapI64, key: i64) -> @&i64
-        let p: *i64 = match hashmap_i64_value_ptr(self, key)
+        let p: *i64 = match self.value_ptr(key)
             Some(p) => p
             None =>
                 hashmap_i64_missing_key(key)
@@ -313,58 +339,7 @@ impl IndexMut for HashMapI64
 # `m[k] = v`, which inserts a missing key.
 impl IndexSet for HashMapI64
     pub fn index_set(self: @&HashMapI64, key: i64, value: i64)
-        hashmap_i64_insert(self, key, value)
-
-# Check if key exists
-pub fn hashmap_i64_contains(m: @HashMapI64, key: i64) -> bool
-    match hashmap_i64_find(m, key)
-        Some(_) => true
-        None => false
-
-# Remove a key (returns 1 if removed, 0 if not found).  Its slot becomes a
-# Tomb so the chains of keys probed past it still reach them.
-pub fn hashmap_i64_remove(m: @&HashMapI64, key: i64) -> i32
-    let idx: i64 = match hashmap_i64_find(m, key)
-        Some(idx) => idx
-        None => return 0
-    let entry: *HashMapEntryI64 = m.entries + idx
-    entry.state = Slot.Tomb
-    m.len = m.len - 1
-    m.tombstones = m.tombstones + 1
-    1
-
-# Grow the table (double capacity)
-pub fn hashmap_i64_grow(m: @&HashMapI64)
-    let old_entries: *HashMapEntryI64 = m.entries
-    let old_cap: i64 = m.cap
-
-    # Allocate new table with double capacity
-    # The new table comes from the same Allocator as the old one.
-    var new_cap: i64 = old_cap * 2
-    if new_cap == 0
-        new_cap = 16
-    let size: i64 = new_cap * sizeof(HashMapEntryI64)
-    let new_entries: *HashMapEntryI64 = malloc_in(allocator_of(old_entries as *u8), size) as *HashMapEntryI64
-    if new_entries == null
-        return  # Out of memory: keep the old table
-    m.entries = new_entries
-    m.cap = new_cap
-    m.len = 0
-    m.tombstones = 0
-
-    # Initialize new entries to empty
-    for i in 0..new_cap
-        let entry: *HashMapEntryI64 = m.entries + i
-        entry.state = Slot.Empty
-
-    # Rehash all occupied entries from old table
-    for i in 0..old_cap
-        let old_entry: *HashMapEntryI64 = old_entries + i
-        if old_entry.state == Slot.Full
-            hashmap_i64_insert(m, old_entry.key, old_entry.value)
-
-    # Free old table (free(null) is a no-op)
-    free(old_entries as *u8)
+        self.insert(key, value)
 
 # ============================================================================
 # HashMap<K: Hash + Eq, V> - the generic map
@@ -414,32 +389,96 @@ pub fn hashmap_with_cap_in<K: Hash + Eq, V>(a: *Allocator, cap: i64) -> HashMap<
     m.tombstones = 0
     m
 
-# Free the table.  The map is empty afterwards, with no slots; it can't be
-# used again until reassigned from hashmap_new.
-pub fn hashmap_drop<K: Hash + Eq, V>(m: @&HashMap<K, V>)
-    vec_drop<HashMapEntry<K, V>>(@&m.slots)
-    m.len = 0
-    m.tombstones = 0
-
 impl<K: Hash + Eq, V> HashMap<K, V>
     # The number of keys.
     pub fn len(self: @HashMap<K, V>) -> i64
         self.len
 
+    # Free the table.  The map is empty afterwards, with no slots; it can't be
+    # used again until reassigned from hashmap_new.
+    pub fn free(self: @&HashMap<K, V>)
+        vec_drop<HashMapEntry<K, V>>(@&self.slots)
+        self.len = 0
+        self.tombstones = 0
+
     # Insert key, or overwrite its value if present.
     pub fn insert(self: @&HashMap<K, V>, key: K, value: V)
-        hashmap_insert<K, V>(self, key, value)
+        # Keep Full + Tomb at most 75% of the table.
+        if (self.len + self.tombstones + 1) * 100 / self.slots.len > 75
+            hashmap_grow<K, V>(self)
+        let idx: i64 = hashmap_find_slot<K, V>(self, @key)
+        let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(self, idx)
+        if e.state == Slot.Full
+            e.value = value
+            return
+        if e.state == Slot.Tomb
+            self.tombstones -= 1
+        e.key = key
+        e.value = value
+        e.state = Slot.Full
+        self.len += 1
 
     # The value for key, or None.
     pub fn get(self: @HashMap<K, V>, key: K) -> Option<V>
-        hashmap_get<K, V>(self, key)
+        let idx: i64 = hashmap_find<K, V>(self, @key)
+        if idx < 0
+            return None
+        let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(self, idx)
+        Some(e.value)
+
+    # The value in key's slot, borrowed, or null.  For a move-only V, which
+    # `get` can't return by value (AGAST #2159): the map still owns it.
+    pub fn get_ptr(self: @HashMap<K, V>, key: K) -> *V
+        let idx: i64 = hashmap_find<K, V>(self, @key)
+        if idx < 0
+            return null
+        let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(self, idx)
+        @e.value
 
     pub fn contains(self: @HashMap<K, V>, key: K) -> bool
         hashmap_find<K, V>(self, @key) >= 0
 
-    # Remove key: true if it was there.
+    # Remove key, leaving a Tomb so the chains through its slot stay intact.
+    # true if it was there.
     pub fn remove(self: @&HashMap<K, V>, key: K) -> bool
-        hashmap_remove<K, V>(self, key)
+        let idx: i64 = hashmap_find<K, V>(self, @key)
+        if idx < 0
+            return false
+        let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(self, idx)
+        e.state = Slot.Tomb
+        self.len -= 1
+        self.tombstones += 1
+        true
+
+    # The number of slots in the table, a power of 2.  With slot_state and
+    # slot_value this walks every entry:
+    #   for i in 0..m.cap()
+    #       if m.slot_state(i) == Slot.Full
+    #           let v: V = m.slot_value(i)
+    # A caller must not insert or remove until the walk ends.
+    pub fn cap(self: @HashMap<K, V>) -> i64
+        self.slots.len
+
+    # The state of slot i: Empty, Full or Tomb.  Tomb is a slot that held a
+    # removed key; a walk that wants every key treats it as empty.
+    pub fn slot_state(self: @HashMap<K, V>, i: i64) -> Slot
+        let e: *HashMapEntry<K, V> = self.slots.data + i
+        e.state
+
+    # The value in slot i.  Meaningful when slot_state says Full.
+    pub fn slot_value(self: @HashMap<K, V>, i: i64) -> V
+        let e: *HashMapEntry<K, V> = self.slots.data + i
+        e.value
+
+    # Remove every key, leaving the table allocated at its current capacity.
+    # The map never frees a value, so the caller drops what its values own
+    # first (as HashMapI64's clear does for its i64 values: nothing).
+    pub fn clear(self: @&HashMap<K, V>)
+        for i in 0..self.slots.len
+            let e: *HashMapEntry<K, V> = self.slots.data + i
+            e.state = Slot.Empty
+        self.len = 0
+        self.tombstones = 0
 
 fn hashmap_slot<K: Hash + Eq, V>(m: @HashMap<K, V>, i: i64) -> *HashMapEntry<K, V>
     m.slots.data + i
@@ -478,83 +517,6 @@ fn hashmap_find_slot<K: Hash + Eq, V>(m: @HashMap<K, V>, key: @K) -> i64
         idx = (idx + 1) & mask
     first_tomb
 
-pub fn hashmap_insert<K: Hash + Eq, V>(m: @&HashMap<K, V>, key: K, value: V)
-    # Keep Full + Tomb at most 75% of the table.
-    if (m.len + m.tombstones + 1) * 100 / m.slots.len > 75
-        hashmap_grow<K, V>(m)
-    let idx: i64 = hashmap_find_slot<K, V>(m, @key)
-    let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
-    if e.state == Slot.Full
-        e.value = value
-        return
-    if e.state == Slot.Tomb
-        m.tombstones -= 1
-    e.key = key
-    e.value = value
-    e.state = Slot.Full
-    m.len += 1
-
-pub fn hashmap_get<K: Hash + Eq, V>(m: @HashMap<K, V>, key: K) -> Option<V>
-    let idx: i64 = hashmap_find<K, V>(m, @key)
-    if idx < 0
-        return None
-    let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
-    Some(e.value)
-
-# The value in `key`'s slot, borrowed, or null. For a move-only `V`, which
-# `hashmap_get` can't return by value (AGAST #2159): the map still owns it.
-pub fn hashmap_get_ptr<K: Hash + Eq, V>(m: @HashMap<K, V>, key: K) -> *V
-    let idx: i64 = hashmap_find<K, V>(m, @key)
-    if idx < 0
-        return null
-    let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
-    @e.value
-
-# Remove key, leaving a Tomb so the chains through its slot stay intact.
-pub fn hashmap_remove<K: Hash + Eq, V>(m: @&HashMap<K, V>, key: K) -> bool
-    let idx: i64 = hashmap_find<K, V>(m, @key)
-    if idx < 0
-        return false
-    let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
-    e.state = Slot.Tomb
-    m.len -= 1
-    m.tombstones += 1
-    true
-
-# The number of keys in the map.
-pub fn hashmap_len<K: Hash + Eq, V>(m: @HashMap<K, V>) -> i64
-    m.len
-
-# The number of slots in the table, a power of 2.  With hashmap_slot_state
-# and hashmap_slot_value this walks every entry:
-#   for i in 0..hashmap_cap(@m)
-#       if hashmap_slot_state(@m, i) == Slot.Full
-#           let v: V = hashmap_slot_value(@m, i)
-# A caller must not insert or remove until the walk ends.
-pub fn hashmap_cap<K: Hash + Eq, V>(m: @HashMap<K, V>) -> i64
-    m.slots.len
-
-# The state of slot i: Empty, Full or Tomb.  Tomb is a slot that held a
-# removed key; a walk that wants every key treats it as empty.
-pub fn hashmap_slot_state<K: Hash + Eq, V>(m: @HashMap<K, V>, i: i64) -> Slot
-    let e: *HashMapEntry<K, V> = m.slots.data + i
-    e.state
-
-# The value in slot i.  Meaningful when hashmap_slot_state says Full.
-pub fn hashmap_slot_value<K: Hash + Eq, V>(m: @HashMap<K, V>, i: i64) -> V
-    let e: *HashMapEntry<K, V> = m.slots.data + i
-    e.value
-
-# Remove every key, leaving the table allocated at its current capacity.
-# The map never frees a value, so the caller drops what its values own
-# first (as HashMapI64's clear does for its i64 values: nothing).
-pub fn hashmap_clear<K: Hash + Eq, V>(m: @&HashMap<K, V>)
-    for i in 0..m.slots.len
-        let e: *HashMapEntry<K, V> = m.slots.data + i
-        e.state = Slot.Empty
-    m.len = 0
-    m.tombstones = 0
-
 # Double the table and reinsert every Full slot, dropping the Tombs.
 fn hashmap_grow<K: Hash + Eq, V>(m: @&HashMap<K, V>)
     # In the old table's Allocator (null, the global heap, for hashmap_new).
@@ -566,7 +528,7 @@ fn hashmap_grow<K: Hash + Eq, V>(m: @&HashMap<K, V>)
             # Move the entry out of the old table (which is freed below
             # without dropping its elements): ptr_read, for a move-only V
             # (AGAST #2159); a bitwise copy of a copy type is the same bytes.
-            hashmap_insert<K, V>(@&bigger, ptr_read<K>(@e.key), ptr_read<V>(@e.value))
-    hashmap_drop<K, V>(m)
+            bigger.insert(ptr_read<K>(@e.key), ptr_read<V>(@e.value))
+    m.free()
     m.slots = bigger.slots
     m.len = bigger.len

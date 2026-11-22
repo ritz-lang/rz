@@ -622,7 +622,9 @@ def test_receiver_program(request, tmp_path, compiler, name):
         # Its `is_empty` and `slice` mean what the built-ins do, so the exit
         # status can't tell them apart: the calls in the IR can.
         ir = (tmp_path / "main.ll").read_text()
-        for fn in ("span_is_empty$u8", "span_slice$u8"):
+        # #4445 moved these into `impl<T> Span<T>`, so the specialised
+        # methods are `Span$u8_is_empty` / `Span$u8_slice`.
+        for fn in ("Span$u8_is_empty", "Span$u8_slice"):
             assert re.search(rf'call [^\n]*@"?{re.escape(fn)}"?\(', ir), (
                 f"{compiler}: ritzlib.span's {fn} isn't called")
 

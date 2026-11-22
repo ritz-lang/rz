@@ -601,11 +601,11 @@ import ritzlib.memory
 
 fn scratch_used(size: i64, fail: bool) -> i64
     var arena = arena_new(size)
-    defer arena_destroy(@arena)
+    defer arena.destroy()
     if fail
         return -1
-    let p = arena_alloc(@arena, 64)
-    arena_used(@arena)
+    let p = arena.alloc(64)
+    arena.used()
 ```
 
 ## 8. Branching

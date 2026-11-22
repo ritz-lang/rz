@@ -306,14 +306,14 @@ struct Arena
 |----------|-----------|-------------|
 | `arena_new` | `fn(size: i64) -> Arena` | Create arena with given capacity |
 | `arena_default` | `fn() -> Arena` | Create 1 MB arena |
-| `arena_alloc` | `fn(a: *Arena, size: i64) -> *u8` | Allocate bytes (8-byte aligned) |
-| `arena_alloc_zero` | `fn(a: *Arena, size: i64) -> *u8` | Allocate and zero-initialize |
-| `arena_alloc_array` | `fn(a: *Arena, count: i64, elem_size: i64) -> *u8` | Allocate array |
-| `arena_reset` | `fn(a: *Arena)` | Reset arena (free all, keep memory) |
-| `arena_destroy` | `fn(a: *Arena)` | Free underlying memory |
-| `arena_used` | `fn(a: *Arena) -> i64` | Get current usage |
-| `arena_remaining` | `fn(a: *Arena) -> i64` | Get remaining capacity |
-| `arena_valid` | `fn(a: *Arena) -> i32` | Check if arena is valid |
+| `a.alloc(size)` | `fn(size: i64) -> *u8` | Allocate bytes (8-byte aligned) |
+| `a.alloc_zero(size)` | `fn(size: i64) -> *u8` | Allocate and zero-initialize |
+| `a.alloc_array(count, elem_size)` | `fn(count: i64, elem_size: i64) -> *u8` | Allocate array |
+| `a.reset()` | `fn()` | Reset arena (free all, keep memory) |
+| `a.destroy()` | `fn()` | Free underlying memory |
+| `a.used()` | `fn() -> i64` | Get current usage |
+| `a.remaining()` | `fn() -> i64` | Get remaining capacity |
+| `a.valid()` | `fn() -> bool` | Check if arena is valid |
 
 #### Process Heap (Simple)
 
@@ -367,9 +367,10 @@ fn give_back(p: *u8, len: i64) -> i32
     return 0
 
 fn main() -> i32
-    let prev: PageSource = page_source_set(PageSource { map: no_pages, unmap: give_back })
+    var src: PageSource = PageSource { map: no_pages, unmap: give_back }
+    let prev: PageSource = src.set()
     let p: *u8 = malloc(8192)  # null: the source had no pages
-    page_source_set(prev)
+    prev.set()
     if p == null
         return 0
     return 1
@@ -383,7 +384,7 @@ fn main() -> i32
 
 Install a source before the first allocation, or restore the previous one
 before anything allocated under it is freed. To give one subsystem its own
-pages instead, build its collections on a `heap_allocator` or `pages_allocator`
+pages instead, build its collections on `h.allocator()` or `src.allocator()`
 (below): those blocks go back to their own source whatever is installed.
 
 #### Allocator
@@ -413,13 +414,13 @@ fn use_arena_vec(a: *Allocator) -> i64
 
 fn arena_vec() -> i64
     var ar: Arena = arena_new(65536)
-    var a: Allocator = arena_allocator(@ar)
+    var a: Allocator = ar.allocator()
     let x: i64 = use_arena_vec(@a)
-    arena_destroy(@ar)
+    ar.destroy()
     x
 ```
 
-`malloc_in(a, n)` takes `n + 16` bytes from `a`, and the block's header names
+`a.malloc(n)` takes `n + 16` bytes from `a`, and the block's header names
 `a` as its owner. Plain `free` and `realloc` read that header, so collection
 code is unchanged and a block never goes back to the wrong allocator. A null
 owner is the global heap. The `Allocator` must stay at its address while any
@@ -427,19 +428,19 @@ block it handed out is live, because the header points at it.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `malloc_in` | `fn(a: *Allocator, size: i64) -> *u8` | `size` bytes owned by `a` (null `a`: `malloc`) |
+| `a.malloc(size)` | `fn(size: i64) -> *u8` | `size` bytes owned by `a` (null `a`: `malloc`) |
 | `allocator_of` | `fn(p: *u8) -> *Allocator` | `p`'s owner; null for the global heap and for null |
-| `arena_allocator` | `fn(arena: *Arena) -> Allocator` | Bump from `arena`; `free` gives nothing back until reset/destroy |
-| `pages_allocator` | `fn(src: *PageSource) -> Allocator` | Each block its own whole-page mapping from `src`, unmapped there |
-| `heap_init` | `fn(h: *Heap, src: PageSource)` | Fill `h` as a size-class heap whose slabs and large blocks map from `src` |
-| `heap_allocator` | `fn(h: *Heap) -> Allocator` | Small blocks from `h`'s 64 KiB slabs, freed into its bins; over 2 KiB, its own mapping |
-| `heap_destroy` | `fn(h: *Heap)` | Unmap every slab and live large block of `h` to its source; `h` is empty again |
+| `ar.allocator()` | `fn() -> Allocator` | Bump from `ar`; `free` gives nothing back until reset/destroy |
+| `src.allocator()` | `fn() -> Allocator` | Each block its own whole-page mapping from `src`, unmapped there |
+| `h.init(src)` | `fn(src: PageSource)` | Fill `h` as a size-class heap whose slabs and large blocks map from `src` |
+| `h.allocator()` | `fn() -> Allocator` | Small blocks from `h`'s 64 KiB slabs, freed into its bins; over 2 KiB, its own mapping |
+| `h.destroy()` | `fn()` | Unmap every slab and live large block of `h` to its source; `h` is empty again |
 
 A `Heap` (AGAST #4326) is the global heap's size classes over a source of its
-own: `pages_allocator` costs a page per block, a `heap_allocator` packs small
+own: `src.allocator()` costs a page per block, `h.allocator()` packs small
 blocks into slabs. The global heap is itself a `Heap` that follows the
 installed source. The `Heap` must stay at its address while its allocator or
-any block from it is live, and `heap_destroy` frees every block at once:
+any block from it is live, and `h.destroy()` frees every block at once:
 
 ```ritz
 import ritzlib.memory
@@ -452,10 +453,10 @@ fn use_heap_vec(a: *Allocator) -> i64
 
 fn heap_vec() -> i64
     var h: Heap
-    heap_init(@h, page_source_get())           # keeps this source
-    var a: Allocator = heap_allocator(@h)
+    h.init(page_source_get())           # keeps this source
+    var a: Allocator = h.allocator()
     let x: i64 = use_heap_vec(@a)
-    heap_destroy(@h)                           # every slab back to the source
+    h.destroy()                           # every slab back to the source
     x
 ```
 
@@ -492,26 +493,28 @@ struct Box<T>
     ptr: *T    # Pointer to heap-allocated T
 ```
 
-**Functions**:
+**Constructors**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `box_new` | `fn<T>(value: T) -> Box<T>` | Create box containing value |
 | `box_new_in` | `fn<T>(a: *Allocator, value: T) -> Box<T>` | `box_new` with the value in memory from `a`; empty if `a` is out of memory |
-| `box_get` | `fn<T>(b: @Box<T>) -> T` | Get value (returns copy) |
-| `box_as_ptr` | `fn<T>(b: @Box<T>) -> *T` | Get pointer to value |
-| `box_set` | `fn<T>(b: @&Box<T>, value: T)` | Set new value |
-| `box_drop` | `fn<T>(b: @&Box<T>)` | Free the box |
-| `box_valid` | `fn<T>(b: @Box<T>) -> i32` | Check if valid |
 
-**Methods** (via impl):
-- `get`, `as_ptr`, `set`, `valid`
+**Operations** are methods (AGAST #4445):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `b.get()` | `fn() -> T` | Get value (returns copy) |
+| `b.as_ptr()` | `fn() -> *T` | Get pointer to value |
+| `b.set(value)` | `fn(value: T)` | Set new value |
+| `b.valid()` | `fn() -> bool` | Check if valid |
+| `b.drop()` | `fn()` | Free the box now (`Box` implements `Drop`: it also runs at scope end) |
 
 **The `heap` keyword is not a `Box`.** `heap 42` is a raw allocation
 expression of type `*i64`: dereference it with `*p` and free it with
 `free(p as *u8)`. `box_new<i64>(42)` returns a `Box<i64>`, which is what
-`box_get` / `box_set` / `box_drop` and the `Drop` impl operate on. Passing a
-`heap`-keyword pointer to `box_get` is a type error.
+`b.get` / `b.set` / `b.drop()` and the `Drop` impl operate on. Passing a
+`heap`-keyword pointer to `b.get` is a type error.
 
 ```ritz
 import ritzlib.box
@@ -519,7 +522,7 @@ import ritzlib.box
 fn heap_vs_box() -> i64
     var p = heap 42            # `heap` keyword: a bare *i64, deref with `*p`
     var q = box_new<i64>(42)   # constructor: a Box<i64> wrapper
-    *p + box_get<i64>(@q)
+    *p + q.get()
 ```
 
 ritzlib once also had `ritzlib.heap`, a `Heap<T>` identical to `Box<T>` with a
@@ -694,26 +697,34 @@ missing key is `None`.
 |----------|-----------|-------------|
 | `hashmap_new<K, V>` | `fn() -> HashMap<K, V>` | Create with 16 slots |
 | `hashmap_with_cap<K, V>` | `fn(cap: i64) -> HashMap<K, V>` | Create with `cap` slots, rounded up to a power of 2 |
-| `hashmap_insert<K, V>` | `fn(m: @&HashMap<K, V>, key: K, value: V)` | Insert or overwrite |
-| `hashmap_get<K, V>` | `fn(m: @HashMap<K, V>, key: K) -> Option<V>` | The value, or `None` |
-| `hashmap_remove<K, V>` | `fn(m: @&HashMap<K, V>, key: K) -> bool` | Remove key (true if it was there) |
-| `hashmap_len<K, V>` | `fn(m: @HashMap<K, V>) -> i64` | The number of keys |
-| `hashmap_cap<K, V>` | `fn(m: @HashMap<K, V>) -> i64` | The number of slots (a power of 2) |
-| `hashmap_slot_state<K, V>` | `fn(m: @HashMap<K, V>, i: i64) -> Slot` | Slot `i`'s state: `Empty`, `Full` or `Tomb` |
-| `hashmap_slot_value<K, V>` | `fn(m: @HashMap<K, V>, i: i64) -> V` | Slot `i`'s value (read it when `Full`) |
-| `hashmap_clear<K, V>` | `fn(m: @&HashMap<K, V>)` | Remove every key, keeping the table allocated |
-| `hashmap_drop<K, V>` | `fn(m: @&HashMap<K, V>)` | Free the table |
+| `hashmap_new_in<K, V>` | `fn(a: *Allocator) -> HashMap<K, V>` | 16 slots, every grow from `a` |
+| `hashmap_with_cap_in<K, V>` | `fn(a: *Allocator, cap: i64) -> HashMap<K, V>` | With capacity, from `a` |
 
-**Iteration** walks the slots: `for i in 0..hashmap_cap(@m)` and
-`hashmap_slot_state(@m, i) == Slot.Full`. `Tomb` is a removed key's slot; a
+Operations are methods (AGAST #4445):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `m.insert(key, value)` | `fn(key: K, value: V)` | Insert or overwrite |
+| `m.get(key)` | `fn(key: K) -> Option<V>` | The value, or `None` |
+| `m.get_ptr(key)` | `fn(key: K) -> *V` | The value, borrowed (for a move-only `V`), or null |
+| `m.contains(key)` | `fn(key: K) -> bool` | Whether the key is present |
+| `m.remove(key)` | `fn(key: K) -> bool` | Remove key (true if it was there) |
+| `m.len()` | `fn() -> i64` | The number of keys |
+| `m.cap()` | `fn() -> i64` | The number of slots (a power of 2) |
+| `m.slot_state(i)` | `fn(i: i64) -> Slot` | Slot `i`'s state: `Empty`, `Full` or `Tomb` |
+| `m.slot_value(i)` | `fn(i: i64) -> V` | Slot `i`'s value (read it when `Full`) |
+| `m.clear()` | `fn()` | Remove every key, keeping the table allocated |
+| `m.free()` | `fn()` | Free the table |
+
+**Iteration** walks the slots: `for i in 0..m.cap()` and
+`m.slot_state(i) == Slot.Full`. `Tomb` is a removed key's slot; a
 probe chain still steps over it. The map never frees a value, so drop what
-the values own before `hashmap_clear` or `hashmap_drop`, and do not insert
+the values own before `m.clear()` or `m.free()`, and do not insert
 or remove during a walk.
 
-**Methods**: `len`, `insert`, `get`, `contains`, `remove`. The map's slot
-table is a `Vec`, so an owned map is move-only and the compiler drops the
-table at scope end (AGAST #2159). `hashmap_drop` remains for a map in raw
-memory. The map never drops its keys or values.
+The map's slot table is a `Vec`, so an owned map is move-only and the
+compiler drops the table at scope end (AGAST #2159). `m.free()` remains for
+a map in raw memory. The map never drops its keys or values.
 
 ```ritz
 import ritzlib.hash
@@ -731,7 +742,7 @@ fn main() -> i32
     let two: i64 = match m.get("two")
         Some(v) => v
         None => 0
-    hashmap_drop(@&m)
+    m.free()
     (one + two - 2) as i32
 ```
 
@@ -764,28 +775,27 @@ struct HashMapI64
 | `hashmap_i64_new_in` | `fn(a: *Allocator) -> HashMapI64` | Table (and every grow) from `a` |
 | `hashmap_i64_with_cap_in` | `fn(a: *Allocator, cap: i64) -> HashMapI64` | With capacity, from `a`; empty if `a` is out of memory |
 
-**Operations**:
+**Operations** are methods (AGAST #4445):
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `hashmap_i64_insert` | `fn(m: @&HashMapI64, key: i64, value: i64)` | Insert or update |
-| `hashmap_i64_get` | `fn(m: @HashMapI64, key: i64) -> i64` | Get value (0 if not found) |
-| `hashmap_i64_find` | `fn(m: @HashMapI64, key: i64) -> i64` | Index of key's slot (-1 if not found) |
-| `hashmap_i64_contains` | `fn(m: @HashMapI64, key: i64) -> bool` | Check if key exists |
-| `hashmap_i64_remove` | `fn(m: @&HashMapI64, key: i64) -> i32` | Remove key (1 if removed) |
-| `hashmap_i64_len` | `fn(m: @HashMapI64) -> i64` | Get entry count |
-| `hashmap_i64_cap` | `fn(m: @HashMapI64) -> i64` | Get capacity |
-| `hashmap_i64_is_empty` | `fn(m: @HashMapI64) -> bool` | Check if empty |
-| `hashmap_i64_drop` | `fn(m: @&HashMapI64)` | Free the map |
-| `hashmap_i64_value_ptr` | `fn(m: @HashMapI64, key: i64) -> Option<*i64>` | The value's slot (None if not found) |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `m.insert(key, value)` | `fn(key: i64, value: i64)` | Insert or update |
+| `m.get(key)` | `fn(key: i64) -> i64` | Get value (0 if not found) |
+| `m.find(key)` | `fn(key: i64) -> Option<i64>` | The key's slot index, or `None` |
+| `m.contains(key)` | `fn(key: i64) -> bool` | Check if key exists |
+| `m.remove(key)` | `fn(key: i64) -> i32` | Remove key (1 if removed) |
+| `m.len()` | `fn() -> i64` | Get entry count |
+| `m.cap()` | `fn() -> i64` | Get capacity |
+| `m.is_empty()` | `fn() -> bool` | Check if empty |
+| `m.clear()` | `fn()` | Remove every key, keeping the table allocated |
+| `m.free()` | `fn()` | Free the map |
+| `m.value_ptr(key)` | `fn(key: i64) -> Option<*i64>` | The value's slot (None if not found) |
 | `hashmap_i64_missing_key` | `fn(key: i64)` | Exit 101: `HashMapI64: key not found: <key>` |
-
-**Methods** (via impl): `len`, `cap`, `is_empty`, `insert`, `get`, `contains`, `remove`
 
 **Indexing** (LANGUAGE_SPEC §7.8): `HashMapI64` implements `Index`, `IndexMut` and
 `IndexSet` at `K` = `V` = `i64`. `m[k] = v` inserts or replaces; `m[k]`, `@m[k]`,
 `@&m[k]` and `m[k] += x` end the program through `hashmap_i64_missing_key` when `k`
-is missing. Test for a key with `hashmap_i64_contains` or `hashmap_i64_get`.
+is missing. Test for a key with `m.contains` or `m.get`.
 
 ```ritz
 import ritzlib.hashmap
@@ -794,7 +804,7 @@ fn main() -> i32
     var m: HashMapI64 = hashmap_i64_new()
     m[7] = 1
     m[7] += 2
-    if not hashmap_i64_contains(@m, 8)
+    if not m.contains(8)
         m[8] = 0
     (m[7] + m[8] - 3) as i32
 ```
@@ -1154,7 +1164,7 @@ fn main() -> i32
     let p = Point { x: 3, y: 4 }
     fmt_show_with(@p, @&w, ">8")          # "  (3, 4)"
     fmt_show_i64_with(255, @&w, "08x")    # "000000ff"
-    (writer_len(@w) - 16) as i32
+    (w.len() - 16) as i32
 ```
 
 **The built-in types** (`ritzlib.fmt.impls`). R36's revisit (#4294) lets
@@ -1784,11 +1794,11 @@ fn count_files(path: StrView) -> i64
         Ok(d) => d
         Err(_) => return 0
     var n: i64 = 0
-    while dir_next(@dir)
-        let e: DirEntry = dir_entry(@dir)    # e.ino, e.kind, e.name: StrView
+    while dir.next()
+        let e: DirEntry = dir.entry()    # e.ino, e.kind, e.name: StrView
         if e.kind == DT_REG
             n += 1
-    dir_close(@dir)
+    dir.close()
     n
 ```
 
@@ -1862,12 +1872,12 @@ fn save(dir: StrView, name: StrView, text: StrView) -> i32
         var made: Result<i32, Errno> = mkdir(dir, 493)    # 0755
         match made
             Ok(_) => pass
-            Err(e) => return errno_code(e)
+            Err(e) => return e.code()
     var path: String = path_join(dir, name)
     var r: Result<i64, Errno> = write_file(string_as_view(@path), text)
     match r
         Ok(_) => 0
-        Err(e) => errno_code(e)
+        Err(e) => e.code()
 ```
 
 ---
@@ -1929,7 +1939,7 @@ struct IoVecBuilder
 TCP/IP socket operations. Every fallible function returns a `Result` whose
 `Err` is a `ritzlib.errno` `Errno` (AGAST #4298; it was a positive `i32`
 errno), and `net` re-exports `ritzlib.errno`. Compare with the raw numbers
-via `errno_code(e) == EINVAL`, or match the variant:
+via `e.code() == EINVAL`, or match the variant:
 
 ```ritz
 import ritzlib.net
@@ -1937,12 +1947,12 @@ import ritzlib.net
 # A listener on 127.0.0.1:`port`, or the errno that stopped it.
 fn open_listener(port: i32) -> Result<Socket, Errno>
     var sock: Socket = socket_tcp()?
-    match socket_bind(@&sock, "127.0.0.1", port)
+    match sock.bind("127.0.0.1", port)
         Ok(_) => pass
         Err(e) =>
-            socket_close(@&sock)
+            sock.close()
             return Err(e)
-    socket_listen(@&sock, 128)?
+    sock.listen(128)?
     Ok(sock)
 
 # Whether something else already holds `port`.
@@ -1950,7 +1960,7 @@ fn port_taken(port: i32) -> bool
     match open_listener(port)
         Ok(s) =>
             var t: Socket = s
-            socket_close(@&t)
+            t.close()
             false
         Err(e) => match e
             AddrInUse => true
@@ -2854,7 +2864,7 @@ fn show_file(path: StrView) -> i32
         Ok(content) =>
             print_string(@content)
             0
-        Err(e) => errno_code(e)
+        Err(e) => e.code()
 ```
 
 **Creating a TCP server**:
@@ -2890,9 +2900,9 @@ fn handle_connection(task: *Task) -> i32
 
 fn run_server(listen_fd: i32) -> i32
     var srv: TaskServer
-    task_server_init(@srv, listen_fd)
-    task_server_run(@srv, handle_connection)
-    task_server_destroy(@srv)
+    srv.init(listen_fd)
+    srv.run(handle_connection)
+    srv.destroy()
     0
 ```
 
