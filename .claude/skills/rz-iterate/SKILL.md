@@ -103,6 +103,16 @@ Rooms run on omegalisk (this machine) or on a remote host (project Borque,
 AGAST #2609). This room stays the only coordinator, and the reap queue
 stays here; remote hosts only run rooms.
 
+**Address a host only by its room id, `adele-<host>` — never the bare host
+name.** Bare-name rooms (`bangerang`, `chungus`, `huburght`) also exist as
+stale stubs holding a handful of old messages. They accept a message and
+deliver it to nobody, so a SPAWN or TEARDOWN sent there vanishes silently and
+looks sent. This actually happened on 2026-11-22: the SPAWN for #4528/#4536
+went to `bangerang` and sat unread for 7 minutes, leaving both tickets
+`executing` with no room and no worktree. Before spawn, `get_conversation_messages`
+on the host room and confirm it has live traffic; after sending, do not assume
+delivery until the host replies `SPAWNED`/`TORNDOWN`.
+
 | Host | Host room | Ritz slots | Ready | Notes |
 |---|---|---|---|---|
 | omegalisk | (local: `systemctl`, `git worktree`) | 2 | yes | 12 cores, 15 GB, WSL |
