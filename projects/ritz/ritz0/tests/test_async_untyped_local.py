@@ -1,7 +1,9 @@
 """AGAST #3762: an untyped local in an `async fn` that awaits takes its value's type.
 
-In an `async fn` with an `await`, every local lives in the fn's future struct
-(async_transform_v2).  An untyped local's type was None, so the struct got no
+In an `async fn` with an `await`, a local that outlives a state boundary lives
+in the fn's future struct (async_transform_v2; a local that dies within one
+state of a re-entered block stays a poll local, #4527).  An untyped local's
+type was None, so the struct got no
 field for it while the constructor still set one, and ritz0 died with a Python
 traceback, `ValueError: Unknown field y in struct go$Future`.  #1318 typed only
 `let v = await f(x)`, as the poll's i32.

@@ -106,6 +106,11 @@ RUNS = {
     "unit_fn_loop": (_DBL + _STORE + "async fn fill(p: *i32, n: i32)\n    var i: i32 = 0\n    while i < n\n"
                      "        *p = *p + await dbl(i)\n        i += 1\n\n"
                      "pub fn main() -> i32\n    var x: i32 = 1\n    await fill(@x, 4)\n    x\n", 13),
+    # A loop body's local used after the await is live across a state
+    # boundary: it stays a future field (AGAST #4527's crossing half).
+    "loop_body_local_used_after_await": (_DBL + _go(
+        "(n: i32) -> i32", "    var i: i32 = 0\n    var s: i32 = 0\n    while i < n\n"
+        "        i += 1\n        let v: i32 = i * 10\n        await dbl(i)\n        s += v\n    s\n", "(3)"), 60),
     # Pending: the poll returns, and the next poll resumes at the await.  The
     # statement ahead of it ran once (CALLS), not once per poll.
     "pending_resumes_at_await": (_LATER + "async fn go() -> i32\n    CALLS += 1\n    let v: i32 = await later()\n"
@@ -293,12 +298,12 @@ RUNS = {
 
 
 # AGAST #4527: an owned local declared in a block the machine re-enters (a
-# loop body, or a `defer` body, which #4191 runs on every exit edge) is placed
-# in the future struct when the fn awaits, so each pass stores over the last
-# and nothing drops the old one.  ritz1 / ritz1_selfhosted free the last one
-# only when the future dies; ritz0 frees none.  `DROPS` counts the frees, and
-# the future is polled to completion inside an inner block so it is destroyed
-# before the counter is read.
+# loop body, or a `defer` body, which #4191 runs on every exit edge) must not
+# become one future field, or each pass stores over the last and nothing drops
+# the old one.  It stays a poll local and the emitter's block-end drop frees it
+# once per run.  `DROPS` counts the frees, and the future is polled to
+# completion inside an inner block so it is destroyed before the counter is
+# read.
 _TRACKED = """\
 trait Drop
     fn drop(self: @&Self)
@@ -322,13 +327,13 @@ _POLL_IN_BLOCK = """\
 pub fn main() -> i32
     var out: i32 = 0
     if true
-        var f: go_Future = go(3)
-        while !go_poll(@f)
+        var f = go(3)
+        while !future_poll(@&f)
             out = out + 100
     return out * 10 + {tail}
 """
 
-# Rows that must fail until #4527 is fixed (a strict xfail, as in the tables).
+# Rows for AGAST #4527: a local in a re-entered block drops once per run.
 _OWNED_LOCAL_ROWS = {
     # A plain owned local in an awaiting loop body: three passes make three
     # values, each must drop once.
@@ -345,7 +350,7 @@ _OWNED_LOCAL_ROWS = {
         + _POLL_IN_BLOCK.format(tail="MARKS * 4 + DROPS"), 15),
 }
 
-OWNED_LOCAL_GAPS = {name: 4527 for name in _OWNED_LOCAL_ROWS}
+OWNED_LOCAL_GAPS = {}
 
 
 # An awaiting `if` operand in the block form, whose arms hold statements:
@@ -375,9 +380,9 @@ def test_async_body_runs_as_written(tmp_path, compiler):
 def test_owned_local_in_reentered_block_drops(tmp_path, compiler):
     """AGAST #4527: an owned local in a re-entered block drops once per run.
 
-    A strict xfail: both rows must fail (wrong free count) until the async
-    lowering stops placing such locals in the future struct; a row that
-    passes fails this test so the gap entry is dropped."""
+    A local that dies within one state of a loop or `defer` body stays a
+    poll local, so the emitter's block-end drop frees it each pass; one live
+    across an `await` stays a future field (the RUNS row above)."""
     assert_runs(compiler, tmp_path, _OWNED_LOCAL_ROWS, OWNED_LOCAL_GAPS)
 
 

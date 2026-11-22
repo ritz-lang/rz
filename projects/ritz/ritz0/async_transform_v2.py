@@ -250,15 +250,19 @@ class AsyncAnalyzer:
         if fn_def.body:
             self._analyze_block(fn_def.body)
 
-        # With an await, every local is a field of the future, which needs its
-        # type (AGAST #3762).  Without one there is no future state to hold.
-        if self.await_points and self.untyped:
-            name, span = self.untyped[0]
-            raise UntypedAsyncLocal(fn_def.name, name, span)
+        # A local in a re-entered block that dies before it crosses a state
+        # boundary stays a poll local: the emitter's own block-end drop then
+        # frees it once per run (AGAST #4527).
+        poll_locals = self._poll_locals(fn_def.body) if self.await_points else set()
+        if self.await_points:
+            for name, span in self.untyped:
+                if name not in poll_locals:
+                    raise UntypedAsyncLocal(fn_def.name, name, span)
 
-        # With an await, every local lives in the future: a state ends at
-        # each await, and a loop or branch may reach any local from another.
-        cross_await = set(self.current_locals) if self.await_points else set()
+        # Otherwise a local lives in the future: a state ends at each await,
+        # and a loop or branch may reach any local from another.
+        cross_await = (set(self.current_locals) - poll_locals
+                       if self.await_points else set())
 
         return AsyncFnAnalysis(
             fn_def=fn_def,
@@ -266,6 +270,52 @@ class AsyncAnalyzer:
             all_locals=dict(self.current_locals),
             cross_await_locals=cross_await
         )
+
+    def _poll_locals(self, body: rast.Block) -> Set[str]:
+        """The locals that may stay locals of the poll rather than fields of
+        the future (AGAST #4527).
+
+        A local declared in a block the machine re-enters (a loop body, or a
+        `defer` body, which runs at every exit edge) becomes one field, so
+        each run overwrites the last value and nothing drops it.  One that
+        is dead before any state boundary in the same activation crosses no
+        `await` and can stay a poll local: the emitter's normal block-end
+        drop then frees it once per run.  A local anywhere else, or one live
+        across a boundary, stays a field as before."""
+        ok: Dict[str, bool] = {}
+
+        def record(name: str, reentered: bool, crosses: bool):
+            ok[name] = ok.get(name, True) and reentered and not crosses
+
+        def walk_block(block: rast.Block, reentered: bool):
+            for i, stmt in enumerate(block.stmts):
+                if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
+                    crosses = stmt.value is not None and _has_await(stmt.value)
+                    if not crosses:
+                        crosses = _crosses_after(stmt.name, block.stmts[i + 1:], block.expr)
+                    record(stmt.name, reentered, crosses)
+                walk_node(stmt, reentered)
+
+        def walk_node(node, reentered: bool):
+            if isinstance(node, rast.Block):
+                walk_block(node, reentered)
+            elif isinstance(node, rast.WhileStmt):
+                walk_node(node.cond, reentered)
+                walk_block(node.body, True)
+            elif isinstance(node, rast.ForStmt):
+                walk_node(node.iter, reentered)
+                walk_block(node.body, True)
+            elif isinstance(node, rast.DeferStmt):
+                # A `defer` body is one synchronous region: it runs whole at
+                # each exit edge, so its own locals never cross a state.
+                walk_block(node.body, True)
+            else:
+                for child in _child_nodes(node):
+                    walk_node(child, reentered)
+
+        if body is not None:
+            walk_block(body, False)
+        return {name for name, is_poll in ok.items() if is_poll}
 
     def _analyze_block(self, block: rast.Block):
         """Analyze a block for await points."""
@@ -583,6 +633,53 @@ def _escaping_jump(node) -> Optional[rast.Node]:
     return None
 
 
+def _mentions(node, name: str) -> bool:
+    """Whether `node` reads or writes the local `name` (AGAST #4527)."""
+    if isinstance(node, rast.Ident):
+        return node.name == name
+    return any(_mentions(child, name) for child in _child_nodes(node))
+
+
+def _splits(node) -> bool:
+    """Whether lowering `node` ends the state it starts in: it holds an
+    `await`, or a `break` / `continue` out of a loop that lowers it."""
+    if _has_await(node):
+        return True
+    if isinstance(node, (rast.WhileStmt, rast.ForStmt)):
+        return _escaping_jump(node.body) is not None
+    return _escaping_jump(node) is not None
+
+
+def _uses_across(node, name: str, split: bool) -> bool:
+    """Whether `node` uses `name` in a state other than the one before it.
+
+    A `defer` body runs at exits, after any await on the way out; a lowered
+    loop runs the name from its back edge or exit; any statement holding an
+    `await` may read it in a state of its own.  Otherwise only a use after an
+    earlier split crosses (a conservative answer: crossing keeps a field)."""
+    if isinstance(node, rast.DeferStmt):
+        return _mentions(node.body, name)
+    if isinstance(node, (rast.WhileStmt, rast.ForStmt)):
+        return (_splits(node) or split) and _mentions(node, name)
+    if _splits(node):
+        return _mentions(node, name)
+    return split and _mentions(node, name)
+
+
+def _crosses_after(name: str, stmts: List[rast.Stmt], tail: Optional[rast.Expr]) -> bool:
+    """Whether `name`, declared before `stmts`, is used after a state
+    boundary in the same activation (AGAST #4527)."""
+    split = False
+    for stmt in stmts:
+        if isinstance(stmt, (rast.LetStmt, rast.VarStmt)) and stmt.name == name:
+            return False  # a redeclaration shadows it; its own decl is checked
+        if _uses_across(stmt, name, split):
+            return True
+        if _splits(stmt):
+            split = True
+    return split and tail is not None and _mentions(tail, name)
+
+
 def _range_of(it: rast.Expr) -> Optional[rast.Range]:
     """A `for`'s iterable as the range the emitter loops over (its
     _normalize_for_iter_expr); None for an array, Vec or other iterable."""
@@ -637,9 +734,9 @@ def _pattern_names(pat) -> Set[str]:
 class SimpleBodyTransformer:
     """Rewrites async fn code to run inside its poll fn.
 
-    A name that lives in the future struct (a param; with an await, every
-    local) reads and writes `(*self).name`, wherever it appears: a `while`
-    condition, an assignment's target, a match arm (AGAST #3727: only
+    A name that lives in the future struct (a param, or a local that outlives
+    a state boundary) reads and writes `(*self).name`, wherever it appears: a
+    `while` condition, an assignment's target, a match arm (AGAST #3727: only
     let/var/return/expression statements were rewritten, so `while i < n` with
     a param `n` was "Unknown identifier: n").  A let of such a local is an
     assignment to its field.  An await already driven by a state reads its

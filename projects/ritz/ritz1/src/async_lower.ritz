@@ -388,6 +388,10 @@ struct AlLocal
     inner_pointee: i32
     inner_ref: i32
     is_param: i32
+    # -1 until a declaration is met, then 1 when every declaration of this
+    # name is in a re-entered block and dies before a state boundary, 0 when
+    # it must be a field (AGAST #4527); zalloc's 0 is the safe default.
+    poll_ok: i32
     unsupported: i32    # a type the future can't hold yet (array, reference, fn)
     span: SrcSpan
     next: *AlLocal
@@ -509,6 +513,7 @@ fn al_local(a: *AlFn, name_sv: StrView, span: SrcSpan) -> *AlLocal
     l.name = name
     l.len = len
     l.span = span
+    l.poll_ok = 0 - 1
     if a.locals == null
         a.locals = l
     else
@@ -803,8 +808,9 @@ fn al_an_expr(a: *AlFn, e: *Expr)
 # Rewriting: a body's names read through `self`, and its awaits lowered
 # ---------------------------------------------------------------------------
 
-# Is `name` held in the future?  Params always; the other locals when the
-# fn awaits (without an await they stay locals of the poll).
+# Is `name` held in the future?  Params always; the other locals that outlive
+# a state boundary, when the fn awaits.  One that dies within one state of a
+# re-entered block stays a local of the poll (AGAST #4527).
 fn al_is_field(a: *AlFn, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
@@ -813,7 +819,11 @@ fn al_is_field(a: *AlFn, name_sv: StrView) -> i32
     let l: *AlLocal = al_local_find(a, StrView { ptr: (name), len: (len) as i64 })
     if l == null
         return 0
-    (l.is_param == 1 or a.npoints > 0) as i32
+    if l.is_param == 1
+        return 1
+    if a.npoints > 0 and l.poll_ok != 1
+        return 1
+    0
 
 fn al_rename_of(a: *AlFn, name_sv: StrView) -> *AlRename
     var name: *u8 = name_sv.ptr
@@ -1511,6 +1521,273 @@ fn al_jump_in_stmt(s: *Stmt) -> *Stmt
     if k == STMT_VAR_DECL
         return al_jump_in_expr(s.var_init)
     null   # a loop's own jumps are its own
+
+# -- which locals stay poll locals (AGAST #4527) ---------------------------
+#
+# A local declared in a block the machine re-enters (a loop body, or a
+# `defer` body, which runs at every exit edge) becomes one field of the
+# future, so each run overwrites the last value and nothing drops it.  One
+# that is dead before any state boundary in the same activation crosses no
+# `await` and can stay a poll local: the emitter's own block-end drop then
+# frees it once per run.  A local anywhere else, or one live across a
+# boundary, stays a field as before.  ritz0's al_poll_locals is the same.
+
+# Whether `name` is read or written in `e`.
+fn al_mentions_expr(e: *Expr, name: *u8, len: i32) -> i32
+    if e == null
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_IDENT
+        return al_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (name), len: (len) as i64 })
+    var r: i32 = 0
+    if k == EXPR_BINARY or k == EXPR_RANGE or k == EXPR_INDEX
+        r = al_mentions_expr(e.left, name, len)
+        if r == 0
+            r = al_mentions_expr(e.right, name, len)
+    else if k == EXPR_UNARY
+        r = al_mentions_expr(e.operand, name, len)
+    else if k == EXPR_CALL
+        if e.func_name == null
+            r = al_mentions_expr(e.left, name, len)
+        if r == 0
+            r = al_mentions_list(e.args, name, len)
+    else if k == EXPR_METHOD
+        r = al_mentions_expr(e.left, name, len)
+        if r == 0
+            r = al_mentions_list(e.args, name, len)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        r = al_mentions_expr(e.left, name, len)
+    else if k == EXPR_IF or k == EXPR_MATCH
+        r = al_mentions_expr(e.left, name, len)
+        if r == 0
+            r = al_mentions_arms(e.args as *MatchArm, name, len)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null and r == 0
+            r = al_mentions_expr(fi.value, name, len)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        r = al_mentions_list(e.args, name, len)
+    r
+
+fn al_mentions_list(e: *Expr, name: *u8, len: i32) -> i32
+    var cur: *Expr = e
+    while cur != null
+        if al_mentions_expr(cur, name, len) == 1
+            return 1
+        cur = cur.next
+    0
+
+fn al_mentions_arms(arm: *MatchArm, name: *u8, len: i32) -> i32
+    var cur: *MatchArm = arm
+    while cur != null
+        if al_mentions_stmts(cur.body_stmts, name, len) == 1
+            return 1
+        if al_mentions_expr(cur.body, name, len) == 1
+            return 1
+        cur = cur.next
+    0
+
+fn al_mentions_stmts(s: *Stmt, name: *u8, len: i32) -> i32
+    var cur: *Stmt = s
+    while cur != null
+        if al_mentions_stmt(cur, name, len) == 1
+            return 1
+        cur = cur.next
+    0
+
+fn al_mentions_stmt(s: *Stmt, name: *u8, len: i32) -> i32
+    let k: i32 = s.kind
+    if k == STMT_VAR_DECL
+        # Its own name is a declaration, not a use.  A `let x = x + 1`'s
+        # initializer still reads the outer `x`.
+        return al_mentions_expr(s.var_init, name, len)
+    if k == STMT_EXPR
+        return al_mentions_expr(s.expr, name, len)
+    if k == STMT_RETURN
+        return al_mentions_expr(s.return_value, name, len)
+    if k == STMT_IF
+        if al_mentions_expr(s.if_cond, name, len) == 1
+            return 1
+        if al_mentions_stmts(s.if_then, name, len) == 1
+            return 1
+        return al_mentions_stmts(s.if_else, name, len)
+    if k == STMT_WHILE
+        if al_mentions_expr(s.while_cond, name, len) == 1
+            return 1
+        return al_mentions_stmts(s.while_body, name, len)
+    if k == STMT_FOR
+        if al_mentions_expr(s.for_start, name, len) == 1
+            return 1
+        if al_mentions_expr(s.for_end, name, len) == 1
+            return 1
+        return al_mentions_stmts(s.for_body, name, len)
+    if k == STMT_LOOP or k == STMT_DEFER or k == STMT_UNSAFE
+        return al_mentions_stmts(s.while_body, name, len)
+    if k == STMT_MATCH
+        if al_mentions_expr(s.if_cond, name, len) == 1
+            return 1
+        return al_mentions_arms(s.if_then as *MatchArm, name, len)
+    if k == STMT_ASSERT
+        return al_mentions_expr(s.if_cond, name, len)
+    if k == STMT_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        if s.assign_target != null and al_eq(StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+            return 1
+        # The base and index of the other forms, as al_await_in_stmt reads them.
+        if k != STMT_INDEX_ASSIGN and k != STMT_LOCAL_FIELD_ASSIGN and k != STMT_LOCAL_FIELD_INDEX_ASSIGN
+            if al_mentions_expr(s.if_cond, name, len) == 1
+                return 1
+        if k != STMT_ASSIGN and k != STMT_MEMBER_ASSIGN and k != STMT_LOCAL_FIELD_ASSIGN
+            if al_mentions_expr(s.while_cond, name, len) == 1
+                return 1
+        return al_mentions_expr(s.assign_value, name, len)
+    0
+
+# Whether lowering `s` ends the state it starts in: it holds an `await`, or a
+# `break` / `continue` out of a loop that lowers it.
+fn al_splits_stmt(s: *Stmt) -> i32
+    if al_await_in_stmt(s) != null
+        return 1
+    let k: i32 = s.kind
+    if k == STMT_WHILE
+        return (al_jump_in_stmts(s.while_body) != null) as i32
+    if k == STMT_FOR
+        return (al_jump_in_stmts(s.for_body) != null) as i32
+    if k == STMT_LOOP
+        return (al_jump_in_stmts(s.while_body) != null) as i32
+    (al_jump_in_stmt(s) != null) as i32
+
+# Whether `s` uses `name` in a state other than the one before it.
+fn al_uses_across_stmt(s: *Stmt, name: *u8, len: i32, split: i32) -> i32
+    let k: i32 = s.kind
+    if k == STMT_DEFER
+        # A defer body runs at exits, after any await on the way out.
+        return al_mentions_stmts(s.while_body, name, len)
+    if k == STMT_WHILE or k == STMT_FOR or k == STMT_LOOP
+        if al_splits_stmt(s) == 1 or split == 1
+            return al_mentions_stmt(s, name, len)
+        return 0
+    if al_splits_stmt(s) == 1
+        return al_mentions_stmt(s, name, len)
+    if split == 1
+        return al_mentions_stmt(s, name, len)
+    0
+
+# Whether `name`, declared before `rest`, is used after a state boundary in
+# the same activation.
+fn al_crosses_after(name: *u8, len: i32, rest: *Stmt) -> i32
+    var split: i32 = 0
+    var cur: *Stmt = rest
+    while cur != null
+        if cur.kind == STMT_VAR_DECL and al_eq(StrView { ptr: (cur.var_name), len: (cur.var_name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+            return 0   # a redeclaration shadows it; its own decl is checked
+        if al_uses_across_stmt(cur, name, len, split) == 1
+            return 1
+        if al_splits_stmt(cur) == 1
+            split = 1
+        cur = cur.next
+    0
+
+# Mark each local's poll_ok from its declarations, `reentered` 1 inside a
+# loop or defer body.
+fn al_mark_walk_stmts(a: *AlFn, s: *Stmt, reentered: i32)
+    var cur: *Stmt = s
+    while cur != null
+        if cur.kind == STMT_VAR_DECL
+            var crosses: i32 = 0
+            if al_await_in(cur.var_init) != null
+                crosses = 1
+            else
+                crosses = al_crosses_after(cur.var_name, cur.var_name_len, cur.next)
+            let l: *AlLocal = al_local_find(a, StrView { ptr: (cur.var_name), len: (cur.var_name_len) as i64 })
+            if l != null
+                if reentered == 0 or crosses == 1
+                    l.poll_ok = 0
+                else if l.poll_ok == 0 - 1
+                    l.poll_ok = 1
+        al_mark_walk_stmt(a, cur, reentered)
+        cur = cur.next
+
+fn al_mark_walk_stmt(a: *AlFn, s: *Stmt, reentered: i32)
+    let k: i32 = s.kind
+    if k == STMT_IF
+        al_mark_walk_expr(a, s.if_cond, reentered)
+        al_mark_walk_stmts(a, s.if_then, reentered)
+        al_mark_walk_stmts(a, s.if_else, reentered)
+    else if k == STMT_WHILE
+        al_mark_walk_expr(a, s.while_cond, reentered)
+        al_mark_walk_stmts(a, s.while_body, 1)
+    else if k == STMT_FOR
+        al_mark_walk_expr(a, s.for_start, reentered)
+        al_mark_walk_expr(a, s.for_end, reentered)
+        al_mark_walk_stmts(a, s.for_body, 1)
+    else if k == STMT_LOOP
+        al_mark_walk_stmts(a, s.while_body, 1)
+    else if k == STMT_DEFER
+        # A `defer` body is one synchronous region: it runs whole at each
+        # exit edge, so its own locals never cross a state.
+        al_mark_walk_stmts(a, s.while_body, 1)
+    else if k == STMT_UNSAFE
+        al_mark_walk_stmts(a, s.while_body, reentered)
+    else if k == STMT_MATCH
+        al_mark_walk_expr(a, s.if_cond, reentered)
+        al_mark_walk_arms(a, s.if_then as *MatchArm, reentered)
+    else if k == STMT_VAR_DECL
+        al_mark_walk_expr(a, s.var_init, reentered)
+    else if k == STMT_EXPR
+        al_mark_walk_expr(a, s.expr, reentered)
+    else if k == STMT_RETURN
+        al_mark_walk_expr(a, s.return_value, reentered)
+    else if k == STMT_ASSERT
+        al_mark_walk_expr(a, s.if_cond, reentered)
+    else if k == STMT_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        if k != STMT_INDEX_ASSIGN and k != STMT_LOCAL_FIELD_ASSIGN and k != STMT_LOCAL_FIELD_INDEX_ASSIGN
+            al_mark_walk_expr(a, s.if_cond, reentered)
+        if k != STMT_ASSIGN and k != STMT_MEMBER_ASSIGN and k != STMT_LOCAL_FIELD_ASSIGN
+            al_mark_walk_expr(a, s.while_cond, reentered)
+        al_mark_walk_expr(a, s.assign_value, reentered)
+
+fn al_mark_walk_expr(a: *AlFn, e: *Expr, reentered: i32)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_BINARY or k == EXPR_RANGE or k == EXPR_INDEX
+        al_mark_walk_expr(a, e.left, reentered)
+        al_mark_walk_expr(a, e.right, reentered)
+    else if k == EXPR_UNARY
+        al_mark_walk_expr(a, e.operand, reentered)
+    else if k == EXPR_CALL
+        if e.func_name == null
+            al_mark_walk_expr(a, e.left, reentered)
+        al_mark_walk_list(a, e.args, reentered)
+    else if k == EXPR_METHOD
+        al_mark_walk_expr(a, e.left, reentered)
+        al_mark_walk_list(a, e.args, reentered)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        al_mark_walk_expr(a, e.left, reentered)
+    else if k == EXPR_IF or k == EXPR_MATCH
+        al_mark_walk_expr(a, e.left, reentered)
+        al_mark_walk_arms(a, e.args as *MatchArm, reentered)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            al_mark_walk_expr(a, fi.value, reentered)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        al_mark_walk_list(a, e.args, reentered)
+
+fn al_mark_walk_list(a: *AlFn, e: *Expr, reentered: i32)
+    var cur: *Expr = e
+    while cur != null
+        al_mark_walk_expr(a, cur, reentered)
+        cur = cur.next
+
+fn al_mark_walk_arms(a: *AlFn, arm: *MatchArm, reentered: i32)
+    var cur: *MatchArm = arm
+    while cur != null
+        al_mark_walk_stmts(a, cur.body_stmts, reentered)
+        al_mark_walk_expr(a, cur.body, reentered)
+        cur = cur.next
 
 fn al_needs(a: *AlFn, s: *Stmt, lp: *AlLoop) -> i32
     if al_await_in_stmt(s) != null
@@ -2569,7 +2846,7 @@ fn al_future_struct(a: *AlFn, name_sv: StrView) -> *StructDef
             var best: *AlLocal = null
             var c: *AlLocal = a.locals
             while c != null
-                if c.is_param == 0 and (placed == null or al_less(StrView { ptr: (placed.name), len: (placed.len) as i64 }, StrView { ptr: (c.name), len: (c.len) as i64 }) == 1)
+                if c.is_param == 0 and c.poll_ok != 1 and (placed == null or al_less(StrView { ptr: (placed.name), len: (placed.len) as i64 }, StrView { ptr: (c.name), len: (c.len) as i64 }) == 1)
                     if best == null or al_less(StrView { ptr: (c.name), len: (c.len) as i64 }, StrView { ptr: (best.name), len: (best.len) as i64 }) == 1
                         best = c
                 c = c.next
@@ -2687,6 +2964,9 @@ fn al_analyse(a: *AlFn) -> i32
         al_local_of_param(a, p)
         p = p.next
     al_an_stmts(a, f.body, 1)
+    if a.npoints > 0
+        # Which locals may stay poll locals rather than future fields.
+        al_mark_walk_stmts(a, f.body, 0)
     if a.npoints == 0
         # Only the params are fields.
         var errs: i32 = 0
