@@ -528,7 +528,6 @@ fn main() -> i32
     emit_trunc(@&ir, 4, 2, "i32")
     format_into(@&ir, "  ret i32 %{4}\n")
     print("{string_as_view(@ir)}")
-    string_drop(@&ir)
     return 0
 ```
 
@@ -544,7 +543,6 @@ fn main() -> i32
     let n: i64 = 3
     format_into(@&c, "\"={{rax}},{{rax}},{{rdi}},~{{rcx}}\" ; {n} operands\n")
     print("{string_as_view(@c)}")
-    string_drop(@&c)
     return 0
 ```
 
@@ -1141,7 +1139,6 @@ import ritzlib.strview
 fn main() -> i32
     var s: String = string_from("hello")
     let n = string_len(@s)
-    string_drop(@&s)
     n as i32
 ```
 
@@ -1186,7 +1183,6 @@ fn main() -> i32
     var s: String = string_from("hello")
     let b: *u8 = string_as_ptr(@&s)
     let same: bool = *a == *b
-    string_drop(@&s)
     if same
         return 0
     1
@@ -1252,7 +1248,6 @@ fn main() -> i32
     var t: String = string_from("abc")
     let c: Span<u8> = span_from_strview(string_as_view(@t))
     let n = a.len + b.len + c.len
-    string_drop(@&t)
     if n == 9
         return 0
     1
@@ -1676,7 +1671,6 @@ fn main() -> i32
     let first = vec_get(@v, 0)
     let p = vec_as_ptr(@v)     # *i32
     let n = twice(3)           # T = i64
-    vec_drop(@&v)
     first + p[0] + n as i32 - 87
 ```
 
@@ -5005,17 +4999,18 @@ pointers, references, `StrView`, and every struct, enum, tuple or array built
 only from copy types. A type doesn't become move-only by holding a raw pointer
 to heap memory. Only `Drop` makes it move-only.
 
-`String` and `Vec<T>` own heap buffers but don't implement `Drop` yet
-(AGAST #2159). Today they are copy types, and their owner releases them by
-calling `string_drop` or `vec_drop` explicitly:
+`String` and `Vec<T>` own heap buffers and implement `Drop` (§13.6, AGAST
+#2159), so they are move-only: the compiler frees the buffer when the owning
+binding's scope ends (§13.6). Don't call `string_drop` or `vec_drop` on an
+owning binding; the free functions remain for a `String` or `Vec<T>` held in
+raw memory and reached through a pointer:
 
 ```ritz
 import ritzlib.string
 
 fn main() -> i32
     var s = string_from("hello")    # s owns the buffer
-    string_drop(@&s)                # released explicitly
-    0
+    string_len(@s) as i32           # freed once, when main returns
 ```
 
 ### 13.2 Move Semantics
@@ -5232,18 +5227,17 @@ Raw pointers get no exception. Code that keeps values in raw memory takes them
 out with `ptr_read<T>(p)` from `ritzlib.ptr`, a bitwise read whose caller becomes
 the owner. The memory at `p` then no longer holds a value.
 
-Copying a copy type that owns a buffer, such as today's `String`, gives two
-bindings that name the same buffer. Only one of them may release it, and the
-compiler doesn't track which one does that:
+A type that owns a buffer such as `String` implements `Drop`, so it is
+move-only: at most one binding ever owns the buffer, and the compiler frees
+it once, at that owner's scope end:
 
 ```ritz
 import ritzlib.string
 
 fn main() -> i32
     let s1 = string_from("hello")
-    var s2 = s1                     # shares s1's buffer
-    string_drop(@&s2)               # drop exactly once
-    0
+    var s2 = s1                     # moves the buffer to s2; s1 is moved-from
+    string_len(@s2) as i32          # freed once, when main returns
 ```
 
 ### 13.3 Borrowing
@@ -5256,7 +5250,6 @@ import ritzlib.string
 fn main() -> i32
     var s = string_from("hello")
     let n = string_len(@s)          # borrow for the call
-    string_drop(@&s)
     n as i32
 ```
 
@@ -5417,7 +5410,6 @@ fn main() -> i32
     var s = string_from("hello")
     append(@&s)
     let n = string_len(@s)
-    string_drop(@&s)
     n as i32
 ```
 
@@ -7431,7 +7423,9 @@ fn main() -> i32
 
 Ritz has no garbage collector. Memory is managed through:
 - Stack allocation (automatic)
-- Explicit `*_drop` calls on owning types
+- Compiler-inserted drops of move-only values (§13.6)
+- Explicit `*_drop` calls for values reached through a raw pointer, which the
+  compiler never drops
 - Explicit heap management (`heap_alloc` / `heap_free`, arenas)
 
 ### 18.4 Volatile Access

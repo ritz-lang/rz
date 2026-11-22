@@ -95,8 +95,12 @@ def test_a_string_refused_at_its_literal_is_not_reported_again(request, tmp_path
 # global generic instance, whose bare name `Vec` monomorph turns into an
 # instance, and a local one.  ritz0's own rule; ritz1's reads only locals.
 ACCEPTED = {
-    "global_generic": ("import ritzlib.gvec\n\nvar g: Vec<i64>\n\n"
-                       "fn main() -> i32\n    let n: i64 = g.len\n    0\n"),
+    # A module-level `Vec` is refused: a value with Drop is never dropped
+    # (§13.6, AGAST #2159). The global holds a pointer; its declared type
+    # still names the generic instance this row is about.
+    "global_generic": ("import ritzlib.gvec\nimport ritzlib.memory\n\nvar g: *Vec<i64> = null\n\n"
+                       "fn main() -> i32\n    g = malloc(sizeof(Vec<i64>)) as *Vec<i64>\n"
+                       "    *g = vec_new<i64>()\n    let n: i64 = g.len\n    0\n"),
     "local_generic": ("import ritzlib.gvec\n\nfn main() -> i32\n"
                       "    var v: Vec<i64> = vec_new<i64>()\n    let n: i64 = v.len\n    0\n"),
 }

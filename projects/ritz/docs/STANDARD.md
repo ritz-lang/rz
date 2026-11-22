@@ -533,20 +533,19 @@ by-value parameter holding it (LANGUAGE_SPEC §13.1). The owner releases it,
 and nothing else does. A function that only uses it borrows it (`@x`, `@&x`) and
 doesn't free it. A function that returns it hands ownership to the caller.
 
-`String` and `Vec<T>` don't implement `Drop` yet (AGAST #2159), so they are
-copy types, and copying one copies the owner's pointer, not the buffer. Until #2159
-lands, the owner calls `string_drop` / `vec_drop` once, usually with a
-`defer` right after it is made (S-OWN-4), and never keeps a copy past the
-drop. When #2159 lands this rule becomes ENFORCED by S-OWN-3.
+`String` and `Vec<T>` implement `Drop` (AGAST #2159, LANGUAGE_SPEC §13.6), so
+they are move-only and S-OWN-3 enforces this: the compiler frees the buffer
+at the owner's scope end. Don't call `string_drop` / `vec_drop` on an owning
+binding; those functions remain for a value reached through a raw pointer,
+which the compiler never drops.
 
 ```ritz
 import ritzlib.string
 
 fn greeting_len() -> i64
     var s = string_from("hello")
-    defer string_drop(@&s)
     string_push_str(@&s, ", world")
-    string_len(@s)
+    string_len(@s)                  # freed once, when the function returns
 ```
 
 #### S-OWN-2 Raw allocation stays inside the owning type

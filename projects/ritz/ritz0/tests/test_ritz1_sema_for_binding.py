@@ -64,15 +64,16 @@ fn main() -> i32
     var n: i32 = 0
 """
 
-# What `for w in <it>` walks.
+# What `for w in <it>` walks.  A Vec is move-only (AGAST #2159), so the two
+# loops over a bare Vec borrow it instead of moving it on the first pass.
 ITERABLES = {
-    "vec": "ws",
+    "vec": "@ws",
     "vec_addr": "@ws",
     "vec_addr_mut": "@&ws",
     "array": "arr",
     "array_addr": "@arr",
     "global_array": "g_arr",
-    "vec_field": "h.ws",
+    "vec_field": "@h.ws",
     "vec_field_addr": "@h.ws",
     "array_field": "h.arr",
     "span": "sp",

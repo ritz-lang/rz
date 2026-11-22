@@ -53,8 +53,7 @@ pub fn main() -> i32
     var items: Vec<i64> = vec_new<i64>()
     vec_push(@&items, 42)
     print_int(vec_get(@items, 0))
-    vec_drop(@&items)
-    0
+    0                       # `items` is freed here (Vec has Drop)
 ```
 
 ## Module Reference

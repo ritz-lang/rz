@@ -225,12 +225,18 @@ _NESTED = """\
 """
 
 _MAIN = _TYPES + "struct O\n    m: i64\n    ts: Vec<T>\n\n" + "pub fn main() -> i32\n" + _FILL
+
+# A T owns Vecs, so it is move-only (§13.6): an array of them starts whole, and
+# an element is reached through its data pointer rather than moved out (#2159).
+_T0 = "T { n: 0, edges: vec_new<E>(), vi: vec_new<i32>(), vf: vec_new<f32>() }"
+_A0 = f"[{_T0}, {_T0}]"
 NESTED = {
-    "vec_of_t": _MAIN + ("    var o: O\n    o.m = 1\n    o.ts = vec_new<T>()\n    o.ts.push(t)\n"
-                         "    var i: i64 = 0\n" + _NESTED.format(b="o.ts[i]")),
+    "vec_of_t": _MAIN + ("    var o: O = O { m: 1, ts: vec_new<T>() }\n    o.ts.push(t)\n"
+                         "    var i: i64 = 0\n    let p: *T = o.ts.data + i\n"
+                         + _NESTED.format(b="p")),
     "vec_name_of_t": _MAIN + ("    var v: Vec<T> = vec_new<T>()\n    v.push(t)\n    var i: i64 = 0\n"
-                              + _NESTED.format(b="v[i]")),
-    "array_of_t": _MAIN + "    var a: [2]T\n    a[1] = t\n    var i: i64 = 2\n" + _NESTED.format(b="a[i - 1]"),
+                              "    let p: *T = v.data + i\n" + _NESTED.format(b="p")),
+    "array_of_t": _MAIN + f"    var a: [2]T = {_A0}\n    a[1] = t\n    var i: i64 = 2\n" + _NESTED.format(b="a[i - 1]"),
 }
 
 # ritz0 crashed indexing `o.ts[i].edges`, 'Cannot index type: Vec$E' (#2567).

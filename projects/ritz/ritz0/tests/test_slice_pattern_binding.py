@@ -43,7 +43,7 @@ BOXES = {
              "    var v: Span<i32> = span_from_ptr<i32>(@a[0], 4)\n",
              "span_empty<i32>()", "t.len", "t[{k}]"),
     "String": ("String",
-               "    var v: String\n    v.data = vec_new<u8>()\n"
+               "    var v: String = string_new()\n    v.data = vec_new<u8>()\n"
                "    v.data.push(10)\n    v.data.push(20)\n    v.data.push(30)\n    v.data.push(40)\n",
                "string_new()", "t.data.len", "t[{k}]"),
 }

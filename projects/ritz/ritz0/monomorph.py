@@ -267,6 +267,14 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             # Visit body
             self._visit_block(item.body)
         elif isinstance(item, rast.StructDef):
+            # Skip generic structs, as for generic fns above: a field that
+            # names a type parameter (`v: Vec<T>`) is an instance only once
+            # a specialization substitutes T.  Noting `Vec<T>` here built
+            # `Vec$T`, whose Drop impl then asked for sizeof(T) (AGAST #2159).
+            # `_register_field_instances` notes the fields of each
+            # specialization.
+            if item.is_generic():
+                return
             # Visit field types
             for _, field_type in item.fields:
                 self._visit_type(field_type)

@@ -37,9 +37,10 @@ test_string_methods.ritz calls them by method syntax, and now reaches the impl.
 NOT WRAPPED, on purpose
 
   * `drop`: ritz0 takes any `(T, 'drop')` method as T's destructor
-    (_get_drop_fn_name), so a plain `drop` wrapper would make a String drop
-    itself at scope end on top of the explicit `s.drop()`. Free a String
-    with `string_drop(@&s)` instead (#3614; checked on the ritzlib suite).
+    (_get_drop_fn_name). `String`'s destructor is `impl Drop for String`
+    (AGAST #2159), which runs at scope end; a `drop` wrapper in `impl String`
+    would be a second destructor for the same type. Nothing frees a String
+    by hand any more (#3614).
 """
 
 import re
@@ -260,9 +261,10 @@ def test_a_pub_impl_method_is_exported(tmp_path):
 
 @pytest.mark.integration
 def test_string_methods_suite_compiles_without_the_table(tmp_path):
-    """#3614: `String` has no `drop` method on purpose (see NOT WRAPPED), so
-    its ritzlib suite frees a String with `string_drop(@&s)`. An `s.drop()`
-    only resolved through the table, which #3496 deleted."""
+    """#3614: `String` has no `drop` method on purpose (see NOT WRAPPED): its
+    destructor is `impl Drop for String` (AGAST #2159), and the suite drops a
+    String at scope end. An `s.drop()` only resolved through the table, which
+    #3496 deleted."""
     _compile_without_table(
         RITZLIB / "tests" / "test_string_methods.ritz",
         tmp_path / "suite.ll", ["--no-runtime"])

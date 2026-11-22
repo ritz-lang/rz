@@ -32,7 +32,7 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.strview { StrView, strview_from_ptr, strview_is_empty, strview_len, strview_eq, strview_starts_with, strview_ends_with }
-import ritzlib.string { String, string_new, string_drop, string_len, string_as_ptr, string_push_cstr, string_push_i64 }
+import ritzlib.string { String, string_new, string_len, string_as_ptr, string_push_cstr, string_push_i64 }
 
 import zeus.worker { WorkerContext }
 import zeus.worker { worker_init, worker_destroy }
@@ -76,7 +76,10 @@ const SHM_FD: i32 = 3  # Zeus always passes shm fd as fd 3
 # by one would go stale when another saved it (AGAST #2459).
 # ============================================================================
 
-var g_repo: WikiPageRepository
+# WikiPageRepository owns a Vec (through MemDocs), so it has drop glue and a
+# module-level value is never dropped.  Keep it in raw memory instead: it is
+# allocated once in main and lives for the process.
+var g_repo: *WikiPageRepository = null
 var g_cache: *PageCache = null
 var g_svc: WikiService
 
@@ -229,8 +232,6 @@ fn send_body(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, content_type
     var headers: String = string_new()
     push_headers(@&headers, status, content_type, string_len(body))
     let rc: i32 = send_raw(ctx, resp, status, @&headers, body)
-    string_drop(@&headers)
-    string_drop(body)
     return rc
 
 
@@ -246,8 +247,6 @@ fn send_redirect(ctx: *WorkerContext, resp: *ResponseSlot, slug: StrView) -> i32
     var body: String = string_new()
     push_redirect_to_page(@&headers, slug)
     let rc: i32 = send_raw(ctx, resp, 303, @&headers, @&body)
-    string_drop(@&headers)
-    string_drop(@&body)
     return rc
 
 
@@ -266,7 +265,6 @@ fn send_html(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, body: @&Stri
 # is empty), anything else is `body` with that status.
 fn send_presented(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, body: @&String, slug: StrView) -> i32
     if status == STATUS_SAVED
-        string_drop(body)
         return send_redirect(ctx, resp, slug)
     return send_html(ctx, resp, status, body)
 
@@ -523,11 +521,16 @@ pub fn main(argc: i32, argv: **u8) -> i32
     # 127.0.0.1:7777, AGAST #3065), encrypted unless MAUSOLEUM_PLAINTEXT=1
     # (#2466); memory for a lone worker without it (src/wiki_app.ritz).
     var cfg: StoreConfig = store_config_from_env()
-    g_repo = wiki_page_repo_new()
+    let repo_ptr: *WikiPageRepository = malloc(sizeof(WikiPageRepository)) as *WikiPageRepository
+    if repo_ptr == null
+        log_cstr(c"Failed to allocate the repository")
+        return 1
+    *repo_ptr = wiki_page_repo_new()
+    g_repo = repo_ptr
     g_cache = malloc(sizeof(PageCache)) as *PageCache
     *g_cache = page_cache_new()
-    g_svc = wiki_service_new(@g_repo, g_cache)
-    if wiki_app_open(@g_repo, @cfg, worker_count) != APP_UNAVAILABLE
+    g_svc = wiki_service_new(g_repo, g_cache)
+    if wiki_app_open(g_repo, @cfg, worker_count) != APP_UNAVAILABLE
         let pages: i64 = wiki_app_seed(@g_svc)
         var count_line: String = log_begin()
         string_push_cstr(@&count_line, c"Store initialized with ")
@@ -573,7 +576,7 @@ pub fn main(argc: i32, argv: **u8) -> i32
                 worker_set_running(@ctx)
 
     worker_destroy(@ctx)
-    wiki_page_repo_disconnect(@g_repo)
+    wiki_page_repo_disconnect(g_repo)
     log_cstr(c"Worker shutting down")
 
     return 0

@@ -98,8 +98,9 @@ LEGAL = {
     # A read of the Vec, and a mutable borrow inside it.
     "read_and_inner_borrow": (_loop("vs[0].a", "        n = n + v + vs.len() as i32\n"
                                     "        let q: @&H = @&vs[0]\n        q.a[1] = 2\n"), 9),
-    # `for v in vs` reads `len` and `data` each pass: a push is safe (#2388).
-    "walk_the_vec": (_loop("vs", "        if n == 0\n            vs.push(h)\n        n = n + 1\n"), 2),
+    # `for v in vs` moves the Vec now that it is move-only (AGAST #2159), so a
+    # push in the body borrows it mutably instead; it still walks in place.
+    "walk_the_vec": (_loop("@&vs", "        if n == 0\n            vs.push(h)\n        n = n + 1\n"), 2),
     # Array-rooted paths hold nothing.
     "array_field": (_loop("h.a", "        h.a[2] = 50\n        n = n + v\n"), 53),
     # An index into an array: the storage can't move, so even the root is free.

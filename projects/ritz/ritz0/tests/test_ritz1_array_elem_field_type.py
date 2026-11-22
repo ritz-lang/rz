@@ -121,6 +121,7 @@ def test_pointer_field_of_an_array_element_strides_by_its_pointee(run_with, name
 # `a[i].edges[j].k` with `a: [N]T`, `T { edges: Vec<E> }`: #2564's shape one level out.
 _VTYPES = """\
 import ritzlib.gvec
+import ritzlib.memory
 
 struct E
     y: f32
@@ -141,8 +142,10 @@ struct H
     m: i64
     a: [2]T
 
-var g: [2]T
-var gh: H
+# A T owns a Vec, so it is move-only: every binding starts from a whole value,
+# and a module-level one is a pointer filled in main (AGAST #2159).
+var g: *[2]T = null
+var gh: *H = null
 
 fn fill(t: *T)
     t.n = 9
@@ -177,8 +180,9 @@ _VCHECK = """\
 """
 
 
-def _vmain(a: str, setup: str, holder: str) -> str:
-    return (_VTYPES + "pub fn main() -> i32\n" + setup + f"    fill(@{holder}[1])\n"
+def _vmain(a: str, setup: str, holder: str, fill_at: str = "") -> str:
+    fill_at = fill_at or f"@{holder}[1]"
+    return (_VTYPES + "pub fn main() -> i32\n" + setup + f"    fill({fill_at})\n"
             + _VCHECK.format(a=a))
 
 
@@ -188,14 +192,21 @@ def _vfn(param: str, a: str, arg: str, setup: str, holder: str) -> str:
             + f"    return f({arg})\n")
 
 
+# Whole values for T, `[2]T` and H, the move-only types (§13.6).
+_T0 = "T { n: 0, edges: vec_new<E>() }"
+_A0 = f"[{_T0}, {_T0}]"
+_H0 = f"H {{ m: 0, a: {_A0} }}"
+_GLOBAL = (f"    g = malloc(sizeof([2]T)) as *[2]T\n    *g = {_A0}\n"
+           f"    gh = malloc(sizeof(H)) as *H\n    *gh = {_H0}\n")
+
 VEC_FIELDS = {
-    "local": _vmain("a", "    var a: [2]T\n", "a"),
-    "global": _vmain("g", "", "g"),
-    "local_field": _vmain("h.a", "    var h: H\n", "h.a"),
-    "global_field": _vmain("gh.a", "", "gh.a"),
-    "array_mut_ref_param": _vfn("@&[2]T", "x", "@&c", "    var c: [2]T\n", "c"),
-    "holder_mut_ref_param": _vfn("@&H", "x.a", "@&hh", "    var hh: H\n", "hh.a"),
-    "holder_ptr_param": _vfn("*H", "x.a", "@hh", "    var hh: H\n", "hh.a"),
+    "local": _vmain("a", f"    var a: [2]T = {_A0}\n", "a"),
+    "global": _vmain("g", _GLOBAL, "g"),
+    "local_field": _vmain("h.a", f"    var h: H = {_H0}\n", "h.a"),
+    "global_field": _vmain("(*gh).a", _GLOBAL, "gh.a", "@((*gh).a[1])"),
+    "array_mut_ref_param": _vfn("@&[2]T", "x", "@&c", f"    var c: [2]T = {_A0}\n", "c"),
+    "holder_mut_ref_param": _vfn("@&H", "x.a", "@&hh", f"    var hh: H = {_H0}\n", "hh.a"),
+    "holder_ptr_param": _vfn("*H", "x.a", "@hh", f"    var hh: H = {_H0}\n", "hh.a"),
 }
 
 

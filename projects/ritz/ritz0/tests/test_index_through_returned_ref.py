@@ -18,6 +18,7 @@ import pytest
 
 import test_ritz1_for_header as for_header
 import test_table_rows as table_rows
+from test_index_through_reference import _string_objects
 from test_table_rows import ALL, Row, Run
 
 TYPES = """\
@@ -53,7 +54,7 @@ fn getv(h: @H) -> @Vec<P>
     @h.v
 
 fn mk() -> H
-    var s: String
+    var s: String = string_new()
     s.data = vec_new<u8>()
     s.data.push(120)
     s.data.push(121)
@@ -79,8 +80,10 @@ TABLE = [
     # `+=` through a `*Vec<P>` call: the call runs once (calls == 1).
     _row("method_ptr_compound", "    h.raw()[0].a += 3\n    h.v[0].a * 10 + h.calls\n", 81),
     _row("field_ptr_read", "    let w = W { p: @h.v }\n    w.p[1].a\n", 7),
-    _row("scalar_elem_read", "    h.ints()[1]\n", 13),
-    _row("string_byte_read", "    h.str()[1] as i32\n", 121),
+    # `Vec` and `String` are move-only (#2159): the call's reference is bound to
+    # a name first, or ritz1 reads the Vec out of it to index.
+    _row("scalar_elem_read", "    let iv: @Vec<i32> = h.ints()\n    iv[1]\n", 13),
+    _row("string_byte_read", "    let sv: @String = h.str()\n    sv[1] as i32\n", 121),
 ]
 
 
@@ -88,6 +91,9 @@ TABLE = [
 @pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
                          ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
 def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    def strings(compiler):
+        return _string_objects(compiler, ritz1_bin)
+
     table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
-                           build=for_header.batch_build(ritz1_bin),
+                           build=for_header.batch_build(ritz1_bin, strings),
                            compile=for_header.batch_compile(ritz1_bin), work=tmp_path)

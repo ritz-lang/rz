@@ -127,7 +127,7 @@ fn one<T>(x: T) -> Vec<T>
 # `unwrap_or` through one receiver shape ritz1 couldn't type.
 SHAPES = {
     "index_of_array_local": ("""\
-    var arr: [2]Vec<i32>
+    var arr: [2]Vec<i32> = [Vec<i32> { data: null, len: 0, cap: 0 }, Vec<i32> { data: null, len: 0, cap: 0 }]
     arr[0] = mk()
     return arr[0].get(0) + arr[0].pop()
 """, 10),
@@ -222,7 +222,7 @@ fn bp() -> *Buf
     return @g_buf
 
 pub fn main() -> i32
-    var h: Holder
+    var h: Holder = Holder { raw: Vec<u8> { data: null, len: 0, cap: 0 } }
     h.raw.len = 0
     var bufs: [2]Buf
     bp().push(4)

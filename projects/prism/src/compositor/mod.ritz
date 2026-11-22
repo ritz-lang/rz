@@ -3,7 +3,8 @@
 # Core compositing functionality.
 
 import ritzlib.gvec { Vec, vec_new }
-pub import compositor.window { Window, WindowState, compare_z_order }
+import ritzlib.ptr { ptr_read }
+pub import compositor.window { Window, WindowState, compare_z_order, window_set_state_ptr, window_mark_dirty_all_ptr, window_mark_dirty_ptr, window_clear_dirty_ptr }
 pub import compositor.damage { DamageTracker, DamageRegion }
 # pub import compositor.scheduler { ScanlineScheduler }  # Future
 # pub import compositor.renderer { Renderer }  # Future
@@ -56,24 +57,30 @@ impl Compositor
         var new_window = window
         new_window.z_order = max_z + 1
 
+        # Capture bounds before the window moves into the list
+        let new_bounds = new_window.bounds()
+
         self.windows.push(new_window)
 
         # Damage the new window's area
-        self.damage.add_damage(new_window.bounds(), id.raw())
+        self.damage.add_damage(new_bounds, id.raw())
 
         id
 
     pub fn destroy_window(self:&, id: WindowId)
         var i: u64 = 0
         while i < self.windows.len()
-            if self.windows[i].id.raw() == id.raw()
+            let win = self.windows.get_ptr(i as i64)
+            if (*win).id.raw() == id.raw()
                 # Damage the area before removing
-                self.damage.add_damage(self.windows[i].bounds(), 0)
+                self.damage.add_damage((*win).bounds(), 0)
 
-                # Remove from list, keeping the remaining windows in z-order
-                var j = i + 1
-                while j < self.windows.len()
-                    self.windows[j - 1] = self.windows[j]
+                # Remove from list, keeping the remaining windows in z-order.
+                # Bubble the doomed window to the end with swaps (its elements
+                # are move-only, so they can't be assigned across slots).
+                var j = i
+                while j + 1 < self.windows.len()
+                    swap_windows_at(@&self.windows, j as i64, (j + 1) as i64)
                     j += 1
                 self.windows.pop()
 
@@ -84,14 +91,15 @@ impl Compositor
                 return
             i += 1
 
-    pub fn window_count(self) -> u64
+    pub fn window_count(self: @Compositor) -> u64
         self.windows.len()
 
     pub fn get_window(self:&, id: WindowId) -> Option<@&Window>
         var i: u64 = 0
         while i < self.windows.len()
-            if self.windows[i].id.raw() == id.raw()
-                return Some(@&self.windows[i])
+            let win = self.windows.get_ptr(i as i64)
+            if (*win).id.raw() == id.raw()
+                return Some(@&*win)
             i += 1
         None
 
@@ -102,21 +110,23 @@ impl Compositor
         if self.focused_window != 0
             var i: u64 = 0
             while i < self.windows.len()
-                if self.windows[i].id.raw() == self.focused_window
-                    self.windows[i].set_state(WindowState.Normal)
-                    self.windows[i].mark_dirty_all()
+                let win = self.windows.get_ptr(i as i64)
+                if (*win).id.raw() == self.focused_window
+                    window_set_state_ptr(win, WindowState.Normal)
+                    window_mark_dirty_all_ptr(win)
                 i += 1
 
         # Focus new
         self.focused_window = id.raw()
         var j: u64 = 0
         while j < self.windows.len()
-            if self.windows[j].id.raw() == id.raw()
-                self.windows[j].set_state(WindowState.Focused)
-                self.windows[j].mark_dirty_all()
+            let win = self.windows.get_ptr(j as i64)
+            if (*win).id.raw() == id.raw()
+                window_set_state_ptr(win, WindowState.Focused)
+                window_mark_dirty_all_ptr(win)
             j += 1
 
-    pub fn focused_window_id(self) -> Option<WindowId>
+    pub fn focused_window_id(self: @Compositor) -> Option<WindowId>
         if self.focused_window == 0
             None
         else
@@ -142,8 +152,9 @@ impl Compositor
             RenderCommand.Invalidate(inv_cmd) =>
                 var i: u64 = 0
                 while i < self.windows.len()
-                    if self.windows[i].id.raw() == window_id.raw()
-                        self.windows[i].mark_dirty(inv_cmd.region)
+                    let win = self.windows.get_ptr(i as i64)
+                    if (*win).id.raw() == window_id.raw()
+                        window_mark_dirty_ptr(win, inv_cmd.region)
                     i += 1
 
             RenderCommand.Nop =>
@@ -309,7 +320,8 @@ impl Compositor
         self.damage.clear()
         var i: u64 = 0
         while i < self.windows.len()
-            self.windows[i].clear_dirty()
+            let win = self.windows.get_ptr(i as i64)
+            window_clear_dirty_ptr(win)
             i += 1
 
     # Simple bubble sort by z-order (good enough for small window counts)
@@ -322,11 +334,11 @@ impl Compositor
         while i < n - 1
             var j: u64 = 0
             while j < n - i - 1
-                if self.windows[j].z_order > self.windows[j + 1].z_order
-                    # Swap
-                    let temp = self.windows[j]
-                    self.windows[j] = self.windows[j + 1]
-                    self.windows[j + 1] = temp
+                let a = self.windows.get_ptr(j as i64)
+                let b = self.windows.get_ptr((j + 1) as i64)
+                if (*a).z_order > (*b).z_order
+                    # Swap (elements are move-only; swap in place)
+                    swap_windows_at(@&self.windows, j as i64, (j + 1) as i64)
                 j += 1
             i += 1
 
@@ -335,8 +347,20 @@ impl Compositor
     pub fn backend(self:&) -> @&MockBackend
         @&self.backend
 
-    pub fn frame_count(self) -> u64
+    pub fn frame_count(self: @Compositor) -> u64
         self.frame_count
 
     pub fn damage_tracker(self:&) -> @&DamageTracker
         @&self.damage
+
+# Swap two window slots through raw pointers. Vec<Window>'s elements are
+# move-only, so vec_get/vec_swap can't be instantiated for Window; a bitwise
+# ptr_read leaves exactly one owner per slot.
+fn swap_windows_at(v: @&Vec<Window>, i: i64, j: i64)
+    if i == j
+        return
+    let a = v.get_ptr(i)
+    let b = v.get_ptr(j)
+    let tmp = ptr_read<Window>(a)
+    *a = ptr_read<Window>(b)
+    *b = tmp

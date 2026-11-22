@@ -9,9 +9,10 @@ judged like `@T` and `@&T`.  A by-value `self` on the element is the same read.
     fn f(p: @Vec<T>) -> T
         return (*p)[1]      # ritz1 and selfhosted accepted it: two owners of one T
 
-What isn't a move stays legal: a copy element (`Vec<i32>`, `Vec<Vec<i32>>`: a Vec
-has no Drop, so it's a copy, and the ticket's own example is one), a pointer
-element, a copy field of the element, a borrowing receiver, `@p[i]`.
+What isn't a move stays legal: a copy element (`i32`), a scalar read through a
+nested index (AGAST #2159 made `Vec` move-only, so an element of `Vec<Vec<i32>>`
+is no longer a copy), a pointer element, a copy field of the element, a
+borrowing receiver, `@p[i]`.
 
 A Vec or Span of a Drop type is refused today on ritz0, in gvec.ritz's generic
 bodies, and on ritz1 in span.ritz's (#2159's question): so the refusals assert the
@@ -83,11 +84,11 @@ NOT_MOVES = {
 # same receiver check as `(*p)[i].m()`.
 DEREF_RECEIVER = "fn f(r: {P}T) -> i32\n    (^*r).burn()\n"
 
-# No Drop in sight: every element is a copy, and each compiles.
+# No Drop in sight: every read is a copy, and each compiles.
 COPIES = {
     "scalar": "fn f(p: {P}Vec<i32>) -> i32\n    let w: i32 = p[1]\n    w\n",
-    "vec_of_vecs": "fn f(p: {P}Vec<Vec<i32>>) -> i32\n    let w: Vec<i32> = p[1]\n    0\n",
-    "deref_vec_of_vecs": "fn f(p: {P}Vec<Vec<i32>>) -> i32\n    let w: Vec<i32> = (*p)[1]\n    0\n",
+    "vec_of_vecs": "fn f(p: {P}Vec<Vec<i32>>) -> i32\n    let w: i32 = p[1][1]\n    w\n",
+    "deref_vec_of_vecs": "fn f(p: {P}Vec<Vec<i32>>) -> i32\n    let w: i32 = (*p)[1][1]\n    w\n",
 }
 
 

@@ -98,8 +98,8 @@ class MonoRewriteMixin:
     def _rewrite_impl(self, impl: rast.ImplBlock) -> rast.ImplBlock:
         """Rewrite a non-generic impl block to use specialized types and calls.
 
-        For example, if String's Drop impl calls vec_drop<u8>(), this rewrites
-        the call to use the specialized vec_drop$u8 function.
+        For example, if String's Drop impl calls the generic `vec_drop` at
+        `u8`, this rewrites the call to the specialized vec_drop$u8 function.
         """
         new_methods = [self._rewrite_function(method) for method in impl.methods]
 

@@ -34,6 +34,15 @@ import test_ritz1_for_header as for_header
 from test_table_rows import Refused, Run, case
 from test_ritz1_for_header import _new
 
+# A `String`'s `string_new`/`String_drop` are linked from ritzlib/string, whose
+# byte Vec (and its Drop) come from gvec (#2159), as test_slice_value_local's
+# String rows already do.
+STRING_UNITS = ("string", "strview", "hash")
+
+
+def _string_objects(compiler, ritz1_bin) -> tuple:
+    return for_header.library_objects(compiler, ritz1_bin, STRING_UNITS)
+
 # The pointer's spelling and the operator that makes one.
 KINDS = {"pointer": ("*", "@"), "reference": ("@", "@"), "mut_reference": ("@&", "@&")}
 WRITABLE = ("pointer", "mut_reference")
@@ -60,7 +69,7 @@ SCALARS = {
              "    var a: [3]i32 = [10, 20, 30]\n"
              "    var v: Span<i32> = span_from_ptr<i32>(@a[0], 3)\n", "a[1]"),
     "String": ("String", "u8",
-               "    var v: String\n    v.data = vec_new<u8>()\n"
+               "    var v: String = string_new()\n    v.data = vec_new<u8>()\n"
                "    v.data.push(10)\n    v.data.push(20)\n    v.data.push(30)\n",
                "*(v.data.data + 1) as i32"),
 }
@@ -111,7 +120,9 @@ SCALAR_READS = {
     "add": "    return (p[0] + p[1]) as i32\n",
     "at": "    let q: *{e} = @p[1]\n    return *q as i32\n",
     "at_next": "    let q: *{e} = @p[0] + 1\n    return *q as i32\n",
-    "at_inferred": "    let q = @p[1]\n    return *q as i32\n",
+    # `as *{e}` keeps the binding untyped while naming the place's type; ritz1
+    # otherwise reads the move-only Vec out of the reference to infer it (#2159).
+    "at_inferred": "    let q = @p[1] as *{e}\n    return *q as i32\n",
     "deref_form": "    return (*p)[1] as i32\n",
 }
 SCALAR_WRITES = {
@@ -331,7 +342,7 @@ pub fn main() -> i32
 def an_unsigned_byte_widens_without_its_sign(ty, kind):
     spelled, addr = KINDS[kind]
     setup = (_new("u8", (1, 200)) if ty == "Vec<u8>" else
-             "    var v: String\n    v.data = vec_new<u8>()\n    v.data.push(1)\n    v.data.push(200)\n")
+             "    var v: String = string_new()\n    v.data = vec_new<u8>()\n    v.data.push(1)\n    v.data.push(200)\n")
     body = "    if p[1] as i64 != 200\n        return 1\n    if p[1] < 100\n        return 2\n    return 0\n"
     return Run(_reads(spelled, ty, setup, addr, body), 0)
 
@@ -428,7 +439,7 @@ pub fn main() -> i32
 
 # What isn't a pointer or reference to a Vec isn't this rule's, though it names one.
 NOT_THROUGH = {
-    "array_of_vecs": ("    var a: [2]Vec<i32>\n    a[0] = vec_new<i32>()\n    a[1] = vec_new<i32>()\n"
+    "array_of_vecs": ("    var a: [2]Vec<i32> = [Vec<i32> { data: null, len: 0, cap: 0 }, Vec<i32> { data: null, len: 0, cap: 0 }]\n    a[0] = vec_new<i32>()\n    a[1] = vec_new<i32>()\n"
                       "    vec_push<i32>(@&a[1], 1)\n    vec_push<i32>(@&a[1], 2)\n"
                       "    return a[1].len as i32\n", 2),
     "the_vec_itself": (_new("i32", (10, 20, 30)) + "    return v[1] / 10\n", 2),
@@ -454,7 +465,7 @@ RAW = {
         "    var a: [2]StrView\n    a[1].len = 3\n    return f(@a[0])\n", 3),
     # Walking rows of Vecs is `p + i`: `p[i]` is an element of the first (R9).
     "vec_row": ("fn f(p: *Vec<i32>) -> i32\n    return (p + 1).len as i32\n",
-                "    var a: [2]Vec<i32>\n    a[0] = vec_new<i32>()\n    a[1] = vec_new<i32>()\n"
+                "    var a: [2]Vec<i32> = [Vec<i32> { data: null, len: 0, cap: 0 }, Vec<i32> { data: null, len: 0, cap: 0 }]\n    a[0] = vec_new<i32>()\n    a[1] = vec_new<i32>()\n"
                 "    vec_push<i32>(@&a[1], 1)\n    vec_push<i32>(@&a[1], 2)\n    return f(@a[0])\n", 2),
 }
 
@@ -837,8 +848,14 @@ def a_vec_method_on_an_element_of_a_local_vec():
 # the batch didn't (#2867), and then fails alone.
 ELEMENT_RECEIVERS = {
     "deref_form": "fn f(p: *Vec<Vec<i32>>) -> i32\n    return (*p)[1].get(1)\n",
-    "field": "fn f(p: *Vec<Vec<i32>>) -> i32\n    var h: H\n    h.vv = *p\n    return h.vv[1].get(1)\n",
-    "let_element": "fn f(p: *Vec<Vec<i32>>) -> i32\n    let w = p[1]\n    return w.get(1)\n",
+    # `Vec` is move-only (#2159), so the field is built in place and its element
+    # is a borrowed receiver; a clone out of `p` would move its elements.
+    "field": ("fn f(p: *Vec<Vec<i32>>) -> i32\n"
+              "    var h: H = H { vv: vec_new<Vec<i32>>() }\n"
+              "    h.vv.push(vec_new<i32>())\n    h.vv.push(vec_new<i32>())\n"
+              "    h.vv[1].push(10)\n    h.vv[1].push(20)\n"
+              "    return h.vv[1].get(1)\n"),
+    "let_element": "fn f(p: *Vec<Vec<i32>>) -> i32\n    let w: *Vec<i32> = p.get_ptr(1)\n    return w.get(1)\n",
 }
 
 
@@ -882,8 +899,11 @@ TABLE = table_rows.cases(globals())
 @pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
                          ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
 def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    def strings(compiler):
+        return _string_objects(compiler, ritz1_bin)
+
     table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
-                           build=for_header.batch_build(ritz1_bin),
+                           build=for_header.batch_build(ritz1_bin, strings),
                            compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
 
 

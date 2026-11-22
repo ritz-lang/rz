@@ -24,8 +24,8 @@ from pathlib import Path
 # ritzlib's core, by import path under `ritzlib.`.  fmt.digits, drop and hash are
 # here because the others use them.
 CORE = frozenset({
-    "drop", "fmt.digits", "gvec", "hash", "hashmap", "memory", "option", "result",
-    "span", "str", "string", "strview",
+    "drop", "fmt.digits", "gvec", "hash", "hashmap", "memory", "option", "ptr",
+    "result", "span", "str", "string", "strview",
 })
 
 IMPORT = re.compile(r"\s*(?:pub\s+)?import\s+ritzlib\.([A-Za-z_][\w.]*)")

@@ -123,8 +123,10 @@ pub fn argspec_positionals(spec: @&ArgSpec, name: StrView, help: StrView, min: i
     spec.pos_min = min
     spec.pos_max = max
 
+# The compiler frees the Vec fields at scope end (AGAST #2159); this leaves
+# the spec empty, and is safe to call on any spec.
 pub fn argspec_drop(spec: @&ArgSpec)
-    vec_drop<ArgFlag>(@&spec.flags)
+    spec.flags.len = 0
 
 # Internal helpers take a StrView by value: it's Copy, so a name that is
 # looked up and then reported is still usable (#2414; #1489 once made it
@@ -237,10 +239,11 @@ pub struct ArgSlot
     present: bool
     value: StrView          # empty for a switch
 
-# The outcome of a successful argspec_parse.  Holds a shallow copy of the
-# spec, so the spec must outlive it; parsed_drop releases its own storage.
+# The outcome of a successful argspec_parse.  Borrows the spec (a raw
+# pointer, so the compiler doesn't drop the caller's flags), so the spec must
+# outlive it; its own Vecs are freed at scope end.
 pub struct ParsedArgs
-    spec: ArgSpec
+    spec: *ArgSpec        # borrowed: the result shares the spec (no copy)
     slots: Vec<ArgSlot>
     positionals: Vec<StrView>
 
@@ -255,7 +258,7 @@ fn parsed_new(spec: @ArgSpec) -> ParsedArgs
         vec_push<ArgSlot>(@&slots, argslot_new(false, strview_empty()))
         i += 1
     let positionals = vec_new<StrView>()
-    let p = ParsedArgs { spec: *spec, slots: slots, positionals: positionals }
+    let p = ParsedArgs { spec: spec, slots: slots, positionals: positionals }
     p
 
 fn record(p: @&ParsedArgs, idx: i64, value: StrView)
@@ -408,7 +411,7 @@ fn value_at(p: @ParsedArgs, idx: i64) -> Option<StrView>
 
 # Was the option given at all (switch or value)?
 pub fn parsed_is_set(p: @ParsedArgs, name: StrView) -> bool
-    let idx = find_index(@p.spec, name)
+    let idx = find_index(@*p.spec, name)
     if idx < 0
         return false
     let s = slot_at(p, idx)
@@ -416,10 +419,10 @@ pub fn parsed_is_set(p: @ParsedArgs, name: StrView) -> bool
 
 # Was the switch given?  False for unknown names and for value options.
 pub fn parsed_switch(p: @ParsedArgs, name: StrView) -> bool
-    let idx = find_index(@p.spec, name)
+    let idx = find_index(@*p.spec, name)
     if idx < 0
         return false
-    if flag_takes_value(@p.spec, idx)
+    if flag_takes_value(@*p.spec, idx)
         return false
     let s = slot_at(p, idx)
     s.present
@@ -427,7 +430,7 @@ pub fn parsed_switch(p: @ParsedArgs, name: StrView) -> bool
 # The option's value: what was given, else its default, else None.
 # None for unknown names and for switches.
 pub fn parsed_value(p: @ParsedArgs, name: StrView) -> Option<StrView>
-    value_at(p, find_index(@p.spec, name))
+    value_at(p, find_index(@*p.spec, name))
 
 # The dashes of the spec option `name` resolves to (see find_index): "-"
 # for a one-byte name that is not a long name (a short option), else "--".
@@ -440,9 +443,9 @@ fn lookup_dashes(spec: @ArgSpec, name: StrView) -> StrView
 # The option's value (see parsed_value) as a decimal i64.
 # Err(NotSet) when there is no value, Err(NotANumber) when it isn't one.
 pub fn parsed_int(p: @ParsedArgs, name: StrView) -> Result<i64, ArgError>
-    let v = value_at(p, find_index(@p.spec, name))
+    let v = value_at(p, find_index(@*p.spec, name))
     if not option_is_some<StrView>(@v)
-        return Err(arg_error_opt(ArgErrorKind.NotSet, name, lookup_dashes(@p.spec, name)))
+        return Err(arg_error_opt(ArgErrorKind.NotSet, name, lookup_dashes(@*p.spec, name)))
     arg_parse_i64(option_unwrap_or<StrView>(@v, strview_empty()))
 
 # All positional arguments, in order, as a slice borrowed from `p`.
@@ -454,9 +457,11 @@ pub fn parsed_positional(p: @ParsedArgs, i: i64) -> Option<StrView>
     let all = parsed_positionals(p)
     args_get(@all, i)
 
+# As argspec_drop: the compiler frees slots and positionals at scope end;
+# this leaves the result empty.
 pub fn parsed_drop(p: @&ParsedArgs)
-    vec_drop<ArgSlot>(@&p.slots)
-    vec_drop<StrView>(@&p.positionals)
+    p.slots.len = 0
+    p.positionals.len = 0
 
 # ============================================================================
 # Numbers

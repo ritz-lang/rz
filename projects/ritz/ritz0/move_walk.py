@@ -299,28 +299,43 @@ class MoveWalk:
             self._defers[-1].append((stmt, self.scope))
         return False
 
-    def _stmt_assign(self, stmt: rast.AssignStmt) -> bool:
+    def _check_assign(self, target: rast.Expr, value: rast.Expr) -> None:
+        """The ownership of `target = value`, for the statement form and the
+        expression form (`x = v` as a match arm or `if` body; AGAST #2159).
+
+        The two share every rule, so they share this: an arm body that moves
+        a payload binding into an outer binding must mark that binding moved,
+        or the emitter drops it at the arm's end and again at its owner's.
+        """
         # Check the value first - this is a move. `t = f(t)` reads the
         # old t before the assignment makes t an owner again.
-        self._check_expr(stmt.value, is_move_context=True)
+        self._check_expr(value, is_move_context=True)
         # The target (lvalue) is not a move, and assigning to a bare
         # moved-from binding is not a use of it (§13.6). Nor is assigning
         # to a field moved out of a binding: that field is owned again.
-        if self._reown_field(stmt.target):
+        if self._reown_field(target):
             # The emitter sets the field's drop flags again.
-            stmt.target.reowns_field = True
-        elif not isinstance(stmt.target, rast.Ident):
-            self._check_expr(stmt.target, is_move_context=False)
+            target.reowns_field = True
+        elif not isinstance(target, rast.Ident):
+            self._check_expr(target, is_move_context=False)
         # A write inside a borrowed place (AGAST #2438, R11a).
-        self._check_mut_use(self._write_place(stmt.target), stmt.target.span, "assign")
+        self._check_mut_use(self._write_place(target), target.span, "assign")
         # After assignment, the target variable becomes owned again
-        if isinstance(stmt.target, rast.Ident):
-            var_info = self.scope.lookup(stmt.target.name)
+        if isinstance(target, rast.Ident):
+            var_info = self.scope.lookup(target.name)
             if var_info:
                 var_info.state = VarState.OWNED
                 var_info.move_span = None
                 var_info.moved_fields = {}
+
+    def _stmt_assign(self, stmt: rast.AssignStmt) -> bool:
+        self._check_assign(stmt.target, stmt.value)
         return False
+
+    def _expr_assign(self, expr: rast.AssignExpr, is_move_context: bool) -> None:
+        # An assignment expression owns exactly as the statement does; the
+        # value it yields is the assigned value, a copy of the target's.
+        self._check_assign(expr.target, expr.value)
 
     def _stmt_asm(self, stmt: rast.AsmStmt) -> bool:
         # §18.6: an `out` or `inout` operand is an assignment of its
@@ -582,7 +597,8 @@ class MoveWalk:
         # The receiver is borrowed (auto-ref) unless the method takes it
         # by value (AGAST #2239). An argument moves when every method of
         # that name takes it by value.
-        by_value = self._method_takes_self(expr) or self._takes_place_behind(expr)
+        by_value = (self._method_takes_self(expr) or self._takes_place_behind(expr)
+                    or self._intrinsic_consumes_receiver(expr))
         self._check_expr(expr.expr, is_move_context=by_value)
         self._check_ref_receiver(expr)
         # A receiver taken `self: @&T` or `self:& T` is a mutable borrow of
@@ -603,6 +619,46 @@ class MoveWalk:
         self._in_args -= 1
         self._restore_borrow_states(borrow_states_before)
         self._mark_temporary(expr, is_move_context)
+
+    def _receiver_is_borrowed(self, place: rast.Expr) -> bool:
+        """Is `place` the referent of an `@T`/`@&T`/`*T`/`name:& T`?"""
+        if self._through_reference(place):
+            return True
+        if not isinstance(place, rast.Ident):
+            return False
+        info = self.scope.lookup(place.name)
+        if info is None:
+            return False
+        return isinstance(self.types.resolve(info.ritz_type),
+                          (rast.PtrType, rast.RefType))
+
+    def _intrinsic_consumes_receiver(self, call: rast.MethodCall) -> bool:
+        """Does `call` move a move-only payload out of its receiver?
+
+        `.unwrap()` is the emitter's intrinsic, not an impl method: it reads
+        `Some`/`Ok`'s payload and hands it to the caller. For a move-only
+        payload the carrier is therefore moved, not borrowed (AGAST #2159);
+        borrowed, its scope-end drop and the payload's binding both free it.
+        The payload's own type is all that matters here, so a copy payload
+        keeps the old borrowing behaviour.
+        """
+        if call.method != 'unwrap':
+            return False
+        if self._receiver_is_borrowed(call.expr):
+            # The payload has an owner elsewhere: taking it out would leave
+            # two, so this is the usual "cannot move out of a reference".
+            self._reject_move_out(call.expr.span)
+            return False
+        ty = self.types.resolve(self._receiver_type(call.expr) or self._place_type(call.expr))
+        while isinstance(ty, (rast.PtrType, rast.RefType)):
+            ty = self.types.resolve(ty.inner)
+        if not isinstance(ty, rast.NamedType):
+            return False
+        base = ty.name.split('$', 1)[0]
+        if base not in ('Option', 'Result'):
+            return False
+        fields = self._variant_fields(ty, 'Some' if base == 'Option' else 'Ok')
+        return bool(fields) and self.types.is_move_only(fields[0])
 
     def _expr_grouped(self, expr: rast.Grouped, is_move_context: bool) -> None:
         self._check_expr(expr.expr, is_move_context=is_move_context)
@@ -737,7 +793,10 @@ class MoveWalk:
         self._check_unwritten_drop(None, expr.span)
 
     def _expr_try(self, expr: rast.TryOp, is_move_context: bool) -> None:
-        self._check_expr(expr.expr, is_move_context=is_move_context)
+        # `e?` consumes `e` whichever way it goes: the Err payload moves into
+        # the returned Err even when the expression's value is discarded, so
+        # the carrier is moved, not dropped at its scope end (AGAST #2159).
+        self._check_expr(expr.expr, is_move_context=True)
         # The Err path returns through every block's defers; the Ok path
         # goes on, so their moves don't carry past the `?`.
         if self._defers and any(self._defers):
@@ -866,6 +925,7 @@ class MoveWalk:
 
     EXPR_CHECKS = {
         rast.Ident: _expr_ident,
+        rast.AssignExpr: _expr_assign,
         rast.BinOp: _expr_binop,
         rast.UnaryOp: _expr_unary,
         rast.Call: _expr_call,

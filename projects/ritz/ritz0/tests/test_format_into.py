@@ -103,7 +103,6 @@ pub fn main() -> i32
     format_into(@&s, "i64={e},{f} zero={z},{y}\\n")
     format_into(@&s, "u8={g} u16={h} u32={i} u64={j}\\n")
     show(@s)
-    string_drop(@&s)
     return 0
 """
 
@@ -140,7 +139,6 @@ pub fn main() -> i32
     format_into(@&s, "t={t} f={1 > 2} sum={n.id + 1}\\n")
     put(@&s, @v, @n)
     show(@s)
-    string_drop(@&s)
     return 0
 """
 
@@ -169,7 +167,6 @@ pub fn main() -> i32
     format_into(@&s, "{x}{x}")
     format_into(@&s, "\\n")
     show(@s)
-    string_drop(@&s)
     return 0
 """
 
@@ -231,7 +228,6 @@ pub fn main() -> i32
     format_into(@&c, "ab{12}cd")
     print("counter {c.bytes} {c.calls}\\n")
 
-    string_drop(@&s)
     return 0
 """
 
@@ -264,7 +260,6 @@ pub fn main() -> i32
     format_into(sink(@&s), "{next()} {next()} {next()}\\n")
     show(@s)
     print("sink calls {g_sink_calls}\\n")
-    string_drop(@&s)
     return 0
 """
 

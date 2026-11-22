@@ -48,21 +48,33 @@ fn json_response(status: i32, body: StrView) -> Response
     response_set_status(@resp, status)
     return resp
 
+# The builder-owning functions below come in two halves.  The `*_into` half
+# owns the JsonBuilder (which has drop glue) and writes the Response through
+# `out`; the public wrapper keeps the `-> Response` signature and has no
+# droppable local.  Returning a call's Response while a droppable local is
+# still alive makes ritz0 merge the ~85KB Response through an SSA `load`,
+# which clang's backend cannot lower.  `*out = ...` is a memcpy instead.
+
 # {"success":true,"data":<json>} with `status`
-fn present_data(status: i32, json: StrView) -> Response
+fn present_data_into(status: i32, json: StrView, out: *Response)
     var builder: JsonBuilder = json_builder_new()
     json_object_start(@&builder)
     json_field_bool(@&builder, "success", 1)
     json_field_raw(@&builder, "data", json)
     json_object_end(@&builder)
-    return json_response(status, json_builder_finish(@&builder))
+    *out = json_response(status, json_builder_finish(@&builder))
+
+fn present_data(status: i32, json: StrView) -> Response
+    var resp: Response
+    present_data_into(status, json, @resp)
+    return resp
 
 # Present success with data (JSON body built separately)
 pub fn present_success(json: StrView) -> Response
     return present_data(STATUS_OK, json)
 
 # Present success with pagination
-pub fn present_paginated(json: StrView, page_info: *PageInfo) -> Response
+fn present_paginated_into(json: StrView, page_info: *PageInfo, out: *Response)
     var builder: JsonBuilder = json_builder_new()
     json_object_start(@&builder)
     json_field_bool(@&builder, "success", 1)
@@ -78,7 +90,12 @@ pub fn present_paginated(json: StrView, page_info: *PageInfo) -> Response
     json_object_end(@&builder)  # meta
     json_object_end(@&builder)  # root
 
-    return json_response(STATUS_OK, json_builder_finish(@&builder))
+    *out = json_response(STATUS_OK, json_builder_finish(@&builder))
+
+pub fn present_paginated(json: StrView, page_info: *PageInfo) -> Response
+    var resp: Response
+    present_paginated_into(json, page_info, @resp)
+    return resp
 
 # Present created resource
 pub fn present_created(json: StrView) -> Response
@@ -99,7 +116,7 @@ pub fn present_no_content() -> Response
 # ============================================================================
 
 # {"success":false,"error":{"code":<code>,"message":<message>}} with `status`
-fn present_error_body(status: i32, code: StrView, message: StrView) -> Response
+fn present_error_body_into(status: i32, code: StrView, message: StrView, out: *Response)
     var builder: JsonBuilder = json_builder_new()
     json_object_start(@&builder)
     json_field_bool(@&builder, "success", 0)
@@ -108,12 +125,20 @@ fn present_error_body(status: i32, code: StrView, message: StrView) -> Response
     json_field_str(@&builder, "message", message)
     json_object_end(@&builder)  # error
     json_object_end(@&builder)  # root
-    return json_response(status, json_builder_finish(@&builder))
+    *out = json_response(status, json_builder_finish(@&builder))
 
-# Present service error
-pub fn present_error(err: ServiceError) -> Response
+fn present_error_body(status: i32, code: StrView, message: StrView) -> Response
+    var resp: Response
+    present_error_body_into(status, code, message, @resp)
+    return resp
+
+# Present service error.
+# Takes the error by pointer: a by-value parameter with drop glue forces each
+# `return` arm to merge the ~85KB Response through a drop block, which clang
+# -O2 does not finish compiling.  The caller keeps ownership and drops it.
+pub fn present_error(err: *ServiceError) -> Response
     let status: i32 = service_error_status_code(err) as i32
-    match err
+    match *err
         ValidationError(errors) =>
             return present_validation_error(status, @errors)
         NotFoundError(msg) =>
@@ -128,7 +153,7 @@ pub fn present_error(err: ServiceError) -> Response
             # Don't expose internal error details
             return present_error_body(status, "INTERNAL_ERROR", "An internal error occurred")
 
-fn present_validation_error(status: i32, errors: *ValidationErrors) -> Response
+fn present_validation_error_into(status: i32, errors: *ValidationErrors, out: *Response)
     var builder: JsonBuilder = json_builder_new()
     json_object_start(@&builder)
     json_field_bool(@&builder, "success", 0)
@@ -152,7 +177,12 @@ fn present_validation_error(status: i32, errors: *ValidationErrors) -> Response
     json_array_end(@&builder)   # details
     json_object_end(@&builder)  # error
     json_object_end(@&builder)  # root
-    return json_response(status, json_builder_finish(@&builder))
+    *out = json_response(status, json_builder_finish(@&builder))
+
+fn present_validation_error(status: i32, errors: *ValidationErrors) -> Response
+    var resp: Response
+    present_validation_error_into(status, errors, @resp)
+    return resp
 
 # ============================================================================
 # Simple error responses

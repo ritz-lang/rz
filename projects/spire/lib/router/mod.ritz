@@ -316,8 +316,12 @@ fn string_from_sv(sv: StrView) -> String
 # Request Handling
 # ============================================================================
 
-# Handle a request, returning a response
-pub fn router_handle(self: *Router, request: *Request) -> Response
+# Fill `out` with the response.  `route_match` has drop glue, so returning a
+# call's Response while it is live would make ritz0 merge the ~85KB Response
+# through an SSA `load`, which clang's backend cannot lower.  Writing through
+# `out` is a memcpy, and the wrapper below returns a Response with no
+# droppable local in scope.
+fn router_handle_into(self: *Router, request: *Request, out: *Response)
     let path: StrView = request_path_strview(request)
     let method: i32 = request.method
 
@@ -325,7 +329,7 @@ pub fn router_handle(self: *Router, request: *Request) -> Response
     # yielding a Response (~85KB) is emitted as a by-value phi that clang -O2
     # does not finish compiling.
     var found: bool = false
-    var route_match: RouteMatch
+    var route_match: RouteMatch = RouteMatch { params: vec_new<RouteParam>() }
     match match_route(self, method, path)
         Some(m) =>
             route_match = m
@@ -333,8 +337,15 @@ pub fn router_handle(self: *Router, request: *Request) -> Response
         None =>
             found = false
     if found
-        return handle_matched_route(self, request, @route_match)
-    return handle_not_found(self, request)
+        *out = handle_matched_route(self, request, @route_match)
+        return
+    *out = handle_not_found(self, request)
+
+# Handle a request, returning a response
+pub fn router_handle(self: *Router, request: *Request) -> Response
+    var resp: Response
+    router_handle_into(self, request, @resp)
+    return resp
 
 fn handle_matched_route(router: *Router, request: *Request, route_match: *RouteMatch) -> Response
     # Inject the captured `:name` segments so handlers can read them with

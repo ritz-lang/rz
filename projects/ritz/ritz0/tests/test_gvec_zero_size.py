@@ -16,8 +16,9 @@ THE FIX
 
 vec_grow sets `cap` for a zero `sizeof(T)` without allocating, and points
 `data` at a non-null dangling address (no element has bytes to read or write
-there).  vec_drop does not hand that address to free, which would read a
-block header below it and fault.  realloc itself is unchanged.
+there).  Neither vec_drop nor the Vec's scope-end Drop (AGAST #2159) hands
+that address to free, which would read a block header below it and fault.
+realloc itself is unchanged.
 
 Each program builds through build.py (gvec needs ritzlib.memory) and exits
 with its expected code.
@@ -64,16 +65,18 @@ pub fn main() -> i32
         return 1
     return 7
 """, 7),
-    # Twenty pushes cross the first capacity (8) twice, and vec_drop must not
-    # free the dangling data pointer.  Exit 20 only if both hold.
+    # Twenty pushes cross the first capacity (8) twice, and the drop at scope
+    # end must not free the dangling data pointer.  Exit 20 only if both hold;
+    # a free(1) faults instead of returning.
     "zst_grow_drop": (UNIT + """\
-pub fn main() -> i32
+fn push_twenty() -> i32
     var v: Vec<Unit> = vec_new<Unit>()
     for i in 0..20
         vec_push<Unit>(@&v, Unit {})
-    let n: i32 = v.len as i32
-    vec_drop<Unit>(@&v)
-    return n + v.len as i32 + v.cap as i32
+    return v.len as i32
+
+pub fn main() -> i32
+    return push_twenty()
 """, 20),
     # A non-zero element is unchanged: real storage, values read back,
     # and the drop frees it.  1 + 2 + 3 = 6, popped 3, len 2: 6 * 10 + 3 + 2.
@@ -87,7 +90,6 @@ pub fn main() -> i32
     let sum: i32 = vec_get<i32>(@v, 0) + vec_get<i32>(@v, 1) + vec_get<i32>(@v, 2)
     let last: i32 = vec_pop<i32>(@&v)
     let r: i32 = sum * 10 + last + v.len as i32
-    vec_drop<i32>(@&v)
     return r
 """, 65),
 }

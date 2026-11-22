@@ -138,8 +138,10 @@ def test_strview_if_chain(tmp_path, compiler, mix, chain, position):
 
 def _span_program(chain: str, position: str) -> str:
     n = CHAINS[chain]
+    # The compiler supplies Span$u8 (bare string literals lower to it); there
+    # is no need to import ritzlib.span, and importing it would pull in gvec
+    # and its Drop impls, which this single-file link does not provide.
     return (
-        "import ritzlib.span\n"
         "fn name(k: i32, a: Span<u8>, b: Span<u8>, c: Span<u8>) -> Span<u8>\n"
         + _body(position, n, ["a", "b", "c"][:n] if n == 3 else ["a", "c"])
         + """

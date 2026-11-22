@@ -8,7 +8,7 @@ On the value itself it wasn't one:
     v[1] += 2               # ritz1 20
     var v: Span<i32> = ...
     v[1] = 7                # ritz0 "Cannot index type", ritz1 20
-    var v: Vec<Vec<i32>>
+    var v: Vec<Vec<i32>> = Vec<Vec<i32>> { data: null, len: 0, cap: 0 }
     v[1][1]                 # ritz1 -11: garbage
 
 So `v[i]` on a local Vec, Span or String is `*(v.data + i)` (`v.ptr` for a Span,
@@ -32,7 +32,7 @@ import pytest
 import test_ritz1_for_header as for_header
 import test_table_rows as table_rows
 from test_table_rows import Refused, Run, case
-from test_index_through_reference import HEADER, KINDS, SCALARS, STRUCTS
+from test_index_through_reference import HEADER, KINDS, SCALARS, STRUCTS, _string_objects
 
 compile_with = for_header.compile_with
 
@@ -144,9 +144,9 @@ VECS = """\
     vec_push<Vec<i32>>(@&v, a)
     vec_push<Vec<i32>>(@&v, b)
 """
-# Element (1, 1) of `v`, read back without `[]`: `v[1]` is a copy of `b`'s header,
-# so the two share a buffer.  (`*((*(v.data + 1)).data + 1)` would be #2450's.)
-VECS_BACK = "*(b.data + 1)"
+# Element (1, 1) of `v`, read back without `[]`.  `a` and `b` are moved into
+# `v` (#2159), so read the buffer through the element `v[1]`, not through `b`.
+VECS_BACK = "*((*(v.data + 1)).data + 1)"
 NESTED_READS = {
     "read": ("    return v[1][1]\n", 20),
     "add": ("    return v[0][1] + v[1][1]\n", 22),
@@ -169,7 +169,7 @@ def an_element_of_an_element_reads(op):
 @case(op=sorted(NESTED_WRITES))
 def an_element_of_an_element_writes(op):
     body, want = NESTED_WRITES[op]
-    program = _main(VECS, body + f"    return {VECS_BACK} + *(a.data + 1) - 2\n")
+    program = _main(VECS, body + f"    return {VECS_BACK} + *((*(v.data)).data + 1) - 2\n")
     return Run(program, want)
 
 
@@ -199,14 +199,20 @@ def an_element_of_an_element_through_a_pointer_writes(kind):
     return Run(program, 22)
 
 
-# A by-value parameter is a local of its own: its elements are the caller's buffer,
-# which a Vec shares, so a store through it lands where the caller looks.
+# A by-value parameter is a local of its own: a Vec owns what it is given, so
+# `f` hands it back and main reads the store through it (#2159); a Span is a
+# view of the caller's array, so the store lands where the caller looks.
 @case(box=["Vec", "Span"])
 def a_by_value_parameter_indexes(box):
     ty, _, setup, back = SCALARS[box]
-    program = (f"{HEADER}fn f(v: {ty}) -> i32\n    v[2] = 9\n    return v[1]\n\n"
-               f"pub fn main() -> i32\n{setup}    let r: i32 = f(v)\n"
-               f"    return r + {back.replace('1', '2')}\n")
+    if box == "Vec":
+        program = (f"{HEADER}fn f(v: Vec<i32>) -> Vec<i32>\n    v[2] = 9\n    return v\n\n"
+                   f"pub fn main() -> i32\n{setup}    let w: Vec<i32> = f(v)\n"
+                   f"    return w[1] + w[2]\n")
+    else:
+        program = (f"{HEADER}fn f(v: {ty}) -> i32\n    v[2] = 9\n    return v[1]\n\n"
+                   f"pub fn main() -> i32\n{setup}    let r: i32 = f(v)\n"
+                   f"    return r + {back.replace('1', '2')}\n")
     return Run(program, 29)
 
 
@@ -333,6 +339,9 @@ TABLE = table_rows.cases(globals())
 @pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
                          ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
 def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    def strings(compiler):
+        return _string_objects(compiler, ritz1_bin)
+
     table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
-                           build=for_header.batch_build(ritz1_bin),
+                           build=for_header.batch_build(ritz1_bin, strings),
                            compile=for_header.batch_compile(ritz1_bin), work=tmp_path)

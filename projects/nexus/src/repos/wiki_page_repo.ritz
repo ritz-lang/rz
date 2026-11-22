@@ -31,7 +31,7 @@
 import ritzlib.memory
 import ritzlib.strview { StrView, strview_len, strview_get, strview_as_ptr }
 import ritzlib.string { String, string_from, string_as_view }
-import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_get, vec_set, vec_drop }
+import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_get, vec_get_ptr, vec_set, vec_drop }
 
 import spire.repo.mausoleum {
     Db,
@@ -96,6 +96,7 @@ pub fn wiki_page_repo_new() -> WikiPageRepository
     repo.scans = 0
     repo.db.client = null
     repo.db.connected = 0
+    repo.mem = mem_docs_new()
     repo
 
 
@@ -546,11 +547,11 @@ fn list_scan_reset(user_data: *u8) -> i32
 
 fn list_scan_clear(pages: *Vec<WikiPage>)
     var i: i64 = 0
-    while i < vec_len<WikiPage>(pages)
-        var page: WikiPage = vec_get<WikiPage>(pages, i)
-        wiki_page_drop(@page)
+    while i < vec_len<WikiPage>(@*pages)
+        let page: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, i)
+        wiki_page_drop(page)
         i += 1
-    vec_drop<WikiPage>(pages)
+    vec_drop<WikiPage>(@&*pages)
     *pages = vec_new<WikiPage>()
 
 
@@ -558,8 +559,8 @@ fn list_scan_clear(pages: *Vec<WikiPage>)
 fn list_index_of(pages: *Vec<WikiPage>, page: *WikiPage) -> i64
     let want: StrView = string_as_view(@page.slug)
     var i: i64 = 0
-    while i < vec_len<WikiPage>(pages)
-        let other: WikiPage = vec_get<WikiPage>(pages, i)
+    while i < vec_len<WikiPage>(@*pages)
+        let other: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, i)
         let have: StrView = string_as_view(@other.slug)
         if strview_len(have) == strview_len(want)
             var same: bool = true
@@ -581,14 +582,14 @@ fn list_keep(pages: *Vec<WikiPage>, page: WikiPage, newest: bool)
     var p: WikiPage = page
     let at: i64 = list_index_of(pages, @p)
     if at < 0
-        vec_push<WikiPage>(pages, p)
+        vec_push<WikiPage>(@&*pages, p)
         return
-    var other: WikiPage = vec_get<WikiPage>(pages, at)
+    let other: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, at)
     if (p.id.value > other.id.value) == newest
-        wiki_page_drop(@other)
-        vec_set<WikiPage>(pages, at, p)
+        wiki_page_drop(other)
+        vec_set<WikiPage>(@&*pages, at, p)
     else
-        wiki_page_drop(@p)
+        pass
 
 
 fn list_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
@@ -611,7 +612,6 @@ pub fn wiki_page_repo_list_all(repo: *WikiPageRepository) -> Result<Vec<WikiPage
     let scanned: i64 = doc_scan(repo, list_scan_step as *u8, list_scan_reset as *u8, @scan as *u8)
     if scanned < 0
         list_scan_clear(@scan.pages)
-        vec_drop<WikiPage>(@&scan.pages)
         return Err(doc_error(scanned, "Scan failed"))
     Ok(scan.pages)
 
@@ -680,7 +680,7 @@ fn listed_id(pages: *Vec<WikiPage>, page: *WikiPage) -> i64
     let at: i64 = list_index_of(pages, page)
     if at < 0
         return -1
-    let other: WikiPage = vec_get<WikiPage>(pages, at)
+    let other: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, at)
     other.id.value
 
 
@@ -692,15 +692,15 @@ fn legacy_scan(legacy: *Db, scan: *AdoptScan) -> i64
 
 # Copy `pages` into this repository's collection (steps 2 and 3). 0 = ok.
 fn adopt_pages(repo: *WikiPageRepository, pages: *Vec<WikiPage>) -> i64
-    let n: i64 = vec_len<WikiPage>(pages)
+    let n: i64 = vec_len<WikiPage>(@*pages)
     if n == 0
         return 0
     var copies: Vec<i64> = vec_new<i64>()
     var i: i64 = 0
     var rc: i64 = 0
     while i < n
-        var page: WikiPage = vec_get<WikiPage>(pages, i)
-        match insert_document(repo, @page)
+        let page: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, i)
+        match insert_document(repo, page)
             Ok(id) => vec_push<i64>(@&copies, id)
             Err(_) =>
                 rc = -1
@@ -712,14 +712,12 @@ fn adopt_pages(repo: *WikiPageRepository, pages: *Vec<WikiPage>) -> i64
         rc = doc_scan(repo, oldest_scan_step as *u8, list_scan_reset as *u8, @oldest as *u8)
         i = 0
         while rc >= 0 and i < vec_len<i64>(@copies)
-            var page: WikiPage = vec_get<WikiPage>(pages, i)
+            let page: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, i)
             let copy: i64 = vec_get<i64>(@copies, i)
-            if listed_id(@oldest.pages, @page) != copy
+            if listed_id(@oldest.pages, page) != copy
                 doc_delete(repo, copy)    # a failure leaves a copy: harmless
             i += 1
         list_scan_clear(@oldest.pages)
-        vec_drop<WikiPage>(@&oldest.pages)
-    vec_drop<i64>(@&copies)
     if rc < 0 then -1 else 0
 
 
@@ -744,7 +742,5 @@ fn adopt_default(repo: *WikiPageRepository) -> i64
             rc = -1
         i += 1
     list_scan_clear(@scan.pages)
-    vec_drop<WikiPage>(@&scan.pages)
-    vec_drop<i64>(@&scan.ids)
     db_close(@legacy)
     rc

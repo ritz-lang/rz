@@ -77,7 +77,7 @@ BOXES = {
     "Span": ("    var a: [4]i32 = [10, 20, 30, 40]\n"
              "    var v: Span<i32> = span_from_ptr<i32>(@a[0], 4)\n",
              "a[1]", "t.len"),
-    "String": ("    var v: String\n    v.data = vec_new<u8>()\n"
+    "String": ("    var v: String = string_new()\n    v.data = vec_new<u8>()\n"
                "    v.data.push(10)\n    v.data.push(20)\n    v.data.push(30)\n    v.data.push(40)\n",
                "*(v.data.data + 1) as i32", "t.data.len"),
 }
@@ -261,8 +261,11 @@ INTO_SPAN_SITES = {
 @case(site=sorted(INTO_SPAN_SITES))
 def a_vec_slice_where_a_span_is_expected_is_a_view(site):
     before, setup = INTO_SPAN_SITES[site]
+    # `some_field_through_ref` moves `v` into `b` (#2159): `b.data` is the Vec,
+    # so its bytes are `b.data.data`; every other site still holds `v`.
+    back = "b.data" if site == "some_field_through_ref" else "v"
     body = ("    t[0] = 7\n"
-            "    let back: i32 = *(v.data + 1)\n"
+            f"    let back: i32 = *({back}.data + 1)\n"
             "    return (t[1] - 30 + t.len as i32 + back * 100 - 700) as i32\n")
     # t = [20, 30]: t[1] - 30 = 0, t.len = 2, back = 7 through a view.
     return Run(f"{HEADER}{before}pub fn main() -> i32\n{VEC_SETUP}{setup}{body}", 2)

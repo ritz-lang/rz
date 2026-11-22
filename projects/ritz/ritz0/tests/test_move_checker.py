@@ -598,6 +598,29 @@ fn main() -> i32
         n_init = main.body.stmts[1].value
         assert not getattr(n_init.expr, 'moves_binding', False)
 
+    def test_assign_expr_moves_are_marked_for_the_emitter(self):
+        """An assignment expression (`x = v` as a match arm) moves `v` too.
+
+        AGAST #2159: the arm body `outer = r` is an AssignExpr, not an
+        AssignStmt. Unmarked, the emitter dropped `r` at the arm's end and
+        `outer` again at its owner's, freeing the same buffer twice."""
+        from parser import parse as _parse
+        module = _parse(self.DEFS + """
+fn main() -> i32
+    var outer = Res { h: 1 }
+    var r = Res { h: 2 }
+    match 1
+        1 => outer = r
+        _ => pass
+    return outer.h
+""")
+        assert MoveChecker().check(module) == []
+        main = next(i for i in module.items
+                    if getattr(i, 'name', None) == 'main')
+        match = main.body.stmts[2].expr
+        arm = match.arms[0]
+        assert getattr(arm.body.value, 'moves_binding', False) is True
+
 
 class TestMutBorrowParamLends:
     """A `name:& T` parameter borrows its argument (AGAST #1315).

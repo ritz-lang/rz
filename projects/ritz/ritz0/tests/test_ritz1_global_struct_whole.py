@@ -71,7 +71,13 @@ SITES = {
                       + "    return 0\n"),
 }
 
-GVEC = "import ritzlib.gvec\n\nvar g: Vec<i32>\n\n"
+# Vec is move-only now (AGAST #2159), so a module-level `var g: Vec<i32>` is
+# refused, as is a generic struct literal in a global initialiser.  This row is
+# about a monomorphised global struct's mangled name, not about the allocator:
+# a local copy-only `Vec<T>` keeps the same layout and the same `Vec$i32` name,
+# and the global is zero-initialised (VFILL writes every field before a read).
+GVEC = ("struct Vec<T>\n    data: *T\n    len: i64\n    cap: i64\n\n"
+        "var g: Vec<i32>\n\n")
 # A header made by hand: the read copies three fields and calls nothing.
 VFILL = "    g.data = null\n    g.len = 3\n    g.cap = 9\n"
 VCHECK = ("    if v.len != 3\n        return 1\n    if v.cap != 9\n        return 2\n"

@@ -136,7 +136,7 @@ struct Vec<T>
 MAIN_VEC = """
 pub fn main() -> i32
     var d: [2]i32 = [1, 3]
-    var v: Vec<i32>
+    var v: Vec<i32> = Vec<i32> { data: null, len: 0 }
     v.data = @d[0]
     v.len = 2
     return f(@&v)

@@ -35,6 +35,7 @@ import json
 import os
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -242,8 +243,60 @@ def _fast(plan: dict, cwd) -> bool:
         return r.returncode == 0
 
 
+# A freestanding test link has no ritzlib.memory to define the allocator
+# primitives a Drop impl's glue calls: a single-file test program imports
+# ritzlib as declarations only, so once Vec and String got Drop impls their
+# scope-end drops referenced `free` and the link failed (AGAST #2159). A weak
+# no-op stands in. Weak, so a link that does carry ritzlib's real `free` uses
+# that one; a no-op is enough for a codegen test, whose fake Vecs usually
+# point at stack memory anyway (a real free would reject those). Only
+# expected-success links come through this module (module doc), so no
+# refusal is masked.
+_FREE_STUB_SRC = """\
+define weak i32 @free(i8* %p) {
+entry:
+  ret i32 0
+}
+"""
+_free_stub_path: Path | None = None
+
+
+def _free_stub() -> Path:
+    """The compiled no-op `free`, built once per session."""
+    global _free_stub_path
+    if _free_stub_path is None:
+        directory = tempfile.mkdtemp(prefix="ritz-free-stub-")
+        atexit.register(shutil.rmtree, directory, ignore_errors=True)
+        ll = Path(directory) / "free.ll"
+        ll.write_text(_FREE_STUB_SRC)
+        obj = Path(directory) / "free.o"
+        built = subprocess.run(["clang", "-c", str(ll), "-o", str(obj)],
+                               capture_output=True, text=True)
+        if built.returncode != 0:
+            raise RuntimeError(f"free stub would not compile:\n{built.stderr}")
+        _free_stub_path = obj
+    return _free_stub_path
+
+
+def _with_free_stub(cmd):
+    """`cmd`, a `-nostdlib` link, linking the no-op `free` too."""
+    if not isinstance(cmd, (list, tuple)) or "-nostdlib" not in cmd or "-c" in cmd:
+        return cmd
+    if os.environ.get("RITZ_TEST_NO_FREE_STUB"):
+        return cmd
+    stub = _free_stub()
+    if any(os.fspath(a) == os.fspath(stub) for a in cmd):
+        return cmd
+    cmd = list(cmd)
+    cmd.insert(1, str(stub))
+    return cmd
+
+
 def clang(cmd, **kwargs) -> subprocess.CompletedProcess:
-    """`subprocess.run(cmd, **kwargs)` for a clang compile/link (module doc)."""
+    """`subprocess.run(cmd, **kwargs)` for a clang compile/link (module doc).
+
+    A `-nostdlib` link also links the weak no-op `free` (see _FREE_STUB_SRC)."""
+    cmd = _with_free_stub(cmd)
     plan = None
     if os.environ.get("RITZ_TEST_LINK", "") != "clang" and set(kwargs) <= _KWARGS:
         plan = _parse(cmd)

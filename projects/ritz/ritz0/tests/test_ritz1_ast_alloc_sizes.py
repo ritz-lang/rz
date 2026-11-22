@@ -182,7 +182,7 @@ def test_no_literal_sized_struct_allocs():
     for path in sorted(RITZ1_SRC.glob("*.ritz")):
         for lineno, line in enumerate(path.read_text().splitlines(), 1):
             m = STRUCT_ALLOC.search(line.split("#", 1)[0])
-            if m and f"sizeof({m.group('ty')})" not in m.group("args"):
+            if m and not re.search(rf"sizeof\(\s*{re.escape(m.group('ty'))}\b", m.group("args")):
                 offenders.append(f"{path.name}:{lineno}: {line.strip()}")
     assert not offenders, (
         "struct allocated without sizeof(T) (use sizeof):\n" + "\n".join(offenders)

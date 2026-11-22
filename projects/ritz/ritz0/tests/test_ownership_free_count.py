@@ -37,11 +37,20 @@ nobody takes drops its elements, and an unannotated literal of a struct is
 A new gap goes in as a gap ticket on its row, a strict xfail: the table's
 test fails if the row passes, so the room that closes it has to flip it.
 
+AGAST #2159 turned the model on the standard library's two owning types:
+`Vec<T>` and `String` now implement `Drop`, so they are move-only and every
+manual `vec_drop` / `string_drop` call on an owned binding is gone. Their
+free counts are pinned separately (`VEC_CASES`, through an instrumented
+Allocator) because they need ritzlib linked; the last of those rows is a
+match arm `found = path`, an assignment *expression* that used to escape the
+move checker and drop the payload twice.
+
 Each table is one test per compiler that asserts every row and names each
 failing one (`row <name>: ...`); see "the harness" below (AGAST #3521).
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -3730,3 +3739,329 @@ def test_move_out_of_a_global_refused(request, tmp_path, compiler):
         return PRELUDE.count("\n") + body.splitlines().index(use) + 1, use.index(path) + 1
 
     _refused_table(compiler, tmp_path, GLOBAL_MOVE_OUT, lambda n: GLOBAL_MOVE_OUT[n][0], wants, at)
+
+
+# ---------------------------------------------------------------------------
+# Vec<T> and String drops (AGAST #2159).
+#
+# Enabling their Drop impls makes the compiler free the buffer: at block end,
+# before return, when the value is reassigned, and in the callee that took it
+# by value. The manual `vec_drop` / `string_drop` call sites go away with it
+# (`test_no_manual_vec_or_string_drops`); a manual drop left in place is a
+# free the compiler can repeat on the owning binding, and on a moved-from
+# binding it frees a buffer the callee already freed.
+#
+# These rows count allocations and frees through an Allocator, as
+# ritzlib/tests/test_allocator.ritz does: `live_bytes` returns to 0 only when
+# every block the collection took was handed back exactly once, so a leak
+# leaves it positive and a double free drives it negative.
+# ---------------------------------------------------------------------------
+
+VEC_PRELUDE = """\
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.string
+import ritzlib.option
+
+# An Arena behind a counting Allocator. ctx points at one of these.
+struct CountingArena
+    arena: Arena
+    allocs: i64
+    frees: i64
+    live_bytes: i64
+
+fn counting_alloc(ctx: *u8, len: i64) -> *u8
+    let c: *CountingArena = ctx as *CountingArena
+    let p: *u8 = arena_alloc(@c.arena, len)
+    if p != null
+        c.allocs += 1
+        c.live_bytes += len
+    return p
+
+fn counting_free(ctx: *u8, p: *u8, len: i64) -> i32
+    let c: *CountingArena = ctx as *CountingArena
+    c.frees += 1
+    c.live_bytes -= len
+    return 0
+
+fn counting_new(c: *CountingArena, size: i64) -> Allocator
+    c.arena = arena_new(size)
+    c.allocs = 0
+    c.frees = 0
+    c.live_bytes = 0
+    return Allocator { ctx: c as *u8, alloc: counting_alloc, free: counting_free }
+
+# Read after the value's scope has ended. 2/3/4 name the count that was wrong.
+fn settle(c: @CountingArena, want_allocs: i64, want_frees: i64) -> i32
+    if c.allocs != want_allocs
+        return 2
+    if c.frees != want_frees
+        return 3
+    if c.live_bytes != 0
+        return 4
+    return 0
+"""
+
+# Each body uses this boilerplate: an arena, then the scenario, then settle.
+VEC_MAIN = """\
+
+pub fn main() -> i32
+    var c: CountingArena
+    var a: Allocator = counting_new(@c, 65536)
+    if build(@a) != {want}
+        return 1
+    return settle(@c, {allocs}, {frees})
+"""
+
+
+def _vec_case(body, want, allocs, frees):
+    return VEC_PRELUDE + body + VEC_MAIN.format(want=want, allocs=allocs, frees=frees)
+
+
+VEC_CASES = {
+    # A Vec of bytes built with room for 8 stays at one allocation; the drop
+    # at the end of `build` returns that block.
+    "vec_scope_end": _vec_case("""\
+fn build(a: *Allocator) -> i64
+    var v: Vec<u8> = vec_with_cap_in<u8>(a, 8)
+    vec_push<u8>(@&v, 1)
+    return vec_len(@v)
+""", 1, 1, 1),
+
+    # `consume_vec` takes ownership: it drops the Vec, and the moved-from
+    # binding in `build` is not dropped again. A copy-semantics compiler
+    # drops both, so frees is 2 and live_bytes goes negative.
+    "vec_move_into_callee": _vec_case("""\
+fn consume_vec(v: Vec<u8>) -> i64
+    return vec_len(@v)
+
+fn build(a: *Allocator) -> i64
+    var v: Vec<u8> = vec_with_cap_in<u8>(a, 8)
+    vec_push<u8>(@&v, 7)
+    return consume_vec(v)
+""", 1, 1, 1),
+
+    # Ownership moves out with the returned value; the caller's binding drops
+    # it once, and the callee does not drop the moved-from local.
+    "vec_return_from_fn": _vec_case("""\
+fn make_vec(a: *Allocator) -> Vec<u8>
+    var v: Vec<u8> = vec_with_cap_in<u8>(a, 8)
+    vec_push<u8>(@&v, 3)
+    return v
+
+fn build(a: *Allocator) -> i64
+    var got: Vec<u8> = make_vec(a)
+    return vec_len(@got)
+""", 1, 1, 1),
+
+    # The old value is dropped before the new one is assigned; the new one is
+    # dropped at block end. Two allocations, two frees.
+    "vec_reassignment": _vec_case("""\
+fn build(a: *Allocator) -> i64
+    var v: Vec<u8> = vec_with_cap_in<u8>(a, 8)
+    v = vec_with_cap_in<u8>(a, 16)
+    return vec_cap(@v)
+""", 16, 2, 2),
+
+    # String owns its bytes through a Vec<u8>: one allocation, one free.
+    "string_scope_end": _vec_case("""\
+fn build(a: *Allocator) -> i64
+    var s: String = string_with_cap_in(a, 10)
+    string_push_str(@&s, "hi")
+    return string_len(@s)
+""", 2, 1, 1),
+
+    # String moves into a callee like any other move-only type.
+    "string_move_into_callee": _vec_case("""\
+fn consume_string(s: String) -> i64
+    return string_len(@s)
+
+fn build(a: *Allocator) -> i64
+    var s: String = string_with_cap_in(a, 10)
+    string_push_str(@&s, "hi")
+    return consume_string(s)
+""", 2, 1, 1),
+
+    # ...and moves out with a returned value.
+    "string_return_from_fn": _vec_case("""\
+fn make_string(a: *Allocator) -> String
+    var s: String = string_with_cap_in(a, 10)
+    string_push_str(@&s, "ok")
+    return s
+
+fn build(a: *Allocator) -> i64
+    var got: String = make_string(a)
+    return string_len(@got)
+""", 2, 1, 1),
+
+    # An arm body is an assignment expression (`found = path`), not an
+    # assignment statement. The payload moves into `found`; the arm must not
+    # drop `path` at its end too (AGAST #2159; the emitter clears the
+    # moved-from binding's drop flag at the mark). Two allocations, two
+    # frees.
+    "string_match_arm_assignment": _vec_case("""\
+fn pick(a: *Allocator) -> Option<String>
+    return Some(string_with_cap_in(a, 8))
+
+fn build(a: *Allocator) -> i64
+    var found: String = string_with_cap_in(a, 16)
+    match pick(a)
+        Some(path) => found = path
+        None => return -1
+    return string_len(@found)
+""", 0, 2, 2),
+
+    # `.unwrap()` hands the Some/Ok payload to the caller, so the carrier is
+    # moved too. Borrowed, its scope-end drop and the payload binding would
+    # both free the buffer (AGAST #2159; #4490 for ritz1).
+    "string_unwrap_moves_carrier": _vec_case("""\
+fn pick(a: *Allocator) -> Option<String>
+    return Some(string_with_cap_in(a, 8))
+
+fn build(a: *Allocator) -> i64
+    var o: Option<String> = pick(a)
+    let s: String = o.unwrap()
+    return string_len(@s)
+""", 0, 1, 1),
+
+    # `e?` consumes its carrier even as a statement: the Err payload moves
+    # into the returned Err, and dropping the carrier at statement end on top
+    # of that frees it twice (AGAST #2159; the Err payload is a String).
+    "string_try_statement_moves_carrier": _vec_case("""\
+fn inner(a: *Allocator) -> Result<i32, String>
+    return Err(string_with_cap_in(a, 8))
+
+fn outer(a: *Allocator) -> Result<i32, String>
+    inner(a)?
+    return Ok(0)
+
+fn build(a: *Allocator) -> i64
+    match outer(a)
+        Ok(v) => return v as i64
+        Err(e) => return string_len(@e)
+""", 0, 1, 1),
+}
+
+# Rows this compiler is known to miss, as {row: AGAST ticket}. A strict
+# xfail, as in the main table: run alone, it must fail, and one that passes
+# fails the test until the entry is dropped.
+VEC_GAPS = {
+    "string_unwrap_moves_carrier": {"ritz1": 4490, "ritz1_selfhosted": 4490},
+}
+
+
+def _build_pkg(compiler, tmp_path, name, program):
+    """Build `program` as a package via build.py, which compiles and links
+    every transitively imported module. Returns (CompletedProcess, exe)."""
+    pkg = tmp_path / f"{name}_{compiler}"
+    (pkg / "src").mkdir(parents=True)
+    (pkg / "src" / "main.ritz").write_text(program)
+    (pkg / "ritz.toml").write_text(
+        f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
+    )
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT),
+               RITZ_BUILD_CACHE_DIR=str(pkg / ".build-cache"))
+    proc = subprocess.run(
+        ["python3", str(RITZ_ROOT / "build.py"), "build", str(pkg),
+         "--compiler", compiler],
+        cwd=RITZ_ROOT, env=env, capture_output=True, text=True, timeout=600,
+    )
+    return proc, pkg / "build" / "debug" / name
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_vec_string_free_count(request, tmp_path, compiler):
+    """Vec<T> and String free their buffer exactly once (AGAST #2159)."""
+    _ritz1(request, compiler)
+    gaps = {name: row[compiler] for name, row in VEC_GAPS.items()
+            if compiler in row}
+    failures = []
+    for name in sorted(VEC_CASES):
+        proc, exe = _build_pkg(compiler, tmp_path, name, VEC_CASES[name])
+        why = None
+        if proc.returncode != 0 or not exe.exists():
+            why = (f"failed to build:\n"
+                   f"{proc.stdout[-1500:]}\n{proc.stderr[-1500:]}")
+        else:
+            rc = subprocess.run([str(exe)], capture_output=True, timeout=60,
+                               check=False).returncode
+            if rc != 0:
+                why = (f"exit {rc} (1 wrong len, 2 alloc count, 3 free count, "
+                       f"4 bytes left live)")
+        if name in gaps:
+            if why is None:
+                failures.append(f"row {name}: XPASS(strict) AGAST #{gaps[name]}: "
+                                f"{compiler} passes it now; drop the gap")
+        elif why is not None:
+            failures.append(f"row {name}: {why}")
+    assert not failures, f"{compiler}: {len(failures)} row(s) failed:\n" + "\n".join(failures)
+
+
+# The manual call that is now a use-after-move: `v` moved into `consume`, so
+# `vec_drop(@&v)` would free the buffer `consume`'s drop already freed. The
+# call is split across a Python literal so this file's own scan (below) does
+# not mistake the text of this expected-error program for a live call site.
+MOVE_THEN_MANUAL_DROP = """\
+import ritzlib.gvec
+
+fn consume(v: Vec<u8>) -> i64
+    vec_len(@v)
+
+pub fn main() -> i32
+    var v: Vec<u8> = vec_new<u8>()
+    consume(v)
+    vec_""" + "drop<u8>(@&v)\n" + """\
+    return 0
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_manual_drop_after_move_refused(request, tmp_path, compiler):
+    """A manual drop on a moved-from Vec is refused, not silently doubled."""
+    _ritz1(request, compiler)
+    proc, _ = _build_pkg(compiler, tmp_path, "move_then_manual_drop",
+                         MOVE_THEN_MANUAL_DROP)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, f"{compiler} accepted a manual drop after a move:\n{out[-2000:]}"
+    # `@&v` is a borrow of a moved value: ritz0 says "use of moved value",
+    # ritz1 "cannot borrow ... value has been moved". Both name `v`.
+    assert "moved" in out and "`v`" in out, out[-3000:]
+
+
+# Calls, not definitions: `pub fn vec_drop<T>(v: @&Vec<T>)` in gvec.ritz and
+# the `vec_drop<u8>` inside string_drop stay — they are the public manual
+# API, which the compiler's Drop impls no longer need.
+#
+# A call on a place reached through a raw pointer (`@&*vp`) stays too: the
+# compiler never drops a value in raw memory, so that is what the manual API
+# is for (AGAST #2159).
+MANUAL_DROP_CALL = re.compile(r"\b(vec_drop|string_drop)\s*(<[^<>]*>)?\s*\(")
+RAW_MEMORY_DROP_CALL = re.compile(r"\b(vec_drop|string_drop)\s*(<[^<>]*>)?\s*\(\s*@&?\*")
+DROP_DEFINITION_FILES = {"ritzlib/gvec.ritz", "ritzlib/string.ritz"}
+BUILD_DIRS = {".ritz-cache", ".build-cache", "build", "target"}
+
+
+@pytest.mark.unit
+def test_no_manual_vec_or_string_drops():
+    """No source in the tree calls vec_drop/string_drop by hand (AGAST #2159)."""
+    offenders = []
+    for path in sorted(RITZ_ROOT.rglob("*")):
+        if path.suffix not in (".ritz", ".py"):
+            continue
+        rel = path.relative_to(RITZ_ROOT).as_posix()
+        if rel in DROP_DEFINITION_FILES:
+            continue
+        if BUILD_DIRS & set(path.relative_to(RITZ_ROOT).parts[:-1]):
+            continue
+        for lineno, line in enumerate(
+                path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if MANUAL_DROP_CALL.search(line) and not RAW_MEMORY_DROP_CALL.search(line):
+                offenders.append(f"{rel}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "manual String/Vec drops are now a double free; delete them "
+        f"({len(offenders)} left):\n" + "\n".join(offenders)
+    )

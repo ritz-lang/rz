@@ -79,7 +79,7 @@ NOT_INDEXABLES = {
 NOT_POINTERS = {
     "vec_value_read": (_new("i32", (10, 20, 30)), "    return (@*v)[1]\n"),
     "vec_value_store": (_new("i32", (10, 20, 30)), "    (@*v)[1] = 7\n    return 0\n"),
-    "string_value_read": ("    var v: String\n    v.data = vec_new<u8>()\n    v.data.push(10)\n",
+    "string_value_read": ("    var v: String = string_new()\n    v.data = vec_new<u8>()\n    v.data.push(10)\n",
                           "    return (@*v)[0] as i32\n"),
 }
 

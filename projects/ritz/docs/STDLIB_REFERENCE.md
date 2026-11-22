@@ -404,13 +404,17 @@ pub struct Allocator
 import ritzlib.memory
 import ritzlib.gvec
 
+# The Vec's drop at the end of this function returns its block to `a`; only
+# then is the arena safe to destroy (a Vec owns its buffer, AGAST #2159).
+fn use_arena_vec(a: *Allocator) -> i64
+    var v: Vec<i64> = vec_new_in<i64>(a)    # every grow comes from the arena
+    vec_push<i64>(@&v, 7)
+    vec_get<i64>(@v, 0)
+
 fn arena_vec() -> i64
     var ar: Arena = arena_new(65536)
     var a: Allocator = arena_allocator(@ar)
-    var v: Vec<i64> = vec_new_in<i64>(@a)   # every grow comes from `ar`
-    vec_push<i64>(@&v, 7)
-    let x: i64 = vec_get<i64>(@v, 0)
-    vec_drop<i64>(@&v)                      # back to `a`, not the global heap
+    let x: i64 = use_arena_vec(@a)
     arena_destroy(@ar)
     x
 ```
@@ -441,14 +445,16 @@ any block from it is live, and `heap_destroy` frees every block at once:
 import ritzlib.memory
 import ritzlib.gvec
 
+fn use_heap_vec(a: *Allocator) -> i64
+    var v: Vec<u8> = vec_new_in<u8>(a)         # a slab block, not a page
+    vec_push<u8>(@&v, 7)
+    vec_get<u8>(@v, 0) as i64                  # drop returns it to h's bins
+
 fn heap_vec() -> i64
     var h: Heap
     heap_init(@h, page_source_get())           # keeps this source
     var a: Allocator = heap_allocator(@h)
-    var v: Vec<u8> = vec_new_in<u8>(@a)        # a slab block, not a page
-    vec_push<u8>(@&v, 7)
-    let x: i64 = vec_get<u8>(@v, 0) as i64
-    vec_drop<u8>(@&v)                          # back to h's bins
+    let x: i64 = use_heap_vec(@a)
     heap_destroy(@h)                           # every slab back to the source
     x
 ```
@@ -558,7 +564,7 @@ struct Vec<T>
 | `vec_cap` | `fn<T>(v: @Vec<T>) -> i64` | Get capacity |
 | `vec_is_empty` | `fn<T>(v: @Vec<T>) -> i32` | Check if empty |
 | `vec_clear` | `fn<T>(v: @&Vec<T>)` | Clear (keeps capacity) |
-| `vec_drop` | `fn<T>(v: @&Vec<T>)` | Free the Vec |
+| `vec_drop` | `fn<T>(v: @&Vec<T>)` | Free the Vec now, for one in raw memory; an owned Vec is freed by its `Drop` impl at scope end (AGAST #2159) |
 
 A zero-size element (a field-less struct) allocates nothing: `len` and `cap`
 count elements as usual, and `data` is a non-null dangling pointer that
@@ -639,7 +645,7 @@ struct String
 | `string_clear` | `fn(s: @&String)` | Clear string |
 | `string_pop` | `fn(s: @&String) -> u8` | Pop last byte |
 | `string_set_char` | `fn(s: @&String, idx: i64, c: u8) -> i32` | Set char at index |
-| `string_drop` | `fn(s: @&String)` | Free string |
+| `string_drop` | `fn(s: @&String)` | Free the string now, for one in raw memory; an owned String is freed by its `Drop` impl at scope end (AGAST #2159) |
 
 **Comparison**:
 
@@ -704,8 +710,10 @@ probe chain still steps over it. The map never frees a value, so drop what
 the values own before `hashmap_clear` or `hashmap_drop`, and do not insert
 or remove during a walk.
 
-**Methods**: `len`, `insert`, `get`, `contains`, `remove`. The map has no
-`Drop` impl yet (its `Vec` hasn't either, #3614): free it with `hashmap_drop`.
+**Methods**: `len`, `insert`, `get`, `contains`, `remove`. The map's slot
+table is a `Vec`, so an owned map is move-only and the compiler drops the
+table at scope end (AGAST #2159). `hashmap_drop` remains for a map in raw
+memory. The map never drops its keys or values.
 
 ```ritz
 import ritzlib.hash
@@ -1676,7 +1684,6 @@ fn read_if_present(path: StrView) -> i32
     match read_file(path)
         Ok(s) =>
             var text: String = s
-            string_drop(@&text)
             0
         Err(e) => match e
             NoEnt => 0
@@ -1858,7 +1865,6 @@ fn save(dir: StrView, name: StrView, text: StrView) -> i32
             Err(e) => return errno_code(e)
     var path: String = path_join(dir, name)
     var r: Result<i64, Errno> = write_file(string_as_view(@path), text)
-    string_drop(@&path)
     match r
         Ok(_) => 0
         Err(e) => errno_code(e)
@@ -2438,7 +2444,7 @@ byte (`"count"` or `"n"`).
 | `argspec_find` | `fn(spec: @ArgSpec, name: StrView) -> Option<i64>` | Index of an option |
 | `argspec_parse` | `fn(spec: @ArgSpec, args: Span<StrView>) -> Result<ParsedArgs, ArgError>` | Parse |
 | `argspec_print_help` | `fn(spec: @ArgSpec)` | Usage, options and arguments on stdout |
-| `argspec_drop` | `fn(spec: @&ArgSpec)` | Release the spec |
+| `argspec_drop` | `fn(spec: @&ArgSpec)` | Leave the spec empty; the compiler frees its slots at scope end (AGAST #2159) |
 
 **Result** (a `ParsedArgs` shares the spec's storage; drop it first):
 
@@ -2450,7 +2456,7 @@ byte (`"count"` or `"n"`).
 | `parsed_int` | `fn(p: @ParsedArgs, name: StrView) -> Result<i64, ArgError>` | `parsed_value` as an i64 |
 | `parsed_positional` | `fn(p: @ParsedArgs, i: i64) -> Option<StrView>` | i-th positional |
 | `parsed_positionals` | `fn(p: @ParsedArgs) -> Span<StrView>` | All positionals |
-| `parsed_drop` | `fn(p: @&ParsedArgs)` | Release the result |
+| `parsed_drop` | `fn(p: @&ParsedArgs)` | Leave the result empty; the compiler frees its Vecs at scope end (AGAST #2159) |
 
 **Errors**: `ArgError` is a struct `{ kind: ArgErrorKind, text: StrView, limit: i64 }`
 with kinds `UnknownOption`, `MissingValue`, `UnexpectedValue`,
@@ -2475,7 +2481,6 @@ fn run(p: ParsedArgs) -> i32
     let count: i64 = match parsed_int(@parsed, "count")
         Ok(n) => n
         Err(e) => -1
-    parsed_drop(@&parsed)
     count as i32
 
 fn fail(spec: @ArgSpec, e: ArgError) -> i32
@@ -2491,8 +2496,6 @@ fn main(argc: i32, argv: **u8) -> i32
     let status: i32 = match argspec_parse(@spec, args_tail(@all))
         Ok(p) => run(p)
         Err(e) => fail(@spec, e)
-    argspec_drop(@&spec)
-    vec_drop<StrView>(@&all)
     status
 ```
 
@@ -2680,7 +2683,7 @@ and stay legal.
 | `json_emit_value` | `fn(v: *JsonValue, buf: *Vec<u8>) -> i32` | Emit to buffer |
 | `json_emit_bytes` | `fn(s: *u8, len: i64, buf: *Vec<u8>) -> i32` | Emit `s[0..len)` as a string; control characters as `\b \f \n \r \t` or `\u00XX` |
 | `json_emit_string` | `fn(s: *u8, buf: *Vec<u8>) -> i32` | `json_emit_bytes` up to the first NUL |
-| `json_to_string` | `fn(v: *JsonValue) -> String` | JSON text; caller owns (`string_drop`) |
+| `json_to_string` | `fn(v: *JsonValue) -> String` | JSON text; the caller owns it, and its `Drop` impl frees it at scope end |
 
 **Error Messages**:
 
@@ -2850,7 +2853,6 @@ fn show_file(path: StrView) -> i32
     match r
         Ok(content) =>
             print_string(@content)
-            string_drop(@&content)
             0
         Err(e) => errno_code(e)
 ```
@@ -2876,7 +2878,6 @@ fn vec_demo() -> i32
     var v: Vec<i32> = vec_new<i32>()
     vec_push<i32>(@&v, 42)
     let val: i32 = vec_get<i32>(@v, 0)
-    vec_drop<i32>(@&v)
     val
 ```
 

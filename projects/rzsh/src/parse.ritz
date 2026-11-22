@@ -22,6 +22,8 @@
 
 import ritzlib.str { strlen }
 import ritzlib.gvec
+import ritzlib.memory
+import ritzlib.ptr { ptr_read }
 import ritzlib.string
 import ritzlib.strview { StrView, strview_from_ptr }
 
@@ -74,9 +76,10 @@ pub fn tokens_word(t: @Tokens, idx: i64) -> *u8
     return tok.word.ptr
 
 pub fn tokens_drop(t: @&Tokens)
+    # A Vec's own drop frees its buffer, not the Strings in it; pop each one
+    # so it is dropped at the end of this loop iteration.
     while t.words.len > 0
-        var w: String = vec_pop<String>(@&t.words)
-        string_drop(@&w)
+        let w: String = vec_pop<String>(@&t.words)
     vec_drop<String>(@&t.words)
     vec_drop<Token>(@&t.toks)
 
@@ -130,8 +133,12 @@ fn finish_word(lx: @&Lexer)
     let p: *u8 = string_as_ptr(@&lx.word)   # NUL-terminates
     let view: StrView = strview_from_ptr(p, n)
     vec_push<Token>(@&lx.out.toks, Token { kind: TokKind.Word, word: view })
-    vec_push<String>(@&lx.out.words, lx.word)
-    lx.word = string_new()
+    # `lx` is a mutable borrow, so moving `lx.word` out of it is refused
+    # (§13.2). ptr_read takes the value out of the field's memory; the raw
+    # store then re-initialises the field without dropping what was moved.
+    let slot: *String = @lx.word
+    vec_push<String>(@&lx.out.words, ptr_read<String>(slot))
+    *slot = string_new()
     lx.quoted = false
 
 # ============================================================================
@@ -290,7 +297,6 @@ pub fn tokenize(line: *u8, pos: i64) -> Tokens
             lx.out.err = PARSE_UNTERMINATED
             break
 
-    string_drop(@&lx.word)
     return lx.out
 
 # ============================================================================
@@ -303,14 +309,24 @@ pub struct ShellVar
     exported: bool
     hidden: bool     # unset tombstone: hides an inherited environ entry
 
-var g_vars: Vec<ShellVar>
+var g_vars: *Vec<ShellVar> = null
+
+# A Vec (and the ShellVar elements it holds) has Drop, so it cannot live at
+# module level (§13.6: a module-level value is never dropped). The table is a
+# heap Vec allocated once; the global is the pointer to it.
+fn vars_vec() -> *Vec<ShellVar>
+    if g_vars == null
+        let p: *Vec<ShellVar> = malloc(sizeof(Vec<ShellVar>)) as *Vec<ShellVar>
+        *p = vec_new<ShellVar>()
+        g_vars = p
+    g_vars
 
 # The environment rzsh was started with (NULL-terminated "K=V" array), or
 # null. Set once by main on Linux; harland has no environment.
 pub var g_environ: **u8 = null
 
 fn var_at(idx: i64) -> *ShellVar
-    return vec_get_ptr<ShellVar>(@&g_vars, idx)
+    return vec_get_ptr<ShellVar>(@&*vars_vec(), idx)
 
 # True when `name` (len bytes) is a valid shell variable name.
 pub fn is_valid_name(name: *u8, len: i64) -> bool
@@ -319,7 +335,7 @@ pub fn is_valid_name(name: *u8, len: i64) -> bool
 fn var_find(name: *u8, len: i64) -> i64
     let want: StrView = strview_from_ptr(name, len)
     var idx: i64 = 0
-    while idx < g_vars.len
+    while idx < vars_vec().len
         let v: *ShellVar = var_at(idx)
         if string_eq(@v.name, want)
             return idx
@@ -346,11 +362,13 @@ fn var_free(v: *ShellVar)
     string_drop(@&v.value)
 
 pub fn vars_clear()
+    if g_vars == null
+        return
     var idx: i64 = 0
     while idx < g_vars.len
         var_free(var_at(idx))
         idx += 1
-    vec_drop<ShellVar>(@&g_vars)
+    vec_drop<ShellVar>(@&*g_vars)
 
 # The slot for `name`. A new one is appended, exported when the name is
 # inherited from the environment (an inherited variable stays exported).
@@ -362,8 +380,8 @@ fn var_slot(name: *u8, len: i64) -> *ShellVar
         name: string_from_bytes(Span<u8> { ptr: (name), len: (len) as i64 }), value: string_new(),
         exported: env_find(name, len) != null, hidden: false
     }
-    vec_push<ShellVar>(@&g_vars, v)
-    return var_at(g_vars.len - 1)
+    vec_push<ShellVar>(@&*vars_vec(), v)
+    return var_at(vars_vec().len - 1)
 
 fn var_store(v: *ShellVar, value: *u8, vlen: i64)
     string_clear(@&v.value)
@@ -432,11 +450,11 @@ pub fn assignment_pos(word: *u8) -> i64
 
 # Table walk for `export` with no arguments: slots are 0..vars_count().
 pub fn vars_count() -> i64
-    return g_vars.len
+    return vars_vec().len
 
 # The name of slot `idx` if it holds an exported variable, else null.
 pub fn var_exported_name(idx: i64) -> *u8
-    if idx < 0 or idx >= g_vars.len
+    if idx < 0 or idx >= vars_vec().len
         return null
     let v: *ShellVar = var_at(idx)
     if v.hidden or not v.exported
@@ -491,7 +509,7 @@ pub fn vars_build_envp() -> Envp
     # the entries are taken in pass 2, once it's complete.
     var count: i64 = 0
     var idx: i64 = 0
-    while idx < g_vars.len
+    while idx < vars_vec().len
         let v: *ShellVar = var_at(idx)
         if v.exported and not v.hidden
             string_push_string(@&e.buf, @v.name)

@@ -11,6 +11,7 @@ import ritzlib.sys {
 import ritzlib.str { strlen, strcmp }
 import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.gvec
+import ritzlib.memory
 
 # ============================================================================
 # String Utilities
@@ -45,25 +46,35 @@ pub fn print_int(n: i64)
 # fixed [512]u8 that dropped every key past byte 511, AGAST #3529). Growing
 # may move it, so read it through line_ptr() rather than keeping a pointer.
 
-var g_line: Vec<u8>
+# A Vec has Drop, so it cannot live at module level (§13.6: a module-level
+# value is never dropped). The buffer is a heap Vec allocated once, and the
+# module-level global is only the pointer to it.
+var g_line: *Vec<u8> = null
 pub var g_line_len: i64 = 0       # Total length of line
 pub var g_line_cursor: i64 = 0    # Cursor position within line
 
+fn line_vec() -> *Vec<u8>
+    if g_line == null
+        let p: *Vec<u8> = malloc(sizeof(Vec<u8>)) as *Vec<u8>
+        *p = vec_new<u8>()
+        g_line = p
+    g_line
+
 # Room for `extra` more bytes plus the NUL; false when out of memory.
 fn line_reserve(extra: i64) -> bool
-    return vec_ensure_cap<u8>(@&g_line, g_line_len + extra + 1)
+    return vec_ensure_cap<u8>(@&*line_vec(), g_line_len + extra + 1)
 
 # NUL-terminates the line at g_line_len.
 fn line_terminate()
-    *(g_line.data + g_line_len) = 0
-    g_line.len = g_line_len
+    *(line_vec().data + g_line_len) = 0
+    line_vec().len = g_line_len
 
 # The current line, NUL-terminated. Valid until the next edit.
 pub fn line_ptr() -> *u8
     if not line_reserve(0)
         return c""
     line_terminate()
-    return g_line.data
+    return line_vec().data
 
 pub fn line_clear() -> i32
     g_line_len = 0
@@ -76,7 +87,7 @@ pub fn line_clear() -> i32
 pub fn line_add_char(c: u8) -> i32
     if not line_reserve(1)
         return 0  # Out of memory: drop the key
-    let buf: *u8 = g_line.data
+    let buf: *u8 = line_vec().data
 
     # Shift characters right of the cursor (none when it is at the end)
     var i: i64 = g_line_len
@@ -94,7 +105,7 @@ pub fn line_add_char(c: u8) -> i32
 pub fn line_backspace() -> i32
     if g_line_cursor == 0
         return 0  # Nothing to delete
-    let buf: *u8 = g_line.data
+    let buf: *u8 = line_vec().data
 
     # Shift characters left from cursor position
     var i: i64 = g_line_cursor - 1
@@ -111,7 +122,7 @@ pub fn line_backspace() -> i32
 pub fn line_delete() -> i32
     if g_line_cursor >= g_line_len
         return 0  # Nothing to delete
-    let buf: *u8 = g_line.data
+    let buf: *u8 = line_vec().data
 
     # Shift characters left
     var i: i64 = g_line_cursor
@@ -158,7 +169,7 @@ pub fn line_kill_to_start()
         return
 
     # Shift remaining characters to start
-    let buf: *u8 = g_line.data
+    let buf: *u8 = line_vec().data
     var i: i64 = 0
     while g_line_cursor + i < g_line_len
         *(buf + i) = *(buf + g_line_cursor + i)
@@ -176,7 +187,7 @@ pub fn line_set(s: *u8)
         return
     var i: i64 = 0
     while i < len
-        *(g_line.data + i) = *(s + i)
+        *(line_vec().data + i) = *(s + i)
         i = i + 1
     g_line_len = len
     g_line_cursor = len

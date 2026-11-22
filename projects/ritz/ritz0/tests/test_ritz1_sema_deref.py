@@ -139,7 +139,7 @@ REACH = {
     "inferred_vec_element_through_reference": (
         ("struct Vec<T>\n    data: *T\n    len: i64\n    cap: i64\n\n"
         "fn g(v: @Vec<Box<H>>) -> i64\n    let c = v[0]\n    c.k\n\n"),
-        ("    var arr: [1]Box<H>\n    arr[0] = b\n    var v: Vec<Box<H>>\n    v.data = @arr[0]\n"
+        ("    var arr: [1]Box<H>\n    arr[0] = b\n    var v: Vec<Box<H>> = Vec<Box<H>> { data: null, len: 0, cap: 0 }\n    v.data = @arr[0]\n"
         "    v.len = 1\n    v.cap = 1\n    g(@v) as i32\n"), 9),
     # `x:& Box<H>` reads as a Box (sema_bind_param): `x.k += 1` steps through deref_mut.
     "borrow_param": ("fn f(x:& Box<H>) -> i64\n    x.k += 1\n    x.k + x.get()\n\n",

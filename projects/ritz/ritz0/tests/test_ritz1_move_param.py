@@ -157,7 +157,6 @@ pub fn main() -> i32
     vec_push<u8>(@&v, 2 as u8)
     vec_push<u8>(@&v, 5 as u8)
     let s = total(v)
-    vec_drop<u8>(@&v)
     return s
 """, 7),
     # A Drop type moves into the callee, which drops it once: DROPS == 1

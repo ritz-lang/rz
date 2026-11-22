@@ -19,20 +19,18 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.string
+import ritzlib.gvec
+import ritzlib.memory
 
 # 2^60: far beyond any address space, so the reserve's realloc must fail.
 fn huge_len() -> i64
     1152921504606846976
 
-# A String whose header claims `len` bytes at `buf`. Never dropped: it does
-# not own `buf`. Used to hand a "too big to reserve" source to the String
-# APIs without allocating it.
-fn fake_string(buf: *u8, len: i64) -> String
-    var f: String
-    f.data.data = buf
-    f.data.len = len
-    f.data.cap = len
-    f
+# A String whose header claims `len` bytes, backed by a real 8-byte block so
+# the automatic drop (AGAST #2159) has something valid to free. `len` is huge,
+# so every reserve that reads it fails before reading the bytes.
+fn fake_string(len: i64) -> String
+    return String { data: Vec<u8> { data: malloc(8), len: len, cap: len } }
 
 # ============================================================================
 # Empty appends
@@ -49,7 +47,6 @@ fn test_empty_appends_leave_string_unchanged() -> i32
     assert string_push_string(@&s, @empty)
     assert string_len(@s) == 3
     assert string_eq_strview(@s, "abc")
-    string_drop(@&s)
     0
 
 # Appending nothing to a never-allocated String must not need a buffer.
@@ -84,7 +81,6 @@ fn test_push_string_self_across_growth() -> i32
     assert string_eq_strview(@s, "abcdefghijklabcdefghijkl")
     assert string_push_bytes(@&s, Span<u8> { ptr: (s.data.data), len: (s.data.len) as i64 })
     assert string_eq_strview(@s, "abcdefghijklabcdefghijklabcdefghijklabcdefghijkl")
-    string_drop(@&s)
     0
 
 # The source pointer is the String's own buffer; the append moves it.
@@ -98,7 +94,6 @@ fn test_push_bytes_own_buffer_across_growth() -> i32
         i += 1
     assert string_len(@s) == 100
     assert string_eq_strview(@s, "0123456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF456789ABCDEF")
-    string_drop(@&s)
     0
 
 # Same, past ritzlib.memory's largest bin (2048), where blocks come from mmap.
@@ -123,7 +118,6 @@ fn test_push_own_large_buffer_across_growth() -> i32
     assert string_push_bytes(@&s, Span<u8> { ptr: (s.data.data), len: (s.data.len) as i64 })
     assert string_len(@s) == 32766
     assert string_get(@s, 32765) == string_get(@s, 16382)
-    string_drop(@&s)
     0
 
 # push_cstr of the String's own C string: the length must be measured before
@@ -134,7 +128,6 @@ fn test_push_cstr_own_buffer() -> i32
     let p: *u8 = string_as_ptr(@&s)
     assert string_push_cstr(@&s, p)
     assert string_eq_strview(@s, "hello, world!!!hello, world!!!")
-    string_drop(@&s)
     0
 
 # ============================================================================
@@ -165,7 +158,6 @@ fn test_push_bytes_every_boundary() -> i32
                     want = src[j - start]
                 assert string_get(@s, j) == want
                 j += 1
-            string_drop(@&s)
             n += 1
         start += 1
     0
@@ -183,7 +175,6 @@ fn test_many_small_appends() -> i32
     assert string_cap(@s) == 512
     assert string_starts_with(@s, "xyzxyz")
     assert string_ends_with(@s, "xyzxyz")
-    string_drop(@&s)
     0
 
 # ============================================================================
@@ -200,7 +191,6 @@ fn test_push_bytes_failed_reserve_is_atomic() -> i32
     # Still usable afterwards.
     assert string_push_str(@&s, "!")
     assert string_eq_strview(@s, "keep!")
-    string_drop(@&s)
     0
 
 # A length so large that len + needed overflows must also fail cleanly.
@@ -210,17 +200,15 @@ fn test_push_bytes_overflowing_len_fails() -> i32
     var buf: [8]u8
     assert not string_push_bytes(@&s, Span<u8> { ptr: (@buf[0]), len: (9223372036854775807) as i64 })
     assert string_eq_strview(@s, "keep")
-    string_drop(@&s)
     0
 
 [[test]]
 fn test_push_string_failed_reserve_is_atomic() -> i32
     var s: String = string_from("keep")
     var buf: [8]u8
-    var big: String = fake_string(@buf[0], huge_len())
+    var big: String = fake_string(huge_len())
     assert not string_push_string(@&s, @big)
     assert string_eq_strview(@s, "keep")
-    string_drop(@&s)
     0
 
 [[test]]
@@ -230,7 +218,6 @@ fn test_push_str_failed_reserve_is_atomic() -> i32
     let sv: StrView = StrView { ptr: @buf[0], len: huge_len() }
     assert not string_push_str(@&s, sv)
     assert string_eq_strview(@s, "keep")
-    string_drop(@&s)
     0
 
 # Constructors and clone cannot return an error code; on a failed reserve they
@@ -242,7 +229,7 @@ fn test_constructors_failed_reserve_return_empty() -> i32
     assert string_len(@a) == 0
     var b: String = string_from(StrView { ptr: @buf[0], len: huge_len() })
     assert string_len(@b) == 0
-    var big: String = fake_string(@buf[0], huge_len())
+    var big: String = fake_string(huge_len())
     var c: String = string_clone(@big)
     assert string_len(@c) == 0
     0
@@ -280,7 +267,6 @@ fn test_push_i64_extremes_across_boundary() -> i32
     assert string_eq_strview(@s, "1234567-9223372036854775808")
     assert string_push_i64(@&s, 9223372036854775807)
     assert string_eq_strview(@s, "1234567-92233720368547758089223372036854775807")
-    string_drop(@&s)
     0
 
 [[test]]

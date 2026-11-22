@@ -17,6 +17,7 @@ import ritzlib.memory
 import ritzlib.drop
 import ritzlib.str
 import ritzlib.option
+import ritzlib.ptr
 
 # ============================================================================
 # Vec<T> - Generic Dynamic Array
@@ -33,36 +34,31 @@ struct Vec<T>
 # Drop trait implementation for automatic cleanup
 # ============================================================================
 
-# Still commented out: callers free a Vec with vec_drop<T>(@&v), and a
-# scope-end drop on top of that would free it twice (#3614).
-#
-# impl<T> Drop for Vec<T>
-#     fn drop(self: @&Vec<T>)
-#         if self.data != null
-#             free(self.data as *u8)
-#         self.data = null
-#         self.len = 0
-#         self.cap = 0
-#
+# The buffer is freed when the owning binding goes out of scope, is
+# reassigned, or is moved into a callee that drops it (AGAST #2159, #1854).
+# Don't call vec_drop on an owned Vec: it would free the buffer a second time.
+impl<T> Drop for Vec<T>
+    fn drop(self: @&Vec<T>)
+        # A zero-size element's data is VEC_ZST_DANGLING, not an allocation.
+        if self.data != null and sizeof(T) != 0
+            free(self.data as *u8)
+        self.data = null
+        self.len = 0
+        self.cap = 0
+
 # ============================================================================
 # Constructors
 # ============================================================================
 
 # Create a new empty Vec.
 pub fn vec_new<T>() -> Vec<T>
-    var v: Vec<T>
-    v.data = null
-    v.len = 0
-    v.cap = 0
-    return v
+    return Vec<T> { data: null, len: 0, cap: 0 }
 
 # Create a new Vec with pre-allocated capacity.
 pub fn vec_with_cap<T>(cap: i64) -> Vec<T>
-    var v: Vec<T>
+    # A move-only Vec has to start from a whole value (§13.6); an empty one.
+    var v: Vec<T> = Vec<T> { data: null, len: 0, cap: 0 }
     if cap <= 0
-        v.data = null
-        v.len = 0
-        v.cap = 0
         return v
 
     let size: i64 = cap * sizeof(T)
@@ -76,11 +72,11 @@ pub fn vec_with_cap<T>(cap: i64) -> Vec<T>
     v.cap = cap
     return v
 
-# A Vec whose memory comes from `a` (AGAST #4120): every grow and the final
-# vec_drop go back to `a` (the block's header names it; see malloc_in). An
-# empty Vec remembers nothing, so this reserves 8 elements, the first grow's
-# capacity anyway. vec_slice / vec_clone of it, and a push after vec_drop,
-# use the global heap. A null `a` is the global heap.
+# A Vec whose memory comes from `a` (AGAST #4120): every grow and the drop
+# at the owner's scope end go back to `a` (the block's header names it; see
+# malloc_in). An empty Vec remembers nothing, so this reserves 8 elements,
+# the first grow's capacity anyway. vec_slice / vec_clone of it, and a push
+# after vec_drop, use the global heap. A null `a` is the global heap.
 pub fn vec_new_in<T>(a: *Allocator) -> Vec<T>
     return vec_with_cap_in<T>(a, 8)
 
@@ -88,10 +84,7 @@ pub fn vec_new_in<T>(a: *Allocator) -> Vec<T>
 # is out of memory.
 # standard-exempt: ptr-len-param: allocator: `cap` sizes the allocation this *Allocator creates
 pub fn vec_with_cap_in<T>(a: *Allocator, cap: i64) -> Vec<T>
-    var v: Vec<T>
-    v.data = null
-    v.len = 0
-    v.cap = 0
+    var v: Vec<T> = Vec<T> { data: null, len: 0, cap: 0 }
     if cap <= 0
         return v
     if sizeof(T) == 0
@@ -192,9 +185,13 @@ pub fn vec_push<T>(v: @&Vec<T>, item: T) -> bool
 
 # Pop the last element from the Vec.
 # Returns the element. Caller must ensure vec is not empty!
+#
+# `ptr_read` moves the element out: a plain `*p` read is refused for a
+# move-only `T` (LANGUAGE_SPEC §13.2), and a pop hands ownership to the
+# caller, leaving the Vec no element there.
 pub fn vec_pop<T>(v: @&Vec<T>) -> T
     v.len = v.len - 1
-    return *(v.data + v.len)
+    return ptr_read<T>(v.data + v.len)
 
 # Get an element by index.
 # Returns the element. Caller must ensure index is valid!

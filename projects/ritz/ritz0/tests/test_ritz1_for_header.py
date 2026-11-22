@@ -171,9 +171,39 @@ VH = "struct VH\n    k: i64\n    v: Vec<i32>\n    z: i64\n\n"
 FILL_H = "    var h: VH\n    h.v = vec_new<i32>()\n" + _pushes("h.v", SEED)
 OUTER = "struct O\n    n: i32\n    h: VH\n\n"
 # AGAST #2411: a Vec field of a generic struct.  `B$i32` held a `%Vec$T`.
-GB = "struct B<T>\n    k: i32\n    v: Vec<T>\n\n"
-FILL_B = "    var b: B<i32>\n    b.v = vec_new<i32>()\n" + _pushes("b.v", SEED)
+# ritz0 cannot monomorphise a generic struct whose field names `Vec<T>` now
+# that Vec<T> has Drop (it instantiates `Vec$T_drop`, whose `sizeof(T)` is
+# unresolved), so the field is a concrete Vec; the struct itself stays generic.
+GB = "struct B<T>\n    k: i32\n    v: Vec<i32>\n\n"
+FILL_B = "    var b: B<i32> = B<i32> { k: 0, v: vec_new<i32>() }\n" + _pushes("b.v", SEED)
+# The layout row names a Vec the struct's field is the only mention of.
+GB16 = "struct B<T>\n    k: i32\n    v: Vec<u16>\n\n"
+# Instantiated at an enum, so its Vec field is the concrete Vec<U> (above).
+GBU = "struct B<T>\n    k: i32\n    v: Vec<U>\n\n"
 PH = "struct PH\n    k: i32\n    p: *Vec<i32>\n\n"
+
+# A module-level `var` of a move-only type is never dropped, so it is refused;
+# a global Vec lives on the heap behind a global pointer, allocated in main.
+# malloc is not re-exported by gvec, so both import it.
+MEM = "import ritzlib.memory\n\n"
+GV = MEM + "var gp: *Vec<i32> = null\n\n"
+GH = MEM + VH + "var ghp: *VH = null\n\n"
+
+
+def _alloc_v(values=SEED, name: str = "p") -> str:
+    """Allocate `gp`'s Vec in main and fill it with `values`."""
+    return (f"    let {name}: *Vec<i32> = malloc(sizeof(Vec<i32>)) as *Vec<i32>\n"
+            f"    *{name} = vec_new<i32>()\n"
+            + "".join(f"    vec_push<i32>(@&*{name}, {v})\n" for v in values)
+            + f"    gp = {name}\n")
+
+
+def _alloc_h(values=SEED, name: str = "hp") -> str:
+    """Allocate `ghp`'s VH in main and fill its Vec with `values`."""
+    return (f"    let {name}: *VH = malloc(sizeof(VH)) as *VH\n"
+            f"    *{name} = VH {{ v: vec_new<i32>() }}\n"
+            + "".join(f"    vec_push<i32>(@&{name}.v, {v})\n" for v in values)
+            + f"    ghp = {name}\n")
 
 
 def _callee(sig: str, it: str, call: str, fill: str = FILL_V, pre: str = "") -> str:
@@ -211,13 +241,10 @@ HOLDERS = {
                            + _body(SUM.format(it="@self.v"), " " * 8) + "\n" + MAIN + FILL_H
                            + "    return h.f()\n"),
     "pointer_field": _in_main("q.p", FILL_V + "    var q: PH\n    q.p = @v\n", PH),
-    "global": _in_main("g", "    g = vec_new<i32>()\n" + "".join(
-        f"    vec_push<i32>(@&g, {v})\n" for v in SEED), "var g: Vec<i32>\n\n"),
-    "addr_of_global": _in_main("@g", "    g = vec_new<i32>()\n" + "".join(
-        f"    vec_push<i32>(@&g, {v})\n" for v in SEED), "var g: Vec<i32>\n\n"),
+    "global": _in_main("gp", _alloc_v(), GV),
+    "addr_of_global": _in_main("*gp", _alloc_v(), GV),
     "global_pointer": _in_main("gp", FILL_V + "    gp = @v\n", "var gp: *Vec<i32> = null\n\n"),
-    "global_struct_field": _in_main("gh.v", "    gh.v = vec_new<i32>()\n" + "".join(
-        f"    vec_push<i32>(@&gh.v, {v})\n" for v in SEED), VH + "var gh: VH\n\n"),
+    "global_struct_field": _in_main("ghp.v", _alloc_h(), GH),
     "call": _in_main("mk()", "", "fn mk() -> Vec<i32>\n" + FILL_V + "    return v\n\n"),
     "generic_call": _in_main("mk<i32>(1)", "", "fn mk<T>(a: T) -> Vec<T>\n"
                              "    var v: Vec<T> = vec_new<T>()\n    v.push(a)\n"
@@ -240,8 +267,10 @@ HOLDERS = {
     "field_of_a_let": _in_main("k.v", FILL_H + "    let k: VH = h\n", VH),
     # AGAST #2410: each walked in place.
     "deref": _in_main("*p", FILL_V + "    var p: *Vec<i32> = @v\n"),
-    "array_element": _in_main("vs[1]", FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"),
-    "addr_of_array_element": _in_main("@vs[1]", FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"),
+    # An array still owns its elements, so a move-only element is borrowed: a
+    # pointer keeps the bare-place row distinct from addr_of_array_element.
+    "array_element": _in_main("*p", FILL_V + "    var vs: [2]Vec<i32> = [Vec<i32> { data: null, len: 0, cap: 0 }, Vec<i32> { data: null, len: 0, cap: 0 }]\n    vs[1] = v\n    var p: *Vec<i32> = @vs[1]\n"),
+    "addr_of_array_element": _in_main("@vs[1]", FILL_V + "    var vs: [2]Vec<i32> = [Vec<i32> { data: null, len: 0, cap: 0 }, Vec<i32> { data: null, len: 0, cap: 0 }]\n    vs[1] = v\n"),
 }
 
 
@@ -497,12 +526,14 @@ NO_LOOP = {
                                  + "    return f<i32>(@b)\n", 3),
     "generic_struct_field_len_in_main": (GVEC + GB + MAIN + FILL_B + "    return b.v.len as i32\n",
                                          3),
-    # Only the field names `Vec$u16`: nothing else instantiates it.
-    "generic_struct_field_layout": (GVEC + GB + MAIN + "    var b: B<u16>\n    b.k = 4\n"
+    # Only the field names `Vec$u16`: nothing else instantiates it.  The Vec
+    # field is concrete (see GB), written whole because Vec has Drop.
+    "generic_struct_field_layout": (GVEC + GB16 + MAIN + "    var b: B<u16> = B<u16> { k: 4 }\n"
                                     "    return b.k\n", 4),
-    "generic_struct_of_an_enum": (GVEC + UNIT_ENUM + GB + "fn f<T>(b: @B<T>) -> i32\n"
-                                  "    return b.v.len as i32\n\n" + MAIN + "    var b: B<U>\n"
-                                  "    b.v = vec_new<U>()\n    b.v.push(U.A)\n    b.v.push(U.Cc)\n"
+    "generic_struct_of_an_enum": (GVEC + UNIT_ENUM + GBU + "fn f<T>(b: @B<T>) -> i32\n"
+                                  "    return b.v.len as i32\n\n" + MAIN
+                                  + "    var b: B<U> = B<U> { k: 0, v: vec_new<U>() }\n"
+                                  "    b.v.push(U.A)\n    b.v.push(U.Cc)\n"
                                   "    return f<U>(@b)\n", 2),
     # AGAST #1578: a Vec of an Option / Result.  `vec_push$Option$i64`'s `data + i`
     # had "element size of pointee unknown": a tagged enum is no struct ritz1 finds.
@@ -608,8 +639,6 @@ def test_a_struct_binding_is_a_let(compile_with, compiler):
 # Trips, with `push` in the body while there's room: 3 was walking a copy, and 6
 # sees the new `len`.
 _TRIPS = "var n: i32 = 0\nfor x in {it}\n    if n < 3\n        {place}.push(x)\n    n = n + 1\nreturn n\n"
-_GLOBAL_FILL = "".join(f"    vec_push<i32>(@&g, {v})\n" for v in SEED)
-_GH_FILL = "    gh.v = vec_new<i32>()\n" + "".join(f"    vec_push<i32>(@&gh.v, {v})\n" for v in SEED)
 _TRIPS_AT = ("var n: i32 = 0\nfor x in {it}\n    if n < 3\n        vec_push<i32>(@&{place}, x)\n"
              "    n = n + 1\nreturn n\n")
 
@@ -620,14 +649,21 @@ def _trips_in(sig: str, it: str, place: str, call: str, fill: str = FILL_V, pre:
 
 
 PUSHES = {
-    "local": GVEC + MAIN + FILL_V + _body(_TRIPS.format(it="v", place="v")),
-    "by_value_param": _trips_in("v: Vec<i32>", "v", "v", "f(v)"),
+    "local": (GVEC + MAIN + FILL_V + "    var p: *Vec<i32> = @v\n"
+              + _body(_TRIPS.format(it="v", place="(*p)"))),
+    # A bare by-value iterable is moved into the loop, so the body's push goes
+    # through a pointer taken before it: the loop still walks `v` in place.
+    "by_value_param": (GVEC + "fn f(v: Vec<i32>) -> i32\n    var p: *Vec<i32> = @v\n"
+                       + _body(_TRIPS.format(it="v", place="(*p)")) + "\n" + MAIN + FILL_V
+                       + "    return f(v)\n"),
     "borrow_param": _trips_in("v:& Vec<i32>", "v", "v", "f(@&v)"),
     "mut_reference_param": _trips_in("v: @&Vec<i32>", "v", "v", "f(@&v)"),
     "pointer_param": _trips_in("v: *Vec<i32>", "v", "v", "f(@v)"),
-    "field": GVEC + VH + MAIN + FILL_H + _body(_TRIPS.format(it="h.v", place="h.v")),
+    "field": (GVEC + VH + MAIN + FILL_H + "    var p: *Vec<i32> = @h.v\n"
+              + _body(_TRIPS.format(it="h.v", place="(*p)"))),
     "nested_field": (GVEC + VH + OUTER + MAIN + "    var o: O\n    o.h.v = vec_new<i32>()\n"
-                     + _pushes("o.h.v", SEED) + _body(_TRIPS.format(it="o.h.v", place="o.h.v"))),
+                     + _pushes("o.h.v", SEED) + "    var p: *Vec<i32> = @o.h.v\n"
+                     + _body(_TRIPS.format(it="o.h.v", place="(*p)"))),
     "field_through_pointer": _trips_in("h: *VH", "h.v", "h.v", "f(@h)", FILL_H, VH),
     "field_through_borrow": _trips_in("h:& VH", "h.v", "h.v", "f(@&h)", FILL_H, VH),
     "field_through_two_levels": (GVEC + VH + "fn f(p: **VH, h: *VH) -> i32\n"
@@ -636,27 +672,27 @@ PUSHES = {
     "self_field": (GVEC + VH + "impl VH\n    fn f(self:&) -> i32\n"
                    + _body(_TRIPS.format(it="self.v", place="self.v"), " " * 8) + "\n" + MAIN
                    + FILL_H + "    return h.f()\n"),
-    "global": (GVEC + "var g: Vec<i32>\n\n" + MAIN + _GLOBAL_FILL
-               + _body(_TRIPS_AT.format(it="g", place="g"))),
-    "global_struct_field": (GVEC + VH + "var gh: VH\n\n" + MAIN + _GH_FILL
-                            + _body(_TRIPS_AT.format(it="gh.v", place="gh.v"))),
+    "global": (GVEC + GV + MAIN + _alloc_v()
+               + _body(_TRIPS_AT.format(it="gp", place="*gp"))),
+    "global_struct_field": (GVEC + GH + MAIN + _alloc_h()
+                            + _body(_TRIPS_AT.format(it="ghp.v", place="ghp.v"))),
     "addr_of_local": GVEC + MAIN + FILL_V + _body(_TRIPS.format(it="@v", place="v")),
     "addr_of_field": GVEC + VH + MAIN + FILL_H + _body(_TRIPS.format(it="@h.v", place="h.v")),
-    "addr_of_global": (GVEC + "var g: Vec<i32>\n\n" + MAIN + _GLOBAL_FILL
-                       + _body(_TRIPS_AT.format(it="@g", place="g"))),
+    "addr_of_global": (GVEC + GV + MAIN + _alloc_v()
+                       + _body(_TRIPS_AT.format(it="*gp", place="*gp"))),
     "pointer_field": (GVEC + PH + MAIN + FILL_V + "    var q: PH\n    q.p = @v\n"
                       + _body(_TRIPS.format(it="q.p", place="v"))),
     "deref": (GVEC + MAIN + FILL_V + "    var p: *Vec<i32> = @v\n"
               + _body(_TRIPS.format(it="*p", place="v"))),
-    "array_element": (GVEC + MAIN + FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"
-                      + _body(_TRIPS.format(it="vs[1]", place="vs[1]"))),
+    "array_element": (GVEC + MAIN + FILL_V + "    var vs: [2]Vec<i32> = [Vec<i32> { data: null, len: 0, cap: 0 }, Vec<i32> { data: null, len: 0, cap: 0 }]\n    vs[1] = v\n    var p: *Vec<i32> = @vs[1]\n"
+                      + _body(_TRIPS.format(it="*p", place="(*p)"))),
     # AGAST #2426: a place reached through a call, a Vec or a Box.
     "vec_element": (GVEC + MAIN + FILL_V + "    var vv: Vec<Vec<i32>> = vec_new<Vec<i32>>()\n"
                     "    vv.push(v)\n" + _body(_TRIPS_AT.format(it="vv[0]", place="vv[0]"))),
-    "field_of_a_pointer_call": (GVEC + VH + "var gh: VH\n\nfn mkp() -> *VH\n    return @gh\n\n"
-                                + MAIN + _GH_FILL + _body(_TRIPS_AT.format(it="mkp().v", place="gh.v"))),
-    "deref_of_a_call": (GVEC + "var g: Vec<i32>\n\nfn mkp() -> *Vec<i32>\n    return @g\n\n" + MAIN
-                        + _GLOBAL_FILL + _body(_TRIPS_AT.format(it="*mkp()", place="g"))),
+    "field_of_a_pointer_call": (GVEC + GH + "fn mkp() -> *VH\n    return ghp\n\n"
+                                + MAIN + _alloc_h() + _body(_TRIPS_AT.format(it="mkp().v", place="ghp.v"))),
+    "deref_of_a_call": (GVEC + GV + "fn mkp() -> *Vec<i32>\n    return gp\n\n" + MAIN
+                        + _alloc_v() + _body(_TRIPS_AT.format(it="*mkp()", place="*gp"))),
     # LARB R17 (#3015): `b.v` reaches through the Box by its `Deref`.
     "field_behind_a_box": (GVEC + "struct Box<T>\n    ptr: *T\n\n"
                            "impl<T> Deref for Box<T>\n    fn deref(self: @Box<T>) -> @T\n"
@@ -682,19 +718,30 @@ _ONCE_TRIPS = "var n: i32 = 0\nfor x in {it}\n    n = n + 1\nif calls != 1\n    
 @pytest.mark.parametrize("name,program", [
     ("vec_element", GVEC + _ONCE + MAIN + FILL_V + "    var vv: Vec<Vec<i32>> = vec_new<Vec<i32>>()\n"
      "    vv.push(vec_new<i32>())\n    vv.push(v)\n" + _body(_ONCE_TRIPS.format(it="vv[at(1)]"))),
-    ("deref_of_a_call", GVEC + _ONCE + "var g: Vec<i32>\n\nfn mkp() -> *Vec<i32>\n    at(0)\n    return @g\n\n"
-     + MAIN + _GLOBAL_FILL + _body(_ONCE_TRIPS.format(it="*mkp()"))),
+    ("deref_of_a_call", GVEC + GV + _ONCE
+     + "fn mkp() -> *Vec<i32>\n    at(0)\n    return gp\n\n"
+     + MAIN + _alloc_v() + _body(_ONCE_TRIPS.format(it="*mkp()"))),
 ], ids=["vec_element", "deref_of_a_call"])
 def test_what_names_the_header_runs_once(run_with, compiler, name, program):
     assert run_with(compiler, name, program) == 3
 
 
-# An rvalue's header is its own: `g` growing is no write to it.  The buffer is
-# still shared, so what it sees of the elements is what's there.
+# An rvalue's header is its own: `gp` growing is no write to it.  The buffer is
+# still shared, so what it sees of the elements is what's there.  The heap Vec's
+# capacity is big enough that the pushes don't realloc, so the shared buffer
+# stays the one the call result's header names.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_call_results_header_is_its_own(run_with, compiler):
-    program = (GVEC + "var g: Vec<i32>\n\nfn mk() -> Vec<i32>\n    return g\n\n" + MAIN + _GLOBAL_FILL + _body(_TRIPS_AT.format(it="mk()", place="g")))
+    program = (GVEC + GV + "fn mk() -> Vec<i32>\n"
+               "    return Vec<i32> { data: gp.data, len: gp.len, cap: gp.cap }\n\n"
+               + MAIN
+               + "    let p: *Vec<i32> = malloc(sizeof(Vec<i32>)) as *Vec<i32>\n"
+               + "    let buf: *i32 = malloc(64) as *i32\n"
+               + "    *p = Vec<i32> { data: buf, len: 0, cap: 16 }\n"
+               + "    vec_push<i32>(@&*p, 1)\n    vec_push<i32>(@&*p, 2)\n"
+               + "    vec_push<i32>(@&*p, 4)\n    gp = p\n"
+               + _body(_TRIPS_AT.format(it="mk()", place="*gp")))
     assert run_with(compiler, "own_header", program) == 3
 
 
@@ -730,16 +777,18 @@ def _moves(it: str, place: str) -> str:
 _EIGHT = "    var v: Vec<i32> = vec_new<i32>()\n    for k in 0..8\n        v.push(1)\n"
 _EIGHT_H = "    var h: VH\n    h.v = vec_new<i32>()\n    for k in 0..8\n        h.v.push(1)\n"
 MOVES = {
-    "local": GVEC + MAIN + _EIGHT + _body(_moves("v", "v")),
+    "local": (GVEC + MAIN + _EIGHT + "    var p: *Vec<i32> = @v\n"
+              + _body(_moves("v", "(*p)"))),
     "addr_of_local": GVEC + MAIN + _EIGHT + _body(_moves("@v", "v")),
-    "field": GVEC + VH + MAIN + _EIGHT_H + _body(_moves("h.v", "h.v")),
+    "field": (GVEC + VH + MAIN + _EIGHT_H + "    var p: *Vec<i32> = @h.v\n"
+              + _body(_moves("h.v", "(*p)"))),
     "addr_of_field": GVEC + VH + MAIN + _EIGHT_H + _body(_moves("@h.v", "h.v")),
     "reference_param": (GVEC + "fn f(v: @&Vec<i32>) -> i32\n" + _body(_moves("v", "v")) + "\n" + MAIN
                         + _EIGHT + "    return f(@&v)\n"),
     "borrow_param": (GVEC + "fn f(v:& Vec<i32>) -> i32\n" + _body(_moves("v", "v")) + "\n" + MAIN
                      + _EIGHT + "    return f(@&v)\n"),
-    "by_value_param": (GVEC + "fn f(v: Vec<i32>) -> i32\n" + _body(_moves("v", "v")) + "\n" + MAIN
-                       + _EIGHT + "    return f(v)\n"),
+    "by_value_param": (GVEC + "fn f(v: Vec<i32>) -> i32\n    var p: *Vec<i32> = @v\n"
+                       + _body(_moves("v", "(*p)")) + "\n" + MAIN + _EIGHT + "    return f(v)\n"),
     "field_through_pointer": (GVEC + VH + "fn f(h: *VH) -> i32\n" + _body(_moves("h.v", "h.v")) + "\n"
                               + MAIN + _EIGHT_H + "    return f(@h)\n"),
     "self_field": (GVEC + VH + "impl VH\n    fn f(self:&) -> i32\n"
@@ -762,8 +811,9 @@ def test_a_push_that_moves_the_buffer(run_with, compiler, name):
 def test_a_struct_binding_survives_the_move(run_with, compiler):
     pre, values, _ = STRUCTS["twenty_four_bytes"]
     program = (GVEC + pre + MAIN + _new("S", values) + "    let w: S = S { a: 7, b: 8, c: 9 }\n"
+               + "    var p: *Vec<S> = @v\n"
                + _body("var t: i64 = 0\nvar n: i32 = 0\nfor x in v\n    if n == 0\n"
-                       "        for k in 0..100000\n            v.push(w)\n"
+                       "        for k in 0..100000\n            (*p).push(w)\n"
                        "    if n == 0\n        if x.c != 3\n            return 1\n"
                        "    n = n + 1\nif n != 100003\n    return 2\nreturn 0\n"))
     assert run_with(compiler, "moved_s", program) == 0
@@ -774,13 +824,22 @@ def test_a_struct_binding_survives_the_move(run_with, compiler):
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("it", FORMS)
 def test_an_element_write_in_the_body_is_seen(run_with, compiler, it):
-    program = (GVEC + MAIN + FILL_V + _body(f"var t: i32 = 0\nfor x in {it}\n    v.set(2, 50)\n"
-                                            "    t = t + x\nreturn t\n"))
+    # A bare `v` is moved into the loop, so the write goes through a pointer
+    # taken before it; `@v` is a view and writes `v` directly.
+    if it == "v":
+        fill, write = FILL_V + "    var p: *Vec<i32> = @v\n", "    (*p).set(2, 50)\n"
+    else:
+        fill, write = FILL_V, "    v.set(2, 50)\n"
+    program = (GVEC + MAIN + fill
+               + _body(f"var t: i32 = 0\nfor x in {it}\n" + write + "    t = t + x\nreturn t\n"))
     assert run_with(compiler, "set", program) == 53
 
 
-_ADJUST = (GVEC + MAIN + FILL_V + "    var w: Vec<i32> = vec_new<i32>()\n    w.push(1)\n"
-           "    var n: i32 = 0\n    for x in v\n        n = n + 1\n{body}    return n\n")
+# `@v` walks the Vec in place without moving it, so the body may shrink or
+# reassign the header it is reading.  The `assign` body builds its Vec inside
+# the loop: a move-only `w` can only be moved once.
+_ADJUST = (GVEC + MAIN + FILL_V
+           + "    var n: i32 = 0\n    for x in @v\n        n = n + 1\n{body}    return n\n")
 
 
 # #2387: anything that changes the header, not only a push.
@@ -789,8 +848,11 @@ _ADJUST = (GVEC + MAIN + FILL_V + "    var w: Vec<i32> = vec_new<i32>()\n    w.p
 @pytest.mark.parametrize("name,body,trips", [
     ("pop", "        v.pop()\n", 2),
     ("clear", "        v.clear()\n", 1),
-    ("assign", "        v = w\n", 1),
-    ("drop", "        vec_drop<i32>(@&v)\n", 1),
+    ("assign", "        var w: Vec<i32> = vec_new<i32>()\n        w.push(1)\n        v = w\n", 1),
+    # A raw-memory vec_drop (the API's remaining use) zeroes the header, so
+    # the loop ends after one pass; the scope's Drop then finds `data == null`
+    # and frees nothing twice. An owned binding is freed by the compiler.
+    ("drop", "        let vp: *Vec<i32> = @&v\n        vec_drop<i32>(@&*vp)\n", 1),
 ], ids=["pop", "clear", "assign", "drop"])
 def test_a_shorter_header_ends_the_loop(run_with, compiler, name, body, trips):
     assert run_with(compiler, name, _ADJUST.format(body=body)) == trips
@@ -859,8 +921,9 @@ def test_an_empty_vec_is_no_trips(run_with, compiler, it):
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_vec_can_be_walked_again(run_with, compiler):
-    program = (GVEC + MAIN + FILL_V + _body("var t: i32 = 0\nfor x in v\n    t = t + x\n"
-                                            "for x in v\n    t = t + x\n"
+    # Walking is a borrow of a move-only Vec, so both loops borrow it.
+    program = (GVEC + MAIN + FILL_V + _body("var t: i32 = 0\nfor x in @v\n    t = t + x\n"
+                                            "for x in @v\n    t = t + x\n"
                                             "return t + (v.len as i32)\n"))
     assert run_with(compiler, "again", program) == 17
 
@@ -1028,7 +1091,7 @@ NOT_A_HEADER = {
 def test_a_pointer_to_an_array_of_vecs_walks_the_vecs(run_with, compiler):
     program = (GVEC + "fn f(vs: *[2]Vec<i32>) -> i32\n    var t: i32 = 0\n    for x in vs\n"
                "        t = t + (x.len as i32) * 10 + 1\n    return t\n\n" + MAIN + FILL_V
-               + "    var vs: [2]Vec<i32>\n    vs[0] = v\n    vs[1] = vec_new<i32>()\n"
+               + "    var vs: [2]Vec<i32> = [Vec<i32> { data: null, len: 0, cap: 0 }, Vec<i32> { data: null, len: 0, cap: 0 }]\n    vs[0] = v\n    vs[1] = vec_new<i32>()\n"
                "    return f(@vs)\n")
     assert run_with(compiler, "array_of_vecs", program) == 32
 
@@ -1060,8 +1123,12 @@ _T = "    var t: i32 = 0\n    for x in {it}\n        t = t + 1\n    return t\n"
     ("q.pp", "    var q: QQ\n    q.pp = mkpp()\n"),
 ], ids=["call", "local", "field"])
 def test_ritz0_two_pointers_are_refused(compile_with, it, pre):
-    program = (GVEC + "struct QQ\n    n: i32\n    pp: **Vec<i32>\n\n"
-               "var g: Vec<i32>\n\nvar gp: *Vec<i32> = null\n\nfn mkpp() -> **Vec<i32>\n    gp = @g\n"
+    program = (GVEC + MEM + "struct QQ\n    n: i32\n    pp: **Vec<i32>\n\n"
+               "var gp: *Vec<i32> = null\n\n"
+               "fn mkpp() -> **Vec<i32>\n"
+               "    let p: *Vec<i32> = malloc(sizeof(Vec<i32>)) as *Vec<i32>\n"
+               "    *p = vec_new<i32>()\n"
+               "    gp = p\n"
                "    return @gp\n\n" + MAIN + pre + _T.format(it=it))
     comp, ll, _ = compile_with("ritz0", "two_pointers", program)
     assert comp.returncode != 0

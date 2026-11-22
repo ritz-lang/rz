@@ -25,6 +25,7 @@
 
 import ritzlib.memory
 import ritzlib.str      # memcpy
+import ritzlib.ptr { ptr_read }
 import ritzlib.hash
 import ritzlib.drop
 import ritzlib.fmt.digits      # fmt_i64_into: the one digit routine (AGAST #1856)
@@ -391,8 +392,8 @@ pub fn hashmap_with_cap<K: Hash + Eq, V>(cap: i64) -> HashMap<K, V>
     hashmap_with_cap_in<K, V>(null, cap)
 
 # An empty map whose table comes from `a` (AGAST #4120): each grow builds the
-# bigger table in `a` too, and hashmap_drop gives it back there. A null `a`
-# is the global heap.
+# bigger table in `a` too, and its slot Vec's drop gives it back there. A
+# null `a` is the global heap.
 pub fn hashmap_new_in<K: Hash + Eq, V>(a: *Allocator) -> HashMap<K, V>
     hashmap_with_cap_in<K, V>(a, 16)
 
@@ -402,8 +403,9 @@ pub fn hashmap_with_cap_in<K: Hash + Eq, V>(a: *Allocator, cap: i64) -> HashMap<
     var n: i64 = 16
     while n < cap
         n *= 2
-    var m: HashMap<K, V>
-    m.slots = vec_with_cap_in<HashMapEntry<K, V>>(a, n)
+    # A move-only HashMap has to start from a whole value (§13.6).
+    let slots: Vec<HashMapEntry<K, V>> = vec_with_cap_in<HashMapEntry<K, V>>(a, n)
+    var m: HashMap<K, V> = HashMap<K, V> { slots: slots, len: 0, tombstones: 0 }
     m.slots.len = n
     for i in 0..n
         let e: *HashMapEntry<K, V> = vec_get_ptr<HashMapEntry<K, V>>(@&m.slots, i)
@@ -499,6 +501,15 @@ pub fn hashmap_get<K: Hash + Eq, V>(m: @HashMap<K, V>, key: K) -> Option<V>
     let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
     Some(e.value)
 
+# The value in `key`'s slot, borrowed, or null. For a move-only `V`, which
+# `hashmap_get` can't return by value (AGAST #2159): the map still owns it.
+pub fn hashmap_get_ptr<K: Hash + Eq, V>(m: @HashMap<K, V>, key: K) -> *V
+    let idx: i64 = hashmap_find<K, V>(m, @key)
+    if idx < 0
+        return null
+    let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
+    @e.value
+
 # Remove key, leaving a Tomb so the chains through its slot stay intact.
 pub fn hashmap_remove<K: Hash + Eq, V>(m: @&HashMap<K, V>, key: K) -> bool
     let idx: i64 = hashmap_find<K, V>(m, @key)
@@ -552,7 +563,10 @@ fn hashmap_grow<K: Hash + Eq, V>(m: @&HashMap<K, V>)
     for i in 0..m.slots.len
         let e: *HashMapEntry<K, V> = m.slots.data + i
         if e.state == Slot.Full
-            hashmap_insert<K, V>(@&bigger, e.key, e.value)
+            # Move the entry out of the old table (which is freed below
+            # without dropping its elements): ptr_read, for a move-only V
+            # (AGAST #2159); a bitwise copy of a copy type is the same bytes.
+            hashmap_insert<K, V>(@&bigger, ptr_read<K>(@e.key), ptr_read<V>(@e.value))
     hashmap_drop<K, V>(m)
     m.slots = bigger.slots
     m.len = bigger.len

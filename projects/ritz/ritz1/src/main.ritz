@@ -64,7 +64,6 @@ fn err2(prefix: StrView, path: *u8) -> i32
     var s: String = string_from_strview(prefix)
     string_push_cstr(@&s, path)
     eprintln_string(@s)
-    string_drop(@&s)
     -1
 
 # Print "prefix<path>middle<extra>\n" as a single error line.
@@ -73,7 +72,6 @@ fn err3(prefix: StrView, path: *u8, extra: *u8) -> i32
     string_push_cstr(@&s, path)
     string_push_cstr(@&s, extra)
     eprintln_string(@s)
-    string_drop(@&s)
     -1
 
 # =============================================================================
@@ -157,7 +155,6 @@ fn tokenize(path: *u8, src_sv: StrView, tokens: *Vec<Token>) -> i32
             else
                 string_push_str(@&msg, "Lexer error: unexpected character")
             eprintln_string(@msg)
-            string_drop(@&msg)
             errors = errors + 1
 
     errors
@@ -278,8 +275,10 @@ fn lower_main(m: *Module, path: *u8) -> i32
     if gm == null
         err2("Parse error in the generated main adapter of: ", path)
         return -1
-    # The AST slices the text: it lives as long as the compile.
+    # The AST slices the text: it lives as long as the compile. Steal the
+    # buffer from `text`, or its Drop (AGAST #2159) frees it at return.
     keep_source_alive(gen)
+    text.data.data = null
     main_abi_rename(f)
     merge_module_into(m, gm)
     0
@@ -288,10 +287,18 @@ fn lower_main(m: *Module, path: *u8) -> i32
 # Import Resolution - Inline imported code into the module
 # =============================================================================
 
-# Track processed import paths.  Vec<String> globals zero-initialise
-# correctly (vec_new's null/0/0 shape matches LLVM zeroinitializer), so
-# no explicit init pass is needed — vec_push grows on demand.
-var g_processed: Vec<String>
+# Track processed import paths.  A Vec has a Drop impl (AGAST #2159), and a
+# module-level value of a Drop type is refused: it would never be dropped.
+# So the Vec lives behind a raw pointer that is allocated once and leaked
+# until compiler exit, like the source buffers below.
+var g_processed: *Vec<String> = null
+
+fn processed_vec() -> *Vec<String>
+    if g_processed == null
+        let p: *Vec<String> = malloc(sizeof(Vec<String>)) as *Vec<String>
+        *p = Vec<String> { data: null, len: 0, cap: 0 }
+        g_processed = p
+    g_processed
 
 # Source buffers backing AST string slices.  We "leak" each by stealing
 # its `data` pointer from the local Vec<u8> in load_and_parse; the OS
@@ -307,15 +314,16 @@ fn keep_source_alive(src_ptr: *u8)
     let _: *u8 = src_ptr
 
 fn was_import_processed(path: @String) -> i32
-    let n: i64 = vec_len<String>(@g_processed)
+    let g: *Vec<String> = processed_vec()
+    let n: i64 = vec_len<String>(@*g)
     for i in 0..n
-        let entry_ptr: *String = vec_get_ptr<String>(@&g_processed, i)
+        let entry_ptr: *String = vec_get_ptr<String>(@&*g, i)
         if string_eq_string(entry_ptr, path)
             return 1
     0
 
 fn mark_import_processed(path: String)
-    vec_push<String>(@&g_processed, path)
+    vec_push<String>(@&*processed_vec(), path)
 
 # The g_processed key of the file at `path` (AGAST #2148): its canonical
 # path, as ritz0's processed_files holds Path.resolve()d ones, so a module
@@ -460,7 +468,6 @@ fn try_open_dep_import(imp: *ImportPath) -> String
                         sys_close(fd)
                         return candidate
                     dep_record_miss(string_as_ptr(@&candidate))
-                    string_drop(@&candidate)
             ds = di + 1
         di = di + 1
     string_new()
@@ -486,7 +493,6 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
     var dep_hit: String = try_open_dep_import(imp)
     if string_len(@dep_hit) > 0
         return dep_hit
-    string_drop(@&dep_hit)
 
     # ritzlib imports skip source-dir and resolve only via RITZ_PATH.
     let is_ritzlib: i32 = import_is_ritzlib(imp)
@@ -515,7 +521,6 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
                     sys_close(fd)
                     return candidate
                 dep_record_miss(string_as_ptr(@&candidate))
-                string_drop(@&candidate)
 
                 # Climb to parent directory.
                 var parent_view: StrView
@@ -558,7 +563,6 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
                     *found_via_ritz_path = 1
                     return candidate
                 dep_record_miss(string_as_ptr(@&candidate))
-                string_drop(@&candidate)
 
                 # Workspace probes: <entry>/<pkg>/lib/<rest>.ritz and
                 # <entry>/<pkg>/src/<rest>.ritz. Mirrors ritz0's
@@ -578,7 +582,6 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
                         *found_via_ritz_path = 1
                         return c_lib
                     dep_record_miss(string_as_ptr(@&c_lib))
-                string_drop(@&c_lib)
 
                 var seg_src: StrView
                 seg_src.ptr = seg_ptr
@@ -591,7 +594,6 @@ fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, fo
                         *found_via_ritz_path = 1
                         return c_src
                     dep_record_miss(string_as_ptr(@&c_src))
-                string_drop(@&c_src)
 
             if had_delim == 0
                 # No more delimiters; we already tried `seg` (the full
@@ -733,7 +735,6 @@ fn check_const_conflicts(m: *Module, other: *Module, path: *u8) -> i32
                     else
                         string_push_str(@&msg, "': defined differently in multiple files")
                     eprintln_string(@msg)
-                    string_drop(@&msg)
                     bad = 1
                 break
             e = e.next
@@ -797,7 +798,6 @@ fn fns_coexist(a: *FnDef, b: *FnDef) -> i32
         public = a
     var key: String = import_key(private.def_file)
     let sees: i32 = vis_sees(string_as_ptr(@&key), public)
-    string_drop(@&key)
     1 - sees
 
 # Of the ungated fns of one name fns_coexist let through, keep the one the
@@ -862,7 +862,6 @@ fn report_fn_conflict(earlier: *FnDef, later: *FnDef)
     string_push_str(@&msg, " and ")
     string_push_cstr(@&msg, later.def_file)
     eprintln_string(@msg)
-    string_drop(@&msg)
 
 # Two definitions of one name inside a single freshly parsed file `m` (its
 # generated `E__from` fns included).  Returns -1 if there was one, else 0.
@@ -990,15 +989,12 @@ fn read_iface_text(src_sv: StrView) -> Vec<u8>
     var len: i64 = src_sv.len
     var path: String = iface_text_path(StrView { ptr: (src), len: (len) })
     if string_len(@path) == 0
-        string_drop(@&path)
         return vec_new<u8>()
     let fd: i32 = sys_open(string_as_ptr(@&path), O_RDONLY)
     if fd < 0
-        string_drop(@&path)
         return vec_new<u8>()
     sys_close(fd)
     let text: Vec<u8> = read_file(string_as_ptr(@&path))
-    string_drop(@&path)
     text
 
 # RITZ1_PARSE_LOG: note that `path`'s source is being lexed and parsed.
@@ -1008,14 +1004,12 @@ fn parse_log_note(path: *u8)
         return
     var log_path: String = string_from_strview(log)
     let fd: i32 = sys_open3(string_as_ptr(@&log_path), O_WRONLY + O_CREAT + O_APPEND, 420)
-    string_drop(@&log_path)
     if fd < 0
         return
     var line: String = string_new()
     string_push_cstr(@&line, path)
     string_push(@&line, '\n')
     sys_write(fd, string_as_ptr(@&line), string_len(@line) as i64)
-    string_drop(@&line)
     sys_close(fd)
 
 # 1 when environment variable `name` holds a truthy value; 0 when it is
@@ -1230,7 +1224,6 @@ fn strip_to_interface(m: *Module)
 fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrView) -> i32
     var m_key: String = import_key(m_path)
     let vm: *VisMod = vis_module(string_as_ptr(@&m_key))
-    string_drop(@&m_key)
     var imp: *ImportDecl = m.imports
     while imp != null
         # Find the import file.
@@ -1241,8 +1234,6 @@ fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrV
             append_import_display(@msg, imp.path)
             string_push_str(@&msg, ".ritz")
             eprintln_string(@msg)
-            string_drop(@&msg)
-            string_drop(@&path)
             return -1
 
         # Cycle detection.
@@ -1250,8 +1241,6 @@ fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrV
         vis_edge(vm, string_as_ptr(@&key), imp)   # AGAST #3891
         let import_vm: *VisMod = vis_module(string_as_ptr(@&key))
         if was_import_processed(@key) == 1
-            string_drop(@&key)
-            string_drop(@&path)
             imp = imp.next
             continue
         mark_import_processed(key)
@@ -1261,14 +1250,12 @@ fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrV
         let gated_mark: i32 = gated_decl_count()
         let import_module: *Module = load_and_parse(@&path)
         if import_module == null
-            string_drop(@&path)
             return -1
         strip_to_interface(import_module)
         vis_names(import_vm, import_module)   # before its imports merge in
         vis_type_names(import_vm, decl_mark)   # its enums and aliases
         vis_r54_names(import_vm, trait_mark, gated_mark)   # R54's extra names
         if check_fn_dups_in_file(import_module) < 0
-            string_drop(@&path)
             return -1
 
         # Child imports: ALWAYS use the resolved file's directory as the
@@ -1286,18 +1273,14 @@ fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrV
         let child_dir: StrView = path_dir(string_as_ptr(@&path))
         let res: i32 = resolve_imports(import_module, string_as_ptr(@&path), child_dir, ritz_path)
         if res < 0
-            string_drop(@&path)
             return -1
 
         if check_const_conflicts(m, import_module, string_as_ptr(@&path)) < 0
-            string_drop(@&path)
             return -1
         if check_fn_conflicts(m, import_module, m_path) < 0
-            string_drop(@&path)
             return -1
         merge_module_into(m, import_module)
 
-        string_drop(@&path)
         imp = imp.next
 
     0
@@ -1611,7 +1594,6 @@ fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz
     # conflict with themselves (AGAST #2148).
     var main_key: String = import_key(input_path)
     let main_vm: *VisMod = vis_module(string_as_ptr(@&main_key))
-    string_drop(@&main_key)
     vis_edges_reset(main_vm)   # a second pass lists its imports afresh
     vis_names(main_vm, m)   # AGAST #3891: before its imports merge in
     vis_type_names(main_vm, decl_mark)   # AGAST #3907: its enums and aliases
@@ -1690,7 +1672,6 @@ fn main(argc: i32, argv: **u8) -> i32
         var skip_msg: String = string_from("Skipped (unchanged): ")
         string_push_cstr(@&skip_msg, args.input_path)
         println_string(@skip_msg)
-        string_drop(@&skip_msg)
         return 0
 
     # Tokenize. Typical compiler input files produce under 20K tokens;
@@ -1704,7 +1685,6 @@ fn main(argc: i32, argv: **u8) -> i32
         var msg: String = string_from("Lexer errors: ")
         string_push_i64(@&msg, lex_errors as i64)
         eprintln_string(@msg)
-        string_drop(@&msg)
         return 1
 
     # Get source directory for relative imports
@@ -1728,7 +1708,7 @@ fn main(argc: i32, argv: **u8) -> i32
     # it against every const the first one merged.
     if type_alias_count() > 0 or array_len_pending() > 0
         array_len_seed(m.constants)
-        vec_clear<String>(@&g_processed)
+        vec_clear<String>(@&*processed_vec())
         dep_record_reset()
         enum_program_reset()
         tuple_regs_reset()   # AGAST #3030
@@ -1897,7 +1877,6 @@ fn main(argc: i32, argv: **u8) -> i32
         sig_take_deps(sig_out)
         var sig_path: String = sig_path_from_src(args.input_path)
         write_sig_file(string_as_ptr(@&sig_path), sig_out)
-        string_drop(@&sig_path)
         sig_data_free(sig_out)
 
     0
