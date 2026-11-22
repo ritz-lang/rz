@@ -549,7 +549,7 @@ fn main() -> i32
 **The sink** is a pointer to a struct (`@&buf`, or a `*T` / `@&T` value)
 whose method `push_bytes(data: *u8, len: i64)` resolves statically, exactly
 as `sink.push_bytes(data, len)` would (§12.2). `String`, `GrowBuf` and
-`Vec<u8>` provide it (`string_push_bytes`, `growbuf_push_bytes`,
+`Vec<u8>` provide it (`string_push_bytes`, `GrowBuf.push_bytes`,
 `vec_push_bytes`), and any type can by implementing it:
 
 ```ritz

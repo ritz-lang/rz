@@ -1220,8 +1220,9 @@ Buffer utilities for parsing.
 
 Text goes in as a `StrView` (a `"..."` literal) and comes out as a `StrView`
 slice of the buffer's own bytes: zero-copy, never truncated. Predicates return
-`bool`. Receivers are `@Buffer` (read-only) or `@&Buffer` (moves the cursor);
-a local passes as `@b` either way.
+`bool`. Buffer and GrowBuf operations are impl methods: `@Buffer` is read-only,
+`@&Buffer` moves the cursor; a method call on a local takes the receiver
+automatically.
 
 ```ritz
 import ritzlib.buf
@@ -1229,10 +1230,10 @@ import ritzlib.strview
 
 fn key_of(line: StrView) -> StrView
     var b: Buffer = buf_new(line)
-    buf_skip_whitespace(@&b)
-    let key: StrView = buf_take_ident(@&b)
-    buf_skip_whitespace(@&b)
-    if not buf_match_char(@&b, '=')
+    b.skip_whitespace()
+    let key: StrView = b.take_ident()
+    b.skip_whitespace()
+    if not b.match_char('=')
         return strview_empty()
     return key
 ```
@@ -1251,64 +1252,64 @@ struct Buffer
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `buf_new` | `fn(s: StrView) -> Buffer` | Cursor at the start of `s` (borrows its bytes) |
-| `buf_from_str` | `fn(buf: @&Buffer, s: StrView) -> i32` | Re-point an existing cursor at `s` |
-| `buf_init` | `fn(buf: @&Buffer, data: *u8, len: i64) -> i32` | From pointer + length (C interop) |
+| `b.from_str(s)` | `fn(s: StrView) -> i32` | Re-point an existing cursor at `s` |
+| `b.init(data)` | `fn(data: Span<u8>) -> i32` | From a `Span<u8>` |
 
 **Position**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `buf_pos` | `fn(buf: @Buffer) -> i64` | Current position |
-| `buf_len` | `fn(buf: @Buffer) -> i64` | Total length |
-| `buf_remaining` | `fn(buf: @Buffer) -> i64` | Remaining bytes |
-| `buf_eof` | `fn(buf: @Buffer) -> bool` | At end? |
-| `buf_rest` | `fn(buf: @Buffer) -> StrView` | Unread bytes, as a slice |
-| `buf_save` | `fn(buf: @Buffer) -> i64` | Save position |
-| `buf_restore` | `fn(buf: @&Buffer, pos: i64) -> i32` | Restore position |
+| `b.pos()` | `fn() -> i64` | Current position |
+| `b.len()` | `fn() -> i64` | Total length |
+| `b.remaining()` | `fn() -> i64` | Remaining bytes |
+| `b.eof()` | `fn() -> bool` | At end? |
+| `b.rest()` | `fn() -> StrView` | Unread bytes, as a slice |
+| `b.save()` | `fn() -> i64` | Save position |
+| `b.restore(pos)` | `fn(pos: i64) -> i32` | Restore position |
 
 **Peek (Don't Advance)**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `buf_peek` | `fn(buf: @Buffer) -> u8` | Peek current byte (0 at end) |
-| `buf_peek_at` | `fn(buf: @Buffer, offset: i64) -> u8` | Peek at offset (0 out of range) |
-| `buf_peek_view` | `fn(buf: @Buffer, n: i64) -> StrView` | Up to `n` bytes, as a slice |
+| `b.peek()` | `fn() -> u8` | Peek current byte (0 at end) |
+| `b.peek_at(offset)` | `fn(offset: i64) -> u8` | Peek at offset (0 out of range) |
+| `b.peek_view(n)` | `fn(n: i64) -> StrView` | Up to `n` bytes, as a slice |
 
 **Consume (Advance)**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `buf_advance` | `fn(buf: @&Buffer) -> u8` | Read and advance |
-| `buf_advance_n` | `fn(buf: @&Buffer, n: i64) -> i64` | Advance n bytes (clamped) |
-| `buf_skip` | `fn(buf: @&Buffer, n: i64) -> i32` | Skip n bytes (clamped) |
+| `b.advance()` | `fn() -> u8` | Read and advance |
+| `b.advance_n(n)` | `fn(n: i64) -> i64` | Advance n bytes (clamped) |
+| `b.skip(n)` | `fn(n: i64) -> i32` | Skip n bytes (clamped) |
 
 **Pattern Matching**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `buf_match_char` | `fn(buf: @&Buffer, c: u8) -> bool` | Consume `c` if next |
-| `buf_match_str` | `fn(buf: @&Buffer, s: StrView) -> bool` | Consume `s` if next |
-| `buf_starts_with` | `fn(buf: @Buffer, s: StrView) -> bool` | Check prefix (no advance) |
+| `b.match_char(c)` | `fn(c: u8) -> bool` | Consume `c` if next |
+| `b.match_str(s)` | `fn(s: StrView) -> bool` | Consume `s` if next |
+| `b.starts_with(s)` | `fn(s: StrView) -> bool` | Check prefix (no advance) |
 
 **Skip Utilities**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `buf_skip_whitespace` | `fn(buf: @&Buffer) -> i64` | Skip space/tab/CR/LF |
-| `buf_skip_until` | `fn(buf: @&Buffer, c: u8) -> i64` | Skip until char |
-| `buf_skip_while` | `fn(buf: @&Buffer, pred: fn(u8) -> bool) -> i64` | Skip a run matching `pred`; returns the count |
+| `b.skip_whitespace()` | `fn() -> i64` | Skip space/tab/CR/LF |
+| `b.skip_until(c)` | `fn(c: u8) -> i64` | Skip until char |
+| `b.skip_while(pred)` | `fn(pred: fn(u8) -> bool) -> i64` | Skip a run matching `pred`; returns the count |
 
 **Zero-Copy Reads** (each returns a slice of the buffer's bytes):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `buf_take_until` | `fn(buf: @&Buffer, c: u8) -> StrView` | Up to (not including) `c`, or to the end |
-| `buf_take_digits` | `fn(buf: @&Buffer) -> StrView` | Run of `[0-9]` |
-| `buf_take_ident` | `fn(buf: @&Buffer) -> StrView` | Run of `[A-Za-z0-9_]` |
-| `buf_take_while` | `fn(buf: @&Buffer, pred: fn(u8) -> bool) -> StrView` | Run matching `pred` |
-| `buf_take_quoted` | `fn(buf: @&Buffer, quote: u8, out: @&String) -> bool` | Decode a quoted string, appending to `out`; false if not at `quote` or unterminated |
+| `b.take_until(c)` | `fn(c: u8) -> StrView` | Up to (not including) `c`, or to the end |
+| `b.take_digits()` | `fn() -> StrView` | Run of `[0-9]` |
+| `b.take_ident()` | `fn() -> StrView` | Run of `[A-Za-z0-9_]` |
+| `b.take_while(pred)` | `fn(pred: fn(u8) -> bool) -> StrView` | Run matching `pred` |
+| `b.take_quoted(quote, out)` | `fn(quote: u8, out: @&String) -> bool` | Decode a quoted string, appending to `out`; false if not at `quote` or unterminated |
 
-**Byte Predicates** (for `buf_take_while` / `buf_skip_while`):
+**Byte Predicates** (for `b.take_while` / `b.skip_while`):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -1322,11 +1323,11 @@ copy into a caller-sized `out`, NUL-terminate within `max_len` (so `max_len`
 
 | Function | Signature | Use instead |
 |----------|-----------|-------------|
-| `buf_peek_n` | `fn(buf: @Buffer, out: *u8, n: i64) -> i64` | `buf_peek_view` |
-| `buf_read_until` | `fn(buf: @&Buffer, c: u8, out: *u8, max_len: i64) -> i64` | `buf_take_until` |
-| `buf_read_while_digit` | `fn(buf: @&Buffer, out: *u8, max_len: i64) -> i64` | `buf_take_digits` |
-| `buf_read_while_alnum` | `fn(buf: @&Buffer, out: *u8, max_len: i64) -> i64` | `buf_take_ident` |
-| `buf_read_quoted` | `fn(buf: @&Buffer, quote: u8, out: *u8, max_len: i64) -> Result<i64, BufQuoteError>` | `buf_take_quoted` |
+| `b.peek_n(out)` | `fn(out: Span<u8>) -> i64` | `b.peek_view(n)` |
+| `b.read_until(c, out)` | `fn(c: u8, out: Span<u8>) -> i64` | `b.take_until(c)` |
+| `b.read_while_digit(out)` | `fn(out: Span<u8>) -> i64` | `b.take_digits()` |
+| `b.read_while_alnum(out)` | `fn(out: Span<u8>) -> i64` | `b.take_ident()` |
+| `b.read_quoted(quote, out)` | `fn(quote: u8, out: Span<u8>) -> Result<i64, BufQuoteError>` | `b.take_quoted(quote, out)` |
 
 **Location Tracking**:
 
@@ -1339,7 +1340,7 @@ struct BufLoc
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `buf_get_loc` | `fn(buf: @Buffer, loc: @&BufLoc) -> i32` | Get line/column |
+| `b.get_loc(loc)` | `fn(loc: @&BufLoc) -> i32` | Get line/column |
 
 #### GrowBuf (Growable Buffer)
 
@@ -1354,7 +1355,7 @@ A standalone struct, not an alias of `Vec<u8>`: the fields match `Vec<u8>`'s
 in name and layout, but the types are distinct: every compiler rejects a
 `GrowBuf` passed to a `Vec<u8>` function (#1948). It has
 an `impl Drop` (`Vec<T>` does not); whether that drop is inserted
-automatically depends on the compiler (#1854), so `growbuf_free` remains for
+automatically depends on the compiler (#1854), so `b.free()` remains for
 explicit release. To read a whole file descriptor, use `vec_read_all_fd`
 (io) and point a `Buffer` at the bytes.
 
@@ -1362,20 +1363,20 @@ explicit release. To read a whole file descriptor, use `vec_read_all_fd`
 |----------|-----------|-------------|
 | `growbuf_new` | `fn() -> GrowBuf` | Create empty |
 | `growbuf_with_cap` | `fn(cap: i64) -> GrowBuf` | Create with capacity |
-| `growbuf_free` | `fn(b: @&GrowBuf) -> i32` | Free (deprecated, use Drop) |
-| `growbuf_grow` | `fn(b: @&GrowBuf, new_cap: i64) -> bool` | Grow capacity |
-| `growbuf_ensure_cap` | `fn(b: @&GrowBuf, needed: i64) -> bool` | Ensure capacity |
-| `growbuf_append` | `fn(b: @&GrowBuf, data: *u8, len: i64) -> bool` | Append bytes |
-| `growbuf_append_view` | `fn(b: @&GrowBuf, s: StrView) -> bool` | Append a StrView |
-| `growbuf_append_byte` | `fn(b: @&GrowBuf, byte: u8) -> bool` | Append single byte |
-| `growbuf_push_bytes` | `fn(b: @&GrowBuf, data: *u8, len: i64) -> bool` | `growbuf_append` under the `push_bytes` name `format_into(@&b, "...")` appends through (AGAST #1824) |
-| `growbuf_clear` | `fn(b: @&GrowBuf) -> i32` | Clear (keep capacity) |
-| `growbuf_len` | `fn(b: @GrowBuf) -> i64` | Get length |
-| `growbuf_cap` | `fn(b: @GrowBuf) -> i64` | Get capacity |
-| `growbuf_get` | `fn(b: @GrowBuf, idx: i64) -> u8` | Byte at index (0 out of range) |
-| `growbuf_is_empty` | `fn(b: @GrowBuf) -> bool` | Empty? |
-| `growbuf_view` | `fn(b: @GrowBuf) -> StrView` | Contents as a slice (invalidated by the next append) |
-| `growbuf_data` | `fn(b: @GrowBuf) -> *u8` | Data pointer (C interop) |
+| `b.free()` | `fn() -> i32` | Free (deprecated, use Drop) |
+| `b.grow(new_cap)` | `fn(new_cap: i64) -> bool` | Grow capacity |
+| `b.ensure_cap(needed)` | `fn(needed: i64) -> bool` | Ensure capacity |
+| `b.append(data)` | `fn(data: Span<u8>) -> bool` | Append bytes |
+| `b.append_view(s)` | `fn(s: StrView) -> bool` | Append a StrView |
+| `b.append_byte(byte)` | `fn(byte: u8) -> bool` | Append single byte |
+| `b.push_bytes(data, len)` | `fn(data: *u8, len: i64) -> bool` | Append bytes; the sink `format_into(@&b, "...")` appends through (AGAST #1824) |
+| `b.clear()` | `fn() -> i32` | Clear (keep capacity) |
+| `b.len()` | `fn() -> i64` | Get length |
+| `b.cap()` | `fn() -> i64` | Get capacity |
+| `b.get(idx)` | `fn(idx: i64) -> u8` | Byte at index (0 out of range) |
+| `b.is_empty()` | `fn() -> bool` | Empty? |
+| `b.view()` | `fn() -> StrView` | Contents as a slice (invalidated by the next append) |
+| `b.data()` | `fn() -> *u8` | Data pointer (C interop) |
 
 ---
 
