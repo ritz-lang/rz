@@ -959,8 +959,30 @@ class MoveChecker(MoveWalk):
         return found
 
     def _method_arg_moves(self, call: rast.MethodCall, i: int) -> bool:
-        """Does argument `i` of `call` move? Only if every same-named method
-        takes it by value; unknown methods lend (no move, no drop-flag clear)."""
+        """Does argument `i` of `call` move? A receiver type the method is
+        known on answers from that type's own param (see below); otherwise
+        every same-named method must take it by value, and an unknown method
+        lends (no move, no drop-flag clear).
+
+        The receiver's type matters: the name-wide table mixes unrelated
+        methods. `Vec<u8>.push(item: u8)` and `Vec<*u8>.push(item: *u8)` share
+        the name, and a `*T` param reads as lending, so a `v.push(x)` argument
+        was taken as lent and `x` was dropped after being copied into the Vec
+        (AGAST #4537). Auto-deref means the receiver may be a pointer."""
+        ty = self._receiver_type(call.expr)
+        while isinstance(ty, (rast.PtrType, rast.RefType)):
+            ty = self.types.resolve(ty.inner)
+        if isinstance(ty, rast.NamedType):
+            cands = self.type_methods.get((ty.name, call.method))
+            if cands:
+                found = []
+                for m in cands:
+                    params = list(m.params)
+                    if params and params[0].name == 'self':
+                        params = params[1:]
+                    found.append(params[i] if i < len(params) else None)
+                return bool(found) and all(
+                    p is not None and not _is_lending_param(p) for p in found)
         params = self._method_arg_params(call, i)
         return bool(params) and all(p is not None and not _is_lending_param(p) for p in params)
 

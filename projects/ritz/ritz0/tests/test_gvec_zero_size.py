@@ -5,7 +5,7 @@ THE DEFECT
     struct Unit
     pub fn main() -> i32
         var v: Vec<Unit> = vec_new<Unit>()
-        vec_push<Unit>(@&v, Unit {})
+        v.push(Unit {})
         v.len as i32     # 0; expected 1
 
 vec_grow asked realloc for `new_cap * sizeof(T)` = 0 bytes.  realloc(null, 0)
@@ -16,7 +16,7 @@ THE FIX
 
 vec_grow sets `cap` for a zero `sizeof(T)` without allocating, and points
 `data` at a non-null dangling address (no element has bytes to read or write
-there).  Neither vec_drop nor the Vec's scope-end Drop (AGAST #2159) hands
+there).  Neither `Vec.deinit` nor the Vec's scope-end Drop (AGAST #2159) hands
 that address to free, which would read a block header below it and fault.
 realloc itself is unchanged.
 
@@ -44,11 +44,11 @@ PROGRAMS = {
     "zst_push_pop_len": (UNIT + """\
 pub fn main() -> i32
     var v: Vec<Unit> = vec_new<Unit>()
-    vec_push<Unit>(@&v, Unit {})
-    vec_push<Unit>(@&v, Unit {})
-    vec_push<Unit>(@&v, Unit {})
+    v.push(Unit {})
+    v.push(Unit {})
+    v.push(Unit {})
     let pushed: i32 = v.len as i32
-    let u: Unit = vec_pop<Unit>(@&v)
+    let u: Unit = v.pop()
     return pushed * 10 + v.len as i32
 """, 32),
     # vec_get of a zero-size element is a valid (empty) value, and the push
@@ -59,8 +59,8 @@ fn relay(u: Unit) -> Unit
 
 pub fn main() -> i32
     var v: Vec<Unit> = vec_new<Unit>()
-    let ok: bool = vec_push<Unit>(@&v, Unit {})
-    let u: Unit = relay(vec_get<Unit>(@v, 0))
+    let ok: bool = v.push(Unit {})
+    let u: Unit = relay(v.get(0))
     if not ok
         return 1
     return 7
@@ -72,7 +72,7 @@ pub fn main() -> i32
 fn push_twenty() -> i32
     var v: Vec<Unit> = vec_new<Unit>()
     for i in 0..20
-        vec_push<Unit>(@&v, Unit {})
+        v.push(Unit {})
     return v.len as i32
 
 pub fn main() -> i32
@@ -86,9 +86,9 @@ import ritzlib.gvec
 pub fn main() -> i32
     var v: Vec<i32> = vec_new<i32>()
     for i in 1..4
-        vec_push<i32>(@&v, i as i32)
-    let sum: i32 = vec_get<i32>(@v, 0) + vec_get<i32>(@v, 1) + vec_get<i32>(@v, 2)
-    let last: i32 = vec_pop<i32>(@&v)
+        v.push(i as i32)
+    let sum: i32 = v.get(0) + v.get(1) + v.get(2)
+    let last: i32 = v.pop()
     let r: i32 = sum * 10 + last + v.len as i32
     return r
 """, 65),

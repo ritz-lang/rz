@@ -244,9 +244,9 @@ CONTAINERS = {
     "vec": (
         "    var v: Vec<P> = vec_new<P>()\n"
         "    for i in 0..20\n"
-        "        vec_push<P>(@&v, P { a: i as u8, b: i * 1000, c: (i + 100) as u8 })\n"
+        "        v.push(P { a: i as u8, b: i * 1000, c: (i + 100) as u8 })\n"
         "    for i in 0..20\n"
-        "        let q = vec_get<P>(@v, i)\n"
+        "        let q = v.get(i)\n"
         "        if q.a != i as u8 or q.b != i * 1000 or q.c != (i + 100) as u8\n"
         "            return (i + 1) as i32\n"
         "    0\n"

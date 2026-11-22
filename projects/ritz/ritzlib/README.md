@@ -51,8 +51,8 @@ pub fn main() -> i32
 
     # Vec<T> is the generic dynamic array
     var items: Vec<i64> = vec_new<i64>()
-    vec_push(@&items, 42)
-    print_int(vec_get(@items, 0))
+    items.push(42)
+    print_int(items.get(0))
     0                       # `items` is freed here (Vec has Drop)
 ```
 

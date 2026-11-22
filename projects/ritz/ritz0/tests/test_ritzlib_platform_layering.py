@@ -186,7 +186,7 @@ import ritzlib.hashmap
 
 fn main() -> i32
     var v: Vec<i64> = vec_new<i64>()
-    vec_push<i64>(@&v, 7)
+    v.push(7)
     var s: String = string_new()
     s.push(65)
     var m: HashMapI64 = hashmap_i64_new()

@@ -379,9 +379,9 @@ def test_runs(tmp_path, compiler):
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_receiver_taken_as_an_argument_is_not_a_slot(tmp_path, compiler):
-    """`v.push(x)` is `vec_push(v, x)`: `x` doesn't land in the `@&Vec`."""
+    """`v.push(x)` is `v.push(x)`: `x` doesn't land in the `@&Vec`."""
     src = _main("import ritzlib.gvec\n\nfn go() -> i32\n    var v: Vec<i32> = vec_new<i32>()\n"
-                "    let x: i32 = 3\n    v.push(x)\n    vec_get<i32>(@v, 0)\n", "    go()\n")
+                "    let x: i32 = 3\n    v.push(x)\n    v.get(0)\n", "    go()\n")
     comp, ll, _ = _compile(compiler, tmp_path, "receiver", src)
     assert comp.returncode == 0 and ll.exists(), comp.stdout + comp.stderr
 

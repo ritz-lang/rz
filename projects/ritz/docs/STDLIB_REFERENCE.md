@@ -137,15 +137,15 @@ import ritzlib.gvec
 
 fn find_first(items: @Vec<i32>, target: i32) -> Option<i32>
     var i: i64 = 0
-    while i < vec_len<i32>(items)
-        if vec_get<i32>(items, i) == target
+    while i < items.len()
+        if items.get(i) == target
             return Some(i as i32)
         i += 1
     return None
 ```
 
-`vec_len` and `vec_get` are generic and ritz0 does not infer the type argument
-at the call site, so it must be written out: `vec_len<i32>(items)`.
+`Vec`'s accessors are methods, so their element type comes from the receiver:
+`items.len()`, `items.get(i)` (AGAST #4537).
 
 ---
 
@@ -409,8 +409,8 @@ import ritzlib.gvec
 # then is the arena safe to destroy (a Vec owns its buffer, AGAST #2159).
 fn use_arena_vec(a: *Allocator) -> i64
     var v: Vec<i64> = vec_new_in<i64>(a)    # every grow comes from the arena
-    vec_push<i64>(@&v, 7)
-    vec_get<i64>(@v, 0)
+    v.push(7)
+    v.get(0)
 
 fn arena_vec() -> i64
     var ar: Arena = arena_new(65536)
@@ -448,8 +448,8 @@ import ritzlib.gvec
 
 fn use_heap_vec(a: *Allocator) -> i64
     var v: Vec<u8> = vec_new_in<u8>(a)         # a slab block, not a page
-    vec_push<u8>(@&v, 7)
-    vec_get<u8>(@v, 0) as i64                  # drop returns it to h's bins
+    v.push(7)
+    v.get(0) as i64                            # drop returns it to h's bins
 
 fn heap_vec() -> i64
     var h: Heap
@@ -2301,35 +2301,35 @@ byte (`"count"` or `"n"`).
 
 **Spec**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `argspec_new` | `fn(program: StrView, about: StrView) -> ArgSpec` | Empty spec |
-| `argspec_switch` | `fn(spec: @&ArgSpec, short: u8, long: StrView, help: StrView)` | Boolean option (`short` 0 / `long` `""` to omit a form) |
-| `argspec_option` | `fn(spec: @&ArgSpec, short: u8, long: StrView, value_name: StrView, help: StrView, default: Option<StrView>)` | Option taking a value |
-| `argspec_positionals` | `fn(spec: @&ArgSpec, name: StrView, help: StrView, min: i64, max: i64)` | Accept min..max positionals (`ARGS_UNLIMITED` = no max); none without this call |
-| `argspec_find` | `fn(spec: @ArgSpec, name: StrView) -> Option<i64>` | Index of an option |
-| `argspec_parse` | `fn(spec: @ArgSpec, args: Span<StrView>) -> Result<ParsedArgs, ArgError>` | Parse |
-| `argspec_print_help` | `fn(spec: @ArgSpec)` | Usage, options and arguments on stdout |
-| `argspec_drop` | `fn(spec: @&ArgSpec)` | Leave the spec empty; the compiler frees its slots at scope end (AGAST #2159) |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `argspec_new` | `fn(program: StrView, about: StrView) -> ArgSpec` | Empty spec (free: it builds one) |
+| `spec.switch` | `fn(short: u8, long: StrView, help: StrView)` | Boolean option (`short` 0 / `long` `""` to omit a form) |
+| `spec.option` | `fn(short: u8, long: StrView, value_name: StrView, help: StrView, default: Option<StrView>)` | Option taking a value |
+| `spec.positionals` | `fn(name: StrView, help: StrView, min: i64, max: i64)` | Accept min..max positionals (`ARGS_UNLIMITED` = no max); none without this call |
+| `spec.find` | `fn(name: StrView) -> Option<i64>` | Index of an option |
+| `spec.parse` | `fn(args: Span<StrView>) -> Result<ParsedArgs, ArgError>` | Parse |
+| `spec.print_help` | `fn()` | Usage, options and arguments on stdout |
+| `spec.deinit` | `fn()` | Leave the spec empty; the compiler frees its slots at scope end (AGAST #2159) |
 
 **Result** (a `ParsedArgs` shares the spec's storage; drop it first):
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `parsed_switch` | `fn(p: @ParsedArgs, name: StrView) -> bool` | Switch given? (false for value options) |
-| `parsed_is_set` | `fn(p: @ParsedArgs, name: StrView) -> bool` | Option given at all? |
-| `parsed_value` | `fn(p: @ParsedArgs, name: StrView) -> Option<StrView>` | Given value, else default, else None |
-| `parsed_int` | `fn(p: @ParsedArgs, name: StrView) -> Result<i64, ArgError>` | `parsed_value` as an i64 |
-| `parsed_positional` | `fn(p: @ParsedArgs, i: i64) -> Option<StrView>` | i-th positional |
-| `parsed_positionals` | `fn(p: @ParsedArgs) -> Span<StrView>` | All positionals |
-| `parsed_drop` | `fn(p: @&ParsedArgs)` | Leave the result empty; the compiler frees its Vecs at scope end (AGAST #2159) |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `p.switch` | `fn(name: StrView) -> bool` | Switch given? (false for value options) |
+| `p.is_set` | `fn(name: StrView) -> bool` | Option given at all? |
+| `p.value` | `fn(name: StrView) -> Option<StrView>` | Given value, else default, else None |
+| `p.int` | `fn(name: StrView) -> Result<i64, ArgError>` | `p.value(name)` as an i64 |
+| `p.positional` | `fn(i: i64) -> Option<StrView>` | i-th positional |
+| `p.positionals` | `fn() -> Span<StrView>` | All positionals |
+| `p.deinit` | `fn()` | Leave the result empty; the compiler frees its Vecs at scope end (AGAST #2159) |
 
 **Errors**: `ArgError` is a struct `{ kind: ArgErrorKind, text: StrView, limit: i64 }`
 with kinds `UnknownOption`, `MissingValue`, `UnexpectedValue`,
 `MissingPositional`, `TooManyPositionals`, `NotANumber` and `NotSet`.
-`arg_error_print(spec, @e)` writes `"<program>: <message>"` to stderr, and
+`spec.error_print(e)` writes `"<program>: <message>"` to stderr, and
 `arg_parse_i64(s: StrView) -> Result<i64, ArgError>` is the strict decimal
-parser `parsed_int` uses (sign, digits, range-checked).
+parser `p.int` uses (sign, digits, range-checked).
 
 **Example**:
 ```ritz
@@ -2342,24 +2342,24 @@ import ritzlib.argspec
 
 fn run(p: ParsedArgs) -> i32
     var parsed = p
-    if parsed_switch(@parsed, "verbose")
+    if parsed.switch("verbose")
         prints("verbose\n")
-    let count: i64 = match parsed_int(@parsed, "count")
+    let count: i64 = match parsed.int("count")
         Ok(n) => n
         Err(e) => -1
     count as i32
 
 fn fail(spec: @ArgSpec, e: ArgError) -> i32
-    arg_error_print(spec, @e)
+    spec.error_print(@e)
     2
 
 fn main(argc: i32, argv: **u8) -> i32
     var all = args_from_argv(argc, argv)
     var spec = argspec_new("myprogram", "Description")
-    argspec_switch(@&spec, 'v', "verbose", "Enable verbose output")
-    argspec_option(@&spec, 'n', "count", "NUM", "Number of items", Some("10"))
-    argspec_positionals(@&spec, "FILE", "Input file(s)", 0, ARGS_UNLIMITED)
-    let status: i32 = match argspec_parse(@spec, args_tail(@all))
+    spec.switch('v', "verbose", "Enable verbose output")
+    spec.option('n', "count", "NUM", "Number of items", Some("10"))
+    spec.positionals("FILE", "Input file(s)", 0, ARGS_UNLIMITED)
+    let status: i32 = match spec.parse(args_tail(@all))
         Ok(p) => run(p)
         Err(e) => fail(@spec, e)
     status
@@ -2742,8 +2742,8 @@ import ritzlib.gvec
 
 fn vec_demo() -> i32
     var v: Vec<i32> = vec_new<i32>()
-    vec_push<i32>(@&v, 42)
-    let val: i32 = vec_get<i32>(@v, 0)
+    v.push(42)
+    let val: i32 = v.get(0)
     val
 ```
 

@@ -217,8 +217,9 @@ pub fn main() -> i32
 }
 
 # The deleted UFCS tables (R66, #3496/#3497): a free fn with a table prefix is
-# no longer a method. `vec_push_str` is ritzlib's, with no `impl<T> Vec<T>`
-# method, so the generic-prefix arm (`vec_<m>$T`) is pinned on a real Vec.
+# no longer a method.  The generic arm was `vec_<m>$T`, so a free `vec_frob`
+# beside a `Vec<u8>` receiver still is not `v.frob()`: AGAST #4537 moved the
+# last vec_* free fns into `impl<T> Vec<T>`, tables and all.
 REFUSED_TABLE = {
     # The non-generic table went by the type's name: String -> string_.
     "table_string_free_fn": (
@@ -241,11 +242,14 @@ pub fn main() -> i32
         """\
 import ritzlib.gvec
 
+fn vec_frob(v: @Vec<u8>) -> i64
+    v.len
+
 pub fn main() -> i32
     var v: Vec<u8> = vec_new<u8>()
-    v.^push_str(c"x")
+    v.^frob() as i32
 """,
-        no_method("push_str", "Vec$u8"),
+        no_method("frob", "Vec$u8"),
     ),
     # ritz1's lowercase `strview_<m>` fallback (#3240, folded into #3497).
     "table_strview_free_fn": (

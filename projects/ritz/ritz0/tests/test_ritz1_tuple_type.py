@@ -106,9 +106,9 @@ pub fn main() -> i32
     var b: Box<(u32, u32)> = Box<(u32, u32)> { v: mk(5) }
     let (p, q) = b.v
     var fns: Vec<(u32, u32)> = vec_new<(u32, u32)>()
-    vec_push<(u32, u32)>(@&fns, mk(10))
-    vec_push<(u32, u32)>(@&fns, mk(20))
-    let (s, l) = vec_get<(u32, u32)>(@fns, 1)
+    fns.push(mk(10))
+    fns.push(mk(20))
+    let (s, l) = fns.get(1)
     (p + q + s + l + fns.len as u32) as i32
 """
 
@@ -248,12 +248,12 @@ import ritzlib.gvec
 
 fn mk<T>(a: T) -> Vec<(T, i32)>
     var v: Vec<(T, i32)> = vec_new<(T, i32)>()
-    vec_push<(T, i32)>(@&v, (a, 2))
+    v.push((a, 2))
     v
 
 pub fn main() -> i32
     let v: Vec<(i64, i32)> = mk<i64>(4)
-    let (a, b) = vec_get<(i64, i32)>(@v, 0)
+    let (a, b) = v.get(0)
     a as i32 * 10 + b
 """
 
@@ -266,10 +266,10 @@ struct Map<K, V>
 
 impl<K, V> Map<K, V>
     fn put(self: @&Map<K, V>, k: K, v: V)
-        vec_push<(K, V)>(@&self.items, (k, v))
+        self.items.push((k, v))
 
     fn at(self: @Map<K, V>, i: i64) -> (K, V)
-        vec_get<(K, V)>(@self.items, i)
+        self.items.get(i)
 
 pub fn main() -> i32
     var m: Map<i32, i64> = Map<i32, i64> { items: vec_new<(i32, i64)>() }

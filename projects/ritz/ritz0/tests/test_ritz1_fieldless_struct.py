@@ -87,8 +87,8 @@ fn tagged(t: Tag<i32>) -> i32
 
 pub fn main() -> i32
     var v: Vec<Unit> = vec_new<Unit>()
-    vec_push<Unit>(@&v, make())
-    let u: Unit = relay(vec_get<Unit>(@v, 0))
+    v.push(make())
+    let u: Unit = relay(v.get(0))
     let a: After = After { x: 30 }
     return E.k() + take(u, 1) + sizeof(Unit) as i32 + a.x + tagged(Tag<i32> {}) + v.len as i32
 """

@@ -141,8 +141,8 @@ VECS = """\
     a.push(2)
     b.push(10)
     b.push(20)
-    vec_push<Vec<i32>>(@&v, a)
-    vec_push<Vec<i32>>(@&v, b)
+    v.push(a)
+    v.push(b)
 """
 # Element (1, 1) of `v`, read back without `[]`.  `a` and `b` are moved into
 # `v` (#2159), so read the buffer through the element `v[1]`, not through `b`.
@@ -276,7 +276,7 @@ pub fn main() -> i32
     v.push(10)
     v.push(20)
     var w: Vec<VP> = vec_new<VP>()
-    vec_push<VP>(@&w, @v)
+    w.push(@v)
 {body}"""
 PTRS_ROWS = {
     "read": ("    return w[0][1]\n", 20),

@@ -667,7 +667,7 @@ pub fn emit_str(s: *EmitterState, text: *u8)
     var i: i32 = 0
     while *(text + i) != 0
         i += 1
-    vec_push_bytes<u8>(s.out, Span<u8> { ptr: (text), len: (i as i64) as i64 })
+    s.out.push_span(Span<u8> { ptr: (text), len: (i as i64) as i64 })
 
 # `  ret ...` / `  ret\n`: the start of a `ret` instruction.
 fn emit_str_is_ret(text: *u8) -> i32
@@ -707,16 +707,16 @@ pub fn emit_name(s: *EmitterState, name_sv: StrView)
     while i < len and *(name + i) != '$'   # '$'
         i += 1
     if i >= len
-        vec_push_bytes<u8>(s.out, Span<u8> { ptr: (name), len: (len as i64) as i64 })
+        s.out.push_span(Span<u8> { ptr: (name), len: (len as i64) as i64 })
         return
     # Up to and including the first `$` as is; every later `$` is `_`.
-    vec_push_bytes<u8>(s.out, Span<u8> { ptr: (name), len: (i as i64 + 1) as i64 })
+    s.out.push_span(Span<u8> { ptr: (name), len: (i as i64 + 1) as i64 })
     for j in (i + 1)..len
         let c: u8 = *(name + j)
         if c == '$'
-            vec_push<u8>(s.out, 95)   # '_'
+            s.out.push(95)   # '_'
         else
-            vec_push<u8>(s.out, c)
+            s.out.push(c)
 
 # AGAST #3257: how many counted errors were printed WITHOUT a file:line:col,
 # out of s.error_count.  Since #3445 the emit_ir_error family is located, so
@@ -904,7 +904,7 @@ pub fn emit_int(s: *EmitterState, n: i64)
     var buf: [20]u8
     let len: i64 = fmt_i64_into(@buf[0], n)
     for i in 0..len
-        vec_push<u8>(s.out, buf[i])
+        s.out.push(buf[i])
 
 pub fn emit_reg(s: *EmitterState, reg: i32)
     # AGAST #4461: any use of a deferred load's register means the copy
@@ -1227,7 +1227,7 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
             s.out = saved
             let at: i64 = r.off + shift
             let old_len: i64 = s.out.len
-            vec_ensure_cap<u8>(s.out, old_len + line.len)
+            s.out.ensure_cap(old_len + line.len)
             memmove(s.out.data + at + line.len, s.out.data + at, old_len - at)
             memcpy(s.out.data + at, line.data, line.len)
             s.out.len = old_len + line.len
@@ -4074,11 +4074,11 @@ fn emit_typed_line(s: *EmitterState, line: *u8, ty: *u8)
     var start: i32 = 0
     while *(line + i) != 0
         if *(line + i) == '#'
-            vec_push_bytes<u8>(s.out, Span<u8> { ptr: (line + start), len: ((i - start) as i64) as i64 })
+            s.out.push_span(Span<u8> { ptr: (line + start), len: ((i - start) as i64) as i64 })
             emit_str(s, ty)
             start = i + 1
         i += 1
-    vec_push_bytes<u8>(s.out, Span<u8> { ptr: (line + start), len: ((i - start) as i64) as i64 })
+    s.out.push_span(Span<u8> { ptr: (line + start), len: ((i - start) as i64) as i64 })
     emit_str(s, IR_NL)
 
 # @__ritz_fmod / @__ritz_fmodf: C's fmod, exactly, at float type `ty`.  Float
@@ -5932,11 +5932,13 @@ pub fn ptr_levels_of(s: *EmitterState, x: *Expr, out_inner: *i32, out_name: **u8
         slot = x.int_val as i32
         name = x.ident_ptr
         name_len = x.ident_len
-    else if x.kind == EXPR_CALL
+    else if x.kind == EXPR_CALL or x.kind == EXPR_METHOD
         # AGAST #2544: `f()` with `f() -> **S`.  The FnDef names S with a
         # `ptr_` per level past two (monomorph's spelling, #2791); only a
         # struct S is recorded by name, so a `-> **u8` answers 0.
-        let fd: *FnDef = find_call_fn(s, x)
+        # AGAST #4537: `(*((w.as_ptr()) + 1)).b` roots the same `**S` at a
+        # method call, which call_fn_def dispatches as it does a call.
+        let fd: *FnDef = call_fn_def(s, x)
         if fd == null or fd.return_type != TYPE_PTR_PTR or fd.return_type_name == null
             return 0
         name = fd.return_type_name
@@ -5991,8 +5993,11 @@ pub fn ptr_arith_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i
 pub fn ptr_root_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
     var name: *u8 = null
     var name_len: i32 = 0
-    if x.kind == EXPR_CALL
-        return fn_ptr_return_pointee(s, find_call_fn(s, x), out_name, out_len)
+    # AGAST #4537: a method call returning `*T` is the same root as a call
+    # (`let e = v.as_ptr() + 1` after ritzlib's vec_as_ptr became a method).
+    # `call_fn_def` dispatches both the call and the method (AGAST #4060).
+    if x.kind == EXPR_CALL or x.kind == EXPR_METHOD
+        return fn_ptr_return_pointee(s, call_fn_def(s, x), out_name, out_len)
     else if x.kind == EXPR_IDENT
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
         if loc == null

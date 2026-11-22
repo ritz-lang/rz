@@ -518,8 +518,8 @@ class TestRitz1Compiler:
             "pub struct Holder\n    items: Vec<Item>\n    maybe: Option<i64>\n\n"
             "pub fn make() -> i64\n    var h: Holder\n"
             "    h.items = vec_new<Item>()\n"
-            "    vec_push<Item>(@h.items, Item { v: 4 })\n"
-            "    vec_len<Item>(@h.items)\n")
+            "    h.items.push(Item { v: 4 })\n"
+            "    h.items.len()\n")
         (d / "main.ritz").write_text(
             "import lib\n\nfn main() -> i32\n    (make() - 1) as i32\n")
         ll = tmp_path / "main.ll"

@@ -529,7 +529,12 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         return ty
 
     def _register_slice_instantiation(self, expr: rast.SliceExpr) -> None:
-        """Register vec_slice<T> instantiation for slice expressions on Vec types."""
+        """Want `Vec<T>.slice` / `Vec<T>.len` for slice expressions on Vecs.
+
+        AGAST #4537: the free `vec_slice` / `vec_len` are gone, so the emitter
+        resolves `v[lo..hi]` as the impl methods (`Vec$T.slice` and, when the
+        end is omitted, `Vec$T.len`).
+        """
         var_type = self._type_of(expr.expr)
         while isinstance(var_type, (rast.PtrType, rast.RefType)):
             var_type = var_type.inner
@@ -538,20 +543,15 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
 
         # Check if it's a Vec<T> type
         if var_type.name == 'Vec' and var_type.args:
-            # Need vec_slice<T> and vec_len<T>
-            type_args = var_type.args
-            for fn_name in ['vec_slice', 'vec_len']:
-                if fn_name in self.generic_functions:
-                    key = (fn_name, self._type_args_to_key(type_args))
-                    if key not in self.function_instantiations:
-                        mangled = mangle_generic_name(fn_name, type_args)
-                        self.function_instantiations[key] = mangled
+            self._want_method(var_type, 'slice')
+            self._want_method(var_type, 'len')
 
     def _register_index_instantiation(self, expr: rast.Index) -> None:
-        """Register vec_get<T> instantiation for Vec<T> indexing sugar.
+        """Want `Vec<T>.get` for Vec<T> indexing sugar.
 
-        `v[i]` on a Vec<T> desugars to `vec_get<T>(&v, i)` in the emitter — so
-        the monomorphizer needs to specialize vec_get<T> alongside the call.
+        AGAST #4537: `v[i]` on a Vec<T> now desugars to the impl method
+        `Vec$T.get` in the emitter, so the monomorphizer specialises that
+        method alongside the call (as it does any `v.get(i)`).
         """
         var_type = self._type_of(expr.expr)
         while isinstance(var_type, (rast.PtrType, rast.RefType)):
@@ -560,12 +560,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             return
 
         if var_type.name == 'Vec' and var_type.args:
-            type_args = var_type.args
-            if 'vec_get' in self.generic_functions:
-                key = ('vec_get', self._type_args_to_key(type_args))
-                if key not in self.function_instantiations:
-                    mangled = mangle_generic_name('vec_get', type_args)
-                    self.function_instantiations[key] = mangled
+            self._want_method(var_type, 'get')
 
     def _note_tuple_lit_let(self, stmt) -> None:
         """Track whether `stmt` binds its name to an untyped tuple literal."""

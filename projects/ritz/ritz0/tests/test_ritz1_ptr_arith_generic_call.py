@@ -1,6 +1,6 @@
-"""AGAST #2791: `vec_as_ptr<E>(@v) + i` strides by sizeof(E).
+"""AGAST #2791: `v.as_ptr() + i` strides by sizeof(E).
 
-ritz1 compiled `*(vec_as_ptr<*u8>(@v) + i)` to `add i64 %base, %i` with no
+ritz1 compiled `*(v.as_ptr() + i)` to `add i64 %base, %i` with no
 `mul`: monomorph left a `-> *T` at T = *u8 as a `*T` named "T", no stride
 lookup resolved "T", and ptr_arith_elem_size's 0 ("not a pointer") made the
 `+ i` a raw BYTE offset.  #2790's rzrz built execve's argv this way and got
@@ -36,16 +36,16 @@ POINTEES = {
 
 # How the element at index 2 is reached from the call.
 SHAPES = {
-    "add": ("", "(vec_as_ptr<{E}>(@v) + i)"),
-    "chain": ("", "(vec_as_ptr<{E}>(@v) + 3 - 1)"),
-    "let": ("    let p = vec_as_ptr<{E}>(@v)\n", "(p + i)"),
+    "add": ("", "(v.as_ptr() + i)"),
+    "chain": ("", "(v.as_ptr() + 3 - 1)"),
+    "let": ("    let p = v.as_ptr()\n", "(p + i)"),
 }
 
 
 def _program(pointee: str, shape: str) -> str:
     prelude, elem, values, read = POINTEES[pointee]
     pre, x = (part.replace("{E}", elem) for part in SHAPES[shape])
-    pushes = "".join(f"    vec_push<{elem}>(@&v, {val})\n" for val in values)
+    pushes = "".join(f"    v.push({val})\n" for val in values)
     return (
         for_header.GVEC + prelude
         + "pub fn main() -> i32\n"
@@ -57,8 +57,8 @@ def _program(pointee: str, shape: str) -> str:
     )
 
 
-# A `**u8` from a written `-> **u8` and from `vec_as_ptr<**u8>` (T = **u8,
-# a `***u8` return), each read through a let-inferred local and a bare call.
+# A `**u8` from a written `-> **u8` and from `v.as_ptr()` on a Vec<**u8>
+# (a `***u8` return), each read through a let-inferred local and a bare call.
 DEEPER = (
     for_header.GVEC
     + "fn f(p: **u8) -> **u8\n    return p\n\n"
@@ -67,11 +67,11 @@ DEEPER = (
     + "    let i: i64 = 2\n"
     + "    let pp = f(@a[0])\n"
     + "    var v: Vec<**u8> = vec_new<**u8>()\n"
-    + "    vec_push<**u8>(@&v, @a[0])\n    vec_push<**u8>(@&v, @a[1])\n    vec_push<**u8>(@&v, @a[2])\n"
-    + "    let q = vec_as_ptr<**u8>(@v)\n"
+    + "    v.push(@a[0])\n    v.push(@a[1])\n    v.push(@a[2])\n"
+    + "    let q = v.as_ptr()\n"
     + "    var t: i32 = *(*(pp + i)) as i32 - 48\n"
     + "    t = t + (**(*(q + i)) as i32 - 48) * 3\n"
-    + "    t = t + (**(*(vec_as_ptr<**u8>(@v) + 1)) as i32 - 48) * 30\n"
+    + "    t = t + (**(*(v.as_ptr() + 1)) as i32 - 48) * 30\n"
     + "    return t\n"
 )
 

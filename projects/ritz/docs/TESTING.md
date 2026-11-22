@@ -395,7 +395,7 @@ Rules:
    11 files #2806 converted went from 529 to 160 test-seconds.
 
    **A row can't borrow from its batch (AGAST #2867).**  A batch is one
-   module, so a generic instance (`vec_get$i32`) or an import one row's code
+   module, so a generic instance (`Vec$i32_get`) or an import one row's code
    brings in is there for every row: a row whose compiler never registers
    the instance it calls still links.  So a row that could lean (it lacks an
    import the batch has, or code it reaches from `__row<k>` mentions a `$`

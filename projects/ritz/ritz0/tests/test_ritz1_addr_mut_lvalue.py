@@ -7,7 +7,7 @@ handled only `EXPR_IDENT` resolving to a local. Every other operand failed with
 `@&s.field`, `@&p.field` through a pointer or `@&` param, `@&o.a.b` (nested),
 `@&arr[i]`, `@&arr[i].f`, and `@&g` for a module-level global. The OP_ADDR
 branch right above it already lowered all of these. ritzlib/argspec.ritz writes
-`vec_push<ArgFlag>(@&spec.flags, f)` seven times, so ritz1 could not compile it
+`spec.flags.push(f)` seven times, so ritz1 could not compile it
 (examples/tier2_stdlib/77_args).
 
 The fix routes `@` and `@&` through one lvalue-address helper so the two can't
@@ -65,7 +65,7 @@ struct S
     v: Vec<i64>
 
 fn add(s: @&S, x: i64)
-    vec_push<i64>(@&s.v, x)
+    s.v.push(x)
 
 pub fn main() -> i32
     var s: S
@@ -84,8 +84,8 @@ struct S
 pub fn main() -> i32
     var s: S
     s.v = vec_new<i64>()
-    vec_push<i64>(@&s.v, 5)
-    vec_push<i64>(@&s.v, 6)
+    s.v.push(5)
+    s.v.push(6)
     (s.v.len) as i32
 """, 2),
     "local_struct_field": (_BUMP + """\

@@ -35,6 +35,9 @@ fn pick<T>(a: T, b: T) -> T
 fn conv<T, U>(x: T) -> U
     conv<T, U>(x)
 
+fn stash<T>(v: @&Vec<T>, item: T) -> i32
+    0
+
 """
 L = FNS.count("\n") + 2  # the first line of a body below
 
@@ -52,8 +55,8 @@ REFUSED = {
                      f"{L + 2}:12", _msg("T", "pick")),
     # `@&Vec<T>` binds T to u8, the item to i32.
     "vec_and_item_disagree": ("    var v = vec_new<u8>()\n    let b: i32 = 2\n"
-                              "    vec_push(@&v, b)\n    return 0\n",
-                              f"{L + 2}:5", _msg("T", "vec_push")),
+                              "    stash(@&v, b)\n    return 0\n",
+                              f"{L + 2}:5", _msg("T", "stash")),
     # T binds; U is in the return type only.
     "second_param_unbound": ("    let a: i32 = 1\n    let b: i64 = conv(a)\n    return 0\n",
                              f"{L + 1}:18", _msg("U", "conv")),

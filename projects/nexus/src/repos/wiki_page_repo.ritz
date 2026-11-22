@@ -31,7 +31,7 @@
 import ritzlib.memory
 import ritzlib.strview { StrView }
 import ritzlib.string { String, string_from }
-import ritzlib.gvec { Vec, vec_new, vec_push, vec_len, vec_get, vec_get_ptr, vec_set, vec_drop }
+import ritzlib.gvec { Vec, vec_new }
 
 import spire.repo.mausoleum {
     Db,
@@ -547,11 +547,11 @@ fn list_scan_reset(user_data: *u8) -> i32
 
 fn list_scan_clear(pages: *Vec<WikiPage>)
     var i: i64 = 0
-    while i < vec_len<WikiPage>(@*pages)
-        let page: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, i)
+    while i < pages.len()
+        let page: *WikiPage = pages.get_ptr(i)
         wiki_page_drop(page)
         i += 1
-    vec_drop<WikiPage>(@&*pages)
+    pages.deinit()
     *pages = vec_new<WikiPage>()
 
 
@@ -559,8 +559,8 @@ fn list_scan_clear(pages: *Vec<WikiPage>)
 fn list_index_of(pages: *Vec<WikiPage>, page: *WikiPage) -> i64
     let want: StrView = (page.slug).as_view()
     var i: i64 = 0
-    while i < vec_len<WikiPage>(@*pages)
-        let other: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, i)
+    while i < pages.len()
+        let other: *WikiPage = pages.get_ptr(i)
         let have: StrView = (other.slug).as_view()
         if have.len() == want.len()
             var same: bool = true
@@ -582,12 +582,12 @@ fn list_keep(pages: *Vec<WikiPage>, page: WikiPage, newest: bool)
     var p: WikiPage = page
     let at: i64 = list_index_of(pages, @p)
     if at < 0
-        vec_push<WikiPage>(@&*pages, p)
+        pages.push(p)
         return
-    let other: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, at)
+    let other: *WikiPage = pages.get_ptr(at)
     if (p.id.value > other.id.value) == newest
         wiki_page_drop(other)
-        vec_set<WikiPage>(@&*pages, at, p)
+        pages.set(at, p)
     else
         pass
 
@@ -648,7 +648,7 @@ struct AdoptScan
 fn adopt_scan_reset(user_data: *u8) -> i32
     let scan: *AdoptScan = user_data as *AdoptScan
     list_scan_clear(@scan.pages)
-    vec_drop<i64>(@&scan.ids)
+    scan.ids.deinit()
     scan.ids = vec_new<i64>()
     0
 
@@ -657,7 +657,7 @@ fn adopt_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
     let scan: *AdoptScan = user_data as *AdoptScan
     match decode_stored(doc_id, data, len)
         Ok(page) =>
-            vec_push<i64>(@&scan.ids, doc_id)
+            scan.ids.push(doc_id)
             list_keep(@&scan.pages, page, true)
             0
         Err(_) =>
@@ -680,7 +680,7 @@ fn listed_id(pages: *Vec<WikiPage>, page: *WikiPage) -> i64
     let at: i64 = list_index_of(pages, page)
     if at < 0
         return -1
-    let other: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, at)
+    let other: *WikiPage = pages.get_ptr(at)
     other.id.value
 
 
@@ -692,16 +692,16 @@ fn legacy_scan(legacy: *Db, scan: *AdoptScan) -> i64
 
 # Copy `pages` into this repository's collection (steps 2 and 3). 0 = ok.
 fn adopt_pages(repo: *WikiPageRepository, pages: *Vec<WikiPage>) -> i64
-    let n: i64 = vec_len<WikiPage>(@*pages)
+    let n: i64 = pages.len()
     if n == 0
         return 0
     var copies: Vec<i64> = vec_new<i64>()
     var i: i64 = 0
     var rc: i64 = 0
     while i < n
-        let page: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, i)
+        let page: *WikiPage = pages.get_ptr(i)
         match insert_document(repo, page)
-            Ok(id) => vec_push<i64>(@&copies, id)
+            Ok(id) => copies.push(id)
             Err(_) =>
                 rc = -1
                 break
@@ -711,9 +711,9 @@ fn adopt_pages(repo: *WikiPageRepository, pages: *Vec<WikiPage>) -> i64
         oldest.pages = vec_new<WikiPage>()
         rc = doc_scan(repo, oldest_scan_step as *u8, list_scan_reset as *u8, @oldest as *u8)
         i = 0
-        while rc >= 0 and i < vec_len<i64>(@copies)
-            let page: *WikiPage = vec_get_ptr<WikiPage>(@&*pages, i)
-            let copy: i64 = vec_get<i64>(@copies, i)
+        while rc >= 0 and i < copies.len()
+            let page: *WikiPage = pages.get_ptr(i)
+            let copy: i64 = copies.get(i)
             if listed_id(@oldest.pages, page) != copy
                 doc_delete(repo, copy)    # a failure leaves a copy: harmless
             i += 1
@@ -737,8 +737,8 @@ fn adopt_default(repo: *WikiPageRepository) -> i64
     if rc >= 0
         rc = adopt_pages(repo, @scan.pages)
     var i: i64 = 0
-    while rc >= 0 and i < vec_len<i64>(@scan.ids)
-        if db_delete(@legacy, vec_get<i64>(@scan.ids, i)) < 0
+    while rc >= 0 and i < scan.ids.len()
+        if db_delete(@legacy, scan.ids.get(i)) < 0
             rc = -1
         i += 1
     list_scan_clear(@scan.pages)

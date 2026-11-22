@@ -8164,8 +8164,10 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                         struct_name = self._get_struct_name_from_type(vec_ptr.type.pointee)
                         if struct_name and struct_name.startswith("Vec$"):
                             elem_suffix = struct_name[4:]
-                            get_name = f"vec_get${elem_suffix}"
-                            if get_name in self.functions:
+                            # AGAST #4537: the free `vec_get` is gone; the
+                            # element read is the impl method `Vec$T.get`.
+                            get_name = self.method_lookup.get((f"Vec${elem_suffix}", 'get'))
+                            if get_name is not None and get_name in self.functions:
                                 vec_get_fn = self.functions[get_name][0]
 
         if iter_kind is None or elem_ty is None:
@@ -9329,10 +9331,13 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                             else:
                                 raise self._err("Vec type without element type")
 
-                        # Build vec_get call: vec_get$T(&v, i)
-                        fn_name = f"vec_get${elem_type_name}"
-                        if fn_name not in self.functions:
-                            raise self._err(f"Vec indexing requires {fn_name} to be defined")
+                        # AGAST #4537: the free `vec_get` is gone; resolve the
+                        # impl method the way every other method call does.
+                        fn_name = self.method_lookup.get((f"Vec${elem_type_name}", 'get'))
+                        if fn_name is None or fn_name not in self.functions:
+                            raise self._err("Vec indexing requires `impl Vec<T>` "
+                                            "with `get` to be defined "
+                                            "(import ritzlib.gvec)")
 
                         fn, _ = self.functions[fn_name]
                         # Get pointer to vec
@@ -9375,7 +9380,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 else:
                     elem_type_name = None
                 if elem_type_name:
-                    fn_name = f"vec_get${elem_type_name}"
+                    # AGAST #4537: the free `vec_get` is gone; the element read
+                    # is the impl method `Vec$T.get`, when monomorph specialized it.
+                    fn_name = self.method_lookup.get((f"Vec${elem_type_name}", 'get'))
                     try:
                         vec_ptr = self._emit_lvalue_addr(expr.expr)
                     except ValueError:
@@ -9388,7 +9395,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                             index = self.builder.sext(index, self.i64)
                         elif isinstance(index.type, ir.IntType) and index.type.width > 64:
                             index = self.builder.trunc(index, self.i64)
-                    if fn_name in self.functions:
+                    if fn_name is not None and fn_name in self.functions:
                         return self.builder.call(self.functions[fn_name][0], [vec_ptr, index])
                     # Fallback: index the `data` field (backing storage) directly.
                     data_field_idx = self._get_struct_field_index(f"Vec${elem_type_name}", 'data')
@@ -9680,9 +9687,12 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         else:
             raise self._err("Vec type without element type")
 
-        fn_name = f"vec_slice${elem_type_name}"
-        if fn_name not in self.functions:
-            raise self._err(f"Vec slicing requires {fn_name} to be defined")
+        # AGAST #4537: the free `vec_slice` / `vec_len` are gone; resolve the
+        # impl methods the way every other method call does.
+        fn_name = self.method_lookup.get((f"Vec${elem_type_name}", 'slice'))
+        if fn_name is None or fn_name not in self.functions:
+            raise self._err("Vec slicing requires `impl Vec<T>` with `slice` "
+                            "to be defined (import ritzlib.gvec)")
 
         fn, _ = self.functions[fn_name]
         vec_ptr = self._emit_lvalue_addr(expr.expr)
@@ -9701,10 +9711,11 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if end.type != self.i64:
                 end = self.builder.sext(end, self.i64)
         else:
-            # Get length via vec_len$T
-            len_fn_name = f"vec_len${elem_type_name}"
-            if len_fn_name not in self.functions:
-                raise self._err(f"Vec slicing requires {len_fn_name} to be defined")
+            # Get length via the impl method Vec$T.len
+            len_fn_name = self.method_lookup.get((f"Vec${elem_type_name}", 'len'))
+            if len_fn_name is None or len_fn_name not in self.functions:
+                raise self._err("Vec slicing requires `impl Vec<T>` with `len` "
+                                "to be defined (import ritzlib.gvec)")
             len_fn, _ = self.functions[len_fn_name]
             end = self.builder.call(len_fn, [vec_ptr])
 

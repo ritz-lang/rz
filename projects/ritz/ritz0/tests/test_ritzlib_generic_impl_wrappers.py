@@ -25,9 +25,13 @@ call's result (plain fn, or `vec_new<i32>()`) and a method's
 
 THE TESTS
 
-  * each impl holds exactly the methods listed here, each `pub`, each a
-    single `return <prefix>_<method><T>(...)` of its own free fn -- except
-    `push_bytes`, whose raw `(data, len)` form is the print-sink protocol.
+  * Option's impl holds exactly the methods listed here, each `pub`, each a
+    single `return option_<method><T>(...)` of its own free fn.
+  * Vec's impl holds its operations' bodies directly.  AGAST #4537 moved
+    every `vec_*` free fn into `impl<T> Vec<T>` and deleted it, so the
+    wrapper premise of #4231 is gone for Vec (as #4533 did for String):
+    each method is `pub`, takes `self`, and no `vec_*` twin remains.
+    `push_bytes` keeps the raw `(data, len)` print-sink protocol shape.
   * every wrapper's name, by method syntax, runs right on each compiler.
   * each receiver shape above, beside a `Vec<Res>` / `Option<Res>` whose
     `get` / `unwrap_or` would be refused, compiles and runs.
@@ -57,10 +61,25 @@ RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
 
 COMPILERS = ("ritz0", "ritz1", "ritz1_selfhosted")
 
+# Every operation `impl<T> Vec<T>` declares, each holding its body (AGAST
+# #4537).  A method and its old free-fn twin would be two spellings of one
+# API, so the twins are gone.
 VEC_METHODS = {
-    "len", "cap", "is_empty", "push", "pop", "get", "get_ptr", "set", "clear",
-    "first", "last", "as_ptr", "slice", "clone", "swap", "push_bytes",
+    "deinit", "valid", "len", "cap", "is_empty", "grow", "ensure_cap", "push",
+    "pop", "get", "get_ptr", "set", "clear", "first", "last", "as_ptr",
+    "slice", "clone", "push_bytes", "push_span", "push_str", "as_str", "swap",
+    "find_lines",
 }
+# The operations that were free fns at 60b73372, whose names the twin check
+# below looks for.  Two methods spell a differently named twin: the manual
+# release that was `vec_drop` (the Drop impl owns `drop`, #3614) and the Span
+# form of `vec_push_bytes`, which `push_bytes` keeps for the print sink.
+VEC_FREE_TWINS = {
+    "drop", "valid", "len", "cap", "is_empty", "grow", "ensure_cap", "push",
+    "pop", "get", "get_ptr", "set", "clear", "first", "last", "as_ptr",
+    "slice", "clone", "push_bytes", "push_str", "as_str", "swap", "find_lines",
+}
+VEC_TWIN_OF = {"deinit": "drop", "push_span": "push_bytes"}
 OPTION_METHODS = {"is_some", "is_none", "unwrap_or"}
 
 # Methods whose raw (data, len) shape is the print-sink protocol.
@@ -69,9 +88,8 @@ PROTOCOL_METHODS = {"push_bytes"}
 
 @pytest.mark.unit
 @pytest.mark.parametrize("path,type_name,prefix,want", [
-    ("gvec.ritz", "Vec", "vec", VEC_METHODS),
     ("option.ritz", "Option", "option", OPTION_METHODS),
-], ids=["Vec", "Option"])
+], ids=["Option"])
 def test_impl_wraps_each_free_fn(path, type_name, prefix, want):
     path = RITZLIB / path
     methods = _impl_methods(path, type_name)
@@ -93,6 +111,34 @@ def test_impl_wraps_each_free_fn(path, type_name, prefix, want):
         want_body = f"return {call}" if fn.ret_type is not None else call
         body = _body_text(path, fn)
         assert body == want_body, f"{type_name}.{name}: body {body!r}, want {want_body!r}"
+
+
+@pytest.mark.unit
+def test_impl_vec_holds_each_method():
+    """AGAST #4537: `impl<T> Vec<T>` owns the bodies, and the vec_* twins
+    (one free fn per operation at 60b73372) are gone from the file."""
+    path = RITZLIB / "gvec.ritz"
+    methods = _impl_methods(path, "Vec")
+    assert set(methods) == VEC_METHODS, (
+        f"impl<T> Vec<T>: missing {sorted(VEC_METHODS - set(methods))}, "
+        f"unexpected {sorted(set(methods) - VEC_METHODS)}")
+    for name, fn in sorted(methods.items()):
+        assert fn.is_pub, f"Vec.{name} must be `pub` (#3418)"
+        params = [p.name for p in fn.params]
+        assert params and params[0] == "self", f"Vec.{name} takes self"
+        if name in PROTOCOL_METHODS:
+            assert params == ["self", "data", "len"], (
+                f"Vec.{name}: params {params!r}, want the print-sink protocol")
+            continue
+        body = _body_text(path, fn)
+        twin = VEC_TWIN_OF.get(name, name)
+        if twin in VEC_FREE_TWINS:
+            assert not re.search(rf"\bvec_{re.escape(twin)}\s*(<[^<>]*>)?\s*\(", body), (
+                f"Vec.{name} forwards to vec_{twin}, not its own body: {body!r}")
+    src = path.read_text()
+    for name in sorted(VEC_FREE_TWINS):
+        assert re.search(rf"^pub fn vec_{re.escape(name)}\b", src, re.M) is None, (
+            f"vec_{name} is still a free fn beside Vec.{name} (AGAST #4537)")
 
 
 # A move-only type: `Vec<Res>.get` / `Option<Res>.unwrap_or` move a Res out of

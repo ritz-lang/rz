@@ -550,7 +550,7 @@ fn main() -> i32
 whose method `push_bytes(data: *u8, len: i64)` resolves statically, exactly
 as `sink.push_bytes(data, len)` would (§12.2). `String`, `GrowBuf` and
 `Vec<u8>` provide it (`String.push_bytes`, `GrowBuf.push_bytes`,
-`vec_push_bytes`), and any type can by implementing it:
+`Vec<u8>.push_bytes`), and any type can by implementing it:
 
 ```ritz
 struct Count
@@ -1085,7 +1085,7 @@ fn main() -> i32
 `a[lo..hi]` slices a `Vec`, `Span` or `String`: elements `lo` up to but not
 including `hi`, and `a[lo..=hi]` includes `hi`. A slice of a `Span` is a `Span`
 over the same elements, so a write through it lands in `a`. A slice of a `Vec` or
-`String` is a new `Vec` or `String`, a copy (`vec_slice`, `String.slice`), unless a
+`String` is a new `Vec` or `String`, a copy (`Vec.slice`, `String.slice`), unless a
 `Span` is expected, where it is a view like a `Span`'s: a `Span<T>` (or `[T]`)
 `let`, return value, argument, or variant payload (`Some(v[0..1])` into an
 `Option<[T]>`).
@@ -1657,7 +1657,7 @@ argument's type, structurally: `T`, `@T`, `@&T`, `*T`, `Vec<T>`, `@Vec<T>`, and
 so on. An explicit `f<T>(...)` still works and wins. An integer literal argument
 to a bare `T` parameter binds `T` to the literal's default type, `i64` (as
 `let x = 3` would), unless another argument binds `T`. Then the literal takes
-that type, so `vec_push(@&v, 42)` on a `Vec<i32>` is `vec_push<i32>`:
+that type, so `put(@&v, 42)` on a `Vec<i32>` is `put<i32>`:
 
 ```ritz
 import ritzlib.gvec
@@ -1665,11 +1665,15 @@ import ritzlib.gvec
 fn twice<T>(x: T) -> T
     x
 
+fn put<T>(v: @&Vec<T>, x: T) -> i32
+    v.push(x)
+    return 0
+
 fn main() -> i32
     var v = vec_new<i32>()     # nothing binds T here: it is spelled out
-    vec_push(@&v, 42)          # T = i32, from `@&Vec<T>`
-    let first = vec_get(@v, 0)
-    let p = vec_as_ptr(@v)     # *i32
+    put(@&v, 42)               # T = i32, from `@&Vec<T>`
+    let first = v.get(0)
+    let p = v.as_ptr()         # *i32
     let n = twice(3)           # T = i64
     first + p[0] + n as i32 - 87
 ```
@@ -3348,7 +3352,7 @@ fn main() -> i32
     v[1] = 7
     v[1] += 2
     var rows: Vec<Vec<i32>> = vec_new<Vec<i32>>()
-    vec_push<Vec<i32>>(@&rows, v)
+    rows.push(v)
     rows[0][0] = 1
     let p: @&Vec<Vec<i32>> = @&rows
     p[0][1] += 1
@@ -5001,8 +5005,8 @@ to heap memory. Only `Drop` makes it move-only.
 
 `String` and `Vec<T>` own heap buffers and implement `Drop` (§13.6, AGAST
 #2159), so they are move-only: the compiler frees the buffer when the owning
-binding's scope ends (§13.6). Don't call `s.deinit()` or `vec_drop` on an
-owning binding; `String.deinit` and `vec_drop` remain for a `String` or
+binding's scope ends (§13.6). Don't call `s.deinit()` or `v.deinit()` on an
+owning binding; `String.deinit` and `Vec.deinit` remain for a `String` or
 `Vec<T>` held in raw memory and reached through a pointer:
 
 ```ritz

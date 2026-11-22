@@ -54,7 +54,7 @@ PROGRAMS = {
     + """\
 pub fn main() -> i32
     var v: Vec<*u8> = vec_new<*u8>()
-    vec_push<*u8>(@&v, c"x")
+    v.push(c"x")
     return v.len as i32
 """,
     # Vec<u64> push / get / len round-trip.
@@ -62,9 +62,9 @@ pub fn main() -> i32
     + """\
 pub fn main() -> i32
     var v: Vec<u64> = vec_new<u64>()
-    vec_push<u64>(@&v, 40)
-    vec_push<u64>(@&v, 2)
-    let s: u64 = vec_get<u64>(@v, 0) + vec_get<u64>(@v, 1)
+    v.push(40)
+    v.push(2)
+    let s: u64 = v.get(0) + v.get(1)
     return (s + v.len as u64) as i32
 """,
     # Pointer to a user struct: `ptr_` + the struct name.
@@ -79,9 +79,9 @@ pub fn main() -> i32
     var b: Cell
     b.x = 33
     var v: Vec<*Cell> = vec_new<*Cell>()
-    vec_push<*Cell>(@&v, @a)
-    vec_push<*Cell>(@&v, @b)
-    let p: *Cell = vec_get<*Cell>(@v, 1)
+    v.push(@a)
+    v.push(@b)
+    let p: *Cell = v.get(1)
     return (p.x + v.len) as i32
 """,
     # A generic annotation inside a struct field (44_csv's shape).
@@ -95,9 +95,9 @@ pub fn main() -> i32
     var r: Row
     r.cells = vec_new<*u8>()
     r.n = 5
-    vec_push<*u8>(@&r.cells, c"ab")
-    vec_push<*u8>(@&r.cells, c"cd")
-    let s: *u8 = vec_get<*u8>(@r.cells, 1)
+    r.cells.push(c"ab")
+    r.cells.push(c"cd")
+    let s: *u8 = r.cells.get(1)
     return (*s as i64 + r.cells.len + r.n) as i32
 """,
     # AGAST #1796: `Vec<T>.data` at T = *u8 is `**u8`.  It was cloned as
@@ -108,15 +108,15 @@ pub fn main() -> i32
     var v = vec_new<*u8>()
     let a: *u8 = c"a"
     let b: *u8 = c"bc"
-    vec_push<*u8>(@&v, a)
-    vec_push<*u8>(@&v, b)
-    vec_push<*u8>(@&v, c"d")
-    if vec_get<*u8>(@v, 1) != b
+    v.push(a)
+    v.push(b)
+    v.push(c"d")
+    if v.get(1) != b
         return 1
-    let top: *u8 = vec_pop<*u8>(@&v)
-    if vec_get<*u8>(@v, 0) != a
+    let top: *u8 = v.pop()
+    if v.get(0) != a
         return 2
-    return (*top as i64 - 100 + *(vec_get<*u8>(@v, 1) + 1) as i64 - 99 + v.len * 10) as i32
+    return (*top as i64 - 100 + *(v.get(1) + 1) as i64 - 99 + v.len * 10) as i32
 """,
     # Same, for a pointer to a struct (`**Cell` element).
     "vec_ptr_struct_get_set": HEADER
@@ -130,11 +130,11 @@ pub fn main() -> i32
     var b: Cell
     b.x = 30
     var v: Vec<*Cell> = vec_new<*Cell>()
-    vec_push<*Cell>(@&v, @a)
-    vec_push<*Cell>(@&v, @a)
-    vec_set<*Cell>(@&v, 1, @b)
-    let p: *Cell = vec_get<*Cell>(@v, 0)
-    let q: *Cell = vec_get<*Cell>(@v, 1)
+    v.push(@a)
+    v.push(@a)
+    v.set(1, @b)
+    let p: *Cell = v.get(0)
+    let q: *Cell = v.get(1)
     return (p.x + q.x + v.len * 100) as i32
 """,
     # A pointer argument to a generic fn parameter / return type.
@@ -143,18 +143,18 @@ pub fn main() -> i32
 fn total(v: *Vec<u64>) -> u64
     var s: u64 = 0
     for i in 0..v.len
-        s = s + vec_get<u64>(v, i)
+        s = s + v.get(i)
     return s
 
 fn make() -> Vec<*u8>
     var v: Vec<*u8> = vec_new<*u8>()
-    vec_push<*u8>(@&v, c"z")
+    v.push(c"z")
     return v
 
 pub fn main() -> i32
     var v: Vec<u64> = vec_new<u64>()
-    vec_push<u64>(@&v, 30)
-    vec_push<u64>(@&v, 12)
+    v.push(30)
+    v.push(12)
     let w: Vec<*u8> = make()
     return (total(@v) + w.len as u64) as i32
 """,

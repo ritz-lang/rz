@@ -6,21 +6,21 @@
 #
 #     var all = args_from_argv(argc, argv)
 #     var spec = argspec_new("demo", "Does a demo")
-#     argspec_switch(@&spec, 'v', "verbose", "Say more")
-#     argspec_option(@&spec, 'n', "count", "NUM", "How many", Some("10"))
-#     argspec_positionals(@&spec, "FILE", "Input files", 0, ARGS_UNLIMITED)
-#     match argspec_parse(@spec, args_tail(@all))   # Span<StrView>
+#     spec.switch('v', "verbose", "Say more")
+#     spec.option('n', "count", "NUM", "How many", Some("10"))
+#     spec.positionals("FILE", "Input files", 0, ARGS_UNLIMITED)
+#     match spec.parse(args_tail(@all))   # Span<StrView>
 #         Ok(p) => run(p)
-#         Err(e) => fail(@spec, e)
+#         Err(e) => spec.error_print(@e)
 #
-# and inside `run`: parsed_switch(@p, "verbose") -> bool,
-# parsed_value(@p, "n") -> Option<StrView>, parsed_int(@p, "count") ->
-# Result<i64, ArgError>, parsed_positional(@p, 0) -> Option<StrView>.
+# and inside `run`: p.switch("verbose") -> bool,
+# p.value("n") -> Option<StrView>, p.int("count") ->
+# Result<i64, ArgError>, p.positional(0) -> Option<StrView>.
 # A name matches an option's long name, or its short name if it is one byte.
 #
 # Nothing is copied: every StrView handed back points into argv (or into the
 # literals the spec was built from), so it lives as long as they do.  Release
-# storage with parsed_drop / argspec_drop.  examples/tier2_stdlib/77_args
+# storage with ParsedArgs.deinit / ArgSpec.deinit.  examples/tier2_stdlib/77_args
 # calls every public function here.
 #
 # ritz1 compiles this module: 77_args and the tier2 examples ported to it in
@@ -39,7 +39,7 @@ import ritzlib.strview
 import ritzlib.span
 import ritzlib.gvec
 
-# Pass as `max` to argspec_positionals for "no upper bound".
+# Pass as `max` to ArgSpec.positionals for "no upper bound".
 pub const ARGS_UNLIMITED: i64 = -1
 
 # ============================================================================
@@ -47,12 +47,12 @@ pub const ARGS_UNLIMITED: i64 = -1
 # ============================================================================
 
 # Every argv entry, argv[0] included, as a StrView over argv's own bytes.
-# Nothing is copied; vec_drop<StrView> releases the vector only.
+# Nothing is copied; Vec<StrView>.deinit releases the vector only.
 pub fn args_from_argv(argc: i32, argv: **u8) -> Vec<StrView>
     var all = vec_new<StrView>()
     var i: i32 = 0
     while i < argc
-        vec_push<StrView>(@&all, strview_from_cstr(*(argv + i)))
+        all.push(strview_from_cstr(*(argv + i)))
         i += 1
     all
 
@@ -72,7 +72,7 @@ pub fn args_get(args: @Span<StrView>, i: i64) -> Option<StrView>
 # The spec
 # ============================================================================
 
-# One option.  Build these with argspec_switch / argspec_option.
+# One option.  Build these with ArgSpec.switch / ArgSpec.option.
 pub struct ArgFlag
     short: u8               # 0 when the option has no short form
     long: StrView           # empty when the option has no long form
@@ -103,30 +103,39 @@ fn argflag_new(short: u8, long: StrView, value_name: StrView, help: StrView, tak
     let f = ArgFlag { short: short, long: long, value_name: value_name, help: help, takes_value: takes_value, has_default: has_default, default: default }
     f
 
-# A boolean option.  Pass short = 0 or long = "" to omit that form.
-pub fn argspec_switch(spec: @&ArgSpec, short: u8, long: StrView, help: StrView)
-    let f = argflag_new(short, long, strview_empty(), help, false, false, strview_empty())
-    vec_push<ArgFlag>(@&spec.flags, f)
+impl ArgSpec
+    # A boolean option.  Pass short = 0 or long = "" to omit that form.
+    pub fn switch(self: @&ArgSpec, short: u8, long: StrView, help: StrView)
+        let f = argflag_new(short, long, strview_empty(), help, false, false, strview_empty())
+        self.flags.push(f)
 
-# An option that takes a value, with an optional default.
-pub fn argspec_option(spec: @&ArgSpec, short: u8, long: StrView, value_name: StrView, help: StrView, default: Option<StrView>)
-    let has_default: bool = option_is_some<StrView>(@default)
-    let value: StrView = option_unwrap_or<StrView>(@default, strview_empty())
-    let f = argflag_new(short, long, value_name, help, true, has_default, value)
-    vec_push<ArgFlag>(@&spec.flags, f)
+    # An option that takes a value, with an optional default.
+    pub fn option(self: @&ArgSpec, short: u8, long: StrView, value_name: StrView, help: StrView, default: Option<StrView>)
+        let has_default: bool = option_is_some<StrView>(@default)
+        let value: StrView = option_unwrap_or<StrView>(@default, strview_empty())
+        let f = argflag_new(short, long, value_name, help, true, has_default, value)
+        self.flags.push(f)
 
-# Accept between min and max positional arguments (max = ARGS_UNLIMITED for
-# no bound).  Without this call the program accepts none.
-pub fn argspec_positionals(spec: @&ArgSpec, name: StrView, help: StrView, min: i64, max: i64)
-    spec.pos_name = name
-    spec.pos_help = help
-    spec.pos_min = min
-    spec.pos_max = max
+    # Accept between min and max positional arguments (max = ARGS_UNLIMITED
+    # for no bound).  Without this call the program accepts none.
+    pub fn positionals(self: @&ArgSpec, name: StrView, help: StrView, min: i64, max: i64)
+        self.pos_name = name
+        self.pos_help = help
+        self.pos_min = min
+        self.pos_max = max
 
-# The compiler frees the Vec fields at scope end (AGAST #2159); this leaves
-# the spec empty, and is safe to call on any spec.
-pub fn argspec_drop(spec: @&ArgSpec)
-    spec.flags.len = 0
+    # The compiler frees the Vec fields at scope end (AGAST #2159); this leaves
+    # the spec empty, and is safe to call on any spec.  Not named `drop`:
+    # ritz0 treats `drop` as the RAII hook (#4445).
+    pub fn deinit(self: @&ArgSpec)
+        self.flags.len = 0
+
+    # Index of the option called `name` (see find_index), or None.
+    pub fn find(self: @ArgSpec, name: StrView) -> Option<i64>
+        let idx = find_index(self, name)
+        if idx < 0
+            return None
+        Some(idx)
 
 # Internal helpers take a StrView by value: it's Copy, so a name that is
 # looked up and then reported is still usable (#2414; #1489 once made it
@@ -136,7 +145,7 @@ fn find_long(spec: @ArgSpec, name: StrView) -> i64
         return -1
     var i: i64 = 0
     while i < spec.flags.len
-        let f = vec_get<ArgFlag>(@spec.flags, i)
+        let f = spec.flags.get(i)
         if (f.long).eq(name)
             return i
         i += 1
@@ -147,7 +156,7 @@ fn find_short(spec: @ArgSpec, c: u8) -> i64
         return -1
     var i: i64 = 0
     while i < spec.flags.len
-        let f = vec_get<ArgFlag>(@spec.flags, i)
+        let f = spec.flags.get(i)
         if f.short == c
             return i
         i += 1
@@ -162,15 +171,8 @@ fn find_index(spec: @ArgSpec, name: StrView) -> i64
         return find_short(spec, name.get(0))
     -1
 
-# Index of the option called `name` (see find_index), or None.
-pub fn argspec_find(spec: @ArgSpec, name: StrView) -> Option<i64>
-    let idx = find_index(spec, name)
-    if idx < 0
-        return None
-    Some(idx)
-
 fn flag_takes_value(spec: @ArgSpec, idx: i64) -> bool
-    let f = vec_get<ArgFlag>(@spec.flags, idx)
+    let f = spec.flags.get(idx)
     f.takes_value
 
 # ============================================================================
@@ -207,29 +209,6 @@ fn arg_error_opt(kind: ArgErrorKind, text: StrView, dashes: StrView) -> ArgError
     let e = ArgError { kind: kind, text: text, limit: 0, dashes: dashes }
     e
 
-# Report an error the conventional way: "<program>: <message>" on stderr.
-pub fn arg_error_print(spec: @ArgSpec, e: @ArgError)
-    # Annotated: ritz1 gives an un-annotated `let` of a StrView field read
-    # through a reference an i64 slot.
-    let prog: StrView = spec.program
-    let text: StrView = e.text
-    let dashes: StrView = e.dashes
-    let k = e.kind
-    if k == ArgErrorKind.UnknownOption
-        eprint("{prog}: unknown option '{dashes}{text}'\n")
-    else if k == ArgErrorKind.MissingValue
-        eprint("{prog}: option '{dashes}{text}' requires a value\n")
-    else if k == ArgErrorKind.UnexpectedValue
-        eprint("{prog}: option '{dashes}{text}' doesn't accept a value\n")
-    else if k == ArgErrorKind.MissingPositional
-        eprint("{prog}: missing required argument '{text}'\n")
-    else if k == ArgErrorKind.TooManyPositionals
-        eprint("{prog}: too many arguments (at most {e.limit}): unexpected '{text}'\n")
-    else if k == ArgErrorKind.NotANumber
-        eprint("{prog}: invalid number '{text}'\n")
-    else
-        eprint("{prog}: option '{dashes}{text}' has no value\n")
-
 # ============================================================================
 # Parsing
 # ============================================================================
@@ -239,7 +218,7 @@ pub struct ArgSlot
     present: bool
     value: StrView          # empty for a switch
 
-# The outcome of a successful argspec_parse.  Borrows the spec (a raw
+# The outcome of a successful ArgSpec.parse.  Borrows the spec (a raw
 # pointer, so the compiler doesn't drop the caller's flags), so the spec must
 # outlive it; its own Vecs are freed at scope end.
 pub struct ParsedArgs
@@ -255,14 +234,14 @@ fn parsed_new(spec: @ArgSpec) -> ParsedArgs
     var slots = vec_new<ArgSlot>()
     var i: i64 = 0
     while i < spec.flags.len
-        vec_push<ArgSlot>(@&slots, argslot_new(false, strview_empty()))
+        slots.push(argslot_new(false, strview_empty()))
         i += 1
     let positionals = vec_new<StrView>()
     let p = ParsedArgs { spec: spec, slots: slots, positionals: positionals }
     p
 
 fn record(p: @&ParsedArgs, idx: i64, value: StrView)
-    vec_set<ArgSlot>(@&p.slots, idx, argslot_new(true, value))
+    p.slots.set(idx, argslot_new(true, value))
 
 # `--name` or `--name=value` at args[i]; `--name VALUE` also reads args[i+1]
 # (the caller skips it — see long_takes_next).  Some(error) on failure.
@@ -348,7 +327,7 @@ fn parse_into(spec: @ArgSpec, args: Span<StrView>, p: @&ParsedArgs) -> Option<Ar
     while i < args.len
         let arg = args.get(i)
         if only_positionals or is_option(arg) == false
-            vec_push<StrView>(@&p.positionals, arg)
+            p.positionals.push(arg)
             i += 1
         else if is_double_dash(arg)
             only_positionals = true
@@ -372,34 +351,82 @@ fn parse_into(spec: @ArgSpec, args: Span<StrView>, p: @&ParsedArgs) -> Option<Ar
     if n < spec.pos_min
         return Some(arg_error(ArgErrorKind.MissingPositional, spec.pos_name, spec.pos_min))
     if spec.pos_max >= 0 and n > spec.pos_max
-        let extra = vec_get<StrView>(@p.positionals, spec.pos_max)
+        let extra = p.positionals.get(spec.pos_max)
         return Some(arg_error(ArgErrorKind.TooManyPositionals, extra, spec.pos_max))
     None
 
 fn parse_failed(p: @&ParsedArgs, e: ArgError) -> Result<ParsedArgs, ArgError>
-    parsed_drop(p)
+    p.deinit()
     Err(e)
 
-# Parse `args` (the arguments only — see args_tail) against `spec`.
-pub fn argspec_parse(spec: @ArgSpec, args: Span<StrView>) -> Result<ParsedArgs, ArgError>
-    var p = parsed_new(spec)
-    let failed = parse_into(spec, args, @&p)
-    if option_is_some<ArgError>(@failed)
-        return parse_failed(@&p, option_unwrap_or<ArgError>(@failed, arg_error(ArgErrorKind.NotSet, strview_empty(), 0)))
-    Ok(p)
+impl ArgSpec
+    # Report an error the conventional way: "<program>: <message>" on stderr.
+    pub fn error_print(self: @ArgSpec, e: @ArgError)
+        # Annotated: ritz1 gives an un-annotated `let` of a StrView field read
+        # through a reference an i64 slot.
+        let prog: StrView = self.program
+        let text: StrView = e.text
+        let dashes: StrView = e.dashes
+        let k = e.kind
+        if k == ArgErrorKind.UnknownOption
+            eprint("{prog}: unknown option '{dashes}{text}'\n")
+        else if k == ArgErrorKind.MissingValue
+            eprint("{prog}: option '{dashes}{text}' requires a value\n")
+        else if k == ArgErrorKind.UnexpectedValue
+            eprint("{prog}: option '{dashes}{text}' doesn't accept a value\n")
+        else if k == ArgErrorKind.MissingPositional
+            eprint("{prog}: missing required argument '{text}'\n")
+        else if k == ArgErrorKind.TooManyPositionals
+            eprint("{prog}: too many arguments (at most {e.limit}): unexpected '{text}'\n")
+        else if k == ArgErrorKind.NotANumber
+            eprint("{prog}: invalid number '{text}'\n")
+        else
+            eprint("{prog}: option '{dashes}{text}' has no value\n")
+
+    # Parse `args` (the arguments only — see args_tail) against this spec.
+    pub fn parse(self: @ArgSpec, args: Span<StrView>) -> Result<ParsedArgs, ArgError>
+        var p = parsed_new(self)
+        let failed = parse_into(self, args, @&p)
+        if option_is_some<ArgError>(@failed)
+            return parse_failed(@&p, option_unwrap_or<ArgError>(@failed, arg_error(ArgErrorKind.NotSet, strview_empty(), 0)))
+        Ok(p)
+
+    # Usage line, description, options and arguments, on stdout.
+    pub fn print_help(self: @ArgSpec)
+        print("Usage: {self.program}")
+        if self.flags.len > 0
+            print(" [OPTIONS]")
+        if self.pos_name.len > 0 and self.pos_min == 0
+            print(" [{self.pos_name}]")
+        else if self.pos_name.len > 0
+            print(" {self.pos_name}")
+        if self.pos_name.len > 0 and (self.pos_max < 0 or self.pos_max > 1)
+            print("...")
+        print("\n")
+        if self.about.len > 0
+            print("\n{self.about}\n")
+        if self.flags.len > 0
+            print("\nOptions:\n")
+            var i: i64 = 0
+            while i < self.flags.len
+                let f = self.flags.get(i)
+                print_flag_help(@f)
+                i += 1
+        if self.pos_name.len > 0
+            print("\nArguments:\n  {self.pos_name}\n        {self.pos_help}\n")
 
 # ============================================================================
 # Reading the result
 # ============================================================================
 
 fn slot_at(p: @ParsedArgs, idx: i64) -> ArgSlot
-    vec_get<ArgSlot>(@p.slots, idx)
+    p.slots.get(idx)
 
 # The value for option `idx` (-1 = unknown): given, else default, else None.
 fn value_at(p: @ParsedArgs, idx: i64) -> Option<StrView>
     if idx < 0
         return None
-    let f = vec_get<ArgFlag>(@p.spec.flags, idx)
+    let f = p.spec.flags.get(idx)
     if f.takes_value == false
         return None
     let s = slot_at(p, idx)
@@ -409,28 +436,52 @@ fn value_at(p: @ParsedArgs, idx: i64) -> Option<StrView>
         return Some(f.default)
     None
 
-# Was the option given at all (switch or value)?
-pub fn parsed_is_set(p: @ParsedArgs, name: StrView) -> bool
-    let idx = find_index(@*p.spec, name)
-    if idx < 0
-        return false
-    let s = slot_at(p, idx)
-    s.present
+impl ParsedArgs
+    # Was the option given at all (switch or value)?
+    pub fn is_set(self: @ParsedArgs, name: StrView) -> bool
+        let idx = find_index(@*self.spec, name)
+        if idx < 0
+            return false
+        let s = slot_at(self, idx)
+        s.present
 
-# Was the switch given?  False for unknown names and for value options.
-pub fn parsed_switch(p: @ParsedArgs, name: StrView) -> bool
-    let idx = find_index(@*p.spec, name)
-    if idx < 0
-        return false
-    if flag_takes_value(@*p.spec, idx)
-        return false
-    let s = slot_at(p, idx)
-    s.present
+    # Was the switch given?  False for unknown names and for value options.
+    pub fn switch(self: @ParsedArgs, name: StrView) -> bool
+        let idx = find_index(@*self.spec, name)
+        if idx < 0
+            return false
+        if flag_takes_value(@*self.spec, idx)
+            return false
+        let s = slot_at(self, idx)
+        s.present
 
-# The option's value: what was given, else its default, else None.
-# None for unknown names and for switches.
-pub fn parsed_value(p: @ParsedArgs, name: StrView) -> Option<StrView>
-    value_at(p, find_index(@*p.spec, name))
+    # The option's value: what was given, else its default, else None.
+    # None for unknown names and for switches.
+    pub fn value(self: @ParsedArgs, name: StrView) -> Option<StrView>
+        value_at(self, find_index(@*self.spec, name))
+
+    # The option's value (see ParsedArgs.value) as a decimal i64.
+    # Err(NotSet) when there is no value, Err(NotANumber) when it isn't one.
+    pub fn int(self: @ParsedArgs, name: StrView) -> Result<i64, ArgError>
+        let v = value_at(self, find_index(@*self.spec, name))
+        if not option_is_some<StrView>(@v)
+            return Err(arg_error_opt(ArgErrorKind.NotSet, name, lookup_dashes(@*self.spec, name)))
+        arg_parse_i64(option_unwrap_or<StrView>(@v, strview_empty()))
+
+    # All positional arguments, in order, as a slice borrowed from `p`.
+    pub fn positionals(self: @ParsedArgs) -> Span<StrView>
+        span_from_vec<StrView>(@self.positionals)
+
+    # The i-th positional argument, or None.
+    pub fn positional(self: @ParsedArgs, i: i64) -> Option<StrView>
+        let all = self.positionals()
+        args_get(@all, i)
+
+    # As ArgSpec.deinit: the compiler frees slots and positionals at scope
+    # end; this leaves the result empty.  Not named `drop` (#4445).
+    pub fn deinit(self: @&ParsedArgs)
+        self.slots.len = 0
+        self.positionals.len = 0
 
 # The dashes of the spec option `name` resolves to (see find_index): "-"
 # for a one-byte name that is not a long name (a short option), else "--".
@@ -439,29 +490,6 @@ fn lookup_dashes(spec: @ArgSpec, name: StrView) -> StrView
         if find_long(spec, name) < 0
             return "-"
     "--"
-
-# The option's value (see parsed_value) as a decimal i64.
-# Err(NotSet) when there is no value, Err(NotANumber) when it isn't one.
-pub fn parsed_int(p: @ParsedArgs, name: StrView) -> Result<i64, ArgError>
-    let v = value_at(p, find_index(@*p.spec, name))
-    if not option_is_some<StrView>(@v)
-        return Err(arg_error_opt(ArgErrorKind.NotSet, name, lookup_dashes(@*p.spec, name)))
-    arg_parse_i64(option_unwrap_or<StrView>(@v, strview_empty()))
-
-# All positional arguments, in order, as a slice borrowed from `p`.
-pub fn parsed_positionals(p: @ParsedArgs) -> Span<StrView>
-    span_from_vec<StrView>(@p.positionals)
-
-# The i-th positional argument, or None.
-pub fn parsed_positional(p: @ParsedArgs, i: i64) -> Option<StrView>
-    let all = parsed_positionals(p)
-    args_get(@all, i)
-
-# As argspec_drop: the compiler frees slots and positionals at scope end;
-# this leaves the result empty.
-pub fn parsed_drop(p: @&ParsedArgs)
-    p.slots.len = 0
-    p.positionals.len = 0
 
 # ============================================================================
 # Numbers
@@ -499,27 +527,3 @@ fn print_flag_help(f: @ArgFlag)
         print("\n        {f.help} (default: {f.default})\n")
     else
         print("\n        {f.help}\n")
-
-# Usage line, description, options and arguments, on stdout.
-pub fn argspec_print_help(spec: @ArgSpec)
-    print("Usage: {spec.program}")
-    if spec.flags.len > 0
-        print(" [OPTIONS]")
-    if spec.pos_name.len > 0 and spec.pos_min == 0
-        print(" [{spec.pos_name}]")
-    else if spec.pos_name.len > 0
-        print(" {spec.pos_name}")
-    if spec.pos_name.len > 0 and (spec.pos_max < 0 or spec.pos_max > 1)
-        print("...")
-    print("\n")
-    if spec.about.len > 0
-        print("\n{spec.about}\n")
-    if spec.flags.len > 0
-        print("\nOptions:\n")
-        var i: i64 = 0
-        while i < spec.flags.len
-            let f = vec_get<ArgFlag>(@spec.flags, i)
-            print_flag_help(@f)
-            i += 1
-    if spec.pos_name.len > 0
-        print("\nArguments:\n  {spec.pos_name}\n        {spec.pos_help}\n")

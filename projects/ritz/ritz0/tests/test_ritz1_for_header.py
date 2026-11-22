@@ -194,7 +194,7 @@ def _alloc_v(values=SEED, name: str = "p") -> str:
     """Allocate `gp`'s Vec in main and fill it with `values`."""
     return (f"    let {name}: *Vec<i32> = malloc(sizeof(Vec<i32>)) as *Vec<i32>\n"
             f"    *{name} = vec_new<i32>()\n"
-            + "".join(f"    vec_push<i32>(@&*{name}, {v})\n" for v in values)
+            + "".join(f"    {name}.push({v})\n" for v in values)
             + f"    gp = {name}\n")
 
 
@@ -202,7 +202,7 @@ def _alloc_h(values=SEED, name: str = "hp") -> str:
     """Allocate `ghp`'s VH in main and fill its Vec with `values`."""
     return (f"    let {name}: *VH = malloc(sizeof(VH)) as *VH\n"
             f"    *{name} = VH {{ v: vec_new<i32>() }}\n"
-            + "".join(f"    vec_push<i32>(@&{name}.v, {v})\n" for v in values)
+            + "".join(f"    {name}.v.push({v})\n" for v in values)
             + f"    ghp = {name}\n")
 
 
@@ -508,18 +508,18 @@ def test_an_enum_element_is_walked_at_its_stride(run_with, compiler, it, name):
 # AGAST #2411: the same, with no `for`.  Each failed to compile on ritz1 before
 # any loop was involved.  The values are what ritz0 returns.
 NO_LOOP = {
-    "enum_vec_get": (GVEC + UNIT_ENUM + MAIN + _FILL_U + "    let g: U = vec_get<U>(@v, 1)\n"
+    "enum_vec_get": (GVEC + UNIT_ENUM + MAIN + _FILL_U + "    let g: U = v.get(1)\n"
                      "    match g\n        U.Cc => 0\n        _ => 1\n", 0),
     "enum_vec_push": (GVEC + UNIT_ENUM + MAIN + "    var v: Vec<U> = vec_new<U>()\n"
-                      "    vec_push<U>(@&v, U.Bb)\n    let g: U = vec_get<U>(@v, 0)\n"
+                      "    v.push(U.Bb)\n    let g: U = v.get(0)\n"
                       "    match g\n        U.Bb => 0\n        _ => 1\n", 0),
     "enum_len": (GVEC + UNIT_ENUM + MAIN + _FILL_U + "    return v.len as i32\n", 3),
     "payload_enum_vec_get": (GVEC + PAYLOAD_ENUM + MAIN + _FILL_C
-                             + "    let g: C = vec_get<C>(@v, 2)\n    match g\n"
+                             + "    let g: C = v.get(2)\n    match g\n"
                              "        C.R(n) => n as i32\n        C.B => 100\n", 7),
     "usize_push_get_len": (GVEC + MAIN + "    var v: Vec<usize> = vec_new<usize>()\n"
                            "    v.push(5000000000)\n    v.push(7)\n"
-                           "    let g: usize = vec_get<usize>(@v, 0)\n    if g != 5000000000\n"
+                           "    let g: usize = v.get(0)\n    if g != 5000000000\n"
                            "        return 1\n    return v.len as i32\n", 2),
     "generic_struct_field_len": (GVEC + GB + "fn f<T>(b: @B<T>) -> i32\n"
                                  "    return b.v.len as i32\n\n" + MAIN + FILL_B
@@ -539,10 +539,10 @@ NO_LOOP = {
     # had "element size of pointee unknown": a tagged enum is no struct ritz1 finds.
     # The AGAST repro: a None pushed, read back, and the length.
     "option_none_push_get_len": (GVEC + MAIN + "    var v: Vec<Option<i64>> = vec_new<Option<i64>>()\n"
-                                 "    let o: Option<i64> = None\n    vec_push<Option<i64>>(@&v, o)\n"
-                                 "    let b: Option<i64> = vec_get<Option<i64>>(@v, 0)\n"
+                                 "    let o: Option<i64> = None\n    v.push(o)\n"
+                                 "    let b: Option<i64> = v.get(0)\n"
                                  "    match b\n        Some(n) => return 9\n        None => pass\n"
-                                 "    return vec_len<Option<i64>>(@v) as i32\n", 1),
+                                 "    return v.len() as i32\n", 1),
 }
 
 # AGAST #1578: Some and None round-trip through a Vec of each tagged enum, at its
@@ -567,8 +567,8 @@ _TE_ROWS = {
 
 def _te_program(ty: str, values, arms: str, want: int) -> str:
     """Push `values`, read each back with vec_get, weight by position, compare to want."""
-    pushes = "".join(f"    vec_push<{ty}>(@&v, {x})\n" for x in values)
-    reads = "".join(f"    i = {k + 1}\n    match vec_get<{ty}>(@v, {k})\n" + arms
+    pushes = "".join(f"    v.push({x})\n" for x in values)
+    reads = "".join(f"    i = {k + 1}\n    match v.get({k})\n" + arms
                     for k in range(len(values)))
     return (GVEC + MAIN + f"    var v: Vec<{ty}> = vec_new<{ty}>()\n" + pushes
             + "    var t: i64 = 0\n    var i: i64 = 0\n" + reads
@@ -637,10 +637,11 @@ def test_a_struct_binding_is_a_let(compile_with, compiler):
 
 
 # Trips, with `push` in the body while there's room: 3 was walking a copy, and 6
-# sees the new `len`.
+# sees the new `len`.  The method receiver auto-borrows its place, so this is
+# the one call shape now that the free `vec_push` is gone (AGAST #4537);
+# `_TRIPS_AT` keeps the rows that used to spell the `@&` borrow explicitly.
 _TRIPS = "var n: i32 = 0\nfor x in {it}\n    if n < 3\n        {place}.push(x)\n    n = n + 1\nreturn n\n"
-_TRIPS_AT = ("var n: i32 = 0\nfor x in {it}\n    if n < 3\n        vec_push<i32>(@&{place}, x)\n"
-             "    n = n + 1\nreturn n\n")
+_TRIPS_AT = _TRIPS
 
 
 def _trips_in(sig: str, it: str, place: str, call: str, fill: str = FILL_V, pre: str = "") -> str:
@@ -673,13 +674,13 @@ PUSHES = {
                    + _body(_TRIPS.format(it="self.v", place="self.v"), " " * 8) + "\n" + MAIN
                    + FILL_H + "    return h.f()\n"),
     "global": (GVEC + GV + MAIN + _alloc_v()
-               + _body(_TRIPS_AT.format(it="gp", place="*gp"))),
+               + _body(_TRIPS_AT.format(it="gp", place="(*gp)"))),
     "global_struct_field": (GVEC + GH + MAIN + _alloc_h()
                             + _body(_TRIPS_AT.format(it="ghp.v", place="ghp.v"))),
     "addr_of_local": GVEC + MAIN + FILL_V + _body(_TRIPS.format(it="@v", place="v")),
     "addr_of_field": GVEC + VH + MAIN + FILL_H + _body(_TRIPS.format(it="@h.v", place="h.v")),
     "addr_of_global": (GVEC + GV + MAIN + _alloc_v()
-                       + _body(_TRIPS_AT.format(it="*gp", place="*gp"))),
+                       + _body(_TRIPS_AT.format(it="*gp", place="(*gp)"))),
     "pointer_field": (GVEC + PH + MAIN + FILL_V + "    var q: PH\n    q.p = @v\n"
                       + _body(_TRIPS.format(it="q.p", place="v"))),
     "deref": (GVEC + MAIN + FILL_V + "    var p: *Vec<i32> = @v\n"
@@ -692,7 +693,7 @@ PUSHES = {
     "field_of_a_pointer_call": (GVEC + GH + "fn mkp() -> *VH\n    return ghp\n\n"
                                 + MAIN + _alloc_h() + _body(_TRIPS_AT.format(it="mkp().v", place="ghp.v"))),
     "deref_of_a_call": (GVEC + GV + "fn mkp() -> *Vec<i32>\n    return gp\n\n" + MAIN
-                        + _alloc_v() + _body(_TRIPS_AT.format(it="*mkp()", place="*gp"))),
+                        + _alloc_v() + _body(_TRIPS_AT.format(it="*mkp()", place="(*gp)"))),
     # LARB R17 (#3015): `b.v` reaches through the Box by its `Deref`.
     "field_behind_a_box": (GVEC + "struct Box<T>\n    ptr: *T\n\n"
                            "impl<T> Deref for Box<T>\n    fn deref(self: @Box<T>) -> @T\n"
@@ -739,9 +740,9 @@ def test_a_call_results_header_is_its_own(run_with, compiler):
                + "    let p: *Vec<i32> = malloc(sizeof(Vec<i32>)) as *Vec<i32>\n"
                + "    let buf: *i32 = malloc(64) as *i32\n"
                + "    *p = Vec<i32> { data: buf, len: 0, cap: 16 }\n"
-               + "    vec_push<i32>(@&*p, 1)\n    vec_push<i32>(@&*p, 2)\n"
-               + "    vec_push<i32>(@&*p, 4)\n    gp = p\n"
-               + _body(_TRIPS_AT.format(it="mk()", place="*gp")))
+               + "    p.push(1)\n    p.push(2)\n"
+               + "    p.push(4)\n    gp = p\n"
+               + _body(_TRIPS_AT.format(it="mk()", place="(*gp)")))
     assert run_with(compiler, "own_header", program) == 3
 
 
@@ -849,10 +850,10 @@ _ADJUST = (GVEC + MAIN + FILL_V
     ("pop", "        v.pop()\n", 2),
     ("clear", "        v.clear()\n", 1),
     ("assign", "        var w: Vec<i32> = vec_new<i32>()\n        w.push(1)\n        v = w\n", 1),
-    # A raw-memory vec_drop (the API's remaining use) zeroes the header, so
+    # A raw-memory `deinit` (the API's remaining use) zeroes the header, so
     # the loop ends after one pass; the scope's Drop then finds `data == null`
     # and frees nothing twice. An owned binding is freed by the compiler.
-    ("drop", "        let vp: *Vec<i32> = @&v\n        vec_drop<i32>(@&*vp)\n", 1),
+    ("drop", "        let vp: *Vec<i32> = @&v\n        vp.deinit()\n", 1),
 ], ids=["pop", "clear", "assign", "drop"])
 def test_a_shorter_header_ends_the_loop(run_with, compiler, name, body, trips):
     assert run_with(compiler, name, _ADJUST.format(body=body)) == trips

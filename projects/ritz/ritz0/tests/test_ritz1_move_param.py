@@ -147,15 +147,15 @@ import ritzlib.gvec
 fn total(data:= Vec<u8>) -> i32
     var s: i32 = 0
     var i: i64 = 0
-    while i < vec_len<u8>(@data)
-        s = s + vec_get<u8>(@data, i) as i32
+    while i < data.len()
+        s = s + data.get(i) as i32
         i = i + 1
     return s
 
 pub fn main() -> i32
     var v: Vec<u8> = vec_new<u8>()
-    vec_push<u8>(@&v, 2 as u8)
-    vec_push<u8>(@&v, 5 as u8)
+    v.push(2 as u8)
+    v.push(5 as u8)
     let s = total(v)
     return s
 """, 7),

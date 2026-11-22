@@ -6,7 +6,7 @@
    instance fallback (`s.push(c)` -> `String_push(@s, c)`) and refused the
    static one: "cannot determine receiver type for method call".
 
-2. An un-annotated `let e = vec_as_ptr<E>(@v) + 1` lost its `*E`: `e.b` was
+2. An un-annotated `let e = v.as_ptr() + 1` lost its `*E`: `e.b` was
    "unhandled EXPR_MEMBER" and `@e.b` "cannot take address".  The annotated
    `let e: *E = ...` was right throughout.
 
@@ -40,7 +40,7 @@ STATICS = {
     "from_then_push": ('    var t = String.from("xy")\n    t.push_str("abc")\n'
                        "    t.len() as i32\n", 5),
     # Its Vec<u8> field: monomorph must know `t` is a String to instantiate
-    # vec_push$u8 for `t.data.push`.
+    # Vec$u8_push for `t.data.push`.
     "field_of_the_result": ('    var t = String.from("xy")\n    t.data.push(65)\n'
                             "    t.data.len as i32\n", 3),
     "from_i64": ("    let t = String.from_i64(4207)\n    t.len() as i32\n", 4),
@@ -97,23 +97,23 @@ PTR_HEADER = (
     "import ritzlib.gvec\n\n"
     "struct E\n    a: i64\n    b: i64\n\n"
     "fn rd(p: @i64) -> i64\n    *p\n\n"
-    "fn mkp(v: *Vec<E>) -> *E\n    vec_as_ptr<E>(v)\n\n"
+    "fn mkp(v: *Vec<E>) -> *E\n    v.as_ptr()\n\n"
 )
 
 # v holds E{1,2}, E{3,4}, E{5,6}; `p: *E` is its first element and `i` is 1.
 PTR_SETUP = (
     "    var v = vec_new<E>()\n"
     "    v.push(E { a: 1, b: 2 })\n    v.push(E { a: 3, b: 4 })\n    v.push(E { a: 5, b: 6 })\n"
-    "    let p: *E = vec_as_ptr<E>(@v)\n"
+    "    let p: *E = v.as_ptr()\n"
     "    var i: i64 = 1\n"
 )
 
 # The let's initialiser -> the element it names, k.
 INITS = {
-    "generic_call": ("vec_as_ptr<E>(@v) + 1", 1),
-    "generic_call_index": ("vec_as_ptr<E>(@v) + i", 1),
-    "parenthesised": ("(vec_as_ptr<E>(@v) + 1)", 1),
-    "chain": ("vec_as_ptr<E>(@v) + 2 - 1", 1),
+    "generic_call": ("v.as_ptr() + 1", 1),
+    "generic_call_index": ("v.as_ptr() + i", 1),
+    "parenthesised": ("(v.as_ptr() + 1)", 1),
+    "chain": ("v.as_ptr() + 2 - 1", 1),
     "plain_call": ("mkp(@v) + 1", 1),
     "local": ("p + 1", 1),
     "local_chain": ("p + i + 1 - 1", 1),
@@ -138,7 +138,7 @@ USES = {
 # 9; each let names element 1.  It was an i64 with no pointee, so `*e = 30`
 # stored 8 bytes (over element 2 for a `*i32`) and `e + 1` stepped one byte.
 # `*i64` stores were right by luck (the let's i64 default is its width).
-SCALAR_INITS = {"generic_call": "vec_as_ptr<{T}>(@w) + 1", "local": "q + 1",
+SCALAR_INITS = {"generic_call": "w.as_ptr() + 1", "local": "q + 1",
                 "chain": "q + 2 - 1", "local_chain": "q + i + 1 - 1",
                 # #2596: a plain copy of a `*T` local, and a Vec's `*T` field.
                 "copy": "q1", "vec_field": "w.data + 1"}
@@ -155,7 +155,7 @@ SCALAR_TYPES = ["i64", "i32", "i16", "u8"]
 
 def _scalar(ty: str, init: str, use: str) -> str:
     body = (f"    var w = vec_new<{ty}>()\n    w.push(5)\n    w.push(7)\n    w.push(9)\n"
-            f"    let q: *{ty} = vec_as_ptr<{ty}>(@w)\n"
+            f"    let q: *{ty} = w.as_ptr()\n"
             f"    let q1: *{ty} = q + 1\n"
             "    var i: i64 = 1\n"
             f"    let e = {SCALAR_INITS[init].format(T=ty)}\n"

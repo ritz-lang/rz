@@ -440,7 +440,7 @@ pub fn main() -> i32
 # What isn't a pointer or reference to a Vec isn't this rule's, though it names one.
 NOT_THROUGH = {
     "array_of_vecs": ("    var a: [2]Vec<i32> = [Vec<i32> { data: null, len: 0, cap: 0 }, Vec<i32> { data: null, len: 0, cap: 0 }]\n    a[0] = vec_new<i32>()\n    a[1] = vec_new<i32>()\n"
-                      "    vec_push<i32>(@&a[1], 1)\n    vec_push<i32>(@&a[1], 2)\n"
+                      "    a[1].push(1)\n    a[1].push(2)\n"
                       "    return a[1].len as i32\n", 2),
     "the_vec_itself": (_new("i32", (10, 20, 30)) + "    return v[1] / 10\n", 2),
 }
@@ -466,7 +466,7 @@ RAW = {
     # Walking rows of Vecs is `p + i`: `p[i]` is an element of the first (R9).
     "vec_row": ("fn f(p: *Vec<i32>) -> i32\n    return (p + 1).len as i32\n",
                 "    var a: [2]Vec<i32> = [Vec<i32> { data: null, len: 0, cap: 0 }, Vec<i32> { data: null, len: 0, cap: 0 }]\n    a[0] = vec_new<i32>()\n    a[1] = vec_new<i32>()\n"
-                "    vec_push<i32>(@&a[1], 1)\n    vec_push<i32>(@&a[1], 2)\n    return f(@a[0])\n", 2),
+                "    a[1].push(1)\n    a[1].push(2)\n    return f(@a[0])\n", 2),
 }
 
 
@@ -599,10 +599,10 @@ impl A
 
 """
 POINTERS = ("    var s0: S = S {{ x: 1, y: 2 }}\n    var s1: S = S {{ x: 3, y: 20 }}\n"
-            "    var v: Vec<*S> = vec_new<*S>()\n    vec_push<*S>(@&v, @s0)\n    vec_push<*S>(@&v, @s1)\n"
+            "    var v: Vec<*S> = vec_new<*S>()\n    v.push(@s0)\n    v.push(@s1)\n"
             "{tail}")
 ARRAYS = ("    var v: Vec<A> = vec_new<A>()\n    var e: A\n    e.a[1] = 20\n"
-          "    vec_push<A>(@&v, e)\n    vec_push<A>(@&v, e)\n{tail}")
+          "    v.push(e)\n    v.push(e)\n{tail}")
 INSIDE = {
     "pointer_element_field": ("Vec<*S>", POINTERS, "    return p[1].y\n", "    return f({a}v)\n", 20),
     "pointer_element": ("Vec<*S>", POINTERS, "    let q: *S = p[1]\n    return q.y\n",
@@ -700,8 +700,8 @@ pub fn main() -> i32
     var b: Vec<i32> = vec_new<i32>()
     b.push(10)
     b.push(20)
-    vec_push<Vec<i32>>(@&v, a)
-    vec_push<Vec<i32>>(@&v, b)
+    v.push(a)
+    v.push(b)
     return f({addr}v)
 """
 
@@ -748,8 +748,8 @@ M_HOLDERS = {
              "a[1].y"),
     "Vec_of_pointers": ("Vec<*M>",
                         "    var m0: M = M { x: 1, y: 2 }\n    var m1: M = M { x: 3, y: 20 }\n"
-                        "    var v: Vec<*M> = vec_new<*M>()\n    vec_push<*M>(@&v, @m0)\n"
-                        "    vec_push<*M>(@&v, @m1)\n",
+                        "    var v: Vec<*M> = vec_new<*M>()\n    v.push(@m0)\n"
+                        "    v.push(@m1)\n",
                         "m1.y"),
 }
 # A call through `(*p)[1]` and `p[1]`, and what f returns.

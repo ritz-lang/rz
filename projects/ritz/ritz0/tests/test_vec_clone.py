@@ -6,7 +6,7 @@ for UFCS to find, so callers hand-rolled one (spectree's `vec_clone_u8`) or
 used the full-slice `[:]` idiom.
 
 One program per compiler covers what can go wrong separately:
-  - `.clone()` resolves through UFCS, and `vec_clone<T>(@v)` directly;
+  - `.clone()` resolves through UFCS, and `v.clone()` directly;
   - the copy has the same length and elements;
   - the copy owns its own buffer: writing or pushing either side leaves the
     other alone (a clone that copied the `data` pointer would alias);
@@ -53,7 +53,7 @@ pub fn main() -> i32
     if v.len() != 3 or w.len() != 4
         return 5
 
-    var direct: Vec<i32> = vec_clone<i32>(@v)
+    var direct: Vec<i32> = v.clone()
     if direct.len() != 3 or direct.get(1) != 99
         return 6
 

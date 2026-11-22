@@ -956,6 +956,37 @@ pub fn main() -> i32
     return f() * 10 + DROPS
 """, 211, {}),
 
+    # AGAST #4537: an owning argument to a method moves, even when another
+    # type declares a same-named method that lends.  `Box.take` takes its
+    # Tracked by value; `Poke.take` shares the name with a `*Tracked` param.
+    # Read from the name-wide table alone, the argument looked lent, so the
+    # caller dropped `t` after the callee had already dropped its parameter
+    # (DROPS 2).  The receiver's own type decides.
+    "method_arg_moves_past_a_lending_namesake": ("""\
+struct Box
+    n: i32
+
+impl Box
+    fn take(self: @&Box, t: Tracked) -> i32
+        return t.id
+
+struct Poke
+    n: i32
+
+impl Poke
+    fn take(self: @&Poke, p: *Tracked) -> i32
+        return 0
+
+fn f() -> i32
+    var b = Box { n: 0 }
+    var t = make(1)
+    return b.take(t)
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 1, {}),
+
     # `@&`: the callee's write is what the drop sees (ORDER gets 7).
     "lent_temp_mut_arg": (LENT + """\
 pub fn main() -> i32
@@ -3824,8 +3855,8 @@ VEC_CASES = {
     "vec_scope_end": _vec_case("""\
 fn build(a: *Allocator) -> i64
     var v: Vec<u8> = vec_with_cap_in<u8>(a, 8)
-    vec_push<u8>(@&v, 1)
-    return vec_len(@v)
+    v.push(1)
+    return v.len()
 """, 1, 1, 1),
 
     # `consume_vec` takes ownership: it drops the Vec, and the moved-from
@@ -3833,11 +3864,11 @@ fn build(a: *Allocator) -> i64
     # drops both, so frees is 2 and live_bytes goes negative.
     "vec_move_into_callee": _vec_case("""\
 fn consume_vec(v: Vec<u8>) -> i64
-    return vec_len(@v)
+    return v.len()
 
 fn build(a: *Allocator) -> i64
     var v: Vec<u8> = vec_with_cap_in<u8>(a, 8)
-    vec_push<u8>(@&v, 7)
+    v.push(7)
     return consume_vec(v)
 """, 1, 1, 1),
 
@@ -3846,12 +3877,12 @@ fn build(a: *Allocator) -> i64
     "vec_return_from_fn": _vec_case("""\
 fn make_vec(a: *Allocator) -> Vec<u8>
     var v: Vec<u8> = vec_with_cap_in<u8>(a, 8)
-    vec_push<u8>(@&v, 3)
+    v.push(3)
     return v
 
 fn build(a: *Allocator) -> i64
     var got: Vec<u8> = make_vec(a)
-    return vec_len(@got)
+    return got.len()
 """, 1, 1, 1),
 
     # The old value is dropped before the new one is assigned; the new one is
@@ -3860,7 +3891,7 @@ fn build(a: *Allocator) -> i64
 fn build(a: *Allocator) -> i64
     var v: Vec<u8> = vec_with_cap_in<u8>(a, 8)
     v = vec_with_cap_in<u8>(a, 16)
-    return vec_cap(@v)
+    return v.cap()
 """, 16, 2, 2),
 
     # String owns its bytes through a Vec<u8>: one allocation, one free.
@@ -3998,19 +4029,17 @@ def test_vec_string_free_count(request, tmp_path, compiler):
 
 
 # The manual call that is now a use-after-move: `v` moved into `consume`, so
-# `vec_drop(@&v)` would free the buffer `consume`'s drop already freed. The
-# call is split across a Python literal so this file's own scan (below) does
-# not mistake the text of this expected-error program for a live call site.
+# `v.deinit()` would free the buffer `consume`'s drop already freed.
 MOVE_THEN_MANUAL_DROP = """\
 import ritzlib.gvec
 
 fn consume(v: Vec<u8>) -> i64
-    vec_len(@v)
+    v.len()
 
 pub fn main() -> i32
     var v: Vec<u8> = vec_new<u8>()
     consume(v)
-    vec_""" + "drop<u8>(@&v)\n" + """\
+    v.deinit()
     return 0
 """
 
@@ -4029,16 +4058,12 @@ def test_manual_drop_after_move_refused(request, tmp_path, compiler):
     assert "moved" in out and "`v`" in out, out[-3000:]
 
 
-# Calls, not definitions: `pub fn vec_drop<T>(v: @&Vec<T>)` in gvec.ritz and
-# the `vec_drop<u8>` inside string_drop stay — they are the public manual
-# API, which the compiler's Drop impls no longer need.
-#
-# A call on a place reached through a raw pointer (`@&*vp`) stays too: the
-# compiler never drops a value in raw memory, so that is what the manual API
-# is for (AGAST #2159).
+# Since AGAST #4537 neither `vec_drop` nor `string_drop` exists: both are
+# `impl` methods (`Vec.deinit`, `String.deinit`) now. This tree-wide scan names
+# any surviving call, which would not compile in any case. A `deinit()` on a
+# place reached through a raw pointer (`vp.deinit()`) is the remaining manual
+# API: the compiler never drops a value in raw memory (AGAST #2159).
 MANUAL_DROP_CALL = re.compile(r"\b(vec_drop|string_drop)\s*(<[^<>]*>)?\s*\(")
-RAW_MEMORY_DROP_CALL = re.compile(r"\b(vec_drop|string_drop)\s*(<[^<>]*>)?\s*\(\s*@&?\*")
-DROP_DEFINITION_FILES = {"ritzlib/gvec.ritz", "ritzlib/string.ritz"}
 BUILD_DIRS = {".ritz-cache", ".build-cache", "build", "target"}
 
 
@@ -4050,15 +4075,13 @@ def test_no_manual_vec_or_string_drops():
         if path.suffix not in (".ritz", ".py"):
             continue
         rel = path.relative_to(RITZ_ROOT).as_posix()
-        if rel in DROP_DEFINITION_FILES:
-            continue
         if BUILD_DIRS & set(path.relative_to(RITZ_ROOT).parts[:-1]):
             continue
         for lineno, line in enumerate(
                 path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
             if line.lstrip().startswith("#"):
                 continue
-            if MANUAL_DROP_CALL.search(line) and not RAW_MEMORY_DROP_CALL.search(line):
+            if MANUAL_DROP_CALL.search(line):
                 offenders.append(f"{rel}:{lineno}: {line.strip()}")
     assert not offenders, (
         "manual String/Vec drops are now a double free; delete them "

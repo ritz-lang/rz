@@ -54,12 +54,12 @@ pub fn ritz_platform_fatal(msg: *u8, len: i64, status: i32)
 pub fn kmain() -> i32
     let p: *u8 = malloc(64)
     var v: Vec<i64> = vec_new<i64>()
-    vec_push(@&v, 7)
+    v.push(7)
     var m: HashMapI64 = hashmap_i64_new()
     m.insert(1, 2)
     let s: String = string_from("core")
     free(p)
-    return (m[1] + vec_get(@v, 0) + s.len()) as i32
+    return (m[1] + v.get(0) + s.len()) as i32
 """
 
 

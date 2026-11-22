@@ -4,7 +4,7 @@
     type Id = Raw
     struct D
         v: Vec<Raw>
-    ... vec_push<Id>(@d.v, 1)
+    ... d.v.push(1)
 
 ritz0 mangled the alias's own name (`Vec$Id`, `vec_push$Id`), so mixing an
 alias with its target was `Vec$Id* != Vec$Raw*`.  Aliases are transparent:

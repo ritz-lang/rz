@@ -108,12 +108,12 @@ import ritzlib.gvec
 
 pub fn main() -> i32
     var inner: Vec<i32> = vec_new<i32>()
-    vec_push<i32>(@&inner, 3)
-    vec_push<i32>(@&inner, 4)
+    inner.push(3)
+    inner.push(4)
     var v: Vec<*Vec<i32>> = vec_new<*Vec<i32>>()
-    vec_push<*Vec<i32>>(@&v, @&inner)
-    let back: *Vec<i32> = vec_get<*Vec<i32>>(@v, 0)
-    return vec_get<i32>(back, 0) + vec_get<i32>(back, 1)
+    v.push(@&inner)
+    let back: *Vec<i32> = v.get(0)
+    return back.get(0) + back.get(1)
 """
 
 

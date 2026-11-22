@@ -535,9 +535,9 @@ doesn't free it. A function that returns it hands ownership to the caller.
 
 `String` and `Vec<T>` implement `Drop` (AGAST #2159, LANGUAGE_SPEC §13.6), so
 they are move-only and S-OWN-3 enforces this: the compiler frees the buffer
-at the owner's scope end. Don't call `s.deinit()` / `vec_drop` on an owning
-binding; `deinit` and `vec_drop` remain for a value reached through a raw
-pointer, which the compiler never drops.
+at the owner's scope end. Don't call `s.deinit()` / `v.deinit()` on an owning
+binding; `String.deinit` and `Vec.deinit` remain for a value reached through a
+raw pointer, which the compiler never drops.
 
 ```ritz
 import ritzlib.string

@@ -5,13 +5,13 @@ argument must mangle as its target type.
     struct D
         v: Vec<Id>                 # field type: Vec$u32 (alias resolved, #1475)
     fn f(d: *D) -> i64
-        return vec_len<Id>(@d.v)   # call suffix: $Id  -> instantiates Vec$Id
+        return d.v.len()   # call suffix: $Id  -> instantiates Vec$Id
 
 ritz1 rejected this with
 
     argument 1 of `vec_len` has the wrong type: Vec$Id* != Vec$u32*
 
-(tempest lib/document.ritz:184, `vec_len<NodeId>(@doc.free_list)`).  The
+(tempest lib/document.ritz:184, `doc.free_list.len()`).  The
 single-token generic-call rules (`f<T>(..)`, `f<*T>(..)`, `f<@T>(..)`) built
 the suffix from the raw token text, bypassing the parse-time alias table that
 type annotations go through.  A full type-argument list (`f<Pair<Id>>(..)`)
@@ -41,13 +41,13 @@ struct D
     v: Vec<Id>
 
 fn f(d: *D) -> i64
-    return vec_len<Id>(@d.v)
+    return d.v.len()
 
 pub fn main() -> i32
     var d: D = D { v: vec_new<Id>() }
-    vec_push<Id>(@&d.v, 7)
-    vec_push<Id>(@&d.v, 9)
-    vec_push<Id>(@&d.v, 11)
+    d.v.push(7)
+    d.v.push(9)
+    d.v.push(11)
     return f(@d) as i32
 """
 
@@ -63,13 +63,13 @@ struct Doc
     free_list: Vec<NodeId>
 
 fn take(doc: *Doc) -> NodeId
-    let n: i64 = vec_len<NodeId>(@doc.free_list)
-    return vec_get<NodeId>(@doc.free_list, n - 1)
+    let n: i64 = doc.free_list.len()
+    return doc.free_list.get(n - 1)
 
 pub fn main() -> i32
     var doc: Doc = Doc { free_list: vec_new<NodeId>() }
-    vec_push<NodeId>(@&doc.free_list, 2)
-    vec_push<NodeId>(@&doc.free_list, 5)
+    doc.free_list.push(2)
+    doc.free_list.push(5)
     return take(@doc) as i32
 """
 
@@ -99,10 +99,10 @@ struct D
 
 pub fn main() -> i32
     var d: D = D { v: vec_new<u32>() }
-    vec_push<Id>(@&d.v, 1)
-    vec_push<Raw>(@&d.v, 2)
-    let x: Id = vec_get<Id>(@d.v, 1)
-    return (vec_len<Id>(@d.v) as i32) + (x as i32) - 1
+    d.v.push(1)
+    d.v.push(2)
+    let x: Id = d.v.get(1)
+    return (d.v.len() as i32) + (x as i32) - 1
 """
 
 # `f<*Alias>(..)` — the pointer rule's suffix is `$ptr_<target>`.
@@ -118,9 +118,9 @@ struct D
 pub fn main() -> i32
     var a: u32 = 3
     var d: D = D { v: vec_new<*u32>() }
-    vec_push<*Id>(@&d.v, @a)
-    let p: *Id = vec_get<*Id>(@d.v, 0)
-    return (vec_len<*Id>(@d.v) as i32) + (*p as i32) - 1
+    d.v.push(@a)
+    let p: *Id = d.v.get(0)
+    return (d.v.len() as i32) + (*p as i32) - 1
 """
 
 # Nested: the alias inside a generic type argument (`Vec<Pair<Id>>`), mixed
@@ -140,9 +140,9 @@ struct D
 
 pub fn main() -> i32
     var d: D = D { v: vec_new<Pair<u32>>() }
-    vec_push<Pair<Id>>(@&d.v, Pair<Id> { a: 1, b: 2 })
-    let q: Pair<Id> = vec_get<Pair<Id>>(@d.v, 0)
-    return (vec_len<Pair<Id>>(@d.v) as i32) + (q.b as i32)
+    d.v.push(Pair<Id> { a: 1, b: 2 })
+    let q: Pair<Id> = d.v.get(0)
+    return (d.v.len() as i32) + (q.b as i32)
 """
 
 # `f<@Alias>(..)` — the reference rule.
