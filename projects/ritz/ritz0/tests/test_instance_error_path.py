@@ -8,7 +8,9 @@
 
 instantiates `impl<T> Span<T>`'s `get` (a method is specialised only once
 called: AGAST #3617), and `get`'s `return *(self.ptr + idx)` moves a T out of
-a pointer.  ritz0 reports it at `.../ritzlib/span.ritz:147:16`; ritz1 and
+a pointer.  ritz0 reports it at `.../ritzlib/span.ritz` column 16, on `get`'s
+`return *(self.ptr + idx)` (the line is derived from the source, not pinned, so
+an edit above it does not look like a regression — AGAST #4554); ritz1 and
 ritz1_selfhosted printed `main.ritz:92:12`, a line main.ritz doesn't have,
 because ref_check located every error in the driver's input file.
 
@@ -22,6 +24,7 @@ ritz1 located in main.ritz because impl methods carried no def_file.
 import os
 import re
 import subprocess
+from pathlib import Path
 
 import pytest
 from ritz0_inproc import run_ritz0
@@ -89,41 +92,52 @@ impl S
 
 MOVE_OUT = "cannot move out of a reference"
 
+# Each case pins the owning file, the column and the message.  The *line* is
+# derived from the source at run time by finding `marker` (a unique substring
+# of the offending line), so an edit above the site in span.ritz/string.ritz
+# shifts both the compiler's report and the expectation together instead of
+# redding the gate with a stale pin that looks like a regression (AGAST #4554).
+#
+# (main.ritz, extra files, the file the error belongs to, marker, column, message)
 CASES = {
-    # (main.ritz, extra files, the file the error belongs to, line:col, message)
     "ritzlib_span": (
         f"import ritzlib.span\n\n{DROP_T}\nfn f(p: @Span<T>) -> i32\n    let x: T = p.get(0)\n    return 0\n",
         {},
         str(RITZ_ROOT / "ritzlib" / "span.ritz"),
-        "147:16",
+        "return *(self.ptr + idx)",
+        16,
         MOVE_OUT,
     ),
     "user_module": (
         f"import cell\n\n{DROP_T}\nfn f(p: @Cell<T>) -> i32\n    let x: T = p.get()\n    return 0\n",
         {"cell.ritz": CELL},
         "cell.ritz",
-        "5:12",
+        "return *(c.ptr + 0)",
+        12,
         MOVE_OUT,
     ),
     "user_method": (
         f"import cell\n\n{DROP_T}\nfn f(p: @Cell<T>) -> i32\n    let x: T = p.get()\n    return 0\n",
         {"cell.ritz": CELL_METHOD},
         "cell.ritz",
-        "6:16",
+        "return *(self.ptr + 0)",
+        16,
         MOVE_OUT,
     ),
     "user_method_binder": (
         "import cell\n\nfn f(p: *Cell<i32>) -> i32\n    return p.get()\n",
         {"cell.ritz": CELL_BINDER},
         "cell.ritz",
-        "8:13",
+        "let K: i32 = 1",
+        13,
         "a local can't take the name of a const: 'K'",
     ),
     "main_method": (
         METHOD,
         {},
         "main.ritz",
-        "8:9",
+        "self.v.push(3 as u8)",
+        9,
         "an `@T` doesn't fit an `@&T` slot",
     ),
 }
@@ -135,7 +149,8 @@ LOC = re.compile(r"(\S+\.ritz):(\d+:\d+): (?:error: )?(.*)")
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(CASES))
 def test_instance_error_names_its_module(compiler, case, tmp_path):
-    main, extra, owner, where, message = CASES[case]
+    main, extra, owner, marker, column, message = CASES[case]
+    where = _where(_source(main, extra, owner), marker, column)
     work = tmp_path / f"{case}_{compiler}"
     work.mkdir()
     for name, text in extra.items():
@@ -157,6 +172,23 @@ def test_instance_error_names_its_module(compiler, case, tmp_path):
     if owner != "main.ritz":
         blamed = [(f, w) for f, w in found if _same_file(f, str(path), work)]
         assert not blamed, f"{compiler}: {case} blamed main.ritz: {blamed}"
+
+
+def _source(main, extra, owner):
+    """The text the error site lives in: main+ENTRY, a sibling module, or disk."""
+    if os.path.isabs(owner):
+        return Path(owner).read_text()
+    if owner in extra:
+        return extra[owner]
+    assert owner == "main.ritz", owner
+    return main + ENTRY
+
+
+def _where(source, marker, column):
+    """`line:col` for the one line containing `marker`, derived from the source."""
+    hits = [n for n, line in enumerate(source.splitlines(), 1) if marker in line]
+    assert len(hits) == 1, f"marker {marker!r} must name one line, found at {hits}"
+    return f"{hits[0]}:{column}"
 
 
 def _emit(compiler, path, ll, work):
