@@ -216,7 +216,9 @@ def test_block_operand_then_store_and_tail_runs(tmp_path, name, program):
 
 # AGAST #4049: a block `match` operand in every statement form ritz1 has
 # (let / var / assign / return / fn tail), nested under `*` and under unary
-# `-`, and narrowed into a u8 slot through `+` (narrow_congs_fit).  ritz0
+# `-`, and narrowed into a u8 slot through `+` (narrow_congs_fit).  AGAST
+# #4584: the unary `-` / `~` forms (and an `if` twin) have literal arms, which
+# take the slot's width through the unary as through `+`.  ritz0
 # always took these; ritz1 parsed the operand but no statement rule ended at
 # its DEDENT, so it refused the line after it.
 MATCH_OPERAND_FORMS = """\
@@ -247,8 +249,21 @@ fn tail_form(c: i32) -> i32
 
 fn neg_form(c: i32) -> i32
     let x: i32 = -match c
-        1 => c
-        _ => c + 2
+        1 => 1
+        _ => 2
+    x
+
+fn neg_if_form(c: i32) -> i32
+    let x: i32 = -if c == 1
+        1
+    else
+        2
+    x
+
+fn bitnot_form(c: i32) -> u8
+    let x: u8 = ~match c
+        1 => 1
+        _ => 2
     x
 
 fn byte_form(c: i32, a: u8, b: u8) -> u8
@@ -270,6 +285,10 @@ fn main() -> i32
         return 5
     if (byte_form(1, 1, 2) as i32) != 7 or (byte_form(0, 1, 2) as i32) != 8
         return 6
+    if neg_if_form(1) != -1 or neg_if_form(0) != -2
+        return 7
+    if (bitnot_form(1) as i32) != 254 or (bitnot_form(0) as i32) != 253
+        return 8
     42
 """
 

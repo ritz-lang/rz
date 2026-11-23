@@ -914,6 +914,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
     # `BinOp.wrapping` (they are congruent, but outside R73's list and not
     # expressible in ritz1).
     _CONGRUENT_BINOPS = frozenset({'+', '-', '*', '&', '|', '^', '<<'})
+    # The unary operators congruent mod 2**width (AGAST #4584): negation and
+    # bitwise not. ritz1's narrow_congs_fit descends the same two.
+    _CONGRUENT_UNOPS = frozenset({'-', '~'})
 
     def _arith_context_nodes(self, root: rast.Expr) -> set:
         """Ids of the BinOps whose result is consumed at the declared type.
@@ -965,6 +968,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         the wrapping `+%` forms) still stop it. A bare literal operand of a
         congruent operator is NOT retyped: only the chains carry the width,
         and the arms of an if / match at their end are 'arm', not 'cong'.
+
+        AGAST #4584: unary `-` and `~` are congruent too, and carry the width
+        the same way (`_CONGRUENT_UNOPS`).
         """
         qualifying = set()
         # (node, how it is reached): 'root' for the slot's own value, 'arm'
@@ -1020,9 +1026,16 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 stack.append((node.left, left_tail))
                 stack.append((node.right, right_tail))
             elif isinstance(node, rast.UnaryOp):
-                # `-(x + 1)` is still consumed at the declared width. Not
-                # extended to 'cong' (AGAST #4219): R73's list is binary.
-                stack.append((node.operand, None))
+                # `-(x + 1)` is still consumed at the declared width.
+                # AGAST #4584: `-` and `~` are congruent mod 2**width like
+                # `+ - *` (the low bits of `-v` / `~v` are a function of v's
+                # low bits alone), so a value path carries the slot's width
+                # through them to an if / match: `let x: i32 = -match c` with
+                # literal arms is not an i64 narrowing, as `6 + match c` is
+                # not. `!` and the pointer forms (`@`, `*`) stop it.
+                congruent = (node.op in self._CONGRUENT_UNOPS
+                             and tail in ('root', 'arm', 'cong'))
+                stack.append((node.operand, 'cong' if congruent else None))
         return qualifying
 
     def _literal_at_slot_width(self, expr: rast.Expr) -> Optional[ir.Value]:

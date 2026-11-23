@@ -121,6 +121,12 @@ RITZ1_EXTRA_REJECTED.update({
     "if_block_i64_arm":            (_IF.format(t="i32", a="x", b="five()"), None),
     # The i32 arm into a u8: the literal arm being a u8 does not hide it.
     "if_block_literal_arm_into_u8": (_IF.format(t="u8", a="x", b="0"), None),
+    # AGAST #4584: unary `-` / `~` carry the slot's width to the merge, but an
+    # arm still has to fit: an i64 arm, or a literal arm too wide for the slot.
+    "if_under_unary_neg_i64_arm":
+        ("let n: i32 = -(if x > 0 then x else five())", None),
+    "if_under_unary_neg_wide_literal_arm":
+        ("let n: u8 = -(if x > 0 then 300 else 1)", None),
 })
 
 # AGAST #1688: shapes ritz1 used to answer NARROW_UNKNOWN for.  Each one in
@@ -171,6 +177,13 @@ RITZ1_EXTRA_REJECTED.update({
     "member_two_levels_i64": ("let n: i32 = q.i.v", _P + ", q: *Out", _DECLS),
 })
 RITZ1_EXTRA_ACCEPTED = {
+    # AGAST #4584: `-` and `~` are congruent mod 2**width like `+ - *`, so a
+    # merge below them is emitted at the slot's width and its literal arms
+    # take it (ritz0 _arith_context_nodes, ritz1 narrow_congs_fit).
+    "if_under_unary_neg_literal_arms":
+        ("let n: i32 = -(if x > 0 then 1 else 2)", None),
+    "if_under_bitnot_literal_arms":
+        ("let n: u8 = ~(if x > 0 then 1 else 2)", None),
     "unannotated_local_of_i8": ("let a = 5 as i8\n    let n: i32 = a", None),
     "unannotated_local_match_literal_arm": (
         "let a = match o\n        Gray => x\n        RGB => 0\n        BGR => 1\n"
