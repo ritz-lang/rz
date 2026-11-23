@@ -754,11 +754,16 @@ class LayoutEmitter:
             return 0, 0
         return (max_align - (1 % max_align)) % max_align, max_size
 
-    def _set_enum_body(self, enum_type, variants) -> None:
-        """Give an enum its `{ i8 tag, [P x i8] pad, [N x i8] data }` body."""
+    def _set_enum_body(self, enum_type, variants, tag_type=None) -> None:
+        """Give an enum its `{ i8 tag, [P x i8] pad, [N x i8] data }` body.
+
+        `tag_type` is an `enum E: <int>`'s repr type (AGAST #4574): such an
+        enum is fieldless and its body is `{ iN }`, holding the discriminant.
+        """
         padding, data_size = self._enum_payload_shape(variants)
         if not any(variant.fields for variant in variants):
-            enum_type.set_body(self.i8)      # all unit variants: just a tag
+            # all unit variants: just a tag
+            enum_type.set_body(tag_type if tag_type is not None else self.i8)
         elif data_size == 0:
             # AGAST #2941: a payload of zero bytes (`Option<()>`) still has a
             # field, and `_get_enum_data_index` / construction / match binding
@@ -785,6 +790,11 @@ class LayoutEmitter:
         entry = self.enum_types.get(name)
         if entry is None:
             return None
+        repr_name = self.enum_reprs.get(name)
+        if repr_name is not None:
+            # AGAST #4574: `enum E: iN` is laid out as its repr type.
+            width = int(repr_name[1:]) // 8
+            return (width, width)
         padding, data_size = self._enum_payload_shape(entry[1])
         return (1 + padding + data_size, 1)
 

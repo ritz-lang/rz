@@ -839,6 +839,11 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # Enum types: name -> (LLVM struct type, list of Variant objects)
         # Enum layout: { i8 tag, [max_size x i8] data }
         self.enum_types: Dict[str, Tuple[ir.BaseStructType, List[rast.Variant]]] = {}
+        # AGAST #4574: enum name -> its representation type's name (`i32`)
+        # for an `enum E: <int>`.  Such an enum is laid out as `{ iN }`
+        # holding the variant's discriminant; one without a repr keeps its
+        # `{ i8 }` index tag.
+        self.enum_reprs: Dict[str, str] = {}
         # Variant to enum mapping: variant_name -> enum_name
         # Used to resolve variant constructors like Some(x) -> Option_i32
         self.variant_to_enum: Dict[str, str] = {}
@@ -1887,7 +1892,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             refuse(_GLOBAL_NON_CONSTANT)
         if constructed or self._get_enum_variant(enum_name, variant).fields:
             refuse(_CONST_PAYLOAD_VARIANT)
-        tag = ir.Constant(self.i8, self._get_enum_variant_tag(enum_name, variant))
+        tag = self._enum_tag_const(enum_name, variant)
         return ir.Constant(llvm_type, [tag] + [ir.Constant(t, None) for t in llvm_type.elements[1:]])
 
     def _names_enum(self, ty: rast.Type) -> bool:
@@ -3189,6 +3194,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         enum_type = self.module.context.get_identified_type(unique_name)
         # Store placeholder - will be defined in _define_enum
         self.enum_types[enum_def.name] = (enum_type, enum_def.variants)
+        repr_ty = enum_def.repr
+        if isinstance(repr_ty, rast.NamedType) and not repr_ty.args:
+            self.enum_reprs[enum_def.name] = repr_ty.name
 
         # Register variant names for constructor resolution
         for variant in enum_def.variants:
@@ -3285,7 +3293,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             Result: { i8, [7 x i8] padding, [24 x i8] data } = 32 bytes total
         """
         enum_type, variants = self.enum_types[enum_def.name]
-        self._set_enum_body(enum_type, variants)
+        self._set_enum_body(enum_type, variants, self._enum_tag_type(enum_def.name))
 
     def _get_enum_data_index(self, enum_name: str) -> int:
         """Get the struct index of the data buffer in an enum.
@@ -3318,15 +3326,46 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # Index 0 is tag, index 1 is padding (if present), index 2 (or 1) is data
         return 2 if padding_needed > 0 else 1
 
+    def _enum_tag_type(self, enum_name: str) -> ir.IntType:
+        """The LLVM type of an enum's field 0 (AGAST #4574): the repr type
+        for an `enum E: <int>`, else the one-byte index tag."""
+        repr_name = self.enum_reprs.get(enum_name)
+        if repr_name is None:
+            return self.i8
+        return ir.IntType(int(repr_name[1:]))
+
+    def _enum_tag_signed(self, enum_name: str) -> bool:
+        """Is enum_name's stored tag a signed integer (an `iN` repr)?"""
+        return self.enum_reprs.get(enum_name, "u")[0] == "i"
+
+    @staticmethod
+    def _variant_discriminants(variants) -> List[int]:
+        """Each variant's discriminant (§10.4): an explicit `= N`, else the
+        previous one + 1, the first 0."""
+        discs = []
+        for v in variants:
+            discs.append(v.discriminant if v.discriminant is not None
+                         else (discs[-1] + 1 if discs else 0))
+        return discs
+
     def _get_enum_variant_tag(self, enum_name: str, variant_name: str) -> int:
-        """Get the tag value for an enum variant."""
+        """The value an enum variant stores in field 0: its discriminant for
+        an enum with a repr type (AGAST #4574), else its declaration index."""
         if enum_name not in self.enum_types:
             raise self._err(f"Unknown enum type: {enum_name}")
         _, variants = self.enum_types[enum_name]
+        discs = (self._variant_discriminants(variants)
+                 if enum_name in self.enum_reprs else None)
         for i, variant in enumerate(variants):
             if variant.name == variant_name:
-                return i
+                return discs[i] if discs is not None else i
         raise self._err(f"Unknown variant {variant_name} in enum {enum_name}")
+
+    def _enum_tag_const(self, enum_name: str, variant_name: str) -> ir.Constant:
+        """Field 0's value for `enum_name.variant_name`, typed to match."""
+        tag_ty = self._enum_tag_type(enum_name)
+        tag = self._get_enum_variant_tag(enum_name, variant_name)
+        return ir.Constant(tag_ty, tag & ((1 << tag_ty.width) - 1))
 
     def _has_enum_variant(self, enum_name: str, variant_name: str) -> bool:
         """Is `variant_name` a declared variant of `enum_name`?
@@ -3398,7 +3437,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
         # Store the tag (index 0)
         tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
-        self.builder.store(ir.Constant(self.i8, tag), tag_ptr)
+        self.builder.store(self._enum_tag_const(enum_name, variant_name), tag_ptr)
 
         # Store payload data if any
         if variant.fields and args:
@@ -3647,7 +3686,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
         # Store the tag (index 0)
         tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
-        self.builder.store(ir.Constant(self.i8, tag), tag_ptr)
+        self.builder.store(self._enum_tag_const(enum_name, variant_name), tag_ptr)
 
         # Store payload data if any
         if variant.fields and args:
@@ -11853,6 +11892,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 break
         if tag_idx is None:
             return None
+        tag_const = self._enum_tag_const(type_name, target_variant)
 
         receiver = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
         # Through every level of pointer to the enum (§5.4, #2398).
@@ -11865,7 +11905,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         self.builder.store(receiver, enum_alloca)
         tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
         tag_val = self.builder.load(tag_ptr)
-        return self.builder.icmp_unsigned('==', tag_val, ir.Constant(self.i8, tag_idx))
+        return self.builder.icmp_unsigned('==', tag_val, tag_const)
 
     def _try_emit_strview_builtin(
         self,
@@ -11973,7 +12013,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
         tag_ptr = self.builder.gep(enum_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, 0)])
         tag_val = self.builder.load(tag_ptr)
-        is_target = self.builder.icmp_unsigned('==', tag_val, ir.Constant(self.i8, target_tag))
+        is_target = self.builder.icmp_unsigned(
+            '==', tag_val, self._enum_tag_const(type_name, target_variant))
 
         ok_block = self.current_fn.append_basic_block("unwrap.ok")
         bad_block = self.current_fn.append_basic_block("unwrap.bad")
@@ -14198,11 +14239,12 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                               expr: rast.Cast) -> Optional[ir.Value]:
         """`e as U` for a fieldless enum value: its discriminant (§10.4).
 
-        None when `val` is no enum.  The tag is the declaration index; it
-        maps to the discriminant through a select chain over constants
-        already reduced to U's width (an integer cast of the representation
-        value yields exactly that residue, widening or narrowing).  An enum
-        whose discriminants are its indices is a plain zext/trunc of the tag.
+        None when `val` is no enum.  An enum with a representation type
+        holds its discriminant (AGAST #4574): U is an integer cast of it,
+        sign-extended for a signed repr.  Otherwise the tag is the
+        declaration index; it maps to the discriminant through a select
+        chain over constants already reduced to U's width, or, when the
+        discriminants are the indices, a plain zext/trunc of the tag.
         """
         entry = self._enum_entry_of_type(val.type)
         if entry is None:
@@ -14213,13 +14255,12 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 raise EmitError(
                     f"cannot convert enum '{enum_name}' to an integer: variant "
                     f"'{v.name}' carries data", expr.span)
-        discs = []
-        for v in variants:
-            discs.append(v.discriminant if v.discriminant is not None
-                         else (discs[-1] + 1 if discs else 0))
+        discs = self._variant_discriminants(variants)
         tag = self.builder.extract_value(val, 0, name="enum.tag")
-        if discs == list(range(len(discs))):
+        if enum_name in self.enum_reprs or discs == list(range(len(discs))):
             if tag.type.width < target_type.width:
+                if self._enum_tag_signed(enum_name):
+                    return self.builder.sext(tag, target_type)
                 return self.builder.zext(tag, target_type)
             if tag.type.width > target_type.width:
                 return self.builder.trunc(tag, target_type)

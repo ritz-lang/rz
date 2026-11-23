@@ -687,8 +687,8 @@ class PatternEmitter:
                     # own span instead of letting a bare ValueError escape.
                     self._require_enum_variant(enum_name, pattern.name, pattern.span)
                     self._refuse_payload_pattern(pattern)
-                    tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
-                    switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
+                    switch.add_case(self._enum_tag_const(enum_name, pattern.name),
+                                    arm_block)
                 elif isinstance(pattern, rast.IdentPattern):
                     # IdentPattern with a variant name (e.g., just `None` without parens)
                     # `variant_to_enum` is global across every enum in scope, so a
@@ -697,8 +697,8 @@ class PatternEmitter:
                     # only a variant case when it belongs to *this* enum; otherwise
                     # it is an ordinary catch-all binding.
                     if self._has_enum_variant(enum_name, pattern.name):
-                        tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
-                        switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
+                        switch.add_case(self._enum_tag_const(enum_name, pattern.name),
+                                        arm_block)
                     else:
                         # This is a catch-all binding - becomes default
                         switch.default = arm_block

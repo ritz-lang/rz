@@ -136,8 +136,11 @@ largest variant:
    index 0    index 1        index 1 or 2
 ```
 
-- **Tag** is always `i8` at struct index 0. The tag value is the variant's
-  ordinal in the declaration — first variant is 0.
+- **Tag** is `i8` at struct index 0. The tag value is the variant's
+  ordinal in the declaration — first variant is 0. The one exception is a
+  fieldless enum with a representation type (`enum E: i32`, LANGUAGE_SPEC
+  §10.1, AGAST #4574): its body is `{ i32 }` (the repr type), holding the
+  variant's discriminant rather than its ordinal.
 - **Padding** is present only when the payload needs alignment greater than 1.
   Its width is `(max_align - (1 % max_align)) % max_align`, i.e. enough to push
   the data buffer to `max_align`. When present the data buffer is at index 2,

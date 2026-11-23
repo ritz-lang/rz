@@ -4426,6 +4426,50 @@ significant — reordering fields changes the layout, just as it does in a
 `Option<T>` and `Result<T, E>` are defined in `ritzlib.option` and
 `ritzlib.result` respectively; import them rather than redeclaring them.
 
+**Layout of a fieldless enum.** How a fieldless enum (no variant carries
+data) is stored depends on whether it names a representation type (§10.4):
+
+- **With a representation type** (`enum E: i32`), a value is stored as that
+  integer type, holding the variant's *discriminant*. `sizeof(E)` is the
+  representation type's size, a struct field of type `E` has its size and
+  alignment, and zeroed memory reads as discriminant 0 (AGAST #4574).
+- **Without one**, a value is a one-byte tag holding the variant's
+  declaration index, so `sizeof(E)` is 1 and zeroed memory reads as the
+  first declared variant.
+
+```ritz
+enum Wide: i32
+    Neg = -1
+    Zero = 0
+
+enum Narrow
+    A
+    B
+
+struct Pair
+    w: Wide
+    b: u8
+
+fn main() -> i32
+    var raw: i64 = 0
+    let w: *Wide = @raw as *Wide
+    if (*w) != Wide.Zero             # zeroed memory: discriminant 0
+        return 1
+    *w = Wide.Neg
+    if raw != 0xFFFFFFFF             # stored as the i32 -1
+        return 2
+    (sizeof(Wide) + sizeof(Narrow) + sizeof(Pair)) as i32   # 4 + 1 + 8
+```
+
+Memory read as a representation-typed enum can hold a value that is no
+variant's discriminant (zeroed memory where no variant is 0, or bytes
+written as an integer). `e as U` converts that value like any other, and
+`==` compares the discriminant it holds, so it equals no variant. In a
+`match` it takes a `_` or binding arm. A `match` that names every variant
+and has no such arm has no arm for it: that is undefined behaviour. Read
+memory that may name no variant as the representation type, and convert it
+with `E.from` (§10.4).
+
 A `match` on an enum must cover every variant (§8.1). For the full treatment —
 memory layout and the design rationale — see
 [`docs/ENUM_VARIANTS.md`](ENUM_VARIANTS.md).
@@ -4639,11 +4683,11 @@ The rules:
 - Every discriminant must fit the representation type, and no two variants
   may share one.
 - `= N` needs a representation type, and an enum with one must be fieldless.
-- The representation type fixes the discriminants' type, not the enum's
-  layout: an enum value is still its tag (§10.1), whatever its
-  discriminants. Convert explicitly to pass one as an integer: an enum
-  value where an integer is expected (a return, an argument, an annotated
-  `let` / `var`, an assignment) is an error.
+- The representation type is also the enum's layout: a value is stored as
+  that integer type, holding its discriminant (§10.1). It is still no
+  integer: convert explicitly to pass one as an integer. An enum value where
+  an integer is expected (a return, an argument, an annotated `let` / `var`,
+  an assignment) is an error.
 
 ```ritz expect-error="expected i64, found enum 'St'; convert with `as`"
 enum St

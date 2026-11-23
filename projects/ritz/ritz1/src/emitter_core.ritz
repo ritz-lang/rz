@@ -3026,7 +3026,8 @@ pub fn mangled_type_size_align(s: *EmitterState, name_sv: StrView, align: *i64) 
     if st == null
         let uei: i32 = user_enum_index(StrView { ptr: (name), len: (len) as i64 })
         if uei >= 0
-            return user_enum_size(s, uei)   # all-i8 struct: 1-aligned (#1797)
+            *align = user_enum_align(uei)   # 1 unless a repr enum (#1797, #4574)
+            return user_enum_size(s, uei)
         if is_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
             return 1   # generic user enum: unmeasured, tag only
         return 0
@@ -3174,13 +3175,35 @@ pub fn user_enum_layout(s: *EmitterState, ei: i32, pad: *i64) -> i64
         *pad = (max_align - (1 % max_align)) % max_align
     max_size
 
-# Total byte size of user enum `ei` (1 for a tag-only enum).
+# Total byte size of user enum `ei`: a tag-only enum is its tag, 1 byte or
+# its repr type's size (AGAST #4574).
 pub fn user_enum_size(s: *EmitterState, ei: i32) -> i64
     var pad: i64 = 0
     let n: i64 = user_enum_layout(s, ei, @pad)
     if n == 0
-        return 1
+        return enum_tag_size(ei)
     1 + pad + n
+
+# Field 0 of the enum named `name_sv` (AGAST #4574): its LLVM type, and
+# the value variant index `vi` stores there -- the repr type and the
+# discriminant for an `enum E: <int>`, else i8 and the index (Option /
+# Result and generic instances included).
+pub fn enum_tag_ty_named(name_sv: StrView) -> *u8
+    let ei: i32 = user_enum_index(name_sv)
+    if ei < 0
+        return IR_TY_I8
+    enum_tag_llvm(ei)
+
+pub fn enum_tag_value_named(name_sv: StrView, vi: i32) -> i64
+    let ei: i32 = user_enum_index(name_sv)
+    if ei < 0
+        return vi as i64
+    enum_tag_value(ei, vi)
+
+# Alignment of user enum `ei`: its repr type's for `enum E: <int>`
+# (AGAST #4574), else 1 (an all-i8 struct, #1797).
+pub fn user_enum_align(ei: i32) -> i64
+    enum_tag_size(ei)
 
 # Field count of variant `vi` of user enum `ei` (0 for a unit variant).
 pub fn enum_variant_field_count(ei: i32, vi: i32) -> i32
@@ -5501,8 +5524,9 @@ fn get_struct_align_by_name(s: *EmitterState, name_sv: StrView) -> i64
         return 1   # AGAST #1898: { i8, [P x i8], [N x i8] } is 1-aligned
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (name_len) as i64 })
     if st == null
-        if user_enum_index(StrView { ptr: (name), len: (name_len) as i64 }) >= 0
-            return 1   # AGAST #1797: an all-i8 struct
+        let uei: i32 = user_enum_index(StrView { ptr: (name), len: (name_len) as i64 })
+        if uei >= 0
+            return user_enum_align(uei)   # AGAST #1797, #4574
         return 8
     if struct_is_packed(st) == 1
         return 1   # `[[packed]]`: an LLVM packed struct is 1-aligned (#1847)
