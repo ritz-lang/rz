@@ -39,8 +39,9 @@
 #     finished, its value stored in the future's `__result`, of the fn's
 #     declared type (a unit fn's future has none).  `await` polls until true,
 #     then reads the field.  An awaited expression that is not an async fn's
-#     call is a hand-written poll source: an `Option<i32>`, `None` while
-#     Pending and `Some(v)` once Ready, so any i32 is a result (AGAST #4558).
+#     call is a hand-written poll source: an `Option<T>`, `None` while
+#     Pending and `Some(v)` once Ready, so any T is a result (AGAST #4558).
+#     T is the declared return type's, of the fn or method it calls (#4604).
 #   * `async fn main` is `__main_future` + `main$poll`, and a sync `main`
 #     polls it to completion.
 #   * `await g(..)` anywhere else (a sync fn) polls g's future until Ready,
@@ -60,268 +61,7 @@ import ritzlib.string
 
 import ast
 import diag
-
-# ---------------------------------------------------------------------------
-# Names and nodes
-# ---------------------------------------------------------------------------
-
-fn al_zalloc(size: i64) -> *u8
-    calloc(1, size)
-
-fn al_clen(s: *u8) -> i32
-    var n: i32 = 0
-    while *(s + n) != 0
-        n += 1
-    n
-
-fn al_eq(a_sv: StrView, b_sv: StrView) -> i32
-    var a: *u8 = a_sv.ptr
-    var alen: i32 = a_sv.len as i32
-    var b: *u8 = b_sv.ptr
-    var blen: i32 = b_sv.len as i32
-    if alen != blen
-        return 0
-    var i: i32 = 0
-    while i < alen
-        if *(a + i) != *(b + i)
-            return 0
-        i += 1
-    1
-
-# Bytewise order of two names, as Python's sorted() orders ritz0's fields.
-fn al_less(a_sv: StrView, b_sv: StrView) -> i32
-    var a: *u8 = a_sv.ptr
-    var alen: i32 = a_sv.len as i32
-    var b: *u8 = b_sv.ptr
-    var blen: i32 = b_sv.len as i32
-    var i: i32 = 0
-    while i < alen and i < blen
-        if *(a + i) != *(b + i)
-            return (*(a + i) < *(b + i)) as i32
-        i += 1
-    (alen < blen) as i32
-
-# `a` then `b` (`blen` bytes), NUL-terminated; its length goes to `*out_len`.
-fn al_join(a_sv: StrView, b_sv: StrView, out_len: *i32) -> *u8
-    var a: *u8 = a_sv.ptr
-    var alen: i32 = a_sv.len as i32
-    var b: *u8 = b_sv.ptr
-    var blen: i32 = b_sv.len as i32
-    let r: *u8 = al_zalloc((alen + blen + 1) as i64)
-    var i: i32 = 0
-    while i < alen
-        *(r + i) = *(a + i)
-        i += 1
-    var j: i32 = 0
-    while j < blen
-        *(r + alen + j) = *(b + j)
-        j += 1
-    *out_len = alen + blen
-    r
-
-# `<name>$Future` and `<name>$poll`: the items an async fn generates.  `$` is
-# no identifier character (lexer.ritz), so no Ritz source can spell either:
-# they are the compiler's alone and can't clash with a user's `fetch_poll` or
-# `fetch_Future` (AGAST #3606).  The spelling lives here and nowhere else.
-const AL_FUTURE_SUFFIX: i32 = 7
-const AL_POLL_SUFFIX: i32 = 5
-
-fn al_future_struct_name(name: *u8, name_len: i32, out_len: *i32) -> *u8
-    al_join(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"$Future"), len: (AL_FUTURE_SUFFIX) as i64 }, out_len)
-
-fn al_poll_fn_name(name: *u8, name_len: i32, out_len: *i32) -> *u8
-    al_join(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"$poll"), len: (AL_POLL_SUFFIX) as i64 }, out_len)
-
-# `<prefix><n>`: `__future_3`.
-fn al_numbered(prefix: *u8, n: i32, out_len: *i32) -> *u8
-    var digits: [12]u8
-    var k: i32 = 0
-    var v: i32 = n
-    if v == 0
-        digits[0] = '0'
-        k = 1
-    while v > 0
-        digits[k] = ('0' as i32 + v % 10) as u8
-        v = v / 10
-        k += 1
-    var rev: [12]u8
-    var i: i32 = 0
-    while i < k
-        rev[i] = digits[k - 1 - i]
-        i += 1
-    al_join(StrView { ptr: (prefix), len: (al_clen(prefix)) as i64 }, StrView { ptr: (@rev[0]), len: (k) as i64 }, out_len)
-
-fn al_expr(kind: ExprKind, span: SrcSpan) -> *Expr
-    let e: *Expr = al_zalloc(sizeof(Expr)) as *Expr
-    e.kind = kind
-    e.span = span
-    e.slot_type = TypeKind.Void
-    e
-
-fn al_int(v: i64, span: SrcSpan) -> *Expr
-    let e: *Expr = al_expr(ExprKind.IntLit, span)
-    e.int_val = v
-    e.lit_kind = LIT_PLAIN
-    e
-
-fn al_ident(name_sv: StrView, span: SrcSpan) -> *Expr
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let e: *Expr = al_expr(ExprKind.Ident, span)
-    e.ident_ptr = name
-    e.ident_len = len
-    e
-
-# `self.<name>`
-fn al_self_field(name_sv: StrView, span: SrcSpan) -> *Expr
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let e: *Expr = al_expr(ExprKind.Member, span)
-    e.left = al_ident(StrView { ptr: (c"self"), len: (4) as i64 }, span)
-    e.ident_ptr = name
-    e.ident_len = len
-    e.bracket = span
-    e
-
-fn al_binary(op: OpKind, left: *Expr, right: *Expr) -> *Expr
-    let e: *Expr = al_expr(ExprKind.Binary, left.span)
-    e.op = op
-    e.left = left
-    e.right = right
-    e
-
-# `0 - 1`: a future's `__state` DONE marker, written as ritz0 writes it.  It
-# is the future's own state, never a value: a poll source's Pending is its
-# `Option<i32>`'s `None` (AGAST #4558).
-fn al_pending(span: SrcSpan) -> *Expr
-    al_binary(OpKind.Sub, al_int(0, span), al_int(1, span))
-
-# `recv.name()`: a method call with no args.
-fn al_method0(recv: *Expr, name_sv: StrView, span: SrcSpan) -> *Expr
-    let e: *Expr = al_expr(ExprKind.Method, span)
-    e.left = recv
-    e.ident_ptr = name_sv.ptr
-    e.ident_len = name_sv.len as i32
-    e
-
-fn al_call(name_sv: StrView, args: *Expr, span: SrcSpan) -> *Expr
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let e: *Expr = al_expr(ExprKind.Call, span)
-    e.func_name = name
-    e.func_name_len = len
-    e.args = args
-    e
-
-fn al_addr_of(name_sv: StrView, span: SrcSpan) -> *Expr
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let e: *Expr = al_expr(ExprKind.Unary, span)
-    e.op = OpKind.Addr
-    e.operand = al_ident(StrView { ptr: (name), len: (len) as i64 }, span)
-    e
-
-fn al_stmt(kind: StmtKind, span: SrcSpan) -> *Stmt
-    let s: *Stmt = al_zalloc(sizeof(Stmt)) as *Stmt
-    s.kind = kind
-    s.span = span
-    s
-
-fn al_expr_stmt(e: *Expr) -> *Stmt
-    let s: *Stmt = al_stmt(StmtKind.Expr, e.span)
-    s.expr = e
-    s
-
-fn al_return(v: *Expr, span: SrcSpan) -> *Stmt
-    let s: *Stmt = al_stmt(StmtKind.Return, span)
-    s.return_value = v
-    s
-
-fn al_if(cond: *Expr, then_body: *Stmt, span: SrcSpan) -> *Stmt
-    let s: *Stmt = al_stmt(StmtKind.If, span)
-    s.if_cond = cond
-    s.if_then = then_body
-    s
-
-# `self.<name> = v`
-fn al_assign_self(name_sv: StrView, v: *Expr, span: SrcSpan) -> *Stmt
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let s: *Stmt = al_stmt(StmtKind.MemberAssign, span)
-    s.if_cond = al_ident(StrView { ptr: (c"self"), len: (4) as i64 }, span)
-    s.assign_target = name
-    s.assign_target_len = len
-    s.bracket = span
-    s.assign_value = v
-    s
-
-fn al_assign_name(name_sv: StrView, v: *Expr, span: SrcSpan) -> *Stmt
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let s: *Stmt = al_stmt(StmtKind.Assign, span)
-    s.assign_target = name
-    s.assign_target_len = len
-    s.assign_value = v
-    s
-
-# `let`/`var <name>: i32 = init` (ty TypeKind.I32), or `: <type_name>` (TypeKind.Struct).
-fn al_decl(name_sv: StrView, ty: TypeKind, type_name_sv: StrView, init: *Expr, is_let: i32, file: *u8, span: SrcSpan) -> *Stmt
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var type_name: *u8 = type_name_sv.ptr
-    var type_name_len: i32 = type_name_sv.len as i32
-    let s: *Stmt = al_stmt(StmtKind.VarDecl, span)
-    s.var_name = name
-    s.var_name_len = len
-    s.var_type = ty
-    s.var_declared_type = ty
-    s.var_type_name = type_name
-    s.var_type_name_len = type_name_len
-    s.var_pointee_type = TypeKind.I64
-    if ty == TypeKind.I32
-        s.var_src_file = file
-    s.var_init = init
-    s.var_is_let = is_let
-    s.name_span = span
-    s
-
-# `head` with `s` linked at its end.
-fn al_append(head: *Stmt, s: *Stmt) -> *Stmt
-    if head == null
-        return s
-    var cur: *Stmt = head
-    while cur.next != null
-        cur = cur.next
-    cur.next = s
-    head
-
-fn al_last(head: *Stmt) -> *Stmt
-    var cur: *Stmt = head
-    while cur != null and cur.next != null
-        cur = cur.next
-    cur
-
-# A fn generated from `orig`: its line, file, visibility and locality.
-fn al_fn(orig: *FnDef, name_sv: StrView, params: *Param, ret: TypeKind, ret_name_sv: StrView, body: *Stmt) -> *FnDef
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var ret_name: *u8 = ret_name_sv.ptr
-    var ret_len: i32 = ret_name_sv.len as i32
-    let f: *FnDef = al_zalloc(sizeof(FnDef)) as *FnDef
-    f.name = name
-    f.name_len = len
-    f.params = params
-    f.return_type = ret
-    f.return_type_name = ret_name
-    f.return_type_name_len = ret_len
-    f.body = body
-    f.line = orig.line
-    f.col = orig.col
-    f.is_local = orig.is_local
-    f.is_pub = orig.is_pub
-    f.def_file = orig.def_file
-    f.target_gated = orig.target_gated
-    f
+import async_ast       # its node builders and names (al_expr, al_decl, al_fn)
 
 # ---------------------------------------------------------------------------
 # The module's async fns
@@ -356,6 +96,17 @@ fn al_call_of_async(e: *Expr) -> *AlAsync
     if e == null or e.kind != ExprKind.Call or e.call_type_suffix_len != 0
         return null
     al_find_async(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+
+# 1 when `s` starts with `prefix`.
+fn al_starts_with(s: StrView, prefix: StrView) -> i32
+    if s.len < prefix.len
+        return 0
+    var i: i64 = 0
+    while i < prefix.len
+        if *(s.ptr + i) != *(prefix.ptr + i)
+            return 0
+        i += 1
+    1
 
 # 1 when `s` ends with `suffix`.
 fn al_ends_with(s: StrView, suffix: StrView) -> i32
@@ -630,6 +381,120 @@ fn al_held_async(a: *AlFn, e: *Expr) -> *AlAsync
         return null
     al_find_async(StrView { ptr: (l.type_name), len: (l.type_name_len - 7) as i64 })
 
+# The struct a method receiver local `l` (`S`, `*S`) names; null otherwise.
+fn al_recv_type(l: *AlLocal) -> *u8
+    if l == null or l.type_name == null
+        return null
+    if l.ty == TypeKind.Struct or (l.ty == TypeKind.Ptr and l.pointee == TypeKind.Struct)
+        return l.type_name
+    null
+
+# The method `name` of an inherent or trait impl on struct `ty`; null if none.
+fn al_find_method(ty_sv: StrView, name_sv: StrView) -> *FnDef
+    var ib: *ImplBlock = g_al_module.impls
+    while ib != null
+        if ib.type_params == null and al_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, ty_sv) == 1
+            var m: *FnDef = ib.methods
+            while m != null
+                if al_eq(StrView { ptr: (m.name), len: (m.name_len) as i64 }, name_sv) == 1
+                    return m
+                m = m.next
+        ib = ib.next
+    null
+
+# The sync fn or method a poll source `e` calls (AGAST #4604): `src(..)` of a
+# declared fn, or `r.m(..)` with r a local or param of a struct type with an
+# impl declaring m.  Null when no declaration says (a fn pointer's call, a
+# receiver of untold type); ritz0's poll_source_fn.
+fn al_source_fn(a: *AlFn, e: *Expr) -> *FnDef
+    if e == null
+        return null
+    if e.kind == ExprKind.Call and e.func_name != null
+        if e.call_type_suffix_len != 0 or al_local_find(a, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) != null
+            return null
+        let f: *FnDef = al_find_fn(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+        if f == null or f.type_params != null
+            return null
+        return f
+    if e.kind == ExprKind.Method and e.left != null and e.left.kind == ExprKind.Ident
+        let r: *AlLocal = al_local_find(a, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+        let ty: *u8 = al_recv_type(r)
+        if ty == null
+            return null
+        let m: *FnDef = al_find_method(StrView { ptr: (ty), len: (r.type_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        if m == null or m.type_params != null
+            return null
+        return m
+    null
+
+# `l` holds poll source f's T, of its declared `-> Option<T>` (monomorphised
+# `Option$T`): 1; 0 when f returns no Option, or a T ritz1 can't hold in a
+# future (AGAST #4604).  ritz0's PollAbi.source_value_type.
+fn al_set_source_value(l: *AlLocal, f: *FnDef) -> i32
+    if f.return_type != TypeKind.Struct or f.return_type_name == null or f.return_type_name_len <= 7
+        return 0
+    if al_starts_with(StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }, StrView { ptr: (c"Option$"), len: (7) as i64 }) == 0
+        return 0
+    let t: StrView = StrView { ptr: (f.return_type_name + 7), len: (f.return_type_name_len - 7) as i64 }
+    let prim: TypeKind = al_prim_of(t)
+    if prim != TypeKind.Void
+        al_set_scalar(l, prim)
+        return 1
+    if al_starts_with(t, StrView { ptr: (c"ptr_"), len: (4) as i64 }) == 1
+        let inner: StrView = StrView { ptr: (t.ptr + 4), len: (t.len - 4) }
+        if al_starts_with(inner, StrView { ptr: (c"ptr_"), len: (4) as i64 }) == 1 or al_type_name_unheld(inner) == 1
+            return 0
+        al_set_scalar(l, TypeKind.Ptr)
+        let pt: TypeKind = al_prim_of(inner)
+        if pt != TypeKind.Void
+            l.pointee = pt
+        else
+            l.pointee = TypeKind.Struct
+            l.type_name = inner.ptr
+            l.type_name_len = inner.len as i32
+        return 1
+    if al_type_name_unheld(t) == 1
+        return 0
+    al_set_struct(l, t)
+    1
+
+# 1 when a mangled type argument names a type a future can't hold as a struct
+# field by name: a reference (`ref_`, `refmut_`) or an array (`arr4_`).
+fn al_type_name_unheld(t: StrView) -> i32
+    if al_starts_with(t, StrView { ptr: (c"ref_"), len: (4) as i64 }) == 1 or al_starts_with(t, StrView { ptr: (c"refmut_"), len: (7) as i64 }) == 1
+        return 1
+    if t.len > 3 and al_starts_with(t, StrView { ptr: (c"arr"), len: (3) as i64 }) == 1 and *(t.ptr + 3) >= 48 and *(t.ptr + 3) <= 57
+        return 1
+    0
+
+# `await e` in an async fn, e no async fn's call nor a held future: a poll
+# source, refused at the await when no declaration types it, or it returns no
+# `Option<T>` (AGAST #4558, #4604), in ritz0's words (check_poll_source).
+# Run as the analysis walks, so in source order and before the locals'.
+fn al_check_source(a: *AlFn, aw: *Expr)
+    let inner: *Expr = aw.operand
+    if al_call_of_async(inner) != null or al_held_async(a, inner) != null
+        return
+    let f: *FnDef = al_source_fn(a, inner)
+    if f == null
+        var m: String = string_new()
+        m.push_str("`await`: the poll source's type is unknown; a poll source is a call of a fn or method declared to return `Option<T>`")
+        al_refuse(a, @&m, aw.span)
+        return
+    var probe: AlLocal
+    if al_set_source_value(@probe, f) == 1
+        return
+    var m: String = string_new()
+    m.push_str("`await ")
+    if inner.kind == ExprKind.Method
+        m.push_span(Span<u8> { ptr: (inner.left.ident_ptr), len: (inner.left.ident_len as i64) as i64 })
+        m.push_str(".")
+    m.push_span(Span<u8> { ptr: (f.name), len: (f.name_len as i64) as i64 })
+    m.push_str("(..)`: a poll source returns `Option<T>` (`None` while Pending, `Some(v)` when Ready); `")
+    m.push_span(Span<u8> { ptr: (f.name), len: (f.name_len as i64) as i64 })
+    m.push_str("` does not")
+    al_refuse(a, @&m, aw.span)
+
 fn al_infer(a: *AlFn, e: *Expr, l: *AlLocal) -> i32
     if e == null
         return 0
@@ -641,8 +506,11 @@ fn al_infer(a: *AlFn, e: *Expr, l: *AlLocal) -> i32
                 let h: *AlAsync = al_held_async(a, e.operand)
                 if h != null
                     return al_set_ret(l, h.f)
-                al_set_scalar(l, TypeKind.I32)   # a hand-written poll source's i32
-                return 1
+                # A hand-written poll source's T, of its `Option<T>` (#4604).
+                let src: *FnDef = al_source_fn(a, e.operand)
+                if src == null
+                    return 0
+                return al_set_source_value(l, src)
             return al_set_ret(l, g.f)   # the awaited fn's result (#1318, R78)
         ExprKind.IntLit =>
             if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
@@ -798,6 +666,8 @@ fn al_an_expr(a: *AlFn, e: *Expr)
     match k
         ExprKind.Await =>
             al_an_expr(a, e.operand)
+            if a.sync == 0
+                al_check_source(a, e)
             a.npoints += 1
         ExprKind.Binary | ExprKind.Range | ExprKind.Index =>
             al_an_expr(a, e.left)
@@ -2061,7 +1931,7 @@ fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
             return
         var n: i32 = 0
         let tmp: *u8 = al_numbered(c"__await_result_", a.nawaits, @n)
-        # Of the awaited fn's result type (R78); a poll source's i32.  A held
+        # Of the awaited fn's result type (R78); a poll source's T.  A held
         # future's (`await p`, R79) is its async fn's.
         let g: *AlAsync = al_call_of_async(e.operand)
         var held: *AlAsync = null
@@ -2079,8 +1949,15 @@ fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
                 al_no_value(a, held, e.span)
             return
         let res: *AlLocal = al_extra(a, StrView { ptr: (tmp), len: (n) as i64 })
-        if callee == null or al_set_ret(res, callee) == 0
-            al_set_scalar(res, TypeKind.I32)
+        if callee != null
+            if al_set_ret(res, callee) == 0
+                al_set_scalar(res, TypeKind.I32)
+        else
+            # A poll source's T, of its `Option<T>` (AGAST #4604); the
+            # analysis refused one with none.
+            let src: *FnDef = al_source_fn(a, e.operand)
+            if src == null or al_set_source_value(res, src) == 0
+                al_set_scalar(res, TypeKind.I32)
         var d: AlDest = al_dest(AL_TO_FIELD, e.span)
         d.name = tmp
         d.len = n
@@ -2251,9 +2128,9 @@ fn al_if_value(a: *AlFn, e: *Expr)
 # future into a field once, and the resume state polls it until it answers
 # true (R78), so a Pending one is polled again on the next poll, not rebuilt;
 # then it reads the future's `__result`.  Anything else awaited is a
-# hand-written poll source, an `Option<i32>` evaluated again at each poll
-# until it is `Some(v)`, and the await is `v`: any i32, -1 and -4096 among
-# them (AGAST #4558).
+# hand-written poll source, an `Option<T>` evaluated again at each poll
+# until it is `Some(v)`, and the await is `v`: any T, an i32's -1 and -4096
+# among them (AGAST #4558), T from the callee's declared type (#4604).
 fn al_lower_await(a: *AlFn, aw: *Expr, d: *AlDest)
     let k: i32 = a.nawaits
     a.nawaits += 1
@@ -2314,7 +2191,12 @@ fn al_lower_await(a: *AlFn, aw: *Expr, d: *AlDest)
             return
         al_deliver(a, al_result_of(al_self_field(StrView { ptr: (inner.ident_ptr), len: (inner.ident_len) as i64 }, span), span), d)
         return
-    al_not_source(a, inner, span)
+    # The source's own `Option<T>` (AGAST #4604): the analysis refused one
+    # no declaration types.
+    let src: *FnDef = al_source_fn(a, inner)
+    var src_ty: StrView = StrView { ptr: (c"Option$i32"), len: (10) as i64 }
+    if src != null and src.return_type_name != null
+        src_ty = StrView { ptr: (src.return_type_name), len: (src.return_type_name_len) as i64 }
     var anl: i32 = 0
     let answer: *u8 = al_numbered(c"__poll_", k, @anl)
     let polled: *Expr = al_hoist(a, inner)
@@ -2322,28 +2204,9 @@ fn al_lower_await(a: *AlFn, aw: *Expr, d: *AlDest)
     let resume: *AlBlock = al_new_block(a)
     al_goto(a, resume, span)
     a.cur = resume
-    al_emit(a, al_decl(StrView { ptr: (answer), len: (anl) as i64 }, TypeKind.Struct, StrView { ptr: (c"Option$i32"), len: (10) as i64 }, polled, 1, a.file, span))
+    al_emit(a, al_decl(StrView { ptr: (answer), len: (anl) as i64 }, TypeKind.Struct, src_ty, polled, 1, a.file, span))
     al_emit(a, al_if(al_poll_source_is_pending(al_ident(StrView { ptr: (answer), len: (anl) as i64 }, span)), al_poll_pending_stmt(span), span))
     al_deliver(a, al_poll_source_value(al_ident(StrView { ptr: (answer), len: (anl) as i64 }, span)), d)
-
-# `await f(..)` in an async fn, f a sync fn: a poll source, so f must return
-# `Option<i32>` (AGAST #4558).  Refused at the await otherwise, in ritz0's
-# words (async_transform_v2.py poll_source_refusal).
-fn al_not_source(a: *AlFn, inner: *Expr, span: SrcSpan)
-    if inner.kind != ExprKind.Call or inner.func_name == null
-        return
-    let f: *FnDef = al_find_fn(StrView { ptr: (inner.func_name), len: (inner.func_name_len) as i64 })
-    if f == null or f.is_async == 1
-        return
-    if f.return_type_name != null and al_eq(StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }, StrView { ptr: (c"Option$i32"), len: (10) as i64 }) == 1
-        return
-    var m: String = string_new()
-    m.push_str("`await ")
-    m.push_span(Span<u8> { ptr: (inner.func_name), len: (inner.func_name_len as i64) as i64 })
-    m.push_str("(..)`: a poll source returns `Option<i32>` (`None` while Pending, `Some(v)` when Ready); `")
-    m.push_span(Span<u8> { ptr: (inner.func_name), len: (inner.func_name_len as i64) as i64 })
-    m.push_str("` does not")
-    al_refuse(a, @&m, span)
 
 fn al_deliver(a: *AlFn, v: *Expr, d: *AlDest)
     v.next = null
@@ -3055,6 +2918,10 @@ fn al_analyse(a: *AlFn) -> i32
         al_local_of_param(a, p)
         p = p.next
     al_an_stmts(a, f.body, 1)
+    # A poll source refused as the walk met it (AGAST #4604), as ritz0's
+    # analyzer raises there, before any local's error.
+    if a.errs > 0
+        return a.errs
     if a.npoints > 0
         # Which locals may stay poll locals rather than future fields.
         al_mark_walk_stmts(a, f.body, 0)

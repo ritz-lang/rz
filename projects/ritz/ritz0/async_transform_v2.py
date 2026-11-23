@@ -148,11 +148,95 @@ def _literal_operand(expr: rast.Expr) -> bool:
     return _untyped_int_literal(expr) or fold_literal_i64(expr) is not None
 
 
-def poll_source_refusal(name: str) -> str:
-    """The words for `await name(..)` of a sync fn that is no poll source (AGAST
-    #4558); ritz1's al_not_source says the same."""
-    return (f"`await {name}(..)`: a poll source returns `Option<i32>` (`None` while Pending, "
+def poll_source_refusal(called: str, name: str) -> str:
+    """The words for `await called(..)` of a sync fn or method `name` that is no
+    poll source (AGAST #4558, #4604); ritz1's al_not_source says the same."""
+    return (f"`await {called}(..)`: a poll source returns `Option<T>` (`None` while Pending, "
             f"`Some(v)` when Ready); `{name}` does not")
+
+
+def poll_source_unknown() -> str:
+    """The words for awaiting a poll source whose declared type the lowering
+    can't find, a fn pointer's call say (AGAST #4604); ritz1's al_source_fn."""
+    return ("`await`: the poll source's type is unknown; a poll source is a call of a fn "
+            "or method declared to return `Option<T>`")
+
+
+class DeclSigs(dict):
+    """Declared fns by name, as a plain dict, plus what a poll source's type
+    takes to read (AGAST #4604): inherent and trait methods by `(type, name)`
+    and enums by name, for a monomorphised `Option$T`'s `Some` payload."""
+
+    def __init__(self, fns=None, methods=None, enums=None):
+        super().__init__(fns or {})
+        self.methods: Dict[Tuple[str, str], rast.FnDef] = methods or {}
+        self.enums: Dict[str, rast.EnumDef] = enums or {}
+
+    @classmethod
+    def of_module(cls, module: rast.Module) -> 'DeclSigs':
+        items = module.items
+        return cls({i.name: i for i in items if isinstance(i, rast.FnDef)},
+                   {(i.type_name, m.name): m for i in items if isinstance(i, rast.ImplBlock)
+                    for m in i.methods},
+                   {i.name: i for i in items if isinstance(i, rast.EnumDef)})
+
+
+def _receiver_type_name(ty: Optional[rast.Type]) -> Optional[str]:
+    """The struct a method receiver of type `ty` (`S`, `*S`, `@S`) names."""
+    while isinstance(ty, (rast.PtrType, rast.RefType)):
+        ty = ty.inner
+    if isinstance(ty, rast.NamedType) and not ty.args:
+        return ty.name
+    return None
+
+
+def poll_source_fn(inner: rast.Expr, local_types: Dict[str, Optional[rast.Type]],
+                   fn_sigs: Dict[str, rast.FnDef]) -> Optional[Tuple[rast.FnDef, str, str]]:
+    """The sync fn or method a poll source `inner` calls, with the call as an
+    `await` names it (`src`, `s.poll`) and the callee's own name; None when no
+    declaration says (a fn pointer's call, a receiver of untold type)."""
+    if isinstance(inner, rast.Call) and isinstance(inner.func, rast.Ident):
+        name = inner.func.name
+        fn = fn_sigs.get(name)
+        if name in local_types or fn is None or fn.type_params or inner.type_args:
+            return None
+        return fn, name, name
+    if isinstance(inner, rast.MethodCall):
+        recv = _ungroup(inner.expr)
+        if not isinstance(recv, rast.Ident):
+            return None
+        owner = _receiver_type_name(local_types.get(recv.name))
+        methods = getattr(fn_sigs, 'methods', {})
+        fn = methods.get((owner, inner.method)) if owner is not None else None
+        if fn is None or fn.type_params:
+            return None
+        return fn, f"{recv.name}.{inner.method}", inner.method
+    return None
+
+
+def poll_source_type(inner: rast.Expr, local_types: Dict[str, Optional[rast.Type]],
+                     fn_sigs: Dict[str, rast.FnDef]) -> Optional[Tuple[rast.Type, rast.Type]]:
+    """A poll source's `(Option<T>, T)`, from its callee's declared return
+    type (AGAST #4604); None when it has none or it is no `Option`."""
+    found = poll_source_fn(inner, local_types, fn_sigs)
+    if found is None:
+        return None
+    ret = found[0].ret_type
+    value = PollAbi.source_value_type(ret, getattr(fn_sigs, 'enums', {}))
+    return (ret, value) if value is not None else None
+
+
+def check_poll_source(inner: rast.Expr, local_types: Dict[str, Optional[rast.Type]],
+                      fn_sigs: Dict[str, rast.FnDef], span) -> Tuple[rast.Type, rast.Type]:
+    """A poll source's `(Option<T>, T)`, or refused at the await `span`: its
+    callee isn't declared here, or doesn't return an `Option` (#4558, #4604)."""
+    found = poll_source_fn(inner, local_types, fn_sigs)
+    if found is None:
+        raise AsyncLoweringError(poll_source_unknown(), span)
+    typed = poll_source_type(inner, local_types, fn_sigs)
+    if typed is None:
+        raise AsyncLoweringError(poll_source_refusal(found[1], found[2]), span)
+    return typed
 
 
 def poll_source_outside_async() -> str:
@@ -180,12 +264,17 @@ def held_future_fn(expr: rast.Expr, local_types: Dict[str, Optional[rast.Type]],
 class AsyncAnalyzer:
     """Analyzes an async function to find await points."""
 
-    def __init__(self, fn_sigs: Optional[Dict[str, rast.FnDef]] = None):
+    def __init__(self, fn_sigs: Optional[Dict[str, rast.FnDef]] = None,
+                 async_functions: Optional[Set[str]] = None):
         self.await_points: List[AwaitPoint] = []
         self.current_locals: Dict[str, rast.Type] = {}
         self.await_index = 0
         # Declared fns by name, for an untyped `let y = f(x)` (AGAST #3762).
-        self.fn_sigs: Dict[str, rast.FnDef] = fn_sigs or {}
+        self.fn_sigs: Dict[str, rast.FnDef] = fn_sigs if fn_sigs is not None else {}
+        # The async fns an `await f(..)` polls as futures, as the generator
+        # tells them (its _is_async_call); any other call is a poll source.
+        self.async_functions: Set[str] = (async_functions if async_functions is not None else
+                                          {n for n, f in self.fn_sigs.items() if f.is_async})
 
     def _infer_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """The type of an untyped local's value, or None when it takes more
@@ -205,7 +294,7 @@ class AsyncAnalyzer:
             return self.current_locals.get(expr.name)
         if isinstance(expr, rast.Await):
             # An async fn's declared result (AGAST #1318, LARB R78); a
-            # hand-written poll source's i32.
+            # hand-written poll source's T, from its `-> Option<T>` (#4604).
             inner = expr.expr
             while isinstance(inner, rast.Grouped):
                 inner = inner.expr
@@ -216,7 +305,8 @@ class AsyncAnalyzer:
             held = held_future_fn(inner, self.current_locals, self.fn_sigs)
             if held is not None:
                 return held.ret_type
-            return rast.NamedType(span, 'i32')
+            typed = poll_source_type(inner, self.current_locals, self.fn_sigs)
+            return typed[1] if typed is not None else None
         if isinstance(expr, rast.Cast):
             return expr.target
         if isinstance(expr, rast.BinOp):
@@ -330,6 +420,18 @@ class AsyncAnalyzer:
             walk_block(body, False)
         return {name for name, is_poll in ok.items() if is_poll}
 
+    def _check_source(self, aw: rast.Await):
+        """Refuse, at the await, a poll source with no declared `Option<T>`
+        (AGAST #4558, #4604), here in source order and before an untyped
+        local it would have typed is reported."""
+        inner = _ungroup(aw.expr)
+        if isinstance(inner, rast.Call) and isinstance(inner.func, rast.Ident):
+            if inner.func.name in self.async_functions:
+                return
+        if held_future_fn(inner, self.current_locals, self.fn_sigs) is not None:
+            return
+        check_poll_source(inner, self.current_locals, self.fn_sigs, aw.span)
+
     def _analyze_block(self, block: rast.Block):
         """Analyze a block for await points."""
         for stmt in block.stmts:
@@ -381,6 +483,7 @@ class AsyncAnalyzer:
         if isinstance(expr, rast.Await):
             # An await nested in the awaited expression runs first.
             self._analyze_expr(expr.expr)
+            self._check_source(expr)
             self.await_points.append(AwaitPoint(index=self.await_index, expr=expr,
                                                 span=getattr(expr, 'span', None)))
             self.await_index += 1
@@ -478,9 +581,9 @@ class PollAbi:
     # poll source, evaluated again at each poll: an `Option<i32>`, `None`
     # while Pending and `Some(v)` once Ready.  The status is the Option's, so
     # every i32 is a genuine result, -1 and -4096 among them (AGAST #4558;
-    # #4485's reserved -4096 is gone).  The await's value is the i32.  ritz1
-    # lowers it alike (async_lower.ritz's al_lower_await).
-    EXPR_TYPE = 'i32'
+    # #4485's reserved -4096 is gone).  The source may be any `Option<T>`, and
+    # the await's value is its T, read from the callee's declared return type
+    # (AGAST #4604).  ritz1 lowers it alike (async_lower.ritz's al_lower_await).
     SOURCE_TYPE = 'Option'
 
     def __init__(self, span: rast.Span, fn_name: Optional[str] = None):
@@ -525,21 +628,22 @@ class PollAbi:
         return rast.UnaryOp(span=self.span, op='!', operand=polled)
 
     @classmethod
-    def source_type(cls, span) -> rast.NamedType:
-        """A poll source's type, `Option<i32>`."""
-        return rast.NamedType(span=span, name=cls.SOURCE_TYPE,
-                              args=[rast.NamedType(span=span, name=cls.EXPR_TYPE)])
-
-    @classmethod
-    def is_source_type(cls, ty: Optional[rast.Type]) -> bool:
-        """Whether `ty` is `Option<i32>`, as written or as the monomorphised
-        `Option$i32` an import of ritzlib.option has made it by now."""
+    def source_value_type(cls, ty: Optional[rast.Type],
+                          enums: Dict[str, rast.EnumDef]) -> Optional[rast.Type]:
+        """The T of a poll source's type `ty`, `Option<T>` as written or the
+        monomorphised `Option$T` an import of ritzlib.option has made it by
+        now (its `Some` payload); None for any other type (AGAST #4604)."""
         if not isinstance(ty, rast.NamedType):
-            return False
-        if ty.name == f"{cls.SOURCE_TYPE}${cls.EXPR_TYPE}" and not ty.args:
-            return True
-        return (ty.name == cls.SOURCE_TYPE and len(ty.args) == 1
-                and isinstance(ty.args[0], rast.NamedType) and ty.args[0].name == cls.EXPR_TYPE)
+            return None
+        if ty.name == cls.SOURCE_TYPE and len(ty.args) == 1:
+            return ty.args[0]
+        if ty.args or not ty.name.startswith(cls.SOURCE_TYPE + '$'):
+            return None
+        enum = enums.get(ty.name)
+        some = [v for v in enum.variants if v.name == 'Some'] if enum is not None else []
+        if len(some) != 1 or len(some[0].fields) != 1:
+            return None
+        return some[0].fields[0]
 
     def expr_is_pending(self, answer: rast.Expr) -> rast.Expr:
         """Whether an awaited poll source's `answer` is Pending: `answer.is_none()`."""
@@ -1453,7 +1557,7 @@ class _CfgBuilder:
                 value=rast.Call(span=inner.span, func=rast.Ident(span=inner.func.span, name=fn_name), args=args)))
             self._resume_on(fn_name, self.rw.self_field(fut, self.span), aw, dest)
             return
-        self.gen._refuse_non_source(inner, aw)
+        source_type, _ = self.gen._poll_source(inner, aw)
         answer = f"__poll_{k}"
         polled = self.hoist(inner)
         resume = self.new_block()
@@ -1461,7 +1565,7 @@ class _CfgBuilder:
         self.cur = resume
         # The await's span locates the poll source's call (#3800).
         self.emit(rast.LetStmt(span=aw.span, name=answer,
-                               type=PollAbi.source_type(self.span), value=polled))
+                               type=copy.deepcopy(source_type), value=polled))
         self.emit(rast.ExprStmt(span=self.span, expr=rast.If(
             span=self.span, cond=self.abi.expr_is_pending(rast.Ident(span=self.span, name=answer)),
             then_block=rast.Block(span=self.span, stmts=[self.abi.pending()], expr=None), else_block=None)))
@@ -1522,7 +1626,7 @@ class TrueAsyncGenerator:
                  fn_sigs: Optional[Dict[str, rast.FnDef]] = None):
         self.analysis = analysis
         # Declared fns by name: an awaited async fn's result type (R78).
-        self.fn_sigs: Dict[str, rast.FnDef] = fn_sigs or {}
+        self.fn_sigs: Dict[str, rast.FnDef] = fn_sigs if fn_sigs is not None else {}
         self.fn_def = analysis.fn_def
         self.dummy_span = rast.Span(0, 0, 0, 0)
         # Set of known async function names (for await transformation)
@@ -1585,7 +1689,7 @@ class TrueAsyncGenerator:
 
     def _await_type(self, aw: rast.Await) -> rast.Type:
         """The type of `aw`'s value: an async fn's declared result type (R78);
-        a hand-written poll source's i32."""
+        a hand-written poll source's T, of its `Option<T>` (AGAST #4604)."""
         inner = aw.expr
         while isinstance(inner, rast.Grouped):
             inner = inner.expr
@@ -1598,21 +1702,16 @@ class TrueAsyncGenerator:
         held = self._held_future(inner)
         if held is not None and held.ret_type is not None:
             return held.ret_type
-        return self._make_named_type(PollAbi.EXPR_TYPE)
+        return self._poll_source(inner, aw)[1]
 
-    def _refuse_non_source(self, inner: rast.Expr, aw: rast.Await):
-        """A sync fn's call awaited in an async fn is a poll source, so it
-        must return `Option<i32>` (AGAST #4558): refused at the await when the
-        fn it calls is declared to return anything else."""
-        if not (isinstance(inner, rast.Call) and isinstance(inner.func, rast.Ident)):
-            return
-        fn = self.fn_sigs.get(inner.func.name)
-        if fn is None or getattr(fn, 'is_async', False):
-            return
-        if PollAbi.is_source_type(fn.ret_type):
-            return
-        name = inner.func.name
-        raise AsyncLoweringError(poll_source_refusal(name), aw.span)
+    def _poll_source(self, inner: rast.Expr, aw: rast.Await) -> Tuple[rast.Type, rast.Type]:
+        """A poll source's `(Option<T>, T)`, from the declared return type of
+        the fn or method it calls (AGAST #4604); refused at the await when
+        there is none, or it is no `Option` (#4558).  The analyzer has
+        refused these already, in source order."""
+        types = {p.name: p.type for p in self.fn_def.params}
+        types.update(self.analysis.all_locals)
+        return check_poll_source(inner, types, self.fn_sigs, aw.span)
 
     def _held_future(self, expr: rast.Expr) -> Optional[rast.FnDef]:
         """The async fn whose future the local or param `expr` holds."""
@@ -1691,9 +1790,10 @@ class TrueAsyncGenerator:
 
 
 def analyze_async_function(fn_def: rast.FnDef,
-                           fn_sigs: Optional[Dict[str, rast.FnDef]] = None) -> AsyncFnAnalysis:
+                           fn_sigs: Optional[Dict[str, rast.FnDef]] = None,
+                           async_functions: Optional[Set[str]] = None) -> AsyncFnAnalysis:
     """Convenience function to analyze an async function."""
-    analyzer = AsyncAnalyzer(fn_sigs)
+    analyzer = AsyncAnalyzer(fn_sigs, async_functions)
     return analyzer.analyze(fn_def)
 
 
@@ -1708,7 +1808,7 @@ def generate_state_machine(fn_def: rast.FnDef, async_functions: Optional[Set[str
 
     Raises UntypedAsyncLocal for an untyped local it cannot type.
     """
-    analysis = analyze_async_function(fn_def, fn_sigs)
+    analysis = analyze_async_function(fn_def, fn_sigs, async_functions)
     generator = TrueAsyncGenerator(analysis, async_functions, fn_sigs)
     return generator.generate()
 

@@ -38,7 +38,7 @@ import type_order
 import match_coverage
 from metadata import type_to_string
 from async_transform_v2 import (generate_state_machine, AsyncStateMachine, UntypedAsyncLocal, AsyncLoweringError,
-                                poll_source_outside_async,
+                                poll_source_outside_async, DeclSigs,
                                 PollAbi, future_type_name, poll_fn_name, async_fn_of_future_type)
 from const_eval import ConstEvaluator, ConstEvalError, fold_literal_i64
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
@@ -3070,7 +3070,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                     has_async_main = True
 
         # Declared fns, for the type of an untyped `let y = f(x)` (AGAST #3762).
-        fn_sigs = {item.name: item for item in module.items if isinstance(item, rast.FnDef)}
+        # Methods and enums too: a poll source's `Option<T>` (AGAST #4604).
+        fn_sigs = DeclSigs.of_module(module)
 
         # Second pass: transform async functions
         for item in module.items:

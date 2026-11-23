@@ -128,7 +128,7 @@ async fn go() -> i32
 
 pub fn main() -> i32
     await go()
-""", "`await plain(..)`: a poll source returns `Option<i32>`"),
+""", "`await plain(..)`: a poll source returns `Option<T>`"),
     # Outside an async fn nothing can suspend: a Pending source can't wait.
     "source_in_sync_fn": (SOURCES + """\
 pub fn main() -> i32

@@ -1,0 +1,273 @@
+# async_lower's node builders and names: the AST nodes the async lowering
+# writes (`self.<field>`, `let`, `if`, a call, a generated fn) and the names
+# it makes (`<f>$Future`, `<f>$poll`, `__poll_<k>`).  Leaf code: it reads
+# only the AST, so async_lower imports it and it imports nothing of
+# async_lower's (moved out of async_lower.ritz by AGAST #4604, which took that
+# file past the 3000-SLOC limit).
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.string
+
+import ast
+import diag
+
+
+pub fn al_zalloc(size: i64) -> *u8
+    calloc(1, size)
+
+pub fn al_clen(s: *u8) -> i32
+    var n: i32 = 0
+    while *(s + n) != 0
+        n += 1
+    n
+
+pub fn al_eq(a_sv: StrView, b_sv: StrView) -> i32
+    var a: *u8 = a_sv.ptr
+    var alen: i32 = a_sv.len as i32
+    var b: *u8 = b_sv.ptr
+    var blen: i32 = b_sv.len as i32
+    if alen != blen
+        return 0
+    var i: i32 = 0
+    while i < alen
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    1
+
+# Bytewise order of two names, as Python's sorted() orders ritz0's fields.
+pub fn al_less(a_sv: StrView, b_sv: StrView) -> i32
+    var a: *u8 = a_sv.ptr
+    var alen: i32 = a_sv.len as i32
+    var b: *u8 = b_sv.ptr
+    var blen: i32 = b_sv.len as i32
+    var i: i32 = 0
+    while i < alen and i < blen
+        if *(a + i) != *(b + i)
+            return (*(a + i) < *(b + i)) as i32
+        i += 1
+    (alen < blen) as i32
+
+# `a` then `b` (`blen` bytes), NUL-terminated; its length goes to `*out_len`.
+pub fn al_join(a_sv: StrView, b_sv: StrView, out_len: *i32) -> *u8
+    var a: *u8 = a_sv.ptr
+    var alen: i32 = a_sv.len as i32
+    var b: *u8 = b_sv.ptr
+    var blen: i32 = b_sv.len as i32
+    let r: *u8 = al_zalloc((alen + blen + 1) as i64)
+    var i: i32 = 0
+    while i < alen
+        *(r + i) = *(a + i)
+        i += 1
+    var j: i32 = 0
+    while j < blen
+        *(r + alen + j) = *(b + j)
+        j += 1
+    *out_len = alen + blen
+    r
+
+# `<name>$Future` and `<name>$poll`: the items an async fn generates.  `$` is
+# no identifier character (lexer.ritz), so no Ritz source can spell either:
+# they are the compiler's alone and can't clash with a user's `fetch_poll` or
+# `fetch_Future` (AGAST #3606).  The spelling lives here and nowhere else.
+const AL_FUTURE_SUFFIX: i32 = 7
+const AL_POLL_SUFFIX: i32 = 5
+
+pub fn al_future_struct_name(name: *u8, name_len: i32, out_len: *i32) -> *u8
+    al_join(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"$Future"), len: (AL_FUTURE_SUFFIX) as i64 }, out_len)
+
+pub fn al_poll_fn_name(name: *u8, name_len: i32, out_len: *i32) -> *u8
+    al_join(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"$poll"), len: (AL_POLL_SUFFIX) as i64 }, out_len)
+
+# `<prefix><n>`: `__future_3`.
+pub fn al_numbered(prefix: *u8, n: i32, out_len: *i32) -> *u8
+    var digits: [12]u8
+    var k: i32 = 0
+    var v: i32 = n
+    if v == 0
+        digits[0] = '0'
+        k = 1
+    while v > 0
+        digits[k] = ('0' as i32 + v % 10) as u8
+        v = v / 10
+        k += 1
+    var rev: [12]u8
+    var i: i32 = 0
+    while i < k
+        rev[i] = digits[k - 1 - i]
+        i += 1
+    al_join(StrView { ptr: (prefix), len: (al_clen(prefix)) as i64 }, StrView { ptr: (@rev[0]), len: (k) as i64 }, out_len)
+
+pub fn al_expr(kind: ExprKind, span: SrcSpan) -> *Expr
+    let e: *Expr = al_zalloc(sizeof(Expr)) as *Expr
+    e.kind = kind
+    e.span = span
+    e.slot_type = TypeKind.Void
+    e
+
+pub fn al_int(v: i64, span: SrcSpan) -> *Expr
+    let e: *Expr = al_expr(ExprKind.IntLit, span)
+    e.int_val = v
+    e.lit_kind = LIT_PLAIN
+    e
+
+pub fn al_ident(name_sv: StrView, span: SrcSpan) -> *Expr
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let e: *Expr = al_expr(ExprKind.Ident, span)
+    e.ident_ptr = name
+    e.ident_len = len
+    e
+
+# `self.<name>`
+pub fn al_self_field(name_sv: StrView, span: SrcSpan) -> *Expr
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let e: *Expr = al_expr(ExprKind.Member, span)
+    e.left = al_ident(StrView { ptr: (c"self"), len: (4) as i64 }, span)
+    e.ident_ptr = name
+    e.ident_len = len
+    e.bracket = span
+    e
+
+pub fn al_binary(op: OpKind, left: *Expr, right: *Expr) -> *Expr
+    let e: *Expr = al_expr(ExprKind.Binary, left.span)
+    e.op = op
+    e.left = left
+    e.right = right
+    e
+
+# `0 - 1`: a future's `__state` DONE marker, written as ritz0 writes it.  It
+# is the future's own state, never a value: a poll source's Pending is its
+# `Option<i32>`'s `None` (AGAST #4558).
+pub fn al_pending(span: SrcSpan) -> *Expr
+    al_binary(OpKind.Sub, al_int(0, span), al_int(1, span))
+
+# `recv.name()`: a method call with no args.
+pub fn al_method0(recv: *Expr, name_sv: StrView, span: SrcSpan) -> *Expr
+    let e: *Expr = al_expr(ExprKind.Method, span)
+    e.left = recv
+    e.ident_ptr = name_sv.ptr
+    e.ident_len = name_sv.len as i32
+    e
+
+pub fn al_call(name_sv: StrView, args: *Expr, span: SrcSpan) -> *Expr
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let e: *Expr = al_expr(ExprKind.Call, span)
+    e.func_name = name
+    e.func_name_len = len
+    e.args = args
+    e
+
+pub fn al_addr_of(name_sv: StrView, span: SrcSpan) -> *Expr
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let e: *Expr = al_expr(ExprKind.Unary, span)
+    e.op = OpKind.Addr
+    e.operand = al_ident(StrView { ptr: (name), len: (len) as i64 }, span)
+    e
+
+pub fn al_stmt(kind: StmtKind, span: SrcSpan) -> *Stmt
+    let s: *Stmt = al_zalloc(sizeof(Stmt)) as *Stmt
+    s.kind = kind
+    s.span = span
+    s
+
+pub fn al_expr_stmt(e: *Expr) -> *Stmt
+    let s: *Stmt = al_stmt(StmtKind.Expr, e.span)
+    s.expr = e
+    s
+
+pub fn al_return(v: *Expr, span: SrcSpan) -> *Stmt
+    let s: *Stmt = al_stmt(StmtKind.Return, span)
+    s.return_value = v
+    s
+
+pub fn al_if(cond: *Expr, then_body: *Stmt, span: SrcSpan) -> *Stmt
+    let s: *Stmt = al_stmt(StmtKind.If, span)
+    s.if_cond = cond
+    s.if_then = then_body
+    s
+
+# `self.<name> = v`
+pub fn al_assign_self(name_sv: StrView, v: *Expr, span: SrcSpan) -> *Stmt
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let s: *Stmt = al_stmt(StmtKind.MemberAssign, span)
+    s.if_cond = al_ident(StrView { ptr: (c"self"), len: (4) as i64 }, span)
+    s.assign_target = name
+    s.assign_target_len = len
+    s.bracket = span
+    s.assign_value = v
+    s
+
+pub fn al_assign_name(name_sv: StrView, v: *Expr, span: SrcSpan) -> *Stmt
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let s: *Stmt = al_stmt(StmtKind.Assign, span)
+    s.assign_target = name
+    s.assign_target_len = len
+    s.assign_value = v
+    s
+
+# `let`/`var <name>: i32 = init` (ty TypeKind.I32), or `: <type_name>` (TypeKind.Struct).
+pub fn al_decl(name_sv: StrView, ty: TypeKind, type_name_sv: StrView, init: *Expr, is_let: i32, file: *u8, span: SrcSpan) -> *Stmt
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    var type_name: *u8 = type_name_sv.ptr
+    var type_name_len: i32 = type_name_sv.len as i32
+    let s: *Stmt = al_stmt(StmtKind.VarDecl, span)
+    s.var_name = name
+    s.var_name_len = len
+    s.var_type = ty
+    s.var_declared_type = ty
+    s.var_type_name = type_name
+    s.var_type_name_len = type_name_len
+    s.var_pointee_type = TypeKind.I64
+    if ty == TypeKind.I32
+        s.var_src_file = file
+    s.var_init = init
+    s.var_is_let = is_let
+    s.name_span = span
+    s
+
+# `head` with `s` linked at its end.
+pub fn al_append(head: *Stmt, s: *Stmt) -> *Stmt
+    if head == null
+        return s
+    var cur: *Stmt = head
+    while cur.next != null
+        cur = cur.next
+    cur.next = s
+    head
+
+pub fn al_last(head: *Stmt) -> *Stmt
+    var cur: *Stmt = head
+    while cur != null and cur.next != null
+        cur = cur.next
+    cur
+
+# A fn generated from `orig`: its line, file, visibility and locality.
+pub fn al_fn(orig: *FnDef, name_sv: StrView, params: *Param, ret: TypeKind, ret_name_sv: StrView, body: *Stmt) -> *FnDef
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    var ret_name: *u8 = ret_name_sv.ptr
+    var ret_len: i32 = ret_name_sv.len as i32
+    let f: *FnDef = al_zalloc(sizeof(FnDef)) as *FnDef
+    f.name = name
+    f.name_len = len
+    f.params = params
+    f.return_type = ret
+    f.return_type_name = ret_name
+    f.return_type_name_len = ret_len
+    f.body = body
+    f.line = orig.line
+    f.col = orig.col
+    f.is_local = orig.is_local
+    f.is_pub = orig.is_pub
+    f.def_file = orig.def_file
+    f.target_gated = orig.target_gated
+    f

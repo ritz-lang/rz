@@ -27,6 +27,7 @@ SOURCES = \
 	diag \
 	ast_helpers \
 	ast_query \
+	async_ast \
 	async_lower \
 	import_vis \
 	parser_gen \

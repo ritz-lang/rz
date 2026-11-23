@@ -6841,24 +6841,33 @@ struct, or a `-1` that is a genuine answer and not Pending.
 
 A compiled future's poll answers `bool`, so no result is ever confused with
 Pending.  An `await` whose operand is not an `async fn`'s call and not a held
-future is a **hand-written poll source**: a call returning `Option<i32>`,
+future is a **hand-written poll source**: a call returning `Option<T>`,
 evaluated again at each poll.  `None` is Pending and `Some(v)` is Ready, and
-the `await` is `v`, an `i32`.  The status is the `Option`'s, so every `i32` is
-a genuine result: `-1` (`-EPERM`) and `-4096` among them (AGAST #4558; the
-reserved `-4096` of AGAST #4485 is gone).  Both frontends lower it alike:
+the `await` is `v`, a `T`.  The status is the `Option`'s, so every `T` is a
+genuine result: an `i32`'s `-1` (`-EPERM`) and `-4096` among them (AGAST
+#4558; the reserved `-4096` of AGAST #4485 is gone).
+
+`T` is read from the declaration of what the source calls (AGAST #4604): a
+fn's `-> Option<T>` for `src(..)`, and the method's for `r.m(..)`, `r` a local
+or parameter of a struct type (`S`, `*S`) whose impl declares `m`.  So an
+`i64`, pointer or struct source needs no cast, and an untyped `let v = await
+src()` is a `T`.  A source no declaration types, a fn pointer's call say, is
+refused at the `await`: "`await`: the poll source's type is unknown; a poll
+source is a call of a fn or method declared to return `Option<T>`".  Both
+frontends lower it alike:
 
 ```text
-let __poll_k: Option<i32> = <source>     # in the await's resume state
+let __poll_k: Option<T> = <source>       # in the await's resume state
 if __poll_k.is_none()
     return false                         # Pending: polled again next time
 <the await's value> = __poll_k.unwrap()
 ```
 
 A future's own `__state` keeps `-1` as its "finished" marker; that is the
-future's state, never a value, so it reserves nothing.  Awaiting a sync fn
-that does not return `Option<i32>` is refused at the `await`: "`await
-plain(..)`: a poll source returns `Option<i32>` (`None` while Pending,
-`Some(v)` when Ready); `plain` does not".
+future's state, never a value, so it reserves nothing.  Awaiting a sync fn or
+method that does not return an `Option` is refused at the `await`: "`await
+plain(..)`: a poll source returns `Option<T>` (`None` while Pending, `Some(v)`
+when Ready); `plain` does not".
 
 ```ritz
 var g_n: i32 = 0
@@ -6872,6 +6881,26 @@ fn later() -> Option<i32>
 async fn go() -> i32
     let v: i32 = await later()
     v + 4096
+
+fn main() -> i32
+    await go()
+```
+
+```ritz
+struct Pt
+    x: i64
+    y: i64
+
+fn far() -> Option<i64>
+    Some(5000000000)             # all 64 bits: the await is an i64
+
+fn origin() -> Option<Pt>
+    Some(Pt { x: 0, y: 0 })
+
+async fn go() -> i32
+    let n = await far()          # i64, from `far`'s `Option<i64>`
+    let p = await origin()       # Pt
+    (n / 1000000000 + p.x) as i32
 
 fn main() -> i32
     await go()
@@ -7143,7 +7172,7 @@ The built-in `future_poll(f: @&Future) -> bool` drives a future one step: it
 returns `false` while the future is Pending and `true` once it has finished.
 The result is read with `await`, not through the poll (LARB R78).
 
-A hand-written poll source — an `Option<i32>`-returning call awaited directly
+A hand-written poll source — an `Option<T>`-returning call awaited directly
 in an async fn — says Pending with `None` and Ready with `Some(v)`, whatever
 `v` is (§16.1, AGAST #4558).  Only an async fn can await one: it may be
 Pending, and nothing else can suspend.  Outside an async fn such an `await` is

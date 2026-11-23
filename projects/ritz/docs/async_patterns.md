@@ -9,12 +9,14 @@ See `examples/75_async_reference/src/main.ritz` for the gold standard implementa
 ## Core Concepts
 
 ### Poll Encoding
-A hand-written **poll source** (an `Option<i32>`-returning call awaited
+A hand-written **poll source** (an `Option<T>`-returning call awaited
 directly in an async fn) uses:
 - `None` = Pending (operation not complete, will be resumed)
-- `Some(v)` = Ready, and `await` is `v`: any i32, `-1` and `-4096` included
+- `Some(v)` = Ready, and `await` is `v`: any T, an i32's `-1` and `-4096` included
 
-No i32 is reserved: the status is the `Option`'s (AGAST #4558).
+No value is reserved: the status is the `Option`'s (AGAST #4558).  T comes
+from the declared return type of the fn or method the source calls, so an
+i64, pointer or struct source needs no cast (AGAST #4604).
 
 ### Future Generation
 When you write:
@@ -182,8 +184,8 @@ async fn connection_handler(state: *ConnectionState) -> i32
 2. **No Pin** - Futures are regular stack values
 3. **No async runtime** - Use `block_on` with `Runtime` directly
 4. **Poll encoding** - A generated future's poll returns `bool`; a hand-written
-   poll source returns `Option<i32>`, `None` while waiting and `Some(v)` with
-   its result, any i32 (AGAST #4558)
+   poll source returns `Option<T>`, `None` while waiting and `Some(v)` with
+   its result, any T (AGAST #4558, #4604)
 
 ## Testing
 
