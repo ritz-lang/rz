@@ -60,11 +60,20 @@ pub var dmar_unit_segment: [8]u16
 pub var dmar_unit_include_all: [8]u8           # 1: the unit covers every device not listed elsewhere
 pub var dmar_num_ioapics: i32 = 0
 pub var dmar_ioapic_id: [8]u8                  # I/O APIC ID (the scope's enumeration ID)
-pub var dmar_ioapic_sid: [8]u32                # its source ID (bus << 8 | dev << 3 | fn), or DMAR_SID_NONE
+pub var dmar_ioapic_sid: [8]u32                # its source ID (segment << 16 | bus << 8 | dev << 3 | fn), or DMAR_SID_NONE
 pub var dmar_ioapic_unit: [8]i32               # the unit that remaps it
+# The PCI segments with a unit, each with its own IRT (AGAST #4598): a
+# unit's source-ID check compares only the 16-bit bus:dev.fn, so a table
+# shared across segments would name a device on another segment.
+pub var dmar_num_segs: i32 = 0
+pub var dmar_seg_id: [8]u16
+pub var dmar_unit_seg_index: [8]i32            # each unit's segment, by dmar_seg_id index
 
 # A source ID that can't be named: the scope's path crosses a bridge.
 pub const DMAR_SID_NONE: u32 = 0xFFFFFFFF
+# dmar_sid_seg_index for DMAR_SID_NONE: no segment to go by, every table.
+# Non-negative so it never reads as an errno (test_no_loose_errno_constants).
+pub const DMAR_SEG_ALL: i32 = 0x7FFFFFFF
 
 fn dmar_rd8(p: *u8, off: u32) -> u8
     return *(p + off as i64)
@@ -90,6 +99,33 @@ pub fn dmar_scope_sid(scope: *u8) -> u32
     let fun: u32 = dmar_rd8(scope, 7) as u32
     return (bus << 8) | ((dev & 0x1F) << 3) | (fun & 0x7)
 
+# The dmar_seg_id index of PCI segment `seg`, -1 if no unit is on it.
+pub fn dmar_seg_index(seg: u32) -> i32
+    var k: i32 = 0
+    while k < dmar_num_segs
+        if (dmar_seg_id[k] as u32) == seg
+            return k
+        k = k + 1
+    return -1
+
+# dmar_seg_index, adding the segment if it is new.
+fn dmar_seg_add(seg: u32) -> i32
+    let k: i32 = dmar_seg_index(seg)
+    if k >= 0
+        return k
+    let n: i32 = dmar_num_segs
+    dmar_seg_id[n] = seg as u16
+    dmar_num_segs = n + 1
+    return n
+
+# The segment index whose IRT and units serve requester `sid` (segment <<
+# 16 | bus:dev.fn): -1 if no unit is on its segment, DMAR_SEG_ALL for
+# DMAR_SID_NONE (an unvalidated source, written to every table).
+pub fn dmar_sid_seg_index(sid: u32) -> i32
+    if sid == DMAR_SID_NONE
+        return DMAR_SEG_ALL
+    return dmar_seg_index(sid >> 16)
+
 # Parse the DMAR table at `table` (`len` bytes, its header's length).
 # Fills the dmar_* variables. Returns the number of remapping units, or -1
 # if the table is too short or not a DMAR. A malformed structure (zero
@@ -98,6 +134,7 @@ pub fn dmar_parse(table: *u8, len: u32) -> i32
     dmar_flags = 0
     dmar_num_units = 0
     dmar_num_ioapics = 0
+    dmar_num_segs = 0
     if len < DMAR_STRUCTS_OFFSET or dmar_rd32(table, 0) != ACPI_SIG_DMAR
         return -1
     if dmar_rd32(table, 4) < len
@@ -114,6 +151,8 @@ pub fn dmar_parse(table: *u8, len: u32) -> i32
             dmar_unit_base[unit] = dmar_rd64(table, off + 8)
             dmar_unit_segment[unit] = dmar_rd16(table, off + 6)
             dmar_unit_include_all[unit] = dmar_rd8(table, off + 4) & DRHD_INCLUDE_PCI_ALL
+            # at most one new segment per unit: dmar_seg_id never overflows
+            dmar_unit_seg_index[unit] = dmar_seg_add(dmar_unit_segment[unit] as u32)
             dmar_num_units = unit + 1
             var s: u32 = off + DRHD_SCOPES_OFFSET
             while s + 6 <= off + slen
@@ -123,7 +162,10 @@ pub fn dmar_parse(table: *u8, len: u32) -> i32
                 if dmar_rd8(table, s) == SCOPE_IOAPIC and dmar_num_ioapics < DMAR_MAX_IOAPICS
                     let k: i32 = dmar_num_ioapics
                     dmar_ioapic_id[k] = dmar_rd8(table, s + 4)
-                    dmar_ioapic_sid[k] = dmar_scope_sid(table + s as i64)
+                    var sid: u32 = dmar_scope_sid(table + s as i64)
+                    if sid != DMAR_SID_NONE
+                        sid = sid | ((dmar_unit_segment[unit] as u32) << 16)
+                    dmar_ioapic_sid[k] = sid
                     dmar_ioapic_unit[k] = unit
                     dmar_num_ioapics = k + 1
                 s = s + sc_len
@@ -172,7 +214,9 @@ pub fn irte_lo(vector: u8, dest: u32, level: bool, x2: bool) -> u64
     return v
 
 # The high 64 bits: the source ID and how it is checked. DMAR_SID_NONE
-# (or any SVT other than VERIFY_SID) means no source validation.
+# (or any SVT other than VERIFY_SID) means no source validation. The SID
+# field is the 16-bit bus:dev.fn: `sid`'s segment (bits 31:16) picked the
+# table, and so the unit, the entry lives in (dmar_sid_seg_index).
 pub fn irte_hi(sid: u32, svt: u32) -> u64
     if svt != IRTE_SVT_VERIFY_SID or sid == DMAR_SID_NONE
         return 0

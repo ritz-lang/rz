@@ -13,11 +13,13 @@
 #   - checks every remapping unit can remap (ECAP.IR, queued invalidation,
 #     and EIM in x2APIC mode); if any can't, remapping stays off and device
 #     interrupts keep the 8-bit / extended-destination-ID rules;
-#   - gives every unit one shared 256-entry IRT and its own invalidation
-#     queue, sets the table pointer, flushes the interrupt entry cache and
+#   - gives every PCI segment with a unit its own 256-entry IRT, and every
+#     unit its segment's table and its own invalidation queue, sets the table pointer, flushes the interrupt entry cache and
 #     turns remapping on with compatibility-format interrupts blocked (CFI
 #     clear): an unremapped MSI or redirection entry would bypass the table.
-# vtd_ir_set then writes an IRTE and invalidates it; drivers/msix.ritz and
+# vtd_ir_set then writes an IRTE in the table of the requester's segment
+# (its source ID's bits 31:16, AGAST #4598) and invalidates it in that
+# segment's units; drivers/msix.ritz and
 # ioapic_set_irq (arch/x86_64/apic.ritz) program their sources in the
 # remappable format with handles from ir_handle_msi / ir_handle_ioapic.
 #
@@ -38,7 +40,8 @@ import drivers.acpi.tables { acpi_find_table }
 import drivers.iommu.dmar {
     ACPI_SIG_DMAR, DMAR_INTR_REMAP, DMAR_X2APIC_OPT_OUT,
     dmar_parse, dmar_flags, dmar_num_units, dmar_unit_base, dmar_num_ioapics,
-    dmar_ioapic_source_id,
+    dmar_ioapic_source_id, dmar_num_segs, dmar_seg_id, dmar_unit_seg_index,
+    dmar_sid_seg_index, DMAR_SEG_ALL,
     irte_lo, irte_hi, IRTE_SVT_VERIFY_SID, IRT_ENTRIES,
     VTD_REG_ECAP, VTD_REG_GCMD, VTD_REG_GSTS,
     VTD_REG_IQH, VTD_REG_IQT, VTD_REG_IQA, VTD_REG_IRTA,
@@ -61,7 +64,7 @@ var vtd_regs: [8]u64            # kernel virtual address of each unit's register
 var vtd_coherent: [8]u8         # ECAP.C: the unit snoops the IRT, no flush needed
 var vtd_qi_phys: [8]u64         # each unit's invalidation queue (one page)
 var vtd_qi_tail: [8]u32         # its next free descriptor
-var vtd_irt_phys: u64 = 0
+var vtd_seg_irt_phys: [8]u64     # each PCI segment's IRT, by dmar_seg_id index
 var vtd_status_phys: u64 = 0    # wait descriptors write their sequence number here
 var vtd_seq: u32 = 0
 
@@ -155,18 +158,10 @@ fn vtd_qi_sync(u: i32) -> bool
 # IRTEs
 # ============================================================================
 
-# Point IRT entry `handle` at `vector` on APIC ID `dest` (32-bit in EIM,
-# else 8-bit), edge or level, from source ID `sid` (DMAR_SID_NONE: not
-# validated), and make every unit drop its cached copy. The source should
-# be masked: a live entry is cleared before its source ID changes.
-# Returns 0, or -1 if remapping is off, the handle is out of range or a
-# unit didn't confirm the invalidation.
-pub fn vtd_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -> i32
-    if vtd_on == 0 or handle >= IRT_ENTRIES
-        return -1
-    let e: u64 = phys_to_virt(vtd_irt_phys) + (handle as u64) * 16
-    let lo: u64 = irte_lo(vector, dest, level, vtd_x2 != 0)
-    let hi: u64 = irte_hi(sid, IRTE_SVT_VERIFY_SID)
+# Write IRTE `handle` of segment index `si`'s table and make that
+# segment's units drop their cached copy. -1 if a unit didn't confirm.
+fn vtd_irte_write(si: i32, handle: u32, lo: u64, hi: u64) -> i32
+    let e: u64 = phys_to_virt(vtd_seg_irt_phys[si]) + (handle as u64) * 16
     if volatile_load((e + 8) as *u64) != hi
         # Not present while the source ID changes: no half-old entry.
         volatile_store(e as *u64, 0)
@@ -178,21 +173,55 @@ pub fn vtd_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -> 
     var rc: i32 = 0
     var u: i32 = 0
     while u < vtd_units
-        if vtd_coherent[u] == 0
-            vtd_clflush(e)
-            memory_barrier()
-        vtd_qi_submit(u, qi_iec_index_lo(handle), 0)
-        if not vtd_qi_sync(u)
-            rc = -1
+        if dmar_unit_seg_index[u] == si
+            if vtd_coherent[u] == 0
+                vtd_clflush(e)
+                memory_barrier()
+            vtd_qi_submit(u, qi_iec_index_lo(handle), 0)
+            if not vtd_qi_sync(u)
+                rc = -1
         u = u + 1
     return rc
 
-# The low 64 bits of IRT entry `handle` (vector, destination, present),
-# for the boot log; 0 if remapping is off.
-pub fn vtd_ir_get_lo(handle: u32) -> u64
+# Point IRT entry `handle` at `vector` on APIC ID `dest` (32-bit in EIM,
+# else 8-bit), edge or level, from requester `sid` (segment << 16 |
+# bus:dev.fn; DMAR_SID_NONE: not validated), in the table of its segment
+# (every table for DMAR_SID_NONE), and make those units drop their cached
+# copy. The source should be masked: a live entry is cleared before its
+# source ID changes. Returns 0, or -1 if remapping is off, the handle is
+# out of range, no unit is on the segment or a unit didn't confirm the
+# invalidation.
+pub fn vtd_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -> i32
+    if vtd_on == 0 or handle >= IRT_ENTRIES
+        return -1
+    let lo: u64 = irte_lo(vector, dest, level, vtd_x2 != 0)
+    let hi: u64 = irte_hi(sid, IRTE_SVT_VERIFY_SID)
+    let si: i32 = dmar_sid_seg_index(sid)
+    if si == DMAR_SEG_ALL
+        var rc: i32 = 0
+        var k: i32 = 0
+        while k < dmar_num_segs
+            if vtd_irte_write(k, handle, lo, hi) != 0
+                rc = -1
+            k = k + 1
+        return rc
+    if si < 0
+        return -1
+    return vtd_irte_write(si, handle, lo, hi)
+
+# The low 64 bits of IRT entry `handle` (vector, destination, present) in
+# the table of requester `sid`'s segment, for the boot log; 0 if remapping
+# is off or no unit is on the segment. DMAR_SID_NONE entries are the same
+# in every table: read the first.
+pub fn vtd_ir_get_lo(handle: u32, sid: u32) -> u64
     if vtd_on == 0 or handle >= IRT_ENTRIES
         return 0
-    return volatile_load((phys_to_virt(vtd_irt_phys) + (handle as u64) * 16) as *u64)
+    var si: i32 = dmar_sid_seg_index(sid)
+    if si == DMAR_SEG_ALL
+        si = 0
+    if si < 0
+        return 0
+    return volatile_load((phys_to_virt(vtd_seg_irt_phys[si]) + (handle as u64) * 16) as *u64)
 
 # The source ID DMAR gives I/O APIC `ioapic_id`, or DMAR_SID_NONE.
 pub fn vtd_ioapic_sid(ioapic_id: u8) -> u32
@@ -240,7 +269,7 @@ fn vtd_unit_enable(u: i32, x2: bool) -> i32
     vtd_wreg64(u, VTD_REG_IQA, vtd_qi_phys[u])
     if not vtd_gcmd(u, GCMD_QIE, 0, GCMD_QIE, true)
         return vtd_fail(u, "queued invalidation won't start")
-    vtd_wreg64(u, VTD_REG_IRTA, vtd_irta(vtd_irt_phys, x2))
+    vtd_wreg64(u, VTD_REG_IRTA, vtd_irta(vtd_seg_irt_phys[dmar_unit_seg_index[u]], x2))
     if not vtd_gcmd(u, GCMD_SIRTP, 0, GCMD_SIRTP, true)
         return vtd_fail(u, "table pointer not taken")
     vtd_qi_submit(u, qi_iec_global_lo(), 0)
@@ -313,10 +342,18 @@ pub fn vtd_ir_init(x2apic: bool) -> i32
         if vtd_qi_phys[u] == 0
             return vtd_fail(u, "no page for the invalidation queue")
         u = u + 1
-    vtd_irt_phys = vtd_alloc_page()
+    var si: i32 = 0
+    while si < dmar_num_segs
+        vtd_seg_irt_phys[si] = vtd_alloc_page()
+        if vtd_seg_irt_phys[si] == 0
+            klog("      Interrupt remapping: off (no page for PCI segment ")
+            klog_dec(dmar_seg_id[si] as i64)
+            klog("'s table)\n")
+            return -1
+        si = si + 1
     vtd_status_phys = vtd_alloc_page()
-    if vtd_irt_phys == 0 or vtd_status_phys == 0
-        klog("      Interrupt remapping: off (no page for the table)\n")
+    if vtd_status_phys == 0
+        klog("      Interrupt remapping: off (no page for the wait status)\n")
         return -1
     u = 0
     while u < n
@@ -331,8 +368,13 @@ pub fn vtd_ir_init(x2apic: bool) -> i32
     vtd_on = 1
     klog("      Interrupt remapping: VT-d on, ")
     klog_dec(n as i64)
-    klog(" unit(s), table at ")
-    klog_hex(vtd_irt_phys)
+    if dmar_num_segs == 1
+        klog(" unit(s), table at ")
+        klog_hex(vtd_seg_irt_phys[0])
+    else
+        klog(" unit(s), ")
+        klog_dec(dmar_num_segs as i64)
+        klog(" PCI segment tables")
     if x2apic
         klog(", 32-bit x2APIC destinations (EIM)\n")
     else

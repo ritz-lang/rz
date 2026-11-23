@@ -173,6 +173,31 @@ fn main() -> i32
         return 30
     if qi_next_tail(0) != 1 or qi_next_tail(255) != 0
         return 31
+
+    # PCI segments (AGAST #4598): DRHD A is on segment 0, B on segment 1;
+    # each distinct segment gets one IRT, and each unit knows which.
+    build(122)
+    if dmar_parse(@t[0], 122) != 2 or dmar_num_segs != 2 or dmar_seg_id[0] != 0 or dmar_seg_id[1] != 1
+        return 32
+    if dmar_unit_seg_index[0] != 0 or dmar_unit_seg_index[1] != 1 or dmar_seg_index(1) != 1 or dmar_seg_index(5) != -1
+        return 33
+    # a requester ID (segment << 16 | bus:dev.fn) picks its segment's table;
+    # one with no source ID goes to every table, one on a segment with no
+    # unit to none
+    if dmar_sid_seg_index(0x0108) != 0 or dmar_sid_seg_index(0x10108) != 1 or dmar_sid_seg_index(0x20108) != -1
+        return 34
+    if dmar_sid_seg_index(DMAR_SID_NONE) != DMAR_SEG_ALL
+        return 35
+    # the IRTE's SID field is the 16-bit bus:dev.fn; the segment chose the table
+    if irte_hi(0x10108, IRTE_SVT_VERIFY_SID) != 0x40108
+        return 36
+    # an I/O APIC's source ID carries its unit's segment; both units on
+    # segment 1 share one table
+    put16(54, 1)
+    if dmar_parse(@t[0], 122) != 2 or dmar_num_segs != 1 or dmar_seg_id[0] != 1 or dmar_unit_seg_index[0] != 0 or dmar_unit_seg_index[1] != 0
+        return 37
+    if dmar_ioapic_source_id(2) != 0x1FFF7 or dmar_ioapic_source_id(9) != DMAR_SID_NONE
+        return 38
     0
 """
 
@@ -183,7 +208,9 @@ CLAIMS = {1: "two DRHD units", 2: "DMAR flags", 3: "unit register bases", 4: "IN
           17: "remap MSI addr", 18: "MSI handle round trip", 19: "MSI format bit", 20: "remap RTE hi",
           21: "remap RTE lo", 22: "RTE handle round trip", 23: "RTE format bit", 24: "handles",
           25: "GCMD from GSTS", 26: "IRTA", 27: "ECAP EIM", 28: "ECAP IR/QI", 29: "IEC descriptors",
-          30: "wait descriptor", 31: "queue tail"}
+          30: "wait descriptor", 31: "queue tail", 32: "segment list", 33: "unit -> segment index",
+          34: "requester ID -> segment table", 35: "no source ID -> every table", 36: "IRTE SID drops the segment",
+          37: "shared segment, one table", 38: "I/O APIC source ID carries its segment"}
 
 
 @pytest.mark.integration
@@ -277,8 +304,28 @@ def test_irq_route_counts_remapping_as_reachable():
 def test_vtd_blocks_compatibility_format_and_invalidates_entries():
     code = _code(VTD)
     # an IRTE change reaches the hardware only after an IEC invalidation
-    assert "qi_iec_index_lo(" in _body(code, "vtd_ir_set"), "vtd_ir_set doesn't invalidate the entry"
+    assert "vtd_irte_write(" in _body(code, "vtd_ir_set")
+    assert "qi_iec_index_lo(" in _body(code, "vtd_irte_write"), "vtd_ir_set doesn't invalidate the entry"
     init = _code(VTD)
     assert "GCMD_IRE" in init and "GCMD_SIRTP" in init and "GCMD_QIE" in init
     # CFI stays clear: a compatibility-format interrupt would bypass the table
     assert re.search(r"GCMD_CFI", init), "vtd must clear CFI explicitly"
+
+
+@pytest.mark.unit
+def test_vtd_picks_the_ir_table_by_the_requesters_segment():
+    # AGAST #4598: one IRT per PCI segment; a unit points at its segment's
+    # table, and an IRTE is written to, read from and invalidated in the
+    # table and units of the requester's segment only.
+    code = _code(VTD)
+    assert re.search(r"vtd_seg_irt_phys\s*:\s*\[8\]u64", code), "no per-segment IRT"
+    assert not re.search(r"^var vtd_irt_phys\b", code, re.M), "a single shared IRT is left"
+    enable = _body(code, "vtd_unit_enable")
+    assert "vtd_seg_irt_phys[dmar_unit_seg_index[u]]" in enable, enable
+    st = _body(code, "vtd_ir_set")
+    assert "dmar_sid_seg_index(sid)" in st, st
+    assert "vtd_irte_write(si," in st, st
+    assert "dmar_unit_seg_index[u] == si" in _body(code, "vtd_irte_write"), "invalidates units of other segments"
+    get = _body(code, "vtd_ir_get_lo")
+    assert re.search(r"fn vtd_ir_get_lo\(handle: u32, sid: u32\)", get) and "dmar_sid_seg_index(sid)" in get, get
+    assert "vtd_ir_get_lo(handle, sid)" in _body(_code(IR), "ir_get_dest")
