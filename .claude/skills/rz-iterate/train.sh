@@ -43,8 +43,8 @@
 #                                       trains 1..k and cancelling their
 #                                       gates; train k+1 becomes train 1
 #   train.sh show                       print every train, in landing order
-#   train.sh pkgs list|test <base>      the touched packages' tests (#3363;
-#                                       the gate runs `test` after its jobs)
+#   train.sh pkgs list <base>           the packages the train touches
+#                                       (#3363), for the gate's PKGS line
 #   train.sh tail                       the deepest built train's tail
 #                                       (<tip12> rz-train/<tip12>), nothing
 #                                       when none is built (#4413)
@@ -140,12 +140,12 @@
 #      ref into the host's clone, check out <tip> in its own worktree
 #      (RZ_REMOTE_WT), and start that tree's run-gate.sh with
 #      RZ_GATE_TRAIN=1 (train priority and reservation on that host, #3317,
-#      #3427) and the package tests as RZ_GATE_AFTER; it prints the log path;
+#      #3427); it prints the log path;
 #   3. train 2's state gets `SPEC=<host> <ref> <remote log> <local log>`.
 # `wait <local log>` runs the remote run-gate.sh --wait in slices, then
 # copies the remote log to <local log> and checks its SHA is the train's tip,
 # so `land` checks `SHA=<tip>` and `EXIT=0` exactly as for a local log.  The
-# remote gate's base (package tests, ci-local --diff-base) is main, train 1's
+# remote gate's base (ci-local --diff-base) is main, train 1's
 # base, not train 1's tail: its pass lands train 1 too (AGAST #4151).  (Was
 # at most 2 trains in flight; since #4031, RZ_TRAIN_DEPTH: see below.)
 # `build --next` keeps every train that has a SPEC and stacks new cars on
@@ -292,7 +292,7 @@ write_queue() {
 # stdin, so the host needs nothing of this branch but its run-gate.sh (the
 # train tree's own).  Everything runs from main, called on the last line:
 # bash has read the whole script by then, so no command can eat it off stdin.
-#   start <repo> <wt> <gate|-> <ref> <tip> <base> <name> <pkgs 0|1>
+#   start <repo> <wt> <gate|-> <ref> <tip> <base> <name>
 #                                  fetch, check out, start the gate; prints
 #                                  the remote log path.  The gate runs on the
 #                                  host's venv (rz_venv_path: a login shell's
@@ -349,7 +349,7 @@ main() {
     local verb="$1"; shift
     case "$verb" in
     start)
-        local repo wt gate got after=""
+        local repo wt gate got
         repo="$(abs "$1")"; wt="$(abs "$2")"; gate="$(gate_of "$wt" "$3")"
         PATH="$(rz_venv_path "$PATH")"; export PATH
         if ! python3 -c 'import pytest' >/dev/null 2>&1; then
@@ -361,8 +361,7 @@ main() {
         [ "$got" = "$5" ] || { echo "error: origin $4 is $got, not the train tip $5" >&2; exit 1; }
         if [ -e "$wt/.git" ]; then git -C "$wt" checkout -q -f --detach "$5"
         else git -C "$repo" worktree add -q --detach "$wt" "$5"; fi
-        [ "$8" = 1 ] && after="bash $(printf %q "$wt/.claude/skills/rz-iterate/train.sh") pkgs test $6"
-        RZ_GATE_TRAIN=1 RZ_GATE_BASE="$6" RZ_GATE_AFTER="$after" bash "$gate" "$wt" "$7" ;;
+        RZ_GATE_TRAIN=1 RZ_GATE_BASE="$6" bash "$gate" "$wt" "$7" ;;
     wait)
         local rc=0 t0 s0 st why=""
         t0="$(date +%s)"; s0="$(wc -c < "$3")"
@@ -959,19 +958,16 @@ cmd_gate() {
         discard_spec >/dev/null      # red (or a stale log): re-gate it here
     fi
     # The base is main, train 1's base (AGAST #4151): a pass lands every train
-    # below too, so the package tests and the ritz0 diff scope cover them.
-    # Package tests for what the trains touch (AGAST #3363); none, and so no
-    # extra step, for a compiler-only train.  stdout is only the log path.
-    local base pkgs after="" log
+    # below too, so the ritz0 diff scope covers them.  The PKGS line previews
+    # the packages the trains touch (AGAST #3363); the gate's test-all job
+    # tests every package (AGAST #3969, #3970).  stdout is only the log path.
+    local base pkgs log
     base="$(use_slot "${q[0]}"; field BASE "$(state)")"
     pkgs="$(cd "$WT" && bash "$HERE/train.sh" pkgs list "$base")"
-    if [[ -n "$pkgs" ]]; then
-        echo "PKGS $(tr '\n' ' ' <<<"$pkgs")" >&2
-        after="bash $(printf %q "$HERE/train.sh") pkgs test $base"
-    fi
+    [[ -z "$pkgs" ]] || echo "PKGS $(tr '\n' ' ' <<<"$pkgs")" >&2
     # Train priority: the next free slot goes to this gate ahead of room
     # gates (run-gate.sh, AGAST #3317).  GATED/SPEC: `pending` skips it (#4031).
-    log="$(RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" RZ_GATE_AFTER="$after" "$GATE" "$WT" "$(gname)")"
+    log="$(RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" "$GATE" "$WT" "$(gname)")"
     if [[ $k -eq 1 ]]; then printf 'GATED=%s\n' "$log" >> "$st"
     else printf 'SPEC=%s - %s %s\n' "$LOCAL" "$log" "$log" >> "$st"; fi
     echo "GATE train $k tip=$(field TIP "$st" | cut -c1-12) here${REASON:+ ($REASON)}: $log" >&2
@@ -985,14 +981,14 @@ cmd_gate() {
 # here (plain `gate`) when none has a free train slot.  stdout is only the
 # local log path.
 gate_next() {
-    local host="$1" q i k flight=0 st tip base ref pkgs=0 rlog llog after=""
+    local host="$1" q i k flight=0 st tip base ref rlog llog
     mapfile -t q < <(queue)
     [[ ${#q[@]} -gt 0 ]] || die "no train built"
     pick_target || die "$WHY"
     k=$TGT
     # The base is main (train 1's base), not the tail below (AGAST #4151): a
-    # pass here lands every train below too, so the package tests and the
-    # ritz0 diff scope must cover their cars as well.
+    # pass here lands every train below too, so the ritz0 diff scope must
+    # cover their cars as well.
     use_slot "${q[0]}"; base="$(field BASE "$(state)")"
     for i in "${!q[@]}"; do
         use_slot "${q[$i]}"; st="$(state)"
@@ -1016,14 +1012,12 @@ gate_next() {
                 || die "no host in RZ_TRAIN_HOSTS ($HOSTS) has a free train slot: gate train $k when one frees"
         fi
     fi
-    [[ -n "$(cd "$WT" && bash "$HERE/train.sh" pkgs list "$base")" ]] && pkgs=1
     # The tail is published for the remote gate and for a new room's base
     # (AGAST #4409): a local gate needs the ref for the room, too.
     ref="rz-train/${tip:0:12}"
     publish_tail
     if is_local "$host"; then
-        [[ $pkgs -eq 0 ]] || after="bash $(printf %q "$HERE/train.sh") pkgs test $base"
-        llog="$(RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" RZ_GATE_AFTER="$after" "$GATE" "$WT" "$(gname)")" \
+        llog="$(RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" "$GATE" "$WT" "$(gname)")" \
             || die "the local gate for train $k did not start"
         if [[ $k -eq 1 ]]; then
             printf 'GATED=%s\n' "$llog" >> "$st"
@@ -1035,7 +1029,7 @@ gate_next() {
         echo "$llog"
         return
     fi
-    if ! rlog="$(remote "$host" start "$REMOTE_REPO" "$(rwt)" "$REMOTE_GATE" "$ref" "$tip" "$base" "$(gname)" "$pkgs" | tail -1)" \
+    if ! rlog="$(remote "$host" start "$REMOTE_REPO" "$(rwt)" "$REMOTE_GATE" "$ref" "$tip" "$base" "$(gname)" | tail -1)" \
             || [[ "$rlog" != /*.log ]]; then
         g push -q origin --delete "refs/heads/$ref" 2>/dev/null || true
         if [[ $k -eq 1 ]]; then
@@ -1154,39 +1148,24 @@ cmd_wait() {
     exit "$rc"
 }
 
-# --- Package tests (AGAST #3363) ------------------------------------------
-# The gate's build-all + bootstrap jobs cover the compiler, not the workspace
-# projects' own tests: #3290's bug landed through a green train and only CI's
-# test-all caught it.  So once those jobs pass, the train gate also runs
-# `train.sh pkgs test <base>` from the train worktree (the tip is HEAD).
-# Since AGAST #3969 the gate runs main.yml's test-all job too, which tests
-# every package before this step, so this step re-runs packages that already
-# passed: a failure stops the gate at test-all, before the PRE-EXISTING base
-# re-run below gets a chance to run.
-#
+# --- Touched packages (AGAST #3363) ---------------------------------------
 #   pkgs list <base>   the package dirs the train touches, one per line
-#   pkgs test <base>   test each; exit 1 on a failure the base doesn't have
+#
+# `gate` prints them as its PKGS preview line.  The gate itself tests every
+# package in main.yml's test-all job (AGAST #3969).  `pkgs test`, which
+# re-tested the touched packages after that and re-ran a failing one on the
+# base to excuse a PRE-EXISTING failure, is retired (AGAST #3970): test-all
+# stopped the gate at a failing package first, so the base re-run never ran,
+# and main is gated by test-all, so a package failing on main is rare.
 #
 # A touched file belongs to the deepest directory above it with a ritz.toml,
-# so a nested package (projects/ritzunit/inventory) is tested on its own.
+# so a nested package (projects/ritzunit/inventory) is listed on its own.
 # Skipped: the projects/ritz package itself (build-all + bootstrap is its
-# gate, so a compiler-only train costs exactly what it did), and rz.toml
-# [workspace.exclude] dirs, which resolve to the package above them.  A
-# package nested in projects/ritz (ritzlib/tests) is NOT skipped, and a
-# ritzlib change selects ritzlib/tests (AGAST #3909, below).
-# Except: a change to ritzunit or ritz0/test_runner.py tests every package
+# gate), and rz.toml [workspace.exclude] dirs, which resolve to the package
+# above them.  A package nested in projects/ritz (ritzlib/tests) is NOT
+# skipped, and a ritzlib change selects ritzlib/tests (AGAST #3909, below).
+# Except: a change to ritzunit or ritz0/test_runner.py selects every package
 # `rz test --all` sweeps, projects/ritz's included (AGAST #3735, below).
-#
-# One verdict line per package:
-#   PKG PASS <id>
-#   PKG KNOWN <id>: ...         fails, excused by a `build` entry in
-#                               known-failures/ as `rz test --all` excuses
-#                               it: advisory
-#   PKG PRE-EXISTING <id>: ...  fails on the base too: not this train's doing
-#   PKG FAIL <id>: ...          fails here, passes on the base (or is new)
-#
-# Not the whole test-all: see SKILL.md "Merge trains" for the timing.
-# Env: RZ_PKG_TEST, the command that tests one package dir (default ./rz test).
 
 # toml_keys <python expr over the parsed rz.toml `c`>: one key per line.
 toml_keys() {
@@ -1256,51 +1235,10 @@ pkgs_list() {
     [[ -z "$touched" ]] || grep -vxF projects/ritz <<<"$touched" || true
 }
 
-pkgs_test() {
-    local base="$1" test="${RZ_PKG_TEST:-./rz test}" p id rc brc rc_all=0 pkgs known
-    mapfile -t pkgs < <(pkgs_list "$base")
-    # The excused ids, from the one known-failures parser (AGAST #1834).  A
-    # malformed list exits 2 with nothing on stdout: no excuses (fail closed).
-    mapfile -t known < <(python3 projects/ritz/tools/known_failures.py list \
-        --gate build --compiler any | cut -f1)
-    BASE_WT=""
-    trap '[[ -z "$BASE_WT" ]] || { git worktree remove --force "$BASE_WT/tree" >/dev/null 2>&1; rm -rf "$BASE_WT"; git worktree prune; }' EXIT
-    echo "=== Train package tests (AGAST #3363): ${#pkgs[@]} package(s) vs base ${base:0:12}"
-    for p in ${pkgs[@]+"${pkgs[@]}"}; do
-        id="${p#projects/}"; [[ "$p" == projects/* ]] || id="../$p"  # rz ids: ../bench/...
-        echo "--- $id (train tip)"
-        # The exit code comes straight from the command, never through a pipe.
-        rc=0; $test "$p" || rc=$?
-        if [[ $rc -eq 0 ]]; then echo "PKG PASS $id"; continue; fi
-        # Exact id match: a nested package isn't excused by its parent's entry.
-        if printf '%s\n' ${known[@]+"${known[@]}"} | grep -qxF -- "$id"; then
-            echo "PKG KNOWN $id: exit $rc, excused in known-failures/ (gate = \"build\", advisory)"
-            continue
-        fi
-        if ! git cat-file -e "$base:$p/ritz.toml" 2>/dev/null; then
-            echo "PKG FAIL $id: exit $rc, and not on the base, so nothing to compare"
-            rc_all=1; continue
-        fi
-        if [[ -z "$BASE_WT" ]]; then
-            BASE_WT="$(mktemp -d)"
-            git worktree add -q --detach "$BASE_WT/tree" "$base"
-        fi
-        echo "--- $id (base ${base:0:12})"
-        brc=0; (cd "$BASE_WT/tree" && $test "$p") || brc=$?
-        if [[ $brc -ne 0 ]]; then
-            echo "PKG PRE-EXISTING $id: exit $rc, and exit $brc on base ${base:0:12} too (not this train's)"
-        else
-            echo "PKG FAIL $id: exit $rc, passes on base ${base:0:12}"
-            rc_all=1
-        fi
-    done
-    return $rc_all
-}
-
 cmd_pkgs() {
-    [[ $# -eq 2 && ( "$1" == list || "$1" == test ) ]] || die "usage: $0 pkgs list|test <base>"
+    [[ $# -eq 2 && "$1" == list ]] || die "usage: $0 pkgs list <base> (pkgs test is retired: AGAST #3970)"
     git rev-parse -q --verify "$2^{commit}" >/dev/null || die "no such commit: $2"
-    "pkgs_$1" "$2"
+    pkgs_list "$2"
 }
 
 # cmd_land [<log>]: land the train whose tip <log> passed, and every train
@@ -1515,5 +1453,5 @@ case "${1:-}" in
     show)  cmd_show ;;
     tail)  cmd_tail ;;
     rebase-plan) shift; cmd_rebase_plan "$@" ;;
-    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [<k> | --next [<host>]] | wait <log> | discard [<host>] | fail <log> | pending | land [<log>] | show | tail | rebase-plan [<ref>] [--dropped <oldtip> [--onto <ref>]] | pkgs list|test <base>" >&2; exit 2 ;;
+    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [<k> | --next [<host>]] | wait <log> | discard [<host>] | fail <log> | pending | land [<log>] | show | tail | rebase-plan [<ref>] [--dropped <oldtip> [--onto <ref>]] | pkgs list <base>" >&2; exit 2 ;;
 esac

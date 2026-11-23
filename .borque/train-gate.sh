@@ -6,9 +6,9 @@
 #   .borque/train-gate.sh <train_worktree>
 #
 # The same gate `train.sh gate` starts: RZ_GATE_TRAIN=1 (train priority for the
-# gate slot, #3317) and, when the train touches a package, RZ_GATE_AFTER =
-# `train.sh pkgs test <base>` (the touched packages' tests, #3363), named
-# "train".  Then run-gate.sh --wait, as verify.sh does.
+# gate slot, #3317) and RZ_GATE_BASE=<base>, named "train".  Then run-gate.sh
+# --wait, as verify.sh does.  No package-test step: the gate's test-all job
+# tests every package (#3969, #3970).
 #
 # The base is `git merge-base HEAD origin/main` in the train worktree.  A
 # train is cars stacked on origin/main as it was when the train was built, so
@@ -28,9 +28,7 @@ set -uo pipefail
 export HOME PATH
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-SKILL="$HERE/../.claude/skills/rz-iterate"
-GATE="${RZ_GATE_SCRIPT:-$SKILL/run-gate.sh}"
-TRAIN="$(cd "$SKILL" && pwd -P)/train.sh"
+GATE="${RZ_GATE_SCRIPT:-$HERE/../.claude/skills/rz-iterate/run-gate.sh}"
 
 if [[ $# -ne 1 ]]; then
     echo "usage: $0 <train_worktree>" >&2
@@ -42,11 +40,7 @@ if ! BASE="$(git -C "$WT" merge-base HEAD origin/main 2>/dev/null)"; then
     exit 64
 fi
 
-AFTER=""
-if [[ -n "$(cd "$WT" && bash "$TRAIN" pkgs list "$BASE")" ]]; then
-    AFTER="bash $(printf %q "$TRAIN") pkgs test $BASE"
-fi
-LOG="$(RZ_GATE_TRAIN=1 RZ_GATE_AFTER="$AFTER" bash "$GATE" "$WT" train)" || exit $?
+LOG="$(RZ_GATE_TRAIN=1 RZ_GATE_BASE="$BASE" bash "$GATE" "$WT" train)" || exit $?
 echo "LOG=$LOG"
 while :; do
     timeout "${RZ_GATE_WAIT_SLICE:-540}" bash "$GATE" --wait "$LOG"

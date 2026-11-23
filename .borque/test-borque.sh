@@ -53,8 +53,8 @@ if [[ "$1" == "--wait" ]]; then
     echo "EXIT=$code"
     exit "$code"
 fi
-printf 'start wt=%s name=%s train=%s after=%s\n' "$1" "$2" \
-    "${RZ_GATE_TRAIN-unset}" "${RZ_GATE_AFTER-unset}" >> "$STUB_CALLS"
+printf 'start wt=%s name=%s train=%s after=%s base=%s\n' "$1" "$2" \
+    "${RZ_GATE_TRAIN-unset}" "${RZ_GATE_AFTER-unset}" "${RZ_GATE_BASE-unset}" >> "$STUB_CALLS"
 [[ -n "${STUB_START_FAIL:-}" ]] && { echo "error: start failed" >&2; exit "$STUB_START_FAIL"; }
 echo "$STUB_LOGDIR/$2-0123456789ab-1.log"
 STUB
@@ -74,7 +74,7 @@ for want in 0 2 98 99; do
     check '[[ $rc -eq $want ]]' "verify.sh exits with the gate's code $want, got $rc"
 done
 check 'grep -q "^start wt=$W name=3722 " "$STUB_CALLS"' "verify.sh names the gate after the task id (3722), in the room's worktree"
-check 'grep -q "train=unset after=unset" "$STUB_CALLS"' "verify.sh is a room gate: no RZ_GATE_TRAIN, no RZ_GATE_AFTER"
+check 'grep -q "train=unset after=unset base=unset" "$STUB_CALLS"' "verify.sh is a room gate: no RZ_GATE_TRAIN, no RZ_GATE_AFTER"
 check '[[ "$(sed -n 2p "$STUB_CALLS")" == "wait $STUB_LOGDIR/3722-0123456789ab-1.log" ]]' "verify.sh waits on the log that start printed"
 check 'grep -q "3722-0123456789ab-1.log" <<<"$out"' "verify.sh prints the log path"
 
@@ -101,29 +101,23 @@ codes 0
 RZ_GATE_SCRIPT="$STUB" run "$V" "$W" >/dev/null 2>&1; rc=$?
 check '[[ $rc -ne 0 && $(starts) -eq 0 ]]' "verify.sh refuses a missing room argument (rc=$rc)"
 
-# train-gate.sh: what `train.sh gate` sets.  A car touching a package: the
-# gate runs that package's tests against the base afterwards.
+# train-gate.sh: what `train.sh gate` sets.  No package-test step (AGAST
+# #3970): the gate's test-all job tests every package (#3969), so a car
+# touching a package gates as a compiler-only one does.
 TP="$T/train-pkg"; make_train "$TP" projects/pkg/a.ritz
 BASE="$(git -C "$TP" rev-parse origin/main)"
 codes 0
 RZ_GATE_SCRIPT="$STUB" run "$TG" "$TP" >/dev/null 2>&1; rc=$?
-want_after="bash $(printf %q "$REPO/.claude/skills/rz-iterate/train.sh") pkgs test $BASE"
 check '[[ $rc -eq 0 ]]' "train-gate.sh exits 0 for a passing gate, got $rc"
-check '[[ "$(head -1 "$STUB_CALLS")" == "start wt=$TP name=train train=1 after=$want_after" ]]' \
-    "train-gate.sh: RZ_GATE_TRAIN=1, name train, RZ_GATE_AFTER=train.sh pkgs test <merge-base with origin/main>"
+check '[[ "$(head -1 "$STUB_CALLS")" == "start wt=$TP name=train train=1 after=unset base=$BASE" ]]' \
+    "train-gate.sh: RZ_GATE_TRAIN=1, name train, no RZ_GATE_AFTER, RZ_GATE_BASE=<merge-base with origin/main>"
 # The base is the merge-base, so an origin/main that moved on since the
 # train was built still gives the train's own base.
 git -C "$TP" checkout -q -b moved "$BASE"; echo c > "$TP/later"; git -C "$TP" add later
 git -C "$TP" commit -qm later; git -C "$TP" update-ref refs/remotes/origin/main HEAD
 git -C "$TP" checkout -q -; codes 0
 RZ_GATE_SCRIPT="$STUB" run "$TG" "$TP" >/dev/null 2>&1
-check 'grep -q "pkgs test $BASE\$" "$STUB_CALLS"' "train-gate.sh: the base is the train's, even after origin/main moves on"
-
-# A compiler-only train: no package tests, as train.sh gate.
-TC="$T/train-ritz"; make_train "$TC" projects/ritz/a.ritz
-codes 0
-RZ_GATE_SCRIPT="$STUB" run "$TG" "$TC" >/dev/null 2>&1
-check '[[ "$(head -1 "$STUB_CALLS")" == "start wt=$TC name=train train=1 after=" ]]' "train-gate.sh: compiler-only train has an empty RZ_GATE_AFTER"
+check 'grep -q "base=$BASE\$" "$STUB_CALLS"' "train-gate.sh: the base is the train's, even after origin/main moves on"
 
 for want in 2 98 99; do
     codes "$want"
@@ -178,17 +172,12 @@ chmod +x "$T/bin/systemd-run" "$T/bin/systemctl"
     RZ_GATE_CMD='exit 2' run "$V" "$W" ritz-task-3722 >/dev/null 2>&1; rc=$?
     check '[[ $rc -eq 2 ]]' "real gate: verify.sh exits 2 for a failing gate, got $rc"
 
-    # The train's package tests run after the gate command, from the tip.
+    # No package-test step after the gate command (AGAST #3970): a train
+    # touching a package passes or fails on the gate command alone.
     T12="$(git -C "$TP" rev-parse --short=12 HEAD)"
-    RZ_PKG_TEST=true RZ_GATE_CMD='exit 0' run "$TG" "$TP" >/dev/null 2>&1; rc=$?
-    check '[[ $rc -eq 0 ]] && grep -q "Train package tests" "$RZ_GATE_DIR/train-$T12-1.log"' "real gate: train-gate.sh runs the package tests after the gate (rc=$rc)"
-    # Fails only with the car's line in it, so it passes on the base.
-    printf '%s\n' '#!/usr/bin/env bash' '! grep -qx b "$1/a.ritz"' > "$T/pkgtest.sh"; chmod +x "$T/pkgtest.sh"
-    RZ_PKG_TEST="$T/pkgtest.sh" RZ_GATE_CMD='exit 0' run "$TG" "$TP" >/dev/null 2>&1; rc=$?
-    check '[[ $rc -eq 1 ]]' "real gate: a package test that fails on the tip only fails the train gate (rc=$rc)"
     RZ_PKG_TEST=false RZ_GATE_CMD='exit 0' run "$TG" "$TP" >/dev/null 2>&1; rc=$?
-    check '[[ $rc -eq 0 ]]' "real gate: a package test failing on the base too doesn't fail the train (rc=$rc)"
-    RZ_PKG_TEST=true RZ_GATE_CMD='exit 2' run "$TG" "$TP" >/dev/null 2>&1; rc=$?
+    check '[[ $rc -eq 0 ]] && ! grep -q "Train package tests" "$RZ_GATE_DIR/train-$T12-1.log"' "real gate: train-gate.sh runs no package tests after the gate (rc=$rc)"
+    RZ_GATE_CMD='exit 2' run "$TG" "$TP" >/dev/null 2>&1; rc=$?
     check '[[ $rc -eq 2 ]]' "real gate: train-gate.sh exits 2 when the gate command fails, got $rc"
     exit "$fails"
 ); fails=$((fails + $?))

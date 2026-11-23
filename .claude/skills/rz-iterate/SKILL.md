@@ -757,8 +757,7 @@ reap ritz-task-1450 1a2b3c4
 `main`, i.e. **after** the merge. Before the merge, the only check is the gate:
 `make -C projects/ritz ci-local` over main.yml's `build-all`, `test-all` and
 `bootstrap` jobs (room gate and train gate, both through run-gate.sh's
-default command), plus `train.sh pkgs test` on the packages a train touches.
-So:
+default command). So:
 
 | main.yml job | before merge | after merge (CI) |
 |---|---|---|
@@ -997,8 +996,7 @@ one to train 1.
       `~/dev/ritz-lang/rz-train-remote` (created on first use), and starts
       **that tree's** `run-gate.sh` with `RZ_GATE_TRAIN=1` (train priority,
       FIFO and reservation on that host, #3317/#3364/#3427, against that
-      host's own room gates) and the package tests (#3363) as
-      `RZ_GATE_AFTER`. Its base, for the package tests and ci-local's
+      host's own room gates). Its base, for ci-local's
       `--diff-base`, is `main` (train 1's base), not train 1's tail: a
       pass lands train 1 too, so it must cover train 1's cars (#4151). It records `SPEC=<host> <ref> <remote log> <local
       log>` in train 2's state and prints the local log path,
@@ -1050,30 +1048,21 @@ one to train 1.
    train gate uses omegalisk's one gate slot. It may wait for a room gate
    that already holds the slot, but it takes the next free one ahead of any
    waiting room gate (`.train-waiting`, #3317; FIFO otherwise, #3364).
-   **It also tests the packages the train touches** (AGAST #3363). #3290's
-   bug got through a green train because build-all + bootstrap don't run
-   the workspace projects' own tests. `train.sh gate` prints `PKGS <dirs>`
-   on stderr. Once build-all and bootstrap pass, the gate runs
-   `train.sh pkgs test <base>`: `./rz test` on each touched package (the
-   deepest `ritz.toml` above each changed file under `projects/`). It skips
-   `projects/ritz/**` and `[workspace.exclude]` dirs, so a compiler-only
-   train costs what it did before. **Except a ritzunit train**: a change
-   to `projects/ritzunit` (its own package, not `inventory`) or to
-   `ritz0/test_runner.py` selects every package `rz test --all` sweeps,
-   `projects/ritz/**` members included (#3735). ritzunit is the `main` of
-   every test binary, and #2072, ritzunit-only, broke ritzlib/tests and
-   zeus through a green train. Each package gets one line, and
-   `--wait` shows them:
-   `PKG PASS`, `PKG KNOWN` (a `build` entry in `known-failures/`: advisory, as in
-   `rz test --all`), `PKG PRE-EXISTING` (fails on the base too, so it was
-   re-run in a temp worktree of the base: not this train's) or `PKG FAIL`
-   (passes on the base, or a new package): the gate fails. Treat a
-   `PKG FAIL` like any other red gate. Since #3969 the gate's own
-   `test-all` job runs every package first, so this step only re-runs
-   packages that already passed. A package failure stops the gate at
-   `[Test workspace]` before the PRE-EXISTING base re-run gets a chance
-   (follow-up: #3970).
-   `train.sh pkgs list <base>` (run in the train worktree) previews the set.
+   **Packages are tested by the gate's `test-all` job** (AGAST #3969),
+   every one of them, so a package failure is a red `[Test workspace]`:
+   treat it like any other red gate. `train.sh gate` prints `PKGS <dirs>`
+   on stderr, the packages the train touches (the deepest `ritz.toml`
+   above each changed file under `projects/`, minus `projects/ritz` and
+   `[workspace.exclude]` dirs; a ritzunit or `ritz0/test_runner.py`
+   change selects every package, #3735), so you know which cars to
+   suspect. The old `train.sh pkgs test` step (#3363), which re-tested
+   those packages after the jobs and excused a `PKG PRE-EXISTING` failure
+   by re-running it on the base, is retired along with `RZ_GATE_AFTER`
+   (AGAST #3970): test-all stopped the gate first, so the base re-run
+   never ran, and main is gated by test-all, so a package already failing
+   on main is rare. If one does, fix main first or add a `known-failures/`
+   entry.
+   `train.sh pkgs list <base>` (run in the train worktree) prints the set.
    **When the train gate ends, pass or fail, it reserves the slot for the
    next train** (`gate-logs/.train-reserved`, #3427), before it lets go of
    it. Reading the verdict and running `land` takes 30-60 s, and a room

@@ -16,8 +16,6 @@
 #   RZ_GATE_DIR    where logs and slot locks go  (default: ~/dev/ritz-lang/gate-logs)
 #   RZ_GATE_POLL   seconds between slot polls    (default: 20; tests use less)
 #   RZ_GATE_TRAIN  1 = a merge-train gate        (train.sh gate sets it)
-#   RZ_GATE_AFTER  run after the command passes  (train.sh gate: its package
-#                  tests, AGAST #3363)
 #   RZ_GATE_TRAIN_HOLD  seconds a .train-reserved holds room gates (default 600)
 #   RZ_GATE_STARVE seconds a room gate waits before it goes ahead of the
 #                  merge trains (default 2700; AGAST #3578)
@@ -290,8 +288,6 @@ BASE="${RZ_GATE_BASE:-}"
 [[ -n "$BASE" ]] || BASE="$(git -C "$WT" merge-base origin/main HEAD 2>/dev/null)" || BASE=""
 BASE="$(git -C "$WT" rev-parse --verify --quiet "${BASE:-none}^{commit}" 2>/dev/null)" || BASE=""
 CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=\"--fail-fast --skip Smoke ${BASE:+--diff-base $BASE }--job build-all --job test-all --job bootstrap\"}"
-# A merge train's package tests (AGAST #3363), only once CMD has passed.
-if [[ -n "${RZ_GATE_AFTER:-}" ]]; then CMD="($CMD) && $RZ_GATE_AFTER"; fi
 UNIT="ritz-gate-$NAME"
 TREE="$GATES/.trees/$UNIT"
 # The gate's own exec-able TMPDIR, beside its checkout (AGAST #3704).

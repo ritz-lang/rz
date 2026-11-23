@@ -220,26 +220,18 @@ has "$out" "gate=not-needed" "a lone KEPT train needs no gate"
 [[ ! -e "$RES" ]] && ok "building a gate=not-needed train drops the reservation" \
     || bad "building a gate=not-needed train drops the reservation"
 
-# 7. Package tests (AGAST #3363): the train gate also tests the workspace
-# packages the train touches, and a failure blocks only if the base passes.
-# Fake packages; RZ_PKG_TEST stands in for `./rz test <dir>` and fails when
-# the package has a FAIL file.
+# 7. Touched packages (AGAST #3363): `pkgs list` names the workspace packages
+# a train touches, for the gate's PKGS preview line.  The gate itself adds no
+# package-test step: its test-all job tests every package (AGAST #3969), and
+# `pkgs test` with its PRE-EXISTING base re-run is retired (AGAST #3970).
 fetch; git -C "$M" checkout -q --detach origin/main
 for d in projects/ritz projects/harland projects/harland/boot projects/ritzunit/inventory \
          projects/oldbad projects/lexis projects/ritz-lsp projects/prism; do
     mkdir -p "$M/$d"; echo "[package]" > "$M/$d/ritz.toml"
 done
 mkdir -p "$M/projects/prism/src"; echo x > "$M/projects/prism/src/main.ritz"
-touch "$M/projects/oldbad/FAIL" "$M/projects/lexis/FAIL"
 printf '%s\n' '[workspace.exclude]' '"projects/harland/boot" = "built by harland"' > "$M/rz.toml"
-# lexis is excused the real way: the real parser, a fake ticket (AGAST #1834).
-mkdir -p "$M/projects/ritz/tools" "$M/known-failures"
-cp "$HERE/../../../projects/ritz/tools/known_failures.py" "$M/projects/ritz/tools/"
-printf '%s\n' '[[entry]]' 'gate = "build"' 'compiler = "any"' 'unit = "lexis"' \
-    'reason = "fake"' 'agast = 1' > "$M/known-failures/1.toml"
 git -C "$M" add -A; git -C "$M" commit -qm packages; git -C "$M" push -q origin HEAD:main
-printf '%s\n' '#!/usr/bin/env bash' 'echo "testing $1 in $PWD"; [[ ! -e "$1/FAIL" ]]' > "$T/pkgtest.sh"
-chmod +x "$T/pkgtest.sh"; export RZ_PKG_TEST="$T/pkgtest.sh"
 PK="$TR"
 # train <files...>: a fresh one-room train whose commit touches <files>, on a
 # base one commit behind main (so it is APPLIED and needs a gate).  Sets $tb.
@@ -254,7 +246,6 @@ train() {
     tb="$(git -C "$M" rev-parse origin/main)"
     bash "$TR" build "pk:$s" >/dev/null 2>&1
 }
-pt() { (cd "$T/train" && bash "$PK" pkgs test "$tb" 2>&1); }
 
 train projects/prism/src/main.ritz projects/ritz/x projects/harland/boot/y \
       projects/ritzunit/inventory/z projects/README projects/ritz-lsp/w
@@ -263,12 +254,12 @@ want="projects/harland projects/prism projects/ritz-lsp projects/ritzunit/invent
 [[ "$(tr '\n' ' ' <<<"$out")" == "$want" ]] \
     && ok "list: each touched file's owning package, minus projects/ritz and excluded dirs" \
     || { bad "list: touched packages"; echo "$out" | sed 's/^/     | /'; }
-log="$(bash "$TR" gate 2>/dev/null)"
-has "$(cat "$log")" "^AFTER=.*train.sh.* pkgs test $tb" "a train touching packages adds their tests to its gate"
-out="$(pt)"; rc=$?
-[[ $rc -eq 0 ]] && ok "passing package tests pass (rc=$rc)" || bad "passing package tests pass (rc=$rc)"
-has "$out" "^PKG PASS +prism" "each touched package is tested"
-has "$out" "^PKG PASS +ritzunit/inventory" "a nested package is tested by its own dir"
+log="$(bash "$TR" gate 2>"$T/err")"
+has "$(cat "$log")" "^AFTER=$" "a train touching packages adds no package-test step to its gate (AGAST #3970)"
+has "$(cat "$T/err")" "^PKGS projects/harland projects/prism " "the gate still previews the touched packages"
+out="$(cd "$T/train" && bash "$PK" pkgs test "$tb" 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && ok "pkgs test is retired: it fails (rc=$rc)" || bad "pkgs test is retired: it fails (rc=$rc)"
+has "$out" "usage: .* pkgs list <base>" "pkgs test is retired: a usage error naming pkgs list"
 
 train projects/ritz/only
 log="$(bash "$TR" gate 2>/dev/null)"
@@ -278,29 +269,6 @@ train projects/ritz/ritzlib/net.ritz
 out="$(cd "$T/train" && bash "$PK" pkgs list "$tb" 2>&1)"
 [[ -z "$out" ]] && ok "list: a ritzlib change selects no ritzlib/tests that doesn't exist" \
     || { bad "list: a ritzlib change selects no ritzlib/tests that doesn't exist"; echo "$out" | sed 's/^/     | /'; }
-
-train projects/prism/FAIL
-out="$(pt)"; rc=$?
-[[ $rc -ne 0 ]] && ok "a new package failure fails (rc=$rc)" || bad "a new package failure fails (rc=$rc)"
-has "$out" "^PKG FAIL +prism.*passes on base" "the new failure is named, against the base"
-has "$out" "^--- prism \(base " "the base was tested too"
-[[ "$(git -C "$T/train" worktree list | wc -l)" -eq 2 ]] && ok "the base worktree is removed" \
-    || { bad "the base worktree is removed"; git -C "$T/train" worktree list; }
-
-train projects/oldbad/src.ritz
-out="$(pt)"; rc=$?
-[[ $rc -eq 0 ]] && ok "a failure the base has too doesn't block (rc=$rc)" || bad "a failure the base has too doesn't block (rc=$rc)"
-has "$out" "^PKG PRE-EXISTING +oldbad" "a pre-existing failure is reported"
-
-train projects/lexis/src.ritz
-out="$(pt)"; rc=$?
-[[ $rc -eq 0 ]] && ok "a known-failing package is advisory (rc=$rc)" || bad "a known-failing package is advisory (rc=$rc)"
-has "$out" "^PKG KNOWN +lexis" "a known-failing package is reported"
-
-train projects/newpkg/ritz.toml projects/newpkg/FAIL
-out="$(pt)"; rc=$?
-[[ $rc -ne 0 ]] && ok "a new package that fails blocks (rc=$rc)" || bad "a new package that fails blocks (rc=$rc)"
-has "$out" "^PKG FAIL +newpkg.*not on the base" "a new package's failure needs no base run"
 
 
 # 8. A ritzunit or test-runner change selects every package (AGAST #3735).
@@ -324,9 +292,6 @@ for f in projects/ritzunit/src/runner.ritz projects/ritz/ritz0/test_runner.py; d
         && ok "list: a $f change selects every package rz test --all sweeps" \
         || { bad "list: a $f change selects every package"; echo "$out" | sed 's/^/     | /'; }
 done
-out="$(pt)"
-has "$out" "^PKG PASS +ritz/ritzlib/tests" "an all-packages train tests a package inside projects/ritz"
-has "$out" "^PKG PRE-EXISTING +oldbad" "an all-packages train still compares failures against the base"
 train projects/ritzunit/inventory/src.ritz
 out="$(cd "$T/train" && bash "$PK" pkgs list "$tb" 2>&1)"
 [[ "$(tr '\n' ' ' <<<"$out")" == "projects/ritzunit/inventory " ]] \
@@ -358,8 +323,7 @@ eq "$(lsr projects/ritz/tools/nested/src.ritz)" "projects/ritz/tools/nested " \
     "list: any other nested package under projects/ritz is tested as its own"
 train projects/ritz/ritzlib/net.ritz
 log="$(bash "$TR" gate 2>/dev/null)"
-has "$(cat "$log")" "^AFTER=.*train.sh.* pkgs test $tb" "a ritzlib-only train adds the package tests to its gate"
-has "$(pt)" "^PKG PASS +ritz/ritzlib/tests" "a ritzlib-only train tests ritzlib/tests"
+has "$(cat "$log")" "^AFTER=$" "a ritzlib-only train adds no package-test step to its gate"
 
 # 10. Stacked trains (AGAST #3809).  A train holds at most 8 cars; the next
 # train builds on its tail (`build --next`, or overflow) and lands after it.
@@ -638,8 +602,7 @@ rlog="$(specof | cut -d' ' -f3)"
 has "$(cat "$rlog" 2>/dev/null)" "^TRAIN=1$" "the remote gate has train priority (RZ_GATE_TRAIN=1)"
 # Against main, train 1's base, not train 1's tail (AGAST #4151): a pass of
 # train 2 lands train 1 too, so its gate must test train 1's packages.
-has "$(cat "$rlog" 2>/dev/null)" "^AFTER=bash .*remote-train(-[0-9]+)?/.claude/skills/rz-iterate/train.sh pkgs test $mb$" \
-    "the remote gate tests trains 1-2's packages against main, train 1's base"
+has "$(cat "$rlog" 2>/dev/null)" "^AFTER=$" "the remote gate adds no package-test step (AGAST #3970)"
 has "$(cat "$rlog" 2>/dev/null)" "^GBASE=$mb$" "the remote gate's diff base is main, train 1's base"
 out="$(bash "$TR" gate --next 2>&1)"; has "$out" "already gating" "gate --next refuses when every later train is gating"
 out="$(bash "$TR" wait "$llog" 2>&1)"; rc=$?
@@ -942,16 +905,15 @@ stops() { cat "$T/systemctl-log" 2>/dev/null; }
 ntrains() { bash "$TR" show 2>/dev/null | grep -c '^== train'; }
 
 # 12a. Train 2 passes (remote) while train 1 still gates here: both land in
-# one push, train 1's gate is stopped, train 3 is promoted.  Train 2's gate
-# tested train 1's packages too: its pkgs base is main.
+# one push, train 1's gate is stopped, train 3 is promoted.  Train 2's
+# `pkgs list` base is main, so it covers train 1's packages too.
 fetch; git -C "$M" checkout -q main; m0="$(git -C "$M" rev-parse origin/main)"
 two ga projects/prism/src/ga; bash "$TR" build "ga1:$c1" "ga2:$c2" >/dev/null 2>&1
 log1="$(bash "$TR" gate 2>/dev/null)"; running "$log1"
 two gb s/gb; bash "$TR" build --next "gb1:$c1" "gb2:$c2" >/dev/null 2>&1
 t2="$(git -C "$T/train-2" rev-parse HEAD)"
 llog="$(bash "$TR" gate --next 2>/dev/null)"; rlog="$(specof | cut -d' ' -f3)"
-has "$(cat "$rlog" 2>/dev/null)" "^AFTER=bash .*train.sh pkgs test $m0$" \
-    "train 2's remote gate runs the package tests though only train 1 touches a package"
+has "$(cat "$rlog" 2>/dev/null)" "^AFTER=$" "train 2's remote gate adds no package-test step"
 out="$(cd "$(rw_of 2)" && bash "$TR" pkgs list "$m0" 2>&1)"
 has "$out" "^projects/prism$" "pkgs list <main> on train 2's tip covers train 1's packages"
 c3="$(room gc1 s/gc1 X)"; fetch; git -C "$M" checkout -q main
