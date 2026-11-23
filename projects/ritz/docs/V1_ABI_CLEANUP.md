@@ -144,12 +144,16 @@ emitted into the user's own module by the same compiler, so it links wherever
 `ritz1/src/main_abi.ritz`, with a byte-identity check in
 `ritz0/test_main_abi.py`.
 
-### Overriding the entry symbol (not built)
+### Overriding the entry symbol
 
-`[[bin]] entry = "kernel_main"` in `ritz.toml` was proposed to pick which
-`pub fn` the runtime dispatches to. No binary needs it: the kernel and UEFI
-targets link their own entry. It is deferred to #4020, and LARB is asked
-whether it belongs at all (#4015).
+`[[bin]] entry` is a build-target key, not a language feature (LARB R68,
+#4015; built in #4434). The language has one entry convention: `main`, in
+one of §5.7's shapes. The runtime adapter still calls `main`.
+
+A hosted binary's function half must be `main`. A freestanding target may
+name the symbol the platform calls (`efi_main`, `kernel_main`); that is the
+link entry, and the UEFI link takes it from the manifest. Harland was the
+binary that asked. There is no hosted runtime dispatch to some other `pub fn`.
 
 ### Env API for the 99% case
 
@@ -389,8 +393,9 @@ Phase 5 removes them.
    `11_env` (env) run it end to end.
 4. Tests: `ritz0/test_main_abi.py` (every row on ritz0, ritz1 and
    ritz1_selfhosted).
-5. Follow-ups: #4018 (diagnostic names), #4019 (Harland mmap), #4020
-   (`[[bin]] entry`), and LARB #4015 (ratify §5.7).
+5. Follow-ups filed here: #4018 (diagnostic names), #4019 (Harland mmap).
+   #4020 (`[[bin]] entry`) closed under R68 (#4015) by #4434: a build-target
+   key, not a second hosted entry function.
 
 ### Phase 2 — Writer + Display + canonical print + format specs (1.5 days)
 
@@ -509,9 +514,11 @@ forms work. Phase 5 removes the old ones in one commit.
    calls `main(args, env)` directly with no synthesized adapter and no
    arity branching. Env access for the 99% case lives in `ritzlib.os.env`
    as free functions (`env.get`, `env.get_or`, `env.must`, `env.iter`).
-   Most code never has to declare interest in env at the entry point. The
-   entry symbol can be overridden per-binary via `[[bin]] entry = "..."`
-   in `ritz.toml`; default is `main`.
+   Most code never has to declare interest in env at the entry point.
+   `[[bin]] entry = "..."` was proposed here as a per-binary override of
+   the runtime entry symbol. Superseded (R68, #4434): it is a build-target
+   key. Hosted binaries name `main`. Freestanding targets name the link
+   symbol (`efi_main`, `kernel_main`). The runtime adapter still calls `main`.
 
 2. **`pub fn main` return type — RESOLVED: optional, defaults to `-> i32`
    with implicit 0.** Drives the absolute minimum-syntax `hello world`:
