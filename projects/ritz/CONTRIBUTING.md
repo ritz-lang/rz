@@ -171,21 +171,20 @@ make test-hello
 make test-05_cat
 ```
 
-### Dual-Compiler Tests
+### Cross-Compiler Tests (Regression Matrix)
 
-The `test/dual_compiler/` directory contains tests that must pass on both ritz0 (Python) and ritz1 (self-hosted):
+Every `[[test]]` fn in `ritz0/test/*.ritz` runs under ritz0, ritz1 and
+ritz1_selfhosted in the gate. A program that must behave the same on every
+compiler goes there:
 
 ```bash
-# Run dual-compiler tests
-cd test/dual_compiler
-./run_tests.sh
-
-# Run specific level
-./run_tests.sh 1
-
-# Verbose output
-./run_tests.sh -v
+make matrix          # ritz1 only, incremental
+make matrix-full     # all three compilers
 ```
+
+(`test/dual_compiler/` used to document a `run_tests.sh` that never existed.
+Nothing ran it, and one of its cases rotted unnoticed. It was deleted by
+AGAST #4573; the matrix covers every case it had.)
 
 ---
 
