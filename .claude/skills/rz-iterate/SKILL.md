@@ -233,7 +233,7 @@ delivery until the host replies `SPAWNED`/`TORNDOWN`.
   claimed"). See "Who owns the ticket" for the whole claim-to-close path.
 - **Host room verbs** (always `send_room_message(room_id="adele-<host>",
   ..., sender_name="rz", ask_claude=True)`):
-  - `SPAWN ritz-task-<id> repo=rz task=<id> callback=rz model=deepseek-flash`, then
+  - `SPAWN ritz-task-<id> repo=rz task=<id> callback=rz` (no `model=`; see "Fleet model"), then
     the briefing. The host answers `SPAWNED ritz-task-<id> on <host>` or
     `SPAWN-FAILED ritz-task-<id> on <host>: <reason>`.
     `SPAWN` creates the worktree off `origin/main`; the room gates with
@@ -378,7 +378,7 @@ brief, verify the agent woke), with these ritz values:
 | Room / branch / unit name | `ritz-task-<agast-id>` |
 | Worktree | `~/dev/ritz-lang/rz-task-<agast-id>` (host makes it off `origin/main`; if a train queue exists, the room then resets it to the deepest tail: step 3 above) |
 | Install from | `~/dev/nevelis/adele`, `--workspace` pointing at the worktree |
-| Model | `deepseek-flash` (see "Fleet model" below), not `opus` |
+| Model | default harness/model, `CLAUDE_CONFIG_DIR=/home/aaron/.claude-bettercomp` in `room.env` (see "Fleet model" below) |
 | Callback room | `rz` |
 
 **Pass `--worktree ~/dev/ritz-lang/rz-task-<agast-id>` explicitly.** `adele
@@ -386,16 +386,21 @@ room spawn`'s default is `<repo-dir>-<room>`, which for repo `rz` and room
 `ritz-task-<id>` gives `rz-ritz-task-<id>` — a worktree name no briefing,
 reap, or teardown step expects (2026-11-20).
 
-**Fleet model (AGAST #2609 follow-up).** While the Claude weekly limit is
-exhausted the whole fleet runs DeepSeek. Pass `--harness deepseek --model
-deepseek-flash` to `adele install` (or `model=deepseek-flash` to the host
-room's `SPAWN`). Since adele #4367 `adele install --harness deepseek`
-writes `~/.config/systemd/user/adele-agent@<room>.service.d/95-adele-harness.conf`
-directly, pinning `--harness deepseek --model deepseek-flash`, before the
-unit starts. Do not hand-write a `90-adele-deepseek.conf` harness drop-in:
-a surviving `90-` sorts before the `95-` pin and is overridden. Rooms that
-keep dying on their first turn, or whose last `claude_response` is the
-synthetic "weekly limit" line, are this, not a bug in their work.
+**Fleet model (Aaron, 2026-11-23: back on Claude).** Rooms use the
+**default harness and model**. Do **not** pass `--harness` / `--model` to
+`adele install`, do **not** install any harness drop-in (`90-adele-deepseek.conf`,
+`95-adele-harness.conf`), and don't put `model=` on a host `SPAWN`. Every
+room's `~/.config/adele/rooms/<room>/room.env` **must** have
+`CLAUDE_CONFIG_DIR=/home/aaron/.claude-bettercomp` (check it after spawn).
+Stale DeepSeek pins live in three places, and any one of them keeps a room
+on DeepSeek or crashes it with `[claude-code:unrecognized_model]
+{"model":"deepseek-flash"}`: `ADELE_HARNESS`/`ADELE_MODEL` lines in
+`room.env`, a harness drop-in, and a `"model": "deepseek-flash"` entry for the
+room in `~/.adele/rooms.json` (the agent logs `Model: (stored, else CLI
+default)` and then the stored value). Clear all three (#203, 2026-11-23).
+Active hosts: omegalisk and huburght only (bangerang, toffee, chungus and
+starbux are out of rotation). huburght got its `~/.claude-bettercomp` copied
+from omegalisk on 2026-11-23.
 
 **"START poke sent" doesn't mean the room started.** Within ~2 minutes of
 `adele room spawn`, check the room has posted a `claude_response` or tool use
