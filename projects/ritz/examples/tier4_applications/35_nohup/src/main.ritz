@@ -25,8 +25,10 @@ import ritzlib.strview
 import ritzlib.string
 import ritzlib.option
 import ritzlib.span
+import ritzlib.fmt
 import ritzlib.os.env
 import ritzlib.process
+import ritzlib.gvec
 
 # ============================================================================
 # Constants
@@ -56,17 +58,14 @@ fn isatty(fd: i32) -> i32
 fn print_error(msg: StrView)
     # Print error message to stderr.  StrView is length-tagged so we
     # don't need a runtime strlen() call.
-    eprints(msg)
+    eprint("{msg}")
 
 fn print_error_ln(msg: StrView)
-    eprintln(msg)
+    eprint("{msg}\n")
 
 # err2-style helper for diagnostics with an embedded path.
 fn nohup_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
-    var s: String = string_from_strview(prefix)
-    s.push_cstr(path)
-    s.push_str(suffix)
-    eprintln_string(@s)
+    eprint("{prefix}{path}{suffix}\n")
     return 1
 
 fn open_nohup_out() -> i32
@@ -77,7 +76,7 @@ fn open_nohup_out() -> i32
     let fd: i32 = sys_open3(c"nohup.out", flags, mode)
 
     if fd >= 0
-        eprintln("nohup: appending output to 'nohup.out'")
+        eprint("nohup: appending output to 'nohup.out'\n")
         return fd
 
     # If current directory failed, try $HOME/nohup.out
@@ -88,11 +87,11 @@ fn open_nohup_out() -> i32
 # $PATH, or the standard directories when it is unset or empty, as
 # execvp(3) does.  Returns 0 if it is not found; if it is found but will not
 # exec, reports that and returns EXIT_CANNOT_INVOKE.  Never returns on success.
-fn exec_from_path(cmd: StrView, argv: **u8) -> i32
+fn exec_from_path(cmd: StrView, exec_args: **u8) -> i32
     match find_command(cmd)
         Some(path) =>
             var full: String = path
-            sys_execve(full.as_ptr(), argv, env_raw_envp())
+            sys_execve(full.as_ptr(), exec_args, env_raw_envp())
             nohup_err2("nohup: failed to run '", full.as_ptr(), "'")
             EXIT_CANNOT_INVOKE
         None => 0
@@ -101,9 +100,21 @@ fn exec_from_path(cmd: StrView, argv: **u8) -> i32
 # Main
 # ============================================================================
 
-fn main(argc: i32, argv: **u8) -> i32
+# args[1..] as a NULL-terminated *u8 array for execve.  Each argv StrView
+# ends at argv's NUL, so .ptr is a valid C string.
+fn exec_argv(args: Span<StrView>) -> Vec<*u8>
+    var av = vec_new<*u8>()
+    var i: i64 = 1
+    while i < args.len
+        let a: StrView = args[i]
+        av.push(a.ptr)
+        i += 1
+    av.push(null)
+    av
+
+pub fn main(args: Span<StrView>) -> i32
     # Check for at least one argument (the command)
-    if argc < 2
+    if args.len < 2
         print_error_ln("nohup: missing operand")
         print_error_ln("Usage: nohup COMMAND [ARG]...")
         return EXIT_NOHUP_FAILURE
@@ -127,23 +138,23 @@ fn main(argc: i32, argv: **u8) -> i32
     if isatty(STDERR) != 0
         sys_dup2(STDOUT, STDERR)
 
-    # Get the command to execute (argv[1])
-    let cmd: *u8 = *(argv + 1)
+    # Get the command to execute (args[1])
+    let cmd_sv: StrView = args[1]
+    let cmd: *u8 = cmd_sv.ptr
 
-    # Build argv for execve: argv[1], argv[2], ..., NULL
-    # We can just use argv+1 since it already has the right format
-    let new_argv: **u8 = argv + 1
+    # Build argv for execve: args[1], args[2], ..., NULL
+    var child_argv: Vec<*u8> = exec_argv(args)
+    let new_args: **u8 = child_argv.as_ptr()
 
     # Execute the command
     # A name with a '/' is a path; anything else is searched for.
-    let cmd_sv: StrView = strview_from_cstr(cmd)
     if cmd_sv.find_byte('/') == cmd_sv.len
-        let rc: i32 = exec_from_path(cmd_sv, new_argv)
+        let rc: i32 = exec_from_path(cmd_sv, new_args)
         if rc != 0
             return rc
 
     # If we have a path with slash or PATH search failed, try direct exec
-    sys_execve(cmd, new_argv, env_raw_envp())
+    sys_execve(cmd, new_args, env_raw_envp())
 
     # If we get here, execve failed.
     if sys_access(cmd, F_OK) != 0
