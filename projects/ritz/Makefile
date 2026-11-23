@@ -99,6 +99,22 @@ tools-unit:
 	@echo "=== Running tools/ unit tests (-n $(PYTEST_J)) ==="
 	@$(PYTHON) -m pytest -q -n $(PYTEST_J) --dist loadgroup tools/
 
+# The tools/ tests that read compiler SOURCES (ritz0/, ritz1/, grammars/,
+# runtime/): the ritz1 ratchets, arch/metrics/emitter-import checks, the
+# kind-ladder ratchet and the ritz0/ritzgen/grammar source checks.  A subset
+# of tools-unit (~1 min vs ~4-6), run by a room's pre-REAP smoke for a
+# compiler change (.claude/skills/rz-iterate/smoke-plan.sh, AGAST #4587:
+# train 814a64f4 went red on test_ritz1_kind_match.py, which it never ran).
+# A new source-reading test belongs under one of these names.
+TOOLS_RATCHETS = tools/test_ritz1_*.py tools/test_ritz0_*.py tools/test_ritzgen_*.py \
+	tools/test_grammar_*.py tools/test_enum_ast_nodes.py tools/test_corpus_parses.py \
+	tools/test_known_failures.py tools/test_ci_local.py
+
+.PHONY: tools-ratchets
+tools-ratchets:
+	@echo "=== Running tools/ source-reading ratchets (-n $(PYTEST_J)) ==="
+	@$(PYTHON) -m pytest -q -n $(PYTEST_J) --dist loadgroup $(wildcard $(TOOLS_RATCHETS))
+
 # ritz1's measurements: modules, sizes, import graph and cycles, where each
 # check runs, long functions.  Printed, never committed (AGAST #3896: a block
 # of them in ritz1/ARCHITECTURE.md made every ritz1 commit conflict); the

@@ -26,12 +26,12 @@ targets() { bash "$SP" plan "$@" | cut -f1 | paste -sd' '; }
 # 1. The path -> targets mapping, one rule at a time.
 change docs/a.md >/dev/null;                    eq "$(targets)" "smoke" "a doc-only diff is smoke alone"
 change projects/ritz/README.md >/dev/null;      eq "$(targets)" "smoke doc-examples" "a ritz doc checks its examples"
-change projects/ritz/ritz0/x.py >/dev/null;     eq "$(targets)" "smoke unit ritz1-bootstrap matrix" "ritz0 runs the full unit suite, ritz1-bootstrap and the matrix"
-change projects/ritz/runtime/r.c >/dev/null;    eq "$(targets)" "smoke unit ritz1-bootstrap matrix" "the runtime runs the compiler set"
+change projects/ritz/ritz0/x.py >/dev/null;     eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix" "ritz0 runs the full unit suite, ritz1-bootstrap and the matrix"
+change projects/ritz/runtime/r.c >/dev/null;    eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix" "the runtime runs the compiler set"
 change projects/ritz/ritz1/src/m.ritz >/dev/null
-eq "$(targets)" "smoke unit ritz1-bootstrap matrix" "ritz1 runs the compiler set rz briefs"
+eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix" "ritz1 runs the compiler set rz briefs"
 change projects/ritz/grammars/g.grammar >/dev/null
-eq "$(targets)" "smoke unit ritz1-bootstrap matrix" "the grammar runs what ritz1 does (regen-check is in the matrix)"
+eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix" "the grammar runs what ritz1 does (regen-check is in the matrix)"
 change projects/ritz/ritzlib/v.ritz >/dev/null; eq "$(targets)" "smoke ritzlib matrix" "ritzlib runs its tests and the matrix"
 change projects/ritz/test/t.ritz >/dev/null;    eq "$(targets)" "smoke ritz-tests matrix" "ritz/test runs the language tests and the matrix"
 change projects/ritz/examples/e.ritz >/dev/null; eq "$(targets)" "smoke examples" "examples run the examples"
@@ -49,13 +49,22 @@ change .claude/settings.json >/dev/null;        eq "$(targets)" "smoke tools-uni
 change .claude/host-env.sh >/dev/null;          eq "$(targets)" "smoke tools-unit skill:rz-iterate" "host-env.sh runs tools-unit and rz-iterate's tests"
 change rz.toml >/dev/null;                      eq "$(targets)" "smoke build-all" "the workspace manifest builds everything"
 change .github/workflows/main.yml >/dev/null;   eq "$(targets)" "smoke" "CI config is smoke alone (the train gate covers it)"
+# AGAST #4587: train 814a64f4 went red on tools/test_ritz1_kind_match.py, a
+# ratchet that reads ritz1 sources, which the compiler set never ran.
+change projects/ritz/grammars/h.grammar >/dev/null
+has "$(bash "$SP" plan)" "^tools-ratchets	make -C projects/ritz tools-ratchets$" "tools-ratchets runs the Makefile's source-reading subset"
+# tools-unit runs all of tools/, so a diff that needs both runs it alone.
+change projects/ritz/ritz1/src/k.ritz projects/ritz/tools/k.py >/dev/null
+eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap matrix" "tools-unit subsumes tools-ratchets"
+change projects/ritz/ritz1/src/k.ritz .claude/settings.json >/dev/null
+eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap matrix" "and so does a .claude/ change's tools-unit"
 
 # 2. A mixed diff: each target once, in the fixed order, packages last.
 s="$(change projects/ritz/ritz0/y.py projects/ritz/tools/u.py projects/ritz/ritz0/z.py \
     projects/spire/lib/a.ritz projects/angelo/src/b.ritz docs/c.md)"
 eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap matrix pkg:angelo pkg:spire" "a mixed diff: each target once, in order"
 eq "$(targets "$s^!")" "smoke tools-unit unit ritz1-bootstrap matrix pkg:angelo pkg:spire" "<sha>^! plans one commit"
-eq "$(targets HEAD~3..HEAD)" "smoke tools-unit unit ritz1-bootstrap matrix build-all pkg:angelo pkg:spire" \
+eq "$(targets HEAD~6..HEAD)" "smoke tools-unit unit ritz1-bootstrap matrix build-all pkg:angelo pkg:spire" \
     "a range plans every commit in it"
 has "$(bash "$SP" plan)" "^unit	make -C projects/ritz unit$" "plan prints each target's command, tab-separated"
 has "$(bash "$SP" plan)" "^pkg:spire	\./rz build spire && \./rz test spire$" "a package's command builds and tests it"

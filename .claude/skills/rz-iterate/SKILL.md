@@ -555,7 +555,10 @@ you changed pass **in full** on that exact commit (step 6).
    `run` maps the files your commit (`HEAD^..HEAD`) changed to their
    subsystems' test targets. Every diff gets `make smoke`. A compiler
    change (`ritz0`, `ritz1`, `grammars`, `runtime`) gets the whole `make
-   unit`, `ritz1-bootstrap` and the matrix. A package gets `./rz build` and
+   unit`, `ritz1-bootstrap`, the matrix and `tools-ratchets`: the tools/
+   tests that read compiler sources (the ritz1 ratchets, kind-ladder,
+   arch and metrics checks; ~1 min; #4587, a red train that skipped them).
+   A package gets `./rz build` and
    `./rz test`, a skill gets its `test-*.sh`, and anything under
    `.claude/` also gets `tools-unit`, whose tests read SKILL.md (the
    mapping is in the script's header). It runs each target **in full**, never a fail-fast

@@ -33,8 +33,13 @@
 #   *.md, docs/**                        doc-only: no target (smoke alone),
 #     except projects/ritz/**.md         doc-examples
 #   projects/ritz/ritz0/**, ritz1/**,
-#     grammars/**, runtime/**            unit ritz1-bootstrap matrix (the
-#                                        compiler set rz briefs, 2026-11-23)
+#     grammars/**, runtime/**            tools-ratchets unit ritz1-bootstrap
+#                                        matrix (the compiler set rz briefs,
+#                                        2026-11-23; tools-ratchets is the
+#                                        tools/ tests that read compiler
+#                                        sources, `make tools-ratchets`, ~1
+#                                        min: #4587, train 814a64f4 went red
+#                                        on one; full tools-unit is 4-6 min)
 #   projects/ritz/ritzlib/**             ritzlib matrix
 #   projects/ritz/test/**                ritz-tests matrix
 #   projects/ritz/examples/**            examples
@@ -52,6 +57,8 @@
 #   rz, rz.toml                          build-all
 #   anything else (.github, known-failures)  smoke alone; the
 #                                        train's full gate covers it
+# tools-unit subsumes tools-ratchets: a diff that plans both runs only
+# tools-unit.
 #
 # Env (tests): RZ_SMOKE_RUNNER, a program run as `<runner> <target>
 # <command>` instead of `bash -c <command>`.
@@ -69,6 +76,7 @@ cmd_of() {
         ritz1-bootstrap)  echo "make -C projects/ritz ritz1-bootstrap" ;;
         matrix)           echo "make -C projects/ritz matrix-quick" ;;
         tools-unit)       echo "make -C projects/ritz tools-unit" ;;
+        tools-ratchets)   echo "make -C projects/ritz tools-ratchets" ;;
         harness-selftest) echo "make -C projects/ritz harness-selftest" ;;
         doc-examples)     echo "make -C projects/ritz check-doc-examples" ;;
         ritzlib)          echo "./rz test ritz/ritzlib/tests" ;;
@@ -104,7 +112,7 @@ targets_of() {
         .claude/host-env.sh)      echo skill:rz-iterate ;;
         *.md|docs/*) return ;;
         projects/ritz/ritz0/*|projects/ritz/ritz1/*|projects/ritz/grammars/*|projects/ritz/runtime/*)
-                                  echo unit; echo ritz1-bootstrap; echo matrix ;;
+                                  echo tools-ratchets; echo unit; echo ritz1-bootstrap; echo matrix ;;
         projects/ritz/ritzlib/*)  echo ritzlib; echo matrix ;;
         projects/ritz/test/*)     echo ritz-tests; echo matrix ;;
         projects/ritz/examples/*) echo examples ;;
@@ -117,7 +125,7 @@ targets_of() {
 }
 
 # The fixed order targets run and are quoted in: cheap and broad first.
-ORDER=(smoke doc-examples tools-unit harness-selftest ritzlib ritz-tests examples unit ritz1-bootstrap matrix build-all)
+ORDER=(smoke doc-examples tools-unit tools-ratchets harness-selftest ritzlib ritz-tests examples unit ritz1-bootstrap matrix build-all)
 
 # plan_targets <range...>: every target for the diff, smoke first, in ORDER,
 # then pkg:/skill: targets sorted.
@@ -130,6 +138,8 @@ plan_targets() {
         [[ -n "$f" ]] || continue
         while IFS= read -r t; do [[ -n "$t" ]] && want[$t]=1; done < <(targets_of "$f")
     done <<<"$files"
+    # tools-unit runs all of tools/, tools-ratchets included (#4587).
+    [[ -z "${want[tools-unit]:-}" ]] || unset 'want[tools-ratchets]'
     for o in "${ORDER[@]}"; do [[ -n "${want[$o]:-}" ]] && echo "$o"; done
     for t in "${!want[@]}"; do case "$t" in pkg:*|skill:*) extra+=("$t") ;; esac; done
     [[ ${#extra[@]} -eq 0 ]] || printf '%s\n' "${extra[@]}" | sort
