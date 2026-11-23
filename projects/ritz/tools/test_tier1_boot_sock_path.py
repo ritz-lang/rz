@@ -43,7 +43,12 @@ FAKE_QEMU = textwrap.dedent("""\
         sys.exit(f"qemu-system-x86_64: -monitor {mon}: {e}")
     s.listen(1)
     with open(serial, "a") as f:
-        f.write("[OK] VirtIO input device\\n")
+        # the kernel's banner, then its ring dump (\\harland\\klog-dump, #1885)
+        f.write("\\n========================================\\n    Hello from Harland!\\n========================================\\n"
+                "\\n=== RING BUFFER DUMP (kernel log) ===\\n"
+                "\\n========================================\\n    Hello from Harland!\\n========================================\\n"
+                "\\n=== END RING BUFFER ===\\n"
+                "[OK] VirtIO input device\\n")
     s.settimeout(20)
     c, _ = s.accept()
     c.sendall(b"QEMU monitor\\n(qemu) ")

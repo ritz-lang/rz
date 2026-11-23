@@ -25,9 +25,10 @@ pytestmark = pytest.mark.integration
 
 MAIN_SRC = KERNEL_SRC / "main.ritz"
 
-# mm/pmm imports serial, whose `asm x86_64:` blocks only ritz0 parses
-# (AGAST #1455/#1825), and ritz0 is what `rz build harland` uses.
-PMM_MODULES = ["mm.pmm", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits"]  # serial imports ritzlib.fmt.digits (#1957)
+# mm/pmm logs through klog (#1885), which imports serial, whose `asm x86_64:`
+# blocks only ritz0 parses (AGAST #1455/#1825), and ritz0 is what `rz build
+# harland` uses. klog imports ritzlib.fmt.digits (#1957) and ritzlib.str.
+PMM_MODULES = ["mm.pmm", "klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
 
 # Exit code i names the i-th failing check.
 PMM_PAGE_ZERO = """\

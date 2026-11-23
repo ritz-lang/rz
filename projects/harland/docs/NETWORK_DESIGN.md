@@ -101,7 +101,7 @@ The VirtIO network driver (~400 lines):
 
 import drivers.virtio.common { ... }
 import mm.vmm { vmm_virt_to_phys }
-import serial { prints, serial_print_hex, serial_print_dec }
+import klog { klog, klog_hex, klog_dec }
 
 # VirtIO-Net Feature Bits
 pub const VIRTIO_NET_F_CSUM: u32 = 0x0001

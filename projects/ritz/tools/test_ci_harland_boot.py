@@ -200,7 +200,14 @@ SCHED_OK = "[sched] 356 ticks, 285 switches, 233 preemptions\n"
 # in a ring-3 SYSCALL at once, each on its own per-CPU stack.
 SMP_OK = "[smp] syscall stacks OK: 4 CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\n"
 PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
-PASSED = BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + SUITE_PASSED + INIT_EXIT
+# The native ESP carries \\harland\\klog-dump, so the kernel dumps its crash
+# ring before init: the dump must be exactly the kernel's serial output up to
+# it, from the banner on (AGAST #1885).
+KERNEL_BANNER = r"\n========================================\n    Hello from Harland!\n========================================\n"
+RING_DUMP_START = r"\n=== RING BUFFER DUMP (kernel log) ===\n"
+RING_DUMP_END = r"\n=== END RING BUFFER ===\n"
+RING_OK = KERNEL_BANNER + RING_DUMP_START + KERNEL_BANNER + RING_DUMP_END
+PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -458,7 +465,7 @@ def test_busy_children_coarsely_paired_by_load_pass(tree):
     two steps per timeslice, so the lines paired (ABBAABBA..., 9 runs). The
     run count must tolerate that; only the [sched] ratio proves the scheduler
     kept preempting."""
-    serial = (BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
+    serial = (RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
               + BUSY_PAIRED_9
               + SCHED_OK
               + SMP_OK
@@ -513,6 +520,33 @@ def test_missing_per_cpu_syscall_stack_verdict_fails(tree):
     r = _run(tree, serial)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "no per-CPU syscall stack verdict" in r.stdout
+
+
+@pytest.mark.integration
+def test_ring_ok_passes(tree):
+    r = _run(tree, PASSED)
+    assert "PASS (native): the crash ring holds all" in r.stdout, r.stdout + r.stderr
+
+
+@pytest.mark.integration
+def test_no_ring_dump_fails(tree):
+    """Without the \\harland\\klog-dump ring dump the boot fails (AGAST #1885)."""
+    r = _run(tree, PASSED.replace(RING_OK, KERNEL_BANNER))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "no ring buffer dump" in r.stdout + r.stderr
+
+
+@pytest.mark.integration
+def test_message_missing_from_the_ring_fails(tree):
+    """A kernel line that reached serial but not the ring (the old prints())
+    makes the dump disagree with the log before it."""
+    serial = PASSED.replace(
+        RING_OK,
+        KERNEL_BANNER + r"Total pages: 523926\n" + RING_DUMP_START + KERNEL_BANNER + RING_DUMP_END,
+    )
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "serial and ring disagree" in r.stdout + r.stderr
 
 
 @pytest.mark.integration

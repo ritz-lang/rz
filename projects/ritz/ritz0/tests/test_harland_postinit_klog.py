@@ -9,6 +9,11 @@ move of two pieces of it:
 * the early-boot ring buffer and the klog helpers (klog, klogs, klog_hex),
   into klog.ritz.
 
+#1885 then made klog.ritz the kernel's one log API: klog(StrView),
+klog_cstr and the klog_dec/udec/hex family replace klog(*u8), klogs,
+klog_hex(prefix, v, suffix) and serial's prints/serial_print_*, so the
+moved lines below now read `klog("...")`.
+
 It ports main's code, not the #1844 branch's (83af7f1d): main has since edited
 kernel_main (#2118/#2130/#2143), and the branch's ring_write_byte grew a
 defensive clamp that would change behaviour. #1887 will gate the self-tests
@@ -40,11 +45,13 @@ KLOG = KERNEL_SRC / "klog.ritz"
 POSTINIT = KERNEL_SRC / "postinit.ritz"
 METRICS = RITZ0_DIR.parents[1] / "larb" / "tools" / "ritz-metrics" / "ritz_metrics.py"
 
-# klog.ritz: the ring buffer and the loggers. pub = called from another module.
+# klog.ritz: the ring buffer and the loggers (the one log API, #1885).
+# pub = called from another module.
 KLOG_FNS = {
-    "ring_write_byte": False, "ring_write": False, "ring_write_hex": False,
-    "ring_clear": True, "ring_len": False, "ring_dump": True,
-    "klog": True, "klogs": True, "klog_hex": True,
+    "ring_write_byte": False, "ring_clear": True, "ring_len": False, "ring_at": False,
+    "ring_copy": True, "ring_dump": True, "klog_serial": True, "klog_bytes": False,
+    "klog": True, "klog_cstr": True, "klog_dec": True, "klog_udec": True,
+    "klog_hex": True, "klog_hex_width": True, "klog_hex_prefix": True,
 }
 KLOG_VARS = {"ring_buffer", "ring_head", "ring_wrapped"}
 KLOG_CONSTS = {"RING_BUFFER_SIZE"}
@@ -61,25 +68,27 @@ POSTINIT_FNS = {"vmm_self_test", "higher_half_self_test", "heap_self_test", "ipc
 # One marker line per moved block, as it is printed. Each must leave main.ritz
 # and appear, unchanged, in postinit.ritz.
 MOVED_LINES = [
-    r'prints("\nTesting Virtual Memory...\n")',
-    r'prints("  VMM test PASSED!\n")',
-    r'prints("\nTesting Higher-Half Mapping...\n")',
-    r'prints("  Higher-half mapping PASSED!\n")',
-    r'prints("\nTesting Kernel Heap...\n")',
-    r'prints("  Heap test PASSED!\n")',
-    r'prints("\nTesting IPC Channels...\n")',
-    r'prints("  IPC test PASSED!\n")',
-    r'prints("\n=== PCI Devices ===\n")',
-    r'prints("\n=== Initializing Network Stack ===\n")',
-    r'prints("\n  Got IP! Pinging gateway...\n")',
-    r'prints("\n=== VirtIO Block Device ===\n")',
+    r'klog("\nTesting Virtual Memory...\n")',
+    r'klog("  VMM test PASSED!\n")',
+    r'klog("\nTesting Higher-Half Mapping...\n")',
+    r'klog("  Higher-half mapping PASSED!\n")',
+    r'klog("\nTesting Kernel Heap...\n")',
+    r'klog("  Heap test PASSED!\n")',
+    r'klog("\nTesting IPC Channels...\n")',
+    r'klog("  IPC test PASSED!\n")',
+    r'klog("\n=== PCI Devices ===\n")',
+    r'klog("\n=== Initializing Network Stack ===\n")',
+    r'klog("\n  Got IP! Pinging gateway...\n")',
+    r'klog("\n=== VirtIO Block Device ===\n")',
     "virtio_blk_test(blk_dev)",
     "test_elf_loader()",
 ]
 
 # kernel_main's SLOC (ritz-metrics) before this move, and the ceiling after it.
+# #1885 added the opt-in klog ring dump before run_init (+4 SLOC: the
+# dump_klog_ring flag, its boot-flag read and the guarded ring_dump call).
 KERNEL_MAIN_SLOC_BEFORE = 402
-KERNEL_MAIN_SLOC_AFTER_MAX = 240
+KERNEL_MAIN_SLOC_AFTER_MAX = 244
 MAIN_SLOC_BEFORE = 595
 MAIN_SLOC_AFTER_MAX = 380
 
@@ -189,21 +198,23 @@ def test_main_defines_none_of_it():
 
 def test_main_imports_what_it_calls():
     code = _code(MAIN)
-    assert _imports_from(code, "klog") == {"ring_clear", "klog"}
+    assert _imports_from(code, "klog") == {"ring_clear", "ring_dump", "klog", "klog_dec", "klog_hex"}
     assert _imports_from(code, "postinit") == {"postinit_self_tests", "postinit_diagnostics"}
 
 
 def test_kernel_main_keeps_the_boot_order():
-    """Self-tests, the success banner, SYSCALL setup, diagnostics, then init:
-    the same serial order as before the move."""
+    """Self-tests, the success banner, SYSCALL setup, diagnostics, the opt-in
+    ring dump (#1885), then init: the same serial order as before the move."""
     body = _body(_code(MAIN), "kernel_main")
     assert "postinit_self_tests(has_boot_info)" in body
     # \b: fs_syscall_init() runs earlier and must not match syscall_init().
     steps = [
         r"\bpostinit_self_tests\(has_boot_info\)",
-        re.escape(r'prints("\nKernel initialized successfully.\n")'),
+        re.escape(r'klog("\nKernel initialized successfully.\n")'),
         r"\bsyscall_init\(\)",
         r"\bpostinit_diagnostics\(run_net_selftests, run_net_responder\)",
+        # #1885: the opt-in ring dump shows the whole boot log before init runs.
+        r"\bring_dump\(\)",
         r"\brun_init\(\)",
     ]
     hits = [list(re.finditer(s, body)) for s in steps]
@@ -222,7 +233,8 @@ def test_ring_dump_stays_bound_from_exceptions():
 def test_ring_write_byte_not_changed():
     """main's ring_write_byte came across, not the branch's clamped one."""
     body = _body(_code(KLOG), "ring_write_byte")
-    assert body.index("ring_buffer[ring_head as i32] = c") < body.index("if ring_head >= RING_BUFFER_SIZE")
+    # #1885 indexes with i64 (ring_head is a u64; i32 was a needless narrowing).
+    assert body.index("ring_buffer[ring_head as i64] = c") < body.index("if ring_head >= RING_BUFFER_SIZE")
     assert body.count("if ring_head >= RING_BUFFER_SIZE") == 1
 
 

@@ -52,22 +52,37 @@ COMPILERS = ["ritz0"]
 # --- stand-ins ----------------------------------------------------------------
 
 # The real serial.ritz drives the UART through port I/O (and doesn't parse on
-# ritz1); these have its signatures and do nothing.
+# ritz1); only its StrView is needed here.
 SERIAL_STUB = """\
 pub struct StrView
     ptr: *u8
     len: i64
+"""
 
-pub fn prints(s: StrView) -> i32
+# The kernel logs through klog (AGAST #1885); these have its signatures and
+# do nothing.
+KLOG_STUB = """\
+import serial { StrView }
+
+pub fn klog(s: StrView) -> i32
     return 0
 
-pub fn println(s: StrView) -> i32
+pub fn klog_cstr(s: *u8) -> i32
     return 0
 
-pub fn serial_print_dec(value: u64) -> i32
+pub fn klog_dec(n: i64) -> i32
     return 0
 
-pub fn serial_print_hex(value: u64) -> i32
+pub fn klog_udec(n: u64) -> i32
+    return 0
+
+pub fn klog_hex(n: u64) -> i32
+    return 0
+
+pub fn klog_hex_width(n: u64, width: i32) -> i32
+    return 0
+
+pub fn klog_hex_prefix(n: u64) -> i32
     return 0
 """
 
@@ -286,6 +301,7 @@ pub fn kfs_save_later() -> i32
 
 STUBS = {
     "serial.ritz": SERIAL_STUB,
+    "klog.ritz": KLOG_STUB,
     "mm/heap.ritz": HEAP_STUB,
     "goliath/blob_id.ritz": BLOB_ID_STUB,
     "goliath/blob_store.ritz": BLOB_STORE_STUB,
@@ -337,7 +353,7 @@ def _run(compiler, tmp_path, src, modules):
 
 
 FD_MODULES = ["fs/fd.ritz", "syscall/errno.ritz"]
-FS_MODULES = ["serial.ritz", "mm/heap.ritz", "goliath/blob_id.ritz", "goliath/blob_store.ritz",
+FS_MODULES = ["serial.ritz", "klog.ritz", "mm/heap.ritz", "goliath/blob_id.ritz", "goliath/blob_store.ritz",
               "goliath/namespace.ritz", "fs/kfs.ritz", "fs/fd.ritz", "fs/syscall.ritz",
               "fs/vfs.ritz", "syscall/errno.ritz"]
 

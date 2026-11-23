@@ -5,7 +5,8 @@
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
-import serial { StrView, prints, serial_print_hex, serial_print_dec }
+import klog { klog, klog_hex, klog_dec }
+import serial { StrView }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_fail_allocs_after, pmm_fail_allocs_off }
 import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_nx_flag, phys_to_virt }
 import fs.syscall { fs_process_pid, fs_process_mmap_next, fs_process_set_mmap_next }
@@ -194,11 +195,11 @@ fn unmap_user_pages(addr: u64, count: u64)
 fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
     # Validate flags - we only support anonymous private mappings
     if (flags & MAP_ANONYMOUS) == 0
-        prints("[mmap] ERROR: only anonymous mappings supported\n")
+        klog("[mmap] ERROR: only anonymous mappings supported\n")
         return Errno.Inval as i64
 
     if length == 0
-        prints("[mmap] ERROR: length cannot be zero\n")
+        klog("[mmap] ERROR: length cannot be zero\n")
         return Errno.Inval as i64
 
     # Round length up to page size
@@ -210,7 +211,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
     if (flags & MAP_FIXED) != 0
         # Must map at the exact address
         if addr_hint == 0 or (addr_hint & 0xFFF) != 0
-            prints("[mmap] ERROR: MAP_FIXED requires page-aligned address\n")
+            klog("[mmap] ERROR: MAP_FIXED requires page-aligned address\n")
             return Errno.Inval as i64
         map_addr = addr_hint
     else if addr_hint != 0 and (addr_hint & 0xFFF) == 0 and not mmap_hint_taken(addr_hint, num_pages)
@@ -219,18 +220,18 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
     else
         # Kernel chooses: this process's bump cursor, advanced on success
         if fs_process_pid() == 0
-            prints("[mmap] ERROR: no current process\n")
+            klog("[mmap] ERROR: no current process\n")
             return Errno.Srch as i64
         map_addr = mmap_cursor(num_pages)
         kernel_chose = true
 
     # Validate address is in user mmap region
     if map_addr < USER_MMAP_START or map_addr >= USER_MMAP_END
-        prints("[mmap] ERROR: address outside user mmap region\n")
+        klog("[mmap] ERROR: address outside user mmap region\n")
         return Errno.NoMem as i64
 
     if (map_addr + num_pages * PAGE_SIZE) > USER_MMAP_END
-        prints("[mmap] ERROR: mapping would exceed mmap region\n")
+        klog("[mmap] ERROR: mapping would exceed mmap region\n")
         return Errno.NoMem as i64
 
     # Compute page table flags from protection
@@ -255,7 +256,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
     while i < num_pages
         let page_phys: u64 = pmm_alloc_page()
         if page_phys == 0
-            prints("[mmap] ERROR: out of physical memory\n")
+            klog("[mmap] ERROR: out of physical memory\n")
             unmap_user_pages(map_addr, i)
             return Errno.NoMem as i64
 
@@ -264,9 +265,9 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
         let page_virt: u64 = map_addr + (i * PAGE_SIZE)
         let result: i32 = vmm_map_page(page_virt, page_phys, pte_flags)
         if result != 0
-            prints("[mmap] ERROR: failed to map page at 0x")
-            serial_print_hex(page_virt)
-            prints("\n")
+            klog("[mmap] ERROR: failed to map page at 0x")
+            klog_hex(page_virt)
+            klog("\n")
             pmm_free_page(page_phys)
             unmap_user_pages(map_addr, i)
             return Errno.NoMem as i64
@@ -277,11 +278,11 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
         fs_process_set_mmap_next(map_addr + num_pages * PAGE_SIZE)
 
     # Debug output
-    prints("[mmap] Mapped ")
-    serial_print_dec(num_pages as i64)
-    prints(" pages at 0x")
-    serial_print_hex(map_addr)
-    prints("\n")
+    klog("[mmap] Mapped ")
+    klog_dec(num_pages as i64)
+    klog(" pages at 0x")
+    klog_hex(map_addr)
+    klog("\n")
 
     return map_addr as i64
 
@@ -298,7 +299,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
 fn sys_munmap_impl(addr: u64, length: u64) -> i64
     # Validate address alignment
     if (addr & 0xFFF) != 0
-        prints("[munmap] ERROR: address not page-aligned\n")
+        klog("[munmap] ERROR: address not page-aligned\n")
         return Errno.Inval as i64
 
     if length == 0
@@ -306,7 +307,7 @@ fn sys_munmap_impl(addr: u64, length: u64) -> i64
 
     # Validate address is in user mmap region
     if addr < USER_MMAP_START or addr >= USER_MMAP_END
-        prints("[munmap] ERROR: address outside user mmap region\n")
+        klog("[munmap] ERROR: address outside user mmap region\n")
         return Errno.Inval as i64
 
     # Round length up to page size
@@ -330,11 +331,11 @@ fn sys_munmap_impl(addr: u64, length: u64) -> i64
         i = i + 1
 
     # Debug output
-    prints("[munmap] Unmapped ")
-    serial_print_dec(num_pages as i64)
-    prints(" pages at 0x")
-    serial_print_hex(addr)
-    prints("\n")
+    klog("[munmap] Unmapped ")
+    klog_dec(num_pages as i64)
+    klog(" pages at 0x")
+    klog_hex(addr)
+    klog("\n")
 
     return 0
 
@@ -357,43 +358,43 @@ const MUNMAP_TEST_PAGES: u64 = 8
 
 # Returns true when every page came back, false (after saying why) if not.
 pub fn munmap_self_test() -> bool
-    prints("\nTesting mmap/munmap page accounting...\n")
+    klog("\nTesting mmap/munmap page accounting...\n")
     let flags: u64 = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
     let prot: u64 = PROT_READ | PROT_WRITE
     let length: u64 = MUNMAP_TEST_PAGES * PAGE_SIZE
 
     # Warm-up: builds the PDPT/PD/PT the measured round trip reuses.
     if sys_mmap_impl(USER_MMAP_START, length, prot, flags) != USER_MMAP_START as i64
-        prints("  munmap test FAILED: warm-up mmap failed\n")
+        klog("  munmap test FAILED: warm-up mmap failed\n")
         return false
     sys_munmap_impl(USER_MMAP_START, length)
 
     let before: u64 = pmm_get_free_pages()
     if sys_mmap_impl(USER_MMAP_START, length, prot, flags) != USER_MMAP_START as i64
-        prints("  munmap test FAILED: mmap failed\n")
+        klog("  munmap test FAILED: mmap failed\n")
         return false
     let mapped: u64 = pmm_get_free_pages()
     let munmap_result: i64 = sys_munmap_impl(USER_MMAP_START, length)
     let after: u64 = pmm_get_free_pages()
 
-    prints("  free pages: before=")
-    serial_print_dec(before)
-    prints(" mapped=")
-    serial_print_dec(mapped)
-    prints(" after=")
-    serial_print_dec(after)
-    prints("\n")
+    klog("  free pages: before=")
+    klog_dec(before)
+    klog(" mapped=")
+    klog_dec(mapped)
+    klog(" after=")
+    klog_dec(after)
+    klog("\n")
 
     if before - mapped != MUNMAP_TEST_PAGES
-        prints("  munmap test FAILED: mmap did not take exactly the pages it mapped\n")
+        klog("  munmap test FAILED: mmap did not take exactly the pages it mapped\n")
         return false
     if munmap_result != 0 or after != before
-        prints("  munmap test FAILED: munmap did not free the pages it unmapped\n")
+        klog("  munmap test FAILED: munmap did not free the pages it unmapped\n")
         return false
     if vmm_virt_to_phys(USER_MMAP_START) != 0
-        prints("  munmap test FAILED: page still mapped after munmap\n")
+        klog("  munmap test FAILED: page still mapped after munmap\n")
         return false
-    prints("  munmap test PASSED!\n")
+    klog("  munmap test PASSED!\n")
     return true
 
 # ============================================================================
@@ -431,16 +432,16 @@ fn mmap_fail_case(name: StrView, addr: u64) -> bool
     pmm_fail_allocs_off()
     let after: u64 = pmm_get_free_pages()
 
-    prints("  ")
-    prints(name)
-    prints(": free pages before=")
-    serial_print_dec(before)
-    prints(" after=")
-    serial_print_dec(after)
-    prints("\n")
+    klog("  ")
+    klog(name)
+    klog(": free pages before=")
+    klog_dec(before)
+    klog(" after=")
+    klog_dec(after)
+    klog("\n")
 
     if result != Errno.NoMem as i64
-        prints("  mmap failure test FAILED: mmap did not return NoMem\n")
+        klog("  mmap failure test FAILED: mmap did not return NoMem\n")
         # It may have mapped the range: give it back so later tests start clean.
         if result == addr as i64
             sys_munmap_impl(addr, length)
@@ -452,23 +453,23 @@ fn mmap_fail_case(name: StrView, addr: u64) -> bool
             still_mapped = true
         i = i + 1
     if still_mapped
-        prints("  mmap failure test FAILED: a page is still mapped after NoMem\n")
+        klog("  mmap failure test FAILED: a page is still mapped after NoMem\n")
         return false
     if after != before
-        prints("  mmap failure test FAILED: NoMem leaked physical pages\n")
+        klog("  mmap failure test FAILED: NoMem leaked physical pages\n")
         return false
     return true
 
 # Returns true when both failure points roll back, false (after saying why)
 # if not.
 pub fn mmap_failure_self_test() -> bool
-    prints("\nTesting mmap rollback on out-of-memory...\n")
+    klog("\nTesting mmap rollback on out-of-memory...\n")
     if not mmap_fail_case("data page", USER_MMAP_START)
         return false
     let pt_addr: u64 = USER_MMAP_START + MMAP_PT_SPAN - 4 * PAGE_SIZE
     if not mmap_fail_case("page table", pt_addr)
         return false
-    prints("  mmap failure test PASSED!\n")
+    klog("  mmap failure test PASSED!\n")
     return true
 
 # ============================================================================
@@ -494,7 +495,7 @@ const MMAP_OVERLAP_LIVE: u64 = 4
 # Returns true when neither overlap leaked or clobbered a page, false
 # (after saying why) if not.
 pub fn mmap_overlap_self_test() -> bool
-    prints("\nTesting mmap over a live mapping...\n")
+    klog("\nTesting mmap over a live mapping...\n")
     let fixed: u64 = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
     let hint: u64 = MAP_ANONYMOUS | MAP_PRIVATE
     let prot: u64 = PROT_READ | PROT_WRITE
@@ -504,7 +505,7 @@ pub fn mmap_overlap_self_test() -> bool
 
     let base: u64 = pmm_get_free_pages()
     if sys_mmap_impl(live, MMAP_OVERLAP_LIVE * PAGE_SIZE, prot, fixed) != live as i64
-        prints("  mmap overlap test FAILED: mapping the live pages failed\n")
+        klog("  mmap overlap test FAILED: mapping the live pages failed\n")
         return false
     let live_phys: u64 = vmm_virt_to_phys(live)
     let held: u64 = pmm_get_free_pages()
@@ -512,43 +513,43 @@ pub fn mmap_overlap_self_test() -> bool
     # Hint over the live pages: must not map at the hint.
     let hinted: i64 = sys_mmap_impl(addr, length, prot, hint)
     let after_hint: u64 = pmm_get_free_pages()
-    prints("  hint: result=0x")
-    serial_print_hex(hinted as u64)
-    prints(" free pages held=")
-    serial_print_dec(held)
-    prints(" after=")
-    serial_print_dec(after_hint)
-    prints("\n")
+    klog("  hint: result=0x")
+    klog_hex(hinted as u64)
+    klog(" free pages held=")
+    klog_dec(held)
+    klog(" after=")
+    klog_dec(after_hint)
+    klog("\n")
     if hinted == addr as i64
-        prints("  mmap overlap test FAILED: hint mapped over a live mapping\n")
+        klog("  mmap overlap test FAILED: hint mapped over a live mapping\n")
         return false
     if after_hint != held
-        prints("  mmap overlap test FAILED: refused hint changed the free count\n")
+        klog("  mmap overlap test FAILED: refused hint changed the free count\n")
         return false
     if vmm_virt_to_phys(addr) != 0 or vmm_virt_to_phys(live) != live_phys
-        prints("  mmap overlap test FAILED: hint touched the live mapping\n")
+        klog("  mmap overlap test FAILED: hint touched the live mapping\n")
         return false
 
     # MAP_FIXED over the live pages: replaces them, freeing the old ones.
     let replaced: i64 = sys_mmap_impl(addr, length, prot, fixed)
     let after_fixed: u64 = pmm_get_free_pages()
-    prints("  MAP_FIXED: free pages base=")
-    serial_print_dec(base)
-    prints(" after=")
-    serial_print_dec(after_fixed)
-    prints("\n")
+    klog("  MAP_FIXED: free pages base=")
+    klog_dec(base)
+    klog(" after=")
+    klog_dec(after_fixed)
+    klog("\n")
     if replaced != addr as i64
-        prints("  mmap overlap test FAILED: MAP_FIXED over a live mapping failed\n")
+        klog("  mmap overlap test FAILED: MAP_FIXED over a live mapping failed\n")
         return false
     if base - after_fixed != MMAP_OVERLAP_PAGES
-        prints("  mmap overlap test FAILED: MAP_FIXED leaked the pages it replaced\n")
+        klog("  mmap overlap test FAILED: MAP_FIXED leaked the pages it replaced\n")
         return false
 
     sys_munmap_impl(addr, length)
     if pmm_get_free_pages() != base
-        prints("  mmap overlap test FAILED: munmap did not give every page back\n")
+        klog("  mmap overlap test FAILED: munmap did not give every page back\n")
         return false
-    prints("  mmap overlap test PASSED!\n")
+    klog("  mmap overlap test PASSED!\n")
     return true
 
 # ============================================================================
@@ -577,19 +578,19 @@ fn mmap_cursor_case(name: StrView, next: u64, num_pages: u64, want: u64) -> bool
     let got: u64 = mmap_cursor_pick(next, num_pages)
     if got == want
         return true
-    prints("  mmap cursor test FAILED: ")
-    prints(name)
-    prints(": got 0x")
-    serial_print_hex(got)
-    prints(" want 0x")
-    serial_print_hex(want)
-    prints("\n")
+    klog("  mmap cursor test FAILED: ")
+    klog(name)
+    klog(": got 0x")
+    klog_hex(got)
+    klog(" want 0x")
+    klog_hex(want)
+    klog("\n")
     return false
 
 # Returns true when every case picks a free range, false (after saying why)
 # if not.
 pub fn mmap_cursor_self_test() -> bool
-    prints("\nTesting the mmap cursor skips mapped pages...\n")
+    klog("\nTesting the mmap cursor skips mapped pages...\n")
     let fixed: u64 = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
     let prot: u64 = PROT_READ | PROT_WRITE
     let start: u64 = USER_MMAP_START
@@ -598,7 +599,7 @@ pub fn mmap_cursor_self_test() -> bool
     let live_len: u64 = MMAP_CURSOR_LIVE * PAGE_SIZE
 
     if sys_mmap_impl(live, live_len, prot, fixed) != live as i64
-        prints("  mmap cursor test FAILED: mapping the live pages failed\n")
+        klog("  mmap cursor test FAILED: mapping the live pages failed\n")
         return false
     var ok: bool = mmap_cursor_case("fits in the gap", start, MMAP_CURSOR_GAP, start)
     if ok
@@ -612,7 +613,7 @@ pub fn mmap_cursor_self_test() -> bool
     sys_munmap_impl(live, live_len)
     if not ok
         return false
-    prints("  mmap cursor test PASSED!\n")
+    klog("  mmap cursor test PASSED!\n")
     return true
 
 # ============================================================================

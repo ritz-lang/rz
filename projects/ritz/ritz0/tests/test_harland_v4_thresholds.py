@@ -170,10 +170,35 @@ fn main() -> i32
 # --- net/dhcp.ritz -------------------------------------------------------------
 
 SERIAL_STUB = """\
-pub fn prints(s: *u8) -> i32
+pub struct StrView
+    ptr: *u8
+    len: i64
+"""
+
+# The kernel logs through klog (AGAST #1885); these have its signatures and
+# do nothing.
+KLOG_STUB = """\
+import serial { StrView }
+
+pub fn klog(s: StrView) -> i32
     return 0
 
-pub fn serial_print_dec(value: u64) -> i32
+pub fn klog_cstr(s: *u8) -> i32
+    return 0
+
+pub fn klog_dec(n: i64) -> i32
+    return 0
+
+pub fn klog_udec(n: u64) -> i32
+    return 0
+
+pub fn klog_hex(n: u64) -> i32
+    return 0
+
+pub fn klog_hex_width(n: u64, width: i32) -> i32
+    return 0
+
+pub fn klog_hex_prefix(n: u64) -> i32
     return 0
 """
 
@@ -355,6 +380,7 @@ DHCP_CLAIMS = {
 def test_dhcp_discover_offer_request_ack(tmp_path):
     tree = {
         "serial.ritz": SERIAL_STUB,
+        "klog.ritz": KLOG_STUB,
         "net/types.ritz": (KERNEL_SRC / "net" / "types.ritz").read_text(),
         "net/ip.ritz": NET_IP_STUB,
         "net/udp.ritz": NET_UDP_STUB,

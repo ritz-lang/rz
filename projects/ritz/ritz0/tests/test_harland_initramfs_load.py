@@ -38,17 +38,32 @@ KERNEL_SRC = PROJECTS / "harland" / "kernel" / "src"
 # where it is declared.
 SERIAL_STUB = """\
 pub import ritzlib.strview { StrView }
+"""
 
-pub fn prints(s: StrView) -> i32
+# The kernel logs through klog (AGAST #1885); these have its signatures and
+# do nothing.
+KLOG_STUB = """\
+import serial { StrView }
+
+pub fn klog(s: StrView) -> i32
     return 0
 
-pub fn println(s: StrView) -> i32
+pub fn klog_cstr(s: *u8) -> i32
     return 0
 
-pub fn serial_print_dec(value: u64) -> i32
+pub fn klog_dec(n: i64) -> i32
     return 0
 
-pub fn serial_print_hex(value: u64) -> i32
+pub fn klog_udec(n: u64) -> i32
+    return 0
+
+pub fn klog_hex(n: u64) -> i32
+    return 0
+
+pub fn klog_hex_width(n: u64, width: i32) -> i32
+    return 0
+
+pub fn klog_hex_prefix(n: u64) -> i32
     return 0
 """
 
@@ -134,6 +149,7 @@ pub fn time_ns() -> u64
 
 STUBS = {
     "serial.ritz": SERIAL_STUB,
+    "klog.ritz": KLOG_STUB,
     "io.ritz": IO_STUB,
     "mm/heap.ritz": HEAP_STUB,
     "drivers/virtio/blk.ritz": BLK_STUB,

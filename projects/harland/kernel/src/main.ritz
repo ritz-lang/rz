@@ -13,9 +13,9 @@
 # Import makes their symbols available (creates external declarations).
 
 import io { halt_loop }
-import serial { StrView, serial_init, prints, serial_print_hex, serial_print_dec, serial_enable_rx }
+import serial { StrView, serial_init, serial_enable_rx }
 import drivers.pci { pci_init }
-import boot_abi.handoff { HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION_INITRAMFS, HARLAND_BOOT_VERSION_FLAGS, HARLAND_BOOT_FLAG_NET_SELFTEST, HARLAND_BOOT_FLAG_NET_RESPONDER, HarlandMemEntry, HarlandBootInfo }
+import boot_abi.handoff { HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION_INITRAMFS, HARLAND_BOOT_VERSION_FLAGS, HARLAND_BOOT_FLAG_NET_SELFTEST, HARLAND_BOOT_FLAG_NET_RESPONDER, HARLAND_BOOT_FLAG_KLOG_DUMP, HarlandMemEntry, HarlandBootInfo }
 import mm.pmm { PAGE_SIZE, Mb2BootInfo, Mb2ModuleTag, mb2_find_module, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_mark_region_used, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel, pmm_bitmap_phys, pmm_bitmap_size }
 import mm.vmm { vmm_init, vmm_flush_tlb_all, vmm_reserve_page_tables, vmm_init_physmap, phys_to_virt }
 import mm.heap { KERNEL_VIRT_BASE, kheap_init, heap_get_used, heap_check }
@@ -110,7 +110,7 @@ import stack_protector
 # ritzlib's platform hooks (#1881): ritzlib's core, which goliath uses, calls
 # them by name, so they too are linked by a bare import.
 import platform
-import klog { ring_clear, klog }
+import klog { ring_clear, ring_dump, klog, klog_dec, klog_hex }
 import postinit { postinit_self_tests, postinit_diagnostics }
 
 # ============================================================================
@@ -134,19 +134,19 @@ var boot_fb_format: u8 = 0
 fn capture_mb2_framebuffer(mb_info_addr: u64)
     let tag_addr: u64 = mb2_find_fb_tag(mb_info_addr)
     if tag_addr == 0
-        prints("      Multiboot2: no framebuffer tag\n")
+        klog("      Multiboot2: no framebuffer tag\n")
         return
     let tag: *Mb2FramebufferTag = tag_addr as *Mb2FramebufferTag
     if (*tag).size < MB2_FB_TAG_RGB_MIN_SIZE
-        prints("      Multiboot2: framebuffer tag too short\n")
+        klog("      Multiboot2: framebuffer tag too short\n")
         return
     let format: u8 = mb2_fb_format((*tag).fb_type, (*tag).bpp, (*tag).red_pos, (*tag).green_pos, (*tag).blue_pos)
     if format == PIXEL_FORMAT_UNSUPPORTED
-        prints("      Multiboot2: unsupported framebuffer type ")
-        serial_print_dec((*tag).fb_type as u64)
-        prints(" bpp ")
-        serial_print_dec((*tag).bpp as u64)
-        prints("\n")
+        klog("      Multiboot2: unsupported framebuffer type ")
+        klog_dec((*tag).fb_type as i64)
+        klog(" bpp ")
+        klog_dec((*tag).bpp as i64)
+        klog("\n")
         return
     boot_fb_addr = (*tag).addr
     boot_fb_width = (*tag).width
@@ -183,12 +183,12 @@ import syscall.runtime.process { process_enter_init }
 # Run /bin/init from the filesystem as PID 1
 # This is the actual init process that runs tests and triggers shutdown.
 fn run_init() -> i32
-    prints("[init] Loading /bin/init from filesystem...\n")
+    klog("[init] Loading /bin/init from filesystem...\n")
 
     # Get filesystem namespace
     let ns: *Namespace = kfs_get()
     if ns == 0 as *Namespace
-        prints("[init] No namespace!\n")
+        klog("[init] No namespace!\n")
         return -1
 
     # Read /bin/init
@@ -197,37 +197,37 @@ fn run_init() -> i32
     let elf_data: *u8 = kfs_read(ns, path, @file_size)
 
     if elf_data == 0 as *u8
-        prints("[init] /bin/init not found in filesystem\n")
+        klog("[init] /bin/init not found in filesystem\n")
         return -1
 
-    prints("[init] Found /bin/init, size=")
-    serial_print_dec(file_size)
-    prints(" bytes\n")
+    klog("[init] Found /bin/init, size=")
+    klog_dec(file_size)
+    klog(" bytes\n")
 
     # Load the ELF at a userspace address
     let load_base: u64 = 0x100000000  # 4GB
     let load_result: ElfLoadResult = elf_load(elf_data, file_size, load_base)
 
     if load_result.error != ElfStatus.Ok
-        prints("[init] ELF load failed, error=")
-        serial_print_dec(elf_status_code(load_result.error))
-        prints("\n")
+        klog("[init] ELF load failed, error=")
+        klog_dec(elf_status_code(load_result.error))
+        klog("\n")
         return -1
 
-    prints("[init] Loaded at entry=0x")
-    serial_print_hex(load_result.entry_point)
-    prints("\n")
+    klog("[init] Loaded at entry=0x")
+    klog_hex(load_result.entry_point)
+    klog("\n")
 
     # Allocate 64KB user stack (16 pages)
     let user_stack_top: u64 = alloc_user_stack()
     if user_stack_top == 0
-        prints("[init] Failed to allocate user stack!\n")
+        klog("[init] Failed to allocate user stack!\n")
         return -1
 
     # Flush TLB for new mappings
     vmm_flush_tlb_all()
 
-    prints("[init] Starting init process...\n\n")
+    klog("[init] Starting init process...\n\n")
 
     # Set up as init process (PID 1), with its own fd table (#2753)
     process_enter_init()
@@ -236,7 +236,7 @@ fn run_init() -> i32
     jump_to_userspace(load_result.entry_point, user_stack_top)
 
     # Should not reach here - init should call ACPI poweroff
-    prints("[init] Init returned unexpectedly\n")
+    klog("[init] Init returned unexpectedly\n")
     return 0
 
 # ============================================================================
@@ -254,20 +254,20 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     ring_clear()
 
     # Banner (use klog to capture in ring buffer)
-    klog(c"\n")
-    klog(c"========================================\n")
-    klog(c"    Hello from Harland!\n")
-    klog(c"========================================\n")
-    klog(c"\n")
+    klog("\n")
+    klog("========================================\n")
+    klog("    Hello from Harland!\n")
+    klog("========================================\n")
+    klog("\n")
 
-    klog(c"Harland kernel starting...\n")
+    klog("Harland kernel starting...\n")
 
     # Detect boot protocol by checking magic value
     # Harland boot info starts with magic 0x4841524C ("HARL")
     # Multiboot2 starts with total_size (small 32-bit value)
-    prints("Boot info at: ")
-    serial_print_hex(boot_info_addr)
-    prints("\n")
+    klog("Boot info at: ")
+    klog_hex(boot_info_addr)
+    klog("\n")
 
     var has_boot_info: bool = false
     # The pre-init network self-tests are a boot option (AGAST #4335): they
@@ -277,17 +277,20 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     # AGAST #1851: the EC2 acceptance image also asks for the bounded window
     # that answers a peer instance's ping.
     var run_net_responder: bool = false
+    # AGAST #1885: \harland\klog-dump asks for the ring dump before init.
+    var dump_klog_ring: bool = false
 
     if boot_info_addr != 0
         let potential_magic: *u32 = boot_info_addr as *u32
         if *potential_magic == HARLAND_BOOT_MAGIC
             boot_protocol = BOOT_PROTOCOL_HARLAND
             harland_boot_info = boot_info_addr as *HarlandBootInfo
-            prints("Boot protocol: Harland (UEFI)\n")
+            klog("Boot protocol: Harland (UEFI)\n")
             has_boot_info = true
             if (*harland_boot_info).version >= HARLAND_BOOT_VERSION_FLAGS
                 run_net_selftests = ((*harland_boot_info).flags & HARLAND_BOOT_FLAG_NET_SELFTEST) != 0
                 run_net_responder = ((*harland_boot_info).flags & HARLAND_BOOT_FLAG_NET_RESPONDER) != 0
+                dump_klog_ring = ((*harland_boot_info).flags & HARLAND_BOOT_FLAG_KLOG_DUMP) != 0
             boot_fb_addr = (*harland_boot_info).framebuffer_addr
             boot_fb_width = (*harland_boot_info).framebuffer_width
             boot_fb_height = (*harland_boot_info).framebuffer_height
@@ -296,32 +299,32 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
             boot_fb_format = (*harland_boot_info).framebuffer_format
         else
             boot_protocol = BOOT_PROTOCOL_MULTIBOOT2
-            prints("Boot protocol: Multiboot2 (BIOS/GRUB)\n")
+            klog("Boot protocol: Multiboot2 (BIOS/GRUB)\n")
             has_boot_info = true
             capture_mb2_framebuffer(boot_info_addr)
     else
         boot_protocol = BOOT_PROTOCOL_UNKNOWN
-        prints("Boot protocol: Unknown (no boot info)\n")
+        klog("Boot protocol: Unknown (no boot info)\n")
 
     # Initialize GDT
-    klog(c"\nInitialization:\n")
-    klog(c"  [..] GDT")
+    klog("\nInitialization:\n")
+    klog("  [..] GDT")
     gdt_init()
-    klog(c"\r  [OK] GDT\n")
+    klog("\r  [OK] GDT\n")
 
     # Remap PIC temporarily (will be replaced by APIC later)
     pic_remap()
 
     # Initialize IDT
-    klog(c"  [..] IDT")
+    klog("  [..] IDT")
     idt_init()
-    klog(c"\r  [OK] IDT\n")
+    klog("\r  [OK] IDT\n")
 
     # Calibrate the TSC before anything waits on it (AP startup, drivers)
     tsc_calibrate()
 
     # Initialize Physical Memory Manager based on boot protocol
-    klog(c"  [..] Physical memory")
+    klog("  [..] Physical memory")
     # The bitmap is carved out of RAM below 1 GiB, sized from the memory map's
     # highest usable address (AGAST #4183); pmm_ok is false when it can't be.
     var pmm_ok: bool = false
@@ -355,41 +358,41 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         if mb_mod != 0 as *Mb2ModuleTag
             pmm_mark_region_used((*mb_mod).mod_start as u64, ((*mb_mod).mod_end - (*mb_mod).mod_start) as u64)
     if boot_protocol == BOOT_PROTOCOL_UNKNOWN
-        klog(c"\r  [!!] Physical memory (no boot info)\n")
+        klog("\r  [!!] Physical memory (no boot info)\n")
     else if pmm_ok
-        klog(c"\r  [OK] Physical memory\n")
+        klog("\r  [OK] Physical memory\n")
     else
-        klog(c"\r  [!!] Physical memory (no bitmap)\n")
+        klog("\r  [!!] Physical memory (no bitmap)\n")
 
     if has_boot_info
         # Print memory statistics
-        prints("      Total pages: ")
-        serial_print_dec(pmm_get_total_pages())
-        prints(" (")
+        klog("      Total pages: ")
+        klog_dec(pmm_get_total_pages())
+        klog(" (")
         let total_mb: u64 = (pmm_get_total_pages() * 4) / 1024
-        serial_print_dec(total_mb)
-        prints(" MB)\n")
+        klog_dec(total_mb)
+        klog(" MB)\n")
 
-        prints("      Bitmap:      ")
-        serial_print_dec(pmm_bitmap_size() / 1024)
-        prints(" KB at ")
-        serial_print_hex(pmm_bitmap_phys())
-        prints("\n")
+        klog("      Bitmap:      ")
+        klog_dec(pmm_bitmap_size() / 1024)
+        klog(" KB at ")
+        klog_hex(pmm_bitmap_phys())
+        klog("\n")
 
-        prints("      Free pages:  ")
-        serial_print_dec(pmm_get_free_pages())
-        prints(" (")
+        klog("      Free pages:  ")
+        klog_dec(pmm_get_free_pages())
+        klog(" (")
         let free_mb: u64 = (pmm_get_free_pages() * 4) / 1024
-        serial_print_dec(free_mb)
-        prints(" MB)\n")
+        klog_dec(free_mb)
+        klog(" MB)\n")
 
     # Initialize Virtual Memory Manager
-    klog(c"  [..] Virtual memory")
+    klog("  [..] Virtual memory")
     vmm_init()
-    klog(c"\r  [OK] Virtual memory\n")
-    prints("      PML4 at: ")
-    serial_print_hex(vmm_pml4_phys)
-    prints("\n")
+    klog("\r  [OK] Virtual memory\n")
+    klog("      PML4 at: ")
+    klog_hex(vmm_pml4_phys)
+    klog("\n")
 
     # Reserve the current page tables before kheap_init allocates through the
     # PMM; reserve again after it, since heap mapping creates new tables (#2749).
@@ -398,24 +401,24 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     # Direct map of RAM for page-table access (AGAST #3530). First pmm
     # allocations after the reserve are low pages the boot identity map covers.
     if vmm_init_physmap() != 0
-        klog(c"  [!!] Physmap (page tables above 1 GiB unreachable)\n")
+        klog("  [!!] Physmap (page tables above 1 GiB unreachable)\n")
     else if boot_protocol == BOOT_PROTOCOL_HARLAND
         # The identity map now stops at 4 GiB, and firmware may have put
         # BootInfo above it (AGAST #4183): reach it through the physmap.
         harland_boot_info = phys_to_virt(boot_info_addr) as *HarlandBootInfo
 
     # Initialize Kernel Heap
-    klog(c"  [..] Kernel heap")
+    klog("  [..] Kernel heap")
     # 256 KiB to start; kalloc grows it on demand, under whichever CR3 is
     # loaded: it is in the kernel half every address space shares (#2761).
     let heap_result: i32 = kheap_init(64)
     if heap_result == 0
-        klog(c"\r  [OK] Kernel heap\n")
-        prints("      Size: ")
-        serial_print_dec(heap_get_used() / 1024)
-        prints(" KB\n")
+        klog("\r  [OK] Kernel heap\n")
+        klog("      Size: ")
+        klog_dec(heap_get_used() / 1024)
+        klog(" KB\n")
     else
-        klog(c"\r  [!!] Kernel heap (init failed)\n")
+        klog("\r  [!!] Kernel heap (init failed)\n")
 
     # Reserve all page table pages in PMM so they won't be reallocated.
     # Re-run after kheap_init since heap mapping creates additional PT pages.
@@ -423,7 +426,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
 
     # Initialize Display subsystem (if framebuffer available)
     if boot_fb_addr != 0
-        klog(c"  [..] Display driver")
+        klog("  [..] Display driver")
         let fb_addr: u64 = boot_fb_addr
         let fb_width: u32 = boot_fb_width
         let fb_height: u32 = boot_fb_height
@@ -432,12 +435,12 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         let fb_format: u8 = boot_fb_format
         let fb_result: i32 = display_init(fb_addr, fb_width, fb_height, fb_pitch, fb_bpp, fb_format)
         if fb_result == 0
-            klog(c"\r  [OK] Display driver\n")
-            prints("      Resolution: ")
-            serial_print_dec(fb_width as u64)
-            prints("x")
-            serial_print_dec(fb_height as u64)
-            prints("\n")
+            klog("\r  [OK] Display driver\n")
+            klog("      Resolution: ")
+            klog_dec(fb_width as i64)
+            klog("x")
+            klog_dec(fb_height as i64)
+            klog("\n")
 
             # Draw a blue test screen to show we have display control
             let fb: *SimpleFramebuffer = display_get_framebuffer()
@@ -447,38 +450,38 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
                 # Draw a bright rectangle in the center
                 fb_fill_rect_rgb(fb, 540, 350, 200, 100, 0x40, 0x80, 0xFF)
         else
-            klog(c"\r  [..] Display driver (headless mode)\n")
+            klog("\r  [..] Display driver (headless mode)\n")
 
-    klog(c"  [..] VFS layer")
+    klog("  [..] VFS layer")
     vfs_init()
-    klog(c"\r  [OK] VFS layer\n")
+    klog("\r  [OK] VFS layer\n")
     if heap_check() != 0
-        klog(c"    [HEAP CORRUPT after vfs_init]\n")
+        klog("    [HEAP CORRUPT after vfs_init]\n")
 
     # Initialize PCI early (needed for VirtIO block device)
-    klog(c"  [..] PCI enumeration (early)")
+    klog("  [..] PCI enumeration (early)")
     let pci_count_early: i32 = pci_init()
-    klog(c"\r  [OK] PCI enumeration (early)\n")
+    klog("\r  [OK] PCI enumeration (early)\n")
     if heap_check() != 0
-        klog(c"    [HEAP CORRUPT after pci_init]\n")
+        klog("    [HEAP CORRUPT after pci_init]\n")
 
     # Initialize VirtIO Input device (keyboard/mouse) - after PCI enumeration
-    klog(c"  [..] VirtIO input device")
+    klog("  [..] VirtIO input device")
     let input_result: i32 = virtio_input_init()
     if input_result == 0
-        klog(c"\r  [OK] VirtIO input device\n")
+        klog("\r  [OK] VirtIO input device\n")
     else
-        klog(c"\r  [..] VirtIO input device (not found)\n")
+        klog("\r  [..] VirtIO input device (not found)\n")
 
     # Initialize VirtIO block device (needed for initramfs loading)
-    klog(c"  [..] VirtIO block device")
+    klog("  [..] VirtIO block device")
     let early_blk_dev: *VirtioBlkDevice = virtio_blk_init()
     if early_blk_dev != 0 as *VirtioBlkDevice
-        klog(c"\r  [OK] VirtIO block device\n")
+        klog("\r  [OK] VirtIO block device\n")
     else
-        klog(c"\r  [..] VirtIO block device (not found)\n")
+        klog("\r  [..] VirtIO block device (not found)\n")
     if heap_check() != 0
-        klog(c"    [HEAP CORRUPT after virtio_blk_init]\n")
+        klog("    [HEAP CORRUPT after virtio_blk_init]\n")
 
     # The kernel namespace is goliath (fs/kfs.ritz, AGAST #1881). The second
     # block device holds its image: it comes up first so the namespace
@@ -486,34 +489,34 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     # /var/boots and saved, and only then does the initial filesystem load
     # on top (so the image holds what was written, not the initramfs).
     let storage_dev: *VirtioBlkDevice = virtio_blk_init_nth(1)
-    klog(c"  [..] Kernel namespace")
+    klog("  [..] Kernel namespace")
     if kfs_init(storage_dev) == 0
-        klog(c"\r  [OK] Kernel namespace (goliath)\n")
+        klog("\r  [OK] Kernel namespace (goliath)\n")
         if heap_check() != 0
-            klog(c"    [HEAP CORRUPT after kfs_init]\n")
+            klog("    [HEAP CORRUPT after kfs_init]\n")
 
-        klog(c"  [..] Persistent storage")
+        klog("  [..] Persistent storage")
         if kfs_has_storage()
             let boots: i64 = kfs_record_boot()
             if boots > 0
-                klog(c"\r  [OK] Persistent storage (goliath image: boot ")
-                serial_print_dec(boots as u64)
-                klog(c", ")
-                serial_print_dec(kfs_blob_count() as u64)
-                klog(c" blobs)\n")
+                klog("\r  [OK] Persistent storage (goliath image: boot ")
+                klog_dec(boots as i64)
+                klog(", ")
+                klog_dec(kfs_blob_count() as i64)
+                klog(" blobs)\n")
             else
-                klog(c"\r  [!!] Persistent storage (save failed: errno ")
-                serial_print_dec((0 - boots) as u64)
-                klog(c")\n")
+                klog("\r  [!!] Persistent storage (save failed: errno ")
+                klog_dec((0 - boots) as i64)
+                klog(")\n")
         else if storage_dev != 0 as *VirtioBlkDevice
-            klog(c"\r  [!!] Persistent storage (image unreadable)\n")
+            klog("\r  [!!] Persistent storage (image unreadable)\n")
         else
-            klog(c"\r  [..] Persistent storage (not found)\n")
+            klog("\r  [..] Persistent storage (not found)\n")
 
         # Initialize filesystem syscalls
-        klog(c"  [..] Filesystem syscalls")
+        klog("  [..] Filesystem syscalls")
         fs_syscall_init()
-        klog(c"\r  [OK] Filesystem syscalls\n")
+        klog("\r  [OK] Filesystem syscalls\n")
 
         # Load initial filesystem: the TAR BOOTX64.EFI read from the ESP if
         # BootInfo carries one (AGAST #4253), or GRUB's multiboot2 module
@@ -527,12 +530,12 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
             let boot_mod: *Mb2ModuleTag = mb2_find_module(boot_info_addr as *Mb2BootInfo)
             if boot_mod != 0 as *Mb2ModuleTag
                 initramfs_set_boot_image(phys_to_virt((*boot_mod).mod_start as u64), ((*boot_mod).mod_end - (*boot_mod).mod_start) as u64)
-        klog(c"  [..] Initial filesystem")
+        klog("  [..] Initial filesystem")
         initramfs_load()
-        klog(c"\r  [OK] Initial filesystem\n")
+        klog("\r  [OK] Initial filesystem\n")
 
     else
-        klog(c"\r  [!!] Kernel namespace (out of memory)\n")
+        klog("\r  [!!] Kernel namespace (out of memory)\n")
 
     # Initialize APIC based on boot protocol (this also reads the MADT, so
     # num_cpus is known afterwards).
@@ -550,7 +553,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         if bsp_cpu < 0
             bsp_cpu = 0
         if cpu_bringup(bsp_cpu) != 0
-            prints("[percpu] BSP bring-up failed\n")
+            klog("[percpu] BSP bring-up failed\n")
             halt_loop()
         syscall_register_smp_test()
         # Boot Application Processors (APs)
@@ -561,46 +564,49 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     # Enable serial port receive interrupts (IRQ 4 already routed by ioapic_init)
     # Use serial_enable_rx() which tracks IER state for TX interrupt coexistence
     serial_enable_rx()
-    klog(c"  [OK] Serial input enabled\n")
+    klog("  [OK] Serial input enabled\n")
 
     # Initialize IPC subsystem
-    klog(c"  [..] IPC channels")
+    klog("  [..] IPC channels")
     channel_init()
     ipc_syscall_init()
-    klog(c"\r  [OK] IPC channels\n")
+    klog("\r  [OK] IPC channels\n")
 
     # Initialize capability subsystem
-    klog(c"  [..] Capability tables")
+    klog("  [..] Capability tables")
     cap_table_init()
     # Init (pid 1) gets the kernel-reserved capabilities: ACPI power-off,
     # the display, and the ambient IPC and filesystem capabilities every
     # process needs. Spawned children inherit the latter three, never POWER
     # (AGAST #1888, #4472).
     if cap_init_bootstrap() == 0
-        klog(c"\r  [OK] Capability tables\n")
+        klog("\r  [OK] Capability tables\n")
     else
-        klog(c"\r  [!!] Capability tables (init bootstrap failed)\n")
+        klog("\r  [!!] Capability tables (init bootstrap failed)\n")
 
     # Note: SHM and DMA modules are WIP - skipped for now
 
     # Memory and IPC self-tests
     postinit_self_tests(has_boot_info)
 
-    prints("\nKernel initialized successfully.\n")
+    klog("\nKernel initialized successfully.\n")
 
     # Initialize syscall interface
-    prints("\n  [..] Syscall interface")
+    klog("\n  [..] Syscall interface")
     syscall_init()
-    prints("\r  [OK] Syscall interface\n")
+    klog("\r  [OK] Syscall interface\n")
 
     # PCI listing, block-device checks and opt-in network self-tests
     postinit_diagnostics(run_net_selftests, run_net_responder)
+
+    if dump_klog_ring
+        ring_dump()
 
     # Run /bin/init as PID 1 - this runs tests and shuts down
     # This will not return if init runs correctly
     let init_result: i32 = run_init()
     if init_result != 0
-        prints("[kernel] Failed to run init!\n")
+        klog("[kernel] Failed to run init!\n")
 
     # If init fails, halt
     halt_loop()

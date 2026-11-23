@@ -19,8 +19,9 @@
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
+import klog { klog, klog_cstr, klog_dec, klog_hex }
 import io { halt_loop, disable_interrupts, enable_interrupts }
-import serial { StrView, prints, serial_print_hex, serial_print_dec, serial_write_byte }
+import serial { StrView }
 import mm.pmm { PAGE_SIZE }
 import mm.vmm { vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_free_pml4, vmm_read_pml4_entry }
 import mm.uptr { uptr_validate_string, uptr_check_read }
@@ -69,13 +70,6 @@ pub fn syscall_strlen(s: *u8) -> i64
         p = p + 1
     return len
 
-# Helper to print null-terminated string
-fn prints_str(s: *u8)
-    var p: *u8 = s
-    while *p != 0
-        serial_write_byte(*p)
-        p = p + 1
-
 # Make the running process init (PID 1, no parent, cwd "/") with its own fd
 # table (#2753) and kernel stack, and start the scheduler's tick (#3629):
 # run_init, before it jumps to /bin/init.
@@ -83,9 +77,9 @@ pub fn process_enter_init()
     proc_table_reset()
     g_kernel_pml4 = vmm_get_current_pml4()
     if proc_enter_init(g_kernel_pml4) != 0
-        prints("[init] No process table slot for init\n")
+        klog("[init] No process table slot for init\n")
     if fs_process_start(1) != 0
-        prints("[init] No fd table: init cannot open files\n")
+        klog("[init] No fd table: init cannot open files\n")
     sched_start(proc_current_slot())
 
 # The errno a failed spawn returns for a failed ELF load: out of memory, or
@@ -124,7 +118,7 @@ fn argv_status_errno(s: ArgvStatus) -> i64
 fn spawn_capture_argv(argv: **u8, argc: i32) -> i64
     let cap: ArgvCapture = argv_capture(argv, argc, uptr_check_read)
     if cap.status != ArgvStatus.Ok
-        prints("[spawn_args] argv capture failed\n")
+        klog("[spawn_args] argv capture failed\n")
         return argv_status_errno(cap.status)
     return cap.bytes
 
@@ -174,16 +168,16 @@ fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     let path_view: StrView = strview_from_ptr(path, path_len)
     let ns: *Namespace = kfs_ns_for(path_view)
     if ns == 0 as *Namespace
-        prints("[spawn_args] No namespace\n")
+        klog("[spawn_args] No namespace\n")
         return Errno.NoDev as i64
 
     var file_size: u64 = 0
     let elf_data: *u8 = kfs_read(ns, kfs_local(path_view), @file_size)
     if elf_data == 0 as *u8
         if argc > 0
-            prints("[spawn_args] File not found: ")
-            prints_str(path)
-            prints("\n")
+            klog("[spawn_args] File not found: ")
+            klog_cstr(path)
+            klog("\n")
         return Errno.NoEnt as i64
 
     # The caller's argv was captured in the handler, before this point
@@ -196,7 +190,7 @@ fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     (*parent).pml4 = parent_pml4
     let slot: i32 = proc_new_child()
     if slot < 0
-        prints("[spawn_args] No child process slot\n")
+        klog("[spawn_args] No child process slot\n")
         return slot as i64
     let child: *Proc = proc_at(slot)
     let child_pid: u64 = child.pid
@@ -217,7 +211,7 @@ fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     let fs_result: i32 = fs_process_start(child_pid)
     fs_process_select(parent_pid)
     if fs_result != 0
-        prints("[spawn_args] No fd table for the child\n")
+        klog("[spawn_args] No fd table for the child\n")
         cap_table_free_pid(child_pid as u32)
         proc_abort_child(slot)
         return fs_result as i64
@@ -230,12 +224,12 @@ fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     (*child).pml4 = child_pml4
 
     # Debug: Print parent PML4[511] before switch
-    prints("[spawn] Parent PML4[511] = 0x")
-    serial_print_hex(vmm_read_pml4_entry(parent_pml4, 511))
-    prints("\n")
-    prints("[spawn] Child  PML4[511] = 0x")
-    serial_print_hex(vmm_read_pml4_entry(child_pml4, 511))
-    prints("\n")
+    klog("[spawn] Parent PML4[511] = 0x")
+    klog_hex(vmm_read_pml4_entry(parent_pml4, 511))
+    klog("\n")
+    klog("[spawn] Child  PML4[511] = 0x")
+    klog_hex(vmm_read_pml4_entry(child_pml4, 511))
+    klog("\n")
 
     # Load in the child's address space, so elf_load maps its pages there.
     # The same base as init's: address spaces are isolated.
@@ -243,7 +237,7 @@ fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     let child_load_base: u64 = 0x100000000
     let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
     if load_result.error != ElfStatus.Ok
-        prints("[spawn_args] Failed to load ELF\n")
+        klog("[spawn_args] Failed to load ELF\n")
         vmm_switch_pml4(parent_pml4)
         spawn_undo(slot, parent_pid)
         return elf_status_errno(load_result.error)
@@ -251,7 +245,7 @@ fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     # 64 KiB user stack (16 pages)
     let child_stack_top: u64 = alloc_user_stack()
     if child_stack_top == 0
-        prints("[spawn_args] Failed to allocate child stack\n")
+        klog("[spawn_args] Failed to allocate child stack\n")
         vmm_switch_pml4(parent_pml4)
         spawn_undo(slot, parent_pid)
         return Errno.NoMem as i64
@@ -260,11 +254,11 @@ fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     var child_argv: u64 = 0
     if argc > 0
         user_rsp = spawn_push_argv(argc, total_string_bytes, @child_argv)
-        prints("[spawn_args] Child argv at 0x")
-        serial_print_hex(child_argv)
-        prints(", stack=0x")
-        serial_print_hex(user_rsp)
-        prints("\n")
+        klog("[spawn_args] Child argv at 0x")
+        klog_hex(child_argv)
+        klog(", stack=0x")
+        klog_hex(user_rsp)
+        klog("\n")
     vmm_switch_pml4(parent_pml4)
 
     # main(argc, argv) in RDI/RSI; the first switch to the slot enters it.
@@ -309,11 +303,11 @@ fn sys_spawn_impl(path: *u8) -> i64
 # sys_spawn_args: run a binary with arguments and wait for it to exit. The
 # child's main() receives: fn main(argc: i32, argv: **u8) -> i32
 fn sys_spawn_args_impl(path: *u8, argc: i32, argv_bytes: i64) -> i64
-    prints("[spawn_args] spawn_args(")
-    prints_str(path)
-    prints(", argc=")
-    serial_print_dec(argc as u64)
-    prints(")\n")
+    klog("[spawn_args] spawn_args(")
+    klog_cstr(path)
+    klog(", argc=")
+    klog_dec(argc as i64)
+    klog(")\n")
     return spawn_and_block(path, argc, argv_bytes)
 
 # sys_exit: the running process exits. Its fds are flushed and closed, its
@@ -366,22 +360,22 @@ fn sys_exit_impl(code: i32) -> i64
     # power off as if fine, if a syscall ran off its stack (#2761), and
     # report how deep any went.
     syscall_stack_check()
-    prints("[exit] syscall stack peak ")
-    serial_print_dec(syscall_stack_used())
-    prints(" of ")
-    serial_print_dec(syscall_stack_size())
-    prints(" bytes\n")
+    klog("[exit] syscall stack peak ")
+    klog_dec(syscall_stack_used())
+    klog(" of ")
+    klog_dec(syscall_stack_size())
+    klog(" bytes\n")
     sched_report()
-    prints("[exit] init exited with code ")
+    klog("[exit] init exited with code ")
     if code < 0
-        prints("-")
-        serial_print_dec((0 - code) as u64)
+        klog("-")
+        klog_dec((0 - code) as i64)
     else
-        serial_print_dec(code as u64)
-    prints(", powering off\n")
+        klog_dec(code as i64)
+    klog(", powering off\n")
     acpi_poweroff()
     # Only reached if the poweroff failed.
-    prints("[exit] ACPI poweroff failed, halting system\n")
+    klog("[exit] ACPI poweroff failed, halting system\n")
     halt_loop()
     return 0
 
@@ -417,11 +411,11 @@ pub fn sys_open_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # needs CREATE as well (AGAST #4472).
     let pid: u32 = current_pid()
     if not cap_process_has(pid, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ)
-        prints("[syscall] open denied (no namespace capability)\n")
+        klog("[syscall] open denied (no namespace capability)\n")
         return Errno.Perm as i64
     let flags: i32 = rdx as i32
     if (flags & O_CREAT) != 0 and not cap_process_has(pid, CAP_TYPE_NAMESPACE, CAP_RIGHT_CREATE)
-        prints("[syscall] open(O_CREAT) denied (no create right)\n")
+        klog("[syscall] open(O_CREAT) denied (no create right)\n")
         return Errno.Perm as i64
     # SECURITY: Validate path buffer
     if rsi > 0
@@ -491,9 +485,9 @@ pub fn sys_acpi_poweroff_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # POWER is init's capability; a process without it cannot power the
     # machine off (AGAST #1888).
     if not cap_process_has(proc_current_pid() as u32, CAP_TYPE_POWER, CAP_RIGHT_EXECUTE)
-        prints("[syscall] ACPI poweroff denied (no capability)\n")
+        klog("[syscall] ACPI poweroff denied (no capability)\n")
         return Errno.Perm as i64
-    prints("[syscall] ACPI poweroff requested\n")
+    klog("[syscall] ACPI poweroff requested\n")
     # Whatever save-on-close deferred (#4321) goes to the disk before the
     # machine goes down.
     if kfs_save_pending()

@@ -46,25 +46,37 @@ KERNEL_SRC = RITZ_ROOT.parent / "harland" / "kernel" / "src"
 
 # --- stand-ins for the driver's hardware imports ------------------------------
 
-# device.ritz only prints; nothing here needs to reach a UART.
+# device.ritz only logs; nothing here needs to reach a UART.
 SERIAL_STUB = """\
 pub struct StrView
     ptr: *u8
     len: i64
+"""
 
-pub fn prints(s: StrView) -> i32
+# The kernel logs through klog (AGAST #1885); these have its signatures and
+# do nothing.
+KLOG_STUB = """\
+import serial { StrView }
+
+pub fn klog(s: StrView) -> i32
     return 0
 
-pub fn serial_print_dec(value: u64) -> i32
+pub fn klog_cstr(s: *u8) -> i32
     return 0
 
-pub fn serial_print_hex(value: u64) -> i32
+pub fn klog_dec(n: i64) -> i32
     return 0
 
-pub fn serial_print_hex8(value: u8) -> i32
+pub fn klog_udec(n: u64) -> i32
     return 0
 
-pub fn serial_write_byte(value: u8) -> i32
+pub fn klog_hex(n: u64) -> i32
+    return 0
+
+pub fn klog_hex_width(n: u64, width: i32) -> i32
+    return 0
+
+pub fn klog_hex_prefix(n: u64) -> i32
     return 0
 """
 
@@ -372,6 +384,7 @@ pub fn post_rx_complete(req_id: u16, length: u16) -> i32
 
 STUBS = {
     "serial.ritz": SERIAL_STUB,
+    "klog.ritz": KLOG_STUB,
     "io.ritz": IO_STUB,
     "arch/x86_64/tsc.ritz": TSC_STUB,
     "drivers/pci.ritz": PCI_STUB,

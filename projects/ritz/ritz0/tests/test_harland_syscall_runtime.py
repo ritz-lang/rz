@@ -44,11 +44,12 @@ MAIN = KERNEL_SRC / "main.ritz"
 RUNTIME = KERNEL_SRC / "syscall" / "runtime"
 METRICS = RITZ0_DIR.parents[1] / "larb" / "tools" / "ritz-metrics" / "ritz_metrics.py"
 
-# area module -> the fns it now defines.
+# area module -> the fns it now defines. (process.ritz's private prints_str
+# is gone: it logs paths with klog.ritz's klog_cstr, AGAST #1885.)
 AREAS = {
     "entry": ["syscall_init", "syscall_table_init", "syscall_handler"],
     "process": [
-        "current_pid", "syscall_strlen", "prints_str", "process_enter_init",
+        "current_pid", "syscall_strlen", "process_enter_init",
         "elf_status_errno", "sys_spawn_impl", "sys_spawn_args_impl", "sys_exit_impl", "sys_wait_impl",
         "sys_exit_handler", "sys_open_handler", "sys_spawn_handler", "sys_spawn_args_handler",
         "sys_spawn_bg_handler", "spawn_process", "wait_for_child",
@@ -149,6 +150,14 @@ def test_area_module_defines_its_code(area):
     assert not missing, f"not defined in {area}.ritz: {missing}"
     assert not set(VARS.get(area, [])) - _vars(code), sorted(set(VARS.get(area, [])) - _vars(code))
     assert not set(CONSTS.get(area, [])) - _consts(code), sorted(set(CONSTS.get(area, [])) - _consts(code))
+
+
+def test_process_logs_paths_through_klog_cstr():
+    """prints_str (serial only, so missing from the crash ring) became klog.ritz's
+    klog_cstr (AGAST #1885); process.ritz must not grow a private copy back."""
+    code = _code(_area("process"))
+    assert "klog_cstr" in (_imports_from(code, "klog") or set())
+    assert "prints_str" not in _fns(code)
 
 
 def test_each_fn_defined_once_across_the_kernel():

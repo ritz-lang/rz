@@ -52,7 +52,7 @@ def test_ap_entry_claims_its_boot_before_running():
     assert claim >= 0, "ap_entry never claims its boot"
     # The claim decides whether this AP runs at all: before it touches any
     # shared state (the serial log, per-CPU bring-up, the started flag).
-    for later in ("prints(", "cpu_bringup(", "cpu_map_mark_started(", "atomic_fetch_add(", "enable_interrupts("):
+    for later in ("klog(", "cpu_bringup(", "cpu_map_mark_started(", "atomic_fetch_add(", "enable_interrupts("):
         at = body.find(later)
         assert at > claim, f"ap_entry calls {later} before claiming its boot"
     # A failed claim parks: interrupts off, then halt forever.

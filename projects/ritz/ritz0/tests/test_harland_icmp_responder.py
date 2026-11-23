@@ -34,11 +34,32 @@ SERIAL_STUB = """\
 pub struct StrView
     ptr: *u8
     len: i64
+"""
 
-pub fn prints(s: StrView) -> i32
+# The kernel logs through klog (AGAST #1885); these have its signatures and
+# do nothing.
+KLOG_STUB = """\
+import serial { StrView }
+
+pub fn klog(s: StrView) -> i32
     return 0
 
-pub fn serial_print_dec(value: u64) -> i32
+pub fn klog_cstr(s: *u8) -> i32
+    return 0
+
+pub fn klog_dec(n: i64) -> i32
+    return 0
+
+pub fn klog_udec(n: u64) -> i32
+    return 0
+
+pub fn klog_hex(n: u64) -> i32
+    return 0
+
+pub fn klog_hex_width(n: u64, width: i32) -> i32
+    return 0
+
+pub fn klog_hex_prefix(n: u64) -> i32
     return 0
 """
 
@@ -177,6 +198,7 @@ fn main() -> i32
 
 STUBS = {
     "serial.ritz": SERIAL_STUB,
+    "klog.ritz": KLOG_STUB,
     "net/types.ritz": TYPES_STUB,
     "net/ip.ritz": IP_STUB,
     "net/arp.ritz": ARP_STUB,

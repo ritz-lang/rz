@@ -27,6 +27,11 @@
 # request 100 ms late. A spin-count poll gave up after ~40 ms of TCG time, and
 # far less on a loaded host (AGAST #4078), so the store must still come up.
 #
+# The native ESP also carries \harland\klog-dump (AGAST #1885): the kernel
+# then writes its crash ring buffer to serial just before it starts init. The
+# dump must be exactly the kernel's serial output up to that point, starting
+# at its first banner: every boot message, numbers included, reached the ring.
+#
 # The grub boot's second virtio-blk disk is a real, blank qcow2 that a third
 # boot, grub-reboot, boots again (AGAST #1881): the kernel's namespace is
 # goliath, restored from that disk's goliath image at boot, and each boot
@@ -344,6 +349,37 @@ slow_disk() {
     fi
 }
 
+# ring_holds_boot NAME: pass only if the kernel's ring dump (the
+# \harland\klog-dump boot option) holds its whole serial log up to the dump,
+# byte for byte, from the first banner on (AGAST #1885).
+ring_holds_boot() {
+    python3 - "$WORK/$1.log" "$1" <<'PY'
+import sys
+log = open(sys.argv[1], "rb").read()
+name = sys.argv[2]
+start = b"\n=== RING BUFFER DUMP (kernel log) ===\n"
+end = b"\n=== END RING BUFFER ===\n"
+first = b"========================================\n    Hello from Harland!\n"
+s = log.find(start)
+if s < 0:
+    sys.exit(f"FAIL ({name}): no ring buffer dump (\\harland\\klog-dump set)")
+e = log.find(end, s)
+if e < 0:
+    sys.exit(f"FAIL ({name}): ring buffer dump never ended")
+dump = log[s + len(start):e]
+if first not in dump[:200]:
+    sys.exit(f"FAIL ({name}): ring dump does not start at the kernel banner: {dump[:120]!r}")
+if not log[:s].endswith(dump):
+    k = 0
+    pre = log[:s]
+    while k < len(dump) and dump[-1 - k] == pre[-1 - k]:
+        k += 1
+    sys.exit(f"FAIL ({name}): serial and ring disagree {k} bytes before the dump: "
+             f"serial {pre[-k - 60:-k]!r} vs ring {dump[-k - 60:len(dump) - k]!r}")
+print(f"PASS ({name}): the crash ring holds all {len(dump)} bytes of the kernel's boot log")
+PY
+}
+
 # no_exception NAME: fail if the kernel took an exception or panicked.
 no_exception() {
     if grep -aqE "EXCEPTION|KERNEL PANIC" "$WORK/$1.log"; then
@@ -594,11 +630,13 @@ if [ "$MODE" != grub ]; then
     mkdir -p "$WORK/esp-native/EFI/BOOT" "$WORK/esp-native/harland"
     cp "$LOADER_EFI" "$WORK/esp-native/EFI/BOOT/BOOTX64.EFI"
     cp "$KERNEL_ELF" "$WORK/esp-native/harland/kernel.elf"
+    : > "$WORK/esp-native/harland/klog-dump"
     boot native "$WORK/esp-native" ",disable-legacy=on,queue-size=1024" \
         -drive "driver=null-co,size=1M,read-zeroes=on,latency-ns=100000000,if=none,id=persist" \
         -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1
     all_passed native || rc=1
     smp_stacks native || rc=1
+    ring_holds_boot native || rc=1
     blk_transport native modern || rc=1
     slow_disk native || rc=1
     key_received native || rc=1

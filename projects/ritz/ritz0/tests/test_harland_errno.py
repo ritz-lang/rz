@@ -48,9 +48,10 @@ RITZLIB_NAME = {
     "NoSpc": "ENOSPC", "Pipe": "EPIPE", "NotEmpty": "ENOTEMPTY",
 }
 
-# The modules a host program needs to link the kernel's serial output path
-# (serial_print_dec's digits come from ritzlib.fmt.digits, #1957).
-SERIAL = ["serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits"]
+# The modules a host program needs to link the kernel's log path: klog (the
+# one log API, #1885) over serial, with digits from ritzlib.fmt.digits (#1957)
+# and klog_cstr's strlen from ritzlib.str.
+SERIAL = ["klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
 
 # serial.ritz and mm/vmm.ritz hold `asm x86_64:` blocks, which ritz1 can't
 # parse yet (AGAST #1455/#1825; harland under ritz1 is #1848), so a test that

@@ -1,0 +1,115 @@
+# Harland's one kernel log API (AGAST #1885)
+#
+# Every kernel message goes through klog.ritz: one sink that writes COM1 and
+# the crash ring buffer, and one number formatter (ritzlib.fmt.digits). The
+# old serial_print_dec took a u64, so `x as u64` for x = -1 printed
+# 18446744073709551615, and prints() wrote serial only, so most boot
+# messages never reached the ring that exceptions.ritz dumps on a crash.
+#
+# A hosted test has no I/O ports: klog_serial(false) leaves the ring as the
+# only sink, and ring_copy reads it back.
+
+import klog { klog, klog_cstr, klog_dec, klog_udec, klog_hex, klog_hex_width, klog_serial, ring_clear, ring_copy, RING_BUFFER_SIZE }
+import ritzlib.strview { StrView }
+
+var g_out: [16384]u8
+
+# The ring's whole content, oldest byte first.
+fn ring_text() -> StrView
+    let n: i64 = ring_copy(@g_out[0], 16384)
+    StrView { ptr: @g_out[0], len: n }
+
+fn fresh()
+    klog_serial(false)
+    ring_clear()
+
+fn ring_is(want: StrView) -> bool
+    let got: StrView = ring_text()
+    if got.len != want.len
+        return false
+    var i: i64 = 0
+    while i < got.len
+        if *(got.ptr + i) != *(want.ptr + i)
+            return false
+        i = i + 1
+    true
+
+[[test]]
+fn test_klog_reaches_ring() -> i32
+    fresh()
+    klog("Harland kernel starting...\n")
+    assert ring_is("Harland kernel starting...\n")
+    0
+
+[[test]]
+fn test_klog_cstr_reaches_ring() -> i32
+    fresh()
+    klog_cstr(c"/bin/init")
+    assert ring_is("/bin/init")
+    0
+
+[[test]]
+fn test_dec_minus_one() -> i32
+    fresh()
+    let map_result: i32 = -1
+    klog_dec(map_result as i64)
+    assert ring_is("-1")
+    0
+
+[[test]]
+fn test_dec_i64_min() -> i32
+    fresh()
+    let min: i64 = 0 - 9223372036854775807 - 1
+    klog_dec(min)
+    assert ring_is("-9223372036854775808")
+    0
+
+[[test]]
+fn test_dec_zero_and_positive() -> i32
+    fresh()
+    klog_dec(0)
+    klog(" ")
+    klog_dec(2046)
+    assert ring_is("0 2046")
+    0
+
+[[test]]
+fn test_udec_u64_max() -> i32
+    fresh()
+    klog_udec(0xFFFFFFFFFFFFFFFF)
+    assert ring_is("18446744073709551615")
+    0
+
+[[test]]
+fn test_hex_no_leading_zeros() -> i32
+    fresh()
+    klog_hex(0x7E1330F0)
+    klog(" ")
+    klog_hex(0)
+    assert ring_is("7E1330F0 0")
+    0
+
+[[test]]
+fn test_hex_width_pads() -> i32
+    fresh()
+    klog_hex_width(0xAB, 4)
+    klog(" ")
+    klog_hex_width(0xFFFFFFFFFFFFFFFD, 16)
+    assert ring_is("00AB FFFFFFFFFFFFFFFD")
+    0
+
+# Past RING_BUFFER_SIZE the ring keeps the newest bytes, oldest first.
+[[test]]
+fn test_ring_wraps_to_newest() -> i32
+    fresh()
+    var i: u64 = 0
+    while i < RING_BUFFER_SIZE
+        klog("x")
+        i = i + 1
+    klog("END")
+    let got: StrView = ring_text()
+    assert got.len == RING_BUFFER_SIZE as i64
+    assert *(got.ptr + 0) == 120  # 'x'
+    assert *(got.ptr + got.len - 3) == 69  # 'E'
+    assert *(got.ptr + got.len - 1) == 68  # 'D'
+    0
