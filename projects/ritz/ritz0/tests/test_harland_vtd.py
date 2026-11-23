@@ -257,9 +257,11 @@ def test_ioapic_entries_are_remappable_when_remapping_is_on():
     assert "ir_init(" in select, select
     assert select.index("x2apic_mode = 1") < select.index("ir_init("), select
     assert "vtd_ir_init(" in _body(_code(IR), "ir_init")
+    # Both boot paths share the post-ACPI bring-up (#1884)
+    b = _body(code, "apic_bring_up")
+    assert b.index("apic_select_mode()") < b.index("ioapic_init()"), b
     for init_fn in ("apic_init_with_mb", "apic_init_from_bootinfo"):
-        b = _body(code, init_fn)
-        assert b.index("apic_select_mode()") < b.index("ioapic_init()"), init_fn
+        assert "apic_bring_up()" in _body(code, init_fn), init_fn
 
 
 @pytest.mark.unit

@@ -191,6 +191,8 @@ def test_ioapic_routes_to_the_bsp_not_apic_id_0():
     # bsp_apic_id is known before the I/O APIC is set up (ap_boot_all is later)
     select = _body(code, "apic_select_mode")
     assert re.search(r"bsp_apic_id\s*=\s*lapic_id\(\)", select), select
+    # Both boot paths share the post-ACPI bring-up (#1884)
+    b = _body(code, "apic_bring_up")
+    assert b.index("apic_select_mode()") < b.index("ioapic_init()"), b
     for init_fn in ("apic_init_with_mb", "apic_init_from_bootinfo"):
-        b = _body(code, init_fn)
-        assert b.index("apic_select_mode()") < b.index("ioapic_init()"), init_fn
+        assert "apic_bring_up()" in _body(code, init_fn), init_fn

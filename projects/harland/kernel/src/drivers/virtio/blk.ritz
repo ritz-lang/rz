@@ -308,15 +308,16 @@ fn blk_reclaim(dev_idx: i32, vq: *Virtqueue) -> bool
         return true
     return blk_complete(dev_idx, vq, blk_inflight_head[dev_idx])
 
-# Read sectors from the block device
-# sector: starting sector number
-# count: number of sectors to read (max 7 sectors = 3584 bytes due to DMA buffer size)
-# buf: buffer to read into (must be large enough)
+# Read (write=false) or write (write=true) `count` sectors at `sector`
+# through the device's one DMA page, bouncing through it to/from `buf`
+# (max 7 sectors = 3584 bytes; the page also holds the header and status).
 # Returns: 0 on success, negative on error
-pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32
+pub fn virtio_blk_rw(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8, write: bool) -> i32
     if dev == 0 as *VirtioBlkDevice
         return -1
     if (*dev).nvme != 0 as *NvmeNamespace
+        if write
+            return nvme_ns_write((*dev).nvme, sector, count, buf)
         return nvme_ns_read((*dev).nvme, sector, count, buf)
 
     let dev_idx: i32 = get_device_index(dev)
@@ -334,16 +335,31 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
     let header_phys: u64 = dev_dma_phys
     let status_phys: u64 = dev_dma_phys + 16
     let data_phys: u64 = dev_dma_phys + 32
+    let data_virt: *u8 = (dev_dma_virt + 32 as i64)
+    let bytes: u32 = count * 512
+    var op: StrView = "Read"
+    if write
+        op = "Write"
 
     # The DMA buffer is the device's until an earlier, timed-out request is done
     let vq: *Virtqueue = (*dev).request_queue
     if not blk_reclaim(dev_idx, vq)
-        println("[virtio-blk] Read timeout (previous request still in flight)")
+        prints("[virtio-blk] ")
+        prints(op)
+        println(" timeout (previous request still in flight)")
         return -3
+
+    if write
+        var j: u32 = 0
+        while j < bytes
+            *(data_virt + j as i64) = *(buf + j as i64)
+            j = j + 1
 
     # Set up request header in DMA buffer
     let header: *VirtioBlkReqHdr = dev_dma_virt as *VirtioBlkReqHdr
     (*header).req_type = VIRTIO_BLK_T_IN
+    if write
+        (*header).req_type = VIRTIO_BLK_T_OUT
     (*header).reserved = 0
     (*header).sector = sector
 
@@ -372,11 +388,14 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
     (*d0).flags = VRING_DESC_F_NEXT
     (*d0).next = desc1 as u16
 
-    # Descriptor 1: Data buffer (device-writable for read) - PHYSICAL ADDRESS
+    # Descriptor 1: Data buffer - PHYSICAL ADDRESS. The device writes it on a
+    # read and only reads it on a write (no WRITE flag = device-readable).
     let d1: *VringDesc = vq_get_desc(vq, desc1 as u16)
     (*d1).addr = data_phys
-    (*d1).len = count * 512
+    (*d1).len = bytes
     (*d1).flags = VRING_DESC_F_WRITE | VRING_DESC_F_NEXT
+    if write
+        (*d1).flags = VRING_DESC_F_NEXT
     (*d1).next = desc2 as u16
 
     # Descriptor 2: Status byte (device-writable) - PHYSICAL ADDRESS
@@ -392,131 +411,36 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
 
     # Poll for completion; on a timeout the request stays in flight
     if not blk_complete(dev_idx, vq, desc0 as u16)
-        println("[virtio-blk] Read timeout")
+        prints("[virtio-blk] ")
+        prints(op)
+        println(" timeout")
         return -3
 
     # Check status
     let status: u8 = *(dev_dma_virt + 16 as i64)
     if status != VIRTIO_BLK_S_OK
-        prints("[virtio-blk] Read error: ")
+        prints("[virtio-blk] ")
+        prints(op)
+        prints(" error: ")
         serial_print_dec(status as u64)
         println("")
         return -5
 
-    # Copy data from DMA buffer to user buffer
-    let data_virt: *u8 = (dev_dma_virt + 32 as i64)
-    let bytes_to_copy: u32 = count * 512
-    var j: u32 = 0
-    while j < bytes_to_copy
-        *(buf + j as i64) = *(data_virt + j as i64)
-        j = j + 1
+    if not write
+        var j: u32 = 0
+        while j < bytes
+            *(buf + j as i64) = *(data_virt + j as i64)
+            j = j + 1
 
     return 0
 
-# Write sectors to the block device
-# sector: starting sector number
-# count: number of sectors to write
-# buf: buffer containing data to write
-# Returns: 0 on success, negative on error
+# Read sectors from the block device (see virtio_blk_rw)
+pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32
+    return virtio_blk_rw(dev, sector, count, buf, false)
+
+# Write sectors to the block device (see virtio_blk_rw)
 pub fn virtio_blk_write(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32
-    if dev == 0 as *VirtioBlkDevice
-        return -1
-    if (*dev).nvme != 0 as *NvmeNamespace
-        return nvme_ns_write((*dev).nvme, sector, count, buf)
-
-    let dev_idx: i32 = get_device_index(dev)
-    let dev_dma_phys: u64 = dma_buffer_phys[dev_idx]
-    let dev_dma_virt: *u8 = dma_buffer_virt[dev_idx]
-
-    if dev_dma_phys == 0
-        println("[virtio-blk] No DMA buffer")
-        return -1
-
-    # DMA buffer layout:
-    # [0-15]   : VirtioBlkReqHdr (16 bytes)
-    # [16]     : status byte
-    # [32-4095]: data (up to 4064 bytes = 7 sectors + some)
-    let header_phys: u64 = dev_dma_phys
-    let status_phys: u64 = dev_dma_phys + 16
-    let data_phys: u64 = dev_dma_phys + 32
-
-    # The DMA buffer is the device's until an earlier, timed-out request is done
-    let vq: *Virtqueue = (*dev).request_queue
-    if not blk_reclaim(dev_idx, vq)
-        println("[virtio-blk] Write timeout (previous request still in flight)")
-        return -3
-
-    # Copy data from user buffer to DMA buffer
-    let data_virt: *u8 = (dev_dma_virt + 32 as i64)
-    let bytes_to_copy: u32 = count * 512
-    var j: u32 = 0
-    while j < bytes_to_copy
-        *(data_virt + j as i64) = *(buf + j as i64)
-        j = j + 1
-
-    # Set up request header in DMA buffer
-    let header: *VirtioBlkReqHdr = dev_dma_virt as *VirtioBlkReqHdr
-    (*header).req_type = VIRTIO_BLK_T_OUT
-    (*header).reserved = 0
-    (*header).sector = sector
-
-    # Initialize status to invalid
-    *(dev_dma_virt + 16 as i64) = 0xFF
-
-    # Allocate 3 descriptors
-    let desc0: i32 = vq_alloc_desc(vq)
-    let desc1: i32 = vq_alloc_desc(vq)
-    let desc2: i32 = vq_alloc_desc(vq)
-
-    if desc0 < 0 or desc1 < 0 or desc2 < 0
-        println("[virtio-blk] No free descriptors")
-        if desc0 >= 0
-            vq_free_desc(vq, desc0 as u16)
-        if desc1 >= 0
-            vq_free_desc(vq, desc1 as u16)
-        if desc2 >= 0
-            vq_free_desc(vq, desc2 as u16)
-        return -2
-
-    # Descriptor 0: Request header (device-readable) - PHYSICAL ADDRESS
-    let d0: *VringDesc = vq_get_desc(vq, desc0 as u16)
-    (*d0).addr = header_phys
-    (*d0).len = VIRTIO_BLK_REQ_HDR_SIZE as u32
-    (*d0).flags = VRING_DESC_F_NEXT
-    (*d0).next = desc1 as u16
-
-    # Descriptor 1: Data buffer (device-readable for write) - PHYSICAL ADDRESS
-    let d1: *VringDesc = vq_get_desc(vq, desc1 as u16)
-    (*d1).addr = data_phys
-    (*d1).len = count * 512
-    (*d1).flags = VRING_DESC_F_NEXT  # No WRITE flag = device-readable
-    (*d1).next = desc2 as u16
-
-    # Descriptor 2: Status byte (device-writable) - PHYSICAL ADDRESS
-    let d2: *VringDesc = vq_get_desc(vq, desc2 as u16)
-    (*d2).addr = status_phys
-    (*d2).len = 1
-    (*d2).flags = VRING_DESC_F_WRITE
-    (*d2).next = 0
-
-    # Submit the request
-    vq_submit(vq, desc0 as u16)
-    vq_notify(vq)
-
-    # Poll for completion; on a timeout the request stays in flight
-    if not blk_complete(dev_idx, vq, desc0 as u16)
-        println("[virtio-blk] Write timeout")
-        return -3
-
-    # Check status
-    let status: u8 = *(dev_dma_virt + 16 as i64)
-    if status != VIRTIO_BLK_S_OK
-        prints("[virtio-blk] Write error: ")
-        serial_print_dec(status as u64)
-        println("")
-        return -5
-
-    return 0
+    return virtio_blk_rw(dev, sector, count, buf, true)
 
 # ============================================================================
 # Utility Functions
