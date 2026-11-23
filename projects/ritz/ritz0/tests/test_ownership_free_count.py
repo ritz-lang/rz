@@ -3913,7 +3913,7 @@ fn build(a: *Allocator) -> i64
 
     # `.unwrap()` hands the Some/Ok payload to the caller, so the carrier is
     # moved too. Borrowed, its scope-end drop and the payload binding would
-    # both free the buffer (AGAST #2159; #4490 for ritz1).
+    # both free the buffer (AGAST #2159, #4490).
     "string_unwrap_moves_carrier": _vec_case("""\
 fn pick(a: *Allocator) -> Option<String>
     return Some(string_with_cap_in(a, 8))
@@ -3946,7 +3946,6 @@ fn build(a: *Allocator) -> i64
 # xfail, as in the main table: run alone, it must fail, and one that passes
 # fails the test until the entry is dropped.
 VEC_GAPS = {
-    "string_unwrap_moves_carrier": {"ritz1": 4490, "ritz1_selfhosted": 4490},
 }
 
 
