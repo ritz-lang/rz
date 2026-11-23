@@ -884,6 +884,16 @@ class PatternEmitter:
                             self._mark_drop_variable_initialized(field_ptr)
                     # Wildcard patterns just discard the value
 
+            # A bare name that isn't one of this enum's variants binds the
+            # scrutinee (§8.2, AGAST #4596): the enum value itself, so a
+            # repr enum's `other as i32` sees a discriminant naming no
+            # variant too. It reads the spill, never re-evaluates the place.
+            binds_scrutinee = (isinstance(pattern, rast.IdentPattern)
+                               and not self._has_enum_variant(enum_name, pattern.name))
+            if binds_scrutinee:
+                self.params[pattern.name] = (self.builder.load(enum_alloca), enum_type)
+                self.ritz_types[pattern.name] = rast.NamedType(None, enum_name, [])
+
             # Emit the arm body
             # A `return` inside one arm must not leak has_returned past
             # the match — _emit_if saves/restores per branch; matches must
@@ -914,6 +924,9 @@ class PatternEmitter:
                 arm_exit_blocks.append(None)
 
             # Clean up bound variables
+            if binds_scrutinee:
+                del self.params[pattern.name]
+                self.ritz_types.pop(pattern.name, None)
             if isinstance(pattern, rast.VariantPattern) and pattern.fields:
                 for field_pattern in pattern.fields:
                     if isinstance(field_pattern, rast.IdentPattern):
