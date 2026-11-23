@@ -1,0 +1,84 @@
+# Harland boot handoff ABI (AGAST #4578)
+#
+# The one declaration of what the UEFI loader (boot/src/main.ritz) hands the
+# kernel (kernel/src/main.ritz): a HarlandBootInfo and the memory map it
+# points at. harland's ritz.toml makes boot_abi a dependency of both
+# binaries, so the two sides compile the same struct; boot_abi/test/test_layout.ritz pins its offsets.
+#
+# This module imports nothing, so it builds for x86_64-unknown-uefi, the
+# freestanding kernel and the hosted test runner alike.
+#
+# Changing the layout: append fields only, bump HARLAND_BOOT_VERSION, add a
+# HARLAND_BOOT_VERSION_<FEATURE> constant the kernel checks before reading
+# them (older loaders still boot newer kernels), and update the layout test.
+
+pub const HARLAND_BOOT_MAGIC: u32 = 0x4841524C   # "HARL"
+
+# The version this loader writes. The kernel never compares against it: it
+# gates each later field on the version that introduced it (below).
+pub const HARLAND_BOOT_VERSION: u32 = 3
+
+# First boot protocol version whose BootInfo carries initramfs_phys/size
+pub const HARLAND_BOOT_VERSION_INITRAMFS: u32 = 2
+
+# First boot protocol version whose BootInfo carries flags/_pad3
+pub const HARLAND_BOOT_VERSION_FLAGS: u32 = 3
+
+# Boot option bits (HarlandBootInfo.flags). Version 3 and later only.
+# The loader sets NET_SELFTEST from the boot volume's \harland\net-selftest
+# marker; the kernel then runs its NIC self-tests before init (AGAST #4335).
+pub const HARLAND_BOOT_FLAG_NET_SELFTEST: u32 = 1
+# AGAST #1851: keep polling after the NIC self-tests for a bounded window so a
+# peer instance can ping us. Set only by the EC2 acceptance image, so an
+# ordinary net-selftest boot (QEMU's NIC gate) never waits for a peer.
+pub const HARLAND_BOOT_FLAG_NET_RESPONDER: u32 = 2
+
+# HarlandMemEntry.mem_type: the loader folds UEFI's memory types into these.
+pub const HARLAND_MEM_USABLE: u32 = 1
+pub const HARLAND_MEM_RESERVED: u32 = 2
+pub const HARLAND_MEM_ACPI_RECLAIMABLE: u32 = 3
+
+# HarlandBootInfo.framebuffer_format
+pub const FB_FORMAT_RGBX: u8 = 0     # Red-Green-Blue-Reserved (UEFI default)
+pub const FB_FORMAT_BGRX: u8 = 1     # Blue-Green-Red-Reserved (common)
+pub const FB_FORMAT_OTHER: u8 = 2    # Custom bitmask (check pixel info)
+
+# One memory map entry (24 bytes)
+[[packed]]
+pub struct HarlandMemEntry
+    base: u64
+    length: u64
+    mem_type: u32                    # HARLAND_MEM_*
+    reserved: u32
+
+# The boot handoff (104 bytes at version 3)
+[[packed]]
+pub struct HarlandBootInfo
+    magic: u32                       # HARLAND_BOOT_MAGIC
+    version: u32                     # HARLAND_BOOT_VERSION of the loader
+    memory_map: *HarlandMemEntry     # Simplified memory map
+    memory_map_entries: u32          # Number of entries
+    _pad1: u32
+    framebuffer_addr: u64            # Framebuffer address (0 if none)
+    framebuffer_width: u32
+    framebuffer_height: u32
+    framebuffer_pitch: u32           # Bytes per scanline
+    framebuffer_bpp: u8              # Bits per pixel (32)
+    framebuffer_format: u8           # FB_FORMAT_*
+    _pad2: [2]u8
+    rsdp_addr: u64                   # ACPI RSDP address
+    kernel_phys: u64                 # Kernel physical address
+    kernel_size: u64                 # Kernel size in bytes
+    pml4_phys: u64                   # Page table physical address
+    # Version 2 (AGAST #4253): \harland\initramfs.tar, read from the boot
+    # volume into loader memory (EfiLoaderData, so reserved in the map).
+    # 0/0 when the ESP has none: the kernel then reads a virtio-blk disk.
+    # Read only when version >= HARLAND_BOOT_VERSION_INITRAMFS.
+    initramfs_phys: u64              # Physical address of the TAR, or 0
+    initramfs_size: u64              # Its size in bytes, or 0
+    # Version 3 (AGAST #4335): boot options (HARLAND_BOOT_FLAG_*). Without
+    # NET_SELFTEST the kernel leaves the NIC alone until init is up, so a
+    # misbehaving driver cannot keep the shell from starting.
+    # Read only when version >= HARLAND_BOOT_VERSION_FLAGS.
+    flags: u32
+    _pad3: u32

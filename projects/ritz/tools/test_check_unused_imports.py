@@ -17,6 +17,9 @@ from check_unused_imports import main, unused_imports  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
 KERNEL = REPO / "projects" / "harland" / "kernel"
+# What the kernel and the UEFI loader both compile (AGAST #4578), and the loader.
+ABI = REPO / "projects" / "harland" / "boot_abi" / "src"
+BOOT_SRC = REPO / "projects" / "harland" / "boot" / "src"
 ALLOW = KERNEL / "unused_imports.allow"
 
 
@@ -69,16 +72,22 @@ class TestHarlandKernel:
         rc = main([str(KERNEL / "src")])
         assert rc == 0, capsys.readouterr().out
 
+    def test_abi_and_loader_have_no_unused_imports(self, capsys):
+        rc = main([str(ABI), str(BOOT_SRC)])
+        assert rc == 0, capsys.readouterr().out
 
-def test_kernel_asm_pause_only_in_io_ritz():
-    """LARB review/5 harland F5: spin loops call io.cpu_pause(); the `pause`
-    instruction is written once, in io.ritz."""
+
+def test_asm_pause_only_in_abi_portio():
+    """LARB review/5 harland F5: spin loops call cpu_pause(); the `pause`
+    instruction is written once. Since AGAST #4578 that is boot_abi/src/portio.ritz,
+    which the kernel (via io.ritz) and the UEFI loader share."""
     import re
 
     hits = [
-        f"{p.relative_to(KERNEL)}:{i}"
-        for p in sorted((KERNEL / "src").rglob("*.ritz"))
+        f"{p.relative_to(KERNEL.parent)}:{i}"
+        for root in (KERNEL / "src", ABI, BOOT_SRC)
+        for p in sorted(root.rglob("*.ritz"))
         for i, line in enumerate(p.read_text().splitlines(), 1)
         if re.fullmatch(r"\s*pause\s*", line)
     ]
-    assert len(hits) == 1 and hits[0].startswith("src/io.ritz:"), hits
+    assert len(hits) == 1 and hits[0].startswith("boot_abi/src/portio.ritz:"), hits

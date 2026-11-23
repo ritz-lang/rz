@@ -17,11 +17,14 @@ nothing regrows there.  One case per package, and each compile stops after
 file and line.
 """
 
+import json
 from pathlib import Path
 
 import pytest
 
 import ritz0
+from import_resolver import DependencyMapping
+from test_harland_kernel_features import harland_deps_args
 
 ROOT = Path(__file__).resolve().parents[4]
 HARLAND = ROOT / "projects/harland"
@@ -55,11 +58,17 @@ def test_repaired_files_type_check_clean(group, tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(ritz0, "PASSES",
                         passes[:passes.index(ritz0._type) + 1] + (ritz0._check_types,))
     failed = []
+    # harland's kernel imports its [dependencies] (goliath, cryptosec,
+    # boot_abi: #1881, #4578), as `rz build harland` passes them.
+    deps = None
+    if root == HARLAND:
+        deps = {name: DependencyMapping(name=name, path=Path(spec["path"]), sources=spec["sources"])
+                for name, spec in json.loads(harland_deps_args()[1]).items()}
     for i, rel in enumerate(files):
         # A fresh output path each time: an up-to-date .ll skips every pass,
         # type checking included.
         ok = ritz0.compile_file(str(root / rel), str(tmp_path / f"{i}.ll"),
-                                no_runtime=True,
+                                no_runtime=True, dependencies=deps,
                                 source_roots=sources, project_root=str(root),
                                 target=target)
         if not ok:

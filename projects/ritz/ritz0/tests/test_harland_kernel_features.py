@@ -48,7 +48,7 @@ BOOT_SRC = HARLAND / "boot" / "src"
 
 def harland_deps_args() -> list[str]:
     """`["--deps", <json>]`: harland's [dependencies] (goliath, cryptosec:
-    AGAST #1881), as `rz build harland` passes them to ritz0."""
+    AGAST #1881; boot_abi: #4578), as `rz build harland` passes them to ritz0."""
     deps = {name: {"path": str(spec.path), "sources": spec.sources}
             for name, spec in package_import_namespaces(read_manifest(HARLAND), HARLAND).items()}
     return ["--deps", json.dumps(deps)]
@@ -57,10 +57,12 @@ def harland_deps_args() -> list[str]:
 def _compile(tmp_path_factory, rel, boot=False):
     """ritz0 IR of one harland module, compiled as `rz build harland` would."""
     out = tmp_path_factory.mktemp("harland_ir") / (Path(rel).stem + ".ll")
+    # Both bins import harland's [dependencies]: goliath and cryptosec
+    # (#1881), and boot_abi, which the loader shares with the kernel (#4578).
     if boot:
-        src, sources, target, extra = BOOT_SRC / rel, '["boot/src"]', "x86_64-unknown-uefi", []
+        src, sources, target = BOOT_SRC / rel, '["boot/src"]', "x86_64-unknown-uefi"
+        extra = harland_deps_args()
     else:
-        # The kernel imports its [dependencies] (goliath, cryptosec: #1881)
         src, sources, target = KERNEL_SRC / rel, '["kernel/src"]', "x86_64-none-elf"
         extra = ["--no-runtime", *harland_deps_args()]
     proc = subprocess.run(

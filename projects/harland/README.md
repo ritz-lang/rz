@@ -99,6 +99,17 @@ User Space
   Hardware (x86-64)
 ```
 
+Source layout:
+
+- `kernel/src/`: the kernel (`[[bin]] harland`)
+- `boot/src/`: the UEFI loader (`[[bin]] bootx64`)
+- `boot_abi/`: a library package both binaries depend on, declaring once
+  what they share: the boot handoff (`boot_abi.handoff`: `HarlandBootInfo`,
+  `HarlandMemEntry`), the ELF64 layouts (`boot_abi.elf64`), port I/O
+  (`boot_abi.portio`) and the polled COM1 driver (`boot_abi.serial`).
+  `boot_abi/test/test_layout.ritz` pins the field offsets. Change the
+  handoff by appending fields and bumping `HARLAND_BOOT_VERSION`.
+
 ## Dependencies
 
 - No runtime dependencies (freestanding kernel)

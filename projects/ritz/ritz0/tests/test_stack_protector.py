@@ -38,6 +38,7 @@ import pytest
 
 from ritz0_inproc import run_ritz0
 import test_ir
+from test_harland_kernel_features import harland_deps_args
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
@@ -172,7 +173,9 @@ def test_harland_kernel_opts_in_and_the_uefi_loader_does_not():
 
 
 def test_harland_defines_the_guard_and_the_failure_handler(tmp_path):
-    ir = _ritz0(tmp_path, KERNEL_SRC / "stack_protector.ritz",
+    # serial (which stack_protector imports) re-exports boot_abi.serial, a
+    # harland [dependency] (#4578): passed as `rz build harland` does.
+    ir = _ritz0(tmp_path, KERNEL_SRC / "stack_protector.ritz", *harland_deps_args(),
                 "--project-root", HARLAND, "--sources", '["kernel/src"]',
                 "--target", "x86_64-none-elf", "--target-os", "harland",
                 "--stack-protector")

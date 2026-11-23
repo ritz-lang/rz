@@ -50,7 +50,7 @@ RITZLIB_NAME = {
 
 # The modules a host program needs to link the kernel's serial output path
 # (serial_print_dec's digits come from ritzlib.fmt.digits, #1957).
-SERIAL = ["serial", "io", "ritzlib.fmt.digits"]
+SERIAL = ["serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits"]
 
 # serial.ritz and mm/vmm.ritz hold `asm x86_64:` blocks, which ritz1 can't
 # parse yet (AGAST #1455/#1825; harland under ritz1 is #1848), so a test that

@@ -27,7 +27,7 @@ MAIN_SRC = KERNEL_SRC / "main.ritz"
 
 # mm/pmm imports serial, whose `asm x86_64:` blocks only ritz0 parses
 # (AGAST #1455/#1825), and ritz0 is what `rz build harland` uses.
-PMM_MODULES = ["mm.pmm", "serial", "io", "ritzlib.fmt.digits"]  # serial imports ritzlib.fmt.digits (#1957)
+PMM_MODULES = ["mm.pmm", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits"]  # serial imports ritzlib.fmt.digits (#1957)
 
 # Exit code i names the i-th failing check.
 PMM_PAGE_ZERO = """\
@@ -130,7 +130,8 @@ SIX_GIB_PAGES = 6 * GIB // 4096
 
 PMM_ABOVE_4G = f"""\
 import ritzlib.option
-import mm.pmm {{ PAGE_SIZE, HarlandBootInfo, HarlandMemEntry, Mb2BootInfo, HARLAND_BOOT_MAGIC, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_bitmap_phys, pmm_init_from_bootinfo, pmm_init_from_multiboot }}
+import boot_abi.handoff {{ HarlandBootInfo, HarlandMemEntry, HARLAND_BOOT_MAGIC, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED }}
+import mm.pmm {{ PAGE_SIZE, Mb2BootInfo, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_bitmap_phys, pmm_init_from_bootinfo, pmm_init_from_multiboot }}
 
 const FOUR_GIB: u64 = 0x100000000
 const SIX_GIB: u64 = 0x180000000

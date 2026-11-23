@@ -15,9 +15,10 @@ where it lives; every other boot script does not, and `test_nvme_boot.sh`
 asserts the runtime skip line.
 
 These are source-level contract checks: the runtime proof is the QEMU boots
-in the gate. The loader and kernel each define their own packed BootInfo
-structure, so their field lists are compared here rather than trusted to
-stay in step by hand.
+in the gate. The loader and kernel share one HarlandBootInfo declaration,
+harland/boot_abi/src/handoff.ritz (AGAST #4578); boot_abi's own
+test/test_layout.ritz pins its offsets, and here both sides are held to
+importing it rather than declaring a copy.
 """
 
 import re
@@ -33,6 +34,7 @@ KERNEL_SRC = HARLAND / "kernel" / "src"
 PMM = KERNEL_SRC / "mm" / "pmm.ritz"
 MAIN = KERNEL_SRC / "main.ritz"
 BOOT_MAIN = HARLAND / "boot" / "src" / "main.ritz"
+HANDOFF = HARLAND / "boot_abi" / "src" / "handoff.ritz"
 TOOLS = HARLAND / "tools"
 
 # Boot scripts that boot the kernel. Only the NIC gate asks for the network
@@ -80,7 +82,7 @@ def _imports_from(code, module):
 
 
 def test_boot_info_v3_appends_the_network_self_test_flag():
-    code = _code(PMM)
+    code = _code(HANDOFF)
     assert _const(code, "HARLAND_BOOT_VERSION_FLAGS") == 3
     assert _const(code, "HARLAND_BOOT_FLAG_NET_SELFTEST") == 1
     # AGAST #1851: a second boot option, so the EC2 acceptance image can ask
@@ -94,28 +96,32 @@ def test_boot_info_v3_appends_the_network_self_test_flag():
     assert fields.index("initramfs_size") < fields.index("flags")
 
 
-def test_loader_and_kernel_boot_info_layouts_are_identical():
-    """The two structures are separate declarations of one ABI."""
-    kernel = _struct_fields(_code(PMM), "pub struct HarlandBootInfo")
-    loader = _struct_fields(_code(BOOT_MAIN), "struct BootInfo")
-    assert loader == kernel
+def test_loader_and_kernel_share_one_boot_info_declaration():
+    """AGAST #4578: one HarlandBootInfo, in boot_abi; neither side keeps a
+    copy that could drift from the other."""
+    # Mb2BootInfo is multiboot2's, a different ABI.
+    struct = re.compile(r"^(?:pub\s+)?struct (?:Harland)?BootInfo$", re.M)
+    for path in (BOOT_MAIN, PMM):
+        assert not struct.search(_code(path)), f"{path.name} declares its own BootInfo"
+    assert struct.findall(_code(HANDOFF)) == ["pub struct HarlandBootInfo"]
+    loader = _imports_from(_code(BOOT_MAIN), "boot_abi.handoff")
+    assert loader and {"HarlandBootInfo", "HarlandMemEntry"} <= loader
+    assert {"HarlandBootInfo", "HarlandMemEntry"} <= _imports_from(_code(PMM), "boot_abi.handoff")
 
 
-def test_loader_and_kernel_agree_on_the_boot_option():
-    loader = _code(BOOT_MAIN)
-    kernel = _code(PMM)
-    assert _const(loader, "BOOT_VERSION") == 3
-    assert _const(loader, "BOOT_FLAG_NET_SELFTEST") == _const(
-        kernel, "HARLAND_BOOT_FLAG_NET_SELFTEST")
-    assert _const(loader, "BOOT_FLAG_NET_RESPONDER") == _const(
-        kernel, "HARLAND_BOOT_FLAG_NET_RESPONDER")
+def test_loader_writes_the_flags_version_and_both_options():
+    loader = _imports_from(_code(BOOT_MAIN), "boot_abi.handoff")
+    assert {"HARLAND_BOOT_VERSION", "HARLAND_BOOT_FLAG_NET_SELFTEST",
+            "HARLAND_BOOT_FLAG_NET_RESPONDER"} <= loader
+    assert _const(_code(HANDOFF), "HARLAND_BOOT_VERSION") == 3
+    assert "boot_info.version = HARLAND_BOOT_VERSION" in _fn_body(_code(BOOT_MAIN), "build_boot_info")
 
 
 def test_loader_reads_the_marker_from_the_boot_volume():
     code = _code(BOOT_MAIN)
     probe = _fn_body(code, "load_boot_options_from_fs")
     assert 'ascii_to_ucs2("\\\\harland\\\\net-selftest"' in probe
-    assert "boot_flags = boot_flags | BOOT_FLAG_NET_SELFTEST" in probe
+    assert "boot_flags = boot_flags | HARLAND_BOOT_FLAG_NET_SELFTEST" in probe
 
 
 def test_loader_reads_the_net_responder_marker():
@@ -124,7 +130,7 @@ def test_loader_reads_the_net_responder_marker():
     code = _code(BOOT_MAIN)
     probe = _fn_body(code, "load_boot_options_from_fs")
     assert 'ascii_to_ucs2("\\\\harland\\\\net-responder"' in probe
-    assert "boot_flags = boot_flags | BOOT_FLAG_NET_RESPONDER" in probe
+    assert "boot_flags = boot_flags | HARLAND_BOOT_FLAG_NET_RESPONDER" in probe
     # Called while the root volume is open, as the initramfs probe is...
     assert "load_boot_options_from_fs(root_file)" in _fn_body(code, "load_kernel_from_fs")
     # ...and handed to the kernel in BootInfo.
@@ -172,7 +178,7 @@ def test_kernel_reads_flags_only_from_a_v3_boot_info():
 
 
 def test_main_imports_the_flag_constants():
-    names = _imports_from(_code(MAIN), "mm.pmm")
+    names = _imports_from(_code(MAIN), "boot_abi.handoff")
     assert {"HARLAND_BOOT_VERSION_FLAGS", "HARLAND_BOOT_FLAG_NET_SELFTEST",
             "HARLAND_BOOT_FLAG_NET_RESPONDER"} <= names
 

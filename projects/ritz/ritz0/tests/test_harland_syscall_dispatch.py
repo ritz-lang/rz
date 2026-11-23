@@ -53,6 +53,9 @@ def harland_deps_args() -> list[str]:
             for name, spec in package_import_namespaces(read_manifest(HARLAND), HARLAND).items()}
     return ["--deps", json.dumps(deps)]
 KERNEL_SRC = HARLAND / "kernel" / "src"
+# The boot_abi package the kernel shares with the UEFI loader (AGAST #4578).
+# HARLAND on RITZ_PATH resolves `boot_abi.x` as boot_abi/src/x.ritz.
+BOOT_ABI_SRC = HARLAND / "boot_abi" / "src"
 # syscall_init, syscall_table_init and syscall_handler moved here from main.ritz (#2751).
 ENTRY = KERNEL_SRC / "syscall" / "runtime" / "entry.ritz"
 METRICS = RITZ_ROOT.parent / "larb" / "tools" / "ritz-metrics" / "ritz_metrics.py"
@@ -99,7 +102,7 @@ def _compile(compiler, tmp_path, src, name, extra=()):
     path = tmp_path / f"{name}.ritz"
     path.write_text(src)
     ll = tmp_path / f"{name}_{compiler}.ll"
-    env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{KERNEL_SRC}:{tmp_path}")
+    env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{KERNEL_SRC}:{HARLAND}:{tmp_path}")
     if compiler == "ritz0":
         proc = run_ritz0([str(path), "-o", str(ll), *extra], cwd=tmp_path, env=env, timeout=300)
     else:
@@ -118,9 +121,15 @@ def _run(compiler, tmp_path, src, modules):
     objs = []
     for mod in modules:
         # ritzlib.* (e.g. ritzlib.fmt.digits, which serial.ritz imports, #1957) lives
-        # under the ritz tree; every other module is a harland kernel module.
-        root = RITZ_ROOT if mod.startswith("ritzlib.") else KERNEL_SRC
-        text = (root / (mod.replace(".", "/") + ".ritz")).read_text()
+        # under the ritz tree, boot_abi.* in harland's boot_abi package (#4578);
+        # every other module is a harland kernel module.
+        if mod.startswith("ritzlib."):
+            path = RITZ_ROOT / (mod.replace(".", "/") + ".ritz")
+        elif mod.startswith("boot_abi."):
+            path = BOOT_ABI_SRC / (mod.removeprefix("boot_abi.").replace(".", "/") + ".ritz")
+        else:
+            path = KERNEL_SRC / (mod.replace(".", "/") + ".ritz")
+        text = path.read_text()
         extra = ("--no-runtime",) if compiler == "ritz0" else ()
         objs.append(str(_compile(compiler, tmp_path, text, mod.replace(".", "_"), extra)))
     objs.insert(0, str(_compile(compiler, tmp_path, src, "t")))

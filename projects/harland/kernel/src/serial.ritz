@@ -3,31 +3,16 @@
 # Provides serial I/O for kernel logging, debugging, and user input.
 
 import io { outb, inb, cpu_pause }
-import ritzlib.fmt.digits { fmt_u64_into }
+# The polled COM1 driver is boot_abi/src/serial.ritz, shared with the UEFI
+# loader (AGAST #4578). Re-exported: kernel modules import it from serial.
+pub import boot_abi.serial { serial_init, serial_write_byte, serial_print, serial_write, serial_print_hex, serial_print_hex_width, print_hex_prefix, serial_print_dec }
+import boot_abi.serial { COM1_DATA, COM1_IER, COM1_LSR, LSR_DR, LSR_THRE }
 
 # ============================================================================
 # Serial Port Constants
 # ============================================================================
 
-const COM1: u16 = 0x3F8
-const COM1_DATA: u16 = 0x3F8
-const COM1_IER: u16 = 0x3F9      # Interrupt Enable Register
-const COM1_IIR: u16 = 0x3FA      # Interrupt Identification Register
-const COM1_FCR: u16 = 0x3FA      # FIFO Control Register (write-only)
-const COM1_LCR: u16 = 0x3FB      # Line Control Register
-const COM1_MCR: u16 = 0x3FC      # Modem Control Register
-const COM1_LSR: u16 = 0x3FD      # Line Status Register
-const COM1_MSR: u16 = 0x3FE      # Modem Status Register
-
-# Line Status Register bits
-const LSR_DR: u8 = 0x01          # Data Ready - byte available to read
-const LSR_OE: u8 = 0x02          # Overrun Error
-const LSR_PE: u8 = 0x04          # Parity Error
-const LSR_FE: u8 = 0x08          # Framing Error
-const LSR_BI: u8 = 0x10          # Break Indicator
-const LSR_THRE: u8 = 0x20        # Transmitter Holding Register Empty
-const LSR_TEMT: u8 = 0x40        # Transmitter Empty
-const LSR_ERROR: u8 = 0x80       # Error in FIFO
+# COM1 registers and LSR bits: boot_abi/src/serial.ritz.
 
 # Interrupt Enable Register bits
 const IER_RDA: u8 = 0x01         # Received Data Available interrupt
@@ -81,73 +66,9 @@ pub import ritzlib.strview { StrView }
 # Serial Port Functions
 # ============================================================================
 
-pub fn serial_init() -> i32
-    outb(COM1_IER, 0x00)      # Disable interrupts
-    outb(COM1_LCR, 0x80)      # Enable DLAB
-    outb(COM1_DATA, 0x01)     # Divisor low (115200 baud)
-    outb(COM1_IER, 0x00)      # Divisor high
-    outb(COM1_LCR, 0x03)      # 8N1
-    outb(COM1_FCR, 0xC7)      # Enable FIFO
-    outb(COM1_MCR, 0x0B)      # Enable IRQs, RTS/DSR
-    return 0
-
-pub fn serial_write_byte(c: u8) -> i32
-    while (inb(COM1_LSR) & LSR_THRE) == 0
-        cpu_pause()
-    outb(COM1_DATA, c)
-    return 0
-
-# Legacy: null-terminated C string (use c"..." literals)
-pub fn serial_print(s: *u8) -> i32
-    var p: *u8 = s
-    while *p != 0
-        serial_write_byte(*p)
-        p = p + 1
-    return 0
-
-# Explicit length (syscall-style, no null scanning)
-pub fn serial_write(buf: *u8, len: i64) -> i32
-    var i: i64 = 0
-    while i < len
-        serial_write_byte(*(buf + i))
-        i = i + 1
-    return 0
-
 # StrView wrapper (use "..." literals - compile-time length)
 pub fn prints(s: StrView) -> i32
     return serial_write(s.ptr, s.len)
-
-# Print hex with NO leading zeros (default, minimal output)
-# For 0, prints "0". For 0x1234, prints "1234".
-pub fn serial_print_hex(value: u64) -> i32
-    let hex_chars: *u8 = c"0123456789ABCDEF"
-
-    # Handle zero specially
-    if value == 0
-        serial_write_byte(48)  # '0'
-        return 0
-
-    # Find first non-zero nibble
-    var i: i32 = 15
-    while i > 0 and ((value >> (i * 4)) & 0xF) == 0
-        i = i - 1
-
-    # Print from first non-zero nibble to end
-    while i >= 0
-        let nibble: u8 = ((value >> (i * 4)) & 0xF) as u8
-        serial_write_byte(*(hex_chars + nibble as i64))
-        i = i - 1
-    return 0
-
-# Print hex with specific width (number of hex digits, with leading zeros)
-pub fn serial_print_hex_width(value: u64, width: i32) -> i32
-    let hex_chars: *u8 = c"0123456789ABCDEF"
-    var i: i32 = width - 1
-    while i >= 0
-        let nibble: u8 = ((value >> (i * 4)) & 0xF) as u8
-        serial_write_byte(*(hex_chars + nibble as i64))
-        i = i - 1
-    return 0
 
 # Padded hex variants - use these when you want leading zeros for alignment
 # Control the width by casting: (x as u8), (x as u16), (x as u32), (x as u64)
@@ -168,25 +89,9 @@ pub fn serial_print_hex32(value: u32) -> i32
 pub fn serial_print_hex64(value: u64) -> i32
     serial_print_hex_width(value, 16)
 
-# value in decimal. Digits from ritzlib.fmt.digits (#1957), which imports nothing,
-# so the freestanding kernel can use it.
-pub fn serial_print_dec(value: u64) -> i32
-    var buf: [20]u8
-    let len: i64 = fmt_u64_into(@buf[0], value)
-    var i: i64 = 0
-    while i < len
-        serial_write_byte(buf[i])
-        i = i + 1
-    return 0
-
 # ============================================================================
 # Convenience Print Functions
 # ============================================================================
-
-# Print hex with "0x" prefix (no leading zeros)
-pub fn print_hex_prefix(value: u64) -> i32
-    prints("0x")
-    return serial_print_hex(value)
 
 # Print hex with "0x" prefix and type-based padding
 # Use (value as u8), (value as u16), etc. to control width

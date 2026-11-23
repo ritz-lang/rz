@@ -1,0 +1,117 @@
+# Polled COM1 serial output shared by the UEFI loader and the kernel
+# (AGAST #4578)
+#
+# The loader logs through these before it hands over; the kernel's
+# serial.ritz re-exports them and adds its buffered, interrupt-driven I/O.
+# One driver, so the two can't disagree on baud rate or line setup.
+#
+# No StrView here: the kernel's is ritzlib.strview's, which the loader can't
+# link (it needs malloc), so each side keeps its own one-line
+# `prints(s: StrView)` over serial_write. Imports only portio and
+# ritzlib.fmt.digits, which imports nothing (#1957).
+
+import boot_abi.portio { outb, inb, cpu_pause }
+import ritzlib.fmt.digits { fmt_u64_into }
+
+# ============================================================================
+# 16550 UART registers (COM1)
+# ============================================================================
+
+pub const COM1: u16 = 0x3F8
+pub const COM1_DATA: u16 = 0x3F8
+pub const COM1_IER: u16 = 0x3F9      # Interrupt Enable Register
+pub const COM1_IIR: u16 = 0x3FA      # Interrupt Identification Register
+pub const COM1_FCR: u16 = 0x3FA      # FIFO Control Register (write-only)
+pub const COM1_LCR: u16 = 0x3FB      # Line Control Register
+pub const COM1_MCR: u16 = 0x3FC      # Modem Control Register
+pub const COM1_LSR: u16 = 0x3FD      # Line Status Register
+pub const COM1_MSR: u16 = 0x3FE      # Modem Status Register
+
+# Line Status Register bits
+pub const LSR_DR: u8 = 0x01          # Data Ready - byte available to read
+pub const LSR_OE: u8 = 0x02          # Overrun Error
+pub const LSR_PE: u8 = 0x04          # Parity Error
+pub const LSR_FE: u8 = 0x08          # Framing Error
+pub const LSR_BI: u8 = 0x10          # Break Indicator
+pub const LSR_THRE: u8 = 0x20        # Transmitter Holding Register Empty
+pub const LSR_TEMT: u8 = 0x40        # Transmitter Empty
+pub const LSR_ERROR: u8 = 0x80       # Error in FIFO
+
+# ============================================================================
+# Output
+# ============================================================================
+
+# 115200 8N1, FIFO on
+pub fn serial_init() -> i32
+    outb(COM1_IER, 0x00)      # Disable interrupts
+    outb(COM1_LCR, 0x80)      # Enable DLAB
+    outb(COM1_DATA, 0x01)     # Divisor low (115200 baud)
+    outb(COM1_IER, 0x00)      # Divisor high
+    outb(COM1_LCR, 0x03)      # 8N1
+    outb(COM1_FCR, 0xC7)      # Enable FIFO
+    outb(COM1_MCR, 0x0B)      # Enable IRQs, RTS/DSR
+    return 0
+
+pub fn serial_write_byte(c: u8) -> i32
+    while (inb(COM1_LSR) & LSR_THRE) == 0
+        cpu_pause()
+    outb(COM1_DATA, c)
+    return 0
+
+# Null-terminated C string (c"..." literals)
+pub fn serial_print(s: *u8) -> i32
+    var p: *u8 = s
+    while *p != 0
+        serial_write_byte(*p)
+        p = p + 1
+    return 0
+
+# Explicit length, no null scanning
+pub fn serial_write(buf: *u8, len: i64) -> i32
+    var i: i64 = 0
+    while i < len
+        serial_write_byte(*(buf + i))
+        i = i + 1
+    return 0
+
+# Hex with no leading zeros: 0 prints "0", 0x1234 prints "1234".
+pub fn serial_print_hex(value: u64) -> i32
+    let hex_chars: *u8 = c"0123456789ABCDEF"
+    if value == 0
+        serial_write_byte(48)  # '0'
+        return 0
+    # Find the first non-zero nibble
+    var i: i32 = 15
+    while i > 0 and ((value >> (i * 4)) & 0xF) == 0
+        i = i - 1
+    while i >= 0
+        let nibble: u8 = ((value >> (i * 4)) & 0xF) as u8
+        serial_write_byte(*(hex_chars + nibble as i64))
+        i = i - 1
+    return 0
+
+# Hex in exactly `width` digits, leading zeros kept
+pub fn serial_print_hex_width(value: u64, width: i32) -> i32
+    let hex_chars: *u8 = c"0123456789ABCDEF"
+    var i: i32 = width - 1
+    while i >= 0
+        let nibble: u8 = ((value >> (i * 4)) & 0xF) as u8
+        serial_write_byte(*(hex_chars + nibble as i64))
+        i = i - 1
+    return 0
+
+# "0x" then serial_print_hex
+pub fn print_hex_prefix(value: u64) -> i32
+    serial_write_byte(48)   # '0'
+    serial_write_byte(120)  # 'x'
+    return serial_print_hex(value)
+
+# Decimal. Digits from ritzlib.fmt.digits (#1957).
+pub fn serial_print_dec(value: u64) -> i32
+    var buf: [20]u8
+    let len: i64 = fmt_u64_into(@buf[0], value)
+    var i: i64 = 0
+    while i < len
+        serial_write_byte(buf[i])
+        i = i + 1
+    return 0

@@ -25,6 +25,9 @@ from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 BOOT_SRC = RITZ_ROOT.parents[0] / "harland" / "boot" / "src" / "main.ritz"
+# The loader imports boot_abi.* (AGAST #4578): projects/harland on RITZ_PATH
+# resolves it as harland/boot_abi/src/<module>.ritz.
+HARLAND = RITZ_ROOT.parents[0] / "harland"
 
 # The EFI spec values.  EFI_GUID is {data1: u32, data2: u16, data3: u16,
 # data4: [8]u8}, and the on-disk image is data1/data2/data3 little-endian
@@ -54,7 +57,7 @@ def _compile(compiler: str, ritz1_bin, tmp_path: Path) -> str:
     work = tmp_path / compiler
     work.mkdir()
     out = work / "boot.ll"
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{HARLAND}")
     if compiler == "ritz0":
         proc = run_ritz0(["--no-runtime", str(BOOT_SRC), "-o", str(out)],
                          cwd=work, env=env, timeout=600)
