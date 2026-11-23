@@ -12,7 +12,7 @@
 import klog { klog, klog_dec, klog_hex, klog_hex_width }
 import io { outl, inl }
 import mm.vmm { vmm_map_mmio, vmm_ensure_mapped }
-import drivers.pci_ecam { mcfg_parse, mcfg_count, mcfg_seg, mcfg_base, mcfg_bus_start, mcfg_bus_end, mcfg_find, ecam_bus_phys, pci_sid }
+import drivers.pci_ecam { mcfg_parse, mcfg_count, mcfg_seg, mcfg_base, mcfg_bus_start, mcfg_bus_end, mcfg_find, ecam_bus_phys, pci_sid, pci_bus_mark, pci_bus_unreached }
 
 # ============================================================================
 # PCI Configuration Space Constants
@@ -141,10 +141,13 @@ pub struct PciDevice
     bar_is_io: [6]u8      # 1 if I/O space, 0 if memory space
     bar_is_64bit: [6]u8   # 1 if 64-bit BAR (uses next slot too)
 
-# Maximum devices we can track
-const PCI_MAX_DEVICES: i32 = 64
-var pci_devices: [64]PciDevice
+# Functions we can track, over every segment (AGAST #4599): a two-socket
+# EPYC lists a few hundred. Functions past the table are counted, not kept,
+# and pci_init_segments logs how many.
+const PCI_MAX_DEVICES: i32 = 256
+var pci_devices: [256]PciDevice
 var pci_device_count: i32 = 0
+var pci_devices_dropped: i32 = 0
 
 # ============================================================================
 # PCI Configuration Space Access
@@ -405,6 +408,7 @@ fn pci_probe_function(seg: u16, bus: u8, device: u8, func: u8) -> bool
         return false
 
     if pci_device_count >= PCI_MAX_DEVICES
+        pci_devices_dropped = pci_devices_dropped + 1
         return false
 
     var dev: PciDevice
@@ -477,10 +481,87 @@ fn pci_scan_bridges(from: i32)
 # Public API
 # ============================================================================
 
+# Mark reached (pci_bus_reached) the bus of every device from `from` on and
+# the secondary..subordinate range of every bridge among them: buses the
+# bridge walk has scanned or that sit behind a bridge, so not root buses.
+fn pci_mark_reached(from: i32)
+    var i: i32 = from
+    while i < pci_device_count
+        let dev: *PciDevice = @pci_devices[i]
+        pci_bus_mark((*dev).segment as u32, (*dev).bus as u32, (*dev).bus as u32)
+        if (*dev).class_code == PCI_CLASS_BRIDGE and (*dev).subclass == 0x04
+            let secondary: u8 = pci_dev_read_config8(dev, 0x19)
+            let subordinate: u8 = pci_dev_read_config8(dev, 0x1A)
+            if secondary != 0
+                pci_bus_mark((*dev).segment as u32, secondary as u32, subordinate as u32)
+        i = i + 1
+
+# Whether any device answers on seg/bus (function 0 of each slot: a device
+# without function 0 has none). Segment 0 asks over port I/O, which reaches
+# every bus; other segments map only function 0's 4 KiB of each slot, not
+# the bus's 1 MiB, since most candidate buses are empty.
+fn pci_bus_has_device(seg: u16, bus: u8) -> bool
+    let phys: u64 = ecam_bus_phys(seg as u32, bus as u32)
+    var slot: u32 = 0
+    while slot < 32
+        var id: u32 = 0xFFFFFFFF
+        if seg == 0
+            outl(PCI_CONFIG_ADDRESS, pci_config_address(bus, slot as u8, 0, 0))
+            id = inl(PCI_CONFIG_DATA)
+        else if phys != 0
+            let va: u64 = vmm_map_mmio(phys + ((slot as u64) << 15), 0x1000)
+            if va != 0
+                id = volatile_load(va as *u32)
+        if (id & 0xFFFF) != 0xFFFF
+            return true
+        slot = slot + 1
+    return false
+
+# Root buses no bridge leads to (AGAST #4599): other host bridges in a
+# segment (an EPYC root complex per quadrant, QEMU pxb-pcie) and every
+# segment past 0. harland parses no AML, so instead of the PNP0A03/PNP0A08
+# _BBN it probes each MCFG bus nothing has reached, lowest first, and scans
+# the ones that answer with their bridges. A root's own buses lie above it,
+# so they are marked before the walk gets to them. Returns how many root
+# buses were found.
+fn pci_scan_roots() -> i32
+    var roots: i32 = 0
+    var i: i32 = 0
+    while i < mcfg_count
+        let seg: u16 = mcfg_seg[i]
+        var b: i32 = pci_bus_unreached(i, 0)
+        while b >= 0
+            pci_bus_mark(seg as u32, b as u32, b as u32)
+            if pci_bus_has_device(seg, b as u8)
+                let from: i32 = pci_device_count
+                pci_scan_bus(seg, b as u8)
+                pci_scan_bridges(from)
+                pci_mark_reached(from)
+                roots = roots + 1
+                klog("[pci] root bus ")
+                klog_hex_width(seg as u64, 4)
+                klog(":")
+                klog_hex_width(b as u64, 2)
+                klog(": ")
+                klog_dec((pci_device_count - from) as i64)
+                klog(" functions\n")
+            b = pci_bus_unreached(i, (b + 1) as u32)
+        i = i + 1
+    return roots
+
+# Functions the table had no room for, if any.
+fn pci_log_dropped()
+    if pci_devices_dropped > 0
+        klog("[pci] device table full: ")
+        klog_dec(pci_devices_dropped as i64)
+        klog(" functions not recorded\n")
+
 pub fn pci_init() -> i32
     pci_device_count = 0
+    pci_devices_dropped = 0
     pci_scan_bus(0, 0)
     pci_scan_bridges(0)
+    pci_log_dropped()
     return pci_device_count
 
 # Every function pci_init found on segment 0 reads the same vendor/device
@@ -512,9 +593,9 @@ fn pci_ecam_check() -> bool
     return true
 
 # After ACPI init: parse the MCFG at `mcfg_addr` (0 = none), turn ECAM on if
-# it agrees with port I/O on segment 0, and enumerate every other segment it
-# describes (once per segment, from its lowest bus). Returns the number of
-# devices found on segments other than 0.
+# it agrees with port I/O on segment 0, and enumerate every root bus the
+# bridge walk from bus 0 missed (pci_scan_roots): other host bridges on
+# segment 0 and every other segment. Returns the number of devices found.
 pub fn pci_init_segments(mcfg_addr: u64) -> i32
     if mcfg_addr == 0
         klog("[pci] no MCFG: segment 0 only, port I/O\n")
@@ -540,30 +621,9 @@ pub fn pci_init_segments(mcfg_addr: u64) -> i32
         pci_ecam_on = false
         return 0
     let before: i32 = pci_device_count
-    i = 0
-    while i < mcfg_count
-        let seg: u16 = mcfg_seg[i]
-        # the segment's lowest bus is its root; skip it if seen already
-        var first: bool = seg != 0
-        var lowest: u8 = mcfg_bus_start[i]
-        var j: i32 = 0
-        while j < mcfg_count
-            if mcfg_seg[j] == seg and (j < i or mcfg_bus_start[j] < lowest)
-                if j < i
-                    first = false
-                else
-                    lowest = mcfg_bus_start[j]
-            j = j + 1
-        if first
-            let from: i32 = pci_device_count
-            pci_scan_bus(seg, lowest)
-            pci_scan_bridges(from)
-            klog("[pci] segment ")
-            klog_hex_width(seg as u64, 4)
-            klog(": ")
-            klog_dec((pci_device_count - from) as i64)
-            klog(" functions\n")
-        i = i + 1
+    pci_mark_reached(0)
+    pci_scan_roots()
+    pci_log_dropped()
     return pci_device_count - before
 
 pub fn pci_find_device(vendor_id: u16, device_id: u16) -> *PciDevice

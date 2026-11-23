@@ -32,6 +32,12 @@ pub var mcfg_seg: [8]u16
 pub var mcfg_bus_start: [8]u8
 pub var mcfg_bus_end: [8]u8
 
+# Root-bus discovery (AGAST #4599): entry * 256 + bus is 1 once something
+# accounts for that bus (a device found on it, or a bridge's secondary..
+# subordinate range covers it). A bus still 0 after the bridge walks may be
+# another host bridge's root bus (EPYC root complexes, QEMU pxb-pcie).
+pub var pci_bus_reached: [2048]u8      # PCI_MCFG_MAX * 256
+
 fn mcfg_rd8(t: *u8, off: u32) -> u32
     return *(t + off as i64) as u32
 
@@ -50,6 +56,10 @@ fn mcfg_rd64(t: *u8, off: u32) -> u64
 # MCFG or its header is cut short or claims more bytes than `len`.
 pub fn mcfg_parse(table: *u8, len: u32) -> i32
     mcfg_count = 0
+    var k: i32 = 0
+    while k < 2048
+        pci_bus_reached[k] = 0
+        k = k + 1
     if len < MCFG_ENTRIES or mcfg_rd32(table, 0) != MCFG_SIGNATURE
         return -1
     let tlen: u32 = mcfg_rd32(table, 4)
@@ -76,6 +86,30 @@ pub fn mcfg_find(seg: u32, bus: u32) -> i32
         if (mcfg_seg[i] as u32) == seg and bus >= (mcfg_bus_start[i] as u32) and bus <= (mcfg_bus_end[i] as u32)
             return i
         i = i + 1
+    return -1
+
+# Mark buses lo..hi of segment `seg` reached, in whichever entries cover
+# them; buses no entry covers are ignored.
+pub fn pci_bus_mark(seg: u32, lo: u32, hi: u32)
+    var b: u32 = lo
+    while b <= hi and b <= 0xFF
+        let i: i32 = mcfg_find(seg, b)
+        if i >= 0
+            pci_bus_reached[i * 256 + b as i32] = 1
+        b = b + 1
+
+# The first bus at or after `from` in entry `entry`'s range that nothing has
+# reached, or -1. A bus counts for the entry mcfg_find picks for it: buses
+# below the range, and buses an earlier entry of the segment also covers,
+# are skipped, so no bus is a candidate twice.
+pub fn pci_bus_unreached(entry: i32, from: u32) -> i32
+    if entry < 0 or entry >= mcfg_count
+        return -1
+    var b: u32 = from
+    while b <= (mcfg_bus_end[entry] as u32)
+        if pci_bus_reached[entry * 256 + b as i32] == 0 and mcfg_find(mcfg_seg[entry] as u32, b) == entry
+            return b as i32
+        b = b + 1
     return -1
 
 # Physical address of bus `bus`'s 1 MiB of config space in segment `seg`,

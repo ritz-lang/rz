@@ -214,11 +214,16 @@ def test_config_access_goes_through_ecam_with_port_io_fallback():
 def test_segments_past_0_are_enumerated_from_mcfg():
     code = _code(PCI)
     seg = _body(code, "pci_init_segments")
-    assert "mcfg_parse(" in seg and "mcfg_seg[" in seg and "pci_scan_bus(" in seg, seg
+    assert "mcfg_parse(" in seg, seg
     # segment 0 was scanned over port I/O by pci_init; ECAM is checked against it
     assert "pci_ecam_check(" in seg, seg
+    # every MCFG bus nothing reached is probed for a root bus (#4599), which
+    # covers segment 1+'s lowest bus too
+    assert "pci_scan_roots(" in seg, seg
+    roots = _body(code, "pci_scan_roots")
+    assert "mcfg_seg[" in roots and "pci_scan_bus(" in roots, roots
     # bridges found there get their secondary buses scanned in their own segment
-    assert "pci_scan_bridges(" in seg
+    assert "pci_scan_bridges(" in roots
     assert "(*dev).segment" in _body(code, "pci_scan_bridges")
     # main runs it once ACPI (in apic_init_*) has found the tables
     main = _code(MAIN)
@@ -247,3 +252,149 @@ def test_msix_sid_carries_the_segment():
 def test_q35_boot_checks_ecam():
     text = IRQ_DEST_BOOT.read_text()
     assert "[pci] ECAM matches port I/O" in text
+
+
+# --- other host bridges' root buses (AGAST #4599) ------------------------------
+#
+# pci_init scans bus 0 and the bridges below it. An EPYC has a root complex
+# per quadrant (root buses 0x00/0x40/0x80/0xC0 in one segment) and QEMU's
+# pxb-pcie adds a root bus at bus_nr: neither sits behind a P2P bridge, so a
+# bridge walk never reaches them. pci_init_segments marks every bus a device
+# or a bridge's secondary..subordinate range accounts for, then probes the
+# MCFG buses still unmarked for a root bus (the brute-force scan; harland
+# parses no AML, so no _BBN). tools/test_irq_dest_boot.sh's plain boot puts a
+# pxb-pcie at bus 0x40 with a root port and a device behind it.
+
+ROOTS_PROGRAM = """\
+import drivers.pci_ecam
+
+var t: [100]u8
+
+fn put8(off: i32, v: u32)
+    t[off] = (v & 0xFF) as u8
+
+fn put16(off: i32, v: u32)
+    put8(off, v)
+    put8(off + 1, v >> 8)
+
+fn put32(off: i32, v: u32)
+    put16(off, v)
+    put16(off + 2, v >> 16)
+
+fn entry(i: i32, base: u64, seg: u32, start: u32, end: u32)
+    let o: i32 = 44 + i * 16
+    put32(o, (base & 0xFFFFFFFF) as u32)
+    put32(o + 4, (base >> 32) as u32)
+    put16(o + 8, seg)
+    put8(o + 10, start)
+    put8(o + 11, end)
+
+# segment 0 buses 00-7f and 80-ff (two entries), segment 1 buses 40-7f
+fn build()
+    var i: i32 = 0
+    while i < 100
+        t[i] = 0
+        i = i + 1
+    put32(0, 0x4746434D)
+    put32(4, 92)
+    entry(0, 0xB0000000, 0, 0x00, 0x7F)
+    entry(1, 0xB0000000, 0, 0x80, 0xFF)
+    entry(2, 0x3F000000000, 1, 0x40, 0x7F)
+
+fn main() -> i32
+    build()
+    if mcfg_parse(@t[0], 92) != 3
+        return 1
+    # nothing reached yet: each entry's first bus, clamped up to its start
+    if pci_bus_unreached(0, 0) != 0 or pci_bus_unreached(2, 0) != 0x40 or pci_bus_unreached(1, 0) != 0x80
+        return 2
+    # bus 0 and a bridge range 01-3f reached: the next root candidate is 0x40
+    pci_bus_mark(0, 0, 0)
+    pci_bus_mark(0, 1, 0x3F)
+    if pci_bus_unreached(0, 0) != 0x40 or pci_bus_unreached(0, 0x41) != 0x41
+        return 3
+    # marks stay in their segment
+    if pci_bus_unreached(2, 0) != 0x40
+        return 4
+    # a range spanning two entries of one segment marks both
+    pci_bus_mark(0, 0x40, 0x85)
+    if pci_bus_unreached(0, 0) != -1 or pci_bus_unreached(1, 0) != 0x86
+        return 5
+    # bus 0xff: the mark loop ends, the last bus is found, past it is none
+    pci_bus_mark(0, 0x86, 0xFE)
+    if pci_bus_unreached(1, 0) != 0xFF or pci_bus_unreached(1, 0x100) != -1
+        return 6
+    pci_bus_mark(0, 0xFF, 0xFF)
+    if pci_bus_unreached(1, 0) != -1
+        return 6
+    # buses no entry covers are ignored; hi < lo marks nothing
+    pci_bus_mark(1, 0x80, 0xFF)
+    pci_bus_mark(1, 0x50, 0x4F)
+    if pci_bus_unreached(2, 0) != 0x40
+        return 7
+    # no such entry
+    if pci_bus_unreached(3, 0) != -1 or pci_bus_unreached(-1, 0) != -1
+        return 8
+    # a new MCFG starts with nothing reached
+    if mcfg_parse(@t[0], 92) != 3 or pci_bus_unreached(0, 0) != 0
+        return 9
+    # an entry overlapping an earlier one of its segment: the earlier owns
+    # the shared buses, so they are never a root candidate twice
+    entry(1, 0xC0000000, 0, 0x70, 0x8F)
+    if mcfg_parse(@t[0], 92) != 3 or pci_bus_unreached(1, 0) != 0x80
+        return 10
+    return 0
+"""
+
+ROOTS_CLAIMS = {1: "parse", 2: "nothing reached", 3: "next candidate after bridges", 4: "per segment",
+                5: "range over two entries", 6: "bus 0xff", 7: "uncovered / empty ranges",
+                8: "no such entry", 9: "parse resets", 10: "overlapping entries"}
+
+
+@pytest.mark.integration
+def test_unreached_buses_are_root_candidates(tmp_path):
+    _run_program(tmp_path, ROOTS_PROGRAM, ROOTS_CLAIMS)
+
+
+@pytest.mark.unit
+def test_root_scan_marks_devices_and_bridge_ranges():
+    code = _code(PCI)
+    mark = _body(code, "pci_mark_reached")
+    # each device's own bus, and a bridge's secondary (0x19)..subordinate (0x1A)
+    assert "pci_bus_mark((*dev).segment as u32, (*dev).bus as u32, (*dev).bus as u32)" in mark, mark
+    assert "pci_dev_read_config8(dev, 0x19)" in mark and "pci_dev_read_config8(dev, 0x1A)" in mark, mark
+    assert "pci_bus_mark((*dev).segment as u32, secondary as u32, subordinate as u32)" in mark, mark
+    roots = _body(code, "pci_scan_roots")
+    # walk each entry's unreached buses; mark what a new root brings in
+    assert "pci_bus_unreached(" in roots and "pci_mark_reached(" in roots and "pci_bus_has_device(" in roots
+    assert "klog(" in roots and "print" not in roots
+    # the scan starts from what pci_init found on segment 0
+    seg = _body(code, "pci_init_segments")
+    assert seg.index("pci_mark_reached(0)") < seg.index("pci_scan_roots(")
+
+
+@pytest.mark.unit
+def test_probing_a_bus_maps_one_page_per_device_not_the_bus():
+    # mapping each candidate bus's whole 1 MiB would fill page tables for
+    # buses that are mostly empty: probe function 0's 4 KiB only
+    body = _body(_code(PCI), "pci_bus_has_device")
+    assert "vmm_map_mmio(" in body and "0x1000" in body, body
+    assert "pci_seg_read_config" not in body, body
+
+
+@pytest.mark.unit
+def test_device_table_fits_a_large_epyc_and_logs_overflow():
+    code = _code(PCI)
+    assert re.search(r"^const PCI_MAX_DEVICES: i32 = 256$", code, re.M)
+    assert re.search(r"^var pci_devices: \[256\]PciDevice$", code, re.M)
+    probe = _body(code, "pci_probe_function")
+    assert "pci_devices_dropped = pci_devices_dropped + 1" in probe, probe
+    assert "pci_log_dropped()" in _body(code, "pci_init_segments") and "pci_log_dropped()" in _body(code, "pci_init")
+    assert "klog(" in _body(code, "pci_log_dropped")
+
+
+@pytest.mark.unit
+def test_q35_boot_has_a_pxb_root_bus():
+    text = IRQ_DEST_BOOT.read_text()
+    assert "pxb-pcie" in text and "bus_nr=0x40" in text
+    assert "[pci] root bus 0000:40" in text

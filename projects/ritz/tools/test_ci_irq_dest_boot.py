@@ -72,7 +72,10 @@ MCFG_0 = r"[pci] MCFG segment 0000 buses 00-ff ECAM B0000000\n"
 ECAM_OK = r"[pci] ECAM matches port I/O on segment 0 (8 functions)\n"
 PCI_ECAM = MCFG_0 + ECAM_OK
 
-PASSED = X2APIC + DEST_8BIT + ioapic(0, 0) + bsp(0) + APS + REROUTE_256 + PCI_ECAM + NVME + SUITE
+# #4599: the plain boot's pxb-pcie root bus, found by the root-bus scan
+PXB_ROOT = r"[pci] root bus 0000:40: 2 functions\n"
+
+PASSED = X2APIC + DEST_8BIT + ioapic(0, 0) + bsp(0) + APS + REROUTE_256 + PCI_ECAM + PXB_ROOT + NVME + SUITE
 
 IR_ON = r"      Interrupt remapping: VT-d on, 1 unit(s), table at 3DE000, 32-bit x2APIC destinations (EIM)\n"
 DEST_IR = r"      Device interrupt destinations: interrupt remapping (32-bit APIC IDs)\n"
@@ -201,6 +204,8 @@ def test_both_boots_run_by_default(tree):
     assert r.returncode == 1 and "PASS: [plain] init Tier-1 suite" in r.stdout and "FAIL: [vtd]" in r.stdout
     argv = (tree["tmp"] / "stub.log").read_text().splitlines()
     assert len(argv) == 2 and "intel-iommu" not in argv[0] and "intel-iommu" in argv[1]
+    # #4599: the pxb-pcie root bus is the plain boot's alone
+    assert "pxb-pcie,id=pxb40,bus_nr=0x40,bus=pcie.0" in argv[0] and "pxb-pcie" not in argv[1]
 
 
 @pytest.mark.integration
@@ -299,6 +304,9 @@ def test_with_the_extended_destination_id_256_keeps_its_own(tree):
     (PASSED.replace(MCFG_0, ""), "no MCFG entry for segment 0 logged"),
     (PASSED.replace(ECAM_OK, ""), "ECAM not checked against port I/O on segment 0"),
     (PASSED.replace("(8 functions)", "(0 functions)"), "ECAM not checked against port I/O on segment 0"),
+    # #4599: the pxb-pcie root bus and what sits behind its root port
+    (PASSED.replace(PXB_ROOT, ""), "pxb-pcie root bus not enumerated"),
+    (PASSED.replace(PXB_ROOT, PXB_ROOT.replace("2 functions", "1 functions")), "pxb-pcie root bus not enumerated"),
 ])
 def test_a_bad_boot_fails(tree, serial, why):
     r = _run(tree, serial)

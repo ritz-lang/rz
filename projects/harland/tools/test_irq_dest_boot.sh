@@ -60,6 +60,10 @@
 #     256", W and I > 0): the 32-bit destination end to end. And a level-
 #     triggered I/O APIC pin: under AMD-Vi its entry's vector field is the
 #     IRTE handle, so it needs a directed EOI; under VT-d the broadcast does;
+#   - plain boot (#4599): a pxb-pcie expander adds a second root bus at
+#     0x40 with a root port and a pci-testdev behind it. No bridge on bus 0
+#     leads there, so only the root-bus scan finds it ("[pci] root bus
+#     0000:40: N functions", N >= 2: the root port and the device behind it);
 #   - an NVMe controller still comes up on MSI-X and its interrupts arrive
 #     ("[msix] nvme interrupts: N, ... completions without one: 0", N > 0);
 #   - the kernel took no exception and init's Tier-1 suite reports ALL
@@ -143,7 +147,7 @@ python3 -c 'import sys; open(sys.argv[1], "wb").truncate(16 << 20)' "$WORK/nvme.
 
 # boot NAME SERIAL: boot the machine, NAME "vtd" / "amdvi" with that IOMMU.
 boot() {
-    local name="$1" serial="$2" machine="q35" accel=() iommu=() vars=()
+    local name="$1" serial="$2" machine="q35" accel=() iommu=() vars=() pxb=()
     if [ "${ACCEL:-}" = kvm ]; then
         accel=(-accel kvm)
         [ "$name" != plain ] && machine="q35,kernel-irqchip=split"
@@ -151,6 +155,10 @@ boot() {
     # The IOMMU first: it must exist before the PCI devices it remaps.
     [ "$name" = vtd ] && iommu=(-device intel-iommu,intremap=on,eim=on)
     [ "$name" = amdvi ] && iommu=(-device amd-iommu,intremap=on,xtsup=on)
+    # #4599: a second host bridge whose root bus no bridge on bus 0 leads to.
+    # Last on the command line: a device without bus= goes on the newest bus.
+    [ "$name" = plain ] && pxb=(-device pxb-pcie,id=pxb40,bus_nr=0x40,bus=pcie.0
+        -device pcie-root-port,id=rp40,bus=pxb40,chassis=40,slot=0 -device pci-testdev,bus=rp40)
     if [ -n "$OVMF_VARS" ]; then
         cp "$OVMF_VARS" "$WORK/vars-$name.fd"
         vars=(-drive "if=pflash,format=raw,file=$WORK/vars-$name.fd")
@@ -167,6 +175,7 @@ boot() {
         -drive "file=$WORK/initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
         -device nvme,serial=harland-irq,drive=nvme0 \
         -drive "file=$WORK/nvme.img,format=raw,if=none,id=nvme0" \
+        "${pxb[@]}" \
         -serial "file:$serial" >/dev/null 2>&1 &
     local pid=$!
     timed_out=1
@@ -361,6 +370,17 @@ check() {
         rc=1
     else
         echo "PASS: $P PCI config access through ECAM, matching port I/O on segment 0 ($ecam)"
+    fi
+    if [ "$name" = plain ]; then
+        local root
+        root=$(grep -aoE "\[pci\] root bus 0000:40: [0-9]+ functions" "$SERIAL" | head -1 | grep -oE "[0-9]+ functions")
+        if [ -z "$root" ] || [ "${root%% *}" -lt 2 ]; then
+            grep -a "\[pci\]" "$SERIAL" | head -8
+            echo "FAIL: $P pxb-pcie root bus not enumerated (want \"[pci] root bus 0000:40: N functions\", N >= 2)"
+            rc=1
+        else
+            echo "PASS: $P second host bridge's root bus 0000:40 enumerated ($root)"
+        fi
     fi
     if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
         echo "PASS: $P init Tier-1 suite: ALL TESTS PASSED"
