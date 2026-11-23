@@ -1,0 +1,63 @@
+# Harland - boot options from the multiboot2 cmdline (AGAST #1887)
+#
+# The UEFI loader turns marker files on the boot volume (\harland\boot-test,
+# \harland\klog-dump, ...) into HarlandBootInfo.flags. A GRUB boot has no
+# such loader, so the kernel reads the same options as whole words on the
+# multiboot2 cmdline tag: `multiboot2 /boot/harland.elf boot-test`.
+#
+# Pure: reads only the info block it is handed, so test/test_boot_options.ritz
+# runs it on the host.
+
+import boot_abi.handoff { HARLAND_BOOT_FLAG_BOOT_TEST, HARLAND_BOOT_FLAG_KLOG_DUMP }
+
+# Multiboot2 tag types (multiboot2 spec §3.6); mm/pmm.ritz has the full list.
+const MB2_TAG_END: u32 = 0
+const MB2_TAG_CMDLINE: u32 = 1
+# A tag's header: u32 type, u32 size. The info block's header: u32
+# total_size, u32 reserved. Tags start after it, each 8-byte aligned.
+const MB2_TAG_HEADER_SIZE: u64 = 8
+const MB2_INFO_HEADER_SIZE: u64 = 8
+
+fn is_space(c: u8) -> bool
+    return c == 32 or c == 9
+
+# True if NUL-terminated `cmdline` holds `word` as a whole space-separated word.
+pub fn cmdline_has_word(cmdline: *u8, word: *u8) -> bool
+    var i: i64 = 0
+    while *(cmdline + i) != 0
+        while is_space(*(cmdline + i))
+            i = i + 1
+        var k: i64 = 0
+        while *(word + k) != 0 and *(cmdline + i + k) == *(word + k)
+            k = k + 1
+        let end: u8 = *(cmdline + i + k)
+        if *(word + k) == 0 and k > 0 and (end == 0 or is_space(end))
+            return true
+        # Skip the rest of this word
+        while *(cmdline + i) != 0 and not is_space(*(cmdline + i))
+            i = i + 1
+    return false
+
+# The HARLAND_BOOT_FLAG_* bits the multiboot2 info block at mb_info_addr asks
+# for on its cmdline; 0 when there is no block or no cmdline tag.
+pub fn mb2_cmdline_flags(mb_info_addr: u64) -> u32
+    if mb_info_addr == 0
+        return 0
+    let total: u64 = *(mb_info_addr as *u32) as u64
+    let info_end: u64 = mb_info_addr + total
+    var tag_ptr: u64 = mb_info_addr + MB2_INFO_HEADER_SIZE
+    while tag_ptr + MB2_TAG_HEADER_SIZE <= info_end
+        let tag_type: u32 = *(tag_ptr as *u32)
+        let tag_size: u32 = *((tag_ptr + 4) as *u32)
+        if tag_type == MB2_TAG_END or (tag_size as u64) < MB2_TAG_HEADER_SIZE
+            return 0
+        if tag_type == MB2_TAG_CMDLINE and (tag_size as u64) > MB2_TAG_HEADER_SIZE
+            let cmdline: *u8 = (tag_ptr + MB2_TAG_HEADER_SIZE) as *u8
+            var flags: u32 = 0
+            if cmdline_has_word(cmdline, c"boot-test")
+                flags = flags | HARLAND_BOOT_FLAG_BOOT_TEST
+            if cmdline_has_word(cmdline, c"klog-dump")
+                flags = flags | HARLAND_BOOT_FLAG_KLOG_DUMP
+            return flags
+        tag_ptr = (tag_ptr + tag_size as u64 + 7) & ~7
+    return 0

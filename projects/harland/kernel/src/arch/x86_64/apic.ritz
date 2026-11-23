@@ -729,14 +729,22 @@ pub fn get_ap_stack_top(cpu_idx: i32) -> u64
 
 # Trampoline code location (must be in low memory, <1MB)
 const AP_TRAMPOLINE_ADDR: u64 = 0x8000
-# The trampoline's stack slot (ap_trampoline.s: AP_TRAMPOLINE_BASE +
-# AP_STACK_OFFSET). An AP takes its stack with an xchg that empties the
-# slot, so no two CPUs ever run on one stack (#4140).
-const AP_STACK_SLOT: u64 = 0x8FF8
+# The trampoline's parameter slots, at AP_TRAMPOLINE_ADDR + ap_trampoline.s's
+# AP_PML4_OFFSET / AP_STACK_OFFSET / AP_ENTRY_OFFSET: the PML4 (u32), the
+# stack top (u64) and the 64-bit entry point (u64). An AP takes its stack
+# with an xchg that empties the slot, so no two CPUs ever run on one stack
+# (#4140).
+const AP_PML4_SLOT: u64 = 0x8FF0    # AP_TRAMPOLINE_ADDR + 0xFF0
+const AP_STACK_SLOT: u64 = 0x8FF8   # AP_TRAMPOLINE_ADDR + 0xFF8
+const AP_ENTRY_SLOT: u64 = 0x9000   # AP_TRAMPOLINE_ADDR + 0x1000
 
 # External symbols from ap_trampoline.s
 extern var ap_trampoline_start: u8
 extern var ap_trampoline_end: u8
+
+# INIT level de-assert (Intel SDM Vol. 3 §11.6.1): trigger mode level (bit
+# 15, 0x8000), level de-assert (bit 14 clear), delivery mode INIT (0x500).
+const ICR_INIT_DEASSERT: u32 = 0x8500
 
 # IPI delivery modes
 const IPI_DELIVERY_FIXED: u8 = 0
@@ -870,24 +878,11 @@ fn ap_setup_trampoline(stack_top: u64) -> i32
         *(dst + i as i64) = *(src + i as i64)
         i = i + 1
 
-    # Set up trampoline parameters at fixed locations
-    # See ap_trampoline.s for layout:
-    #   0x8FF0: PML4 address (u32)
-    #   0x8FF8: Stack pointer (u64)
-    #   0x9000: Entry point (u64)
-
-    # PML4 address (32-bit at 0x8FF0)
-    let pml4_ptr: *u32 = 0x8FF0 as *u32
-    *pml4_ptr = vmm_pml4_phys as u32
-
-    # Stack pointer (64-bit at 0x8FF8)
-    let stack_ptr: *u64 = AP_STACK_SLOT as *u64
-    # Stack top is the address of the END of the AP's stack (stacks grow down)
-    *stack_ptr = stack_top
-
-    # Entry point (64-bit at 0x9000)
-    let entry_ptr: *u64 = 0x9000 as *u64
-    *entry_ptr = ap_entry as u64
+    # The trampoline's parameters (layout: ap_trampoline.s). The stack top
+    # is the END of the AP's stack (stacks grow down).
+    *(AP_PML4_SLOT as *u32) = vmm_pml4_phys as u32
+    *(AP_STACK_SLOT as *u64) = stack_top
+    *(AP_ENTRY_SLOT as *u64) = ap_entry as u64
 
     return 0
 
@@ -909,7 +904,7 @@ fn ap_boot_one(apic_id: u32, cpu_idx: i32, stack_top: u64) -> i32
     # Send INIT de-assert (level=0, trigger=level). x2APIC mode has no
     # INIT level de-assert (and CPUs since the Pentium 4 ignore it).
     if x2apic_mode == 0
-        lapic_send_icr(apic_id, 0x8500)  # INIT, level, de-assert
+        lapic_send_icr(apic_id, ICR_INIT_DEASSERT)
     delay_us(200)
 
     # Send SIPI (Startup IPI) - vector is page number (0x08 for 0x8000)

@@ -18,7 +18,7 @@
 
 # Shared with the kernel through the boot_abi package (AGAST #4578): the boot handoff, the
 # ELF64 layouts and the polled COM1 driver are declared once.
-import boot_abi.handoff { HarlandBootInfo, HarlandMemEntry, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION, HARLAND_BOOT_FLAG_NET_SELFTEST, HARLAND_BOOT_FLAG_NET_RESPONDER, HARLAND_BOOT_FLAG_KLOG_DUMP, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED, HARLAND_MEM_ACPI_RECLAIMABLE }
+import boot_abi.handoff { HarlandBootInfo, HarlandMemEntry, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION, HARLAND_BOOT_FLAG_NET_SELFTEST, HARLAND_BOOT_FLAG_NET_RESPONDER, HARLAND_BOOT_FLAG_KLOG_DUMP, HARLAND_BOOT_FLAG_BOOT_TEST, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED, HARLAND_MEM_ACPI_RECLAIMABLE }
 import boot_abi.elf64 { Elf64Ehdr, Elf64Phdr, Elf64Shdr, Elf64Sym, ELF_MAGIC, PT_LOAD, SHT_SYMTAB }
 import boot_abi.serial { serial_init, serial_write, print_hex_prefix, serial_print_udec }
 
@@ -1015,7 +1015,7 @@ fn load_kernel_from_fs() -> i32
 
     # Boot options from the same volume (AGAST #4335).
     load_boot_options_from_fs(root_file)
-    load_klog_dump_option(root_file)
+    load_test_options(root_file)
 
     # Close root
     (root.close as EfiFn1)(root_file)
@@ -1145,22 +1145,29 @@ fn load_boot_options_from_fs(root_file: u64) -> i32
     prints("    Boot option \\harland\\net-responder: peer-ping window on\n")
     return 0
 
-# \harland\klog-dump asks the kernel to write its crash ring buffer to
-# serial just before it starts init (AGAST #1885). The boot test
-# (tools/test_tier1_boot.sh) writes it and checks the dump holds the whole
-# boot log. Like net-selftest, only its existence matters.
-fn load_klog_dump_option(root_file: u64) -> i32
-    ascii_to_ucs2("\\harland\\klog-dump", @boot_options_path[0])
+# A marker file on the boot volume sets one boot flag; only its existence
+# matters, like net-selftest. Returns true if the marker was there.
+fn load_marker_option(root_file: u64, path: StrView, flag: u32) -> bool
+    ascii_to_ucs2(path, @boot_options_path[0])
     let root: *EfiFile = root_file as *EfiFile
     var file: u64 = 0
     let st: u64 = (root.open as EfiFn5)(root_file, @file as u64, @boot_options_path[0] as u64, EFI_FILE_MODE_READ, 0)
     if st != EFI_SUCCESS
-        return 1
+        return false
     let f: *EfiFile = file as *EfiFile
     (f.close as EfiFn1)(file)
-    boot_flags = boot_flags | HARLAND_BOOT_FLAG_KLOG_DUMP
-    prints("    Boot option \\harland\\klog-dump: ring buffer dump before init\n")
-    return 0
+    boot_flags = boot_flags | flag
+    return true
+
+# \harland\klog-dump asks the kernel to write its crash ring buffer to
+# serial just before it starts init (AGAST #1885); \harland\boot-test asks
+# it to run its self-tests before init (AGAST #1887). The boot test
+# (tools/test_tier1_boot.sh) writes both and checks what the kernel logs.
+fn load_test_options(root_file: u64)
+    if load_marker_option(root_file, "\\harland\\klog-dump", HARLAND_BOOT_FLAG_KLOG_DUMP)
+        prints("    Boot option \\harland\\klog-dump: ring buffer dump before init\n")
+    if load_marker_option(root_file, "\\harland\\boot-test", HARLAND_BOOT_FLAG_BOOT_TEST)
+        prints("    Boot option \\harland\\boot-test: kernel self-tests before init\n")
 
 # ============================================================================
 # ELF Loading

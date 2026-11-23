@@ -139,11 +139,7 @@ def test_loader_reads_the_net_responder_marker():
 
 def test_kernel_hands_the_responder_option_to_postinit():
     body = _fn_body(_code(MAIN), "kernel_main")
-    assert "var run_net_responder: bool = false" in body
-    assert re.search(
-        r"run_net_responder = "
-        r"\(\(\*harland_boot_info\)\.flags & HARLAND_BOOT_FLAG_NET_RESPONDER\) != 0",
-        body), body
+    assert "let run_net_responder: bool = boot_option(HARLAND_BOOT_FLAG_NET_RESPONDER)" in body
     assert "postinit_diagnostics(run_net_selftests, run_net_responder)" in body
 
 
@@ -165,15 +161,19 @@ def test_postinit_waits_for_a_peer_ping_only_when_asked():
 
 
 def test_kernel_reads_flags_only_from_a_v3_boot_info():
-    """An older loader leaves the flag 0 rather than undefined bytes."""
+    """An older loader leaves the flag 0 rather than undefined bytes. Since
+    #1887 detect_boot_protocol reads the flags (a multiboot2 boot takes them
+    from its cmdline) and kernel_main asks boot_option for each."""
     code = _code(MAIN)
-    body = _fn_body(code, "kernel_main")
-    assert "var run_net_selftests: bool = false" in body
+    detect = _fn_body(code, "detect_boot_protocol")
     assert re.search(
         r"if \(\*harland_boot_info\)\.version >= HARLAND_BOOT_VERSION_FLAGS\n"
-        r"\s+run_net_selftests = "
-        r"\(\(\*harland_boot_info\)\.flags & HARLAND_BOOT_FLAG_NET_SELFTEST\) != 0",
-        body), body
+        r"\s+boot_flags = \(\*harland_boot_info\)\.flags\n",
+        detect), detect
+    assert "boot_flags = mb2_cmdline_flags(boot_info_addr)" in detect
+    assert re.search(r"^var boot_flags: u32 = 0$", code, re.M)
+    body = _fn_body(code, "kernel_main")
+    assert "let run_net_selftests: bool = boot_option(HARLAND_BOOT_FLAG_NET_SELFTEST)" in body
     assert "postinit_diagnostics(run_net_selftests, run_net_responder)" in body
 
 

@@ -312,34 +312,48 @@ def test_pmm_alloc_uses_a_next_free_hint(tmp_path):
 
 # --- kernel_main reserves the UEFI boot regions before anything allocates -------
 
-def _kernel_main():
+def _fn(name):
     src = MAIN_SRC.read_text()
-    m = re.search(r"^pub fn kernel_main\(boot_info_addr: u64\) -> i32\n((?:[ \t]+.*\n|[ \t]*\n|#.*\n)+)",
-                  src, re.M)
-    assert m, "kernel/src/main.ritz has no kernel_main"
+    m = re.search(rf"^(?:pub )?fn {name}\(.*\n((?:[ \t]+.*\n|[ \t]*\n|#.*\n)+)", src, re.M)
+    assert m, f"kernel/src/main.ritz has no {name}"
     # Comments say what the code should do; the test checks what it does.
     return "\n".join(line.split("#", 1)[0].rstrip() for line in m.group(1).splitlines())
 
 
-def test_harland_branch_reserves_boot_regions_before_first_allocation():
+def _kernel_main():
+    return _fn("kernel_main")
+
+
+# Since #1887 kernel_main runs init phases, each its own fn:
+# init_physical_memory (which reserves the boot regions) comes before
+# init_virtual_memory (vmm_init, then the kernel heap).
+def test_physical_memory_phase_runs_before_virtual_memory():
     body = _kernel_main()
-    start = body.index("pmm_init_from_bootinfo(harland_boot_info, ")
-    end = body.index("else if boot_protocol == BOOT_PROTOCOL_MULTIBOOT2", start)
-    branch = body[start:end]
+    assert body.index("init_physical_memory(boot_info_addr)") < body.index("init_virtual_memory(boot_info_addr)")
+
+
+def test_harland_branch_reserves_boot_regions_before_first_allocation():
+    pmm = _fn("init_physical_memory")
+    start = pmm.index("pmm_init_from_bootinfo(harland_boot_info, ")
+    end = pmm.index("else if boot_protocol == BOOT_PROTOCOL_MULTIBOOT2", start)
+    assert "reserve_harland_boot_regions(boot_info_addr)" in pmm[start:end]
+    branch = _fn("reserve_harland_boot_regions")
     required = {
-        "kernel image": r"pmm_mark_region_used\(\(\*harland_boot_info\)\.kernel_phys, \(\*harland_boot_info\)\.kernel_size\)",
-        "PML4": r"pmm_mark_region_used\(\(\*harland_boot_info\)\.pml4_phys, PAGE_SIZE\)",
+        "kernel image": r"pmm_mark_region_used\(\(\*info\)\.kernel_phys, \(\*info\)\.kernel_size\)",
+        "PML4": r"pmm_mark_region_used\(\(\*info\)\.pml4_phys, PAGE_SIZE\)",
         "boot info": r"pmm_mark_region_used\(boot_info_addr, ",
-        "memory map": r"pmm_mark_region_used\(\(\*harland_boot_info\)\.memory_map as u64, ",
+        "memory map": r"pmm_mark_region_used\(\(\*info\)\.memory_map as u64, ",
     }
+    assert "let info: *HarlandBootInfo = harland_boot_info" in branch
     missing = [name for name, pat in required.items() if not re.search(pat, branch)]
     assert not missing, f"HARLAND branch does not reserve: {', '.join(missing)}"
-    # The PMM branch runs before vmm_init / heap_init, the first allocators.
-    assert end < body.index("vmm_init()") < body.index("heap_init(")
+    # vmm_init and the heap, the first allocators, run in the next phase.
+    vm = _fn("init_virtual_memory")
+    assert vm.index("vmm_init()") < vm.index("heap_init(")
 
 
 def test_page_tables_reserved_before_and_after_heap_init():
-    body = _kernel_main()
+    body = _fn("init_virtual_memory")
     heap = body.index("heap_init(")
     calls = [m.start() for m in re.finditer(r"vmm_reserve_page_tables\(\)", body)]
     assert any(c < heap for c in calls), "page tables not reserved before heap_init"

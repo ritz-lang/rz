@@ -559,28 +559,35 @@ kstack_get_current:
 # EFER.SCE, STAR (kernel CS 0x08), LSTAR (syscall_entry) and SFMASK (IF) are
 # per-CPU MSRs: every CPU sets its own in cpu_bringup, before it can enter
 # ring 3. Same values syscall/runtime/entry.ritz writes on the BSP.
+.set MSR_EFER, 0xC0000080
+.set MSR_STAR, 0xC0000081
+.set MSR_LSTAR, 0xC0000082
+.set MSR_SFMASK, 0xC0000084
+.set EFER_SCE, 1
+.set KERNEL_CS, 0x08                   # arch/x86_64/gdt.ritz GDT_KERNEL_CODE
+.set RFLAGS_IF, 0x200
 .global syscall_msr_init
 .type syscall_msr_init, @function
 syscall_msr_init:
     # EFER.SCE = 1
-    movl $0xC0000080, %ecx
+    movl $MSR_EFER, %ecx
     rdmsr
-    orl $1, %eax
+    orl $EFER_SCE, %eax
     wrmsr
-    # STAR: bits 47:32 = kernel CS 0x08
-    movl $0xC0000081, %ecx
+    # STAR: bits 47:32 (EDX's low half) = kernel CS
+    movl $MSR_STAR, %ecx
     xorl %eax, %eax
-    movl $0x08, %edx
+    movl $KERNEL_CS, %edx
     wrmsr
     # LSTAR = syscall_entry
     movabsq $syscall_entry, %rax
     movq %rax, %rdx
     shrq $32, %rdx
-    movl $0xC0000082, %ecx
+    movl $MSR_LSTAR, %ecx
     wrmsr
-    # SFMASK = 0x200 (clear IF)
-    movl $0xC0000084, %ecx
-    movl $0x200, %eax
+    # SFMASK = RFLAGS.IF: SYSCALL enters the kernel with IF=0
+    movl $MSR_SFMASK, %ecx
+    movl $RFLAGS_IF, %eax
     xorl %edx, %edx
     wrmsr
     ret

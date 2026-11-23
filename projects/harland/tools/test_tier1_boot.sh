@@ -32,6 +32,14 @@
 # dump must be exactly the kernel's serial output up to that point, starting
 # at its first banner: every boot message, numbers included, reached the ring.
 #
+# Every boot runs in the kernel's boot-test mode (AGAST #1887): the native
+# ESP carries \harland\boot-test and the grub boots pass `boot-test` on the
+# multiboot2 cmdline. The kernel then runs its self-tests before init, one
+# "[boot-test] PASS|FAIL <name>" line each and a "[boot-test] N passed, M
+# failed" summary. Each boot must report every name in BOOT_TESTS passed and
+# none failed. Boots without the option (every other boot test, and real
+# hardware) run no self-tests.
+#
 # The grub boot's second virtio-blk disk is a real, blank qcow2 that a third
 # boot, grub-reboot, boots again (AGAST #1881): the kernel's namespace is
 # goliath, restored from that disk's goliath image at boot, and each boot
@@ -380,6 +388,42 @@ print(f"PASS ({name}): the crash ring holds all {len(dump)} bytes of the kernel'
 PY
 }
 
+# The kernel self-tests every boot-test boot must pass (postinit.ritz's
+# boot_self_tests). channel-close and channel-debug-print were skipped as
+# page faults until AGAST #1887; the gate now requires both.
+BOOT_TESTS="vmm higher-half heap ipc channel-close channel-debug-print munmap mmap-failure pmm-above-4g mmap-overlap mmap-cursor elf-loader virtio-blk-read"
+
+# boot_tests_passed NAME: pass only if the kernel's boot-test summary is in
+# the log (before any ring dump, which repeats it) with 0 failed, no test logged FAIL, and every BOOT_TESTS name
+# logged PASS (AGAST #1887).
+boot_tests_passed() {
+    python3 - "$WORK/$1.log" "$1" $BOOT_TESTS <<'PY'
+import re, sys
+text = open(sys.argv[1], "rb").read().decode(errors="replace")
+name, required = sys.argv[2], sys.argv[3:]
+# The ring dump (\\harland\\klog-dump) repeats the log: read up to it only
+text = text.split("\n=== RING BUFFER DUMP (kernel log) ===\n", 1)[0]
+def fail(msg):
+    print(msg)
+    sys.exit(1)
+results = re.findall(r"\[boot-test\] (PASS|FAIL) (\S+)", text)
+passed = [t for v, t in results if v == "PASS"]
+failed = [t for v, t in results if v == "FAIL"]
+summary = re.search(r"\[boot-test\] (\d+) passed, (\d+) failed", text)
+if failed:
+    fail(f"FAIL ({name}): boot self-tests failed: {' '.join(failed)}")
+if not summary:
+    fail(f"FAIL ({name}): no boot-test summary (kernel ran no self-tests: \\harland\\boot-test / cmdline boot-test)")
+missing = [t for t in required if t not in passed]
+if missing:
+    fail(f"FAIL ({name}): boot self-tests missing: {' '.join(missing)}")
+n_pass, n_fail = map(int, summary.groups())
+if n_fail != 0 or n_pass != len(passed):
+    fail(f"FAIL ({name}): boot-test summary {n_pass} passed, {n_fail} failed disagrees with {len(passed)} PASS lines")
+print(f"PASS ({name}): {n_pass} kernel boot self-tests passed")
+PY
+}
+
 # no_exception NAME: fail if the kernel took an exception or panicked.
 no_exception() {
     if grep -aqE "EXCEPTION|KERNEL PANIC" "$WORK/$1.log"; then
@@ -631,10 +675,12 @@ if [ "$MODE" != grub ]; then
     cp "$LOADER_EFI" "$WORK/esp-native/EFI/BOOT/BOOTX64.EFI"
     cp "$KERNEL_ELF" "$WORK/esp-native/harland/kernel.elf"
     : > "$WORK/esp-native/harland/klog-dump"
+    : > "$WORK/esp-native/harland/boot-test"
     boot native "$WORK/esp-native" ",disable-legacy=on,queue-size=1024" \
         -drive "driver=null-co,size=1M,read-zeroes=on,latency-ns=100000000,if=none,id=persist" \
         -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1
     all_passed native || rc=1
+    boot_tests_passed native || rc=1
     smp_stacks native || rc=1
     ring_holds_boot native || rc=1
     blk_transport native modern || rc=1
@@ -652,7 +698,7 @@ if [ "$MODE" != native ]; then
     cat > "$WORK/grub.cfg" <<'EOF'
 set timeout=0
 insmod all_video
-menuentry "Harland" { multiboot2 /boot/harland.elf; boot; }
+menuentry "Harland" { multiboot2 /boot/harland.elf boot-test; boot; }
 EOF
     grub-mkstandalone -O x86_64-efi -o "$WORK/esp-grub/EFI/BOOT/BOOTX64.EFI" \
         "boot/grub/grub.cfg=$WORK/grub.cfg" "boot/harland.elf=$KERNEL_ELF" \
@@ -671,6 +717,7 @@ EOF
         rc=1
     fi
     all_passed grub || rc=1
+    boot_tests_passed grub || rc=1
     smp_stacks grub || rc=1
     blk_transport grub legacy || rc=1
     key_received grub || rc=1
@@ -682,6 +729,7 @@ EOF
     # The same storage disk, booted again: the image survives the reboot
     boot grub-reboot "$WORK/esp-grub" "" "${STORAGE[@]}" || rc=1
     all_passed grub-reboot || rc=1
+    boot_tests_passed grub-reboot || rc=1
     smp_stacks grub-reboot || rc=1
     persisted grub-reboot 2 || rc=1
     saved_subtree grub-reboot || rc=1

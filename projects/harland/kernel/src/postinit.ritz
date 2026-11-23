@@ -1,19 +1,21 @@
-# Harland Kernel Post-Init Self-Tests and Diagnostics
+# Harland Kernel Boot-Test Self-Tests and Diagnostics
 #
-# Moved out of kernel_main (AGAST #2752). kernel_main runs
-# postinit_self_tests once the scheduler is up, prints its success banner
-# and sets up SYSCALL, then runs postinit_diagnostics before starting
-# /bin/init. Their serial output is unchanged by the move; #1887 gates
-# them later. The network diagnostics are opt-in since #4335: a
-# misbehaving NIC made a real-hardware boot panic before init ran.
+# Moved out of kernel_main (AGAST #2752). boot_self_tests runs only in
+# boot-test mode (AGAST #1887), before SYSCALL is set up; the boot gate
+# asserts its "[boot-test]" lines. postinit_diagnostics runs on every boot
+# after SYSCALL setup, before /bin/init: the PCI listing and the MSI-X
+# checks the interrupt boot tests read. The network diagnostics are opt-in
+# since #4335: a misbehaving NIC made a real-hardware boot panic before
+# init ran.
 
 import klog { klog, klog_dec, klog_hex }
 import serial { StrView }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages }
 import mm.vmm { PTE_WRITABLE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, phys_to_virt }
-import mm.heap { kalloc, kfree, heap_get_free }
+import mm.heap { KERNEL_VIRT_BASE, kalloc, kfree, heap_get_free, heap_check }
 import ipc.message { Message, MSG_FLAG_NONE }
-import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send, channel_recv }
+import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send, channel_recv, channel_close, channel_debug_print }
+import syscall.errno { Errno }
 import drivers.pci { pci_print_all_devices }
 import drivers.msix { msix_print_all }
 import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
@@ -31,226 +33,170 @@ import loader.elf { test_elf_loader }
 import syscall.runtime.memory { munmap_self_test, mmap_failure_self_test, mmap_overlap_self_test, mmap_cursor_self_test }
 
 # ============================================================================
-# Self-tests (need boot info: they allocate and map memory)
+# Boot-test mode self-tests (AGAST #1887)
 # ============================================================================
+#
+# Run only when the boot asked for boot-test mode (\harland\boot-test, or
+# `boot-test` on the multiboot2 cmdline). Each test logs its own detail, then
+# boot_self_tests logs one "[boot-test] PASS|FAIL <name>" line for it and a
+# "[boot-test] N passed, M failed" summary, which tools/test_tier1_boot.sh
+# asserts. A failure is a KERNEL PANIC: every boot gate fails on one.
 
-fn vmm_self_test()
+# The test patterns and addresses: a page mapped past the 1 GiB of 2 MiB
+# boot pages, and the kernel's load address seen through both of its maps.
+const VMM_TEST_VADDR: u64 = 0xFFFFFFFFD0000000
+const VMM_TEST_PATTERN: u64 = 0xDEADBEEFCAFEBABE
+const KERNEL_LOAD_PHYS: u64 = 0x100000
+const HEAP_TEST_PATTERN: u64 = 0x1234567890ABCDEF
+const IPC_TEST_MSG_TYPE: u32 = 42
+const IPC_TEST_SENDER: u32 = 1
+const IPC_TEST_RECEIVER: u32 = 2
+
+fn vmm_self_test() -> bool
     klog("\nTesting Virtual Memory...\n")
-
-    # Verify identity mapping for kernel
-    let test_vaddr: u64 = 0x100000
-    let resolved: u64 = vmm_virt_to_phys(test_vaddr)
-    klog("  virt_to_phys(0x100000) = ")
-    klog_hex(resolved)
-    klog("\n")
-
-    # Allocate a new page and map it at a high address
     let new_page: u64 = pmm_alloc_page()
-    klog("  Allocated page: ")
-    klog_hex(new_page)
-    klog("\n")
-
-    # Map at a test virtual address in higher-half kernel space
-    # Using address past the 1GB pre-mapped region (which uses 2MB huge pages)
-    let test_map_vaddr: u64 = 0xFFFFFFFFD0000000
-    let map_result: i32 = vmm_map_page(test_map_vaddr, new_page, PTE_WRITABLE)
-    klog("  Map 0xFFFFFFFFD0000000 -> result: ")
-    klog_dec(map_result as i64)
-    klog("\n")
-
-    if map_result == 0
-        # Verify the mapping
-        let verify_phys: u64 = vmm_virt_to_phys(test_map_vaddr)
-        klog("  virt_to_phys(0xFFFFFFFFD0000000) = ")
-        klog_hex(verify_phys)
+    if new_page == 0
+        klog("  pmm_alloc_page failed\n")
+        return false
+    let map_result: i32 = vmm_map_page(VMM_TEST_VADDR, new_page, PTE_WRITABLE)
+    if map_result != 0
+        klog("  vmm_map_page failed: ")
+        klog_dec(map_result as i64)
         klog("\n")
-
-        # Write to the mapped page (via identity-mapped physical address)
-        let data_ptr: *u64 = new_page as *u64
-        *data_ptr = 0xDEADBEEFCAFEBABE
-
-        # Read via the new virtual mapping
-        let mapped_ptr: *u64 = test_map_vaddr as *u64
-        let read_val: u64 = *mapped_ptr
-        klog("  Wrote 0xDEADBEEFCAFEBABE, read: ")
-        klog_hex(read_val)
-        klog("\n")
-
-        if read_val == 0xDEADBEEFCAFEBABE
-            klog("  VMM test PASSED!\n")
-        else
-            klog("  VMM test FAILED!\n")
-
-        # Unmap and free
-        vmm_unmap_page(test_map_vaddr)
         pmm_free_page(new_page)
-    else
-        klog("  Mapping failed!\n")
-
-fn higher_half_self_test()
-    # Test higher-half mapping
-    klog("\nTesting Higher-Half Mapping...\n")
-
-    # The kernel physical address 0x100000 should also be accessible
-    # at virtual address 0xFFFFFFFF80100000 (higher-half)
-    let kernel_virt_base: u64 = 0xFFFFFFFF80000000
-    let kernel_phys: u64 = 0x100000
-    let hh_vaddr: u64 = kernel_virt_base + kernel_phys
-
-    # Read from physical address (identity mapped)
-    let phys_ptr: *u64 = kernel_phys as *u64
-    let phys_val: u64 = *phys_ptr
-
-    # Read from higher-half virtual address
-    let hh_ptr: *u64 = hh_vaddr as *u64
-    let hh_val: u64 = *hh_ptr
-
-    klog("  Read from 0x100000: ")
-    klog_hex(phys_val)
+        return false
+    # Write through the physmap, read through the new mapping
+    *(phys_to_virt(new_page) as *u64) = VMM_TEST_PATTERN
+    let read_val: u64 = *(VMM_TEST_VADDR as *u64)
+    let resolved: u64 = vmm_virt_to_phys(VMM_TEST_VADDR)
+    klog("  page ")
+    klog_hex(new_page)
+    klog(" mapped at ")
+    klog_hex(VMM_TEST_VADDR)
+    klog(" resolves to ")
+    klog_hex(resolved)
+    klog(", read ")
+    klog_hex(read_val)
     klog("\n")
-    klog("  Read from 0xFFFFFFFF80100000: ")
+    vmm_unmap_page(VMM_TEST_VADDR)
+    pmm_free_page(new_page)
+    return read_val == VMM_TEST_PATTERN and resolved == new_page
+
+fn higher_half_self_test() -> bool
+    klog("\nTesting Higher-Half Mapping...\n")
+    # The kernel's load address reads the same through the identity map and
+    # the higher half
+    let phys_val: u64 = *(KERNEL_LOAD_PHYS as *u64)
+    let hh_val: u64 = *((KERNEL_VIRT_BASE + KERNEL_LOAD_PHYS) as *u64)
+    klog("  identity ")
+    klog_hex(phys_val)
+    klog(", higher half ")
     klog_hex(hh_val)
     klog("\n")
+    return phys_val == hh_val
 
-    if phys_val == hh_val
-        klog("  Higher-half mapping PASSED!\n")
-    else
-        klog("  Higher-half mapping FAILED!\n")
-
-fn heap_self_test()
-    # Test heap allocations
+fn heap_self_test() -> bool
     klog("\nTesting Kernel Heap...\n")
-
     let alloc1: *u8 = kalloc(64)
-    klog("  kalloc(64) = ")
-    klog_hex(alloc1 as u64)
-    klog("\n")
-
     let alloc2: *u8 = kalloc(128)
-    klog("  kalloc(128) = ")
-    klog_hex(alloc2 as u64)
-    klog("\n")
-
     let alloc3: *u8 = kalloc(256)
-    klog("  kalloc(256) = ")
-    klog_hex(alloc3 as u64)
-    klog("\n")
-
-    klog("  Free space: ")
+    if alloc1 == 0 as *u8 or alloc2 == 0 as *u8 or alloc3 == 0 as *u8
+        klog("  kalloc failed\n")
+        return false
+    *(alloc1 as *u64) = HEAP_TEST_PATTERN
+    kfree(alloc2)
+    # A smaller allocation fits the freed middle block
+    let alloc4: *u8 = kalloc(100)
+    let read_back: u64 = *(alloc1 as *u64)
+    klog("  free space: ")
     klog_dec(heap_get_free())
-    klog(" bytes\n")
-
-    # Write to allocated memory
-    let test_ptr: *u64 = alloc1 as *u64
-    *test_ptr = 0x1234567890ABCDEF
-    let read_back: u64 = *test_ptr
-    klog("  Write/read test: ")
+    klog(" bytes, read back ")
     klog_hex(read_back)
     klog("\n")
-
-    # Free middle allocation
-    kfree(alloc2)
-    klog("  Freed alloc2\n")
-    klog("  Free space: ")
-    klog_dec(heap_get_free())
-    klog(" bytes\n")
-
-    # Reallocate should reuse freed block
-    let alloc4: *u8 = kalloc(100)
-    klog("  kalloc(100) = ")
-    klog_hex(alloc4 as u64)
-    klog("\n")
-
-    if read_back == 0x1234567890ABCDEF
-        klog("  Heap test PASSED!\n")
-    else
-        klog("  Heap test FAILED!\n")
-
-    # Cleanup
     kfree(alloc1)
     kfree(alloc3)
-    kfree(alloc4)
+    if alloc4 != 0 as *u8
+        kfree(alloc4)
+    return alloc4 != 0 as *u8 and read_back == HEAP_TEST_PATTERN and heap_check() == 0
 
-fn ipc_self_test()
-    # Test IPC channels
+# One message from endpoint A to endpoint B: type, sender and payload arrive.
+fn ipc_self_test(pair: ChannelPair) -> bool
     klog("\nTesting IPC Channels...\n")
-    klog("  [1] Creating channel...\n")
-
-    # Create a channel pair
-    let pair: ChannelPair = channel_create(1, 2)
-    klog("  [2] Channel created\n")
-    if pair.endpoint_a != 0 as *ChannelEndpoint
-        klog("  Channel created, id=")
-        klog_dec(pair.channel_id as i64)
+    if pair.endpoint_a == 0 as *ChannelEndpoint
+        klog("  channel_create failed\n")
+        return false
+    # Message is 4 KiB: too big for the kernel stack
+    let send_msg: *Message = kalloc(sizeof(Message) as u64) as *Message
+    let recv_msg: *Message = kalloc(sizeof(Message) as u64) as *Message
+    var ok: bool = false
+    if send_msg != 0 as *Message and recv_msg != 0 as *Message
+        let payload: StrView = "Hello IPC!"
+        (*send_msg).header.msg_type = IPC_TEST_MSG_TYPE
+        (*send_msg).header.flags = MSG_FLAG_NONE
+        (*send_msg).header.seq = 0
+        (*send_msg).header.payload_len = payload.len as u32
+        var i: i64 = 0
+        while i < payload.len
+            (*send_msg).payload[i as i32] = *(payload.ptr + i)
+            i = i + 1
+        let send_result: i32 = channel_send(pair.endpoint_a, send_msg, IPC_TEST_SENDER)
+        var sender: u32 = 0
+        let recv_result: i32 = channel_recv(pair.endpoint_b, recv_msg, @sender)
+        klog("  send ")
+        klog_dec(send_result as i64)
+        klog(", recv ")
+        klog_dec(recv_result as i64)
+        klog(", msg_type ")
+        klog_dec((*recv_msg).header.msg_type as i64)
+        klog(", sender ")
+        klog_dec(sender as i64)
         klog("\n")
+        ok = send_result == 0 and recv_result == payload.len as i32
+        ok = ok and (*recv_msg).header.msg_type == IPC_TEST_MSG_TYPE and sender == IPC_TEST_SENDER
+        i = 0
+        while ok and i < payload.len
+            ok = (*recv_msg).payload[i as i32] == *(payload.ptr + i)
+            i = i + 1
+    if send_msg != 0 as *Message
+        kfree(send_msg as *u8)
+    if recv_msg != 0 as *Message
+        kfree(recv_msg as *u8)
+    return ok
 
-        # Allocate message on heap (4KB struct is too big for stack)
-        klog("  [3] Allocating send message on heap...\n")
-        let send_msg: *Message = kalloc(4096) as *Message
-        if send_msg == 0 as *Message
-            klog("  Failed to allocate send_msg!\n")
-        else
-            # Initialize the message
-            (*send_msg).header.msg_type = 42
-            (*send_msg).header.flags = MSG_FLAG_NONE
-            (*send_msg).header.seq = 0
-            (*send_msg).header.payload_len = 10
-
-            let payload_str: *u8 = c"Hello IPC!"
-            var i: i32 = 0
-            while i < 10
-                (*send_msg).payload[i] = *(payload_str + i as i64)
-                i = i + 1
-
-            klog("  [4] Sending message...\n")
-            let send_result: i32 = channel_send(pair.endpoint_a, send_msg, 1)
-            klog("  Send result: ")
-            klog_dec(send_result as i64)
-            klog("\n")
-
-            # Allocate receive buffer
-            klog("  [5] Allocating recv message on heap...\n")
-            let recv_msg: *Message = kalloc(4096) as *Message
-            if recv_msg == 0 as *Message
-                klog("  Failed to allocate recv_msg!\n")
-            else
-                var sender: u32 = 0
-                klog("  [6] Receiving message...\n")
-                let recv_result: i32 = channel_recv(pair.endpoint_b, recv_msg, @sender)
-                klog("  Recv result: ")
-                klog_dec(recv_result as i64)
-                klog(", msg_type=")
-                klog_dec((*recv_msg).header.msg_type as i64)
-                klog(", sender=")
-                klog_dec(sender as i64)
-                klog("\n")
-
-                # Check payload
-                klog("  Payload: ")
-                var shown: i64 = (*recv_msg).header.payload_len as i64
-                if shown > 20
-                    shown = 20
-                klog(StrView { ptr: @(*recv_msg).payload[0], len: shown })
-                klog("\n")
-
-                if (*recv_msg).header.msg_type == 42 and sender == 1
-                    klog("  IPC test PASSED!\n")
-                else
-                    klog("  IPC test FAILED!\n")
-
-                kfree(recv_msg as *u8)
-
-            kfree(send_msg as *u8)
-
-        # Close channels - skip for now due to page fault
-        # channel_close(pair.endpoint_a)
-        # channel_close(pair.endpoint_b)
-        klog("  (channel close skipped)\n")
-    else
-        klog("  Channel creation failed!\n")
-
-    # Note: channel_debug_print causes page fault - skipped for now
-    # channel_debug_print()
+# Closing endpoint A breaks the pipe for B; closing B as well frees the
+# channel and the message still queued on it, so a third close finds it free
+# and the heap is intact. Skipped "due to page fault" until AGAST #1887: a
+# queue entry was allocated 16 bytes short of a QueuedMessage, so queueing
+# one wrote over the next heap block.
+fn channel_close_self_test(pair: ChannelPair) -> bool
+    if pair.endpoint_a == 0 as *ChannelEndpoint
+        return false
+    let msg: *Message = kalloc(sizeof(Message) as u64) as *Message
+    if msg == 0 as *Message
+        return false
+    (*msg).header.payload_len = 0
+    # Left on B's queue, for closing B to free
+    let queued: i32 = channel_send(pair.endpoint_a, msg, IPC_TEST_SENDER)
+    let close_a: i32 = channel_close(pair.endpoint_a)
+    let send_b: i32 = channel_send(pair.endpoint_b, msg, IPC_TEST_RECEIVER)
+    let close_b: i32 = channel_close(pair.endpoint_b)
+    let close_again: i32 = channel_close(pair.endpoint_b)
+    kfree(msg as *u8)
+    let heap_ok: bool = heap_check() == 0
+    klog("  queued ")
+    klog_dec(queued as i64)
+    klog(", close a ")
+    klog_dec(close_a as i64)
+    klog(", send to closed peer ")
+    klog_dec(send_b as i64)
+    klog(", close b ")
+    klog_dec(close_b as i64)
+    klog(", close freed ")
+    klog_dec(close_again as i64)
+    if not heap_ok
+        klog(", HEAP CORRUPT")
+    klog("\n")
+    return heap_ok and queued == 0 and close_a == 0 and send_b == Errno.Pipe as i32 and close_b == 0 and close_again == Errno.BadF as i32
 
 # RAM above 4 GiB (AGAST #4183): pmm hands out pages from the top of RAM and
 # the kernel reaches them through the physmap. Takes HIGH_TEST_PAGES pages
@@ -309,39 +255,53 @@ fn pmm_high_memory_self_test() -> bool
     klog(" PASSED\n")
     return true
 
-# Memory and IPC self-tests, in boot order.
-pub fn postinit_self_tests(has_boot_info: bool)
-    if has_boot_info
-        vmm_self_test()
-        higher_half_self_test()
-        heap_self_test()
-        ipc_self_test()
-        # A leak here is a regression the boot tests must catch (#1443):
-        # they fail on KERNEL PANIC, not on a FAILED line.
-        if not munmap_self_test()
-            klog("\n*** KERNEL PANIC ***\n")
-            klog("munmap self-test failed\n")
-            halt_loop()
-        # A failed mmap must not leak what it mapped before failing (#3552).
-        if not mmap_failure_self_test()
-            klog("\n*** KERNEL PANIC ***\n")
-            klog("mmap failure self-test failed\n")
-            halt_loop()
-        # RAM above 4 GiB is allocatable and reachable (#4183).
-        if not pmm_high_memory_self_test()
-            klog("\n*** KERNEL PANIC ***\n")
-            klog("pmm above-4G self-test failed\n")
-            halt_loop()
-        # mmap over a live mapping must not leak the pages it covers (#4114).
-        if not mmap_overlap_self_test()
-            klog("\n*** KERNEL PANIC ***\n")
-            klog("mmap overlap self-test failed\n")
-            halt_loop()
-        # The kernel-chosen cursor must not land on a live mapping (#4142).
-        if not mmap_cursor_self_test()
-            klog("\n*** KERNEL PANIC ***\n")
-            klog("mmap cursor self-test failed\n")
-            halt_loop()
+var boot_tests_passed: i32 = 0
+var boot_tests_failed: i32 = 0
+
+fn boot_test_result(name: StrView, ok: bool)
+    if ok
+        boot_tests_passed = boot_tests_passed + 1
+        klog("[boot-test] PASS ")
+    else
+        boot_tests_failed = boot_tests_failed + 1
+        klog("[boot-test] FAIL ")
+    klog(name)
+    klog("\n")
+
+# The boot-test mode self-tests, in order (AGAST #1887). The gate's list of
+# names is BOOT_TESTS in tools/test_tier1_boot.sh.
+pub fn boot_self_tests()
+    klog("\n=== Boot-test mode: kernel self-tests ===\n")
+    boot_test_result("vmm", vmm_self_test())
+    boot_test_result("higher-half", higher_half_self_test())
+    boot_test_result("heap", heap_self_test())
+    let pair: ChannelPair = channel_create(IPC_TEST_SENDER, IPC_TEST_RECEIVER)
+    boot_test_result("ipc", ipc_self_test(pair))
+    boot_test_result("channel-close", channel_close_self_test(pair))
+    boot_test_result("channel-debug-print", channel_debug_print() == 0)
+    # A leak here is a regression (#1443); a failed mmap must not leak what
+    # it mapped (#3552); RAM above 4 GiB is allocatable and reachable
+    # (#4183); mmap over a live mapping must not leak (#4114); the
+    # kernel-chosen cursor must not land on a live mapping (#4142).
+    boot_test_result("munmap", munmap_self_test())
+    boot_test_result("mmap-failure", mmap_failure_self_test())
+    boot_test_result("pmm-above-4g", pmm_high_memory_self_test())
+    boot_test_result("mmap-overlap", mmap_overlap_self_test())
+    boot_test_result("mmap-cursor", mmap_cursor_self_test())
+    boot_test_result("elf-loader", test_elf_loader() == 0)
+    # Disk 0 still reads after the initramfs load (no disk: no test)
+    let blk_dev: *VirtioBlkDevice = virtio_blk_get_device()
+    if blk_dev != 0 as *VirtioBlkDevice
+        boot_test_result("virtio-blk-read", virtio_blk_test(blk_dev) == 0)
+    klog("[boot-test] ")
+    klog_dec(boot_tests_passed as i64)
+    klog(" passed, ")
+    klog_dec(boot_tests_failed as i64)
+    klog(" failed\n")
+    if boot_tests_failed != 0
+        klog("\n*** KERNEL PANIC ***\n")
+        klog("boot-test mode: a kernel self-test failed\n")
+        halt_loop()
 
 # ============================================================================
 # Diagnostics (after SYSCALL setup)
@@ -559,17 +519,11 @@ fn nvme_msix_check()
     klog("\n")
 
 fn virtio_blk_check()
-    # VirtIO Block device already initialized early (for initramfs loading)
-    # Just run a test if it's available
-    klog("\n=== VirtIO Block Device ===\n")
+    # Initialized early, for the initramfs; its read test is a boot-test
+    # mode self-test (boot_self_tests)
     let blk_dev: *VirtioBlkDevice = virtio_blk_get_device()
     if blk_dev != 0 as *VirtioBlkDevice
-        klog("  (already initialized for initramfs)\n")
-        # Run a basic read test to verify it's still working
-        virtio_blk_test(blk_dev)
         virtio_blk_msix_check(blk_dev)
-    else
-        klog("  No VirtIO Block device found (add -drive to QEMU)\n")
 
 # Disk 0's MSI-X wait (AGAST #3631): read VIRTIO_BLK_MSIX_READS sectors
 # polled (IF=0), then again with interrupts on, when each request sleeps on
@@ -614,7 +568,7 @@ fn virtio_blk_msix_check(dev: *VirtioBlkDevice)
     else
         klog(", data: DIFFERENT\n")
 
-# PCI listing, block device and ELF loader checks, in boot order. The
+# PCI listing and MSI-X interrupt checks, in boot order. The
 # network self-tests are a boot option (AGAST #4335): when the loader did
 # not find the boot volume's \harland\net-selftest marker (every boot except
 # QEMU's NIC gate), the NIC is left alone until init is up, so a misbehaving
@@ -633,6 +587,3 @@ pub fn postinit_diagnostics(run_net_selftests: bool, run_net_responder: bool)
     nvme_msix_check()
 
     virtio_blk_check()
-
-    # Test ELF loader (validates structures and parsing)
-    test_elf_loader()

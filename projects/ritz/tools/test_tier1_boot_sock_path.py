@@ -42,12 +42,16 @@ FAKE_QEMU = textwrap.dedent("""\
     except OSError as e:
         sys.exit(f"qemu-system-x86_64: -monitor {mon}: {e}")
     s.listen(1)
+    # the kernel's banner and boot-test self-tests (\\harland\\boot-test,
+    # #1887), then its ring dump repeating both (\\harland\\klog-dump, #1885)
+    names = ("vmm higher-half heap ipc channel-close channel-debug-print munmap "
+             "mmap-failure pmm-above-4g mmap-overlap mmap-cursor elf-loader virtio-blk-read").split()
+    log = ("\\n========================================\\n    Hello from Harland!\\n========================================\\n"
+           + "".join(f"[boot-test] PASS {n}\\n" for n in names)
+           + f"[boot-test] {len(names)} passed, 0 failed\\n")
     with open(serial, "a") as f:
-        # the kernel's banner, then its ring dump (\\harland\\klog-dump, #1885)
-        f.write("\\n========================================\\n    Hello from Harland!\\n========================================\\n"
-                "\\n=== RING BUFFER DUMP (kernel log) ===\\n"
-                "\\n========================================\\n    Hello from Harland!\\n========================================\\n"
-                "\\n=== END RING BUFFER ===\\n"
+        f.write(log + "\\n=== RING BUFFER DUMP (kernel log) ===\\n" + log
+                + "\\n=== END RING BUFFER ===\\n"
                 "[OK] VirtIO input device\\n")
     s.settimeout(20)
     c, _ = s.accept()

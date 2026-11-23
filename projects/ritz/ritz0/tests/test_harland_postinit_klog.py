@@ -19,6 +19,14 @@ kernel_main (#2118/#2130/#2143), and the branch's ring_write_byte grew a
 defensive clamp that would change behaviour. #1887 will gate the self-tests
 later; this move doesn't touch what they do or print.
 
+#1887 gated them: boot_self_tests runs only in boot-test mode (the
+\\harland\\boot-test marker, or `boot-test` on the multiboot2 cmdline), logs
+one "[boot-test] PASS|FAIL <name>" line per test, and panics on a failure;
+tools/test_tier1_boot.sh asserts the lines. The virtio-blk read and ELF
+loader checks moved from the diagnostics into it, and channel_close /
+channel_debug_print, skipped as page faults, now run. kernel_main is at most
+80 SLOC.
+
 The serial output order is part of the behaviour, so kernel_main still calls
 the self-tests, prints "Kernel initialized successfully.", sets up SYSCALL,
 then runs the diagnostics: two postinit entry points, in that order.
@@ -58,28 +66,24 @@ KLOG_CONSTS = {"RING_BUFFER_SIZE"}
 
 # postinit.ritz: two entry points, each running its checks in this order.
 POSTINIT_ENTRIES = {
-    "postinit_self_tests": ["vmm_self_test", "higher_half_self_test", "heap_self_test", "ipc_self_test"],
-    "postinit_diagnostics": ["pci_print_all_devices", "network_dhcp_ping", "virtio_blk_check",
-                             "test_elf_loader"],
+    "boot_self_tests": ["vmm_self_test", "higher_half_self_test", "heap_self_test", "ipc_self_test",
+                        "channel_close_self_test", "channel_debug_print", "test_elf_loader",
+                        "virtio_blk_test"],
+    "postinit_diagnostics": ["pci_print_all_devices", "network_dhcp_ping", "virtio_blk_check"],
 }
 POSTINIT_FNS = {"vmm_self_test", "higher_half_self_test", "heap_self_test", "ipc_self_test",
-                "network_dhcp_ping", "virtio_blk_check"}
+                "channel_close_self_test", "network_dhcp_ping", "virtio_blk_check"}
 
 # One marker line per moved block, as it is printed. Each must leave main.ritz
 # and appear, unchanged, in postinit.ritz.
 MOVED_LINES = [
     r'klog("\nTesting Virtual Memory...\n")',
-    r'klog("  VMM test PASSED!\n")',
     r'klog("\nTesting Higher-Half Mapping...\n")',
-    r'klog("  Higher-half mapping PASSED!\n")',
     r'klog("\nTesting Kernel Heap...\n")',
-    r'klog("  Heap test PASSED!\n")',
     r'klog("\nTesting IPC Channels...\n")',
-    r'klog("  IPC test PASSED!\n")',
     r'klog("\n=== PCI Devices ===\n")',
     r'klog("\n=== Initializing Network Stack ===\n")',
     r'klog("\n  Got IP! Pinging gateway...\n")',
-    r'klog("\n=== VirtIO Block Device ===\n")',
     "virtio_blk_test(blk_dev)",
     "test_elf_loader()",
 ]
@@ -88,7 +92,9 @@ MOVED_LINES = [
 # #1885 added the opt-in klog ring dump before run_init (+4 SLOC: the
 # dump_klog_ring flag, its boot-flag read and the guarded ring_dump call).
 KERNEL_MAIN_SLOC_BEFORE = 402
-KERNEL_MAIN_SLOC_AFTER_MAX = 244
+# #1887: kernel_main is a sequence of init phases, each its own fn; the
+# acceptance bound is 80 SLOC.
+KERNEL_MAIN_SLOC_AFTER_MAX = 80
 MAIN_SLOC_BEFORE = 595
 MAIN_SLOC_AFTER_MAX = 380
 
@@ -145,9 +151,21 @@ def test_postinit_module_defines_the_self_tests():
     assert POSTINIT_FNS <= set(fns), sorted(POSTINIT_FNS - set(fns))
     for entry, steps in POSTINIT_ENTRIES.items():
         _calls_in_order(_body(code, entry), steps)
-    # The memory/IPC self-tests still only run with boot info.
-    body = _body(code, "postinit_self_tests")
-    assert body.index("if has_boot_info") < body.index("vmm_self_test(")
+    # Each self-test's verdict is a logged PASS/FAIL line, not just its own
+    # detail lines, and a failure panics (#1887).
+    body = _body(code, "boot_self_tests")
+    assert body.count("boot_test_result(") >= 13, body
+    assert '"channel-close", channel_close_self_test(pair)' in body
+    assert '"channel-debug-print", channel_debug_print() == 0' in body
+    assert body.index("if boot_tests_failed != 0") < body.index("halt_loop()")
+
+
+def test_no_self_test_call_is_skipped():
+    """#1887: channel_close and channel_debug_print were commented out "due
+    to page fault"; neither may come back as a comment."""
+    text = POSTINIT.read_text()
+    assert not re.search(r"#\s*channel_(close|debug_print)\(", text)
+    assert "skipped for now" not in text and "close skipped" not in text
 
 
 def test_network_self_tests_are_opt_in():
@@ -199,17 +217,18 @@ def test_main_defines_none_of_it():
 def test_main_imports_what_it_calls():
     code = _code(MAIN)
     assert _imports_from(code, "klog") == {"ring_clear", "ring_dump", "klog", "klog_dec", "klog_hex"}
-    assert _imports_from(code, "postinit") == {"postinit_self_tests", "postinit_diagnostics"}
+    assert _imports_from(code, "postinit") == {"boot_self_tests", "postinit_diagnostics"}
 
 
 def test_kernel_main_keeps_the_boot_order():
-    """Self-tests, the success banner, SYSCALL setup, diagnostics, the opt-in
-    ring dump (#1885), then init: the same serial order as before the move."""
+    """Self-tests (boot-test mode only, #1887), the success banner, SYSCALL
+    setup, diagnostics, the opt-in ring dump (#1885), then init: the same
+    serial order as before the move."""
     body = _body(_code(MAIN), "kernel_main")
-    assert "postinit_self_tests(has_boot_info)" in body
+    assert re.search(r"^    if boot_test\n        boot_self_tests\(\)$", body, re.M), body
     # \b: fs_syscall_init() runs earlier and must not match syscall_init().
     steps = [
-        r"\bpostinit_self_tests\(has_boot_info\)",
+        r"\bboot_self_tests\(\)",
         re.escape(r'klog("\nKernel initialized successfully.\n")'),
         r"\bsyscall_init\(\)",
         r"\bpostinit_diagnostics\(run_net_selftests, run_net_responder\)",

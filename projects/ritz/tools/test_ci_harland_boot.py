@@ -156,6 +156,8 @@ echo "$@" >> "$STUB_LOG"
 prev=""
 for a in "$@"; do
     if [ "$prev" = "-serial" ]; then printf '%b' "$FAKE_SERIAL" > "${a#file:}"; fi
+    # The ESP's files, relative to it (boot options are marker files there).
+    case "$a" in *fat:rw:*) d="${a#*fat:rw:}"; (cd "$d" && find . -type f | sed 's|^|ESP |') >> "$STUB_LOG" ;; esac
     prev="$a"
 done
 if [ "${FAKE_POWEROFF:-0}" = 1 ]; then sleep 1; exit 0; fi
@@ -203,10 +205,26 @@ PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
 # The native ESP carries \\harland\\klog-dump, so the kernel dumps its crash
 # ring before init: the dump must be exactly the kernel's serial output up to
 # it, from the banner on (AGAST #1885).
+# The boot-test mode (AGAST #1887): the ESP's \\harland\\boot-test marker (GRUB:
+# the `boot-test` cmdline word) makes the kernel run its self-tests, one
+# "[boot-test] PASS|FAIL <name>" line each and a summary. The gate requires
+# every name in BOOT_TESTS to pass, among them channel-close and
+# channel-debug-print, which the kernel used to skip as page faults.
+BOOT_TESTS = (
+    "vmm", "higher-half", "heap", "ipc", "channel-close", "channel-debug-print",
+    "munmap", "mmap-failure", "pmm-above-4g", "mmap-overlap", "mmap-cursor",
+    "elf-loader", "virtio-blk-read",
+)
+BOOT_TEST_OK = "".join(f"[boot-test] PASS {t}\n" for t in BOOT_TESTS) + (
+    f"[boot-test] {len(BOOT_TESTS)} passed, 0 failed\n"
+)
 KERNEL_BANNER = r"\n========================================\n    Hello from Harland!\n========================================\n"
 RING_DUMP_START = r"\n=== RING BUFFER DUMP (kernel log) ===\n"
 RING_DUMP_END = r"\n=== END RING BUFFER ===\n"
-RING_OK = KERNEL_BANNER + RING_DUMP_START + KERNEL_BANNER + RING_DUMP_END
+# The kernel's log up to the dump (its boot-test lines included), then the
+# dump repeating it.
+RING_OK = (KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_START
+           + KERNEL_BANNER + BOOT_TEST_OK + RING_DUMP_END)
 PASSED = RING_OK + BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + SUITE_PASSED + INIT_EXIT
 
 
@@ -815,3 +833,64 @@ def test_build_passes_the_compiler_to_rz(tree):
     calls = log.read_text().splitlines()
     assert calls and calls[0] == "build harland --compiler ritz1_selfhosted"
     assert all(c.endswith("--compiler ritz1_selfhosted") for c in calls), calls
+
+
+# --------------------------------------------------------------------------
+# Boot-test mode (AGAST #1887): the kernel's self-tests are asserted
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_native_esp_carries_the_boot_test_marker(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "ESP ./harland/boot-test" in (tree["tmp"] / "stub.log").read_text()
+    assert f"PASS (native): {len(BOOT_TESTS)} kernel boot self-tests passed" in r.stdout
+
+
+def test_grub_boots_pass_boot_test_on_the_cmdline():
+    """GRUB has no ESP marker for the kernel to see: the multiboot2 cmdline
+    carries the same option."""
+    text = (REPO / BOOT_SCRIPT).read_text()
+    assert "multiboot2 /boot/harland.elf boot-test;" in text
+
+
+@pytest.mark.integration
+def test_no_boot_test_summary_fails(tree):
+    """A kernel that ran no self-tests (or never reached the summary) fails."""
+    r = _run(tree, PASSED.replace(BOOT_TEST_OK, ""))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (native): no boot-test summary" in r.stdout
+
+
+@pytest.mark.integration
+def test_a_failed_boot_test_fails(tree):
+    serial = PASSED.replace("PASS heap\n", "FAIL heap\n").replace(
+        f"{len(BOOT_TESTS)} passed, 0 failed", f"{len(BOOT_TESTS) - 1} passed, 1 failed"
+    )
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (native): boot self-tests failed: heap" in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", ["channel-close", "channel-debug-print"])
+def test_a_skipped_boot_test_fails(tree, name):
+    """The two IPC calls the kernel skipped as page faults must run: a boot
+    that leaves one out fails even with a clean summary."""
+    serial = PASSED.replace(f"[boot-test] PASS {name}\n", "").replace(
+        f"{len(BOOT_TESTS)} passed", f"{len(BOOT_TESTS) - 1} passed"
+    )
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"FAIL (native): boot self-tests missing: {name}" in r.stdout
+
+
+@pytest.mark.integration
+def test_boot_test_lines_repeated_by_the_ring_dump_count_once(tree):
+    """The \\harland\\klog-dump ring dump repeats the kernel's log, its
+    [boot-test] lines included: the gate reads them only before the dump."""
+    assert PASSED.count("[boot-test] PASS heap") == 2
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"PASS (native): {len(BOOT_TESTS)} kernel boot self-tests passed" in r.stdout
