@@ -14,7 +14,8 @@ measurement and the pytest suite found are pinned here too:
   generic impl's (`W_bump`) has none, and is refused in the emitter's and
   ritz1's words, not as "Unknown function".
 - `println` / `eprintln` / `write` / `writeln` with an interpolated literal
-  are the emitter's own; with a plain one they're ordinary names.
+  are the emitter's own; with a plain one they're ordinary names.  The
+  placeholders' names are checked, located (AGAST #4594).
 - `m.K`, `m.f()` and a `m.K =>` arm keep §15.3's `module.item` wording
   (LANGUAGE_SPEC.md pins it), not "Unknown identifier: m".
 - A const's value is the const folder's: it refuses an unknown name there,
@@ -117,6 +118,33 @@ class TestResolverCorpusBugs:
         # Without a placeholder the emitter calls whatever fn is in scope.
         src = f"fn f(w: i32)\n    {call}\n"
         assert any("Unknown function" in e for e in names(src)), names(src)
+
+    # AGAST #4594: an interpolated literal's placeholders are expressions,
+    # and their names are checked, located, as any other expression's.
+    @pytest.mark.parametrize("call,col", [
+        ('print("a {nope}\\n")', 15), ('println("{nope}")', 15),
+        ('eprintln("{nope}")', 16), ('write(w, "{nope}")', 15),
+        ('writeln(w, "{nope}")', 17), ('format_into(w, "{nope}")', 21),
+    ], ids=["print", "println", "eprintln", "write", "writeln", "format_into"])
+    def test_unknown_placeholder_name_is_unknown(self, call, col):
+        errs = names(f"fn f(w: i32)\n    {call}\n")
+        assert len(errs) == 1 and errs[0].endswith(": Unknown identifier: nope"), errs
+        assert errs[0].startswith("<stdin>:2:"), errs
+
+    def test_placeholder_names_in_scope_are_known(self):
+        src = ("const K: i32 = 1\nfn g() -> i32\n    2\n\n"
+               "fn f(w: i32, x: i32)\n    println(\"{x} {K} {g()} {x + K:08x}\")\n")
+        assert names(src) == []
+
+    def test_hidden_name_in_a_placeholder_reported_once(self):
+        # import_visibility's walker is name_resolver's: it walked the
+        # placeholders itself, and must not walk them twice now.
+        from import_visibility import _HiddenUses
+        mod = parse("fn f()\n    println(\"{c_val()}\")\n", "main.ritz")
+        walker = _HiddenUses({"c_val": ("c", "b", mod.items[0], "c.ritz")}, "main.ritz")
+        walker._collect_definitions(mod)
+        walker._check_item(mod.items[0])
+        assert len(walker.found) == 1 and "`c_val` is undefined" in walker.found[0], walker.found
 
     def test_await_operand_still_walked(self):
         src = "fn main() -> i32\n    let v: i32 = await nope()\n    v\n"

@@ -141,9 +141,7 @@ class _HiddenUses(NameResolver):
             # name_resolver skips it: check it as an annotation's type is.
             for arg in expr.args:
                 self._check_expr(arg, scope)
-        elif isinstance(expr, rast.InterpString):
-            for part in expr.exprs:
-                self._check_expr(part, scope)
+        # An interpolated literal's placeholders are name_resolver's walk.
         super()._check_expr(expr, scope)
 
     def _check_pattern(self, pattern: rast.Pattern, scope: Scope):

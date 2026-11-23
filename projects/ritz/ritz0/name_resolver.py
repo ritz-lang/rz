@@ -530,6 +530,12 @@ class NameResolver:
             self._check_expr(expr.target, scope)
             self._check_expr(expr.value, scope)
 
+        elif isinstance(expr, rast.InterpString):
+            # print / println / write / format_into("..{x}.."): each
+            # placeholder is an expression, located in the literal (#4594).
+            for placeholder in expr.exprs:
+                self._check_expr(placeholder, scope)
+
         # Literals (IntLit, FloatLit, StringLit, CharLit, BoolLit, NilLit)
         # don't need checking
 
