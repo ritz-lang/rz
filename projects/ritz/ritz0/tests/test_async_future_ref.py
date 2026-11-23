@@ -29,12 +29,12 @@ import pytest
 from test_ref_into_value import COMPILERS
 from test_table_rows import assert_refusals, assert_runs
 
-# `slow` is Pending twice: its awaited poll source answers the reserved
-# POLL_PENDING (-4096) until its third call.  RUNS counts how often its body finished, so a finished future that
-# ran again shows.
+# `slow` is Pending twice: its awaited poll source answers `None` until its
+# third call.  RUNS counts how often its body finished, so a finished future
+# that ran again shows.
 _SLOW = (
     "var TICKS: i32 = 0\nvar RUNS: i32 = 0\n\n"
-    "fn tick() -> i32\n    TICKS = TICKS + 1\n    if TICKS < 3\n        return 0 - 4096\n    0\n\n"
+    "fn tick() -> Option<i32>\n    TICKS = TICKS + 1\n    if TICKS < 3\n        return None\n    Some(0)\n\n"
     "async fn slow() -> i64\n    let t: i32 = await tick()\n    RUNS = RUNS + 1\n    5000000000 + t as i64\n\n"
     "async fn neg() -> i32\n    let t: i32 = await tick()\n    RUNS = RUNS + 1\n    t - 1\n\n"
 )

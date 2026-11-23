@@ -40,9 +40,9 @@ ROWS = {
     # A unit async fn: the poll state with no result to deliver.
     "unit_async_call": ("async fn tick(x: i32)\n    pass\n\n"
                         "async fn go(x: i32)\n    await tick(x)\n\n" + _MAIN),
-    # A hand-written poll source: an ordinary call polled until not -1, in
+    # A hand-written poll source: an ordinary call polled until `Some`, in
     # the `__poll_k` let the lowering synthesises.
-    "poll_source": ("fn ready(x: i32) -> i32\n    x\n\n"
+    "poll_source": ("fn ready(x: i32) -> Option<i32>\n    Some(x)\n\n"
                     "async fn go(x: i32) -> i32\n    await ready(x)\n\n" + _MAIN),
     # `await` in a sync fn: the emitter's poll loop.  Already located.
     "sync_await": _FETCH + "fn main() -> i32\n    await fetch(3)\n",

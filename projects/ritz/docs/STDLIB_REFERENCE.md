@@ -1957,8 +1957,7 @@ Async TCP networking using io_uring.
 Drives one future, or one blocking operation at a time, on an io_uring of its
 own. For many concurrent tasks, use [async.tasks](#asynctasks).
 
-**Constants**:
-- `POLL_PENDING`: -4096. A poll function returns this while it is suspended; any other value, including -1, is Ready. The value is reserved because no syscall result can be it: Linux results are errors in [-4095, -1] or successes >= 0 (AGAST #4485).
+**Poll sources**: `rt.poll_read(fd, buf, offset)` and `rt.poll_write(fd, buf, offset)` return `Option<i32>`, the type `await` reads in an async fn (LANGUAGE_SPEC §16.1): `None` while the operation is in flight (the future is suspended on it), then `Some(result)`, whatever the result is: 0 at EOF, -1 for -EPERM, -12 if no SQE was free (AGAST #4558).
 
 ```ritz
 import ritzlib.uring
@@ -1984,11 +1983,10 @@ struct Runtime
 ```
 
 `waker_io_ready`, not the value of `waker_io_result`, says whether a completion
-is waiting, so a read at EOF returns 0 rather than being resubmitted. A
-hand-written poll function that returns an -EPERM result it was handed is
-Ready(-1) rather than being read as Pending (AGAST #2328): it returns
-`POLL_PENDING` while Pending, and any other value — including -1 — is its
-Ready result (AGAST #4485).
+is waiting, so a read at EOF returns `Some(0)` rather than being resubmitted
+(AGAST #2328). A hand-written poll function returns `None` while Pending and
+`Some(v)` when Ready, so an -EPERM result it was handed is `Some(-1)`, never
+read as Pending (AGAST #4558).
 
 `spawn`/`run_spawned` queue several held futures on one runtime (LARB R79).
 Each queued task has its own waker slot (`SpawnTask`): while a task's poll

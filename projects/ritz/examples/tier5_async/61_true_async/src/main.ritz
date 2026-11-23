@@ -15,24 +15,11 @@ import ritzlib.async.runtime
 import ritzlib.fmt
 
 # ============================================================================
-# Poll enum
+# Poll encoding
 # ============================================================================
 
-# For now, we'll use a simple i32 encoding:
-# Any other value = Ready(value)
-# -4096 (POLL_PENDING) = Pending, the reserved value no syscall result can be
-# This is a simplification until we have proper enum support in codegen
-
-fn poll_pending() -> i32
-    return 0 - 4096
-
-fn is_ready(poll: i32) -> i32
-    if poll == (0 - 4096)
-        return 0
-    return 1
-
-fn unwrap_ready(poll: i32) -> i32
-    return poll
+# A hand-written poll source returns `Option<i32>`: `None` = Pending,
+# `Some(v)` = Ready(v), the same contract `await` expects (AGAST #4558).
 
 # ============================================================================
 # Test 1: Simple async that returns immediately (Ready)
@@ -42,9 +29,9 @@ fn unwrap_ready(poll: i32) -> i32
 struct ImmediateFuture
     value: i32
 
-fn immediate_poll(self: *ImmediateFuture) -> i32
+fn immediate_poll(self: *ImmediateFuture) -> Option<i32>
     # Always ready with the stored value
-    return self.value
+    return Some(self.value)
 
 fn test_immediate_ready() -> i32
     print("test_immediate_ready... ")
@@ -53,13 +40,14 @@ fn test_immediate_ready() -> i32
     future.value = 42
 
     # Poll should return Ready(42)
-    let result: i32 = immediate_poll(@future)
+    let poll: Option<i32> = immediate_poll(@future)
 
-    if is_ready(result) == 0
+    if poll.is_none()
         print("FAIL: expected Ready, got Pending\n")
         return 1
 
-    if unwrap_ready(result) != 42
+    let result: i32 = poll.unwrap()
+    if result != 42
         print("FAIL: expected 42, got {result as i64}\n")
         return 1
 
@@ -75,11 +63,11 @@ struct CountdownFuture
     remaining: i32
     value: i32
 
-fn countdown_poll(self: *CountdownFuture) -> i32
+fn countdown_poll(self: *CountdownFuture) -> Option<i32>
     if self.remaining > 0
         self.remaining = self.remaining - 1
-        return poll_pending()
-    return self.value
+        return None
+    return Some(self.value)
 
 fn test_countdown_future() -> i32
     print("test_countdown_future... ")
@@ -89,29 +77,30 @@ fn test_countdown_future() -> i32
     future.value = 100
 
     # First 3 polls should return Pending
-    var poll1: i32 = countdown_poll(@future)
-    if is_ready(poll1) != 0
+    let poll1: Option<i32> = countdown_poll(@future)
+    if poll1.is_some()
         print("FAIL: poll 1 should be Pending\n")
         return 1
 
-    var poll2: i32 = countdown_poll(@future)
-    if is_ready(poll2) != 0
+    let poll2: Option<i32> = countdown_poll(@future)
+    if poll2.is_some()
         print("FAIL: poll 2 should be Pending\n")
         return 1
 
-    var poll3: i32 = countdown_poll(@future)
-    if is_ready(poll3) != 0
+    let poll3: Option<i32> = countdown_poll(@future)
+    if poll3.is_some()
         print("FAIL: poll 3 should be Pending\n")
         return 1
 
     # 4th poll should be Ready(100)
-    var poll4: i32 = countdown_poll(@future)
-    if is_ready(poll4) == 0
+    let poll4: Option<i32> = countdown_poll(@future)
+    if poll4.is_none()
         print("FAIL: poll 4 should be Ready\n")
         return 1
 
-    if unwrap_ready(poll4) != 100
-        print("FAIL: expected 100, got {poll4 as i64}\n")
+    let value: i32 = poll4.unwrap()
+    if value != 100
+        print("FAIL: expected 100, got {value as i64}\n")
         return 1
 
     print("OK\n")
@@ -125,13 +114,13 @@ fn test_countdown_future() -> i32
 fn block_on_countdown(future: *CountdownFuture) -> i32
     var poll_count: i32 = 0
     loop
-        let result: i32 = countdown_poll(future)
+        let result: Option<i32> = countdown_poll(future)
         poll_count += 1
         if poll_count > 100
             # Safety limit
             return -1
-        if is_ready(result) != 0
-            return unwrap_ready(result)
+        if result.is_some()
+            return result.unwrap()
         # In real async, we would wait for I/O here
         # For this test, we just continue polling
 

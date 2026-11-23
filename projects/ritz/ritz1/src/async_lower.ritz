@@ -39,13 +39,13 @@
 #     finished, its value stored in the future's `__result`, of the fn's
 #     declared type (a unit fn's future has none).  `await` polls until true,
 #     then reads the field.  An awaited expression that is not an async fn's
-#     call is a hand-written poll source: an i32, POLL_PENDING (-4096) while
-#     Pending and any other value, including -1, as its Ready result (#4485).
+#     call is a hand-written poll source: an `Option<i32>`, `None` while
+#     Pending and `Some(v)` once Ready, so any i32 is a result (AGAST #4558).
 #   * `async fn main` is `__main_future` + `main$poll`, and a sync `main`
 #     polls it to completion.
 #   * `await g(..)` anywhere else (a sync fn) polls g's future until Ready,
-#     through a private `__await_g` this file defines; `await` of a sync call
-#     is the call.
+#     through a private `__await_g` this file defines; a poll source can't be
+#     awaited there, since nothing can suspend (AGAST #4558).
 #   * A bare call to an async fn, as a statement or into a typed let, only
 #     builds its future: refused (LANGUAGE_SPEC §16.2, #1395), in ritz0's words.
 #
@@ -190,17 +190,19 @@ fn al_binary(op: OpKind, left: *Expr, right: *Expr) -> *Expr
     e.right = right
     e
 
-# `0 - 1`: a future's `__state` DONE marker, written as ritz0 writes it.  This
-# is NOT the poll source's Pending: the two are separate encodings (AGAST #4485).
+# `0 - 1`: a future's `__state` DONE marker, written as ritz0 writes it.  It
+# is the future's own state, never a value: a poll source's Pending is its
+# `Option<i32>`'s `None` (AGAST #4558).
 fn al_pending(span: SrcSpan) -> *Expr
     al_binary(OpKind.Sub, al_int(0, span), al_int(1, span))
 
-# `0 - 4096`: the reserved Pending value a hand-written poll source returns.
-# Linux syscall results are errors in [-4095, -1] or successes >= 0, so -4096
-# can never be a genuine result: a real -1 reads as Ready(-1), not Pending
-# (AGAST #4485).  ritz0 must reserve the same value (async_transform_v2.py).
-fn al_poll_source_pending(span: SrcSpan) -> *Expr
-    al_binary(OpKind.Sub, al_int(0, span), al_int(4096, span))
+# `recv.name()`: a method call with no args.
+fn al_method0(recv: *Expr, name_sv: StrView, span: SrcSpan) -> *Expr
+    let e: *Expr = al_expr(ExprKind.Method, span)
+    e.left = recv
+    e.ident_ptr = name_sv.ptr
+    e.ident_len = name_sv.len as i32
+    e
 
 fn al_call(name_sv: StrView, args: *Expr, span: SrcSpan) -> *Expr
     var name: *u8 = name_sv.ptr
@@ -1057,6 +1059,11 @@ fn al_rw_expr(a: *AlFn, e: *Expr) -> *Expr
             call.func_name_len = hf.name_len
             call.next = e.next
             return call
+        # Anything else is a poll source, which only an async fn can await:
+        # it may be Pending, and nothing here can suspend (AGAST #4558).
+        var m: String = string_new()
+        m.push_str("`await` of a poll source outside an async fn: a poll source can only be awaited in an async fn, which can suspend while it is Pending")
+        al_refuse(a, @&m, e.span)
         op.next = e.next
         return op
     match k
@@ -1234,12 +1241,15 @@ fn al_poll_not_ready(polled: *Expr) -> *Expr
     e.operand = polled
     e
 
-# Whether an awaited poll source's i32 `answer` is Pending: `answer == -4096`.
+# Whether an awaited poll source's `answer` is Pending: `answer.is_none()`.
 fn al_poll_source_is_pending(answer: *Expr) -> *Expr
-    al_binary(OpKind.Eq, answer, al_poll_source_pending(answer.span))
+    al_method0(answer, StrView { ptr: (c"is_none"), len: (7) as i64 }, answer.span)
+
+# A Ready poll source's value: `answer.unwrap()`, read once it is not None.
+fn al_poll_source_value(answer: *Expr) -> *Expr
+    al_method0(answer, StrView { ptr: (c"unwrap"), len: (6) as i64 }, answer.span)
 
 # Whether a future's `__state` says its body has finished: `__state == -1`.
-# Kept separate from the poll source's Pending sentinel (AGAST #4485).
 fn al_state_is_done(state: *Expr) -> *Expr
     al_binary(OpKind.Eq, state, al_pending(state.span))
 
@@ -2241,8 +2251,9 @@ fn al_if_value(a: *AlFn, e: *Expr)
 # future into a field once, and the resume state polls it until it answers
 # true (R78), so a Pending one is polled again on the next poll, not rebuilt;
 # then it reads the future's `__result`.  Anything else awaited is a
-# hand-written poll source, evaluated again at each poll until it is not
-# POLL_PENDING (-4096); any other value, including -1, is its Ready result.
+# hand-written poll source, an `Option<i32>` evaluated again at each poll
+# until it is `Some(v)`, and the await is `v`: any i32, -1 and -4096 among
+# them (AGAST #4558).
 fn al_lower_await(a: *AlFn, aw: *Expr, d: *AlDest)
     let k: i32 = a.nawaits
     a.nawaits += 1
@@ -2303,6 +2314,7 @@ fn al_lower_await(a: *AlFn, aw: *Expr, d: *AlDest)
             return
         al_deliver(a, al_result_of(al_self_field(StrView { ptr: (inner.ident_ptr), len: (inner.ident_len) as i64 }, span), span), d)
         return
+    al_not_source(a, inner, span)
     var anl: i32 = 0
     let answer: *u8 = al_numbered(c"__poll_", k, @anl)
     let polled: *Expr = al_hoist(a, inner)
@@ -2310,9 +2322,28 @@ fn al_lower_await(a: *AlFn, aw: *Expr, d: *AlDest)
     let resume: *AlBlock = al_new_block(a)
     al_goto(a, resume, span)
     a.cur = resume
-    al_emit(a, al_decl(StrView { ptr: (answer), len: (anl) as i64 }, TypeKind.I32, StrView { ptr: (null), len: (0) as i64 }, polled, 1, a.file, span))
+    al_emit(a, al_decl(StrView { ptr: (answer), len: (anl) as i64 }, TypeKind.Struct, StrView { ptr: (c"Option$i32"), len: (10) as i64 }, polled, 1, a.file, span))
     al_emit(a, al_if(al_poll_source_is_pending(al_ident(StrView { ptr: (answer), len: (anl) as i64 }, span)), al_poll_pending_stmt(span), span))
-    al_deliver(a, al_ident(StrView { ptr: (answer), len: (anl) as i64 }, span), d)
+    al_deliver(a, al_poll_source_value(al_ident(StrView { ptr: (answer), len: (anl) as i64 }, span)), d)
+
+# `await f(..)` in an async fn, f a sync fn: a poll source, so f must return
+# `Option<i32>` (AGAST #4558).  Refused at the await otherwise, in ritz0's
+# words (async_transform_v2.py poll_source_refusal).
+fn al_not_source(a: *AlFn, inner: *Expr, span: SrcSpan)
+    if inner.kind != ExprKind.Call or inner.func_name == null
+        return
+    let f: *FnDef = al_find_fn(StrView { ptr: (inner.func_name), len: (inner.func_name_len) as i64 })
+    if f == null or f.is_async == 1
+        return
+    if f.return_type_name != null and al_eq(StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }, StrView { ptr: (c"Option$i32"), len: (10) as i64 }) == 1
+        return
+    var m: String = string_new()
+    m.push_str("`await ")
+    m.push_span(Span<u8> { ptr: (inner.func_name), len: (inner.func_name_len as i64) as i64 })
+    m.push_str("(..)`: a poll source returns `Option<i32>` (`None` while Pending, `Some(v)` when Ready); `")
+    m.push_span(Span<u8> { ptr: (inner.func_name), len: (inner.func_name_len as i64) as i64 })
+    m.push_str("` does not")
+    al_refuse(a, @&m, span)
 
 fn al_deliver(a: *AlFn, v: *Expr, d: *AlDest)
     v.next = null
@@ -3241,14 +3272,16 @@ fn al_bare_fn(f: *FnDef) -> i32
     al_bare_stmts(g_al_path, f.body, (f.return_type != TypeKind.Void) as i32)
 
 # Awaits in a sync fn: polled to completion in place.
-fn al_sync_fn(f: *FnDef)
+# Answers the errors it reported (a poll source awaited there, AGAST #4558).
+fn al_sync_fn(f: *FnDef) -> i32
     if f.body == null
-        return
+        return 0
     var a: AlFn
     al_fn_init(@a, f, 1)
     # Its locals, so `await p` (p a held future, R79) knows p's future type.
     al_an_stmts(@a, f.body, 1)
     f.body = al_rw_stmts(@a, f.body)
+    a.errs
 
 # R79: the built-in `Future`, "some async fn's future", which only a
 # reference can hold.  It is the futures' one header field, the poll fn
@@ -3527,13 +3560,13 @@ pub fn async_lower_module(m: *Module, path: *u8) -> i32
     # A helper this adds is appended, and has no await of its own.
     f = m.functions
     while f != null
-        al_sync_fn(f)
+        errs += al_sync_fn(f)
         f = f.next
     var ib: *ImplBlock = m.impls
     while ib != null
         var method: *FnDef = ib.methods
         while method != null
-            al_sync_fn(method)
+            errs += al_sync_fn(method)
             method = method.next
         ib = ib.next
-    0
+    errs

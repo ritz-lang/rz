@@ -9,13 +9,12 @@ See `examples/75_async_reference/src/main.ritz` for the gold standard implementa
 ## Core Concepts
 
 ### Poll Encoding
-A hand-written **poll source** (any `i32`-returning call awaited directly) uses:
-- `POLL_PENDING` (`-4096`) = Pending (operation not complete, will be resumed)
-- any other value, **including `-1`** = Ready (operation complete, result is the return value)
+A hand-written **poll source** (an `Option<i32>`-returning call awaited
+directly in an async fn) uses:
+- `None` = Pending (operation not complete, will be resumed)
+- `Some(v)` = Ready, and `await` is `v`: any i32, `-1` and `-4096` included
 
-`-4096` is reserved because no syscall result can be it: Linux results are
-errors in `[-4095, -1]` or successes `>= 0`, so a genuine `-1` (e.g. `-EPERM`)
-is a result, not Pending (AGAST #4485).
+No i32 is reserved: the status is the `Option`'s (AGAST #4558).
 
 ### Future Generation
 When you write:
@@ -91,15 +90,14 @@ struct IoReadState
 ```
 
 ### Step 2: Poll Function
-`runtime_poll_read` submits the read and returns Pending; once `block_on` has
-seen the completion, the next call returns its result, whatever the value (0 at
-EOF, and -1 for -EPERM, included: -1 is not the Pending sentinel, which is
-`POLL_PENDING` = -4096, AGAST #4485). Do not read `rt.waker_io_result` yourself: before AGAST #2328 the
-examples did, and a result of 0 looked like "none yet".
+`rt.poll_read` submits the read and returns `None` (Pending); once `block_on`
+has seen the completion, the next call returns `Some(result)`, whatever the
+value (0 at EOF, -1 for -EPERM). Do not read `rt.waker_io_result` yourself:
+before AGAST #2328 the examples did, and a result of 0 looked like "none yet".
 
 ```ritz
-fn io_read_source(state: *IoReadState) -> i32
-    return runtime_poll_read(state.rt, state.fd, Span<u8> { ptr: (state.buf), len: (state.len) as i64 }, 0)
+fn io_read_source(state: *IoReadState) -> Option<i32>
+    return state.rt.poll_read(state.fd, Span<u8> { ptr: (state.buf), len: (state.len) as i64 }, 0)
 ```
 
 ### Step 3: Async Wrapper
@@ -140,8 +138,8 @@ From `ritzlib/async/runtime.ritz`:
 
 | Function | Purpose |
 |----------|---------|
-| `runtime_poll_read(rt, fd, buf, len, offset)` | Async file/pipe read |
-| `runtime_poll_write(rt, fd, buf, len, offset)` | Async file/pipe write |
+| `rt.poll_read(fd, buf, offset) -> Option<i32>` | Async file/pipe read |
+| `rt.poll_write(fd, buf, offset) -> Option<i32>` | Async file/pipe write |
 
 For sockets, use the `task_*` operations in `ritzlib/async/tasks.ritz`.
 
@@ -184,8 +182,8 @@ async fn connection_handler(state: *ConnectionState) -> i32
 2. **No Pin** - Futures are regular stack values
 3. **No async runtime** - Use `block_on` with `Runtime` directly
 4. **Poll encoding** - A generated future's poll returns `bool`; a hand-written
-   poll source returns i32 with `POLL_PENDING` (`-4096`) while waiting and any
-   other value — including `-1` — as its result (AGAST #4485)
+   poll source returns `Option<i32>`, `None` while waiting and `Some(v)` with
+   its result, any i32 (AGAST #4558)
 
 ## Testing
 

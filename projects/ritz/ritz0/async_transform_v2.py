@@ -148,6 +148,19 @@ def _literal_operand(expr: rast.Expr) -> bool:
     return _untyped_int_literal(expr) or fold_literal_i64(expr) is not None
 
 
+def poll_source_refusal(name: str) -> str:
+    """The words for `await name(..)` of a sync fn that is no poll source (AGAST
+    #4558); ritz1's al_not_source says the same."""
+    return (f"`await {name}(..)`: a poll source returns `Option<i32>` (`None` while Pending, "
+            f"`Some(v)` when Ready); `{name}` does not")
+
+
+def poll_source_outside_async() -> str:
+    """The words for awaiting a poll source outside an async fn (AGAST #4558)."""
+    return ("`await` of a poll source outside an async fn: a poll source can only be awaited "
+            "in an async fn, which can suspend while it is Pending")
+
+
 def held_future_fn(expr: rast.Expr, local_types: Dict[str, Optional[rast.Type]],
                    fn_sigs: Dict[str, rast.FnDef]) -> Optional[rast.FnDef]:
     """The async fn whose future the local `expr` holds (`var p = f(args)`,
@@ -462,13 +475,13 @@ class PollAbi:
     DONE = -1
 
     # An awaited expression that is not an async fn's call is a hand-written
-    # poll source, evaluated again at each poll: an i32, PENDING while waiting
-    # and its raw result (any value, including -1) when Ready.  Linux results
-    # are errors in [-4095, -1] or successes >= 0, so -4096 is reserved: a
-    # genuine -1 is Ready(-1), not Pending (AGAST #4485).  ritz1 reserves the
-    # same value (async_lower.ritz's al_poll_source_pending).
+    # poll source, evaluated again at each poll: an `Option<i32>`, `None`
+    # while Pending and `Some(v)` once Ready.  The status is the Option's, so
+    # every i32 is a genuine result, -1 and -4096 among them (AGAST #4558;
+    # #4485's reserved -4096 is gone).  The await's value is the i32.  ritz1
+    # lowers it alike (async_lower.ritz's al_lower_await).
     EXPR_TYPE = 'i32'
-    PENDING = -4096
+    SOURCE_TYPE = 'Option'
 
     def __init__(self, span: rast.Span, fn_name: Optional[str] = None):
         self.span = span
@@ -511,11 +524,30 @@ class PollAbi:
         """Whether an inner generated poll's answer, `polled`, is Pending."""
         return rast.UnaryOp(span=self.span, op='!', operand=polled)
 
+    @classmethod
+    def source_type(cls, span) -> rast.NamedType:
+        """A poll source's type, `Option<i32>`."""
+        return rast.NamedType(span=span, name=cls.SOURCE_TYPE,
+                              args=[rast.NamedType(span=span, name=cls.EXPR_TYPE)])
+
+    @classmethod
+    def is_source_type(cls, ty: Optional[rast.Type]) -> bool:
+        """Whether `ty` is `Option<i32>`, as written or as the monomorphised
+        `Option$i32` an import of ritzlib.option has made it by now."""
+        if not isinstance(ty, rast.NamedType):
+            return False
+        if ty.name == f"{cls.SOURCE_TYPE}${cls.EXPR_TYPE}" and not ty.args:
+            return True
+        return (ty.name == cls.SOURCE_TYPE and len(ty.args) == 1
+                and isinstance(ty.args[0], rast.NamedType) and ty.args[0].name == cls.EXPR_TYPE)
+
     def expr_is_pending(self, answer: rast.Expr) -> rast.Expr:
-        """Whether an awaited poll source's i32 `answer` is Pending (-4096)."""
-        sentinel = rast.BinOp(span=self.span, op='-', left=rast.IntLit(span=self.span, value=0),
-                              right=rast.IntLit(span=self.span, value=-self.PENDING))
-        return rast.BinOp(span=self.span, op='==', left=answer, right=sentinel)
+        """Whether an awaited poll source's `answer` is Pending: `answer.is_none()`."""
+        return rast.MethodCall(span=self.span, expr=answer, method='is_none', args=[])
+
+    def expr_value(self, answer: rast.Expr) -> rast.Expr:
+        """A Ready poll source's value: `answer.unwrap()`, read once it is not None."""
+        return rast.MethodCall(span=self.span, expr=answer, method='unwrap', args=[])
 
     def pending(self) -> rast.Stmt:
         """Return Pending from this poll."""
@@ -1421,6 +1453,7 @@ class _CfgBuilder:
                 value=rast.Call(span=inner.span, func=rast.Ident(span=inner.func.span, name=fn_name), args=args)))
             self._resume_on(fn_name, self.rw.self_field(fut, self.span), aw, dest)
             return
+        self.gen._refuse_non_source(inner, aw)
         answer = f"__poll_{k}"
         polled = self.hoist(inner)
         resume = self.new_block()
@@ -1428,11 +1461,11 @@ class _CfgBuilder:
         self.cur = resume
         # The await's span locates the poll source's call (#3800).
         self.emit(rast.LetStmt(span=aw.span, name=answer,
-                               type=self.gen._make_named_type(PollAbi.EXPR_TYPE), value=polled))
+                               type=PollAbi.source_type(self.span), value=polled))
         self.emit(rast.ExprStmt(span=self.span, expr=rast.If(
             span=self.span, cond=self.abi.expr_is_pending(rast.Ident(span=self.span, name=answer)),
             then_block=rast.Block(span=self.span, stmts=[self.abi.pending()], expr=None), else_block=None)))
-        self.deliver(rast.Ident(span=self.span, name=answer), dest)
+        self.deliver(self.abi.expr_value(rast.Ident(span=self.span, name=answer)), dest)
 
     def _resume_on(self, fn_name: str, fut: rast.Expr, aw: rast.Await, dest):
         """A resume state polling `fn_name`'s future, the place `fut`, until
@@ -1566,6 +1599,20 @@ class TrueAsyncGenerator:
         if held is not None and held.ret_type is not None:
             return held.ret_type
         return self._make_named_type(PollAbi.EXPR_TYPE)
+
+    def _refuse_non_source(self, inner: rast.Expr, aw: rast.Await):
+        """A sync fn's call awaited in an async fn is a poll source, so it
+        must return `Option<i32>` (AGAST #4558): refused at the await when the
+        fn it calls is declared to return anything else."""
+        if not (isinstance(inner, rast.Call) and isinstance(inner.func, rast.Ident)):
+            return
+        fn = self.fn_sigs.get(inner.func.name)
+        if fn is None or getattr(fn, 'is_async', False):
+            return
+        if PollAbi.is_source_type(fn.ret_type):
+            return
+        name = inner.func.name
+        raise AsyncLoweringError(poll_source_refusal(name), aw.span)
 
     def _held_future(self, expr: rast.Expr) -> Optional[rast.FnDef]:
         """The async fn whose future the local or param `expr` holds."""

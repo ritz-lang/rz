@@ -38,6 +38,7 @@ import type_order
 import match_coverage
 from metadata import type_to_string
 from async_transform_v2 import (generate_state_machine, AsyncStateMachine, UntypedAsyncLocal, AsyncLoweringError,
+                                poll_source_outside_async,
                                 PollAbi, future_type_name, poll_fn_name, async_fn_of_future_type)
 from const_eval import ConstEvaluator, ConstEvalError, fold_literal_i64
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
@@ -10637,7 +10638,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         1. Inside async fn: Handled by async_transform, should not reach here
         2. Outside async fn: Generate poll loop for async function calls
 
-        For non-async calls, just evaluate the inner expression (synchronous MVP).
+        Anything else is a poll source, refused here: only an async fn can
+        suspend while it is Pending (AGAST #4558).
         """
         inner_expr = await_expr.expr
         while isinstance(inner_expr, rast.Grouped):
@@ -10656,8 +10658,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         if held is not None:
             return self._emit_poll_until_ready(held, self._emit_lvalue_addr(inner_expr))
 
-        # Non-async call: just evaluate the inner expression (MVP behavior)
-        return self._emit_expr(inner_expr)
+        # Anything else is a poll source (AGAST #4558), which only an async fn
+        # can await: it may be Pending, and nothing here can suspend.
+        raise EmitError(poll_source_outside_async(), await_expr.span)
 
     def _emit_await_poll_loop(self, fn_name: str, args: list) -> ir.Value:
         """Generate a poll loop for awaiting an async function outside async context.

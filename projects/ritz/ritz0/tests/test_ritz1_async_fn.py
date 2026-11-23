@@ -48,15 +48,15 @@ _FORTY_TWO = "async fn g() -> i32\n    42\n\n"
 _STORE = "fn store(p: *i32, v: i32)\n    *p = v\n\n"
 _DBL = "async fn dbl(x: i32) -> i32\n    x * 2\n\n"
 
-# A poll fn that is Pending (the reserved -4096 sentinel) twice, then Ready(30).
+# A poll fn that is Pending (`None`) twice, then Ready(30).
 _TICK = """\
 var g_n: i32 = 0
 
-fn tick() -> i32
+fn tick() -> Option<i32>
     g_n = g_n + 1
     if g_n < 3
-        return 0 - 4096
-    g_n * 10
+        return None
+    Some(g_n * 10)
 
 async fn waits() -> i32
     let v: i32 = await tick()
@@ -88,7 +88,8 @@ RUNS = {
                      "    let b: i32 = await dbl(a)\n    let c: i32 = await dbl(b)\n    c / 2\n\n"
                      + _main("    let r: i32 = await chain(10)\n    r\n"), 40),
     # 53_async's test 4: an await nested in the awaited call, as the tail.
-    "nested_tail_await": ("fn get_value(x: i32) -> i32\n    x * 10\n\nfn add_one(x: i32) -> i32\n    x + 1\n\n"
+    "nested_tail_await": ("fn get_value(x: i32) -> Option<i32>\n    Some(x * 10)\n\n"
+                          "fn add_one(x: i32) -> Option<i32>\n    Some(x + 1)\n\n"
                           "async fn e(x: i32) -> i32\n    await add_one(await get_value(x))\n\n"
                           + _main("    let r: i32 = await e(4)\n    r\n"), 41),
     # 55_async_state_machine's test 4: an await in each arm of the tail `if`.
@@ -112,12 +113,12 @@ RUNS = {
                        "async fn go(x: i32) -> i32\n    let v = await fetch(x + 1)\n    v + 1\n\n"
                        + _main("    let r: i32 = await go(4)\n    r\n"), 6),
     # 64_async_io's shape: a struct pointer param handed to a poll fn.
-    "struct_ptr_param": ("struct St\n    n: i32\n\nfn st_poll(s: *St) -> i32\n    s.n\n\n"
+    "struct_ptr_param": ("struct St\n    n: i32\n\nfn st_poll(s: *St) -> Option<i32>\n    Some(s.n)\n\n"
                          "async fn rd(s: *St) -> i32\n    let r: i32 = await st_poll(s)\n    r + 1\n\n"
                          + _main("    var s: St = St { n: 40 }\n    let r: i32 = await rd(@s)\n    r\n"), 41),
     # blocking_fs's shape: arithmetic on a primitive pointer param, held in the
     # future, strides by its pointee (4 here, not 1).
-    "ptr_param_arith": ("fn id(x: i32) -> i32\n    x\n\n"
+    "ptr_param_arith": ("fn id(x: i32) -> Option<i32>\n    Some(x)\n\n"
                         "async fn at(p: *i32, i: i64) -> i32\n    let v: i32 = await id(*(p + i))\n    v\n\n"
                         + _main("    var xs: [3]i32 = [10, 20, 30]\n    let r: i32 = await at(@xs[0], 2)\n    r\n"), 30),
     # `return await` as the last statement is the fn's value.
@@ -133,10 +134,6 @@ RUNS = {
     # The future is a value: an executor keeps it and polls it.
     "future_kept": ("async fn f()\n    pass\n\n"
                     + _main("    var p = f()\n    future_poll(@&p)\n    5\n"), 5),
-    # `await` of a sync fn is its call, in a sync fn, and in a match arm.
-    "await_sync_fn": ("fn h() -> i32\n    1\n\nfn k() -> i32\n    let v: i32 = await h()\n    v\n\n"
-                      "fn m() -> i32\n    match h()\n        1 => 3\n        _ => await h()\n\n"
-                      + _main("    k() * 10 + m()\n"), 13),
 }
 
 

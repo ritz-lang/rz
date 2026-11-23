@@ -190,14 +190,15 @@ struct PipeOp
     len: i32
     polls: i32
 
-# Poll sources over the runtime's poll operations.  A plain fn returning the
-# i32 poll encoding is awaited directly by the compiler-generated future; there
-# is no hand-written adapter to cast to *Future (LARB R79, AGAST #4009).
-fn pipe_read_source(op: *PipeOp) -> i32
+# Poll sources over the runtime's poll operations.  A plain fn returning
+# `Option<i32>` (None = Pending, AGAST #4558) is awaited directly by the
+# compiler-generated future; there is no hand-written adapter to cast to
+# *Future (LARB R79, AGAST #4009).
+fn pipe_read_source(op: *PipeOp) -> Option<i32>
     op.polls = op.polls + 1
     return op.rt.poll_read(op.fd, Span<u8> { ptr: (op.buf), len: (op.len) as i64 }, 0)
 
-fn pipe_write_source(op: *PipeOp) -> i32
+fn pipe_write_source(op: *PipeOp) -> Option<i32>
     op.polls = op.polls + 1
     return op.rt.poll_write(op.fd, Span<u8> { ptr: (op.buf), len: (op.len) as i64 }, 0)
 
@@ -301,8 +302,7 @@ fn test_block_on_write_reaches_the_fd() -> i32
 # Test 5b: a result of 0 or -1 is a result, not "none yet" (AGAST #2328)
 # ============================================================================
 #
-# 0 is a read at EOF or a zero-length write; -1 is -EPERM, which is also the
-# POLL_PENDING encoding.  Before #2328 the runtime took a stored result of 0 to
+# 0 is a read at EOF or a zero-length write; -1 is -EPERM.  Before #2328 the runtime took a stored result of 0 to
 # mean "nothing has completed", so an EOF read was resubmitted for ever.
 
 [[test]]
@@ -380,9 +380,8 @@ fn test_block_on_zero_length_write_returns_zero() -> i32
 
 # io_uring will not easily fail a pipe read with -EPERM, so stand in for
 # runtime_wait_for_io: record -1 as the completed operation's result.  The
-# source takes it as a result and clears the flag; only block_on's read of the
-# poll encoding would confuse -1 with Pending, and the generated futures never
-# see this path (LARB R79).
+# source takes it as Some(-1) and clears the flag: the Option, not the value,
+# says Ready (AGAST #4558).
 [[test]]
 fn test_poll_source_eperm_result_is_not_pending() -> i32
     var fds: [2]i32
@@ -406,13 +405,16 @@ fn test_poll_source_eperm_result_is_not_pending() -> i32
     rt.waker_io_result = -1
     rt.waker_io_ready = 1
 
-    let result: i32 = pipe_read_source(@op)
+    let polled: Option<i32> = pipe_read_source(@op)
     let cleared: i32 = rt.waker_io_ready
     rt.destroy()
     sys_close(fds[0])
     sys_close(fds[1])
 
-    if result != -1
+    if polled.is_none()
+        prints("FAIL: an -EPERM completion should be Ready, not Pending\n")
+        return 1
+    if polled.unwrap() != -1
         prints("FAIL: an -EPERM completion should be returned as -1, not read as Pending\n")
         return 1
     if op.polls != 1
@@ -432,8 +434,8 @@ fn test_poll_source_eperm_result_is_not_pending() -> i32
 # violation: a Pending poll that registered no waker would stay unfinished for
 # ever (see test_block_on_future.ritz).  The failure exits the process, so fork.
 
-fn always_pending(x: i32) -> i32
-    return POLL_PENDING
+fn always_pending(x: i32) -> Option<i32>
+    return None
 
 async fn never_ready() -> i32
     let v: i32 = await always_pending(0)

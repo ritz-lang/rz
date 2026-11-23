@@ -6841,13 +6841,41 @@ struct, or a `-1` that is a genuine answer and not Pending.
 
 A compiled future's poll answers `bool`, so no result is ever confused with
 Pending.  An `await` whose operand is not an `async fn`'s call and not a held
-future is a **hand-written poll source**: an `i32`-returning call evaluated
-again at each poll.  Its Pending is the reserved value `-4096`
-(`POLL_PENDING` in `ritzlib.async.runtime`), which no syscall result can be:
-Linux results are errors in `[-4095, -1]` or successes `>= 0`.  So a genuine
-`-1` (e.g. `-EPERM`) is Ready(-1), not Pending (AGAST #4485).  Every value
-other than `POLL_PENDING`, including `-1`, is the Ready result.  Both
-frontends and the runtime reserve this same value.
+future is a **hand-written poll source**: a call returning `Option<i32>`,
+evaluated again at each poll.  `None` is Pending and `Some(v)` is Ready, and
+the `await` is `v`, an `i32`.  The status is the `Option`'s, so every `i32` is
+a genuine result: `-1` (`-EPERM`) and `-4096` among them (AGAST #4558; the
+reserved `-4096` of AGAST #4485 is gone).  Both frontends lower it alike:
+
+```text
+let __poll_k: Option<i32> = <source>     # in the await's resume state
+if __poll_k.is_none()
+    return false                         # Pending: polled again next time
+<the await's value> = __poll_k.unwrap()
+```
+
+A future's own `__state` keeps `-1` as its "finished" marker; that is the
+future's state, never a value, so it reserves nothing.  Awaiting a sync fn
+that does not return `Option<i32>` is refused at the `await`: "`await
+plain(..)`: a poll source returns `Option<i32>` (`None` while Pending,
+`Some(v)` when Ready); `plain` does not".
+
+```ritz
+var g_n: i32 = 0
+
+fn later() -> Option<i32>
+    g_n = g_n + 1
+    if g_n < 3
+        return None              # Pending
+    Some(0 - 4096)               # Ready(-4096): any i32 is a result
+
+async fn go() -> i32
+    let v: i32 = await later()
+    v + 4096
+
+fn main() -> i32
+    await go()
+```
 
 `await` drives a future to completion in place (§16.2).  An executor drives a
 held future through the built-in `future_poll` and then reads the result with
@@ -7115,10 +7143,20 @@ The built-in `future_poll(f: @&Future) -> bool` drives a future one step: it
 returns `false` while the future is Pending and `true` once it has finished.
 The result is read with `await`, not through the poll (LARB R78).
 
-A hand-written poll source — any `i32`-returning call awaited directly — says
-Pending by returning the reserved `POLL_PENDING` (`-4096`), and says Ready by
-returning any other value, its result.  A genuine `-1` is a result, not
-Pending (AGAST #4485).
+A hand-written poll source — an `Option<i32>`-returning call awaited directly
+in an async fn — says Pending with `None` and Ready with `Some(v)`, whatever
+`v` is (§16.1, AGAST #4558).  Only an async fn can await one: it may be
+Pending, and nothing else can suspend.  Outside an async fn such an `await` is
+refused: "`await` of a poll source outside an async fn: a poll source can only
+be awaited in an async fn, which can suspend while it is Pending".
+
+```ritz expect-error="a poll source can only be awaited in an async fn"
+fn ready() -> Option<i32>
+    Some(1)
+
+fn main() -> i32
+    await ready()
+```
 
 ritzlib's runtime drives one future on one io_uring, waiting on the ring
 whenever a poll answers Pending (`ritzlib/async/runtime.ritz`):
