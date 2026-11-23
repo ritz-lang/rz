@@ -424,20 +424,27 @@ def test_briefing_says_spawn_does_not_create_tmpdir_dropin():
 
 
 @pytest.mark.unit
-def test_briefing_says_install_writes_harness_pin_directly():
-    """AGAST #4476: `adele install --harness deepseek` writes
-    `95-adele-harness.conf` itself; a hand-written `90-` harness drop-in
-    sorts before that pin and is overridden, so do not write one."""
+def test_briefing_says_fleet_runs_default_harness_with_bettercomp_config():
+    """Aaron, 2026-11-23 (AGAST #4569, replacing #4476's DeepSeek pin):
+    rooms run the default harness and model, with no harness drop-in, and
+    every room's room.env carries CLAUDE_CONFIG_DIR for the bettercomp
+    config. The three places a stale DeepSeek pin hides are named so a
+    room stuck on `unrecognized_model` can be cleared."""
     para = _briefing_paragraph("**Fleet model")
     flat = " ".join(para.split()).lower()
-    # The generated pin is named, with the install flags that write it.
-    assert "95-adele-harness.conf" in flat
-    assert "--harness deepseek --model deepseek-flash" in flat
-    # The obsolete hand-written drop-in is named only as a "do not".
-    assert "do not hand-write" in flat
+    # Default harness/model: no flags, no drop-in, no model= on a SPAWN.
+    assert "default harness and model" in flat
+    assert "do **not** pass `--harness` / `--model`" in flat
+    assert "do **not** install any harness drop-in" in flat
     assert "90-adele-deepseek.conf" in flat
-    assert "sorts before" in flat
-    assert "overridden" in flat
+    assert "95-adele-harness.conf" in flat
+    assert "model=" in flat
+    # The config dir every room must carry, and where it goes.
+    assert "claude_config_dir=/home/aaron/.claude-bettercomp" in flat
+    assert "room.env" in flat
+    # The three hiding places of a stale DeepSeek pin.
+    assert "room.env" in flat and "drop-in" in flat and "rooms.json" in flat
+    assert "clear all three" in flat
 
 
 @pytest.mark.unit
