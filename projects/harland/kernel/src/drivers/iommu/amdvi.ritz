@@ -12,14 +12,17 @@
 #   - finds the ACPI IVRS table and parses it (drivers/iommu/ivrs.ritz);
 #   - picks GA mode (128-bit IRTEs) if every IOMMU has it, and XT (32-bit
 #     x2APIC destinations) in x2APIC mode if every IOMMU has that too;
-#   - builds one device table covering device IDs 0..last, every entry
-#     DMA pass-through (V, TV, Mode 0, IR, IW) and interrupts blocked (IV,
-#     IntCtl 00b: aborted) until a table is set;
-#   - gives every IOMMU its own command buffer, points it at the device
-#     table, turns it on and invalidates everything it may have cached.
+#   - builds a device table for each PCI segment with an IOMMU, covering
+#     device IDs 0..the last its IVHDs name, every entry DMA pass-through
+#     (V, TV, Mode 0, IR, IW) and interrupts blocked (IV, IntCtl 00b:
+#     aborted) until a table is set;
+#   - gives every IOMMU its own command buffer, points it at its segment's
+#     device table, turns it on and invalidates everything it may have
+#     cached.
 # amdvi_ir_set then gives the device its 256-entry IRT on first use (DTE
 # IntCtl 10b, INVALIDATE_DEVTAB_ENTRY), writes the IRTE and issues
-# INVALIDATE_INTERRUPT_TABLE + COMPLETION_WAIT on every IOMMU.
+# INVALIDATE_INTERRUPT_TABLE + COMPLETION_WAIT on every IOMMU of the
+# device's segment.
 #
 # The handles are drivers/iommu/dmar.ritz's (I/O APIC pin N: N, MSI vector
 # V: 128 + (V & 127)), so the boot logs read the same under either vendor.
@@ -27,8 +30,9 @@
 # amdvi_ir_set takes no lock: today only the BSP calls it, during boot. A
 # caller on another CPU needs one around the table writes and the buffer.
 #
-# Only PCI segment 0: a device ID is 16 bits and the table is the
-# segment's.
+# Requester IDs are segment << 16 | bus:dev.fn (ivrs.ritz amdvi_sid): a
+# device ID is 16 bits and names a DTE in its segment's table, so a
+# multi-segment EPYC gets one table per segment (AGAST #4339).
 
 import io { memory_barrier, cpu_pause }
 import serial { prints, serial_print_dec, serial_print_hex }
@@ -38,8 +42,10 @@ import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import drivers.acpi.tables { acpi_find_table }
 import drivers.iommu.ivrs {
     ACPI_SIG_IVRS, IVRS_DEVID_NONE,
-    ivrs_parse, ivrs_ivhd_type, ivrs_num_units, ivrs_unit_base, ivrs_unit_segment, ivrs_unit_efr,
+    ivrs_parse, ivrs_ivhd_type, ivrs_num_units, ivrs_unit_base, ivrs_unit_efr,
     ivrs_last_devid, ivrs_num_special, ivrs_ioapic_devid, ivrs_alias,
+    ivrs_num_segs, ivrs_seg_id, ivrs_seg_last_devid, ivrs_unit_seg_index, ivrs_seg_index,
+    ivrs_sid_seg, ivrs_sid_rid,
     DTE_SIZE, AMDVI_IRT_ENTRIES,
     dte_q0_passthrough, dte_q2_blocked, dte_q2_remap, dte_q2_is_remap, dte_q2_irt,
     amdvi_devtab_reg, amdvi_devtab_pages,
@@ -62,8 +68,10 @@ var amdvi_regs: [8]u64              # kernel virtual address of each IOMMU's reg
 var amdvi_ia: [8]u8                 # EFR.IASup: INVALIDATE_ALL works
 var amdvi_cmd_phys: [8]u64          # each IOMMU's command buffer (one page)
 var amdvi_cmd_tail: [8]u32          # its next free command
-var amdvi_devtab_phys: u64 = 0
-var amdvi_devtab_last: u32 = 0      # the last device ID the table covers
+# Per PCI segment, by ivrs_seg_* index: its device table and the last
+# device ID it covers.
+var amdvi_seg_devtab_phys: [8]u64
+var amdvi_seg_last: [8]u32
 var amdvi_status_phys: u64 = 0      # COMPLETION_WAIT stores its sequence number here
 var amdvi_seq: u64 = 0
 
@@ -141,14 +149,16 @@ fn amdvi_cmd_sync(u: i32) -> bool
         cpu_pause()
     return true
 
-# Queue `lo` (a 128-bit command whose hi half is 0) on every IOMMU and wait
-# for each. False if any didn't confirm.
-fn amdvi_cmd_all(lo: u64) -> bool
+# Queue `lo` (a 128-bit command whose hi half is 0) on every IOMMU of
+# segment index `si` (the ones reading that segment's device table) and
+# wait for each. False if any didn't confirm.
+fn amdvi_cmd_seg(si: i32, lo: u64) -> bool
     var ok: bool = true
     var u: i32 = 0
     while u < amdvi_units
-        if not amdvi_cmd_submit(u, lo, 0) or not amdvi_cmd_sync(u)
-            ok = false
+        if ivrs_unit_seg_index[u] == si
+            if not amdvi_cmd_submit(u, lo, 0) or not amdvi_cmd_sync(u)
+                ok = false
         u = u + 1
     return ok
 
@@ -156,8 +166,9 @@ fn amdvi_cmd_all(lo: u64) -> bool
 # Device table and IRTEs
 # ============================================================================
 
-fn amdvi_dte(devid: u32) -> u64
-    return phys_to_virt(amdvi_devtab_phys) + (devid as u64) * DTE_SIZE
+# Device `dev`'s DTE (virtual); `dev` as amdvi_devid gives it.
+fn amdvi_dte(dev: u32) -> u64
+    return phys_to_virt(amdvi_seg_devtab_phys[(dev >> 16) as i32]) + ((dev & 0xFFFF) as u64) * DTE_SIZE
 
 fn amdvi_zero_page(p: u64)
     let v: *u64 = phys_to_virt(p) as *u64
@@ -172,21 +183,27 @@ fn amdvi_alloc_page() -> u64
         amdvi_zero_page(p)
     return p
 
-# The device ID requests from requester ID `sid` arrive with (IVRS alias
-# entries), or IVRS_DEVID_NONE if the device table doesn't cover it.
+# The device requests from requester `sid` (segment << 16 | bus:dev.fn)
+# arrive as (IVRS alias entries): its segment's index in the high 16 bits,
+# its device ID in the low 16. IVRS_DEVID_NONE if no device table covers
+# it: no IOMMU on the segment, or past the segment's last device ID.
 fn amdvi_devid(sid: u32) -> u32
-    if sid == IVRS_DEVID_NONE or sid > 0xFFFF
+    if sid == IVRS_DEVID_NONE
         return IVRS_DEVID_NONE
-    let d: u32 = ivrs_alias(sid)
-    if d > amdvi_devtab_last
+    let a: u32 = ivrs_alias(sid)
+    let si: i32 = ivrs_seg_index(ivrs_sid_seg(a))
+    if si < 0
         return IVRS_DEVID_NONE
-    return d
+    let d: u32 = ivrs_sid_rid(a)
+    if d > amdvi_seg_last[si]
+        return IVRS_DEVID_NONE
+    return ((si as u32) << 16) | d
 
-# Device `devid`'s IRT (physical), given one on first use: a zeroed page
-# (every entry RemapEn 0), then the DTE pointing at it, invalidated
-# everywhere. 0 on failure.
-fn amdvi_irt(devid: u32) -> u64
-    let q2p: *u64 = (amdvi_dte(devid) + 16) as *u64
+# Device `dev`'s IRT (physical), given one on first use: a zeroed page
+# (every entry RemapEn 0), then the DTE pointing at it, invalidated on
+# every IOMMU of its segment. 0 on failure.
+fn amdvi_irt(dev: u32) -> u64
+    let q2p: *u64 = (amdvi_dte(dev) + 16) as *u64
     let q2: u64 = volatile_load(q2p)
     if dte_q2_is_remap(q2)
         return dte_q2_irt(q2)
@@ -196,23 +213,23 @@ fn amdvi_irt(devid: u32) -> u64
     memory_barrier()
     volatile_store(q2p, dte_q2_remap(irt))
     memory_barrier()
-    if not amdvi_cmd_all(cmd_inv_dte_lo(devid))
+    if not amdvi_cmd_seg((dev >> 16) as i32, cmd_inv_dte_lo(dev & 0xFFFF))
         return 0
     return irt
 
 # Point IRTE `handle` of the device with requester ID `sid` at `vector` on
 # APIC ID `dest` (32-bit with XT, else 8-bit), and make every IOMMU drop
-# its cached copy. `level` is the source's business (the redirection
+# its cached copy (those of the device's segment). `level` is the source's business (the redirection
 # entry's trigger mode); an AMD-Vi IRTE has no trigger bit. The source
 # should be masked. Returns 0, or -1 if remapping is off, the handle or
 # device is out of range, or an IOMMU didn't confirm.
 pub fn amdvi_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -> i32
     if amdvi_on == 0 or handle >= AMDVI_IRT_ENTRIES
         return -1
-    let devid: u32 = amdvi_devid(sid)
-    if devid == IVRS_DEVID_NONE
+    let dev: u32 = amdvi_devid(sid)
+    if dev == IVRS_DEVID_NONE
         return -1
-    let irt: u64 = amdvi_irt(devid)
+    let irt: u64 = amdvi_irt(dev)
     if irt == 0
         return -1
     if amdvi_ga != 0
@@ -226,7 +243,7 @@ pub fn amdvi_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -
     else
         volatile_store((phys_to_virt(irt) + (handle as u64) * 4) as *u32, irte32(vector, dest))
     memory_barrier()
-    if not amdvi_cmd_all(cmd_inv_irt_lo(devid))
+    if not amdvi_cmd_seg((dev >> 16) as i32, cmd_inv_irt_lo(dev & 0xFFFF))
         return -1
     return 0
 
@@ -235,10 +252,10 @@ pub fn amdvi_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -
 pub fn amdvi_ir_get_dest(handle: u32, sid: u32) -> u32
     if amdvi_on == 0 or handle >= AMDVI_IRT_ENTRIES
         return 0xFFFFFFFF
-    let devid: u32 = amdvi_devid(sid)
-    if devid == IVRS_DEVID_NONE
+    let dev: u32 = amdvi_devid(sid)
+    if dev == IVRS_DEVID_NONE
         return 0xFFFFFFFF
-    let q2: u64 = volatile_load((amdvi_dte(devid) + 16) as *u64)
+    let q2: u64 = volatile_load((amdvi_dte(dev) + 16) as *u64)
     if not dte_q2_is_remap(q2)
         return 0xFFFFFFFF
     let irt: u64 = phys_to_virt(dte_q2_irt(q2))
@@ -248,7 +265,8 @@ pub fn amdvi_ir_get_dest(handle: u32, sid: u32) -> u32
         return irte_ga_dest(lo, hi)
     return irte32_dest(volatile_load((irt + (handle as u64) * 4) as *u32))
 
-# The device ID IVRS gives I/O APIC `ioapic_id`, or IVRS_DEVID_NONE.
+# The requester ID (segment << 16 | device ID) IVRS gives I/O APIC
+# `ioapic_id`, or IVRS_DEVID_NONE.
 pub fn amdvi_ioapic_sid(ioapic_id: u8) -> u32
     return ivrs_ioapic_devid(ioapic_id)
 
@@ -271,9 +289,11 @@ fn amdvi_units_disable(n: i32)
         amdvi_wcontrol(u, 0)
         u = u + 1
 
-# Turn IOMMU `u` on: command buffer, device table, control; then drop
-# whatever it cached from firmware's tables.
+# Turn IOMMU `u` on: command buffer, its segment's device table, control;
+# then drop whatever it cached from firmware's tables.
 fn amdvi_unit_enable(u: i32) -> i32
+    let si: i32 = ivrs_unit_seg_index[u]
+    let last: u32 = amdvi_seg_last[si]
     # Firmware may have left it on: off first, so the new tables take.
     let ctrl: u64 = amdvi_reg64(u, AMDVI_REG_CONTROL)
     amdvi_wcontrol(u, 0)
@@ -281,7 +301,7 @@ fn amdvi_unit_enable(u: i32) -> i32
     amdvi_wreg64(u, AMDVI_REG_CMDBUF, amdvi_cmdbuf_reg(amdvi_cmd_phys[u]))
     amdvi_wreg64(u, AMDVI_REG_CMD_HEAD, 0)
     amdvi_wreg64(u, AMDVI_REG_CMD_TAIL, 0)
-    amdvi_wreg64(u, AMDVI_REG_DEVTAB, amdvi_devtab_reg(amdvi_devtab_phys, amdvi_devtab_pages(amdvi_devtab_last)))
+    amdvi_wreg64(u, AMDVI_REG_DEVTAB, amdvi_devtab_reg(amdvi_seg_devtab_phys[si], amdvi_devtab_pages(last)))
     amdvi_wcontrol(u, amdvi_control(ctrl, amdvi_ga != 0, amdvi_xt != 0))
     let deadline: u64 = deadline_after_us(AMDVI_TIMEOUT_US)
     while (amdvi_reg32(u, AMDVI_REG_STATUS) & STATUS_CMDBUF_RUN) == 0
@@ -293,12 +313,35 @@ fn amdvi_unit_enable(u: i32) -> i32
             return amdvi_fail(u, "INVALIDATE_ALL not queued")
     else
         var d: u32 = 0
-        while d <= amdvi_devtab_last
+        while d <= last
             if not amdvi_cmd_submit(u, cmd_inv_dte_lo(d), 0) or not amdvi_cmd_submit(u, cmd_inv_irt_lo(d), 0)
                 return amdvi_fail(u, "invalidation not queued")
             d = d + 1
     if not amdvi_cmd_sync(u)
         return amdvi_fail(u, "invalidation not confirmed")
+    return 0
+
+# Allocate and fill segment index `si`'s device table: device IDs 0..the
+# segment's last, every one DMA pass-through, interrupts blocked. -1 if
+# there is no memory for it.
+fn amdvi_devtab_init(si: i32) -> i32
+    let last: u32 = ivrs_seg_last_devid[si] & 0xFFFF
+    amdvi_seg_last[si] = last
+    let pages: u64 = amdvi_devtab_pages(last)
+    let phys: u64 = pmm_alloc_contig(pages)
+    if phys == 0
+        return -1
+    amdvi_seg_devtab_phys[si] = phys
+    var p: u64 = 0
+    while p < pages
+        amdvi_zero_page(phys + p * 4096)
+        p = p + 1
+    var d: u32 = 0
+    while d <= last
+        let e: u64 = amdvi_dte(((si as u32) << 16) | d)
+        volatile_store(e as *u64, dte_q0_passthrough())
+        volatile_store((e + 16) as *u64, dte_q2_blocked())
+        d = d + 1
     return 0
 
 # Bring up interrupt remapping on every IOMMU IVRS lists. `x2apic`: the
@@ -334,8 +377,6 @@ pub fn amdvi_ir_init(x2apic: bool) -> i32
     var modes: u32 = 3
     var u: i32 = 0
     while u < n
-        if ivrs_unit_segment[u] != 0
-            return amdvi_fail(u, "PCI segment other than 0")
         let regs: u64 = vmm_map_mmio(ivrs_unit_base[u], AMDVI_MMIO_SIZE)
         if regs == 0
             return amdvi_fail(u, "registers not mappable")
@@ -351,24 +392,20 @@ pub fn amdvi_ir_init(x2apic: bool) -> i32
         u = u + 1
     amdvi_ga = (modes & 1) as u8
     amdvi_xt = ((modes >> 1) & 1) as u8
-    # The device table: every device DMA pass-through, interrupts blocked.
-    amdvi_devtab_last = ivrs_last_devid & 0xFFFF
-    let pages: u64 = amdvi_devtab_pages(amdvi_devtab_last)
-    amdvi_devtab_phys = pmm_alloc_contig(pages)
+    # A device table per PCI segment: every device DMA pass-through,
+    # interrupts blocked.
     amdvi_status_phys = amdvi_alloc_page()
-    if amdvi_devtab_phys == 0 or amdvi_status_phys == 0
+    if amdvi_status_phys == 0
         prints("      Interrupt remapping: off (no memory for the device table)\n")
         return -1
-    var p: u64 = 0
-    while p < pages
-        amdvi_zero_page(amdvi_devtab_phys + p * 4096)
-        p = p + 1
-    var d: u32 = 0
-    while d <= amdvi_devtab_last
-        let e: u64 = amdvi_dte(d)
-        volatile_store(e as *u64, dte_q0_passthrough())
-        volatile_store((e + 16) as *u64, dte_q2_blocked())
-        d = d + 1
+    var si: i32 = 0
+    while si < ivrs_num_segs
+        if amdvi_devtab_init(si) != 0
+            prints("      Interrupt remapping: off (no memory for PCI segment ")
+            serial_print_dec(ivrs_seg_id[si] as u64)
+            prints("'s device table)\n")
+            return -1
+        si = si + 1
     memory_barrier()
     amdvi_units = n
     u = 0
@@ -381,8 +418,20 @@ pub fn amdvi_ir_init(x2apic: bool) -> i32
     amdvi_on = 1
     prints("      Interrupt remapping: AMD-Vi on, ")
     serial_print_dec(n as u64)
-    prints(" unit(s), device table at ")
-    serial_print_hex(amdvi_devtab_phys)
+    if ivrs_num_segs == 1
+        prints(" unit(s), device table at ")
+        serial_print_hex(amdvi_seg_devtab_phys[0])
+    else
+        prints(" unit(s), device tables at ")
+        si = 0
+        while si < ivrs_num_segs
+            if si > 0
+                prints(" ")
+            serial_print_hex(amdvi_seg_devtab_phys[si])
+            prints(" (segment ")
+            serial_print_dec(ivrs_seg_id[si] as u64)
+            prints(")")
+            si = si + 1
     if amdvi_xt != 0
         prints(", 32-bit x2APIC destinations (GA, XT)\n")
     else if amdvi_ga != 0

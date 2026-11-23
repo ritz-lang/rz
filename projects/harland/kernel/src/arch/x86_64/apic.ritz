@@ -26,7 +26,10 @@ import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_index_of_apic
 import arch.x86_64.idt { idt_load_current }
 import arch.x86_64.percpu { cpu_bringup, cpu_boot_stack_top, cpu_stack_alloc }
 import arch.x86_64.cpu_smp { smp_ap_run }
-import arch.x86_64.irq_dest { irq_dest_pick, irq_ext_dest_from_cpuid, ioapic_rte_hi, ioapic_rte_dest, msi_addr_lo, IRQ_DEST_NONE }
+import arch.x86_64.irq_dest {
+    irq_dest_pick, irq_ext_dest_from_cpuid, ioapic_rte_hi, ioapic_rte_dest, msi_addr_lo, IRQ_DEST_NONE,
+    IOAPIC_RTE_LEVEL, ioapic_rte_mode, ioapic_has_eoi_reg, ioapic_needs_directed_eoi, ioapic_eoi_value
+}
 import drivers.iommu.ir { ir_init, ir_enabled, ir_x2apic, ir_set, ir_get_dest, ir_ioapic_sid, ir_ioapic_rte_hi, ir_ioapic_rte_lo, ir_ioapic_rte_handle, IR_NO_HANDLE }
 import drivers.iommu.dmar { ir_handle_ioapic }
 
@@ -474,6 +477,10 @@ const IOAPIC_VER: u8 = 0x01
 const IOAPIC_ARB: u8 = 0x02
 const IOAPIC_REDTBL: u8 = 0x10    # Redirection table (0x10 + 2*n for entry n)
 
+# EOI register (MMIO offset, version 20h and up): writing a vector clears
+# Remote IRR on the level-triggered entries whose vector field it is.
+const IOAPIC_EOI: u64 = 0x40
+
 # Read I/O APIC register
 fn ioapic_read(reg: u8) -> u32
     let regsel: *u32 = ioapic_mmio as *u32
@@ -491,25 +498,55 @@ fn ioapic_write(reg: u8, value: u32) -> i32
 
 # The I/O APIC's own ID (IOAPIC_ID bits 27:24): DMAR names its source ID by it.
 var ioapic_hw_id: u8 = 0
+# Its version register: 20h and up have the EOI register.
+var ioapic_version: u32 = 0
 
-# Set up an I/O APIC redirection entry
-fn ioapic_set_irq(irq: u8, vector: u8, dest_apic: u32, masked: bool) -> i32
+# Pins ioapic_eoi knows; past these an entry can't be addressed with u8
+# register indices anyway.
+const IOAPIC_MAX_PINS: u8 = 64
+# What ioapic_eoi writes to the EOI register for each pin, or
+# IOAPIC_NO_EOI when the LAPIC's EOI broadcast already matches the entry
+# (edge, or the vector field is the vector). Set when the pin is set up, so
+# the interrupt path reads no I/O APIC register.
+const IOAPIC_NO_EOI: u16 = 0x100
+var ioapic_pin_eoi: [64]u16
+
+# Set up I/O APIC redirection entry `irq`: `vector` on APIC ID `dest_apic`,
+# `mode` its trigger and polarity bits (irq_dest.ritz ioapic_rte_mode).
+# Returns 0, or -1 with the entry left masked.
+fn ioapic_set_irq_mode(irq: u8, vector: u8, dest_apic: u32, masked: bool, mode: u32) -> i32
     let reg_lo: u8 = IOAPIC_REDTBL + irq * 2
     let reg_hi: u8 = IOAPIC_REDTBL + irq * 2 + 1
+    let level: bool = (mode & IOAPIC_RTE_LEVEL) != 0
+    if irq < IOAPIC_MAX_PINS
+        ioapic_pin_eoi[irq as i32] = IOAPIC_NO_EOI
 
     # With interrupt remapping (#4316) the entry names IRT entry `irq`, and
     # that entry the vector and the (32-bit) destination. Masked first, so
     # the pin never fires through a half-written entry.
     if ir_enabled()
         let handle: u32 = ir_handle_ioapic(irq as u32)
-        ioapic_write(reg_lo, ir_ioapic_rte_lo(vector, handle, true))
-        if ir_set(handle, vector, dest_apic, false, ir_ioapic_sid(ioapic_hw_id)) != 0
+        let lo: u32 = ir_ioapic_rte_lo(vector, handle, masked) | mode
+        ioapic_write(reg_lo, ir_ioapic_rte_lo(vector, handle, true) | mode)
+        # Under AMD-Vi the vector field is the handle, so a level pin's
+        # Remote IRR clears only through the EOI register (#4339).
+        let directed: bool = ioapic_needs_directed_eoi(lo, vector)
+        if directed and (irq >= IOAPIC_MAX_PINS or not ioapic_has_eoi_reg(ioapic_version))
+            prints("      I/O APIC: IRQ ")
+            serial_print_dec(irq as u64)
+            prints(": level-triggered needs a directed EOI, which I/O APIC version ")
+            serial_print_hex((ioapic_version & 0xFF) as u64)
+            prints(" lacks; left masked\n")
+            return -1
+        if ir_set(handle, vector, dest_apic, level, ir_ioapic_sid(ioapic_hw_id)) != 0
             prints("      I/O APIC: IRQ ")
             serial_print_dec(irq as u64)
             prints(": IRTE not set; left masked\n")
             return -1
+        if directed
+            ioapic_pin_eoi[irq as i32] = ioapic_eoi_value(lo) as u16
         ioapic_write(reg_hi, ir_ioapic_rte_hi(handle))
-        ioapic_write(reg_lo, ir_ioapic_rte_lo(vector, handle, masked))
+        ioapic_write(reg_lo, lo)
         return 0
 
     # High 32 bits: destination APIC ID bits 7:0 in 31:24, and with the
@@ -521,16 +558,64 @@ fn ioapic_set_irq(irq: u8, vector: u8, dest_apic: u32, masked: bool) -> i32
     # Bit 8-10: Delivery mode (000 = Fixed)
     # Bit 11: Destination mode (0 = Physical)
     # Bit 12: Delivery status (read-only)
-    # Bit 13: Pin polarity (0 = High active)
+    # Bit 13: Pin polarity (0 = High active), from `mode`
     # Bit 14: Remote IRR (read-only)
-    # Bit 15: Trigger mode (0 = Edge)
+    # Bit 15: Trigger mode (0 = Edge), from `mode`
     # Bit 16: Mask (1 = masked)
-    var value: u32 = vector as u32
+    var value: u32 = (vector as u32) | mode
     if masked
         value = value | 0x10000
     ioapic_write(reg_lo, value)
 
     return 0
+
+# Set up an edge-triggered, active-high I/O APIC redirection entry.
+fn ioapic_set_irq(irq: u8, vector: u8, dest_apic: u32, masked: bool) -> i32
+    return ioapic_set_irq_mode(irq, vector, dest_apic, masked, ioapic_rte_mode(false, false))
+
+# Set up a level-triggered I/O APIC redirection entry (PCI INTx pins are
+# active low). Its handler ends with lapic_eoi() and then ioapic_eoi(irq).
+# Returns 0, or -1 with the entry left masked: no IRTE, or (AMD-Vi) an
+# I/O APIC without the EOI register.
+pub fn ioapic_set_level_irq(irq: u8, vector: u8, dest_apic: u32, active_low: bool, masked: bool) -> i32
+    return ioapic_set_irq_mode(irq, vector, dest_apic, masked, ioapic_rte_mode(true, active_low))
+
+# After lapic_eoi() for level-triggered pin `irq`: when the LAPIC's EOI
+# broadcast can't match the entry (AMD-Vi: its vector field is the IRTE
+# handle), write that field to the EOI register, so Remote IRR clears and
+# the pin can fire again. Returns 1 if it wrote, else 0.
+pub fn ioapic_eoi(irq: u8) -> i32
+    if irq >= IOAPIC_MAX_PINS
+        return 0
+    let v: u16 = ioapic_pin_eoi[irq as i32]
+    if v == IOAPIC_NO_EOI
+        return 0
+    volatile_store((ioapic_mmio + IOAPIC_EOI) as *u32, v as u32)
+    return 1
+
+# Set pin `pin` up level-triggered and active low, masked (nothing drives
+# it), read the entry back and log how its EOI goes, for
+# tools/test_irq_dest_boot.sh (#4339):
+#   I/O APIC: level pin P: entry vector E for vector V, directed|broadcast EOI
+# then send that EOI once and put the pin back as ioapic_init left it.
+fn ioapic_level_selftest(pin: u8, dest: u32)
+    let vector: u8 = 32 + pin
+    if ioapic_set_level_irq(pin, vector, dest, true, true) == 0
+        let lo: u32 = ioapic_read(IOAPIC_REDTBL + pin * 2)
+        prints("      I/O APIC: level pin ")
+        serial_print_dec(pin as u64)
+        if (lo & IOAPIC_RTE_LEVEL) == 0
+            prints(": trigger mode didn't stick\n")
+        else
+            prints(": entry vector ")
+            serial_print_dec((lo & 0xFF) as u64)
+            prints(" for vector ")
+            serial_print_dec(vector as u64)
+            if ioapic_eoi(pin) != 0
+                prints(", directed EOI\n")
+            else
+                prints(", broadcast EOI\n")
+    ioapic_set_irq(pin, vector, 0, true)
 
 # Initialize I/O APIC
 fn ioapic_init() -> i32
@@ -540,6 +625,7 @@ fn ioapic_init() -> i32
 
     ioapic_hw_id = ((ioapic_read(IOAPIC_ID) >> 24) & 0xF) as u8
     let version: u32 = ioapic_read(IOAPIC_VER)
+    ioapic_version = version
     let max_irqs: u32 = ((version >> 16) & 0xFF) + 1
 
     prints("      I/O APIC version: ")
@@ -591,6 +677,10 @@ fn ioapic_init() -> i32
         serial_print_dec(ir_ioapic_rte_handle(ioapic_read(IOAPIC_REDTBL + 9), ioapic_read(IOAPIC_REDTBL + 8)) as u64)
         prints(")")
     prints("\n")
+
+    # A level-triggered pin on the last PCI pin (#4339): how its EOI goes.
+    if max_irqs > 16
+        ioapic_level_selftest((max_irqs - 1) as u8, dest)
 
     return 0
 

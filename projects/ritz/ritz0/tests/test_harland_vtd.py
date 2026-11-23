@@ -246,7 +246,7 @@ def test_msix_entry_uses_an_irte_when_remapping_is_on():
 @pytest.mark.unit
 def test_ioapic_entries_are_remappable_when_remapping_is_on():
     code = _code(APIC)
-    set_irq = _body(code, "ioapic_set_irq")
+    set_irq = _body(code, "ioapic_set_irq_mode")   # edge and level pins (#4339)
     assert "ir_enabled()" in set_irq, set_irq
     assert "ir_handle_ioapic(" in set_irq and "ir_ioapic_rte_hi(" in set_irq and "ir_ioapic_rte_lo(" in set_irq
     assert "ir_set(" in set_irq and "ir_ioapic_sid(" in set_irq, set_irq

@@ -107,6 +107,20 @@ fn main() -> i32
     # with remapping, 256 and 511 take their own; nothing is rerouted
     if irq_dest_pick(256, 300, @ids[0], 4, false, true) != 256 or irq_dest_pick(511, 0, @ids[0], 4, false, true) != 511
         return 22
+    # #4339 level pins: trigger bit 15, polarity bit 13
+    if ioapic_rte_mode(false, false) != 0 or ioapic_rte_mode(true, false) != 0x8000 or ioapic_rte_mode(true, true) != 0xA000
+        return 23
+    # the EOI register (offset 40h) exists from version 20h
+    if ioapic_has_eoi_reg(0x11) or not ioapic_has_eoi_reg(0x170020) or not ioapic_has_eoi_reg(0x21)
+        return 24
+    # a level entry whose vector field isn't the vector (AMD-Vi: the IRTE
+    # handle) needs a directed EOI; a matching one, or an edge entry, doesn't
+    if not ioapic_needs_directed_eoi(0x1A017, 0x37) or ioapic_needs_directed_eoi(0x1A037, 0x37)
+        return 25
+    if ioapic_needs_directed_eoi(0x10017, 0x37)
+        return 26
+    if ioapic_eoi_value(0x1A017) != 0x17
+        return 27
     0
 """
 
@@ -116,7 +130,9 @@ CLAIMS = {1: "IDs 0..254 reachable", 2: "255 is broadcast", 3: "256+ needs ext d
           10: "RTE round trip", 11: "pick wanted", 12: "pick BSP", 13: "pick first reachable",
           14: "pick ext dest", 15: "pick none", 16: "KVM ext dest bit", 17: "KVM without bit",
           18: "KVM leaf missing", 19: "non-KVM signature",
-          20: "IR reaches 255 and 15+ bits", 21: "IR x2APIC broadcast", 22: "pick with IR"}
+          20: "IR reaches 255 and 15+ bits", 21: "IR x2APIC broadcast", 22: "pick with IR",
+          23: "RTE trigger/polarity", 24: "EOI register version", 25: "directed EOI when vector field differs",
+          26: "edge needs no EOI", 27: "EOI value is the vector field"}
 
 
 @pytest.mark.integration
@@ -185,7 +201,7 @@ def test_ioapic_routes_to_the_bsp_not_apic_id_0():
         assert m, f"IRQ {irq} isn't unmasked in ioapic_init"
         assert not re.fullmatch(r"\d+", m.group(1).strip()), f"IRQ {irq} goes to literal APIC ID {m.group(1)}"
     assert re.search(r"irq_route_dest\(\s*bsp_apic_id\s*\)", init), init
-    set_irq = _body(code, "ioapic_set_irq")
+    set_irq = _body(code, "ioapic_set_irq_mode")
     assert re.search(r"dest_apic:\s*u32", set_irq), "ioapic_set_irq still takes an 8-bit destination"
     assert "ioapic_rte_hi(" in set_irq, set_irq
     # bsp_apic_id is known before the I/O APIC is set up (ap_boot_all is later)

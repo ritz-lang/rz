@@ -54,6 +54,12 @@
 #     "interrupt remapping (32-bit APIC IDs)", APIC ID 256 not rerouted, the
 #     I/O APIC's IRQ 1 and 4 remapped (IRTE 1, 4) to the BSP, and the NVMe
 #     vectors set through IRTEs aimed at the BSP;
+#   - vtd / amdvi boot (#4339): the AP's own NVMe I/O vector set up through
+#     an IRTE aimed at APIC ID 256, and the AP's read waited for it and took
+#     it ("[msix] nvme AP 256: ... waited=W, interrupted=I, IRTE h -> APIC ID
+#     256", W and I > 0): the 32-bit destination end to end. And a level-
+#     triggered I/O APIC pin: under AMD-Vi its entry's vector field is the
+#     IRTE handle, so it needs a directed EOI; under VT-d the broadcast does;
 #   - an NVMe controller still comes up on MSI-X and its interrupts arrive
 #     ("[msix] nvme interrupts: N, ... completions without one: 0", N > 0);
 #   - the kernel took no exception and init's Tier-1 suite reports ALL
@@ -264,6 +270,48 @@ check() {
             rc=1
         else
             echo "PASS: $P NVMe MSI-X vectors $va and $vi go through IRTEs to the BSP $want_irte"
+        fi
+        # #4339: the AP's own I/O vector goes through an IRTE aimed at APIC
+        # ID 256 (the 32-bit destination), and the AP's read waited for and
+        # took that interrupt (nvme_ap_probe):
+        # "[msix] nvme AP 256: ... waited=W, interrupted=I, IRTE h -> APIC ID d".
+        local ap ap_w ap_i ap_d
+        ap=$(grep -aoE "\[msix\] nvme AP $AP_APIC_ID: nsid [0-9]+: LBA [0-9]+-[0-9]+ fnv1a=[0-9]+, waited=[0-9]+, interrupted=[0-9]+(, IRTE [0-9]+ -> APIC ID [0-9]+)?" "$SERIAL" | tail -1)
+        ap_w=$(echo "$ap" | sed -nE 's/.*waited=([0-9]+),.*/\1/p')
+        ap_i=$(echo "$ap" | sed -nE 's/.*interrupted=([0-9]+).*/\1/p')
+        ap_d=$(echo "$ap" | sed -nE 's/.*, IRTE [0-9]+ -> APIC ID ([0-9]+)$/\1/p')
+        if [ -z "$ap" ]; then
+            grep -a "nvme AP\|\[apcall\]" "$SERIAL" | head -3
+            echo "FAIL: $P no NVMe read on APIC ID $AP_APIC_ID ([msix] nvme AP $AP_APIC_ID: ... waited=W, interrupted=I, IRTE h -> APIC ID d)"
+            rc=1
+        elif [ -z "$ap_d" ]; then
+            echo "FAIL: $P APIC ID $AP_APIC_ID's NVMe vector was not set up through an IRTE: \"$ap\""
+            rc=1
+        elif [ "$ap_d" != "$AP_APIC_ID" ]; then
+            echo "FAIL: $P APIC ID $AP_APIC_ID's NVMe vector: IRTE aimed at APIC ID $ap_d, want $AP_APIC_ID"
+            rc=1
+        elif [ "$ap_w" -eq 0 ] || [ "$ap_i" -eq 0 ]; then
+            echo "FAIL: $P APIC ID $AP_APIC_ID's NVMe read did not take its interrupt (waited=$ap_w, interrupted=$ap_i)"
+            rc=1
+        else
+            echo "PASS: $P APIC ID $AP_APIC_ID's NVMe vector goes through an IRTE aimed at it, and fired there ($ap_i interrupt(s))"
+        fi
+        # #4339: a level-triggered pin. Under AMD-Vi the entry's vector field
+        # is the IRTE handle, so the LAPIC's EOI broadcast can't match it
+        # and the I/O APIC's EOI register must be written ("directed"); VT-d
+        # keeps the vector there ("broadcast").
+        local lvl want_eoi=broadcast
+        [ "$name" = amdvi ] && want_eoi=directed
+        lvl=$(grep -aoE "I/O APIC: level pin [0-9]+: entry vector [0-9]+ for vector [0-9]+, (directed|broadcast) EOI" "$SERIAL" | head -1)
+        if [ -z "$lvl" ]; then
+            grep -a "I/O APIC" "$SERIAL" | head -4
+            echo "FAIL: $P no level pin set up (I/O APIC: level pin P: entry vector E for vector V, ... EOI)"
+            rc=1
+        elif [ "${lvl% EOI}" = "${lvl%, *}, $want_eoi" ]; then
+            echo "PASS: $P level-triggered pin: ${lvl#I/O APIC: }"
+        else
+            echo "FAIL: $P level-triggered pin: \"$lvl\", want $want_eoi EOI"
+            rc=1
         fi
     elif grep -aqF "Device interrupt destinations: extended destination ID" "$SERIAL"; then
         if grep -aqF "[irq] APIC ID $AP_APIC_ID:" "$SERIAL"; then

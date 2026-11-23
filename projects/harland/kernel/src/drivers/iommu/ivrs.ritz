@@ -14,7 +14,8 @@
 #     or 40h, the highest type present, as Linux picks), the device IDs they
 #     cover (the device table must reach the last one), alias entries
 #     (requests from a device arrive with another device's ID) and the
-#     I/O APIC / HPET special entries (ivrs_parse);
+#     I/O APIC / HPET special entries (ivrs_parse), and groups the IOMMUs by
+#     PCI segment: each segment needs its own device table (AGAST #4339);
 #   - encodes DTEs, IRTEs (32-bit legacy and 128-bit GA), the MSI address /
 #     data and redirection entries that name an IRTE, command-buffer
 #     commands and register values, and decodes IRTEs back for the logs.
@@ -77,6 +78,17 @@ pub const IVRS_MAX_ALIASES: i32 = 16
 # A device ID that can't be named.
 pub const IVRS_DEVID_NONE: u32 = 0xFFFFFFFF
 
+# Requester IDs carry their PCI segment (#4339): segment << 16 | bus:dev.fn.
+# A device ID is 16 bits and names a DTE in its segment's table.
+pub fn amdvi_sid(seg: u32, rid: u32) -> u32
+    return ((seg & 0xFFFF) << 16) | (rid & 0xFFFF)
+
+pub fn ivrs_sid_seg(sid: u32) -> u32
+    return sid >> 16
+
+pub fn ivrs_sid_rid(sid: u32) -> u32
+    return sid & 0xFFFF
+
 # What ivrs_parse found.
 pub var ivrs_ivinfo: u32 = 0
 pub var ivrs_ivhd_type: u8 = 0                 # the IVHD type used
@@ -85,15 +97,23 @@ pub var ivrs_unit_base: [8]u64                 # MMIO base, per IOMMU
 pub var ivrs_unit_devid: [8]u16                # the IOMMU's own device ID
 pub var ivrs_unit_segment: [8]u16
 pub var ivrs_unit_efr: [8]u64                  # EFR image (11h/40h), or 10h's GA/XT as EFR bits
-pub var ivrs_last_devid: u32 = 0               # the highest device ID any entry names
+pub var ivrs_last_devid: u32 = 0               # the highest device ID any entry names, any segment
+pub var ivrs_unit_seg_index: [8]i32            # each IOMMU's segment, as an index into ivrs_seg_*
+pub var ivrs_num_segs: i32 = 0                 # PCI segments with an IOMMU: one device table each
+pub var ivrs_seg_id: [8]u16
+pub var ivrs_seg_last_devid: [8]u32            # the highest device ID the segment's IVHDs name
 pub var ivrs_num_special: i32 = 0
 pub var ivrs_special_variety: [16]u8           # IVHD_SPECIAL_IOAPIC / _HPET
 pub var ivrs_special_handle: [16]u8            # I/O APIC ID or HPET number
 pub var ivrs_special_devid: [16]u16
+pub var ivrs_special_seg: [16]u16
 pub var ivrs_num_aliases: i32 = 0
 pub var ivrs_alias_first: [16]u16              # requests from first..last
 pub var ivrs_alias_last: [16]u16
 pub var ivrs_alias_to: [16]u16                 # arrive as this device ID
+pub var ivrs_alias_seg: [16]u16                # in this segment
+
+var ivrs_cur_seg: i32 = 0                      # the segment index of the IVHD being parsed
 
 fn ivrs_rd8(p: *u8, off: u32) -> u8
     return *(p + off as i64)
@@ -110,6 +130,28 @@ fn ivrs_rd64(p: *u8, off: u32) -> u64
 fn ivrs_note_devid(devid: u32)
     if devid > ivrs_last_devid
         ivrs_last_devid = devid
+    if devid > ivrs_seg_last_devid[ivrs_cur_seg]
+        ivrs_seg_last_devid[ivrs_cur_seg] = devid
+
+# The index of segment `seg` in ivrs_seg_*, or -1 if no IOMMU is on it.
+pub fn ivrs_seg_index(seg: u32) -> i32
+    var k: i32 = 0
+    while k < ivrs_num_segs
+        if (ivrs_seg_id[k] as u32) == seg
+            return k
+        k = k + 1
+    return -1
+
+# ivrs_seg_index, adding the segment if it is new.
+fn ivrs_seg_add(seg: u32) -> i32
+    let k: i32 = ivrs_seg_index(seg)
+    if k >= 0
+        return k
+    let n: i32 = ivrs_num_segs
+    ivrs_seg_id[n] = seg as u16
+    ivrs_seg_last_devid[n] = 0
+    ivrs_num_segs = n + 1
+    return n
 
 # Bytes in the device entry at `e` (type `t`), 0 if unknown: parsing stops.
 pub fn ivhd_entry_len(t: u8, e: *u8, room: u32) -> u32
@@ -128,6 +170,7 @@ fn ivrs_add_alias(first: u32, last: u32, to: u32)
     ivrs_alias_first[k] = first as u16
     ivrs_alias_last[k] = last as u16
     ivrs_alias_to[k] = to as u16
+    ivrs_alias_seg[k] = ivrs_seg_id[ivrs_cur_seg]
     ivrs_num_aliases = k + 1
     ivrs_note_devid(last)
     ivrs_note_devid(to)
@@ -171,6 +214,7 @@ fn ivrs_parse_entries(t: *u8, off: u32, end: u32)
                 ivrs_special_variety[k] = ivrs_rd8(t, e + 7)
                 ivrs_special_handle[k] = ivrs_rd8(t, e + 4)
                 ivrs_special_devid[k] = sdev as u16
+                ivrs_special_seg[k] = ivrs_seg_id[ivrs_cur_seg]
                 ivrs_num_special = k + 1
         e = e + n
 
@@ -186,6 +230,9 @@ pub fn ivrs_parse(table: *u8, len: u32) -> i32
     ivrs_last_devid = 0
     ivrs_num_special = 0
     ivrs_num_aliases = 0
+    ivrs_num_segs = 0
+    ivrs_cur_seg = 0
+    ivrs_seg_last_devid[0] = 0
     if len < IVRS_BLOCKS_OFFSET or ivrs_rd32(table, 0) != ACPI_SIG_IVRS
         return -1
     if ivrs_rd32(table, 4) < len
@@ -218,6 +265,8 @@ pub fn ivrs_parse(table: *u8, len: u32) -> i32
             ivrs_unit_devid[u] = ivrs_rd16(table, off + 4)
             ivrs_unit_base[u] = ivrs_rd64(table, off + 8)
             ivrs_unit_segment[u] = ivrs_rd16(table, off + 16)
+            ivrs_cur_seg = ivrs_seg_add(ivrs_unit_segment[u] as u32)
+            ivrs_unit_seg_index[u] = ivrs_cur_seg
             if bt == IVHD_TYPE_10
                 let feat: u32 = ivrs_rd32(table, off + 20)
                 var efr: u64 = 0
@@ -234,25 +283,27 @@ pub fn ivrs_parse(table: *u8, len: u32) -> i32
         off = off + blen
     return ivrs_num_units
 
-# The device ID IVRS gives the I/O APIC with ID `ioapic_id`, or
-# IVRS_DEVID_NONE.
+# The requester ID (segment << 16 | device ID) IVRS gives the I/O APIC
+# with ID `ioapic_id`, or IVRS_DEVID_NONE.
 pub fn ivrs_ioapic_devid(ioapic_id: u8) -> u32
     var k: i32 = 0
     while k < ivrs_num_special
         if ivrs_special_variety[k] == IVHD_SPECIAL_IOAPIC and ivrs_special_handle[k] == ioapic_id
-            return ivrs_special_devid[k] as u32
+            return amdvi_sid(ivrs_special_seg[k] as u32, ivrs_special_devid[k] as u32)
         k = k + 1
     return IVRS_DEVID_NONE
 
-# The device ID requests from `devid` arrive with (an alias entry's
-# target), or `devid` itself.
-pub fn ivrs_alias(devid: u32) -> u32
+# The requester ID requests from `sid` (segment << 16 | device ID) arrive
+# with: an alias entry's target in the same segment, or `sid` itself.
+pub fn ivrs_alias(sid: u32) -> u32
+    let seg: u32 = ivrs_sid_seg(sid)
+    let devid: u32 = ivrs_sid_rid(sid)
     var k: i32 = 0
     while k < ivrs_num_aliases
-        if devid >= (ivrs_alias_first[k] as u32) and devid <= (ivrs_alias_last[k] as u32)
-            return ivrs_alias_to[k] as u32
+        if (ivrs_alias_seg[k] as u32) == seg and devid >= (ivrs_alias_first[k] as u32) and devid <= (ivrs_alias_last[k] as u32)
+            return amdvi_sid(seg, ivrs_alias_to[k] as u32)
         k = k + 1
-    return devid
+    return sid
 
 # ============================================================================
 # Device table (256-bit entries: q0..q3)
@@ -342,9 +393,10 @@ pub fn irte_ga_vector(hi: u64) -> u8
 # interrupt from a device whose DTE says so, taking the IRTE index from
 # data bits 10:0. An MSI goes to FEE0_0000 (destination 0, ignored) with the
 # handle as its data; a redirection entry carries the handle in its vector
-# field, fixed delivery, physical, destination 0. Edge-triggered only, as
-# ioapic_set_irq programs them: a level-triggered pin's EOI broadcast
-# carries the IRTE's vector, which wouldn't match the entry's.
+# field, fixed delivery, physical, destination 0. A level-triggered pin's
+# EOI broadcast carries the IRTE's vector, which doesn't match the entry's,
+# so arch/x86_64/apic.ritz sends those a directed EOI (irq_dest.ritz,
+# AGAST #4339). The trigger and polarity bits are ORed in there.
 
 pub const AMDVI_MSI_ADDR: u32 = 0xFEE00000
 

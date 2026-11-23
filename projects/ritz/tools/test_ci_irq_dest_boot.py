@@ -74,10 +74,17 @@ IR_ON = r"      Interrupt remapping: VT-d on, 1 unit(s), table at 3DE000, 32-bit
 DEST_IR = r"      Device interrupt destinations: interrupt remapping (32-bit APIC IDs)\n"
 IOAPIC_IR = r"      I/O APIC: IRQ 1 -> APIC ID 0, IRQ 4 -> APIC ID 0 (remapped: IRTE 1, 4)\n"
 NVME_IR = NVME.replace("io=65\\n", "io=65 (IRTE 192, 193 -> APIC ID 0, 0)\\n", 1)
-VTD_PASSED = X2APIC + IR_ON + DEST_IR + IOAPIC_IR + bsp(0) + APS + NVME_IR + SUITE
+# #4339: the AP's own I/O vector, set up through an IRTE aimed at APIC ID 256
+AP_IR = (r"[msix] nvme AP 256: nsid 1: LBA 32568-32767 fnv1a=2166136261, waited=1, interrupted=1, "
+         r"IRTE 194 -> APIC ID 256\n")
+# #4339: a level-triggered pin. VT-d keeps the vector in the entry, so the
+# LAPIC's EOI broadcast clears it; AMD-Vi puts the IRTE handle there.
+LEVEL_VTD = r"      I/O APIC: level pin 23: entry vector 55 for vector 55, broadcast EOI\n"
+LEVEL_AMD = r"      I/O APIC: level pin 23: entry vector 23 for vector 55, directed EOI\n"
+VTD_PASSED = X2APIC + IR_ON + DEST_IR + IOAPIC_IR + LEVEL_VTD + bsp(0) + APS + NVME_IR + AP_IR + SUITE
 
 AMD_ON = r"      Interrupt remapping: AMD-Vi on, 1 unit(s), device table at 3DB000, 32-bit x2APIC destinations (GA, XT)\n"
-AMDVI_PASSED = VTD_PASSED.replace(IR_ON, AMD_ON)
+AMDVI_PASSED = VTD_PASSED.replace(IR_ON, AMD_ON).replace(LEVEL_VTD, LEVEL_AMD)
 
 
 def _build_all() -> list[dict]:
@@ -220,6 +227,14 @@ def test_the_vtd_line_does_not_pass_an_amdvi_boot(tree):
     (AMDVI_PASSED.replace(IOAPIC_IR, ioapic(0, 0)), "not in the remappable format"),
     (AMDVI_PASSED.replace(NVME_IR, NVME), "NVMe MSI-X entries are not in the remappable format"),
     (AMDVI_PASSED.replace("-> APIC ID 0, 0)", "-> APIC ID 0, 256)"), "want \"(IRTE 192, 193 -> APIC ID 0, 0)\""),
+    # #4339: the AP's IRTE, and an interrupt delivered through it
+    (AMDVI_PASSED.replace(AP_IR, ""), "no NVMe read on APIC ID 256"),
+    (AMDVI_PASSED.replace("IRTE 194 -> APIC ID 256", "IRTE 194 -> APIC ID 0"), "IRTE aimed at APIC ID 0, want 256"),
+    (AMDVI_PASSED.replace(", IRTE 194 -> APIC ID 256", ""), "not set up through an IRTE"),
+    (AMDVI_PASSED.replace("waited=1, interrupted=1", "waited=1, interrupted=0"), "interrupted=0"),
+    # #4339: level pins under AMD-Vi need the directed EOI
+    (AMDVI_PASSED.replace(LEVEL_AMD, LEVEL_AMD.replace("directed", "broadcast")), "want directed EOI"),
+    (AMDVI_PASSED.replace(LEVEL_AMD, ""), "no level pin set up"),
 ])
 def test_a_bad_amdvi_boot_fails(tree, serial, why):
     r = _run(tree, serial, "amdvi")
@@ -239,6 +254,8 @@ def test_a_bad_amdvi_boot_fails(tree, serial, why):
     (VTD_PASSED.replace("-> APIC ID 0, 0)", "-> APIC ID 0, 256)"), "want \"(IRTE 192, 193 -> APIC ID 0, 0)\""),
     (VTD_PASSED.replace("(IRTE 192, 193", "(IRTE 64, 65"), "want"),
     (VTD_PASSED.replace("interrupts: 3,", "interrupts: 0,"), "counter is 0"),
+    (VTD_PASSED.replace("IRTE 194 -> APIC ID 256", "IRTE 194 -> APIC ID 0"), "IRTE aimed at APIC ID 0, want 256"),
+    (VTD_PASSED.replace(LEVEL_VTD, LEVEL_AMD), "want broadcast EOI"),
 ])
 def test_a_bad_vtd_boot_fails(tree, serial, why):
     r = _run(tree, serial, "vtd")
