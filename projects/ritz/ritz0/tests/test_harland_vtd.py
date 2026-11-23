@@ -239,8 +239,8 @@ def test_msix_entry_uses_an_irte_when_remapping_is_on():
     assert "ir_handle_msi(vector)" in body and "ir_msi_addr(" in body and "ir_msi_data(" in body, body
     assert "msi_addr_remap(" in _body(_code(IR), "ir_msi_addr")
     # the device's requester ID goes into the IRTE for source validation
-    sid = _body(code, "msix_sid")
-    assert re.search(r"\.bus\b", sid) and re.search(r"\.device\b", sid) and re.search(r"\.function\b", sid), sid
+    # the requester ID is the device's, segment included (AGAST #4582)
+    assert "pci_dev_sid((*info).dev)" in _body(code, "msix_sid")
 
 
 @pytest.mark.unit

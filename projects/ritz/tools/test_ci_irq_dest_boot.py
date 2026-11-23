@@ -67,8 +67,12 @@ REROUTE_256 = (r"    [irq] APIC ID 256: device interrupts -> APIC ID 0 (MSI addr
 NVME = (r"[msix] nvme harland-irq: MSI-X on, vectors admin=64 io=65\n"
         r"[msix] nvme interrupts: 3, commands waited: 2, completions without one: 0\n")
 SUITE = r"  ALL TESTS PASSED\n"
+# #4582: q35 has an MCFG; config access moves to ECAM once segment 0 matches
+MCFG_0 = r"[pci] MCFG segment 0000 buses 00-ff ECAM B0000000\n"
+ECAM_OK = r"[pci] ECAM matches port I/O on segment 0 (8 functions)\n"
+PCI_ECAM = MCFG_0 + ECAM_OK
 
-PASSED = X2APIC + DEST_8BIT + ioapic(0, 0) + bsp(0) + APS + REROUTE_256 + NVME + SUITE
+PASSED = X2APIC + DEST_8BIT + ioapic(0, 0) + bsp(0) + APS + REROUTE_256 + PCI_ECAM + NVME + SUITE
 
 IR_ON = r"      Interrupt remapping: VT-d on, 1 unit(s), table at 3DE000, 32-bit x2APIC destinations (EIM)\n"
 DEST_IR = r"      Device interrupt destinations: interrupt remapping (32-bit APIC IDs)\n"
@@ -81,7 +85,7 @@ AP_IR = (r"[msix] nvme AP 256: nsid 1: LBA 32568-32767 fnv1a=2166136261, waited=
 # LAPIC's EOI broadcast clears it; AMD-Vi puts the IRTE handle there.
 LEVEL_VTD = r"      I/O APIC: level pin 23: entry vector 55 for vector 55, broadcast EOI\n"
 LEVEL_AMD = r"      I/O APIC: level pin 23: entry vector 23 for vector 55, directed EOI\n"
-VTD_PASSED = X2APIC + IR_ON + DEST_IR + IOAPIC_IR + LEVEL_VTD + bsp(0) + APS + NVME_IR + AP_IR + SUITE
+VTD_PASSED = X2APIC + IR_ON + DEST_IR + IOAPIC_IR + LEVEL_VTD + bsp(0) + APS + PCI_ECAM + NVME_IR + AP_IR + SUITE
 
 AMD_ON = r"      Interrupt remapping: AMD-Vi on, 1 unit(s), device table at 3DB000, 32-bit x2APIC destinations (GA, XT)\n"
 AMDVI_PASSED = VTD_PASSED.replace(IR_ON, AMD_ON).replace(LEVEL_VTD, LEVEL_AMD)
@@ -256,6 +260,7 @@ def test_a_bad_amdvi_boot_fails(tree, serial, why):
     (VTD_PASSED.replace("interrupts: 3,", "interrupts: 0,"), "counter is 0"),
     (VTD_PASSED.replace("IRTE 194 -> APIC ID 256", "IRTE 194 -> APIC ID 0"), "IRTE aimed at APIC ID 0, want 256"),
     (VTD_PASSED.replace(LEVEL_VTD, LEVEL_AMD), "want broadcast EOI"),
+    (VTD_PASSED.replace(MCFG_0, ""), "[vtd] no MCFG entry for segment 0 logged"),
 ])
 def test_a_bad_vtd_boot_fails(tree, serial, why):
     r = _run(tree, serial, "vtd")
@@ -290,6 +295,10 @@ def test_with_the_extended_destination_id_256_keeps_its_own(tree):
     (PASSED.replace("without one: 0", "without one: 2"), "arrived without an interrupt"),
     (PASSED.replace(SUITE, ""), "did not report ALL TESTS PASSED"),
     (PASSED + r"KERNEL PANIC\n", "kernel exception"),
+    # #4582: ECAM on q35, checked against port I/O first
+    (PASSED.replace(MCFG_0, ""), "no MCFG entry for segment 0 logged"),
+    (PASSED.replace(ECAM_OK, ""), "ECAM not checked against port I/O on segment 0"),
+    (PASSED.replace("(8 functions)", "(0 functions)"), "ECAM not checked against port I/O on segment 0"),
 ])
 def test_a_bad_boot_fails(tree, serial, why):
     r = _run(tree, serial)

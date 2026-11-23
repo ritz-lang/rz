@@ -1,0 +1,108 @@
+# Harland PCI segments: MCFG parsing, ECAM addresses, requester IDs (AGAST #4582)
+#
+# Port I/O (0xCF8/0xCFC) reaches PCI segment 0 only. A multi-segment machine
+# (EPYC) puts devices on segments 1+, whose config space is reachable only
+# through ECAM, the memory-mapped config space the ACPI MCFG table describes
+# (PCI Firmware Spec 3.0 §4.1.2). Each MCFG entry gives one segment's ECAM
+# base and the bus range it decodes; bus B, device D, function F, register R
+# sits at base + (B << 20 | D << 15 | F << 12 | R). The base names bus 0
+# even when the range starts later.
+#
+# Requester IDs (AMD-Vi device table lookups, VT-d source IDs) are
+# segment << 16 | bus << 8 | device << 3 | function: the same packing as
+# drivers/iommu/ivrs.ritz amdvi_sid.
+#
+# Import-free so the host tests can compile it on its own
+# (projects/ritz/ritz0/tests/test_harland_pci_segments.py). drivers/pci.ritz
+# maps the ECAM windows and does the accesses.
+
+# MCFG layout: 36-byte ACPI header, 8 reserved bytes, then 16-byte entries:
+# base (8), segment (2), start bus (1), end bus (1), reserved (4).
+const MCFG_SIGNATURE: u32 = 0x4746434D   # "MCFG"
+const MCFG_ENTRIES: u32 = 44
+const MCFG_ENTRY_SIZE: u32 = 16
+
+# Entries kept; more are ignored.
+pub const PCI_MCFG_MAX: i32 = 8
+
+# What mcfg_parse found.
+pub var mcfg_count: i32 = 0
+pub var mcfg_base: [8]u64
+pub var mcfg_seg: [8]u16
+pub var mcfg_bus_start: [8]u8
+pub var mcfg_bus_end: [8]u8
+
+fn mcfg_rd8(t: *u8, off: u32) -> u32
+    return *(t + off as i64) as u32
+
+fn mcfg_rd16(t: *u8, off: u32) -> u32
+    return mcfg_rd8(t, off) | (mcfg_rd8(t, off + 1) << 8)
+
+fn mcfg_rd32(t: *u8, off: u32) -> u32
+    return mcfg_rd16(t, off) | (mcfg_rd16(t, off + 2) << 16)
+
+fn mcfg_rd64(t: *u8, off: u32) -> u64
+    return (mcfg_rd32(t, off) as u64) | ((mcfg_rd32(t, off + 4) as u64) << 32)
+
+# Parse the MCFG at `table`, of which `len` bytes are readable. Keeps each
+# usable entry (non-zero base, end bus >= start bus, wholly inside the
+# table), up to PCI_MCFG_MAX. Returns the number kept, or -1 if it isn't an
+# MCFG or its header is cut short or claims more bytes than `len`.
+pub fn mcfg_parse(table: *u8, len: u32) -> i32
+    mcfg_count = 0
+    if len < MCFG_ENTRIES or mcfg_rd32(table, 0) != MCFG_SIGNATURE
+        return -1
+    let tlen: u32 = mcfg_rd32(table, 4)
+    if tlen < MCFG_ENTRIES or tlen > len
+        return -1
+    var off: u32 = MCFG_ENTRIES
+    while off + MCFG_ENTRY_SIZE <= tlen and mcfg_count < PCI_MCFG_MAX
+        let base: u64 = mcfg_rd64(table, off)
+        let start: u32 = mcfg_rd8(table, off + 10)
+        let end: u32 = mcfg_rd8(table, off + 11)
+        if base != 0 and end >= start
+            mcfg_base[mcfg_count] = base
+            mcfg_seg[mcfg_count] = mcfg_rd16(table, off + 8) as u16
+            mcfg_bus_start[mcfg_count] = start as u8
+            mcfg_bus_end[mcfg_count] = end as u8
+            mcfg_count = mcfg_count + 1
+        off = off + MCFG_ENTRY_SIZE
+    return mcfg_count
+
+# The entry whose range decodes (segment, bus), or -1.
+pub fn mcfg_find(seg: u32, bus: u32) -> i32
+    var i: i32 = 0
+    while i < mcfg_count
+        if (mcfg_seg[i] as u32) == seg and bus >= (mcfg_bus_start[i] as u32) and bus <= (mcfg_bus_end[i] as u32)
+            return i
+        i = i + 1
+    return -1
+
+# Physical address of bus `bus`'s 1 MiB of config space in segment `seg`,
+# or 0 if no entry decodes it.
+pub fn ecam_bus_phys(seg: u32, bus: u32) -> u64
+    let i: i32 = mcfg_find(seg, bus)
+    if i < 0
+        return 0
+    return mcfg_base[i] + (((bus & 0xFF) as u64) << 20)
+
+# Physical address of register `reg` (0-0xFFF) of seg/bus:dev.func, or 0 if
+# no entry decodes that bus.
+pub fn ecam_addr(seg: u32, bus: u32, dev: u32, func: u32, reg: u32) -> u64
+    let b: u64 = ecam_bus_phys(seg, bus)
+    if b == 0
+        return 0
+    return b + (((dev & 0x1F) as u64) << 15) + (((func & 0x7) as u64) << 12) + ((reg & 0xFFF) as u64)
+
+# True if an entry describes a segment other than 0.
+pub fn mcfg_has_other_segments() -> bool
+    var i: i32 = 0
+    while i < mcfg_count
+        if mcfg_seg[i] != 0
+            return true
+        i = i + 1
+    return false
+
+# Requester ID: segment << 16 | bus << 8 | device << 3 | function.
+pub fn pci_sid(seg: u32, bus: u32, dev: u32, func: u32) -> u32
+    return ((seg & 0xFFFF) << 16) | ((bus & 0xFF) << 8) | ((dev & 0x1F) << 3) | (func & 0x7)

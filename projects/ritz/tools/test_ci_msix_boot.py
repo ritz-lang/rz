@@ -73,7 +73,10 @@ open(out, "wb").close()
 """
 SUITE_PASSED = r"[test] hello ... PASS (exit=0)\n  Results: 10 passed, 0 failed\n  ALL TESTS PASSED\n"
 
-NVME_TABLE = r"[msix] 00:05.00 1B36:0010: 65 vectors, table BAR0+0x2000\n"
+# #4582: the pc machine has no MCFG, so PCI stays on port I/O. Logged before
+# any driver's MSI-X set-up, so every fixture that reaches NVMe carries it.
+PCI_PORT_IO = r"[pci] no MCFG: segment 0 only, port I/O\n"
+NVME_TABLE = PCI_PORT_IO + r"[msix] 00:05.00 1B36:0010: 65 vectors, table BAR0+0x2000\n"
 NIC_ON = r"[msix] virtio-net: MSI-X on, vectors config=64 rx=65 tx=66\n"
 
 
@@ -375,6 +378,13 @@ def test_no_nvme_msix_table_fails(tree):
 def test_exception_fails_even_if_everything_else_passed(tree):
     r = _run(tree, r"EXCEPTION: #GP\nRIP=0x1\nCR2=0\n" + PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
+
+
+@pytest.mark.integration
+def test_pci_left_port_io_without_an_mcfg_fails(tree):
+    r = _run(tree, PASSED.replace(PCI_PORT_IO, ""))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert 'FAIL: no "[pci] no MCFG: segment 0 only, port I/O" on the pc machine' in r.stdout
 
 
 @pytest.mark.integration

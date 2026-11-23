@@ -88,6 +88,7 @@ pub const VIRTIO_DEVICE_INPUT: u16 = 0x1052
 pub const PCI_CAP_VENDOR: u8 = 0x09
 
 pub struct PciDevice
+    segment: u16
     bus: u8
     device: u8
     function: u8
@@ -129,13 +130,13 @@ pub fn pci_enable_io(dev: *PciDevice)
 pub fn pci_find_capability_nth(dev: *PciDevice, cap_id: u8, n: i32) -> u8
     0
 
-pub fn pci_read_config8(bus: u8, device: u8, func: u8, offset: u8) -> u8
+pub fn pci_dev_read_config8(dev: *PciDevice, offset: u8) -> u8
     0
 
-pub fn pci_read_config16(bus: u8, device: u8, func: u8, offset: u8) -> u16
+pub fn pci_dev_read_config16(dev: *PciDevice, offset: u8) -> u16
     0
 
-pub fn pci_read_config32(bus: u8, device: u8, func: u8, offset: u8) -> u32
+pub fn pci_dev_read_config32(dev: *PciDevice, offset: u8) -> u32
     0
 """
 

@@ -362,6 +362,15 @@ elif [ "$nrx_halts" -eq 0 ]; then
 else
     echo "PASS: virtio-net RX waited on its vector $nrx_waits times, halted $nrx_halts"
 fi
+# QEMU's pc machine has no MCFG: PCI stays on port I/O, segment 0 only
+# (AGAST #4582; tools/test_irq_dest_boot.sh boots q35 through ECAM).
+if grep -aqF "[pci] no MCFG: segment 0 only, port I/O" "$SERIAL"; then
+    echo "PASS: no MCFG on pc: PCI config access stays on port I/O"
+else
+    grep -a "\[pci\]" "$SERIAL" | head -5
+    echo "FAIL: no \"[pci] no MCFG: segment 0 only, port I/O\" on the pc machine"
+    rc=1
+fi
 if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
     echo "PASS: init Tier-1 suite: ALL TESTS PASSED"
 else

@@ -346,6 +346,22 @@ check() {
     else
         echo "PASS: $P NVMe delivered $n_count MSI-X interrupts, none missed"
     fi
+    # q35 has an MCFG: config access moves to ECAM once segment 0 reads the
+    # same through it as through port I/O (AGAST #4582); the MSI-X set-up
+    # above then ran over ECAM.
+    local ecam
+    ecam=$(grep -aoE "\[pci\] ECAM matches port I/O on segment 0 \([0-9]+ functions\)" "$SERIAL" | head -1 | grep -oE "[0-9]+ functions")
+    if ! grep -aiqE "\[pci\] MCFG segment 0000 buses 00-ff ECAM" "$SERIAL"; then
+        grep -a "\[pci\]" "$SERIAL" | head -5
+        echo "FAIL: $P no MCFG entry for segment 0 logged ([pci] MCFG segment 0000 buses 00-ff ECAM ...)"
+        rc=1
+    elif [ -z "$ecam" ] || [ "${ecam%% *}" -eq 0 ]; then
+        grep -a "\[pci\]" "$SERIAL" | head -5
+        echo "FAIL: $P ECAM not checked against port I/O on segment 0 (want \"[pci] ECAM matches port I/O on segment 0 (N functions)\", N > 0)"
+        rc=1
+    else
+        echo "PASS: $P PCI config access through ECAM, matching port I/O on segment 0 ($ecam)"
+    fi
     if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
         echo "PASS: $P init Tier-1 suite: ALL TESTS PASSED"
     else
