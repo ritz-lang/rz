@@ -102,7 +102,7 @@ def hidden_names(own_items: List[rast.Item], resolver, from_file: str,
 
 class _HiddenUses(NameResolver):
     """name_resolver's walk, reporting only uses of hidden names, in one
-    file. Its own unknown-name errors are --check-names', and dropped."""
+    file. Its own unknown-name errors are _check_names', and dropped."""
 
     def __init__(self, hidden: Dict[str, Hint], from_file: str):
         super().__init__()

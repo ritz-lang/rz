@@ -159,7 +159,7 @@ class _Compile:
     source_path: str
     output_path: str
     no_runtime: bool = False
-    check_names: bool = False
+    check_names: bool = True
     check_ownership: bool = False
     dependencies: Optional[dict] = None
     source_roots: Optional[list] = None
@@ -382,7 +382,7 @@ def _check_no_effect(ctx: _Compile) -> bool:
 
 
 def _check_names(ctx: _Compile) -> bool:
-    """`--check-names`: every referenced name is defined."""
+    """Every referenced name is defined (on unless --no-check-names)."""
     if not ctx.check_names:
         return True
     return _report(resolve_names(ctx.module, ctx.module_names), "Name error: ")
@@ -605,7 +605,7 @@ PASSES = (
 
 
 def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
-                  check_names: bool = False, check_ownership: bool = False,
+                  check_names: bool = True, check_ownership: bool = False,
                   dependencies: dict = None,
                   source_roots: list = None, project_root: str = None,
                   target: str = 'x86_64-unknown-linux-gnu',
@@ -708,8 +708,14 @@ def main():
     parser.add_argument('--test-table', action='store_true',
                         help='Compile as a test binary root: emit the [[test]] table for the '
                              'ritzunit runner (LANGUAGE_SPEC §17.1)')
+    # On by default (AGAST #1823). The escape is for bisecting a checker bug
+    # only: build.py, the test runner, tools and gates never pass it (a test
+    # greps for it).
+    parser.add_argument('--no-check-names', action='store_true',
+                        help='Disable the unknown-name check (enabled by default; '
+                             'for bisecting only)')
     parser.add_argument('--check-names', action='store_true',
-                        help='Verify all referenced names are defined before IR emission')
+                        help='Accepted for compatibility: the name check is on by default')
     parser.add_argument('--no-check-ownership', action='store_true',
                         help='Disable ownership/borrowing checks (enabled by default)')
     parser.add_argument('--deps',
@@ -803,7 +809,7 @@ def main():
 
         success = compile_file(args.source[0], args.output,
                                no_runtime=args.no_runtime,
-                               check_names=args.check_names,
+                               check_names=not args.no_check_names,
                                check_ownership=not args.no_check_ownership,
                                dependencies=dependencies,
                                source_roots=source_roots,

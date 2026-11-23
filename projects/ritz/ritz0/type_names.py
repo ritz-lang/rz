@@ -6,7 +6,7 @@ refused with no source location.  Every compiler now says
 "unknown type `Nope`" where the name is written, the words #3264 uses for an
 `impl` on one.
 
-The walk is name_resolver's (it runs in full only under `--check-names`),
+The walk is name_resolver's (it runs in full as _check_names, after this),
 keeping only its type-name findings: known is a primitive, a SIMD vector, a
 built-in type, a struct, enum, alias or trait of the merged module (an
 import counts), an item's own type parameter, or a module-qualified name.

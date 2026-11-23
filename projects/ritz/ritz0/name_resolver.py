@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from typing import Set, Dict, List, Optional
 from dataclasses import dataclass
 import ritz_ast as rast
+import ref_rules
 
 
 class NameError(Exception):
@@ -54,6 +55,18 @@ INTRINSICS = frozenset({
 # and friends.
 BUILTIN_VARIANTS = frozenset({'Some', 'None', 'Ok', 'Err'})
 BUILTIN_GENERICS = frozenset({'Option', 'Result', 'Span'})
+
+
+def _interp_print(name: str, args) -> bool:
+    """`println("..{x}..")` / `eprintln` and `write(w, "..{x}..")` /
+    `writeln`: the emitter lowers these itself, only with an interpolated
+    literal (emitter/calls.py, AGAST #202).  Otherwise the name is an
+    ordinary fn's, and must be defined."""
+    if name in ('println', 'eprintln'):
+        return len(args) == 1 and isinstance(args[0], rast.InterpString)
+    if name in ('write', 'writeln'):
+        return len(args) == 2 and isinstance(args[1], rast.InterpString)
+    return False
 
 
 class NameResolver:
@@ -109,15 +122,15 @@ class NameResolver:
         self.traits: Set[str] = set()
         self.global_vars: Set[str] = set()
         self.variants: Set[str] = set(BUILTIN_VARIANTS)  # every enum's variants
+        # `W_bump` -> (`bump`, `W`, [`T`]): a method of a generic impl, which
+        # has no free name (instantiate.Generics.method_names, LARB R37).
+        self.generic_methods: Dict[str, tuple] = {}
 
         # Generic parameters of the items being walked (`T` in `fn f<T>`)
         self.type_params: Set[str] = set()
 
         # Errors collected during resolution
         self.errors: List[NameError] = []
-
-        # Track if we're inside an async function (for await validation)
-        self.in_async_fn: bool = False
 
     def resolve(self, module: rast.Module) -> List[NameError]:
         """Resolve all names in a module.
@@ -156,6 +169,16 @@ class NameResolver:
                 self.traits.add(item.name)
             elif isinstance(item, rast.VarDef):
                 self.global_vars.add(item.name)
+            elif isinstance(item, rast.ImplBlock):
+                # A non-generic impl's methods have R10's free name `C_mk`
+                # (LANGUAGE_SPEC §5.4); a generic impl's have none.
+                for m in item.methods:
+                    free = f"{item.type_name}_{m.name}"
+                    if item.type_params:
+                        self.generic_methods[free] = (
+                            m.name, item.type_name, item.type_params)
+                    else:
+                        self.functions.add(free)
 
     def _check_item(self, item):
         """Check an item for unresolved references."""
@@ -205,16 +228,9 @@ class NameResolver:
 
         scope = Scope(None, param_names)
 
-        # Track async context for await validation
-        old_in_async = self.in_async_fn
-        self.in_async_fn = getattr(fn, 'is_async', False)
-
         # Check body
         if fn.body:
             self._check_block(fn.body, scope)
-
-        # Restore async context
-        self.in_async_fn = old_in_async
 
     def _check_struct(self, struct: rast.StructDef):
         """Check struct field types."""
@@ -223,11 +239,14 @@ class NameResolver:
                 self._check_type(field_type)
 
     def _check_const(self, const: rast.ConstDef):
-        """Check constant definition."""
+        """Check constant definition.
+
+        Its value is the const folder's: it refuses any name that isn't a
+        constant, unknown ones included, located and in ritz1's framing
+        (`const 'T': element 1 is not a constant integer expression (Unknown
+        constant 'NOPE' ...)`, AGAST #1568, #1823)."""
         if const.type:
             self._check_type(const.type)
-        if const.value:
-            self._check_expr(const.value, Scope(None, set()))
 
     def _check_trait(self, trait: rast.TraitDef):
         """Check trait definition."""
@@ -241,8 +260,13 @@ class NameResolver:
     def _check_impl(self, impl: rast.ImplBlock):
         """Check impl block."""
         with self._generic(impl.type_params):
-            # Check the type being implemented for
-            self._check_type_name(impl.type_name, impl.span)
+            # Check the type being implemented for.  The parser spells a
+            # pointer target `impl Display for *u8` as `ptr_u8`
+            # (builtin_types.POINTER_TARGETS, AGAST #1823).  Imported here:
+            # builtin_types imports this module.
+            from builtin_types import POINTER_TARGETS
+            if impl.type_name not in POINTER_TARGETS:
+                self._check_type_name(impl.type_name, impl.span)
 
             # Check each method
             for method in impl.methods:
@@ -323,7 +347,11 @@ class NameResolver:
                 self._check_pattern(field_pat, scope)
         elif isinstance(pattern, rast.VariantPattern):
             # Check enum type exists
-            if (pattern.qualifier and pattern.qualifier not in self.enums
+            if (pattern.qualifier and not pattern.fields
+                    and self._module_item(rast.Ident(pattern.span, pattern.qualifier),
+                                          pattern.name, pattern.span, scope)):
+                pass
+            elif (pattern.qualifier and pattern.qualifier not in self.enums
                     and pattern.qualifier not in self.module_names):
                 self.errors.append(NameError(
                     f"Unknown enum: {pattern.qualifier}",
@@ -333,24 +361,44 @@ class NameResolver:
             for field_pat in pattern.fields:
                 self._check_pattern(field_pat, scope)
 
+    def _names_known(self, name: str, scope: Scope) -> bool:
+        """Does `name` name anything an identifier may: a local, an item, a
+        builtin, a module, or a type as a receiver (`Point.new()`)?"""
+        return (scope.contains(name) or
+                name in self.functions or
+                name in self.constants or
+                name in self.global_vars or
+                name in self.BUILTINS or
+                name in self.variants or
+                name in ('nil', 'pass') or
+                name in self.module_names or
+                # A type as a receiver: `Point.new()`, `Errno.Fault`
+                name in self.enums or
+                name in self.structs or
+                name in self.type_aliases or
+                name in self.type_params)
+
+    def _module_item(self, qualifier: rast.Expr, name: str, span, scope: Scope) -> bool:
+        """`m.K`, `m.f()`, a `m.K =>` arm: an unknown qualifier before an
+        item is module access (§15.3, AGAST #2215).  Refuse it in the words
+        the emitter and ritz1 use (LANGUAGE_SPEC.md pins them), not as
+        "Unknown identifier: m"; True when refused."""
+        if not (isinstance(qualifier, rast.Ident)
+                and not self._names_known(qualifier.name, scope)
+                and (name in self.functions or name in self.constants
+                     or name in self.global_vars)):
+            return False
+        from qualified_access import module_item_access_removed
+        self.errors.append(NameError(
+            module_item_access_removed(qualifier.name, name), span))
+        return True
+
     def _check_expr(self, expr: rast.Expr, scope: Scope):
         """Check an expression for unresolved references."""
         if isinstance(expr, rast.Ident):
             # Check if identifier is defined
             name = expr.name
-            if not (scope.contains(name) or
-                    name in self.functions or
-                    name in self.constants or
-                    name in self.global_vars or
-                    name in self.BUILTINS or
-                    name in self.variants or
-                    name in ('nil', 'pass') or
-                    name in self.module_names or
-                    # A type as a receiver: `Point.new()`, `Errno.Fault`
-                    name in self.enums or
-                    name in self.structs or
-                    name in self.type_aliases or
-                    name in self.type_params):
+            if not self._names_known(name, scope):
                 self.errors.append(NameError(
                     f"Unknown identifier: {name}",
                     expr.span
@@ -366,11 +414,14 @@ class NameResolver:
                 name = expr.func.name
                 if not (name in self.functions or
                         name in self.BUILTINS or
+                        _interp_print(name, expr.args) or
                         name in self.variants or
                         scope.contains(name) or
                         name in self.global_vars):
+                    generic_method = self.generic_methods.get(name)
                     self.errors.append(NameError(
-                        f"Unknown function: {name}",
+                        ref_rules.generic_method_free_call(*generic_method)
+                        if generic_method else f"Unknown function: {name}",
                         expr.span
                     ))
             else:
@@ -397,7 +448,8 @@ class NameResolver:
             self._check_expr(expr.index, scope)
 
         elif isinstance(expr, rast.Field):
-            self._check_expr(expr.expr, scope)
+            if not self._module_item(expr.expr, expr.field, expr.span, scope):
+                self._check_expr(expr.expr, scope)
             # Don't check field names - need type info
 
         elif isinstance(expr, rast.MethodCall):
@@ -405,7 +457,8 @@ class NameResolver:
             # (AGAST #3597), as the emitter's _builtin_type_receiver takes it.
             # Only as a receiver: a bare `Span` is no value.  (A local named
             # `Span` is defined either way.)
-            if not (isinstance(expr.expr, rast.Ident) and expr.expr.name == 'Span'):
+            if not (isinstance(expr.expr, rast.Ident) and expr.expr.name == 'Span'
+                    or self._module_item(expr.expr, expr.method, expr.span, scope)):
                 self._check_expr(expr.expr, scope)
             for arg in expr.args:
                 self._check_expr(arg, scope)
@@ -444,12 +497,8 @@ class NameResolver:
                     self._check_expr(arm.body, arm_scope)
 
         elif isinstance(expr, rast.Await):
-            # await can only appear inside async functions
-            if not self.in_async_fn:
-                self.errors.append(NameError(
-                    "await can only be used inside async functions",
-                    expr.span
-                ))
+            # `await` is allowed in any fn: outside an `async fn` it drives
+            # the future in place (LANGUAGE_SPEC §16.2, AGAST #1823).
             self._check_expr(expr.expr, scope)
 
         elif isinstance(expr, (rast.Grouped, rast.TryOp, rast.HeapExpr)):
