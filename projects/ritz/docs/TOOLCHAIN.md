@@ -3,7 +3,7 @@
 ## The pin
 
 **ritz requires clang/LLVM 21.** CI installs and pins exactly that version
-(`.github/actions/install-toolchain`, driven by `CLANG_VERSION` in
+(`.github/actions/setup`, driven by `CLANG_VERSION` in
 `.github/workflows/main.yml` and `pr.yml`). Local development should match.
 
 Check what you have:
@@ -26,6 +26,28 @@ If your distro does not carry 21, use the upstream installer:
 ```sh
 wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s 21
 ```
+
+## shellcheck
+
+**ritz requires shellcheck 0.11**, and it comes from pip, not the system:
+`shellcheck-py`, a wheel that carries the static shellcheck binary, is in
+`requirements-dev.txt` and pinned in `requirements.lock` (AGAST #4360). The
+setup action's pip install puts it in CI's Python bin dir, and a gate host's
+shared venv (`~/dev/.venv`, or `~/dev/nevelis/.venv` on omegalisk) gets it
+from the same line, with no `sudo` and no system package:
+
+```sh
+python -m pip install -r projects/ritz/requirements.txt \
+    -r projects/ritz/requirements-dev.txt -c projects/ritz/requirements.lock
+shellcheck --version   # expect: version: 0.11.0, from the venv's bin/
+```
+
+Before this, the gate hosts had no shellcheck, so every shellcheck test
+skipped there and a shell finding failed CI only (#4359). Tests now get the
+binary from `ritz0/harness/shellcheck_tool.py`, which fails the test (never
+skips) when shellcheck is missing or is not the version the lock pins, and
+prints the install line above. To move to a newer shellcheck, change the pin
+in `requirements.lock` and the bound in `requirements-dev.txt` together.
 
 ## Why the version is pinned at all
 

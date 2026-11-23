@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+import shellcheck_tool
+
 pytestmark = pytest.mark.integration
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
@@ -88,14 +90,9 @@ def test_run_sh_is_executable_bash():
 def test_run_sh_shellcheck_clean():
     """AGAST #4359: this used to skip silently wherever shellcheck was not
     installed (the gate host), so a runner-only finding hid for weeks. The
-    findings are fixed; where the tool is missing, fail on a CI runner
-    instead of skipping, as tools/test_ci_workflows.py does (AGAST #4264)."""
-    shellcheck = shutil.which("shellcheck")
-    if shellcheck is None:
-        if os.environ.get("CI"):
-            pytest.fail("shellcheck is not on PATH on a CI runner")
-        pytest.skip("shellcheck not on PATH")
-    r = subprocess.run([shellcheck, str(RUN_SH)], capture_output=True, text=True)
+    findings are fixed, and shellcheck is pinned in the venv (AGAST #4360), so
+    a missing one fails here on every host, the gate included."""
+    r = subprocess.run([shellcheck_tool.shellcheck(), str(RUN_SH)], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
 
 

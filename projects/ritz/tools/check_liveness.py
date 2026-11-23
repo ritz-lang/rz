@@ -48,6 +48,7 @@ ENTRY_POINTS = {
     "cost_meter.py": "pytest plugin; conftest.py names it in pytest_plugins",
     "only_files.py": "pytest plugin; conftest.py names it in pytest_plugins",
     "read_guard.py": "pytest plugin; conftest.py names it in pytest_plugins",
+    "harness/shellcheck_tool.py": "test harness: the pinned shellcheck, imported only by tests (#4360)",
 }
 
 # Directories under ritz0/ that are sys.path roots of their own: a module in

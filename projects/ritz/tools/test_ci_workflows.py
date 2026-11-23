@@ -21,8 +21,6 @@ What these tests pin, and why:
   test-all never runs before a merge.
 """
 
-import os
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -30,6 +28,8 @@ import re
 
 import pytest
 import yaml
+
+import shellcheck_tool
 
 PKG_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PKG_DIR.parents[1]
@@ -137,17 +137,11 @@ def test_gate_coverage_is_documented_where_main_yml_points():
     assert sorted(re.findall(r"--job ([\w-]+)", cmd)) == sorted(set(jobs) - not_gated), cmd
 
 
-# Spawns shellcheck: integration even though it skips without it (AGAST #4264).
+# Spawns shellcheck (AGAST #4264); the pinned one, which fails rather than
+# skips when it is missing (AGAST #4360).
 @pytest.mark.integration
 def test_regression_sh_is_shellcheck_clean():
-    shellcheck = shutil.which("shellcheck")
-    if shellcheck is None:
-        # ubuntu-latest ships shellcheck, so CI always runs this; a local
-        # host without it skips rather than failing for a missing tool.
-        if os.environ.get("CI"):
-            pytest.fail("shellcheck is not on PATH on a CI runner")
-        pytest.skip("shellcheck not on PATH")
-    r = subprocess.run([shellcheck, "-x", "scripts/regression.sh"],
+    r = subprocess.run([shellcheck_tool.shellcheck(), "-x", "scripts/regression.sh"],
                        cwd=PKG_DIR, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
 

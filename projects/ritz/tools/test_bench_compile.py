@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+import shellcheck_tool
+
 REPO = Path(__file__).resolve().parents[3]
 COMPILE_SH = REPO / "bench" / "compile.sh"
 
@@ -391,14 +393,12 @@ def test_bootstrap_uses_real_target_and_keeps_ritzlib_objects(fake, tmp_path):
     assert make_log.count("distclean") >= 2
 
 
-# Spawns shellcheck: integration even though it skips without it (AGAST #4264).
+# Spawns shellcheck (AGAST #4264); the pinned one, which fails rather than
+# skips when it is missing (AGAST #4360).
 @pytest.mark.integration
 def test_shellcheck_clean():
-    sc = shutil.which("shellcheck")
-    if not sc:
-        pytest.skip("shellcheck not installed")
     r = subprocess.run(
-        [sc, str(COMPILE_SH)], capture_output=True, text=True, check=False
+        [shellcheck_tool.shellcheck(), str(COMPILE_SH)], capture_output=True, text=True, check=False
     )
     assert r.returncode == 0, r.stdout
 

@@ -68,6 +68,7 @@ LOCAL_MODULES = {
     "ritz1_unit",
     "smoke",
     "smoke_stack",
+    "shellcheck_tool",  # ritz0/harness/, the pinned shellcheck (AGAST #4360)
     "sweep_pytest_tmp",  # ages out /tmp/pytest-of-$USER (AGAST #4274)
     "standard_report",  # docs/STANDARD.md's conformance report (AGAST #1344)
     "ritzgen_py",
