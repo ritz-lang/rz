@@ -18,6 +18,14 @@ match_arm_set_block, and the merge is one phi typed exactly as a match's.
 A nested `if`/`else` that ends an arm (including an `else if` chain) is that
 arm's value.
 
+AGAST #4553: a block `if`/`else` as an OPERAND (`6 + if c` + then body +
+`else` + else body).  ritz0 accepts it; ritz1's primary_expr only had the
+else-less block form (#4543), so it failed at `else`.  The grammar now takes
+the with-else form too (expr_if_operand) and its else block's DEDENT ends
+the statement through `open_if_ended`, as the else-less form's does.  The
+`operand_*` programs below cover the let / return / fn-tail / narrowing-fit
+shapes, and are run on all three compilers.
+
 The inline_* programs cover the single-line `if c then a else b` form
 (AGAST #1753): primary_expr's `IF expr THEN expr ELSE expr`, lowered through
 the same EXPR_IF / expr_if path by expr_if_inline.  The narrowing parity
@@ -450,6 +458,77 @@ fn main() -> i32
     p.x + p.y
 """
 
+# AGAST #4553: a block `if`/`else` as a binary operand. ritz0 accepts it;
+# ritz1's primary_expr had only the else-less form (#4543), so it failed at
+# `else`. The else block ends the statement in DEDENT, as if_expr_rhs does.
+OPERAND_LET = """\
+fn pick(c: i32) -> i32
+    let x: i32 = 6 + if c == 1
+        1
+    else
+        2
+    x
+
+fn main() -> i32
+    if pick(1) != 7
+        return 1
+    if pick(0) != 8
+        return 2
+    42
+"""
+
+# The operand in a `return` value and in an fn tail.
+OPERAND_RETURN_TAIL = """\
+fn ret(c: i32) -> i32
+    return 100 + if c == 1
+        1
+    else
+        2
+
+fn tail(c: i32) -> i32
+    1000 + if c == 1
+        1
+    else
+        2
+
+fn main() -> i32
+    if ret(1) != 101 or ret(0) != 102
+        return 1
+    if tail(1) != 1001 or tail(0) != 1002
+        return 2
+    42
+"""
+
+# An `else if` chain as the operand's else arm, and a u8 slot whose literal
+# arms fit it (the slot-width merge, ritz0 _arith_context_nodes / #4553's
+# narrow_congs_fit).
+OPERAND_ELSE_IF_AND_U8 = """\
+fn classify(c: i32) -> i32
+    let x: i32 = 10 + if c < 0
+        1
+    else if c == 0
+        2
+    else
+        3
+    x
+
+fn byte_arms(c: i32, a: u8, b: u8) -> u8
+    let x: u8 = 6 + if c == 1
+        a
+    else
+        b
+    x
+
+fn main() -> i32
+    if classify(0 - 5) != 11 or classify(0) != 12 or classify(1) != 13
+        return 1
+    if (byte_arms(1, 1, 2) as i32) != 7
+        return 2
+    if (byte_arms(0, 1, 2) as i32) != 8
+        return 3
+    42
+"""
+
 PROGRAMS = {
     "assign_value": ASSIGN_VALUE,
     "struct_lit_field": STRUCT_LIT_FIELD,
@@ -474,7 +553,16 @@ PROGRAMS = {
     "diverging_then": DIVERGING_THEN,
     "diverging_strview": DIVERGING_STRVIEW,
     "diverging_match": DIVERGING_MATCH,
+    # AGAST #4553: block `if`/`else` as an operand.
+    "operand_let": OPERAND_LET,
+    "operand_return_tail": OPERAND_RETURN_TAIL,
+    "operand_else_if_and_u8": OPERAND_ELSE_IF_AND_U8,
 }
+
+# The #4553 programs, run on the self-hosted build too (its parser and Sema
+# are the ones ritz1 compiled).
+OPERAND_PROGRAMS = ["operand_let", "operand_return_tail",
+                    "operand_else_if_and_u8"]
 
 # An if-expression with no `else` has no value; both compilers reject it.
 MALFORMED = {
@@ -579,6 +667,18 @@ def test_ritz1_selfhosted_if_value_after_assign_and_in_a_literal(tmp_path, name)
     """AGAST #2369, on the self-hosted build: its lexer and parser are the ones
     ritz1 compiled.  (#2369's lexer layout frame, which let a block `if` open
     inside a literal's `{`, went with LARB R46a, #3388.)"""
+    from test_ref_into_value import _run as _run_any
+    assert _run_any("ritz1_selfhosted", tmp_path, name, PROGRAMS[name]) == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", OPERAND_PROGRAMS)
+def test_ritz1_selfhosted_if_operand(tmp_path, name):
+    """AGAST #4553: an `if`/`else` operand in let / return / tail / u8 slot.
+
+    ritz0 and ritz1 are covered by the PROGRAMS rows above; this asserts the
+    output-parity third compiler reaches the same 42.
+    """
     from test_ref_into_value import _run as _run_any
     assert _run_any("ritz1_selfhosted", tmp_path, name, PROGRAMS[name]) == 42
 

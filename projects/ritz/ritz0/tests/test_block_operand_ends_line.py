@@ -214,11 +214,11 @@ def test_block_operand_then_store_and_tail_runs(tmp_path, name, program):
     assert _run("ritz0", tmp_path, name, program) == 0
 
 
-# ritz1 has no statement form that ends in a block operand (only `let x =
-# match …` / `if …` RHS forms), so before #3435 it took one only when the next
-# line began with an operator, and then swallowed that line: here
-# `y = 5 + 2 - y`, 6.  Now the line is a statement and the operand is refused
-# there.  (Block operands on ritz1 are a parity gap of their own: #4049.)
+# Before #3435 ritz1 took a block operand only when the next line began with
+# an operator, and then swallowed that line: here `y = 5 + 2 - y`, 6.  Now
+# the line is a statement and the operand is refused there.  The refusal row
+# uses `match`: a block `if`/`else` operand is parsed since #4553, but a
+# `match` operand is still ritz1's parity gap (#4049).
 RITZ1_SWALLOWED = """\
 fn h(c: i32) -> i32
     var y: i32 = 1

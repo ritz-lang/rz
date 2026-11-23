@@ -1040,6 +1040,11 @@ fn narrow_unproven_in(env: *NarrowEnv, init: *Expr, decl: i32) -> i32
             return 0
     if narrow_arms_fit(env, init, decl) == 1
         return 0
+    # AGAST #4553: a merge reached through congruent operators (see
+    # narrow_congs_fit).  narrow_src_type_in reports the chain's two literal
+    # arms as i64; the merge itself is emitted at the slot's width.
+    if narrow_congs_fit(env, init, decl) == 1
+        return 0
     src
 
 # AGAST #4081 (ritz0's `_arms_fit`, #1444): is `e` an if/match each of whose
@@ -1071,6 +1076,48 @@ fn narrow_arms_fit(env: *NarrowEnv, e: *Expr, decl: i32) -> i32
                     return 0
         arm = arm.next
     1
+
+# AGAST #4553: `let x: i32 = 6 + if c then 1 else 2` is not a narrowing in
+# ritz0.  The operators `+ - * & | ^ <<` are congruent mod 2**width
+# (#4219), so an if / match reached through them is emitted at the slot's
+# width and its literal arms take that width (ritzo's _arith_context_nodes).
+# narrow_src_type_in joins two literal arms to i64 outside a slot's own tail,
+# which overstates that merge.  Judge the reachable merge by its arms
+# instead.  A side scores -1 (fails), 0 (fine, no merge) or 1 (fine, reached
+# a merge); only a chain that reaches one is exempt, so `let x: u8 = 200 +
+# 100`, whose SUM must fit rather than an arm, is still refused.
+fn narrow_congs_fit(env: *NarrowEnv, e: *Expr, decl: i32) -> i32
+    if e == null
+        return -1
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        if narrow_arms_fit(env, e, decl) == 1
+            return 1
+        return -1
+    if e.kind == EXPR_BINARY and narrow_is_congruent_op(e.op) == 1 and e.wrapping == 0
+        let l: i32 = narrow_congs_fit(env, e.left, decl)
+        if l < 0
+            return -1
+        if e.op == OP_SHL
+            # A shift's right operand is a count, not a value at the slot's
+            # width (ritz0's `_arith_context_nodes` does not descend into it).
+            return l
+        let r: i32 = narrow_congs_fit(env, e.right, decl)
+        if r < 0
+            return -1
+        if l == 1 or r == 1
+            return 1
+        return 0
+    var v: i64 = 0
+    if narrow_const_value(env, e, 1, @v) == 1
+        if narrow_fits(v, decl) == 1
+            return 0
+        return -1
+    let at: i32 = narrow_src_type_in(env, e, 1)
+    if at == NARROW_UNKNOWN
+        return -1
+    if ty_bits(at) <= ty_bits(decl)
+        return 0
+    -1
 
 fn narrow_report(sm: *Sema, stmt: *Stmt, decl: i32, src: i32)
     if stmt.var_src_file != null
