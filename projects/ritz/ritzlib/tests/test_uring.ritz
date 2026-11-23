@@ -115,3 +115,79 @@ fn test_uring_nop()
 
     ring.cqe_seen(@*cqe)
     ring.destroy()
+
+# ----------------------------------------------------------------------------
+# Free-running counters (AGAST #4548). The kernel's SQ/CQ head and tail are
+# u32 counters that wrap; only the slot index is masked. These rows build a
+# ring over local memory with the counters at the i32 wrap point, so plain
+# `+`/`-` (which trap, LARB R63) would stop the program.
+# ----------------------------------------------------------------------------
+
+fn wrap_ring(ring: *IoUring, sq_head: *i32, sq_tail: *i32, cq_head: *i32, cq_tail: *i32, sq_array: *i32, sqes: *IoUringSqe)
+    ring.ring_fd = 0 - 1
+    ring.sq_head = sq_head
+    ring.sq_tail = sq_tail
+    ring.sq_mask = 7
+    ring.sq_entries = 8
+    ring.sq_array = sq_array
+    ring.sqes = sqes
+    ring.cq_head = cq_head
+    ring.cq_tail = cq_tail
+    ring.cq_mask = 7
+    ring.cq_entries = 8
+
+[[test]]
+fn test_uring_sq_tail_wraps()
+    var sq_head: i32 = 2147483647 - 2
+    var sq_tail: i32 = 2147483647
+    var cq_head: i32 = 0
+    var cq_tail: i32 = 0
+    var sq_array: [8]i32
+    var sqes: [8]IoUringSqe
+    var ring: IoUring
+    wrap_ring(@ring, @sq_head, @sq_tail, @cq_head, @cq_tail, @sq_array[0], @sqes[0])
+
+    # Three in flight across the wrap: the ring still has room.
+    var sqe: *IoUringSqe = null
+    match ring.get_sqe()
+        Some(p) => sqe = p
+        None =>
+            assert false
+    assert sqe == @sqes[7]
+    ring.sqe_submit()
+    assert sq_tail == 0 - 2147483647 - 1
+
+[[test]]
+fn test_uring_submit_counts_across_wrap()
+    var sq_head: i32 = 2147483647
+    var sq_tail: i32 = 0 - 2147483647 - 1
+    var cq_head: i32 = 0
+    var cq_tail: i32 = 0
+    var sq_array: [8]i32
+    var sqes: [8]IoUringSqe
+    var ring: IoUring
+    wrap_ring(@ring, @sq_head, @sq_tail, @cq_head, @cq_tail, @sq_array[0], @sqes[0])
+
+    # One pending SQE (tail - head wraps to 1); fd -1 makes the enter fail
+    # with -EBADF instead of submitting anything.
+    assert ring.submit() < 0
+    assert ring.submit_and_wait(0) < 0
+
+[[test]]
+fn test_uring_cq_head_wraps()
+    var sq_head: i32 = 0
+    var sq_tail: i32 = 0
+    var cq_head: i32 = 2147483647
+    var cq_tail: i32 = 0 - 2147483647 - 1
+    var sq_array: [8]i32
+    var sqes: [8]IoUringSqe
+    var ring: IoUring
+    wrap_ring(@ring, @sq_head, @sq_tail, @cq_head, @cq_tail, @sq_array[0], @sqes[0])
+
+    var cqe: *IoUringCqe = null
+    match ring.peek_cqe()
+        Some(p) => cqe = p
+        None =>
+            assert false
+    ring.cqe_seen(@*cqe)
+    assert cq_head == cq_tail

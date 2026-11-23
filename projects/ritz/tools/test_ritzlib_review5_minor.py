@@ -36,8 +36,14 @@ def _files(root: Path, pattern: str):
 
 
 def test_no_digit_loop_outside_fmt():
-    """`git grep -nE '% 10([^0-9]|$)' ritzlib -- ':!*fmt/digits.ritz' ':!*test*'` is empty."""
-    digit_loop = re.compile(r"% 10(?![0-9])")
+    """`git grep -nE '% 10([^0-9]|$)' ritzlib -- ':!*fmt/digits.ritz' ':!*test*'` is empty.
+
+    `% 10` is the modulo; `*% 10`, `+% 10` and `-% 10` are the wrapping
+    operators (LARB R63), e.g. atoi's `result *% 10` (AGAST #4548), and are
+    not a digit loop.
+    """
+    digit_loop = re.compile(r"(?<![*+\-])% 10(?![0-9])")
+    assert digit_loop.search("n % 10") and not digit_loop.search("r *% 10 +% d")
     offenders = []
     for path in _files(RITZLIB, "*"):
         rel = str(path.relative_to(RITZLIB))
