@@ -9,7 +9,7 @@ import ritzlib.strview
 import lib.html.token { Token, TOKEN_START_TAG, TOKEN_END_TAG, TOKEN_CHARACTER, TOKEN_COMMENT, TOKEN_DOCTYPE, TOKEN_EOF }
 import lib.dom.tag { Tag, tag_from_name, tag_is_void, tag_is_formatting, tag_is_special }
 import lib.dom.attribute { Attribute }
-import lib.event { EventHandler, emit_document_start, emit_document_end, emit_element_start, emit_element_end, emit_text, emit_comment, emit_doctype }
+import lib.event { EventSink, emit_document_start, emit_document_end, emit_element_start, emit_element_end, emit_text, emit_comment, emit_doctype }
 
 # =============================================================================
 # Insertion Modes
@@ -68,9 +68,9 @@ pub struct FormattingEntry
 # Tree Builder State
 # =============================================================================
 
-pub struct TreeBuilder
-    # Event sink for DOM events
-    sink: EventHandler
+pub struct TreeBuilder<S: EventSink>
+    # Event sink for DOM events, owned by value (a concrete type: R55)
+    sink: S
 
     # Current insertion mode
     mode: i32
@@ -101,8 +101,8 @@ pub struct TreeBuilder
 # Initialization
 # =============================================================================
 
-pub fn tree_builder_new(sink: EventHandler) -> TreeBuilder
-    var tb: TreeBuilder
+pub fn tree_builder_new<S: EventSink>(sink: S) -> TreeBuilder<S>
+    var tb: TreeBuilder<S>
 
     tb.sink = sink
     tb.mode = MODE_INITIAL
@@ -122,23 +122,23 @@ pub fn tree_builder_new(sink: EventHandler) -> TreeBuilder
 # Stack Operations
 # =============================================================================
 
-fn push_element(tb:& TreeBuilder, tag: Tag)
+fn push_element<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag)
     if tb.stack_len < MAX_STACK_DEPTH
         tb.stack[tb.stack_len].tag = tag
         tb.stack_len = tb.stack_len + 1
 
-fn pop_element(tb:& TreeBuilder) -> Tag
+fn pop_element<S: EventSink>(tb:& TreeBuilder<S>) -> Tag
     if tb.stack_len > 0
         tb.stack_len = tb.stack_len - 1
         return tb.stack[tb.stack_len].tag
     Tag.Unknown("")
 
-fn current_node(tb: @TreeBuilder) -> Tag
+fn current_node<S: EventSink>(tb: @TreeBuilder<S>) -> Tag
     if tb.stack_len > 0
         return tb.stack[tb.stack_len - 1].tag
     Tag.Unknown("")
 
-fn stack_has_element_in_scope(tb: @TreeBuilder, target: Tag) -> i32
+fn stack_has_element_in_scope<S: EventSink>(tb: @TreeBuilder<S>, target: Tag) -> i32
     # Walk stack from top, check if target is in scope
     # Scope is bounded by certain elements (table, html, etc.)
     # TODO: Implement proper scope checking
@@ -157,7 +157,7 @@ fn stack_has_element_in_scope(tb: @TreeBuilder, target: Tag) -> i32
 # Formatting Elements
 # =============================================================================
 
-fn push_formatting_element(tb:& TreeBuilder, tag: Tag, attrs: *Attribute, attr_count: u32)
+fn push_formatting_element<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag, attrs: *Attribute, attr_count: u32)
     if tb.formatting_len < MAX_FORMATTING_ELEMENTS
         tb.formatting[tb.formatting_len].kind = FORMATTING_ELEMENT
         tb.formatting[tb.formatting_len].tag = tag
@@ -165,18 +165,18 @@ fn push_formatting_element(tb:& TreeBuilder, tag: Tag, attrs: *Attribute, attr_c
         tb.formatting[tb.formatting_len].attr_count = attr_count
         tb.formatting_len = tb.formatting_len + 1
 
-fn push_formatting_marker(tb:& TreeBuilder)
+fn push_formatting_marker<S: EventSink>(tb:& TreeBuilder<S>)
     if tb.formatting_len < MAX_FORMATTING_ELEMENTS
         tb.formatting[tb.formatting_len].kind = FORMATTING_MARKER
         tb.formatting_len = tb.formatting_len + 1
 
-fn clear_formatting_to_marker(tb:& TreeBuilder)
+fn clear_formatting_to_marker<S: EventSink>(tb:& TreeBuilder<S>)
     while tb.formatting_len > 0
         tb.formatting_len = tb.formatting_len - 1
         if tb.formatting[tb.formatting_len].kind == FORMATTING_MARKER
             break
 
-fn reconstruct_active_formatting(tb:& TreeBuilder)
+fn reconstruct_active_formatting<S: EventSink>(tb:& TreeBuilder<S>)
     # TODO: Implement adoption agency adjacent algorithm
     # For now, stub
     pass
@@ -185,7 +185,7 @@ fn reconstruct_active_formatting(tb:& TreeBuilder)
 # Pending Text
 # =============================================================================
 
-fn flush_pending_text(tb:& TreeBuilder)
+fn flush_pending_text<S: EventSink>(tb:& TreeBuilder<S>)
     if tb.pending_text_len > 0
         let text = StrView {
             ptr: @tb.pending_text[0],
@@ -194,7 +194,7 @@ fn flush_pending_text(tb:& TreeBuilder)
         emit_text(tb.sink, text)
         tb.pending_text_len = 0
 
-fn append_pending_text(tb:& TreeBuilder, c: u8)
+fn append_pending_text<S: EventSink>(tb:& TreeBuilder<S>, c: u8)
     if tb.pending_text_len < 4096
         tb.pending_text[tb.pending_text_len] = c
         tb.pending_text_len = tb.pending_text_len + 1
@@ -203,7 +203,7 @@ fn append_pending_text(tb:& TreeBuilder, c: u8)
 # Token Processing - Main Entry Point
 # =============================================================================
 
-pub fn tree_builder_process_token(tb:& TreeBuilder, token: Token)
+pub fn tree_builder_process_token<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     match tb.mode
         MODE_INITIAL => process_initial(tb, token)
         MODE_BEFORE_HTML => process_before_html(tb, token)
@@ -225,7 +225,7 @@ pub fn tree_builder_process_token(tb:& TreeBuilder, token: Token)
 # Insertion Mode Handlers
 # =============================================================================
 
-fn process_initial(tb:& TreeBuilder, token: Token)
+fn process_initial<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     if token.kind == TOKEN_DOCTYPE
         emit_doctype(tb.sink, token.doctype.name, token.doctype.public_id, token.doctype.system_id)
         tb.mode = MODE_BEFORE_HTML
@@ -242,7 +242,7 @@ fn process_initial(tb:& TreeBuilder, token: Token)
         tb.mode = MODE_BEFORE_HTML
         process_before_html(tb, token)
 
-fn process_before_html(tb:& TreeBuilder, token: Token)
+fn process_before_html<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     if token.kind == TOKEN_DOCTYPE
         # Parse error, ignore
         return
@@ -277,11 +277,11 @@ fn process_before_html(tb:& TreeBuilder, token: Token)
         tb.mode = MODE_BEFORE_HEAD
         process_before_head(tb, token)
 
-fn insert_html_element(tb:& TreeBuilder)
+fn insert_html_element<S: EventSink>(tb:& TreeBuilder<S>)
     emit_element_start(tb.sink, Tag.Html, null, 0, 0)
     push_element(tb, Tag.Html)
 
-fn process_before_head(tb:& TreeBuilder, token: Token)
+fn process_before_head<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     if token.kind == TOKEN_CHARACTER
         let c = token.character.char
         if c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 12  # 12 = form feed (no '\f' escape)
@@ -318,12 +318,12 @@ fn process_before_head(tb:& TreeBuilder, token: Token)
         tb.mode = MODE_IN_HEAD
         process_in_head(tb, token)
 
-fn insert_head_element(tb:& TreeBuilder)
+fn insert_head_element<S: EventSink>(tb:& TreeBuilder<S>)
     emit_element_start(tb.sink, Tag.Head, null, 0, 0)
     push_element(tb, Tag.Head)
     tb.head_element_idx = tb.stack_len as i32 - 1
 
-fn process_in_head(tb:& TreeBuilder, token: Token)
+fn process_in_head<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     if token.kind == TOKEN_CHARACTER
         let c = token.character.char
         if c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 12  # 12 = form feed (no '\f' escape)
@@ -393,14 +393,14 @@ fn process_in_head(tb:& TreeBuilder, token: Token)
     else
         pop_head_and_continue(tb, token)
 
-fn pop_head_and_continue(tb:& TreeBuilder, token: Token)
+fn pop_head_and_continue<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     flush_pending_text(tb)
     emit_element_end(tb.sink, Tag.Head)
     pop_element(tb)
     tb.mode = MODE_AFTER_HEAD
     process_after_head(tb, token)
 
-fn process_after_head(tb:& TreeBuilder, token: Token)
+fn process_after_head<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     if token.kind == TOKEN_CHARACTER
         let c = token.character.char
         if c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 12  # 12 = form feed (no '\f' escape)
@@ -449,7 +449,7 @@ fn process_after_head(tb:& TreeBuilder, token: Token)
     else
         insert_body_and_continue(tb, token)
 
-fn insert_body_and_continue(tb:& TreeBuilder, token: Token)
+fn insert_body_and_continue<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     flush_pending_text(tb)
     emit_element_start(tb.sink, Tag.Body, null, 0, 0)
     push_element(tb, Tag.Body)
@@ -457,7 +457,7 @@ fn insert_body_and_continue(tb:& TreeBuilder, token: Token)
     tb.mode = MODE_IN_BODY
     process_in_body(tb, token)
 
-fn process_in_body(tb:& TreeBuilder, token: Token)
+fn process_in_body<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     if token.kind == TOKEN_CHARACTER
         let c = token.character.char
         if c == 0
@@ -490,7 +490,7 @@ fn process_in_body(tb:& TreeBuilder, token: Token)
         # For now, just emit document end
         close_all_elements(tb)
 
-fn process_start_tag_in_body(tb:& TreeBuilder, token: Token)
+fn process_start_tag_in_body<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     let name = token.start_tag.name
     let tag = tag_from_name(name)
 
@@ -642,7 +642,7 @@ fn process_start_tag_in_body(tb:& TreeBuilder, token: Token)
         emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
         push_element(tb, tag)
 
-fn process_end_tag_in_body(tb:& TreeBuilder, token: Token)
+fn process_end_tag_in_body<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     let name = token.end_tag.name
     let tag = tag_from_name(name)
 
@@ -711,7 +711,7 @@ fn process_end_tag_in_body(tb:& TreeBuilder, token: Token)
         # Any other end tag - walk up stack
         close_element_any(tb, tag)
 
-fn process_text(tb:& TreeBuilder, token: Token)
+fn process_text<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     if token.kind == TOKEN_CHARACTER
         append_pending_text(tb, token.character.char as u8)
     else if token.kind == TOKEN_EOF
@@ -727,24 +727,24 @@ fn process_text(tb:& TreeBuilder, token: Token)
         pop_element(tb)
         tb.mode = tb.original_mode
 
-fn process_in_table(tb:& TreeBuilder, token: Token)
+fn process_in_table<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     # TODO: Implement table parsing
     # For now, foster parent into body
     process_in_body(tb, token)
 
-fn process_in_table_body(tb:& TreeBuilder, token: Token)
+fn process_in_table_body<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     # TODO: Implement
     process_in_body(tb, token)
 
-fn process_in_row(tb:& TreeBuilder, token: Token)
+fn process_in_row<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     # TODO: Implement
     process_in_body(tb, token)
 
-fn process_in_cell(tb:& TreeBuilder, token: Token)
+fn process_in_cell<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     # TODO: Implement
     process_in_body(tb, token)
 
-fn process_in_select(tb:& TreeBuilder, token: Token)
+fn process_in_select<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     # TODO: Implement
     if token.kind == TOKEN_CHARACTER
         append_pending_text(tb, token.character.char as u8)
@@ -761,7 +761,7 @@ fn process_in_select(tb:& TreeBuilder, token: Token)
             close_element(tb, Tag.Select)
             tb.mode = MODE_IN_BODY
 
-fn process_after_body(tb:& TreeBuilder, token: Token)
+fn process_after_body<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     if token.kind == TOKEN_CHARACTER
         let c = token.character.char
         if c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 12  # 12 = form feed (no '\f' escape)
@@ -789,7 +789,7 @@ fn process_after_body(tb:& TreeBuilder, token: Token)
     else if token.kind == TOKEN_EOF
         close_all_elements(tb)
 
-fn process_after_after_body(tb:& TreeBuilder, token: Token)
+fn process_after_after_body<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     if token.kind == TOKEN_COMMENT
         emit_comment(tb.sink, token.comment.data)
     else if token.kind == TOKEN_DOCTYPE
@@ -814,7 +814,7 @@ fn process_after_after_body(tb:& TreeBuilder, token: Token)
 # Helper Functions
 # =============================================================================
 
-fn has_p_in_button_scope(tb: @TreeBuilder) -> i32
+fn has_p_in_button_scope<S: EventSink>(tb: @TreeBuilder<S>) -> i32
     # Walk stack looking for <p>, bounded by button scope elements
     var i = tb.stack_len
     while i > 0
@@ -826,8 +826,10 @@ fn has_p_in_button_scope(tb: @TreeBuilder) -> i32
             return 0
     0
 
+# `pub` only so the generic TreeBuilder<S> fns' instances, emitted in the
+# caller's module, can link to them (AGAST #4608). Not part of lexis's API.
 # For has_p_in_button_scope (variant-only): 1 = <p>, 2 = scope boundary
-fn button_scope_kind(tag: Tag) -> i32
+pub fn button_scope_kind(tag: Tag) -> i32
     match tag
         Tag.P => 1
         Tag.Button => 2
@@ -835,7 +837,7 @@ fn button_scope_kind(tag: Tag) -> i32
         Tag.Div => 2
         _ => 0
 
-fn stack_has_template(tb: @TreeBuilder) -> i32
+fn stack_has_template<S: EventSink>(tb: @TreeBuilder<S>) -> i32
     var i = tb.stack_len
     while i > 0
         i = i - 1
@@ -843,22 +845,23 @@ fn stack_has_template(tb: @TreeBuilder) -> i32
             return 1
     0
 
-# Variant-only test (no payload to compare)
-fn tag_is_template(tag: Tag) -> bool
+# Variant-only test (no payload to compare). `pub` for #4608, as above.
+pub fn tag_is_template(tag: Tag) -> bool
     match tag
         Tag.Template => true
         _ => false
 
-fn tag_is_p(tag: Tag) -> bool
+# `pub` for #4608, as above.
+pub fn tag_is_p(tag: Tag) -> bool
     match tag
         Tag.P => true
         _ => false
 
-fn stack_has_element_in_list_scope(tb: @TreeBuilder, target: Tag) -> i32
+fn stack_has_element_in_list_scope<S: EventSink>(tb: @TreeBuilder<S>, target: Tag) -> i32
     # Similar to scope but with list-specific boundaries
     stack_has_element_in_scope(tb, target)
 
-fn close_p_element(tb:& TreeBuilder)
+fn close_p_element<S: EventSink>(tb:& TreeBuilder<S>)
     # Pop elements until we pop <p>
     emit_element_end(tb.sink, Tag.P)
     while tb.stack_len > 0
@@ -868,7 +871,7 @@ fn close_p_element(tb:& TreeBuilder)
         else
             emit_element_end(tb.sink, tag)
 
-fn close_element(tb:& TreeBuilder, target: Tag)
+fn close_element<S: EventSink>(tb:& TreeBuilder<S>, target: Tag)
     # Pop until we find target
     while tb.stack_len > 0
         let tag = current_node(@tb)
@@ -877,16 +880,16 @@ fn close_element(tb:& TreeBuilder, target: Tag)
         # TODO: proper tag comparison
         break  # Simplified
 
-fn close_element_any(tb:& TreeBuilder, target: Tag)
+fn close_element_any<S: EventSink>(tb:& TreeBuilder<S>, target: Tag)
     # Walk up stack, pop if found
     close_element(tb, target)
 
-fn run_adoption_agency(tb:& TreeBuilder, tag: Tag)
+fn run_adoption_agency<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag)
     # TODO: Implement full adoption agency algorithm
     # For now, just close the element
     close_element(tb, tag)
 
-fn close_all_elements(tb:& TreeBuilder)
+fn close_all_elements<S: EventSink>(tb:& TreeBuilder<S>)
     while tb.stack_len > 0
         let tag = pop_element(tb)
         emit_element_end(tb.sink, tag)
@@ -896,6 +899,6 @@ fn close_all_elements(tb:& TreeBuilder)
 # High-Level API
 # =============================================================================
 
-pub fn tree_builder_finish(tb:& TreeBuilder)
+pub fn tree_builder_finish<S: EventSink>(tb:& TreeBuilder<S>)
     flush_pending_text(tb)
     close_all_elements(tb)

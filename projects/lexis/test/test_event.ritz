@@ -1,16 +1,18 @@
-# test/test_event.ritz - events reach a handler that isn't the no-op one (#2216)
+# test/test_event.ritz - events reach a sink that isn't the no-op one (#2216, #4012)
 #
-# EventHandler is a struct of fn pointers plus a ctx (Ritz has no dynamic
-# dispatch). These tests build a recording handler, the way tempest's
-# lexis_bridge would, and check each emit_* helper calls its own callback with
-# the handler's ctx and the event's data.
+# A sink is any type that implements `trait EventSink`; the emit_* helpers and
+# the parser are generic over it, so each call resolves at compile time (no
+# fn pointers, no ctx cast: LARB R80, R55). These tests implement EventSink on
+# a recording struct, the way tempest's lexis_bridge does, and check each
+# emit_* helper calls its own method with the event's data.
 
-import lib.event { EventHandler, no_op_handler_new, emit_document_start, emit_document_end, emit_element_start, emit_element_end, emit_text, emit_comment, emit_doctype, emit_error, emit_warning, ElementStartEvent, ElementEndEvent, TextEvent, CommentEvent, DoctypeEvent, ParseErrorEvent, ParseWarningEvent, PARSE_ERROR_UNCLOSED_TAG, PARSE_WARNING_DEPRECATED }
+import lib.event { EventSink, NoOpSink, emit_document_start, emit_document_end, emit_element_start, emit_element_end, emit_text, emit_comment, emit_doctype, emit_error, emit_warning, ElementStartEvent, ElementEndEvent, TextEvent, CommentEvent, DoctypeEvent, ParseErrorEvent, ParseWarningEvent, PARSE_ERROR_UNCLOSED_TAG, PARSE_WARNING_DEPRECATED }
 import lib.dom.tag { Tag }
 import lib.dom.attribute { Attribute }
+import lib.lexis { HtmlParser, html_parser_new, html_parser_run }
 
-# What the recording callbacks saw. One counter per callback, so a helper
-# that calls the wrong callback shows up as the wrong counter moving.
+# What the sink saw. One counter per method, so a helper that calls the
+# wrong method shows up as the wrong counter moving.
 struct Recorder
     document_starts: i32
     document_ends: i32
@@ -36,108 +38,82 @@ fn recorder_new() -> Recorder
         last_kind: -1, last_line: 0, last_col: 0
     }
 
-fn rec_document_start(ctx: *u8)
-    let r = ctx as *Recorder
-    r.document_starts = r.document_starts + 1
+impl EventSink for Recorder
+    fn on_document_start(self:&)
+        self.document_starts = self.document_starts + 1
 
-fn rec_document_end(ctx: *u8)
-    let r = ctx as *Recorder
-    r.document_ends = r.document_ends + 1
+    fn on_document_end(self:&)
+        self.document_ends = self.document_ends + 1
 
-fn rec_element_start(ctx: *u8, event: @ElementStartEvent)
-    let r = ctx as *Recorder
-    r.element_starts = r.element_starts + 1
-    r.last_attr_count = event.attr_count
-    r.last_self_closing = event.self_closing
+    fn on_element_start(self:&, event: @ElementStartEvent)
+        self.element_starts = self.element_starts + 1
+        self.last_attr_count = event.attr_count
+        self.last_self_closing = event.self_closing
 
-fn rec_element_end(ctx: *u8, event: @ElementEndEvent)
-    let r = ctx as *Recorder
-    r.element_ends = r.element_ends + 1
+    fn on_element_end(self:&, event: @ElementEndEvent)
+        self.element_ends = self.element_ends + 1
 
-fn rec_text(ctx: *u8, event: @TextEvent)
-    let r = ctx as *Recorder
-    r.texts = r.texts + 1
-    r.last_len = event.content.len as i64
+    fn on_text(self:&, event: @TextEvent)
+        self.texts = self.texts + 1
+        self.last_len = event.content.len as i64
 
-fn rec_comment(ctx: *u8, event: @CommentEvent)
-    let r = ctx as *Recorder
-    r.comments = r.comments + 1
-    r.last_len = event.content.len as i64
+    fn on_comment(self:&, event: @CommentEvent)
+        self.comments = self.comments + 1
+        self.last_len = event.content.len as i64
 
-fn rec_doctype(ctx: *u8, event: @DoctypeEvent)
-    let r = ctx as *Recorder
-    r.doctypes = r.doctypes + 1
-    r.last_len = event.name.len as i64
+    fn on_doctype(self:&, event: @DoctypeEvent)
+        self.doctypes = self.doctypes + 1
+        self.last_len = event.name.len as i64
 
-fn rec_error(ctx: *u8, event: @ParseErrorEvent)
-    let r = ctx as *Recorder
-    r.errors = r.errors + 1
-    r.last_kind = event.kind
-    r.last_line = event.line
-    r.last_col = event.col
+    fn on_error(self:&, event: @ParseErrorEvent)
+        self.errors = self.errors + 1
+        self.last_kind = event.kind
+        self.last_line = event.line
+        self.last_col = event.col
 
-fn rec_warning(ctx: *u8, event: @ParseWarningEvent)
-    let r = ctx as *Recorder
-    r.warnings = r.warnings + 1
-    r.last_kind = event.kind
-    r.last_line = event.line
-    r.last_col = event.col
+    fn on_warning(self:&, event: @ParseWarningEvent)
+        self.warnings = self.warnings + 1
+        self.last_kind = event.kind
+        self.last_line = event.line
+        self.last_col = event.col
 
-fn recording_handler(r: *Recorder) -> EventHandler
-    EventHandler {
-        ctx: r as *u8,
-        on_document_start: rec_document_start,
-        on_document_end: rec_document_end,
-        on_element_start: rec_element_start,
-        on_element_end: rec_element_end,
-        on_text: rec_text,
-        on_comment: rec_comment,
-        on_doctype: rec_doctype,
-        on_error: rec_error,
-        on_warning: rec_warning
-    }
-
-# Sum of every counter: a helper that fires exactly one callback moves it by 1.
+# Sum of every counter: a helper that fires exactly one method moves it by 1.
 fn total(r: @Recorder) -> i32
     r.document_starts + r.document_ends + r.element_starts + r.element_ends + r.texts + r.comments + r.doctypes + r.errors + r.warnings
 
 [[test]]
-fn test_document_start_and_end_reach_handler() -> i32
+fn test_document_start_and_end_reach_sink() -> i32
     var r = recorder_new()
-    var h = recording_handler(@&r as *Recorder)
-    emit_document_start(h)
+    emit_document_start(r)
     assert r.document_starts == 1
     assert total(@r) == 1
-    emit_document_end(h)
+    emit_document_end(r)
     assert r.document_ends == 1
     assert total(@r) == 2
     0
 
 [[test]]
-fn test_text_reaches_handler_with_content() -> i32
+fn test_text_reaches_sink_with_content() -> i32
     var r = recorder_new()
-    var h = recording_handler(@&r as *Recorder)
-    emit_text(h, "hello")
+    emit_text(r, "hello")
     assert r.texts == 1
     assert r.last_len == 5
     assert total(@r) == 1
     0
 
 [[test]]
-fn test_comment_reaches_handler_with_content() -> i32
+fn test_comment_reaches_sink_with_content() -> i32
     var r = recorder_new()
-    var h = recording_handler(@&r as *Recorder)
-    emit_comment(h, "note")
+    emit_comment(r, "note")
     assert r.comments == 1
     assert r.last_len == 4
     assert total(@r) == 1
     0
 
 [[test]]
-fn test_doctype_reaches_handler_with_name() -> i32
+fn test_doctype_reaches_sink_with_name() -> i32
     var r = recorder_new()
-    var h = recording_handler(@&r as *Recorder)
-    emit_doctype(h, "html", "", "")
+    emit_doctype(r, "html", "", "")
     assert r.doctypes == 1
     assert r.last_len == 4
     assert total(@r) == 1
@@ -146,9 +122,8 @@ fn test_doctype_reaches_handler_with_name() -> i32
 [[test]]
 fn test_element_start_copies_attrs_and_flag() -> i32
     var r = recorder_new()
-    var h = recording_handler(@&r as *Recorder)
     var attrs: [2]Attribute
-    emit_element_start(h, Tag.Br, @&attrs[0] as *Attribute, 2, 1)
+    emit_element_start(r, Tag.Br, @&attrs[0] as *Attribute, 2, 1)
     assert r.element_starts == 1
     assert r.last_attr_count == 2
     assert r.last_self_closing == 1
@@ -158,27 +133,24 @@ fn test_element_start_copies_attrs_and_flag() -> i32
 [[test]]
 fn test_element_start_with_null_attrs_has_none() -> i32
     var r = recorder_new()
-    var h = recording_handler(@&r as *Recorder)
-    emit_element_start(h, Tag.Html, null, 0, 0)
+    emit_element_start(r, Tag.Html, null, 0, 0)
     assert r.element_starts == 1
     assert r.last_attr_count == 0
     assert r.last_self_closing == 0
     0
 
 [[test]]
-fn test_element_end_reaches_handler() -> i32
+fn test_element_end_reaches_sink() -> i32
     var r = recorder_new()
-    var h = recording_handler(@&r as *Recorder)
-    emit_element_end(h, Tag.Html)
+    emit_element_end(r, Tag.Html)
     assert r.element_ends == 1
     assert total(@r) == 1
     0
 
 [[test]]
-fn test_error_reaches_handler_with_position() -> i32
+fn test_error_reaches_sink_with_position() -> i32
     var r = recorder_new()
-    var h = recording_handler(@&r as *Recorder)
-    emit_error(h, PARSE_ERROR_UNCLOSED_TAG, "unclosed", 3, 7)
+    emit_error(r, PARSE_ERROR_UNCLOSED_TAG, "unclosed", 3, 7)
     assert r.errors == 1
     assert r.last_kind == PARSE_ERROR_UNCLOSED_TAG
     assert r.last_line == 3
@@ -187,10 +159,9 @@ fn test_error_reaches_handler_with_position() -> i32
     0
 
 [[test]]
-fn test_warning_reaches_handler_with_position() -> i32
+fn test_warning_reaches_sink_with_position() -> i32
     var r = recorder_new()
-    var h = recording_handler(@&r as *Recorder)
-    emit_warning(h, PARSE_WARNING_DEPRECATED, "old", 9, 2)
+    emit_warning(r, PARSE_WARNING_DEPRECATED, "old", 9, 2)
     assert r.warnings == 1
     assert r.last_kind == PARSE_WARNING_DEPRECATED
     assert r.last_line == 9
@@ -198,18 +169,35 @@ fn test_warning_reaches_handler_with_position() -> i32
     assert total(@r) == 1
     0
 
-# The no-op handler accepts every event and has no ctx to write through.
+# The parser owns its sink by value (HtmlParser<S>.tree_builder.sink): a
+# document parsed through html_parser_run reaches the Recorder's methods.
 [[test]]
-fn test_no_op_handler_accepts_every_event() -> i32
-    var h = no_op_handler_new()
-    assert h.ctx == null
-    emit_document_start(h)
-    emit_text(h, "x")
-    emit_element_start(h, Tag.Html, null, 0, 0)
-    emit_element_end(h, Tag.Html)
-    emit_comment(h, "c")
-    emit_doctype(h, "html", "", "")
-    emit_error(h, PARSE_ERROR_UNCLOSED_TAG, "e", 1, 1)
-    emit_warning(h, PARSE_WARNING_DEPRECATED, "w", 1, 1)
-    emit_document_end(h)
+fn test_parser_drives_recording_sink() -> i32
+    var hp = html_parser_new("<p>hi</p>", recorder_new())
+    html_parser_run(hp)
+    let r = @hp.tree_builder.sink
+    assert r.element_starts >= 1
+    assert r.texts >= 1
+    0
+
+# The no-op sink accepts every event.
+[[test]]
+fn test_no_op_sink_accepts_every_event() -> i32
+    var s = NoOpSink {}
+    emit_document_start(s)
+    emit_text(s, "x")
+    emit_element_start(s, Tag.Html, null, 0, 0)
+    emit_element_end(s, Tag.Html)
+    emit_comment(s, "c")
+    emit_doctype(s, "html", "", "")
+    emit_error(s, PARSE_ERROR_UNCLOSED_TAG, "e", 1, 1)
+    emit_warning(s, PARSE_WARNING_DEPRECATED, "w", 1, 1)
+    emit_document_end(s)
+    0
+
+# A parser over the no-op sink runs a whole document.
+[[test]]
+fn test_parser_runs_with_no_op_sink() -> i32
+    var hp = html_parser_new("<html><body>x</body></html>", NoOpSink {})
+    html_parser_run(hp)
     0

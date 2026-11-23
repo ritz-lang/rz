@@ -8,9 +8,14 @@
 # of HTML as they arrive from the network.
 
 import ritzlib.strview { StrView }
-import ritzlib.gvec { Vec }
-import lib.document { NodeId, Tag }
+import ritzlib.gvec { Vec, vec_new }
+import lib.document { NodeId }
+import lexis.dom.tag { Tag }
+import lexis.dom.attribute { Attribute }
+import lexis.css.rule { Stylesheet }
 import lib.iris_bridge { ComputedStyle }
+import lexis.event { EventSink, ElementStartEvent, ElementEndEvent, TextEvent, CommentEvent, DoctypeEvent, ParseErrorEvent, ParseWarningEvent }
+import lexis.lexis { html_parser_new, html_parser_run, css_parse }
 
 # ============================================================================
 # Parse Events - Lexis → Tempest
@@ -50,10 +55,7 @@ pub enum ParseEvent
         line: u32
         column: u32
 
-## HTML attribute name/value pair.
-pub struct Attribute
-    name: StrView
-    value: StrView
+# ElementStart's attributes are lexis's `Attribute` (name/value StrViews).
 
 # ============================================================================
 # CSS Events - Lexis → Tempest
@@ -68,54 +70,101 @@ pub struct StyleResult
 # Lexis Parser Interface
 # ============================================================================
 
-## HTML parser state.
+## HTML parser state: the events lexis has emitted and not yet handed out.
+## A FIFO from two stacks: the sink pushes onto `inbox` in parse order, and
+## lexis_poll_event pops `outbox`, refilling it from `inbox` (which reverses
+## it) when it runs dry. A ParseEvent owns a Vec, so it can only be moved
+## out with pop; Vec.get would copy it.
 pub struct LexisParser
-    # Internal parser state
-    state: i32
+    inbox: Vec<ParseEvent>
+    outbox: Vec<ParseEvent>
+    complete: i32           # 1 once a DocumentEnd has been queued
     # Error callback stream (for debug console)
     error_count: i32
 
 ## Create a new HTML parser.
 pub fn lexis_parser_new() -> LexisParser
     var parser: LexisParser
-    parser.state = 0
+    parser.inbox = vec_new<ParseEvent>()
+    parser.outbox = vec_new<ParseEvent>()
+    parser.complete = 0
     parser.error_count = 0
     return parser
 
-## Feed HTML data to parser (streaming).
-## Returns number of events ready to poll.
+## Lexis's event sink for one parse: queues each event on the LexisParser it
+## borrows. Lexis's parser is generic over its sink (`HtmlParser<S:
+## EventSink>`, LARB R55), so these calls resolve at compile time; there is
+## no fn-pointer table and no `*u8` context to cast back (R80).
+pub struct LexisSink
+    parser:& LexisParser
+
+impl EventSink for LexisSink
+    fn on_document_start(self:&)
+        self.parser.inbox.push(ParseEvent.DocumentStart)
+
+    fn on_document_end(self:&)
+        self.parser.inbox.push(ParseEvent.DocumentEnd)
+        self.parser.complete = 1
+
+    fn on_element_start(self:&, event: @ElementStartEvent)
+        var attributes = vec_new<Attribute>()
+        var i: u32 = 0
+        while i < event.attr_count
+            attributes.push(event.attrs[i])
+            i = i + 1
+        self.parser.inbox.push(ParseEvent.ElementStart(event.tag, attributes))
+
+    fn on_element_end(self:&, event: @ElementEndEvent)
+        self.parser.inbox.push(ParseEvent.ElementEnd(event.tag))
+
+    fn on_text(self:&, event: @TextEvent)
+        self.parser.inbox.push(ParseEvent.Text(event.content))
+
+    fn on_comment(self:&, event: @CommentEvent)
+        self.parser.inbox.push(ParseEvent.Comment(event.content))
+
+    fn on_doctype(self:&, event: @DoctypeEvent)
+        self.parser.inbox.push(ParseEvent.Doctype(event.name, event.public_id, event.system_id))
+
+    fn on_error(self:&, event: @ParseErrorEvent)
+        self.parser.error_count = self.parser.error_count + 1
+        self.parser.inbox.push(ParseEvent.ParseError(event.message, event.line, event.col))
+
+    fn on_warning(self:&, event: @ParseWarningEvent)
+        pass
+
+## Feed HTML data to parser. Lexis parses `data` and the events queue on
+## `parser`. Returns number of events ready to poll.
 pub fn lexis_feed(parser:& LexisParser, data: StrView) -> i32
-    # TODO: Call into Lexis library
-    return 0
+    var hp = html_parser_new(data, LexisSink { parser: @&parser })
+    html_parser_run(hp)
+    (parser.inbox.len() + parser.outbox.len()) as i32
 
 ## Poll for next parse event.
 pub fn lexis_poll_event(parser:& LexisParser) -> Option<ParseEvent>
-    # TODO: Get next event from Lexis
-    return None
+    if parser.outbox.is_empty()
+        while not parser.inbox.is_empty()
+            parser.outbox.push(parser.inbox.pop())
+    if parser.outbox.is_empty()
+        return None
+    Some(parser.outbox.pop())
 
 ## Check if parsing is complete.
-pub fn lexis_is_complete(parser: LexisParser) -> i32
-    return 0
+pub fn lexis_is_complete(parser: @LexisParser) -> i32
+    return parser.complete
 
 ## Get parse error count.
-pub fn lexis_error_count(parser: LexisParser) -> i32
+pub fn lexis_error_count(parser: @LexisParser) -> i32
     return parser.error_count
 
 # ============================================================================
 # CSS Stylesheet Interface
 # ============================================================================
 
-## Parsed CSS stylesheet.
-pub struct Stylesheet
-    # Parsed CSS rules
-    rule_count: i32
-
-## Parse a CSS stylesheet.
+## Parse a CSS stylesheet (lexis's Stylesheet; free it with lexis's
+## stylesheet_free).
 pub fn lexis_parse_css(css: StrView) -> Stylesheet
-    var sheet: Stylesheet
-    sheet.rule_count = 0
-    # TODO: Call into Lexis CSS parser
-    return sheet
+    css_parse(css)
 
 # ============================================================================
 # Style Computation Interface

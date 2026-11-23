@@ -1,0 +1,88 @@
+# test/test_lexis_bridge.ritz - lexis's parser drives tempest's EventSink (#4012)
+#
+# lexis_feed runs lexis's HtmlParser<LexisSink>; LexisSink implements lexis's
+# `trait EventSink` and queues ParseEvents on the LexisParser it borrows
+# (LARB R55: no fn-pointer table, no `*u8` ctx). These tests check that the
+# events lexis emits come out of lexis_poll_event, in order.
+
+import ritzlib.strview
+import lexis.dom.tag { Tag }
+import lib.lexis_bridge { LexisParser, lexis_parser_new, lexis_feed, lexis_poll_event, ParseEvent }
+
+# One code per event, so a sequence can be compared as numbers:
+# ElementStart <p> = 1, ElementEnd <p> = 2, Text = 3 (+ len * 10), Comment = 4,
+# ElementStart of any other tag = 5, ElementEnd of any other tag = 6,
+# DocumentStart = 7, DocumentEnd = 8, other = 9.
+fn is_p(tag: Tag) -> bool
+    match tag
+        Tag.P => true
+        _ => false
+
+fn code(event: ParseEvent) -> i64
+    match event
+        ParseEvent.ElementStart(tag, attributes) =>
+            if is_p(tag)
+                return 1
+            return 5
+        ParseEvent.ElementEnd(tag) =>
+            if is_p(tag)
+                return 2
+            return 6
+        ParseEvent.Text(content) =>
+            return 3 + content.len * 10
+        ParseEvent.Comment(content) =>
+            return 4
+        ParseEvent.DocumentStart =>
+            return 7
+        ParseEvent.DocumentEnd =>
+            return 8
+        _ =>
+            return 9
+
+# Poll until an event that isn't an implied html/head/body element; -1 when
+# the queue is empty.
+fn next_code(parser:& LexisParser) -> i64
+    loop
+        match lexis_poll_event(parser)
+            Some(event) =>
+                let c = code(event)
+                if c != 5 and c != 6
+                    return c
+            None =>
+                return -1
+
+[[test]]
+fn test_feed_queues_events_in_parse_order() -> i32
+    var parser = lexis_parser_new()
+    let ready = lexis_feed(@&parser, "<p>hi</p><!--c-->")
+    assert ready > 0
+    assert next_code(@&parser) == 1         # <p>
+    assert next_code(@&parser) == 23        # "hi"
+    assert next_code(@&parser) == 2         # </p>
+    assert next_code(@&parser) == 4         # <!--c-->
+    assert next_code(@&parser) == 8         # end of input
+    assert next_code(@&parser) == -1
+    0
+
+[[test]]
+fn test_poll_on_empty_parser_is_none() -> i32
+    var parser = lexis_parser_new()
+    assert next_code(@&parser) == -1
+    0
+
+# Events from a second feed queue behind those not yet polled from the first.
+[[test]]
+fn test_second_feed_queues_behind_unpolled_events() -> i32
+    var parser = lexis_parser_new()
+    lexis_feed(@&parser, "<p>ab</p>")
+    assert next_code(@&parser) == 1         # <p> (first feed)
+    lexis_feed(@&parser, "<p>xyz</p>")
+    assert next_code(@&parser) == 23        # "ab": still the first feed's
+    assert next_code(@&parser) == 2
+    assert next_code(@&parser) == 8
+    assert next_code(@&parser) == 1         # then the second feed's
+    assert next_code(@&parser) == 33        # "xyz"
+    assert next_code(@&parser) == 2
+    assert next_code(@&parser) == 8
+    assert next_code(@&parser) == -1
+    0
