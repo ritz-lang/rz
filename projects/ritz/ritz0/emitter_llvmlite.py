@@ -1327,7 +1327,13 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 return self._fn_value_type(expr.name, expr.span)
             return None
         elif isinstance(expr, rast.BinOp):
-            # Binary ops inherit type from left operand, unless it's a literal
+            # A comparison is a bool whatever its operands are: typed as its
+            # left operand, `{n > 0}` dispatched to `Display for i64` with an
+            # `i1` and printed garbage (AGAST #4577). `and` / `or` need no
+            # case: their left operand is already a bool.
+            if expr.op in self._ASSERT_CMP_OPS:
+                return rast.NamedType(expr.span, 'bool')
+            # Other binary ops inherit type from left operand, unless it's a literal
             # that takes the right one's type (LARB R21, #3112): `2 * x` is x's.
             if (expr.op in self._INT_ARITH_OPS and expr.op not in ('<<', '>>')
                     and self._literal_operand_value(expr.left) is not None
