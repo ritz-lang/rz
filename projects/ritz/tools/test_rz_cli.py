@@ -110,6 +110,23 @@ class TestKnownFailingConfig:
         assert rz.known_failing_from_config("ritz1") == {"x": "AGAST #7: r1"}
         assert rz.known_failing_from_config("ritz0") == {}
 
+    def test_the_ritz1_test_sweep_also_reads_parity_excuses(self, rz, tmp_path,
+                                                            monkeypatch):
+        """AGAST #4591: a package that builds under ritz1 but whose tests fail
+        there is a `parity` entry.  Only the test sweep under that compiler
+        reads it: the build sweep would xpass-fail on it, and ritz0's test
+        sweep is the reference, never excused."""
+        self._kf_dir(tmp_path, monkeypatch,
+                     '[[entry]]\ngate = "build"\ncompiler = "ritz1"\nunit = "x"\n'
+                     'reason = "r1"\nagast = 7\n'
+                     '[[entry]]\ngate = "parity"\ncompiler = "ritz1"\nunit = "y"\n'
+                     'reason = "p1"\nagast = 7\n')
+        assert rz.known_failing_from_config("ritz1", kind="test") == {
+            "x": "AGAST #7: r1", "y": "AGAST #7: p1"}
+        assert rz.known_failing_from_config("ritz1") == {"x": "AGAST #7: r1"}
+        assert rz.known_failing_from_config("ritz0", kind="test") == {}
+        assert rz.known_failing_from_config("ritz1_selfhosted", kind="test") == {}
+
     def test_a_malformed_excuse_stops_rz(self, rz, tmp_path, monkeypatch, capsys):
         # No ticket: rz refuses rather than honouring it.
         self._kf_dir(tmp_path, monkeypatch,

@@ -86,6 +86,10 @@ def test_an_empty_or_missing_directory_has_no_entries(tmp_path):
     ("7.toml", entry(gate="doc", compiler="ritz1", unit="LANGUAGE_SPEC.md 12"), "12-hex"),
     ("7.toml", entry(gate="matrix", compiler="ritz1", unit="a::b::c"), "a::b::c"),
     ("7.toml", entry() + entry(), "listed twice"),
+    # AGAST #4591: parity excuses a non-reference compiler only; ritz0's
+    # test sweep is the reference and has no excuse at all.
+    ("7.toml", entry(gate="parity", compiler="ritz0"), "ritz0"),
+    ("7.toml", entry(gate="parity", compiler="any"), "any"),
 ])
 def test_load_refuses_a_malformed_entry_naming_its_file(tmp_path, name, text, needle):
     write(tmp_path, name, text)
@@ -130,7 +134,7 @@ def test_every_checked_in_entry_names_something_that_exists():
     """An entry for a unit that is gone is dead weight that reads as debt."""
     ritz = WORKSPACE / "projects" / "ritz"
     for e in kf.load():
-        if e.gate == "build":
+        if e.gate in ("build", "parity"):
             assert (WORKSPACE / "projects" / e.unit / "ritz.toml").is_file(), e
         elif e.gate == "matrix":
             assert (ritz / "ritz0" / "test" / f"{e.unit.partition('::')[0]}.ritz").is_file(), e
@@ -178,6 +182,22 @@ def test_a_compiler_named_build_entry_excuses_only_that_compiler(tmp_path):
     assert kf.known("build", "ritz0", es) == {"lexis": "AGAST #7: why"}
     assert kf.known("build", "ritz1_selfhosted", es) == {"lexis": "AGAST #7: why"}
     assert kf.known("build", "any", es) == {"lexis": "AGAST #7: why"}
+
+
+@pytest.mark.unit
+def test_parity_entries_are_per_self_hosted_compiler(tmp_path):
+    """AGAST #4591: `rz test --all --compiler ritz1` must match ritz0's
+    sweep.  A package whose tests pass under ritz0 but not ritz1 (it builds,
+    so no `build` entry fits) is a `parity` entry naming that compiler and
+    the ritz1 ticket.  It is read by no other gate and no other compiler."""
+    write(tmp_path, "7.toml",
+          entry(gate="parity", compiler="ritz1", unit="angelo")
+          + entry(gate="parity", compiler="ritz1_selfhosted", unit="prism"))
+    es = kf.load(tmp_path)
+    assert kf.known("parity", "ritz1", es) == {"angelo": "AGAST #7: why"}
+    assert kf.known("parity", "ritz1_selfhosted", es) == {"prism": "AGAST #7: why"}
+    assert kf.known("parity", "ritz0", es) == {}
+    assert kf.known("build", "ritz1", es) == {}
 
 
 @pytest.mark.unit

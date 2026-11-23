@@ -380,10 +380,12 @@ class TestGateWiring:
                             calls.setdefault("bpar", (projects, jobs)) and
                             (list(failed), []))
         monkeypatch.setattr(rz, "known_failing_from_config",
-                            lambda compiler: calls.setdefault("kf", compiler) and
+                            lambda compiler, kind="build":
+                            calls.setdefault("kf", compiler) and
+                            calls.setdefault("kf_kind", kind) and
                             {"q": "AGAST #1 — x"})
 
-        def gate(kind, f, kf, ran, setup=None):
+        def gate(kind, f, kf, ran, setup=None, where=None):
             calls["gate"] = (kind, f, kf, ran)
             return 0
         monkeypatch.setattr(rz, "summarize_gate", gate)
@@ -413,6 +415,16 @@ class TestGateWiring:
                           ["build", "--all", "-j", "3", "--compiler", "ritz1"],
                           [])
         assert calls["kf"] == "ritz1"
+        assert calls["kf_kind"] == "build"
+
+    def test_test_sweep_reads_its_compilers_parity_excuses(self, rz,
+                                                          monkeypatch):
+        """AGAST #4591: the ritz1 test sweep asks for the test-side list
+        (build + parity entries naming ritz1)."""
+        calls = self._run(rz, monkeypatch,
+                          ["test", "--all", "-j", "3", "--compiler", "ritz1"],
+                          [])
+        assert (calls["kf"], calls["kf_kind"]) == ("ritz1", "test")
 
     def test_j1_keeps_the_serial_streaming_path(self, rz, monkeypatch):
         ran = []

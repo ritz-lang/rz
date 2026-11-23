@@ -236,7 +236,7 @@ def sweep_results(failed, ran):
 EXIT_SETUP = 3
 
 
-def summarize_gate(kind, failed, known_failing, ran, setup=None):
+def summarize_gate(kind, failed, known_failing, ran, setup=None, where=None):
     """Print the end-of-sweep gate summary; return the process exit code.
 
     The known-failing list is deliberately NOT continue-on-error: excused
@@ -254,6 +254,7 @@ def summarize_gate(kind, failed, known_failing, ran, setup=None):
     listed as SETUP ERROR rather than as failures, and alone make the exit
     EXIT_SETUP; any real failure or xpass still exits 1.
     """
+    where = where or KNOWN_WHERE
     o = known_failures.outcome(known_failing, sweep_results(failed, ran))
     hard, known, xpass = o.hard, list(o.known), o.xpass
     setup_set = set(setup or ())
@@ -273,7 +274,7 @@ def summarize_gate(kind, failed, known_failing, ran, setup=None):
     for p in known:
         print(f"PKG KNOWN {p}: {known_failing[p]}", flush=True)
     for p in xpass:
-        print(f"PKG XPASS {p}: excused in {KNOWN_WHERE} but passed",
+        print(f"PKG XPASS {p}: excused in {where} but passed",
               flush=True)
     for p in setup_err:
         print(f"PKG SETUP {p}: a missing tool, not a regression", flush=True)
@@ -283,7 +284,7 @@ def summarize_gate(kind, failed, known_failing, ran, setup=None):
     print(flush=True)
     if known:
         print(f"⚠ {len(known)} known-failing project(s) still failing "
-              f"(advisory, tracked in {KNOWN_WHERE}):",
+              f"(advisory, tracked in {where}):",
               flush=True)
         for p in known:
             print(f"    {p} — {known_failing[p]}", flush=True)
@@ -316,17 +317,30 @@ def summarize_gate(kind, failed, known_failing, ran, setup=None):
 KNOWN_WHERE = 'known-failures/ (gate = "build")'
 
 
-def known_failing_from_config(compiler="any"):
+# The test sweep under a self-hosted compiler also reads `parity` (#4591).
+KNOWN_WHERE_TEST = 'known-failures/ (gate = "build" or "parity")'
+
+
+def known_failing_from_config(compiler="any", kind="build"):
     """The `build` gate's excuses, {project: "AGAST #n: reason"}, from
     known-failures/<agast>.toml via tools/known_failures.py (AGAST #1834):
     the `any` entries plus those naming `compiler`, the sweep's compiler
     (AGAST #4272: a package only ritz1 cannot build is excused under ritz1).
 
+    For the test sweep (`kind="test"`) under ritz1 or ritz1_selfhosted, plus
+    the `parity` entries naming that compiler (AGAST #4591): packages that
+    build there but whose tests pass only under ritz0.  ritz0, the reference,
+    has none, and the build sweep never reads them (it would xpass on them).
+
     The parser refuses an entry without a ticket, so `rz` refuses a
     malformed excuse rather than honouring it: exit 2, naming the file.
     """
     try:
-        return known_failures.known("build", compiler)
+        known = known_failures.known("build", compiler)
+        if kind == "test" and compiler in known_failures.GATES["parity"][0]:
+            for unit, cite in known_failures.known("parity", compiler).items():
+                known.setdefault(unit, cite)
+        return known
     except known_failures.KnownFailuresError as e:
         print(f"rz: {e}", file=sys.stderr)
         sys.exit(2)
@@ -737,7 +751,9 @@ def cmd_test(args):
         # re-exposes any genuine behavioural failure here. Every other
         # test failure gates, always.
         return summarize_gate(
-            "test", failed, known_failing_from_config(compiler), projects)
+            "test", failed, known_failing_from_config(compiler, kind="test"),
+            projects, where=KNOWN_WHERE_TEST if compiler != "ritz0"
+            else KNOWN_WHERE)
 
     if not args.project:
         print("Error: Specify a project or use --all", file=sys.stderr)

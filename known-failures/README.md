@@ -6,7 +6,7 @@ read by one parser and judged by one rule: `projects/ritz/tools/known_failures.p
 
 ```toml
 [[entry]]
-gate     = "matrix"             # build | matrix | regression | examples | doc
+gate     = "matrix"             # build | parity | matrix | regression | examples | doc
 compiler = "ritz1"              # which compiler the excuse holds under
 unit     = "test_trait_bounds"  # what failed, in the gate's own key
 reason   = "trait bounds on generic params"
@@ -16,6 +16,7 @@ agast    = 1621                 # the ticket; must equal the file name
 | gate | read by | compiler | unit |
 |------|---------|----------|------|
 | `build` | `rz build --all`, `rz test --all`, train.sh package tests | `any` (every compiler), or ritz0, ritz1, ritz1_selfhosted (that sweep only) | rz project id (`lexis`, `ritz/ritzlib/tests`) |
+| `parity` | `rz test --all --compiler C` (C's sweep only; never ritz0) | ritz1, ritz1_selfhosted | rz project id whose tests pass under ritz0 |
 | `matrix` | `tools/run_regression_matrix.py` | ritz0, ritz1, ritz1_selfhosted | `file` (its build failures only) or `file::fn` |
 | `regression` | `scripts/regression.sh` (via the CLI) | ritz0, ritz1 (covers ritz1_selfhosted) | example key: path under `examples/`, `/` → `_` |
 | `examples` | `tools/example_tests.py` | ritz0 | test file under `examples/` |
@@ -35,9 +36,13 @@ agast    = 1621                 # the ticket; must equal the file name
     ritz1_selfhosted's accept sets with no list at all. Two compilers
     disagreeing is a self-hosting bug. That is also why a `regression` ritz1
     entry covers ritz1_selfhosted, and a selfhosted-only one is refused.
-  - **A test-side excuse** for `rz test --all`. A behavioural failure is never
-    excusable. A package that cannot compile also fails its tests, so the
-    test sweep reads the `build` entries.
+  - **A test-side excuse** for `rz test --all` under ritz0, the reference. A
+    behavioural failure is never excusable. A package that cannot compile
+    also fails its tests, so the test sweep reads the `build` entries.
+    Under ritz1 or ritz1_selfhosted it also reads `parity` (AGAST #4591):
+    a package that builds there but whose tests pass only under ritz0 is a
+    self-hosted compiler bug, tracked like the matrix's per-fn ritz1
+    entries. It never applies to ritz0's sweep, and the build sweep ignores it.
 - New entries are not prevented, only stale ones. Review additions.
 
 `python3 projects/ritz/tools/known_failures.py check` validates every file;

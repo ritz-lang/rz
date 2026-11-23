@@ -1162,3 +1162,24 @@ def test_the_ritz1_sweep_is_never_scoped_out(tmp_path, monkeypatch):
                             True, [f"SKIPPED {step.name}"]))
     assert ci_local.main(["--job", "bootstrap", "--diff-base", BASE]) == 0
     assert log.read_text().split() == ["build", "sweep"]
+
+
+@pytest.mark.unit
+def test_the_gate_tests_every_package_under_ritz1():
+    """AGAST #4591: M1.1's criterion is that every package's tests pass under
+    ritz1 as under ritz0.  The bootstrap job sweeps `rz test --all --compiler
+    ritz1` once ritz1 is built (after the ritz1 build sweep, so a package
+    ritz1 cannot build is reported there first), from the workspace root,
+    and no per-step read set may scope it out.  A ritz1-only test failure is
+    a known-failures/ `parity` entry naming ritz1 and its ticket."""
+    steps = [s for s in ci_local.load_steps() if s.job == "bootstrap"]
+    names = [s.name for s in steps]
+    sweep = [i for i, s in enumerate(steps)
+             if re.search(r"(^|\s)\./rz test --all --compiler ritz1(\s|$)", s.run)]
+    assert len(sweep) == 1, names
+    step = steps[sweep[0]]
+    assert step.workdir == ".", step
+    build = next(i for i, s in enumerate(steps)
+                 if re.search(r"\bmake build-all-ritz1\b", s.run))
+    assert names.index(ci_local.PYTEST_PREREQ) < build < sweep[0]
+    assert step.name not in {s.name for s in ci_local.ritz0_scope.STEPS}

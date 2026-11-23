@@ -30,7 +30,8 @@ The rules, all enforced here at load time so no gate can honour a bad excuse:
 And two gates have no name here, so nothing can excuse them: regression.sh's
 Stage 5 (ritz1 vs ritz1_selfhosted accept sets, compared with no list at all)
 and a test-side excuse for `rz test --all` (a behavioural failure is never
-excusable; that sweep reads the `build` list).
+excusable; that sweep reads the `build` list, plus, under ritz1 or
+ritz1_selfhosted only, the `parity` list of packages ritz0 passes, #4591).
 
 CLI, for shell callers (regression.sh) and humans:
   known_failures.py verdict --gate G --compiler C UNIT STATUS
@@ -80,13 +81,22 @@ GATES: dict[str, tuple[tuple[str, ...], str]] = {
                  "a test file under examples/ (tools/example_tests.py)"),
     "doc": (("ritz1", "ritz1_selfhosted"),
             "`<DOC.md> <12-hex block digest>` (tools/check_doc_examples.py)"),
+    # AGAST #4591: `rz test --all --compiler C` must match ritz0's sweep.  A
+    # package that builds under C but whose tests fail only there is a
+    # self-hosted compiler bug, excused here against its ticket, like the
+    # matrix's per-fn ritz1 entries.  Never ritz0 or `any`: the reference
+    # compiler's test sweep has no excuse (NEVER_EXCUSED["test"]).
+    "parity": (("ritz1", "ritz1_selfhosted"),
+               "an rz project id whose tests pass under ritz0 "
+               "(`rz test --all --compiler ritz1`)"),
 }
 
 NEVER_EXCUSED = {
     "stage5": "Stage 5 compares ritz1 and ritz1_selfhosted with no list: two "
               "compilers disagreeing is a self-hosting bug",
     "test": "a test failure is behavioural; `rz test --all` reads the build "
-            "list for packages that cannot compile",
+            "list for packages that cannot compile, and under a self-hosted "
+            "compiler the `parity` list for ritz0-vs-ritz1 differences",
 }
 
 FIELDS = ("gate", "compiler", "unit", "reason", "agast")
