@@ -1,0 +1,114 @@
+# AGAST #4576: an indexed struct element as a print placeholder, with
+# ritzlib.fmt in scope, so the value prints through its Display / Debug impl
+# (the ticket's `print("a0={args[0]}")` on a Span<StrView>, and a user struct).
+#
+# ritz1 typed the placeholder `args[0]` as an integer and emitted
+# `trunc i64 %.N to i8` on the `%StrView`; an `[N]S` or `*S` element was
+# refused as "a whole struct is not a value here".  The intrinsic (no impl)
+# path is test_issue_print_index_elem_type.ritz.
+#
+# The matrix runs this file under ritz0, ritz1 and ritz1_selfhosted; ritz0 is
+# the oracle for the bytes.
+
+import ritzlib.sys
+import ritzlib.fmt
+import ritzlib.string
+
+struct Point
+    x: i64
+    y: i64
+
+impl Display for Point
+    fn show(self: @Point, w: @&Writer) -> i64
+        let before: i64 = w.len
+        format_into(w, "({self.x}, {self.y})")
+        w.len - before
+
+var g_rd: i32 = 0
+var g_saved: i32 = 0
+var g_fd: i32 = 0
+
+fn capture_begin(fd: i32) -> i32
+    var fds: [2]i32
+    if sys_pipe(@fds[0]) != 0
+        return 1
+    g_fd = fd
+    g_rd = fds[0]
+    g_saved = sys_dup(fd)
+    sys_dup2(fds[1], fd)
+    sys_close(fds[1])
+    0
+
+# Restore the captured fd, read what was written, compare it with `want`.
+# Returns 0 on an exact byte match.
+fn capture_end_expect(want: *u8) -> i32
+    sys_dup2(g_saved, g_fd)
+    sys_close(g_saved)
+    var buf: [256]u8
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < 256
+        n = sys_read(g_rd, @buf[got], 256 - got)
+        if n > 0
+            got = got + n
+    sys_close(g_rd)
+    var i: i64 = 0
+    while *(want + i) != 0
+        if i >= got
+            return 2
+        if buf[i] != *(want + i)
+            return 3
+        i = i + 1
+    if i != got
+        return 4
+    0
+
+[[test_helper]]
+fn show_args(args: Span<StrView>) -> i32
+    assert capture_begin(1) == 0
+    print("a0={args[0]} a1={args[1]}\n")
+    capture_end_expect(c"a0=prog a1=-v\n")
+
+[[test]]
+fn test_span_strview_index_display() -> i32
+    var arr: [2]StrView = ["prog", "-v"]
+    assert show_args(@arr) == 0
+    0
+
+[[test_helper]]
+fn show_points(pts: Span<Point>) -> i32
+    assert capture_begin(1) == 0
+    print("{pts[1]}\n")
+    capture_end_expect(c"(3, 4)\n")
+
+[[test]]
+fn test_span_struct_index_display() -> i32
+    var pts: [2]Point = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }]
+    assert show_points(@pts) == 0
+    0
+
+[[test]]
+fn test_array_struct_index_display() -> i32
+    var pts: [2]Point = [Point { x: 1, y: 2 }, Point { x: -5, y: 6 }]
+    assert capture_begin(1) == 0
+    print("{pts[0]}|{pts[1]}\n")
+    assert capture_end_expect(c"(1, 2)|(-5, 6)\n") == 0
+    0
+
+[[test]]
+fn test_ptr_struct_index_display() -> i32
+    var pts: [2]Point = [Point { x: 1, y: 2 }, Point { x: 7, y: 8 }]
+    let p: *Point = @pts[0]
+    assert capture_begin(1) == 0
+    print("{p[1]}\n")
+    assert capture_end_expect(c"(7, 8)\n") == 0
+    0
+
+# `:?` on a struct with no Debug impl auto-derives its fields.
+[[test]]
+fn test_array_struct_index_debug() -> i32
+    var pts: [1]Point = [Point { x: 9, y: 0 }]
+    assert capture_begin(1) == 0
+    print("{pts[0]:?}\n")
+    assert capture_end_expect(c"Point { x: 9, y: 0 }\n") == 0
+    0

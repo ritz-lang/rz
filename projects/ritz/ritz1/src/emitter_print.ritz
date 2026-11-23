@@ -50,6 +50,7 @@ import bool_check   # AGAST #2342
 import bool_kind
 import diag          # fn_display_name (AGAST #4018)
 import ast_helpers   # is_test_fn / is_test_helper_fn (AGAST #1869)
+import index_through # index_through_value_struct (AGAST #4576)
 
 # Report an error at a print literal: an IR comment, a stderr line located
 # at the literal (diag, AGAST #3445; it used to name the line alone), and one
@@ -152,6 +153,75 @@ fn interp_is_view_name(name_sv: StrView) -> i32
         return 1
     name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 })
 
+# AGAST #4576: the struct `e` is BY VALUE when it is an element `a[i]`, `p[i]`
+# or `args[i]` (a `[N]S` local, field, global or const, a `*S`, or a Vec / Span
+# of S), else null/0.  A placeholder's nodes are parsed after Sema, and
+# synth_slot_ty gives an element its storage slot (`args[i]` through a Span is
+# the byte path's u8), so the print path asks for the struct by name, as
+# `.field` on an element does (index_elem_struct_name).  A pointer element
+# (`[N]*S`, a `**S` field) is no struct value: it prints as a pointer.
+fn fmt_index_struct(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null or e.kind != ExprKind.Index or e.left == null or e.right == null or e.right.kind == ExprKind.Range
+        return
+    var n: *u8 = null
+    var l: i32 = 0
+    if index_through(s, e) != null
+        # A Vec / Span / pointer-to-array buffer: a struct or pointer held there.
+        if index_through_value_struct(s, e, @n, @l) == 0
+            return
+    else
+        # `[N]*S` elements (a local, field, global or const) and `**S` fields
+        # name S too, for `.field` through them.
+        var elem: TypeKind = TypeKind.Void
+        var pslot: i32 = 0
+        array_elem_record(s, e, @elem, @pslot, @n, @l)
+        if elem != TypeKind.Void and elem != TypeKind.Struct
+            return
+        if e.left.kind == ExprKind.Member
+            let f: *StructField = resolve_member_chain_field(s, e.left)
+            if f == null or f.field_type == TypeKind.PtrPtr
+                return
+        index_elem_struct_name(s, e, @n, @l)
+    # An enum, which these name as well, is no struct to find_struct.
+    if n == null or l <= 0 or find_struct(s, StrView { ptr: (n), len: (l) as i64 }) == null
+        return
+    *out_name = n
+    *out_len = l
+
+# AGAST #4576: the view type (StrView, Span$u8) an element `e` POINTS AT, when
+# it is one of a `[N]*V` (a local, field, global or const), a `**V` field or a
+# `**V` local; else null/0.  fmt_index_struct leaves these out: the element is
+# the pointer, which interp_strview_kind loads the view through (its kind 2).
+fn fmt_index_view_ptr(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null or e.kind != ExprKind.Index or e.left == null or e.right == null or e.right.kind == ExprKind.Range
+        return
+    var n: *u8 = null
+    var l: i32 = 0
+    if array_elem_pointee(s, e, @n, @l) != TypeKind.Struct
+        n = null
+        l = 0
+        let b: *Expr = e.left
+        match b.kind
+            ExprKind.Member =>
+                let f: *StructField = resolve_member_chain_field(s, b)
+                if f != null and f.field_type == TypeKind.PtrPtr
+                    n = f.field_type_name
+                    l = f.field_type_name_len
+            ExprKind.Ident =>
+                let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
+                if lv != null and lv_var_type(lv) == TypeKind.PtrPtr
+                    n = lv_type_name(lv)
+                    l = lv_type_name_len(lv)
+            _ => pass
+    if n == null or l <= 0 or interp_is_view_name(StrView { ptr: (n), len: (l) as i64 }) == 0
+        return
+    *out_name = n
+    *out_len = l
+
 # Is `e` a StrView? Returns 1 for a view value (an aggregate register),
 # 2 for a pointer or reference to a StrView (an i64 register), else 0.
 # Writes the aggregate's LLVM type name. ritz0 decides by LLVM type
@@ -186,6 +256,16 @@ fn interp_strview_kind(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32
     # Method calls returning a view by value (`{s.as_view()}`, #4533).
     if n == null or l <= 0
         call_result_struct_name(s, e, @n, @l)
+    # An element `args[i]` (AGAST #4576).
+    if n == null or l <= 0
+        fmt_index_struct(s, e, @n, @l)
+    # An element that points at a view, as a local `*StrView` does (AGAST #4576).
+    if n == null or l <= 0
+        fmt_index_view_ptr(s, e, @n, @l)
+        if n != null and l > 0
+            *out_name = n
+            *out_len = l
+            return 2
     if interp_is_view_name(StrView { ptr: (n), len: (l) as i64 }) == 1
         *out_name = n
         *out_len = l
@@ -370,6 +450,21 @@ fn fmt_type_of(s: *EmitterState, e: *Expr, out: *FmtType)
         out.is_bool = 1
         return
     let t: TypeKind = expr_slot_ty(e)
+    # AGAST #4576: an element of a `[N]*T` (a local, field, global or const)
+    # is a pointer, whose i64 slot printed its address as a number.
+    if e.kind == ExprKind.Index and ty_int_bits(t) > 0
+        var elem: TypeKind = TypeKind.Void
+        var pslot: i32 = 0
+        var en: *u8 = null
+        var el: i32 = 0
+        array_elem_record(s, e, @elem, @pslot, @en, @el)
+        if elem == TypeKind.Ptr
+            out.kind = TypeKind.Ptr
+            out.pointee = ptr_slot_flat(pslot)
+            if out.pointee == TypeKind.U8
+                out.name = c"ptr_u8"
+                out.name_len = 6
+            return
     match t
         TypeKind.Ref | TypeKind.MutRef =>
             out.kind = t
@@ -417,6 +512,10 @@ fn fmt_type_of(s: *EmitterState, e: *Expr, out: *FmtType)
     # resolves the callee through the import graph.
     if n == null or l <= 0
         call_result_struct_name(s, e, @n, @l)
+    # An element `a[i]` / `p[i]` / `args[i]` of a struct (AGAST #4576), whose
+    # slot type `t` is its storage's integer.
+    if n == null or l <= 0
+        fmt_index_struct(s, e, @n, @l)
     if n != null and l > 0
         out.name = n
         out.name_len = l
@@ -541,7 +640,9 @@ fn fmt_impl_method(s: *EmitterState, type_name_sv: StrView, tname_sv: StrView, m
 fn fmt_materialize(s: *EmitterState, e: *Expr, ft: *FmtType, span: SrcSpan) -> *Expr
     var nlen: i32 = 0
     let name: *u8 = fmt_name(StrView { ptr: (c"tmp"), len: (3) as i64 }, @nlen)
-    let v: i32 = emit_expr(s, e)
+    # A struct receiver is copied into the slot below, so an element `a[i]`
+    # is no "whole struct where a number goes" (AGAST #4576).
+    let v: i32 = emit_struct_copy(s, e, ft.kind)
     let slot: i32 = next_reg(s)
     match ft.kind
         TypeKind.Struct =>
@@ -937,7 +1038,13 @@ fn fmt_write_bool(s: *EmitterState, sink: *PrintSink, v: i32) -> i32
 fn fmt_strview_parts(s: *EmitterState, e: *Expr, kind: i32, name_sv: StrView, out_len: *i32) -> i32
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
-    var v: i32 = emit_expr(s, e)
+    var v: i32 = 0
+    if kind == 1
+        # The view's fields are read off a copy: an element `args[i]` is one
+        # (AGAST #4576).
+        v = emit_struct_copy(s, e, TypeKind.Struct)
+    else
+        v = emit_expr(s, e)
     if kind == 2
         let p: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, v)
         let agg: i32 = next_reg(s)

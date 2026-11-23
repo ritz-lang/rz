@@ -1,0 +1,147 @@
+# AGAST #4576: an index expression whose element is not an integer, used
+# directly as a print placeholder (`print("{args[0]}")` with args: Span<StrView>).
+#
+# ritz1 lowered the placeholder as an integer and emitted
+# `trunc i64 %.N to i8` on a %StrView, which clang rejects.  The placeholder
+# must take the element type the index really has, as `let a: StrView = args[0]`
+# already did.  Spans, arrays and pointers each type an index separately, so
+# each is covered; a pointer and an integer element are the controls.  This
+# file has no Display impls in scope, so the compiler's own StrView form
+# prints; test_issue_print_index_elem_impl.ritz is the ritzlib.fmt path.
+#
+# The matrix runs this file under ritz0, ritz1 and ritz1_selfhosted; ritz0 is
+# the oracle for the bytes.
+
+import ritzlib.sys
+import ritzlib.string
+
+var g_rd: i32 = 0
+var g_saved: i32 = 0
+var g_fd: i32 = 0
+
+fn capture_begin(fd: i32) -> i32
+    var fds: [2]i32
+    if sys_pipe(@fds[0]) != 0
+        return 1
+    g_fd = fd
+    g_rd = fds[0]
+    g_saved = sys_dup(fd)
+    sys_dup2(fds[1], fd)
+    sys_close(fds[1])
+    0
+
+# Restore the captured fd, read what was written, compare it with `want`.
+# Returns 0 on an exact byte match.
+fn capture_end_expect(want: *u8) -> i32
+    sys_dup2(g_saved, g_fd)
+    sys_close(g_saved)
+    var buf: [256]u8
+    var got: i64 = 0
+    var n: i64 = 1
+    while n > 0 and got < 256
+        n = sys_read(g_rd, @buf[got], 256 - got)
+        if n > 0
+            got = got + n
+    sys_close(g_rd)
+    var i: i64 = 0
+    while *(want + i) != 0
+        if i >= got
+            return 2
+        if buf[i] != *(want + i)
+            return 3
+        i = i + 1
+    if i != got
+        return 4
+    0
+
+[[test_helper]]
+fn show_span(args: Span<StrView>) -> i32
+    assert capture_begin(1) == 0
+    print("a0={args[0]} a1={args[1]}\n")
+    capture_end_expect(c"a0=prog a1=--flag\n")
+
+[[test_helper]]
+fn show_span_var_index(args: Span<StrView>, i: i64) -> i32
+    assert capture_begin(1) == 0
+    print("[{args[i]}]\n")
+    capture_end_expect(c"[--flag]\n")
+
+[[test]]
+fn test_span_strview_index_placeholder() -> i32
+    var arr: [2]StrView = ["prog", "--flag"]
+    assert show_span(@arr) == 0
+    assert show_span_var_index(@arr, 1) == 0
+    0
+
+[[test]]
+fn test_array_strview_index_placeholder() -> i32
+    var arr: [2]StrView = ["x", "yz"]
+    assert capture_begin(1) == 0
+    print("{arr[0]}-{arr[1]}\n")
+    assert capture_end_expect(c"x-yz\n") == 0
+    0
+
+[[test]]
+fn test_ptr_strview_index_placeholder() -> i32
+    var arr: [2]StrView = ["p0", "p1"]
+    let p: *StrView = @arr[0]
+    assert capture_begin(1) == 0
+    print("{p[1]}\n")
+    assert capture_end_expect(c"p1\n") == 0
+    0
+
+# A pointer element (`[N]*u8`) is no struct: it prints as its C string.
+[[test]]
+fn test_array_cstr_index_placeholder() -> i32
+    var names: [2]*u8 = [c"ab", c"cde"]
+    assert capture_begin(1) == 0
+    print("{names[1]}\n")
+    assert capture_end_expect(c"cde\n") == 0
+    0
+
+# A `[N]*StrView` element is a pointer to a view, not a `%StrView`: it prints
+# what `{q}` with `q: *StrView` does.
+[[test]]
+fn test_array_strview_ptr_index_placeholder() -> i32
+    var a: StrView = "hey"
+    var ps: [1]*StrView = [@a]
+    let q: *StrView = ps[0]
+    assert capture_begin(1) == 0
+    print("[{q}] [{ps[0]}]\n")
+    assert capture_end_expect(c"[hey] [hey]\n") == 0
+    0
+
+struct ViewPtrs
+    ps: **StrView
+
+# So is an element of a `**StrView` field.
+[[test]]
+fn test_field_strview_ptrptr_index_placeholder() -> i32
+    var a: StrView = "hi"
+    var arr: [1]*StrView = [@a]
+    let h: ViewPtrs = ViewPtrs { ps: @arr[0] }
+    assert capture_begin(1) == 0
+    print("[{h.ps[0]}]\n")
+    assert capture_end_expect(c"[hi]\n") == 0
+    0
+
+# And of a `**StrView` local.
+[[test]]
+fn test_local_strview_ptrptr_index_placeholder() -> i32
+    var a: StrView = "yo"
+    var arr: [1]*StrView = [@a]
+    let pp: **StrView = @arr[0]
+    assert capture_begin(1) == 0
+    print("[{pp[0]}]\n")
+    assert capture_end_expect(c"[yo]\n") == 0
+    0
+
+# Control: an integer element still prints as a number.
+[[test]]
+fn test_span_int_index_placeholder() -> i32
+    var arr: [2]i64 = [7, -3]
+    let s: Span<i64> = @arr
+    assert capture_begin(1) == 0
+    print("{s[0]} {s[1]}\n")
+    assert capture_end_expect(c"7 -3\n") == 0
+    0
