@@ -1,7 +1,7 @@
 # tests/test_html_tokenizer.ritz - HTML tokenizer tests
 
 import ritzlib.strview
-import lib.html.tokenizer { Tokenizer, tokenizer_new, tokenizer_next }
+import lib.html.tokenizer { Tokenizer, State, tokenizer_new, tokenizer_next, tokenizer_set_state }
 import lib.html.token
 
 # =============================================================================
@@ -257,4 +257,95 @@ fn test_void_elements() -> i32
     if tok.start_tag.attr_count != 1
         return 1
 
+    expect_eof(t)
+
+# =============================================================================
+# State dispatch (AGAST #3937: State is an enum, one fn per state)
+# =============================================================================
+
+[[test]]
+fn test_new_tokenizer_starts_in_data_state() -> i32
+    var t = tokenizer_new("x")
+    match t.state
+        State.Data => 0
+        _ => 1
+
+[[test]]
+fn test_set_state_takes_a_state() -> i32
+    # The tree builder switches modes with a State, not an i32.
+    var t = tokenizer_new("<b>")
+    tokenizer_set_state(t, State.TagOpen)
+    match t.state
+        State.TagOpen => 0
+        _ => 1
+
+# Behaviour pinned across the split: one case per state family.
+
+[[test]]
+fn test_bogus_comment_from_question_mark() -> i32
+    var t = tokenizer_new("<?php x?>")
+    let tok = tokenizer_next(t)
+    if tok.kind != TOKEN_COMMENT
+        return 1
+    if not (tok.comment.data).eq("?php x?")
+        return 1
+    expect_eof(t)
+
+[[test]]
+fn test_empty_end_tag_is_dropped() -> i32
+    var t = tokenizer_new("</>")
+    expect_eof(t)
+
+[[test]]
+fn test_comment_with_inner_dashes() -> i32
+    var t = tokenizer_new("<!--a-b--c--->")
+    let tok = tokenizer_next(t)
+    if tok.kind != TOKEN_COMMENT
+        return 1
+    if not (tok.comment.data).eq("a-b--c-")
+        return 1
+    expect_eof(t)
+
+[[test]]
+fn test_doctype_without_name_forces_quirks() -> i32
+    var t = tokenizer_new("<!DOCTYPE>")
+    let tok = tokenizer_next(t)
+    if tok.kind != TOKEN_DOCTYPE
+        return 1
+    if tok.doctype.force_quirks != 1
+        return 1
+    expect_eof(t)
+
+[[test]]
+fn test_bare_ampersand_is_a_character() -> i32
+    var t = tokenizer_new("& ")
+    let tok = tokenizer_next(t)
+    if tok.kind != TOKEN_CHARACTER
+        return 1
+    if tok.character.char != 38
+        return 1
+    return 0
+
+[[test]]
+fn test_every_quote_style_ends_an_attribute() -> i32
+    var t = tokenizer_new("<a x=\"1\" y='2' z=3 w>")
+    let tok = tokenizer_next(t)
+    if tok.kind != TOKEN_START_TAG
+        return 1
+    if tok.start_tag.attr_count != 4
+        return 1
+    # Every Attribute aliases the shared name/value buffers, so only the
+    # last one reads back intact (separate bug, see AGAST follow-up).
+    if not (tok.start_tag.attrs[3].name).eq("w")
+        return 2
+    expect_eof(t)
+
+[[test]]
+fn test_null_in_data_is_replacement_char() -> i32
+    var t = tokenizer_new("\0")
+    let tok = tokenizer_next(t)
+    if tok.kind != TOKEN_CHARACTER
+        return 1
+    if tok.character.char != 65533
+        return 1
     expect_eof(t)
