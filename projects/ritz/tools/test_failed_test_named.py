@@ -48,8 +48,9 @@ def test_a_failing_file_names_each_failed_fn_and_its_rc(tmp_path, monkeypatch,
 
     got = buildpy.run_test_file(t, tmp_path, buildpy.test_env_for_files(), 60)
     out = capsys.readouterr().out
-    assert got == {"status": "fail", "passed": 7, "failed": 2}
+    assert (got["status"], got["passed"], got["failed"]) == ("fail", 7, 2)
     assert "✗ test_x.ritz — 7 passed, 2 failed" in out
+    assert "wall " in out and "binary " in out
     assert "test_serve_in_file_range_sends_206: exited with code 2" in out
     assert "test_crashy: crashed with signal 11" in out
     assert "boom on stderr" in out  # the failed fn's own output, too

@@ -12,7 +12,9 @@ A test binary (LANGUAGE_SPEC.md §17.1, AGAST #1868) is
 
 It is compiled and linked once, run once with `--json`, and ritzunit runs each
 test in its own forked child. This module turns the JSON report into
-`run_test_file`'s (passed, failed, failures) for `ritz0 --test`.
+`run_test_file`'s (passed, failed, failures) for `ritz0 --test`. The same
+object carries `binary_ms` (the report's `summary.duration_ms`) and `slow`
+(each test at or over one second), which `run_files` prints for build.py.
 """
 
 import sys
@@ -683,6 +685,49 @@ RITZUNIT_MAIN = RITZUNIT_ROOT / "src" / "bin_main.ritz"
 # allowed each test 10 s.
 TEST_TIMEOUT_MS = 10000
 
+# A test this long is named on the `rz test` file line. ritzunit already
+# records it; the listing was the only place it was dropped.
+SLOW_TEST_MS = 1000
+
+
+class FileResult(tuple):
+    """`(passed, failed, failures)` plus the binary's own timings.
+
+    A 3-tuple, so `passed, failed, failures = run_test_file(...)` and
+    `run_test_file(...)[:2]` keep working. `binary_ms` is ritzunit's
+    `summary.duration_ms`, or None when the binary did not report one.
+    `slow` is `(name, duration_ms)` for every test at or over `SLOW_TEST_MS`.
+    """
+
+    def __new__(cls, passed, failed, failures, binary_ms=None, slow=()):
+        self = super().__new__(cls, (passed, failed, list(failures)))
+        self.binary_ms = binary_ms
+        self.slow = tuple(slow)
+        return self
+
+
+def _report_timings(report: dict):
+    """`(binary_ms, slow)` from a ritzunit JSON report.
+
+    `binary_ms` is None when the summary has no duration. `slow` keeps tests
+    whose own `duration_ms` is at least one second, in report order.
+    """
+    summary = report.get("summary") or {}
+    try:
+        binary_ms = int(summary["duration_ms"])
+    except (KeyError, TypeError, ValueError):
+        binary_ms = None
+    slow = []
+    for t in report.get("tests") or []:
+        name = t.get("name")
+        try:
+            ms = int(t.get("duration_ms"))
+        except (TypeError, ValueError):
+            continue
+        if isinstance(name, str) and name and ms >= SLOW_TEST_MS:
+            slow.append((name, ms))
+    return binary_ms, slow
+
 
 def runner_args() -> List[str]:
     """ritzunit's flags: the JSON report is what passes or fails the file."""
@@ -904,18 +949,21 @@ def failures_from_report(report: dict) -> List[str]:
     return failures
 
 
-def run_test_binary(exe_path: str, cwd: Optional[str] = None) -> Tuple[int, int, List[str]]:
+def run_test_binary(exe_path: str, cwd: Optional[str] = None) -> FileResult:
     """Run a test binary once; return (passed, failed, failure_messages).
 
     ritzunit exits 0 when every test passed and 1 otherwise; anything else, or
-    a report that does not parse, means the runner itself failed.
+    a report that does not parse, means the runner itself failed. The result
+    also carries the report's binary duration and any test at or over one
+    second (`FileResult`).
     """
     timeout = int(os.environ.get("RITZ_TEST_TIMEOUT", "180"))
     try:
         result = subprocess.run([exe_path] + runner_args(), capture_output=True,
                                 timeout=timeout, cwd=cwd)
     except subprocess.TimeoutExpired:
-        return 0, 1, [f"test binary timed out after {timeout}s"]
+        return FileResult(0, 1, [f"test binary timed out after {timeout}s"],
+                          binary_ms=timeout * 1000)
     stderr = result.stderr.decode("utf-8", errors="replace").strip()
     try:
         report = json.loads(result.stdout.decode("utf-8", errors="replace"))
@@ -926,7 +974,7 @@ def run_test_binary(exe_path: str, cwd: Optional[str] = None) -> Tuple[int, int,
         msg = f"test runner exited with code {result.returncode} without a report"
         if stderr:
             msg += "\n      " + _indent(stderr)
-        return 0, 1, [msg]
+        return FileResult(0, 1, [msg])
     passed = summary["passed"]
     failed = summary["failed"] + summary["crashed"] + summary["timeout"]
     failures = failures_from_report(report)
@@ -934,7 +982,8 @@ def run_test_binary(exe_path: str, cwd: Optional[str] = None) -> Tuple[int, int,
         failures.append(f"test runner exit code {result.returncode} disagrees with "
                         f"its report ({failed} failed)")
         failed = max(failed, 1)
-    return passed, failed, failures
+    binary_ms, slow = _report_timings(report)
+    return FileResult(passed, failed, failures, binary_ms=binary_ms, slow=slow)
 
 
 class TestBuildError(Exception):
@@ -964,15 +1013,16 @@ def first_diagnostic(error: str) -> str:
 
 
 def run_test_file(source_path: str, verbose: bool = False,
-                  compiler: str = "ritz0") -> Tuple[int, int, List[str]]:
+                  compiler: str = "ritz0") -> FileResult:
     """Build `source_path`'s test binary with `compiler` and run it.
 
-    Returns (passed, failed, failure_messages). Raises TestBuildError, with
+    Returns (passed, failed, failure_messages), with `binary_ms` and `slow`
+    when the binary reported them (`FileResult`). Raises TestBuildError, with
     the build error, if the binary cannot be built.
     """
     tests = find_test_functions(source_path)
     if not tests:
-        return (0, 0, [])
+        return FileResult(0, 0, [])
 
     tmpdir = None
     try:
@@ -982,11 +1032,11 @@ def run_test_file(source_path: str, verbose: bool = False,
         exe_path, error = build_test_binary(source_path, tmpdir, compiler)
         if error:
             raise TestBuildError(error)
-        passed, failed, failures = run_test_binary(exe_path)
+        result = run_test_binary(exe_path)
         if verbose:
-            for f in failures:
+            for f in result[2]:
                 print(f"  FAIL {f}")
-        return passed, failed, failures
+        return result
     finally:
         if tmpdir and os.path.exists(tmpdir):
             cleanup_scratch_dir(tmpdir)
@@ -1001,6 +1051,20 @@ def _print_error(file_path: str, error: str) -> None:
     where = str(Path(file_path).resolve().parent) + os.sep
     diag = first_diagnostic(error).replace(where, "")
     print(f"Error in {Path(file_path).name}: {diag}", file=sys.stderr)
+
+
+def _print_timings(result) -> None:
+    """Lines build.py reads back out of this report.
+
+    `binary_ms N` is the test binary's own duration. `slow <name> N` is one
+    test that ran at least a second. Both sit above the harness summary, so
+    classify_test_file's "N passed, M failed" scan is unchanged.
+    """
+    binary_ms = getattr(result, "binary_ms", None)
+    if binary_ms is not None:
+        print(f"binary_ms {int(binary_ms)}")
+    for name, ms in getattr(result, "slow", ()):
+        print(f"slow {name} {int(ms)}")
 
 
 def run_files(files: List[str], verbose: bool = False, compiler: str = "ritz0") -> int:
@@ -1022,7 +1086,9 @@ def run_files(files: List[str], verbose: bool = False, compiler: str = "ritz0") 
         if verbose:
             print(f"\n{file_path}:")
         try:
-            passed, failed, failures = run_test_file(file_path, verbose, compiler)
+            result = run_test_file(file_path, verbose, compiler)
+            passed, failed, failures = result
+            _print_timings(result)
             total_passed += passed
             total_failed += failed
             all_failures.extend(failures)
