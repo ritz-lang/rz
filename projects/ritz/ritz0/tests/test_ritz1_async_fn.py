@@ -48,14 +48,14 @@ _FORTY_TWO = "async fn g() -> i32\n    42\n\n"
 _STORE = "fn store(p: *i32, v: i32)\n    *p = v\n\n"
 _DBL = "async fn dbl(x: i32) -> i32\n    x * 2\n\n"
 
-# A poll fn that is Pending twice, then Ready(30).
+# A poll fn that is Pending (the reserved -4096 sentinel) twice, then Ready(30).
 _TICK = """\
 var g_n: i32 = 0
 
 fn tick() -> i32
     g_n = g_n + 1
     if g_n < 3
-        return 0 - 1
+        return 0 - 4096
     g_n * 10
 
 async fn waits() -> i32

@@ -9,8 +9,13 @@ See `examples/75_async_reference/src/main.ritz` for the gold standard implementa
 ## Core Concepts
 
 ### Poll Encoding
-- `-1` = Pending (operation not complete, will be resumed)
-- `>= 0` = Ready (operation complete, result is the return value)
+A hand-written **poll source** (any `i32`-returning call awaited directly) uses:
+- `POLL_PENDING` (`-4096`) = Pending (operation not complete, will be resumed)
+- any other value, **including `-1`** = Ready (operation complete, result is the return value)
+
+`-4096` is reserved because no syscall result can be it: Linux results are
+errors in `[-4095, -1]` or successes `>= 0`, so a genuine `-1` (e.g. `-EPERM`)
+is a result, not Pending (AGAST #4485).
 
 ### Future Generation
 When you write:
@@ -21,7 +26,9 @@ async fn my_func(x: i32) -> i32
 
 The compiler generates:
 - a `my_func$Future` struct (holds parameters and state)
-- a `my_func$poll(*my_func$Future) -> i32` function (state machine)
+- a `my_func$poll(*my_func$Future) -> bool` function (state machine); it
+  returns `false` while Pending and `true` once finished, having written the
+  result into the future's `__result` field (LARB R78)
 
 `$` is not an identifier character, so neither name can be written in Ritz
 source (AGAST #3606). They are implementation details: hold a future untyped
@@ -86,7 +93,8 @@ struct IoReadState
 ### Step 2: Poll Function
 `runtime_poll_read` submits the read and returns Pending; once `block_on` has
 seen the completion, the next call returns its result, whatever the value (0 at
-EOF included). Do not read `rt.waker_io_result` yourself: before AGAST #2328 the
+EOF, and -1 for -EPERM, included: -1 is not the Pending sentinel, which is
+`POLL_PENDING` = -4096, AGAST #4485). Do not read `rt.waker_io_result` yourself: before AGAST #2328 the
 examples did, and a result of 0 looked like "none yet".
 
 ```ritz
@@ -175,7 +183,9 @@ async fn connection_handler(state: *ConnectionState) -> i32
 1. **No Future trait** - Ritz uses generated `NAME$Future` structs and `NAME$poll` functions, which no source can name (AGAST #3606)
 2. **No Pin** - Futures are regular stack values
 3. **No async runtime** - Use `block_on` with `Runtime` directly
-4. **Poll encoding** - Uses i32 (-1 = Pending, >= 0 = Ready) not enum
+4. **Poll encoding** - A generated future's poll returns `bool`; a hand-written
+   poll source returns i32 with `POLL_PENDING` (`-4096`) while waiting and any
+   other value — including `-1` — as its result (AGAST #4485)
 
 ## Testing
 

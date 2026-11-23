@@ -35,10 +35,11 @@ def _go(sig: str, body: str, call: str) -> str:
     return f"async fn go{sig}\n{body}\npub fn main() -> i32\n    await go{call}\n"
 
 
-# A hand-written poll source: Pending until it has been polled `PENDS` times.
-# `await later()` in an async fn re-evaluates it on each poll of the future.
+# A hand-written poll source: Pending (the reserved -4096 sentinel) until it
+# has been polled `PENDS` times.  `await later()` in an async fn re-evaluates
+# it on each poll of the future.
 _LATER = ("var TICKS: i32 = 0\nvar CALLS: i32 = 0\n\n"
-          "fn later() -> i32\n    TICKS += 1\n    if TICKS <= 2\n        return 0 - 1\n    5\n\n")
+          "fn later() -> i32\n    TICKS += 1\n    if TICKS <= 2\n        return 0 - 4096\n    5\n\n")
 # main polls go by hand, counting Pending answers into the exit code.  A poll
 # is false while Pending, and true with the value in `__result` (R78, #3728).
 _POLL_GO = ("pub fn main() -> i32\n    var f = go()\n    var pends: i32 = 0\n"

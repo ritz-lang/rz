@@ -66,6 +66,17 @@ RUNS = {
     "unit_poll_true": ("var RAN: i32 = 0\n\nasync fn u()\n    RAN = 4\n\n"
                        "pub fn main() -> i32\n    var f = u()\n"
                        "    if future_poll(@&f)\n        return RAN\n    9\n", 4),
+    # A hand-written poll source (not an async fn) whose genuine answer is -1.
+    # -1 was the old Pending encoding, so the generated future never became
+    # ready.  The bounded loop fails (exits 9) under the old ABI instead of
+    # hanging; the reserved Pending sentinel makes -1 a Ready(-1) (AGAST #4485).
+    "poll_source_genuine_minus_one": (
+        "fn minus_one() -> i32\n    return 0 - 1\n\n"
+        "async fn observe() -> i32\n    let v: i32 = await minus_one()\n    v\n\n"
+        "pub fn main() -> i32\n    var f = observe()\n    var n: i32 = 0\n"
+        "    while !future_poll(@&f)\n        n += 1\n"
+        "        if n > 10\n            return 9\n"
+        "    if f.__result == 0 - 1\n        return 0\n    1\n", 0),
 }
 
 

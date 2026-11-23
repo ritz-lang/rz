@@ -1958,7 +1958,7 @@ Drives one future, or one blocking operation at a time, on an io_uring of its
 own. For many concurrent tasks, use [async.tasks](#asynctasks).
 
 **Constants**:
-- `POLL_PENDING`: -1. A poll function returns this while it is suspended; any other value is Ready.
+- `POLL_PENDING`: -4096. A poll function returns this while it is suspended; any other value, including -1, is Ready. The value is reserved because no syscall result can be it: Linux results are errors in [-4095, -1] or successes >= 0 (AGAST #4485).
 
 ```ritz
 import ritzlib.uring
@@ -1986,7 +1986,9 @@ struct Runtime
 `waker_io_ready`, not the value of `waker_io_result`, says whether a completion
 is waiting, so a read at EOF returns 0 rather than being resubmitted. A
 hand-written poll function that returns an -EPERM result it was handed is
-Ready(-1) rather than being read as Pending (AGAST #2328).
+Ready(-1) rather than being read as Pending (AGAST #2328): it returns
+`POLL_PENDING` while Pending, and any other value — including -1 — is its
+Ready result (AGAST #4485).
 
 `spawn`/`run_spawned` queue several held futures on one runtime (LARB R79).
 Each queued task has its own waker slot (`SpawnTask`): while a task's poll
@@ -2015,8 +2017,9 @@ as `block_on` does, when a poll reports Pending without suspending on the ring
 | `get_runtime` | `fn() -> *Runtime` | Get global runtime |
 | `cleanup_runtime` | `fn()` | Cleanup global runtime |
 
-A `runtime_poll_*` result of 0 cannot be told from "no result yet", so a read at
-EOF is submitted again (AGAST #2328).
+`runtime_poll_*` uses the waker's ready flag, not its result value, so a read at
+EOF (0) or a -EPERM completion (-1) is returned as a result rather than
+resubmitted (AGAST #2328, #4485).
 
 ---
 

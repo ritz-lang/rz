@@ -30,7 +30,7 @@ async fn constant() -> i32
 
 # A poll source that is always Pending and registers nothing on the ring.
 fn always_pending(x: i32) -> i32
-    0 - 1
+    POLL_PENDING
 
 async fn spawn_never_ready() -> i32
     let v: i32 = await always_pending(0)
@@ -189,6 +189,63 @@ fn test_spawn_suspends_on_real_io() -> i32
         return 1
     if buf[0] != 90
         prints("FAIL: the read did not land in the task's buffer\n")
+        return 1
+    return 0
+
+# ============================================================================
+# (d) A spawned future observes a genuine -1 completion (AGAST #4485)
+# ============================================================================
+#
+# A hand-written poll source returns POLL_PENDING while Pending (the reserved
+# value) and its raw result when Ready.  A genuine -1 completion (e.g. EPERM)
+# must therefore be Ready(-1), not read as Pending: under the old -1 sentinel
+# the generated future stayed Pending after the completion and tripped
+# run_spawned's "Pending did not suspend" fatal instead of finishing.
+[[test]]
+fn test_spawned_future_observes_genuine_minus_one() -> i32
+    var fds: [2]i32
+    if sys_pipe(@fds[0]) < 0
+        prints("FAIL: sys_pipe failed\n")
+        return 1
+
+    var rt: Runtime
+    if rt.init() < 0
+        prints("FAIL: runtime_init failed\n")
+        return 1
+
+    var buf: [1]u8
+    var p = read_byte(@rt, fds[0], @buf[0])
+    rt.spawn(@&p)
+
+    # First poll: submit the read and suspend the task on the ring (slot 0).
+    rt.current_task = 0
+    let ready: bool = future_poll(@&p)
+    rt.current_task = 0 - 1
+    if ready
+        prints("FAIL: the first poll should have suspended\n")
+        return 1
+    if rt.spawn_tasks[0].state != 1   # SPAWN_WAITING
+        prints("FAIL: the task should be waiting on the ring\n")
+        return 1
+
+    # Stand in for runtime_wait_for_io: the operation completed with -1.
+    rt.spawn_tasks[0].io_result = 0 - 1
+    rt.spawn_tasks[0].io_ready = 1
+    rt.spawn_tasks[0].state = 2       # SPAWN_READY
+
+    let drain_result: i32 = rt.run_spawned()
+    let n: i32 = await p
+    rt.destroy()
+    sys_close(fds[0])
+    sys_close(fds[1])
+
+    if drain_result != 0
+        prints("FAIL: run_spawned should return 0\n")
+        return 1
+    if n != 0 - 1
+        prints("FAIL: the spawned future should observe -1, got ")
+        print_int(n as i64)
+        prints("\n")
         return 1
     return 0
 

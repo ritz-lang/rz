@@ -39,7 +39,8 @@
 #     finished, its value stored in the future's `__result`, of the fn's
 #     declared type (a unit fn's future has none).  `await` polls until true,
 #     then reads the field.  An awaited expression that is not an async fn's
-#     call is a hand-written poll source: an i32, -1 while Pending.
+#     call is a hand-written poll source: an i32, POLL_PENDING (-4096) while
+#     Pending and any other value, including -1, as its Ready result (#4485).
 #   * `async fn main` is `__main_future` + `main$poll`, and a sync `main`
 #     polls it to completion.
 #   * `await g(..)` anywhere else (a sync fn) polls g's future until Ready,
@@ -189,9 +190,17 @@ fn al_binary(op: i32, left: *Expr, right: *Expr) -> *Expr
     e.right = right
     e
 
-# `0 - 1`: a hand-written poll source's Pending, written as ritz0 writes it.
+# `0 - 1`: a future's `__state` DONE marker, written as ritz0 writes it.  This
+# is NOT the poll source's Pending: the two are separate encodings (AGAST #4485).
 fn al_pending(span: SrcSpan) -> *Expr
     al_binary(OP_SUB, al_int(0, span), al_int(1, span))
+
+# `0 - 4096`: the reserved Pending value a hand-written poll source returns.
+# Linux syscall results are errors in [-4095, -1] or successes >= 0, so -4096
+# can never be a genuine result: a real -1 reads as Ready(-1), not Pending
+# (AGAST #4485).  ritz0 must reserve the same value (async_transform_v2.py).
+fn al_poll_source_pending(span: SrcSpan) -> *Expr
+    al_binary(OP_SUB, al_int(0, span), al_int(4096, span))
 
 fn al_call(name_sv: StrView, args: *Expr, span: SrcSpan) -> *Expr
     var name: *u8 = name_sv.ptr
@@ -1209,9 +1218,14 @@ fn al_poll_not_ready(polled: *Expr) -> *Expr
     e.operand = polled
     e
 
-# Whether an awaited poll source's i32 `answer` is Pending (-1).
-fn al_poll_is_pending(answer: *Expr) -> *Expr
-    al_binary(OP_EQ, answer, al_pending(answer.span))
+# Whether an awaited poll source's i32 `answer` is Pending: `answer == -4096`.
+fn al_poll_source_is_pending(answer: *Expr) -> *Expr
+    al_binary(OP_EQ, answer, al_poll_source_pending(answer.span))
+
+# Whether a future's `__state` says its body has finished: `__state == -1`.
+# Kept separate from the poll source's Pending sentinel (AGAST #4485).
+fn al_state_is_done(state: *Expr) -> *Expr
+    al_binary(OP_EQ, state, al_pending(state.span))
 
 # Return Pending from this poll.
 fn al_poll_pending_stmt(span: SrcSpan) -> *Stmt
@@ -2188,7 +2202,8 @@ fn al_if_value(a: *AlFn, e: *Expr)
 # future into a field once, and the resume state polls it until it answers
 # true (R78), so a Pending one is polled again on the next poll, not rebuilt;
 # then it reads the future's `__result`.  Anything else awaited is a
-# hand-written poll source, evaluated again at each poll until it is not -1.
+# hand-written poll source, evaluated again at each poll until it is not
+# POLL_PENDING (-4096); any other value, including -1, is its Ready result.
 fn al_lower_await(a: *AlFn, aw: *Expr, d: *AlDest)
     let k: i32 = a.nawaits
     a.nawaits += 1
@@ -2257,7 +2272,7 @@ fn al_lower_await(a: *AlFn, aw: *Expr, d: *AlDest)
     al_goto(a, resume, span)
     a.cur = resume
     al_emit(a, al_decl(StrView { ptr: (answer), len: (anl) as i64 }, TYPE_I32, StrView { ptr: (null), len: (0) as i64 }, polled, 1, a.file, span))
-    al_emit(a, al_if(al_poll_is_pending(al_ident(StrView { ptr: (answer), len: (anl) as i64 }, span)), al_poll_pending_stmt(span), span))
+    al_emit(a, al_if(al_poll_source_is_pending(al_ident(StrView { ptr: (answer), len: (anl) as i64 }, span)), al_poll_pending_stmt(span), span))
     al_deliver(a, al_ident(StrView { ptr: (answer), len: (anl) as i64 }, span), d)
 
 fn al_deliver(a: *AlFn, v: *Expr, d: *AlDest)
@@ -2934,7 +2949,7 @@ fn al_poll(a: *AlFn, name_sv: StrView, fut_sv: StrView) -> *FnDef
         body = al_dispatch(a, span)
     # R79's finished guard, first of all: a poll of a finished future is true
     # at once and runs nothing.
-    let guard: *Stmt = al_if(al_poll_is_pending(al_self_field(StrView { ptr: (c"__state"), len: (7) as i64 }, span)), al_return(al_true(span), span), span)
+    let guard: *Stmt = al_if(al_state_is_done(al_self_field(StrView { ptr: (c"__state"), len: (7) as i64 }, span)), al_return(al_true(span), span), span)
     guard.next = body
     body = guard
     let self_p: *Param = al_zalloc(sizeof(Param)) as *Param

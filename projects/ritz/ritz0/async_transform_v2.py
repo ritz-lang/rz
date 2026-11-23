@@ -462,8 +462,13 @@ class PollAbi:
     DONE = -1
 
     # An awaited expression that is not an async fn's call is a hand-written
-    # poll source, evaluated again at each poll: an i32, -1 while Pending.
+    # poll source, evaluated again at each poll: an i32, PENDING while waiting
+    # and its raw result (any value, including -1) when Ready.  Linux results
+    # are errors in [-4095, -1] or successes >= 0, so -4096 is reserved: a
+    # genuine -1 is Ready(-1), not Pending (AGAST #4485).  ritz1 reserves the
+    # same value (async_lower.ritz's al_poll_source_pending).
     EXPR_TYPE = 'i32'
+    PENDING = -4096
 
     def __init__(self, span: rast.Span, fn_name: Optional[str] = None):
         self.span = span
@@ -507,10 +512,10 @@ class PollAbi:
         return rast.UnaryOp(span=self.span, op='!', operand=polled)
 
     def expr_is_pending(self, answer: rast.Expr) -> rast.Expr:
-        """Whether an awaited poll source's i32 `answer` is Pending (-1)."""
-        minus_one = rast.BinOp(span=self.span, op='-', left=rast.IntLit(span=self.span, value=0),
-                               right=rast.IntLit(span=self.span, value=1))
-        return rast.BinOp(span=self.span, op='==', left=answer, right=minus_one)
+        """Whether an awaited poll source's i32 `answer` is Pending (-4096)."""
+        sentinel = rast.BinOp(span=self.span, op='-', left=rast.IntLit(span=self.span, value=0),
+                              right=rast.IntLit(span=self.span, value=-self.PENDING))
+        return rast.BinOp(span=self.span, op='==', left=answer, right=sentinel)
 
     def pending(self) -> rast.Stmt:
         """Return Pending from this poll."""

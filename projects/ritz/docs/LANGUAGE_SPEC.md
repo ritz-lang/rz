@@ -6680,6 +6680,16 @@ written into the future, of the fn's declared type (none for a unit fn).  The
 result is kept whole whatever its type: an `i64` above 2^31, a pointer, a
 struct, or a `-1` that is a genuine answer and not Pending.
 
+A compiled future's poll answers `bool`, so no result is ever confused with
+Pending.  An `await` whose operand is not an `async fn`'s call and not a held
+future is a **hand-written poll source**: an `i32`-returning call evaluated
+again at each poll.  Its Pending is the reserved value `-4096`
+(`POLL_PENDING` in `ritzlib.async.runtime`), which no syscall result can be:
+Linux results are errors in `[-4095, -1]` or successes `>= 0`.  So a genuine
+`-1` (e.g. `-EPERM`) is Ready(-1), not Pending (AGAST #4485).  Every value
+other than `POLL_PENDING`, including `-1`, is the Ready result.  Both
+frontends and the runtime reserve this same value.
+
 `await` drives a future to completion in place (§16.2).  An executor drives a
 held future through the built-in `future_poll` and then reads the result with
 `await` (§16.3).
@@ -6945,6 +6955,11 @@ elsewhere works.
 The built-in `future_poll(f: @&Future) -> bool` drives a future one step: it
 returns `false` while the future is Pending and `true` once it has finished.
 The result is read with `await`, not through the poll (LARB R78).
+
+A hand-written poll source — any `i32`-returning call awaited directly — says
+Pending by returning the reserved `POLL_PENDING` (`-4096`), and says Ready by
+returning any other value, its result.  A genuine `-1` is a result, not
+Pending (AGAST #4485).
 
 ritzlib's runtime drives one future on one io_uring, waiting on the ring
 whenever a poll answers Pending (`ritzlib/async/runtime.ritz`):
