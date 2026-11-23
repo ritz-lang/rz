@@ -8,15 +8,26 @@
 # This is also the kernel's block-device interface: NVMe namespaces
 # (drivers/nvme) are handed out as block devices after the virtio disks, and
 # virtio_blk_read/virtio_blk_write pass them to the NVMe driver (#1850).
+#
+# A disk with MSI-X (AGAST #3631) signals its request queue, and config
+# changes, on one vector (drivers/virtio/vmsix.ritz). A request issued with
+# IF=1 (a syscall) sleeps on that vector between checks of the used ring
+# (drivers/irq_wait.ritz) instead of spinning; one issued with IF=0 (boot)
+# still polls. It sleeps in sti;hlt without parking the process: a second
+# process would reuse the device's one DMA page mid-request. The used ring stays the ground truth either way, and the TSC
+# deadline still bounds the wait.
 
 import serial { prints, println, serial_print_hex8, serial_print_dec }
 import drivers.pci { PciDevice, pci_find_virtio_nth, VIRTIO_DEVICE_BLOCK }
-import drivers.virtio.common { VirtioDevice, Virtqueue, VringDesc, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_setup_queue, VIO_TRANSPORT_MMIO, vio_read_config64, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE }
+import drivers.msix { MsixInfo, msix_vector_count }
+import drivers.irq_wait { irq_wait_vector }
+import drivers.virtio.vmsix { VIO_MSIX_ENTRY, vio_msix_setup }
+import drivers.virtio.common { VirtioDevice, Virtqueue, VringDesc, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_setup_queue, vio_setup_queue_vec, VIO_TRANSPORT_MMIO, vio_read_config64, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE }
 import drivers.nvme.nvme { NvmeNamespace, nvme_probe, nvme_get_namespace, nvme_ns_sectors, nvme_ns_read, nvme_ns_write }
 import mm.heap { kalloc, kfree }
 import mm.vmm { phys_to_virt }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
-import io { rdtsc }
+import io { rdtsc, interrupts_enabled }
 
 # ============================================================================
 # VirtIO Block Feature Bits
@@ -115,6 +126,17 @@ var dma_buffer_virt: [4]*u8
 var blk_inflight: [4]bool
 var blk_inflight_head: [4]u16
 
+# MSI-X (AGAST #3631): device n's IDT vector (0 = none, polled) and table.
+# Each sleep of a request's wait lasts at most BLK_IRQ_WATCHDOG_TICKS of
+# LAPIC bus clock / 16 (~16 ms at QEMU's 1 GHz), then the wait re-checks
+# its ring and the TSC deadline. blk_irq_waits counts requests that waited
+# on their vector, blk_irq_halts the hlts they slept in.
+const BLK_IRQ_WATCHDOG_TICKS: u32 = 0x00100000
+var blk_msix: [4]MsixInfo
+var blk_msix_vec: [4]u8
+var blk_irq_waits: u64 = 0
+var blk_irq_halts: u64 = 0
+
 # ============================================================================
 # Device Initialization
 # ============================================================================
@@ -158,11 +180,20 @@ pub fn virtio_blk_init_nth(n: i32) -> *VirtioBlkDevice
         kfree(dev as *u8)
         return 0 as *VirtioBlkDevice
 
+    # MSI-X before the config read: it moves the legacy config (#3631)
+    blk_msix_vec[n] = vio_msix_setup(vdev, pci_dev, @blk_msix[n], "virtio-blk")
+
     # Read device configuration
     (*dev).capacity = vio_read_config64(vdev, VIRTIO_BLK_CFG_CAPACITY)
 
-    # Set up the request queue (queue 0)
-    (*dev).request_queue = vio_setup_queue(vdev, 0)
+    # Set up the request queue (queue 0), on the MSI-X entry if there is one
+    if blk_msix_vec[n] != 0
+        (*dev).request_queue = vio_setup_queue_vec(vdev, 0, VIO_MSIX_ENTRY)
+        if (*dev).request_queue == 0 as *Virtqueue
+            println("[msix] virtio-blk: queue refused its vector, polling")
+            blk_msix_vec[n] = 0
+    if blk_msix_vec[n] == 0
+        (*dev).request_queue = vio_setup_queue(vdev, 0)
     if (*dev).request_queue == 0 as *Virtqueue
         println("[virtio-blk] Failed to set up request queue")
         kfree(dev as *u8)
@@ -266,21 +297,34 @@ fn get_device_index(dev: *VirtioBlkDevice) -> i32
         i = i + 1
     return 0  # Fall back to device 0
 
-# Poll vq until the device returns a used buffer: true once it has, false if
-# REQUEST_TIMEOUT_TSC cycles pass first.
-fn wait_used(vq: *Virtqueue) -> bool
+# Wait until device dev_idx returns a used buffer on vq: true once it has,
+# false if REQUEST_TIMEOUT_TSC cycles pass first. With an MSI-X vector and
+# IF=1 it sleeps on the vector between checks; otherwise it polls.
+fn wait_used(dev_idx: i32, vq: *Virtqueue) -> bool
     let start: u64 = rdtsc()
-    while not vq_has_used(vq)
+    let vec: u8 = blk_msix_vec[dev_idx]
+    let sleep: bool = vec != 0 and interrupts_enabled()
+    if sleep
+        blk_irq_waits = blk_irq_waits + 1
+    while true
+        # Snapshot the vector before the check: an interrupt for this
+        # completion that lands after it ends the sleep at once.
+        var seen: u64 = 0
+        if sleep
+            seen = msix_vector_count(vec)
+        if vq_has_used(vq)
+            return true
         if rdtsc() - start > REQUEST_TIMEOUT_TSC
             return false
-    return true
+        if sleep
+            irq_wait_vector(vec, seen, BLK_IRQ_WATCHDOG_TICKS, 1, false, @blk_irq_halts)
 
 # Wait (up to wait_used's TSC deadline) for device dev_idx's request whose
 # chain starts at `head`, then take its used entry and free the chain. Returns true once it has completed. On a
 # timeout the request stays in flight (blk_inflight), and the next call on the
 # device finishes it in blk_reclaim before touching the DMA buffer.
 fn blk_complete(dev_idx: i32, vq: *Virtqueue, head: u16) -> bool
-    if not wait_used(vq)
+    if not wait_used(dev_idx, vq)
         blk_inflight[dev_idx] = true
         blk_inflight_head[dev_idx] = head
         return false
@@ -433,6 +477,26 @@ pub fn virtio_blk_rw(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8, w
             j = j + 1
 
     return 0
+
+# Block device n's MSI-X vector, 0 if it polls (or isn't a virtio disk)
+pub fn virtio_blk_msix_vector(n: i32) -> u8
+    if n < 0 or n >= MAX_BLK_DEVICES
+        return 0
+    return blk_msix_vec[n]
+
+# Interrupts block device n's vector has delivered (0 without MSI-X)
+pub fn virtio_blk_irq_count(n: i32) -> u64
+    let vec: u8 = virtio_blk_msix_vector(n)
+    if vec == 0
+        return 0
+    return msix_vector_count(vec)
+
+# Requests that slept on their vector, and the hlts they slept in
+pub fn virtio_blk_irq_wait_count() -> u64
+    return blk_irq_waits
+
+pub fn virtio_blk_irq_halt_count() -> u64
+    return blk_irq_halts
 
 # Read sectors from the block device (see virtio_blk_rw)
 pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32

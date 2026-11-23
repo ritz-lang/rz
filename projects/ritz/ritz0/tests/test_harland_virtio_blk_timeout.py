@@ -71,6 +71,7 @@ pub fn serial_print_hex8(value: u8) -> i32
 # Block device 0 is a legacy virtio device with its I/O BAR at 0xC000.
 PCI_STUB = """\
 pub const VIRTIO_DEVICE_BLOCK: u16 = 0x1001
+pub const VIRTIO_DEVICE_INPUT: u16 = 0x1052
 pub const PCI_CAP_VENDOR: u8 = 0x09
 
 pub struct PciDevice
@@ -198,13 +199,38 @@ pub fn phys_to_virt(paddr: u64) -> u64
 """
 
 # The device. Legacy registers at 0xC000 (virtio 1.1 §4.1.4.8): features 0,
-# queue 0 has QNUM entries, capacity CAPACITY sectors. Reading sector S gives
-# byte i = (S * 7 + i) & 255; a write is logged (count, last sector, its
-# first byte). The rings are where common.ritz puts them for the PFN it wrote.
+# queues 0 and 1 have QNUM entries, capacity CAPACITY sectors. Reading sector
+# S gives byte i = (S * 7 + i) & 255; a write is logged (count, last sector,
+# its first byte). The rings are where common.ritz puts them for the PFN it
+# wrote (the last queue set up).
+#
+# MSI-X (AGAST #3631), off unless fake_msix_present(true): once the driver
+# enables it (the drivers/msix.ritz stand-in calls fake_msix_enable) the
+# config vector and the selected queue's vector sit at 20 and 22 and the
+# device config moves to 24. A completion then "interrupts": the queue's
+# table entry's vector is counted. With fake_dev_irq_only(true) the device
+# completes a request only while the CPU sleeps in sti_hlt, as a real one
+# whose interrupt wakes a hlt: a driver that spins instead never sees it.
+# The CPU's IF flag, sti_hlt and the LAPIC watchdog / wait queue that
+# drivers/irq_wait.ritz calls (extern) are stand-ins here too; the watchdog
+# expires on its WD_CHECKS-th check.
 IO_STUB = """\
 const BASE: u16 = 0xC000
 const QNUM: u16 = 16
 const CAPACITY: u32 = 64
+const NO_VECTOR: u16 = 0xFFFF
+const WD_CHECKS: i32 = 3
+
+var g_msix_present: bool = false
+var g_msix_on: bool = false
+var g_entry_vec: [4]u8
+var g_cfg_vec: u16 = 0xFFFF
+var g_qvec: [2]u16
+var g_irqs: [16]u64
+var g_irq_only: bool = false
+var g_if: bool = false
+var g_hlts: u64 = 0
+var g_wd_checks: i32 = 0
 
 var g_status: u8 = 0
 var g_qsel: u16 = 0
@@ -249,6 +275,14 @@ fn serve(head: u16)
         g_write_byte = *(data as *u8)
     *(status as *u8) = 0
 
+# Interrupt for queue 0's completion: count its entry's vector, if any.
+fn raise_queue_irq()
+    if not g_msix_on or g_qvec[0] == NO_VECTOR or g_qvec[0] > 3
+        return
+    let v: u8 = g_entry_vec[g_qvec[0] as i32]
+    if v >= 64 and v < 80
+        g_irqs[(v - 64) as i32] = g_irqs[(v - 64) as i32] + 1
+
 # Complete every request the driver has made available, in order.
 pub fn fake_dev_service() -> i32
     let avail_idx: u16 = *((avail_ring() + 2) as *u16)
@@ -261,6 +295,7 @@ pub fn fake_dev_service() -> i32
         *((elem + 4) as *u32) = 1
         *((used_ring() + 2) as *u16) = uidx + 1
         g_last_avail = g_last_avail + 1
+        raise_queue_irq()
     0
 
 # Requests made available and not yet completed.
@@ -269,6 +304,101 @@ pub fn fake_dev_pending() -> u16
 
 pub fn fake_dev_hold(hold: bool) -> i32
     g_hold = hold
+    0
+
+pub fn fake_dev_irq_only(on: bool) -> i32
+    g_irq_only = on
+    0
+
+pub fn fake_msix_present(on: bool) -> i32
+    g_msix_present = on
+    g_qvec[0] = NO_VECTOR
+    g_qvec[1] = NO_VECTOR
+    0
+
+pub fn fake_msix_is_present() -> bool
+    g_msix_present
+
+pub fn fake_msix_enable() -> i32
+    g_msix_on = true
+    0
+
+pub fn fake_msix_set_entry(entry: u16, vector: u8) -> i32
+    if entry < 4
+        g_entry_vec[entry as i32] = vector
+    0
+
+pub fn fake_msix_entry_vector(entry: u16) -> u8
+    g_entry_vec[entry as i32]
+
+pub fn fake_msix_count(vector: u8) -> u64
+    if vector >= 64 and vector < 80
+        return g_irqs[(vector - 64) as i32]
+    0
+
+pub fn fake_cfg_vector() -> u16
+    g_cfg_vec
+
+pub fn fake_queue_vector(q: u16) -> u16
+    g_qvec[q as i32]
+
+pub fn fake_cpu_halts() -> u64
+    g_hlts
+
+pub fn fake_cpu_set_if(on: bool) -> i32
+    g_if = on
+    0
+
+pub fn interrupts_enabled() -> bool
+    g_if
+
+pub fn enable_interrupts() -> i32
+    g_if = true
+    0
+
+pub fn disable_interrupts() -> i32
+    g_if = false
+    0
+
+# sti;hlt: a device holding back its completion for an interrupt delivers
+# it now (and the interrupt wakes the hlt).
+pub fn sti_hlt() -> i32
+    g_if = true
+    g_hlts = g_hlts + 1
+    if g_irq_only and not g_hold
+        fake_dev_service()
+    0
+
+pub fn lapic_watchdog_arm(ticks: u32) -> i32
+    g_wd_checks = 0
+    0
+
+pub fn lapic_watchdog_expired() -> bool
+    g_wd_checks = g_wd_checks + 1
+    g_wd_checks >= WD_CHECKS
+
+pub fn lapic_watchdog_stop() -> i32
+    0
+
+# The wait queue: parking is possible only after fake_waitq_allow(true);
+# a park counts and, like the woken process, sees the interrupt delivered.
+var g_can_park: bool = false
+var g_parks: u64 = 0
+
+pub fn fake_waitq_allow(on: bool) -> i32
+    g_can_park = on
+    0
+
+pub fn fake_waitq_parks() -> u64
+    g_parks
+
+pub fn waitq_can_park() -> bool
+    g_can_park
+
+pub fn waitq_park() -> i32
+    g_parks = g_parks + 1
+    if g_irq_only and not g_hold
+        fake_dev_service()
     0
 
 pub fn fake_dev_writes() -> i32
@@ -302,13 +432,21 @@ pub fn inb(port: u16) -> u8
 pub fn outw(port: u16, value: u16) -> i32
     if port == BASE + 14
         g_qsel = value
-    if port == BASE + 16 and not g_hold
+    if port == BASE + 16 and not g_hold and not g_irq_only
         fake_dev_service()
+    if g_msix_on and port == BASE + 20
+        g_cfg_vec = value
+    if g_msix_on and port == BASE + 22 and g_qsel < 2
+        g_qvec[g_qsel as i32] = value
     0
 
 pub fn inw(port: u16) -> u16
-    if port == BASE + 12 and g_qsel == 0
+    if port == BASE + 12 and g_qsel < 2
         return QNUM
+    if g_msix_on and port == BASE + 20
+        return g_cfg_vec
+    if g_msix_on and port == BASE + 22 and g_qsel < 2
+        return g_qvec[g_qsel as i32]
     0
 
 pub fn outl(port: u16, value: u32) -> i32
@@ -317,9 +455,51 @@ pub fn outl(port: u16, value: u32) -> i32
     0
 
 pub fn inl(port: u16) -> u32
-    if port == BASE + 20
+    if not g_msix_on and port == BASE + 20
+        return CAPACITY
+    if g_msix_on and port == BASE + 24
         return CAPACITY
     0
+"""
+
+# drivers/msix.ritz: the device's table lives in the io stand-in.
+MSIX_STUB = """\
+import drivers.pci { PciDevice }
+import io { fake_msix_is_present, fake_msix_enable, fake_msix_set_entry, fake_msix_count }
+
+pub struct MsixInfo
+    dev: *PciDevice
+    cap: u8
+    table_bar: u8
+    table_size: u16
+    table_offset: u32
+    table_virt: u64
+
+var g_msix_next: u8 = 64
+
+pub fn msix_probe(dev: *PciDevice, out: *MsixInfo) -> i32
+    (*out).dev = dev
+    if not fake_msix_is_present()
+        return -1
+    (*out).table_size = 4
+    0
+
+pub fn msix_enable(info: *MsixInfo) -> i32
+    fake_msix_enable()
+    (*info).table_virt = 1
+    0
+
+pub fn msix_vector_alloc() -> u8
+    let v: u8 = g_msix_next
+    g_msix_next = g_msix_next + 1
+    v
+
+pub fn msix_set_entry(info: *MsixInfo, entry: u16, vector: u8) -> i32
+    fake_msix_set_entry(entry, vector)
+    0
+
+pub fn msix_vector_count(vector: u8) -> u64
+    fake_msix_count(vector)
 """
 
 STUBS = {
@@ -327,11 +507,13 @@ STUBS = {
     "io.ritz": IO_STUB,
     "drivers/pci.ritz": PCI_STUB,
     "drivers/nvme/nvme.ritz": NVME_STUB,
+    "drivers/msix.ritz": MSIX_STUB,
     "mm/pmm.ritz": PMM_STUB,
     "mm/heap.ritz": HEAP_STUB,
     "mm/vmm.ritz": VMM_STUB,
 }
-REAL = ["drivers/virtio/blk.ritz", "drivers/virtio/common.ritz"]
+REAL = ["drivers/virtio/blk.ritz", "drivers/virtio/common.ritz",
+        "drivers/virtio/vmsix.ritz", "drivers/irq_wait.ritz"]
 
 # Exit code -> the claim that failed.
 CHECKS = {
@@ -436,8 +618,6 @@ fn main() -> i32
     0
 """
 
-MODULES = list(STUBS) + REAL
-
 
 def _compile(tmp_path, path, name, extra=()):
     ll = tmp_path / f"{name}.ll"
@@ -447,18 +627,18 @@ def _compile(tmp_path, path, name, extra=()):
     return ll
 
 
-def _run(tmp_path, src):
+def _run(tmp_path, src, real=REAL):
     """Compile `src` and each module of the stub tree (own object each), link, run."""
     tree = tmp_path / "tree"
     sources = dict(STUBS)
-    for rel in REAL:
+    for rel in real:
         sources[rel] = (KERNEL_SRC / rel).read_text()
     for rel, text in sources.items():
         (tree / rel).parent.mkdir(parents=True, exist_ok=True)
         (tree / rel).write_text(text)
     # The kernel is built by ritz0 (build.py --no-runtime), so only ritz0 runs.
     objs = [str(_compile(tmp_path, tree / rel, rel[:-5].replace("/", "_"), ("--no-runtime",)))
-            for rel in MODULES]
+            for rel in sources]
     (tmp_path / "t.ritz").write_text(src)
     objs.insert(0, str(_compile(tmp_path, tmp_path / "t.ritz", "t")))
     exe = tmp_path / "t"

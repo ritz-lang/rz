@@ -15,13 +15,13 @@ import ipc.message { Message, MSG_FLAG_NONE }
 import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send, channel_recv }
 import drivers.pci { pci_print_all_devices }
 import drivers.msix { msix_print_all }
-import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count }
+import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
 import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
 import io { enable_interrupts, disable_interrupts, halt_loop }
 import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
 import arch.x86_64.apcall { ap_run_nvme_probe }
-import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test }
-import net.stack { net_stack_init, net_poll, net_configure_dhcp, net_is_configured, net_device_type }
+import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test, virtio_blk_read, virtio_blk_msix_vector, virtio_blk_irq_count, virtio_blk_irq_wait_count, virtio_blk_irq_halt_count }
+import net.stack { net_stack_init, net_poll, net_wait_rx, net_configure_dhcp, net_is_configured, net_device_type }
 import net.ip { ip_get_gateway, ip_print_config }
 import net.icmp { icmp_ping, icmp_distinct_reply_count, icmp_echo_request_count, icmp_echo_reply_sent_count }
 import net.arp { arp_cache_lookup, arp_send_request }
@@ -413,6 +413,11 @@ fn network_tx_burst()
 # meet a quiet RX path, and a peer that answers ends the wait immediately.
 const NET_PEER_PING_WINDOW_US: u64 = 240000000   # 240 seconds
 
+# The DHCP window: 2 s, as its old 1000 polls 2 ms apart took. The gateway
+# ping goes out once configured, but not before 200 ms in (the old 100th poll).
+const NET_DHCP_WINDOW_US: u64 = 2000000
+const NET_DHCP_PING_AFTER_US: u64 = 200000
+
 # Only called when the boot option asked for it (AGAST #4335): this probes
 # every NIC driver, so on hardware whose driver is broken it can panic.
 fn network_dhcp_ping(run_net_responder: bool)
@@ -426,23 +431,25 @@ fn network_dhcp_ping(run_net_responder: bool)
         prints("  Starting DHCP...\n")
         net_configure_dhcp()
 
-        # Poll for packets until configured or timeout. Interrupts are on
-        # for this window only (the kernel otherwise boots with IF=0), so
-        # the NIC's MSI-X interrupts are delivered and counted (#1852). The
-        # syscall path already runs kernel code with IF=1 the same way.
+        # Poll for packets for the DHCP window. Interrupts are on for this
+        # window only (the kernel otherwise boots with IF=0), so the NIC's
+        # MSI-X interrupts are delivered and counted (#1852). Between polls
+        # the CPU sleeps on the NIC's RX vector (#3631); a NIC that can't
+        # (ENA, no MSI-X) waits 2 ms instead, as every NIC used to. The
+        # window is timed, so frames that end a wait early don't shorten it.
         prints("  Polling for network packets...\n")
         enable_interrupts()
-        var poll_count: i32 = 0
+        let window_end: u64 = deadline_after_us(NET_DHCP_WINDOW_US)
+        let ping_after: u64 = deadline_after_us(NET_DHCP_PING_AFTER_US)
         var ping_sent: u8 = 0
         var arp_pending: u8 = 0
-        while poll_count < 1000
+        while not deadline_passed(window_end)
             net_poll()
-            poll_count = poll_count + 1
-
-            delay_us(2000)
+            if not net_wait_rx()
+                delay_us(2000)
 
             # If we got configured, try a ping
-            if net_is_configured() and ping_sent == 0 and poll_count >= 100
+            if net_is_configured() and ping_sent == 0 and deadline_passed(ping_after)
                 if arp_pending == 0
                     prints("\n  Got IP! Pinging gateway...\n")
                 let gateway: *u8 = ip_get_gateway()
@@ -458,6 +465,11 @@ fn network_dhcp_ping(run_net_responder: bool)
         if virtio_net_msix_enabled() != 0
             prints("[msix] virtio-net interrupts: ")
             serial_print_dec(virtio_net_irq_count())
+            prints("\n")
+            prints("[msix] virtio-net rx waits: ")
+            serial_print_dec(virtio_net_rx_wait_count())
+            prints(", halted: ")
+            serial_print_dec(virtio_net_rx_halt_count())
             prints("\n")
 
         if net_is_configured()
@@ -554,8 +566,52 @@ fn virtio_blk_check()
         prints("  (already initialized for initramfs)\n")
         # Run a basic read test to verify it's still working
         virtio_blk_test(blk_dev)
+        virtio_blk_msix_check(blk_dev)
     else
         prints("  No VirtIO Block device found (add -drive to QEMU)\n")
+
+# Disk 0's MSI-X wait (AGAST #3631): read VIRTIO_BLK_MSIX_READS sectors
+# polled (IF=0), then again with interrupts on, when each request sleeps on
+# the disk's vector, and log
+#   [msix] virtio-blk interrupts: N, requests waited: W, halted: H, data: same|DIFFERENT
+# tools/test_msix_boot.sh wants N > 0, W > 0 and "same": the interrupt-driven
+# reads return what the polled ones did. (H may be 0: QEMU often completes a
+# request before its wait first checks.)
+const VIRTIO_BLK_MSIX_READS: u64 = 8
+
+fn virtio_blk_msix_check(dev: *VirtioBlkDevice)
+    if virtio_blk_msix_vector(0) == 0
+        return
+    var polled: [512]u8
+    var waited: [512]u8
+    var same: bool = true
+    var failed: bool = false
+    var s: u64 = 0
+    while s < VIRTIO_BLK_MSIX_READS
+        if virtio_blk_read(dev, s, 1, @polled[0]) != 0
+            failed = true
+        enable_interrupts()
+        if virtio_blk_read(dev, s, 1, @waited[0]) != 0
+            failed = true
+        disable_interrupts()
+        var i: i32 = 0
+        while i < 512
+            if polled[i] != waited[i]
+                same = false
+            i = i + 1
+        s = s + 1
+    prints("[msix] virtio-blk interrupts: ")
+    serial_print_dec(virtio_blk_irq_count(0))
+    prints(", requests waited: ")
+    serial_print_dec(virtio_blk_irq_wait_count())
+    prints(", halted: ")
+    serial_print_dec(virtio_blk_irq_halt_count())
+    if failed
+        prints(", data: FAILED\n")
+    else if same
+        prints(", data: same\n")
+    else
+        prints(", data: DIFFERENT\n")
 
 # PCI listing, block device and ELF loader checks, in boot order. The
 # network self-tests are a boot option (AGAST #4335): when the loader did

@@ -48,6 +48,17 @@
 #     commands' own "[msix] nvme waits halted: H" is only logged: QEMU often
 #     raises the interrupt before the wait checks, so H = 0 is legal
 #     (AGAST #4246);
+#   - virtio-blk and virtio-input are modern-only too (disable-legacy=on;
+#     QEMU's virtio-keyboard-pci always is), so their MSI-X goes through
+#     common_cfg msix_config and queue_msix_vector (AGAST #3631): both log
+#     "[msix] virtio-blk: MSI-X on" / "[msix] virtio-input: MSI-X on";
+#   - "[msix] virtio-blk interrupts: N, requests waited: W, halted: H,
+#     data: D" has N > 0, W > 0 and D = same: with interrupts on, disk reads
+#     slept on the disk's vector and returned what polled reads did (H is
+#     only logged: QEMU often completes a request before its wait checks);
+#   - "[msix] virtio-net rx waits: W, halted: H" has W > 0 and H > 0: the
+#     DHCP window slept on the NIC's RX vector between polls instead of
+#     spinning a fixed delay (AGAST #3631);
 #   - the kernel took no exception, and init's Tier-1 suite still reports
 #     ALL TESTS PASSED with the NIC and NVMe attached.
 #
@@ -161,7 +172,8 @@ timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m 2G \
     -display none -no-reboot -monitor none \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
     -drive "format=raw,file=fat:rw:$WORK/esp" \
-    -device virtio-blk-pci,drive=initramfs \
+    -device virtio-blk-pci,drive=initramfs,disable-legacy=on \
+    -device virtio-keyboard-pci \
     -drive "file=$WORK/initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
     -device virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024 \
     -netdev user,id=net0 \
@@ -179,7 +191,7 @@ kill "$pid" 2>/dev/null
 wait "$pid" 2>/dev/null
 
 echo "----- msix boot: MSI-X lines -----"
-grep -a "\[msix\]" "$SERIAL" | head -20
+grep -a "\[msix\]" "$SERIAL" | head -30
 echo "----------------------------------"
 
 rc=0
@@ -294,6 +306,61 @@ elif [ "$n_idle" -gt "$IDLE_HALTS_MAX" ]; then
     rc=1
 else
     echo "PASS: NVMe idle interrupt wait slept: halted $n_idle times in one watchdog round"
+fi
+if grep -aqE "\[virtio-blk\] Device 0 initialized \([0-9]+ MB, modern" "$SERIAL"; then
+    echo "PASS: virtio-blk is driven over the modern (MMIO) transport"
+else
+    grep -a "\[virtio-blk\]" "$SERIAL" | head -5
+    echo "FAIL: virtio-blk was not driven over the modern (MMIO) transport"
+    rc=1
+fi
+if grep -aq "\[msix\] virtio-blk: MSI-X on" "$SERIAL"; then
+    echo "PASS: virtio-blk is in MSI-X mode"
+else
+    grep -a "\[msix\] virtio-blk" "$SERIAL" | head -3
+    echo "FAIL: virtio-blk did not come up in MSI-X mode"
+    rc=1
+fi
+birq=$(grep -aoE "\[msix\] virtio-blk interrupts: [0-9]+, requests waited: [0-9]+, halted: [0-9]+, data: [A-Za-z]+" "$SERIAL" | tail -1)
+bk_count=$(echo "$birq" | sed -nE 's/.*interrupts: ([0-9]+),.*/\1/p')
+bk_waited=$(echo "$birq" | sed -nE 's/.*requests waited: ([0-9]+),.*/\1/p')
+bk_data=$(echo "$birq" | sed -nE 's/.*data: ([A-Za-z]+)$/\1/p')
+if [ -z "$birq" ]; then
+    echo "FAIL: no virtio-blk MSI-X read check logged ([msix] virtio-blk interrupts: N, requests waited: W, ...)"
+    rc=1
+elif [ "$bk_count" -eq 0 ]; then
+    echo "FAIL: virtio-blk MSI-X interrupt counter is 0, want > 0"
+    rc=1
+elif [ "$bk_waited" -eq 0 ]; then
+    echo "FAIL: no virtio-blk request waited for its MSI-X interrupt (polled with $bk_count delivered)"
+    rc=1
+elif [ "$bk_data" != "same" ]; then
+    echo "FAIL: virtio-blk reads under MSI-X returned data: $bk_data, want the polled reads' (same)"
+    rc=1
+else
+    echo "PASS: virtio-blk delivered $bk_count MSI-X interrupts, $bk_waited requests waited for theirs, same data as polled"
+fi
+if grep -aq "\[msix\] virtio-input: MSI-X on" "$SERIAL"; then
+    echo "PASS: virtio-input is in MSI-X mode"
+else
+    grep -a "\[msix\] virtio-input\|\[virtio-input\]" "$SERIAL" | head -3
+    echo "FAIL: virtio-input did not come up in MSI-X mode"
+    rc=1
+fi
+nrx=$(grep -aoE "\[msix\] virtio-net rx waits: [0-9]+, halted: [0-9]+" "$SERIAL" | tail -1)
+nrx_waits=$(echo "$nrx" | sed -nE 's/.*rx waits: ([0-9]+),.*/\1/p')
+nrx_halts=$(echo "$nrx" | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
+if [ -z "$nrx" ]; then
+    echo "FAIL: no virtio-net RX wait count logged ([msix] virtio-net rx waits: W, halted: H)"
+    rc=1
+elif [ "$nrx_waits" -eq 0 ]; then
+    echo "FAIL: the DHCP window never waited on the RX vector: it busy-polls"
+    rc=1
+elif [ "$nrx_halts" -eq 0 ]; then
+    echo "FAIL: virtio-net RX waits ($nrx_waits) never halted: they spin instead of sleeping"
+    rc=1
+else
+    echo "PASS: virtio-net RX waited on its vector $nrx_waits times, halted $nrx_halts"
 fi
 if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
     echo "PASS: init Tier-1 suite: ALL TESTS PASSED"

@@ -1,0 +1,63 @@
+# Harland Kernel - sleep until an MSI-X vector fires (AGAST #3631)
+#
+# A driver that has an MSI-X vector for a completion should sleep until the
+# vector fires rather than spin on its ring. drivers/msix.ritz counts every
+# MSI-X interrupt per vector (msix_dispatch) and irq_handler then wakes the
+# kernel's interrupt wait queue (proc/waitq.ritz), so a vector's count is
+# its "pending" flag: a waiter snapshots it before checking its ring, and the
+# vector has fired for it once the count moves.
+#
+# irq_wait_vector is that sleep. NVMe used it first, as nvme_irq_sleep
+# (AGAST #4212, #4220); virtio-blk and virtio-net use it too now. With
+# `may_park`, on the BSP with a process running, it parks the process on the
+# wait queue so other processes run; otherwise (boot, an AP, or a driver
+# that can't take a second caller while a request is in flight) it sleeps in
+# sti;hlt, holding the CPU. Only a driver whose shared state is locked
+# across the wait may park: NVMe locks its queue (nvme_q_lock); virtio-blk
+# and virtio-net have one DMA page / ring and no lock, so they don't. The condition
+# is re-checked after every wake with interrupts off, so an interrupt landing
+# between the check and the sleep still wakes it. A one-shot LAPIC watchdog
+# (arch/x86_64/apic.ritz) bounds every sleep, so a vector that never fires
+# costs `max_rounds` watchdog runs, not a hang.
+
+import io { disable_interrupts, enable_interrupts, sti_hlt }
+import drivers.msix { msix_vector_count }
+
+# One-shot LAPIC timer that wakes a hlt waiting for a vector (apic.ritz)
+extern fn lapic_watchdog_arm(ticks: u32) -> i32
+extern fn lapic_watchdog_expired() -> bool
+extern fn lapic_watchdog_stop() -> i32
+# The kernel's interrupt wait queue (proc/waitq.ritz). Declared, not
+# imported: proc/sched imports fs/syscall, which reaches the block drivers,
+# so importing it here would close an import cycle.
+extern fn waitq_can_park() -> bool
+extern fn waitq_park() -> i32
+
+# Sleep until `vec` has fired more than `seen` times, or `max_rounds` runs
+# of the LAPIC watchdog (each `ticks` of bus clock / 16) have passed. Call
+# with IF=1, `seen` read before the caller last checked its completion
+# condition. Parks the process only if `may_park` (above). Adds the hlts
+# slept in to `*halts`. Returns true if the vector
+# fired, false if it gave up. Returns with IF=1 and the watchdog disarmed.
+pub fn irq_wait_vector(vec: u8, seen: u64, ticks: u32, max_rounds: u32, may_park: bool, halts: *u64) -> bool
+    var fired: bool = true
+    var rounds: u32 = 0
+    lapic_watchdog_arm(ticks)
+    while true
+        disable_interrupts()
+        if msix_vector_count(vec) != seen
+            break
+        if lapic_watchdog_expired()
+            rounds = rounds + 1
+            if rounds >= max_rounds
+                fired = false
+                break
+            lapic_watchdog_arm(ticks)
+        if may_park and waitq_can_park()
+            waitq_park()
+        else
+            *halts = *halts + 1
+            sti_hlt()
+    lapic_watchdog_stop()
+    enable_interrupts()
+    return fired

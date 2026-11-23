@@ -9,7 +9,8 @@
 #
 # Reference: https://docs.oasis-open.org/virtio/virtio/v1.1/cs01/virtio-v1.1-cs01.html
 
-import io { memory_barrier, read_barrier }
+import io { memory_barrier, read_barrier, interrupts_enabled }
+import drivers.irq_wait { irq_wait_vector }
 import serial { prints, serial_print_hex, serial_print_dec, serial_write_byte }
 import drivers.pci { PciDevice, pci_find_virtio, VIRTIO_DEVICE_NET }
 import mm.vmm { vmm_virt_to_phys, phys_to_virt }
@@ -113,6 +114,15 @@ var virtio_tx_next: u32 = 0
 var virtio_net_msix: MsixInfo
 var virtio_net_msix_on: u8 = 0
 var virtio_net_vectors: [3]u8
+
+# RX waits (AGAST #3631): a caller with nothing to do until a frame arrives
+# sleeps on the RX vector (virtio_net_wait_rx) for at most
+# VIRTIO_NET_RX_WAIT_TICKS of LAPIC bus clock / 16 (~2 ms at QEMU's 1 GHz;
+# a tick, 10 ms, once the scheduler tick runs). Counted: waits that slept,
+# and the hlts they slept in.
+const VIRTIO_NET_RX_WAIT_TICKS: u32 = 0x00020000
+var virtio_net_rx_waits: u64 = 0
+var virtio_net_rx_halts: u64 = 0
 
 # ============================================================================
 # VirtQueue Operations
@@ -509,6 +519,30 @@ pub fn virtio_net_get_device() -> *VirtioNetDevice
 # 1 if the NIC signals through MSI-X (virtio_net_setup_msix succeeded)
 pub fn virtio_net_msix_enabled() -> u8
     return virtio_net_msix_on
+
+# Sleep until a frame arrives (the RX vector fires) or a short watchdog
+# runs out: what a receive loop does between net_poll calls. Returns at
+# once if a frame is already waiting. Returns false, without waiting, when
+# it can't sleep (no MSI-X, or IF=0): the caller then delays as it did
+# before. Returns with IF unchanged.
+pub fn virtio_net_wait_rx() -> bool
+    if virtio_net.initialized == 0 or virtio_net_msix_on == 0 or not interrupts_enabled()
+        return false
+    let vec: u8 = virtio_net_vectors[1]
+    # Snapshot before the check: a frame landing after it ends the sleep
+    let seen: u64 = msix_vector_count(vec)
+    if vq_has_used(virtio_net.rx_queue)
+        return true
+    virtio_net_rx_waits = virtio_net_rx_waits + 1
+    irq_wait_vector(vec, seen, VIRTIO_NET_RX_WAIT_TICKS, 1, false, @virtio_net_rx_halts)
+    return true
+
+# RX waits that slept, and the hlts they slept in
+pub fn virtio_net_rx_wait_count() -> u64
+    return virtio_net_rx_waits
+
+pub fn virtio_net_rx_halt_count() -> u64
+    return virtio_net_rx_halts
 
 # MSI-X interrupts the NIC has delivered so far, over all its vectors
 pub fn virtio_net_irq_count() -> u64

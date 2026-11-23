@@ -124,7 +124,25 @@ def nvme_idle(p: int) -> str:
 
 NVME_OK = NVME_ON + NVME_READ + nvme_interrupts(5) + NVME_HALTED + nvme_idle(1)
 
-PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_OK + SUITE_PASSED
+# virtio-blk and virtio-input on MSI-X over the modern transport; blk reads
+# and the DHCP window sleep on their vectors (AGAST #3631)
+BLK_MODERN = r"[virtio-blk] Device 0 initialized (16 MB, modern, queue 256)\n"
+BLK_ON = r"[msix] virtio-blk: MSI-X on, vector 65\n"
+INPUT_ON = r"[msix] virtio-input: MSI-X on, vector 64\n"
+
+
+def blk_waits(n: int = 17, waited: int = 8, data: str = "same") -> str:
+    return (rf"[msix] virtio-blk interrupts: {n}, requests waited: {waited}, "
+            rf"halted: 8, data: {data}\n")
+
+
+def net_rx_waits(waits: int = 880, halts: int = 880) -> str:
+    return rf"[msix] virtio-net rx waits: {waits}, halted: {halts}\n"
+
+
+WAITS_OK = BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + net_rx_waits()
+
+PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_OK + WAITS_OK + SUITE_PASSED
 
 
 # --------------------------------------------------------------------------
@@ -282,6 +300,9 @@ def test_boot_attaches_a_nic_on_user_net_and_an_nvme(tree):
     )
     assert "-netdev user,id=net0" in argv
     assert "-device nvme," in argv
+    # Modern-only disk and keyboard: their MSI-X goes through common_cfg
+    assert "virtio-blk-pci,drive=initramfs,disable-legacy=on" in argv
+    assert "-device virtio-keyboard-pci" in argv
 
 
 @pytest.mark.integration
@@ -384,7 +405,8 @@ def test_nvme_commands_that_never_halted_still_pass(tree):
     """Every command's interrupt beat its wait's first check (H = 0): legal,
     the idle wait still proves the wait sleeps (AGAST #4246)"""
     serial = (NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_ON + NVME_READ
-              + nvme_interrupts(5) + r"[msix] nvme waits halted: 0\n" + nvme_idle(1) + SUITE_PASSED)
+              + nvme_interrupts(5) + r"[msix] nvme waits halted: 0\n" + nvme_idle(1) + WAITS_OK
+              + SUITE_PASSED)
     r = _run(tree, serial)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "PASS: NVMe idle interrupt wait slept" in r.stdout
@@ -422,6 +444,52 @@ def test_nvme_commands_that_never_halted_still_pass(tree):
 )
 def test_nvme_msix_check_fails(tree, nvme, want):
     serial = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + nvme + SUITE_PASSED
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout, r.stdout
+
+
+# --------------------------------------------------------------------------
+# virtio-blk / virtio-input on MSI-X, waits that sleep (AGAST #3631)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_virtio_waits_pass(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS: virtio-blk delivered 17 MSI-X interrupts, 8 requests waited for theirs" in r.stdout
+    assert "PASS: virtio-input is in MSI-X mode" in r.stdout
+    assert "PASS: virtio-net RX waited on its vector 880 times, halted 880" in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "waits, want",
+    [
+        (BLK_ON + INPUT_ON + blk_waits() + net_rx_waits(),
+         "virtio-blk was not driven over the modern (MMIO) transport"),
+        (BLK_MODERN + INPUT_ON + blk_waits() + net_rx_waits(),
+         "virtio-blk did not come up in MSI-X mode"),
+        # Requests polled although the vector fired
+        (BLK_MODERN + BLK_ON + INPUT_ON + blk_waits(waited=0) + net_rx_waits(),
+         "no virtio-blk request waited"),
+        (BLK_MODERN + BLK_ON + INPUT_ON + blk_waits(data="DIFFERENT") + net_rx_waits(),
+         "returned data: DIFFERENT"),
+        (BLK_MODERN + BLK_ON + blk_waits() + net_rx_waits(),
+         "virtio-input did not come up in MSI-X mode"),
+        # The DHCP window back on a fixed delay
+        (BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + net_rx_waits(0, 0),
+         "never waited on the RX vector"),
+        # Waits that spin on the counter instead of hlt
+        (BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + net_rx_waits(880, 0),
+         "never halted: they spin"),
+    ],
+    ids=["blk-legacy", "blk-polled", "blk-never-waited", "blk-wrong-data", "input-polled",
+         "net-no-rx-wait", "net-rx-spins"],
+)
+def test_virtio_wait_check_fails(tree, waits, want):
+    serial = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_OK + waits + SUITE_PASSED
     r = _run(tree, serial)
     assert r.returncode == 1, r.stdout + r.stderr
     assert want in r.stdout, r.stdout

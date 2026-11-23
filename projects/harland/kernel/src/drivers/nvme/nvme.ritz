@@ -63,7 +63,8 @@
 # Reference: NVM Express Base Specification 1.4, sections 3 (registers),
 # 4 (queues), 5 (admin commands) and the NVM Command Set (read/write).
 
-import io { memory_barrier, read_barrier, cpu_pause, interrupts_enabled, disable_interrupts, enable_interrupts, sti_hlt }
+import io { memory_barrier, read_barrier, cpu_pause, interrupts_enabled, sti_hlt }
+import drivers.irq_wait { irq_wait_vector }
 import serial { prints, serial_print_dec, serial_print_hex, serial_write_byte }
 import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_vector_alloc_local, msix_set_entry_to, msix_vector_count, msix_entry_irte, msix_entry_dest, MSIX_NO_IRTE }
 import drivers.pci { PciDevice, PCI_CLASS_STORAGE, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory, pci_read_config16, pci_write_config16 }
@@ -74,10 +75,6 @@ import arch.x86_64.cpu_map { num_cpus, cpu_apic_ids, cpu_index_of_apic_id }
 
 # Current CPU's Local APIC ID (arch/x86_64/apic.ritz)
 extern fn lapic_id() -> u32
-# One-shot LAPIC timer that wakes a hlt waiting for a vector (apic.ritz)
-extern fn lapic_watchdog_arm(ticks: u32) -> i32
-extern fn lapic_watchdog_expired() -> bool
-extern fn lapic_watchdog_stop() -> i32
 # The kernel's interrupt wait queue (proc/waitq.ritz). Declared, not imported:
 # proc/sched imports fs/syscall, which reaches this driver through virtio/blk,
 # so importing it here would close an import cycle.
@@ -302,36 +299,13 @@ fn nvme_wait_csts(c: *NvmeController, mask: u32, want: u32) -> i32
 # ============================================================================
 
 # Sleep until `vec` has fired more than `irqs` times, or `max_rounds` runs
-# of the LAPIC watchdog have passed. Called with IF=1. On the BSP with a
-# process running it parks the process on the kernel wait queue, so other
-# processes run; otherwise (boot, an AP) it does sti;hlt. Either way the
-# condition is re-checked after every wake with interrupts off, so an
-# interrupt landing between the check and the sleep still wakes it. Any
-# interrupt wakes a hlt; the watchdog bounds the wait. Adds the hlts it slept
-# in to `*halts`. Returns 1 if the vector fired, 0 if it gave up. Returns
-# with IF=1 and the watchdog disarmed.
+# of the LAPIC watchdog have passed (drivers/irq_wait.ritz, shared with the
+# virtio drivers since AGAST #3631). Returns 1 if the vector fired, 0 if it
+# gave up; with IF=1 and the watchdog disarmed.
 fn nvme_irq_sleep(vec: u8, irqs: u64, max_rounds: u32, halts: *u64) -> i32
-    var fired: i32 = 1
-    var rounds: u32 = 0
-    lapic_watchdog_arm(NVME_IRQ_WATCHDOG_TICKS)
-    while true
-        disable_interrupts()
-        if msix_vector_count(vec) != irqs
-            break
-        if lapic_watchdog_expired()
-            rounds = rounds + 1
-            if rounds >= max_rounds
-                fired = 0
-                break
-            lapic_watchdog_arm(NVME_IRQ_WATCHDOG_TICKS)
-        if waitq_can_park()
-            waitq_park()
-        else
-            *halts = *halts + 1
-            sti_hlt()
-    lapic_watchdog_stop()
-    enable_interrupts()
-    return fired
+    if irq_wait_vector(vec, irqs, NVME_IRQ_WATCHDOG_TICKS, max_rounds, true, halts)
+        return 1
+    return 0
 
 # A command's wait for its completion interrupt: counts a miss when the
 # vector doesn't fire within NVME_IRQ_WATCHDOG_ROUNDS watchdog runs; the

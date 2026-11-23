@@ -1,0 +1,59 @@
+# VirtIO MSI-X setup for single-vector devices (AGAST #3631)
+#
+# virtio-blk and virtio-input need one interrupt: "a buffer came back on my
+# queue". vio_msix_setup gives such a device one IDT vector on MSI-X table
+# entry 0 and routes config changes there too (virtio 1.1 §4.1.5.1.2 lets
+# them share). The caller then sets its queue up with
+# vio_setup_queue_vec(..., VIO_MSIX_ENTRY), which writes the queue's vector
+# (modern: common_cfg queue_msix_vector, 0x1A; legacy: I/O offset 22) while
+# the queue is selected. A config-change interrupt on the shared vector only
+# wakes a waiter early; it re-checks its ring and sleeps again.
+#
+# virtio-net has its own three-entry setup (drivers/virtio/net.ritz).
+
+import serial { prints, serial_print_dec }
+import drivers.pci { PciDevice }
+import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry }
+import drivers.virtio.common { VirtioDevice, vio_note_msix_on, vio_set_config_msix_vector }
+
+# The table entry the device's queue (and config changes) signal
+pub const VIO_MSIX_ENTRY: u16 = 0
+
+# Put `vdev` in MSI-X mode with one vector, logged as `name`. Must run after
+# feature negotiation and before anything reads the device-specific config,
+# which moves from offset 20 to 24 on the legacy transport once MSI-X is on.
+# Returns the IDT vector, or 0 if the device stays on (polled) INTx.
+pub fn vio_msix_setup(vdev: *VirtioDevice, pci_dev: *PciDevice, info: *MsixInfo, name: StrView) -> u8
+    if msix_probe(pci_dev, info) != 0
+        prints("[msix] ")
+        prints(name)
+        prints(": no MSI-X capability, polling\n")
+        return 0
+    let vector: u8 = msix_vector_alloc()
+    if vector == 0
+        prints("[msix] ")
+        prints(name)
+        prints(": out of MSI-X vectors, polling\n")
+        return 0
+    if msix_enable(info) != 0
+        prints("[msix] ")
+        prints(name)
+        prints(": can't map the MSI-X table, polling\n")
+        return 0
+    # MSI-X Enable is set from here on: the legacy config has moved.
+    vio_note_msix_on(vdev)
+    if msix_set_entry(info, VIO_MSIX_ENTRY, vector) != 0
+        prints("[msix] ")
+        prints(name)
+        prints(": MSI-X entry not set, polling\n")
+        return 0
+    if vio_set_config_msix_vector(vdev, VIO_MSIX_ENTRY) != 0
+        prints("[msix] ")
+        prints(name)
+        prints(": config change vector refused\n")
+    prints("[msix] ")
+    prints(name)
+    prints(": MSI-X on, vector ")
+    serial_print_dec(vector as u64)
+    prints("\n")
+    return vector

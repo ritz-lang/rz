@@ -6,10 +6,18 @@
 # References:
 # - https://docs.oasis-open.org/virtio/virtio/v1.1/virtio-v1.1.html#x1-3850008
 # - https://www.kernel.org/doc/html/latest/input/event-codes.html
+#
+# With MSI-X (AGAST #3631) the event queue, and config changes, signal one
+# vector (drivers/virtio/vmsix.ritz): on the modern transport through
+# common_cfg msix_config and queue_msix_vector. virtio_input_poll still reads
+# the used ring, which stays the ground truth; the vector's count tells a
+# caller that events arrived without it touching the device.
 
 import serial { prints, serial_print_hex, serial_print_hex8, serial_print_dec }
 import drivers.pci { PciDevice, pci_find_virtio, VIRTIO_DEVICE_INPUT }
-import drivers.virtio.common { VirtioDevice, VIO_TRANSPORT_MMIO,Virtqueue, VringDesc, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_setup_queue, vq_alloc_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE }
+import drivers.msix { MsixInfo, msix_vector_count }
+import drivers.virtio.vmsix { VIO_MSIX_ENTRY, vio_msix_setup }
+import drivers.virtio.common { VirtioDevice, VIO_TRANSPORT_MMIO, Virtqueue, VringDesc, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_setup_queue, vio_setup_queue_vec, vq_alloc_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE }
 import mm.heap { kalloc, kfree }
 import mm.vmm { phys_to_virt }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
@@ -194,6 +202,10 @@ const NUM_EVENT_BUFFERS: i32 = 64
 
 var input_device: *VirtioInputDevice = 0 as *VirtioInputDevice
 
+# MSI-X (AGAST #3631): the event queue's IDT vector (0 = none, polled)
+var input_msix: MsixInfo
+var input_msix_vec: u8 = 0
+
 # ============================================================================
 # Ring Buffer Operations
 # ============================================================================
@@ -283,8 +295,17 @@ pub fn virtio_input_init() -> i32
         input_device = 0 as *VirtioInputDevice
         return -1
 
-    # Setup event queue (queue 0) - receives events from device
-    let event_queue: *Virtqueue = vio_setup_queue(virtio_dev, 0)
+    # Event queue (queue 0) - receives events from device; on the MSI-X
+    # entry if the device has one
+    input_msix_vec = vio_msix_setup(virtio_dev, pci_dev, @input_msix, "virtio-input")
+    var event_queue: *Virtqueue = 0 as *Virtqueue
+    if input_msix_vec != 0
+        event_queue = vio_setup_queue_vec(virtio_dev, 0, VIO_MSIX_ENTRY)
+        if event_queue == 0 as *Virtqueue
+            prints("[msix] virtio-input: queue refused its vector, polling\n")
+            input_msix_vec = 0
+    if input_msix_vec == 0
+        event_queue = vio_setup_queue(virtio_dev, 0)
     if event_queue == 0 as *Virtqueue
         prints("[virtio-input] Failed to setup event queue\n")
         kfree(input_device as *u8)
@@ -420,6 +441,16 @@ pub fn virtio_input_get_event(event: *VirtioInputEvent) -> bool
 
 pub fn virtio_input_available() -> bool
     return input_device != 0 as *VirtioInputDevice
+
+# The event queue's MSI-X vector, 0 if the device is polled
+pub fn virtio_input_msix_vector() -> u8
+    return input_msix_vec
+
+# Interrupts the event queue's vector has delivered (0 without MSI-X)
+pub fn virtio_input_irq_count() -> u64
+    if input_msix_vec == 0
+        return 0
+    return msix_vector_count(input_msix_vec)
 
 # ============================================================================
 # Convert Key Code to ASCII (basic mapping)
