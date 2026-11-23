@@ -174,7 +174,8 @@ fn rasterize_subpixel_rgb(
 
     # Scale bearing back
     result.bearing_x = (bounds.x_min / (3 as f32)).floor() as i32
-    result.bearing_y = bounds.y_max.ceil() as i32
+    # Edges are y-down: the top is at y_min, bearing_y is baseline-to-top.
+    result.bearing_y = (0.0 - bounds.y_min).ceil() as i32
 
     # Apply filter and downsample
     for y in 0..height
@@ -250,12 +251,13 @@ fn contour_to_edges_scaled(contour: @Contour, scale_x: f32, scale_y: f32, edge_t
         let next_idx = (i + 1) % n
         let next = contour.points[next_idx]
 
-        let p = Point2D.new(curr.x as f32 * scale_x, curr.y as f32 * scale_y)
+        # Negate y: TrueType y grows up, bitmap y grows down (AGAST #4568).
+        let p = Point2D.new(curr.x as f32 * scale_x, 0.0 - curr.y as f32 * scale_y)
         points.push(ContourPoint { p: p, on_curve: curr.on_curve })
 
         # If both current and next are off-curve, add implied on-curve
         if not curr.on_curve and not next.on_curve
-            let next_p = Point2D.new(next.x as f32 * scale_x, next.y as f32 * scale_y)
+            let next_p = Point2D.new(next.x as f32 * scale_x, 0.0 - next.y as f32 * scale_y)
             let implied = p.midpoint(next_p)
             points.push(ContourPoint { p: implied, on_curve: true })
 
@@ -399,4 +401,63 @@ fn test_subpixel_rgb_rendering() -> i32
                 break
 
     assert has_color
+    0
+
+# Right triangle, wide edge at the TOP in TrueType space (y-up), point at
+# the bottom (AGAST #4568).
+fn top_heavy_triangle_sp() -> GlyphOutline
+    var contour = Contour.new()
+    contour.add_point(OutlinePoint.new(0, 100, true))
+    contour.add_point(OutlinePoint.new(100, 100, true))
+    contour.add_point(OutlinePoint.new(0, 0, true))
+
+    var outline = GlyphOutline.new()
+    outline.x_min = 0
+    outline.y_min = 0
+    outline.x_max = 100
+    outline.y_max = 100
+    outline.add_contour(contour)
+    outline
+
+# Sum of R+G+B over rows [y0, y1)
+fn rgb_rows(g: @SubpixelGlyph, y0: u32, y1: u32) -> u32
+    var sum: u32 = 0
+    for y in y0..y1
+        for x in 0..g.width
+            let c = g.get_pixel(x, y)
+            sum = sum + c.r as u32 + c.g as u32 + c.b as u32
+    sum
+
+[[test]]
+fn test_subpixel_rgb_is_upright() -> i32
+    let outline = top_heavy_triangle_sp()
+    let result = rasterize_subpixel(@outline, 100, 20, SubpixelOrder.RGB)
+    let half = result.height / 2
+    assert rgb_rows(@result, 0, half) > rgb_rows(@result, half, result.height) * 2
+    0
+
+[[test]]
+fn test_subpixel_rgb_bearing_y_is_top_above_baseline() -> i32
+    # Font y 0..100 at scale 0.2: the top is 20px above the baseline.
+    let outline = top_heavy_triangle_sp()
+    let result = rasterize_subpixel(@outline, 100, 20, SubpixelOrder.RGB)
+    assert result.bearing_y == 20
+    0
+
+[[test]]
+fn test_subpixel_implied_on_curve_point_is_flipped() -> i32
+    # Off-curve (0,100),(100,100) imply the top on-curve point (50,100).
+    var contour = Contour.new()
+    contour.add_point(OutlinePoint.new(0, 0, true))
+    contour.add_point(OutlinePoint.new(0, 100, false))
+    contour.add_point(OutlinePoint.new(100, 100, false))
+    contour.add_point(OutlinePoint.new(100, 0, true))
+
+    var outline = GlyphOutline.new()
+    outline.x_max = 100
+    outline.y_max = 100
+    outline.add_contour(contour)
+
+    let result = rasterize_subpixel(@outline, 100, 20, SubpixelOrder.RGB)
+    assert result.bearing_y == 20
     0

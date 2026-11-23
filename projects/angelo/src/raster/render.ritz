@@ -39,12 +39,14 @@ fn contour_to_edges(contour: @Contour, scale: f32, edge_table:& EdgeTable)
         let next_idx = (i + 1) % n
         let next = contour.points[next_idx]
 
-        let p = Point2D.from_i16(curr.x, curr.y).scale(scale)
+        # TrueType y grows up, bitmap y grows down: negate y so the edges are
+        # in pixel space and bitmap row 0 is the glyph's top (AGAST #4568).
+        let p = Point2D.new(curr.x as f32 * scale, 0.0 - curr.y as f32 * scale)
         points.push(ExpandedPoint.new(p, curr.on_curve))
 
         # If both current and next are off-curve, add implied on-curve
         if not curr.on_curve and not next.on_curve
-            let next_p = Point2D.from_i16(next.x, next.y).scale(scale)
+            let next_p = Point2D.new(next.x as f32 * scale, 0.0 - next.y as f32 * scale)
             let implied = p.midpoint(next_p)
             points.push(ExpandedPoint.new(implied, true))
 
@@ -162,7 +164,9 @@ pub fn rasterize_outline(outline: @GlyphOutline, units_per_em: u16, size_px: u32
         width: width,
         height: height,
         bearing_x: x_min.floor() as i32,
-        bearing_y: y_max.ceil() as i32,  # TrueType y grows up, bitmap y grows down
+        # Edges are y-down, so the glyph's top is at y_min; bearing_y is the
+        # distance from the baseline up to that top.
+        bearing_y: (0.0 - y_min).ceil() as i32,
         advance: 0  # Caller should set this from hmtx
     }
 
@@ -294,4 +298,72 @@ fn test_contour_with_bezier() -> i32
     assert result.width > 0
     assert result.height > 0
 
+    0
+
+# A right triangle whose wide edge is at the TOP in TrueType space (y = 100,
+# y grows up) and whose point is at the bottom (0, 0). Used by the
+# orientation tests: TrueType y-up must come out bitmap y-down (AGAST #4568).
+fn top_heavy_triangle() -> GlyphOutline
+    var contour = Contour.new()
+    contour.add_point(OutlinePoint.new(0, 100, true))
+    contour.add_point(OutlinePoint.new(100, 100, true))
+    contour.add_point(OutlinePoint.new(0, 0, true))
+
+    var outline = GlyphOutline.new()
+    outline.x_min = 0
+    outline.y_min = 0
+    outline.x_max = 100
+    outline.y_max = 100
+    outline.add_contour(contour)
+    outline
+
+# Sum of alpha over bitmap rows [y0, y1)
+fn alpha_rows(g: @RasterizedGlyph, y0: u32, y1: u32) -> u32
+    var sum: u32 = 0
+    for y in y0..y1
+        for x in 0..g.width
+            sum = sum + g.get_pixel_alpha(x, y) as u32
+    sum
+
+[[test]]
+fn test_rasterize_is_upright() -> i32
+    # The triangle's mass is at the top in font space, so it must be in the
+    # top half of the bitmap (row 0 = top), for both fill paths.
+    let outline = top_heavy_triangle()
+    let plain = rasterize_outline(@outline, 100, 20, false)
+    let half = plain.height / 2
+    assert alpha_rows(@plain, 0, half) > alpha_rows(@plain, half, plain.height) * 2
+
+    let aa = rasterize_outline(@outline, 100, 20, true)
+    let aa_half = aa.height / 2
+    assert alpha_rows(@aa, 0, aa_half) > alpha_rows(@aa, aa_half, aa.height) * 2
+    0
+
+[[test]]
+fn test_rasterize_bearing_y_is_top_above_baseline() -> i32
+    # bearing_y = distance from the baseline up to the glyph's top. The
+    # triangle spans font y 0..100 at scale 0.2, so its top is 20px up.
+    let outline = top_heavy_triangle()
+    let result = rasterize_outline(@outline, 100, 20, false)
+    assert result.bearing_y == 20
+    0
+
+[[test]]
+fn test_implied_on_curve_point_is_flipped() -> i32
+    # Two consecutive off-curve points (0,100) and (100,100) imply an
+    # on-curve point at (50,100): the glyph's top. It must be flipped with
+    # the rest, so the top is still 20px above the baseline at scale 0.2.
+    var contour = Contour.new()
+    contour.add_point(OutlinePoint.new(0, 0, true))
+    contour.add_point(OutlinePoint.new(0, 100, false))
+    contour.add_point(OutlinePoint.new(100, 100, false))
+    contour.add_point(OutlinePoint.new(100, 0, true))
+
+    var outline = GlyphOutline.new()
+    outline.x_max = 100
+    outline.y_max = 100
+    outline.add_contour(contour)
+
+    let result = rasterize_outline(@outline, 100, 20, false)
+    assert result.bearing_y == 20
     0
