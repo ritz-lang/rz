@@ -71,10 +71,9 @@ pub fn main() -> i32
 """,
 }
 
-# A `*self` method on a const: ritz0 refuses it ("Unknown variable", AGAST
-# #4593), so ritz1 and ritz1_selfhosted only.  The const is an LLVM
-# `constant`: the method runs on a copy, so `bump` neither faults nor changes
-# P0.
+# A `*self` method on a const runs on a copy of it, on every compiler (ritz0
+# refused it as "Unknown variable: P0" until AGAST #4593).  The const is an
+# LLVM `constant`: `bump` neither faults nor changes P0.
 PTR_SELF = P_DEF + """\
 pub fn main() -> i32
     if P0.bump() != 41 or P0.bump() != 41
@@ -91,6 +90,6 @@ def test_method_on_a_struct_const(tmp_path, compiler, name):
     assert _run(compiler, tmp_path, name, PROGRAMS[name]) == 42
 
 
-@pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_pointer_self_runs_on_a_copy(tmp_path, compiler):
     assert _run(compiler, tmp_path, "ptr_self", PTR_SELF) == 42

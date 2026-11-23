@@ -928,6 +928,15 @@ class CallEmitter:
                         tmp = self.builder._entry_alloca(ty, f"{name}.tmp")  # AGAST #3661
                         self.builder.store(val, tmp)
                         receiver_val = tmp
+                elif self._is_const_data(name):
+                    # A struct or enum const is read-only data (LARB R60):
+                    # a pointer `self` runs on a copy of it, as ritz1's
+                    # emit_expr_method does (AGAST #4589, #4593), so no
+                    # method can write the constant.
+                    gvar = self._const_data_global(name)
+                    tmp = self.builder._entry_alloca(gvar.type.pointee, f"{name}.copy")
+                    self.builder.store(self.builder.load(gvar), tmp)
+                    receiver_val = tmp
                 else:
                     raise self._err(f"Unknown variable: {name}")
             else:

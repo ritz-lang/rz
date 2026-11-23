@@ -1557,7 +1557,9 @@ fn main() -> i32
 
 A struct or enum const is read-only data, like a const array: `C.f` and `C`
 read it, `@C` is an `@S` into it, and `@&C`, `C.f = v` and a borrow of it
-through a `self:&` method are errors. A const isn't a pattern: an arm naming
+through a `self:&` method are errors. A method whose `self` is a raw pointer
+(`self: *S`) runs on a copy of the const: what it writes through `self`
+changes the copy, never `C` (AGAST #4589, #4593). A const isn't a pattern: an arm naming
 a struct or enum const is refused as any binder taking a const's name is
 (below); match the variant itself.
 
