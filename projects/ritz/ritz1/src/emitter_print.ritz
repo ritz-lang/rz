@@ -37,6 +37,7 @@ import ritzlib.memory
 import ritzlib.str     # memset (compiler-built Expr nodes)
 import ritzlib.strview # strview_starts_with (was emitter_expr_call's)
 import ritzlib.string  # String for the missing-impl diagnostic
+import ritzlib.fmt.digits  # fmt_i64_into (AGAST #4586)
 import ast
 import types
 import emitter_core
@@ -1889,6 +1890,133 @@ pub fn emit_assert_helpers(s: *EmitterState)
     emit_str(s, c"  %len = sub i64 %ei, %p4i\n")
     emit_str(s, c"  %r1 = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %p4i, i64 %len)\n")
     emit_str(s, c"  ret void\n")
+    emit_str(s, c"}\n")
+
+# =============================================================================
+# A match with no arm for a repr enum's value (AGAST #4586; LANGUAGE_SPEC §10.1)
+#
+# An exhaustive match on an `enum E: <int>` with no `_` / binding arm stops
+# when the stored discriminant names no variant, writing
+#
+#     <file>:<line>:<col>: match on <E>: value <v> names no variant
+#
+# to stderr and exiting 1: byte for byte ritz0's _emit_match_no_variant_trap.
+# <v> is the raw discriminant, sign-extended for an `iN` repr.
+
+# 1 once this module traps: emit_module then defines @__ritz_match_trap.
+# A module global, not an EmitterState field (#1816 freezes those).
+var g_match_trap_used: i32 = 0
+
+fn match_trap_put(buf: *u8, at: i32, sv: StrView) -> i32
+    for i in 0..sv.len as i32
+        *(buf + at + i) = *(sv.ptr + i)
+    at + sv.len as i32
+
+# Trap with the discriminant held in field 0 of the enum at `slot` (a `ptr`
+# register).  The caller ends the block with `unreachable`.
+pub fn emit_match_no_variant_trap(s: *EmitterState, enum_name_sv: StrView, slot: i32, line: i32, col: i32)
+    var blen: i32 = 0
+    let base: *u8 = assert_file_base(@blen)
+    let head: *u8 = malloc((blen + enum_name_sv.len as i32 + 96) as i64)
+    var at: i32 = match_trap_put(head, 0, StrView { ptr: (base), len: (blen) as i64 })
+    *(head + at) = ':'
+    at = at + 1 + fmt_i64_into(head + at + 1, line as i64) as i32
+    *(head + at) = ':'
+    at = at + 1 + fmt_i64_into(head + at + 1, col as i64) as i32
+    at = match_trap_put(head, at, StrView { ptr: (c": match on "), len: (11) as i64 })
+    at = match_trap_put(head, at, enum_name_sv)
+    at = match_trap_put(head, at, StrView { ptr: (c": value "), len: (8) as i64 })
+    let idx: i32 = add_string(s, StrView { ptr: (head), len: (at) as i64 })
+
+    let ei: i32 = user_enum_index(enum_name_sv)
+    let tag_ty: *u8 = enum_tag_llvm(ei)
+    let tag_ptr: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, tag_ptr)
+    emit_str(s, IR_GEP_NAMED)
+    emit_name(s, enum_name_sv)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, slot)
+    emit_str(s, c", i32 0, i32 0\n")
+    let tag: i32 = next_reg(s)
+    emit_load_into(s, tag_ty, tag, tag_ptr)
+    var wide: i32 = tag
+    if ty_int_bits(enum_repr(ei)) < 64
+        wide = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, wide)
+        if enum_tag_signed(ei) == 1
+            emit_str(s, c" = sext ")
+        else
+            emit_str(s, c" = zext ")
+        emit_str(s, tag_ty)
+        emit_str(s, IR_SP)
+        emit_reg(s, tag)
+        emit_str(s, IR_TO_I64)
+    g_match_trap_used = 1
+    s.sret_helpers_used = 1   # the helper copies with @__ritz_sret_copy
+    emit_str(s, c"  call void @__ritz_match_trap(ptr @.str.")
+    emit_int(s, idx as i64)
+    emit_str(s, c", i64 ")
+    emit_int(s, at as i64)
+    emit_str(s, IR_I64_SEP)
+    emit_reg(s, wide)
+    emit_str(s, IR_I64_SEP)
+    emit_int(s, enum_tag_signed(ei) as i64)
+    emit_str(s, IR_CLOSE)
+
+# @__ritz_match_trap(head, hlen, v, signed): ritz0's _match_trap_fn as text.
+# The message is built in a stack buffer, then written with its newline and
+# the process exits 1.
+pub fn emit_match_trap_helper(s: *EmitterState)
+    if g_match_trap_used == 0
+        return
+    g_match_trap_used = 0
+    emit_str(s, c"\n; match with no arm for a repr enum's value (AGAST #4586)\n")
+    emit_str(s, c"@.ritz_match_tail = private unnamed_addr constant [18 x i8] c\" names no variant\\0A\"\n")
+    emit_str(s, c"define internal void @__ritz_match_trap(ptr %head, i64 %hlen, i64 %v, i64 %signed) \"no-builtins\"")
+    emit_no_red_zone_attr(s)
+    emit_str(s, c" {\n")
+    emit_str(s, c"entry:\n")
+    emit_str(s, c"  %scr = alloca [24 x i8]\n")
+    emit_str(s, c"  %end = getelementptr [24 x i8], ptr %scr, i64 0, i64 24\n")
+    emit_str(s, c"  %cap = add i64 %hlen, 48\n")
+    emit_str(s, c"  %buf = alloca i8, i64 %cap\n")
+    emit_str(s, c"  call void @__ritz_sret_copy(ptr %buf, ptr %head, i64 %hlen)\n")
+    emit_str(s, c"  %sg = icmp ne i64 %signed, 0\n")
+    emit_str(s, c"  %isn = icmp slt i64 %v, 0\n")
+    emit_str(s, c"  %neg = and i1 %sg, %isn\n")
+    emit_str(s, c"  %negv = sub i64 0, %v\n")
+    emit_str(s, c"  %mag = select i1 %neg, i64 %negv, i64 %v\n")
+    emit_str(s, c"  br label %digit\n")
+    emit_str(s, c"digit:\n")
+    emit_str(s, c"  %p = phi ptr [ %end, %entry ], [ %np, %digit ]\n")
+    emit_str(s, c"  %val = phi i64 [ %mag, %entry ], [ %q, %digit ]\n")
+    emit_str(s, c"  %np = getelementptr i8, ptr %p, i64 -1\n")
+    emit_str(s, c"  %d = urem i64 %val, 10\n")
+    emit_str(s, c"  %dc = add i64 %d, 48\n")
+    emit_str(s, c"  %ch = trunc i64 %dc to i8\n")
+    emit_str(s, c"  store i8 %ch, ptr %np\n")
+    emit_str(s, c"  %q = udiv i64 %val, 10\n")
+    emit_str(s, c"  %more = icmp ne i64 %q, 0\n")
+    emit_str(s, c"  br i1 %more, label %digit, label %done\n")
+    emit_str(s, c"done:\n")
+    emit_str(s, c"  %mp = getelementptr i8, ptr %np, i64 -1\n")
+    emit_str(s, c"  store i8 45, ptr %mp\n")
+    emit_str(s, c"  %first = select i1 %neg, ptr %mp, ptr %np\n")
+    emit_str(s, c"  %ei = ptrtoint ptr %end to i64\n")
+    emit_str(s, c"  %fi = ptrtoint ptr %first to i64\n")
+    emit_str(s, c"  %dl = sub i64 %ei, %fi\n")
+    emit_str(s, c"  %dd = getelementptr i8, ptr %buf, i64 %hlen\n")
+    emit_str(s, c"  call void @__ritz_sret_copy(ptr %dd, ptr %first, i64 %dl)\n")
+    emit_str(s, c"  %at = add i64 %hlen, %dl\n")
+    emit_str(s, c"  %td = getelementptr i8, ptr %buf, i64 %at\n")
+    emit_str(s, c"  call void @__ritz_sret_copy(ptr %td, ptr @.ritz_match_tail, i64 18)\n")
+    emit_str(s, c"  %len = add i64 %at, 18\n")
+    emit_str(s, c"  %bi = ptrtoint ptr %buf to i64\n")
+    emit_str(s, c"  %w = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %bi, i64 %len)\n")
+    emit_str(s, c"  %x = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 60, i64 1)\n")
+    emit_str(s, c"  unreachable\n")
     emit_str(s, c"}\n")
 
 # =============================================================================

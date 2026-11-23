@@ -606,6 +606,113 @@ class PatternEmitter:
         self._note_int_merge(phi, [v for v, _ in incoming])
         return phi
 
+    # The trap's text after the value (AGAST #4586); ritz1's
+    # MATCH_TRAP_TAIL is the same bytes.
+    MATCH_TRAP_TAIL = " names no variant"
+
+    def _emit_match_no_variant_trap(self, expr: rast.Match, tag: ir.Value,
+                                    enum_name: str) -> None:
+        """Stop: an exhaustive match's repr enum holds no variant's value.
+
+        Writes `<file>:<line>:<col>: match on <E>: value <v> names no
+        variant` (LANGUAGE_SPEC §10.1) and exits 1, through
+        @__ritz_match_trap.  <v> is the raw discriminant, read as the repr
+        type reads it: sign-extended for an `iN`, zero-extended for a `uN`.
+        """
+        span = expr.span
+        head = (f"{self._assert_basename(span.file)}:{span.line}:{span.column}: "
+                f"match on {enum_name}: value ")
+        buf = self._get_string_constant(head)
+        zero = ir.Constant(self.i64, 0)
+        signed = self._enum_tag_signed(enum_name)
+        if tag.type.width < 64:
+            tag = (self.builder.sext if signed else self.builder.zext)(tag, self.i64)
+        self.builder.call(self._match_trap_fn(), [
+            self.builder.gep(buf, [zero, zero]),
+            ir.Constant(self.i64, len(head.encode("utf-8"))),
+            tag, ir.Constant(self.i64, int(signed))])
+        self.builder.unreachable()
+
+    def _match_trap_fn(self) -> ir.Function:
+        """`internal void @__ritz_match_trap(i8* head, i64 hlen, i64 v,
+        i64 signed)`: write `head`, `v` in decimal and MATCH_TRAP_TAIL as one
+        message, then stop with status 1 (AGAST #4586).
+
+        The message is built in a stack buffer (bytes copied by
+        @__ritz_sret_copy, a no-builtins byte loop) so a freestanding target
+        stops through one `ritz_platform_fatal(msg, len, 1)` call (#4119);
+        hosted, it writes the message and a newline to fd 2 and exits 1, as
+        every other ritz0 trap does.  ritz1 emits the same function as text
+        (emitter_match.ritz emit_match_trap_helper).
+        """
+        fn = self.module.globals.get("__ritz_match_trap")
+        if fn is not None:
+            return fn
+        i64, i8 = self.i64, self.i8
+        i8p = i8.as_pointer()
+        fn = ir.Function(self.module, ir.FunctionType(self.void, [i8p, i64, i64, i64]),
+                         name="__ritz_match_trap")
+        fn.linkage = "internal"
+        head, hlen, v, signed = fn.args
+        c = lambda n: ir.Constant(i64, n)
+        copy = self._large_copy_helper()
+        tail = self.MATCH_TRAP_TAIL
+        freestanding = getattr(self, "is_freestanding", False)
+        if not freestanding:
+            tail += "\n"   # ritz_platform_fatal adds its own newline
+        entry = fn.append_basic_block("entry")
+        loop = fn.append_basic_block("digit")
+        done = fn.append_basic_block("done")
+        b = ir.IRBuilder(entry)
+        # Digits are written backwards from the end of a 24-byte scratch
+        # buffer (20 digits and a sign at most), as @__ritz_assert_val does.
+        scratch = b.alloca(ir.ArrayType(i8, 24))
+        end = b.gep(scratch, [c(0), c(24)])
+        buf = b.alloca(i8, size=b.add(hlen, c(48)))
+        b.call(copy, [buf, head, hlen])
+        neg = b.and_(b.icmp_unsigned('!=', signed, c(0)), b.icmp_signed('<', v, c(0)))
+        mag = b.select(neg, b.sub(c(0), v), v)
+        b.branch(loop)
+
+        b.position_at_end(loop)
+        p = b.phi(i8p)
+        val = b.phi(i64)
+        np_ = b.gep(p, [c(-1)])
+        b.store(b.trunc(b.add(b.urem(val, c(10)), c(48)), i8), np_)
+        q = b.udiv(val, c(10))
+        p.add_incoming(end, entry)
+        p.add_incoming(np_, loop)
+        val.add_incoming(mag, entry)
+        val.add_incoming(q, loop)
+        b.cbranch(b.icmp_unsigned('!=', q, c(0)), loop, done)
+
+        b.position_at_end(done)
+        minus_at = b.gep(np_, [c(-1)])
+        b.store(ir.Constant(i8, ord('-')), minus_at)
+        first = b.select(neg, minus_at, np_)
+        digits = b.sub(b.ptrtoint(end, i64), b.ptrtoint(first, i64))
+        b.call(copy, [b.gep(buf, [hlen]), first, digits])
+        at = b.add(hlen, digits)
+        tail_g = self._get_string_constant(tail)
+        b.call(copy, [b.gep(buf, [at]), b.gep(tail_g, [c(0), c(0)]), c(len(tail))])
+        total = b.add(at, c(len(tail)))
+        if freestanding:
+            fatal = self.module.globals.get("ritz_platform_fatal")
+            if fatal is None:
+                fatal = ir.Function(self.module,
+                                    ir.FunctionType(self.void, [i8p, i64, self.i32]),
+                                    name="ritz_platform_fatal")
+            b.call(fatal, [buf, total, ir.Constant(self.i32, 1)])
+        else:
+            asm = lambda n: ir.InlineAsm(
+                ir.FunctionType(i64, [i64] * n), "syscall",
+                "=&{rax}," + ",".join(["{rax}", "{rdi}", "{rsi}", "{rdx}"][:n])
+                + ",~{rcx},~{r11},~{memory}", side_effect=True)
+            b.call(asm(4), [c(1), c(2), b.ptrtoint(buf, i64), total])
+            b.call(asm(2), [c(60), c(1)])
+        b.unreachable()
+        return fn
+
     def _emit_enum_match(self, expr: rast.Match, enum_val: ir.Value, enum_name: str) -> ir.Value:
         """Emit a match on an enum type with VariantPattern arms.
 
@@ -669,7 +776,11 @@ class PatternEmitter:
 
         merge_block = self.current_fn.append_basic_block("match.merge")
 
-        # Create an unreachable default block (should never be reached in well-typed code)
+        # The default when no arm is a catch-all.  Coverage (R6) means every
+        # variant has an arm, so only a repr enum's stored value that names
+        # no variant reaches it (§10.1): that traps (AGAST #4586).  An
+        # untyped enum's index tag can't name no variant short of memory
+        # corruption, so its default stays `unreachable`.
         unreachable_block = self.current_fn.append_basic_block("match.unreachable")
         default_block = unreachable_block
 
@@ -708,9 +819,12 @@ class PatternEmitter:
                 else:
                     raise NotImplementedError(f"Pattern type {type(pattern)} not supported in enum match")
 
-        # Emit the unreachable block
+        # Emit the no-arm block; a catch-all arm took the default instead.
         self.builder.position_at_end(unreachable_block)
-        self.builder.unreachable()
+        if switch.default is unreachable_block and enum_name in self.enum_reprs:
+            self._emit_match_no_variant_trap(expr, tag, enum_name)
+        else:
+            self.builder.unreachable()
 
         # Emit each arm body
         arm_values = []

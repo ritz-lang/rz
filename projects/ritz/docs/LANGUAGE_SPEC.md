@@ -4466,9 +4466,22 @@ variant's discriminant (zeroed memory where no variant is 0, or bytes
 written as an integer). `e as U` converts that value like any other, and
 `==` compares the discriminant it holds, so it equals no variant. In a
 `match` it takes a `_` or binding arm. A `match` that names every variant
-and has no such arm has no arm for it: that is undefined behaviour. Read
-memory that may name no variant as the representation type, and convert it
-with `E.from` (§10.4).
+and has no such arm has no arm for it, so it stops the program: it writes
+
+```text
+<file>:<line>:<col>: match on <E>: value <v> names no variant
+```
+
+to stderr and exits with status 1, where `<line>:<col>` is the `match` and
+`<v>` the value held, read as the representation type reads it (`-7` for an
+`i32`, `200` for a `u8`). A freestanding target stops through its
+`ritz_platform_fatal` hook with the same message. Read memory that may name
+no variant as the representation type, and convert it with `E.from`
+(§10.4).
+
+An enum without a representation type stores its variant index, which names
+no variant only if the memory was corrupted; a `match` on one has no such
+check, and reaching it is undefined behaviour.
 
 A `match` on an enum must cover every variant (§8.1). For the full treatment —
 memory layout and the design rationale — see

@@ -2679,6 +2679,31 @@ fn emit_match_place_load(s: *EmitterState, slot: i32, enum_name_sv: StrView) -> 
     emit_str(s, c"  ; match @place\n")
     reg
 
+# AGAST #4586: end the block no arm took.  A match on a repr enum
+# (`enum E: <int>`, LANGUAGE_SPEC §10.1) with no `_` / binding arm reaches it
+# when the stored value names no variant: that traps.  Anything else is
+# `unreachable`: coverage rules a miss out, and an untyped enum's index tag
+# names no variant only through memory corruption.
+fn emit_match_no_arm(s: *EmitterState, arms: *MatchArm, enum_name_sv: StrView, is_enum: i32, scrut_slot: i32, span: SrcSpan)
+    if is_enum == 1 and scrut_slot != 0 and match_traps_no_variant(s, arms, enum_name_sv) == 1
+        emit_match_no_variant_trap(s, enum_name_sv, scrut_slot, span.line, span.col)
+    emit_str(s, c"  unreachable\n")
+
+fn match_traps_no_variant(s: *EmitterState, arms: *MatchArm, enum_name_sv: StrView) -> i32
+    if enum_name_sv.ptr == null
+        return 0
+    let ei: i32 = user_enum_index(enum_name_sv)
+    if ei < 0 or ty_int_bits(enum_repr(ei)) == 0
+        return 0
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.pattern_kind == PAT_WILDCARD
+            return 0
+        if arm.pattern_kind == PAT_IDENT and match_arm_is_variant(s, arm, ei, 0) == 0
+            return 0
+        arm = arm.next
+    1
+
 # Main entry: emit a match construct. Returns the phi register holding
 # the match's result value (or 0 if no arms contribute).
 pub fn emit_match(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan) -> i32
@@ -2821,13 +2846,15 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         s.last_match_agg_name = null
         s.last_match_agg_name_len = 0
         s.last_match_float_ty = TypeKind.Void
-        emit_str(s, c"  unreachable\n")
+        emit_match_no_arm(s, arms, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, is_enum, scrut_slot, span)
         begin_block(s, end_label)
         own_match_end(s, own_old)
         return 0
 
-    # Current block is the last "next" block: no arm matched, and coverage has
-    # ruled that out (AGAST #2344), so it ends in `unreachable`.
+    # Current block is the last "next" block: no arm matched.  Coverage has
+    # ruled out a variant with no arm (AGAST #2344), so it ends in
+    # `unreachable`, or in a trap when a repr enum's value names no variant
+    # (emit_match_no_arm, AGAST #4586).
     # AGAST #1666: publish the phi type for an untyped `let v = match ...`.
     # Set after every arm (nested matches inside arms included) so the
     # outermost match's type is what the enclosing let sees.
@@ -2847,11 +2874,11 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         s.last_match_agg_name_len = 0
         s.last_match_float_ty = TypeKind.Void
         match_void_arms_settle(s, @result, wants_value)   # AGAST #2046
-        emit_str(s, c"  unreachable\n")
+        emit_match_no_arm(s, arms, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, is_enum, scrut_slot, span)
         begin_block(s, end_label)
         own_match_end(s, own_old)
         return 0
-    emit_str(s, c"  unreachable\n")
+    emit_match_no_arm(s, arms, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, is_enum, scrut_slot, span)
 
     # End block with phi over all arm results: ( arm_result, arm_exit_label ).
     begin_block(s, end_label)
