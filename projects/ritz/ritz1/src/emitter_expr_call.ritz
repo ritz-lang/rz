@@ -4595,6 +4595,32 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # TypeKind.Ptr/TypeKind.Ref calls now return i64 directly — no conversion needed
     return call_result
 
+# AGAST #4603: `br` on the Option / Result tag in `tag_reg` (an i8; Some /
+# Ok is 0): a None / Err goes to a block that calls `llvm.trap` and ends
+# `unreachable`, ritz0's `unwrap.bad`.  Emission carries on in the Some / Ok
+# block.  No `declare`: LLVM's IR parser declares an `llvm.*` intrinsic itself,
+# as it does the undeclared `@llvm.memcpy` calls elsewhere.
+fn emit_unwrap_tag_trap(s: *EmitterState, tag_reg: i32)
+    let ok_i1: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, ok_i1)
+    emit_str(s, c" = icmp eq i8 ")
+    emit_reg(s, tag_reg)
+    emit_str(s, c", 0  ; unwrap tag check (Ok/Some == 0)\n")
+    let l_ok: i32 = next_label(s)
+    let l_bad: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, ok_i1)
+    emit_str(s, IR_LABEL_SEP)
+    emit_label(s, l_ok)
+    emit_str(s, IR_LABEL_SEP)
+    emit_label(s, l_bad)
+    emit_str(s, IR_NL)
+    begin_block(s, l_bad)
+    emit_str(s, c"  call void @llvm.trap()  ; unwrap of None / Err\n")
+    emit_str(s, c"  unreachable\n")
+    begin_block(s, l_ok)
+
 # Option<T>.unwrap / .unwrap_or and Result<T,E>.unwrap / .unwrap_or — inline
 # intrinsic matching the tag-encoded i64 representation that ritz1 uses for
 # tagged enums (see emitter_match.ritz and is_variant_carrier in this file):
@@ -4686,6 +4712,13 @@ fn try_emit_enum_unwrap(s: *EmitterState, e: *Expr, type_name_sv: StrView, recei
     let tag_reg: i32 = next_reg(s)
     emit_load_into(s, IR_TY_I8, tag_reg, tag_ptr)
 
+    # AGAST #4603: unwrap() of a None / Err traps, as ritz0's does: the tag
+    # check branches to `llvm.trap` (SIGILL), and the payload is read only
+    # on the Some / Ok path.  It loaded the payload unchecked, so a None
+    # unwrapped to 0 and the program carried on.
+    if is_unwrap
+        emit_unwrap_tag_trap(s, tag_reg)
+
     # payload = the Ok / Some payload at field 2 (AGAST #1898), loaded at its
     # own width and widened to i64 because ritz1's call/arith paths expect
     # i64-width scalars; aggregate unwrap returns would need a more careful
@@ -4744,9 +4777,7 @@ fn try_emit_enum_unwrap(s: *EmitterState, e: *Expr, type_name_sv: StrView, recei
     let payload: i32 = emit_tagged_payload_load(s, pay_ptr, StrView { ptr: (type_name), len: (type_name_len) as i64 }, 0)
 
     if is_unwrap
-        # unwrap(): return payload assuming tag==0 (Ok/Some).  ritz0 traps
-        # on None/Err; we emit branchless IR that always yields the
-        # payload, which is sufficient for the existing Wave-2 tests.
+        # unwrap(): the tag check above already trapped on None / Err.
         return payload
 
     # unwrap_or(default): select payload when tag==0, else default.
