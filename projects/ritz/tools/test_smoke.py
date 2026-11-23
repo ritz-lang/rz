@@ -436,7 +436,16 @@ def test_run_gate_runs_smoke_before_ci_local():
 
 @pytest.mark.unit
 def test_rz_iterate_briefing_asks_for_smoke_before_gate():
+    """AGAST #4580: a room runs smoke-plan.sh (smoke first, then its
+    subsystems' targets) before REAP; a full room gate is optional and comes
+    after it in the briefing."""
     text = (REPO_ROOT / ".claude" / "skills" / "rz-iterate" / "SKILL.md").read_text()
-    gate_at = text.index("**Gate that commit**")
-    smoke_at = text.find("make -C projects/ritz smoke")
-    assert 0 <= smoke_at < gate_at
+    brief_at = text.index("### The briefing (send verbatim")
+    check_at = text.index("**Smoke-check your subsystems, in full**", brief_at)
+    run_at = text.index("smoke-plan.sh run", check_at)
+    gate_at = text.index("run-gate.sh", check_at)
+    assert run_at < gate_at
+    # smoke-plan.sh always puts `make smoke` first.
+    plan = (REPO_ROOT / ".claude" / "skills" / "rz-iterate" / "smoke-plan.sh").read_text()
+    assert 'smoke)            echo "make -C projects/ritz smoke"' in plan
+    assert re.search(r"^ORDER=\(smoke ", plan, re.M)

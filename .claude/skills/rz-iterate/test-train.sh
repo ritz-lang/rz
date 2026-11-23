@@ -41,13 +41,17 @@ RES="$RZ_GATE_DIR/.train-reserved"
 export RZ_TRAIN_NAME="test-train-$$"
 TR="$HERE/train.sh"
 fetch() { git -C "$M" fetch -q origin; }
+# gland: gate the train to gate (a passing fake gate) and land it.  Every
+# train with a car needs a full gate (AGAST #4580 item 9), KEPT cars too.
+gland() { bash "$TR" land "$(bash "$TR" gate 2>/dev/null)"; }
 
 # 1. One commit already on main: kept with its SHA, no gate, lands.
 fetch; s1="$(room r1 a A1)"; git -C "$M" checkout -q main
 out="$(bash "$TR" build "r1:$s1" 2>&1)"
 has "$out" "^KEPT +r1 ${s1:0:12}" "fast-forward item is KEPT"
-has "$out" "gate=not-needed" "a lone KEPT item needs no gate"
-out="$(bash "$TR" land 2>&1)"
+has "$out" "gate=needed" "a lone KEPT item still needs a full gate (#4580: its room may have smoke-checked only)"
+out="$(bash "$TR" land 2>&1)"; has "$out" "gate needed" "land refuses a KEPT train with no gate log"
+out="$(gland 2>&1)"
 has "$out" "^MERGED +r1 ${s1:0:12} as ${s1:0:12}" "KEPT item lands with its own SHA"
 [[ "$(git -C "$M" rev-parse origin/main)" == "$s1" ]] && ok "origin/main is r1" || bad "origin/main is r1"
 
@@ -148,7 +152,7 @@ R="$T/room"; git clone -q "$T/origin.git" "$R" 2>/dev/null
 # 6a. A successful land reserves the slot, stamped with the time.
 fetch; s9="$(room r9 d D9)"; git -C "$M" checkout -q main
 rm -f "$RES"; bash "$TR" build "r9:$s9" >/dev/null 2>&1
-before="$(date +%s)"; out="$(bash "$TR" land 2>&1)"
+before="$(date +%s)"; out="$(gland 2>&1)"
 has "$out" "^MAIN " "r9 lands"
 t="$(cat "$RES" 2>/dev/null)"
 [[ "$t" =~ ^[0-9]+$ ]] && (( t >= before && t <= $(date +%s) )) \
@@ -212,11 +216,13 @@ for v in "$(( $(date +%s) - 601 ))" "$(( $(date +%s) + 3600 ))" garbage ""; do
         || bad "a reservation of '$v' doesn't block a room gate (rc=$rc)"
 done
 
-# 6d. A train that needs no gate drops the reservation: no train gate is coming.
+# 6d. A train that needs no gate drops the reservation: no train gate is
+# coming.  Only a train with no car needs none (AGAST #4580): here its one
+# item is already on main.
 date +%s > "$RES"
-fetch; s12="$(room r12 c C12)"; git -C "$M" checkout -q main
-out="$(bash "$TR" build "r12:$s12" 2>&1)"
-has "$out" "gate=not-needed" "a lone KEPT train needs no gate"
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "r9:$s9" 2>&1)"
+has "$out" "n=0 gate=not-needed" "a train with no car needs no gate"
 [[ ! -e "$RES" ]] && ok "building a gate=not-needed train drops the reservation" \
     || bad "building a gate=not-needed train drops the reservation"
 
@@ -384,7 +390,7 @@ out="$(bash "$TR" build "sd1:$d1" "sd2:$d2" 2>&1)"; td="$(git -C "$T/train" rev-
 e="$(room se s/e E "$td")"; fetch; git -C "$M" checkout -q main
 out="$(bash "$TR" build --next "se:$e" 2>&1)"
 has "$out" "^KEPT +se ${e:0:12}" "a car rebased onto the gating train's tail is KEPT"
-has "$out" "^TRAIN 2 .*n=1 gate=not-needed" "its own gate ran on that tree: no gate"
+has "$out" "^TRAIN 2 .*n=1 gate=needed" "a KEPT car's train still needs a full gate (#4580)"
 out="$(bash "$TR" build "sd1:$d1" "sd2:$d2" "se:$e" 2>&1)"
 has "$out" "^KEPT +se ${e:0:12}" "a rebuilt train has the same tail, so it is still KEPT"
 f="$(room sf s/f F)"; fetch; git -C "$M" checkout -q main
@@ -1208,15 +1214,15 @@ l3="$(bash "$TR" gate --next 2>/dev/null)"
 bash "$TR" wait "$l3" >/dev/null 2>&1
 out="$(bash "$TR" land "$l3" 2>&1)"; has "$out" "^MERGED +ub1 " "its pass lands train 1 too"
 
-# 14c. A gate=not-needed deepest train still covers a train below that needs
-# one: it is the one to gate.
+# 14c. A KEPT-only deepest train covers the train below it: it is the one
+# to gate (and, since #4580, needs a gate itself).
 fetch; git -C "$M" checkout -q main
 two uc s/uc; bash "$TR" build "uc1:$c1" "uc2:$c2" >/dev/null 2>&1
 k1="$(room uc3 s/uc3 X "$(tipn 1)")"; fetch; git -C "$M" checkout -q main
 out="$(bash "$TR" build --next "uc3:$k1" 2>&1)"
-has "$out" "^TRAIN 2 .*n=1 gate=not-needed" "a car on train 1's tail is a not-needed train 2"
+has "$out" "^TRAIN 2 .*n=1 gate=needed" "a car on train 1's tail is a KEPT train 2 that needs a gate"
 eq "$(bash "$TR" pending)" "GATE train 2 n=1 (no new car for 0s): train.sh gate --next" \
-    "a not-needed deepest train over a needed one is the one to gate"
+    "the KEPT deepest train over a needed one is the one to gate"
 log="$(bash "$TR" gate 2>/dev/null)"
 [[ "$(shaof "$log")" == "$(tipn 2)" ]] && ok "gate gates it" || bad "gate gates it"
 out="$(bash "$TR" land "$log" 2>&1)"; has "$out" "^MERGED +uc3 " "and its pass lands both"
@@ -1273,13 +1279,17 @@ bash "$TR" fail "$l3" >/dev/null 2>&1
 
 # 14g. Trains that need no gate are never pending; a gate log for another
 # SHA than the tip is no verdict of this train (it gates again, not FAIL).
+# A lone KEPT car needs its gate (AGAST #4580); only a train with no car
+# needs none.
 fetch; git -C "$M" checkout -q main
 k1="$(room uf1 s/uf1 X)"; fetch; git -C "$M" checkout -q main
-out="$(bash "$TR" build "uf1:$k1" 2>&1)"; has "$out" "gate=not-needed" "a lone KEPT car needs no gate"
+out="$(bash "$TR" build "uf1:$k1" 2>&1)"; has "$out" "gate=needed" "a lone KEPT car still needs a full gate"
+has "$(bash "$TR" pending)" "^GATE train 1 n=1 " "a KEPT-only train is pending"
+gland >/dev/null 2>&1
+out="$(bash "$TR" build "uf1:$k1" 2>&1)"; has "$out" "n=0 gate=not-needed" "a train with no car needs no gate"
 eq "$(bash "$TR" pending)" "" "a not-needed train is not pending"
 out="$(bash "$TR" gate 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && has "$out" "no train needs a gate" "gate refuses when no train needs one" || bad "gate refuses when no train needs one (rc=$rc)"
-bash "$TR" land >/dev/null 2>&1
 two ug s/ug; bash "$TR" build "ug1:$c1" "ug2:$c2" >/dev/null 2>&1
 l1="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"
 sed -i "s/^SHA=.*/SHA=$(git -C "$M" rev-parse origin/main)/" "$l1"
@@ -1550,7 +1560,7 @@ has "$out" "^ROOM zunk base=. tail=$p1 unknown$" "an unknown base is listed as u
 ! grep -q '^REBASE zunk' <<<"$out" && ok "an unknown base gets no rebase message" || bad "an unknown base gets no rebase message"
 
 # 18h. No train built: main is the reference (a room on main is on-tail).
-bash "$TR" land >/dev/null 2>&1   # train 1 is gate=not-needed (its car is KEPT)
+gland >/dev/null 2>&1   # train 1's car is KEPT; it still gates (#4580)
 eq "$(bash "$TR" tail)" "" "tail prints nothing once the trains land"
 main="$(git -C "$M" rev-parse origin/main)"; m12="${main:0:12}"
 older="$(git -C "$M" rev-parse origin/main~1)"; o12="${older:0:12}"
@@ -1583,7 +1593,7 @@ has "$out" "^SKIP zdrop2: gate live \(host STATUS\); not rebasing mid-gate" \
 # the operator may paste it relative to the repo root.  The SPEC records it
 # absolutely, so `wait` must normalise before deciding no train owns it.
 fetch; git -C "$M" checkout -q main
-bash "$TR" land >/dev/null 2>&1; rm -f "$RES"
+gland >/dev/null 2>&1; rm -f "$RES"
 two wa s/wa; bash "$TR" build "wa1:$c1" "wa2:$c2" >/dev/null 2>&1
 llog="$(bash "$TR" gate --next hostx 2>/dev/null)"
 bash "$TR" wait "$llog" >/dev/null 2>&1
@@ -1605,7 +1615,7 @@ out="$(cd "$T" && bash "$TR" wait gates/train-000000000000-1@hostx.log 2>&1)"; r
 fetch; git -C "$M" checkout -q main
 s="$(room wr s/wr WR)"; fetch; git -C "$M" checkout -q main
 rm -f "$RES"; bash "$TR" build "wr:$s" >/dev/null 2>&1
-bash "$TR" land >/dev/null 2>&1
+gland >/dev/null 2>&1
 [[ -e "$RES" ]] && ok "land writes .train-reserved before the next gate" \
     || bad "land writes .train-reserved before the next gate"
 two wb s/wb; bash "$TR" build "wb1:$c1" "wb2:$c2" >/dev/null 2>&1
@@ -1619,7 +1629,7 @@ bash "$TR" wait "$llog" >/dev/null 2>&1; bash "$TR" land "$llog" >/dev/null 2>&1
 fetch; git -C "$M" checkout -q main
 s="$(room ws s/ws WS)"; fetch; git -C "$M" checkout -q main
 rm -f "$RES"; bash "$TR" build "ws:$s" >/dev/null 2>&1
-bash "$TR" land >/dev/null 2>&1
+gland >/dev/null 2>&1
 [[ -e "$RES" ]] && ok "land writes .train-reserved for the local fallback too" \
     || bad "land writes .train-reserved for the local fallback too"
 two wl s/wl; bash "$TR" build "wl1:$c1" "wl2:$c2" >/dev/null 2>&1
@@ -1635,6 +1645,64 @@ exec 8>&-; rm -f "$T/host-hostx.env"
 has "$(cat "$wl" 2>/dev/null)" "^SHA=$wl_tip$" "the local fallback ran the train"
 lout="$(bash "$TR" land "$wl" 2>&1)"
 has "$lout" "^MERGED " "the local fallback verdict lands"
+rm -f "$RES"
+
+# 20. A clean rebase skips the room gate; the train gate covers it (AGAST
+# #4580, Aaron 2026-11-23).  A room REAPs commit X, gated on main, then
+# rebases it cleanly onto a train tail and force-pushes X' without
+# re-gating or re-REAPing.  rz boards the original REAP: X' is accepted
+# because its patch matches X, and it is APPLIED, never KEPT, so a train
+# gate is always what tests it.
+fetch; git -C "$M" checkout -q main
+gland >/dev/null 2>&1; rm -f "$RES"
+ry="$(room ry s/ry RY)"; rx="$(room rx s/rx RX)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build "ry:$ry" >/dev/null 2>&1
+ty="$(tipn 1)"
+# rx rebases onto train 1's tail with no conflict and pushes, no new REAP.
+rx2="$(room rx s/rx RX "$ty")"; fetch; git -C "$M" checkout -q main
+[[ "$rx2" != "$rx" && "$(git -C "$M" rev-parse "$rx2^")" == "$ty" ]] \
+    && ok "setup: rx's rebased commit sits on train 1's tail" || bad "setup: rx's rebased commit sits on train 1's tail"
+out="$(bash "$TR" build --next "rx:$rx" 2>&1)"
+has "$out" "^APPLIED +rx ${rx:0:12} as " "a cleanly rebased, ungated car boards on its original REAP as APPLIED"
+! grep -q "^KEPT +rx\|^BAD +rx" <<<"$out" && ok "the rebased car is neither KEPT nor BAD" \
+    || { bad "the rebased car is neither KEPT nor BAD"; echo "$out" | sed 's/^/     | /'; }
+has "$out" "^TRAIN 2 .*n=1 gate=needed" "the train holding a rebased, ungated car needs its gate"
+# Rebuilt from scratch, X' sits right on train 1's tail: still APPLIED.
+out="$(bash "$TR" build "ry:$ry" "rx:$rx" 2>&1)"
+has "$out" "^APPLIED +rx ${rx:0:12} as " "a rebased car on the tail is APPLIED, not KEPT"
+has "$out" "^TRAIN 1 .*n=2 gate=needed" "its own gate never ran on that tree: the train gates"
+# The rebased car's REAP may also name X' itself, as before: KEPT then.
+out="$(bash "$TR" build "ry:$ry" "rx:$rx2" 2>&1)"
+has "$out" "^KEPT +rx ${rx2:0:12}" "a REAP naming the rebased SHA on the tail is still KEPT"
+
+# 20b. The room changed code to fit (a different patch): the old REAP is BAD.
+git -C "$M" checkout -q --detach "$ty"
+echo "RX changed" > "$M/s/rx"; git -C "$M" add -A; git -C "$M" commit -qm "rx: change s/rx"
+git -C "$M" push -q -f origin HEAD:refs/heads/rx; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "ry:$ry" "rx:$rx" 2>&1)"
+has "$out" "^BAD +rx ${rx:0:12}: origin/rx is not this commit" \
+    "a rebase that changed the patch needs a new gate and REAP: the old REAP is BAD"
+
+# 20c. rebase-plan no longer asks for a re-gate on a clean rebase.
+main="$(git -C "$M" rev-parse origin/main)"; m12="${main:0:12}"
+older="$(git -C "$M" rev-parse origin/main~1)"; o12="${older:0:12}"
+out="$(printf 'zold %s idle\n' "$o12" | bash "$TR" rebase-plan "$main")"
+has "$out" "^REBASE zold onto main: .*clean: push it, no re-check and no new REAP" \
+    "a clean rebase is told to push without re-gating"
+has "$out" "^REBASE zold onto main: .*conflicted or changed code: resolve, re-check \(smoke-plan.sh run\) and REAP" \
+    "a conflicted rebase still re-gates and REAPs"
+
+# 20d. A room gate on a train tail is that train's gate (AGAST #4580 item 7):
+# a room based on train 1's tail boards train 2 KEPT, and its own log
+# (SHA = train 2's tip, EXIT=0) lands trains 1 and 2 with no train gate.
+bash "$TR" build "ry:$ry" >/dev/null 2>&1; ty="$(tipn 1)"
+rz7="$(room rz7 s/rz7 RZ7 "$ty")"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build --next "rz7:$rz7" 2>&1)"
+has "$out" "^KEPT +rz7 ${rz7:0:12}" "a room gated on train 1's tail boards KEPT"
+rlog="$T/gate-room-rz7.log"; printf 'SHA=%s\nEXIT=0\n' "$rz7" > "$rlog"
+out="$(bash "$TR" land "$rlog" 2>&1)"
+has "$out" "^MERGED +ry " "the room's log lands train 1 too"
+has "$out" "^MERGED +rz7 ${rz7:0:12} as ${rz7:0:12}" "the room's log lands its own train"
 rm -f "$RES"
 
 unset RZ_TRAIN_DEBOUNCE; export RZ_TRAIN_MAX=8

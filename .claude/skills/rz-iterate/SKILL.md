@@ -511,19 +511,20 @@ callback room `rz`.
 **If your SPAWN named a train tail `<tail12>`:** the host created the
 worktree off `origin/main`; base it on the deepest train tail instead:
 `git fetch origin rz-train/<tail12> && git reset --hard FETCH_HEAD`. Make
-and gate your commit on that base: it boards the train as KEPT. Do not
-rebase onto `origin/main` before you gate (step 5) unless `rz` tells you to:
+and check your commit on that base: it boards the train as KEPT. Do not
+rebase onto `origin/main` before you REAP (step 5) unless `rz` tells you to:
 that would replay the train's cars and stop you boarding as KEPT.
 
-### You own this: `rz` merges your commit without re-testing it
+### You own this: your REAP vouches for your commit
 
-`rz` runs `git merge --ff-only` on the SHA you REAP and pushes it. Your REAP
-vouches for that exact commit.
+`rz` boards the SHA you REAP onto a merge train, and the train's full gate
+runs before anything reaches `main`. Your REAP vouches that the subsystems
+you changed pass **in full** on that exact commit (step 6).
 
 0. **Keep your room description current.** Whenever your focus changes, call
    `update_room_description(room_id="ritz-task-<id>", description="...")`: one
    concise sentence, about 20-30 characters, 60 at most ("Fix ritz1 slice
-   bounds checks", "Re-gating after rebase").
+   bounds checks", "Smoke-checking subsystems").
 1. **Already fixed on `origin/main`?** `complete_task` with the evidence and
    REAP `none`. That's final: commit nothing after it. This is the only time
    you touch your ticket's status. `rz` claimed it as `<claim name>` and
@@ -544,74 +545,93 @@ vouches for that exact commit.
    rebase onto `origin/main` would replay the train's cars and stop you
    boarding as KEPT), then squash to one commit: `ritz-task-<id>: 🤖
    <terse description>`.
-   Then run `make -C projects/ritz smoke` (≤ 2 min) before requesting a
-   gate; fix anything it reports first. A gate slot is one machine-wide.
-6. **Gate that commit**, detached so a new message can't kill it, with
-   your own worktree's gate script (a branch may carry gate fixes for itself;
-   Aaron, 2026-11-16, Borque #3724):
+6. **Smoke-check your subsystems, in full** (Aaron, 2026-11-23, AGAST
+   #4580): no full room gate is needed before REAP. The train's full gate
+   runs on the whole train before it lands. Run, in the foreground:
+   ```bash
+   bash .claude/skills/rz-iterate/smoke-plan.sh plan   # what it will run
+   bash .claude/skills/rz-iterate/smoke-plan.sh run    # last line: your quote
+   ```
+   `run` maps the files your commit (`HEAD^..HEAD`) changed to their
+   subsystems' test targets. Every diff gets `make smoke`. A compiler
+   change (`ritz0`, `ritz1`, `grammars`, `runtime`) gets the whole `make
+   unit`, `ritz1-bootstrap` and the matrix. A package gets `./rz build` and
+   `./rz test`, a skill gets its `test-*.sh`, and anything under
+   `.claude/` also gets `tools-unit`, whose tests read SKILL.md (the
+   mapping is in the script's header). It runs each target **in full**, never a fail-fast
+   subset: #4450 ran 59 of ~24k ritz0 tests and cost two red trains. The
+   last line is your REAP quote: `smoke <sha12> [<targets>] EXIT=0`. It
+   refuses a dirty tree, and EXIT=99 means HEAD moved under it. Only
+   `EXIT=0` passes: otherwise fix, re-squash and re-run. A long run (the full
+   `unit` is ~24k tests) outlasts one 10-minute tool call: start it with
+   the Bash tool's `run_in_background`, its output to a log, and wait on it
+   in the foreground in slices under 10 minutes until it exits (never end a
+   turn with it pending). The quote is the log's last line. If you touched packages outside `projects/ritz`, compare
+   their failures against `origin/main` before calling them pre-existing.
+
+   **A full room gate is still allowed, and is the stronger quote**: for
+   example when your commit is alone on the deepest tail, where its gate
+   lands the trains below it (SKILL.md "A room gate on a train's tail"). Run
+   it detached, with your own worktree's gate script:
    ```bash
    W=~/dev/ritz-lang/rz-task-<id>
    LOG=$(bash "$W/.claude/skills/rz-iterate/run-gate.sh" "$W" <id>)
    timeout 540 bash "$W/.claude/skills/rz-iterate/run-gate.sh" --wait "$LOG"
    ```
-   A gate fix on `main` reaches you only when you rebase. No room reads
-   `~/dev/ritz-lang/rz` any more, so it works unchanged under Borque's hostd.
-   Run the wait in the foreground and repeat it on exit 124, which only means
-   the slice ran out. A budget-only verdict is terminal, not a retry, and must
-   not be conflated with the exit-124 wait: if the only failing step is
-   `[bootstrap] ritz0 unit tests`, the log prints a `test budget: … breach(es)`
-   line and pytest reports `0 failed`, then push, REAP quoting `EXIT=2
-   budget-only: <raw> / factor <f> = <norm> vs cap`, and do not re-gate or wait
-   for another slot (`rz` accepts that REAP). A `test budget: no calibration at
-   <path>` line is not this case: it is a host setup error, so fix the machine
-   and re-gate. It runs a clean `make -C projects/ritz ci-local` over CI's `build-all`
-   and `bootstrap` jobs (#2141), one gate machine-wide, and exits with the
-   gate's code (98 = no verdict, 99 = HEAD moved; neither passes). A
-   `SETUP ERROR` line means a missing tool on this machine (e.g. lld-link
-   for harland), not a regression: fix the machine and re-gate. The gate runs at full CPU weight; your room runs at CPUWeight=20
-   under a 5G memory cap, so room builds can't starve it (#1811). Your
-   permissions deny `systemd-run` (it would take a build out of the cap).
-   A test that needs a real unit runs it through
-   `bash .claude/room-unit.sh [--pipe] [--unit=NAME] -- <cmd>`, which keeps
-   it in `ritz-rooms.slice` under a 1G, 15-minute cap and shares your /tmp
-   (#3568). Builds never go through it. If you touched packages
-   outside `projects/ritz`, also `./rz build <pkg>` and run their tests;
-   compare failures against `origin/main` before calling them pre-existing.
-   **Only exit 0 passes, except the terminal budget-only verdict above.**
+   Repeat the wait on exit 124 (the slice ran out). Only exit 0 passes,
+   with one exception: if the only failing step is `[bootstrap] ritz0 unit
+   tests`, the log prints a `test budget: … breach(es)` line, and pytest
+   reports `0 failed`, the budget-only verdict is terminal. Quote it as
+   `EXIT=2 budget-only: <raw> / factor <f> = <norm> vs cap` and do not
+   re-gate. A `test budget: no calibration` or `SETUP ERROR` line is a host
+   setup error: fix the machine and re-gate. 98 = no verdict, 99 = HEAD
+   moved. One gate slot is shared machine-wide.
 
-   Run the full suite only through `run-gate.sh` (one machine-wide slot).
+   Your room runs at CPUWeight=20 under a 5G memory cap (#1811), and your
+   permissions deny `systemd-run`. A test that needs a real unit runs it
+   through `bash .claude/room-unit.sh [--pipe] [--unit=NAME] -- <cmd>` (1G,
+   15-minute cap, shares your /tmp; #3568). Builds never go through it.
    Never start `ci_local.py` or `make ci-local` in the background yourself:
-   that creates the duplicate pytest trees that invite a machine-wide kill.
-   Never `pkill -f`, `kill -- -PGID` or any pattern that can match another
-   room's `ci_local.py` or `pytest`; kill only the exact PIDs you spawned,
-   and if you cannot identify them, tell `rz` instead of widening the kill.
-
-   Otherwise fix, re-squash, re-run.
-7. **Don't chase `main`.** REAP the commit you gated. `rz` usually lands it
-   by cherry-picking it onto `main` in a batch with other rooms' commits and
-   gating the batch, so it may reach `main` under a different SHA. You only
-   rebase if `rz` tells you to.
+   the full suite runs only through `run-gate.sh`. Never `pkill -f`,
+   `kill -- -PGID` or any pattern that can match another room's
+   `ci_local.py` or `pytest`. Kill only the exact PIDs you spawned; if you
+   can't identify them, tell `rz` instead of widening the kill.
+7. **Don't chase `main`.** REAP the commit you checked. `rz` usually lands
+   it by cherry-picking it onto `main` in a batch with other rooms' commits
+   and gating the batch, so it may reach `main` under a different SHA. You
+   only rebase if `rz` tells you to.
 8. **Push and REAP:** `git push --force-with-lease origin ritz-task-<id>`
    (remote rooms: `git push --force-with-lease origin
    HEAD:refs/heads/ritz-task-<id>`). Never `-f`/`--force`: the lease refuses
    to overwrite a branch someone else moved. If it's rejected as stale,
    `git fetch origin`, check `origin/ritz-task-<id>` is your own earlier
-   push, and retry; if it isn't yours, stop and tell `rz`. Then exactly one:
+   push, and retry; if it isn't yours, stop and tell `rz`. Then exactly one,
+   quoting step 6's last line before the dash (every room, local or
+   remote):
    ```
    mcp__adele-context__send_room_message(
        room_id="rz",
-       message="REAP ritz-task-<id> <full-sha> — <one line: what changed>",
+       message="REAP ritz-task-<id> <full-sha> smoke <sha12> [<targets>] EXIT=0 — <one line: what changed>",
        sender_name="ritz-task-<id>",
        ask_claude=True)
    ```
-   A remote room's line also quotes its gate, before the dash:
-   `REAP ritz-task-<id> <full-sha> gate <log name> SHA=<first 12> EXIT=0 — <one line>`.
+   With a full gate instead, quote it: `REAP ritz-task-<id> <full-sha> gate
+   <log name> SHA=<first 12> EXIT=0 — <one line>`.
    Don't `complete_task`: the REAP line is your evidence, and `rz` closes the
    ticket once your commit is on `main`.
-9. **On "rebase onto <sha7>"** (your commit conflicted with `main` or failed
-   the gate on top of it; the message says which, with the failing lines):
-   rebase, fix if needed, re-gate, push and REAP again. Until that message,
-   stay on your base, even after REAPing.
+9. **On "rebase onto <sha7>"** (a preemptive move to the deepest tail, or
+   your commit conflicted with `main` or failed the train's gate; the
+   message says which, with the failing lines): rebase.
+   - **Clean** (no conflict, no code changed to fit, and not a failed gate):
+     push the rebased commit (`--force-with-lease`) and **don't re-run step
+     6**. If you already REAPed, send **no** new REAP: `rz` boards your
+     first REAP and the train gate covers the rebased commit. If you're
+     still working, carry on on the new base and check once, when you
+     finish.
+   - **It conflicted, you changed code to fit, or the message names a
+     failed gate:** fix, re-run step 6, push and REAP again.
+
+   Until that message, stay on your base, even after REAPing.
 
 **Never end a turn with work pending:** nothing wakes you when a gate,
 mutation run or subagent finishes (#1533). Wait in the foreground, in slices
@@ -655,9 +675,10 @@ add them after the room line):
 You're on **<host>**, not omegalisk. `rz` can't read your files or journal,
 so:
 
-- **Your REAP must quote the gate's verdict:** add `gate <log name>
-  SHA=<first 12> EXIT=0` to the REAP line, copied from the log. `rz` checks
-  that the SHA matches the one you REAP.
+- **Your REAP must quote your check's verdict** (step 8): the `smoke
+  <sha12> [<targets>] EXIT=0` line, or `gate <log name> SHA=<first 12>
+  EXIT=0` for a full gate. `rz` checks it against the SHA you REAP with
+  `smoke-plan.sh check`.
 - **AGAST:** read your ticket and file new ones as a local room would. The
   ticket is claimed as `ritz-task-<id>@<host>`; leave its status alone
   (step 1). The ticket text is also pasted below. If an AGAST call fails, say so in your REAP, list
@@ -885,9 +906,42 @@ This is also how Borque's conductor works.
 - **A car conflicts** (e.g. ABCD is in the train, E arrives, and E conflicts
   with C): bounce E to its room with the exact commit to rebase onto, the
   tail (D's train SHA), not `main`. The room resolves the conflict on D,
-  re-gates and REAPs again, and E joins the back of the train.
+  re-runs its smoke check (briefing step 6) and REAPs again, and E joins
+  the back of the train.
 - **A train fails:** find the culprit by reasoning first, bisection second
   (step 6).
+
+**Train-gated REAPs are the default (Aaron, 2026-11-23 ~19:30Z, AGAST
+#4580): "Instead of completely ungated, we should smoke test the subsystems
+we've changed. The whole gate gets run on the whole train before merging,
+to keep the main branch stable. But we will increase velocity."** A room
+no longer runs a full gate before it REAPs. It runs `smoke-plan.sh run`:
+smoke plus every changed subsystem's test targets, each **in full**
+(briefing step 6). It quotes `smoke <sha12> [<targets>] EXIT=0`. One full
+train gate then covers every car. **Main never moves without a full gate on
+the landed SHA.** That is the train's gate, or a room's own full gate on
+exactly the train's tip (the KEPT case under "A room gate on a train's
+tail"). A room may still choose a full gate, and its `gate ... SHA=...
+EXIT=0` quote is still accepted.
+
+The 2026-11-23 experiment, the evidence: 7 cars (#4573 room-gated; #4559,
+#4571, #1884, #4547, #4360, #4450 train-gated), 4 train gates.
+(a) bangerang `train-5225c3a2974c-1`: red in 1 min on #4450 (a `TYPE_*`
+test). (b) omegalisk `train-f691404028c6-1`: red after 36 min, #4450 again
+(12 ritz0 unit failures: the room had run only the 59 fail-fast files, not
+the ~24k-test suite). (c) huburght `train-4ea5aeb4611a-1`: the other 6
+green, landed as 4ea5aeb4. The five small, disjoint cars cost no extra gate;
+the one compiler-wide car (#4450: 69 files under ritz1/src and ritz0) cost
+two, because it ran a fail-fast subset of the suites it changed. (d) #4450
+then gated itself on 4ea5aeb4 (main by then) and landed as 32f468e4 with no
+train gate. That is the lesson the smoke check encodes: a changed subsystem
+runs **in full** (`ritz0` → the whole `make unit`). The 17:45Z interim
+marker, `gate skipped (train-gated)`, is retired: `smoke-plan.sh check`
+refuses it. The same run showed host venv drift: #4360 pinned shellcheck-py,
+and a gate host whose venv lacks a pinned package fails those tests (all
+three hosts were fixed by hand by 19:30Z). #4583 makes a stale venv a `SETUP
+ERROR` or a skipped host; until it lands, keep train gates off a host whose
+venv is behind `projects/ritz/requirements.lock`.
 
 `train.sh` numbers trains in landing order: **train 1** is built on
 `main`, train 2 is stacked on its tail, and so on (AGAST #3809). `gate`
@@ -902,10 +956,37 @@ one to train 1.
    say in one line what's queued. Never add to a train that's gating: a REAP
    that arrives then rides the next train, stacked on the gating train's
    tail.
-2. **Check each REAP line before it boards.** A remote room's REAP must
-   quote `SHA=<12> EXIT=0` from its gate log, and that SHA must be the REAP
-   SHA's prefix. Without it, it's a room mistake (step 7). (`train.sh build`
-   checks the rest: the branch tip is the REAP SHA, and it's one commit.)
+2. **Check each REAP line before it boards.** Every REAP (local or remote)
+   quotes its room's check before the dash, and that quote must cover the
+   REAP SHA:
+   ```bash
+   .claude/skills/rz-iterate/smoke-plan.sh check <full-sha> '<quote>'
+   ```
+   `OK` boards it. `REFUSED: <why>` is a room mistake (step 7). It accepts a
+   smoke quote, `smoke <sha12> [<targets>] EXIT=0`, whose targets include
+   every target `smoke-plan.sh plan <sha>^!` lists for that commit (extra
+   targets are fine). It also accepts a full gate quote, `gate <log>
+   SHA=<12> EXIT=0`, or the terminal `EXIT=2 budget-only: ...` verdict. For
+   rooms briefed by hand before `smoke-plan.sh` existed, it also accepts
+   the interim `verified smoke+unit+ritz1-bootstrap+matrix on <base12>
+   (unit: <N> passed, 0 failed)` form, checking its targets only.
+   Run it in your main checkout once `git fetch` has the REAP SHA.
+   (`train.sh build` checks the rest: the branch tip is the REAP SHA, and
+   it's one commit.) One accepted exception (AGAST #4580):
+   - **The branch moved after the REAP by a clean rebase** (briefing step
+     9): its tip is a commit with the REAP SHA's patch on another base, and
+     the room sent no new REAP. Board the **original** REAP line, quote and
+     all (check the quote against the REAP SHA, not the new tip). `build` matches it by `git patch-id --verbatim`, picks the
+     branch's commit and prints `APPLIED <branch> <REAP sha12> as <new>`,
+     **never `KEPT`**, even when it sits right on the tail: the room's check
+     ran on another base, so the train gate is what covers it. A tip whose
+     patch differs (the room changed code) is `BAD ... not this commit`:
+     the room must re-check and REAP.
+
+   **Never bounce a REAP because `main` moved** (the rule under "Merge
+   trains", 2026-11-17; broken on 2026-11-23 with #4573): `build`
+   cherry-picks it onto the new base. Bounce only a `CONFLICT`, a `BAD`, or
+   a car named by a red gate.
 3. **Build the train** from the unchecked items, oldest first
    (`get_scratchpad` first, never from memory).
    **No train gating:** every unchecked item, on `origin/main`:
@@ -929,15 +1010,17 @@ one to train 1.
    train on the last one's tail by itself (10 cars: `TRAIN 1 ... n=8`, then
    `TRAIN 2 base=<train 1's tip> ... n=2`). A car whose branch sits on an
    unlanded train commit (step 7's bounce) boards: `KEPT` when its parent
-   is the tail it lands on (its own gate ran on that tree), `APPLIED` when
+   is the tail it lands on (its room's check ran on that tree), `APPLIED` when
    it sits on the same patches at other SHAs; `BAD ... not in the train`
    only if a commit under it is in no train. `rz-larb` boards like any room
    (`rz-larb:<sha>`).
 4. **Gate the deepest train** (AGAST #4156) when `train.sh pending` says
-   `GATE train <k>` (dispatch rule above), unless every train is
-   `gate=not-needed` (only cars already on their base or on each other:
-   their own gates cover them; `pending` lists nothing, `land` with no
-   log). `pending`'s `GATE` line names `gate --next` for every train, so
+   `GATE train <k>` (dispatch rule above). **Every train with a car needs
+   a full gate, `KEPT` cars included** (AGAST #4580 item 9: rooms REAP on a
+   smoke check, so main never moves without a full gate on the landed SHA).
+   Only a train with no car is `gate=not-needed`. The one substitute is a
+   room's own full gate of the train's tip (a `KEPT` last car; "A room gate
+   on a train's tail" below): pass that room log to `land`. `pending`'s `GATE` line names `gate --next` for every train, so
    `GATE train 1` (the only train, or a bisect prefix) also gates off this
    host when another host has a free train slot (AGAST #4422;
    `RZ_TRAIN_HOSTS` applies to every train, this host tried last by
@@ -1026,6 +1109,16 @@ one to train 1.
    the deepest tail is in "Spawning a room": the host creates the worktree
    off `origin/main`, then the room fetches and resets to the tail.
 
+   **A room gate on a train's tail is the next train's gate** (AGAST
+   #4580; #4450 on 2026-11-23). A room gated on train k's tail boards
+   train k+1 as `KEPT`, so when it is train k+1's last car, train k+1's tip
+   is the room's commit (every car below it was in the tree it gated) and its room log (`SHA=` that tip, `EXIT=0`) is a
+   verdict for it. `land <room log>` accepts any log whose `SHA=` is a
+   train tip, so it lands trains 1..k+1 without a train gate. Copy a remote
+   room's log under `gate-logs/` first. Only `KEPT` qualifies: a car the
+   room rebased without re-gating is `APPLIED` (Reaping step 2), and its
+   log names another SHA.
+
    Refusals: no train 2 (`gate` is for train 1), the train to gate is
    train 1 (`train.sh gate`), the deepest train already gating (`already
    gating`: wait for it; only its red verdict opens a bisect), no train
@@ -1084,9 +1177,10 @@ one to train 1.
    trains as usual: a train gate that queues behind a starved room gate
    just waits one room gate (its log shows queue position 2). Don't hold
    trains back by hand any more.
-5. **Gate passes (exit 0), or `gate=not-needed`:**
+5. **Gate passes (exit 0)**, the train's gate or a room's full gate of its
+   tip:
    ```bash
-   .claude/skills/rz-iterate/train.sh land "$LOG"      # no log when not needed
+   .claude/skills/rz-iterate/train.sh land "$LOG"
    ```
    **Land the deepest train that passed** (AGAST #4151, #4130). `$LOG` may be
    any train's: train k is built on train k-1's tail, so a pass of train k's
@@ -1109,13 +1203,12 @@ one to train 1.
    sha12>` per commit of trains 1..k. If a train was stacked behind train k,
    it prints `NEXT base=<12> tip=<12> n=<cars> gate=<...>`: that train is train 1 now, its
    base (the tail just pushed) is `main`: run `pending` and gate what it
-   names (step 4; the deepest train, AGAST #4156), or land it with no log if
-   `gate=not-needed`. If it was gating (4b) the line ends `spec=<local
+   names (step 4; the deepest train, AGAST #4156). If it was gating (4b) the line ends `spec=<local
    log>`: don't gate it again, `train.sh wait` that log (if not done yet)
    and land it with that log. It also
    renews the gate's reservation (#3365), so the 10 minutes count from the
-   push: build and gate the next train promptly. A `build` with
-   `gate=not-needed` drops the reservation; if nothing else is queued, just
+   push: build and gate the next train promptly. A `build` with no car
+   (`gate=not-needed`) drops the reservation; if nothing else is queued, just
    let it expire. For each:
    `complete_task` (`Merged to main as <main sha8> (train <tip sha8>). <REAP
    line>`; if refused, see "Who owns the ticket"), `check_scratchpad_item`,
@@ -1222,7 +1315,7 @@ one to train 1.
    <file>[,<file>]` (the train cars touching the conflicted files, or
    `main` when no train car does). Check its item and send its room one
    line: "your commit conflicts with <car> on <files> in the train; rebase
-   onto <tail sha12>, resolve, re-gate and REAP". `<tail>` is the `tip=` of
+   onto <tail sha12>, resolve, re-check and REAP". `<tail>` is the `tip=` of
    the last `TRAIN` line, so the rebased car stacks onto the back of the
    trains; `build` then accepts it (step 3). Its next REAP joins
    the back of the queue. **`BAD` or a missing gate quote** leave that
@@ -1269,7 +1362,18 @@ most one action line:
     ROOM <room> base=<b12> tail=<t12|main> on-tail|behind|unknown|other
     SKIP <room>: gate live (<why>); not rebasing mid-gate
     REBASE <room> onto <t12>: rebase onto <t12>: `git fetch origin
-           rz-train/<t12> && git rebase FETCH_HEAD`, resolve, re-gate and REAP
+           rz-train/<t12> && git rebase FETCH_HEAD`; clean: push it, no
+           re-check and no new REAP (the train gate covers it; still working:
+           check once when done); conflicted or changed code: resolve,
+           re-check (smoke-plan.sh run) and REAP
+
+**A clean rebase is not re-gated** (AGAST #4580; Aaron, 2026-11-23:
+"Disjoint work can be optimistically rebased without re-gating in the envs;
+save the re-gating for the merge train to save on total runs"). A room that
+rebases cleanly pushes and stops there: if it already REAPed, its original
+REAP boards as `APPLIED` (Reaping step 2), and the train gate tests it. Only
+a rebase that conflicted, or that made the room change code, is re-checked
+(`smoke-plan.sh run`) and REAPed again.
 
 The reference is the deepest built tail, or `origin/main` when no train is
 built (`tail=main`); an `unknown` base is listed, never messaged. A room

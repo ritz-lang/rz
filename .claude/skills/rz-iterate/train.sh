@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # Merge train: land several REAPed commits on main with ONE gate (Aaron,
-# 2026-11-12).  Every REAP is one squashed commit that its room already gated
-# on its own base, so instead of each room rebasing and re-gating in turn,
-# rz stacks them on origin/main in queue order and gates only the top.
+# 2026-11-12).  Every REAP is one squashed commit that its room checked on
+# its own base (smoke-plan.sh: its subsystems in full, AGAST #4580), so
+# instead of each room rebasing and re-gating in turn, rz stacks them on
+# origin/main in queue order and gates only the top, in full.
 #
 #   train.sh build <branch>:<sha> ...         stack the cars on origin/main,
 #                                             replacing every train
@@ -70,7 +71,13 @@
 # lines), and promotes train k+1.  The 8-car cap is per gate, not per land.
 #
 # `build` prints one line per item, then a summary per train:
-#   APPLIED  <branch> <sha12> as <new12>   (cherry-picked; same patch)
+#   APPLIED  <branch> <sha12> as <new12>   (cherry-picked; same patch.  Also
+#                                          a car its room rebased cleanly
+#                                          after the REAP without a new
+#                                          gate: <sha12> is the REAP's, the
+#                                          pick its branch's commit with
+#                                          that patch; never KEPT, so a
+#                                          train gate covers it; AGAST #4580)
 #   KEPT     <branch> <sha12>              (its parent is the tail: same SHA)
 #   CONFLICT <branch> <sha12> with <cars|main> on <files>
 #                                          (left out; its room must rebase)
@@ -479,9 +486,12 @@ start_train() {
 # finish_train: the summary.  A later train nothing boarded is dropped.
 finish_train() {
     local st need=needed; st="$(state)"
-    # Nothing new to test: either nothing applied, or cars kept as-is (their
-    # rooms' gates ran on exactly this tree).
-    [[ $picked -eq 0 ]] && need=not-needed
+    # Every train with a car needs a full gate (AGAST #4580 item 9: rooms
+    # REAP on a subsystem smoke check, so a KEPT car's room may never have
+    # run the full gate; main never moves without one).  A room's own full
+    # gate of a KEPT car is still a verdict for the train whose tip it is:
+    # pass its log to `land`.  Only a train with no car is not-needed.
+    [[ $n -eq 0 ]] && need=not-needed
     printf 'TIP=%s\nGATE=%s\n' "$(g rev-parse HEAD)" "$need" >> "$st"
     echo "TRAIN $k base=${TBASE:0:12} tip=$(g rev-parse --short=12 HEAD) n=$n gate=$need"
     if [[ $n -eq 0 && $k -gt 1 ]]; then
@@ -542,6 +552,22 @@ cmd_build() {
     build_on "$keep" "$@"
 }
 
+# rebased_of <reaped> <tip>: the commit over main on <tip>'s branch with
+# <reaped>'s patch (git patch-id --verbatim), when the room rebased its REAPed
+# commit cleanly and pushed it without a new gate or REAP (AGAST #4580).
+# Empty when none matches: the patch changed, so the room must re-gate and
+# REAP.
+rebased_of() {
+    local want c p sha
+    [[ -n "$2" ]] || return 0
+    want="$(git -C "$MAIN_WT" show --no-color --format='commit %H' "$1" | git -C "$MAIN_WT" patch-id --verbatim | awk '{print $1}')"
+    [[ -n "$want" ]] || return 0
+    while read -r p sha; do
+        if [[ "$p" == "$want" ]]; then c="$sha"; fi
+    done < <(git -C "$MAIN_WT" log -p --no-color --format='commit %H' "origin/main..$2" | git -C "$MAIN_WT" patch-id --verbatim)
+    echo "${c:-}"
+}
+
 # build_on <keep> <items...>: keep the first <keep> trains as they are, and
 # build <items> on the last one's tail (on origin/main for 0), replacing every
 # later train.
@@ -555,7 +581,7 @@ cmd_build() {
 # leaves the kept trains queued.
 build_on() {
     local keep="$1"; shift
-    local item branch sha full tip items=()
+    local item branch sha full tip rebased reaped items=()
     for item in "$@"; do
         branch="${item%%:*}"; sha="${item#*:}"
         [[ "$branch" != "$item" && -n "$branch" && -n "$sha" ]] \
@@ -575,7 +601,16 @@ build_on() {
         if [[ "$full" != "$tip" ]] \
                 && ! { [[ -n "$tip" ]] \
                     && git -C "$MAIN_WT" merge-base --is-ancestor "$full" "$tip" 2>/dev/null; }; then
-            echo "BAD      $branch ${full:0:12}: origin/$branch is not this commit"; continue
+            # A clean rebase after the REAP (AGAST #4580): the room moved its
+            # gated commit onto a train tail or main without re-gating and
+            # sent no new REAP.  Board the branch's commit with the same
+            # patch, as REBASED so it is APPLIED, never KEPT: its room gate
+            # ran on another base, and only the train gate covers it.
+            rebased="$(rebased_of "$full" "$tip")"
+            if [[ -z "$rebased" ]]; then
+                echo "BAD      $branch ${full:0:12}: origin/$branch is not this commit"; continue
+            fi
+            items+=("$branch:$rebased:$full"); continue
         fi
         items+=("$branch:$full")
     done
@@ -609,7 +644,11 @@ build_on() {
     local parent count mb files pick p sha2 left=()
     local -A have=() pid=()
     for item in ${items[@]+"${items[@]}"}; do
-        branch="${item%%:*}"; full="${item#*:}"
+        # <branch>:<commit>[:<reaped>]: <reaped> is set for a car rebased
+        # after its REAP (rebased_of); its lines name the REAPed SHA.
+        branch="${item%%:*}"; full="${item#*:}"; reaped=""
+        if [[ "$full" == *:* ]]; then reaped="${full#*:}"; full="${full%%:*}"; fi
+        local shown="${reaped:-$full}"
         # One unlanded commit over main, or over train commits (a car bounced
         # to rebase onto a train's tail).  A commit already on the base (main,
         # every train below, and this train's earlier cars) does not count
@@ -640,10 +679,10 @@ build_on() {
                 fi
             done < <(g rev-list --reverse "$mb..$full")
             if [[ ${#left[@]} -eq 0 ]]; then
-                echo "EMPTY    $branch ${full:0:12}"; continue
+                echo "EMPTY    $branch ${shown:0:12}"; continue
             fi
             if [[ ${#left[@]} -ne 1 ]]; then
-                echo "BAD      $branch ${full:0:12}: $count commits over main, ${#left[@]} not in the train; want 1 over it"
+                echo "BAD      $branch ${shown:0:12}: $count commits over main, ${#left[@]} not in the train; want 1 over it"
                 continue
             fi
             pick="${left[0]}"
@@ -653,10 +692,12 @@ build_on() {
             start_train "$(free_slot)" "$(g rev-parse HEAD)"
         fi
         parent="$(g rev-parse "$pick^")"
-        if [[ "$parent" == "$(g rev-parse HEAD)" ]]; then
-            # On the tail already: keep its SHA, so its own gate still counts.
+        if [[ "$parent" == "$(g rev-parse HEAD)" && -z "$reaped" ]]; then
+            # On the tail already: keep its SHA, so a room's full gate of it
+            # is still a verdict for this train (`land <room log>`).
+            # Not a car rebased after its REAP: its gate ran on another base.
             g merge -q --ff-only "$pick"
-            echo "KEPT     $branch ${full:0:12}"
+            echo "KEPT     $branch ${shown:0:12}"
             printf 'ITEM=%s %s %s\n' "$branch" "$full" "$pick" >> "$(state)"
             n=$((n + 1)); continue
         fi
@@ -666,15 +707,15 @@ build_on() {
                 g cherry-pick --empty=drop "$pick" >/dev/null 2>&1; then
             files="$(g diff --name-only --diff-filter=U)"
             g cherry-pick --abort >/dev/null 2>&1 || g reset -q --hard
-            echo "CONFLICT $branch ${full:0:12} with $(conflict_with "$files") on $(paste -sd, <<<"$files")"
+            echo "CONFLICT $branch ${shown:0:12} with $(conflict_with "$files") on $(paste -sd, <<<"$files")"
             continue
         fi
         # --empty=drop succeeds without a commit when main already has it.
         if [[ "$(g rev-list --count "$TBASE..HEAD")" -le $n ]]; then
-            echo "EMPTY    $branch ${full:0:12}"; continue
+            echo "EMPTY    $branch ${shown:0:12}"; continue
         fi
-        echo "APPLIED  $branch ${full:0:12} as $(g rev-parse --short=12 HEAD)"
-        printf 'ITEM=%s %s %s\n' "$branch" "$full" "$(g rev-parse HEAD)" >> "$(state)"
+        echo "APPLIED  $branch ${shown:0:12} as $(g rev-parse --short=12 HEAD)"
+        printf 'ITEM=%s %s %s\n' "$branch" "$shown" "$(g rev-parse HEAD)" >> "$(state)"
         n=$((n + 1)); picked=$((picked + 1))
     done
     finish_train
@@ -773,7 +814,9 @@ gate_reason() {
 #   ROOM <room> base=<b12> tail=<t12|main> on-tail|behind|unknown|other
 #   SKIP <room>: gate live (<why>); not rebasing mid-gate
 #   REBASE <room> onto <t12>: rebase onto <t12>: `git fetch origin
-#          rz-train/<t12> && git rebase FETCH_HEAD`, resolve, re-gate and REAP
+#          rz-train/<t12> && git rebase FETCH_HEAD`; clean: push it, no
+#          re-check and no new REAP; conflicted or changed code: resolve,
+#          re-check and REAP (AGAST #4580; see rebase_line)
 #   BOUNCE <room> onto <t12|main>: the train was discarded; rebase onto
 #          <t12|main>: ... (--dropped mode)
 # --dropped <oldtip>: bounce the rooms whose <base> is exactly <oldtip>, onto
@@ -855,16 +898,22 @@ cmd_rebase_plan() {
 
 # rebase_line <verb> <room> <refname>: the one message the caller sends (or
 # forwards) for <room>.  main has no rz-train ref: fetch it directly.
+# A clean rebase is not re-checked (AGAST #4580, Aaron 2026-11-23): the room
+# pushes it and, if it already REAPed, sends no new REAP; `build` boards the
+# original REAP as APPLIED and the train gate covers it.  A room still
+# working checks once, when it finishes (smoke-plan.sh run).  Only a rebase
+# that conflicted, or made the room change code, is re-checked and REAPed.
+REBASE_TAIL='clean: push it, no re-check and no new REAP (the train gate covers it; still working: check once when done); conflicted or changed code: resolve, re-check (smoke-plan.sh run) and REAP'
 rebase_line() {
     local verb="$1" room="$2" refname="$3" fetch
     if [[ "$refname" == main ]]; then
         fetch='git fetch origin && git rebase FETCH_HEAD'
-        printf '%s %s onto main: rebase onto main: `%s`, resolve, re-gate and REAP\n' \
-            "$verb" "$room" "$fetch"
+        printf '%s %s onto main: rebase onto main: `%s`; %s\n' \
+            "$verb" "$room" "$fetch" "$REBASE_TAIL"
     else
         fetch="git fetch origin rz-train/$refname && git rebase FETCH_HEAD"
-        printf '%s %s onto %s: rebase onto %s: `%s`, resolve, re-gate and REAP\n' \
-            "$verb" "$room" "$refname" "$refname" "$fetch"
+        printf '%s %s onto %s: rebase onto %s: `%s`; %s\n' \
+            "$verb" "$room" "$refname" "$refname" "$fetch" "$REBASE_TAIL"
     fi
 }
 
