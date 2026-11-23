@@ -936,6 +936,10 @@ fn track_method_init_local(m: *Module, name_sv: StrView, init: *Expr)
         return
     let idx: i32 = find_local_var_idx(StrView { ptr: (init.left.ident_ptr), len: (init.left.ident_len) as i64 })
     if idx < 0
+        # `let m = M.new()`: a static method of struct M.  Untyped, `m.get(..)`
+        # would want `get` on every generic instance (`Vec$L.get` at a
+        # move-only L nothing calls), AGAST #4588.
+        track_impl_method_local(m, name_sv, StrView { ptr: (init.left.ident_ptr), len: (init.left.ident_len) as i64 }, init)
         return
     let kind: i32 = *(g_lv_prefix_kind + idx)
     if kind > 0
@@ -964,6 +968,14 @@ fn track_method_init_local(m: *Module, name_sv: StrView, init: *Expr)
     if name_eq(StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (c"String"), len: (6) as i64 }) == 1 and name_eq(StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }, StrView { ptr: (c"slice"), len: (5) as i64 }) == 1
         track_typed_local(StrView { ptr: (name), len: (name_len) as i64 }, TypeKind.Struct, StrView { ptr: (c"String"), len: (6) as i64 })
         return
+    track_impl_method_local(m, name_sv, StrView { ptr: (tn), len: (tn_len) as i64 }, init)
+
+# Record local `name_sv`, set to `init` (a call of method `init.ident` on
+# struct `tn_sv` or a value of it), as that method's return type: from the
+# struct's non-generic impl.  Untracked when there is no such method.
+fn track_impl_method_local(m: *Module, name_sv: StrView, tn_sv: StrView, init: *Expr)
+    let tn: *u8 = tn_sv.ptr
+    let tn_len: i32 = tn_sv.len as i32
     var ib: *ImplBlock = m.impls
     while ib != null
         if ib.type_params == null and ib.type_name_len == tn_len
@@ -972,7 +984,7 @@ fn track_method_init_local(m: *Module, name_sv: StrView, init: *Expr)
                 while meth != null
                     if meth.name_len == init.ident_len
                         if memcmp(meth.name, init.ident_ptr, init.ident_len as i64) == 0
-                            track_typed_local(StrView { ptr: (name), len: (name_len) as i64 }, meth.return_type, StrView { ptr: (meth.return_type_name), len: (meth.return_type_name_len) as i64 })
+                            track_typed_local(name_sv, meth.return_type, StrView { ptr: (meth.return_type_name), len: (meth.return_type_name_len) as i64 })
                             return
                     meth = meth.next
         ib = ib.next
@@ -5337,7 +5349,11 @@ fn receiver_instance(m: *Module, recv: *Expr, out_len: *i32) -> *u8
         ExprKind.Method =>
             # `a.slice(0, 1).get(0)`: what the inner method returns at a's type.
             var il: i32 = 0
-            let inner: *u8 = receiver_instance(m, r.left, @il)
+            var inner: *u8 = receiver_instance(m, r.left, @il)
+            if inner == null and r.left != null and r.left.kind == ExprKind.Ident and find_local_var_idx(StrView { ptr: (r.left.ident_ptr), len: (r.left.ident_len) as i64 }) < 0
+                # `M.new().get(0)`: what M's static `new` returns (AGAST #4588).
+                inner = r.left.ident_ptr
+                il = r.left.ident_len
             if inner == null or il <= 0
                 return null
             return method_result_type_name(m, StrView { ptr: (inner), len: (il) as i64 }, StrView { ptr: (r.ident_ptr), len: (r.ident_len) as i64 }, out_len)
