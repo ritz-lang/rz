@@ -7448,8 +7448,13 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             length = self.builder.extract_value(value, 1)
             return self._sink_write_ptr(sink, ptr, length)
 
-        # Pointer types (assume *u8 = string) - use strlen + write
+        # Other pointers print the NUL-terminated bytes they point at
+        # (LANGUAGE_SPEC "other pointers"; ritz1's fmt_write_cstr). The scan
+        # is in bytes whatever the pointee: a `*Point` (AGAST #4585) used to
+        # load a whole `%Point` per step and `icmp` it against 0.
         elif isinstance(ty, ir.PointerType):
+            if ty.pointee != self.i8:
+                value = self.builder.bitcast(value, self.i8.as_pointer())
             return self._emit_sink_cstr(sink, value)
 
         # Boolean - print "true" or "false"
