@@ -163,7 +163,7 @@ CASES = {
              (5, 12), "Error: {at}: unknown type `Nope`", "unknown type `Nope`"),
     "variable": ("pub fn main() -> i32\n    let x: i32 = 1\n    return x + nope\n",
                  (3, 16), "Name error: {at}: Unknown identifier: nope",
-                 "ritz1 cannot emit: unknown identifier 'nope'"),
+                 "Unknown identifier: nope"),
 }
 
 
@@ -199,6 +199,49 @@ def test_unknown_name_refused_by_every_compiler(request, tmp_path, compiler, nam
     else:
         expected = f"{at}: error: {ritz1_message}"
     assert expected in out.splitlines(), f"{compiler}: want {expected!r}:\n{out[-2000:]}"
+
+
+# Every kind of bare name ritz1's Sema must still know (AGAST #4595): a
+# const, a global, a fn as a value, a local, a bare unit variant, and the
+# `E` of `E.V` / `T` of `T.m(..)`, which name no value.
+KNOWN_NAMES = """\
+const K: i32 = 3
+var g: i32 = 4
+
+enum Color
+    Red
+    Green
+
+struct P
+    x: i32
+
+impl P
+    fn new(x: i32) -> P
+        P { x: x }
+
+fn twice(x: i32) -> i32
+    x * 2
+
+pub fn main() -> i32
+    let f: fn(i32) -> i32 = twice
+    let c: Color = Red
+    let d: Color = Color.Green
+    let p: P = P.new(1)
+    return K + g + f(1) + p.x - 10
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_known_names_accepted_by_every_compiler(request, tmp_path, compiler):
+    """The other side of the variable row: no known name is refused."""
+    request.getfixturevalue({"ritz0": "run_ritz0", "ritz1": "ritz1_bin",
+                             "ritz1_selfhosted": "ritz1_selfhosted"}[compiler])
+    src = tmp_path / "main.ritz"
+    src.write_text(KNOWN_NAMES)
+    comp = _compile(compiler, src, tmp_path / "main.ll")
+    out = comp.stdout + comp.stderr
+    assert comp.returncode == 0, f"{compiler} refused a known name:\n{out[-2000:]}"
 
 
 @pytest.mark.integration

@@ -46,9 +46,16 @@ fn main() -> i32
 """
 
 # The emit_ir_error_begin/_end site (#1369): `unknown identifier`, naming it.
+# A name nothing declares is Sema's since AGAST #4595; a payload variant used
+# bare is declared, so it still reaches the emitter.
 _UNKNOWN_IDENT = """\
+enum E
+    Empty
+    Holds(i32)
+
 fn main() -> i32
-    return no_such_name
+    let e: E = Holds
+    return 0
 """
 
 # ... and a plain emit_ir_error: a BitOps method with the wrong arity.
@@ -72,8 +79,13 @@ _BOTH = """\
 struct StrView
     a: i32
 
+enum E
+    Empty
+    Holds(i32)
+
 fn main() -> i32
-    return no_such_name
+    let e: E = Holds
+    return 0
 """
 
 # Said by Sema now (deref_field.ritz, AGAST #3509), in diag's form (#3445).
@@ -86,7 +98,7 @@ CASES = {
     # AGAST #3621: located, so no summary.
     "emit_ir_error_begin": (
         _UNKNOWN_IDENT,
-        ["unit.ritz:2:12: error: ritz1 cannot emit: unknown identifier 'no_such_name'"],
+        ["unit.ritz:6:16: error: ritz1 cannot emit: unknown identifier 'Holds'"],
         None,
     ),
     "emit_ir_error": (
@@ -97,7 +109,7 @@ CASES = {
     "unlocated_only": (_BAD_STRVIEW, [_STRVIEW], f"error: ritz1 emitted 1 {SUMMARY}"),
     "located_and_unlocated": (
         _BOTH,
-        [_STRVIEW, "unit.ritz:5:12: error: ritz1 cannot emit: unknown identifier"],
+        [_STRVIEW, "unit.ritz:9:16: error: ritz1 cannot emit: unknown identifier 'Holds'"],
         f"error: ritz1 emitted 1 {SUMMARY}",
     ),
 }

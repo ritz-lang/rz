@@ -36,10 +36,11 @@ _CANNOT = "ritz1 cannot emit: "
 
 # name -> (source, "line:col", message, extra ritz1 args)
 ROWS = {
-    # emit_ir_error_begin / _end
+    # emit_ir_error_begin / _end: a payload variant used bare (a name nothing
+    # declares is Sema's "Unknown identifier: x" since AGAST #4595)
     "unknown_identifier": (
-        "fn main() -> i32\n    return no_such_name\n",
-        "2:12", _CANNOT + "unknown identifier 'no_such_name'", []),
+        _PAYLOAD_E + "fn main() -> i32\n    let e: E = A\n    0\n",
+        "6:16", _CANNOT + "unknown identifier 'A'", []),
     # emit_ir_error_begin through ptr_elem_size_unknown's threaded span
     "ptr_elem_size_unknown": (
         "extern fn get() -> *void\n\npub fn main() -> i32\n    let i: i64 = 1\n"

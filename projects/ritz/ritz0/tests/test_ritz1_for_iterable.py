@@ -1142,6 +1142,9 @@ BOTH_REFUSE = {
     "scalar_field": (_H2 + MAIN + "    var h: H\n" + _SUM_V.format(it="h.n")),
     "unknown_name": (MAIN + _SUM_V.format(it="nope")),
 }
+# A name nothing declares never reaches the `for`: ritz1's Sema refuses it at
+# the name with ritz0's words (AGAST #4595), at the same location.
+BOTH_REFUSE_MESSAGE = {"unknown_name": "Unknown identifier: nope"}
 
 
 @pytest.mark.integration
@@ -1150,7 +1153,7 @@ BOTH_REFUSE = {
 def test_anything_else_is_a_located_error(compile_with, compiler, name):
     program = BOTH_REFUSE[name]
     comp, ll, _ = compile_with(compiler, name, program)
-    _is_refused(comp, ll, "error: " + UNSUPPORTED, program)
+    _is_refused(comp, ll, "error: " + BOTH_REFUSE_MESSAGE.get(name, UNSUPPORTED), program)
 
 
 @pytest.mark.integration

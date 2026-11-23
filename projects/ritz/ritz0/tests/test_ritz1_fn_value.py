@@ -282,7 +282,8 @@ def test_ritz1_unknown_name_still_rejected(ritz1_bin, tmp_path):
     """The fn fallback must not swallow genuinely unknown identifiers."""
     comp, ll = _compile("ritz1", tmp_path, "unknown_name", UNKNOWN_NAME)
     assert comp.returncode != 0
-    assert "unknown identifier 'no_such_fn'" in comp.stderr + comp.stdout
+    # Refused by Sema in ritz0's words (AGAST #4595), not by the emitter.
+    assert "Unknown identifier: no_such_fn" in comp.stderr + comp.stdout
     assert not ll.exists()
 
 

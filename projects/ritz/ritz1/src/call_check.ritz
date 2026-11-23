@@ -817,6 +817,53 @@ pub fn call_check_call(sm: *Sema, e: *Expr)
         cf = lent_self_call_view_in(sm.module, fd)
     ca_args(sm, e, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, 1, cf.params, e.args)
 
+# --- Names (AGAST #4595) ---------------------------------------------------------
+#
+# A bare name `nope` that nothing declares, refused at the name in ritz0's
+# words, "Unknown identifier: nope", as cc_unknown refuses a call.  The
+# emitter used to be the first to see it ("ritz1 cannot emit: unknown
+# identifier 'nope'").  A name is known when emit_expr_ident lowers it or
+# refuses it in its own words: a local, const (a builtin one too), global or
+# fn, or a variant some enum declares (a unit variant, a generic enum's with
+# or without an instance, one two enums declare, the builtin `None`).
+#
+# The `x` of `x.f` / `x.m(..)` is no value when it names a type, an enum or
+# an impl (`E.V`, `Vec2.new(..)`), so it isn't judged here: the caller hands
+# it to call_check_qualifier before walking it.
+
+var g_cc_qualifier: *Expr = null
+
+# `q` is the next name walked, the left of a member or method: not judged.
+pub fn call_check_qualifier(q: *Expr)
+    g_cc_qualifier = q
+
+fn cc_known_ident(sm: *Sema, name: StrView) -> i32
+    if sema_is_local(sm, name) == 1 or sbk_const(sm, name) != null or is_builtin_const(name) == 1
+        return 1
+    if sbk_global(sm, name) != null or sema_find_fn(sm, name) != null
+        return 1
+    if name_eq(name, StrView { ptr: (c"None"), len: (4) as i64 }) == 1
+        return 1
+    var vi: i32 = 0
+    var other: i32 = 0
+    if enum_of_variant_unique(name, @vi, @other) != 0 - 1
+        return 1
+    (generic_enum_of_variant(name, @vi) >= 0) as i32
+
+# An ExprKind.Ident, as sema_walk visits it.
+pub fn call_check_ident(sm: *Sema, e: *Expr)
+    let q: *Expr = g_cc_qualifier
+    g_cc_qualifier = null
+    if e == q or g_cc_mute > 0
+        return
+    let name: StrView = StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }
+    if cc_known_ident(sm, name) == 1
+        return
+    if cc_report(sm, e.span.line, e.span.col) == 1
+        eprints_cstr(c"Unknown identifier: ")
+        eprint_bytes(name)
+        eprint_char('\n')
+
 # --- Method calls ----------------------------------------------------------------
 
 # 1 when `x` names a local or a global: a value, not a type.

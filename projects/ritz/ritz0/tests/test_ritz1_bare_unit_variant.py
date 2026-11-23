@@ -508,7 +508,8 @@ def test_ritz1_unknown_name_still_errors(tmp_path):
     """A name that is no variant, local, global, const or fn stays an error."""
     comp, ll, _ = _compile("ritz1", tmp_path, "unknown", UNKNOWN_NAME)
     assert comp.returncode != 0
-    assert "unknown identifier 'D'" in comp.stderr, comp.stderr
+    # Refused by Sema in ritz0's words (AGAST #4595), not by the emitter.
+    assert "Unknown identifier: D" in comp.stderr, comp.stderr
 
 
 # A payload variant used bare has no value without its payload: still an
