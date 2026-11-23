@@ -64,9 +64,6 @@ EXTERNAL_DIRS = ("", "tools", "scripts")
 # reported, so this list cannot outlive its reasons.
 RITZLIB_ALLOWLIST = {
     "testlib.ritz": "the test assertion library: every importer is a test by design",
-    "fmt.ritz": "#198 Phase 2 (#201) ships the Writer / Display surface tested in "
-                "isolation (ritzlib/tests/test_fmt_*); Phase 3 (#202) lowers "
-                "interpolation onto it. Drop this entry when #202 lands",
 }
 
 # A `.ritz` file with one of these as a directory component, or named test_*,
