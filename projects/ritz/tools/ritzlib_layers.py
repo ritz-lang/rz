@@ -11,6 +11,11 @@ ritzlib.hashmap declare `extern fn` (ritz_platform_page_map,
 ritz_platform_page_unmap, ritz_platform_fatal): ritzlib.sys defines them for a
 hosted program, and a freestanding one defines its own.
 
+BARE is the heap-free part of the core: modules that import only BARE
+modules, so they reach no allocator and a target with no heap (the UEFI
+loader, HWINV) can import them.  ritzlib.strview is one (AGAST #4601): its
+one malloc user, to_cstr, is ritzlib.string's strview_to_cstr.
+
     python3 tools/ritzlib_layers.py [RITZLIB]   # exit 1 naming each violation
 
 tools/test_ritzlib_layers.py::test_core_imports_only_core runs the check in
@@ -28,6 +33,9 @@ CORE = frozenset({
     "result", "span", "str", "string", "strview",
 })
 
+# The heap-free core: none imports ritzlib.memory, even transitively.
+BARE = frozenset({"fmt.digits", "option", "strview"})
+
 IMPORT = re.compile(r"\s*(?:pub\s+)?import\s+ritzlib\.([A-Za-z_][\w.]*)")
 
 
@@ -42,7 +50,8 @@ def imports(path):
 
 
 def check(ritzlib):
-    """One message per violation: a CORE module missing, or importing a hosted one."""
+    """One message per violation: a CORE module missing, or importing a hosted
+    one, or a BARE module importing one that is not BARE."""
     ritzlib = Path(ritzlib)
     problems = []
     for mod in sorted(CORE):
@@ -55,6 +64,9 @@ def check(ritzlib):
             if dep not in CORE:
                 problems.append(f"ritzlib/{rel}:{n}: core module ritzlib.{mod} "
                                 f"imports hosted ritzlib.{dep}")
+            elif mod in BARE and dep not in BARE:
+                problems.append(f"ritzlib/{rel}:{n}: bare module ritzlib.{mod} "
+                                f"imports ritzlib.{dep}, which is not bare")
     return problems
 
 

@@ -41,6 +41,11 @@ with no syscalls: no core module imports a module outside the core, so
 in `tools/ritzlib_layers.py`, whose check (`make tools-unit`) fails when a
 core module imports a hosted one.
 
+Inside the core, the **bare** modules (`strview`, `option`, `fmt.digits`)
+import only each other, so they reach no allocator: a target with no heap at
+all, such as harland's UEFI loader, imports them (AGAST #4601). The same check
+fails when a bare module imports one that is not bare.
+
 The core reaches the platform only through three hooks it declares
 `extern fn`:
 
@@ -771,7 +776,9 @@ the same name, and `span_as_strview` / `span_from_strview` convert between the t
 type of a bare `"..."` literal. It never allocates or frees, is not
 NUL-terminated, and must not outlive the bytes it points at. Use `String`
 (`ritzlib.string`) when you need to own or grow the text. Every method takes
-the view by value; slicing returns a new view of the same bytes.
+the view by value; slicing returns a new view of the same bytes. The module
+is bare (no allocator in its imports); for a `malloc`ed NUL-terminated copy,
+`ritzlib.string`'s `strview_to_cstr(sv)` (the caller `free`s it).
 
 **Construction** (free fns; no method form):
 
@@ -791,7 +798,6 @@ Access / conversion:
 | `s.is_empty()` | `fn() -> bool` | `len == 0` |
 | `s.get(idx)` | `fn(idx: i64) -> u8` | Byte at `idx` (unchecked) |
 | `s.as_ptr()` | `fn() -> *u8` | Pointer to the first byte |
-| `s.to_cstr()` | `fn() -> *u8` | `malloc`ed NUL-terminated copy; caller `free`s it |
 | `s.as_cstr_unchecked()` | `fn() -> *u8` | The pointer as a C string. Only sound if the bytes after the view hold a NUL, as they do for a whole literal; a slice usually doesn't |
 | `s.parse_i64()` | `fn() -> Option<i64>` | The whole view as decimal, optional `+`/`-`: `None` for empty, a bare sign, whitespace, junk or overflow. Trim first if needed |
 

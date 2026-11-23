@@ -30,7 +30,7 @@ SINKS = {"klog.ritz", "serial.ritz", "tty/console.ritz"}
 # functions (boot_abi/src/serial.ritz, re-exported by serial.ritz) and the
 # kernel's old wrappers over them.
 SERIAL_ONLY = re.compile(
-    r"\b(prints|println|prints_str|serial_print|serial_write|serial_write_byte"
+    r"\b(prints|println|prints_str|serial_print(?:_sv)?|serial_write|serial_write_byte"
     r"|serial_print_dec|serial_print_hex(?:_width|8|16|32|64)?"
     r"|print_hex_prefix(?:8|16|32|64)?)\s*\("
 )

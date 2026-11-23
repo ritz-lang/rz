@@ -6,6 +6,11 @@ none of it reaches ritzlib.sys, so a target with no syscalls (the Harland
 kernel) can import it.  Everything else is hosted.  `check` names every core
 module that imports a hosted one; `test_core_imports_only_core` runs it on
 the real tree in `make tools-unit`.
+
+Inside the core, BARE is the heap-free part: modules that reach no allocator,
+so a target with no heap at all (the UEFI loader, HWINV) can import them.
+StrView is one (AGAST #4601): before it, ritzlib.strview imported
+ritzlib.memory for to_cstr and the loader declared its own StrView.
 """
 
 import sys
@@ -16,7 +21,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 import ritzlib_layers
-from ritzlib_layers import CORE, check, imports
+from ritzlib_layers import BARE, CORE, check, imports
 
 RITZLIB = Path(__file__).resolve().parent.parent / "ritzlib"
 
@@ -33,7 +38,7 @@ def lib(tmp_path, sources):
 
 def core_tree(tmp_path, **overrides):
     """A ritzlib holding every CORE module (empty) plus `overrides`."""
-    sources = {f"{m.replace('.', '/')}.ritz": "" for m in CORE}
+    sources = {f"{m.replace('.', '/')}.ritz": "" for m in CORE | BARE}
     sources.update({f"{k}.ritz": v for k, v in overrides.items()})
     return lib(tmp_path, sources)
 
@@ -85,3 +90,22 @@ def test_main_exit_status(tmp_path, capsys):
     assert ritzlib_layers.main([str(core_tree(tmp_path / "a"))]) == 0
     assert ritzlib_layers.main([str(core_tree(tmp_path / "b", gvec="import ritzlib.sys\n"))]) == 1
     assert "core module ritzlib.gvec imports hosted ritzlib.sys" in capsys.readouterr().out
+
+
+def test_bare_is_core_and_holds_strview():
+    # The loader and HWINV import ritzlib.strview, so it must stay heap-free.
+    assert BARE <= CORE
+    assert {"strview", "option", "fmt.digits"} <= BARE
+    assert "memory" not in BARE
+
+
+def test_bare_importing_heap_core_is_reported(tmp_path):
+    root = core_tree(tmp_path, strview="import ritzlib.option\nimport ritzlib.memory\n")
+    assert check(root) == [
+        "ritzlib/strview.ritz:2: bare module ritzlib.strview imports "
+        "ritzlib.memory, which is not bare"]
+
+
+def test_bare_importing_bare_is_fine(tmp_path):
+    root = core_tree(tmp_path, strview="import ritzlib.option\n")
+    assert check(root) == []

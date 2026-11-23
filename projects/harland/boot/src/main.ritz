@@ -17,10 +17,12 @@
 # System V calling convention (RDI, RSI, RDX, RCX, R8, R9).
 
 # Shared with the kernel through the boot_abi package (AGAST #4578): the boot handoff, the
-# ELF64 layouts and the polled COM1 driver are declared once.
+# ELF64 layouts and the polled COM1 driver are declared once. StrView ("..."
+# literals) is ritzlib's, which is heap-free (AGAST #4601).
+import ritzlib.strview { StrView }
 import boot_abi.handoff { HarlandBootInfo, HarlandMemEntry, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION, HARLAND_BOOT_FLAG_NET_SELFTEST, HARLAND_BOOT_FLAG_NET_RESPONDER, HARLAND_BOOT_FLAG_KLOG_DUMP, HARLAND_BOOT_FLAG_BOOT_TEST, HARLAND_MEM_USABLE, HARLAND_MEM_RESERVED, HARLAND_MEM_ACPI_RECLAIMABLE }
 import boot_abi.elf64 { Elf64Ehdr, Elf64Phdr, Elf64Shdr, Elf64Sym, ELF_MAGIC, PT_LOAD, SHT_SYMTAB }
-import boot_abi.serial { serial_init, serial_write, print_hex_prefix, serial_print_udec }
+import boot_abi.serial { serial_init, serial_print_sv, print_hex_prefix, serial_print_udec }
 
 # ============================================================================
 # UEFI Types and Constants
@@ -304,20 +306,6 @@ const KERNEL_VIRT_BASE: u64 = 0xFFFFFFFF80000000
 const KERNEL_PHYS_BASE: u64 = 0x100000
 
 # ============================================================================
-# Serial output: boot_abi/src/serial.ritz, plus the loader's own StrView
-# ============================================================================
-
-# StrView - Zero-copy string view (matches ritzlib layout). "hello" literals
-# are StrViews. The loader can't link ritzlib.strview (it needs malloc), so
-# it declares the layout itself and wraps serial_write.
-pub struct StrView
-    ptr: *u8
-    len: i64
-
-fn prints(s: StrView) -> i32
-    return serial_write(s.ptr, s.len)
-
-# ============================================================================
 # UEFI Service Calls
 #
 # UEFI firmware functions use the Microsoft x64 convention. A function
@@ -387,22 +375,22 @@ fn memory_to_map_mb() -> u64
     return mb
 
 fn allocate_page_tables() -> i32
-    prints("  Allocating page tables...\n")
+    serial_print_sv("  Allocating page tables...\n")
     # PML4, the identity PDPT, the higher-half PDPT, then one PD per GiB.
     map_gbs = (memory_to_map_mb() + 1023) / 1024
     let pages: u64 = 3 + map_gbs
     var addr: u64 = 0
     var status: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, @addr)
     if status != EFI_SUCCESS
-        prints("    ERROR: Failed to allocate page tables\n")
+        serial_print_sv("    ERROR: Failed to allocate page tables\n")
         return -1
     pml4_addr = addr
     pdpt_identity_addr = addr + 0x1000
     pdpt_highhalf_addr = addr + 0x2000
     pd_addr = addr + 0x3000
-    prints("    PML4 at ")
+    serial_print_sv("    PML4 at ")
     print_hex_prefix(pml4_addr)
-    prints("\n")
+    serial_print_sv("\n")
     var p: *u64 = pml4_addr as *u64
     var i: u64 = 0
     while i < pages * 512
@@ -426,14 +414,14 @@ fn chunk_has_ram(base: u64) -> bool
     return false
 
 fn setup_page_tables() -> i32
-    prints("  Setting up page tables based on detected memory...\n")
+    serial_print_sv("  Setting up page tables based on detected memory...\n")
     let flags: u64 = PTE_PRESENT | PTE_WRITABLE
     let huge_flags: u64 = PTE_PRESENT | PTE_WRITABLE | PTE_HUGE
 
     let mapped_mb: u64 = memory_to_map_mb()
-    prints("    Will map ")
+    serial_print_sv("    Will map ")
     serial_print_udec(mapped_mb)
-    prints(" MB of memory\n")
+    serial_print_sv(" MB of memory\n")
 
     # PML4[0] -> pdpt_identity (for identity mapping)
     let pml4: *u64 = pml4_addr as *u64
@@ -468,16 +456,16 @@ fn setup_page_tables() -> i32
     let pdpt_hh_510: *u64 = (pdpt_highhalf_addr + 510 * 8) as *u64
     *pdpt_hh_510 = pd_addr | flags
 
-    prints("    Identity map: 0-")
+    serial_print_sv("    Identity map: 0-")
     serial_print_udec(mapped_mb)
-    prints("MB -> 0-")
+    serial_print_sv("MB -> 0-")
     serial_print_udec(mapped_mb)
-    prints("MB\n")
-    prints("    Higher-half:  0xFFFFFFFF80000000 -> 0-1GB\n")
+    serial_print_sv("MB\n")
+    serial_print_sv("    Higher-half:  0xFFFFFFFF80000000 -> 0-1GB\n")
     return 0
 
 fn load_page_tables() -> i32
-    prints("  Loading page tables into CR3...\n")
+    serial_print_sv("  Loading page tables into CR3...\n")
     asm x86_64:
         movq {pml4_addr}, %rax
         movq %rax, %cr3
@@ -498,22 +486,22 @@ fn is_ram_type(t: u32) -> bool
     return (t >= EFI_LOADER_CODE and t <= EFI_CONVENTIONAL_MEMORY) or t == EFI_ACPI_RECLAIM_MEMORY or t == EFI_ACPI_MEMORY_NVS
 
 fn get_memory_map() -> i32
-    prints("  Getting memory map...\n")
+    serial_print_sv("  Getting memory map...\n")
     memory_map_size = 16384
     let map_ptr: *u8 = @memory_map_buffer[0]
     let status: u64 = efi_get_memory_map(@memory_map_size, map_ptr, @memory_map_key, @memory_map_desc_size, @memory_map_desc_version)
     if status != EFI_SUCCESS
-        prints("    ERROR: GetMemoryMap failed with status ")
+        serial_print_sv("    ERROR: GetMemoryMap failed with status ")
         print_hex_prefix(status)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
     let num_entries: u64 = memory_map_size / memory_map_desc_size
-    prints("    Got ")
+    serial_print_sv("    Got ")
     serial_print_udec(num_entries)
-    prints(" memory map entries\n")
-    prints("    Descriptor size: ")
+    serial_print_sv(" memory map entries\n")
+    serial_print_sv("    Descriptor size: ")
     serial_print_udec(memory_map_desc_size)
-    prints(" bytes\n")
+    serial_print_sv(" bytes\n")
     var usable_pages: u64 = 0
     var highest_usable_addr: u64 = 0
     var i: u64 = 0
@@ -531,14 +519,14 @@ fn get_memory_map() -> i32
     let usable_mb: u64 = (usable_pages * 4096) / (1024 * 1024)
     # Round up to nearest 256MB for simpler page table setup
     detected_memory_mb = ((highest_usable_addr + 0x0FFFFFFF) / 0x10000000) * 256
-    prints("    Usable memory: ")
+    serial_print_sv("    Usable memory: ")
     serial_print_udec(usable_mb)
-    prints(" MB\n")
-    prints("    Highest address: ")
+    serial_print_sv(" MB\n")
+    serial_print_sv("    Highest address: ")
     print_hex_prefix(highest_usable_addr)
-    prints(" -> mapping ")
+    serial_print_sv(" -> mapping ")
     serial_print_udec(detected_memory_mb)
-    prints(" MB\n")
+    serial_print_sv(" MB\n")
     return 0
 
 # ============================================================================
@@ -584,14 +572,14 @@ fn guid_equals(a: *EfiGuid, b: *EfiGuid) -> i32
 var rsdp_address: u64 = 0
 
 fn find_rsdp_from_uefi() -> i32
-    prints("  Finding ACPI RSDP from UEFI...\n")
+    serial_print_sv("  Finding ACPI RSDP from UEFI...\n")
 
     let num_entries: u64 = g_system_table.number_of_table_entries
     let config_table: *EfiConfigurationTable = g_system_table.configuration_table as *EfiConfigurationTable
 
-    prints("    Configuration table entries: ")
+    serial_print_sv("    Configuration table entries: ")
     serial_print_udec(num_entries)
-    prints("\n")
+    serial_print_sv("\n")
 
     var i: u64 = 0
     while i < num_entries
@@ -600,22 +588,22 @@ fn find_rsdp_from_uefi() -> i32
         # Check for ACPI 2.0 RSDP first (preferred)
         if guid_equals(@(*entry).vendor_guid, @acpi20_guid) == 1
             rsdp_address = (*entry).vendor_table
-            prints("    Found ACPI 2.0 RSDP at: ")
+            serial_print_sv("    Found ACPI 2.0 RSDP at: ")
             print_hex_prefix(rsdp_address)
-            prints("\n")
+            serial_print_sv("\n")
             return 0
 
         # Fall back to ACPI 1.0 RSDP
         if guid_equals(@(*entry).vendor_guid, @acpi10_guid) == 1
             rsdp_address = (*entry).vendor_table
-            prints("    Found ACPI 1.0 RSDP at: ")
+            serial_print_sv("    Found ACPI 1.0 RSDP at: ")
             print_hex_prefix(rsdp_address)
-            prints("\n")
+            serial_print_sv("\n")
             return 0
 
         i = i + 1
 
-    prints("    WARNING: No ACPI RSDP found in configuration table\n")
+    serial_print_sv("    WARNING: No ACPI RSDP found in configuration table\n")
     return -1
 
 # ============================================================================
@@ -631,58 +619,58 @@ var fb_bpp: u8 = 0
 var fb_format: u32 = 0
 
 fn init_graphics() -> i32
-    prints("  Initializing graphics (UEFI GOP)...\n")
+    serial_print_sv("  Initializing graphics (UEFI GOP)...\n")
 
     # Locate GOP protocol
     var gop_ptr: u64 = 0
     let status: u64 = efi_locate_protocol(@gop_guid, 0, @gop_ptr)
     if status != EFI_SUCCESS
-        prints("    WARNING: No GOP found (headless mode)\n")
+        serial_print_sv("    WARNING: No GOP found (headless mode)\n")
         return -1
 
     let gop: *EfiGraphicsOutputProtocol = gop_ptr as *EfiGraphicsOutputProtocol
     let mode: *EfiGopMode = (*gop).mode
     let info: *EfiGopModeInfo = (*mode).info
 
-    prints("    GOP found at: ")
+    serial_print_sv("    GOP found at: ")
     print_hex_prefix(gop_ptr)
-    prints("\n")
+    serial_print_sv("\n")
 
     # Print current mode info
-    prints("    Current mode: ")
+    serial_print_sv("    Current mode: ")
     serial_print_udec((*mode).mode_number as u64)
-    prints(" of ")
+    serial_print_sv(" of ")
     serial_print_udec((*mode).max_mode as u64)
-    prints("\n")
+    serial_print_sv("\n")
 
-    prints("    Resolution: ")
+    serial_print_sv("    Resolution: ")
     serial_print_udec((*info).horizontal_resolution as u64)
-    prints("x")
+    serial_print_sv("x")
     serial_print_udec((*info).vertical_resolution as u64)
-    prints("\n")
+    serial_print_sv("\n")
 
-    prints("    Pixels per scanline: ")
+    serial_print_sv("    Pixels per scanline: ")
     serial_print_udec((*info).pixels_per_scan_line as u64)
-    prints("\n")
+    serial_print_sv("\n")
 
-    prints("    Pixel format: ")
+    serial_print_sv("    Pixel format: ")
     if (*info).pixel_format == EFI_PIXEL_RGBX_8BIT
-        prints("RGBX\n")
+        serial_print_sv("RGBX\n")
     else if (*info).pixel_format == EFI_PIXEL_BGRX_8BIT
-        prints("BGRX\n")
+        serial_print_sv("BGRX\n")
     else if (*info).pixel_format == EFI_PIXEL_BITMASK
-        prints("Bitmask\n")
+        serial_print_sv("Bitmask\n")
     else if (*info).pixel_format == EFI_PIXEL_BLT_ONLY
-        prints("BLT-only (no direct framebuffer!)\n")
+        serial_print_sv("BLT-only (no direct framebuffer!)\n")
         return -1
     else
-        prints("Unknown\n")
+        serial_print_sv("Unknown\n")
 
-    prints("    Framebuffer: ")
+    serial_print_sv("    Framebuffer: ")
     print_hex_prefix((*mode).frame_buffer_base)
-    prints(" (")
+    serial_print_sv(" (")
     serial_print_udec((*mode).frame_buffer_size / 1024)
-    prints(" KB)\n")
+    serial_print_sv(" KB)\n")
 
     # Store framebuffer info for HarlandBootInfo
     fb_addr = (*mode).frame_buffer_base
@@ -694,7 +682,7 @@ fn init_graphics() -> i32
 
     # Quick visual test: fill framebuffer with a color
     # This happens before ExitBootServices, so we can access it directly
-    prints("    Drawing test pattern...\n")
+    serial_print_sv("    Drawing test pattern...\n")
     let fb: *u32 = fb_addr as *u32
     var y: u32 = 0
     while y < fb_height
@@ -719,7 +707,7 @@ fn init_graphics() -> i32
             x = x + 1
         y = y + 1
 
-    prints("    Graphics initialized!\n")
+    serial_print_sv("    Graphics initialized!\n")
     return 0
 
 # ============================================================================
@@ -745,7 +733,7 @@ fn convert_efi_memory_type(efi_type: u32) -> u32
     return HARLAND_MEM_RESERVED
 
 fn build_boot_info() -> i32
-    prints("  Building BootInfo structure...\n")
+    serial_print_sv("  Building BootInfo structure...\n")
 
     # Set magic and version
     boot_info.magic = HARLAND_BOOT_MAGIC
@@ -774,9 +762,9 @@ fn build_boot_info() -> i32
     boot_info.memory_map = @boot_memory_map[0]
     boot_info.memory_map_entries = boot_memory_map_count
 
-    prints("    Memory map entries: ")
+    serial_print_sv("    Memory map entries: ")
     serial_print_udec(boot_memory_map_count as u64)
-    prints("\n")
+    serial_print_sv("\n")
 
     # Set RSDP address
     boot_info.rsdp_addr = rsdp_address
@@ -804,17 +792,17 @@ fn build_boot_info() -> i32
     boot_info.framebuffer_format = fb_format as u8
 
     if fb_addr != 0
-        prints("    Framebuffer: ")
+        serial_print_sv("    Framebuffer: ")
         serial_print_udec(fb_width as u64)
-        prints("x")
+        serial_print_sv("x")
         serial_print_udec(fb_height as u64)
-        prints(" @ ")
+        serial_print_sv(" @ ")
         print_hex_prefix(fb_addr)
-        prints("\n")
+        serial_print_sv("\n")
 
-    prints("    BootInfo ready at: ")
+    serial_print_sv("    BootInfo ready at: ")
     print_hex_prefix(@boot_info as u64)
-    prints("\n")
+    serial_print_sv("\n")
 
     return 0
 
@@ -855,7 +843,7 @@ var kernel_entry: u64 = 0
 var file_info_buffer: [256]u8
 
 fn load_kernel_from_fs() -> i32
-    prints("  Loading kernel from filesystem...\n")
+    serial_print_sv("  Loading kernel from filesystem...\n")
     init_kernel_path()
 
     # Find filesystem handles using LocateHandleBuffer
@@ -863,17 +851,17 @@ fn load_kernel_from_fs() -> i32
     var handle_buffer: u64 = 0
     let lhb_status: u64 = efi_locate_handle_buffer(@fs_guid, @num_handles, @handle_buffer)
     if lhb_status != EFI_SUCCESS
-        prints("    ERROR: Failed to locate filesystem handles: ")
+        serial_print_sv("    ERROR: Failed to locate filesystem handles: ")
         print_hex_prefix(lhb_status)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
 
-    prints("    Found ")
+    serial_print_sv("    Found ")
     serial_print_udec(num_handles)
-    prints(" filesystem handle(s)\n")
+    serial_print_sv(" filesystem handle(s)\n")
 
     if num_handles == 0
-        prints("    ERROR: No filesystems found\n")
+        serial_print_sv("    ERROR: No filesystems found\n")
         return -1
 
     # Try each filesystem handle to find our kernel
@@ -884,9 +872,9 @@ fn load_kernel_from_fs() -> i32
     var i: u64 = 0
     while i < num_handles && found_fs == 0
         let handle: u64 = *(handles + i)
-        prints("    Trying handle ")
+        serial_print_sv("    Trying handle ")
         serial_print_udec(i)
-        prints(": ")
+        serial_print_sv(": ")
         print_hex_prefix(handle)
 
         # Get filesystem protocol from this handle
@@ -895,19 +883,19 @@ fn load_kernel_from_fs() -> i32
         if fs_status == EFI_SUCCESS
             fs_protocol = fs_iface
             found_fs = 1
-            prints(" OK\n")
+            serial_print_sv(" OK\n")
         else
-            prints(" FAIL\n")
+            serial_print_sv(" FAIL\n")
 
         i = i + 1
 
     if found_fs == 0
-        prints("    ERROR: Could not get filesystem protocol from any handle\n")
+        serial_print_sv("    ERROR: Could not get filesystem protocol from any handle\n")
         return -1
 
-    prints("    Got filesystem protocol at ")
+    serial_print_sv("    Got filesystem protocol at ")
     print_hex_prefix(fs_protocol)
-    prints("\n")
+    serial_print_sv("\n")
 
     let fs: *EfiSimpleFileSystem = fs_protocol as *EfiSimpleFileSystem
 
@@ -915,12 +903,12 @@ fn load_kernel_from_fs() -> i32
     var root_file: u64 = 0
     let status2: u64 = (fs.open_volume as EfiFn2)(fs_protocol, @root_file as u64)
     if status2 != EFI_SUCCESS
-        prints("    ERROR: Failed to open root volume: ")
+        serial_print_sv("    ERROR: Failed to open root volume: ")
         print_hex_prefix(status2)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
 
-    prints("    Opened root volume\n")
+    serial_print_sv("    Opened root volume\n")
 
     let root: *EfiFile = root_file as *EfiFile
 
@@ -931,12 +919,12 @@ fn load_kernel_from_fs() -> i32
     let kfile_ptr: u64 = @kernel_file as u64
     let status3: u64 = (root.open as EfiFn5)(root_file, kfile_ptr, kpath_ptr, EFI_FILE_MODE_READ, 0)
     if status3 != EFI_SUCCESS
-        prints("    ERROR: Failed to open \\harland\\kernel.elf: ")
+        serial_print_sv("    ERROR: Failed to open \\harland\\kernel.elf: ")
         print_hex_prefix(status3)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
 
-    prints("    Opened kernel file: \\harland\\kernel.elf\n")
+    serial_print_sv("    Opened kernel file: \\harland\\kernel.elf\n")
 
     let kfile: *EfiFile = kernel_file as *EfiFile
 
@@ -949,31 +937,31 @@ fn load_kernel_from_fs() -> i32
     # SetPosition to 0xFFFFFFFFFFFFFFFF means end of file
     let status4: u64 = (kfile.set_position as EfiFn2)(kernel_file, 0xFFFFFFFFFFFFFFFF)
     if status4 != EFI_SUCCESS
-        prints("    ERROR: Failed to seek to end: ")
+        serial_print_sv("    ERROR: Failed to seek to end: ")
         print_hex_prefix(status4)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
 
     var file_size: u64 = 0
     let status5: u64 = (kfile.get_position as EfiFn2)(kernel_file, @file_size as u64)
     if status5 != EFI_SUCCESS
-        prints("    ERROR: Failed to get file size: ")
+        serial_print_sv("    ERROR: Failed to get file size: ")
         print_hex_prefix(status5)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
 
-    prints("    Kernel file size: ")
+    serial_print_sv("    Kernel file size: ")
     serial_print_udec(file_size)
-    prints(" bytes\n")
+    serial_print_sv(" bytes\n")
 
     kernel_size = file_size
 
     # Seek back to beginning
     let status6: u64 = (kfile.set_position as EfiFn2)(kernel_file, 0)
     if status6 != EFI_SUCCESS
-        prints("    ERROR: Failed to seek to start: ")
+        serial_print_sv("    ERROR: Failed to seek to start: ")
         print_hex_prefix(status6)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
 
     # Allocate memory for kernel (round up to pages)
@@ -981,30 +969,30 @@ fn load_kernel_from_fs() -> i32
     var kernel_addr: u64 = 0
     let status7: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages_needed, @kernel_addr)
     if status7 != EFI_SUCCESS
-        prints("    ERROR: Failed to allocate kernel buffer: ")
+        serial_print_sv("    ERROR: Failed to allocate kernel buffer: ")
         print_hex_prefix(status7)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
 
     kernel_buffer = kernel_addr as *u8
-    prints("    Allocated ")
+    serial_print_sv("    Allocated ")
     serial_print_udec(pages_needed)
-    prints(" pages at ")
+    serial_print_sv(" pages at ")
     print_hex_prefix(kernel_addr)
-    prints("\n")
+    serial_print_sv("\n")
 
     # Read the kernel file
     var bytes_to_read: u64 = file_size
     let status8: u64 = (kfile.read as EfiFn3)(kernel_file, @bytes_to_read as u64, kernel_addr)
     if status8 != EFI_SUCCESS
-        prints("    ERROR: Failed to read kernel: ")
+        serial_print_sv("    ERROR: Failed to read kernel: ")
         print_hex_prefix(status8)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
 
-    prints("    Read ")
+    serial_print_sv("    Read ")
     serial_print_udec(bytes_to_read)
-    prints(" bytes\n")
+    serial_print_sv(" bytes\n")
 
     # Close kernel file
     (kfile.close as EfiFn1)(kernel_file)
@@ -1020,7 +1008,7 @@ fn load_kernel_from_fs() -> i32
     # Close root
     (root.close as EfiFn1)(root_file)
 
-    prints("    Kernel loaded successfully!\n")
+    serial_print_sv("    Kernel loaded successfully!\n")
     return 0
 
 # ============================================================================
@@ -1054,7 +1042,7 @@ fn load_initramfs_from_fs(root_file: u64) -> i32
     var file: u64 = 0
     let st_open: u64 = (root.open as EfiFn5)(root_file, @file as u64, @initramfs_path[0] as u64, EFI_FILE_MODE_READ, 0)
     if st_open != EFI_SUCCESS
-        prints("    No \\harland\\initramfs.tar on the boot volume (kernel will try virtio-blk)\n")
+        serial_print_sv("    No \\harland\\initramfs.tar on the boot volume (kernel will try virtio-blk)\n")
         return 1
     let f: *EfiFile = file as *EfiFile
 
@@ -1066,18 +1054,18 @@ fn load_initramfs_from_fs(root_file: u64) -> i32
     if status == EFI_SUCCESS
         status = (f.set_position as EfiFn2)(file, 0)
     if status != EFI_SUCCESS or size == 0
-        prints("    ERROR: Cannot size initramfs.tar: ")
+        serial_print_sv("    ERROR: Cannot size initramfs.tar: ")
         print_hex_prefix(status)
-        prints("\n")
+        serial_print_sv("\n")
         (f.close as EfiFn1)(file)
         return -1
 
     var addr: u64 = 0
     status = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, (size + 4095) / 4096, @addr)
     if status != EFI_SUCCESS
-        prints("    ERROR: Cannot allocate initramfs buffer: ")
+        serial_print_sv("    ERROR: Cannot allocate initramfs buffer: ")
         print_hex_prefix(status)
-        prints("\n")
+        serial_print_sv("\n")
         (f.close as EfiFn1)(file)
         return -1
 
@@ -1085,22 +1073,22 @@ fn load_initramfs_from_fs(root_file: u64) -> i32
     status = (f.read as EfiFn3)(file, @got as u64, addr)
     (f.close as EfiFn1)(file)
     if status != EFI_SUCCESS or got != size
-        prints("    ERROR: Cannot read initramfs.tar: ")
+        serial_print_sv("    ERROR: Cannot read initramfs.tar: ")
         print_hex_prefix(status)
-        prints(", ")
+        serial_print_sv(", ")
         serial_print_udec(got)
-        prints(" of ")
+        serial_print_sv(" of ")
         serial_print_udec(size)
-        prints(" bytes\n")
+        serial_print_sv(" bytes\n")
         return -1
 
     initramfs_addr = addr
     initramfs_size = size
-    prints("    Read initramfs: ")
+    serial_print_sv("    Read initramfs: ")
     serial_print_udec(size)
-    prints(" bytes at ")
+    serial_print_sv(" bytes at ")
     print_hex_prefix(addr)
-    prints("\n")
+    serial_print_sv("\n")
     return 0
 
 # ============================================================================
@@ -1123,12 +1111,12 @@ fn load_boot_options_from_fs(root_file: u64) -> i32
     var file: u64 = 0
     let st_open: u64 = (root.open as EfiFn5)(root_file, @file as u64, @boot_options_path[0] as u64, EFI_FILE_MODE_READ, 0)
     if st_open != EFI_SUCCESS
-        prints("    No \\harland\\net-selftest (network self-tests off)\n")
+        serial_print_sv("    No \\harland\\net-selftest (network self-tests off)\n")
         return 1
     let f: *EfiFile = file as *EfiFile
     (f.close as EfiFn1)(file)
     boot_flags = boot_flags | HARLAND_BOOT_FLAG_NET_SELFTEST
-    prints("    Boot option \\harland\\net-selftest: network self-tests on\n")
+    serial_print_sv("    Boot option \\harland\\net-selftest: network self-tests on\n")
 
     # AGAST #1851: a second, independent file asks for the peer-ping window.
     # Only the EC2 acceptance image writes it, so the QEMU NIC gate's boot is
@@ -1137,12 +1125,12 @@ fn load_boot_options_from_fs(root_file: u64) -> i32
     file = 0
     let st_peer: u64 = (root.open as EfiFn5)(root_file, @file as u64, @boot_options_path[0] as u64, EFI_FILE_MODE_READ, 0)
     if st_peer != EFI_SUCCESS
-        prints("    No \\harland\\net-responder (no peer-ping window)\n")
+        serial_print_sv("    No \\harland\\net-responder (no peer-ping window)\n")
         return 0
     let pf: *EfiFile = file as *EfiFile
     (pf.close as EfiFn1)(file)
     boot_flags = boot_flags | HARLAND_BOOT_FLAG_NET_RESPONDER
-    prints("    Boot option \\harland\\net-responder: peer-ping window on\n")
+    serial_print_sv("    Boot option \\harland\\net-responder: peer-ping window on\n")
     return 0
 
 # A marker file on the boot volume sets one boot flag; only its existence
@@ -1165,9 +1153,9 @@ fn load_marker_option(root_file: u64, path: StrView, flag: u32) -> bool
 # (tools/test_tier1_boot.sh) writes both and checks what the kernel logs.
 fn load_test_options(root_file: u64)
     if load_marker_option(root_file, "\\harland\\klog-dump", HARLAND_BOOT_FLAG_KLOG_DUMP)
-        prints("    Boot option \\harland\\klog-dump: ring buffer dump before init\n")
+        serial_print_sv("    Boot option \\harland\\klog-dump: ring buffer dump before init\n")
     if load_marker_option(root_file, "\\harland\\boot-test", HARLAND_BOOT_FLAG_BOOT_TEST)
-        prints("    Boot option \\harland\\boot-test: kernel self-tests before init\n")
+        serial_print_sv("    Boot option \\harland\\boot-test: kernel self-tests before init\n")
 
 # ============================================================================
 # ELF Loading
@@ -1192,7 +1180,7 @@ fn elf_find_symbol(elf_data: *u8, name: *u8) -> u64
 
     # Need section headers to find symbol table
     if elf.e_shoff == 0 || elf.e_shnum == 0
-        prints("    No section headers\n")
+        serial_print_sv("    No section headers\n")
         return 0
 
     var symtab_offset: u64 = 0
@@ -1221,7 +1209,7 @@ fn elf_find_symbol(elf_data: *u8, name: *u8) -> u64
         i = i + 1
 
     if symtab_offset == 0
-        prints("    No symbol table found\n")
+        serial_print_sv("    No symbol table found\n")
         return 0
 
     # Search for the symbol
@@ -1242,10 +1230,10 @@ fn elf_find_symbol(elf_data: *u8, name: *u8) -> u64
     return 0
 
 fn parse_and_load_elf() -> i32
-    prints("  Parsing ELF kernel...\n")
+    serial_print_sv("  Parsing ELF kernel...\n")
 
     if kernel_buffer == 0 as *u8
-        prints("    ERROR: No kernel loaded\n")
+        serial_print_sv("    ERROR: No kernel loaded\n")
         return -1
 
     let elf: *Elf64Ehdr = kernel_buffer as *Elf64Ehdr
@@ -1253,31 +1241,31 @@ fn parse_and_load_elf() -> i32
     # Check ELF magic
     let magic: u32 = *(kernel_buffer as *u32)
     if magic != ELF_MAGIC
-        prints("    ERROR: Invalid ELF magic: ")
+        serial_print_sv("    ERROR: Invalid ELF magic: ")
         print_hex_prefix(magic as u64)
-        prints("\n")
+        serial_print_sv("\n")
         return -1
 
-    prints("    Valid ELF header\n")
-    prints("    ELF entry point: ")
+    serial_print_sv("    Valid ELF header\n")
+    serial_print_sv("    ELF entry point: ")
     print_hex_prefix(elf.e_entry)
-    prints("\n")
-    prints("    Program headers: ")
+    serial_print_sv("\n")
+    serial_print_sv("    Program headers: ")
     serial_print_udec(elf.e_phnum as u64)
-    prints(" at offset ")
+    serial_print_sv(" at offset ")
     print_hex_prefix(elf.e_phoff)
-    prints("\n")
+    serial_print_sv("\n")
 
     # Find kernel_main in the symbol table
     # This is proper 64-bit code we can jump to directly from UEFI
     kernel_entry = elf_find_symbol(kernel_buffer, c"kernel_main")
     if kernel_entry == 0
-        prints("    ERROR: kernel_main symbol not found!\n")
+        serial_print_sv("    ERROR: kernel_main symbol not found!\n")
         return -1
 
-    prints("    kernel_main found at: ")
+    serial_print_sv("    kernel_main found at: ")
     print_hex_prefix(kernel_entry)
-    prints("\n")
+    serial_print_sv("\n")
 
     # Process program headers and load segments
     var i: u16 = 0
@@ -1286,15 +1274,15 @@ fn parse_and_load_elf() -> i32
         let ph: *Elf64Phdr = (kernel_buffer + ph_offset) as *Elf64Phdr
 
         if ph.p_type == PT_LOAD
-            prints("    LOAD segment: vaddr=")
+            serial_print_sv("    LOAD segment: vaddr=")
             print_hex_prefix(ph.p_vaddr)
-            prints(" paddr=")
+            serial_print_sv(" paddr=")
             print_hex_prefix(ph.p_paddr)
-            prints(" filesz=")
+            serial_print_sv(" filesz=")
             serial_print_udec(ph.p_filesz)
-            prints(" memsz=")
+            serial_print_sv(" memsz=")
             serial_print_udec(ph.p_memsz)
-            prints("\n")
+            serial_print_sv("\n")
 
             # Copy segment to physical address
             let src: *u8 = kernel_buffer + ph.p_offset
@@ -1313,7 +1301,7 @@ fn parse_and_load_elf() -> i32
 
         i = i + 1
 
-    prints("    ELF segments loaded\n")
+    serial_print_sv("    ELF segments loaded\n")
     return 0
 
 # ============================================================================
@@ -1321,9 +1309,9 @@ fn parse_and_load_elf() -> i32
 # ============================================================================
 
 fn jump_to_kernel() -> i32
-    prints("\n========================================\n")
-    prints("  Jumping to kernel at higher-half!\n")
-    prints("========================================\n\n")
+    serial_print_sv("\n========================================\n")
+    serial_print_sv("  Jumping to kernel at higher-half!\n")
+    serial_print_sv("========================================\n\n")
 
     # Use ELF entry point if kernel was loaded from filesystem
     # Otherwise fall back to default (for testing bootloader alone)
@@ -1336,20 +1324,20 @@ fn jump_to_kernel() -> i32
     # or a physical address (flat/legacy kernel that needs translation)
     if kernel_virt < KERNEL_VIRT_BASE
         # Legacy flat kernel - convert physical to virtual
-        prints("  Kernel entry (physical): ")
+        serial_print_sv("  Kernel entry (physical): ")
         print_hex_prefix(kernel_virt)
-        prints("\n")
+        serial_print_sv("\n")
         kernel_virt = KERNEL_VIRT_BASE + kernel_virt
 
-    prints("  Kernel entry (virtual):  ")
+    serial_print_sv("  Kernel entry (virtual):  ")
     print_hex_prefix(kernel_virt)
-    prints("\n")
+    serial_print_sv("\n")
 
     # Pass HarlandBootInfo address to kernel
     let boot_info_addr: u64 = @boot_info as u64
-    prints("  BootInfo at:     ")
+    serial_print_sv("  BootInfo at:     ")
     print_hex_prefix(boot_info_addr)
-    prints("\n")
+    serial_print_sv("\n")
 
     # Jump to kernel with System V calling convention (RDI = boot_info)
     # The kernel uses System V, but we've been using MS x64 (Windows target)
@@ -1368,25 +1356,25 @@ fn jump_to_kernel() -> i32
 # Since we compile for Windows target, our function receives these correctly
 pub fn efi_main(image_handle: u64, system_table: *EfiSystemTable) -> u64
     serial_init()
-    prints("\n")
-    prints("========================================\n")
-    prints("    Harland UEFI Bootloader\n")
-    prints("========================================\n")
-    prints("\n")
+    serial_print_sv("\n")
+    serial_print_sv("========================================\n")
+    serial_print_sv("    Harland UEFI Bootloader\n")
+    serial_print_sv("========================================\n")
+    serial_print_sv("\n")
     g_image_handle = image_handle
     g_system_table = system_table
     g_boot_services = system_table.boot_services
-    prints("UEFI handles saved:\n")
-    prints("  ImageHandle:   ")
+    serial_print_sv("UEFI handles saved:\n")
+    serial_print_sv("  ImageHandle:   ")
     print_hex_prefix(image_handle)
-    prints("\n")
-    prints("  SystemTable:   ")
+    serial_print_sv("\n")
+    serial_print_sv("  SystemTable:   ")
     print_hex_prefix(system_table as u64)
-    prints("\n")
-    prints("  BootServices:  ")
+    serial_print_sv("\n")
+    serial_print_sv("  BootServices:  ")
     print_hex_prefix(g_boot_services as u64)
-    prints("\n\n")
-    prints("Initialization:\n")
+    serial_print_sv("\n\n")
+    serial_print_sv("Initialization:\n")
 
     # Find ACPI RSDP from UEFI configuration table (must happen before ExitBootServices)
     find_rsdp_from_uefi()
@@ -1397,35 +1385,35 @@ pub fn efi_main(image_handle: u64, system_table: *EfiSystemTable) -> u64
 
     # Load kernel from filesystem (must happen before ExitBootServices)
     if load_kernel_from_fs() != 0
-        prints("  WARNING: Kernel not found on filesystem\n")
-        prints("  (Bootloader test mode - no kernel to load)\n")
+        serial_print_sv("  WARNING: Kernel not found on filesystem\n")
+        serial_print_sv("  (Bootloader test mode - no kernel to load)\n")
     else
         if parse_and_load_elf() != 0
-            prints("FATAL: Failed to parse/load kernel ELF\n")
+            serial_print_sv("FATAL: Failed to parse/load kernel ELF\n")
             return 1
 
     if get_memory_map() != 0
-        prints("FATAL: Failed to get memory map\n")
+        serial_print_sv("FATAL: Failed to get memory map\n")
         return 1
     if allocate_page_tables() != 0
-        prints("FATAL: Failed to allocate page tables\n")
+        serial_print_sv("FATAL: Failed to allocate page tables\n")
         return 1
     if setup_page_tables() != 0
-        prints("FATAL: Failed to set up page tables\n")
+        serial_print_sv("FATAL: Failed to set up page tables\n")
         return 1
 
     # Get final memory map (needed for ExitBootServices and HarlandBootInfo)
     if get_memory_map() != 0
-        prints("FATAL: Failed to get final memory map\n")
+        serial_print_sv("FATAL: Failed to get final memory map\n")
         return 1
 
     # Build HarlandBootInfo structure with memory map and RSDP
     build_boot_info()
 
-    prints("\n  Exiting boot services...\n")
+    serial_print_sv("\n  Exiting boot services...\n")
     let status: u64 = efi_exit_boot_services(memory_map_key)
     if status != EFI_SUCCESS
-        prints("    WARNING: ExitBootServices failed, retrying...\n")
+        serial_print_sv("    WARNING: ExitBootServices failed, retrying...\n")
         memory_map_size = 16384
         let map_ptr2: *u8 = @memory_map_buffer[0]
         let s2: u64 = efi_get_memory_map(@memory_map_size, map_ptr2, @memory_map_key, @memory_map_desc_size, @memory_map_desc_version)
@@ -1434,9 +1422,9 @@ pub fn efi_main(image_handle: u64, system_table: *EfiSystemTable) -> u64
             build_boot_info()
             let s3: u64 = efi_exit_boot_services(memory_map_key)
             if s3 != EFI_SUCCESS
-                prints("    FATAL: ExitBootServices failed twice!\n")
+                serial_print_sv("    FATAL: ExitBootServices failed twice!\n")
                 return 1
-    prints("    Boot services exited successfully\n")
+    serial_print_sv("    Boot services exited successfully\n")
     load_page_tables()
     jump_to_kernel()
     return 0
