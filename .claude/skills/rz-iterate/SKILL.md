@@ -392,6 +392,11 @@ reap, or teardown step expects (2026-11-20).
 `95-adele-harness.conf`), and don't put `model=` on a host `SPAWN`. Every
 room's `~/.config/adele/rooms/<room>/room.env` **must** have
 `CLAUDE_CONFIG_DIR=/home/aaron/.claude-bettercomp` (check it after spawn).
+`adele room spawn` writes a `room.env` without it and starts the unit at
+once, so the first turn would run on `~/.claude`. On huburght the shared
+`~/.config/adele/adele.env` also carries it, so every room starts on the right config;
+on omegalisk (whose `adele.env` serves non-ritz rooms too) append it to
+`room.env` and restart the unit before the briefing (#4548, 2026-11-23).
 Stale DeepSeek pins live in three places, and any one of them keeps a room
 on DeepSeek or crashes it with `[claude-code:unrecognized_model]
 {"model":"deepseek-flash"}`: `ADELE_HARNESS`/`ADELE_MODEL` lines in
