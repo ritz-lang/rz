@@ -4651,13 +4651,14 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 self.builder.store(ir.Constant(self.i1, 0), flag)
 
     def _drop_loop_scopes(self) -> None:
-        """break / continue: drop the scopes opened inside the innermost loop."""
+        """break / continue: drop the scopes and temporaries opened inside the
+        innermost loop, innermost first as `return` does: an arm binding
+        declared after a pending temporary drops before it (AGAST #4387,
+        #4592)."""
         tdepth = self._loop_temp_depth[-1] if self._loop_temp_depth else len(self._temp_frames)
-        for frame in reversed(self._temp_frames[tdepth:]):
-            self._drop_temp_frame(frame)
         depth = self._loop_drop_depth[-1] if self._loop_drop_depth else len(self.drop_scope_stack)
-        for scope in reversed(self.drop_scope_stack[depth:]):
-            self._emit_drop_for_scope(scope)
+        self._drop_innermost_first(self.drop_scope_stack[depth:],
+                                   self._temp_frames[tdepth:])
 
     def _register_drop_variable(self, name: str, alloca: ir.AllocaInstr, ritz_type: rast.Type):
         """Register a variable that may need Drop when its scope ends.
@@ -5375,10 +5376,19 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         Args:
             exclude_var: Variable name to exclude from dropping (for return moves)
         """
+        self._drop_innermost_first(self.drop_scope_stack, self._temp_frames,
+                                   exclude_var)
+
+    def _drop_innermost_first(self, scopes, frames,
+                              exclude_var: Optional[str] = None) -> None:
+        """Drop `scopes`' bindings and `defer`s and `frames`' pending
+        temporaries together, newest first by registration sequence (§13.6,
+        AGAST #4304): used by `return` (every scope) and `break` / `continue`
+        (the scopes inside the loop, AGAST #4592)."""
         entries = [(seq, name, alloca, ritz_type, False)
-                   for scope in self.drop_scope_stack
+                   for scope in scopes
                    for name, alloca, ritz_type, seq in scope]
-        for frame in self._temp_frames:
+        for frame in frames:
             entries.extend((seq, "tmp", slot, ty, True) for slot, _flag, ty, seq in frame)
         for _seq, name, alloca, ritz_type, is_temp in sorted(entries, key=lambda e: -e[0]):
             if is_temp:
@@ -7952,6 +7962,25 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
 
         return None
 
+    def _emit_loop_body_tail(self, tail: Optional[rast.Expr]) -> None:
+        """A `while` / `for` body's trailing expression, if the body reaches
+        it.  Its value is discarded (AGAST #3749) and, like a statement's,
+        its temporaries drop at its end, once per iteration (§13.6): left in
+        the loop statement's frame, each slot dropped once, after the loop,
+        and an arm's call leaked on every other iteration (AGAST #4592)."""
+        if self.builder.block.is_terminated or tail is None:
+            return
+        self._temp_frames.append([])
+        try:
+            if isinstance(tail, rast.If):
+                self._emit_if(tail)
+            else:
+                self._emit_expr(tail)
+        finally:
+            frame = self._temp_frames.pop()
+        if frame and not self.builder.block.is_terminated:
+            self._drop_temp_frame(frame)
+
     def _emit_while(self, stmt: rast.WhileStmt) -> None:
         """Emit a while loop."""
         cond_block = self.current_fn.append_basic_block("while.cond")
@@ -7983,12 +8012,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if result is True:
                 break
 
-        # Handle trailing expression in while body (if any)
-        if not self.builder.block.is_terminated and stmt.body.expr:
-            if isinstance(stmt.body.expr, rast.If):
-                self._emit_if(stmt.body.expr)
-            else:
-                self._emit_expr(stmt.body.expr)
+        self._emit_loop_body_tail(stmt.body.expr)
         self._leave_drop_scope()
 
         if not self.builder.block.is_terminated:
@@ -8115,12 +8139,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if result is True:
                 break
 
-        # Handle trailing expression in for body (if any)
-        if not self.builder.block.is_terminated and stmt.body.expr:
-            if isinstance(stmt.body.expr, rast.If):
-                self._emit_if(stmt.body.expr)
-            else:
-                self._emit_expr(stmt.body.expr)
+        self._emit_loop_body_tail(stmt.body.expr)
         self._leave_drop_scope()
 
         # Jump to increment if not terminated
@@ -8330,11 +8349,7 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if result is True:
                 break
 
-        if not self.builder.block.is_terminated and stmt.body.expr:
-            if isinstance(stmt.body.expr, rast.If):
-                self._emit_if(stmt.body.expr)
-            else:
-                self._emit_expr(stmt.body.expr)
+        self._emit_loop_body_tail(stmt.body.expr)
         self._leave_drop_scope()
 
         if not self.builder.block.is_terminated:

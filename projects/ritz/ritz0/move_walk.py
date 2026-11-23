@@ -351,7 +351,9 @@ class MoveWalk:
             # The condition runs at the loop head, on every iteration.
             self._check_expr(stmt.cond, is_move_context=False)
             self._push_scope()
-            done = self._check_block(stmt.body)
+            # A loop body is never a value: its last line is discarded
+            # (AGAST #3749), so an arm's call there is a temporary (#4592).
+            done = self._check_block(stmt.body, value_used=False)
             self._pop_scope()
             return done
         self._check_loop(iteration)
@@ -378,7 +380,8 @@ class MoveWalk:
             # Loop variable is defined fresh each iteration
             # For range-based for loops, the variable is i64 (Copy type)
             self.scope.define(stmt.var, rast.NamedType(stmt.span, 'i64', []), stmt.span)
-            done = self._check_block(stmt.body)
+            # Discarded, as a `while` body's (#4592).
+            done = self._check_block(stmt.body, value_used=False)
             self._pop_scope()
             return done
         self._check_loop(iteration)
