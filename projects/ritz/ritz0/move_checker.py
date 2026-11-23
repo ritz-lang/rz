@@ -1151,6 +1151,14 @@ class MoveChecker(MoveWalk):
         payload) tells the emitter the arm, not the scrutinee, owns it."""
         arm.takes_payload = False
         pattern = arm.pattern
+        if self._binds_scrutinee(pattern, scrut_ty):
+            # `other => ...` binds the scrutinee itself (AGAST #4602): the
+            # binding takes it, so moving it out drops it once.
+            info = self.scope.vars.get(pattern.name)
+            if info is not None:
+                info.ritz_type = scrut_ty
+                arm.takes_payload = True
+            return
         if not isinstance(pattern, rast.VariantPattern):
             return
         fields = self._variant_fields(scrut_ty, pattern.name)
@@ -1162,6 +1170,19 @@ class MoveChecker(MoveWalk):
                 if info is not None:
                     info.ritz_type = fty
                     arm.takes_payload = True
+
+    def _binds_scrutinee(self, pattern: rast.Pattern, scrut_ty: rast.Type) -> bool:
+        """Whether an arm's pattern is a bare name that binds the enum
+        scrutinee of type `scrut_ty` (§8.2, AGAST #4596): a name that isn't
+        one of its variants, as the emitter's `binds_scrutinee` decides."""
+        if not isinstance(pattern, rast.IdentPattern):
+            return False
+        ty = self.types.resolve(scrut_ty)
+        if not isinstance(ty, rast.NamedType):
+            return False
+        if ty.name not in self.types.enums and ty.name not in ('Option', 'Result'):
+            return False
+        return self._variant_fields(ty, pattern.name) is None
 
     def _lent_scrutinee_type(self, scrut: rast.Expr) -> Optional[rast.Type]:
         """The type of a match scrutinee that something else owns, or None:
@@ -1184,8 +1205,15 @@ class MoveChecker(MoveWalk):
         """An arm of a match that owns nothing: its payload bindings are
         copies of a value the scrutinee's owner still drops, so a move-only
         one is lent like a `name:& T` parameter: it reads, and a by-value
-        move out of it is refused (AGAST #2178, Rust's E0507)."""
+        move out of it is refused (AGAST #2178, Rust's E0507). So is a
+        bare-name arm's copy of the scrutinee (AGAST #4602)."""
         pattern = arm.pattern
+        if self._binds_scrutinee(pattern, scrut_ty):
+            info = self.scope.vars.get(pattern.name)
+            if info is not None:
+                info.ritz_type = scrut_ty
+                info.borrow = rast.Borrow.MUTABLE
+            return
         if not isinstance(pattern, rast.VariantPattern):
             return
         fields = self._variant_fields(scrut_ty, pattern.name)

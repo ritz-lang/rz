@@ -2828,20 +2828,61 @@ fn oc_match_payload(sm: *Sema, arm: *MatchArm, name_sv: StrView)
         return
     if o.match_scrut == OC_MATCH_LENT
         if oc_move_only(sm, StrView { ptr: (pname), len: (plen) as i64 }) == 1
-            if o.lent_count >= o.lent_cap
-                let cap: i32 = o.lent_cap * 2
-                o.lent_vi = realloc(o.lent_vi as *u8, (cap as i64) * 4) as *i32
-                o.lent_name = realloc(o.lent_name as *u8, (cap as i64) * 8) as **u8
-                o.lent_cap = cap
-            let lvi: *i32 = o.lent_vi
-            let lname: **u8 = o.lent_name
-            let v: *SemaVar = @sm.scope[vi]
-            lvi[o.lent_count] = vi
-            lname[o.lent_count] = v.name
-            o.lent_count = o.lent_count + 1
+            oc_lend(sm, vi)
         return
     if oc_move_only(sm, StrView { ptr: (pname), len: (plen) as i64 }) == 1
         oc_register_as(sm, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (pname), len: (plen) as i64 }, 0)
+
+# A non-owning match lent the binding `vi`, a copy of the owner's value
+# (AGAST #2178): oc_lent_payload refuses moving it.
+fn oc_lend(sm: *Sema, vi: i32)
+    let o: *OcState = oc()
+    if o.lent_count >= o.lent_cap
+        let cap: i32 = o.lent_cap * 2
+        o.lent_vi = realloc(o.lent_vi as *u8, (cap as i64) * 4) as *i32
+        o.lent_name = realloc(o.lent_name as *u8, (cap as i64) * 8) as **u8
+        o.lent_cap = cap
+    let lvi: *i32 = o.lent_vi
+    let lname: **u8 = o.lent_name
+    let v: *SemaVar = @sm.scope[vi]
+    lvi[o.lent_count] = vi
+    lname[o.lent_count] = v.name
+    o.lent_count = o.lent_count + 1
+
+# AGAST #4602: a bare-name arm bound the enum scrutinee itself (#4596; ast_query's
+# arm_binds_enum_value).  Of a move-only scrutinee the match owns, the binding takes
+# it, as a payload binding takes its payload; when the match owns nothing it
+# is a copy of the owner's value, so it is lent.  ritz0's twin is
+# MoveChecker._binds_scrutinee.
+fn oc_scrut_binding(sm: *Sema, arm: *MatchArm, scrut: *Expr)
+    let o: *OcState = oc()
+    if scrut == null or arm.pattern_kind != PAT_IDENT
+        return
+    if o.match_scrut < 0 and o.match_scrut != OC_MATCH_LENT
+        return
+    var len: i32 = 0
+    var name: *u8 = null
+    if o.match_scrut >= 0
+        let sb: *OcBind = oc_live_at(o, o.match_scrut)
+        name = sb.type_name
+        len = sb.type_name_len
+    else
+        var typed: *Expr = scrut
+        if scrut.kind == ExprKind.Unary and (scrut.op == OpKind.Addr or scrut.op == OpKind.AddrMut) and scrut.operand != null
+            typed = scrut.operand
+        name = oc_scrut_enum(sm, typed, @len)
+    if name == null or oc_move_only(sm, StrView { ptr: (name), len: (len) as i64 }) == 0
+        return
+    if arm_binds_enum_value(arm, StrView { ptr: (name), len: (len) as i64 }) == 0
+        return
+    let bound: StrView = StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }
+    let vi: i32 = oc_var_index(sm, bound)
+    if vi < 0
+        return
+    if o.match_scrut == OC_MATCH_LENT
+        oc_lend(sm, vi)
+    else
+        oc_register_as(sm, bound, StrView { ptr: (name), len: (len) as i64 }, 0)
 
 # After the arms have met: forget the scrutinee where no arm took it, and
 # restore the enclosing match's state.
@@ -3190,6 +3231,7 @@ fn oc_replay_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
             arm_select_bind(arm, 0)
         else if arm.pattern_kind == PAT_IDENT
             sema_bind(sm, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+            oc_scrut_binding(sm, arm, scrut)
         oc_replay_list(sm, arm.body_stmts)
         oc_arm_value(sm, arm, 0)
         oc_replay_expr(sm, arm.body)
@@ -3476,6 +3518,12 @@ pub fn own_check_arm_bound(sm: *Sema, arm: *MatchArm)
     if oc_muted() == 1
         return
     oc_arm_bound(sm, arm)
+
+# AGAST #4602: the bare-name arm that just bound the enum scrutinee.
+pub fn own_check_arm_binds_scrut(sm: *Sema, arm: *MatchArm, scrut: *Expr)
+    if oc_muted() == 1
+        return
+    oc_scrut_binding(sm, arm, scrut)
 
 pub fn own_check_arm_value(sm: *Sema, arm: *MatchArm, discard: i32)
     if oc_muted() == 1

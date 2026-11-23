@@ -113,6 +113,13 @@ enum Slot
 
 """
 
+# A by-value parameter of a move-only enum: it drops the enum (AGAST #4602).
+EAT_SLOT = """\
+fn eat(s: Slot) -> i32
+    return 0
+
+"""
+
 # A move-only enum carrying a move-only enum (AGAST #3329).
 NESTED_SLOT = """\
 enum Nest
@@ -2094,6 +2101,63 @@ pub fn main() -> i32
     return inner + DROPS
 """, 12, {}),
 
+    # AGAST #4602: a bare-name arm binds the scrutinee itself (#4596), so
+    # it takes it like a payload binding takes its payload: the binding
+    # drops it once, at the end of its arm unless it moved on.
+    "match_binding_arm_drops": (SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    match s
+        Empty => pass
+        other => pass
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
+    "match_binding_arm_into_call": (SLOT + EAT_SLOT + """\
+fn f() -> i32
+    var s = Slot.Full(make(1))
+    match s
+        Empty => pass
+        other => eat(other)
+    return DROPS * 10
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
+    "match_binding_arm_returned": (SLOT + EAT_SLOT + """\
+fn pick() -> Slot
+    let s = Slot.Full(make(1))
+    match s
+        Empty => return Slot.Empty
+        other => return other
+
+pub fn main() -> i32
+    let got = pick()
+    let before = DROPS
+    eat(got)
+    return before * 10 + DROPS
+""", 1, {}),
+
+    # As a value: the arm's result is the binding, moved out once.
+    "match_binding_arm_value": (SLOT + EAT_SLOT + """\
+fn f() -> i32
+    let s = Slot.Full(make(1))
+    let n = match s
+        Empty => 7
+        other => eat(other)
+    return DROPS * 10 + n
+
+pub fn main() -> i32
+    let inner = f()
+    return inner + DROPS
+""", 11, {}),
+
     # AGAST #2177 from here on (ritz1's cases from #2174, now shared).
     # A match moves its scrutinee (ritz0's rule), and the match
     # owns it.  A payload binding takes the payload and drops at the end of
@@ -3145,6 +3209,20 @@ fn g(s:& Flagged) -> i32
         Has(f) => return take_flag(f)
         _ => return 0
 """ + TAIL, 18, 36),
+    # AGAST #4602: a bare-name arm under a match that owns nothing binds a
+    # copy of the owner's enum, so it is lent like a payload binding.
+    "pointer_match_binding_arm_into_call": (SLOT + EAT_SLOT + """\
+fn g(p: *Slot) -> i32
+    match *p
+        Empty => return 0
+        other => return eat(other)
+""" + TAIL, 11, 29),
+    "lent_param_match_binding_arm_returned": (SLOT + """\
+fn g(s:& Slot) -> Slot
+    match s
+        Empty => return Slot.Empty
+        other => return other
+""" + TAIL, 8, 25),
 }
 
 # AGAST #3329: a nested payload pattern (`Has(Full(x))`) under a match that

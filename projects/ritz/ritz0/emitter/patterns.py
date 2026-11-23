@@ -891,8 +891,13 @@ class PatternEmitter:
             binds_scrutinee = (isinstance(pattern, rast.IdentPattern)
                                and not self._has_enum_variant(enum_name, pattern.name))
             if binds_scrutinee:
-                self.params[pattern.name] = (self.builder.load(enum_alloca), enum_type)
+                scrut_val = self.builder.load(enum_alloca)
+                self.params[pattern.name] = (scrut_val, enum_type)
                 self.ritz_types[pattern.name] = rast.NamedType(None, enum_name, [])
+                if scrut_flag is not None and takes:
+                    # The binding took the scrutinee (its drop flag is
+                    # clear): it drops it once, unless moved (AGAST #4602).
+                    self._register_let_drop(pattern.name, scrut_val, expr.owns_scrutinee)
 
             # Emit the arm body
             # A `return` inside one arm must not leak has_returned past
