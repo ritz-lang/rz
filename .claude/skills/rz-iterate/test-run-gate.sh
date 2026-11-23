@@ -633,6 +633,47 @@ l22="$(RZ_GATE_CMD='exit 0' gate "$V22" t22k)"
 check '[[ -e "$V22/.gate-log-name" ]]' "a tracked .gate-log-name is left alone"
 check 'clean22' "and the tracked worktree stays unchanged"
 
+# 23. A venv that doesn't match the commit's requirements.lock (AGAST #4583)
+# is a SETUP ERROR, not a test failure: the command never runs.  The fake
+# venv's python3 is the real one with a site dir of hand-made dist-infos: a
+# pin installed under its other spelling (rzfake_a), one at the wrong version
+# (rzfake-b), one missing (rzfake-missing), one right (rzfake-c).
+fakedist() {   # fakedist <site> <name> <version>
+    mkdir -p "$1/$2-$3.dist-info"
+    printf 'Metadata-Version: 2.1\nName: %s\nVersion: %s\n' "$2" "$3" > "$1/$2-$3.dist-info/METADATA"
+}
+realpy="$(command -v python3)"
+mkdir -p "$T/venv23/bin"
+printf '#!/bin/sh\nPYTHONPATH="%s" exec "%s" "$@"\n' "$T/site23" "$realpy" > "$T/venv23/bin/python3"
+chmod +x "$T/venv23/bin/python3"
+fakedist "$T/site23" rzfake_a 1.0; fakedist "$T/site23" rzfake-b 1.9; fakedist "$T/site23" rzfake-c 3.0
+V23="$T/wt23"
+git init -q "$V23"; mkdir -p "$V23/projects/ritz"
+printf '# a comment\nrzfake-a==1.0\nrzfake-b==2.0   # wrong version\n\nrzfake-missing==1.0\nrzfake-c==3.0\n' \
+    > "$V23/projects/ritz/requirements.lock"
+git -C "$V23" add -A; git -C "$V23" commit -qm lock
+rm -f "$RZ_TEST_ORDER.ran23"
+l23="$(PATH="$T/venv23/bin:$PATH" RZ_GATE_CMD='touch "$RZ_TEST_ORDER.ran23"' gate "$V23" t23)"
+gate --wait "$l23" > "$T/wait23" 2>&1; rc=$?
+check '[[ $rc -eq 2 ]]' "--wait exits 2 when the venv doesn't match the lock, got $rc"
+check 'grep -q "^SETUP ERROR: this host.s python3 ($T/venv23/bin/python3) does not match projects/ritz/requirements.lock" "$l23"' \
+    "the log says SETUP ERROR and names the python3"
+check 'grep -q "rzfake-b==2.0 (installed 1.9)" "$l23"' "it names the pin at the wrong version"
+check 'grep -q "rzfake-missing==1.0 (not installed)" "$l23"' "it names the missing pin"
+check '! grep -q "rzfake-a==\|rzfake-c==" "$l23"' "it names no pin that matches (rzfake_a is rzfake-a, PEP 503)"
+check 'grep -q "pip install -r projects/ritz/requirements.lock" "$l23"' "it says how to fix the venv"
+check 'grep -q "^SETUP ERROR: this host" "$T/wait23"' "--wait prints the SETUP ERROR line"
+check '[[ ! -e "$RZ_TEST_ORDER.ran23" ]]' "the command never ran on the stale venv"
+# Synced: the gate runs.
+rm -rf "$T/site23/rzfake-b-1.9.dist-info"; fakedist "$T/site23" rzfake-b 2.0; fakedist "$T/site23" rzfake_missing 1.0
+l23="$(PATH="$T/venv23/bin:$PATH" RZ_GATE_CMD='touch "$RZ_TEST_ORDER.ran23"' gate "$V23" t23)"
+check 'grep -qx EXIT=0 "$l23" && [[ -e "$RZ_TEST_ORDER.ran23" ]]' "a venv that matches the lock runs the command"
+# A commit with no lock (every gate above) checks nothing: the same stale
+# venv still runs a lockless tree.
+rm -rf "$T/site23/rzfake-b-2.0.dist-info"
+l23="$(PATH="$T/venv23/bin:$PATH" RZ_GATE_CMD='exit 0' gate "$W" t23n)"
+check 'grep -qx EXIT=0 "$l23" && ! grep -q "^SETUP ERROR" "$l23"' "a commit without requirements.lock checks nothing"
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1

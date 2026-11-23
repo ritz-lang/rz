@@ -587,7 +587,9 @@ you changed pass **in full** on that exact commit (step 6).
    reports `0 failed`, the budget-only verdict is terminal. Quote it as
    `EXIT=2 budget-only: <raw> / factor <f> = <norm> vs cap` and do not
    re-gate. A `test budget: no calibration` or `SETUP ERROR` line is a host
-   setup error: fix the machine and re-gate. 98 = no verdict, 99 = HEAD
+   setup error: fix the machine and re-gate (a stale venv's line names the
+   pins it misses; `python3 -m pip install -r projects/ritz/requirements.lock`
+   fixes it, #4583). 98 = no verdict, 99 = HEAD
    moved. One gate slot is shared machine-wide.
 
    Your room runs at CPUWeight=20 under a 5G memory cap (#1811), and your

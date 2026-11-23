@@ -144,6 +144,15 @@
 #     SETUP ERROR (exit 2) naming the dir, and the command never runs.  The
 #     log's header names the dir (TMPDIR=); the trap removes it with the
 #     checkout.  RZ_GATE_PROBE overrides the probe (tests).
+#   * a venv that matches the commit's projects/ritz/requirements.lock
+#     (AGAST #4583): #4360 pinned shellcheck-py, and every host whose venv
+#     had not been re-synced failed its tests, a red train for a host
+#     problem.  After the TMPDIR probe, the python3 on PATH (the one the
+#     command's make uses) must have every `==` pin installed at that
+#     version (rz_venv_drift, host-env.sh; names per PEP 503).  A miss is a
+#     SETUP ERROR (exit 2) listing each pin it missed and the pip line that
+#     fixes it, and the command never runs.  A commit with no lock checks
+#     nothing.  The rest of the closure is tools/python_deps.py's report.
 #   * no run-gate scratch in the worktree it tests (AGAST #4420): a caller
 #     kept the log's path in `.gate-log-name` at the worktree root so a later
 #     turn could --wait.  Untracked, it made `adele room rm` refuse the worktree
@@ -533,6 +542,10 @@ else
     if ! why="$(mkdir -p -m 700 "$RZ_TMPDIR" 2>&1 && "$RZ_PROBE" probe "$RZ_TMPDIR" 2>&1)"; then
         echo "SETUP ERROR: the gate's TMPDIR $RZ_TMPDIR can't run binaries (noexec?); not a test failure: $why" >> "$RZ_LOG"
         rc=2
+    # The venv against the commit's requirements.lock (AGAST #4583).
+    elif ! why="$(mapfile -t pins < <(rz_lock_pins "$RZ_TREE/projects/ritz/requirements.lock"); rz_venv_drift "${pins[@]}")"; then
+        echo "SETUP ERROR: this host's python3 ($(command -v python3 || echo none)) does not match projects/ritz/requirements.lock; not a test failure: $why.  Fix: python3 -m pip install -r projects/ritz/requirements.lock" >> "$RZ_LOG"
+        rc=2
     else
         (cd "$RZ_TREE" && TMPDIR="$RZ_TMPDIR" bash -c "$RZ_CMD") >> "$RZ_LOG" 2>&1
         rc=$?
@@ -563,7 +576,8 @@ echo "EXIT=$rc" >> "$RZ_LOG"
 EOF
 # By path, never as `bash -c "$INNER"` (AGAST #3567; see the header).
 SCRIPT="${LOG%.log}.unit.sh"
-printf '%s\n' "$INNER" > "$SCRIPT"
+# The lock check's helpers (host-env.sh) go first: the unit sources nothing.
+{ declare -f rz_lock_pins rz_venv_drift; printf '%s\n' "$INNER"; } > "$SCRIPT"
 
 systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --slice=ritz-gate.slice --property=CPUWeight=100 \

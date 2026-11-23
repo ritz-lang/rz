@@ -305,7 +305,9 @@ write_queue() {
 #                                  host's venv (rz_venv_path: a login shell's
 #                                  PATH has none, AGAST #4025), and start
 #                                  refuses before it takes a slot if that
-#                                  python3 can't import pytest
+#                                  python3 can't import pytest, or (after the
+#                                  checkout) if its venv misses a pin of the
+#                                  tip's requirements.lock (AGAST #4583)
 #   wait <wt> <gate|-> <log> <secs> <pause>
 #                                  run-gate.sh --wait for at most <secs>
 #                                  (124: still running).  A gate with no
@@ -320,8 +322,11 @@ write_queue() {
 #                                  re-poll can't spin
 #   cat <log>                      the log
 #   stop <name>                    stop the gate's unit, if it runs
-#   free                           how many more train gates the host can
-#                                  start now (rz_train_free; AGAST #4031)
+#   free [<pins...>]               how many more train gates the host can
+#                                  start now (rz_train_free; AGAST #4031), or
+#                                  "stale venv: <pins it misses>" if its venv
+#                                  doesn't have these name==version pins
+#                                  (rz_venv_drift; AGAST #4583)
 read -r -d '' REMOTE_SH <<'EOF' || true
 set -euo pipefail
 abs() { case "$1" in /*) echo "$1" ;; *) echo "$HOME/$1" ;; esac; }
@@ -368,6 +373,15 @@ main() {
         [ "$got" = "$5" ] || { echo "error: origin $4 is $got, not the train tip $5" >&2; exit 1; }
         if [ -e "$wt/.git" ]; then git -C "$wt" checkout -q -f --detach "$5"
         else git -C "$repo" worktree add -q --detach "$wt" "$5"; fi
+        # The venv against the tip's lock (AGAST #4583): `free` checked it
+        # for gate --next's pick; this catches a host named outright, or one
+        # whose venv changed since.
+        local pins why
+        mapfile -t pins < <(rz_lock_pins "$wt/projects/ritz/requirements.lock")
+        if ! why="$(rz_venv_drift "${pins[@]}")"; then
+            echo "error: $(hostname): stale venv: the gate's python3 ($(command -v python3)) does not match the train tip's requirements.lock: $why; no gate started (fix: python3 -m pip install -r projects/ritz/requirements.lock)" >&2
+            exit 1
+        fi
         RZ_GATE_TRAIN=1 RZ_GATE_BASE="$6" bash "$gate" "$wt" "$7" ;;
     wait)
         local rc=0 t0 s0 st why=""
@@ -396,7 +410,13 @@ main() {
         exit 98 ;;
     cat) cat "$1" ;;
     stop) systemctl --user stop "ritz-gate-$1" 2>/dev/null || true ;;
-    free) rz_train_free ;;
+    free)
+        # <pins...>: the train tip's lock (AGAST #4583).  A venv that misses
+        # one has no slot for that train: say why instead of a count.
+        local why
+        PATH="$(rz_venv_path "$PATH")"; export PATH
+        if ! why="$(rz_venv_drift "$@")"; then echo "stale venv: $why"; exit 0; fi
+        rz_train_free ;;
     *) echo "error: unknown verb $verb" >&2; exit 2 ;;
     esac
 }
@@ -409,7 +429,8 @@ remote() {
     local host="$1"; shift
     # shellcheck disable=SC2086  # $SSH is a command line
     $SSH "$host" "bash -l -s -- $(printf '%q ' "$@")" <<<"$(declare -f rz_venv_path \
-        rz_host_env_load rz_budget_scale_ok rz_gate_slots rz_train_free)
+        rz_host_env_load rz_budget_scale_ok rz_gate_slots rz_train_free \
+        rz_lock_pins rz_venv_drift)
 $REMOTE_SH"
 }
 
@@ -1102,14 +1123,19 @@ gate_next() {
 # This host is asked directly, the rest over ssh; an unreachable one is
 # skipped.  Says why on stderr for each host it passes over.  With `remote`,
 # this host is passed over too: train 1 prefers another host, and gates here
-# only as its fallback (AGAST #4422).
+# only as its fallback (AGAST #4422).  A host whose venv misses a pin of the
+# train's requirements.lock (rz_venv_drift; AGAST #4583) is passed over too,
+# "stale venv: <pins>": its gate would fail on the host, not the train.
 pick_train_host() {
-    local remote="${1:-}" h n
+    local remote="${1:-}" h n pins
+    mapfile -t pins < <(g show HEAD:projects/ritz/requirements.lock 2>/dev/null | rz_lock_pins -)
     for h in $HOSTS; do
         [[ -z "$remote" ]] || ! is_local "$h" || continue
-        if is_local "$h"; then n="$(rz_train_free "$GATES" 2>/dev/null)" || n=""
-        else n="$(remote "$h" free 2>/dev/null | tail -1)" || n=""; fi
+        if ! is_local "$h"; then n="$(remote "$h" free "${pins[@]}" 2>/dev/null | tail -1)" || n=""
+        elif ! n="stale venv: $(PATH="$(rz_venv_path "$PATH")" rz_venv_drift "${pins[@]}")"; then :
+        else n="$(rz_train_free "$GATES" 2>/dev/null)" || n=""; fi
         if [[ "$n" =~ ^[0-9]+$ && $n -gt 0 ]]; then echo "$h"; return 0; fi
+        if [[ "$n" == "stale venv: "* ]]; then echo "note: $h: $n" >&2; continue; fi
         echo "note: $h: ${n:+no free train slot}${n:-unreachable}" >&2
     done
     return 1

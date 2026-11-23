@@ -519,7 +519,7 @@ fi
 # PATH: /etc/profile resets it, so no venv on it (AGAST #4025).
 # Each host has its own gate dir, and its own host.env if the test wrote one
 # (AGAST #4031: `free` reads them).
-export RZ_GATE_DIR="$RZ_TEST_DIR/gates-$host"
+export RZ_GATE_DIR="$RZ_TEST_DIR/gates-$host" RZ_TEST_HOST="$host"
 if [[ -e "$RZ_TEST_DIR/host-$host.env" ]]; then
     unset RZ_GATE_SLOTS RZ_TRAIN_SLOTS; export RZ_HOST_ENV="$RZ_TEST_DIR/host-$host.env"
 fi
@@ -527,11 +527,18 @@ HOME="$RZ_TEST_DIR/rhome" PATH="$RZ_TEST_DIR/rbin:/usr/local/bin:/usr/bin:/bin" 
 EOF
 chmod +x "$T/bin/fakessh"
 # The remote host's gate venv: a python3 whose `import pytest` works unless
-# no-pytest exists.
+# no-pytest exists.  Any other -c runs the real python3, with the host's
+# rsite-<host> on its path if there is one: hand-made dist-infos for the
+# requirements.lock check (AGAST #4583).
 mkdir -p "$T/rhome/dev/.venv/bin"
-cat > "$T/rhome/dev/.venv/bin/python3" <<'EOF'
+cat > "$T/rhome/dev/.venv/bin/python3" <<EOF
 #!/bin/sh
-[ -e "$RZ_TEST_DIR/no-pytest" ] && { echo "No module named pytest" >&2; exit 1; }
+[ -e "\$RZ_TEST_DIR/no-pytest" ] && { echo "No module named pytest" >&2; exit 1; }
+[ "\$1 \$2" = "-c import pytest" ] && exit 0
+if [ "\$1" = -c ]; then
+    [ -d "\$RZ_TEST_DIR/rsite-\$RZ_TEST_HOST" ] && export PYTHONPATH="\$RZ_TEST_DIR/rsite-\$RZ_TEST_HOST"
+    exec "$(command -v python3)" "\$@"
+fi
 exit 0
 EOF
 chmod +x "$T/rhome/dev/.venv/bin/python3"
@@ -1706,4 +1713,57 @@ has "$out" "^MERGED +rz7 ${rz7:0:12} as ${rz7:0:12}" "the room's log lands its o
 rm -f "$RES"
 
 unset RZ_TRAIN_DEBOUNCE; export RZ_TRAIN_MAX=8
+
+# 21. A host whose venv misses a pin of the train tip's requirements.lock is
+# a skipped host, not a red train (AGAST #4583).  hostx's venv has rzfake-b
+# at the wrong version and no rzfake-missing; hosty's matches (rzfake_a is
+# rzfake-a, PEP 503).  This host's real python3 has none of them.
+fakedist() {   # fakedist <site> <name> <version>
+    mkdir -p "$1/$2-$3.dist-info"
+    printf 'Metadata-Version: 2.1\nName: %s\nVersion: %s\n' "$2" "$3" > "$1/$2-$3.dist-info/METADATA"
+}
+fakedist "$T/rsite-hostx" rzfake-a 1.0; fakedist "$T/rsite-hostx" rzfake-b 1.9
+fakedist "$T/rsite-hosty" rzfake_a 1.0; fakedist "$T/rsite-hosty" rzfake-b 2.0; fakedist "$T/rsite-hosty" rzfake-missing 1.0
+rm -f "$T"/host-host[xy].env; export RZ_TRAIN_HOSTS="localbox hostx hosty"
+fetch; git -C "$M" checkout -q main
+lk="$(room vl1 projects/ritz/requirements.lock "$(printf '# pins\nrzfake-a==1.0\nrzfake-b==2.0  # x\n\nrzfake-missing==1.0')")"
+v2="$(room vl2 s/vl2 X)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build "vl1:$lk" "vl2:$v2" >"$T/out21" 2>&1 \
+    || { bad "section 21's train builds"; sed 's/^/     | /' "$T/out21"; bash "$TR" show | sed 's/^/     | /'; }
+tv="$(tipn 1)"
+l21="$(bash "$TR" gate --next 2>"$T/err")"
+[[ "$(specof | cut -d' ' -f1)" == hosty ]] && ok "gate --next skips a host whose venv misses a lock pin" \
+    || { bad "gate --next skips a host whose venv misses a lock pin (spec: $(specof))"; sed 's/^/     | /' "$T/err"; }
+has "$(cat "$T/err")" "^note: hostx: stale venv: rzfake-b==2.0 \(installed 1.9\) rzfake-missing==1.0 \(not installed\)$" \
+    "it names the host and every pin it misses"
+has "$(sed -n 's/^hostx bash -l -s -- free //p' "$T/ssh-log" | tail -1)" "^rzfake-a==1.0 rzfake-b==2.0 rzfake-missing==1.0 *$" \
+    "free is sent the train tip's pins, comments dropped"
+bash "$TR" discard >/dev/null 2>&1
+# A host named outright: start checks out the tip, then refuses.  (hosty's
+# gate above wrote the fake gate's log for this tip.)
+rm -f "$T/gate-${tv:0:12}.log"
+out="$(bash "$TR" gate --next hostx 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "stale venv: .*does not match the train tip.s requirements.lock: rzfake-b==2.0 \(installed 1.9\)" \
+    "start refuses a named host whose venv misses a pin" \
+    || bad "start refuses a named host whose venv misses a pin (rc=$rc)"
+has "$out" "pip install -r projects/ritz/requirements.lock" "the refusal says how to fix the venv"
+[[ ! -e "$T/gate-${tv:0:12}.log" && -z "$(specof)" && -z "$(oref "${tv:0:12}")" ]] \
+    && ok "the stale-venv refusal starts no gate and leaves no SPEC or ref" \
+    || bad "the stale-venv refusal starts no gate and leaves no SPEC or ref"
+# Every remote host stale: train 1 falls back here, after saying why.
+rm -rf "$T/rsite-hosty/rzfake-b-2.0.dist-info"
+l21="$(bash "$TR" gate --next 2>"$T/err")"; rc=$?
+grep -q "^note: hostx: stale venv" "$T/err" && grep -q "^note: hosty: stale venv: rzfake-b==2.0 (not installed)" "$T/err" \
+    && ok "each stale host is passed over by name" || { bad "each stale host is passed over by name"; sed 's/^/     | /' "$T/err"; }
+[[ $rc -eq 0 && "$l21" != *@* ]] && ok "with no host left, train 1 gates here" \
+    || bad "with no host left, train 1 gates here (rc=$rc, '$l21')"
+# Train 2 may gate here too: this host's own venv is checked as well, so a
+# stale one here is passed over like any other (hosty synced again).
+fakedist "$T/rsite-hosty" rzfake-b 2.0
+v3="$(room vl3 s/vl3 X "$(tipn 1)")"; fetch; git -C "$M" checkout -q main
+bash "$TR" build --next "vl3:$v3" >/dev/null 2>&1
+l21="$(bash "$TR" gate --next 2>"$T/err")"
+[[ "$(specof | cut -d' ' -f1)" == hosty ]] && grep -q "^note: localbox: stale venv: rzfake-a==1.0 (not installed)" "$T/err" \
+    && ok "a stale venv on this host is passed over too" \
+    || { bad "a stale venv on this host is passed over too (spec: $(specof))"; sed 's/^/     | /' "$T/err"; }
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

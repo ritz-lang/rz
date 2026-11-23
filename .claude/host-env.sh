@@ -193,3 +193,50 @@ rz_train_free() {
     fi
     echo $((free > waiting ? free - waiting : 0))
 }
+
+# rz_lock_pins <requirements.lock | ->: its `name==version` pins, one per line,
+# comments, blanks and markers dropped.  Nothing (and success) for a file that
+# does not exist: a commit from before the lock pins nothing (AGAST #4583).
+rz_lock_pins() {
+    [[ "$1" == - || -f "$1" ]] || return 0
+    sed -e 's/#.*//' -e 's/;.*//' -e 's/[[:space:]]//g' "$1" | grep '==' || true
+}
+
+# rz_venv_drift <name==version>...: does the python3 on PATH have exactly
+# these pins installed (AGAST #4583)?  Exit 0 if so, else 1 with one line on
+# stdout naming every pin it misses, e.g. "llvmlite==0.50.0 (installed
+# 0.49.0) shellcheck-py==0.11.0.1 (not installed)", so the host can be fixed
+# with one `pip install -r projects/ritz/requirements.lock`.  Names compare as PEP 503
+# says (shellcheck_py is shellcheck-py); versions compare as strings, as the
+# lock's are what pip installs.  A python3 that can't run says so (exit 1).
+# Only the pins: tools/python_deps.py reports the rest of the closure.
+# No pins: exit 0 without starting python.  Self-contained: train.sh sends it
+# to the gate hosts with `declare -f`.
+rz_venv_drift() {
+    [[ $# -gt 0 ]] || return 0
+    local out rc=0
+    out="$(python3 -c '
+import importlib.metadata as md, re, sys
+norm = lambda s: re.sub(r"[-_.]+", "-", s).lower()
+have = {}
+for d in md.distributions():
+    n = d.metadata["Name"]
+    if n:
+        have.setdefault(norm(n), d.version)
+bad = []
+for pin in sys.argv[1:]:
+    name, _, want = pin.partition("==")
+    got = have.get(norm(name))
+    if got is None:
+        bad.append("%s (not installed)" % pin)
+    elif got != want:
+        bad.append("%s (installed %s)" % (pin, got))
+print(" ".join(bad))
+sys.exit(1 if bad else 0)
+' "$@" 2>&1)" || rc=$?
+    if [[ $rc -ne 0 && -z "$out" ]]; then
+        out="python3 ($(command -v python3 || echo none)) did not run (exit $rc)"
+    fi
+    [[ -z "$out" ]] || echo "$out"
+    return $(( rc == 0 ? 0 : 1 ))
+}
