@@ -6,7 +6,7 @@
 # Memory layout at 0x8000:
 #   0x8000 - 0x8FFF: Trampoline code
 #   0x8FF0: PML4 address (u32)
-#   0x8FF8: Stack pointer (u64)
+#   0x8FF8: Stack pointer (u64); the AP takes it with xchg, leaving 0
 #   0x9000: Entry point (u64)
 #
 # The BSP writes these values before sending SIPI.
@@ -111,8 +111,14 @@ ap_lm64:
     movw %ax, %gs
     movw %ax, %ss
 
-    # Load stack from fixed location
-    movq (AP_TRAMPOLINE_BASE + AP_STACK_OFFSET), %rsp
+    # Take the stack from its fixed location, emptying the slot (xchg with
+    # memory is locked), so no two CPUs ever share a stack. An empty slot
+    # means the BSP gave up on this boot (or another AP took the stack):
+    # halt here, touching nothing (AGAST #4140).
+    xorq %rsp, %rsp
+    xchgq %rsp, (AP_TRAMPOLINE_BASE + AP_STACK_OFFSET)
+    testq %rsp, %rsp
+    jz ap_halt
 
     # Load entry point and call it
     movq (AP_TRAMPOLINE_BASE + AP_ENTRY_OFFSET), %rax

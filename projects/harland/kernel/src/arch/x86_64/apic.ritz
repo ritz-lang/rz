@@ -23,7 +23,7 @@ import mm.pmm { Mb2BootInfo }
 import boot_abi.handoff { HarlandBootInfo }
 import mm.vmm { vmm_pml4_phys, vmm_map_mmio }
 import drivers.acpi.tables { acpi_init_with_mb, acpi_init_from_bootinfo, local_apic_addr, io_apic_addr }
-import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_index_of_apic_id, cpu_map_mark_started, cpu_map_started, cpu_map_needs_x2apic }
+import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_map_mark_started, cpu_map_started, cpu_map_needs_x2apic, cpu_map_boot_begin, cpu_map_boot_claim, cpu_map_boot_abandon }
 import arch.x86_64.idt { idt_load_current }
 import arch.x86_64.percpu { cpu_bringup, cpu_boot_stack_top, cpu_stack_alloc }
 import arch.x86_64.cpu_smp { smp_ap_run }
@@ -729,6 +729,10 @@ pub fn get_ap_stack_top(cpu_idx: i32) -> u64
 
 # Trampoline code location (must be in low memory, <1MB)
 const AP_TRAMPOLINE_ADDR: u64 = 0x8000
+# The trampoline's stack slot (ap_trampoline.s: AP_TRAMPOLINE_BASE +
+# AP_STACK_OFFSET). An AP takes its stack with an xchg that empties the
+# slot, so no two CPUs ever run on one stack (#4140).
+const AP_STACK_SLOT: u64 = 0x8FF8
 
 # External symbols from ap_trampoline.s
 extern var ap_trampoline_start: u8
@@ -772,6 +776,15 @@ fn lapic_send_ipi(dest_apic: u32, vector: u8, delivery_mode: u8) -> i32
 pub fn lapic_send_fixed_ipi(dest_apic: u32, vector: u8) -> i32
     return lapic_send_ipi(dest_apic, vector, IPI_DELIVERY_FIXED)
 
+# Park this CPU for good: interrupts off, halt forever. An AP whose boot the
+# BSP abandoned (or never opened) ends here, touching nothing shared (#4140).
+fn ap_park()
+    asm x86_64:
+        cli
+    while true
+        asm x86_64:
+            hlt
+
 # AP entry point (called by ap_trampoline.s after transition to long mode)
 pub fn ap_entry() -> i32
     # Follow the BSP into x2APIC mode before touching our LAPIC
@@ -785,6 +798,17 @@ pub fn ap_entry() -> i32
 
     # Get our APIC ID
     let my_apic_id: u32 = lapic_id()
+
+    # Claim the boot the BSP opened for this CPU, before touching anything
+    # shared. It fails if the BSP already gave up on us (printed TIMEOUT and
+    # moved on), never opened one (an APIC ID the MADT did not list), or we
+    # already claimed it: then park, rather than run on per-CPU state the
+    # BSP has written off (#4140). The claim's index is this CPU's index:
+    # per-CPU state (GS area, TSS, IDT, SYSCALL MSRs and its own guard-paged
+    # stacks) is indexed by it, never by the APIC ID.
+    let my_index: i32 = cpu_map_boot_claim(my_apic_id)
+    if my_index < 0
+        ap_park()
 
     # Initialize our local APIC, as lapic_init does on the BSP. The timer is
     # masked: the scheduler tick runs on the BSP only (#4192).
@@ -801,20 +825,10 @@ pub fn ap_entry() -> i32
     # so no TSS is needed (#4220).
     idt_load_current()
 
-    # This CPU's index: per-CPU state (GS area, TSS, IDT, SYSCALL MSRs and
-    # its own guard-paged stacks) is indexed by it, never by the APIC ID.
-    let my_index: i32 = cpu_index_of_apic_id(my_apic_id)
-
     # Print message (need mutex for serial, but for now just try)
     prints("    AP ")
     serial_print_dec(my_apic_id as u64)
     prints(" started!\n")
-
-    if my_index < 0
-        # An APIC ID the MADT did not list has no per-CPU state: halt it.
-        while true
-            asm x86_64:
-                hlt
 
     # Bring the CPU up before marking it started: ap_boot_all returns once
     # the flag is set, and the BSP's SMP syscall self-test then expects this
@@ -867,7 +881,7 @@ fn ap_setup_trampoline(stack_top: u64) -> i32
     *pml4_ptr = vmm_pml4_phys as u32
 
     # Stack pointer (64-bit at 0x8FF8)
-    let stack_ptr: *u64 = 0x8FF8 as *u64
+    let stack_ptr: *u64 = AP_STACK_SLOT as *u64
     # Stack top is the address of the END of the AP's stack (stacks grow down)
     *stack_ptr = stack_top
 
@@ -884,8 +898,9 @@ fn ap_boot_one(apic_id: u32, cpu_idx: i32, stack_top: u64) -> i32
     serial_print_dec(apic_id as u64)
     prints("...")
 
-    # Set up trampoline for this AP
+    # Set up trampoline for this AP, and open its boot for it to claim
     ap_setup_trampoline(stack_top)
+    cpu_map_boot_begin(cpu_idx)
 
     # Send INIT IPI
     lapic_send_ipi(apic_id, 0, IPI_DELIVERY_INIT)
@@ -910,6 +925,20 @@ fn ap_boot_one(apic_id: u32, cpu_idx: i32, stack_top: u64) -> i32
     let deadline: u64 = deadline_after_us(1000000)
     while cpu_map_started(cpu_idx) == 0 && not deadline_passed(deadline)
         cpu_pause()
+
+    # Out of time: give up on the AP, unless it already claimed its boot.
+    if cpu_map_started(cpu_idx) == 0
+        if cpu_map_boot_abandon(cpu_idx)
+            # It never claimed it: a late claim now fails and it parks. Take
+            # the stack back too, so an AP still in real mode finds the slot
+            # empty and halts in the trampoline.
+            atomic_xchg(AP_STACK_SLOT as *u64, 0)
+        else
+            # It claimed the boot and is running (cpu_bringup): it owns its
+            # stack and per-CPU state, so let it finish flagging started.
+            let late: u64 = deadline_after_us(1000000)
+            while cpu_map_started(cpu_idx) == 0 && not deadline_passed(late)
+                cpu_pause()
 
     if cpu_map_started(cpu_idx) != 0
         prints(" OK\n")

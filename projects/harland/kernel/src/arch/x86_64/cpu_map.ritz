@@ -23,6 +23,17 @@ pub var cpu_apic_ids: [64]u32
 # Per-CPU "AP has started" flags, set by the AP itself (ap_entry).
 var cpu_started: [64]u8
 
+# Per-CPU AP boot handshake (AGAST #4140). The BSP opens a CPU's boot before
+# INIT (BOOT_OPEN); the AP claims it first thing in ap_entry (OPEN ->
+# CLAIMED); a BSP that times out abandons it (OPEN -> ABANDONED). Both moves
+# are one compare-and-swap on the same byte, so exactly one side wins: an AP
+# that starts after the BSP gave up finds its boot abandoned and parks.
+const BOOT_CLOSED: u8 = 0
+const BOOT_OPEN: u8 = 1
+const BOOT_CLAIMED: u8 = 2
+const BOOT_ABANDONED: u8 = 3
+var cpu_boot_state: [64]u8
+
 # MADT entry types that describe a CPU (ACPI 6.5, 5.2.12.2 and 5.2.12.12).
 const MADT_TYPE_LOCAL_APIC: u8 = 0      # 8 bytes: type, len, uid, apic_id(u8), flags(u32)
 const MADT_TYPE_LOCAL_X2APIC: u8 = 9    # 16 bytes: type, len, rsvd(2), x2apic_id(u32), flags(u32), uid(u32)
@@ -36,6 +47,7 @@ pub fn cpu_map_reset() -> i32
     while i < MAX_CPUS
         cpu_apic_ids[i] = 0
         cpu_started[i] = 0
+        cpu_boot_state[i] = BOOT_CLOSED
         i = i + 1
     return 0
 
@@ -46,6 +58,7 @@ pub fn cpu_map_add(apic_id: u32) -> i32
     let idx: i32 = num_cpus as i32
     cpu_apic_ids[idx] = apic_id
     cpu_started[idx] = 0
+    cpu_boot_state[idx] = BOOT_CLOSED
     num_cpus = num_cpus + 1
     return idx
 
@@ -115,3 +128,32 @@ pub fn cpu_map_started(cpu_idx: i32) -> i32
     if cpu_idx < 0 or cpu_idx >= MAX_CPUS
         return 0
     return atomic_load(@cpu_started[cpu_idx] as *u8) as i32
+
+# BSP, before it sends INIT: open this CPU's boot for its AP to claim.
+# Returns 0, or -1 for an index outside the table.
+pub fn cpu_map_boot_begin(cpu_idx: i32) -> i32
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return -1
+    atomic_store(@cpu_boot_state[cpu_idx] as *u8, BOOT_OPEN)
+    return 0
+
+# AP, first thing in ap_entry: claim the boot the BSP opened for this APIC ID.
+# Returns the CPU index if this AP may run; -1 if its boot was never opened,
+# was already claimed, or the BSP abandoned it (the caller parks).
+pub fn cpu_map_boot_claim(apic_id: u32) -> i32
+    let idx: i32 = cpu_index_of_apic_id(apic_id)
+    if idx < 0
+        return -1
+    let was: u8 = atomic_cmpxchg(@cpu_boot_state[idx] as *u8, BOOT_OPEN, BOOT_CLAIMED)
+    if was != BOOT_OPEN
+        return -1
+    return idx
+
+# BSP, when its wait for the AP runs out: abandon the boot. True if the AP
+# had not claimed it (a late claim now fails, so the AP parks); false if
+# the AP already claimed it and is running (wait for it to flag started).
+pub fn cpu_map_boot_abandon(cpu_idx: i32) -> bool
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return false
+    let was: u8 = atomic_cmpxchg(@cpu_boot_state[cpu_idx] as *u8, BOOT_OPEN, BOOT_ABANDONED)
+    return was == BOOT_OPEN

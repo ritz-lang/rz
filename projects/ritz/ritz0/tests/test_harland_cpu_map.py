@@ -152,6 +152,32 @@ fn main() -> i32
     *(b + 17) = 12                    # a type 9 entry shorter than 16 bytes
     if cpu_map_add_madt_entry(b) != -1 or cpu_map_add_madt_entry(b + 16) != -1 or num_cpus != 3
         return 25
+
+    # AP boot handshake (#4140): the BSP opens a CPU's boot, the AP claims it
+    # first thing in ap_entry, and a BSP that gives up takes it back, so an
+    # AP that starts late finds its boot abandoned and parks.
+    cpu_map_reset()
+    cpu_map_add(0)
+    cpu_map_add(256)
+    cpu_map_add(5)
+    if cpu_map_boot_claim(256) != -1
+        return 26
+    if cpu_map_boot_begin(1) != 0 or cpu_map_boot_claim(256) != 1
+        return 27
+    if cpu_map_boot_claim(256) != -1
+        return 28
+    if cpu_map_boot_abandon(1)
+        return 29
+    if cpu_map_boot_begin(2) != 0 or not cpu_map_boot_abandon(2) or cpu_map_boot_claim(5) != -1
+        return 30
+    if cpu_map_boot_claim(77) != -1 or cpu_map_boot_begin(-1) != -1 or cpu_map_boot_begin(64) != -1 or cpu_map_boot_abandon(64)
+        return 31
+    cpu_map_boot_begin(1)
+    cpu_map_reset()
+    cpu_map_add(0)
+    cpu_map_add(256)
+    if cpu_map_boot_claim(256) != -1
+        return 32
     0
 """
 
@@ -164,7 +190,11 @@ CLAIMS = {1: "MAX_CPUS is 64", 2: "reset empties the table", 3: "add returns CPU
           16: "32-bit x2APIC ID kept whole", 17: "an ID > 255 needs x2APIC", 18: "IDs <= 255 don't",
           19: "MADT type 0 CPU recorded", 20: "MADT type 9 CPU recorded", 21: "online-capable type 9 recorded",
           22: "disabled CPUs skipped", 23: "a CPU in both type 0 and 9 keeps one index",
-          24: "non-CPU entry ignored", 25: "short entries ignored"}
+          24: "non-CPU entry ignored", 25: "short entries ignored",
+          26: "an AP whose boot was never opened can't claim it", 27: "opened boot -> claim returns the index",
+          28: "a boot is claimed once", 29: "abandon after the AP claimed -> false (it runs)",
+          30: "abandoned boot -> the late AP's claim fails", 31: "unknown APIC ID / bad index refused",
+          32: "reset closes open boots"}
 
 
 @pytest.mark.integration
@@ -239,7 +269,7 @@ def test_per_cpu_arrays_are_max_cpus_long():
     (sched/mod.ritz's cpu_sched was one; #1882 deleted the unused scheduler.)"""
     n = _max_cpus()
     assert n > 16, "MAX_CPUS still 16: CPUs past 16 are dropped"
-    for path, names in ((CPU_MAP, ("cpu_apic_ids", "cpu_started")),
+    for path, names in ((CPU_MAP, ("cpu_apic_ids", "cpu_started", "cpu_boot_state")),
                         (APIC, ("ap_stack_tops",)),
                         (PERCPU, ("cpu_stack_bases",))):
         code = _code(path)
