@@ -5768,18 +5768,26 @@ fn if_stmt_arm_ptr_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: *u8) -> 
 #
 # AGAST #3421: the `if`'s float slot (`float_hint`, 0 if none) reaches an
 # `if` / `match` ending the arm, as a match arm's does (#2092).
-fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: TypeKind, discarded: i32, float_hint: TypeKind)
+#
+# AGAST #4590: `moves` == 1 when the `if`'s value is read (it has an `else`
+# and is not discarded): the arm's trailing expression then moves out
+# (own_mark_if_arm_moves), as a match arm's does.
+fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: TypeKind, discarded: i32, float_hint: TypeKind, moves: i32)
     let saved: *Stmt = s.if_arm_value
+    let saved_moves: *Stmt = own_mark_if_arm_moves(null)
     var st: *Stmt = list
     while st != null
         if st.next == null and st.kind == StmtKind.Expr
             s.if_arm_value = st
+            if moves == 1
+                own_mark_if_arm_moves(st)
         if st.next == null and discarded == 1
             s.if_stmt_discarded = st
         if st.next == null and discarded == 0 and stmt_is_if_or_match(st) == 1
             s.match_float_hint = float_hint
         emit_stmt(s, st, ret_type)
         s.if_arm_value = saved
+        own_mark_if_arm_moves(saved_moves)
         if st.kind == StmtKind.Return
             begin_block(s, next_label(s))
             clear_last_expr(s)
@@ -6062,6 +6070,10 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
             emit_assert_stmt(s, stmt)
         StmtKind.If =>
             let discarded: i32 = if_stmt_is_discarded(s, stmt)   # AGAST #3749
+            # AGAST #4590: a value-giving `if` moves its arms' values out.
+            var arm_moves: i32 = 0
+            if discarded == 0 and stmt.if_else != null
+                arm_moves = 1
             # AGAST #3421: the float slot the value lands in (a `-> f64` fn's
             # tail), taken before the condition so a match there can't see it.
             # The arms settle against it (if_stmt_arm_float_settle).
@@ -6109,7 +6121,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
             clear_last_expr(s)  # Reset before then branch
             # AGAST #2158: each arm is a block for drops.
             own_push_scope(s)
-            emit_if_stmt_arm(s, stmt.if_then, ret_type, discarded, fr.hint_ty)
+            emit_if_stmt_arm(s, stmt.if_then, ret_type, discarded, fr.hint_ty, arm_moves)
             # AGAST #2559: the arm value's struct type, while its bindings resolve.
             var then_agg: *u8 = null
             var then_agg_len: i32 = 0
@@ -6142,7 +6154,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
                 begin_block(s, else_label)
                 clear_last_expr(s)  # Reset before else branch
                 own_push_scope(s)
-                emit_if_stmt_arm(s, stmt.if_else, ret_type, discarded, fr.hint_ty)
+                emit_if_stmt_arm(s, stmt.if_else, ret_type, discarded, fr.hint_ty, arm_moves)
                 if_stmt_arm_agg(s, stmt.if_else, @else_agg, @else_agg_len)
                 own_pop_scope(s)
                 else_result = last_expr_here(s)  # Capture else branch result
