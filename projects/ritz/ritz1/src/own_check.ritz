@@ -1378,6 +1378,31 @@ fn oc_check_ref_receiver(sm: *Sema, e: *Expr)
         let at: *Expr = own_start_of(e)
         oc_error_move_out(sm, at.span.line, at.span.col)
 
+# `.unwrap()` moves a move-only Some/Ok payload out of its carrier, so the
+# carrier is moved too (AGAST #4490; ritz0's MoveWalk._intrinsic_consumes_receiver).
+# A copy payload keeps the old borrowing behaviour. A borrowed receiver is
+# refused and not consumed: the payload already has an owner.
+fn oc_note_unwrap(sm: *Sema, e: *Expr, rmv: *i32)
+    if e.ident_len != 6 or e.args != null
+        return
+    if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap"), len: (6) as i64 }) == 0
+        return
+    if e.left == null
+        return
+    var t: SemaTy
+    sema_expr_ty(sm, e.left, @t)
+    if t.name == null or t.name_len <= 0 or is_tagged_enum_type(StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 0
+        return
+    var pay_len: i32 = 0
+    let pay: *u8 = tagged_enum_arg_in(@sm.struct_map, sm.module, StrView { ptr: (t.name), len: (t.name_len) as i64 }, 0, @pay_len)
+    if pay == null or pay_len <= 0 or oc_move_only(sm, StrView { ptr: (pay), len: (pay_len) as i64 }) == 0
+        return
+    if oc_through(sm, e.left) == 1 or ref_is_pointer(t.kind) == 1
+        oc_error_move_out(sm, e.left.span.line, e.left.span.col)
+        *rmv = 0
+        return
+    *rmv = 1
+
 # A scrutinee moves into its match, unless a reference holds it, or it is an
 # array's element (#2268): that's a read.
 fn oc_scrutinee_mv(sm: *Sema, e: *Expr) -> i32
@@ -1682,6 +1707,8 @@ fn oc_walk(sm: *Sema, e: *Expr, mv: i32)
             rmv = 1
         if taken != null and param_self_is_value(taken.params) == 1
             rmv = 1
+        # `.unwrap()` of a move-only Option/Result consumes the carrier (#4490).
+        oc_note_unwrap(sm, e, @rmv)
         oc_check_ref_receiver(sm, e)
         oc_walk(sm, e.left, rmv)
         var mp: *Param = null
