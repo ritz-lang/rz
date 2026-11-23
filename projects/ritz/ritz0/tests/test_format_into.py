@@ -11,9 +11,11 @@ THE FEATURE (LANGUAGE_SPEC "Formatting into a buffer")
     format_into(sink, "  %{r} = trunc i64 %{v} to {ty}\\n")
 
 takes the same literal, placeholder grammar and `{{` / `}}` escapes as print,
-and appends each piece to `sink` through `sink.push_bytes(data: *u8, len: i64)`,
-resolved statically like any method call. `String`, `GrowBuf` and `Vec<u8>`
-provide it; so can any user type. Unsigned integers format as unsigned.
+and appends each piece to `sink` through `sink.push_bytes(data: Span<u8>)`,
+resolved statically like any method call. `String`, `GrowBuf` and `Writer`
+provide it; `Vec<u8>.push_bytes` still takes `(data: *u8, len: i64)` (#4537
+moved that method into the impl and left the raw pair).
+A user type can too. Unsigned integers format as unsigned.
 
 ORACLE
 
@@ -196,8 +198,8 @@ struct Counter
     calls: i64
 
 impl Counter
-    fn push_bytes(self: @&Counter, data: *u8, len: i64) -> i32
-        self.bytes = self.bytes + len
+    fn push_bytes(self: @&Counter, data: Span<u8>) -> i32
+        self.bytes = self.bytes + data.len
         self.calls = self.calls + 1
         return 0
 

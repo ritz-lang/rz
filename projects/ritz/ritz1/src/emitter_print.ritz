@@ -1774,10 +1774,11 @@ pub fn emit_assert_helpers(s: *EmitterState)
 #
 # The literal is split exactly as print's (emit_interp_literal), and every
 # piece -- literal text or a formatted value -- is appended with one call to
-# `sink.push_bytes(data: *u8, len: i64)`, resolved like a method call on the
-# sink's struct: a UFCS helper (string_push_bytes, vec_push_bytes$u8) or an
-# impl method (e.g. GrowBuf.push_bytes). ritz0's _emit_format_into is the
-# oracle.
+# `sink.push_bytes(data: Span<u8>)`, resolved like a method call on the
+# sink's struct (e.g. GrowBuf.push_bytes). Vec<u8>.push_bytes, the impl
+# method #4537 moved off `vec_push_bytes`, still takes `(data, len)`, and
+# that shape is still accepted.
+# ritz0's _emit_format_into is the oracle.
 #
 # A value is formatted into a stack buffer by @__ritz_fmt_int /
 # @__ritz_fmt_strlen (emit_format_helpers), not print's write helpers. print
@@ -1788,7 +1789,7 @@ struct FmtSink
     recv: i32          # register holding the sink as a `ptr`
     callee: *u8        # IR name of push_bytes (no `@`)
     callee_len: i32
-    fn_def: *FnDef     # its params (self, data, len) and return type
+    fn_def: *FnDef     # its params and return type
 
 # Report a format_into error at `at`, naming `name` (may be null) before
 # `msg`. Counts like emit_print_error.
@@ -1861,9 +1862,77 @@ fn fmt_emit_ret_type(s: *EmitterState, fd: *FnDef)
     else
         emit_str(s, c"i64")
 
+# 1 when push_bytes takes `(self, data: Span<u8>)` (AGAST #4555).
+fn fmt_sink_is_span(fd: *FnDef) -> i32
+    if fd == null or fd.params == null
+        return 0
+    let p: *Param = fd.params.next
+    if p == null or p.next != null
+        return 0
+    if param_is_span(p) == 0
+        return 0
+    return name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 })
+
+# 1 when push_bytes still takes `(self, data, len: i64)`. Vec<u8> does:
+# #4537 moved the method into the impl and left this signature.
+fn fmt_sink_is_raw(fd: *FnDef) -> i32
+    if fd == null or fd.params == null or fd.params.next == null
+        return 0
+    let last: *Param = fd.params.next.next
+    if last == null or last.next != null
+        return 0
+    return (last.param_type == TYPE_I64) as i32
+
+# push_bytes(sink, Span<u8> { ptr: data, len }). `data` is a `ptr` register;
+# the length is the register len_reg when it is > 0, else the constant len_imm.
+fn fmt_push_span(s: *EmitterState, k: *FmtSink, data: i32, len_reg: i32, len_imm: i64)
+    let p2: *Param = k.fn_def.params.next
+    let sv1: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, sv1)
+    emit_str(s, c" = insertvalue ")
+    emit_param_llvm_type(s, p2)
+    emit_str(s, c" undef, ptr ")
+    emit_reg(s, data)
+    emit_str(s, IR_COMMA_0)
+    let sv2: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, sv2)
+    emit_str(s, c" = insertvalue ")
+    emit_param_llvm_type(s, p2)
+    emit_str(s, c" ")
+    emit_reg(s, sv1)
+    emit_str(s, IR_I64_SEP)
+    if len_reg > 0
+        emit_reg(s, len_reg)
+    else
+        emit_int(s, len_imm)
+    emit_str(s, IR_COMMA_1)
+    if k.fn_def.return_type == TYPE_VOID
+        emit_str(s, c"  call void @")
+    else
+        let r: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, r)
+        emit_str(s, IR_CALL)
+        fmt_emit_ret_type(s, k.fn_def)
+        emit_str(s, c" @")
+    emit_name(s, StrView { ptr: (k.callee), len: (k.callee_len) as i64 })
+    emit_str(s, c"(ptr ")
+    emit_reg(s, k.recv)
+    emit_str(s, IR_COMMA)
+    emit_param_llvm_type(s, p2)
+    emit_str(s, IR_SP)
+    emit_reg(s, sv2)
+    emit_str(s, IR_CLOSE)
+
 # push_bytes(sink, data, len). `data` is a `ptr` register; the length is the
-# register len_reg when it is > 0, else the constant len_imm.
+# register len_reg when it is > 0, else the constant len_imm. A Span sink
+# is built and passed as one argument; the raw pair remains for Vec<u8>.
 fn fmt_push(s: *EmitterState, k: *FmtSink, data: i32, len_reg: i32, len_imm: i64)
+    if fmt_sink_is_span(k.fn_def) == 1
+        fmt_push_span(s, k, data, len_reg, len_imm)
+        return
     let p2: *Param = k.fn_def.params.next
     let p3: *Param = p2.next
     var d: i32 = data
@@ -2100,7 +2169,7 @@ pub fn emit_format_into(s: *EmitterState, e: *Expr) -> i32
     var tn_len: i32 = 0
     let tn: *u8 = fmt_sink_struct(s, sink, @tn_len)
     if tn == null
-        fmt_error(s, e, StrView { ptr: (null), len: (0) as i64 }, c"the sink is not a pointer to a struct with a push_bytes(data: *u8, len: i64) method to append through")
+        fmt_error(s, e, StrView { ptr: (null), len: (0) as i64 }, c"the sink is not a pointer to a struct with a push_bytes(data: Span<u8>) method to append through")
         return emit_print_zero(s)
 
     # push_bytes, in emit_expr_method's order: a specialised generic impl
@@ -2128,15 +2197,10 @@ pub fn emit_format_into(s: *EmitterState, e: *Expr) -> i32
             if fd.is_local == 0
                 add_method_extern(s, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (c"push_bytes"), len: (10) as i64 })
     if fd == null
-        fmt_error(s, e, StrView { ptr: (tn), len: (tn_len) as i64 }, c"has no push_bytes(data: *u8, len: i64) method to append through")
+        fmt_error(s, e, StrView { ptr: (tn), len: (tn_len) as i64 }, c"has no push_bytes(data: Span<u8>) method to append through")
         return emit_print_zero(s)
-    var np: i32 = 0
-    var pp: *Param = fd.params
-    while pp != null
-        np = np + 1
-        pp = pp.next
-    if np != 3 or fd.params.next.next.param_type != TYPE_I64
-        fmt_error(s, e, StrView { ptr: (tn), len: (tn_len) as i64 }, c"push_bytes must take (self, data: *u8, len: i64) to be a format_into sink")
+    if fmt_sink_is_span(fd) == 0 and fmt_sink_is_raw(fd) == 0
+        fmt_error(s, e, StrView { ptr: (tn), len: (tn_len) as i64 }, c"push_bytes must take (self, data: Span<u8>) to be a format_into sink")
         return emit_print_zero(s)
 
     let v: i32 = emit_expr(s, sink)

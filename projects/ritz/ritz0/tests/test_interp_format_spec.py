@@ -53,12 +53,12 @@ struct Sink
     sum: i64
 
 impl Sink
-    fn push_bytes(self: @&Sink, data: *u8, len: i64) -> i32
+    fn push_bytes(self: @&Sink, data: Span<u8>) -> i32
         var i: i64 = 0
-        while i < len
-            self.sum = self.sum + (*(data + i)) as i64
+        while i < data.len
+            self.sum = self.sum + (*(data.ptr + i)) as i64
             i = i + 1
-        self.bytes = self.bytes + len
+        self.bytes = self.bytes + data.len
         return 0
 
 """

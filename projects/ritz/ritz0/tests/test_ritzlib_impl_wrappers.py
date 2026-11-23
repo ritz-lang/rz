@@ -72,8 +72,9 @@ STRING_METHODS = STRING_STATIC | {
 }
 
 
-# Methods whose raw (ptr, len) shape is the print-sink protocol.
-PROTOCOL_METHODS = {"push_bytes"}
+# push_bytes used to keep a raw (ptr, len) for the print sink. AGAST #4555
+# made that sink a Span<u8>. Nothing in impl String is exempt from the
+# ordinary param check anymore.
 
 
 def _impl_methods(path: Path, type_name: str) -> dict:
@@ -112,12 +113,12 @@ def test_impl_string_holds_each_method():
     for name, fn in sorted(methods.items()):
         assert fn.is_pub, f"String.{name} must be `pub` (#3418)"
         params = [p.name for p in fn.params]
-        if name in PROTOCOL_METHODS:
-            # The print-sink protocol (LANGUAGE_SPEC §2.6): the compiler emits
-            # `sink.push_bytes(data: *u8, len: i64)`, so this one keeps the
-            # raw (ptr, len) shape; `push_span` takes the Span.
-            assert params == ["self", "bytes", "len"], (
-                f"String.{name}: params {params!r}, want the protocol form")
+        if name == "push_bytes":
+            # format_into's sink (LANGUAGE_SPEC §2.6, AGAST #4555).
+            header = path.read_text().splitlines()[fn.span.line - 1]
+            assert params == ["self", "bytes"], (
+                f"String.{name}: params {params!r}, want (self, bytes)")
+            assert "Span<u8>" in header, header
             continue
         if name in STRING_STATIC:
             assert "self" not in params, f"String.{name} is a constructor"
@@ -149,7 +150,7 @@ fn main() -> i32
     s.push_str("yz")
     s.push_cstr(c"w")
     s.push_string(@a)
-    s.push_bytes(c"qq", 2)
+    s.push_bytes(Span<u8> { ptr: (c"qq"), len: (2) as i64 })
     s.push_i64(7)
     s.set_char(0, 'X')
     u.push_str("Hi")

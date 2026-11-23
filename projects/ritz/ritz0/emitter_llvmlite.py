@@ -6703,8 +6703,10 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
     #
     # The literal is split exactly as print's (the parser builds the same
     # InterpString), and every piece -- literal text or a formatted value --
-    # is appended with one call to `sink.push_bytes(data: *u8, len: i64)`,
+    # is appended with one call to `sink.push_bytes(data: Span<u8>)`,
     # resolved the way a method call on the sink's type would be.
+    # `Vec<u8>.push_bytes` (the impl method #4537 moved off `vec_push_bytes`)
+    # still takes `(data, len)`, and that shape is still accepted.
     #
     # A value is formatted into a stack buffer by two module-internal
     # helpers, @__ritz_fmt_int and @__ritz_fmt_strlen, which ritz1 defines
@@ -6767,17 +6769,32 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         if mangled is None or mangled not in self.functions:
             shown = type_name or str(sink.type.pointee)
             raise EmitError(
-                f"format_into: type '{shown}' has no push_bytes(data: *u8, len: i64) "
+                f"format_into: type '{shown}' has no push_bytes(data: Span<u8>) "
                 f"method to append through", span)
-        fn, _ = self.functions[mangled]
+        fn, fn_def = self.functions[mangled]
+        params = list(fn_def.params)
         ptys = self._fn_param_types(fn)
-        if len(ptys) != 3:
+        # Span is the protocol (AGAST #4555). The 3-arg form remains for
+        # Vec<u8>.push_bytes, which #4537 moved into the impl and left raw.
+        span_sink = len(params) == 2 and self._is_u8_span(params[1].type)
+        raw_sink = len(ptys) == 3 and ptys[2] == self.i64
+        if not span_sink and not raw_sink:
             raise EmitError(
-                f"format_into: '{mangled}' must take (self, data: *u8, len: i64) "
+                f"format_into: '{mangled}' must take (self, data: Span<u8>) "
                 f"to be a push_bytes sink", span)
         recv = sink if sink.type == ptys[0] else self.builder.bitcast(sink, ptys[0])
 
         def push(ptr, length):
+            if span_sink:
+                i8ptr = self.i8.as_pointer()
+                if ptr.type != i8ptr:
+                    ptr = self.builder.bitcast(ptr, i8ptr)
+                length = self._convert_type(length, self.i64)
+                agg = ir.Constant(ptys[1], ir.Undefined)
+                agg = self.builder.insert_value(agg, ptr, 0)
+                agg = self.builder.insert_value(agg, length, 1)
+                self.builder.call(fn, [recv, agg])
+                return
             if ptr.type != ptys[1]:
                 ptr = self.builder.bitcast(ptr, ptys[1])
             self.builder.call(fn, [recv, ptr, self._convert_type(length, ptys[2])])
