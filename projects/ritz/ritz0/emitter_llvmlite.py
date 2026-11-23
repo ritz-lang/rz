@@ -7780,7 +7780,14 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         target_type = None
         # The arms as they were before the merge converted them (#1444).
         pre_merge = (then_value, else_value)
-        if then_value is not None and else_value is not None:
+        # A discarded if whose arm has no value (AGAST #4450: a statement
+        # match ending the tail `else` of a procedure) merges nothing, so the
+        # arms' types are not compared: reading that arm's type was an error.
+        # Two valued arms are still compared when discarded, so a clash such
+        # as `if c then h() else q()` (f64 vs *u8) is still refused (#4199).
+        valueless_arm = has_no_value(then_value) or has_no_value(else_value)
+        if (then_value is not None and else_value is not None
+                and not (discard and valueless_arm)):
             if then_value.type != else_value.type:
                 # A float-annotated initialiser fixes the merge type (#2027):
                 # by size alone, i64 vs f64 kept the THEN type and `if c then

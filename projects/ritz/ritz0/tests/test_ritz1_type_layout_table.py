@@ -474,8 +474,12 @@ DELETED_LADDERS = [
     "prim_name_size",
 ]
 
-# `<operand> ==/!= TYPE_I16`: the kinds one operand is compared against.
-_INT_KIND = re.compile(r"([\w.]+)\s*[!=]=\s*TYPE_([IU])(8|16|32|64)\b")
+# `<operand> ==/!= TypeKind.I16`: the kinds one operand is compared against.
+_INT_KIND = re.compile(r"([\w.]+)\s*[!=]=\s*TypeKind\.([IU])(8|16|32|64)\b")
+# A `match` or-pattern arm `TypeKind.I16 | TypeKind.U16 =>` (AGAST #4450) is
+# the same rung: every alternative is compared against the one scrutinee.
+_OR_ARM = re.compile(r"^\s*TypeKind\.\w+(?:\s*\|\s*TypeKind\.\w+)+\s*=>")
+_ARM_KIND = re.compile(r"TypeKind\.([IU])(8|16|32|64)\b")
 
 
 def _code_lines():
@@ -496,15 +500,19 @@ def test_deleted_type_ladder_stays_deleted(name):
 
 def _ladder_rungs():
     """Lines outside types.ritz that spell a primitive-type ladder rung:
-    both signednesses of one width (`t == TYPE_I16 or t == TYPE_U16`) or a
-    hand-rolled set of three or more integer kinds (`is_signed`), compared
-    against ONE operand (`a == TYPE_U64 and b == TYPE_I64` is two facts)."""
+    both signednesses of one width (`t == TypeKind.I16 or t == TypeKind.U16`,
+    or the arm `TypeKind.I16 | TypeKind.U16 =>`) or a hand-rolled set of three
+    or more integer kinds (`is_signed`), compared against ONE operand
+    (`a == TypeKind.U64 and b == TypeKind.I64` is two facts)."""
     for f, n, code in _code_lines():
         if f in (TYPES_RITZ, "ast.ritz"):
             continue
         by_operand = {}
         for operand, sign, width in _INT_KIND.findall(code):
             by_operand.setdefault(operand, set()).add((sign, width))
+        if _OR_ARM.match(code):
+            for sign, width in _ARM_KIND.findall(code):
+                by_operand.setdefault("<match scrutinee>", set()).add((sign, width))
         for kinds in by_operand.values():
             widths = [w for _, w in kinds]
             if len(kinds) >= 3 or len(widths) != len(set(widths)):
@@ -527,6 +535,6 @@ def test_types_ritz_table_is_complete():
     """Every primitive kind has a row in each types.ritz function."""
     text = (RITZ1_SRC / TYPES_RITZ).read_text()
     for kind in ["I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64"]:
-        assert f"TYPE_{kind}" in text
+        assert f"TypeKind.{kind}" in text
     for spelling in ['c"float"', 'c"double"', 'c"i1"', 'c"ptr"']:
         assert spelling in text

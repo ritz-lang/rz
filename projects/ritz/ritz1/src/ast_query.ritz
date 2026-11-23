@@ -30,77 +30,74 @@ import ast
 import types
 import ast_helpers   # enum_find / enum_variant_* (AGAST #1660)
 
-# AGAST #1328: "not a local" miss value for find_local_type.  The old miss
-# value was TYPE_I64, which is indistinguishable from a real i64 local —
-# twice now (#1325 deref form, #1328 subscript form) a caller treated a
-# global pointer as an i64 and silently loaded the wrong width.  -1 collides
-# with no TYPE_* kind, so a caller that forgets to handle the miss now takes
-# its explicit "unknown" branch instead of impersonating an i64.
-const TYPE_UNKNOWN: i32 = -1
 
 # AGAST #4404: N.  Sema's annotation on an Expr (ast.ritz's Expr.sema_ty),
 # encoded kind + 2 so the parser arena's zeroing means "not annotated".
 # sema_walk notes it for every expression it reaches; the emitter reads it
 # through expr_sema_ty rather than re-deriving a type from EmitterState.
-pub fn expr_note_sema_ty(e: *Expr, k: i32)
+pub fn expr_note_sema_ty(e: *Expr, k: TypeKind)
     if e == null
         return
-    e.sema_ty = k + 2
+    e.sema_ty = (k as i32) + 2
 
-# The TYPE_* kind Sema gave `e`, or TYPE_UNKNOWN when it did not annotate it
+# The TYPE_* kind Sema gave `e`, or TypeKind.Unknown when it did not annotate it
 # (null, or a node the walk never reached).  1 not 2 -- see expr_note_sema_ty.
-pub fn expr_sema_ty(e: *Expr) -> i32
+pub fn expr_sema_ty(e: *Expr) -> TypeKind
     if e == null
-        return TYPE_UNKNOWN
+        return TypeKind.Unknown
     if e.sema_ty == 0
-        return TYPE_UNKNOWN
-    e.sema_ty - 2
+        return TypeKind.Unknown
+    type_kind_of(e.sema_ty - 2)
 
-# 1 when Sema annotated `e` (its answer may still be TYPE_UNKNOWN).
+# 1 when Sema annotated `e` (its answer may still be TypeKind.Unknown).
 pub fn expr_has_sema_ty(e: *Expr) -> i32
     (e != null and e.sema_ty != 0) as i32
 
 # AGAST #4404: the slot type a node fixes by itself -- the arms of the
 # emitter's old get_expr_type that never read EmitterState: literals, a
 # cast's written target, a comparison's i64 bool slot (AGAST #3931 / #1646),
-# and `@` / `@&` / `not` / `~`.  TYPE_UNKNOWN for the kinds whose slot needs
+# and `@` / `@&` / `not` / `~`.  TypeKind.Unknown for the kinds whose slot needs
 # Sema's scope; those are typed by sema_slot_ty (AGAST #4410).
-pub fn expr_local_slot_ty(e: *Expr) -> i32
+pub fn expr_local_slot_ty(e: *Expr) -> TypeKind
     if e == null
-        return TYPE_UNKNOWN
-    let k: i32 = e.kind
-    if k == EXPR_INT_LIT
-        return TYPE_I64
-    if k == EXPR_FLOAT_LIT
-        return TYPE_F64
-    if k == EXPR_CHAR_LIT
-        return TYPE_U8
-    if k == EXPR_STRING_LIT
-        return TYPE_STRUCT   # bare "..." is a StrView (AGAST #98)
-    if k == EXPR_CSTRING_LIT or k == EXPR_NIL_LIT
-        return TYPE_PTR
-    if k == EXPR_CAST
-        # Target type stored in e.op (set by expr_cast).
-        return e.op
-    if k == EXPR_BINARY and e.op >= OP_EQ and e.op <= OP_GE
-        return TYPE_I64
-    if k == EXPR_UNARY
-        if e.op == OP_ADDR
-            return TYPE_PTR
-        if e.op == OP_ADDR_MUT
-            return TYPE_MUT_REF
-        if e.op == OP_NOT or e.op == OP_BIT_NOT
-            return TYPE_I64
-    TYPE_UNKNOWN
+        return TypeKind.Unknown
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.IntLit =>
+            return TypeKind.I64
+        ExprKind.FloatLit =>
+            return TypeKind.F64
+        ExprKind.CharLit =>
+            return TypeKind.U8
+        ExprKind.StringLit =>
+            return TypeKind.Struct   # bare "..." is a StrView (AGAST #98)
+        ExprKind.CstringLit | ExprKind.NilLit =>
+            return TypeKind.Ptr
+        ExprKind.Cast =>
+            # Target type stored in e.op (set by expr_cast).
+            return e.type_kind
+        _ => pass
+    if k == ExprKind.Binary and op_is_comparison(e.op)
+        return TypeKind.I64
+    if k == ExprKind.Unary
+        match e.op
+            OpKind.Addr =>
+                return TypeKind.Ptr
+            OpKind.AddrMut =>
+                return TypeKind.MutRef
+            OpKind.Not | OpKind.BitNot =>
+                return TypeKind.I64
+            _ => pass
+    TypeKind.Unknown
 
 # The slot type the emitter reads (#4404): Sema's annotation from its walk,
 # else the node-local answer for a node built after the walk -- a print
 # placeholder's parsed expression (`{x as i64}`) never meets Sema.
-pub fn expr_slot_ty(e: *Expr) -> i32
+pub fn expr_slot_ty(e: *Expr) -> TypeKind
     if e == null
-        return TYPE_UNKNOWN
+        return TypeKind.Unknown
     if e.sema_ty != 0
-        return e.sema_ty - 2
+        return type_kind_of(e.sema_ty - 2)
     expr_local_slot_ty(e)
 
 # Helper to check if name matches a string.  The one i32 (0/1) compare
@@ -178,13 +175,13 @@ pub fn find_impl_method_by_symbol(m: *Module, name_sv: StrView) -> *FnDef
 
 # A fn that yields no value: no return type, or `-> void` (AGAST #2246).
 pub fn fn_is_procedure(fd: *FnDef) -> i32
-    if fd == null or fd.return_type != TYPE_VOID
+    if fd == null or fd.return_type != TypeKind.Void
         return 0
     1
 
 # Is this name a primitive integer/float/bool type? Used in several places
 # where post-monomorphization a generic `T` has been substituted with a
-# primitive but the AST still carries TYPE_STRUCT — we must NOT emit `%u16`
+# primitive but the AST still carries TypeKind.Struct — we must NOT emit `%u16`
 # struct references or `{ i8 }` fallback decls for those names.
 pub fn is_primitive_type_name(name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
@@ -277,46 +274,50 @@ pub fn is_tagged_enum_type(name_sv: StrView) -> i32
 
 # AGAST #1596: the element kind for indexing THROUGH a pointer-typed struct
 # field (`s.data[i]` with `data: *T` or `**T`). `**T` elements are pointers;
-# a `*Struct` element is TYPE_STRUCT (spelled `%T` from field_type_name);
+# a `*Struct` element is TypeKind.Struct (spelled `%T` from field_type_name);
 # primitive pointees (integers, since #2053 f32 / f64, and since #2063 bool)
 # come from array_elem_type (#1304); their in-memory spelling is
 # ptr_field_elem_llvm.  Anything else (an unrecorded pointee, a non-pointer
-# field) is TYPE_UNKNOWN: ritz1 cannot address it at the right width, so
+# field) is TypeKind.Unknown: ritz1 cannot address it at the right width, so
 # callers must fail closed rather than guess a stride.  bool is an `i1`
 # everywhere since #2063 (a local `[N]bool` kept i64 slots, so a `*bool`
 # had no single stride).
-pub fn ptr_field_elem_kind(field: *StructField) -> i32
-    if field.field_type == TYPE_PTR_PTR
-        return TYPE_PTR
-    if field.field_type != TYPE_PTR
-        return TYPE_UNKNOWN
+pub fn ptr_field_elem_kind(field: *StructField) -> TypeKind
+    if field.field_type == TypeKind.PtrPtr
+        return TypeKind.Ptr
+    if field.field_type != TypeKind.Ptr
+        return TypeKind.Unknown
     if field.field_type_name_len > 0
-        return TYPE_STRUCT
-    let t: i32 = field.array_elem_type
+        return TypeKind.Struct
+    let t: TypeKind = field.array_elem_type
     if ty_int_in(t, 8, 16) == 1
         return t
     if ty_int_in(t, 32, 64) == 1
         return t
-    if t == TYPE_F32 or t == TYPE_F64 or t == TYPE_BOOL
+    if t == TypeKind.F32 or t == TypeKind.F64 or t == TypeKind.Bool
         return t
-    return TYPE_UNKNOWN
+    return TypeKind.Unknown
 
 # Width in bits a scalar type code is stored at (see tagged_enum_scalar_bits).
-pub fn type_code_scalar_bits(t: i32, signed: *i32) -> i32
+pub fn type_code_scalar_bits(t: TypeKind, signed: *i32) -> i32
     *signed = 1
-    if t == TYPE_I8
-        return 8
-    if t == TYPE_I16
-        return 16
-    if t == TYPE_I32
-        return 32
+    match t
+        TypeKind.I8 =>
+            return 8
+        TypeKind.I16 =>
+            return 16
+        TypeKind.I32 =>
+            return 32
+        _ => pass
     *signed = 0
-    if t == TYPE_U8 or t == TYPE_BOOL
-        return 8
-    if t == TYPE_U16
-        return 16
-    if t == TYPE_U32
-        return 32
+    match t
+        TypeKind.U8 | TypeKind.Bool =>
+            return 8
+        TypeKind.U16 =>
+            return 16
+        TypeKind.U32 =>
+            return 32
+        _ => pass
     *signed = 1
     64
 
@@ -387,7 +388,7 @@ pub fn user_enum_tuple_field(name_sv: StrView, sel: i32) -> *StructField
 pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0
-    if e == null or e.kind != EXPR_CALL
+    if e == null or e.kind != ExprKind.Call
         return
     var vi: i32 = 0
     var other: i32 = 0
@@ -414,7 +415,7 @@ pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
 pub fn user_enum_ctor_call(e: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0
-    if e == null or e.kind != EXPR_CALL
+    if e == null or e.kind != ExprKind.Call
         return
     let n: *u8 = e.func_name
     let l: i32 = e.func_name_len
@@ -448,21 +449,21 @@ pub fn shape_leaf_count(sh: *ArrayShape) -> i32
 # AGAST #1965: 1 when `e` is a float literal or a negated one (`-2.5`, which
 # #1959 lowers as `fneg double`).  Both are `double`, narrowable to f32.
 pub fn is_float_lit_operand(e: *Expr) -> i32
-    if e.kind == EXPR_FLOAT_LIT
+    if e.kind == ExprKind.FloatLit
         return 1
-    if e.kind == EXPR_UNARY and e.op == OP_NEG
+    if e.kind == ExprKind.Unary and e.op == OpKind.Neg
         return is_float_lit_operand(e.operand)
     # AGAST #3607: literals only, `0.0 - 7.0`, is a literal too (ritz0's
     # FloatLitType): it takes the other side's width, and is never an f64
     # meeting an f32.
-    if e.kind == EXPR_BINARY and (e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV)
+    if e.kind == ExprKind.Binary and (e.op == OpKind.Add or e.op == OpKind.Sub or e.op == OpKind.Mul or e.op == OpKind.Div)
         return (is_float_lit_operand(e.left) == 1 and is_float_lit_operand(e.right) == 1) as i32
     return 0
 
-# AGAST #2308: the scalar T of a `-> @T` / `-> @&T` fn, or TYPE_VOID.
-pub fn ret_ref_scalar_pointee(f: *FnDef) -> i32
+# AGAST #2308: the scalar T of a `-> @T` / `-> @&T` fn, or TypeKind.Void.
+pub fn ret_ref_scalar_pointee(f: *FnDef) -> TypeKind
     if f == null or f.ret_ref == null or primitive_name_len(f.ret_ref.param_pointee_type) == 0
-        return TYPE_VOID
+        return TypeKind.Void
     return f.ret_ref.param_pointee_type
 
 # The volatile and atomic memory builtins (LANGUAGE_SPEC §18.4-§18.5, AGAST
@@ -697,7 +698,7 @@ struct LocalVar
     # 17 flat facts lived here until #4528; tr_*/lv_* answer them now.
     ty: *TypeRef
     # AGAST #1521: 1 for a local declared `: bool`. emit_var_decl stores bools
-    # in an i64 slot, so the chain alone cannot say (its kind is TYPE_I64).
+    # in an i64 slot, so the chain alone cannot say (its kind is TypeKind.I64).
     is_bool: i32
     # AGAST #2342/#4280 refinement bits, see LV_BK_*.
     bk: i32
@@ -771,16 +772,22 @@ pub fn lv_set_is_lent_self(v: *LocalVar, x: i32)
 # The LocalVar type facts, answered from `ty` (AGAST #4528)
 # =============================================================================
 
-fn lv_tyref(kind: i32) -> *TypeRef
+fn lv_tyref(kind: TypeKind) -> *TypeRef
     let t: *TypeRef = malloc(sizeof(TypeRef)) as *TypeRef
     memset(t as *u8, 0, sizeof(TypeRef))
     t.kind = kind
-    t.ref_inner = TYPE_VOID
+    t.ref_inner = TypeKind.Void
+    return t
+
+# lv_tyref for a leaf that records inner-pointee slot `slot` (tr_set_slot).
+fn lv_tyref_slot(slot: i32) -> *TypeRef
+    let t: *TypeRef = lv_tyref(TypeKind.Void)
+    tr_set_slot(t, slot)
     return t
 
 # 1 for a kind a pointer chain continues through.
-fn lv_is_ptr_kind(k: i32) -> i32
-    (k == TYPE_PTR or k == TYPE_PTR_PTR or k == TYPE_REF or k == TYPE_MUT_REF) as i32
+fn lv_is_ptr_kind(k: TypeKind) -> i32
+    (k == TypeKind.Ptr or k == TypeKind.PtrPtr or k == TypeKind.Ref or k == TypeKind.MutRef) as i32
 
 # The name the just-built array element `e` carries, from a flat type name.
 # A `[N]S` names S on the element; a `[N]*S` / `[N]@S` names it on the
@@ -788,13 +795,13 @@ fn lv_is_ptr_kind(k: i32) -> i32
 fn lv_name_into_elem(e: *TypeRef, name: *u8, name_len: i32)
     if e == null or name == null or name_len <= 0
         return
-    if e.kind == TYPE_STRUCT
+    if e.kind == TypeKind.Struct
         e.name = name
         e.name_len = name_len
         return
     if lv_is_ptr_kind(e.kind) == 1
         if e.pointee == null
-            e.pointee = lv_tyref(TYPE_STRUCT)
+            e.pointee = lv_tyref(TypeKind.Struct)
         e.pointee.name = name
         e.pointee.name_len = name_len
         return
@@ -804,7 +811,7 @@ fn lv_name_into_elem(e: *TypeRef, name: *u8, name_len: i32)
 # Build the chain an add_local_full's flat arguments describe.  Depth is kept
 # at the two levels the flat model had (`**T` is PTR_PTR -> PTR), so
 # tr_ptr_ptr_inner_pointee reads the leaf kind exactly as the flat field did.
-pub fn lv_ty_from_flat(var_type: i32, type_name_sv: StrView, pointee: i32, arr_size: i32, arr_elem: i32) -> *TypeRef
+pub fn lv_ty_from_flat(var_type: TypeKind, type_name_sv: StrView, pointee: TypeKind, arr_size: i32, arr_elem: TypeKind) -> *TypeRef
     var name: *u8 = type_name_sv.ptr
     var name_len: i32 = type_name_sv.len as i32
     let t: *TypeRef = lv_tyref(var_type)
@@ -814,42 +821,42 @@ pub fn lv_ty_from_flat(var_type: i32, type_name_sv: StrView, pointee: i32, arr_s
     # and the checks read it as such.
     t.name = name
     t.name_len = name_len
-    if var_type == TYPE_ARRAY
+    if var_type == TypeKind.Array
         t.count = arr_size as i64
         t.elem = lv_tyref(arr_elem)
-        # The flat pointee_type of an array local: TYPE_I64 for a plain
-        # `[N]T`, TYPE_ARRAY for a `a:& [N]T` borrow bound as an array local.
+        # The flat pointee_type of an array local: TypeKind.I64 for a plain
+        # `[N]T`, TypeKind.Array for a `a:& [N]T` borrow bound as an array local.
         # The whole-array lowering reads it (`array_ptr_local`, #2305).
         t.pointee = lv_tyref(pointee)
         return t
     if lv_is_ptr_kind(var_type) == 1
         t.pointee = lv_tyref(pointee)
-        if var_type == TYPE_REF or var_type == TYPE_MUT_REF
+        if var_type == TypeKind.Ref or var_type == TypeKind.MutRef
             t.ref_inner = pointee
-        if var_type == TYPE_PTR_PTR and pointee == TYPE_PTR
-            t.pointee.pointee = lv_tyref(TYPE_VOID)
-        else if (var_type == TYPE_REF or var_type == TYPE_MUT_REF) and pointee == TYPE_PTR
-            t.pointee.pointee = lv_tyref(TYPE_VOID)
-        else if pointee == TYPE_ARRAY
-            t.pointee.elem = lv_tyref(TYPE_VOID)
+        if var_type == TypeKind.PtrPtr and pointee == TypeKind.Ptr
+            t.pointee.pointee = lv_tyref(TypeKind.Void)
+        else if (var_type == TypeKind.Ref or var_type == TypeKind.MutRef) and pointee == TypeKind.Ptr
+            t.pointee.pointee = lv_tyref(TypeKind.Void)
+        else if pointee == TypeKind.Array
+            t.pointee.elem = lv_tyref(TypeKind.Void)
         return t
     return t
 
 # The LocalVar add_local_full makes, and the image ref_check builds for a Sema
 # binding (AGAST #4391).  Clears every field, then records the name and type.
-pub fn lv_loc_init(loc: *LocalVar, name_sv: StrView, var_type: i32, type_name_sv: StrView, pointee: i32, arr_size: i32, arr_elem: i32)
+pub fn lv_loc_init(loc: *LocalVar, name_sv: StrView, var_type: TypeKind, type_name_sv: StrView, pointee: TypeKind, arr_size: i32, arr_elem: TypeKind)
     memset(loc as *u8, 0, sizeof(LocalVar))
     loc.name = name_sv.ptr
     loc.name_len = name_sv.len as i32
     loc.ty = lv_ty_from_flat(var_type, type_name_sv, pointee, arr_size, arr_elem)
 
 # The flat kind of the local (was LocalVar.var_type).
-pub fn lv_var_type(v: *LocalVar) -> i32
+pub fn lv_var_type(v: *LocalVar) -> TypeKind
     tr_flat(v.ty)
 
 # The local's own array node (a by-value `[N]T`), null otherwise.
 fn lv_own_array(v: *LocalVar) -> *TypeRef
-    if v.ty != null and v.ty.kind == TYPE_ARRAY
+    if v.ty != null and v.ty.kind == TypeKind.Array
         return v.ty
     null
 
@@ -859,16 +866,16 @@ pub fn lv_array_size(v: *LocalVar) -> i32
         return 0
     tr_count(a) as i32
 
-pub fn lv_array_elem_type(v: *LocalVar) -> i32
+pub fn lv_array_elem_type(v: *LocalVar) -> TypeKind
     let a: *TypeRef = lv_own_array(v)
     if a == null
-        return TYPE_VOID
+        return TypeKind.Void
     tr_elem_kind(a)
 
-pub fn lv_array_elem_pointee(v: *LocalVar) -> i32
+pub fn lv_array_elem_pointee(v: *LocalVar) -> TypeKind
     let a: *TypeRef = lv_own_array(v)
     if a == null
-        return TYPE_VOID
+        return TypeKind.Void
     tr_elem_pointee(a)
 
 pub fn lv_array_shape(v: *LocalVar) -> *ArrayShape
@@ -915,13 +922,13 @@ pub fn lv_pointee_array_elem_name_len(v: *LocalVar) -> i32
     lv_pointee_array_elem_name(v, @l)
     l
 
-pub fn lv_pointee_type(v: *LocalVar) -> i32
+pub fn lv_pointee_type(v: *LocalVar) -> TypeKind
     if v.ty == null
-        return TYPE_VOID
+        return TypeKind.Void
     # A reference records its referent's flat kind in ref_inner (`@T` -> T,
-    # `@*T` -> TYPE_PTR); the flat pointee_type was that value.  A pointer's
+    # `@*T` -> TypeKind.Ptr); the flat pointee_type was that value.  A pointer's
     # is its immediate pointee.
-    if v.ty.kind == TYPE_REF or v.ty.kind == TYPE_MUT_REF
+    if v.ty.kind == TypeKind.Ref or v.ty.kind == TypeKind.MutRef
         return tr_ref_inner(v.ty)
     tr_pointee_kind(v.ty)
 
@@ -951,47 +958,49 @@ fn lv_pa_node(v: *LocalVar, create: i32) -> *TypeRef
         return null
     # A by-value array local records its flat pointee_type too: a `:& [N]T`
     # borrow is bound as an array local whose pointee is the array (#2305).
-    if t.kind == TYPE_ARRAY
-        if t.pointee != null and t.pointee.kind == TYPE_ARRAY
-            return t.pointee
-        return null
-    if t.kind == TYPE_PTR
-        if t.pointee == null
-            if create == 0
-                return null
-            t.pointee = lv_tyref(TYPE_ARRAY)
-        if t.pointee.kind == TYPE_ARRAY
-            return t.pointee
-        return null
-    if t.kind == TYPE_PTR_PTR
-        if t.pointee == null
-            if create == 0
-                return null
-            t.pointee = lv_tyref(TYPE_PTR)
-        if t.pointee.kind == TYPE_PTR
-            if t.pointee.pointee == null
-                if create == 0
-                    return null
-                t.pointee.pointee = lv_tyref(TYPE_ARRAY)
-            if t.pointee.pointee.kind == TYPE_ARRAY
-                return t.pointee.pointee
-        return null
-    if t.kind == TYPE_REF or t.kind == TYPE_MUT_REF
-        if t.pointee != null and t.pointee.kind == TYPE_ARRAY
-            return t.pointee
-        if t.ref_inner == TYPE_PTR
+    match t.kind
+        TypeKind.Array =>
+            if t.pointee != null and t.pointee.kind == TypeKind.Array
+                return t.pointee
+            return null
+        TypeKind.Ptr =>
             if t.pointee == null
                 if create == 0
                     return null
-                t.pointee = lv_tyref(TYPE_PTR)
-            if t.pointee.kind == TYPE_PTR
+                t.pointee = lv_tyref(TypeKind.Array)
+            if t.pointee.kind == TypeKind.Array
+                return t.pointee
+            return null
+        TypeKind.PtrPtr =>
+            if t.pointee == null
+                if create == 0
+                    return null
+                t.pointee = lv_tyref(TypeKind.Ptr)
+            if t.pointee.kind == TypeKind.Ptr
                 if t.pointee.pointee == null
                     if create == 0
                         return null
-                    t.pointee.pointee = lv_tyref(TYPE_ARRAY)
-                if t.pointee.pointee.kind == TYPE_ARRAY
+                    t.pointee.pointee = lv_tyref(TypeKind.Array)
+                if t.pointee.pointee.kind == TypeKind.Array
                     return t.pointee.pointee
-        return null
+            return null
+        TypeKind.Ref | TypeKind.MutRef =>
+            if t.pointee != null and t.pointee.kind == TypeKind.Array
+                return t.pointee
+            if t.ref_inner == TypeKind.Ptr
+                if t.pointee == null
+                    if create == 0
+                        return null
+                    t.pointee = lv_tyref(TypeKind.Ptr)
+                if t.pointee.kind == TypeKind.Ptr
+                    if t.pointee.pointee == null
+                        if create == 0
+                            return null
+                        t.pointee.pointee = lv_tyref(TypeKind.Array)
+                    if t.pointee.pointee.kind == TypeKind.Array
+                        return t.pointee.pointee
+            return null
+        _ => pass
     null
 
 pub fn lv_pointee_array_size(v: *LocalVar) -> i32
@@ -1000,16 +1009,16 @@ pub fn lv_pointee_array_size(v: *LocalVar) -> i32
         return 0
     tr_count(a) as i32
 
-pub fn lv_pointee_array_elem_type(v: *LocalVar) -> i32
+pub fn lv_pointee_array_elem_type(v: *LocalVar) -> TypeKind
     let a: *TypeRef = lv_pa_node(v, 0)
     if a == null
-        return TYPE_VOID
+        return TypeKind.Void
     tr_elem_kind(a)
 
-pub fn lv_pointee_array_elem_pointee(v: *LocalVar) -> i32
+pub fn lv_pointee_array_elem_pointee(v: *LocalVar) -> TypeKind
     let a: *TypeRef = lv_pa_node(v, 0)
     if a == null
-        return TYPE_VOID
+        return TypeKind.Void
     tr_elem_pointee(a)
 
 pub fn lv_pointee_array_elem_name(v: *LocalVar, out_len: *i32) -> *u8
@@ -1029,7 +1038,7 @@ pub fn lv_pointee_array_shape(v: *LocalVar) -> *ArrayShape
 # The setters lowering uses where it used to assign a flat field (AGAST #4528)
 # =============================================================================
 
-pub fn lv_set_var_type(v: *LocalVar, k: i32)
+pub fn lv_set_var_type(v: *LocalVar, k: TypeKind)
     if v.ty == null
         v.ty = lv_tyref(k)
     else
@@ -1042,14 +1051,14 @@ pub fn lv_set_type_name(v: *LocalVar, name: *u8, name_len: i32)
     v.ty.name = name
     v.ty.name_len = name_len
 
-pub fn lv_set_pointee_type(v: *LocalVar, k: i32)
+pub fn lv_set_pointee_type(v: *LocalVar, k: TypeKind)
     if v.ty == null
-        v.ty = lv_tyref(TYPE_PTR)
+        v.ty = lv_tyref(TypeKind.Ptr)
     if v.ty.pointee == null
         v.ty.pointee = lv_tyref(k)
     else
         v.ty.pointee.kind = k
-    if v.ty.kind == TYPE_REF or v.ty.kind == TYPE_MUT_REF
+    if v.ty.kind == TypeKind.Ref or v.ty.kind == TypeKind.MutRef
         v.ty.ref_inner = k
 
 pub fn lv_set_array_size(v: *LocalVar, n: i32)
@@ -1057,7 +1066,7 @@ pub fn lv_set_array_size(v: *LocalVar, n: i32)
     if a != null
         a.count = n as i64
 
-pub fn lv_set_array_elem_type(v: *LocalVar, k: i32)
+pub fn lv_set_array_elem_type(v: *LocalVar, k: TypeKind)
     let a: *TypeRef = lv_own_array(v)
     if a == null
         return
@@ -1067,25 +1076,27 @@ pub fn lv_set_array_elem_type(v: *LocalVar, k: i32)
         a.elem.kind = k
 
 # E for `[N]*E` and its kin: the element's pointee fact tr_elem_pointee reads.
-pub fn lv_set_array_elem_pointee(v: *LocalVar, k: i32)
+pub fn lv_set_array_elem_pointee(v: *LocalVar, k: TypeKind)
     let a: *TypeRef = lv_own_array(v)
     if a == null or a.elem == null
         return
     let e: *TypeRef = a.elem
-    if e.kind == TYPE_PTR
-        if e.pointee == null
-            e.pointee = lv_tyref(k)
-        else
-            e.pointee.kind = k
-    else if e.kind == TYPE_PTR_PTR
-        if e.pointee == null
-            e.pointee = lv_tyref(TYPE_PTR)
-        if e.pointee.pointee == null
-            e.pointee.pointee = lv_tyref(k)
-        else
-            e.pointee.pointee.kind = k
-    else if e.kind == TYPE_REF or e.kind == TYPE_MUT_REF
-        e.ref_inner = k
+    match e.kind
+        TypeKind.Ptr =>
+            if e.pointee == null
+                e.pointee = lv_tyref(k)
+            else
+                e.pointee.kind = k
+        TypeKind.PtrPtr =>
+            if e.pointee == null
+                e.pointee = lv_tyref(TypeKind.Ptr)
+            if e.pointee.pointee == null
+                e.pointee.pointee = lv_tyref(k)
+            else
+                e.pointee.pointee.kind = k
+        TypeKind.Ref | TypeKind.MutRef =>
+            e.ref_inner = k
+        _ => pass
 
 pub fn lv_set_array_shape(v: *LocalVar, sh: *ArrayShape)
     let a: *TypeRef = lv_own_array(v)
@@ -1103,35 +1114,35 @@ pub fn lv_set_inner_pointee_type(v: *LocalVar, k: i32)
     if v.ty == null
         return
     var slot: *TypeRef = v.ty
-    if slot.kind == TYPE_REF or slot.kind == TYPE_MUT_REF
+    if slot.kind == TypeKind.Ref or slot.kind == TypeKind.MutRef
         # `@*T` / `@&*T` records T as a `**T` does: it is the pointee of the
         # pointer the reference wraps (tr_pointee_kind(ty.pointee)).
-        if slot.ref_inner == TYPE_PTR
+        if slot.ref_inner == TypeKind.Ptr
             if slot.pointee == null
-                slot.pointee = lv_tyref(TYPE_PTR)
+                slot.pointee = lv_tyref(TypeKind.Ptr)
             if slot.pointee.pointee == null
-                slot.pointee.pointee = lv_tyref(k)
+                slot.pointee.pointee = lv_tyref_slot(k)
             else
-                slot.pointee.pointee.kind = k
+                tr_set_slot(slot.pointee.pointee, k)
             return
-        if slot.ref_inner == TYPE_PTR_PTR
+        if slot.ref_inner == TypeKind.PtrPtr
             slot = slot.pointee
         else
             return
-    if slot == null or slot.kind != TYPE_PTR_PTR
+    if slot == null or slot.kind != TypeKind.PtrPtr
         return
     # The flat inner_pointee_type is independent of the flat pointee_type, and
     # an inferred copy (`let z = p`, p: ***C) left the latter at its parser
     # default.  The chain needs the PTR level for tr_ptr_ptr_inner_pointee to
     # read the leaf back, so make it here.
     if slot.pointee == null
-        slot.pointee = lv_tyref(TYPE_PTR)
-    else if slot.pointee.kind != TYPE_PTR
-        slot.pointee.kind = TYPE_PTR
+        slot.pointee = lv_tyref(TypeKind.Ptr)
+    else if slot.pointee.kind != TypeKind.Ptr
+        slot.pointee.kind = TypeKind.Ptr
     if slot.pointee.pointee == null
-        slot.pointee.pointee = lv_tyref(k)
+        slot.pointee.pointee = lv_tyref_slot(k)
     else
-        slot.pointee.pointee.kind = k
+        tr_set_slot(slot.pointee.pointee, k)
 
 pub fn lv_set_inner_ref(v: *LocalVar, r: i32)
     if v.ty != null
@@ -1145,7 +1156,7 @@ pub fn lv_set_fn_sig(v: *LocalVar, sig: *FnDef)
 fn lv_pa_ensure(v: *LocalVar) -> *TypeRef
     let a: *TypeRef = lv_pa_node(v, 1)
     if a != null and a.elem == null
-        a.elem = lv_tyref(TYPE_VOID)
+        a.elem = lv_tyref(TypeKind.Void)
     a
 
 pub fn lv_set_pointee_array_size(v: *LocalVar, n: i32)
@@ -1153,7 +1164,7 @@ pub fn lv_set_pointee_array_size(v: *LocalVar, n: i32)
     if a != null
         a.count = n as i64
 
-pub fn lv_set_pointee_array_elem_type(v: *LocalVar, k: i32)
+pub fn lv_set_pointee_array_elem_type(v: *LocalVar, k: TypeKind)
     let a: *TypeRef = lv_pa_ensure(v)
     if a == null
         return
@@ -1162,25 +1173,27 @@ pub fn lv_set_pointee_array_elem_type(v: *LocalVar, k: i32)
     else
         a.elem.kind = k
 
-pub fn lv_set_pointee_array_elem_pointee(v: *LocalVar, k: i32)
+pub fn lv_set_pointee_array_elem_pointee(v: *LocalVar, k: TypeKind)
     let a: *TypeRef = lv_pa_ensure(v)
     if a == null or a.elem == null
         return
     let e: *TypeRef = a.elem
-    if e.kind == TYPE_PTR
-        if e.pointee == null
-            e.pointee = lv_tyref(k)
-        else
-            e.pointee.kind = k
-    else if e.kind == TYPE_PTR_PTR
-        if e.pointee == null
-            e.pointee = lv_tyref(TYPE_PTR)
-        if e.pointee.pointee == null
-            e.pointee.pointee = lv_tyref(k)
-        else
-            e.pointee.pointee.kind = k
-    else if e.kind == TYPE_REF or e.kind == TYPE_MUT_REF
-        e.ref_inner = k
+    match e.kind
+        TypeKind.Ptr =>
+            if e.pointee == null
+                e.pointee = lv_tyref(k)
+            else
+                e.pointee.kind = k
+        TypeKind.PtrPtr =>
+            if e.pointee == null
+                e.pointee = lv_tyref(TypeKind.Ptr)
+            if e.pointee.pointee == null
+                e.pointee.pointee = lv_tyref(k)
+            else
+                e.pointee.pointee.kind = k
+        TypeKind.Ref | TypeKind.MutRef =>
+            e.ref_inner = k
+        _ => pass
 
 pub fn lv_set_pointee_array_elem_name(v: *LocalVar, name: *u8, name_len: i32)
     let a: *TypeRef = lv_pa_ensure(v)
@@ -1264,7 +1277,7 @@ pub fn is_variant_null(name_sv: StrView) -> i32
 # =========================================================================
 # The ident-only half of expr_is_ptr_valued: the shape `*x` / `*x = v` see.
 # The integer kinds a `:&` borrow binds as a plain local (AGAST #1644).
-pub fn is_borrow_scalar_kind(t: i32) -> i32
+pub fn is_borrow_scalar_kind(t: TypeKind) -> i32
     if ty_int_in(t, 8, 16) == 1
         return 1
     if ty_int_in(t, 32, 64) == 1
@@ -1292,7 +1305,7 @@ pub fn array_ptr_elem_name(loc: *LocalVar, out_len: *i32) -> *u8
 # variant, `Z(1)`, or none for a payload one, `One()`.  *out_ei / *out_vi
 # name the variant.  With no such fn it was "Unknown function: Z".
 pub fn user_variant_ctor_miscounted(e: *Expr, out_ei: *i32, out_vi: *i32) -> i32
-    if e == null or e.kind != EXPR_CALL
+    if e == null or e.kind != ExprKind.Call
         return 0
     var other: i32 = 0
     let ei: i32 = enum_of_variant_unique(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, out_vi, @other)
@@ -1310,7 +1323,7 @@ pub fn user_variant_ctor_miscounted(e: *Expr, out_ei: *i32, out_vi: *i32) -> i32
 # non-generic enums declare as a variant.  Returns 1 and fills *out_a /
 # *out_b with the two enums to name (enum_of_variant_unique's -2), else 0.
 pub fn user_variant_ctor_ambiguous(e: *Expr, out_a: *i32, out_b: *i32) -> i32
-    if e == null or e.kind != EXPR_CALL
+    if e == null or e.kind != ExprKind.Call
         return 0
     if enum_of_variant_unique(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, out_a, out_b) == 0 - 2
         return 1
@@ -1320,7 +1333,7 @@ pub fn user_variant_ctor_ambiguous(e: *Expr, out_a: *i32, out_b: *i32) -> i32
 # Helper: find the leftmost/base expression in a chain of binary ops
 # e.g., for (a.ptr + pos + i), returns a.ptr
 pub fn find_base_expr(e: *Expr) -> *Expr
-    if e.kind == EXPR_BINARY
+    if e.kind == ExprKind.Binary
         return find_base_expr(e.left)
     return e
 
@@ -1328,16 +1341,16 @@ pub fn find_base_expr(e: *Expr) -> *Expr
 # 1 when `p` takes an array by address: `a:& [N]T`, `a: @[N]T`, `a: @&[N]T`.
 # `*[N]T` doesn't: ritz0 refuses `g(a)` there.
 pub fn param_takes_array_ref(p: *Param) -> i32
-    if p.param_type != TYPE_REF and p.param_type != TYPE_MUT_REF
+    if p.param_type != TypeKind.Ref and p.param_type != TypeKind.MutRef
         return 0
-    if p.param_pointee_type == TYPE_ARRAY
+    if p.param_pointee_type == TypeKind.Array
         return 1
     0
 
 # =========================================================================
 # 1 when `p` is a `Span<T>`: emit_expr_call builds one from a local array.
 pub fn param_is_span(p: *Param) -> i32
-    if p.param_type != TYPE_STRUCT or p.param_type_name == null or p.param_type_name_len <= 4
+    if p.param_type != TypeKind.Struct or p.param_type_name == null or p.param_type_name_len <= 4
         return 0
     return (memcmp(p.param_type_name, c"Span$", 5) == 0) as i32
 
@@ -1350,11 +1363,11 @@ pub fn param_is_span(p: *Param) -> i32
 pub fn span_view_base(e: *Expr) -> *Expr
     if e == null
         return null
-    if e.kind == EXPR_INDEX
-        if e.right != null and e.right.kind == EXPR_RANGE
+    if e.kind == ExprKind.Index
+        if e.right != null and e.right.kind == ExprKind.Range
             return e.left
         return null
-    if e.kind != EXPR_STRUCT_LIT or e.ident_ptr == null or e.ident_len <= 5
+    if e.kind != ExprKind.StructLit or e.ident_ptr == null or e.ident_len <= 5
         return null
     if memcmp(e.ident_ptr, c"Span$", 5) != 0
         return null
@@ -1362,8 +1375,8 @@ pub fn span_view_base(e: *Expr) -> *Expr
     while fi != null
         if fi.name_len == 3 and memcmp(fi.name, c"ptr", 3) == 0
             let v: *Expr = fi.value
-            if v != null and v.kind == EXPR_BINARY and v.op == OP_ADD and v.left != null
-                if v.left.kind == EXPR_MEMBER and v.left.ident_len == 4 and memcmp(v.left.ident_ptr, c"data", 4) == 0
+            if v != null and v.kind == ExprKind.Binary and v.op == OpKind.Add and v.left != null
+                if v.left.kind == ExprKind.Member and v.left.ident_len == 4 and memcmp(v.left.ident_ptr, c"data", 4) == 0
                     return v.left.left
             return null
         fi = fi.next
@@ -1377,7 +1390,7 @@ pub fn span_view_base(e: *Expr) -> *Expr
 pub struct ArrayDims
     rank: i32
     dims: [8]i32
-    leaf: i32
+    leaf: TypeKind
     name: *u8
     name_len: i32
 
@@ -1386,7 +1399,7 @@ pub const ARG_DIMS_UNKNOWN: i32 = 0
 pub const ARG_DIMS_ARRAY: i32 = 1
 pub const ARG_DIMS_NOT_ARRAY: i32 = 2
 
-pub fn array_dims_1d(out: *ArrayDims, size: i32, elem: i32, name_sv: StrView) -> i32
+pub fn array_dims_1d(out: *ArrayDims, size: i32, elem: TypeKind, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     out.rank = 1
@@ -1446,7 +1459,7 @@ pub fn impl_of_method(m: *Module, f: *FnDef) -> *ImplBlock
 #
 # AGAST #3278: a typed `self:& C`, and so a generic instance's bare `self:&`
 # once name_untyped_self has named it, is lent the same way.  It's a
-# TYPE_MUT_REF without is_borrow (Param.is_self_borrow), which ref_check's
+# TypeKind.MutRef without is_borrow (Param.is_self_borrow), which ref_check's
 # ref_args and call_check's ca_borrow read as an `@&C` slot: `C_bump(c)` was "a value
 # doesn't fit a reference slot".  ref_value.ritz (Sema) calls this for the free call too.
 # lent_self_call_view over the module `m`: Sema's too (AGAST #4011).
@@ -1457,9 +1470,9 @@ pub fn lent_self_call_view_in(m: *Module, f: *FnDef) -> *FnDef
     if param_is_self(p) == 0 or p.is_self_borrow == 0 or p.is_borrow == 1
         return f
     var typed: i32 = 0
-    if p.param_type == TYPE_MUT_REF and p.param_type_name_len > 0
+    if p.param_type == TypeKind.MutRef and p.param_type_name_len > 0
         typed = 1
-    if typed == 0 and (p.param_type != TYPE_STRUCT or p.param_type_name_len > 0)
+    if typed == 0 and (p.param_type != TypeKind.Struct or p.param_type_name_len > 0)
         return f
     var ib: *ImplBlock = null
     if typed == 0
@@ -1469,8 +1482,8 @@ pub fn lent_self_call_view_in(m: *Module, f: *FnDef) -> *FnDef
     let lent: *Param = malloc(sizeof(Param)) as *Param
     memcpy(lent as *u8, p as *u8, sizeof(Param))
     if typed == 0
-        lent.param_type = TYPE_MUT_REF
-        lent.param_pointee_type = TYPE_STRUCT
+        lent.param_type = TypeKind.MutRef
+        lent.param_pointee_type = TypeKind.Struct
         lent.param_type_name = ib.type_name
         lent.param_type_name_len = ib.type_name_len
     lent.is_borrow = 1
@@ -1491,12 +1504,12 @@ pub fn param_pointee_dims(out: *ArrayDims, p: *Param)
 # 1 when two array element types name the same type (struct elements by name).
 # Exactly the same type, through an address too: `[N]u32` doesn't fit a
 # reference to `[N]i32`, though LLVM spells both `i32` (#2367).
-pub fn array_elem_types_match(a: i32, a_name_sv: StrView, b: i32, b_name_sv: StrView) -> i32
+pub fn array_elem_types_match(a: TypeKind, a_name_sv: StrView, b: TypeKind, b_name_sv: StrView) -> i32
     var a_name: *u8 = a_name_sv.ptr
     var a_len: i32 = a_name_sv.len as i32
     var b_name: *u8 = b_name_sv.ptr
     var b_len: i32 = b_name_sv.len as i32
-    if a == TYPE_STRUCT or b == TYPE_STRUCT
+    if a == TypeKind.Struct or b == TypeKind.Struct
         if a != b or a_len != b_len or a_len <= 0
             return 0
         return (memcmp(a_name, b_name, a_len as i64) == 0) as i32
@@ -1511,15 +1524,15 @@ pub fn array_elem_types_match(a: i32, a_name_sv: StrView, b: i32, b_name_sv: Str
 # On the local `loc` bound for `param` (name_array_ptr_param, AGAST #4011: Sema's
 # image of it too).
 pub fn name_array_ptr_param_loc(loc: *LocalVar, param: *Param)
-    let ptr_elem: bool = param.param_pointee_array_elem_type == TYPE_PTR and param.param_pointee_array_elem_pointee == TYPE_STRUCT
-    if param.param_pointee_array_size <= 0 or (param.param_pointee_array_elem_type != TYPE_STRUCT and ptr_elem == false)
+    let ptr_elem: bool = param.param_pointee_array_elem_type == TypeKind.Ptr and param.param_pointee_array_elem_pointee == TypeKind.Struct
+    if param.param_pointee_array_size <= 0 or (param.param_pointee_array_elem_type != TypeKind.Struct and ptr_elem == false)
         return
-    if param.param_pointee_type == TYPE_ARRAY and ptr_elem
+    if param.param_pointee_type == TypeKind.Array and ptr_elem
         return
-    if param.param_pointee_type != TYPE_ARRAY
+    if param.param_pointee_type != TypeKind.Array
         # AGAST #2331: and `@*[N]S` / `@&*[N]S`, as `**[N]S`.
-        let ref_ptr: bool = (param.param_type == TYPE_REF or param.param_type == TYPE_MUT_REF) and param.param_pointee_type == TYPE_PTR
-        if ref_ptr == false and (param.param_type != TYPE_PTR_PTR or param.param_inner_pointee_type != TYPE_ARRAY)
+        let ref_ptr: bool = (param.param_type == TypeKind.Ref or param.param_type == TypeKind.MutRef) and param.param_pointee_type == TypeKind.Ptr
+        if ref_ptr == false and (param.param_type != TypeKind.PtrPtr or param.param_inner_pointee_type != (TypeKind.Array as i32))
             return
     if loc == null or lv_name_len(loc) <= 0
         return
@@ -1532,8 +1545,8 @@ pub fn name_array_ptr_param_loc(loc: *LocalVar, param: *Param)
 pub fn names_array_elem_struct(stmt: *Stmt) -> i32
     if stmt.var_pointee_array_size <= 0
         return 0
-    let elem: i32 = stmt.var_pointee_array_elem_type
-    (elem == TYPE_STRUCT or (elem == TYPE_PTR and stmt.var_pointee_array_elem_pointee == TYPE_STRUCT)) as i32
+    let elem: TypeKind = stmt.var_pointee_array_elem_type
+    (elem == TypeKind.Struct or (elem == TypeKind.Ptr and stmt.var_pointee_array_elem_pointee == TypeKind.Struct)) as i32
 
 # AGAST #2543: a `*[N]S`, `@[N]S`, `@&[N]S` or `**[N]S` local records S in
 # pointee_array_elem_name, as such a param does (#2548).  It recorded none, so
@@ -1548,7 +1561,7 @@ pub fn names_array_elem_struct(stmt: *Stmt) -> i32
 pub fn name_array_ptr_local(loc: *LocalVar, stmt: *Stmt, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let deep_ptr: bool = ref_to_ptr(loc) == 1 or lv_var_type(loc) == TYPE_PTR_PTR
+    let deep_ptr: bool = ref_to_ptr(loc) == 1 or lv_var_type(loc) == TypeKind.PtrPtr
     if lv_name_len(loc) > 0 and deep_ptr and names_array_elem_struct(stmt) == 1
         var dn: i32 = 0
         let dname: *u8 = lv_name(loc, @dn)
@@ -1557,44 +1570,48 @@ pub fn name_array_ptr_local(loc: *LocalVar, stmt: *Stmt, name_sv: StrView)
         return
     if lv_name_len(loc) > 0 or name == null or len <= 0
         return
-    if stmt.var_pointee_array_size <= 0 or stmt.var_pointee_array_elem_type != TYPE_STRUCT
+    if stmt.var_pointee_array_size <= 0 or stmt.var_pointee_array_elem_type != TypeKind.Struct
         return
-    let t: i32 = lv_var_type(loc)
-    let one: bool = (t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF) and stmt.var_pointee_type == TYPE_ARRAY
+    let t: TypeKind = lv_var_type(loc)
+    let one: bool = (t == TypeKind.Ptr or t == TypeKind.Ref or t == TypeKind.MutRef) and stmt.var_pointee_type == TypeKind.Array
     # AGAST #3079: an `@*[N]S` / `@&*[N]S` (`let r = @q`) is as deep as a `**[N]S`.
-    let deep: bool = t == TYPE_PTR_PTR or ((t == TYPE_REF or t == TYPE_MUT_REF) and stmt.var_pointee_type == TYPE_PTR)
-    let two: bool = deep and stmt.var_inner_pointee_type == TYPE_ARRAY
+    let deep: bool = t == TypeKind.PtrPtr or ((t == TypeKind.Ref or t == TypeKind.MutRef) and stmt.var_pointee_type == TypeKind.Ptr)
+    let two: bool = deep and stmt.var_inner_pointee_type == (TypeKind.Array as i32)
     if one or two
         lv_set_pointee_array_elem_name(loc, name, len)
 
 # AGAST #2331: 1 for an `@*T` or `@&*T` local.  It records N and U when T is
 # `[N]U`: `*r` reads that `*[N]U`, as it does through a `**[N]U`.
 pub fn ref_to_ptr(loc: *LocalVar) -> i32
-    let t: i32 = lv_var_type(loc)
-    if t != TYPE_REF and t != TYPE_MUT_REF
+    let t: TypeKind = lv_var_type(loc)
+    if t != TypeKind.Ref and t != TypeKind.MutRef
         return 0
-    (lv_pointee_type(loc) == TYPE_PTR) as i32
+    (lv_pointee_type(loc) == TypeKind.Ptr) as i32
 
 # AGAST #2403: pointers between a `self` param and its struct, as
 # local_struct_levels counts a local's: 2 for `**S` and `@*S`.
 pub fn self_struct_levels(p: *Param) -> i32
-    if p.param_type == TYPE_PTR_PTR
-        return ptr_ptr_ident_levels(p.param_inner_pointee_type)
-    if p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF
-        if p.param_pointee_type == TYPE_PTR
-            return 2
-        if p.param_pointee_type == TYPE_PTR_PTR
-            return 3
-        return 1
-    if p.param_type == TYPE_PTR
-        return 1
+    match p.param_type
+        TypeKind.PtrPtr =>
+            return ptr_ptr_ident_levels(p.param_inner_pointee_type)
+        TypeKind.Ref | TypeKind.MutRef =>
+            match p.param_pointee_type
+                TypeKind.Ptr =>
+                    return 2
+                TypeKind.PtrPtr =>
+                    return 3
+                _ => pass
+            return 1
+        TypeKind.Ptr =>
+            return 1
+        _ => pass
     0
 
 # 1 for a `p:& **S` param, of any depth.
 pub fn param_borrows_struct_ptr_ptr(p: *Param) -> i32
-    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF or p.param_pointee_type != TYPE_PTR_PTR
+    if p.is_borrow != 1 or p.param_type != TypeKind.MutRef or p.param_pointee_type != TypeKind.PtrPtr
         return 0
-    (ptr_ptr_slot_inner(p.param_inner_pointee_type) == TYPE_STRUCT) as i32
+    (ptr_ptr_slot_inner(p.param_inner_pointee_type) == TypeKind.Struct) as i32
 
 # AGAST #1924: pointer levels of a `**S` local/param/field from its inner
 # pointee slot: 3 for `***S`.  2 when the slot records nothing (the

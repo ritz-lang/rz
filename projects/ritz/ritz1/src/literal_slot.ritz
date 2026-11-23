@@ -13,7 +13,7 @@
 # bool_check also visits, before the value's own sub-expressions are walked.
 # Its refusals are Sema errors, and what it learns it writes on the AST as
 # annotations the emitter only reads:
-#   - a literal in a `*u8` slot is rewritten to EXPR_CSTRING_LIT in place, so
+#   - a literal in a `*u8` slot is rewritten to ExprKind.CstringLit in place, so
 #     the emitter (and every check after this one) sees a plain `c"..."`;
 #   - a `/` or `%` that lands in an integer slot records it in Expr.slot_type
 #     (lit_slot_arith, AGAST #3225).
@@ -46,11 +46,11 @@ fn lit_report_str(sm: *Sema, e: *Expr, is_string: i32)
 
 # `e` is a tail landing in a `*u8` slot.
 fn lit_into_ptr(sm: *Sema, e: *Expr)
-    if e.kind == EXPR_STRING_LIT
-        e.kind = EXPR_CSTRING_LIT
+    if e.kind == ExprKind.StringLit
+        e.kind = ExprKind.CstringLit
         return
     var t: SemaTy
-    if sema_expr_ty(sm, e, @t) != TYPE_STRUCT
+    if sema_expr_ty(sm, e, @t) != TypeKind.Struct
         return
     lit_refuse_named(sm, e, StrView { ptr: (t.name), len: (t.name_len) as i64 })
 
@@ -66,24 +66,24 @@ fn lit_refuse_named(sm: *Sema, e: *Expr, name_sv: StrView)
 # A block's tail isn't emitted yet, so its own `let`s aren't in scope: a tail
 # naming one is read off the declaration.  1 if `e` is such a tail.
 fn lit_block_local_into_ptr(sm: *Sema, stmts: *Stmt, e: *Expr) -> i32
-    if e.kind != EXPR_IDENT
+    if e.kind != ExprKind.Ident
         return 0
     var decl: *Stmt = null
     var st: *Stmt = stmts
     while st != null
-        if st.kind == STMT_VAR_DECL and name_eq(StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+        if st.kind == StmtKind.VarDecl and name_eq(StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
             decl = st
         st = st.next
     if decl == null
         return 0
-    if decl.var_declared_type == TYPE_STRUCT
+    if decl.var_declared_type == TypeKind.Struct
         lit_refuse_named(sm, e, StrView { ptr: (decl.var_type_name), len: (decl.var_type_name_len) as i64 })
-    else if decl.var_declared_type == TYPE_VOID and decl.var_init != null
-        if decl.var_init.kind == EXPR_STRING_LIT
+    else if decl.var_declared_type == TypeKind.Void and decl.var_init != null
+        if decl.var_init.kind == ExprKind.StringLit
             lit_report_str(sm, e, 0)
         else
             var t: SemaTy
-            if sema_expr_ty(sm, decl.var_init, @t) == TYPE_STRUCT
+            if sema_expr_ty(sm, decl.var_init, @t) == TypeKind.Struct
                 lit_refuse_named(sm, e, StrView { ptr: (t.name), len: (t.name_len) as i64 })
     1
 
@@ -95,7 +95,7 @@ fn lit_eprint_u64(v: u64)
 # The literal of 2^64 or more under `e`, `-` and all, or null (AGAST #3083).
 fn lit_overflowed(e: *Expr) -> *Expr
     var lit: *Expr = e
-    if e.kind == EXPR_UNARY
+    if e.kind == ExprKind.Unary
         lit = e.operand
     if lit.ident_ptr == null
         return null
@@ -136,11 +136,11 @@ fn lit_eprint_overflowed(lit: *Expr)
 
 # `e` is a tail landing in the integer type `t`, or something else: a literal
 # that can't be a `t` is refused.  The emitter's lit_check_fits until AGAST #3510.
-pub fn lit_fits_check(sm: *Sema, e: *Expr, t: i32)
+pub fn lit_fits_check(sm: *Sema, e: *Expr, t: TypeKind)
     let width: i32 = ty_bits(t)
     if width <= 1
         return
-    if e.kind == EXPR_STRING_LIT
+    if e.kind == ExprKind.StringLit
         if lit_report(sm, e) == 1
             eprints_cstr(c"a string literal does not fit in `")
             eprints_cstr(ty_name(t))
@@ -150,17 +150,17 @@ pub fn lit_fits_check(sm: *Sema, e: *Expr, t: i32)
     if lit_int_value(e, @v) == 0
         return
     # The lexer wraps a literal above i64's range, so a plain one reads negative.
-    let wrapped: i32 = (e.kind == EXPR_INT_LIT and v < 0) as i32
+    let wrapped: i32 = (e.kind == ExprKind.IntLit and v < 0) as i32
     # A negated one reads positive, below -2^63, which fits no type (AGAST #2138).
     # -2^63 itself negates back to i64::MIN, and fits as before.
-    let neg_wrapped: i32 = (e.kind == EXPR_UNARY and v > 0) as i32
+    let neg_wrapped: i32 = (e.kind == ExprKind.Unary and v > 0) as i32
     # 2^64 and past wrap mod 2^64, to anything: their source text says so.
     let over: *Expr = lit_overflowed(e)
     var fits: i32 = 0
     if over != null
         if lit_report(sm, e) == 1
             eprint_char('`')
-            if e.kind == EXPR_UNARY
+            if e.kind == ExprKind.Unary
                 eprint_char('-')
             lit_eprint_overflowed(over)
             eprints_cstr(c"` does not fit in `")
@@ -172,7 +172,7 @@ pub fn lit_fits_check(sm: *Sema, e: *Expr, t: i32)
     else if width < 64
         fits = narrow_fits(v, t)
     else if ty_is_unsigned(t) == 1
-        fits = (e.kind == EXPR_INT_LIT or v == 0) as i32
+        fits = (e.kind == ExprKind.IntLit or v == 0) as i32
     else
         fits = 1 - wrapped
     if fits == 0 and lit_report(sm, e) == 1
@@ -195,13 +195,13 @@ pub fn lit_fits_check(sm: *Sema, e: *Expr, t: i32)
 # `line:1` for a match arm's Block, whose span ritz0 reports as its first line
 # with the column reset to 1 (AGAST #4439), or `line:col` for the `if`
 # expression ritz0 reports whole (AGAST #4441); at the value when neither is.
-fn lit_block_local_into_float(sm: *Sema, stmts: *Stmt, e: *Expr, t: i32, line: i32, col: i32) -> i32
-    if e == null or e.kind != EXPR_IDENT
+fn lit_block_local_into_float(sm: *Sema, stmts: *Stmt, e: *Expr, t: TypeKind, line: i32, col: i32) -> i32
+    if e == null or e.kind != ExprKind.Ident
         return 0
     var decl: *Stmt = null
     var st: *Stmt = stmts
     while st != null
-        if st.kind == STMT_VAR_DECL and name_eq(StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+        if st.kind == StmtKind.VarDecl and name_eq(StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
             decl = st
         st = st.next
     if decl == null
@@ -209,8 +209,8 @@ fn lit_block_local_into_float(sm: *Sema, stmts: *Stmt, e: *Expr, t: i32, line: i
     # AGAST #3892: a pointer `let`, from its annotation (or, unannotated, its
     # initialiser), as the emitter's bool_kind had it in the block's scope.
     var bk: i32 = BK_UNSURE
-    var pointee: i32 = TYPE_VOID
-    if decl.var_declared_type != TYPE_VOID
+    var pointee: TypeKind = TypeKind.Void
+    if decl.var_declared_type != TypeKind.Void
         bk = bk_of_type(decl.var_declared_type, StrView { ptr: (decl.var_type_name), len: (decl.var_type_name_len) as i64 })
         pointee = decl.var_pointee_type
     else if decl.var_init != null
@@ -221,7 +221,7 @@ fn lit_block_local_into_float(sm: *Sema, stmts: *Stmt, e: *Expr, t: i32, line: i
     if bk == BK_PTR
         float_slot_pointer_to(sm, e, pointee, t)
         return 1
-    var src: i32 = NARROW_UNKNOWN
+    var src: TypeKind = TypeKind.NarrowUnknown
     if ty_bits(decl.var_declared_type) > 0 or ty_is_float(decl.var_declared_type) == 1
         src = decl.var_declared_type
     if line > 0
@@ -230,37 +230,39 @@ fn lit_block_local_into_float(sm: *Sema, stmts: *Stmt, e: *Expr, t: i32, line: i
         float_slot_judge(sm, e, src, t)
     1
 
-fn lit_is_float(t: i32) -> i32
-    (t == TYPE_F32 or t == TYPE_F64) as i32
+fn lit_is_float(t: TypeKind) -> i32
+    (t == TypeKind.F32 or t == TypeKind.F64) as i32
 
-fn lit_tail_block(sm: *Sema, stmts: *Stmt, t: i32, pointee: i32, fit: i32, line: i32, col: i32)
+fn lit_tail_block(sm: *Sema, stmts: *Stmt, t: TypeKind, pointee: TypeKind, fit: i32, line: i32, col: i32)
     var last: *Stmt = stmts
     if last == null
         return
     while last.next != null
         last = last.next
-    if last.kind == STMT_EXPR and t == TYPE_PTR and pointee == TYPE_U8
+    if last.kind == StmtKind.Expr and t == TypeKind.Ptr and pointee == TypeKind.U8
         if lit_block_local_into_ptr(sm, stmts, last.expr) == 1
             return
-    if last.kind == STMT_EXPR and fit == 1 and lit_is_float(t) == 1
+    if last.kind == StmtKind.Expr and fit == 1 and lit_is_float(t) == 1
         if lit_block_local_into_float(sm, stmts, last.expr, t, line, col) == 1
             return
     lit_tail_stmt(sm, last, t, pointee, fit, line, col)
 
-fn lit_tail_stmt(sm: *Sema, stmt: *Stmt, t: i32, pointee: i32, fit: i32, line: i32, col: i32)
-    if stmt.kind == STMT_EXPR
-        lit_tails(sm, stmt.expr, t, pointee, fit, line, col)
-    else if stmt.kind == STMT_IF
-        # A fn's trailing `if` is its statement: ritz0 reports the if itself.
-        var oline: i32 = line
-        var ocol: i32 = col
-        if oline == 0
-            oline = stmt.span.line
-            ocol = stmt.span.col
-        lit_tail_block(sm, stmt.if_then, t, pointee, fit, oline, ocol)
-        lit_tail_block(sm, stmt.if_else, t, pointee, fit, oline, ocol)
-    else if stmt.kind == STMT_MATCH
-        lit_tail_arms(sm, stmt.if_then as *MatchArm, t, pointee, fit, 1, line, col)
+fn lit_tail_stmt(sm: *Sema, stmt: *Stmt, t: TypeKind, pointee: TypeKind, fit: i32, line: i32, col: i32)
+    match stmt.kind
+        StmtKind.Expr =>
+            lit_tails(sm, stmt.expr, t, pointee, fit, line, col)
+        StmtKind.If =>
+            # A fn's trailing `if` is its statement: ritz0 reports the if itself.
+            var oline: i32 = line
+            var ocol: i32 = col
+            if oline == 0
+                oline = stmt.span.line
+                ocol = stmt.span.col
+            lit_tail_block(sm, stmt.if_then, t, pointee, fit, oline, ocol)
+            lit_tail_block(sm, stmt.if_else, t, pointee, fit, oline, ocol)
+        StmtKind.Match =>
+            lit_tail_arms(sm, stmt.if_then as *MatchArm, t, pointee, fit, 1, line, col)
+        _ => pass
 
 # The line ritz0 reports a match arm's Block at (AGAST #4439): its first
 # statement's, else its bare tail's, with the column reset to 1.
@@ -274,7 +276,7 @@ fn lit_arm_block_line(arm: *MatchArm) -> i32
 # `block` 1: `arms` are a match's, so a float narrowing is reported at the
 # arm's Block (lit_arm_block_line) -- which wins over the owner's own span, as
 # in ritz0; 0: an if's, reported at the if (`line`/`col`, AGAST #4441).
-fn lit_tail_arms(sm: *Sema, arms: *MatchArm, t: i32, pointee: i32, fit: i32, block: i32, line: i32, col: i32)
+fn lit_tail_arms(sm: *Sema, arms: *MatchArm, t: TypeKind, pointee: TypeKind, fit: i32, block: i32, line: i32, col: i32)
     var arm: *MatchArm = arms
     while arm != null
         if arm.is_pass == 0 and arm.body != null
@@ -284,7 +286,7 @@ fn lit_tail_arms(sm: *Sema, arms: *MatchArm, t: i32, pointee: i32, fit: i32, blo
                 aline = lit_arm_block_line(arm)
                 acol = 0
             var local: i32 = 0
-            if t == TYPE_PTR and pointee == TYPE_U8
+            if t == TypeKind.Ptr and pointee == TypeKind.U8
                 local = lit_block_local_into_ptr(sm, arm.body_stmts, arm.body)
             else if fit == 1 and lit_is_float(t) == 1
                 local = lit_block_local_into_float(sm, arm.body_stmts, arm.body, t, aline, acol)
@@ -295,20 +297,20 @@ fn lit_tail_arms(sm: *Sema, arms: *MatchArm, t: i32, pointee: i32, fit: i32, blo
 # `line`/`col` > 0 is where a float narrowing in this tail is reported (see
 # lit_block_local_into_float); an `if` sets it from its own span when the slot
 # hasn't named a place already.
-fn lit_tails(sm: *Sema, e: *Expr, t: i32, pointee: i32, fit: i32, line: i32, col: i32)
+fn lit_tails(sm: *Sema, e: *Expr, t: TypeKind, pointee: TypeKind, fit: i32, line: i32, col: i32)
     if e == null
         return
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+    if e.kind == ExprKind.If or e.kind == ExprKind.Match
         var oline: i32 = line
         var ocol: i32 = col
-        if oline == 0 and e.kind == EXPR_IF
+        if oline == 0 and e.kind == ExprKind.If
             oline = e.span.line
             ocol = e.span.col
-        lit_tail_arms(sm, e.args as *MatchArm, t, pointee, fit, (e.kind == EXPR_MATCH) as i32, oline, ocol)
+        lit_tail_arms(sm, e.args as *MatchArm, t, pointee, fit, (e.kind == ExprKind.Match) as i32, oline, ocol)
         return
-    if t == TYPE_PTR and pointee == TYPE_U8
+    if t == TypeKind.Ptr and pointee == TypeKind.U8
         lit_into_ptr(sm, e)
-    else if fit == 1 and (t == TYPE_F32 or t == TYPE_F64)
+    else if fit == 1 and (t == TypeKind.F32 or t == TypeKind.F64)
         float_slot_defer_at(e, t, line, col)   # an integer into a float slot (#2945)
     else if fit == 1
         lit_fits_check(sm, e, t)
@@ -326,50 +328,52 @@ fn lit_tails(sm: *Sema, e: *Expr, t: i32, pointee: i32, fit: i32, line: i32, col
 # reaches records the slot (Expr.slot_type) and divides at it.  Directly means
 # through those operators: a call, index, cast, `>>` or `~` reads its operand
 # at the operand's own type (R21), and stops the walk.  Every node reached is
-# rewritten, TYPE_VOID for a slot that isn't an integer, so none keeps a stale
+# rewritten, TypeKind.Void for a slot that isn't an integer, so none keeps a stale
 # slot from an earlier instance.  ritz0's _register_slot_arith.
-fn lit_slot_arith(e: *Expr, t: i32)
+fn lit_slot_arith(e: *Expr, t: TypeKind)
     if e == null
         return
-    if e.kind == EXPR_UNARY and e.op == OP_NEG
+    if e.kind == ExprKind.Unary and e.op == OpKind.Neg
         lit_slot_arith(e.operand, t)
         return
-    if e.kind != EXPR_BINARY
+    if e.kind != ExprKind.Binary
         return
     if e.wrapping == 1
         # LARB R63 (AGAST #3486): `+%` wraps at its operand type by request, so
         # a wider slot doesn't widen it, or anything below it, as a cast stops
         # the walk.  ritz0's _register_slot_arith records None here.
-        e.slot_type = TYPE_VOID
+        e.slot_type = TypeKind.Void
         return
-    let op: i32 = e.op
-    if op == OP_DIV or op == OP_MOD
+    let op: OpKind = e.op
+    if op == OpKind.Div or op == OpKind.Mod
         if ty_bits(t) > 1
             e.slot_type = t
         else
-            e.slot_type = TYPE_VOID
-    if op == OP_ADD or op == OP_SUB or op == OP_MUL or op == OP_DIV or op == OP_MOD or op == OP_BIT_AND or op == OP_BIT_OR or op == OP_BIT_XOR
-        lit_slot_arith(e.left, t)
-        lit_slot_arith(e.right, t)
-    else if op == OP_SHL
-        lit_slot_arith(e.left, t)         # a shift's count has no say (section 7.4)
+            e.slot_type = TypeKind.Void
+    match op
+        OpKind.Add | OpKind.Sub | OpKind.Mul | OpKind.Div | OpKind.Mod | OpKind.BitAnd | OpKind.BitOr | OpKind.BitXor =>
+            lit_slot_arith(e.left, t)
+            lit_slot_arith(e.right, t)
+        OpKind.Shl =>
+            lit_slot_arith(e.left, t)         # a shift's count has no say (section 7.4)
+        _ => pass
 
 # `e` lands in a slot of kind `t`, pointing at `pointee` if it's a pointer.
-pub fn literal_slot(sm: *Sema, e: *Expr, t: i32, pointee: i32)
+pub fn literal_slot(sm: *Sema, e: *Expr, t: TypeKind, pointee: TypeKind)
     lit_tails(sm, e, t, pointee, 1, 0, 0)
 
 # The value of `stmt`, the last of a fn, lands in the fn's return slot.
-pub fn literal_tail(sm: *Sema, stmt: *Stmt, t: i32, pointee: i32)
-    if stmt.kind == STMT_IF or stmt.kind == STMT_MATCH
+pub fn literal_tail(sm: *Sema, stmt: *Stmt, t: TypeKind, pointee: TypeKind)
+    if stmt.kind == StmtKind.If or stmt.kind == StmtKind.Match
         lit_tail_stmt(sm, stmt, t, pointee, 1, 0, 0)
 
 # AGAST #3440 (R62): a `c"..."` is a bare `*u8` with no length, so it doesn't
 # fit a `{ ptr, len }` slot: a `Span<u8>` or a StrView.  Only a plain `"..."`
 # does.  ritz0's _refuse_cstring_in_view.  The slot is named, as a struct is.
-fn lit_view_word(t: i32, name_sv: StrView) -> *u8
+fn lit_view_word(t: TypeKind, name_sv: StrView) -> *u8
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if t != TYPE_STRUCT
+    if t != TypeKind.Struct
         return null
     if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"Span<u8>"), len: (8) as i64 }) == 1
         return c"Span<u8>"
@@ -380,14 +384,14 @@ fn lit_view_word(t: i32, name_sv: StrView) -> *u8
 fn lit_view_tails(sm: *Sema, e: *Expr, word: *u8)
     if e == null
         return
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+    if e.kind == ExprKind.If or e.kind == ExprKind.Match
         var arm: *MatchArm = e.args as *MatchArm
         while arm != null
             if arm.is_pass == 0
                 lit_view_tails(sm, arm.body, word)
             arm = arm.next
         return
-    if e.kind == EXPR_CSTRING_LIT and lit_report(sm, e) == 1
+    if e.kind == ExprKind.CstringLit and lit_report(sm, e) == 1
         eprints_cstr(c"a `c\"...\"` literal is a `*u8`, not a `")
         eprints_cstr(word)
         eprints_cstr(c"`: write a plain `\"...\"` literal\n")
@@ -401,20 +405,22 @@ fn lit_view_block(sm: *Sema, stmts: *Stmt, word: *u8)
     lit_view_stmt(sm, last, word)
 
 fn lit_view_stmt(sm: *Sema, stmt: *Stmt, word: *u8)
-    if stmt.kind == STMT_EXPR
-        lit_view_tails(sm, stmt.expr, word)
-    else if stmt.kind == STMT_IF
-        lit_view_block(sm, stmt.if_then, word)
-        lit_view_block(sm, stmt.if_else, word)
-    else if stmt.kind == STMT_MATCH
-        var arm: *MatchArm = stmt.if_then as *MatchArm
-        while arm != null
-            if arm.is_pass == 0
-                lit_view_tails(sm, arm.body, word)
-            arm = arm.next
+    match stmt.kind
+        StmtKind.Expr =>
+            lit_view_tails(sm, stmt.expr, word)
+        StmtKind.If =>
+            lit_view_block(sm, stmt.if_then, word)
+            lit_view_block(sm, stmt.if_else, word)
+        StmtKind.Match =>
+            var arm: *MatchArm = stmt.if_then as *MatchArm
+            while arm != null
+                if arm.is_pass == 0
+                    lit_view_tails(sm, arm.body, word)
+                arm = arm.next
+        _ => pass
 
 # `e` lands in a slot of kind `t` named `name`.
-pub fn literal_view(sm: *Sema, e: *Expr, t: i32, name_sv: StrView)
+pub fn literal_view(sm: *Sema, e: *Expr, t: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let word: *u8 = lit_view_word(t, StrView { ptr: (name), len: (len) as i64 })
@@ -422,15 +428,15 @@ pub fn literal_view(sm: *Sema, e: *Expr, t: i32, name_sv: StrView)
         lit_view_tails(sm, e, word)
 
 # `stmt`, the last of a fn, lands in its return slot of kind `t` named `name`.
-pub fn literal_view_tail(sm: *Sema, stmt: *Stmt, t: i32, name_sv: StrView)
+pub fn literal_view_tail(sm: *Sema, stmt: *Stmt, t: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let word: *u8 = lit_view_word(t, StrView { ptr: (name), len: (len) as i64 })
-    if word != null and (stmt.kind == STMT_IF or stmt.kind == STMT_MATCH)
+    if word != null and (stmt.kind == StmtKind.If or stmt.kind == StmtKind.Match)
         lit_view_stmt(sm, stmt, word)
 
 # What a fn's return slot points at: `-> *u8` keeps the name, not the kind.
-pub fn literal_ret_pointee(name_sv: StrView) -> i32
+pub fn literal_ret_pointee(name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     primitive_type_from_name(StrView { ptr: (name), len: (len) as i64 })
@@ -438,14 +444,14 @@ pub fn literal_ret_pointee(name_sv: StrView) -> i32
 # `e as T`: a literal takes `*u8` here too, and a StrView still doesn't.  The cast
 # says it means to truncate, so nothing else is checked.
 pub fn literal_cast(sm: *Sema, e: *Expr)
-    lit_tails(sm, e.left, e.op, e.cast_pointee, 0, 0, 0)
+    lit_tails(sm, e.left, e.type_kind, e.cast_pointee, 0, 0, 0)
 
 # One element of a `[N]T` literal: literals fit, and the rest narrow only as a
 # `let` would.
-fn lit_element(sm: *Sema, el: *Expr, elem: i32, pointee: i32)
+fn lit_element(sm: *Sema, el: *Expr, elem: TypeKind, pointee: TypeKind)
     literal_slot(sm, el, elem, pointee)
-    let src: i32 = narrow_sema_unproven(sm, el, elem)
-    if src != 0 and lit_report(sm, el) == 1
+    let src: TypeKind = narrow_sema_unproven(sm, el, elem)
+    if src != TypeKind.Void and lit_report(sm, el) == 1
         eprints_cstr(c"implicit narrowing: this element of a `")
         eprints_cstr(ty_name(elem))
         eprints_cstr(c"` array has type `")
@@ -455,21 +461,23 @@ fn lit_element(sm: *Sema, el: *Expr, elem: i32, pointee: i32)
         eprints_cstr(c"` if truncation is intended\n")
 
 # `e` lands in an array of `elem`.
-pub fn literal_array(sm: *Sema, e: *Expr, elem: i32, pointee: i32)
+pub fn literal_array(sm: *Sema, e: *Expr, elem: TypeKind, pointee: TypeKind)
     if e == null
         return
-    if e.kind == EXPR_ARRAY_FILL
-        lit_element(sm, e.left, elem, pointee)
-    else if e.kind == EXPR_ARRAY_LIT
-        var el: *Expr = e.args
-        while el != null
-            lit_element(sm, el, elem, pointee)
-            el = el.next
+    match e.kind
+        ExprKind.ArrayFill =>
+            lit_element(sm, e.left, elem, pointee)
+        ExprKind.ArrayLit =>
+            var el: *Expr = e.args
+            while el != null
+                lit_element(sm, el, elem, pointee)
+                el = el.next
+        _ => pass
 
 fn lit_field(sm: *Sema, e: *Expr, f: *StructField)
     if f == null
         return
-    if f.field_type == TYPE_ARRAY
+    if f.field_type == TypeKind.Array
         literal_array(sm, e, f.array_elem_type, f.array_elem_pointee)
     else
         literal_slot(sm, e, f.field_type, f.ptr_pointee)
@@ -484,7 +492,7 @@ fn lit_args(sm: *Sema, params: *Param, args: *Expr)
     var p: *Param = params
     var a: *Expr = args
     while p != null and a != null
-        if p.param_type == TYPE_ARRAY
+        if p.param_type == TypeKind.Array
             literal_array(sm, a, p.param_array_elem_type, p.param_array_elem_pointee)
         else
             literal_slot(sm, a, p.param_type, p.param_pointee_type)
@@ -526,8 +534,8 @@ fn lit_into_local(sm: *Sema, e: *Expr, name_sv: StrView)
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (name), len: (len) as i64 })
     if v != null
         # The integer type its declaration wrote, else its kind.
-        if v.narrow != 0
-            literal_slot(sm, e, v.narrow, TYPE_VOID)
+        if v.narrow != TypeKind.Void
+            literal_slot(sm, e, v.narrow, TypeKind.Void)
         else
             literal_slot(sm, e, v.kind, v.pointee)
             literal_carrier(sm, e, v.kind, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 })   # AGAST #3029
@@ -540,87 +548,93 @@ fn lit_into_local(sm: *Sema, e: *Expr, name_sv: StrView)
 fn lit_into_element(sm: *Sema, e: *Expr, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    var kind: i32 = TYPE_VOID
-    var pointee: i32 = TYPE_VOID
+    var kind: TypeKind = TypeKind.Void
+    var pointee: TypeKind = TypeKind.Void
     sema_named_elem(sm, StrView { ptr: (name), len: (len) as i64 }, @kind, @pointee)
-    if kind != TYPE_VOID
+    if kind != TypeKind.Void
         literal_slot(sm, e, kind, pointee)
 
 fn lit_into_target(sm: *Sema, e: *Expr, target: *Expr)
-    if target.kind == EXPR_IDENT
-        lit_into_local(sm, e, StrView { ptr: (target.ident_ptr), len: (target.ident_len) as i64 })
-    else if target.kind == EXPR_MEMBER
-        lit_field(sm, e, sbk_member_field(sm, target))
-    else if target.kind == EXPR_INDEX
-        var kind: i32 = TYPE_VOID
-        var pointee: i32 = TYPE_VOID
-        sema_index_slot(sm, target, @kind, @pointee)   # AGAST #2332, #2440
-        if kind != TYPE_VOID
-            literal_slot(sm, e, kind, pointee)
-    else if target.kind == EXPR_UNARY and target.op == OP_DEREF
-        let at: i32 = lit_deref_slot(sm, target.operand)
-        if at != TYPE_VOID
-            literal_slot(sm, e, at, TYPE_VOID)
+    match target.kind
+        ExprKind.Ident =>
+            lit_into_local(sm, e, StrView { ptr: (target.ident_ptr), len: (target.ident_len) as i64 })
+        ExprKind.Member =>
+            lit_field(sm, e, sbk_member_field(sm, target))
+        ExprKind.Index =>
+            var kind: TypeKind = TypeKind.Void
+            var pointee: TypeKind = TypeKind.Void
+            sema_index_slot(sm, target, @kind, @pointee)   # AGAST #2332, #2440
+            if kind != TypeKind.Void
+                literal_slot(sm, e, kind, pointee)
+        _ =>
+            if target.kind == ExprKind.Unary and target.op == OpKind.Deref
+                let at: TypeKind = lit_deref_slot(sm, target.operand)
+                if at != TypeKind.Void
+                    literal_slot(sm, e, at, TypeKind.Void)
 
 # `*p = e`: what `p` points at, under any `p + k` / `p - k`; `p` may be an
-# element `a[i]` of an `a: [N]*T` (#2332).  TYPE_VOID when Sema can't say.
-fn lit_deref_slot(sm: *Sema, p: *Expr) -> i32
+# element `a[i]` of an `a: [N]*T` (#2332).  TypeKind.Void when Sema can't say.
+fn lit_deref_slot(sm: *Sema, p: *Expr) -> TypeKind
     var x: *Expr = p
-    while x != null and x.kind == EXPR_BINARY and (x.op == OP_ADD or x.op == OP_SUB)
+    while x != null and x.kind == ExprKind.Binary and (x.op == OpKind.Add or x.op == OpKind.Sub)
         x = x.left
     if x == null
-        return TYPE_VOID
-    if x.kind == EXPR_INDEX
-        var kind: i32 = TYPE_VOID
-        var pointee: i32 = TYPE_VOID
+        return TypeKind.Void
+    if x.kind == ExprKind.Index
+        var kind: TypeKind = TypeKind.Void
+        var pointee: TypeKind = TypeKind.Void
         sema_index_slot(sm, x, @kind, @pointee)
-        if kind == TYPE_PTR
+        if kind == TypeKind.Ptr
             return pointee
-        return TYPE_VOID
+        return TypeKind.Void
     var t: SemaTy
-    let k: i32 = sema_expr_ty(sm, x, @t)
-    if k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF
-        return t.pointee
-    if k == TYPE_PTR_PTR
-        return TYPE_PTR
-    TYPE_VOID
+    let k: TypeKind = sema_expr_ty(sm, x, @t)
+    match k
+        TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
+            return t.pointee
+        TypeKind.PtrPtr =>
+            return TypeKind.Ptr
+        _ => pass
+    TypeKind.Void
 
 # `target = value`, in each spelling the parser has for one.
 pub fn literal_stmt(sm: *Sema, stmt: *Stmt)
-    if stmt.kind == STMT_ASSIGN
-        if stmt.assign_target_len != 0
-            lit_into_local(sm, stmt.assign_value, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-        else
-            lit_into_target(sm, stmt.assign_value, stmt.if_cond as *Expr)
-    else if stmt.kind == STMT_INDEX_ASSIGN
-        lit_into_element(sm, stmt.assign_value, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-    else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN or stmt.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
-        if v == null
-            return
-        let st: *StructDef = sema_find_struct(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 })
-        if st == null
-            return
-        let idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-        if idx < 0
-            return
-        let f: *StructField = get_field_type(st, idx)
-        if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
-            lit_field(sm, stmt.assign_value, f)
-        else if f.field_type == TYPE_ARRAY
-            literal_slot(sm, stmt.assign_value, f.array_elem_type, f.array_elem_pointee)
+    match stmt.kind
+        StmtKind.Assign =>
+            if stmt.assign_target_len != 0
+                lit_into_local(sm, stmt.assign_value, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+            else
+                lit_into_target(sm, stmt.assign_value, stmt.if_cond as *Expr)
+        StmtKind.IndexAssign =>
+            lit_into_element(sm, stmt.assign_value, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+        StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
+            if v == null
+                return
+            let st: *StructDef = sema_find_struct(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 })
+            if st == null
+                return
+            let idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+            if idx < 0
+                return
+            let f: *StructField = get_field_type(st, idx)
+            if stmt.kind == StmtKind.LocalFieldAssign
+                lit_field(sm, stmt.assign_value, f)
+            else if f.field_type == TypeKind.Array
+                literal_slot(sm, stmt.assign_value, f.array_elem_type, f.array_elem_pointee)
+        _ => pass
 
 # --- The slots sema_walk visits ----------------------------------------------
 
 # The rows of an N-D `[N][M]T` initialiser, depth `d` of `sh`: each leaf row's
 # elements land in a T (#2357, #3377).
 fn lit_nd_rows(sm: *Sema, sh: *ArrayShape, d: i32, e: *Expr)
-    if e == null or (e.kind != EXPR_ARRAY_LIT and e.kind != EXPR_ARRAY_FILL)
+    if e == null or (e.kind != ExprKind.ArrayLit and e.kind != ExprKind.ArrayFill)
         return
     if d == sh.rank - 1
         literal_array(sm, e, sh.leaf_type, sh.leaf_pointee)
         return
-    if e.kind == EXPR_ARRAY_FILL
+    if e.kind == ExprKind.ArrayFill
         lit_nd_rows(sm, sh, d + 1, e.left)
         return
     var row: *Expr = e.args
@@ -630,12 +644,12 @@ fn lit_nd_rows(sm: *Sema, sh: *ArrayShape, d: i32, e: *Expr)
 
 # A `let` / `var` with a declared type: its initialiser lands in it.
 pub fn literal_decl(sm: *Sema, st: *Stmt)
-    if st.var_init == null or st.var_declared_type == TYPE_VOID
+    if st.var_init == null or st.var_declared_type == TypeKind.Void
         return
     literal_slot(sm, st.var_init, st.var_declared_type, st.var_pointee_type)   # AGAST #2341
     literal_view(sm, st.var_init, st.var_declared_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })   # AGAST #3440
     literal_carrier(sm, st.var_init, st.var_declared_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })   # AGAST #3029
-    if st.var_declared_type == TYPE_ARRAY
+    if st.var_declared_type == TypeKind.Array
         if st.var_array_shape != null
             lit_nd_rows(sm, st.var_array_shape, 0, st.var_init)
         else
@@ -657,9 +671,9 @@ pub fn literal_fn_tail(sm: *Sema, stmt: *Stmt)
     let f: *FnDef = sm.cur_fn
     if f == null
         return
-    let pointee: i32 = literal_ret_pointee(StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
-    if stmt.kind == STMT_EXPR
-        if f.return_type != TYPE_STRUCT
+    let pointee: TypeKind = literal_ret_pointee(StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
+    if stmt.kind == StmtKind.Expr
+        if f.return_type != TypeKind.Struct
             literal_slot(sm, stmt.expr, f.return_type, pointee)
         literal_carrier(sm, stmt.expr, f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })   # AGAST #3029
         return
@@ -684,14 +698,14 @@ pub fn literal_globals(sm: *Sema)
     var c: *ConstEntry = sm.module.constants
     while c != null
         literal_slot(sm, c.value_expr, c.const_type, c.ptr_pointee)   # AGAST #2341
-        if c.const_type == TYPE_ARRAY
+        if c.const_type == TypeKind.Array
             literal_array(sm, c.value_expr, c.array_elem_type, c.array_elem_pointee)
         c = c.next
     var g: *GlobalVarDef = sm.module.globals
     while g != null
         if g.is_extern == 0
             literal_slot(sm, g.init_expr, g.var_type, g.pointee_type)   # AGAST #2341
-            if g.var_type == TYPE_ARRAY
+            if g.var_type == TypeKind.Array
                 literal_array(sm, g.init_expr, g.array_elem_type, g.array_elem_pointee)
         g = g.next
 
@@ -710,48 +724,50 @@ fn lit_is_untyped(e: *Expr) -> i32
     var v: i64 = 0
     lit_int_value(e, @v)
 
-fn lit_arith_op(op: i32) -> i32
-    if op == OP_ADD or op == OP_SUB or op == OP_MUL or op == OP_DIV or op == OP_MOD
+fn lit_arith_op(op: OpKind) -> i32
+    if op == OpKind.Add or op == OpKind.Sub or op == OpKind.Mul or op == OpKind.Div or op == OpKind.Mod
         return 1
-    (op == OP_BIT_AND or op == OP_BIT_OR or op == OP_BIT_XOR or op == OP_SHL or op == OP_SHR) as i32
+    (op == OpKind.BitAnd or op == OpKind.BitOr or op == OpKind.BitXor or op == OpKind.Shl or op == OpKind.Shr) as i32
 
 # The integer type of a non-operator `e`, as Sema types it.
-fn lit_leaf_type(sm: *Sema, e: *Expr) -> i32
-    if e.kind == EXPR_INDEX
-        if e.right == null or e.right.kind == EXPR_RANGE
-            return TYPE_UNKNOWN
-        var kind: i32 = TYPE_VOID
-        var pointee: i32 = TYPE_VOID
-        sema_index_slot(sm, e, @kind, @pointee)
-        return kind
-    if e.kind == EXPR_METHOD
-        let fd: *FnDef = sbk_method_def(sm, e)
-        if fd == null
-            return TYPE_UNKNOWN
-        return fd.return_type
+fn lit_leaf_type(sm: *Sema, e: *Expr) -> TypeKind
+    match e.kind
+        ExprKind.Index =>
+            if e.right == null or e.right.kind == ExprKind.Range
+                return TypeKind.Unknown
+            var kind: TypeKind = TypeKind.Void
+            var pointee: TypeKind = TypeKind.Void
+            sema_index_slot(sm, e, @kind, @pointee)
+            return kind
+        ExprKind.Method =>
+            let fd: *FnDef = sbk_method_def(sm, e)
+            if fd == null
+                return TypeKind.Unknown
+            return fd.return_type
+        _ => pass
     sema_expr_type(sm, e)
 
 # Bit width (8 / 16 / 32 / 64) of `e`'s integer value, and `uns` its sign.
 fn lit_int_shape(sm: *Sema, e: *Expr, uns: *i32) -> i32
     *uns = 0
-    if e.kind == EXPR_INT_LIT
+    if e.kind == ExprKind.IntLit
         if e.int_val < 0
             *uns = 1
         return 64
-    if e.kind == EXPR_UNARY and (e.op == OP_NEG or e.op == OP_BIT_NOT)
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Neg or e.op == OpKind.BitNot)
         return lit_int_shape(sm, e.operand, uns)
-    if e.kind == EXPR_BINARY and lit_arith_op(e.op) == 1
+    if e.kind == ExprKind.Binary and lit_arith_op(e.op) == 1
         let lit_l: i32 = lit_is_untyped(e.left)
         let lit_r: i32 = lit_is_untyped(e.right)
         if lit_r == 1 and lit_l == 0
             return lit_int_shape(sm, e.left, uns)
-        if lit_l == 1 and lit_r == 0 and e.op != OP_SHL and e.op != OP_SHR
+        if lit_l == 1 and lit_r == 0 and e.op != OpKind.Shl and e.op != OpKind.Shr
             return lit_int_shape(sm, e.right, uns)
         var lu: i32 = 0
         var ru: i32 = 0
         let lb: i32 = lit_int_shape(sm, e.left, @lu)
         let rb: i32 = lit_int_shape(sm, e.right, @ru)
-        if e.op == OP_SHL or e.op == OP_SHR
+        if e.op == OpKind.Shl or e.op == OpKind.Shr
             *uns = lu
             if rb > lb
                 return rb
@@ -764,32 +780,34 @@ fn lit_int_shape(sm: *Sema, e: *Expr, uns: *i32) -> i32
             return rb
         *uns = lu | ru
         return lb
-    if e.kind == EXPR_BINARY
+    if e.kind == ExprKind.Binary
         return 64
-    let t: i32 = lit_leaf_type(sm, e)
-    if t == TYPE_U64
-        *uns = 1
-        return 64
-    # A bool is the emitter's i64 slot; what Sema can't type says nothing.
-    if t == TYPE_BOOL or t == TYPE_UNKNOWN or t == TYPE_VOID
-        return 64
+    let t: TypeKind = lit_leaf_type(sm, e)
+    match t
+        TypeKind.U64 =>
+            *uns = 1
+            return 64
+        # A bool is the emitter's i64 slot; what Sema can't type says nothing.
+        TypeKind.Bool | TypeKind.Unknown | TypeKind.Void =>
+            return 64
+        _ => pass
     var signed: i32 = 1
     let bits: i32 = type_code_scalar_bits(t, @signed)
     *uns = 1 - signed
     bits
 
-fn lit_int_kind(bits: i32, uns: i32) -> i32
+fn lit_int_kind(bits: i32, uns: i32) -> TypeKind
     if bits == 8
-        return if uns == 1 then TYPE_U8 else TYPE_I8
+        return if uns == 1 then TypeKind.U8 else TypeKind.I8
     if bits == 16
-        return if uns == 1 then TYPE_U16 else TYPE_I16
+        return if uns == 1 then TypeKind.U16 else TypeKind.I16
     if bits == 32
-        return if uns == 1 then TYPE_U32 else TYPE_I32
-    TYPE_VOID
+        return if uns == 1 then TypeKind.U32 else TypeKind.I32
+    TypeKind.Void
 
 # Every binary operator: an untyped literal operand fits the other's type.
 pub fn literal_operand_check(sm: *Sema, e: *Expr)
-    if e.op == OP_SHL or e.op == OP_SHR or lit_arith_op(e.op) == 0
+    if e.op == OpKind.Shl or e.op == OpKind.Shr or lit_arith_op(e.op) == 0
         return
     let lit_l: i32 = lit_is_untyped(e.left)
     let lit_r: i32 = lit_is_untyped(e.right)
@@ -801,8 +819,8 @@ pub fn literal_operand_check(sm: *Sema, e: *Expr)
         lit = e.left
         other = e.right
     var uns: i32 = 0
-    let t: i32 = lit_int_kind(lit_int_shape(sm, other, @uns), uns)
-    if t != TYPE_VOID
+    let t: TypeKind = lit_int_kind(lit_int_shape(sm, other, @uns), uns)
+    if t != TypeKind.Void
         lit_fits_check(sm, lit, t)
 
 # The expression slots, before `e`'s operands are walked: `e as T`, a struct
@@ -810,15 +828,17 @@ pub fn literal_operand_check(sm: *Sema, e: *Expr)
 # follow call_check (literal_call), and a method's its receiver (literal_method).
 pub fn literal_expr(sm: *Sema, e: *Expr)
     float_slot_due(sm, e)
-    let k: i32 = e.kind
-    if k == EXPR_CAST
-        literal_cast(sm, e)
-    else if k == EXPR_STRUCT_LIT
-        literal_struct_lit(sm, e)
-    else if k == EXPR_CALL or k == EXPR_METHOD
-        literal_variant(sm, e)   # AGAST #3029
-    else if k == EXPR_BINARY
-        literal_operand_check(sm, e)
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Cast =>
+            literal_cast(sm, e)
+        ExprKind.StructLit =>
+            literal_struct_lit(sm, e)
+        ExprKind.Call | ExprKind.Method =>
+            literal_variant(sm, e)   # AGAST #3029
+        ExprKind.Binary =>
+            literal_operand_check(sm, e)
+        _ => pass
 
 # --- AGAST #3029: an array literal a variant carries -------------------------
 #
@@ -835,7 +855,7 @@ fn lit_payload_array(sm: *Sema, enum_name_sv: StrView, tag: i32, out: *ArrayArg)
         return 0
     let uf: *StructField = user_enum_tuple_field(StrView { ptr: (enum_name), len: (len) as i64 }, tag)
     if uf != null
-        if uf.field_type != TYPE_ARRAY or uf.array_size <= 0
+        if uf.field_type != TypeKind.Array or uf.array_size <= 0
             return 0
         out.elem = uf.array_elem_type
         out.pointee = uf.array_elem_pointee
@@ -849,18 +869,18 @@ fn lit_payload_array(sm: *Sema, enum_name_sv: StrView, tag: i32, out: *ArrayArg)
 fn lit_payload(sm: *Sema, enum_name_sv: StrView, tag: i32, payload: *Expr)
     var enum_name: *u8 = enum_name_sv.ptr
     var len: i32 = enum_name_sv.len as i32
-    if payload == null or (payload.kind != EXPR_ARRAY_LIT and payload.kind != EXPR_ARRAY_FILL)
+    if payload == null or (payload.kind != ExprKind.ArrayLit and payload.kind != ExprKind.ArrayFill)
         return
     var arr: ArrayArg
     if lit_payload_array(sm, StrView { ptr: (enum_name), len: (len) as i64 }, tag, @arr) == 1
         literal_array(sm, payload, arr.elem, arr.pointee)
 
-# `E.V(..)` (an EXPR_METHOD on an enum's name no local or global shadows)
+# `E.V(..)` (an ExprKind.Method on an enum's name no local or global shadows)
 # and `V(..)` of one non-generic enum.
 pub fn literal_variant(sm: *Sema, e: *Expr)
-    if e.kind == EXPR_METHOD
+    if e.kind == ExprKind.Method
         let q: *Expr = e.left
-        if q == null or q.kind != EXPR_IDENT or e.args == null or e.args.next != null
+        if q == null or q.kind != ExprKind.Ident or e.args == null or e.args.next != null
             return
         if sema_find_local(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }) != null or sbk_global(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }) != null
             return
@@ -871,7 +891,7 @@ pub fn literal_variant(sm: *Sema, e: *Expr)
         if vi >= 0 and enum_variant_kind(ei, vi) == ENUM_VARIANT_TUPLE
             lit_payload(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }, vi, e.args)
         return
-    if e.kind != EXPR_CALL or e.func_name_len == 0 or e.args == null
+    if e.kind != ExprKind.Call or e.func_name_len == 0 or e.args == null
         return
     # A carrier's name is the builtin's unless a slot says otherwise
     # (users_variant_wins): literal_carrier takes those.
@@ -897,19 +917,19 @@ fn lit_carrier_tag(e: *Expr) -> i32
 
 # `e` lands in a slot of kind `t` named `name`: a `Some([..])` / `Ok([..])` /
 # `Err([..])` there carries the Option / Result the slot names.
-pub fn literal_carrier(sm: *Sema, e: *Expr, t: i32, name_sv: StrView)
+pub fn literal_carrier(sm: *Sema, e: *Expr, t: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if e == null or t != TYPE_STRUCT or name == null
+    if e == null or t != TypeKind.Struct or name == null
         return
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+    if e.kind == ExprKind.If or e.kind == ExprKind.Match
         var arm: *MatchArm = e.args as *MatchArm
         while arm != null
             if arm.is_pass == 0
                 literal_carrier(sm, arm.body, t, StrView { ptr: (name), len: (len) as i64 })
             arm = arm.next
         return
-    if e.kind != EXPR_CALL or e.args == null or e.args.next != null
+    if e.kind != ExprKind.Call or e.args == null or e.args.next != null
         return
     let tag: i32 = lit_carrier_tag(e)
     if tag >= 0
@@ -917,22 +937,24 @@ pub fn literal_carrier(sm: *Sema, e: *Expr, t: i32, name_sv: StrView)
 
 # The value an `if` / `match` statement ends in, in each branch, lands in a
 # slot of kind `t` named `name` (a fn's tail).
-fn lit_carrier_stmt(sm: *Sema, stmt: *Stmt, t: i32, name_sv: StrView)
+fn lit_carrier_stmt(sm: *Sema, stmt: *Stmt, t: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if stmt.kind == STMT_EXPR
-        literal_carrier(sm, stmt.expr, t, StrView { ptr: (name), len: (len) as i64 })
-    else if stmt.kind == STMT_IF
-        lit_carrier_block(sm, stmt.if_then, t, StrView { ptr: (name), len: (len) as i64 })
-        lit_carrier_block(sm, stmt.if_else, t, StrView { ptr: (name), len: (len) as i64 })
-    else if stmt.kind == STMT_MATCH
-        var arm: *MatchArm = stmt.if_then as *MatchArm
-        while arm != null
-            if arm.is_pass == 0
-                literal_carrier(sm, arm.body, t, StrView { ptr: (name), len: (len) as i64 })
-            arm = arm.next
+    match stmt.kind
+        StmtKind.Expr =>
+            literal_carrier(sm, stmt.expr, t, StrView { ptr: (name), len: (len) as i64 })
+        StmtKind.If =>
+            lit_carrier_block(sm, stmt.if_then, t, StrView { ptr: (name), len: (len) as i64 })
+            lit_carrier_block(sm, stmt.if_else, t, StrView { ptr: (name), len: (len) as i64 })
+        StmtKind.Match =>
+            var arm: *MatchArm = stmt.if_then as *MatchArm
+            while arm != null
+                if arm.is_pass == 0
+                    literal_carrier(sm, arm.body, t, StrView { ptr: (name), len: (len) as i64 })
+                arm = arm.next
+        _ => pass
 
-fn lit_carrier_block(sm: *Sema, stmts: *Stmt, t: i32, name_sv: StrView)
+fn lit_carrier_block(sm: *Sema, stmts: *Stmt, t: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var last: *Stmt = stmts

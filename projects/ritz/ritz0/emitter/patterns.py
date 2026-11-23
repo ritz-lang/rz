@@ -234,11 +234,47 @@ class PatternEmitter:
         on ritz1, silently, and a repeated value failed at clang, unlocated.
         `gap` is the R6 check for this scrutinee, asked of the arms so far.
         """
-        found = match_coverage.unreachable_arm(expr.arms, gap, test)
+        found = match_coverage.unreachable_pattern(expr.arms, gap, test)
         if found:
-            arm, cover = found
+            at, _arm, cover = found
             raise EmitError(f"unreachable match arm: the arm at line "
-                            f"{cover.pattern.span.line} covers it", arm.pattern.span)
+                            f"{cover.pattern.span.line} covers it", at.span)
+
+    @staticmethod
+    def _arm_patterns(expr: rast.Match):
+        """(arm, pattern) for every pattern an arm tests: its own, or each
+        alternative of an or-pattern (AGAST #4450)."""
+        for arm in expr.arms:
+            for pattern in match_coverage.alternatives(arm.pattern):
+                yield arm, pattern
+
+    OR_BINDS = ("an or-pattern can't bind a name: each alternative is a "
+                "literal, a const or a variant")
+    OR_WILDCARD = ("`_` can't be an alternative of an or-pattern: it matches "
+                   "everything; give it an arm of its own")
+    OR_PAYLOAD = ("an or-pattern alternative can't have a payload list: give "
+                  "that variant an arm of its own")
+
+    def _refuse_or_alternatives(self, expr: rast.Match, tests) -> None:
+        """An or-pattern's alternatives bind nothing (§8.2, AGAST #4450).
+
+        `_` takes every value, so it is an arm of its own; a payload list
+        (`Some(v)`, even `Some(_)`) is refused whatever it binds; a bare name
+        is a test only where `tests(name)` says so (a variant of this enum, an
+        integer const against an integer), and anywhere else it would bind.
+        Each is said at the alternative, ahead of every other check of the
+        arms. ritz1's twin is match_refuse_or_alternatives.
+        """
+        for arm in expr.arms:
+            if not isinstance(arm.pattern, rast.OrPattern):
+                continue
+            for alt in arm.pattern.alternatives:
+                if isinstance(alt, rast.WildcardPattern):
+                    raise EmitError(self.OR_WILDCARD, alt.span)
+                if isinstance(alt, (rast.VariantPattern, rast.StructPattern)) and alt.fields:
+                    raise EmitError(self.OR_PAYLOAD, alt.span)
+                if isinstance(alt, rast.IdentPattern) and not tests(alt.name):
+                    raise EmitError(self.OR_BINDS, alt.span)
 
     @staticmethod
     def _int_const_fits(const: ir.Constant, width: int) -> bool:
@@ -589,6 +625,7 @@ class PatternEmitter:
         """
         enum_type, variants = self.enum_types[enum_name]
         variant_names = {variant.name for variant in variants}
+        self._refuse_or_alternatives(expr, lambda name: name in variant_names)
         # A char pattern's own error, ahead of the generic literal one.
         self._refuse_char_arms(expr, False)
         self._refuse_pattern_kind(expr, rast.LitPattern)
@@ -601,9 +638,9 @@ class PatternEmitter:
         self._require_covered(expr, match_coverage.enum_gap(expr.arms, names))
         # An arm naming a variant this enum doesn't declare is that error, not
         # an unreachable arm, though it follows every variant (AGAST #2349).
-        for arm in expr.arms:
-            if isinstance(arm.pattern, rast.VariantPattern):
-                self._require_enum_variant(enum_name, arm.pattern.name, arm.pattern.span)
+        for _arm, pattern in self._arm_patterns(expr):
+            if isinstance(pattern, rast.VariantPattern):
+                self._require_enum_variant(enum_name, pattern.name, pattern.span)
         self._require_reachable(expr, lambda arms: match_coverage.enum_gap(arms, names),
                                 match_coverage.enum_test(variant_names))
 
@@ -639,37 +676,37 @@ class PatternEmitter:
         # Build switch instruction
         switch = self.builder.switch(tag, default_block)
 
-        # Add cases for each VariantPattern arm
+        # Add cases for each VariantPattern arm; an or-pattern's alternatives
+        # are each a case of its arm's block (AGAST #4450).
         for i, (arm, arm_block) in enumerate(zip(expr.arms, arm_blocks)):
-            pattern = arm.pattern
-
-            if isinstance(pattern, rast.VariantPattern):
-                # Find the tag for this variant. A pattern naming a variant the
-                # scrutinee's enum does not declare is a source error that no
-                # earlier pass rejects, so report it here against the pattern's
-                # own span instead of letting a bare ValueError escape.
-                self._require_enum_variant(enum_name, pattern.name, pattern.span)
-                self._refuse_payload_pattern(pattern)
-                tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
-                switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
-            elif isinstance(pattern, rast.IdentPattern):
-                # IdentPattern with a variant name (e.g., just `None` without parens)
-                # `variant_to_enum` is global across every enum in scope, so a
-                # bare name belonging to a *different* enum used to pass this
-                # test and then crash in the tag lookup. An unqualified name is
-                # only a variant case when it belongs to *this* enum; otherwise
-                # it is an ordinary catch-all binding.
-                if self._has_enum_variant(enum_name, pattern.name):
+            for pattern in match_coverage.alternatives(arm.pattern):
+                if isinstance(pattern, rast.VariantPattern):
+                    # Find the tag for this variant. A pattern naming a variant the
+                    # scrutinee's enum does not declare is a source error that no
+                    # earlier pass rejects, so report it here against the pattern's
+                    # own span instead of letting a bare ValueError escape.
+                    self._require_enum_variant(enum_name, pattern.name, pattern.span)
+                    self._refuse_payload_pattern(pattern)
                     tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
                     switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
-                else:
-                    # This is a catch-all binding - becomes default
+                elif isinstance(pattern, rast.IdentPattern):
+                    # IdentPattern with a variant name (e.g., just `None` without parens)
+                    # `variant_to_enum` is global across every enum in scope, so a
+                    # bare name belonging to a *different* enum used to pass this
+                    # test and then crash in the tag lookup. An unqualified name is
+                    # only a variant case when it belongs to *this* enum; otherwise
+                    # it is an ordinary catch-all binding.
+                    if self._has_enum_variant(enum_name, pattern.name):
+                        tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
+                        switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
+                    else:
+                        # This is a catch-all binding - becomes default
+                        switch.default = arm_block
+                elif isinstance(pattern, rast.WildcardPattern):
+                    # Wildcard matches any remaining - becomes default
                     switch.default = arm_block
-            elif isinstance(pattern, rast.WildcardPattern):
-                # Wildcard matches any remaining - becomes default
-                switch.default = arm_block
-            else:
-                raise NotImplementedError(f"Pattern type {type(pattern)} not supported in enum match")
+                else:
+                    raise NotImplementedError(f"Pattern type {type(pattern)} not supported in enum match")
 
         # Emit the unreachable block
         self.builder.position_at_end(unreachable_block)
@@ -817,8 +854,7 @@ class PatternEmitter:
         """Refuse a `'(' =>` pattern unless the scrutinee is a u8."""
         if allow_u8:
             return
-        for arm in expr.arms:
-            pattern = arm.pattern
+        for arm, pattern in self._arm_patterns(expr):
             if isinstance(pattern, rast.LitPattern) and pattern.is_char:
                 raise EmitError(self.CHAR_PATTERN_NEEDS_U8,
                                 pattern.span or arm.span)
@@ -832,8 +868,7 @@ class PatternEmitter:
         kind of pattern, said at the pattern. A literal on an enum raised an unlocated NotImplementedError
         (#3002); a `true` there says what #2344 says, as ritz1 does.
         """
-        for arm in expr.arms:
-            pattern = arm.pattern
+        for arm, pattern in self._arm_patterns(expr):
             if not isinstance(pattern, kinds):
                 continue
             message = self._PATTERN_NEEDS[type(pattern)]
@@ -849,8 +884,7 @@ class PatternEmitter:
         the bare `CONST =>`, which compares against the const (it is not a
         fresh binding).  `C.G` with `C` an enum stays a variant.
         """
-        for arm in expr.arms:
-            pat = arm.pattern
+        for _arm, pat in self._arm_patterns(expr):
             if isinstance(pat, rast.VariantPattern) and pat.qualifier and not pat.fields:
                 self._refuse_module_item(pat.qualifier, pat.name, pat.span)
 
@@ -996,12 +1030,13 @@ class PatternEmitter:
         """
         int_type = match_val.type
         is_bool = int_type == self.i1
+        self._refuse_or_alternatives(expr, self._is_integer_const)
         self._refuse_char_arms(expr, int_type == ir.IntType(8))
-        for arm in expr.arms:
-            if (not is_bool and isinstance(arm.pattern, rast.LitPattern)
-                    and isinstance(arm.pattern.value, bool)):
+        for _arm, pattern in self._arm_patterns(expr):
+            if (not is_bool and isinstance(pattern, rast.LitPattern)
+                    and isinstance(pattern.value, bool)):
                 raise EmitError("a `true` or `false` pattern needs a bool scrutinee",
-                                arm.pattern.span)
+                                pattern.span)
         self._resolve_module_consts(expr)
         self._refuse_pattern_kind(expr, rast.VariantPattern)
         # A name that is an integer `const` compares (§8.2); a float or bool
@@ -1044,33 +1079,33 @@ class PatternEmitter:
         # Build switch instruction
         switch = self.builder.switch(match_val, default_block)
 
-        # Add cases for each literal pattern
+        # Add cases for each literal pattern; an or-pattern's alternatives are
+        # each a case of its arm's block (AGAST #4450).
         for i, (arm, arm_block) in enumerate(zip(expr.arms, arm_blocks)):
-            pattern = arm.pattern
-
-            if isinstance(pattern, rast.LitPattern):
-                # Get the literal value
-                lit_val = pattern.value
-                if isinstance(lit_val, int):
-                    case_val = ir.Constant(int_type, lit_val)
-                    switch.add_case(case_val, arm_block)
-                elif isinstance(lit_val, str) and len(lit_val) == 1:
-                    # Character literal
-                    case_val = ir.Constant(int_type, ord(lit_val))
-                    switch.add_case(case_val, arm_block)
-                else:
-                    raise NotImplementedError(f"Literal pattern type not supported: {type(lit_val)}")
-            elif isinstance(pattern, rast.IdentPattern):
-                # Check if this is a constant reference
-                if pattern.name in self.constants:
-                    # Constants are stored as (value, type) tuples
-                    val, ty = self.constants[pattern.name]
-                    if isinstance(ty, ir.IntType):
-                        # Create LLVM constant with the match value's type
-                        case_val = ir.Constant(int_type, val)
+            for pattern in match_coverage.alternatives(arm.pattern):
+                if isinstance(pattern, rast.LitPattern):
+                    # Get the literal value
+                    lit_val = pattern.value
+                    if isinstance(lit_val, int):
+                        case_val = ir.Constant(int_type, lit_val)
                         switch.add_case(case_val, arm_block)
-                # Otherwise it's a catch-all (handled as default above)
-            # WildcardPattern is handled as default above
+                    elif isinstance(lit_val, str) and len(lit_val) == 1:
+                        # Character literal
+                        case_val = ir.Constant(int_type, ord(lit_val))
+                        switch.add_case(case_val, arm_block)
+                    else:
+                        raise NotImplementedError(f"Literal pattern type not supported: {type(lit_val)}")
+                elif isinstance(pattern, rast.IdentPattern):
+                    # Check if this is a constant reference
+                    if pattern.name in self.constants:
+                        # Constants are stored as (value, type) tuples
+                        val, ty = self.constants[pattern.name]
+                        if isinstance(ty, ir.IntType):
+                            # Create LLVM constant with the match value's type
+                            case_val = ir.Constant(int_type, val)
+                            switch.add_case(case_val, arm_block)
+                    # Otherwise it's a catch-all (handled as default above)
+                # WildcardPattern is handled as default above
 
         # Emit the unreachable block if we created one
         if default_arm_idx is None:
@@ -1090,8 +1125,7 @@ class PatternEmitter:
         """A `"..."` arm compares a StrView, so on anything else it is an error
         at the arm (AGAST #1876). A `*u8` or `String` scrutinee converts first:
         `StrView.from_cstr(p)`, `s.as_view()`."""
-        for arm in expr.arms:
-            pattern = arm.pattern
+        for arm, pattern in self._arm_patterns(expr):
             if isinstance(pattern, rast.LitPattern) and isinstance(pattern.value, str):
                 raise EmitError(self.STRING_PATTERN_NEEDS_STRVIEW,
                                 pattern.span or arm.span)
@@ -1110,9 +1144,9 @@ class PatternEmitter:
         an integer, so every name binds the StrView. ritz1's twin is
         emit_str_pattern_test in emitter_match.ritz.
         """
+        self._refuse_or_alternatives(expr, lambda name: False)
         self._refuse_char_arms(expr, False)
-        for arm in expr.arms:
-            pattern = arm.pattern
+        for arm, pattern in self._arm_patterns(expr):
             if isinstance(pattern, rast.LitPattern) and not isinstance(pattern.value, str):
                 message = self._PATTERN_NEEDS[rast.LitPattern]
                 if isinstance(pattern.value, bool):
@@ -1131,29 +1165,30 @@ class PatternEmitter:
         ptr = self.builder.extract_value(match_val, 0)
         length = self.builder.extract_value(match_val, 1)
         for i, arm in enumerate(expr.arms):
-            pattern = arm.pattern
-            if not isinstance(pattern, rast.LitPattern):
+            if not isinstance(arm.pattern, (rast.LitPattern, rast.OrPattern)):
                 # A catch-all; reachability refused any arm after it.
                 self.builder.branch(arm_blocks[i])
                 break
-            data = pattern.value.encode('utf-8')
-            nxt = self.current_fn.append_basic_block(f"match.next.{i}")
-            same_len = self.builder.icmp_signed(
-                '==', length, ir.Constant(length.type, len(data)))
-            if not data:
-                self.builder.cbranch(same_len, arm_blocks[i], nxt)
-            else:
-                cmp_block = self.current_fn.append_basic_block(f"match.bytes.{i}")
-                self.builder.cbranch(same_len, cmp_block, nxt)
-                self.builder.position_at_end(cmp_block)
-                equal = None
-                for k, byte in enumerate(data):
-                    at = self.builder.gep(ptr, [ir.Constant(self.i64, k)])
-                    hit = self.builder.icmp_unsigned(
-                        '==', self.builder.load(at), ir.Constant(self.i8, byte))
-                    equal = hit if equal is None else self.builder.and_(equal, hit)
-                self.builder.cbranch(equal, arm_blocks[i], nxt)
-            self.builder.position_at_end(nxt)
+            # An or-pattern tests each alternative in turn (AGAST #4450).
+            for pattern in match_coverage.alternatives(arm.pattern):
+                data = pattern.value.encode('utf-8')
+                nxt = self.current_fn.append_basic_block(f"match.next.{i}")
+                same_len = self.builder.icmp_signed(
+                    '==', length, ir.Constant(length.type, len(data)))
+                if not data:
+                    self.builder.cbranch(same_len, arm_blocks[i], nxt)
+                else:
+                    cmp_block = self.current_fn.append_basic_block(f"match.bytes.{i}")
+                    self.builder.cbranch(same_len, cmp_block, nxt)
+                    self.builder.position_at_end(cmp_block)
+                    equal = None
+                    for k, byte in enumerate(data):
+                        at = self.builder.gep(ptr, [ir.Constant(self.i64, k)])
+                        hit = self.builder.icmp_unsigned(
+                            '==', self.builder.load(at), ir.Constant(self.i8, byte))
+                        equal = hit if equal is None else self.builder.and_(equal, hit)
+                    self.builder.cbranch(equal, arm_blocks[i], nxt)
+                self.builder.position_at_end(nxt)
         else:
             # Coverage demands a catch-all, so this is never reached.
             self.builder.unreachable()

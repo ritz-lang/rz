@@ -15,7 +15,7 @@
 # This is ritz0's `_int_into_float_slot`, and ritz0/test_implicit_int_to_float.py
 # feeds the same programs to both; the words are ritz0/float_rules.py's.  The
 # source type comes from narrowing.ritz's narrow_src_type, which answers
-# NARROW_UNKNOWN when unsure: then the value converts as before (sitofp of the
+# TypeKind.NarrowUnknown when unsure: then the value converts as before (sitofp of the
 # i64 register) and nothing is refused, so a gap here is a missed refusal,
 # never a refused program ritz0 accepts.
 #
@@ -51,11 +51,11 @@ import sema_type   # sema_expr_ty: what a pointer points at
 pub fn fs_literal_only(e: *Expr) -> i32
     if e == null
         return 0
-    if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
+    if e.kind == ExprKind.IntLit or e.kind == ExprKind.CharLit
         return 1
-    if e.kind == EXPR_UNARY and (e.op == OP_NEG or e.op == OP_BIT_NOT)
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Neg or e.op == OpKind.BitNot)
         return fs_literal_only(e.operand)
-    if e.kind == EXPR_BINARY and narrow_is_arith_op(e.op) == 1
+    if e.kind == ExprKind.Binary and narrow_is_arith_op(e.op) == 1
         if fs_literal_only(e.left) == 1 and fs_literal_only(e.right) == 1
             return 1
     0
@@ -64,14 +64,14 @@ pub fn fs_literal_only(e: *Expr) -> i32
 # operand, a cast at its operand).
 fn fs_report_at(e: *Expr) -> *Expr
     var at: *Expr = e
-    while at.kind == EXPR_BINARY or at.kind == EXPR_CAST
+    while at.kind == ExprKind.Binary or at.kind == ExprKind.Cast
         at = at.left
     at
 
 # Is every value of integer type `src` exact in float type `dst`?
-fn fs_exact(src: i32, dst: i32) -> i32
+fn fs_exact(src: TypeKind, dst: TypeKind) -> i32
     let bits: i32 = ty_bits(src)
-    if dst == TYPE_F64
+    if dst == TypeKind.F64
         return if bits <= 32 then 1 else 0
     if bits <= 16 then 1 else 0
 
@@ -90,17 +90,19 @@ fn fs_exact(src: i32, dst: i32) -> i32
 fn fs_float_literal_only(e: *Expr) -> i32
     if e == null
         return 0
-    if e.kind == EXPR_FLOAT_LIT or e.kind == EXPR_INT_LIT
+    if e.kind == ExprKind.FloatLit or e.kind == ExprKind.IntLit
         return 1
-    if e.kind == EXPR_UNARY and e.op == OP_NEG
+    if e.kind == ExprKind.Unary and e.op == OpKind.Neg
         return fs_float_literal_only(e.operand)
-    if e.kind == EXPR_BINARY
-        if e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV or e.op == OP_MOD
-            if fs_float_literal_only(e.left) == 1 and fs_float_literal_only(e.right) == 1
-                return 1
-        return 0
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
-        return fs_float_arms_literal_only(e.args as *MatchArm)
+    match e.kind
+        ExprKind.Binary =>
+            if e.op == OpKind.Add or e.op == OpKind.Sub or e.op == OpKind.Mul or e.op == OpKind.Div or e.op == OpKind.Mod
+                if fs_float_literal_only(e.left) == 1 and fs_float_literal_only(e.right) == 1
+                    return 1
+            return 0
+        ExprKind.If | ExprKind.Match =>
+            return fs_float_arms_literal_only(e.args as *MatchArm)
+        _ => pass
     0
 
 # 1 when every value arm of `arm` is a float literal / constant expression.
@@ -115,43 +117,43 @@ fn fs_float_arms_literal_only(arm: *MatchArm) -> i32
         a = a.next
     1
 
-# The float width (TYPE_F32 / TYPE_F64) of `e` as a value, or 0 when Sema
+# The float width (TypeKind.F32 / TypeKind.F64) of `e` as a value, or 0 when Sema
 # cannot say.  An if / match takes the width of its non-literal arms: a float
 # literal arm takes the other sides' width (§7.1), so it is a wildcard.
-pub fn float_slot_src(sm: *Sema, e: *Expr) -> i32
+pub fn float_slot_src(sm: *Sema, e: *Expr) -> TypeKind
     if e == null
-        return 0
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        return TypeKind.Void
+    if e.kind == ExprKind.If or e.kind == ExprKind.Match
         return fs_float_merge(sm, e.args as *MatchArm)
-    if e.kind == EXPR_IDENT
+    if e.kind == ExprKind.Ident
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if v != null
-            if v.kind == TYPE_F32 or v.kind == TYPE_F64
+            if v.kind == TypeKind.F32 or v.kind == TypeKind.F64
                 return v.kind
-            if v.float_src == TYPE_F32 or v.float_src == TYPE_F64
+            if v.float_src == TypeKind.F32 or v.float_src == TypeKind.F64
                 return v.float_src
     # An integer literal operand leaves the expression untyped here (`y * 2`),
     # and that is a gap, not a guess; a float literal is exempt above.
-    let t: i32 = sema_expr_type(sm, e)
-    if t == TYPE_F32 or t == TYPE_F64
+    let t: TypeKind = sema_expr_type(sm, e)
+    if t == TypeKind.F32 or t == TypeKind.F64
         return t
-    0
+    TypeKind.Void
 
 # The float width an if / match yields, from its non-literal arms (f32 with
 # f64 widens to f64).  0 when none is a typed float.
-fn fs_float_merge(sm: *Sema, arm: *MatchArm) -> i32
-    var merged: i32 = TYPE_VOID
+fn fs_float_merge(sm: *Sema, arm: *MatchArm) -> TypeKind
+    var merged: TypeKind = TypeKind.Void
     var a: *MatchArm = arm
     while a != null
         if a.is_pass == 0 and a.body != null
             if fs_float_literal_only(a.body) == 0
-                let w: i32 = float_slot_src(sm, a.body)
-                if w == 0
-                    return 0
-                if merged == TYPE_VOID
+                let w: TypeKind = float_slot_src(sm, a.body)
+                if w == TypeKind.Void
+                    return TypeKind.Void
+                if merged == TypeKind.Void
                     merged = w
                 else if merged != w
-                    merged = TYPE_F64
+                    merged = TypeKind.F64
         a = a.next
     merged
 
@@ -160,7 +162,7 @@ fn fs_float_merge(sm: *Sema, arm: *MatchArm) -> i32
 # at `line:col`, else `line:1` (an arm's Block, whose span ritz0 reports as its
 # first line, column 1, AGAST #4439); with no line, at the value.  An `if`
 # expression is reported at itself, column and all (AGAST #4441).
-fn fs_report_narrow_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32, col: i32)
+fn fs_report_narrow_at(sm: *Sema, value: *Expr, src: TypeKind, dst: TypeKind, line: i32, col: i32)
     if line > 0
         if col > 0
             if bool_sema_report_pos(sm, line, col) == 0
@@ -177,24 +179,24 @@ fn fs_report_narrow_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32, c
     eprints_cstr(c_float_name(dst))
     eprints_cstr(c"`\n")
 
-fn fs_report_narrow(sm: *Sema, value: *Expr, src: i32, dst: i32)
+fn fs_report_narrow(sm: *Sema, value: *Expr, src: TypeKind, dst: TypeKind)
     fs_report_narrow_at(sm, value, src, dst, 0, 0)
 
-# `value`, of float type where narrow_sema_src_type answered NARROW_UNKNOWN,
+# `value`, of float type where narrow_sema_src_type answered TypeKind.NarrowUnknown,
 # lands in float slot `dst`: refuse an f64 value in an f32 slot (LARB R70).
 # `src` is the type a block tail's declaration gave it (#4439, #4441), or
 # NARROW_* when only the value can say.  `line` > 0 is the place to report at,
 # as fs_report_narrow_at takes it.
-fn fs_float_narrow_check_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32, col: i32)
-    if dst != TYPE_F32 or fs_float_literal_only(value) == 1
+fn fs_float_narrow_check_at(sm: *Sema, value: *Expr, src: TypeKind, dst: TypeKind, line: i32, col: i32)
+    if dst != TypeKind.F32 or fs_float_literal_only(value) == 1
         return
     # A known source decides it; only when Sema has none (NARROW_*) does the
     # value have to answer for itself, which it can't once its scope closes.
-    var w: i32 = src
-    if w != TYPE_F64
+    var w: TypeKind = src
+    if w != TypeKind.F64
         w = float_slot_src(sm, value)
-    if w == TYPE_F64
-        fs_report_narrow_at(sm, value, TYPE_F64, TYPE_F32, line, col)
+    if w == TypeKind.F64
+        fs_report_narrow_at(sm, value, TypeKind.F64, TypeKind.F32, line, col)
 
 # Sema's annotation: the values landing in a float slot whose source type is
 # an unsigned integer exact there (u8 / u16 / u32), keyed by the Expr, mapped
@@ -202,7 +204,7 @@ fn fs_float_narrow_check_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i
 var g_fs_unsigned: *HashMapI64 = null
 var g_fs_ready: i32 = 0
 
-fn float_slot_note(value: *Expr, src: i32)
+fn float_slot_note(value: *Expr, src: TypeKind)
     if g_fs_ready == 0
         g_fs_unsigned = malloc(sizeof(HashMapI64)) as *HashMapI64
         *g_fs_unsigned = hashmap_i64_with_cap(256)
@@ -217,30 +219,30 @@ pub fn float_slot_unsigned(value: *Expr) -> i32
 
 # `value` lands in an f32 / f64 slot of type `dst` (a Sema check, AGAST #3510):
 # refuse an inexact integer source (see the header), and note an unsigned one.
-pub fn float_slot_check(sm: *Sema, value: *Expr, dst: i32)
+pub fn float_slot_check(sm: *Sema, value: *Expr, dst: TypeKind)
     float_slot_check_at(sm, value, dst, 0, 0)
 
 # float_slot_check, with a `line` > 0 to report a float narrowing at: an arm's
 # Block (AGAST #4439), or an `if` expression's own line and column (#4441).
-pub fn float_slot_check_at(sm: *Sema, value: *Expr, dst: i32, line: i32, col: i32)
+pub fn float_slot_check_at(sm: *Sema, value: *Expr, dst: TypeKind, line: i32, col: i32)
     if value == null or float_slot_pointer(sm, value, dst) == 1 or fs_literal_only(value) == 1
         return
     float_slot_judge_at(sm, value, narrow_sema_src_type(sm, value), dst, line, col)
 
 # `value`, of integer type `src` (or NARROW_*), lands in a float slot `dst`.
-pub fn float_slot_judge(sm: *Sema, value: *Expr, src: i32, dst: i32)
+pub fn float_slot_judge(sm: *Sema, value: *Expr, src: TypeKind, dst: TypeKind)
     float_slot_judge_at(sm, value, src, dst, 0, 0)
 
 # float_slot_judge, with a `line` > 0 to report a float narrowing at: the
 # match arm's Block whose tail named a block-local declaration (#4439), or the
 # `if` expression itself, column and all (#4441).
-pub fn float_slot_judge_at(sm: *Sema, value: *Expr, src: i32, dst: i32, line: i32, col: i32)
+pub fn float_slot_judge_at(sm: *Sema, value: *Expr, src: TypeKind, dst: TypeKind, line: i32, col: i32)
     # A float source narrows only from f64 to f32 (LARB R70, AGAST #3998);
     # narrow_sema_src_type types integers alone, so a float reaches the first
-    # arm as NARROW_UNKNOWN and is typed here.
-    if src == TYPE_F32
+    # arm as TypeKind.NarrowUnknown and is typed here.
+    if src == TypeKind.F32
         return
-    if src == TYPE_F64 or src == NARROW_UNKNOWN or src == NARROW_LIT or ty_bits(src) <= 1
+    if src == TypeKind.F64 or src == TypeKind.NarrowUnknown or src == TypeKind.NarrowLit or ty_bits(src) <= 1
         fs_float_narrow_check_at(sm, value, src, dst, line, col)
         return
     if fs_exact(src, dst) == 0
@@ -265,10 +267,10 @@ const FS_DST_MASK: i64 = 65535
 const FS_LINE_SHIFT: i64 = 16
 const FS_COL_SHIFT: i64 = 32
 
-pub fn float_slot_defer(value: *Expr, dst: i32)
+pub fn float_slot_defer(value: *Expr, dst: TypeKind)
     float_slot_defer_at(value, dst, 0, 0)
 
-pub fn float_slot_defer_at(value: *Expr, dst: i32, line: i32, col: i32)
+pub fn float_slot_defer_at(value: *Expr, dst: TypeKind, line: i32, col: i32)
     if value == null
         return
     if g_fs_pending_ready == 0
@@ -285,7 +287,7 @@ pub fn float_slot_due(sm: *Sema, e: *Expr)
     let key: i64 = (*g_fs_pending).get(e as i64)
     if key != 0
         (*g_fs_pending).remove(e as i64)
-        let dst: i32 = (key & FS_DST_MASK) as i32
+        let dst: TypeKind = type_kind_of((key & FS_DST_MASK) as i32)
         let line: i32 = ((key >> FS_LINE_SHIFT) & FS_DST_MASK) as i32
         let col: i32 = ((key >> FS_COL_SHIFT) & FS_DST_MASK) as i32
         float_slot_check_at(sm, e, dst, line, col)
@@ -324,20 +326,20 @@ pub fn float_slot_pointer_at(sm: *Sema, value: *Expr)
 # slot is ref_check's "a reference or pointer doesn't fit a by-value slot:
 # write `*` to read through it", as in ritz0 (test_ref_into_value.py): noted
 # as said, so its if / match (float_arms_settle) leaves it to ref_check too.
-pub fn float_slot_pointer(sm: *Sema, value: *Expr, dst: i32) -> i32
+pub fn float_slot_pointer(sm: *Sema, value: *Expr, dst: TypeKind) -> i32
     if sema_bool_kind(sm, value) != BK_PTR
         return 0
     var t: SemaTy
-    var pointee: i32 = TYPE_VOID
-    let k: i32 = sema_expr_ty(sm, value, @t)
-    if k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF
+    var pointee: TypeKind = TypeKind.Void
+    let k: TypeKind = sema_expr_ty(sm, value, @t)
+    if k == TypeKind.Ptr or k == TypeKind.Ref or k == TypeKind.MutRef
         pointee = t.pointee
     float_slot_pointer_to(sm, value, pointee, dst)
     1
 
-# float_slot_pointer for a `value` known to point at `pointee` (TYPE_VOID if
+# float_slot_pointer for a `value` known to point at `pointee` (TypeKind.Void if
 # unknown).
-pub fn float_slot_pointer_to(sm: *Sema, value: *Expr, pointee: i32, dst: i32)
+pub fn float_slot_pointer_to(sm: *Sema, value: *Expr, pointee: TypeKind, dst: TypeKind)
     if pointee == dst
         fs_pointer_said(value)
     else
@@ -346,7 +348,7 @@ pub fn float_slot_pointer_to(sm: *Sema, value: *Expr, pointee: i32, dst: i32)
 # An if / match's arms, judged in each arm's scope as the walk leaves it
 # (float_arm_note), then settled once all are (float_arms_settle): the if /
 # matches with a float arm, and the arm values that are pointers.
-var g_fs_float_owner: *HashMapI64 = null   # EXPR_IF / EXPR_MATCH -> 1: an arm is a float
+var g_fs_float_owner: *HashMapI64 = null   # ExprKind.If / ExprKind.Match -> 1: an arm is a float
 var g_fs_ptr_arm: *HashMapI64 = null       # arm value -> 1: a pointer
 var g_fs_arms_ready: i32 = 0
 
@@ -358,7 +360,7 @@ fn fs_arms_init()
         *g_fs_ptr_arm = hashmap_i64_with_cap(64)
         g_fs_arms_ready = 1
 
-# The walk just left `arm` of `owner` (an EXPR_IF / EXPR_MATCH), with the
+# The walk just left `arm` of `owner` (an ExprKind.If / ExprKind.Match), with the
 # arm's bindings and `let`s still in scope.  A nested if / match arm is a
 # float when one of its own arms is (it was settled first); it is never a
 # pointer arm here: its own pointer arm is its own.
@@ -367,7 +369,7 @@ pub fn float_arm_note(sm: *Sema, owner: *Expr, arm: *MatchArm)
         return
     fs_arms_init()
     let v: *Expr = arm.body
-    if v.kind == EXPR_IF or v.kind == EXPR_MATCH
+    if v.kind == ExprKind.If or v.kind == ExprKind.Match
         if (*g_fs_float_owner).get(v as i64) != 0
             (*g_fs_float_owner).insert(owner as i64, 1)
         return
@@ -390,7 +392,7 @@ pub fn float_arms_settle(sm: *Sema, owner: *Expr, arms: *MatchArm)
             float_slot_pointer_at(sm, arm.body)
         arm = arm.next
 
-fn c_float_name(t: i32) -> *u8
-    if t == TYPE_F32
+fn c_float_name(t: TypeKind) -> *u8
+    if t == TypeKind.F32
         return c"f32"
     c"f64"

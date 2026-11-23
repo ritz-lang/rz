@@ -638,6 +638,15 @@ class VariantPattern(Pattern):
 
 
 @dataclass
+class OrPattern(Pattern):
+    """Or-pattern `A | B | C` (LANGUAGE_SPEC §8.2, AGAST #4450): the arm is
+    taken when any alternative matches.  Only a match arm's top-level pattern
+    is one, and an alternative binds nothing: the emitter refuses a binding,
+    `_` and a payload list (patterns.py, _refuse_or_alternatives)."""
+    alternatives: List[Pattern]
+
+
+@dataclass
 class StructPattern(Pattern):
     """Struct pattern: Point { x, y }."""
     name: str

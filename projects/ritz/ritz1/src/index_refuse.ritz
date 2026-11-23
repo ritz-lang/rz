@@ -38,7 +38,7 @@ import types           # ty_int_in, ty_is_float
 
 # 1 for a scalar type no ritz1 local uses to hold a pointer (AGAST #2885): an
 # i64 or u64 may, so neither is refused.
-fn ir_sized_scalar(t: i32) -> i32
+fn ir_sized_scalar(t: TypeKind) -> i32
     (ty_int_in(t, 8, 32) == 1 or ty_is_float(t) == 1) as i32
 
 # `x`, a name, as the emitter's local of it: 1 and its type in *out, its `:&`
@@ -46,18 +46,18 @@ fn ir_sized_scalar(t: i32) -> i32
 # what it was written (a `c:& C` is an `@&C`); rs_local reads it as its C.
 fn ir_local(sm: *Sema, x: *Expr, out: *SemaTy, lent: **Param) -> *SemaVar
     *lent = null
-    if x == null or x.kind != EXPR_IDENT
+    if x == null or x.kind != ExprKind.Ident
         return null
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
     if v == null
         return null
     if v.lent != null
         let p: *Param = v.lent
-        let ipt: i32 = p.param_inner_pointee_type
-        if p.is_borrow == 1 and p.param_pointee_type == TYPE_PTR and (ipt == TYPE_ARRAY or primitive_name_len(ipt) > 0 or (ipt == TYPE_STRUCT and p.param_type_name_len > 0))
+        let ipt: TypeKind = ptr_slot_flat(p.param_inner_pointee_type)
+        if p.is_borrow == 1 and p.param_pointee_type == TypeKind.Ptr and (ipt == TypeKind.Array or primitive_name_len(ipt) > 0 or (ipt == TypeKind.Struct and p.param_type_name_len > 0))
             # AGAST #2075 / #3103: `p:& *T` binds as the caller's `*T` local
             # (bind_scalar_borrow_param), not as a lent one.
-            rs_set(out, TYPE_PTR, ipt, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+            rs_set(out, TypeKind.Ptr, ipt, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
             return v
         *lent = p
         rs_set(out, p.param_type, p.param_pointee_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
@@ -81,7 +81,7 @@ fn ir_at_bracket(sm: *Sema, e: *Expr, msg: *u8) -> i32
 
 # needs_index's words for `name` (or, with `name` null, the scalar `kind`) at
 # `e`'s `[`; 0 when a scalar `kind` has no name.
-fn ir_needs_index(sm: *Sema, e: *Expr, name_sv: StrView, kind: i32) -> i32
+fn ir_needs_index(sm: *Sema, e: *Expr, name_sv: StrView, kind: TypeKind) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var n: *u8 = name
@@ -111,11 +111,11 @@ fn ir_reference_refused(sm: *Sema, e: *Expr) -> i32
     let v: *SemaVar = ir_local(sm, e.left, @t, @lent)
     if v == null
         return 0
-    if t.kind != TYPE_REF and t.kind != TYPE_MUT_REF
+    if t.kind != TypeKind.Ref and t.kind != TypeKind.MutRef
         return 0
-    if t.pointee == TYPE_ARRAY
+    if t.pointee == TypeKind.Array
         return 0
-    if t.pointee == TYPE_STRUCT and name_is_indexable(StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 1
+    if t.pointee == TypeKind.Struct and name_is_indexable(StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 1
         return 0
     sema_error_at(sm, e.span.line, e.span.col)
     eprints_cstr(c"a reference is one value, not a buffer: `[]` needs an array, Vec, Span or String behind it\n")
@@ -130,7 +130,7 @@ fn ir_reference_refused(sm: *Sema, e: *Expr) -> i32
 # bases rs_ty types where sema_expr_ty can't).
 fn ir_element_refused(sm: *Sema, e: *Expr) -> i32
     let inner: *Expr = e.left
-    if inner.right == null or inner.right.kind == EXPR_RANGE
+    if inner.right == null or inner.right.kind == ExprKind.Range
         return 0
     var root: *Expr = inner.left
     if root == null
@@ -138,44 +138,46 @@ fn ir_element_refused(sm: *Sema, e: *Expr) -> i32
     var t: SemaTy
     var lent: *Param = null
     let v: *SemaVar = ir_local(sm, root, @t, @lent)
-    if v != null and lent == null and t.kind == TYPE_ARRAY
+    if v != null and lent == null and t.kind == TypeKind.Array
         # An element of a local `[N]T`: a row of an N-D one indexes.
         var el: SemaTy
-        let ek: i32 = sema_arr_elem(@t, @el)
-        if ek == TYPE_UNKNOWN or ek == TYPE_ARRAY
-            return 0
-        if ek == TYPE_STRUCT
-            if ir_struct_indexes(sm, StrView { ptr: (el.name), len: (el.name_len) as i64 }) == 1
+        let ek: TypeKind = sema_arr_elem(@t, @el)
+        match ek
+            TypeKind.Unknown | TypeKind.Array =>
                 return 0
-            return ir_needs_index(sm, e, StrView { ptr: (el.name), len: (el.name_len) as i64 }, TYPE_STRUCT)
+            TypeKind.Struct =>
+                if ir_struct_indexes(sm, StrView { ptr: (el.name), len: (el.name_len) as i64 }) == 1
+                    return 0
+                return ir_needs_index(sm, e, StrView { ptr: (el.name), len: (el.name_len) as i64 }, TypeKind.Struct)
+            _ => pass
         return ir_needs_index(sm, e, StrView { ptr: (null), len: (0) as i64 }, ek)
     if v != null and lent == null
         # An element of the `[N]T` a `*[N]T` points at (its `p#` view).
-        let view: i32 = sema_view_elem(sm, v)
-        if view != TYPE_VOID
-            if view == TYPE_STRUCT
+        let view: TypeKind = sema_view_elem(sm, v)
+        if view != TypeKind.Void
+            if view == TypeKind.Struct
                 if ir_struct_indexes(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) == 1
                     return 0
-                return ir_needs_index(sm, e, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, TYPE_STRUCT)
+                return ir_needs_index(sm, e, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, TypeKind.Struct)
             return ir_needs_index(sm, e, StrView { ptr: (null), len: (0) as i64 }, view)
     # An element of a Vec, Span or String, or of what a pointer to one points
     # at: `v[i]`, `(*p)[i]`, `x.vf[i]`.
-    let rk: i32 = root.kind
-    if rk != EXPR_IDENT and rk != EXPR_MEMBER and (rk != EXPR_UNARY or root.op != OP_DEREF)
+    let rk: ExprKind = root.kind
+    if rk != ExprKind.Ident and rk != ExprKind.Member and (rk != ExprKind.Unary or root.op != OpKind.Deref)
         return 0
     if v == null and rs_ty(sm, root, @t) == 0
         return 0
-    if rk == EXPR_IDENT and t.kind != TYPE_STRUCT and (ref_is_pointer(t.kind) == 0 or t.pointee != TYPE_STRUCT)
+    if rk == ExprKind.Ident and t.kind != TypeKind.Struct and (ref_is_pointer(t.kind) == 0 or t.pointee != TypeKind.Struct)
         return 0
-    var k: i32 = TYPE_VOID
+    var k: TypeKind = TypeKind.Void
     var n: *u8 = null
     var l: i32 = 0
     if let_through_elem(sm, t.kind, t.pointee, StrView { ptr: (t.name), len: (t.name_len) as i64 }, @k, @n, @l) == 0
         return 0
-    if k == TYPE_STRUCT
+    if k == TypeKind.Struct
         if n == null or l <= 0 or sema_find_struct(sm, StrView { ptr: (n), len: (l) as i64 }) == null or ir_struct_indexes(sm, StrView { ptr: (n), len: (l) as i64 }) == 1
             return 0
-        return ir_needs_index(sm, e, StrView { ptr: (n), len: (l) as i64 }, TYPE_STRUCT)
+        return ir_needs_index(sm, e, StrView { ptr: (n), len: (l) as i64 }, TypeKind.Struct)
     ir_needs_index(sm, e, StrView { ptr: (null), len: (0) as i64 }, k)
 
 # AGAST #3132: `(*p)[i]`, `e`, with `p` a local `*T` and T a struct without
@@ -187,46 +189,46 @@ fn ir_deref_pointee_refused(sm: *Sema, e: *Expr) -> i32
     var lent: *Param = null
     if ir_local(sm, e.left.operand, @t, @lent) == null
         return 0
-    if t.kind != TYPE_PTR or t.pointee == TYPE_ARRAY
+    if t.kind != TypeKind.Ptr or t.pointee == TypeKind.Array
         return 0
-    if t.pointee == TYPE_STRUCT
+    if t.pointee == TypeKind.Struct
         if t.name == null or t.name_len == 0 or name_is_indexable(StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 1
             return 0
         if si_is_struct(sm.module, StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 0 or ir_struct_indexes(sm, StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 1
             return 0
-        return ir_needs_index(sm, e, StrView { ptr: (t.name), len: (t.name_len) as i64 }, TYPE_STRUCT)
+        return ir_needs_index(sm, e, StrView { ptr: (t.name), len: (t.name_len) as i64 }, TypeKind.Struct)
     if ir_sized_scalar(t.pointee) == 0
         return 0
     ir_needs_index(sm, e, StrView { ptr: (null), len: (0) as i64 }, t.pointee)
 
-# `e`, an EXPR_INDEX read or store target.  sema_walk_expr calls this for
+# `e`, an ExprKind.Index read or store target.  sema_walk_expr calls this for
 # every index it visits, after index_scalar_check.  A slice (`p[a..b]`) meets
 # the reference rule only, as index_refused had it.
 pub fn index_refuse_check(sm: *Sema, e: *Expr)
-    if e == null or e.kind != EXPR_INDEX or e.left == null or e.right == null
+    if e == null or e.kind != ExprKind.Index or e.left == null or e.right == null
         return
     let b: *Expr = e.left
-    if b.kind == EXPR_IDENT
+    if b.kind == ExprKind.Ident
         ir_reference_refused(sm, e)
-    else if e.right.kind == EXPR_RANGE
+    else if e.right.kind == ExprKind.Range
         return
-    else if b.kind == EXPR_INDEX
+    else if b.kind == ExprKind.Index
         ir_element_refused(sm, e)
-    else if b.kind == EXPR_UNARY and b.op == OP_DEREF
+    else if b.kind == ExprKind.Unary and b.op == OpKind.Deref
         ir_deref_pointee_refused(sm, e)
 
-# `p[i] = v` / `p[i] op= v`, a STMT_INDEX_ASSIGN on the name st.assign_target,
+# `p[i] = v` / `p[i] op= v`, a StmtKind.IndexAssign on the name st.assign_target,
 # index st.while_cond, `[` at st.bracket: index_refuse_check on that target.
 pub fn index_refuse_name_store(sm: *Sema, st: *Stmt)
     var root: Expr
     var target: Expr
     memset(@root as *u8, 0, sizeof(Expr))
     memset(@target as *u8, 0, sizeof(Expr))
-    root.kind = EXPR_IDENT
+    root.kind = ExprKind.Ident
     root.span = st.span
     root.ident_ptr = st.assign_target
     root.ident_len = st.assign_target_len
-    target.kind = EXPR_INDEX
+    target.kind = ExprKind.Index
     target.span = st.span
     target.bracket = st.bracket
     target.left = @root
@@ -241,38 +243,38 @@ pub fn index_refuse_name_store(sm: *Sema, st: *Stmt)
 # or a method's receiver too, `(*v).f` / `(*v).m()`, which the emitter never
 # refused ("unhandled EXPR_MEMBER", "cannot determine receiver type").
 pub fn deref_value_check(sm: *Sema, d: *Expr)
-    if d == null or d.kind != EXPR_UNARY or d.op != OP_DEREF
+    if d == null or d.kind != ExprKind.Unary or d.op != OpKind.Deref
         return
     var t: SemaTy
     var lent: *Param = null
     if ir_local(sm, d.operand, @t, @lent) == null or lent != null
         return
-    if t.kind != TYPE_STRUCT and ir_sized_scalar(t.kind) == 0
+    if t.kind != TypeKind.Struct and ir_sized_scalar(t.kind) == 0
         return
     sema_error_at(sm, d.span.line, d.span.col)
     eprints_cstr(c"`*x` needs `x` to be a pointer or a reference: this one is a value\n")
 
-# AGAST #2330: `p[i] = b`, `target` the store's EXPR_INDEX (`p[i]` or
+# AGAST #2330: `p[i] = b`, `target` the store's ExprKind.Index (`p[i]` or
 # `(*p)[i]`) and `st` the assignment, with `p` a local `*[N]T`, `@[N]T` or
 # `@&[N]T` the emitter views (add_array_view) and `b` a whole array.  `p[i]`
 # is one T (LARB R9); ritz0 stored `b` a row on.  ritz0 says the same, from
 # array_rules.ELEMENT_NOT_ARRAY.
 pub fn index_whole_array_check(sm: *Sema, target: *Expr, st: *Stmt)
     let value: *Expr = st.assign_value
-    if target == null or target.kind != EXPR_INDEX or target.left == null or value == null
+    if target == null or target.kind != ExprKind.Index or target.left == null or value == null
         return
-    if target.right == null or target.right.kind == EXPR_RANGE
+    if target.right == null or target.right.kind == ExprKind.Range
         return
     var root: *Expr = target.left
-    if root.kind == EXPR_UNARY and root.op == OP_DEREF
+    if root.kind == ExprKind.Unary and root.op == OpKind.Deref
         root = root.operand
-    if root == null or root.kind != EXPR_IDENT
+    if root == null or root.kind != ExprKind.Ident
         return
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (root.ident_ptr), len: (root.ident_len) as i64 })
-    if v == null or sema_view_elem(sm, v) == TYPE_VOID
+    if v == null or sema_view_elem(sm, v) == TypeKind.Void
         return
-    let literal: i32 = (value.kind == EXPR_ARRAY_LIT or value.kind == EXPR_ARRAY_FILL) as i32
-    if literal == 0 and sema_expr_type(sm, value) != TYPE_ARRAY
+    let literal: i32 = (value.kind == ExprKind.ArrayLit or value.kind == ExprKind.ArrayFill) as i32
+    if literal == 0 and sema_expr_type(sm, value) != TypeKind.Array
         return
     sema_error_at(sm, st.span.line, st.span.col)
     eprints_cstr(c"`p[i]` is one element of the array behind `p`, not the whole array: `*p = a` stores the array\n")

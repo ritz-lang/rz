@@ -95,9 +95,9 @@ the emitter (AGAST #3462, #1816; LARB review/5 ritz1 N1):
   `sema_error_at` to report a located `error: file:line:col: ...`.
 - Read types from Sema, not the emitter (AGAST #3501).  `sema_find_local`
   gives a local's declared type (`SemaVar`), and `sema_expr_ty` /
-  `sema_expr_type` (`sema_type.ritz`) type an expression, `TYPE_UNKNOWN` when
+  `sema_expr_type` (`sema_type.ritz`) type an expression, `TypeKind.Unknown` when
   Sema can't say: treat that as bool_check treats `BK_UNSURE`.  A bool is
-  `TYPE_BOOL` there, not the emitter's i64 slot.  A shape your check needs
+  `TypeKind.Bool` there, not the emitter's i64 slot.  A shape your check needs
   that Sema leaves unknown goes into `sema_expr_ty` first, and
   `RITZ1_SEMA_PROBE=1` (`sema_probe.ritz`, pinned by
   `ritz0/test_ritz1_sema_type.py`) must still report no mismatch with the

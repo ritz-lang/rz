@@ -24,7 +24,7 @@
 # sema_expr_ty, a `for` variable an element of what it iterates, a `V(x)` arm
 # binding V's payload and a `let (a, b)` binding its field (AGAST #3810).  A
 # range's `for` variable, a catch-all arm binding and a scalar `:&` param are
-# bound TYPE_UNKNOWN.  It visits every sub-expression of a statement, so
+# bound TypeKind.Unknown.  It visits every sub-expression of a statement, so
 # RITZ1_SEMA_PROBE (sema_probe.ritz) can pin sema_expr_ty against the
 # emitter's typing on each.
 
@@ -152,7 +152,7 @@ fn sema_vis_report(sm: *Sema, line: i32, col: i32, name_sv: StrView)
     eprints_cstr(h.via)
     eprints_cstr(c"` `pub import` it\n")
 
-# AGAST #3042: what `owner`, an EXPR_IF / EXPR_MATCH, yields: the struct its
+# AGAST #3042: what `owner`, an ExprKind.If / ExprKind.Match, yields: the struct its
 # arm's value `body` is, typed in the arm's scope, with its bindings and
 # `let`s.  The first arm that types wins: ritz0 types an `if` by its
 # then-branch.  match_scrutinee_type reads it for `match (if c then b else d)`.
@@ -162,17 +162,17 @@ fn sema_note_arm_value(sm: *Sema, owner: *Expr, arm: *MatchArm)
     # An `E.V(..)` (which sema_expr_ty types since AGAST #3810), or a unit
     # variant `E.V` (since #4251), types no arm here: ritz1 refuses a variant
     # two enums declare on such a scrutinee.
-    if arm.body != null and arm.body.kind == EXPR_METHOD and rl_qualified_variant(sm, arm.body) == 1
+    if arm.body != null and arm.body.kind == ExprKind.Method and rl_qualified_variant(sm, arm.body) == 1
         return
-    if arm.body != null and arm.body.kind == EXPR_MEMBER and sema_enum_name(sm, arm.body.left) != null
+    if arm.body != null and arm.body.kind == ExprKind.Member and sema_enum_name(sm, arm.body.left) != null
         return
     var t: SemaTy
-    if sema_expr_ty(sm, arm.body, @t) == TYPE_STRUCT and t.name != null and t.name_len > 0
+    if sema_expr_ty(sm, arm.body, @t) == TypeKind.Struct and t.name != null and t.name_len > 0
         owner.value_ty_name = t.name
         owner.value_ty_name_len = t.name_len
 
 # `scrut` is the match's scrutinee; null for an if-expression's arms.  `owner`
-# is the EXPR_IF / EXPR_MATCH the arms are of; null for a match statement.
+# is the ExprKind.If / ExprKind.Match the arms are of; null for a match statement.
 # `discard`: the match / if's value is discarded, so its arms' are (#3980).
 fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discard: i32)
     own_check_arms_begin(sm, scrut)   # AGAST #3507: a match owns what it moves
@@ -216,7 +216,7 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discar
         # AGAST #4543: a value-wanted match arm's block tail that is an
         # else-less `if` has no value; report it at that `if` (#1406's
         # position, as ritz0 does), before the arm is walked.
-        if owner != null and owner.kind == EXPR_MATCH and discard == 0
+        if owner != null and owner.kind == ExprKind.Match and discard == 0
             if_arm_check_match_arm(sm, arm)
 
         # match_arm_set_block keeps an arm's trailing expression apart in
@@ -293,93 +293,95 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
 
     wrapping_check(sm, e)   # LARB R63 (AGAST #3486): integer operands
 
-    let k: i32 = e.kind
-    if k == EXPR_IDENT and sema_is_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0
+    let k: ExprKind = e.kind
+    if k == ExprKind.Ident and sema_is_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0
         sema_vis_use(sm, e.span.line, e.span.col, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    else if k == EXPR_CALL and sema_is_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 0
+    else if k == ExprKind.Call and sema_is_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 0
         sema_vis_use(sm, e.span.line, e.span.col, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
-    else if k == EXPR_STRUCT_LIT
+    else if k == ExprKind.StructLit
         sema_vis_use(sm, e.span.line, e.span.col, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    if k == EXPR_MATCH or k == EXPR_IF
-        if discard == 0
-            if_arm_check(sm, e)   # AGAST #1613 / #3512: both arms, before the condition
-        sema_walk_expr(sm, e.left)
-        var scrut: *Expr = null
-        if k == EXPR_MATCH
-            scrut = e.left
-        sema_walk_arms(sm, scrut, e.args as *MatchArm, e, discard)
-    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        if k == EXPR_INDEX
-            # One report per `[` (AGAST #3755 / #3893): a scalar element is
-            # both's since Sema types it (#3943).
-            if index_scalar_check(sm, e) == 0
-                index_refuse_check(sm, e)
-        sema_walk_expr(sm, e.left)
-        sema_walk_expr(sm, e.right)
-    else if k == EXPR_UNARY
-        deref_value_check(sm, e)   # AGAST #3893: `*v`, v a value
-        sema_walk_expr(sm, e.operand)
-    else if k == EXPR_CAST or k == EXPR_MEMBER or k == EXPR_TRY or k == EXPR_ARRAY_FILL
-        sema_walk_expr(sm, e.left)
-    else if k == EXPR_CALL
-        # LARB R37 (AGAST #3373), else AGAST #1629 / #3503.  let_check's
-        # argument rule first, as emit_expr_call ran it first (#3294 / #3504).
-        let gm: i32 = generic_method_check(sm, e)
+    match k
+        ExprKind.Match | ExprKind.If =>
+            if discard == 0
+                if_arm_check(sm, e)   # AGAST #1613 / #3512: both arms, before the condition
+            sema_walk_expr(sm, e.left)
+            var scrut: *Expr = null
+            if k == ExprKind.Match
+                scrut = e.left
+            sema_walk_arms(sm, scrut, e.args as *MatchArm, e, discard)
+        ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
+            if k == ExprKind.Index
+                # One report per `[` (AGAST #3755 / #3893): a scalar element is
+                # both's since Sema types it (#3943).
+                if index_scalar_check(sm, e) == 0
+                    index_refuse_check(sm, e)
+            sema_walk_expr(sm, e.left)
+            sema_walk_expr(sm, e.right)
+        ExprKind.Unary =>
+            deref_value_check(sm, e)   # AGAST #3893: `*v`, v a value
+            sema_walk_expr(sm, e.operand)
+        ExprKind.Cast | ExprKind.Member | ExprKind.Try | ExprKind.ArrayFill =>
+            sema_walk_expr(sm, e.left)
+        ExprKind.Call =>
+            # LARB R37 (AGAST #3373), else AGAST #1629 / #3503.  let_check's
+            # argument rule first, as emit_expr_call ran it first (#3294 / #3504).
+            let gm: i32 = generic_method_check(sm, e)
 
-        let_another_struct_call(sm, e)
+            let_another_struct_call(sm, e)
 
-        if gm == 0
-            call_check_call(sm, e)
+            if gm == 0
+                call_check_call(sm, e)
 
-        if call_check_muted() == 0
-            literal_call(sm, e)   # AGAST #2341: after the call's own check
+            if call_check_muted() == 0
+                literal_call(sm, e)   # AGAST #2341: after the call's own check
 
-        if call_check_muted() == 0
-            fn_slot_call(sm, e)   # AGAST #4310
+            if call_check_muted() == 0
+                fn_slot_call(sm, e)   # AGAST #4310
 
-        if call_check_muted() == 0
-            slot_narrowing_call(sm, e)   # AGAST #4081
+            if call_check_muted() == 0
+                slot_narrowing_call(sm, e)   # AGAST #4081
 
-        # `sizeof(x)` and a non-literal `print(x)` never lower their operand.
-        let mute: i32 = call_check_mutes(e)
+            # `sizeof(x)` and a non-literal `print(x)` never lower their operand.
+            let mute: i32 = call_check_mutes(e)
 
-        let in_sizeof: i32 = let_check_sizeof_of(e)   # AGAST #3504
+            let in_sizeof: i32 = let_check_sizeof_of(e)   # AGAST #3504
 
-        call_check_mute(mute)
+            call_check_mute(mute)
 
-        let_check_sizeof(in_sizeof)
-        sema_walk_list(sm, e.args)
-        let_check_sizeof(0 - in_sizeof)
+            let_check_sizeof(in_sizeof)
+            sema_walk_list(sm, e.args)
+            let_check_sizeof(0 - in_sizeof)
 
-        call_check_mute(0 - mute)
-    else if k == EXPR_ARRAY_LIT
-        sema_walk_list(sm, e.args)
-    else if k == EXPR_METHOD
-        # After the receiver, as emit_expr_method lowers it first.
-        let_another_struct_method(sm, e)   # AGAST #3294
+            call_check_mute(0 - mute)
+        ExprKind.ArrayLit =>
+            sema_walk_list(sm, e.args)
+        ExprKind.Method =>
+            # After the receiver, as emit_expr_method lowers it first.
+            let_another_struct_method(sm, e)   # AGAST #3294
 
-        let_check_receiver(sm, e)          # AGAST #2403
-        sema_walk_expr(sm, e.left)
-        call_check_method(sm, e)      # AGAST #1629 / #3503
+            let_check_receiver(sm, e)          # AGAST #2403
+            sema_walk_expr(sm, e.left)
+            call_check_method(sm, e)      # AGAST #1629 / #3503
 
-        if call_check_muted() == 0
-            literal_method(sm, e)     # after its receiver, as emit_expr_method
+            if call_check_muted() == 0
+                literal_method(sm, e)     # after its receiver, as emit_expr_method
 
-        if call_check_muted() == 0
-            slot_narrowing_method(sm, e)   # AGAST #4081
-        sema_walk_list(sm, e.args)
-    else if k == EXPR_STRUCT_LIT
-        struct_lit_field_check(sm, e)   # LARB R49 (AGAST #3563)
+            if call_check_muted() == 0
+                slot_narrowing_method(sm, e)   # AGAST #4081
+            sema_walk_list(sm, e.args)
+        ExprKind.StructLit =>
+            struct_lit_field_check(sm, e)   # LARB R49 (AGAST #3563)
 
-        fn_slot_struct_lit(sm, e)   # AGAST #4310
+            fn_slot_struct_lit(sm, e)   # AGAST #4310
 
-        if call_check_muted() == 0
-            slot_narrowing_struct_lit(sm, e)   # AGAST #4218
+            if call_check_muted() == 0
+                slot_narrowing_struct_lit(sm, e)   # AGAST #4218
 
-        var fi: *FieldInit = e.args as *FieldInit
-        while fi != null
-            sema_walk_expr(sm, fi.value)
-            fi = fi.next
+            var fi: *FieldInit = e.args as *FieldInit
+            while fi != null
+                sema_walk_expr(sm, fi.value)
+                fi = fi.next
+        _ => pass
 
 fn sema_walk_list(sm: *Sema, first: *Expr)
     var a: *Expr = first
@@ -390,49 +392,49 @@ fn sema_walk_list(sm: *Sema, first: *Expr)
 # The declared type of a `let` / `var`, else its initialiser's.
 fn sema_bind_decl(sm: *Sema, st: *Stmt)
     var t: SemaTy
-    if st.var_declared_type != TYPE_VOID
+    if st.var_declared_type != TypeKind.Void
         t.kind = st.var_type
         t.name = st.var_type_name
         t.name_len = st.var_type_name_len
         t.pointee = st.var_pointee_type
         # On a `[N]fn(..)` array var_fn_sig is the element's signature.
         t.fn_sig = null
-        if st.var_type == TYPE_PTR
+        if st.var_type == TypeKind.Ptr
             t.fn_sig = st.var_fn_sig
     else
         sema_expr_ty(sm, st.var_init, @t)
         # AGAST #4081: `let t = take` holds fn `take`, so `t(..)` takes its
         # params (its kind stays unknown, as the bare name's).
         let init: *Expr = st.var_init
-        if t.fn_sig == null and init != null and init.kind == EXPR_IDENT and sema_find_local(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) == null
+        if t.fn_sig == null and init != null and init.kind == ExprKind.Ident and sema_find_local(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) == null
             t.fn_sig = sema_find_fn(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 })
     sema_bind_ty(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, @t, st.var_is_let)
     # AGAST #4410: `let r = @q` with `q` a scalar `*T` is a `**T` held as a
     # PTR_PTR local (the emitter's infer_ref_to_scalar_pointer_let), so `**r`
     # reads a T.  Sema's source typer has only the `@`'s PTR.
-    if st.var_declared_type == TYPE_VOID and sm.scope_top > 0 and st.var_init != null
-        if st.var_init.kind == EXPR_UNARY and (st.var_init.op == OP_ADDR or st.var_init.op == OP_ADDR_MUT) and st.var_init.operand != null and st.var_init.operand.kind == EXPR_IDENT
+    if st.var_declared_type == TypeKind.Void and sm.scope_top > 0 and st.var_init != null
+        if st.var_init.kind == ExprKind.Unary and (st.var_init.op == OpKind.Addr or st.var_init.op == OpKind.AddrMut) and st.var_init.operand != null and st.var_init.operand.kind == ExprKind.Ident
             let src: *SemaVar = sema_find_local(sm, StrView { ptr: (st.var_init.operand.ident_ptr), len: (st.var_init.operand.ident_len) as i64 })
-            if src != null and (src.kind == TYPE_PTR or src.kind == TYPE_PTR_PTR) and src.type_name_len == 0
-                var inner: i32 = src.pointee
-                if src.kind == TYPE_PTR_PTR
+            if src != null and (src.kind == TypeKind.Ptr or src.kind == TypeKind.PtrPtr) and src.type_name_len == 0
+                var inner: i32 = (src.pointee as i32)
+                if src.kind == TypeKind.PtrPtr
                     inner = src.inner
-                let leaf: i32 = inner % PTR_DEPTH_UNIT
-                if leaf >= TYPE_I32 and leaf <= TYPE_F64 and leaf != TYPE_PTR and leaf != TYPE_PTR_PTR
-                    if src.kind == TYPE_PTR_PTR
-                        inner = inner + PTR_DEPTH_UNIT
+                let leaf: TypeKind = ptr_ptr_slot_inner(inner)
+                if type_is_scalar_leaf(leaf)
+                    if src.kind == TypeKind.PtrPtr
+                        inner = ptr_slot_deepen(inner, 1)
                     let lv0: *SemaVar = @sm.scope[sm.scope_top - 1]
-                    lv0.kind = TYPE_PTR_PTR
-                    lv0.pointee = TYPE_PTR
+                    lv0.kind = TypeKind.PtrPtr
+                    lv0.pointee = TypeKind.Ptr
                     lv0.inner = inner
     # AGAST #4410: an unannotated local's slot is its initialiser's, which
     # emit_var_decl infers (a float method's width, else i64).  The initialiser
     # has been walked and annotated, so read that here.
-    if st.var_declared_type == TYPE_VOID and sm.scope_top > 0
+    if st.var_declared_type == TypeKind.Void and sm.scope_top > 0
         let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
         lv.float_src = float_slot_src(sm, st.var_init)   # AGAST #3998
-        let af: i32 = sema_arm_float_slot(sm, st.var_init)
-        if af != 0
+        let af: TypeKind = sema_arm_float_slot(sm, st.var_init)
+        if af != TypeKind.Void
             lv.init_slot = af     # a float if / match slot (last_match_float_ty)
         else
             lv.init_slot = expr_sema_ty(st.var_init)
@@ -440,30 +442,30 @@ fn sema_bind_decl(sm: *Sema, st: *Stmt)
             # emit_var_decl infers its pointee (`let v = **r` is a T).  The slot
             # typer resolves it; an if / match / array literal keeps its own
             # rule above.
-            if lv.init_slot == TYPE_UNKNOWN and st.var_init != null
-                let ik: i32 = st.var_init.kind
-                if ik != EXPR_IF and ik != EXPR_MATCH and ik != EXPR_ARRAY_LIT and ik != EXPR_ARRAY_FILL
+            if lv.init_slot == TypeKind.Unknown and st.var_init != null
+                let ik: ExprKind = st.var_init.kind
+                if ik != ExprKind.If and ik != ExprKind.Match and ik != ExprKind.ArrayLit and ik != ExprKind.ArrayFill
                     lv.init_slot = sema_slot_ty(sm, st.var_init)
             # AGAST #4410: `let q = a[1]` with `a:& [N]*T` is the emitter's
             # element (`a *T`).  Only the borrow-param array view needs this:
             # other bases keep Sema's source typing (and the emitter's own
             # inference mirrors it).
-            if st.var_init != null and st.var_init.kind == EXPR_INDEX and st.var_init.left != null and st.var_init.left.kind == EXPR_IDENT and st.var_init.right != null and st.var_init.right.kind != EXPR_RANGE
+            if st.var_init != null and st.var_init.kind == ExprKind.Index and st.var_init.left != null and st.var_init.left.kind == ExprKind.Ident and st.var_init.right != null and st.var_init.right.kind != ExprKind.Range
                 let src: *SemaVar = sema_find_local(sm, StrView { ptr: (st.var_init.left.ident_ptr), len: (st.var_init.left.ident_len) as i64 })
-                if src != null and src.kind == TYPE_UNKNOWN and src.lent != null and src.lent.param_pointee_type == TYPE_ARRAY
+                if src != null and src.kind == TypeKind.Unknown and src.lent != null and src.lent.param_pointee_type == TypeKind.Array
                     lv.init_slot = src.lent.param_pointee_array_elem_type
-                    if src.lent.param_pointee_array_elem_pointee != TYPE_VOID
+                    if src.lent.param_pointee_array_elem_pointee != TypeKind.Void
                         lv.pointee = src.lent.param_pointee_array_elem_pointee
         # AGAST #4410: an untyped `let a = [@p, ..]` is an `[N]*T`; keep the
         # element's pointee T so `*a[i]` loads its width.
-        if st.var_init != null and (st.var_init.kind == EXPR_ARRAY_LIT or st.var_init.kind == EXPR_ARRAY_FILL)
+        if st.var_init != null and (st.var_init.kind == ExprKind.ArrayLit or st.var_init.kind == ExprKind.ArrayFill)
             var first: *Expr = st.var_init.args
-            if st.var_init.kind == EXPR_ARRAY_FILL
+            if st.var_init.kind == ExprKind.ArrayFill
                 first = st.var_init.left
             if first != null
                 var ft: SemaTy
                 sema_expr_ty(sm, first, @ft)
-                if ft.kind == TYPE_PTR or ft.kind == TYPE_REF or ft.kind == TYPE_MUT_REF
+                if ft.kind == TypeKind.Ptr or ft.kind == TypeKind.Ref or ft.kind == TypeKind.MutRef
                     lv.pointee = ft.pointee
     sema_index_note_decl(sm, st)   # its element, for sema_elem_ty (AGAST #3943)
     # AGAST #4428: an unannotated `let q = <array element>` / `@<element>` /
@@ -479,7 +481,7 @@ fn sema_bind_for(sm: *Sema, st: *Stmt)
     sema_ty_unknown(@t)
     if st.for_end == null
         var it: *Expr = st.for_start
-        if it != null and it.kind == EXPR_UNARY and (it.op == OP_ADDR or it.op == OP_ADDR_MUT)
+        if it != null and it.kind == ExprKind.Unary and (it.op == OpKind.Addr or it.op == OpKind.AddrMut)
             it = it.operand
         sema_elem_ty(sm, it, @t)
     sema_bind_ty(sm, StrView { ptr: (st.for_var), len: (st.for_var_len) as i64 }, @t, 0)
@@ -490,14 +492,14 @@ fn sema_bind_for(sm: *Sema, st: *Stmt)
     if st.for_end == null and sm.scope_top > 0
         let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
         var itv: *Expr = st.for_start
-        if itv != null and itv.kind == EXPR_UNARY and (itv.op == OP_ADDR or itv.op == OP_ADDR_MUT)
+        if itv != null and itv.kind == ExprKind.Unary and (itv.op == OpKind.Addr or itv.op == OpKind.AddrMut)
             itv = itv.operand
         if itv != null
-            let ep: i32 = sema_iter_pointee(sm, itv)
-            if ep != TYPE_VOID
+            let ep: TypeKind = sema_iter_pointee(sm, itv)
+            if ep != TypeKind.Void
                 lv.pointee = ep
-            let es: i32 = sema_iter_elem_slot(sm, itv)
-            if es != TYPE_UNKNOWN
+            let es: TypeKind = sema_iter_elem_slot(sm, itv)
+            if es != TypeKind.Unknown
                 lv.init_slot = es
     # AGAST #4410: a range's variable is the bound's slot (the emitter takes it
     # from `0..n`'s n), which sema_elem_ty leaves unknown for a range.
@@ -542,7 +544,7 @@ fn sema_tuple_pattern_check(sm: *Sema, st: *Stmt, tup: *SemaTy)
     var name: *u8 = tup.name
     var name_len: i32 = tup.name_len
     var sd: *StructDef = null
-    if tup.kind == TYPE_STRUCT and name != null and name_len > 0
+    if tup.kind == TypeKind.Struct and name != null and name_len > 0
         sd = sema_recv_struct(sm, tup)
         if sd == null
             return   # an enum, not a named struct
@@ -569,20 +571,20 @@ fn sema_tuple_inner_note(sm: *Sema, tup: *SemaTy, i: i32)
     if sm.scope_top <= 0
         return
     let inner: i32 = sema_tuple_field_inner(sm, tup, i)
-    if inner != TYPE_VOID
+    if inner != (TypeKind.Void as i32)
         let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
         lv.inner = inner
 
 fn sema_bind_param(sm: *Sema, p: *Param)
     var t: SemaTy
-    if p.is_borrow == 1 and p.param_pointee_type == TYPE_STRUCT
+    if p.is_borrow == 1 and p.param_pointee_type == TypeKind.Struct
         # `x:& S` reads as its S for `.` (§13.4), as ref_check's ref_of_local
         # has it.  A scalar `h:& T` is still read and written as `*h`, which
         # bool_check judges off the param itself: left unknown.
-        t.kind = TYPE_STRUCT
+        t.kind = TypeKind.Struct
         t.name = p.param_type_name
         t.name_len = p.param_type_name_len
-        t.pointee = TYPE_VOID
+        t.pointee = TypeKind.Void
         t.fn_sig = null
     else if p.is_borrow == 1
         sema_ty_unknown(@t)
@@ -592,7 +594,7 @@ fn sema_bind_param(sm: *Sema, p: *Param)
         t.name_len = p.param_type_name_len
         t.pointee = p.param_pointee_type
         t.fn_sig = p.fn_sig
-    if p.is_self_borrow == 1 and p.param_type == TYPE_STRUCT and p.param_type_name_len == 0 and sm.cur_impl != null
+    if p.is_self_borrow == 1 and p.param_type == TypeKind.Struct and p.param_type_name_len == 0 and sm.cur_impl != null
         # AGAST #3975: a bare `self:&` is its impl's struct, so `self.f` and
         # `self.f.m()` are typed as under a bare `self`.
         t.name = sm.cur_impl.type_name
@@ -604,8 +606,8 @@ fn sema_bind_param(sm: *Sema, p: *Param)
         let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
         lv.lent = p
 
-fn sema_is_assign(kind: i32) -> i32
-    (kind == STMT_ASSIGN or kind == STMT_MEMBER_ASSIGN or kind == STMT_MEMBER_INDEX_ASSIGN or kind == STMT_INDEX_ASSIGN or kind == STMT_LOCAL_FIELD_ASSIGN or kind == STMT_LOCAL_FIELD_INDEX_ASSIGN) as i32
+fn sema_is_assign(kind: StmtKind) -> i32
+    (kind == StmtKind.Assign or kind == StmtKind.MemberAssign or kind == StmtKind.MemberIndexAssign or kind == StmtKind.IndexAssign or kind == StmtKind.LocalFieldAssign or kind == StmtKind.LocalFieldIndexAssign) as i32
 
 # A block: what it binds goes out of scope at its end.  A `let` is bound
 # after its initialiser.  `void_tail` is 1 for the body of a fn that returns
@@ -636,7 +638,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
 
         # AGAST #3507: the move check, as the emitter ran it on each statement
         # before lowering it; a fn's value tail is a move (own_check_tail).
-        own_check_stmt(sm, st, (fn_tail == 1 and sm.cur_fn.return_type != TYPE_VOID) as i32)
+        own_check_stmt(sm, st, (fn_tail == 1 and sm.cur_fn.return_type != TypeKind.Void) as i32)
 
         if fn_tail == 1
             bool_check_tail(sm, st)   # AGAST #2342
@@ -644,7 +646,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         # AGAST #2028: a fn's tail expression is its return value, not a
         # statement; #3293 judges it.  An `@&` of a `let` in it is refused as
         # anywhere else (AGAST #3804: the emitter never let-checked it).
-        if fn_tail == 1 and st.kind == STMT_EXPR
+        if fn_tail == 1 and st.kind == StmtKind.Expr
             return_check_another_struct(sm, st.expr, st.expr.span.line, st.expr.span.col)
 
             let_check_expr(sm, st.expr)
@@ -657,161 +659,166 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         if fn_tail == 1
             fn_slot_tail(sm, st)   # AGAST #4310
 
-        if tail_value == 1 and st.next == null and st.kind == STMT_EXPR
+        if tail_value == 1 and st.next == null and st.kind == StmtKind.Expr
             slot_narrowing_tail(sm, st.expr)   # AGAST #4081: the fn's value
 
         ref_loan_check_stmt(sm, st)   # AGAST #2438 / #3506
 
         ref_value_check_stmt(sm, st)   # AGAST #3926
-        if st.kind == STMT_VAR_DECL
-            if st.var_declared_type != TYPE_VOID
-                sema_vis_use(sm, st.span.line, st.span.col, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
-            bool_check_decl(sm, st)   # AGAST #2342
+        match st.kind
+            StmtKind.VarDecl =>
+                if st.var_declared_type != TypeKind.Void
+                    sema_vis_use(sm, st.span.line, st.span.col, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
+                bool_check_decl(sm, st)   # AGAST #2342
 
-            literal_decl(sm, st)      # AGAST #2341
+                literal_decl(sm, st)      # AGAST #2341
 
-            fn_slot_decl(sm, st)      # AGAST #4310
-            sema_walk_expr(sm, st.var_init)
-            check_implicit_narrowing(sm, st)   # AGAST #1364 / #3505
-            sema_bind_decl(sm, st)
-            let_note_decl(sm, st)   # AGAST #3504
+                fn_slot_decl(sm, st)      # AGAST #4310
+                sema_walk_expr(sm, st.var_init)
+                check_implicit_narrowing(sm, st)   # AGAST #1364 / #3505
+                sema_bind_decl(sm, st)
+                let_note_decl(sm, st)   # AGAST #3504
 
-            eai_note_decl(sm, st)   # AGAST #3511
+                eai_note_decl(sm, st)   # AGAST #3511
 
-            narrow_sema_decl(sm, st)
+                narrow_sema_decl(sm, st)
 
-            bool_note_decl(sm, st)
-        else if st.kind == STMT_TUPLE_DECL
-            sema_walk_expr(sm, st.var_init)
-            sema_bind_tuple(sm, st)
-        else if st.kind == STMT_FOR
-            sema_walk_expr(sm, st.for_start)
-            sema_walk_expr(sm, st.for_end)
-            let for_mark: i32 = sm.scope_top
-            sema_bind_for(sm, st)
-            narrow_sema_for(sm, st)   # AGAST #4080
+                bool_note_decl(sm, st)
+            StmtKind.TupleDecl =>
+                sema_walk_expr(sm, st.var_init)
+                sema_bind_tuple(sm, st)
+            StmtKind.For =>
+                sema_walk_expr(sm, st.for_start)
+                sema_walk_expr(sm, st.for_end)
+                let for_mark: i32 = sm.scope_top
+                sema_bind_for(sm, st)
+                narrow_sema_for(sm, st)   # AGAST #4080
 
-            bool_note_for(sm, st)
+                bool_note_for(sm, st)
 
-            let_note_for(sm, st)   # AGAST #2389: an element is a `let`
+                let_note_for(sm, st)   # AGAST #2389: an element is a `let`
 
-            own_check_loop_enter(sm)   # AGAST #3507
-            sema_walk_stmts(sm, st.for_body, 0)
+                own_check_loop_enter(sm)   # AGAST #3507
+                sema_walk_stmts(sm, st.for_body, 0)
 
-            own_check_loop_exit(sm)
-            sm.scope_top = for_mark
-        else if st.kind == STMT_IF
-            bool_check_cond(sm, st.if_cond, c"if condition")
-            sema_walk_expr(sm, st.if_cond)
-            var in_tail: i32 = (tail_value == 1 and st.next == null) as i32
-            # An arm's else-less tail already has if_arm_value's "no value"
-            # error: its tail was wanted as a value, so it is not also a
-            # statement with no effect (LARB R64 / R69, AGAST #3492).
-            if if_arm_no_else_at(st.span.line, st.span.col) == 1
-                in_tail = 1
-
-            if_arm_want_tail(in_tail)
-
-            own_check_if_then(sm, st)   # AGAST #3507: the arms' moves merge
-            sema_walk_stmts(sm, st.if_then, 0)
-
-            own_check_if_else(sm, st)
-
-            if_arm_want_tail(in_tail)
-            sema_walk_stmts(sm, st.if_else, 0)
-
-            own_check_if_end(sm, st)
-        else if st.kind == STMT_WHILE
-            bool_check_cond(sm, st.while_cond, c"while condition")
-            sema_walk_expr(sm, st.while_cond)
-
-            own_check_loop_enter(sm)   # AGAST #3507
-            sema_walk_stmts(sm, st.while_body, 0)
-
-            own_check_loop_exit(sm)
-        else if st.kind == STMT_LOOP or st.kind == STMT_DEFER or st.kind == STMT_UNSAFE
-            if_arm_want_tail((st.kind == STMT_UNSAFE and tail_value == 1 and st.next == null) as i32)
-
-            # AGAST #3507: a loop's body; a `defer`'s runs at its block's exits,
-            # not here; an `unsafe` block's bindings are its block's.
-            if st.kind == STMT_LOOP
-                own_check_loop_enter(sm)
-
-            if st.kind == STMT_DEFER
-                own_check_mute(1)
-
-            if st.kind == STMT_UNSAFE
-                own_check_unsafe()
-            sema_walk_stmts(sm, st.while_body, 0)
-
-            if st.kind == STMT_LOOP
                 own_check_loop_exit(sm)
-
-            if st.kind == STMT_DEFER
-                own_check_mute(0 - 1)
-        else if st.kind == STMT_MATCH
-            sema_walk_expr(sm, st.if_cond)
-            # AGAST #3980: its arms are values only if it is the block's.
-            let discard_m: i32 = (tail_value == 0 or st.next != null) as i32
-            sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm, null, discard_m)
-        else if st.kind == STMT_RETURN
-            bool_check_return(sm, st.return_value)
-
-            if st.return_value != null
-                return_check_another_struct(sm, st.return_value, st.span.line, st.span.col)   # AGAST #3293
-
-            literal_return(sm, st.return_value)   # AGAST #2341
-
-            if st.return_value != null
-                fn_slot_return(sm, st)   # AGAST #4310
-
-            slot_narrowing_return(sm, st.return_value)   # AGAST #4081
-            sema_walk_expr(sm, st.return_value)
-        else if st.kind == STMT_EXPR
-            # Only a block's last statement can be its value (AGAST #2137).
-            # LARB R69 (AGAST #3997): the last line of a block that is no
-            # value — a loop body, a statement `if`'s branch, a statement
-            # `match`'s arm — is discarded too (tail_value, #3980).
-            if st.next != null or void_tail == 1 or tail_value == 0
-                must_use_check_value(sm, st.expr)
-
-            # AGAST #3189 / #3512 / #3920: as ritz0 judges an ExprStmt: an
-            # arm's last statement before its value too.  LARB R69 (AGAST
-            # #3968): so is the last line of a block that is no value, a loop
-            # body or a statement `if`'s branch (tail_value, #3980).
-            if st.next != null or void_tail == 1 or tail_value == 0
-                discarded_array_check_value(sm, st.expr)
-
-            # LARB R64 / R69 (AGAST #3492): a statement that computes a value
-            # and throws it away.  The same positions as the two above.
-            if st.next != null or void_tail == 1 or tail_value == 0
-                no_effect_check_value(sm, st.expr)
-            sema_walk_expr(sm, st.expr)
-        else if st.kind == STMT_ASSERT
-            bool_check_cond(sm, st.if_cond, c"assert condition")
-            sema_walk_expr(sm, st.if_cond)
-        else if sema_is_assign(st.kind) == 1
-            bool_check_stmt(sm, st)   # AGAST #2342
-
-            literal_stmt(sm, st)      # AGAST #2341
-
-            fn_slot_assign(sm, st)    # AGAST #4310
-
-            slot_narrowing_assign(sm, st)   # AGAST #4081
-
-            if st.kind == STMT_ASSIGN and st.assign_target_len == 0
-                index_store_check(sm, st.if_cond)   # AGAST #3565
-
-                index_whole_array_check(sm, st.if_cond, st)   # AGAST #3893
+                sm.scope_top = for_mark
+            StmtKind.If =>
+                bool_check_cond(sm, st.if_cond, c"if condition")
                 sema_walk_expr(sm, st.if_cond)
-            else if st.kind == STMT_INDEX_ASSIGN
-                index_name_scalar_check(sm, st)   # AGAST #3755
+                var in_tail: i32 = (tail_value == 1 and st.next == null) as i32
+                # An arm's else-less tail already has if_arm_value's "no value"
+                # error: its tail was wanted as a value, so it is not also a
+                # statement with no effect (LARB R64 / R69, AGAST #3492).
+                if if_arm_no_else_at(st.span.line, st.span.col) == 1
+                    in_tail = 1
 
-                index_refuse_name_store(sm, st)   # AGAST #3893
+                if_arm_want_tail(in_tail)
+
+                own_check_if_then(sm, st)   # AGAST #3507: the arms' moves merge
+                sema_walk_stmts(sm, st.if_then, 0)
+
+                own_check_if_else(sm, st)
+
+                if_arm_want_tail(in_tail)
+                sema_walk_stmts(sm, st.if_else, 0)
+
+                own_check_if_end(sm, st)
+            StmtKind.While =>
+                bool_check_cond(sm, st.while_cond, c"while condition")
                 sema_walk_expr(sm, st.while_cond)
-            else if st.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN or st.kind == STMT_MEMBER_INDEX_ASSIGN
-                index_field_scalar_check(sm, st)   # AGAST #3799
-            sema_walk_expr(sm, st.assign_value)
+
+                own_check_loop_enter(sm)   # AGAST #3507
+                sema_walk_stmts(sm, st.while_body, 0)
+
+                own_check_loop_exit(sm)
+            StmtKind.Loop | StmtKind.Defer | StmtKind.Unsafe =>
+                if_arm_want_tail((st.kind == StmtKind.Unsafe and tail_value == 1 and st.next == null) as i32)
+
+                # AGAST #3507: a loop's body; a `defer`'s runs at its block's exits,
+                # not here; an `unsafe` block's bindings are its block's.
+                if st.kind == StmtKind.Loop
+                    own_check_loop_enter(sm)
+
+                if st.kind == StmtKind.Defer
+                    own_check_mute(1)
+
+                if st.kind == StmtKind.Unsafe
+                    own_check_unsafe()
+                sema_walk_stmts(sm, st.while_body, 0)
+
+                if st.kind == StmtKind.Loop
+                    own_check_loop_exit(sm)
+
+                if st.kind == StmtKind.Defer
+                    own_check_mute(0 - 1)
+            StmtKind.Match =>
+                sema_walk_expr(sm, st.if_cond)
+                # AGAST #3980: its arms are values only if it is the block's.
+                let discard_m: i32 = (tail_value == 0 or st.next != null) as i32
+                sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm, null, discard_m)
+            StmtKind.Return =>
+                bool_check_return(sm, st.return_value)
+
+                if st.return_value != null
+                    return_check_another_struct(sm, st.return_value, st.span.line, st.span.col)   # AGAST #3293
+
+                literal_return(sm, st.return_value)   # AGAST #2341
+
+                if st.return_value != null
+                    fn_slot_return(sm, st)   # AGAST #4310
+
+                slot_narrowing_return(sm, st.return_value)   # AGAST #4081
+                sema_walk_expr(sm, st.return_value)
+            StmtKind.Expr =>
+                # Only a block's last statement can be its value (AGAST #2137).
+                # LARB R69 (AGAST #3997): the last line of a block that is no
+                # value — a loop body, a statement `if`'s branch, a statement
+                # `match`'s arm — is discarded too (tail_value, #3980).
+                if st.next != null or void_tail == 1 or tail_value == 0
+                    must_use_check_value(sm, st.expr)
+
+                # AGAST #3189 / #3512 / #3920: as ritz0 judges an ExprStmt: an
+                # arm's last statement before its value too.  LARB R69 (AGAST
+                # #3968): so is the last line of a block that is no value, a loop
+                # body or a statement `if`'s branch (tail_value, #3980).
+                if st.next != null or void_tail == 1 or tail_value == 0
+                    discarded_array_check_value(sm, st.expr)
+
+                # LARB R64 / R69 (AGAST #3492): a statement that computes a value
+                # and throws it away.  The same positions as the two above.
+                if st.next != null or void_tail == 1 or tail_value == 0
+                    no_effect_check_value(sm, st.expr)
+                sema_walk_expr(sm, st.expr)
+            StmtKind.Assert =>
+                bool_check_cond(sm, st.if_cond, c"assert condition")
+                sema_walk_expr(sm, st.if_cond)
+            _ =>
+                if sema_is_assign(st.kind) == 1
+                    bool_check_stmt(sm, st)   # AGAST #2342
+
+                    literal_stmt(sm, st)      # AGAST #2341
+
+                    fn_slot_assign(sm, st)    # AGAST #4310
+
+                    slot_narrowing_assign(sm, st)   # AGAST #4081
+
+                    if st.kind == StmtKind.Assign and st.assign_target_len == 0
+                        index_store_check(sm, st.if_cond)   # AGAST #3565
+
+                        index_whole_array_check(sm, st.if_cond, st)   # AGAST #3893
+                        sema_walk_expr(sm, st.if_cond)
+                    else
+                        match st.kind
+                            StmtKind.IndexAssign =>
+                                index_name_scalar_check(sm, st)   # AGAST #3755
+
+                                index_refuse_name_store(sm, st)   # AGAST #3893
+                                sema_walk_expr(sm, st.while_cond)
+                            StmtKind.LocalFieldIndexAssign | StmtKind.MemberIndexAssign =>
+                                index_field_scalar_check(sm, st)   # AGAST #3799
+                            _ => pass
+                    sema_walk_expr(sm, st.assign_value)
         ref_loan_after(sm, st)   # a declaration holds its `@x` (AGAST #3506)
 
         ref_value_after(sm, st)   # its binding's notes (AGAST #3926)
@@ -824,7 +831,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
 fn sema_enum_as_int(sm: *Sema, st: *Stmt, first: *Stmt)
     if sm.cur_fn == null
         return
-    if st.next == null and st.kind == STMT_EXPR and first == sm.cur_fn.body
+    if st.next == null and st.kind == StmtKind.Expr and first == sm.cur_fn.body
         enum_as_int_tail(sm, st.expr, sm.cur_fn.return_type)
     else
         enum_as_int_stmt(sm, st, sm.cur_fn.return_type)
@@ -854,8 +861,8 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
 
     own_check_begin_fn(sm, f)   # AGAST #3507: by-value move-only params
 
-    if_arm_want_tail((f.return_type != TYPE_VOID) as i32)   # AGAST #3980
-    sema_walk_stmts(sm, f.body, (f.return_type == TYPE_VOID) as i32)
+    if_arm_want_tail((f.return_type != TypeKind.Void) as i32)   # AGAST #3980
+    sema_walk_stmts(sm, f.body, (f.return_type == TypeKind.Void) as i32)
     tail_value_check(sm, f)   # AGAST #2236 / #3511, after call_check's notes
 
     own_check_end_fn(sm, f)   # AGAST #3507: the fn's `ret`
@@ -898,12 +905,12 @@ fn fv_error(name: *u8) -> i32
     diag_error(at.file, diag_span(at.line, at.col), c"`Future` has no size; take it by reference, `@&Future`")
     1
 
-# 1 when `ty` (a `TYPE_ARRAY` of `elem`) is `Future` by value, refused.
-fn fv_slot(ty: i32, elem: i32, name: *u8, len: i32) -> i32
+# 1 when `ty` (a `TypeKind.Array` of `elem`) is `Future` by value, refused.
+fn fv_slot(ty: TypeKind, elem: TypeKind, name: *u8, len: i32) -> i32
     var by_value: i32 = 0
-    if ty == TYPE_STRUCT
+    if ty == TypeKind.Struct
         by_value = 1
-    else if ty == TYPE_ARRAY and elem == TYPE_STRUCT
+    else if ty == TypeKind.Array and elem == TypeKind.Struct
         by_value = 1
     if by_value == 0 or fv_named_future(name, len) == 0
         return 0
@@ -913,30 +920,32 @@ fn fv_stmts(s: *Stmt) -> i32
     var n: i32 = 0
     var cur: *Stmt = s
     while cur != null
-        let k: i32 = cur.kind
-        if k == STMT_VAR_DECL
-            n = n + fv_slot(cur.var_type, cur.var_array_elem_type, cur.var_type_name, cur.var_type_name_len)
-            if cur.var_array != null
-                n = n + fv_slot(cur.var_type, cur.var_array.elem, cur.var_array.name, cur.var_array.name_len)
-        else if k == STMT_IF
-            n = n + fv_stmts(cur.if_then)
-            n = n + fv_stmts(cur.if_else)
-        else if k == STMT_WHILE or k == STMT_LOOP or k == STMT_DEFER or k == STMT_UNSAFE
-            n = n + fv_stmts(cur.while_body)
-        else if k == STMT_FOR
-            n = n + fv_stmts(cur.for_body)
-        else if k == STMT_MATCH
-            var arm: *MatchArm = cur.if_then as *MatchArm
-            while arm != null
-                n = n + fv_stmts(arm.body_stmts)
-                arm = arm.next
+        let k: StmtKind = cur.kind
+        match k
+            StmtKind.VarDecl =>
+                n = n + fv_slot(cur.var_type, cur.var_array_elem_type, cur.var_type_name, cur.var_type_name_len)
+                if cur.var_array != null
+                    n = n + fv_slot(cur.var_type, cur.var_array.elem, cur.var_array.name, cur.var_array.name_len)
+            StmtKind.If =>
+                n = n + fv_stmts(cur.if_then)
+                n = n + fv_stmts(cur.if_else)
+            StmtKind.While | StmtKind.Loop | StmtKind.Defer | StmtKind.Unsafe =>
+                n = n + fv_stmts(cur.while_body)
+            StmtKind.For =>
+                n = n + fv_stmts(cur.for_body)
+            StmtKind.Match =>
+                var arm: *MatchArm = cur.if_then as *MatchArm
+                while arm != null
+                    n = n + fv_stmts(arm.body_stmts)
+                    arm = arm.next
+            _ => pass
         cur = cur.next
     n
 
 fn fv_fn(f: *FnDef) -> i32
-    var n: i32 = fv_slot(f.return_type, TYPE_VOID, f.return_type_name, f.return_type_name_len)
+    var n: i32 = fv_slot(f.return_type, TypeKind.Void, f.return_type_name, f.return_type_name_len)
     if f.ret_array_param != null
-        n = n + fv_slot(TYPE_ARRAY, f.ret_array_param.param_array_elem_type, f.ret_array_param.param_type_name, f.ret_array_param.param_type_name_len)
+        n = n + fv_slot(TypeKind.Array, f.ret_array_param.param_array_elem_type, f.ret_array_param.param_type_name, f.ret_array_param.param_type_name_len)
     var p: *Param = f.params
     while p != null
         n = n + fv_slot(p.param_type, p.param_array_elem_type, p.param_type_name, p.param_type_name_len)
@@ -950,13 +959,13 @@ fn fv_module(m: *Module) -> i32
         var fld: *StructField = st.fields
         while fld != null
             n = n + fv_slot(fld.field_type, fld.array_elem_type, fld.field_type_name, fld.field_type_name_len)
-            n = n + fv_slot(TYPE_ARRAY, fld.array_elem_type, fld.array_elem_type_name, fld.array_elem_type_name_len)
+            n = n + fv_slot(TypeKind.Array, fld.array_elem_type, fld.array_elem_type_name, fld.array_elem_type_name_len)
             fld = fld.next
         st = st.next
     var g: *GlobalVarDef = m.globals
     while g != null
         n = n + fv_slot(g.var_type, g.array_elem_type, g.type_name, g.type_name_len)
-        n = n + fv_slot(TYPE_ARRAY, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
+        n = n + fv_slot(TypeKind.Array, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
         g = g.next
     var f: *FnDef = m.functions
     while f != null

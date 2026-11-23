@@ -4,59 +4,63 @@
 # Designed to be easy to parse and emit to LLVM IR.
 
 import tokens_gen
+import ritzlib.option   # TypeKind.from (type_kind_of)
 
 # Expression kinds
-const EXPR_INT_LIT: i32 = 1
-# Expr.lit_kind of an EXPR_INT_LIT (AGAST #2236).
+pub enum ExprKind: i32
+    Unset = 0   # a zeroed Expr: no kind yet
+    IntLit = 1
+    StringLit = 2
+    NilLit = 3  # nil literal (null pointer)
+    Ident = 4
+    Binary = 5
+    Unary = 6
+    Call = 7
+    Cast = 8
+    Index = 9  # Array/pointer indexing: expr[index]
+    Member = 10  # Member access: expr.field (TODO: not yet implemented in emitter)
+    StructLit = 11  # Struct literal: Type { field: value, ... }
+    Method = 12      # Method call: expr.method(args)
+    CharLit = 13    # Character literal: 'a'
+    Range = 14       # Range expression: start..end (left=start, right=end)
+    ArrayLit = 15   # Array literal: [a, b, c] (parser-only; ignored by emitter when stored in consts)
+    CstringLit = 16 # C-string literal: c"..." (null-terminated *u8)
+    # EXPR_SSTRING_LIT (slot 17) was removed in AGAST #98 — bare ExprKind.StringLit
+    # now emits a StrView aggregate of the same shape. Slot kept as a hole so
+    # subsequent EXPR_* values stay stable.
+    Match = 18       # Match expression: match scrutinee \n pattern => body ...
+    Try = 19         # Try operator: expr? — on Ok/Some continue with payload,
+    # on Err/None early-return the encoded value. Inner expr
+    # lives in `left`. (AGAST #134)
+    # Float literal — value is the raw source bytes; emitter parses + emits as
+    # `float`/`double` constant.  Storage shares string_ptr/string_len because
+    # IEEE-754 bit-exact reconstruction needs the raw decimal repr.
+    FloatLit = 20
+    # Array fill literal: `[value; N]` — repeated initialization. (AGAST #178)
+    # `left` holds the value expression; `int_val` holds the count (extracted
+    # from the count token in the grammar action — only int literal counts are
+    # supported, mirroring ritz0).
+    ArrayFill = 21
+    # If/else expression (AGAST #1613): `let n = if c` + indented arms + `else`.
+    # Condition in `left`; `args` holds two wildcard MatchArms (then, else) built
+    # by expr_if / match_arm_set_block, so the arms' values, block statements and
+    # struct-typed phi go through the same machinery as ExprKind.Match arms.
+    If = 22
+    # A type as `sizeof`'s operand (AGAST #2124): `sizeof([8]u8)`, and
+    # monomorph's `sizeof(T)` substitution.  int_val = element count (1 for a
+    # non-array), op = the leaf TYPE_* kind, ident_ptr/ident_len = the leaf
+    # struct name (TypeKind.Struct only).  Only sizeof reads it.
+    TypeOperand = 23
+    # AGAST #1456: `await e` (operand in .operand).  async_lower.ritz lowers every
+    # one before any check (AGAST #3814); no later pass sees one.
+    Await = 24
+
+# Expr.lit_kind of an ExprKind.IntLit (AGAST #2236).
 const LIT_PLAIN: i32 = 0   # a number
 const LIT_TRUE: i32 = 1    # `true`
 const LIT_PASS: i32 = 2    # `pass` in expression position
 const LIT_FALSE: i32 = 3   # `false`
 const LIT_UNIT: i32 = 4    # `()`, the unit value (AGAST #2272)
-const EXPR_STRING_LIT: i32 = 2
-const EXPR_NIL_LIT: i32 = 3  # nil literal (null pointer)
-const EXPR_IDENT: i32 = 4
-const EXPR_BINARY: i32 = 5
-const EXPR_UNARY: i32 = 6
-const EXPR_CALL: i32 = 7
-const EXPR_CAST: i32 = 8
-const EXPR_INDEX: i32 = 9  # Array/pointer indexing: expr[index]
-const EXPR_MEMBER: i32 = 10  # Member access: expr.field (TODO: not yet implemented in emitter)
-const EXPR_STRUCT_LIT: i32 = 11  # Struct literal: Type { field: value, ... }
-const EXPR_METHOD: i32 = 12      # Method call: expr.method(args)
-const EXPR_CHAR_LIT: i32 = 13    # Character literal: 'a'
-const EXPR_RANGE: i32 = 14       # Range expression: start..end (left=start, right=end)
-const EXPR_ARRAY_LIT: i32 = 15   # Array literal: [a, b, c] (parser-only; ignored by emitter when stored in consts)
-const EXPR_CSTRING_LIT: i32 = 16 # C-string literal: c"..." (null-terminated *u8)
-# EXPR_SSTRING_LIT (slot 17) was removed in AGAST #98 — bare EXPR_STRING_LIT
-# now emits a StrView aggregate of the same shape. Slot kept as a hole so
-# subsequent EXPR_* values stay stable.
-const EXPR_MATCH: i32 = 18       # Match expression: match scrutinee \n pattern => body ...
-const EXPR_TRY: i32 = 19         # Try operator: expr? — on Ok/Some continue with payload,
-                                 # on Err/None early-return the encoded value. Inner expr
-                                 # lives in `left`. (AGAST #134)
-# Float literal — value is the raw source bytes; emitter parses + emits as
-# `float`/`double` constant.  Storage shares string_ptr/string_len because
-# IEEE-754 bit-exact reconstruction needs the raw decimal repr.
-const EXPR_FLOAT_LIT: i32 = 20
-# Array fill literal: `[value; N]` — repeated initialization. (AGAST #178)
-# `left` holds the value expression; `int_val` holds the count (extracted
-# from the count token in the grammar action — only int literal counts are
-# supported, mirroring ritz0).
-const EXPR_ARRAY_FILL: i32 = 21
-# If/else expression (AGAST #1613): `let n = if c` + indented arms + `else`.
-# Condition in `left`; `args` holds two wildcard MatchArms (then, else) built
-# by expr_if / match_arm_set_block, so the arms' values, block statements and
-# struct-typed phi go through the same machinery as EXPR_MATCH arms.
-const EXPR_IF: i32 = 22
-# A type as `sizeof`'s operand (AGAST #2124): `sizeof([8]u8)`, and
-# monomorph's `sizeof(T)` substitution.  int_val = element count (1 for a
-# non-array), op = the leaf TYPE_* kind, ident_ptr/ident_len = the leaf
-# struct name (TYPE_STRUCT only).  Only sizeof reads it.
-const EXPR_TYPE_OPERAND: i32 = 23
-# AGAST #1456: `await e` (operand in .operand).  async_lower.ritz lowers every
-# one before any check (AGAST #3814); no later pass sees one.
-const EXPR_AWAIT: i32 = 24
 
 # Pattern kinds (used by MatchArm)
 # NOTE: pattern kinds live in their own namespace — not confused with EXPR_/STMT_.
@@ -69,99 +73,92 @@ const PAT_STR: i32 = 6       # "text"; its cooked bytes in pattern_name/_len (AG
 const PAT_CHAR: i32 = 7      # '('; its byte in pattern_int, an integer typed u8 (LARB R72, #4196)
 
 # Binary operators
-const OP_ADD: i32 = 1
-const OP_SUB: i32 = 2
-const OP_MUL: i32 = 3
-const OP_DIV: i32 = 4
-const OP_MOD: i32 = 5
-const OP_EQ: i32 = 6
-const OP_NE: i32 = 7
-const OP_LT: i32 = 8
-const OP_GT: i32 = 9
-const OP_LE: i32 = 10
-const OP_GE: i32 = 11
-const OP_AND: i32 = 12
-const OP_OR: i32 = 13
-
-# Bitwise operators
-const OP_BIT_AND: i32 = 14
-const OP_BIT_OR: i32 = 15
-const OP_BIT_XOR: i32 = 16
-const OP_SHL: i32 = 17
-const OP_SHR: i32 = 18
-
-# Unary operators
-const OP_NEG: i32 = 20
-const OP_NOT: i32 = 21
-const OP_DEREF: i32 = 22  # Pointer dereference: *expr
-const OP_ADDR: i32 = 23      # Address-of: @expr
-const OP_BIT_NOT: i32 = 24   # Bitwise NOT: ~expr
-const OP_ADDR_MUT: i32 = 25  # Mutable address-of: @&expr
-
-# Unary operator aliases (used by parser/emitter to distinguish unary context)
-const UOP_NEG: i32 = 20
-const UOP_NOT: i32 = 21
-const UOP_DEREF: i32 = 22
-const UOP_ADDR: i32 = 23
-const UOP_BIT_NOT: i32 = 24
-const UOP_ADDR_MUT: i32 = 25
-
-# Wrapping operators (LARB R63, AGAST #3486).  Parser-side codes only: the
-# grammar's `+%` / `-%` / `*%` and their `op=` forms arrive as these, and
-# binary_op_new / expr_binary and the compound-assign builders turn one into
-# its plain OP_ADD / OP_SUB / OP_MUL with Expr.wrapping set.  No Expr keeps
-# one, so every pass past the parser sees the plain operator plus the flag.
-const OP_ADD_WRAP: i32 = 26
-const OP_SUB_WRAP: i32 = 27
-const OP_MUL_WRAP: i32 = 28
+pub enum OpKind: i32
+    Unset = 0   # not an operator (a zeroed Expr.op)
+    Add = 1
+    Sub = 2
+    Mul = 3
+    Div = 4
+    Mod = 5
+    Eq = 6
+    Ne = 7
+    Lt = 8
+    Gt = 9
+    Le = 10
+    Ge = 11
+    And = 12
+    Or = 13
+    # Bitwise operators
+    BitAnd = 14
+    BitOr = 15
+    BitXor = 16
+    Shl = 17
+    Shr = 18
+    # Unary operators
+    Neg = 20
+    Not = 21
+    Deref = 22  # Pointer dereference: *expr
+    Addr = 23      # Address-of: @expr
+    BitNot = 24   # Bitwise NOT: ~expr
+    AddrMut = 25  # Mutable address-of: @&expr
+    # Wrapping operators (LARB R63, AGAST #3486).  Parser-side codes only: the
+    # grammar's `+%` / `-%` / `*%` and their `op=` forms arrive as these, and
+    # binary_op_new / expr_binary and the compound-assign builders turn one into
+    # its plain OpKind.Add / OpKind.Sub / OpKind.Mul with Expr.wrapping set.  No Expr keeps
+    # one, so every pass past the parser sees the plain operator plus the flag.
+    AddWrap = 26
+    SubWrap = 27
+    MulWrap = 28
 
 # Statement kinds
-const STMT_VAR_DECL: i32 = 1
-const STMT_ASSIGN: i32 = 2
-const STMT_RETURN: i32 = 3
-const STMT_IF: i32 = 4
-const STMT_WHILE: i32 = 5
-const STMT_EXPR: i32 = 6
-const STMT_MEMBER_ASSIGN: i32 = 7  # ptr.field = value
-const STMT_MEMBER_INDEX_ASSIGN: i32 = 8  # ptr.field[index] = value
-const STMT_INDEX_ASSIGN: i32 = 9  # name[index] = value
-const STMT_BREAK: i32 = 10        # break statement
-const STMT_CONTINUE: i32 = 11     # continue statement (for future use)
-const STMT_LOCAL_FIELD_ASSIGN: i32 = 12  # local_var.field = value
-const STMT_LOCAL_FIELD_INDEX_ASSIGN: i32 = 13  # local_var.field[index] = value
-const STMT_FOR: i32 = 14  # for i in start..end { body }
-const STMT_LOOP: i32 = 15 # loop { body } - infinite loop with break
-const STMT_MATCH: i32 = 16 # match scrutinee \n pattern => body ...
-# `assert <cond>` — runtime check; if cond evaluates 0/false the program
-# exits with status 1 via inline syscall(60).  The condition expression
-# is stored in `if_cond` (reusing STMT_IF's slot — the lowering is
-# semantically a guarded if).  Message text is not yet plumbed.
-const STMT_ASSERT: i32 = 17
-# `let (x, y) = expr` — destructure a 2-field tuple into two locals (LARB R67:
-# a named struct is refused, at paren_span).  First name lives in var_name
-# (slot reused), second in assign_target.  Init expression in var_init.  The
-# emitter resolves the tuple type from the init expression and extractvalue's
-# fields 0 and 1.
-const STMT_TUPLE_DECL: i32 = 18
-# G9b (AGAST #1899): the body of an imported fn stripped to its interface
-# (main.ritz strip_to_interface).  A no-op that every body walker skips; the
-# fn keeps a non-null body because `body == null` means `extern fn`.
-const STMT_STRIPPED: i32 = 19
-# `defer <stmt>` / `defer` + block (LANGUAGE_SPEC §13.7, AGAST #1625).  The
-# deferred statement list is in while_body (null for a bare `defer`), and
-# defer_is_block is 1 for the block form.  Nothing is emitted at the
-# `defer`: own_defer registers it, and it is emitted at each exit of its
-# block, interleaved with the drops (ownership.ritz).
-const STMT_DEFER: i32 = 20
-# `unsafe` + block (AGAST #2248).  The body is in while_body, as a `loop`'s.
-# A block for scope and drops, never a loop: a `break` in it leaves the loop
-# around it, and it diverges exactly when its body does (ritz0 UnsafeBlock).
-const STMT_UNSAFE: i32 = 21
-# `asm ARCH (clauses): <raw lines>` (LANGUAGE_SPEC §18.6, LARB R50, AGAST
-# #3394).  Everything is in asm_block; the statement holds no expressions or
-# statements, so a walker has nothing to descend into.  ritz1 parses and checks
-# it (stmt_asm, ast_helpers.ritz) and lowers it (emitter_asm.ritz, AGAST #3395).
-const STMT_ASM: i32 = 22
+pub enum StmtKind: i32
+    Unset = 0   # a zeroed Stmt: no kind yet
+    VarDecl = 1
+    Assign = 2
+    Return = 3
+    If = 4
+    While = 5
+    Expr = 6
+    MemberAssign = 7  # ptr.field = value
+    MemberIndexAssign = 8  # ptr.field[index] = value
+    IndexAssign = 9  # name[index] = value
+    Break = 10        # break statement
+    Continue = 11     # continue statement (for future use)
+    LocalFieldAssign = 12  # local_var.field = value
+    LocalFieldIndexAssign = 13  # local_var.field[index] = value
+    For = 14  # for i in start..end { body }
+    Loop = 15 # loop { body } - infinite loop with break
+    Match = 16 # match scrutinee \n pattern => body ...
+    # `assert <cond>` — runtime check; if cond evaluates 0/false the program
+    # exits with status 1 via inline syscall(60).  The condition expression
+    # is stored in `if_cond` (reusing StmtKind.If's slot — the lowering is
+    # semantically a guarded if).  Message text is not yet plumbed.
+    Assert = 17
+    # `let (x, y) = expr` — destructure a 2-field tuple into two locals (LARB R67:
+    # a named struct is refused, at paren_span).  First name lives in var_name
+    # (slot reused), second in assign_target.  Init expression in var_init.  The
+    # emitter resolves the tuple type from the init expression and extractvalue's
+    # fields 0 and 1.
+    TupleDecl = 18
+    # G9b (AGAST #1899): the body of an imported fn stripped to its interface
+    # (main.ritz strip_to_interface).  A no-op that every body walker skips; the
+    # fn keeps a non-null body because `body == null` means `extern fn`.
+    Stripped = 19
+    # `defer <stmt>` / `defer` + block (LANGUAGE_SPEC §13.7, AGAST #1625).  The
+    # deferred statement list is in while_body (null for a bare `defer`), and
+    # defer_is_block is 1 for the block form.  Nothing is emitted at the
+    # `defer`: own_defer registers it, and it is emitted at each exit of its
+    # block, interleaved with the drops (ownership.ritz).
+    Defer = 20
+    # `unsafe` + block (AGAST #2248).  The body is in while_body, as a `loop`'s.
+    # A block for scope and drops, never a loop: a `break` in it leaves the loop
+    # around it, and it diverges exactly when its body does (ritz0 UnsafeBlock).
+    Unsafe = 21
+    # `asm ARCH (clauses): <raw lines>` (LANGUAGE_SPEC §18.6, LARB R50, AGAST
+    # #3394).  Everything is in asm_block; the statement holds no expressions or
+    # statements, so a walker has nothing to descend into.  ritz1 parses and checks
+    # it (stmt_asm, ast_helpers.ritz) and lowers it (emitter_asm.ritz, AGAST #3395).
+    Asm = 22
 
 # asm operand directions (AsmOperand.dir).  ASM_CLOBBER marks a `clobber REG`
 # clause while the grammar builds the clause list; stmt_asm moves it to
@@ -179,35 +176,53 @@ const ASM_REG_RSP: i32 = 4
 const ASM_REG_RBP: i32 = 5
 
 # Type kinds
-const TYPE_VOID: i32 = 0       # No return type (void)
-const TYPE_I32: i32 = 1
-const TYPE_I64: i32 = 2
-const TYPE_U8: i32 = 3
-const TYPE_BOOL: i32 = 4
-const TYPE_PTR: i32 = 5
-const TYPE_PTR_PTR: i32 = 6  # Pointer-to-pointer (**u8, etc.)
-const TYPE_I8: i32 = 7
-const TYPE_U64: i32 = 8       # Unsigned 64-bit integer
-const TYPE_U16: i32 = 9       # Unsigned 16-bit integer
-const TYPE_U32: i32 = 10      # Unsigned 32-bit integer
-const TYPE_I16: i32 = 11      # Signed 16-bit integer
-# IEEE-754 floats — first-class type kinds rather than TYPE_STRUCT+name="f32"
-# (the half-measure from `04c944e`).  is_float_type() centralises the check;
-# emit_llvm_type / arith / cmp / cast paths dispatch on these to use
-# float/double + fadd/fmul/fcmp/sitofp/fptosi instead of integer ops.
-const TYPE_F32: i32 = 12      # 32-bit IEEE-754 single precision
-const TYPE_F64: i32 = 13      # 64-bit IEEE-754 double precision
-const TYPE_STRUCT: i32 = 100  # Named struct type (100+ reserved for structs)
-const TYPE_ARRAY: i32 = 101   # Array type [N]T - stores size and element type
-const TYPE_REF: i32 = 102     # Immutable reference @T (emits as pointer)
-const TYPE_MUT_REF: i32 = 103 # Mutable reference @@T (emits as pointer)
+pub enum TypeKind: i32
+    # Void first: zeroed memory is an enum's first variant, not the one with
+    # discriminant 0 (AGAST #4574); a zeroed field is Void, as the i32 was.
+    Void = 0       # No return type (void)
+    I32 = 1
+    I64 = 2
+    U8 = 3
+    Bool = 4
+    Ptr = 5
+    PtrPtr = 6  # Pointer-to-pointer (**u8, etc.)
+    I8 = 7
+    U64 = 8       # Unsigned 64-bit integer
+    U16 = 9       # Unsigned 16-bit integer
+    U32 = 10      # Unsigned 32-bit integer
+    I16 = 11      # Signed 16-bit integer
+    # IEEE-754 floats — first-class type kinds rather than TypeKind.Struct+name="f32"
+    # (the half-measure from `04c944e`).  is_float_type() centralises the check;
+    # emit_llvm_type / arith / cmp / cast paths dispatch on these to use
+    # float/double + fadd/fmul/fcmp/sitofp/fptosi instead of integer ops.
+    F32 = 12      # 32-bit IEEE-754 single precision
+    F64 = 13      # 64-bit IEEE-754 double precision
+    Struct = 100  # Named struct type (100+ reserved for structs)
+    Array = 101   # Array type [N]T - stores size and element type
+    Ref = 102     # Immutable reference @T (emits as pointer)
+    MutRef = 103 # Mutable reference @@T (emits as pointer)
+    # AGAST #1328: "not a local" miss value for find_local_type (was
+    # ast_query.ritz TypeKind.Unknown).  The old miss value was I64, which a
+    # caller took for a real i64 local; Unknown collides with no kind.
+    Unknown = -1
+    # AGAST #4450: an inner-pointee slot (see PTR_DEPTH_UNIT) read as a kind
+    # when it packs levels past `**`: ptr_slot_flat's answer for a `***T`.
+    # It equals no other kind, as the packed i32 it replaces did.
+    DeepPtr = 1024
+    # AGAST #4450: analysis sentinels, kinds no declared type has: a
+    # narrowing check's "cannot tell" (was narrowing.ritz TypeKind.NarrowUnknown)
+    # and its bare integer literal (TypeKind.NarrowLit), and fn_slot's fn-typed
+    # slot (was fn_slot.ritz TypeKind.FnSig = 9001, renumbered off NarrowUnknown).
+    NarrowUnknown = 9001
+    NarrowLit = 9002
+    FnSig = 9003
 
 # AGAST #1924: a `**T` records its innermost pointee T in one i32 slot
 # (Stmt.var_inner_pointee_type, Param.param_inner_pointee_type,
 # GlobalVarDef / StructField / LocalVar.inner_pointee_type).  A deeper
 # pointer packs its extra levels into the same slot: `***T` is
 # T + PTR_DEPTH_UNIT, `****T` is T + 2 * PTR_DEPTH_UNIT.  Every reader that
-# asks "is this a **S?" (`== TYPE_STRUCT`) therefore still answers no for
+# asks "is this a **S?" (`== TypeKind.Struct`) therefore still answers no for
 # `***S`, and every copy of the slot carries the depth with it.  Decode
 # with ptr_ptr_slot_levels / ptr_ptr_slot_inner below.
 const PTR_DEPTH_UNIT: i32 = 1024
@@ -224,20 +239,100 @@ const INNER_REF_MUT: i32 = 2      # an `@&T`, or a `:&` borrow
 # of the whole pointer type: 2 for `**T`, 3 for `***T`; 0 when the slot
 # records nothing.
 pub fn ptr_ptr_slot_levels(slot: i32) -> i32
-    if slot == TYPE_VOID or slot < 0
+    if slot == (TypeKind.Void as i32) or slot < 0
         return 0
     return 2 + slot / PTR_DEPTH_UNIT
 
 # The innermost pointee T of an inner-pointee slot.
-pub fn ptr_ptr_slot_inner(slot: i32) -> i32
+pub fn ptr_ptr_slot_inner(slot: i32) -> TypeKind
     if slot < 0
-        return TYPE_VOID
-    return slot % PTR_DEPTH_UNIT
+        return TypeKind.Void
+    type_kind_of(slot % PTR_DEPTH_UNIT)
 
 # The slot with its innermost pointee replaced by `inner` (depth kept), for
 # monomorph's `**T` -> `**i32`.
-pub fn ptr_ptr_slot_subst(slot: i32, inner: i32) -> i32
-    return slot - ptr_ptr_slot_inner(slot) + inner
+pub fn ptr_ptr_slot_subst(slot: i32, inner: TypeKind) -> i32
+    return slot - (ptr_ptr_slot_inner(slot) as i32) + (inner as i32)
+
+# AGAST #4450: the levels past `**` a slot packs (0 for a `**T`).
+pub fn ptr_slot_extra(slot: i32) -> i32
+    slot / PTR_DEPTH_UNIT
+
+# AGAST #4450: `slot` with `n` more levels past `**`: a `**T` slot deepened
+# by one is the `***T` slot.  These helpers are the only code that knows the
+# packing; every other reader goes through them.
+pub fn ptr_slot_deepen(slot: i32, n: i32) -> i32
+    slot + n * PTR_DEPTH_UNIT
+
+# AGAST #4450: an inner-pointee slot read as a kind: its kind for a `**T`,
+# DeepPtr when it packs more levels (matching no other kind, as the packed
+# value did).
+pub fn ptr_slot_flat(slot: i32) -> TypeKind
+    if ptr_slot_extra(slot) > 0
+        return TypeKind.DeepPtr
+    type_kind_of(slot)
+
+# AGAST #4450: the TypeKind an i32 encodes (a packed slot's kind, an encoded
+# Expr.sema_ty, a loop counter over the scalar kinds); Unknown for a value
+# that is no kind.
+pub fn type_kind_of(v: i32) -> TypeKind
+    match TypeKind.from(v)
+        Some(k) => k
+        None => TypeKind.Unknown
+
+# AGAST #4450: the scalar leaf kinds (I32 .. F64 but the two pointer kinds),
+# which were range checks on the old i32 codes.
+pub fn type_is_scalar_leaf(t: TypeKind) -> bool
+    match t
+        TypeKind.I32 => true
+        TypeKind.I64 => true
+        TypeKind.U8 => true
+        TypeKind.Bool => true
+        TypeKind.I8 => true
+        TypeKind.U64 => true
+        TypeKind.U16 => true
+        TypeKind.U32 => true
+        TypeKind.I16 => true
+        TypeKind.F32 => true
+        TypeKind.F64 => true
+        _ => false
+
+# AGAST #4450: `t < TypeKind.Struct and t not a pointer kind` on the old codes:
+# Unknown, Void and the scalar leaves.
+pub fn type_is_below_struct_nonptr(t: TypeKind) -> bool
+    match t
+        TypeKind.Unknown => true
+        TypeKind.Void => true
+        _ => type_is_scalar_leaf(t)
+
+# AGAST #4450: OpKind's ordered groups, which were range checks on the old
+# i32 codes.  Eq .. Ge: the comparisons.
+pub fn op_is_comparison(op: OpKind) -> bool
+    match op
+        OpKind.Eq => true
+        OpKind.Ne => true
+        OpKind.Lt => true
+        OpKind.Gt => true
+        OpKind.Le => true
+        OpKind.Ge => true
+        _ => false
+
+# Eq .. Or: the comparisons and the logical `and` / `or` (a bool result).
+pub fn op_is_cmp_or_logic(op: OpKind) -> bool
+    match op
+        OpKind.And => true
+        OpKind.Or => true
+        _ => op_is_comparison(op)
+
+# BitAnd .. Shr: the bitwise operators and the shifts.
+pub fn op_is_bitwise(op: OpKind) -> bool
+    match op
+        OpKind.BitAnd => true
+        OpKind.BitOr => true
+        OpKind.BitXor => true
+        OpKind.Shl => true
+        OpKind.Shr => true
+        _ => false
 
 # Source location span for DWARF debug info.  Named SrcSpan, not Span, so it
 # does not collide with ritzlib.span's Span<T>, which main.ritz reaches
@@ -255,8 +350,8 @@ struct TupleName
   next: *TupleName
 
 # AGAST #1509: the full shape of a multi-dimensional array type `[d0][d1]..T`.
-# A nested array is still TYPE_ARRAY with array_size = d0 and array_elem_type
-# = TYPE_ARRAY; this records every dimension (outermost first) and the leaf
+# A nested array is still TypeKind.Array with array_size = d0 and array_elem_type
+# = TypeKind.Array; this records every dimension (outermost first) and the leaf
 # T, which the 1-D fields cannot hold.  Built by type_array, carried only by
 # the declarations ritz1 lowers (local and global `var`); every other site
 # that meets a nested array type rejects it (nd_array_reject).
@@ -265,16 +360,16 @@ const MAX_ARRAY_RANK: i32 = 8
 struct ArrayShape
   rank: i32                 # number of dimensions, >= 2
   dims: [8]i32              # MAX_ARRAY_RANK; dims[0] is the outermost
-  leaf_type: i32            # T (never TYPE_ARRAY)
-  leaf_name: *u8            # struct name when leaf_type == TYPE_STRUCT
+  leaf_type: TypeKind            # T (never TypeKind.Array)
+  leaf_name: *u8            # struct name when leaf_type == TypeKind.Struct
   leaf_name_len: i32
-  leaf_pointee: i32         # AGAST #2343: U when T is `*U`; TYPE_VOID otherwise
+  leaf_pointee: TypeKind         # AGAST #2343: U when T is `*U`; TypeKind.Void otherwise
 
 # AGAST #2343: an array's element, where a type is kept only long enough to judge
 # a store: a fn's `-> [N]T` and `x as [N]T`.
 struct ArrayElem
-  elem: i32                 # T (TYPE_ARRAY for `[N][M]..T`)
-  pointee: i32              # U for `[N]*U`; TYPE_VOID otherwise
+  elem: TypeKind                 # T (TypeKind.Array for `[N][M]..T`)
+  pointee: TypeKind              # U for `[N]*U`; TypeKind.Void otherwise
   name: *u8                 # the struct T or U
   name_len: i32
   shape: *ArrayShape        # non-null for `[N][M]..T`
@@ -288,87 +383,95 @@ struct ArrayElem
 
 # Expression node
 struct Expr
-  kind: i32
+  kind: ExprKind
   span: SrcSpan  # Source location for DWARF debug info
-  # For EXPR_INT_LIT
+  # For ExprKind.IntLit
   int_val: i64
-  # For EXPR_STRING_LIT
+  # For ExprKind.StringLit
   string_ptr: *u8
   string_len: i32
-  # For EXPR_IDENT
-  # For EXPR_CAST to `*T` (AGAST #1453): ident_ptr/ident_len = the pointee
-  # struct name (null for a non-struct pointee), int_val = the pointee kind
-  # (TYPE_STRUCT, TYPE_I32, ...; TYPE_VOID when unknown).  For EXPR_CAST to
+  # For ExprKind.Ident
+  # For ExprKind.Cast to `*T` (AGAST #1453): ident_ptr/ident_len = the pointee
+  # struct name (null for a non-struct pointee), cast_ptr_kind = the pointee
+  # kind (TypeKind.Struct, TypeKind.I32, ...; TypeKind.Void when unknown).  For ExprKind.Cast to
   # a struct `C`, ident_ptr/ident_len = `C` (AGAST #2288).  For a parsed
-  # EXPR_INT_LIT, its source text if it is 2^64 or more, else null (#3083).
+  # ExprKind.IntLit, its source text if it is 2^64 or more, else null (#3083).
   ident_ptr: *u8
   ident_len: i32
-  # For EXPR_BINARY and EXPR_INDEX
-  op: i32
+  # For ExprKind.Binary and ExprKind.Index
+  op: OpKind
   left: *Expr     # Binary: left operand, Index: base expression
   right: *Expr    # Binary: right operand, Index: index expression
-  # AGAST #3486 (LARB R63): 1 on an EXPR_BINARY the source wrote `+%`, `-%` or
+  # AGAST #3486 (LARB R63): 1 on an ExprKind.Binary the source wrote `+%`, `-%` or
   # `*%` (and on the `op=` desugaring of `+%=` etc.).  op holds the plain
   # operator, so every rule for `+` applies; only these two differ: a wider
   # slot doesn't widen it (literal_slot.lit_slot_arith stops there), and on a
   # float or a pointer it is refused (wrapping.ritz).  emitter_expr_arith wraps
   # the result back to the operand type.  parser_alloc zeroes it.
   wrapping: i32
-  # For EXPR_UNARY
+  # For ExprKind.Unary
   operand: *Expr
-  # For EXPR_CALL
+  # For ExprKind.Call
   func_name: *u8
   func_name_len: i32
   call_type_suffix: *u8       # Type suffix for generic calls, e.g., "$u8" for vec_new<u8>()
   call_type_suffix_len: i32
   args: *Expr        # Linked list of args (using 'next' below)
-  # For EXPR_METHOD: receiver in 'left', method name in 'ident_ptr/ident_len', args in 'args'
+  # For ExprKind.Method: receiver in 'left', method name in 'ident_ptr/ident_len', args in 'args'
   # Linked list
   next: *Expr
-  # AGAST #2120: for EXPR_CAST to a fn type, its signature (with the alias's
+  # AGAST #2120: for ExprKind.Cast to a fn type, its signature (with the alias's
   # [[callconv]]), so `(p as EfiFn)(..)` calls typed; null otherwise.  Set
-  # only by the cast constructors: read it on EXPR_CAST nodes alone.
+  # only by the cast constructors: read it on ExprKind.Cast nodes alone.
   fn_sig: *FnDef
-  # AGAST #2341: for EXPR_CAST, the pointee of a pointer target.
-  cast_pointee: i32
-  # AGAST #2343: for EXPR_CAST to `[N]T`, its element; null otherwise.
+  # AGAST #2341: for ExprKind.Cast, the pointee of a pointer target.
+  cast_pointee: TypeKind
+  # AGAST #4450: for ExprKind.Cast, the target type; for ExprKind.TypeOperand, the
+  # leaf type.  (Held in `op` until then, which is an operator everywhere
+  # else.)
+  type_kind: TypeKind
+  # AGAST #4450: for ExprKind.Cast to `*T`, T's kind (AGAST #1453; TypeKind.Void when
+  # unknown), with ident_ptr/ident_len naming a struct T.  Held in int_val
+  # until then.
+  cast_ptr_kind: i32
+  # AGAST #2343: for ExprKind.Cast to `[N]T`, its element; null otherwise.
   cast_array: *ArrayElem
-  # AGAST #4122: for EXPR_CAST to `*[N][M]..T`, the type as a param records
+  # AGAST #4122: for ExprKind.Cast to `*[N][M]..T`, the type as a param records
   # it (base_ptr_array reads it); null otherwise.
   cast_ptr_array: *Param
-  # AGAST #2236: for EXPR_INT_LIT, how it was written (LIT_*).  `true` and `1`
+  # AGAST #2236: for ExprKind.IntLit, how it was written (LIT_*).  `true` and `1`
   # both lower to the integer 1, and `pass` and `0` to 0, but tail_value.ritz
   # has to tell them apart.  Set by the expr_int family only: parser_alloc
-  # does not zero, so read it on EXPR_INT_LIT nodes alone.
+  # does not zero, so read it on ExprKind.IntLit nodes alone.
   lit_kind: i32
-  # AGAST #2452: for EXPR_INDEX, where its `[` is, so an error about the index
+  # AGAST #2452: for ExprKind.Index, where its `[` is, so an error about the index
   # is located there as ritz0's are (`sv[0][1]` names the second `[`).  Line 0
   # for an index the compiler built: read it through index_bracket_line/_col.
-  # For an EXPR_MEMBER (and the EXPR_METHOD it may become) the parser builds,
+  # For an ExprKind.Member (and the ExprKind.Method it may become) the parser builds,
   # where its field name is (AGAST #3015): R17's errors are located there.
-  # For an EXPR_CAST the parser builds, where its `as` is (AGAST #3040), line
+  # For an ExprKind.Cast the parser builds, where its `as` is (AGAST #3040), line
   # 0 for one the compiler built.
   bracket: SrcSpan
-  # AGAST #3225: for an EXPR_BINARY `/` or `%`, the integer slot it lands in
-  # directly (through `+ - * / % << & | ^` and unary `-`), TYPE_VOID if none:
+  # AGAST #3225: for an ExprKind.Binary `/` or `%`, the integer slot it lands in
+  # directly (through `+ - * / % << & | ^` and unary `-`), TypeKind.Void if none:
   # in a wider slot it divides at the slot's type (literal_slot.ritz,
-  # lit_slot_arith).  Every EXPR_BINARY constructor sets it; read it there alone.
-  slot_type: i32
-  # AGAST #3509: Sema's annotation on an EXPR_CALL it made for `.` through
+  # lit_slot_arith).  Every ExprKind.Binary constructor sets it; read it there alone.
+  slot_type: TypeKind
+  # AGAST #3509: Sema's annotation on an ExprKind.Call it made for `.` through
   # `Deref` / `DerefMut` (deref_field.ritz); null on every other node
   # (parser_alloc zeroes what it hands out).
   deref_step: *DerefStep
-  # AGAST #3042: Sema's annotation on an EXPR_IF / EXPR_MATCH: the struct (an
+  # AGAST #3042: Sema's annotation on an ExprKind.If / ExprKind.Match: the struct (an
   # enum, `G$i32` included) its value is, typed from its first arm Sema can
   # type, in that arm's scope (sema_walk_arms).  match_scrutinee_type reads it
   # for `match (if c then b else d)`, which otherwise guessed its enum from
   # the arms.  Null when no arm types as a struct, and on every other node.
   value_ty_name: *u8
   value_ty_name_len: i32
-  # AGAST #2847: monomorph's annotation on an EXPR_METHOD it made for `m[k]`
+  # AGAST #2847: monomorph's annotation on an ExprKind.Method it made for `m[k]`
   # on a struct (§7.8, struct_index.ritz); null on every other node.
   index_step: *IndexStep
-  # AGAST #4033: own_check's annotation on an EXPR_CAST `@x as *U` of a
+  # AGAST #4033: own_check's annotation on an ExprKind.Cast `@x as *U` of a
   # binding with unwritten parts (§13.6): 1 when the cast writes them, with
   # own_raw_bits their path set (0 when x was unwritten whole).  The emitter
   # sets x's drop flag and clears those mask bits there (own_raw_written).
@@ -376,8 +479,8 @@ struct Expr
   own_raw_bits: i32
   # AGAST #4404: Sema's annotation.  The TYPE_* kind its expr typer
   # (sema_type.ritz, `sema_expr_ty`) gave this node in the scope sema_walk
-  # reached it in, encoded +2: 0 means "not annotated", 1 TYPE_UNKNOWN, 2
-  # TYPE_VOID, and so on.  Read it through expr_sema_ty (ast_query.ritz).
+  # reached it in, encoded +2: 0 means "not annotated", 1 TypeKind.Unknown, 2
+  # TypeKind.Void, and so on.  Read it through expr_sema_ty (ast_query.ritz).
   # The emitter reads types from here instead of re-deriving them from
   # EmitterState (#1816).
   sema_ty: i32
@@ -407,12 +510,12 @@ struct DerefStep
 
 # Statement node
 struct Stmt
-  kind: i32
+  kind: StmtKind
   span: SrcSpan  # Source location for DWARF debug info
-  # For STMT_TUPLE_DECL: where the pattern's `(` is.  LARB R67's refusal
+  # For StmtKind.TupleDecl: where the pattern's `(` is.  LARB R67's refusal
   # points there (AGAST #3500), as ritz0's LetTupleStmt.paren_span does.
   paren_span: SrcSpan
-  # For STMT_VAR_DECL
+  # For StmtKind.VarDecl
   var_name: *u8
   var_name_len: i32
   # AGAST #4528: the `*TypeRef` the declaration's type was parsed from
@@ -420,67 +523,67 @@ struct Stmt
   # derived from it by the parser and stay for the Sema-side readers; lowering
   # registers the local from the chain.
   var_ty: *TypeRef
-  var_type: i32
-  var_type_name: *u8        # Struct name when var_type == TYPE_STRUCT
+  var_type: TypeKind
+  var_type_name: *u8        # Struct name when var_type == TypeKind.Struct
   var_type_name_len: i32
-  var_array_size: i32       # Array size when var_type == TYPE_ARRAY
-  var_array_elem_type: i32  # Element type when var_type == TYPE_ARRAY
+  var_array_size: i32       # Array size when var_type == TypeKind.Array
+  var_array_elem_type: TypeKind  # Element type when var_type == TypeKind.Array
   var_array_shape: *ArrayShape  # AGAST #1509: non-null for `[N][M]..T`
-  var_pointee_type: i32    # Element type when var_type == TYPE_PTR (e.g., TYPE_U8 for *u8)
-  var_array_elem_pointee: i32  # AGAST #2341: T for `[N]*T`; TYPE_VOID otherwise
+  var_pointee_type: TypeKind    # Element type when var_type == TypeKind.Ptr (e.g., TypeKind.U8 for *u8)
+  var_array_elem_pointee: TypeKind  # AGAST #2341: T for `[N]*T`; TypeKind.Void otherwise
   var_array: *ArrayElem     # AGAST #2995: the element of a `[N]T` local; null otherwise
   var_init: *Expr
-  # For STMT_ASSIGN
+  # For StmtKind.Assign
   assign_target: *u8
   assign_target_len: i32
   assign_value: *Expr
-  # For STMT_RETURN
+  # For StmtKind.Return
   return_value: *Expr
-  # For STMT_IF
+  # For StmtKind.If
   if_cond: *Expr
   if_then: *Stmt     # Body (linked list of statements)
   if_else: *Stmt     # Optional else body
-  # For STMT_WHILE
+  # For StmtKind.While
   while_cond: *Expr
   while_body: *Stmt
-  # For STMT_FOR (for i in start..end { body })
+  # For StmtKind.For (for i in start..end { body })
   for_var: *u8           # Loop variable name
   for_var_len: i32
   for_start: *Expr       # Range start expression
   for_end: *Expr         # Range end expression
   for_body: *Stmt        # Loop body (linked list of statements)
   for_inclusive: i32     # 1 for `start..=end` (bound `<=`), 0 for `start..end` (AGAST #1530)
-  # For STMT_EXPR
+  # For StmtKind.Expr
   expr: *Expr
   # Linked list
   next: *Stmt
   # AGAST #1671: signature of a `let f: fn(...) -> T` local (null otherwise).
   var_fn_sig: *FnDef
-  # AGAST #1364: the type the programmer WROTE on a let/var (TYPE_VOID when
+  # AGAST #1364: the type the programmer WROTE on a let/var (TypeKind.Void when
   # there was no annotation).  var_type cannot answer that: the parser
-  # defaults a missing annotation to TYPE_I64.  AGAST #4407: the emitter's
+  # defaults a missing annotation to TypeKind.I64.  AGAST #4407: the emitter's
   # own inference no longer writes var_type, so this stays the parser's.
   # src_file is the arena path for the narrowing diagnostic, set only for an
   # integer annotation narrower than 64 bits (the only ones that can narrow).
-  var_declared_type: i32
+  var_declared_type: TypeKind
   var_src_file: *u8
   # AGAST #1815: for `**T` (exactly two levels), the innermost pointee T
-  # (TYPE_U8 for **u8, ...); TYPE_VOID otherwise.  var_pointee_type is
-  # TYPE_PTR for every **T, so without this `*(*(pp + i) + k)` cannot
+  # (TypeKind.U8 for **u8, ...); TypeKind.Void otherwise.  var_pointee_type is
+  # TypeKind.Ptr for every **T, so without this `*(*(pp + i) + k)` cannot
   # know its element width or stride.
   var_inner_pointee_type: i32
   # AGAST #2399: the reference nearest the pointee, INNER_REF_*: `@@S` and `*@S`
   # are held as an `@*S` / `**S`, and this keeps what that level was.
   var_inner_ref: i32
-  # AGAST #2028: 1 for a STMT_VAR_DECL written `let` (stmt_let_decl), 0 for
+  # AGAST #2028: 1 for a StmtKind.VarDecl written `let` (stmt_let_decl), 0 for
   # `var`.  emit_stmt copies it to LocalVar.is_let; let_check.ritz rejects
   # writes and `@&` into that binding's own storage.
   var_is_let: i32
-  # AGAST #1953: for a STMT_VAR_DECL annotated `*[N]T`, N and T (as
-  # Param.param_pointee_array_*); 0 / TYPE_VOID otherwise.
+  # AGAST #1953: for a StmtKind.VarDecl annotated `*[N]T`, N and T (as
+  # Param.param_pointee_array_*); 0 / TypeKind.Void otherwise.
   var_pointee_array_size: i32
-  var_pointee_array_elem_type: i32
-  var_pointee_array_elem_pointee: i32  # AGAST #2343: U for `*[N]*U`; TYPE_VOID otherwise
+  var_pointee_array_elem_type: TypeKind
+  var_pointee_array_elem_pointee: TypeKind  # AGAST #2343: U for `*[N]*U`; TypeKind.Void otherwise
   # AGAST #3663: the name S in `*[N]S` / `*[N]*S` (a generic's T among them);
   # null otherwise.  Only monomorph reads it: the emitter names S from the
   # initializer.  A `*[N]T` local had no T, so its element stayed a struct "T".
@@ -490,11 +593,11 @@ struct Stmt
   # array, the plane's `[M][N]..T` (pointee_array_size is then M*N.., the
   # flat count, and the elem T); null otherwise.  Set by infer_array_ptr_let.
   var_pointee_array_shape: *ArrayShape
-  # AGAST #2308: for a STMT_VAR_DECL annotated `@T` / `@&T`, that type as a
+  # AGAST #2308: for a StmtKind.VarDecl annotated `@T` / `@&T`, that type as a
   # param would declare it, which is where its referent is recorded; null
   # otherwise.  See capture_var_type.
   var_ref: *Param
-  # AGAST #1869: for STMT_ASSERT, the `, "message"` text (null / 0 if none).
+  # AGAST #1869: for StmtKind.Assert, the `, "message"` text (null / 0 if none).
   # Set by stmt_assert only: parser_alloc does not zero, so no other kind
   # may read it.  monomorph's byte copy carries it to clones.
   assert_msg: *u8
@@ -509,17 +612,17 @@ struct Stmt
   # stmt_tuple_decl only (parser_alloc does not zero); monomorph's byte copy
   # carries it to clones.
   tuple_more: *TupleName
-  # AGAST #1625: for STMT_DEFER, 1 for the block form (`defer` + an indented
+  # AGAST #1625: for StmtKind.Defer, 1 for the block form (`defer` + an indented
   # block), 0 for `defer <stmt>`.  Set by stmt_defer only.
   defer_is_block: i32
-  # AGAST #3394: for STMT_ASM, the block.  Set by stmt_asm only.
+  # AGAST #3394: for StmtKind.Asm, the block.  Set by stmt_asm only.
   asm_block: *AsmBlock
-  # AGAST #2886: for STMT_INDEX_ASSIGN, `n[i] = v` / `n[i] op= v`, where its `[`
+  # AGAST #2886: for StmtKind.IndexAssign, `n[i] = v` / `n[i] op= v`, where its `[`
   # is.  Set by stmt_assign_index only (parser_alloc does not zero).
-  # AGAST #3015: for STMT_LOCAL_FIELD_ASSIGN, STMT_LOCAL_FIELD_INDEX_ASSIGN,
-  # STMT_MEMBER_ASSIGN and STMT_MEMBER_INDEX_ASSIGN, where the field name is.
+  # AGAST #3015: for StmtKind.LocalFieldAssign, StmtKind.LocalFieldIndexAssign,
+  # StmtKind.MemberAssign and StmtKind.MemberIndexAssign, where the field name is.
   bracket: SrcSpan
-  # AGAST #2847: for STMT_LOCAL_FIELD_INDEX_ASSIGN and STMT_MEMBER_INDEX_ASSIGN,
+  # AGAST #2847: for StmtKind.LocalFieldIndexAssign and StmtKind.MemberIndexAssign,
   # where its `[` is (the token after the field name), so §7.8's errors are
   # located there.  Set by their constructors only.
   index_at: SrcSpan
@@ -552,7 +655,7 @@ struct AsmOperand
   kind_span: SrcSpan
   next: *AsmOperand
 
-# The body of a STMT_ASM (AGAST #3394).
+# The body of a StmtKind.Asm (AGAST #3394).
 struct AsmBlock
   arch: *u8
   arch_len: i32
@@ -586,18 +689,18 @@ struct Param
   # flat param_* facts below are derived from it by the parser; lowering
   # registers the local from the chain.
   param_ty: *TypeRef
-  param_type: i32
-  param_type_name: *u8      # Struct name when param_type == TYPE_STRUCT
+  param_type: TypeKind
+  param_type_name: *u8      # Struct name when param_type == TypeKind.Struct
   param_type_name_len: i32
-  param_pointee_type: i32   # Element type when param_type == TYPE_PTR
+  param_pointee_type: TypeKind   # Element type when param_type == TypeKind.Ptr
   next: *Param
   # AGAST #1644: 1 for the `name:& T` borrow spelling.  It has the same
-  # TYPE_MUT_REF as `name: @&T`, but ritz0 auto-dereferences it: `x` reads
+  # TypeKind.MutRef as `name: @&T`, but ritz0 auto-dereferences it: `x` reads
   # the pointee and `x = v` writes it.  (At the end to preserve layout; the
   # parser allocates 56 bytes and monomorph's clone 48, both >= 48.)
   is_borrow: i32
   # AGAST #1671: the signature of a `fn(...) -> T` param (null otherwise).
-  # The param's own type is still TYPE_PTR; this only lets a call through
+  # The param's own type is still TypeKind.Ptr; this only lets a call through
   # it use the callee's real LLVM signature.  Brings Param to 56 bytes,
   # which is what the parser allocates (monomorph clones with sizeof).
   fn_sig: *FnDef
@@ -606,30 +709,30 @@ struct Param
   # AGAST #2399: the reference nearest the pointee, INNER_REF_*: `@@S` and `*@S`
   # are held as an `@*S` / `**S`, and this keeps what that level was.
   param_inner_ref: i32
-  # AGAST #1953: for a `*[N]T` param (param_pointee_type == TYPE_ARRAY), N
-  # and T; 0 / TYPE_VOID otherwise.  A struct T is named by param_type_name.
+  # AGAST #1953: for a `*[N]T` param (param_pointee_type == TypeKind.Array), N
+  # and T; 0 / TypeKind.Void otherwise.  A struct T is named by param_type_name.
   # Both allocators (param_new, monomorph's clone) use sizeof(Param).
   param_pointee_array_size: i32
-  param_pointee_array_elem_type: i32
-  param_pointee_array_elem_pointee: i32  # AGAST #2343: U for `*[N]*U`; TYPE_VOID otherwise
+  param_pointee_array_elem_type: TypeKind
+  param_pointee_array_elem_pointee: TypeKind  # AGAST #2343: U for `*[N]*U`; TypeKind.Void otherwise
   # AGAST #2290: every dimension of a `:& [N][M]..T` referent; null otherwise.
   param_pointee_array_shape: *ArrayShape
-  # AGAST #2287: for a by-value `[N]T` param (param_type == TYPE_ARRAY), N and
-  # T; 0 / TYPE_VOID otherwise.  A struct or `*S` T is named by param_type_name,
+  # AGAST #2287: for a by-value `[N]T` param (param_type == TypeKind.Array), N and
+  # T; 0 / TypeKind.Void otherwise.  A struct or `*S` T is named by param_type_name,
   # as LocalVar.type_name names it.
   param_array_size: i32
-  param_array_elem_type: i32
-  param_array_elem_pointee: i32   # AGAST #2341: T for `[N]*T`; TYPE_VOID otherwise
+  param_array_elem_type: TypeKind
+  param_array_elem_pointee: TypeKind   # AGAST #2341: T for `[N]*T`; TypeKind.Void otherwise
   # AGAST #3634: every dimension of a by-value `[N][M]..T` (param_array_size is
-  # then N and param_array_elem_type TYPE_ARRAY, as on an N-D local); null
+  # then N and param_array_elem_type TypeKind.Array, as on an N-D local); null
   # otherwise.  A return type's ret_array_param carries it the same way.
   param_array_shape: *ArrayShape
   # AGAST #2286: 1 for `self:& T`, which is otherwise the same Param as
   # `self: @&T`.  It isn't is_borrow: that would make `self` an is_lent local.
   is_self_borrow: i32
   # AGAST #2308: U for `@*U` / `@&*U` / `:& *U` (param_pointee_type is then
-  # TYPE_PTR, and a struct U is named by param_type_name); TYPE_VOID otherwise.
-  param_ref_ptr_pointee: i32
+  # TypeKind.Ptr, and a struct U is named by param_type_name); TypeKind.Void otherwise.
+  param_ref_ptr_pointee: TypeKind
   # AGAST #2407: where the name is, for binder_check.ritz; zero when unknown.
   name_span: SrcSpan
 
@@ -638,8 +741,8 @@ struct FnDef
   name: *u8
   name_len: i32
   params: *Param
-  return_type: i32
-  return_type_name: *u8   # Struct name when return_type == TYPE_STRUCT
+  return_type: TypeKind
+  return_type_name: *u8   # Struct name when return_type == TypeKind.Struct
   return_type_name_len: i32
   body: *Stmt        # Linked list of statements
   line: i32          # Source line for DWARF debug info
@@ -709,11 +812,14 @@ struct OwnedBinds
 # `*TypeRef` answers every question from it.
 #
 # `kind` is the flat TYPE_* code the rest of the compiler already speaks: a
-# pointer whose pointee is a pointer is TYPE_PTR_PTR, exactly as the old
+# pointer whose pointee is a pointer is TypeKind.PtrPtr, exactly as the old
 # type_ptr computed, so flat AST fields and the IR do not move.
 struct TypeRef
-  kind: i32
-  name: *u8            # struct/generic name when kind == TYPE_STRUCT
+  kind: TypeKind
+  # AGAST #4450: when kind is DeepPtr, the packed inner-pointee slot it stands
+  # for (lv_set_inner_pointee_type); 0 otherwise.
+  deep_slot: i32
+  name: *u8            # struct/generic name when kind == TypeKind.Struct
   name_len: i32
   pointee: *TypeRef    # inner of `*T` / `@T` / `@&T`; null otherwise
   elem: *TypeRef       # element of `[N]T`; null otherwise
@@ -725,25 +831,25 @@ struct TypeRef
   # `inner_ref_of` reported; it is the inner level's when that is itself one.
   inner_ref: i32
   # For `@T` / `@&T`: the referent's flat kind, as `last_ref_inner_type` held.
-  ref_inner: i32
+  ref_inner: TypeKind
 
 # Const declaration
 struct ConstEntry
   name: *u8
   name_len: i32
-  const_type: i32   # Type of the constant (TYPE_I32, TYPE_I64, etc.)
+  const_type: TypeKind   # Type of the constant (TypeKind.I32, TypeKind.I64, etc.)
   value: i64        # For integer constants (holds val.int_val)
   next: *ConstEntry
   # Extra metadata for non-integer constants (e.g., const arrays of struct literals).
   # Appended at the end to preserve the layout assumed by existing code that uses
   # only the classic fields above.
   value_expr: *Expr                 # Original AST for the initializer (null for int-only consts)
-  array_size: i32                   # Array length when const_type == TYPE_ARRAY
-  array_elem_type: i32              # Element type (TYPE_STRUCT, TYPE_I32, etc.)
-  array_elem_type_name: *u8         # Struct name when array_elem_type == TYPE_STRUCT
+  array_size: i32                   # Array length when const_type == TypeKind.Array
+  array_elem_type: TypeKind              # Element type (TypeKind.Struct, TypeKind.I32, etc.)
+  array_elem_type_name: *u8         # Struct name when array_elem_type == TypeKind.Struct
   array_elem_type_name_len: i32
-  array_elem_pointee: i32           # AGAST #2341: T for `[N]*T`; TYPE_VOID otherwise
-  ptr_pointee: i32                  # AGAST #2341: T for `const P: *T`
+  array_elem_pointee: TypeKind           # AGAST #2341: T for `[N]*T`; TypeKind.Void otherwise
+  ptr_pointee: TypeKind                  # AGAST #2341: T for `const P: *T`
   # AGAST #189: struct type name for scalar `const FOO: StructTy = ...` —
   # the parser captures `last_type_name` from `parse_type_spec` so the
   # emitter can lower the const as a `%StructTy { ... }` global.
@@ -782,17 +888,17 @@ const CONST_FOLD_BAD: i32 = 3       # not a constant integer expression
 struct StructField
   name: *u8
   name_len: i32
-  field_type: i32
-  # For TYPE_STRUCT fields (nested structs):
-  field_type_name: *u8         # Struct name when field_type == TYPE_STRUCT
+  field_type: TypeKind
+  # For TypeKind.Struct fields (nested structs):
+  field_type_name: *u8         # Struct name when field_type == TypeKind.Struct
   field_type_name_len: i32
-  # For TYPE_ARRAY fields:
+  # For TypeKind.Array fields:
   array_size: i32              # Number of elements (e.g., 16 for [16]i32)
-  array_elem_type: i32         # Element type (e.g., TYPE_I32, TYPE_STRUCT)
-  array_elem_type_name: *u8    # Struct name when array_elem_type == TYPE_STRUCT
+  array_elem_type: TypeKind         # Element type (e.g., TypeKind.I32, TypeKind.Struct)
+  array_elem_type_name: *u8    # Struct name when array_elem_type == TypeKind.Struct
   array_elem_type_name_len: i32
-  array_elem_pointee: i32      # AGAST #2341: T for `[N]*T`; TYPE_VOID otherwise
-  ptr_pointee: i32             # AGAST #2341: T for `p: *T`; TYPE_VOID otherwise
+  array_elem_pointee: TypeKind      # AGAST #2341: T for `[N]*T`; TypeKind.Void otherwise
+  ptr_pointee: TypeKind             # AGAST #2341: T for `p: *T`; TypeKind.Void otherwise
   field_mut_ref: i32           # AGAST #2337: 1 for `r: @&T`, which lower_ref_fields leaves a `*T`
   field_shared_ref: i32        # AGAST #2338: 1 for `r: @T`, likewise
   # AGAST #2399: the reference nearest the pointee, INNER_REF_*: `@@S` and `*@S`
@@ -800,21 +906,21 @@ struct StructField
   field_inner_ref: i32
   next: *StructField
   # AGAST #1924: for a `**T` field, T (packed with any deeper levels, see
-  # PTR_DEPTH_UNIT); TYPE_VOID otherwise.  `*(*(s.rows + i) + k)` reads it.
+  # PTR_DEPTH_UNIT); TypeKind.Void otherwise.  `*(*(s.rows + i) + k)` reads it.
   inner_pointee_type: i32
   # AGAST #2120: a fn-typed field's signature (`f: EfiFn`), null otherwise.
   fn_sig: *FnDef
   # AGAST #2097: every dimension of a `m: [N][M]..T` field (directly or via
   # a `type Grid = [N][M]T` alias), null for any other type.  array_size /
-  # array_elem_type still hold the outer dim and TYPE_ARRAY.
+  # array_elem_type still hold the outer dim and TypeKind.Array.
   array_shape: *ArrayShape
   # AGAST #2329: for `r: *[N]T`, `@[N]T` or `@&[N]T`, that type as a param would
   # hold it (ptr_array_of_last); null otherwise.  `h.r[i]` is element i.
   ptr_array: *Param
   # AGAST #3151: U for an `r: @*U` / `@&*U` field, as Param.param_ref_ptr_pointee
-  # keeps it (a struct U's name is field_type_name); TYPE_VOID otherwise, and in
+  # keeps it (a struct U's name is field_type_name); TypeKind.Void otherwise, and in
   # a generic's instance, whose U may be a parameter.
-  field_ref_ptr_pointee: i32
+  field_ref_ptr_pointee: TypeKind
   # AGAST #3666: for `fs: [N]fn(..) -> T`, the element's signature, so
   # `(t.fs[i])(..)` calls typed; null otherwise.  Not fn_sig, whose readers
   # take it to mean the field itself is a fn.
@@ -852,7 +958,7 @@ struct EnumDef
                             # reads the `<...>` that follows it
   name_len: i32
   generic: i32              # 1 for `enum Name<T>`, ENUM_INSTANCE for a monomorph instance, else 0
-  repr: i32                 # Representation type (TYPE_U64, ...), 0 for none
+  repr: TypeKind                 # Representation type (TypeKind.U64, ...), 0 for none
   is_pub: i32               # 1 for `pub enum`
   line: i32                 # Line of the name (where the generated `from` source starts)
   variants: *EnumVariant
@@ -887,18 +993,18 @@ struct ImportDecl
 struct GlobalVarDef
   name: *u8
   name_len: i32
-  var_type: i32          # TYPE_I32, TYPE_I64, TYPE_PTR, TYPE_STRUCT, etc.
+  var_type: TypeKind          # TypeKind.I32, TypeKind.I64, TypeKind.Ptr, TypeKind.Struct, etc.
   type_name: *u8         # For struct types
   type_name_len: i32
   init_expr: *Expr       # Optional initializer expression (can be 0)
   next: *GlobalVarDef
-  # Pointee type for var_type == TYPE_PTR — needed so emit_expr_arith
+  # Pointee type for var_type == TypeKind.Ptr — needed so emit_expr_arith
   # can scale `*(g + i)` by the right element size.  Without this, *i32
   # globals like `var g_inst_name_lens: *i32 = null` emit raw `add i64`
   # without stride and `load i64` without width, producing garbage reads
   # — surfaced as the selfhost-only 8-test gap (monomorph couldn't read
   # back instantiation name_lens, so specialization names were lost).
-  pointee_type: i32
+  pointee_type: TypeKind
   # AGAST #190: array dimensions for `var g: [N]T` globals.  Without these
   # the global was emitted as `i64 zeroinitializer` instead of
   # `[N x %T] zeroinitializer`, and any `g[i]` indexing flowed through the
@@ -906,12 +1012,12 @@ struct GlobalVarDef
   # "; ERROR: unhandled EXPR_MEMBER" for `g[i].field` (nexus's
   # `var g_fallback: [100]FallbackPage` in store.ritz fallback_init /
   # fallback_find).  Mirrors LocalVar.array_size / array_elem_type.
-  array_size: i32                   # Array size when var_type == TYPE_ARRAY
-  array_elem_type: i32              # Element type (TYPE_STRUCT, TYPE_I32, ...)
-  array_elem_type_name: *u8         # Struct name when array_elem_type == TYPE_STRUCT
+  array_size: i32                   # Array size when var_type == TypeKind.Array
+  array_elem_type: TypeKind              # Element type (TypeKind.Struct, TypeKind.I32, ...)
+  array_elem_type_name: *u8         # Struct name when array_elem_type == TypeKind.Struct
   array_elem_type_name_len: i32
   array_shape: *ArrayShape          # AGAST #1509: non-null for `[N][M]..T`
-  array_elem_pointee: i32           # AGAST #2341: T for `[N]*T`; TYPE_VOID otherwise
+  array_elem_pointee: TypeKind           # AGAST #2341: T for `[N]*T`; TypeKind.Void otherwise
   # AGAST #1501: where the declaration lives, so emit_global_vars can give a
   # non-constant initializer a "<file>:<line>:<col>" error.  src_file is a
   # copy in the parser arena (the driver drops an import's path String once
@@ -934,7 +1040,7 @@ struct GlobalVarDef
   # would hold it (ptr_array_of_last); null otherwise.  `g[i]` is element i.
   ptr_array: *Param
   # AGAST #4324: the signature of `var g: fn(..) -> T` (a fn-typed global's
-  # TYPE_PTR), so an assignment to it is judged and its type spelled as a
+  # TypeKind.Ptr), so an assignment to it is judged and its type spelled as a
   # local's is; null for every other global.
   fn_sig: *FnDef
 
@@ -996,21 +1102,21 @@ const POSTFIX_TRY: i32 = 5       # Try operator `?`; applied by apply_postfix_p 
 # Binary operation chain (for left-factored grammar)
 # Used to avoid exponential backtracking in expression parsing
 struct BinaryOp
-  op: i32           # OP_ADD, OP_SUB, etc.
+  op: OpKind           # OpKind.Add, OpKind.Sub, etc.
   right: *Expr      # Right operand
   next: *BinaryOp   # Next operation in chain (for a + b + c)
 
 # Cast operation chain (for left-factored cast expression)
 # Handles: expr as type1 as type2 ...
 struct CastTail
-  cast_type: i32    # TYPE_I32, TYPE_PTR, etc.
-  # AGAST #1453: for `as *T`, the pointee kind (TYPE_STRUCT, TYPE_I32, ...)
-  # and, for a struct pointee, its name.  TYPE_VOID / null when unknown.
-  # Copied onto the EXPR_CAST node by apply_cast_tail.
+  cast_type: TypeKind    # TypeKind.I32, TypeKind.Ptr, etc.
+  # AGAST #1453: for `as *T`, the pointee kind (TypeKind.Struct, TypeKind.I32, ...)
+  # and, for a struct pointee, its name.  TypeKind.Void / null when unknown.
+  # Copied onto the ExprKind.Cast node by apply_cast_tail.
   pointee_type: i32
-  # #4035: the `*T` / `@T` / `@&T` pointee a cast leaves on the EXPR_CAST node
+  # #4035: the `*T` / `@T` / `@&T` pointee a cast leaves on the ExprKind.Cast node
   # (Expr.cast_pointee), derived from the tail's *TypeRef.
-  cast_pointee: i32
+  cast_pointee: TypeKind
   next: *CastTail   # Next cast in chain
   pointee_name: *u8
   pointee_name_len: i32
@@ -1022,7 +1128,7 @@ struct CastTail
 # A generic type argument as the parser captured it (first_generic_type_arg):
 # its kind, its mangled spelling, and where it is written.
 struct GenericArg
-    ty: i32
+    ty: TypeKind
     name: *u8
     name_len: i32
     next: *GenericArg
@@ -1049,14 +1155,14 @@ struct PostfixOp
   member_name: *u8
   member_len: i32
   # For POSTFIX_CAST
-  cast_type: i32
+  cast_type: TypeKind
   # Linked list
   next: *PostfixOp
-  # For POSTFIX_INDEX: where its `[` is (AGAST #2452), for the EXPR_INDEX it makes
+  # For POSTFIX_INDEX: where its `[` is (AGAST #2452), for the ExprKind.Index it makes
   bracket: SrcSpan
 
 # Match arm: one case of a match expression/statement
-# For STMT_MATCH / EXPR_MATCH:
+# For StmtKind.Match / ExprKind.Match:
 #   - Stmt uses if_cond = scrutinee expr, if_then recast as *MatchArm
 #   - Expr uses left = scrutinee expr, args recast as *MatchArm
 # Pattern data is inlined (flat) so we don't need a separate Pattern struct.
@@ -1120,6 +1226,12 @@ struct MatchArm
     # else-less block `if` used as a value, so if_arm_check can tell it from a
     # real arm whose block merely ends without an expression (also is_pass).
     else_missing: i32
+    # AGAST #4450: an or-pattern `A | B | C =>`.  This arm's own pattern
+    # fields are the first alternative; or_next chains the others, each a
+    # MatchArm holding only a pattern (no body, no next).  Null for an arm
+    # with one pattern.  arm_pattern_next walks an arm list alternative by
+    # alternative.
+    or_next: *MatchArm
 
 # Field initializer in struct literal
 struct FieldInit
@@ -1147,7 +1259,7 @@ struct Parser
   var_type_name_len: i32
   # AGAST #2805: and the pointee and inner pointee slot of a `*T` / `**T`
   # annotation, which `<*S>` in the initializer would overwrite.
-  var_pointee: i32
+  var_pointee: TypeKind
   var_inner_pointee: i32
   var_inner_ref: i32
   # Conditional compilation: set to 1 by parse_attr when it sees

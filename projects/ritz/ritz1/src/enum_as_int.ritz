@@ -33,7 +33,7 @@
 # Like narrowing.ritz it is one-sided: an expression is an enum only when
 # eai_enum_value names a non-generic user enum, and a target is an integer
 # only when its type was written (an unannotated local is the parser's
-# TYPE_I64 default whatever it holds, so it is never trusted).  A missed
+# TypeKind.I64 default whatever it holds, so it is never trusted).  A missed
 # rejection is a parity gap with ritz0; a false one would refuse a valid
 # program.
 #
@@ -98,7 +98,7 @@ fn eai_is_const(sm: *Sema, name_sv: StrView) -> i32
 # qualified_variant_enum: a local or global named `E` shadows the enum.
 fn eai_qualified(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
     let q: *Expr = e.left
-    if q == null or q.kind != EXPR_IDENT
+    if q == null or q.kind != ExprKind.Ident
         return 0
     if sema_find_local(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }) != null
         return 0
@@ -125,58 +125,60 @@ fn eai_call_fn(sm: *Sema, e: *Expr) -> *FnDef
 fn eai_resolve(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
     *out_name = null
     *out_len = 0
-    let k: i32 = e.kind
-    if k == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if v == null
-            return 0
-        if g_eai_notes_ready == 1
-            let noted: *u8 = (*g_eai_notes).get(v.name as i64) as *u8
-            if noted != null
-                return eai_set(StrView { ptr: (noted), len: ((*g_eai_note_lens).get(v.name as i64) as i32) as i64 }, out_name, out_len)
-        # AGAST #2135: a pointer local is no enum value, whatever its
-        # type_name says.
-        if v.kind == TYPE_PTR or v.kind == TYPE_PTR_PTR
-            return 0
-        if eai_is_enum_name(StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) == 1
-            return eai_set(StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, out_name, out_len)
-        return 0
-    if k == EXPR_METHOD
-        return eai_qualified(sm, e, out_name, out_len)   # `Opt.Holds(40)`
-    if k == EXPR_CALL
-        user_variant_ctor_enum(e, out_name, out_len)     # `Holds(40)`
-        if *out_name != null
-            return 1
-        let fd: *FnDef = eai_call_fn(sm, e)
-        if fd != null and fd.return_type == TYPE_STRUCT and eai_is_enum_name(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) == 1
-            return eai_set(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }, out_name, out_len)
-        return 0
-    if k == EXPR_UNARY
-        if e.op != OP_DEREF
-            return 0
-        let opnd: *Expr = e.operand
-        if opnd != null and opnd.kind == EXPR_IDENT
-            # `*p` of a `p: *E` local: E, from the pointee's name.
-            let pv: *SemaVar = sema_find_local(sm, StrView { ptr: (opnd.ident_ptr), len: (opnd.ident_len) as i64 })
-            if pv != null and pv.kind == TYPE_PTR and pv.pointee == TYPE_STRUCT
-                if eai_is_enum_name(StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 }) == 1
-                    return eai_set(StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 }, out_name, out_len)
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Ident =>
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if v == null
                 return 0
-        return eai_resolve(sm, e.operand, out_name, out_len)
-    if k == EXPR_MEMBER
-        if eai_qualified(sm, e, out_name, out_len) == 1   # `Opt.Vacant`
-            return 1
-        # An enum-typed struct field, `h.d` (AGAST #1797).
-        var t: SemaTy
-        if sema_expr_ty(sm, e, @t) == TYPE_STRUCT and eai_is_enum_name(StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 1
-            return eai_set(StrView { ptr: (t.name), len: (t.name_len) as i64 }, out_name, out_len)
-        return 0
+            if g_eai_notes_ready == 1
+                let noted: *u8 = (*g_eai_notes).get(v.name as i64) as *u8
+                if noted != null
+                    return eai_set(StrView { ptr: (noted), len: ((*g_eai_note_lens).get(v.name as i64) as i32) as i64 }, out_name, out_len)
+            # AGAST #2135: a pointer local is no enum value, whatever its
+            # type_name says.
+            if v.kind == TypeKind.Ptr or v.kind == TypeKind.PtrPtr
+                return 0
+            if eai_is_enum_name(StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) == 1
+                return eai_set(StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, out_name, out_len)
+            return 0
+        ExprKind.Method =>
+            return eai_qualified(sm, e, out_name, out_len)   # `Opt.Holds(40)`
+        ExprKind.Call =>
+            user_variant_ctor_enum(e, out_name, out_len)     # `Holds(40)`
+            if *out_name != null
+                return 1
+            let fd: *FnDef = eai_call_fn(sm, e)
+            if fd != null and fd.return_type == TypeKind.Struct and eai_is_enum_name(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) == 1
+                return eai_set(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }, out_name, out_len)
+            return 0
+        ExprKind.Unary =>
+            if e.op != OpKind.Deref
+                return 0
+            let opnd: *Expr = e.operand
+            if opnd != null and opnd.kind == ExprKind.Ident
+                # `*p` of a `p: *E` local: E, from the pointee's name.
+                let pv: *SemaVar = sema_find_local(sm, StrView { ptr: (opnd.ident_ptr), len: (opnd.ident_len) as i64 })
+                if pv != null and pv.kind == TypeKind.Ptr and pv.pointee == TypeKind.Struct
+                    if eai_is_enum_name(StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 }) == 1
+                        return eai_set(StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 }, out_name, out_len)
+                    return 0
+            return eai_resolve(sm, e.operand, out_name, out_len)
+        ExprKind.Member =>
+            if eai_qualified(sm, e, out_name, out_len) == 1   # `Opt.Vacant`
+                return 1
+            # An enum-typed struct field, `h.d` (AGAST #1797).
+            var t: SemaTy
+            if sema_expr_ty(sm, e, @t) == TypeKind.Struct and eai_is_enum_name(StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 1
+                return eai_set(StrView { ptr: (t.name), len: (t.name_len) as i64 }, out_name, out_len)
+            return 0
+        _ => pass
     0
 
 # A bare `B`: a unit variant of exactly one enum, the name no const, local,
 # global or fn (bare_unit_variant_enum).  The enum index, or -1.
 fn eai_bare_unit(sm: *Sema, e: *Expr) -> i32
-    if e.kind != EXPR_IDENT
+    if e.kind != ExprKind.Ident
         return 0 - 1
     if eai_is_const(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
         return 0 - 1
@@ -216,7 +218,7 @@ pub fn eai_begin_fn()
 # sema_walk, after binding an unannotated `let` / `var`: the enum its
 # initialiser is, if any.
 pub fn eai_note_decl(sm: *Sema, st: *Stmt)
-    if st.var_declared_type != TYPE_VOID or st.var_init == null or st.var_name == null
+    if st.var_declared_type != TypeKind.Void or st.var_init == null or st.var_name == null
         return
     var en: *u8 = null
     var en_len: i32 = 0
@@ -237,12 +239,12 @@ pub fn eai_note_decl(sm: *Sema, st: *Stmt)
 
 # `e` where an integer of type kind `want` is expected: report it at
 # line:col if `e` is an enum.  `want` that is no integer kind is no check.
-fn eai_check(sm: *Sema, e: *Expr, want: i32, line: i32, col: i32)
+fn eai_check(sm: *Sema, e: *Expr, want: TypeKind, line: i32, col: i32)
     eai_check_arg(sm, e, want, line, col, StrView { ptr: (null), len: (0) as i64 }, 0)
 
 # eai_check, for argument `argno` of `fname` when `fname` isn't null: ritz0
 # says "argument N of `f`: " first (#3340).
-fn eai_check_arg(sm: *Sema, e: *Expr, want: i32, line: i32, col: i32, fname_sv: StrView, argno: i32)
+fn eai_check_arg(sm: *Sema, e: *Expr, want: TypeKind, line: i32, col: i32, fname_sv: StrView, argno: i32)
     var fname: *u8 = fname_sv.ptr
     var flen: i32 = fname_sv.len as i32
     if ty_bits(want) == 0
@@ -265,7 +267,7 @@ fn eai_check_arg(sm: *Sema, e: *Expr, want: i32, line: i32, col: i32, fname_sv: 
     eprints_cstr(c"'; convert with `as`\n")
     sm.error_count = sm.error_count + 1
 
-fn eai_check_at(sm: *Sema, e: *Expr, want: i32)
+fn eai_check_at(sm: *Sema, e: *Expr, want: TypeKind)
     if e != null
         eai_check(sm, e, want, e.span.line, e.span.col)
 
@@ -274,37 +276,39 @@ fn eai_check_at(sm: *Sema, e: *Expr, want: i32)
 # =============================================================================
 
 # Type kind of field `f` of the struct local / pointer-to-struct local `name`.
-fn eai_local_field_type(sm: *Sema, name_sv: StrView, f_sv: StrView) -> i32
+fn eai_local_field_type(sm: *Sema, name_sv: StrView, f_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var f: *u8 = f_sv.ptr
     var flen: i32 = f_sv.len as i32
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (name), len: (len) as i64 })
     if v == null or v.type_name == null or v.type_name_len <= 0
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     let st: *StructDef = sema_find_struct(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 })
     if st == null
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     let idx: i32 = find_field_index(st, StrView { ptr: (f), len: (flen) as i64 })
     if idx < 0
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     let field: *StructField = get_field_type(st, idx)
     narrow_known(field.field_type)
 
-# Type kind of an assignment target expression, or NARROW_UNKNOWN.
-fn eai_target_type(sm: *Sema, t: *Expr) -> i32
+# Type kind of an assignment target expression, or TypeKind.NarrowUnknown.
+fn eai_target_type(sm: *Sema, t: *Expr) -> TypeKind
     if t == null
-        return NARROW_UNKNOWN
-    if t.kind == EXPR_IDENT
-        return narrow_sema_name_type(sm, StrView { ptr: (t.ident_ptr), len: (t.ident_len) as i64 })
-    if t.kind == EXPR_MEMBER
-        # A field's type is always written.
-        var ft: SemaTy
-        let fk: i32 = sema_expr_ty(sm, t, @ft)
-        if fk != TYPE_UNKNOWN
-            return narrow_known(fk)
-        return narrow_sema_member_type(sm, t)
-    NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
+    match t.kind
+        ExprKind.Ident =>
+            return narrow_sema_name_type(sm, StrView { ptr: (t.ident_ptr), len: (t.ident_len) as i64 })
+        ExprKind.Member =>
+            # A field's type is always written.
+            var ft: SemaTy
+            let fk: TypeKind = sema_expr_ty(sm, t, @ft)
+            if fk != TypeKind.Unknown
+                return narrow_known(fk)
+            return narrow_sema_member_type(sm, t)
+        _ => pass
+    TypeKind.NarrowUnknown
 
 # The type a method call's receiver dispatches on, as method_recv_type: a
 # local's or global's type, a field's, else (a bare name) the type itself.
@@ -312,23 +316,25 @@ fn eai_recv_type(sm: *Sema, recv: *Expr, out_len: *i32) -> *u8
     *out_len = 0
     if recv == null
         return null
-    if recv.kind == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
-        if v != null
-            *out_len = v.type_name_len
-            return v.type_name
-        let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
-        if g != null
-            *out_len = g.type_name_len
-            return g.type_name
-        *out_len = recv.ident_len
-        return recv.ident_ptr
-    if recv.kind == EXPR_MEMBER
-        var t: SemaTy
-        if sema_expr_ty(sm, recv, @t) == TYPE_UNKNOWN
-            return null
-        *out_len = t.name_len
-        return t.name
+    match recv.kind
+        ExprKind.Ident =>
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
+            if v != null
+                *out_len = v.type_name_len
+                return v.type_name
+            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
+            if g != null
+                *out_len = g.type_name_len
+                return g.type_name
+            *out_len = recv.ident_len
+            return recv.ident_ptr
+        ExprKind.Member =>
+            var t: SemaTy
+            if sema_expr_ty(sm, recv, @t) == TypeKind.Unknown
+                return null
+            *out_len = t.name_len
+            return t.name
+        _ => pass
     null
 
 # The fn a method call dispatches to (UFCS helper, impl method or
@@ -345,7 +351,7 @@ fn eai_method_fn(sm: *Sema, e: *Expr) -> *FnDef
 # its receiver is a value).
 fn eai_static_call(sm: *Sema, e: *Expr, m: *FnDef) -> i32
     let r: *Expr = e.left
-    if r == null or r.kind != EXPR_IDENT or param_is_self(m.params) == 1
+    if r == null or r.kind != ExprKind.Ident or param_is_self(m.params) == 1
         return 0
     if sema_find_local(sm, StrView { ptr: (r.ident_ptr), len: (r.ident_len) as i64 }) != null
         return 0
@@ -362,91 +368,99 @@ fn eai_static_call(sm: *Sema, e: *Expr, m: *FnDef) -> i32
 pub fn enum_as_int_expr(sm: *Sema, e: *Expr)
     if e == null
         return
-    let k: i32 = e.kind
-    if k == EXPR_UNARY
-        enum_as_int_expr(sm, e.operand)
-    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        enum_as_int_expr(sm, e.left)
-        enum_as_int_expr(sm, e.right)
-    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY
-        enum_as_int_expr(sm, e.left)
-    else if k == EXPR_CALL or k == EXPR_METHOD
-        # Numbered as call_check's cc_method numbers them (#3319): a method call
-        # is `m(r, ..)`, its receiver argument 1; a static call has none.
-        var p: *Param = null
-        var fname: *u8 = e.func_name
-        var flen: i32 = e.func_name_len
-        var argno: i32 = 1
-        if k == EXPR_METHOD
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Unary =>
+            enum_as_int_expr(sm, e.operand)
+        ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
             enum_as_int_expr(sm, e.left)
-            fname = e.ident_ptr
-            flen = e.ident_len
-            let m: *FnDef = eai_method_fn(sm, e)
-            if m != null
-                p = m.params
-                if p != null and eai_static_call(sm, e, m) == 0
-                    p = p.next   # the receiver
-                    argno = 2
-        else
-            let f: *FnDef = eai_call_fn(sm, e)
-            if f != null
-                p = f.params
-        var a: *Expr = e.args
-        while a != null
-            enum_as_int_expr(sm, a)
-            if p != null
-                eai_check_arg(sm, a, p.param_type, a.span.line, a.span.col, StrView { ptr: (fname), len: (flen) as i64 }, argno)
-                p = p.next
-            a = a.next
-            argno = argno + 1
+            enum_as_int_expr(sm, e.right)
+        ExprKind.Member | ExprKind.Cast | ExprKind.Try =>
+            enum_as_int_expr(sm, e.left)
+        ExprKind.Call | ExprKind.Method =>
+            # Numbered as call_check's cc_method numbers them (#3319): a method call
+            # is `m(r, ..)`, its receiver argument 1; a static call has none.
+            var p: *Param = null
+            var fname: *u8 = e.func_name
+            var flen: i32 = e.func_name_len
+            var argno: i32 = 1
+            if k == ExprKind.Method
+                enum_as_int_expr(sm, e.left)
+                fname = e.ident_ptr
+                flen = e.ident_len
+                let m: *FnDef = eai_method_fn(sm, e)
+                if m != null
+                    p = m.params
+                    if p != null and eai_static_call(sm, e, m) == 0
+                        p = p.next   # the receiver
+                        argno = 2
+            else
+                let f: *FnDef = eai_call_fn(sm, e)
+                if f != null
+                    p = f.params
+            var a: *Expr = e.args
+            while a != null
+                enum_as_int_expr(sm, a)
+                if p != null
+                    eai_check_arg(sm, a, p.param_type, a.span.line, a.span.col, StrView { ptr: (fname), len: (flen) as i64 }, argno)
+                    p = p.next
+                a = a.next
+                argno = argno + 1
+        _ => pass
 
 # A fn / method's trailing expression, returned as `ret_type`.
-pub fn enum_as_int_tail(sm: *Sema, e: *Expr, ret_type: i32)
+pub fn enum_as_int_tail(sm: *Sema, e: *Expr, ret_type: TypeKind)
     enum_as_int_expr(sm, e)
     eai_check_at(sm, e, ret_type)
 
 # One statement, before it is walked.  `ret_type` is the fn's return type.
-pub fn enum_as_int_stmt(sm: *Sema, stmt: *Stmt, ret_type: i32)
-    let k: i32 = stmt.kind
+pub fn enum_as_int_stmt(sm: *Sema, stmt: *Stmt, ret_type: TypeKind)
+    let k: StmtKind = stmt.kind
     let line: i32 = stmt.span.line
     let col: i32 = stmt.span.col
-    if k == STMT_VAR_DECL
-        enum_as_int_expr(sm, stmt.var_init)
-        eai_check(sm, stmt.var_init, stmt.var_declared_type, line, col)
-        return
-    if k == STMT_TUPLE_DECL
-        enum_as_int_expr(sm, stmt.var_init)
-        return
-    if k == STMT_RETURN
-        enum_as_int_expr(sm, stmt.return_value)
-        eai_check_at(sm, stmt.return_value, ret_type)
-        return
-    if k == STMT_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        enum_as_int_expr(sm, stmt.assign_value)
-        var want: i32 = NARROW_UNKNOWN
-        if k == STMT_ASSIGN
-            if stmt.assign_target_len > 0
-                # `x = v` / `x op= v`: the target is a bare name.
-                want = narrow_sema_name_type(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-            else
-                want = eai_target_type(sm, stmt.if_cond as *Expr)
-        else if k == STMT_LOCAL_FIELD_ASSIGN
-            # `name.f = v`
-            want = eai_local_field_type(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-        else if k == STMT_MEMBER_ASSIGN
-            # `p.f = v`, the pointer expression in if_cond.
-            let pe: *Expr = stmt.if_cond as *Expr
-            if pe != null and pe.kind == EXPR_IDENT
-                want = eai_local_field_type(sm, StrView { ptr: (pe.ident_ptr), len: (pe.ident_len) as i64 }, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-        if want != NARROW_UNKNOWN
-            eai_check(sm, stmt.assign_value, want, line, col)
-        return
-    if k == STMT_EXPR
-        enum_as_int_expr(sm, stmt.expr)
-    else if k == STMT_IF or k == STMT_ASSERT
-        enum_as_int_expr(sm, stmt.if_cond)
-    else if k == STMT_WHILE
-        enum_as_int_expr(sm, stmt.while_cond)
-    else if k == STMT_FOR
-        enum_as_int_expr(sm, stmt.for_start)
-        enum_as_int_expr(sm, stmt.for_end)
+    match k
+        StmtKind.VarDecl =>
+            enum_as_int_expr(sm, stmt.var_init)
+            eai_check(sm, stmt.var_init, stmt.var_declared_type, line, col)
+            return
+        StmtKind.TupleDecl =>
+            enum_as_int_expr(sm, stmt.var_init)
+            return
+        StmtKind.Return =>
+            enum_as_int_expr(sm, stmt.return_value)
+            eai_check_at(sm, stmt.return_value, ret_type)
+            return
+        StmtKind.Assign | StmtKind.IndexAssign | StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign | StmtKind.MemberAssign | StmtKind.MemberIndexAssign =>
+            enum_as_int_expr(sm, stmt.assign_value)
+            var want: TypeKind = TypeKind.NarrowUnknown
+            match k
+                StmtKind.Assign =>
+                    if stmt.assign_target_len > 0
+                        # `x = v` / `x op= v`: the target is a bare name.
+                        want = narrow_sema_name_type(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+                    else
+                        want = eai_target_type(sm, stmt.if_cond as *Expr)
+                StmtKind.LocalFieldAssign =>
+                    # `name.f = v`
+                    want = eai_local_field_type(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+                StmtKind.MemberAssign =>
+                    # `p.f = v`, the pointer expression in if_cond.
+                    let pe: *Expr = stmt.if_cond as *Expr
+                    if pe != null and pe.kind == ExprKind.Ident
+                        want = eai_local_field_type(sm, StrView { ptr: (pe.ident_ptr), len: (pe.ident_len) as i64 }, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+                _ => pass
+            if want != TypeKind.NarrowUnknown
+                eai_check(sm, stmt.assign_value, want, line, col)
+            return
+        _ => pass
+    match k
+        StmtKind.Expr =>
+            enum_as_int_expr(sm, stmt.expr)
+        StmtKind.If | StmtKind.Assert =>
+            enum_as_int_expr(sm, stmt.if_cond)
+        StmtKind.While =>
+            enum_as_int_expr(sm, stmt.while_cond)
+        StmtKind.For =>
+            enum_as_int_expr(sm, stmt.for_start)
+            enum_as_int_expr(sm, stmt.for_end)
+        _ => pass

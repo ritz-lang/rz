@@ -43,25 +43,27 @@ const BK_BAD: i32 = 6      # an operator bool_check_binary rejects by itself
 const BK_NONE: i32 = -1    # SemaVar.bk / elem_bk: no note made
 
 # The kind of a TYPE_* with its struct name, which may name a primitive.
-pub fn bk_of_type(t: i32, name_sv: StrView) -> i32
+pub fn bk_of_type(t: TypeKind, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
-    if t == TYPE_BOOL
-        return BK_BOOL
-    if t == TYPE_F32 or t == TYPE_F64
-        return BK_FLOAT
-    if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF
-        return BK_PTR
-    if t == TYPE_STRUCT
-        if name_eq(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"bool"), len: (4) as i64 }) == 1
+    match t
+        TypeKind.Bool =>
             return BK_BOOL
-        if name_eq(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"usize"), len: (5) as i64 }) == 1 or name_eq(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"isize"), len: (5) as i64 }) == 1
-            return BK_INT
-        return BK_OTHER
-    if t == TYPE_ARRAY
-        return BK_OTHER
-    if t == TYPE_VOID
-        return BK_UNSURE
+        TypeKind.F32 | TypeKind.F64 =>
+            return BK_FLOAT
+        TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
+            return BK_PTR
+        TypeKind.Struct =>
+            if name_eq(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"bool"), len: (4) as i64 }) == 1
+                return BK_BOOL
+            if name_eq(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"usize"), len: (5) as i64 }) == 1 or name_eq(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"isize"), len: (5) as i64 }) == 1
+                return BK_INT
+            return BK_OTHER
+        TypeKind.Array =>
+            return BK_OTHER
+        TypeKind.Void =>
+            return BK_UNSURE
+        _ => pass
     BK_INT
 
 pub fn bk_of_fn(f: *FnDef) -> i32
@@ -91,33 +93,35 @@ fn bk_write(k: i32)
     else if k == BK_PTR
         eprints_cstr(c": write `p != null`")
 
-fn bool_op_name(op: i32) -> *u8
-    if op == OP_AND
-        return c"and"
-    if op == OP_OR
-        return c"or"
-    if op == OP_BIT_AND
-        return c"&"
-    if op == OP_BIT_OR
-        return c"|"
-    if op == OP_BIT_XOR
-        return c"^"
-    if op == OP_SHL
-        return c"<<"
-    if op == OP_SHR
-        return c">>"
-    if op == OP_ADD
-        return c"+"
-    if op == OP_SUB
-        return c"-"
-    if op == OP_MUL
-        return c"*"
-    if op == OP_DIV
-        return c"/"
+fn bool_op_name(op: OpKind) -> *u8
+    match op
+        OpKind.And =>
+            return c"and"
+        OpKind.Or =>
+            return c"or"
+        OpKind.BitAnd =>
+            return c"&"
+        OpKind.BitOr =>
+            return c"|"
+        OpKind.BitXor =>
+            return c"^"
+        OpKind.Shl =>
+            return c"<<"
+        OpKind.Shr =>
+            return c">>"
+        OpKind.Add =>
+            return c"+"
+        OpKind.Sub =>
+            return c"-"
+        OpKind.Mul =>
+            return c"*"
+        OpKind.Div =>
+            return c"/"
+        _ => pass
     c"%"
 
 fn is_comparison(e: *Expr) -> i32
-    if e.kind == EXPR_BINARY and e.op >= OP_EQ and e.op <= OP_GE
+    if e.kind == ExprKind.Binary and op_is_comparison(e.op)
         return 1
     0
 
@@ -181,10 +185,10 @@ pub fn bk_tagged_binding(name_sv: StrView, is_err: i32) -> i32
 # local what the emitter records on its LocalVar (is_bool / bk_unsure).
 
 # The kind of a SemaTy kind, BK_UNSURE where Sema can't say.
-fn sbk_of_ty(t: i32, name_sv: StrView) -> i32
+fn sbk_of_ty(t: TypeKind, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
-    if t == TYPE_UNKNOWN
+    if t == TypeKind.Unknown
         return BK_UNSURE
     bk_of_type(t, StrView { ptr: (name), len: (name_len) as i64 })
 
@@ -234,8 +238,8 @@ pub fn sbk_element(sm: *Sema, name_sv: StrView) -> i32
     if v != null
         # AGAST #2440: a Vec, Span or String, or a pointer to one, indexes its
         # buffer's element.
-        let through: i32 = sbk_through_elem(sm, v)
-        if through != TYPE_VOID
+        let through: TypeKind = sbk_through_elem(sm, v)
+        if through != TypeKind.Void
             return bk_of_type(through, StrView { ptr: (null), len: (0) as i64 })
         if v.elem_bk != BK_NONE
             return v.elem_bk
@@ -246,47 +250,51 @@ pub fn sbk_element(sm: *Sema, name_sv: StrView) -> i32
         # struct T too (`KS[i]` of a `const [N]StrView`), now that the
         # emitter's bk_element takes the same element from the ConstEntry.
         let ce: *ConstEntry = sbk_const(sm, StrView { ptr: (name), len: (len) as i64 })
-        if ce != null and ce.const_type == TYPE_ARRAY
+        if ce != null and ce.const_type == TypeKind.Array
             return bk_of_type(ce.array_elem_type, StrView { ptr: (ce.array_elem_type_name), len: (ce.array_elem_type_name_len) as i64 })
         return BK_UNSURE
-    if g.var_type == TYPE_ARRAY
-        return bk_of_type(g.array_elem_type, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
-    if g.var_type == TYPE_PTR
-        return bk_of_type(g.pointee_type, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
-    if g.var_type == TYPE_PTR_PTR
-        return BK_PTR
+    match g.var_type
+        TypeKind.Array =>
+            return bk_of_type(g.array_elem_type, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
+        TypeKind.Ptr =>
+            return bk_of_type(g.pointee_type, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
+        TypeKind.PtrPtr =>
+            return BK_PTR
+        _ => pass
     BK_UNSURE
 
 # AGAST #3768: the primitive a `*T` of kind `k` points at when Sema left its
 # pointee untyped and `name` spells it: a `-> *i32` call's return names its
-# pointee "i32" (#1984), as `let p = pi()` binds it.  Else TYPE_UNKNOWN.
-fn sbk_named_pointee(k: i32, pointee: i32, name_sv: StrView) -> i32
+# pointee "i32" (#1984), as `let p = pi()` binds it.  Else TypeKind.Unknown.
+fn sbk_named_pointee(k: TypeKind, pointee: TypeKind, name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if k != TYPE_PTR or (pointee != TYPE_VOID and pointee != TYPE_UNKNOWN)
-        return TYPE_UNKNOWN
-    let p: i32 = primitive_type_from_name(StrView { ptr: (name), len: (len) as i64 })
-    if p == 0
-        return TYPE_UNKNOWN
+    if k != TypeKind.Ptr or (pointee != TypeKind.Void and pointee != TypeKind.Unknown)
+        return TypeKind.Unknown
+    let p: TypeKind = primitive_type_from_name(StrView { ptr: (name), len: (len) as i64 })
+    if p == TypeKind.Void
+        return TypeKind.Unknown
     p
 
 # The element kind of `v[i]` when `v` indexes through a Vec, Span or String
-# (or one level of pointer to one), else TYPE_VOID: through_named_elem.
-fn sbk_through_elem(sm: *Sema, v: *SemaVar) -> i32
+# (or one level of pointer to one), else TypeKind.Void: through_named_elem.
+fn sbk_through_elem(sm: *Sema, v: *SemaVar) -> TypeKind
     sema_through_elem(sm, v.kind, v.pointee, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 })
 
 # The field member access `e` reads, through a struct or a pointer to one.
 fn sbk_field(sm: *Sema, e: *Expr) -> *StructField
-    if e == null or e.kind != EXPR_MEMBER or e.left == null
+    if e == null or e.kind != ExprKind.Member or e.left == null
         return null
     var r: SemaTy
-    let rk: i32 = sema_expr_ty(sm, e.left, @r)
+    let rk: TypeKind = sema_expr_ty(sm, e.left, @r)
     var st: *StructDef = null
-    if rk == TYPE_STRUCT
-        st = sema_find_struct(sm, StrView { ptr: (r.name), len: (r.name_len) as i64 })
-    else if rk == TYPE_PTR or rk == TYPE_REF or rk == TYPE_MUT_REF
-        if r.pointee == TYPE_STRUCT
+    match rk
+        TypeKind.Struct =>
             st = sema_find_struct(sm, StrView { ptr: (r.name), len: (r.name_len) as i64 })
+        TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
+            if r.pointee == TypeKind.Struct
+                st = sema_find_struct(sm, StrView { ptr: (r.name), len: (r.name_len) as i64 })
+        _ => pass
     if st == null
         return null
     let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
@@ -299,29 +307,31 @@ fn sbk_field(sm: *Sema, e: *Expr) -> *StructField
 fn sbk_nd_shape(sm: *Sema, e: *Expr, out_depth: *i32) -> *ArrayShape
     var depth: i32 = 0
     var base: *Expr = e
-    while base.kind == EXPR_INDEX
+    while base.kind == ExprKind.Index
         depth = depth + 1
         base = base.left
     var sh: *ArrayShape = null
-    if base.kind == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-        if v != null
-            sh = v.shape
-        else
-            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-            if g != null and g.var_type == TYPE_ARRAY
-                sh = g.array_shape
-    else if base.kind == EXPR_MEMBER
-        let f: *StructField = sbk_field(sm, base)
-        if f != null and f.field_type == TYPE_ARRAY
-            sh = f.array_shape
+    match base.kind
+        ExprKind.Ident =>
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            if v != null
+                sh = v.shape
+            else
+                let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                if g != null and g.var_type == TypeKind.Array
+                    sh = g.array_shape
+        ExprKind.Member =>
+            let f: *StructField = sbk_field(sm, base)
+            if f != null and f.field_type == TypeKind.Array
+                sh = f.array_shape
+        _ => pass
     if sh == null or depth > sh.rank
         return null
     *out_depth = depth
     sh
 
 fn sbk_index(sm: *Sema, e: *Expr) -> i32
-    if e.right != null and e.right.kind == EXPR_RANGE
+    if e.right != null and e.right.kind == ExprKind.Range
         return BK_PTR
     # AGAST #2768: a full-rank `x[i][j]` over an N-D `[N][M]T` is its leaf T.
     var nd_depth: i32 = 0
@@ -330,32 +340,34 @@ fn sbk_index(sm: *Sema, e: *Expr) -> i32
         return bk_of_type(nd_sh.leaf_type, StrView { ptr: (nd_sh.leaf_name), len: (nd_sh.leaf_name_len) as i64 })
     let base: *Expr = e.left
     # `(*p)[i]` with `p` a pointer to a Vec, Span or String.
-    if base.kind == EXPR_UNARY and base.op == OP_DEREF and base.operand.kind == EXPR_IDENT
+    if base.kind == ExprKind.Unary and base.op == OpKind.Deref and base.operand.kind == ExprKind.Ident
         let pv: *SemaVar = sema_find_local(sm, StrView { ptr: (base.operand.ident_ptr), len: (base.operand.ident_len) as i64 })
-        if pv != null and pv.kind != TYPE_STRUCT
-            let through: i32 = sbk_through_elem(sm, pv)
-            if through != TYPE_VOID
+        if pv != null and pv.kind != TypeKind.Struct
+            let through: TypeKind = sbk_through_elem(sm, pv)
+            if through != TypeKind.Void
                 return bk_of_type(through, StrView { ptr: (null), len: (0) as i64 })
-    if base.kind == EXPR_IDENT
-        let k: i32 = sbk_element(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-        if k != BK_UNSURE
-            return k
-    else if base.kind == EXPR_MEMBER
-        # AGAST #3024: `t.0[i]` of a nameless tuple's `[N]T` element.
-        let tk: i32 = sbk_tuple_elem(sm, base)
-        if tk != BK_UNSURE
-            return tk
-        # AGAST #3768: through what sbk_receiver names, too: `(*p).arr[i]`.
-        let f: *StructField = sbk_member_field(sm, base)
-        if f != null
-            if f.field_type == TYPE_ARRAY
-                return bk_of_type(f.array_elem_type, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
-            if f.field_type == TYPE_PTR and f.array_elem_type == TYPE_BOOL
-                return BK_BOOL
+    match base.kind
+        ExprKind.Ident =>
+            let k: i32 = sbk_element(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            if k != BK_UNSURE
+                return k
+        ExprKind.Member =>
+            # AGAST #3024: `t.0[i]` of a nameless tuple's `[N]T` element.
+            let tk: i32 = sbk_tuple_elem(sm, base)
+            if tk != BK_UNSURE
+                return tk
+            # AGAST #3768: through what sbk_receiver names, too: `(*p).arr[i]`.
+            let f: *StructField = sbk_member_field(sm, base)
+            if f != null
+                if f.field_type == TypeKind.Array
+                    return bk_of_type(f.array_elem_type, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
+                if f.field_type == TypeKind.Ptr and f.array_elem_type == TypeKind.Bool
+                    return BK_BOOL
+        _ => pass
     # AGAST #3943: else Sema's one element typer, which also sees through a
     # Vec, Span or String a field, call or method holds (`w.vs[0]`, `mk()[0]`).
     var et: SemaTy
-    if sema_elem_ty(sm, base, @et) != TYPE_UNKNOWN
+    if sema_elem_ty(sm, base, @et) != TypeKind.Unknown
         return bk_of_type(et.kind, StrView { ptr: (et.name), len: (et.name_len) as i64 })
     BK_UNSURE
 
@@ -387,17 +399,19 @@ pub fn sbk_method_recv(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
         return null
     var name: *u8 = null
     var len: i32 = 0
-    if rcv.kind == EXPR_IDENT
+    if rcv.kind == ExprKind.Ident
         if sema_find_local(sm, StrView { ptr: (rcv.ident_ptr), len: (rcv.ident_len) as i64 }) == null and sbk_global(sm, StrView { ptr: (rcv.ident_ptr), len: (rcv.ident_len) as i64 }) == null
             # Neither local nor global: a static call names its impl type.
             *out_len = rcv.ident_len
             return rcv.ident_ptr
-    if rcv.kind == EXPR_STRUCT_LIT
-        *out_len = rcv.ident_len
-        return rcv.ident_ptr
-    if rcv.kind == EXPR_STRING_LIT
-        *out_len = 7
-        return c"StrView"
+    match rcv.kind
+        ExprKind.StructLit =>
+            *out_len = rcv.ident_len
+            return rcv.ident_ptr
+        ExprKind.StringLit =>
+            *out_len = 7
+            return c"StrView"
+        _ => pass
     sbk_receiver(sm, rcv, @name, @len)
     if name == null or len <= 0
         return null
@@ -451,7 +465,7 @@ fn sbk_method(sm: *Sema, e: *Expr) -> i32
     # AGAST #4403: a `Span$T` accessor the emitter lowers inline has no
     # FnDef; ask the typer that mirrors those builtins.
     var bt: SemaTy
-    if sema_span_method_ty(StrView { ptr: (tn), len: (tn_len) as i64 }, e, @bt) != TYPE_UNKNOWN
+    if sema_span_method_ty(StrView { ptr: (tn), len: (tn_len) as i64 }, e, @bt) != TypeKind.Unknown
         return bk_of_type(bt.kind, StrView { ptr: (bt.name), len: (bt.name_len) as i64 })
     BK_UNSURE
 
@@ -461,24 +475,27 @@ fn sbk_method(sm: *Sema, e: *Expr) -> i32
 pub fn sbk_value_fn_sig(sm: *Sema, c: *Expr) -> *FnDef
     if c == null
         return null
-    if c.kind == EXPR_INDEX and c.left != null and c.left.kind == EXPR_IDENT
+    if c.kind == ExprKind.Index and c.left != null and c.left.kind == ExprKind.Ident
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (c.left.ident_ptr), len: (c.left.ident_len) as i64 })
         if v != null
             return v.elem_fn_sig
-    else if c.kind == EXPR_INDEX and c.left != null and c.left.kind == EXPR_MEMBER and c.right != null and c.right.kind != EXPR_RANGE
+    else if c.kind == ExprKind.Index and c.left != null and c.left.kind == ExprKind.Member and c.right != null and c.right.kind != ExprKind.Range
         let af: *StructField = sbk_field(sm, c.left)
-        if af != null and af.field_type == TYPE_ARRAY
+        if af != null and af.field_type == TypeKind.Array
             return af.elem_fn_sig
-    else if c.kind == EXPR_CAST
-        return c.fn_sig
-    else if c.kind == EXPR_MEMBER
-        let f: *StructField = sbk_member_field(sm, c)
-        if f != null and f.field_type == TYPE_PTR
-            return f.fn_sig
-    else if c.kind == EXPR_CALL
-        let fd: *FnDef = sema_call_fn(sm, c)
-        if fd != null and fd.return_type == TYPE_PTR
-            return fd.ret_fn_sig
+    else
+        match c.kind
+            ExprKind.Cast =>
+                return c.fn_sig
+            ExprKind.Member =>
+                let f: *StructField = sbk_member_field(sm, c)
+                if f != null and f.field_type == TypeKind.Ptr
+                    return f.fn_sig
+            ExprKind.Call =>
+                let fd: *FnDef = sema_call_fn(sm, c)
+                if fd != null and fd.return_type == TypeKind.Ptr
+                    return fd.ret_fn_sig
+            _ => pass
     null
 
 fn sbk_call(sm: *Sema, e: *Expr) -> i32
@@ -499,8 +516,8 @@ fn sbk_call(sm: *Sema, e: *Expr) -> i32
     if mem != 0
         if mem == MEM_VOLATILE_STORE or mem == MEM_ATOMIC_STORE or e.args == null
             return BK_UNSURE
-        let pt: i32 = sbk_pointee(sm, e.args)
-        if pt == TYPE_UNKNOWN or pt == TYPE_VOID
+        let pt: TypeKind = sbk_pointee(sm, e.args)
+        if pt == TypeKind.Unknown or pt == TypeKind.Void
             return BK_UNSURE
         return bk_of_type(pt, StrView { ptr: (null), len: (0) as i64 })
     let fd: *FnDef = sema_call_fn(sm, e)
@@ -511,35 +528,35 @@ fn sbk_call(sm: *Sema, e: *Expr) -> i32
 # 1 when `e` names an array (a local, global or const), whose `[i]` is its
 # element, not a view's.
 fn sbk_is_array(sm: *Sema, e: *Expr) -> i32
-    if e.kind != EXPR_IDENT
-        return (e.kind == EXPR_MEMBER and sbk_member_kind_is_array(sm, e) == 1) as i32
+    if e.kind != ExprKind.Ident
+        return (e.kind == ExprKind.Member and sbk_member_kind_is_array(sm, e) == 1) as i32
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if v != null
-        return (v.kind == TYPE_ARRAY) as i32
+        return (v.kind == TypeKind.Array) as i32
     let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if g != null
-        return (g.var_type == TYPE_ARRAY) as i32
+        return (g.var_type == TypeKind.Array) as i32
     let ce: *ConstEntry = sbk_const(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    (ce != null and ce.const_type == TYPE_ARRAY) as i32
+    (ce != null and ce.const_type == TypeKind.Array) as i32
 
 fn sbk_member_kind_is_array(sm: *Sema, e: *Expr) -> i32
     let f: *StructField = sbk_member_field(sm, e)
-    (f != null and f.field_type == TYPE_ARRAY) as i32
+    (f != null and f.field_type == TypeKind.Array) as i32
 
 # The struct `e` is, or points at: `x`, `(*p).f`, `a[i].f`, `(x as *S).f`, ..
 pub fn sbk_receiver(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0
-    if e.kind == EXPR_UNARY and (e.op == OP_DEREF or e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Deref or e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         sbk_receiver(sm, e.operand, out_name, out_len)
-    else if e.kind == EXPR_CALL and e.func_name_len == 0
+    else if e.kind == ExprKind.Call and e.func_name_len == 0
         let sig: *FnDef = sbk_value_fn_sig(sm, e.left)
-        if sig != null and (sig.return_type == TYPE_STRUCT or sig.return_type == TYPE_PTR)
+        if sig != null and (sig.return_type == TypeKind.Struct or sig.return_type == TypeKind.Ptr)
             *out_name = sig.return_type_name
             *out_len = sig.return_type_name_len
-    else if e.kind == EXPR_BINARY and (e.op == OP_ADD or e.op == OP_SUB)
+    else if e.kind == ExprKind.Binary and (e.op == OpKind.Add or e.op == OpKind.Sub)
         sbk_receiver(sm, e.left, out_name, out_len)
-    else if e.kind == EXPR_INDEX
+    else if e.kind == ExprKind.Index
         sbk_receiver(sm, e.left, out_name, out_len)
         # `v[i]` of a Vec<S> / Span<S> is an S: its buffer's element.  An
         # array's element is the name itself.
@@ -555,78 +572,83 @@ pub fn sbk_receiver(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
                     let df: *StructField = get_field_type(st, di)
                     *out_name = df.field_type_name
                     *out_len = df.field_type_name_len
-    else if e.kind == EXPR_CAST and e.ident_len > 0
+    else if e.kind == ExprKind.Cast and e.ident_len > 0
         *out_name = e.ident_ptr
         *out_len = e.ident_len
-    else if e.kind == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if v != null
-            *out_name = v.type_name
-            *out_len = v.type_name_len
-        else
-            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-            # AGAST #3984: a `[N]T` global keeps T as its element's name.
-            if g != null and g.var_type == TYPE_ARRAY
-                *out_name = g.array_elem_type_name
-                *out_len = g.array_elem_type_name_len
-            else if g != null
-                *out_name = g.type_name
-                *out_len = g.type_name_len
-            else
-                let ce: *ConstEntry = sbk_const(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-                if ce != null and ce.const_type == TYPE_ARRAY
-                    *out_name = ce.array_elem_type_name
-                    *out_len = ce.array_elem_type_name_len
-                else if ce != null
-                    *out_name = ce.type_name
-                    *out_len = ce.type_name_len
-    else if e.kind == EXPR_IF or e.kind == EXPR_MATCH
-        # The first arm that names one.
-        var arm: *MatchArm = e.args as *MatchArm
-        while arm != null and *out_name == null
-            if arm.is_pass == 0 and arm.body != null
-                sbk_receiver(sm, arm.body, out_name, out_len)
-            arm = arm.next
-    else if e.kind == EXPR_METHOD and sbk_is_unwrap(e) == 1
-        # `r.unwrap()` of an Option$S / Result$S$E is an S.
-        var cname: *u8 = null
-        var clen: i32 = 0
-        sbk_receiver(sm, e.left, @cname, @clen)
-        if cname != null and clen > 0 and is_tagged_enum_type(StrView { ptr: (cname), len: (clen) as i64 }) == 1
-            var ok_len: i32 = 0
-            let ok: *u8 = sbk_ok_struct(sm, StrView { ptr: (cname), len: (clen) as i64 }, @ok_len)
-            if ok != null
-                *out_name = ok
-                *out_len = ok_len
-    else if e.kind == EXPR_METHOD
-        # A method's struct, `*S`, or `@S` / `@&S` return names the next
-        # receiver.
-        let fd: *FnDef = sbk_method_def(sm, e)
-        if fd != null and (fd.return_type == TYPE_STRUCT or fd.return_type == TYPE_PTR)
-            *out_name = fd.return_type_name
-            *out_len = fd.return_type_name_len
-        else if fd != null and (fd.return_type == TYPE_REF or fd.return_type == TYPE_MUT_REF)
-            # AGAST #4457: `comp.damage_tracker().has_damage()` — the tail's
-            # rule, so a method's `-> @S` / `-> @&S` types like a free fn's.
-            var t: SemaTy
-            if sema_expr_ty(sm, e, @t) == fd.return_type and t.pointee == TYPE_STRUCT
-                *out_name = t.name
-                *out_len = t.name_len
-    else if e.kind == EXPR_MEMBER
-        let f: *StructField = sbk_member_field(sm, e)
-        if f != null
-            if f.field_type == TYPE_ARRAY
-                *out_name = f.array_elem_type_name
-                *out_len = f.array_elem_type_name_len
-            else
-                *out_name = f.field_type_name
-                *out_len = f.field_type_name_len
     else
-        var t: SemaTy
-        let k: i32 = sema_expr_ty(sm, e, @t)
-        if k == TYPE_STRUCT or ((k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF) and t.pointee == TYPE_STRUCT)
-            *out_name = t.name
-            *out_len = t.name_len
+        match e.kind
+            ExprKind.Ident =>
+                let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                if v != null
+                    *out_name = v.type_name
+                    *out_len = v.type_name_len
+                else
+                    let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                    # AGAST #3984: a `[N]T` global keeps T as its element's name.
+                    if g != null and g.var_type == TypeKind.Array
+                        *out_name = g.array_elem_type_name
+                        *out_len = g.array_elem_type_name_len
+                    else if g != null
+                        *out_name = g.type_name
+                        *out_len = g.type_name_len
+                    else
+                        let ce: *ConstEntry = sbk_const(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                        if ce != null and ce.const_type == TypeKind.Array
+                            *out_name = ce.array_elem_type_name
+                            *out_len = ce.array_elem_type_name_len
+                        else if ce != null
+                            *out_name = ce.type_name
+                            *out_len = ce.type_name_len
+            ExprKind.If | ExprKind.Match =>
+                # The first arm that names one.
+                var arm: *MatchArm = e.args as *MatchArm
+                while arm != null and *out_name == null
+                    if arm.is_pass == 0 and arm.body != null
+                        sbk_receiver(sm, arm.body, out_name, out_len)
+                    arm = arm.next
+            _ =>
+                if e.kind == ExprKind.Method and sbk_is_unwrap(e) == 1
+                    # `r.unwrap()` of an Option$S / Result$S$E is an S.
+                    var cname: *u8 = null
+                    var clen: i32 = 0
+                    sbk_receiver(sm, e.left, @cname, @clen)
+                    if cname != null and clen > 0 and is_tagged_enum_type(StrView { ptr: (cname), len: (clen) as i64 }) == 1
+                        var ok_len: i32 = 0
+                        let ok: *u8 = sbk_ok_struct(sm, StrView { ptr: (cname), len: (clen) as i64 }, @ok_len)
+                        if ok != null
+                            *out_name = ok
+                            *out_len = ok_len
+                else
+                    match e.kind
+                        ExprKind.Method =>
+                            # A method's struct, `*S`, or `@S` / `@&S` return names the next
+                            # receiver.
+                            let fd: *FnDef = sbk_method_def(sm, e)
+                            if fd != null and (fd.return_type == TypeKind.Struct or fd.return_type == TypeKind.Ptr)
+                                *out_name = fd.return_type_name
+                                *out_len = fd.return_type_name_len
+                            else if fd != null and (fd.return_type == TypeKind.Ref or fd.return_type == TypeKind.MutRef)
+                                # AGAST #4457: `comp.damage_tracker().has_damage()` — the tail's
+                                # rule, so a method's `-> @S` / `-> @&S` types like a free fn's.
+                                var t: SemaTy
+                                if sema_expr_ty(sm, e, @t) == fd.return_type and t.pointee == TypeKind.Struct
+                                    *out_name = t.name
+                                    *out_len = t.name_len
+                        ExprKind.Member =>
+                            let f: *StructField = sbk_member_field(sm, e)
+                            if f != null
+                                if f.field_type == TypeKind.Array
+                                    *out_name = f.array_elem_type_name
+                                    *out_len = f.array_elem_type_name_len
+                                else
+                                    *out_name = f.field_type_name
+                                    *out_len = f.field_type_name_len
+                        _ =>
+                            var t: SemaTy
+                            let k: TypeKind = sema_expr_ty(sm, e, @t)
+                            if k == TypeKind.Struct or ((k == TypeKind.Ptr or k == TypeKind.Ref or k == TypeKind.MutRef) and t.pointee == TypeKind.Struct)
+                                *out_name = t.name
+                                *out_len = t.name_len
 
 # The field `e` reads, through what sbk_receiver names when Sema can't type
 # the receiver: `(*p).f`, `a[i].f`, `(*(*b).ops).n`.
@@ -674,7 +696,7 @@ fn sbk_member(sm: *Sema, e: *Expr) -> i32
         return tn.bk[ti]
     var f: *StructField = sbk_field(sm, e)
     # `colors.ON`: a const reached through its module.
-    if f == null and e.left.kind == EXPR_IDENT and sema_find_local(sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == null
+    if f == null and e.left.kind == ExprKind.Ident and sema_find_local(sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == null
         let ce: *ConstEntry = sbk_const(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if ce != null
             return bk_of_type(ce.const_type, StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 })
@@ -689,77 +711,85 @@ fn sbk_member(sm: *Sema, e: *Expr) -> i32
             return BK_UNSURE
     bk_of_type(f.field_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
 
-# What `*e` reads, a TYPE_*, or TYPE_UNKNOWN: the pointee of a pointer local,
+# What `*e` reads, a TYPE_*, or TypeKind.Unknown: the pointee of a pointer local,
 # global, field or cast, through `p + n` / `p - n` and `@x`.
-fn sbk_pointee(sm: *Sema, e: *Expr) -> i32
-    let k: i32 = e.kind
-    if k == EXPR_BINARY and (e.op == OP_ADD or e.op == OP_SUB)
+fn sbk_pointee(sm: *Sema, e: *Expr) -> TypeKind
+    let k: ExprKind = e.kind
+    if k == ExprKind.Binary and (e.op == OpKind.Add or e.op == OpKind.Sub)
         return sbk_pointee(sm, e.left)
-    if k == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+    if k == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         return sema_expr_type(sm, e.operand)
     # `*a[i]` with `a: [N]*U` (a local, param or field) reads a U.
-    if k == EXPR_INDEX and e.right != null and e.right.kind != EXPR_RANGE
-        if e.left.kind == EXPR_IDENT
-            let av: *SemaVar = sema_find_local(sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-            if av != null and av.kind == TYPE_ARRAY and av.elem_bk == BK_PTR
-                return av.elem_pointee
-        else if e.left.kind == EXPR_MEMBER
-            let af: *StructField = sbk_member_field(sm, e.left)
-            if af != null and af.field_type == TYPE_ARRAY and af.array_elem_type == TYPE_PTR
-                return af.array_elem_pointee
-        return TYPE_UNKNOWN
+    if k == ExprKind.Index and e.right != null and e.right.kind != ExprKind.Range
+        match e.left.kind
+            ExprKind.Ident =>
+                let av: *SemaVar = sema_find_local(sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+                if av != null and av.kind == TypeKind.Array and av.elem_bk == BK_PTR
+                    return av.elem_pointee
+            ExprKind.Member =>
+                let af: *StructField = sbk_member_field(sm, e.left)
+                if af != null and af.field_type == TypeKind.Array and af.array_elem_type == TypeKind.Ptr
+                    return af.array_elem_pointee
+            _ => pass
+        return TypeKind.Unknown
     # AGAST #3768: `*f()` / `*x.m()` of a `-> *T` / `-> @T` with T a scalar
     # (inline_ptr_pointee): `m[k]` is `*m.index(k)` through `impl Index`.
-    if k == EXPR_CALL or k == EXPR_METHOD
-        var fd: *FnDef = null
-        if k == EXPR_METHOD
-            fd = sbk_method_def(sm, e)
-        else if e.func_name_len > 0 and sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == null
-            fd = sema_call_fn(sm, e)
-        if fd == null
-            return TYPE_UNKNOWN
-        if fd.return_type == TYPE_PTR
-            let rp: i32 = primitive_type_from_name(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
-            if rp != 0
-                return rp
-        let rr: i32 = ret_ref_scalar_pointee(fd)
-        if rr != TYPE_VOID
-            return rr
-        return TYPE_UNKNOWN
-    if k == EXPR_CAST
-        if e.op == TYPE_PTR_PTR
-            return TYPE_PTR
-        if e.op == TYPE_PTR
-            return e.int_val as i32
-        return TYPE_UNKNOWN
-    if k == EXPR_MEMBER
-        let f: *StructField = sbk_member_field(sm, e)
-        if f == null
-            return TYPE_UNKNOWN
-        if f.field_type == TYPE_PTR_PTR
-            return TYPE_PTR
-        if f.field_type == TYPE_PTR
-            return f.array_elem_type
-        # An `@T` / `@&T` field: the `*T` emit_module lowers it to.
-        if f.field_type == TYPE_REF or f.field_type == TYPE_MUT_REF
-            if f.field_ref_ptr_pointee != TYPE_VOID and f.field_ref_ptr_pointee != 0
-                return TYPE_PTR
-            if f.field_type_name_len > 0
-                return TYPE_STRUCT
-            if f.array_elem_type != 0
-                return f.array_elem_type
-        return TYPE_UNKNOWN
-    if k == EXPR_IDENT
+    match k
+        ExprKind.Call | ExprKind.Method =>
+            var fd: *FnDef = null
+            if k == ExprKind.Method
+                fd = sbk_method_def(sm, e)
+            else if e.func_name_len > 0 and sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == null
+                fd = sema_call_fn(sm, e)
+            if fd == null
+                return TypeKind.Unknown
+            if fd.return_type == TypeKind.Ptr
+                let rp: TypeKind = primitive_type_from_name(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
+                if rp != TypeKind.Void
+                    return rp
+            let rr: TypeKind = ret_ref_scalar_pointee(fd)
+            if rr != TypeKind.Void
+                return rr
+            return TypeKind.Unknown
+        ExprKind.Cast =>
+            match e.type_kind
+                TypeKind.PtrPtr =>
+                    return TypeKind.Ptr
+                TypeKind.Ptr =>
+                    return ptr_slot_flat(e.cast_ptr_kind)
+                _ => pass
+            return TypeKind.Unknown
+        ExprKind.Member =>
+            let f: *StructField = sbk_member_field(sm, e)
+            if f == null
+                return TypeKind.Unknown
+            match f.field_type
+                TypeKind.PtrPtr =>
+                    return TypeKind.Ptr
+                TypeKind.Ptr =>
+                    return f.array_elem_type
+                _ => pass
+            # An `@T` / `@&T` field: the `*T` emit_module lowers it to.
+            if f.field_type == TypeKind.Ref or f.field_type == TypeKind.MutRef
+                if f.field_ref_ptr_pointee != TypeKind.Void and f.field_ref_ptr_pointee != TypeKind.Void
+                    return TypeKind.Ptr
+                if f.field_type_name_len > 0
+                    return TypeKind.Struct
+                if f.array_elem_type != TypeKind.Void
+                    return f.array_elem_type
+            return TypeKind.Unknown
+        _ => pass
+    if k == ExprKind.Ident
         var t: SemaTy
-        let tk: i32 = sema_expr_ty(sm, e, @t)
-        if tk == TYPE_PTR_PTR
-            return TYPE_PTR
-        let np: i32 = sbk_named_pointee(tk, t.pointee, StrView { ptr: (t.name), len: (t.name_len) as i64 })
-        if np != TYPE_UNKNOWN
+        let tk: TypeKind = sema_expr_ty(sm, e, @t)
+        if tk == TypeKind.PtrPtr
+            return TypeKind.Ptr
+        let np: TypeKind = sbk_named_pointee(tk, t.pointee, StrView { ptr: (t.name), len: (t.name_len) as i64 })
+        if np != TypeKind.Unknown
             return np
-        if tk == TYPE_PTR or tk == TYPE_REF or tk == TYPE_MUT_REF
+        if tk == TypeKind.Ptr or tk == TypeKind.Ref or tk == TypeKind.MutRef
             return t.pointee
-    TYPE_UNKNOWN
+    TypeKind.Unknown
 
 # How many pointer levels `x` has (ptr_levels_of): a `**T` / `***T` local,
 # global or field, through `+ n` and `*`, down to 1 under a `*` (`*pp`, which
@@ -768,36 +798,39 @@ fn sbk_pointee(sm: *Sema, e: *Expr) -> i32
 fn sbk_ptr_depth(sm: *Sema, x: *Expr, out_slot: *i32) -> i32
     if x == null
         return 0
-    if x.kind == EXPR_BINARY
-        if x.op == OP_ADD or x.op == OP_SUB
-            return sbk_ptr_depth(sm, x.left, out_slot)
-        return 0
-    if x.kind == EXPR_UNARY
-        if x.op != OP_DEREF
+    match x.kind
+        ExprKind.Binary =>
+            if x.op == OpKind.Add or x.op == OpKind.Sub
+                return sbk_ptr_depth(sm, x.left, out_slot)
             return 0
-        let sub: i32 = sbk_ptr_depth(sm, x.operand, out_slot)
-        if sub < 2
-            return 0
-        return sub - 1
-    var slot: i32 = TYPE_VOID
-    if x.kind == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
-        if v != null
-            if v.kind != TYPE_PTR_PTR
+        ExprKind.Unary =>
+            if x.op != OpKind.Deref
                 return 0
-            slot = v.inner
-        else
-            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
-            if g == null or g.var_type != TYPE_PTR_PTR
+            let sub: i32 = sbk_ptr_depth(sm, x.operand, out_slot)
+            if sub < 2
                 return 0
-            slot = g.inner_pointee_type
-    else if x.kind == EXPR_MEMBER
-        let f: *StructField = sbk_member_field(sm, x)
-        if f == null or f.field_type != TYPE_PTR_PTR
+            return sub - 1
+        _ => pass
+    var slot: i32 = (TypeKind.Void as i32)
+    match x.kind
+        ExprKind.Ident =>
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+            if v != null
+                if v.kind != TypeKind.PtrPtr
+                    return 0
+                slot = v.inner
+            else
+                let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+                if g == null or g.var_type != TypeKind.PtrPtr
+                    return 0
+                slot = g.inner_pointee_type
+        ExprKind.Member =>
+            let f: *StructField = sbk_member_field(sm, x)
+            if f == null or f.field_type != TypeKind.PtrPtr
+                return 0
+            slot = f.inner_pointee_type
+        _ =>
             return 0
-        slot = f.inner_pointee_type
-    else
-        return 0
     let levels: i32 = ptr_ptr_slot_levels(slot)
     if levels < 2
         return 0
@@ -810,109 +843,115 @@ fn sbk_ptr_depth(sm: *Sema, x: *Expr, out_slot: *i32) -> i32
 fn sbk_deref(sm: *Sema, e: *Expr) -> i32
     # AGAST #2972: `*h` of an integer or `bool` borrow `h:& T` is `h`.
     let o: *Expr = e.operand
-    if o.kind == EXPR_IDENT
+    if o.kind == ExprKind.Ident
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (o.ident_ptr), len: (o.ident_len) as i64 })
-        if v != null and v.kind == TYPE_UNKNOWN and (v.bk == BK_BOOL or v.bk == BK_INT)
+        if v != null and v.kind == TypeKind.Unknown and (v.bk == BK_BOOL or v.bk == BK_INT)
             return v.bk
     # `*p` of a `**T` (or deeper) is a pointer; `*(*pp + k)` its T.
-    var slot: i32 = TYPE_VOID
+    var slot: i32 = (TypeKind.Void as i32)
     let depth: i32 = sbk_ptr_depth(sm, o, @slot)
     if depth >= 2
         return BK_PTR
-    if depth == 1 and ptr_ptr_slot_inner(slot) != TYPE_STRUCT
+    if depth == 1 and ptr_ptr_slot_inner(slot) != TypeKind.Struct
         return sbk_of_ty(ptr_ptr_slot_inner(slot), StrView { ptr: (null), len: (0) as i64 })
     # `*r` of `let r = @x`, whose pointee Sema leaves untyped.
-    if o.kind == EXPR_IDENT
+    if o.kind == ExprKind.Ident
         let rv: *SemaVar = sema_find_local(sm, StrView { ptr: (o.ident_ptr), len: (o.ident_len) as i64 })
-        if rv != null and rv.elem_bk != BK_NONE and (rv.pointee == TYPE_VOID or rv.pointee == TYPE_UNKNOWN)
+        if rv != null and rv.elem_bk != BK_NONE and (rv.pointee == TypeKind.Void or rv.pointee == TypeKind.Unknown)
             return rv.elem_bk
     # AGAST #3024: `*(t.0)` of a nameless tuple's `*T` element.
-    if o.kind == EXPR_MEMBER
+    if o.kind == ExprKind.Member
         let tk: i32 = sbk_tuple_elem(sm, o)
         if tk != BK_UNSURE
             return tk
-    let pt: i32 = sbk_pointee(sm, o)
+    let pt: TypeKind = sbk_pointee(sm, o)
     # `*@x` of a struct reads as an i64 to the emitter; `*p` of a `*S` a struct.
-    if pt == TYPE_STRUCT and o.kind != EXPR_UNARY
+    if pt == TypeKind.Struct and o.kind != ExprKind.Unary
         # Through `x: @S` / `@&S` the emitter's get_expr_type says i64.
-        let ok: i32 = sema_expr_type(sm, o)
-        if o.kind == EXPR_IDENT and (ok == TYPE_REF or ok == TYPE_MUT_REF)
+        let ok: TypeKind = sema_expr_type(sm, o)
+        if o.kind == ExprKind.Ident and (ok == TypeKind.Ref or ok == TypeKind.MutRef)
             return BK_INT
         return BK_OTHER
-    if pt == TYPE_BOOL
-        return BK_BOOL
-    if pt == TYPE_F32 or pt == TYPE_F64
-        return BK_FLOAT
-    if pt == TYPE_PTR or pt == TYPE_PTR_PTR or pt == TYPE_REF or pt == TYPE_MUT_REF
-        return BK_PTR
-    if pt == TYPE_UNKNOWN or pt == TYPE_VOID
-        # AGAST #3768: `*@a[i]` reads what `a[i]` is, a scalar (not a struct,
-        # which the emitter's get_expr_type calls an i64).
-        if o.kind == EXPR_UNARY and (o.op == OP_ADDR or o.op == OP_ADDR_MUT)
-            let ik: i32 = sema_bool_kind(sm, o.operand)
-            if ik == BK_INT or ik == BK_BOOL or ik == BK_FLOAT or ik == BK_PTR
-                return ik
-        return BK_UNSURE
+    match pt
+        TypeKind.Bool =>
+            return BK_BOOL
+        TypeKind.F32 | TypeKind.F64 =>
+            return BK_FLOAT
+        TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
+            return BK_PTR
+        TypeKind.Unknown | TypeKind.Void =>
+            # AGAST #3768: `*@a[i]` reads what `a[i]` is, a scalar (not a struct,
+            # which the emitter's get_expr_type calls an i64).
+            if o.kind == ExprKind.Unary and (o.op == OpKind.Addr or o.op == OpKind.AddrMut)
+                let ik: i32 = sema_bool_kind(sm, o.operand)
+                if ik == BK_INT or ik == BK_BOOL or ik == BK_FLOAT or ik == BK_PTR
+                    return ik
+            return BK_UNSURE
+        _ => pass
     BK_INT
 
 # What `e` is, or BK_UNSURE.  See the header.
 pub fn sema_bool_kind(sm: *Sema, e: *Expr) -> i32
     if e == null
         return BK_UNSURE
-    let k: i32 = e.kind
-    if k == EXPR_INT_LIT
-        if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
-            return BK_BOOL
-        if e.lit_kind == LIT_PASS
-            return BK_UNSURE
-        return BK_INT
-    if k == EXPR_CHAR_LIT
-        return BK_INT
-    if k == EXPR_FLOAT_LIT
-        return BK_FLOAT
-    if k == EXPR_CSTRING_LIT or k == EXPR_NIL_LIT
-        return BK_PTR
-    if k == EXPR_STRING_LIT or k == EXPR_STRUCT_LIT or k == EXPR_ARRAY_LIT or k == EXPR_ARRAY_FILL
-        return BK_OTHER
-    if k == EXPR_IDENT
-        return sbk_name(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    if k == EXPR_BINARY
-        if e.op >= OP_EQ and e.op <= OP_OR
-            return BK_BOOL
-        let l: i32 = sema_bool_kind(sm, e.left)
-        let r: i32 = sema_bool_kind(sm, e.right)
-        if l == BK_BOOL or r == BK_BOOL
-            return BK_BAD
-        if e.op >= OP_BIT_AND and e.op <= OP_SHR
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.IntLit =>
+            if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
+                return BK_BOOL
+            if e.lit_kind == LIT_PASS
+                return BK_UNSURE
             return BK_INT
-        return bk_arithmetic(l, r)
-    if k == EXPR_UNARY
-        if e.op == OP_NOT
-            return BK_BOOL
-        if e.op == OP_ADDR or e.op == OP_ADDR_MUT
+        ExprKind.CharLit =>
+            return BK_INT
+        ExprKind.FloatLit =>
+            return BK_FLOAT
+        ExprKind.CstringLit | ExprKind.NilLit =>
             return BK_PTR
-        if e.op == OP_NEG or e.op == OP_BIT_NOT
-            let o: i32 = sema_bool_kind(sm, e.operand)
-            if o == BK_BOOL
+        ExprKind.StringLit | ExprKind.StructLit | ExprKind.ArrayLit | ExprKind.ArrayFill =>
+            return BK_OTHER
+        ExprKind.Ident =>
+            return sbk_name(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        ExprKind.Binary =>
+            if op_is_cmp_or_logic(e.op)
+                return BK_BOOL
+            let l: i32 = sema_bool_kind(sm, e.left)
+            let r: i32 = sema_bool_kind(sm, e.right)
+            if l == BK_BOOL or r == BK_BOOL
                 return BK_BAD
-            return o
-        if e.op == OP_DEREF
-            return sbk_deref(sm, e)
-        return BK_UNSURE
-    if k == EXPR_CAST
-        return bk_of_type(e.op, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    if k == EXPR_MEMBER
-        return sbk_member(sm, e)
-    if k == EXPR_INDEX
-        return sbk_index(sm, e)
-    if k == EXPR_CALL
-        return sbk_call(sm, e)
-    if k == EXPR_METHOD
-        return sbk_method(sm, e)
-    if k == EXPR_IF or k == EXPR_MATCH
-        return sbk_arms(sm, e.args as *MatchArm)
-    if k == EXPR_TRY
-        return sbk_payload_of(sm, e.left)
+            if op_is_bitwise(e.op)
+                return BK_INT
+            return bk_arithmetic(l, r)
+        ExprKind.Unary =>
+            match e.op
+                OpKind.Not =>
+                    return BK_BOOL
+                OpKind.Addr | OpKind.AddrMut =>
+                    return BK_PTR
+                OpKind.Neg | OpKind.BitNot =>
+                    let o: i32 = sema_bool_kind(sm, e.operand)
+                    if o == BK_BOOL
+                        return BK_BAD
+                    return o
+                OpKind.Deref =>
+                    return sbk_deref(sm, e)
+                _ => pass
+            return BK_UNSURE
+        ExprKind.Cast =>
+            return bk_of_type(e.type_kind, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        ExprKind.Member =>
+            return sbk_member(sm, e)
+        ExprKind.Index =>
+            return sbk_index(sm, e)
+        ExprKind.Call =>
+            return sbk_call(sm, e)
+        ExprKind.Method =>
+            return sbk_method(sm, e)
+        ExprKind.If | ExprKind.Match =>
+            return sbk_arms(sm, e.args as *MatchArm)
+        ExprKind.Try =>
+            return sbk_payload_of(sm, e.left)
+        _ => pass
     BK_UNSURE
 
 # --- Notes on the locals sema_walk binds ---------------------------------------
@@ -943,7 +982,7 @@ pub fn bool_note_decl(sm: *Sema, st: *Stmt)
     let v: *SemaVar = sbk_last(sm)
     if v == null
         return
-    if st.var_declared_type == TYPE_VOID
+    if st.var_declared_type == TypeKind.Void
         if st.var_init != null
             sm.scope_top = sm.scope_top - 1
             let k: i32 = sema_bool_kind(sm, st.var_init)
@@ -954,10 +993,10 @@ pub fn bool_note_decl(sm: *Sema, st: *Stmt)
                 sbk_receiver(sm, st.var_init, @rname, @rlen)
             # `let r = @&a[i]`: `*r` and `r[0]` are what it points at.
             let init: *Expr = st.var_init
-            if init.kind == EXPR_UNARY and (init.op == OP_ADDR or init.op == OP_ADDR_MUT)
+            if init.kind == ExprKind.Unary and (init.op == OpKind.Addr or init.op == OpKind.AddrMut)
                 v.elem_bk = sema_bool_kind(sm, init.operand)
             # `let b = f()` with `f -> [N]T`: its elements are T.
-            else if init.kind == EXPR_CALL and init.func_name_len > 0
+            else if init.kind == ExprKind.Call and init.func_name_len > 0
                 let rf: *FnDef = sema_call_fn(sm, init)
                 if rf != null and rf.ret_array != null
                     let ra: *ArrayElem = rf.ret_array
@@ -965,9 +1004,9 @@ pub fn bool_note_decl(sm: *Sema, st: *Stmt)
                     v.shape = ra.shape
                     v.elem_pointee = ra.pointee
             # `let a = [true, false]` / `[false; 100]`: its elements.
-            else if init.kind == EXPR_ARRAY_LIT and init.args != null
+            else if init.kind == ExprKind.ArrayLit and init.args != null
                 v.elem_bk = sema_bool_kind(sm, init.args)
-            else if init.kind == EXPR_ARRAY_FILL
+            else if init.kind == ExprKind.ArrayFill
                 v.elem_bk = sema_bool_kind(sm, init.left)
             # AGAST #3768: `let t = (a, b)`: its elements, for `t.1` / `let (x, y) = t`.
             v.bk_tuple = sbk_tuple_of(sm, init)
@@ -982,19 +1021,21 @@ pub fn bool_note_decl(sm: *Sema, st: *Stmt)
         return
     v.bk = bk_of_type(st.var_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
     v.inner = st.var_inner_pointee_type
-    if st.var_type == TYPE_ARRAY
-        v.elem_fn_sig = st.var_fn_sig
-        v.shape = st.var_array_shape
-        v.elem_pointee = st.var_array_elem_pointee
-        v.elem_bk = bk_of_type(st.var_array_elem_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
-    else if st.var_type == TYPE_PTR or st.var_type == TYPE_REF or st.var_type == TYPE_MUT_REF
-        # `p: *[N]T` indexes T (#2321), not the array.
-        if st.var_pointee_type == TYPE_ARRAY
-            v.elem_bk = bk_of_type(st.var_pointee_array_elem_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
-        else
-            v.elem_bk = bk_of_type(st.var_pointee_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
-    else if st.var_type == TYPE_PTR_PTR
-        v.elem_bk = BK_PTR
+    match st.var_type
+        TypeKind.Array =>
+            v.elem_fn_sig = st.var_fn_sig
+            v.shape = st.var_array_shape
+            v.elem_pointee = st.var_array_elem_pointee
+            v.elem_bk = bk_of_type(st.var_array_elem_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
+        TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
+            # `p: *[N]T` indexes T (#2321), not the array.
+            if st.var_pointee_type == TypeKind.Array
+                v.elem_bk = bk_of_type(st.var_pointee_array_elem_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
+            else
+                v.elem_bk = bk_of_type(st.var_pointee_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
+        TypeKind.PtrPtr =>
+            v.elem_bk = BK_PTR
+        _ => pass
 
 # The param sema_walk just bound.
 pub fn bool_note_param(sm: *Sema, p: *Param)
@@ -1003,33 +1044,35 @@ pub fn bool_note_param(sm: *Sema, p: *Param)
         return
     # `x:& T` binds as the T it borrows (bind_scalar_borrow_param): an integer,
     # `bool`, float, `*T` or `[N]T`; `*x` of a scalar is `x`.
-    let pt: i32 = p.param_pointee_type
+    let pt: TypeKind = p.param_pointee_type
     # Sema binds a `:&` param untyped: its struct (`c:& C`, `p:& **K`) names
     # it for `p.f`.
-    if p.is_borrow == 1 and v.kind == TYPE_UNKNOWN
+    if p.is_borrow == 1 and v.kind == TypeKind.Unknown
         v.type_name = p.param_type_name
         v.type_name_len = p.param_type_name_len
-    if p.is_borrow == 1 and p.param_type == TYPE_MUT_REF and pt != TYPE_STRUCT
+    if p.is_borrow == 1 and p.param_type == TypeKind.MutRef and pt != TypeKind.Struct
         v.bk = bk_of_type(pt, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-        if pt == TYPE_ARRAY
+        if pt == TypeKind.Array
             v.elem_bk = bk_of_type(p.param_pointee_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
             v.shape = p.param_pointee_array_shape
         return
     v.bk = bk_of_type(p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
     v.inner = p.param_inner_pointee_type
-    if v.inner == TYPE_VOID
-        v.inner = p.param_ref_ptr_pointee
-    if p.param_type == TYPE_ARRAY
-        v.elem_bk = bk_of_type(p.param_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-        v.shape = p.param_array_shape
-        v.elem_pointee = p.param_array_elem_pointee
-    else if p.param_type == TYPE_PTR or p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF
-        if p.param_pointee_type == TYPE_ARRAY
-            v.elem_bk = bk_of_type(p.param_pointee_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-        else
-            v.elem_bk = bk_of_type(p.param_pointee_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-    else if p.param_type == TYPE_PTR_PTR
-        v.elem_bk = BK_PTR
+    if v.inner == (TypeKind.Void as i32)
+        v.inner = (p.param_ref_ptr_pointee as i32)
+    match p.param_type
+        TypeKind.Array =>
+            v.elem_bk = bk_of_type(p.param_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+            v.shape = p.param_array_shape
+            v.elem_pointee = p.param_array_elem_pointee
+        TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
+            if p.param_pointee_type == TypeKind.Array
+                v.elem_bk = bk_of_type(p.param_pointee_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+            else
+                v.elem_bk = bk_of_type(p.param_pointee_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+        TypeKind.PtrPtr =>
+            v.elem_bk = BK_PTR
+        _ => pass
 
 # The two bindings of `let (a, b) = init` sema_walk just bound: the elements
 # of the nameless tuple it destructures (sbk_tuple_of), else the fields of the
@@ -1047,14 +1090,14 @@ pub fn bool_note_tuple(sm: *Sema, st: *Stmt)
             k1 = note.bk[1]
     else
         var lit: *Expr = st.var_init
-        if lit.kind == EXPR_IF or lit.kind == EXPR_MATCH
+        if lit.kind == ExprKind.If or lit.kind == ExprKind.Match
             var arm: *MatchArm = lit.args as *MatchArm
             while arm != null and (arm.is_pass == 1 or arm.body == null)
                 arm = arm.next
             lit = null
             if arm != null
                 lit = arm.body
-        if lit != null and (lit.kind != EXPR_STRUCT_LIT or lit.ident_len != 0)
+        if lit != null and (lit.kind != ExprKind.StructLit or lit.ident_len != 0)
             var name: *u8 = null
             var len: i32 = 0
             sbk_receiver(sm, lit, @name, @len)
@@ -1083,7 +1126,7 @@ var g_sbk_tuples_on: i32 = 0
 var g_sbk_tuples: *HashMapI64 = null       # a nameless tuple literal -> its *SemaTupleNote
 
 fn sbk_is_tuple_lit(e: *Expr) -> i32
-    if e == null or e.kind != EXPR_STRUCT_LIT or e.ident_len != 0
+    if e == null or e.kind != ExprKind.StructLit or e.ident_len != 0
         return 0
     let fi: *FieldInit = e.args as *FieldInit
     (fi != null and fi.name_len == 1 and *fi.name == '0') as i32
@@ -1136,18 +1179,20 @@ fn sbk_tuple_of(sm: *Sema, e: *Expr) -> *SemaTupleNote
             if has_tuple
                 return (*g_sbk_tuples).get(e as i64) as *SemaTupleNote
         return sbk_tuple_lit(sm, e)
-    if e.kind == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if v == null
-            return null
-        return v.bk_tuple
-    if e.kind == EXPR_MEMBER
-        let tn: *SemaTupleNote = sbk_tuple_of(sm, e.left)
-        let ti: i32 = sbk_tuple_index(tn, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if ti < 0
-            return null
-        return tn.sub[ti]
-    if e.kind != EXPR_IF and e.kind != EXPR_MATCH
+    match e.kind
+        ExprKind.Ident =>
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if v == null
+                return null
+            return v.bk_tuple
+        ExprKind.Member =>
+            let tn: *SemaTupleNote = sbk_tuple_of(sm, e.left)
+            let ti: i32 = sbk_tuple_index(tn, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if ti < 0
+                return null
+            return tn.sub[ti]
+        _ => pass
+    if e.kind != ExprKind.If and e.kind != ExprKind.Match
         return null
     var arm: *MatchArm = e.args as *MatchArm
     while arm != null
@@ -1163,10 +1208,12 @@ fn sbk_tuple_of(sm: *Sema, e: *Expr) -> *SemaTupleNote
 # or a tuple element's own (`(t.0, 1)`); BK_NONE where Sema can't say.
 fn sbk_value_elem(sm: *Sema, x: *Expr) -> i32
     var k: i32 = BK_UNSURE
-    if x.kind == EXPR_IDENT
-        k = sbk_element(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
-    else if x.kind == EXPR_MEMBER
-        k = sbk_tuple_elem(sm, x)
+    match x.kind
+        ExprKind.Ident =>
+            k = sbk_element(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+        ExprKind.Member =>
+            k = sbk_tuple_elem(sm, x)
+        _ => pass
     if k == BK_UNSURE
         return BK_NONE
     k
@@ -1197,7 +1244,7 @@ fn sbk_tuple_bind(v: *SemaVar, tn: *SemaTupleNote, i: i32)
     v.bk_tuple = tn.sub[i]
     if tn.elem[i] != BK_NONE
         v.elem_bk = tn.elem[i]   # AGAST #3024
-    if v.kind == TYPE_UNKNOWN and tn.name[i] != null and tn.name_len[i] > 0
+    if v.kind == TypeKind.Unknown and tn.name[i] != null and tn.name_len[i] > 0
         v.type_name = tn.name[i]
         v.type_name_len = tn.name_len[i]
 
@@ -1217,24 +1264,26 @@ pub fn bool_note_for(sm: *Sema, st: *Stmt)
 # row, whose elements are T, or a plane of its own shape.
 fn sbk_iter_rows(sm: *Sema, v: *SemaVar, it: *Expr)
     var e: *Expr = it
-    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         e = e.operand
     var depth: i32 = 0
     var sh: *ArrayShape = null
-    if e.kind == EXPR_INDEX
-        sh = sbk_nd_shape(sm, e, @depth)
-    else if e.kind == EXPR_IDENT
-        let lv: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if lv != null
-            sh = lv.shape
-        else
-            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-            if g != null and g.var_type == TYPE_ARRAY
-                sh = g.array_shape
-    else if e.kind == EXPR_MEMBER
-        let f: *StructField = sbk_member_field(sm, e)
-        if f != null and f.field_type == TYPE_ARRAY
-            sh = f.array_shape
+    match e.kind
+        ExprKind.Index =>
+            sh = sbk_nd_shape(sm, e, @depth)
+        ExprKind.Ident =>
+            let lv: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if lv != null
+                sh = lv.shape
+            else
+                let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                if g != null and g.var_type == TypeKind.Array
+                    sh = g.array_shape
+        ExprKind.Member =>
+            let f: *StructField = sbk_member_field(sm, e)
+            if f != null and f.field_type == TypeKind.Array
+                sh = f.array_shape
+        _ => pass
     if sh == null
         return
     # What each turn binds has this many dimensions.
@@ -1264,15 +1313,15 @@ fn sbk_iter_elem(sm: *Sema, it: *Expr) -> i32
     var e: *Expr = it
     if e == null
         return BK_UNSURE
-    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         e = e.operand
-    if e.kind == EXPR_IDENT
+    if e.kind == ExprKind.Ident
         return sbk_element(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    if e.kind == EXPR_MEMBER
+    if e.kind == ExprKind.Member
         let f: *StructField = sbk_member_field(sm, e)
-        if f != null and f.field_type == TYPE_ARRAY
+        if f != null and f.field_type == TypeKind.Array
             return bk_of_type(f.array_elem_type, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
-    if e.kind == EXPR_ARRAY_LIT and e.args != null
+    if e.kind == ExprKind.ArrayLit and e.args != null
         return sema_bool_kind(sm, e.args)
     BK_UNSURE
 
@@ -1299,7 +1348,7 @@ pub fn bool_note_arm(sm: *Sema, arm: *MatchArm, scrut: *Expr)
         sbk_payload_struct(sm, v, StrView { ptr: (name), len: (len) as i64 }, is_err)
         # AGAST #4265: one sema_arm_payload_ty typed (a struct, a user enum
         # such as fs's Errno) is what its type says, as the emitter has it.
-        if v.bk == BK_UNSURE and v.kind != TYPE_UNKNOWN
+        if v.bk == BK_UNSURE and v.kind != TypeKind.Unknown
             v.bk = sbk_of_ty(v.kind, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 })
     else if user_enum_index(StrView { ptr: (name), len: (len) as i64 }) >= 0
         let uf: *StructField = user_enum_tuple_field(StrView { ptr: (name), len: (len) as i64 }, arm_variant_sel(StrView { ptr: (name), len: (len) as i64 }, arm))
@@ -1311,7 +1360,7 @@ pub fn bool_note_arm(sm: *Sema, arm: *MatchArm, scrut: *Expr)
                 v.bk = k
             else
                 v.bk = sbk_binding(k)
-            if uf.field_type == TYPE_STRUCT and v.kind == TYPE_UNKNOWN
+            if uf.field_type == TypeKind.Struct and v.kind == TypeKind.Unknown
                 v.type_name = uf.field_type_name
                 v.type_name_len = uf.field_type_name_len
 
@@ -1360,7 +1409,7 @@ fn sbk_payload_struct(sm: *Sema, v: *SemaVar, name_sv: StrView, is_err: i32)
     if is_err == 1
         i = end + 1
         end = len
-    if i >= len or v.kind != TYPE_UNKNOWN
+    if i >= len or v.kind != TypeKind.Unknown
         return
     if name_eq(StrView { ptr: (name + i), len: (end - i) as i64 }, StrView { ptr: (c"f32"), len: (3) as i64 }) == 1 or name_eq(StrView { ptr: (name + i), len: (end - i) as i64 }, StrView { ptr: (c"f64"), len: (3) as i64 }) == 1
         v.bk = BK_FLOAT
@@ -1442,7 +1491,7 @@ fn bool_require(sm: *Sema, e: *Expr, what: *u8, op: *u8)
 # 1 when `e` is `o.m(...)` on an `Option$`/`Result$` receiver with no fn for
 # `m`, and `m` none of the carrier's builtins (unwrap, unwrap_or, is_some...).
 fn sbk_is_unknown_carrier_method(sm: *Sema, e: *Expr) -> i32
-    if e.kind != EXPR_METHOD or sbk_is_unwrap(e) == 1
+    if e.kind != ExprKind.Method or sbk_is_unwrap(e) == 1
         return 0
     if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"is_some"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"is_none"), len: (7) as i64 }) == 1
         return 0
@@ -1460,11 +1509,11 @@ fn sbk_is_unknown_carrier_method(sm: *Sema, e: *Expr) -> i32
 
 fn sbk_is_procedure_call(sm: *Sema, e: *Expr) -> i32
     var fd: *FnDef = null
-    if e.kind == EXPR_CALL and e.func_name_len > 0 and sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == null
+    if e.kind == ExprKind.Call and e.func_name_len > 0 and sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == null
         fd = sema_call_fn(sm, e)
-    else if e.kind == EXPR_METHOD
+    else if e.kind == ExprKind.Method
         fd = sbk_method_def(sm, e)
-    (fd != null and fd.return_type == TYPE_VOID) as i32
+    (fd != null and fd.return_type == TypeKind.Void) as i32
 
 # `what` is `if condition`, `while condition` or `assert condition`.
 pub fn bool_check_cond(sm: *Sema, e: *Expr, what: *u8)
@@ -1484,7 +1533,7 @@ fn bool_reject_operand(sm: *Sema, e: *Expr, op: *u8, wanted: *u8, bitwise: i32)
 
 # Every binary operator, before its operands.
 pub fn bool_check_binary(sm: *Sema, e: *Expr)
-    if e.op == OP_AND or e.op == OP_OR
+    if e.op == OpKind.And or e.op == OpKind.Or
         bool_require(sm, e.left, c"operand of `", bool_op_name(e.op))
         bool_require(sm, e.right, c"operand of `", bool_op_name(e.op))
         return
@@ -1494,7 +1543,7 @@ pub fn bool_check_binary(sm: *Sema, e: *Expr)
         return
     if l == BK_BAD or r == BK_BAD
         return
-    if e.op >= OP_EQ and e.op <= OP_GE
+    if op_is_comparison(e.op)
         var other: i32 = l
         if l == BK_BOOL
             other = r
@@ -1506,18 +1555,18 @@ pub fn bool_check_binary(sm: *Sema, e: *Expr)
     var bad: *Expr = e.right
     if l == BK_BOOL
         bad = e.left
-    if e.op >= OP_BIT_AND and e.op <= OP_SHR
+    if op_is_bitwise(e.op)
         bool_reject_operand(sm, bad, bool_op_name(e.op), c"an integer", 1)
     else
         bool_reject_operand(sm, bad, bool_op_name(e.op), c"a number", 0)
 
 # `not`, `-` and `~`.
 pub fn bool_check_unary(sm: *Sema, e: *Expr)
-    if e.op == OP_NOT
+    if e.op == OpKind.Not
         bool_require(sm, e.operand, c"operand of `", c"not")
-    else if e.op == OP_NEG and sema_bool_kind(sm, e.operand) == BK_BOOL
+    else if e.op == OpKind.Neg and sema_bool_kind(sm, e.operand) == BK_BOOL
         bool_reject_operand(sm, e.operand, c"-", c"a number", 0)
-    else if e.op == OP_BIT_NOT and sema_bool_kind(sm, e.operand) == BK_BOOL
+    else if e.op == OpKind.BitNot and sema_bool_kind(sm, e.operand) == BK_BOOL
         bool_reject_operand(sm, e.operand, c"~", c"an integer", 1)
 
 # A value of kind `v` lands in a slot of kind `slot`, at line:col.  Silent when
@@ -1547,7 +1596,7 @@ pub fn bool_check_slot_kind(sm: *Sema, e: *Expr, slot: i32)
     if e != null
         bool_check_kinds(sm, sema_bool_kind(sm, e), slot, e.span.line, e.span.col)
 
-pub fn bool_check_slot(sm: *Sema, e: *Expr, t: i32, name_sv: StrView)
+pub fn bool_check_slot(sm: *Sema, e: *Expr, t: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     bool_check_slot_kind(sm, e, bk_of_type(t, StrView { ptr: (name), len: (name_len) as i64 }))
@@ -1567,7 +1616,7 @@ pub fn bool_check_arms(sm: *Sema, arms: *MatchArm)
 
 # `x as T`, with T's kind in `e.op`.
 pub fn bool_check_cast(sm: *Sema, e: *Expr)
-    let target: i32 = bk_of_type(e.op, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let target: i32 = bk_of_type(e.type_kind, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if target == BK_BOOL
         if bool_sema_report_at(sm, e) == 1
             eprints_cstr(c"`as bool` is removed: write `x != 0`\n")
@@ -1635,64 +1684,68 @@ pub fn bool_check_struct_lit(sm: *Sema, e: *Expr)
 # Thrown away or not, the arms agree, as on ritz0: a valueless arm (a call to a
 # fn returning nothing, #2046) is unsure, so bool_check_kinds lets it be (#3774).
 pub fn bool_check_expr(sm: *Sema, e: *Expr)
-    let k: i32 = e.kind
-    if k == EXPR_BINARY
-        bool_check_binary(sm, e)
-    else if k == EXPR_UNARY
-        bool_check_unary(sm, e)
-    else if k == EXPR_CAST
-        bool_check_cast(sm, e)
-    else if k == EXPR_INDEX
-        if e.right != null and e.right.kind != EXPR_RANGE
-            bool_check_index(sm, e.right)
-    else if k == EXPR_CALL
-        bool_check_call(sm, e)
-    else if k == EXPR_METHOD
-        bool_check_method(sm, e)
-    else if k == EXPR_STRUCT_LIT
-        bool_check_struct_lit(sm, e)
-    else if k == EXPR_IF
-        let then_arm: *MatchArm = e.args as *MatchArm
-        bool_check_cond(sm, e.left, c"if condition")
-        bool_check_arms(sm, then_arm)
-    else if k == EXPR_MATCH
-        bool_check_arms(sm, e.args as *MatchArm)
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Binary =>
+            bool_check_binary(sm, e)
+        ExprKind.Unary =>
+            bool_check_unary(sm, e)
+        ExprKind.Cast =>
+            bool_check_cast(sm, e)
+        ExprKind.Index =>
+            if e.right != null and e.right.kind != ExprKind.Range
+                bool_check_index(sm, e.right)
+        ExprKind.Call =>
+            bool_check_call(sm, e)
+        ExprKind.Method =>
+            bool_check_method(sm, e)
+        ExprKind.StructLit =>
+            bool_check_struct_lit(sm, e)
+        ExprKind.If =>
+            let then_arm: *MatchArm = e.args as *MatchArm
+            bool_check_cond(sm, e.left, c"if condition")
+            bool_check_arms(sm, then_arm)
+        ExprKind.Match =>
+            bool_check_arms(sm, e.args as *MatchArm)
+        _ => pass
 
 # `target = value`, in each spelling the parser has for one.
 pub fn bool_check_stmt(sm: *Sema, stmt: *Stmt)
-    if stmt.kind == STMT_ASSIGN
-        if stmt.assign_target_len != 0
-            bool_check_slot_kind(sm, stmt.assign_value, sbk_name(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }))
-            return
-        let target: *Expr = stmt.if_cond as *Expr
-        if target.kind == EXPR_INDEX and target.right != null and target.right.kind != EXPR_RANGE
-            bool_check_index(sm, target.right)
-        bool_check_slot_kind(sm, stmt.assign_value, sema_bool_kind(sm, target))
-    else if stmt.kind == STMT_INDEX_ASSIGN
-        bool_check_index(sm, stmt.while_cond)
-        bool_check_slot_kind(sm, stmt.assign_value, sbk_element(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }))
-    else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN or stmt.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
-        if v == null
-            return
-        let st: *StructDef = sema_find_struct(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 })
-        if st == null
-            return
-        let idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-        if idx < 0
-            return
-        let f: *StructField = get_field_type(st, idx)
-        if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
-            bool_check_slot(sm, stmt.assign_value, f.field_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
-        else if f.field_type == TYPE_ARRAY
+    match stmt.kind
+        StmtKind.Assign =>
+            if stmt.assign_target_len != 0
+                bool_check_slot_kind(sm, stmt.assign_value, sbk_name(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }))
+                return
+            let target: *Expr = stmt.if_cond as *Expr
+            if target.kind == ExprKind.Index and target.right != null and target.right.kind != ExprKind.Range
+                bool_check_index(sm, target.right)
+            bool_check_slot_kind(sm, stmt.assign_value, sema_bool_kind(sm, target))
+        StmtKind.IndexAssign =>
             bool_check_index(sm, stmt.while_cond)
-            bool_check_slot(sm, stmt.assign_value, f.array_elem_type, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
+            bool_check_slot_kind(sm, stmt.assign_value, sbk_element(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }))
+        StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
+            if v == null
+                return
+            let st: *StructDef = sema_find_struct(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 })
+            if st == null
+                return
+            let idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+            if idx < 0
+                return
+            let f: *StructField = get_field_type(st, idx)
+            if stmt.kind == StmtKind.LocalFieldAssign
+                bool_check_slot(sm, stmt.assign_value, f.field_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+            else if f.field_type == TypeKind.Array
+                bool_check_index(sm, stmt.while_cond)
+                bool_check_slot(sm, stmt.assign_value, f.array_elem_type, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
+        _ => pass
 
 # `let a: [N]T = [..]`: each element lands in a T.
-pub fn bool_check_array_lit(sm: *Sema, e: *Expr, elem: i32, name_sv: StrView)
+pub fn bool_check_array_lit(sm: *Sema, e: *Expr, elem: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
-    if e == null or e.kind != EXPR_ARRAY_LIT
+    if e == null or e.kind != ExprKind.ArrayLit
         return
     var el: *Expr = e.args
     while el != null
@@ -1702,7 +1755,7 @@ pub fn bool_check_array_lit(sm: *Sema, e: *Expr, elem: i32, name_sv: StrView)
 # The rows of an N-D `[N][M]T` initialiser, depth `d` of `sh`: each leaf row's
 # elements land in a T.
 fn bool_check_nd_rows(sm: *Sema, sh: *ArrayShape, d: i32, e: *Expr)
-    if e == null or e.kind != EXPR_ARRAY_LIT
+    if e == null or e.kind != ExprKind.ArrayLit
         return
     if d == sh.rank - 1
         bool_check_array_lit(sm, e, sh.leaf_type, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
@@ -1714,7 +1767,7 @@ fn bool_check_nd_rows(sm: *Sema, sh: *ArrayShape, d: i32, e: *Expr)
 
 # A `let` / `var` with a declared type: its initialiser lands in it.
 pub fn bool_check_decl(sm: *Sema, st: *Stmt)
-    if st.var_init == null or st.var_declared_type == TYPE_VOID
+    if st.var_init == null or st.var_declared_type == TypeKind.Void
         return
     bool_check_slot(sm, st.var_init, st.var_declared_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
     bool_check_array_lit(sm, st.var_init, st.var_array_elem_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
@@ -1735,18 +1788,20 @@ fn sbk_block(sm: *Sema, stmts: *Stmt) -> i32
         return BK_UNSURE
     while last.next != null
         last = last.next
-    if last.kind == STMT_IF
-        return sbk_if_stmt(sm, last)
-    if last.kind == STMT_MATCH
-        return sbk_arms(sm, last.if_then as *MatchArm)
-    if last.kind != STMT_EXPR
+    match last.kind
+        StmtKind.If =>
+            return sbk_if_stmt(sm, last)
+        StmtKind.Match =>
+            return sbk_arms(sm, last.if_then as *MatchArm)
+        _ => pass
+    if last.kind != StmtKind.Expr
         return BK_UNSURE
     let e: *Expr = last.expr
-    if e.kind == EXPR_IDENT
+    if e.kind == ExprKind.Ident
         var st: *Stmt = stmts
         while st != last
-            if st.kind == STMT_VAR_DECL and name_eq(StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
-                if st.var_declared_type != TYPE_VOID
+            if st.kind == StmtKind.VarDecl and name_eq(StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+                if st.var_declared_type != TypeKind.Void
                     return bk_of_type(st.var_declared_type, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
                 return sema_bool_kind(sm, st.var_init)
             st = st.next
@@ -1768,18 +1823,18 @@ pub fn bool_check_tail(sm: *Sema, stmt: *Stmt)
     let slot: i32 = bk_of_type(f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
     if slot == BK_UNSURE
         return
-    if stmt.kind == STMT_EXPR
-        if f.return_type != TYPE_STRUCT
+    if stmt.kind == StmtKind.Expr
+        if f.return_type != TypeKind.Struct
             bool_check_slot_kind(sm, stmt.expr, slot)
-    else if stmt.kind == STMT_IF and stmt.if_else != null
+    else if stmt.kind == StmtKind.If and stmt.if_else != null
         # The arms agree first, as the phi's do, then the value meets the slot.
         var tail: *Stmt = stmt.if_else
         while tail.next != null
             tail = tail.next
-        if tail.kind == STMT_EXPR
+        if tail.kind == StmtKind.Expr
             bool_check_kinds(sm, sbk_block(sm, stmt.if_else), sbk_block(sm, stmt.if_then), tail.expr.span.line, tail.expr.span.col)
         bool_check_kinds(sm, sbk_if_stmt(sm, stmt), slot, stmt.span.line, stmt.span.col)
-    else if stmt.kind == STMT_MATCH
+    else if stmt.kind == StmtKind.Match
         let arms: *MatchArm = stmt.if_then as *MatchArm
         bool_check_arms(sm, arms)
         bool_check_kinds(sm, sbk_arms(sm, arms), slot, stmt.span.line, stmt.span.col)
@@ -1788,8 +1843,8 @@ pub fn bool_check_tail(sm: *Sema, stmt: *Stmt)
 pub fn bool_check_globals(sm: *Sema)
     var c: *ConstEntry = sm.module.constants
     while c != null
-        if c.const_type == TYPE_BOOL
-            bool_check_slot(sm, c.value_expr, TYPE_BOOL, StrView { ptr: (null), len: (0) as i64 })
+        if c.const_type == TypeKind.Bool
+            bool_check_slot(sm, c.value_expr, TypeKind.Bool, StrView { ptr: (null), len: (0) as i64 })
         c = c.next
     var g: *GlobalVarDef = sm.module.globals
     while g != null

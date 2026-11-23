@@ -22,8 +22,17 @@ import ritz_ast as rast
 CATCH_ALL = "a catch-all"
 
 
+def alternatives(pattern: rast.Pattern) -> List[rast.Pattern]:
+    """An or-pattern's alternatives (AGAST #4450); any other pattern alone."""
+    if isinstance(pattern, rast.OrPattern):
+        return pattern.alternatives
+    return [pattern]
+
+
 def _counted(arms: Sequence[rast.MatchArm]) -> List[rast.Pattern]:
-    return [arm.pattern for arm in arms if arm.guard is None]
+    """Every pattern an unguarded arm tests, each alternative of an
+    or-pattern counted.  None is a catch-all: they bind nothing."""
+    return [alt for arm in arms if arm.guard is None for alt in alternatives(arm.pattern)]
 
 
 def _takes_any_value(pattern: rast.Pattern) -> bool:
@@ -125,19 +134,32 @@ def unreachable_arm(
 ) -> Optional[Tuple[rast.MatchArm, rast.MatchArm]]:
     """The first arm no value can reach, with the arm that covers it, or None.
     `gap` is the scrutinee's R6 check, asked of the arms so far."""
+    found = unreachable_pattern(arms, gap, test)
+    return found and found[1:]
+
+
+def unreachable_pattern(
+    arms: Sequence[rast.MatchArm],
+    gap: Callable[[Sequence[rast.MatchArm]], List[str]],
+    test: Callable[[rast.Pattern], Test],
+) -> Optional[Tuple[rast.Pattern, rast.MatchArm, rast.MatchArm]]:
+    """unreachable_arm's answer, with the pattern to say it at first: the
+    arm's own, or the alternative of an or-pattern that repeats a test.  A
+    repeat is one whether the arm that has it already is an earlier one or
+    this one (`Red | Red`), as a repeated arm is (AGAST #4450)."""
     covered = {}
     closer = None
     for index, arm in enumerate(arms):
         # An arm that repeats a test names the arm it repeats, even once all is
         # covered: `Some(v) / None / Some(_)` is a second `Some`, said at `Some(v)`.
-        tested = test(arm.pattern)
-        if tested is not None and tested[0] in covered:
-            return arm, covered[tested[0]]
-        if closer is not None:
-            return arm, closer
-        if arm.guard is None:
-            if tested is not None and tested[1]:
+        for alt in alternatives(arm.pattern):
+            tested = test(alt)
+            if tested is not None and tested[0] in covered:
+                return alt, arm, covered[tested[0]]
+            if arm.guard is None and closer is None and tested is not None and tested[1]:
                 covered[tested[0]] = arm
-            if not gap(arms[:index + 1]):
-                closer = arm
+        if closer is not None:
+            return arm.pattern, arm, closer
+        if arm.guard is None and not gap(arms[:index + 1]):
+            closer = arm
     return None

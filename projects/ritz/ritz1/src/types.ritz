@@ -36,71 +36,73 @@ import ast
 import ritzlib.memory   # calloc for the view layout below (AGAST #4545)
 
 # 1 for the eight integer kinds (not bool).
-pub fn ty_is_int(t: i32) -> i32
+pub fn ty_is_int(t: TypeKind) -> i32
     (ty_int_bits(t) > 0) as i32
 
-pub fn ty_is_signed(t: i32) -> i32
-    if t == TYPE_I8 or t == TYPE_I16 or t == TYPE_I32 or t == TYPE_I64
+pub fn ty_is_signed(t: TypeKind) -> i32
+    if t == TypeKind.I8 or t == TypeKind.I16 or t == TypeKind.I32 or t == TypeKind.I64
         return 1
     0
 
-pub fn ty_is_unsigned(t: i32) -> i32
-    if t == TYPE_U8 or t == TYPE_U16 or t == TYPE_U32 or t == TYPE_U64
+pub fn ty_is_unsigned(t: TypeKind) -> i32
+    if t == TypeKind.U8 or t == TypeKind.U16 or t == TypeKind.U32 or t == TypeKind.U64
         return 1
     0
 
 # Width in bits of an integer kind; 0 for bool and everything else.
-pub fn ty_int_bits(t: i32) -> i32
-    if t == TYPE_I8 or t == TYPE_U8
-        return 8
-    if t == TYPE_I16 or t == TYPE_U16
-        return 16
-    if t == TYPE_I32 or t == TYPE_U32
-        return 32
-    if t == TYPE_I64 or t == TYPE_U64
-        return 64
+pub fn ty_int_bits(t: TypeKind) -> i32
+    match t
+        TypeKind.I8 | TypeKind.U8 =>
+            return 8
+        TypeKind.I16 | TypeKind.U16 =>
+            return 16
+        TypeKind.I32 | TypeKind.U32 =>
+            return 32
+        TypeKind.I64 | TypeKind.U64 =>
+            return 64
+        _ => pass
     0
 
 # 1 when `t` is an integer kind whose width lies in lo..hi bits
 # (`ty_int_in(t, 8, 16)`: i8/u8/i16/u16).
-pub fn ty_int_in(t: i32, lo: i32, hi: i32) -> i32
+pub fn ty_int_in(t: TypeKind, lo: i32, hi: i32) -> i32
     let bits: i32 = ty_int_bits(t)
     (bits > 0 and bits >= lo and bits <= hi) as i32
 
 # Width in bits of an integer or bool kind (bool = 1); 0 for anything else.
-pub fn ty_bits(t: i32) -> i32
-    if t == TYPE_BOOL
+pub fn ty_bits(t: TypeKind) -> i32
+    if t == TypeKind.Bool
         return 1
     ty_int_bits(t)
 
-pub fn ty_is_float(t: i32) -> i32
-    (t == TYPE_F32 or t == TYPE_F64) as i32
+pub fn ty_is_float(t: TypeKind) -> i32
+    (t == TypeKind.F32 or t == TypeKind.F64) as i32
 
-pub fn ty_is_ptr(t: i32) -> i32
-    (t == TYPE_PTR or t == TYPE_PTR_PTR) as i32
+pub fn ty_is_ptr(t: TypeKind) -> i32
+    (t == TypeKind.Ptr or t == TypeKind.PtrPtr) as i32
 
 # Bytes one value of kind `t` occupies; 0 when `t` is not a primitive
 # (struct, enum, array, ref, void) -- never a guess.
-pub fn ty_store_size(t: i32) -> i64
-    if t == TYPE_BOOL
+pub fn ty_store_size(t: TypeKind) -> i64
+    if t == TypeKind.Bool
         return 1
     let bits: i32 = ty_int_bits(t)
     if bits > 0
         return (bits / 8) as i64
-    if t == TYPE_F32
+    if t == TypeKind.F32
         return 4
-    if t == TYPE_F64 or ty_is_ptr(t) == 1
+    if t == TypeKind.F64 or ty_is_ptr(t) == 1
         return 8
     0
 
 # Natural alignment of a primitive kind (its size on x86_64); 0 if unknown.
-pub fn ty_align(t: i32) -> i64
+pub fn ty_align(t: TypeKind) -> i64
     ty_store_size(t)
 
 # LLVM spelling of kind `t` in memory: `[N x <this>]` arrays, struct
 # fields, pointees, slots.  null for a kind that is not a primitive
 # (struct / enum / array / ref / void), which the caller spells itself.
-pub fn ty_mem_llvm(t: i32) -> *u8
+pub fn ty_mem_llvm(t: TypeKind) -> *u8
     let bits: i32 = ty_int_bits(t)
     if bits == 8
         return c"i8"
@@ -110,12 +112,14 @@ pub fn ty_mem_llvm(t: i32) -> *u8
         return c"i32"
     if bits == 64
         return c"i64"
-    if t == TYPE_BOOL
-        return c"i1"
-    if t == TYPE_F32
-        return c"float"
-    if t == TYPE_F64
-        return c"double"
+    match t
+        TypeKind.Bool =>
+            return c"i1"
+        TypeKind.F32 =>
+            return c"float"
+        TypeKind.F64 =>
+            return c"double"
+        _ => pass
     if ty_is_ptr(t) == 1
         return c"ptr"
     null
@@ -123,12 +127,14 @@ pub fn ty_mem_llvm(t: i32) -> *u8
 # LLVM spelling of kind `t` as a value (params, returns, call operands).
 # Pointers and `@T` are carried as i64 (ritz1's unified value model); an
 # `@&T` is a `ptr`; anything unknown is i64.
-pub fn ty_value_llvm(t: i32) -> *u8
-    if t == TYPE_VOID
-        return c"void"
-    if t == TYPE_MUT_REF
-        return c"ptr"
-    if ty_is_ptr(t) == 1 or t == TYPE_REF
+pub fn ty_value_llvm(t: TypeKind) -> *u8
+    match t
+        TypeKind.Void =>
+            return c"void"
+        TypeKind.MutRef =>
+            return c"ptr"
+        _ => pass
+    if ty_is_ptr(t) == 1 or t == TypeKind.Ref
         return c"i64"
     let m: *u8 = ty_mem_llvm(t)
     if m == null
@@ -137,27 +143,29 @@ pub fn ty_value_llvm(t: i32) -> *u8
 
 # The Ritz spelling of a primitive kind (`u16`); "i64" for anything else,
 # which is how ritz1 types an unknown integer.
-pub fn ty_name(t: i32) -> *u8
-    if t == TYPE_I8
-        return c"i8"
-    if t == TYPE_U8
-        return c"u8"
-    if t == TYPE_I16
-        return c"i16"
-    if t == TYPE_U16
-        return c"u16"
-    if t == TYPE_I32
-        return c"i32"
-    if t == TYPE_U32
-        return c"u32"
-    if t == TYPE_U64
-        return c"u64"
-    if t == TYPE_BOOL
-        return c"bool"
-    if t == TYPE_F32
-        return c"f32"
-    if t == TYPE_F64
-        return c"f64"
+pub fn ty_name(t: TypeKind) -> *u8
+    match t
+        TypeKind.I8 =>
+            return c"i8"
+        TypeKind.U8 =>
+            return c"u8"
+        TypeKind.I16 =>
+            return c"i16"
+        TypeKind.U16 =>
+            return c"u16"
+        TypeKind.I32 =>
+            return c"i32"
+        TypeKind.U32 =>
+            return c"u32"
+        TypeKind.U64 =>
+            return c"u64"
+        TypeKind.Bool =>
+            return c"bool"
+        TypeKind.F32 =>
+            return c"f32"
+        TypeKind.F64 =>
+            return c"f64"
+        _ => pass
     c"i64"
 
 fn ty_name_is(name_sv: StrView, want_sv: StrView) -> i32
@@ -175,26 +183,27 @@ fn ty_name_is(name_sv: StrView, want_sv: StrView) -> i32
     1
 
 # The primitive kind the Ritz spelling `name` names (`usize` is u64,
-# `isize` is i64, #3464); TYPE_VOID when `name` is not a primitive.
-pub fn ty_from_name(name_sv: StrView) -> i32
+# `isize` is i64, #3464); TypeKind.Void when `name` is not a primitive.
+pub fn ty_from_name(name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if name == null or len < 2 or len > 5
-        return TYPE_VOID
-    # Every primitive kind lies in TYPE_I32 (1) .. TYPE_F64 (13); the two
+        return TypeKind.Void
+    # Every primitive kind lies in TypeKind.I32 (1) .. TypeKind.F64 (13); the two
     # pointer kinds in that range have no word spelling.
-    var t: i32 = TYPE_I32
-    while t <= TYPE_F64
+    var code: i32 = TypeKind.I32 as i32
+    while code <= (TypeKind.F64 as i32)
+        let t: TypeKind = type_kind_of(code)
         if ty_is_ptr(t) == 0 and ty_name_is(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (ty_name(t)), len: (ty_name_len(t)) as i64 }) == 1
             return t
-        t = t + 1
+        code = code + 1
     if ty_name_is(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"isize"), len: (5) as i64 }) == 1
-        return TYPE_I64
+        return TypeKind.I64
     if ty_name_is(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"usize"), len: (5) as i64 }) == 1
-        return TYPE_U64
-    TYPE_VOID
+        return TypeKind.U64
+    TypeKind.Void
 
-fn ty_name_len(t: i32) -> i32
+fn ty_name_len(t: TypeKind) -> i32
     let n: *u8 = ty_name(t)
     var i: i32 = 0
     while *(n + i) != 0
@@ -209,11 +218,11 @@ fn ty_name_len(t: i32) -> i32
 # chain is the type: `pointee` / `elem`, not a separate depth count.
 # =============================================================================
 
-# The flat kind a TypeRef stands for.  Any depth >= 2 is TYPE_PTR_PTR, as the
+# The flat kind a TypeRef stands for.  Any depth >= 2 is TypeKind.PtrPtr, as the
 # flat model had it; the chain carries the depth (`tr_depth`).
-pub fn tr_flat(tr: *TypeRef) -> i32
+pub fn tr_flat(tr: *TypeRef) -> TypeKind
     if tr == null
-        return TYPE_VOID
+        return TypeKind.Void
     tr.kind
 
 pub fn tr_is_ptr(tr: *TypeRef) -> i32
@@ -245,14 +254,16 @@ pub fn tr_elem(tr: *TypeRef) -> *TypeRef
 pub fn tr_depth(tr: *TypeRef) -> i32
     if tr == null
         return 0
-    if tr.kind == TYPE_PTR
-        return 1
-    if tr.kind == TYPE_PTR_PTR
-        if tr.pointee == null
-            return 2
-        if tr.pointee.kind == TYPE_PTR
-            return 2
-        return 1 + tr_depth(tr.pointee)
+    match tr.kind
+        TypeKind.Ptr =>
+            return 1
+        TypeKind.PtrPtr =>
+            if tr.pointee == null
+                return 2
+            if tr.pointee.kind == TypeKind.Ptr
+                return 2
+            return 1 + tr_depth(tr.pointee)
+        _ => pass
     0
 
 # The name a struct type carries: its own, or the deepest struct a pointer /
@@ -262,7 +273,7 @@ pub fn tr_name(tr: *TypeRef, out_len: *i32) -> *u8
     *out_len = 0
     if tr == null
         return null
-    if tr.kind == TYPE_STRUCT
+    if tr.kind == TypeKind.Struct
         *out_len = tr.name_len
         return tr.name
     if tr.pointee != null
@@ -299,14 +310,14 @@ pub fn view_len_name() -> *u8
     c"len"
 
 # A fresh StructField of the view: named, typed, and every specialization
-# field at its TYPE_VOID / null default (calloc zeroes them).
-fn view_field_new(name: *u8, name_len: i32, ty: i32) -> *StructField
+# field at its TypeKind.Void / null default (calloc zeroes them).
+fn view_field_new(name: *u8, name_len: i32, ty: TypeKind) -> *StructField
     let f: *StructField = calloc(1, sizeof(StructField)) as *StructField
     f.name = name
     f.name_len = name_len
     f.field_type = ty
-    f.inner_pointee_type = TYPE_VOID
-    f.field_ref_ptr_pointee = TYPE_VOID
+    f.inner_pointee_type = (TypeKind.Void as i32)
+    f.field_ref_ptr_pointee = TypeKind.Void
     f
 
 # The `{ ptr: *P, len: i64 }` StructDef named `name_sv`.  `generic` = 1 makes
@@ -318,14 +329,14 @@ fn view_field_new(name: *u8, name_len: i32, ty: i32) -> *StructField
 pub fn view_struct_new(name_sv: StrView, generic: i32) -> *StructDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let ptr_f: *StructField = view_field_new(view_ptr_name(), VIEW_PTR_NAME_LEN, TYPE_PTR)
+    let ptr_f: *StructField = view_field_new(view_ptr_name(), VIEW_PTR_NAME_LEN, TypeKind.Ptr)
     if generic == 1
-        ptr_f.ptr_pointee = TYPE_STRUCT
+        ptr_f.ptr_pointee = TypeKind.Struct
         ptr_f.field_type_name = c"T"
         ptr_f.field_type_name_len = 1
     else
-        ptr_f.array_elem_type = TYPE_U8   # the pointee, for `span.ptr + i` stride
-    ptr_f.next = view_field_new(view_len_name(), VIEW_LEN_NAME_LEN, TYPE_I64)
+        ptr_f.array_elem_type = TypeKind.U8   # the pointee, for `span.ptr + i` stride
+    ptr_f.next = view_field_new(view_len_name(), VIEW_LEN_NAME_LEN, TypeKind.I64)
     let st: *StructDef = calloc(1, sizeof(StructDef)) as *StructDef
     st.name = name
     st.name_len = len
@@ -339,12 +350,12 @@ pub fn view_layout_ok(st: *StructDef) -> i32
     let f1: *StructField = st.fields
     if f1 == null
         return 0
-    if f1.field_type != TYPE_PTR
+    if f1.field_type != TypeKind.Ptr
         return 0
     let f2: *StructField = f1.next
     if f2 == null
         return 0
-    if f2.field_type != TYPE_I64
+    if f2.field_type != TypeKind.I64
         return 0
     if f2.next != null
         return 0

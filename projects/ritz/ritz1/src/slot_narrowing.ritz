@@ -31,7 +31,7 @@
 # ritz0/test_ritz1_implicit_narrowing_slots.py feeds its tables to ritz1.
 #
 # One-sided, as narrowing.ritz is: a slot or a value whose integer type Sema
-# cannot name (NARROW_UNKNOWN, a borrow, a generic) is never refused.
+# cannot name (TypeKind.NarrowUnknown, a borrow, a generic) is never refused.
 #
 # WHERE IT RUNS: on Sema, from sema_walk, at the slots literal_slot.ritz
 # visits, before the value's own sub-expressions are walked.
@@ -81,7 +81,7 @@ struct SlotWords
 # operand, a cast at its operand), as float_slot reports it.
 fn sn_report_at(e: *Expr) -> *Expr
     var at: *Expr = e
-    while (at.kind == EXPR_BINARY or at.kind == EXPR_CAST) and at.left != null
+    while (at.kind == ExprKind.Binary or at.kind == ExprKind.Cast) and at.left != null
         at = at.left
     at
 
@@ -130,11 +130,11 @@ fn sn_print_slot(w: *SlotWords)
     eprints_cstr(c"` is `")
 
 # `value` lands in integer slot `slot`: refuse it unless it provably fits.
-fn sn_check(sm: *Sema, value: *Expr, slot: i32, w: *SlotWords)
-    if value == null or slot == NARROW_UNKNOWN
+fn sn_check(sm: *Sema, value: *Expr, slot: TypeKind, w: *SlotWords)
+    if value == null or slot == TypeKind.NarrowUnknown
         return
-    let src: i32 = narrow_sema_unproven(sm, value, slot)
-    if src == 0
+    let src: TypeKind = narrow_sema_unproven(sm, value, slot)
+    if src == TypeKind.Void
         return
     if bool_sema_report_at(sm, sn_report_at(value)) == 0
         return
@@ -165,49 +165,51 @@ fn sn_words(w: *SlotWords, kind: i32, name_sv: StrView)
 # Assignment
 # =============================================================================
 
-# The integer type of place `t` (an EXPR_* target), else NARROW_UNKNOWN; and
+# The integer type of place `t` (an EXPR_* target), else TypeKind.NarrowUnknown; and
 # its words.
-fn sn_place_type(sm: *Sema, t: *Expr, w: *SlotWords) -> i32
+fn sn_place_type(sm: *Sema, t: *Expr, w: *SlotWords) -> TypeKind
     sn_words(w, SN_PLACE, StrView { ptr: (null), len: (0) as i64 })
     if t == null
-        return NARROW_UNKNOWN
-    if t.kind == EXPR_IDENT
-        w.name = t.ident_ptr
-        w.name_len = t.ident_len
-        return narrow_sema_name_type(sm, StrView { ptr: (t.ident_ptr), len: (t.ident_len) as i64 })
-    if t.kind == EXPR_MEMBER
-        if t.left != null and t.left.kind == EXPR_IDENT
-            w.base = t.left.ident_ptr
-            w.base_len = t.left.ident_len
+        return TypeKind.NarrowUnknown
+    match t.kind
+        ExprKind.Ident =>
             w.name = t.ident_ptr
             w.name_len = t.ident_len
-            w.shape = 1
-        let f: *StructField = sbk_member_field(sm, t)
-        if f == null
-            return NARROW_UNKNOWN
-        return narrow_known(f.field_type)
-    if t.kind == EXPR_INDEX
-        if t.left != null and t.left.kind == EXPR_IDENT
-            w.name = t.left.ident_ptr
-            w.name_len = t.left.ident_len
-            w.indexed = 1
-        if t.right == null or t.right.kind == EXPR_RANGE
-            return NARROW_UNKNOWN
-        var kind: i32 = TYPE_VOID
-        var pointee: i32 = TYPE_VOID
-        sema_index_slot(sm, t, @kind, @pointee)
-        return narrow_known(kind)
-    if t.kind == EXPR_UNARY and t.op == OP_DEREF
-        if t.operand != null and t.operand.kind == EXPR_IDENT
+            return narrow_sema_name_type(sm, StrView { ptr: (t.ident_ptr), len: (t.ident_len) as i64 })
+        ExprKind.Member =>
+            if t.left != null and t.left.kind == ExprKind.Ident
+                w.base = t.left.ident_ptr
+                w.base_len = t.left.ident_len
+                w.name = t.ident_ptr
+                w.name_len = t.ident_len
+                w.shape = 1
+            let f: *StructField = sbk_member_field(sm, t)
+            if f == null
+                return TypeKind.NarrowUnknown
+            return narrow_known(f.field_type)
+        ExprKind.Index =>
+            if t.left != null and t.left.kind == ExprKind.Ident
+                w.name = t.left.ident_ptr
+                w.name_len = t.left.ident_len
+                w.indexed = 1
+            if t.right == null or t.right.kind == ExprKind.Range
+                return TypeKind.NarrowUnknown
+            var kind: TypeKind = TypeKind.Void
+            var pointee: TypeKind = TypeKind.Void
+            sema_index_slot(sm, t, @kind, @pointee)
+            return narrow_known(kind)
+        _ => pass
+    if t.kind == ExprKind.Unary and t.op == OpKind.Deref
+        if t.operand != null and t.operand.kind == ExprKind.Ident
             w.name = t.operand.ident_ptr
             w.name_len = t.operand.ident_len
             w.shape = 3
         var pt: SemaTy
-        let pk: i32 = sema_expr_ty(sm, t.operand, @pt)
-        if pk == TYPE_PTR or pk == TYPE_REF or pk == TYPE_MUT_REF
+        let pk: TypeKind = sema_expr_ty(sm, t.operand, @pt)
+        if pk == TypeKind.Ptr or pk == TypeKind.Ref or pk == TypeKind.MutRef
             return narrow_known(pt.pointee)
-        return NARROW_UNKNOWN
-    NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
+    TypeKind.NarrowUnknown
 
 # The field `field` of the struct `local` is, else null.
 fn sn_local_field(sm: *Sema, local_sv: StrView, field_sv: StrView) -> *StructField
@@ -225,39 +227,41 @@ fn sn_local_field(sm: *Sema, local_sv: StrView, field_sv: StrView) -> *StructFie
 pub fn slot_narrowing_assign(sm: *Sema, st: *Stmt)
     var w: SlotWords
     sn_words(@w, SN_PLACE, StrView { ptr: (null), len: (0) as i64 })
-    var slot: i32 = NARROW_UNKNOWN
-    let k: i32 = st.kind
-    if k == STMT_ASSIGN
-        if st.assign_target_len != 0
+    var slot: TypeKind = TypeKind.NarrowUnknown
+    let k: StmtKind = st.kind
+    match k
+        StmtKind.Assign =>
+            if st.assign_target_len != 0
+                w.name = st.assign_target
+                w.name_len = st.assign_target_len
+                slot = narrow_sema_name_type(sm, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 })
+            else
+                slot = sn_place_type(sm, st.if_cond as *Expr, @w)
+        StmtKind.IndexAssign =>
             w.name = st.assign_target
             w.name_len = st.assign_target_len
-            slot = narrow_sema_name_type(sm, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 })
-        else
-            slot = sn_place_type(sm, st.if_cond as *Expr, @w)
-    else if k == STMT_INDEX_ASSIGN
-        w.name = st.assign_target
-        w.name_len = st.assign_target_len
-        w.indexed = 1
-        var kind: i32 = TYPE_VOID
-        var pointee: i32 = TYPE_VOID
-        sema_named_elem(sm, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 }, @kind, @pointee)
-        slot = narrow_known(kind)
-    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
-        w.base = st.var_name
-        w.base_len = st.var_name_len
-        w.name = st.assign_target
-        w.name_len = st.assign_target_len
-        w.shape = 1
-        let f: *StructField = sn_local_field(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 })
-        slot = sn_field_slot(sm, f, sn_is(k, STMT_LOCAL_FIELD_INDEX_ASSIGN), @w)
-    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        let f: *StructField = sn_member_field(sm, st, @w)
-        slot = sn_field_slot(sm, f, sn_is(k, STMT_MEMBER_INDEX_ASSIGN), @w)
-        if k == STMT_MEMBER_ASSIGN
-            sn_async_result(sm, st.if_cond as *Expr, @w)
+            w.indexed = 1
+            var kind: TypeKind = TypeKind.Void
+            var pointee: TypeKind = TypeKind.Void
+            sema_named_elem(sm, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 }, @kind, @pointee)
+            slot = narrow_known(kind)
+        StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
+            w.base = st.var_name
+            w.base_len = st.var_name_len
+            w.name = st.assign_target
+            w.name_len = st.assign_target_len
+            w.shape = 1
+            let f: *StructField = sn_local_field(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 })
+            slot = sn_field_slot(sm, f, sn_is(k, StmtKind.LocalFieldIndexAssign), @w)
+        StmtKind.MemberAssign | StmtKind.MemberIndexAssign =>
+            let f: *StructField = sn_member_field(sm, st, @w)
+            slot = sn_field_slot(sm, f, sn_is(k, StmtKind.MemberIndexAssign), @w)
+            if k == StmtKind.MemberAssign
+                sn_async_result(sm, st.if_cond as *Expr, @w)
+        _ => pass
     sn_check(sm, st.assign_value, slot, @w)
 
-fn sn_is(a: i32, b: i32) -> i32
+fn sn_is(a: StmtKind, b: StmtKind) -> i32
     if a == b
         return 1
     0
@@ -265,14 +269,14 @@ fn sn_is(a: i32, b: i32) -> i32
 # The slot field `f` is (null: unknown), or with `indexed` (`x.f[i] = v`, the
 # STMT_*_INDEX_ASSIGN forms, AGAST #4309) the slot an element of it is, as
 # `x.f[i]` on the right is typed; the place is then worded `<place>[..]`.
-fn sn_field_slot(sm: *Sema, f: *StructField, indexed: i32, w: *SlotWords) -> i32
+fn sn_field_slot(sm: *Sema, f: *StructField, indexed: i32, w: *SlotWords) -> TypeKind
     if f == null
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     if indexed == 0
         return narrow_known(f.field_type)
     w.indexed = 1
-    var kind: i32 = TYPE_VOID
-    var pointee: i32 = TYPE_VOID
+    var kind: TypeKind = TypeKind.Void
+    var pointee: TypeKind = TypeKind.Void
     sema_field_elem(sm, f, @kind, @pointee)
     narrow_known(kind)
 
@@ -289,11 +293,11 @@ fn sn_member_field(sm: *Sema, st: *Stmt, w: *SlotWords) -> *StructField
         return null
     w.name = st.assign_target
     w.name_len = st.assign_target_len
-    if pe.kind == EXPR_IDENT
+    if pe.kind == ExprKind.Ident
         w.base = pe.ident_ptr
         w.base_len = pe.ident_len
         w.shape = 4
-    else if pe.kind == EXPR_MEMBER and pe.left != null and pe.left.kind == EXPR_IDENT
+    else if pe.kind == ExprKind.Member and pe.left != null and pe.left.kind == ExprKind.Ident
         w.base = pe.left.ident_ptr
         w.base_len = pe.left.ident_len
         w.mid = pe.ident_ptr
@@ -304,8 +308,8 @@ fn sn_member_field(sm: *Sema, st: *Stmt, w: *SlotWords) -> *StructField
         # `*self.s.f`, the shape-5 words (AGAST #4309).
         if name_eq(StrView { ptr: (w.base), len: (w.base_len) as i64 }, StrView { ptr: (c"self"), len: (4) as i64 }) == 1 and sn_poll_fn_len(sm) > 0
             var mt: SemaTy
-            let mk: i32 = sema_expr_ty(sm, pe, @mt)
-            if mk == TYPE_PTR or mk == TYPE_REF or mk == TYPE_MUT_REF
+            let mk: TypeKind = sema_expr_ty(sm, pe, @mt)
+            if mk == TypeKind.Ptr or mk == TypeKind.Ref or mk == TypeKind.MutRef
                 w.shape = 6
     else
         w.name = null     # "the place assigned"
@@ -344,7 +348,7 @@ fn sn_poll_fn_len(sm: *Sema) -> i32
 # `(*self).__result = v` takes this route too, and keeps its place wording,
 # "`*self.__result` is", unless its fn is `<f>$poll(self: *<f>$Future)`.
 fn sn_async_result(sm: *Sema, pe: *Expr, w: *SlotWords)
-    if pe == null or pe.kind != EXPR_IDENT or w.kind != SN_PLACE or w.name == null
+    if pe == null or pe.kind != ExprKind.Ident or w.kind != SN_PLACE or w.name == null
         return
     if name_eq(StrView { ptr: (pe.ident_ptr), len: (pe.ident_len) as i64 }, StrView { ptr: (c"self"), len: (4) as i64 }) == 0 or name_eq(StrView { ptr: (w.name), len: (w.name_len) as i64 }, StrView { ptr: (c"__result"), len: (8) as i64 }) == 0
         return
@@ -380,7 +384,7 @@ pub fn slot_narrowing_call(sm: *Sema, e: *Expr)
     if e.call_type_suffix_len <= 0
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
         if v != null
-            if v.fn_sig != null and v.kind != TYPE_ARRAY
+            if v.fn_sig != null and v.kind != TypeKind.Array
                 sn_args(sm, v.fn_sig.params, e.args, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
             return
     let fd: *FnDef = sema_call_fn(sm, e)
@@ -407,7 +411,7 @@ pub fn slot_narrowing_method(sm: *Sema, e: *Expr)
 # =============================================================================
 
 # `S { f: v, .. }`: each value lands in its field (ritz0's
-# _emit_struct_lit_field, #4157).  A nested literal is its own EXPR_STRUCT_LIT,
+# _emit_struct_lit_field, #4157).  A nested literal is its own ExprKind.StructLit,
 # judged when the walk reaches it.  A generic struct's `T` field is no
 # integer type, so it is never refused.
 pub fn slot_narrowing_struct_lit(sm: *Sema, e: *Expr)
@@ -431,19 +435,19 @@ pub fn slot_narrowing_struct_lit(sm: *Sema, e: *Expr)
 # Return and fn tail
 # =============================================================================
 
-# The return slot of the fn being walked, NARROW_UNKNOWN when it has none
+# The return slot of the fn being walked, TypeKind.NarrowUnknown when it has none
 # that §7.5 judges here.
-fn sn_return_slot(sm: *Sema, w: *SlotWords) -> i32
+fn sn_return_slot(sm: *Sema, w: *SlotWords) -> TypeKind
     let f: *FnDef = sm.cur_fn
     if f == null
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     sn_words(w, SN_RETURN, StrView { ptr: (f.name), len: (f.name_len) as i64 })
     narrow_known(f.return_type)
 
 # `return v` in the fn being walked.
 pub fn slot_narrowing_return(sm: *Sema, v: *Expr)
     var w: SlotWords
-    let slot: i32 = sn_return_slot(sm, @w)
+    let slot: TypeKind = sn_return_slot(sm, @w)
     sn_check(sm, v, slot, @w)
 
 # `e` is the fn's value: its tail, or the tail of a block or match arm in the
@@ -451,5 +455,5 @@ pub fn slot_narrowing_return(sm: *Sema, v: *Expr)
 # reaches it, so the block's `let`s and the arm's bindings are in scope.
 pub fn slot_narrowing_tail(sm: *Sema, e: *Expr)
     var w: SlotWords
-    let slot: i32 = sn_return_slot(sm, @w)
+    let slot: TypeKind = sn_return_slot(sm, @w)
     sn_check(sm, e, slot, @w)

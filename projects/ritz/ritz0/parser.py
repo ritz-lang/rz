@@ -1646,6 +1646,15 @@ class Parser:
         """
         span = self._current().span
         pattern = self.parse_pattern()
+        # An or-pattern, `A | B | C =>` (§8.2, AGAST #4450).  What each
+        # alternative may be depends on the scrutinee, so the emitter judges
+        # them (_refuse_or_alternatives).
+        if self._at(TokenType.PIPE):
+            alternatives = [pattern]
+            while self._at(TokenType.PIPE):
+                self._advance()
+                alternatives.append(self.parse_pattern())
+            pattern = rast.OrPattern(pattern.span, alternatives)
 
         # Match-arm guards (`n if n == 4 => ...`) are not part of the language
         # (docs/LANGUAGE_SPEC.md; ritz1 does not parse them). ritz0 once parsed

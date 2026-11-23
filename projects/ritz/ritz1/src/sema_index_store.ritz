@@ -1,12 +1,12 @@
 # ritz1/src/sema_index_store.ritz - an index store ritz1 can't lower
 #
-# AGAST #3565.  An expression-target index store `x[i] = v` (a STMT_ASSIGN
-# whose target is an EXPR_INDEX) is lowered by one of emit_assign's arms for
-# its base: an array element or `**T` element (base EXPR_INDEX), `(*p)[i]`
-# (EXPR_UNARY), `x.f[i]` (EXPR_MEMBER, which refuses what it can't type
-# itself, #1439), `b.m()[i]` (EXPR_METHOD, #3528), `f()[i]` (EXPR_CALL,
-# #3442), and `(e as *T)[i]`, `(q + k)[i]`, `(p)[i]` (EXPR_CAST, EXPR_BINARY
-# and EXPR_IDENT: emit_ptr_base_index_store).  A target none of them takes
+# AGAST #3565.  An expression-target index store `x[i] = v` (a StmtKind.Assign
+# whose target is an ExprKind.Index) is lowered by one of emit_assign's arms for
+# its base: an array element or `**T` element (base ExprKind.Index), `(*p)[i]`
+# (ExprKind.Unary), `x.f[i]` (ExprKind.Member, which refuses what it can't type
+# itself, #1439), `b.m()[i]` (ExprKind.Method, #3528), `f()[i]` (ExprKind.Call,
+# #3442), and `(e as *T)[i]`, `(q + k)[i]`, `(p)[i]` (ExprKind.Cast, ExprKind.Binary
+# and ExprKind.Ident: emit_ptr_base_index_store).  A target none of them takes
 # reached the generic deref path, which read `x[i]` as a VALUE and stored
 # through it: always a miscompile, most often a SIGSEGV.
 #
@@ -46,39 +46,39 @@ fn isc_global(sm: *Sema, name_sv: StrView) -> *GlobalVarDef
 # 1 when `x`, an index store base's root, is a `**T` or a `*T` whose pointee
 # the emitter can stride by (index_store_root_pointee's roots).
 fn isc_root_ok(sm: *Sema, x: *Expr) -> i32
-    let k: i32 = x.kind
-    if k == EXPR_UNARY
+    let k: ExprKind = x.kind
+    if k == ExprKind.Unary
         return isc_addr_elem_ok(sm, x)
-    if k != EXPR_CAST and k != EXPR_CALL and k != EXPR_MEMBER and k != EXPR_IDENT
+    if k != ExprKind.Cast and k != ExprKind.Call and k != ExprKind.Member and k != ExprKind.Ident
         return 0
     # A call through a local fn pointer: the emitter resolves no FnDef for it.
-    if k == EXPR_CALL and isc_local_call(sm, x) == 1
+    if k == ExprKind.Call and isc_local_call(sm, x) == 1
         return 0
-    if k == EXPR_IDENT and sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) == null
+    if k == ExprKind.Ident and sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) == null
         # A global `*S` keeps S on pointee_type_name, not where Sema reads it.
         let g: *GlobalVarDef = isc_global(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
         if g == null
             return 0
-        if g.var_type == TYPE_PTR_PTR
+        if g.var_type == TypeKind.PtrPtr
             return 1
-        if g.var_type != TYPE_PTR
+        if g.var_type != TypeKind.Ptr
             return 0
         if primitive_name_len(g.pointee_type) > 0
             return 1
         return (g.pointee_type_name_len > 0 and sema_find_struct(sm, StrView { ptr: (g.pointee_type_name), len: (g.pointee_type_name_len) as i64 }) != null) as i32
     var t: SemaTy
-    let kind: i32 = sema_expr_ty(sm, x, @t)
-    if kind == TYPE_PTR_PTR
+    let kind: TypeKind = sema_expr_ty(sm, x, @t)
+    if kind == TypeKind.PtrPtr
         return 1
     # AGAST #3757: `p as @&T` points at T as `p as *T` does.
-    if kind != TYPE_PTR and (k != EXPR_CAST or kind != TYPE_MUT_REF)
+    if kind != TypeKind.Ptr and (k != ExprKind.Cast or kind != TypeKind.MutRef)
         return 0
     if primitive_name_len(t.pointee) > 0
         return 1
     if t.name == null or t.name_len == 0
         return 0
     # A call's `*i32` return names its pointee "i32" (#1984).
-    if primitive_type_from_name(StrView { ptr: (t.name), len: (t.name_len) as i64 }) != 0
+    if primitive_type_from_name(StrView { ptr: (t.name), len: (t.name_len) as i64 }) != TypeKind.Void
         return 1
     (sema_find_struct(sm, StrView { ptr: (t.name), len: (t.name_len) as i64 }) != null) as i32
 
@@ -86,33 +86,33 @@ fn isc_root_ok(sm: *Sema, x: *Expr) -> i32
 # `[N]T` named `a` with a scalar or known-struct element, a subset of
 # addr_elem_root_pointee's roots (which also takes fields and higher ranks).
 fn isc_addr_elem_ok(sm: *Sema, x: *Expr) -> i32
-    if x.op != OP_ADDR or x.operand == null or x.operand.kind != EXPR_INDEX
+    if x.op != OpKind.Addr or x.operand == null or x.operand.kind != ExprKind.Index
         return 0
     let a: *Expr = x.operand.left
-    if a == null or a.kind != EXPR_IDENT
+    if a == null or a.kind != ExprKind.Ident
         return 0
-    if x.operand.right != null and x.operand.right.kind == EXPR_RANGE
+    if x.operand.right != null and x.operand.right.kind == ExprKind.Range
         return 0
-    var elem: i32 = TYPE_VOID
+    var elem: TypeKind = TypeKind.Void
     var name: *u8 = null
     var len: i32 = 0
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 })
     if v != null
-        if v.kind != TYPE_ARRAY
+        if v.kind != TypeKind.Array
             return 0
         elem = v.index_elem
         name = v.type_name
         len = v.type_name_len
     else
         let g: *GlobalVarDef = isc_global(sm, StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 })
-        if g == null or g.var_type != TYPE_ARRAY
+        if g == null or g.var_type != TypeKind.Array
             return 0
         elem = g.array_elem_type
         name = g.array_elem_type_name
         len = g.array_elem_type_name_len
     if primitive_name_len(elem) > 0
         return 1
-    (elem == TYPE_STRUCT and name != null and len > 0 and sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 }) != null) as i32
+    (elem == TypeKind.Struct and name != null and len > 0 and sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 }) != null) as i32
 
 # 1 for a call with no name, or through a local of that name.
 fn isc_local_call(sm: *Sema, e: *Expr) -> i32
@@ -125,14 +125,14 @@ fn isc_local_call(sm: *Sema, e: *Expr) -> i32
 # a pointer (`q - p` is a count).
 fn isc_base_ok(sm: *Sema, x: *Expr) -> i32
     var root: *Expr = x
-    while root.kind == EXPR_BINARY
-        if root.op != OP_ADD and root.op != OP_SUB
+    while root.kind == ExprKind.Binary
+        if root.op != OpKind.Add and root.op != OpKind.Sub
             return 0
-        if root.op == OP_SUB and isc_base_ok(sm, root.right) == 1
+        if root.op == OpKind.Sub and isc_base_ok(sm, root.right) == 1
             return 0
         root = root.left
     # An `as @&T` cast roots no arithmetic (index_store_base_pointee).
-    if root != x and root.kind == EXPR_CAST and root.op == TYPE_MUT_REF
+    if root != x and root.kind == ExprKind.Cast and root.type_kind == TypeKind.MutRef
         return 0
     isc_root_ok(sm, root)
 
@@ -142,20 +142,20 @@ fn isc_base_ok(sm: *Sema, x: *Expr) -> i32
 # fn pointer is one.
 fn isc_scalar_ptr(sm: *Sema, x: *Expr) -> i32
     var t: SemaTy
-    if sema_expr_ty(sm, x, @t) != TYPE_PTR
+    if sema_expr_ty(sm, x, @t) != TypeKind.Ptr
         return 0
     if primitive_name_len(t.pointee) > 0
         return 1
-    (t.name_len > 0 and primitive_type_from_name(StrView { ptr: (t.name), len: (t.name_len) as i64 }) != 0) as i32
+    (t.name_len > 0 and primitive_type_from_name(StrView { ptr: (t.name), len: (t.name_len) as i64 }) != TypeKind.Void) as i32
 
 # Refuse the index store whose target is `target` when no emit_assign arm
 # lowers it.  sema_walk calls this for each expression-target assignment.
 pub fn index_store_check(sm: *Sema, target: *Expr)
-    if target == null or target.kind != EXPR_INDEX or target.left == null
+    if target == null or target.kind != ExprKind.Index or target.left == null
         return
     let base: *Expr = target.left
-    let k: i32 = base.kind
-    if k != EXPR_CAST and k != EXPR_BINARY and k != EXPR_IDENT and k != EXPR_CALL
+    let k: ExprKind = base.kind
+    if k != ExprKind.Cast and k != ExprKind.Binary and k != ExprKind.Ident and k != ExprKind.Call
         return
     if isc_base_ok(sm, base) == 1
         return
@@ -165,7 +165,7 @@ pub fn index_store_check(sm: *Sema, target: *Expr)
         return
     # Pointer arithmetic is no view index_through takes: only
     # emit_ptr_base_index_store stores through it.
-    if k != EXPR_BINARY and isc_scalar_ptr(sm, base) == 0
+    if k != ExprKind.Binary and isc_scalar_ptr(sm, base) == 0
         return
     sema_error_at(sm, target.span.line, target.span.col)
     eprints_cstr(c"can't store through this element: ritz1 stores into `x[i]` here only when `x` is a `*T` or `**T` it can type\n")
@@ -179,7 +179,7 @@ pub fn index_store_check(sm: *Sema, target: *Expr)
 # (`n[a..b]`) is index_through's to refuse.
 
 # Report `[`-located §7.8 words when `kind` is a scalar; 1 if it reported.
-fn isc_scalar_refused(sm: *Sema, kind: i32, line: i32, col: i32) -> i32
+fn isc_scalar_refused(sm: *Sema, kind: TypeKind, line: i32, col: i32) -> i32
     if primitive_name_len(kind) == 0
         return 0
     sema_error_at(sm, line, col)
@@ -188,11 +188,11 @@ fn isc_scalar_refused(sm: *Sema, kind: i32, line: i32, col: i32) -> i32
     eprints_cstr(c"` can't be indexed: it doesn't implement `Index` (§7.8)\n")
     1
 
-# `e`, an EXPR_INDEX read or store target, whose base Sema types as a scalar:
+# `e`, an ExprKind.Index read or store target, whose base Sema types as a scalar:
 # a scalar element too, `x[i][j]` (AGAST #3943).  sema_walk_expr calls this for
 # every index it visits.  1 if it reported.
 pub fn index_scalar_check(sm: *Sema, e: *Expr) -> i32
-    if e.left == null or e.right == null or e.right.kind == EXPR_RANGE
+    if e.left == null or e.right == null or e.right.kind == ExprKind.Range
         return 0
     var line: i32 = e.span.line
     var col: i32 = e.span.col
@@ -201,27 +201,27 @@ pub fn index_scalar_check(sm: *Sema, e: *Expr) -> i32
         col = e.bracket.col
     isc_scalar_refused(sm, sema_expr_type(sm, e.left), line, col)
 
-# `st`, a STMT_INDEX_ASSIGN `n[i] = v` / `n[i] op= v`, whose name Sema types
+# `st`, a StmtKind.IndexAssign `n[i] = v` / `n[i] op= v`, whose name Sema types
 # as a scalar.  Its `[` is st.bracket.
 pub fn index_name_scalar_check(sm: *Sema, st: *Stmt)
     var t: SemaTy
     isc_scalar_refused(sm, sema_name_ty(sm, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 }, @t), st.bracket.line, st.bracket.col)
 
-# AGAST #3799: `s.f[i] = v` / `p.f[i] = v` (STMT_LOCAL_FIELD_INDEX_ASSIGN,
-# receiver st.var_name) and `(*p).f[i] = v` (STMT_MEMBER_INDEX_ASSIGN,
+# AGAST #3799: `s.f[i] = v` / `p.f[i] = v` (StmtKind.LocalFieldIndexAssign,
+# receiver st.var_name) and `(*p).f[i] = v` (StmtKind.MemberIndexAssign,
 # receiver st.if_cond), and their `op=` forms, whose field `f`, st.assign_target,
 # Sema types as a scalar.  st.bracket is where the field name is (#3015); the
 # grammar puts its `[` next, after any blanks on the same line.
 pub fn index_field_scalar_check(sm: *Sema, st: *Stmt)
     var r: SemaTy
-    if st.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN
+    if st.kind == StmtKind.LocalFieldIndexAssign
         sema_name_ty(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, @r)
     else if st.if_cond != null
         sema_expr_ty(sm, st.if_cond, @r)
     else
         return
     var t: SemaTy
-    let kind: i32 = sema_field_ty(sm, @r, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 }, @t)
+    let kind: TypeKind = sema_field_ty(sm, @r, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 }, @t)
     var col: i32 = st.bracket.col + st.assign_target_len
     var c: *u8 = st.assign_target + st.assign_target_len
     while *c == ' ' or *c == 9   # ' ', '\t'

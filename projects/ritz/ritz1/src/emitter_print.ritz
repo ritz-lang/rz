@@ -160,21 +160,23 @@ fn interp_is_view_name(name_sv: StrView) -> i32
 fn interp_strview_kind(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
     *out_name = null
     *out_len = 0
-    if e.kind == EXPR_MEMBER
+    if e.kind == ExprKind.Member
         let fld: *StructField = resolve_member_chain_field(s, e)
         if fld == null or interp_is_view_name(StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 }) == 0
             return 0
         *out_name = fld.field_type_name
         *out_len = fld.field_type_name_len
-        if fld.field_type == TYPE_STRUCT
-            return 1
-        if fld.field_type == TYPE_PTR or fld.field_type == TYPE_REF or fld.field_type == TYPE_MUT_REF
-            return 2
+        match fld.field_type
+            TypeKind.Struct =>
+                return 1
+            TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
+                return 2
+            _ => pass
         return 0
-    if e.kind == EXPR_IDENT
+    if e.kind == ExprKind.Ident
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if loc != null and interp_is_view_name(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
-            if lv_var_type(loc) == TYPE_PTR or lv_var_type(loc) == TYPE_REF or lv_var_type(loc) == TYPE_MUT_REF
+            if lv_var_type(loc) == TypeKind.Ptr or lv_var_type(loc) == TypeKind.Ref or lv_var_type(loc) == TypeKind.MutRef
                 *out_name = lv_type_name(loc)
                 *out_len = lv_type_name_len(loc)
                 return 2
@@ -269,15 +271,15 @@ fn fmt_ident_expr(name_sv: StrView, span: SrcSpan) -> *Expr
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     let e: *Expr = fmt_expr_zero()
-    e.kind = EXPR_IDENT
+    e.kind = ExprKind.Ident
     e.ident_ptr = name
     e.ident_len = name_len
     e.span = span
     e
 
-fn fmt_unary_expr(op: i32, operand: *Expr, span: SrcSpan) -> *Expr
+fn fmt_unary_expr(op: OpKind, operand: *Expr, span: SrcSpan) -> *Expr
     let e: *Expr = fmt_expr_zero()
-    e.kind = EXPR_UNARY
+    e.kind = ExprKind.Unary
     e.op = op
     e.operand = operand
     e.span = span
@@ -287,7 +289,7 @@ fn fmt_member_expr(base: *Expr, name_sv: StrView, span: SrcSpan) -> *Expr
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     let e: *Expr = fmt_expr_zero()
-    e.kind = EXPR_MEMBER
+    e.kind = ExprKind.Member
     e.left = base
     e.ident_ptr = name
     e.ident_len = name_len
@@ -298,7 +300,7 @@ fn fmt_method_expr(recv: *Expr, name_sv: StrView, args: *Expr, span: SrcSpan) ->
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     let e: *Expr = fmt_expr_zero()
-    e.kind = EXPR_METHOD
+    e.kind = ExprKind.Method
     e.left = recv
     e.ident_ptr = name
     e.ident_len = name_len
@@ -333,16 +335,16 @@ fn fmt_parse(s: *EmitterState, text_sv: StrView, line: i32, col: i32) -> *Expr
 # The Ritz type of `e`'s value and the name a Display/Debug impl for it would
 # be registered under (null when none is derivable).
 struct FmtType
-    kind: i32
+    kind: TypeKind
     name: *u8
     name_len: i32
     is_bool: i32
-    pointee: i32
+    pointee: TypeKind
 
 # The dispatch name of a reference's referent, when it is a primitive or
 # `*u8` (`{r}` prints what r refers to, as ritz0 reads a RefType).
-fn fmt_pointee_name(kind: i32, inner: i32, out: *FmtType)
-    if kind == TYPE_PTR and inner == TYPE_U8
+fn fmt_pointee_name(kind: TypeKind, inner: i32, out: *FmtType)
+    if kind == TypeKind.Ptr and inner == (TypeKind.U8 as i32)
         out.name = c"ptr_u8"
         out.name_len = 6
         return
@@ -352,55 +354,59 @@ fn fmt_pointee_name(kind: i32, inner: i32, out: *FmtType)
         out.name_len = primitive_name_len(kind)
 
 fn fmt_type_of(s: *EmitterState, e: *Expr, out: *FmtType)
-    out.kind = TYPE_I64
+    out.kind = TypeKind.I64
     out.name = null
     out.name_len = 0
     out.is_bool = 0
-    out.pointee = TYPE_I64
+    out.pointee = TypeKind.I64
     if e == null
         return
     # A bool lives in an i64 slot (AGAST #1521), so get_expr_type alone
     # cannot tell it apart from an i64.
     if interp_is_bool(s, e) == 1
-        out.kind = TYPE_I64
+        out.kind = TypeKind.I64
         out.name = c"bool"
         out.name_len = 4
         out.is_bool = 1
         return
-    let t: i32 = expr_slot_ty(e)
-    if t == TYPE_REF or t == TYPE_MUT_REF
-        out.kind = t
-        if e.kind == EXPR_IDENT
-            let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-            if loc != null
-                if lv_type_name_len(loc) > 0
-                    out.name = lv_type_name(loc)
-                    out.name_len = lv_type_name_len(loc)
-                else
-                    fmt_pointee_name(lv_pointee_type(loc), lv_inner_pointee_type(loc), out)
-        else if e.kind == EXPR_CALL
-            let fd: *FnDef = find_call_fn(s, e)
-            if fd != null and fd.return_type_name_len > 0
-                out.name = fd.return_type_name
-                out.name_len = fd.return_type_name_len
-        else if e.kind == EXPR_METHOD
-            let md: *FnDef = method_call_def(s, e)
-            if md != null and md.return_type_name_len > 0
-                out.name = md.return_type_name
-                out.name_len = md.return_type_name_len
-        return
-    if t == TYPE_PTR or t == TYPE_PTR_PTR
-        out.kind = t
-        if e.kind == EXPR_CSTRING_LIT
-            out.name = c"ptr_u8"
-            out.name_len = 6
+    let t: TypeKind = expr_slot_ty(e)
+    match t
+        TypeKind.Ref | TypeKind.MutRef =>
+            out.kind = t
+            match e.kind
+                ExprKind.Ident =>
+                    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                    if loc != null
+                        if lv_type_name_len(loc) > 0
+                            out.name = lv_type_name(loc)
+                            out.name_len = lv_type_name_len(loc)
+                        else
+                            fmt_pointee_name(lv_pointee_type(loc), lv_inner_pointee_type(loc), out)
+                ExprKind.Call =>
+                    let fd: *FnDef = find_call_fn(s, e)
+                    if fd != null and fd.return_type_name_len > 0
+                        out.name = fd.return_type_name
+                        out.name_len = fd.return_type_name_len
+                ExprKind.Method =>
+                    let md: *FnDef = method_call_def(s, e)
+                    if md != null and md.return_type_name_len > 0
+                        out.name = md.return_type_name
+                        out.name_len = md.return_type_name_len
+                _ => pass
             return
-        let pt: i32 = get_deref_store_type(s, e)
-        out.pointee = pt
-        if pt == TYPE_U8
-            out.name = c"ptr_u8"
-            out.name_len = 6
-        return
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            out.kind = t
+            if e.kind == ExprKind.CstringLit
+                out.name = c"ptr_u8"
+                out.name_len = 6
+                return
+            let pt: TypeKind = get_deref_store_type(s, e)
+            out.pointee = pt
+            if pt == TypeKind.U8
+                out.name = c"ptr_u8"
+                out.name_len = 6
+            return
+        _ => pass
     out.kind = t
     var n: *u8 = null
     var l: i32 = 0
@@ -414,22 +420,24 @@ fn fmt_type_of(s: *EmitterState, e: *Expr, out: *FmtType)
     if n != null and l > 0
         out.name = n
         out.name_len = l
-        if out.kind != TYPE_STRUCT
-            out.kind = TYPE_STRUCT
+        if out.kind != TypeKind.Struct
+            out.kind = TypeKind.Struct
         return
-    if t == TYPE_STRUCT
-        if e.kind == EXPR_IDENT
-            let loc2: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-            if loc2 != null and lv_type_name_len(loc2) > 0
-                out.name = lv_type_name(loc2)
-                out.name_len = lv_type_name_len(loc2)
-        else if e.kind == EXPR_MEMBER
-            # resolve_expr_struct_name has no member arm; the field's declared
-            # type names it (`{o.inner}`, `{s.f.g}`).
-            let fld: *StructField = resolve_member_chain_field(s, e)
-            if fld != null and fld.field_type_name_len > 0
-                out.name = fld.field_type_name
-                out.name_len = fld.field_type_name_len
+    if t == TypeKind.Struct
+        match e.kind
+            ExprKind.Ident =>
+                let loc2: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                if loc2 != null and lv_type_name_len(loc2) > 0
+                    out.name = lv_type_name(loc2)
+                    out.name_len = lv_type_name_len(loc2)
+            ExprKind.Member =>
+                # resolve_expr_struct_name has no member arm; the field's declared
+                # type names it (`{o.inner}`, `{s.f.g}`).
+                let fld: *StructField = resolve_member_chain_field(s, e)
+                if fld != null and fld.field_type_name_len > 0
+                    out.name = fld.field_type_name
+                    out.name_len = fld.field_type_name_len
+            _ => pass
         return
     let pn: *u8 = primitive_name_from_type(t)
     if pn != null
@@ -535,66 +543,68 @@ fn fmt_materialize(s: *EmitterState, e: *Expr, ft: *FmtType, span: SrcSpan) -> *
     let name: *u8 = fmt_name(StrView { ptr: (c"tmp"), len: (3) as i64 }, @nlen)
     let v: i32 = emit_expr(s, e)
     let slot: i32 = next_reg(s)
-    if ft.kind == TYPE_STRUCT
-        entry_alloca_reg_begin_named(s, slot)
-        emit_name(s, StrView { ptr: (ft.name), len: (ft.name_len) as i64 })
-        emit_str(s, c"  ; print receiver\n")
-        entry_alloca_reg_end(s)
-        emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (ft.name), len: (ft.name_len) as i64 }, v, slot)
-        add_local_struct(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, TYPE_STRUCT, StrView { ptr: (ft.name), len: (ft.name_len) as i64 })
-    else if ft.kind == TYPE_MUT_REF
-        entry_alloca_reg(s, slot, c"ptr", c"print receiver (mut ref)")
-        emit_store_typed(s, IR_TY_PTR, v, slot)
-        let pt: i32 = ty_from_name(StrView { ptr: (ft.name), len: (ft.name_len) as i64 })
-        add_local_full(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, TYPE_MUT_REF, StrView { ptr: (ft.name), len: (ft.name_len) as i64 }, pt, 0, 0)
-    else if ft.kind == TYPE_REF or ft.kind == TYPE_PTR or ft.kind == TYPE_PTR_PTR
-        entry_alloca_reg(s, slot, c"i64", c"print receiver (ref/ptr)")
-        emit_store_typed(s, IR_TY_I64, v, slot)
-        var pt2: i32 = ty_from_name(StrView { ptr: (ft.name), len: (ft.name_len) as i64 })
-        if ft.kind == TYPE_PTR or ft.kind == TYPE_PTR_PTR
-            pt2 = ft.pointee
-        else if pt2 == TYPE_VOID
-            pt2 = ft.pointee
-        add_local_full(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, ft.kind, StrView { ptr: (ft.name), len: (ft.name_len) as i64 }, pt2, 0, 0)
-    else if ft.kind == TYPE_F32 or ft.kind == TYPE_F64
-        entry_alloca_reg_begin(s, slot)
-        emit_str(s, ty_mem_llvm(ft.kind))
-        emit_str(s, c"  ; print receiver (float)\n")
-        entry_alloca_reg_end(s)
-        emit_str(s, IR_STORE_IND)
-        emit_str(s, ty_mem_llvm(ft.kind))
-        emit_str(s, IR_SP)
-        emit_reg(s, v)
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, slot)
-        emit_str(s, IR_NL)
-        add_local(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, ft.kind)
-    else if ty_int_bits(ft.kind) > 0 and ty_int_bits(ft.kind) < 64
-        let mem: *u8 = ty_mem_llvm(ft.kind)
-        let t: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, t)
-        emit_str(s, IR_TRUNC)
-        emit_reg(s, v)
-        emit_str(s, IR_TO_SP)
-        emit_str(s, mem)
-        emit_str(s, IR_NL)
-        entry_alloca_reg_begin(s, slot)
-        emit_str(s, mem)
-        emit_str(s, c"  ; print receiver (narrow int)\n")
-        entry_alloca_reg_end(s)
-        emit_str(s, IR_STORE_IND)
-        emit_str(s, mem)
-        emit_str(s, IR_SP)
-        emit_reg(s, t)
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, slot)
-        emit_str(s, IR_NL)
-        add_local(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, ft.kind)
-    else
-        entry_alloca_reg(s, slot, c"i64", c"print receiver")
-        emit_store_typed(s, IR_TY_I64, v, slot)
-        add_local(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, ft.kind)
+    match ft.kind
+        TypeKind.Struct =>
+            entry_alloca_reg_begin_named(s, slot)
+            emit_name(s, StrView { ptr: (ft.name), len: (ft.name_len) as i64 })
+            emit_str(s, c"  ; print receiver\n")
+            entry_alloca_reg_end(s)
+            emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (ft.name), len: (ft.name_len) as i64 }, v, slot)
+            add_local_struct(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, TypeKind.Struct, StrView { ptr: (ft.name), len: (ft.name_len) as i64 })
+        TypeKind.MutRef =>
+            entry_alloca_reg(s, slot, c"ptr", c"print receiver (mut ref)")
+            emit_store_typed(s, IR_TY_PTR, v, slot)
+            let pt: TypeKind = ty_from_name(StrView { ptr: (ft.name), len: (ft.name_len) as i64 })
+            add_local_full(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, TypeKind.MutRef, StrView { ptr: (ft.name), len: (ft.name_len) as i64 }, pt, 0, TypeKind.Void)
+        TypeKind.Ref | TypeKind.Ptr | TypeKind.PtrPtr =>
+            entry_alloca_reg(s, slot, c"i64", c"print receiver (ref/ptr)")
+            emit_store_typed(s, IR_TY_I64, v, slot)
+            var pt2: TypeKind = ty_from_name(StrView { ptr: (ft.name), len: (ft.name_len) as i64 })
+            if ft.kind == TypeKind.Ptr or ft.kind == TypeKind.PtrPtr
+                pt2 = ft.pointee
+            else if pt2 == TypeKind.Void
+                pt2 = ft.pointee
+            add_local_full(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, ft.kind, StrView { ptr: (ft.name), len: (ft.name_len) as i64 }, pt2, 0, TypeKind.Void)
+        TypeKind.F32 | TypeKind.F64 =>
+            entry_alloca_reg_begin(s, slot)
+            emit_str(s, ty_mem_llvm(ft.kind))
+            emit_str(s, c"  ; print receiver (float)\n")
+            entry_alloca_reg_end(s)
+            emit_str(s, IR_STORE_IND)
+            emit_str(s, ty_mem_llvm(ft.kind))
+            emit_str(s, IR_SP)
+            emit_reg(s, v)
+            emit_str(s, IR_PTR_SEP)
+            emit_reg(s, slot)
+            emit_str(s, IR_NL)
+            add_local(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, ft.kind)
+        _ =>
+            if ty_int_bits(ft.kind) > 0 and ty_int_bits(ft.kind) < 64
+                let mem: *u8 = ty_mem_llvm(ft.kind)
+                let t: i32 = next_reg(s)
+                emit_str(s, IR_INDENT)
+                emit_reg(s, t)
+                emit_str(s, IR_TRUNC)
+                emit_reg(s, v)
+                emit_str(s, IR_TO_SP)
+                emit_str(s, mem)
+                emit_str(s, IR_NL)
+                entry_alloca_reg_begin(s, slot)
+                emit_str(s, mem)
+                emit_str(s, c"  ; print receiver (narrow int)\n")
+                entry_alloca_reg_end(s)
+                emit_str(s, IR_STORE_IND)
+                emit_str(s, mem)
+                emit_str(s, IR_SP)
+                emit_reg(s, t)
+                emit_str(s, IR_PTR_SEP)
+                emit_reg(s, slot)
+                emit_str(s, IR_NL)
+                add_local(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, ft.kind)
+            else
+                entry_alloca_reg(s, slot, c"i64", c"print receiver")
+                emit_store_typed(s, IR_TY_I64, v, slot)
+                add_local(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, ft.kind)
     if ft.is_bool == 1
         let bl: *LocalVar = find_local_struct_name(s, StrView { ptr: (name), len: (nlen) as i64 })
         if bl != null
@@ -713,9 +723,9 @@ fn fmt_make_fd_writer(s: *EmitterState, sink: *PrintSink, span: SrcSpan) -> i32
     sink.ilen = ilen
     var nlen: i32 = 0
     let name: *u8 = fmt_name(StrView { ptr: (c"writer"), len: (6) as i64 }, @nlen)
-    add_local_struct(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, TYPE_STRUCT, StrView { ptr: (FMT_WRITER_NAME), len: (FMT_WRITER_NAME_LEN) as i64 })
+    add_local_struct(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, TypeKind.Struct, StrView { ptr: (FMT_WRITER_NAME), len: (FMT_WRITER_NAME_LEN) as i64 })
     sink.wptr = slot
-    sink.arg = fmt_unary_expr(OP_ADDR_MUT, fmt_ident_expr(StrView { ptr: (name), len: (nlen) as i64 }, span), span)
+    sink.arg = fmt_unary_expr(OpKind.AddrMut, fmt_ident_expr(StrView { ptr: (name), len: (nlen) as i64 }, span), span)
     1
 
 # Evaluate the Writer expression write/writeln names, once, into a hidden
@@ -727,21 +737,21 @@ fn fmt_explicit_writer(s: *EmitterState, writer_expr: *Expr, sink: *PrintSink, s
     let st: *StructDef = fmt_writer_shape(s, span, @isink, @ifd, @ilen)
     if st == null
         return 0
-    let t: i32 = expr_slot_ty(writer_expr)
-    if t != TYPE_MUT_REF and t != TYPE_REF and t != TYPE_PTR and t != TYPE_PTR_PTR
+    let t: TypeKind = expr_slot_ty(writer_expr)
+    if t != TypeKind.MutRef and t != TypeKind.Ref and t != TypeKind.Ptr and t != TypeKind.PtrPtr
         fmt_error_at(s, span, c"write/writeln needs a Writer as its first argument (`write(@&w, \"...\")`)")
         return 0
     let v: i32 = emit_expr(s, writer_expr)
     let slot: i32 = next_reg(s)
     entry_alloca_reg(s, slot, c"ptr", c"write/writeln Writer")
-    if t == TYPE_MUT_REF
+    if t == TypeKind.MutRef
         emit_store_typed(s, IR_TY_PTR, v, slot)
     else
         let wp: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, v)
         emit_store_typed(s, IR_TY_PTR, wp, slot)
     var nlen: i32 = 0
     let name: *u8 = fmt_name(StrView { ptr: (c"wptr"), len: (4) as i64 }, @nlen)
-    add_local_struct(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, TYPE_MUT_REF, StrView { ptr: (FMT_WRITER_NAME), len: (FMT_WRITER_NAME_LEN) as i64 })
+    add_local_struct(s, StrView { ptr: (name), len: (nlen) as i64 }, slot, TypeKind.MutRef, StrView { ptr: (FMT_WRITER_NAME), len: (FMT_WRITER_NAME_LEN) as i64 })
     sink.kind = 1
     sink.wptr = slot
     sink.isink = isink
@@ -987,10 +997,10 @@ fn fmt_intrinsic_display(s: *EmitterState, sink: *PrintSink, e: *Expr, ft: *FmtT
         let p2: i32 = emit_fmt_int(s, e, ft.kind, @n2)
         if p2 >= 0
             return fmt_sink_write_ptr(s, sink, p2, n2)
-    if ft.kind == TYPE_PTR or ft.kind == TYPE_PTR_PTR or ft.kind == TYPE_REF or ft.kind == TYPE_MUT_REF
+    if ft.kind == TypeKind.Ptr or ft.kind == TypeKind.PtrPtr or ft.kind == TypeKind.Ref or ft.kind == TypeKind.MutRef
         let v: i32 = emit_expr(s, e)
         var vi: i32 = v
-        if ft.kind == TYPE_MUT_REF
+        if ft.kind == TypeKind.MutRef
             vi = next_reg(s)
             emit_str(s, IR_INDENT)
             emit_reg(s, vi)
@@ -1040,7 +1050,7 @@ fn fmt_debug_of(s: *EmitterState, e: *Expr, ft: *FmtType, sink: *PrintSink, span
             if w == null
                 return 0
             return emit_expr_method(s, fmt_method_expr(id, StrView { ptr: (c"show_debug"), len: (10) as i64 }, w, span))
-    if ft.kind == TYPE_STRUCT and ft.name != null and ft.name_len > 0
+    if ft.kind == TypeKind.Struct and ft.name != null and ft.name_len > 0
         if fmt_is_builtin_target(StrView { ptr: (ft.name), len: (ft.name_len) as i64 }) == 0
             let st: *StructDef = find_struct(s, StrView { ptr: (ft.name), len: (ft.name_len) as i64 })
             if st != null
@@ -1080,30 +1090,32 @@ fn fmt_field_type(f: *StructField, out: *FmtType)
     out.name = null
     out.name_len = 0
     out.is_bool = 0
-    out.pointee = TYPE_I64
-    if f.field_type == TYPE_STRUCT and f.field_type_name_len > 0
+    out.pointee = TypeKind.I64
+    if f.field_type == TypeKind.Struct and f.field_type_name_len > 0
         out.name = f.field_type_name
         out.name_len = f.field_type_name_len
         return
-    if f.field_type == TYPE_BOOL
-        out.kind = TYPE_I64
-        out.is_bool = 1
-        out.name = c"bool"
-        out.name_len = 4
-        return
-    if f.field_type == TYPE_PTR or f.field_type == TYPE_PTR_PTR
-        out.pointee = f.array_elem_type
-        if f.array_elem_type == TYPE_U8 or f.ptr_pointee == TYPE_U8
-            out.name = c"ptr_u8"
-            out.name_len = 6
-        return
-    if f.field_type == TYPE_REF or f.field_type == TYPE_MUT_REF
-        if f.field_type_name_len > 0
-            out.name = f.field_type_name
-            out.name_len = f.field_type_name_len
-        else
-            fmt_pointee_name(f.ptr_pointee, f.inner_pointee_type, out)
-        return
+    match f.field_type
+        TypeKind.Bool =>
+            out.kind = TypeKind.I64
+            out.is_bool = 1
+            out.name = c"bool"
+            out.name_len = 4
+            return
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            out.pointee = f.array_elem_type
+            if f.array_elem_type == TypeKind.U8 or f.ptr_pointee == TypeKind.U8
+                out.name = c"ptr_u8"
+                out.name_len = 6
+            return
+        TypeKind.Ref | TypeKind.MutRef =>
+            if f.field_type_name_len > 0
+                out.name = f.field_type_name
+                out.name_len = f.field_type_name_len
+            else
+                fmt_pointee_name(f.ptr_pointee, f.inner_pointee_type, out)
+            return
+        _ => pass
     let pn: *u8 = primitive_name_from_type(f.field_type)
     if pn != null
         out.name = pn
@@ -1143,7 +1155,7 @@ fn fmt_print_value(s: *EmitterState, sink: *PrintSink, lit: *Expr, e: *Expr, spe
 # shape (the write when there is no placeholder, else 0).
 fn emit_interp_print(s: *EmitterState, sink: *PrintSink, lit: *Expr, newline: i32, want_total: i32) -> i32
     var total: i32 = 0
-    if lit.kind == EXPR_CSTRING_LIT
+    if lit.kind == ExprKind.CstringLit
         if interp_cstr_has_placeholder(StrView { ptr: (lit.string_ptr), len: (lit.string_len) as i64 }) == 1
             emit_print_error(s, lit, c"`c\"...\"` literals do not interpolate: the placeholder would be printed verbatim. Use a plain string literal `\"...\"` here, or `{{` to print a literal brace")
             return emit_print_zero(s)
@@ -1256,7 +1268,7 @@ fn emit_interp_bytes(s: *EmitterState, fd: i64, k: *FmtSink, data_sv: StrView) -
 # print's literal splitting, for print / eprint (k == null: write to fd) and
 # format_into (append each piece to the sink k).
 fn emit_interp_literal(s: *EmitterState, fd: i64, k: *FmtSink, lit: *Expr) -> i32
-    if lit.kind == EXPR_CSTRING_LIT
+    if lit.kind == ExprKind.CstringLit
         if interp_cstr_has_placeholder(StrView { ptr: (lit.string_ptr), len: (lit.string_len) as i64 }) == 1
             # #1374/#1394: c"..." does not interpolate, so this would print
             # the placeholder verbatim. Reject it, as ritz0 does.
@@ -1498,11 +1510,13 @@ fn assert_write_own_loc(s: *EmitterState, line: i32)
 
 # How a failing assert prints an operand of type expr_slot_ty(e); -1: not.
 fn assert_operand_kind(s: *EmitterState, e: *Expr) -> i32
-    let t: i32 = expr_slot_ty(e)
-    if t == TYPE_BOOL
-        return ASSERT_V_BOOL
-    if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF
-        return ASSERT_V_PTR
+    let t: TypeKind = expr_slot_ty(e)
+    match t
+        TypeKind.Bool =>
+            return ASSERT_V_BOOL
+        TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
+            return ASSERT_V_PTR
+        _ => pass
     if ty_is_unsigned(t) == 1
         return ASSERT_V_UNSIGNED
     if ty_is_signed(t) == 1
@@ -1516,17 +1530,19 @@ fn assert_fn_name_len(f: *FnDef) -> i32
         n += 1
     n
 
-fn assert_op_text(op: i32) -> *u8
-    if op == OP_EQ
-        return c"=="
-    if op == OP_NE
-        return c"!="
-    if op == OP_LT
-        return c"<"
-    if op == OP_GT
-        return c">"
-    if op == OP_LE
-        return c"<="
+fn assert_op_text(op: OpKind) -> *u8
+    match op
+        OpKind.Eq =>
+            return c"=="
+        OpKind.Ne =>
+            return c"!="
+        OpKind.Lt =>
+            return c"<"
+        OpKind.Gt =>
+            return c">"
+        OpKind.Le =>
+            return c"<="
+        _ => pass
     c">="
 
 # In a [[test]] fn, note the location of the call `e` before it is made.  A
@@ -1575,7 +1591,7 @@ pub fn emit_assert_stmt(s: *EmitterState, stmt: *Stmt)
     var is_cmp: bool = false
     var lk: i32 = -1
     var rk: i32 = -1
-    if c.kind == EXPR_BINARY and c.op >= OP_EQ and c.op <= OP_GE
+    if c.kind == ExprKind.Binary and op_is_comparison(c.op)
         is_cmp = true
         lk = assert_operand_kind(s, c.left)
         rk = assert_operand_kind(s, c.right)
@@ -1594,7 +1610,7 @@ pub fn emit_assert_stmt(s: *EmitterState, stmt: *Stmt)
         show = 1
     let cap_l: i32 = s.assert_cap_l
     let cap_r: i32 = s.assert_cap_r
-    # Narrowed to i1 for the `br`, as STMT_IF does (AGAST #1646).
+    # Narrowed to i1 for the `br`, as StmtKind.If does (AGAST #1646).
     let a_cond_i1: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, a_cond_i1)
@@ -1808,8 +1824,8 @@ fn fmt_error(s: *EmitterState, at: *Expr, name_sv: StrView, msg: *u8)
     eprints_cstr(c"\n")
     s.error_count = s.error_count + 1
 
-fn fmt_is_ptr_type(t: i32) -> i32
-    if t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF
+fn fmt_is_ptr_type(t: TypeKind) -> i32
+    if t == TypeKind.Ptr or t == TypeKind.Ref or t == TypeKind.MutRef
         return 1
     0
 
@@ -1821,23 +1837,25 @@ fn fmt_sink_struct(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
     if named != null
         return named
     *out_len = 0
-    if e.kind == EXPR_MEMBER
-        let f: *StructField = member_field_def(s, e)
-        if f != null and fmt_is_ptr_type(f.field_type) == 1 and f.field_type_name_len > 0
-            *out_len = f.field_type_name_len
-            return f.field_type_name
-    else if e.kind == EXPR_CALL
-        let fd: *FnDef = find_call_fn(s, e)
-        if fd != null and fmt_is_ptr_type(fd.return_type) == 1 and fd.return_type_name_len > 0
-            *out_len = fd.return_type_name_len
-            return fd.return_type_name
+    match e.kind
+        ExprKind.Member =>
+            let f: *StructField = member_field_def(s, e)
+            if f != null and fmt_is_ptr_type(f.field_type) == 1 and f.field_type_name_len > 0
+                *out_len = f.field_type_name_len
+                return f.field_type_name
+        ExprKind.Call =>
+            let fd: *FnDef = find_call_fn(s, e)
+            if fd != null and fmt_is_ptr_type(fd.return_type) == 1 and fd.return_type_name_len > 0
+                *out_len = fd.return_type_name_len
+                return fd.return_type_name
+        _ => pass
     null
 
 # Is the sink expression a struct value (not a pointer to one)?
 fn fmt_sink_is_value(s: *EmitterState, e: *Expr) -> i32
-    if e.kind == EXPR_IDENT
+    if e.kind == ExprKind.Ident
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if loc != null and lv_var_type(loc) == TYPE_STRUCT
+        if loc != null and lv_var_type(loc) == TypeKind.Struct
             return 1
     var n: *u8 = null
     var l: i32 = 0
@@ -1848,8 +1866,8 @@ fn fmt_sink_is_value(s: *EmitterState, e: *Expr) -> i32
 
 # The `ret` type push_bytes is called with.
 fn fmt_emit_ret_type(s: *EmitterState, fd: *FnDef)
-    let rt: i32 = fd.return_type
-    if rt == TYPE_BOOL
+    let rt: TypeKind = fd.return_type
+    if rt == TypeKind.Bool
         emit_str(s, c"i1")
     else if ty_int_bits(rt) == 32
         emit_str(s, c"i32")
@@ -1857,8 +1875,8 @@ fn fmt_emit_ret_type(s: *EmitterState, fd: *FnDef)
         emit_str(s, c"i16")
     else if ty_int_bits(rt) == 8
         emit_str(s, c"i8")
-    else if rt == TYPE_STRUCT and fd.return_type_name_len > 0
-        emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
+    else if rt == TypeKind.Struct and fd.return_type_name_len > 0
+        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
     else
         emit_str(s, c"i64")
 
@@ -1881,7 +1899,7 @@ fn fmt_sink_is_raw(fd: *FnDef) -> i32
     let last: *Param = fd.params.next.next
     if last == null or last.next != null
         return 0
-    return (last.param_type == TYPE_I64) as i32
+    return (last.param_type == TypeKind.I64) as i32
 
 # push_bytes(sink, Span<u8> { ptr: data, len }). `data` is a `ptr` register;
 # the length is the register len_reg when it is > 0, else the constant len_imm.
@@ -1908,7 +1926,7 @@ fn fmt_push_span(s: *EmitterState, k: *FmtSink, data: i32, len_reg: i32, len_imm
     else
         emit_int(s, len_imm)
     emit_str(s, IR_COMMA_1)
-    if k.fn_def.return_type == TYPE_VOID
+    if k.fn_def.return_type == TypeKind.Void
         emit_str(s, c"  call void @")
     else
         let r: i32 = next_reg(s)
@@ -1936,7 +1954,7 @@ fn fmt_push(s: *EmitterState, k: *FmtSink, data: i32, len_reg: i32, len_imm: i64
     let p2: *Param = k.fn_def.params.next
     let p3: *Param = p2.next
     var d: i32 = data
-    if p2.param_type != TYPE_MUT_REF
+    if p2.param_type != TypeKind.MutRef
         # A `*u8` param is an i64 in ritz1's signatures.
         d = next_reg(s)
         emit_str(s, IR_INDENT)
@@ -1944,7 +1962,7 @@ fn fmt_push(s: *EmitterState, k: *FmtSink, data: i32, len_reg: i32, len_imm: i64
         emit_str(s, c" = ptrtoint ptr ")
         emit_reg(s, data)
         emit_str(s, IR_TO_I64)
-    if k.fn_def.return_type == TYPE_VOID
+    if k.fn_def.return_type == TypeKind.Void
         emit_str(s, c"  call void @")
     else
         let r: i32 = next_reg(s)
@@ -1993,25 +2011,27 @@ fn fmt_push_const(s: *EmitterState, k: *FmtSink, data_sv: StrView)
 # not an integer type. Signedness comes from the Ritz type: an unsigned
 # value is zero-extended and divided unsigned (AGAST #2128). print, eprint
 # and format_into all format integers here.
-fn emit_fmt_int(s: *EmitterState, e: *Expr, ty: i32, out_len: *i32) -> i32
+fn emit_fmt_int(s: *EmitterState, e: *Expr, ty: TypeKind, out_len: *i32) -> i32
     var narrow: *u8 = null
     var is_int: bool = true
     var signed: i32 = 1
-    if ty == TYPE_I64
-        narrow = null
-    else if ty == TYPE_U64
-        signed = 0
-    else if ty_int_bits(ty) == 32
-        narrow = c"i32"
-        signed = (ty == TYPE_I32) as i32
-    else if ty_int_bits(ty) == 16
-        narrow = c"i16"
-        signed = (ty == TYPE_I16) as i32
-    else if ty_int_bits(ty) == 8
-        narrow = c"i8"
-        signed = (ty == TYPE_I8) as i32
-    else
-        is_int = false
+    match ty
+        TypeKind.I64 =>
+            narrow = null
+        TypeKind.U64 =>
+            signed = 0
+        _ =>
+            if ty_int_bits(ty) == 32
+                narrow = c"i32"
+                signed = (ty == TypeKind.I32) as i32
+            else if ty_int_bits(ty) == 16
+                narrow = c"i16"
+                signed = (ty == TypeKind.I16) as i32
+            else if ty_int_bits(ty) == 8
+                narrow = c"i8"
+                signed = (ty == TypeKind.I8) as i32
+            else
+                is_int = false
     if not is_int
         return -1
     var v: i32 = emit_expr(s, e)
@@ -2104,7 +2124,7 @@ fn fmt_push_value(s: *EmitterState, k: *FmtSink, lit: *Expr, e: *Expr) -> i32
         fmt_push(s, k, ptr, len, 0)
         return 1
 
-    let ty: i32 = expr_slot_ty(e)
+    let ty: TypeKind = expr_slot_ty(e)
     if interp_is_bool(s, e) == 1
         let v: i32 = emit_expr(s, e)
         let b: i32 = next_reg(s)
@@ -2135,7 +2155,7 @@ fn fmt_push_value(s: *EmitterState, k: *FmtSink, lit: *Expr, e: *Expr) -> i32
         fmt_push(s, k, p, n, 0)
         return 1
 
-    if ty == TYPE_PTR or ty == TYPE_PTR_PTR or ty == TYPE_REF or ty == TYPE_MUT_REF
+    if ty == TypeKind.Ptr or ty == TypeKind.PtrPtr or ty == TypeKind.Ref or ty == TypeKind.MutRef
         let v: i32 = emit_expr(s, e)
         let sp: i32 = i64_value_to_ptr(s, e, v)
         let sn: i32 = next_reg(s)
@@ -2160,7 +2180,7 @@ pub fn emit_format_into(s: *EmitterState, e: *Expr) -> i32
     if lit == null or lit.next != null
         fmt_error(s, e, StrView { ptr: (null), len: (0) as i64 }, c"format_into(sink, \"...\") takes two arguments: a pointer to the buffer and a string literal")
         return emit_print_zero(s)
-    if lit.kind != EXPR_STRING_LIT and lit.kind != EXPR_CSTRING_LIT
+    if lit.kind != ExprKind.StringLit and lit.kind != ExprKind.CstringLit
         fmt_error(s, e, StrView { ptr: (null), len: (0) as i64 }, c"format_into's second argument must be a string literal: its placeholders are resolved at compile time")
         return emit_print_zero(s)
     if fmt_sink_is_value(s, sink) == 1

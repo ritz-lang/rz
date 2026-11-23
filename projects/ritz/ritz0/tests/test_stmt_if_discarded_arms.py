@@ -68,6 +68,19 @@ fn run(flag: i32, out: @&i32)
         mk(out)
 """
 
+# AGAST #4450: the tail else ends in a statement match, which has no value.
+MATCH = """\
+fn run(flag: i32, out: @&i32)
+    if flag == 1
+        side(out)
+    else
+        match flag
+            0 =>
+                var k: i32 = 10
+                *out = *out + k
+            _ => pass
+"""
+
 # The if/else is a statement in a fn that returns a value.
 VALUED = """\
 fn run(flag: i32, out: @&i32) -> i32
@@ -90,6 +103,7 @@ ROWS = {
     "tail": (TAIL, 11),
     "mid": (MID, 211),
     "nested": (NESTED, 11),
+    "match": (MATCH, 11),
     "valued": (VALUED, 11),
 }
 

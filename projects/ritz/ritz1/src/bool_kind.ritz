@@ -50,19 +50,21 @@ pub fn bk_element(s: *EmitterState, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     # AGAST #2440: through a pointer or reference, the buffer's element.
-    let through: i32 = through_named_elem(s, StrView { ptr: (name), len: (len) as i64 })
-    if through != TYPE_VOID
+    let through: TypeKind = through_named_elem(s, StrView { ptr: (name), len: (len) as i64 })
+    if through != TypeKind.Void
         return bk_of_type(through, StrView { ptr: (null), len: (0) as i64 })
     let idx: i32 = find_local_idx(s, StrView { ptr: (name), len: (len) as i64 })
     if idx >= 0
         let loc: *LocalVar = local_at(s, idx)
-        if lv_var_type(loc) == TYPE_ARRAY
-            return bk_of_type(lv_array_elem_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
-        if lv_var_type(loc) == TYPE_PTR or lv_var_type(loc) == TYPE_REF or lv_var_type(loc) == TYPE_MUT_REF
-            # `p: *[N]T` indexes T (#2321), not the array.
-            if lv_pointee_type(loc) == TYPE_ARRAY
-                return bk_of_type(lv_pointee_array_elem_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
-            return bk_of_type(lv_pointee_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+        match lv_var_type(loc)
+            TypeKind.Array =>
+                return bk_of_type(lv_array_elem_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+            TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
+                # `p: *[N]T` indexes T (#2321), not the array.
+                if lv_pointee_type(loc) == TypeKind.Array
+                    return bk_of_type(lv_pointee_array_elem_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+                return bk_of_type(lv_pointee_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+            _ => pass
         return BK_UNSURE
     let g: *GlobalVarDef = find_global(s, StrView { ptr: (name), len: (len) as i64 })
     if g == null
@@ -70,17 +72,19 @@ pub fn bk_element(s: *EmitterState, name_sv: StrView) -> i32
         # the ConstEntry, as Sema's sbk_element does.  get_expr_type guessed
         # an i64 for a struct element, so a `const [N]StrView` was BK_INT.
         let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (name), len: (len) as i64 })
-        if ce != null and ce.const_type == TYPE_ARRAY
+        if ce != null and ce.const_type == TypeKind.Array
             return bk_of_type(ce.array_elem_type, StrView { ptr: (ce.array_elem_type_name), len: (ce.array_elem_type_name_len) as i64 })
         return BK_UNSURE
-    if g.var_type == TYPE_ARRAY
-        return bk_of_type(g.array_elem_type, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
-    if g.var_type == TYPE_PTR
-        return bk_of_type(g.pointee_type, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
+    match g.var_type
+        TypeKind.Array =>
+            return bk_of_type(g.array_elem_type, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
+        TypeKind.Ptr =>
+            return bk_of_type(g.pointee_type, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
+        _ => pass
     BK_UNSURE
 
 fn bk_index(s: *EmitterState, e: *Expr) -> i32
-    if e.right != null and e.right.kind == EXPR_RANGE
+    if e.right != null and e.right.kind == ExprKind.Range
         return BK_PTR
     # AGAST #2768: a full-rank `x[i][j]` over an N-D `[N][M]T` (local, global
     # or field) is its leaf T.  Its base is an index, not a name, so it fell to
@@ -90,18 +94,27 @@ fn bk_index(s: *EmitterState, e: *Expr) -> i32
     let nd_sh: *ArrayShape = nd_index_shape(s, e, @nd_depth)
     if nd_sh != null and nd_depth == nd_sh.rank
         return bk_of_type(nd_sh.leaf_type, StrView { ptr: (nd_sh.leaf_name), len: (nd_sh.leaf_name_len) as i64 })
+    # AGAST #4450: `p[i]` through a `*E`, E a user enum, is the `%E` the
+    # emitter loads (ptr_index_user_enum), not an integer.
+    var pe_name: *u8 = null
+    var pe_len: i32 = 0
+    ptr_index_user_enum(s, e, @pe_name, @pe_len)
+    if pe_len > 0
+        return bk_of_type(TypeKind.Struct, StrView { ptr: (pe_name), len: (pe_len) as i64 })
     let base: *Expr = e.left
-    if base.kind == EXPR_IDENT
-        let k: i32 = bk_element(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-        if k != BK_UNSURE
-            return k
-    else if base.kind == EXPR_MEMBER
-        let f: *StructField = member_field_def(s, base)
-        if f != null
-            if f.field_type == TYPE_ARRAY
-                return bk_of_type(f.array_elem_type, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
-            if f.field_type == TYPE_PTR and get_member_pointee_type_exact(s, base) == TYPE_BOOL
-                return BK_BOOL
+    match base.kind
+        ExprKind.Ident =>
+            let k: i32 = bk_element(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            if k != BK_UNSURE
+                return k
+        ExprKind.Member =>
+            let f: *StructField = member_field_def(s, base)
+            if f != null
+                if f.field_type == TypeKind.Array
+                    return bk_of_type(f.array_elem_type, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
+                if f.field_type == TypeKind.Ptr and get_member_pointee_type_exact(s, base) == TypeKind.Bool
+                    return BK_BOOL
+        _ => pass
     bk_of_type(expr_slot_ty(e), StrView { ptr: (null), len: (0) as i64 })
 
 # The first arm with a value: a `return` arm has none, and ritz0's phi skips it.
@@ -183,50 +196,52 @@ fn bk_call(s: *EmitterState, e: *Expr) -> i32
 fn bk_receiver(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0
-    if e.kind == EXPR_UNARY and e.op == OP_DEREF
+    if e.kind == ExprKind.Unary and e.op == OpKind.Deref
         bk_receiver(s, e.operand, out_name, out_len)
-    else if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+    else if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         # AGAST #3948: `(*(@x)).f` — the address carries x's own struct type,
         # as deref_pointee_struct_name reads it for the emitter's lowering.
         bk_receiver(s, e.operand, out_name, out_len)
-    else if e.kind == EXPR_BINARY and (e.op == OP_ADD or e.op == OP_SUB)
+    else if e.kind == ExprKind.Binary and (e.op == OpKind.Add or e.op == OpKind.Sub)
         bk_receiver(s, e.left, out_name, out_len)
-    else if e.kind == EXPR_INDEX
+    else if e.kind == ExprKind.Index
         # AGAST #3948: the element's own struct, as member_field_def reads an
         # `a[i].f` base — a Vec's or Span's element, not the container's name.
         index_elem_struct_name(s, e, out_name, out_len)
         if *out_name == null
             bk_receiver(s, e.left, out_name, out_len)
-    else if e.kind == EXPR_CAST and e.ident_len > 0
+    else if e.kind == ExprKind.Cast and e.ident_len > 0
         *out_name = e.ident_ptr
         *out_len = e.ident_len
-    else if e.kind == EXPR_IDENT
-        let idx: i32 = find_local_idx(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if idx >= 0
-            let loc: *LocalVar = local_at(s, idx)
-            *out_name = lv_type_name(loc)
-            *out_len = lv_type_name_len(loc)
-        else
-            let g: *GlobalVarDef = find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-            if g != null
-                *out_name = g.type_name
-                *out_len = g.type_name_len
-    else if e.kind == EXPR_MEMBER
-        let f: *StructField = member_field_def(s, e)
-        if f != null
-            if f.field_type == TYPE_ARRAY
-                *out_name = f.array_elem_type_name
-                *out_len = f.array_elem_type_name_len
-            else
-                *out_name = f.field_type_name
-                *out_len = f.field_type_name_len
     else
-        resolve_expr_struct_name(s, e, out_name, out_len)
+        match e.kind
+            ExprKind.Ident =>
+                let idx: i32 = find_local_idx(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                if idx >= 0
+                    let loc: *LocalVar = local_at(s, idx)
+                    *out_name = lv_type_name(loc)
+                    *out_len = lv_type_name_len(loc)
+                else
+                    let g: *GlobalVarDef = find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                    if g != null
+                        *out_name = g.type_name
+                        *out_len = g.type_name_len
+            ExprKind.Member =>
+                let f: *StructField = member_field_def(s, e)
+                if f != null
+                    if f.field_type == TypeKind.Array
+                        *out_name = f.array_elem_type_name
+                        *out_len = f.array_elem_type_name_len
+                    else
+                        *out_name = f.field_type_name
+                        *out_len = f.field_type_name_len
+            _ =>
+                resolve_expr_struct_name(s, e, out_name, out_len)
 
 fn bk_member(s: *EmitterState, e: *Expr) -> i32
     var f: *StructField = member_field_def(s, e)
     # `colors.ON`: a const reached through its module.
-    if f == null and e.left.kind == EXPR_IDENT and find_local_idx(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) < 0
+    if f == null and e.left.kind == ExprKind.Ident and find_local_idx(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) < 0
         let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if ce != null
             return bk_of_type(ce.const_type, StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 })
@@ -249,65 +264,69 @@ fn bk_member(s: *EmitterState, e: *Expr) -> i32
 pub fn bool_kind(s: *EmitterState, e: *Expr) -> i32
     if e == null
         return BK_UNSURE
-    let k: i32 = e.kind
-    if k == EXPR_INT_LIT
-        if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
-            return BK_BOOL
-        if e.lit_kind == LIT_PASS
-            return BK_UNSURE
-        return BK_INT
-    if k == EXPR_CHAR_LIT
-        return BK_INT
-    if k == EXPR_FLOAT_LIT
-        return BK_FLOAT
-    if k == EXPR_CSTRING_LIT or k == EXPR_NIL_LIT
-        return BK_PTR
-    if k == EXPR_STRING_LIT or k == EXPR_STRUCT_LIT or k == EXPR_ARRAY_LIT or k == EXPR_ARRAY_FILL
-        return BK_OTHER
-    if k == EXPR_IDENT
-        return bk_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    if k == EXPR_BINARY
-        if e.op >= OP_EQ and e.op <= OP_OR
-            return BK_BOOL
-        let l: i32 = bool_kind(s, e.left)
-        let r: i32 = bool_kind(s, e.right)
-        if l == BK_BOOL or r == BK_BOOL
-            return BK_BAD
-        if e.op >= OP_BIT_AND and e.op <= OP_SHR
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.IntLit =>
+            if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
+                return BK_BOOL
+            if e.lit_kind == LIT_PASS
+                return BK_UNSURE
             return BK_INT
-        return bk_arithmetic(l, r)
-    if k == EXPR_UNARY
-        if e.op == OP_NOT
-            return BK_BOOL
-        if e.op == OP_ADDR or e.op == OP_ADDR_MUT
+        ExprKind.CharLit =>
+            return BK_INT
+        ExprKind.FloatLit =>
+            return BK_FLOAT
+        ExprKind.CstringLit | ExprKind.NilLit =>
             return BK_PTR
-        if e.op == OP_NEG or e.op == OP_BIT_NOT
-            let o: i32 = bool_kind(s, e.operand)
-            if o == BK_BOOL
+        ExprKind.StringLit | ExprKind.StructLit | ExprKind.ArrayLit | ExprKind.ArrayFill =>
+            return BK_OTHER
+        ExprKind.Ident =>
+            return bk_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        ExprKind.Binary =>
+            if op_is_cmp_or_logic(e.op)
+                return BK_BOOL
+            let l: i32 = bool_kind(s, e.left)
+            let r: i32 = bool_kind(s, e.right)
+            if l == BK_BOOL or r == BK_BOOL
                 return BK_BAD
-            return o
-        # AGAST #2972: `*h` of an integer or `bool` borrow `h:& T` is `h`.
-        if e.op == OP_DEREF and lent_scalar_ident(s, e.operand) != null
-            return bool_kind(s, e.operand)
-        return bk_of_type(expr_slot_ty(e), StrView { ptr: (null), len: (0) as i64 })
-    if k == EXPR_CAST
-        return bk_of_type(e.op, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    if k == EXPR_MEMBER
-        return bk_member(s, e)
-    if k == EXPR_INDEX
-        return bk_index(s, e)
-    if k == EXPR_CALL
-        return bk_call(s, e)
-    if k == EXPR_METHOD
-        return bk_method(s, e)
-    if k == EXPR_IF or k == EXPR_MATCH
-        return bk_arms(s, e.args as *MatchArm)
-    if k == EXPR_TRY
-        return bk_payload_of(s, e.left)
+            if op_is_bitwise(e.op)
+                return BK_INT
+            return bk_arithmetic(l, r)
+        ExprKind.Unary =>
+            match e.op
+                OpKind.Not =>
+                    return BK_BOOL
+                OpKind.Addr | OpKind.AddrMut =>
+                    return BK_PTR
+                OpKind.Neg | OpKind.BitNot =>
+                    let o: i32 = bool_kind(s, e.operand)
+                    if o == BK_BOOL
+                        return BK_BAD
+                    return o
+                _ => pass
+            # AGAST #2972: `*h` of an integer or `bool` borrow `h:& T` is `h`.
+            if e.op == OpKind.Deref and lent_scalar_ident(s, e.operand) != null
+                return bool_kind(s, e.operand)
+            return bk_of_type(expr_slot_ty(e), StrView { ptr: (null), len: (0) as i64 })
+        ExprKind.Cast =>
+            return bk_of_type(e.type_kind, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        ExprKind.Member =>
+            return bk_member(s, e)
+        ExprKind.Index =>
+            return bk_index(s, e)
+        ExprKind.Call =>
+            return bk_call(s, e)
+        ExprKind.Method =>
+            return bk_method(s, e)
+        ExprKind.If | ExprKind.Match =>
+            return bk_arms(s, e.args as *MatchArm)
+        ExprKind.Try =>
+            return bk_payload_of(s, e.left)
+        _ => pass
     BK_UNSURE
 
 # The local just added is a pattern's binding, of kind `k`.  Its slot is an i64
-# whatever the value is, so TYPE_I64 says nothing.
+# whatever the value is, so TypeKind.I64 says nothing.
 pub fn bool_note_binding(s: *EmitterState, k: i32)
     let loc: *LocalVar = local_at(s, s.local_count - 1)
     loc.is_bool = (k == BK_BOOL) as i32

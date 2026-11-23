@@ -521,7 +521,7 @@ fn oc_build_paths(sm: *Sema, name_sv: StrView, out_n: *i32) -> *OwnPath
     while i < n
         let p: *OwnPath = @paths[i]
         let f: *StructField = p.fld
-        if f.field_type == TYPE_STRUCT and oc_path_depth(paths, i) < OC_MAX_DEPTH and oc_partly_movable(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == 1
+        if f.field_type == TypeKind.Struct and oc_path_depth(paths, i) < OC_MAX_DEPTH and oc_partly_movable(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == 1
             n = oc_add_paths(sm, @paths, @cap, n, i, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
         i += 1
     *out_n = n
@@ -653,15 +653,15 @@ fn oc_local_owns(sm: *Sema, loc: *LocalVar, count: *i32, len: *i32) -> *u8
     *count = 0
     var name: *u8 = lv_type_name(loc)
     var n: i32 = lv_type_name_len(loc)
-    if lv_var_type(loc) == TYPE_ARRAY
+    if lv_var_type(loc) == TypeKind.Array
         if lv_array_shape(loc) != null
             if own_shape_elems(lv_array_shape(loc), count, @name, @n) == 0
                 return null
-        else if lv_array_elem_type(loc) == TYPE_STRUCT and lv_array_size(loc) > 0
+        else if lv_array_elem_type(loc) == TypeKind.Struct and lv_array_size(loc) > 0
             *count = lv_array_size(loc)
         else
             return null
-    else if lv_var_type(loc) != TYPE_STRUCT
+    else if lv_var_type(loc) != TypeKind.Struct
         return null
     if oc_move_only(sm, StrView { ptr: (name), len: (n) as i64 }) == 0
         return null
@@ -705,11 +705,11 @@ fn oc_register(sm: *Sema, name_sv: StrView) -> i32
     var tname: *u8 = null
     if loc != null
         tname = oc_local_owns(sm, loc, @count, @tlen)
-    if tname == null and (loc == null or lv_var_type(loc) != TYPE_ARRAY)
+    if tname == null and (loc == null or lv_var_type(loc) != TypeKind.Array)
         # A user enum value (`var s = E.V(x)`): Sema's own type of it, where
         # the image of its LocalVar can't say.
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (name), len: (len) as i64 })
-        if v != null and v.kind == TYPE_STRUCT and user_enum_index(StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) >= 0 and oc_move_only(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) == 1
+        if v != null and v.kind == TypeKind.Struct and user_enum_index(StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) >= 0 and oc_move_only(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) == 1
             tname = v.type_name
             tlen = v.type_name_len
     if tname == null
@@ -848,12 +848,14 @@ fn oc_error_borrow_field_at(sm: *Sema, line: i32, col: i32, b: *OcBind, bits: i3
 
 # `x.f.g`, as written.
 fn oc_put_path(e: *Expr)
-    if e.kind == EXPR_MEMBER
-        oc_put_path(e.left)
-        oc_put_char('.')
-        oc_put_bytes(e.ident_ptr, e.ident_len)
-    else if e.kind == EXPR_IDENT
-        oc_put_bytes(e.ident_ptr, e.ident_len)
+    match e.kind
+        ExprKind.Member =>
+            oc_put_path(e.left)
+            oc_put_char('.')
+            oc_put_bytes(e.ident_ptr, e.ident_len)
+        ExprKind.Ident =>
+            oc_put_bytes(e.ident_ptr, e.ident_len)
+        _ => pass
 
 fn oc_error_move_from_drop(sm: *Sema, line: i32, col: i32, e: *Expr, tname_sv: StrView)
     var tname: *u8 = tname_sv.ptr
@@ -964,7 +966,7 @@ fn oc_store_path(sm: *Sema, b: *OcBind, path: i32, exact: i32, line: i32, col: i
 
 fn oc_member_root(e: *Expr) -> *Expr
     var r: *Expr = e
-    while r.kind == EXPR_MEMBER and r.left != null
+    while r.kind == ExprKind.Member and r.left != null
         r = r.left
     r
 
@@ -986,12 +988,12 @@ fn oc_struct_field(sm: *Sema, name_sv: StrView, idx: i32) -> *StructField
 # fn's field, with x (*out_b) and the first struct along the path that has
 # its own drop (*out_drop, null if none); else null.
 fn oc_member_path(sm: *Sema, e: *Expr, out_b: **OcBind, out_drop: **u8, out_drop_len: *i32) -> *StructField
-    if e.kind != EXPR_MEMBER or e.left == null
+    if e.kind != ExprKind.Member or e.left == null
         return null
     let l: *Expr = e.left
     var tname: *u8 = null
     var tlen: i32 = 0
-    if l.kind == EXPR_IDENT
+    if l.kind == ExprKind.Ident
         let b: *OcBind = oc_lookup(sm, StrView { ptr: (l.ident_ptr), len: (l.ident_len) as i64 })
         if b == null or b.count > 0
             return null
@@ -1000,7 +1002,7 @@ fn oc_member_path(sm: *Sema, e: *Expr, out_b: **OcBind, out_drop: **u8, out_drop
         *out_b = b
     else
         let pf: *StructField = oc_member_path(sm, l, out_b, out_drop, out_drop_len)
-        if pf == null or pf.field_type != TYPE_STRUCT
+        if pf == null or pf.field_type != TypeKind.Struct
             return null
         tname = pf.field_type_name
         tlen = pf.field_type_name_len
@@ -1010,7 +1012,7 @@ fn oc_member_path(sm: *Sema, e: *Expr, out_b: **OcBind, out_drop: **u8, out_drop
     let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if idx < 0
         return null
-    if l.kind == EXPR_IDENT
+    if l.kind == ExprKind.Ident
         *out_drop = null
         *out_drop_len = 0
     if *out_drop == null and oc_has_drop_impl(sm, StrView { ptr: (tname), len: (tlen) as i64 }) == 1
@@ -1021,7 +1023,7 @@ fn oc_member_path(sm: *Sema, e: *Expr, out_b: **OcBind, out_drop: **u8, out_drop
 # The deepest path of `b` along the member path `e`, rooted at b (-1 for b
 # itself); *out_exact is 1 when `e` ends on it.
 fn oc_path_of(b: *OcBind, e: *Expr, out_exact: *i32) -> i32
-    if e.kind != EXPR_MEMBER or e.left == null
+    if e.kind != ExprKind.Member or e.left == null
         *out_exact = 1
         return 0 - 1
     var exact: i32 = 0
@@ -1044,11 +1046,13 @@ fn oc_call_fn(sm: *Sema, e: *Expr) -> *FnDef
 # in *out_len), or null.
 fn oc_call_ret_type(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
     var f: *FnDef = null
-    if e.kind == EXPR_CALL
-        f = oc_call_fn(sm, e)
-    else if e.kind == EXPR_METHOD
-        f = rs_method_def(sm, e)   # AGAST #2262
-    if f == null or f.return_type != TYPE_STRUCT or f.return_type_name_len <= 0
+    match e.kind
+        ExprKind.Call =>
+            f = oc_call_fn(sm, e)
+        ExprKind.Method =>
+            f = rs_method_def(sm, e)   # AGAST #2262
+        _ => pass
+    if f == null or f.return_type != TypeKind.Struct or f.return_type_name_len <= 0
         return null
     if oc_move_only(sm, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }) == 0
         return null
@@ -1058,7 +1062,7 @@ fn oc_call_ret_type(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
 # `call().f` with f a move-only field (ritz0's _is_move_only_field).
 fn oc_temp_field_move_only(sm: *Sema, e: *Expr) -> i32
     let l: *Expr = e.left
-    if l == null or l.kind != EXPR_CALL
+    if l == null or l.kind != ExprKind.Call
         return 0
     var len: i32 = 0
     let name: *u8 = oc_call_ret_type(sm, l, @len)
@@ -1079,17 +1083,17 @@ fn oc_temp_field_move_only(sm: *Sema, e: *Expr) -> i32
 # reads through no such buffer.
 fn oc_buffer_value_struct(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
     let l: *Expr = e.left
-    if e.right == null or e.right.kind == EXPR_RANGE or l == null
+    if e.right == null or e.right.kind == ExprKind.Range or l == null
         return 0 - 1
-    if l.kind != EXPR_IDENT and l.kind != EXPR_MEMBER and (l.kind != EXPR_UNARY or l.op != OP_DEREF)
+    if l.kind != ExprKind.Ident and l.kind != ExprKind.Member and (l.kind != ExprKind.Unary or l.op != OpKind.Deref)
         return 0 - 1
     var t: SemaTy
     if rs_ty(sm, l, @t) == 0
         return 0 - 1
     var el: SemaTy
-    if t.name == null or t.name_len <= 0 or sema_buffer_ty(sm, @t, @el) == TYPE_UNKNOWN
+    if t.name == null or t.name_len <= 0 or sema_buffer_ty(sm, @t, @el) == TypeKind.Unknown
         return 0 - 1
-    if el.kind != TYPE_STRUCT or el.name == null or el.name_len <= 0
+    if el.kind != TypeKind.Struct or el.name == null or el.name_len <= 0
         return 0
     *out_name = el.name
     *out_len = el.name_len
@@ -1098,14 +1102,14 @@ fn oc_buffer_value_struct(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) ->
 # The struct `e` holds by value: 1 and its name, or 0.  `p[i]` through a Vec
 # or Span holds its element (AGAST #2444, R9).
 fn oc_value_struct(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
-    if e.kind == EXPR_INDEX and rs_through_kind(sm, e) != TYPE_VOID
+    if e.kind == ExprKind.Index and rs_through_kind(sm, e) != TypeKind.Void
         let r: i32 = oc_buffer_value_struct(sm, e, out_name, out_len)
         if r >= 0
             return r
     var env: RefEnv
     var t: RefTy
     if ref_ty_in(ref_env_of(@env, null, sm), e, @t) == 1
-        if t.kind != TYPE_STRUCT
+        if t.kind != TypeKind.Struct
             return 0
         if t.name_len > 0
             *out_name = t.name
@@ -1113,11 +1117,11 @@ fn oc_value_struct(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
             return 1
     # A name or field ref_ty_in can't type: Sema's (a nameless tuple and its
     # fields, `p[i].f` through a Vec or Span, AGAST #2444).
-    if e.kind != EXPR_IDENT and e.kind != EXPR_MEMBER
+    if e.kind != ExprKind.Ident and e.kind != ExprKind.Member
         return 0
     var st: SemaTy
     sema_expr_ty(sm, e, @st)
-    if st.kind != TYPE_STRUCT or st.name == null or st.name_len <= 0
+    if st.kind != TypeKind.Struct or st.name == null or st.name_len <= 0
         return 0
     *out_name = st.name
     *out_len = st.name_len
@@ -1147,12 +1151,12 @@ fn oc_through(sm: *Sema, e0: *Expr) -> i32
     var e: *Expr = e0
     while e != null
         var next: *Expr = null
-        if e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX
+        if e.kind == ExprKind.Member or e.kind == ExprKind.Index
             next = e.left
-        else if e.kind == EXPR_UNARY and e.op == OP_DEREF
+        else if e.kind == ExprKind.Unary and e.op == OpKind.Deref
             next = e.operand
         else
-            if e.kind != EXPR_IDENT
+            if e.kind != ExprKind.Ident
                 return 0
             if sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == null
                 return 0
@@ -1171,7 +1175,7 @@ fn oc_through(sm: *Sema, e0: *Expr) -> i32
 # AGAST #2336: `e` (`*r`, `r.f`, `p[i]`) names a move-only value behind a
 # reference.  Used by value it would have two owners.
 fn oc_moves_out(sm: *Sema, e: *Expr) -> i32
-    if e.kind == EXPR_IDENT
+    if e.kind == ExprKind.Ident
         return 0
     var name: *u8 = null
     var len: i32 = 0
@@ -1185,42 +1189,44 @@ fn oc_moves_out(sm: *Sema, e: *Expr) -> i32
 # when `a` is an array held by value.  ritz0's MoveChecker._element_root.
 fn oc_element_root(sm: *Sema, e: *Expr) -> *Expr
     var r: *Expr = e
-    while r != null and r.kind == EXPR_MEMBER
+    while r != null and r.kind == ExprKind.Member
         r = r.left
-    if r == null or r.kind != EXPR_INDEX
+    if r == null or r.kind != ExprKind.Index
         return null
     var env: RefEnv
     var b: RefTy
-    if ref_ty_in(ref_env_of(@env, null, sm), r.left, @b) == 0 or b.kind != TYPE_ARRAY
+    if ref_ty_in(ref_env_of(@env, null, sm), r.left, @b) == 0 or b.kind != TypeKind.Array
         return null
     r
 
 # nd_index_shape on Sema: the `[N][M]..T` an index chain `e` indexes into,
 # with the number of indexes in *out_depth; null when it indexes none.
 fn oc_nd_index_shape(sm: *Sema, e: *Expr, out_depth: *i32) -> *ArrayShape
-    if e == null or e.kind != EXPR_INDEX
+    if e == null or e.kind != ExprKind.Index
         return null
     var depth: i32 = 0
     var base: *Expr = e
-    while base.kind == EXPR_INDEX
+    while base.kind == ExprKind.Index
         depth = depth + 1
         base = base.left
     var sh: *ArrayShape = null
-    if base.kind == EXPR_IDENT
-        if sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 }) != null
-            let loc: *LocalVar = oc_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-            if loc != null and lv_var_type(loc) == TYPE_ARRAY
-                sh = lv_array_shape(loc)
-            else if loc != null and ref_is_pointer(lv_var_type(loc)) == 1
-                sh = lv_pointee_array_shape(loc)
-        else
-            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-            if g != null and g.var_type == TYPE_ARRAY
-                sh = g.array_shape
-    else if base.kind == EXPR_MEMBER
-        let f: *StructField = rs_field(sm, base)
-        if f != null and f.field_type == TYPE_ARRAY
-            sh = f.array_shape
+    match base.kind
+        ExprKind.Ident =>
+            if sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 }) != null
+                let loc: *LocalVar = oc_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                if loc != null and lv_var_type(loc) == TypeKind.Array
+                    sh = lv_array_shape(loc)
+                else if loc != null and ref_is_pointer(lv_var_type(loc)) == 1
+                    sh = lv_pointee_array_shape(loc)
+            else
+                let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                if g != null and g.var_type == TypeKind.Array
+                    sh = g.array_shape
+        ExprKind.Member =>
+            let f: *StructField = rs_field(sm, base)
+            if f != null and f.field_type == TypeKind.Array
+                sh = f.array_shape
+        _ => pass
     if sh == null or depth > sh.rank
         return null
     *out_depth = depth
@@ -1234,7 +1240,7 @@ fn oc_moves_element(sm: *Sema, e: *Expr) -> i32
     var row_depth: i32 = 0
     let row_sh: *ArrayShape = oc_nd_index_shape(sm, e, @row_depth)
     if row_sh != null and row_depth < row_sh.rank
-        if row_sh.leaf_type != TYPE_STRUCT or row_sh.leaf_name_len == 0
+        if row_sh.leaf_type != TypeKind.Struct or row_sh.leaf_name_len == 0
             return 0
         return oc_move_only(sm, StrView { ptr: (row_sh.leaf_name), len: (row_sh.leaf_name_len) as i64 })
     if oc_element_root(sm, e) == null
@@ -1249,9 +1255,9 @@ fn oc_moves_element(sm: *Sema, e: *Expr) -> i32
 # `G.f.g`) that moves a move-only value out of the module-level `var G`.
 fn oc_moves_global(sm: *Sema, e: *Expr) -> *Expr
     var r: *Expr = e
-    while r != null and r.kind == EXPR_MEMBER
+    while r != null and r.kind == ExprKind.Member
         r = r.left
-    if r == null or r.kind != EXPR_IDENT
+    if r == null or r.kind != ExprKind.Ident
         return null
     if sema_find_local(sm, StrView { ptr: (r.ident_ptr), len: (r.ident_len) as i64 }) != null or sbk_global(sm, StrView { ptr: (r.ident_ptr), len: (r.ident_len) as i64 }) == null
         return null
@@ -1266,7 +1272,7 @@ fn oc_moves_global(sm: *Sema, e: *Expr) -> *Expr
 fn oc_param_moves(p: *Param) -> i32
     if p == null
         return 1
-    if p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF or p.param_type == TYPE_PTR or p.param_type == TYPE_PTR_PTR
+    if p.param_type == TypeKind.Ref or p.param_type == TypeKind.MutRef or p.param_type == TypeKind.Ptr or p.param_type == TypeKind.PtrPtr
         return 0
     1
 
@@ -1283,7 +1289,7 @@ fn oc_walk_args(sm: *Sema, a0: *Expr, p0: *Param)
 # on the struct of a local receiver.
 fn oc_recv_def(sm: *Sema, e: *Expr) -> *FnDef
     let recv: *Expr = e.left
-    if recv == null or recv.kind != EXPR_IDENT
+    if recv == null or recv.kind != ExprKind.Ident
         return null
     if sema_find_local(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 }) == null
         return null
@@ -1299,40 +1305,42 @@ fn oc_ptr_ptr_struct(sm: *Sema, x: *Expr, out_len: *i32) -> *u8
         return null
     var name: *u8 = null
     var len: i32 = 0
-    if x.kind == EXPR_IDENT
-        if sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) != null
-            let loc: *LocalVar = oc_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
-            if loc == null or lv_var_type(loc) != TYPE_PTR_PTR
+    match x.kind
+        ExprKind.Ident =>
+            if sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) != null
+                let loc: *LocalVar = oc_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+                if loc == null or lv_var_type(loc) != TypeKind.PtrPtr
+                    return null
+                name = lv_type_name(loc)
+                len = lv_type_name_len(loc)
+            else
+                let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+                if g == null or g.var_type != TypeKind.PtrPtr
+                    return null
+                name = g.pointee_type_name
+                len = g.pointee_type_name_len
+        ExprKind.Member =>
+            let f: *StructField = rs_field(sm, x)
+            if f == null or f.field_type != TypeKind.PtrPtr
                 return null
-            name = lv_type_name(loc)
-            len = lv_type_name_len(loc)
-        else
-            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
-            if g == null or g.var_type != TYPE_PTR_PTR
+            name = f.field_type_name
+            len = f.field_type_name_len
+        ExprKind.Cast =>
+            if x.type_kind != TypeKind.PtrPtr
                 return null
-            name = g.pointee_type_name
-            len = g.pointee_type_name_len
-    else if x.kind == EXPR_MEMBER
-        let f: *StructField = rs_field(sm, x)
-        if f == null or f.field_type != TYPE_PTR_PTR
-            return null
-        name = f.field_type_name
-        len = f.field_type_name_len
-    else if x.kind == EXPR_CAST
-        if x.op != TYPE_PTR_PTR
-            return null
-        name = x.ident_ptr
-        len = x.ident_len
-    else if x.kind == EXPR_CALL
-        # `f()` with `f() -> **S`, spelled with a `ptr_` per level past two.
-        let fd: *FnDef = oc_call_fn(sm, x)
-        if fd == null or fd.return_type != TYPE_PTR_PTR or fd.return_type_name == null
-            return null
-        name = fd.return_type_name
-        len = fd.return_type_name_len
-        while len > 4 and memcmp(name, c"ptr_", 4) == 0
-            name = name + 4
-            len = len - 4
+            name = x.ident_ptr
+            len = x.ident_len
+        ExprKind.Call =>
+            # `f()` with `f() -> **S`, spelled with a `ptr_` per level past two.
+            let fd: *FnDef = oc_call_fn(sm, x)
+            if fd == null or fd.return_type != TypeKind.PtrPtr or fd.return_type_name == null
+                return null
+            name = fd.return_type_name
+            len = fd.return_type_name_len
+            while len > 4 and memcmp(name, c"ptr_", 4) == 0
+                name = name + 4
+                len = len - 4
+        _ => pass
     if name == null or len <= 0 or sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 }) == null
         return null
     *out_len = len
@@ -1344,7 +1352,7 @@ fn oc_check_ref_receiver(sm: *Sema, e: *Expr)
     var len: i32 = 0
     var is_ptr: i32 = 0
     var m: *FnDef = null
-    if e.left != null and e.left.kind == EXPR_INDEX and rs_through_kind(sm, e.left) != TYPE_VOID
+    if e.left != null and e.left.kind == ExprKind.Index and rs_through_kind(sm, e.left) != TypeKind.Void
         # `p[i].m()`: the element's method, on the element's type (AGAST #2444).
         if oc_buffer_value_struct(sm, e.left, @name, @len) != 1
             return
@@ -1357,7 +1365,7 @@ fn oc_check_ref_receiver(sm: *Sema, e: *Expr)
             len = t.name_len
             is_ptr = ref_is_pointer(t.kind)
             m = rs_method_def(sm, e)
-        else if e.left != null and e.left.kind == EXPR_MEMBER and oc_value_struct(sm, e.left, @name, @len) == 1
+        else if e.left != null and e.left.kind == ExprKind.Member and oc_value_struct(sm, e.left, @name, @len) == 1
             # `p[i].f.m()` through a Vec or Span: f's struct.
             m = sema_method_fn(sm, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         else
@@ -1430,7 +1438,7 @@ const OC_READ_DEREF: i32 = 3
 # The struct (an `a:& [N]T`'s element T) a `:&` param `e` names, when reading
 # `e` as `how` (OC_READ_*) reads the referent; null otherwise.
 fn oc_lent_name(sm: *Sema, e: *Expr, how: i32, out_len: *i32) -> *u8
-    if e == null or e.kind != EXPR_IDENT
+    if e == null or e.kind != ExprKind.Ident
         return null
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if v == null or v.lent == null
@@ -1439,19 +1447,19 @@ fn oc_lent_name(sm: *Sema, e: *Expr, how: i32, out_len: *i32) -> *u8
     if loc == null or lv_type_name_len(loc) <= 0
         return null
     let p: *Param = v.lent
-    let arr: i32 = (lv_is_lent(loc) == 1 and lv_var_type(loc) == TYPE_ARRAY) as i32   # lent_array_ident
-    let referent: i32 = (lv_is_lent(loc) == 1 and lv_var_type(loc) == TYPE_MUT_REF and lv_pointee_type(loc) == TYPE_STRUCT) as i32
+    let arr: i32 = (lv_is_lent(loc) == 1 and lv_var_type(loc) == TypeKind.Array) as i32   # lent_array_ident
+    let referent: i32 = (lv_is_lent(loc) == 1 and lv_var_type(loc) == TypeKind.MutRef and lv_pointee_type(loc) == TypeKind.Struct) as i32
     var ok: i32 = 0
     if how == OC_READ_SLOT
         ok = arr | referent
-        if p.is_self_borrow == 1 and lv_pointee_type(loc) == TYPE_STRUCT and (lv_var_type(loc) == TYPE_PTR or lv_var_type(loc) == TYPE_MUT_REF)
+        if p.is_self_borrow == 1 and lv_pointee_type(loc) == TypeKind.Struct and (lv_var_type(loc) == TypeKind.Ptr or lv_var_type(loc) == TypeKind.MutRef)
             ok = 1   # lent_self_local
     else if how == OC_READ_VALUE
         ok = arr | referent
     else if how == OC_READ_ADDR
         # lent_struct_local: a `:&` param (an impl's `self:&` too) held as a
         # reference to a struct.
-        ok = ((lv_var_type(loc) == TYPE_MUT_REF or lv_var_type(loc) == TYPE_PTR) and lv_pointee_type(loc) == TYPE_STRUCT) as i32
+        ok = ((lv_var_type(loc) == TypeKind.MutRef or lv_var_type(loc) == TypeKind.Ptr) and lv_pointee_type(loc) == TypeKind.Struct) as i32
     else
         ok = arr
     if ok == 0
@@ -1472,68 +1480,70 @@ fn oc_lent_read(sm: *Sema, e: *Expr, how: i32)
 fn oc_lent_walk(sm: *Sema, e: *Expr, mv: i32)
     if e == null
         return
-    let k: i32 = e.kind
-    if k == EXPR_IDENT
-        if mv == 1
-            oc_lent_read(sm, e, OC_READ_SLOT)
-    else if k == EXPR_UNARY
-        # AGAST #2286: `*@c` reads `c:& C` by value, as `c` itself does; and
-        # `*a` the whole `a:& [N]T` (AGAST #2290).
-        if e.op == OP_DEREF and mv == 1 and e.operand != null and e.operand.kind == EXPR_UNARY and e.operand.op == OP_ADDR
-            oc_lent_read(sm, e.operand.operand, OC_READ_ADDR)
-            return
-        if e.op == OP_DEREF and mv == 1 and e.operand != null and e.operand.kind == EXPR_IDENT
-            oc_lent_read(sm, e.operand, OC_READ_DEREF)
-            return
-        if e.op == OP_ADDR or e.op == OP_ADDR_MUT
-            return
-        oc_lent_walk(sm, e.operand, 0)
-    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        oc_lent_walk(sm, e.left, 0)
-        oc_lent_walk(sm, e.right, 0)
-    else if k == EXPR_MEMBER
-        oc_lent_walk(sm, e.left, 0)
-    else if k == EXPR_CAST or k == EXPR_TRY
-        oc_lent_walk(sm, e.left, mv)
-    else if k == EXPR_CALL
-        if e.func_name_len == 6 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sizeof"), len: (6) as i64 }) == 1
-            return
-        var p: *Param = null
-        let f: *FnDef = oc_call_fn(sm, e)
-        if f != null
-            p = f.params
-        var a: *Expr = e.args
-        while a != null
-            oc_lent_walk(sm, a, oc_param_moves(p))
-            if p != null
-                p = p.next
-            a = a.next
-    else if k == EXPR_METHOD
-        oc_lent_walk(sm, e.left, 0)
-        var mp: *Param = null
-        let m: *FnDef = oc_recv_def(sm, e)
-        if m != null and m.params != null
-            mp = m.params.next
-        var a: *Expr = e.args
-        while a != null
-            oc_lent_walk(sm, a, oc_param_moves(mp))
-            if mp != null
-                mp = mp.next
-            a = a.next
-    else if k == EXPR_STRUCT_LIT
-        var fi: *FieldInit = e.args as *FieldInit
-        while fi != null
-            oc_lent_walk(sm, fi.value, 1)
-            fi = fi.next
-    else if k == EXPR_ARRAY_LIT
-        var el: *Expr = e.args
-        while el != null
-            oc_lent_walk(sm, el, 1)
-            el = el.next
-    else if k == EXPR_ARRAY_FILL
-        oc_lent_walk(sm, e.left, 1)
-    else if k == EXPR_MATCH or k == EXPR_IF
-        oc_lent_walk(sm, e.left, 0)
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Ident =>
+            if mv == 1
+                oc_lent_read(sm, e, OC_READ_SLOT)
+        ExprKind.Unary =>
+            # AGAST #2286: `*@c` reads `c:& C` by value, as `c` itself does; and
+            # `*a` the whole `a:& [N]T` (AGAST #2290).
+            if e.op == OpKind.Deref and mv == 1 and e.operand != null and e.operand.kind == ExprKind.Unary and e.operand.op == OpKind.Addr
+                oc_lent_read(sm, e.operand.operand, OC_READ_ADDR)
+                return
+            if e.op == OpKind.Deref and mv == 1 and e.operand != null and e.operand.kind == ExprKind.Ident
+                oc_lent_read(sm, e.operand, OC_READ_DEREF)
+                return
+            if e.op == OpKind.Addr or e.op == OpKind.AddrMut
+                return
+            oc_lent_walk(sm, e.operand, 0)
+        ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
+            oc_lent_walk(sm, e.left, 0)
+            oc_lent_walk(sm, e.right, 0)
+        ExprKind.Member =>
+            oc_lent_walk(sm, e.left, 0)
+        ExprKind.Cast | ExprKind.Try =>
+            oc_lent_walk(sm, e.left, mv)
+        ExprKind.Call =>
+            if e.func_name_len == 6 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sizeof"), len: (6) as i64 }) == 1
+                return
+            var p: *Param = null
+            let f: *FnDef = oc_call_fn(sm, e)
+            if f != null
+                p = f.params
+            var a: *Expr = e.args
+            while a != null
+                oc_lent_walk(sm, a, oc_param_moves(p))
+                if p != null
+                    p = p.next
+                a = a.next
+        ExprKind.Method =>
+            oc_lent_walk(sm, e.left, 0)
+            var mp: *Param = null
+            let m: *FnDef = oc_recv_def(sm, e)
+            if m != null and m.params != null
+                mp = m.params.next
+            var a: *Expr = e.args
+            while a != null
+                oc_lent_walk(sm, a, oc_param_moves(mp))
+                if mp != null
+                    mp = mp.next
+                a = a.next
+        ExprKind.StructLit =>
+            var fi: *FieldInit = e.args as *FieldInit
+            while fi != null
+                oc_lent_walk(sm, fi.value, 1)
+                fi = fi.next
+        ExprKind.ArrayLit =>
+            var el: *Expr = e.args
+            while el != null
+                oc_lent_walk(sm, el, 1)
+                el = el.next
+        ExprKind.ArrayFill =>
+            oc_lent_walk(sm, e.left, 1)
+        ExprKind.Match | ExprKind.If =>
+            oc_lent_walk(sm, e.left, 0)
+        _ => pass
 
 # AGAST #2949: `e` is a block's last statement, so it is the block's value:
 # a bare `c` with `c:& C` (or `a:& [N]T`) reads the referent, in a void fn
@@ -1545,34 +1555,36 @@ fn oc_lent_value_stmt(sm: *Sema, e: *Expr)
 
 # The reads of a statement's own expressions, as oc_check_stmt walks them.
 fn oc_lent_stmt(sm: *Sema, stmt: *Stmt)
-    let k: i32 = stmt.kind
-    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
-        oc_lent_walk(sm, stmt.var_init, 1)
-    else if k == STMT_ASSIGN
-        let t: *Expr = stmt.if_cond as *Expr
-        if stmt.assign_target_len == 0 and t != null and t.kind != EXPR_IDENT
-            oc_lent_walk(sm, t, 0)
-        oc_lent_walk(sm, stmt.assign_value, 1)
-    else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        oc_lent_walk(sm, stmt.while_cond, 0)
-        oc_lent_walk(sm, stmt.assign_value, 1)
-    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
-        oc_lent_walk(sm, stmt.assign_value, 1)
-    else if k == STMT_RETURN
-        oc_lent_walk(sm, stmt.return_value, 1)
-    else if k == STMT_EXPR
-        if stmt.next == null
-            oc_lent_value_stmt(sm, stmt.expr)
-        oc_lent_walk(sm, stmt.expr, 0)
-    else if k == STMT_MATCH
-        oc_lent_walk(sm, stmt.if_cond as *Expr, 0)
-    else if k == STMT_IF or k == STMT_ASSERT
-        oc_lent_walk(sm, stmt.if_cond, 0)
-    else if k == STMT_WHILE
-        oc_lent_walk(sm, stmt.while_cond, 0)
-    else if k == STMT_FOR
-        oc_lent_walk(sm, stmt.for_start, 0)
-        oc_lent_walk(sm, stmt.for_end, 0)
+    let k: StmtKind = stmt.kind
+    match k
+        StmtKind.VarDecl | StmtKind.TupleDecl =>
+            oc_lent_walk(sm, stmt.var_init, 1)
+        StmtKind.Assign =>
+            let t: *Expr = stmt.if_cond as *Expr
+            if stmt.assign_target_len == 0 and t != null and t.kind != ExprKind.Ident
+                oc_lent_walk(sm, t, 0)
+            oc_lent_walk(sm, stmt.assign_value, 1)
+        StmtKind.IndexAssign | StmtKind.LocalFieldIndexAssign | StmtKind.MemberIndexAssign =>
+            oc_lent_walk(sm, stmt.while_cond, 0)
+            oc_lent_walk(sm, stmt.assign_value, 1)
+        StmtKind.LocalFieldAssign | StmtKind.MemberAssign =>
+            oc_lent_walk(sm, stmt.assign_value, 1)
+        StmtKind.Return =>
+            oc_lent_walk(sm, stmt.return_value, 1)
+        StmtKind.Expr =>
+            if stmt.next == null
+                oc_lent_value_stmt(sm, stmt.expr)
+            oc_lent_walk(sm, stmt.expr, 0)
+        StmtKind.Match =>
+            oc_lent_walk(sm, stmt.if_cond as *Expr, 0)
+        StmtKind.If | StmtKind.Assert =>
+            oc_lent_walk(sm, stmt.if_cond, 0)
+        StmtKind.While =>
+            oc_lent_walk(sm, stmt.while_cond, 0)
+        StmtKind.For =>
+            oc_lent_walk(sm, stmt.for_start, 0)
+            oc_lent_walk(sm, stmt.for_end, 0)
+        _ => pass
 
 # --- The walk -------------------------------------------------------------------------------
 
@@ -1626,7 +1638,7 @@ fn oc_walk_member(sm: *Sema, e: *Expr, mv: i32)
 fn oc_walk(sm: *Sema, e: *Expr, mv: i32)
     if e == null
         return
-    let k: i32 = e.kind
+    let k: ExprKind = e.kind
     if mv == 1 and oc_moves_out(sm, e) == 1
         let at: *Expr = own_start_of(e)
         oc_error_move_out(sm, at.span.line, at.span.col)
@@ -1640,141 +1652,145 @@ fn oc_walk(sm: *Sema, e: *Expr, mv: i32)
         if g != null
             oc_error_move_out_of_global(sm, g, e)
             return
-    if k == EXPR_IDENT
-        if mv == 1 and oc_lent_payload(sm, e) == 1
-            oc_error_move_out(sm, e.span.line, e.span.col)
-            return
-        let b: *OcBind = oc_lookup(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if b == null
-            return
-        if b.moved == 1
-            oc_error_use_at(sm, e.span.line, e.span.col, b, b.move_line, b.move_col)
-            return
-        if b.fmoved != 0
-            oc_error_field_use_at(sm, e.span.line, e.span.col, b, b.fmoved)
-            return
-        oc_note_use(b, e.span.line, e.span.col, 0)
-        if mv == 1
-            # LARB R57 (AGAST #3473): a move conflicts with a live `@` of an
-            # overlapping place, as a mutable borrow does.
-            if ref_loan_move_conflict(sm, e) == 1
+    match k
+        ExprKind.Ident =>
+            if mv == 1 and oc_lent_payload(sm, e) == 1
+                oc_error_move_out(sm, e.span.line, e.span.col)
                 return
-            b.moved = 1
-            b.move_line = e.span.line
-            b.move_col = e.span.col
-    else if k == EXPR_UNARY
-        if (e.op == OP_ADDR or e.op == OP_ADDR_MUT) and e.operand != null and e.operand.kind == EXPR_IDENT
-            let bb: *OcBind = oc_lookup(sm, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
-            if bb != null
-                if bb.moved == 1
-                    oc_error_borrow_at(sm, e.span.line, e.span.col, bb)
-                else if bb.fmoved != 0
-                    oc_error_borrow_field_at(sm, e.span.line, e.span.col, bb, bb.fmoved)
+            let b: *OcBind = oc_lookup(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if b == null
+                return
+            if b.moved == 1
+                oc_error_use_at(sm, e.span.line, e.span.col, b, b.move_line, b.move_col)
+                return
+            if b.fmoved != 0
+                oc_error_field_use_at(sm, e.span.line, e.span.col, b, b.fmoved)
+                return
+            oc_note_use(b, e.span.line, e.span.col, 0)
+            if mv == 1
+                # LARB R57 (AGAST #3473): a move conflicts with a live `@` of an
+                # overlapping place, as a mutable borrow does.
+                if ref_loan_move_conflict(sm, e) == 1
+                    return
+                b.moved = 1
+                b.move_line = e.span.line
+                b.move_col = e.span.col
+        ExprKind.Unary =>
+            if (e.op == OpKind.Addr or e.op == OpKind.AddrMut) and e.operand != null and e.operand.kind == ExprKind.Ident
+                let bb: *OcBind = oc_lookup(sm, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
+                if bb != null
+                    if bb.moved == 1
+                        oc_error_borrow_at(sm, e.span.line, e.span.col, bb)
+                    else if bb.fmoved != 0
+                        oc_error_borrow_field_at(sm, e.span.line, e.span.col, bb, bb.fmoved)
+                    else
+                        oc_note_use(bb, e.span.line, e.span.col, 1)
+                return
+            oc_walk(sm, e.operand, 0)
+        ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
+            oc_walk(sm, e.left, 0)
+            oc_walk(sm, e.right, 0)
+        ExprKind.Member =>
+            oc_walk_member(sm, e, mv)
+        ExprKind.Cast =>
+            # `v as T` hands its operand's value on (AGAST #2964).
+            oc_raw_written(sm, e)   # AGAST #4033
+            oc_walk(sm, e.left, mv)
+        ExprKind.Try =>
+            # `e?` consumes `e` either way: on Err its payload moves into the
+            # returned Err even when the value is discarded, so the carrier is
+            # moved, not dropped at scope end (AGAST #2159).
+            oc_walk(sm, e.left, 1)
+        ExprKind.Call =>
+            # sizeof's operand is never evaluated (ritz0 #2124).
+            if e.func_name_len == 6 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sizeof"), len: (6) as i64 }) == 1
+                return
+            var p: *Param = null
+            let f: *FnDef = oc_call_fn(sm, e)
+            if f != null
+                p = f.params
+            oc_walk_args(sm, e.args, p)
+        ExprKind.Method =>
+            # A by-value `self` takes the receiver (AGAST #2393); a call result
+            # as receiver of a method ritz1 can't find stays a move (#2262).
+            let m: *FnDef = oc_recv_def(sm, e)
+            var rmv: i32 = 0
+            let taken: *FnDef = rs_method_def(sm, e)
+            if taken == null and e.left != null and (e.left.kind == ExprKind.Call or e.left.kind == ExprKind.Method)
+                rmv = 1
+            if taken != null and param_self_is_value(taken.params) == 1
+                rmv = 1
+            # `.unwrap()` of a move-only Option/Result consumes the carrier (#4490).
+            oc_note_unwrap(sm, e, @rmv)
+            oc_check_ref_receiver(sm, e)
+            oc_walk(sm, e.left, rmv)
+            var mp: *Param = null
+            if m != null
+                mp = m.params
+                if mp != null
+                    mp = mp.next
+            oc_walk_args(sm, e.args, mp)
+        ExprKind.StructLit =>
+            var fi: *FieldInit = e.args as *FieldInit
+            while fi != null
+                oc_walk(sm, fi.value, 1)
+                fi = fi.next
+        ExprKind.ArrayLit =>
+            # A literal owns its elements (ritz0 #2238, AGAST #2266).
+            var el: *Expr = e.args
+            while el != null
+                if oc_moves_out(sm, el) == 1
+                    let eat: *Expr = own_start_of(el)
+                    oc_error_move_out(sm, eat.span.line, eat.span.col)
                 else
-                    oc_note_use(bb, e.span.line, e.span.col, 1)
-            return
-        oc_walk(sm, e.operand, 0)
-    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        oc_walk(sm, e.left, 0)
-        oc_walk(sm, e.right, 0)
-    else if k == EXPR_MEMBER
-        oc_walk_member(sm, e, mv)
-    else if k == EXPR_CAST
-        # `v as T` hands its operand's value on (AGAST #2964).
-        oc_raw_written(sm, e)   # AGAST #4033
-        oc_walk(sm, e.left, mv)
-    else if k == EXPR_TRY
-        # `e?` consumes `e` either way: on Err its payload moves into the
-        # returned Err even when the value is discarded, so the carrier is
-        # moved, not dropped at scope end (AGAST #2159).
-        oc_walk(sm, e.left, 1)
-    else if k == EXPR_CALL
-        # sizeof's operand is never evaluated (ritz0 #2124).
-        if e.func_name_len == 6 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sizeof"), len: (6) as i64 }) == 1
-            return
-        var p: *Param = null
-        let f: *FnDef = oc_call_fn(sm, e)
-        if f != null
-            p = f.params
-        oc_walk_args(sm, e.args, p)
-    else if k == EXPR_METHOD
-        # A by-value `self` takes the receiver (AGAST #2393); a call result
-        # as receiver of a method ritz1 can't find stays a move (#2262).
-        let m: *FnDef = oc_recv_def(sm, e)
-        var rmv: i32 = 0
-        let taken: *FnDef = rs_method_def(sm, e)
-        if taken == null and e.left != null and (e.left.kind == EXPR_CALL or e.left.kind == EXPR_METHOD)
-            rmv = 1
-        if taken != null and param_self_is_value(taken.params) == 1
-            rmv = 1
-        # `.unwrap()` of a move-only Option/Result consumes the carrier (#4490).
-        oc_note_unwrap(sm, e, @rmv)
-        oc_check_ref_receiver(sm, e)
-        oc_walk(sm, e.left, rmv)
-        var mp: *Param = null
-        if m != null
-            mp = m.params
-            if mp != null
-                mp = mp.next
-        oc_walk_args(sm, e.args, mp)
-    else if k == EXPR_STRUCT_LIT
-        var fi: *FieldInit = e.args as *FieldInit
-        while fi != null
-            oc_walk(sm, fi.value, 1)
-            fi = fi.next
-    else if k == EXPR_ARRAY_LIT
-        # A literal owns its elements (ritz0 #2238, AGAST #2266).
-        var el: *Expr = e.args
-        while el != null
-            if oc_moves_out(sm, el) == 1
-                let eat: *Expr = own_start_of(el)
-                oc_error_move_out(sm, eat.span.line, eat.span.col)
-            else
-                oc_walk(sm, el, 1)
-            el = el.next
-    else if k == EXPR_ARRAY_FILL
-        # `[v; N]` moves `v` into its element, as `[v]` does (AGAST #2976).
-        oc_walk(sm, e.left, 1)
-    else if k == EXPR_MATCH
-        oc_walk(sm, e.left, oc_scrutinee_mv(sm, e.left))
-    else if k == EXPR_IF
-        oc_walk(sm, e.left, 0)
+                    oc_walk(sm, el, 1)
+                el = el.next
+        ExprKind.ArrayFill =>
+            # `[v; N]` moves `v` into its element, as `[v]` does (AGAST #2976).
+            oc_walk(sm, e.left, 1)
+        ExprKind.Match =>
+            oc_walk(sm, e.left, oc_scrutinee_mv(sm, e.left))
+        ExprKind.If =>
+            oc_walk(sm, e.left, 0)
+        _ => pass
 
 # How many `?` emitting `e` emits a `ret` for (each runs every deferred
 # statement first, own_before_ret): the ones oc_walk visits.
 fn oc_try_count(e: *Expr) -> i32
     if e == null
         return 0
-    let k: i32 = e.kind
-    if k == EXPR_TRY
-        return 1 + oc_try_count(e.left)
-    if k == EXPR_UNARY
-        return oc_try_count(e.operand)
-    if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        return oc_try_count(e.left) + oc_try_count(e.right)
-    if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_ARRAY_FILL or k == EXPR_MATCH or k == EXPR_IF
-        return oc_try_count(e.left)
-    if k == EXPR_CALL or k == EXPR_ARRAY_LIT
-        var n: i32 = 0
-        var a: *Expr = e.args
-        while a != null
-            n = n + oc_try_count(a)
-            a = a.next
-        return n
-    if k == EXPR_METHOD
-        var n: i32 = oc_try_count(e.left)
-        var a: *Expr = e.args
-        while a != null
-            n = n + oc_try_count(a)
-            a = a.next
-        return n
-    if k == EXPR_STRUCT_LIT
-        var n: i32 = 0
-        var fi: *FieldInit = e.args as *FieldInit
-        while fi != null
-            n = n + oc_try_count(fi.value)
-            fi = fi.next
-        return n
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Try =>
+            return 1 + oc_try_count(e.left)
+        ExprKind.Unary =>
+            return oc_try_count(e.operand)
+        ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
+            return oc_try_count(e.left) + oc_try_count(e.right)
+        ExprKind.Member | ExprKind.Cast | ExprKind.ArrayFill | ExprKind.Match | ExprKind.If =>
+            return oc_try_count(e.left)
+        ExprKind.Call | ExprKind.ArrayLit =>
+            var n: i32 = 0
+            var a: *Expr = e.args
+            while a != null
+                n = n + oc_try_count(a)
+                a = a.next
+            return n
+        ExprKind.Method =>
+            var n: i32 = oc_try_count(e.left)
+            var a: *Expr = e.args
+            while a != null
+                n = n + oc_try_count(a)
+                a = a.next
+            return n
+        ExprKind.StructLit =>
+            var n: i32 = 0
+            var fi: *FieldInit = e.args as *FieldInit
+            while fi != null
+                n = n + oc_try_count(fi.value)
+                fi = fi.next
+            return n
+        _ => pass
     0
 
 # Each `?` in `e` leaves the fn: the deferred statements run there.
@@ -1792,26 +1808,28 @@ fn oc_try_rets(sm: *Sema, e: *Expr)
 fn oc_first_try(e: *Expr) -> *Expr
     if e == null
         return null
-    let k: i32 = e.kind
-    if k == EXPR_TRY
-        let inner: *Expr = oc_first_try(e.left)
-        if inner != null
-            return inner
-        return e
-    if k == EXPR_UNARY
-        return oc_first_try(e.operand)
-    if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        let l: *Expr = oc_first_try(e.left)
-        if l != null
-            return l
-        return oc_first_try(e.right)
-    if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_ARRAY_FILL or k == EXPR_MATCH or k == EXPR_IF
-        return oc_first_try(e.left)
-    if k == EXPR_METHOD
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Try =>
+            let inner: *Expr = oc_first_try(e.left)
+            if inner != null
+                return inner
+            return e
+        ExprKind.Unary =>
+            return oc_first_try(e.operand)
+        ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
+            let l: *Expr = oc_first_try(e.left)
+            if l != null
+                return l
+            return oc_first_try(e.right)
+        ExprKind.Member | ExprKind.Cast | ExprKind.ArrayFill | ExprKind.Match | ExprKind.If =>
+            return oc_first_try(e.left)
+        _ => pass
+    if k == ExprKind.Method
         let r: *Expr = oc_first_try(e.left)
         if r != null
             return r
-    if k == EXPR_CALL or k == EXPR_ARRAY_LIT or k == EXPR_METHOD
+    if k == ExprKind.Call or k == ExprKind.ArrayLit or k == ExprKind.Method
         var a: *Expr = e.args
         while a != null
             let t: *Expr = oc_first_try(a)
@@ -1819,7 +1837,7 @@ fn oc_first_try(e: *Expr) -> *Expr
                 return t
             a = a.next
         return null
-    if k == EXPR_STRUCT_LIT
+    if k == ExprKind.StructLit
         var fi: *FieldInit = e.args as *FieldInit
         while fi != null
             let t: *Expr = oc_first_try(fi.value)
@@ -1832,12 +1850,12 @@ fn oc_first_try(e: *Expr) -> *Expr
 
 # The binding a whole-binding assignment `x = v` writes, or null.
 fn oc_assign_target(sm: *Sema, stmt: *Stmt) -> *OcBind
-    if stmt.kind != STMT_ASSIGN
+    if stmt.kind != StmtKind.Assign
         return null
     if stmt.assign_target_len > 0
         return oc_lookup(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
     let t: *Expr = stmt.if_cond as *Expr
-    if t != null and t.kind == EXPR_IDENT
+    if t != null and t.kind == ExprKind.Ident
         return oc_lookup(sm, StrView { ptr: (t.ident_ptr), len: (t.ident_len) as i64 })
     null
 
@@ -1848,104 +1866,108 @@ fn oc_assign_target(sm: *Sema, stmt: *Stmt) -> *OcBind
 fn oc_check_stmt(sm: *Sema, stmt: *Stmt)
     if oc_checking(sm) == 0
         return
-    let k: i32 = stmt.kind
-    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
-        oc_walk(sm, stmt.var_init, 1)
-    else if k == STMT_ASSIGN
-        let t: *Expr = stmt.if_cond as *Expr
-        # `x.f... = v` (AGAST #2168, #2242): v first, as ritz0 checks it, since
-        # it can move what is stored to; then the path is owned again.
-        var pb: *OcBind = null
-        var pf: *StructField = null
-        if stmt.assign_target_len == 0 and t != null and t.kind == EXPR_MEMBER
-            var dn: *u8 = null
-            var dl: i32 = 0
-            pf = oc_member_path(sm, t, @pb, @dn, @dl)
-        if pf == null and stmt.assign_target_len == 0 and t != null and t.kind != EXPR_IDENT
-            oc_walk(sm, t, 0)
-        oc_walk(sm, stmt.assign_value, 1)
-        if pf != null
-            var exact: i32 = 0
-            let path: i32 = oc_path_of(pb, t, @exact)
-            let root: *Expr = oc_member_root(t)
-            oc_store_path(sm, pb, path, exact, root.span.line, root.span.col)
-    else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
-        # `x[i] = v`, `x.f = v`, `x.f[i] = v`: x is used, not moved.
-        var base: *OcBind = null
-        if k == STMT_INDEX_ASSIGN
-            base = oc_lookup(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-        else
-            base = oc_lookup(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
-        if k == STMT_LOCAL_FIELD_ASSIGN and base != null and base.count == 0
-            # `x.f = v`, as the path store above.
+    let k: StmtKind = stmt.kind
+    match k
+        StmtKind.VarDecl | StmtKind.TupleDecl =>
+            oc_walk(sm, stmt.var_init, 1)
+        StmtKind.Assign =>
+            let t: *Expr = stmt.if_cond as *Expr
+            # `x.f... = v` (AGAST #2168, #2242): v first, as ritz0 checks it, since
+            # it can move what is stored to; then the path is owned again.
+            var pb: *OcBind = null
+            var pf: *StructField = null
+            if stmt.assign_target_len == 0 and t != null and t.kind == ExprKind.Member
+                var dn: *u8 = null
+                var dl: i32 = 0
+                pf = oc_member_path(sm, t, @pb, @dn, @dl)
+            if pf == null and stmt.assign_target_len == 0 and t != null and t.kind != ExprKind.Ident
+                oc_walk(sm, t, 0)
             oc_walk(sm, stmt.assign_value, 1)
-            let path: i32 = oc_named_path(base, 0 - 1, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-            var exact: i32 = 0
-            if path >= 0
-                exact = 1
-            oc_store_path(sm, base, path, exact, stmt.span.line, stmt.span.col)
-            return
-        if k == STMT_LOCAL_FIELD_INDEX_ASSIGN and base != null and base.count == 0 and base.moved == 0
-            # AGAST #3434: `x.f[i] = v` uses the array `x.f` as a place.
-            let fpath: i32 = oc_named_path(base, 0 - 1, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-            var fexact: i32 = 0
-            if fpath >= 0
-                fexact = 1
-            let fover: i32 = oc_overlap(base, fpath, fexact)
-            if own_set_and(base.fmoved, fover) != 0
-                oc_error_field_use_at(sm, stmt.span.line, stmt.span.col, base, own_set_and(base.fmoved, fover))
+            if pf != null
+                var exact: i32 = 0
+                let path: i32 = oc_path_of(pb, t, @exact)
+                let root: *Expr = oc_member_root(t)
+                oc_store_path(sm, pb, path, exact, root.span.line, root.span.col)
+        StmtKind.IndexAssign | StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
+            # `x[i] = v`, `x.f = v`, `x.f[i] = v`: x is used, not moved.
+            var base: *OcBind = null
+            if k == StmtKind.IndexAssign
+                base = oc_lookup(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+            else
+                base = oc_lookup(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
+            if k == StmtKind.LocalFieldAssign and base != null and base.count == 0
+                # `x.f = v`, as the path store above.
+                oc_walk(sm, stmt.assign_value, 1)
+                let path: i32 = oc_named_path(base, 0 - 1, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+                var exact: i32 = 0
+                if path >= 0
+                    exact = 1
+                oc_store_path(sm, base, path, exact, stmt.span.line, stmt.span.col)
                 return
-            oc_note_field_use(base, fover, stmt.span.line, stmt.span.col)
-        if base != null
-            oc_note_place_use(sm, base, stmt.span.line, stmt.span.col)
-        if k != STMT_LOCAL_FIELD_ASSIGN
+            if k == StmtKind.LocalFieldIndexAssign and base != null and base.count == 0 and base.moved == 0
+                # AGAST #3434: `x.f[i] = v` uses the array `x.f` as a place.
+                let fpath: i32 = oc_named_path(base, 0 - 1, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+                var fexact: i32 = 0
+                if fpath >= 0
+                    fexact = 1
+                let fover: i32 = oc_overlap(base, fpath, fexact)
+                if own_set_and(base.fmoved, fover) != 0
+                    oc_error_field_use_at(sm, stmt.span.line, stmt.span.col, base, own_set_and(base.fmoved, fover))
+                    return
+                oc_note_field_use(base, fover, stmt.span.line, stmt.span.col)
+            if base != null
+                oc_note_place_use(sm, base, stmt.span.line, stmt.span.col)
+            if k != StmtKind.LocalFieldAssign
+                oc_walk(sm, stmt.while_cond, 0)
+            oc_walk(sm, stmt.assign_value, 1)
+        StmtKind.MemberAssign | StmtKind.MemberIndexAssign =>
+            oc_walk(sm, stmt.assign_value, 1)
+        StmtKind.Return =>
+            oc_walk(sm, stmt.return_value, 1)
+        StmtKind.Expr =>
+            oc_walk(sm, stmt.expr, 0)
+        StmtKind.Match =>
+            # AGAST #2174: the scrutinee moves into the match.
+            oc_walk(sm, stmt.if_cond as *Expr, oc_scrutinee_mv(sm, stmt.if_cond as *Expr))
+        StmtKind.If | StmtKind.Assert =>
+            oc_walk(sm, stmt.if_cond, 0)
+        StmtKind.While =>
             oc_walk(sm, stmt.while_cond, 0)
-        oc_walk(sm, stmt.assign_value, 1)
-    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        oc_walk(sm, stmt.assign_value, 1)
-    else if k == STMT_RETURN
-        oc_walk(sm, stmt.return_value, 1)
-    else if k == STMT_EXPR
-        oc_walk(sm, stmt.expr, 0)
-    else if k == STMT_MATCH
-        # AGAST #2174: the scrutinee moves into the match.
-        oc_walk(sm, stmt.if_cond as *Expr, oc_scrutinee_mv(sm, stmt.if_cond as *Expr))
-    else if k == STMT_IF or k == STMT_ASSERT
-        oc_walk(sm, stmt.if_cond, 0)
-    else if k == STMT_WHILE
-        oc_walk(sm, stmt.while_cond, 0)
-    else if k == STMT_FOR
-        oc_walk(sm, stmt.for_start, 0)
-        oc_walk(sm, stmt.for_end, 0)
+        StmtKind.For =>
+            oc_walk(sm, stmt.for_start, 0)
+            oc_walk(sm, stmt.for_end, 0)
+        _ => pass
 
 # The `?`s the statement's own expressions hold, in the order emitting them
 # reaches each `ret`.
 fn oc_stmt_try_rets(sm: *Sema, stmt: *Stmt)
-    let k: i32 = stmt.kind
-    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
-        oc_try_rets(sm, stmt.var_init)
-    else if k == STMT_ASSIGN
-        if stmt.assign_target_len == 0
+    let k: StmtKind = stmt.kind
+    match k
+        StmtKind.VarDecl | StmtKind.TupleDecl =>
+            oc_try_rets(sm, stmt.var_init)
+        StmtKind.Assign =>
+            if stmt.assign_target_len == 0
+                oc_try_rets(sm, stmt.if_cond as *Expr)
+            oc_try_rets(sm, stmt.assign_value)
+        StmtKind.IndexAssign | StmtKind.LocalFieldIndexAssign | StmtKind.MemberIndexAssign =>
+            oc_try_rets(sm, stmt.while_cond)
+            oc_try_rets(sm, stmt.assign_value)
+        StmtKind.LocalFieldAssign | StmtKind.MemberAssign =>
+            oc_try_rets(sm, stmt.assign_value)
+        StmtKind.Return =>
+            oc_try_rets(sm, stmt.return_value)
+        StmtKind.Expr =>
+            oc_try_rets(sm, stmt.expr)
+        StmtKind.Match =>
             oc_try_rets(sm, stmt.if_cond as *Expr)
-        oc_try_rets(sm, stmt.assign_value)
-    else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        oc_try_rets(sm, stmt.while_cond)
-        oc_try_rets(sm, stmt.assign_value)
-    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
-        oc_try_rets(sm, stmt.assign_value)
-    else if k == STMT_RETURN
-        oc_try_rets(sm, stmt.return_value)
-    else if k == STMT_EXPR
-        oc_try_rets(sm, stmt.expr)
-    else if k == STMT_MATCH
-        oc_try_rets(sm, stmt.if_cond as *Expr)
-    else if k == STMT_IF or k == STMT_ASSERT
-        oc_try_rets(sm, stmt.if_cond)
-    else if k == STMT_WHILE
-        oc_try_rets(sm, stmt.while_cond)
-    else if k == STMT_FOR
-        oc_try_rets(sm, stmt.for_start)
-        oc_try_rets(sm, stmt.for_end)
+        StmtKind.If | StmtKind.Assert =>
+            oc_try_rets(sm, stmt.if_cond)
+        StmtKind.While =>
+            oc_try_rets(sm, stmt.while_cond)
+        StmtKind.For =>
+            oc_try_rets(sm, stmt.for_start)
+            oc_try_rets(sm, stmt.for_end)
+        _ => pass
 
 # Everything the emitter did for `stmt` before its nested statement lists:
 # the check, the `?` exits, a `defer`'s registration, a `break` / `continue`
@@ -1954,63 +1976,67 @@ fn oc_stmt_begin(sm: *Sema, stmt: *Stmt)
     oc_check_stmt(sm, stmt)
     oc_lent_stmt(sm, stmt)
     oc_stmt_try_rets(sm, stmt)
-    let k: i32 = stmt.kind
-    if k == STMT_DEFER
-        oc_defer(sm, stmt)
-    else if k == STMT_BREAK
-        oc_check_jump_drop(sm, stmt)   # AGAST #4096
-        oc_loop_jump(sm, 0)
-    else if k == STMT_CONTINUE
-        oc_check_jump_drop(sm, stmt)
-        oc_loop_jump(sm, 1)
-    else if k == STMT_RETURN
-        oc_before_ret(sm)
-        if oc_checking(sm) == 1
-            oc_check_unwritten_drop(sm, 0, stmt.span.line, stmt.span.col)   # AGAST #4096
+    let k: StmtKind = stmt.kind
+    match k
+        StmtKind.Defer =>
+            oc_defer(sm, stmt)
+        StmtKind.Break =>
+            oc_check_jump_drop(sm, stmt)   # AGAST #4096
+            oc_loop_jump(sm, 0)
+        StmtKind.Continue =>
+            oc_check_jump_drop(sm, stmt)
+            oc_loop_jump(sm, 1)
+        StmtKind.Return =>
+            oc_before_ret(sm)
+            if oc_checking(sm) == 1
+                oc_check_unwritten_drop(sm, 0, stmt.span.line, stmt.span.col)   # AGAST #4096
+        _ => pass
 
 # After a statement (and its nested lists): a declaration registers what it
 # binds; `x = v` owns v; a `return` ends its block for the check, and so does
 # a `break` / `continue` in a loop.
 fn oc_stmt_end(sm: *Sema, stmt: *Stmt)
     let o: *OcState = oc()
-    let k: i32 = stmt.kind
-    if k == STMT_VAR_DECL
-        oc_decl(sm, stmt)
-    else if k == STMT_TUPLE_DECL
-        # AGAST #3033: each name owns the element it was bound to.
-        var tup: *StructDef = null
-        var un: *u8 = null
-        var ul: i32 = 0
-        un = oc_sema_struct(sm, stmt.var_init, @ul)
-        if un != null
-            tup = oc_find_struct(sm, StrView { ptr: (un), len: (ul) as i64 })
-        var f: *StructField = null
-        if tup != null
-            f = tup.fields
-        oc_tuple_name(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, f)
-        if f != null
-            f = f.next
-        oc_tuple_name(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, f)
-        if f != null
-            f = f.next
-        var tn: *TupleName = stmt.tuple_more
-        while tn != null
-            oc_tuple_name(sm, StrView { ptr: (tn.name), len: (tn.len) as i64 }, f)
+    let k: StmtKind = stmt.kind
+    match k
+        StmtKind.VarDecl =>
+            oc_decl(sm, stmt)
+        StmtKind.TupleDecl =>
+            # AGAST #3033: each name owns the element it was bound to.
+            var tup: *StructDef = null
+            var un: *u8 = null
+            var ul: i32 = 0
+            un = oc_sema_struct(sm, stmt.var_init, @ul)
+            if un != null
+                tup = oc_find_struct(sm, StrView { ptr: (un), len: (ul) as i64 })
+            var f: *StructField = null
+            if tup != null
+                f = tup.fields
+            oc_tuple_name(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, f)
             if f != null
                 f = f.next
-            tn = tn.next
-    else if k == STMT_ASSIGN
-        let b: *OcBind = oc_assign_target(sm, stmt)
-        if b != null
-            b.moved = 0
-            b.shadow = 0
-            b.fmoved = 0
-            b.fshadow = 0
+            oc_tuple_name(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, f)
+            if f != null
+                f = f.next
+            var tn: *TupleName = stmt.tuple_more
+            while tn != null
+                oc_tuple_name(sm, StrView { ptr: (tn.name), len: (tn.len) as i64 }, f)
+                if f != null
+                    f = f.next
+                tn = tn.next
+        StmtKind.Assign =>
+            let b: *OcBind = oc_assign_target(sm, stmt)
+            if b != null
+                b.moved = 0
+                b.shadow = 0
+                b.fmoved = 0
+                b.fshadow = 0
+        _ => pass
     if o.scope_count <= 0
         return
-    if k == STMT_RETURN
+    if k == StmtKind.Return
         oc_mark_dead(o)
-    else if (k == STMT_BREAK or k == STMT_CONTINUE) and o.loop_depth > 0
+    else if (k == StmtKind.Break or k == StmtKind.Continue) and o.loop_depth > 0
         oc_mark_dead(o)
 
 # The struct a value `e` is: ref_check's image of it (oc_value_struct), else
@@ -2026,7 +2052,7 @@ fn oc_sema_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
         return n
     var t: SemaTy
     sema_expr_ty(sm, e, @t)
-    if t.kind == TYPE_STRUCT and t.name != null and t.name_len > 0
+    if t.kind == TypeKind.Struct and t.name != null and t.name_len > 0
         *out_len = t.name_len
         return t.name
     null
@@ -2038,7 +2064,7 @@ fn oc_tuple_name(sm: *Sema, name_sv: StrView, f: *StructField)
     var len: i32 = name_sv.len as i32
     if oc_register(sm, StrView { ptr: (name), len: (len) as i64 }) == 1 or f == null
         return
-    if f.field_type == TYPE_STRUCT and oc_move_only(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == 1
+    if f.field_type == TypeKind.Struct and oc_move_only(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == 1
         oc_register_as(sm, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, 0)
 
 # A `let` / `var` just bound: register it.  §3.3 (LARB R39, AGAST #3377): `var
@@ -2049,7 +2075,7 @@ fn oc_decl(sm: *Sema, stmt: *Stmt)
         if oc_register(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }) == 1
             oc_start_unwritten(sm, stmt)
         return
-    if oc_register(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }) == 1 or stmt.var_declared_type != TYPE_VOID
+    if oc_register(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }) == 1 or stmt.var_declared_type != TypeKind.Void
         return
     # What the image of its LocalVar can't say: `let p = (a, b)` and `let x =
     # p.0` of a nameless tuple, `var s = E.V` / `E.V(x)` / `V(x)` of a user
@@ -2058,7 +2084,7 @@ fn oc_decl(sm: *Sema, stmt: *Stmt)
     var vl: i32 = 0
     var count: i32 = 0
     let init: *Expr = stmt.var_init
-    if init.kind == EXPR_ARRAY_LIT
+    if init.kind == ExprKind.ArrayLit
         # AGAST #2266: `let a = [h.t]`, an array of what its elements are.
         var el: *Expr = init.args
         while el != null
@@ -2073,7 +2099,7 @@ fn oc_decl(sm: *Sema, stmt: *Stmt)
 
 fn oc_check_uninit_array(sm: *Sema, stmt: *Stmt)
     let loc: *LocalVar = oc_local(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
-    if loc == null or lv_var_type(loc) != TYPE_ARRAY
+    if loc == null or lv_var_type(loc) != TypeKind.Array
         return
     var count: i32 = 0
     var len: i32 = 0
@@ -2446,10 +2472,10 @@ fn oc_keep_unwritten(snap: *i32)
 # clears those mask bits (Expr.own_raw, ownership.ritz's own_raw_written).
 # Lending x into a `*T` parameter without the cast stays a use of it.
 fn oc_raw_written(sm: *Sema, e: *Expr)
-    if e.op != TYPE_PTR or e.left == null or e.left.kind != EXPR_UNARY
+    if e.type_kind != TypeKind.Ptr or e.left == null or e.left.kind != ExprKind.Unary
         return
     let a: *Expr = e.left
-    if (a.op != OP_ADDR and a.op != OP_ADDR_MUT) or a.operand == null or a.operand.kind != EXPR_IDENT
+    if (a.op != OpKind.Addr and a.op != OpKind.AddrMut) or a.operand == null or a.operand.kind != ExprKind.Ident
         return
     let b: *OcBind = oc_lookup(sm, StrView { ptr: (a.operand.ident_ptr), len: (a.operand.ident_len) as i64 })
     if b == null or b.uninit_line == 0
@@ -2576,7 +2602,7 @@ fn oc_merge_moved(after_then: *i32)
     oc_restore(after_then)
     free(now as *u8)
 
-# STMT_IF, after both arms: settle the move state per ritz0.
+# StmtKind.If, after both arms: settle the move state per ritz0.
 fn oc_if_merge(before: *i32, after_then: *i32, then_dead: i32, has_else: i32, else_dead: i32)
     if has_else == 0
         if then_dead == 1
@@ -2618,41 +2644,45 @@ fn oc_arms_settle(before: *i32, acc: *i32)
 
 # 1 when `e` is a constructor that builds its enum where it stands.
 fn oc_scrutinee_builds(sm: *Sema, e: *Expr) -> i32
-    if e.kind == EXPR_CALL
-        if is_variant_carrier(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1 or is_variant_null(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1
-            return 1
-        var name: *u8 = null
-        var len: i32 = 0
-        user_variant_ctor_enum(e, @name, @len)
-        if name != null
-            return 1
-        if e.call_type_suffix_len == 0 and sema_find_fn(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == null
-            var vi: i32 = 0
-            if generic_enum_of_variant(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi) >= 0
+    match e.kind
+        ExprKind.Call =>
+            if is_variant_carrier(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1 or is_variant_null(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1
                 return 1
-        return 0
-    if e.kind == EXPR_METHOD
-        return rl_qualified_variant(sm, e)
+            var name: *u8 = null
+            var len: i32 = 0
+            user_variant_ctor_enum(e, @name, @len)
+            if name != null
+                return 1
+            if e.call_type_suffix_len == 0 and sema_find_fn(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == null
+                var vi: i32 = 0
+                if generic_enum_of_variant(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi) >= 0
+                    return 1
+            return 0
+        ExprKind.Method =>
+            return rl_qualified_variant(sm, e)
+        _ => pass
     0
 
 # 1 when the move check just moved `e`, a match scrutinee, by value.
 fn oc_scrutinee_moved(sm: *Sema, e: *Expr) -> i32
     if oc_checking(sm) == 0
         return 0
-    let k: i32 = e.kind
-    if k == EXPR_IDENT
-        let b: *OcBind = oc_lookup(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if b != null and b.count == 0 and b.moved == 1
-            return 1
-        return 0
-    if k == EXPR_CALL
-        var len: i32 = 0
-        if oc_call_ret_type(sm, e, @len) != null
-            return 1
-        return oc_scrutinee_builds(sm, e)
-    if k == EXPR_METHOD
-        return oc_scrutinee_builds(sm, e)
-    if k == EXPR_MEMBER
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Ident =>
+            let b: *OcBind = oc_lookup(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if b != null and b.count == 0 and b.moved == 1
+                return 1
+            return 0
+        ExprKind.Call =>
+            var len: i32 = 0
+            if oc_call_ret_type(sm, e, @len) != null
+                return 1
+            return oc_scrutinee_builds(sm, e)
+        ExprKind.Method =>
+            return oc_scrutinee_builds(sm, e)
+        _ => pass
+    if k == ExprKind.Member
         var b: *OcBind = null
         var dn: *u8 = null
         var dl: i32 = 0
@@ -2664,17 +2694,17 @@ fn oc_scrutinee_moved(sm: *Sema, e: *Expr) -> i32
 # AGAST #2178: does a match on `e` own nothing because something else owns
 # the value?  ritz0's MoveChecker._lent_scrutinee_type.
 fn oc_match_lent(sm: *Sema, e: *Expr) -> i32
-    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         return 1
     if oc_through(sm, e) == 1 or oc_element_root(sm, e) != null
         return 1
     var r: *Expr = e
-    while r != null and (r.kind == EXPR_MEMBER or (r.kind == EXPR_UNARY and r.op == OP_DEREF))
-        if r.kind == EXPR_MEMBER
+    while r != null and (r.kind == ExprKind.Member or (r.kind == ExprKind.Unary and r.op == OpKind.Deref))
+        if r.kind == ExprKind.Member
             r = r.left
         else
             r = r.operand
-    if r == null or r.kind != EXPR_IDENT
+    if r == null or r.kind != ExprKind.Ident
         return 0
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (r.ident_ptr), len: (r.ident_len) as i64 })
     if v == null
@@ -2687,7 +2717,7 @@ fn oc_match_lent(sm: *Sema, e: *Expr) -> i32
 # `x` of a tagged constructor `Some(x)` / `Ok(x)` / `Err(x)`, which builds
 # its enum where it stands; null for any other `e`.
 fn oc_ctor_arg(e: *Expr) -> *Expr
-    if e == null or e.kind != EXPR_CALL
+    if e == null or e.kind != ExprKind.Call
         return null
     if is_variant_carrier(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 0 and is_variant_null(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 0
         return null
@@ -2701,13 +2731,13 @@ fn oc_ctor_arg(e: *Expr) -> *Expr
 fn oc_scrut_enum(sm: *Sema, typed: *Expr, out_len: *i32) -> *u8
     var t: SemaTy
     sema_expr_ty(sm, typed, @t)
-    if t.kind != TYPE_UNKNOWN and t.name != null and t.name_len > 0
+    if t.kind != TypeKind.Unknown and t.name != null and t.name_len > 0
         *out_len = t.name_len
         return t.name
     # Else what the image of its LocalVar says (ref_check's typing).
     var env: RefEnv
     var r: RefTy
-    if ref_ty_in(ref_env_of(@env, null, sm), typed, @r) == 0 or r.kind != TYPE_STRUCT or r.name_len <= 0
+    if ref_ty_in(ref_env_of(@env, null, sm), typed, @r) == 0 or r.kind != TypeKind.Struct or r.name_len <= 0
         return null
     *out_len = r.name_len
     r.name
@@ -2721,7 +2751,7 @@ fn oc_match_begin(sm: *Sema, scrut: *Expr)
     if scrut == null
         return
     var typed: *Expr = scrut
-    if scrut.kind == EXPR_UNARY and (scrut.op == OP_ADDR or scrut.op == OP_ADDR_MUT) and scrut.operand != null
+    if scrut.kind == ExprKind.Unary and (scrut.op == OpKind.Addr or scrut.op == OpKind.AddrMut) and scrut.operand != null
         typed = scrut.operand
     var len: i32 = 0
     var name: *u8 = oc_scrut_enum(sm, typed, @len)
@@ -2748,7 +2778,7 @@ fn oc_match_begin(sm: *Sema, scrut: *Expr)
 # (sema_arm_payload_ty: a variant's payload of the scrutinee's enum, `Some(v)`
 # of `match Some(make(1))` too); null when it holds none.
 fn oc_payload_struct(pv: *SemaVar, out_len: *i32) -> *u8
-    if pv.kind != TYPE_STRUCT or pv.type_name == null or pv.type_name_len <= 0
+    if pv.kind != TypeKind.Struct or pv.type_name == null or pv.type_name_len <= 0
         return null
     *out_len = pv.type_name_len
     pv.type_name
@@ -2892,102 +2922,106 @@ fn oc_defer_leaves_list(e: *Expr, loops: i32) -> i32
 fn oc_defer_leaves_expr(e: *Expr, loops: i32) -> i32
     if e == null
         return DEFER_OK
-    let k: i32 = e.kind
-    if k == EXPR_TRY
-        return DEFER_TRY
-    if k == EXPR_UNARY
-        return oc_defer_leaves_expr(e.operand, loops)
-    if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        let r: i32 = oc_defer_leaves_expr(e.left, loops)
-        if r != DEFER_OK
-            return r
-        return oc_defer_leaves_expr(e.right, loops)
-    if k == EXPR_MEMBER or k == EXPR_CAST
-        return oc_defer_leaves_expr(e.left, loops)
-    if k == EXPR_CALL or k == EXPR_ARRAY_LIT
-        return oc_defer_leaves_list(e.args, loops)
-    if k == EXPR_METHOD
-        let r: i32 = oc_defer_leaves_expr(e.left, loops)
-        if r != DEFER_OK
-            return r
-        return oc_defer_leaves_list(e.args, loops)
-    if k == EXPR_STRUCT_LIT
-        var fi: *FieldInit = e.args as *FieldInit
-        while fi != null
-            let r: i32 = oc_defer_leaves_expr(fi.value, loops)
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Try =>
+            return DEFER_TRY
+        ExprKind.Unary =>
+            return oc_defer_leaves_expr(e.operand, loops)
+        ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
+            let r: i32 = oc_defer_leaves_expr(e.left, loops)
             if r != DEFER_OK
                 return r
-            fi = fi.next
-        return DEFER_OK
-    if k == EXPR_MATCH or k == EXPR_IF
-        let r: i32 = oc_defer_leaves_expr(e.left, loops)
-        if r != DEFER_OK
-            return r
-        return oc_defer_leaves_arms(e.args as *MatchArm, loops)
+            return oc_defer_leaves_expr(e.right, loops)
+        ExprKind.Member | ExprKind.Cast =>
+            return oc_defer_leaves_expr(e.left, loops)
+        ExprKind.Call | ExprKind.ArrayLit =>
+            return oc_defer_leaves_list(e.args, loops)
+        ExprKind.Method =>
+            let r: i32 = oc_defer_leaves_expr(e.left, loops)
+            if r != DEFER_OK
+                return r
+            return oc_defer_leaves_list(e.args, loops)
+        ExprKind.StructLit =>
+            var fi: *FieldInit = e.args as *FieldInit
+            while fi != null
+                let r: i32 = oc_defer_leaves_expr(fi.value, loops)
+                if r != DEFER_OK
+                    return r
+                fi = fi.next
+            return DEFER_OK
+        ExprKind.Match | ExprKind.If =>
+            let r: i32 = oc_defer_leaves_expr(e.left, loops)
+            if r != DEFER_OK
+                return r
+            return oc_defer_leaves_arms(e.args as *MatchArm, loops)
+        _ => pass
     DEFER_OK
 
 fn oc_defer_leaves_stmt(st: *Stmt, loops: i32) -> i32
-    let k: i32 = st.kind
-    if k == STMT_RETURN
-        return DEFER_RETURN
-    if k == STMT_BREAK
-        if loops == 0
-            return DEFER_BREAK
-        return DEFER_OK
-    if k == STMT_CONTINUE
-        if loops == 0
-            return DEFER_CONTINUE
-        return DEFER_OK
-    if k == STMT_EXPR
-        return oc_defer_leaves_expr(st.expr, loops)
-    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
-        return oc_defer_leaves_expr(st.var_init, loops)
-    if k == STMT_IF
-        var r: i32 = oc_defer_leaves_expr(st.if_cond, loops)
-        if r == DEFER_OK
-            r = oc_defer_leaves_stmts(st.if_then, loops)
-        if r == DEFER_OK
-            r = oc_defer_leaves_stmts(st.if_else, loops)
-        return r
-    if k == STMT_ASSERT
-        return oc_defer_leaves_expr(st.if_cond, loops)
-    if k == STMT_WHILE
-        let r: i32 = oc_defer_leaves_expr(st.while_cond, loops)
-        if r != DEFER_OK
+    let k: StmtKind = st.kind
+    match k
+        StmtKind.Return =>
+            return DEFER_RETURN
+        StmtKind.Break =>
+            if loops == 0
+                return DEFER_BREAK
+            return DEFER_OK
+        StmtKind.Continue =>
+            if loops == 0
+                return DEFER_CONTINUE
+            return DEFER_OK
+        StmtKind.Expr =>
+            return oc_defer_leaves_expr(st.expr, loops)
+        StmtKind.VarDecl | StmtKind.TupleDecl =>
+            return oc_defer_leaves_expr(st.var_init, loops)
+        StmtKind.If =>
+            var r: i32 = oc_defer_leaves_expr(st.if_cond, loops)
+            if r == DEFER_OK
+                r = oc_defer_leaves_stmts(st.if_then, loops)
+            if r == DEFER_OK
+                r = oc_defer_leaves_stmts(st.if_else, loops)
             return r
-        return oc_defer_leaves_stmts(st.while_body, loops + 1)
-    if k == STMT_LOOP
-        return oc_defer_leaves_stmts(st.while_body, loops + 1)
-    if k == STMT_UNSAFE
-        return oc_defer_leaves_stmts(st.while_body, loops)   # a block, not a loop (#2248)
-    if k == STMT_ASM
-        # Control leaves an asm block at its end (§18.6, AGAST #3394).
-        return DEFER_OK
-    if k == STMT_FOR
-        var r: i32 = oc_defer_leaves_expr(st.for_start, loops)
-        if r == DEFER_OK
-            r = oc_defer_leaves_expr(st.for_end, loops)
-        if r == DEFER_OK
-            r = oc_defer_leaves_stmts(st.for_body, loops + 1)
-        return r
-    if k == STMT_MATCH
-        let r: i32 = oc_defer_leaves_expr(st.if_cond as *Expr, loops)
-        if r != DEFER_OK
+        StmtKind.Assert =>
+            return oc_defer_leaves_expr(st.if_cond, loops)
+        StmtKind.While =>
+            let r: i32 = oc_defer_leaves_expr(st.while_cond, loops)
+            if r != DEFER_OK
+                return r
+            return oc_defer_leaves_stmts(st.while_body, loops + 1)
+        StmtKind.Loop =>
+            return oc_defer_leaves_stmts(st.while_body, loops + 1)
+        StmtKind.Unsafe =>
+            return oc_defer_leaves_stmts(st.while_body, loops)   # a block, not a loop (#2248)
+        StmtKind.Asm =>
+            # Control leaves an asm block at its end (§18.6, AGAST #3394).
+            return DEFER_OK
+        StmtKind.For =>
+            var r: i32 = oc_defer_leaves_expr(st.for_start, loops)
+            if r == DEFER_OK
+                r = oc_defer_leaves_expr(st.for_end, loops)
+            if r == DEFER_OK
+                r = oc_defer_leaves_stmts(st.for_body, loops + 1)
             return r
-        return oc_defer_leaves_arms(st.if_then as *MatchArm, loops)
-    if k == STMT_ASSIGN
-        if st.assign_target_len == 0
+        StmtKind.Match =>
             let r: i32 = oc_defer_leaves_expr(st.if_cond as *Expr, loops)
             if r != DEFER_OK
                 return r
-        return oc_defer_leaves_expr(st.assign_value, loops)
-    if k == STMT_MEMBER_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN
-        return oc_defer_leaves_expr(st.assign_value, loops)
-    if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        let r: i32 = oc_defer_leaves_expr(st.while_cond, loops)
-        if r != DEFER_OK
-            return r
-        return oc_defer_leaves_expr(st.assign_value, loops)
+            return oc_defer_leaves_arms(st.if_then as *MatchArm, loops)
+        StmtKind.Assign =>
+            if st.assign_target_len == 0
+                let r: i32 = oc_defer_leaves_expr(st.if_cond as *Expr, loops)
+                if r != DEFER_OK
+                    return r
+            return oc_defer_leaves_expr(st.assign_value, loops)
+        StmtKind.MemberAssign | StmtKind.LocalFieldAssign =>
+            return oc_defer_leaves_expr(st.assign_value, loops)
+        StmtKind.IndexAssign | StmtKind.LocalFieldIndexAssign | StmtKind.MemberIndexAssign =>
+            let r: i32 = oc_defer_leaves_expr(st.while_cond, loops)
+            if r != DEFER_OK
+                return r
+            return oc_defer_leaves_expr(st.assign_value, loops)
+        _ => pass
     DEFER_OK
 
 fn oc_defer_leaves_stmts(list: *Stmt, loops: i32) -> i32
@@ -3006,7 +3040,7 @@ fn oc_defer_refusal(sm: *Sema, d: *Stmt) -> i32
     if body == null
         oc_defer_error(sm, d, c"`defer` needs a statement")
         return 1
-    if d.defer_is_block == 0 and (body.kind == STMT_VAR_DECL or body.kind == STMT_TUPLE_DECL)
+    if d.defer_is_block == 0 and (body.kind == StmtKind.VarDecl or body.kind == StmtKind.TupleDecl)
         oc_defer_error(sm, d, c"a deferred `let` or `var` would die at once")
         return 1
     let r: i32 = oc_defer_leaves_stmts(body, 0)
@@ -3022,7 +3056,7 @@ fn oc_defer_refusal(sm: *Sema, d: *Stmt) -> i32
         return 1
     0
 
-# A STMT_DEFER is reached: register it with the innermost block.
+# A StmtKind.Defer is reached: register it with the innermost block.
 fn oc_defer(sm: *Sema, d: *Stmt)
     let o: *OcState = oc()
     if oc_defer_refusal(sm, d) == 1
@@ -3141,108 +3175,112 @@ fn oc_replay_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
 fn oc_replay_expr(sm: *Sema, e: *Expr)
     if e == null
         return
-    let k: i32 = e.kind
-    if k == EXPR_MATCH or k == EXPR_IF
-        oc_replay_expr(sm, e.left)
-        var scrut: *Expr = null
-        if k == EXPR_MATCH
-            scrut = e.left
-        oc_replay_arms(sm, scrut, e.args as *MatchArm)
-    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        oc_replay_expr(sm, e.left)
-        oc_replay_expr(sm, e.right)
-    else if k == EXPR_UNARY
-        oc_replay_expr(sm, e.operand)
-    else if k == EXPR_CAST or k == EXPR_MEMBER or k == EXPR_TRY or k == EXPR_ARRAY_FILL
-        oc_replay_expr(sm, e.left)
-    else if k == EXPR_CALL or k == EXPR_ARRAY_LIT
-        var a: *Expr = e.args
-        while a != null
-            oc_replay_expr(sm, a)
-            a = a.next
-    else if k == EXPR_METHOD
-        oc_replay_expr(sm, e.left)
-        var a: *Expr = e.args
-        while a != null
-            oc_replay_expr(sm, a)
-            a = a.next
-    else if k == EXPR_STRUCT_LIT
-        var fi: *FieldInit = e.args as *FieldInit
-        while fi != null
-            oc_replay_expr(sm, fi.value)
-            fi = fi.next
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Match | ExprKind.If =>
+            oc_replay_expr(sm, e.left)
+            var scrut: *Expr = null
+            if k == ExprKind.Match
+                scrut = e.left
+            oc_replay_arms(sm, scrut, e.args as *MatchArm)
+        ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
+            oc_replay_expr(sm, e.left)
+            oc_replay_expr(sm, e.right)
+        ExprKind.Unary =>
+            oc_replay_expr(sm, e.operand)
+        ExprKind.Cast | ExprKind.Member | ExprKind.Try | ExprKind.ArrayFill =>
+            oc_replay_expr(sm, e.left)
+        ExprKind.Call | ExprKind.ArrayLit =>
+            var a: *Expr = e.args
+            while a != null
+                oc_replay_expr(sm, a)
+                a = a.next
+        ExprKind.Method =>
+            oc_replay_expr(sm, e.left)
+            var a: *Expr = e.args
+            while a != null
+                oc_replay_expr(sm, a)
+                a = a.next
+        ExprKind.StructLit =>
+            var fi: *FieldInit = e.args as *FieldInit
+            while fi != null
+                oc_replay_expr(sm, fi.value)
+                fi = fi.next
+        _ => pass
 
 fn oc_replay_stmt(sm: *Sema, st: *Stmt)
     oc_stmt_begin(sm, st)
-    let k: i32 = st.kind
-    if k == STMT_VAR_DECL
-        oc_replay_expr(sm, st.var_init)
-        var t: SemaTy
-        if st.var_declared_type != TYPE_VOID
-            t.kind = st.var_type
-            t.name = st.var_type_name
-            t.name_len = st.var_type_name_len
-            t.pointee = st.var_pointee_type
-            t.fn_sig = null
-        else
-            sema_expr_ty(sm, st.var_init, @t)
-        sema_bind_ty(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, @t, st.var_is_let)
-    else if k == STMT_TUPLE_DECL
-        oc_replay_expr(sm, st.var_init)
-        sema_bind(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 })
-        sema_bind(sm, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 })
-        var tn: *TupleName = st.tuple_more
-        while tn != null
-            sema_bind(sm, StrView { ptr: (tn.name), len: (tn.len) as i64 })
-            tn = tn.next
-    else if k == STMT_IF
-        oc_replay_expr(sm, st.if_cond)
-        let before: *i32 = oc_snapshot()
-        oc_replay_block(sm, st.if_then)
-        let then_dead: i32 = oc().last_pop_dead
-        let after_then: *i32 = oc_snapshot()
-        var else_dead: i32 = 0
-        var has_else: i32 = 0
-        if st.if_else != null
-            has_else = 1
-            oc_restore(before)
-            oc_replay_block(sm, st.if_else)
-            else_dead = oc().last_pop_dead
-        oc_if_merge(before, after_then, then_dead, has_else, else_dead)
-    else if k == STMT_WHILE
-        oc_replay_expr(sm, st.while_cond)
-        oc_replay_loop(sm, st.while_body)
-    else if k == STMT_LOOP
-        oc_replay_loop(sm, st.while_body)
-    else if k == STMT_FOR
-        oc_replay_expr(sm, st.for_start)
-        oc_replay_expr(sm, st.for_end)
-        let for_mark: i32 = sm.scope_top
-        sema_bind(sm, StrView { ptr: (st.for_var), len: (st.for_var_len) as i64 })
-        oc_replay_loop(sm, st.for_body)
-        sm.scope_top = for_mark
-    else if k == STMT_UNSAFE
-        let mark: i32 = sm.scope_top
-        oc_replay_list(sm, st.while_body)
-        sm.scope_top = mark
-    else if k == STMT_MATCH
-        oc_replay_expr(sm, st.if_cond as *Expr)
-        oc_replay_arms(sm, st.if_cond as *Expr, st.if_then as *MatchArm)
-    else if k == STMT_RETURN
-        oc_replay_expr(sm, st.return_value)
-    else if k == STMT_EXPR
-        oc_replay_expr(sm, st.expr)
-    else if k == STMT_ASSERT
-        oc_replay_expr(sm, st.if_cond)
-    else if k == STMT_ASSIGN
-        if st.assign_target_len == 0
+    let k: StmtKind = st.kind
+    match k
+        StmtKind.VarDecl =>
+            oc_replay_expr(sm, st.var_init)
+            var t: SemaTy
+            if st.var_declared_type != TypeKind.Void
+                t.kind = st.var_type
+                t.name = st.var_type_name
+                t.name_len = st.var_type_name_len
+                t.pointee = st.var_pointee_type
+                t.fn_sig = null
+            else
+                sema_expr_ty(sm, st.var_init, @t)
+            sema_bind_ty(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, @t, st.var_is_let)
+        StmtKind.TupleDecl =>
+            oc_replay_expr(sm, st.var_init)
+            sema_bind(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 })
+            sema_bind(sm, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 })
+            var tn: *TupleName = st.tuple_more
+            while tn != null
+                sema_bind(sm, StrView { ptr: (tn.name), len: (tn.len) as i64 })
+                tn = tn.next
+        StmtKind.If =>
+            oc_replay_expr(sm, st.if_cond)
+            let before: *i32 = oc_snapshot()
+            oc_replay_block(sm, st.if_then)
+            let then_dead: i32 = oc().last_pop_dead
+            let after_then: *i32 = oc_snapshot()
+            var else_dead: i32 = 0
+            var has_else: i32 = 0
+            if st.if_else != null
+                has_else = 1
+                oc_restore(before)
+                oc_replay_block(sm, st.if_else)
+                else_dead = oc().last_pop_dead
+            oc_if_merge(before, after_then, then_dead, has_else, else_dead)
+        StmtKind.While =>
+            oc_replay_expr(sm, st.while_cond)
+            oc_replay_loop(sm, st.while_body)
+        StmtKind.Loop =>
+            oc_replay_loop(sm, st.while_body)
+        StmtKind.For =>
+            oc_replay_expr(sm, st.for_start)
+            oc_replay_expr(sm, st.for_end)
+            let for_mark: i32 = sm.scope_top
+            sema_bind(sm, StrView { ptr: (st.for_var), len: (st.for_var_len) as i64 })
+            oc_replay_loop(sm, st.for_body)
+            sm.scope_top = for_mark
+        StmtKind.Unsafe =>
+            let mark: i32 = sm.scope_top
+            oc_replay_list(sm, st.while_body)
+            sm.scope_top = mark
+        StmtKind.Match =>
             oc_replay_expr(sm, st.if_cond as *Expr)
-        oc_replay_expr(sm, st.assign_value)
-    else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        oc_replay_expr(sm, st.while_cond)
-        oc_replay_expr(sm, st.assign_value)
-    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
-        oc_replay_expr(sm, st.assign_value)
+            oc_replay_arms(sm, st.if_cond as *Expr, st.if_then as *MatchArm)
+        StmtKind.Return =>
+            oc_replay_expr(sm, st.return_value)
+        StmtKind.Expr =>
+            oc_replay_expr(sm, st.expr)
+        StmtKind.Assert =>
+            oc_replay_expr(sm, st.if_cond)
+        StmtKind.Assign =>
+            if st.assign_target_len == 0
+                oc_replay_expr(sm, st.if_cond as *Expr)
+            oc_replay_expr(sm, st.assign_value)
+        StmtKind.IndexAssign | StmtKind.LocalFieldIndexAssign | StmtKind.MemberIndexAssign =>
+            oc_replay_expr(sm, st.while_cond)
+            oc_replay_expr(sm, st.assign_value)
+        StmtKind.LocalFieldAssign | StmtKind.MemberAssign =>
+            oc_replay_expr(sm, st.assign_value)
+        _ => pass
     oc_stmt_end(sm, st)
 
 # =============================================================================
@@ -3277,7 +3315,7 @@ pub fn own_check_begin_fn(sm: *Sema, f: *FnDef)
     oc_push_scope()
     var p: *Param = f.params
     while p != null
-        if p.param_type == TYPE_STRUCT or p.param_type == TYPE_ARRAY
+        if p.param_type == TypeKind.Struct or p.param_type == TypeKind.Array
             oc_register(sm, StrView { ptr: (p.name), len: (p.name_len) as i64 })
         p = p.next
     o.body_pending = OC_BLOCK_BODY
@@ -3335,7 +3373,7 @@ pub fn own_check_mute(delta: i32)
 pub fn own_check_stmt(sm: *Sema, st: *Stmt, fn_tail: i32)
     if oc_muted() == 1
         return
-    if fn_tail == 1 and st.kind == STMT_EXPR
+    if fn_tail == 1 and st.kind == StmtKind.Expr
         if oc_checking(sm) == 1
             oc_walk(sm, st.expr, 1)
         oc_lent_value_stmt(sm, st.expr)

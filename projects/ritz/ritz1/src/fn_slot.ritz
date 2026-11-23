@@ -53,20 +53,19 @@ import sema_type
 import bool_check      # sbk_global, sbk_value_fn_sig, sbk_member_field
 
 # A `fn(..) -> T` base; no TYPE_* is this.
-const FS_FN: i32 = 9001
 const FS_MAX: i32 = 4
 
 # A type as ritz0 spells and judges it: `n` pointer / reference levels
-# (outermost first, each a TYPE_PTR / TYPE_REF / TYPE_MUT_REF) over a base, a
-# primitive TYPE_* (TYPE_VOID for none), a TYPE_STRUCT `name`, a TYPE_ARRAY
-# of `size` `elem`s, or an FS_FN `sig`.  `lent` is a `name:& T` param, whose
+# (outermost first, each a TypeKind.Ptr / TypeKind.Ref / TypeKind.MutRef) over a base, a
+# primitive TYPE_* (TypeKind.Void for none), a TypeKind.Struct `name`, a TypeKind.Array
+# of `size` `elem`s, or an TypeKind.FnSig `sig`.  `lent` is a `name:& T` param, whose
 # borrow level is not among the levels (ritz0 types the param as T).  `ok` is
 # 0 when some part couldn't be decoded.
 struct FsTy
     ok: i32
     n: i32
-    lv: [4]i32
-    base: i32
+    lv: [4]TypeKind
+    base: TypeKind
     name: *u8
     name_len: i32
     size: i32
@@ -77,7 +76,7 @@ struct FsTy
 fn fs_clear(t: *FsTy)
     t.ok = 1
     t.n = 0
-    t.base = TYPE_VOID
+    t.base = TypeKind.Void
     t.name = null
     t.name_len = 0
     t.size = 0
@@ -90,17 +89,17 @@ fn fs_new() -> *FsTy
     fs_clear(t)
     t
 
-fn fs_prim(k: i32) -> i32
-    (fs_int(k) == 1 or k == TYPE_BOOL or ty_is_float(k) == 1) as i32
+fn fs_prim(k: TypeKind) -> i32
+    (fs_int(k) == 1 or k == TypeKind.Bool or ty_is_float(k) == 1) as i32
 
-fn fs_int(k: i32) -> i32
+fn fs_int(k: TypeKind) -> i32
     (ty_int_bits(k) != 0) as i32
 
 # An i64 / u64, which a pointer fits and which fits a pointer.
-fn fs_word(k: i32) -> i32
+fn fs_word(k: TypeKind) -> i32
     (ty_int_bits(k) == 64) as i32
 
-fn fs_push(t: *FsTy, k: i32)
+fn fs_push(t: *FsTy, k: TypeKind)
     if t.n >= FS_MAX
         t.ok = 0
         return
@@ -125,30 +124,30 @@ fn fs_name_ok(name_sv: StrView) -> i32
     1
 
 # The base `kind` (a primitive, or a struct `name`).
-fn fs_base(t: *FsTy, kind: i32, name_sv: StrView)
+fn fs_base(t: *FsTy, kind: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if fs_prim(kind) == 1
         t.base = kind
-    else if kind == TYPE_STRUCT and fs_name_ok(StrView { ptr: (name), len: (len) as i64 }) == 1
-        t.base = TYPE_STRUCT
+    else if kind == TypeKind.Struct and fs_name_ok(StrView { ptr: (name), len: (len) as i64 }) == 1
+        t.base = TypeKind.Struct
         t.name = name
         t.name_len = len
     else
         t.ok = 0
 
 # A 1-D `[size]E`, E a primitive or struct (`name`), or a `*U` (`elem_pointee`).
-fn fs_array(t: *FsTy, size: i32, elem_kind: i32, name_sv: StrView, elem_pointee: i32, shape: *ArrayShape)
+fn fs_array(t: *FsTy, size: i32, elem_kind: TypeKind, name_sv: StrView, elem_pointee: TypeKind, shape: *ArrayShape)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if shape != null or size <= 0
         t.ok = 0
         return
-    t.base = TYPE_ARRAY
+    t.base = TypeKind.Array
     t.size = size
     let el: *FsTy = fs_new()
-    if elem_kind == TYPE_PTR
-        fs_push(el, TYPE_PTR)
+    if elem_kind == TypeKind.Ptr
+        fs_push(el, TypeKind.Ptr)
         fs_base(el, elem_pointee, StrView { ptr: (name), len: (len) as i64 })
     else
         fs_base(el, elem_kind, StrView { ptr: (name), len: (len) as i64 })
@@ -157,17 +156,17 @@ fn fs_array(t: *FsTy, size: i32, elem_kind: i32, name_sv: StrView, elem_pointee:
         t.ok = 0
 
 # What a one-level pointer / reference param `p` of kind `k` points at.
-fn fs_pointee(t: *FsTy, p: *Param, k: i32)
-    let pt: i32 = p.param_pointee_type
-    if pt == TYPE_ARRAY
+fn fs_pointee(t: *FsTy, p: *Param, k: TypeKind)
+    let pt: TypeKind = p.param_pointee_type
+    if pt == TypeKind.Array
         fs_array(t, p.param_pointee_array_size, p.param_pointee_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, p.param_pointee_array_elem_pointee, p.param_pointee_array_shape)
-    else if pt == TYPE_PTR and k != TYPE_PTR
+    else if pt == TypeKind.Ptr and k != TypeKind.Ptr
         # `@*U` / `@&*U` / `:& *U`; `@@U` is held as an `@*U` (INNER_REF_*)
-        var lk: i32 = TYPE_PTR
+        var lk: TypeKind = TypeKind.Ptr
         if p.is_borrow == 0 and p.param_inner_ref == INNER_REF_SHARED
-            lk = TYPE_REF
+            lk = TypeKind.Ref
         else if p.is_borrow == 0 and p.param_inner_ref == INNER_REF_MUT
-            lk = TYPE_MUT_REF
+            lk = TypeKind.MutRef
         fs_push(t, lk)
         fs_base(t, p.param_ref_ptr_pointee, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
     else
@@ -176,30 +175,32 @@ fn fs_pointee(t: *FsTy, p: *Param, k: i32)
 # The type param `p` declares.
 fn fs_param(p: *Param, t: *FsTy)
     fs_clear(t)
-    let k: i32 = p.param_type
-    if fs_prim(k) == 1 or k == TYPE_STRUCT
+    let k: TypeKind = p.param_type
+    if fs_prim(k) == 1 or k == TypeKind.Struct
         fs_base(t, k, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-    else if k == TYPE_ARRAY
+    else if k == TypeKind.Array
         fs_array(t, p.param_array_size, p.param_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, p.param_array_elem_pointee, p.param_array_shape)
-    else if k == TYPE_PTR and p.fn_sig != null
-        t.base = FS_FN
+    else if k == TypeKind.Ptr and p.fn_sig != null
+        t.base = TypeKind.FnSig
         t.sig = p.fn_sig
-    else if k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF
-        fs_push(t, k)
-        fs_pointee(t, p, k)
-    else if k == TYPE_PTR_PTR
-        let slot: i32 = p.param_inner_pointee_type
-        let levels: i32 = ptr_ptr_slot_levels(slot)
-        if levels < 2
-            t.ok = 0
-            return
-        var i: i32 = 0
-        while i < levels
-            fs_push(t, TYPE_PTR)
-            i = i + 1
-        fs_base(t, ptr_ptr_slot_inner(slot), StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
     else
-        t.ok = 0
+        match k
+            TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
+                fs_push(t, k)
+                fs_pointee(t, p, k)
+            TypeKind.PtrPtr =>
+                let slot: i32 = p.param_inner_pointee_type
+                let levels: i32 = ptr_ptr_slot_levels(slot)
+                if levels < 2
+                    t.ok = 0
+                    return
+                var i: i32 = 0
+                while i < levels
+                    fs_push(t, TypeKind.Ptr)
+                    i = i + 1
+                fs_base(t, ptr_ptr_slot_inner(slot), StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+            _ =>
+                t.ok = 0
     if p.is_borrow == 1 or p.is_self_borrow == 1
         # `name:& T` is T to ritz0, with its own fit into a `@T` slot.
         if t.n == 0
@@ -215,9 +216,9 @@ fn fs_param(p: *Param, t: *FsTy)
 # The type `fd` returns.
 fn fs_ret(sm: *Sema, fd: *FnDef, t: *FsTy)
     fs_clear(t)
-    let rt: i32 = fd.return_type
+    let rt: TypeKind = fd.return_type
     if fd.ret_fn_sig != null
-        t.base = FS_FN
+        t.base = TypeKind.FnSig
         t.sig = fd.ret_fn_sig
     else if fd.ret_ref != null
         fs_param(fd.ret_ref, t)
@@ -225,30 +226,34 @@ fn fs_ret(sm: *Sema, fd: *FnDef, t: *FsTy)
         fs_param(fd.ret_ptr_array, t)
     else if fd.ret_array_param != null
         fs_param(fd.ret_array_param, t)
-    else if rt == TYPE_VOID
-        t.base = TYPE_VOID
-    else if rt == TYPE_PTR
-        # A `-> *T` return names T on return_type_name (#1984); a fn type's
-        # does too since #4324.
-        fs_push(t, TYPE_PTR)
-        let pt: i32 = primitive_type_from_name(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
-        if pt != 0
-            t.base = pt
-        else if sema_find_struct(sm, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) != null
-            fs_base(t, TYPE_STRUCT, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
-        else
-            t.ok = 0
     else
-        fs_base(t, rt, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
+        match rt
+            TypeKind.Void =>
+                t.base = TypeKind.Void
+            TypeKind.Ptr =>
+                # A `-> *T` return names T on return_type_name (#1984); a fn type's
+                # does too since #4324.
+                fs_push(t, TypeKind.Ptr)
+                let pt: TypeKind = primitive_type_from_name(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
+                if pt != TypeKind.Void
+                    t.base = pt
+                else if sema_find_struct(sm, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) != null
+                    fs_base(t, TypeKind.Struct, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
+                else
+                    t.ok = 0
+            _ =>
+                fs_base(t, rt, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
 
 # 1 when every part of `t` decoded, nested signatures too.
 fn fs_ok(sm: *Sema, t: *FsTy) -> i32
     if t.ok == 0
         return 0
-    if t.base == FS_FN
-        return fs_sig_ok(sm, t.sig)
-    if t.base == TYPE_ARRAY
-        return fs_ok(sm, t.elem)
+    match t.base
+        TypeKind.FnSig =>
+            return fs_sig_ok(sm, t.sig)
+        TypeKind.Array =>
+            return fs_ok(sm, t.elem)
+        _ => pass
     1
 
 # 1 when `fd`'s whole signature decodes: it can be judged and spelled.
@@ -270,7 +275,7 @@ fn fs_sig_ok(sm: *Sema, fd: *FnDef) -> i32
 
 # A struct whose fits ritz0 rules elsewhere (a view, a future): taken as fitting.
 fn fs_view_name(t: *FsTy) -> i32
-    if t.base != TYPE_STRUCT
+    if t.base != TypeKind.Struct
         return 0
     if name_eq(StrView { ptr: (t.name), len: (t.name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (t.name), len: (t.name_len) as i64 }, StrView { ptr: (c"Future"), len: (6) as i64 }) == 1
         return 1
@@ -280,7 +285,7 @@ fn fs_view_name(t: *FsTy) -> i32
 
 # `a` from level `ai` is a `*u8` exactly.
 fn fs_is_byte_ptr(a: *FsTy, ai: i32) -> i32
-    (a.n - ai == 1 and a.lv[ai] == TYPE_PTR and a.base == TYPE_U8) as i32
+    (a.n - ai == 1 and a.lv[ai] == TypeKind.Ptr and a.base == TypeKind.U8) as i32
 
 # Does `a` (from its level `ai`) fit where `e` (from `ei`) is wanted?
 fn fs_compat(sm: *Sema, a: *FsTy, ai: i32, e: *FsTy, ei: i32) -> i32
@@ -291,35 +296,35 @@ fn fs_compat(sm: *Sema, a: *FsTy, ai: i32, e: *FsTy, ei: i32) -> i32
     if an > 0 and en == 0
         if fs_word(e.base) == 1
             return 1
-        return (e.base == FS_FN and fs_is_byte_ptr(a, ai) == 1) as i32
+        return (e.base == TypeKind.FnSig and fs_is_byte_ptr(a, ai) == 1) as i32
     if an == 0 and en > 0
         return fs_word(a.base)
     if an > 0 and en > 0
         if fs_is_byte_ptr(e, ei) == 1
             return 1
-        if fs_is_byte_ptr(a, ai) == 1 and e.lv[ei] == TYPE_PTR
+        if fs_is_byte_ptr(a, ai) == 1 and e.lv[ei] == TypeKind.Ptr
             return 1
         return fs_compat(sm, a, ai + 1, e, ei + 1)
     # Both bases, no levels left.
-    if a.base == FS_FN or e.base == FS_FN
-        if a.base == FS_FN and e.base == FS_FN
+    if a.base == TypeKind.FnSig or e.base == TypeKind.FnSig
+        if a.base == TypeKind.FnSig and e.base == TypeKind.FnSig
             return fs_sig_fits(sm, a.sig, e.sig)
         return 0
-    if a.base == TYPE_ARRAY or e.base == TYPE_ARRAY
-        if a.base == TYPE_ARRAY and e.base == TYPE_ARRAY
+    if a.base == TypeKind.Array or e.base == TypeKind.Array
+        if a.base == TypeKind.Array and e.base == TypeKind.Array
             return fs_compat(sm, a.elem, 0, e.elem, 0)
         return 0
-    if a.base == TYPE_VOID or e.base == TYPE_VOID
+    if a.base == TypeKind.Void or e.base == TypeKind.Void
         return 1
-    if a.base == TYPE_STRUCT or e.base == TYPE_STRUCT
-        if a.base == TYPE_STRUCT and e.base == TYPE_STRUCT
+    if a.base == TypeKind.Struct or e.base == TypeKind.Struct
+        if a.base == TypeKind.Struct and e.base == TypeKind.Struct
             return name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (e.name), len: (e.name_len) as i64 })
         return 0
     if a.base == e.base
         return 1
     if fs_int(a.base) == 1 and fs_int(e.base) == 1
         return 1
-    (a.base == TYPE_F32 and e.base == TYPE_F64) as i32
+    (a.base == TypeKind.F32 and e.base == TypeKind.F64) as i32
 
 # Arrays reached through matching levels have the same length and element.
 fn fs_agree(a: *FsTy, ai: i32, e: *FsTy, ei: i32) -> i32
@@ -328,14 +333,14 @@ fn fs_agree(a: *FsTy, ai: i32, e: *FsTy, ei: i32) -> i32
     while i < a.n and j < e.n
         i = i + 1
         j = j + 1
-    if i < a.n or j < e.n or a.base != TYPE_ARRAY or e.base != TYPE_ARRAY
+    if i < a.n or j < e.n or a.base != TypeKind.Array or e.base != TypeKind.Array
         return 1
     if a.size != e.size
         return 0
     let x: *FsTy = a.elem
     let y: *FsTy = e.elem
-    if x.n == 0 and y.n == 0 and x.base != TYPE_ARRAY and y.base != TYPE_ARRAY and x.base != FS_FN and y.base != FS_FN
-        if x.base == TYPE_STRUCT or y.base == TYPE_STRUCT
+    if x.n == 0 and y.n == 0 and x.base != TypeKind.Array and y.base != TypeKind.Array and x.base != TypeKind.FnSig and y.base != TypeKind.FnSig
+        if x.base == TypeKind.Struct or y.base == TypeKind.Struct
             return (x.base == y.base and name_eq(StrView { ptr: (x.name), len: (x.name_len) as i64 }, StrView { ptr: (y.name), len: (y.name_len) as i64 }) == 1) as i32
         return (x.base == y.base) as i32
     fs_agree(x, 0, y, 0)
@@ -370,27 +375,29 @@ fn fs_sig_fits(sm: *Sema, a: *FnDef, e: *FnDef) -> i32
 fn fs_print(sm: *Sema, t: *FsTy)
     var i: i32 = 0
     while i < t.n
-        let k: i32 = t.lv[i]
-        if k == TYPE_PTR
-            eprints_cstr(c"*")
-        else if k == TYPE_REF
-            eprints_cstr(c"@")
-        else
-            eprints_cstr(c"@&")
+        let k: TypeKind = t.lv[i]
+        match k
+            TypeKind.Ptr =>
+                eprints_cstr(c"*")
+            TypeKind.Ref =>
+                eprints_cstr(c"@")
+            _ =>
+                eprints_cstr(c"@&")
         i = i + 1
-    if t.base == FS_FN
-        fs_print_sig(sm, t.sig)
-    else if t.base == TYPE_ARRAY
-        eprints_cstr(c"[")
-        eprint_int(t.size as i64)
-        eprints_cstr(c"]")
-        fs_print(sm, t.elem)
-    else if t.base == TYPE_STRUCT
-        eprint_bytes(StrView { ptr: (t.name), len: (t.name_len) as i64 })
-    else if t.base == TYPE_VOID
-        eprints_cstr(c"void")
-    else
-        eprints_cstr(ty_name(t.base))
+    match t.base
+        TypeKind.FnSig =>
+            fs_print_sig(sm, t.sig)
+        TypeKind.Array =>
+            eprints_cstr(c"[")
+            eprint_int(t.size as i64)
+            eprints_cstr(c"]")
+            fs_print(sm, t.elem)
+        TypeKind.Struct =>
+            eprint_bytes(StrView { ptr: (t.name), len: (t.name_len) as i64 })
+        TypeKind.Void =>
+            eprints_cstr(c"void")
+        _ =>
+            eprints_cstr(ty_name(t.base))
 
 fn fs_print_sig(sm: *Sema, fd: *FnDef)
     eprints_cstr(c"fn(")
@@ -414,7 +421,7 @@ fn fs_print_sig(sm: *Sema, fd: *FnDef)
 fn fs_value_sig(sm: *Sema, v: *Expr) -> *FnDef
     if v == null
         return null
-    if v.kind == EXPR_IDENT
+    if v.kind == ExprKind.Ident
         let lv: *SemaVar = sema_find_local(sm, StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 })
         if lv != null
             return lv.fn_sig
@@ -444,7 +451,7 @@ fn fs_report(sm: *Sema, line: i32, col: i32)
 
 # `let h: fn(..) -> T = v` / `var`.
 pub fn fn_slot_decl(sm: *Sema, st: *Stmt)
-    if st.var_init == null or st.var_declared_type != TYPE_PTR
+    if st.var_init == null or st.var_declared_type != TypeKind.Ptr
         return
     let sig: *FnDef = fs_misfit(sm, st.var_init, st.var_fn_sig)
     if sig == null
@@ -458,7 +465,7 @@ pub fn fn_slot_decl(sm: *Sema, st: *Stmt)
 
 # The fn type of the place `target = ..` writes, or null.
 fn fs_target_sig(sm: *Sema, st: *Stmt) -> *FnDef
-    if st.kind == STMT_ASSIGN
+    if st.kind == StmtKind.Assign
         if st.assign_target_len != 0
             let v: *SemaVar = sema_find_local(sm, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 })
             if v != null
@@ -469,12 +476,12 @@ fn fs_target_sig(sm: *Sema, st: *Stmt) -> *FnDef
                 return g.fn_sig
             return null
         let target: *Expr = st.if_cond as *Expr
-        if target != null and target.kind == EXPR_MEMBER
+        if target != null and target.kind == ExprKind.Member
             let f: *StructField = sbk_member_field(sm, target)
-            if f != null and f.field_type == TYPE_PTR
+            if f != null and f.field_type == TypeKind.Ptr
                 return f.fn_sig
         return null
-    if st.kind == STMT_LOCAL_FIELD_ASSIGN
+    if st.kind == StmtKind.LocalFieldAssign
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 })
         if v == null
             return null
@@ -485,7 +492,7 @@ fn fs_target_sig(sm: *Sema, st: *Stmt) -> *FnDef
         if idx < 0
             return null
         let f: *StructField = get_field_type(sd, idx)
-        if f.field_type == TYPE_PTR
+        if f.field_type == TypeKind.Ptr
             return f.fn_sig
     null
 
@@ -515,7 +522,7 @@ pub fn fn_slot_call(sm: *Sema, e: *Expr)
     var a: *Expr = e.args
     var n: i32 = 1
     while p != null and a != null
-        if p.param_type == TYPE_PTR and p.fn_sig != null
+        if p.param_type == TypeKind.Ptr and p.fn_sig != null
             let sig: *FnDef = fs_misfit(sm, a, p.fn_sig)
             if sig != null
                 fs_report(sm, a.span.line, a.span.col)
@@ -542,7 +549,7 @@ pub fn fn_slot_struct_lit(sm: *Sema, e: *Expr)
         let idx: i32 = find_field_index(sd, StrView { ptr: (fi.name), len: (fi.name_len) as i64 })
         if idx >= 0
             let f: *StructField = get_field_type(sd, idx)
-            if f.field_type == TYPE_PTR and f.fn_sig != null
+            if f.field_type == TypeKind.Ptr and f.fn_sig != null
                 let sig: *FnDef = fs_misfit(sm, fi.value, f.fn_sig)
                 if sig != null
                     fs_report(sm, fi.value.span.line, fi.value.span.col)
@@ -558,7 +565,7 @@ pub fn fn_slot_struct_lit(sm: *Sema, e: *Expr)
 # `return v` in the fn being walked.
 pub fn fn_slot_return(sm: *Sema, st: *Stmt)
     let f: *FnDef = sm.cur_fn
-    if f == null or f.return_type != TYPE_PTR
+    if f == null or f.return_type != TypeKind.Ptr
         return
     let sig: *FnDef = fs_misfit(sm, st.return_value, f.ret_fn_sig)
     if sig == null
@@ -573,7 +580,7 @@ pub fn fn_slot_return(sm: *Sema, st: *Stmt)
 # `st`, the last statement of the fn being walked, is its value.
 pub fn fn_slot_tail(sm: *Sema, st: *Stmt)
     let f: *FnDef = sm.cur_fn
-    if f == null or f.return_type != TYPE_PTR or st.kind != STMT_EXPR
+    if f == null or f.return_type != TypeKind.Ptr or st.kind != StmtKind.Expr
         return
     let sig: *FnDef = fs_misfit(sm, st.expr, f.ret_fn_sig)
     if sig == null

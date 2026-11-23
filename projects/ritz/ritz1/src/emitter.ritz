@@ -35,13 +35,13 @@ import ritzlib.hashmap
 
 # AGAST #2565: an impl method's (non-sret) return type, as its `define` line
 # and its implicit-tail `ret` both spell it.  A primitive can still reach here
-# as a TYPE_STRUCT name (`-> void`; usize/isize did until AGAST #2198 made
-# them TYPE_I64); emit_llvm_type_struct maps those names to their LLVM
-# primitive, and a TYPE_STRUCT that lost its name keeps emit_llvm_type's i64.
+# as a TypeKind.Struct name (`-> void`; usize/isize did until AGAST #2198 made
+# them TypeKind.I64); emit_llvm_type_struct maps those names to their LLVM
+# primitive, and a TypeKind.Struct that lost its name keeps emit_llvm_type's i64.
 fn emit_method_ret_type(s: *EmitterState, method: *FnDef)
     if ret_array_of(method) != null
         emit_fn_ret_llvm_type(s, method)   # AGAST #2302: `[N x T]`
-    else if method.return_type == TYPE_STRUCT and method.return_type_name != null and method.return_type_name_len > 0
+    else if method.return_type == TypeKind.Struct and method.return_type_name != null and method.return_type_name_len > 0
         emit_llvm_type_struct(s, method.return_type, StrView { ptr: (method.return_type_name), len: (method.return_type_name_len) as i64 })
     else
         emit_str(s, ty_value_llvm(method.return_type))
@@ -49,23 +49,23 @@ fn emit_method_ret_type(s: *EmitterState, method: *FnDef)
 # 1 if the method returns a real named struct (`define %T`), 0 for a scalar:
 # its tail is a scalar register, not a struct to load and `ret %T`.
 #
-# AGAST #3561: no primitive reaches here as a TYPE_STRUCT name any more, so
+# AGAST #3561: no primitive reaches here as a TypeKind.Struct name any more, so
 # #2565's is_primitive_type_name guard was dead and is gone.  type_named
 # parses usize/isize/f32/f64 to their kinds (#2198), the other primitives are
 # tokens, monomorph substitutes `-> T` through primitive_type_from_name, and
 # an `impl` on a primitive (the only way `-> Self` names one) is refused.
 fn method_returns_named_struct(method: *FnDef) -> i32
-    if method.return_type != TYPE_STRUCT or method.return_type_name == null or method.return_type_name_len <= 0
+    if method.return_type != TypeKind.Struct or method.return_type_name == null or method.return_type_name_len <= 0
         return 0
     1
 
 # AGAST #3147: a tail in a `-> S` method is a copy into the return slot, as
 # `return e` is (#2996), so a whole struct element (`p[i]`, `(*r)[i]`) is
 # loaded rather than refused.  emit_struct_copy's `ty` for that tail.
-fn method_tail_copy_type(method: *FnDef) -> i32
+fn method_tail_copy_type(method: *FnDef) -> TypeKind
     if method_returns_named_struct(method) == 1
-        return TYPE_STRUCT
-    TYPE_VOID
+        return TypeKind.Struct
+    TypeKind.Void
 
 # The span of a body's last statement: the value an implicit return returns.
 fn body_tail_span(body: *Stmt) -> SrcSpan
@@ -87,13 +87,13 @@ fn body_tail_span(body: *Stmt) -> SrcSpan
 #
 # `tail` is the body's last statement (body_tail_span), where an error about
 # the implicit return's value is reported (AGAST #3445).
-fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: bool, ret_type: i32, ret_type_name_sv: StrView, tail: SrcSpan)
+fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: bool, ret_type: TypeKind, ret_type_name_sv: StrView, tail: SrcSpan)
     var ret_type_name: *u8 = ret_type_name_sv.ptr
     var ret_type_name_len: i32 = ret_type_name_sv.len as i32
-    # A TYPE_STRUCT return that lost its name is declared through emit_llvm_type
+    # A TypeKind.Struct return that lost its name is declared through emit_llvm_type
     # (emit_impl_method's header does this), so every `ret` below must be too.
     var named_struct: i32 = 0
-    if ret_type == TYPE_STRUCT and ret_type_name != null and ret_type_name_len > 0
+    if ret_type == TypeKind.Struct and ret_type_name != null and ret_type_name_len > 0
         named_struct = 1
 
     # If no explicit return and function has non-void return, use the last
@@ -104,11 +104,11 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: bool, ret_ty
     # loop-exit block, where the body does not dominate the ret on the
     # zero-iteration path.  `last_expr_here` returns 0 in that case, and
     # Sema's tail_value_check (AGAST #2236, #3511) has already rejected a fn that ends there.
-    if not has_explicit_return and ret_type != TYPE_VOID
+    if not has_explicit_return and ret_type != TypeKind.Void
         var ival: i32 = last_expr_here(s)
         # AGAST #2950: a tail `if` / `match` whose phi is an i64 in a `-> @&T`
         # fn (an arm `q` with `q: *C`), or a `ptr` in a `-> *T` / `-> @T` one.
-        if ival > 0 and ret_type == TYPE_MUT_REF and s.last_expr_model == LAST_EXPR_I64
+        if ival > 0 and ret_type == TypeKind.MutRef and s.last_expr_model == LAST_EXPR_I64
             let p: i32 = next_reg(s)
             emit_str(s, IR_INDENT)
             emit_reg(s, p)
@@ -116,7 +116,7 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: bool, ret_ty
             emit_reg(s, ival)
             emit_str(s, c" to ptr  ; #2950\n")
             ival = p
-        else if ival > 0 and (ret_type == TYPE_PTR or ret_type == TYPE_REF) and s.last_expr_model == LAST_EXPR_PTR
+        else if ival > 0 and (ret_type == TypeKind.Ptr or ret_type == TypeKind.Ref) and s.last_expr_model == LAST_EXPR_PTR
             let q: i32 = next_reg(s)
             emit_str(s, IR_INDENT)
             emit_reg(s, q)
@@ -125,7 +125,7 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: bool, ret_ty
             emit_str(s, c" to i64  ; #2950\n")
             ival = q
         if ival > 0
-            if ret_type == TYPE_ARRAY
+            if ret_type == TypeKind.Array
                 # AGAST #2302: emit_array_return takes a tail statement; this
                 # value (an `if` / `match` arm's, say) is no `[N x T]`.
                 emit_ir_error(s, tail, c"a `-> [N]T` fn's value here is not lowered by ritz1 (return the array from each arm)")
@@ -134,7 +134,7 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: bool, ret_ty
                 emit_str(s, c"  ret i32 ")
                 emit_reg(s, trunc)
                 emit_str(s, IR_NL)
-            else if ret_type == TYPE_BOOL
+            else if ret_type == TypeKind.Bool
                 # Match arms / binops carry their result as i64 even when the
                 # function signature is bool; trunc back to i1 at the implicit
                 # return (mirrors the explicit-return path at line ~195).
@@ -160,7 +160,7 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: bool, ret_ty
                 # (ritz-task-133).  Without this the tail-expression phi
                 # carries `%Result$...` but the ret claims `i64`.
                 emit_str(s, c"  ret ")
-                emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (ret_type_name), len: (ret_type_name_len) as i64 })
+                emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (ret_type_name), len: (ret_type_name_len) as i64 })
                 emit_str(s, IR_SP)
                 emit_reg(s, ival)
                 emit_str(s, IR_NL)
@@ -177,17 +177,17 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: bool, ret_ty
             # its scrutinee (#2245, #2344): this is the merge after arms that
             # all left, or the exit of a `while true`.
             emit_str(s, c"  unreachable\n")
-    else if ret_type == TYPE_VOID and not has_explicit_return
+    else if ret_type == TypeKind.Void and not has_explicit_return
         emit_str(s, c"  ret void\n")
 
 # AGAST #3421: a statement `if` ending a fn body.  In an `-> f64` / `-> f32`
 # fn it is a float slot (LARB R43), as the tail `match` is (#3385); in a
 # procedure nobody reads its value, so it has no phi (its arms could be an
 # i64 and a double, #3749's discarded `if`).
-fn tail_if_slot(s: *EmitterState, stmt: *Stmt, ret_type: i32, ret_name_sv: StrView)
+fn tail_if_slot(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind, ret_name_sv: StrView)
     var ret_name: *u8 = ret_name_sv.ptr
     var ret_name_len: i32 = ret_name_sv.len as i32
-    if ret_type == TYPE_VOID
+    if ret_type == TypeKind.Void
         s.if_stmt_discarded = stmt
         return
     s.match_float_hint = slot_float_type(ret_type, StrView { ptr: (ret_name), len: (ret_name_len) as i64 })
@@ -203,13 +203,13 @@ fn bind_nd_pointee_param(s: *EmitterState, param: *Param)
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
     if loc == null
         return
-    if param.param_type == TYPE_PTR and lv_pointee_type(loc) == TYPE_ARRAY
+    if param.param_type == TypeKind.Ptr and lv_pointee_type(loc) == TypeKind.Array
         lv_set_pointee_array_shape(loc, param.param_pointee_array_shape)
-    else if param.param_type == TYPE_PTR_PTR and lv_pointee_type(loc) == TYPE_PTR
+    else if param.param_type == TypeKind.PtrPtr and lv_pointee_type(loc) == TypeKind.Ptr
         lv_set_pointee_array_shape(loc, param.param_pointee_array_shape)
-    else if (param.param_type == TYPE_REF or param.param_type == TYPE_MUT_REF) and lv_pointee_type(loc) == TYPE_PTR
+    else if (param.param_type == TypeKind.Ref or param.param_type == TypeKind.MutRef) and lv_pointee_type(loc) == TypeKind.Ptr
         lv_set_pointee_array_shape(loc, param.param_pointee_array_shape)   # AGAST #4122: `@*[N][M]T`
-    else if (param.param_type == TYPE_REF or param.param_type == TYPE_MUT_REF) and lv_pointee_type(loc) == TYPE_ARRAY
+    else if (param.param_type == TypeKind.Ref or param.param_type == TypeKind.MutRef) and lv_pointee_type(loc) == TypeKind.Array
         lv_set_pointee_array_shape(loc, param.param_pointee_array_shape)   # AGAST #4313: `@[N][M]T` / `@&[N][M]T`
 
 # AGAST #1644: bind a scalar `name:& T` borrow param whose ptr was just
@@ -223,64 +223,66 @@ fn bind_nd_pointee_param(s: *EmitterState, param: *Param)
 # same way.
 # An array pointee binds the same way, as an array local (AGAST #2290).
 fn bind_scalar_borrow_param(s: *EmitterState, param: *Param, alloca_reg: i32) -> i32
-    if param.is_borrow != 1 or param.param_type != TYPE_MUT_REF
+    if param.is_borrow != 1 or param.param_type != TypeKind.MutRef
         return 0
-    let pt: i32 = param.param_pointee_type
+    let pt: TypeKind = param.param_pointee_type
     # AGAST #2290: `a:& [N]T` binds as an array local whose slot is the array
     # behind the borrow, so `a[i]`, `a[i] = v`, `@a[i]`, `a[i].f` and every
     # other element path index it as `[N x T]`, as for the caller's own array.
     # As a reference local the index paths had no element type and fell back
     # to i64: `a[1] = 3` stored 8 bytes past the end of a `[2]i32`.
-    if pt == TYPE_ARRAY
-        let aslot: i32 = emit_borrow_slot_load(s, alloca_reg)
-        add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, aslot, TYPE_ARRAY, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, TYPE_ARRAY, param.param_pointee_array_size, param.param_pointee_array_elem_type)
-        set_local_pointee_array(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_pointee_array_size, param.param_pointee_array_elem_type)
-        set_local_pointee_elem(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_pointee_array_elem_pointee)
-        let lent: *LocalVar = find_local_struct_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
-        lv_set_array_elem_pointee(lent, param.param_pointee_array_elem_pointee)   # it reads as the array
-        let aloc: *LocalVar = find_local_struct_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
-        lv_set_array_shape(aloc, param.param_pointee_array_shape)
-        mark_lent_param(s, param)
-        return 1
-    # AGAST #2075: `p:& *T` (T an integer or a struct) is a borrow of a
-    # pointer variable, and like the integer case `p` reads as the
-    # referent: the `*T` value.  Bind it as a `*T` local whose slot is the
-    # caller's pointer variable, so `p`, `*p`, `p.f`, `@*p` (which is p's
-    # value) and `p = q` lower as for the caller's own `var p: *T`.  Before
-    # this, `p` was left a TYPE_MUT_REF whose value is the borrow itself,
-    # so `@*p` returned the `**T` slot.
-    if pt == TYPE_PTR
-        let ipt: i32 = param.param_inner_pointee_type
-        # AGAST #3103: `p:& *[N]T` the same way, as a `*[N]T` local with the
-        # `p#` view a `p: *[N]T` param gets, so `p[i]` is element i (§13.4).
-        if ipt == TYPE_ARRAY and param.param_pointee_array_size > 0
-            let aps: i32 = emit_borrow_slot_load(s, alloca_reg)
-            add_array_view(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, aps, TYPE_PTR, TYPE_ARRAY, param.param_pointee_array_size, param.param_pointee_array_elem_type, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 })
-            add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, aps, TYPE_PTR, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, TYPE_ARRAY, 0, 0)
+    match pt
+        TypeKind.Array =>
+            let aslot: i32 = emit_borrow_slot_load(s, alloca_reg)
+            add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, aslot, TypeKind.Array, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, TypeKind.Array, param.param_pointee_array_size, param.param_pointee_array_elem_type)
             set_local_pointee_array(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_pointee_array_size, param.param_pointee_array_elem_type)
             set_local_pointee_elem(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_pointee_array_elem_pointee)
-            # AGAST #4122: `p:& *[N][M]T` is a plane pointer, as a `p: *[N][M]T` is.
-            let bloc: *LocalVar = find_local_struct_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
-            lv_set_pointee_array_shape(bloc, param.param_pointee_array_shape)
-            name_array_ptr_param(s, param)
+            let lent: *LocalVar = find_local_struct_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
+            lv_set_array_elem_pointee(lent, param.param_pointee_array_elem_pointee)   # it reads as the array
+            let aloc: *LocalVar = find_local_struct_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
+            lv_set_array_shape(aloc, param.param_pointee_array_shape)
+            mark_lent_param(s, param)
             return 1
-        # AGAST #2086: and `p:& *bool`, `*f32`, `*f64`: left to the normal
-        # path, `*p` read the borrow slot as the pointer's referent, so
-        # `*p = 3.0` stored a double where the `*f64` lives (invalid IR) and
-        # `*p = true` refused a `bool` as a pointer.
-        let float_or_bool: bool = ipt == TYPE_BOOL or ipt == TYPE_F32 or ipt == TYPE_F64
-        if is_borrow_scalar_kind(ipt) == 0 and ipt != TYPE_STRUCT and float_or_bool == false
-            return 0
-        if ipt == TYPE_STRUCT and param.param_type_name_len <= 0
-            return 0
-        let pslot: i32 = emit_borrow_slot_load(s, alloca_reg)
-        add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, pslot, TYPE_PTR, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, ipt, 0, 0)
-        set_local_inner_ref(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_inner_ref)   # AGAST #2399: `p:& @S`
-        return 1
+        # AGAST #2075: `p:& *T` (T an integer or a struct) is a borrow of a
+        # pointer variable, and like the integer case `p` reads as the
+        # referent: the `*T` value.  Bind it as a `*T` local whose slot is the
+        # caller's pointer variable, so `p`, `*p`, `p.f`, `@*p` (which is p's
+        # value) and `p = q` lower as for the caller's own `var p: *T`.  Before
+        # this, `p` was left a TypeKind.MutRef whose value is the borrow itself,
+        # so `@*p` returned the `**T` slot.
+        TypeKind.Ptr =>
+            let ipt: TypeKind = ptr_slot_flat(param.param_inner_pointee_type)
+            # AGAST #3103: `p:& *[N]T` the same way, as a `*[N]T` local with the
+            # `p#` view a `p: *[N]T` param gets, so `p[i]` is element i (§13.4).
+            if ipt == TypeKind.Array and param.param_pointee_array_size > 0
+                let aps: i32 = emit_borrow_slot_load(s, alloca_reg)
+                add_array_view(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, aps, TypeKind.Ptr, TypeKind.Array, param.param_pointee_array_size, param.param_pointee_array_elem_type, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 })
+                add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, aps, TypeKind.Ptr, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, TypeKind.Array, 0, TypeKind.Void)
+                set_local_pointee_array(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_pointee_array_size, param.param_pointee_array_elem_type)
+                set_local_pointee_elem(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_pointee_array_elem_pointee)
+                # AGAST #4122: `p:& *[N][M]T` is a plane pointer, as a `p: *[N][M]T` is.
+                let bloc: *LocalVar = find_local_struct_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
+                lv_set_pointee_array_shape(bloc, param.param_pointee_array_shape)
+                name_array_ptr_param(s, param)
+                return 1
+            # AGAST #2086: and `p:& *bool`, `*f32`, `*f64`: left to the normal
+            # path, `*p` read the borrow slot as the pointer's referent, so
+            # `*p = 3.0` stored a double where the `*f64` lives (invalid IR) and
+            # `*p = true` refused a `bool` as a pointer.
+            let float_or_bool: bool = ipt == TypeKind.Bool or ipt == TypeKind.F32 or ipt == TypeKind.F64
+            if is_borrow_scalar_kind(ipt) == 0 and ipt != TypeKind.Struct and float_or_bool == false
+                return 0
+            if ipt == TypeKind.Struct and param.param_type_name_len <= 0
+                return 0
+            let pslot: i32 = emit_borrow_slot_load(s, alloca_reg)
+            add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, pslot, TypeKind.Ptr, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, ipt, 0, TypeKind.Void)
+            set_local_inner_ref(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_inner_ref)   # AGAST #2399: `p:& @S`
+            return 1
+        _ => pass
     # AGAST #2372: `p:& **S` the same way, as a `**S` local.
     if param_borrows_struct_ptr_ptr(param) == 1
         let ppslot: i32 = emit_borrow_slot_load(s, alloca_reg)
-        add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, ppslot, TYPE_PTR_PTR, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, TYPE_PTR, 0, 0)
+        add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, ppslot, TypeKind.PtrPtr, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, TypeKind.Ptr, 0, TypeKind.Void)
         set_local_inner_pointee(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_inner_pointee_type)
         set_local_inner_ref(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, param.param_inner_ref)
         return 1
@@ -289,12 +291,12 @@ fn bind_scalar_borrow_param(s: *EmitterState, param: *Param, alloca_reg: i32) ->
     # (a `bool` local keeps it in the low byte of a wider slot).
     # AGAST #1668: and `x:& f32` / `x:& f64`, as a float local: `x` reads the
     # caller's float, `x = x + 1.0` writes it, `@&x` is the caller's pointer.
-    let float_pt: bool = pt == TYPE_F32 or pt == TYPE_F64
-    if is_borrow_scalar_kind(pt) == 0 and pt != TYPE_BOOL and float_pt == false
+    let float_pt: bool = pt == TypeKind.F32 or pt == TypeKind.F64
+    if is_borrow_scalar_kind(pt) == 0 and pt != TypeKind.Bool and float_pt == false
         return 0
     let slot: i32 = emit_borrow_slot_load(s, alloca_reg)
     add_local(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, slot, pt)
-    if pt == TYPE_BOOL
+    if pt == TypeKind.Bool
         local_at(s, s.local_count - 1).is_bool = 1
     mark_lent_param(s, param)
     return 1
@@ -307,8 +309,8 @@ fn bind_scalar_borrow_param(s: *EmitterState, param: *Param, alloca_reg: i32) ->
 # T only for a `p:& *T` borrow (param_borrow); param_ref_ptr_pointee is VOID
 # for anything but an `@*T` / `@&*T`.
 fn param_local_inner_pointee(param: *Param) -> i32
-    if param.param_inner_pointee_type == TYPE_VOID
-        return param.param_ref_ptr_pointee
+    if param.param_inner_pointee_type == (TypeKind.Void as i32)
+        return (param.param_ref_ptr_pointee as i32)
     param.param_inner_pointee_type
 
 # AGAST #2548: a `*[N]S`, `@[N]S` or `@&[N]S` param records S where
@@ -336,17 +338,17 @@ fn mark_lent_param(s: *EmitterState, param: *Param)
     if loc == null
         return
     # AGAST #2407: a param that holds no fn value can't be called.
-    loc.not_fn = (param.fn_sig == null and param.param_type != TYPE_PTR) as i32
+    loc.not_fn = (param.fn_sig == null and param.param_type != TypeKind.Ptr) as i32
     # `self:& C` on a free fn binds here too; in an impl it's a `*C` local.
-    if (param.is_borrow == 1 or param.is_self_borrow == 1) and lv_var_type(loc) == TYPE_MUT_REF
+    if (param.is_borrow == 1 or param.is_self_borrow == 1) and lv_var_type(loc) == TypeKind.MutRef
         lv_set_holds_lent_ptr(loc, 1)
     # AGAST #2278: `self:& T` reads its referent into a by-value `T` slot.
-    if param.is_self_borrow == 1 and lv_pointee_type(loc) == TYPE_STRUCT and (lv_var_type(loc) == TYPE_PTR or lv_var_type(loc) == TYPE_MUT_REF)
+    if param.is_self_borrow == 1 and lv_pointee_type(loc) == TypeKind.Struct and (lv_var_type(loc) == TypeKind.Ptr or lv_var_type(loc) == TypeKind.MutRef)
         lv_set_is_lent_self(loc, 1)
-    if param.is_borrow != 1 or param.param_type != TYPE_MUT_REF
+    if param.is_borrow != 1 or param.param_type != TypeKind.MutRef
         return
-    let pt: i32 = param.param_pointee_type
-    if pt != TYPE_STRUCT and pt != TYPE_ARRAY and is_borrow_scalar_kind(pt) == 0
+    let pt: TypeKind = param.param_pointee_type
+    if pt != TypeKind.Struct and pt != TypeKind.Array and is_borrow_scalar_kind(pt) == 0
         return
     lv_set_is_lent(loc, 1)
 
@@ -387,7 +389,7 @@ fn bind_byval_param(s: *EmitterState, param: *Param) -> i32
 # callee's copy: a no-op GEP names it as a `%.N` slot, as bind_byval_param does,
 # with no first-class `store [N x T]`.
 fn bind_array_param(s: *EmitterState, param: *Param) -> i32
-    if param.param_type != TYPE_ARRAY
+    if param.param_type != TypeKind.Array
         return 0
     let slot: i32 = next_reg(s)
     if array_param_uses_byval(s, param) == 1
@@ -408,13 +410,13 @@ fn bind_array_param(s: *EmitterState, param: *Param) -> i32
         emit_str(s, c".arg, ptr ")
         emit_reg(s, slot)
         emit_str(s, IR_NL)
-    add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, slot, TYPE_ARRAY, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, TYPE_I64, param.param_array_size, param.param_array_elem_type)
+    add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, slot, TypeKind.Array, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, TypeKind.I64, param.param_array_size, param.param_array_elem_type)
     let arr: *LocalVar = find_local_struct_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
     lv_set_array_elem_pointee(arr, param.param_array_elem_pointee)   # AGAST #2343
     lv_set_array_shape(arr, param.param_array_shape)   # AGAST #3634: an N-D local
     return 1
 
-# Spill a bool parameter into an i64 slot and register it as TYPE_I64.
+# Spill a bool parameter into an i64 slot and register it as TypeKind.I64.
 #
 # AGAST #1497. The ABI passes a bool as i1, but ritz1's value model is i64 for
 # every scalar, and bool LOCALS were already promoted to i64 slots for that
@@ -432,7 +434,7 @@ fn emit_bool_param_spill(s: *EmitterState, param: *Param)
     emit_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
     emit_str(s, c".arg to i64\n")
     emit_store_typed(s, IR_TY_I64, wide, alloca_reg)
-    add_local(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, alloca_reg, TYPE_I64)
+    add_local(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, alloca_reg, TypeKind.I64)
     # AGAST #1521: the slot is i64, but print interpolation must still see a
     # bool (`print("{b}")` prints true/false), the same as emit_var_decl's
     # bool locals.
@@ -785,7 +787,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
 
     var param3: *Param = f.params
     while param3 != null
-        if param3.param_type == TYPE_BOOL
+        if param3.param_type == TypeKind.Bool
             emit_bool_param_spill(s, param3)
             param3 = param3.next
             continue
@@ -808,24 +810,25 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         emit_str(s, IR_NL)
         # Track parameter type including struct name for method calls
         # For pointer-to-struct params like *Vec<u8>, we need both:
-        # - param_pointee_type (TYPE_STRUCT) to know it's a pointer to struct
+        # - param_pointee_type (TypeKind.Struct) to know it's a pointer to struct
         # - param_type_name ("Vec$u8") to mangle method calls correctly
         if bind_scalar_borrow_param(s, param3, alloca_reg) == 1
             param3 = param3.next
             continue
-        if param3.param_type == TYPE_PTR or param3.param_type == TYPE_PTR_PTR or param3.param_type == TYPE_REF or param3.param_type == TYPE_MUT_REF
-            add_array_view(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, alloca_reg, param3.param_type, param3.param_pointee_type, param3.param_pointee_array_size, param3.param_pointee_array_elem_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 })   # AGAST #2330
-            add_local_full(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, alloca_reg, param3.param_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 }, param3.param_pointee_type, 0, 0)
-            set_local_inner_pointee(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, param_local_inner_pointee(param3))   # AGAST #3131
-            set_local_inner_ref(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, param3.param_inner_ref)   # AGAST #2399
-            set_local_pointee_array(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, param3.param_pointee_array_size, param3.param_pointee_array_elem_type)  # AGAST #1953
-            bind_nd_pointee_param(s, param3)   # AGAST #2098
-            set_local_pointee_elem(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, param3.param_pointee_array_elem_pointee)
-            name_array_ptr_param(s, param3)   # AGAST #2548
-        else if param3.param_type == TYPE_STRUCT
-            add_local_struct(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, alloca_reg, param3.param_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 })
-        else
-            add_local(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, alloca_reg, param3.param_type)
+        match param3.param_type
+            TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
+                add_array_view(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, alloca_reg, param3.param_type, param3.param_pointee_type, param3.param_pointee_array_size, param3.param_pointee_array_elem_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 })   # AGAST #2330
+                add_local_full(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, alloca_reg, param3.param_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 }, param3.param_pointee_type, 0, TypeKind.Void)
+                set_local_inner_pointee(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, param_local_inner_pointee(param3))   # AGAST #3131
+                set_local_inner_ref(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, param3.param_inner_ref)   # AGAST #2399
+                set_local_pointee_array(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, param3.param_pointee_array_size, param3.param_pointee_array_elem_type)  # AGAST #1953
+                bind_nd_pointee_param(s, param3)   # AGAST #2098
+                set_local_pointee_elem(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, param3.param_pointee_array_elem_pointee)
+                name_array_ptr_param(s, param3)   # AGAST #2548
+            TypeKind.Struct =>
+                add_local_struct(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, alloca_reg, param3.param_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 })
+            _ =>
+                add_local(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, alloca_reg, param3.param_type)
         set_local_fn_sig(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 }, param3.fn_sig)  # AGAST #1671
         mark_lent_param(s, param3)   # AGAST #2250
         param3 = param3.next
@@ -841,7 +844,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             has_explicit_return = true   # AGAST #2305: a tail `if` / `else` of arrays
             stmt = stmt.next
             continue
-        if stmt.next == null and stmt.kind == STMT_EXPR and emit_lent_return(s, stmt.expr, f.return_type) == 1
+        if stmt.next == null and stmt.kind == StmtKind.Expr and emit_lent_return(s, stmt.expr, f.return_type) == 1
             has_explicit_return = true
             stmt = stmt.next
             continue
@@ -849,14 +852,14 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         # AGAST #4072: a procedure's tail returns nothing, so it is an
         # expression statement: its value is a temporary, dropped (§13.6)
         # before the defers run, and emit_implicit_return_tail emits `ret void`.
-        if stmt.next == null and stmt.kind == STMT_EXPR and f.return_type != TYPE_VOID
+        if stmt.next == null and stmt.kind == StmtKind.Expr and f.return_type != TypeKind.Void
             has_explicit_return = true
             struct_return_as_int_refused(s, stmt.expr, f.return_type)   # AGAST #3008
             own_tail_moves(s, stmt.expr)   # AGAST #2158: the tail is moved out
             if emit_array_return(s, stmt.expr, ret_array_of(f)) == 1
                 has_explicit_return = true   # AGAST #2302: a `-> [N]T` tail is returned whole
             # Special handling for struct literal returns
-            else if stmt.expr.kind == EXPR_STRUCT_LIT and f.return_type == TYPE_STRUCT
+            else if stmt.expr.kind == ExprKind.StructLit and f.return_type == TypeKind.Struct
                 # Allocate space for the struct, initialize fields, load and return
                 let alloca_reg: i32 = next_reg(s)
                 entry_alloca_reg_begin_named(s, alloca_reg)
@@ -881,20 +884,20 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     emit_str(s, IR_SP)
                     emit_reg(s, val)
                     emit_str(s, IR_NL)
-            else if f.return_type == TYPE_STRUCT
+            else if f.return_type == TypeKind.Struct
                 # Struct return — handle ident (load from alloca) or call result.
                 # Use emit_llvm_type_struct so tagged-enum types (Result$/Option$)
                 # auto-route to `i64` instead of `%<name>` (task-99 cluster #3).
                 # AGAST #3147: the tail is a copy into the return slot, as
                 # `return e` is, so `p[i]` / `(*r)[i]` of a `C` loads it.
-                if stmt.expr.kind == EXPR_IDENT
+                if stmt.expr.kind == ExprKind.Ident
                     let local: *LocalVar = struct_value_local(s, stmt.expr)
                     if local != null and s.ret_sret == 1
                         emit_sret_ret_from_ptr(s, find_local(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 }))   # AGAST #1730
                     else if local != null
                         let loc: i32 = find_local(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
                         let val: i32 = next_reg(s)
-                        emit_struct_load_or_defer(s, TYPE_STRUCT, val, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, loc, null, 0)
+                        emit_struct_load_or_defer(s, TypeKind.Struct, val, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, loc, null, 0)
                         # AGAST #3564: a tail `v` for `let v = "..."` loads a
                         # %Span$u8; a `-> StrView` fn returns it as a %StrView.
                         var ret_name: *u8 = lv_type_name(local)
@@ -905,29 +908,29 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                             ret_name = s.ret_type_name
                             ret_name_len = s.ret_type_name_len
                         emit_str(s, c"  ret ")
-                        emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (ret_name), len: (ret_name_len) as i64 })
+                        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (ret_name), len: (ret_name_len) as i64 })
                         emit_str(s, IR_SP)
                         emit_reg(s, ret_val)
                         emit_str(s, IR_NL)
                     else if s.ret_sret == 1
-                        emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TYPE_STRUCT))   # AGAST #1730
+                        emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TypeKind.Struct))   # AGAST #1730
                     else
-                        let val: i32 = emit_struct_copy(s, stmt.expr, TYPE_STRUCT)
+                        let val: i32 = emit_struct_copy(s, stmt.expr, TypeKind.Struct)
                         emit_str(s, c"  ret ")
-                        emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
+                        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
                         emit_str(s, IR_SP)
                         emit_reg(s, val)
                         emit_str(s, IR_NL)
                 else if s.ret_sret == 1
-                    emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TYPE_STRUCT))   # AGAST #1730
+                    emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TypeKind.Struct))   # AGAST #1730
                 else
                     # Function call or other expression returning struct.
                     # AGAST #1643: a tail `"..."` is a %Span$u8; coerce it to a
                     # %StrView return the way `return "..."` does (#168).
-                    let val: i32 = emit_struct_copy(s, stmt.expr, TYPE_STRUCT)
+                    let val: i32 = emit_struct_copy(s, stmt.expr, TypeKind.Struct)
                     let ret_reg: i32 = coerce_struct_ret_value(s, stmt.expr, val, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
                     emit_str(s, c"  ret ")
-                    emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
+                    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
                     emit_str(s, IR_SP)
                     emit_reg(s, ret_reg)
                     emit_str(s, IR_NL)
@@ -947,7 +950,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     emit_str(s, c"  ret i32 ")
                     emit_reg(s, trunc)
                     emit_str(s, IR_NL)
-                else if f.return_type == TYPE_BOOL
+                else if f.return_type == TypeKind.Bool
                     # Comparisons zext to i64; trunc back for bool returns.
                     # (task-99 cluster #1)
                     let btrunc: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, val)
@@ -965,7 +968,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     emit_str(s, c"  ret i16 ")
                     emit_reg(s, btrunc16)
                     emit_str(s, IR_NL)
-                else if f.return_type == 0
+                else if f.return_type == TypeKind.Void
                     emit_str(s, c"  ret void\n")
                 else
                     emit_str(s, c"  ret ")
@@ -978,13 +981,13 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             # by dead code (an `if` that returns, say) leaves the final block
             # open, and it needs the implicit tail's terminator.
             has_explicit_return = false
-            if stmt.kind == STMT_RETURN
+            if stmt.kind == StmtKind.Return
                 has_explicit_return = true
-            if stmt.next == null and stmt.kind == STMT_MATCH
+            if stmt.next == null and stmt.kind == StmtKind.Match
                 set_match_agg_hint(s, f.return_type)   # AGAST #3205: the tail match
                 # LARB R43 (#3385): and in an `-> f64` fn it is a float slot.
                 s.match_float_hint = slot_float_type(f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
-            if stmt.next == null and stmt.kind == STMT_IF
+            if stmt.next == null and stmt.kind == StmtKind.If
                 tail_if_slot(s, stmt, f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
             emit_stmt(s, stmt, f.return_type)
         stmt = stmt.next
@@ -1039,7 +1042,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # ritz-task-193 — clear per-method locals map (matches emit_fn).
     s.local_map.clear()
     # Propagate this method's return-type name into emitter state so
-    # STMT_RETURN handling (in emitter_stmt.ritz) emits the correct
+    # StmtKind.Return handling (in emitter_stmt.ritz) emits the correct
     # `ret %T` rather than leaking the previous fn's `s.ret_type_name`.
     # Without this, `fn slice(self: @StrView, ...) -> StrView` ended up
     # emitting `ret %Token` because the Token-returning emit_fn ran
@@ -1077,7 +1080,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # is set), emit `%Type` so call sites that walk the impl table can
     # match the signature.  Other return types route through
     # emit_llvm_type which preserves the legacy i64 default for
-    # TYPE_STRUCT-without-name (impl methods whose return slot lost the
+    # TypeKind.Struct-without-name (impl methods whose return slot lost the
     # name during parse — strview_slice etc. land here).
     if s.ret_sret == 1
         emit_str(s, c"void")
@@ -1132,7 +1135,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     var param2: *Param = method.params
     while param2 != null
-        if param2.param_type == TYPE_BOOL
+        if param2.param_type == TypeKind.Bool
             emit_bool_param_spill(s, param2)
             param2 = param2.next
             continue
@@ -1174,44 +1177,46 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             # member access resolves via the impl type. (task-99 cluster #1)
             # AGAST #3079: `self: @C` is an `@C`, read-only (was a `*C` plus
             # the holds_shared_ref flag, #2338).
-            var self_kind: i32 = TYPE_PTR
-            if param2.param_type == TYPE_REF and param2.is_self_borrow == 0
-                self_kind = TYPE_REF
+            var self_kind: TypeKind = TypeKind.Ptr
+            if param2.param_type == TypeKind.Ref and param2.is_self_borrow == 0
+                self_kind = TypeKind.Ref
             # AGAST #4294: a `self` whose pointee is a primitive (`impl
             # Display for bool`, `self: @bool`) is no struct, so its deref
             # must load the scalar's width (an i1 for bool), not `%bool`.
             # Keep the impl target name only for a struct pointee.  Only a
-            # reference pointee says: param_of_type leaves TYPE_I64 in
-            # param_pointee_type for a bare `self` / `self:&` (TYPE_STRUCT),
+            # reference pointee says: param_of_type leaves TypeKind.I64 in
+            # param_pointee_type for a bare `self` / `self:&` (TypeKind.Struct),
             # and that must keep naming the impl's type.
             var self_name: *u8 = ib.type_name
             var self_name_len: i32 = ib.type_name_len
-            var self_pointee: i32 = TYPE_STRUCT
-            let self_is_ref: i32 = (param2.param_type == TYPE_REF or param2.param_type == TYPE_MUT_REF) as i32
+            var self_pointee: TypeKind = TypeKind.Struct
+            let self_is_ref: i32 = (param2.param_type == TypeKind.Ref or param2.param_type == TypeKind.MutRef) as i32
             if self_is_ref == 1 and primitive_name_from_type(param2.param_pointee_type) != null
                 self_name = null
                 self_name_len = 0
                 self_pointee = param2.param_pointee_type
-            add_local_full(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, self_kind, StrView { ptr: (self_name), len: (self_name_len) as i64 }, self_pointee, 0, 0)
+            add_local_full(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, self_kind, StrView { ptr: (self_name), len: (self_name_len) as i64 }, self_pointee, 0, TypeKind.Void)
             # AGAST #2286: `self:&` is passed as a `ptr`, so `@self` is that
             # pointer.  `self: @C` and `self: @&C` are references: `@self` is the
             # reference's address.
-            if param2.param_type == TYPE_STRUCT or param2.is_self_borrow == 1
+            if param2.param_type == TypeKind.Struct or param2.is_self_borrow == 1
                 let self_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 })
                 lv_set_holds_lent_ptr(self_loc, 1)
-        else if param2.param_type == TYPE_PTR or param2.param_type == TYPE_PTR_PTR or param2.param_type == TYPE_REF or param2.param_type == TYPE_MUT_REF
-            add_array_view(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, param2.param_type, param2.param_pointee_type, param2.param_pointee_array_size, param2.param_pointee_array_elem_type, StrView { ptr: (param2.param_type_name), len: (param2.param_type_name_len) as i64 })   # AGAST #2330
-            add_local_full(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, param2.param_type, StrView { ptr: (param2.param_type_name), len: (param2.param_type_name_len) as i64 }, param2.param_pointee_type, 0, 0)
-            set_local_inner_pointee(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, param_local_inner_pointee(param2))   # AGAST #3131
-            set_local_inner_ref(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, param2.param_inner_ref)   # AGAST #2399
-            set_local_pointee_array(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, param2.param_pointee_array_size, param2.param_pointee_array_elem_type)  # AGAST #1953
-            bind_nd_pointee_param(s, param2)   # AGAST #2098
-            set_local_pointee_elem(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, param2.param_pointee_array_elem_pointee)
-            name_array_ptr_param(s, param2)   # AGAST #2548
-        else if param2.param_type == TYPE_STRUCT
-            add_local_struct(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, param2.param_type, StrView { ptr: (param2.param_type_name), len: (param2.param_type_name_len) as i64 })
         else
-            add_local(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, param2.param_type)
+            match param2.param_type
+                TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
+                    add_array_view(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, param2.param_type, param2.param_pointee_type, param2.param_pointee_array_size, param2.param_pointee_array_elem_type, StrView { ptr: (param2.param_type_name), len: (param2.param_type_name_len) as i64 })   # AGAST #2330
+                    add_local_full(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, param2.param_type, StrView { ptr: (param2.param_type_name), len: (param2.param_type_name_len) as i64 }, param2.param_pointee_type, 0, TypeKind.Void)
+                    set_local_inner_pointee(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, param_local_inner_pointee(param2))   # AGAST #3131
+                    set_local_inner_ref(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, param2.param_inner_ref)   # AGAST #2399
+                    set_local_pointee_array(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, param2.param_pointee_array_size, param2.param_pointee_array_elem_type)  # AGAST #1953
+                    bind_nd_pointee_param(s, param2)   # AGAST #2098
+                    set_local_pointee_elem(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, param2.param_pointee_array_elem_pointee)
+                    name_array_ptr_param(s, param2)   # AGAST #2548
+                TypeKind.Struct =>
+                    add_local_struct(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, param2.param_type, StrView { ptr: (param2.param_type_name), len: (param2.param_type_name_len) as i64 })
+                _ =>
+                    add_local(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, alloca_reg, param2.param_type)
         set_local_fn_sig(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 }, param2.fn_sig)  # AGAST #1671
         mark_lent_param(s, param2)   # AGAST #2250
         param2 = param2.next
@@ -1225,19 +1230,19 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             has_explicit_return = true   # AGAST #2305: a tail `if` / `else` of arrays
             stmt = stmt.next
             continue
-        if stmt.next == null and stmt.kind == STMT_EXPR and emit_lent_return(s, stmt.expr, method.return_type) == 1
+        if stmt.next == null and stmt.kind == StmtKind.Expr and emit_lent_return(s, stmt.expr, method.return_type) == 1
             has_explicit_return = true   # AGAST #2279, as in emit_fn
             stmt = stmt.next
             continue
         # Check if this is the last statement and it's an expression (implicit return)
-        if stmt.next == null and stmt.kind == STMT_EXPR and method.return_type != TYPE_VOID
+        if stmt.next == null and stmt.kind == StmtKind.Expr and method.return_type != TypeKind.Void
             has_explicit_return = true   # AGAST #4072: a procedure's tail is a statement
             struct_return_as_int_refused(s, stmt.expr, method.return_type)   # AGAST #3008
             own_tail_moves(s, stmt.expr)   # AGAST #2158
             if emit_array_return(s, stmt.expr, ret_array_of(method)) == 1
                 has_explicit_return = true   # AGAST #2302: a `-> [N]T` tail is returned whole
             # Special handling for struct literal returns
-            else if stmt.expr.kind == EXPR_STRUCT_LIT and method.return_type == TYPE_STRUCT
+            else if stmt.expr.kind == ExprKind.StructLit and method.return_type == TypeKind.Struct
                 # Allocate space for the struct, initialize fields, load and return
                 let alloca_reg: i32 = next_reg(s)
                 entry_alloca_reg_begin_named(s, alloca_reg)
@@ -1278,7 +1283,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     emit_str(s, c"  ret i32 ")
                     emit_reg(s, trunc)
                     emit_str(s, IR_NL)
-                else if method.return_type == TYPE_BOOL
+                else if method.return_type == TypeKind.Bool
                     # Comparisons zext to i64 in emit_binary; trunc back to
                     # i1 for bool-returning methods. (task-99 cluster #1)
                     let btrunc: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, val)
@@ -1295,25 +1300,25 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     emit_str(s, c"  ret i16 ")
                     emit_reg(s, btrunc16)
                     emit_str(s, IR_NL)
-                else if method.return_type == 0
+                else if method.return_type == TypeKind.Void
                     emit_str(s, c"  ret void\n")
                 else if method_returns_named_struct(method) == 1
                     # Struct-returning impl method.  Function header
                     # emits `define %T @T_method(...)` so the body must
                     # `ret %T <val>`.  Two shapes:
                     #
-                    #  * EXPR_IDENT holding a pointer: emit_expr loaded
+                    #  * ExprKind.Ident holding a pointer: emit_expr loaded
                     #    the local as i64 (ptr-as-int).  Need
                     #    inttoptr+load to materialise a typed struct.
                     #
-                    #  * EXPR_CALL (`return strview_slice(...)`), or a
+                    #  * ExprKind.Call (`return strview_slice(...)`), or a
                     #    struct local such as a by-value `self`: that's
                     #    already a `%T` register, so just `ret %T <val>`.
                     #
                     # AGAST #2351: only a LOCAL can hold a pointer.  A bare
                     # `None` is an ident but no local: emit_expr built the
                     # aggregate, so it takes the value path, as in emit_fn.
-                    let tail_is_local: i32 = (stmt.expr.kind == EXPR_IDENT and find_local(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 }) >= 0) as i32
+                    let tail_is_local: i32 = (stmt.expr.kind == ExprKind.Ident and find_local(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 }) >= 0) as i32
                     let tail_holds_ptr: i32 = (tail_is_local == 1 and struct_value_local(s, stmt.expr) == null) as i32
                     if tail_holds_ptr == 1 and s.ret_sret == 1
                         let spp: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, val)
@@ -1356,13 +1361,13 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             # by dead code (an `if` that returns, say) leaves the final block
             # open, and it needs the implicit tail's terminator.
             has_explicit_return = false
-            if stmt.kind == STMT_RETURN
+            if stmt.kind == StmtKind.Return
                 has_explicit_return = true
-            if stmt.next == null and stmt.kind == STMT_MATCH
+            if stmt.next == null and stmt.kind == StmtKind.Match
                 set_match_agg_hint(s, method.return_type)   # AGAST #3205: the tail match
                 # LARB R43 (#3385): and in an `-> f64` fn it is a float slot.
                 s.match_float_hint = slot_float_type(method.return_type, StrView { ptr: (method.return_type_name), len: (method.return_type_name_len) as i64 })
-            if stmt.next == null and stmt.kind == STMT_IF
+            if stmt.next == null and stmt.kind == StmtKind.If
                 tail_if_slot(s, stmt, method.return_type, StrView { ptr: (method.return_type_name), len: (method.return_type_name_len) as i64 })
             emit_stmt(s, stmt, method.return_type)
         stmt = stmt.next
@@ -1682,7 +1687,7 @@ fn emit_extern_declarations(s: *EmitterState)
                     emit_name(s, StrView { ptr: (sym_name), len: (sym_len) as i64 })
                     emit_str(s, c"(...)")
                     emit_declare_attrs_nl(s)
-                else if fn_def != null and fn_def.return_type == TYPE_STRUCT
+                else if fn_def != null and fn_def.return_type == TypeKind.Struct
                     emit_str(s, c"declare ")
                     emit_str(s, fn_callconv_kw(fn_def))
                     emit_str(s, IR_PCT)
@@ -1691,14 +1696,14 @@ fn emit_extern_declarations(s: *EmitterState)
                     emit_name(s, StrView { ptr: (sym_name), len: (sym_len) as i64 })
                     emit_str(s, c"(...)")
                     emit_declare_attrs_nl(s)
-                else if fn_def != null and fn_def.return_type == TYPE_I32
+                else if fn_def != null and fn_def.return_type == TypeKind.I32
                     emit_str(s, c"declare ")
                     emit_str(s, fn_callconv_kw(fn_def))
                     emit_str(s, c"i32 @")
                     emit_name(s, StrView { ptr: (sym_name), len: (sym_len) as i64 })
                     emit_str(s, c"(...)")
                     emit_declare_attrs_nl(s)
-                else if fn_def != null and fn_def.return_type == TYPE_VOID
+                else if fn_def != null and fn_def.return_type == TypeKind.Void
                     emit_str(s, c"declare ")
                     emit_str(s, fn_callconv_kw(fn_def))
                     emit_str(s, c"void @")
@@ -1715,31 +1720,33 @@ fn emit_extern_declarations(s: *EmitterState)
     if namelist_count(@s.externs) > 0
         emit_str(s, IR_NL)
 # Returns 1 if every value-type struct dependency of `st` has already been
-# emitted, 0 otherwise.  Pointer fields (TYPE_PTR / TYPE_PTR_PTR) are not
+# emitted, 0 otherwise.  Pointer fields (TypeKind.Ptr / TypeKind.PtrPtr) are not
 # dependencies — LLVM's opaque `ptr` lets us reference a forward-declared
-# struct through a pointer.  Embedded structs (TYPE_STRUCT) and arrays of
-# structs (TYPE_ARRAY whose elem is TYPE_STRUCT) require the dependent
+# struct through a pointer.  Embedded structs (TypeKind.Struct) and arrays of
+# structs (TypeKind.Array whose elem is TypeKind.Struct) require the dependent
 # struct's body to be in scope before the use, so they DO count.
 # ritz-task-169.
 fn struct_deps_satisfied(s: *EmitterState, st: *StructDef) -> i32
     var field: *StructField = st.fields
     while field != null
-        if field.field_type == TYPE_STRUCT
-            if field.field_type_name != null
-                if field.field_type_name_len > 0
-                    if was_struct_emitted(s, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }) == 0
-                        return 0
-        else if field.field_type == TYPE_ARRAY
-            if field.array_elem_type == TYPE_STRUCT
-                if field.array_elem_type_name != null
-                    if field.array_elem_type_name_len > 0
-                        if was_struct_emitted(s, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }) == 0
+        match field.field_type
+            TypeKind.Struct =>
+                if field.field_type_name != null
+                    if field.field_type_name_len > 0
+                        if was_struct_emitted(s, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }) == 0
                             return 0
-            # AGAST #2097: `m: [2][2]P` holds P by value too.
-            let fsh: *ArrayShape = field.array_shape
-            if fsh != null and fsh.leaf_type == TYPE_STRUCT and fsh.leaf_name_len > 0
-                if was_struct_emitted(s, StrView { ptr: (fsh.leaf_name), len: (fsh.leaf_name_len) as i64 }) == 0
-                    return 0
+            TypeKind.Array =>
+                if field.array_elem_type == TypeKind.Struct
+                    if field.array_elem_type_name != null
+                        if field.array_elem_type_name_len > 0
+                            if was_struct_emitted(s, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }) == 0
+                                return 0
+                # AGAST #2097: `m: [2][2]P` holds P by value too.
+                let fsh: *ArrayShape = field.array_shape
+                if fsh != null and fsh.leaf_type == TypeKind.Struct and fsh.leaf_name_len > 0
+                    if was_struct_emitted(s, StrView { ptr: (fsh.leaf_name), len: (fsh.leaf_name_len) as i64 }) == 0
+                        return 0
+            _ => pass
         field = field.next
     1
 
@@ -1883,12 +1890,12 @@ fn emit_tagged_enum_arg_decls(s: *EmitterState, name_sv: StrView)
 fn emit_tagged_enum_sig_decls(s: *EmitterState, sig: *FnDef)
     if sig == null
         return
-    if sig.return_type == TYPE_STRUCT or sig.return_type == TYPE_PTR or sig.return_type == TYPE_REF or sig.return_type == TYPE_MUT_REF
+    if sig.return_type == TypeKind.Struct or sig.return_type == TypeKind.Ptr or sig.return_type == TypeKind.Ref or sig.return_type == TypeKind.MutRef
         emit_tagged_enum_decl_once(s, StrView { ptr: (sig.return_type_name), len: (sig.return_type_name_len) as i64 })
     emit_tagged_enum_sig_decls(s, sig.ret_fn_sig)
     var p: *Param = sig.params
     while p != null
-        if p.param_type == TYPE_STRUCT or p.param_type == TYPE_PTR or p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF
+        if p.param_type == TypeKind.Struct or p.param_type == TypeKind.Ptr or p.param_type == TypeKind.Ref or p.param_type == TypeKind.MutRef
             emit_tagged_enum_decl_once(s, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
         emit_tagged_enum_sig_decls(s, p.fn_sig)
         p = p.next
@@ -1900,10 +1907,10 @@ fn emit_tagged_enum_sig_decls(s: *EmitterState, sig: *FnDef)
 fn emit_tagged_enum_types(s: *EmitterState)
     var f: *FnDef = s.module.functions
     while f != null
-        # AGAST #186: scan TYPE_PTR/TYPE_REF/TYPE_MUT_REF too so monomorph-
+        # AGAST #186: scan TypeKind.Ptr/TypeKind.Ref/TypeKind.MutRef too so monomorph-
         # produced fns like `option_is_none$ptr_Page(opt: *Option$ptr_Page)`
         # get their `%Option$ptr_Page` decl emitted.  Original code only
-        # looked at TYPE_STRUCT params/returns and missed pointer-to-enum.
+        # looked at TypeKind.Struct params/returns and missed pointer-to-enum.
         emit_tagged_enum_sig_decls(s, f)
         # Walk body for let-bindings with explicit enum types
         emit_tagged_enum_scan_stmts(s, f.body)
@@ -1938,9 +1945,9 @@ fn emit_tagged_enum_types(s: *EmitterState)
     # AGAST #2454: a global `var g: [N]Option<T>` or `Option<T>` names one too.
     var g: *GlobalVarDef = s.module.globals
     while g != null
-        if g.var_type == TYPE_STRUCT
+        if g.var_type == TypeKind.Struct
             emit_tagged_enum_decl_once(s, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
-        else if g.var_type == TYPE_ARRAY and g.array_elem_type == TYPE_STRUCT
+        else if g.var_type == TypeKind.Array and g.array_elem_type == TypeKind.Struct
             emit_tagged_enum_decl_once(s, StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 })
         g = g.next
 
@@ -1985,27 +1992,29 @@ fn emit_late_enum_types(s: *EmitterState, pos: i64)
 fn emit_tagged_enum_scan_stmts(s: *EmitterState, body: *Stmt)
     var st: *Stmt = body
     while st != null
-        if st.kind == STMT_VAR_DECL
-            # AGAST #186: scan pointer-typed locals too — `var p: *Option<*Page>`
-            # carries the mangled enum name in var_type_name even though
-            # var_type is TYPE_PTR.
-            # AGAST #2454: `[N]Option<T>`, whose var_type_name is its element's:
-            # undeclared, its alloca was an unsized type clang refused.
-            if st.var_type == TYPE_STRUCT or st.var_type == TYPE_PTR or st.var_type == TYPE_REF or st.var_type == TYPE_MUT_REF or st.var_type == TYPE_ARRAY
-                emit_tagged_enum_decl_once(s, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
-            emit_tagged_enum_sig_decls(s, st.var_fn_sig)   # AGAST #3979: `let f: fn() -> Result<P, i32>`
-        else if st.kind == STMT_IF
-            emit_tagged_enum_scan_stmts(s, st.if_then)
-            if st.if_else != null
-                emit_tagged_enum_scan_stmts(s, st.if_else)
-        else if st.kind == STMT_WHILE
-            emit_tagged_enum_scan_stmts(s, st.while_body)
-        else if st.kind == STMT_FOR
-            emit_tagged_enum_scan_stmts(s, st.for_body)
-        else if st.kind == STMT_LOOP or st.kind == STMT_DEFER or st.kind == STMT_UNSAFE
-            emit_tagged_enum_scan_stmts(s, st.while_body)
-        else if st.kind == STMT_ASM
-            pass   # STMT_ASM holds no statement, expression or type (AGAST #3394).
+        match st.kind
+            StmtKind.VarDecl =>
+                # AGAST #186: scan pointer-typed locals too — `var p: *Option<*Page>`
+                # carries the mangled enum name in var_type_name even though
+                # var_type is TypeKind.Ptr.
+                # AGAST #2454: `[N]Option<T>`, whose var_type_name is its element's:
+                # undeclared, its alloca was an unsized type clang refused.
+                if st.var_type == TypeKind.Struct or st.var_type == TypeKind.Ptr or st.var_type == TypeKind.Ref or st.var_type == TypeKind.MutRef or st.var_type == TypeKind.Array
+                    emit_tagged_enum_decl_once(s, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
+                emit_tagged_enum_sig_decls(s, st.var_fn_sig)   # AGAST #3979: `let f: fn() -> Result<P, i32>`
+            StmtKind.If =>
+                emit_tagged_enum_scan_stmts(s, st.if_then)
+                if st.if_else != null
+                    emit_tagged_enum_scan_stmts(s, st.if_else)
+            StmtKind.While =>
+                emit_tagged_enum_scan_stmts(s, st.while_body)
+            StmtKind.For =>
+                emit_tagged_enum_scan_stmts(s, st.for_body)
+            StmtKind.Loop | StmtKind.Defer | StmtKind.Unsafe =>
+                emit_tagged_enum_scan_stmts(s, st.while_body)
+            StmtKind.Asm =>
+                pass   # StmtKind.Asm holds no statement, expression or type (AGAST #3394).
+            _ => pass
         st = st.next
 
 # User-enum type decls (ritz0 parity — test_issue_qualified_enum_variant;
@@ -2075,21 +2084,23 @@ fn emit_enum_fallback_decl(s: *EmitterState, name_sv: StrView)
 fn emit_enum_fallback_scan_stmts(s: *EmitterState, body: *Stmt)
     var st: *Stmt = body
     while st != null
-        if st.kind == STMT_VAR_DECL
-            if st.var_type == TYPE_STRUCT
-                emit_enum_fallback_decl(s, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
-        else if st.kind == STMT_IF
-            emit_enum_fallback_scan_stmts(s, st.if_then)
-            if st.if_else != null
-                emit_enum_fallback_scan_stmts(s, st.if_else)
-        else if st.kind == STMT_WHILE
-            emit_enum_fallback_scan_stmts(s, st.while_body)
-        else if st.kind == STMT_FOR
-            emit_enum_fallback_scan_stmts(s, st.for_body)
-        else if st.kind == STMT_LOOP or st.kind == STMT_DEFER or st.kind == STMT_UNSAFE
-            emit_enum_fallback_scan_stmts(s, st.while_body)
-        else if st.kind == STMT_ASM
-            pass   # STMT_ASM holds no statement, expression or type (AGAST #3394).
+        match st.kind
+            StmtKind.VarDecl =>
+                if st.var_type == TypeKind.Struct
+                    emit_enum_fallback_decl(s, StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
+            StmtKind.If =>
+                emit_enum_fallback_scan_stmts(s, st.if_then)
+                if st.if_else != null
+                    emit_enum_fallback_scan_stmts(s, st.if_else)
+            StmtKind.While =>
+                emit_enum_fallback_scan_stmts(s, st.while_body)
+            StmtKind.For =>
+                emit_enum_fallback_scan_stmts(s, st.for_body)
+            StmtKind.Loop | StmtKind.Defer | StmtKind.Unsafe =>
+                emit_enum_fallback_scan_stmts(s, st.while_body)
+            StmtKind.Asm =>
+                pass   # StmtKind.Asm holds no statement, expression or type (AGAST #3394).
+            _ => pass
         st = st.next
 
 fn emit_enum_fallback_types(s: *EmitterState)
@@ -2105,11 +2116,11 @@ fn emit_enum_fallback_types(s: *EmitterState)
     # Function signatures.
     var f: *FnDef = s.module.functions
     while f != null
-        if f.return_type == TYPE_STRUCT
+        if f.return_type == TypeKind.Struct
             emit_enum_fallback_decl(s, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
         var p: *Param = f.params
         while p != null
-            if p.param_type == TYPE_STRUCT
+            if p.param_type == TypeKind.Struct
                 emit_enum_fallback_decl(s, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
             p = p.next
         emit_enum_fallback_scan_stmts(s, f.body)
@@ -2120,11 +2131,11 @@ fn emit_enum_fallback_types(s: *EmitterState)
     while ib != null
         var meth: *FnDef = ib.methods
         while meth != null
-            if meth.return_type == TYPE_STRUCT
+            if meth.return_type == TypeKind.Struct
                 emit_enum_fallback_decl(s, StrView { ptr: (meth.return_type_name), len: (meth.return_type_name_len) as i64 })
             var mp: *Param = meth.params
             while mp != null
-                if mp.param_type == TYPE_STRUCT
+                if mp.param_type == TypeKind.Struct
                     emit_enum_fallback_decl(s, StrView { ptr: (mp.param_type_name), len: (mp.param_type_name_len) as i64 })
                 mp = mp.next
             emit_enum_fallback_scan_stmts(s, meth.body)
@@ -2140,7 +2151,7 @@ fn emit_enum_fallback_types(s: *EmitterState)
     while sd != null
         var sf: *StructField = sd.fields
         while sf != null
-            if sf.field_type == TYPE_STRUCT and is_enum_type(StrView { ptr: (sf.field_type_name), len: (sf.field_type_name_len) as i64 }) == 1
+            if sf.field_type == TypeKind.Struct and is_enum_type(StrView { ptr: (sf.field_type_name), len: (sf.field_type_name_len) as i64 }) == 1
                 emit_enum_fallback_decl(s, StrView { ptr: (sf.field_type_name), len: (sf.field_type_name_len) as i64 })
             sf = sf.next
         sd = sd.next
@@ -2148,7 +2159,7 @@ fn emit_enum_fallback_types(s: *EmitterState)
     # Global variable types.
     var g: *GlobalVarDef = s.module.globals
     while g != null
-        if g.var_type == TYPE_STRUCT
+        if g.var_type == TypeKind.Struct
             emit_enum_fallback_decl(s, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
         g = g.next
 
@@ -2194,56 +2205,58 @@ fn global_init_fold(s: *EmitterState, e: *Expr, out: *GlobalInit)
     # not 0) or BAD with its own error.  A float/struct/pointer const's
     # `value` is not its value, and any other name (a global, a fn) is not
     # constant: both stay BAD.
-    if e.kind == EXPR_IDENT
-        let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if ce != null and ce.fold_state == CONST_FOLD_DONE and is_int_const_type(ce.const_type) == 1
+    match e.kind
+        ExprKind.Ident =>
+            let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if ce != null and ce.fold_state == CONST_FOLD_DONE and is_int_const_type(ce.const_type) == 1
+                out.kind = GINIT_INT
+                out.int_val = ce.value
+            return
+        ExprKind.IntLit | ExprKind.CharLit =>
             out.kind = GINIT_INT
-            out.int_val = ce.value
-        return
-    if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
-        out.kind = GINIT_INT
-        out.int_val = e.int_val
-        return
-    if e.kind == EXPR_FLOAT_LIT
-        out.kind = GINIT_FLOAT
-        out.text = e.string_ptr
-        out.text_len = e.string_len
-        out.neg = 0
-        return
-    if e.kind == EXPR_NIL_LIT
-        out.kind = GINIT_NULL
-        return
-    # AGAST #2357: a string in a pointer slot points at its own @.str.
-    if e.kind == EXPR_CSTRING_LIT
-        out.kind = GINIT_STR
-        out.text = e.string_ptr
-        out.text_len = e.string_len
-        return
-    if e.kind == EXPR_CAST
-        global_init_fold(s, e.left, out)
-        return
-    if e.kind == EXPR_UNARY
-        global_init_fold(s, e.operand, out)
-        # int_val holds u64 values too (0x8000000000000000 is i64::MIN), so
-        # negation is two's complement and wraps by design (LARB R63).
-        if e.op == OP_NEG
-            if out.kind == GINIT_INT
-                out.int_val = 0 -% out.int_val
-                return
-            if out.kind == GINIT_FLOAT
-                out.neg = 1 - out.neg
-                return
-        else if e.op == OP_BIT_NOT and out.kind == GINIT_INT
-            out.int_val = 0 -% out.int_val -% 1
+            out.int_val = e.int_val
             return
-        else if e.op == OP_NOT and out.kind == GINIT_INT
-            if out.int_val == 0
-                out.int_val = 1
-            else
-                out.int_val = 0
+        ExprKind.FloatLit =>
+            out.kind = GINIT_FLOAT
+            out.text = e.string_ptr
+            out.text_len = e.string_len
+            out.neg = 0
             return
-        out.kind = GINIT_BAD
-        return
+        ExprKind.NilLit =>
+            out.kind = GINIT_NULL
+            return
+        # AGAST #2357: a string in a pointer slot points at its own @.str.
+        ExprKind.CstringLit =>
+            out.kind = GINIT_STR
+            out.text = e.string_ptr
+            out.text_len = e.string_len
+            return
+        ExprKind.Cast =>
+            global_init_fold(s, e.left, out)
+            return
+        ExprKind.Unary =>
+            global_init_fold(s, e.operand, out)
+            # int_val holds u64 values too (0x8000000000000000 is i64::MIN), so
+            # negation is two's complement and wraps by design (LARB R63).
+            if e.op == OpKind.Neg
+                if out.kind == GINIT_INT
+                    out.int_val = 0 -% out.int_val
+                    return
+                if out.kind == GINIT_FLOAT
+                    out.neg = 1 - out.neg
+                    return
+            else if e.op == OpKind.BitNot and out.kind == GINIT_INT
+                out.int_val = 0 -% out.int_val -% 1
+                return
+            else if e.op == OpKind.Not and out.kind == GINIT_INT
+                if out.int_val == 0
+                    out.int_val = 1
+                else
+                    out.int_val = 0
+                return
+            out.kind = GINIT_BAD
+            return
+        _ => pass
 
 # 1 if a float literal's text is +0.0 (FLOAT is /[0-9]+\.[0-9]+/: no exponent).
 fn global_init_float_is_pos_zero(gi: *GlobalInit) -> i32
@@ -2338,54 +2351,58 @@ fn const_parse_f64(text_sv: StrView, out: *f64) -> i32
 fn const_fold_float(s: *EmitterState, e: *Expr, out: *f64) -> i32
     if e == null
         return 0
-    if e.kind == EXPR_FLOAT_LIT
-        return const_parse_f64(StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 }, out)
-    if e.kind == EXPR_INT_LIT or e.kind == EXPR_CHAR_LIT
-        *out = e.int_val as f64
-        return 1
-    if e.kind == EXPR_IDENT
-        let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if ce == null
-            return 0
-        if is_int_const_type(ce.const_type) == 1
-            if ce.fold_state != CONST_FOLD_DONE
+    match e.kind
+        ExprKind.FloatLit =>
+            return const_parse_f64(StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 }, out)
+        ExprKind.IntLit | ExprKind.CharLit =>
+            *out = e.int_val as f64
+            return 1
+        ExprKind.Ident =>
+            let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if ce == null
                 return 0
-            *out = ce.value as f64
-            return 1
-        if ce.const_type == TYPE_F64 or ce.const_type == TYPE_F32
-            return const_fold_float(s, ce.value_expr, out)
-        return 0
-    if e.kind == EXPR_CAST
-        return const_fold_float(s, e.left, out)
-    if e.kind == EXPR_UNARY
-        if e.op != OP_NEG
+            if is_int_const_type(ce.const_type) == 1
+                if ce.fold_state != CONST_FOLD_DONE
+                    return 0
+                *out = ce.value as f64
+                return 1
+            if ce.const_type == TypeKind.F64 or ce.const_type == TypeKind.F32
+                return const_fold_float(s, ce.value_expr, out)
             return 0
-        if const_fold_float(s, e.operand, out) == 0
-            return 0
-        *out = 0.0 - *out
-        return 1
-    if e.kind == EXPR_BINARY
-        var a: f64 = 0.0
-        var b: f64 = 0.0
-        if const_fold_float(s, e.left, @a) == 0
-            return 0
-        if const_fold_float(s, e.right, @b) == 0
-            return 0
-        if e.op == OP_ADD
-            *out = a + b
-            return 1
-        if e.op == OP_SUB
-            *out = a - b
-            return 1
-        if e.op == OP_MUL
-            *out = a * b
-            return 1
-        if e.op == OP_DIV
-            if b == 0.0
+        ExprKind.Cast =>
+            return const_fold_float(s, e.left, out)
+        ExprKind.Unary =>
+            if e.op != OpKind.Neg
                 return 0
-            *out = a / b
+            if const_fold_float(s, e.operand, out) == 0
+                return 0
+            *out = 0.0 - *out
             return 1
-        return 0
+        ExprKind.Binary =>
+            var a: f64 = 0.0
+            var b: f64 = 0.0
+            if const_fold_float(s, e.left, @a) == 0
+                return 0
+            if const_fold_float(s, e.right, @b) == 0
+                return 0
+            match e.op
+                OpKind.Add =>
+                    *out = a + b
+                    return 1
+                OpKind.Sub =>
+                    *out = a - b
+                    return 1
+                OpKind.Mul =>
+                    *out = a * b
+                    return 1
+                OpKind.Div =>
+                    if b == 0.0
+                        return 0
+                    *out = a / b
+                    return 1
+                _ => pass
+            return 0
+        _ => pass
     0
 
 # The words every R60 refusal ends with (LANGUAGE_SPEC §4.3), ritz0's
@@ -2486,24 +2503,26 @@ fn emit_global_init(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
         emit_const_value(s, @c, 0 - 1, @f, g.init_expr, @root)
         return
     # Storage `ptr`.
-    if g.var_type == TYPE_PTR
-        if gi.kind == GINIT_STR
+    match g.var_type
+        TypeKind.Ptr =>
+            if gi.kind == GINIT_STR
+                emit_str(s, IR_SP)
+                emit_cstring_const(s, StrView { ptr: (gi.text), len: (gi.text_len) as i64 })
+            else if gi.kind == GINIT_NULL or (gi.kind == GINIT_INT and gi.int_val == 0)
+                emit_str(s, c" null")
+            else
+                emit_str(s, c" inttoptr (i64 ")
+                emit_int(s, gi.int_val)
+                emit_str(s, c" to ptr)")
+            return
+        # LARB R60: a float global is typed `double` / `float` (not an i64 slot)
+        # and its folded bits are the initializer, exactly as a run-time literal
+        # rounds.  gi.int_val holds the bits of the widened `double`.
+        TypeKind.F64 | TypeKind.F32 =>
             emit_str(s, IR_SP)
-            emit_cstring_const(s, StrView { ptr: (gi.text), len: (gi.text_len) as i64 })
-        else if gi.kind == GINIT_NULL or (gi.kind == GINIT_INT and gi.int_val == 0)
-            emit_str(s, c" null")
-        else
-            emit_str(s, c" inttoptr (i64 ")
-            emit_int(s, gi.int_val)
-            emit_str(s, c" to ptr)")
-        return
-    # LARB R60: a float global is typed `double` / `float` (not an i64 slot)
-    # and its folded bits are the initializer, exactly as a run-time literal
-    # rounds.  gi.int_val holds the bits of the widened `double`.
-    if g.var_type == TYPE_F64 or g.var_type == TYPE_F32
-        emit_str(s, IR_SP)
-        emit_double_bits(s, gi.int_val)
-        return
+            emit_double_bits(s, gi.int_val)
+            return
+        _ => pass
     # Every other storage type is an LLVM integer.
     emit_str(s, IR_SP)
     if gi.kind == GINIT_NULL
@@ -2526,40 +2545,42 @@ fn global_init_check(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
     gi.kind = GINIT_BAD
     if g.init_expr == null
         return
-    if g.var_type == TYPE_STRUCT or g.var_type == TYPE_ARRAY
+    if g.var_type == TypeKind.Struct or g.var_type == TypeKind.Array
         gi.kind = GINIT_AGGR
         return
-    if g.var_type != TYPE_PTR and (g.init_expr.kind == EXPR_STRING_LIT or g.init_expr.kind == EXPR_CSTRING_LIT)
+    if g.var_type != TypeKind.Ptr and (g.init_expr.kind == ExprKind.StringLit or g.init_expr.kind == ExprKind.CstringLit)
         global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a pointer but has a string initializer")
         return
     # A float slot: a float or integer literal, a numeric const, `-`, `+ - *
     # /` and casts of those.  f32 is the `double` rounded to float, then
     # widened for the hex spelling, exactly as a run-time f32 literal is.
-    if g.var_type == TYPE_F64 or g.var_type == TYPE_F32
-        var d: f64 = 0.0
-        if const_fold_float(s, g.init_expr, @d) == 0
-            # LARB R60: `null` fits a pointer slot only, under ritz0's words.
-            if g.init_expr.kind == EXPR_NIL_LIT
-                global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a pointer but has a null initializer")
+    match g.var_type
+        TypeKind.F64 | TypeKind.F32 =>
+            var d: f64 = 0.0
+            if const_fold_float(s, g.init_expr, @d) == 0
+                # LARB R60: `null` fits a pointer slot only, under ritz0's words.
+                if g.init_expr.kind == ExprKind.NilLit
+                    global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a pointer but has a null initializer")
+                    return
+                global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
                 return
-            global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
+            if g.var_type == TypeKind.F32
+                let narrow: f32 = d as f32
+                d = narrow as f64
+            gi.kind = GINIT_FCONST
+            gi.int_val = *(@d as *i64)
             return
-        if g.var_type == TYPE_F32
-            let narrow: f32 = d as f32
-            d = narrow as f64
-        gi.kind = GINIT_FCONST
-        gi.int_val = *(@d as *i64)
-        return
-    if g.var_type == TYPE_PTR
-        global_init_fold(s, g.init_expr, gi)
-        if gi.kind == GINIT_BAD
-            global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
-        else if gi.kind == GINIT_FLOAT
-            global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a float type but has a float initializer")
-            gi.kind = GINIT_BAD
-        return
+        TypeKind.Ptr =>
+            global_init_fold(s, g.init_expr, gi)
+            if gi.kind == GINIT_BAD
+                global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, global_non_constant_why())
+            else if gi.kind == GINIT_FLOAT
+                global_init_error(s, g, g.init_expr.span.line, g.init_expr.span.col, c"is not a float type but has a float initializer")
+                gi.kind = GINIT_BAD
+            return
+        _ => pass
     # An integer / bool / char slot.
-    if g.init_expr.kind == EXPR_NIL_LIT
+    if g.init_expr.kind == ExprKind.NilLit
         # ritz1 has always stored `null` in an integer global as 0.
         gi.kind = GINIT_INT
         gi.int_val = 0
@@ -2622,66 +2643,73 @@ fn emit_global_llvm_type(s: *EmitterState, g: *GlobalVarDef)
     # LARB R60 (AGAST #3480): a float global is stored at its own type, so
     # `@g = global double` / `global float`, not an i64 slot holding a
     # `bitcast (double …)`.
-    if g.var_type == TYPE_F64
-        emit_str(s, c"double")
-        return
-    if g.var_type == TYPE_F32
-        emit_str(s, c"float")
-        return
+    match g.var_type
+        TypeKind.F64 =>
+            emit_str(s, c"double")
+            return
+        TypeKind.F32 =>
+            emit_str(s, c"float")
+            return
+        _ => pass
     # Emit the type
-    if g.var_type == TYPE_STRUCT
+    if g.var_type == TypeKind.Struct
         emit_str(s, IR_PCT)
         emit_name(s, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
     else if ty_int_bits(g.var_type) == 32
         emit_str(s, c"i32")
     else if ty_int_bits(g.var_type) == 64
         emit_str(s, c"i64")
-    else if g.var_type == TYPE_PTR
-        emit_str(s, c"ptr")
-    else if g.var_type == TYPE_BOOL
-        # AGAST #3001: one byte, as ritz0 declares it and as every access is.
-        emit_str(s, c"i1")
-    else if g.var_type == TYPE_ARRAY and g.array_shape != null
-        # AGAST #1509: `var g: [N][M]T` -> `[N x [M x T]]` (was `[N x i64]`).
-        emit_array_shape_llvm(s, g.array_shape, 0)
-    else if g.var_type == TYPE_ARRAY
-        # AGAST #190: `var g: [N]T` — emit `[N x T]` so indexing GEPs
-        # use the right stride.  Without this branch the global fell
-        # through to `i64 zeroinitializer` and `g_fallback[i].used`
-        # in nexus tripped "; ERROR: unhandled EXPR_MEMBER" because
-        # the emitter had no array-stride context to GEP through.
-        emit_str(s, c"[")
-        emit_int(s, g.array_size as i64)
-        emit_str(s, IR_X)
-        if g.array_elem_type == TYPE_STRUCT and g.array_elem_type_name_len > 0
-            emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 })
-        else
-            # Shared with index lowering (AGAST #1504) so `g[i]` GEPs
-            # the layout declared here.
-            emit_str(s, elem_mem_llvm(g.array_elem_type))
-        emit_str(s, c"]")
     else
-        emit_str(s, c"i64")
+        match g.var_type
+            TypeKind.Ptr =>
+                emit_str(s, c"ptr")
+            TypeKind.Bool =>
+                # AGAST #3001: one byte, as ritz0 declares it and as every access is.
+                emit_str(s, c"i1")
+            _ =>
+                if g.var_type == TypeKind.Array and g.array_shape != null
+                    # AGAST #1509: `var g: [N][M]T` -> `[N x [M x T]]` (was `[N x i64]`).
+                    emit_array_shape_llvm(s, g.array_shape, 0)
+                else if g.var_type == TypeKind.Array
+                    # AGAST #190: `var g: [N]T` — emit `[N x T]` so indexing GEPs
+                    # use the right stride.  Without this branch the global fell
+                    # through to `i64 zeroinitializer` and `g_fallback[i].used`
+                    # in nexus tripped "; ERROR: unhandled EXPR_MEMBER" because
+                    # the emitter had no array-stride context to GEP through.
+                    emit_str(s, c"[")
+                    emit_int(s, g.array_size as i64)
+                    emit_str(s, IR_X)
+                    if g.array_elem_type == TypeKind.Struct and g.array_elem_type_name_len > 0
+                        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 })
+                    else
+                        # Shared with index lowering (AGAST #1504) so `g[i]` GEPs
+                        # the layout declared here.
+                        emit_str(s, elem_mem_llvm(g.array_elem_type))
+                    emit_str(s, c"]")
+                else
+                    emit_str(s, c"i64")
 
 # AGAST #1879: an `extern var` is declared with its exact type -- the symbol
 # is another object's, so an i64 slot would claim a size and alignment it
 # does not have (`extern var __bss_start: u8` is one byte, alignment 1).
 fn emit_extern_global_llvm_type(s: *EmitterState, g: *GlobalVarDef)
-    let t: i32 = g.var_type
+    let t: TypeKind = g.var_type
     if ty_int_bits(t) == 8
         emit_str(s, c"i8")
     else if ty_int_bits(t) == 16
         emit_str(s, c"i16")
-    else if t == TYPE_BOOL
-        emit_str(s, c"i1")
-    else if t == TYPE_F32
-        emit_str(s, c"float")
-    else if t == TYPE_F64
-        emit_str(s, c"double")
-    else if t == TYPE_REF or t == TYPE_MUT_REF or t == TYPE_PTR_PTR
-        emit_str(s, c"ptr")
     else
-        emit_global_llvm_type(s, g)
+        match t
+            TypeKind.Bool =>
+                emit_str(s, c"i1")
+            TypeKind.F32 =>
+                emit_str(s, c"float")
+            TypeKind.F64 =>
+                emit_str(s, c"double")
+            TypeKind.Ref | TypeKind.MutRef | TypeKind.PtrPtr =>
+                emit_str(s, c"ptr")
+            _ =>
+                emit_global_llvm_type(s, g)
 
 # LARB R60: a const or global `var` of a type with Drop, or holding one, is an
 # error (§4.3): nothing drops it — it lives until the process exits.  A global
@@ -2714,18 +2742,20 @@ fn global_drop_refused(s: *EmitterState, g: *GlobalVarDef) -> i32
     var n: *u8 = null
     var nl: i32 = 0
     var arr: i32 = 0 - 1
-    if g.var_type == TYPE_STRUCT
-        n = g.type_name
-        nl = g.type_name_len
-    else if g.var_type == TYPE_ARRAY
-        arr = g.array_size
-        if g.array_elem_type == TYPE_STRUCT
-            n = g.array_elem_type_name
-            nl = g.array_elem_type_name_len
-        else if g.array_shape != null and g.array_shape.leaf_type == TYPE_STRUCT
-            n = g.array_shape.leaf_name
-            nl = g.array_shape.leaf_name_len
-            arr = g.array_shape.dims[0]
+    match g.var_type
+        TypeKind.Struct =>
+            n = g.type_name
+            nl = g.type_name_len
+        TypeKind.Array =>
+            arr = g.array_size
+            if g.array_elem_type == TypeKind.Struct
+                n = g.array_elem_type_name
+                nl = g.array_elem_type_name_len
+            else if g.array_shape != null and g.array_shape.leaf_type == TypeKind.Struct
+                n = g.array_shape.leaf_name
+                nl = g.array_shape.leaf_name_len
+                arr = g.array_shape.dims[0]
+        _ => pass
     if n == null or nl <= 0
         return 0
     if own_type_is_move_only(s, StrView { ptr: (n), len: (nl) as i64 }) == 0
@@ -2738,14 +2768,16 @@ fn const_drop_refused(s: *EmitterState, c: *ConstEntry) -> i32
     var n: *u8 = null
     var nl: i32 = 0
     var arr: i32 = 0 - 1
-    if c.const_type == TYPE_STRUCT
-        n = c.type_name
-        nl = c.type_name_len
-    else if c.const_type == TYPE_ARRAY
-        arr = c.array_size
-        if c.array_elem_type == TYPE_STRUCT
-            n = c.array_elem_type_name
-            nl = c.array_elem_type_name_len
+    match c.const_type
+        TypeKind.Struct =>
+            n = c.type_name
+            nl = c.type_name_len
+        TypeKind.Array =>
+            arr = c.array_size
+            if c.array_elem_type == TypeKind.Struct
+                n = c.array_elem_type_name
+                nl = c.array_elem_type_name_len
+        _ => pass
     if n == null or nl <= 0
         return 0
     if own_type_is_move_only(s, StrView { ptr: (n), len: (nl) as i64 }) == 0
@@ -2819,7 +2851,7 @@ fn emit_global_vars(s: *EmitterState)
 
 # Find a FieldInit in a struct literal's FieldInit list by field name.
 # Note: parse_struct_lit returns the *FieldInit linked list directly,
-# and EXPR_STRUCT_LIT stores the list head in `e.args` (see ident_or_struct).
+# and ExprKind.StructLit stores the list head in `e.args` (see ident_or_struct).
 # We iterate the list directly — there is no boxed StructLit struct.
 fn find_field_init(fields: *FieldInit, name_sv: StrView) -> *FieldInit
     var fi: *FieldInit = fields
@@ -2996,16 +3028,16 @@ fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
 # Any other value or field type is a located error, never a silent 0: the
 # operand is still written, typed, so the line stays well-formed.
 fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, v: *Expr, path: *ConstFieldPath)
-    let ft: i32 = field.field_type
+    let ft: TypeKind = field.field_type
     # LARB R60: a const is a constant initialiser.  A struct, enum or array
     # const is read-only data (R48); its value is its own initialiser, inlined
     # here as ritz0's _const_init does (`const D: In = C`, `var g: In = C`).
     # A struct or enum slot takes a const of its own type; an array slot a
     # const array of it.
-    if v.kind == EXPR_IDENT and (ft == TYPE_STRUCT or ft == TYPE_ARRAY)
+    if v.kind == ExprKind.Ident and (ft == TypeKind.Struct or ft == TypeKind.Array)
         let src: *ConstEntry = find_const_entry(s, StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 })
         if src != null and src.const_type == ft and src.value_expr != null
-            if ft == TYPE_STRUCT and name_eq(StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 }, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }) == 0
+            if ft == TypeKind.Struct and name_eq(StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 }, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }) == 0
                 emit_str(s, c"zeroinitializer")
                 const_field_error_head(s, c, elem_idx, path)
                 eprints_cstr(c"names const `")
@@ -3022,7 +3054,7 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
             emit_const_value(s, c, elem_idx, field, src.value_expr, path)
             g_const_inline_depth -= 1
             return
-    if ft == TYPE_STRUCT and v.kind == EXPR_STRING_LIT
+    if ft == TypeKind.Struct and v.kind == ExprKind.StringLit
         # Treat target struct as StrView-shaped: { ptr, i64 len }.
         emit_str(s, c"{ ptr ")
         emit_const_string_ref(s, c, elem_idx, v, path)
@@ -3040,16 +3072,18 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
             return
         emit_int(s, folded)
         return
-    if ft == TYPE_PTR or ft == TYPE_PTR_PTR
-        emit_const_ptr_field(s, c, elem_idx, field, v, path)
-        return
-    if ft == TYPE_F64 or ft == TYPE_F32
-        emit_const_float_field(s, c, elem_idx, ft, v, path)
-        return
-    if ft == TYPE_STRUCT
+    match ft
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            emit_const_ptr_field(s, c, elem_idx, field, v, path)
+            return
+        TypeKind.F64 | TypeKind.F32 =>
+            emit_const_float_field(s, c, elem_idx, ft, v, path)
+            return
+        _ => pass
+    if ft == TypeKind.Struct
         let st: *StructDef = find_struct(s, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
         if st != null
-            if v.kind != EXPR_STRUCT_LIT
+            if v.kind != ExprKind.StructLit
                 emit_str(s, c"zeroinitializer")
                 const_field_error(s, c, elem_idx, path, c"is not a struct literal")
                 return
@@ -3069,7 +3103,7 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
         if ei >= 0
             emit_const_unit_variant(s, c, elem_idx, ei, v, path)
             return
-    if ft == TYPE_ARRAY
+    if ft == TypeKind.Array
         emit_const_array_field(s, c, elem_idx, field, v, path)
         return
     # Anything else ritz1 has no constant form for.
@@ -3087,16 +3121,16 @@ fn emit_const_unit_variant(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ei: 
     var name: *u8 = null
     var len: i32 = 0
     var constructed: i32 = 0
-    if (v.kind == EXPR_MEMBER or v.kind == EXPR_METHOD) and v.left != null and v.left.kind == EXPR_IDENT
+    if (v.kind == ExprKind.Member or v.kind == ExprKind.Method) and v.left != null and v.left.kind == ExprKind.Ident
         if v.left.ident_len == en_len and memcmp(v.left.ident_ptr, en, en_len) == 0
             name = v.ident_ptr
             len = v.ident_len
-            constructed = (v.kind == EXPR_METHOD) as i32
-    else if v.kind == EXPR_CALL and v.func_name != null
+            constructed = (v.kind == ExprKind.Method) as i32
+    else if v.kind == ExprKind.Call and v.func_name != null
         name = v.func_name
         len = v.func_name_len
         constructed = 1
-    else if v.kind == EXPR_IDENT
+    else if v.kind == ExprKind.Ident
         name = v.ident_ptr
         len = v.ident_len
     var vi: i32 = 0 - 1
@@ -3147,19 +3181,19 @@ fn emit_const_array_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
         el.field_type_name_len = field.array_elem_type_name_len
         el.ptr_pointee = field.array_elem_pointee
     el.array_size = 0
-    el.array_elem_type = TYPE_VOID
+    el.array_elem_type = TypeKind.Void
     el.array_elem_type_name = null
     el.array_elem_type_name_len = 0
-    el.array_elem_pointee = TYPE_VOID
+    el.array_elem_pointee = TypeKind.Void
     el.field_mut_ref = 0
     el.field_shared_ref = 0
     el.field_inner_ref = 0
     el.next = null
-    el.inner_pointee_type = TYPE_VOID
+    el.inner_pointee_type = (TypeKind.Void as i32)
     el.fn_sig = null
     el.array_shape = null
     el.ptr_array = null
-    el.field_ref_ptr_pointee = TYPE_VOID
+    el.field_ref_ptr_pointee = TypeKind.Void
     el.elem_fn_sig = null
     if sh != null
         emit_const_array_dim(s, c, elem_idx, sh, 0, sh.dims[0], @el, v, path)
@@ -3172,32 +3206,35 @@ fn emit_const_array_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
 fn emit_const_array_dim(s: *EmitterState, c: *ConstEntry, elem_idx: i32, sh: *ArrayShape, d: i32, n: i32, el: *StructField, v: *Expr, path: *ConstFieldPath)
     var count: i32 = 0
     var fill: *Expr = null
-    if v.kind == EXPR_ARRAY_LIT
-        var ce: *Expr = v.args
-        while ce != null
-            count += 1
-            ce = ce.next
-    else if v.kind == EXPR_ARRAY_FILL
-        fill = v.left
-        count = v.int_val as i32
-    if (v.kind != EXPR_ARRAY_LIT and v.kind != EXPR_ARRAY_FILL) or count != n
+    match v.kind
+        ExprKind.ArrayLit =>
+            var ce: *Expr = v.args
+            while ce != null
+                count += 1
+                ce = ce.next
+        ExprKind.ArrayFill =>
+            fill = v.left
+            count = v.int_val as i32
+        _ => pass
+    if (v.kind != ExprKind.ArrayLit and v.kind != ExprKind.ArrayFill) or count != n
         emit_str(s, c"zeroinitializer")
         const_field_error_head(s, c, elem_idx, path)
         if c.is_global == 1 or elem_idx < 0
             # LARB R60: ritz0's _const_init_array wording, against the slot's
             # type (`is an array literal of 2 elements for a [3]i32`).
-            if v.kind == EXPR_ARRAY_FILL
-                eprints_cstr(c"is a fill of ")
-                eprint_i64(count as i64)
-                eprints_cstr(c" elements for a `")
-            else if v.kind == EXPR_ARRAY_LIT
-                eprints_cstr(c"is an array literal of ")
-                eprint_i64(count as i64)
-                eprints_cstr(c" elements for a `")
-            else
-                eprints_cstr(global_non_constant_why())
-                eprints_cstr(c"\n")
-                return
+            match v.kind
+                ExprKind.ArrayFill =>
+                    eprints_cstr(c"is a fill of ")
+                    eprint_i64(count as i64)
+                    eprints_cstr(c" elements for a `")
+                ExprKind.ArrayLit =>
+                    eprints_cstr(c"is an array literal of ")
+                    eprint_i64(count as i64)
+                    eprints_cstr(c" elements for a `")
+                _ =>
+                    eprints_cstr(global_non_constant_why())
+                    eprints_cstr(c"\n")
+                    return
             eprint_char('[')
             eprint_i64(n as i64)
             eprint_char(']')
@@ -3242,12 +3279,12 @@ fn emit_const_array_dim(s: *EmitterState, c: *ConstEntry, elem_idx: i32, sh: *Ar
 # The Ritz spelling of an array's leaf element (`i32`, `*u8`, `P`) for an
 # error naming its type (LARB R60).
 fn eprint_array_leaf_type(el: *StructField)
-    if el.field_type == TYPE_STRUCT and el.field_type_name_len > 0
+    if el.field_type == TypeKind.Struct and el.field_type_name_len > 0
         eprint_bytes(StrView { ptr: (el.field_type_name), len: (el.field_type_name_len) as i64 })
         return
-    if el.field_type == TYPE_PTR
+    if el.field_type == TypeKind.Ptr
         eprint_char('*')
-        if el.ptr_pointee == TYPE_STRUCT or el.ptr_pointee == TYPE_VOID
+        if el.ptr_pointee == TypeKind.Struct or el.ptr_pointee == TypeKind.Void
             return
         eprints_cstr(ty_name(el.ptr_pointee))
         return
@@ -3262,7 +3299,7 @@ fn emit_const_string_ref(s: *EmitterState, c: *ConstEntry, elem_idx: i32, v: *Ex
     # global.  A global's initialiser, and a whole struct const's value, use
     # the string pool (LARB R60): the pool is emitted after every global, so a
     # global may name an entry before its definition.
-    if c.is_global == 0 and elem_idx >= 0 and path != null and path.up == null and path.fi != null and v.kind == EXPR_STRING_LIT
+    if c.is_global == 0 and elem_idx >= 0 and path != null and path.up == null and path.fi != null and v.kind == ExprKind.StringLit
         emit_str(s, c"@.const.")
         emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
         emit_str(s, c".")
@@ -3274,11 +3311,11 @@ fn emit_const_string_ref(s: *EmitterState, c: *ConstEntry, elem_idx: i32, v: *Ex
 
 # AGAST #3651: a pointer field's value -- `null`, or a string in a `*u8`.
 fn emit_const_ptr_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, v: *Expr, path: *ConstFieldPath)
-    if v.kind == EXPR_NIL_LIT
+    if v.kind == ExprKind.NilLit
         emit_str(s, c"null")
         return
-    let byte_ptr: i32 = (field.field_type == TYPE_PTR and (ty_int_bits(field.ptr_pointee) == 8)) as i32
-    if byte_ptr == 1 and (v.kind == EXPR_STRING_LIT or v.kind == EXPR_CSTRING_LIT)
+    let byte_ptr: i32 = (field.field_type == TypeKind.Ptr and (ty_int_bits(field.ptr_pointee) == 8)) as i32
+    if byte_ptr == 1 and (v.kind == ExprKind.StringLit or v.kind == ExprKind.CstringLit)
         emit_const_string_ref(s, c, elem_idx, v, path)
         return
     emit_str(s, c"null")
@@ -3291,17 +3328,17 @@ fn emit_const_ptr_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: 
 # f32 constant must be exact, so it is written as the hex `double` of the
 # literal rounded to double and then to float, as an f32 local is.  An
 # integer converts as int_into_float_slot's sitofp does.
-fn emit_const_float_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ft: i32, v: *Expr, path: *ConstFieldPath)
+fn emit_const_float_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ft: TypeKind, v: *Expr, path: *ConstFieldPath)
     var neg: i32 = 0
     var e: *Expr = v
-    while e.kind == EXPR_UNARY and e.op == OP_NEG
+    while e.kind == ExprKind.Unary and e.op == OpKind.Neg
         neg = 1 - neg
         e = e.operand
-    if e.kind == EXPR_INT_LIT
+    if e.kind == ExprKind.IntLit
         var n: i64 = e.int_val
         if neg == 1
             n = 0 - n
-        if ft == TYPE_F64
+        if ft == TypeKind.F64
             var d: f64 = n as f64
             emit_double_bits(s, *(@d as *i64))
         else
@@ -3309,7 +3346,7 @@ fn emit_const_float_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ft: i
             var wide: f64 = narrow as f64
             emit_double_bits(s, *(@wide as *i64))
         return
-    if e.kind != EXPR_FLOAT_LIT
+    if e.kind != ExprKind.FloatLit
         # LARB R60: a const, arithmetic or a cast of constant initialisers is
         # one too — in a whole struct const's field and in a global's, which
         # route here with elem_idx -1 / is_global (ritz0's _const_init).  A
@@ -3317,7 +3354,7 @@ fn emit_const_float_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ft: i
         if c.is_global == 1 or elem_idx < 0
             var d: f64 = 0.0
             if const_fold_float(s, v, @d) == 1
-                if ft == TYPE_F32
+                if ft == TypeKind.F32
                     let narrow: f32 = d as f32
                     d = narrow as f64
                 emit_double_bits(s, *(@d as *i64))
@@ -3325,7 +3362,7 @@ fn emit_const_float_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ft: i
         emit_str(s, c"0.0")
         const_field_error(s, c, elem_idx, path, c"is not a float literal or an integer literal")
         return
-    if ft == TYPE_F64
+    if ft == TypeKind.F64
         if neg == 1
             emit_str(s, c"-")
         emit_name(s, StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 })
@@ -3543,7 +3580,7 @@ fn emit_const_array_fill_entry(s: *EmitterState, c: *ConstEntry)
 # (literal_array retyped "..." already) or null; the integer 0 is not a
 # pointer (LANGUAGE_SPEC §3.3 "Constant tables").  1 if it is one of those.
 fn const_ptr_elem_ok(e: *Expr) -> i32
-    (e.kind == EXPR_CSTRING_LIT or e.kind == EXPR_NIL_LIT) as i32
+    (e.kind == ExprKind.CstringLit or e.kind == ExprKind.NilLit) as i32
 
 # AGAST #3946: `const T: [N]S = [S { .. }; N]`.  A struct table can't be a
 # fill (LANGUAGE_SPEC §3.3, "write its elements out").  Reported at the
@@ -3610,7 +3647,7 @@ fn const_ptr_table_error(s: *EmitterState, c: *ConstEntry, idx: i32, e: *Expr)
 # `ptr @.str.K` for a string element, `ptr null` for null.
 fn emit_const_ptr_elem(s: *EmitterState, e: *Expr)
     emit_str(s, c"ptr ")
-    if e.kind == EXPR_CSTRING_LIT
+    if e.kind == ExprKind.CstringLit
         emit_cstring_const(s, StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 })
     else
         emit_str(s, c"null")
@@ -3624,7 +3661,7 @@ fn emit_const_ptr_array(s: *EmitterState, c: *ConstEntry)
     mark_global_emitted(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
     var fill: *Expr = null
     var first: *Expr = c.value_expr.args
-    if c.value_expr.kind == EXPR_ARRAY_FILL
+    if c.value_expr.kind == ExprKind.ArrayFill
         fill = c.value_expr.left
         first = fill
     var bad: i32 = 0
@@ -3690,11 +3727,13 @@ fn emit_const_strview_fill(s: *EmitterState, c: *ConstEntry)
 # array, and any of their fills.  The evaluator emits the same
 # `[N x T] [T v, ...]` an integer table gets.
 fn const_array_shared(c: *ConstEntry) -> i32
-    if c.array_elem_type == TYPE_F32 or c.array_elem_type == TYPE_F64
-        return 1
-    if c.array_elem_type == TYPE_ARRAY
-        return 1
-    if c.array_elem_type == TYPE_STRUCT and c.array_elem_type_name_len > 0
+    match c.array_elem_type
+        TypeKind.F32 | TypeKind.F64 =>
+            return 1
+        TypeKind.Array =>
+            return 1
+        _ => pass
+    if c.array_elem_type == TypeKind.Struct and c.array_elem_type_name_len > 0
         if user_enum_index(StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 }) >= 0
             return 1
     return 0
@@ -3706,7 +3745,7 @@ fn emit_const_array_shared_entry(s: *EmitterState, c: *ConstEntry)
     mark_global_emitted(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
     var f: StructField
     memzero(@f as *u8, sizeof(StructField) as i64)
-    f.field_type = TYPE_ARRAY
+    f.field_type = TypeKind.Array
     f.array_size = c.array_size
     f.array_elem_type = c.array_elem_type
     f.array_elem_type_name = c.array_elem_type_name
@@ -3723,7 +3762,7 @@ fn emit_const_array_shared_entry(s: *EmitterState, c: *ConstEntry)
     emit_str(s, c" = internal constant [")
     emit_int(s, c.array_size as i64)
     emit_str(s, IR_X)
-    if c.array_elem_type == TYPE_STRUCT and c.array_elem_type_name_len > 0
+    if c.array_elem_type == TypeKind.Struct and c.array_elem_type_name_len > 0
         emit_str(s, IR_PCT)
         emit_name(s, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 })
     else
@@ -3734,14 +3773,14 @@ fn emit_const_array_shared_entry(s: *EmitterState, c: *ConstEntry)
 
 # Emit a single ConstEntry as an LLVM global constant (if applicable).
 fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
-    if c.const_type != TYPE_ARRAY
+    if c.const_type != TypeKind.Array
         return
     if c.value_expr == null
         return
     var is_fill: i32 = 0
-    if c.value_expr.kind == EXPR_ARRAY_FILL
+    if c.value_expr.kind == ExprKind.ArrayFill
         is_fill = 1
-    if c.value_expr.kind != EXPR_ARRAY_LIT and is_fill == 0
+    if c.value_expr.kind != ExprKind.ArrayLit and is_fill == 0
         return
     if const_array_shared(c) == 1
         emit_const_array_shared_entry(s, c)
@@ -3750,9 +3789,9 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     # array.  It used to emit no global, so `Z[i]` indexed through
     # `inttoptr i64 0`.  Fold `v` once and repeat it for all N elements.
     if is_fill == 1
-        if c.array_elem_type == TYPE_PTR
+        if c.array_elem_type == TypeKind.Ptr
             emit_const_ptr_array(s, c)   # AGAST #1866: `[c"s"; N]`, `[null; N]`
-        else if c.array_elem_type != TYPE_STRUCT
+        else if c.array_elem_type != TypeKind.Struct
             emit_const_array_fill_entry(s, c)
         else if const_strview_fill(c) == 1
             emit_const_strview_fill(s, c)   # AGAST #3978: `["s"; N]`
@@ -3763,10 +3802,10 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     # Required so `for v in VALUES` (iterable form) can reference the
     # global by name.  Integer consts of non-array shape stay inlined
     # via find_const; this path is purely for the [N]T iterable case.
-    if c.array_elem_type == TYPE_PTR
+    if c.array_elem_type == TypeKind.Ptr
         emit_const_ptr_array(s, c)
         return
-    if c.array_elem_type != TYPE_STRUCT
+    if c.array_elem_type != TypeKind.Struct
         if was_global_emitted(s, StrView { ptr: (c.name), len: (c.name_len) as i64 }) == 1
             return
         mark_global_emitted(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
@@ -3808,7 +3847,7 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
         return
     if c.value_expr == null
         return
-    if c.value_expr.kind != EXPR_ARRAY_LIT
+    if c.value_expr.kind != ExprKind.ArrayLit
         return
     # Dedup across imports (same const may be reached from multiple paths)
     if was_global_emitted(s, StrView { ptr: (c.name), len: (c.name_len) as i64 }) == 1
@@ -3823,14 +3862,16 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     var elem: *Expr = c.value_expr.args
     var elem_idx: i32 = 0
     while elem != null
-        if elem.kind == EXPR_STRUCT_LIT
-            var fi: *FieldInit = elem.args as *FieldInit
-            while fi != null
-                if fi.value != null and fi.value.kind == EXPR_STRING_LIT
-                    emit_const_array_string(s, c, elem_idx, fi)
-                fi = fi.next
-        else if elem.kind == EXPR_STRING_LIT
-            emit_const_array_elem_string(s, c, elem_idx, elem)   # AGAST #3325
+        match elem.kind
+            ExprKind.StructLit =>
+                var fi: *FieldInit = elem.args as *FieldInit
+                while fi != null
+                    if fi.value != null and fi.value.kind == ExprKind.StringLit
+                        emit_const_array_string(s, c, elem_idx, fi)
+                    fi = fi.next
+            ExprKind.StringLit =>
+                emit_const_array_elem_string(s, c, elem_idx, elem)   # AGAST #3325
+            _ => pass
         elem_idx = elem_idx + 1
         elem = elem.next
 
@@ -3848,25 +3889,26 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     while elem != null
         if elem_idx > 0
             emit_str(s, IR_COMMA)
-        if elem.kind == EXPR_STRUCT_LIT
-            emit_const_struct_literal(s, c, elem_idx, st, elem)
-        else if elem.kind == EXPR_STRING_LIT
-            # AGAST #3325: a `[N]StrView` element `"..."` is `{ ptr, len }`
-            # over its backing bytes; it was a zeroinitializer, an empty view.
-            emit_str(s, IR_PCT)
-            emit_name(s, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 })
-            emit_str(s, c" { ptr @.const.")
-            emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
-            emit_str(s, c".")
-            emit_int(s, elem_idx as i64)
-            emit_str(s, IR_I64_SEP)
-            emit_int(s, elem.string_len as i64)
-            emit_str(s, c" }")
-        else
-            # Unexpected non-struct element in a struct-array; emit zero.
-            emit_str(s, IR_PCT)
-            emit_name(s, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 })
-            emit_str(s, c" zeroinitializer")
+        match elem.kind
+            ExprKind.StructLit =>
+                emit_const_struct_literal(s, c, elem_idx, st, elem)
+            ExprKind.StringLit =>
+                # AGAST #3325: a `[N]StrView` element `"..."` is `{ ptr, len }`
+                # over its backing bytes; it was a zeroinitializer, an empty view.
+                emit_str(s, IR_PCT)
+                emit_name(s, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 })
+                emit_str(s, c" { ptr @.const.")
+                emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
+                emit_str(s, c".")
+                emit_int(s, elem_idx as i64)
+                emit_str(s, IR_I64_SEP)
+                emit_int(s, elem.string_len as i64)
+                emit_str(s, c" }")
+            _ =>
+                # Unexpected non-struct element in a struct-array; emit zero.
+                emit_str(s, IR_PCT)
+                emit_name(s, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 })
+                emit_str(s, c" zeroinitializer")
         elem_idx = elem_idx + 1
         elem = elem.next
 
@@ -3891,7 +3933,7 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
 # i64-vs-%StrView mismatch at the call site.
 #
 # Currently restricted to the StrView shape `{ ptr, i64 }` driven by an
-# EXPR_STRING_LIT initializer — that's the only scalar-struct-const shape
+# ExprKind.StringLit initializer — that's the only scalar-struct-const shape
 # observed in the codebase (mausoleum/storage.ritz, lexis/dom/attribute.ritz,
 # prism/test/test_text_rendering.ritz).  Other struct shapes fall through
 # to the legacy `add i64 0, 0` path, matching previous behaviour.
@@ -3904,7 +3946,7 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
 # `@C` is then `@P` and `C.f` a GEP into it, as a const array's are.  A const
 # may name another (`const D: In = C`): its value is inlined.
 fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
-    if c.const_type != TYPE_STRUCT
+    if c.const_type != TypeKind.Struct
         return
     if c.type_name == null
         return
@@ -3916,7 +3958,7 @@ fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
     if was_global_emitted(s, StrView { ptr: (c.name), len: (c.name_len) as i64 }) == 1
         return
     mark_global_emitted(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
-    if c.value_expr.kind != EXPR_STRING_LIT
+    if c.value_expr.kind != ExprKind.StringLit
         var f: StructField
         memzero(@f as *u8, sizeof(StructField) as i64)
         f.field_type = c.const_type
@@ -3971,7 +4013,7 @@ fn emit_const_arrays(s: *EmitterState)
             emit_const_array_entry(s, c)
             # AGAST #189 — also lower scalar struct consts (`const FOO: StrView
             # = "..."`).  Distinct from the array path: const_type is
-            # TYPE_STRUCT here, not TYPE_ARRAY.
+            # TypeKind.Struct here, not TypeKind.Array.
             emit_const_struct_entry(s, c)
         c = c.next
     emit_str(s, IR_NL)
@@ -4112,11 +4154,13 @@ pub fn emitter_set_test_mode(on: i32)
 # Bit width of a [[test]] fn's result: 0 for none, 1..64 for an integer,
 # -1 for anything else (rejected).
 fn test_ret_bits(f: *FnDef) -> i32
-    let t: i32 = f.return_type
-    if t == TYPE_VOID
-        return 0
-    if t == TYPE_BOOL
-        return 1
+    let t: TypeKind = f.return_type
+    match t
+        TypeKind.Void =>
+            return 0
+        TypeKind.Bool =>
+            return 1
+        _ => pass
     if ty_int_bits(t) == 8
         return 8
     if ty_int_bits(t) == 16
@@ -4125,7 +4169,7 @@ fn test_ret_bits(f: *FnDef) -> i32
         return 32
     if ty_int_bits(t) == 64
         return 64
-    if t == TYPE_STRUCT
+    if t == TypeKind.Struct
         let n: *u8 = f.return_type_name
         let l: i32 = f.return_type_name_len
         if name_eq(StrView { ptr: (n), len: (l) as i64 }, StrView { ptr: (c"void"), len: (4) as i64 }) == 1
@@ -4333,13 +4377,13 @@ fn emit_test_table(s: *EmitterState)
 # AGAST #2041: a struct field of reference type to a struct (`ch: @C`,
 # `ch: @&C`, `ch:& C`) is a `*C` field as far as the emitter is concerned.
 # ritz0 lays it out as `ptr` and auto-derefs member access through it, which
-# is exactly what every TYPE_PTR field path (struct literal, member read,
+# is exactly what every TypeKind.Ptr field path (struct literal, member read,
 # member assignment, sizeof, field + i, ...) already does.  Rather than teach
 # each of those sites the two ref codes, rewrite the field once, after
 # monomorphize_module (clone_struct_fields substitutes a `@T` pointee the
 # same way as a `*T` one) and before any struct is laid out or looked up.
 # AGAST #2050: refs to an integer (`p: @i32`) lower the same way.  A
-# TYPE_PTR field with a primitive pointee needs array_elem_type, which
+# TypeKind.Ptr field with a primitive pointee needs array_elem_type, which
 # field_new records for integer refs.  A ref with neither a struct name nor
 # an integer pointee (`@f64`, `@bool`, `@*u8`) keeps its ref type and stays
 # on the existing fail-closed path.
@@ -4388,7 +4432,7 @@ pub fn emit_module(m: *Module, out: *Vec<u8>) -> i32
         ret_type_name: null,
         ret_type_name_len: 0,
         ret_sret: 0,   # AGAST #1730 — set per fn by emit_fn / emit_impl_method
-        fn_ret_type: TYPE_VOID,   # AGAST #1454 — set per fn like ret_sret
+        fn_ret_type: TypeKind.Void,   # AGAST #1454 — set per fn like ret_sret
         sret_last_val: 0,
         sret_last_slot: 0,
         sret_helpers_used: 0,
@@ -4404,10 +4448,10 @@ pub fn emit_module(m: *Module, out: *Vec<u8>) -> i32
         ctx_simd_name_len: 0,
         last_match_agg_name: null,   # AGAST #1666
         last_match_agg_name_len: 0,
-        last_match_float_ty: 0,   # AGAST #1946
+        last_match_float_ty: TypeKind.Void,   # AGAST #1946
         last_if_stmt_agg_name: null,   # AGAST #2559
         last_if_stmt_agg_name_len: 0,
-        match_float_hint: 0,
+        match_float_hint: TypeKind.Void,
         match_agg_hint: null,   # AGAST #3205
         match_agg_hint_len: 0,
         match_no_value: 0,   # AGAST #2046
@@ -4424,7 +4468,7 @@ pub fn emit_module(m: *Module, out: *Vec<u8>) -> i32
         unknown_struct_name: null,   # AGAST #3362
         unknown_struct_name_len: 0,
         match_scrut_kind: 0,
-        match_scrut_int: 0,
+        match_scrut_int: TypeKind.Void,
         match_scrut_str: 0,
         wanted: null,   # AGAST #2260
         wanted_count: 0,
@@ -4434,7 +4478,7 @@ pub fn emit_module(m: *Module, out: *Vec<u8>) -> i32
         packed_marks: null,   # AGAST #4462 — see packed_mark / packed_marked
         packed_marks_cap: 0,
         narrow_params: null,
-        narrow_decls: [NarrowDecl { name: null, name_len: 0, decl_type: 0, declared: 0, init: null }; 256],
+        narrow_decls: [NarrowDecl { name: null, name_len: 0, decl_type: TypeKind.Void, declared: TypeKind.Void, init: null }; 256],
         narrow_decl_count: 0,
         narrow_decl_overflow: 0,
         fn_assert_kind: ASSERT_FN_PLAIN,   # AGAST #1869 — see emit_assert_stmt

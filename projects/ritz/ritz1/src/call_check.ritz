@@ -78,7 +78,7 @@ var g_cc_mute: i32 = 0
 
 # 1 when `e`'s arguments are never lowered, so their calls aren't judged.
 pub fn call_check_mutes(e: *Expr) -> i32
-    if e.kind != EXPR_CALL or e.func_name_len == 0
+    if e.kind != ExprKind.Call or e.func_name_len == 0
         return 0
     if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sizeof"), len: (6) as i64 }) == 1
         return 1
@@ -86,7 +86,7 @@ pub fn call_check_mutes(e: *Expr) -> i32
         return 0
     if e.args == null
         return 0
-    (e.args.kind != EXPR_STRING_LIT and e.args.kind != EXPR_CSTRING_LIT) as i32
+    (e.args.kind != ExprKind.StringLit and e.args.kind != ExprKind.CstringLit) as i32
 
 pub fn call_check_mute(delta: i32)
     g_cc_mute = g_cc_mute + delta
@@ -226,43 +226,43 @@ fn cc_arity(sm: *Sema, line: i32, col: i32, name_sv: StrView, fd: *FnDef, args: 
         eprint_char('\n')
     1
 
-fn cc_int_type(t: i32) -> i32
+fn cc_int_type(t: TypeKind) -> i32
     return (ty_is_int(t) == 1) as i32
 
 # The `name:& T` param `e` names, the emitter's lent_local (LocalVar.is_lent,
 # AGAST #2250): a `:&` param of an integer, struct or array T.  Null else.
 fn cc_lent(sm: *Sema, e: *Expr) -> *Param
-    if e == null or e.kind != EXPR_IDENT
+    if e == null or e.kind != ExprKind.Ident
         return null
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if v == null or v.lent == null
         return null
     let p: *Param = v.lent
-    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+    if p.is_borrow != 1 or p.param_type != TypeKind.MutRef
         return null
-    let pt: i32 = p.param_pointee_type
-    if pt != TYPE_STRUCT and pt != TYPE_ARRAY and is_borrow_scalar_kind(pt) == 0
+    let pt: TypeKind = p.param_pointee_type
+    if pt != TypeKind.Struct and pt != TypeKind.Array and is_borrow_scalar_kind(pt) == 0
         return null
     p
 
 # The `h:& T` param `e` names when T is an integer or `bool` (AGAST #2972):
 # `*h` is `h`.  The emitter's lent_scalar_ident.
 fn cc_lent_scalar(sm: *Sema, e: *Expr) -> i32
-    if e == null or e.kind != EXPR_IDENT
+    if e == null or e.kind != ExprKind.Ident
         return 0
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if v == null or v.lent == null
         return 0
     let p: *Param = v.lent
-    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+    if p.is_borrow != 1 or p.param_type != TypeKind.MutRef
         return 0
-    (p.param_pointee_type == TYPE_BOOL or is_borrow_scalar_kind(p.param_pointee_type) == 1) as i32
+    (p.param_pointee_type == TypeKind.Bool or is_borrow_scalar_kind(p.param_pointee_type) == 1) as i32
 
 # The struct a `:&` param `e` borrows, or null: `c:& C` (lent_struct_local).
 fn cc_lent_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
     *out_len = 0
     let p: *Param = cc_lent(sm, e)
-    if p == null or p.param_pointee_type != TYPE_STRUCT
+    if p == null or p.param_pointee_type != TypeKind.Struct
         return null
     *out_len = p.param_type_name_len
     p.param_type_name
@@ -270,21 +270,23 @@ fn cc_lent_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
 # 1 if `p` surely points at an integer: a pointer or borrow local to one, a
 # `*i64` field, or either plus an offset (`p + i`).
 fn cc_int_pointer(sm: *Sema, p: *Expr) -> i32
-    if p.kind == EXPR_IDENT
-        if cc_lent_scalar(sm, p) == 1
-            return 1
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (p.ident_ptr), len: (p.ident_len) as i64 })
-        if v != null and v.kind != TYPE_ARRAY
-            if v.kind != TYPE_PTR and v.kind != TYPE_REF and v.kind != TYPE_MUT_REF
-                return 0
-            return cc_int_type(v.pointee)
-        return 0
-    if p.kind == EXPR_MEMBER
-        let f: *StructField = sbk_member_field(sm, p)
-        if f != null and f.field_type == TYPE_PTR
-            return cc_int_type(f.array_elem_type)
-        return 0
-    if p.kind == EXPR_BINARY and (p.op == OP_ADD or p.op == OP_SUB)
+    match p.kind
+        ExprKind.Ident =>
+            if cc_lent_scalar(sm, p) == 1
+                return 1
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (p.ident_ptr), len: (p.ident_len) as i64 })
+            if v != null and v.kind != TypeKind.Array
+                if v.kind != TypeKind.Ptr and v.kind != TypeKind.Ref and v.kind != TypeKind.MutRef
+                    return 0
+                return cc_int_type(v.pointee)
+            return 0
+        ExprKind.Member =>
+            let f: *StructField = sbk_member_field(sm, p)
+            if f != null and f.field_type == TypeKind.Ptr
+                return cc_int_type(f.array_elem_type)
+            return 0
+        _ => pass
+    if p.kind == ExprKind.Binary and (p.op == OpKind.Add or p.op == OpKind.Sub)
         return cc_int_pointer(sm, p.left)
     0
 
@@ -294,24 +296,26 @@ fn cc_int_pointer(sm: *Sema, p: *Expr) -> i32
 # whose element type is known, and arithmetic or `-` / `~` of these (LARB
 # R47b, #3420).
 fn cc_sure_int(sm: *Sema, a: *Expr) -> i32
-    let k: i32 = a.kind
-    if k == EXPR_INT_LIT or k == EXPR_CHAR_LIT or k == EXPR_CAST or k == EXPR_IDENT
-        return 1
-    if k == EXPR_CALL or k == EXPR_METHOD or k == EXPR_MEMBER
-        return 1
-    if k == EXPR_BINARY
-        return (sema_bool_kind(sm, a.left) == BK_INT and cc_sure_int(sm, a.left) == 1 and sema_bool_kind(sm, a.right) == BK_INT and cc_sure_int(sm, a.right) == 1) as i32
-    if k == EXPR_UNARY and (a.op == OP_NEG or a.op == OP_BIT_NOT)
+    let k: ExprKind = a.kind
+    match k
+        ExprKind.IntLit | ExprKind.CharLit | ExprKind.Cast | ExprKind.Ident =>
+            return 1
+        ExprKind.Call | ExprKind.Method | ExprKind.Member =>
+            return 1
+        ExprKind.Binary =>
+            return (sema_bool_kind(sm, a.left) == BK_INT and cc_sure_int(sm, a.left) == 1 and sema_bool_kind(sm, a.right) == BK_INT and cc_sure_int(sm, a.right) == 1) as i32
+        _ => pass
+    if k == ExprKind.Unary and (a.op == OpKind.Neg or a.op == OpKind.BitNot)
         return cc_sure_int(sm, a.operand)
-    if k == EXPR_UNARY and a.op == OP_DEREF and a.operand != null
+    if k == ExprKind.Unary and a.op == OpKind.Deref and a.operand != null
         return cc_int_pointer(sm, a.operand)
-    if k == EXPR_INDEX and a.left != null
+    if k == ExprKind.Index and a.left != null
         let base: *Expr = a.left
-        if base.kind == EXPR_IDENT
+        if base.kind == ExprKind.Ident
             return (sbk_element(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 }) == BK_INT) as i32
-        if base.kind == EXPR_MEMBER
+        if base.kind == ExprKind.Member
             let f: *StructField = sbk_member_field(sm, base)
-            if f != null and f.field_type == TYPE_ARRAY
+            if f != null and f.field_type == TypeKind.Array
                 return cc_int_type(f.array_elem_type)
     0
 
@@ -323,34 +327,35 @@ fn cc_pointee_struct(sm: *Sema, a: *Expr, out_len: *i32) -> *u8
     *out_len = 0
     var name: *u8 = null
     var len: i32 = 0
-    if a.kind == EXPR_UNARY and (a.op == OP_ADDR or a.op == OP_ADDR_MUT)
+    if a.kind == ExprKind.Unary and (a.op == OpKind.Addr or a.op == OpKind.AddrMut)
         let x: *Expr = a.operand
         if x == null
             return null
-        if x.kind == EXPR_IDENT
-            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
-            if v == null
+        match x.kind
+            ExprKind.Ident =>
+                let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+                if v == null
+                    return null
+                if v.kind == TypeKind.Struct
+                    name = v.type_name
+                    len = v.type_name_len
+                else
+                    name = cc_lent_struct(sm, x, @len)
+            ExprKind.Member =>
+                let f: *StructField = sbk_member_field(sm, x)
+                if f == null or f.field_type != TypeKind.Struct
+                    return null
+                name = f.field_type_name
+                len = f.field_type_name_len
+            _ =>
                 return null
-            if v.kind == TYPE_STRUCT
-                name = v.type_name
-                len = v.type_name_len
-            else
-                name = cc_lent_struct(sm, x, @len)
-        else if x.kind == EXPR_MEMBER
-            let f: *StructField = sbk_member_field(sm, x)
-            if f == null or f.field_type != TYPE_STRUCT
-                return null
-            name = f.field_type_name
-            len = f.field_type_name_len
-        else
-            return null
-    else if a.kind == EXPR_IDENT
+    else if a.kind == ExprKind.Ident
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 })
         if v == null or v.lent != null
             return null
-        if v.kind != TYPE_PTR and v.kind != TYPE_REF and v.kind != TYPE_MUT_REF
+        if v.kind != TypeKind.Ptr and v.kind != TypeKind.Ref and v.kind != TypeKind.MutRef
             return null
-        if v.pointee != TYPE_STRUCT
+        if v.pointee != TypeKind.Struct
             return null
         name = v.type_name
         len = v.type_name_len
@@ -366,10 +371,12 @@ fn cc_pointee_struct(sm: *Sema, a: *Expr, out_len: *i32) -> *u8
 fn cc_not_a_struct(sm: *Sema, a: *Expr, want_sv: StrView) -> *u8
     var want: *u8 = want_sv.ptr
     var want_len: i32 = want_sv.len as i32
-    if a.kind == EXPR_NIL_LIT
-        return c"`null`"
-    if a.kind == EXPR_CSTRING_LIT
-        return c"a `*u8`"
+    match a.kind
+        ExprKind.NilLit =>
+            return c"`null`"
+        ExprKind.CstringLit =>
+            return c"a `*u8`"
+        _ => pass
     let k: i32 = sema_bool_kind(sm, a)
     if k == BK_FLOAT
         return c"a float"
@@ -397,9 +404,9 @@ fn cc_not_a_struct(sm: *Sema, a: *Expr, want_sv: StrView) -> *u8
         return c"a pointer"
     # A local `*u8` / `*i32` ...: a pointer to no struct at all.  A `*[N]u8`
     # makes a StrView in ritz0, so a pointer to an array isn't judged.
-    if a.kind == EXPR_IDENT
+    if a.kind == ExprKind.Ident
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 })
-        if v != null and v.lent == null and v.kind == TYPE_PTR and v.pointee != TYPE_STRUCT and v.pointee != TYPE_VOID and v.pointee != TYPE_ARRAY and v.pointee != TYPE_UNKNOWN
+        if v != null and v.lent == null and v.kind == TypeKind.Ptr and v.pointee != TypeKind.Struct and v.pointee != TypeKind.Void and v.pointee != TypeKind.Array and v.pointee != TypeKind.Unknown
             return c"a pointer"
     null
 
@@ -408,14 +415,14 @@ fn cc_struct_value(sm: *Sema, a: *Expr, out_len: *i32) -> *u8
     *out_len = 0
     var name: *u8 = null
     var len: i32 = 0
-    # A `c:& C` param is a TYPE_MUT_REF local naming its referent (#2250).
+    # A `c:& C` param is a TypeKind.MutRef local naming its referent (#2250).
     let lent: *Param = cc_lent(sm, a)
     if lent != null
-        if lent.param_pointee_type != TYPE_STRUCT
+        if lent.param_pointee_type != TypeKind.Struct
             return null
         name = lent.param_type_name
         len = lent.param_type_name_len
-    else if a.kind == EXPR_STRING_LIT
+    else if a.kind == ExprKind.StringLit
         # A bare literal lowers to a %Span$u8 (AGAST #98), and is named so.
         name = c"Span$u8"
         len = 7
@@ -444,13 +451,14 @@ fn cc_kind_error(sm: *Sema, a: *Expr, fname_sv: StrView, argno: i32, p: *Param) 
     else
         eprint_int(argno as i64)
     eprints_cstr(c" is declared `")
-    if p.param_type == TYPE_PTR
-        eprint_char('*')
-        eprint_bytes(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-    else if p.param_type == TYPE_STRUCT
-        eprint_bytes(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-    else
-        eprints_cstr(primitive_name_from_type(p.param_type))
+    match p.param_type
+        TypeKind.Ptr =>
+            eprint_char('*')
+            eprint_bytes(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+        TypeKind.Struct =>
+            eprint_bytes(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+        _ =>
+            eprints_cstr(primitive_name_from_type(p.param_type))
     eprints_cstr(c"` but its argument is ")
     1
 
@@ -461,12 +469,12 @@ fn cc_kind(sm: *Sema, fname_sv: StrView, argno: i32, a: *Expr, p: *Param)
     if a == null or p == null or p.is_borrow == 1
         return
     let pk: i32 = bk_of_type(p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-    if p.param_type == TYPE_STRUCT and pk == BK_OTHER
+    if p.param_type == TypeKind.Struct and pk == BK_OTHER
         if sema_find_struct(sm, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == null
             return
         # A `c"..."` into a StrView / `Span<u8>` is literal_slot's, said at
         # this argument already (AGAST #3440).
-        if a.kind == EXPR_CSTRING_LIT and (name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 }) == 1)
+        if a.kind == ExprKind.CstringLit and (name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 }) == 1)
             return
         let what: *u8 = cc_not_a_struct(sm, a, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
         if what != null and cc_kind_error(sm, a, StrView { ptr: (fname), len: (flen) as i64 }, argno, p) == 1
@@ -475,15 +483,15 @@ fn cc_kind(sm: *Sema, fname_sv: StrView, argno: i32, a: *Expr, p: *Param)
         return
     # A `*Q` param given a known struct value of another type (#3340).  One of
     # Q itself is ref_check's ("a value doesn't fit a reference slot"), as is
-    # anything into an `@Q`, which is TYPE_REF and not judged here.
-    if p.param_type == TYPE_PTR and p.param_pointee_type == TYPE_STRUCT
+    # anything into an `@Q`, which is TypeKind.Ref and not judged here.
+    if p.param_type == TypeKind.Ptr and p.param_pointee_type == TypeKind.Struct
         if p.param_type_name == null or p.param_type_name_len <= 0
             return
         if sema_find_struct(sm, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == null
             return
         # A bare literal is a StrView (#98), lowered as a %Span$u8: into a
         # `*StrView` / `*Span<u8>` it is a value of Q, ref_check's to refuse.
-        if a.kind == EXPR_STRING_LIT and (name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 }) == 1)
+        if a.kind == ExprKind.StringLit and (name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 }) == 1)
             return
         var vlen: i32 = 0
         let val: *u8 = cc_struct_value(sm, a, @vlen)
@@ -494,7 +502,7 @@ fn cc_kind(sm: *Sema, fname_sv: StrView, argno: i32, a: *Expr, p: *Param)
             eprint_bytes(StrView { ptr: (val), len: (vlen) as i64 })
             eprints_cstr(c"`\n")
         return
-    if (pk != BK_INT and pk != BK_FLOAT and pk != BK_BOOL) or p.param_type == TYPE_STRUCT
+    if (pk != BK_INT and pk != BK_FLOAT and pk != BK_BOOL) or p.param_type == TypeKind.Struct
         return
     if primitive_name_from_type(p.param_type) == null
         return
@@ -540,19 +548,19 @@ fn cc_unboxed_name(name_sv: StrView) -> i32
 # `@S` / `@&S` (AGAST #2560), a call or method returning a struct (#2413,
 # #3241), an element of a `[N]S` or a Vec<S> (#3420).
 fn cc_struct_arg(sm: *Sema, a: *Expr) -> i32
-    if a.kind == EXPR_STRUCT_LIT
+    if a.kind == ExprKind.StructLit
         return 1
     var fd: *FnDef = null
-    if a.kind == EXPR_CALL and a.func_name_len > 0
+    if a.kind == ExprKind.Call and a.func_name_len > 0
         fd = cc_named_fn(sm, a)
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (a.func_name), len: (a.func_name_len) as i64 })
         if v != null
             fd = v.fn_sig
-    else if a.kind == EXPR_METHOD
+    else if a.kind == ExprKind.Method
         fd = sbk_method_def(sm, a)
     if fd != null
-        return (fd.return_type == TYPE_STRUCT and sema_find_struct(sm, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) != null) as i32
-    if (a.kind == EXPR_UNARY and a.op == OP_DEREF) or a.kind == EXPR_INDEX
+        return (fd.return_type == TypeKind.Struct and sema_find_struct(sm, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) != null) as i32
+    if (a.kind == ExprKind.Unary and a.op == OpKind.Deref) or a.kind == ExprKind.Index
         var name: *u8 = null
         var len: i32 = 0
         sbk_receiver(sm, a, @name, @len)
@@ -562,7 +570,7 @@ fn cc_struct_arg(sm: *Sema, a: *Expr) -> i32
 fn cc_boxed(sm: *Sema, e: *Expr, argno: i32, a: *Expr, p: *Param, span_ok: i32)
     if a == null or p == null or p.is_borrow == 1
         return
-    if p.param_type != TYPE_STRUCT or p.param_type_name == null or p.param_type_name_len <= 0
+    if p.param_type != TypeKind.Struct or p.param_type_name == null or p.param_type_name_len <= 0
         return
     if is_primitive_type_name(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == 1
         return
@@ -622,7 +630,7 @@ fn cc_print_arg(sm: *Sema, e: *Expr)
     var line: i32 = e.span.line
     var col: i32 = e.span.col
     if e.args != null and e.args.next == null
-        if e.args.kind == EXPR_STRING_LIT or e.args.kind == EXPR_CSTRING_LIT
+        if e.args.kind == ExprKind.StringLit or e.args.kind == ExprKind.CstringLit
             return
         line = e.args.span.line
         col = e.args.span.col
@@ -760,7 +768,7 @@ fn cc_adapted_main(sm: *Sema, e: *Expr) -> i32
         eprint_char('\n')
     1
 
-# A call `f(args)` (EXPR_CALL), before its arguments are walked.
+# A call `f(args)` (ExprKind.Call), before its arguments are walked.
 pub fn call_check_call(sm: *Sema, e: *Expr)
     if g_cc_mute > 0
         return
@@ -823,29 +831,31 @@ fn cc_recv_type(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
     *out_len = 0
     var recv: *Expr = e.left
     # `(@d).m()` and `(@&d).m()` dispatch on `d` (AGAST #2550).
-    while recv.kind == EXPR_UNARY and (recv.op == OP_ADDR or recv.op == OP_ADDR_MUT) and recv.operand != null
+    while recv.kind == ExprKind.Unary and (recv.op == OpKind.Addr or recv.op == OpKind.AddrMut) and recv.operand != null
         recv = recv.operand
-    if recv.kind == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
-        if v != null
-            *out_len = v.type_name_len
-            return v.type_name
-        let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
-        if g == null
+    match recv.kind
+        ExprKind.Ident =>
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
+            if v != null
+                *out_len = v.type_name_len
+                return v.type_name
+            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
+            if g == null
+                return null
+            if g.var_type == TypeKind.Struct and g.type_name_len > 0
+                *out_len = g.type_name_len
+                return g.type_name
+            if (g.var_type == TypeKind.Ptr or g.var_type == TypeKind.Ref or g.var_type == TypeKind.MutRef) and g.pointee_type == TypeKind.Struct and g.pointee_type_name_len > 0
+                *out_len = g.pointee_type_name_len
+                return g.pointee_type_name
             return null
-        if g.var_type == TYPE_STRUCT and g.type_name_len > 0
-            *out_len = g.type_name_len
-            return g.type_name
-        if (g.var_type == TYPE_PTR or g.var_type == TYPE_REF or g.var_type == TYPE_MUT_REF) and g.pointee_type == TYPE_STRUCT and g.pointee_type_name_len > 0
-            *out_len = g.pointee_type_name_len
-            return g.pointee_type_name
-        return null
-    if recv.kind == EXPR_STRING_LIT
-        *out_len = 7
-        return c"StrView"
-    if recv.kind == EXPR_STRUCT_LIT
-        *out_len = recv.ident_len
-        return recv.ident_ptr
+        ExprKind.StringLit =>
+            *out_len = 7
+            return c"StrView"
+        ExprKind.StructLit =>
+            *out_len = recv.ident_len
+            return recv.ident_ptr
+        _ => pass
     var name: *u8 = null
     var len: i32 = 0
     sbk_receiver(sm, recv, @name, @len)
@@ -882,13 +892,13 @@ fn cc_inline_method(type_name_sv: StrView, e: *Expr) -> i32
         return 1
     (type_name_len > 5 and memcmp(type_name, c"Span$", 5) == 0) as i32
 
-# A method call `r.m(args)` / `T.m(args)` (EXPR_METHOD), after its receiver
+# A method call `r.m(args)` / `T.m(args)` (ExprKind.Method), after its receiver
 # is walked and before its arguments are.
 pub fn call_check_method(sm: *Sema, e: *Expr)
     let left: *Expr = e.left
     if left == null or g_cc_mute > 0
         return
-    if left.kind == EXPR_IDENT and cc_is_value_name(sm, left) == 0
+    if left.kind == ExprKind.Ident and cc_is_value_name(sm, left) == 0
         # `Opt.Holds(x)`: a variant beats an impl method (AGAST #1466).
         let ei: i32 = enum_find(StrView { ptr: (left.ident_ptr), len: (left.ident_len) as i64 })
         if ei >= 0 and enum_variant_index(StrView { ptr: (left.ident_ptr), len: (left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
@@ -949,7 +959,7 @@ fn cc_boxed_args(sm: *Sema, e: *Expr, params: *Param, span_ok: i32)
 # (AGAST #4244), said instead of the array check's.
 
 fn ca_local(sm: *Sema, e: *Expr) -> *LocalVar
-    if e == null or e.kind != EXPR_IDENT
+    if e == null or e.kind != ExprKind.Ident
         return null
     var env: RefEnv
     var is_local: i32 = 0
@@ -957,10 +967,10 @@ fn ca_local(sm: *Sema, e: *Expr) -> *LocalVar
 
 # 1 when `e` names a local, typed or not.
 fn ca_is_local(sm: *Sema, e: *Expr) -> i32
-    (e != null and e.kind == EXPR_IDENT and sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null) as i32
+    (e != null and e.kind == ExprKind.Ident and sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null) as i32
 
 fn ca_global(sm: *Sema, e: *Expr) -> *GlobalVarDef
-    if e == null or e.kind != EXPR_IDENT or ca_is_local(sm, e) == 1
+    if e == null or e.kind != ExprKind.Ident or ca_is_local(sm, e) == 1
         return null
     sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
 
@@ -1000,9 +1010,9 @@ fn ca_param_struct(sm: *Sema, p: *Param, out_len: *i32) -> *u8
     *out_len = 0
     if p == null or p.is_borrow == 1 or p.param_type_name_len <= 0
         return null
-    if p.param_type != TYPE_PTR and p.param_type != TYPE_REF and p.param_type != TYPE_MUT_REF
+    if p.param_type != TypeKind.Ptr and p.param_type != TypeKind.Ref and p.param_type != TypeKind.MutRef
         return null
-    if p.param_pointee_type != TYPE_STRUCT or sema_find_struct(sm, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == null
+    if p.param_pointee_type != TypeKind.Struct or sema_find_struct(sm, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == null
         return null
     *out_len = p.param_type_name_len
     p.param_type_name
@@ -1014,36 +1024,37 @@ fn ca_arg_struct(sm: *Sema, arg: *Expr, out_len: *i32) -> *u8
     *out_len = 0
     var name: *u8 = null
     var len: i32 = 0
-    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+    if arg.kind == ExprKind.Unary and (arg.op == OpKind.Addr or arg.op == OpKind.AddrMut)
         let x: *Expr = arg.operand
         if x == null
             return null
-        if x.kind == EXPR_IDENT
-            let loc: *LocalVar = ca_local(sm, x)
-            if loc == null
+        match x.kind
+            ExprKind.Ident =>
+                let loc: *LocalVar = ca_local(sm, x)
+                if loc == null
+                    return null
+                let lent: i32 = (lv_holds_lent_ptr(loc) == 1 and lv_pointee_type(loc) == TypeKind.Struct) as i32
+                if lv_var_type(loc) != TypeKind.Struct and lent == 0
+                    return null
+                if ca_names_differ(sm, x, loc) == 1
+                    return null
+                name = lv_type_name(loc)
+                len = lv_type_name_len(loc)
+            ExprKind.Member =>
+                let f: *StructField = rs_field(sm, x)
+                if f == null or f.field_type != TypeKind.Struct
+                    return null
+                name = f.field_type_name
+                len = f.field_type_name_len
+            _ =>
                 return null
-            let lent: i32 = (lv_holds_lent_ptr(loc) == 1 and lv_pointee_type(loc) == TYPE_STRUCT) as i32
-            if lv_var_type(loc) != TYPE_STRUCT and lent == 0
-                return null
-            if ca_names_differ(sm, x, loc) == 1
-                return null
-            name = lv_type_name(loc)
-            len = lv_type_name_len(loc)
-        else if x.kind == EXPR_MEMBER
-            let f: *StructField = rs_field(sm, x)
-            if f == null or f.field_type != TYPE_STRUCT
-                return null
-            name = f.field_type_name
-            len = f.field_type_name_len
-        else
-            return null
-    else if arg.kind == EXPR_IDENT
+    else if arg.kind == ExprKind.Ident
         let loc: *LocalVar = ca_local(sm, arg)
         if loc == null
             return null
-        if lv_var_type(loc) != TYPE_PTR and lv_var_type(loc) != TYPE_REF and lv_var_type(loc) != TYPE_MUT_REF
+        if lv_var_type(loc) != TypeKind.Ptr and lv_var_type(loc) != TypeKind.Ref and lv_var_type(loc) != TypeKind.MutRef
             return null
-        if lv_pointee_type(loc) != TYPE_STRUCT or ca_names_differ(sm, arg, loc) == 1
+        if lv_pointee_type(loc) != TypeKind.Struct or ca_names_differ(sm, arg, loc) == 1
             return null
         name = lv_type_name(loc)
         len = lv_type_name_len(loc)
@@ -1090,11 +1101,11 @@ fn ca_struct_ptr(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Ex
 # The `*[N]T` / `@[N]T` / `@&[N]T` local `e` names (array_ptr_local), or null.
 fn ca_array_ptr_local(sm: *Sema, e: *Expr) -> *LocalVar
     let loc: *LocalVar = ca_local(sm, e)
-    if loc == null or lv_pointee_type(loc) != TYPE_ARRAY or lv_pointee_array_size(loc) <= 0
+    if loc == null or lv_pointee_type(loc) != TypeKind.Array or lv_pointee_array_size(loc) <= 0
         return null
-    if lv_var_type(loc) == TYPE_ARRAY and lv_is_lent(loc) == 1
+    if lv_var_type(loc) == TypeKind.Array and lv_is_lent(loc) == 1
         return loc
-    if lv_var_type(loc) != TYPE_PTR and lv_var_type(loc) != TYPE_REF and lv_var_type(loc) != TYPE_MUT_REF
+    if lv_var_type(loc) != TypeKind.Ptr and lv_var_type(loc) != TypeKind.Ref and lv_var_type(loc) != TypeKind.MutRef
         return null
     loc
 
@@ -1102,21 +1113,23 @@ fn ca_array_ptr_local(sm: *Sema, e: *Expr) -> *LocalVar
 # as (base_ptr_array), or null.
 fn ca_base_ptr_array(sm: *Sema, e: *Expr) -> *Param
     var pa: *Param = null
-    if e.kind == EXPR_MEMBER
-        let f: *StructField = rs_field(sm, e)
-        if f != null
-            pa = f.ptr_array
-    else if e.kind == EXPR_IDENT
-        let g: *GlobalVarDef = ca_global(sm, e)
-        if g != null
-            pa = g.ptr_array
-    else if e.kind == EXPR_CALL
-        let fd: *FnDef = sema_call_fn(sm, e)
-        if fd != null
-            pa = fd.ret_ptr_array
-    else if e.kind == EXPR_CAST
-        pa = e.cast_ptr_array
-    if pa == null or pa.param_pointee_array_size <= 0 or pa.param_type == TYPE_PTR_PTR
+    match e.kind
+        ExprKind.Member =>
+            let f: *StructField = rs_field(sm, e)
+            if f != null
+                pa = f.ptr_array
+        ExprKind.Ident =>
+            let g: *GlobalVarDef = ca_global(sm, e)
+            if g != null
+                pa = g.ptr_array
+        ExprKind.Call =>
+            let fd: *FnDef = sema_call_fn(sm, e)
+            if fd != null
+                pa = fd.ret_ptr_array
+        ExprKind.Cast =>
+            pa = e.cast_ptr_array
+        _ => pass
+    if pa == null or pa.param_pointee_array_size <= 0 or pa.param_type == TypeKind.PtrPtr
         return null
     pa
 
@@ -1128,7 +1141,7 @@ fn ca_array_ptr_shape(sm: *Sema, e: *Expr, out: *ArrayDims) -> i32
         var en_len: i32 = 0
         let en: *u8 = array_ptr_elem_name(loc, @en_len)
         return array_dims_1d(out, lv_pointee_array_size(loc), lv_pointee_array_elem_type(loc), StrView { ptr: (en), len: (en_len) as i64 })
-    if e.kind == EXPR_BINARY
+    if e.kind == ExprKind.Binary
         return 0
     let pa: *Param = ca_base_ptr_array(sm, e)
     if pa == null
@@ -1138,49 +1151,49 @@ fn ca_array_ptr_shape(sm: *Sema, e: *Expr, out: *ArrayDims) -> i32
 # A whole 1-D array `value` reads (arg_array_shape): a local or by-value param,
 # a global, `*@a`, `*p` of a `*[N]T`, a field.
 fn ca_array_shape(sm: *Sema, value: *Expr, out: *ArrayDims) -> i32
-    if value.kind == EXPR_IDENT
+    if value.kind == ExprKind.Ident
         let loc: *LocalVar = ca_local(sm, value)
         if loc != null
             # An inferred `let b = g(a)` of a generic's `[N]T` keeps no N here.
-            if lv_var_type(loc) == TYPE_ARRAY and lv_array_shape(loc) == null and lv_array_size(loc) > 0
+            if lv_var_type(loc) == TypeKind.Array and lv_array_shape(loc) == null and lv_array_size(loc) > 0
                 return array_dims_1d(out, lv_array_size(loc), lv_array_elem_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
             return 0
         if ca_is_local(sm, value) == 1
             return 0
         let g: *GlobalVarDef = ca_global(sm, value)
-        if g != null and g.var_type == TYPE_ARRAY and g.array_shape == null
+        if g != null and g.var_type == TypeKind.Array and g.array_shape == null
             return array_dims_1d(out, g.array_size, g.array_elem_type, StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 })
         return 0
-    if value.kind == EXPR_UNARY and value.op == OP_DEREF and value.operand != null
+    if value.kind == ExprKind.Unary and value.op == OpKind.Deref and value.operand != null
         let o: *Expr = value.operand
-        if o.kind == EXPR_UNARY and (o.op == OP_ADDR or o.op == OP_ADDR_MUT) and o.operand != null
+        if o.kind == ExprKind.Unary and (o.op == OpKind.Addr or o.op == OpKind.AddrMut) and o.operand != null
             let x: *Expr = o.operand
-            if x.kind == EXPR_IDENT or x.kind == EXPR_UNARY
+            if x.kind == ExprKind.Ident or x.kind == ExprKind.Unary
                 return ca_array_shape(sm, x, out)
             return 0
         return ca_array_ptr_shape(sm, o, out)
-    if value.kind == EXPR_MEMBER
+    if value.kind == ExprKind.Member
         let f: *StructField = rs_field(sm, value)
-        if f != null and f.field_type == TYPE_ARRAY and f.array_shape == null
+        if f != null and f.field_type == TypeKind.Array and f.array_shape == null
             return array_dims_1d(out, f.array_size, f.array_elem_type, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 })
     0
 
 # The N-D array a name or field is (nd_array_base_shape), or null.
 fn ca_nd_shape(sm: *Sema, base: *Expr) -> *ArrayShape
-    if base.kind == EXPR_MEMBER
+    if base.kind == ExprKind.Member
         let f: *StructField = rs_field(sm, base)
-        if f == null or f.field_type != TYPE_ARRAY
+        if f == null or f.field_type != TypeKind.Array
             return null
         return f.array_shape
-    if base.kind != EXPR_IDENT
+    if base.kind != ExprKind.Ident
         return null
     let loc: *LocalVar = ca_local(sm, base)
     if loc != null
-        if lv_var_type(loc) == TYPE_ARRAY
+        if lv_var_type(loc) == TypeKind.Array
             return lv_array_shape(loc)
         return null
     let g: *GlobalVarDef = ca_global(sm, base)
-    if g != null and g.var_type == TYPE_ARRAY
+    if g != null and g.var_type == TypeKind.Array
         return g.array_shape
     null
 
@@ -1189,29 +1202,31 @@ fn ca_nd_shape(sm: *Sema, base: *Expr) -> *ArrayShape
 fn ca_place_dims(sm: *Sema, value: *Expr, out: *ArrayDims) -> i32
     if ca_array_shape(sm, value, out) == 1
         return ARG_DIMS_ARRAY
-    if value.kind == EXPR_IDENT
-        let sh: *ArrayShape = ca_nd_shape(sm, value)
-        if sh != null
-            return array_dims_nd(out, sh, 0)
-        let loc: *LocalVar = ca_local(sm, value)
-        if loc != null and lv_var_type(loc) == TYPE_ARRAY
+    match value.kind
+        ExprKind.Ident =>
+            let sh: *ArrayShape = ca_nd_shape(sm, value)
+            if sh != null
+                return array_dims_nd(out, sh, 0)
+            let loc: *LocalVar = ca_local(sm, value)
+            if loc != null and lv_var_type(loc) == TypeKind.Array
+                return ARG_DIMS_UNKNOWN
+            if loc != null or ca_global(sm, value) != null
+                return ARG_DIMS_NOT_ARRAY
             return ARG_DIMS_UNKNOWN
-        if loc != null or ca_global(sm, value) != null
-            return ARG_DIMS_NOT_ARRAY
-        return ARG_DIMS_UNKNOWN
-    if value.kind == EXPR_MEMBER
-        let f: *StructField = rs_field(sm, value)
-        if f != null and f.field_type == TYPE_ARRAY and f.array_shape != null
-            return array_dims_nd(out, f.array_shape, 0)
-        if f != null and f.field_type != TYPE_ARRAY
-            return ARG_DIMS_NOT_ARRAY
-        return ARG_DIMS_UNKNOWN
-    if value.kind == EXPR_INDEX
+        ExprKind.Member =>
+            let f: *StructField = rs_field(sm, value)
+            if f != null and f.field_type == TypeKind.Array and f.array_shape != null
+                return array_dims_nd(out, f.array_shape, 0)
+            if f != null and f.field_type != TypeKind.Array
+                return ARG_DIMS_NOT_ARRAY
+            return ARG_DIMS_UNKNOWN
+        _ => pass
+    if value.kind == ExprKind.Index
         # The chain's base and depth (nd_index_shape).  A `[K]*[N][M]T`
         # element, or a plane pointer's, isn't judged.
         var depth: i32 = 0
         var base: *Expr = value
-        while base.kind == EXPR_INDEX
+        while base.kind == ExprKind.Index
             depth = depth + 1
             base = base.left
         let bl: *LocalVar = ca_local(sm, base)
@@ -1224,21 +1239,21 @@ fn ca_place_dims(sm: *Sema, value: *Expr, out: *ArrayDims) -> i32
             return array_dims_nd(out, sh, depth)
         # An element of a 1-D array.
         var whole: ArrayDims
-        if value.left.kind != EXPR_INDEX and ca_place_dims(sm, value.left, @whole) == ARG_DIMS_ARRAY
+        if value.left.kind != ExprKind.Index and ca_place_dims(sm, value.left, @whole) == ARG_DIMS_ARRAY
             return ARG_DIMS_NOT_ARRAY
     ARG_DIMS_UNKNOWN
 
 # What `arg` points at, for a param that takes an array by address (ref_arg_dims).
 fn ca_ref_dims(sm: *Sema, arg: *Expr, out: *ArrayDims) -> i32
-    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+    if arg.kind == ExprKind.Unary and (arg.op == OpKind.Addr or arg.op == OpKind.AddrMut)
         return ca_place_dims(sm, arg.operand, out)
-    if arg.kind == EXPR_IDENT
+    if arg.kind == ExprKind.Ident
         let loc: *LocalVar = ca_local(sm, arg)
-        if loc != null and lv_var_type(loc) != TYPE_ARRAY
+        if loc != null and lv_var_type(loc) != TypeKind.Array
             let ploc: *LocalVar = ca_array_ptr_local(sm, arg)
             if ploc != null
                 # AGAST #4122: a plane pointer `*[N][M]T` points at its shape.
-                if lv_pointee_array_shape(ploc) != null and lv_var_type(ploc) == TYPE_PTR
+                if lv_pointee_array_shape(ploc) != null and lv_var_type(ploc) == TypeKind.Ptr
                     return array_dims_nd(out, lv_pointee_array_shape(ploc), 0)
                 var en_len: i32 = 0
                 let en: *u8 = array_ptr_elem_name(ploc, @en_len)
@@ -1246,8 +1261,8 @@ fn ca_ref_dims(sm: *Sema, arg: *Expr, out: *ArrayDims) -> i32
             if lv_is_lent(loc) == 1
                 return ARG_DIMS_NOT_ARRAY
             # A pointer whose pointee is known and no array (AGAST #2323).
-            if lv_var_type(loc) == TYPE_PTR or lv_var_type(loc) == TYPE_PTR_PTR or lv_var_type(loc) == TYPE_REF or lv_var_type(loc) == TYPE_MUT_REF
-                if lv_pointee_type(loc) == TYPE_ARRAY or lv_pointee_type(loc) == TYPE_UNKNOWN or lv_pointee_type(loc) == TYPE_VOID
+            if lv_var_type(loc) == TypeKind.Ptr or lv_var_type(loc) == TypeKind.PtrPtr or lv_var_type(loc) == TypeKind.Ref or lv_var_type(loc) == TypeKind.MutRef
+                if lv_pointee_type(loc) == TypeKind.Array or lv_pointee_type(loc) == TypeKind.Unknown or lv_pointee_type(loc) == TypeKind.Void
                     return ARG_DIMS_UNKNOWN
                 return ARG_DIMS_NOT_ARRAY
     ca_place_dims(sm, arg, out)
@@ -1264,7 +1279,7 @@ fn ca_array_ref(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Exp
         ca_error(sm, call, call, StrView { ptr: (fname), len: (flen) as i64 }, argno, c"the parameter points at an array")
         return
     # A struct element the image doesn't name (`let p = q` of an `@&[3]S`) is unjudged.
-    if got.leaf == TYPE_STRUCT and got.name_len <= 0
+    if got.leaf == TypeKind.Struct and got.name_len <= 0
         return
     var want: ArrayDims
     param_pointee_dims(@want, p)
@@ -1273,7 +1288,7 @@ fn ca_array_ref(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Exp
 
 # 1 when `p` is a StrView.
 fn ca_strview(p: *Param) -> i32
-    (p.param_type == TYPE_STRUCT and name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1) as i32
+    (p.param_type == TypeKind.Struct and name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1) as i32
 
 # 1 when `arg`, into the StrView `p`, is a `[N]u8` / `[N]i8` (bare, `@a`, or a
 # `*[N]u8` local, param or field): ritz0 makes it the StrView (strview_array_src).
@@ -1283,13 +1298,13 @@ fn ca_strview_array(sm: *Sema, arg: *Expr, p: *Param) -> i32
     if ca_strview(p) == 0
         return 0
     var src: ArrayDims
-    if arg.kind == EXPR_IDENT or arg.kind == EXPR_MEMBER
+    if arg.kind == ExprKind.Ident or arg.kind == ExprKind.Member
         if ca_array_ptr_shape(sm, arg, @src) == 1
             if ty_int_bits(src.leaf) == 8
                 return 1
             return 2
     var x: *Expr = arg
-    let addr: i32 = (x.kind == EXPR_UNARY and (x.op == OP_ADDR or x.op == OP_ADDR_MUT) and x.operand != null) as i32
+    let addr: i32 = (x.kind == ExprKind.Unary and (x.op == OpKind.Addr or x.op == OpKind.AddrMut) and x.operand != null) as i32
     if addr == 1
         x = x.operand
     if ca_array_shape(sm, x, @src) == 0
@@ -1327,12 +1342,12 @@ const CA_BORROW_SHARED: i32 = 5    # reached through an `@T`, read-only
 # The type of a place, as the emitter's PlaceType: `name` is a struct's, or for
 # a pointer the struct it points at.
 struct CaPlace
-    kind: i32
-    pointee: i32
+    kind: TypeKind
+    pointee: TypeKind
     name: *u8
     name_len: i32
 
-fn ca_place_set(out: *CaPlace, kind: i32, pointee: i32, name_sv: StrView) -> i32
+fn ca_place_set(out: *CaPlace, kind: TypeKind, pointee: TypeKind, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     out.kind = kind
@@ -1341,16 +1356,16 @@ fn ca_place_set(out: *CaPlace, kind: i32, pointee: i32, name_sv: StrView) -> i32
     out.name_len = name_len
     1
 
-fn ca_is_pointer(t: i32) -> i32
-    (t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF) as i32
+fn ca_is_pointer(t: TypeKind) -> i32
+    (t == TypeKind.Ptr or t == TypeKind.PtrPtr or t == TypeKind.Ref or t == TypeKind.MutRef) as i32
 
 # What `*x` gives, for `x` of type `base`.
 fn ca_place_deref(base: *CaPlace, out: *CaPlace) -> i32
-    var held: i32 = TYPE_UNKNOWN
+    var held: TypeKind = TypeKind.Unknown
     if base.name_len > 0
-        held = TYPE_STRUCT
-    if base.kind == TYPE_PTR_PTR
-        return ca_place_set(out, TYPE_PTR, held, StrView { ptr: (base.name), len: (base.name_len) as i64 })
+        held = TypeKind.Struct
+    if base.kind == TypeKind.PtrPtr
+        return ca_place_set(out, TypeKind.Ptr, held, StrView { ptr: (base.name), len: (base.name_len) as i64 })
     if ca_is_pointer(base.kind) == 0
         return 0
     ca_place_set(out, base.pointee, held, StrView { ptr: (base.name), len: (base.name_len) as i64 })
@@ -1360,14 +1375,14 @@ fn ca_place_deref(base: *CaPlace, out: *CaPlace) -> i32
 fn ca_plane_shape(sm: *Sema, e: *Expr) -> *ArrayShape
     var x: *Expr = e
     var deref: i32 = 0
-    if e.kind == EXPR_UNARY and e.op == OP_DEREF and e.operand != null
+    if e.kind == ExprKind.Unary and e.op == OpKind.Deref and e.operand != null
         x = e.operand
         deref = 1
     let loc: *LocalVar = ca_local(sm, x)
     if loc == null or lv_pointee_array_shape(loc) == null
         return null
     # Its slot holds the plane pointer's address: only `*r` is the pointer.
-    let holds: i32 = (lv_pointee_type(loc) == TYPE_PTR and (lv_var_type(loc) == TYPE_PTR_PTR or lv_var_type(loc) == TYPE_REF or lv_var_type(loc) == TYPE_MUT_REF)) as i32
+    let holds: i32 = (lv_pointee_type(loc) == TypeKind.Ptr and (lv_var_type(loc) == TypeKind.PtrPtr or lv_var_type(loc) == TypeKind.Ref or lv_var_type(loc) == TypeKind.MutRef)) as i32
     if holds == 1 and deref == 0
         return null
     lv_pointee_array_shape(loc)
@@ -1377,7 +1392,7 @@ fn ca_plane_shape(sm: *Sema, e: *Expr) -> *ArrayShape
 fn ca_place_index(sm: *Sema, value: *Expr, out: *CaPlace) -> i32
     var depth: i32 = 0
     var base: *Expr = value
-    while base.kind == EXPR_INDEX
+    while base.kind == ExprKind.Index
         depth = depth + 1
         base = base.left
     var sh: *ArrayShape = ca_nd_shape(sm, base)
@@ -1385,13 +1400,13 @@ fn ca_place_index(sm: *Sema, value: *Expr, out: *CaPlace) -> i32
         sh = ca_plane_shape(sm, base)
     if sh != null and depth <= sh.rank
         if depth < sh.rank
-            return ca_place_set(out, TYPE_ARRAY, TYPE_UNKNOWN, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
-        return ca_place_set(out, sh.leaf_type, TYPE_UNKNOWN, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+            return ca_place_set(out, TypeKind.Array, TypeKind.Unknown, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+        return ca_place_set(out, sh.leaf_type, TypeKind.Unknown, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
     var src: ArrayDims
     if ca_array_shape(sm, value.left, @src) == 1
-        var held: i32 = TYPE_UNKNOWN
+        var held: TypeKind = TypeKind.Unknown
         if src.name_len > 0
-            held = TYPE_STRUCT
+            held = TypeKind.Struct
         return ca_place_set(out, src.leaf, held, StrView { ptr: (src.name), len: (src.name_len) as i64 })
     var b: CaPlace
     if ca_place_type(sm, value.left, @b) == 0
@@ -1400,26 +1415,28 @@ fn ca_place_index(sm: *Sema, value: *Expr, out: *CaPlace) -> i32
 
 # 1 and `out` when Sema can type the place `e` (place_type_of).
 fn ca_place_type(sm: *Sema, e: *Expr, out: *CaPlace) -> i32
-    if e.kind == EXPR_IDENT
-        if ca_is_local(sm, e) == 1
-            let loc: *LocalVar = ca_local(sm, e)
-            if loc == null
+    match e.kind
+        ExprKind.Ident =>
+            if ca_is_local(sm, e) == 1
+                let loc: *LocalVar = ca_local(sm, e)
+                if loc == null
+                    return 0
+                return ca_place_set(out, lv_var_type(loc), lv_pointee_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if g == null
                 return 0
-            return ca_place_set(out, lv_var_type(loc), lv_pointee_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
-        let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if g == null
-            return 0
-        if ca_is_pointer(g.var_type) == 1
-            return ca_place_set(out, g.var_type, g.pointee_type, StrView { ptr: (g.pointee_type_name), len: (g.pointee_type_name_len) as i64 })
-        return ca_place_set(out, g.var_type, TYPE_UNKNOWN, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
-    if e.kind == EXPR_MEMBER
-        let f: *StructField = rs_field(sm, e)
-        if f == null
-            return 0
-        return ca_place_set(out, f.field_type, ptr_field_elem_kind(f), StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
-    if e.kind == EXPR_INDEX
-        return ca_place_index(sm, e, out)
-    if e.kind == EXPR_UNARY and e.op == OP_DEREF and e.operand != null
+            if ca_is_pointer(g.var_type) == 1
+                return ca_place_set(out, g.var_type, g.pointee_type, StrView { ptr: (g.pointee_type_name), len: (g.pointee_type_name_len) as i64 })
+            return ca_place_set(out, g.var_type, TypeKind.Unknown, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
+        ExprKind.Member =>
+            let f: *StructField = rs_field(sm, e)
+            if f == null
+                return 0
+            return ca_place_set(out, f.field_type, ptr_field_elem_kind(f), StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+        ExprKind.Index =>
+            return ca_place_index(sm, e, out)
+        _ => pass
+    if e.kind == ExprKind.Unary and e.op == OpKind.Deref and e.operand != null
         var b: CaPlace
         if ca_place_type(sm, find_base_expr(e.operand), @b) == 0
             return 0
@@ -1430,13 +1447,13 @@ fn ca_place_type(sm: *Sema, e: *Expr, out: *CaPlace) -> i32
 # field or element of a call result isn't one.
 fn ca_arg_is_place(sm: *Sema, e: *Expr) -> i32
     var root: *Expr = e
-    while root.kind == EXPR_MEMBER or root.kind == EXPR_INDEX
-        if root.kind == EXPR_INDEX and root.right != null and root.right.kind == EXPR_RANGE
+    while root.kind == ExprKind.Member or root.kind == ExprKind.Index
+        if root.kind == ExprKind.Index and root.right != null and root.right.kind == ExprKind.Range
             return 0
         root = root.left
-    if root.kind == EXPR_UNARY and root.op == OP_DEREF
+    if root.kind == ExprKind.Unary and root.op == OpKind.Deref
         return 1
-    if root.kind != EXPR_IDENT
+    if root.kind != ExprKind.Ident
         return 0
     if ca_is_local(sm, root) == 1
         return 1
@@ -1444,18 +1461,18 @@ fn ca_arg_is_place(sm: *Sema, e: *Expr) -> i32
 
 # What `arg`, no place, does for `p`: it passes if it's the pointer `p` is.
 fn ca_rvalue_borrow(sm: *Sema, arg: *Expr, p: *Param) -> i32
-    if arg.kind == EXPR_NIL_LIT or arg.kind == EXPR_CSTRING_LIT
+    if arg.kind == ExprKind.NilLit or arg.kind == ExprKind.CstringLit
         return CA_BORROW_RVALUE
-    var t: i32 = sema_expr_type(sm, arg)
-    if arg.kind == EXPR_METHOD
+    var t: TypeKind = sema_expr_type(sm, arg)
+    if arg.kind == ExprKind.Method
         let m: *FnDef = sbk_method_def(sm, arg)
         if m == null
             return CA_BORROW_UNTYPED
         t = m.return_type
-    if t == TYPE_REF
+    if t == TypeKind.Ref
         return CA_BORROW_SHARED
-    if p.param_pointee_type == TYPE_PTR
-        if t == TYPE_PTR_PTR
+    if p.param_pointee_type == TypeKind.Ptr
+        if t == TypeKind.PtrPtr
             return CA_BORROW_PASS
     else if ca_is_pointer(t) == 1
         return CA_BORROW_PASS
@@ -1465,18 +1482,18 @@ fn ca_rvalue_borrow(sm: *Sema, arg: *Expr, p: *Param) -> i32
 # root is one.  An `@&T` or `*T` nearer than that makes it writable.
 fn ca_behind_shared(sm: *Sema, e: *Expr) -> i32
     var pl: CaPlace
-    if ca_place_type(sm, e, @pl) == 1 and pl.kind == TYPE_REF
+    if ca_place_type(sm, e, @pl) == 1 and pl.kind == TypeKind.Ref
         return 1
     var at: *Expr = e
     while at != null
-        if at.kind == EXPR_MEMBER or at.kind == EXPR_INDEX
+        if at.kind == ExprKind.Member or at.kind == ExprKind.Index
             at = at.left
-        else if at.kind == EXPR_UNARY and at.op == OP_DEREF
+        else if at.kind == ExprKind.Unary and at.op == OpKind.Deref
             at = find_base_expr(at.operand)
         else
             return 0
         if ca_place_type(sm, at, @pl) == 1
-            if pl.kind == TYPE_REF
+            if pl.kind == TypeKind.Ref
                 return 1
             if ca_is_pointer(pl.kind) == 1
                 return 0
@@ -1484,35 +1501,35 @@ fn ca_behind_shared(sm: *Sema, e: *Expr) -> i32
 
 # AGAST #2354: 1 when `arg` names a by-value `@&U` param of the fn walked.
 fn ca_ref_param(sm: *Sema, arg: *Expr) -> i32
-    if arg.kind != EXPR_IDENT or sm.cur_fn == null
+    if arg.kind != ExprKind.Ident or sm.cur_fn == null
         return 0
     var q: *Param = sm.cur_fn.params
     while q != null
-        if q.param_type == TYPE_MUT_REF and q.is_borrow == 0 and name_eq(StrView { ptr: (q.name), len: (q.name_len) as i64 }, StrView { ptr: (arg.ident_ptr), len: (arg.ident_len) as i64 }) == 1
+        if q.param_type == TypeKind.MutRef and q.is_borrow == 0 and name_eq(StrView { ptr: (q.name), len: (q.name_len) as i64 }, StrView { ptr: (arg.ident_ptr), len: (arg.ident_len) as i64 }) == 1
             return 1
         q = q.next
     0
 
 # 1 when pointer place `pl` is the `*U` that `p`, a `:& *U`, borrows.
 fn ca_pointer_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
-    let want: i32 = p.param_ref_ptr_pointee
-    if want == TYPE_VOID or pl.pointee == TYPE_UNKNOWN
+    let want: TypeKind = p.param_ref_ptr_pointee
+    if want == TypeKind.Void or pl.pointee == TypeKind.Unknown
         return 1
     # AGAST #3101: `r:& T` at T = `*[N]E` takes a `*[N]E` place, the same N and E.
-    if want == TYPE_ARRAY and p.param_pointee_array_size > 0
-        if pl.pointee != TYPE_ARRAY
+    if want == TypeKind.Array and p.param_pointee_array_size > 0
+        if pl.pointee != TypeKind.Array
             return 0
         var got: ArrayDims
         if ca_ref_dims(sm, arg, @got) != ARG_DIMS_ARRAY
             return 1
         # A struct element the image doesn't name (a `var q: *[3]S`) is
         # unjudged, as in ca_array_ref.
-        if got.leaf == TYPE_STRUCT and got.name_len <= 0
+        if got.leaf == TypeKind.Struct and got.name_len <= 0
             return 1
         var dims: ArrayDims
         param_pointee_dims(@dims, p)
         return array_dims_match(@got, @dims)
-    if want == TYPE_STRUCT or pl.pointee == TYPE_STRUCT
+    if want == TypeKind.Struct or pl.pointee == TypeKind.Struct
         return (want == pl.pointee and name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (pl.name), len: (pl.name_len) as i64 }) == 1) as i32
     # Exactly: a `*u32` isn't the `*i32` (#2530).
     (want == pl.pointee) as i32
@@ -1522,11 +1539,11 @@ fn ca_pointer_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
 # pointer as a `*U` does (#2354); an `@&U` param is no place: ritz0 gives it no
 # storage.  (A `**S` into `:& **S`, place or pointer, passes either way: #2372.)
 fn ca_pointer_place(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
-    if p.param_pointee_type != TYPE_PTR
+    if p.param_pointee_type != TypeKind.Ptr
         return CA_BORROW_PASS
-    if pl.kind == TYPE_PTR_PTR or pl.pointee == TYPE_PTR
+    if pl.kind == TypeKind.PtrPtr or pl.pointee == TypeKind.Ptr
         return CA_BORROW_PASS
-    if pl.kind != TYPE_PTR and (pl.kind != TYPE_MUT_REF or ca_ref_param(sm, arg) == 1)
+    if pl.kind != TypeKind.Ptr and (pl.kind != TypeKind.MutRef or ca_ref_param(sm, arg) == 1)
         return CA_BORROW_MISFIT
     if ca_pointer_fits(sm, arg, pl, p) == 1
         return CA_BORROW_PASS
@@ -1535,16 +1552,16 @@ fn ca_pointer_place(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
 # 1 when the place `arg`, of type `pl`, holds the `T` of `p`: exactly, not by
 # width (Aaron's ruling on AGAST #2368), so `:& u32` doesn't take an `i32`.
 fn ca_place_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
-    let pt: i32 = p.param_pointee_type
-    if pl.kind != TYPE_ARRAY and pl.kind != TYPE_STRUCT
+    let pt: TypeKind = p.param_pointee_type
+    if pl.kind != TypeKind.Array and pl.kind != TypeKind.Struct
         # AGAST #2994: a `bool` local is a `bool`, though its slot is an i64.
         let loc: *LocalVar = ca_local(sm, arg)
         if loc != null and loc.is_bool == 1
-            return (pt == TYPE_BOOL) as i32
+            return (pt == TypeKind.Bool) as i32
         return (pl.kind == pt) as i32
-    if pl.kind == TYPE_STRUCT
-        return (pt == TYPE_STRUCT and name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (pl.name), len: (pl.name_len) as i64 }) == 1) as i32
-    if pt != TYPE_ARRAY
+    if pl.kind == TypeKind.Struct
+        return (pt == TypeKind.Struct and name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (pl.name), len: (pl.name_len) as i64 }) == 1) as i32
+    if pt != TypeKind.Array
         return 0
     var got: ArrayDims
     var want: ArrayDims
@@ -1555,20 +1572,20 @@ fn ca_place_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
 
 # What `arg` is to the `:&` param `p` (the emitter's borrow_arg_kind).
 fn ca_borrow_kind(sm: *Sema, arg: *Expr, p: *Param) -> i32
-    if p == null or p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+    if p == null or p.is_borrow != 1 or p.param_type != TypeKind.MutRef
         return CA_BORROW_PASS
-    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+    if arg.kind == ExprKind.Unary and (arg.op == OpKind.Addr or arg.op == OpKind.AddrMut)
         return CA_BORROW_PASS
     # An `a:& [N]T` param reads as the pointer it's bound to.
     let lent: *LocalVar = ca_local(sm, arg)
-    if lent != null and lv_var_type(lent) == TYPE_ARRAY and lv_is_lent(lent) == 1
+    if lent != null and lv_var_type(lent) == TypeKind.Array and lv_is_lent(lent) == 1
         return CA_BORROW_PASS
     if ca_arg_is_place(sm, arg) == 0
         return ca_rvalue_borrow(sm, arg, p)
     if ca_behind_shared(sm, arg) == 1
         return CA_BORROW_SHARED
     var pl: CaPlace
-    if ca_place_type(sm, arg, @pl) == 0 or pl.kind == TYPE_UNKNOWN
+    if ca_place_type(sm, arg, @pl) == 0 or pl.kind == TypeKind.Unknown
         return CA_BORROW_UNTYPED
     if ca_is_pointer(pl.kind) == 1
         return ca_pointer_place(sm, arg, @pl, p)
@@ -1605,14 +1622,14 @@ fn ca_array(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Expr, p
     if sv == 2
         ca_error(sm, call, arg, StrView { ptr: (fname), len: (flen) as i64 }, argno, c"the parameter doesn't take a whole array")
         return
-    let literal: i32 = (arg.kind == EXPR_ARRAY_LIT or arg.kind == EXPR_ARRAY_FILL) as i32
+    let literal: i32 = (arg.kind == ExprKind.ArrayLit or arg.kind == ExprKind.ArrayFill) as i32
     if literal == 0 and param_takes_array_ref(p) == 1
         ca_array_ref(sm, call, StrView { ptr: (fname), len: (flen) as i64 }, argno, arg, p)
         return
     var src: ArrayDims
     if literal == 0 and ca_array_shape(sm, arg, @src) == 0
         return
-    if p.param_type == TYPE_ARRAY
+    if p.param_type == TypeKind.Array
         if literal == 0 and src.dims[0] != p.param_array_size
             ca_error(sm, call, call, StrView { ptr: (fname), len: (flen) as i64 }, argno, c"the array's length isn't the parameter's")
         return

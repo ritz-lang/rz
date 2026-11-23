@@ -115,7 +115,7 @@ var RV_IN_ARG: i32 = 0
 var RV_DECL_ROOT: *u8 = null
 var RV_DECL_ROOT_LEN: i32 = 0
 var RV_DECL_TY: RefTy
-var RV_DECL_KIND: i32 = 0
+var RV_DECL_KIND: TypeKind = TypeKind.Void
 var RV_DECL_REF: RefTy
 var RV_DECL_INIT: RefTy
 var RV_DECL_INIT_OK: i32 = 0
@@ -133,7 +133,7 @@ fn rv_ty(sm: *Sema, e: *Expr, out: *RefTy) -> i32
 
 # The image of the local `x` names (RsNote.loc); null if none, or not a local.
 fn rv_loc(sm: *Sema, x: *Expr) -> *LocalVar
-    if x == null or x.kind != EXPR_IDENT
+    if x == null or x.kind != ExprKind.Ident
         return null
     var env: RefEnv
     var is_local: i32 = 0
@@ -172,26 +172,29 @@ fn rv_shared(sm: *Sema, e: *Expr) -> i32
 
 # The statement forms the parser splits a place into, put back together.
 fn rv_writes_shared(sm: *Sema, stmt: *Stmt) -> i32
-    let k: i32 = stmt.kind
+    let k: StmtKind = stmt.kind
     var root: Expr
     var member: Expr
     var element: Expr
-    if k == STMT_ASSIGN
-        if stmt.assign_target_len > 0
+    match k
+        StmtKind.Assign =>
+            if stmt.assign_target_len > 0
+                return 0
+            return rv_shared(sm, stmt.if_cond as *Expr)
+        StmtKind.IndexAssign =>
+            rl_expr_ident(@root, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+            rl_expr_index(@element, @root, null)
+            return rv_shared(sm, @element)
+        _ => pass
+    match k
+        StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
+            rl_expr_ident(@root, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
+            rl_expr_member(@member, @root, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+        StmtKind.MemberAssign | StmtKind.MemberIndexAssign =>
+            rl_expr_member(@member, stmt.if_cond as *Expr, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+        _ =>
             return 0
-        return rv_shared(sm, stmt.if_cond as *Expr)
-    if k == STMT_INDEX_ASSIGN
-        rl_expr_ident(@root, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-        rl_expr_index(@element, @root, null)
-        return rv_shared(sm, @element)
-    if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
-        rl_expr_ident(@root, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
-        rl_expr_member(@member, @root, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        rl_expr_member(@member, stmt.if_cond as *Expr, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-    else
-        return 0
-    if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
+    if k == StmtKind.LocalFieldAssign or k == StmtKind.MemberAssign
         return rv_shared(sm, @member)
     rl_expr_index(@element, @member, null)
     rv_shared(sm, @element)
@@ -201,7 +204,7 @@ fn rv_check_write(sm: *Sema, stmt: *Stmt)
         return
     # `(*p).f = v` starts at the `(`, and the place at the `*`.
     var col: i32 = stmt.span.col
-    if stmt.kind == STMT_MEMBER_ASSIGN or stmt.kind == STMT_MEMBER_INDEX_ASSIGN
+    if stmt.kind == StmtKind.MemberAssign or stmt.kind == StmtKind.MemberIndexAssign
         col = col + 1
     rv_error(sm, stmt.span.line, col, c"cannot write through an `@T`: make it `@&T`\n")
 
@@ -213,12 +216,12 @@ fn rv_check_borrow(sm: *Sema, e: *Expr)
 # A method taking `self: @&T` writes what its receiver reaches, as `recv.f = v`
 # would: `.` finds the receiver the same way.  `p` is its first param, whatever
 # that's called: a standalone function takes the receiver there too.  A bare
-# `self:&` is a TYPE_STRUCT param marked is_self_borrow, the same borrow as
+# `self:&` is a TypeKind.Struct param marked is_self_borrow, the same borrow as
 # `self:& T` (#2389, #3983).
 fn rv_check_receiver(sm: *Sema, e: *Expr, p: *Param)
     if p == null
         return
-    if p.param_type != TYPE_MUT_REF and (p.param_type != TYPE_STRUCT or p.is_self_borrow != 1)
+    if p.param_type != TypeKind.MutRef and (p.param_type != TypeKind.Struct or p.is_self_borrow != 1)
         return
     var member: Expr
     rl_expr_member(@member, e.left, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
@@ -232,7 +235,7 @@ fn rv_addr_into_mut(sm: *Sema, e: *Expr)
     if let_addr_of_own(sm, e) == 1
         if rv_first_report(e.span.line, e.span.col) == 1
             let_error_addr(sm, e)
-    else if e.kind == EXPR_UNARY and e.op == OP_ADDR
+    else if e.kind == ExprKind.Unary and e.op == OpKind.Addr
         if rv_shared(sm, e.operand) == 1
             rv_check_borrow(sm, e)
         else
@@ -242,7 +245,7 @@ fn rv_addr_into_mut(sm: *Sema, e: *Expr)
 # rv_addr_into_mut's.  An `@&T` reached through an `@T`, as `h.m` of `h: @H`
 # is, is read-only too (#2381): what `e` points at is walked.
 fn rv_shared_into_mut(sm: *Sema, e: *Expr)
-    if e.kind == EXPR_UNARY and e.op == OP_ADDR
+    if e.kind == ExprKind.Unary and e.op == OpKind.Addr
         return
     var env: RefEnv
     let view: i32 = ref_view_in(rv_env(sm, @env), e)
@@ -253,8 +256,8 @@ fn rv_shared_into_mut(sm: *Sema, e: *Expr)
         return
     var pointee: Expr
     memset(@pointee as *u8, 0, sizeof(Expr))
-    pointee.kind = EXPR_UNARY
-    pointee.op = OP_DEREF
+    pointee.kind = ExprKind.Unary
+    pointee.op = OpKind.Deref
     pointee.operand = e
     if rv_shared(sm, @pointee) == 1
         rv_error_at(sm, e, c"an `@T` doesn't fit an `@&T` slot: make it `@&T`\n")
@@ -266,7 +269,7 @@ fn rv_shared_into_mut(sm: *Sema, e: *Expr)
 fn rv_local_root(sm: *Sema, e0: *Expr) -> *SemaVar
     var e: *Expr = e0
     while e != null
-        if e.kind == EXPR_IDENT
+        if e.kind == ExprKind.Ident
             let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
             if v == null
                 return null
@@ -274,12 +277,12 @@ fn rv_local_root(sm: *Sema, e0: *Expr) -> *SemaVar
             if n != null and n.caller_place == 1
                 return null
             return v
-        if e.kind != EXPR_MEMBER and e.kind != EXPR_INDEX
+        if e.kind != ExprKind.Member and e.kind != ExprKind.Index
             return null
         var base: RefTy
         if rv_ty(sm, e.left, @base) == 0 or ref_is_pointer(base.kind) == 1
             return null
-        if e.kind == EXPR_INDEX and (base.kind != TYPE_ARRAY or e.right == null or e.right.kind == EXPR_RANGE)
+        if e.kind == ExprKind.Index and (base.kind != TypeKind.Array or e.right == null or e.right.kind == ExprKind.Range)
             return null
         e = e.left
     null
@@ -288,7 +291,7 @@ fn rv_local_root(sm: *Sema, e0: *Expr) -> *SemaVar
 # v's storage rather than a copy (§7.8, LARB R57).  A Span's slice views what
 # that Span does, so it lends nothing for R2.
 fn rv_is_vec_or_string(t: *SemaTy) -> i32
-    if t.kind != TYPE_STRUCT or t.name == null
+    if t.kind != TypeKind.Struct or t.name == null
         return 0
     if t.name_len > 4 and memcmp(t.name, c"Vec$", 4) == 0
         return 1
@@ -303,7 +306,7 @@ fn rv_span_view_root(sm: *Sema, e: *Expr, len: *i32) -> *u8
     if base == null
         return null
     var t: SemaTy
-    if sema_expr_ty(sm, base, @t) == 0 or rv_is_vec_or_string(@t) == 0
+    if sema_expr_ty(sm, base, @t) == TypeKind.Void or rv_is_vec_or_string(@t) == 0
         return null
     let root: *SemaVar = rv_local_root(sm, base)
     if root == null
@@ -313,7 +316,7 @@ fn rv_span_view_root(sm: *Sema, e: *Expr, len: *i32) -> *u8
 
 # 1 when `stmt`, a declaration, writes a `Span<T>` type (LARB R57).
 fn rv_decl_is_span(stmt: *Stmt) -> i32
-    if stmt.var_declared_type != TYPE_STRUCT or stmt.var_type_name_len <= 5
+    if stmt.var_declared_type != TypeKind.Struct or stmt.var_type_name_len <= 5
         return 0
     (memcmp(stmt.var_type_name, c"Span$", 5) == 0) as i32
 
@@ -322,13 +325,13 @@ fn rv_decl_is_span(stmt: *Stmt) -> i32
 fn rv_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
     if e == null
         return null
-    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         let root: *SemaVar = rv_local_root(sm, e.operand)
         if root == null
             return null
         *len = root.name_len
         return root.name
-    if e.kind != EXPR_IDENT
+    if e.kind != ExprKind.Ident
         return null
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     let n: *RsNote = rs_note(sm, v)
@@ -340,13 +343,13 @@ fn rv_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
 
 # What `e`, which rv_referent named a root for, has: a binding keeps it.
 fn rv_referent_ty(sm: *Sema, e: *Expr, out: *RefTy) -> i32
-    if e.kind == EXPR_IDENT
+    if e.kind == ExprKind.Ident
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if v != null
             let n: *RsNote = rs_note(sm, v)
             if n == null
-                return ref_set(out, TYPE_PTR, TYPE_VOID, StrView { ptr: (null), len: (0) as i64 })
-            return ref_set(out, TYPE_PTR, n.root_pointee, StrView { ptr: (n.root_name), len: (n.root_name_len) as i64 })
+                return ref_set(out, TypeKind.Ptr, TypeKind.Void, StrView { ptr: (null), len: (0) as i64 })
+            return ref_set(out, TypeKind.Ptr, n.root_pointee, StrView { ptr: (n.root_name), len: (n.root_name_len) as i64 })
     rv_ty(sm, e, out)
 
 # `name` is written, or its address may let it be: if it's a `var`, what it holds
@@ -362,7 +365,7 @@ fn rv_forget_name(sm: *Sema, name_sv: StrView)
         n.root = null
 
 fn rv_forget(sm: *Sema, e: *Expr)
-    if e != null and e.kind == EXPR_IDENT
+    if e != null and e.kind == ExprKind.Ident
         rv_forget_name(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
 
 # The local root `a` refers to, if it has `ret`'s pointee.  A `:&` param or a
@@ -380,7 +383,7 @@ fn rv_gives_referent(sm: *Sema, a: *Expr, lent: i32, ret: *RefTy, len: *i32) -> 
     if place == null or rv_ty(sm, a, @t) == 0
         return null
     var held: RefTy
-    ref_set(@held, TYPE_PTR, t.kind, StrView { ptr: (t.name), len: (t.name_len) as i64 })
+    ref_set(@held, TypeKind.Ptr, t.kind, StrView { ptr: (t.name), len: (t.name_len) as i64 })
     if ref_same_referent(@held, ret) == 0
         return null
     *len = place.name_len
@@ -391,7 +394,7 @@ fn rv_gives_referent(sm: *Sema, a: *Expr, lent: i32, ret: *RefTy, len: *i32) -> 
 # reference has to live through, isn't asked.
 fn rv_call_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
     var f: *FnDef = null
-    if e.kind == EXPR_METHOD
+    if e.kind == ExprKind.Method
         f = rs_method_def(sm, e)
     else
         f = sema_call_fn(sm, e)
@@ -401,7 +404,7 @@ fn rv_call_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
     var p: *Param = f.params
     if p != null and name_eq(StrView { ptr: (p.name), len: (p.name_len) as i64 }, StrView { ptr: (c"self"), len: (4) as i64 }) == 1
         p = p.next
-    if e.kind == EXPR_METHOD
+    if e.kind == ExprKind.Method
         let by_self: *u8 = rv_gives_referent(sm, e.left, 1, @ret, len)
         if by_self != null
             return by_self
@@ -426,7 +429,7 @@ fn rv_check_return(sm: *Sema, e: *Expr)
     # Span slot already is by rv_referent.
     if root == null and rv_is_span(@RV_RET) == 1
         root = rv_span_view_root(sm, e, @len)
-    if root == null and (e.kind == EXPR_CALL or e.kind == EXPR_METHOD)
+    if root == null and (e.kind == ExprKind.Call or e.kind == ExprKind.Method)
         root = rv_call_referent(sm, e, @len)
     if root == null or rv_report(sm, e.span.line, e.span.col) == 0
         return
@@ -450,13 +453,13 @@ fn rv_return_pointee(sm: *Sema, e: *Expr)
 # --- Slot errors ---------------------------------------------------------------------
 
 fn rv_error_slot(sm: *Sema, e: *Expr)
-    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         rv_error_at(sm, e, c"`@x` doesn't fit a by-value slot: drop the `@`\n")
     else
         rv_error_at(sm, e, c"a reference or pointer doesn't fit a by-value slot: write `*` to read through it\n")
 
 fn rv_error_value(sm: *Sema, e: *Expr, slot: *RefTy)
-    if slot.kind == TYPE_MUT_REF
+    if slot.kind == TypeKind.MutRef
         rv_error_at(sm, e, c"a value doesn't fit a reference slot: write `@&x` to borrow it\n")
     else
         rv_error_at(sm, e, c"a value doesn't fit a reference slot: write `@x` to borrow it\n")
@@ -498,23 +501,23 @@ fn rv_same_shape(a: *ArrayShape, b: *ArrayShape) -> i32
     for i in 0..a.rank
         if a.dims[i] != b.dims[i]
             return 0
-    if a.leaf_type != TYPE_STRUCT or a.leaf_name_len == 0 or b.leaf_name_len == 0
+    if a.leaf_type != TypeKind.Struct or a.leaf_name_len == 0 or b.leaf_name_len == 0
         return 1
     name_eq(StrView { ptr: (a.leaf_name), len: (a.leaf_name_len) as i64 }, StrView { ptr: (b.leaf_name), len: (b.leaf_name_len) as i64 })
 
 # 0 only when `a`'s element is known not to be `slot`'s: what the tables can't
 # name stays unjudged.
 fn rv_same_element(a: *RefTy, slot: *RefTy) -> i32
-    if a.pointee == TYPE_VOID or slot.pointee == TYPE_VOID
+    if a.pointee == TypeKind.Void or slot.pointee == TypeKind.Void
         return 1
     if a.pointee != slot.pointee
         return 0
-    if a.pointee == TYPE_ARRAY
+    if a.pointee == TypeKind.Array
         return rv_same_shape(a.shape, slot.shape)
-    if a.pointee == TYPE_PTR and a.elem_pointee != TYPE_VOID and slot.elem_pointee != TYPE_VOID
+    if a.pointee == TypeKind.Ptr and a.elem_pointee != TypeKind.Void and slot.elem_pointee != TypeKind.Void
         if a.elem_pointee != slot.elem_pointee
             return 0
-    if a.pointee != TYPE_STRUCT and (a.pointee != TYPE_PTR or a.elem_pointee != TYPE_STRUCT)
+    if a.pointee != TypeKind.Struct and (a.pointee != TypeKind.Ptr or a.elem_pointee != TypeKind.Struct)
         return 1
     if a.name_len == 0 or slot.name_len == 0
         return 1
@@ -522,7 +525,7 @@ fn rv_same_element(a: *RefTy, slot: *RefTy) -> i32
 
 # 1 for `@x` or `@&x`, written where the slot is.
 fn rv_is_written(e: *Expr) -> i32
-    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         return 1
     0
 
@@ -530,7 +533,7 @@ fn rv_is_written(e: *Expr) -> i32
 # (the stricter §3.2 rule's), not a cast (the escape hatch R71 itself names), and
 # not arithmetic on an `@x` the tables can't vouch for (rv_unsure_pointer_arith).
 fn rv_judges_value(sm: *Sema, e: *Expr) -> i32
-    if rv_is_written(e) == 1 or e.kind == EXPR_CAST
+    if rv_is_written(e) == 1 or e.kind == ExprKind.Cast
         return 0
     if rv_unsure_pointer_arith(sm, e) == 1
         return 0
@@ -541,7 +544,7 @@ fn rv_judges_value(sm: *Sema, e: *Expr) -> i32
 # (its `[i]` runs through to the element only at the emitter), so the pointee
 # it names is no element (AGAST #3999, rv_unsure_referent).
 fn rv_unsure_pointer_arith(sm: *Sema, e: *Expr) -> i32
-    if e == null or e.kind != EXPR_BINARY
+    if e == null or e.kind != ExprKind.Binary
         return 0
     if rv_unsure_referent(sm, e.left) == 1
         return 1
@@ -566,10 +569,10 @@ fn rv_lent_referent(sm: *Sema, a: *Expr, p: *Param)
 # rv_other_referent for `e`, `@x` of type `a`: a `bool` local is a `bool`,
 # though its slot is kept wider.
 fn rv_other_written(sm: *Sema, e: *Expr, a: *RefTy, slot: *RefTy) -> i32
-    let kept: i32 = a.pointee
+    let kept: TypeKind = a.pointee
     let x: *LocalVar = rv_loc(sm, e.operand)
     if x != null and x.is_bool == 1
-        a.pointee = TYPE_BOOL
+        a.pointee = TypeKind.Bool
     let other: i32 = rv_other_referent(sm, a, slot)
     a.pointee = kept
     other
@@ -580,7 +583,7 @@ fn rv_other_written(sm: *Sema, e: *Expr, a: *RefTy, slot: *RefTy) -> i32
 # since AGAST #2527 (inferred_int_init), so the local table vouches for it.
 fn rv_unsure_referent(sm: *Sema, e: *Expr) -> i32
     let x: *Expr = e.operand
-    if x == null or x.kind != EXPR_INDEX
+    if x == null or x.kind != ExprKind.Index
         return 0
     var env: RefEnv
     ref_is_through_in(rv_env(sm, @env), x)
@@ -591,23 +594,23 @@ fn rv_unsure_referent(sm: *Sema, e: *Expr) -> i32
 # rv_value_into_ref's own question, "a reference to one pointer type", and what
 # the tables can't name stays unjudged.
 fn rv_other_referent(sm: *Sema, a: *RefTy, slot: *RefTy) -> i32
-    var x: i32 = a.pointee
-    var want: i32 = slot.pointee
+    var x: TypeKind = a.pointee
+    var want: TypeKind = slot.pointee
     # A field, an element or a payload keeps a `*S`'s name and not the kind.
-    if want == TYPE_VOID and slot.name_len > 0
-        want = TYPE_STRUCT
+    if want == TypeKind.Void and slot.name_len > 0
+        want = TypeKind.Struct
     # The parser names a `-> *X` return after the last type it saw when X isn't
     # a struct (`-> *[2]i32` after a `*C`), so that name only judges a struct.
-    if slot.name_only == 1 and x != TYPE_STRUCT
+    if slot.name_only == 1 and x != TypeKind.Struct
         return 0
     # A scalar pointee with a name contradicts itself: a generic's `v: T` at
     # `T = *i32` or `*C` keeps the name and a defaulted kind (`i64`).
-    if want != TYPE_STRUCT and want != TYPE_ARRAY and slot.name_len > 0
+    if want != TypeKind.Struct and want != TypeKind.Array and slot.name_len > 0
         return 0
     # A pointer referent is another type than any the tables name; two of them
     # are rv_value_into_ref's "a reference to one pointer type".
-    let xp: i32 = (x == TYPE_PTR or x == TYPE_PTR_PTR) as i32
-    let wp: i32 = (want == TYPE_PTR or want == TYPE_PTR_PTR) as i32
+    let xp: i32 = (x == TypeKind.Ptr or x == TypeKind.PtrPtr) as i32
+    let wp: i32 = (want == TypeKind.Ptr or want == TypeKind.PtrPtr) as i32
     if xp == 1 and wp == 1
         return 0
     if xp == 1
@@ -618,13 +621,13 @@ fn rv_other_referent(sm: *Sema, a: *RefTy, slot: *RefTy) -> i32
         return 0
     if x != want
         return 1
-    if x == TYPE_STRUCT
+    if x == TypeKind.Struct
         # R79: any async fn's `NAME$Future` fits a slot for the built-in
         # `Future`, by reference.
         if sema_future_ref_fits(slot.name, slot.name_len, a.name, a.name_len) == 1
             return 0
         return 1 - name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
-    if x == TYPE_ARRAY
+    if x == TypeKind.Array
         if a.ref_shape != null or slot.ref_shape != null
             return rv_shapes_differ(a, slot)   # AGAST #2098
         if a.ref_size > 0 and slot.ref_size > 0 and a.ref_size != slot.ref_size
@@ -632,7 +635,7 @@ fn rv_other_referent(sm: *Sema, a: *RefTy, slot: *RefTy) -> i32
         if rv_judged(sm, a.ref_elem, a) == 1 and rv_judged(sm, slot.ref_elem, slot) == 1
             if a.ref_elem != slot.ref_elem
                 return 1
-            if a.ref_elem == TYPE_STRUCT
+            if a.ref_elem == TypeKind.Struct
                 return 1 - name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
     0
 
@@ -653,19 +656,19 @@ fn rv_shapes_differ(x: *RefTy, y: *RefTy) -> i32
         if a.dims[i] != b.dims[i]
             return 1
         i = i + 1
-    if a.leaf_type == TYPE_STRUCT
+    if a.leaf_type == TypeKind.Struct
         return 1 - name_eq(StrView { ptr: (a.leaf_name), len: (a.leaf_name_len) as i64 }, StrView { ptr: (b.leaf_name), len: (b.leaf_name_len) as i64 })
     0
 
 # 1 when `kind`, with `t`'s name, is a referent the tables name: a scalar, an
 # array, or a struct that is one.  A `*i32` return or field, or a generic's
 # `*T`, keeps a name and no kind, so a name that isn't a struct is unjudged.
-fn rv_judged(sm: *Sema, kind: i32, t: *RefTy) -> i32
-    if kind == TYPE_VOID or kind == TYPE_UNKNOWN or kind == TYPE_PTR or kind == TYPE_PTR_PTR
+fn rv_judged(sm: *Sema, kind: TypeKind, t: *RefTy) -> i32
+    if kind == TypeKind.Void or kind == TypeKind.Unknown or kind == TypeKind.Ptr or kind == TypeKind.PtrPtr
         return 0
     if ref_is_pointer(kind) == 1
         return 0
-    if kind != TYPE_STRUCT
+    if kind != TypeKind.Struct
         return 1
     if t.name_len == 0 or sema_find_struct(sm, StrView { ptr: (t.name), len: (t.name_len) as i64 }) == null
         return 0
@@ -681,11 +684,11 @@ fn rv_names_lent(sm: *Sema, e: *Expr) -> i32
 # `a`, which `e` has, is what `slot` refers to.
 fn rv_is_referent(a: *RefTy, slot: *RefTy) -> i32
     # A field, an element or a payload keeps a `*S`'s name and not the kind.
-    if slot.pointee == TYPE_VOID and slot.name_len > 0 and a.kind == TYPE_STRUCT
+    if slot.pointee == TypeKind.Void and slot.name_len > 0 and a.kind == TypeKind.Struct
         return name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
     if a.kind != slot.pointee
         return 0
-    if a.kind != TYPE_STRUCT
+    if a.kind != TypeKind.Struct
         return 1
     name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
 
@@ -705,13 +708,13 @@ fn rv_other_value_pointee(sm: *Sema, a: *RefTy, slot: *RefTy) -> i32
     # The byte pointer, both ways: a plain `*u8` slot, or a plain `*u8` value in
     # any `*T` slot.  `@u8` is neither (`@x` keeps §3.2), and a `@T` slot takes
     # only a byte pointee, never the bridge.
-    if slot.kind == TYPE_PTR
-        if slot.pointee == TYPE_U8
+    if slot.kind == TypeKind.Ptr
+        if slot.pointee == TypeKind.U8
             return 0
-        if a.kind == TYPE_PTR and a.pointee == TYPE_U8
+        if a.kind == TypeKind.Ptr and a.pointee == TypeKind.U8
             return 0
     # A struct for another struct at a call is #1948's words, as for `@x`.
-    if RV_IN_ARG > 0 and a.pointee == TYPE_STRUCT and slot.pointee == TYPE_STRUCT
+    if RV_IN_ARG > 0 and a.pointee == TypeKind.Struct and slot.pointee == TypeKind.Struct
         return 0
     # A generic's `T = *S` / `*[N]E` keeps the type's name (a struct's, or the
     # mangled array spelling `arrN_E`) while the tables default the pointee kind
@@ -722,7 +725,7 @@ fn rv_other_value_pointee(sm: *Sema, a: *RefTy, slot: *RefTy) -> i32
     # A generic's `[N]S` arrives as the struct S on one side and the array [N]S
     # on the other (the pointer value lost its shape).  With one name, the names
     # decide; where they don't speak, it's unjudged.
-    if a.pointee == TYPE_STRUCT and slot.pointee == TYPE_ARRAY or a.pointee == TYPE_ARRAY and slot.pointee == TYPE_STRUCT
+    if a.pointee == TypeKind.Struct and slot.pointee == TypeKind.Array or a.pointee == TypeKind.Array and slot.pointee == TypeKind.Struct
         if a.name_len == 0 or slot.name_len == 0
             return 0
         return 1 - name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
@@ -731,30 +734,34 @@ fn rv_other_value_pointee(sm: *Sema, a: *RefTy, slot: *RefTy) -> i32
     # Into a reference param, a pointee of another LLVM type is #1948's too: the
     # emitter compares the pointer types.  What passes that, a pointee a sign
     # apart (`@i32` into an `@u32` param), is R71's.
-    if RV_IN_ARG > 0 and (slot.kind == TYPE_REF or slot.kind == TYPE_MUT_REF) and rv_signed_kind(a.pointee) != rv_signed_kind(slot.pointee)
+    if RV_IN_ARG > 0 and (slot.kind == TypeKind.Ref or slot.kind == TypeKind.MutRef) and rv_signed_kind(a.pointee) != rv_signed_kind(slot.pointee)
         return 0
     1
 
 # `k`'s LLVM integer type: an unsigned kind as the signed one it shares bits with,
 # so a difference only in sign reads as no difference (R71's #1948 exemption).
-fn rv_signed_kind(k: i32) -> i32
-    if k == TYPE_U32
-        return TYPE_I32
-    if k == TYPE_U64
-        return TYPE_I64
-    if k == TYPE_U16
-        return TYPE_I16
-    if k == TYPE_U8
-        return TYPE_I8
+fn rv_signed_kind(k: TypeKind) -> TypeKind
+    match k
+        TypeKind.U32 =>
+            return TypeKind.I32
+        TypeKind.U64 =>
+            return TypeKind.I64
+        TypeKind.U16 =>
+            return TypeKind.I16
+        TypeKind.U8 =>
+            return TypeKind.I8
+        _ => pass
     k
 
 # 1 for a scalar pointee kind (a number, bool or float): the kind the tables give
 # a generic's pointer pointee when they didn't carry it (R71's name-vs-kind fixup).
-fn rv_is_scalar_kind(k: i32) -> i32
-    if k == TYPE_VOID or k == TYPE_UNKNOWN or k == TYPE_STRUCT or k == TYPE_ARRAY
-        return 0
-    if k == TYPE_PTR or k == TYPE_PTR_PTR
-        return 0
+fn rv_is_scalar_kind(k: TypeKind) -> i32
+    match k
+        TypeKind.Void | TypeKind.Unknown | TypeKind.Struct | TypeKind.Array =>
+            return 0
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            return 0
+        _ => pass
     1
 
 # `e`, of type `a`, lands in reference or pointer `slot`.  Only a pointer fits:
@@ -773,21 +780,21 @@ fn rv_value_into_ref(sm: *Sema, e: *Expr, a: *RefTy, slot: *RefTy)
         # reference value of another pointee doesn't fit (LARB R71).  `@x` is
         # the stricter §3.2 rule's, above; a reference to a pointer is the
         # branch below's.
-        if slot.pointee != TYPE_PTR or slot.kind == TYPE_PTR
+        if slot.pointee != TypeKind.Ptr or slot.kind == TypeKind.Ptr
             if rv_judges_value(sm, e) == 1 and rv_other_value_pointee(sm, a, slot) == 1
                 rv_error_other_type(sm, e)
             return
-        if a.kind == TYPE_PTR and a.pointee != TYPE_PTR
+        if a.kind == TypeKind.Ptr and a.pointee != TypeKind.Ptr
             rv_error_value(sm, e, slot)
-        else if a.pointee == TYPE_PTR and a.name_len > 0 and slot.name_len > 0
+        else if a.pointee == TypeKind.Ptr and a.name_len > 0 and slot.name_len > 0
             if name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (slot.name), len: (slot.name_len) as i64 }) == 0
                 rv_error_other_pointee(sm, e)
-        else if a.pointee == TYPE_PTR and rv_other_ptr_pointee(a, slot) == 1
+        else if a.pointee == TypeKind.Ptr and rv_other_ptr_pointee(a, slot) == 1
             rv_error_other_pointee(sm, e)
         return
-    if slot.kind != TYPE_PTR or rv_is_referent(a, slot) == 1 or rv_names_lent(sm, e) == 1
+    if slot.kind != TypeKind.Ptr or rv_is_referent(a, slot) == 1 or rv_names_lent(sm, e) == 1
         rv_error_value(sm, e, slot)
-    else if a.kind == TYPE_ARRAY and slot.pointee != TYPE_VOID and slot.pointee != TYPE_UNKNOWN
+    else if a.kind == TypeKind.Array and slot.pointee != TypeKind.Void and slot.pointee != TypeKind.Unknown
         rv_error_array_into_pointer(sm, e)
 
 # AGAST #3048: 1 when `a` is a `*T` and `slot` a `**T` of that very T: the
@@ -795,12 +802,12 @@ fn rv_value_into_ref(sm: *Sema, e: *Expr, a: *RefTy, slot: *RefTy)
 # no implicit `*T` -> `**T`; `q as **T` says it on purpose).  Exactly T, as
 # ritz0's `same`: a `*U` of another U is a pointer as an integer (#2370).
 fn rv_is_ptr_ptr_referent(a: *RefTy, slot: *RefTy) -> i32
-    if a.kind != TYPE_PTR or slot.kind != TYPE_PTR or slot.pointee != TYPE_PTR
+    if a.kind != TypeKind.Ptr or slot.kind != TypeKind.Ptr or slot.pointee != TypeKind.Ptr
         return 0
-    let t: i32 = slot.ptr_pointee
-    if t == TYPE_VOID or t == TYPE_UNKNOWN or a.pointee != t
+    let t: TypeKind = slot.ptr_pointee
+    if t == TypeKind.Void or t == TypeKind.Unknown or a.pointee != t
         return 0
-    if t != TYPE_STRUCT
+    if t != TypeKind.Struct
         return 1
     if a.name_len == 0 or slot.held_name_len == 0
         return 0
@@ -813,7 +820,7 @@ fn rv_addr_of_reference(sm: *Sema, e: *Expr) -> i32
     var t: RefTy
     if rv_ty(sm, e.operand, @t) == 0
         return 0
-    (t.kind == TYPE_REF or t.kind == TYPE_MUT_REF) as i32
+    (t.kind == TypeKind.Ref or t.kind == TypeKind.MutRef) as i32
 
 # AGAST #2364: 1 when `a`'s `*U` pointee is known not to be `slot`'s.  A scalar
 # U has no name for the branch above to compare, so the kinds are, exactly, as
@@ -821,14 +828,14 @@ fn rv_addr_of_reference(sm: *Sema, e: *Expr) -> i32
 # scalar one.  A U either side didn't record stays unjudged.  A generic's
 # instance keeps U's name even when it's a scalar (`g<i64>`), and its kind with it.
 fn rv_other_ptr_pointee(a: *RefTy, slot: *RefTy) -> i32
-    let x: i32 = a.ptr_pointee
-    let want: i32 = slot.ptr_pointee
-    if x == TYPE_VOID or x == TYPE_UNKNOWN or want == TYPE_VOID or want == TYPE_UNKNOWN
+    let x: TypeKind = a.ptr_pointee
+    let want: TypeKind = slot.ptr_pointee
+    if x == TypeKind.Void or x == TypeKind.Unknown or want == TypeKind.Void or want == TypeKind.Unknown
         return 0
     (x != want) as i32
 
 fn rv_is_span(slot: *RefTy) -> i32
-    if slot.kind != TYPE_STRUCT or slot.name_len <= 5
+    if slot.kind != TypeKind.Struct or slot.name_len <= 5
         return 0
     return (memcmp(slot.name, c"Span$", 5) == 0) as i32
 
@@ -864,7 +871,7 @@ fn rv_note_arms(arms: *MatchArm, slot: *RefTy)
 fn rv_note_value(e: *Expr, slot: *RefTy)
     if e == null
         return
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+    if e.kind == ExprKind.If or e.kind == ExprKind.Match
         rv_note_arms(e.args as *MatchArm, slot)
     else
         rv_note(e, slot)
@@ -876,13 +883,15 @@ fn rv_note_stmts(list: *Stmt, slot: *RefTy)
         return
     while st.next != null
         st = st.next
-    if st.kind == STMT_EXPR
-        rv_note_value(st.expr, slot)
-    else if st.kind == STMT_IF
-        rv_note_stmts(st.if_then, slot)
-        rv_note_stmts(st.if_else, slot)
-    else if st.kind == STMT_MATCH
-        rv_note_arms(st.if_then as *MatchArm, slot)
+    match st.kind
+        StmtKind.Expr =>
+            rv_note_value(st.expr, slot)
+        StmtKind.If =>
+            rv_note_stmts(st.if_then, slot)
+            rv_note_stmts(st.if_else, slot)
+        StmtKind.Match =>
+            rv_note_arms(st.if_then as *MatchArm, slot)
+        _ => pass
 
 # `e` is about to be reached as a tail: judge it against the slot it was noted
 # for, now its arm's bindings are in scope.
@@ -916,23 +925,23 @@ fn rv_literal_length(sm: *Sema, e: *Expr, slot: *RefTy)
 
 # `e`'s value lands in `slot`.
 fn rv_into(sm: *Sema, e: *Expr, slot: *RefTy)
-    if e == null or slot.kind == TYPE_VOID and slot.returned == 0
+    if e == null or slot.kind == TypeKind.Void and slot.returned == 0
         return
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+    if e.kind == ExprKind.If or e.kind == ExprKind.Match
         rv_note_value(e, slot)
         return
-    if slot.kind == TYPE_MUT_REF
+    if slot.kind == TypeKind.MutRef
         rv_addr_into_mut(sm, e)
         rv_shared_into_mut(sm, e)
     if slot.returned == 1
         rv_check_return(sm, e)
         if RV_RET_ARRAY_OK == 1
             rv_return_pointee(sm, e)
-    if slot.kind == TYPE_VOID
+    if slot.kind == TypeKind.Void
         return
-    if slot.kind == TYPE_ARRAY
+    if slot.kind == TypeKind.Array
         rv_literal_length(sm, e, slot)
-    if e.kind == EXPR_ARRAY_LIT and slot.kind == TYPE_ARRAY
+    if e.kind == ExprKind.ArrayLit and slot.kind == TypeKind.Array
         var part: RefTy
         rv_element(slot, @part)
         var el: *Expr = e.args
@@ -940,7 +949,7 @@ fn rv_into(sm: *Sema, e: *Expr, slot: *RefTy)
             rv_into(sm, el, @part)
             el = el.next
         return
-    if e.kind == EXPR_ARRAY_FILL and slot.kind == TYPE_ARRAY
+    if e.kind == ExprKind.ArrayFill and slot.kind == TypeKind.Array
         var fill: RefTy
         rv_element(slot, @fill)
         rv_into(sm, e.left, @fill)
@@ -949,24 +958,24 @@ fn rv_into(sm: *Sema, e: *Expr, slot: *RefTy)
     if rv_ty(sm, e, @a) == 1
         if ref_is_pointer(slot.kind) == 1
             rv_value_into_ref(sm, e, @a, slot)
-        else if a.kind == TYPE_ARRAY and rv_is_span(slot) == 1
+        else if a.kind == TypeKind.Array and rv_is_span(slot) == 1
             rv_error_value(sm, e, slot)
         else if ref_is_pointer(a.kind) == 1 and ref_same_pointee(@a, slot) == 1
             rv_error_slot(sm, e)
-        else if a.kind == TYPE_ARRAY and slot.kind == TYPE_ARRAY and rv_same_element(@a, slot) == 0
+        else if a.kind == TypeKind.Array and slot.kind == TypeKind.Array and rv_same_element(@a, slot) == 0
             rv_array_error(sm, e)
     rv_into_variant(sm, e, slot)
 
 # What an element of the array `slot` lands in.
 fn rv_element(slot: *RefTy, out: *RefTy)
-    if slot.pointee != TYPE_ARRAY or ref_row(slot, out) == 0
-        ref_set(out, slot.pointee, 0, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
-        out.elem_pointee = TYPE_VOID
+    if slot.pointee != TypeKind.Array or ref_row(slot, out) == 0
+        ref_set(out, slot.pointee, TypeKind.Void, StrView { ptr: (slot.name), len: (slot.name_len) as i64 })
+        out.elem_pointee = TypeKind.Void
 
 # `Some(x)`, `Ok(x)` or `Err(x)` into an instance of Option or Result: its name
 # says what the payload is, for a struct.
 fn rv_into_variant(sm: *Sema, e: *Expr, slot: *RefTy)
-    if e.kind != EXPR_CALL or e.args == null or slot.kind != TYPE_STRUCT
+    if e.kind != ExprKind.Call or e.args == null or slot.kind != TypeKind.Struct
         return
     var variant: i32 = 0
     if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"Err"), len: (3) as i64 }) == 1
@@ -981,7 +990,7 @@ fn rv_into_variant(sm: *Sema, e: *Expr, slot: *RefTy)
     if rv_of_mangled_ref(sm, StrView { ptr: (name), len: (len) as i64 }, @part) == 0
         if sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 }) == null
             return
-        ref_set(@part, TYPE_STRUCT, 0, StrView { ptr: (name), len: (len) as i64 })
+        ref_set(@part, TypeKind.Struct, TypeKind.Void, StrView { ptr: (name), len: (len) as i64 })
     rv_into(sm, e.args, @part)
 
 # AGAST #2384: the slot a reference type argument spells, as ref_of_param
@@ -991,36 +1000,36 @@ fn rv_into_variant(sm: *Sema, e: *Expr, slot: *RefTy)
 fn rv_of_mangled_ref(sm: *Sema, name_sv: StrView, out: *RefTy) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    var kind: i32 = TYPE_REF
+    var kind: TypeKind = TypeKind.Ref
     var k: i32 = 4
     if len > 7 and memcmp(name, c"refmut_", 7) == 0
-        kind = TYPE_MUT_REF
+        kind = TypeKind.MutRef
         k = 7
     else if len <= 4 or memcmp(name, c"ref_", 4) != 0
         return 0
     let r: *u8 = name + k
     let n: i32 = len - k
-    let prim: i32 = primitive_type_from_name(StrView { ptr: (r), len: (n) as i64 })
-    if prim != 0
+    let prim: TypeKind = primitive_type_from_name(StrView { ptr: (r), len: (n) as i64 })
+    if prim != TypeKind.Void
         return ref_set(out, kind, prim, StrView { ptr: (null), len: (0) as i64 })
     if n > 4 and memcmp(r, c"ptr_", 4) == 0
         # The pointer's own pointee is only a name here, as for a struct one.
-        if primitive_type_from_name(StrView { ptr: (r + 4), len: (n - 4) as i64 }) != 0
-            return ref_set(out, kind, TYPE_PTR, StrView { ptr: (null), len: (0) as i64 })
-        return ref_set(out, kind, TYPE_PTR, StrView { ptr: (r + 4), len: (n - 4) as i64 })
+        if primitive_type_from_name(StrView { ptr: (r + 4), len: (n - 4) as i64 }) != TypeKind.Void
+            return ref_set(out, kind, TypeKind.Ptr, StrView { ptr: (null), len: (0) as i64 })
+        return ref_set(out, kind, TypeKind.Ptr, StrView { ptr: (r + 4), len: (n - 4) as i64 })
     var size: i32 = 0
-    var elem: i32 = 0
+    var elem: TypeKind = TypeKind.Void
     if rv_mangled_array(r, n, @size, @elem) == 1
-        ref_set(out, kind, TYPE_ARRAY, StrView { ptr: (null), len: (0) as i64 })
+        ref_set(out, kind, TypeKind.Array, StrView { ptr: (null), len: (0) as i64 })
         out.ref_size = size
         out.ref_elem = elem
         return 1
     if sema_find_struct(sm, StrView { ptr: (r), len: (n) as i64 }) == null
         return 0
-    ref_set(out, kind, TYPE_STRUCT, StrView { ptr: (r), len: (n) as i64 })
+    ref_set(out, kind, TypeKind.Struct, StrView { ptr: (r), len: (n) as i64 })
 
 # "arr" N "_" E with E a primitive: N to *size, E's TYPE_* to *elem.  1 if so.
-fn rv_mangled_array(r: *u8, n: i32, size: *i32, elem: *i32) -> i32
+fn rv_mangled_array(r: *u8, n: i32, size: *i32, elem: *TypeKind) -> i32
     if n < 6 or memcmp(r, c"arr", 3) != 0
         return 0
     var pos: i32 = 3
@@ -1030,8 +1039,8 @@ fn rv_mangled_array(r: *u8, n: i32, size: *i32, elem: *i32) -> i32
         pos = pos + 1
     if pos == 3 or pos + 1 >= n or *(r + pos) != '_'   # '_'
         return 0
-    let t: i32 = primitive_type_from_name(StrView { ptr: (r + pos + 1), len: (n - pos - 1) as i64 })
-    if t == 0
+    let t: TypeKind = primitive_type_from_name(StrView { ptr: (r + pos + 1), len: (n - pos - 1) as i64 })
+    if t == TypeKind.Void
         return 0
     *size = v
     *elem = t
@@ -1047,11 +1056,11 @@ fn rv_mangled_array(r: *u8, n: i32, size: *i32, elem: *i32) -> i32
 fn rv_ptr_ptr_slot(out: *RefTy, inner: i32, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    ref_set(out, TYPE_PTR, TYPE_PTR, StrView { ptr: (null), len: (0) as i64 })
+    ref_set(out, TypeKind.Ptr, TypeKind.Ptr, StrView { ptr: (null), len: (0) as i64 })
     if ptr_ptr_slot_levels(inner) != 2
         return 1
     out.ptr_pointee = ptr_ptr_slot_inner(inner)
-    if out.ptr_pointee == TYPE_STRUCT
+    if out.ptr_pointee == TypeKind.Struct
         out.held_name = name
         out.held_name_len = len
     1
@@ -1066,26 +1075,26 @@ fn rv_slot_of_name(sm: *Sema, name_sv: StrView, out: *RefTy) -> i32
     var is_local: i32 = 0
     let loc: *LocalVar = ref_local_in(rv_env(sm, @env), StrView { ptr: (name), len: (len) as i64 }, @is_local)
     if is_local == 1
-        if loc == null or lv_var_type(loc) != TYPE_PTR_PTR
+        if loc == null or lv_var_type(loc) != TypeKind.PtrPtr
             return 0
         return rv_ptr_ptr_slot(out, lv_inner_pointee_type(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
     let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (name), len: (len) as i64 })
-    if g == null or g.var_type != TYPE_PTR_PTR
+    if g == null or g.var_type != TypeKind.PtrPtr
         return 0
     rv_ptr_ptr_slot(out, g.inner_pointee_type, StrView { ptr: (g.pointee_type_name), len: (g.pointee_type_name_len) as i64 })
 
 # What field `f` takes, as a slot: as lower_ref_fields will make it, which Sema
 # runs before.
 fn rv_field_slot(f: *StructField, out: *RefTy)
-    let t: i32 = lowered_field_type(f)
-    if t == TYPE_ARRAY
+    let t: TypeKind = lowered_field_type(f)
+    if t == TypeKind.Array
         ref_of_array_field(f, out)
-    else if f.field_ref_ptr_pointee != TYPE_VOID
+    else if f.field_ref_ptr_pointee != TypeKind.Void
         rv_field_ptr_slot(f, out)
-    else if t == TYPE_PTR_PTR
+    else if t == TypeKind.PtrPtr
         rv_ptr_ptr_slot(out, f.inner_pointee_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
-    else if t == TYPE_PTR and f.field_mut_ref == 1
-        ref_set(out, TYPE_MUT_REF, f.array_elem_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+    else if t == TypeKind.Ptr and f.field_mut_ref == 1
+        ref_set(out, TypeKind.MutRef, f.array_elem_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
     else
         ref_set(out, t, f.array_elem_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
 
@@ -1093,21 +1102,23 @@ fn rv_field_slot(f: *StructField, out: *RefTy)
 # written as, as a param is (ref_of_param), and not the nameless `**` slot
 # lower_ref_fields leaves: `w.r = @&h` of an `h:& *C` misfits an `@&*D`.
 fn rv_field_ptr_slot(f: *StructField, out: *RefTy)
-    var kind: i32 = TYPE_REF
+    var kind: TypeKind = TypeKind.Ref
     if f.field_mut_ref == 1
-        kind = TYPE_MUT_REF
-    ref_set(out, kind, TYPE_PTR, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+        kind = TypeKind.MutRef
+    ref_set(out, kind, TypeKind.Ptr, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
     out.ptr_pointee = f.field_ref_ptr_pointee
 
 fn rv_decl_slot(stmt: *Stmt, out: *RefTy) -> i32
-    if stmt.var_declared_type == TYPE_VOID
+    if stmt.var_declared_type == TypeKind.Void
         return 0
-    if stmt.var_type == TYPE_PTR_PTR
-        return rv_ptr_ptr_slot(out, stmt.var_inner_pointee_type, StrView { ptr: (stmt.var_type_name), len: (stmt.var_type_name_len) as i64 })
-    if stmt.var_type == TYPE_ARRAY
-        return ref_set_array(out, stmt.var_array_elem_type, stmt.var_array_elem_pointee, StrView { ptr: (stmt.var_type_name), len: (stmt.var_type_name_len) as i64 }, stmt.var_array_shape, stmt.var_array_size)
+    match stmt.var_type
+        TypeKind.PtrPtr =>
+            return rv_ptr_ptr_slot(out, stmt.var_inner_pointee_type, StrView { ptr: (stmt.var_type_name), len: (stmt.var_type_name_len) as i64 })
+        TypeKind.Array =>
+            return ref_set_array(out, stmt.var_array_elem_type, stmt.var_array_elem_pointee, StrView { ptr: (stmt.var_type_name), len: (stmt.var_type_name_len) as i64 }, stmt.var_array_shape, stmt.var_array_size)
+        _ => pass
     ref_set(out, stmt.var_type, stmt.var_pointee_type, StrView { ptr: (stmt.var_type_name), len: (stmt.var_type_name_len) as i64 })
-    if stmt.var_pointee_type == TYPE_ARRAY
+    if stmt.var_pointee_type == TypeKind.Array
         out.ref_size = stmt.var_pointee_array_size
         out.ref_elem = stmt.var_pointee_array_elem_type
         out.ref_shape = stmt.var_pointee_array_shape   # AGAST #2098
@@ -1139,7 +1150,7 @@ fn rv_check_fill(sm: *Sema, e: *Expr)
         return
     var name: *u8 = null
     var len: i32 = 0
-    if e.left.kind == EXPR_STRUCT_LIT
+    if e.left.kind == ExprKind.StructLit
         name = e.left.ident_ptr
         len = e.left.ident_len
     else
@@ -1158,20 +1169,20 @@ fn rv_check_fill(sm: *Sema, e: *Expr)
 # integer-to-pointer cast and stays; a string literal is a `*u8` already, and a
 # StrView or String into a `*T` has LARB R3's own words (AGAST #2341).
 fn rv_cast_value_to_ref(sm: *Sema, e: *Expr)
-    if e.op != TYPE_PTR and e.op != TYPE_REF and e.op != TYPE_MUT_REF
+    if e.type_kind != TypeKind.Ptr and e.type_kind != TypeKind.Ref and e.type_kind != TypeKind.MutRef
         return
-    if e.left == null or e.left.kind == EXPR_STRING_LIT
+    if e.left == null or e.left.kind == ExprKind.StringLit
         return
     var a: RefTy
     if rv_ty(sm, e.left, @a) == 0
         return
-    if a.kind != TYPE_STRUCT and a.kind != TYPE_ARRAY
+    if a.kind != TypeKind.Struct and a.kind != TypeKind.Array
         return
-    if e.op == TYPE_PTR and a.kind == TYPE_STRUCT
+    if e.type_kind == TypeKind.Ptr and a.kind == TypeKind.Struct
         if name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (a.name), len: (a.name_len) as i64 }, StrView { ptr: (c"String"), len: (6) as i64 }) == 1
             return
     var target: RefTy
-    ref_set(@target, e.op, 0, StrView { ptr: (null), len: (0) as i64 })
+    ref_set(@target, e.type_kind, TypeKind.Void, StrView { ptr: (null), len: (0) as i64 })
     rv_error_value(sm, e.left, @target)
 
 # `r as T` with `r: @T`, `@&T` or `*T` and T move-only (AGAST #2985): the
@@ -1179,12 +1190,12 @@ fn rv_cast_value_to_ref(sm: *Sema, e: *Expr)
 # it the cast copies the value out from behind the reference, and both owners
 # drop it.  A copy T is left alone, and so is a cast to a pointer type.
 fn rv_cast_move_only(sm: *Sema, e: *Expr)
-    if e.op != TYPE_STRUCT or e.ident_len == 0
+    if e.type_kind != TypeKind.Struct or e.ident_len == 0
         return
     if own_type_is_move_only_in(sm.module, @sm.struct_map, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0
         return
     var target: RefTy
-    ref_set(@target, TYPE_STRUCT, 0, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    ref_set(@target, TypeKind.Struct, TypeKind.Void, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     rv_into(sm, e.left, @target)
 
 # --- A call's temporary --------------------------------------------------------------
@@ -1202,10 +1213,10 @@ fn rv_temp_call(sm: *Sema, e: *Expr) -> *Expr
 
 # `mk().x = 1`, `mk().n[1] = 3`, `mk().x += 1`: at the place's start.
 fn rv_check_temp_store(sm: *Sema, stmt: *Stmt)
-    if stmt.kind != STMT_ASSIGN or stmt.assign_target_len != 0
+    if stmt.kind != StmtKind.Assign or stmt.assign_target_len != 0
         return
     let place: *Expr = stmt.if_cond as *Expr
-    if place == null or (place.kind != EXPR_MEMBER and place.kind != EXPR_INDEX)
+    if place == null or (place.kind != ExprKind.Member and place.kind != ExprKind.Index)
         return
     if rv_temp_call(sm, place) == null
         return
@@ -1214,7 +1225,7 @@ fn rv_check_temp_store(sm: *Sema, stmt: *Stmt)
 # `mk().bump()` with `self: @&T` / `self:& T` stores into the temporary as
 # R1 exception 4's auto-ref lends it.  `p` is the method's first param.
 fn rv_check_temp_receiver(sm: *Sema, e: *Expr, p: *Param)
-    if p == null or param_is_self(p) == 0 or p.param_type != TYPE_MUT_REF
+    if p == null or param_is_self(p) == 0 or p.param_type != TypeKind.MutRef
         return
     if rv_temp_call(sm, e.left) == null
         return
@@ -1259,15 +1270,15 @@ fn rv_named_holds_ptr(sm: *Sema, name_sv: StrView, depth: i32) -> i32
 fn rv_fields_hold_ptr(sm: *Sema, fields: *StructField, depth: i32) -> i32
     var f: *StructField = fields
     while f != null
-        let t: i32 = lowered_field_type(f)
-        if f.fn_sig == null and (ref_is_pointer(t) == 1 or t == TYPE_PTR_PTR)
+        let t: TypeKind = lowered_field_type(f)
+        if f.fn_sig == null and (ref_is_pointer(t) == 1 or t == TypeKind.PtrPtr)
             return 1
-        if t == TYPE_STRUCT and rv_named_holds_ptr(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, depth) == 1
+        if t == TypeKind.Struct and rv_named_holds_ptr(sm, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, depth) == 1
             return 1
-        if t == TYPE_ARRAY
-            if ref_is_pointer(f.array_elem_type) == 1 or f.array_elem_type == TYPE_PTR_PTR
+        if t == TypeKind.Array
+            if ref_is_pointer(f.array_elem_type) == 1 or f.array_elem_type == TypeKind.PtrPtr
                 return 1
-            if f.array_elem_type == TYPE_STRUCT and rv_named_holds_ptr(sm, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 }, depth) == 1
+            if f.array_elem_type == TypeKind.Struct and rv_named_holds_ptr(sm, StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 }, depth) == 1
                 return 1
         f = f.next
     0
@@ -1276,17 +1287,17 @@ fn rv_fields_hold_ptr(sm: *Sema, fields: *StructField, depth: i32) -> i32
 fn rv_returns_ptr(sm: *Sema, f: *FnDef) -> i32
     if f == null or f.ret_fn_sig != null
         return 0
-    let t: i32 = f.return_type
-    if ref_is_pointer(t) == 1 or t == TYPE_PTR_PTR or f.ret_ref != null
+    let t: TypeKind = f.return_type
+    if ref_is_pointer(t) == 1 or t == TypeKind.PtrPtr or f.ret_ref != null
         return 1
     if f.ret_array != null
         let a: *ArrayElem = f.ret_array
-        if ref_is_pointer(a.elem) == 1 or a.elem == TYPE_PTR_PTR
+        if ref_is_pointer(a.elem) == 1 or a.elem == TypeKind.PtrPtr
             return 1
-        if a.elem == TYPE_STRUCT
+        if a.elem == TypeKind.Struct
             return rv_named_holds_ptr(sm, StrView { ptr: (a.name), len: (a.name_len) as i64 }, 0)
         return 0
-    if t == TYPE_STRUCT
+    if t == TypeKind.Struct
         return rv_named_holds_ptr(sm, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }, 0)
     0
 
@@ -1294,7 +1305,7 @@ fn rv_returns_ptr(sm: *Sema, f: *FnDef) -> i32
 fn rv_check_lent_escape(sm: *Sema, args: *Expr, f: *FnDef)
     var a: *Expr = args
     while a != null
-        if a.kind == EXPR_UNARY and (a.op == OP_ADDR or a.op == OP_ADDR_MUT) and rv_temp_call(sm, a.operand) != null
+        if a.kind == ExprKind.Unary and (a.op == OpKind.Addr or a.op == OpKind.AddrMut) and rv_temp_call(sm, a.operand) != null
             if rv_returns_ptr(sm, f) == 0 or rv_report(sm, a.span.line, a.span.col) == 0
                 return
             eprints_cstr(c"this call returns a reference, and `")
@@ -1403,88 +1414,90 @@ fn rv_call_def(sm: *Sema, e: *Expr) -> *FnDef
 fn rv_walk(sm: *Sema, e: *Expr)
     if e == null
         return
-    let k: i32 = e.kind
-    if k == EXPR_CALL
-        if e.func_name_len == 6 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sizeof"), len: (6) as i64 }) == 1
-            return
-        # AGAST #3015: `S_deref(@b)` made for `b.f` (R17) is a step of the
-        # place `b.f`, which the borrow it's in is of; it lends nothing itself.
-        if df_is_step(e) == 1
-            let sa: *Expr = e.args
-            if sa != null and sa.kind == EXPR_UNARY and (sa.op == OP_ADDR or sa.op == OP_ADDR_MUT)
-                rv_walk(sm, sa.operand)
-            else
-                rv_walk(sm, sa)
-            return
-        var en: *u8 = null
-        var el: i32 = 0
-        user_variant_ctor_enum(e, @en, @el)
-        if en != null
-            var vi: i32 = 0
-            var other: i32 = 0
-            let ei: i32 = enum_of_variant_unique(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi, @other)
-            if ei >= 0
-                rv_payload(sm, e.args, ei, vi)
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Call =>
+            if e.func_name_len == 6 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sizeof"), len: (6) as i64 }) == 1
+                return
+            # AGAST #3015: `S_deref(@b)` made for `b.f` (R17) is a step of the
+            # place `b.f`, which the borrow it's in is of; it lends nothing itself.
+            if df_is_step(e) == 1
+                let sa: *Expr = e.args
+                if sa != null and sa.kind == ExprKind.Unary and (sa.op == OpKind.Addr or sa.op == OpKind.AddrMut)
+                    rv_walk(sm, sa.operand)
+                else
+                    rv_walk(sm, sa)
+                return
+            var en: *u8 = null
+            var el: i32 = 0
+            user_variant_ctor_enum(e, @en, @el)
+            if en != null
+                var vi: i32 = 0
+                var other: i32 = 0
+                let ei: i32 = enum_of_variant_unique(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi, @other)
+                if ei >= 0
+                    rv_payload(sm, e.args, ei, vi)
+                rv_walk_list(sm, e.args)
+                return
+            let f: *FnDef = rv_call_def(sm, e)
+            var p: *Param = null
+            if f != null
+                p = f.params
+            rv_check_lent_escape(sm, e.args, f)
+            rv_args(sm, e.args, f, p)
+        ExprKind.Method =>
+            var qv: i32 = 0
+            let qe: i32 = rv_qualified_variant(sm, e, @qv)
+            if qe >= 0
+                rv_payload(sm, e.args, qe, qv)
+                rv_walk_list(sm, e.args)
+                return
+            rv_walk(sm, e.left)
+            var mp: *Param = null
+            let m: *FnDef = rs_method_def(sm, e)
+            if m != null
+                # A method found by a looser name, `v.push(x)` for `vec_push(v, x)`,
+                # takes the receiver as an argument: its params don't line up, so
+                # the slots go unjudged, as in ritz0.
+                mp = m.params
+                rv_check_temp_receiver(sm, e, mp)
+                rv_check_receiver(sm, e, mp)
+                if mp != null and name_eq(StrView { ptr: (mp.name), len: (mp.name_len) as i64 }, StrView { ptr: (c"self"), len: (4) as i64 }) == 1
+                    mp = mp.next
+                else
+                    if mp != null
+                        rv_value_args(sm, e.args, mp.next)
+                    mp = null
+            rv_check_lent_escape(sm, e.args, m)
+            rv_args(sm, e.args, null, mp)
+        ExprKind.StructLit =>
+            rv_walk_struct(sm, e)
+        ExprKind.ArrayLit =>
             rv_walk_list(sm, e.args)
-            return
-        let f: *FnDef = rv_call_def(sm, e)
-        var p: *Param = null
-        if f != null
-            p = f.params
-        rv_check_lent_escape(sm, e.args, f)
-        rv_args(sm, e.args, f, p)
-    else if k == EXPR_METHOD
-        var qv: i32 = 0
-        let qe: i32 = rv_qualified_variant(sm, e, @qv)
-        if qe >= 0
-            rv_payload(sm, e.args, qe, qv)
-            rv_walk_list(sm, e.args)
-            return
-        rv_walk(sm, e.left)
-        var mp: *Param = null
-        let m: *FnDef = rs_method_def(sm, e)
-        if m != null
-            # A method found by a looser name, `v.push(x)` for `vec_push(v, x)`,
-            # takes the receiver as an argument: its params don't line up, so
-            # the slots go unjudged, as in ritz0.
-            mp = m.params
-            rv_check_temp_receiver(sm, e, mp)
-            rv_check_receiver(sm, e, mp)
-            if mp != null and name_eq(StrView { ptr: (mp.name), len: (mp.name_len) as i64 }, StrView { ptr: (c"self"), len: (4) as i64 }) == 1
-                mp = mp.next
-            else
-                if mp != null
-                    rv_value_args(sm, e.args, mp.next)
-                mp = null
-        rv_check_lent_escape(sm, e.args, m)
-        rv_args(sm, e.args, null, mp)
-    else if k == EXPR_STRUCT_LIT
-        rv_walk_struct(sm, e)
-    else if k == EXPR_ARRAY_LIT
-        rv_walk_list(sm, e.args)
-    else if k == EXPR_ARRAY_FILL
-        rv_check_fill(sm, e)
-        rv_walk(sm, e.left)
-    else if k == EXPR_UNARY
-        if e.op == OP_ADDR_MUT or e.op == OP_ADDR
-            rv_check_temp_addr(sm, e)
-        if e.op == OP_ADDR_MUT
-            rv_check_borrow(sm, e)
-        if e.op == OP_ADDR_MUT or e.op == OP_ADDR
-            rv_forget(sm, e.operand)
-        rv_walk(sm, e.operand)
-    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        rv_walk(sm, e.left)
-        rv_walk(sm, e.right)
-    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_MATCH or k == EXPR_IF
-        if k == EXPR_CAST and e.cast_array != null
-            var target: RefTy
-            ref_set_elem(@target, e.cast_array)
-            rv_into(sm, e.left, @target)
-        if k == EXPR_CAST
-            rv_cast_move_only(sm, e)
-            rv_cast_value_to_ref(sm, e)
-        rv_walk(sm, e.left)
+        ExprKind.ArrayFill =>
+            rv_check_fill(sm, e)
+            rv_walk(sm, e.left)
+        ExprKind.Unary =>
+            if e.op == OpKind.AddrMut or e.op == OpKind.Addr
+                rv_check_temp_addr(sm, e)
+            if e.op == OpKind.AddrMut
+                rv_check_borrow(sm, e)
+            if e.op == OpKind.AddrMut or e.op == OpKind.Addr
+                rv_forget(sm, e.operand)
+            rv_walk(sm, e.operand)
+        ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
+            rv_walk(sm, e.left)
+            rv_walk(sm, e.right)
+        ExprKind.Member | ExprKind.Cast | ExprKind.Try | ExprKind.Match | ExprKind.If =>
+            if k == ExprKind.Cast and e.cast_array != null
+                var target: RefTy
+                ref_set_elem(@target, e.cast_array)
+                rv_into(sm, e.left, @target)
+            if k == ExprKind.Cast
+                rv_cast_move_only(sm, e)
+                rv_cast_value_to_ref(sm, e)
+            rv_walk(sm, e.left)
+        _ => pass
 
 # --- What Sema's scope doesn't keep -------------------------------------------------
 
@@ -1494,10 +1507,10 @@ fn rv_caller_place(p: *Param) -> i32
     (p.is_borrow == 1 or p.is_self_borrow == 1) as i32
 
 # set_local_pointee_array, on the image.
-fn rv_loc_pointee_array(loc: *LocalVar, size: i32, elem: i32)
+fn rv_loc_pointee_array(loc: *LocalVar, size: i32, elem: TypeKind)
     if size <= 0
         return
-    if lv_pointee_type(loc) == TYPE_ARRAY or lv_var_type(loc) == TYPE_PTR_PTR or ref_to_ptr(loc) == 1
+    if lv_pointee_type(loc) == TypeKind.Array or lv_var_type(loc) == TypeKind.PtrPtr or ref_to_ptr(loc) == 1
         lv_set_pointee_array_size(loc, size)
         lv_set_pointee_array_elem_type(loc, elem)
 
@@ -1508,22 +1521,22 @@ fn rv_loc_pointee_array(loc: *LocalVar, size: i32, elem: i32)
 # one level from its struct as a pointer to the impl's type, whose `@self` is
 # the pointer it holds (AGAST #2286, #3071, #3079).
 fn rv_param_loc(p: *Param, loc: *LocalVar, ib: *ImplBlock)
-    let pt: i32 = p.param_pointee_type
-    if p.param_type == TYPE_BOOL
-        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TYPE_I64, StrView { ptr: (null), len: (0) as i64 }, TYPE_I64, 0, 0)   # emit_bool_param_spill
+    let pt: TypeKind = p.param_pointee_type
+    if p.param_type == TypeKind.Bool
+        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TypeKind.I64, StrView { ptr: (null), len: (0) as i64 }, TypeKind.I64, 0, TypeKind.Void)   # emit_bool_param_spill
         loc.is_bool = 1
         return
     if ib != null and param_self_is_ptr(p) == 1 and self_struct_levels(p) < 2
-        var self_kind: i32 = TYPE_PTR
-        if p.param_type == TYPE_REF and p.is_self_borrow == 0
-            self_kind = TYPE_REF
-        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, self_kind, StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, TYPE_STRUCT, 0, 0)
-        if p.param_type == TYPE_STRUCT or p.is_self_borrow == 1
+        var self_kind: TypeKind = TypeKind.Ptr
+        if p.param_type == TypeKind.Ref and p.is_self_borrow == 0
+            self_kind = TypeKind.Ref
+        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, self_kind, StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, TypeKind.Struct, 0, TypeKind.Void)
+        if p.param_type == TypeKind.Struct or p.is_self_borrow == 1
             lv_set_holds_lent_ptr(loc, 1)
         rv_mark_lent(p, loc)
         return
-    if p.param_type == TYPE_ARRAY
-        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TYPE_ARRAY, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TYPE_I64, p.param_array_size, p.param_array_elem_type)
+    if p.param_type == TypeKind.Array
+        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TypeKind.Array, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TypeKind.I64, p.param_array_size, p.param_array_elem_type)
         lv_set_array_elem_pointee(loc, p.param_array_elem_pointee)
         lv_set_array_shape(loc, p.param_array_shape)
         return
@@ -1532,82 +1545,85 @@ fn rv_param_loc(p: *Param, loc: *LocalVar, ib: *ImplBlock)
         rv_mark_lent(p, loc)
     if lent > 0
         return
-    let t: i32 = p.param_type
-    if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF
-        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, t, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, pt, 0, 0)
-        var inner: i32 = p.param_inner_pointee_type
-        if inner == TYPE_VOID
-            inner = p.param_ref_ptr_pointee
-        if inner != TYPE_VOID
-            lv_set_inner_pointee_type(loc, inner)
-        lv_set_inner_ref(loc, p.param_inner_ref)
-        rv_loc_pointee_array(loc, p.param_pointee_array_size, p.param_pointee_array_elem_type)
-        # bind_nd_pointee_param's `*[N][M]T` plane shape, and (#4313) an
-        # `@[N][M]T` / `@&[N][M]T` one.  Its `**[N][M]T` and `@*[N][M]T`
-        # arms (#4122) set it on a pointer-to-pointer, which ref_ty_in never
-        # reads (only a pointee array's shape is a slot's).
-        if (t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF) and p.param_pointee_array_shape != null and lv_pointee_type(loc) == TYPE_ARRAY
-            lv_set_pointee_array_shape(loc, p.param_pointee_array_shape)
-        lv_set_pointee_array_elem_pointee(loc, p.param_pointee_array_elem_pointee)
-        name_array_ptr_param_loc(loc, p)
-    else if t == TYPE_STRUCT
-        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, t, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TYPE_I64, 0, 0)
-    else
-        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, t, StrView { ptr: (null), len: (0) as i64 }, TYPE_I64, 0, 0)
+    let t: TypeKind = p.param_type
+    match t
+        TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
+            rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, t, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, pt, 0, TypeKind.Void)
+            var inner: i32 = p.param_inner_pointee_type
+            if inner == (TypeKind.Void as i32)
+                inner = (p.param_ref_ptr_pointee as i32)
+            if inner != (TypeKind.Void as i32)
+                lv_set_inner_pointee_type(loc, inner)
+            lv_set_inner_ref(loc, p.param_inner_ref)
+            rv_loc_pointee_array(loc, p.param_pointee_array_size, p.param_pointee_array_elem_type)
+            # bind_nd_pointee_param's `*[N][M]T` plane shape, and (#4313) an
+            # `@[N][M]T` / `@&[N][M]T` one.  Its `**[N][M]T` and `@*[N][M]T`
+            # arms (#4122) set it on a pointer-to-pointer, which ref_ty_in never
+            # reads (only a pointee array's shape is a slot's).
+            if (t == TypeKind.Ptr or t == TypeKind.Ref or t == TypeKind.MutRef) and p.param_pointee_array_shape != null and lv_pointee_type(loc) == TypeKind.Array
+                lv_set_pointee_array_shape(loc, p.param_pointee_array_shape)
+            lv_set_pointee_array_elem_pointee(loc, p.param_pointee_array_elem_pointee)
+            name_array_ptr_param_loc(loc, p)
+        TypeKind.Struct =>
+            rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, t, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TypeKind.I64, 0, TypeKind.Void)
+        _ =>
+            rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, t, StrView { ptr: (null), len: (0) as i64 }, TypeKind.I64, 0, TypeKind.Void)
     rv_mark_lent(p, loc)
 
 # bind_scalar_borrow_param's locals: a `name:& T` whose `name` reads as T.
 fn rv_scalar_borrow_loc(p: *Param, loc: *LocalVar) -> i32
-    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+    if p.is_borrow != 1 or p.param_type != TypeKind.MutRef
         return 0
-    let pt: i32 = p.param_pointee_type
-    if pt == TYPE_ARRAY
-        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TYPE_ARRAY, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TYPE_ARRAY, p.param_pointee_array_size, p.param_pointee_array_elem_type)
-        rv_loc_pointee_array(loc, p.param_pointee_array_size, p.param_pointee_array_elem_type)
-        lv_set_pointee_array_elem_pointee(loc, p.param_pointee_array_elem_pointee)
-        lv_set_array_elem_pointee(loc, p.param_pointee_array_elem_pointee)
-        lv_set_array_shape(loc, p.param_pointee_array_shape)
-        return 1
-    if pt == TYPE_PTR
-        let ipt: i32 = p.param_inner_pointee_type
-        if ipt == TYPE_ARRAY and p.param_pointee_array_size > 0
-            rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TYPE_PTR, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TYPE_ARRAY, 0, 0)
+    let pt: TypeKind = p.param_pointee_type
+    match pt
+        TypeKind.Array =>
+            rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TypeKind.Array, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TypeKind.Array, p.param_pointee_array_size, p.param_pointee_array_elem_type)
             rv_loc_pointee_array(loc, p.param_pointee_array_size, p.param_pointee_array_elem_type)
             lv_set_pointee_array_elem_pointee(loc, p.param_pointee_array_elem_pointee)
-            # AGAST #4122: `p:& *[N][M]T` is a plane pointer, as a `p: *[N][M]T` is.
-            lv_set_pointee_array_shape(loc, p.param_pointee_array_shape)
-            name_array_ptr_param_loc(loc, p)
+            lv_set_array_elem_pointee(loc, p.param_pointee_array_elem_pointee)
+            lv_set_array_shape(loc, p.param_pointee_array_shape)
+            return 1
+        TypeKind.Ptr =>
+            let ipt: TypeKind = ptr_slot_flat(p.param_inner_pointee_type)
+            if ipt == TypeKind.Array and p.param_pointee_array_size > 0
+                rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TypeKind.Ptr, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TypeKind.Array, 0, TypeKind.Void)
+                rv_loc_pointee_array(loc, p.param_pointee_array_size, p.param_pointee_array_elem_type)
+                lv_set_pointee_array_elem_pointee(loc, p.param_pointee_array_elem_pointee)
+                # AGAST #4122: `p:& *[N][M]T` is a plane pointer, as a `p: *[N][M]T` is.
+                lv_set_pointee_array_shape(loc, p.param_pointee_array_shape)
+                name_array_ptr_param_loc(loc, p)
+                return 2
+            let float_or_bool: bool = ipt == TypeKind.Bool or ipt == TypeKind.F32 or ipt == TypeKind.F64
+            if is_borrow_scalar_kind(ipt) == 0 and ipt != TypeKind.Struct and float_or_bool == false
+                return 0
+            if ipt == TypeKind.Struct and p.param_type_name_len <= 0
+                return 0
+            rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TypeKind.Ptr, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, ipt, 0, TypeKind.Void)
+            lv_set_inner_ref(loc, p.param_inner_ref)
             return 2
-        let float_or_bool: bool = ipt == TYPE_BOOL or ipt == TYPE_F32 or ipt == TYPE_F64
-        if is_borrow_scalar_kind(ipt) == 0 and ipt != TYPE_STRUCT and float_or_bool == false
-            return 0
-        if ipt == TYPE_STRUCT and p.param_type_name_len <= 0
-            return 0
-        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TYPE_PTR, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, ipt, 0, 0)
-        lv_set_inner_ref(loc, p.param_inner_ref)
-        return 2
+        _ => pass
     if param_borrows_struct_ptr_ptr(p) == 1
-        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TYPE_PTR_PTR, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TYPE_PTR, 0, 0)
-        if p.param_inner_pointee_type != TYPE_VOID
+        rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, TypeKind.PtrPtr, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, TypeKind.Ptr, 0, TypeKind.Void)
+        if p.param_inner_pointee_type != (TypeKind.Void as i32)
             lv_set_inner_pointee_type(loc, p.param_inner_pointee_type)
         lv_set_inner_ref(loc, p.param_inner_ref)
         return 2
-    let float_pt: bool = pt == TYPE_F32 or pt == TYPE_F64
-    if is_borrow_scalar_kind(pt) == 0 and pt != TYPE_BOOL and float_pt == false
+    let float_pt: bool = pt == TypeKind.F32 or pt == TypeKind.F64
+    if is_borrow_scalar_kind(pt) == 0 and pt != TypeKind.Bool and float_pt == false
         return 0
-    rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, pt, StrView { ptr: (null), len: (0) as i64 }, TYPE_I64, 0, 0)
-    if pt == TYPE_BOOL
+    rs_loc_new(loc, StrView { ptr: (p.name), len: (p.name_len) as i64 }, pt, StrView { ptr: (null), len: (0) as i64 }, TypeKind.I64, 0, TypeKind.Void)
+    if pt == TypeKind.Bool
         loc.is_bool = 1
     1
 
 # mark_lent_param, on the image.
 fn rv_mark_lent(p: *Param, loc: *LocalVar)
-    if (p.is_borrow == 1 or p.is_self_borrow == 1) and lv_var_type(loc) == TYPE_MUT_REF
+    if (p.is_borrow == 1 or p.is_self_borrow == 1) and lv_var_type(loc) == TypeKind.MutRef
         lv_set_holds_lent_ptr(loc, 1)
-    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+    if p.is_borrow != 1 or p.param_type != TypeKind.MutRef
         return
-    let pt: i32 = p.param_pointee_type
-    if pt != TYPE_STRUCT and pt != TYPE_ARRAY and is_borrow_scalar_kind(pt) == 0
+    let pt: TypeKind = p.param_pointee_type
+    if pt != TypeKind.Struct and pt != TypeKind.Array and is_borrow_scalar_kind(pt) == 0
         return
     lv_set_is_lent(loc, 1)
 
@@ -1631,41 +1647,43 @@ fn rv_note_params(sm: *Sema, f: *FnDef)
 # The LocalVar emit_var_decl binds for a declared `let` / `var`: its slot as
 # written (a `bool` held in an i64 slot), named as name_array_ptr_local names it.
 fn rv_decl_loc(stmt: *Stmt, loc: *LocalVar)
-    var t: i32 = stmt.var_type
-    let declared_bool: i32 = (t == TYPE_BOOL) as i32
-    if t == TYPE_BOOL
-        t = TYPE_I64
+    var t: TypeKind = stmt.var_type
+    let declared_bool: i32 = (t == TypeKind.Bool) as i32
+    if t == TypeKind.Bool
+        t = TypeKind.I64
     let name: *u8 = stmt.var_type_name
     let len: i32 = stmt.var_type_name_len
-    let pointer: i32 = (t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF) as i32
-    if t == TYPE_PTR and len > 0
-        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (name), len: (len) as i64 }, TYPE_STRUCT, 0, 0)
-    else if (t == TYPE_REF or t == TYPE_MUT_REF) and len > 0 and stmt.var_pointee_type != TYPE_ARRAY
-        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (name), len: (len) as i64 }, stmt.var_pointee_type, 0, 0)
-    else if t == TYPE_PTR_PTR and len > 0
-        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (name), len: (len) as i64 }, stmt.var_pointee_type, 0, 0)
+    let pointer: i32 = (t == TypeKind.Ptr or t == TypeKind.PtrPtr or t == TypeKind.Ref or t == TypeKind.MutRef) as i32
+    if t == TypeKind.Ptr and len > 0
+        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (name), len: (len) as i64 }, TypeKind.Struct, 0, TypeKind.Void)
+    else if (t == TypeKind.Ref or t == TypeKind.MutRef) and len > 0 and stmt.var_pointee_type != TypeKind.Array
+        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (name), len: (len) as i64 }, stmt.var_pointee_type, 0, TypeKind.Void)
+    else if t == TypeKind.PtrPtr and len > 0
+        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (name), len: (len) as i64 }, stmt.var_pointee_type, 0, TypeKind.Void)
     else if pointer == 1
-        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (null), len: (0) as i64 }, stmt.var_pointee_type, 0, 0)
-    else if t == TYPE_STRUCT
-        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (name), len: (len) as i64 }, TYPE_I64, 0, 0)
-    else if t == TYPE_ARRAY
-        let el: i32 = stmt.var_array_elem_type
-        let named_elem: i32 = (el == TYPE_STRUCT or el == TYPE_PTR or el == TYPE_PTR_PTR or el == TYPE_REF or el == TYPE_MUT_REF) as i32
-        if named_elem == 1 and len > 0
-            rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, TYPE_ARRAY, StrView { ptr: (name), len: (len) as i64 }, TYPE_I64, stmt.var_array_size, el)
-        else
-            rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, TYPE_ARRAY, StrView { ptr: (null), len: (0) as i64 }, TYPE_I64, stmt.var_array_size, el)
-        lv_set_array_elem_pointee(loc, stmt.var_array_elem_pointee)
-        lv_set_array_shape(loc, stmt.var_array_shape)
+        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (null), len: (0) as i64 }, stmt.var_pointee_type, 0, TypeKind.Void)
     else
-        rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (null), len: (0) as i64 }, TYPE_I64, 0, 0)
+        match t
+            TypeKind.Struct =>
+                rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (name), len: (len) as i64 }, TypeKind.I64, 0, TypeKind.Void)
+            TypeKind.Array =>
+                let el: TypeKind = stmt.var_array_elem_type
+                let named_elem: i32 = (el == TypeKind.Struct or el == TypeKind.Ptr or el == TypeKind.PtrPtr or el == TypeKind.Ref or el == TypeKind.MutRef) as i32
+                if named_elem == 1 and len > 0
+                    rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, TypeKind.Array, StrView { ptr: (name), len: (len) as i64 }, TypeKind.I64, stmt.var_array_size, el)
+                else
+                    rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, TypeKind.Array, StrView { ptr: (null), len: (0) as i64 }, TypeKind.I64, stmt.var_array_size, el)
+                lv_set_array_elem_pointee(loc, stmt.var_array_elem_pointee)
+                lv_set_array_shape(loc, stmt.var_array_shape)
+            _ =>
+                rs_loc_new(loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, t, StrView { ptr: (null), len: (0) as i64 }, TypeKind.I64, 0, TypeKind.Void)
     if pointer == 1
-        if stmt.var_inner_pointee_type != TYPE_VOID
+        if stmt.var_inner_pointee_type != (TypeKind.Void as i32)
             lv_set_inner_pointee_type(loc, stmt.var_inner_pointee_type)
         lv_set_inner_ref(loc, stmt.var_inner_ref)
         rv_loc_pointee_array(loc, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)
         lv_set_pointee_array_elem_pointee(loc, stmt.var_pointee_array_elem_pointee)
-        if lv_pointee_type(loc) == TYPE_ARRAY
+        if lv_pointee_type(loc) == TypeKind.Array
             lv_set_pointee_array_shape(loc, stmt.var_pointee_array_shape)
         name_array_ptr_local(loc, stmt, StrView { ptr: (name), len: (len) as i64 })
     loc.is_bool = declared_bool
@@ -1680,39 +1698,39 @@ fn rv_infer_loc(sm: *Sema, stmt: *Stmt, v: *SemaVar, loc: *LocalVar, n: *RsNote)
     # bool_kind can't type the initialiser (BK_UNSURE): the emitter's local
     # says nothing then.
     if v.bk == 0
-        rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, TYPE_I64, StrView { ptr: (null), len: (0) as i64 }, TYPE_I64, 0, 0)
+        rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, TypeKind.I64, StrView { ptr: (null), len: (0) as i64 }, TypeKind.I64, 0, TypeKind.Void)
         lv_set_bk_unsure(loc, 1)
         return 1
     if rv_infer_nd_addr(sm, stmt.var_init, loc) == 1 or rv_infer_base_ptr_array(sm, stmt.var_init, loc) == 1
         loc.name = name
         loc.name_len = len
         return 1
-    if RV_DECL_KIND != TYPE_VOID
-        rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, RV_DECL_KIND, StrView { ptr: (RV_DECL_REF.name), len: (RV_DECL_REF.name_len) as i64 }, RV_DECL_REF.pointee, 0, 0)
+    if RV_DECL_KIND != TypeKind.Void
+        rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, RV_DECL_KIND, StrView { ptr: (RV_DECL_REF.name), len: (RV_DECL_REF.name_len) as i64 }, RV_DECL_REF.pointee, 0, TypeKind.Void)
         n.ptr_pointee = RV_DECL_REF.ptr_pointee
         rv_loc_pointee_array(loc, RV_DECL_REF.ref_size, RV_DECL_REF.ref_elem)
-        if lv_pointee_type(loc) == TYPE_ARRAY
+        if lv_pointee_type(loc) == TypeKind.Array
             lv_set_pointee_array_shape(loc, RV_DECL_REF.ref_shape)
         return 1
     if RV_DECL_INIT_OK == 1
         let a: *RefTy = @RV_DECL_INIT
         if ref_is_pointer(a.kind) == 1
-            rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, a.kind, StrView { ptr: (a.name), len: (a.name_len) as i64 }, a.pointee, 0, 0)
+            rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, a.kind, StrView { ptr: (a.name), len: (a.name_len) as i64 }, a.pointee, 0, TypeKind.Void)
             n.ptr_pointee = a.ptr_pointee
             rv_loc_pointee_array(loc, a.ref_size, a.ref_elem)
-            if lv_pointee_type(loc) == TYPE_ARRAY
+            if lv_pointee_type(loc) == TypeKind.Array
                 lv_set_pointee_array_shape(loc, a.ref_shape)
             return 1
-        if a.kind == TYPE_ARRAY
-            rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, TYPE_ARRAY, StrView { ptr: (a.name), len: (a.name_len) as i64 }, TYPE_I64, a.array_len, a.pointee)
+        if a.kind == TypeKind.Array
+            rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, TypeKind.Array, StrView { ptr: (a.name), len: (a.name_len) as i64 }, TypeKind.I64, a.array_len, a.pointee)
             lv_set_array_elem_pointee(loc, a.elem_pointee)
             lv_set_array_shape(loc, a.shape)
             return 1
-        if a.kind != TYPE_UNKNOWN and a.kind != TYPE_VOID and a.kind != TYPE_PTR_PTR
-            var k: i32 = a.kind
-            if k == TYPE_BOOL or v.bk == 1   # BK_BOOL: an i64 slot
-                k = TYPE_I64
-            rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, k, StrView { ptr: (a.name), len: (a.name_len) as i64 }, TYPE_I64, 0, 0)
+        if a.kind != TypeKind.Unknown and a.kind != TypeKind.Void and a.kind != TypeKind.PtrPtr
+            var k: TypeKind = a.kind
+            if k == TypeKind.Bool or v.bk == 1   # BK_BOOL: an i64 slot
+                k = TypeKind.I64
+            rs_loc_new(loc, StrView { ptr: (name), len: (len) as i64 }, k, StrView { ptr: (a.name), len: (a.name_len) as i64 }, TypeKind.I64, 0, TypeKind.Void)
             loc.is_bool = (v.bk == 1) as i32
             return 1
     rs_default_loc(sm, v, loc)
@@ -1724,23 +1742,25 @@ fn rv_infer_base_ptr_array(sm: *Sema, init: *Expr, loc: *LocalVar) -> i32
     if init == null
         return 0
     var pa: *Param = null
-    if init.kind == EXPR_MEMBER
-        let f: *StructField = rs_field(sm, init)
-        if f != null
-            pa = f.ptr_array
-    else if init.kind == EXPR_IDENT
-        if sema_find_local(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) != null
-            return 0
-        let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 })
-        if g != null
-            pa = g.ptr_array
-    else if init.kind == EXPR_CALL
-        let fd: *FnDef = rs_call_fn(sm, init)
-        if fd != null
-            pa = fd.ret_ptr_array
+    match init.kind
+        ExprKind.Member =>
+            let f: *StructField = rs_field(sm, init)
+            if f != null
+                pa = f.ptr_array
+        ExprKind.Ident =>
+            if sema_find_local(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) != null
+                return 0
+            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 })
+            if g != null
+                pa = g.ptr_array
+        ExprKind.Call =>
+            let fd: *FnDef = rs_call_fn(sm, init)
+            if fd != null
+                pa = fd.ret_ptr_array
+        _ => pass
     if pa == null or pa.param_pointee_array_size <= 0
         return 0
-    rs_loc_new(loc, StrView { ptr: (null), len: (0) as i64 }, pa.param_type, StrView { ptr: (null), len: (0) as i64 }, TYPE_ARRAY, 0, 0)
+    rs_loc_new(loc, StrView { ptr: (null), len: (0) as i64 }, pa.param_type, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Array, 0, TypeKind.Void)
     lv_set_pointee_array_size(loc, pa.param_pointee_array_size)
     lv_set_pointee_array_elem_type(loc, pa.param_pointee_array_elem_type)
     1
@@ -1749,35 +1769,37 @@ fn rv_infer_base_ptr_array(sm: *Sema, init: *Expr, loc: *LocalVar) -> i32
 # field), with one index short of its rank a row `@[N]T` (#2555), fewer a plane
 # `[M][N]..T` held as its flat `@[M*N..]T` (#2570).  1 when `init` is one.
 fn rv_infer_nd_addr(sm: *Sema, init: *Expr, loc: *LocalVar) -> i32
-    if init == null or init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT)
+    if init == null or init.kind != ExprKind.Unary or (init.op != OpKind.Addr and init.op != OpKind.AddrMut)
         return 0
     let oper: *Expr = init.operand
-    if oper == null or oper.kind != EXPR_INDEX
+    if oper == null or oper.kind != ExprKind.Index
         return 0
     var depth: i32 = 0
     var base: *Expr = oper
-    while base.kind == EXPR_INDEX
+    while base.kind == ExprKind.Index
         depth = depth + 1
         base = base.left
     var sh: *ArrayShape = null
-    if base.kind == EXPR_IDENT
-        let arr: *LocalVar = rv_loc(sm, base)
-        if arr != null and lv_var_type(arr) == TYPE_ARRAY
-            sh = lv_array_shape(arr)
-        else if sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 }) == null
-            let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-            if g != null and g.var_type == TYPE_ARRAY
-                sh = g.array_shape
-    else if base.kind == EXPR_MEMBER
-        let f: *StructField = rs_field(sm, base)
-        if f != null and f.field_type == TYPE_ARRAY
-            sh = f.array_shape
+    match base.kind
+        ExprKind.Ident =>
+            let arr: *LocalVar = rv_loc(sm, base)
+            if arr != null and lv_var_type(arr) == TypeKind.Array
+                sh = lv_array_shape(arr)
+            else if sema_find_local(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 }) == null
+                let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                if g != null and g.var_type == TypeKind.Array
+                    sh = g.array_shape
+        ExprKind.Member =>
+            let f: *StructField = rs_field(sm, base)
+            if f != null and f.field_type == TypeKind.Array
+                sh = f.array_shape
+        _ => pass
     if sh == null or depth > sh.rank - 1
         return 0
-    var kind: i32 = TYPE_REF
-    if init.op == OP_ADDR_MUT
-        kind = TYPE_MUT_REF
-    rs_loc_new(loc, StrView { ptr: (null), len: (0) as i64 }, kind, StrView { ptr: (null), len: (0) as i64 }, TYPE_ARRAY, 0, 0)
+    var kind: TypeKind = TypeKind.Ref
+    if init.op == OpKind.AddrMut
+        kind = TypeKind.MutRef
+    rs_loc_new(loc, StrView { ptr: (null), len: (0) as i64 }, kind, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Array, 0, TypeKind.Void)
     lv_set_pointee_array_elem_type(loc, sh.leaf_type)
     lv_set_pointee_array_elem_pointee(loc, sh.leaf_pointee)
     if depth == sh.rank - 1
@@ -1786,7 +1808,7 @@ fn rv_infer_nd_addr(sm: *Sema, init: *Expr, loc: *LocalVar) -> i32
         let plane: *ArrayShape = nd_shape_from(sh, depth)
         lv_set_pointee_array_size(loc, shape_leaf_count(plane))
         lv_set_pointee_array_shape(loc, plane)
-    if sh.leaf_type == TYPE_STRUCT
+    if sh.leaf_type == TypeKind.Struct
         lv_set_pointee_array_elem_name(loc, sh.leaf_name, sh.leaf_name_len)
     1
 
@@ -1803,7 +1825,7 @@ fn rv_note_decl(sm: *Sema, stmt: *Stmt)
     n.ref_pointee = RV_DECL_REF.pointee
     n.ref_name = RV_DECL_REF.name
     n.ref_name_len = RV_DECL_REF.name_len
-    if stmt.var_declared_type != TYPE_VOID
+    if stmt.var_declared_type != TypeKind.Void
         rv_decl_loc(stmt, @n.loc)
         # AGAST #2364: U of a declared `@*U` / `@&*U`, on Sema's note.
         n.ptr_pointee = ref_decl_ptr_pointee(stmt)
@@ -1816,22 +1838,22 @@ fn rv_note_decl(sm: *Sema, stmt: *Stmt)
         # let_note_decl records the binding as `@T` / `@&T` / `*T` and the
         # emitter lowers it so.  Type the note the same way, so Sema's checks
         # and call_check's place image of `x` agree with the slot it gets.
-        var uk: i32 = TYPE_VOID
+        var uk: TypeKind = TypeKind.Void
         var un: *u8 = null
         var unl: i32 = 0
-        var up: i32 = TYPE_VOID
+        var up: TypeKind = TypeKind.Void
         if let_unwrap_payload_pointer(sm, stmt.var_init, @uk, @un, @unl, @up) == 1
             n.ref_kind = uk
             n.ref_pointee = up
             n.ref_name = un
             n.ref_name_len = unl
-            n.ptr_pointee = TYPE_VOID
+            n.ptr_pointee = TypeKind.Void
             n.has_loc = 1
-            rs_loc_new(@n.loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, uk, StrView { ptr: (un), len: (unl) as i64 }, up, 0, 0)
+            rs_loc_new(@n.loc, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, uk, StrView { ptr: (un), len: (unl) as i64 }, up, 0, TypeKind.Void)
         # The `q#` view add_array_view gives what the inference made a `*[N]T`,
         # which SemaVar.index_elem, from what's written, can't know.
         let lo: *LocalVar = @n.loc
-        if n.has_loc == 1 and lv_bk_unsure(lo) == 0 and lv_pointee_type(lo) == TYPE_ARRAY and lv_pointee_array_size(lo) > 0 and ref_is_pointer(lv_var_type(lo)) == 1
+        if n.has_loc == 1 and lv_bk_unsure(lo) == 0 and lv_pointee_type(lo) == TypeKind.Array and lv_pointee_array_size(lo) > 0 and ref_is_pointer(lv_var_type(lo)) == 1
             var vn_len: i32 = 0
             let vn: *u8 = array_ptr_elem_name(lo, @vn_len)
             if sx_view_elem_ok(sm, lv_pointee_array_elem_type(lo), StrView { ptr: (vn), len: (vn_len) as i64 }) == 1
@@ -1842,8 +1864,8 @@ fn rv_note_decl(sm: *Sema, stmt: *Stmt)
         return
     # An un-annotated `let` holds the `@T`.  `let n: i64 = @c` is a pointer as an
     # integer: no reference, whatever the binding says.
-    let declared: i32 = stmt.var_declared_type
-    if declared == TYPE_VOID or declared == TYPE_PTR_PTR or ref_is_pointer(declared) == 1 or rv_decl_is_span(stmt) == 1
+    let declared: TypeKind = stmt.var_declared_type
+    if declared == TypeKind.Void or declared == TypeKind.PtrPtr or ref_is_pointer(declared) == 1 or rv_decl_is_span(stmt) == 1
         n.root = RV_DECL_ROOT
         n.root_len = RV_DECL_ROOT_LEN
         n.root_loops = RV_LOOPS
@@ -1855,14 +1877,14 @@ fn rv_note_decl(sm: *Sema, stmt: *Stmt)
 # inferred_fn_sig: its own, or an un-annotated `let h = t.f` / `fs[1]`'s, or
 # `let f = mb`'s mb.  Before the binding exists.
 fn rv_decl_fn_sig(sm: *Sema, stmt: *Stmt) -> *FnDef
-    if stmt.var_fn_sig != null or stmt.var_declared_type != TYPE_VOID
+    if stmt.var_fn_sig != null or stmt.var_declared_type != TypeKind.Void
         return stmt.var_fn_sig
     let init: *Expr = stmt.var_init
-    if init != null and (init.kind == EXPR_MEMBER or init.kind == EXPR_INDEX)
+    if init != null and (init.kind == ExprKind.Member or init.kind == ExprKind.Index)
         var t: SemaTy
         sema_expr_ty(sm, init, @t)
         return t.fn_sig
-    if init == null or init.kind != EXPR_IDENT
+    if init == null or init.kind != ExprKind.Ident
         return null
     if sema_find_local(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) != null or sbk_global(sm, StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }) != null
         return null
@@ -1880,26 +1902,26 @@ fn rv_before_decl(sm: *Sema, stmt: *Stmt)
     if RV_DECL_ROOT == null and rv_decl_is_span(stmt) == 1
         RV_DECL_ROOT = rv_span_view_root(sm, stmt.var_init, @RV_DECL_ROOT_LEN)
     if RV_DECL_ROOT != null and rv_referent_ty(sm, stmt.var_init, @RV_DECL_TY) == 0
-        RV_DECL_TY.pointee = TYPE_VOID
-    RV_DECL_KIND = TYPE_VOID
+        RV_DECL_TY.pointee = TypeKind.Void
+    RV_DECL_KIND = TypeKind.Void
     RV_DECL_INIT_OK = 0
     RV_DECL_FN = rv_decl_fn_sig(sm, stmt)
     if stmt.var_init != null
         RV_DECL_INIT_OK = rv_ty(sm, stmt.var_init, @RV_DECL_INIT)
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
+    if stmt.var_type != TypeKind.I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
         return
     var env: RefEnv
     let view: i32 = ref_view_in(rv_env(sm, @env), stmt.var_init)
     if view == REF_VIEW_SHARED
-        RV_DECL_KIND = TYPE_REF
+        RV_DECL_KIND = TypeKind.Ref
     else if view == REF_VIEW_MUT
-        RV_DECL_KIND = TYPE_MUT_REF
+        RV_DECL_KIND = TypeKind.MutRef
     else
         return
     # What it points at, as the inference typed it before the view made it a
     # reference: `@q` of a `*C` is an `@*C`.
     if RV_DECL_INIT_OK == 0 or ref_is_pointer(RV_DECL_INIT.kind) == 0
-        ref_set(@RV_DECL_REF, RV_DECL_KIND, TYPE_VOID, StrView { ptr: (null), len: (0) as i64 })
+        ref_set(@RV_DECL_REF, RV_DECL_KIND, TypeKind.Void, StrView { ptr: (null), len: (0) as i64 })
     else
         RV_DECL_REF = RV_DECL_INIT
 
@@ -1916,18 +1938,18 @@ pub fn ref_value_note_arm(sm: *Sema, arm: *MatchArm, scrut: *Expr)
     var t: SemaTy
     sema_expr_ty(sm, scrut, @t)
     sm.scope_top = sm.scope_top + 1
-    if t.kind == TYPE_UNKNOWN or t.name == null or t.name_len <= 0 or user_enum_index(StrView { ptr: (t.name), len: (t.name_len) as i64 }) < 0
+    if t.kind == TypeKind.Unknown or t.name == null or t.name_len <= 0 or user_enum_index(StrView { ptr: (t.name), len: (t.name_len) as i64 }) < 0
         return
     let f: *StructField = user_enum_tuple_field(StrView { ptr: (t.name), len: (t.name_len) as i64 }, arm_variant_sel(StrView { ptr: (t.name), len: (t.name_len) as i64 }, arm))
     if f == null or f.field_shared_ref == 0 and f.field_mut_ref == 0
         return
     let n: *RsNote = rs_note_new(sm, v)
-    n.ref_kind = TYPE_REF
+    n.ref_kind = TypeKind.Ref
     if f.field_mut_ref == 1
-        n.ref_kind = TYPE_MUT_REF
+        n.ref_kind = TypeKind.MutRef
     n.ref_pointee = f.ptr_pointee
-    if n.ref_pointee == TYPE_VOID and f.field_type_name_len > 0
-        n.ref_pointee = TYPE_STRUCT
+    if n.ref_pointee == TypeKind.Void and f.field_type_name_len > 0
+        n.ref_pointee = TypeKind.Struct
     n.ref_name = f.field_type_name
     n.ref_name_len = f.field_type_name_len
 
@@ -1947,7 +1969,7 @@ pub fn ref_value_bind_arm(sm: *Sema, arm: *MatchArm)
     if n == null
         n = rs_note_new(sm, v)
     n.has_loc = rs_default_loc(sm, v, @n.loc)
-    if n.has_loc == 0 or lv_var_type(@n.loc) == TYPE_STRUCT or lv_var_type(@n.loc) == TYPE_ARRAY
+    if n.has_loc == 0 or lv_var_type(@n.loc) == TypeKind.Struct or lv_var_type(@n.loc) == TypeKind.Array
         return
     if ref_is_pointer(lv_var_type(@n.loc)) == 1
         return
@@ -1969,10 +1991,10 @@ pub fn ref_value_begin_fn(sm: *Sema, f: *FnDef)
     rs_notes_clear()
     rv_note_params(sm, f)
     if ref_of_fn(f, @RV_RET) == 0
-        RV_RET.kind = TYPE_VOID
+        RV_RET.kind = TypeKind.Void
     # `-> *i32` and `-> **T` name nothing ref_of_fn can, and still leave as pointers.
     RV_RET.returned = 0
-    if ref_is_pointer(f.return_type) == 1 or f.return_type == TYPE_PTR_PTR
+    if ref_is_pointer(f.return_type) == 1 or f.return_type == TypeKind.PtrPtr
         RV_RET.returned = 1
     # LARB R57: a `-> Span<T>` return leaves with a view the caller holds.
     if rv_is_span(@RV_RET) == 1
@@ -1982,87 +2004,89 @@ pub fn ref_value_begin_fn(sm: *Sema, f: *FnDef)
     RV_RET_ARRAY_OK = 0
     if f.ret_ptr_array != null and ref_of_param(f.ret_ptr_array, @RV_RET_ARRAY) == 1
         RV_RET_ARRAY_OK = 1
-    if RV_RET.kind != TYPE_VOID or RV_RET.returned == 1
+    if RV_RET.kind != TypeKind.Void or RV_RET.returned == 1
         rv_note_stmts(f.body, @RV_RET)
 
 # What a write's place evaluates on the way: its base and its index.
 fn rv_walk_target(sm: *Sema, stmt: *Stmt)
-    let k: i32 = stmt.kind
-    if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_ASSIGN and stmt.assign_target_len == 0
+    let k: StmtKind = stmt.kind
+    if k == StmtKind.MemberAssign or k == StmtKind.MemberIndexAssign or k == StmtKind.Assign and stmt.assign_target_len == 0
         rv_walk(sm, stmt.if_cond as *Expr)
-    if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+    if k == StmtKind.IndexAssign or k == StmtKind.LocalFieldIndexAssign or k == StmtKind.MemberIndexAssign
         rv_walk(sm, stmt.while_cond)
 
 # Statement `stmt`, before the statements nested in it: its own place and
 # values (an `if` or loop's condition, a `for`'s range).
 pub fn ref_value_check_stmt(sm: *Sema, stmt: *Stmt)
-    let k: i32 = stmt.kind
+    let k: StmtKind = stmt.kind
     rv_check_temp_store(sm, stmt)
     rv_check_write(sm, stmt)
     rv_walk_target(sm, stmt)
     var env: RefEnv
     var slot: RefTy
-    if k == STMT_VAR_DECL
-        if stmt.var_init != null and rv_decl_slot(stmt, @slot) == 1
-            rv_into(sm, stmt.var_init, @slot)
-        rv_walk(sm, stmt.var_init)
-        rv_before_decl(sm, stmt)
-    else if k == STMT_TUPLE_DECL
-        rv_walk(sm, stmt.var_init)
-    else if k == STMT_ASSIGN
-        var known: i32 = 0
-        if stmt.assign_target_len > 0
-            known = rv_slot_of_name(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, @slot)
-        else
-            known = rv_ty(sm, stmt.if_cond as *Expr, @slot)
-        if known == 1
-            rv_into(sm, stmt.assign_value, @slot)
-        rv_walk(sm, stmt.assign_value)
-        if stmt.assign_target_len > 0
-            rv_forget_name(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-    else if k == STMT_RETURN
-        rv_into(sm, stmt.return_value, @RV_RET)
-        rv_walk(sm, stmt.return_value)
-    else if k == STMT_EXPR
-        ref_value_check_value(sm, stmt.expr)
-    else if k == STMT_MATCH or k == STMT_IF or k == STMT_ASSERT
-        rv_walk(sm, stmt.if_cond as *Expr)
-    else if k == STMT_WHILE
-        rv_walk(sm, stmt.while_cond)
-        RV_LOOPS = RV_LOOPS + 1
-    else if k == STMT_FOR
-        rv_walk(sm, stmt.for_start)
-        rv_walk(sm, stmt.for_end)
-        RV_LOOPS = RV_LOOPS + 1
-    else if k == STMT_LOOP
-        RV_LOOPS = RV_LOOPS + 1
-    else if k == STMT_ASM
-        # An asm block (§18.6, AGAST #3395) assigns its `out` / `inout` operands.
-        var o: *AsmOperand = stmt.asm_block.operands
-        while o != null
-            if o.dir == ASM_OUT or o.dir == ASM_INOUT
-                rv_forget_name(sm, StrView { ptr: (o.name), len: (o.name_len) as i64 })
-            o = o.next
-    else if k == STMT_LOCAL_FIELD_ASSIGN
-        var owner: RefTy
-        if ref_of_ident_in(rv_env(sm, @env), StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, @owner) == 1
-            rv_into_field(sm, stmt, @owner)
-        rv_walk(sm, stmt.assign_value)
-    else if k == STMT_MEMBER_ASSIGN
-        var base: RefTy
-        if rv_ty(sm, stmt.if_cond, @base) == 1
-            rv_into_field(sm, stmt, @base)
-        rv_walk(sm, stmt.assign_value)
-    else if k == STMT_INDEX_ASSIGN
-        var held: RefTy
-        if ref_of_ident_in(rv_env(sm, @env), StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, @held) == 1
-            if held.kind == TYPE_ARRAY or ref_is_pointer(held.kind) == 1
-                var part: RefTy
-                rv_element(@held, @part)
-                rv_into(sm, stmt.assign_value, @part)
-        rv_walk(sm, stmt.assign_value)
-    else if k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        rv_walk(sm, stmt.assign_value)
+    match k
+        StmtKind.VarDecl =>
+            if stmt.var_init != null and rv_decl_slot(stmt, @slot) == 1
+                rv_into(sm, stmt.var_init, @slot)
+            rv_walk(sm, stmt.var_init)
+            rv_before_decl(sm, stmt)
+        StmtKind.TupleDecl =>
+            rv_walk(sm, stmt.var_init)
+        StmtKind.Assign =>
+            var known: i32 = 0
+            if stmt.assign_target_len > 0
+                known = rv_slot_of_name(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, @slot)
+            else
+                known = rv_ty(sm, stmt.if_cond as *Expr, @slot)
+            if known == 1
+                rv_into(sm, stmt.assign_value, @slot)
+            rv_walk(sm, stmt.assign_value)
+            if stmt.assign_target_len > 0
+                rv_forget_name(sm, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+        StmtKind.Return =>
+            rv_into(sm, stmt.return_value, @RV_RET)
+            rv_walk(sm, stmt.return_value)
+        StmtKind.Expr =>
+            ref_value_check_value(sm, stmt.expr)
+        StmtKind.Match | StmtKind.If | StmtKind.Assert =>
+            rv_walk(sm, stmt.if_cond as *Expr)
+        StmtKind.While =>
+            rv_walk(sm, stmt.while_cond)
+            RV_LOOPS = RV_LOOPS + 1
+        StmtKind.For =>
+            rv_walk(sm, stmt.for_start)
+            rv_walk(sm, stmt.for_end)
+            RV_LOOPS = RV_LOOPS + 1
+        StmtKind.Loop =>
+            RV_LOOPS = RV_LOOPS + 1
+        StmtKind.Asm =>
+            # An asm block (§18.6, AGAST #3395) assigns its `out` / `inout` operands.
+            var o: *AsmOperand = stmt.asm_block.operands
+            while o != null
+                if o.dir == ASM_OUT or o.dir == ASM_INOUT
+                    rv_forget_name(sm, StrView { ptr: (o.name), len: (o.name_len) as i64 })
+                o = o.next
+        StmtKind.LocalFieldAssign =>
+            var owner: RefTy
+            if ref_of_ident_in(rv_env(sm, @env), StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, @owner) == 1
+                rv_into_field(sm, stmt, @owner)
+            rv_walk(sm, stmt.assign_value)
+        StmtKind.MemberAssign =>
+            var base: RefTy
+            if rv_ty(sm, stmt.if_cond, @base) == 1
+                rv_into_field(sm, stmt, @base)
+            rv_walk(sm, stmt.assign_value)
+        StmtKind.IndexAssign =>
+            var held: RefTy
+            if ref_of_ident_in(rv_env(sm, @env), StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, @held) == 1
+                if held.kind == TypeKind.Array or ref_is_pointer(held.kind) == 1
+                    var part: RefTy
+                    rv_element(@held, @part)
+                    rv_into(sm, stmt.assign_value, @part)
+            rv_walk(sm, stmt.assign_value)
+        StmtKind.LocalFieldIndexAssign | StmtKind.MemberIndexAssign =>
+            rv_walk(sm, stmt.assign_value)
+        _ => pass
 
 # A tail or a match arm's value, its bindings in scope.
 pub fn ref_value_check_value(sm: *Sema, e: *Expr)
@@ -2072,9 +2096,9 @@ pub fn ref_value_check_value(sm: *Sema, e: *Expr)
 # After statement `stmt` and what's nested in it: a declaration's binding exists
 # now, and a loop is over.
 pub fn ref_value_after(sm: *Sema, stmt: *Stmt)
-    let k: i32 = stmt.kind
-    if k == STMT_WHILE or k == STMT_FOR or k == STMT_LOOP
+    let k: StmtKind = stmt.kind
+    if k == StmtKind.While or k == StmtKind.For or k == StmtKind.Loop
         RV_LOOPS = RV_LOOPS - 1
-    if k == STMT_VAR_DECL
+    if k == StmtKind.VarDecl
         rv_note_decl(sm, stmt)
     RV_DECL_ROOT = null

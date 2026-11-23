@@ -25,10 +25,10 @@
 # value model keeps every integer in an i64 register, so every initialiser
 # would look 64-bit.  The source type is therefore inferred from RITZ types
 # by narrow_src_type below, and that inference is deliberately one-sided: when
-# it is not sure, it answers NARROW_UNKNOWN and the check stays silent.  A
+# it is not sure, it answers TypeKind.NarrowUnknown and the check stays silent.  A
 # missed rejection is a parity gap; a false rejection would refuse a program
 # ritz0 accepts, which the regression suite would (rightly) fail on.  In
-# The parser defaults an unannotated local to TYPE_I64 whatever its
+# The parser defaults an unannotated local to TypeKind.I64 whatever its
 # initialiser is, so that default is never read.  Sema records the type
 # narrow_src_type infers for the initialiser instead (narrow_sema_decl, AGAST
 # #1688): ritz0 sizes the local's slot from the value it emits, the same width.
@@ -58,11 +58,9 @@ import sema
 import sema_type
 import bool_check   # sbk_method_def, sbk_receiver (AGAST #1688)
 
-# narrow_src_type results that are not a TYPE_* kind.
-# Positive and far from every TYPE_* kind (consts must be plain literals).
-const NARROW_UNKNOWN: i32 = 9001   # cannot tell: never reject on this
-const NARROW_LIT: i32 = 9002       # a bare integer literal: adopts the
-                                   # declared type (#1396), never narrows
+# narrow_src_type answers a TypeKind, TypeKind.NarrowUnknown when it cannot
+# tell (never reject on that), or TypeKind.NarrowLit for a bare integer
+# literal, which adopts the declared type (#1396) and never narrows.
 
 const I64_MAX: i64 = 9223372036854775807
 
@@ -88,7 +86,7 @@ pub fn narrow_note_decl(s: *EmitterState, stmt: *Stmt)
         # Lookups could miss a shadowing entry: stop trusting the table.
         s.narrow_decl_overflow = 1
         return
-    var t: i32 = NARROW_UNKNOWN
+    var t: TypeKind = TypeKind.NarrowUnknown
     if ty_bits(stmt.var_declared_type) > 0
         t = stmt.var_declared_type
     let idx: i32 = s.narrow_decl_count
@@ -104,7 +102,7 @@ pub fn narrow_note_decl(s: *EmitterState, stmt: *Stmt)
 # emitted (the caller truncates the table to its mark after the arm), so
 # `let a: f64 = match o / Some(x) => x` over a u64 is refused as the plain
 # `let a: f64 = x` is.  `t` 0 or a non-integer records an unknown.
-pub fn narrow_note_binding(s: *EmitterState, name_sv: StrView, t: i32)
+pub fn narrow_note_binding(s: *EmitterState, name_sv: StrView, t: TypeKind)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if s.narrow_decl_count >= 256
@@ -114,8 +112,8 @@ pub fn narrow_note_binding(s: *EmitterState, name_sv: StrView, t: i32)
     s.narrow_decls[idx].name = name
     s.narrow_decls[idx].name_len = len
     s.narrow_decls[idx].decl_type = narrow_known(t)
-    # Not TYPE_VOID, so sizeof() reads the local's own slot, as before.
-    s.narrow_decls[idx].declared = TYPE_I64
+    # Not TypeKind.Void, so sizeof() reads the local's own slot, as before.
+    s.narrow_decls[idx].declared = TypeKind.I64
     s.narrow_decls[idx].init = null
     s.narrow_decl_count = idx + 1
 
@@ -126,7 +124,7 @@ pub fn narrow_note_binding(s: *EmitterState, name_sv: StrView, t: i32)
 # sema_walk binds a name, then notes here the integer type it was written
 # with, on that binding.  An unnamed bind (sema_bind_ty skips it) is no note.
 
-fn narrow_sema_note(sm: *Sema, name_sv: StrView, t: i32)
+fn narrow_sema_note(sm: *Sema, name_sv: StrView, t: TypeKind)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if sm.scope_top <= 0
@@ -134,7 +132,7 @@ fn narrow_sema_note(sm: *Sema, name_sv: StrView, t: i32)
     let v: *SemaVar = @sm.scope[sm.scope_top - 1]
     if v.name != name or v.name_len != len
         return
-    v.narrow = 0
+    v.narrow = TypeKind.Void
     if ty_bits(t) > 0
         v.narrow = t
 
@@ -145,7 +143,7 @@ pub fn narrow_sema_param(sm: *Sema, p: *Param)
 # type, as ritz0 sizes an unannotated local's slot from the value it emits.
 # A bare literal is an i64 there: `let a = 5` then `let n: i32 = a` is refused.
 pub fn narrow_sema_decl(sm: *Sema, st: *Stmt)
-    if st.var_declared_type != TYPE_VOID
+    if st.var_declared_type != TypeKind.Void
         narrow_sema_note(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, st.var_declared_type)
         return
     if sm.scope_top <= 0
@@ -158,10 +156,10 @@ pub fn narrow_sema_decl(sm: *Sema, st: *Stmt)
     env.s = null
     env.sm = sm
     sm.scope_top = sm.scope_top - 1
-    var t: i32 = narrow_src_type_in(@env, st.var_init, 0)
+    var t: TypeKind = narrow_src_type_in(@env, st.var_init, 0)
     sm.scope_top = sm.scope_top + 1
-    if t == NARROW_LIT
-        t = TYPE_I64
+    if t == TypeKind.NarrowLit
+        t = TypeKind.I64
     narrow_sema_note(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, t)
 
 # A match arm's binding (AGAST #3345 / #3358, as the emitter's
@@ -179,15 +177,15 @@ pub fn narrow_sema_arm(sm: *Sema, scrut: *Expr, arm: *MatchArm)
 # The payload's integer type of `arm`'s variant of the enum `scrut` is, as
 # emit_match_arm_body picks the variant (`Some` / `Ok` tag 0, else 1; a user
 # enum's own index); 0 when Sema can't type the scrutinee as an enum.
-fn narrow_sema_payload(sm: *Sema, scrut: *Expr, arm: *MatchArm) -> i32
+fn narrow_sema_payload(sm: *Sema, scrut: *Expr, arm: *MatchArm) -> TypeKind
     if scrut == null
-        return 0
+        return TypeKind.Void
     var e: *Expr = scrut
-    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT) and e.operand != null
+    if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut) and e.operand != null
         e = e.operand   # `match @place` matches the enum it addresses
     var t: SemaTy
-    if sema_expr_ty(sm, e, @t) != TYPE_STRUCT or t.name == null or t.name_len <= 0
-        return 0
+    if sema_expr_ty(sm, e, @t) != TypeKind.Struct or t.name == null or t.name_len <= 0
+        return TypeKind.Void
     var variant: i32 = 1
     if name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Some"), len: (4) as i64 }) == 1 or name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Ok"), len: (2) as i64 }) == 1
         variant = 0
@@ -201,11 +199,11 @@ fn narrow_sema_payload(sm: *Sema, scrut: *Expr, arm: *MatchArm) -> i32
 # Types
 # =============================================================================
 
-# A type kind if it is an integer/bool, else NARROW_UNKNOWN.
-pub fn narrow_known(t: i32) -> i32
+# A type kind if it is an integer/bool, else TypeKind.NarrowUnknown.
+pub fn narrow_known(t: TypeKind) -> TypeKind
     if ty_bits(t) > 0
         return t
-    NARROW_UNKNOWN
+    TypeKind.NarrowUnknown
 
 # The const named `name`.  Sema runs before emit_module resolves a const
 # that named one not yet parsed (resolve_const_values), so it resolves the
@@ -225,12 +223,12 @@ fn narrow_env_const(env: *NarrowEnv, name_sv: StrView) -> *ConstEntry
         c = c.next
     null
 
-# Ritz type of an identifier, or NARROW_UNKNOWN.  Same precedence as
+# Ritz type of an identifier, or TypeKind.NarrowUnknown.  Same precedence as
 # emission: constants shadow locals.
-pub fn narrow_ident_type(s: *EmitterState, e: *Expr) -> i32
+pub fn narrow_ident_type(s: *EmitterState, e: *Expr) -> TypeKind
     narrow_name_type(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
 
-pub fn narrow_name_type(s: *EmitterState, name_sv: StrView) -> i32
+pub fn narrow_name_type(s: *EmitterState, name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var env: NarrowEnv
@@ -238,20 +236,20 @@ pub fn narrow_name_type(s: *EmitterState, name_sv: StrView) -> i32
     env.sm = null
     narrow_env_name_type(@env, StrView { ptr: (name), len: (len) as i64 })
 
-fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> i32
+fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let ce: *ConstEntry = narrow_env_const(env, StrView { ptr: (name), len: (len) as i64 })
     if ce != null
         if ce.fold_state != CONST_FOLD_DONE
-            return NARROW_UNKNOWN
+            return TypeKind.NarrowUnknown
         return narrow_known(ce.const_type)
     if env.s == null
         # Sema: the innermost binding of the name, else a global.
         let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (name), len: (len) as i64 })
         if v != null
-            if v.narrow == 0
-                return NARROW_UNKNOWN
+            if v.narrow == TypeKind.Void
+                return TypeKind.NarrowUnknown
             return v.narrow
         # Every global's type is written (the parser refuses an untyped one,
         # #3375), so an i64 / u64 global is trusted here (AGAST #1688).
@@ -260,16 +258,16 @@ fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> i32
             if name_eq(StrView { ptr: (sg.name), len: (sg.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
                 if ty_is_int(sg.var_type) == 1
                     return sg.var_type
-                return NARROW_UNKNOWN
+                return TypeKind.NarrowUnknown
             sg = sg.next
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     let s: *EmitterState = env.s
     if s.narrow_decl_overflow != 0
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     # Newest declaration first.  Block scopes are not tracked, so if two
     # declarations of the name disagree the answer is unknown, not a guess.
     var found: i32 = 0
-    var t: i32 = NARROW_UNKNOWN
+    var t: TypeKind = TypeKind.NarrowUnknown
     var i: i32 = s.narrow_decl_count - 1
     while i >= 0
         let d: *NarrowDecl = @s.narrow_decls[i]
@@ -278,7 +276,7 @@ fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> i32
                 found = 1
                 t = d.decl_type
             else if d.decl_type != t
-                return NARROW_UNKNOWN
+                return TypeKind.NarrowUnknown
         i = i - 1
     if found == 1
         return t
@@ -290,19 +288,19 @@ fn narrow_env_name_type(env: *NarrowEnv, name_sv: StrView) -> i32
     let g: *GlobalVarDef = find_global(s, StrView { ptr: (name), len: (len) as i64 })
     if g != null
         return narrow_global_type(g)
-    NARROW_UNKNOWN
+    TypeKind.NarrowUnknown
 
 # The emitter's view keeps its narrower-than-64-bit rule for a global (its
 # codegen readers, sizeof and a match scrutinee, never needed more).
-fn narrow_global_type(g: *GlobalVarDef) -> i32
+fn narrow_global_type(g: *GlobalVarDef) -> TypeKind
     let gw: i32 = ty_bits(g.var_type)
     if gw > 1 and gw < 64
         return g.var_type
-    NARROW_UNKNOWN
+    TypeKind.NarrowUnknown
 
 # A name's and a `local.field`'s written type from Sema's scope, for
 # enum_as_int's targets (AGAST #3511).
-pub fn narrow_sema_name_type(sm: *Sema, name_sv: StrView) -> i32
+pub fn narrow_sema_name_type(sm: *Sema, name_sv: StrView) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var env: NarrowEnv
@@ -310,53 +308,53 @@ pub fn narrow_sema_name_type(sm: *Sema, name_sv: StrView) -> i32
     env.sm = sm
     narrow_env_name_type(@env, StrView { ptr: (name), len: (len) as i64 })
 
-pub fn narrow_sema_member_type(sm: *Sema, e: *Expr) -> i32
+pub fn narrow_sema_member_type(sm: *Sema, e: *Expr) -> TypeKind
     var env: NarrowEnv
     env.s = null
     env.sm = sm
     narrow_env_member_type(@env, e)
 
 # Ritz type of `local.field` / `ptr.field`; field types are always written.
-fn narrow_env_member_type(env: *NarrowEnv, e: *Expr) -> i32
-    if e.left == null or e.left.kind != EXPR_IDENT
-        return NARROW_UNKNOWN
+fn narrow_env_member_type(env: *NarrowEnv, e: *Expr) -> TypeKind
+    if e.left == null or e.left.kind != ExprKind.Ident
+        return TypeKind.NarrowUnknown
     var tn: *u8 = null
     var tl: i32 = 0
     if env.s != null
         let local: *LocalVar = find_local_struct_name(env.s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
         if local == null
-            return NARROW_UNKNOWN
+            return TypeKind.NarrowUnknown
         tn = lv_type_name(local)
         tl = lv_type_name_len(local)
     else
         let v: *SemaVar = sema_find_local(env.sm, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
         if v == null
-            return NARROW_UNKNOWN
+            return TypeKind.NarrowUnknown
         tn = v.type_name
         tl = v.type_name_len
     if tl == 0
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     var st: *StructDef = null
     if env.s != null
         st = find_struct(env.s, StrView { ptr: (tn), len: (tl) as i64 })
     else
         st = sema_find_struct(env.sm, StrView { ptr: (tn), len: (tl) as i64 })
     if st == null
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if idx < 0
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     let field: *StructField = get_field_type(st, idx)
     narrow_known(field.field_type)
 
-fn narrow_call_type(env: *NarrowEnv, e: *Expr) -> i32
+fn narrow_call_type(env: *NarrowEnv, e: *Expr) -> TypeKind
     var fn_def: *FnDef = null
     if env.s != null
         fn_def = find_call_fn(env.s, e)
     else
         fn_def = narrow_sema_call_fn(env.sm, e)
     if fn_def == null
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     narrow_known(fn_def.return_type)
 
 # The callee find_call_fn resolves, from Sema's scope: a typed fn-pointer
@@ -368,71 +366,75 @@ pub fn narrow_sema_call_fn(sm: *Sema, e: *Expr) -> *FnDef
         return null
     if e.call_type_suffix_len <= 0
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
-        if v != null and v.fn_sig != null and v.kind != TYPE_ARRAY
+        if v != null and v.fn_sig != null and v.kind != TypeKind.Array
             return v.fn_sig
     sema_call_fn(sm, e)
 
 # AGAST #1688: what Sema knows of `p[i]`, `*p`, `x.m()` and `e?`, the
 # element, pointee, return or payload type, read only through Sema's view.
-fn narrow_sema_place_type(sm: *Sema, e: *Expr) -> i32
-    let k: i32 = e.kind
-    if k == EXPR_INDEX
-        if e.right == null or e.right.kind == EXPR_RANGE
-            return NARROW_UNKNOWN
-        var kind: i32 = TYPE_VOID
-        var pointee: i32 = TYPE_VOID
-        sema_index_slot(sm, e, @kind, @pointee)
-        return narrow_known(kind)
-    if k == EXPR_UNARY
-        var t: SemaTy
-        let pk: i32 = sema_expr_ty(sm, e.operand, @t)
-        if pk == TYPE_PTR or pk == TYPE_REF or pk == TYPE_MUT_REF
-            return narrow_known(t.pointee)
-        return NARROW_UNKNOWN
-    if k == EXPR_METHOD
-        # `.unwrap()` / `.unwrap_or(d)` is the carrier's intrinsic, no FnDef.
-        if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap"), len: (6) as i64 }) == 1 or name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap_or"), len: (9) as i64 }) == 1
+fn narrow_sema_place_type(sm: *Sema, e: *Expr) -> TypeKind
+    let k: ExprKind = e.kind
+    match k
+        ExprKind.Index =>
+            if e.right == null or e.right.kind == ExprKind.Range
+                return TypeKind.NarrowUnknown
+            var kind: TypeKind = TypeKind.Void
+            var pointee: TypeKind = TypeKind.Void
+            sema_index_slot(sm, e, @kind, @pointee)
+            return narrow_known(kind)
+        ExprKind.Unary =>
+            var t: SemaTy
+            let pk: TypeKind = sema_expr_ty(sm, e.operand, @t)
+            if pk == TypeKind.Ptr or pk == TypeKind.Ref or pk == TypeKind.MutRef
+                return narrow_known(t.pointee)
+            return TypeKind.NarrowUnknown
+        ExprKind.Method =>
+            # `.unwrap()` / `.unwrap_or(d)` is the carrier's intrinsic, no FnDef.
+            if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap"), len: (6) as i64 }) == 1 or name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap_or"), len: (9) as i64 }) == 1
+                return narrow_sema_payload_of(sm, e.left)
+            let fd: *FnDef = sbk_method_def(sm, e)
+            if fd == null
+                return TypeKind.NarrowUnknown
+            return narrow_known(fd.return_type)
+        ExprKind.Try =>
             return narrow_sema_payload_of(sm, e.left)
-        let fd: *FnDef = sbk_method_def(sm, e)
-        if fd == null
-            return NARROW_UNKNOWN
-        return narrow_known(fd.return_type)
-    if k == EXPR_TRY
-        return narrow_sema_payload_of(sm, e.left)
-    NARROW_UNKNOWN
+        _ => pass
+    TypeKind.NarrowUnknown
 
 # The Ok / Some payload's integer type of an Option / Result `carrier`.
-fn narrow_sema_payload_of(sm: *Sema, carrier: *Expr) -> i32
+fn narrow_sema_payload_of(sm: *Sema, carrier: *Expr) -> TypeKind
     var name: *u8 = null
     var len: i32 = 0
     sbk_receiver(sm, carrier, @name, @len)
     if name == null or len <= 0 or is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
-        return NARROW_UNKNOWN
+        return TypeKind.NarrowUnknown
     narrow_known(tagged_enum_int_type_in(@sm.struct_map, sm.module, StrView { ptr: (name), len: (len) as i64 }, 0))
 
 # The type ritz0 would give an arithmetic result: the wider operand, with a
 # bare literal adopting the other side (#1396).  Two literals stay i64 in
 # ritz0 (#1445), so `2 << 8` is an i64 that the constant rule must clear.
-fn narrow_join(a: i32, b: i32) -> i32
-    if a == NARROW_UNKNOWN or b == NARROW_UNKNOWN
-        return NARROW_UNKNOWN
-    if a == NARROW_LIT and b == NARROW_LIT
-        return TYPE_I64
-    if a == NARROW_LIT
+fn narrow_join(a: TypeKind, b: TypeKind) -> TypeKind
+    if a == TypeKind.NarrowUnknown or b == TypeKind.NarrowUnknown
+        return TypeKind.NarrowUnknown
+    if a == TypeKind.NarrowLit and b == TypeKind.NarrowLit
+        return TypeKind.I64
+    if a == TypeKind.NarrowLit
         return b
-    if b == NARROW_LIT
+    if b == TypeKind.NarrowLit
         return a
-    if a == TYPE_BOOL or b == TYPE_BOOL
-        return NARROW_UNKNOWN
+    if a == TypeKind.Bool or b == TypeKind.Bool
+        return TypeKind.NarrowUnknown
     if ty_bits(b) > ty_bits(a)
         return b
     a
 
-pub fn narrow_is_arith_op(op: i32) -> i32
-    if op == OP_ADD or op == OP_SUB or op == OP_MUL or op == OP_DIV or op == OP_MOD
-        return 1
-    if op == OP_BIT_AND or op == OP_BIT_OR or op == OP_BIT_XOR or op == OP_SHL or op == OP_SHR
-        return 1
+pub fn narrow_is_arith_op(op: OpKind) -> i32
+    match op
+        OpKind.Add | OpKind.Sub | OpKind.Mul | OpKind.Div | OpKind.Mod =>
+            return 1
+        OpKind.BitAnd | OpKind.BitOr | OpKind.BitXor | OpKind.Shl | OpKind.Shr =>
+            return 1
+        _ => pass
     0
 
 # The operators congruent mod 2**width (LARB R73, AGAST #4219): a value path
@@ -443,11 +445,13 @@ pub fn narrow_is_arith_op(op: i32) -> i32
 # congruent too, and arrive here as the plain op codes with Expr.wrapping set
 # (LARB R63, AGAST #3486), so they take these rows unchanged; ritz0 excludes
 # them for the same reason.
-fn narrow_is_congruent_op(op: i32) -> i32
-    if op == OP_ADD or op == OP_SUB or op == OP_MUL
-        return 1
-    if op == OP_BIT_AND or op == OP_BIT_OR or op == OP_BIT_XOR or op == OP_SHL
-        return 1
+fn narrow_is_congruent_op(op: OpKind) -> i32
+    match op
+        OpKind.Add | OpKind.Sub | OpKind.Mul =>
+            return 1
+        OpKind.BitAnd | OpKind.BitOr | OpKind.BitXor | OpKind.Shl =>
+            return 1
+        _ => pass
     0
 
 # 1 when operand `e` is an integer literal (`-` and all) and `other` isn't, so
@@ -461,17 +465,17 @@ fn narrow_is_int_lit(e: *Expr) -> i32
     if e == null
         return 0
     var lit: *Expr = e
-    if e.kind == EXPR_UNARY and e.op == OP_NEG and e.operand != null
+    if e.kind == ExprKind.Unary and e.op == OpKind.Neg and e.operand != null
         lit = e.operand
-    (lit.kind == EXPR_INT_LIT and lit.lit_kind == LIT_PLAIN) as i32
+    (lit.kind == ExprKind.IntLit and lit.lit_kind == LIT_PLAIN) as i32
 
 # AGAST #4082: operand `e` of an arithmetic operator, typed `t`, beside
 # `other`, typed `ot`.  An all-literal `e` (`0 - 1`, `~63`, `1 << 26`) is one
 # literal of its i64 value (narrow_fold_lit), so under R21 it is `other`'s
-# type when that value fits it: NARROW_LIT.  A value that doesn't fit stays
+# type when that value fits it: TypeKind.NarrowLit.  A value that doesn't fit stays
 # the i64 it was, as in ritz0 (`_literal_operand_value`).  `arm_i64` says a
 # shift's left literal in an `if` arm is an i64, as `1 << n` is there.
-fn narrow_folded_side(e: *Expr, other: *Expr, t: i32, ot: i32, arm_i64: i32) -> i32
+fn narrow_folded_side(e: *Expr, other: *Expr, t: TypeKind, ot: TypeKind, arm_i64: i32) -> TypeKind
     var v: i64 = 0
     if narrow_fold_lit(e, @v) == 0
         return t
@@ -479,10 +483,10 @@ fn narrow_folded_side(e: *Expr, other: *Expr, t: i32, ot: i32, arm_i64: i32) -> 
     if narrow_is_int_lit(other) == 1 or narrow_fold_lit(other, @ov) == 1
         return t        # both literal: the operator itself folds
     if arm_i64 == 1
-        return TYPE_I64
+        return TypeKind.I64
     if ty_is_int(ot) == 1 and ty_bits(ot) < 64 and narrow_fits(v, ot) == 0
-        return TYPE_I64
-    NARROW_LIT
+        return TypeKind.I64
+    TypeKind.NarrowLit
 
 # ritz0's fold_literal_i64 (AGAST #4082): the i64 value of an operator over
 # untyped integer literals only, into *out; 1 if it folds.  A bare literal
@@ -493,7 +497,7 @@ fn narrow_folded_side(e: *Expr, other: *Expr, t: i32, ot: i32, arm_i64: i32) -> 
 pub fn narrow_fold_lit(e: *Expr, out: *i64) -> i32
     if e == null or narrow_is_int_lit(e) == 1
         return 0
-    if e.kind != EXPR_BINARY and e.kind != EXPR_UNARY
+    if e.kind != ExprKind.Binary and e.kind != ExprKind.Unary
         return 0
     narrow_fold_lit_in(e, out)
 
@@ -501,76 +505,79 @@ fn narrow_fold_lit_in(e: *Expr, out: *i64) -> i32
     if e == null
         return 0
     let min: i64 = 0 - I64_MAX - 1
-    if e.kind == EXPR_INT_LIT
+    if e.kind == ExprKind.IntLit
         # A negative int_val is a literal only a u64 holds (int_operand_shape).
         if e.lit_kind != LIT_PLAIN or e.int_val < 0
             return 0
         *out = e.int_val
         return 1
     var l: i64 = 0
-    if e.kind == EXPR_UNARY
-        if e.op != OP_NEG and e.op != OP_BIT_NOT
+    if e.kind == ExprKind.Unary
+        if e.op != OpKind.Neg and e.op != OpKind.BitNot
             return 0
         if narrow_fold_lit_in(e.operand, @l) == 0
             return 0
-        if e.op == OP_BIT_NOT
+        if e.op == OpKind.BitNot
             *out = (0 - 1) - l
             return 1
         if l == min
             return 0
         *out = 0 - l
         return 1
-    if e.kind != EXPR_BINARY or narrow_is_arith_op(e.op) == 0
+    if e.kind != ExprKind.Binary or narrow_is_arith_op(e.op) == 0
         return 0
     var r: i64 = 0
     if narrow_fold_lit_in(e.left, @l) == 0 or narrow_fold_lit_in(e.right, @r) == 0
         return 0
-    let op: i32 = e.op
-    if op == OP_SHL or op == OP_SHR
-        if r < 0 or r >= 64
-            return 0
-        if op == OP_SHR
-            *out = l >> r
+    let op: OpKind = e.op
+    match op
+        OpKind.Shl | OpKind.Shr =>
+            if r < 0 or r >= 64
+                return 0
+            if op == OpKind.Shr
+                *out = l >> r
+                return 1
+            if l >= 0 and l > (I64_MAX >> r)
+                return 0
+            if l < 0 and l < (min >> r)
+                return 0
+            *out = l << r
             return 1
-        if l >= 0 and l > (I64_MAX >> r)
-            return 0
-        if l < 0 and l < (min >> r)
-            return 0
-        *out = l << r
-        return 1
-    if op == OP_DIV or op == OP_MOD
-        if r == 0 or (l == min and r == 0 - 1)
-            return 0
-        if op == OP_DIV
-            *out = l / r
-        else
-            *out = l % r
-        return 1
-    if op == OP_ADD
-        if narrow_add_ok(l, r) == 0
-            return 0
-        *out = l + r
-        return 1
-    if op == OP_SUB
-        if narrow_sub_ok(l, r) == 0
-            return 0
-        *out = l - r
-        return 1
-    if op == OP_MUL
-        if narrow_mul_ok(l, r) == 0
-            return 0
-        *out = l * r
-        return 1
-    if op == OP_BIT_AND
-        *out = l & r
-    else if op == OP_BIT_OR
-        *out = l | r
-    else
-        *out = l ^ r
+        OpKind.Div | OpKind.Mod =>
+            if r == 0 or (l == min and r == 0 - 1)
+                return 0
+            if op == OpKind.Div
+                *out = l / r
+            else
+                *out = l % r
+            return 1
+        OpKind.Add =>
+            if narrow_add_ok(l, r) == 0
+                return 0
+            *out = l + r
+            return 1
+        OpKind.Sub =>
+            if narrow_sub_ok(l, r) == 0
+                return 0
+            *out = l - r
+            return 1
+        OpKind.Mul =>
+            if narrow_mul_ok(l, r) == 0
+                return 0
+            *out = l * r
+            return 1
+        _ => pass
+    match op
+        OpKind.BitAnd =>
+            *out = l & r
+        OpKind.BitOr =>
+            *out = l | r
+        _ =>
+            *out = l ^ r
     1
 
-# Ritz type of an initialiser, NARROW_LIT, or NARROW_UNKNOWN (see header).
-pub fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
+# Ritz type of an initialiser, TypeKind.NarrowLit, or TypeKind.NarrowUnknown (see header).
+pub fn narrow_src_type(s: *EmitterState, e: *Expr) -> TypeKind
     var env: NarrowEnv
     env.s = s
     env.sm = null
@@ -589,123 +596,129 @@ pub fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
 # operand and its literal arms are i64 again.
 const NARROW_SLOT: i32 = 2
 
-fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
+fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> TypeKind
     if e == null
-        return NARROW_UNKNOWN
-    let k: i32 = e.kind
+        return TypeKind.NarrowUnknown
+    let k: ExprKind = e.kind
     # What an operator's operand reads: never a slot tail.
     let op_lit: i32 = (lit_i64 == 1) as i32
-    if k == EXPR_INT_LIT
-        if lit_i64 == 1
-            return TYPE_I64
-        return NARROW_LIT
-    if k == EXPR_CHAR_LIT
-        return TYPE_U8
-    if k == EXPR_IDENT
-        return narrow_env_name_type(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    if k == EXPR_CALL
-        return narrow_call_type(env, e)
-    if k == EXPR_CAST
-        return narrow_known(e.op)
-    if k == EXPR_MEMBER
-        let mt: i32 = narrow_env_member_type(env, e)
-        if mt == NARROW_UNKNOWN and env.sm != null
-            # `a.b.c`: Sema types the chain; a field's type is always written.
-            return narrow_known(sema_expr_type(env.sm, e))
-        return mt
-    if env.sm != null and (k == EXPR_INDEX or k == EXPR_METHOD or k == EXPR_TRY)
+    match k
+        ExprKind.IntLit =>
+            if lit_i64 == 1
+                return TypeKind.I64
+            return TypeKind.NarrowLit
+        ExprKind.CharLit =>
+            return TypeKind.U8
+        ExprKind.Ident =>
+            return narrow_env_name_type(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        ExprKind.Call =>
+            return narrow_call_type(env, e)
+        ExprKind.Cast =>
+            return narrow_known(e.type_kind)
+        ExprKind.Member =>
+            let mt: TypeKind = narrow_env_member_type(env, e)
+            if mt == TypeKind.NarrowUnknown and env.sm != null
+                # `a.b.c`: Sema types the chain; a field's type is always written.
+                return narrow_known(sema_expr_type(env.sm, e))
+            return mt
+        _ => pass
+    if env.sm != null and (k == ExprKind.Index or k == ExprKind.Method or k == ExprKind.Try)
         return narrow_sema_place_type(env.sm, e)
-    if env.sm != null and k == EXPR_UNARY and e.op == OP_DEREF
+    if env.sm != null and k == ExprKind.Unary and e.op == OpKind.Deref
         return narrow_sema_place_type(env.sm, e)
-    if k == EXPR_BINARY
-        if e.op >= OP_EQ and e.op <= OP_OR
-            return TYPE_BOOL
-        if e.op == OP_SHR
-            # AGAST #2360: ritz0's slot typing stops at `>>`, so a literal
-            # inside either operand is an i64 there, and so is a literal left
-            # operand: `(a << 4) >> 4` and `64 >> a` are i64 even below a u8
-            # slot.  Only a bare literal count still adopts the left side.
-            let lt: i32 = narrow_src_type_in(env, e.left, 1)
-            if e.right != null and e.right.kind == EXPR_INT_LIT
-                return narrow_join(lt, NARROW_LIT)
-            let ct: i32 = narrow_src_type_in(env, e.right, 1)
-            return narrow_join(lt, narrow_folded_side(e.right, e.left, ct, lt, 0))
-        if narrow_is_arith_op(e.op) == 1
-            # LARB R21 (AGAST #3112): a literal operand is the other operand's
-            # type, in an `if` arm or under `>>` too: `(a << 4) >> 4` is a's.
-            # A shift's left literal is not (`1 << n`), as before.
-            # AGAST #4219 (LARB R73): a congruent operator is itself consumed
-            # at the slot's width, so it passes the slot marker on to its
-            # operands; an if / match below it is then a tail of the slot and
-            # its literal arms take the slot's type.  `/`, `%` and the rest
-            # keep demoting (`op_lit`), as before.
-            var operand_lit: i32 = op_lit
-            if narrow_is_congruent_op(e.op) == 1
-                operand_lit = lit_i64
-            var lt: i32 = NARROW_LIT
-            if e.op == OP_SHL or narrow_operand_lit(e.left, e.right) == 0
-                lt = narrow_src_type_in(env, e.left, operand_lit)
-            var rt: i32 = NARROW_LIT
-            # A shift's count is an amount, not a value at the slot's width.
-            var right_lit: i32 = operand_lit
-            if e.op == OP_SHL
-                right_lit = op_lit
-            if narrow_operand_lit(e.right, e.left) == 0
-                rt = narrow_src_type_in(env, e.right, right_lit)
-            # AGAST #4082: an all-literal operand is one literal, R21 and all.
-            var shl_arm: i32 = 0
-            if e.op == OP_SHL and op_lit == 1
-                shl_arm = 1     # `1 << n` in an arm is an i64: so is `(1 << 2) << n`
-            let lf: i32 = narrow_folded_side(e.left, e.right, lt, rt, shl_arm)
-            let rf: i32 = narrow_folded_side(e.right, e.left, rt, lt, 0)
-            return narrow_join(lf, rf)
-        return NARROW_UNKNOWN
-    if k == EXPR_UNARY
-        if e.op == OP_NOT
-            return TYPE_BOOL
-        if e.op == OP_NEG or e.op == OP_BIT_NOT
-            return narrow_src_type_in(env, e.operand, op_lit)
-        return NARROW_UNKNOWN
-    if k == EXPR_IF
-        # AGAST #1613: the wider of the two arms, literals counting as i64,
-        # or as the slot's type in a slot's tail (#1445, NARROW_SLOT).
-        let then_arm: *MatchArm = e.args as *MatchArm
-        let else_arm: *MatchArm = then_arm.next
-        if then_arm.is_pass != 0 or then_arm.body == null
-            return NARROW_UNKNOWN
-        if else_arm.is_pass != 0 or else_arm.body == null
-            return NARROW_UNKNOWN
-        var arm_lit: i32 = 1
-        if lit_i64 == NARROW_SLOT
-            arm_lit = NARROW_SLOT
-        return narrow_join(narrow_src_type_in(env, then_arm.body, arm_lit), narrow_src_type_in(env, else_arm.body, arm_lit))
-    if k == EXPR_MATCH
-        # Measured against ritz0, not assumed: a literal arm takes the type
-        # of the non-literal arms (`match o: A => x_i32, B => 0` is i32), and
-        # a match whose arms are ALL literals is i64.  (An `if`'s literal arms
-        # are i64 outside a slot's tail; see EXPR_IF above and lit_i64.)
-        var t: i32 = NARROW_LIT
-        var arm: *MatchArm = e.args as *MatchArm
-        if arm == null
-            return NARROW_UNKNOWN
-        while arm != null
-            if arm.is_pass != 0 or arm.body == null
-                return NARROW_UNKNOWN
-            let at: i32 = narrow_src_type_in(env, arm.body, lit_i64)
-            if at == NARROW_UNKNOWN
-                return NARROW_UNKNOWN
-            if at != NARROW_LIT
-                if t == NARROW_LIT
-                    t = at
-                else
-                    t = narrow_join(t, at)
-                if t == NARROW_UNKNOWN
-                    return NARROW_UNKNOWN
-            arm = arm.next
-        if t == NARROW_LIT
-            return TYPE_I64
-        return t
-    NARROW_UNKNOWN
+    match k
+        ExprKind.Binary =>
+            if op_is_cmp_or_logic(e.op)
+                return TypeKind.Bool
+            if e.op == OpKind.Shr
+                # AGAST #2360: ritz0's slot typing stops at `>>`, so a literal
+                # inside either operand is an i64 there, and so is a literal left
+                # operand: `(a << 4) >> 4` and `64 >> a` are i64 even below a u8
+                # slot.  Only a bare literal count still adopts the left side.
+                let lt: TypeKind = narrow_src_type_in(env, e.left, 1)
+                if e.right != null and e.right.kind == ExprKind.IntLit
+                    return narrow_join(lt, TypeKind.NarrowLit)
+                let ct: TypeKind = narrow_src_type_in(env, e.right, 1)
+                return narrow_join(lt, narrow_folded_side(e.right, e.left, ct, lt, 0))
+            if narrow_is_arith_op(e.op) == 1
+                # LARB R21 (AGAST #3112): a literal operand is the other operand's
+                # type, in an `if` arm or under `>>` too: `(a << 4) >> 4` is a's.
+                # A shift's left literal is not (`1 << n`), as before.
+                # AGAST #4219 (LARB R73): a congruent operator is itself consumed
+                # at the slot's width, so it passes the slot marker on to its
+                # operands; an if / match below it is then a tail of the slot and
+                # its literal arms take the slot's type.  `/`, `%` and the rest
+                # keep demoting (`op_lit`), as before.
+                var operand_lit: i32 = op_lit
+                if narrow_is_congruent_op(e.op) == 1
+                    operand_lit = lit_i64
+                var lt: TypeKind = TypeKind.NarrowLit
+                if e.op == OpKind.Shl or narrow_operand_lit(e.left, e.right) == 0
+                    lt = narrow_src_type_in(env, e.left, operand_lit)
+                var rt: TypeKind = TypeKind.NarrowLit
+                # A shift's count is an amount, not a value at the slot's width.
+                var right_lit: i32 = operand_lit
+                if e.op == OpKind.Shl
+                    right_lit = op_lit
+                if narrow_operand_lit(e.right, e.left) == 0
+                    rt = narrow_src_type_in(env, e.right, right_lit)
+                # AGAST #4082: an all-literal operand is one literal, R21 and all.
+                var shl_arm: i32 = 0
+                if e.op == OpKind.Shl and op_lit == 1
+                    shl_arm = 1     # `1 << n` in an arm is an i64: so is `(1 << 2) << n`
+                let lf: TypeKind = narrow_folded_side(e.left, e.right, lt, rt, shl_arm)
+                let rf: TypeKind = narrow_folded_side(e.right, e.left, rt, lt, 0)
+                return narrow_join(lf, rf)
+            return TypeKind.NarrowUnknown
+        ExprKind.Unary =>
+            match e.op
+                OpKind.Not =>
+                    return TypeKind.Bool
+                OpKind.Neg | OpKind.BitNot =>
+                    return narrow_src_type_in(env, e.operand, op_lit)
+                _ => pass
+            return TypeKind.NarrowUnknown
+        ExprKind.If =>
+            # AGAST #1613: the wider of the two arms, literals counting as i64,
+            # or as the slot's type in a slot's tail (#1445, NARROW_SLOT).
+            let then_arm: *MatchArm = e.args as *MatchArm
+            let else_arm: *MatchArm = then_arm.next
+            if then_arm.is_pass != 0 or then_arm.body == null
+                return TypeKind.NarrowUnknown
+            if else_arm.is_pass != 0 or else_arm.body == null
+                return TypeKind.NarrowUnknown
+            var arm_lit: i32 = 1
+            if lit_i64 == NARROW_SLOT
+                arm_lit = NARROW_SLOT
+            return narrow_join(narrow_src_type_in(env, then_arm.body, arm_lit), narrow_src_type_in(env, else_arm.body, arm_lit))
+        ExprKind.Match =>
+            # Measured against ritz0, not assumed: a literal arm takes the type
+            # of the non-literal arms (`match o: A => x_i32, B => 0` is i32), and
+            # a match whose arms are ALL literals is i64.  (An `if`'s literal arms
+            # are i64 outside a slot's tail; see ExprKind.If above and lit_i64.)
+            var t: TypeKind = TypeKind.NarrowLit
+            var arm: *MatchArm = e.args as *MatchArm
+            if arm == null
+                return TypeKind.NarrowUnknown
+            while arm != null
+                if arm.is_pass != 0 or arm.body == null
+                    return TypeKind.NarrowUnknown
+                let at: TypeKind = narrow_src_type_in(env, arm.body, lit_i64)
+                if at == TypeKind.NarrowUnknown
+                    return TypeKind.NarrowUnknown
+                if at != TypeKind.NarrowLit
+                    if t == TypeKind.NarrowLit
+                        t = at
+                    else
+                        t = narrow_join(t, at)
+                    if t == TypeKind.NarrowUnknown
+                        return TypeKind.NarrowUnknown
+                arm = arm.next
+            if t == TypeKind.NarrowLit
+                return TypeKind.I64
+            return t
+        _ => pass
+    TypeKind.NarrowUnknown
 
 # =============================================================================
 # Constant folding -- port of ritz0's _const_int_value
@@ -750,34 +763,36 @@ fn narrow_mul_ok(a: i64, b: i64) -> i32
 fn narrow_const_value(env: *NarrowEnv, e: *Expr, whole: i32, out: *i64) -> i32
     if e == null
         return 0
-    if e.kind == EXPR_INT_LIT
-        *out = e.int_val
-        return 1
-    if e.kind == EXPR_IDENT
-        let ce: *ConstEntry = narrow_env_const(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-        if ce == null or ce.fold_state != CONST_FOLD_DONE
-            return 0
-        let w: i32 = ty_bits(ce.const_type)
-        if w < 8
-            return 0
-        if w < 64 and whole == 0
-            return 0
-        *out = ce.value
-        return 1
-    if e.kind == EXPR_UNARY
-        var v: i64 = 0
-        if e.op != OP_NEG and e.op != OP_BIT_NOT
-            return 0
-        if narrow_const_value(env, e.operand, 0, @v) == 0
-            return 0
-        if e.op == OP_NEG
-            if v == 0 - I64_MAX - 1
+    match e.kind
+        ExprKind.IntLit =>
+            *out = e.int_val
+            return 1
+        ExprKind.Ident =>
+            let ce: *ConstEntry = narrow_env_const(env, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if ce == null or ce.fold_state != CONST_FOLD_DONE
                 return 0
-            *out = 0 - v
-        else
-            *out = (0 - 1) - v    # ~v
-        return 1
-    if e.kind != EXPR_BINARY
+            let w: i32 = ty_bits(ce.const_type)
+            if w < 8
+                return 0
+            if w < 64 and whole == 0
+                return 0
+            *out = ce.value
+            return 1
+        ExprKind.Unary =>
+            var v: i64 = 0
+            if e.op != OpKind.Neg and e.op != OpKind.BitNot
+                return 0
+            if narrow_const_value(env, e.operand, 0, @v) == 0
+                return 0
+            if e.op == OpKind.Neg
+                if v == 0 - I64_MAX - 1
+                    return 0
+                *out = 0 - v
+            else
+                *out = (0 - 1) - v    # ~v
+            return 1
+        _ => pass
+    if e.kind != ExprKind.Binary
         return 0
     var l: i64 = 0
     var r: i64 = 0
@@ -785,58 +800,60 @@ fn narrow_const_value(env: *NarrowEnv, e: *Expr, whole: i32, out: *i64) -> i32
         return 0
     if narrow_const_value(env, e.right, 0, @r) == 0
         return 0
-    let op: i32 = e.op
-    if op == OP_SHL
-        # A shift of 64 or more is poison in LLVM, not 0.
-        if r < 0 or r >= 64
-            return 0
-        if l >= 0 and l > (I64_MAX >> r)
-            return 0
-        if l < 0 and l < ((0 - I64_MAX - 1) >> r)
-            return 0
-        *out = l << r
-        return 1
-    if op == OP_SHR or op == OP_DIV or op == OP_MOD
-        # Signed and unsigned forms (ashr/lshr, sdiv/udiv) agree only for
-        # non-negative operands; see ritz0's comment on `(1 << 62) * 4 >> 60`.
-        if l < 0 or r < 0
-            return 0
-        if op == OP_SHR
-            if r >= 64
+    let op: OpKind = e.op
+    match op
+        OpKind.Shl =>
+            # A shift of 64 or more is poison in LLVM, not 0.
+            if r < 0 or r >= 64
                 return 0
-            *out = l >> r
+            if l >= 0 and l > (I64_MAX >> r)
+                return 0
+            if l < 0 and l < ((0 - I64_MAX - 1) >> r)
+                return 0
+            *out = l << r
             return 1
-        if r == 0
-            return 0
-        if op == OP_DIV
-            *out = l / r
-        else
-            *out = l % r
-        return 1
-    if op == OP_ADD
-        if narrow_add_ok(l, r) == 0
-            return 0
-        *out = l + r
-        return 1
-    if op == OP_SUB
-        if narrow_sub_ok(l, r) == 0
-            return 0
-        *out = l - r
-        return 1
-    if op == OP_MUL
-        if narrow_mul_ok(l, r) == 0
-            return 0
-        *out = l * r
-        return 1
-    if op == OP_BIT_AND
-        *out = l & r
-        return 1
-    if op == OP_BIT_OR
-        *out = l | r
-        return 1
-    if op == OP_BIT_XOR
-        *out = l ^ r
-        return 1
+        OpKind.Shr | OpKind.Div | OpKind.Mod =>
+            # Signed and unsigned forms (ashr/lshr, sdiv/udiv) agree only for
+            # non-negative operands; see ritz0's comment on `(1 << 62) * 4 >> 60`.
+            if l < 0 or r < 0
+                return 0
+            if op == OpKind.Shr
+                if r >= 64
+                    return 0
+                *out = l >> r
+                return 1
+            if r == 0
+                return 0
+            if op == OpKind.Div
+                *out = l / r
+            else
+                *out = l % r
+            return 1
+        OpKind.Add =>
+            if narrow_add_ok(l, r) == 0
+                return 0
+            *out = l + r
+            return 1
+        OpKind.Sub =>
+            if narrow_sub_ok(l, r) == 0
+                return 0
+            *out = l - r
+            return 1
+        OpKind.Mul =>
+            if narrow_mul_ok(l, r) == 0
+                return 0
+            *out = l * r
+            return 1
+        OpKind.BitAnd =>
+            *out = l & r
+            return 1
+        OpKind.BitOr =>
+            *out = l | r
+            return 1
+        OpKind.BitXor =>
+            *out = l ^ r
+            return 1
+        _ => pass
     0
 
 # [*lo, *hi] bounding every value of e; 1 if proven.  Port of ritz0's
@@ -851,7 +868,7 @@ fn narrow_provable_range(env: *NarrowEnv, e: *Expr, whole: i32, lo: *i64, hi: *i
         return 1
     if e == null
         return 0
-    if e.kind == EXPR_BINARY and e.op == OP_BIT_AND
+    if e.kind == ExprKind.Binary and e.op == OpKind.BitAnd
         var found: i32 = 0
         var best: i64 = 0
         var k: i64 = 0
@@ -868,7 +885,7 @@ fn narrow_provable_range(env: *NarrowEnv, e: *Expr, whole: i32, lo: *i64, hi: *i
         *hi = best
         return 1
     # An if expression (#1613) is the union of its two arms, as in ritz0.
-    if e.kind == EXPR_MATCH or e.kind == EXPR_IF
+    if e.kind == ExprKind.Match or e.kind == ExprKind.If
         var arm: *MatchArm = e.args as *MatchArm
         if arm == null
             return 0
@@ -889,7 +906,7 @@ fn narrow_provable_range(env: *NarrowEnv, e: *Expr, whole: i32, lo: *i64, hi: *i
         return 1
     0
 
-pub fn narrow_fits(v: i64, t: i32) -> i32
+pub fn narrow_fits(v: i64, t: TypeKind) -> i32
     let w: i32 = ty_bits(t)
     if ty_is_unsigned(t) == 1
         return (v >= 0 and v <= ((1 as i64) << w) - 1) as i32
@@ -897,24 +914,24 @@ pub fn narrow_fits(v: i64, t: i32) -> i32
     (v >= 0 - half and v <= half - 1) as i32
 
 # The integer kind of `bits` bits, unsigned when `uns` is 1; 0 for no such kind.
-pub fn int_kind_of(bits: i32, uns: i32) -> i32
-    var k: i32 = 0
+pub fn int_kind_of(bits: i32, uns: i32) -> TypeKind
+    var k: TypeKind = TypeKind.Void
     if bits == 8
-        k = TYPE_I8
+        k = TypeKind.I8
         if uns == 1
-            k = TYPE_U8
+            k = TypeKind.U8
     else if bits == 16
-        k = TYPE_I16
+        k = TypeKind.I16
         if uns == 1
-            k = TYPE_U16
+            k = TypeKind.U16
     else if bits == 32
-        k = TYPE_I32
+        k = TypeKind.I32
         if uns == 1
-            k = TYPE_U32
+            k = TypeKind.U32
     else if bits == 64
-        k = TYPE_I64
+        k = TypeKind.I64
         if uns == 1
-            k = TYPE_U64
+            k = TypeKind.U64
     k
 
 # AGAST #4080 (LANGUAGE_SPEC §6.3): the integer type of `for x in a..b`'s x,
@@ -925,32 +942,32 @@ pub fn int_kind_of(bits: i32, uns: i32) -> i32
 # Otherwise the wider bound's width, unsigned when a bound is: any unsigned
 # bound below 64 bits, a u64 at 64 (#1636 / #3328).  0 when a bound's type is
 # untold.
-pub fn for_range_type(ts: i32, lit_s: i32, sv: i64, te: i32, lit_e: i32, ev: i64) -> i32
+pub fn for_range_type(ts: TypeKind, lit_s: i32, sv: i64, te: TypeKind, lit_e: i32, ev: i64) -> TypeKind
     if lit_s == 1 and lit_e == 1
-        return TYPE_I64
+        return TypeKind.I64
     if lit_s == 1 or lit_e == 1
-        var o: i32 = te
+        var o: TypeKind = te
         var v: i64 = sv
         if lit_e == 1
             o = ts
             v = ev
         let ob: i32 = ty_int_bits(o)
         if ob == 0
-            return 0
+            return TypeKind.Void
         if ob == 64 or narrow_fits(v, o) == 1
             return o
-        return TYPE_I64
+        return TypeKind.I64
     let sb: i32 = ty_int_bits(ts)
     let eb: i32 = ty_int_bits(te)
     if sb == 0 or eb == 0
-        return 0
+        return TypeKind.Void
     var bits: i32 = sb
     if eb > bits
         bits = eb
     var uns: i32 = 0
-    if ty_is_unsigned(ts) == 1 and (bits < 64 or ts == TYPE_U64)
+    if ty_is_unsigned(ts) == 1 and (bits < 64 or ts == TypeKind.U64)
         uns = 1
-    if ty_is_unsigned(te) == 1 and (bits < 64 or te == TYPE_U64)
+    if ty_is_unsigned(te) == 1 and (bits < 64 or te == TypeKind.U64)
         uns = 1
     int_kind_of(bits, uns)
 
@@ -970,8 +987,8 @@ pub fn narrow_sema_for(sm: *Sema, st: *Stmt)
     var ev: i64 = 0
     let lit_s: i32 = lit_int_value(st.for_start, @sv)
     let lit_e: i32 = lit_int_value(st.for_end, @ev)
-    var ts: i32 = 0
-    var te: i32 = 0
+    var ts: TypeKind = TypeKind.Void
+    var te: TypeKind = TypeKind.Void
     sm.scope_top = sm.scope_top - 1
     if lit_s == 0
         ts = narrow_src_type_in(@env, st.for_start, 1)
@@ -999,14 +1016,14 @@ pub fn check_implicit_narrowing(sm: *Sema, stmt: *Stmt)
     var env: NarrowEnv
     env.s = null
     env.sm = sm
-    let decl: i32 = stmt.var_declared_type
-    let src: i32 = narrow_unproven_in(@env, stmt.var_init, decl)
-    if src != 0
+    let decl: TypeKind = stmt.var_declared_type
+    let src: TypeKind = narrow_unproven_in(@env, stmt.var_init, decl)
+    if src != TypeKind.Void
         narrow_report(sm, stmt, decl, src)
 
 # narrow_src_type read through Sema's scope: an integer into a float slot
 # (float_slot.ritz's float_slot_check, AGAST #3510).
-pub fn narrow_sema_src_type(sm: *Sema, e: *Expr) -> i32
+pub fn narrow_sema_src_type(sm: *Sema, e: *Expr) -> TypeKind
     var env: NarrowEnv
     env.s = null
     env.sm = sm
@@ -1014,38 +1031,38 @@ pub fn narrow_sema_src_type(sm: *Sema, e: *Expr) -> i32
 
 # narrow_unproven read through Sema's scope: an element of a `[N]T` literal
 # (literal_slot.ritz's lit_element, AGAST #3510).
-pub fn narrow_sema_unproven(sm: *Sema, init: *Expr, decl: i32) -> i32
+pub fn narrow_sema_unproven(sm: *Sema, init: *Expr, decl: TypeKind) -> TypeKind
     var env: NarrowEnv
     env.s = null
     env.sm = sm
     narrow_unproven_in(@env, init, decl)
 
 # `init`'s type if landing in `decl` narrows it and might lose bits, else 0.
-pub fn narrow_unproven(s: *EmitterState, init: *Expr, decl: i32) -> i32
+pub fn narrow_unproven(s: *EmitterState, init: *Expr, decl: TypeKind) -> TypeKind
     var env: NarrowEnv
     env.s = s
     env.sm = null
     narrow_unproven_in(@env, init, decl)
 
-fn narrow_unproven_in(env: *NarrowEnv, init: *Expr, decl: i32) -> i32
+fn narrow_unproven_in(env: *NarrowEnv, init: *Expr, decl: TypeKind) -> TypeKind
     let dw: i32 = ty_bits(decl)
     if init == null or dw <= 1 or dw >= 64
-        return 0
-    let src: i32 = narrow_src_type_in(env, init, NARROW_SLOT)
-    if src == NARROW_UNKNOWN or src == NARROW_LIT or ty_bits(src) <= dw
-        return 0
+        return TypeKind.Void
+    let src: TypeKind = narrow_src_type_in(env, init, NARROW_SLOT)
+    if src == TypeKind.NarrowUnknown or src == TypeKind.NarrowLit or ty_bits(src) <= dw
+        return TypeKind.Void
     var lo: i64 = 0
     var hi: i64 = 0
     if narrow_provable_range(env, init, 1, @lo, @hi) == 1
         if narrow_fits(lo, decl) == 1 and narrow_fits(hi, decl) == 1
-            return 0
+            return TypeKind.Void
     if narrow_arms_fit(env, init, decl) == 1
-        return 0
+        return TypeKind.Void
     # AGAST #4553: a merge reached through congruent operators (see
     # narrow_congs_fit).  narrow_src_type_in reports the chain's two literal
     # arms as i64; the merge itself is emitted at the slot's width.
     if narrow_congs_fit(env, init, decl) == 1
-        return 0
+        return TypeKind.Void
     src
 
 # AGAST #4081 (ritz0's `_arms_fit`, #1444): is `e` an if/match each of whose
@@ -1056,8 +1073,8 @@ fn narrow_unproven_in(env: *NarrowEnv, init: *Expr, decl: i32) -> i32
 # value.  An arm that is itself a merge (`else if`) is judged arm by arm too.
 # A mask arm is not a constant: ritz0 judges the arms as emitted, where
 # `big() & 255` is an i64, so only the whole-merge range above clears it.
-fn narrow_arms_fit(env: *NarrowEnv, e: *Expr, decl: i32) -> i32
-    if e == null or (e.kind != EXPR_IF and e.kind != EXPR_MATCH)
+fn narrow_arms_fit(env: *NarrowEnv, e: *Expr, decl: TypeKind) -> i32
+    if e == null or (e.kind != ExprKind.If and e.kind != ExprKind.Match)
         return 0
     let dw: i32 = ty_bits(decl)
     var arm: *MatchArm = e.args as *MatchArm
@@ -1071,8 +1088,8 @@ fn narrow_arms_fit(env: *NarrowEnv, e: *Expr, decl: i32) -> i32
             if narrow_fits(v, decl) == 0
                 return 0
         else
-            let at: i32 = narrow_src_type_in(env, arm.body, 1)
-            if at == NARROW_UNKNOWN or ty_bits(at) > dw
+            let at: TypeKind = narrow_src_type_in(env, arm.body, 1)
+            if at == TypeKind.NarrowUnknown or ty_bits(at) > dw
                 if narrow_arms_fit(env, arm.body, decl) == 0
                     return 0
         arm = arm.next
@@ -1087,18 +1104,18 @@ fn narrow_arms_fit(env: *NarrowEnv, e: *Expr, decl: i32) -> i32
 # instead.  A side scores -1 (fails), 0 (fine, no merge) or 1 (fine, reached
 # a merge); only a chain that reaches one is exempt, so `let x: u8 = 200 +
 # 100`, whose SUM must fit rather than an arm, is still refused.
-fn narrow_congs_fit(env: *NarrowEnv, e: *Expr, decl: i32) -> i32
+fn narrow_congs_fit(env: *NarrowEnv, e: *Expr, decl: TypeKind) -> i32
     if e == null
         return -1
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+    if e.kind == ExprKind.If or e.kind == ExprKind.Match
         if narrow_arms_fit(env, e, decl) == 1
             return 1
         return -1
-    if e.kind == EXPR_BINARY and narrow_is_congruent_op(e.op) == 1 and e.wrapping == 0
+    if e.kind == ExprKind.Binary and narrow_is_congruent_op(e.op) == 1 and e.wrapping == 0
         let l: i32 = narrow_congs_fit(env, e.left, decl)
         if l < 0
             return -1
-        if e.op == OP_SHL
+        if e.op == OpKind.Shl
             # A shift's right operand is a count, not a value at the slot's
             # width (ritz0's `_arith_context_nodes` does not descend into it).
             return l
@@ -1113,14 +1130,14 @@ fn narrow_congs_fit(env: *NarrowEnv, e: *Expr, decl: i32) -> i32
         if narrow_fits(v, decl) == 1
             return 0
         return -1
-    let at: i32 = narrow_src_type_in(env, e, 1)
-    if at == NARROW_UNKNOWN
+    let at: TypeKind = narrow_src_type_in(env, e, 1)
+    if at == TypeKind.NarrowUnknown
         return -1
     if ty_bits(at) <= ty_bits(decl)
         return 0
     -1
 
-fn narrow_report(sm: *Sema, stmt: *Stmt, decl: i32, src: i32)
+fn narrow_report(sm: *Sema, stmt: *Stmt, decl: TypeKind, src: TypeKind)
     if stmt.var_src_file != null
         eprints_cstr(stmt.var_src_file)
     else

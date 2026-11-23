@@ -311,6 +311,12 @@ class NameResolver:
         """Check a pattern and add any bindings to scope."""
         if isinstance(pattern, rast.IdentPattern):
             scope.locals.add(pattern.name)
+        elif isinstance(pattern, rast.OrPattern):
+            # An alternative binds nothing (the emitter refuses a name that
+            # would), but a qualified `E.V` is still a use of `E` (AGAST #4450).
+            for alt in pattern.alternatives:
+                if not isinstance(alt, rast.IdentPattern):
+                    self._check_pattern(alt, scope)
         elif isinstance(pattern, rast.StructPattern):
             self._check_type_name(pattern.name, pattern.span)
             for _field_name, field_pat in pattern.fields:

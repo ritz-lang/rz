@@ -1,0 +1,272 @@
+# Regression tests for AGAST #4450: a fieldless (C-style) enum value that
+# lives in MEMORY -- a global, a field read through a pointer or a global
+# pointer, `*p`, `p[i]`, an `[N]E` element -- reads as its tag exactly like
+# a local does, and a store of one writes the enum's own representation.
+#
+# ritz1 holds a unit enum as `%E = type { i8 }` (a 1-byte variant index;
+# AGAST #4574 tracks that `: i32` does not widen it).  Locals convert the
+# `%E` register to its tag with extractvalue + zext; a load from memory
+# elsewhere used to flow on as an i64 (`trunc i64 %<%E>`), a global compare
+# emitted `icmp` on the aggregate, and `p[i]` through `*E` stepped 8 bytes.
+# ritz1 compiling itself (after #4450 turned its kind codes into enums)
+# hit each of these.
+#
+# ritz0 is the oracle.  Each case returns 42 when correct and a distinct
+# small code naming the failed check otherwise; every comparison is
+# exercised with both outcomes.
+
+enum Kind: i32
+    Void = 0
+    A = 1
+    B = 2
+    Big = 1024
+    Neg = -1
+
+struct Shape
+    n: i32
+    leaf: Kind
+    lv: [4]Kind
+    tail: i32
+
+var g_kind: Kind
+var g_shape: Shape
+var g_shape_ptr: *Shape
+
+# --- global read + compare --------------------------------------------------
+
+fn set_global(k: Kind)
+    g_kind = k
+
+fn global_main() -> i32
+    if g_kind != Kind.Void
+        return 1
+    set_global(Kind.B)
+    if g_kind != Kind.B
+        return 2
+    if g_kind == Kind.A
+        return 3
+    if (g_kind as i32) != 2
+        return 4
+    let k = g_kind
+    if k != Kind.B
+        return 5
+    g_kind = Kind.Neg
+    if (g_kind as i32) != -1
+        return 6
+    if g_kind != Kind.Neg
+        return 7
+    g_kind = Kind.Big
+    if (g_kind as i32) != 1024
+        return 8
+    if g_kind == Kind.Neg
+        return 9
+    let m: i32 = match g_kind
+        Big => 42
+        _ => 10
+    return m
+
+[[test]]
+fn test_enum_global_read_compare() -> i32
+    assert global_main() == 42
+    0
+
+# --- field via pointer and via global pointer, with `as` --------------------
+
+fn leaf_of(p: *Shape) -> i32
+    (p.leaf as i32)
+
+fn field_ptr_main() -> i32
+    var s = Shape { n: 7, leaf: Kind.Big, tail: 9 }
+    let p: *Shape = @s
+    if (p.leaf as i32) != 1024
+        return 1
+    if p.leaf != Kind.Big
+        return 2
+    if p.leaf == Kind.A
+        return 3
+    p.leaf = Kind.Neg
+    if leaf_of(p) != -1
+        return 4
+    if s.leaf != Kind.Neg
+        return 5
+    g_shape_ptr = @s
+    if (g_shape_ptr.leaf as i32) != -1
+        return 6
+    g_shape_ptr.leaf = Kind.A
+    if (g_shape_ptr.leaf as i32) != 1
+        return 7
+    if g_shape_ptr.leaf != Kind.A
+        return 8
+    if g_shape_ptr.leaf == Kind.B
+        return 9
+    if s.n != 7 or s.tail != 9
+        return 10
+    g_shape.leaf = Kind.B
+    if (g_shape.leaf as i32) != 2
+        return 11
+    if g_shape.leaf != Kind.B
+        return 12
+    return 42
+
+[[test]]
+fn test_enum_field_via_pointer_and_global_pointer() -> i32
+    assert field_ptr_main() == 42
+    0
+
+# --- `p[i] = E.X` through `*E`, then read back ------------------------------
+
+fn fill(p: *Kind, n: i32)
+    var i: i32 = 0
+    while i < n
+        if i % 2 == 0
+            p[i] = Kind.Big
+        else
+            p[i] = Kind.Neg
+        i = i + 1
+
+fn ptr_index_main() -> i32
+    var arr: [8]Kind
+    var guard: [8]u8
+    var j: i32 = 0
+    while j < 8
+        guard[j] = 77 as u8
+        j = j + 1
+    let p: *Kind = @arr[0]
+    fill(p, 8)
+    if p[0] != Kind.Big
+        return 1
+    if p[1] != Kind.Neg
+        return 2
+    if (p[6] as i32) != 1024
+        return 3
+    if (p[7] as i32) != -1
+        return 4
+    if arr[5] != Kind.Neg
+        return 5
+    if *p != Kind.Big
+        return 6
+    *p = Kind.A
+    if (*p as i32) != 1
+        return 7
+    if arr[0] != Kind.A
+        return 8
+    # one byte per element: the 9th slot would be the first byte past arr
+    let q = p + 1
+    if *q != Kind.Neg
+        return 9
+    j = 0
+    while j < 8
+        if guard[j] != 77 as u8
+            return 10
+        j = j + 1
+    return 42
+
+[[test]]
+fn test_enum_ptr_index_store_load() -> i32
+    assert ptr_index_main() == 42
+    0
+
+# --- `[N]E` struct-field element compare ------------------------------------
+
+fn array_field_main() -> i32
+    var s = Shape { n: 1, leaf: Kind.Void, tail: 2 }
+    s.lv[0] = Kind.A
+    s.lv[1] = Kind.Neg
+    s.lv[2] = Kind.Big
+    s.lv[3] = Kind.B
+    if s.lv[0] != Kind.A
+        return 1
+    if s.lv[1] == Kind.A
+        return 2
+    if s.lv[1] != Kind.Neg
+        return 3
+    if (s.lv[2] as i32) != 1024
+        return 4
+    var i: i32 = 3
+    if s.lv[i] != Kind.B
+        return 5
+    let p: *Shape = @s
+    if p.lv[1] != Kind.Neg
+        return 6
+    if (p.lv[i] as i32) != 2
+        return 7
+    g_shape_ptr = @s
+    if g_shape_ptr.lv[2] != Kind.Big
+        return 8
+    if s.n != 1 or s.tail != 2
+        return 9
+    return 42
+
+[[test]]
+fn test_enum_array_field_element_compare() -> i32
+    assert array_field_main() == 42
+    0
+
+# --- pointer and array globals and fields, `match`, `*(p + i)` --------------
+
+struct Holder
+    ks: *Kind
+
+var g_kinds: [3]Kind
+var g_kind_ptr: *Kind
+
+fn kinds_at(p: *Kind) -> *Kind
+    p
+
+fn kind_code(k: Kind) -> i32
+    match k
+        Void => 0
+        A => 1
+        B => 2
+        Big => 3
+        Neg => 4
+
+fn more_shapes_main() -> i32
+    var buf: [4]Kind
+    g_kind_ptr = @buf[0]
+    g_kind_ptr[2] = Kind.Neg
+    if buf[2] != Kind.Neg
+        return 1
+    if (g_kind_ptr[2] as i32) != -1
+        return 2
+    let h = Holder { ks: @buf[0] }
+    h.ks[3] = Kind.Big
+    if h.ks[3] != Kind.Big
+        return 3
+    if (h.ks[3] as i32) != 1024
+        return 4
+    g_kinds[1] = Kind.B
+    if g_kinds[1] != Kind.B
+        return 5
+    if g_kinds[0] != Kind.Void
+        return 6
+    if (g_kinds[1] as i32) != 2
+        return 7
+    let p: *Kind = @buf[0]
+    if *(p + 3) != Kind.Big
+        return 8
+    if (*(p + 2) as i32) != -1
+        return 9
+    let m: i32 = match buf[3]
+        Big => 42
+        _ => 10
+    if m != 42
+        return m
+    let m2: i32 = match *(p + 2)
+        Neg => 42
+        _ => 11
+    if m2 != 42
+        return m2
+    if kind_code(g_kinds[1]) != 2 or kind_code(p[3]) != 3
+        return 12
+    kinds_at(p)[1] = Kind.B
+    if buf[1] != Kind.B
+        return 13
+    if kinds_at(p)[1] != Kind.B or (kinds_at(p)[3] as i32) != 1024
+        return 14
+    return 42
+
+[[test]]
+fn test_enum_pointer_and_array_globals_fields() -> i32
+    assert more_shapes_main() == 42
+    0

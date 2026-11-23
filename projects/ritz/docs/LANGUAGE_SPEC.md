@@ -4104,6 +4104,95 @@ let c: i64 = match n
     _ => pass
 ```
 
+#### Or-Patterns
+
+An arm's pattern may be several alternatives separated by `|`, written on one
+line: `P1 | P2 | ... =>`. The arm is taken when any alternative matches, in
+both the inline and the block arm form (AGAST #4450).
+
+```ritz
+enum Kind: i32
+    Void = 0
+    A = 1
+    B = 2
+    Big = 1024
+    Neg = -1
+
+fn weight(k: Kind) -> i32
+    match k
+        Kind.A | Kind.B =>
+            let base: i32 = 10
+            base + (k as i32)
+        Big | Neg => 100
+        Void => 0
+
+fn class(c: u8) -> i32
+    match c
+        ' ' | '\t' | '\n' => 1
+        '0' | '1' => 2
+        _ => 0
+
+fn main() -> i32
+    weight(Kind.B) + weight(Kind.Neg) + class('\t')   # 12 + 100 + 1
+```
+
+An alternative binds nothing. Each is a literal, an integer `const`, or a
+variant without a payload list, qualified or not: `Empty | Dot` on an enum
+whose other variants carry data is allowed. Each of these is a compile error
+at the alternative:
+
+- a name that would bind, one that is neither a variant of the scrutinee's
+  enum nor an integer `const` compared against an integer;
+- `_`, which matches everything, so it is an arm of its own;
+- a variant with a payload list, `Some(v)` or `Some(_)`: give it an arm of its
+  own.
+
+```ritz expect-error="an or-pattern can't bind a name: each alternative is a literal, a const or a variant"
+enum Color
+    Red
+    Green
+    Blue
+
+fn f(c: Color) -> i32
+    match c
+        Red | other => 1
+
+fn main() -> i32
+    f(Color.Red)
+```
+
+```ritz expect-error="`_` can't be an alternative of an or-pattern: it matches everything; give it an arm of its own"
+fn f(n: i64) -> i64
+    match n
+        0 | _ => 1
+
+fn main() -> i32
+    f(0) as i32
+```
+
+Coverage and reachability (§8.1) count every alternative. `Red | Green => 1`
+alone on a `Color` is "missing Blue", and a `_` after alternatives that name
+every variant is unreachable. An alternative that repeats a value or a
+variant, whether an earlier arm has it or an earlier alternative of the same
+arm, is an unreachable arm, said at the alternative and naming the arm that
+has it first:
+
+```ritz expect-error="unreachable match arm: the arm at line 8 covers it"
+enum Color
+    Red
+    Green
+    Blue
+
+fn f(c: Color) -> i32
+    match c
+        Red => 1
+        Green | Red => 2
+        Blue => 3
+
+fn main() -> i32
+    f(Color.Red)
+```
+
 ---
 
 ## 9. Structs

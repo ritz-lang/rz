@@ -134,6 +134,18 @@ def unmapped_tokens(grammar: Grammar) -> List[str]:
     return [t.name for t in grammar.tokens if t.name not in HAND_WRITTEN_TOKEN_IDS]
 
 
+
+# AGAST #4450: ritz1's kind codes are C-style enums (ritz1/src/ast.ritz), and
+# Ritz has no int -> enum coercion, so a rule typed `-> OpKind` can't fall back
+# to `return 0`.  Each enum's default is its zero variant: the one a zeroed
+# Expr / Stmt / TypeRef already holds.
+KIND_ENUM_ZERO = {
+    'ExprKind': 'ExprKind.Unset',
+    'StmtKind': 'StmtKind.Unset',
+    'OpKind': 'OpKind.Unset',
+    'TypeKind': 'TypeKind.Void',
+}
+
 class RitzGenerator:
     """Generate Ritz source files from grammar."""
 
@@ -348,7 +360,7 @@ class RitzGenerator:
         self._emit('    p.fn_return_type_name_len = 0')
         self._emit('    p.var_type_name = null')
         self._emit('    p.var_type_name_len = 0')
-        self._emit('    p.var_pointee = 0')
+        self._emit('    p.var_pointee = TypeKind.Void')
         self._emit('    p.var_inner_pointee = 0')
         self._emit('    p.var_inner_ref = 0')
         self._emit('    # Conditional-compilation skip flag. MUST be zeroed — if left')
@@ -509,6 +521,8 @@ class RitzGenerator:
             return 'p_current_token(p)'  # Return a dummy token
         elif rt == 'i32':
             return '0'
+        elif rt in KIND_ENUM_ZERO:
+            return KIND_ENUM_ZERO[rt]
         return 'null'
 
     def _symbol_type(self, sym: GrammarSymbol, rule_context: str) -> str:
@@ -531,6 +545,8 @@ class RitzGenerator:
             return 'null'
         elif ty == 'Token':
             return 'p_current_token(p)'
+        elif ty in KIND_ENUM_ZERO:
+            return KIND_ENUM_ZERO[ty]
         return '0'
 
     def _is_nullable_rule(self, rule_name: str) -> bool:

@@ -25,10 +25,10 @@
 # THE DIFFERENCES ARE ALL IN THE AST:
 #
 #   * ritz0 has a Block with a tail `expr`.  ritz1 has a statement list, so the
-#     last statement of a list is the tail, and only STMT_EXPR / STMT_IF /
-#     STMT_MATCH can carry a value there.  Everything else is the gap.
+#     last statement of a list is the tail, and only StmtKind.Expr / StmtKind.If /
+#     StmtKind.Match can carry a value there.  Everything else is the gap.
 #   * A MatchArm holds its tail in `body`, detached from `body_stmts` by
-#     match_arm_set_block.  EXPR_IF is two such arms, so arms are read one way.
+#     match_arm_set_block.  ExprKind.If is two such arms, so arms are read one way.
 #   * `true` and `pass` lower to integer literals; see Expr.lit_kind.
 #
 # ritz0 walks every dataclass field for a `break`.  ritz1's Expr and Stmt reuse
@@ -50,7 +50,7 @@ import sema
 # =============================================================================
 #
 # Everything here is under the body of the loop being judged.  An inner loop
-# owns its own breaks, so STMT_WHILE / STMT_FOR / STMT_LOOP end the walk.
+# owns its own breaks, so StmtKind.While / StmtKind.For / StmtKind.Loop end the walk.
 
 fn tail_arms_have_break(arms: *MatchArm) -> i32
     var arm: *MatchArm = arms
@@ -69,30 +69,32 @@ fn tail_arms_have_break(arms: *MatchArm) -> i32
 fn tail_expr_has_break(e: *Expr) -> i32
     if e == null
         return 0
-    if e.kind == EXPR_MATCH or e.kind == EXPR_IF
+    if e.kind == ExprKind.Match or e.kind == ExprKind.If
         return tail_arms_have_break(e.args as *MatchArm)
     0
 
 fn tail_stmt_has_break(st: *Stmt) -> i32
-    let k: i32 = st.kind
-    if k == STMT_BREAK
-        return 1
-    if k == STMT_EXPR
-        return tail_expr_has_break(st.expr)
-    if k == STMT_RETURN
-        return tail_expr_has_break(st.return_value)
-    if k == STMT_VAR_DECL
-        return tail_expr_has_break(st.var_init)
-    if k == STMT_IF
-        if tail_stmts_have_break(st.if_then) == 1
+    let k: StmtKind = st.kind
+    match k
+        StmtKind.Break =>
             return 1
-        return tail_stmts_have_break(st.if_else)
-    if k == STMT_MATCH
-        return tail_arms_have_break(st.if_then as *MatchArm)
-    if k == STMT_UNSAFE
-        return tail_stmts_have_break(st.while_body)   # a block, not a loop (#2248)
-    if k == STMT_ASM
-        return 0   # text, not statements (AGAST #3394)
+        StmtKind.Expr =>
+            return tail_expr_has_break(st.expr)
+        StmtKind.Return =>
+            return tail_expr_has_break(st.return_value)
+        StmtKind.VarDecl =>
+            return tail_expr_has_break(st.var_init)
+        StmtKind.If =>
+            if tail_stmts_have_break(st.if_then) == 1
+                return 1
+            return tail_stmts_have_break(st.if_else)
+        StmtKind.Match =>
+            return tail_arms_have_break(st.if_then as *MatchArm)
+        StmtKind.Unsafe =>
+            return tail_stmts_have_break(st.while_body)   # a block, not a loop (#2248)
+        StmtKind.Asm =>
+            return 0   # text, not statements (AGAST #3394)
+        _ => pass
     0
 
 pub fn tail_stmts_have_break(list: *Stmt) -> i32
@@ -110,35 +112,37 @@ pub fn tail_stmts_have_break(list: *Stmt) -> i32
 # A `match` whose arms all return diverges: every match covers its scrutinee or
 # is an error (LARB R6, #2245, #2344), so no value gets past the arms.  emit_fn
 # relies on this for its `unreachable`.  ritz0's ExprStmt case has no twin here:
-# a `match` statement is always STMT_MATCH, and an inline `if` cannot diverge
+# a `match` statement is always StmtKind.Match, and an inline `if` cannot diverge
 # because its `else` cannot be a block-bodied `match` (it does not parse).  Only
 # an arm's `body` gets to tail_expr_diverges.
 
 pub fn tail_is_true_literal(e: *Expr) -> i32
-    if e.kind == EXPR_INT_LIT and e.lit_kind == LIT_TRUE
+    if e.kind == ExprKind.IntLit and e.lit_kind == LIT_TRUE
         return 1
     0
 
 fn tail_stmt_diverges(st: *Stmt) -> i32
-    let k: i32 = st.kind
-    if k == STMT_RETURN
-        return 1
-    if k == STMT_LOOP
-        return 1 - tail_stmts_have_break(st.while_body)
-    if k == STMT_WHILE
-        if tail_is_true_literal(st.while_cond) == 0
-            return 0
-        return 1 - tail_stmts_have_break(st.while_body)
-    if k == STMT_IF
-        if tail_stmts_diverge(st.if_then) == 0
-            return 0
-        return tail_stmts_diverge(st.if_else)
-    if k == STMT_MATCH
-        return tail_arms_diverge(st.if_then as *MatchArm)
-    if k == STMT_UNSAFE
-        return tail_stmts_diverge(st.while_body)   # ritz0's UnsafeBlock (#2248)
-    if k == STMT_ASM
-        return 0   # control leaves at its end; a `loop` after it diverges (§18.6)
+    let k: StmtKind = st.kind
+    match k
+        StmtKind.Return =>
+            return 1
+        StmtKind.Loop =>
+            return 1 - tail_stmts_have_break(st.while_body)
+        StmtKind.While =>
+            if tail_is_true_literal(st.while_cond) == 0
+                return 0
+            return 1 - tail_stmts_have_break(st.while_body)
+        StmtKind.If =>
+            if tail_stmts_diverge(st.if_then) == 0
+                return 0
+            return tail_stmts_diverge(st.if_else)
+        StmtKind.Match =>
+            return tail_arms_diverge(st.if_then as *MatchArm)
+        StmtKind.Unsafe =>
+            return tail_stmts_diverge(st.while_body)   # ritz0's UnsafeBlock (#2248)
+        StmtKind.Asm =>
+            return 0   # control leaves at its end; a `loop` after it diverges (§18.6)
+        _ => pass
     0
 
 pub fn tail_stmts_diverge(list: *Stmt) -> i32
@@ -163,7 +167,7 @@ fn tail_arms_diverge(arms: *MatchArm) -> i32
     1
 
 fn tail_expr_diverges(e: *Expr) -> i32
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+    if e.kind == ExprKind.If or e.kind == ExprKind.Match
         return tail_arms_diverge(e.args as *MatchArm)
     0
 
@@ -185,9 +189,9 @@ fn tail_is_procedure_call(e: *Expr) -> i32
     0
 
 fn tail_expr_gap(e: *Expr) -> *SrcSpan
-    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+    if e.kind == ExprKind.If or e.kind == ExprKind.Match
         return tail_arms_gap(e.args as *MatchArm)
-    if e.kind == EXPR_INT_LIT and e.lit_kind == LIT_PASS
+    if e.kind == ExprKind.IntLit and e.lit_kind == LIT_PASS
         return @e.span
     if tail_is_procedure_call(e) == 1
         return @e.span
@@ -212,12 +216,14 @@ fn tail_arm_gap(arm: *MatchArm) -> *SrcSpan
     @arm.pass_span
 
 fn tail_stmt_gap(st: *Stmt) -> *SrcSpan
-    let k: i32 = st.kind
-    if k == STMT_EXPR
-        return tail_expr_gap(st.expr)
-    if k == STMT_MATCH
-        return tail_arms_gap(st.if_then as *MatchArm)
-    if k == STMT_IF and st.if_else != null
+    let k: StmtKind = st.kind
+    match k
+        StmtKind.Expr =>
+            return tail_expr_gap(st.expr)
+        StmtKind.Match =>
+            return tail_arms_gap(st.if_then as *MatchArm)
+        _ => pass
+    if k == StmtKind.If and st.if_else != null
         let gap: *SrcSpan = tail_stmts_gap(st.if_then)
         if gap != null
             return gap
@@ -264,7 +270,7 @@ pub fn tail_note_callee(e: *Expr, fd: *FnDef)
     g_tail_procs = n
 
 fn tail_report_gap(sm: *Sema, f: *FnDef)
-    if f.return_type == TYPE_VOID or fn_is_decl(f) == 1
+    if f.return_type == TypeKind.Void or fn_is_decl(f) == 1
         return
     let gap: *SrcSpan = tail_stmts_gap(f.body)
     if gap == null
