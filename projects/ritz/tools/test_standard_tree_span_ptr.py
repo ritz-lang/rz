@@ -34,7 +34,7 @@ def _summary(module: str) -> dict[str, dict[str, int]]:
     [
         ("span.ritz", 5),     # 5 raw-pair / C-string constructor boundaries
         ("strview.ritz", 5),  # 5 C-string / raw-pair boundaries
-        ("string.ritz", 7),   # 2 *Allocator + 5 C-string / byte-buffer
+        ("string.ritz", 6),   # 2 *Allocator + 4 C-string; push_bytes is a Span (#4555)
     ],
 )
 def test_raw_pointer_parameters_are_converted_or_exempted(module, exempt):

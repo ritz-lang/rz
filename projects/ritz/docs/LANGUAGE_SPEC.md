@@ -547,18 +547,21 @@ fn main() -> i32
 ```
 
 **The sink** is a pointer to a struct (`@&buf`, or a `*T` / `@&T` value)
-whose method `push_bytes(data: *u8, len: i64)` resolves statically, exactly
-as `sink.push_bytes(data, len)` would (§12.2). `String`, `GrowBuf` and
-`Vec<u8>` provide it (`String.push_bytes`, `GrowBuf.push_bytes`,
-`Vec<u8>.push_bytes`), and any type can by implementing it:
+whose method `push_bytes(data: Span<u8>)` resolves statically, exactly
+as `sink.push_bytes(data)` would (§12.2). `String`, `GrowBuf` and
+`Writer` provide it (`String.push_bytes`, `GrowBuf.push_bytes`,
+`Writer.push_bytes`). `Vec<u8>.push_bytes`, the impl method #4537 moved
+off `vec_push_bytes`, still takes `(data: *u8, len: i64)`, and both
+compilers accept that shape as well. Any type can be a sink by
+implementing the Span form:
 
 ```ritz
 struct Count
     bytes: i64
 
 impl Count
-    fn push_bytes(self: @&Count, data: *u8, len: i64) -> i32
-        self.bytes = self.bytes + len
+    fn push_bytes(self: @&Count, data: Span<u8>) -> i32
+        self.bytes = self.bytes + data.len
         return 0
 
 fn main() -> i32

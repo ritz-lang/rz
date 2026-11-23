@@ -525,7 +525,7 @@ Modification:
 | `s.push_cstr(cstr)` | `fn(cstr: *u8) -> bool` | Push NUL-terminated C string |
 | `s.push_string(other)` | `fn(other: @String) -> bool` | Push String |
 | `s.push_span(bytes)` | `fn(bytes: Span<u8>) -> bool` | Push a byte span |
-| `s.push_bytes(bytes, len)` | `fn(bytes: *u8, len: i64) -> bool` | Push raw bytes; the print-sink protocol `format_into(@&s, "...")` appends through (AGAST #1824) |
+| `s.push_bytes(bytes)` | `fn(bytes: Span<u8>) -> bool` | Append a byte span; the print-sink protocol `format_into(@&s, "...")` appends through (AGAST #4555) |
 | `s.push_i64(n)` | `fn(n: i64) -> bool` | Push an integer in decimal (all of i64); replaces `itoa` |
 | `s.clear()` | `fn()` | Clear string |
 | `s.pop()` | `fn() -> u8` | Pop last byte |
@@ -1244,7 +1244,7 @@ explicit release. To read a whole file descriptor, use `vec_read_all_fd`
 | `b.append(data)` | `fn(data: Span<u8>) -> bool` | Append bytes |
 | `b.append_view(s)` | `fn(s: StrView) -> bool` | Append a StrView |
 | `b.append_byte(byte)` | `fn(byte: u8) -> bool` | Append single byte |
-| `b.push_bytes(data, len)` | `fn(data: *u8, len: i64) -> bool` | Append bytes; the sink `format_into(@&b, "...")` appends through (AGAST #1824) |
+| `b.push_bytes(data)` | `fn(data: Span<u8>) -> bool` | Append a byte span; the sink `format_into(@&b, "...")` appends through (AGAST #4555) |
 | `b.clear()` | `fn() -> i32` | Clear (keep capacity) |
 | `b.len()` | `fn() -> i64` | Get length |
 | `b.cap()` | `fn() -> i64` | Get capacity |
