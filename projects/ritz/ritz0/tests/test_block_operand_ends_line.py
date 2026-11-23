@@ -42,15 +42,15 @@ operand shapes, which leave the loop at different depths; and every infix
 token at the start of the next line, which is now its own statement (refused
 there, or a statement of its own), never part of the `let`.  The infix rows
 are checked against the parser's precedence table, so a new operator gets one.
-ritz0 runs the `match` and `if` shapes; ritz1 refuses, at the `-`, the
-shape it used to swallow.
+ritz0 runs the `match` and `if` shapes, and so do ritz1 and ritz1_selfhosted
+since #4553 (`if`) and #4049 (`match`, in every statement form).
 """
 
 import pytest
 import ritz_ast as rast
 from lexer import Lexer
 from parser import ParseError, Parser, parse
-from test_ref_into_value import _assert_refused, _run
+from test_ref_into_value import _run
 
 
 def _body(src):
@@ -214,27 +214,85 @@ def test_block_operand_then_store_and_tail_runs(tmp_path, name, program):
     assert _run("ritz0", tmp_path, name, program) == 0
 
 
-# Before #3435 ritz1 took a block operand only when the next line began with
-# an operator, and then swallowed that line: here `y = 5 + 2 - y`, 6.  Now
-# the line is a statement and the operand is refused there.  The refusal row
-# uses `match`: a block `if`/`else` operand is parsed since #4553, but a
-# `match` operand is still ritz1's parity gap (#4049).
-RITZ1_SWALLOWED = """\
-fn h(c: i32) -> i32
-    var y: i32 = 1
-    y = 5 + match c
+# AGAST #4049: a block `match` operand in every statement form ritz1 has
+# (let / var / assign / return / fn tail), nested under `*` and under unary
+# `-`, and narrowed into a u8 slot through `+` (narrow_congs_fit).  ritz0
+# always took these; ritz1 parsed the operand but no statement rule ended at
+# its DEDENT, so it refused the line after it.
+MATCH_OPERAND_FORMS = """\
+fn let_form(c: i32) -> i32
+    let x: i32 = 6 + match c
         1 => 1
         _ => 2
-    ^-y
+    x
+
+fn var_assign_form(c: i32) -> i32
+    var y: i32 = 10 + match c
+        1 => 1
+        _ => 2
+    y = y * 2 + match c
+        1 => 100
+        _ => 200
     y
 
+fn return_form(c: i32) -> i32
+    return 100 + match c
+        1 => 1
+        _ => 2
+
+fn tail_form(c: i32) -> i32
+    1000 + 2 * match c
+        1 => 1
+        _ => 2
+
+fn neg_form(c: i32) -> i32
+    let x: i32 = -match c
+        1 => c
+        _ => c + 2
+    x
+
+fn byte_form(c: i32, a: u8, b: u8) -> u8
+    let x: u8 = 6 + match c
+        1 => a
+        _ => b
+    x
+
 fn main() -> i32
-    h(2)
+    if let_form(1) != 7 or let_form(0) != 8
+        return 1
+    if var_assign_form(1) != 122 or var_assign_form(0) != 224
+        return 2
+    if return_form(1) != 101 or return_form(0) != 102
+        return 3
+    if tail_form(1) != 1002 or tail_form(0) != 1004
+        return 4
+    if neg_form(1) != -1 or neg_form(0) != -2
+        return 5
+    if (byte_form(1, 1, 2) as i32) != 7 or (byte_form(0, 1, 2) as i32) != 8
+        return 6
+    42
 """
+
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 
 @pytest.mark.integration
+@pytest.mark.batched
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_match_operand_in_every_statement_form_runs(request, tmp_path, compiler):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    assert _run(compiler, tmp_path, "match_operand_forms", MATCH_OPERAND_FORMS) == 42
+
+
+# Before #3435 ritz1 took a block `match` operand only when the next line
+# began with an operator, and then swallowed that line (`*p = x` read as
+# `… * p = x`, `-x` as `… - x`).  Since #4049 it takes the operand and the
+# next line is a statement of its own, so MATCH_PROGRAM's store and `-x`
+# tail run as on ritz0: a swallowed line would not return 0.
+@pytest.mark.integration
+@pytest.mark.batched
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_ritz1_does_not_swallow_the_line_after_a_match_operand(request, tmp_path, compiler):
+def test_ritz1_match_operand_then_store_and_tail_runs(request, tmp_path, compiler):
     request.getfixturevalue("ritz1_bin")
-    _assert_refused(compiler, tmp_path, "swallowed", RITZ1_SWALLOWED, "unexpected '-'")
+    assert _run(compiler, tmp_path, "match_operand", MATCH_PROGRAM) == 0
