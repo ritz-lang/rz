@@ -18,8 +18,7 @@
 #   mausoleum help                    Print help
 
 import ritzlib.sys
-import ritzlib.io
-import ritzlib.str
+import ritzlib.fmt
 import ritzlib.strview
 import ritzlib.memory
 import ritzlib.option
@@ -65,11 +64,6 @@ fn default_host() -> StrView
 fn default_collection() -> StrView
     return "default"
 
-# Helper: compare a C string (from argv) to a StrView literal
-# This is for FFI boundary - argv comes as *u8 from the kernel
-fn arg_eq(arg: *u8, literal: StrView) -> i32
-    return literal.eq_cstr(arg) as i32
-
 # ============================================================================
 # Argument Parsing
 # ============================================================================
@@ -95,63 +89,62 @@ const CMD_SERVE: i32 = 2
 const CMD_SHELL: i32 = 3
 const CMD_BAD_ARGS: i32 = 4   # parse_args printed why; exit 2
 
-fn parse_args(argc: i32, argv: **u8, args: *Args)
-    args.command = CMD_HELP
-    args.port = DEFAULT_PORT
-    args.host = default_host()
-    args.collection = default_collection()
-    args.data_dir = null
-    args.no_encryption = 0
-    args.serial_mode = 0
-    args.explicit_encrypted = 0
+fn parse_args(args: Span<StrView>, out: *Args)
+    out.command = CMD_HELP
+    out.port = DEFAULT_PORT
+    out.host = default_host()
+    out.collection = default_collection()
+    out.data_dir = null
+    out.no_encryption = 0
+    out.serial_mode = 0
+    out.explicit_encrypted = 0
 
-    if argc < 2
+    if args.len < 2
         return
 
-    var cmd: *u8 = *(argv + 1)
+    let cmd: StrView = args[1]
 
-    # Use arg_eq() to compare C strings from argv to string literals
-    if arg_eq(cmd, "help") != 0 or arg_eq(cmd, "--help") != 0 or arg_eq(cmd, "-h") != 0
-        args.command = CMD_HELP
+    if cmd.eq("help") or cmd.eq("--help") or cmd.eq("-h")
+        out.command = CMD_HELP
         return
 
-    if arg_eq(cmd, "version") != 0 or arg_eq(cmd, "--version") != 0 or arg_eq(cmd, "-v") != 0
-        args.command = CMD_VERSION
+    if cmd.eq("version") or cmd.eq("--version") or cmd.eq("-v")
+        out.command = CMD_VERSION
         return
 
-    if arg_eq(cmd, "serve") != 0
-        args.command = CMD_SERVE
+    if cmd.eq("serve")
+        out.command = CMD_SERVE
         # Parse --port and --data-dir
-        var i: i32 = 2
-        while i < argc
-            var arg: *u8 = *(argv + i)
-            if arg_eq(arg, "--port") != 0 or arg_eq(arg, "-p") != 0
-                if i + 1 < argc
-                    if port_arg(*(argv + i + 1), args) == 0
+        var i: i64 = 2
+        while i < args.len
+            let arg: StrView = args[i]
+            if arg.eq("--port") or arg.eq("-p")
+                if i + 1 < args.len
+                    if port_arg(args[i + 1], out) == 0
                         return
                     i += 2
                 else
                     i += 1
-            else if arg_eq(arg, "--data-dir") != 0 or arg_eq(arg, "-d") != 0
-                if i + 1 < argc
-                    args.data_dir = *(argv + i + 1)
+            else if arg.eq("--data-dir") or arg.eq("-d")
+                if i + 1 < args.len
+                    out.data_dir = args[i + 1].as_ptr()
                     i += 2
                 else
                     i += 1
-            else if arg_eq(arg, "--no-encryption") != 0
-                args.no_encryption = 1
+            else if arg.eq("--no-encryption")
+                out.no_encryption = 1
                 i += 1
-            else if arg_eq(arg, "--encrypted") != 0
-                args.explicit_encrypted = 1
-                args.no_encryption = 0
+            else if arg.eq("--encrypted")
+                out.explicit_encrypted = 1
+                out.no_encryption = 0
                 i += 1
-            else if arg_eq(arg, "--serial") != 0
+            else if arg.eq("--serial")
                 # Phase 7: async is now the default.  --serial opts back
                 # in to the legacy serve_loop / serve_loop_plain path,
                 # kept as a bisect escape hatch.
-                args.serial_mode = 1
+                out.serial_mode = 1
                 i += 1
-            else if arg_eq(arg, "--async") != 0
+            else if arg.eq("--async")
                 # Phase 7: --async is now a no-op (the default).  Accept
                 # it silently so existing scripts and the few callers
                 # still passing it (concurrent_test.sh, etc.) keep
@@ -161,52 +154,51 @@ fn parse_args(argc: i32, argv: **u8, args: *Args)
                 i += 1
         return
 
-    if arg_eq(cmd, "shell") != 0
-        args.command = CMD_SHELL
+    if cmd.eq("shell")
+        out.command = CMD_SHELL
         # Parse --host, --port and --collection
-        var i: i32 = 2
-        while i < argc
-            var arg: *u8 = *(argv + i)
-            if arg_eq(arg, "--port") != 0 or arg_eq(arg, "-p") != 0
-                if i + 1 < argc
-                    if port_arg(*(argv + i + 1), args) == 0
+        var i: i64 = 2
+        while i < args.len
+            let arg: StrView = args[i]
+            if arg.eq("--port") or arg.eq("-p")
+                if i + 1 < args.len
+                    if port_arg(args[i + 1], out) == 0
                         return
                     i += 2
                 else
                     i += 1
-            else if arg_eq(arg, "--host") != 0 or arg_eq(arg, "-h") != 0
-                if i + 1 < argc
-                    # Convert C string from argv to StrView at FFI boundary
-                    args.host = strview_from_cstr(*(argv + i + 1))
+            else if arg.eq("--host") or arg.eq("-h")
+                if i + 1 < args.len
+                    out.host = args[i + 1]
                     i += 2
                 else
                     i += 1
-            else if arg_eq(arg, "--collection") != 0 or arg_eq(arg, "-c") != 0
-                if i + 1 < argc
-                    args.collection = strview_from_cstr(*(argv + i + 1))
+            else if arg.eq("--collection") or arg.eq("-c")
+                if i + 1 < args.len
+                    out.collection = args[i + 1]
                     i += 2
                 else
                     i += 1
-            else if arg_eq(arg, "--no-encryption") != 0
-                args.no_encryption = 1
+            else if arg.eq("--no-encryption")
+                out.no_encryption = 1
                 i += 1
             else
                 i += 1
         return
 
     # Unknown command - show help
-    args.command = CMD_HELP
+    out.command = CMD_HELP
 
-# --port's value, range-checked by cliarg_parse_i32 (#4039).  The old
+# --port's value, range-checked by cliarg_parse_i64_in (#4039).  The old
 # parse_int skipped non-digits and wrapped past i32.  0 = refused: prints
 # why and sets CMD_BAD_ARGS.
-fn port_arg(s: *u8, args: *Args) -> i32
-    if cliarg_parse_i32(s, @args.port) == 1
+fn port_arg(s: StrView, out: *Args) -> i32
+    var v: i64 = 0
+    if cliarg_parse_i64_in(s, -2147483648, 2147483647, @v) == 1
+        out.port = v as i32
         return 1
-    prints("ERROR: invalid --port value: ")
-    prints_cstr(s)
-    prints("\n")
-    args.command = CMD_BAD_ARGS
+    print("ERROR: invalid --port value: {s}\n")
+    out.command = CMD_BAD_ARGS
     return 0
 
 # ============================================================================
@@ -214,61 +206,56 @@ fn port_arg(s: *u8, args: *Args) -> i32
 # ============================================================================
 
 fn print_banner()
-    prints("Mausoleum v0.1.0\n")
-    prints("Where data is entombed forever.\n")
-    prints("\n")
+    print("Mausoleum v0.1.0\n")
+    print("Where data is entombed forever.\n")
+    print("\n")
 
 fn print_help()
-    prints("Mausoleum - An encrypted document database\n")
-    prints("\n")
-    prints("Usage:\n")
-    prints("  mausoleum serve [OPTIONS]               Start the server\n")
-    prints("  mausoleum shell [--host H] [--port P] [--collection NAME] [--no-encryption]\n")
-    prints("                                          Connect to a server: put/get/delete/list\n")
-    prints("                                          (exits 1 if any command failed)\n")
-    prints("  mausoleum version                       Print version information\n")
-    prints("  mausoleum help                          Print this help\n")
-    prints("\n")
-    prints("Server options:\n")
-    prints("  --port, -p PORT                         Listen port (default: 7777)\n")
-    prints("  --data-dir, -d PATH                     Data directory for persistence\n")
-    prints("                                          (default: in-memory)\n")
-    prints("  --no-encryption                         Disable encryption (development only!)\n")
-    prints("  --encrypted                             Force encryption ON (default; explicit\n")
-    prints("                                          form for self-documenting scripts)\n")
-    prints("  --serial                                Use the legacy serial serve loop\n")
-    prints("                                          (bisect escape hatch; default loop is\n")
-    prints("                                          io_uring async since phase 7)\n")
-    prints("\n")
-    prints("Shell options:\n")
-    prints("  --host, -h HOST                         Server host (default: 127.0.0.1)\n")
-    prints("  --port, -p PORT                         Server port (default: 7777)\n")
-    prints("  --collection, -c NAME                   Collection to work in (default: the\n")
-    prints("                                          default collection, named `default`)\n")
-    prints("  --no-encryption                         For a `serve --no-encryption` server\n")
-    prints("\n")
-    prints("Security:\n")
-    prints("  By default, connections use X25519 key exchange + ChaCha20-Poly1305.\n")
-    prints("  Use --no-encryption only for local development/testing.\n")
-    prints("\n")
-    prints("Examples:\n")
-    prints("  mausoleum serve --port 8888             Start server on port 8888\n")
-    prints("  mausoleum serve --data-dir /var/m7m     Start with persistent storage\n")
-    prints("  mausoleum serve --no-encryption         Start without encryption (dev mode)\n")
-    prints("  mausoleum shell --host 192.168.1.5      Connect to remote server\n")
-    prints("  mausoleum shell -c nexus_pages          Browse nexus's wiki pages\n")
-    prints("\n")
+    print("Mausoleum - An encrypted document database\n")
+    print("\n")
+    print("Usage:\n")
+    print("  mausoleum serve [OPTIONS]               Start the server\n")
+    print("  mausoleum shell [--host H] [--port P] [--collection NAME] [--no-encryption]\n")
+    print("                                          Connect to a server: put/get/delete/list\n")
+    print("                                          (exits 1 if any command failed)\n")
+    print("  mausoleum version                       Print version information\n")
+    print("  mausoleum help                          Print this help\n")
+    print("\n")
+    print("Server options:\n")
+    print("  --port, -p PORT                         Listen port (default: 7777)\n")
+    print("  --data-dir, -d PATH                     Data directory for persistence\n")
+    print("                                          (default: in-memory)\n")
+    print("  --no-encryption                         Disable encryption (development only!)\n")
+    print("  --encrypted                             Force encryption ON (default; explicit\n")
+    print("                                          form for self-documenting scripts)\n")
+    print("  --serial                                Use the legacy serial serve loop\n")
+    print("                                          (bisect escape hatch; default loop is\n")
+    print("                                          io_uring async since phase 7)\n")
+    print("\n")
+    print("Shell options:\n")
+    print("  --host, -h HOST                         Server host (default: 127.0.0.1)\n")
+    print("  --port, -p PORT                         Server port (default: 7777)\n")
+    print("  --collection, -c NAME                   Collection to work in (default: the\n")
+    print("                                          default collection, named `default`)\n")
+    print("  --no-encryption                         For a `serve --no-encryption` server\n")
+    print("\n")
+    print("Security:\n")
+    print("  By default, connections use X25519 key exchange + ChaCha20-Poly1305.\n")
+    print("  Use --no-encryption only for local development/testing.\n")
+    print("\n")
+    print("Examples:\n")
+    print("  mausoleum serve --port 8888             Start server on port 8888\n")
+    print("  mausoleum serve --data-dir /var/m7m     Start with persistent storage\n")
+    print("  mausoleum serve --no-encryption         Start without encryption (dev mode)\n")
+    print("  mausoleum shell --host 192.168.1.5      Connect to remote server\n")
+    print("  mausoleum shell -c nexus_pages          Browse nexus's wiki pages\n")
+    print("\n")
 
 fn print_version()
-    prints("Mausoleum v0.1.0\n")
-    prints("Ritz Database Engine\n")
-    prints("Protocol: M7SP v1 (encrypted)\n")
-    prints("Crypto: X25519 + ChaCha20-Poly1305\n")
-
-# ritzlib.io's fmt-backed print_int (#1957). The digit loop it replaces
-# negated with `v = -v`, so i32's minimum printed as a bare "-".
-fn print_i32(n: i32)
-    print_int(n as i64)
+    print("Mausoleum v0.1.0\n")
+    print("Ritz Database Engine\n")
+    print("Protocol: M7SP v1 (encrypted)\n")
+    print("Crypto: X25519 + ChaCha20-Poly1305\n")
 
 # ============================================================================
 # Collection Metadata Persistence Helper
@@ -301,31 +288,27 @@ fn serial_connect(reader: *MessageReader, resp: *MessageBuffer, request_id: i32,
 # ============================================================================
 
 fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> i32
-    prints("Starting Mausoleum server...\n")
-    prints("  Port: ")
-    print_i32(port)
-    prints("\n")
+    print("Starting Mausoleum server...\n")
+    print("  Port: {port}\n")
     if data_dir != null
-        prints("  Data: ")
-        prints_cstr(data_dir)
-        prints("\n")
+        print("  Data: {data_dir}\n")
     else
-        prints("  Data: in-memory (no persistence)\n")
+        print("  Data: in-memory (no persistence)\n")
     if no_encryption != 0
-        prints("  Encryption: DISABLED (development mode)\n")
+        print("  Encryption: DISABLED (development mode)\n")
     else
-        prints("  Encryption: X25519 + ChaCha20-Poly1305\n")
+        print("  Encryption: X25519 + ChaCha20-Poly1305\n")
     if serial_mode != 0
         if no_encryption != 0
-            prints("  Loop: serial, plain (--serial — legacy bisect baseline)\n")
+            print("  Loop: serial, plain (--serial — legacy bisect baseline)\n")
         else
-            prints("  Loop: serial, encrypted (--serial — legacy bisect baseline)\n")
+            print("  Loop: serial, encrypted (--serial — legacy bisect baseline)\n")
     else
         if no_encryption != 0
-            prints("  Loop: io_uring async, plain (default since phase 7)\n")
+            print("  Loop: io_uring async, plain (default since phase 7)\n")
         else
-            prints("  Loop: io_uring async, encrypted (default since phase 7)\n")
-    prints("\n")
+            print("  Loop: io_uring async, encrypted (default since phase 7)\n")
+    print("\n")
 
     # Create buffer pool - either persistent or in-memory
     var pool: *BufferPool = null
@@ -335,18 +318,16 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
         # Persistent mode - use storage engine
         let storage_opt = storage_open(data_dir)
         if option_is_none<*Storage>(@storage_opt)
-            prints("Error: Failed to open storage at ")
-            prints_cstr(data_dir)
-            prints("\n")
+            print("Error: Failed to open storage at {data_dir}\n")
             return 1
         storage = option_unwrap_or<*Storage>(@storage_opt, null)
         pool = storage_pool(storage)
-        prints("Opened persistent storage.\n")
+        print("Opened persistent storage.\n")
     else
         # In-memory mode
         let pool_opt = buffer_pool_new(BUFFER_POOL_FRAMES)
         if option_is_none<*BufferPool>(@pool_opt)
-            prints("Error: Failed to allocate buffer pool\n")
+            print("Error: Failed to allocate buffer pool\n")
             return 1
         pool = option_unwrap_or<*BufferPool>(@pool_opt, null)
 
@@ -358,14 +339,13 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
         # Reopen the collection this data directory holds (or start one).
         col_result = collection_open_storage(@collection, storage, DEFAULT_COLLECTION_ID)
         if col_result >= 0
-            prints("Loaded ")
-            print_i64(collection_count(@collection))
-            prints(" document(s).\n")
+            let count: i64 = collection_count(@collection)
+            print("Loaded {count} document(s).\n")
     else
         col_result = collection_init(@collection, pool, DEFAULT_COLLECTION_ID)
 
     if col_result < 0
-        prints("Error: Failed to create/load collection\n")
+        print("Error: Failed to create/load collection\n")
         if storage != null
             storage_destroy(storage)
         else
@@ -377,9 +357,9 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
     match socket_tcp_nonblock()
         Ok(s) => sock = s
         Err(e) =>
-            prints("Error: Failed to create socket: ")
+            print("Error: Failed to create socket: ")
             errno_write(1, e)
-            prints("\n")
+            print("\n")
             collection_destroy(@collection)
             if storage != null
                 storage_destroy(storage)
@@ -395,9 +375,7 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
         Ok(_) => bound = true
         Err(_) => bound = false
     if not bound
-        prints("Error: Failed to bind to port ")
-        print_i32(port)
-        prints("\n")
+        print("Error: Failed to bind to port {port}\n")
         sock.close()
         collection_destroy(@collection)
         if storage != null
@@ -412,7 +390,7 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
         Ok(_) => listening = true
         Err(_) => listening = false
     if not listening
-        prints("Error: Failed to listen on socket\n")
+        print("Error: Failed to listen on socket\n")
         sock.close()
         collection_destroy(@collection)
         if storage != null
@@ -421,12 +399,10 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
             buffer_pool_destroy(pool)
         return 1
 
-    prints("Server listening on 0.0.0.0:")
-    print_i32(port)
-    prints("\n")
-    prints("Press Ctrl+C to stop.\n")
-    prints("Note: Each write is committed (WAL + data file) before it is acknowledged.\n")
-    prints("\n")
+    print("Server listening on 0.0.0.0:{port}\n")
+    print("Press Ctrl+C to stop.\n")
+    print("Note: Each write is committed (WAL + data file) before it is acknowledged.\n")
+    print("\n")
 
     # Accept loop selection — phase 7 flipped async to the default:
     #   default --no-encryption     → serve_async              (plain async)
@@ -460,7 +436,7 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
     else
         buffer_pool_destroy(pool)
 
-    prints("Server stopped.\n")
+    print("Server stopped.\n")
     return 0
 
 # Server main loop - handles encrypted connections
@@ -468,7 +444,7 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
     # Create signalfd for SIGTERM/SIGINT
     let signal_fd: i32 = signalfd_create_for_shutdown()
     if signal_fd < 0
-        prints("Warning: Failed to create signalfd, shutdown may not be graceful\n")
+        print("Warning: Failed to create signalfd, shutdown may not be graceful\n")
 
     # Set up poll fds: [0] = listen socket, [1] = signal fd
     var poll_fds: [2]PollFd
@@ -494,7 +470,7 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
 
         if poll_result == 0
             if shutdown_requested() != 0
-                prints("Shutdown requested (flag).\n")
+                print("Shutdown requested (flag).\n")
                 break
             continue
 
@@ -502,7 +478,7 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
         if signal_fd >= 0 and (poll_fds[1].revents & POLLIN) != 0
             let sig: i32 = signalfd_read(signal_fd)
             if sig == SIGTERM or sig == SIGINT
-                prints("Received shutdown signal, stopping server...\n")
+                print("Received shutdown signal, stopping server...\n")
                 break
 
         # Check for new connection
@@ -520,12 +496,12 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
             client_sock.family = AF_INET
             client_sock.socktype = SOCK_STREAM
 
-            prints("New connection, performing encrypted handshake...\n")
+            print("New connection, performing encrypted handshake...\n")
 
             # Initialize encrypted channel
             var channel: EncryptedChannel = channel_new()
             if channel_init_server(@channel, client_sock) < 0
-                prints("  Error: Channel init failed\n")
+                print("  Error: Channel init failed\n")
                 sys_close(client_fd)
                 poll_fds[0].revents = 0
                 poll_fds[1].revents = 0
@@ -533,14 +509,14 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
 
             # Perform handshake
             if channel_handshake_server(@channel) < 0
-                prints("  Error: Handshake failed\n")
+                print("  Error: Handshake failed\n")
                 channel_free(@channel)
                 sys_close(client_fd)
                 poll_fds[0].revents = 0
                 poll_fds[1].revents = 0
                 continue
 
-            prints("  Encrypted session established.\n")
+            print("  Encrypted session established.\n")
 
             # Handle commands
             handle_encrypted_session(@channel, pool, storage, reg)
@@ -548,7 +524,7 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
             # Cleanup
             channel_free(@channel)
             sys_close(client_fd)
-            prints("Connection closed.\n")
+            print("Connection closed.\n")
 
         # Reset revents for next poll
         poll_fds[0].revents = 0
@@ -701,9 +677,7 @@ fn handle_insert(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, 
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to insert document")
         return
 
-    prints("  INSERT doc_id=")
-    print_i64(out_id.value)
-    prints("\n")
+    print("  INSERT doc_id={out_id.value}\n")
 
     build_insert_ok(resp, request_id, out_id.value)
 
@@ -731,11 +705,7 @@ fn handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, col
     else if get_result != ERR_OK
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
     else
-        prints("  GET doc_id=")
-        print_i64(doc_id_val)
-        prints(" size=")
-        print_i64(doc_size)
-        prints("\n")
+        print("  GET doc_id={doc_id_val} size={doc_size}\n")
         build_get_ok(resp, request_id, doc_buf, doc_size as i32)
     free(doc_buf)
 
@@ -771,9 +741,7 @@ fn handle_update(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, 
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to update document")
         return
 
-    prints("  UPDATE doc_id=")
-    print_i64(doc.id.value)
-    prints("\n")
+    print("  UPDATE doc_id={doc.id.value}\n")
 
     build_update_ok(resp, request_id)
 
@@ -798,9 +766,7 @@ fn handle_delete(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, 
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to delete document")
         return
 
-    prints("  DELETE doc_id=")
-    print_i64(doc_id_val)
-    prints("\n")
+    print("  DELETE doc_id={doc_id_val}\n")
 
     build_delete_ok(resp, request_id)
 
@@ -837,9 +803,7 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
     # Read max_results (0 = all)
     let max_results: i32 = msgreader_read_i32(reader)
 
-    prints("  SCAN max_results=")
-    print_i32(max_results)
-    prints("\n")
+    print("  SCAN max_results={max_results}\n")
 
     # A batch is up to ASYNC_MAX_MSG: room for one MAX_DOC_SIZE document,
     # or several small ones (AGAST #3638).
@@ -957,9 +921,7 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
     free(val_buf)
     btree_iter_destroy(iter)
 
-    prints("  SCAN emitted ")
-    print_i32(total_emitted)
-    prints(" doc(s)\n")
+    print("  SCAN emitted {total_emitted} doc(s)\n")
 
     # Trailing SCAN_END goes into the caller's resp buffer; serve loop
     # sends it after handle_scan returns.
@@ -1032,7 +994,7 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
     # Create signalfd for SIGTERM/SIGINT for graceful shutdown
     let signal_fd: i32 = signalfd_create_for_shutdown()
     if signal_fd < 0
-        prints("Warning: Failed to create signalfd, shutdown may not be graceful\n")
+        print("Warning: Failed to create signalfd, shutdown may not be graceful\n")
 
     # Set up poll fds: [0] = listen socket, [1] = signal fd
     var poll_fds: [2]PollFd
@@ -1061,7 +1023,7 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
         if poll_result == 0
             # Timeout - check shutdown flag
             if shutdown_requested() != 0
-                prints("Shutdown requested (flag).\n")
+                print("Shutdown requested (flag).\n")
                 break
             continue
 
@@ -1069,7 +1031,7 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
         if signal_fd >= 0 and (poll_fds[1].revents & POLLIN) != 0
             let sig: i32 = signalfd_read(signal_fd)
             if sig == SIGTERM or sig == SIGINT
-                prints("Received shutdown signal, stopping server...\n")
+                print("Received shutdown signal, stopping server...\n")
                 break
 
         # Check for new connection
@@ -1078,14 +1040,14 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
             if client_fd < 0
                 continue
 
-            prints("New connection (plain TCP).\n")
+            print("New connection (plain TCP).\n")
 
             # Handle session using plain TCP
             handle_plain_session(client_fd, pool, storage, reg)
 
             # Cleanup
             sys_close(client_fd)
-            prints("Connection closed.\n")
+            print("Connection closed.\n")
 
         # Reset revents for next poll
         poll_fds[0].revents = 0
@@ -1125,7 +1087,7 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *Col
         msgbuf_init(@resp, buf + ASYNC_MAX_MSG, ASYNC_MAX_MSG)
 
         if msg_type == MSG_CONNECT
-            prints("  CONNECT received\n")
+            print("  CONNECT received\n")
             collection = serial_connect(@reader, @resp, request_id, reg, collection)
 
         else if msg_type == MSG_PING
@@ -1245,22 +1207,16 @@ fn write_all(fd: i32, data: *u8, len: i32)
 # ============================================================================
 
 fn cmd_shell(host: StrView, port: i32, collection: StrView, no_encryption: i32) -> i32
-    prints("Mausoleum Shell\n")
-    prints("Connecting to ")
-    # Print StrView (it's null-terminated since it's a literal or from strview_from_cstr)
-    prints_cstr(host.ptr)
-    prints(":")
-    print_i32(port)
-    prints(", collection ")
-    prints_cstr(collection.ptr)
+    print("Mausoleum Shell\n")
+    print("Connecting to {host}:{port}, collection {collection}")
     if no_encryption != 0
-        prints(" (plain)...\n")
+        print(" (plain)...\n")
     else
-        prints(" (encrypted)...\n")
+        print(" (encrypted)...\n")
 
     let client: *Client = client_new()
     if client == null
-        prints("Error: Failed to create client\n")
+        print("Error: Failed to create client\n")
         return 1
 
     var rc: i32 = 0
@@ -1269,29 +1225,27 @@ fn cmd_shell(host: StrView, port: i32, collection: StrView, no_encryption: i32) 
     else
         rc = client_connect_encrypted(client, host, port, collection)
     if rc < 0
-        prints("Error: Failed to connect to server (error ")
-        print_i32(rc)
         let connect_errno: i32 = client_last_errno(client)
         if connect_errno != 0
-            prints(", errno ")
-            print_i32(connect_errno)
-        prints(")\n")
+            print("Error: Failed to connect to server (error {rc}, errno {connect_errno})\n")
+        else
+            print("Error: Failed to connect to server (error {rc})\n")
         client_free(client)
         return 1
 
     if no_encryption != 0
-        prints("Session established (unencrypted).\n")
+        print("Session established (unencrypted).\n")
     else
-        prints("Encrypted session established.\n")
-    prints("\n")
+        print("Encrypted session established.\n")
+    print("\n")
     shell_print_help()
-    prints("\n")
+    print("\n")
 
     let failures: i32 = shell_run(client, STDIN)
 
     client_disconnect(client)
     client_free(client)
-    prints("Disconnected.\n")
+    print("Disconnected.\n")
     if failures > 0
         return 1
     return 0
@@ -1300,25 +1254,25 @@ fn cmd_shell(host: StrView, port: i32, collection: StrView, no_encryption: i32) 
 # Main Entry Point
 # ============================================================================
 
-pub fn main(argc: i32, argv: **u8) -> i32
-    var args: Args
-    parse_args(argc, argv, @args)
+pub fn main(args: Span<StrView>) -> i32
+    var parsed: Args
+    parse_args(args, @parsed)
 
-    if args.command == CMD_BAD_ARGS
+    if parsed.command == CMD_BAD_ARGS
         return 2
 
-    if args.command == CMD_HELP
+    if parsed.command == CMD_HELP
         print_help()
         return 0
 
-    if args.command == CMD_VERSION
+    if parsed.command == CMD_VERSION
         print_version()
         return 0
 
-    if args.command == CMD_SERVE
-        return cmd_serve(args.port, args.data_dir, args.no_encryption, args.serial_mode)
+    if parsed.command == CMD_SERVE
+        return cmd_serve(parsed.port, parsed.data_dir, parsed.no_encryption, parsed.serial_mode)
 
-    if args.command == CMD_SHELL
-        return cmd_shell(args.host, args.port, args.collection, args.no_encryption)
+    if parsed.command == CMD_SHELL
+        return cmd_shell(parsed.host, parsed.port, parsed.collection, parsed.no_encryption)
 
     return 0

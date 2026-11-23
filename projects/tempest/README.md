@@ -66,17 +66,17 @@ import sage { Engine }
 import iris { RenderEngine }
 import prism { Window }
 
-fn main(argc: i32, argv: **u8) -> i32
+pub fn main(args: Span<StrView>) -> i32
     let window = prism_create_window(800, 600, "Tempest")
     let tab = spawn_tab_process(window.id)
-    tab.navigate(argv[1])
+    tab.navigate(args[1])
     event_loop(window)
     0
 ```
 
 ```ritz
 # Tab process entry point (tab_process.ritz)
-fn main(argc: i32, argv: **u8) -> i32
+pub fn main(args: Span<StrView>) -> i32
     let renderer = iris_connect(prism_connect())
     let js_engine = sage_create()
     let parser = lexis_create(renderer, js_engine)

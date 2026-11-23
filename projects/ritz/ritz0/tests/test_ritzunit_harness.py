@@ -251,6 +251,19 @@ def test_strip_main_keeps_line_numbers_and_what_follows_main():
     assert out[:3] == ["", "", ""]
     assert out[3:] == src[3:]
 
+    published = textwrap.dedent("""\
+        pub fn main() -> i32
+            0
+
+        [[test]]
+        fn stays() -> i32
+            0
+        """)
+    blanked = test_runner.strip_main_from_source(published).split("\n")
+    original = published.split("\n")
+    assert blanked[:2] == ["", ""]
+    assert blanked[2:] == original[2:]
+
 
 # `main` sits above the tests: a harness that deletes its lines would shift
 # every location after it.

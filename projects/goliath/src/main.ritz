@@ -43,7 +43,7 @@ pub import goliath.path { path_is_absolute, path_is_root, path_validate }
 #
 # ritzlib.fs is not imported: its path_basename collides with goliath.path's.
 import ritzlib.sys { sys_open, sys_read, sys_write, sys_close, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
-import ritzlib.io { prints, prints_cstr, eprints, eprints_cstr, print_int }
+import ritzlib.fmt
 import ritzlib.strview { StrView, strview_from_cstr, strview_from_ptr }
 import ritzlib.os.env { env_get_or }
 import ritzlib.span { Span, span_from_ptr }
@@ -60,35 +60,26 @@ const CLI_MAX_ENTRIES: i32 = 256   # namespace.ritz's MAX_DIR_ENTRIES
 const CLI_PATH_MAX: i64 = 4096
 
 fn print_usage()
-    prints_cstr(c"Usage: goliath [--help] COMMAND [ARGS]\n")
-    prints_cstr(c"\n")
-    prints_cstr(c"Goliath is a content-addressable blob store. Commands:\n")
-    prints_cstr(c"    put FILE     store FILE as /<its name>, print its blob id\n")
-    prints_cstr(c"    get ID       write blob ID to stdout\n")
-    prints_cstr(c"    ls PATH      list a directory (ID  SIZE  NAME), or one file\n")
-    prints_cstr(c"\n")
-    prints_cstr(c"The store is the file $GOLIATH_STORE (default ./goliath.store).\n")
+    print("Usage: goliath [--help] COMMAND [ARGS]\n")
+    print("\n")
+    print("Goliath is a content-addressable blob store. Commands:\n")
+    print("    put FILE     store FILE as /<its name>, print its blob id\n")
+    print("    get ID       write blob ID to stdout\n")
+    print("    ls PATH      list a directory (ID  SIZE  NAME), or one file\n")
+    print("\n")
+    print("The store is the file $GOLIATH_STORE (default ./goliath.store).\n")
 
-fn usage_error(msg: *u8) -> i32
-    eprints_cstr(c"goliath: ")
-    eprints_cstr(msg)
-    eprints_cstr(c"\nUsage: goliath [--help] COMMAND [ARGS] (try --help)\n")
+fn usage_error(msg: StrView) -> i32
+    eprint("goliath: {msg}\nUsage: goliath [--help] COMMAND [ARGS] (try --help)\n")
     2
 
 # "goliath: <cmd>: <what>: <msg>\n" on stderr; returns 1.
-fn fail(cmd: *u8, what: StrView, msg: *u8) -> i32
-    eprints_cstr(c"goliath: ")
-    eprints_cstr(cmd)
-    eprints_cstr(c": ")
+fn fail(cmd: StrView, what: StrView, msg: StrView) -> i32
     if what.len > 0
-        eprints(what)
-        eprints_cstr(c": ")
-    eprints_cstr(msg)
-    eprints_cstr(c"\n")
+        eprint("goliath: {cmd}: {what}: {msg}\n")
+    else
+        eprint("goliath: {cmd}: {msg}\n")
     1
-
-fn arg(argv: **u8, i: i32) -> StrView
-    strview_from_cstr(*(argv + i))
 
 # $GOLIATH_STORE if set and non-empty, else ./goliath.store
 fn store_path() -> StrView
@@ -98,20 +89,21 @@ fn store_path() -> StrView
     "goliath.store"
 
 # Open the store, or say why not (returns 1 then, else 0).
-fn open_store(cmd: *u8, path: StrView, store: *MemoryBlobStore, ns: *Namespace) -> i32
+fn open_store(cmd: StrView, path: StrView, store: *MemoryBlobStore, ns: *Namespace) -> i32
     let rc: ErrorCode = file_store_open(path, store, ns)
     if rc == ErrorCode.Ok
         return 0
     if rc == ErrorCode.CorruptBlob
-        return fail(cmd, path, c"corrupt store file (not a goliath store, or damaged)")
+        return fail(cmd, path, "corrupt store file (not a goliath store, or damaged)")
     if rc == ErrorCode.PathTooLong
-        return fail(cmd, path, c"bad store path")
-    fail(cmd, path, c"cannot read store file")
+        return fail(cmd, path, "bad store path")
+    fail(cmd, path, "cannot read store file")
 
 fn print_hex_id(id: *BlobId)
     var hex: [65]u8
     blob_id_to_hex(id, @hex[0])
-    prints_cstr(@hex[0])
+    let h: StrView = strview_from_cstr(@hex[0])
+    print("{h}")
 
 # ============================================================================
 # put FILE
@@ -161,20 +153,20 @@ fn read_host_file(cpath: *u8, len_out: *i64, cap_out: *i64) -> *u8
 
 fn cmd_put(file: StrView, store_file: StrView) -> i32
     if file.len >= CLI_PATH_MAX
-        return fail(c"put", file, c"path too long")
+        return fail("put", file, "path too long")
     # argv strings are NUL-terminated
     var len: i64 = 0
     var cap: i64 = 0
     let data: *u8 = read_host_file(file.ptr, @len, @cap)
     if data == null
-        return fail(c"put", file, c"cannot read file")
+        return fail("put", file, "cannot read file")
 
     # Link it at /<basename>
     let name: StrView = path_basename(file)
     var nspath: [258]u8
     if name.len == 0 or name.len > 255
         sys_munmap(data, cap)
-        return fail(c"put", file, c"no usable file name to store it under")
+        return fail("put", file, "no usable file name to store it under")
     nspath[0] = 47  # '/'
     var i: i64 = 0
     while i < name.len
@@ -183,14 +175,14 @@ fn cmd_put(file: StrView, store_file: StrView) -> i32
     let path: StrView = strview_from_ptr(@nspath[0], name.len + 1)
     if not path_validate(path)
         sys_munmap(data, cap)
-        return fail(c"put", name, c"not a valid goliath file name")
+        return fail("put", name, "not a valid goliath file name")
 
     # Hold the writer lock from load to save, so a concurrent put can't load
     # the same old store and rename its copy over ours (#3882)
     let lock: i32 = file_store_lock(store_file)
     if lock < 0
         sys_munmap(data, cap)
-        return fail(c"put", store_file, c"cannot lock store file")
+        return fail("put", store_file, "cannot lock store file")
     let rc: i32 = put_locked(file, path, data, len, store_file)
     file_store_unlock(lock)
     sys_munmap(data, cap)
@@ -200,7 +192,7 @@ fn cmd_put(file: StrView, store_file: StrView) -> i32
 fn put_locked(file: StrView, path: StrView, data: *u8, len: i64, store_file: StrView) -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace
-    if open_store(c"put", store_file, @store, @ns) != 0
+    if open_store("put", store_file, @store, @ns) != 0
         memory_store_free(@store)
         return 1
 
@@ -213,14 +205,14 @@ fn put_locked(file: StrView, path: StrView, data: *u8, len: i64, store_file: Str
         if wrc != ErrorCode.Ok
             memory_store_free(@store)
             if wrc == ErrorCode.OutOfSpace
-                return fail(c"put", path, c"root directory is full")
-            return fail(c"put", path, c"cannot link it into the namespace")
+                return fail("put", path, "root directory is full")
+            return fail("put", path, "cannot link it into the namespace")
         if file_store_save(store_file, @ns) != ErrorCode.Ok
             memory_store_free(@store)
-            return fail(c"put", store_file, c"cannot write store file")
+            return fail("put", store_file, "cannot write store file")
     memory_store_free(@store)
     print_hex_id(@id)
-    prints_cstr(c"\n")
+    print("\n")
     0
 
 # ============================================================================
@@ -230,16 +222,16 @@ fn put_locked(file: StrView, path: StrView, data: *u8, len: i64, store_file: Str
 fn cmd_get(hex: StrView, store_file: StrView) -> i32
     var id: BlobId
     if not blob_id_from_hex(hex, @id)
-        return fail(c"get", hex, c"not a blob id (want 64 hex digits)")
+        return fail("get", hex, "not a blob id (want 64 hex digits)")
 
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace
-    if open_store(c"get", store_file, @store, @ns) != 0
+    if open_store("get", store_file, @store, @ns) != 0
         memory_store_free(@store)
         return 1
     if not memory_store_exists(@store, @id)
         memory_store_free(@store)
-        return fail(c"get", hex, c"not found")
+        return fail("get", hex, "not found")
 
     let data: *u8 = memory_store_get(@store, @id)
     let size: i64 = memory_store_get_size(@store, @id) as i64
@@ -248,7 +240,7 @@ fn cmd_get(hex: StrView, store_file: StrView) -> i32
         let n: i64 = sys_write(1, data + done, size - done)
         if n <= 0
             memory_store_free(@store)
-            return fail(c"get", hex, c"write to stdout failed")
+            return fail("get", hex, "write to stdout failed")
         done = done + n
     memory_store_free(@store)
     0
@@ -259,13 +251,12 @@ fn cmd_get(hex: StrView, store_file: StrView) -> i32
 
 fn print_entry(entry: *DirEntry)
     print_hex_id(@(*entry).blob_id)
-    prints_cstr(c"  ")
-    print_int((*entry).metadata.size as i64)
-    prints_cstr(c"  ")
-    prints(dir_entry_name(entry))
+    let size: i64 = (*entry).metadata.size as i64
+    let name: StrView = dir_entry_name(entry)
     if dir_entry_is_dir(entry)
-        prints_cstr(c"/")
-    prints_cstr(c"\n")
+        print("  {size}  {name}/\n")
+    else
+        print("  {size}  {name}\n")
 
 # Print every entry of the directory at `dir`. -1 if it isn't one.
 fn list_dir(ns: *Namespace, dir: StrView, entries: *DirEntry) -> i32
@@ -280,13 +271,13 @@ fn list_dir(ns: *Namespace, dir: StrView, entries: *DirEntry) -> i32
 
 fn cmd_ls(path: StrView, store_file: StrView) -> i32
     if not path_is_absolute(path)
-        return fail(c"ls", path, c"not an absolute path (goliath paths start with /)")
+        return fail("ls", path, "not an absolute path (goliath paths start with /)")
     if not path_validate(path)
-        return fail(c"ls", path, c"not a valid goliath path")
+        return fail("ls", path, "not a valid goliath path")
 
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace
-    if open_store(c"ls", store_file, @store, @ns) != 0
+    if open_store("ls", store_file, @store, @ns) != 0
         memory_store_free(@store)
         return 1
 
@@ -294,7 +285,7 @@ fn cmd_ls(path: StrView, store_file: StrView) -> i32
     var rc: i32 = 0
     if path_is_root(path)
         if list_dir(@ns, path, @entries[0]) != 0
-            rc = fail(c"ls", path, c"cannot read directory")
+            rc = fail("ls", path, "cannot read directory")
     else
         # Find PATH's own entry in its parent: a directory is listed, a
         # file is printed as itself
@@ -309,39 +300,37 @@ fn cmd_ls(path: StrView, store_file: StrView) -> i32
                 break
             i = i + 1
         if found < 0
-            rc = fail(c"ls", path, c"not found")
+            rc = fail("ls", path, "not found")
         else if dir_entry_is_dir(@entries[found])
             if list_dir(@ns, path, @entries[0]) != 0
-                rc = fail(c"ls", path, c"cannot read directory")
+                rc = fail("ls", path, "cannot read directory")
         else
             print_entry(@entries[found])
     memory_store_free(@store)
     rc
 
-pub fn main(argc: i32, argv: **u8) -> i32
-    if argc < 2
-        return usage_error(c"no command")
+pub fn main(args: Span<StrView>) -> i32
+    if args.len < 2
+        return usage_error("no command")
 
-    let cmd: StrView = arg(argv, 1)
-    if cmd.eq_cstr(c"--help") or cmd.eq_cstr(c"-h")
+    let cmd: StrView = args[1]
+    if cmd.eq("--help") or cmd.eq("-h")
         print_usage()
         return 0
 
     let store_file: StrView = store_path()
-    if cmd.eq_cstr(c"put")
-        if argc != 3
-            return usage_error(c"put takes one FILE")
-        return cmd_put(arg(argv, 2), store_file)
-    if cmd.eq_cstr(c"get")
-        if argc != 3
-            return usage_error(c"get takes one blob ID")
-        return cmd_get(arg(argv, 2), store_file)
-    if cmd.eq_cstr(c"ls")
-        if argc != 3
-            return usage_error(c"ls takes one PATH")
-        return cmd_ls(arg(argv, 2), store_file)
+    if cmd.eq("put")
+        if args.len != 3
+            return usage_error("put takes one FILE")
+        return cmd_put(args[2], store_file)
+    if cmd.eq("get")
+        if args.len != 3
+            return usage_error("get takes one blob ID")
+        return cmd_get(args[2], store_file)
+    if cmd.eq("ls")
+        if args.len != 3
+            return usage_error("ls takes one PATH")
+        return cmd_ls(args[2], store_file)
 
-    eprints_cstr(c"goliath: unknown command '")
-    eprints(cmd)
-    eprints_cstr(c"' (try --help)\n")
+    eprint("goliath: unknown command '{cmd}' (try --help)\n")
     2

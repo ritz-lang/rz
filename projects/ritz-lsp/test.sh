@@ -749,7 +749,7 @@ if REAL_RITZ1.is_file():
     env = {k: v for k, v in os.environ.items() if k not in ("RITZ1", "RITZ_PATH")}
     ruri = (docdir / "real.ritz").as_uri()
     undefined = "fn main() -> i32\n    nope(1)\n"
-    uses_ritzlib = 'import ritzlib.io\n\nfn main() -> i32\n    prints_cstr(c"hi\\n")\n    0\n'
+    uses_ritzlib = 'import ritzlib.fmt\n\nfn main() -> i32\n    print("hi\\n")\n    0\n'
     rc, out = stepwise([did_open(ruri, undefined, 1), did_change(ruri, uses_ritzlib, 2)],
                        env=env, cwd=str(scratch))
     d = diags(out) + [{}, {}]

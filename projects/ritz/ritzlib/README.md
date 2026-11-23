@@ -40,19 +40,21 @@ pub fn main() -> i32
 ```
 
 ```ritz
-import ritzlib.io
+import ritzlib.fmt
 import ritzlib.strview
 import ritzlib.gvec
 
 pub fn main() -> i32
     # A string literal is a StrView: a { ptr, len } pair, no allocation
     let s: StrView = "hello"
-    print_int(strview_len(s))
+    let n: i64 = strview_len(s)
+    print("{n}")
 
     # Vec<T> is the generic dynamic array
     var items: Vec<i64> = vec_new<i64>()
     items.push(42)
-    print_int(items.get(0))
+    let first: i64 = items.get(0)
+    print("{first}")
     0                       # `items` is freed here (Vec has Drop)
 ```
 

@@ -15,13 +15,13 @@
 # Config file: See valet.json for format
 
 import ritzlib.sys
-import ritzlib.io
+import ritzlib.fmt
 import ritzlib.str
 import ritzlib.option
 import ritzlib.result
 import ritzlib.strview
 import ritzlib.fmt.digits { fmt_i64_into }
-import ritzlib.span
+import ritzlib.span { Span }
 import ritzlib.gvec
 import ritzlib.argspec
 import ritzlib.async.tasks
@@ -104,8 +104,8 @@ fn logging_middleware(path: *u8, path_len: i32) -> i32
     for i in 0..copy_len
         path_buf[i] = *(path + i)
     path_buf[copy_len] = 0
-    prints_cstr(@path_buf[0])
-    prints("\n")
+    let shown: StrView = strview_from_ptr(@path_buf[0], copy_len as i64)
+    print("{shown}\n")
     return MW_CONTINUE  # Continue to next middleware/handler
 
 
@@ -535,35 +535,20 @@ var g_proxy_total_continuations: i64 = 0
 var g_proxy_pending_returned: i64 = 0  # times we returned STATUS_PROXY_PENDING
 
 pub fn proxy_dump_counters()
-    prints_cstr(c"[counters] entries=")
-    print_int(g_proxy_total_entries)
-    prints_cstr(c" pending_ret=")
-    print_int(g_proxy_pending_returned)
-    prints_cstr(c" submits=")
-    print_int(g_proxy_total_submits)
-    prints_cstr(c" completions=")
-    print_int(g_proxy_total_completions)
-    prints_cstr(c" continuations=")
-    print_int(g_proxy_total_continuations)
-    prints_cstr(c" ring_full=")
-    print_int(g_proxy_ring_full)
-    prints_cstr(c" submit_fail=")
-    print_int(g_proxy_submit_fail)
-    prints_cstr(c" arm_fail=")
-    print_int(g_proxy_arm_fail)
-    prints_cstr(c" send_fail_cont=")
-    print_int(g_proxy_send_fail_continuation)
-    prints_cstr(c" state_lost=")
-    print_int(g_proxy_state_lost)
-    prints_cstr(c" handle_null=")
-    print_int(g_proxy_handle_null)
-    prints_cstr(c" deadline_504=")
-    print_int(g_proxy_deadline_504)
-    prints_cstr(c" arena_oversize=")
-    print_int(g_proxy_arena_oversize)
-    prints_cstr(c" bad_response=")
-    print_int(g_proxy_bad_response)
-    prints_cstr(c"\n")
+    print("[counters] entries={g_proxy_total_entries}")
+    print(" pending_ret={g_proxy_pending_returned}")
+    print(" submits={g_proxy_total_submits}")
+    print(" completions={g_proxy_total_completions}")
+    print(" continuations={g_proxy_total_continuations}")
+    print(" ring_full={g_proxy_ring_full}")
+    print(" submit_fail={g_proxy_submit_fail}")
+    print(" arm_fail={g_proxy_arm_fail}")
+    print(" send_fail_cont={g_proxy_send_fail_continuation}")
+    print(" state_lost={g_proxy_state_lost}")
+    print(" handle_null={g_proxy_handle_null}")
+    print(" deadline_504={g_proxy_deadline_504}")
+    print(" arena_oversize={g_proxy_arena_oversize}")
+    print(" bad_response={g_proxy_bad_response}\n")
 
 
 # Continuation for the cooperative-yield proxy.  Invoked by valet's
@@ -752,11 +737,10 @@ fn cli_path(p: @ParsedArgs, name: StrView) -> StrView
 # Main
 # ============================================================================
 
-fn main(argc: i32, argv: **u8) -> i32
-    # Parse arguments
-    var all = args_from_argv(argc, argv)
+pub fn main(args: Span<StrView>) -> i32
+    # Parse arguments. args[0] is the program name.
     let spec = build_spec()
-    let parsed = match spec.parse(args_tail(@all))
+    let parsed = match spec.parse(args.from(1))
         Ok(p) => p
         Err(e) => return usage_error(@spec, e)
 
@@ -781,15 +765,13 @@ fn main(argc: i32, argv: **u8) -> i32
     if config_path.len > 0
         let ret: i32 = config_load(@cfg, config_path.ptr)
         if ret < 0
-            eprints("valet: failed to load config file\n")
+            eprint("valet: failed to load config file\n")
             return 1
-        prints("Loaded config from: ")
-        prints(config_path)
-        prints("\n")
+        print("Loaded config from: {config_path}\n")
     else
         # Try default config file
         if config_load(@cfg, c"valet.json") == 0
-            prints("Loaded config from: valet.json\n")
+            print("Loaded config from: valet.json\n")
 
     # Command-line overrides
     if cli_port > 0
@@ -801,22 +783,22 @@ fn main(argc: i32, argv: **u8) -> i32
 
     # Validate
     if cfg.port <= 0 || cfg.port > 65535
-        eprints("valet: invalid port number\n")
+        eprint("valet: invalid port number\n")
         return 1
 
     if cfg.workers < 0
-        eprints("valet: invalid worker count\n")
+        eprint("valet: invalid worker count\n")
         return 1
 
     # Setup signal handling
     config_setup_signals()
 
     # Print banner
-    prints("\n")
-    prints("Valet HTTP Server\n")
-    prints("=================\n")
+    print("\n")
+    print("Valet HTTP Server\n")
+    print("=================\n")
     config_print(@cfg)
-    prints("\n")
+    print("\n")
 
     # Initialize Valet app
     var app: Valet
@@ -839,7 +821,7 @@ fn main(argc: i32, argv: **u8) -> i32
     if cfg.tls_enabled != 0
         let tls_ret: i32 = valet_tls_files(@app, @cfg.tls_cert[0], @cfg.tls_key[0])
         if tls_ret < 0
-            eprints("valet: failed to load TLS certificates\n")
+            eprint("valet: failed to load TLS certificates\n")
             return 1
 
     # Register middleware
@@ -850,17 +832,15 @@ fn main(argc: i32, argv: **u8) -> i32
     # zeus daemon over the shm ring.  See handle_zeus_proxy above.
     let zeus_sock: StrView = cli_path(@parsed, "zeus-socket")
     if zeus_sock.len > 0
-        prints("Zeus reverse-proxy mode enabled\n")
-        prints("  zeus socket: ")
-        prints(zeus_sock)
-        prints("\n")
+        print("Zeus reverse-proxy mode enabled\n")
+        print("  zeus socket: {zeus_sock}\n")
 
         # Allocate the client on the heap so its address survives across
         # handler invocations (handlers reach it via g_zeus_client_ptr).
         let zc_size: i64 = 4096
         let zc_mem: *u8 = sys_mmap(0, zc_size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
         if zc_mem == (-1) as *u8
-            eprints("valet: failed to allocate zeus client\n")
+            eprint("valet: failed to allocate zeus client\n")
             return 1
         let client: *ZeusClient = zc_mem as *ZeusClient
 
@@ -869,34 +849,30 @@ fn main(argc: i32, argv: **u8) -> i32
 
         let zinit: i32 = zeus_client_init(client, @zcfg)
         if zinit != 0
-            eprints("valet: zeus_client_init failed\n")
+            eprint("valet: zeus_client_init failed\n")
             return 1
 
         let zconn: i32 = zeus_client_connect(client, zeus_sock.ptr)
         if zconn != 0
-            eprints("valet: zeus_client_connect failed\n")
+            eprint("valet: zeus_client_connect failed\n")
             return 1
 
         let zhs: i32 = zeus_client_handshake(client)
         if zhs < 0
-            eprints("valet: zeus handshake failed\n")
+            eprint("valet: zeus handshake failed\n")
             return 1
 
-        prints("  reported workers: ")
-        print_int(zhs as i64)
-        prints("\n")
+        print("  reported workers: {zhs}\n")
 
         var attached: i32 = 0
         while attached < zhs
             let widx: i32 = zeus_client_recv_worker(client)
             if widx < 0
-                eprints("valet: failed to receive worker info\n")
+                eprint("valet: failed to receive worker info\n")
                 return 1
             attached += 1
 
-        prints("  attached workers: ")
-        print_int(attached as i64)
-        prints("\n")
+        print("  attached workers: {attached}\n")
 
         g_zeus_client_ptr = client as i64
         g_zeus_attached = attached

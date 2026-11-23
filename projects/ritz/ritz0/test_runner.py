@@ -312,7 +312,8 @@ def strip_main_from_source(source: str) -> str:
         indent = len(line) - len(stripped)
         if in_main and stripped and not stripped.startswith('#') and indent <= main_indent:
             in_main = False
-        if not in_main and (stripped.startswith('fn main(') or stripped.startswith('fn main (')):
+        header = stripped[4:].lstrip() if stripped.startswith('pub ') else stripped
+        if not in_main and (header.startswith('fn main(') or header.startswith('fn main (')):
             in_main = True
             main_indent = indent
         result_lines.append('' if in_main else line)
