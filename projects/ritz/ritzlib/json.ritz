@@ -419,22 +419,36 @@ fn jp_parse_string(p: *JsonParser, is_key: i32) -> *JsonValue
     v.str_len = dst_pos
     return v
 
+# num_val is the integer part, truncated toward zero, saturated at the i64
+# bounds.  Fraction digits are consumed but not accumulated (#4571): a
+# valid number of any length parses without overflowing.
 fn jp_parse_number(p: *JsonParser) -> *JsonValue
     var neg: i32 = 0
     if jp_peek(p) == '-'  # '-'
         neg = 1
         jp_advance(p)
 
+    # Negative numbers accumulate below zero so that i64 MIN is reachable.
+    let i64_max: i64 = 9223372036854775807
+    let i64_min: i64 = 0 - i64_max - 1
     var val: i64 = 0
     var has_decimal: i32 = 0
-    var decimal_places: i64 = 0
 
     while p.pos < p.len
         let ch: i32 = jp_peek(p)
         if ch >= 48 and ch <= 57  # '0'-'9'
-            if has_decimal != 0
-                decimal_places += 1
-            val = val * 10 + (ch - 48) as i64
+            if has_decimal == 0
+                let d: i64 = (ch - 48) as i64
+                if neg != 0
+                    if val < (i64_min + d) / 10
+                        val = i64_min
+                    else
+                        val = val * 10 - d
+                else
+                    if val > (i64_max - d) / 10
+                        val = i64_max
+                    else
+                        val = val * 10 + d
             jp_advance(p)
         else if ch == '.' and has_decimal == 0  # '.'
             has_decimal = 1
@@ -442,15 +456,11 @@ fn jp_parse_number(p: *JsonParser) -> *JsonValue
         else
             break
 
-    if neg != 0
-        val = 0 - val
-
     let v: *JsonValue = match json_alloc_value()
         Some(x) => x
         None => return null
     v.kind = JSON_NUMBER
     v.num_val = val
-    # Note: For float support, we'd need to track decimal_places
     return v
 
 fn jp_parse_array(p: *JsonParser) -> *JsonValue

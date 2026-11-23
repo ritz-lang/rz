@@ -7,7 +7,9 @@
 #     a raw control character inside a string: code 8 (JSON_ERR_CONTROL_CHAR)
 #     at that byte (AGAST #3941);
 #     pos is where the parser stopped (end of input for "[1, 2" and "\"open");
-#   - numbers are integers: -1.25 parses as -125, -0012 as -12;
+#   - numbers are integers, the fraction truncated and the integer part
+#     saturated at the i64 bounds (AGAST #4571): -1.25 parses as -1,
+#     -0012 as -12;
 #   - input after the first value is ignored: "[1] x" parses as [1];
 #   - "\/" decodes to "/" (a JSON escape since AGAST #3914; before that it
 #     was an unknown escape that happened to copy the right character).
@@ -51,7 +53,7 @@ $ object {6}
 .owner null is_null=1
 .meta object {5}
 .meta.tier number 5
-.meta.ratio number -125
+.meta.ratio number -1
 .meta.quote string |say "hi"<9>now| "say \"hi\"\tnow"
 .meta.empty array [0]
 .meta.none object {0}
@@ -61,7 +63,7 @@ count number: 3
 count string: 4
 count array: 2
 count object: 3
-emit: {"name": "ritz", "version": 3, "stable": false, "tags": ["compiler", "self-hosted"], "owner": null, "meta": {"tier": 5, "ratio": -125, "quote": "say \"hi\"\tnow", "empty": [], "none": {}}}
+emit: {"name": "ritz", "version": 3, "stable": false, "tags": ["compiler", "self-hosted"], "owner": null, "meta": {"tier": 5, "ratio": -1, "quote": "say \"hi\"\tnow", "empty": [], "none": {}}}
 roundtrip: identical
 == lookup ==
 name: ritz
@@ -77,7 +79,7 @@ owner is_null: 1
 name is_null: 0
 meta object_len: 5
 meta.tier: 5
-meta.ratio (-1.25): -125
+meta.ratio (-1.25): -1
 meta.quote: say "hi"<9>now
 meta.empty array_len: 0
 meta.none object_len: 0
