@@ -26,6 +26,7 @@ import ritzlib.string
 import ritzlib.strview
 import ritzlib.result
 import ritzlib.option
+import ritzlib.memory  # malloc, free: DirIter's getdents buffer
 # Errno is part of this API (every Err), so importers of fs get it too.
 pub import ritzlib.errno
 
@@ -386,21 +387,32 @@ pub fn rmdir(path: StrView) -> Result<i32, Errno>
 
 const DIR_BUF_SIZE: i64 = 4096
 
+# `buf` is a heap block of DIR_BUF_SIZE, not an inline array. DirIter is
+# returned by value inside Result; a 4096-byte field makes that aggregate
+# about 4 KB, and clang's instruction selection then takes about a minute
+# on dir_open and on every caller. dir_close frees the block. A copy of a
+# DirIter aliases the same block; close it once.
 pub struct DirIter
     fd: i32              # Directory file descriptor
-    buf: [4096]u8        # Buffer for getdents64
+    buf: *u8             # getdents64 buffer, or null once closed
     buf_pos: i64         # Current position in buffer
     buf_len: i64         # Bytes read into buffer
     entry: *u8           # Current entry pointer
 
 # Open a directory for iteration; Err (NoEnt, NotDir, Acces, ...) if it
 # cannot be opened. Release the Ok iterator with dir_close.
+# standard-exempt: raw-alloc: getdents buffer owned by DirIter, freed in close
 pub fn dir_open(path: StrView) -> Result<DirIter, Errno>
     let fd: i32 = fs_open(path, O_RDONLY + O_DIRECTORY, 0)
     if fd < 0
         return Err(errno_from_raw(fd))
+    let buf: *u8 = malloc(DIR_BUF_SIZE)
+    if buf == null
+        sys_close(fd)
+        return Err(Errno.NoMem)
     var dir: DirIter
     dir.fd = fd
+    dir.buf = buf
     dir.buf_pos = 0
     dir.buf_len = 0
     dir.entry = null
@@ -411,10 +423,15 @@ pub fn dir_open(path: StrView) -> Result<DirIter, Errno>
 # touches fields, because ritz1 cannot forward an @&T parameter into a *T one
 # (AGAST #1652).
 fn dir_advance(dir: @&DirIter) -> bool
+    # Closed: fd < 0 and buf already freed. Do not hand getdents a null pointer.
+    if dir.fd < 0 or dir.buf == null
+        dir.entry = null
+        return false
+
     # Need more data?
     if dir.buf_pos >= dir.buf_len
         # Read next batch of entries
-        dir.buf_len = sys_getdents64(dir.fd, @dir.buf[0], DIR_BUF_SIZE)
+        dir.buf_len = sys_getdents64(dir.fd, dir.buf, DIR_BUF_SIZE)
         dir.buf_pos = 0
 
         if dir.buf_len <= 0
@@ -422,7 +439,7 @@ fn dir_advance(dir: @&DirIter) -> bool
             return false
 
     # Point to current entry
-    dir.entry = @dir.buf[0] + dir.buf_pos
+    dir.entry = dir.buf + dir.buf_pos
 
     # Advance position for next call
     let d: *Dirent64 = dir.entry as *Dirent64
@@ -456,7 +473,7 @@ impl DirIter
     #             Some(e) => handle(@e)
     #             None => break
     pub fn next_entry(self: @&DirIter) -> Option<DirEntry>
-        # A closed iterator (fd < 0) ends here too: getdents64 fails, buf_len <= 0.
+        # A closed iterator (fd < 0, buffer freed) ends here too.
         if not dir_advance(self)
             return None
         let d: *Dirent64 = self.entry as *Dirent64
@@ -489,8 +506,13 @@ impl DirIter
             Some(t) => t == DT_LNK
             None => false
 
-    # Close the directory iterator.
+    # Close the directory iterator and free its getdents buffer.
+    # A second close is a no-op.
     pub fn close(self: *DirIter)
         if self.fd >= 0
             sys_close(self.fd)
             self.fd = -1
+        if self.buf != null
+            free(self.buf)
+            self.buf = null
+        self.entry = null

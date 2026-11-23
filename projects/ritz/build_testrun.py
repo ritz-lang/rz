@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -86,9 +87,71 @@ def classify_test_file(returncode: int, stdout: str) -> tuple[str, int, int]:
     return "pass", passed, failed
 
 
+def format_duration_ms(ms: int) -> str:
+    """A duration with a unit, so it cannot be read as a pass count.
+
+    Always seconds, three decimals: `wall 0.004s` and `wall 12.345s` parse
+    the same way, and a file under 15s is a number under 15.
+    """
+    return f"{ms / 1000:.3f}s"
+
+
+# ritzunit's per-test duration at or above which the file line names it.
+SLOW_TEST_MS = 1000
+_BINARY_MS = re.compile(r"^binary_ms (\d+)$")
+_SLOW_TEST = re.compile(r"^slow (\S+) (\d+)$")
+
+
+def parse_report_timings(stdout: str) -> tuple[Optional[int], list[tuple[str, int]]]:
+    """`(binary_ms, slow tests)` from the lines `run_files` prints.
+
+    `binary_ms` is None when the binary did not report a duration (it did
+    not build, or it produced no JSON). `slow` is `(name, duration_ms)` for
+    each test at or over one second, in report order.
+    """
+    binary = None
+    slow: list[tuple[str, int]] = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        m = _BINARY_MS.match(line)
+        if m:
+            binary = int(m.group(1))
+            continue
+        m = _SLOW_TEST.match(line)
+        if m:
+            ms = int(m.group(2))
+            if ms >= SLOW_TEST_MS:
+                slow.append((m.group(1), ms))
+    return binary, slow
+
+
+def _timing_suffix(wall_ms: int, binary_ms: Optional[int]) -> str:
+    """` — wall <file unit> — binary <test binary>` for one verdict line."""
+    shown = 0 if binary_ms is None else binary_ms
+    return (f" — wall {format_duration_ms(wall_ms)}"
+            f" — binary {format_duration_ms(shown)}")
+
+
+def _print_slow_tests(slow: list[tuple[str, int]]) -> None:
+    for name, ms in slow:
+        print(f"        {name} {format_duration_ms(ms)}")
+
+
+def _file_outcome(status: str, passed: int, failed: int, wall_ms: int,
+                  binary_ms: Optional[int], slow: list[tuple[str, int]]) -> dict:
+    return {
+        "status": status,
+        "passed": passed,
+        "failed": failed,
+        "wall_ms": wall_ms,
+        "binary_ms": 0 if binary_ms is None else binary_ms,
+        "slow": [{"name": name, "duration_ms": ms} for name, ms in slow],
+    }
+
+
 def format_test_summary(n_files: int, tests_passed: int, tests_failed: int,
                         n_fail: int, n_error: int, n_empty: int,
-                        n_timeout: int) -> str:
+                        n_timeout: int, suite_ms: Optional[int] = None) -> str:
     """The Σ line for a package's .ritz test files.
 
     The headline counts FILES that did not pass. It used to read
@@ -98,22 +161,29 @@ def format_test_summary(n_files: int, tests_passed: int, tests_failed: int,
     and "0 failed" beside three compile failures reads as green to anyone
     scanning a log (AGAST #1345). A file that failed to compile has not
     passed. Zero counts are left out, so nothing prints "0 failed".
+
+    `suite_ms`, when given, appends the suite's wall-clock total (`— suite
+    1.234s`). Callers that predate the field omit it and the line is unchanged.
     """
     not_passing = n_fail + n_error + n_empty + n_timeout
     if not_passing == 0:
-        return f"  Σ ✓ {n_files} of {n_files} files passed ({tests_passed} tests)"
-    parts = []
-    if n_fail:
-        parts.append(f"{n_fail} with failing tests ({tests_failed} failed)")
-    if n_error:
-        parts.append(f"{n_error} compile-failed")
-    if n_empty:
-        parts.append(f"{n_empty} with no [[test]] functions")
-    if n_timeout:
-        parts.append(f"{n_timeout} timed-out")
-    ok = n_files - not_passing
-    return (f"  Σ ✗ {not_passing} of {n_files} files FAILED: {', '.join(parts)}"
-            f" | {ok} file(s) passed, {tests_passed} tests passed")
+        line = f"  Σ ✓ {n_files} of {n_files} files passed ({tests_passed} tests)"
+    else:
+        parts = []
+        if n_fail:
+            parts.append(f"{n_fail} with failing tests ({tests_failed} failed)")
+        if n_error:
+            parts.append(f"{n_error} compile-failed")
+        if n_empty:
+            parts.append(f"{n_empty} with no [[test]] functions")
+        if n_timeout:
+            parts.append(f"{n_timeout} timed-out")
+        ok = n_files - not_passing
+        line = (f"  Σ ✗ {not_passing} of {n_files} files FAILED: {', '.join(parts)}"
+                f" | {ok} file(s) passed, {tests_passed} tests passed")
+    if suite_ms is not None:
+        line += f" — suite {format_duration_ms(suite_ms)}"
+    return line
 
 
 def per_file_timeout() -> int:
@@ -241,32 +311,39 @@ def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
     relative paths work; imports still resolve via RITZ_PATH (env-based,
     not CWD-based — see ritz0/import_resolver.py).
     """
+    t0 = time.perf_counter()
     run = _ritz0_test_in_process if _can_run_in_process() else _ritz0_test_subprocess
     result = run(Path(tfile), Path(pkg_dir), test_env, timeout, compiler)
+    wall_ms = int(round((time.perf_counter() - t0) * 1000))
     if result is None:
-        print(f"    ⏱  {tfile.name} — TIMEOUT after {timeout}s")
-        return {"status": "timeout", "passed": 0, "failed": 0}
+        print(f"    ⏱  {tfile.name} — TIMEOUT after {timeout}s"
+              f"{_timing_suffix(wall_ms, None)}")
+        return _file_outcome("timeout", 0, 0, wall_ms, None, [])
 
     relay_compiler_warnings(result.stderr)
     status, file_passed, file_failed = classify_test_file(
         result.returncode, result.stdout)
-    outcome = {"status": status, "passed": file_passed, "failed": file_failed}
+    binary_ms, slow = parse_report_timings(result.stdout)
+    suffix = _timing_suffix(wall_ms, binary_ms)
+    outcome = _file_outcome(status, file_passed, file_failed, wall_ms, binary_ms, slow)
 
     if status == "empty":
         print(f"    ✗ {tfile.name} — ran 0 tests: no [[test]] functions "
-              f"(a test file that cannot fail is not a test)")
+              f"(a test file that cannot fail is not a test){suffix}")
     elif status == "error":
         # Compile / link / runtime failure before harness summary
         err_first = compile_failure_reason(result.stdout, result.stderr)
-        print(f"    ✗ {tfile.name} — {err_first}")
+        print(f"    ✗ {tfile.name} — {err_first}{suffix}")
     elif status == "fail":
         # Compiled and ran but some tests failed: name each one and how it
         # failed (AGAST #4052), from the report's "Failures:" block.
-        print(f"    ✗ {tfile.name} — {file_passed} passed, {file_failed} failed")
+        print(f"    ✗ {tfile.name} — {file_passed} passed, {file_failed} failed{suffix}")
+        _print_slow_tests(slow)
         for line in failure_lines(result.stdout):
             print(f"        {line}")
     else:
-        print(f"    ✓ {tfile.name} — {file_passed} passed")
+        print(f"    ✓ {tfile.name} — {file_passed} passed{suffix}")
+        _print_slow_tests(slow)
     return outcome
 
 
@@ -323,12 +400,21 @@ def compile_failure_reason(stdout: str, stderr: str) -> str:
     return _compile_failure_reason(stdout, stderr)[:_REASON_MAX]
 
 
-def summarize_file_outcomes(outcomes: list[dict]) -> str:
-    """The Σ line for a list of run_test_file outcomes."""
+def summarize_file_outcomes(outcomes: list[dict],
+                           suite_ms: Optional[int] = None) -> str:
+    """The Σ line for a list of run_test_file outcomes.
+
+    `suite_ms` is the suite wall clock. When the caller does not pass one
+    and the outcomes carry `wall_ms` (a parallel unit listing), the total is
+    their sum. Outcomes from before timings existed omit both, and the line
+    stays the count-only form.
+    """
     by = lambda s: sum(1 for o in outcomes if o["status"] == s)  # noqa: E731
     # Assertion counts only from files whose harness summary was trusted,
     # exactly as the serial loop always counted them.
     counted = [o for o in outcomes if o["status"] in ("pass", "fail")]
+    if suite_ms is None and any("wall_ms" in o for o in outcomes):
+        suite_ms = sum(int(o.get("wall_ms") or 0) for o in outcomes)
     return format_test_summary(
         n_files=len(outcomes),
         tests_passed=sum(o["passed"] for o in counted),
@@ -337,6 +423,7 @@ def summarize_file_outcomes(outcomes: list[dict]) -> str:
         n_error=by("error"),
         n_empty=by("empty"),
         n_timeout=by("timeout"),
+        suite_ms=suite_ms,
     )
 
 
@@ -438,11 +525,13 @@ def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0",
         # across the workspace via --unit-file; AGAST #1809.)
         test_env = test_env_for_files()
         timeout = per_file_timeout()
+        t0 = time.perf_counter()
         outcomes = [run_test_file(t, run_dir, test_env, timeout, compiler)
                     for t in ritz_tests]
+        suite_ms = int(round((time.perf_counter() - t0) * 1000))
         if any(o["status"] != "pass" for o in outcomes):
             all_passed = False
-        print(summarize_file_outcomes(outcomes))
+        print(summarize_file_outcomes(outcomes, suite_ms=suite_ms))
 
     # Run test.sh if it exists
     if (pkg_dir / "test.sh").exists():

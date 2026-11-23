@@ -20,6 +20,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -40,6 +41,9 @@ cas = importlib.import_module("cas")
 
 HAS_CLANG = shutil.which("clang") is not None
 needs_clang = pytest.mark.skipif(not HAS_CLANG, reason="clang not on PATH")
+
+# File and Σ lines carry these; two runs of one file differ only in the numbers.
+_DURATION = re.compile(r" — (?:wall|binary|suite) \d+\.\d{3}s")
 
 
 @pytest.fixture(autouse=True)
@@ -267,8 +271,13 @@ def test_unit_file_runs_no_ritz0_test_subprocess(tmp_path, monkeypatch, buildpy,
         "build.py", "test", str(pkg), "--unit-file", str(t), "--unit-result", str(result)])
     assert (buildpy.main() or 0) == 0
     assert calls["ritz0_test"] == [], "build.py still starts `ritz0.py --test`"
-    assert json.loads(result.read_text()) == {"status": "pass", "passed": 1, "failed": 0}
-    assert "✓ test_b.ritz — 1 passed" in capsys.readouterr().out
+    got = json.loads(result.read_text())
+    out = capsys.readouterr().out
+    assert (got["status"], got["passed"], got["failed"]) == ("pass", 1, 0)
+    assert isinstance(got["wall_ms"], int) and got["wall_ms"] >= 0
+    assert isinstance(got["binary_ms"], int) and got["binary_ms"] >= 0
+    assert "✓ test_b.ritz — 1 passed" in out
+    assert re.search(r"wall \d+\.\d{3}s — binary \d+\.\d{3}s", out)
 
 
 @pytest.mark.integration
@@ -292,12 +301,18 @@ def test_in_process_verdicts_match_the_subprocess_ones(tmp_path, monkeypatch, bu
     out = capsys.readouterr().out
     assert got["status"] == status
     assert line in out
+    assert re.search(r"wall \d+\.\d{3}s — binary \d+\.\d{3}s", out)
 
     monkeypatch.setattr(buildpy, "_can_run_in_process", lambda: False)
     calls = _spy(monkeypatch, buildpy)
-    assert buildpy.run_test_file(t, pkg, env, timeout) == got
+    second = buildpy.run_test_file(t, pkg, env, timeout)
+    # Durations move between runs; the verdict text around them does not.
+    assert (second["status"], second["passed"], second["failed"]) == (
+        got["status"], got["passed"], got["failed"])
     assert len(calls["ritz0_test"]) == 1
-    assert capsys.readouterr().out == out
+    second_out = capsys.readouterr().out
+    assert _DURATION.sub("", second_out) == _DURATION.sub("", out)
+    assert re.search(r"wall \d+\.\d{3}s — binary \d+\.\d{3}s", second_out)
 
 
 @pytest.mark.unit
@@ -317,7 +332,8 @@ def test_in_process_unit_runs_in_the_package_with_the_test_env(tmp_path, monkeyp
     env = {**buildpy.test_env_for_files(), "RITZ_1915_MARKER": "yes"}
 
     got = buildpy.run_test_file(t, pkg, env, 60, "ritz1")
-    assert got == {"status": "pass", "passed": 1, "failed": 0}
+    assert (got["status"], got["passed"], got["failed"]) == ("pass", 1, 0)
+    assert "wall_ms" in got and "binary_ms" in got
     assert seen == {"cwd": str(pkg), "ritz_path": env["RITZ_PATH"], "marker": "yes",
                     "path": str(t), "compiler": "ritz1"}
     assert os.getcwd() == cwd
@@ -332,8 +348,10 @@ def test_in_process_unit_times_out(tmp_path, monkeypatch, buildpy, test_runner, 
     t0 = time.monotonic()
     got = buildpy.run_test_file(t, pkg, buildpy.test_env_for_files(), 1)
     assert time.monotonic() - t0 < 10
-    assert got == {"status": "timeout", "passed": 0, "failed": 0}
-    assert "TIMEOUT after 1s" in capsys.readouterr().out
+    assert (got["status"], got["passed"], got["failed"]) == ("timeout", 0, 0)
+    out = capsys.readouterr().out
+    assert "TIMEOUT after 1s" in out
+    assert re.search(r"wall \d+\.\d{3}s — binary \d+\.\d{3}s", out)
 
 
 # integration: it runs the ritz0 stub as a real subprocess (AGAST #3807).
@@ -349,7 +367,57 @@ def test_off_the_main_thread_the_unit_runs_as_a_subprocess(tmp_path, monkeypatch
         r=buildpy.run_test_file(t, pkg, buildpy.test_env_for_files(), 60)))
     th.start()
     th.join()
-    assert out["r"] == {"status": "pass", "passed": 1, "failed": 0}
+    assert (out["r"]["status"], out["r"]["passed"], out["r"]["failed"]) == ("pass", 1, 0)
+    assert "wall_ms" in out["r"] and "binary_ms" in out["r"]
+
+
+_SLOW_SRC = """\
+import ritzlib.sys
+
+fn sleep_ms(ms: i64)
+    var ts: [2]i64
+    ts[0] = ms / 1000
+    ts[1] = (ms % 1000) * 1000000
+    sys_nanosleep(@ts[0], null)
+
+[[test]]
+fn test_instant() -> i32
+    0
+
+[[test]]
+fn test_over_one_second() -> i32
+    sleep_ms(1200)
+    0
+"""
+
+
+@pytest.mark.integration
+@needs_clang
+def test_file_line_names_wall_binary_suite_and_a_slow_test(tmp_path, buildpy, capsys):
+    """The real verdict printer, fed by a real ritzunit JSON report.
+
+    `test_over_one_second` sleeps 1.2s, so its `duration_ms` is at least
+    1000 and the file line must name it. The instant test must not be named.
+    """
+    pkg = tmp_path / "pkg"
+    (pkg / "test").mkdir(parents=True)
+    (pkg / "test" / "test_slow.ritz").write_text(_SLOW_SRC)
+    cfg = {"package": {"name": "t"}, "build": {"test_only": True}}
+
+    assert buildpy.run_tests(pkg, cfg) is True
+    out = capsys.readouterr().out
+    assert re.search(
+        r"✓ test_slow\.ritz — 2 passed — wall \d+\.\d{3}s — binary \d+\.\d{3}s",
+        out), out
+    binary = re.search(r"✓ test_slow\.ritz — 2 passed — wall \d+\.\d{3}s — binary (\d+\.\d{3})s", out)
+    assert float(binary.group(1)) >= 1.0, out
+    named = re.findall(r"^        (\S+) (\d+\.\d{3})s$", out, re.M)
+    assert [name for name, _ in named] == ["test_over_one_second"], out
+    assert float(named[0][1]) >= 1.0
+    assert re.search(
+        r"Σ ✓ 1 of 1 files passed \(2 tests\) — suite \d+\.\d{3}s", out), out
+    suite = re.search(r"suite (\d+\.\d{3})s", out)
+    assert float(suite.group(1)) >= 1.0
 
 
 # --- the tiers hold under spawn_guard ----------------------------------------

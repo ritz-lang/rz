@@ -17,6 +17,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -661,8 +662,15 @@ def test_pool_verdict_lines_match_serial_build_py(rz, tmp_path, capsys):
     failed = rz.test_projects_parallel([str(pkg)], 3, "ritz0")
     pooled = capsys.readouterr().out
 
-    verdict = lambda s: [l for l in s.splitlines()  # noqa: E731
-                         if l.startswith(("    ✓", "    ✗", "    ⏱", "  Σ"))]
+    lines = lambda s: [l for l in s.splitlines()  # noqa: E731
+                       if l.startswith(("    ✓", "    ✗", "    ⏱", "  Σ"))]
+    # Per-file lines end `— wall <s> — binary <s>` and the Σ line `— suite
+    # <s>`: wall-clock times differ between any two runs, so the verdicts
+    # are compared with them stripped (and each side must still carry them).
+    timing = re.compile(r"( — wall \d+\.\d{3}s — binary \d+\.\d{3}s| — suite \d+\.\d{3}s)$")
+    verdict = lambda s: [timing.sub("", l) for l in lines(s)]  # noqa: E731
     assert serial.returncode == 1 and failed == [str(pkg)]
     assert verdict(pooled) == verdict(serial.stdout)
     assert len(verdict(pooled)) == 4, pooled
+    for side in (pooled, serial.stdout):
+        assert all(timing.search(l) for l in lines(side)), side
