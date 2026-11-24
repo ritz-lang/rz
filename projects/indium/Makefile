@@ -12,6 +12,9 @@ KERNEL_ELF = $(HARLAND_DIR)/build/debug/harland.elf
 BOOTLOADER = $(HARLAND_DIR)/build/debug/BOOTX64.EFI
 ISO_FILE = $(BUILD_DIR)/indium.iso
 UEFI_DISK = $(BUILD_DIR)/uefi-boot.img
+SHELL_DISK = $(BUILD_DIR)/uefi-shell.img
+SHELL_TAR = $(BUILD_DIR)/shell-initramfs.tar
+SHELL_STORAGE ?= $(BUILD_DIR)/shell-storage.qcow2
 
 # QEMU
 QEMU = qemu-system-x86_64
@@ -38,7 +41,7 @@ STORAGE = $(BUILD_DIR)/storage.qcow2
 # Phony targets
 # ============================================================================
 
-.PHONY: all clean kernel userspace initramfs-bin iso run run-iso run-uefi shell debug test test-uefi test-uefi-gui ec2-disk ec2-boot help
+.PHONY: all clean kernel userspace initramfs-bin iso run run-iso run-uefi shell shell-image debug test test-uefi test-uefi-gui ec2-disk ec2-boot help
 
 all: iso
 
@@ -63,7 +66,9 @@ iso: kernel
 	./tools/mkiso.sh
 
 # Create UEFI boot disk (uses mtools, no root required)
-$(UEFI_DISK): kernel $(BUILD_DIR)/initramfs.tar
+$(UEFI_DISK): BOOT_TAR = $(BUILD_DIR)/initramfs.tar
+$(SHELL_DISK): BOOT_TAR = $(SHELL_TAR)
+$(UEFI_DISK) $(SHELL_DISK): kernel
 	@echo "=== Creating UEFI Boot Disk ==="
 	@mkdir -p $(BUILD_DIR)
 	@# 64MB FAT32 image: BOOTX64.EFI, harland/kernel.elf, startup.nsh and
@@ -71,9 +76,12 @@ $(UEFI_DISK): kernel $(BUILD_DIR)/initramfs.tar
 	@# (AGAST #4253), so the disk boots with no virtio-blk initramfs disk.
 	@# tools/mkuefi.py logs and time-limits each step and never runs dd,
 	@# which hung here (AGAST #2748).
-	@echo '@echo -off' > $(BUILD_DIR)/startup.nsh
-	@echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $(BUILD_DIR)/startup.nsh
-	python3 ./tools/mkuefi.py $@ $(BOOTLOADER) $(KERNEL_ELF) $(BUILD_DIR)/startup.nsh $(BUILD_DIR)/initramfs.tar
+	@echo '@echo -off' > $@.startup.nsh
+	@echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $@.startup.nsh
+	python3 ./tools/mkuefi.py $@ $(BOOTLOADER) $(KERNEL_ELF) $@.startup.nsh $(BOOT_TAR)
+
+$(UEFI_DISK): $(BUILD_DIR)/initramfs.tar
+$(SHELL_DISK): $(SHELL_TAR)
 
 # Create EC2-compatible UEFI boot disk with GPT partition table
 # EC2 requires a proper GPT with EFI System Partition for UEFI boot
@@ -151,9 +159,9 @@ $(INITRAMFS): $(BUILD_DIR)/initramfs.tar
 		--bin-dir $(INITRAMFS_BIN) \
 		--output $(INITRAMFS)
 
-$(STORAGE):
-	@mkdir -p $(BUILD_DIR)
-	qemu-img create -f qcow2 $@ 512M
+$(STORAGE) $(SHELL_STORAGE):
+	@mkdir -p "$(@D)"
+	qemu-img create -f qcow2 "$@" 512M
 
 # Default run: BIOS/ISO (most reliable)
 run: run-iso
@@ -194,31 +202,29 @@ run-uefi: $(UEFI_DISK) $(INITRAMFS) $(STORAGE)
 		-serial mon:stdio $(QEMU_DISPLAY) \
 		-no-reboot
 
-# An interactive shell on the serial console (AGAST #4252): the initramfs with
-# init_interactive as /bin/init, which spawns /bin/rzsh. COM1 is this
-# terminal (-serial mon:stdio, no display): type at the `rzsh> ` prompt.
-# Ctrl-A x quits QEMU; rzsh's `exit` returns to init, which powers off. Under OVMF with
-# harland's own BOOTX64.EFI on a vvfat ESP directory (no mtools), as
-# harland/tools/test_shell_boot.sh boots, which scripts a session over the
-# same image in the gate.
-SHELL_ESP = $(BUILD_DIR)/shell-esp
-SHELL_INITRAMFS = $(BUILD_DIR)/shell-initramfs.qcow2
-
-shell: kernel initramfs-bin
-	@if [ -z "$(OVMF_CODE)" ]; then echo "ERROR: OVMF not found. Install ovmf package."; exit 1; fi
-	@rm -rf $(SHELL_ESP) && mkdir -p $(SHELL_ESP)/EFI/BOOT $(SHELL_ESP)/harland
-	cp $(BOOTLOADER) $(SHELL_ESP)/EFI/BOOT/BOOTX64.EFI
-	cp $(KERNEL_ELF) $(SHELL_ESP)/harland/kernel.elf
+# Build a UEFI disk with init_interactive as /bin/init. The loader reads
+# the initramfs from the boot disk and passes it to Harland in BootInfo.
+$(SHELL_TAR): initramfs-bin
 	python3 $(HARLAND_DIR)/tools/mkinitramfs.py --bin-dir $(INITRAMFS_BIN) \
-		--init init_interactive --output $(SHELL_INITRAMFS)
+		--init init_interactive --output $@
+
+shell-image: $(SHELL_DISK) $(SHELL_STORAGE)
+
+# Harland uses the second VirtIO block device for Goliath. Attach the boot
+# disk first, so the shell only needs one other disk for persistent /var.
+shell: QEMU_DISPLAY = -display none
+shell: shell-image
+	@if [ -z "$(OVMF_CODE)" ]; then echo "ERROR: OVMF not found. Install ovmf package."; exit 1; fi
 	@echo "=== Booting to rzsh on this terminal (Ctrl-A x quits QEMU) ==="
 	$(QEMU) $(QEMU_CPU) -smp 4 -m 2G \
 		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
-		-drive format=raw,file=fat:rw:$(SHELL_ESP) \
-		-device virtio-blk-pci,drive=initramfs \
-		-drive file=$(SHELL_INITRAMFS),format=qcow2,if=none,id=initramfs \
-		-display none \
-		-serial mon:stdio \
+		-drive file=$(SHELL_DISK),format=raw,if=none,id=boot \
+		-device virtio-blk-pci,drive=boot,bootindex=1 \
+		-drive file="$(SHELL_STORAGE)",format=qcow2,if=none,id=storage \
+		-device virtio-blk-pci,drive=storage \
+		-device virtio-net-pci,netdev=net0 \
+		-netdev user,id=net0 \
+		-serial mon:stdio $(QEMU_DISPLAY) \
 		-no-reboot
 
 # Run with GDB server for debugging (BIOS mode)
@@ -294,6 +300,7 @@ help:
 	@echo "  userspace   - Build indium's own userspace programs"
 	@echo "  initramfs-bin - Build and stage every package in initramfs.pkgs"
 	@echo "  iso         - Create bootable ISO with GRUB"
+	@echo "  shell-image - Build the UEFI shell image and create its Goliath disk"
 	@echo "  ec2-disk    - Create EC2-compatible UEFI disk (GPT + ESP), rootless"
 	@echo "  ec2-boot    - Boot it once on a t3.micro, save the serial log (iac/run.sh)"
 	@echo ""

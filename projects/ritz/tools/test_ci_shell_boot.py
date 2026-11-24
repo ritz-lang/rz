@@ -150,7 +150,10 @@ REPLIES = {
     "echo hi": "hi\n",
     "pwd": "/\n",
     "ls /bin": "  cat\n  init\n  rzsh\n",
-    "cat /etc/motd": "[spawn_args] spawn_args(/bin/cat, argc=2)\nWelcome to Harland!\n",
+    "cat /etc/motd": "Welcome to Harland!\n",
+    "ping --help": "Usage: ping <host>\n",
+    "ping 1.1.1.1": "ping: ICMP is unavailable from Harland userspace\n",
+    "ls /shell-fs-test": "child\n",
     "echo after-cat": "after-cat\n",
 }
 # tty_session()'s commands (#4254), kept apart so the wrong-answer cases above
@@ -215,8 +218,7 @@ def test_shell_step_is_a_real_gate_with_a_timeout():
 
 @pytest.mark.integration
 def test_make_shell_boots_init_interactive_on_a_serial_stdio_console():
-    """`make shell` is the image the boot test scripts: init_interactive as
-    /bin/init, COM1 on the terminal, no display."""
+    """Boot init_interactive from the UEFI shell image with COM1 on the terminal."""
     r = subprocess.run(["make", "-n", "-C", str(REPO / "projects/indium"), "shell",
                         "OVMF_CODE=/x/OVMF_CODE.fd"],
                        capture_output=True, text=True, timeout=60)
@@ -224,7 +226,8 @@ def test_make_shell_boots_init_interactive_on_a_serial_stdio_console():
     assert "--init init_interactive" in r.stdout
     assert "-serial mon:stdio" in r.stdout
     assert "-display none" in r.stdout
-    assert "fat:rw:" in r.stdout
+    assert "uefi-shell.img" in r.stdout
+    assert "shell-storage.qcow2" in r.stdout
 
 
 def test_readme_says_how_to_get_a_prompt():
@@ -311,7 +314,7 @@ def test_a_scripted_session_passes(tree):
     keep.mkdir()
     r = _run(tree, env_extra={"KEEP_WORK": str(keep)})
     assert r.returncode == 0, r.stdout + r.stderr
-    for cmd in ("echo hi", "pwd", "ls /bin", "cat /etc/motd", "echo after-cat", "exit"):
+    for cmd in (*REPLIES, "exit"):
         assert f"PASS: `{cmd}`" in r.stdout
     for check in TTY_PASSES:
         assert check in r.stdout, check
