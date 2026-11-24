@@ -2,7 +2,7 @@
 
 Follow-up from #1877/#3629. Until this ticket syscall_entry.s kept one set of
 user-frame globals (user_rsp_save, syscall_user_*), one kernel-stack pointer
-(kstack_current_top) and one TSS (gdt.ritz tss, rsp0 + IST1/2/3 stacks). That
+(kstack_current_top) and one TSS (gdt.ritz tss, rsp0 + IST1-5 stacks). That
 is safe only while the APs never leave the kernel: the BSP alone takes SYSCALL.
 After this ticket the APs do enter ring 3 (for the self-test) and then idle in
 the kernel with interrupts on, ready for #4220's AP-call IPIs.
@@ -11,7 +11,7 @@ This ticket makes the syscall machinery per CPU and proves it:
 
   * arch/x86_64/percpu.ritz gives every CPU a per-CPU area (syscall_entry.s
     percpu_areas, reached through GS with swapgs at entry/exit), four
-    guard-paged kernel stacks in the kernel half (syscall, IST1/2/3), a TSS
+    guard-paged kernel stacks in the kernel half (syscall, IST1-5), a TSS
     with those stacks, an IDT and its own SYSCALL MSRs.
   * arch/x86_64/cpu_smp.ritz runs after ap_boot_all: every CPU enters a
     ring-3 stub and SYSCALLs, the handler barriers until all of them are
@@ -121,7 +121,7 @@ def test_gdt_has_one_tss_descriptor_per_cpu():
     assert f"var tsses: [{max_cpus}]Tss" in gdt
     assert "fn tss_selector(cpu_idx: i32) -> u16" in gdt
     init = _body(gdt, "gdt_init_cpu")
-    assert "tss_fill(cpu_idx, rsp0, ist1, ist2, ist3)" in init
+    assert "tss_fill(cpu_idx, rsp0, ist1, ist2, ist3, ist4, ist5)" in init
     assert "set_tss_entry(GDT_TSS_FIRST + cpu_idx * 2" in init
     assert "tss_load(tss_selector(cpu_idx))" in init
 

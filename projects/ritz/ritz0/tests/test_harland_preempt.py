@@ -179,7 +179,8 @@ def test_scheduler_starts_the_tick_before_init_enters_ring_3():
 
 def test_timer_irq_runs_on_ist3_and_moves_a_ring3_frame_to_the_process_stack():
     idt = IDT.read_text()
-    assert re.search(r"idt_set_gate\(32, irq_stub_timer as u64, cs, 3,", idt)
+    assert re.search(r"idt_set_gate\(32, irq_stub_timer as u64, cs, IST_TICK,", idt)
+    assert re.search(r"^const IST_TICK: u8 = 3$", idt, re.M)
     gdt = (KERNEL_SRC / "arch" / "x86_64" / "gdt.ritz").read_text()
     assert "tsses[cpu_idx].ist3 = " in gdt
     asm = _isr_s()

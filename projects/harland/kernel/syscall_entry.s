@@ -83,8 +83,9 @@ percpu_areas_end:
 #   ... + KSTACK_STRIDE                 the stack's top
 #
 # In .bss so an overflow can't run into .data (it once ran into g_child_pid
-# and fs_current, AGAST #2761, #4064). #PF and #DF run on IST1 (idt.ritz),
-# so a write into a guard page is reported as "syscall stack overflow"
+# and fs_current, AGAST #2761, #4064). A write into a guard page faults, and
+# the #PF can't push onto the overflowed stack, so it becomes a #DF, which runs
+# on its own IST stack (idt.ritz) and reports "syscall stack overflow"
 # (exceptions.ritz).
 .align 4096
 proc_kstacks:

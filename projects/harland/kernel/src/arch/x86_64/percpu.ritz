@@ -10,11 +10,11 @@
 #   * PC_KSTACK_TOP is the RSP syscall_entry loads. proc/sched.ritz makes it
 #     the running process's kernel stack on every switch; a CPU that is not
 #     running a process (an AP in the SMP self-test) uses the stack below.
-#   * TSS.rsp0 and TSS.ist1/2/3 (gdt.ritz) are per CPU, so two CPUs can take
+#   * TSS.rsp0 and TSS.ist1-5 (gdt.ritz) are per CPU, so two CPUs can take
 #     a ring-3 IRQ, a #PF or a tick at once without sharing a stack.
 #
-# Each CPU's stack block is eight PMM pages, two per stack: an unmapped guard
-# page, then the stack. The stack's lowest quadword holds a sentinel checked
+# Each CPU's stack block is twelve PMM pages, two per stack: an unmapped
+# guard page, then the stack. The stack's lowest quadword holds a sentinel checked
 # by syscall/stack.ritz when a syscall leaves the kernel.
 #
 # GS convention (swapgs): in the kernel IA32_GS_BASE is this CPU's area and
@@ -46,15 +46,19 @@ const KERNEL_GS_BASE_MSR: u32 = 0xC0000102
 pub const CPU_STACK_GUARD: u64 = 4096
 pub const CPU_STACK_SIZE: u64 = 4096
 pub const CPU_STACK_STRIDE: u64 = 8192
-# Four stacks per CPU: syscall/kernel, IST1 (exceptions), IST2 (IRQs), IST3 (tick).
-pub const CPU_STACK_COUNT: i32 = 4
+# Six stacks per CPU: syscall/kernel, then one per TSS IST slot the IDT uses
+# (idt.ritz, AGAST #4628): IST1 #DF/#SS, IST2 IRQs, IST3 the tick, IST4 NMI,
+# IST5 #MC. Stack `CPU_ISTn` is TSS.istn's.
+pub const CPU_STACK_COUNT: i32 = 6
 pub const CPU_KSTACK: i32 = 0
 pub const CPU_IST1: i32 = 1
 pub const CPU_IST2: i32 = 2
 pub const CPU_IST3: i32 = 3
-# Eight pages = four (guard + stack) pairs.
-const CPU_STACK_PAGES: u64 = 8
-# Eight pages of virtual space per CPU (guard + stack, four times), mapped in
+pub const CPU_IST4: i32 = 4
+pub const CPU_IST5: i32 = 5
+# Twelve pages = six (guard + stack) pairs.
+const CPU_STACK_PAGES: u64 = 12
+# Twelve pages of virtual space per CPU (guard + stack, six times), mapped in
 # the kernel half so every user PML4 (which shares PML4[256..511]) reaches
 # the stacks. PML4 index 300, clear of the physmap (256), MMIO (257) and the
 # kernel image (511).
@@ -87,7 +91,7 @@ pub fn cpu_stack_bottom(cpu_idx: i32, which: i32) -> u64
 pub fn cpu_stack_top(cpu_idx: i32, which: i32) -> u64
     return cpu_stack_guard(cpu_idx, which) + CPU_STACK_STRIDE
 
-# Allocate CPU `cpu_idx`'s eight-page stack block and unmap its four guard
+# Allocate CPU `cpu_idx`'s twelve-page stack block and unmap its six guard
 # pages. The pages are identity-mapped and are used as physical addresses by
 # the AP trampoline, so a block that is not is a boot-time panic. Returns the
 # base, or 0 if the PMM is out of contiguous pages.
@@ -151,7 +155,9 @@ pub fn cpu_bringup(cpu_idx: i32) -> i32
     let result: i32 = gdt_init_cpu(cpu_idx, ktop,
                                    cpu_stack_top(cpu_idx, CPU_IST1),
                                    cpu_stack_top(cpu_idx, CPU_IST2),
-                                   cpu_stack_top(cpu_idx, CPU_IST3))
+                                   cpu_stack_top(cpu_idx, CPU_IST3),
+                                   cpu_stack_top(cpu_idx, CPU_IST4),
+                                   cpu_stack_top(cpu_idx, CPU_IST5))
     if result != 0
         return result
     idt_load_current()

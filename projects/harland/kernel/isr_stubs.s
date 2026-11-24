@@ -88,7 +88,7 @@ gdt_flush:
 # user's GS_BASE. Like Linux's paranoid_entry, these read MSR_GS_BASE: a
 # value that is not one of syscall_entry.s's percpu_areas is the user's, so
 # swapgs, and note it in %ebx (callee-saved: exception_handler keeps it) to
-# swap back on exit. Both run on IST1.
+# swap back on exit. Each runs on its own IST stack (idt.ritz, AGAST #4628).
 .set MSR_GS_BASE, 0xC0000101
 
 .macro ISR_PARANOID num
@@ -448,7 +448,7 @@ IRQ_STUB 65, 96
 # IST3 to the top of this CPU's kernel stack (PC_KSTACK_TOP via GS, which is
 # TSS.rsp0; per-CPU, AGAST #4192) and continues there. A tick from
 # ring 0 never switches, so it stays on IST3. IF=0 throughout (interrupt
-# gate), and nothing else runs on IST3 (NMI and #DF are IST1).
+# gate), and nothing else runs on IST3 (NMI, #MC and #DF have their own).
 .global irq_stub_timer
 irq_stub_timer:
     SWAPGS_IF_USER              # before any per-CPU access (AGAST #4192)
@@ -556,3 +556,30 @@ nmi_gs_probe:
     popfq
     ret
 .size nmi_gs_probe, . - nmi_gs_probe
+
+# ============================================================================
+# The "ist-nest" boot self-test's faults (AGAST #4628)
+# ============================================================================
+# void ist_nest_faults(u64 unmapped): called from the NMI handler while the
+# test is armed (arch/x86_64/nmi_probe.ritz). A #GP (a load from a
+# non-canonical address) and then a #PF (a load from `unmapped`, a kernel
+# address with no page); exceptions.ritz resumes each at its _resume label.
+# Both run on the stack they interrupt, here the NMI's IST stack below its
+# frame; on a shared IST stack the fault would restart at its top, over the
+# NMI's frame, and this `ret` would go to garbage.
+.global ist_nest_faults
+.global ist_nest_gp_at
+.global ist_nest_gp_resume
+.global ist_nest_pf_at
+.global ist_nest_pf_resume
+.type ist_nest_faults, @function
+ist_nest_faults:
+    movabsq $0x8000000000000000, %rax
+ist_nest_gp_at:
+    movq (%rax), %rax                 # non-canonical: #GP(0)
+ist_nest_gp_resume:
+ist_nest_pf_at:
+    movq (%rdi), %rax                 # not present: #PF
+ist_nest_pf_resume:
+    ret
+.size ist_nest_faults, . - ist_nest_faults

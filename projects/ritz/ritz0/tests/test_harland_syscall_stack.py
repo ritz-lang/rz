@@ -114,7 +114,7 @@ def test_tss_and_stacks_are_per_cpu():
     gdt = (KERNEL / "src" / "arch" / "x86_64" / "gdt.ritz").read_text()
     assert "var tsses: [64]Tss" in gdt
     assert "tsses[cpu_idx].rsp0 = rsp0" in gdt
-    for ist in ("ist1", "ist2", "ist3"):
+    for ist in ("ist1", "ist2", "ist3", "ist4", "ist5"):
         assert f"tsses[cpu_idx].{ist} = {ist}" in gdt, ist
     assert "gdt_set_kernel_stack_cpu(cpu_idx: i32, stack_top: u64)" in gdt
     percpu = (KERNEL / "src" / "arch" / "x86_64" / "percpu.ritz").read_text()
@@ -167,7 +167,8 @@ def test_check_panics_and_runs_where_syscalls_leave_the_kernel():
 # AGAST #1877: an unmapped guard page under the stack, and no big locals on
 # syscall paths. The sentinel only notices an overflow when the syscall
 # returns; the guard page faults on the first write past the bottom, and #PF
-# runs on IST1, so the fault is reported instead of corrupting .bss.
+# becomes a #DF on its own IST stack, so the fault is reported instead of
+# corrupting .bss.
 # ---------------------------------------------------------------------------
 
 VMM = KERNEL / "src" / "mm" / "vmm.ritz"
@@ -227,11 +228,13 @@ def test_page_fault_on_the_guard_page_reports_the_overflow():
     hit = _body(STACK.read_text(), "syscall_stack_guard_hit")
     assert "kstack_guard(slot)" in hit and "while slot < kstack_slots()" in hit
     assert "KERNEL PANIC: syscall stack overflow" in handler
-    # #PF and #DF run on IST1, so the fault handler never uses the overflowed
-    # stack.
+    # #PF runs on the interrupted stack (AGAST #4628), so an overflow can't
+    # push its frame and becomes a #DF, which has its own IST stack and must
+    # report the guard page too.
+    assert "(vec == 14 or vec == 8) and syscall_stack_guard_hit(read_cr2())" in handler
     idt = IDT.read_text()
-    for vec in (8, 14):
-        assert re.search(rf"idt_set_gate\({vec}, isr_stub_{vec} as u64, cs, 1,", idt), vec
+    assert re.search(r"idt_set_gate\(8, isr_stub_8 as u64, cs, IST_DF,", idt)
+    assert re.search(r"^const IST_DF: u8 = [1-7]$", idt, re.M)
 
 
 def test_no_big_locals_on_syscall_paths():

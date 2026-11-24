@@ -8,6 +8,14 @@
 # nmi_gs_probe swapgs's to a recognisable user GS, sends this CPU an NMI and
 # waits; the handler (exception_handler, first thing) records GS_BASE here.
 #
+# The "ist-nest" boot self-test (AGAST #4628) sends the same NMI, and its
+# handler takes a #GP and then a #PF (isr_stubs.s ist_nest_faults), each
+# resumed past the faulting instruction (ist_nest_catch). NMI runs on its own
+# IST stack and #GP/#PF on the stack they interrupt (idt.ritz), so both
+# faults push below the NMI's live frames. When they shared IST1 a fault
+# restarted at the top of IST1, over the NMI's frame, and the NMI returned
+# to garbage.
+#
 # A leaf module so exceptions.ritz can call it: postinit.ritz passes the
 # LAPIC's ICR (apic.ritz lapic_icr_lo_mmio, 0 in x2APIC mode) and APIC ID.
 
@@ -16,6 +24,17 @@ import klog { klog, klog_hex }
 
 extern fn nmi_gs_probe(icr_lo: u64, apic_id: u64) -> u64
 extern fn nmi_probe_mark()
+extern fn ist_nest_faults(unmapped: u64)
+extern fn ist_nest_gp_at()
+extern fn ist_nest_gp_resume()
+extern fn ist_nest_pf_at()
+extern fn ist_nest_pf_resume()
+
+const GP_VECTOR: u64 = 13
+const PF_VECTOR: u64 = 14
+# The faults' frames must sit within this much below the NMI's frame: on the
+# NMI's own stack, under its live frames.
+const IST_NEST_REACH: u64 = 4096
 
 const GS_BASE_MSR: u32 = 0xC0000101
 const KERNEL_GS_BASE_MSR: u32 = 0xC0000102
@@ -29,18 +48,49 @@ var nmi_probe_seen: bool = false
 var nmi_probe_gs: u64 = 0
 var nmi_probe_cs: u64 = 0
 
+# "ist-nest": fault inside the NMI handler (an unmapped kernel address for
+# the #PF), and where each frame landed.
+var ist_nest_armed: bool = false
+var ist_nest_in_nmi: bool = false
+var ist_nest_unmapped: u64 = 0
+var ist_nest_nmi_frame: u64 = 0
+var ist_nest_gp_frame: u64 = 0
+var ist_nest_pf_frame: u64 = 0
+
 # An NMI while the probe is armed: record the GS_BASE its handler runs on and
-# let it return. False, doing nothing, when not armed.
-pub fn nmi_probe_catch(cs: u64) -> bool
+# let it return (after the "ist-nest" faults, when those are armed). `frame`
+# is the NMI's InterruptFrame. False, doing nothing, when not armed.
+pub fn nmi_probe_catch(cs: u64, frame: u64) -> bool
     if not nmi_probe_armed
         return false
     nmi_probe_armed = false
     nmi_probe_gs = rdmsr(GS_BASE_MSR)
     nmi_probe_cs = cs
+    if ist_nest_armed
+        ist_nest_armed = false
+        ist_nest_nmi_frame = frame
+        ist_nest_in_nmi = true
+        memory_barrier()
+        ist_nest_faults(ist_nest_unmapped)
+        ist_nest_in_nmi = false
     nmi_probe_seen = true
     memory_barrier()
     nmi_probe_mark()
     return true
+
+# A fault inside the "ist-nest" NMI: the #GP or #PF of ist_nest_faults.
+# Records where its frame landed and returns the RIP to resume at, or 0 for
+# any other fault (and whenever the test is not in its NMI).
+pub fn ist_nest_catch(vector: u64, rip: u64, cs: u64, frame: u64) -> u64
+    if not ist_nest_in_nmi or (cs & 3) != 0
+        return 0
+    if vector == GP_VECTOR and rip == ist_nest_gp_at as u64
+        ist_nest_gp_frame = frame
+        return ist_nest_gp_resume as u64
+    if vector == PF_VECTOR and rip == ist_nest_pf_at as u64
+        ist_nest_pf_frame = frame
+        return ist_nest_pf_resume as u64
+    return 0
 
 fn nmi_gs_fail(why: StrView) -> bool
     klog("[nmi-gs] FAILED: ")
@@ -86,4 +136,50 @@ pub fn nmi_gs_selftest(x2apic: bool, icr: u64, apic_id: u32) -> bool
     klog("; its exit restored the user's GS ")
     klog_hex(gs_after_nmi)
     klog("\n")
+    return true
+
+fn ist_nest_fail(why: StrView) -> bool
+    klog("[ist-nest] FAILED: ")
+    klog(why)
+    klog("\n")
+    return false
+
+# True if a fault frame at `fault` is on the NMI's stack, below its frame.
+fn ist_nest_below_nmi(fault: u64) -> bool
+    return fault != 0 and fault < ist_nest_nmi_frame and ist_nest_nmi_frame - fault < IST_NEST_REACH
+
+# A #GP and a #PF inside the NMI handler (AGAST #4628). Each must be caught
+# and resumed, push its frame below the NMI's on the NMI's stack, and leave
+# the NMI able to return to the probe with GS as nmi-gs requires.
+# `unmapped` is a kernel address with no page (a CPU stack's guard page).
+pub fn ist_nest_selftest(x2apic: bool, icr: u64, apic_id: u32, unmapped: u64) -> bool
+    ist_nest_unmapped = unmapped
+    ist_nest_nmi_frame = 0
+    ist_nest_gp_frame = 0
+    ist_nest_pf_frame = 0
+    ist_nest_armed = true
+    let returned: bool = nmi_gs_selftest(x2apic, icr, apic_id)
+    ist_nest_armed = false
+    if not returned
+        return ist_nest_fail("the NMI did not return to the probe intact")
+    if ist_nest_gp_frame == 0
+        return ist_nest_fail("the #GP inside the NMI handler was not caught")
+    if ist_nest_pf_frame == 0
+        return ist_nest_fail("the #PF inside the NMI handler was not caught")
+    if not ist_nest_below_nmi(ist_nest_gp_frame) or not ist_nest_below_nmi(ist_nest_pf_frame)
+        klog("[ist-nest] NMI frame ")
+        klog_hex(ist_nest_nmi_frame)
+        klog(", #GP frame ")
+        klog_hex(ist_nest_gp_frame)
+        klog(", #PF frame ")
+        klog_hex(ist_nest_pf_frame)
+        klog("\n")
+        return ist_nest_fail("a fault inside the NMI handler did not push below the NMI's frame")
+    klog("[ist-nest] #GP and #PF inside the NMI handler pushed below its frame ")
+    klog_hex(ist_nest_nmi_frame)
+    klog(" (at ")
+    klog_hex(ist_nest_gp_frame)
+    klog(" and ")
+    klog_hex(ist_nest_pf_frame)
+    klog(") and returned; the NMI returned to its probe\n")
     return true

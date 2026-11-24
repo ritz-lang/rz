@@ -138,7 +138,7 @@ var gdt_descriptor: GdtDescriptor
 # stacks.
 var kernel_stack: [4096]u8
 
-# IST1: Interrupt stack for critical exceptions (NMI, double fault, stack fault, machine check)
+# IST1: #DF and #SS (idt.ritz IST_DF)
 var interrupt_stack: [4096]u8
 
 # IST2: Interrupt stack for hardware IRQs (timer, etc.)
@@ -146,6 +146,10 @@ var irq_stack: [4096]u8
 
 # IST3: the scheduler's timer tick (isr_stubs.s irq_stub_timer, #3629)
 var timer_stack: [4096]u8
+
+# IST4: NMI, and IST5: #MC, each alone on its stack (AGAST #4628)
+var nmi_stack: [4096]u8
+var mc_stack: [4096]u8
 
 # ============================================================================
 # GDT Helper Functions
@@ -196,8 +200,8 @@ fn set_tss_entry(gdt_index: i32, tss_addr: u64)
 fn tss_selector(cpu_idx: i32) -> u16
     return ((GDT_TSS_FIRST + cpu_idx * 2) * 8) as u16
 
-# Fill CPU `cpu_idx`'s TSS: ring-0 RSP and the three IST stacks.
-fn tss_fill(cpu_idx: i32, rsp0: u64, ist1: u64, ist2: u64, ist3: u64)
+# Fill CPU `cpu_idx`'s TSS: ring-0 RSP and the five IST stacks.
+fn tss_fill(cpu_idx: i32, rsp0: u64, ist1: u64, ist2: u64, ist3: u64, ist4: u64, ist5: u64)
     # Zero out the TSS
     let tss_ptr: *u8 = @tsses[cpu_idx] as *u8
     var i: i32 = 0
@@ -209,6 +213,8 @@ fn tss_fill(cpu_idx: i32, rsp0: u64, ist1: u64, ist2: u64, ist3: u64)
     tsses[cpu_idx].ist1 = ist1
     tsses[cpu_idx].ist2 = ist2
     tsses[cpu_idx].ist3 = ist3
+    tsses[cpu_idx].ist4 = ist4
+    tsses[cpu_idx].ist5 = ist5
     # I/O permission bitmap offset (beyond TSS = no IOPB)
     tsses[cpu_idx].iopb_offset = 104
 
@@ -241,7 +247,9 @@ pub fn gdt_init()
     tss_fill(0, (@kernel_stack[0] as u64) + 4096,
              (@interrupt_stack[0] as u64) + 4096,
              (@irq_stack[0] as u64) + 4096,
-             (@timer_stack[0] as u64) + 4096)
+             (@timer_stack[0] as u64) + 4096,
+             (@nmi_stack[0] as u64) + 4096,
+             (@mc_stack[0] as u64) + 4096)
     set_tss_entry(GDT_TSS_FIRST, @tsses[0] as u64)
 
     # Set up GDT descriptor
@@ -254,16 +262,16 @@ pub fn gdt_init()
     # Load the TSS
     tss_load(tss_selector(0))
 
-# Give CPU `cpu_idx` its own TSS (rsp0 + IST1/2/3 stacks) and load TR with its
+# Give CPU `cpu_idx` its own TSS (rsp0 + IST1-5 stacks) and load TR with its
 # selector. Called by arch/x86_64/percpu.ritz cpu_bringup on every CPU; on the
 # BSP it replaces the early fallback stacks, on an AP it is the first TSS.
-pub fn gdt_init_cpu(cpu_idx: i32, rsp0: u64, ist1: u64, ist2: u64, ist3: u64) -> i32
+pub fn gdt_init_cpu(cpu_idx: i32, rsp0: u64, ist1: u64, ist2: u64, ist3: u64, ist4: u64, ist5: u64) -> i32
     if cpu_idx < 0 or cpu_idx >= MAX_CPUS
         return -1
     # The AP must be on the kernel GDT before loading its own TSS descriptor
     # (the trampoline's GDT has no TSS); reloading on the BSP is harmless.
     gdt_load()
-    tss_fill(cpu_idx, rsp0, ist1, ist2, ist3)
+    tss_fill(cpu_idx, rsp0, ist1, ist2, ist3, ist4, ist5)
     set_tss_entry(GDT_TSS_FIRST + cpu_idx * 2, @tsses[cpu_idx] as u64)
     tss_load(tss_selector(cpu_idx))
     return 0

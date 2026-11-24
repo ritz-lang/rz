@@ -15,7 +15,7 @@ import proc.sched { sched_tick }
 import proc.waitq { waitq_wake_irq }
 import arch.x86_64.apcall { ap_call_dispatch }
 import arch.x86_64.sysret_catch { sysret_selftest_catch }
-import arch.x86_64.nmi_probe { nmi_probe_catch }
+import arch.x86_64.nmi_probe { ist_nest_catch, nmi_probe_catch }
 
 # External functions from main.ritz
 extern fn ring_dump()
@@ -242,7 +242,14 @@ fn log_user_fault(frame: *InterruptFrame, user_rip: u64, bad_iret: bool)
 pub fn exception_handler(frame: *InterruptFrame)
     # The "nmi-gs" self-test's NMI (arch/x86_64/nmi_probe.ritz, AGAST
     # #4612): recorded and returned from, before anything reads per-CPU state.
-    if (*frame).vector == 2 and nmi_probe_catch((*frame).cs)
+    if (*frame).vector == 2 and nmi_probe_catch((*frame).cs, frame as u64)
+        return
+
+    # The "ist-nest" self-test's #GP and #PF inside that NMI (AGAST #4628):
+    # resumed past the faulting instruction.
+    let nest_resume: u64 = ist_nest_catch((*frame).vector, (*frame).rip, (*frame).cs, frame as u64)
+    if nest_resume != 0
+        (*frame).rip = nest_resume
         return
 
     # A #GP on the syscall exit's IRETQ to a non-canonical RIP is the
@@ -259,9 +266,12 @@ pub fn exception_handler(frame: *InterruptFrame)
         # Never reached: the parent resumed, or the machine powered off.
         return
 
-    # A kernel write into the syscall stack's unmapped guard page (#1877).
-    # IST1 gives this handler its own stack, so it gets this far.
-    if (*frame).vector == 14 and syscall_stack_guard_hit(read_cr2())
+    # A kernel write into a stack's unmapped guard page (#1877). #PF runs on
+    # the stack it interrupted (idt.ritz, AGAST #4628), so an overflow can't
+    # push its frame and becomes a #DF on its own IST stack; CR2 still holds
+    # the guard page address, as Linux's #DF handler reads it.
+    let vec: u64 = (*frame).vector
+    if (vec == 14 or vec == 8) and syscall_stack_guard_hit(read_cr2())
         klog("\n*** KERNEL PANIC: syscall stack overflow (guard page hit at 0x")
         klog_hex(read_cr2())
         klog(") ***\n")
