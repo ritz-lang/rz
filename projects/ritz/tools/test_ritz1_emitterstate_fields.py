@@ -60,7 +60,10 @@ SEMA_TYPE = SRC / "sema_type.ritz"
 # "run the align pass" flag), and packed_marks/packed_marks_cap arrived -- the
 # per-register packed provenance each GEP records as it is emitted, which the
 # load/store sites consult.  Both are lowering state, like the buffers above.
-MEASURED_FIELDS = 100
+#
+# #4454 added `mono`: monomorphisation's tables, which were module globals.
+# Lowering records a generic enum first named at emission there.
+MEASURED_FIELDS = 101
 
 # The three names the superseded acceptance grep counted (101 hits on main).
 # They are lowering state: every file that touches them is emitter-side.
