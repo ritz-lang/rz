@@ -50,7 +50,7 @@ PINS = {
     "ritzunit": 7,
     "rzsh": 4,
     "spire": 1,
-    "tome": 119,
+    "tome": 110,
     "valet": 40,
     "zeus": 20,
 }

@@ -16,8 +16,10 @@
 
 import ritzlib.ct
 import ritzlib.fmt.digits
+import ritzlib.gvec
 import ritzlib.memory
 import ritzlib.option
+import ritzlib.span
 import ritzlib.str
 import ritzlib.string
 import ritzlib.strview
@@ -1100,28 +1102,33 @@ fn cmd_zcard(ctx: *CommandContext, cmd: *RespCommand) -> i32
     return CMD_OK
 
 
-# Reply with `count` range items: their members, each followed by its score
-# when `withscores`.  Frees `items`.
-fn ctx_write_zitems(ctx: *CommandContext, items: *ZItem, count: i64, withscores: bool)
+# Reply with the range `items`: their members, each followed by its score
+# when `withscores`.  A score's text is formatted into a stack buffer as it
+# is written (once while sizing the reply, once while writing it), so the
+# reply needs no scratch allocation.  `items` is borrowed.
+fn ctx_write_zitems(ctx: *CommandContext, items: Span<ZItem>, withscores: bool)
+    let count: i64 = items.len
     var n: i64 = count
     if withscores
         n = 2 * count
-    let views: *StrView = malloc(n * sizeof(StrView) + 1) as *StrView
-    # Each score's text lives in `digits` (SCORE_FMT_MAX bytes a score)
-    # until the reply is written.
-    let digits: *u8 = malloc(SCORE_FMT_MAX * count + 1)
+    var digits: [SCORE_FMT_MAX]u8
+    var need: i64 = RESP_FRAME_OVERHEAD
     for i in 0..count
+        let it: ZItem = items.get(i)
+        need += it.member.len + RESP_FRAME_OVERHEAD
         if withscores
-            let d: *u8 = digits + SCORE_FMT_MAX * i
-            let len: i64 = score_format(items[i].score, d)
-            views[2 * i] = items[i].member
-            views[2 * i + 1] = strview_from_ptr(d, len)
-        else
-            views[i] = items[i].member
-    ctx_write_bulk_array(ctx, views, n)  # frees views
-    free(digits)
-    if items != null
-        free(items as *u8)
+            need += score_format(it.score, @digits[0]) + RESP_FRAME_OVERHEAD
+    if need > ctx.resp_cap as i64
+        ctx_too_large(ctx)
+        return
+    var pos: i32 = resp_write_array(ctx.resp_buf, n)
+    for i in 0..count
+        let it: ZItem = items.get(i)
+        pos += resp_write_bulk(ctx.resp_buf + pos, it.member)
+        if withscores
+            let len: i64 = score_format(it.score, @digits[0])
+            pos += resp_write_bulk(ctx.resp_buf + pos, strview_from_ptr(@digits[0], len))
+    ctx.resp_len = pos
 
 
 # Parse a score bound as Redis's zslParseRange: a score, "(" before it
@@ -1223,7 +1230,9 @@ fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direct
     if rangetype != ZRANGE_RANK
         var count: i64 = 0
         let items: *ZItem = store_zrange_spec(ctx.store, key_sv, @spec, rev, opts.offset, opts.limit, @&count)
-        ctx_write_zitems(ctx, items, count, opts.withscores)
+        ctx_write_zitems(ctx, span_from_ptr<ZItem>(items, count), opts.withscores)
+        if items != null
+            free(items as *u8)
         return CMD_OK
 
     cmd_zrange_by_rank(ctx, key_sv, start, stop, rev, opts.withscores)
@@ -1323,17 +1332,19 @@ fn cmd_zrange_by_rank(ctx: *CommandContext, key_sv: StrView, start: i64, stop: i
         members = store_zrevrange(ctx.store, key_sv, start, stop, @&count)
     else
         members = store_zrange(ctx.store, key_sv, start, stop, @&count)
-    let items: *ZItem = malloc(count * sizeof(ZItem) + 1) as *ZItem
+    var items: Vec<ZItem> = vec_with_cap<ZItem>(count)
     for i in 0..count
-        items[i].member = members[i]
-        items[i].score = 0.0
+        var item: ZItem
+        item.member = members[i]
+        item.score = 0.0
         if withscores
             var score: f64 = 0.0
             store_zscore(ctx.store, key_sv, members[i], @&score)
-            items[i].score = score
+            item.score = score
+        items.push(item)
     if members != null
         free(members as *u8)
-    ctx_write_zitems(ctx, items, count, withscores)
+    ctx_write_zitems(ctx, span_from_vec<ZItem>(@items), withscores)
 
 
 # ZCOUNT key min max: the number of members whose score is in [min, max]
