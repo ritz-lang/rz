@@ -14,6 +14,12 @@ import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.sys
 import ritzlib.net
 import ritzlib.option
+import ritzlib.strview { StrView, strview_from_ptr, strview_from_cstr }
+import ritzlib.string { String }
+import ritzlib.fd { fd_open, O_RDWR }
+import ritzlib.fs { copy_file, path_join, mkdir, remove_dir_all }
+import ritzlib.process { fork, try_wait_pid, wait_pid, kill }
+import ritzlib.time { sleep_ms }
 
 import mausoleum.buffer_pool
 import mausoleum.collection { Collection, collection_init, collection_open_storage }
@@ -29,7 +35,6 @@ const READY_POLLS: i32 = 200        # x 50ms = 10s max wait per attempt
 const POOL_FRAMES: i32 = 1024
 const PR_SET_PDEATHSIG: i64 = 1
 const SIG_KILL: i32 = 9
-const WAIT_NOHANG: i32 = 1
 
 var g_next_offset: i32 = 0
 
@@ -39,13 +44,6 @@ pub struct LiveDb
     port: i32
     has_dir: bool       # serving the data directory `dir`, not memory
     dir: [128]u8        # NUL-terminated
-
-
-fn sleep_ms(ms: i64)
-    var ts: [2]i64
-    ts[0] = ms / 1000
-    ts[1] = (ms % 1000) * 1000000
-    sys_nanosleep(@ts[0], null)
 
 
 # Bind `sock` to 0.0.0.0:`port`.
@@ -60,14 +58,21 @@ fn listen_ok(sock: @&Socket) -> bool
         Err(_) => false
 
 
+# Point the child's stdin, stdout and stderr at /dev/null (left open: the
+# child serves until killed).
+fn quiet_stdio()
+    match fd_open("/dev/null", O_RDWR, 0)
+        Ok(devnull) =>
+            devnull.dup_to(0)
+            devnull.dup_to(1)
+            devnull.dup_to(2)
+        Err(_) => pass
+
+
 # The child: serve an empty in-memory collection until killed.
 fn serve_forever(port: i32)
     syscall2(SYS_PRCTL, PR_SET_PDEATHSIG, SIG_KILL as i64)
-    let devnull: i32 = sys_open(c"/dev/null", 2)   # O_RDWR
-    if devnull >= 0
-        sys_dup2(devnull, 0)
-        sys_dup2(devnull, 1)
-        sys_dup2(devnull, 2)
+    quiet_stdio()
 
     let pool_opt = buffer_pool_new(POOL_FRAMES)
     if option_is_none<*BufferPool>(@pool_opt)
@@ -95,11 +100,7 @@ fn serve_forever(port: i32)
 # The child: serve the data directory `dir` until killed.
 fn serve_store_forever(port: i32, dir: *u8)
     syscall2(SYS_PRCTL, PR_SET_PDEATHSIG, SIG_KILL as i64)
-    let devnull: i32 = sys_open(c"/dev/null", 2)   # O_RDWR
-    if devnull >= 0
-        sys_dup2(devnull, 0)
-        sys_dup2(devnull, 1)
-        sys_dup2(devnull, 2)
+    quiet_stdio()
 
     let storage_opt = storage_open(dir)
     if option_is_none<*Storage>(@storage_opt)
@@ -134,10 +135,12 @@ fn serve_child(db: *LiveDb, port: i32)
 
 # 1 if the child already exited (and was reaped), else 0.
 fn exited(pid: i32) -> i32
-    var status: i32 = 0
-    if sys_wait4(pid, @status, WAIT_NOHANG, null) == pid
-        return 1
-    return 0
+    match try_wait_pid(pid)
+        Ok(done) =>
+            match done
+                Some(_) => return 1
+                None => return 0
+        Err(_) => return 0
 
 
 # Poll until the server completes a real handshake.
@@ -175,12 +178,15 @@ fn live_db_serve(db: *LiveDb) -> i32
     while attempt < PORT_ATTEMPTS
         g_next_offset += 1
         let port: i32 = PORT_BASE + ((sys_getpid() * 37 + g_next_offset) % PORT_SPAN)
-        let pid: i32 = sys_fork()
-        if pid < 0
-            return -1
-        if pid == 0
-            serve_child(db, port)
-            sys_exit(1)
+        var pid: i32 = 0
+        match fork()
+            Ok(side) =>
+                match side
+                    Child =>
+                        serve_child(db, port)
+                        sys_exit(1)
+                    Parent(child) => pid = child
+            Err(_) => return -1
         db.pid = pid
         db.port = port
         let state: i32 = wait_ready(db)
@@ -201,12 +207,15 @@ pub fn live_db_restart(db: *LiveDb) -> i32
     let port: i32 = db.port
     var attempt: i32 = 0
     while attempt < PORT_ATTEMPTS
-        let pid: i32 = sys_fork()
-        if pid < 0
-            return -1
-        if pid == 0
-            serve_child(db, port)
-            sys_exit(1)
+        var pid: i32 = 0
+        match fork()
+            Ok(side) =>
+                match side
+                    Child =>
+                        serve_child(db, port)
+                        sys_exit(1)
+                    Parent(child) => pid = child
+            Err(_) => return -1
         db.pid = pid
         db.port = port
         let state: i32 = wait_ready(db)
@@ -224,9 +233,8 @@ pub fn live_db_restart(db: *LiveDb) -> i32
 pub fn live_db_stop(db: *LiveDb)
     if db.pid <= 0
         return
-    sys_kill(db.pid, SIG_KILL)
-    var status: i32 = 0
-    sys_wait4(db.pid, @status, 0, null)
+    kill(db.pid, SIG_KILL)
+    wait_pid(db.pid)
     db.pid = 0
 
 
@@ -234,11 +242,11 @@ pub fn live_db_stop(db: *LiveDb)
 # A server on a data directory
 # ============================================================================
 
-fn append_cstr(buf: *u8, pos: i64, s: *u8) -> i64
+fn append_str(buf: *u8, pos: i64, s: StrView) -> i64
     var p: i64 = pos
     var i: i64 = 0
-    while *(s + i) != 0
-        *(buf + p) = *(s + i)
+    while i < s.len
+        *(buf + p) = *(s.ptr + i)
         p += 1
         i += 1
     p
@@ -249,91 +257,47 @@ fn append_uint(buf: *u8, pos: i64, n: i32) -> i64
     pos + fmt_i64_into(buf + pos, n as i64)
 
 
-# Copy <src_dir>/<name> to <dst_dir>/<name>. 0 = ok.
-fn copy_file(src_dir: *u8, dst_dir: *u8, name: *u8) -> i32
-    var src: [512]u8
-    var dst: [512]u8
-    var p: i64 = append_cstr(@src[0], 0, src_dir)
-    p = append_cstr(@src[0], p, c"/")
-    p = append_cstr(@src[0], p, name)
-    src[p] = 0
-    p = append_cstr(@dst[0], 0, dst_dir)
-    p = append_cstr(@dst[0], p, c"/")
-    p = append_cstr(@dst[0], p, name)
-    dst[p] = 0
-    let in_fd: i32 = sys_open(@src[0], O_RDONLY)
-    if in_fd < 0
-        return 1
-    let out_fd: i32 = sys_open3(@dst[0], O_RDWR | O_CREAT | O_TRUNC, 420)
-    if out_fd < 0
-        sys_close(in_fd)
-        return 2
-    var buf: [4096]u8
+# Copy <src_dir>/<name> to <dst_dir>/<name> (mode 0644). 0 = ok.
+fn copy_into(src_dir: StrView, dst_dir: StrView, name: StrView) -> i32
+    var src: String = path_join(src_dir, name)
+    var dst: String = path_join(dst_dir, name)
     var rc: i32 = 0
-    loop
-        let n: i64 = sys_read(in_fd, @buf[0], 4096)
-        if n < 0
-            rc = 3
-            break
-        if n == 0
-            break
-        if sys_write(out_fd, @buf[0], n) != n
-            rc = 4
-            break
-    sys_close(in_fd)
-    sys_close(out_fd)
+    match copy_file(src.as_view(), dst.as_view(), 420)
+        Ok(_) => pass
+        Err(_) => rc = 1
+    src.deinit()
+    dst.deinit()
     rc
 
 
-# Remove every entry of a flat directory, then the directory.
-fn rm_dir_flat(dir: *u8)
-    let fd: i32 = sys_open(dir, O_RDONLY + O_DIRECTORY)
-    if fd >= 0
-        var ents: [4096]u8
-        var child: [512]u8
-        loop
-            let n: i64 = sys_getdents64(fd, @ents[0], 4096)
-            if n <= 0
-                break
-            var off: i64 = 0
-            while off < n
-                let rec: *u8 = @ents[off]
-                let reclen: i64 = (*(rec + 16) as i64) + ((*(rec + 17) as i64) << 8)
-                let name: *u8 = rec + 19
-                let is_dot: bool = *name == 46 and *(name + 1) == 0
-                let is_dotdot: bool = *name == 46 and *(name + 1) == 46 and *(name + 2) == 0
-                if not is_dot and not is_dotdot
-                    var p: i64 = append_cstr(@child[0], 0, dir)
-                    p = append_cstr(@child[0], p, c"/")
-                    p = append_cstr(@child[0], p, name)
-                    child[p] = 0
-                    sys_unlink(@child[0])
-                off += reclen
-        sys_close(fd)
-    sys_rmdir(dir)
+# Remove the data directory and everything in it (absent is fine).
+fn rm_dir(dir: StrView)
+    remove_dir_all(dir)
 
 
 # Start a server on a copy of the data directory `fixture` (meta.m7m,
 # data.m7m and wal.wal.000000, as a stopped `mausoleum serve --data-dir`
 # leaves them), made under /tmp. Returns 0 once it accepts connections, < 0
 # if it never did. live_db_remove_store deletes the copy.
-pub fn live_db_start_store(db: *LiveDb, fixture: *u8) -> i32
+pub fn live_db_start_store(db: *LiveDb, fixture: StrView) -> i32
     g_next_offset += 1
-    var p: i64 = append_cstr(@db.dir[0], 0, c"/tmp/nexus_live_db_")
+    var p: i64 = append_str(@db.dir[0], 0, "/tmp/nexus_live_db_")
     p = append_uint(@db.dir[0], p, sys_getpid())
-    p = append_cstr(@db.dir[0], p, c"_")
+    p = append_str(@db.dir[0], p, "_")
     p = append_uint(@db.dir[0], p, g_next_offset)
     db.dir[p] = 0
     db.has_dir = true
     db.pid = 0
-    rm_dir_flat(@db.dir[0])
-    if sys_mkdir(@db.dir[0], 493) != 0
-        return -10
-    if copy_file(fixture, @db.dir[0], c"meta.m7m") != 0
+    let dir: StrView = strview_from_ptr(@db.dir[0], p)
+    rm_dir(dir)
+    match mkdir(dir, 493)
+        Ok(_) => pass
+        Err(_) => return -10
+    if copy_into(fixture, dir, "meta.m7m") != 0
         return -11
-    if copy_file(fixture, @db.dir[0], c"data.m7m") != 0
+    if copy_into(fixture, dir, "data.m7m") != 0
         return -12
-    if copy_file(fixture, @db.dir[0], c"wal.wal.000000") != 0
+    if copy_into(fixture, dir, "wal.wal.000000") != 0
         return -13
     live_db_serve(db)
 
@@ -342,5 +306,5 @@ pub fn live_db_start_store(db: *LiveDb, fixture: *u8) -> i32
 pub fn live_db_remove_store(db: *LiveDb)
     live_db_stop(db)
     if db.has_dir
-        rm_dir_flat(@db.dir[0])
+        rm_dir(strview_from_cstr(@db.dir[0]))
         db.has_dir = false

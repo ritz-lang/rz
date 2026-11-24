@@ -42,11 +42,12 @@ pub import goliath.path { path_is_absolute, path_is_root, path_validate }
 # Exit status: 0 done, 1 failed, 2 usage error.
 #
 # ritzlib.fs is not imported: its path_basename collides with goliath.path's.
-import ritzlib.sys { sys_open, sys_read, sys_write, sys_close, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
+import ritzlib.sys { sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
 import ritzlib.fmt
 import ritzlib.strview { StrView, strview_from_cstr, strview_from_ptr }
 import ritzlib.os.env { env_get_or }
 import ritzlib.span { Span, span_from_ptr }
+import ritzlib.fd { Fd, fd_open, fd_stdout, O_RDONLY }
 import goliath.blob_id { BlobId, BLOB_ID_HEX_LEN, blob_id_compute, blob_id_eq, blob_id_is_zero, blob_id_to_hex, blob_id_from_hex }
 import goliath.hosted { memory_store_new }
 import goliath.blob_store { MemoryBlobStore, memory_store_exists, memory_store_get, memory_store_get_size, memory_store_free }
@@ -109,12 +110,12 @@ fn print_hex_id(id: *BlobId)
 # put FILE
 # ============================================================================
 
-# Read the whole host file `cpath` into fresh mmap'd memory. Returns the
+# Read the whole host file `path` into fresh mmap'd memory. Returns the
 # buffer (*len_out bytes, capacity *cap_out) or null.
-fn read_host_file(cpath: *u8, len_out: *i64, cap_out: *i64) -> *u8
-    let fd: i32 = sys_open(cpath, 0)  # O_RDONLY
-    if fd < 0
-        return null
+fn read_host_file(path: StrView, len_out: *i64, cap_out: *i64) -> *u8
+    var f: Fd = match fd_open(path, O_RDONLY, 0)
+        Ok(opened) => opened
+        Err(_) => return null
     let prot: i32 = PROT_READ + PROT_WRITE
     let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
     var cap: i64 = 65536
@@ -122,13 +123,13 @@ fn read_host_file(cpath: *u8, len_out: *i64, cap_out: *i64) -> *u8
     var len: i64 = 0
     loop
         if (buf as i64) < 0
-            sys_close(fd)
+            f.close()
             return null
         if len == cap
             let bigger: *u8 = sys_mmap(0, cap * 2, prot, flags, -1, 0)
             if (bigger as i64) < 0
                 sys_munmap(buf, cap)
-                sys_close(fd)
+                f.close()
                 return null
             var i: i64 = 0
             while i < len
@@ -137,16 +138,18 @@ fn read_host_file(cpath: *u8, len_out: *i64, cap_out: *i64) -> *u8
             sys_munmap(buf, cap)
             buf = bigger
             cap = cap * 2
-        let n: i64 = sys_read(fd, buf + len, cap - len)
-        if n < 0
-            # e.g. EISDIR
-            sys_munmap(buf, cap)
-            sys_close(fd)
-            return null
+        var n: i64 = 0
+        match f.read(Span<u8> { ptr: buf + len, len: cap - len })
+            Ok(k) => n = k
+            Err(_) =>
+                # e.g. EISDIR
+                sys_munmap(buf, cap)
+                f.close()
+                return null
         if n == 0
             break
         len = len + n
-    sys_close(fd)
+    f.close()
     *len_out = len
     *cap_out = cap
     buf
@@ -154,10 +157,9 @@ fn read_host_file(cpath: *u8, len_out: *i64, cap_out: *i64) -> *u8
 fn cmd_put(file: StrView, store_file: StrView) -> i32
     if file.len >= CLI_PATH_MAX
         return fail("put", file, "path too long")
-    # argv strings are NUL-terminated
     var len: i64 = 0
     var cap: i64 = 0
-    let data: *u8 = read_host_file(file.ptr, @len, @cap)
+    let data: *u8 = read_host_file(file, @len, @cap)
     if data == null
         return fail("put", file, "cannot read file")
 
@@ -179,12 +181,12 @@ fn cmd_put(file: StrView, store_file: StrView) -> i32
 
     # Hold the writer lock from load to save, so a concurrent put can't load
     # the same old store and rename its copy over ours (#3882)
-    let lock: i32 = file_store_lock(store_file)
-    if lock < 0
+    var lock: Fd = file_store_lock(store_file)
+    if not lock.valid()
         sys_munmap(data, cap)
         return fail("put", store_file, "cannot lock store file")
     let rc: i32 = put_locked(file, path, data, len, store_file)
-    file_store_unlock(lock)
+    file_store_unlock(@&lock)
     sys_munmap(data, cap)
     rc
 
@@ -235,13 +237,11 @@ fn cmd_get(hex: StrView, store_file: StrView) -> i32
 
     let data: *u8 = memory_store_get(@store, @id)
     let size: i64 = memory_store_get_size(@store, @id) as i64
-    var done: i64 = 0
-    while done < size
-        let n: i64 = sys_write(1, data + done, size - done)
-        if n <= 0
+    match fd_stdout().write_all(Span<u8> { ptr: data, len: size })
+        Ok(_) => pass
+        Err(_) =>
             memory_store_free(@store)
             return fail("get", hex, "write to stdout failed")
-        done = done + n
     memory_store_free(@store)
     0
 

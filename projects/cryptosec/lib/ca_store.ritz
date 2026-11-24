@@ -23,6 +23,9 @@ import cryptosec.mem
 import cryptosec.pem
 import cryptosec.x509
 import ritzlib.memory { memzero }
+import ritzlib.strview { StrView }
+import ritzlib.span { Span }
+import ritzlib.fd { Fd, fd_open, O_RDONLY, SEEK_SET, SEEK_END }
 
 # ============================================================================
 # Constants
@@ -213,53 +216,52 @@ pub fn ca_store_load_pem_bundle(store: *CaStore, pem_data: *u8, pem_len: i64) ->
 
 # Load certificates from a PEM bundle file
 # Returns: number of certificates loaded, or -1 on file error
-pub fn ca_store_load_pem_file(store: *CaStore, path: *u8, path_len: i32) -> i32
-    # Open file
-    # Need null-terminated path for sys_open
-    var path_buf: [256]u8
-    if path_len >= 255
+pub fn ca_store_load_pem_file(store: *CaStore, path: StrView) -> i32
+    # Paths of 255 bytes or more are refused, as before the Fd port.
+    if path.len >= 255
         return -1
-    var i: i32 = 0
-    while i < path_len
-        path_buf[i] = path[i]
-        i += 1
-    path_buf[path_len] = 0
 
-    let fd: i32 = sys_open(@path_buf[0], 0)  # O_RDONLY
-    if fd < 0
-        return -1
+    var f: Fd = match fd_open(path, O_RDONLY, 0)
+        Ok(opened) => opened
+        Err(_) => return -1
 
     # Get file size via lseek
-    let size: i64 = sys_lseek(fd, 0, 2)  # SEEK_END
+    var size: i64 = -1
+    match f.seek(0, SEEK_END)
+        Ok(end) => size = end
+        Err(_) => pass
     if size < 0 || size > CA_STORE_MAX_FILE_SIZE
-        sys_close(fd)
+        f.close()
         return -1
 
     # An empty bundle holds no certificates. mmap of length 0 is EINVAL, so
     # it must not get that far (GitHub #149 L-2, AGAST #2586).
     if size == 0
-        sys_close(fd)
+        f.close()
         return 0
 
     # Seek back to start
-    sys_lseek(fd, 0, 0)  # SEEK_SET
+    f.seek(0, SEEK_SET)
 
     # Allocate buffer for file content
     let file_buf: *u8 = sys_mmap(0, size, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
     if ca_mmap_failed(file_buf)
-        sys_close(fd)
+        f.close()
         return -1
 
     # Read file
     var total_read: i64 = 0
     while total_read < size
         let to_read: i64 = size - total_read
-        let n: i64 = sys_read(fd, file_buf + total_read, to_read)
+        var n: i64 = 0
+        match f.read(Span<u8> { ptr: file_buf + total_read, len: to_read })
+            Ok(k) => n = k
+            Err(_) => pass
         if n <= 0
             break
         total_read = total_read + n
 
-    sys_close(fd)
+    f.close()
 
     if total_read != size
         sys_munmap(file_buf, size)

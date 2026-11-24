@@ -15,6 +15,8 @@
 import ritzlib.sys
 import ritzlib.strview { StrView }
 import ritzlib.span { Span, span_from_strview }
+import ritzlib.fd { Fd, Pipe, pipe }
+import ritzlib.process { fork, wait_pid }
 
 import spire.http.mod { Response, response_ok, response_created }
 import spire.http.mod { response_bad_request, response_unauthorized, response_forbidden }
@@ -37,35 +39,49 @@ import spire.http.response
 
 var g_err: [2048]u8
 var g_err_len: i64 = 0
-var g_pipe: [2]i32
+var g_pipe: Pipe = Pipe { read: Fd { fd: -1 }, write: Fd { fd: -1 } }
 
-fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
+fn read_all(f: @Fd, buf: *u8, cap: i64) -> i64
     var got: i64 = 0
     var n: i64 = 1
     while n > 0 and got < cap
-        n = sys_read(fd, buf + got, cap - got)
+        match f.read(Span<u8> { ptr: buf + got, len: cap - got })
+            Ok(k) => n = k
+            Err(_) => n = -1
         if n > 0
             got = got + n
     got
 
-# Fork with the child's stderr on a pipe.  Returns the pid; 0 in the child.
+# Fork with the child's stderr on a pipe.  Returns the pid; 0 in the child,
+# < 0 if the fork failed.
 fn capture_begin() -> i32
-    sys_pipe(@g_pipe[0])
-    let pid: i32 = sys_fork()
-    if pid == 0
-        sys_dup2(g_pipe[1], 2)
-        sys_close(g_pipe[0])
-        sys_close(g_pipe[1])
+    match pipe()
+        Ok(p) => g_pipe = p
+        Err(_) => pass
+    var pid: i32 = -1
+    match fork()
+        Ok(side) =>
+            match side
+                Child =>
+                    g_pipe.write.dup_to(2)
+                    g_pipe.close()
+                    pid = 0
+                Parent(child) => pid = child
+        Err(e) => pid = -e.code()
     pid
 
-# In the parent: the child's stderr into g_err, and its exit status.
+# In the parent: the child's stderr into g_err, and its exit status (0 if it
+# was killed by a signal, as WEXITSTATUS reads it).
 fn capture_end(pid: i32) -> i32
-    sys_close(g_pipe[1])
-    g_err_len = read_all(g_pipe[0], @g_err[0], 2048)
-    sys_close(g_pipe[0])
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    (status >> 8) & 255
+    g_pipe.write.close()
+    g_err_len = read_all(@g_pipe.read, @g_err[0], 2048)
+    g_pipe.read.close()
+    match wait_pid(pid)
+        Ok(r) =>
+            if r.signaled != 0
+                return 0
+            r.exit_code
+        Err(_) => 0
 
 # True when the captured stderr contains `want`.
 fn stderr_has(want: StrView) -> bool

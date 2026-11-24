@@ -15,8 +15,10 @@
 # `<path>.lock` sidecar: the store itself can't carry it, since each save
 # renames a new inode over it. Plain readers need no lock.
 
-import ritzlib.sys { sys_open, sys_open3, sys_flock, sys_getpid, LOCK_EX, sys_read, sys_write, sys_close, sys_lseek, sys_rename, sys_unlink, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
-import ritzlib.strview { StrView }
+import ritzlib.sys { sys_getpid, sys_rename, sys_unlink, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
+import ritzlib.fd { Fd, fd_open, fd_adopt, fd_borrow, SEEK_SET, SEEK_END, O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_CLOEXEC, LOCK_EX }
+import ritzlib.span { Span }
+import ritzlib.strview { StrView, strview_from_ptr, strview_empty }
 import goliath.blob_store { MemoryBlobStore }
 import goliath.namespace { Namespace, namespace_new }
 import goliath.image { ImageSink, image_write, image_load, IMAGE_HEADER_SIZE, IMAGE_VERSION }
@@ -30,40 +32,41 @@ const FS_ENOENT: i32 = 2
 # Helpers
 # ============================================================================
 
-# `path` + `suffix` (a C string) + NUL into `buf` (FS_PATH_BUF bytes).
-fn fs_path_cstr(path: StrView, suffix: *u8, buf: *u8) -> bool
-    var n: i64 = 0
-    while *(suffix + n) != 0
-        n = n + 1
-    if path.len == 0 or path.len + n >= FS_PATH_BUF
-        return false
+# `path` + `suffix` + NUL into `buf` (FS_PATH_BUF bytes), as a view of `buf`
+# (without the NUL). An empty view if `path` is empty, holds a NUL, or the
+# pair doesn't fit. The NUL is for rename(2)/unlink(2), which stay raw here:
+# ritzlib.fs can't be imported (its DirEntry and path_basename collide with
+# goliath's).
+fn fs_path_join(path: StrView, suffix: StrView, buf: *u8) -> StrView
+    if path.len == 0 or path.len + suffix.len >= FS_PATH_BUF
+        return strview_empty()
     var i: i64 = 0
     while i < path.len
         if *(path.ptr + i) == 0
-            return false
+            return strview_empty()
         *(buf + i) = *(path.ptr + i)
         i = i + 1
     var j: i64 = 0
-    while j < n
-        *(buf + i + j) = *(suffix + j)
+    while j < suffix.len
+        *(buf + i + j) = *(suffix.ptr + j)
         j = j + 1
     *(buf + i + j) = 0
-    true
+    strview_from_ptr(buf, i + j)
 
-# `path` + ".tmp." + the decimal pid + NUL into `buf` (FS_PATH_BUF bytes):
-# a temp name no other live process will pick.
-fn fs_tmp_path_cstr(path: StrView, buf: *u8) -> bool
+# `path` + ".tmp." + the decimal pid into `buf` (FS_PATH_BUF bytes): a temp
+# name no other live process will pick. Empty if it doesn't fit.
+fn fs_tmp_path(path: StrView, buf: *u8) -> StrView
     var suffix: [32]u8
-    let prefix: *u8 = c".tmp."
+    let prefix: StrView = ".tmp."
     var n: i64 = 0
-    while *(prefix + n) != 0
-        suffix[n] = *(prefix + n)
+    while n < prefix.len
+        suffix[n] = *(prefix.ptr + n)
         n = n + 1
     var digits: [16]u8
     var d: i64 = 0
     var pid: i64 = sys_getpid() as i64
     if pid <= 0
-        return false
+        return strview_empty()
     while pid > 0
         digits[d] = (48 + pid % 10) as u8
         pid = pid / 10
@@ -72,18 +75,7 @@ fn fs_tmp_path_cstr(path: StrView, buf: *u8) -> bool
         d = d - 1
         suffix[n] = digits[d]
         n = n + 1
-    suffix[n] = 0
-    fs_path_cstr(path, @suffix[0], buf)
-
-# Write all `len` bytes. False on any error.
-fn fs_write_all(fd: i32, data: *u8, len: i64) -> bool
-    var done: i64 = 0
-    while done < len
-        let n: i64 = sys_write(fd, data + done, len - done)
-        if n <= 0
-            return false
-        done = done + n
-    true
+    fs_path_join(path, strview_from_ptr(@suffix[0], n), buf)
 
 # ============================================================================
 # Load
@@ -97,35 +89,48 @@ fn fs_write_all(fd: i32, data: *u8, len: i64) -> bool
 # ErrorCode.IoError (can't read it) or ErrorCode.PathTooLong.
 pub fn file_store_open(path: StrView, store: *MemoryBlobStore, ns_out: *Namespace) -> ErrorCode
     var cpath: [4096]u8
-    if not fs_path_cstr(path, c"", @cpath[0])
+    let full: StrView = fs_path_join(path, "", @cpath[0])
+    if full.len == 0
         return ErrorCode.PathTooLong
 
-    let fd: i32 = sys_open(@cpath[0], 0)  # O_RDONLY
-    if fd == -FS_ENOENT
-        *ns_out = namespace_new(store)
-        return ErrorCode.Ok
-    if fd < 0
-        return ErrorCode.IoError
+    var f: Fd = fd_adopt(-1)
+    match fd_open(full, O_RDONLY, 0)
+        Ok(opened) => f = opened
+        Err(e) =>
+            if e.code() == FS_ENOENT
+                *ns_out = namespace_new(store)
+                return ErrorCode.Ok
+            return ErrorCode.IoError
 
-    let len: i64 = sys_lseek(fd, 0, 2)  # SEEK_END
-    if len < 0 or sys_lseek(fd, 0, 0) != 0
-        sys_close(fd)
+    var len: i64 = -1
+    match f.seek(0, SEEK_END)
+        Ok(end) => len = end
+        Err(_) => pass
+    var rewound: bool = false
+    match f.seek(0, SEEK_SET)
+        Ok(at) => rewound = at == 0
+        Err(_) => pass
+    if len < 0 or not rewound
+        f.close()
         return ErrorCode.IoError
     if len < IMAGE_HEADER_SIZE
-        sys_close(fd)
+        f.close()
         return ErrorCode.CorruptBlob
 
     let buf: *u8 = sys_mmap(0, len, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
     if (buf as i64) < 0
-        sys_close(fd)
+        f.close()
         return ErrorCode.IoError
     var got: i64 = 0
     while got < len
-        let n: i64 = sys_read(fd, buf + got, len - got)
+        var n: i64 = 0
+        match f.read(Span<u8> { ptr: buf + got, len: len - got })
+            Ok(k) => n = k
+            Err(_) => pass
         if n <= 0
             break
         got = got + n
-    sys_close(fd)
+    f.close()
 
     var rc: ErrorCode = ErrorCode.IoError
     if got == len
@@ -137,11 +142,15 @@ pub fn file_store_open(path: StrView, store: *MemoryBlobStore, ns_out: *Namespac
 # Save
 # ============================================================================
 
+# ImageSink callback: `ctx` points at the raw fd of the open temp file.
 fn fs_sink_write(ctx: *u8, data: *u8, len: i64) -> bool
-    fs_write_all(*(ctx as *i32), data, len)
+    let f: Fd = fd_borrow(*(ctx as *i32))
+    match f.write_all(Span<u8> { ptr: data, len: len })
+        Ok(_) => true
+        Err(_) => false
 
-fn fs_save_to_fd(fd: i32, ns: *Namespace) -> bool
-    var fd_cell: i32 = fd
+fn fs_save_to_fd(f: @Fd, ns: *Namespace) -> bool
+    var fd_cell: i32 = f.raw()
     var sink: ImageSink = ImageSink { ctx: @fd_cell as *u8, write: fs_sink_write }
     image_write(ns, @sink)
 
@@ -151,19 +160,26 @@ fn fs_save_to_fd(fd: i32, ns: *Namespace) -> bool
 pub fn file_store_save(path: StrView, ns: *Namespace) -> ErrorCode
     var cpath: [4096]u8
     var ctmp: [4096]u8
-    if not fs_path_cstr(path, c"", @cpath[0]) or not fs_tmp_path_cstr(path, @ctmp[0])
+    let full: StrView = fs_path_join(path, "", @cpath[0])
+    let tmp: StrView = fs_tmp_path(path, @ctmp[0])
+    if full.len == 0 or tmp.len == 0
         return ErrorCode.PathTooLong
 
-    # O_WRONLY | O_CREAT | O_TRUNC, mode 0644
-    let fd: i32 = sys_open3(@ctmp[0], 577, 420)
-    if fd < 0
+    # mode 0644
+    var f: Fd = fd_adopt(-1)
+    match fd_open(tmp, O_WRONLY + O_CREAT + O_TRUNC, 420)
+        Ok(opened) => f = opened
+        Err(_) => return ErrorCode.IoError
+    let ok: bool = fs_save_to_fd(@f, ns)
+    var closed: bool = true
+    match f.close()
+        Ok(_) => pass
+        Err(_) => closed = false
+    if not closed or not ok
+        sys_unlink(tmp.ptr)
         return ErrorCode.IoError
-    let ok: bool = fs_save_to_fd(fd, ns)
-    if sys_close(fd) != 0 or not ok
-        sys_unlink(@ctmp[0])
-        return ErrorCode.IoError
-    if sys_rename(@ctmp[0], @cpath[0]) != 0
-        sys_unlink(@ctmp[0])
+    if sys_rename(tmp.ptr, full.ptr) != 0
+        sys_unlink(tmp.ptr)
         return ErrorCode.IoError
     ErrorCode.Ok
 
@@ -172,25 +188,27 @@ pub fn file_store_save(path: StrView, ns: *Namespace) -> ErrorCode
 # ============================================================================
 
 # Take the exclusive writer lock for the store at `path`, waiting for any
-# other holder. Returns the lock's fd (>= 0) for file_store_unlock, or -1:
-# the store path didn't fit in the buffer, or the lock couldn't be taken.
-# Creates `<path>.lock` (empty, mode 0644) if missing and leaves it in place:
-# removing it would let a waiter lock an unlinked inode while a newcomer
-# locks a new one.
-pub fn file_store_lock(path: StrView) -> i32
+# other holder. Returns the lock file for file_store_unlock, or a closed Fd
+# (not valid()): the store path didn't fit in the buffer, or the lock
+# couldn't be taken. Creates `<path>.lock` (empty, mode 0644) if missing and
+# leaves it in place: removing it would let a waiter lock an unlinked inode
+# while a newcomer locks a new one.
+pub fn file_store_lock(path: StrView) -> Fd
     var clock: [4096]u8
-    if not fs_path_cstr(path, c".lock", @clock[0])
-        return -1
-    # O_RDWR | O_CREAT | O_CLOEXEC, mode 0644
-    let fd: i32 = sys_open3(@clock[0], 2 + 64 + 524288, 420)
-    if fd < 0
-        return -1
-    if sys_flock(fd, LOCK_EX) != 0
-        sys_close(fd)
-        return -1
-    fd
+    let lock_path: StrView = fs_path_join(path, ".lock", @clock[0])
+    if lock_path.len == 0
+        return fd_adopt(-1)
+    var f: Fd = fd_adopt(-1)
+    match fd_open(lock_path, O_RDWR + O_CREAT + O_CLOEXEC, 420)
+        Ok(opened) => f = opened
+        Err(_) => return fd_adopt(-1)
+    match f.lock(LOCK_EX)
+        Ok(_) => pass
+        Err(_) =>
+            f.close()
+            return fd_adopt(-1)
+    f
 
 # Release a lock from file_store_lock (closing its fd drops the flock).
-pub fn file_store_unlock(fd: i32)
-    if fd >= 0
-        sys_close(fd)
+pub fn file_store_unlock(lock: @&Fd)
+    lock.close()

@@ -54,6 +54,8 @@ import ritzlib.os.env
 import ritzlib.fs
 import ritzlib.timer
 import ritzlib.json
+import ritzlib.fd { Fd, fd_borrow, fd_adopt }
+import ritzlib.time { sleep_ms }
 
 import symbols
 import paths
@@ -112,7 +114,7 @@ fn scratch_root() -> String
         out.push_str(env_get_or("TMPDIR", "/tmp"))
         out.push_str("/ritz-lsp-")
         out.push_i64(sys_getuid() as i64)
-    sys_mkdir(out.as_ptr(), 448)
+    mkdir(out.as_view(), 448)
     out
 
 # =============================================================================
@@ -245,7 +247,7 @@ fn compile(dl: *DiagList, uri: *u8, text: *u8, text_len: i64)
     var dir: String = scratch_root()
     dir.push('/')
     push_hash_hex(@&dir, uri)
-    sys_mkdir(dir.as_ptr(), 448)
+    mkdir(dir.as_view(), 448)
     var input: String = dir.clone()
     input.push('/')
     input.push_string(@base)
@@ -257,9 +259,9 @@ fn compile(dl: *DiagList, uri: *u8, text: *u8, text_len: i64)
         Ok(n) => run_ritz1(dl, @&ritz1, @&input, @&output, @&ipath, text, text_len)
         Err(e) => write_failed(dl, @&input, e.code())
 
-    sys_unlink(input.as_ptr())
-    sys_unlink(output.as_ptr())
-    sys_rmdir(dir.as_ptr())
+    unlink(input.as_view())
+    unlink(output.as_view())
+    rmdir(dir.as_view())
 
 fn write_failed(dl: *DiagList, input: @&String, errno: i32)
     var m: String = string_from("ritz-lsp: cannot write ")
@@ -343,32 +345,41 @@ fn drain(q: @&Process, err: @&Vec<u8>, out: @&Vec<u8>, deadline: i64)
             return
         if rc > 0
             if fds[0].revents != 0
-                let n: i64 = sys_read(q.stderr_fd, @buf[0], 4096)
+                let n: i64 = read_some(q.stderr_fd, @buf[0])
                 if n > 0
                     err.push_span(Span<u8> { ptr: (@buf[0]), len: (n) as i64 })
                 else
-                    sys_close(q.stderr_fd)
+                    close_pipe(q.stderr_fd)
                     q.stderr_fd = -1
             if fds[1].revents != 0
-                let n: i64 = sys_read(q.stdout_fd, @buf[0], 4096)
+                let n: i64 = read_some(q.stdout_fd, @buf[0])
                 if n > 0
                     out.push_span(Span<u8> { ptr: (@buf[0]), len: (n) as i64 })
                 else
-                    sys_close(q.stdout_fd)
+                    close_pipe(q.stdout_fd)
                     q.stdout_fd = -1
+
+# One read of up to 4096 bytes from the Process's pipe `fd` (it stays the
+# Process's): the count, 0 at EOF, -1 on error.
+fn read_some(fd: i32, buf: *u8) -> i64
+    match fd_borrow(fd).read(Span<u8> { ptr: buf, len: 4096 })
+        Ok(n) => n
+        Err(_) => -1
+
+# Close the Process's pipe `fd`; the caller marks the field -1.
+fn close_pipe(fd: i32)
+    var f: Fd = fd_adopt(fd)
+    f.close()
 
 # q's result once it exits, or None if it is still running at `deadline`.
 fn wait_until(q: @&Process, deadline: i64) -> Option<ProcessResult>
-    var ts: [2]i64
-    ts[0] = 0
-    ts[1] = 5000000
     loop
         match q.try_wait()
             Some(r) => return Some(r)
             None => pass
         if ms_left(deadline) == 0
             return None
-        sys_nanosleep(@ts[0], null)
+        sleep_ms(5)
 
 # The textDocument/publishDiagnostics params for `uri` at `version` into
 # `out`, from a ritz1 compile of `text`.

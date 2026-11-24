@@ -39,6 +39,9 @@ import ritzlib.argspec
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.os.env
+import ritzlib.fd { Fd, fd_adopt, SEEK_SET, SEEK_END }
+import ritzlib.process { fork, kill, wait_pid }
+import ritzlib.time { now, now_unix_ms }
 import ritzunit.wait_status
 
 # ============================================================================
@@ -57,9 +60,6 @@ struct RitzTest
 # ============================================================================
 # Constants
 # ============================================================================
-
-const SEEK_SET: i32 = 0
-const SEEK_END: i32 = 2
 
 const MFD_CLOEXEC: i64 = 1
 
@@ -111,13 +111,10 @@ pub fn options_default() -> RunOptions
 # ============================================================================
 
 fn get_time_ms() -> i64
-    var tv: Timeval
-    sys_gettimeofday(@tv, null)
-    return tv.tv_sec * 1000 + tv.tv_usec / 1000
+    return now_unix_ms()
 
 fn get_time_us() -> i64
-    var tv: Timeval
-    sys_gettimeofday(@tv, null)
+    let tv: Timeval = now()
     return tv.tv_sec * 1000000 + tv.tv_usec
 
 # ============================================================================
@@ -169,24 +166,28 @@ pub fn test_exit_status(ret: i32) -> i32
 # The capture file a child writes its stdout and stderr to: a memfd, one per
 # pool slot, emptied before each test. -1 if it could not be created (output
 # then goes to the runner's own stdout/stderr).
-fn capture_open() -> i32
+fn capture_open() -> Fd
+    # memfd_create(2) has no typed wrapper: raw, then owned as an Fd.
     let fd: i64 = syscall2(SYS_MEMFD_CREATE, c"ritzunit-capture" as i64, MFD_CLOEXEC)
     if fd < 0
-        return -1
-    return fd as i32
+        return fd_adopt(-1)
+    return fd_adopt(fd as i32)
 
-fn capture_reset(fd: i32)
-    if fd < 0
+fn capture_reset(f: @Fd)
+    if not f.valid()
         return
-    syscall2(SYS_FTRUNCATE, fd as i64, 0)
-    sys_lseek(fd, 0, SEEK_SET)
+    f.truncate(0)
+    f.seek(0, SEEK_SET)
 
-# The last CAPTURE_KEEP bytes a child wrote to `fd`, in a fresh allocation.
-fn capture_take(fd: i32) -> StrView
+# The last CAPTURE_KEEP bytes a child wrote to `f`, in a fresh allocation.
+fn capture_take(f: @Fd) -> StrView
     var out: StrView = strview_empty()
-    if fd < 0
+    if not f.valid()
         return out
-    let size: i64 = sys_lseek(fd, 0, SEEK_END)
+    var size: i64 = 0
+    match f.seek(0, SEEK_END)
+        Ok(end) => size = end
+        Err(_) => pass
     if size <= 0
         return out
     var start: i64 = 0
@@ -196,10 +197,13 @@ fn capture_take(fd: i32) -> StrView
     let buf: *u8 = malloc(want + 1)
     if buf == null
         return out
-    sys_lseek(fd, start, SEEK_SET)
+    f.seek(start, SEEK_SET)
     var got: i64 = 0
     while got < want
-        let n: i64 = sys_read(fd, buf + got, want - got)
+        var n: i64 = 0
+        match f.read(Span<u8> { ptr: buf + got, len: want - got })
+            Ok(k) => n = k
+            Err(_) => pass
         if n <= 0
             break
         got += n
@@ -246,7 +250,7 @@ struct PoolSlot
     start_ms: i64
     deadline_ms: i64
     killed: i32          # 1 once SIGKILLed for passing its deadline
-    capture_fd: i32
+    capture_fd: Fd       # the capture memfd (closed: not valid)
 
 # One test's outcome, held until every test before it has been reported.
 struct Outcome
@@ -269,28 +273,31 @@ fn outcome_fail_to_start(out: *Outcome)
 # Fork the test at run-list position `pos` into `slot`. A failed fork records
 # the test as failed at once.
 fn pool_launch(opts: @RunOptions, slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_mask: *i64) -> i32
-    capture_reset(slot.capture_fd)
+    capture_reset(@slot.capture_fd)
     # A child without a capture file writes to our stdout: the report so far
     # must be there first. With one, the report stays buffered.
-    if slot.capture_fd < 0
+    if not slot.capture_fd.valid()
         out_flush()
-    let pid: i32 = sys_fork()
-    if pid < 0
-        outcome_fail_to_start(out)
-        return 0
-
-    if pid == 0
-        # === Child: the test sees the signal mask the runner started with ===
-        sys_rt_sigprocmask(SIG_SETMASK, old_mask, null, 8)
-        # The report buffered so far is the runner's to write, not the test's.
-        out_discard()
-        child_disable_core(opts)
-        if slot.capture_fd >= 0
-            sys_dup2(slot.capture_fd, 1)
-            sys_dup2(slot.capture_fd, 2)
-        let run: fn() -> i32 = test.run
-        sys_exit(test_exit_status(run()))
-        return 0
+    var pid: i32 = 0
+    match fork()
+        Ok(side) =>
+            match side
+                Child =>
+                    # === Child: the test sees the signal mask the runner started with ===
+                    sys_rt_sigprocmask(SIG_SETMASK, old_mask, null, 8)
+                    # The report buffered so far is the runner's to write, not the test's.
+                    out_discard()
+                    child_disable_core(opts)
+                    if slot.capture_fd.valid()
+                        slot.capture_fd.dup_to(1)
+                        slot.capture_fd.dup_to(2)
+                    let run: fn() -> i32 = test.run
+                    sys_exit(test_exit_status(run()))
+                    return 0
+                Parent(child) => pid = child
+        Err(_) =>
+            outcome_fail_to_start(out)
+            return 0
 
     slot.pid = pid
     slot.pos = pos
@@ -306,7 +313,7 @@ fn pool_record(slot: *PoolSlot, status: i32, outcomes: *Outcome)
     result_from_reap(status, slot.killed, @out.result)
     out.output = strview_empty()
     if out.result.status != TEST_RESULT_PASS
-        out.output = capture_take(slot.capture_fd)
+        out.output = capture_take(@slot.capture_fd)
     out.done = 1
     slot.pid = 0
 
@@ -315,6 +322,8 @@ fn pool_reap(slots: *PoolSlot, nslots: i64, outcomes: *Outcome) -> i32
     var reaped: i32 = 0
     loop
         var status: i32 = 0
+        # Raw: process.try_wait_pid reaps one pid; this reaps any child and
+        # needs which one it was, and its status for result_from_reap.
         let pid: i32 = sys_wait4(-1, @status, WNOHANG, null)
         if pid <= 0
             return reaped
@@ -339,7 +348,7 @@ fn pool_wait(slots: *PoolSlot, nslots: i64, outcomes: *Outcome)
             let slot: *PoolSlot = @slots[i]
             if slot.pid != 0 && slot.killed == 0
                 if slot.deadline_ms <= now
-                    sys_kill(slot.pid, SIGKILL)
+                    kill(slot.pid, SIGKILL)
                     slot.killed = 1
                 else if earliest < 0 || slot.deadline_ms < earliest
                     earliest = slot.deadline_ms
@@ -359,9 +368,8 @@ fn pool_abandon(slots: *PoolSlot, nslots: i64)
     for i in 0..nslots
         let slot: *PoolSlot = @slots[i]
         if slot.pid != 0
-            sys_kill(slot.pid, SIGKILL)
-            var status: i32 = 0
-            sys_wait4(slot.pid, @status, 0, null)
+            kill(slot.pid, SIGKILL)
+            wait_pid(slot.pid)
             slot.pid = 0
 
 # ============================================================================
@@ -499,8 +507,7 @@ fn run_pool(opts: @RunOptions, tests: *RitzTest, run: *i64, nrun: i64, outcomes:
 
     sys_rt_sigprocmask(SIG_SETMASK, @old_mask, null, 8)
     for i in 0..nslots
-        if slots[i].capture_fd >= 0
-            sys_close(slots[i].capture_fd)
+        slots[i].capture_fd.close()
 
 # ============================================================================
 # Main Test Runner

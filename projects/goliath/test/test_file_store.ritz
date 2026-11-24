@@ -8,8 +8,10 @@
 # Fixtures live under /tmp, named by pid so concurrent runs don't collide,
 # and each test removes its own.
 
-# Not ritzlib.fs: its path_basename collides with goliath.path's.
-import ritzlib.sys { sys_getpid, sys_open, sys_open3, sys_read, sys_write, sys_close, sys_unlink }
+# Not ritzlib.fs: its path_basename and DirEntry collide with goliath's, so
+# unlink stays raw.
+import ritzlib.sys { sys_getpid, sys_unlink }
+import ritzlib.fd { Fd, fd_open, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC }
 import ritzlib.strview { StrView, strview_from_ptr }
 import ritzlib.span { Span, span_from_ptr }
 import ritzlib.fmt.digits { fmt_i64_into }
@@ -43,34 +45,38 @@ const FIXTURE_MAX: i64 = 8192
 
 # Read the file at `path` into `buf` (FIXTURE_MAX bytes). Its length, or -1.
 fn fixture_read(path: StrView, buf: *u8) -> i64
-    let fd: i32 = sys_open(path.ptr, 0)
-    if fd < 0
-        return -1
+    var f: Fd = match fd_open(path, O_RDONLY, 0)
+        Ok(opened) => opened
+        Err(_) => return -1
     var len: i64 = 0
     loop
-        let n: i64 = sys_read(fd, buf + len, FIXTURE_MAX - len)
+        var n: i64 = 0
+        match f.read(Span<u8> { ptr: buf + len, len: FIXTURE_MAX - len })
+            Ok(k) => n = k
+            Err(_) => pass
         if n <= 0
             break
         len = len + n
-    sys_close(fd)
+    f.close()
     len
 
 # Create or truncate the file at `path` with `len` bytes of `data`.
 fn fixture_write(path: StrView, data: *u8, len: i64)
-    # O_WRONLY | O_CREAT | O_TRUNC, 0644
-    let fd: i32 = sys_open3(path.ptr, 577, 420)
-    if fd < 0
-        return
-    sys_write(fd, data, len)
-    sys_close(fd)
+    # 0644
+    var f: Fd = match fd_open(path, O_WRONLY + O_CREAT + O_TRUNC, 420)
+        Ok(opened) => opened
+        Err(_) => return
+    f.write(Span<u8> { ptr: data, len: len })
+    f.close()
 
 fn fixture_exists(path: StrView) -> bool
-    let fd: i32 = sys_open(path.ptr, 0)
-    if fd < 0
-        return false
-    sys_close(fd)
+    var f: Fd = match fd_open(path, O_RDONLY, 0)
+        Ok(opened) => opened
+        Err(_) => return false
+    f.close()
     true
 
+# `path` is NUL-terminated (tmp_path).
 fn fixture_unlink(path: StrView)
     sys_unlink(path.ptr)
 
