@@ -1,0 +1,131 @@
+# ritz1/src/intrinsic_check.ritz - the x86 / SIMD intrinsics' arity and operands
+#
+# AGAST #4658 (folded into #4657).  The AES-NI, SHA-NI and vector builtins
+# are one table here: each one's arity, its operands' names, and what its
+# operands must be.  Sema refuses a call that breaks a row where it is
+# written, in ritz0's words (emitter/intrinsics.py):
+#
+#     aesenc(1, 2)       # error: aesenc() requires v4i32 or v2i64 arguments
+#     sha256rnds2(a, b)  # error: sha256rnds2() requires 3 arguments (cdgh, abef, wk)
+#
+# The emitter took a scalar operand for a v2i64 and lowered the call
+# (emit_x86_intrinsic_v2i64), and said a wrong arity as "ritz1 cannot emit:
+# x86 intrinsic arity mismatch".  An operand Sema can't type is left to the
+# emitter, as bool_check leaves BK_UNSURE.  ritz0's rows:
+# test_emit_value_errors_located.py, every compiler.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.strview
+
+import ast
+import ast_query   # name_eq, eprint_bytes, is_simd_vector_type_name
+import sema
+import sema_type
+import types
+
+# What a row's operands must be: nothing Sema checks, the first operand a
+# 128-bit AES state (v4i32 or v2i64), every operand a v4i32, every operand
+# a vector, or the first operand a vector.
+const IC_ANY: i32 = 0
+const IC_AES_FIRST: i32 = 1
+const IC_V4I32_ALL: i32 = 2
+const IC_VEC_ALL: i32 = 3
+const IC_VEC_FIRST: i32 = 4
+
+struct IntrinsicRow
+    arity: i32
+    operands: StrView   # "(state, key)": ritz0's arity words
+    rule: i32           # IC_*
+    refusal: StrView    # after "name() ": ritz0's operand words
+
+# The row for intrinsic `name`; arity 0 when `name` is none.
+fn ic_row(name: StrView) -> IntrinsicRow
+    if name_eq(name, "aesenc") == 1 or name_eq(name, "aesenclast") == 1 or name_eq(name, "aesdec") == 1 or name_eq(name, "aesdeclast") == 1
+        return IntrinsicRow { arity: 2, operands: "(state, key)", rule: IC_AES_FIRST, refusal: "requires v4i32 or v2i64 arguments" }
+    if name_eq(name, "aesimc") == 1
+        return IntrinsicRow { arity: 1, operands: "(key)", rule: IC_AES_FIRST, refusal: "requires v4i32 or v2i64 argument" }
+    if name_eq(name, "aeskeygenassist") == 1
+        return IntrinsicRow { arity: 2, operands: "(key, rcon)", rule: IC_AES_FIRST, refusal: "requires v4i32 or v2i64 first argument" }
+    if name_eq(name, "sha256rnds2") == 1
+        return IntrinsicRow { arity: 3, operands: "(cdgh, abef, wk)", rule: IC_V4I32_ALL, refusal: "requires v4i32 arguments" }
+    if name_eq(name, "sha256msg1") == 1 or name_eq(name, "sha256msg2") == 1
+        return IntrinsicRow { arity: 2, operands: "(w0, w1)", rule: IC_V4I32_ALL, refusal: "requires v4i32 arguments" }
+    if name_eq(name, "simd_add") == 1 or name_eq(name, "simd_xor") == 1
+        return IntrinsicRow { arity: 2, operands: "(vector, vector)", rule: IC_VEC_ALL, refusal: "requires vector arguments" }
+    if name_eq(name, "simd_rotl") == 1
+        return IntrinsicRow { arity: 2, operands: "(vector, shift)", rule: IC_VEC_FIRST, refusal: "requires a vector argument" }
+    if name_eq(name, "xgetbv") == 1
+        return IntrinsicRow { arity: 1, operands: "(xcr)", rule: IC_ANY, refusal: "" }
+    IntrinsicRow { arity: 0, operands: "", rule: IC_ANY, refusal: "" }
+
+# 1 when Sema types `x` as surely not what `rule` asks of it; an operand it
+# can't type is not judged.
+fn ic_operand_wrong(sm: *Sema, x: *Expr, rule: i32) -> i32
+    var t: SemaTy
+    if sema_expr_ty(sm, x, @t) == TypeKind.Unknown
+        return 0
+    if t.kind != TypeKind.Struct or t.name == null or t.name_len <= 0
+        return 1
+    let n: StrView = StrView { ptr: t.name, len: t.name_len as i64 }
+    if rule == IC_AES_FIRST
+        return (name_eq(n, "v4i32") == 0 and name_eq(n, "v2i64") == 0) as i32
+    if rule == IC_V4I32_ALL
+        return (name_eq(n, "v4i32") == 0) as i32
+    (is_simd_vector_type_name(n) == 0) as i32
+
+# 1 the first time this check reports at `e`: a call is said once, though
+# the walk can reach it twice (a match arm's value, a tail).
+fn ic_first(sm: *Sema, e: *Expr) -> i32
+    if sm.ic_err_line == e.span.line and sm.ic_err_col == e.span.col
+        return 0
+    sm.ic_err_line = e.span.line
+    sm.ic_err_col = e.span.col
+    sema_error_at(sm, e.span.line, e.span.col)
+    1
+
+fn ic_refuse(sm: *Sema, e: *Expr, name: StrView, what: StrView)
+    if ic_first(sm, e) == 0
+        return
+    eprint_bytes(name)
+    eprints("() ")
+    eprint_bytes(what)
+    eprint_char('\n')
+
+# The walk's check of a call: an intrinsic's arity, then its operands.  A
+# local of the name (a fn value) is no intrinsic.
+pub fn intrinsic_check_call(sm: *Sema, e: *Expr)
+    if e == null or e.kind != ExprKind.Call or e.func_name_len == 0
+        return
+    let name: StrView = StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }
+    let row: IntrinsicRow = ic_row(name)
+    if row.arity == 0 or sema_is_local(sm, name) == 1
+        return
+    var argc: i32 = 0
+    var a: *Expr = e.args
+    while a != null
+        argc += 1
+        a = a.next
+    if argc != row.arity
+        if ic_first(sm, e) == 0
+            return
+        eprint_bytes(name)
+        eprints("() requires ")
+        eprint_i64(row.arity as i64)
+        if row.arity == 1
+            eprints(" argument ")
+        else
+            eprints(" arguments ")
+        eprint_bytes(row.operands)
+        eprint_char('\n')
+        return
+    if row.rule == IC_ANY
+        return
+    a = e.args
+    while a != null
+        if ic_operand_wrong(sm, a, row.rule) == 1
+            ic_refuse(sm, e, name, row.refusal)
+            return
+        if row.rule == IC_AES_FIRST or row.rule == IC_VEC_FIRST
+            return
+        a = a.next

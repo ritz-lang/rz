@@ -408,6 +408,8 @@ class ExprEmitter:
 
         if op in ('+', '-'):
             self._refuse_reference_arithmetic(expr, left, right)
+        if op in ('+', '-', '*', '/', '%'):
+            self._refuse_pointer_operand(expr, left, right)
 
         if op == '+':
             # Handle pointer arithmetic: ptr + int -> GEP

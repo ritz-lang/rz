@@ -85,6 +85,8 @@ SOURCES = \
 	tail_value \
 	trait_bound \
 	wrapping \
+	ptr_arith \
+	intrinsic_check \
 	reachability \
 	emitter_asm \
 	emitter_stmt \

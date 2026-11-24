@@ -169,6 +169,8 @@ an entry here, and every entry names a module that exists (`--check`).
 | `sema_probe` | Test-only: compares Sema's typing with the emitter's (`RITZ1_SEMA_PROBE`). |
 | `struct_cast` | `as` between two different struct types is refused (§7.5, LARB R72, #4000). |
 | `wrapping` | `+%` / `-%` / `*%` are integer operators: a float or pointer operand is refused (LARB R63, §7.1, #3486). |
+| `ptr_arith` | Pointer arithmetic is `*T ± int`, `int + *T` and `*T - *T`: any other arithmetic operand that is a pointer or reference is refused (§7.1, #4657). |
+| `intrinsic_check` | The x86 / SIMD intrinsics' table: each one's arity and operand types, refused in ritz0's words (#4657). |
 
 **Checks**
 
@@ -247,6 +249,12 @@ empty. A note that belongs to a move goes on that check's own entry.
   ownership, emitter_stmt / _core / _expr_call, ref_check's `env.s` side)
   go with their own moves (#3506, #3507).
 
+- `intrinsic_check` — the AES-NI, SHA-NI, `simd_add` / `simd_xor` /
+  `simd_rotl` and `xgetbv` intrinsics as one table (#4657): each one's arity,
+  its operands' names and what they must be (a v4i32, a v2i64, a vector).
+  A call that breaks its row is refused at the call, in ritz0's words; an
+  operand Sema can't type is left to the emitter.
+
 - `let_check` — `let` immutability: no write or `@&` through a `let`'s place.
   Its place rule (`let_place`) reads either view through a `LetEnv`:
   `ref_value` asks it about an `@x` of a `let` in an `@&T` slot
@@ -286,6 +294,11 @@ empty. A note that belongs to a move goes on that check's own entry.
   nothing rescans the finished body for them.
 
 - `pass_value` — `pass` has no value (§2.4, §6.1).
+
+- `ptr_arith` — pointer arithmetic is `*T ± int`, `int + *T` and `*T - *T`
+  (§7.1, #4657); any other `+ - * / %` with a pointer or reference operand
+  is refused at that operand, in ritz0's typing pass's words. An `@T` local
+  under `+` / `-` is the emitter's `refuse_ref_arith`'s (#3037).
 
 - `reachability` — code that can never run is refused. Run by main over the
   whole module before monomorphisation.
