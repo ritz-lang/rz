@@ -71,6 +71,7 @@ import tail_value    # tail_note_callee (AGAST #3511)
 import ref_check     # RefEnv, ref_local_in, rs_field (AGAST #4173)
 import ritzlib.memory
 import ritzlib.str
+import ritzlib.strview
 
 # >0 inside an operand emit_expr_call never lowers (`sizeof(x)`, a
 # non-literal `print(x)`): its calls aren't judged.
@@ -173,18 +174,18 @@ fn cc_private(sm: *Sema, line: i32, col: i32, owner: *ImplBlock, name_sv: StrVie
                 eprint_int(fd.line as i64)
                 eprint_char(':')
                 eprint_int(fd.col as i64)
-                eprints_cstr(c": note: ")
+                eprints(": note: ")
             eprint_char('`')
             if owner != null
                 eprint_bytes(StrView { ptr: (owner.type_name), len: (owner.type_name_len) as i64 })
                 eprint_char('.')
             eprint_bytes(StrView { ptr: (name), len: (len) as i64 })
             if round == 0
-                eprints_cstr(c"` is private to ")
+                eprints("` is private to ")
                 eprints_cstr(cc_basename(fd.def_file))
-                eprints_cstr(c"; mark it `pub` (#3413)\n")
+                eprints("; mark it `pub` (#3413)\n")
             else
-                eprints_cstr(c"` is declared here\n")
+                eprints("` is declared here\n")
     1
 
 # A call to `name` that no declared, imported or `extern` fn answers,
@@ -198,9 +199,9 @@ fn cc_unknown(sm: *Sema, e: *Expr)
         # AGAST #3934: `heap e` calls ritzlib.memory's __heap_new, as
         # ritz0's needs its malloc, and is refused in ritz0's words.
         if is_heap_new(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1
-            eprints_cstr(c"heap requires ritzlib.memory (malloc not found)\n")
+            eprints("heap requires ritzlib.memory (malloc not found)\n")
             return
-        eprints_cstr(c"Unknown function: ")
+        eprints("Unknown function: ")
         eprint_bytes(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
         eprint_char('\n')
 
@@ -219,9 +220,9 @@ fn cc_arity(sm: *Sema, line: i32, col: i32, name_sv: StrView, fd: *FnDef, args: 
     if cc_report(sm, line, col) == 1
         eprint_char('`')
         eprint_bytes(StrView { ptr: (name), len: (len) as i64 })
-        eprints_cstr(c"` called with ")
+        eprints("` called with ")
         eprint_int(n as i64)
-        eprints_cstr(c" argument(s) but defined with ")
+        eprints(" argument(s) but defined with ")
         eprint_int(m as i64)
         eprint_char('\n')
     1
@@ -438,11 +439,11 @@ fn cc_kind_error(sm: *Sema, a: *Expr, fname_sv: StrView, argno: i32, p: *Param) 
     var flen: i32 = fname_sv.len as i32
     if cc_report(sm, a.span.line, a.span.col) == 0
         return 0
-    eprints_cstr(c"argument ")
+    eprints("argument ")
     eprint_int(argno as i64)
-    eprints_cstr(c" of `")
+    eprints(" of `")
     eprint_bytes(StrView { ptr: (fname), len: (flen) as i64 })
-    eprints_cstr(c"` has the wrong type: parameter ")
+    eprints("` has the wrong type: parameter ")
     # A `fn(..)` type names no params (#3348): number the one it missed.
     if p.name_len > 0
         eprint_char('`')
@@ -450,7 +451,7 @@ fn cc_kind_error(sm: *Sema, a: *Expr, fname_sv: StrView, argno: i32, p: *Param) 
         eprint_char('`')
     else
         eprint_int(argno as i64)
-    eprints_cstr(c" is declared `")
+    eprints(" is declared `")
     match p.param_type
         TypeKind.Ptr =>
             eprint_char('*')
@@ -459,59 +460,240 @@ fn cc_kind_error(sm: *Sema, a: *Expr, fname_sv: StrView, argno: i32, p: *Param) 
             eprint_bytes(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
         _ =>
             eprints_cstr(primitive_name_from_type(p.param_type))
-    eprints_cstr(c"` but its argument is ")
+    eprints("` but its argument is ")
     1
 
-# Argument `argno` of `fname`, `a`, for param `p`.
+# Argument `argno` of `fname`, `a`, for param `p`: slot_kind_fit's rule.  An
+# argument is refused here for a struct on either side; a float, `null` or
+# pointer into an integer param (SKF_NUM) is the argument checks' own.
 fn cc_kind(sm: *Sema, fname_sv: StrView, argno: i32, a: *Expr, p: *Param)
     var fname: *u8 = fname_sv.ptr
     var flen: i32 = fname_sv.len as i32
     if a == null or p == null or p.is_borrow == 1
         return
-    let pk: i32 = bk_of_type(p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-    if p.param_type == TypeKind.Struct and pk == BK_OTHER
-        if sema_find_struct(sm, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == null
-            return
-        # A `c"..."` into a StrView / `Span<u8>` is literal_slot's, said at
-        # this argument already (AGAST #3440).
-        if a.kind == ExprKind.CstringLit and (name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 }) == 1)
-            return
-        let what: *u8 = cc_not_a_struct(sm, a, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-        if what != null and cc_kind_error(sm, a, StrView { ptr: (fname), len: (flen) as i64 }, argno, p) == 1
-            eprints_cstr(what)
+    var fit: SlotFit
+    if slot_kind_fit(sm, a, p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, p.param_pointee_type, 0, @fit) != SKF_AGG
+        return
+    if fit.slot_class == SKS_STRUCT
+        if cc_kind_error(sm, a, StrView { ptr: (fname), len: (flen) as i64 }, argno, p) == 1
+            eprints(strview_from_cstr(cc_not_a_struct(sm, a, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })))
             eprint_char('\n')
         return
-    # A `*Q` param given a known struct value of another type (#3340).  One of
-    # Q itself is ref_check's ("a value doesn't fit a reference slot"), as is
-    # anything into an `@Q`, which is TypeKind.Ref and not judged here.
-    if p.param_type == TypeKind.Ptr and p.param_pointee_type == TypeKind.Struct
-        if p.param_type_name == null or p.param_type_name_len <= 0
-            return
-        if sema_find_struct(sm, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == null
-            return
-        # A bare literal is a StrView (#98), lowered as a %Span$u8: into a
-        # `*StrView` / `*Span<u8>` it is a value of Q, ref_check's to refuse.
-        if a.kind == ExprKind.StringLit and (name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1 or name_eq(StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, StrView { ptr: (c"Span$u8"), len: (7) as i64 }) == 1)
-            return
-        var vlen: i32 = 0
-        let val: *u8 = cc_struct_value(sm, a, @vlen)
-        if val == null or name_eq(StrView { ptr: (val), len: (vlen) as i64 }, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == 1
-            return
-        if cc_kind_error(sm, a, StrView { ptr: (fname), len: (flen) as i64 }, argno, p) == 1
-            eprints_cstr(c"a `")
-            eprint_bytes(StrView { ptr: (val), len: (vlen) as i64 })
-            eprints_cstr(c"`\n")
-        return
-    if (pk != BK_INT and pk != BK_FLOAT and pk != BK_BOOL) or p.param_type == TypeKind.Struct
-        return
-    if primitive_name_from_type(p.param_type) == null
-        return
+    if fit.value_class == SKV_STRUCT and cc_kind_error(sm, a, StrView { ptr: (fname), len: (flen) as i64 }, argno, p) == 1
+        eprints("a `")
+        eprint_bytes(StrView { ptr: (fit.name), len: (fit.name_len) as i64 })
+        eprints("`\n")
+
+# --- One rule for a value's kind in its slot (AGAST #4653) ---------------------
+#
+# Every slot asks slot_kind_fit: a call's argument (cc_kind, above), and a
+# `let` / `var`, an assignment, a struct-literal field, a `return` and a fn's
+# tail (slot_kind.ritz, which says it in each site's words).  ritz0 has one
+# rule too (type_queries.py's _types_compatible, let_rules.py).  A slot is a
+# kind, the name a struct (or a pointer's struct pointee) has, and a pointer's
+# pointee kind, read off whatever declared it.
+#
+#   slot              value refused                                 class
+#   struct            an integer, float, `bool`, `null`, C string   SKF_AGG
+#                     or pointer (cc_not_a_struct)
+#   int/float/bool    a struct                                      SKF_AGG
+#   int               a float or `null`; a pointer, but into an     SKF_NUM
+#                     i64 / u64
+#   pointer           a struct, but one of its own pointee          SKF_AGG
+#                     (ref_check's) or a String / StrView into a
+#                     `*u8` (literal_slot's); a float
+#   pointer           an integer narrower than i64 / u64            SKF_NUM
+#
+# A struct of another struct is let_check's (another_struct_source), said
+# in its words at a let, a store, a return and an argument; `other` 1 asks
+# for it here too, for the arms of a fn's `if` / `match` tail, which
+# let_check doesn't reach.  A value Sema can't type fits.
+
+const SKF_FITS: i32 = 0
+const SKF_AGG: i32 = 1    # a struct on one side, or a float / struct into a pointer
+const SKF_NUM: i32 = 2    # scalar into scalar: ritz0's type checker's words
+
+const SKS_NONE: i32 = 0
+const SKS_STRUCT: i32 = 1
+const SKS_INT: i32 = 2
+const SKS_FLOAT: i32 = 3
+const SKS_BOOL: i32 = 4
+const SKS_PTR: i32 = 5
+
+const SKV_NONE: i32 = 0
+const SKV_STRUCT: i32 = 1
+const SKV_INT: i32 = 2
+const SKV_FLOAT: i32 = 3
+const SKV_BOOL: i32 = 4
+const SKV_NULL: i32 = 5
+const SKV_PTR: i32 = 6
+
+# What slot_kind_fit found: the slot's and value's classes, and the value's
+# type as Ritz writes it: `name` is a struct's name, a pointer's pointee
+# (`*` before it) or a scalar's.
+pub struct SlotFit
+    slot_class: i32
+    value_class: i32
+    name: *u8
+    name_len: i32
+    slot_pointee: TypeKind   # a pointer slot's pointee, TypeKind.Struct for a known struct
+    value_pointee: TypeKind  # a pointer value's pointee
+
+fn skf_named(out: *SlotFit, class: i32, name: StrView) -> i32
+    out.value_class = class
+    out.name = name.ptr
+    out.name_len = name.len as i32
+    class
+
+# An integer kind's name, or an empty view for any other kind.
+fn skf_int_name(t: TypeKind) -> StrView
+    let n: *u8 = primitive_name_from_type(t)
+    if ty_int_bits(t) == 0 or n == null
+        return strview_empty()
+    strview_from_cstr(n)
+
+# The class of value `a`, its type's name into `out`.
+fn skf_value(sm: *Sema, a: *Expr, out: *SlotFit) -> i32
+    match a.kind
+        ExprKind.NilLit =>
+            return skf_named(out, SKV_NULL, "null")
+        ExprKind.CstringLit =>
+            return skf_named(out, SKV_PTR, "u8")
+        ExprKind.StringLit | ExprKind.If | ExprKind.Match | ExprKind.ArrayLit | ExprKind.ArrayFill =>
+            return SKV_NONE
+        _ => pass
+    # A `c:& C` param reads as the C it borrows (#2250).
+    let lent: i32 = (cc_lent(sm, a) != null) as i32
+    let bk: i32 = if lent == 1 then BK_OTHER else sema_bool_kind(sm, a)
+    var t: SemaTy
+    let k: TypeKind = sema_expr_ty(sm, a, @t)
+    if bk == BK_FLOAT
+        if k == TypeKind.F32
+            return skf_named(out, SKV_FLOAT, "f32")
+        return skf_named(out, SKV_FLOAT, "f64")
+    if bk == BK_BOOL
+        return skf_named(out, SKV_BOOL, "bool")
+    if bk == BK_INT and cc_sure_int(sm, a) == 1
+        var name: StrView = skf_int_name(k)
+        if name.len == 0 and (a.kind == ExprKind.IntLit or a.kind == ExprKind.CharLit)
+            name = "i64"
+        if name.len == 0
+            return SKV_NONE
+        return skf_named(out, SKV_INT, name)
+    if bk == BK_PTR
+        if k != TypeKind.Ptr
+            return SKV_NONE
+        out.value_pointee = t.pointee
+        if t.pointee == TypeKind.Struct
+            if t.name == null or t.name_len <= 0
+                return SKV_NONE
+            out.value_class = SKV_PTR
+            out.name = t.name
+            out.name_len = t.name_len
+            return SKV_PTR
+        let pn: *u8 = primitive_name_from_type(t.pointee)
+        if pn == null or t.pointee == TypeKind.Void
+            return SKV_NONE
+        return skf_named(out, SKV_PTR, strview_from_cstr(pn))
     var len: i32 = 0
-    let got: *u8 = cc_struct_value(sm, a, @len)
-    if got != null and cc_kind_error(sm, a, StrView { ptr: (fname), len: (flen) as i64 }, argno, p) == 1
-        eprints_cstr(c"a `")
-        eprint_bytes(StrView { ptr: (got), len: (len) as i64 })
-        eprints_cstr(c"`\n")
+    var sname: *u8 = cc_struct_value(sm, a, @len)
+    if sname == null and a.kind == ExprKind.StructLit and a.ident_len > 0 and sema_find_struct(sm, StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 }) != null
+        sname = a.ident_ptr
+        len = a.ident_len
+    if sname == null
+        return SKV_NONE
+    out.value_class = SKV_STRUCT
+    out.name = sname
+    out.name_len = len
+    SKV_STRUCT
+
+fn skf_is_view(name_sv: StrView) -> i32
+    (name_eq(name_sv, "StrView") == 1 or name_eq(name_sv, "Span$u8") == 1) as i32
+
+# The class of a slot of kind `t`; a pointer's pointee into out.slot_pointee.
+fn skf_slot(sm: *Sema, t: TypeKind, name_sv: StrView, pointee: TypeKind, out: *SlotFit) -> i32
+    out.slot_pointee = pointee
+    match t
+        TypeKind.Struct =>
+            if name_sv.ptr == null or name_sv.len <= 0 or sema_find_struct(sm, name_sv) == null
+                return SKS_NONE
+            return SKS_STRUCT
+        TypeKind.Bool =>
+            return SKS_BOOL
+        TypeKind.F32 | TypeKind.F64 =>
+            return SKS_FLOAT
+        TypeKind.Ptr => pass
+        _ =>
+            if ty_int_bits(t) > 0
+                return SKS_INT
+            return SKS_NONE
+    # `-> *T` keeps T's name, not its kind: a known struct is the pointee.
+    if pointee != TypeKind.Struct and primitive_name_from_type(pointee) == null and name_sv.ptr != null and name_sv.len > 0 and sema_find_struct(sm, name_sv) != null
+        out.slot_pointee = TypeKind.Struct
+    if out.slot_pointee == TypeKind.Struct and (name_sv.ptr == null or name_sv.len <= 0 or sema_find_struct(sm, name_sv) == null)
+        return SKS_NONE
+    SKS_PTR
+
+fn skf_wide_int(name: StrView) -> i32
+    (name.eq("i64") or name.eq("u64")) as i32
+
+# Does `a` fit a slot of kind `t` named `name` (a pointer's: its pointee's),
+# pointing at `pointee`?  SKF_FITS, or the misfit's class with what was found
+# in `out`.  `other` 1: a struct of another struct is judged here too.
+pub fn slot_kind_fit(sm: *Sema, a: *Expr, t: TypeKind, name_sv: StrView, pointee: TypeKind, other: i32, out: *SlotFit) -> i32
+    out.slot_class = SKS_NONE
+    out.value_class = SKV_NONE
+    out.name = null
+    out.name_len = 0
+    out.slot_pointee = pointee
+    out.value_pointee = TypeKind.Void
+    if a == null
+        return SKF_FITS
+    let sc: i32 = skf_slot(sm, t, name_sv, pointee, out)
+    out.slot_class = sc
+    if sc == SKS_NONE
+        return SKF_FITS
+    if sc == SKS_STRUCT
+        # A C-string literal into a StrView / `Span<u8>` is literal_slot's (#3440).
+        if a.kind == ExprKind.CstringLit and skf_is_view(name_sv) == 1
+            return SKF_FITS
+        if cc_not_a_struct(sm, a, name_sv) != null
+            skf_value(sm, a, out)
+            return SKF_AGG
+        if other == 0 or a.kind == ExprKind.Cast or skf_value(sm, a, out) != SKV_STRUCT
+            return SKF_FITS
+        let vsv: StrView = StrView { ptr: (out.name), len: (out.name_len) as i64 }
+        if name_eq(vsv, name_sv) == 1
+            return SKF_FITS
+        # A `Span<u8>` converts to a StrView (#168), not back (#3441).
+        if name_eq(vsv, "Span$u8") == 1 and name_eq(name_sv, "StrView") == 1
+            return SKF_FITS
+        return SKF_AGG
+    let vc: i32 = skf_value(sm, a, out)
+    if vc == SKV_STRUCT
+        if sc != SKS_PTR
+            return SKF_AGG
+        let vn: StrView = StrView { ptr: (out.name), len: (out.name_len) as i64 }
+        # One of its own pointee is ref_check's ("a value doesn't fit a
+        # reference slot"); a String / StrView into a `*u8` literal_slot's.
+        if out.slot_pointee == TypeKind.Struct and name_eq(vn, name_sv) == 1
+            return SKF_FITS
+        if out.slot_pointee == TypeKind.U8 and (skf_is_view(vn) == 1 or name_eq(vn, "String") == 1)
+            return SKF_FITS
+        return SKF_AGG
+    if sc == SKS_INT
+        if vc == SKV_FLOAT or vc == SKV_NULL
+            return SKF_NUM
+        # A pointer to the slot's own type is ref_value's ("write `*`").
+        if vc == SKV_PTR and out.value_pointee != t and ty_int_bits(t) != 64
+            return SKF_NUM
+        return SKF_FITS
+    if sc == SKS_PTR
+        if vc == SKV_FLOAT
+            return SKF_AGG
+        if vc == SKV_INT and skf_wide_int(StrView { ptr: (out.name), len: (out.name_len) as i64 }) == 0
+            return SKF_NUM
+    SKF_FITS
 
 # Each argument of `fname(args)` against `params`, numbered from `argno`.
 fn cc_kinds(sm: *Sema, fname_sv: StrView, argno: i32, params: *Param, args: *Expr)
@@ -586,7 +768,7 @@ fn cc_boxed(sm: *Sema, e: *Expr, argno: i32, a: *Expr, p: *Param, span_ok: i32)
     if sema_bool_kind(sm, a) != BK_INT and sema_is_int_kind(sema_expr_type(sm, a)) == 0
         return
     if cc_kind_error(sm, a, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, argno, p) == 1
-        eprints_cstr(c"an integer\n")
+        eprints("an integer\n")
 
 # Method call `e` (`r.m(..)`, `T.m(..)`, or a UFCS helper's `v.push(..)`),
 # against `fd`.  As ritz0 counts it (#3319), the call is its desugaring
@@ -606,9 +788,9 @@ fn cc_method(sm: *Sema, e: *Expr, fd: *FnDef, recv: i32)
         if cc_report(sm, e.span.line, e.span.col) == 1
             eprint_char('`')
             eprint_bytes(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-            eprints_cstr(c"` called with ")
+            eprints("` called with ")
             eprint_int(given as i64)
-            eprints_cstr(c" argument(s) but defined with ")
+            eprints(" argument(s) but defined with ")
             eprint_int(want as i64)
             eprint_char('\n')
         return
@@ -637,7 +819,7 @@ fn cc_print_arg(sm: *Sema, e: *Expr)
     if cc_report(sm, line, col) == 0
         return
     eprint_bytes(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
-    eprints_cstr(c"() requires a single string literal argument\n")
+    eprints("() requires a single string literal argument\n")
 
 # 1 for a name emit_expr_call lowers inline before it looks for a fn: the
 # print / format / alloca / sizeof builtins, the SIMD and x86 intrinsics,
@@ -1021,7 +1203,7 @@ pub fn call_check_ident(sm: *Sema, e: *Expr)
                 eprints("` is generic, so it can't be used as a value: call it\n")
         return
     if cc_report(sm, e.span.line, e.span.col) == 1
-        eprints_cstr(c"Unknown identifier: ")
+        eprints("Unknown identifier: ")
         eprint_bytes(name)
         eprint_char('\n')
 
@@ -1262,11 +1444,11 @@ fn ca_report(sm: *Sema, call: *Expr, at: *Expr, fname_sv: StrView, argno: i32) -
     g_ca_argno = argno
     sm.error_count = sm.error_count + 1
     diag_error_at(sema_file(sm), at.span)
-    eprints_cstr(c"argument ")
+    eprints("argument ")
     eprint_int(argno as i64)
-    eprints_cstr(c" of `")
+    eprints(" of `")
     eprint_bytes(StrView { ptr: (fname), len: (flen) as i64 })
-    eprints_cstr(c"` has the wrong type: ")
+    eprints("` has the wrong type: ")
     1
 
 fn ca_error(sm: *Sema, call: *Expr, at: *Expr, fname_sv: StrView, argno: i32, why: *u8)
@@ -1365,9 +1547,9 @@ fn ca_struct_ptr(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Ex
         return
     if ca_report(sm, call, call, StrView { ptr: (fname), len: (flen) as i64 }, argno) == 1
         eprint_bytes(StrView { ptr: (want), len: (want_len) as i64 })
-        eprints_cstr(c"* != ")
+        eprints("* != ")
         eprint_bytes(StrView { ptr: (got), len: (got_len) as i64 })
-        eprints_cstr(c"*\n")
+        eprints("*\n")
 
 # --- Arrays ---
 

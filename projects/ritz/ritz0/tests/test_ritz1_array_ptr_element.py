@@ -657,10 +657,8 @@ _runs("pointer_index_reads_the_struct", {n: _T_MAIN + b for n, b in POINTER_INDE
 # `let n: i64 = *(p + 0)` (test_struct_deref_value.py).
 # AGAST #3053: so is `a[1][1]` with `a: [2]*S`.  ritz1 put the `%S` load in the
 # i64 slot: a clang error, unlocated.
-NOT_AN_INTEGER = {
-    "ritz0": ("`n` is declared `i64` but its initialiser has type", 5),
-    "ritz1": ("a whole struct is not a value here in ritz1", 18),
-}
+# AGAST #4653: ritz1 judges a `let` on Sema now, in ritz0's words at the `let`.
+NOT_AN_INTEGER = ("`n` is declared `i64` but its initialiser has type", 5)
 STRUCT_READS_AS_I64 = {
     "pointer_index": (_T_MAIN, "p[0]"),
     "element_index": (_COPY_MAIN, "a[1][1]"),
@@ -669,10 +667,9 @@ STRUCT_READS_AS_I64 = {
 
 for _form in sorted(STRUCT_READS_AS_I64):
     _main, _init = STRUCT_READS_AS_I64[_form]
-    for _who, (_message, _col) in NOT_AN_INTEGER.items():
-        _refused_at(_id("struct_read_through_a_pointer_is_not_an_integer", _form),
-                    _main + f"    let n: i64 = {_init}\n    return 0\n", _message,
-                    (_main.count("\n") + 1, _col), ["ritz0"] if _who == "ritz0" else RITZ1S)
+    _refused_at(_id("struct_read_through_a_pointer_is_not_an_integer", _form),
+                _main + f"    let n: i64 = {_init}\n    return 0\n", NOT_AN_INTEGER[0],
+                (_main.count("\n") + 1, NOT_AN_INTEGER[1]))
 
 
 # AGAST #3188: nor is it any narrower integer.  ritz1 refused only the i64 lets;
@@ -686,16 +683,15 @@ NARROW_LETS = {
 _COPY_LINE = _COPY_MAIN.count("\n") + 1
 
 
-def _not_an_integer(test, program, col):
-    """Refused on `_COPY_LINE` with no traceback or "expected 'i64'" (_compile_clean);
-    the ritz1s at `col`, in their own words."""
-    ROWS.append(Row(test, ("ritz0",), Refused(program, f"main.ritz:{_COPY_LINE}:")))
-    _refused_at(test, program, "a whole struct is not a value here in ritz1", (_COPY_LINE, col), RITZ1S)
+def _not_an_integer(test, program):
+    """Refused at the `let` on `_COPY_LINE` with no traceback or "expected 'i64'"
+    (_compile_clean), in ritz0's words on every compiler (AGAST #4653)."""
+    _refused_at(test, program, "`n` is declared `", (_COPY_LINE, 5))
 
 
 for _name in sorted(NARROW_LETS):
     _not_an_integer(_id("struct_pointee_is_not_a_narrow_integer", _name),
-                    _COPY_MAIN + NARROW_LETS[_name] + "    return 0\n", NARROW_LETS[_name].index("= ") + 3)
+                    _COPY_MAIN + NARROW_LETS[_name] + "    return 0\n")
 
 
 # ... nor a number in any other slot: `p[i]` and `a[i][j]` are refused at the
@@ -705,11 +701,20 @@ INDEX_SLOTS = {"returned": ("    return {}\n", 12), "added": ("    return {} + 1
                "cast": ("    return {} as i32\n", 12)}
 
 
+def _not_a_number(test, program, col, words):
+    """Refused on `_COPY_LINE` (_compile_clean); the ritz1s at `col`, in `words`."""
+    ROWS.append(Row(test, ("ritz0",), Refused(program, f"main.ritz:{_COPY_LINE}:")))
+    _refused_at(test, program, words, (_COPY_LINE, col), RITZ1S)
+
+
 for _slot in sorted(INDEX_SLOTS):
     for _form in ["p[0]", "a[1][1]"]:
         _body, _col = INDEX_SLOTS[_slot]
-        _not_an_integer(_id("struct_pointee_index_is_not_a_number", _slot, _form),
-                        _COPY_MAIN + _body.format(_form), _col)
+        # AGAST #4653: a `return` is judged on Sema, in ritz0's words.
+        _words = ("the fn returns `i32`, but this is struct `S`" if _slot == "returned"
+                  else "a whole struct is not a value here in ritz1")
+        _not_a_number(_id("struct_pointee_index_is_not_a_number", _slot, _form),
+                      _COPY_MAIN + _body.format(_form), _col, _words)
 
 
 def _compile_clean(compiler, src, work):

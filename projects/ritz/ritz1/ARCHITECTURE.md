@@ -316,6 +316,14 @@ empty. A note that belongs to a move goes on that check's own entry.
 - `sema_index_store` — an index store ritz1 can't lower is refused, not
   miscompiled.
 
+- `slot_kind` — a value whose kind doesn't fit its slot is refused at a
+  `let` / `var`, an assignment, a struct literal field, a `return` and a fn's
+  tail (#4653): a struct into a scalar or pointer, a scalar, `null` or
+  pointer into a struct, a float or `null` into an integer, an int narrower
+  than i64 / u64 to or from a pointer. The rule is call_check's
+  `slot_kind_fit`, which a call's argument asks too; this module says it in
+  ritz0's words for each slot.
+
 - `slot_narrowing` — the same rule at an assignment, a call argument, a
   `return`, a fn's tail value (§7.5, #4081) and a struct literal field
   (#4218), on Sema, at the slots literal_slot visits; a tail is judged where

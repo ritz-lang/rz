@@ -46,6 +46,8 @@ MESSAGES = {
     "plain": "cannot cast struct `S` to `i64`: a struct is not an integer",
     "returned": "the fn returns `i64`, but this is struct `S`: a struct is not an integer",
     "compared": "'==' is not supported for struct type",
+    # AGAST #4653: a `let` is judged on Sema now, in ritz0's words.
+    "let_integer": "`n` is declared `i64` but its initialiser has type `",
 }
 LOCATED = re.compile(r"main\.ritz:\d+:\d+:")
 
@@ -159,8 +161,10 @@ def test_a_whole_struct_deref_copies(run_with, name, compiler):
 # AGAST #3198: a struct local, param or call result is no integer either.  With
 # `let n: i32 = l` (or `= mk()`, `= l.dup()`) ritz1 loaded the `%S` into the i32
 # and clang refused the IR, unlocated; `let n: i64 = l` was worse, a silent copy
-# of the struct into `n`.  ritz0 refuses each at the `let`, ritz1 at the init,
-# for every integer width (#3188 did `*q`, `p[i]` and `a[i][j]`).
+# of the struct into `n`.  Each compiler refuses each at the `let`, for every
+# integer width (#3188 did `*q`, `p[i]` and `a[i][j]`), in ritz0's words since
+# AGAST #4653 (slot_kind.ritz; ritz1 said "a whole struct is not a value here"
+# at the init).
 _VALUE_LET = (_S + "impl S\n    fn dup(self: @S) -> S\n        return *self\n\n"
               "fn mk() -> S\n    var s: S\n    s.y = 6\n    return s\n\n"
               "pub fn main() -> i32\n    var l: S\n    l.y = 6\n")
@@ -179,12 +183,8 @@ def test_a_struct_value_is_not_an_integer_let(compile_with, width, form, compile
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} took `let n: {width} = {STRUCT_VALUE_FORMS[form]}`"
     assert "Traceback" not in out and "expected 'i" not in out, out[-1500:]
-    if compiler == "ritz0":
-        assert f"main.ritz:{_VALUE_LET_LINE}:5:" in out, out[-1500:]
-    else:
-        assert "a whole struct is not a value here in ritz1" in out, out[-1500:]
-        col = len(f"    let n: {width} = ") + 1
-        assert f"main.ritz:{_VALUE_LET_LINE}:{col}:" in out, out[-1500:]
+    assert f"main.ritz:{_VALUE_LET_LINE}:5:" in out, out[-1500:]
+    assert f"`n` is declared `{width}` but its initialiser has type `" in out, out[-1500:]
 
 
 # ... and the copies stay legal: into a struct slot, annotated or not.

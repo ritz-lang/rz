@@ -1,0 +1,317 @@
+# ritz1/src/slot_kind.ritz - a value whose kind doesn't fit its slot (AGAST #4653)
+#
+# call_check's slot_kind_fit is the one rule; a call's argument has asked it
+# since #1629 (cc_kind).  A `let` / `var`, an assignment, a struct-literal
+# field, a `return` and a fn's tail ask it here, from sema_walk, and say the
+# refusal in ritz0's words for that slot, at ritz0's place:
+#
+#     let p: P = five()     `p` is declared `P` but its initialiser has type `i64`
+#     let x: u32 = d        cannot initialize u32 with f64
+#     n = null              cannot assign null to i32
+#     p = v                 cannot assign to `p`: cannot store Other to *u8: mismatching types
+#     S { v: T { id: 1 } }  field `v` of `S` is `u8`, not `T`
+#     return fl()           return type f64 doesn't match expected u32
+#     T { id: 1 }           the fn returns `i32`, but this is struct `T`: ...
+#     five()                block expression has type i64, expected P
+#
+# ritz0 spells some of these with LLVM's types (`%"struct.ritz_module_1.P"`,
+# `i8**`); ritz1 names the Ritz type in the same sentence.  ritz0 says the
+# first kind of each pair (an aggregate on one side, SKF_AGG) in the
+# emitter's words and the second (scalar into scalar, SKF_NUM) in its type
+# checker's, so a store and a field say which.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.strview
+
+import ast
+import types
+import ast_helpers
+import ast_query     # name_eq, eprint_bytes
+import sema
+import sema_type
+import bool_check    # bool_sema_report_pos, sbk_member_field
+import call_check    # slot_kind_fit, SlotFit
+import field_slot    # eprint_source_type
+import literal_slot  # literal_ret_pointee
+
+fn sk_report(sm: *Sema, line: i32, col: i32) -> i32
+    bool_sema_report_pos(sm, line, col)
+
+fn sk_eprint_kind(t: TypeKind)
+    let n: *u8 = primitive_name_from_type(t)
+    if n == null
+        eprint_char('?')
+    else
+        eprints(strview_from_cstr(n))
+
+# The slot's type, as its declaration wrote it.
+fn sk_eprint_slot(t: TypeKind, name_sv: StrView, f: *SlotFit)
+    if f.slot_class == SKS_STRUCT
+        eprint_source_type(name_sv)
+    else if f.slot_class == SKS_PTR
+        eprint_char('*')
+        if f.slot_pointee == TypeKind.Struct
+            eprint_source_type(name_sv)
+        else
+            sk_eprint_kind(f.slot_pointee)
+    else
+        sk_eprint_kind(t)
+
+# The value's type: a struct's name, a pointer's `*T`, a scalar's or `null`.
+fn sk_eprint_value(f: *SlotFit)
+    if f.value_class == SKV_PTR
+        eprint_char('*')
+    if f.name == null
+        eprint_char('?')
+    else
+        eprint_source_type(StrView { ptr: (f.name), len: (f.name_len) as i64 })
+
+# A struct into an integer return slot: the emitter's words, at the value
+# (emitter_expr_access's struct_return_as_int_refused).  1 if it was one.
+fn sk_struct_as_int(sm: *Sema, v: *Expr, t: TypeKind, f: *SlotFit) -> i32
+    if f.value_class != SKV_STRUCT or ty_int_bits(t) == 0
+        return 0
+    if sk_report(sm, v.span.line, v.span.col) == 1
+        eprints("the fn returns `")
+        sk_eprint_kind(t)
+        eprints("`, but this is struct `")
+        eprint_bytes(StrView { ptr: (f.name), len: (f.name_len) as i64 })
+        eprints("`: a struct is not an integer (return one of its fields)\n")
+    1
+
+# --- let / var ------------------------------------------------------------------
+
+# A `let` / `var` with a declared type: its initialiser lands in it.
+pub fn slot_kind_decl(sm: *Sema, st: *Stmt)
+    if st.var_init == null or st.var_declared_type == TypeKind.Void
+        return
+    let tname: StrView = StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 }
+    var f: SlotFit
+    let k: i32 = slot_kind_fit(sm, st.var_init, st.var_declared_type, tname, st.var_pointee_type, 0, @f)
+    if k == SKF_FITS or sk_report(sm, st.span.line, st.span.col) == 0
+        return
+    if k == SKF_AGG and f.slot_class != SKS_PTR and f.value_class != SKV_NULL and f.value_class != SKV_PTR
+        eprint_char('`')
+        eprint_bytes(StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 })
+        eprints("` is declared `")
+        sk_eprint_slot(st.var_declared_type, tname, @f)
+        eprints("` but its initialiser has type `")
+        sk_eprint_value(@f)
+        eprints("`\n")
+        return
+    eprints("cannot initialize ")
+    sk_eprint_slot(st.var_declared_type, tname, @f)
+    eprints(" with ")
+    sk_eprint_value(@f)
+    eprint_char('\n')
+
+# --- Assignment -----------------------------------------------------------------
+
+# `st` stores its value into `what` `name` (a local, or `field ` one), of
+# kind `t` named `tname`, at `pointee`.
+fn sk_store(sm: *Sema, st: *Stmt, what: StrView, name_sv: StrView, t: TypeKind, tname: StrView, pointee: TypeKind)
+    var f: SlotFit
+    let k: i32 = slot_kind_fit(sm, st.assign_value, t, tname, pointee, 0, @f)
+    if k == SKF_FITS or sk_report(sm, st.span.line, st.span.col) == 0
+        return
+    if k == SKF_NUM
+        eprints("cannot assign ")
+        sk_eprint_value(@f)
+        eprints(" to ")
+        sk_eprint_slot(t, tname, @f)
+        eprint_char('\n')
+        return
+    eprints("cannot assign to ")
+    eprints(what)
+    eprint_char('`')
+    eprint_bytes(name_sv)
+    eprints("`: cannot store ")
+    sk_eprint_value(@f)
+    eprints(" to ")
+    sk_eprint_slot(t, tname, @f)
+    eprints(": mismatching types\n")
+
+fn sk_store_field(sm: *Sema, st: *Stmt, fd: *StructField)
+    if fd == null or fd.field_type == TypeKind.Array
+        return
+    sk_store(sm, st, "field ", StrView { ptr: (fd.name), len: (fd.name_len) as i64 }, fd.field_type, StrView { ptr: (fd.field_type_name), len: (fd.field_type_name_len) as i64 }, fd.ptr_pointee)
+
+# `x = v`, `x.f = v` and `a.b.f = v`.  An element or `*p` store is
+# sema_index_store's and literal_slot's.
+pub fn slot_kind_assign(sm: *Sema, st: *Stmt)
+    match st.kind
+        StmtKind.Assign =>
+            if st.assign_target_len == 0
+                let target: *Expr = st.if_cond as *Expr
+                if target != null and target.kind == ExprKind.Member
+                    sk_store_field(sm, st, sbk_member_field(sm, target))
+                return
+            let v: *SemaVar = sema_find_local(sm, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 })
+            if v == null
+                return
+            var t: TypeKind = v.kind
+            if v.narrow != TypeKind.Void
+                t = v.narrow
+            sk_store(sm, st, "", StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 }, t, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, v.pointee)
+        StmtKind.LocalFieldAssign =>
+            let base: *SemaVar = sema_find_local(sm, StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 })
+            if base == null
+                return
+            let sd: *StructDef = sema_find_struct(sm, StrView { ptr: (base.type_name), len: (base.type_name_len) as i64 })
+            if sd == null
+                return
+            let idx: i32 = find_field_index(sd, StrView { ptr: (st.assign_target), len: (st.assign_target_len) as i64 })
+            if idx >= 0
+                sk_store_field(sm, st, get_field_type(sd, idx))
+        _ => pass
+
+# --- A struct literal's fields --------------------------------------------------
+
+# `S { f: v, .. }`: each value lands in its field, refused at the value.
+pub fn slot_kind_struct_lit(sm: *Sema, e: *Expr)
+    let sd: *StructDef = sema_find_struct(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    if sd == null
+        return
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null
+        let idx: i32 = find_field_index(sd, StrView { ptr: (fi.name), len: (fi.name_len) as i64 })
+        if idx >= 0 and fi.value != null
+            sk_field(sm, sd, get_field_type(sd, idx), fi.value)
+        fi = fi.next
+
+fn sk_field(sm: *Sema, sd: *StructDef, fd: *StructField, v: *Expr)
+    if fd.field_type == TypeKind.Array
+        return
+    let tname: StrView = StrView { ptr: (fd.field_type_name), len: (fd.field_type_name_len) as i64 }
+    var f: SlotFit
+    let k: i32 = slot_kind_fit(sm, v, fd.field_type, tname, fd.ptr_pointee, 0, @f)
+    if k == SKF_FITS or sk_report(sm, v.span.line, v.span.col) == 0
+        return
+    if k == SKF_NUM
+        eprints("field '")
+        eprint_bytes(StrView { ptr: (fd.name), len: (fd.name_len) as i64 })
+        eprints("': expected ")
+        sk_eprint_slot(fd.field_type, tname, @f)
+        eprints(", got ")
+        sk_eprint_value(@f)
+        eprint_char('\n')
+        return
+    eprints("field `")
+    eprint_bytes(StrView { ptr: (fd.name), len: (fd.name_len) as i64 })
+    eprints("` of `")
+    eprint_bytes(StrView { ptr: (sd.name), len: (sd.name_len) as i64 })
+    eprints("` is `")
+    sk_eprint_slot(fd.field_type, tname, @f)
+    eprints("`, not `")
+    sk_eprint_value(@f)
+    eprints("`\n")
+
+# --- return and a fn's tail -----------------------------------------------------
+
+# `return v` in the fn being walked: at the `return`, as ritz0's checker.
+pub fn slot_kind_return(sm: *Sema, st: *Stmt)
+    let fd: *FnDef = sm.cur_fn
+    let v: *Expr = st.return_value
+    if fd == null or v == null
+        return
+    let tname: StrView = StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }
+    var f: SlotFit
+    let k: i32 = slot_kind_fit(sm, v, fd.return_type, tname, literal_ret_pointee(tname), 0, @f)
+    if k == SKF_FITS or sk_struct_as_int(sm, v, fd.return_type, @f) == 1
+        return
+    if sk_report(sm, st.span.line, st.span.col) == 1
+        eprints("return type ")
+        sk_eprint_value(@f)
+        eprints(" doesn't match expected ")
+        sk_eprint_slot(fd.return_type, tname, @f)
+        eprint_char('\n')
+
+# Value `v` is the fn's (an arm's, `other` 1) and lands in its return slot;
+# refused at (line, col).  An arm's scalar into a scalar is the arms' own
+# (if_arm_value's mixed arms, float_slot).
+fn sk_tail_value(sm: *Sema, fd: *FnDef, v: *Expr, other: i32, line: i32, col: i32)
+    if v == null
+        return
+    let tname: StrView = StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }
+    var f: SlotFit
+    let k: i32 = slot_kind_fit(sm, v, fd.return_type, tname, literal_ret_pointee(tname), other, @f)
+    if k == SKF_FITS or (other == 1 and k == SKF_NUM) or sk_struct_as_int(sm, v, fd.return_type, @f) == 1
+        return
+    if sk_report(sm, line, col) == 1
+        eprints("block expression has type ")
+        sk_eprint_value(@f)
+        eprints(", expected ")
+        sk_eprint_slot(fd.return_type, tname, @f)
+        eprint_char('\n')
+
+# The local a place reads from: `x` of `x.f`, `x[i]`, `x.m()` and `*x`.
+fn sk_root(e: *Expr) -> *Expr
+    var x: *Expr = e
+    while x != null
+        match x.kind
+            ExprKind.Member | ExprKind.Index | ExprKind.Method =>
+                x = x.left
+            ExprKind.Unary =>
+                x = x.operand
+            _ =>
+                return x
+    null
+
+# 1 if `v` reads a `let` of `stmts`: the walk reaches a block's tail before
+# the block's scope is bound, so Sema would read an outer namesake.
+fn sk_block_local(stmts: *Stmt, v: *Expr) -> i32
+    let e: *Expr = sk_root(v)
+    if e == null or e.kind != ExprKind.Ident
+        return 0
+    var st: *Stmt = stmts
+    while st != null
+        if st.kind == StmtKind.VarDecl and name_eq(StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+            return 1
+        st = st.next
+    0
+
+# The last statement of a branch of the fn's trailing `if` / `match`.
+fn sk_tail_block(sm: *Sema, fd: *FnDef, stmts: *Stmt, line: i32, col: i32)
+    var last: *Stmt = stmts
+    if last == null
+        return
+    while last.next != null
+        last = last.next
+    match last.kind
+        StmtKind.Expr =>
+            if sk_block_local(stmts, last.expr) == 0
+                sk_tail_value(sm, fd, last.expr, 1, line, col)
+        StmtKind.If | StmtKind.Match =>
+            sk_tail_stmt(sm, fd, last, line, col)
+        _ => pass
+
+fn sk_tail_stmt(sm: *Sema, fd: *FnDef, st: *Stmt, line: i32, col: i32)
+    if st.kind == StmtKind.If
+        sk_tail_block(sm, fd, st.if_then, line, col)
+        sk_tail_block(sm, fd, st.if_else, line, col)
+        return
+    # A match arm's value may read its pattern's binding, not bound yet: an
+    # arm reading a local (or nesting an `if` / `match`) is left to the emitter.
+    var arm: *MatchArm = st.if_then as *MatchArm
+    while arm != null
+        let root: *Expr = sk_root(arm.body)
+        if arm.is_pass == 0 and arm.body != null and (root == null or root.kind != ExprKind.Ident) and arm.body.kind != ExprKind.If and arm.body.kind != ExprKind.Match
+            sk_tail_value(sm, fd, arm.body, 1, line, col)
+        arm = arm.next
+
+# `st`, the last statement of the fn being walked, is its value.  A plain
+# expression is refused at itself; a trailing `if` / `match` at the statement,
+# each branch's value judged, a struct of another struct too (let_check's
+# return_check_another_struct takes only a plain one).
+pub fn slot_kind_tail(sm: *Sema, st: *Stmt)
+    let fd: *FnDef = sm.cur_fn
+    if fd == null or fd.return_type == TypeKind.Void
+        return
+    match st.kind
+        StmtKind.Expr =>
+            sk_tail_value(sm, fd, st.expr, 0, st.expr.span.line, st.expr.span.col)
+        StmtKind.If | StmtKind.Match =>
+            sk_tail_stmt(sm, fd, st, st.span.line, st.span.col)
+        _ => pass

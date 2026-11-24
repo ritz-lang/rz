@@ -626,6 +626,18 @@ for _db, (_ddecl, _dsetup, _dname) in _DIRECT_BASES.items():
                                              + "pub fn main() -> i32\n    return f() as i32\n")
 
 
+# AGAST #4653: a `let`, a store and a `return` of the element are judged on Sema
+# (slot_kind.ritz), in ritz0's words; every other use is still the emitter's.
+def _whole_struct_words(name):
+    if name.startswith("let_integer"):
+        return "`n` is declared `i64` but its initialiser has type `S`"
+    if name.startswith("assigned"):
+        return "cannot assign to `n`: cannot store S to i64"
+    if name.startswith("returned") and name != "returned_deref_pointer":
+        return "the fn returns `i64`, but this is struct `S`: a struct is not an integer"
+    return "a whole struct is not a value here in ritz1"
+
+
 # AGAST #2999: ritz0 typed `a[1] as i32`, and `return a[1]` from an `-> i64` fn, as
 # the struct itself, and clang refused the IR ("value doesn't match function result
 # type").  ritz0 refuses any struct value as an integer, located; ritz1's rows above.
@@ -1066,7 +1078,7 @@ TABLE = [
       for op in SHARED_POINTER_ELEMENT_OPS),
     *(Row(f"a_whole_struct_element_copies[{name}]", ALL, Run(STRUCT_COPIES[name], 5)) for name in sorted(STRUCT_COPIES)),
     *(Row(f"ritz1_refuses_a_whole_struct_element[{name}]", RITZ1S,
-          Refused(WHOLE_STRUCT_ELEMENT[name], "a whole struct is not a value here in ritz1"))
+          Refused(WHOLE_STRUCT_ELEMENT[name], _whole_struct_words(name)))
       for name in sorted(WHOLE_STRUCT_ELEMENT)),
     # AGAST #2999: ritz0 typed `a[1] as i32`, and `return a[1]` from an `-> i64` fn,
     # as the struct itself; it refuses any struct value as an integer.

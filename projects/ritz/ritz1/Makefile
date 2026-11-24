@@ -76,6 +76,7 @@ SOURCES = \
 	bool_kind \
 	call_check \
 	literal_slot \
+	slot_kind \
 	float_slot \
 	fn_slot \
 	slot_narrowing \
