@@ -18,7 +18,8 @@ after `-> @&T`) is not judged by that name.
 import re
 
 import pytest
-from test_ref_into_value import COMPILERS, _assert_refused, _compile, _run
+from test_ref_into_value import COMPILERS, _compile, _run
+from test_table_rows import assert_refusals
 
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
 
@@ -85,14 +86,13 @@ REFUSED = {
     "vec_without_import": "fn f(a: @^Vec<u8>) -> i64\n    0\n",
 }
 
-ROWS = [(c, site) for c in COMPILERS for site in sorted(REFUSED)]
-
-
-@pytest.mark.parametrize("compiler,site", ROWS)
-def test_an_unknown_type_name_is_refused(tmp_path, compiler, site):
-    marked = REFUSED[site]
-    name = re.search(r"\^(\w+)", marked).group(1)
-    _assert_refused(compiler, tmp_path, site, marked + MAIN, f"unknown type `{name}`")
+# One case per compiler, a table of sites (AGAST #4654: 123 cases were the
+# suite's growth; `assert_refusals` batches the sites and names each failure).
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_unknown_type_name_is_refused(tmp_path, compiler):
+    rows = {site: (marked + MAIN, f"unknown type `{re.search(r'\^(\w+)', marked).group(1)}`")
+            for site, marked in REFUSED.items()}
+    assert_refusals(compiler, tmp_path, rows)
 
 
 # One message, naming the type, and no IR: the ticket's clang failure was the

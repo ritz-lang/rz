@@ -373,23 +373,32 @@ fn g(x: i32) -> i32
 }
 
 
+# ritz0 alone: no row reaches the user as a traceback, and each corrected
+# program still compiles.  One case each, a loop over ROWS (AGAST #4654: the
+# message and its place are test_every_compiler_says_it_there's, batched).
 @pytest.mark.integration
-@pytest.mark.parametrize("row", sorted(ROWS))
-def test_user_error_is_located_not_a_traceback(tmp_path, row):
-    marked, message, _ = ROWS[row]
-    src, where = _located(marked)
-    comp = _compile(tmp_path, src)
-    assert comp.returncode != 0, f"accepted {row}:\n{src}"
-    assert "Traceback (most recent call last)" not in comp.stderr, comp.stderr[-3000:]
-    assert f"main.ritz:{where}: {message}" in comp.stderr, comp.stderr[-3000:]
+def test_user_error_is_located_not_a_traceback(tmp_path):
+    bad = []
+    for row, (marked, message, _) in sorted(ROWS.items()):
+        src, where = _located(marked)
+        comp = _compile(tmp_path, src)
+        if comp.returncode == 0:
+            bad.append(f"accepted {row}:\n{src}")
+        elif "Traceback (most recent call last)" in comp.stderr:
+            bad.append(f"{row}: traceback:\n{comp.stderr[-3000:]}")
+        elif f"main.ritz:{where}: {message}" not in comp.stderr:
+            bad.append(f"{row}: want main.ritz:{where}: {message}, got:\n{comp.stderr[-3000:]}")
+    assert not bad, "\n".join(bad)
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("row", sorted(ROWS))
-def test_corrected_program_still_compiles(tmp_path, row):
-    good = ROWS[row][2]
-    comp = _compile(tmp_path, good)
-    assert comp.returncode == 0, f"{row}:\n{good}\n{comp.stderr[-3000:]}"
+def test_corrected_program_still_compiles(tmp_path):
+    bad = []
+    for row, (_, _, good) in sorted(ROWS.items()):
+        comp = _compile(tmp_path, good)
+        if comp.returncode != 0:
+            bad.append(f"{row}:\n{good}\n{comp.stderr[-3000:]}")
+    assert not bad, "\n".join(bad)
 
 
 # AGAST #4654 / #4665: every compiler refuses each row with ritz0's words,
