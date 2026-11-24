@@ -1,0 +1,148 @@
+# ritzlib.uring: the typed prep/submit API (AGAST #4637, was #4647).
+#
+#   prep_read / prep_write(fd, buf: Span<u8>, offset, user_data)
+#   prep_recv / prep_send / prep_send_zc / prep_send_zc_report(fd, buf: Span<u8>, flags, user_data)
+#   prep_accept(fd, flags, user_data)                  no peer address
+#   prep_accept_from(fd, peer: @&SockAddrStorage, flags, user_data)
+#   prep_accept_multishot(fd, flags, user_data)
+#   prep_connect(fd, addr: @SockAddrStorage, user_data)
+#   prep_readv / prep_writev(fd, iov: Span<Iovec>, offset, user_data)
+#   prep_timeout(ts: @KernelTimespec, count, flags, user_data)
+#   IoUring.submit() / submit_and_wait(n) -> Result<i32, Errno>
+#
+# The SQE rows build an SQE in local memory and read its fields back; no
+# ring is needed. Each buffer must outlive its completion: these never submit.
+
+import ritzlib.sys
+import ritzlib.uring
+import ritzlib.iovec
+import ritzlib.net
+import ritzlib.span
+import ritzlib.result
+import ritzlib.errno
+
+fn blank() -> IoUringSqe
+    var sqe: IoUringSqe
+    sqe.opcode = 0
+    sqe.fd = 0
+    sqe.addr = 0
+    sqe.len = 0
+    sqe.off = 0
+    sqe.user_data = 0
+    sqe
+
+fn count_of(r: Result<i32, Errno>) -> i32
+    match r
+        Ok(n) => n
+        Err(e) => -1000 - e.code()
+
+[[test]]
+fn test_prep_read_takes_a_span() -> i32
+    var buf: [64]u8
+    var sqe: IoUringSqe = blank()
+    sqe.prep_read(5, Span<u8> { ptr: @buf[0], len: 48 }, 16, 77)
+    assert sqe.opcode == IORING_OP_READ
+    assert sqe.fd == 5
+    assert sqe.addr == @buf[0] as i64
+    assert sqe.len == 48
+    assert sqe.off == 16
+    assert sqe.user_data == 77
+    0
+
+[[test]]
+fn test_prep_write_takes_a_span() -> i32
+    let msg: StrView = "hello"
+    var sqe: IoUringSqe = blank()
+    sqe.prep_write(1, Span<u8> { ptr: msg.ptr, len: msg.len }, 0, 3)
+    assert sqe.opcode == IORING_OP_WRITE
+    assert sqe.addr == msg.ptr as i64
+    assert sqe.len == 5
+    0
+
+[[test]]
+fn test_prep_recv_send_take_spans() -> i32
+    var buf: [32]u8
+    var sqe: IoUringSqe = blank()
+    sqe.prep_recv(7, Span<u8> { ptr: @buf[0], len: 32 }, 0, 1)
+    assert sqe.opcode == IORING_OP_RECV
+    assert sqe.addr == @buf[0] as i64
+    assert sqe.len == 32
+    sqe.prep_send(7, Span<u8> { ptr: @buf[0], len: 9 }, 0, 2)
+    assert sqe.opcode == IORING_OP_SEND
+    assert sqe.len == 9
+    sqe.prep_send_zc(7, Span<u8> { ptr: @buf[0], len: 10 }, 0, 3)
+    assert sqe.opcode == IORING_OP_SEND_ZC
+    assert sqe.len == 10
+    sqe.prep_send_zc_report(7, Span<u8> { ptr: @buf[0], len: 11 }, 0, 4)
+    assert sqe.ioprio == IORING_SEND_ZC_REPORT_USAGE
+    assert sqe.len == 11
+    0
+
+[[test]]
+fn test_prep_accept_without_and_with_a_peer() -> i32
+    var sqe: IoUringSqe = blank()
+    sqe.prep_accept(3, 0, 9)
+    assert sqe.opcode == IORING_OP_ACCEPT
+    assert sqe.addr == 0
+    assert sqe.off == 0
+    var peer: SockAddrStorage = sockaddr_storage_new()
+    assert peer.len == 128
+    sqe.prep_accept_from(3, @&peer, 0, 10)
+    assert sqe.addr == @peer.bytes[0] as i64
+    # The kernel writes the peer's length back through addr2.
+    assert sqe.off == @peer.len as i64
+    sqe.prep_accept_multishot(3, 0, 11)
+    assert sqe.addr == 0
+    assert sqe.ioprio == 1
+    0
+
+[[test]]
+fn test_prep_connect_takes_an_address() -> i32
+    var addr: SockAddrStorage = sockaddr_storage_new()
+    addr.len = 16
+    var sqe: IoUringSqe = blank()
+    sqe.prep_connect(4, @addr, 12)
+    assert sqe.opcode == IORING_OP_CONNECT
+    assert sqe.addr == @addr.bytes[0] as i64
+    assert sqe.off == 16
+    0
+
+[[test]]
+fn test_prep_readv_writev_take_iovec_spans() -> i32
+    var vecs: [2]Iovec
+    var sqe: IoUringSqe = blank()
+    sqe.prep_writev(1, Span<Iovec> { ptr: @vecs[0], len: 2 }, -1, 13)
+    assert sqe.opcode == IORING_OP_WRITEV
+    assert sqe.addr == @vecs[0] as i64
+    assert sqe.len == 2
+    sqe.prep_readv(0, Span<Iovec> { ptr: @vecs[0], len: 1 }, 0, 14)
+    assert sqe.opcode == IORING_OP_READV
+    assert sqe.len == 1
+    0
+
+[[test]]
+fn test_prep_timeout_takes_a_borrow() -> i32
+    var ts: KernelTimespec
+    ts.tv_sec = 1
+    ts.tv_nsec = 0
+    var sqe: IoUringSqe = blank()
+    sqe.prep_timeout(@ts, 0, 0, 15)
+    assert sqe.opcode == IORING_OP_TIMEOUT
+    assert sqe.addr == @ts as i64
+    0
+
+[[test]]
+fn test_submit_nop_is_ok_one() -> i32
+    var ring: IoUring
+    if ring.init(8) < 0
+        return 0   # no io_uring here
+    match ring.get_sqe()
+        Some(sqe) => sqe.prep_nop(42)
+        None =>
+            assert false
+    ring.sqe_submit()
+    assert count_of(ring.submit_and_wait(1)) == 1
+    # Nothing pending: Ok(0) without entering the kernel.
+    assert count_of(ring.submit()) == 0
+    ring.destroy()
+    0

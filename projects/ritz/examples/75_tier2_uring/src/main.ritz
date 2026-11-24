@@ -11,6 +11,7 @@ import ritzlib.io
 import ritzlib.memory
 import ritzlib.async_net
 import ritzlib.uring
+import ritzlib.result
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.strview
@@ -91,17 +92,18 @@ fn run_server(port: i32, max_handled: i32)
             print("FAIL: could not get accept SQE\n")
             return
     let accept_ud: i64 = encode_user_data(0, OP_ACCEPT)
-    accept_sqe.prep_accept(server_fd, null, null, 0, accept_ud)
+    accept_sqe.prep_accept(server_fd, 0, accept_ud)
     ring.sqe_submit()
     ring.submit()
     accept_pending = 1
 
     # Event loop
     while total_handled < max_handled or active_conns > 0
-        let completed: i32 = ring.submit_and_wait(1)
-        if completed < 0
-            print("io_uring wait error\n")
-            break
+        match ring.submit_and_wait(1)
+            Ok(_) => pass
+            Err(_) =>
+                print("io_uring wait error\n")
+                break
 
         # Process completions
         loop
@@ -135,7 +137,7 @@ fn run_server(port: i32, max_handled: i32)
                             Some(p) =>
                                 let recv_sqe: *IoUringSqe = p
                                 let recv_ud: i64 = encode_user_data(found_slot, OP_RECV)
-                                recv_sqe.prep_recv(result, conn_bufs[found_slot], BUF_SIZE as u64, 0, recv_ud)
+                                recv_sqe.prep_recv(result, Span<u8> { ptr: conn_bufs[found_slot], len: BUF_SIZE as i64 }, 0, recv_ud)
                                 ring.sqe_submit()
                             None => pass
                     else
@@ -147,7 +149,7 @@ fn run_server(port: i32, max_handled: i32)
                         Some(p) =>
                             let new_accept: *IoUringSqe = p
                             let new_accept_ud: i64 = encode_user_data(0, OP_ACCEPT)
-                            new_accept.prep_accept(server_fd, null, null, 0, new_accept_ud)
+                            new_accept.prep_accept(server_fd, 0, new_accept_ud)
                             ring.sqe_submit()
                             accept_pending = 1
                         None => pass
@@ -165,7 +167,7 @@ fn run_server(port: i32, max_handled: i32)
                         Some(p) =>
                             let send_sqe: *IoUringSqe = p
                             let send_ud: i64 = encode_user_data(slot, OP_SEND)
-                            send_sqe.prep_send(conn_fds[slot], conn_bufs[slot], result as u64, 0, send_ud)
+                            send_sqe.prep_send(conn_fds[slot], Span<u8> { ptr: conn_bufs[slot], len: result as i64 }, 0, send_ud)
                             ring.sqe_submit()
                         None => pass
 
@@ -182,7 +184,7 @@ fn run_server(port: i32, max_handled: i32)
                         Some(p) =>
                             let next_recv: *IoUringSqe = p
                             let next_recv_ud: i64 = encode_user_data(slot, OP_RECV)
-                            next_recv.prep_recv(conn_fds[slot], conn_bufs[slot], BUF_SIZE as u64, 0, next_recv_ud)
+                            next_recv.prep_recv(conn_fds[slot], Span<u8> { ptr: conn_bufs[slot], len: BUF_SIZE as i64 }, 0, next_recv_ud)
                             ring.sqe_submit()
                         None => pass
 

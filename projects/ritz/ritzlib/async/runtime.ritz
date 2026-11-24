@@ -254,8 +254,6 @@ impl Runtime
     # Submit a read operation and wait for completion.
     # Ok(bytes read, 0 at EOF) or Err(errno) from submission or the completion.
     pub fn read(self: *Runtime, fd: i32, buf_sv: Span<u8>, offset: i64) -> Result<i64, Errno>
-        let buf: *u8 = buf_sv.ptr
-        let count: i32 = buf_sv.len as i32
         let user_data: i64 = self.next_user_data
         self.next_user_data = self.next_user_data + 1
 
@@ -265,13 +263,13 @@ impl Runtime
             None => return Err(Errno.NoMem)
 
         # Prepare the read
-        sqe.prep_read(fd, buf, count, offset, user_data)
+        sqe.prep_read(fd, buf_sv, offset, user_data)
         self.ring.sqe_submit()
 
         # Submit and wait for completion
-        let ret: i32 = self.ring.submit_and_wait(1)
-        if ret < 0
-            return Err(errno_from_raw(ret))
+        match self.ring.submit_and_wait(1)
+            Ok(_) => pass
+            Err(e) => return Err(e)
 
         # Get the completion
         let cqe: *IoUringCqe = match self.ring.peek_cqe()
@@ -288,8 +286,6 @@ impl Runtime
     # Submit a write operation and wait for completion.
     # Ok(bytes written) or Err(errno) from submission or the completion.
     pub fn write(self: *Runtime, fd: i32, buf_sv: Span<u8>, offset: i64) -> Result<i64, Errno>
-        let buf: *u8 = buf_sv.ptr
-        let count: i32 = buf_sv.len as i32
         let user_data: i64 = self.next_user_data
         self.next_user_data = self.next_user_data + 1
 
@@ -297,12 +293,12 @@ impl Runtime
             Some(p) => p
             None => return Err(Errno.NoMem)
 
-        sqe.prep_write(fd, buf, count, offset, user_data)
+        sqe.prep_write(fd, buf_sv, offset, user_data)
         self.ring.sqe_submit()
 
-        let ret: i32 = self.ring.submit_and_wait(1)
-        if ret < 0
-            return Err(errno_from_raw(ret))
+        match self.ring.submit_and_wait(1)
+            Ok(_) => pass
+            Err(e) => return Err(e)
 
         let cqe: *IoUringCqe = match self.ring.peek_cqe()
             Some(p) => p
@@ -328,9 +324,9 @@ impl Runtime
         sqe.prep_close(fd, user_data)
         self.ring.sqe_submit()
 
-        let ret: i32 = self.ring.submit_and_wait(1)
-        if ret < 0
-            return Err(errno_from_raw(ret))
+        match self.ring.submit_and_wait(1)
+            Ok(_) => pass
+            Err(e) => return Err(e)
 
         let cqe: *IoUringCqe = match self.ring.peek_cqe()
             Some(p) => p
@@ -352,8 +348,6 @@ impl Runtime
         self.waker_user_data = 0
 
     pub fn poll_read(self: *Runtime, fd: i32, buf_sv: Span<u8>, offset: i64) -> Option<i32>
-        let buf: *u8 = buf_sv.ptr
-        let len: i32 = buf_sv.len as i32
         if self.current_task >= 0
             let t = @&self.spawn_tasks[self.current_task]
             if t.io_ready != 0
@@ -367,12 +361,10 @@ impl Runtime
 
         let user_data: i64 = self.next_user_data
         self.next_user_data = self.next_user_data + 1
-        sqe.prep_read(fd, buf, len, offset, user_data)
+        sqe.prep_read(fd, buf_sv, offset, user_data)
         return runtime_suspend_on(self, user_data)
 
     pub fn poll_write(self: *Runtime, fd: i32, buf_sv: Span<u8>, offset: i64) -> Option<i32>
-        let buf: *u8 = buf_sv.ptr
-        let len: i32 = buf_sv.len as i32
         if self.current_task >= 0
             let t = @&self.spawn_tasks[self.current_task]
             if t.io_ready != 0
@@ -386,15 +378,15 @@ impl Runtime
 
         let user_data: i64 = self.next_user_data
         self.next_user_data = self.next_user_data + 1
-        sqe.prep_write(fd, buf, len, offset, user_data)
+        sqe.prep_write(fd, buf_sv, offset, user_data)
         return runtime_suspend_on(self, user_data)
 
     # Wait for at least one completion and record the one the waker is armed for
     pub fn wait_for_io(self: *Runtime) -> i32
         # Submit any pending SQEs and wait for at least one CQE
-        let ret: i32 = self.ring.submit_and_wait(1)
-        if ret < 0
-            return ret
+        match self.ring.submit_and_wait(1)
+            Ok(_) => pass
+            Err(e) => return -e.code()
 
         # Process completions
         var processed: i32 = 0

@@ -22,7 +22,7 @@ pytestmark = pytest.mark.unit
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent.parent
 
-PINS = {"bool-return": (6, 6), "out-param": (5, 18), "status-return": (22, 108)}
+PINS = {"bool-return": (6, 6), "out-param": (4, 17), "status-return": (20, 105)}
 
 
 def test_ritzlib_c_shapes_only_go_down():

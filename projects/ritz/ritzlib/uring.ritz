@@ -20,6 +20,12 @@
 
 import ritzlib.sys
 import ritzlib.option
+import ritzlib.span
+import ritzlib.result
+import ritzlib.iovec
+import ritzlib.net
+# Errno is part of this API (submit), so importers of uring get it too.
+pub import ritzlib.errno
 
 # ============================================================================
 # Syscall numbers
@@ -204,7 +210,8 @@ struct IoUring
 pub fn sys_io_uring_setup(entries: i32, params: *IoUringParams) -> i32
     return syscall2(SYS_IO_URING_SETUP, entries as i64, params as i64) as i32
 
-pub fn sys_io_uring_enter(fd: i32, to_submit: i32, min_complete: i32, flags: i32) -> i32
+# Ok(SQEs consumed), or Err(errno) from io_uring_enter(2).
+pub fn sys_io_uring_enter(fd: i32, to_submit: i32, min_complete: i32, flags: i32) -> Result<i32, Errno>
     # io_uring_enter is a 6-arg syscall: (fd, to_submit, min_complete, flags, argp, argsz).
     # Using syscall4 here leaves r8/r9 holding whatever the call site happened to
     # have in them, so the kernel sees a garbage argp.  When that pointer is
@@ -213,7 +220,10 @@ pub fn sys_io_uring_enter(fd: i32, to_submit: i32, min_complete: i32, flags: i32
     # event loop spuriously die after the first client cleanly disconnects
     # (the call site that path takes happens to leave r8/r9 dirty).  Pass
     # explicit zeros via syscall6 so the kernel sees argp=NULL, argsz=0.
-    return syscall6(SYS_IO_URING_ENTER, fd as i64, to_submit as i64, min_complete as i64, flags as i64, 0, 0) as i32
+    let rc: i32 = syscall6(SYS_IO_URING_ENTER, fd as i64, to_submit as i64, min_complete as i64, flags as i64, 0, 0) as i32
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(rc)
 
 # standard-exempt: raw-ptr-param: io_uring_register(2) syscall ABI
 pub fn sys_io_uring_register(fd: i32, opcode: i32, arg: *u8, nr_args: i32) -> i32
@@ -427,19 +437,21 @@ impl IoUring
         let tail: i32 = *self.sq_tail
         *self.sq_tail = tail +% 1
 
-    # Submit all pending SQEs and optionally wait for completions
-    pub fn submit(self: *IoUring) -> i32
+    # Submit all pending SQEs: Ok(how many the kernel took), Ok(0) with
+    # nothing pending (no syscall), or Err(errno) from io_uring_enter(2).
+    pub fn submit(self: *IoUring) -> Result<i32, Errno>
         let tail: i32 = *self.sq_tail
         let head: i32 = *self.sq_head
         let to_submit: i32 = tail -% head
 
         if to_submit == 0
-            return 0
+            return Ok(0)
 
         return sys_io_uring_enter(self.ring_fd, to_submit, 0, 0)
 
-    # Submit and wait for at least min_complete completions
-    pub fn submit_and_wait(self: *IoUring, min_complete: i32) -> i32
+    # Submit pending SQEs and wait for at least min_complete completions:
+    # Ok(SQEs submitted), or Err(errno) (Intr if a signal cut the wait).
+    pub fn submit_and_wait(self: *IoUring, min_complete: i32) -> Result<i32, Errno>
         let tail: i32 = *self.sq_tail
         let head: i32 = *self.sq_head
         let to_submit: i32 = tail -% head
@@ -467,29 +479,33 @@ impl IoUring
         # First check if there's already a CQE available
         match self.peek_cqe()
             Some(p) => return Some(p)
-            None =>
-                # No CQE available; ask the kernel to wait for one.
-                let ret: i32 = sys_io_uring_enter(self.ring_fd, 0, 1, IORING_ENTER_GETEVENTS)
-                if ret < 0
-                    return None
-                return self.peek_cqe()
+            None => pass
+        # No CQE available; ask the kernel to wait for one. (A flag, not a
+        # match returning Option from a match arm: ritz1 mistypes that.)
+        var waited: bool = true
+        match sys_io_uring_enter(self.ring_fd, 0, 1, IORING_ENTER_GETEVENTS)
+            Ok(_) => pass
+            Err(_) => waited = false
+        if not waited
+            return None
+        self.peek_cqe()
 
     # Alias for uring_destroy (common naming convention)
     pub fn cleanup(self: *IoUring)
         self.destroy()
 
 impl IoUringSqe
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: buffer and length registers
     # Prepare a read SQE
-    # standard-exempt: ptr-len-param: io_uring ABI: the SQE buffer and length fields
-    pub fn prep_read(self: *IoUringSqe, fd: i32, buf: *u8, len: i32, offset: i64, user_data: i64)
+    pub fn prep_read(self: *IoUringSqe, fd: i32, buf: Span<u8>, offset: i64, user_data: i64)
+        # `buf` is read/written by the kernel after this returns: it must stay
+        # valid (not freed, not reused) until this SQE's CQE arrives.
         self.opcode = IORING_OP_READ
         self.flags = 0
         self.ioprio = 0
         self.fd = fd
         self.off = offset
-        self.addr = buf as i64
-        self.len = len
+        self.addr = buf.ptr as i64
+        self.len = buf.len as i32
         self.rw_flags = 0
         self.user_data = user_data
         self.buf_index = 0
@@ -498,17 +514,17 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: buffer and length registers
     # Prepare a write SQE
-    # standard-exempt: ptr-len-param: io_uring ABI: the SQE buffer and length fields
-    pub fn prep_write(self: *IoUringSqe, fd: i32, buf: *u8, len: i32, offset: i64, user_data: i64)
+    pub fn prep_write(self: *IoUringSqe, fd: i32, buf: Span<u8>, offset: i64, user_data: i64)
+        # `buf` is read/written by the kernel after this returns: it must stay
+        # valid (not freed, not reused) until this SQE's CQE arrives.
         self.opcode = IORING_OP_WRITE
         self.flags = 0
         self.ioprio = 0
         self.fd = fd
         self.off = offset
-        self.addr = buf as i64
-        self.len = len
+        self.addr = buf.ptr as i64
+        self.len = buf.len as i32
         self.rw_flags = 0
         self.user_data = user_data
         self.buf_index = 0
@@ -517,15 +533,14 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: accept addr registers
     # Prepare an accept SQE (for TCP servers)
-    pub fn prep_accept(self: *IoUringSqe, fd: i32, addr: *u8, addrlen: *i32, flags: i32, user_data: i64)
+    pub fn prep_accept(self: *IoUringSqe, fd: i32, flags: i32, user_data: i64)
         self.opcode = IORING_OP_ACCEPT
         self.flags = 0
         self.ioprio = 0
         self.fd = fd
-        self.off = addrlen as i64  # addr2 in union
-        self.addr = addr as i64
+        self.off = 0                # no peer address wanted
+        self.addr = 0
         self.len = 0
         self.rw_flags = flags
         self.user_data = user_data
@@ -534,6 +549,14 @@ impl IoUringSqe
         self.splice_fd_in = 0
         self.pad1 = 0
         self.pad2 = 0
+
+    # Prepare an accept SQE that also reports the peer's address: the kernel
+    # writes it into peer.bytes and its length into peer.len (start it at
+    # 128, as sockaddr_storage_new does). `peer` must stay valid until the CQE.
+    pub fn prep_accept_from(self: *IoUringSqe, fd: i32, peer: @&SockAddrStorage, flags: i32, user_data: i64)
+        self.prep_accept(fd, flags, user_data)
+        self.addr = @peer.bytes[0] as i64
+        self.off = @peer.len as i64  # addr2: where the kernel writes the length
 
     # Prepare a close SQE
     pub fn prep_close(self: *IoUringSqe, fd: i32, user_data: i64)
@@ -552,17 +575,17 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: buffer and length registers
     # Prepare a recv SQE (socket receive)
-    # standard-exempt: ptr-len-param: io_uring ABI: the SQE buffer and length fields
-    pub fn prep_recv(self: *IoUringSqe, fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)
+    pub fn prep_recv(self: *IoUringSqe, fd: i32, buf: Span<u8>, flags: i32, user_data: i64)
+        # `buf` is read/written by the kernel after this returns: it must stay
+        # valid (not freed, not reused) until this SQE's CQE arrives.
         self.opcode = IORING_OP_RECV
         self.flags = 0
         self.ioprio = 0
         self.fd = fd
         self.off = 0
-        self.addr = buf as i64
-        self.len = len as i32
+        self.addr = buf.ptr as i64
+        self.len = buf.len as i32
         self.rw_flags = flags
         self.user_data = user_data
         self.buf_index = 0
@@ -571,17 +594,17 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: buffer and length registers
     # Prepare a send SQE (socket send)
-    # standard-exempt: ptr-len-param: io_uring ABI: the SQE buffer and length fields
-    pub fn prep_send(self: *IoUringSqe, fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)
+    pub fn prep_send(self: *IoUringSqe, fd: i32, buf: Span<u8>, flags: i32, user_data: i64)
+        # `buf` is read/written by the kernel after this returns: it must stay
+        # valid (not freed, not reused) until this SQE's CQE arrives.
         self.opcode = IORING_OP_SEND
         self.flags = 0
         self.ioprio = 0
         self.fd = fd
         self.off = 0
-        self.addr = buf as i64
-        self.len = len as i32
+        self.addr = buf.ptr as i64
+        self.len = buf.len as i32
         self.rw_flags = flags
         self.user_data = user_data
         self.buf_index = 0
@@ -590,15 +613,16 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: connect addr register
     # Prepare a connect SQE (socket connect)
-    pub fn prep_connect(self: *IoUringSqe, fd: i32, addr: *u8, addrlen: i32, user_data: i64)
+    pub fn prep_connect(self: *IoUringSqe, fd: i32, addr: @SockAddrStorage, user_data: i64)
+        # `addr` is read by the kernel after this returns: keep it alive until
+        # the CQE arrives.
         self.opcode = IORING_OP_CONNECT
         self.flags = 0
         self.ioprio = 0
         self.fd = fd
-        self.off = addrlen as i64
-        self.addr = addr as i64
+        self.off = addr.len as i64
+        self.addr = @addr.bytes[0] as i64
         self.len = 0
         self.rw_flags = 0
         self.user_data = user_data
@@ -608,16 +632,16 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: iovec register
     # Prepare a readv SQE (scatter read)
-    pub fn prep_readv(self: *IoUringSqe, fd: i32, iov: *u8, nr_vecs: i32, offset: i64, user_data: i64)
+    pub fn prep_readv(self: *IoUringSqe, fd: i32, iov: Span<Iovec>, offset: i64, user_data: i64)
+        # `iov` and the buffers it names must stay valid until the CQE arrives.
         self.opcode = IORING_OP_READV
         self.flags = 0
         self.ioprio = 0
         self.fd = fd
         self.off = offset
-        self.addr = iov as i64
-        self.len = nr_vecs
+        self.addr = iov.ptr as i64
+        self.len = iov.len as i32
         self.rw_flags = 0
         self.user_data = user_data
         self.buf_index = 0
@@ -626,16 +650,16 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: iovec register
     # Prepare a writev SQE (gather write)
-    pub fn prep_writev(self: *IoUringSqe, fd: i32, iov: *u8, nr_vecs: i32, offset: i64, user_data: i64)
+    pub fn prep_writev(self: *IoUringSqe, fd: i32, iov: Span<Iovec>, offset: i64, user_data: i64)
+        # `iov` and the buffers it names must stay valid until the CQE arrives.
         self.opcode = IORING_OP_WRITEV
         self.flags = 0
         self.ioprio = 0
         self.fd = fd
         self.off = offset
-        self.addr = iov as i64
-        self.len = nr_vecs
+        self.addr = iov.ptr as i64
+        self.len = iov.len as i32
         self.rw_flags = 0
         self.user_data = user_data
         self.buf_index = 0
@@ -644,17 +668,16 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: accept addr registers
     # Prepare a multishot accept SQE
     # Only needs to be submitted once - generates continuous CQEs for new connections
     # Check IORING_CQE_F_MORE flag to know if multishot is still active
-    pub fn prep_accept_multishot(self: *IoUringSqe, fd: i32, addr: *u8, addrlen: *i32, flags: i32, user_data: i64)
+    pub fn prep_accept_multishot(self: *IoUringSqe, fd: i32, flags: i32, user_data: i64)
         self.opcode = IORING_OP_ACCEPT
         self.flags = 0
         self.ioprio = IORING_ACCEPT_MULTISHOT as u16  # IOPRIO field holds accept flags
         self.fd = fd
-        self.off = addrlen as i64  # addr2 in union
-        self.addr = addr as i64
+        self.off = 0                # no peer address wanted
+        self.addr = 0
         self.len = 0
         self.rw_flags = flags
         self.user_data = user_data
@@ -664,13 +687,13 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: timespec register
     # Prepare a timeout SQE
     # ts: pointer to KernelTimespec with timeout duration
     # count: number of completions to wait for (0 = just timeout)
     # flags: IORING_TIMEOUT_* flags (usually 0)
-    # standard-exempt: ptr-len-param: io_uring ABI: the SQE timespec and count fields
-    pub fn prep_timeout(self: *IoUringSqe, ts: *KernelTimespec, count: u32, flags: u32, user_data: i64)
+    pub fn prep_timeout(self: *IoUringSqe, ts: @KernelTimespec, count: u32, flags: u32, user_data: i64)
+        # `ts` is read by the kernel after this returns: keep it alive until
+        # the CQE arrives.
         self.opcode = IORING_OP_TIMEOUT
         self.flags = 0
         self.ioprio = 0
@@ -705,22 +728,22 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: buffer and length registers
     # Prepare a zero-copy send SQE
     # fd: socket file descriptor
     # buf: pointer to data buffer (MUST remain valid until CQE!)
     # len: number of bytes to send
     # flags: MSG_* flags (usually 0)
     # user_data: completion identifier
-    # standard-exempt: ptr-len-param: io_uring ABI: the SQE buffer and length fields
-    pub fn prep_send_zc(self: *IoUringSqe, fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)
+    pub fn prep_send_zc(self: *IoUringSqe, fd: i32, buf: Span<u8>, flags: i32, user_data: i64)
+        # `buf` is read/written by the kernel after this returns: it must stay
+        # valid (not freed, not reused) until this SQE's CQE arrives.
         self.opcode = IORING_OP_SEND_ZC
         self.flags = 0
         self.ioprio = 0
         self.fd = fd
         self.off = 0
-        self.addr = buf as i64
-        self.len = len as i32
+        self.addr = buf.ptr as i64
+        self.len = buf.len as i32
         self.rw_flags = flags  # MSG_* flags
         self.user_data = user_data
         self.buf_index = 0
@@ -729,19 +752,19 @@ impl IoUringSqe
         self.pad1 = 0
         self.pad2 = 0
 
-    # standard-exempt: raw-ptr-param: io_uring SQE ABI: buffer and length registers
     # Prepare a zero-copy send with notification request
     # When IORING_SEND_ZC_REPORT_USAGE is set, the kernel reports whether
     # zero-copy was actually used via the IORING_CQE_F_NOTIF flag in the CQE.
-    # standard-exempt: ptr-len-param: io_uring ABI: the SQE buffer and length fields
-    pub fn prep_send_zc_report(self: *IoUringSqe, fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)
+    pub fn prep_send_zc_report(self: *IoUringSqe, fd: i32, buf: Span<u8>, flags: i32, user_data: i64)
+        # `buf` is read/written by the kernel after this returns: it must stay
+        # valid (not freed, not reused) until this SQE's CQE arrives.
         self.opcode = IORING_OP_SEND_ZC
         self.flags = 0
         self.ioprio = IORING_SEND_ZC_REPORT_USAGE
         self.fd = fd
         self.off = 0
-        self.addr = buf as i64
-        self.len = len as i32
+        self.addr = buf.ptr as i64
+        self.len = buf.len as i32
         self.rw_flags = flags
         self.user_data = user_data
         self.buf_index = 0

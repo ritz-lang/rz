@@ -17,6 +17,11 @@
 #     - SO_REUSEPORT allows kernel to load-balance connections
 
 import ritzlib.sys
+import ritzlib.fd
+import ritzlib.process { fork, kill, wait_pid, try_wait_pid }
+import ritzlib.time { sleep_ms }
+import ritzlib.option
+import ritzlib.result
 import ritzlib.io
 import ritzlib.fmt
 import ritzlib.str
@@ -138,14 +143,15 @@ pub fn master_init(m: *MasterServer, port: i32, num_workers: i32) -> i32
     set_reuseaddr(fd)
     set_reuseport(fd)  # Critical for multi-process load balancing
 
+    var listener: Fd = fd_adopt(fd)
     let bind_ret: i32 = tcp_bind(fd, 0, port)
     if bind_ret < 0
-        sys_close(fd)
+        listener.close()
         return bind_ret
 
     let listen_ret: i32 = tcp_listen(fd, 128)
     if listen_ret < 0
-        sys_close(fd)
+        listener.close()
         return listen_ret
 
     m.listen_fd = fd
@@ -164,17 +170,17 @@ fn spawn_worker(m: *MasterServer, worker_id: i32) -> i32
     let port: i32 = m.port
     let listen_fd: i32 = m.listen_fd
 
-    let pid: i32 = sys_fork()
-
-    if pid < 0
-        print("Failed to fork worker {worker_id}\n")
-        return pid
-
-    if pid == 0
-        # Child process - become a worker
-        let ret: i32 = worker_main(port, listen_fd, worker_id)
-        sys_exit(ret)
-        # Never returns
+    var pid: i32 = 0
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child =>
+                    # Become a worker; never returns
+                    sys_exit(worker_main(port, listen_fd, worker_id))
+                Parent(child) => pid = child
+        Err(e) =>
+            print("Failed to fork worker {worker_id}\n")
+            return -e.code()
 
     # Parent process - record worker info
     m.workers[worker_id].pid = pid
@@ -199,9 +205,29 @@ pub fn master_spawn_workers(m: *MasterServer) -> i32
 # Worker monitoring
 # ============================================================================
 
+# How child `pid` exited, reaping it; None while it still runs (or if there
+# is nothing to wait for).
+fn reap_worker(pid: i32) -> Option<ProcessResult>
+    match try_wait_pid(pid)
+        Ok(o) => o
+        Err(_) => None
+
+# True once child `pid` has exited (reaping it).
+fn worker_reaped(pid: i32) -> bool
+    let r: Option<ProcessResult> = reap_worker(pid)
+    option_is_some<ProcessResult>(@r)
+
+# Log how worker `i` exited.
+fn report_worker_exit(m: *MasterServer, i: i32, pr: @ProcessResult)
+    print("Worker {i} (PID {m.workers[i].pid}) exited")
+    if pr.signaled != 0
+        print(" (signal {pr.signal})")
+    else
+        print(" (code {pr.exit_code})")
+    print("\n")
+
 # Check for exited workers and restart them
 pub fn master_check_workers(m: *MasterServer) -> i32
-    var status: i32 = 0
     var restarted: i32 = 0
 
     # Check each worker slot
@@ -209,21 +235,14 @@ pub fn master_check_workers(m: *MasterServer) -> i32
     while i < m.num_workers
         if m.workers[i].state == WORKER_RUNNING
             # Check if this worker has exited (non-blocking)
-            let ret: i32 = sys_wait4(m.workers[i].pid, @status, WNOHANG, null)
+            var exited: bool = false
+            match reap_worker(m.workers[i].pid)
+                Some(pr) =>
+                    report_worker_exit(m, i, @pr)
+                    exited = true
+                None => pass
 
-            if ret > 0
-                # Worker exited
-                let exit_code: i32 = (status >> 8) & 255  # WEXITSTATUS
-                let signaled: i32 = status & 127         # WTERMSIG (if non-zero)
-
-                print("Worker {i} (PID {m.workers[i].pid}) exited")
-
-                if signaled != 0
-                    print(" (signal {signaled})")
-                else
-                    print(" (code {exit_code})")
-                print("\n")
-
+            if exited
                 m.workers[i].state = WORKER_STOPPED
                 m.workers[i].pid = 0
 
@@ -251,7 +270,7 @@ pub fn master_shutdown(m: *MasterServer)
     var i: i32 = 0
     while i < m.num_workers
         if m.workers[i].state == WORKER_RUNNING
-            sys_kill(m.workers[i].pid, SIGTERM)
+            kill(m.workers[i].pid, SIGTERM)
             m.workers[i].state = WORKER_STOPPING
         i += 1
 
@@ -265,9 +284,7 @@ pub fn master_shutdown(m: *MasterServer)
         i = 0
         while i < m.num_workers
             if m.workers[i].state != WORKER_STOPPED
-                var status: i32 = 0
-                let ret: i32 = sys_wait4(m.workers[i].pid, @status, WNOHANG, null)
-                if ret > 0
+                if worker_reaped(m.workers[i].pid)
                     m.workers[i].state = WORKER_STOPPED
                     m.workers[i].pid = 0
                 else
@@ -275,11 +292,7 @@ pub fn master_shutdown(m: *MasterServer)
             i += 1
 
         if remaining > 0
-            # Sleep 100ms
-            var req: [2]i64
-            req[0] = 0           # seconds
-            req[1] = 100000000   # 100ms in nanoseconds
-            sys_nanosleep(@req[0], null)
+            sleep_ms(100)
             attempts += 1
 
     # Force kill any remaining workers
@@ -289,10 +302,9 @@ pub fn master_shutdown(m: *MasterServer)
         i = 0
         while i < m.num_workers
             if m.workers[i].state != WORKER_STOPPED
-                sys_kill(m.workers[i].pid, SIGKILL)
+                kill(m.workers[i].pid, SIGKILL)
                 # Reap the zombie
-                var status: i32 = 0
-                sys_wait4(m.workers[i].pid, @status, 0, null)
+                wait_pid(m.workers[i].pid)
                 m.workers[i].state = WORKER_STOPPED
                 m.workers[i].pid = 0
             i += 1
@@ -306,7 +318,8 @@ pub fn master_shutdown(m: *MasterServer)
 
 pub fn master_destroy(m: *MasterServer)
     if m.listen_fd >= 0
-        sys_close(m.listen_fd)
+        var listener: Fd = fd_adopt(m.listen_fd)
+        listener.close()
         m.listen_fd = -1
 
 
@@ -323,10 +336,6 @@ pub fn master_run(m: *MasterServer) -> i32
     while g_shutdown == 0
         master_check_workers(m)
 
-        # Sleep 100ms
-        var req: [2]i64
-        req[0] = 0           # seconds
-        req[1] = 100000000   # 100ms in nanoseconds
-        sys_nanosleep(@req[0], null)
+        sleep_ms(100)
 
     return 0

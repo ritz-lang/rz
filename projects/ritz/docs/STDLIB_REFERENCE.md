@@ -2502,8 +2502,8 @@ struct IoUring
 | `ring.destroy()` | `fn()` | Destroy ring |
 | `ring.get_sqe()` | `fn() -> Option<*IoUringSqe>` | Get SQE (None when the ring is full) |
 | `ring.sqe_submit()` | `fn()` | Advance SQ tail |
-| `ring.submit()` | `fn() -> i32` | Submit pending SQEs |
-| `ring.submit_and_wait(min_complete)` | `fn(min_complete: i32) -> i32` | Submit and wait |
+| `ring.submit()` | `fn() -> Result<i32, Errno>` | Submit pending SQEs: `Ok(count)`, `Ok(0)` with none pending (no syscall) |
+| `ring.submit_and_wait(min_complete)` | `fn(min_complete: i32) -> Result<i32, Errno>` | Submit and wait for `min_complete` CQEs |
 | `ring.peek_cqe()` | `fn() -> Option<*IoUringCqe>` | Peek CQE (None when none is ready) |
 | `ring.wait_cqe()` | `fn() -> Option<*IoUringCqe>` | Wait for CQE |
 | `ring.cqe_seen(cqe)` | `fn(cqe: @IoUringCqe)` | Mark CQE consumed |
@@ -2513,27 +2513,34 @@ struct IoUring
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `sqe.prep_read(fd, buf, len, offset, user_data)` | `fn(fd: i32, buf: *u8, len: i32, offset: i64, user_data: i64)` | Prepare read |
-| `sqe.prep_write(fd, buf, len, offset, user_data)` | `fn(fd: i32, buf: *u8, len: i32, offset: i64, user_data: i64)` | Prepare write |
-| `sqe.prep_accept(fd, addr, addrlen, flags, user_data)` | `fn(fd: i32, addr: *u8, addrlen: *i32, flags: i32, user_data: i64)` | Prepare accept |
-| `sqe.prep_accept_multishot(fd, addr, addrlen, flags, user_data)` | `fn(fd: i32, addr: *u8, addrlen: *i32, flags: i32, user_data: i64)` | Multishot accept (5.19+) |
+| `sqe.prep_read(fd, buf, offset, user_data)` | `fn(fd: i32, buf: Span<u8>, offset: i64, user_data: i64)` | Prepare read |
+| `sqe.prep_write(fd, buf, offset, user_data)` | `fn(fd: i32, buf: Span<u8>, offset: i64, user_data: i64)` | Prepare write |
+| `sqe.prep_accept(fd, flags, user_data)` | `fn(fd: i32, flags: i32, user_data: i64)` | Prepare accept (no peer address) |
+| `sqe.prep_accept_from(fd, peer, flags, user_data)` | `fn(fd: i32, peer: @&SockAddrStorage, flags: i32, user_data: i64)` | Accept, the kernel writing the peer's address and length into `peer` |
+| `sqe.prep_accept_multishot(fd, flags, user_data)` | `fn(fd: i32, flags: i32, user_data: i64)` | Multishot accept (5.19+) |
 | `sqe.prep_close(fd, user_data)` | `fn(fd: i32, user_data: i64)` | Prepare close |
-| `sqe.prep_recv(fd, buf, len, flags, user_data)` | `fn(fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | Prepare recv |
-| `sqe.prep_send(fd, buf, len, flags, user_data)` | `fn(fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | Prepare send |
-| `sqe.prep_send_zc(fd, buf, len, flags, user_data)` | `fn(fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | Zero-copy send (6.0+) |
-| `sqe.prep_readv(fd, iov, nr_vecs, offset, user_data)` | `fn(fd: i32, iov: *u8, nr_vecs: i32, offset: i64, user_data: i64)` | Vectored read |
-| `sqe.prep_writev(fd, iov, nr_vecs, offset, user_data)` | `fn(fd: i32, iov: *u8, nr_vecs: i32, offset: i64, user_data: i64)` | Vectored write |
+| `sqe.prep_recv(fd, buf, flags, user_data)` | `fn(fd: i32, buf: Span<u8>, flags: i32, user_data: i64)` | Prepare recv |
+| `sqe.prep_send(fd, buf, flags, user_data)` | `fn(fd: i32, buf: Span<u8>, flags: i32, user_data: i64)` | Prepare send |
+| `sqe.prep_send_zc(fd, buf, flags, user_data)` | `fn(fd: i32, buf: Span<u8>, flags: i32, user_data: i64)` | Zero-copy send (6.0+) |
+| `sqe.prep_readv(fd, iov, offset, user_data)` | `fn(fd: i32, iov: Span<Iovec>, offset: i64, user_data: i64)` | Vectored read |
+| `sqe.prep_writev(fd, iov, offset, user_data)` | `fn(fd: i32, iov: Span<Iovec>, offset: i64, user_data: i64)` | Vectored write |
 | `sqe.prep_splice(fd_out, off_out, fd_in, off_in, len, splice_flags, user_data)` | `fn(fd_out: i32, off_out: i64, fd_in: i32, off_in: i64, len: u32, splice_flags: i32, user_data: i64)` | Splice |
-| `sqe.prep_timeout(ts, count, flags, user_data)` | `fn(ts: *KernelTimespec, count: u32, flags: u32, user_data: i64)` | Timeout |
-| `sqe.prep_connect(fd, addr, addrlen, user_data)` | `fn(fd: i32, addr: *u8, addrlen: i32, user_data: i64)` | Prepare connect |
+| `sqe.prep_timeout(ts, count, flags, user_data)` | `fn(ts: @KernelTimespec, count: u32, flags: u32, user_data: i64)` | Timeout |
+| `sqe.prep_connect(fd, addr, user_data)` | `fn(fd: i32, addr: @SockAddrStorage, user_data: i64)` | Prepare connect to `addr` (`addr.len` bytes) |
 | `sqe.prep_nop(user_data)` | `fn(user_data: i64)` | An immediate CQE with no work (a cooperative yield) |
-| `sqe.prep_send_zc_report(fd, buf, len, flags, user_data)` | `fn(fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | `prep_send_zc` that asks the kernel to report whether zero-copy was used |
+| `sqe.prep_send_zc_report(fd, buf, flags, user_data)` | `fn(fd: i32, buf: Span<u8>, flags: i32, user_data: i64)` | `prep_send_zc` that asks the kernel to report whether zero-copy was used |
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `cqe.get_data64()` | `fn() -> i64` | The CQE's `user_data` |
 
-**Safety Note**: Zero-copy operations (`IORING_OP_SEND_ZC`) require the buffer to remain valid until the CQE is received.
+**Lifetimes**: every `prep_*` that takes a buffer, iovec span, address or
+timespec hands the kernel its address; the kernel reads or writes it after the
+call returns. Keep it valid (not freed, not reused, not a stack temporary that
+goes out of scope) until that SQE's CQE arrives. The span form makes the
+length travel with the pointer; it can't check this lifetime (S-PTR-6).
+`SockAddrStorage` (`ritzlib.net`) is 128 bytes plus its `len`;
+`sockaddr_storage_new()` gives one ready for `prep_accept_from`.
 
 ---
 

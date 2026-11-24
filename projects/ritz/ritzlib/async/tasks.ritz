@@ -294,7 +294,7 @@ impl TaskPool
             Some(p) => p
             None => return false
 
-        sqe.prep_recv(task.fd, @task.read_buf[0], TASK_BUFFER_SIZE as u64, 0, task.id)
+        sqe.prep_recv(task.fd, Span<u8> { ptr: @task.read_buf[0], len: TASK_BUFFER_SIZE as i64 }, 0, task.id)
         self.ring.sqe_submit()  # Advance the SQ tail
         task.state = TASK_WAITING
         return true
@@ -309,7 +309,7 @@ impl TaskPool
 
         task.write_len = len
         task.write_pos = 0
-        sqe.prep_send(task.fd, @task.write_buf[0], len as u64, 0, task.id)
+        sqe.prep_send(task.fd, Span<u8> { ptr: @task.write_buf[0], len: len as i64 }, 0, task.id)
         self.ring.sqe_submit()  # Advance the SQ tail
         task.state = TASK_WAITING
         return true
@@ -366,12 +366,10 @@ impl TaskPool
     # The _submit_ form takes the pool explicitly, for handlers that keep
     # their own state in task.user_data (tome, valet's TLS path).
     pub fn submit_send_buf(self: *TaskPool, task: @&Task, buf_sv: Span<u8>) -> bool
-        let buf: *u8 = buf_sv.ptr
-        let len: i32 = buf_sv.len as i32
         let sqe: *IoUringSqe = match self.ring.get_sqe()
             Some(p) => p
             None => return false
-        sqe.prep_send(task.fd, buf, len as u64, 0, task.id)
+        sqe.prep_send(task.fd, buf_sv, 0, task.id)
         self.ring.sqe_submit()
         task.state = TASK_WAITING
         return true
@@ -380,12 +378,10 @@ impl TaskPool
     # requests that outgrow task.read_buf).  The buffer MUST stay valid until
     # the CQE arrives.  Returns true once queued, false if the SQ is full (no SQE).
     pub fn submit_recv_buf(self: *TaskPool, task: @&Task, buf_sv: Span<u8>) -> bool
-        let buf: *u8 = buf_sv.ptr
-        let len: i32 = buf_sv.len as i32
         let sqe: *IoUringSqe = match self.ring.get_sqe()
             Some(p) => p
             None => return false
-        sqe.prep_recv(task.fd, buf, len as u64, 0, task.id)
+        sqe.prep_recv(task.fd, buf_sv, 0, task.id)
         self.ring.sqe_submit()
         task.state = TASK_WAITING
         return true
@@ -399,7 +395,7 @@ impl TaskPool
             None => return false
 
         # Use writev with offset=-1 to indicate no seek (for sockets)
-        sqe.prep_writev(task.fd, iov.ptr as *u8, iov.len as i32, -1, task.id)
+        sqe.prep_writev(task.fd, iov, -1, task.id)
         self.ring.sqe_submit()
         task.state = TASK_WAITING
         return true
@@ -416,7 +412,7 @@ impl TaskPool
 
         task.write_len = len
         task.write_pos = 0
-        sqe.prep_send_zc(task.fd, @task.write_buf[0], len as u64, 0, task.id)
+        sqe.prep_send_zc(task.fd, Span<u8> { ptr: @task.write_buf[0], len: len as i64 }, 0, task.id)
         self.ring.sqe_submit()
         task.state = TASK_WAITING
         return true
@@ -426,13 +422,11 @@ impl TaskPool
     # Use this for sending data that's already in a stable location
     # (e.g., static .rodata strings, mmap'd files, pre-allocated pools)
     pub fn submit_send_zc_buf(self: *TaskPool, task: @&Task, buf_sv: Span<u8>) -> bool
-        let buf: *u8 = buf_sv.ptr
-        let len: i32 = buf_sv.len as i32
         let sqe: *IoUringSqe = match self.ring.get_sqe()
             Some(p) => p
             None => return false
 
-        sqe.prep_send_zc(task.fd, buf, len as u64, 0, task.id)
+        sqe.prep_send_zc(task.fd, buf_sv, 0, task.id)
         self.ring.sqe_submit()
         task.state = TASK_WAITING
         return true
@@ -480,9 +474,9 @@ impl TaskPool
                 break
 
             # Wait for at least one completion
-            let wait_ret = self.ring.submit_and_wait(1)
-            if wait_ret < 0
-                return wait_ret
+            match self.ring.submit_and_wait(1)
+                Ok(_) => pass
+                Err(e) => return -e.code()
 
             # Process all available CQEs
             loop
@@ -643,7 +637,7 @@ impl TaskServer
             Some(p) => p
             None => return false
 
-        sqe.prep_accept(self.listen_fd, null, null, 0, self.accept_user_data)
+        sqe.prep_accept(self.listen_fd, 0, self.accept_user_data)
         self.ring.sqe_submit()  # Advance the SQ tail
         return true
 
@@ -654,7 +648,7 @@ impl TaskServer
             Some(p) => p
             None => return false
 
-        sqe.prep_accept_multishot(self.listen_fd, null, null, 0, self.accept_user_data)
+        sqe.prep_accept_multishot(self.listen_fd, 0, self.accept_user_data)
         self.ring.sqe_submit()
         return true
 
@@ -744,9 +738,9 @@ impl TaskServer
             self.poll_tasks()
 
             # Submit any pending I/O and wait for completions
-            let wait_ret = self.ring.submit_and_wait(1)
-            if wait_ret < 0
-                return wait_ret
+            match self.ring.submit_and_wait(1)
+                Ok(_) => pass
+                Err(e) => return -e.code()
 
             # Process all CQEs
             loop
@@ -802,9 +796,9 @@ impl TaskServer
             self.poll_tasks()
 
             # Submit any pending I/O and wait for completions
-            let wait_ret = self.ring.submit_and_wait(1)
-            if wait_ret < 0
-                return wait_ret
+            match self.ring.submit_and_wait(1)
+                Ok(_) => pass
+                Err(e) => return -e.code()
 
             # Process all CQEs
             loop

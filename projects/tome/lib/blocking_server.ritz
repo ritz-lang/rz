@@ -18,6 +18,9 @@ import ritzlib.str
 import ritzlib.string
 import ritzlib.strview
 import ritzlib.sys
+import ritzlib.fd
+import ritzlib.span
+import ritzlib.result
 import ritzlib.io
 import ritzlib.fmt
 import ritzlib.async_net
@@ -53,7 +56,6 @@ pub fn blocking_server_set_password(password: *u8)
 # a command split across reads waits for its tail (AGAST #2457).
 # Returns 0 on clean close, negative on error.
 
-const BLK_EINTR: i64 = -4
 
 
 fn handle_client(client_fd: i32) -> i32
@@ -61,6 +63,8 @@ fn handle_client(client_fd: i32) -> i32
     if s == null
         return -12  # ENOMEM
 
+    # The connection is the caller's: it closes it after this returns.
+    let conn: Fd = fd_borrow(client_fd)
     var ret: i64 = 0
     loop
         session_process(s)
@@ -69,24 +73,27 @@ fn handle_client(client_fd: i32) -> i32
         # filled, unread commands are still waiting in the input.
         let pending: i64 = session_pending_len(s)
         if pending > 0
-            let sent: i64 = sys_write(client_fd, session_pending_ptr(s), pending)
-            if sent == BLK_EINTR
-                continue
-            if sent < 0
-                ret = sent
-                break
+            # Fd.write retries EINTR itself.
+            var sent: i64 = 0
+            match conn.write(Span<u8> { ptr: session_pending_ptr(s), len: pending })
+                Ok(n) => sent = n
+                Err(e) =>
+                    ret = -(e.code() as i64)
+                    break
             session_sent(s, sent)
             continue
 
         if session_should_close(s) != 0
             break
 
-        let n: i64 = sys_read(client_fd, session_recv_ptr(s), session_recv_room(s))
-        if n == BLK_EINTR
-            continue
-        if n <= 0
-            ret = n  # 0 = client closed
-            break
+        var n: i64 = 0
+        match conn.read(Span<u8> { ptr: session_recv_ptr(s), len: session_recv_room(s) })
+            Ok(got) => n = got
+            Err(e) =>
+                ret = -(e.code() as i64)
+                break
+        if n == 0
+            break  # client closed
         session_received(s, n)
 
     session_free(s)
@@ -120,15 +127,16 @@ pub fn blocking_server_init(srv: @&BlockingTomeServer, port: i32) -> i32
     set_reuseport(fd)
 
     # Bind
+    var listener: Fd = fd_adopt(fd)
     let bind_ret: i32 = tcp_bind(fd, 0, port)
     if bind_ret < 0
-        sys_close(fd)
+        listener.close()
         return bind_ret
 
     # Listen
     let listen_ret: i32 = tcp_listen(fd, 128)
     if listen_ret < 0
-        sys_close(fd)
+        listener.close()
         return listen_ret
 
     srv.listen_fd = fd
@@ -153,7 +161,8 @@ pub fn blocking_server_run(srv: @BlockingTomeServer) -> i32
         handle_client(client_fd)
 
         # Close client connection
-        sys_close(client_fd)
+        var client: Fd = fd_adopt(client_fd)
+        client.close()
 
     return 0
 
@@ -163,4 +172,5 @@ pub fn blocking_server_stop(srv: @BlockingTomeServer)
 
 
 pub fn blocking_server_destroy(srv: @BlockingTomeServer)
-    sys_close(srv.listen_fd)
+    var listener: Fd = fd_adopt(srv.listen_fd)
+    listener.close()

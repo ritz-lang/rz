@@ -4,6 +4,8 @@
 # ritzlib's io_uring bindings.
 
 import ritzlib.uring
+import ritzlib.result
+import ritzlib.net
 import ritzlib.span
 import ritzlib.sys
 import lib.types
@@ -105,7 +107,7 @@ pub fn async_submit_read(ring: *IoUring, conn: *AsyncHttpConn) -> i32
     let buf_remaining: i32 = DEFAULT_READ_BUF_SIZE - conn.read_len
     let user_data: i64 = OP_TAG_READ | (conn.fd as i64)
 
-    sqe.prep_read(conn.fd, buf_ptr, buf_remaining, 0, user_data)
+    sqe.prep_read(conn.fd, Span<u8> { ptr: buf_ptr, len: buf_remaining as i64 }, 0, user_data)
     ring.sqe_submit()
     conn.state = CONN_STATE_READING
 
@@ -124,32 +126,34 @@ pub fn async_submit_write(ring: *IoUring, conn: *AsyncHttpConn) -> i32
     let bytes_to_write: i32 = conn.write_len - conn.write_pos
     let user_data: i64 = OP_TAG_WRITE | (conn.fd as i64)
 
-    sqe.prep_write(conn.fd, buf_ptr, bytes_to_write, 0, user_data)
+    sqe.prep_write(conn.fd, Span<u8> { ptr: buf_ptr, len: bytes_to_write as i64 }, 0, user_data)
     ring.sqe_submit()
     conn.state = CONN_STATE_WRITING
 
     return ASYNC_OK
 
-# Submit an accept request
-pub fn async_submit_accept(ring: *IoUring, listen_fd: i32, addr: *u8, addr_len: *i32) -> i32
+# Submit an accept request; the kernel writes the peer's address into `peer`,
+# which must stay valid until the completion.
+pub fn async_submit_accept(ring: *IoUring, listen_fd: i32, peer: @&SockAddrStorage) -> i32
     let sqe: *IoUringSqe = match ring.get_sqe()
         Some(p) => p
         None => return ASYNC_ERR_RING_FULL
 
     let user_data: i64 = OP_TAG_ACCEPT | (listen_fd as i64)
-    sqe.prep_accept(listen_fd, addr, addr_len, 0, user_data)
+    sqe.prep_accept_from(listen_fd, peer, 0, user_data)
     ring.sqe_submit()
 
     return ASYNC_OK
 
-# Submit a connect request
-pub fn async_submit_connect(ring: *IoUring, fd: i32, addr: *u8, addr_len: i32) -> i32
+# Submit a connect request to `addr`, which must stay valid until the
+# completion.
+pub fn async_submit_connect(ring: *IoUring, fd: i32, addr: @SockAddrStorage) -> i32
     let sqe: *IoUringSqe = match ring.get_sqe()
         Some(p) => p
         None => return ASYNC_ERR_RING_FULL
 
     let user_data: i64 = OP_TAG_CONNECT | (fd as i64)
-    sqe.prep_connect(fd, addr, addr_len, user_data)
+    sqe.prep_connect(fd, addr, user_data)
     ring.sqe_submit()
 
     return ASYNC_OK
@@ -320,10 +324,10 @@ pub fn async_process_completions(ring: *IoUring, conns: *AsyncHttpConn, max_conn
 # ============================================================================
 
 # Submit all pending SQEs and wait for at least min_complete completions
-pub fn async_submit_and_wait(ring: *IoUring, min_complete: i32) -> i32
+pub fn async_submit_and_wait(ring: *IoUring, min_complete: i32) -> Result<i32, Errno>
     return ring.submit_and_wait(min_complete)
 
 # Submit all pending SQEs (non-blocking)
-pub fn async_submit(ring: *IoUring) -> i32
+pub fn async_submit(ring: *IoUring) -> Result<i32, Errno>
     return ring.submit()
 

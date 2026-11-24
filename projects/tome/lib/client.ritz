@@ -4,6 +4,9 @@
 # Handles connection, command encoding, and response parsing.
 
 import ritzlib.sys
+import ritzlib.fd
+import ritzlib.span
+import ritzlib.result
 import ritzlib.io
 import ritzlib.fmt
 import ritzlib.str
@@ -20,7 +23,7 @@ import tome.resp
 # ============================================================================
 
 struct TomeClient
-    fd: i32             # Socket file descriptor
+    fd: Fd              # The connection (closed: raw -1)
     connected: i32      # Connection status
     read_buf: [8192]u8  # Buffer for receiving responses
     read_len: i32       # Bytes in read buffer
@@ -29,7 +32,7 @@ struct TomeClient
 # Initialize client (not connected yet)
 pub fn client_new() -> TomeClient
     var c: TomeClient
-    c.fd = -1
+    c.fd = fd_adopt(-1)
     c.connected = 0
     c.read_len = 0
     return c
@@ -83,12 +86,13 @@ pub fn client_connect(c: *TomeClient, host: i32, port: i32) -> i32
         return fd
 
     # Connect to server
+    var conn: Fd = fd_adopt(fd)
     let ret: i32 = tcp_connect(fd, host, port)
     if ret < 0
-        sys_close(fd)
+        conn.close()
         return ret
 
-    c.fd = fd
+    c.fd = conn
     c.connected = 1
     c.read_len = 0
     return 0
@@ -96,9 +100,7 @@ pub fn client_connect(c: *TomeClient, host: i32, port: i32) -> i32
 
 # Disconnect from server
 pub fn client_disconnect(c: *TomeClient)
-    if c.fd >= 0
-        sys_close(c.fd)
-        c.fd = -1
+    c.fd.close()
     c.connected = 0
 
 
@@ -116,8 +118,10 @@ pub fn client_is_connected(c: *TomeClient) -> i32
 pub fn client_send_raw(c: *TomeClient, data: *u8, len: i64) -> i64
     if c.connected == 0
         return -1
-    # Using sys_write instead of sys_send for WSL compatibility
-    return sys_write(c.fd, data, len)
+    # write(2), not send(2), for WSL compatibility
+    match c.fd.write(Span<u8> { ptr: data, len: len })
+        Ok(n) => n
+        Err(e) => -(e.code() as i64)
 
 
 # Send a simple command with no arguments (e.g., PING)
@@ -191,8 +195,11 @@ pub fn client_recv(c: *TomeClient) -> i32
     if c.connected == 0
         return -1
 
-    # Using sys_read instead of sys_recv for WSL compatibility
-    let ret: i64 = sys_read(c.fd, @c.read_buf[0], 8192)
+    # read(2), not recv(2), for WSL compatibility
+    var ret: i64 = 0
+    match c.fd.read(Span<u8> { ptr: @c.read_buf[0], len: 8192 })
+        Ok(n) => ret = n
+        Err(e) => ret = -(e.code() as i64)
     if ret <= 0
         c.connected = 0
         return ret as i32
