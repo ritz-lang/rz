@@ -219,11 +219,14 @@ pub fn deflate_stream_write(s: *DeflateStream, data: *u8, len: i64, out: *u8, ou
                     if chain_count >= max_chain
                         break
 
-                    # Calculate distance in the window
+                    # Calculate distance in the window. At distance
+                    # WINDOW_SIZE the candidate's slot is the one the current
+                    # byte just overwrote, so the ring no longer holds it
+                    # (AGAST #4611): stop one short.
                     let dist: i64 = s.window_pos - chain_pos as i64
                     if dist <= 0
                         break
-                    if dist > DSTREAM_WINDOW_SIZE as i64
+                    if dist >= DSTREAM_WINDOW_SIZE as i64
                         break
 
                     # Check match length
@@ -233,11 +236,19 @@ pub fn deflate_stream_write(s: *DeflateStream, data: *u8, len: i64, out: *u8, ou
                     if max_len < DSTREAM_MAX_MATCH as i64
                         max_match_len = max_len as i32
 
-                    # Compares past window_pos read unwritten window bytes:
-                    # AGAST #4611.
+                    # Compare only bytes that are really in the window
+                    # (AGAST #4611). Source bytes before window_pos are in
+                    # the ring; window_pos itself and on (an overlapping
+                    # match, dist < length) are this input, still unwritten
+                    # there: the decoder copies byte by byte, so the source
+                    # byte dist back is data[pos + match_len - dist].
                     while match_len < max_match_len
-                        let win_match_idx: i32 = (chain_pos + match_len) & DSTREAM_WINDOW_MASK
-                        if s.window[win_match_idx] != data[pos + match_len as i64]
+                        var src_byte: u8 = 0
+                        if match_len as i64 < dist
+                            src_byte = s.window[(chain_pos + match_len) & DSTREAM_WINDOW_MASK]
+                        else
+                            src_byte = data[pos + match_len as i64 - dist]
+                        if src_byte != data[pos + match_len as i64]
                             break
                         match_len = match_len + 1
 

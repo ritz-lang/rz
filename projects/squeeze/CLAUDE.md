@@ -33,6 +33,7 @@ squeeze/
 │   ├── test_crc32_simd.ritz
 │   ├── test_crossval.ritz  # Cross-validation against system gzip/zlib
 │   ├── test_deflate.ritz
+│   ├── test_deflate_stream_window.ritz  # Stream match search reads only written window bytes
 │   ├── test_fixed_huffman_pin.ritz  # Byte-identity pins for every fixed-Huffman writer
 │   ├── test_gzip.ritz
 │   ├── test_gzip_stream.ritz
@@ -59,7 +60,7 @@ file documented both. squeeze is `test_only = true` with no `[[bin]]`, so
 Run from the **monorepo root**. `rz` sets `RITZ_PATH` itself.
 
 ```bash
-# Run all tests — 16 .ritz test files, 209 [[test]] functions.
+# Run all tests — 17 .ritz test files, 213 [[test]] functions.
 # Takes several minutes; budget for it.
 ./rz test squeeze
 ```

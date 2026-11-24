@@ -36,7 +36,7 @@ Squeeze is a pure Ritz implementation with no C dependencies, targeting both cor
 # reports "nothing to build" — that is the correct, successful outcome.
 ./rz build squeeze
 
-# Run the test suite (209 [[test]] functions; takes several minutes)
+# Run the test suite (213 [[test]] functions; takes several minutes)
 ./rz test squeeze
 ```
 
