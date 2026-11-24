@@ -26,7 +26,6 @@
 
 import ritzlib.sys
 import ritzlib.fmt
-import ritzlib.str
 import ritzlib.gvec
 import ritzlib.span
 import ritzlib.option
@@ -70,6 +69,8 @@ struct Value
     env_idx: i32
     # For builtins
     builtin_id: i32
+    # Length of the symbol name in sym
+    sym_len: i32
 
 # Value heap (LispHeap: ritzlib.memory now owns the name Heap)
 struct LispHeap
@@ -78,7 +79,7 @@ struct LispHeap
     cap: i32
 
 fn lisp_heap_init(h: *LispHeap, cap: i32) -> i32
-    let size: i64 = cap as i64 * 152  # sizeof(Value) approx
+    let size: i64 = cap as i64 * sizeof(Value)
     let ptr: i64 = sys_mmap(0, size, 3, 34, -1, 0)
     if ptr < 0
         return -1
@@ -103,6 +104,14 @@ fn heap_get(h: *LispHeap, idx: i32) -> *Value
 fn value_sym_ptr(v: *Value) -> *u8
     return (v as *u8) + 16  # offset of sym field
 
+fn value_sym(v: *Value) -> StrView
+    StrView { ptr: value_sym_ptr(v), len: v.sym_len as i64 }
+
+# Copy `name` into a [64]u8 symbol field, truncated to fit; the bytes copied.
+fn copy_name(dst: *u8, name: StrView) -> i32
+    var out = Span<u8> { ptr: dst, len: MAX_SYMBOL_LEN - 1 }
+    out.copy_from(Span<u8> { ptr: name.ptr, len: name.len }) as i32
+
 # ============================================================================
 # Environment (bindings)
 # ============================================================================
@@ -110,6 +119,7 @@ fn value_sym_ptr(v: *Value) -> *u8
 struct Binding
     name: [64]u8
     value_idx: i32
+    name_len: i32
 
 struct Env
     bindings: *Binding
@@ -127,12 +137,14 @@ fn env_init(e: *Env, bindings: *Binding, cap: i32) -> i32
 fn binding_name_ptr(b: *Binding) -> *u8
     return b as *u8
 
-fn env_set(e: *Env, name: *u8, value_idx: i32) -> i32
+fn binding_name(b: *Binding) -> StrView
+    StrView { ptr: binding_name_ptr(b), len: b.name_len as i64 }
+
+fn env_set(e: *Env, name: StrView, value_idx: i32) -> i32
     # Check if already exists
     for i in 0..e.count
         let b: *Binding = e.bindings + i
-        let b_name: *u8 = binding_name_ptr(b)
-        if streq(b_name, name)
+        if binding_name(b).eq(name)
             b.value_idx = value_idx
             return 0
 
@@ -140,17 +152,15 @@ fn env_set(e: *Env, name: *u8, value_idx: i32) -> i32
     if e.count >= e.cap
         return -1
     let b: *Binding = e.bindings + e.count
-    let b_name: *u8 = binding_name_ptr(b)
-    strcpy(b_name, name)
+    b.name_len = copy_name(binding_name_ptr(b), name)
     b.value_idx = value_idx
     e.count = e.count + 1
     return 0
 
-fn env_get(e: *Env, name: *u8) -> i32
+fn env_get(e: *Env, name: StrView) -> i32
     for i in 0..e.count
         let b: *Binding = e.bindings + i
-        let b_name: *u8 = binding_name_ptr(b)
-        if streq(b_name, name)
+        if binding_name(b).eq(name)
             return b.value_idx
     return -1
 
@@ -185,12 +195,11 @@ fn make_number(s: *LispState, n: i64) -> i32
     v.num = n
     return idx
 
-fn make_symbol(s: *LispState, name: *u8) -> i32
+fn make_symbol(s: *LispState, name: StrView) -> i32
     let idx: i32 = lisp_alloc(@s.values)
     let v: *Value = heap_get(@s.values, idx)
     v.vtype = TYPE_SYMBOL
-    let sym_ptr: *u8 = value_sym_ptr(v)
-    strcpy(sym_ptr, name)
+    v.sym_len = copy_name(value_sym_ptr(v), name)
     return idx
 
 fn make_cons(s: *LispState, car: i32, cdr: i32) -> i32
@@ -302,9 +311,8 @@ fn parse_symbol(p: *Parser) -> i32
             break
         buf[len] = advance(p)
         len += 1
-    buf[len] = 0
 
-    return make_symbol(p.state, @buf[0])
+    return make_symbol(p.state, StrView { ptr: @buf[0], len: len })
 
 fn parse_list(p: *Parser) -> i32
     advance(p)  # skip '('
@@ -353,7 +361,7 @@ fn parse_expr(p: *Parser) -> i32
     if c == '\''  # '\'' (quote)
         advance(p)
         let quoted: i32 = parse_expr(p)
-        let quote_sym: i32 = make_symbol(p.state, c"quote")
+        let quote_sym: i32 = make_symbol(p.state, "quote")
         let inner: i32 = make_cons(p.state, quoted, p.state.nil_idx)
         return make_cons(p.state, quote_sym, inner)
 
@@ -491,8 +499,7 @@ fn eval_expr(s: *LispState, idx: i32) -> i32
         return idx
 
     if v.vtype == TYPE_SYMBOL
-        let sym_ptr: *u8 = value_sym_ptr(v)
-        let bound: i32 = env_get(@s.env, sym_ptr)
+        let bound: i32 = env_get(@s.env, value_sym(v))
         if bound >= 0
             return bound
         return s.nil_idx
@@ -507,14 +514,14 @@ fn eval_expr(s: *LispState, idx: i32) -> i32
     # Check for special forms
     let fn_val: *Value = heap_get(@s.values, fn_expr)
     if fn_val.vtype == TYPE_SYMBOL
-        let sym_ptr: *u8 = value_sym_ptr(fn_val)
+        let sym: StrView = value_sym(fn_val)
 
         # (quote x)
-        if streq(sym_ptr, c"quote")
+        if sym.eq("quote")
             return car(s, args)
 
         # (if cond then else)
-        if streq(sym_ptr, c"if")
+        if sym.eq("if")
             let cond: i32 = eval_expr(s, car(s, args))
             if is_true(s, cond) != 0
                 return eval_expr(s, car(s, cdr(s, args)))
@@ -522,16 +529,15 @@ fn eval_expr(s: *LispState, idx: i32) -> i32
                 return eval_expr(s, car(s, cdr(s, cdr(s, args))))
 
         # (define name value)
-        if streq(sym_ptr, c"define")
+        if sym.eq("define")
             let name_idx: i32 = car(s, args)
             let name_val: *Value = heap_get(@s.values, name_idx)
-            let name_ptr: *u8 = value_sym_ptr(name_val)
             let val: i32 = eval_expr(s, car(s, cdr(s, args)))
-            env_set(@s.env, name_ptr, val)
+            env_set(@s.env, value_sym(name_val), val)
             return val
 
         # (lambda (args) body)
-        if streq(sym_ptr, c"lambda")
+        if sym.eq("lambda")
             let params: i32 = car(s, args)
             let body: i32 = car(s, cdr(s, args))
             return make_lambda(s, params, body)
@@ -590,8 +596,8 @@ fn print_value(s: *LispState, idx: i32) -> i32
         return 0
 
     if v.vtype == TYPE_SYMBOL
-        let sym_ptr: *u8 = value_sym_ptr(v)
-        print("{sym_ptr}")
+        let sym: StrView = value_sym(v)
+        print("{sym}")
         return 0
 
     if v.vtype == TYPE_CONS
@@ -627,18 +633,18 @@ fn print_value(s: *LispState, idx: i32) -> i32
 # ============================================================================
 
 fn setup_builtins(s: *LispState) -> i32
-    env_set(@s.env, c"+", make_builtin(s, BUILTIN_PLUS))
-    env_set(@s.env, c"-", make_builtin(s, BUILTIN_MINUS))
-    env_set(@s.env, c"*", make_builtin(s, BUILTIN_MULT))
-    env_set(@s.env, c"/", make_builtin(s, BUILTIN_DIV))
-    env_set(@s.env, c"=", make_builtin(s, BUILTIN_EQ))
-    env_set(@s.env, c"<", make_builtin(s, BUILTIN_LT))
-    env_set(@s.env, c">", make_builtin(s, BUILTIN_GT))
-    env_set(@s.env, c"car", make_builtin(s, BUILTIN_CAR))
-    env_set(@s.env, c"cdr", make_builtin(s, BUILTIN_CDR))
-    env_set(@s.env, c"cons", make_builtin(s, BUILTIN_CONS))
-    env_set(@s.env, c"null?", make_builtin(s, BUILTIN_NULLP))
-    env_set(@s.env, c"number?", make_builtin(s, BUILTIN_NUMBERP))
+    env_set(@s.env, "+", make_builtin(s, BUILTIN_PLUS))
+    env_set(@s.env, "-", make_builtin(s, BUILTIN_MINUS))
+    env_set(@s.env, "*", make_builtin(s, BUILTIN_MULT))
+    env_set(@s.env, "/", make_builtin(s, BUILTIN_DIV))
+    env_set(@s.env, "=", make_builtin(s, BUILTIN_EQ))
+    env_set(@s.env, "<", make_builtin(s, BUILTIN_LT))
+    env_set(@s.env, ">", make_builtin(s, BUILTIN_GT))
+    env_set(@s.env, "car", make_builtin(s, BUILTIN_CAR))
+    env_set(@s.env, "cdr", make_builtin(s, BUILTIN_CDR))
+    env_set(@s.env, "cons", make_builtin(s, BUILTIN_CONS))
+    env_set(@s.env, "null?", make_builtin(s, BUILTIN_NULLP))
+    env_set(@s.env, "number?", make_builtin(s, BUILTIN_NUMBERP))
     return 0
 
 # ============================================================================
@@ -709,7 +715,7 @@ fn lisp(file: Option<StrView>) -> i32
         return 1
 
     # Allocate bindings
-    let bind_size: i64 = MAX_ENV_BINDINGS as i64 * 72
+    let bind_size: i64 = MAX_ENV_BINDINGS as i64 * sizeof(Binding)
     let bind_ptr: i64 = sys_mmap(0, bind_size, 3, 34, -1, 0)
     if bind_ptr < 0
         eprint("lisp: failed to allocate env\n")

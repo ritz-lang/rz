@@ -20,7 +20,6 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
 import ritzlib.strview
 import ritzlib.string
 import ritzlib.fs
@@ -32,7 +31,7 @@ import ritzlib.gvec
 import ritzlib.argspec
 
 # Diagnostic helper — see 24_cp.
-fn find_warn2(prefix: StrView, path: *u8, suffix: StrView)
+fn find_warn2(prefix: StrView, path: StrView, suffix: StrView)
     eprint("{prefix}{path}{suffix}\n")
 
 # ============================================================================
@@ -40,7 +39,8 @@ fn find_warn2(prefix: StrView, path: *u8, suffix: StrView)
 # ============================================================================
 
 struct FindOptions
-    name_pattern: *u8   # -name
+    name_pattern: StrView  # -name
+    has_name: bool
     type_filter: u8     # -type: 'f', 'd', 'l', or 0 for any
     maxdepth: i32       # -maxdepth, -1 for unlimited
 
@@ -48,27 +48,22 @@ struct FindOptions
 # Helpers
 # ============================================================================
 
-fn parse_int(s: *u8) -> i32
-    var val: i32 = 0
-    var i: i64 = 0
-    while *(s + i) != 0
-        let c: u8 = *(s + i)
-        if c < '0' or c > '9'
-            return val
-        val = val * 10 + (c - '0') as i32
-        i += 1
-    return val
+# Byte i of s, or 0 past its end.
+fn byte_at(s: StrView, i: i64) -> u8
+    if i < s.len
+        return s.get(i)
+    0
 
 # Simple glob match: * matches any sequence
-fn glob_match(pattern: *u8, text: *u8) -> i32
+fn glob_match(pattern: StrView, text: StrView) -> i32
     var pi: i64 = 0
     var ti: i64 = 0
     var star_pi: i64 = -1
     var star_ti: i64 = 0
 
-    while *(text + ti) != 0
-        let pc: u8 = *(pattern + pi)
-        let tc: u8 = *(text + ti)
+    while ti < text.len
+        let pc: u8 = byte_at(pattern, pi)
+        let tc: u8 = text.get(ti)
 
         if pc == '*'  # '*'
             star_pi = pi
@@ -86,10 +81,10 @@ fn glob_match(pattern: *u8, text: *u8) -> i32
             return 0
 
     # Check remaining pattern (only stars allowed)
-    while *(pattern + pi) == '*'
+    while byte_at(pattern, pi) == '*'
         pi += 1
 
-    return (*(pattern + pi) == 0) as i32
+    return (pi >= pattern.len) as i32
 
 fn get_file_type_char(mode: i32) -> u8
     let type_bits: i32 = mode / 4096
@@ -105,7 +100,7 @@ fn get_file_type_char(mode: i32) -> u8
 # Find function
 # ============================================================================
 
-fn matches_filter(path: *u8, d_type: u8, opts: *FindOptions) -> i32
+fn matches_filter(path: StrView, d_type: u8, opts: *FindOptions) -> i32
     # Check type filter
     if opts.type_filter != 0
         var type_char: u8 = 0
@@ -116,7 +111,7 @@ fn matches_filter(path: *u8, d_type: u8, opts: *FindOptions) -> i32
         else if d_type == DT_LNK
             type_char = 108  # 'l'
         else if d_type == DT_UNKNOWN  # need to stat
-            match lstat(strview_from_cstr(path))
+            match lstat(path)
                 Ok(st) => type_char = get_file_type_char(st.st_mode)
                 Err(_) => pass
 
@@ -124,23 +119,19 @@ fn matches_filter(path: *u8, d_type: u8, opts: *FindOptions) -> i32
             return 0
 
     # Check name pattern
-    if opts.name_pattern != null
-        # The basename of a C string ends at that string's NUL, so its .ptr
-        # is itself a C string.
-        let base: StrView = path_basename(strview_from_cstr(path))
-        let name: *u8 = base.ptr
-        if glob_match(opts.name_pattern, name) == 0
+    if opts.has_name
+        if glob_match(opts.name_pattern, path_basename(path)) == 0
             return 0
 
     return 1
 
-fn find_path(path: *u8, depth: i32, opts: *FindOptions)
+fn find_path(path: StrView, depth: i32, opts: *FindOptions)
     # Check maxdepth
     if opts.maxdepth >= 0 and depth > opts.maxdepth
         return
 
     var mode: i32 = 0
-    match lstat(strview_from_cstr(path))
+    match lstat(path)
         Ok(st) => mode = st.st_mode
         Err(_) =>
             find_warn2("find: '", path, "': No such file or directory")
@@ -165,17 +156,15 @@ fn find_path(path: *u8, depth: i32, opts: *FindOptions)
     if opts.maxdepth >= 0 and depth >= opts.maxdepth
         return
 
-    var dir: DirIter = match dir_open(strview_from_cstr(path))
+    var dir: DirIter = match dir_open(path)
         Ok(it) => it
         Err(_) => return
 
     while dir.next()
         let e: DirEntry = dir.entry()
-        let name: *u8 = e.name.ptr
-
-        if not streq(name, c".") and not streq(name, c"..")
-            var child: String = path_join(strview_from_cstr(path), e.name)
-            find_path(child.as_ptr(), depth + 1, opts)
+        if not e.name.eq(".") and not e.name.eq("..")
+            var child: String = path_join(path, e.name)
+            find_path(child.as_view(), depth + 1, opts)
 
     dir.close()
 
@@ -196,12 +185,6 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Positional i as a C string.  A positional is always a whole argv entry, so
-# its view ends at argv's NUL and .ptr is a valid C string.
-fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
-    let v: StrView = pos.get(i)
-    v.ptr
-
 fn or_empty(o: Option<StrView>) -> StrView
     match o
         Some(s) => s
@@ -220,11 +203,11 @@ fn find_all(spec: @ArgSpec, p: @ParsedArgs) -> i32
     var opts: FindOptions
     opts.maxdepth = -1  # unlimited by default
 
-    # --name: a value from argv runs to argv's NUL, so .ptr is a C string.
-    opts.name_pattern = null
+    opts.name_pattern = strview_empty()
+    opts.has_name = false
     if p.is_set("name")
-        let pattern: StrView = or_empty(p.value("name"))
-        opts.name_pattern = pattern.ptr
+        opts.name_pattern = or_empty(p.value("name"))
+        opts.has_name = true
 
     # Type filter: first char of --type, or 0
     opts.type_filter = 0
@@ -242,10 +225,10 @@ fn find_all(spec: @ArgSpec, p: @ParsedArgs) -> i32
     # Process paths
     let pos = p.positionals()
     if pos.len == 0
-        find_path(c".", 0, @opts)
+        find_path(".", 0, @opts)
     else
         for i in 0..pos.len
-            find_path(positional_cstr(@pos, i), 0, @opts)
+            find_path(pos.get(i), 0, @opts)
 
     return 0
 

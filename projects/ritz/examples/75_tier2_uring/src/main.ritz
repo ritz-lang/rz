@@ -2,18 +2,16 @@
 # Tests: io_uring submit/complete cycle, multiple pending operations
 # Expected: Can handle multiple connections concurrently
 #
-# Simplified architecture with heap-allocated state:
+# Simplified architecture with fixed-size connection state:
 # - One io_uring ring handles all I/O
-# - Connection state tracked in heap-allocated array
+# - Connection state tracked in fixed-size arrays
 # - User data encodes slot and operation type
 
 import ritzlib.io
-import ritzlib.memory
 import ritzlib.async_net
 import ritzlib.uring
 import ritzlib.result
 import ritzlib.sys
-import ritzlib.str
 import ritzlib.strview
 import ritzlib.option
 import ritzlib.span
@@ -81,14 +79,15 @@ fn run_server(port: i32, max_handled: i32)
         srv.close()
         return
 
-    # Allocate connection tracking arrays (an Fd is one i32)
-    let conn_fds: *Fd = malloc((MAX_CONNS * 4) as u64) as *Fd
-    let conn_bufs: **u8 = malloc((MAX_CONNS * 8) as u64) as **u8
+    # Connection tracking: one Fd and one BUF_SIZE buffer per slot
+    var conn_fds: [16]Fd
+    var buf_mem: [65536]u8  # MAX_CONNS * BUF_SIZE
+    var conn_bufs: [16]*u8
 
     # Initialize to closed (free)
     for i in 0..MAX_CONNS
         conn_fds[i] = fd_adopt(-1)  # closed = free slot
-        conn_bufs[i] = malloc(BUF_SIZE as u64)
+        conn_bufs[i] = @buf_mem[(i * BUF_SIZE) as i64]
 
     var accept_pending: i32 = 0
     var active_conns: i32 = 0
@@ -199,10 +198,7 @@ fn run_server(port: i32, max_handled: i32)
 
     # Cleanup
     for i in 0..MAX_CONNS
-        free(conn_bufs[i])
         conn_fds[i].close()  # Ok and a no-op for a free slot
-    free(conn_fds as *u8)
-    free(conn_bufs as *u8)
 
     ring.cleanup()
     srv.close()

@@ -28,7 +28,6 @@
 
 import ritzlib.sys
 import ritzlib.fmt
-import ritzlib.str
 import ritzlib.gvec
 import ritzlib.span
 import ritzlib.option
@@ -59,6 +58,8 @@ struct TomlEntry
     key: [256]u8       # Full dotted key path
     value: [4096]u8    # String representation of value
     value_type: i32
+    key_len: i64
+    value_len: i64
 
 # Helper functions to get pointers to entry fields
 # (workaround for @entry.key[0] not being supported)
@@ -67,6 +68,17 @@ fn entry_key_ptr(entry: *TomlEntry) -> *u8
 
 fn entry_value_ptr(entry: *TomlEntry) -> *u8
     return (entry as *u8) + 256
+
+fn entry_key(entry: *TomlEntry) -> StrView
+    StrView { ptr: entry_key_ptr(entry), len: entry.key_len }
+
+fn entry_value(entry: *TomlEntry) -> StrView
+    StrView { ptr: entry_value_ptr(entry), len: entry.value_len }
+
+# Copy `src` to `dst`, at most `cap` bytes of it; the bytes copied.
+fn copy_into(dst: *u8, cap: i64, src: StrView) -> i64
+    var out = Span<u8> { ptr: dst, len: cap }
+    out.copy_from(Span<u8> { ptr: src.ptr, len: src.len })
 
 # ============================================================================
 # TOML Parser
@@ -86,7 +98,7 @@ struct TomlParser
     max_entries: i32
     # Error tracking
     error: i32
-    error_msg: *u8
+    error_msg: StrView
 
 # Get pointer to parser's section field (at offset 32: 8+8+8+4+4padding)
 fn parser_section_ptr(p: *TomlParser) -> *u8
@@ -104,7 +116,7 @@ fn parser_init(p: *TomlParser, data: *u8, len: i64, entries: *TomlEntry, max: i3
     p.entry_count = 0
     p.max_entries = max
     p.error = 0
-    p.error_msg = c""
+    p.error_msg = ""
     return 0
 
 fn peek(p: *TomlParser) -> u8
@@ -127,7 +139,7 @@ fn advance(p: *TomlParser) -> u8
         p.line = p.line + 1
     return c
 
-fn set_error(p: *TomlParser, msg: *u8) -> i32
+fn set_error(p: *TomlParser, msg: StrView) -> i32
     p.error = 1
     p.error_msg = msg
     return -1
@@ -326,16 +338,14 @@ fn parse_value(p: *TomlParser, out: *u8, max_len: i64, val_type: *i32) -> i64
     if c == 't'  # 't'
         if peek_at(p, 1) == 'r' and peek_at(p, 2) == 117 and peek_at(p, 3) == 'e'  # "rue"
             p.pos = p.pos + 4
-            strcpy(out, c"true")
             *val_type = TOML_BOOL
-            return 4
+            return copy_into(out, max_len, "true")
 
     if c == 'f'  # 'f'
         if peek_at(p, 1) == 'a' and peek_at(p, 2) == 108 and peek_at(p, 3) == 115 and peek_at(p, 4) == 'e'  # "alse"
             p.pos = p.pos + 5
-            strcpy(out, c"false")
             *val_type = TOML_BOOL
-            return 5
+            return copy_into(out, max_len, "false")
 
     # Number
     if c == '+' or c == '-' or (c >= '0' and c <= '9')  # + - 0-9
@@ -367,9 +377,9 @@ fn parse_value(p: *TomlParser, out: *u8, max_len: i64, val_type: *i32) -> i64
 # Entry management
 # ============================================================================
 
-fn add_entry(p: *TomlParser, key: *u8, value: *u8, val_type: i32) -> i32
+fn add_entry(p: *TomlParser, key: StrView, value: StrView, val_type: i32) -> i32
     if p.entry_count >= p.max_entries
-        return set_error(p, c"too many entries")
+        return set_error(p, "too many entries")
 
     let entry: *TomlEntry = p.entries + p.entry_count
     let entry_key: *u8 = entry_key_ptr(entry)
@@ -377,14 +387,14 @@ fn add_entry(p: *TomlParser, key: *u8, value: *u8, val_type: i32) -> i32
     let sec_ptr: *u8 = parser_section_ptr(p)
 
     # Build full key path
+    var klen: i64 = 0
     if p.section_len > 0
-        strcpy(entry_key, sec_ptr)
-        strcpy(entry_key + p.section_len, c".")
-        strcpy(entry_key + p.section_len + 1, key)
-    else
-        strcpy(entry_key, key)
+        klen = copy_into(entry_key, MAX_KEY_LEN, StrView { ptr: sec_ptr, len: p.section_len })
+        klen += copy_into(entry_key + klen, MAX_KEY_LEN - klen, ".")
+    klen += copy_into(entry_key + klen, MAX_KEY_LEN - klen, key)
+    entry.key_len = klen
 
-    strcpy(entry_val, value)
+    entry.value_len = copy_into(entry_val, MAX_VALUE_LEN, value)
     entry.value_type = val_type
 
     p.entry_count = p.entry_count + 1
@@ -422,18 +432,18 @@ fn parse_keyval(p: *TomlParser) -> i32
     var key_buf: [256]u8
     let key_len: i64 = parse_key(p, @key_buf[0], 256)
     if key_len == 0
-        return set_error(p, c"expected key")
+        return set_error(p, "expected key")
 
     skip_whitespace(p)
     if peek(p) != 61  # '='
-        return set_error(p, c"expected '='")
+        return set_error(p, "expected '='")
     advance(p)
 
     var value_buf: [4096]u8
     var val_type: i32 = TOML_STRING
     let val_len: i64 = parse_value(p, @value_buf[0], 4096, @val_type)
 
-    add_entry(p, @key_buf[0], @value_buf[0], val_type)
+    add_entry(p, StrView { ptr: @key_buf[0], len: key_len }, StrView { ptr: @value_buf[0], len: val_len }, val_type)
     return 0
 
 fn parse_line(p: *TomlParser) -> i32
@@ -475,19 +485,18 @@ fn parse_document(p: *TomlParser) -> i32
 # Query and output
 # ============================================================================
 
-fn find_entry(entries: *TomlEntry, count: i32, key: *u8) -> *TomlEntry
+fn find_entry(entries: *TomlEntry, count: i32, key: StrView) -> *TomlEntry
     for i in 0..count
         let e: *TomlEntry = entries + i
-        let e_key: *u8 = entry_key_ptr(e)
-        if streq(e_key, key)
+        if entry_key(e).eq(key)
             return e
     return null
 
 fn print_entries(entries: *TomlEntry, count: i32) -> i32
     for i in 0..count
         let e: *TomlEntry = entries + i
-        let e_key: *u8 = entry_key_ptr(e)
-        let e_val: *u8 = entry_value_ptr(e)
+        let e_key: StrView = entry_key(e)
+        let e_val: StrView = entry_value(e)
         if e.value_type == TOML_STRING
             print("{e_key} = \"{e_val}\"\n")
         else
@@ -497,7 +506,7 @@ fn print_entries(entries: *TomlEntry, count: i32) -> i32
 fn print_keys(entries: *TomlEntry, count: i32) -> i32
     for i in 0..count
         let e: *TomlEntry = entries + i
-        let e_key: *u8 = entry_key_ptr(e)
+        let e_key: StrView = entry_key(e)
         print("{e_key}\n")
     return 0
 
@@ -553,12 +562,11 @@ fn flag_i32(b: bool) -> i32
         return 1
     0
 
-# An option's value as the C string the parser works on: a view of an argv
-# string or of a literal default, so NUL-terminated; null when not given.
-fn value_cstr(o: Option<StrView>) -> *u8
+# An option's value, or the empty view when not given.
+fn value_or_empty(o: Option<StrView>) -> StrView
     match o
-        Some(s) => s.as_cstr_unchecked()
-        None => null
+        Some(s) => s
+        None => ""
 
 # Read FILE, or stdin when there is none.  Returns 1 after reporting a failure.
 fn read_input(file: Option<StrView>, input: *Vec<u8>) -> i32
@@ -579,8 +587,8 @@ fn read_stdin_or_report(input: *Vec<u8>) -> i32
     0
 
 fn toml(p: @ParsedArgs) -> i32
-    # No -g is null; "-g ''" is an empty key, which (as before) lists entries.
-    let get_key: *u8 = value_cstr(p.value("g"))
+    # No -g, or "-g ''" (an empty key), lists entries.
+    let get_key: StrView = value_or_empty(p.value("g"))
     let list_keys: i32 = flag_i32(p.switch("k"))
     let validate_only: i32 = flag_i32(p.switch("v"))
 
@@ -590,19 +598,13 @@ fn toml(p: @ParsedArgs) -> i32
     if read_input(p.positional(0), @input) != 0
         return 1
 
-    input.push(0)  # null terminate
-
-    # Allocate entry storage
-    let entries_size: i64 = MAX_ENTRIES as i64 * 4360  # sizeof(TomlEntry) approx
-    let entries_ptr: i64 = sys_mmap(0, entries_size, 3, 34, -1, 0)
-    if entries_ptr < 0
-        eprint("toml: memory allocation failed\n")
-        return 1
-    let entries: *TomlEntry = entries_ptr as *TomlEntry
+    # Entry storage: the parser fills the capacity through `entries`.
+    var entry_store: Vec<TomlEntry> = vec_with_cap<TomlEntry>(MAX_ENTRIES as i64)
+    let entries: *TomlEntry = entry_store.data
 
     # Parse
     var parser: TomlParser
-    parser_init(@parser, input.data, input.len - 1, entries, MAX_ENTRIES)
+    parser_init(@parser, input.data, input.len, entries, MAX_ENTRIES)
 
     if parse_document(@parser) != 0
         # The line number has always gone to stdout and the rest to
@@ -610,25 +612,22 @@ fn toml(p: @ParsedArgs) -> i32
         eprint("toml: parse error at line ")
         print("{parser.line}")
         eprint(": {parser.error_msg}\n")
-        sys_munmap(entries_ptr, entries_size)
         return 1
 
     # Output
     if validate_only == 0
-        if get_key != null and *get_key != 0
+        if get_key.len > 0
             let entry: *TomlEntry = find_entry(entries, parser.entry_count, get_key)
             if entry == null
                 eprint("toml: key not found: {get_key}\n")
-                sys_munmap(entries_ptr, entries_size)
                 return 1
-            let entry_val: *u8 = entry_value_ptr(entry)
+            let entry_val: StrView = entry_value(entry)
             print("{entry_val}\n")
         else if list_keys != 0
             print_keys(entries, parser.entry_count)
         else
             print_entries(entries, parser.entry_count)
 
-    sys_munmap(entries_ptr, entries_size)
     # Drop is automatic via RAII
     return 0
 

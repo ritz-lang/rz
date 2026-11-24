@@ -22,15 +22,14 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
 import ritzlib.strview
+import ritzlib.cmp { Ordering }
 import ritzlib.result
 import ritzlib.fs
 import ritzlib.fd { Fd, fd_open }
 import ritzlib.string
 import ritzlib.option
 import ritzlib.span
-import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.gvec
 import ritzlib.argspec
 import ritzlib.fmt
@@ -58,7 +57,10 @@ fn put_byte(c: u8)
 # Print right-padded number (for column alignment)
 fn print_int_width(n: i64, width: i32)
     var buf: [20]u8
-    let len: i64 = format_int(n, @buf[0])
+    var w: Writer = span_writer(Span<u8> { ptr: @buf[0], len: 20 })
+    fmt_show_i64(n, @&w)
+    let digits: StrView = w.view()
+    let len: i64 = digits.len
 
     # Pad with spaces
     var spaces: i32 = width - len as i32
@@ -66,12 +68,7 @@ fn print_int_width(n: i64, width: i32)
         print(" ")
         spaces -= 1
 
-    prints(StrView { ptr: @buf[0], len: len })
-
-# Format a number into a buffer, returns length
-# Decimal of val into buf (>= 20 bytes); ritzlib.fmt (AGAST #4118).
-fn format_int(val: i64, buf: *u8) -> i64
-    return fmt_i64_into(buf, val)
+    prints(digits)
 
 # Format human-readable size (K, M, G) with width padding
 fn print_size_human_width(size: i64)
@@ -194,17 +191,20 @@ struct DirEntries
     names_len: i64
     names_cap: i64
 
+# The stored name of row e.
+fn entry_name(entries: *DirEntries, e: *LsEntry) -> StrView
+    StrView { ptr: entries.names + e.name_offset, len: e.name_len }
+
 fn sort_entries(entries: *DirEntries)
     # Simple insertion sort
     for i in 1..entries.count
         let entry: LsEntry = *(entries.entries + i)
-        let entry_name: *u8 = entries.names + entry.name_offset
+        let name: StrView = entry_name(entries, @entry)
 
         var j: i64 = i - 1
         while j >= 0
             let other: *LsEntry = entries.entries + j
-            let other_name: *u8 = entries.names + other.name_offset
-            if strcmp(entry_name, other_name) >= 0
+            if name.cmp(entry_name(entries, other)) != Ordering.Less
                 break
             # Shift entry right
             *(entries.entries + j + 1) = *other
@@ -217,7 +217,7 @@ fn sort_entries(entries: *DirEntries)
 # ============================================================================
 
 # `ls -l` row for an entry we could lstat: mode, links, size, name, suffix.
-fn print_long_entry(name: *u8, st: @Stat, opts: *LsOptions)
+fn print_long_entry(name: StrView, st: @Stat, opts: *LsOptions)
     print_mode(st.st_mode)
     print(" ")
 
@@ -245,17 +245,17 @@ fn print_long_entry(name: *u8, st: @Stat, opts: *LsOptions)
             print("@")
 
 # `ls -l` row for an entry whose lstat failed: just the name.
-fn print_unstatable_entry(name: *u8)
+fn print_unstatable_entry(name: StrView)
     print("?????????? ??? ???????? {name}")
 
-fn list_entry(dir: StrView, name: *u8, d_type: i32, opts: *LsOptions)
+fn list_entry(dir: StrView, name: StrView, d_type: i32, opts: *LsOptions)
     # Skip hidden files unless -a
-    if opts.show_all == 0 and *name == '.'  # '.'
+    if opts.show_all == 0 and name.starts_with(".")
         return
 
     if opts.long_list != 0
         # Build full path for stat
-        var path: String = path_join(dir, strview_from_cstr(name))
+        var path: String = path_join(dir, name)
 
         # Get file info
         var info: Result<Stat, Errno> = lstat(path.as_view())
@@ -340,8 +340,7 @@ fn list_directory(path: StrView, opts: *LsOptions, show_dirname: i32) -> i32
     # Print entries
     for i in 0..entries.count
         let e: *LsEntry = entries.entries + i
-        let name: *u8 = entries.names + e.name_offset
-        list_entry(path, name, e.d_type, opts)
+        list_entry(path, entry_name(@entries, e), e.d_type, opts)
 
     # Add final newline for multi-column mode
     if opts.long_list == 0 and opts.one_per_line == 0 and entries.count > 0

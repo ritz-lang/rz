@@ -27,7 +27,6 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
 import ritzlib.strview
 import ritzlib.string
 import ritzlib.option
@@ -39,7 +38,7 @@ import ritzlib.time { sleep_ms }
 
 # Diagnostic helper — see 24_cp.  Used for the many timeout error
 # messages that embed an argv-derived path/value.
-fn timeout_err2(prefix: StrView, path: *u8, suffix: StrView)
+fn timeout_err2(prefix: StrView, path: StrView, suffix: StrView)
     eprint("{prefix}{path}{suffix}\n")
 
 # ============================================================================
@@ -57,15 +56,15 @@ const EXIT_ENOENT: i32 = 127
 
 # Parse a duration string (e.g., "5", "0.5", "10.25")
 # Returns 0 on success, non-zero on error
-fn parse_duration(s: *u8, out_sec: *i64, out_nsec: *i64) -> i32
+fn parse_duration(s: StrView, out_sec: *i64, out_nsec: *i64) -> i32
     var sec: i64 = 0
     var nsec: i64 = 0
-    var i: i32 = 0
+    var i: i64 = 0
     var frac_digits: i32 = 0
     var in_frac: i32 = 0
 
-    while *(s + i) != 0
-        let c: u8 = *(s + i)
+    while i < s.len
+        let c: u8 = s.get(i)
 
         if c == '.'  # '.'
             if in_frac == 1
@@ -93,6 +92,21 @@ fn parse_duration(s: *u8, out_sec: *i64, out_nsec: *i64) -> i32
     *out_sec = sec
     *out_nsec = nsec
     return 0
+
+# Parse a signal spec (TERM, KILL, INT, HUP, optionally SIG-prefixed, or a
+# number). Returns 0 or less when it isn't one.
+fn parse_signal(sig: StrView) -> i32
+    if sig.eq("TERM") or sig.eq("SIGTERM")
+        return SIGTERM
+    if sig.eq("KILL") or sig.eq("SIGKILL")
+        return SIGKILL
+    if sig.eq("INT") or sig.eq("SIGINT")
+        return SIGINT
+    if sig.eq("HUP") or sig.eq("SIGHUP")
+        return SIGHUP
+    match sig.parse_i64()
+        Some(n) => n as i32
+        None => 0
 
 # ============================================================================
 # Command execution helpers
@@ -156,12 +170,11 @@ fn poll_child(pid: i32, sent_signal: i32) -> i32
 fn run_timeout(timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, kill_nsec: i64, use_kill: i32, signal: i32, cmd_args: Span<StrView>) -> i32
     # Find the command
     let cmd0: StrView = cmd_args[0]
-    let cmd_name: *u8 = cmd0.ptr
     var found: String = string_new()
     match find_command(cmd0)
         Some(path) => found = path
         None =>
-            timeout_err2("timeout: '", cmd_name, "': No such file or directory")
+            timeout_err2("timeout: '", cmd0, "': No such file or directory")
             return EXIT_ENOENT
     let cmd_path: *u8 = found.as_ptr()
 
@@ -229,15 +242,14 @@ pub fn main(args: Span<StrView>) -> i32
         return EXIT_CANCELED
 
     # Parse options manually to handle positional args properly
-    var timeout_str: *u8 = null
-    var kill_str: *u8 = null
+    var kill_str: StrView = strview_empty()
+    var have_kill: bool = false
     var signal: i32 = SIGTERM
     var cmd_start: i64 = 0
 
     var i: i64 = 1
     while i < args.len
         let argv_i: StrView = args[i]
-        let arg: *u8 = argv_i.ptr
 
         # Check for -k or --kill-after
         if argv_i.eq("-k")
@@ -245,13 +257,14 @@ pub fn main(args: Span<StrView>) -> i32
             if i >= args.len
                 eprint("timeout: option '-k' requires an argument\n")
                 return EXIT_CANCELED
-            let kill_v: StrView = args[i]
-            kill_str = kill_v.ptr
+            kill_str = args[i]
+            have_kill = true
             i += 1
             continue
 
-        if strneq(arg, c"--kill-after=", 13)
-            kill_str = arg + 13
+        if argv_i.starts_with("--kill-after=")
+            kill_str = argv_i.skip(13)
+            have_kill = true
             i += 1
             continue
 
@@ -262,39 +275,19 @@ pub fn main(args: Span<StrView>) -> i32
                 eprint("timeout: option '-s' requires an argument\n")
                 return EXIT_CANCELED
             let sig_v: StrView = args[i]
-            let sig_str: *u8 = sig_v.ptr
-            # Parse signal (support TERM, KILL, or number)
-            if sig_v.eq("TERM") or sig_v.eq("SIGTERM")
-                signal = SIGTERM
-            else if sig_v.eq("KILL") or sig_v.eq("SIGKILL")
-                signal = SIGKILL
-            else if sig_v.eq("INT") or sig_v.eq("SIGINT")
-                signal = SIGINT
-            else if sig_v.eq("HUP") or sig_v.eq("SIGHUP")
-                signal = SIGHUP
-            else
-                signal = atoi(sig_str) as i32
-                if signal <= 0
-                    timeout_err2("timeout: invalid signal '", sig_str, "'")
-                    return EXIT_CANCELED
+            signal = parse_signal(sig_v)
+            if signal <= 0
+                timeout_err2("timeout: invalid signal '", sig_v, "'")
+                return EXIT_CANCELED
             i += 1
             continue
 
-        if strneq(arg, c"--signal=", 9)
-            let sig_str: *u8 = arg + 9
-            if streq(sig_str, c"TERM") or streq(sig_str, c"SIGTERM")
-                signal = SIGTERM
-            else if streq(sig_str, c"KILL") or streq(sig_str, c"SIGKILL")
-                signal = SIGKILL
-            else if streq(sig_str, c"INT") or streq(sig_str, c"SIGINT")
-                signal = SIGINT
-            else if streq(sig_str, c"HUP") or streq(sig_str, c"SIGHUP")
-                signal = SIGHUP
-            else
-                signal = atoi(sig_str) as i32
-                if signal <= 0
-                    timeout_err2("timeout: invalid signal '", sig_str, "'")
-                    return EXIT_CANCELED
+        if argv_i.starts_with("--signal=")
+            let sig_str: StrView = argv_i.skip(9)
+            signal = parse_signal(sig_str)
+            if signal <= 0
+                timeout_err2("timeout: invalid signal '", sig_str, "'")
+                return EXIT_CANCELED
             i += 1
             continue
 
@@ -304,8 +297,8 @@ pub fn main(args: Span<StrView>) -> i32
             break
 
         # Check for other options starting with -
-        if *arg == '-' and *(arg + 1) != 0
-            timeout_err2("timeout: unrecognized option '", arg, "'")
+        if argv_i.starts_with("-") and argv_i.len > 1
+            timeout_err2("timeout: unrecognized option '", argv_i, "'")
             return EXIT_CANCELED
 
         # Not an option, this is the duration
@@ -316,8 +309,7 @@ pub fn main(args: Span<StrView>) -> i32
         eprint("timeout: missing operand\n")
         return EXIT_CANCELED
 
-    let timeout_v: StrView = args[i]
-    timeout_str = timeout_v.ptr
+    let timeout_str: StrView = args[i]
     i += 1
 
     if i >= args.len
@@ -337,7 +329,7 @@ pub fn main(args: Span<StrView>) -> i32
     var kill_sec: i64 = 0
     var kill_nsec: i64 = 0
     var use_kill: i32 = 0
-    if kill_str != null
+    if have_kill
         if parse_duration(kill_str, @kill_sec, @kill_nsec) != 0
             timeout_err2("timeout: invalid time interval '", kill_str, "'")
             return EXIT_CANCELED

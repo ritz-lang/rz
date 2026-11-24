@@ -3,17 +3,15 @@
 #
 # Architecture:
 # - One io_uring ring handles all I/O (accept, recv, send)
-# - Connection state tracked in heap-allocated arrays
+# - Connection state tracked in fixed-size arrays
 # - User data encodes slot and operation type
 # - HTTP/1.1 keep-alive: reuse connections for multiple requests
 
 import ritzlib.io
-import ritzlib.memory
 import ritzlib.async_net
 import ritzlib.uring
 import ritzlib.result
 import ritzlib.sys
-import ritzlib.str
 import ritzlib.strview
 import ritzlib.option
 import ritzlib.span
@@ -59,34 +57,22 @@ fn decode_op(user_data: i64) -> i64
 # Response templates
 # ============================================================================
 
-var RESPONSE_OK: [256]u8
-var RESPONSE_OK_KEEPALIVE: [256]u8
-var RESPONSE_NOT_FOUND: [256]u8
-var RESPONSE_OK_LEN: i32 = 0
-var RESPONSE_OK_KEEPALIVE_LEN: i32 = 0
-var RESPONSE_NOT_FOUND_LEN: i32 = 0
+fn response_ok() -> StrView
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
 
 
-fn copy_string(dest: *u8, src: *u8) -> i32
-    var len: i32 = 0
-    while *(src + len) != 0
-        *(dest + len) = *(src + len)
-        len += 1
-    return len
+fn response_ok_keepalive() -> StrView
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK"
 
 
-fn init_responses()
-    # Response for close connection
-    let close_resp = c"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
-    RESPONSE_OK_LEN = copy_string(@RESPONSE_OK[0], close_resp as *u8)
+fn response_not_found() -> StrView
+    "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found"
 
-    # Response for keep-alive connection
-    let keepalive_resp = c"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK"
-    RESPONSE_OK_KEEPALIVE_LEN = copy_string(@RESPONSE_OK_KEEPALIVE[0], keepalive_resp as *u8)
 
-    # 404 response
-    let not_found = c"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found"
-    RESPONSE_NOT_FOUND_LEN = copy_string(@RESPONSE_NOT_FOUND[0], not_found as *u8)
+# Per-connection receive and send buffers: BUF_SIZE bytes for each of the
+# MAX_CONNS slots, zeroed at load.
+var RECV_MEM: [1048576]u8  # MAX_CONNS * BUF_SIZE
+var SEND_MEM: [1048576]u8  # MAX_CONNS * BUF_SIZE
 
 
 # ============================================================================
@@ -156,11 +142,11 @@ fn parse_request(buf: *u8, len: i32, req: *ParsedRequest) -> i32
     return PARSE_INCOMPLETE
 
 
-fn match_path(buf: *u8, path_start: i32, path_len: i32, target: *u8, target_len: i32) -> i32
-    if path_len != target_len
+fn match_path(buf: *u8, path_start: i32, path_len: i32, target: StrView) -> i32
+    if path_len as i64 != target.len
         return 0
     for i in 0..path_len
-        if *(buf + path_start + i) != *(target + i)
+        if *(buf + path_start + i) != target.get(i as i64)
             return 0
     return 1
 
@@ -170,8 +156,6 @@ fn match_path(buf: *u8, path_start: i32, path_len: i32, target: *u8, target_len:
 # ============================================================================
 
 fn run_server(port: i32)
-    init_responses()
-
     var srv: Socket
     match socket_tcp()
         Ok(s) => srv = s
@@ -207,24 +191,21 @@ fn run_server(port: i32)
         srv.close()
         return
 
-    # Connection state arrays (an Fd is one i32; closed = free slot)
-    let conn_fds: *Fd = malloc((MAX_CONNS * 4) as u64) as *Fd
-    let conn_keep_alive: *i32 = malloc((MAX_CONNS * 4) as u64) as *i32
-    let recv_bufs: **u8 = malloc((MAX_CONNS * 8) as u64) as **u8
-    let send_bufs: **u8 = malloc((MAX_CONNS * 8) as u64) as **u8
+    # Connection state arrays (MAX_CONNS slots; closed Fd = free slot)
+    var conn_fds: [256]Fd
+    var conn_keep_alive: [256]i32
+    var recv_bufs: [256]*u8
+    var send_bufs: [256]*u8
 
     for i in 0..MAX_CONNS
         conn_fds[i] = fd_adopt(-1)
         conn_keep_alive[i] = 0
-        recv_bufs[i] = malloc(BUF_SIZE as u64)
-        memzero(recv_bufs[i], BUF_SIZE as i64)
-        send_bufs[i] = malloc(BUF_SIZE as u64)
-        memzero(send_bufs[i], BUF_SIZE as i64)
+        recv_bufs[i] = @RECV_MEM[(i * BUF_SIZE) as i64]
+        send_bufs[i] = @SEND_MEM[(i * BUF_SIZE) as i64]
 
     # Pre-allocate request/response buffers to avoid stack exhaustion in event loop
     var req: ParsedRequest
-    var resp_buf: *u8
-    var resp_len: i32
+    var resp: StrView = response_not_found()
     var keep_alive: i32
 
     # Submit initial accept
@@ -302,7 +283,7 @@ fn run_server(port: i32)
                     conn_fds[slot].close()
                     conn_keep_alive[slot] = 0
                 else
-                    # Parse request (req, resp_buf, resp_len, keep_alive pre-allocated outside loop)
+                    # Parse request (req, resp, keep_alive pre-allocated outside loop)
                     let parse_result = parse_request(recv_bufs[slot], result, @req)
 
                     # Reset response variables for this iteration
@@ -310,29 +291,26 @@ fn run_server(port: i32)
 
                     if parse_result == PARSE_OK
                         # Check route and set response
-                        if match_path(recv_bufs[slot], req.path_start, req.path_len, c"/health", 7) != 0
+                        if match_path(recv_bufs[slot], req.path_start, req.path_len, "/health") != 0
                             keep_alive = req.keep_alive
-                        else if match_path(recv_bufs[slot], req.path_start, req.path_len, c"/", 1) != 0
+                        else if match_path(recv_bufs[slot], req.path_start, req.path_len, "/") != 0
                             keep_alive = req.keep_alive
                         else
                             keep_alive = 0  # 404 always closes
 
                         if keep_alive != 0
-                            resp_buf = @RESPONSE_OK_KEEPALIVE[0]
-                            resp_len = RESPONSE_OK_KEEPALIVE_LEN
+                            resp = response_ok_keepalive()
                         else
-                            resp_buf = @RESPONSE_OK[0]
-                            resp_len = RESPONSE_OK_LEN
+                            resp = response_ok()
                     else
-                        resp_buf = @RESPONSE_NOT_FOUND[0]
-                        resp_len = RESPONSE_NOT_FOUND_LEN
+                        resp = response_not_found()
 
                     # Remember if we should keep alive
                     conn_keep_alive[slot] = keep_alive
 
                     # Copy response to send buffer
-                    for i in 0..resp_len
-                        *(send_bufs[slot] + i) = *(resp_buf + i)
+                    var send_buf: Span<u8> = Span<u8> { ptr: send_bufs[slot], len: BUF_SIZE as i64 }
+                    let resp_len: i64 = send_buf.copy_from(span_from_strview(resp))
 
                     # Submit send
                     var send_sqe: *IoUringSqe = null
@@ -342,7 +320,7 @@ fn run_server(port: i32)
                             # SQ full - close connection
                             conn_fds[slot].close()
                     if send_sqe != null
-                        send_sqe.prep_send(conn_fds[slot].raw(), Span<u8> { ptr: send_bufs[slot], len: resp_len as i64 }, 0, encode_user_data(slot, OP_SEND))
+                        send_sqe.prep_send(conn_fds[slot].raw(), Span<u8> { ptr: send_bufs[slot], len: resp_len }, 0, encode_user_data(slot, OP_SEND))
                         ring.sqe_submit()
 
             else if op == OP_SEND

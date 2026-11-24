@@ -7,47 +7,35 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.fmt
 import ritzlib.async.blocking_fs
-import ritzlib.str
+import ritzlib.string
 import ritzlib.strview
 import ritzlib.os.env
 import ritzlib.fd { Fd, fd_open, O_CREAT, O_WRONLY, O_TRUNC }
 import ritzlib.fs { unlink }
 
-# Build "$TMPDIR/<stem>_<pid>.txt" into buf (>= 512 bytes, so stem <= 64
-# bytes) and return it NUL-terminated, the path sys_open3/sys_unlink take;
-# TMPDIR unset, empty or overlong means /tmp.  Concurrent runs of this binary
-# -- two gates on one host, or two stages of one gate -- must never share a
-# file: with a fixed /tmp name one run's unlink landed between another's
-# write and read, and regression Stage 1 flaked (AGAST #4207).
-fn scratch_path(buf: *u8, stem: StrView) -> *u8
+# "$TMPDIR/<stem>_<pid>.txt"; TMPDIR unset, empty or overlong means /tmp.
+# Concurrent runs of this binary -- two gates on one host, or two stages of
+# one gate -- must never share a file: with a fixed /tmp name one run's
+# unlink landed between another's write and read, and regression Stage 1
+# flaked (AGAST #4207).  getpid stays raw: ritzlib has no wrapper for it.
+fn scratch_path(stem: StrView) -> String
     var dir: StrView = env_get_or("TMPDIR", "/tmp")
     if dir.len == 0 or dir.len > 400
         dir = "/tmp"
-    memcpy(buf, dir.ptr, dir.len)
-    var n: i64 = dir.len
-    *(buf + n) = 47  # '/'
-    n += 1
-    memcpy(buf + n, stem.ptr, stem.len)
-    n += stem.len
-    *(buf + n) = 95  # '_'
-    n += 1
-    *(buf + n) = 0
-    itoa(sys_getpid() as i64, buf + n)
-    strcat(buf, ".txt")
-    buf
-
-# Delete a scratch file (`path` is the NUL-terminated buffer scratch_path
-# built, which the async_* calls take as is).
-fn remove_scratch(path: *u8)
-    unlink(strview_from_cstr(path))
+    var path: String = String.from(dir)
+    path.push(47)  # '/'
+    path.push_str(stem)
+    path.push(95)  # '_'
+    path.push_i64(sys_getpid() as i64)
+    path.push_str(".txt")
+    path
 
 # Test 1: Async write and read back
 fn test_async_write_read() -> bool
     print("test_async_write_read... ")
 
-    var path_buf: [512]u8
-
-    let path: *u8 = scratch_path(@path_buf[0], "ritz_async_test")
+    let path_s: String = scratch_path("ritz_async_test")
+    let path: StrView = path_s.as_view()
 
     # Write data
     var write_buf: [32]u8
@@ -59,7 +47,7 @@ fn test_async_write_read() -> bool
     write_buf[5] = 33   # !
     write_buf[6] = 10   # \n
 
-    let written: i64 = match await async_write_file(strview_from_cstr(path), Span<u8> { ptr: (@write_buf[0]), len: (7) as i64 })
+    let written: i64 = match await async_write_file(path, Span<u8> { ptr: (@write_buf[0]), len: (7) as i64 })
         Ok(n) => n
         Err(e) => -(e.code() as i64)
     if written != 7
@@ -73,28 +61,28 @@ fn test_async_write_read() -> bool
         read_buf[i] = 0
         i += 1
 
-    let read_count: i64 = match await async_read_file(strview_from_cstr(path), Span<u8> { ptr: (@read_buf[0]), len: (32) as i64 })
+    let read_count: i64 = match await async_read_file(path, Span<u8> { ptr: (@read_buf[0]), len: (32) as i64 })
         Ok(n) => n
         Err(e) => -(e.code() as i64)
     if read_count != 7
         print("FAIL: read returned {read_count}\n")
-        remove_scratch(path)
+        unlink(path)
         return false
 
     # Verify content
     if read_buf[0] != 72 or read_buf[1] != 101 or read_buf[2] != 108
         print("FAIL: content mismatch\n")
-        remove_scratch(path)
+        unlink(path)
         return false
 
     # Cleanup
-    remove_scratch(path)
+    unlink(path)
     print("OK\n")
     return true
 
 # Test 2: Async open/read/close
-async fn read_small_file(path: *u8, buf: *u8) -> i64
-    let fd: i32 = match await async_open(strview_from_cstr(path), O_RDONLY)
+async fn read_small_file(path: StrView, buf: *u8) -> i64
+    let fd: i32 = match await async_open(path, O_RDONLY)
         Ok(f) => f
         Err(e) => return -(e.code() as i64)
     let n: i64 = await async_read(fd, Span<u8> { ptr: (buf), len: (100) as i64 })
@@ -105,9 +93,9 @@ fn test_async_open_read_close() -> bool
     print("test_async_open_read_close... ")
 
     # First create a test file
-    var path_buf: [512]u8
-    let path: *u8 = scratch_path(@path_buf[0], "ritz_async_test2")
-    var f: Fd = match fd_open(strview_from_cstr(path), O_CREAT | O_WRONLY | O_TRUNC, 420)
+    let path_s: String = scratch_path("ritz_async_test2")
+    let path: StrView = path_s.as_view()
+    var f: Fd = match fd_open(path, O_CREAT | O_WRONLY | O_TRUNC, 420)
         Ok(opened) => opened
         Err(_) =>
             print("FAIL: couldn't create test file\n")
@@ -131,22 +119,22 @@ fn test_async_open_read_close() -> bool
     let n: i64 = await read_small_file(path, @buf[0])
     if n != 4
         print("FAIL: expected 4 bytes, got {n}\n")
-        remove_scratch(path)
+        unlink(path)
         return false
 
     if buf[0] != 84 or buf[1] != 101 or buf[2] != 115 or buf[3] != 116
         print("FAIL: content mismatch\n")
-        remove_scratch(path)
+        unlink(path)
         return false
 
-    remove_scratch(path)
+    unlink(path)
     print("OK\n")
     return true
 
 # Test 3: Error handling - file not found
 # The errno of a failed open, 0 if it opened.
-async fn try_open_missing(path: *u8) -> i32
-    match await async_open(strview_from_cstr(path), O_RDONLY)
+async fn try_open_missing(path: StrView) -> i32
+    match await async_open(path, O_RDONLY)
         Ok(fd) =>
             await async_close(fd)
             0
@@ -156,8 +144,8 @@ fn test_async_error_handling() -> bool
     print("test_async_error_handling... ")
 
     # Never created: a per-run name, so no other run can make it exist.
-    var path_buf: [512]u8
-    let err: i32 = await try_open_missing(scratch_path(@path_buf[0], "ritz_async_missing"))
+    let path_s: String = scratch_path("ritz_async_missing")
+    let err: i32 = await try_open_missing(path_s.as_view())
     if err == 0
         print("FAIL: expected an error, the open succeeded\n")
         return false

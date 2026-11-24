@@ -54,6 +54,7 @@ import ritzlib.strview
 import ritzlib.string
 import ritzlib.json
 import ritzlib.fmt
+import ritzlib.fd { fd_stdin }
 
 # Write one raw byte to stdout (the fd writer is unbuffered, so it stays
 # ordered with print).
@@ -184,16 +185,17 @@ fn print_json(v: *JsonValue) -> i32
     print("{s.as_view()}")
     0
 
-# Append `s` to the path buffer at `len`, clamped to PATH_MAX; returns new len.
-fn path_push(path: *u8, len: i64, s: *u8) -> i64
-    var n: i64 = len
+# Append `s` to the path, clamped to PATH_MAX bytes.
+fn path_push(path: @&String, s: StrView)
     var i: i64 = 0
-    while *(s + i) != 0 and n < PATH_MAX
-        *(path + n) = *(s + i)
-        n += 1
+    while i < s.len and path.len() < PATH_MAX
+        path.push(s.get(i))
         i += 1
-    *(path + n) = 0
-    return n
+
+# Cut the path back to its first `len` bytes.
+fn path_truncate(path: @&String, len: i64)
+    while path.len() > len
+        path.pop()
 
 # ============================================================================
 # 1. Walk
@@ -212,40 +214,41 @@ fn walk_string(v: *JsonValue, s: StrView) -> i32
 # `kind` is the only struct field touched, to choose which accessor applies
 # (and `keys`, which has no accessor, to enumerate an object).  The None arms
 # below cannot fire for a node of the matching kind.
-fn walk(v: *JsonValue, path: *u8, plen: i64) -> i32
+fn walk(v: *JsonValue, path: @&String) -> i32
+    let plen: i64 = path.len()
     let kind: i32 = v.kind
     g_tally[kind as i64] = g_tally[kind as i64] + 1
 
     if plen == 0
         print("$")
     else
-        print("{path}")
+        print("{path.as_view()}")
     print(" {kind_name(kind)} ")
 
     if kind == JSON_OBJECT
         let n: i64 = v.object_len()
         print("\{{n}\}\n")
         for i in 0..n
-            let key: *u8 = *(v.keys + i)
-            var nlen: i64 = path_push(path, plen, ".")
-            nlen = path_push(path, nlen, key)
-            match v.get_field(strview_from_cstr(key))
-                Some(child) => walk(child, path, nlen)
+            # The keys are NUL-terminated (JsonValue.keys has no accessor).
+            let key: StrView = strview_from_cstr(*(v.keys + i))
+            path_push(path, ".")
+            path_push(path, key)
+            match v.get_field(key)
+                Some(child) => walk(child, path)
                 None => pass
-            *(path + plen) = 0
+            path_truncate(path, plen)
     else if kind == JSON_ARRAY
         let n: i64 = v.array_len()
         print("[{n}]\n")
         for i in 0..n
-            var num: [24]u8
-            itoa(i, @num[0])
-            var nlen: i64 = path_push(path, plen, "[")
-            nlen = path_push(path, nlen, @num[0])
-            nlen = path_push(path, nlen, "]")
+            var num: String = string_from_i64(i)
+            path_push(path, "[")
+            path_push(path, num.as_view())
+            path_push(path, "]")
             match v.get_index(i)
-                Some(child) => walk(child, path, nlen)
+                Some(child) => walk(child, path)
                 None => pass
-            *(path + plen) = 0
+            path_truncate(path, plen)
     else if kind == JSON_STRING
         match v.get_string()
             Some(s) => walk_string(v, s)
@@ -279,9 +282,8 @@ fn reparse_failed(err: JsonError) -> i32
 fn report(root: *JsonValue) -> i32
     for k in 0..6
         g_tally[k] = 0
-    var path: [512]u8
-    path[0] = 0
-    walk(root, @path[0], 0)
+    var path: String = string_new()
+    walk(root, @&path)
 
     for k in 0..6
         if g_tally[k] != 0
@@ -424,19 +426,19 @@ fn report_and_free(root: *JsonValue) -> i32
 
 pub fn main() -> i32
     println("== doc ==")
-    var input: Vec<u8> = vec_new<u8>()
-    match vec_read_all_fd(0, @&input)
+    var input: String = string_new()
+    match fd_stdin().read_to_end(@&input)
         Ok(_) => pass
         Err(_) =>
             println("vec_read_all_fd failed")
             return 1
 
     var src: StrView = builtin_doc()
-    if input.len == 0
+    if input.len() == 0
         println("source: builtin")
     else
         println("source: stdin")
-        src = strview_from_ptr(input.data, input.len)
+        src = input.as_view()
     show("bytes: ", src.len)
 
     let rc: i32 = match json_parse(src)
