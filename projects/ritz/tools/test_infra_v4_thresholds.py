@@ -16,6 +16,10 @@ ritz0 and ritz1, are the behaviour proof. This file measures them with the
 LARB ritz-metrics script (it reads source; nothing compiles), so the next
 feature is not bolted back onto one giant fn.
 
+Found later, same treatment: mausoleum m7sp_dispatch (#4618, SLOC 133 / CC 42)
+asks one m7sp_dispatch_<family> helper per opcode family, and tome cmd_zrange
+(#4619, CC 36) parses its options and bounds in cmd_zrange_<step> helpers.
+
 squeeze's deflate_dynamic, deferred while #4605 / #4611 reworked squeeze, was
 split by AGAST #4624 into dyn_<phase> helpers (LZ77 pass, tree building,
 code-length encoding, block emission); test_fixed_huffman_pin.ritz pins its
@@ -43,6 +47,8 @@ PINNED = {
     "valet_handle_tls_connection": "valet/lib/valet.ritz",
     "handle_task_event_encrypted": "mausoleum/lib/server_async.ritz",
     "cmd_dispatch": "tome/lib/commands.ritz",
+    "m7sp_dispatch": "mausoleum/lib/server_async.ritz",  # #4618
+    "cmd_zrange": "tome/lib/commands.ritz",  # #4619
     "qpack_static_get": "http/lib/qpack_static.ritz",
     "x509_parse_extensions": "cryptosec/lib/x509.ritz",
     "deflate_dynamic": "squeeze/lib/deflate.ritz",
@@ -52,8 +58,8 @@ PINNED = {
 # bulk into one new helper.
 WHOLE_FILE_HELPERS = {
     "valet/lib/valet.ritz": ("valet_",),
-    "mausoleum/lib/server_async.ritz": ("handle_task_event_encrypted", "enc_"),
-    "tome/lib/commands.ritz": ("cmd_dispatch", "dispatch_"),
+    "mausoleum/lib/server_async.ritz": ("handle_task_event_encrypted", "enc_", "m7sp_dispatch"),
+    "tome/lib/commands.ritz": ("cmd_dispatch", "dispatch_", "cmd_zrange"),
     "squeeze/lib/deflate.ritz": ("deflate_dynamic", "dyn_"),
 }
 

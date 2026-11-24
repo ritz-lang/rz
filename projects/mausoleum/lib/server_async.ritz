@@ -841,31 +841,38 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
 # session is updated in-place when the message affects per-connection
 # state (e.g., active_txn).  Behavior matches handle_plain_session in
 # src/main.ritz one-for-one (less SCAN, deferred to phase 4).
+#
+# Each opcode family has an m7sp_dispatch_<family> helper that answers
+# true when it handled the message (AGAST #4618: a const table can't hold
+# fn pointers, LANGUAGE_SPEC section 3.3).
 fn m7sp_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, msg_type: i32, request_id: i32)
     var collection: *Collection = session.collection as *Collection
     if collection == null
         collection = get_collection()
     let storage: *Storage = get_storage()
 
-    if msg_type == MSG_CONNECT
-        # Bind the session to the collection it names (AGAST #3637); an
-        # unknown name is created (see lib/registry.ritz).
-        var name_len: i32 = 0
-        let name: *u8 = msgreader_read_bytes(reader, @name_len)
-        if name == null and name_len != 0
-            build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed collection name")
-            return
-        let bound: *Collection = registry_bind(@g_registry, name, name_len)
-        if bound == null
-            build_error(resp, request_id, PROTO_ERR_COLLECTION_REFUSED, "Collection name too long, or too many collections")
-            return
-        session.collection = bound as i64
-        build_connected(resp, request_id, 1)
+    if m7sp_dispatch_session(reader, resp, session, storage, msg_type, request_id)
         return
+    if m7sp_dispatch_doc(reader, resp, collection, storage, msg_type, request_id)
+        return
+    if m7sp_dispatch_txn(resp, session, storage, msg_type, request_id)
+        return
+    if m7sp_dispatch_query(reader, resp, session, collection, msg_type, request_id)
+        return
+
+    # Unknown type — well-formed protocol error.
+    build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "Unknown message type")
+
+
+# CONNECT, PING, DISCONNECT.
+fn m7sp_dispatch_session(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, storage: *Storage, msg_type: i32, request_id: i32) -> bool
+    if msg_type == MSG_CONNECT
+        m7sp_dispatch_connect(reader, resp, session, request_id)
+        return true
 
     if msg_type == MSG_PING
         build_pong(resp, request_id)
-        return
+        return true
 
     if msg_type == MSG_DISCONNECT
         # Abort any txn we were holding before responding.  The client
@@ -875,40 +882,56 @@ fn m7sp_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSes
             storage_abort_txn(storage)
         session.active_txn = -1
         build_disconnected(resp, request_id)
-        return
+        return true
 
+    return false
+
+
+# Bind the session to the collection it names (AGAST #3637); an unknown
+# name is created (see lib/registry.ritz).
+fn m7sp_dispatch_connect(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, request_id: i32)
+    var name_len: i32 = 0
+    let name: *u8 = msgreader_read_bytes(reader, @name_len)
+    if name == null and name_len != 0
+        build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed collection name")
+        return
+    let bound: *Collection = registry_bind(@g_registry, name, name_len)
+    if bound == null
+        build_error(resp, request_id, PROTO_ERR_COLLECTION_REFUSED, "Collection name too long, or too many collections")
+        return
+    session.collection = bound as i64
+    build_connected(resp, request_id, 1)
+
+
+# INSERT, GET, UPDATE, DELETE; the writes flush after answering.
+fn m7sp_dispatch_doc(reader: *MessageReader, resp: *MessageBuffer, collection: *Collection, storage: *Storage, msg_type: i32, request_id: i32) -> bool
     if msg_type == MSG_INSERT
         async_handle_insert(reader, resp, request_id, collection)
         async_flush_after_write(storage, collection)
-        return
+        return true
 
     if msg_type == MSG_GET
         async_handle_get(reader, resp, request_id, collection)
-        return
+        return true
 
     if msg_type == MSG_UPDATE
         async_handle_update(reader, resp, request_id, collection)
         async_flush_after_write(storage, collection)
-        return
+        return true
 
     if msg_type == MSG_DELETE
         async_handle_delete(reader, resp, request_id, collection)
         async_flush_after_write(storage, collection)
-        return
+        return true
 
+    return false
+
+
+# TXN_BEGIN, TXN_COMMIT, TXN_ABORT.
+fn m7sp_dispatch_txn(resp: *MessageBuffer, session: *M7SPSession, storage: *Storage, msg_type: i32, request_id: i32) -> bool
     if msg_type == MSG_TXN_BEGIN
-        if storage != null
-            let txn_id: i64 = storage_begin_txn(storage)
-            if txn_id >= 0
-                session.active_txn = txn_id
-                build_txn_begun(resp, request_id, txn_id)
-            else
-                build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to begin transaction")
-        else
-            # In-memory mode — placeholder txn id (matches serial path)
-            session.active_txn = 1
-            build_txn_begun(resp, request_id, session.active_txn)
-        return
+        m7sp_dispatch_txn_begin(resp, session, storage, request_id)
+        return true
 
     if msg_type == MSG_TXN_COMMIT
         if session.active_txn >= 0 and storage != null
@@ -920,48 +943,37 @@ fn m7sp_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSes
         else
             build_txn_committed(resp, request_id)
         session.active_txn = -1
-        return
+        return true
 
     if msg_type == MSG_TXN_ABORT
         if session.active_txn >= 0 and storage != null
             storage_abort_txn(storage)
         build_txn_aborted(resp, request_id)
         session.active_txn = -1
-        return
+        return true
 
-    # SCAN — open the iterator and emit the first SCAN_RESULT batch into
-    # `resp`.  The post-send branch in `handle_task_event` advances the
-    # iter on each completed write (PARSE_SENDING → another batch), and
-    # finally emits a trailing SCAN_END before returning to NEED_HEADER.
-    # See the "SCAN flow" comment above `m7sp_scan_build_batch`.
-    if msg_type == MSG_SCAN
-        let max_results: i32 = msgreader_read_i32(reader)
+    return false
 
-        print("  [async] SCAN max_results={max_results}\n")
 
-        # If a previous scan somehow leaked, free its iter before starting.
-        if session.scan_iter != 0
-            btree_iter_destroy(session.scan_iter as *BTreeIter)
-            session.scan_iter = 0
-
-        let iter_opt = collection_scan(collection)
-        var iter: *BTreeIter = null
-        if not option_is_none<*BTreeIter>(@iter_opt)
-            iter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
-
-        session.scan_iter = iter as i64
-        session.scan_request_id = request_id
-        session.scan_max_results = max_results
-        session.scan_total_emitted = 0
-
-        let last: i32 = m7sp_scan_build_batch(resp, session)
-        if last != 0
-            # First batch was also the last (empty collection or
-            # single-batch result) — next CQE sends SCAN_END.
-            session.scan_active = 2
+fn m7sp_dispatch_txn_begin(resp: *MessageBuffer, session: *M7SPSession, storage: *Storage, request_id: i32)
+    if storage != null
+        let txn_id: i64 = storage_begin_txn(storage)
+        if txn_id >= 0
+            session.active_txn = txn_id
+            build_txn_begun(resp, request_id, txn_id)
         else
-            session.scan_active = 1
-        return
+            build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to begin transaction")
+    else
+        # In-memory mode — placeholder txn id (matches serial path)
+        session.active_txn = 1
+        build_txn_begun(resp, request_id, session.active_txn)
+
+
+# SCAN, SCAN_NEXT, INDEX_CREATE, FIND.
+fn m7sp_dispatch_query(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, collection: *Collection, msg_type: i32, request_id: i32) -> bool
+    if msg_type == MSG_SCAN
+        m7sp_dispatch_scan(reader, resp, session, collection, request_id)
+        return true
 
     # SCAN_NEXT: in this protocol, SCAN_RESULT batches are pushed by the
     # server (driven off send completion), not pulled — there is no
@@ -969,59 +981,100 @@ fn m7sp_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSes
     # error if a client somehow sends one.
     if msg_type == MSG_SCAN_NEXT
         build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "SCAN_NEXT not used by this server (push model)")
-        return
+        return true
 
-    # INDEX_CREATE — create (or confirm) a secondary index on a field.
-    # Payload: [field_len: i32][field: bytes][unique: i32]; `unique` is
-    # reserved.  Idempotent, so a reconnecting client ensures its indexes
-    # after every dial; a new index is built from the documents already in
-    # the collection (AGAST #3644).
     if msg_type == MSG_INDEX_CREATE
-        var field_len: i32 = 0
-        let field: *u8 = msgreader_read_bytes(reader, @field_len)
-        msgreader_read_i32(reader)      # reserved `unique` field
-        if field == null or field_len <= 0
-            build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed index field")
-            return
-        let rc: i32 = collection_index_create(collection, field, field_len)
-        if rc == ERR_OK
-            build_index_created(resp, request_id)
-        else if rc == ERR_INVALID
-            build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Invalid index field")
-        else if rc == ERR_FULL
-            build_error(resp, request_id, PROTO_ERR_INTERNAL, "Too many indexes")
-        else
-            build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to create index")
-        return
+        m7sp_dispatch_index_create(reader, resp, collection, request_id)
+        return true
 
-    # FIND — document ids holding a field value.
-    # Payload: [field_len: i32][field][value_len: i32][value]
-    # A field with no index is PROTO_ERR_NO_INDEX, which tells the client to
-    # fall back to a scan rather than treat the value as absent.
     if msg_type == MSG_FIND
-        var field_len: i32 = 0
-        let field: *u8 = msgreader_read_bytes(reader, @field_len)
-        var value_len: i32 = 0
-        let value: *u8 = msgreader_read_bytes(reader, @value_len)
-        if field == null or field_len <= 0 or value_len < 0
-            build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed find")
-            return
-        let ids: *i64 = malloc(FIND_MAX_IDS as i64 * 8) as *i64
-        if ids == null
-            build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
-            return
-        let rc: i32 = collection_index_find_string(collection, field, field_len, value, value_len, ids, FIND_MAX_IDS)
-        if rc == ERR_NOT_FOUND
-            build_error(resp, request_id, PROTO_ERR_NO_INDEX, "No index on field")
-        else if rc < 0
-            build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
-        else
-            build_find_result(resp, request_id, ids, rc)
-        free(ids as *u8)
-        return
+        m7sp_dispatch_find(reader, resp, collection, request_id)
+        return true
 
-    # Unknown type — well-formed protocol error.
-    build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "Unknown message type")
+    return false
+
+
+# SCAN — open the iterator and emit the first SCAN_RESULT batch into
+# `resp`.  The post-send branch in `handle_task_event` advances the
+# iter on each completed write (PARSE_SENDING → another batch), and
+# finally emits a trailing SCAN_END before returning to NEED_HEADER.
+# See the "SCAN flow" comment above `m7sp_scan_build_batch`.
+fn m7sp_dispatch_scan(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, collection: *Collection, request_id: i32)
+    let max_results: i32 = msgreader_read_i32(reader)
+
+    print("  [async] SCAN max_results={max_results}\n")
+
+    # If a previous scan somehow leaked, free its iter before starting.
+    if session.scan_iter != 0
+        btree_iter_destroy(session.scan_iter as *BTreeIter)
+        session.scan_iter = 0
+
+    let iter_opt = collection_scan(collection)
+    var iter: *BTreeIter = null
+    if not option_is_none<*BTreeIter>(@iter_opt)
+        iter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+
+    session.scan_iter = iter as i64
+    session.scan_request_id = request_id
+    session.scan_max_results = max_results
+    session.scan_total_emitted = 0
+
+    let last: i32 = m7sp_scan_build_batch(resp, session)
+    if last != 0
+        # First batch was also the last (empty collection or
+        # single-batch result) — next CQE sends SCAN_END.
+        session.scan_active = 2
+    else
+        session.scan_active = 1
+
+
+# INDEX_CREATE — create (or confirm) a secondary index on a field.
+# Payload: [field_len: i32][field: bytes][unique: i32]; `unique` is
+# reserved.  Idempotent, so a reconnecting client ensures its indexes
+# after every dial; a new index is built from the documents already in
+# the collection (AGAST #3644).
+fn m7sp_dispatch_index_create(reader: *MessageReader, resp: *MessageBuffer, collection: *Collection, request_id: i32)
+    var field_len: i32 = 0
+    let field: *u8 = msgreader_read_bytes(reader, @field_len)
+    msgreader_read_i32(reader)      # reserved `unique` field
+    if field == null or field_len <= 0
+        build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed index field")
+        return
+    let rc: i32 = collection_index_create(collection, field, field_len)
+    if rc == ERR_OK
+        build_index_created(resp, request_id)
+    else if rc == ERR_INVALID
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Invalid index field")
+    else if rc == ERR_FULL
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Too many indexes")
+    else
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to create index")
+
+
+# FIND — document ids holding a field value.
+# Payload: [field_len: i32][field][value_len: i32][value]
+# A field with no index is PROTO_ERR_NO_INDEX, which tells the client to
+# fall back to a scan rather than treat the value as absent.
+fn m7sp_dispatch_find(reader: *MessageReader, resp: *MessageBuffer, collection: *Collection, request_id: i32)
+    var field_len: i32 = 0
+    let field: *u8 = msgreader_read_bytes(reader, @field_len)
+    var value_len: i32 = 0
+    let value: *u8 = msgreader_read_bytes(reader, @value_len)
+    if field == null or field_len <= 0 or value_len < 0
+        build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed find")
+        return
+    let ids: *i64 = malloc(FIND_MAX_IDS as i64 * 8) as *i64
+    if ids == null
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
+        return
+    let rc: i32 = collection_index_find_string(collection, field, field_len, value, value_len, ids, FIND_MAX_IDS)
+    if rc == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NO_INDEX, "No index on field")
+    else if rc < 0
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
+    else
+        build_find_result(resp, request_id, ids, rc)
+    free(ids as *u8)
 
 
 # ============================================================================

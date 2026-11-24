@@ -1205,6 +1205,14 @@ const ZDIR_AUTO: i32 = 0
 const ZDIR_FORWARD: i32 = 1
 const ZDIR_REVERSE: i32 = 2
 
+# The options ZRANGE and its family parse after `key start stop`.
+struct ZRangeOpts
+    rangetype: i32           # ZRANGE_AUTO until an option or the command fixes it
+    direction: i32           # ZDIR_AUTO / ZDIR_FORWARD / ZDIR_REVERSE
+    withscores: bool
+    offset: i64              # LIMIT offset count; count -1 is no limit
+    limit: i64
+
 # ZRANGE key start stop [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]
 # and the commands it generalises (Redis's zrangeGenericCommand):
 #   ZREVRANGE key start stop [WITHSCORES]
@@ -1215,6 +1223,9 @@ const ZDIR_REVERSE: i32 = 2
 # "[m" and "(m".  Reversed score and lex ranges are given max first.  A
 # negative LIMIT count is no limit.  The reply is an array of members, each
 # followed by its score with WITHSCORES.
+#
+# Options, bounds and the rank reply are cmd_zrange_<step> helpers (AGAST
+# #4619: one fn was over the LARB v4 complexity line).
 fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direction_in: i32, name: *u8) -> i32
     if cmd.argc < 4
         var err: [96]u8
@@ -1222,11 +1233,45 @@ fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direct
         ctx_write_error(ctx, @err[0])
         return CMD_ERR_ARGC
 
-    var rangetype: i32 = rangetype_in
-    var direction: i32 = direction_in
-    var withscores: bool = false
-    var offset: i64 = 0
-    var limit: i64 = -1
+    var opts: ZRangeOpts
+    opts.rangetype = rangetype_in
+    opts.direction = direction_in
+    opts.withscores = false
+    opts.offset = 0
+    opts.limit = -1
+    let opts_rc: i32 = cmd_zrange_opts(ctx, cmd, @opts)
+    if opts_rc != CMD_OK
+        return opts_rc
+    let rangetype: i32 = opts.rangetype
+    let rev: bool = opts.direction == ZDIR_REVERSE
+
+    var start: i64 = 0
+    var stop: i64 = 0
+    var spec: ZRangeSpec
+    spec.by = rangetype
+    let bounds_rc: i32 = cmd_zrange_bounds(ctx, cmd, rangetype, rev, @spec, @start, @stop)
+    if bounds_rc != CMD_OK
+        return bounds_rc
+
+    var key_sv: StrView = resp_arg_sv(@cmd.args[1])
+    if zset_wrongtype(ctx, key_sv)
+        return CMD_ERR_TYPE
+
+    if rangetype != ZRANGE_RANK
+        var count: i64 = 0
+        let items: *ZItem = store_zrange_spec(ctx.store, key_sv, @spec, rev, opts.offset, opts.limit, @&count)
+        ctx_write_zitems(ctx, items, count, opts.withscores)
+        return CMD_OK
+
+    cmd_zrange_by_rank(ctx, key_sv, start, stop, rev, opts.withscores)
+    return CMD_OK
+
+
+# The options after `key start stop`: WITHSCORES, LIMIT offset count, and
+# REV / BYLEX / BYSCORE where the command left them open.  Settles an open
+# range type to ZRANGE_RANK and rejects the combinations Redis rejects.
+# CMD_OK, or the error already written.
+fn cmd_zrange_opts(ctx: *CommandContext, cmd: *RespCommand, opts: *ZRangeOpts) -> i32
     let o_withscores: StrView = "WITHSCORES"
     let o_limit: StrView = "LIMIT"
     let o_rev: StrView = "REV"
@@ -1237,57 +1282,58 @@ fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direct
         let opt: *RespArg = @cmd.args[j]
         let left: i32 = cmd.argc - j - 1
         if resp_arg_eq_ci_sv(opt, o_withscores) == 1
-            withscores = true
+            opts.withscores = true
         else if resp_arg_eq_ci_sv(opt, o_limit) == 1 and left >= 2
             var ok: i32 = 0
             var ok2: i32 = 0
-            offset = resp_arg_to_int(@cmd.args[j + 1], @ok)
+            opts.offset = resp_arg_to_int(@cmd.args[j + 1], @ok)
             if ok == 1
-                limit = resp_arg_to_int(@cmd.args[j + 2], @ok2)
+                opts.limit = resp_arg_to_int(@cmd.args[j + 2], @ok2)
             if ok == 0 or ok2 == 0
                 let notint: StrView = "ERR value is not an integer or out of range"
                 ctx_write_error_sv(ctx, notint)
                 return CMD_ERR_SYNTAX
             j += 2
-        else if direction == ZDIR_AUTO and resp_arg_eq_ci_sv(opt, o_rev) == 1
-            direction = ZDIR_REVERSE
-        else if rangetype == ZRANGE_AUTO and resp_arg_eq_ci_sv(opt, o_bylex) == 1
-            rangetype = ZRANGE_BY_LEX
-        else if rangetype == ZRANGE_AUTO and resp_arg_eq_ci_sv(opt, o_byscore) == 1
-            rangetype = ZRANGE_BY_SCORE
+        else if opts.direction == ZDIR_AUTO and resp_arg_eq_ci_sv(opt, o_rev) == 1
+            opts.direction = ZDIR_REVERSE
+        else if opts.rangetype == ZRANGE_AUTO and resp_arg_eq_ci_sv(opt, o_bylex) == 1
+            opts.rangetype = ZRANGE_BY_LEX
+        else if opts.rangetype == ZRANGE_AUTO and resp_arg_eq_ci_sv(opt, o_byscore) == 1
+            opts.rangetype = ZRANGE_BY_SCORE
         else
             let err: StrView = "ERR syntax error"
             ctx_write_error_sv(ctx, err)
             return CMD_ERR_SYNTAX
         j += 1
 
-    if rangetype == ZRANGE_AUTO
-        rangetype = ZRANGE_RANK
-    let rev: bool = direction == ZDIR_REVERSE
-    if limit != -1 and rangetype == ZRANGE_RANK
+    if opts.rangetype == ZRANGE_AUTO
+        opts.rangetype = ZRANGE_RANK
+    if opts.limit != -1 and opts.rangetype == ZRANGE_RANK
         let err: StrView = "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"
         ctx_write_error_sv(ctx, err)
         return CMD_ERR_SYNTAX
-    if withscores and rangetype == ZRANGE_BY_LEX
+    if opts.withscores and opts.rangetype == ZRANGE_BY_LEX
         let err: StrView = "ERR syntax error, WITHSCORES not supported in combination with BYLEX"
         ctx_write_error_sv(ctx, err)
         return CMD_ERR_SYNTAX
+    return CMD_OK
 
+
+# The `start stop` / `min max` arguments: ranks into start / stop, score or
+# lex bounds into spec (max first when reversed).  CMD_OK, or the error
+# already written.
+fn cmd_zrange_bounds(ctx: *CommandContext, cmd: *RespCommand, rangetype: i32, rev: bool, spec: *ZRangeSpec, start: *i64, stop: *i64) -> i32
     var minidx: i32 = 2
     var maxidx: i32 = 3
     if rev and rangetype != ZRANGE_RANK
         minidx = 3
         maxidx = 2
 
-    var start: i64 = 0
-    var stop: i64 = 0
-    var spec: ZRangeSpec
-    spec.by = rangetype
     if rangetype == ZRANGE_RANK
         var ok: i32 = 0
         var ok2: i32 = 0
-        start = resp_arg_to_int(@cmd.args[2], @ok)
-        stop = resp_arg_to_int(@cmd.args[3], @ok2)
+        *start = resp_arg_to_int(@cmd.args[2], @ok)
+        *stop = resp_arg_to_int(@cmd.args[3], @ok2)
         if ok == 0 or ok2 == 0
             let notint: StrView = "ERR value is not an integer or out of range"
             ctx_write_error_sv(ctx, notint)
@@ -1302,17 +1348,13 @@ fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direct
             let err: StrView = "ERR min or max not valid string range item"
             ctx_write_error_sv(ctx, err)
             return CMD_ERR_SYNTAX
+    return CMD_OK
 
-    var key_sv: StrView = resp_arg_sv(@cmd.args[1])
-    if zset_wrongtype(ctx, key_sv)
-        return CMD_ERR_TYPE
 
+# A rank range's reply: the members from start to stop (from the end when
+# reversed), each with its score looked up when WITHSCORES asks.
+fn cmd_zrange_by_rank(ctx: *CommandContext, key_sv: StrView, start: i64, stop: i64, rev: bool, withscores: bool)
     var count: i64 = 0
-    if rangetype != ZRANGE_RANK
-        let items: *ZItem = store_zrange_spec(ctx.store, key_sv, @spec, rev, offset, limit, @&count)
-        ctx_write_zitems(ctx, items, count, withscores)
-        return CMD_OK
-
     var members: *StrView = null
     if rev
         members = store_zrevrange(ctx.store, key_sv, start, stop, @&count)
@@ -1329,7 +1371,6 @@ fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direct
     if members != null
         free(members as *u8)
     ctx_write_zitems(ctx, items, count, withscores)
-    return CMD_OK
 
 
 # ZCOUNT key min max: the number of members whose score is in [min, max]
