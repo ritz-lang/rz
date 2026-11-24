@@ -23,8 +23,6 @@ RITZLIB = Path(__file__).resolve().parent.parent / "ritzlib"
 
 # (file relative to ritzlib, function, param) -> why it is not by value
 ALLOWED = {
-    ("strview.ritz", "split_once", "before"): "output param: written",
-    ("strview.ritz", "split_once", "after"): "output param: written",
     ("os/env.ritz", "env_get_p", "name"): (
         "the pointer form of env_get by design; by value it would be env_get"
     ),

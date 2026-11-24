@@ -12,7 +12,7 @@ The library is organized as individual `.ritz` files, each providing a focused s
 
 Ritzlib spans from low-level syscall wrappers to high-level abstractions like async I/O with io_uring, JSON parsing, and hash maps. It targets Linux userspace and Harland userspace programs; the Harland kernel does not link it, and imports only `ritzlib.option`. Syscall numbers live only in `sys.ritz`, each under a `[[target_os]]`; `memory` gets its pages from a pluggable `PageSource` so a host without mmap can supply them.
 
-Ritzlib's **core** (`str`, `strview`, `span`, `option`, `result`, `gvec`, `string`, `hashmap`, `memory`, `fmt`, `drop`, `hash`) builds freestanding: it imports nothing outside the core, so never `ritzlib.sys`, and reaches the platform only through three `extern fn ritz_platform_*` hooks that `sys` (or, weakly, every hosted `_start`) defines and a kernel defines for itself. The rest is **hosted**. `tools/ritzlib_layers.py` holds the list and fails when a core module imports a hosted one (docs/STDLIB_REFERENCE.md, "Core and hosted").
+Ritzlib's **core** (`str`, `strview`, `span`, `option`, `result`, `cmp`, `gvec`, `string`, `hashmap`, `memory`, `fmt`, `drop`, `hash`) builds freestanding: it imports nothing outside the core, so never `ritzlib.sys`, and reaches the platform only through three `extern fn ritz_platform_*` hooks that `sys` (or, weakly, every hosted `_start`) defines and a kernel defines for itself. The rest is **hosted**. `tools/ritzlib_layers.py` holds the list and fails when a core module imports a hosted one (docs/STDLIB_REFERENCE.md, "Core and hosted").
 
 ## Features
 
@@ -70,6 +70,7 @@ pub fn main() -> i32
 | `async_net.ritz` | `ritzlib.async_net` | Async TCP networking |
 | `box.ritz` | `ritzlib.box` | Owned heap allocation |
 | `buf.ritz` | `ritzlib.buf` | Buffer and reader utilities for parsing |
+| `cmp.ritz` | `ritzlib.cmp` | Ordering, the result of a three-way comparison |
 | `ct.ritz` | `ritzlib.ct` | Constant-time comparison (AGAST #1863) |
 | `drop.ritz` | `ritzlib.drop` | Drop trait for automatic cleanup |
 | `elf.ritz` | `ritzlib.elf` | ELF Binary Format Parser |

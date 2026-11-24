@@ -357,7 +357,9 @@ REJECTED.update({
 # met `c"abc"` with its StrView receiver param and refused it, failing all of
 # ritzlib/tests/test_strview.ritz. Compiled, not run: a one-file link has no
 # ritzlib.strview, and ritz0 resolves no free `strview_*` helper of a test's own.
-_UFCS_RECEIVER = 'fn main() -> i32\n    let v: StrView = "abc"\n    v.cmp_cstr(c"abc")\n'
+# #4639 deleted cmp_cstr; eq_cstr(self, cstr: *u8) has the same shape.
+_UFCS_RECEIVER = ('fn main() -> i32\n    let v: StrView = "abc"\n'
+                  '    if v.eq_cstr(c"abc")\n        return 0\n    1\n')
 
 # AGAST #3483 (R62): in a `Span<u8>` slot a `"..."` literal is a `Span<u8>` of its
 # bytes. Each slot checks the length and every byte, past an escape, and exits 42.

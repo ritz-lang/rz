@@ -105,7 +105,7 @@ SOURCES = \
 # - timer (ritzlib/timer.ritz): RITZ1_PARSE_ONLY's clock (AGAST #4379).
 # - errno: io.ritz's vec_read_all_fd returns Err(errno).
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str fmt_digits string strview hash hashmap memory gvec drop option result json span os_env timer errno
+RITZLIB_MODULES = sys io str fmt_digits string strview cmp hash hashmap memory gvec drop option result json span os_env timer errno
 
 # Build artifacts
 BUILD_DIR = build

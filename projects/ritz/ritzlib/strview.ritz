@@ -19,11 +19,13 @@
 # For owned strings that can be stored/moved, use String.
 #
 # Heap-free (BARE in tools/ritzlib_layers.py, AGAST #4601): this module imports
-# only ritzlib.option, so a target with no allocator (harland's UEFI loader and
-# HWINV) imports it. The one allocating conversion, a NUL-terminated copy, is
+# only ritzlib.option and ritzlib.cmp, so a target with no allocator (harland's
+# UEFI loader and HWINV) imports it. The one allocating conversion, a
+# NUL-terminated copy, is
 # ritzlib.string's strview_to_cstr.
 
-import ritzlib.option  # strview_parse_i64 -> Option<i64>
+import ritzlib.option  # parse_i64, split_once -> Option
+import ritzlib.cmp     # cmp -> Ordering
 
 # ============================================================================
 # StrView - Zero-copy string view
@@ -32,6 +34,11 @@ import ritzlib.option  # strview_parse_i64 -> Option<i64>
 pub struct StrView
     ptr: *u8       # Pointer to first byte (not owned, not null-terminated)
     len: i64       # Number of bytes
+
+# The two sides of StrView.split_once, the delimiter in neither.
+pub struct SplitPair
+    before: StrView
+    after: StrView
 
 # ============================================================================
 # Constructors
@@ -120,11 +127,9 @@ impl StrView
             return false
         return true
 
-    # Lexicographic comparison of two StrViews
-    # Returns: -1 if a < b, 0 if a == b, 1 if a > b
-    # standard-exempt: sentinel-return: three-way ordering, not an error (lexicographic compare)
-    pub fn cmp(self: StrView, b: StrView) -> i32
-        # Compare byte by byte up to the shorter length
+    # Lexicographic comparison of two StrViews, bytes unsigned; a proper
+    # prefix sorts first ("app" < "apple").
+    pub fn cmp(self: StrView, b: StrView) -> Ordering
         var min_len: i64 = self.len
         if b.len < min_len
             min_len = b.len
@@ -133,39 +138,18 @@ impl StrView
             let ca: u8 = *(self.ptr + i)
             let cb: u8 = *(b.ptr + i)
             if ca < cb
-                return -1
+                return Ordering.Less
             if ca > cb
-                return 1
+                return Ordering.Greater
 
-        # All compared bytes are equal, shorter string is "less than"
+        # Inline, not cmp_i64: strview uses only cmp's type, so a program
+        # that links strview.o alone needs no cmp.o (the unit harnesses link
+        # a fixed module set).
         if self.len < b.len
-            return -1
+            return Ordering.Less
         if self.len > b.len
-            return 1
-        return 0
-
-    # Lexicographic comparison of StrView to C string (for FFI interop)
-    # Returns: -1 if s < cstr, 0 if s == cstr, 1 if s > cstr
-    # standard-exempt: sentinel-return: three-way ordering, not an error (lexicographic compare)
-    # standard-exempt: raw-ptr-param: NUL-terminated C-string ABI
-    pub fn cmp_cstr(self: StrView, cstr: *u8) -> i32
-        var i: i64 = 0
-        while i < self.len
-            let cc: u8 = *(cstr + i)
-            if cc == 0
-                # cstr ended early, self is longer -> self > cstr
-                return 1
-            let cs: u8 = *(self.ptr + i)
-            if cs < cc
-                return -1
-            if cs > cc
-                return 1
-            i += 1
-        # All self bytes matched, check if cstr has more
-        if *(cstr + i) != 0
-            # cstr is longer -> self < cstr
-            return -1
-        return 0
+            return Ordering.Greater
+        return Ordering.Equal
 
     # Create a sub-view [start:end)
     pub fn slice(self: StrView, start: i64, end: i64) -> StrView
@@ -310,24 +294,16 @@ impl StrView
                 return i
         return self.len
 
-    # Split on first occurrence of delimiter byte
-    # Returns (before, after) where 'after' excludes the delimiter
-    # If delimiter not found, returns (full string, empty)
-    # Uses mutable borrows for output parameters
-    pub fn split_once(self: StrView, delim: u8, before:& StrView, after:& StrView) -> i32
+    # Split on the first `delim`: Some({before, after}), the delimiter in
+    # neither, or None when self has no `delim`. Either side may be empty
+    # ("=v" gives before "" and after "v").
+    pub fn split_once(self: StrView, delim: u8) -> Option<SplitPair>
         let idx: i64 = self.find_byte(delim)
         if idx >= self.len
-            before.ptr = self.ptr
-            before.len = self.len
-            after.ptr = self.ptr + self.len
-            after.len = 0
-            return 0  # Delimiter not found
-
-        before.ptr = self.ptr
-        before.len = idx
-        after.ptr = self.ptr + idx + 1
-        after.len = self.len - idx - 1
-        return 1  # Delimiter found
+            return None
+        let before = StrView { ptr: self.ptr, len: idx }
+        let after = StrView { ptr: self.ptr + idx + 1, len: self.len - idx - 1 }
+        Some(SplitPair { before: before, after: after })
 
     # Trim leading whitespace
     pub fn trim_start(self: StrView) -> StrView

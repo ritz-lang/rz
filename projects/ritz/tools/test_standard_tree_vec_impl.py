@@ -48,7 +48,7 @@ def test_free_fn_method_is_clear_across_ritzlib():
     """
     summary = summarise(scan_tree([RITZ_ROOT / "ritzlib"]))
     assert summary["free-fn-method"]["violations"] == 0
-    # 14 are deliberate, documented exemptions (span.ritz 11, sys.ritz 2,
-    # time.ritz's sleep(d: Duration), AGAST #4637).
-    assert summary["free-fn-method"]["exempt"] == 14
+    # 15 are deliberate, documented exemptions (span.ritz 12, sys.ritz 2,
+    # time.ritz's sleep(d: Duration), AGAST #4637; #4639 added span_cmp).
+    assert summary["free-fn-method"]["exempt"] == 15
     assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}

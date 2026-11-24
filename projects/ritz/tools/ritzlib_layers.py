@@ -29,12 +29,12 @@ from pathlib import Path
 # ritzlib's core, by import path under `ritzlib.`.  fmt.digits, drop and hash are
 # here because the others use them.
 CORE = frozenset({
-    "drop", "fmt.digits", "gvec", "hash", "hashmap", "memory", "option", "ptr",
+    "cmp", "drop", "fmt.digits", "gvec", "hash", "hashmap", "memory", "option", "ptr",
     "result", "span", "str", "string", "strview",
 })
 
 # The heap-free core: none imports ritzlib.memory, even transitively.
-BARE = frozenset({"fmt.digits", "option", "strview"})
+BARE = frozenset({"cmp", "fmt.digits", "option", "strview"})
 
 IMPORT = re.compile(r"\s*(?:pub\s+)?import\s+ritzlib\.([A-Za-z_][\w.]*)")
 

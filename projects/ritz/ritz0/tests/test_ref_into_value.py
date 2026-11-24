@@ -132,7 +132,8 @@ ADDR_SLOTS = {
 # as its first param (`a.cmp(b)` lowers to `StrView_cmp` on ritz1;
 # on ritz0), judges its arguments as that free fn's call does (AGAST #3154).
 # One row per receiver kind each compiler resolves its own way.
-UFCS = "import ritzlib.strview\nimport ritzlib.string\nimport ritzlib.gvec\n\n" + COPY
+UFCS = ("import ritzlib.strview\nimport ritzlib.cmp\nimport ritzlib.string\n"
+        "import ritzlib.gvec\n\n" + COPY)
 UFCS_SLOTS = {
     "strview_addr": ("fn f(a: StrView, b: StrView) -> i32\n    a.cmp(^@b)\n", ADDR_INTO_VALUE),
     "strview_ref": ("fn f(r: @StrView, a: StrView) -> i32\n    a.cmp(^r)\n", REF_INTO_VALUE),
@@ -148,7 +149,14 @@ fn f(r: @StrView, a: StrView, sv: StrView, s: @&String, v: @&Vec<C>, c: C, p: *C
     s.push_str(sv)
     v.push(c)
     v.push(*p)
-    r.cmp(sv) + a.cmp(*r) + a.cmp(sv)
+    var n: i32 = 0
+    if r.cmp(sv) == Ordering.Equal
+        n += 1
+    if a.cmp(*r) == Ordering.Equal
+        n += 1
+    if a.cmp(sv) == Ordering.Equal
+        n += 1
+    n
 """
 
 # The same reads, written out: what rule 1's error tells you to do.

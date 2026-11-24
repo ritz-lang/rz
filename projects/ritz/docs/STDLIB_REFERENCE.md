@@ -33,7 +33,7 @@ Ritzlib is built on three core principles:
 ### Core and hosted
 
 ritzlib has two layers (AGAST #4119). The **core** (`str`, `strview`, `span`,
-`option`, `result`, `gvec`, `string`, `hashmap`, `memory`, and `fmt.digits`,
+`option`, `result`, `cmp`, `gvec`, `string`, `hashmap`, `memory`, and `fmt.digits`,
 `drop` and `hash`, which they use) builds for a freestanding target, such as a kernel
 with no syscalls: no core module imports a module outside the core, so
 `ritzlib.sys` is never in its import closure. Everything else (`sys`, `io`,
@@ -41,7 +41,7 @@ with no syscalls: no core module imports a module outside the core, so
 in `tools/ritzlib_layers.py`, whose check (`make tools-unit`) fails when a
 core module imports a hosted one.
 
-Inside the core, the **bare** modules (`strview`, `option`, `fmt.digits`)
+Inside the core, the **bare** modules (`strview`, `option`, `cmp`, `fmt.digits`)
 import only each other, so they reach no allocator: a target with no heap at
 all, such as harland's UEFI loader, imports them (AGAST #4601). The same check
 fails when a bare module imports one that is not bare.
@@ -845,6 +845,41 @@ fn main() -> i32
 
 ---
 
+### cmp
+
+**Module**: `ritzlib.cmp` (core, bare)
+
+`Ordering`, what every three-way compare returns (`StrView.cmp`, `span_cmp`,
+`cmp_i64`) in place of C's -1/0/1 `i32`.
+
+```ritz
+import ritzlib.cmp
+
+fn sign(n: i64) -> i64
+    match cmp_i64(n, 0)
+        Less => -1
+        Equal => 0
+        Greater => 1
+
+[[test]]
+fn test_cmp_example() -> i32
+    assert sign(-5) == -1
+    assert cmp_i64(1, 2).is_lt() and cmp_i64(2, 2).is_ge()
+    assert cmp_i64(1, 2).reverse() == Ordering.Greater
+    0
+```
+
+| Item | Signature | Description |
+|------|-----------|-------------|
+| `Ordering` | `enum { Less, Equal, Greater }` | A three-way result |
+| `o.is_eq()`, `o.is_ne()` | `fn() -> bool` | `Equal` / not `Equal` |
+| `o.is_lt()`, `o.is_le()` | `fn() -> bool` | `Less` / not `Greater` |
+| `o.is_gt()`, `o.is_ge()` | `fn() -> bool` | `Greater` / not `Less` |
+| `o.reverse()` | `fn() -> Ordering` | `Less` and `Greater` swapped |
+| `cmp_i64` | `fn(a: i64, b: i64) -> Ordering` | Compare two integers |
+
+---
+
 ### span
 
 **Module**: `ritzlib.span`
@@ -879,6 +914,8 @@ struct Span<T>
 | `s.slice(start, end)` | `fn(start: i64, end: i64) -> Span<T>` | Sub-span `[start, end)` |
 | `s.from(start)` | `fn(start: i64) -> Span<T>` | From `start` to the end |
 | `s.to(end)` | `fn(end: i64) -> Span<T>` | From the beginning to `end` |
+| `s.copy_from(src)` | `fn(src: Span<T>) -> i64` | Copy `min(s.len, src.len)` elements of `src` to the front of `s`, overlap-safe; returns the count. Replaces `memcpy`/`memmove` |
+| `s.fill(v)` | `fn(v: T)` | Set every element to `v`. Replaces `memset` |
 
 **Slicing** (free functions):
 
@@ -897,6 +934,7 @@ the same name (`span_eq` calls `.eq`), and `span_as_strview` / `span_from_strvie
 |----------|-----------|-------------|
 | `span_as_strview` | `fn(s: @Span<u8>) -> StrView` | View the same bytes as a StrView |
 | `span_eq` | `fn(a: @Span<u8>, b: @Span<u8>) -> bool` | Compare equality |
+| `span_cmp` | `fn(a: @Span<u8>, b: @Span<u8>) -> Ordering` | Bytewise order, as `StrView.cmp`. Replaces `memcmp` |
 | `span_eq_cstr` | `fn(s: @Span<u8>, cstr: *u8) -> bool` | Compare to C string |
 | `span_contains` | `fn(haystack: @Span<u8>, needle: @Span<u8>) -> bool` | Contains check |
 | `span_starts_with` | `fn(s: @Span<u8>, prefix: @Span<u8>) -> bool` | Prefix check |
@@ -947,8 +985,7 @@ Comparison:
 |--------|-----------|-------------|
 | `s.eq(t)` | `fn(t: StrView) -> bool` | Same length and bytes |
 | `s.eq_cstr(c)` | `fn(c: *u8) -> bool` | Equal to a C string |
-| `s.cmp(t)` | `fn(t: StrView) -> i32` | Bytewise order: -1, 0 or 1; a prefix sorts first |
-| `s.cmp_cstr(c)` | `fn(c: *u8) -> i32` | `s.cmp` against a C string |
+| `s.cmp(t)` | `fn(t: StrView) -> Ordering` | Bytewise order, bytes unsigned; a prefix sorts first (`ritzlib.cmp`) |
 
 Slicing (no allocation):
 
@@ -960,7 +997,7 @@ Slicing (no allocation):
 | `s.trim_start()` | `fn() -> StrView` | Drop leading space, `\t`, `\n`, `\r` |
 | `s.trim_end()` | `fn() -> StrView` | Drop trailing whitespace |
 | `s.trim()` | `fn() -> StrView` | Both ends |
-| `s.split_once(delim, before, after)` | `fn(delim: u8, before:& StrView, after:& StrView) -> i32` | Split at the first `delim` (excluded): 1 if found; 0 and `before = s`, `after` empty if not. Call as `s.split_once('=', @&k, @&v)` |
+| `s.split_once(delim)` | `fn(delim: u8) -> Option<SplitPair>` | Split at the first `delim`: `Some` of `{before, after}`, the delimiter in neither (either may be empty), or `None` when `delim` is absent |
 
 Search:
 
@@ -979,17 +1016,17 @@ The constructors stay free functions: they have no method form (LARB R66).
 **Example**:
 ```ritz
 import ritzlib.option
+import ritzlib.cmp
 import ritzlib.strview
 
 # "key = value" -> the value as an i64, or None
 fn config_int(line: StrView, key: StrView) -> Option<i64>
-    var k: StrView = strview_empty()
-    var v: StrView = strview_empty()
-    if line.split_once('=', @&k, @&v) == 0
-        return None
-    if not k.trim().eq(key)
-        return None
-    (v.trim()).parse_i64()
+    match line.split_once('=')
+        Some(p) =>
+            if not p.before.trim().eq(key)
+                return None
+            (p.after.trim()).parse_i64()
+        None => None
 
 [[test]]
 fn test_strview_example() -> i32
@@ -1002,7 +1039,7 @@ fn test_strview_example() -> i32
     let base = path.skip(path.rfind("/") + 1)
     assert base.eq("libc.so")
     assert path.starts_with("/usr") and path.ends_with(".so")
-    assert ("abc").cmp("abd") < 0
+    assert ("abc").cmp("abd") == Ordering.Less
     assert path.find_byte('l') == 5
     assert path.len() == 16
     0
@@ -1022,10 +1059,11 @@ New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
 |-------|-------------|
 | `strlen` | `s.len()` on a `StrView` or `String` |
 | `streq`, `strneq` | `s.eq(t)` / `s.eq_cstr(c)`; `s.take(n)` then `s.eq(t)` |
-| `strcmp` | `s.cmp(t)` |
+| `strcmp` | `s.cmp(t) -> Ordering` |
 | `strchr` | `s.find_byte(c)` |
 | `strrchr` | `s.rfind(t)` |
 | `strstr` | `s.find(t)`, `s.contains(t)` |
+| `memcpy`, `memmove`, `memset`, `memcmp` | `dst.copy_from(src)`, `s.fill(b)`, `span_cmp(@a, @b)` on a `Span` |
 | `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `s.take(n)` to bound it |
 | `strcat` | `s.push_str(v)`, `s.push_string(other)` |
 | `atoi` | `s.parse_i64() -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |
@@ -1069,12 +1107,12 @@ the compiler emits calls to those symbols.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `isdigit` | `fn(c: u8) -> i32` | Is digit (0-9) |
-| `isalpha` | `fn(c: u8) -> i32` | Is letter |
-| `isalnum` | `fn(c: u8) -> i32` | Is alphanumeric |
-| `isspace` | `fn(c: u8) -> i32` | Is whitespace |
-| `isupper` | `fn(c: u8) -> i32` | Is uppercase |
-| `islower` | `fn(c: u8) -> i32` | Is lowercase |
+| `isdigit` | `fn(c: u8) -> bool` | Is digit (0-9) |
+| `isalpha` | `fn(c: u8) -> bool` | Is letter |
+| `isalnum` | `fn(c: u8) -> bool` | Is alphanumeric |
+| `isspace` | `fn(c: u8) -> bool` | Is whitespace |
+| `isupper` | `fn(c: u8) -> bool` | Is uppercase |
+| `islower` | `fn(c: u8) -> bool` | Is lowercase |
 | `toupper` | `fn(c: u8) -> u8` | To uppercase |
 | `tolower` | `fn(c: u8) -> u8` | To lowercase |
 
