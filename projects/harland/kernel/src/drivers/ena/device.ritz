@@ -648,6 +648,26 @@ fn ena_admin_wait_completion(dev: *EnaDevice, cmd_id: u16) -> i32
 
     return -1
 
+# One admin round trip (AGAST #4579): submit `cmd`, wait for its completion
+# and return 0, the negated completion status, or -1 on timeout. On success,
+# when out_cq_entry is not NULL, it receives the completion entry; callers
+# cast it to the command's response layout. The entry lives in the ACQ and
+# stays valid until the queue wraps (ENA_ADMIN_CQ_DEPTH commands later), so
+# read the fields before submitting more than that. On failure the out
+# pointer is left alone. This is the only caller of ena_admin_submit_cmd and
+# ena_admin_wait_completion (ritz0/tests/test_harland_ena_admin_exec.py).
+pub fn ena_admin_exec(dev: *EnaDevice, cmd: *EnaAdminAqEntry, out_cq_entry: **EnaAdminAcqEntry) -> i32
+    let cmd_id: u16 = ena_admin_submit_cmd(dev, cmd)
+    let result: i32 = ena_admin_wait_completion(dev, cmd_id)
+    if result != 0
+        return result
+    if out_cq_entry != 0 as **EnaAdminAcqEntry
+        # wait_completion has advanced the head past this command's entry.
+        let aq: *EnaAdminQueue = @(*dev).admin_queue
+        let entry_addr: u64 = ena_admin_cq_entry_addr(aq, ena_get_prev_cq_head(aq))
+        *out_cq_entry = entry_addr as *EnaAdminAcqEntry
+    return 0
+
 # ============================================================================
 # Feature Queries
 # ============================================================================
@@ -664,18 +684,12 @@ fn ena_get_device_attributes(dev: *EnaDevice) -> i32
     cmd.common_desc.opcode = ENA_ADMIN_GET_FEATURE
     cmd.feature_id = ENA_ADMIN_DEVICE_ATTRIBUTES
 
-    let cmd_id: u16 = ena_admin_submit_cmd(dev, @cmd as *EnaAdminAqEntry)
-    let result: i32 = ena_admin_wait_completion(dev, cmd_id)
-
+    var cqe: *EnaAdminAcqEntry = 0 as *EnaAdminAcqEntry
+    let result: i32 = ena_admin_exec(dev, @cmd as *EnaAdminAqEntry, @cqe)
     if result != 0
         klog("[ena] Failed to get device attributes\n")
         return result
-
-    # Parse response from CQ
-    let aq: *EnaAdminQueue = @(*dev).admin_queue
-    let prev_head: u16 = ena_get_prev_cq_head(aq)
-    let entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
-    let resp: *EnaAdminDeviceAttrFeature = entry_addr as *EnaAdminDeviceAttrFeature
+    let resp: *EnaAdminDeviceAttrFeature = cqe as *EnaAdminDeviceAttrFeature
 
     # Copy MAC address
     var j: i32 = 0
@@ -707,9 +721,8 @@ fn ena_get_max_queues(dev: *EnaDevice) -> i32
     cmd.common_desc.opcode = ENA_ADMIN_GET_FEATURE
     cmd.feature_id = ENA_ADMIN_MAX_QUEUES_NUM
 
-    let cmd_id: u16 = ena_admin_submit_cmd(dev, @cmd as *EnaAdminAqEntry)
-    let result: i32 = ena_admin_wait_completion(dev, cmd_id)
-
+    var cqe: *EnaAdminAcqEntry = 0 as *EnaAdminAcqEntry
+    let result: i32 = ena_admin_exec(dev, @cmd as *EnaAdminAqEntry, @cqe)
     if result != 0
         klog("[ena] Failed to get max queues (may not be supported)\n")
         # Set defaults
@@ -719,11 +732,7 @@ fn ena_get_max_queues(dev: *EnaDevice) -> i32
         (*dev).max_cq_depth = ENA_IO_QUEUE_DEPTH as u16
         return 0
 
-    # Parse response
-    let aq: *EnaAdminQueue = @(*dev).admin_queue
-    let prev_head: u16 = ena_get_prev_cq_head(aq)
-    let entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
-    let resp: *EnaAdminMaxQueuesFeature = entry_addr as *EnaAdminMaxQueuesFeature
+    let resp: *EnaAdminMaxQueuesFeature = cqe as *EnaAdminMaxQueuesFeature
 
     (*dev).max_tx_queues = ((*resp).max_sq_num / 2) as u16  # Half for TX
     (*dev).max_rx_queues = ((*resp).max_sq_num / 2) as u16  # Half for RX
@@ -765,18 +774,12 @@ fn ena_set_aenq_config(dev: *EnaDevice) -> i32
     get_cmd.common_desc.opcode = ENA_ADMIN_GET_FEATURE
     get_cmd.feature_id = ENA_ADMIN_AENQ_CONFIG
 
-    var cmd_id: u16 = ena_admin_submit_cmd(dev, @get_cmd as *EnaAdminAqEntry)
-    var result: i32 = ena_admin_wait_completion(dev, cmd_id)
-
+    var cqe: *EnaAdminAcqEntry = 0 as *EnaAdminAcqEntry
+    var result: i32 = ena_admin_exec(dev, @get_cmd as *EnaAdminAqEntry, @cqe)
     if result != 0
         klog("[ena] Failed to get AENQ config\n")
         return result
-
-    # Parse response
-    let aq: *EnaAdminQueue = @(*dev).admin_queue
-    var prev_head: u16 = ena_get_prev_cq_head(aq)
-    var entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
-    let resp: *EnaAdminAenqFeature = entry_addr as *EnaAdminAenqFeature
+    let resp: *EnaAdminAenqFeature = cqe as *EnaAdminAenqFeature
 
     let supported: u32 = (*resp).supported_groups
     klog("[ena]   Supported AENQ groups: 0x")
@@ -808,9 +811,7 @@ fn ena_set_aenq_config(dev: *EnaDevice) -> i32
     set_cmd.feature_id = ENA_ADMIN_AENQ_CONFIG
     set_cmd.aenq_enabled_groups = enabled
 
-    cmd_id = ena_admin_submit_cmd(dev, @set_cmd as *EnaAdminAqEntry)
-    result = ena_admin_wait_completion(dev, cmd_id)
-
+    result = ena_admin_exec(dev, @set_cmd as *EnaAdminAqEntry, 0 as **EnaAdminAcqEntry)
     if result != 0
         klog("[ena] Failed to set AENQ config\n")
         return result
@@ -884,18 +885,14 @@ fn ena_create_cq(dev: *EnaDevice, qid: u16, depth: u16, direction: u8, cq_out: *
     klog_dec(entry_size_bytes)
     klog(" bytes)\n")
 
-    let cmd_id: u16 = ena_admin_submit_cmd(dev, @cmd as *EnaAdminAqEntry)
-    let result: i32 = ena_admin_wait_completion(dev, cmd_id)
-
+    var cqe: *EnaAdminAcqEntry = 0 as *EnaAdminAcqEntry
+    let result: i32 = ena_admin_exec(dev, @cmd as *EnaAdminAqEntry, @cqe)
     if result != 0
         klog("[ena] Failed to create CQ\n")
         return result
 
-    # Get response with HW index and interrupt unmask offset
-    let aq: *EnaAdminQueue = @(*dev).admin_queue
-    let prev_head: u16 = ena_get_prev_cq_head(aq)
-    let entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
-    let resp: *EnaAdminCreateCqResp = entry_addr as *EnaAdminCreateCqResp
+    # Response carries the HW index and interrupt unmask offset
+    let resp: *EnaAdminCreateCqResp = cqe as *EnaAdminCreateCqResp
 
     (*cq_out).hw_index = (*resp).cq_idx
     (*cq_out).head_db_offset = (*resp).cq_head_db_offset
@@ -985,18 +982,14 @@ fn ena_create_sq(dev: *EnaDevice, qid: u16, cq_idx: u16, direction: u8, depth: u
     klog("[ena] SQ raw: ")
     ena_dump_bytes(@cmd as *u8, 36)
 
-    let cmd_id: u16 = ena_admin_submit_cmd(dev, @cmd as *EnaAdminAqEntry)
-    let result: i32 = ena_admin_wait_completion(dev, cmd_id)
-
+    var cqe: *EnaAdminAcqEntry = 0 as *EnaAdminAcqEntry
+    let result: i32 = ena_admin_exec(dev, @cmd as *EnaAdminAqEntry, @cqe)
     if result != 0
         klog("[ena] Failed to create SQ\n")
         return result
 
-    # Get doorbell offset from response
-    let aq: *EnaAdminQueue = @(*dev).admin_queue
-    let prev_head: u16 = ena_get_prev_cq_head(aq)
-    let entry_addr: u64 = ena_admin_cq_entry_addr(aq, prev_head)
-    let resp: *EnaAdminCreateSqResp = entry_addr as *EnaAdminCreateSqResp
+    # Response carries the doorbell offset
+    let resp: *EnaAdminCreateSqResp = cqe as *EnaAdminCreateSqResp
 
     (*sq_out).doorbell_offset = (*resp).sq_doorbell_offset
 

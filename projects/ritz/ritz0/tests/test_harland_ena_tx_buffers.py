@@ -233,6 +233,18 @@ var g_tx_cq_prod: u32 = 0
 var g_tx_cq_phase: u8 = 1
 var g_tx_db_off: u32 = 0
 var g_last_tx_db: u32 = 0
+# Admin replies (#4579): the status the next replies carry, and whether the
+# device answers admin doorbells at all (false: every command times out).
+var g_admin_status: u8 = 0
+var g_admin_hold: bool = false
+
+pub fn fake_admin_status(status: u8) -> i32
+    g_admin_status = status
+    return 0
+
+pub fn fake_admin_hold(hold: bool) -> i32
+    g_admin_hold = hold
+    return 0
 
 pub fn mmio_base() -> u64
     return @g_mmio[0] as u64
@@ -269,7 +281,7 @@ fn service()
     let cqe: u64 = cq + (g_cq_idx as u64) * 64
     zero(cqe, 64)
     *(cqe as *u16) = cmd_id
-    *((cqe + 2) as *u8) = 0              # ENA_ADMIN_SUCCESS
+    *((cqe + 2) as *u8) = g_admin_status # 0 = ENA_ADMIN_SUCCESS
     *((cqe + 3) as *u8) = g_cq_phase
     *((cqe + 4) as *u16) = 0
     *((cqe + 6) as *u16) = idx as u16
@@ -346,7 +358,7 @@ fn post_tx_complete()
 
 pub fn on_barrier() -> i32
     let sq: u64 = rd_addr(ENA_REGS_AQ_BASE_LO_OFF, ENA_REGS_AQ_BASE_HI_OFF)
-    if sq != 0
+    if sq != 0 and not g_admin_hold
         let db: u32 = rd32(ENA_REGS_AQ_DB_OFF)
         if db != g_last_db
             g_last_db = db
