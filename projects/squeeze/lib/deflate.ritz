@@ -60,6 +60,74 @@ pub fn hash3(data: *u8, pos: i64) -> i32
     return h as i32
 
 
+# Hash-chain match search, shared by deflate_compressed (fixed Huffman) and
+# deflate_dynamic's LZ77 pass (AGAST #4629). Pinned in test/test_lz77_match.ritz.
+
+# Hash chain limit for a compression level: 4, 16 (level >= 4) or 128 (>= 7).
+pub fn lz77_max_chain(level: i32) -> i32
+    var max_chain: i32 = 4
+    if level >= 4
+        max_chain = 16
+    if level >= 7
+        max_chain = 128
+    return max_chain
+
+
+# Length of the common prefix of input[a..] and input[b..], at most max_len.
+pub fn lz77_match_length(input: *u8, a: i64, b: i64, max_len: i32) -> i32
+    var match_len: i32 = 0
+    while match_len < max_len
+        if input[a + match_len as i64] != input[b + match_len as i64]
+            break
+        match_len = match_len + 1
+    return match_len
+
+
+# Walk the hash chain for pos (at most max_chain links, within the window),
+# then head the chain with pos. Returns the best match length (0 if none
+# reaches MIN_MATCH); its distance goes to *out_dist. pos + 2 < input_len.
+pub fn lz77_find_match(input: *u8, input_len: i64, pos: i64, head: *i32, prev: *i32, max_chain: i32, out_dist: *i32) -> i32
+    var best_len: i32 = 0
+    let h: i32 = hash3(input, pos)
+    var chain_pos: i32 = head[h]
+    var chain_count: i32 = 0
+
+    var max_match_len: i32 = MAX_MATCH
+    if input_len - pos < MAX_MATCH as i64
+        max_match_len = (input_len - pos) as i32
+
+    while chain_pos >= 0
+        if chain_count >= max_chain
+            break
+        let dist: i64 = pos - chain_pos as i64
+        if dist > WINDOW_SIZE as i64
+            break
+
+        let match_len: i32 = lz77_match_length(input, chain_pos as i64, pos, max_match_len)
+        if match_len >= MIN_MATCH and match_len > best_len
+            best_len = match_len
+            out_dist[0] = dist as i32
+
+        chain_pos = prev[chain_pos & (WINDOW_SIZE - 1)]
+        chain_count = chain_count + 1
+
+    let curr_idx: i32 = (pos as i32) & (WINDOW_SIZE - 1)
+    prev[curr_idx] = head[h]
+    head[h] = pos as i32
+    return best_len
+
+
+# Head the hash chains for the bytes a match at pos skips (pos+1 .. pos+len-1).
+pub fn lz77_insert_match_hashes(input: *u8, input_len: i64, pos: i64, len: i32, head: *i32, prev: *i32)
+    for i in 1..len
+        let mpos: i64 = pos + i as i64
+        if mpos + 2 < input_len
+            let mh: i32 = hash3(input, mpos)
+            let midx: i32 = (mpos as i32) & (WINDOW_SIZE - 1)
+            prev[midx] = head[mh]
+            head[mh] = mpos as i32
+
+
 # ============================================================================
 # Main Deflate Function
 # ============================================================================
@@ -168,78 +236,21 @@ fn deflate_compressed(input: *u8, input_len: i64, output: *u8, output_cap: i64, 
         head[i] = -1
         prev[i] = 0
 
-    # Determine max chain length based on compression level
-    var max_chain: i32 = 4
-    if level >= 4
-        max_chain = 16
-    if level >= 7
-        max_chain = 128
-
+    let max_chain: i32 = lz77_max_chain(level)
     var pos: i64 = 0
 
     while pos < input_len
-        # Try to find a match
         var best_len: i32 = 0
         var best_dist: i32 = 0
-
         if pos + 2 < input_len
-            let h: i32 = hash3(input, pos)
-            var chain_pos: i32 = head[h]
-            var chain_count: i32 = 0
-
-            while chain_pos >= 0
-                if chain_count >= max_chain
-                    break
-
-                let dist: i64 = pos - chain_pos as i64
-                if dist > WINDOW_SIZE as i64
-                    break
-
-                # Check match length at this position
-                var match_len: i32 = 0
-                let max_len: i64 = input_len - pos
-                var max_match_len: i32 = MAX_MATCH
-                if max_len < MAX_MATCH as i64
-                    max_match_len = max_len as i32
-
-                while match_len < max_match_len
-                    if input[chain_pos as i64 + match_len as i64] != input[pos + match_len as i64]
-                        break
-                    match_len = match_len + 1
-
-                if match_len >= MIN_MATCH
-                    if match_len > best_len
-                        best_len = match_len
-                        best_dist = dist as i32
-
-                # Move to previous position in chain
-                let prev_idx: i32 = chain_pos & (WINDOW_SIZE - 1)
-                chain_pos = prev[prev_idx]
-                chain_count = chain_count + 1
-
-            # Update hash chain
-            let curr_idx: i32 = (pos as i32) & (WINDOW_SIZE - 1)
-            prev[curr_idx] = head[h]
-            head[h] = pos as i32
+            best_len = lz77_find_match(input, input_len, pos, @head[0], @prev[0], max_chain, @best_dist)
 
         if best_len >= MIN_MATCH
-            # Emit length/distance pair
             huffman_encode_fixed_match(@writer, best_len, best_dist)
-
-            # Update hash chains for all bytes in match
-            for i in 1..best_len
-                let mpos: i64 = pos + i as i64
-                if mpos + 2 < input_len
-                    let mh: i32 = hash3(input, mpos)
-                    let midx: i32 = (mpos as i32) & (WINDOW_SIZE - 1)
-                    prev[midx] = head[mh]
-                    head[mh] = mpos as i32
-
+            lz77_insert_match_hashes(input, input_len, pos, best_len, @head[0], @prev[0])
             pos = pos + best_len as i64
         else
-            # Emit literal
-            let byte: i32 = input[pos] as i32
-            huffman_encode(litlen_enc, byte, @writer)
+            huffman_encode(litlen_enc, input[pos] as i32, @writer)
             pos = pos + 1
 
     # Write end-of-block marker (symbol 256)
@@ -514,71 +525,6 @@ fn compute_hclen(cl_lengths: *u8) -> i32
 # single-function version (pinned in test/test_fixed_huffman_pin.ritz).
 # ----------------------------------------------------------------------------
 
-# Hash chain limit for a compression level: 4, 16 (level >= 4) or 128 (>= 7).
-fn dyn_max_chain(level: i32) -> i32
-    var max_chain: i32 = 4
-    if level >= 4
-        max_chain = 16
-    if level >= 7
-        max_chain = 128
-    return max_chain
-
-
-# Length of the common prefix of input[a..] and input[b..], at most max_len.
-fn dyn_match_length(input: *u8, a: i64, b: i64, max_len: i32) -> i32
-    var match_len: i32 = 0
-    while match_len < max_len
-        if input[a + match_len as i64] != input[b + match_len as i64]
-            break
-        match_len = match_len + 1
-    return match_len
-
-
-# Walk the hash chain for pos (at most max_chain links, within the window),
-# then head the chain with pos. Returns the best match length (0 if none
-# reaches MIN_MATCH); its distance goes to *out_dist. pos + 2 < input_len.
-fn dyn_find_match(input: *u8, input_len: i64, pos: i64, head: *i32, prev: *i32, max_chain: i32, out_dist: *i32) -> i32
-    var best_len: i32 = 0
-    let h: i32 = hash3(input, pos)
-    var chain_pos: i32 = head[h]
-    var chain_count: i32 = 0
-
-    var max_match_len: i32 = MAX_MATCH
-    if input_len - pos < MAX_MATCH as i64
-        max_match_len = (input_len - pos) as i32
-
-    while chain_pos >= 0
-        if chain_count >= max_chain
-            break
-        let dist: i64 = pos - chain_pos as i64
-        if dist > WINDOW_SIZE as i64
-            break
-
-        let match_len: i32 = dyn_match_length(input, chain_pos as i64, pos, max_match_len)
-        if match_len >= MIN_MATCH and match_len > best_len
-            best_len = match_len
-            out_dist[0] = dist as i32
-
-        chain_pos = prev[chain_pos & (WINDOW_SIZE - 1)]
-        chain_count = chain_count + 1
-
-    let curr_idx: i32 = (pos as i32) & (WINDOW_SIZE - 1)
-    prev[curr_idx] = head[h]
-    head[h] = pos as i32
-    return best_len
-
-
-# Head the hash chains for the bytes a match at pos skips (pos+1 .. pos+len-1).
-fn dyn_insert_match_hashes(input: *u8, input_len: i64, pos: i64, len: i32, head: *i32, prev: *i32)
-    for i in 1..len
-        let mpos: i64 = pos + i as i64
-        if mpos + 2 < input_len
-            let mh: i32 = hash3(input, mpos)
-            let midx: i32 = (mpos as i32) & (WINDOW_SIZE - 1)
-            prev[midx] = head[mh]
-            head[mh] = mpos as i32
-
-
 # LZ77 output of the dynamic encoder. A literal has extra == -1; a match has
 # its length code in sym, length extra bits in extra, distance code in dist
 # and distance extra bits in dist_extra.
@@ -599,7 +545,7 @@ fn dyn_lz77_pass(input: *u8, input_len: i64, level: i32, lz: *DynLzBuf, litlen_f
         head[i] = -1
         prev[i] = 0
 
-    let max_chain: i32 = dyn_max_chain(level)
+    let max_chain: i32 = lz77_max_chain(level)
     lz.count = 0
     var pos: i64 = 0
 
@@ -610,7 +556,7 @@ fn dyn_lz77_pass(input: *u8, input_len: i64, level: i32, lz: *DynLzBuf, litlen_f
         var best_len: i32 = 0
         var best_dist: i32 = 0
         if pos + 2 < input_len
-            best_len = dyn_find_match(input, input_len, pos, @head[0], @prev[0], max_chain, @best_dist)
+            best_len = lz77_find_match(input, input_len, pos, @head[0], @prev[0], max_chain, @best_dist)
 
         let n: i32 = lz.count
         if best_len >= MIN_MATCH
@@ -622,7 +568,7 @@ fn dyn_lz77_pass(input: *u8, input_len: i64, level: i32, lz: *DynLzBuf, litlen_f
             lz.dist_extra[n] = best_dist - deflate_distance_base(dist_code)
             litlen_freq[len_code] = litlen_freq[len_code] + 1
             dist_freq[dist_code] = dist_freq[dist_code] + 1
-            dyn_insert_match_hashes(input, input_len, pos, best_len, @head[0], @prev[0])
+            lz77_insert_match_hashes(input, input_len, pos, best_len, @head[0], @prev[0])
             pos = pos + best_len as i64
         else
             let byte: i32 = input[pos] as i32

@@ -1,0 +1,131 @@
+# test/test_lz77_match.ritz - Shared LZ77 hash-chain helpers in deflate.ritz
+#
+# deflate_compressed (fixed Huffman) and deflate_dynamic both search matches
+# through lz77_find_match and head skipped positions with
+# lz77_insert_match_hashes (AGAST #4629). These pin each helper's contract:
+# chain-length and window bounds, the head update after a search, and which
+# positions a match's hash inserts cover. Byte-identity of the encoders that
+# use them is pinned in test_fixed_huffman_pin.ritz.
+
+import ritzlib.sys
+import ritzlib.io
+
+import lib.deflate
+
+
+var g_in: [40000]u8
+var g_head: [32768]i32
+var g_prev: [32768]i32
+
+
+fn lz_reset()
+    for i in 0..32768
+        g_head[i] = -1
+        g_prev[i] = 0
+
+
+fn lz_fill(s: StrView, at: i64)
+    for i in 0..s.len
+        g_in[at + i] = s.ptr[i]
+
+
+fn lz_find(len: i64, pos: i64, max_chain: i32, dist: *i32) -> i32
+    dist[0] = 0
+    return lz77_find_match(@g_in[0], len, pos, @g_head[0], @g_prev[0], max_chain, dist)
+
+
+[[test]]
+fn test_lz77_max_chain_by_level() -> i32
+    if lz77_max_chain(1) != 4 or lz77_max_chain(3) != 4
+        return 1
+    if lz77_max_chain(4) != 16 or lz77_max_chain(6) != 16
+        return 2
+    if lz77_max_chain(7) != 128 or lz77_max_chain(9) != 128
+        return 3
+    return 0
+
+
+[[test]]
+fn test_lz77_match_length_stops_at_mismatch_and_cap() -> i32
+    lz_fill("abcabdabcabc", 0)
+    if lz77_match_length(@g_in[0], 0, 3, 9) != 2
+        return 1  # "ab" then c != d
+    if lz77_match_length(@g_in[0], 0, 6, 6) != 5
+        return 2  # "abcab" then d != c
+    if lz77_match_length(@g_in[0], 0, 6, 2) != 2
+        return 3  # capped by max_len
+    return 0
+
+
+[[test]]
+fn test_lz77_find_match_longest_within_input() -> i32
+    lz_reset()
+    lz_fill("abcabcabc", 0)
+    var dist: i32 = 0
+    # pos 0: empty chain, no match, but pos 0 now heads its chain
+    if lz_find(9, 0, 4, @dist) != 0
+        return 1
+    if g_head[hash3(@g_in[0], 0)] != 0
+        return 2
+    # pos 3: matches pos 0 for the 6 bytes left, distance 3
+    if lz_find(9, 3, 4, @dist) != 6 or dist != 3
+        return 3
+    if g_head[hash3(@g_in[0], 3)] != 3
+        return 4
+    return 0
+
+
+[[test]]
+fn test_lz77_find_match_chain_limit() -> i32
+    lz_reset()
+    lz_fill("abcabcabc", 0)
+    var dist: i32 = 0
+    lz_find(9, 0, 4, @dist)
+    # max_chain 0 walks no links but still heads the chain
+    if lz_find(9, 3, 0, @dist) != 0
+        return 1
+    if g_head[hash3(@g_in[0], 3)] != 3
+        return 2
+    return 0
+
+
+[[test]]
+fn test_lz77_find_match_window_bound() -> i32
+    # A match exactly WINDOW_SIZE (32768) back is found; one byte further is not.
+    for i in 0..40000
+        g_in[i] = '.'
+    lz_fill("xyzwA", 0)
+    lz_fill("xyzwB", 32768)
+    var dist: i32 = 0
+    lz_reset()
+    lz_find(40000, 0, 128, @dist)
+    if lz_find(40000, 32768, 128, @dist) != 4 or dist != 32768
+        return 1
+    lz_fill("xyzwC", 32769)
+    lz_reset()
+    lz_find(40000, 0, 128, @dist)
+    if lz_find(40000, 32769, 128, @dist) != 0
+        return 2  # 32769 back: past the window
+    return 0
+
+
+[[test]]
+fn test_lz77_insert_match_hashes_covers_skipped_positions() -> i32
+    lz_reset()
+    lz_fill("abcdefg", 0)
+    # A 5-byte match at 0 in a 7-byte input skips 1..4; only 1..4 with
+    # mpos + 2 < 7 get hashed (1, 2, 3, 4), and 0 itself is left alone.
+    lz77_insert_match_hashes(@g_in[0], 7, 0, 5, @g_head[0], @g_prev[0])
+    if g_head[hash3(@g_in[0], 0)] != -1
+        return 1
+    for p in 1..5
+        if g_head[hash3(@g_in[0], p as i64)] != p as i32
+            return 2
+    # Input of 6: position 4 has no 3 bytes left and must not be hashed
+    lz_reset()
+    lz77_insert_match_hashes(@g_in[0], 6, 0, 5, @g_head[0], @g_prev[0])
+    if g_head[hash3(@g_in[0], 3)] != 3
+        return 3
+    if g_head[hash3(@g_in[0], 4)] != -1
+        return 4
+    return 0

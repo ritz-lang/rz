@@ -41,6 +41,7 @@ squeeze/
 │   ├── test_hashchain_simd.ritz
 │   ├── test_huffman.ritz
 │   ├── test_inflate.ritz
+│   ├── test_lz77_match.ritz  # Shared LZ77 hash-chain helpers (find/insert/bounds)
 │   ├── test_squeeze.ritz
 │   ├── test_zlib.ritz
 │   └── test_zlib_stream.ritz
@@ -61,7 +62,7 @@ file documented both. squeeze is `test_only = true` with no `[[bin]]`, so
 Run from the **monorepo root**. `rz` sets `RITZ_PATH` itself.
 
 ```bash
-# Run all tests — 18 .ritz test files, 215 [[test]] functions.
+# Run all tests — 19 .ritz test files, 222 [[test]] functions.
 # Takes several minutes; budget for it.
 ./rz test squeeze
 ```
