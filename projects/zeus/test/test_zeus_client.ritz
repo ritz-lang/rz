@@ -11,6 +11,9 @@
 
 import ritzlib.sys
 import ritzlib.io
+import ritzlib.fd { Fd, fd_adopt }
+import ritzlib.result
+import ritzlib.errno
 
 # Import our library
 import zeus.zeus_client
@@ -61,7 +64,7 @@ fn test_zeus_client_init_destroy() -> i32
 
     # Check initial state
     assert client.state == ZEUS_CLIENT_STATE_INIT
-    assert client.socket_fd == -1
+    assert client.socket_fd.raw() == -1
     assert client.worker_count == 0
 
     zeus_client_destroy(@client)
@@ -77,7 +80,7 @@ fn test_worker_handle_init() -> i32
     worker_handle_init(@handle)
 
     assert handle.slot_idx == -1
-    assert handle.shm_fd == -1
+    assert handle.shm_fd.raw() == -1
     assert handle.shm_base == null
 
     return 0
@@ -233,6 +236,8 @@ fn test_scm_rights_send_recv_fd() -> i32
     if sp_result < 0
         prints("FAIL: socketpair failed\n")
         return 1
+    var end0: Fd = fd_adopt(sv[0])
+    var end1: Fd = fd_adopt(sv[1])
 
     # Create shm region to get an fd to send
     var shm_cfg: ShmConfig
@@ -242,8 +247,8 @@ fn test_scm_rights_send_recv_fd() -> i32
     let create_result: i32 = shm_create(@region, @shm_cfg)
     if create_result < 0
         prints("FAIL: shm_create failed\n")
-        sys_close(sv[0])
-        sys_close(sv[1])
+        end0.close()
+        end1.close()
         return 1
 
     # Write magic byte to the shm region
@@ -251,57 +256,58 @@ fn test_scm_rights_send_recv_fd() -> i32
     *test_data = 0x42  # Magic byte
 
     # Send the fd via SCM_RIGHTS
-    let send_result: i32 = scm_rights_send_fd(sv[0], region.fd)
+    let send_result: i32 = scm_rights_send_fd(end0.raw(), region.fd)
     if send_result < 0
         prints("FAIL: scm_rights_send_fd failed\n")
         shm_destroy(@region)
-        sys_close(sv[0])
-        sys_close(sv[1])
+        end0.close()
+        end1.close()
         return 1
 
     # Receive the fd via SCM_RIGHTS
     var received_fd: i32 = -1
-    let recv_result: i32 = scm_rights_recv_fd(sv[1], @received_fd)
+    let recv_result: i32 = scm_rights_recv_fd(end1.raw(), @received_fd)
     if recv_result < 0
         prints("FAIL: scm_rights_recv_fd failed\n")
         shm_destroy(@region)
-        sys_close(sv[0])
-        sys_close(sv[1])
+        end0.close()
+        end1.close()
         return 1
 
     # Verify we got a valid fd
     if received_fd < 0
         prints("FAIL: received_fd is invalid\n")
         shm_destroy(@region)
-        sys_close(sv[0])
-        sys_close(sv[1])
+        end0.close()
+        end1.close()
         return 1
+    var received: Fd = fd_adopt(received_fd)
 
     # Map the received fd and check the magic byte
     let recv_data: *u8 = sys_mmap(0, region.size, PROT_READ, MAP_SHARED, received_fd, 0)
     if recv_data == (-1 as *u8)
         prints("FAIL: mmap of received fd failed\n")
-        sys_close(received_fd)
+        received.close()
         shm_destroy(@region)
-        sys_close(sv[0])
-        sys_close(sv[1])
+        end0.close()
+        end1.close()
         return 1
 
     if *recv_data != 0x42
         prints("FAIL: magic byte mismatch\n")
         sys_munmap(recv_data, region.size)
-        sys_close(received_fd)
+        received.close()
         shm_destroy(@region)
-        sys_close(sv[0])
-        sys_close(sv[1])
+        end0.close()
+        end1.close()
         return 1
 
     # Cleanup
     sys_munmap(recv_data, region.size)
-    sys_close(received_fd)
+    received.close()
     shm_destroy(@region)
-    sys_close(sv[0])
-    sys_close(sv[1])
+    end0.close()
+    end1.close()
     return 0
 
 # ============================================================================

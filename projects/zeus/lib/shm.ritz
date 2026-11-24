@@ -10,6 +10,9 @@
 # The fd can be passed to worker processes via fork() or unix socket.
 
 import ritzlib.sys
+import ritzlib.fd { Fd, fd_adopt }
+import ritzlib.result
+import ritzlib.errno
 import zeus.control
 import zeus.ring
 import zeus.arena
@@ -109,17 +112,19 @@ pub fn shm_create(region: *ShmRegion, cfg: *ShmConfig) -> i32
     let fd: i32 = sys_memfd_create(c"zeus_shm", MFD_CLOEXEC)
     if fd < 0
         return fd
+    var memfd: Fd = fd_adopt(fd)
 
     # Set size
-    let ret: i32 = sys_ftruncate(fd, total_size)
-    if ret < 0
-        sys_close(fd)
-        return ret
+    match memfd.truncate(total_size)
+        Ok(_) => pass
+        Err(e) =>
+            memfd.close()
+            return -e.code()
 
     # Map the memory
     let base: *u8 = sys_mmap(0, total_size, PROT_READ + PROT_WRITE, MAP_SHARED, fd, 0)
     if base == (-1) as *u8
-        sys_close(fd)
+        memfd.close()
         return -1
 
     # Store region info
@@ -182,8 +187,9 @@ pub fn shm_attach(region: *ShmRegion, fd: i32, size: i64) -> i32
 pub fn shm_destroy(region: *ShmRegion)
     if region.base != null && region.size > 0
         sys_munmap(region.base, region.size)
-    if region.fd >= 0
-        sys_close(region.fd)
+    # region.fd stays an i32: shm_attach stores a number it does not own
+    var memfd: Fd = fd_adopt(region.fd)
+    memfd.close()
     region.base = null
     region.size = 0
     region.fd = -1

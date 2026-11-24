@@ -17,6 +17,11 @@ import ritzlib.string { String, string_from, string_from_cstr }
 import ritzlib.os.env { env_raw_envp, env_get_or }
 import ritzlib.strview
 import ritzlib.span { Span, span_from_ptr }
+import ritzlib.fd { Fd, fd_open }
+import ritzlib.fs { mkdir, rmdir, unlink }
+import ritzlib.process { ProcessResult, wait_pid }
+import ritzlib.result
+import ritzlib.errno
 import zeus.main_helpers
 
 # ============================================================================
@@ -357,6 +362,26 @@ fn scratch_dir(tag: *u8) -> String
     scratch_dir_in(env_get_or("TMPDIR", ""), tag)
 
 
+# Write `<head><record>\n` to `script` as an executable (0755) file.
+fn write_script(script: *u8, head: StrView, record: *u8) -> bool
+    match fd_open(strview_from_cstr(script), O_WRONLY | O_CREAT | O_TRUNC, 493)
+        Ok(f) =>
+            var file: Fd = f
+            file.write_str(head)
+            file.write_str(strview_from_cstr(record))
+            file.write_str("\n")
+            file.close()
+            true
+        Err(_) => false
+
+
+# A descriptor for spawn_worker's shm_fd: /dev/null, left open as before.
+fn dev_null_raw() -> i32
+    match fd_open("/dev/null", O_RDONLY, 0)
+        Ok(f) => f.raw()
+        Err(e) => -e.code()
+
+
 # Exec a script that writes its arguments to `out`, wait, read them back.
 fn spawn_and_capture(dir: *u8, worker_count: i32, out: *u8, out_cap: i64) -> i64
     var script: [256]u8
@@ -368,29 +393,26 @@ fn spawn_and_capture(dir: *u8, worker_count: i32, out: *u8, out_cap: i64) -> i64
     memcpy(@record[d], c"/argv", 6)
 
     # #!/bin/sh + `echo "$@" > <dir>/argv`
-    let fd: i32 = sys_open3(@script[0], 577, 493)    # O_WRONLY|O_CREAT|O_TRUNC, 0755
-    if fd < 0
+    if !write_script(@script[0], "#!/bin/sh\necho \"$@\" > ", @record[0])
         return -1
-    let head: *u8 = c"#!/bin/sh\necho \"$@\" > "
-    sys_write(fd, head, strlen(head))
-    sys_write(fd, @record[0], strlen(@record[0]))
-    sys_write(fd, c"\n", 1)
-    sys_close(fd)
 
-    let shm: i32 = sys_open(c"/dev/null", 0)
+    let shm: i32 = dev_null_raw()
     let pid: i32 = spawn_worker(shm, 4096, 7, worker_count, @script[0])
     if pid <= 0
         return -2
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
+    wait_pid(pid)
 
-    let rfd: i32 = sys_open(@record[0], 0)
-    if rfd < 0
-        return -3
-    let got: i64 = sys_read(rfd, out, out_cap)
-    sys_close(rfd)
-    sys_unlink(@record[0])
-    sys_unlink(@script[0])
+    var got: i64 = 0
+    match fd_open(strview_from_cstr(@record[0]), O_RDONLY, 0)
+        Ok(f) =>
+            var rf: Fd = f
+            match rf.read(Span<u8> { ptr: out, len: out_cap })
+                Ok(k) => got = k
+                Err(e) => got = -(e.code() as i64)
+            rf.close()
+        Err(_) => return -3
+    unlink(strview_from_cstr(@record[0]))
+    unlink(strview_from_cstr(@script[0]))
     got
 
 
@@ -444,10 +466,10 @@ fn test_scratch_dir_follows_tmpdir() -> i32
     if ok == 0
         return 1
     let d: *u8 = dir.as_ptr()
-    sys_mkdir(d, 448)
+    mkdir(strview_from_cstr(d), 448)
     var out: [64]u8
     let n: i64 = spawn_and_capture(d, 2, @out[0], 64)
-    sys_rmdir(d)
+    rmdir(strview_from_cstr(d))
     if n <= 0
         return 2
     0
@@ -456,10 +478,10 @@ fn test_scratch_dir_follows_tmpdir() -> i32
 [[test]]
 fn test_spawn_worker_passes_worker_count() -> i32
     var dir: String = scratch_dir(c"zeus-argv-")
-    sys_mkdir(dir.as_ptr(), 448)
+    mkdir(strview_from_cstr(dir.as_ptr()), 448)
     var out: [64]u8
     let n: i64 = spawn_and_capture(dir.as_ptr(), 3, @out[0], 64)
-    sys_rmdir(dir.as_ptr())
+    rmdir(strview_from_cstr(dir.as_ptr()))
     if n < 0
         return 1
     # "<shm_size> <worker_id> <worker_count>\n"
@@ -509,7 +531,7 @@ fn test_spawn_worker_passes_the_environment() -> i32
         return 100     # no usable variable to look for
     var dir: String = scratch_dir(c"zeus-env-")
     let d: *u8 = dir.as_ptr()
-    sys_mkdir(d, 448)
+    mkdir(strview_from_cstr(d), 448)
     let dl: i64 = strlen(d)
     var script: [256]u8
     var record: [256]u8
@@ -519,38 +541,38 @@ fn test_spawn_worker_passes_the_environment() -> i32
     memcpy(@record[dl], c"/env", 5)
 
     # #!/bin/sh + `env > <dir>/env`
-    let fd: i32 = sys_open3(@script[0], 577, 493)
-    if fd < 0
+    if !write_script(@script[0], "#!/bin/sh\nenv > ", @record[0])
         return 1
-    let head: *u8 = c"#!/bin/sh\nenv > "
-    sys_write(fd, head, strlen(head))
-    sys_write(fd, @record[0], strlen(@record[0]))
-    sys_write(fd, c"\n", 1)
-    sys_close(fd)
 
-    let shm: i32 = sys_open(c"/dev/null", 0)
+    let shm: i32 = dev_null_raw()
     let pid: i32 = spawn_worker(shm, 4096, 0, 1, @script[0])
     if pid <= 0
         return 2
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
+    wait_pid(pid)
 
     let cap: i64 = 262144
     let out: *u8 = malloc(cap + 1)
-    let rfd: i32 = sys_open(@record[0], 0)
     var n: i64 = 0
-    if rfd >= 0
-        loop
-            let r: i64 = sys_read(rfd, out + n, cap - n)
-            if r <= 0
-                break
-            n += r
-        sys_close(rfd)
+    var opened: bool = false
+    match fd_open(strview_from_cstr(@record[0]), O_RDONLY, 0)
+        Ok(f) =>
+            opened = true
+            var rf: Fd = f
+            loop
+                var r: i64 = 0
+                match rf.read(Span<u8> { ptr: out + n, len: cap - n })
+                    Ok(k) => r = k
+                    Err(_) => r = -1
+                if r <= 0
+                    break
+                n += r
+            rf.close()
+        Err(_) => pass
     *(out + n) = 0
-    sys_unlink(@record[0])
-    sys_unlink(@script[0])
-    sys_rmdir(d)
-    if rfd < 0
+    unlink(strview_from_cstr(@record[0]))
+    unlink(strview_from_cstr(@script[0]))
+    rmdir(strview_from_cstr(d))
+    if !opened
         return 3
     let found: bool = strstr(out, want) != null
     free(out)

@@ -21,6 +21,10 @@
 #   [IPC via shared memory rings]
 
 import ritzlib.sys
+import ritzlib.fd { Fd, fd_adopt }
+import ritzlib.span { Span }
+import ritzlib.result
+import ritzlib.errno
 import zeus.shm
 import zeus.control
 import zeus.ring
@@ -96,14 +100,14 @@ pub fn zeus_client_config_init(cfg: *ZeusClientConfig, max_workers: i32, connect
 
 pub struct WorkerHandle
     slot_idx: i32               # Slot index from daemon
-    shm_fd: i32                 # Shared memory fd (received via SCM_RIGHTS)
+    shm_fd: Fd                  # Shared memory fd (received via SCM_RIGHTS)
     shm_size: i64               # Size of shared memory region
     shm_base: *u8               # Base address after mmap
     attached: i32               # 1 if attached to shm, 0 otherwise
 
 pub fn worker_handle_init(handle: *WorkerHandle)
     handle.slot_idx = -1
-    handle.shm_fd = -1
+    handle.shm_fd = fd_adopt(-1)
     handle.shm_size = 0
     handle.shm_base = null
     handle.attached = 0
@@ -114,9 +118,7 @@ pub fn worker_handle_destroy(handle: *WorkerHandle)
         handle.shm_base = null
         handle.attached = 0
 
-    if handle.shm_fd >= 0
-        sys_close(handle.shm_fd)
-        handle.shm_fd = -1
+    handle.shm_fd.close()
 
     handle.slot_idx = -1
     handle.shm_size = 0
@@ -128,7 +130,7 @@ pub fn worker_handle_destroy(handle: *WorkerHandle)
 pub struct ZeusClient
     config: ZeusClientConfig   # Configuration
     state: i32                  # Current state
-    socket_fd: i32              # Connection to daemon
+    socket_fd: Fd               # Connection to daemon
     _pad1: i32                  # Padding
 
     workers: *WorkerHandle      # Array of worker handles (mmap'd)
@@ -149,7 +151,7 @@ pub fn zeus_client_init(client: *ZeusClient, cfg: *ZeusClientConfig) -> i32
     client.config.connect_timeout_ms = cfg.connect_timeout_ms
 
     client.state = ZEUS_CLIENT_STATE_INIT
-    client.socket_fd = -1
+    client.socket_fd = fd_adopt(-1)
     client.worker_count = 0
     client.max_workers = cfg.max_workers
     client.next_request_id = 1
@@ -190,9 +192,7 @@ pub fn zeus_client_destroy(client: *ZeusClient)
         client.workers = null
 
     # Close socket
-    if client.socket_fd >= 0
-        sys_close(client.socket_fd)
-        client.socket_fd = -1
+    client.socket_fd.close()
 
     client.state = ZEUS_CLIENT_STATE_CLOSED
 
@@ -231,12 +231,13 @@ pub fn zeus_client_connect(client: *ZeusClient, socket_path: *u8) -> i32
 
     # Connect
     let result: i32 = syscall3(SYS_CONNECT, fd as i64, @addr[0] as i64, (2 + i) as i64) as i32
+    var sock: Fd = fd_adopt(fd)
     if result < 0
-        sys_close(fd)
+        sock.close()
         client.state = ZEUS_CLIENT_STATE_ERROR
         return result
 
-    client.socket_fd = fd
+    client.socket_fd = sock
     client.state = ZEUS_CLIENT_STATE_CONNECTED
     return 0
 
@@ -398,17 +399,17 @@ pub fn scm_rights_recv_fd(sock: i32, out_fd: *i32) -> i32
 
 # Send a message to daemon
 pub fn zeus_client_send(client: *ZeusClient, msg: *ClientMessage) -> i32
-    if client.socket_fd < 0
+    if !client.socket_fd.valid()
         return -1
 
-    let result: i64 = sys_write(client.socket_fd, msg as *u8, 8)  # sizeof(ClientMessage)
-    if result < 0
-        return result as i32
+    match client.socket_fd.write(Span<u8> { ptr: msg as *u8, len: 8 })  # sizeof(ClientMessage)
+        Err(e) => return -e.code()
+        Ok(_) => pass
     return 0
 
 # Receive a message from daemon (may include fd via SCM_RIGHTS)
 pub fn zeus_client_recv(client: *ZeusClient, msg: *DaemonMessage, out_fd: *i32) -> i32
-    if client.socket_fd < 0
+    if !client.socket_fd.valid()
         return -1
 
     *out_fd = -1
@@ -435,7 +436,7 @@ pub fn zeus_client_recv(client: *ZeusClient, msg: *DaemonMessage, out_fd: *i32) 
     hdr.msg_controllen = 32
     hdr.msg_flags = 0
 
-    let result: i64 = syscall3(SYS_RECVMSG, client.socket_fd as i64, @hdr as i64, 0)
+    let result: i64 = syscall3(SYS_RECVMSG, client.socket_fd.raw() as i64, @hdr as i64, 0)
     if result < 0
         return result as i32
 
@@ -506,12 +507,12 @@ pub fn zeus_client_recv_worker(client: *ZeusClient) -> i32
     if result < 0
         return result
 
+    var shm: Fd = fd_adopt(shm_fd)
     if msg.msg_type != DAEMON_MSG_WORKER_INFO
-        if shm_fd >= 0
-            sys_close(shm_fd)
+        shm.close()
         return -1
 
-    if shm_fd < 0
+    if !shm.valid()
         # No fd received
         return -1
 
@@ -523,11 +524,11 @@ pub fn zeus_client_recv_worker(client: *ZeusClient) -> i32
             # Attach to shm
             let base: *u8 = sys_mmap(0, msg.shm_size, PROT_READ + PROT_WRITE, MAP_SHARED, shm_fd, 0)
             if base == (-1 as *u8)
-                sys_close(shm_fd)
+                shm.close()
                 return -1
 
             handle.slot_idx = msg.worker_idx
-            handle.shm_fd = shm_fd
+            handle.shm_fd = shm
             handle.shm_size = msg.shm_size
             handle.shm_base = base
             handle.attached = 1
@@ -537,7 +538,7 @@ pub fn zeus_client_recv_worker(client: *ZeusClient) -> i32
         i = i + 1
 
     # No free slots
-    sys_close(shm_fd)
+    shm.close()
     return -1
 
 # Get worker handle by local index

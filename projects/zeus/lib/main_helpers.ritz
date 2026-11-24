@@ -13,6 +13,10 @@ import ritzlib.os.env { env_raw_envp }
 import ritzlib.option
 import ritzlib.strview { StrView, strview_from_cstr }
 import ritzlib.span { Span }
+import ritzlib.fd { Fd, fd_adopt }
+import ritzlib.process { ForkResult, fork }
+import ritzlib.result
+import ritzlib.errno
 
 # ============================================================================
 # Constants
@@ -209,12 +213,11 @@ pub fn spawn_worker(shm_fd: i32, shm_size: i64, worker_id: i32, worker_count: i3
     let zeus_pid: i32 = sys_getpid()
     # Built (and cached) in zeus, so the child allocates nothing after fork.
     let envp: **u8 = env_raw_envp()
-    let pid: i32 = sys_fork()
-    if pid < 0
-        return -1
-    if pid > 0
-        # Parent - return child pid
-        return pid
+    match fork()
+        Err(_) => return -1
+        Ok(fr) => match fr
+            Parent(pid) => return pid   # Parent - return child pid
+            Child => pass
 
     # Child process
     worker_child_signal_setup(zeus_pid)
@@ -224,8 +227,9 @@ pub fn spawn_worker(shm_fd: i32, shm_size: i64, worker_id: i32, worker_count: i3
 
     # Dup shm_fd to fd 3 if it's not already
     if shm_fd != 3
-        sys_dup2(shm_fd, 3)
-        sys_close(shm_fd)
+        var shm: Fd = fd_adopt(shm_fd)
+        shm.dup_to(3)
+        shm.close()
 
     # Build argv for exec
     # zeus-worker <shm_size> <worker_id> <worker_count>
@@ -245,7 +249,8 @@ pub fn spawn_worker(shm_fd: i32, shm_size: i64, worker_id: i32, worker_count: i3
     argv[3] = @count_str[0]
     argv[4] = null
 
-    # Exec (doesn't return on success)
+    # Exec (doesn't return on success). Raw execve, not process.exec: exec
+    # allocates argv after fork, and this child allocates nothing.
     sys_execve(app_path, @argv[0], envp)
 
     # If we get here, exec failed
@@ -330,4 +335,5 @@ pub fn worker_child_signal_setup(zeus_pid: i32)
 pub fn signal_self_pipe_write(fd: i32, signum: i32)
     var buf: [1]u8
     buf[0] = signum as u8
-    sys_write(fd, @buf[0], 1)
+    let pipe_end: Fd = fd_borrow(fd)
+    pipe_end.write(Span<u8> { ptr: @buf[0], len: 1 })

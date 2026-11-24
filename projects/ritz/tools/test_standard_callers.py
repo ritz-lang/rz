@@ -55,7 +55,7 @@ PINS = {
     "tempest": 1,
     "tome": 397,
     "valet": 240,
-    "zeus": 156,
+    "zeus": 77,
 }
 
 

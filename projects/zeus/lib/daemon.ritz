@@ -12,6 +12,12 @@
 #   - Minimal overhead in steady state
 
 import ritzlib.sys
+import ritzlib.fd { Fd, Pipe, fd_adopt, pipe }
+import ritzlib.fs { unlink }
+import ritzlib.span { Span }
+import ritzlib.strview { strview_from_cstr }
+import ritzlib.result
+import ritzlib.errno
 import zeus.shm
 import zeus.control
 import zeus.ring
@@ -104,12 +110,12 @@ pub struct DaemonContext
     max_workers: i32            # 52: Maximum workers
 
     # Socket
-    listen_fd: i32              # 56: Unix socket fd
+    listen_fd: Fd               # 56: Unix socket fd
     _pad2: i32                  # 60: Padding
 
     # Signal handling
-    signal_read_fd: i32         # 64: Read end of signal pipe
-    signal_write_fd: i32        # 68: Write end of signal pipe
+    signal_read_fd: Fd          # 64: Read end of signal pipe
+    signal_write_fd: Fd         # 68: Write end of signal pipe
 
 # ============================================================================
 # Lifecycle
@@ -126,7 +132,7 @@ pub fn daemon_init(ctx: *DaemonContext, cfg: *DaemonConfig) -> i32
     ctx.state = DAEMON_STATE_IDLE
     ctx.worker_count = 0
     ctx.max_workers = cfg.worker_count
-    ctx.listen_fd = -1
+    ctx.listen_fd = fd_adopt(-1)
 
     # Allocate worker slots
     let slot_size: i64 = (MAX_WORKERS as i64) * 72  # sizeof(WorkerSlot) ~ 72
@@ -145,18 +151,17 @@ pub fn daemon_init(ctx: *DaemonContext, cfg: *DaemonConfig) -> i32
         i = i + 1
 
     # Create signal pipe
-    var pipe_fds: [2]i32
-    let pipe_result: i32 = sys_pipe(@pipe_fds[0])
-    if pipe_result < 0
-        sys_munmap(ctx.workers as *u8, slot_size)
-        return -1
-
-    ctx.signal_read_fd = pipe_fds[0]
-    ctx.signal_write_fd = pipe_fds[1]
+    match pipe()
+        Ok(p) =>
+            ctx.signal_read_fd = p.read
+            ctx.signal_write_fd = p.write
+        Err(_) =>
+            sys_munmap(ctx.workers as *u8, slot_size)
+            return -1
 
     # Set pipe to non-blocking
-    set_nonblocking(ctx.signal_read_fd)
-    set_nonblocking(ctx.signal_write_fd)
+    set_nonblocking(ctx.signal_read_fd.raw())
+    set_nonblocking(ctx.signal_write_fd.raw())
 
     return 0
 
@@ -184,18 +189,11 @@ pub fn daemon_destroy(ctx: *DaemonContext)
         ctx.workers = null
 
     # Close socket
-    if ctx.listen_fd >= 0
-        sys_close(ctx.listen_fd)
-        ctx.listen_fd = -1
+    ctx.listen_fd.close()
 
     # Close signal pipe
-    if ctx.signal_read_fd >= 0
-        sys_close(ctx.signal_read_fd)
-        ctx.signal_read_fd = -1
-
-    if ctx.signal_write_fd >= 0
-        sys_close(ctx.signal_write_fd)
-        ctx.signal_write_fd = -1
+    ctx.signal_read_fd.close()
+    ctx.signal_write_fd.close()
 
     ctx.state = DAEMON_STATE_STOPPED
 
@@ -363,9 +361,10 @@ pub fn daemon_create_socket(ctx: *DaemonContext, path: *u8) -> i32
     let fd: i32 = syscall3(SYS_SOCKET, 1, 1, 0) as i32
     if fd < 0
         return fd
+    var sock: Fd = fd_adopt(fd)
 
     # Unlink existing socket file
-    sys_unlink(path)
+    unlink(strview_from_cstr(path))
 
     # Bind to path
     var addr: [110]u8  # sockaddr_un size
@@ -388,16 +387,16 @@ pub fn daemon_create_socket(ctx: *DaemonContext, path: *u8) -> i32
     # bind(fd, addr, addrlen)
     let bind_result: i32 = syscall3(SYS_BIND, fd as i64, @addr[0] as i64, (2 + i) as i64) as i32
     if bind_result < 0
-        sys_close(fd)
+        sock.close()
         return bind_result
 
     # listen(fd, backlog)
     let listen_result: i32 = syscall2(SYS_LISTEN, fd as i64, 16) as i32
     if listen_result < 0
-        sys_close(fd)
+        sock.close()
         return listen_result
 
-    ctx.listen_fd = fd
+    ctx.listen_fd = sock
     return 0
 
 # ============================================================================
@@ -408,7 +407,7 @@ pub fn daemon_create_socket(ctx: *DaemonContext, path: *u8) -> i32
 pub fn daemon_notify_signal(ctx: *DaemonContext, signum: i32)
     var buf: [1]u8
     buf[0] = signum as u8
-    sys_write(ctx.signal_write_fd, @buf[0], 1)
+    ctx.signal_write_fd.write(Span<u8> { ptr: @buf[0], len: 1 })
 
 # ============================================================================
 # Worker Info for Valet
