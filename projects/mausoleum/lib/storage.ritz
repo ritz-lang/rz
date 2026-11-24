@@ -27,6 +27,8 @@ import ritzlib.fd
 import ritzlib.fs
 import ritzlib.str
 import ritzlib.strview
+import ritzlib.string
+import ritzlib.span
 import ritzlib.memory
 import ritzlib.option
 
@@ -87,7 +89,7 @@ struct Storage
     wal_writer: *WalWriter
     recovery_mgr: *RecoveryManager
 
-    base_path: *u8
+    base_path: String
     base_path_len: i32
 
     meta: StorageMeta
@@ -103,17 +105,6 @@ struct Storage
     current_lsn: i64        # Current LSN for the active transaction
 
     is_open: i32
-
-# ============================================================================
-# Path Building Helpers
-# ============================================================================
-
-fn build_path(base: *u8, base_len: i32, suffix: StrView, buf: *u8) -> i32
-    let blen: i64 = base_len as i64
-    memcpy(buf, base, blen)
-    memcpy(buf + blen, suffix.ptr, suffix.len)
-    *(buf + blen + suffix.len) = 0
-    return (blen + suffix.len) as i32
 
 # ============================================================================
 # Metadata Operations
@@ -233,11 +224,11 @@ fn storage_entry_index(storage: *Storage, id: i32) -> i64
 fn storage_apply_recovered(storage: *Storage, rec: *NamedCollectionMeta) -> i32
     let e: *NamedCollectionMeta = storage_entry(storage, rec.id as i32)
     if e != null
-        memcpy(@e.meta as *u8, @rec.meta as *u8, sizeof(CollectionMeta))
+        e.meta = rec.meta
         return ERR_OK
     if storage.meta.coll_count >= MAX_COLLECTIONS as i64
         return ERR_FULL
-    memcpy((storage.colls + storage.meta.coll_count) as *u8, rec as *u8, sizeof(NamedCollectionMeta))
+    *(storage.colls + storage.meta.coll_count) = *rec
     storage.meta.coll_count += 1
     return ERR_OK
 
@@ -247,8 +238,7 @@ fn storage_open_fail(storage: *Storage)
         free(storage.colls as *u8)
     if storage.coll_dirty != null
         free(storage.coll_dirty)
-    if storage.base_path != null
-        free(storage.base_path)
+    storage.base_path.deinit()
     free(storage as *u8)
 
 # ============================================================================
@@ -260,26 +250,24 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
     if path == null
         return None
 
-    let path_len: i64 = strlen(path)
+    let base: StrView = strview_from_cstr(path)
+    let path_len: i64 = base.len
     if path_len <= 0 or path_len > 200
+        return None
+
+    # Copy base path
+    let base_copy: String = string_from(base)
+    if base_copy.len() != path_len
         return None
 
     # Allocate storage structure
     let storage: *Storage = malloc(sizeof(Storage)) as *Storage
     if storage == null
         return None
-    storage.base_path = null
-    storage.colls = null
-    storage.coll_dirty = null
-
-    # Copy base path
-    let base_copy: *u8 = malloc(path_len + 1)
-    if base_copy == null
-        storage_open_fail(storage)
-        return None
-    memcpy(base_copy, path, path_len + 1)
     storage.base_path = base_copy
     storage.base_path_len = path_len as i32
+    storage.colls = null
+    storage.coll_dirty = null
 
     # The collection table (AGAST #3637).
     storage.colls = malloc(MAX_COLLECTIONS as i64 * sizeof(NamedCollectionMeta)) as *NamedCollectionMeta
@@ -298,16 +286,16 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
     storage.is_open = 0
 
     # Create the directory; it may already exist (Err(Exist) is fine).
-    mkdir(strview_from_ptr(base_copy, path_len), 493)  # 0755
+    mkdir(base, 493)  # 0755
 
-    # Build paths
+    # Build paths (base is at most 200 bytes)
     var data_path: [256]u8
     var wal_path: [256]u8
     var meta_path: [256]u8
 
-    build_path(base_copy, storage.base_path_len, DATA_FILE_NAME, @data_path[0])
-    build_path(base_copy, storage.base_path_len, WAL_FILE_NAME, @wal_path[0])
-    build_path(base_copy, storage.base_path_len, META_FILE_NAME, @meta_path[0])
+    m7m_path_join(@data_path, base, DATA_FILE_NAME)
+    m7m_path_join(@wal_path, base, WAL_FILE_NAME)
+    m7m_path_join(@meta_path, base, META_FILE_NAME)
 
     # Open or create meta file
     var is_new: i32 = 0
@@ -431,9 +419,7 @@ pub fn storage_close(storage: *Storage) -> i32
         storage.meta_fd.close()
 
     # Free base path
-    if storage.base_path != null
-        free(storage.base_path)
-        storage.base_path = null
+    storage.base_path.deinit()
 
     storage.is_open = 0
     return ERR_OK
@@ -757,8 +743,8 @@ pub fn storage_set_collection_meta_of(storage: *Storage, id: i32, meta: *Collect
     if idx < 0
         return ERR_NOT_FOUND
     let e: *NamedCollectionMeta = storage.colls + idx
-    if memcmp(@e.meta as *u8, meta as *u8, sizeof(CollectionMeta)) != 0
-        memcpy(@e.meta as *u8, meta as *u8, sizeof(CollectionMeta))
+    if not collection_meta_eq(@e.meta, meta)
+        e.meta = *meta
         *(storage.coll_dirty + idx) = 1
         storage.meta_dirty = 1
     return ERR_OK
@@ -772,7 +758,7 @@ pub fn storage_collection_meta_of(storage: *Storage, id: i32, out: *CollectionMe
     let e: *NamedCollectionMeta = storage_entry(storage, id)
     if e == null
         return -1
-    memcpy(out as *u8, @e.meta as *u8, sizeof(CollectionMeta))
+    *out = e.meta
     if out.root_page_id == INVALID_PAGE_ID
         return 0
     return 1

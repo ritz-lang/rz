@@ -19,6 +19,8 @@
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
+import ritzlib.option
+import ritzlib.string
 
 import mausoleum.m7m_types
 import mausoleum.page
@@ -56,8 +58,7 @@ struct Txn
 struct TxnManager
     pool: *BufferPool               # Buffer pool for page access
     wal_writer: *WalWriter          # WAL for durability
-    wal_path: *u8                   # Base path for WAL files
-    wal_path_len: i32
+    wal_path: String                  # Base path for WAL files
 
     next_txn_id: i64                # Next transaction ID to assign
     commit_ts: i64                  # Global commit timestamp counter
@@ -84,18 +85,16 @@ pub fn txn_mgr_new(pool: *BufferPool, wal_path: *u8) -> *TxnManager
         return null
 
     # Copy WAL path
-    let path_len: i64 = strlen(wal_path)
-    let path_copy: *u8 = malloc(path_len + 1)
-    if path_copy == null
-        free(mgr as *u8)
-        return null
-    memcpy(path_copy, wal_path, path_len + 1)
+    var path_copy: String = match m7m_path_copy(wal_path)
+        Some(s) => s
+        None =>
+            free(mgr as *u8)
+            return null
 
     # Allocate active transaction slots
     let active_size: i64 = MAX_ACTIVE_TXNS * sizeof(Txn)
     let active_txns: *Txn = malloc(active_size) as *Txn
     if active_txns == null
-        free(path_copy)
         free(mgr as *u8)
         return null
     memset(active_txns as *u8, 0, active_size)
@@ -105,7 +104,6 @@ pub fn txn_mgr_new(pool: *BufferPool, wal_path: *u8) -> *TxnManager
     let committed_txns: *i64 = malloc(committed_capacity * 8) as *i64
     if committed_txns == null
         free(active_txns as *u8)
-        free(path_copy)
         free(mgr as *u8)
         return null
 
@@ -114,7 +112,6 @@ pub fn txn_mgr_new(pool: *BufferPool, wal_path: *u8) -> *TxnManager
     if wal_writer == null
         free(committed_txns as *u8)
         free(active_txns as *u8)
-        free(path_copy)
         free(mgr as *u8)
         return null
 
@@ -123,7 +120,6 @@ pub fn txn_mgr_new(pool: *BufferPool, wal_path: *u8) -> *TxnManager
         wal_writer_destroy(wal_writer)
         free(committed_txns as *u8)
         free(active_txns as *u8)
-        free(path_copy)
         free(mgr as *u8)
         return null
 
@@ -131,7 +127,6 @@ pub fn txn_mgr_new(pool: *BufferPool, wal_path: *u8) -> *TxnManager
     mgr.pool = pool
     mgr.wal_writer = wal_writer
     mgr.wal_path = path_copy
-    mgr.wal_path_len = path_len as i32
     mgr.next_txn_id = 1
     mgr.commit_ts = 1
     mgr.active_txns = active_txns
@@ -163,8 +158,7 @@ pub fn txn_mgr_destroy(mgr: *TxnManager)
     if mgr.active_txns != null
         free(mgr.active_txns as *u8)
 
-    if mgr.wal_path != null
-        free(mgr.wal_path)
+    mgr.wal_path.deinit()
 
     free(mgr as *u8)
 

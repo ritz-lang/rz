@@ -41,7 +41,7 @@ PINS = {
     "indium": 123,
     "larb": 3,
     "lexis": 10,
-    "mausoleum": 651,
+    "mausoleum": 501,
     "nexus": 73,
     "prism": 7,
     "ritz": 2281,

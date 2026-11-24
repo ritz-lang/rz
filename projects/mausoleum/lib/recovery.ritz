@@ -16,6 +16,7 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.memory
+import ritzlib.string
 import ritzlib.option
 
 import mausoleum.m7m_types
@@ -63,8 +64,7 @@ struct TxnEntry
 struct RecoveryManager
     pool: *BufferPool           # Buffer pool for page recovery
     wal_writer: *WalWriter      # WAL writer (for checkpoints)
-    wal_path: *u8               # Base path for WAL files
-    wal_path_len: i32
+    wal_path: String              # Base path for WAL files
 
     # Active transaction table
     txn_table: *TxnEntry        # Array of active transactions
@@ -91,25 +91,22 @@ pub fn recovery_mgr_new(pool: *BufferPool, wal_path: *u8) -> *RecoveryManager
         return null
 
     # Copy WAL path
-    let path_len: i64 = strlen(wal_path)
-    let path_copy: *u8 = malloc(path_len + 1)
-    if path_copy == null
-        free(mgr as *u8)
-        return null
-    memcpy(path_copy, wal_path, path_len + 1)
+    var path_copy: String = match m7m_path_copy(wal_path)
+        Some(s) => s
+        None =>
+            free(mgr as *u8)
+            return null
 
     # Allocate transaction table. Size by sizeof: a literal 24 undersized the
     # 32-byte TxnEntry and overflowed past 192 transactions (AGAST #3683).
     let txn_table: *TxnEntry = malloc(MAX_ACTIVE_TXNS * sizeof(TxnEntry)) as *TxnEntry
     if txn_table == null
-        free(path_copy)
         free(mgr as *u8)
         return null
 
     let metas: *NamedCollectionMeta = malloc(MAX_COLLECTIONS as i64 * sizeof(NamedCollectionMeta)) as *NamedCollectionMeta
     if metas == null
         free(txn_table as *u8)
-        free(path_copy)
         free(mgr as *u8)
         return null
 
@@ -117,7 +114,6 @@ pub fn recovery_mgr_new(pool: *BufferPool, wal_path: *u8) -> *RecoveryManager
     mgr.pool = pool
     mgr.wal_writer = null
     mgr.wal_path = path_copy
-    mgr.wal_path_len = path_len as i32
     mgr.txn_table = txn_table
     mgr.txn_count = 0
 
@@ -146,8 +142,7 @@ pub fn recovery_mgr_destroy(mgr: *RecoveryManager)
     if mgr.metas != null
         free(mgr.metas as *u8)
 
-    if mgr.wal_path != null
-        free(mgr.wal_path)
+    mgr.wal_path.deinit()
 
     free(mgr as *u8)
 
@@ -204,12 +199,8 @@ pub fn recovery_recover(mgr: *RecoveryManager) -> i32
 
     # Build WAL file path
     var path_buf: [256]u8
-    let base_len: i64 = mgr.wal_path_len as i64
-    memcpy(@path_buf[0], mgr.wal_path, base_len)
-    let suffix: StrView = ".wal.000000"
-    memcpy(@path_buf[base_len], suffix.ptr, suffix.len)
-    # A StrView carries no NUL; wal_reader_open needs a C string (AGAST #1560).
-    path_buf[base_len + suffix.len] = 0
+    # wal_reader_open needs a C string: path_join NUL-terminates (AGAST #1560).
+    m7m_path_join(@path_buf, mgr.wal_path.as_view(), ".wal.000000")
 
     # Try to open WAL file
     let reader: *WalReader = wal_reader_new()
@@ -426,7 +417,7 @@ pub fn recovery_checkpoint(mgr: *RecoveryManager) -> i32
 
     # Create WAL writer if needed
     if mgr.wal_writer == null
-        mgr.wal_writer = wal_writer_new(mgr.wal_path)
+        mgr.wal_writer = wal_writer_new(mgr.wal_path.as_ptr())
         if mgr.wal_writer == null
             return ERR_NO_MEMORY
         let open_result: i32 = wal_writer_open(mgr.wal_writer)
@@ -456,12 +447,12 @@ fn recovery_put_meta(mgr: *RecoveryManager, entry: *NamedCollectionMeta) -> i32
     while i < mgr.meta_count
         let cur: *NamedCollectionMeta = mgr.metas + i
         if cur.id == entry.id
-            memcpy(cur as *u8, entry as *u8, sizeof(NamedCollectionMeta))
+            *cur = *entry
             return ERR_OK
         i += 1
     if mgr.meta_count >= MAX_COLLECTIONS
         return ERR_FULL
-    memcpy((mgr.metas + mgr.meta_count) as *u8, entry as *u8, sizeof(NamedCollectionMeta))
+    *(mgr.metas + mgr.meta_count) = *entry
     mgr.meta_count += 1
     return ERR_OK
 
@@ -476,7 +467,7 @@ pub fn recovery_collection_meta_count(mgr: *RecoveryManager) -> i32
 pub fn recovery_collection_meta_at(mgr: *RecoveryManager, i: i32, out: *NamedCollectionMeta) -> i32
     if mgr == null or out == null or i < 0 or i >= mgr.meta_count
         return 0
-    memcpy(out as *u8, (mgr.metas + i) as *u8, sizeof(NamedCollectionMeta))
+    *out = *(mgr.metas + i)
     return 1
 
 pub fn recovery_stats(mgr: *RecoveryManager) -> *RecoveryStats

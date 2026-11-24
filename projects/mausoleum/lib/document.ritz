@@ -10,6 +10,7 @@
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.strview
+import ritzlib.span
 
 import mausoleum.m7m_types
 
@@ -187,6 +188,12 @@ pub fn field_string_ptr(f: *Field) -> *u8
 pub fn field_string_len(f: *Field) -> i64
     return f.len_val
 
+# A STRING or BYTES field's bytes as a StrView (empty for any other type).
+pub fn field_string_view(f: *Field) -> StrView
+    if f.len_val <= 0
+        return strview_empty()
+    return strview_from_ptr(f.ptr_val, f.len_val)
+
 pub fn field_bytes_ptr(f: *Field) -> *u8
     return f.ptr_val
 
@@ -238,21 +245,20 @@ pub fn doc_init(doc: *Document, id: *DocumentId)
     doc.field_count = 0
     doc.link_count = 0
     # Zero out field and link arrays
-    memset(@doc.fields[0] as *u8, 0, 64 * sizeof(FieldEntry))
-    memset(@doc.links[0] as *u8, 0, 32 * sizeof(Link))
+    let fields: Span<FieldEntry> = @doc.fields
+    fields.fill(FieldEntry { key: [0; 64], value: field_null() })
+    let links: Span<Link> = @doc.links
+    links.fill(Link { label: [0; 32], target: DocumentId { value: 0 } })
 
 # ============================================================================
 # Field Operations
 # ============================================================================
 
 # Find field index by key, returns -1 if not found
-# Takes raw ptr + len to avoid ownership complications
-fn doc_find_field_index(doc: *Document, key_ptr: *u8, key_len: i64) -> i32
+fn doc_find_field_index(doc: *Document, key: StrView) -> i32
     var i: i32 = 0
     while i < doc.field_count
-        # Build temporary StrView for comparison
-        let key: StrView = strview_from_ptr(key_ptr, key_len)
-        if key.eq_cstr(@doc.fields[i].key[0])
+        if key.eq(m7m_name_view(@doc.fields[i].key))
             return i
         i = i + 1
     return -1
@@ -261,12 +267,8 @@ fn doc_find_field_index(doc: *Document, key_ptr: *u8, key_len: i64) -> i32
 # key: Field name as StrView
 # value: Field value to set
 pub fn doc_set_field(doc: *Document, key: StrView, value: *Field) -> i32
-    # Store ptr and len before key is moved
-    let key_ptr: *u8 = key.ptr
-    let key_len: i64 = key.len
-
     # Check if field exists
-    var idx: i32 = doc_find_field_index(doc, key_ptr, key_len)
+    var idx: i32 = doc_find_field_index(doc, key)
     if idx >= 0
         # Update existing field
         doc.fields[idx].value = *value
@@ -277,12 +279,10 @@ pub fn doc_set_field(doc: *Document, key: StrView, value: *Field) -> i32
     if doc.field_count >= MAX_FIELDS as i32
         return ERR_FULL
 
-    if key_len > MAX_KEY_LEN
+    if key.len > MAX_KEY_LEN
         return ERR_INVALID
 
-    # Copy key (use ptr since we need null-terminated storage)
-    memcpy(@doc.fields[doc.field_count].key[0], key_ptr, key_len)
-    doc.fields[doc.field_count].key[key_len] = 0  # Null terminate
+    m7m_name_store(@doc.fields[doc.field_count].key, key)
     doc.fields[doc.field_count].value = *value
     doc.field_count = doc.field_count + 1
     doc.updated_at = m7m_timestamp_now()
@@ -292,7 +292,7 @@ pub fn doc_set_field(doc: *Document, key: StrView, value: *Field) -> i32
 # key: Field name as StrView
 # out: Output field value
 pub fn doc_get_field(doc: *Document, key: StrView, out: *Field) -> i32
-    var idx: i32 = doc_find_field_index(doc, key.ptr, key.len)
+    var idx: i32 = doc_find_field_index(doc, key)
     if idx < 0
         return ERR_NOT_FOUND
     *out = doc.fields[idx].value
@@ -300,7 +300,7 @@ pub fn doc_get_field(doc: *Document, key: StrView, out: *Field) -> i32
 
 # Remove a field from a document
 pub fn doc_remove_field(doc: *Document, key: StrView) -> i32
-    var idx: i32 = doc_find_field_index(doc, key.ptr, key.len)
+    var idx: i32 = doc_find_field_index(doc, key)
     if idx < 0
         return ERR_NOT_FOUND
 
@@ -315,7 +315,7 @@ pub fn doc_remove_field(doc: *Document, key: StrView) -> i32
     return ERR_OK
 
 pub fn doc_has_field(doc: *Document, key: StrView) -> i32
-    if doc_find_field_index(doc, key.ptr, key.len) >= 0
+    if doc_find_field_index(doc, key) >= 0
         return 1
     return 0
 
@@ -353,16 +353,16 @@ pub fn doc_touch(doc: *Document)
 # ============================================================================
 
 # Find link index by label and target, returns -1 if not found
-fn doc_find_link_index(doc: *Document, label: *u8, target: *DocumentId) -> i32
+fn doc_find_link_index(doc: *Document, label: StrView, target: *DocumentId) -> i32
     var i: i32 = 0
     while i < doc.link_count
-        if strcmp(@doc.links[i].label[0], label) == 0
+        if label.eq(m7m_name_view(@doc.links[i].label))
             if doc_id_eq(@doc.links[i].target, target) == 1
                 return i
         i = i + 1
     return -1
 
-pub fn doc_add_link(doc: *Document, label: *u8, target: *DocumentId) -> i32
+pub fn doc_add_link(doc: *Document, label: StrView, target: *DocumentId) -> i32
     # Check if link already exists
     var idx: i32 = doc_find_link_index(doc, label, target)
     if idx >= 0
@@ -371,22 +371,21 @@ pub fn doc_add_link(doc: *Document, label: *u8, target: *DocumentId) -> i32
     if doc.link_count >= MAX_LINKS as i32
         return ERR_FULL
 
-    var label_len: i64 = strlen(label)
-    if label_len > MAX_LINK_LABEL_LEN
+    if label.len > MAX_LINK_LABEL_LEN
         return ERR_INVALID
 
-    strcpy(@doc.links[doc.link_count].label[0], label)
+    m7m_name_store(@doc.links[doc.link_count].label, label)
     doc.links[doc.link_count].target = *target
     doc.link_count = doc.link_count + 1
     doc.updated_at = m7m_timestamp_now()
     return ERR_OK
 
-pub fn doc_has_link(doc: *Document, label: *u8, target: *DocumentId) -> i32
+pub fn doc_has_link(doc: *Document, label: StrView, target: *DocumentId) -> i32
     if doc_find_link_index(doc, label, target) >= 0
         return 1
     return 0
 
-pub fn doc_remove_link(doc: *Document, label: *u8, target: *DocumentId) -> i32
+pub fn doc_remove_link(doc: *Document, label: StrView, target: *DocumentId) -> i32
     var idx: i32 = doc_find_link_index(doc, label, target)
     if idx < 0
         return ERR_NOT_FOUND
@@ -401,11 +400,11 @@ pub fn doc_remove_link(doc: *Document, label: *u8, target: *DocumentId) -> i32
     doc.updated_at = m7m_timestamp_now()
     return ERR_OK
 
-pub fn doc_link_count_by_label(doc: *Document, label: *u8) -> i32
+pub fn doc_link_count_by_label(doc: *Document, label: StrView) -> i32
     var count: i32 = 0
     var i: i32 = 0
     while i < doc.link_count
-        if strcmp(@doc.links[i].label[0], label) == 0
+        if label.eq(m7m_name_view(@doc.links[i].label))
             count = count + 1
         i = i + 1
     return count

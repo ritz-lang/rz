@@ -23,6 +23,8 @@ import ritzlib.sys
 import ritzlib.fd
 import ritzlib.str
 import ritzlib.strview
+import ritzlib.string
+import ritzlib.option
 import ritzlib.memory
 
 import mausoleum.m7m_types
@@ -124,8 +126,7 @@ struct WalWriter
     current_lsn: i64            # Current LSN counter
     segment_num: i32            # Current segment number
     segment_pos: i64            # Position in current segment
-    base_path: *u8              # Base path for WAL files
-    base_path_len: i32          # Length of base path
+    base_path: String           # Base path for WAL files
 
 # ============================================================================
 # WAL Writer Creation/Destruction
@@ -148,13 +149,12 @@ pub fn wal_writer_new(base_path: *u8) -> *WalWriter
         return null
 
     # Copy base path
-    let path_len: i64 = strlen(base_path)
-    let path_copy: *u8 = malloc(path_len + 1)
-    if path_copy == null
-        free(buffer)
-        free(writer as *u8)
-        return null
-    memcpy(path_copy, base_path, path_len + 1)
+    var path_copy: String = match m7m_path_copy(base_path)
+        Some(s) => s
+        None =>
+            free(buffer)
+            free(writer as *u8)
+            return null
 
     # Initialize
     writer.fd = fd_adopt(-1)
@@ -164,7 +164,6 @@ pub fn wal_writer_new(base_path: *u8) -> *WalWriter
     writer.segment_num = 0
     writer.segment_pos = 0
     writer.base_path = path_copy
-    writer.base_path_len = path_len as i32
 
     return writer
 
@@ -175,13 +174,7 @@ pub fn wal_writer_open(writer: *WalWriter) -> i32
 
     # Build segment file name
     var path_buf: [256]u8
-    let base_len: i64 = writer.base_path_len as i64
-    memcpy(@path_buf[0], writer.base_path, base_len)
-
-    # Add segment suffix (e.g., ".wal.000000")
-    let suffix: StrView = ".wal.000000"
-    memcpy(@path_buf[base_len], suffix.ptr, suffix.len)
-    path_buf[base_len + 11] = 0
+    m7m_path_join(@path_buf, writer.base_path.as_view(), ".wal.000000")
 
     # Open file
     match fd_open(strview_from_cstr(@path_buf[0]), O_RDWR | O_CREAT | O_APPEND, 420)
@@ -215,8 +208,7 @@ pub fn wal_writer_destroy(writer: *WalWriter)
 
     if writer.buffer != null
         free(writer.buffer)
-    if writer.base_path != null
-        free(writer.base_path)
+    writer.base_path.deinit()
 
     free(writer as *u8)
 
@@ -379,9 +371,7 @@ pub fn wal_write_insert(w: *WalWriter, tid: i64, prev: i64, pid: i64, off: i32, 
     payload.data_len = data_len
 
     # Calculate checksum over header + payload + data
-    var checksum_buf: [64]u8
-    memcpy(@checksum_buf[0], @header as *u8, WAL_HEADER_SIZE - 2)
-    header.checksum = crc16(@checksum_buf[0], WAL_HEADER_SIZE - 2)
+    header.checksum = crc16(@header as *u8, WAL_HEADER_SIZE - 2)
 
     # Write header
     var err: i32 = write_bytes(writer, @header as *u8, WAL_HEADER_SIZE)

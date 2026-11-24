@@ -23,7 +23,7 @@
 # bool and docref values are still indexed so they can match each other.
 
 import ritzlib.memory { malloc, free }
-import ritzlib.str { memcpy }
+import ritzlib.span
 import ritzlib.strview { StrView, strview_from_ptr }
 import ritzlib.option
 
@@ -54,7 +54,9 @@ import mausoleum.document {
     FIELD_STRING,
     FIELD_BYTES,
     FIELD_DOCREF,
-    doc_get_field
+    doc_get_field,
+    field_string,
+    field_string_view
 }
 
 # Indexes one collection can carry.  nexus uses one ("slug").
@@ -197,6 +199,11 @@ pub fn field_index_find(set: *FieldIndexSet, field: *u8, field_len: i32) -> *Fie
     null
 
 
+# The field an index is on.
+fn field_index_name(idx: *FieldIndex) -> StrView
+    return strview_from_ptr(@idx.field[0], idx.field_len as i64)
+
+
 pub fn field_index_has(set: *FieldIndexSet, field: *u8, field_len: i32) -> i32
     if field_index_find(set, field, field_len) != null
         return 1
@@ -215,12 +222,13 @@ pub fn field_index_count(set: *FieldIndexSet) -> i32
 
 # Write a field value's key prefix, the part a lookup shares.  Returns the
 # number of bytes written, or -1 for a value that can't be indexed.
-fn encode_prefix(f: *Field, buf: *u8, cap: i32) -> i32
+fn encode_prefix(f: *Field, buf: Span<u8>) -> i32
+    let cap: i32 = buf.len as i32
     if f.ftype == FIELD_NULL
         return -1
     if cap < 1
         return -1
-    *(buf + 0) = f.ftype as u8
+    buf[0] = f.ftype as u8
     var pos: i32 = 1
 
     if f.ftype == FIELD_STRING or f.ftype == FIELD_BYTES
@@ -231,11 +239,11 @@ fn encode_prefix(f: *Field, buf: *u8, cap: i32) -> i32
             len = VALUE_MAX
         if pos + 2 + len > cap
             return -1
-        *(buf + pos) = ((len >> 8) & 0xFF) as u8
-        *(buf + pos + 1) = (len & 0xFF) as u8
+        buf[pos] = ((len >> 8) & 0xFF) as u8
+        buf[pos + 1] = (len & 0xFF) as u8
         pos += 2
         if len > 0
-            memcpy(buf + pos, f.ptr_val, len as i64)
+            buf.from(pos as i64).copy_from(field_string_view(f).take(len as i64).as_bytes())
             pos += len
         return pos
 
@@ -248,7 +256,7 @@ fn encode_prefix(f: *Field, buf: *u8, cap: i32) -> i32
             v = v ^ 0x8000000000000000
         var i: i32 = 0
         while i < 8
-            *(buf + pos + i) = ((v >> ((7 - i) * 8)) & 0xFF) as u8
+            buf[pos + i] = ((v >> ((7 - i) * 8)) & 0xFF) as u8
             i += 1
         return pos + 8
 
@@ -258,7 +266,7 @@ fn encode_prefix(f: *Field, buf: *u8, cap: i32) -> i32
         var v: i64 = f.ref_val
         var i: i32 = 0
         while i < 8
-            *(buf + pos + i) = ((v >> ((7 - i) * 8)) & 0xFF) as u8
+            buf[pos + i] = ((v >> ((7 - i) * 8)) & 0xFF) as u8
             i += 1
         return pos + 8
 
@@ -301,10 +309,9 @@ pub fn field_index_insert_doc(set: *FieldIndexSet, doc: *Document) -> i32
     while i < set.count
         let idx: *FieldIndex = @set.indexes[i]
         var f: Field
-        let name: StrView = strview_from_ptr(@idx.field[0], idx.field_len as i64)
-        if doc_get_field(doc, name, @f) == ERR_OK and f.ftype != FIELD_NULL
+        if doc_get_field(doc, field_index_name(idx), @f) == ERR_OK and f.ftype != FIELD_NULL
             var key: [KEY_BUF]u8
-            var n: i32 = encode_prefix(@f, @key[0], KEY_BUF)
+            var n: i32 = encode_prefix(@f, @key)
             if n > 0
                 n = append_id(@key[0], n, doc.id.value)
                 if n > 0
@@ -328,10 +335,9 @@ pub fn field_index_delete_doc(set: *FieldIndexSet, doc: *Document) -> i32
     while i < set.count
         let idx: *FieldIndex = @set.indexes[i]
         var f: Field
-        let name: StrView = strview_from_ptr(@idx.field[0], idx.field_len as i64)
-        if doc_get_field(doc, name, @f) == ERR_OK and f.ftype != FIELD_NULL
+        if doc_get_field(doc, field_index_name(idx), @f) == ERR_OK and f.ftype != FIELD_NULL
             var key: [KEY_BUF]u8
-            var n: i32 = encode_prefix(@f, @key[0], KEY_BUF)
+            var n: i32 = encode_prefix(@f, @key)
             if n > 0
                 n = append_id(@key[0], n, doc.id.value)
                 if n > 0
@@ -387,25 +393,24 @@ pub fn field_index_find_string(set: *FieldIndexSet, field: *u8, field_len: i32, 
     if value_len < 0
         return ERR_INVALID
 
-    var prefix: [KEY_BUF]u8
-    prefix[0] = FIELD_STRING as u8
-    var len: i32 = value_len
-    if len > VALUE_MAX
-        len = VALUE_MAX
-    if 3 + len > KEY_BUF
+    if value == null and value_len > 0
         return ERR_INVALID
-    prefix[1] = ((len >> 8) & 0xFF) as u8
-    prefix[2] = (len & 0xFF) as u8
-    if len > 0 and value != null
-        memcpy(@prefix[3], value, len as i64)
-    let plen: i32 = 3 + len
+
+    # The prefix every entry holding `value` starts with.
+    var prefix: [KEY_BUF]u8
+    var vf: Field = field_string(value, value_len as i64)
+    let plen: i32 = encode_prefix(@vf, @prefix)
+    if plen < 0
+        return ERR_INVALID
 
     # Exclusive upper bound: the prefix followed by the largest id bytes.
     var end: [KEY_BUF]u8
-    memcpy(@end[0], @prefix[0], plen as i64)
+    let end_s: Span<u8> = @end
+    let prefix_s: Span<u8> = @prefix
+    end_s.copy_from(prefix_s.to(plen as i64))
     var b: i32 = 0
     while b < 8
-        end[plen + b] = 0xFF
+        end_s[plen + b] = 0xFF
         b += 1
 
     let iter_opt: Option<*BTreeIter> = btree_scan(idx.tree, @prefix[0], plen, @end[0], plen + 8)
