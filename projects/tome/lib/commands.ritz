@@ -1433,29 +1433,14 @@ fn require_auth(ctx: *CommandContext) -> i32
 # Command Dispatcher
 # ============================================================================
 
-# Dispatch a parsed command to the appropriate handler
-pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
-    if cmd.argc == 0
-        let err: StrView = "ERR empty command"
-        ctx_write_error_sv(ctx, err)
-        return CMD_ERR_SYNTAX
+# Returned by a dispatch_* family helper when the command is not one of
+# its own. Every cmd_* handler returns a CMD_* code (0 down to -4), so this
+# never collides with a handler's result.
+const DISPATCH_MISS: i32 = -100
 
-    let c: *RespArg = @cmd.args[0]
 
-    # AUTH command - always allowed (needed to authenticate)
-    let cmd_auth_name: StrView = "AUTH"
-    if resp_arg_eq_ci_sv(c, cmd_auth_name) == 1
-        return cmd_auth(ctx, cmd)
-
-    # Check authentication for all other commands. PING is NOT exempt: with
-    # requirepass set, Redis answers an unauthenticated PING with NOAUTH
-    # (only AUTH/HELLO/QUIT are no-auth), and so does tome (AGAST #1686).
-    if require_auth(ctx) == 0
-        let err: StrView = "NOAUTH Authentication required."
-        ctx_write_error_sv(ctx, err)
-        return CMD_ERR_SYNTAX
-
-    # Server commands (require auth)
+# Server commands; DISPATCH_MISS if c names none of them
+fn dispatch_server(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_ping_name: StrView = "PING"
     if resp_arg_eq_ci_sv(c, cmd_ping_name) == 1
         return cmd_ping(ctx, cmd)
@@ -1474,8 +1459,11 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let cmd_flushdb_name: StrView = "FLUSHDB"
     if resp_arg_eq_ci_sv(c, cmd_flushdb_name) == 1
         return cmd_flushdb(ctx, cmd)
+    return DISPATCH_MISS
 
-    # String commands
+
+# String commands; DISPATCH_MISS if c names none of them
+fn dispatch_string(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_get_name: StrView = "GET"
     if resp_arg_eq_ci_sv(c, cmd_get_name) == 1
         return cmd_get(ctx, cmd)
@@ -1512,8 +1500,11 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let cmd_persist_name: StrView = "PERSIST"
     if resp_arg_eq_ci_sv(c, cmd_persist_name) == 1
         return cmd_persist(ctx, cmd)
+    return DISPATCH_MISS
 
-    # List commands
+
+# List commands; DISPATCH_MISS if c names none of them
+fn dispatch_list(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_lpush_name: StrView = "LPUSH"
     if resp_arg_eq_ci_sv(c, cmd_lpush_name) == 1
         return cmd_lpush(ctx, cmd)
@@ -1535,8 +1526,11 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let cmd_lrange_name: StrView = "LRANGE"
     if resp_arg_eq_ci_sv(c, cmd_lrange_name) == 1
         return cmd_lrange(ctx, cmd)
+    return DISPATCH_MISS
 
-    # Set commands
+
+# Set commands; DISPATCH_MISS if c names none of them
+fn dispatch_set(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_sadd_name: StrView = "SADD"
     if resp_arg_eq_ci_sv(c, cmd_sadd_name) == 1
         return cmd_sadd(ctx, cmd)
@@ -1552,8 +1546,11 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let cmd_smembers_name: StrView = "SMEMBERS"
     if resp_arg_eq_ci_sv(c, cmd_smembers_name) == 1
         return cmd_smembers(ctx, cmd)
+    return DISPATCH_MISS
 
-    # Hash commands
+
+# Hash commands; DISPATCH_MISS if c names none of them
+fn dispatch_hash(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_hset_name: StrView = "HSET"
     if resp_arg_eq_ci_sv(c, cmd_hset_name) == 1
         return cmd_hset(ctx, cmd)
@@ -1578,8 +1575,11 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let cmd_hgetall_name: StrView = "HGETALL"
     if resp_arg_eq_ci_sv(c, cmd_hgetall_name) == 1
         return cmd_hgetall(ctx, cmd)
+    return DISPATCH_MISS
 
-    # Sorted set commands
+
+# Sorted set commands; DISPATCH_MISS if c names none of them
+fn dispatch_zset(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_zadd_name: StrView = "ZADD"
     if resp_arg_eq_ci_sv(c, cmd_zadd_name) == 1
         return cmd_zadd(ctx, cmd)
@@ -1622,6 +1622,51 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let cmd_zrevrangebylex_name: StrView = "ZREVRANGEBYLEX"
     if resp_arg_eq_ci_sv(c, cmd_zrevrangebylex_name) == 1
         return cmd_zrange(ctx, cmd, ZRANGE_BY_LEX, ZDIR_REVERSE, c"zrevrangebylex")
+    return DISPATCH_MISS
+
+
+# Dispatch a parsed command to the appropriate handler
+pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc == 0
+        let err: StrView = "ERR empty command"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_SYNTAX
+
+    let c: *RespArg = @cmd.args[0]
+
+    # AUTH command - always allowed (needed to authenticate)
+    let cmd_auth_name: StrView = "AUTH"
+    if resp_arg_eq_ci_sv(c, cmd_auth_name) == 1
+        return cmd_auth(ctx, cmd)
+
+    # Check authentication for all other commands. PING is NOT exempt: with
+    # requirepass set, Redis answers an unauthenticated PING with NOAUTH
+    # (only AUTH/HELLO/QUIT are no-auth), and so does tome (AGAST #1686).
+    if require_auth(ctx) == 0
+        let err: StrView = "NOAUTH Authentication required."
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_SYNTAX
+
+    # Families in the original match order: server, string, list, set,
+    # hash, sorted set. The first family that knows the name answers.
+    var r: i32 = dispatch_server(ctx, cmd, c)
+    if r != DISPATCH_MISS
+        return r
+    r = dispatch_string(ctx, cmd, c)
+    if r != DISPATCH_MISS
+        return r
+    r = dispatch_list(ctx, cmd, c)
+    if r != DISPATCH_MISS
+        return r
+    r = dispatch_set(ctx, cmd, c)
+    if r != DISPATCH_MISS
+        return r
+    r = dispatch_hash(ctx, cmd, c)
+    if r != DISPATCH_MISS
+        return r
+    r = dispatch_zset(ctx, cmd, c)
+    if r != DISPATCH_MISS
+        return r
 
     # Unknown command
     let err: StrView = "ERR unknown command"

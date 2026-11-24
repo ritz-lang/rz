@@ -1364,6 +1364,224 @@ fn handle_task_event(task: *Task) -> i32
 # Phase 6: encrypted connection handler
 # ============================================================================
 #
+# Per-state helpers for `handle_task_event_encrypted`.  Each returns the
+# handler's own result (1 = close, -1 = keep the task), or ENC_CONTINUE when
+# the state machine falls through to the next state in the same call.
+const ENC_CONTINUE: i32 = 0
+
+# First call: encrypted-mode session init, then await client pubkey.
+fn enc_on_first_event(task: *Task, idx: i32) -> i32
+    if g_draining != 0
+        return 1    # shutting down: close a new connection unserved
+    m7sp_session_init_encrypted(idx)
+    let pool: *TaskPool = task.user_data as *TaskPool
+    if not pool.submit_recv(task)
+        m7sp_session_destroy(idx)
+        return 1
+    return -1
+
+# HANDSHAKE_SEND completed: server pubkey delivered.  Move to the
+# post-handshake encrypted message loop.
+fn enc_on_handshake_sent(task: *Task, idx: i32, session: *M7SPSession) -> i32
+    let hs_progress: i32 = m7sp_send_progress(task, session)
+    if hs_progress < 0 or g_draining != 0
+        m7sp_session_destroy(idx)
+        return 1
+    if hs_progress > 0
+        return -1
+    session.parse_state = PARSE_NEED_HEADER
+    session.have = 0
+    session.msg_len = 0
+    if not task.reset_for_recv()
+        m7sp_session_destroy(idx)
+        return 1
+    return -1
+
+# Encrypted SCAN continuations (parity with the plain handler).  Returns
+# -1/1 when a continuation frame was submitted (or failed), ENC_CONTINUE
+# when no scan frame is pending (scan_active 0, or 3 after tear-down).
+fn enc_scan_continue(task: *Task, idx: i32, session: *M7SPSession) -> i32
+    if session.scan_active == 1
+        # Build the next SCAN_RESULT batch into a stack plaintext
+        # buffer, encrypt into task.write_buf, submit_send.  If this
+        # batch drained the iter, transition to scan_active=2 so the
+        # *next* CQE emits SCAN_END.
+        var pt1: [36864]u8
+        var resp1: MessageBuffer
+        msgbuf_init(@resp1, @pt1[0], ASYNC_MAX_MSG)
+        let last1: i32 = m7sp_scan_build_batch(@resp1, session)
+        if last1 != 0
+            session.scan_active = 2
+        let send_ret1: i32 = m7sp_send_encrypted(task, session, @pt1[0], msgbuf_len(@resp1))
+        if send_ret1 < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
+
+    if session.scan_active == 2
+        # Final SCAN_RESULT (has_more=0) has been delivered; emit the
+        # trailing SCAN_END terminator.  Tiny message — header only.
+        var pt2: [256]u8
+        var resp2: MessageBuffer
+        msgbuf_init(@resp2, @pt2[0], 256)
+        build_scan_end(@resp2, session.scan_request_id)
+        session.scan_active = 3
+        let send_ret2: i32 = m7sp_send_encrypted(task, session, @pt2[0], msgbuf_len(@resp2))
+        if send_ret2 < 0
+            m7sp_session_destroy(idx)
+            return 1
+        return -1
+
+    if session.scan_active == 3
+        # SCAN_END acknowledged — tear down the iter and reset for the
+        # next request on this keep-alive connection.
+        print("  [async/enc] SCAN done - emitted {session.scan_total_emitted} doc(s)\n")
+        if session.scan_iter != 0
+            btree_iter_destroy(session.scan_iter as *BTreeIter)
+            session.scan_iter = 0
+        session.scan_active = 0
+        session.scan_request_id = 0
+        session.scan_max_results = 0
+        session.scan_total_emitted = 0
+    return ENC_CONTINUE
+
+# SENDING completed (encrypted reply delivered): keep-alive.
+#
+# Multi-frame responses (SCAN) need to keep emitting frames until the
+# iter is drained AND the trailing SCAN_END is sent.  Mirrors the
+# plain-path PARSE_SENDING continuation at the top of handle_task_event,
+# but every outbound frame goes through cipher_encrypt_msg before
+# task_submit_send (the client side is symmetric — channel_recv reads
+# one encrypted frame per call, channel_send wraps one plaintext
+# message per call, so frame ↔ message is 1:1 in both directions).
+fn enc_on_reply_sent(task: *Task, idx: i32, session: *M7SPSession) -> i32
+    let progress: i32 = m7sp_send_progress(task, session)
+    if progress < 0
+        m7sp_session_destroy(idx)
+        return 1
+    if progress > 0
+        return -1   # the rest of the frame is on its way
+
+    let scan_rc: i32 = enc_scan_continue(task, idx, session)
+    if scan_rc != ENC_CONTINUE
+        return scan_rc
+
+    # Shutting down: the reply is out, take no further request.
+    if g_draining != 0
+        m7sp_session_destroy(idx)
+        return 1
+
+    session.parse_state = PARSE_NEED_HEADER
+    session.have = 0
+    session.msg_len = 0
+    session.recv_big = 0
+    if not task.reset_for_recv()
+        m7sp_session_destroy(idx)
+        return 1
+    return -1
+
+# Need more bytes: queue another recv.  -1 keeps the task, 1 closes.
+fn enc_recv_more(task: *Task, idx: i32, session: *M7SPSession) -> i32
+    let ret: i32 = m7sp_recv_more(task, session)
+    if ret < 0
+        m7sp_session_destroy(idx)
+        return 1
+    return -1
+
+# HANDSHAKE_RECV: collect 32 bytes of client pubkey.
+fn enc_on_handshake_recv(task: *Task, idx: i32, session: *M7SPSession) -> i32
+    if session.have < ENC_PUBKEY_SIZE
+        return enc_recv_more(task, idx, session)
+
+    # Have full client pubkey — derive session keys, then queue the
+    # server's pubkey for send.  After it ships, the next recv
+    # starts the encrypted post-handshake stream.
+    if m7sp_enc_accept_client_pubkey(idx, @task.read_buf[0]) < 0
+        return 1
+    mem_copy(@task.write_buf[0], @session.cipher_public_key[0], 32)
+
+    session.parse_state = PARSE_HANDSHAKE_SEND
+    let ret: i32 = m7sp_submit_out(task, session, @task.write_buf[0], ENC_PUBKEY_SIZE)
+    if ret < 0
+        m7sp_session_destroy(idx)
+        return 1
+    return -1
+
+# NEED_HEADER (encrypted): collect 4-byte outer length prefix.  Returns
+# ENC_CONTINUE once the frame length is set and the state is NEED_BODY.
+fn enc_on_need_header(task: *Task, idx: i32, session: *M7SPSession) -> i32
+    if session.have < ENC_LEN_PREFIX_SIZE
+        return enc_recv_more(task, idx, session)
+
+    let h: *u8 = @task.read_buf[0]
+    var payload_len: i32 = (*(h + 0) as i32) << 24
+    payload_len = payload_len | ((*(h + 1) as i32) << 16)
+    payload_len = payload_len | ((*(h + 2) as i32) << 8)
+    payload_len = payload_len | (*(h + 3) as i32)
+
+    # Smallest valid payload: nonce (12) + tag (16); zero ciphertext.
+    if payload_len < ENC_NONCE_SIZE + ENC_TAG_SIZE
+        m7sp_session_destroy(idx)
+        return 1
+    let total_msg_len: i32 = ENC_LEN_PREFIX_SIZE + payload_len
+    # Cap matches the plain path: the frame of an ASYNC_MAX_MSG
+    # plaintext; past TASK_BUFFER_SIZE it is collected in big_recv.
+    session.msg_len = total_msg_len
+    if payload_len > ASYNC_MAX_FRAME or m7sp_recv_msg_len_set(task, session, ASYNC_MAX_FRAME) < 0
+        m7sp_session_destroy(idx)
+        return 1
+    session.parse_state = PARSE_NEED_BODY
+    return ENC_CONTINUE
+
+# NEED_BODY (encrypted): collect bytes until full frame.  Returns
+# ENC_CONTINUE once the state is DISPATCHING.
+fn enc_on_need_body(task: *Task, idx: i32, session: *M7SPSession) -> i32
+    if session.have < session.msg_len
+        return enc_recv_more(task, idx, session)
+    session.parse_state = PARSE_DISPATCHING
+    return ENC_CONTINUE
+
+# DISPATCHING: decrypt, parse, dispatch, encrypt, submit_send.
+fn enc_dispatch(task: *Task, idx: i32, session: *M7SPSession) -> i32
+    # Decrypt the inbound frame into a stack plaintext buffer of
+    # ASYNC_MAX_MSG, the most any accepted frame holds.  Stack frame
+    # is ~72 KiB (in + out); well within the 8 MiB process default.
+    var plaintext_in: [36864]u8
+    let plaintext_len: i32 = cipher_decrypt_msg(session, m7sp_msg_bytes(task, session), session.msg_len, @plaintext_in[0], ASYNC_MAX_MSG)
+    if plaintext_len < 0
+        print("  [async/enc] decrypt failed code={plaintext_len}\n")
+        m7sp_session_destroy(idx)
+        return 1
+
+    var reader: MessageReader
+    let parse_rc: i32 = msgreader_init(@reader, @plaintext_in[0], plaintext_len)
+    if parse_rc != PROTO_OK
+        m7sp_session_destroy(idx)
+        return 1
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    let request_id: i32 = msgreader_request_id(@reader)
+
+    # Build the plaintext response (up to ASYNC_MAX_MSG); its frame
+    # goes out from write_buf or big_send (m7sp_send_encrypted).
+    var plaintext_out: [36864]u8
+    var resp: MessageBuffer
+    msgbuf_init(@resp, @plaintext_out[0], ASYNC_MAX_MSG)
+
+    m7sp_dispatch(@reader, @resp, session, msg_type, request_id)
+
+    let resp_len: i32 = msgbuf_len(@resp)
+    if resp_len <= 0
+        m7sp_session_destroy(idx)
+        return 1
+
+    session.parse_state = PARSE_SENDING
+    let ret: i32 = m7sp_send_encrypted(task, session, @plaintext_out[0], resp_len)
+    if ret < 0
+        m7sp_session_destroy(idx)
+        return 1
+    return -1
+
 # Same shape as `handle_task_event`, but with two extra states ahead of
 # NEED_HEADER and a different interpretation of the bytes accumulated in
 # read_buf.  In encrypted mode:
@@ -1382,109 +1600,12 @@ fn handle_task_event_encrypted(task: *Task) -> i32
     let idx: i32 = task_to_session_idx(task)
     let session: *M7SPSession = @g_sessions[idx]
 
-    # ─── First call: encrypted-mode session init, then await client pubkey ───
     if session.in_use == 0
-        if g_draining != 0
-            return 1    # shutting down: close a new connection unserved
-        m7sp_session_init_encrypted(idx)
-        let pool: *TaskPool = task.user_data as *TaskPool
-        if not pool.submit_recv(task)
-            m7sp_session_destroy(idx)
-            return 1
-        return -1
-
-    # ─── HANDSHAKE_SEND completed: server pubkey delivered.  Move to
-    #     post-handshake encrypted message loop. ───
+        return enc_on_first_event(task, idx)
     if session.parse_state == PARSE_HANDSHAKE_SEND
-        let hs_progress: i32 = m7sp_send_progress(task, session)
-        if hs_progress < 0 or g_draining != 0
-            m7sp_session_destroy(idx)
-            return 1
-        if hs_progress > 0
-            return -1
-        session.parse_state = PARSE_NEED_HEADER
-        session.have = 0
-        session.msg_len = 0
-        if not task.reset_for_recv()
-            m7sp_session_destroy(idx)
-            return 1
-        return -1
-
-    # ─── SENDING completed (encrypted reply delivered): keep-alive ───
-    #
-    # Multi-frame responses (SCAN) need to keep emitting frames until the
-    # iter is drained AND the trailing SCAN_END is sent.  Mirrors the
-    # plain-path PARSE_SENDING continuation at the top of handle_task_event,
-    # but every outbound frame goes through cipher_encrypt_msg before
-    # task_submit_send (the client side is symmetric — channel_recv reads
-    # one encrypted frame per call, channel_send wraps one plaintext
-    # message per call, so frame ↔ message is 1:1 in both directions).
+        return enc_on_handshake_sent(task, idx, session)
     if session.parse_state == PARSE_SENDING
-        let progress: i32 = m7sp_send_progress(task, session)
-        if progress < 0
-            m7sp_session_destroy(idx)
-            return 1
-        if progress > 0
-            return -1   # the rest of the frame is on its way
-
-        # ─── Encrypted SCAN continuations (parity with plain handler) ───
-        if session.scan_active == 1
-            # Build the next SCAN_RESULT batch into a stack plaintext
-            # buffer, encrypt into task.write_buf, submit_send.  If this
-            # batch drained the iter, transition to scan_active=2 so the
-            # *next* CQE emits SCAN_END.
-            var pt1: [36864]u8
-            var resp1: MessageBuffer
-            msgbuf_init(@resp1, @pt1[0], ASYNC_MAX_MSG)
-            let last1: i32 = m7sp_scan_build_batch(@resp1, session)
-            if last1 != 0
-                session.scan_active = 2
-            let send_ret1: i32 = m7sp_send_encrypted(task, session, @pt1[0], msgbuf_len(@resp1))
-            if send_ret1 < 0
-                m7sp_session_destroy(idx)
-                return 1
-            return -1
-
-        if session.scan_active == 2
-            # Final SCAN_RESULT (has_more=0) has been delivered; emit the
-            # trailing SCAN_END terminator.  Tiny message — header only.
-            var pt2: [256]u8
-            var resp2: MessageBuffer
-            msgbuf_init(@resp2, @pt2[0], 256)
-            build_scan_end(@resp2, session.scan_request_id)
-            session.scan_active = 3
-            let send_ret2: i32 = m7sp_send_encrypted(task, session, @pt2[0], msgbuf_len(@resp2))
-            if send_ret2 < 0
-                m7sp_session_destroy(idx)
-                return 1
-            return -1
-
-        if session.scan_active == 3
-            # SCAN_END acknowledged — tear down the iter and reset for the
-            # next request on this keep-alive connection.
-            print("  [async/enc] SCAN done - emitted {session.scan_total_emitted} doc(s)\n")
-            if session.scan_iter != 0
-                btree_iter_destroy(session.scan_iter as *BTreeIter)
-                session.scan_iter = 0
-            session.scan_active = 0
-            session.scan_request_id = 0
-            session.scan_max_results = 0
-            session.scan_total_emitted = 0
-            # Fall through to the recv reset below.
-
-        # Shutting down: the reply is out, take no further request.
-        if g_draining != 0
-            m7sp_session_destroy(idx)
-            return 1
-
-        session.parse_state = PARSE_NEED_HEADER
-        session.have = 0
-        session.msg_len = 0
-        session.recv_big = 0
-        if not task.reset_for_recv()
-            m7sp_session_destroy(idx)
-            return 1
-        return -1
+        return enc_on_reply_sent(task, idx, session)
 
     # ─── A recv completed ───
     let n: i32 = task.io_result
@@ -1494,107 +1615,20 @@ fn handle_task_event_encrypted(task: *Task) -> i32
 
     session.have += n
 
-    # ─── HANDSHAKE_RECV: collect 32 bytes of client pubkey ───
     if session.parse_state == PARSE_HANDSHAKE_RECV
-        if session.have < ENC_PUBKEY_SIZE
-            let ret: i32 = m7sp_recv_more(task, session)
-            if ret < 0
-                m7sp_session_destroy(idx)
-                return 1
-            return -1
-
-        # Have full client pubkey — derive session keys, then queue the
-        # server's pubkey for send.  After it ships, the next recv
-        # starts the encrypted post-handshake stream.
-        if m7sp_enc_accept_client_pubkey(idx, @task.read_buf[0]) < 0
-            return 1
-        mem_copy(@task.write_buf[0], @session.cipher_public_key[0], 32)
-
-        session.parse_state = PARSE_HANDSHAKE_SEND
-        let ret: i32 = m7sp_submit_out(task, session, @task.write_buf[0], ENC_PUBKEY_SIZE)
-        if ret < 0
-            m7sp_session_destroy(idx)
-            return 1
-        return -1
-
-    # ─── NEED_HEADER (encrypted): collect 4-byte outer length prefix ───
+        return enc_on_handshake_recv(task, idx, session)
+    # NEED_HEADER falls through to NEED_BODY, which falls through to
+    # DISPATCHING, within a single recv completion.
     if session.parse_state == PARSE_NEED_HEADER
-        if session.have < ENC_LEN_PREFIX_SIZE
-            let ret: i32 = m7sp_recv_more(task, session)
-            if ret < 0
-                m7sp_session_destroy(idx)
-                return 1
-            return -1
-
-        let h: *u8 = @task.read_buf[0]
-        var payload_len: i32 = (*(h + 0) as i32) << 24
-        payload_len = payload_len | ((*(h + 1) as i32) << 16)
-        payload_len = payload_len | ((*(h + 2) as i32) << 8)
-        payload_len = payload_len | (*(h + 3) as i32)
-
-        # Smallest valid payload: nonce (12) + tag (16); zero ciphertext.
-        if payload_len < ENC_NONCE_SIZE + ENC_TAG_SIZE
-            m7sp_session_destroy(idx)
-            return 1
-        let total_msg_len: i32 = ENC_LEN_PREFIX_SIZE + payload_len
-        # Cap matches the plain path: the frame of an ASYNC_MAX_MSG
-        # plaintext; past TASK_BUFFER_SIZE it is collected in big_recv.
-        session.msg_len = total_msg_len
-        if payload_len > ASYNC_MAX_FRAME or m7sp_recv_msg_len_set(task, session, ASYNC_MAX_FRAME) < 0
-            m7sp_session_destroy(idx)
-            return 1
-        session.parse_state = PARSE_NEED_BODY
-
-    # ─── NEED_BODY (encrypted): collect bytes until full frame ───
+        let hdr_rc: i32 = enc_on_need_header(task, idx, session)
+        if hdr_rc != ENC_CONTINUE
+            return hdr_rc
     if session.parse_state == PARSE_NEED_BODY
-        if session.have < session.msg_len
-            let ret: i32 = m7sp_recv_more(task, session)
-            if ret < 0
-                m7sp_session_destroy(idx)
-                return 1
-            return -1
-        session.parse_state = PARSE_DISPATCHING
-
-    # ─── DISPATCHING: decrypt, parse, dispatch, encrypt, submit_send ───
+        let body_rc: i32 = enc_on_need_body(task, idx, session)
+        if body_rc != ENC_CONTINUE
+            return body_rc
     if session.parse_state == PARSE_DISPATCHING
-        # Decrypt the inbound frame into a stack plaintext buffer of
-        # ASYNC_MAX_MSG, the most any accepted frame holds.  Stack frame
-        # is ~72 KiB (in + out); well within the 8 MiB process default.
-        var plaintext_in: [36864]u8
-        let plaintext_len: i32 = cipher_decrypt_msg(session, m7sp_msg_bytes(task, session), session.msg_len, @plaintext_in[0], ASYNC_MAX_MSG)
-        if plaintext_len < 0
-            print("  [async/enc] decrypt failed code={plaintext_len}\n")
-            m7sp_session_destroy(idx)
-            return 1
-
-        var reader: MessageReader
-        let parse_rc: i32 = msgreader_init(@reader, @plaintext_in[0], plaintext_len)
-        if parse_rc != PROTO_OK
-            m7sp_session_destroy(idx)
-            return 1
-
-        let msg_type: i32 = msgreader_msg_type(@reader)
-        let request_id: i32 = msgreader_request_id(@reader)
-
-        # Build the plaintext response (up to ASYNC_MAX_MSG); its frame
-        # goes out from write_buf or big_send (m7sp_send_encrypted).
-        var plaintext_out: [36864]u8
-        var resp: MessageBuffer
-        msgbuf_init(@resp, @plaintext_out[0], ASYNC_MAX_MSG)
-
-        m7sp_dispatch(@reader, @resp, session, msg_type, request_id)
-
-        let resp_len: i32 = msgbuf_len(@resp)
-        if resp_len <= 0
-            m7sp_session_destroy(idx)
-            return 1
-
-        session.parse_state = PARSE_SENDING
-        let ret: i32 = m7sp_send_encrypted(task, session, @plaintext_out[0], resp_len)
-        if ret < 0
-            m7sp_session_destroy(idx)
-            return 1
-        return -1
+        return enc_dispatch(task, idx, session)
 
     # Unreachable in the normal state machine
     m7sp_session_destroy(idx)

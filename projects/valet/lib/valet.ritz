@@ -1368,13 +1368,373 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
     return -1
 
 
+# The request valet_handle_connection is handling: task.read_buf, or a heap
+# buffer when the request outgrew it (AGAST #2104).
+struct ValetReqView
+    buf: *u8
+    len: i32
+    body_len: i64
+    close_after: i32
+
+
+# A state helper's "not answered yet: go on to the next state".  Never a
+# handler return code.
+const VALET_CONN_NEXT: i32 = -1000
+
+
+# Respond, or close if the keep-alive budget is spent.  Returns the handler
+# convention.
+fn valet_conn_next_or_close(task: *Task, app: *Valet) -> i32
+    if task.request_count < app.keepalive_requests
+        let ret = valet_next_request(task)
+        if ret < 0
+            tcp_shutdown(task.fd, SHUT_WR)
+            return 0
+        return -1
+    tcp_shutdown(task.fd, SHUT_WR)
+    return 0
+
+
+# Send the response built in task.write_buf.  Returns the handler convention.
+fn valet_conn_start_send(task: *Task, res: *Response) -> i32
+    task.write_len = res.len
+    task.write_pos = 0
+    task.handler_state = CONN_STATE_SEND
+    let ret = valet_task_send(task, res.len)
+    if ret < 0
+        return 1
+    return -1
+
+
+# A text/plain 500 that closes the connection.
+fn valet_res_500_close(res: *Response, body: *u8, len: i32)
+    response_status(res, 500)
+    response_header(res, c"Content-Type", c"text/plain")
+    response_header(res, c"Connection", c"close")
+    response_content_length(res, len as i64)
+    response_end_headers(res)
+    response_body(res, body, len)
+
+
+# Point the handler context at this request and make it current.
+fn valet_ctx_enter(ctx: *HandlerContext, req: *Request, res: *Response, raw: *u8, raw_len: i32, task: *Task)
+    ctx.req = req
+    ctx.res = res
+    ctx.route_result = null
+    ctx.path = req.path_ptr
+    ctx.path_len = req.path_len
+    ctx.raw_buf = raw
+    ctx.raw_len = raw_len
+    ctx.task = task
+    set_g_ctx(ctx)
+
+
+# A completion in the RECV state: submit the first recv of a fresh task, or
+# end the connection on EOF / error.  VALET_CONN_NEXT when io_result is
+# bytes received.
+fn valet_conn_take_recv(task: *Task) -> i32
+    if task.io_result == TASK_IO_FRESH
+        # Fresh task — never submitted recv.  A previous connection in
+        # this pool slot may have died mid-request; drop its buffer.
+        bigbuf_release_task(task)
+        valet_set_consumed(task, 0)
+        let ret: bool = task.recv()
+        if not ret
+            return 1
+        return -1
+
+    if task.io_result <= 0
+        # EOF (0) or error (<0) — connection done.
+        bigbuf_release_task(task)
+        return 0
+    return VALET_CONN_NEXT
+
+
+# The heap buffer a request is being received into, or null for
+# task.read_buf.
+fn valet_conn_recv_target(task: *Task) -> *BigBuf
+    var big: *BigBuf = null
+    if g_bigbuf_active > 0
+        big = bigbuf_for(task)
+        if big != null and big.mode != BIGBUF_RECV
+            # A finished request's buffer (e.g. after a static
+            # response) — done with it.
+            if big.mode == BIGBUF_PARSED
+                bigbuf_release(big)
+            big = null
+    return big
+
+
+# A whole request of `total` bytes is in `big` (or read_buf): keep what
+# follows it (a pipelined one) for valet_next_request, in read_buf.
+fn valet_conn_keep_rest(task: *Task, big: *BigBuf, total: i64, v: *ValetReqView)
+    if big != null
+        big.mode = BIGBUF_PARSED
+        let rest: i64 = big.len - total
+        if rest > VALET_READ_BUF as i64
+            # Too much to keep: answer this one and close.
+            v.close_after = 1
+            task.read_len = 0
+        else
+            memcpy(@task.read_buf[0], big.ptr + total, rest)
+            task.read_len = rest as i32
+        valet_set_consumed(task, 0)
+    else
+        valet_set_consumed(task, v.len)
+
+
+# State: RECV - read until a whole request is buffered.  `added` bytes came
+# in since the last look.  Fills `v` and moves to PARSE, returning
+# VALET_CONN_NEXT, or returns the handler convention.
+fn valet_conn_frame(task: *Task, v: *ValetReqView, added: i32) -> i32
+    let app: *Valet = get_g_app()
+    let big: *BigBuf = valet_conn_recv_target(task)
+
+    # Append: read_len is 0 for a new request (spawn_task,
+    # task_reset_for_recv), or what is already buffered of this one:
+    # headers not all here yet (AGAST #2201), or a pipelined request
+    # (AGAST #1865).
+    var in_buf: *u8 = @task.read_buf[0]
+    var in_len: i64 = 0
+    if big != null
+        big.len = big.len + added as i64
+        in_buf = big.ptr
+        in_len = big.len
+    else
+        task.read_len = task.read_len + added
+        in_len = task.read_len as i64
+
+    # Where does the request end?  http's lib/h1_framing.ritz decides,
+    # for this server and projects/http alike (AGAST #1865).  Reading
+    # into a heap buffer, it picks up where the last recv left it.
+    var local_frame: H1Frame
+    var f: *H1Frame = valet_frame_slot(task)
+    if f == null
+        f = @local_frame
+        h1_frame_init(f)
+    var total: i64 = 0
+    if big != null
+        total = h1_frame_continue(in_buf, in_len, valet_body_limit(app), f)
+    else
+        total = request_frame(in_buf, in_len as i32, valet_body_limit(app), f)
+    if total == H1F_INCOMPLETE
+        return valet_recv_more(task, app, big, f)
+    if total < 0
+        let code: i32 = h1_frame_status(total)
+        if code == 413
+            log_warn(c"Request too large, closing connection")
+        else
+            log_warn(c"Bad request framing, closing connection")
+        bigbuf_release_task(task)
+        return valet_send_error(task, code)
+    if app.max_request_size > 0 && total > app.max_request_size as i64
+        log_warn(c"Request too large, closing connection")
+        bigbuf_release_task(task)
+        return valet_send_413(task)
+
+    # A chunked body is decoded in place, behind the headers, so a
+    # handler reads it like a Content-Length one.
+    v.body_len = h1_frame_dechunk(in_buf, f)
+    v.buf = in_buf
+    v.len = total as i32
+    valet_conn_keep_rest(task, big, total, v)
+
+    task.handler_state = CONN_STATE_PARSE
+    return VALET_CONN_NEXT
+
+
+# Run a matched route: before interceptors, the handler, after
+# interceptors, building a 500 if the handler failed without answering.
+# Clears the handler context.  Returns 1 when the handler went to the
+# cooperative-yield proxy (state PROXY_WAIT, nothing to send yet), else 0.
+fn valet_conn_run_route(task: *Task, req: *Request, res: *Response, rr: *RouteMatch) -> i32
+    # Run per-route before interceptors
+    let before_result: i32 = route_run_before(rr.route, req.path_ptr, req.path_len)
+    if before_result == MW_HANDLED
+        # Before interceptor handled the request
+        set_g_ctx(null)
+        return 0
+    if before_result == MW_ERROR
+        # Before interceptor error - send 500
+        set_g_ctx(null)
+        valet_res_500_close(res, c"Interceptor Error\n", 18)
+        return 0
+
+    # Call the matched handler
+    let h: fn(*u8, i32) -> i32 = rr.handler
+    let status: i32 = h(req.path_ptr, req.path_len)
+
+    # Cooperative-yield proxy: handler armed a yield SQE and asked for
+    # re-entry on CQE.  Don't send any response yet — transition to
+    # CONN_STATE_PROXY_WAIT.  After-interceptors are deferred until the
+    # continuation finalises the response (typical interceptors don't run
+    # for the proxy path so this is academic in current usage).
+    if status == STATUS_PROXY_PENDING
+        set_g_ctx(null)
+        task.handler_state = CONN_STATE_PROXY_WAIT
+        return 1
+
+    # Run per-route after interceptors (in reverse order)
+    route_run_after(rr.route, req.path_ptr, req.path_len)
+
+    # Clear context
+    set_g_ctx(null)
+
+    # If handler returns non-zero and didn't write response, send 500
+    if status != 0 && res.len == 0
+        valet_res_500_close(res, c"Internal Server Error\n", 22)
+    return 0
+
+
+# Saturate the request count, so the SEND state closes after this response,
+# when the connection won't be reused.
+fn valet_conn_count_request(task: *Task, req: *Request, app: *Valet, close_after: i32)
+    task.request_count += 1
+    if close_after != 0
+        task.request_count = app.keepalive_requests
+
+    # Client won't reuse the connection (HTTP/1.0 without keep-alive,
+    # or "Connection: close"): saturate the counter so every
+    # `request_count < keepalive_requests` check below closes after
+    # this response (AGAST #2106).
+    if valet_keep_alive(req, task.request_count, app.keepalive_requests) == 0
+        task.request_count = app.keepalive_requests
+
+
+# State: PARSE - parse request, route, build response.  Returns the handler
+# convention.
+fn valet_conn_serve(task: *Task, v: *ValetReqView) -> i32
+    var req: Request
+    request_init(@req)
+
+    let parsed = request_parse(@req, v.buf, v.len)
+    if parsed < 0
+        bigbuf_release_task(task)
+        return 0
+    req.content_length = v.body_len
+
+    let app: *Valet = get_g_app()
+    valet_conn_count_request(task, @req, app, v.close_after)
+
+    # Check for static file request first (only for GET requests)
+    if request_is_get(@req) != 0
+        if valet_try_static_raw(app, task, req.path_ptr, req.path_len, v.buf, v.len) != 0
+            # Static file was served - check keep-alive
+            return valet_conn_next_or_close(task, app)
+
+    var res: Response
+    response_init(@res, @task.write_buf[0], 8192)
+
+    # Set up handler context early for middleware access
+    var handler_ctx: HandlerContext
+    valet_ctx_enter(@handler_ctx, @req, @res, v.buf, v.len, task)
+
+    # Run middleware pipeline
+    let mw_result: i32 = router_run_middleware(@app.router, req.path_ptr, req.path_len)
+    if mw_result == MW_HANDLED
+        # Middleware handled the request - send response if any
+        set_g_ctx(null)
+        if res.len > 0
+            return valet_conn_start_send(task, @res)
+        # Middleware handled but no response - keep-alive
+        return valet_conn_next_or_close(task, app)
+    if mw_result == MW_ERROR
+        # Middleware error - send 500
+        set_g_ctx(null)
+        valet_res_500_close(@res, c"Middleware Error\n", 17)
+        return valet_conn_start_send(task, @res)
+
+    # Try to match route
+    var route_result: RouteMatch
+    let matched: i32 = router_match(@app.router, req.method_ptr, req.path_ptr, req.path_len, @route_result)
+
+    if matched == 1
+        # Update context with route result
+        handler_ctx.route_result = @route_result
+        if valet_conn_run_route(task, @req, @res, @route_result) != 0
+            return -1
+    else
+        # No route matched - 404
+        response_not_found(@res)
+
+    return valet_conn_start_send(task, @res)
+
+
+# State: PROXY_WAIT - cooperative-yield proxy continuation.
+# Triggered by a NOP/timer/futex CQE for a task that earlier returned
+# STATUS_PROXY_PENDING.  Dispatch to the registered continuation,
+# which peeks the response ring (peek-by-id) and either builds the
+# final reply (transition to CONN_STATE_SEND) or re-arms the yield.
+fn valet_conn_proxy_wait(task: *Task) -> i32
+    let cont: fn(*Task) -> i32 = get_proxy_continuation()
+    if cont == null
+        # Nothing registered — bail out cleanly rather than spin.
+        return 1
+    # A kernel that refuses IORING_OP_TIMEOUT answers our timer yield
+    # with -EINVAL at once: yield with NOPs from now on (AGAST #183).
+    if g_proxy_timer_ok != 0 and proxy_yield_timer_rejected(task.io_result) != 0
+        g_proxy_timer_ok = 0
+    return cont(task)
+
+
+# A send finished in the SEND state, with a heap buffer active: go on with
+# a large response, and drop a finished large request's buffer.
+# VALET_CONN_NEXT when the large response (if any) is all out.
+fn valet_conn_sent_big(task: *Task) -> i32
+    let b: *BigBuf = sendbuf_for(task)
+    if b != null and b.mode == BIGBUF_SEND
+        if task.io_result == 0
+            bigbuf_release_task(task)
+            return 1
+        b.pos = b.pos + task.io_result as i64
+        if b.pos < b.len
+            # Short send: resume from where the kernel stopped.
+            if not task.send_buf(Span<u8> { ptr: (b.ptr + b.pos), len: ((b.len - b.pos) as i32) as i64 })
+                bigbuf_release_task(task)
+                return 1
+            return -1
+        bigbuf_release(b)
+    let r: *BigBuf = bigbuf_for(task)
+    if r != null and r.mode == BIGBUF_PARSED
+        bigbuf_release(r)
+    return VALET_CONN_NEXT
+
+
+# State: SEND - wait for send completion.  Returns the handler convention.
+fn valet_conn_sent(task: *Task) -> i32
+    if task.io_result < 0
+        bigbuf_release_task(task)
+        return 1
+
+    # Large response, and/or a finished large request's buffer?
+    if g_bigbuf_active > 0
+        let r: i32 = valet_conn_sent_big(task)
+        if r != VALET_CONN_NEXT
+            return r
+
+    # A write_buf response: the rest of it is still in write_buf, from
+    # write_pos on. Send it before keep-alive moves on to the next
+    # request, or the client gets a truncated response followed by the
+    # next one (AGAST #3678; the TLS SEND state's fix is #2197 item 5).
+    if task.write_pos < task.write_len
+        if task.io_result == 0
+            return 1
+        task.write_pos = task.write_pos + task.io_result
+        if task.write_pos < task.write_len
+            if not task.send_buf(Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+                return 1
+            return -1
+
+    # Check keep-alive limit from app config
+    return valet_conn_next_or_close(task, get_g_app())
+
+
 pub fn valet_handle_connection(task: *Task) -> i32
-    # The request being handled: task.read_buf, or a heap buffer when the
-    # request outgrew it (AGAST #2104).
-    var req_buf: *u8 = @task.read_buf[0]
-    var req_len: i32 = 0
-    var body_len: i64 = 0
-    var close_after: i32 = 0
+    var view: ValetReqView
+    view.buf = @task.read_buf[0]
+    view.len = 0
+    view.body_len = 0
+    view.close_after = 0
 
     # Bytes received since the last look: a recv's result, or none when a
     # pipelined request was left in read_buf (valet_next_request).
@@ -1382,328 +1742,24 @@ pub fn valet_handle_connection(task: *Task) -> i32
     if task.handler_state == CONN_STATE_PIPELINE
         task.handler_state = CONN_STATE_RECV
     else if task.handler_state == CONN_STATE_RECV
-        if task.io_result == TASK_IO_FRESH
-            # Fresh task — never submitted recv.  A previous connection in
-            # this pool slot may have died mid-request; drop its buffer.
-            bigbuf_release_task(task)
-            valet_set_consumed(task, 0)
-            let ret: bool = task.recv()
-            if not ret
-                return 1
-            return -1
-
-        if task.io_result <= 0
-            # EOF (0) or error (<0) — connection done.
-            bigbuf_release_task(task)
-            return 0
+        let r: i32 = valet_conn_take_recv(task)
+        if r != VALET_CONN_NEXT
+            return r
         added = task.io_result
 
-    # State: RECV - read until a whole request is buffered
     if task.handler_state == CONN_STATE_RECV
-        let app: *Valet = get_g_app()
-        var big: *BigBuf = null
-        if g_bigbuf_active > 0
-            big = bigbuf_for(task)
-            if big != null and big.mode != BIGBUF_RECV
-                # A finished request's buffer (e.g. after a static
-                # response) — done with it.
-                if big.mode == BIGBUF_PARSED
-                    bigbuf_release(big)
-                big = null
+        let r: i32 = valet_conn_frame(task, @view, added)
+        if r != VALET_CONN_NEXT
+            return r
 
-        # Append: read_len is 0 for a new request (spawn_task,
-        # task_reset_for_recv), or what is already buffered of this one:
-        # headers not all here yet (AGAST #2201), or a pipelined request
-        # (AGAST #1865).
-        var in_buf: *u8 = @task.read_buf[0]
-        var in_len: i64 = 0
-        if big != null
-            big.len = big.len + added as i64
-            in_buf = big.ptr
-            in_len = big.len
-        else
-            task.read_len = task.read_len + added
-            in_len = task.read_len as i64
-
-        # Where does the request end?  http's lib/h1_framing.ritz decides,
-        # for this server and projects/http alike (AGAST #1865).  Reading
-        # into a heap buffer, it picks up where the last recv left it.
-        var local_frame: H1Frame
-        var f: *H1Frame = valet_frame_slot(task)
-        if f == null
-            f = @local_frame
-            h1_frame_init(f)
-        var total: i64 = 0
-        if big != null
-            total = h1_frame_continue(in_buf, in_len, valet_body_limit(app), f)
-        else
-            total = request_frame(in_buf, in_len as i32, valet_body_limit(app), f)
-        if total == H1F_INCOMPLETE
-            return valet_recv_more(task, app, big, f)
-        if total < 0
-            let code: i32 = h1_frame_status(total)
-            if code == 413
-                log_warn(c"Request too large, closing connection")
-            else
-                log_warn(c"Bad request framing, closing connection")
-            bigbuf_release_task(task)
-            return valet_send_error(task, code)
-        if app.max_request_size > 0 && total > app.max_request_size as i64
-            log_warn(c"Request too large, closing connection")
-            bigbuf_release_task(task)
-            return valet_send_413(task)
-
-        # A chunked body is decoded in place, behind the headers, so a
-        # handler reads it like a Content-Length one.
-        body_len = h1_frame_dechunk(in_buf, f)
-        req_buf = in_buf
-        req_len = total as i32
-
-        # Keep what follows the request (a pipelined one) for
-        # valet_next_request, in read_buf.
-        if big != null
-            big.mode = BIGBUF_PARSED
-            let rest: i64 = big.len - total
-            if rest > VALET_READ_BUF as i64
-                # Too much to keep: answer this one and close.
-                close_after = 1
-                task.read_len = 0
-            else
-                memcpy(@task.read_buf[0], big.ptr + total, rest)
-                task.read_len = rest as i32
-            valet_set_consumed(task, 0)
-        else
-            valet_set_consumed(task, req_len)
-
-        task.handler_state = CONN_STATE_PARSE
-
-    # State: PARSE - parse request, route, build response
     if task.handler_state == CONN_STATE_PARSE
-        var req: Request
-        request_init(@req)
+        return valet_conn_serve(task, @view)
 
-        let parsed = request_parse(@req, req_buf, req_len)
-        if parsed < 0
-            bigbuf_release_task(task)
-            return 0
-        req.content_length = body_len
-
-        task.request_count += 1
-
-        # Get global app pointer
-        let app: *Valet = get_g_app()
-        if close_after != 0
-            task.request_count = app.keepalive_requests
-
-        # Client won't reuse the connection (HTTP/1.0 without keep-alive,
-        # or "Connection: close"): saturate the counter so every
-        # `request_count < keepalive_requests` check below closes after
-        # this response (AGAST #2106).
-        if valet_keep_alive(@req, task.request_count, app.keepalive_requests) == 0
-            task.request_count = app.keepalive_requests
-
-        # Check for static file request first (only for GET requests)
-        if request_is_get(@req) != 0
-            if valet_try_static_raw(app, task, req.path_ptr, req.path_len, req_buf, req_len) != 0
-                # Static file was served - check keep-alive
-                if task.request_count < app.keepalive_requests
-                    let ret = valet_next_request(task)
-                    if ret < 0
-                        tcp_shutdown(task.fd, SHUT_WR)
-                        return 0
-                    return -1
-                tcp_shutdown(task.fd, SHUT_WR)
-                return 0
-
-        var res: Response
-        response_init(@res, @task.write_buf[0], 8192)
-
-        # Set up handler context early for middleware access
-        var handler_ctx: HandlerContext
-        handler_ctx.req = @req
-        handler_ctx.res = @res
-        handler_ctx.route_result = null
-        handler_ctx.path = req.path_ptr
-        handler_ctx.path_len = req.path_len
-        handler_ctx.raw_buf = req_buf
-        handler_ctx.raw_len = req_len
-        handler_ctx.task = task
-        set_g_ctx(@handler_ctx)
-
-        # Run middleware pipeline
-        let mw_result: i32 = router_run_middleware(@app.router, req.path_ptr, req.path_len)
-        if mw_result == MW_HANDLED
-            # Middleware handled the request - send response if any
-            set_g_ctx(null)
-            if res.len > 0
-                task.write_len = res.len
-                task.write_pos = 0
-                task.handler_state = CONN_STATE_SEND
-                let ret = valet_task_send(task, res.len)
-                if ret < 0
-                    return 1
-                return -1
-            # Middleware handled but no response - keep-alive
-            if task.request_count < app.keepalive_requests
-                let ret = valet_next_request(task)
-                if ret < 0
-                    tcp_shutdown(task.fd, SHUT_WR)
-                    return 0
-                return -1
-            tcp_shutdown(task.fd, SHUT_WR)
-            return 0
-        if mw_result == MW_ERROR
-            # Middleware error - send 500
-            set_g_ctx(null)
-            response_status(@res, 500)
-            response_header(@res, c"Content-Type", c"text/plain")
-            response_header(@res, c"Connection", c"close")
-            let body = c"Middleware Error\n"
-            response_content_length(@res, 17)
-            response_end_headers(@res)
-            response_body(@res, body, 17)
-            task.write_len = res.len
-            task.write_pos = 0
-            task.handler_state = CONN_STATE_SEND
-            let ret = valet_task_send(task, res.len)
-            if ret < 0
-                return 1
-            return -1
-
-        # Try to match route
-        var route_result: RouteMatch
-        let matched: i32 = router_match(@app.router, req.method_ptr, req.path_ptr, req.path_len, @route_result)
-
-        if matched == 1
-            # Update context with route result
-            handler_ctx.route_result = @route_result
-
-            # Run per-route before interceptors
-            let before_result: i32 = route_run_before(route_result.route, req.path_ptr, req.path_len)
-            if before_result == MW_HANDLED
-                # Before interceptor handled the request
-                set_g_ctx(null)
-            else
-                if before_result == MW_ERROR
-                    # Before interceptor error - send 500
-                    set_g_ctx(null)
-                    response_status(@res, 500)
-                    response_header(@res, c"Content-Type", c"text/plain")
-                    response_header(@res, c"Connection", c"close")
-                    let body = c"Interceptor Error\n"
-                    response_content_length(@res, 18)
-                    response_end_headers(@res)
-                    response_body(@res, body, 18)
-                else
-                    # Call the matched handler
-                    let h: fn(*u8, i32) -> i32 = route_result.handler
-                    let status: i32 = h(req.path_ptr, req.path_len)
-
-                    # Cooperative-yield proxy: handler armed a yield SQE
-                    # and asked for re-entry on CQE.  Don't send any
-                    # response yet — transition to CONN_STATE_PROXY_WAIT.
-                    # After-interceptors are deferred until the
-                    # continuation finalises the response (typical
-                    # interceptors don't run for the proxy path so this
-                    # is academic in current usage).
-                    if status == STATUS_PROXY_PENDING
-                        set_g_ctx(null)
-                        task.handler_state = CONN_STATE_PROXY_WAIT
-                        return -1
-
-                    # Run per-route after interceptors (in reverse order)
-                    route_run_after(route_result.route, req.path_ptr, req.path_len)
-
-                    # Clear context
-                    set_g_ctx(null)
-
-                    # If handler returns non-zero and didn't write response, send 500
-                    if status != 0 && res.len == 0
-                        response_status(@res, 500)
-                        response_header(@res, c"Content-Type", c"text/plain")
-                        response_header(@res, c"Connection", c"close")
-                        let body = c"Internal Server Error\n"
-                        response_content_length(@res, 22)
-                        response_end_headers(@res)
-                        response_body(@res, body, 22)
-        else
-            # No route matched - 404
-            response_not_found(@res)
-
-        task.write_len = res.len
-        task.write_pos = 0
-        task.handler_state = CONN_STATE_SEND
-
-        let ret = valet_task_send(task, res.len)
-        if ret < 0
-            return 1
-        return -1
-
-    # State: PROXY_WAIT - cooperative-yield proxy continuation.
-    # Triggered by a NOP/timer/futex CQE for a task that earlier returned
-    # STATUS_PROXY_PENDING.  Dispatch to the registered continuation,
-    # which peeks the response ring (peek-by-id) and either builds the
-    # final reply (transition to CONN_STATE_SEND) or re-arms the yield.
     if task.handler_state == CONN_STATE_PROXY_WAIT
-        let cont: fn(*Task) -> i32 = get_proxy_continuation()
-        if cont == null
-            # Nothing registered — bail out cleanly rather than spin.
-            return 1
-        # A kernel that refuses IORING_OP_TIMEOUT answers our timer yield
-        # with -EINVAL at once: yield with NOPs from now on (AGAST #183).
-        if g_proxy_timer_ok != 0 and proxy_yield_timer_rejected(task.io_result) != 0
-            g_proxy_timer_ok = 0
-        return cont(task)
+        return valet_conn_proxy_wait(task)
 
-    # State: SEND - wait for send completion
     if task.handler_state == CONN_STATE_SEND
-        if task.io_result < 0
-            bigbuf_release_task(task)
-            return 1
-
-        # Large response, and/or a finished large request's buffer?
-        if g_bigbuf_active > 0
-            let b: *BigBuf = sendbuf_for(task)
-            if b != null and b.mode == BIGBUF_SEND
-                if task.io_result == 0
-                    bigbuf_release_task(task)
-                    return 1
-                b.pos = b.pos + task.io_result as i64
-                if b.pos < b.len
-                    # Short send: resume from where the kernel stopped.
-                    if not task.send_buf(Span<u8> { ptr: (b.ptr + b.pos), len: ((b.len - b.pos) as i32) as i64 })
-                        bigbuf_release_task(task)
-                        return 1
-                    return -1
-                bigbuf_release(b)
-            let r: *BigBuf = bigbuf_for(task)
-            if r != null and r.mode == BIGBUF_PARSED
-                bigbuf_release(r)
-
-        # A write_buf response: the rest of it is still in write_buf, from
-        # write_pos on. Send it before keep-alive moves on to the next
-        # request, or the client gets a truncated response followed by the
-        # next one (AGAST #3678; the TLS SEND state's fix is #2197 item 5).
-        if task.write_pos < task.write_len
-            if task.io_result == 0
-                return 1
-            task.write_pos = task.write_pos + task.io_result
-            if task.write_pos < task.write_len
-                if not task.send_buf(Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
-                    return 1
-                return -1
-
-        # Check keep-alive limit from app config
-        let app: *Valet = get_g_app()
-        if task.request_count < app.keepalive_requests
-            let ret = valet_next_request(task)
-            if ret < 0
-                tcp_shutdown(task.fd, SHUT_WR)
-                return 0
-            return -1
-
-        tcp_shutdown(task.fd, SHUT_WR)
-        return 0
+        return valet_conn_sent(task)
 
     return 0
 
@@ -1903,15 +1959,7 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
 
     # Set up handler context
     var handler_ctx: HandlerContext
-    handler_ctx.req = @req
-    handler_ctx.res = @res
-    handler_ctx.route_result = null
-    handler_ctx.path = req.path_ptr
-    handler_ctx.path_len = req.path_len
-    handler_ctx.raw_buf = @tls_data.req[0]
-    handler_ctx.raw_len = total as i32
-    handler_ctx.task = task
-    set_g_ctx(@handler_ctx)
+    valet_ctx_enter(@handler_ctx, @req, @res, @tls_data.req[0], total as i32, task)
 
     # Run middleware
     let mw_result: i32 = router_run_middleware(@app.router, req.path_ptr, req.path_len)
@@ -1961,6 +2009,237 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
     return -1
 
 
+# Free the connection's TLS state and return `code` (the handler convention).
+fn valet_tls_drop(task: *Task, tls_data: *TlsTaskData, code: i32) -> i32
+    tls_task_data_free(tls_data)
+    task.user_data = null
+    return code
+
+
+# Submit a handshake recv.  Returns the handler convention.
+fn valet_tls_recv_or_drop(task: *Task, tls_data: *TlsTaskData) -> i32
+    let ret = tls_task_recv(task, tls_data)
+    if ret < 0
+        return valet_tls_drop(task, tls_data, 1)
+    return -1
+
+
+# Submit an application-data recv.  Returns the handler convention.
+fn valet_tls_recv_app_or_drop(task: *Task, tls_data: *TlsTaskData) -> i32
+    let ret = tls_task_recv_app(task, tls_data)
+    if ret < 0
+        return valet_tls_drop(task, tls_data, 1)
+    return -1
+
+
+# Send `len` bytes of write_buf.  Returns the handler convention.
+fn valet_tls_send_or_drop(task: *Task, tls_data: *TlsTaskData, len: i32) -> i32
+    let ret = tls_task_send(task, tls_data, len)
+    if ret < 0
+        return valet_tls_drop(task, tls_data, 1)
+    return -1
+
+
+# A send of write_buf completed: count it, and if it was short send the
+# rest of write_buf, from write_pos on.  VALET_CONN_NEXT when it is all out.
+fn valet_tls_resume_send(task: *Task, tls_data: *TlsTaskData) -> i32
+    task.write_pos = task.write_pos + task.io_result
+    if task.write_pos < task.write_len
+        if not tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+            return valet_tls_drop(task, tls_data, 1)
+        return -1
+    return VALET_CONN_NEXT
+
+
+# On first call (handler_state == 0), allocate TLS state and move to
+# HANDSHAKE.  Null on failure.
+fn valet_tls_init(task: *Task, app: *Valet) -> *TlsTaskData
+    prints("[TLS] Allocating TLS state...\n")
+    let tls_data: *TlsTaskData = tls_task_data_alloc()
+    if tls_data == null
+        prints("[TLS] ERROR: Allocation failed!\n")
+        return null  # Allocation failed
+    prints("[TLS] Setting pool pointer...\n")
+    tls_data.pool = get_tls_pool()
+    prints("[TLS] Calling tls_server_init...\n")
+    if tls_server_init(@tls_data.tls, @app.tls_config) != 0
+        # RNG failure: no ephemeral key, so no handshake (AGAST #1863)
+        prints("[TLS] ERROR: tls_server_init failed (RNG)\n")
+        tls_task_data_free(tls_data)
+        task.user_data = null
+        return null
+    prints("[TLS] tls_server_init done\n")
+    task.user_data = tls_data as *u8
+    task.handler_state = TLS_CONN_STATE_HANDSHAKE
+    # task.io_result stays TASK_IO_FRESH: the HANDSHAKE state below reads
+    # that sentinel as "submit the ClientHello recv" (AGAST #2190).
+    prints("[TLS] TLS state allocated, starting handshake\n")
+    return tls_data
+
+
+# State: HANDSHAKE_SEND - a handshake flight finished sending. io_result
+# counts bytes sent, not received, so it must never reach the HANDSHAKE
+# state, which would read it as a recv length (AGAST #2190).
+fn valet_tls_handshake_sent(task: *Task, tls_data: *TlsTaskData) -> i32
+    if task.io_result <= 0
+        prints("[TLS] ERROR: handshake send failed\n")
+        return valet_tls_drop(task, tls_data, 1)
+    # Short send: the rest of the flight is still in write_buf, from
+    # write_pos on, as in the SEND state (AGAST #3677). A big cert chain
+    # or a small SO_SNDBUF cuts it short; the client can't answer a
+    # flight it hasn't all got, so finish it before waiting on a recv.
+    let r: i32 = valet_tls_resume_send(task, tls_data)
+    if r != VALET_CONN_NEXT
+        return r
+    task.handler_state = TLS_CONN_STATE_HANDSHAKE
+    return valet_tls_recv_or_drop(task, tls_data)
+
+
+# The handshake is complete: move to RECV.  The first request can share a
+# read with the client's Finished: serve it now, as no later recv will
+# return it.  VALET_CONN_NEXT (io_result = its length) when buffered.
+fn valet_tls_handshake_done(task: *Task, tls_data: *TlsTaskData) -> i32
+    task.handler_state = TLS_CONN_STATE_RECV
+    let buffered: i64 = tls_server_take_buffered(@tls_data.tls, @tls_data.rx[0], TLS_RX_CAP)
+    if buffered == 0
+        return valet_tls_recv_app_or_drop(task, tls_data)
+    task.io_result = buffered as i32
+    return VALET_CONN_NEXT
+
+
+# Feed a received handshake record (io_result > 0 bytes) to TLS.
+# VALET_CONN_NEXT to go on to the next state.
+fn valet_tls_feed(task: *Task, tls_data: *TlsTaskData) -> i32
+    let nbytes: i64 = task.io_result as i64
+    print("[TLS] Processing {nbytes} bytes of TLS data\n")
+    var out: [8192]u8
+    var out_len: i64 = 0
+    let result: i32 = tls_server_process(@tls_data.tls, @task.read_buf[0], task.io_result as i64, @out[0], 8192, @out_len)
+
+    print("[TLS] tls_server_process returned {result}, out_len={out_len}\n")
+
+    if result == TLS_RESULT_ERROR
+        let tls_error: i64 = tls_server_error(@tls_data.tls) as i64
+        print("[TLS] ERROR: Handshake error, tls_error={tls_error}\n")
+        log_error(c"TLS handshake error")
+        return valet_tls_drop(task, tls_data, 1)
+
+    if result == TLS_RESULT_HAVE_OUTPUT
+        # Send handshake response
+        var i: i64 = 0
+        while i < out_len
+            task.write_buf[i] = out[i]
+            i = i + 1
+        task.write_len = out_len as i32
+        task.handler_state = TLS_CONN_STATE_HANDSHAKE_SEND
+        return valet_tls_send_or_drop(task, tls_data, out_len as i32)
+
+    if result == TLS_RESULT_NEED_INPUT
+        return valet_tls_recv_or_drop(task, tls_data)
+
+    if result == TLS_RESULT_COMPLETE
+        return valet_tls_handshake_done(task, tls_data)
+    return VALET_CONN_NEXT
+
+
+# State: HANDSHAKE - TLS negotiation. Every completion here is a recv.
+# VALET_CONN_NEXT to go on to the next state.
+fn valet_tls_handshake(task: *Task, tls_data: *TlsTaskData) -> i32
+    let io_result: i64 = task.io_result as i64
+    let tls_state: i64 = tls_server_state(@tls_data.tls) as i64
+    print("[TLS] In HANDSHAKE state, io_result={io_result}, tls_state={tls_state}\n")
+
+    # Need to receive data?
+    if task.io_result == TASK_IO_FRESH
+        prints("[TLS] Submitting recv for ClientHello...\n")
+        let ret = tls_task_recv(task, tls_data)
+        if ret < 0
+            prints("[TLS] ERROR: recv submit failed\n")
+            return valet_tls_drop(task, tls_data, 1)
+        return -1
+
+    # EOF (0) or error (<0): the client left mid-handshake. Resubmitting
+    # the recv here would complete at once, forever.
+    if task.io_result <= 0
+        return valet_tls_drop(task, tls_data, 0)
+
+    # Feed received data to TLS
+    return valet_tls_feed(task, tls_data)
+
+
+# State: RECV - receive encrypted application data.  Returns the handler
+# convention.
+fn valet_tls_recv_state(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
+    if task.io_result == TASK_IO_FRESH
+        # Fresh task — never submitted recv. Submit the initial recv now.
+        return valet_tls_recv_app_or_drop(task, tls_data)
+
+    if task.io_result <= 0
+        # EOF (0) or error (<0) — connection done.
+        return valet_tls_drop(task, tls_data, 0)
+
+    # The recv landed behind the buffered ciphertext.
+    tls_data.rx_len = tls_data.rx_len + task.io_result as i64
+    return tls_serve_buffered(task, tls_data, app)
+
+
+# Close TLS connection: send close_notify, and shut down only once it is
+# out. The send is only queued here; a shutdown now beats it to the wire
+# and the client sees a truncated stream (AGAST #2196).
+fn valet_tls_close(task: *Task, tls_data: *TlsTaskData) -> i32
+    var close_buf: [128]u8
+    let close_len: i64 = tls_server_close(@tls_data.tls, @close_buf[0], 128)
+    if close_len > 0
+        var i: i64 = 0
+        while i < close_len
+            task.write_buf[i] = close_buf[i]
+            i = i + 1
+        task.handler_state = TLS_CONN_STATE_CLOSE_SEND
+        if tls_task_send(task, tls_data, close_len as i32) == 0
+            return -1
+
+    tcp_shutdown(task.fd, SHUT_WR)
+    return valet_tls_drop(task, tls_data, 0)
+
+
+# State: SEND - wait for send completion.  Returns the handler convention.
+fn valet_tls_sent(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
+    if task.io_result <= 0
+        return valet_tls_drop(task, tls_data, 1)
+
+    # Short send: the rest of the record is still in write_buf, from
+    # write_pos on. Send it before anything else: a record cut short and
+    # followed by the next one is garbage to the client (AGAST #2197
+    # item 5). Nothing touches write_buf until the whole record is out.
+    let r: i32 = valet_tls_resume_send(task, tls_data)
+    if r != VALET_CONN_NEXT
+        return r
+
+    # Keep-alive
+    if task.request_count < app.keepalive_requests
+        task.handler_state = TLS_CONN_STATE_RECV
+        task.io_result = 0
+        # A pipelined request may already be buffered: no recv would
+        # bring it, as the client is waiting on us.
+        if tls_data.req_len > 0 or tls_data.rx_len > 0
+            return tls_serve_buffered(task, tls_data, app)
+        return valet_tls_recv_app_or_drop(task, tls_data)
+
+    return valet_tls_close(task, tls_data)
+
+
+# State: CLOSE_SEND - the close_notify alert finished sending. Finish a
+# short send, then shut down. A failed send leaves nothing to wait for.
+fn valet_tls_close_sent(task: *Task, tls_data: *TlsTaskData) -> i32
+    if task.io_result > 0
+        task.write_pos = task.write_pos + task.io_result
+        if task.write_pos < task.write_len
+            if tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+                return -1
+    tcp_shutdown(task.fd, SHUT_WR)
+    return valet_tls_drop(task, tls_data, 0)
+
+
 pub fn valet_handle_tls_connection(task: *Task) -> i32
     prints("[TLS] handle_tls_connection called\n")
     let app: *Valet = get_g_app()
@@ -1970,226 +2249,30 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
     # Note: spawn_task sets handler_state=0 and user_data=pool pointer,
     # so we can't use user_data==null for first-call detection
     if task.handler_state == TLS_CONN_STATE_INIT
-        prints("[TLS] Allocating TLS state...\n")
-        tls_data = tls_task_data_alloc()
+        tls_data = valet_tls_init(task, app)
         if tls_data == null
-            prints("[TLS] ERROR: Allocation failed!\n")
-            return 1  # Allocation failed
-        prints("[TLS] Setting pool pointer...\n")
-        tls_data.pool = get_tls_pool()
-        prints("[TLS] Calling tls_server_init...\n")
-        if tls_server_init(@tls_data.tls, @app.tls_config) != 0
-            # RNG failure: no ephemeral key, so no handshake (AGAST #1863)
-            prints("[TLS] ERROR: tls_server_init failed (RNG)\n")
-            tls_task_data_free(tls_data)
-            task.user_data = null
             return 1
-        prints("[TLS] tls_server_init done\n")
-        task.user_data = tls_data as *u8
-        task.handler_state = TLS_CONN_STATE_HANDSHAKE
-        # task.io_result stays TASK_IO_FRESH: the HANDSHAKE state below reads
-        # that sentinel as "submit the ClientHello recv" (AGAST #2190).
-        prints("[TLS] TLS state allocated, starting handshake\n")
     else
         tls_data = task.user_data as *TlsTaskData
 
-    # State: HANDSHAKE_SEND - a handshake flight finished sending. io_result
-    # counts bytes sent, not received, so it must never reach the HANDSHAKE
-    # state below, which would read it as a recv length (AGAST #2190).
     if task.handler_state == TLS_CONN_STATE_HANDSHAKE_SEND
-        if task.io_result <= 0
-            prints("[TLS] ERROR: handshake send failed\n")
-            tls_task_data_free(tls_data)
-            task.user_data = null
-            return 1
-        # Short send: the rest of the flight is still in write_buf, from
-        # write_pos on, as in the SEND state (AGAST #3677). A big cert chain
-        # or a small SO_SNDBUF cuts it short; the client can't answer a
-        # flight it hasn't all got, so finish it before waiting on a recv.
-        task.write_pos = task.write_pos + task.io_result
-        if task.write_pos < task.write_len
-            if not tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
-                tls_task_data_free(tls_data)
-                task.user_data = null
-                return 1
-            return -1
-        task.handler_state = TLS_CONN_STATE_HANDSHAKE
-        let ret = tls_task_recv(task, tls_data)
-        if ret < 0
-            tls_task_data_free(tls_data)
-            task.user_data = null
-            return 1
-        return -1
+        return valet_tls_handshake_sent(task, tls_data)
 
-    # State: HANDSHAKE - TLS negotiation. Every completion here is a recv.
     if task.handler_state == TLS_CONN_STATE_HANDSHAKE
-        let io_result: i64 = task.io_result as i64
-        let tls_state: i64 = tls_server_state(@tls_data.tls) as i64
-        print("[TLS] In HANDSHAKE state, io_result={io_result}, tls_state={tls_state}\n")
+        let r: i32 = valet_tls_handshake(task, tls_data)
+        if r != VALET_CONN_NEXT
+            return r
 
-        # Need to receive data?
-        if task.io_result == TASK_IO_FRESH
-            prints("[TLS] Submitting recv for ClientHello...\n")
-            let ret = tls_task_recv(task, tls_data)
-            if ret < 0
-                prints("[TLS] ERROR: recv submit failed\n")
-                tls_task_data_free(tls_data)
-                task.user_data = null
-                return 1
-            return -1
-
-        # EOF (0) or error (<0): the client left mid-handshake. Resubmitting
-        # the recv here would complete at once, forever.
-        if task.io_result <= 0
-            tls_task_data_free(tls_data)
-            task.user_data = null
-            return 0
-
-        # Feed received data to TLS
-        if task.io_result > 0
-            let nbytes: i64 = task.io_result as i64
-            print("[TLS] Processing {nbytes} bytes of TLS data\n")
-            var out: [8192]u8
-            var out_len: i64 = 0
-            let result: i32 = tls_server_process(@tls_data.tls, @task.read_buf[0], task.io_result as i64, @out[0], 8192, @out_len)
-
-            print("[TLS] tls_server_process returned {result}, out_len={out_len}\n")
-
-            if result == TLS_RESULT_ERROR
-                let tls_error: i64 = tls_server_error(@tls_data.tls) as i64
-                print("[TLS] ERROR: Handshake error, tls_error={tls_error}\n")
-                log_error(c"TLS handshake error")
-                tls_task_data_free(tls_data)
-                task.user_data = null
-                return 1
-
-            if result == TLS_RESULT_HAVE_OUTPUT
-                # Send handshake response
-                var i: i64 = 0
-                while i < out_len
-                    task.write_buf[i] = out[i]
-                    i = i + 1
-                task.write_len = out_len as i32
-                task.handler_state = TLS_CONN_STATE_HANDSHAKE_SEND
-                let ret = tls_task_send(task, tls_data, out_len as i32)
-                if ret < 0
-                    tls_task_data_free(tls_data)
-                    task.user_data = null
-                    return 1
-                return -1
-
-            if result == TLS_RESULT_NEED_INPUT
-                let ret = tls_task_recv(task, tls_data)
-                if ret < 0
-                    tls_task_data_free(tls_data)
-                    task.user_data = null
-                    return 1
-                return -1
-
-            if result == TLS_RESULT_COMPLETE
-                task.handler_state = TLS_CONN_STATE_RECV
-                # The first request can share a read with the client's
-                # Finished: serve it now, as no later recv will return it.
-                let buffered: i64 = tls_server_take_buffered(@tls_data.tls, @tls_data.rx[0], TLS_RX_CAP)
-                if buffered == 0
-                    let ret = tls_task_recv_app(task, tls_data)
-                    if ret < 0
-                        tls_task_data_free(tls_data)
-                        task.user_data = null
-                        return 1
-                    return -1
-                task.io_result = buffered as i32
-
-    # State: RECV - receive encrypted application data
     if task.handler_state == TLS_CONN_STATE_RECV
-        if task.io_result == TASK_IO_FRESH
-            # Fresh task — never submitted recv. Submit the initial recv now.
-            let ret = tls_task_recv_app(task, tls_data)
-            if ret < 0
-                tls_task_data_free(tls_data)
-                task.user_data = null
-                return 1
-            return -1
+        return valet_tls_recv_state(task, tls_data, app)
 
-        if task.io_result <= 0
-            # EOF (0) or error (<0) — connection done.
-            tls_task_data_free(tls_data)
-            task.user_data = null
-            return 0
-
-        # The recv landed behind the buffered ciphertext.
-        tls_data.rx_len = tls_data.rx_len + task.io_result as i64
-        return tls_serve_buffered(task, tls_data, app)
-
-    # State: SEND - wait for send completion
     if task.handler_state == TLS_CONN_STATE_SEND
-        if task.io_result <= 0
-            tls_task_data_free(tls_data)
-            task.user_data = null
-            return 1
+        return valet_tls_sent(task, tls_data, app)
 
-        # Short send: the rest of the record is still in write_buf, from
-        # write_pos on. Send it before anything else: a record cut short and
-        # followed by the next one is garbage to the client (AGAST #2197
-        # item 5). Nothing touches write_buf until the whole record is out.
-        task.write_pos = task.write_pos + task.io_result
-        if task.write_pos < task.write_len
-            if not tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
-                tls_task_data_free(tls_data)
-                task.user_data = null
-                return 1
-            return -1
-
-        # Keep-alive
-        if task.request_count < app.keepalive_requests
-            task.handler_state = TLS_CONN_STATE_RECV
-            task.io_result = 0
-            # A pipelined request may already be buffered: no recv would
-            # bring it, as the client is waiting on us.
-            if tls_data.req_len > 0 or tls_data.rx_len > 0
-                return tls_serve_buffered(task, tls_data, app)
-            let ret = tls_task_recv_app(task, tls_data)
-            if ret < 0
-                tls_task_data_free(tls_data)
-                task.user_data = null
-                return 1
-            return -1
-
-        # Close TLS connection: send close_notify, and shut down only once it
-        # is out. The send is only queued here; a shutdown now beats it to
-        # the wire and the client sees a truncated stream (AGAST #2196).
-        var close_buf: [128]u8
-        let close_len: i64 = tls_server_close(@tls_data.tls, @close_buf[0], 128)
-        if close_len > 0
-            var i: i64 = 0
-            while i < close_len
-                task.write_buf[i] = close_buf[i]
-                i = i + 1
-            task.handler_state = TLS_CONN_STATE_CLOSE_SEND
-            if tls_task_send(task, tls_data, close_len as i32) == 0
-                return -1
-
-        tcp_shutdown(task.fd, SHUT_WR)
-        tls_task_data_free(tls_data)
-        task.user_data = null
-        return 0
-
-    # State: CLOSE_SEND - the close_notify alert finished sending. Finish a
-    # short send, then shut down. A failed send leaves nothing to wait for.
     if task.handler_state == TLS_CONN_STATE_CLOSE_SEND
-        if task.io_result > 0
-            task.write_pos = task.write_pos + task.io_result
-            if task.write_pos < task.write_len
-                if tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
-                    return -1
-        tcp_shutdown(task.fd, SHUT_WR)
-        tls_task_data_free(tls_data)
-        task.user_data = null
-        return 0
+        return valet_tls_close_sent(task, tls_data)
 
-    tls_task_data_free(tls_data)
-    task.user_data = null
-    return 0
+    return valet_tls_drop(task, tls_data, 0)
 
 
 # Global TLS task pool pointer (set during valet_run when TLS is enabled)
