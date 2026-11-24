@@ -141,10 +141,18 @@ AGAST #1392. Two things live here, and they are independent.
 13. `inproc` (AGAST #4622) — every test that is not `integration`-marked and
    asks for no ritz1-building fixture (`is_inproc_item`, the rule smoke uses
    within its files).  It compiles nothing (item 9), so it runs before ritz1
-   is built.  `make tools-ratchets` runs `-m inproc` serially, which is how a
+   is built.  `make tools-ratchets` runs `-m inproc`, which is how a
    room's smoke reaches the ritz1 source-layout ratchets kept here
    (test_ritz1_sema_walk_layout.py and the like).  A test that only reads
    source needs no marker: leave off `integration` and it is in.
+
+14. `--no-ritz1-build` (AGAST #4672) — the session builds nothing: the
+   verdict (item 4) is a refusal naming the option, so a test that asks for
+   ritz1 fails, never skips.  `make tools-ratchets` passes it to run
+   `-m inproc` under xdist, whose controller would otherwise build ritz1
+   before any worker starts, though no inproc test uses it.  An option, not
+   an environment variable, for item 4's reason: a nested pytest must not
+   inherit it.
 """
 
 import os
@@ -311,8 +319,24 @@ def build_ritz1_artifacts() -> str:
     return ""
 
 
+_NO_BUILD = (
+    "ritz1 was not built: this session ran with --no-ritz1-build (conftest "
+    "item 14), so a test that needs ritz1 cannot run in it"
+)
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--no-ritz1-build", action="store_true", default=False,
+        help="build neither ritz1 nor the runtime start object; tests that "
+             "ask for them fail (conftest item 14)",
+    )
+
+
 def _session_verdict(config) -> str:
     """The build verdict for this session, building now if nobody has yet."""
+    if config.getoption("--no-ritz1-build"):
+        return _NO_BUILD
     workerinput = getattr(config, "workerinput", None)
     if workerinput is not None:
         if _BUILD_KEY not in workerinput:

@@ -197,6 +197,26 @@ def test_failed_session_build_fails_tests_never_skips(ritz1_bin, tmp_path, mode)
         f"a failed ritz1 build must fail every test that needs it:\n{out[-4000:]}")
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize("mode", ["serial", "xdist"])
+def test_no_ritz1_build_session_runs_no_make(tmp_path, mode):
+    """`--no-ritz1-build` (AGAST #4672): make tools-ratchets runs `-m inproc`
+    under xdist, whose controller would otherwise build ritz1 before any
+    worker starts, though no inproc test uses it.  With the option nothing
+    is built, and a test that does ask for ritz1 fails, never skips (#1327)."""
+    extra = ("--no-ritz1-build", "-rfs")
+    if mode == "xdist":
+        extra += ("-n", "2", "--dist", "loadgroup")
+    proc, lines = _nested_pytest(tmp_path, *extra)
+    out = proc.stdout + proc.stderr
+    assert lines == [], f"a --no-ritz1-build session ran make:\n" + "\n".join(lines)
+    assert proc.returncode == 1, f"expected the ritz1 tests to fail (exit 1):\n{out[-4000:]}"
+    assert "--no-ritz1-build" in out, out[-4000:]
+    red = sum(int(n) for n in re.findall(r"(\d+) (?:failed|errors?)\b", out))
+    assert red >= 4, out[-4000:]
+    assert not re.search(r"\d+ skipped\b", out), out[-4000:]
+
+
 # Tests that lead the collection order (AGAST #1804): the longest single test,
 # the members of the serial `tree` group, and every batched (`xdist_group`)
 # file that sorts before the ordinary bulk.  conftest ranks all groups ahead of

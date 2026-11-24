@@ -39,6 +39,10 @@
 #                                       behind a gating one buffers to 8);
 #                                       FAIL: a red train with nothing
 #                                       below it to bisect
+#   train.sh precheck [<k>]             make tools-ratchets on the tip of
+#                                       the train pending would gate, or
+#                                       train <k>, before it gates (AGAST
+#                                       #4672; see cmd_precheck)
 #   train.sh land [<log>]               push the tail of the train <log>
 #                                       passed (train k) to main, landing
 #                                       trains 1..k and cancelling their
@@ -1512,6 +1516,57 @@ cmd_pending() {
     fi
 }
 
+# cmd_precheck [<k>]: the guards and ratchets on train k's tip, before it
+# spends a gate slot (AGAST #4672; SKILL.md Reaping step 3b).  <k> defaults
+# to the train `pending` would gate (pick_target).  Each car's smoke ran the
+# ratchets on its own base; this catches pins that each car had right alone
+# but that disagree on the merged tree (two cars lowering one exact count,
+# two edits to one allowlist), in ~15 s instead of a red ~30 min gate.
+#
+# Runs `make -C projects/ritz tools-ratchets` (RZ_PRECHECK_CMD overrides it,
+# for tests) in train k's own worktree, never the shared checkout, as a
+# waited-for unit in ritz-gate.slice at the gate's CPUWeight: the
+# coordinator's turn waits on it, and it must not be starved by room work.
+# The ratchets read tracked files only (#4672), so a reused train worktree
+# gives the verdict a fresh checkout would.
+#
+# Prints `PRECHECK train <k> tip=<12> EXIT=<n>`, then on red only the
+# failing lines (pytest's FAILED/ERROR) and the full log's path; appends
+# `PRECHECK=<tip> <exit>` to the train's state (the last line is current; a
+# rebuild starts a new state).  Exits 0 on green, 1 on red.
+cmd_precheck() {
+    local q k="${1:-}" st tip cmd log rc unit
+    mapfile -t q < <(queue)
+    [[ ${#q[@]} -gt 0 ]] || die "no train built"
+    if [[ -z "$k" ]]; then
+        pick_target || die "$WHY"
+        k=$TGT
+    else
+        [[ "$k" =~ ^[1-9][0-9]*$ && $k -le ${#q[@]} ]] || die "no train $k (${#q[@]} built)"
+    fi
+    use_slot "${q[$((k - 1))]}"
+    st="$(state)"; tip="$(field TIP "$st")"
+    [[ -n "$tip" && "$tip" == "$(g rev-parse HEAD)" ]] \
+        || die "train $k's worktree moved since build; rebuild"
+    cmd="${RZ_PRECHECK_CMD:-make -C projects/ritz tools-ratchets}"
+    mkdir -p "$GATES"
+    log="$GATES/precheck-$(gname)-${tip:0:12}.log"
+    unit="ritz-precheck-$(gname)"
+    rc=0
+    systemd-run --user --quiet --wait --pipe --collect --unit="$unit" \
+        --slice=ritz-gate.slice --property=CPUWeight=100 \
+        --working-directory="$WT" \
+        --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
+        -- bash -c "$cmd" > "$log" 2>&1 < /dev/null || rc=$?
+    printf 'PRECHECK=%s %s\n' "$tip" "$rc" >> "$st"
+    echo "PRECHECK train $k tip=${tip:0:12} EXIT=$rc"
+    if [[ $rc -ne 0 ]]; then
+        grep -E '^(FAILED|ERROR) ' "$log" || true
+        echo "log: $log"
+        return 1
+    fi
+}
+
 case "${1:-}" in
     build) shift; cmd_build "$@" ;;
     gate)  shift; cmd_gate "$@" ;;
@@ -1523,10 +1578,11 @@ case "${1:-}" in
         done ;;
     fail)  shift; cmd_fail "$@" ;;
     pending) cmd_pending ;;
+    precheck) shift; cmd_precheck "$@" ;;
     land)  shift; cmd_land "$@" ;;
     pkgs)  shift; cmd_pkgs "$@" ;;
     show)  cmd_show ;;
     tail)  cmd_tail ;;
     rebase-plan) shift; cmd_rebase_plan "$@" ;;
-    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [<k> | --next [<host>]] | wait <log> | discard [<host>] | fail <log> | pending | land [<log>] | show | tail | rebase-plan [<ref>] [--dropped <oldtip> [--onto <ref>]] | pkgs list <base>" >&2; exit 2 ;;
+    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [<k> | --next [<host>]] | wait <log> | discard [<host>] | fail <log> | pending | precheck [<k>] | land [<log>] | show | tail | rebase-plan [<ref>] [--dropped <oldtip> [--onto <ref>]] | pkgs list <base>" >&2; exit 2 ;;
 esac

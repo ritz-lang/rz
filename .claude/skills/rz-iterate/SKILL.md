@@ -42,6 +42,12 @@ sections below give the mechanics; this is the policy they serve:
    culprit's room commit a fix on the red tail. The held cars and the fix
    then board together. Innocent cars never go back to their rooms.
    Bisect only when no culprit can be named.
+   **Pin and count conflicts between cars are the conductor's to fix**
+   (Aaron, 2026-11-24): the guards and ratchets precheck the train tip
+   before it gates (Reaping step 3b), and a failure that is only cars'
+   pins, counts or lists disagreeing on the merged tree gets one
+   `train: reconcile pins` car from `rz` itself (step 6, "Reconcile car").
+   Anything that needs code still goes to the culprit's room.
 7. **Finish work; don't breed follow-ons** (Aaron, 2026-11-24: "We are now
    at 2250 total cards, we were barely at 1000 before the big push started
    ... we are walking in circles instead of walking towards the
@@ -394,6 +400,10 @@ unchanged and runs `run-gate.sh` on the stack.
 
 **Must not:** edit code, run any test or gate other than a train's, resolve a
 conflict, edit, rebase or squash a room's branch, or investigate a failure.
+**The two exceptions** (Aaron, 2026-11-24), both on a train only, never a
+room's branch: the ratchet **precheck** of a train tip (Reaping step 3b),
+and a **reconcile car** that touches only pin, baseline and allowlist data
+files, written by the guard's own update command (step 6).
 Anything like that becomes an AGAST ticket and a room. If CI on `main` goes red with a *new* failure, file it at high priority
 and spawn a room for it. Don't fix it here.
 
@@ -626,12 +636,13 @@ you changed pass **in full** on that exact commit (step 6).
    bash .claude/skills/rz-iterate/smoke-plan.sh run    # last line: your quote
    ```
    `run` maps the files your commit (`HEAD^..HEAD`) changed to their
-   subsystems' test targets. Every diff gets `make smoke`. A compiler
-   change (`ritz0`, `ritz1`, `grammars`, `runtime`) gets the whole `make
-   unit`, `ritz1-bootstrap`, the matrix and `tools-ratchets`: the tools/
-   tests that read compiler sources (the ritz1 ratchets, kind-ladder,
-   arch and metrics checks; ~1 min; #4587, a red train that skipped them).
-   A package gets `./rz build` and
+   subsystems' test targets. Every diff gets `make smoke` and
+   `tools-ratchets`: the guards and ratchets (the tools/ tests that read
+   compiler sources, the pins such as test_standard_callers.py, and
+   ritz0's in-process tests; ~15 s; #4587, #4653 and #4654 went red on
+   ones their smoke skipped; AGAST #4672). A compiler change (`ritz0`,
+   `ritz1`, `grammars`, `runtime`) also gets the whole `make unit`,
+   `ritz1-bootstrap` and the matrix. A package gets `./rz build` and
    `./rz test`, a skill gets its `test-*.sh`, and anything under
    `.claude/` also gets `tools-unit`, whose tests read SKILL.md (the
    mapping is in the script's header). It runs each target **in full**, never a fail-fast
@@ -1093,6 +1104,28 @@ one to train 1.
    it sits on the same patches at other SHAs; `BAD ... not in the train`
    only if a commit under it is in no train. `rz-larb` boards like any room
    (`rz-larb:<sha>`).
+3b. **Precheck the tip before it gates** (Aaron, 2026-11-24: "the guards
+   and ratchets might need to be updated if we are merging multiple things
+   at once & counts need to be updated"). When `pending` says `GATE train
+   <k>` and the train has 2+ cars, run the guards and ratchets on that tip
+   first:
+   ```bash
+   .claude/skills/rz-iterate/train.sh precheck <k>   # PRECHECK train <k> tip=<12> EXIT=<n>
+   ```
+   Each car's smoke checked its own pins; this catches pins that each car
+   had right alone but that disagree on the merged tree (two cars lowering
+   the same exact-match count, two edits to one allowlist). EXIT=0: gate.
+   Red: the failing lines decide. A pin/count/list conflict between cars
+   gets a reconcile car (step 6) and a re-precheck, then the gate. Any other
+   red is a red train: step 6 as if the gate had failed, without spending
+   a gate slot. `train.sh precheck` (AGAST #4672) runs `make -C
+   projects/ritz tools-ratchets` (~15 s idle) in that train's own
+   worktree, under ritz-gate.slice, and records `PRECHECK=<tip> <exit>` in
+   the train's state (`train.sh show`); red, it prints the FAILED/ERROR
+   lines and the full log's path. The ratchets read tracked files only, so
+   a reused train worktree gives a fresh checkout's verdict. Still never
+   run them in this host's shared checkout: that is a room's tree, not a
+   train's.
 4. **Gate the deepest train** (AGAST #4156) when `train.sh pending` says
    `GATE train <k>` (dispatch rule above). **Every train with a car needs
    a full gate, `KEPT` cars included** (AGAST #4580 item 9: rooms REAP on a
@@ -1363,6 +1396,34 @@ one to train 1.
       culprit's room says the fix isn't one small commit, no fix REAP has
       come in 45 minutes, or the fixed train goes red again. Then the
       HELD cars other than the culprit board without it.
+
+   **Reconcile car** (Aaron, 2026-11-24; the one fix `rz` writes itself).
+   It applies only when every failing line, from the precheck (step 3b) or
+   the gate, is a guard or ratchet whose pin, count or list the cars
+   disagree on in the merged tree, each car having passed it alone. Then:
+   1. In the red train's worktree (`train.sh show` names it; never a room's
+      branch, never the shared checkout), on the red tail, run the guard's
+      own update command (e.g. `python3 tools/ritz1_ratchet.py --update`)
+      or edit the list file by hand to combine both cars' edits.
+   2. **Only in the allowed direction:** lower a down-only pin to the
+      merged count, set an exact-match pin to the merged count when it is
+      lower than both cars' old pins, drop stale entries, union two cars'
+      allowlist additions. **Never raise a pin or add a new exemption**: a
+      count that got worse is a culprit's bug, and goes to its room.
+   3. `git diff --stat` must list only pin, baseline and allowlist data
+      files (`*.json`, `*.txt`, `*.toml` baselines the guard reads). If it
+      touches anything else, stop and use the culprit-room path.
+   4. Commit it on the tail as `train: reconcile pins (<guards>)`, push it
+      to `rz-reconcile/<tail12>` on origin, `train.sh fail <log>` if the
+      gate was red, and board it as the last of the HELD cars:
+      `build [--next] <held cars> rz-reconcile/<tail12>:<sha> <rest>`.
+      Re-run the precheck (`train.sh precheck <k>`), then gate.
+   5. Say it in the turn report (guards, old → new pins). The branch is
+      deleted when its train lands, like a room's.
+
+   Everything else stays with the rooms: a count that got worse, a fix
+   that needs code, a rule guard tripped by another car's tests (today's
+   `spawn_guard` red was that kind, so #4627 fixed it on the red tail).
 
    **Reason first, then bisect** (the fallback). Read the failing lines
    (`train.sh wait` / `run-gate.sh --wait` prints them; a remote gate's

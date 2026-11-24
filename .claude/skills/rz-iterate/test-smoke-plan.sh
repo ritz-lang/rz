@@ -24,31 +24,31 @@ change() {
 targets() { bash "$SP" plan "$@" | cut -f1 | paste -sd' '; }
 
 # 1. The path -> targets mapping, one rule at a time.
-change docs/a.md >/dev/null;                    eq "$(targets)" "smoke" "a doc-only diff is smoke alone"
-change projects/ritz/README.md >/dev/null;      eq "$(targets)" "smoke doc-examples" "a ritz doc checks its examples"
+change docs/a.md >/dev/null;                    eq "$(targets)" "smoke tools-ratchets" "a doc-only diff is smoke and the ratchets"
+change projects/ritz/README.md >/dev/null;      eq "$(targets)" "smoke doc-examples tools-ratchets" "a ritz doc checks its examples"
 change projects/ritz/ritz0/x.py >/dev/null;     eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix" "ritz0 runs the full unit suite, ritz1-bootstrap and the matrix"
 change projects/ritz/runtime/r.c >/dev/null;    eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix" "the runtime runs the compiler set"
 change projects/ritz/ritz1/src/m.ritz >/dev/null
 eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix" "ritz1 runs the compiler set rz briefs"
 change projects/ritz/grammars/g.grammar >/dev/null
 eq "$(targets)" "smoke tools-ratchets unit ritz1-bootstrap matrix" "the grammar runs what ritz1 does (regen-check is in the matrix)"
-change projects/ritz/ritzlib/v.ritz >/dev/null; eq "$(targets)" "smoke ritzlib matrix" "ritzlib runs its tests and the matrix"
-change projects/ritz/test/t.ritz >/dev/null;    eq "$(targets)" "smoke ritz-tests matrix" "ritz/test runs the language tests and the matrix"
-change projects/ritz/examples/e.ritz >/dev/null; eq "$(targets)" "smoke examples" "examples run the examples"
-change projects/ritz/tools/t.py >/dev/null;     eq "$(targets)" "smoke tools-unit" "tools run tools-unit"
-change projects/ritz/scripts/s.sh >/dev/null;   eq "$(targets)" "smoke harness-selftest" "scripts run the harness self-tests"
+change projects/ritz/ritzlib/v.ritz >/dev/null; eq "$(targets)" "smoke tools-ratchets ritzlib matrix" "ritzlib runs its tests and the matrix"
+change projects/ritz/test/t.ritz >/dev/null;    eq "$(targets)" "smoke tools-ratchets ritz-tests matrix" "ritz/test runs the language tests and the matrix"
+change projects/ritz/examples/e.ritz >/dev/null; eq "$(targets)" "smoke tools-ratchets examples" "examples run the examples"
+change projects/ritz/tools/t.py >/dev/null;     eq "$(targets)" "smoke tools-unit tools-ratchets" "tools run tools-unit (and the ratchets: no unit for ritz0's half)"
+change projects/ritz/scripts/s.sh >/dev/null;   eq "$(targets)" "smoke tools-ratchets harness-selftest" "scripts run the harness self-tests"
 change projects/ritz/build.py >/dev/null;       eq "$(targets)" "smoke tools-unit unit" "other ritz files run unit and tools-unit"
-change projects/nexus/src/n.ritz >/dev/null;    eq "$(targets)" "smoke pkg:nexus" "a package runs its own build and tests"
+change projects/nexus/src/n.ritz >/dev/null;    eq "$(targets)" "smoke tools-ratchets pkg:nexus" "a package runs its own build and tests"
 change .claude/skills/rz-iterate/train.sh >/dev/null
-eq "$(targets)" "smoke tools-unit skill:rz-iterate" "a skill runs its own tests and tools-unit"
+eq "$(targets)" "smoke tools-unit tools-ratchets skill:rz-iterate" "a skill runs its own tests and tools-unit"
 # AGAST #4580 bounce: tools/test_provision_room.py and test_smoke.py assert
 # SKILL.md's text, so a .claude/ change (markdown included) runs tools-unit.
 change .claude/skills/rz-iterate/SKILL.md >/dev/null
-eq "$(targets)" "smoke tools-unit skill:rz-iterate" "a skill's SKILL.md runs tools-unit and the skill's tests"
-change .claude/settings.json >/dev/null;        eq "$(targets)" "smoke tools-unit" "any other .claude/ file runs tools-unit"
-change .claude/host-env.sh >/dev/null;          eq "$(targets)" "smoke tools-unit skill:rz-iterate" "host-env.sh runs tools-unit and rz-iterate's tests"
-change rz.toml >/dev/null;                      eq "$(targets)" "smoke build-all" "the workspace manifest builds everything"
-change .github/workflows/main.yml >/dev/null;   eq "$(targets)" "smoke" "CI config is smoke alone (the train gate covers it)"
+eq "$(targets)" "smoke tools-unit tools-ratchets skill:rz-iterate" "a skill's SKILL.md runs tools-unit and the skill's tests"
+change .claude/settings.json >/dev/null;        eq "$(targets)" "smoke tools-unit tools-ratchets" "any other .claude/ file runs tools-unit"
+change .claude/host-env.sh >/dev/null;          eq "$(targets)" "smoke tools-unit tools-ratchets skill:rz-iterate" "host-env.sh runs tools-unit and rz-iterate's tests"
+change rz.toml >/dev/null;                      eq "$(targets)" "smoke tools-ratchets build-all" "the workspace manifest builds everything"
+change .github/workflows/main.yml >/dev/null;   eq "$(targets)" "smoke tools-ratchets" "CI config is smoke and the ratchets (the train gate covers the rest)"
 # AGAST #4587: train 814a64f4 went red on tools/test_ritz1_kind_match.py, a
 # ratchet that reads ritz1 sources, which the compiler set never ran.
 change projects/ritz/grammars/h.grammar >/dev/null
@@ -60,12 +60,20 @@ eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap matrix" "tools-unit subsu
 change projects/ritz/ritz1/src/k.ritz .claude/settings.json >/dev/null
 eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap matrix" "and so does a .claude/ change's tools-unit"
 
+# AGAST #4672: every car runs the ratchets (~15 s), not only a compiler
+# change: #4653 and #4654 both broke a pin their smoke never ran.  Only
+# tools-unit and unit together subsume them (tools/ and all of ritz0).
+change projects/ritz/tools/v.py >/dev/null
+has "$(bash "$SP" plan)" "^tools-ratchets	" "tools-unit alone does not subsume the ratchets (ritz0's -m inproc half)"
+change projects/ritz/build.py >/dev/null
+eq "$(targets)" "smoke tools-unit unit" "tools-unit and unit together do"
+
 # 2. A mixed diff: each target once, in the fixed order, packages last.
 s="$(change projects/ritz/ritz0/y.py projects/ritz/tools/u.py projects/ritz/ritz0/z.py \
     projects/spire/lib/a.ritz projects/angelo/src/b.ritz docs/c.md)"
 eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap matrix pkg:angelo pkg:spire" "a mixed diff: each target once, in order"
 eq "$(targets "$s^!")" "smoke tools-unit unit ritz1-bootstrap matrix pkg:angelo pkg:spire" "<sha>^! plans one commit"
-eq "$(targets HEAD~6..HEAD)" "smoke tools-unit unit ritz1-bootstrap matrix build-all pkg:angelo pkg:spire" \
+eq "$(targets HEAD~8..HEAD)" "smoke tools-unit unit ritz1-bootstrap matrix build-all pkg:angelo pkg:spire" \
     "a range plans every commit in it"
 has "$(bash "$SP" plan)" "^unit	make -C projects/ritz unit$" "plan prints each target's command, tab-separated"
 has "$(bash "$SP" plan)" "^pkg:spire	\./rz build spire && \./rz test spire$" "a package's command builds and tests it"

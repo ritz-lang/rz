@@ -29,19 +29,13 @@
 # <t1>+<t2>+... on <base12> (unit: <N> passed, 0 failed)`: it names no SHA
 # or exit, so only its targets (and any "N failed" being 0) are checked.
 #
-# Paths -> targets (first match per path; every diff also runs `smoke`):
-#   *.md, docs/**                        doc-only: no target (smoke alone),
+# Paths -> targets (first match per path; every diff also runs `smoke` and
+# `tools-ratchets`, below):
+#   *.md, docs/**                        doc-only: no target of its own,
 #     except projects/ritz/**.md         doc-examples
 #   projects/ritz/ritz0/**, ritz1/**,
-#     grammars/**, runtime/**            tools-ratchets unit ritz1-bootstrap
-#                                        matrix (the compiler set rz briefs,
-#                                        2026-11-23; tools-ratchets is the
-#                                        tools/ tests that read compiler
-#                                        sources plus ritz0's in-process
-#                                        tests (`-m inproc`), `make
-#                                        tools-ratchets`, ~1 min: #4587 and
-#                                        #4622, trains went red on one of
-#                                        each; full tools-unit is 4-6 min)
+#     grammars/**, runtime/**            unit ritz1-bootstrap matrix (the
+#                                        compiler set rz briefs, 2026-11-23)
 #   projects/ritz/ritzlib/**             ritzlib matrix
 #   projects/ritz/test/**                ritz-tests matrix
 #   projects/ritz/examples/**            examples
@@ -57,11 +51,17 @@
 #                                        .claude/room-unit.sh)
 #   .claude/host-env.sh                  skill:rz-iterate (train.sh sources it)
 #   rz, rz.toml                          build-all
-#   anything else (.github, known-failures)  smoke alone; the
+#   anything else (.github, known-failures)  nothing of its own; the
 #                                        train's full gate covers it
-# tools-unit and unit together subsume tools-ratchets (tools/ and all of
-# ritz0): a diff that plans both runs only tools-unit.  Every path that plans
-# tools-ratchets also plans unit, so tools-unit alone is the test.
+# tools-ratchets, every diff (AGAST #4672): the guards and ratchets, `make
+# tools-ratchets` (the tools/ tests that read compiler sources plus ritz0's
+# in-process tests, `-m inproc`), ~15 s.  Trains went red on ratchets a car's
+# smoke never ran: #4587 and #4622 for compiler changes, then #4653 and
+# #4654 on test_standard_callers.py, whose cars ran tools-ratchets without
+# it.  The train conductor runs the same target on the train tip before it
+# gates (train.sh precheck).  tools-unit and unit together subsume it
+# (tools/ and all of ritz0): a diff that plans both runs only those; either
+# alone does not.
 #
 # Env (tests): RZ_SMOKE_RUNNER, a program run as `<runner> <target>
 # <command>` instead of `bash -c <command>`.
@@ -115,7 +115,7 @@ targets_of() {
         .claude/host-env.sh)      echo skill:rz-iterate ;;
         *.md|docs/*) return ;;
         projects/ritz/ritz0/*|projects/ritz/ritz1/*|projects/ritz/grammars/*|projects/ritz/runtime/*)
-                                  echo tools-ratchets; echo unit; echo ritz1-bootstrap; echo matrix ;;
+                                  echo unit; echo ritz1-bootstrap; echo matrix ;;
         projects/ritz/ritzlib/*)  echo ritzlib; echo matrix ;;
         projects/ritz/test/*)     echo ritz-tests; echo matrix ;;
         projects/ritz/examples/*) echo examples ;;
@@ -137,13 +137,14 @@ plan_targets() {
     local -A want=()
     files="$(git -C "$ROOT" diff --name-only "$@")" || die "bad range: $*"
     want[smoke]=1
+    want[tools-ratchets]=1
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
         while IFS= read -r t; do [[ -n "$t" ]] && want[$t]=1; done < <(targets_of "$f")
     done <<<"$files"
-    # tools-unit runs all of tools/ (#4587); unit, always planned with
-    # tools-ratchets, runs all of ritz0, its -m inproc half included (#4622).
-    [[ -z "${want[tools-unit]:-}" ]] || unset 'want[tools-ratchets]'
+    # tools-unit runs all of tools/ (#4587) and unit all of ritz0, its
+    # -m inproc half included (#4622): both, and the ratchets are covered.
+    [[ -z "${want[tools-unit]:-}" || -z "${want[unit]:-}" ]] || unset 'want[tools-ratchets]'
     for o in "${ORDER[@]}"; do [[ -n "${want[$o]:-}" ]] && echo "$o"; done
     for t in "${!want[@]}"; do case "$t" in pkg:*|skill:*) extra+=("$t") ;; esac; done
     [[ ${#extra[@]} -eq 0 ]] || printf '%s\n' "${extra[@]}" | sort

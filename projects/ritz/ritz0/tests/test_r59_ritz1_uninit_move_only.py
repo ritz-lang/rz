@@ -25,6 +25,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import move_walk  # noqa: E402
 import ritz_ast as rast  # noqa: E402
+import ritz0  # noqa: E402
 from ritz0 import compile_file  # noqa: E402
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +49,13 @@ def uninit_move_only(monkeypatch):
     checks[rast.VarStmt] = hooked
     monkeypatch.setattr(move_walk.MoveWalk, "STMT_CHECKS", checks)
     monkeypatch.setenv("RITZ_PATH", str(RITZ_ROOT))
+    # The move checker runs in _check_ownership and, per generic instance,
+    # in _check_instances; nothing after them walks a `var`.  Stop there:
+    # emitting the IR was ~5 of emitter.ritz's ~13 s, the long pole of
+    # `make tools-ratchets` (AGAST #4672).
+    passes = list(ritz0.PASSES)
+    assert passes.index(ritz0._check_ownership) < passes.index(ritz0._check_instances)
+    monkeypatch.setattr(ritz0, "PASSES", tuple(passes[:passes.index(ritz0._check_instances) + 1]))
     return hits
 
 

@@ -8,10 +8,12 @@ no package context (--deps, RITZ_PATH, --target-os) to pass. The only skip is
 rz.toml's [workspace.exclude] entry for docs/archive (retired code). There is
 no allowlist: a file that doesn't parse gets fixed or deleted.
 
-One test case, not one per file (docs/TESTING.md, "What a ritz0 pytest case
-costs"). Parsing ~1,250 files is ~15 CPU-s, so a child process spreads it over
-a fork pool; the child also keeps ritz0's `parser`/`lexer` modules out of this
-process's sys.modules.
+SHARDS test cases, not one per file (docs/TESTING.md, "What a ritz0 pytest
+case costs"). Parsing ~1,350 files is ~15 CPU-s, so each case's child process
+spreads its share over a fork pool; the child also keeps ritz0's
+`parser`/`lexer` modules out of this process's sys.modules. One case was the
+long pole of `make tools-ratchets` under xdist (~15 s, AGAST #4672); the
+shards (every SHARDS-th file of the sorted list) let the workers share it.
 """
 
 from __future__ import annotations
@@ -51,10 +53,13 @@ def check(path):
     return None
 
 paths = sys.stdin.read().split()
-with get_context("fork").Pool(min(8, os.cpu_count() or 1)) as pool:
+with get_context("fork").Pool(min(4, os.cpu_count() or 1)) as pool:
     bad = [r for r in pool.map(check, paths, chunksize=16) if r]
 print(json.dumps(bad))
 """
+
+
+SHARDS = 4
 
 
 def corpus() -> list[str]:
@@ -65,7 +70,8 @@ def corpus() -> list[str]:
     return [f for f in files if not f.startswith(ARCHIVE + "/")]
 
 
-def test_every_tracked_ritz_file_parses():
+@pytest.mark.parametrize("shard", range(SHARDS), ids=lambda i: f"shard{i}of{SHARDS}")
+def test_every_tracked_ritz_file_parses(shard):
     # The one skip must stay rz.toml's archive exclusion, not drift from it.
     exclude = tomllib.loads((WORKSPACE / "rz.toml").read_text())["workspace"]["exclude"]
     assert ARCHIVE in exclude, f"{ARCHIVE} is no longer in rz.toml [workspace.exclude]"
@@ -73,10 +79,12 @@ def test_every_tracked_ritz_file_parses():
     files = corpus()
     # Guard the walk: an empty or truncated list would pass vacuously.
     assert len(files) > 1000, f"only {len(files)} tracked .ritz files found"
+    mine = sorted(files)[shard::SHARDS]
+    assert mine, shard
 
     proc = subprocess.run(
         [sys.executable, "-c", _CHILD, str(RITZ0)], check=False, cwd=WORKSPACE,
-        input="\n".join(files), capture_output=True, text=True, timeout=300,
+        input="\n".join(mine), capture_output=True, text=True, timeout=300,
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
     assert proc.returncode == 0, proc.stderr[-4000:]

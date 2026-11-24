@@ -56,8 +56,29 @@ def test_ritz0_half_runs_every_inproc_test():
     # No file or directory argument narrows it: a list would drift.
     paths = [w for w in words if "/" in w or w.endswith(".py")]
     assert paths == [], f"ritz0 half names paths {paths}; select by marker only"
-    # Serial: under xdist the controller builds ritz1 first (conftest item 4).
-    assert "-n" not in words, words
+    # Parallel, but building nothing (AGAST #4672): without --no-ritz1-build
+    # the xdist controller builds ritz1 first (conftest items 4, 14), ~15 s
+    # no inproc test uses.  Serial took ~60 s.
+    assert "-n" in words and "xdist" in words, words
+    assert "--no-ritz1-build" in words, words
+
+
+def test_incremental_deps_build_test_is_not_a_ratchet():
+    """test_ritz1_incremental_deps.py builds ritz1 four times (~50 s): a build
+    test, not a source ratchet (AGAST #4672).  It stays in tools-unit, which
+    runs all of tools/."""
+    tools = [ln for ln in _pytest_lines() if "tools/test_" in ln]
+    assert tools and all("test_ritz1_incremental_deps" not in ln for ln in tools), tools
+    assert any("tools/test_ritz1_ratchet.py" in ln for ln in tools), tools
+    assert (RITZ / "tools" / "test_ritz1_incremental_deps.py").exists()
+
+
+def test_standard_caller_pins_are_a_ratchet():
+    """tools/test_standard_callers.py (#4636's down-only raw-API caller pins)
+    caught two cars whose smoke ran tools-ratchets but not tools-unit
+    (#4653 +29, #4654 +28 callers), so neither room saw it (AGAST #4672)."""
+    tools = [ln for ln in _pytest_lines() if "tools/test_" in ln]
+    assert any("tools/test_standard_callers.py" in ln for ln in tools), tools
 
 
 def test_tools_and_ritz0_are_separate_pytests():

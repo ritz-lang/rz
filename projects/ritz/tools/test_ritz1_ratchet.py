@@ -174,12 +174,24 @@ def test_at_baseline_has_no_findings():
     assert compare(m, m) == []
 
 
-def test_milestone_ptr_len_param_pair_target_is_met():
+# The real tree's measurement, ~5 s: taken once and shared by the two tests
+# that grade it, which one xdist group keeps on one worker (AGAST #4672: each
+# measured it again, and they were the long pole of `make tools-ratchets`).
+_TREE_GROUP = pytest.mark.xdist_group("ritz1_ratchet_tree")
+
+
+@pytest.fixture(scope="module")
+def tree_measured():
+    return measure()
+
+
+@_TREE_GROUP
+def test_milestone_ptr_len_param_pair_target_is_met(tree_measured):
     """M1.3 (#1830) sets ptr_len_param_pair <= 40.  AGAST #4449 converted the
     ritz1 `(*u8, len)` parameter pairs to StrView, so the real tree must stay
     at or under that target — the ratchet's one-way baseline alone would only
     hold it at the old 923."""
-    measured = measure()
+    measured = tree_measured
     assert measured["scalars"]["ptr_len_param_pair"] <= 40
 
 
@@ -578,12 +590,13 @@ def test_two_tickets_raising_the_same_metric_cherry_pick_in_either_order(tmp_pat
 # --------------------------------------------------------------------------
 
 
-def test_committed_baseline_matches_this_tree():
+@_TREE_GROUP
+def test_committed_baseline_matches_this_tree(tree_measured):
     assert DEFAULT_BASELINE.exists(), DEFAULT_BASELINE
     allowance = effective_baseline(
         load_baseline(DEFAULT_BASELINE), load_acceptances(DEFAULT_ACCEPT)
     )
-    measured = measure()
+    measured = tree_measured
     findings = compare(measured, allowance)
     regressions = [f for f in findings if f.kind == "regression"]
     assert regressions == [], "\n".join(f.detail for f in regressions)

@@ -15,6 +15,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pytest
 import ritz1_unit
+from tracked import tracked
 
 RITZ = ritz1_unit.RITZ_ROOT
 REPO = RITZ.parent.parent
@@ -87,12 +88,14 @@ def test_a_file_with_no_test_fn_fails_end_to_end(tmp_path):
 def test_suite_on_disk_is_only_test_files():
     """Everything in ritz1/test/ is a [[test]] file the gate runs.  A
     program or fixture dropped there would fail the gate as `empty`; this
-    names the problem first, and keeps subdirectories out (not globbed)."""
-    entries = sorted(p.name for p in ritz1_unit.TEST_DIR.iterdir())
-    assert entries, "ritz1/test/ is empty"
-    for name in entries:
-        p = ritz1_unit.TEST_DIR / name
-        assert p.is_file() and name.startswith("test_") and name.endswith(".ritz"), name
+    names the problem first, and keeps subdirectories out (not globbed).
+    Tracked files only (AGAST #4672): a test that compiled ritzlib in place
+    leaves an ignored ritz1/test/ritzlib/*.sig, which the gate never sees."""
+    files = tracked(ritz1_unit.TEST_DIR)
+    assert files, "ritz1/test/ is empty"
+    for p in files:
+        name = p.relative_to(ritz1_unit.TEST_DIR).as_posix()
+        assert name.startswith("test_") and name.endswith(".ritz"), name
         assert "[[test]]" in p.read_text().splitlines(), f"{name}: no [[test]] fn"
 
 

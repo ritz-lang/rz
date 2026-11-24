@@ -40,6 +40,7 @@ from lexer import Lexer  # noqa: E402
 from parser import Parser  # noqa: E402
 
 from test_module_interface import LIB, MAIN  # noqa: E402
+from tracked import tracked  # noqa: E402
 
 RITZ1_BUILD = RITZ_DIR / "ritz1" / "build"
 
@@ -177,27 +178,53 @@ def _norm(module: rast.Module) -> list:
     return out
 
 
-CORPUS = sorted([*(RITZ_DIR / "ritzlib").rglob("*.ritz"),
-                 *(RITZ_DIR / "ritz1" / "src").glob("*.ritz")])
+# Tracked files only (AGAST #4672), so a reused checkout's leftovers are not
+# graded.  SHARDS cases, not one for the corpus: ritz1/src's 75 files cost
+# ~12 s together, the long pole of `make tools-ratchets` under xdist.  Not one
+# per module either: that is ~160 ids against the ritz0 suite's test cap
+# (tools/test_budget.toml).  Largest file first, dealt round-robin, so the
+# shards cost about the same.
+CORPUS = sorted(
+    [p for p in tracked(RITZ_DIR / "ritzlib") if p.suffix == ".ritz"]
+    + [p for p in tracked(RITZ_DIR / "ritz1" / "src")
+       if p.suffix == ".ritz" and p.parent == RITZ_DIR / "ritz1" / "src"])
 
 
 @pytest.mark.unit
-def test_text_parses_to_stripped_module_across_corpus():
+def test_corpus_is_the_ritzlib_and_ritz1_modules():
+    """The per-module cases below are not vacuous: the corpus is there."""
+    names = {p.relative_to(RITZ_DIR).as_posix() for p in CORPUS}
+    assert len(CORPUS) > 100, len(CORPUS)
+    assert "ritz1/src/main.ritz" in names and "ritzlib/io.ritz" in names, sorted(names)[:20]
+
+
+SHARDS = 8
+_BY_SIZE = sorted(CORPUS, key=lambda p: (-p.stat().st_size, p))
+SHARD = [_BY_SIZE[i::SHARDS] for i in range(SHARDS)]
+
+
+@pytest.mark.unit
+def test_shards_cover_the_corpus_once():
+    """Every module is in exactly one shard: none is dropped by sharding."""
+    dealt = [p for shard in SHARD for p in shard]
+    assert sorted(dealt) == CORPUS
+    assert all(SHARD), [len(s) for s in SHARD]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("shard", range(SHARDS), ids=lambda i: f"shard{i}")
+def test_text_parses_to_stripped_module_across_corpus(shard):
     """The interface text of every corpus module parses to its stripped
-    module, every span the same: a reader sees what ritz0's interface is."""
-    checked = 0
-    for path in CORPUS:
+    module, every span the same: a reader sees what ritz0's interface is.
+    Every module parses: test_corpus_parses.py holds every tracked .ritz
+    file to that, with no allowlist (#4042)."""
+    for path in SHARD[shard]:
         src = path.read_text()
-        try:
-            tokens, module = mi._parse_with_tokens(src, str(path))
-        except Exception:
-            continue  # doesn't parse in ritz0 (fixtures of error tests)
+        tokens, module = mi._parse_with_tokens(src, str(path))
         text = mi.interface_text(src, tokens, module)
         assert text.count("\n") == src.count("\n"), path
         again = Parser(Lexer(text, str(path)).tokenize()).parse_module()
         assert _norm(again) == _norm(module), path
-        checked += 1
-    assert checked > 50
 
 
 # ---------------------------------------------------------------------------

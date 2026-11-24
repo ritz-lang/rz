@@ -33,6 +33,7 @@ from pathlib import Path
 import pytest
 
 from ritz0_inproc import run_ritz0
+from tracked import is_tracked
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
@@ -431,8 +432,10 @@ def test_no_single_parent_globals(name):
 
 
 def test_scheduler_is_deleted_and_main_no_longer_imports_it():
-    assert not (KERNEL_SRC / "sched").exists(), "sched/ is back"
-    assert not (HARLAND / "kernel" / "context_switch.s").exists()
+    # Tracked files only (AGAST #4672): a reused checkout keeps sched/ alive
+    # with an ignored mod.ritz.sig, which is not the scheduler coming back.
+    assert not is_tracked(KERNEL_SRC / "sched"), "sched/ is back"
+    assert not is_tracked(HARLAND / "kernel" / "context_switch.s")
     assert "context_switch.s" not in (HARLAND / "ritz.toml").read_text()
     main = _code(KERNEL_SRC / "main.ritz")
     assert not re.search(r"^import sched\b", main, re.MULTILINE)

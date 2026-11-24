@@ -115,6 +115,7 @@ mkdir -p "$T/bin" "$T/active" "$RZ_GATE_DIR"
 export RZ_TEST_ACTIVE="$T/active" PATH="$T/bin:$PATH"
 cat > "$T/bin/systemd-run" <<'STUB'
 #!/usr/bin/env bash
+printf "%s\n" "$*" >> "$RZ_TEST_DIR/systemd-run-log"
 envs=(); wd=.; unit=
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1766,4 +1767,77 @@ l21="$(bash "$TR" gate --next 2>"$T/err")"
 [[ "$(specof | cut -d' ' -f1)" == hosty ]] && grep -q "^note: localbox: stale venv: rzfake-a==1.0 (not installed)" "$T/err" \
     && ok "a stale venv on this host is passed over too" \
     || { bad "a stale venv on this host is passed over too (spec: $(specof))"; sed 's/^/     | /' "$T/err"; }
+# 22. precheck (AGAST #4672): the guards and ratchets on a train's tip, in its
+# worktree, under ritz-gate.slice, before it spends a gate slot (SKILL.md
+# Reaping step 3b).  RZ_PRECHECK_CMD stands in for `make -C projects/ritz
+# tools-ratchets`; the systemd-run stub above runs it in the foreground.
+bash "$TR" discard >/dev/null 2>&1
+unset RZ_TRAIN_HOSTS
+cat > "$T/precheck.sh" <<'PRE'
+#!/usr/bin/env bash
+pwd -P > "$RZ_TEST_DIR/precheck-wd"
+echo "=== Running tools/ source-reading ratchets"
+echo "noise that is not a failure"
+if [[ "${RZ_FAKE_PRECHECK:-0}" != 0 ]]; then
+    echo "FAILED tools/test_standard_callers.py::test_raw_api_callers_only_go_down - AssertionError"
+    echo "ERROR tests/test_x.py::test_y - ImportError"
+    echo "make[1]: *** [Makefile:130: tools-ratchets-tools] Error 1"
+    echo "1 failed, 457 passed in 9.1s"
+fi
+exit "${RZ_FAKE_PRECHECK:-0}"
+PRE
+chmod +x "$T/precheck.sh"
+export RZ_PRECHECK_CMD="$T/precheck.sh"
+fetch; git -C "$M" checkout -q main
+p1="$(room pc1 s/pc1 P1)"; p2="$(room pc2 s/pc2 P2)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build "pc1:$p1" "pc2:$p2" >/dev/null 2>&1
+tp="$(tipn 1)"; : > "$T/systemd-run-log"
+
+# 22a. A green tip: one line, exit 0, recorded, run in the train's worktree
+# under the gate slice.
+out="$(bash "$TR" precheck 2>&1)"; rc=$?
+eq "$out" "PRECHECK train 1 tip=${tp:0:12} EXIT=0" "precheck prints PRECHECK train <k> tip=<12> EXIT=<n>"
+eq "$rc" 0 "a green precheck exits 0"
+eq "$(cat "$T/precheck-wd" 2>/dev/null)" "$(cd "$T/train" && pwd -P)" "the precheck runs in the train's worktree"
+has "$(cat "$T/systemd-run-log")" "(^| )--slice=ritz-gate\.slice( |$)" "the precheck runs under ritz-gate.slice"
+has "$(cat "$T/systemd-run-log")" "(^| )--wait( |$)" "systemd-run waits for the precheck's verdict"
+eq "$(bash "$TR" show | sed -n 's/^PRECHECK=//p')" "$tp 0" "the train state records PRECHECK=<tip> <exit>"
+
+# 22b. A red tip: the verdict, then only the failing lines; exit non-zero.
+out="$(RZ_FAKE_PRECHECK=1 bash "$TR" precheck 1 2>&1)"; rc=$?
+has "$out" "^PRECHECK train 1 tip=${tp:0:12} EXIT=1$" "a red precheck says EXIT=1"
+has "$out" "^FAILED tools/test_standard_callers.py::test_raw_api_callers_only_go_down" "it prints the FAILED lines"
+has "$out" "^ERROR tests/test_x.py::test_y" "and the ERROR lines"
+! grep -q "noise\|^===" <<<"$out" && ok "and nothing else of the run" || { bad "and nothing else of the run"; sed 's/^/     | /' <<<"$out"; }
+has "$out" "log: .*precheck" "it names the full log"
+[[ $rc -ne 0 ]] && ok "a red precheck exits non-zero" || bad "a red precheck exits non-zero"
+eq "$(bash "$TR" show | sed -n 's/^PRECHECK=//p' | tail -1)" "$tp 1" "the red verdict is recorded too (last one wins)"
+
+# 22c. No <k>: the train `pending` would gate (pick_target): the deepest.
+q1="$(room pc3 s/pc3 P3 "$tp")"; fetch; git -C "$M" checkout -q main
+bash "$TR" build --next "pc3:$q1" >/dev/null 2>&1
+tp2="$(tipn 2)"
+out="$(bash "$TR" precheck 2>&1)"
+eq "$out" "PRECHECK train 2 tip=${tp2:0:12} EXIT=0" "precheck with no <k> takes the train pending would gate"
+eq "$(cat "$T/precheck-wd")" "$(cd "$T/train-2" && pwd -P)" "in that train's own worktree"
+out="$(bash "$TR" precheck 1 2>&1)"
+eq "$out" "PRECHECK train 1 tip=${tp:0:12} EXIT=0" "precheck <k> takes train k"
+out="$(bash "$TR" precheck 3 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "no train 3" "precheck refuses a train that isn't built" \
+    || bad "precheck refuses a train that isn't built"
+
+# 22d. A worktree that moved since build is refused: its verdict would not
+# be the tip's.
+echo x > "$T/train/s/pc1"; git -C "$T/train" commit -qam stray
+out="$(bash "$TR" precheck 1 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "moved since build" "precheck refuses a moved worktree" \
+    || bad "precheck refuses a moved worktree"
+git -C "$T/train" reset -q --hard HEAD~1
+
+# 22e. The real command is `make -C projects/ritz tools-ratchets`.
+: > "$T/systemd-run-log"
+out="$(env -u RZ_PRECHECK_CMD bash "$TR" precheck 1 2>&1)"
+has "$(cat "$T/systemd-run-log")" "make -C projects/ritz tools-ratchets" "by default the precheck runs make tools-ratchets"
+unset RZ_PRECHECK_CMD
+
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }
