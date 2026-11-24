@@ -1,0 +1,290 @@
+# ritzlib.fs: the path and cwd API over StrView (AGAST #4637).
+#
+#   access(path, mode: F_OK/R_OK/W_OK/X_OK) -> Result<(), Errno>
+#   cwd() -> Result<String, Errno>, chdir(path) -> Result<(), Errno>
+#   rename(from, to) / chmod(path, mode) -> Result<(), Errno>
+#   read_link(path) -> Result<String, Errno>
+#   symlink(target, link) -> Result<(), Errno>
+#   set_times(path, atime: FileTime, mtime: FileTime) -> Result<(), Errno>
+#   remove_dir_all(path) -> Result<(), Errno>   a whole tree, never following links
+#       FileTime: Now | Omit | At(ns since the epoch)
+#
+# Each test owns its fixtures under /tmp, named by pid.
+
+import ritzlib.sys
+import ritzlib.fs
+import ritzlib.fd
+import ritzlib.errno
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.result
+import ritzlib.fmt.digits { fmt_i64_into }
+
+const E_NOENT: i32 = 2
+const E_NOTDIR: i32 = 20
+const E_INVAL: i32 = 22
+const E_NAMETOOLONG: i32 = 36
+
+fn tmp_path(name: StrView) -> String
+    var s: String = string_from("/tmp/ritzlib_fsp_")
+    var digits: [24]u8
+    let n: i64 = fmt_i64_into(@digits[0], sys_getpid() as i64)
+    s.push_span(Span<u8> { ptr: @digits[0], len: n })
+    s.push('_')
+    s.push_str(name)
+    s
+
+fn unit_err(r: Result<(), Errno>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => e.code()
+
+fn string_err(r: Result<String, Errno>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => e.code()
+
+# 1 if `r` is Ok and its String equals `want`.
+fn string_is(r: Result<String, Errno>, want: StrView) -> bool
+    match r
+        Ok(s) => s.as_view().eq(want)
+        Err(_) => false
+
+fn touch(path: @String)
+    match fd_open(path.as_view(), O_WRONLY + O_CREAT + O_TRUNC, 420)
+        Ok(f) =>
+            var g: Fd = f
+            g.close()
+        Err(_) => pass
+
+fn mode_of(path: @String) -> i32
+    match stat(path.as_view())
+        Ok(st) => st.st_mode & 4095
+        Err(e) => -1000 - e.code()
+
+fn mtime_of(path: @String) -> i64
+    match stat(path.as_view())
+        Ok(st) => st.st_mtime
+        Err(e) => -1000 - e.code() as i64
+
+fn atime_of(path: @String) -> i64
+    match stat(path.as_view())
+        Ok(st) => st.st_atime
+        Err(e) => -1000 - e.code() as i64
+
+# ============================================================================
+# access
+# ============================================================================
+
+[[test]]
+fn test_access_existing_and_missing() -> i32
+    let p: String = tmp_path("acc")
+    touch(@p)
+    assert unit_err(access(p.as_view(), F_OK)) == 0
+    assert unit_err(access(p.as_view(), R_OK + W_OK)) == 0
+    unlink(p.as_view())
+    assert unit_err(access(p.as_view(), F_OK)) == E_NOENT
+    0
+
+# ============================================================================
+# cwd / chdir
+# ============================================================================
+
+[[test]]
+fn test_chdir_then_cwd() -> i32
+    match cwd()
+        Ok(before) =>
+            assert unit_err(chdir("/tmp")) == 0
+            assert string_is(cwd(), "/tmp")
+            # Back where we were, so the rest of the binary sees its own cwd.
+            assert unit_err(chdir(before.as_view())) == 0
+            assert string_is(cwd(), before.as_view())
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_cwd_is_absolute() -> i32
+    match cwd()
+        Ok(s) =>
+            assert s.len() > 0
+            assert s.char_at(0) == '/'
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_chdir_missing_is_noent_and_file_is_notdir() -> i32
+    assert unit_err(chdir("/nonexistent/ritzlib/dir")) == E_NOENT
+    let p: String = tmp_path("notdir")
+    touch(@p)
+    assert unit_err(chdir(p.as_view())) == E_NOTDIR
+    unlink(p.as_view())
+    0
+
+# ============================================================================
+# rename
+# ============================================================================
+
+[[test]]
+fn test_rename_moves_the_file() -> i32
+    let a: String = tmp_path("ren_a")
+    let b: String = tmp_path("ren_b")
+    touch(@a)
+    assert unit_err(rename(a.as_view(), b.as_view())) == 0
+    assert not path_exists(a.as_view())
+    assert path_exists(b.as_view())
+    unlink(b.as_view())
+    0
+
+[[test]]
+fn test_rename_missing_is_noent() -> i32
+    let a: String = tmp_path("ren_missing")
+    let b: String = tmp_path("ren_never")
+    assert unit_err(rename(a.as_view(), b.as_view())) == E_NOENT
+    0
+
+[[test]]
+fn test_rename_long_path_is_nametoolong() -> i32
+    var s: String = string_from("/tmp/")
+    for i in 0..5000
+        s.push('a')
+    let b: String = tmp_path("ren_long")
+    assert unit_err(rename(s.as_view(), b.as_view())) == E_NAMETOOLONG
+    assert unit_err(rename(b.as_view(), s.as_view())) == E_NAMETOOLONG
+    0
+
+# ============================================================================
+# chmod
+# ============================================================================
+
+[[test]]
+fn test_chmod_sets_mode() -> i32
+    let p: String = tmp_path("chmod")
+    touch(@p)
+    assert unit_err(chmod(p.as_view(), 448)) == 0     # 0700
+    assert mode_of(@p) == 448
+    unlink(p.as_view())
+    assert unit_err(chmod(p.as_view(), 448)) == E_NOENT
+    0
+
+# ============================================================================
+# symlink / read_link
+# ============================================================================
+
+[[test]]
+fn test_symlink_then_read_link() -> i32
+    let link: String = tmp_path("link")
+    assert unit_err(symlink("/some/target/path", link.as_view())) == 0
+    assert is_symlink(link.as_view())
+    assert string_is(read_link(link.as_view()), "/some/target/path")
+    unlink(link.as_view())
+    0
+
+[[test]]
+fn test_read_link_of_a_file_is_inval_and_missing_is_noent() -> i32
+    let p: String = tmp_path("notlink")
+    touch(@p)
+    assert string_err(read_link(p.as_view())) == E_INVAL
+    unlink(p.as_view())
+    assert string_err(read_link(p.as_view())) == E_NOENT
+    0
+
+[[test]]
+fn test_read_link_proc_self_exe_is_absolute() -> i32
+    match read_link("/proc/self/exe")
+        Ok(s) =>
+            assert s.len() > 1
+            assert s.char_at(0) == '/'
+        Err(_) =>
+            assert false
+    0
+
+# ============================================================================
+# set_times
+# ============================================================================
+
+[[test]]
+fn test_set_times_at_and_omit() -> i32
+    let p: String = tmp_path("times")
+    touch(@p)
+    # 2001-09-09T01:46:40Z = 1e9 s.
+    let t: i64 = 1000000000
+    assert unit_err(set_times(p.as_view(), FileTime.At(t * 1000000000), FileTime.At(t * 1000000000))) == 0
+    assert atime_of(@p) == t
+    assert mtime_of(@p) == t
+    # Omit leaves mtime; At moves atime only.
+    assert unit_err(set_times(p.as_view(), FileTime.At((t + 5) * 1000000000), FileTime.Omit)) == 0
+    assert atime_of(@p) == t + 5
+    assert mtime_of(@p) == t
+    # Now moves mtime past the 2001 stamp.
+    assert unit_err(set_times(p.as_view(), FileTime.Omit, FileTime.Now)) == 0
+    assert mtime_of(@p) > t
+    unlink(p.as_view())
+    assert unit_err(set_times(p.as_view(), FileTime.Now, FileTime.Now)) == E_NOENT
+    0
+
+# ============================================================================
+# remove_dir_all
+# ============================================================================
+
+[[test]]
+fn test_remove_dir_all_removes_a_nested_tree() -> i32
+    let root: String = tmp_path("tree")
+    mkdir(root.as_view(), 493)
+    let sub: String = path_join(root.as_view(), "sub")
+    mkdir(sub.as_view(), 493)
+    let deeper: String = path_join(sub.as_view(), "deeper")
+    mkdir(deeper.as_view(), 493)
+    let a: String = path_join(root.as_view(), "a.txt")
+    let b: String = path_join(deeper.as_view(), "b.txt")
+    touch(@a)
+    touch(@b)
+    assert unit_err(remove_dir_all(root.as_view())) == 0
+    assert not path_exists(root.as_view())
+    0
+
+[[test]]
+fn test_remove_dir_all_does_not_follow_symlinks() -> i32
+    # A link to a directory outside the tree is removed, not descended into.
+    let keep: String = tmp_path("keep")
+    mkdir(keep.as_view(), 493)
+    let precious: String = path_join(keep.as_view(), "precious")
+    touch(@precious)
+    let root: String = tmp_path("linktree")
+    mkdir(root.as_view(), 493)
+    let link: String = path_join(root.as_view(), "to_keep")
+    symlink(keep.as_view(), link.as_view())
+    assert unit_err(remove_dir_all(root.as_view())) == 0
+    assert not path_exists(root.as_view())
+    assert path_exists(precious.as_view())
+    unlink(precious.as_view())
+    rmdir(keep.as_view())
+    0
+
+[[test]]
+fn test_remove_dir_all_many_entries() -> i32
+    # More entries than one getdents buffer holds.
+    let root: String = tmp_path("many")
+    mkdir(root.as_view(), 493)
+    for i in 0..300
+        var name: String = string_from("entry_with_a_longish_name_")
+        var digits: [24]u8
+        let n: i64 = fmt_i64_into(@digits[0], i as i64)
+        name.push_span(Span<u8> { ptr: @digits[0], len: n })
+        let p: String = path_join(root.as_view(), name.as_view())
+        touch(@p)
+    assert unit_err(remove_dir_all(root.as_view())) == 0
+    assert not path_exists(root.as_view())
+    0
+
+[[test]]
+fn test_remove_dir_all_missing_is_noent_and_file_is_notdir() -> i32
+    let missing: String = tmp_path("never_made")
+    assert unit_err(remove_dir_all(missing.as_view())) == E_NOENT
+    let f: String = tmp_path("plainfile")
+    touch(@f)
+    assert unit_err(remove_dir_all(f.as_view())) == E_NOTDIR
+    unlink(f.as_view())
+    0

@@ -18,6 +18,7 @@
 #   mausoleum help                    Print help
 
 import ritzlib.sys
+import ritzlib.fd
 import ritzlib.fmt
 import ritzlib.strview
 import ritzlib.memory
@@ -502,7 +503,7 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
             var channel: EncryptedChannel = channel_new()
             if channel_init_server(@channel, client_sock) < 0
                 print("  Error: Channel init failed\n")
-                sys_close(client_fd)
+                client_sock.close()
                 poll_fds[0].revents = 0
                 poll_fds[1].revents = 0
                 continue
@@ -511,7 +512,7 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
             if channel_handshake_server(@channel) < 0
                 print("  Error: Handshake failed\n")
                 channel_free(@channel)
-                sys_close(client_fd)
+                client_sock.close()
                 poll_fds[0].revents = 0
                 poll_fds[1].revents = 0
                 continue
@@ -523,16 +524,16 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
 
             # Cleanup
             channel_free(@channel)
-            sys_close(client_fd)
+            client_sock.close()
             print("Connection closed.\n")
 
         # Reset revents for next poll
         poll_fds[0].revents = 0
         poll_fds[1].revents = 0
 
-    # Cleanup signalfd
-    if signal_fd >= 0
-        sys_close(signal_fd)
+    # Cleanup signalfd (raw: poll(2) takes its number)
+    var sig: Fd = fd_adopt(signal_fd)
+    sig.close()
 
 # Handle a single encrypted session
 fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
@@ -1042,20 +1043,22 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
 
             print("New connection (plain TCP).\n")
 
+            var client: Fd = fd_adopt(client_fd)
+
             # Handle session using plain TCP
             handle_plain_session(client_fd, pool, storage, reg)
 
             # Cleanup
-            sys_close(client_fd)
+            client.close()
             print("Connection closed.\n")
 
         # Reset revents for next poll
         poll_fds[0].revents = 0
         poll_fds[1].revents = 0
 
-    # Cleanup signalfd
-    if signal_fd >= 0
-        sys_close(signal_fd)
+    # Cleanup signalfd (raw: poll(2) takes its number)
+    var sig: Fd = fd_adopt(signal_fd)
+    sig.close()
 
 # Handle a single plain (unencrypted) session
 fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
@@ -1169,13 +1172,9 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *Col
 # Read exactly `len` bytes into buf.  0 once they are all in, -1 on EOF or
 # an error first.
 fn read_exact(fd: i32, buf: *u8, len: i32) -> i32
-    var got: i32 = 0
-    while got < len
-        let n: i64 = sys_read(fd, buf + got, (len - got) as i64)
-        if n <= 0
-            return -1
-        got += n as i32
-    return 0
+    match fd_borrow(fd).read_exact(Span<u8> { ptr: buf, len: len as i64 })
+        Ok(_) => 0
+        Err(_) => -1
 
 # Read one M7SP message (header, then the length it gives) into buf.  Its
 # length, or -1 on EOF / error / a message over `cap`, after which the
@@ -1195,12 +1194,7 @@ fn read_message(fd: i32, buf: *u8, cap: i32) -> i32
 
 # Write all of data[0..len) (a socket may take less per write).
 fn write_all(fd: i32, data: *u8, len: i32)
-    var sent: i32 = 0
-    while sent < len
-        let n: i64 = sys_write(fd, data + sent, (len - sent) as i64)
-        if n <= 0
-            return
-        sent += n as i32
+    fd_borrow(fd).write_all(Span<u8> { ptr: data, len: len as i64 })
 
 # ============================================================================
 # Shell Command - Interactive Client
@@ -1241,7 +1235,7 @@ fn cmd_shell(host: StrView, port: i32, collection: StrView, no_encryption: i32) 
     shell_print_help()
     print("\n")
 
-    let failures: i32 = shell_run(client, STDIN)
+    let failures: i32 = shell_run(client, fd_stdin())
 
     client_disconnect(client)
     client_free(client)

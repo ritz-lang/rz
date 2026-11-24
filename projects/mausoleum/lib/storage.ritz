@@ -23,6 +23,8 @@
 #   storage_close(storage)
 
 import ritzlib.sys
+import ritzlib.fd
+import ritzlib.fs
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.memory
@@ -89,7 +91,7 @@ struct Storage
     base_path_len: i32
 
     meta: StorageMeta
-    meta_fd: i32            # File descriptor for meta file
+    meta_fd: Fd             # meta.m7m (closed: raw -1)
 
     # The collection table: meta.coll_count entries of MAX_COLLECTIONS, and
     # per entry 1 if it changed since the last commit (AGAST #3637).
@@ -136,11 +138,16 @@ fn meta_only_default(meta: *StorageMeta, colls: *NamedCollectionMeta)
 # Read meta.m7m into *meta and the collection table `colls` (room for
 # MAX_COLLECTIONS).  A v1 file comes back as a v2 table holding only the
 # default collection, its tree (if the file recorded one) included.
-fn meta_read(fd: i32, meta: *StorageMeta, colls: *NamedCollectionMeta) -> i32
-    if sys_lseek(fd, 0, 0) < 0  # SEEK_SET
-        return ERR_IO
+fn meta_read(fd: @Fd, meta: *StorageMeta, colls: *NamedCollectionMeta) -> i32
+    match fd.seek(0, SEEK_SET)
+        Ok(_) => pass
+        Err(_) => return ERR_IO
 
-    let bytes_read: i64 = sys_read(fd, meta as *u8, sizeof(StorageMeta))
+    # A v1 file is shorter than StorageMeta: one read, whatever it gives.
+    var bytes_read: i64 = 0
+    match fd.read(Span<u8> { ptr: meta as *u8, len: sizeof(StorageMeta) })
+        Ok(n) => bytes_read = n
+        Err(_) => return ERR_IO
     if bytes_read < STORAGE_META_V1_HEADER
         return ERR_CORRUPT
     if meta.magic != STORAGE_MAGIC
@@ -148,9 +155,13 @@ fn meta_read(fd: i32, meta: *StorageMeta, colls: *NamedCollectionMeta) -> i32
 
     if meta.version == STORAGE_VERSION_V1
         meta_only_default(meta, colls)
-        if sys_lseek(fd, STORAGE_META_V1_HEADER, 0) < 0
-            return ERR_IO
-        let n: i64 = sys_read(fd, @colls.meta as *u8, sizeof(CollectionMeta))
+        match fd.seek(STORAGE_META_V1_HEADER, SEEK_SET)
+            Ok(_) => pass
+            Err(_) => return ERR_IO
+        var n: i64 = 0
+        match fd.read(Span<u8> { ptr: @colls.meta as *u8, len: sizeof(CollectionMeta) })
+            Ok(got) => n = got
+            Err(_) => return ERR_IO
         if n == 0
             # Written before collections were persisted: no tree recorded.
             collection_meta_clear(@colls.meta)
@@ -166,28 +177,32 @@ fn meta_read(fd: i32, meta: *StorageMeta, colls: *NamedCollectionMeta) -> i32
     if meta.coll_count < 1 or meta.coll_count > MAX_COLLECTIONS as i64
         return ERR_CORRUPT
     let table_len: i64 = meta.coll_count * sizeof(NamedCollectionMeta)
-    if sys_read(fd, colls as *u8, table_len) != table_len
-        return ERR_CORRUPT
+    match fd.read_exact(Span<u8> { ptr: colls as *u8, len: table_len })
+        Ok(_) => pass
+        Err(_) => return ERR_CORRUPT
     if colls.id != DEFAULT_COLLECTION_ID as i64
         return ERR_CORRUPT
     return ERR_OK
 
-fn meta_write(fd: i32, meta: *StorageMeta, colls: *NamedCollectionMeta) -> i32
-    if sys_lseek(fd, 0, 0) < 0  # SEEK_SET
-        return ERR_IO
+fn meta_write(fd: @Fd, meta: *StorageMeta, colls: *NamedCollectionMeta) -> i32
+    match fd.seek(0, SEEK_SET)
+        Ok(_) => pass
+        Err(_) => return ERR_IO
 
-    if sys_write(fd, meta as *u8, sizeof(StorageMeta)) != sizeof(StorageMeta)
-        return ERR_IO
+    match fd.write_all(Span<u8> { ptr: meta as *u8, len: sizeof(StorageMeta) })
+        Ok(_) => pass
+        Err(_) => return ERR_IO
     let table_len: i64 = meta.coll_count * sizeof(NamedCollectionMeta)
-    if sys_write(fd, colls as *u8, table_len) != table_len
-        return ERR_IO
+    match fd.write_all(Span<u8> { ptr: colls as *u8, len: table_len })
+        Ok(_) => pass
+        Err(_) => return ERR_IO
 
     # NOTE: Would call fsync here for durability, but syscall not yet in ritzlib
     # TODO: Add sys_fsync to ritzlib.sys
     return ERR_OK
 
 fn storage_meta_write(storage: *Storage) -> i32
-    return meta_write(storage.meta_fd, @storage.meta, storage.colls)
+    return meta_write(@storage.meta_fd, @storage.meta, storage.colls)
 
 # Every collection's meta is now on disk: nothing is dirty.
 fn storage_meta_clean(storage: *Storage)
@@ -276,14 +291,14 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
     storage.pool = null
     storage.wal_writer = null
     storage.recovery_mgr = null
-    storage.meta_fd = -1
+    storage.meta_fd = fd_adopt(-1)
     storage.current_txn = 0
     storage.current_lsn = 0
     storage_meta_clean(storage)
     storage.is_open = 0
 
-    # Try to create directory (may already exist)
-    sys_mkdir(path, 493)  # 0755
+    # Create the directory; it may already exist (Err(Exist) is fine).
+    mkdir(strview_from_ptr(base_copy, path_len), 493)  # 0755
 
     # Build paths
     var data_path: [256]u8
@@ -296,14 +311,18 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
 
     # Open or create meta file
     var is_new: i32 = 0
-    var meta_fd: i32 = sys_open(@meta_path[0], O_RDWR)
-    if meta_fd < 0
-        # Create new meta file
-        meta_fd = sys_open3(@meta_path[0], O_RDWR | O_CREAT, 420)
-        if meta_fd < 0
-            storage_open_fail(storage)
-            return None
-        is_new = 1
+    let meta_view: StrView = strview_from_cstr(@meta_path[0])
+    var meta_fd: Fd = fd_adopt(-1)
+    match fd_open(meta_view, O_RDWR, 0)
+        Ok(f) => meta_fd = f
+        Err(_) =>
+            # Create new meta file
+            match fd_open(meta_view, O_RDWR | O_CREAT, 420)
+                Ok(f) => meta_fd = f
+                Err(_) =>
+                    storage_open_fail(storage)
+                    return None
+            is_new = 1
 
     storage.meta_fd = meta_fd
 
@@ -311,19 +330,19 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
     if is_new != 0
         meta_init(@storage.meta, storage.colls)
         if storage_meta_write(storage) != ERR_OK
-            sys_close(meta_fd)
+            meta_fd.close()
             storage_open_fail(storage)
             return None
     else
-        if meta_read(meta_fd, @storage.meta, storage.colls) != ERR_OK
-            sys_close(meta_fd)
+        if meta_read(@meta_fd, @storage.meta, storage.colls) != ERR_OK
+            meta_fd.close()
             storage_open_fail(storage)
             return None
 
     # Create buffer pool
     let pool_opt: Option<*BufferPool> = buffer_pool_new(DEFAULT_BUFFER_SIZE)
     if option_is_none<*BufferPool>(@pool_opt)
-        sys_close(meta_fd)
+        meta_fd.close()
         storage_open_fail(storage)
         return None
     storage.pool = option_unwrap_or<*BufferPool>(@pool_opt, null)
@@ -335,7 +354,7 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
     let open_result: i32 = buffer_pool_open(storage.pool, @data_path[0])
     if open_result != ERR_OK
         buffer_pool_destroy(storage.pool)
-        sys_close(meta_fd)
+        meta_fd.close()
         storage_open_fail(storage)
         return None
 
@@ -355,7 +374,7 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
         if rc != ERR_OK
             recovery_mgr_destroy(storage.recovery_mgr)
             buffer_pool_destroy(storage.pool)
-            sys_close(meta_fd)
+            meta_fd.close()
             storage_open_fail(storage)
             return None
 
@@ -407,10 +426,9 @@ pub fn storage_close(storage: *Storage) -> i32
         storage.recovery_mgr = null
 
     # Write final metadata
-    if storage.meta_fd >= 0
+    if storage.meta_fd.valid()
         storage_meta_write(storage)
-        sys_close(storage.meta_fd)
-        storage.meta_fd = -1
+        storage.meta_fd.close()
 
     # Free base path
     if storage.base_path != null

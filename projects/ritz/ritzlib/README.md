@@ -75,6 +75,7 @@ pub fn main() -> i32
 | `elf.ritz` | `ritzlib.elf` | ELF Binary Format Parser |
 | `endian.ritz` | `ritzlib.endian` | big- and little-endian integers in a byte buffer |
 | `errno.ritz` | `ritzlib.errno` | `Errno`, a typed kernel error code (AGAST #4248) |
+| `fd.ritz` | `ritzlib.fd` | Fd, an owned file descriptor with Result methods; pipe() |
 | `fmt.ritz` | `ritzlib.fmt` | formatting and printing: the one import |
 | `fmt/digits.ritz` | `ritzlib.fmt.digits` | the one integer-to-text digit routine |
 | `fmt/display.ritz` | `ritzlib.fmt.display` | the Display and Debug traits |
@@ -101,6 +102,7 @@ pub fn main() -> i32
 | `strview.ritz` | `ritzlib.strview` | Zero-copy string view |
 | `sys.ritz` | `ritzlib.sys` | System call wrappers |
 | `testlib.ritz` | `ritzlib.testlib` | Helpers for `[[test]]` integration tests |
+| `time.ritz` | `ritzlib.time` | Duration, sleep(Duration) and the wall clock |
 | `timer.ritz` | `ritzlib.timer` | High-performance timing utilities |
 | `uring.ritz` | `ritzlib.uring` | io_uring bindings for Linux |
 <!-- END module table -->

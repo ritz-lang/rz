@@ -368,6 +368,144 @@ pub fn rmdir(path: StrView) -> Result<i32, Errno>
     fs_unit(sys_rmdir(@cpath[0]))
 
 # ============================================================================
+# Paths, permissions, cwd -> Result<_, Errno> (AGAST #4637)
+# ============================================================================
+#
+#   access(path, mode) / chdir / rename / chmod / symlink -> Result<(), Errno>
+#   cwd() / read_link(path) -> Result<String, Errno>
+#   set_times(path, atime: FileTime, mtime: FileTime) -> Result<(), Errno>
+#
+# Each takes StrView paths; a path of FS_PATH_MAX bytes or more is
+# Err(NameTooLong) without a syscall.
+
+# Map a raw syscall return (0 or -errno) to Result<(), Errno>.
+fn fs_done(ret: i32) -> Result<(), Errno>
+    if ret < 0
+        return Err(errno_from_raw(ret))
+    Ok(())
+
+# Whether `path` permits `mode`: F_OK (exists), or R_OK + W_OK + X_OK
+# summed, checked against the real uid as access(2) does.
+pub fn access(path: StrView, mode: i32) -> Result<(), Errno>
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(path, @cpath[0])
+    if perr != 0
+        return Err(errno_from_raw(perr))
+    fs_done(sys_access(@cpath[0], mode))
+
+# Change this process's working directory.
+pub fn chdir(path: StrView) -> Result<(), Errno>
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(path, @cpath[0])
+    if perr != 0
+        return Err(errno_from_raw(perr))
+    fs_done(sys_chdir(@cpath[0]))
+
+# Move `from` to `to` (rename(2)), replacing a file at `to`. Err(Other(18))
+# (EXDEV) across filesystems: copy_file then unlink instead.
+pub fn rename(from: StrView, to: StrView) -> Result<(), Errno>
+    var cfrom: [4096]u8
+    var cto: [4096]u8
+    let ferr: i32 = fs_path_cstr(from, @cfrom[0])
+    if ferr != 0
+        return Err(errno_from_raw(ferr))
+    let terr: i32 = fs_path_cstr(to, @cto[0])
+    if terr != 0
+        return Err(errno_from_raw(terr))
+    fs_done(sys_rename(@cfrom[0], @cto[0]))
+
+# Set the permission bits of `path` (chmod(2)), e.g. 493 = 0755.
+pub fn chmod(path: StrView, mode: i32) -> Result<(), Errno>
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(path, @cpath[0])
+    if perr != 0
+        return Err(errno_from_raw(perr))
+    fs_done(sys_chmod(@cpath[0], mode))
+
+# Create a symbolic link at `link` whose contents are `target` (which need
+# not exist).
+pub fn symlink(target: StrView, link: StrView) -> Result<(), Errno>
+    var ctarget: [4096]u8
+    var clink: [4096]u8
+    let terr: i32 = fs_path_cstr(target, @ctarget[0])
+    if terr != 0
+        return Err(errno_from_raw(terr))
+    let lerr: i32 = fs_path_cstr(link, @clink[0])
+    if lerr != 0
+        return Err(errno_from_raw(lerr))
+    fs_done(sys_symlink(@ctarget[0], @clink[0]))
+
+# The current working directory, an absolute path.
+pub fn cwd() -> Result<String, Errno>
+    var buf: [4096]u8
+    # getcwd(2) returns the length including the NUL.
+    let n: i64 = sys_getcwd(@buf[0], 4096)
+    if n < 0
+        return Err(errno_from_raw(n as i32))
+    var len: i64 = n
+    if len > 0 and buf[len - 1] == 0
+        len -= 1
+    var out: String = string_with_cap(len + 1)
+    out.push_span(Span<u8> { ptr: @buf[0], len: len })
+    Ok(out)
+
+# The contents of the symbolic link at `path` (readlink(2)): Err(Inval) if
+# `path` is not a symlink.
+pub fn read_link(path: StrView) -> Result<String, Errno>
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(path, @cpath[0])
+    if perr != 0
+        return Err(errno_from_raw(perr))
+    var buf: [4096]u8
+    let n: i64 = sys_readlink(@cpath[0], @buf[0], 4096)
+    if n < 0
+        return Err(errno_from_raw(n as i32))
+    # readlink(2) truncates silently: a full buffer may have lost bytes.
+    if n >= 4096
+        return Err(Errno.NameTooLong)
+    var out: String = string_with_cap(n + 1)
+    out.push_span(Span<u8> { ptr: @buf[0], len: n })
+    Ok(out)
+
+# One timestamp for set_times: the current time, unchanged, or a moment in
+# nanoseconds since the Unix epoch.
+pub enum FileTime
+    Now
+    Omit
+    At(i64)
+
+# Fill one utimensat(2) timespec slot (two i64s at `ts`) from `t`.
+fn fs_timespec(t: FileTime, ts: @&[2]i64)
+    match t
+        Now =>
+            ts[0] = 0
+            ts[1] = UTIME_NOW
+        Omit =>
+            ts[0] = 0
+            ts[1] = UTIME_OMIT
+        At(ns) =>
+            ts[0] = ns / 1000000000
+            ts[1] = ns % 1000000000
+
+# Set the access and modification times of `path` (utimensat(2), following
+# symlinks). `touch` is set_times(path, FileTime.Now, FileTime.Now).
+pub fn set_times(path: StrView, atime: FileTime, mtime: FileTime) -> Result<(), Errno>
+    var cpath: [4096]u8
+    let perr: i32 = fs_path_cstr(path, @cpath[0])
+    if perr != 0
+        return Err(errno_from_raw(perr))
+    var a: [2]i64
+    var m: [2]i64
+    fs_timespec(atime, @&a)
+    fs_timespec(mtime, @&m)
+    var times: [4]i64
+    times[0] = a[0]
+    times[1] = a[1]
+    times[2] = m[0]
+    times[3] = m[1]
+    fs_done(sys_utimensat(at_fdcwd(), @cpath[0], @times[0], 0))
+
+# ============================================================================
 # Directory Iteration
 # ============================================================================
 # High-level directory iteration API using getdents64.
@@ -516,3 +654,48 @@ impl DirIter
             free(self.buf)
             self.buf = null
         self.entry = null
+
+# ============================================================================
+# remove_dir_all -> Result<(), Errno> (AGAST #4637)
+# ============================================================================
+
+# Remove the directory at `path` and everything under it. Symlinks are
+# removed, never followed, so nothing outside the tree is touched. Err(NotDir)
+# if `path` is not a directory (use unlink); the first other error stops the
+# walk and is returned, leaving what remains in place.
+pub fn remove_dir_all(path: StrView) -> Result<(), Errno>
+    var dir: DirIter
+    match dir_open(path)
+        Ok(d) => dir = d
+        Err(e) => return Err(e)
+    var failed: Option<Errno> = None
+    loop
+        match dir.next_entry()
+            Some(e) =>
+                if e.name.eq(".") or e.name.eq("..")
+                    continue
+                let child: String = path_join(path, e.name)
+                var is_tree: bool = e.kind == DT_DIR
+                # Some filesystems report DT_UNKNOWN: ask lstat (no follow).
+                if e.kind == DT_UNKNOWN
+                    is_tree = is_dir(child.as_view())
+                var r: Result<(), Errno> = Ok(())
+                if is_tree
+                    r = remove_dir_all(child.as_view())
+                else
+                    match unlink(child.as_view())
+                        Ok(_) => pass
+                        Err(err) => r = Err(err)
+                match r
+                    Ok(_) => pass
+                    Err(err) =>
+                        failed = Some(err)
+                        break
+            None => break
+    dir.close()
+    match failed
+        Some(err) => return Err(err)
+        None => pass
+    match rmdir(path)
+        Ok(_) => Ok(())
+        Err(err) => Err(err)

@@ -14,6 +14,9 @@
 
 import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.sys
+import ritzlib.string
+import ritzlib.result
+import ritzlib.fs { remove_dir_all, stat }
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.option
@@ -51,48 +54,17 @@ fn make_tmp_path(buf: *u8, tag: *u8)
     p = append_cstr(buf, p, tag)
     *(buf + p) = 0
 
-# Remove every entry of a flat directory, then the directory.
+# Remove the directory and everything in it (ritzlib.fs remove_dir_all).
 fn rm_dir_flat(dir: *u8)
-    let fd: i32 = sys_open(dir, O_RDONLY + O_DIRECTORY)
-    if fd >= 0
-        var ents: [4096]u8
-        var child: [512]u8
-        loop
-            let n: i64 = sys_getdents64(fd, @ents[0], 4096)
-            if n <= 0
-                break
-            var off: i64 = 0
-            while off < n
-                let rec: *u8 = @ents[off]
-                let reclen: i64 = (*(rec + 16) as i64) + ((*(rec + 17) as i64) << 8)
-                let name: *u8 = rec + 19
-                let is_dot: bool = *name == 46 and *(name + 1) == 0
-                let is_dotdot: bool = *name == 46 and *(name + 1) == 46 and *(name + 2) == 0
-                if not is_dot and not is_dotdot
-                    var p: i64 = append_cstr(@child[0], 0, dir)
-                    p = append_cstr(@child[0], p, c"/")
-                    p = append_cstr(@child[0], p, name)
-                    child[p] = 0
-                    sys_unlink(@child[0])
-                off += reclen
-        sys_close(fd)
-    sys_rmdir(dir)
+    remove_dir_all(strview_from_cstr(dir))
 
 # Size in bytes of <dir>/<name>, or -1 if it cannot be opened.
-fn file_size(dir: *u8, name: *u8) -> i64
-    var path: [512]u8
-    var p: i64 = append_cstr(@path[0], 0, dir)
-    p = append_cstr(@path[0], p, name)
-    path[p] = 0
-    let fd: i32 = sys_open(@path[0], O_RDONLY)
-    if fd < 0
-        return -1
-    var st: Stat
-    var size: i64 = -1
-    if sys_fstat2(fd, @&st) == 0
-        size = st.st_size
-    sys_close(fd)
-    return size
+fn store_file_size(dir: *u8, name: StrView) -> i64
+    var path: String = string_from(strview_from_cstr(dir))
+    path.push_str(name)
+    match stat(path.as_view())
+        Ok(st) => st.st_size
+        Err(_) => -1
 
 fn open_store(path: *u8) -> *Storage
     let opt: Option<*Storage> = storage_open(path)
@@ -218,7 +190,7 @@ fn test_restart_after_abandon_keeps_documents() -> i32
         return 1
     # The ticket's symptom: wal.wal.000000 stayed 0 bytes after writes.
     # Five committed inserts log at least one full page image.
-    if file_size(@path[0], c"/wal.wal.000000") < 4096
+    if store_file_size(@path[0], "/wal.wal.000000") < 4096
         rm_dir_flat(@path[0])
         return 2
     # No storage_destroy: the process "dies" here.
@@ -241,7 +213,7 @@ fn test_restart_recovers_from_wal_alone() -> i32
     if collection_open_storage(@col, s, 1) != ERR_OK
         rm_dir_flat(@path[0])
         return 2
-    let data_before: i64 = file_size(@path[0], c"/data.m7m")
+    let data_before: i64 = store_file_size(@path[0], "/data.m7m")
 
     var i: i32 = 1
     while i <= 5
@@ -257,7 +229,7 @@ fn test_restart_recovers_from_wal_alone() -> i32
     if storage_wal_commit(s) != ERR_OK
         rm_dir_flat(@path[0])
         return 4
-    if file_size(@path[0], c"/data.m7m") != data_before
+    if store_file_size(@path[0], "/data.m7m") != data_before
         rm_dir_flat(@path[0])
         return 5  # pages reached data.m7m, so this would not test redo
 
@@ -343,7 +315,7 @@ fn test_close_checkpoints_the_wal() -> i32
     let wal_open: i64 = storage_wal_size(s)
     collection_destroy(@col)
     storage_destroy(s)
-    let wal_closed: i64 = file_size(@path[0], c"/wal.wal.000000")
+    let wal_closed: i64 = store_file_size(@path[0], "/wal.wal.000000")
     rm_dir_flat(@path[0])
     if wal_open < 4096
         return 2  # 5 committed writes logged less than one page image
@@ -486,7 +458,7 @@ fn test_restart_reuses_pages_freed_before_it() -> i32
     else if has_big(@col, @id, MAX_DOC_SIZE - 100, 2) == 0
         rc = 11
     storage_destroy(s)
-    if rc == 0 and file_size(@path[0], c"/data.m7m") != pages * PAGE_SIZE
+    if rc == 0 and store_file_size(@path[0], "/data.m7m") != pages * PAGE_SIZE
         rc = 12
     rm_dir_flat(@path[0])
     rc

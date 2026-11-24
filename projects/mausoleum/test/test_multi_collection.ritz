@@ -15,6 +15,13 @@
 
 import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.sys
+import ritzlib.fd
+import ritzlib.process { fork, exec, kill, wait_pid, try_wait_pid }
+import ritzlib.time { sleep_ms }
+import ritzlib.span
+import ritzlib.result
+import ritzlib.option
+import ritzlib.fs { remove_dir_all, access }
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.net
@@ -48,12 +55,6 @@ struct TestServer
 # Helpers
 # ============================================================================
 
-fn sleep_ms(ms: i64)
-    var ts: [2]i64
-    ts[0] = ms / 1000
-    ts[1] = (ms % 1000) * 1000000
-    sys_nanosleep(@ts[0], null)
-
 fn append_uint(buf: *u8, pos: i64, n: i32) -> i64
     # digits from ritzlib.fmt (#1957)
     pos + fmt_i64_into(buf + pos, n as i64)
@@ -67,31 +68,15 @@ fn append_cstr(buf: *u8, pos: i64, s: *u8) -> i64
         i += 1
     return p
 
+# Remove the directory and everything in it (ritzlib.fs remove_dir_all).
 fn rm_dir_flat(dir: *u8)
-    let fd: i32 = sys_open(dir, O_RDONLY + O_DIRECTORY)
-    if fd >= 0
-        var ents: [4096]u8
-        var child: [512]u8
-        loop
-            let n: i64 = sys_getdents64(fd, @ents[0], 4096)
-            if n <= 0
-                break
-            var off: i64 = 0
-            while off < n
-                let rec: *u8 = @ents[off]
-                let reclen: i64 = (*(rec + 16) as i64) + ((*(rec + 17) as i64) << 8)
-                let name: *u8 = rec + 19
-                let is_dot: bool = *name == 46 and *(name + 1) == 0
-                let is_dotdot: bool = *name == 46 and *(name + 1) == 46 and *(name + 2) == 0
-                if not is_dot and not is_dotdot
-                    var p: i64 = append_cstr(@child[0], 0, dir)
-                    p = append_cstr(@child[0], p, c"/")
-                    p = append_cstr(@child[0], p, name)
-                    child[p] = 0
-                    sys_unlink(@child[0])
-                off += reclen
-        sys_close(fd)
-    sys_rmdir(dir)
+    remove_dir_all(strview_from_cstr(dir))
+
+# Whether the built server binary is there and executable.
+fn access_ok(bin: *u8) -> bool
+    match access(strview_from_cstr(bin), X_OK)
+        Ok(_) => true
+        Err(_) => false
 
 # fork+exec `mausoleum serve --no-encryption --port P --data-dir DIR
 # [--serial]`.
@@ -100,46 +85,52 @@ fn spawn_server(port: i32, dir: *u8, serial: i32) -> i32
     let end: i64 = append_uint(@port_str[0], 0, port)
     port_str[end] = 0
 
-    var argv: [9]*u8
-    argv[0] = server_bin()
-    argv[1] = c"serve"
-    argv[2] = c"--no-encryption"
-    argv[3] = c"--port"
-    argv[4] = @port_str[0]
-    argv[5] = c"--data-dir"
-    argv[6] = dir
-    argv[7] = null
-    argv[8] = null
+    # argv[1..]; exec makes argv[0] the binary's path.
+    var args: [7]StrView
+    args[0] = "serve"
+    args[1] = "--no-encryption"
+    args[2] = "--port"
+    args[3] = strview_from_cstr(@port_str[0])
+    args[4] = "--data-dir"
+    args[5] = strview_from_cstr(dir)
+    var nargs: i64 = 6
     if serial != 0
-        argv[7] = c"--serial"
+        args[6] = "--serial"
+        nargs = 7
 
-    let pid: i32 = sys_fork()
-    if pid != 0
-        return pid
+    match fork()
+        Ok(fr) =>
+            match fr
+                Parent(child) => return child
+                Child => pass
+        Err(e) => return -e.code()
     syscall2(SYS_PRCTL, PR_SET_PDEATHSIG, SIG_KILL as i64)
-    let devnull: i32 = sys_open(c"/dev/null", 2)
-    if devnull >= 0
-        sys_dup2(devnull, 0)
-        sys_dup2(devnull, 1)
-        sys_dup2(devnull, 2)
-        if devnull > 2
-            sys_close(devnull)
-    sys_execve(server_bin(), @argv[0], null)
+    match fd_open("/dev/null", O_RDWR, 0)
+        Ok(f) =>
+            var devnull: Fd = f
+            devnull.dup_to(0)
+            devnull.dup_to(1)
+            devnull.dup_to(2)
+            if devnull.raw() > 2
+                devnull.close()
+        Err(_) => pass
+    exec(strview_from_cstr(server_bin()), span_from_ptr<StrView>(@args[0], nargs))
     sys_exit(127)
     return -1
 
 fn server_kill(pid: i32)
     if pid <= 0
         return
-    sys_kill(pid, SIG_KILL)
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
+    kill(pid, SIG_KILL)
+    wait_pid(pid)
 
 fn server_exited(pid: i32) -> i32
-    var status: i32 = 0
-    if sys_wait4(pid, @status, WAIT_NOHANG, null) == pid
-        return 1
-    return 0
+    match try_wait_pid(pid)
+        Ok(o) =>
+            match o
+                Some(_) => return 1
+                None => return 0
+        Err(_) => return 0
 
 # 0 = ready, 1 = exited, 2 = timed out.
 fn wait_ready(srv: *TestServer) -> i32
@@ -161,7 +152,7 @@ fn wait_ready(srv: *TestServer) -> i32
 
 # Start the server on srv.dir.  `same_port` reuses srv.port (a restart).
 fn server_start(srv: *TestServer, same_port: i32) -> i32
-    if sys_access(server_bin(), 1) != 0
+    if not access_ok(server_bin())
         return 90
     let base: i32 = PORT_BASE + ((sys_getpid() * 13 + 5) % PORT_SPAN)
     var attempt: i32 = 0

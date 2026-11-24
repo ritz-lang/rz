@@ -19,7 +19,9 @@
 #   buffer_pool_mark_logged says the WAL holds it, it may be written back.
 
 import ritzlib.sys
+import ritzlib.fd
 import ritzlib.str
+import ritzlib.strview
 import ritzlib.memory
 import ritzlib.option
 
@@ -58,7 +60,7 @@ struct BufferPool
     lru_head: i32               # Most recently used unpinned frame
     lru_tail: i32               # Least recently used unpinned frame
     free_list: i32              # Head of free frame list
-    file_fd: i32                # File descriptor for I/O
+    file_fd: Fd                 # data.m7m (closed: raw -1, an in-memory pool)
     next_page_id: i64           # Next page ID to allocate
     stats_hits: i64             # Cache hit count
     stats_misses: i64           # Cache miss count
@@ -126,7 +128,7 @@ pub fn buffer_pool_new(num_frames: i32) -> Option<*BufferPool>
     pool.lru_head = -1
     pool.lru_tail = -1
     pool.free_list = 0  # First frame is head of free list
-    pool.file_fd = -1
+    pool.file_fd = fd_adopt(-1)
     pool.next_page_id = 0
     pool.stats_hits = 0
     pool.stats_misses = 0
@@ -151,8 +153,7 @@ pub fn buffer_pool_destroy(pool: *BufferPool)
     buffer_pool_flush_all(pool)
 
     # Close file if open
-    if pool.file_fd >= 0
-        sys_close(pool.file_fd)
+    pool.file_fd.close()
 
     # Free memory
     if pool.hash_table != null
@@ -308,16 +309,14 @@ pub fn buffer_pool_open(pool: *BufferPool, path: *u8) -> i32
         return ERR_INVALID
 
     # Open file (create if not exists)
-    let fd: i32 = sys_open3(path, O_RDWR | O_CREAT, 420)  # 0644
-    if fd < 0
-        return ERR_IO
-
-    pool.file_fd = fd
+    match fd_open(strview_from_cstr(path), O_RDWR | O_CREAT, 420)  # 0644
+        Ok(f) => pool.file_fd = f
+        Err(_) => return ERR_IO
 
     # Get file size to determine next_page_id
-    var stat_buf: Stat
-    if sys_fstat2(fd, @&stat_buf) == 0
-        pool.next_page_id = stat_buf.st_size / PAGE_SIZE
+    match pool.file_fd.stat()
+        Ok(st) => pool.next_page_id = st.st_size / PAGE_SIZE
+        Err(_) => pass
 
     return ERR_OK
 
@@ -330,43 +329,40 @@ pub fn buffer_pool_close(pool: *BufferPool) -> i32
     buffer_pool_flush_all(pool)
 
     # Close file
-    if pool.file_fd >= 0
-        sys_close(pool.file_fd)
-        pool.file_fd = -1
+    pool.file_fd.close()
 
     return ERR_OK
 
 # Read a page from disk into a frame
 fn read_page(pool: *BufferPool, frame: *Frame, page_id: i64) -> i32
-    if pool.file_fd < 0
+    if not pool.file_fd.valid()
         return ERR_IO
 
-    let offset: i64 = page_id * PAGE_SIZE
-    let result: i64 = sys_lseek(pool.file_fd, offset, 0)  # SEEK_SET = 0
-    if result < 0
-        return ERR_IO
+    match pool.file_fd.seek(page_id * PAGE_SIZE, SEEK_SET)
+        Ok(_) => pass
+        Err(_) => return ERR_IO
 
-    let bytes_read: i64 = sys_read(pool.file_fd, @frame.page as *u8, PAGE_SIZE)
-    if bytes_read < PAGE_SIZE
-        # New page - initialize it
-        page_init(@frame.page, PAGE_MAGIC_FREE, page_id)
-        page_update_checksum(@frame.page)
+    match pool.file_fd.read_exact(Span<u8> { ptr: @frame.page as *u8, len: PAGE_SIZE })
+        Ok(_) => pass
+        Err(_) =>
+            # Past the end of the file: a new page - initialize it
+            page_init(@frame.page, PAGE_MAGIC_FREE, page_id)
+            page_update_checksum(@frame.page)
 
     return ERR_OK
 
 # Write a page from a frame to disk
 fn write_page(pool: *BufferPool, frame: *Frame) -> i32
-    if pool.file_fd < 0
+    if not pool.file_fd.valid()
         return ERR_IO
 
-    let offset: i64 = frame.page_id * PAGE_SIZE
-    let result: i64 = sys_lseek(pool.file_fd, offset, 0)
-    if result < 0
-        return ERR_IO
+    match pool.file_fd.seek(frame.page_id * PAGE_SIZE, SEEK_SET)
+        Ok(_) => pass
+        Err(_) => return ERR_IO
 
-    let bytes_written: i64 = sys_write(pool.file_fd, @frame.page as *u8, PAGE_SIZE)
-    if bytes_written != PAGE_SIZE
-        return ERR_IO
+    match pool.file_fd.write_all(Span<u8> { ptr: @frame.page as *u8, len: PAGE_SIZE })
+        Ok(_) => pass
+        Err(_) => return ERR_IO
 
     return ERR_OK
 
@@ -568,12 +564,14 @@ pub fn buffer_pool_reclaim_free_pages(pool: *BufferPool) -> i32
         let frame_idx: i32 = find_frame(pool, page_id)
         if frame_idx >= 0
             magic = get_frame(pool, frame_idx).page.header.magic
-        else if pool.file_fd >= 0
-            if sys_lseek(pool.file_fd, page_id * PAGE_SIZE, 0) < 0
-                return ERR_IO
+        else if pool.file_fd.valid()
+            match pool.file_fd.seek(page_id * PAGE_SIZE, SEEK_SET)
+                Ok(_) => pass
+                Err(_) => return ERR_IO
             # A short read is past the end of the file: never written.
-            if sys_read(pool.file_fd, @magic as *u8, 4) != 4
-                magic = PAGE_MAGIC_FREE
+            match pool.file_fd.read_exact(Span<u8> { ptr: @magic as *u8, len: 4 })
+                Ok(_) => pass
+                Err(_) => magic = PAGE_MAGIC_FREE
         else
             magic = 0 - 1   # In-memory pool, page evicted: unknown, keep it.
         if magic == PAGE_MAGIC_FREE

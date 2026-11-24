@@ -588,3 +588,80 @@ impl Process
 # impl Drop for Process
 #     fn drop(self: @&Process)
 #         process_cleanup(self)
+
+# ============================================================================
+# fork / exec / wait_pid / kill -> Result (AGAST #4637)
+# ============================================================================
+# The bare process primitives, for a caller that needs the child itself (a
+# daemon, a server worker, a redirect spawn does not cover). To run a program
+# and read its output, use spawn above.
+#
+#     match fork()
+#         Ok(fr) => match fr
+#             Child =>
+#                 ...                          # e.g. p.write.dup_to(1)
+#                 exec("/bin/echo", args)      # returns only on failure
+#                 sys_exit(127)
+#             Parent(pid) =>
+#                 match wait_pid(pid)          # Result<ProcessResult, Errno>
+#                     Ok(r) => r.exit_code ...
+#         Err(e) => ...                        # Again, NoMem
+
+# Which side of a fork this is: the child, or the parent with the child's pid.
+pub enum ForkResult
+    Child
+    Parent(i32)
+
+# fork(2): Ok(Child) in the new process, Ok(Parent(pid)) in this one.
+pub fn fork() -> Result<ForkResult, Errno>
+    let pid: i32 = sys_fork()
+    if pid < 0
+        return Err(errno_from_raw(pid))
+    if pid == 0
+        return Ok(ForkResult.Child)
+    Ok(ForkResult.Parent(pid))
+
+# Replace this process with the program at `path` (no $PATH search: see
+# find_command), argv[0] = `path`, argv[1..] = `args`, this process's
+# environment. Returns only if execve(2) failed, with why (NoEnt, Acces, ...).
+#
+# standard-exempt: raw-alloc: frees the argv block when execve(2) returns; the fork/exec boundary owns it
+pub fn exec(path: StrView, args: Span<StrView>) -> Errno
+    var argv0: StrView = path
+    let argv: **u8 = cstr_array(span_from_ptr<StrView>(@argv0, 1), args)
+    if argv == null
+        return Errno.NoMem
+    # argv[0] is a NUL-terminated copy of `path`: hand that to the kernel.
+    let rc: i32 = sys_execve(*argv, argv, env_raw_envp())
+    free(argv as *u8)
+    errno_from_raw(rc)
+
+# Block until child `pid` exits (wait4(2)): Ok(how it exited), Err(Child) if
+# it is not a child of this process or was already reaped.
+pub fn wait_pid(pid: i32) -> Result<ProcessResult, Errno>
+    var status: i32 = 0
+    var ret: i32 = sys_wait4(pid, @status, 0, null)
+    while ret == -EINTR
+        ret = sys_wait4(pid, @status, 0, null)
+    if ret < 0
+        return Err(errno_from_raw(ret))
+    Ok(status_result(status))
+
+# wait_pid without blocking: Ok(Some(result)) if `pid` has exited (reaping
+# it), Ok(None) if it is still running, Err(Child) if there is nothing to wait for.
+pub fn try_wait_pid(pid: i32) -> Result<Option<ProcessResult>, Errno>
+    var status: i32 = 0
+    let ret: i32 = sys_wait4(pid, @status, WNOHANG, null)
+    if ret < 0
+        return Err(errno_from_raw(ret))
+    if ret == 0
+        return Ok(None)
+    Ok(Some(status_result(status)))
+
+# Send signal `sig` to process `pid` (kill(2)); sig 0 only checks it exists.
+# Err(Other(3)) (ESRCH) if there is no such process.
+pub fn kill(pid: i32, sig: i32) -> Result<(), Errno>
+    let rc: i32 = sys_kill(pid, sig)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(())

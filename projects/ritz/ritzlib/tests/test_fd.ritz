@@ -1,0 +1,416 @@
+# ritzlib.fd: an owned file descriptor with Result methods (AGAST #4637).
+#
+#   fd_open(path: StrView, flags: i32, mode: i32) -> Result<Fd, Errno>
+#   pipe() -> Result<Pipe, Errno>            Pipe { read: Fd, write: Fd }
+#   fd_stdin / fd_stdout / fd_stderr() -> Fd  borrowed: never close them
+#   fd_adopt(raw: i32) -> Fd                  take ownership of a raw fd
+#   fd_borrow(raw: i32) -> Fd                 use a raw fd someone else closes
+#
+#   Fd.read(buf: Span<u8>) -> Result<i64, Errno>
+#   Fd.read_exact(buf: Span<u8>) -> Result<(), Errno>   Err(Io) at early EOF
+#   Fd.read_to_end(out: @&String) -> Result<i64, Errno>
+#   Fd.write(data: Span<u8>) -> Result<i64, Errno>
+#   Fd.write_all(data: Span<u8>) / write_str(s: StrView) -> Result<(), Errno>
+#   Fd.close() -> Result<(), Errno>           a second close is Ok and a no-op
+#   Fd.dup() -> Result<Fd, Errno>, Fd.dup_to(target: i32) -> Result<(), Errno>
+#   Fd.seek(offset, whence) -> Result<i64, Errno>
+#   Fd.stat() -> Result<Stat, Errno>, Fd.truncate(len) -> Result<(), Errno>
+#   Fd.chmod(mode) / lock(op) -> Result<(), Errno>
+#   Fd.raw() -> i32, Fd.valid() -> bool
+#
+# Every test owns its fixture under /tmp, named by pid so concurrent runs
+# (gate slots, compiler variants) stay apart.
+
+import ritzlib.sys
+import ritzlib.fd
+import ritzlib.fs
+import ritzlib.errno
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.result
+import ritzlib.fmt.digits { fmt_i64_into }
+
+const E_NOENT: i32 = 2
+const E_IO: i32 = 5
+const E_BADF: i32 = 9
+const E_EXIST: i32 = 17
+const E_ISDIR: i32 = 21
+const E_PIPE: i32 = 32
+const E_NAMETOOLONG: i32 = 36
+
+# "/tmp/ritzlib_fd_<pid>_<name>" as a String.
+fn tmp_path(name: StrView) -> String
+    var s: String = string_from("/tmp/ritzlib_fd_")
+    var digits: [24]u8
+    let n: i64 = fmt_i64_into(@digits[0], sys_getpid() as i64)
+    s.push_span(Span<u8> { ptr: @digits[0], len: n })
+    s.push('_')
+    s.push_str(name)
+    s
+
+# The Fd of an Ok; a closed Fd (raw -1) for an Err, so the next call on it
+# reports EBADF and the test sees that.
+fn fd_of(r: Result<Fd, Errno>) -> Fd
+    match r
+        Ok(f) => f
+        Err(_) => fd_adopt(-1)
+
+# The errno number of an Err, 0 for Ok (whose Fd is closed).
+fn open_err(r: Result<Fd, Errno>) -> i32
+    match r
+        Ok(f) =>
+            var g: Fd = f
+            g.close()
+            0
+        Err(e) => e.code()
+
+fn unit_err(r: Result<(), Errno>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => e.code()
+
+# The count of an Ok, -1000 - errno for an Err (so a test sees which).
+fn count_of(r: Result<i64, Errno>) -> i64
+    match r
+        Ok(n) => n
+        Err(e) => -1000 - e.code() as i64
+
+fn size_of_stat(r: Result<Stat, Errno>) -> i64
+    match r
+        Ok(st) => st.st_size
+        Err(e) => -1000 - e.code() as i64
+
+fn mode_of_stat(r: Result<Stat, Errno>) -> i32
+    match r
+        Ok(st) => st.st_mode & 4095
+        Err(e) => -1000 - e.code()
+
+fn view_of(s: @String) -> StrView
+    s.as_view()
+
+# A fresh read-write file at `path`, truncated (O_RDWR|O_CREAT|O_TRUNC, 0644).
+fn fresh(path: @String) -> Fd
+    fd_of(fd_open(path.as_view(), O_RDWR + O_CREAT + O_TRUNC, 420))
+
+# ============================================================================
+# fd_open
+# ============================================================================
+
+[[test]]
+fn test_open_missing_is_noent() -> i32
+    let p: String = tmp_path("missing")
+    assert open_err(fd_open(view_of(@p), O_RDONLY, 0)) == E_NOENT
+    0
+
+[[test]]
+fn test_open_excl_existing_is_exist() -> i32
+    let p: String = tmp_path("excl")
+    var f: Fd = fresh(@p)
+    assert f.valid()
+    assert unit_err(f.close()) == 0
+    assert open_err(fd_open(view_of(@p), O_WRONLY + O_CREAT + O_EXCL, 420)) == E_EXIST
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_open_directory_for_write_is_isdir() -> i32
+    assert open_err(fd_open("/tmp", O_WRONLY, 0)) == E_ISDIR
+    0
+
+[[test]]
+fn test_open_long_path_is_nametoolong() -> i32
+    var s: String = string_from("/tmp/")
+    for i in 0..5000
+        s.push('a')
+    assert open_err(fd_open(view_of(@s), O_RDONLY, 0)) == E_NAMETOOLONG
+    0
+
+[[test]]
+fn test_open_takes_an_unterminated_slice() -> i32
+    # A StrView carries no NUL: fd_open must stop at len, not read on.
+    let p: String = tmp_path("slice")
+    var f: Fd = fresh(@p)
+    f.close()
+    var longer: String = string_from(view_of(@p))
+    longer.push_str("XYZ")
+    let v: StrView = view_of(@longer)
+    var g: Fd = fd_of(fd_open(strview_from_ptr(v.ptr, v.len - 3), O_RDONLY, 0))
+    assert g.valid()
+    g.close()
+    unlink(view_of(@p))
+    0
+
+# ============================================================================
+# read / write / write_all / write_str / seek / read_to_end
+# ============================================================================
+
+[[test]]
+fn test_write_seek_read_round_trip() -> i32
+    let p: String = tmp_path("rw")
+    var f: Fd = fresh(@p)
+    assert unit_err(f.write_str("hello, fd")) == 0
+    assert count_of(f.seek(0, SEEK_SET)) == 0
+    var buf: [32]u8
+    assert count_of(f.read(Span<u8> { ptr: @buf[0], len: 32 })) == 9
+    assert strview_from_ptr(@buf[0], 9).eq("hello, fd")
+    # At the end, read reports 0 (EOF), not an error.
+    assert count_of(f.read(Span<u8> { ptr: @buf[0], len: 32 })) == 0
+    f.close()
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_write_returns_count() -> i32
+    let p: String = tmp_path("count")
+    var f: Fd = fresh(@p)
+    let data: StrView = "abcdef"
+    assert count_of(f.write(Span<u8> { ptr: data.ptr, len: 4 })) == 4
+    assert count_of(f.seek(0, SEEK_END)) == 4
+    f.close()
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_write_all_large_buffer() -> i32
+    let p: String = tmp_path("big")
+    var f: Fd = fresh(@p)
+    var big: String = string_new()
+    for i in 0..100000
+        big.push('x')
+    assert unit_err(f.write_all(span_from_strview(view_of(@big)))) == 0
+    assert size_of_stat(f.stat()) == 100000
+    f.close()
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_read_to_end_appends_everything() -> i32
+    let p: String = tmp_path("rte")
+    var f: Fd = fresh(@p)
+    var big: String = string_new()
+    for i in 0..10000
+        big.push('a' + (i % 26) as u8)
+    f.write_str(view_of(@big))
+    f.seek(0, SEEK_SET)
+    var out: String = string_from(">")
+    assert count_of(f.read_to_end(@&out)) == 10000
+    assert out.len() == 10001
+    assert strview_from_ptr(out.as_ptr() + 1, 10000).eq(view_of(@big))
+    f.close()
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_read_exact_fills_or_reports_io() -> i32
+    let p: String = tmp_path("exact")
+    var f: Fd = fresh(@p)
+    f.write_str("0123456789")
+    f.seek(0, SEEK_SET)
+    var buf: [8]u8
+    assert unit_err(f.read_exact(Span<u8> { ptr: @buf[0], len: 8 })) == 0
+    assert strview_from_ptr(@buf[0], 8).eq("01234567")
+    # Two bytes left: EOF before the buffer fills is Err(Io).
+    assert unit_err(f.read_exact(Span<u8> { ptr: @buf[0], len: 8 })) == E_IO
+    f.close()
+    unlink(p.as_view())
+    0
+
+[[test]]
+fn test_read_exact_across_short_pipe_reads() -> i32
+    # A pipe hands back what is there: read_exact must keep reading.
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            p.write.write_str("abc")
+            p.write.write_str("def")
+            p.write.close()
+            var buf: [6]u8
+            assert unit_err(p.read.read_exact(Span<u8> { ptr: @buf[0], len: 6 })) == 0
+            assert strview_from_ptr(@buf[0], 6).eq("abcdef")
+            p.read.close()
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_seek_negative_is_inval() -> i32
+    let p: String = tmp_path("seek")
+    var f: Fd = fresh(@p)
+    assert count_of(f.seek(-5, SEEK_SET)) == -1022
+    f.close()
+    unlink(view_of(@p))
+    0
+
+# ============================================================================
+# close / valid / raw
+# ============================================================================
+
+[[test]]
+fn test_close_twice_is_ok_and_marks_closed() -> i32
+    let p: String = tmp_path("close")
+    var f: Fd = fresh(@p)
+    assert f.raw() >= 0
+    assert unit_err(f.close()) == 0
+    assert not f.valid()
+    assert f.raw() == -1
+    assert unit_err(f.close()) == 0
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_ops_on_closed_fd_are_badf() -> i32
+    var f: Fd = fd_adopt(-1)
+    var buf: [4]u8
+    assert count_of(f.read(Span<u8> { ptr: @buf[0], len: 4 })) == -1000 - E_BADF as i64
+    assert unit_err(f.write_str("x")) == E_BADF
+    assert count_of(f.seek(0, SEEK_SET)) == -1000 - E_BADF as i64
+    assert size_of_stat(f.stat()) == -1000 - E_BADF as i64
+    assert unit_err(f.truncate(0)) == E_BADF
+    assert open_err(f.dup()) == E_BADF
+    0
+
+# ============================================================================
+# stat / truncate / chmod / lock
+# ============================================================================
+
+[[test]]
+fn test_truncate_then_stat() -> i32
+    let p: String = tmp_path("trunc")
+    var f: Fd = fresh(@p)
+    f.write_str("0123456789")
+    assert size_of_stat(f.stat()) == 10
+    assert unit_err(f.truncate(3)) == 0
+    assert size_of_stat(f.stat()) == 3
+    f.close()
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_chmod_sets_mode() -> i32
+    let p: String = tmp_path("chmod")
+    var f: Fd = fresh(@p)
+    assert unit_err(f.chmod(384)) == 0      # 0600
+    assert mode_of_stat(f.stat()) == 384
+    f.close()
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_lock_and_unlock() -> i32
+    let p: String = tmp_path("lock")
+    var f: Fd = fresh(@p)
+    assert unit_err(f.lock(LOCK_EX)) == 0
+    assert unit_err(f.lock(LOCK_UN)) == 0
+    f.close()
+    unlink(view_of(@p))
+    0
+
+# ============================================================================
+# dup / dup_to
+# ============================================================================
+
+[[test]]
+fn test_dup_shares_the_offset() -> i32
+    let p: String = tmp_path("dup")
+    var f: Fd = fresh(@p)
+    var g: Fd = fd_of(f.dup())
+    assert g.valid()
+    assert g.raw() != f.raw()
+    f.write_str("abc")
+    g.write_str("def")
+    assert size_of_stat(f.stat()) == 6
+    f.close()
+    g.close()
+    unlink(view_of(@p))
+    0
+
+[[test]]
+fn test_dup_to_replaces_target() -> i32
+    let p: String = tmp_path("dupto")
+    var f: Fd = fresh(@p)
+    var spare: Fd = fd_of(fd_open("/dev/null", O_RDONLY, 0))
+    assert unit_err(f.dup_to(spare.raw())) == 0
+    # spare's number now names the file.
+    spare.write_str("via spare")
+    assert size_of_stat(f.stat()) == 9
+    spare.close()
+    f.close()
+    unlink(view_of(@p))
+    0
+
+# ============================================================================
+# pipe
+# ============================================================================
+
+[[test]]
+fn test_pipe_round_trip() -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            assert unit_err(p.write.write_str("through")) == 0
+            p.write.close()
+            var out: String = string_new()
+            assert count_of(p.read.read_to_end(@&out)) == 7
+            assert view_of(@out).eq("through")
+            p.read.close()
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_pipe_write_after_reader_closed_is_epipe() -> i32
+    signal_ignore(SIGPIPE)
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            p.read.close()
+            assert unit_err(p.write.write_str("nobody")) == E_PIPE
+            p.write.close()
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_pipe_close_closes_both_ends() -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            p.close()
+            assert not p.read.valid()
+            assert not p.write.valid()
+        Err(_) =>
+            assert false
+    0
+
+# ============================================================================
+# stdio
+# ============================================================================
+
+[[test]]
+fn test_stdio_numbers() -> i32
+    assert fd_stdin().raw() == 0
+    assert fd_stdout().raw() == 1
+    assert fd_stderr().raw() == 2
+    0
+
+[[test]]
+fn test_borrow_reads_through_a_number_it_does_not_own() -> i32
+    let path: String = tmp_path("borrow")
+    var f: Fd = fresh(@path)
+    f.write_str("lent")
+    f.seek(0, SEEK_SET)
+    let lent: Fd = fd_borrow(f.raw())
+    var buf: [8]u8
+    assert count_of(lent.read(Span<u8> { ptr: @buf[0], len: 8 })) == 4
+    assert lent.raw() == f.raw()
+    # The owner closes; the borrow is never closed.
+    assert unit_err(f.close()) == 0
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_stdout_write_str() -> i32
+    assert unit_err(fd_stdout().write_str("")) == 0
+    0

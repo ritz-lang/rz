@@ -6,6 +6,8 @@
 # document the server stores.
 
 import ritzlib.sys
+import ritzlib.result
+import ritzlib.fd
 import ritzlib.str
 import ritzlib.strview
 
@@ -15,21 +17,23 @@ import lib.collection
 import lib.client
 import lib.shell
 
-# A pipe whose read end holds `data` and whose write end is closed.
-fn pipe_with(data: *u8, len: i64) -> i32
-    var fds: [2]i32
-    if sys_pipe(@fds[0]) < 0
-        return -1
-    sys_write(fds[1], data, len)
-    sys_close(fds[1])
-    return fds[0]
+# A pipe whose read end holds `data` and whose write end is closed; a
+# closed Fd if pipe(2) fails (its reads then fail, ending the reader).
+fn pipe_with(data: StrView) -> Fd
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            p.write.write_str(data)
+            p.write.close()
+            return p.read
+        Err(_) => return fd_adopt(-1)
 
 fn eq(s: *u8, lit: *u8) -> bool
     return strcmp(s, lit) == 0
 
 [[test]]
 fn test_line_reader_splits_one_read_into_lines() -> i32
-    let fd: i32 = pipe_with(c"ping\nquit\n", 10)
+    var fd: Fd = pipe_with("ping\nquit\n")
     var r: LineReader
     line_reader_init(@r, fd)
     var out: [64]u8
@@ -40,12 +44,12 @@ fn test_line_reader_splits_one_read_into_lines() -> i32
         rc = 2
     else if line_reader_next(@r, @out[0], 64) != -1
         rc = 3
-    sys_close(fd)
+    fd.close()
     return rc
 
 [[test]]
 fn test_line_reader_crlf_blank_and_unterminated_last_line() -> i32
-    let fd: i32 = pipe_with(c"get 1\r\n\nlist", 12)
+    var fd: Fd = pipe_with("get 1\r\n\nlist")
     var r: LineReader
     line_reader_init(@r, fd)
     var out: [64]u8
@@ -58,12 +62,12 @@ fn test_line_reader_crlf_blank_and_unterminated_last_line() -> i32
         rc = 3
     else if line_reader_next(@r, @out[0], 64) != -1
         rc = 4
-    sys_close(fd)
+    fd.close()
     return rc
 
 [[test]]
 fn test_line_reader_cuts_long_line_and_keeps_going() -> i32
-    let fd: i32 = pipe_with(c"abcdefghij\nok\n", 14)
+    var fd: Fd = pipe_with("abcdefghij\nok\n")
     var r: LineReader
     line_reader_init(@r, fd)
     var out: [8]u8
@@ -72,7 +76,7 @@ fn test_line_reader_cuts_long_line_and_keeps_going() -> i32
         rc = 1
     else if line_reader_next(@r, @out[0], 8) != 2 or not eq(@out[0], c"ok")
         rc = 2
-    sys_close(fd)
+    fd.close()
     return rc
 
 [[test]]

@@ -91,6 +91,7 @@ modules links without sys. A freestanding program defines all three itself.
 6. [I/O Operations](#io-operations)
    - [io](#io) - Console I/O
    - [fs](#fs) - Filesystem operations
+   - [fd](#fd) - Owned file descriptors, pipes
    - [iovec](#iovec) - Vectored I/O for scatter/gather writes
 7. [Networking](#networking)
    - [net](#net) - TCP/IP socket operations
@@ -106,6 +107,7 @@ modules links without sys. A freestanding program defines all three itself.
    - [os.env](#osenv) - Environment variables
 10. [Utilities](#utilities)
     - [timer](#timer) - High-precision timing
+    - [time](#time) - Duration, sleep, wall clock
     - [json](#json) - JSON parsing
     - [elf](#elf) - ELF binary parsing
     - [endian](#endian) - Big- and little-endian integers in a byte buffer
@@ -1900,6 +1902,122 @@ fn save(dir: StrView, name: StrView, text: StrView) -> i32
         Err(e) => e.code()
 ```
 
+**Paths, permissions, cwd** (AGAST #4637):
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `access` | `fn(path: StrView, mode: i32) -> Result<(), Errno>` | `path` permits `mode`: `F_OK` (exists), or `R_OK` + `W_OK` + `X_OK` summed (real uid, as access(2)) |
+| `chdir` | `fn(path: StrView) -> Result<(), Errno>` | Change the working directory |
+| `cwd` | `fn() -> Result<String, Errno>` | The working directory, absolute |
+| `rename` | `fn(from: StrView, to: StrView) -> Result<(), Errno>` | Move `from` to `to`, replacing a file there; `Err(Other(18))` (EXDEV) across filesystems |
+| `chmod` | `fn(path: StrView, mode: i32) -> Result<(), Errno>` | Set permission bits (`493` = 0755) |
+| `symlink` | `fn(target: StrView, link: StrView) -> Result<(), Errno>` | Create `link` pointing at `target` (which need not exist) |
+| `read_link` | `fn(path: StrView) -> Result<String, Errno>` | A symlink's contents; `Err(Inval)` if `path` is not a symlink |
+| `set_times` | `fn(path: StrView, atime: FileTime, mtime: FileTime) -> Result<(), Errno>` | Set access/modification times (follows symlinks) |
+| `remove_dir_all` | `fn(path: StrView) -> Result<(), Errno>` | Remove a directory and everything under it; symlinks are removed, never followed. `Err(NotDir)` for a file; the first other error stops the walk |
+
+`FileTime` is `Now`, `Omit` (leave it unchanged) or `At(ns)`, nanoseconds since
+the Unix epoch; `touch` is `set_times(path, FileTime.Now, FileTime.Now)`.
+
+```ritz
+import ritzlib.fs
+import ritzlib.string
+import ritzlib.result
+
+# Run in `dir`, then come back: 0, or the errno's number.
+fn in_dir(dir: StrView) -> i32
+    match cwd()
+        Ok(home) =>
+            match chdir(dir)
+                Ok(_) => pass
+                Err(e) => return e.code()
+            # ... work relative to `dir` ...
+            match chdir(home.as_view())
+                Ok(_) => 0
+                Err(e) => e.code()
+        Err(e) => e.code()
+```
+
+---
+
+### fd
+
+**Module**: `ritzlib.fd`
+
+`Fd`, an owned file descriptor whose every fallible operation returns
+`Result<_, Errno>` (AGAST #4637). Programs hold an `Fd`, never a bare `i32`
+and a negative errno; the raw `sys_*` fd calls are the kernel-ABI layer under
+it. `ritzlib.fd` re-exports `ritzlib.errno`, the `O_*` open flags, `LOCK_*`
+and `Stat` from `ritzlib.sys`, and defines `SEEK_SET`, `SEEK_CUR`, `SEEK_END`.
+
+```ritz
+struct Fd
+    fd: i32            # -1 once closed
+
+struct Pipe
+    read: Fd
+    write: Fd
+```
+
+**Ownership.** An `Fd` from `fd_open`, `pipe`, `dup` or `fd_adopt` owns its
+descriptor; close it once with `close()`, which marks it closed (`raw()` is
+`-1`), so a second close is `Ok(())` and closes nothing. An `impl Drop` will
+close it automatically once Drop lands (#1854). `fd_stdin` / `fd_stdout` /
+`fd_stderr` borrow the standard streams, and `fd_borrow` any number owned
+elsewhere: never close those. A read or write
+interrupted by a signal is retried, so `Err(Intr)` never escapes.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `fd_open` | `fn(path: StrView, flags: i32, mode: i32) -> Result<Fd, Errno>` | open(2): `O_RDONLY`, `O_WRONLY + O_CREAT + O_TRUNC`, ...; `mode` when created (`420` = 0644). `NameTooLong` at 4096 bytes, no syscall |
+| `pipe` | `fn() -> Result<Pipe, Errno>` | A new pipe; both ends owned by the caller |
+| `fd_stdin` / `fd_stdout` / `fd_stderr` | `fn() -> Fd` | The standard streams, borrowed |
+| `fd_adopt` | `fn(raw: i32) -> Fd` | Own a raw descriptor (a socket, an inherited fd); `-1` gives a closed Fd |
+| `fd_borrow` | `fn(raw: i32) -> Fd` | Use a raw descriptor someone else owns and closes (a `Socket`'s fd, a caller's number): never close it |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `f.read(buf)` | `fn(buf: Span<u8>) -> Result<i64, Errno>` | Up to `buf.len` bytes; `Ok(0)` at EOF |
+| `f.read_exact(buf)` | `fn(buf: Span<u8>) -> Result<(), Errno>` | Fill all of `buf` across short reads; `Err(Io)` if EOF comes first |
+| `f.read_to_end(out)` | `fn(out: @&String) -> Result<i64, Errno>` | Append everything to EOF; `Ok` = bytes appended |
+| `f.write(data)` | `fn(data: Span<u8>) -> Result<i64, Errno>` | One write(2); may be short |
+| `f.write_all(data)` | `fn(data: Span<u8>) -> Result<(), Errno>` | Retry short writes; `Err(Pipe)` once the reader is gone (SIGPIPE ignored) |
+| `f.write_str(s)` | `fn(s: StrView) -> Result<(), Errno>` | `write_all` of a StrView |
+| `f.close()` | `fn() -> Result<(), Errno>` | Close and mark closed; a second close is `Ok(())` |
+| `f.dup()` | `fn() -> Result<Fd, Errno>` | A new owned descriptor for the same open file |
+| `f.dup_to(target)` | `fn(target: i32) -> Result<(), Errno>` | dup2(2): make descriptor `target` (e.g. `1`) this file; `f` stays open |
+| `f.seek(offset, whence)` | `fn(offset: i64, whence: i32) -> Result<i64, Errno>` | lseek(2); `Ok` = new offset |
+| `f.stat()` | `fn() -> Result<Stat, Errno>` | fstat(2) |
+| `f.truncate(len)` | `fn(len: i64) -> Result<(), Errno>` | ftruncate(2) |
+| `f.chmod(mode)` | `fn(mode: i32) -> Result<(), Errno>` | fchmod(2) |
+| `f.lock(op)` | `fn(op: i32) -> Result<(), Errno>` | flock(2): `LOCK_SH`, `LOCK_EX`, `LOCK_UN`, `+ LOCK_NB` |
+| `f.raw()` | `fn() -> i32` | The number, for a kernel-ABI hand-off (poll, io_uring); ownership stays |
+| `f.valid()` | `fn() -> bool` | Open? |
+| `p.close()` (Pipe) | `fn() -> Result<(), Errno>` | Close both ends |
+
+Every method on a closed `Fd` is `Err(BadF)` without a syscall.
+
+```ritz
+import ritzlib.fd
+import ritzlib.string
+import ritzlib.result
+
+# The contents of `path` with a trailing line added, written back.
+fn append_line(path: StrView, line: StrView) -> Result<(), Errno>
+    match fd_open(path, O_RDWR + O_CREAT, 420)
+        Ok(f) =>
+            var file: Fd = f
+            match file.seek(0, SEEK_END)
+                Ok(_) => pass
+                Err(e) =>
+                    file.close()
+                    return Err(e)
+            let w: Result<(), Errno> = file.write_str(line)
+            file.close()
+            w
+        Err(e) => Err(e)
+```
+
 ---
 
 ### iovec
@@ -2491,6 +2609,42 @@ struct ProcessResult
 | `find_command` | `fn(name: StrView) -> Option<String>` | Search `$PATH`, or the standard dirs if it is unset or empty |
 | `find_command_in` | `fn(name: StrView, path: StrView) -> Option<String>` | Search a `:`-separated dir list: first executable `dir/name`; an empty component is `.`; a name with `/` comes back as is |
 
+**fork / exec / wait / kill** (AGAST #4637). The bare primitives, for a caller
+that needs the child itself (a daemon, a worker, a redirect `spawn` doesn't
+cover). To run a program and read its output, use `spawn`.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `fork` | `fn() -> Result<ForkResult, Errno>` | `Ok(Child)` in the new process, `Ok(Parent(pid))` in this one |
+| `exec` | `fn(path: StrView, args: Span<StrView>) -> Errno` | execve(2) `path` (no `$PATH` search) with argv[0] = `path`, argv[1..] = `args`, our environment. Returns only on failure, with why |
+| `wait_pid` | `fn(pid: i32) -> Result<ProcessResult, Errno>` | Block until child `pid` exits; `Err(Child)` if it isn't ours or was already reaped |
+| `try_wait_pid` | `fn(pid: i32) -> Result<Option<ProcessResult>, Errno>` | `wait_pid` without blocking: `Ok(None)` while it runs |
+| `kill` | `fn(pid: i32, sig: i32) -> Result<(), Errno>` | Send `sig` (0 checks the pid exists); `Err(Other(3))` (ESRCH) if there's no such process |
+
+```ritz
+import ritzlib.process
+import ritzlib.fd
+import ritzlib.sys { sys_exit }
+import ritzlib.span
+import ritzlib.result
+
+# Run /bin/true with stdout redirected to `out`; its exit code, or -errno.
+fn run_true_into(out: @Fd) -> i32
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child =>
+                    out.dup_to(1)
+                    exec("/bin/true", span_empty<StrView>())
+                    sys_exit(127)
+                    0
+                Parent(pid) =>
+                    match wait_pid(pid)
+                        Ok(r) => r.exit_code
+                        Err(e) => -e.code()
+        Err(e) => -e.code()
+```
+
 ---
 
 ### argspec
@@ -2699,6 +2853,42 @@ struct Stopwatch
 | `sw.avg_nanos()` | `fn() -> i64` | Average ns |
 | `sw.count()` | `fn() -> i64` | Number of samples |
 | `sw.print()` | `fn() -> i32` | Print stats |
+
+---
+
+### time
+
+**Module**: `ritzlib.time`
+
+`Duration`, `sleep` and the wall clock (AGAST #4637), so a program never
+builds a nanosleep timespec array by hand. For elapsed-time measurement use
+[timer](#timer)'s monotonic clock: the wall clock can jump.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `duration_ns` / `duration_us` / `duration_ms` / `duration_secs` | `fn(n: i64) -> Duration` | A Duration (held as nanoseconds) |
+| `sleep` | `fn(d: Duration)` | Block at least `d`; a signal doesn't cut it short; `<= 0` returns at once |
+| `sleep_ms` | `fn(ms: i64)` | `sleep(duration_ms(ms))` |
+| `now` | `fn() -> Timeval` | Wall clock: `tv_sec`, `tv_usec` since the Unix epoch |
+| `now_unix_ms` | `fn() -> i64` | `now()` in milliseconds |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `d.as_nanos()` / `as_micros()` / `as_millis()` / `as_secs()` | `fn() -> i64` | Converted, truncating toward zero |
+
+```ritz
+import ritzlib.time
+
+# Poll `ready` every 10 ms for up to `limit`; whether it became ready.
+fn wait_until(ready: fn() -> bool, limit: Duration) -> bool
+    var waited: i64 = 0
+    while waited < limit.as_millis()
+        if ready()
+            return true
+        sleep_ms(10)
+        waited += 10
+    ready()
+```
 
 ---
 

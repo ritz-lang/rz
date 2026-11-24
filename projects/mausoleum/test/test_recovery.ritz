@@ -3,6 +3,10 @@
 # Tests for crash recovery using WAL replay.
 
 import ritzlib.sys
+import ritzlib.result
+import ritzlib.fd
+import ritzlib.strview
+import ritzlib.fs { unlink }
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.option
@@ -63,7 +67,7 @@ fn cleanup_test_files(base_path: *u8)
             div = div / 10
             i += 1
         path_buf[base_len + 11] = 0
-        sys_unlink(@path_buf[0])
+        unlink(strview_from_cstr(@path_buf[0]))
         seg += 1
 
 # ============================================================================
@@ -652,11 +656,14 @@ fn test_recovery_torn_tail_keeps_committed_prefix() -> i32
     let base_len: i64 = strlen(base_path)
     memcpy(@path_buf[0], base_path, base_len)
     memcpy(@path_buf[base_len], c".wal.000000", 12)
-    let fd: i32 = sys_open3(@path_buf[0], O_WRONLY | O_APPEND, 420)
     var junk: [16]u8
     memset(@junk[0], 0x5A, 16)
-    sys_write(fd, @junk[0], 16)
-    sys_close(fd)
+    match fd_open(strview_from_cstr(@path_buf[0]), O_WRONLY | O_APPEND, 420)
+        Ok(f) =>
+            var wal: Fd = f
+            wal.write_all(Span<u8> { ptr: @junk[0], len: 16 })
+            wal.close()
+        Err(_) => return 90
 
     let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
     var rc: i32 = 0
@@ -753,13 +760,16 @@ fn test_recovery_corrupted_wal() -> i32
     let suffix: *u8 = c".wal.000000"
     memcpy(@path_buf[base_len], suffix, 12)
 
-    let fd: i32 = sys_open3(@path_buf[0], O_RDWR | O_CREAT | O_TRUNC, 420)
     var garbage: [64]u8
     garbage[0] = 0xFF
     garbage[1] = 0xFE
     garbage[2] = 0xFD
-    sys_write(fd, @garbage[0], 64)
-    sys_close(fd)
+    match fd_open(strview_from_cstr(@path_buf[0]), O_RDWR | O_CREAT | O_TRUNC, 420)
+        Ok(f) =>
+            var wal: Fd = f
+            wal.write_all(Span<u8> { ptr: @garbage[0], len: 64 })
+            wal.close()
+        Err(_) => return 90
 
     # Recovery should handle corruption gracefully
     let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)

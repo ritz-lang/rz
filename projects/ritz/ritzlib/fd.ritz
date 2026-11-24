@@ -1,0 +1,289 @@
+# ritzlib/fd.ritz - Fd, an owned file descriptor with Result methods; pipe()
+#
+# The typed layer over sys.ritz's fd syscalls (AGAST #4637). A program
+# holds an `Fd`, not a bare i32, and every fallible operation returns a
+# Result whose Err is a ritzlib.errno `Errno`, never a negative number.
+#
+#     match fd_open("/etc/hostname", O_RDONLY, 0)
+#         Ok(f) =>
+#             var file: Fd = f
+#             var text: String = string_new()
+#             file.read_to_end(@&text)          # Result<i64, Errno>
+#             file.close()
+#         Err(e) => ...                         # NoEnt, Acces, ...
+#
+#     match pipe()                              # Result<Pipe, Errno>
+#         Ok(p) => ...                          # p.read, p.write: two Fds
+#
+# Ownership: an Fd from fd_open, pipe, dup or fd_adopt owns its descriptor
+# and must be closed once with close(), which marks it closed (raw -1), so a
+# second close is Ok(()) and closes nothing. An `impl Drop` will close it
+# automatically once Drop lands (AGAST #1854). fd_stdin/fd_stdout/fd_stderr
+# borrow the process's standard streams: never close those.
+#
+# raw() is for the remaining kernel-ABI hand-offs (poll, io_uring, execve
+# redirection by number): it does not transfer ownership.
+#
+# A read or write interrupted by a signal (EINTR) is retried, so Err(Intr)
+# never escapes these methods.
+
+import ritzlib.sys
+# What a caller of fd_open / stat / lock needs, so `import ritzlib.fd` is enough.
+pub import ritzlib.sys { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK, O_CLOEXEC, O_DIRECTORY, LOCK_SH, LOCK_EX, LOCK_NB, LOCK_UN, Stat }
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.result
+# Errno is part of this API (every Err), so importers of fd get it too.
+pub import ritzlib.errno
+
+# lseek(2) whence.
+pub const SEEK_SET: i32 = 0
+pub const SEEK_CUR: i32 = 1
+pub const SEEK_END: i32 = 2
+
+const FD_PATH_MAX: i64 = 4096
+const FD_ENAMETOOLONG: i32 = 36
+const FD_EBADF: i32 = 9
+const FD_EINTR: i32 = 4
+const FD_EIO: i32 = 5
+
+# An owned file descriptor; `fd` is -1 once closed.
+pub struct Fd
+    fd: i32
+
+# The two ends of a pipe(2): bytes written to `write` are read from `read`.
+pub struct Pipe
+    read: Fd
+    write: Fd
+
+# Map a raw syscall return (0 or -errno) to Result<(), Errno>.
+fn fd_unit(rc: i32) -> Result<(), Errno>
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(())
+
+# Map a raw i64 syscall return (a count, or -errno) to Result<i64, Errno>.
+fn fd_count(rc: i64) -> Result<i64, Errno>
+    if rc < 0
+        return Err(errno_from_raw(rc as i32))
+    Ok(rc)
+
+# ============================================================================
+# Constructors
+# ============================================================================
+
+# Open `path` with open(2) `flags` (O_RDONLY, O_WRONLY + O_CREAT + O_TRUNC, ...)
+# and, when O_CREAT creates it, permission bits `mode` (420 = 0644). Err
+# NameTooLong for a path of 4096 bytes or more, without a syscall.
+pub fn fd_open(path: StrView, flags: i32, mode: i32) -> Result<Fd, Errno>
+    if path.len >= FD_PATH_MAX
+        return Err(errno_from_raw(FD_ENAMETOOLONG))
+    # A StrView carries no terminator: copy it and add one for the kernel.
+    var cpath: [4096]u8
+    for i in 0..path.len
+        cpath[i] = *(path.ptr + i)
+    cpath[path.len] = 0
+    let rc: i32 = sys_open3(@cpath[0], flags, mode)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(Fd { fd: rc })
+
+# Take ownership of a raw descriptor (a socket, an inherited fd, a number from
+# a protocol). -1 gives a closed Fd, whose every operation is Err(BadF).
+pub fn fd_adopt(raw: i32) -> Fd
+    Fd { fd: raw }
+
+# Use a raw descriptor that something else owns and closes (a socket held
+# by a ritzlib.net Socket, an fd number from a caller): never close the
+# returned Fd. The same struct as fd_adopt; the name records who closes it.
+pub fn fd_borrow(raw: i32) -> Fd
+    Fd { fd: raw }
+
+# The process's standard streams, borrowed: never close them.
+pub fn fd_stdin() -> Fd
+    Fd { fd: 0 }
+
+pub fn fd_stdout() -> Fd
+    Fd { fd: 1 }
+
+pub fn fd_stderr() -> Fd
+    Fd { fd: 2 }
+
+# A new pipe(2): Ok(Pipe { read, write }), both ends owned by the caller.
+pub fn pipe() -> Result<Pipe, Errno>
+    var ends: [2]i32
+    let rc: i32 = sys_pipe(@ends[0])
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(Pipe { read: Fd { fd: ends[0] }, write: Fd { fd: ends[1] } })
+
+# ============================================================================
+# Fd methods
+# ============================================================================
+
+# Methods (S-IMPL-1): an Fd is the subject of every operation on it.
+impl Fd
+    # The descriptor number, for a kernel-ABI hand-off (poll, io_uring, a
+    # dup_to target). -1 once closed. Ownership stays with this Fd.
+    pub fn raw(self: @Fd) -> i32
+        self.fd
+
+    # Whether this Fd holds an open descriptor (false once closed).
+    pub fn valid(self: @Fd) -> bool
+        self.fd >= 0
+
+    # Close the descriptor and mark this Fd closed, so a second close, or a
+    # close of an Fd that never opened, is Ok(()) and closes nothing.
+    # Err(errno) from close(2): the descriptor is released either way (Linux
+    # frees it even when close reports EINTR or EIO).
+    pub fn close(self: @&Fd) -> Result<(), Errno>
+        if self.fd < 0
+            return Ok(())
+        let rc: i32 = sys_close(self.fd)
+        self.fd = -1
+        fd_unit(rc)
+
+    # read(2) at most buf.len bytes into `buf`: Ok(bytes read, 0 at EOF).
+    pub fn read(self: @Fd, buf: Span<u8>) -> Result<i64, Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        var n: i64 = sys_read(self.fd, buf.ptr, buf.len)
+        while n == -(FD_EINTR as i64)
+            n = sys_read(self.fd, buf.ptr, buf.len)
+        fd_count(n)
+
+    # Fill all of `buf`, reading again after each short read. Err(Io) if EOF
+    # comes first (the bytes read so far are in `buf`, the count is lost):
+    # for a fixed-size header or record.
+    pub fn read_exact(self: @Fd, buf: Span<u8>) -> Result<(), Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        var done: i64 = 0
+        while done < buf.len
+            let n: i64 = sys_read(self.fd, buf.ptr + done, buf.len - done)
+            if n == -(FD_EINTR as i64)
+                continue
+            if n < 0
+                return Err(errno_from_raw(n as i32))
+            if n == 0
+                return Err(errno_from_raw(FD_EIO))
+            done += n
+        Ok(())
+
+    # Read until EOF, appending every byte to `out`: Ok(bytes appended).
+    pub fn read_to_end(self: @Fd, out: @&String) -> Result<i64, Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        var chunk: [4096]u8
+        var total: i64 = 0
+        loop
+            let n: i64 = sys_read(self.fd, @chunk[0], 4096)
+            if n == -(FD_EINTR as i64)
+                continue
+            if n < 0
+                return Err(errno_from_raw(n as i32))
+            if n == 0
+                break
+            out.push_span(Span<u8> { ptr: @chunk[0], len: n })
+            total += n
+        Ok(total)
+
+    # write(2) at most data.len bytes: Ok(bytes written), possibly short.
+    pub fn write(self: @Fd, data: Span<u8>) -> Result<i64, Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        var n: i64 = sys_write(self.fd, data.ptr, data.len)
+        while n == -(FD_EINTR as i64)
+            n = sys_write(self.fd, data.ptr, data.len)
+        fd_count(n)
+
+    # Write all of `data`, retrying short writes. Err(Io) if the kernel takes
+    # no bytes at all; Err(Pipe) once the reader is gone (with SIGPIPE ignored).
+    pub fn write_all(self: @Fd, data: Span<u8>) -> Result<(), Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        var done: i64 = 0
+        while done < data.len
+            let n: i64 = sys_write(self.fd, data.ptr + done, data.len - done)
+            if n == -(FD_EINTR as i64)
+                continue
+            if n < 0
+                return Err(errno_from_raw(n as i32))
+            if n == 0
+                return Err(errno_from_raw(FD_EIO))
+            done += n
+        Ok(())
+
+    # write_all of a StrView's bytes.
+    pub fn write_str(self: @Fd, s: StrView) -> Result<(), Errno>
+        self.write_all(Span<u8> { ptr: s.ptr, len: s.len })
+
+    # A new descriptor for the same open file (dup(2)), owned by the caller.
+    pub fn dup(self: @Fd) -> Result<Fd, Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        let rc: i32 = sys_dup(self.fd)
+        if rc < 0
+            return Err(errno_from_raw(rc))
+        Ok(Fd { fd: rc })
+
+    # Make descriptor number `target` refer to this open file (dup2(2)),
+    # closing whatever `target` was. The usual use is a child redirecting a
+    # standard stream before exec: `p.write.dup_to(1)`. This Fd stays open.
+    pub fn dup_to(self: @Fd, target: i32) -> Result<(), Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        let rc: i32 = sys_dup2(self.fd, target)
+        if rc < 0
+            return Err(errno_from_raw(rc))
+        Ok(())
+
+    # Reposition the file offset (lseek(2)): Ok(the new offset from the start).
+    pub fn seek(self: @Fd, offset: i64, whence: i32) -> Result<i64, Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        fd_count(sys_lseek(self.fd, offset, whence))
+
+    # The open file's status (fstat(2)).
+    pub fn stat(self: @Fd) -> Result<Stat, Errno>
+        var st: Stat
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        let rc: i32 = sys_fstat2(self.fd, @&st)
+        if rc < 0
+            return Err(errno_from_raw(rc))
+        Ok(st)
+
+    # Set the file's length to `len` bytes (ftruncate(2)).
+    pub fn truncate(self: @Fd, len: i64) -> Result<(), Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        fd_unit(sys_ftruncate(self.fd, len))
+
+    # Set the file's permission bits (fchmod(2)), e.g. 384 = 0600.
+    pub fn chmod(self: @Fd, mode: i32) -> Result<(), Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        fd_unit(sys_fchmod(self.fd, mode))
+
+    # Advisory whole-file lock (flock(2)): LOCK_SH, LOCK_EX, LOCK_UN, with
+    # LOCK_NB added to fail with Again instead of blocking.
+    pub fn lock(self: @Fd, op: i32) -> Result<(), Errno>
+        if self.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        fd_unit(sys_flock(self.fd, op))
+
+# ============================================================================
+# Pipe methods
+# ============================================================================
+
+impl Pipe
+    # Close both ends (each a no-op if already closed). The first error wins.
+    pub fn close(self: @&Pipe) -> Result<(), Errno>
+        let r: Result<(), Errno> = self.read.close()
+        let w: Result<(), Errno> = self.write.close()
+        match r
+            Err(e) => return Err(e)
+            Ok(_) => pass
+        w

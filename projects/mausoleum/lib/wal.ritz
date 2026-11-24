@@ -20,6 +20,7 @@
 # - Records are sequential with LSN ordering
 
 import ritzlib.sys
+import ritzlib.fd
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.memory
@@ -117,7 +118,7 @@ struct WalPageWritePayload
 # ============================================================================
 
 struct WalWriter
-    fd: i32                     # File descriptor
+    fd: Fd                      # The segment file (closed: raw -1)
     buffer: *u8                 # Write buffer
     buffer_pos: i64             # Current position in buffer
     current_lsn: i64            # Current LSN counter
@@ -156,7 +157,7 @@ pub fn wal_writer_new(base_path: *u8) -> *WalWriter
     memcpy(path_copy, base_path, path_len + 1)
 
     # Initialize
-    writer.fd = -1
+    writer.fd = fd_adopt(-1)
     writer.buffer = buffer
     writer.buffer_pos = 0
     writer.current_lsn = 1
@@ -183,16 +184,14 @@ pub fn wal_writer_open(writer: *WalWriter) -> i32
     path_buf[base_len + 11] = 0
 
     # Open file
-    let fd: i32 = sys_open3(@path_buf[0], O_RDWR | O_CREAT | O_APPEND, 420)
-    if fd < 0
-        return ERR_IO
-
-    writer.fd = fd
+    match fd_open(strview_from_cstr(@path_buf[0]), O_RDWR | O_CREAT | O_APPEND, 420)
+        Ok(f) => writer.fd = f
+        Err(_) => return ERR_IO
 
     # Appending to an existing segment: start counting from its size.
-    var st: Stat
-    if sys_fstat2(fd, @&st) == 0
-        writer.segment_pos = st.st_size
+    match writer.fd.stat()
+        Ok(st) => writer.segment_pos = st.st_size
+        Err(_) => pass
     return ERR_OK
 
 # Close WAL writer
@@ -203,9 +202,7 @@ pub fn wal_writer_close(writer: *WalWriter) -> i32
     # Flush any remaining data
     wal_writer_flush(writer)
 
-    if writer.fd >= 0
-        sys_close(writer.fd)
-        writer.fd = -1
+    writer.fd.close()
 
     return ERR_OK
 
@@ -243,15 +240,15 @@ fn crc16(data: *u8, len: i64) -> u16
 
 # Flush buffer to disk
 pub fn wal_writer_flush(writer: *WalWriter) -> i32
-    if writer == null or writer.fd < 0
+    if writer == null or not writer.fd.valid()
         return ERR_INVALID
 
     if writer.buffer_pos == 0
         return ERR_OK
 
-    let written: i64 = sys_write(writer.fd, writer.buffer, writer.buffer_pos)
-    if written != writer.buffer_pos
-        return ERR_IO
+    match writer.fd.write_all(Span<u8> { ptr: writer.buffer, len: writer.buffer_pos })
+        Ok(_) => pass
+        Err(_) => return ERR_IO
 
     writer.segment_pos += writer.buffer_pos
     writer.buffer_pos = 0
@@ -510,11 +507,12 @@ pub fn wal_write_named_meta(writer: *WalWriter, txn_id: i64, prev_lsn: i64, entr
 # Discard every record: called once all of them are known to be in the data
 # file (checkpoint).  The fd is O_APPEND, so later writes start at 0 again.
 pub fn wal_writer_truncate(writer: *WalWriter) -> i32
-    if writer == null or writer.fd < 0
+    if writer == null or not writer.fd.valid()
         return ERR_INVALID
     writer.buffer_pos = 0
-    if sys_ftruncate(writer.fd, 0) < 0
-        return ERR_IO
+    match writer.fd.truncate(0)
+        Ok(_) => pass
+        Err(_) => return ERR_IO
     writer.segment_pos = 0
     return ERR_OK
 
@@ -556,7 +554,7 @@ pub fn wal_write_checkpoint(writer: *WalWriter) -> i64
 # ============================================================================
 
 struct WalReader
-    fd: i32
+    fd: Fd
     buffer: *u8
     buffer_size: i64
     buffer_pos: i64
@@ -573,7 +571,7 @@ pub fn wal_reader_new() -> *WalReader
         free(reader as *u8)
         return null
 
-    reader.fd = -1
+    reader.fd = fd_adopt(-1)
     reader.buffer = buffer
     reader.buffer_size = WAL_BUFFER_SIZE
     reader.buffer_pos = 0
@@ -586,11 +584,9 @@ pub fn wal_reader_open(reader: *WalReader, path: *u8) -> i32
     if reader == null or path == null
         return ERR_INVALID
 
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
-        return ERR_IO
-
-    reader.fd = fd
+    match fd_open(strview_from_cstr(path), O_RDONLY, 0)
+        Ok(f) => reader.fd = f
+        Err(_) => return ERR_IO
     reader.buffer_pos = 0
     reader.buffer_len = 0
 
@@ -600,9 +596,7 @@ pub fn wal_reader_close(reader: *WalReader) -> i32
     if reader == null
         return ERR_INVALID
 
-    if reader.fd >= 0
-        sys_close(reader.fd)
-        reader.fd = -1
+    reader.fd.close()
 
     return ERR_OK
 
@@ -619,11 +613,14 @@ pub fn wal_reader_destroy(reader: *WalReader)
 
 # Read next record header (returns 0 on success, -1 on EOF, error code otherwise)
 pub fn wal_reader_next(reader: *WalReader, header: *WalRecordHeader) -> i32
-    if reader == null or header == null or reader.fd < 0
+    if reader == null or header == null or not reader.fd.valid()
         return ERR_INVALID
 
     # Try to read header
-    let bytes_read: i64 = sys_read(reader.fd, header as *u8, WAL_HEADER_SIZE)
+    var bytes_read: i64 = 0
+    match reader.fd.read(Span<u8> { ptr: header as *u8, len: WAL_HEADER_SIZE })
+        Ok(n) => bytes_read = n
+        Err(_) => return ERR_IO
     if bytes_read == 0
         return -1  # EOF
     if bytes_read != WAL_HEADER_SIZE
@@ -641,6 +638,15 @@ pub fn wal_reader_next(reader: *WalReader, header: *WalRecordHeader) -> i32
     reader.current_lsn = header.lsn
     return ERR_OK
 
+# Read exactly buf.len payload bytes of the current record (after its
+# header): ERR_OK, or ERR_IO if the WAL ends first or the read fails.
+pub fn wal_reader_read_payload(reader: *WalReader, buf: Span<u8>) -> i32
+    if reader == null
+        return ERR_INVALID
+    match reader.fd.read_exact(buf)
+        Ok(_) => ERR_OK
+        Err(_) => ERR_IO
+
 # Skip to end of current record (after reading header)
 pub fn wal_reader_skip_payload(reader: *WalReader, header: *WalRecordHeader) -> i32
     if reader == null or header == null
@@ -648,9 +654,9 @@ pub fn wal_reader_skip_payload(reader: *WalReader, header: *WalRecordHeader) -> 
 
     let payload_len: i64 = (header.len as i64) - WAL_HEADER_SIZE
     if payload_len > 0
-        let result: i64 = sys_lseek(reader.fd, payload_len, 1)  # SEEK_CUR = 1
-        if result < 0
-            return ERR_IO
+        match reader.fd.seek(payload_len, SEEK_CUR)
+            Ok(_) => pass
+            Err(_) => return ERR_IO
 
     return ERR_OK
 

@@ -15,6 +15,9 @@
 
 import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.sys
+import ritzlib.string
+import ritzlib.result
+import ritzlib.fs { remove_dir_all, copy_file, mkdir }
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.option
@@ -53,77 +56,32 @@ fn make_tmp_path(buf: *u8, tag: *u8)
     p = append_cstr(buf, p, tag)
     *(buf + p) = 0
 
-# Remove every entry of a flat directory, then the directory.
+# Remove the directory and everything in it (ritzlib.fs remove_dir_all).
 fn rm_dir_flat(dir: *u8)
-    let fd: i32 = sys_open(dir, O_RDONLY + O_DIRECTORY)
-    if fd >= 0
-        var ents: [4096]u8
-        var child: [512]u8
-        loop
-            let n: i64 = sys_getdents64(fd, @ents[0], 4096)
-            if n <= 0
-                break
-            var off: i64 = 0
-            while off < n
-                let rec: *u8 = @ents[off]
-                let reclen: i64 = (*(rec + 16) as i64) + ((*(rec + 17) as i64) << 8)
-                let name: *u8 = rec + 19
-                let is_dot: bool = *name == 46 and *(name + 1) == 0
-                let is_dotdot: bool = *name == 46 and *(name + 1) == 46 and *(name + 2) == 0
-                if not is_dot and not is_dotdot
-                    var p: i64 = append_cstr(@child[0], 0, dir)
-                    p = append_cstr(@child[0], p, c"/")
-                    p = append_cstr(@child[0], p, name)
-                    child[p] = 0
-                    sys_unlink(@child[0])
-                off += reclen
-        sys_close(fd)
-    sys_rmdir(dir)
+    remove_dir_all(strview_from_cstr(dir))
 
 # Copy <src_dir><name> to <dst_dir><name>.  0 = ok.
-fn copy_file(src_dir: *u8, dst_dir: *u8, name: *u8) -> i32
-    var src: [512]u8
-    var dst: [512]u8
-    var p: i64 = append_cstr(@src[0], 0, src_dir)
-    p = append_cstr(@src[0], p, name)
-    src[p] = 0
-    p = append_cstr(@dst[0], 0, dst_dir)
-    p = append_cstr(@dst[0], p, name)
-    dst[p] = 0
-    let in_fd: i32 = sys_open(@src[0], O_RDONLY)
-    if in_fd < 0
-        return 1
-    let out_fd: i32 = sys_open3(@dst[0], O_RDWR | O_CREAT, 420)
-    if out_fd < 0
-        sys_close(in_fd)
-        return 2
-    var buf: [4096]u8
-    var rc: i32 = 0
-    loop
-        let n: i64 = sys_read(in_fd, @buf[0], 4096)
-        if n < 0
-            rc = 3
-            break
-        if n == 0
-            break
-        if sys_write(out_fd, @buf[0], n) != n
-            rc = 4
-            break
-    sys_close(in_fd)
-    sys_close(out_fd)
-    return rc
+fn copy_named(src_dir: *u8, dst_dir: *u8, name: StrView) -> i32
+    var src: String = string_from(strview_from_cstr(src_dir))
+    src.push_str(name)
+    var dst: String = string_from(strview_from_cstr(dst_dir))
+    dst.push_str(name)
+    match copy_file(src.as_view(), dst.as_view(), 420)
+        Ok(_) => 0
+        Err(_) => 1
 
 # A fresh copy of fixture `fixture` (e.g. c"test/fixtures/store_v1_clean")
 # at `dst`.  0 = ok.
 fn copy_fixture(fixture: *u8, dst: *u8) -> i32
     rm_dir_flat(dst)
-    if sys_mkdir(dst, 493) != 0
-        return 1
-    if copy_file(fixture, dst, c"/meta.m7m") != 0
+    match mkdir(strview_from_cstr(dst), 493)
+        Ok(_) => pass
+        Err(_) => return 1
+    if copy_named(fixture, dst, "/meta.m7m") != 0
         return 2
-    if copy_file(fixture, dst, c"/data.m7m") != 0
+    if copy_named(fixture, dst, "/data.m7m") != 0
         return 3
-    if copy_file(fixture, dst, c"/wal.wal.000000") != 0
+    if copy_named(fixture, dst, "/wal.wal.000000") != 0
         return 4
     return 0
 

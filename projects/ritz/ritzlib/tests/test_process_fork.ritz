@@ -1,0 +1,156 @@
+# ritzlib.process: fork / exec / wait / kill as Result APIs (AGAST #4637).
+#
+#   fork() -> Result<ForkResult, Errno>      ForkResult: Child | Parent(pid)
+#   exec(path: StrView, args: Span<StrView>) -> Errno   only returns on failure
+#   wait_pid(pid) -> Result<ProcessResult, Errno>
+#   try_wait_pid(pid) -> Result<Option<ProcessResult>, Errno>
+#   kill(pid, sig) -> Result<(), Errno>
+#
+# For running a program and reading its output, prefer spawn (see
+# test_process_api.ritz); these are for the callers that need a bare fork.
+
+import ritzlib.sys
+import ritzlib.process
+import ritzlib.fd
+import ritzlib.time
+import ritzlib.errno
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
+
+const E_NOENT: i32 = 2
+const E_CHILD: i32 = 10
+
+fn unit_err(r: Result<(), Errno>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => e.code()
+
+# The exit code of an Ok wait, -1000 - errno for an Err.
+fn exit_of(r: Result<ProcessResult, Errno>) -> i32
+    match r
+        Ok(pr) => pr.exit_code
+        Err(e) => -1000 - e.code()
+
+fn signal_of(r: Result<ProcessResult, Errno>) -> i32
+    match r
+        Ok(pr) =>
+            if pr.signaled != 0
+                return pr.signal
+            0
+        Err(e) => -1000 - e.code()
+
+# The pid of a fork's parent side; in the child, exit with `code` at once.
+fn fork_exiting(code: i32) -> i32
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child =>
+                    sys_exit(code)
+                    0
+                Parent(pid) => pid
+        Err(_) => -1
+
+[[test]]
+fn test_fork_child_exit_code_reaches_wait_pid() -> i32
+    let pid: i32 = fork_exiting(7)
+    assert pid > 0
+    assert exit_of(wait_pid(pid)) == 7
+    0
+
+[[test]]
+fn test_wait_pid_twice_is_echild() -> i32
+    let pid: i32 = fork_exiting(0)
+    assert exit_of(wait_pid(pid)) == 0
+    assert exit_of(wait_pid(pid)) == -1000 - E_CHILD
+    0
+
+[[test]]
+fn test_kill_then_wait_reports_signal() -> i32
+    var pid: i32 = -1
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child =>
+                    sleep_ms(10000)
+                    sys_exit(0)
+                Parent(p) => pid = p
+        Err(_) =>
+            assert false
+    assert unit_err(kill(pid, SIGKILL)) == 0
+    assert signal_of(wait_pid(pid)) == SIGKILL
+    0
+
+[[test]]
+fn test_kill_missing_pid_is_srch() -> i32
+    # pid_max is at most 2^22: this pid cannot exist.
+    assert unit_err(kill(1073741823, 0)) == 3
+    0
+
+[[test]]
+fn test_try_wait_pid_running_then_done() -> i32
+    var pid: i32 = -1
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child =>
+                    sleep_ms(200)
+                    sys_exit(3)
+                Parent(p) => pid = p
+        Err(_) =>
+            assert false
+    match try_wait_pid(pid)
+        Ok(o) =>
+            assert option_is_none<ProcessResult>(@o)
+        Err(_) =>
+            assert false
+    sleep_ms(400)
+    match try_wait_pid(pid)
+        Ok(o) =>
+            match o
+                Some(pr) =>
+                    assert pr.exit_code == 3
+                None =>
+                    assert false
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_exec_in_child_runs_the_program() -> i32
+    # The child redirects stdout into a pipe and execs /bin/echo.
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            match fork()
+                Ok(fr) =>
+                    match fr
+                        Child =>
+                            p.read.close()
+                            p.write.dup_to(1)
+                            var args: [2]StrView
+                            args[0] = "hello"
+                            args[1] = "exec"
+                            exec("/bin/echo", span_from_ptr<StrView>(@args[0], 2))
+                            sys_exit(127)
+                        Parent(pid) =>
+                            p.write.close()
+                            var out: String = string_new()
+                            p.read.read_to_end(@&out)
+                            p.read.close()
+                            assert out.as_view().eq("hello exec\n")
+                            assert exit_of(wait_pid(pid)) == 0
+                Err(_) =>
+                    assert false
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_exec_missing_returns_noent() -> i32
+    # No fork needed: a failed exec returns to its caller.
+    let e: Errno = exec("/nonexistent/ritzlib/prog", span_empty<StrView>())
+    assert e.code() == E_NOENT
+    0

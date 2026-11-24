@@ -17,6 +17,7 @@
 # non-zero when driven from a script.
 
 import ritzlib.sys
+import ritzlib.fd
 import ritzlib.io
 import ritzlib.fmt
 import ritzlib.str
@@ -40,13 +41,13 @@ const SHELL_LIST_VALUE_MAX: i64 = 48
 # ============================================================================
 
 struct LineReader
-    fd: i32
+    fd: Fd              # borrowed: the reader never closes it
     buf: [8192]u8
     start: i32          # first unconsumed byte
     end: i32            # one past the last buffered byte
     eof: i32
 
-pub fn line_reader_init(r: *LineReader, fd: i32)
+pub fn line_reader_init(r: *LineReader, fd: Fd)
     r.fd = fd
     r.start = 0
     r.end = 0
@@ -78,11 +79,13 @@ pub fn line_reader_next(r: *LineReader, out: *u8, out_cap: i32) -> i32
                 memmove(@r.buf[0], @r.buf[r.start], pending as i64)
             r.start = 0
             r.end = pending
-        let n: i64 = sys_read(r.fd, @r.buf[r.end], (SHELL_READ_BUF - r.end) as i64)
-        if n <= 0
-            r.eof = 1
-        else
-            r.end += n as i32
+        match r.fd.read(Span<u8> { ptr: @r.buf[r.end], len: (SHELL_READ_BUF - r.end) as i64 })
+            Ok(n) =>
+                if n == 0
+                    r.eof = 1
+                else
+                    r.end += n as i32
+            Err(_) => r.eof = 1
 
 # Line = buf[start..stop) (minus a trailing '\r'); consume up to `next`.
 fn line_take(r: *LineReader, stop: i32, next: i32, out: *u8, out_cap: i32) -> i32
@@ -310,7 +313,7 @@ fn id_arg(line: *u8, len: i32, pos: *i32, cmd: StrView, out: *i64) -> i32
 
 # Run commands from `input` until quit/exit or end of input.  Returns the
 # number of commands that failed.
-pub fn shell_run(client: *Client, input: i32) -> i32
+pub fn shell_run(client: *Client, input: Fd) -> i32
     var reader: LineReader
     line_reader_init(@reader, input)
     var line: [4096]u8

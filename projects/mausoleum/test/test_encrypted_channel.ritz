@@ -4,6 +4,8 @@
 # Note: Full integration tests would require socketpair or loopback sockets.
 
 import ritzlib.sys
+import ritzlib.result
+import ritzlib.fd
 import ritzlib.net
 
 import lib.encrypted_channel
@@ -145,14 +147,16 @@ fn ec_handshake_with_peer(ch: *EncryptedChannel, server: i32, peer_pub: *u8) -> 
     memzero(@ch.send_key[0], 32)
     memzero(@ch.recv_key[0], 32)
     # The peer's key is already queued; ours lands in sv[1]'s buffer.
-    if sys_write(sv[1], peer_pub, 32) != 32
-        return 101
+    var peer: Fd = fd_adopt(sv[1])
+    match peer.write_all(Span<u8> { ptr: peer_pub, len: 32 })
+        Ok(_) => pass
+        Err(_) => return 101
     var rc: i32 = 0
     if server != 0
         rc = channel_handshake_server(ch)
     else
         rc = channel_handshake_client(ch)
-    sys_close(sv[1])
+    peer.close()
     return rc
 
 fn ec_all_zero(p: *u8, n: i32) -> i32
@@ -251,15 +255,18 @@ fn ec_connected_pair(cli: *EncryptedChannel, srv: *EncryptedChannel) -> i32
     b.socktype = 1
     if channel_init_client(cli, a) < 0 or channel_init_server(srv, b) < 0
         return 101
-    if sys_write(sv[0], @cli.public_key[0], 32) != 32
-        return 102
+    # sv[0] and sv[1] belong to the Sockets a and b.
+    match fd_borrow(sv[0]).write_all(Span<u8> { ptr: @cli.public_key[0], len: 32 })
+        Ok(_) => pass
+        Err(_) => return 102
     if channel_handshake_server(srv) != 0
         return 103
     if channel_handshake_client(cli) != 0
         return 104
     var stray: [32]u8
-    if sys_read(sv[1], @stray[0], 32) != 32
-        return 105
+    match fd_borrow(sv[1]).read_exact(Span<u8> { ptr: @stray[0], len: 32 })
+        Ok(_) => pass
+        Err(_) => return 105
     0
 
 [[test]]
