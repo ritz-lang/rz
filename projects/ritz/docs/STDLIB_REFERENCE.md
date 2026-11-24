@@ -3091,7 +3091,8 @@ struct ElfReader
 | `elf.get_symbol_name(sym_index)` | `fn(sym_index: i64) -> Option<*u8>` | Get symbol name |
 | `elf.get_symbol_info(sym_index)` | `fn(sym_index: i64) -> u8` | Get symbol info |
 | `elf.symbol_count()` | `fn() -> i64` | Get symbol count |
-| `elf.find_test_functions(callback, user_data)` | `fn(callback: *u8, user_data: *u8) -> i32` | Find test_* functions |
+| `elf.image()` | `fn() -> Span<u8>` | The whole image, as a span |
+| `elf.find_test_functions()` | `fn() -> i32` | Count global `test_*` functions |
 | `elf.print_test_functions()` | `fn()` | Print test functions |
 
 ---
@@ -3100,27 +3101,34 @@ struct ElfReader
 
 **Module**: `ritzlib.endian`
 
-Reads and writes multi-byte integers in a caller-owned byte buffer, in the byte
-order a wire or file format chose (AGAST #1858). The pointer is byte-addressed,
-so it need not be aligned (packed headers, ELF and MADT records). There is no
-bounds check: the caller owns the buffer, as with `*u8` everywhere.
+Reads and writes multi-byte integers at a byte offset in a `Span<u8>`, in the
+byte order a wire or file format chose (AGAST #1858). The offset is
+byte-addressed, so it need not be aligned (packed headers, ELF and MADT
+records). An array fits the span slot as `@array`.
+
+Every access is bounds-checked (AGAST #4644): one whose bytes do not all lie in
+the span (`off < 0` or `off + width > s.len`) ends the program with status 101
+and `endian: <width> bytes at offset <off> overrun a span of <len>`, through the
+platform's fatal hook, as a missing hashmap key does
+(`ritz0/tests/test_endian_bounds.py`).
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `endian_read_u16_be` / `_le` | `fn(p: *u8) -> u16` | Read a u16 in big / little endian |
-| `endian_read_u32_be` / `_le` | `fn(p: *u8) -> u32` | Read a u32 in big / little endian |
-| `endian_read_u64_be` / `_le` | `fn(p: *u8) -> u64` | Read a u64 in big / little endian |
-| `endian_write_u16_be` / `_le` | `fn(p: *u8, v: u16)` | Write a u16 in big / little endian |
-| `endian_write_u32_be` / `_le` | `fn(p: *u8, v: u32)` | Write a u32 in big / little endian |
-| `endian_write_u64_be` / `_le` | `fn(p: *u8, v: u64)` | Write a u64 in big / little endian |
+| `endian_read_u16_be` / `_le` | `fn(s: [u8], off: i64) -> u16` | Read a u16 in big / little endian |
+| `endian_read_u32_be` / `_le` | `fn(s: [u8], off: i64) -> u32` | Read a u32 in big / little endian |
+| `endian_read_u64_be` / `_le` | `fn(s: [u8], off: i64) -> u64` | Read a u64 in big / little endian |
+| `endian_write_u16_be` / `_le` | `fn(s: [u8], off: i64, v: u16)` | Write a u16 in big / little endian |
+| `endian_write_u32_be` / `_le` | `fn(s: [u8], off: i64, v: u32)` | Write a u32 in big / little endian |
+| `endian_write_u64_be` / `_le` | `fn(s: [u8], off: i64, v: u64)` | Write a u64 in big / little endian |
 
 ```ritz
+import ritzlib.span
 import ritzlib.endian
 
 fn main() -> i32
-    var b: [4]u8 = [0, 0, 0, 0]
-    endian_write_u32_be(@b[0], 0xdeadbeef)
-    if endian_read_u32_be(@b[0]) == 0xdeadbeef
+    var b: [6]u8 = [0, 0, 0, 0, 0, 0]
+    endian_write_u32_be(@b, 2, 0xdeadbeef)
+    if endian_read_u32_be(@b, 2) == 0xdeadbeef
         0
     else
         1

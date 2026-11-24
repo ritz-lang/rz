@@ -299,10 +299,12 @@ build-all-ritz1: ritz1-bootstrap
 	cd ../.. && ./rz build --all --compiler ritz1
 	cd ../.. && ./rz build --all --compiler ritz1_selfhosted
 
-# Build and test all examples (always runs)
+# Build and test all examples (always runs). The walk starts in examples/:
+# build.py --all skips rz.toml's [workspace.exclude] dirs, and examples/ is
+# one of them unless the walk starts inside it (AGAST #4644).
 .PHONY: examples
 examples:
-	@$(PYTHON) build.py test --all
+	@cd examples && $(PYTHON) ../build.py test --all
 
 # Build all examples (no tests)
 build:

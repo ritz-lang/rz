@@ -7,8 +7,8 @@
 # section-header string table, and lists symbols with elf_parse_sections.
 #
 # elf.ritz has no find-section-by-name, so section_exists walks the section
-# headers itself with elf's read_u16/u32/u64 (the same raw offsets
-# elf_parse_sections uses).  Nothing printed depends on addresses, sizes or
+# headers itself with ritzlib.endian's little-endian readers, at offsets into
+# the image's span (the same offsets elf_parse_sections uses).  Nothing printed depends on addresses, sizes or
 # symbol counts, which differ between the ritz0 and ritz1 builds.
 
 import ritzlib.sys
@@ -17,10 +17,13 @@ import ritzlib.gvec
 import ritzlib.result
 import ritzlib.elf
 import ritzlib.fd { Fd, fd_open, O_RDONLY }
+import ritzlib.span
+import ritzlib.endian
+import ritzlib.strview
 
 const O_RDONLY: i32 = 0
 
-# Is the NUL-terminated name at `p` (in an ELF string table) exactly `want`?
+# Is the NUL-terminated symbol name at `p` (from get_symbol_name) exactly `want`?
 fn name_is(p: *u8, want: StrView) -> bool
     var i: i64 = 0
     while i < want.len
@@ -29,21 +32,32 @@ fn name_is(p: *u8, want: StrView) -> bool
         i += 1
     return *(p + want.len) == 0
 
-# Does the ELF image `data` have a section named `name`?
-fn section_exists(data: *u8, size: i64, name: StrView) -> bool
-    let shoff: i64 = read_u64(data + 40)
-    let shentsize: i64 = read_u16(data + 58) as i64
-    let shnum: i64 = read_u16(data + 60) as i64
-    let shstrndx: i64 = read_u16(data + 62) as i64
-    if shoff == 0 or shnum == 0 or shoff + shnum * shentsize > size
+# Is the NUL-terminated name at `off` in `img` equal to `name`?
+fn name_at_eq(img: [u8], off: i64, name: StrView) -> bool
+    if off < 0 or off + name.len >= img.len
         return false
-    let strtab_sh: *u8 = data + shoff + shstrndx * shentsize
-    let names: *u8 = data + read_u64(strtab_sh + 24)
+    var i: i64 = 0
+    while i < name.len
+        if img[off + i] != *(name.ptr + i)
+            return false
+        i += 1
+    return img[off + name.len] == 0
+
+# Does the ELF image `img` have a section named `name`?
+fn section_exists(img: [u8], name: StrView) -> bool
+    let shoff: i64 = endian_read_u64_le(img, 40) as i64
+    let shentsize: i64 = endian_read_u16_le(img, 58) as i64
+    let shnum: i64 = endian_read_u16_le(img, 60) as i64
+    let shstrndx: i64 = endian_read_u16_le(img, 62) as i64
+    if shoff == 0 or shnum == 0 or shoff + shnum * shentsize > img.len
+        return false
+    let strtab_sh: i64 = shoff + shstrndx * shentsize
+    let names: i64 = endian_read_u64_le(img, strtab_sh + 24) as i64
     var i: i64 = 0
     while i < shnum
-        let sh: *u8 = data + shoff + i * shentsize
-        let off: i64 = read_u32(sh) as i64
-        if name_is(names + off, name)
+        let sh: i64 = shoff + i * shentsize
+        let off: i64 = endian_read_u32_le(img, sh) as i64
+        if name_at_eq(img, names + off, name)
             return true
         i += 1
     return false
@@ -53,8 +67,8 @@ fn yes_no(v: bool) -> StrView
         return "yes"
     return "no"
 
-fn show_section(data: *u8, size: i64, name: StrView)
-    let s: StrView = yes_no(section_exists(data, size, name))
+fn show_section(img: [u8], name: StrView)
+    let s: StrView = yes_no(section_exists(img, name))
     print("section {name}: {s}\n")
 
 fn main() -> i32
@@ -91,15 +105,16 @@ fn main() -> i32
         print("data: little-endian\n")
     else
         print("data: big-endian\n")
-    let machine: i32 = read_u16(image.data + 18)
+    let img: [u8] = span_from_vec<u8>(@image)
+    let machine: i32 = endian_read_u16_le(img, 18) as i32
     if machine == 62
         print("machine: {machine} (x86-64)\n")
     else
         print("machine: {machine}\n")
 
-    show_section(image.data, image.len, ".text")
-    show_section(image.data, image.len, ".symtab")
-    show_section(image.data, image.len, ".no_such_section")
+    show_section(img, ".text")
+    show_section(img, ".symtab")
+    show_section(img, ".no_such_section")
 
     let ps: i32 = match r.parse_sections()
         Ok(_) => 0
@@ -132,10 +147,10 @@ fn main() -> i32
     while k < 8
         bytes[k] = (k + 1) as u8
         k += 1
-    let a: i32 = read_u16(@bytes[0])
-    let bb: i32 = read_u32(@bytes[0])
-    let c: i64 = read_u64(@bytes[0])
-    print("read_u16/u32/u64: {a} {bb} {c}\n")
+    let a: i32 = endian_read_u16_le(@bytes, 0) as i32
+    let bb: i32 = endian_read_u32_le(@bytes, 0) as i32
+    let c: i64 = endian_read_u64_le(@bytes, 0) as i64
+    print("endian_read_u16/u32/u64_le: {a} {bb} {c}\n")
 
     # Rejections: too short for a header, and a wrong magic number.
     var bad: ElfReader

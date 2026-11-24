@@ -37,6 +37,7 @@ from pathlib import Path
 import pytest
 
 from ritz0_inproc import run_ritz0
+from test_table_rows import _closure
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
@@ -169,10 +170,10 @@ fn main() -> i32
 
 # --- net/dhcp.ritz -------------------------------------------------------------
 
+# kernel/src/serial.ritz re-exports ritzlib's StrView, as this does: a stub
+# declaring its own would clash with the one ritzlib.endian's imports bring.
 SERIAL_STUB = """\
-pub struct StrView
-    ptr: *u8
-    len: i64
+pub import ritzlib.strview { StrView }
 """
 
 # The kernel logs through klog (AGAST #1885); these have its signatures and
@@ -386,9 +387,11 @@ def test_dhcp_discover_offer_request_ack(tmp_path):
         "net/udp.ritz": NET_UDP_STUB,
         "net/eth.ritz": NET_ETH_STUB,
         "net/dhcp.ritz": (KERNEL_SRC / "net" / "dhcp.ritz").read_text(),
-        # dhcp.ritz imports ritzlib.endian (AGAST #1858); a real build compiles
-        # the module to its own object, and so must this tree.
-        "ritzlib/endian.ritz": (RITZ_ROOT / "ritzlib" / "endian.ritz").read_text(),
+        # dhcp.ritz imports ritzlib.endian (AGAST #1858), and endian imports
+        # ritzlib.span for its Span<u8> parameters (#4644); a real build
+        # compiles each module to its own object, and so must this tree.
+        **{f"ritzlib/{unit}.ritz": (RITZ_ROOT / "ritzlib" / f"{unit}.ritz").read_text()
+           for unit in _closure(("endian",))},
     }
     rc = _run(tmp_path, DHCP_MAIN, tree)
     assert rc == 0, f"exit {rc}: {DHCP_CLAIMS.get(rc, 'crashed')}"

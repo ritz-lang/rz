@@ -12,6 +12,7 @@ import cryptosec.pem
 import cryptosec.p256
 import cryptosec.sha256
 import ritzlib.endian
+import ritzlib.span
 
 # ============================================================================
 # Config Tests
@@ -944,13 +945,14 @@ fn test_client_near_hrr_random_is_not_hrr() -> i32
 
 # Frame the handshake body at out[9..9+body] as one ServerHello record.
 fn frame_2182(out: *u8, body: i64) -> i64
+    let rec: [u8] = span_from_ptr<u8>(out, 9 + body)
     out[0] = 22
     out[1] = 0x03
     out[2] = 0x03
-    endian_write_u16_be(out + 3, (body + 4) as u16)
+    endian_write_u16_be(rec, 3, (body + 4) as u16)
     out[5] = HS_SERVER_HELLO
     out[6] = 0
-    endian_write_u16_be(out + 7, (body) as u16)
+    endian_write_u16_be(rec, 7, (body) as u16)
     return 9 + body
 
 # Write version, `random`, session id echo, suite and compression at out[9..].
@@ -961,13 +963,15 @@ fn hello_head_2182(out: *u8, random: *u8, client: *TlsClient, suite: u16) -> i64
     mem_copy(out + 11, random, 32)
     out[43] = 32
     mem_copy(out + 44, @client.client_hello.session_id[0], 32)
-    endian_write_u16_be(out + 76, (suite as i64) as u16)
+    let head: [u8] = span_from_ptr<u8>(out, 79)
+    endian_write_u16_be(head, 76, (suite as i64) as u16)
     out[78] = 0
     return 79
 
 fn ext_version_2182(out: *u8, p: i64) -> i64
-    endian_write_u16_be(out + p, (43) as u16)
-    endian_write_u16_be(out + p + 2, (2) as u16)
+    let rec: [u8] = span_from_ptr<u8>(out, p + 6)
+    endian_write_u16_be(rec, p, (43) as u16)
+    endian_write_u16_be(rec, p + 2, (2) as u16)
     out[p + 4] = 0x03
     out[p + 5] = 0x04
     return p + 6
@@ -979,21 +983,28 @@ fn hrr_2182(out: *u8, client: *TlsClient, suite: u16, group: u16, cookie_len: i6
     hello_retry_request_random(@magic[0])
     let at: i64 = hello_head_2182(out, @magic[0], client, suite)
     var p: i64 = ext_version_2182(out, at + 2)
+    # The record's extent: the extensions below end it
+    var end: i64 = p
     if group != 0
-        endian_write_u16_be(out + p, (51) as u16)
-        endian_write_u16_be(out + p + 2, (2) as u16)
-        endian_write_u16_be(out + p + 4, (group as i64) as u16)
+        end = end + 6
+    if cookie_len > 0
+        end = end + 6 + cookie_len
+    let rec: [u8] = span_from_ptr<u8>(out, end)
+    if group != 0
+        endian_write_u16_be(rec, p, (51) as u16)
+        endian_write_u16_be(rec, p + 2, (2) as u16)
+        endian_write_u16_be(rec, p + 4, (group as i64) as u16)
         p = p + 6
     if cookie_len > 0
-        endian_write_u16_be(out + p, (44) as u16)
-        endian_write_u16_be(out + p + 2, (cookie_len + 2) as u16)
-        endian_write_u16_be(out + p + 4, (cookie_len) as u16)
+        endian_write_u16_be(rec, p, (44) as u16)
+        endian_write_u16_be(rec, p + 2, (cookie_len + 2) as u16)
+        endian_write_u16_be(rec, p + 4, (cookie_len) as u16)
         var i: i64 = 0
         while i < cookie_len
             out[p + 6 + i] = (0x40 + i) as u8
             i += 1
         p = p + 6 + cookie_len
-    endian_write_u16_be(out + at, (p - at - 2) as u16)
+    endian_write_u16_be(rec, at, (p - at - 2) as u16)
     return frame_2182(out, p - 9)
 
 # A ServerHello record for `client` with one key share of `key_len` bytes.
@@ -1002,13 +1013,15 @@ fn sh_2182(out: *u8, client: *TlsClient, suite: u16, group: u16, key: *u8, key_l
     rnd[0] = 0x22
     let at: i64 = hello_head_2182(out, @rnd[0], client, suite)
     var p: i64 = ext_version_2182(out, at + 2)
-    endian_write_u16_be(out + p, (51) as u16)
-    endian_write_u16_be(out + p + 2, (4 + key_len) as u16)
-    endian_write_u16_be(out + p + 4, (group as i64) as u16)
-    endian_write_u16_be(out + p + 6, (key_len) as u16)
+    # The record ends with the key_share extension
+    let rec: [u8] = span_from_ptr<u8>(out, p + 8 + key_len)
+    endian_write_u16_be(rec, p, (51) as u16)
+    endian_write_u16_be(rec, p + 2, (4 + key_len) as u16)
+    endian_write_u16_be(rec, p + 4, (group as i64) as u16)
+    endian_write_u16_be(rec, p + 6, (key_len) as u16)
     mem_copy(out + p + 8, key, key_len)
     p = p + 8 + key_len
-    endian_write_u16_be(out + at, (p - at - 2) as u16)
+    endian_write_u16_be(rec, at, (p - at - 2) as u16)
     return frame_2182(out, p - 9)
 
 # Init and start `client`; CH1's record goes to ch1. Returns its length.
@@ -1230,7 +1243,7 @@ fn test_retry_refuses_data_after_hrr_in_its_record() -> i32
         return 1
     var rec: [256]u8
     let n: i64 = hrr_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, 0, 5)
-    endian_write_u16_be(@rec[3], (n - 5 + 4) as u16)
+    endian_write_u16_be(@rec, 3, (n - 5 + 4) as u16)
     rec[n] = HS_ENCRYPTED_EXTENSIONS
     rec[n + 1] = 0
     rec[n + 2] = 0

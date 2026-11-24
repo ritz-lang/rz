@@ -201,8 +201,9 @@ name = "cat"
 # Build and test a specific example
 python3 build.py test 21_ls
 
-# Build all examples
-python3 build.py build --all
+# Build all examples. --all skips rz.toml's [workspace.exclude] dirs
+# (examples/ is one) unless the walk starts inside them, so start there.
+(cd examples && python3 ../build.py build --all)
 
 # Run ritz0's language test suite
 python3 build.py ritz-tests

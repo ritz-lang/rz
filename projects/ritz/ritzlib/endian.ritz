@@ -1,4 +1,4 @@
-# ritzlib/endian.ritz - big- and little-endian integers in a byte buffer
+# ritzlib/endian.ritz - big- and little-endian integers in a byte span
 
 # Reading and writing multi-byte integers out of a byte buffer, in the byte
 # order a wire or file format chose.  This is the one copy for the ecosystem
@@ -6,103 +6,147 @@
 # parsed a format carried its own `be16_2182`, `load32_le`, `read_key_len`,
 # `load_be64`, nine spellings of the same four shifts.
 #
-# A read takes a pointer to the first byte and returns the integer; a write
-# takes the pointer and the value and stores the integer's bytes there.  The
-# functions are byte-addressed, so the pointer need not be aligned (MADT
-# entries, TCP headers and ELF records are packed).  There is no bounds
-# check: the caller owns the buffer, as with `*u8` everywhere.
+# A read takes a `Span<u8>` and a byte offset into it and returns the
+# integer; a write takes the span, the offset and the value and stores the
+# integer's bytes there.  The functions are byte-addressed, so the offset
+# need not be aligned (MADT entries, TCP headers and ELF records are packed).
 #
-# This is the byte-codec/C-ABI boundary the standard's raw-ptr-param rule
-# documents as exempt (S-PTR-1): the raw `*u8` is the API, not an accident.
-# Callers pass `p + n` into the middle of a larger buffer they own, and no
-# length exists at the call boundary (`sha512_transform(ctx, block: *u8)`
-# is exactly 128 bytes; `poly1305_init(ctx, key: *u8)` exactly 32), so a
-# Span parameter could not check anything -- it would have to invent a
-# length.  Every entry point below carries an exemption naming that reason.
+# Bounds (AGAST #4644): an access whose bytes do not all lie in the span,
+# `off < 0` or `off + width > s.len`, ends the program with status 101 and
+# `endian: <width> bytes at offset <off> overrun a span of <len>`, through
+# the platform's fatal hook (as hashmap's missing key does), so a freestanding
+# kernel stops through its own.  The functions used to take a raw `*u8` with
+# no length, exempt from S-PTR-1 as a "byte-codec boundary" (#4538); an
+# out-of-range read was then a silent overread, in parsers of untrusted
+# input among others.  A caller whose buffer is a fixed-size array passes
+# `@array` (it fits a `Span<u8>` slot); one holding a pointer it was given
+# with a length builds the span once, at that boundary.
 #
 # Naming is §15.3's prefixed free functions, so a caller writes
-# `endian_read_u16_be(p)` and there is no doubt which integer, order or
-# direction it is.  Integer byte swapping itself is the language's
-# `x.swap_bytes()` (ritzlib/tests/test_bitops.ritz), not this module.
+# `endian_read_u16_be(s, off)` and there is no doubt which integer, order or
+# direction it is.  They are free functions, not `Span<u8>` methods, because
+# Ritz refuses `impl Span<u8>` beside `impl<T> Span<T>` (AGAST #4445).
+# Integer byte swapping itself is the language's `x.swap_bytes()`
+# (ritzlib/tests/test_bitops.ritz), not this module.
+
+import ritzlib.span
+import ritzlib.str             # memcpy, for the overrun message
+import ritzlib.strview         # StrView, for the overrun message
+import ritzlib.fmt.digits      # fmt_i64_into, for the overrun message
+
+# The platform's "end the program" hook: ritzlib.sys defines it, a hosted
+# `_start` carries a weak one, a freestanding kernel its own (AGAST #4119).
+extern fn ritz_platform_fatal(msg: *u8, len: i64, status: i32)
+
+# ============================================================================
+# Bounds
+# ============================================================================
+
+# `width` bytes at `off` do not fit a span of `len`: say so and end the
+# program, with status 101 as a missing hashmap key does.
+fn endian_overrun(width: i64, off: i64, len: i64)
+    var buf: [96]u8
+    var n: i64 = 0
+    let a: StrView = "endian: "
+    memcpy(@buf[n], a.ptr, a.len)
+    n += a.len
+    n += fmt_i64_into(@buf[n], width)
+    let b: StrView = " bytes at offset "
+    memcpy(@buf[n], b.ptr, b.len)
+    n += b.len
+    n += fmt_i64_into(@buf[n], off)
+    let c: StrView = " overrun a span of "
+    memcpy(@buf[n], c.ptr, c.len)
+    n += c.len
+    n += fmt_i64_into(@buf[n], len)
+    ritz_platform_fatal(@buf[0], n, 101)
+
+# A pointer to `width` bytes at `off` in `s`, after checking they all lie in
+# it.  `off > s.len - width` rather than `off + width > s.len`: an offset
+# near i64's top must not overflow into a pass.
+fn endian_at(s: [u8], off: i64, width: i64) -> *u8
+    if off < 0 or off > s.len - width
+        endian_overrun(width, off, s.len)
+    return s.ptr + off
 
 # ============================================================================
 # Reads
 # ============================================================================
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 read at a caller-chosen offset, no length at the call boundary
-pub fn endian_read_u16_be(p: *u8) -> u16
+pub fn endian_read_u16_be(s: [u8], off: i64) -> u16
+    let p: *u8 = endian_at(s, off, 2)
     let b0: u16 = (*p) as u16
     let b1: u16 = (*(p + 1)) as u16
     return (b0 << 8) | b1
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 read at a caller-chosen offset, no length at the call boundary
-pub fn endian_read_u16_le(p: *u8) -> u16
+pub fn endian_read_u16_le(s: [u8], off: i64) -> u16
+    let p: *u8 = endian_at(s, off, 2)
     let b0: u16 = (*p) as u16
     let b1: u16 = (*(p + 1)) as u16
     return b0 | (b1 << 8)
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 read at a caller-chosen offset, no length at the call boundary
-pub fn endian_read_u32_be(p: *u8) -> u32
+pub fn endian_read_u32_be(s: [u8], off: i64) -> u32
+    let p: *u8 = endian_at(s, off, 4)
     let b0: u32 = (*p) as u32
     let b1: u32 = (*(p + 1)) as u32
     let b2: u32 = (*(p + 2)) as u32
     let b3: u32 = (*(p + 3)) as u32
     return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 read at a caller-chosen offset, no length at the call boundary
-pub fn endian_read_u32_le(p: *u8) -> u32
+pub fn endian_read_u32_le(s: [u8], off: i64) -> u32
+    let p: *u8 = endian_at(s, off, 4)
     let b0: u32 = (*p) as u32
     let b1: u32 = (*(p + 1)) as u32
     let b2: u32 = (*(p + 2)) as u32
     let b3: u32 = (*(p + 3)) as u32
     return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 read at a caller-chosen offset, no length at the call boundary
-pub fn endian_read_u64_be(p: *u8) -> u64
-    let lo: u64 = endian_read_u32_be(p + 4) as u64
-    let hi: u64 = endian_read_u32_be(p) as u64
+pub fn endian_read_u64_be(s: [u8], off: i64) -> u64
+    endian_at(s, off, 8)
+    let hi: u64 = endian_read_u32_be(s, off) as u64
+    let lo: u64 = endian_read_u32_be(s, off + 4) as u64
     return (hi << 32) | lo
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 read at a caller-chosen offset, no length at the call boundary
-pub fn endian_read_u64_le(p: *u8) -> u64
-    let lo: u64 = endian_read_u32_le(p) as u64
-    let hi: u64 = endian_read_u32_le(p + 4) as u64
+pub fn endian_read_u64_le(s: [u8], off: i64) -> u64
+    endian_at(s, off, 8)
+    let lo: u64 = endian_read_u32_le(s, off) as u64
+    let hi: u64 = endian_read_u32_le(s, off + 4) as u64
     return lo | (hi << 32)
 
 # ============================================================================
 # Writes
 # ============================================================================
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 write at a caller-chosen offset, the caller owns the buffer length
-pub fn endian_write_u16_be(p: *u8, v: u16)
+pub fn endian_write_u16_be(s: [u8], off: i64, v: u16)
+    let p: *u8 = endian_at(s, off, 2)
     *(p + 0) = ((v >> 8) & 0xff) as u8
     *(p + 1) = (v & 0xff) as u8
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 write at a caller-chosen offset, the caller owns the buffer length
-pub fn endian_write_u16_le(p: *u8, v: u16)
+pub fn endian_write_u16_le(s: [u8], off: i64, v: u16)
+    let p: *u8 = endian_at(s, off, 2)
     *(p + 0) = (v & 0xff) as u8
     *(p + 1) = ((v >> 8) & 0xff) as u8
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 write at a caller-chosen offset, the caller owns the buffer length
-pub fn endian_write_u32_be(p: *u8, v: u32)
+pub fn endian_write_u32_be(s: [u8], off: i64, v: u32)
+    let p: *u8 = endian_at(s, off, 4)
     *(p + 0) = ((v >> 24) & 0xff) as u8
     *(p + 1) = ((v >> 16) & 0xff) as u8
     *(p + 2) = ((v >> 8) & 0xff) as u8
     *(p + 3) = (v & 0xff) as u8
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 write at a caller-chosen offset, the caller owns the buffer length
-pub fn endian_write_u32_le(p: *u8, v: u32)
+pub fn endian_write_u32_le(s: [u8], off: i64, v: u32)
+    let p: *u8 = endian_at(s, off, 4)
     *(p + 0) = (v & 0xff) as u8
     *(p + 1) = ((v >> 8) & 0xff) as u8
     *(p + 2) = ((v >> 16) & 0xff) as u8
     *(p + 3) = ((v >> 24) & 0xff) as u8
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 write at a caller-chosen offset, the caller owns the buffer length
-pub fn endian_write_u64_be(p: *u8, v: u64)
-    endian_write_u32_be(p, (v >> 32) as u32)
-    endian_write_u32_be(p + 4, (v & 0xffffffff) as u32)
+pub fn endian_write_u64_be(s: [u8], off: i64, v: u64)
+    endian_at(s, off, 8)
+    endian_write_u32_be(s, off, (v >> 32) as u32)
+    endian_write_u32_be(s, off + 4, (v & 0xffffffff) as u32)
 
-# standard-exempt: raw-ptr-param: byte-codec boundary; unaligned *u8 write at a caller-chosen offset, the caller owns the buffer length
-pub fn endian_write_u64_le(p: *u8, v: u64)
-    endian_write_u32_le(p, (v & 0xffffffff) as u32)
-    endian_write_u32_le(p + 4, (v >> 32) as u32)
+pub fn endian_write_u64_le(s: [u8], off: i64, v: u64)
+    endian_at(s, off, 8)
+    endian_write_u32_le(s, off, (v & 0xffffffff) as u32)
+    endian_write_u32_le(s, off + 4, (v >> 32) as u32)

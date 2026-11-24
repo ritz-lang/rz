@@ -852,25 +852,53 @@ def find_package_by_name_or_path(name_or_path: str) -> tuple[Path, dict] | None:
     return None
 
 
-def find_all_packages(search_dir: Path = None) -> list[tuple[Path, dict]]:
+def _workspace_excluded_dirs(search_dir: Path) -> list[Path]:
+    """The enclosing rz.toml's [workspace.exclude] dirs that apply to a walk
+    from search_dir (AGAST #4644).
+
+    rz validates the table (workspace_exclusions); this only reads its keys.
+    An exclusion that contains search_dir is dropped: a walk that starts
+    inside an excluded tree asked for it (tools/example_tests.py and `make
+    examples` walk examples/ on purpose).
+    """
+    for root in (search_dir, *search_dir.parents):
+        rz_toml = root / "rz.toml"
+        if rz_toml.is_file():
+            break
+    else:
+        return []
+    with open(rz_toml, "rb") as f:
+        table = tomllib.load(f).get("workspace", {}).get("exclude", {})
+    dirs = [(root / rel).resolve() for rel in table]
+    return [d for d in dirs if not (search_dir == d or d in search_dir.parents)]
+
+
+def find_all_packages(search_dir: Path | None = None) -> list[tuple[Path, dict]]:
     """Find all packages with ritz.toml files under search_dir.
 
-    Defaults to current working directory if not specified.
+    Defaults to current working directory if not specified. Skips each
+    directory the enclosing rz.toml's [workspace.exclude] names, and
+    everything below it, matched by path component as `./rz --all` does;
+    an excluded manifest is not even loaded.
     """
     if search_dir is None:
         search_dir = Path.cwd()
 
     search_dir = search_dir.resolve()
+    excluded = _workspace_excluded_dirs(search_dir)
     packages = []
 
     # Search for all ritz.toml files recursively.  docs/archive is retired
     # code that nothing should build: rz.toml's [workspace.exclude] keeps it
     # out of the workspace, and `--all` skips it the same way (AGAST #4648).
     for toml_path in sorted(search_dir.glob("**/ritz.toml")):
+        pkg = toml_path.parent
         parts = toml_path.relative_to(search_dir).parts
         if any(parts[i:i + 2] == ("docs", "archive") for i in range(len(parts))):
             continue
-        packages.append((toml_path.parent, load(toml_path)))
+        if any(pkg == d or d in pkg.parents for d in excluded):
+            continue
+        packages.append((pkg, load(toml_path)))
 
     return packages
 

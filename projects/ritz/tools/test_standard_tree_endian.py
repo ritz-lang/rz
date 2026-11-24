@@ -1,16 +1,13 @@
 """Pin ritzlib/endian.ritz against docs/STANDARD.md's raw-ptr-param rule.
 
-AGAST #4538.  endian.ritz is a byte-codec module: every entry point is a raw
-`*u8` offset into a caller-owned buffer, and the callers walk a stream with
-`p + n` in crypto inner loops (`block + i * 8`, `out + p`, `@key[4]`).  There
-is no length at the call boundary -- `sha512_transform(ctx, block: *u8)` takes
-exactly 128 bytes, `poly1305_init(ctx, key: *u8)` exactly 32 -- so a Span
-parameter could not check anything; it would have to invent a length.  The 12
-functions therefore take the standard's documented exemption path, and this
-file pins that decision so a later edit cannot quietly change it.
+AGAST #4644 (reversing #4538).  endian's reads and writes took a raw `*u8`
+with no length, all 12 exempt as a "byte-codec boundary": an out-of-range
+read was a silent overread.  They now take a `Span<u8>` and an offset and
+check the access fits, so the module has no raw pointer parameter and no
+exemption.  This file pins that, so a raw `*u8` form cannot quietly return.
 
-Kept in its own file: rooms #4531-#4534 are editing
-tools/test_standard_report.py concurrently, and this pin belongs to #4538.
+Kept in its own file: rooms #4531-#4534 were editing
+tools/test_standard_report.py concurrently when #4538 added it.
 """
 
 import sys
@@ -27,8 +24,8 @@ pytestmark = pytest.mark.unit
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 
 
-def test_endian_raw_pointer_parameters_are_exempted_with_reasons():
-    """AGAST #4538: 12 byte-codec entry points, all exempt, none malformed."""
+def test_endian_has_no_raw_pointer_parameters():
+    """AGAST #4644: every entry point takes a Span<u8>, none is exempt."""
     summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "endian.ritz"]))
-    assert summary["raw-ptr-param"] == {"violations": 0, "exempt": 12}
+    assert summary["raw-ptr-param"] == {"violations": 0, "exempt": 0}
     assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}

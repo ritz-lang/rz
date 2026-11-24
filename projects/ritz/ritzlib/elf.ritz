@@ -10,6 +10,9 @@ import ritzlib.io
 import ritzlib.memory
 import ritzlib.option
 import ritzlib.result
+import ritzlib.span
+import ritzlib.strview
+import ritzlib.endian
 
 # ============================================================================
 # ELF Constants
@@ -113,39 +116,11 @@ pub enum ElfError
     NoSections     # e_shoff / e_shnum are zero
     NoSymtab       # no SHT_SYMTAB section
 
-# Read a 16-bit little-endian value
-# standard-exempt: raw-ptr-param: ELF image ABI: byte pointer into the mapped ELF headers
-pub fn read_u16(ptr: *u8) -> i32
-    let lo: i32 = *ptr as i32
-    let hi: i32 = *(ptr + 1) as i32
-    return lo + (hi << 8)
-
-# Read a 32-bit little-endian value
-# standard-exempt: raw-ptr-param: ELF image ABI: byte pointer into the mapped ELF headers
-pub fn read_u32(ptr: *u8) -> i32
-    let b0: i32 = *ptr as i32
-    let b1: i32 = *(ptr + 1) as i32
-    let b2: i32 = *(ptr + 2) as i32
-    let b3: i32 = *(ptr + 3) as i32
-    return b0 + (b1 << 8) + (b2 << 16) + (b3 << 24)
-
-# Read a 64-bit little-endian value
-# standard-exempt: raw-ptr-param: ELF image ABI: byte pointer into the mapped ELF headers
-pub fn read_u64(ptr: *u8) -> i64
-    let lo: i64 = read_u32(ptr) as i64
-    let hi: i64 = read_u32(ptr + 4) as i64
-    # Handle sign extension carefully
-    return (lo & 0xFFFFFFFF) + ((hi & 0xFFFFFFFF) << 32)
-
-# Check if a string starts with a prefix
-# standard-exempt: raw-ptr-param: ELF .strtab ABI: NUL-terminated symbol names in the string table
-pub fn starts_with(s: *u8, prefix: *u8) -> bool
-    var i: i64 = 0
-    while *(prefix + i) != 0
-        if *(s + i) != *(prefix + i)
-            return false
-        i += 1
-    return true
+# Header fields are read with ritzlib.endian's little-endian readers, at an
+# offset into the image's span: a header that points past the end of the
+# image stops the program rather than reading beyond it (AGAST #4644).  A
+# symbol name is a NUL-terminated .strtab string; `strview_from_cstr(name)`
+# and StrView's `starts_with` test its prefix.
 
 # Check if symbol is a function
 pub fn elf_is_function(info: u8) -> bool
@@ -201,6 +176,10 @@ impl ElfReader
         self.ehdr = data as *Elf64_Ehdr
         return Ok(())
 
+    # The whole image, as a span: header reads are offsets into it.
+    pub fn image(self: *ElfReader) -> Span<u8>
+        return span_from_ptr<u8>(self.data, self.size)
+
     # Parse section headers and find symbol/string tables
     # Ok(()) when section headers were found and a symbol table located.
     pub fn parse_sections(self: *ElfReader) -> Result<(), ElfError>
@@ -209,13 +188,13 @@ impl ElfReader
             return Err(ElfError.NoSections)
 
         let data: *u8 = self.data
+        let img: [u8] = self.image()
 
         # Get section header offset and count
         # Note: We read raw bytes due to potential alignment issues
-        let shoff: i64 = read_u64(data + 40)  # e_shoff at offset 40
-        let shentsize: i32 = read_u16(data + 58)  # e_shentsize at offset 58
-        let shnum: i32 = read_u16(data + 60)  # e_shnum at offset 60
-        let shstrndx: i32 = read_u16(data + 62)  # e_shstrndx at offset 62
+        let shoff: i64 = endian_read_u64_le(img, 40) as i64  # e_shoff at offset 40
+        let shentsize: i32 = endian_read_u16_le(img, 58) as i32  # e_shentsize at offset 58
+        let shnum: i32 = endian_read_u16_le(img, 60) as i32  # e_shnum at offset 60
 
         if shoff == 0 or shnum == 0
             return Err(ElfError.NoSections)
@@ -224,23 +203,23 @@ impl ElfReader
 
         # Find .symtab and .strtab sections
         for i in 0..shnum
-            let sh_ptr: *u8 = data + shoff + (i as i64 * shentsize as i64)
-            let sh_type: i32 = read_u32(sh_ptr + 4)  # sh_type at offset 4
+            let sh: i64 = shoff + (i as i64 * shentsize as i64)
+            let sh_type: i32 = endian_read_u32_le(img, sh + 4) as i32  # sh_type at offset 4
 
             if sh_type == SHT_SYMTAB
                 # Found symbol table
-                let sh_offset: i64 = read_u64(sh_ptr + 24)  # sh_offset at offset 24
-                let sh_size: i64 = read_u64(sh_ptr + 32)  # sh_size at offset 32
-                let sh_entsize: i64 = read_u64(sh_ptr + 56)  # sh_entsize at offset 56
-                let sh_link: i32 = read_u32(sh_ptr + 40)  # sh_link at offset 40 (strtab index)
+                let sh_offset: i64 = endian_read_u64_le(img, sh + 24) as i64  # sh_offset at offset 24
+                let sh_size: i64 = endian_read_u64_le(img, sh + 32) as i64  # sh_size at offset 32
+                let sh_entsize: i64 = endian_read_u64_le(img, sh + 56) as i64  # sh_entsize at offset 56
+                let sh_link: i32 = endian_read_u32_le(img, sh + 40) as i32  # sh_link at offset 40 (strtab index)
 
                 self.symtab = (data + sh_offset) as *Elf64_Sym
                 if sh_entsize > 0
                     self.symtab_count = sh_size / sh_entsize
 
                 # Get the linked string table
-                let strtab_sh_ptr: *u8 = data + shoff + (sh_link as i64 * shentsize as i64)
-                let strtab_offset: i64 = read_u64(strtab_sh_ptr + 24)
+                let strtab_sh: i64 = shoff + (sh_link as i64 * shentsize as i64)
+                let strtab_offset: i64 = endian_read_u64_le(img, strtab_sh + 24) as i64
                 self.strtab = data + strtab_offset
 
         if self.symtab == null
@@ -256,9 +235,9 @@ impl ElfReader
         if sym_index < 0 or sym_index >= self.symtab_count
             return None
 
-        # Read symbol's st_name field
-        let sym_ptr: *u8 = (self.symtab as *u8) + (sym_index * 24)  # sizeof(Elf64_Sym) = 24
-        let st_name: i32 = read_u32(sym_ptr)
+        # Read symbol's st_name field: entries are sizeof(Elf64_Sym) = 24 bytes
+        let syms: [u8] = span_from_ptr<u8>(self.symtab as *u8, self.symtab_count * 24)
+        let st_name: i32 = endian_read_u32_le(syms, sym_index * 24) as i32
 
         return Some(self.strtab + st_name)
 
@@ -276,11 +255,10 @@ impl ElfReader
     pub fn symbol_count(self: *ElfReader) -> i64
         return self.symtab_count
 
-    # Find all test functions (functions starting with "test_")
-    # Calls callback for each found test function
-    # Returns count of test functions found
-# standard-exempt: raw-ptr-param: ELF symbol-walk callback ABI: a raw fn pointer and opaque user_data
-    pub fn find_test_functions(self: *ElfReader, callback: *u8, user_data: *u8) -> i32
+    # Count the global functions whose name starts with "test_".  (It took a
+    # `callback: *u8, user_data: *u8` pair it never called until AGAST #4644;
+    # nothing passed one.)
+    pub fn find_test_functions(self: *ElfReader) -> i32
         var count: i32 = 0
         var i: i64 = 0
 
@@ -291,12 +269,8 @@ impl ElfReader
             if elf_is_function(info) and elf_is_global(info)
                 match self.get_symbol_name(i)
                     Some(p) =>
-                        let name: *u8 = p
-                        # Check if name starts with "test_"
-                        if starts_with(name, c"test_")
+                        if strview_from_cstr(p).starts_with("test_")
                             count += 1
-                            # If callback provided, call it
-                            # (callback mechanism would need function pointer support)
                     None => pass
 
             i += 1
@@ -315,7 +289,7 @@ impl ElfReader
                 match self.get_symbol_name(i)
                     Some(p) =>
                         let name: *u8 = p
-                        if starts_with(name, c"test_")
+                        if strview_from_cstr(name).starts_with("test_")
                             print("  {name}\n")
                     None => pass
 

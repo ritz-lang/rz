@@ -16,7 +16,7 @@ section .no_such_section: no
 elf_parse_sections: 0
 symbols > 0: 1
 main is a global function: 1
-read_u16/u32/u64: 513 67305985 578437695752307201
+endian_read_u16/u32/u64_le: 513 67305985 578437695752307201
 elf_init on 16 bytes: -1
 elf_init on bad magic: -1
 GOLDEN
