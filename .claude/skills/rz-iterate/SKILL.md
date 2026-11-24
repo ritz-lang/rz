@@ -622,6 +622,15 @@ you changed pass **in full** on that exact commit (step 6).
    go red. A pytest matrix is paid by every gate: size it to the rule, not
    the cross product, and read "What a ritz0 pytest case costs" in
    `projects/ritz/docs/TESTING.md` before adding hundreds of cases.
+2a. **Write Ritz, not C.** `c"strings"` are only for C interop, where the
+   callee can't take a length and needs NUL termination; null termination
+   is unsafe and heavily discouraged wherever a safer API exists. Add
+   no new `c""` outside an interop boundary (a syscall path or argv, an
+   `extern fn`), and new text-taking APIs take `StrView`: if the only API
+   takes NUL-terminated `*u8`, add the `StrView` one to ritzlib. Read
+   `projects/ritz/docs/RITZ_NOT_C.md` before writing code, and run
+   `docs/REVIEW.md` (`/ritz-review`) on your diff. Your REAP line says how
+   many `c""` you added and removed.
 3. **Subagents (Agent tool) for parallel work.** No rooms of your own.
 4. **Finish the job; don't file follow-ons.** Aaron, 2026-11-24: the
    board went from ~1,000 to 2,250 cards in one push, and follow-on
@@ -1081,6 +1090,12 @@ one to train 1.
      ran on another base, so the train gate is what covers it. A tip whose
      patch differs (the room changed code) is `BAD ... not this commit`:
      the room must re-check and REAP.
+
+   **Read the diff for added `c"`** (AGAST #4673): `git show <sha> | grep
+   '^+.*c"'`. Bounce any added literal outside an interop boundary (a
+   syscall path or argv, an `extern fn`; STANDARD.md S-TEXT-1) back to the
+   room with the line; the down-only pin in `tools-ratchets` catches only a
+   net rise per project.
 
    **Never bounce a REAP because `main` moved** (the rule under "Merge
    trains", 2026-11-17; broken on 2026-11-23 with #4573): `build`

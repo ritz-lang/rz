@@ -75,15 +75,26 @@ import ritzlib.sys
 import ritzlib.io
 
 fn main() -> i32
-    print(c"Hello, world!\n")
+    print("Hello, world!\n")
     0
 ```
 
+**Write Ritz, not C.** `c"strings"` are only for C interop, where the callee
+can't take a length and needs NUL termination; null termination is unsafe and
+heavily discouraged wherever a safer API exists. App code passes
+`StrView`/`String`; if the only API for something takes NUL-terminated `*u8`,
+the fix is a `StrView` API in ritzlib, not a `c""` at the call site
+(`docs/STANDARD.md` S-TEXT-1; `docs/RITZ_NOT_C.md` has the rest).
+
 **String literals:**
-- `"hello"` → `StrView` (a `{ ptr, len }` pair; no allocation), or `*u8` in a
-  `*u8` slot. Every literal is NUL-terminated
-- `c"hello"` → `*u8` (NUL-terminated C string)
-- A non-literal `StrView` or a `String` never fits `*u8`: write `.ptr` / `s.as_ptr()`
+- `"hello"` → `StrView` (a `{ ptr, len }` pair; no allocation). This is the
+  literal to write. Text APIs take a `StrView`
+- `c"hello"` → `*u8`, NUL-terminated. C interop only: an `extern fn` or a
+  syscall path/argv argument, ideally inside a ritzlib wrapper. A project's
+  `c"` count is pinned down-only (`tools/test_standard_callers.py`)
+- A bare `"hello"` also fits a `*u8` slot (every literal carries a trailing
+  NUL), for the same boundaries. A non-literal `StrView` or a `String` never
+  does: write `.ptr` / `s.as_ptr()`
 
 `s"hello"` was removed by AGAST #98: bare `"..."` now produces a `StrView` of
 the same `{ ptr, len }` shape, so the prefix was redundant. `make
@@ -108,18 +119,23 @@ and the four harness gotchas (read-until-EOF, temp-file stdin, etc.).
 
 ## Documentation
 
-**Normative and compile-gated.** Every fenced ` ```ritz ` block in these four is
+**Normative and compile-gated.** Every fenced ` ```ritz ` block in these five is
 compiled by `make check-doc-examples` on every build, so their examples cannot
 drift from the compiler. Membership in that gate is the only thing that has
 actually prevented doc rot here — docs inside it are accurate, docs outside it
 have not been:
 
-- `docs/LANGUAGE_SPEC.md` - **the language standard. Start here.**
+- `docs/RITZ_NOT_C.md` - **start here**: each C habit and its Ritz form, one compiled example per row
+- `docs/STANDARD.md` - **the Ritz standard, read second**: idioms (Part I) and conventions (Part II), each rule marked ENFORCED, CHECKED or ADVISORY. `docs/STYLE.md` and `STYLE.md` are pointers to it
+- `docs/LANGUAGE_SPEC.md` - the language reference
 - `docs/STDLIB_REFERENCE.md` - ritzlib reference
-- `docs/STANDARD.md` - **the Ritz standard**: idioms (Part I) and conventions (Part II), each rule marked ENFORCED, CHECKED or ADVISORY. `docs/STYLE.md` and `STYLE.md` are pointers to it
 - `docs/ECOSYSTEM.md` - ecosystem overview
 
-The other three moved here from `projects/larb/docs/` on 2026-09-03 (AGAST #1311):
+`docs/REVIEW.md` is the review checklist (`/ritz-review` runs it on a diff):
+run it on your own diff before you commit.
+
+The spec, the stdlib reference and the ecosystem overview moved here from
+`projects/larb/docs/` on 2026-09-03 (AGAST #1311):
 living outside `projects/ritz` is why they went seven months without a migration
 pass.
 

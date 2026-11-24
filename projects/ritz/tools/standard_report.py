@@ -16,6 +16,7 @@ Usage:
     python3 tools/standard_report.py --list KEY [PATH ...]
     python3 tools/standard_report.py --json [PATH ...]
     python3 tools/standard_report.py --callers [--json] [--lib LIB] [PATH ...]
+    python3 tools/standard_report.py --c-literals [--json] [PATH ...]
 
 THE COUNTING RULES (each is the "Report:" line of a rule in STANDARD.md)
 -----------------------------------------------------------------------
@@ -93,6 +94,18 @@ outside the library, in a file that imports the defining module
 one).  A method call ``x.name(`` is not a call of the free fn.  Totals are
 grouped by project (the first directory under each PATH; default:
 ``projects/``).
+
+C LITERALS (#4673)
+------------------
+
+``--c-literals`` counts ``c"..."`` literals in every .ritz file under the
+given trees (tests included; build output and hidden dirs not), grouped by
+project like ``--callers``.  STANDARD.md S-TEXT-1: a NUL-terminated literal
+belongs only at a C-interop boundary, so the count only goes down
+(tools/test_standard_callers.py pins it per project).  A ``c`` counts as the
+prefix only when it directly precedes a literal's opening quote and isn't
+the tail of a longer identifier; quotes inside a literal, a char literal or
+a ``#`` comment are not literals.
 """
 
 from __future__ import annotations
@@ -590,6 +603,54 @@ def callers_by_api(sites: list[CallSite]) -> dict[str, int]:
     return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
+def count_c_literals(line: str) -> int:
+    """The `c"..."` literals that open on `line` (strings never span lines)."""
+    n, i, end = 0, 0, len(line)
+    while i < end:
+        ch = line[i]
+        if ch == "#":
+            break
+        if ch == "'":
+            j = i + 2 if i + 1 < end and line[i + 1] == "\\" else i + 1
+            if j + 1 < end and line[j + 1] == "'":
+                i = j + 2
+                continue
+            i += 1
+            continue
+        if ch == '"':
+            if i > 0 and line[i - 1] == "c" and (i < 2 or not (line[i - 2].isalnum()
+                                                               or line[i - 2] == "_")):
+                n += 1
+            i += 1
+            while i < end and line[i] != '"':
+                i += 2 if line[i] == "\\" else 1
+            i += 1
+            continue
+        i += 1
+    return n
+
+
+def c_literals_by_project(roots: list[Path]) -> dict[str, int]:
+    """{project: `c"..."` literal count} over every .ritz file under `roots`."""
+    out: dict[str, int] = {}
+    for root in roots:
+        for f in _ritz_files(root, Path("/nonexistent")):
+            rel = f.relative_to(root)
+            key = rel.parts[0] if len(rel.parts) > 1 else "."
+            n = sum(count_c_literals(ln) for ln in f.read_text(errors="replace").split("\n"))
+            out[key] = out.get(key, 0) + n
+    return dict(sorted(out.items()))
+
+
+def c_literal_breaches(counts: dict[str, int], pins: dict[str, int]) -> list[str]:
+    """Projects whose `c"..."` count is above its pin (an unpinned project's pin is 0).
+
+    Down-only: a count under its pin passes (lower the pin when you port).
+    """
+    return [f'{p}: {n} c"" literals > pin {pins.get(p, 0)}'
+            for p, n in sorted(counts.items()) if n > pins.get(p, 0)]
+
+
 def summarise(sites: list[Site]) -> dict[str, dict[str, int]]:
     out = {k: {"violations": 0, "exempt": 0} for k in [*RULES, MALFORMED]}
     for s in sites:
@@ -632,8 +693,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--callers", action="store_true",
                     help="count calls of the library's exempt APIs under PATHs (default: projects/)")
     ap.add_argument("--lib", type=Path, help="the library for --callers (default: ritzlib)")
+    ap.add_argument("--c-literals", action="store_true",
+                    help='count c"..." literals per project under PATHs (default: projects/)')
     args = ap.parse_args(argv)
     ritz = Path(__file__).resolve().parent.parent
+    if args.c_literals:
+        counts = c_literals_by_project(args.paths or [ritz.parent])
+        if args.json:
+            print(json.dumps({"total": sum(counts.values()), "by_project": counts}, indent=2))
+            return 0
+        print(f'c"..." literals: {sum(counts.values())} (STANDARD.md S-TEXT-1)')
+        for k, v in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            print(f"  {v:>6}  {k}")
+        return 0
     if args.callers:
         return _main_callers(args.lib or ritz / "ritzlib", args.paths or [ritz.parent], args.json)
     paths = args.paths or [ritz / "ritzlib"]

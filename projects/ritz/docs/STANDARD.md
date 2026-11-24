@@ -332,7 +332,7 @@ fn position_or_end(xs: Span<i64>, want: i64) -> i64
         None => xs.len
 ```
 
-## 5. Parameters, references and spans
+## 5. Parameters, references, spans and text
 
 #### S-PTR-1 A parameter is a value, a reference or a span, not a raw `*T`
 
@@ -445,7 +445,8 @@ fn reset(p: @Point)
 
 Only a string literal fits a `*u8` slot. A `StrView` or a `String` is passed
 to a C-string API as `.ptr` or `s.as_ptr()`, which makes its NUL
-assumption visible (LARB R3, #2341).
+assumption visible (LARB R3, #2341). Whether that C-string API should exist
+at all is S-TEXT-1's question.
 
 ```ritz body expect-error="a StrView is not a `*u8`"
 let s: StrView = "hello"
@@ -466,6 +467,62 @@ struct Counter
 fn make() -> @Counter
     var c = Counter { n: 1 }
     return @c
+```
+
+#### S-TEXT-1 `c"..."` is for C interop only
+
+**Status: ENFORCED**
+
+A `c"..."` literal, and any NUL-terminated `*u8` text, is only for C
+interop: a callee that can't take a length and needs the NUL, such as a
+syscall's path or argv argument or an `extern fn`. Null termination is
+unsafe (the length lives in the data, so one missing NUL reads past the end),
+and its use is heavily discouraged wherever a safer API exists. Keep it inside
+the ritzlib wrapper for that boundary. Everything above it passes `StrView`
+(a `"..."` literal) or `String`. When the only API for something takes
+NUL-terminated `*u8`, the fix is a `StrView` API in ritzlib, not a `c""` at
+the call site. That includes the `*_cstr` helpers (`eprints_cstr`,
+`eq_cstr`, `starts_with_cstr`): use their `StrView` forms.
+
+Enforced by: `make tools-ratchets`. `tools/test_standard_callers.py` pins
+each project's `c"..."` count (`standard_report.py --c-literals`) down-only,
+so a new literal fails unless the same commit removes one. The compilers
+refuse a `c"..."` in a `StrView` slot (below). Whether a remaining literal is
+a genuine interop boundary is judged at review (`docs/REVIEW.md`).
+
+A text API takes a `StrView`, and its callers pass plain literals:
+
+```ritz
+import ritzlib.io
+
+fn greet(name: StrView)
+    prints("hello, ")
+    prints(name)
+    prints("\n")
+
+fn main() -> i32
+    greet("world")
+    0
+```
+
+At a genuine C boundary, `c"..."` is acceptable. `puts(3)` takes no length,
+so it needs the NUL:
+
+```ritz
+extern fn puts(s: *u8) -> i32
+
+fn hello_from_c() -> i32
+    puts(c"hello from C")
+```
+
+A `c"..."` passed to a Ritz-level text API is refused:
+
+```ritz expect-error="is a `*u8`, not a `StrView`: write a plain"
+fn shout(msg: StrView) -> i64
+    msg.len
+
+fn main() -> i32
+    shout(c"hello") as i32
 ```
 
 ## 6. Behaviour: methods
