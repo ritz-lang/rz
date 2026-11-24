@@ -11,6 +11,8 @@ from move_checker import MoveChecker, OwnershipError
 from array_rules import FILL_MOVE_ONLY, MOVE_OUT_OF_ELEMENT
 from ref_rules import MOVE_OUT_OF_REF, move_out_of_global
 import ritz_ast as rast
+from test_ref_into_value import COMPILERS
+from test_table_rows import assert_refusals, assert_runs
 
 
 def drop_impl(ty: str) -> str:
@@ -780,6 +782,21 @@ fn main() -> i32
         assert len(errs) == 1 and "use of moved value: `q`" in str(errs[0])
 
 
+# AGAST #4657: TestMoveOutOfMutBorrowParam's by-value receivers, on every
+# compiler (test_every_compiler_refuses_a_by_value_receiver).
+_BY_VALUE_RECEIVER = {
+    "param": "fn f(t:& Res) -> i32\n    return ^t.burn()\n",
+    "grouped": "fn f(t:& Res) -> i32\n    return (^t).burn()\n",
+    "deref": "fn f(t:& Res) -> i32\n    return (^*t).burn()\n",
+    "field": "fn f(w:& Wrap) -> i32\n    return ^w.r.burn()\n",
+    "nested_field": "fn f(d:& Deep) -> i32\n    return ^d.w.r.burn()\n",
+    "self_param": "impl Wrap\n    fn spend(self:& Wrap) -> i32\n        return ^self.r.burn()\n",
+    "bare_self_param": "impl Wrap\n    fn spend(self:&) -> i32\n        return ^self.r.burn()\n",
+    "self_mut_ref": "impl Wrap\n    fn spend(self: @&Wrap) -> i32\n        return ^self.r.burn()\n",
+    "self_ref": "impl Wrap\n    fn spend(self: @Wrap) -> i32\n        return ^self.r.burn()\n",
+}
+
+
 class TestMoveOutOfMutBorrowParam:
     """A `name:& T` parameter can't be moved out of (AGAST #2231).
 
@@ -1263,6 +1280,30 @@ impl Wrap
         errs = check(self.DEFS + body)
         assert len(errs) == 1, errs
         assert f"cannot move out of a reference" in str(errs[0])
+
+    # AGAST #4657: the same rows on every compiler, at the receiver.  ritz1
+    # compiled `self.r.burn()` through an impl's `self:&` (a `*Wrap` local
+    # its move check didn't count as a reference); `self: @&Wrap` / `@Wrap`
+    # and the bare `self:&` are the other receivers that lend.
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize("compiler", COMPILERS)
+    def test_every_compiler_refuses_a_by_value_receiver(self, tmp_path, compiler):
+        assert_refusals(compiler, tmp_path, {
+            name: (self.DEFS + body + "\nfn main() -> i32\n    0\n", MOVE_OUT_OF_REF)
+            for name, body in _BY_VALUE_RECEIVER.items()})
+
+    @pytest.mark.integration
+    @pytest.mark.parametrize("compiler", COMPILERS)
+    def test_every_compiler_runs_an_owned_receiver(self, tmp_path, compiler):
+        """Control: an owner, or a by-reference method, is no move out."""
+        main = ("\nfn main() -> i32\n    var w = Wrap { r: Res { h: 3 } }\n"
+                "    let a: i32 = w.peek()\n    let v = Wrap { r: Res { h: 4 } }\n"
+                "    return a + v.spend()\n")
+        assert_runs(compiler, tmp_path, {
+            "owned_self": (self.DEFS + "impl Wrap\n    fn spend(self:= Wrap) -> i32\n"
+                           "        return self.r.burn()\n\n    fn peek(self:& Wrap) -> i32\n"
+                           "        return self.r.look()\n" + main, 7)})
 
     # AGAST #2178: a match that owns nothing (`match t` of a `:&` param,
     # `match @s`, a scrutinee read through a pointer) binds a copy of the

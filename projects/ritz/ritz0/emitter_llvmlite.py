@@ -10284,6 +10284,31 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                     not isinstance(resolve_alias_in(ty.inner, self.type_aliases), rast.ArrayType)):
                 raise EmitError(array_rules.ref_arith(expr.op, type_to_string(ty.inner)), expr.span)
 
+    def _refuse_pointer_operand(self, expr: rast.BinOp, left: ir.Value, right: ir.Value) -> None:
+        """AGAST #4657: a pointer operand an arithmetic operator has no meaning
+        for (LANGUAGE_SPEC §7.1): only `*T ± int`, `int + *T` and `*T - *T`
+        step or measure.  The typing pass's words, at the operand, before
+        llvmlite's unlocated "Operands must be the same type"."""
+        lp = isinstance(left.type, ir.PointerType)
+        rp = isinstance(right.type, ir.PointerType)
+        if not (lp or rp):
+            return
+        op = expr.op
+        if op in ('+', '-') and lp and isinstance(right.type, ir.IntType):
+            return
+        if op == '+' and rp and isinstance(left.type, ir.IntType):
+            return
+        if op == '-' and lp and rp:
+            return  # a distance, or _pointer_difference's mixed-pointee refusal
+        side = expr.left if lp else expr.right
+        ty = ((self._typed_type(side, within=self.current_fn_def) if self.typed is not None else None)
+              or self._infer_ritz_type(side))
+        if isinstance(ty, rast.RefType):  # the spec's spelling, as the typing pass's
+            shown = ("@&" if ty.mutable else "@") + type_to_string(ty.inner)
+        else:
+            shown = type_to_string(ty) if ty is not None else str((left if lp else right).type)
+        raise EmitError(f"arithmetic operator requires numeric type, got {shown}", side.span)
+
     def _pointer_difference(self, left: ir.Value, right: ir.Value, expr: rast.Expr) -> ir.Value:
         """`left - right` on two pointers: their distance in elements, an i64.
 

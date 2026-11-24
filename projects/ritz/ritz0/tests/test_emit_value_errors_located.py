@@ -35,7 +35,7 @@ import pytest
 
 from ritz0_inproc import run_ritz0
 from test_ref_into_value import COMPILERS, _compile as _compile3
-from test_table_rows import assert_refusals
+from test_table_rows import assert_refusals, assert_runs
 
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
@@ -462,12 +462,71 @@ WRONG_CAUSE = {
 }
 
 
+# AGAST #4657: forms ritz1 compiled, or said as an emitter failure.  `?` on a
+# struct or a pointer (ritz1 refused only a scalar); a tuple pattern naming
+# too many or too few, of a local or a call; each x86 / SIMD intrinsic's
+# operands and arity (ritz1 took a scalar for a v2i64, and said "ritz1 cannot
+# emit: x86 intrinsic arity mismatch").  ritz0's words, emitter/intrinsics.py.
+def _intrinsic(call):
+    return "fn main() -> i32\n    let v = ^" + call + "\n    0\n"
+
+
+FORMS = {
+    "try_on_struct": ("struct P\n    x: i64\n\nfn f() -> P\n    P { x: 1 }\n\n"
+                      "fn g() -> Option<i64>\n    let b = ^f()?\n    Some(b.x)\n" + MAIN0,
+                      "Try operator requires a Result or an Option"),
+    "try_on_pointer": ("fn g(p: *u8) -> Option<i64>\n    let b = ^p?\n    Some(1)\n" + MAIN0,
+                       "Try operator requires a Result or an Option"),
+    "tuple_more_names_of_local": ("fn main() -> i32\n    let t = (1, 2)\n    ^let (a, b, c) = t\n    0\n",
+                                  "Tuple destructuring mismatch: expected 2 elements, got 3 names"),
+    "tuple_fewer_names_of_call": ("fn mk() -> (i64, i64, i64)\n    (1, 2, 3)\n\n"
+                                  + "fn main() -> i32\n    ^let (a, b) = mk()\n    0\n",
+                                  "Tuple destructuring mismatch: expected 3 elements, got 2 names"),
+    "tuple_more_names_of_call": ("fn mk() -> (i64, i64)\n    (1, 2)\n\n"
+                                 + "fn main() -> i32\n    ^let (a, b, c) = mk()\n    0\n",
+                                 "Tuple destructuring mismatch: expected 2 elements, got 3 names"),
+}
+FORMS.update({f"{fn}_scalar": (_intrinsic(f"{fn}(1, 2)"), f"{fn}() requires v4i32 or v2i64 arguments")
+              for fn in ("aesenc", "aesenclast", "aesdec", "aesdeclast")})
+FORMS.update({
+    "aesimc_scalar": (_intrinsic("aesimc(1)"), "aesimc() requires v4i32 or v2i64 argument"),
+    "aeskeygenassist_scalar": (_intrinsic("aeskeygenassist(1, 2)"),
+                               "aeskeygenassist() requires v4i32 or v2i64 first argument"),
+    "sha256msg1_scalar": (_intrinsic("sha256msg1(1, 2)"), "sha256msg1() requires v4i32 arguments"),
+    "sha256msg2_scalar": (_intrinsic("sha256msg2(1, 2)"), "sha256msg2() requires v4i32 arguments"),
+    "sha256rnds2_scalar": (_intrinsic("sha256rnds2(1, 2, 3)"), "sha256rnds2() requires v4i32 arguments"),
+    "simd_add_scalar": (_intrinsic("simd_add(1, 2)"), "simd_add() requires vector arguments"),
+    "simd_xor_scalar": (_intrinsic("simd_xor(1, 2)"), "simd_xor() requires vector arguments"),
+    "simd_rotl_scalar": (_intrinsic("simd_rotl(1, 2)"), "simd_rotl() requires a vector argument"),
+    "aesenc_arity": (_intrinsic("aesenc(1)"), "aesenc() requires 2 arguments (state, key)"),
+    "aesimc_arity": (_intrinsic("aesimc(1, 2)"), "aesimc() requires 1 argument (key)"),
+    "aeskeygenassist_arity": (_intrinsic("aeskeygenassist(1, 2, 3)"),
+                              "aeskeygenassist() requires 2 arguments (key, rcon)"),
+    "sha256rnds2_arity": (_intrinsic("sha256rnds2(1, 2)"),
+                          "sha256rnds2() requires 3 arguments (cdgh, abef, wk)"),
+    "sha256msg1_arity": (_intrinsic("sha256msg1(1)"), "sha256msg1() requires 2 arguments (w0, w1)"),
+    "simd_add_arity": (_intrinsic("simd_add(1, 2, 3)"), "simd_add() requires 2 arguments (vector, vector)"),
+    "simd_rotl_arity": (_intrinsic("simd_rotl(1)"), "simd_rotl() requires 2 arguments (vector, shift)"),
+    "xgetbv_arity": (_intrinsic("xgetbv(0, 1)"), "xgetbv() requires 1 argument (xcr)"),
+})
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_every_compiler_says_it_there(tmp_path, compiler):
     rows = {row: (marked, message) for row, (marked, message, _) in ROWS.items()}
     rows.update(WRONG_CAUSE)
+    rows.update(FORMS)
     assert_refusals(compiler, tmp_path, rows, {} if compiler == "ritz0" else RITZ1_GAPS)
+
+
+# AGAST #4657: ritz1 said "Unknown function: xgetbv".  XCR0's x87 and SSE
+# bits are set wherever the OS saves SSE state, as every x86-64 Linux does.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_every_compiler_runs_xgetbv(tmp_path, compiler):
+    assert_runs(compiler, tmp_path, {
+        "xcr0_x87_sse": ("fn main() -> i32\n    let x: u64 = xgetbv(0)\n    (x & 3) as i32\n", 3)})
 
 
 # The cause is the only error: before #4665 ritz1 also said the later fault

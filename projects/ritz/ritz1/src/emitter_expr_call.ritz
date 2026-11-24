@@ -3267,6 +3267,53 @@ fn mem_widen(s: *EmitterState, v: i32, bits: i32, ty: TypeKind) -> i32
     r
 
 # volatile_* / atomic_* / fence (LANGUAGE_SPEC §18.4-§18.5, AGAST #1879).
+# `xgetbv(xcr)` (AGAST #4657): XCR `xcr` (ecx in) as a u64, edx:eax.  The
+# operand is an integer in the i64 value model, so it is truncated to the
+# i32 ecx takes; Sema has checked the arity (intrinsic_check.ritz).  ritz0's
+# lowering (emitter/intrinsics.py _xgetbv), the same asm and constraints.
+fn emit_xgetbv(s: *EmitterState, e: *Expr) -> i32
+    let x: i32 = mem_narrow(s, emit_expr(s, e.args), 32)
+    let pair: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, pair)
+    emit_sv(s, " = call { i32, i32 } asm sideeffect \"xgetbv\", \"={ax},={dx},{cx},~{dirflag},~{fpsr},~{flags}\"(i32 ")
+    emit_reg(s, x)
+    emit_sv(s, ")\n")
+    var half: [2]i32
+    var k: i32 = 0
+    while k < 2
+        let part: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, part)
+        emit_sv(s, " = extractvalue { i32, i32 } ")
+        emit_reg(s, pair)
+        if k == 0
+            emit_sv(s, ", 0\n")
+        else
+            emit_sv(s, ", 1\n")
+        half[k] = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, half[k])
+        emit_sv(s, " = zext i32 ")
+        emit_reg(s, part)
+        emit_sv(s, " to i64\n")
+        k += 1
+    let hi: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, hi)
+    emit_sv(s, " = shl i64 ")
+    emit_reg(s, half[1])
+    emit_sv(s, ", 32\n")
+    let r: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, r)
+    emit_sv(s, " = or i64 ")
+    emit_reg(s, half[0])
+    emit_sv(s, ", ")
+    emit_reg(s, hi)
+    emit_str(s, IR_NL)
+    r
+
 fn emit_mem_builtin(s: *EmitterState, e: *Expr, id: i32) -> i32
     var want: i32 = 2
     if id == MEM_FENCE
@@ -3989,6 +4036,8 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         return emit_x86_intrinsic_v2i64(s, e, StrView { ptr: (c"llvm.x86.aesni.aesimc"), len: (21) as i64 }, 1, -1)
     if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"aeskeygenassist"), len: (15) as i64 }) == 1
         return emit_aeskeygenassist(s, e)
+    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "xgetbv") == 1
+        return emit_xgetbv(s, e)
     # AGAST #1879: volatile / atomic memory builtins.  Reserved names, as in
     # ritz0: checked before user fns, so they never become an extern.
     let mem_id: i32 = mem_builtin_id(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })

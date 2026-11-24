@@ -1,0 +1,90 @@
+# ritz1/src/ptr_arith.ritz - an operand arithmetic has no meaning for
+#
+# AGAST #4657, LANGUAGE_SPEC §7.1.  Pointer arithmetic is `*T + int`,
+# `int + *T`, `*T - int` and `*T - *T` (their distance, an i64): nothing
+# else.  Any other `+ - * / %` with a pointer or reference operand is refused
+# at that operand, in ritz0's typing pass's words:
+#
+#     fn f(a: *u8, b: *u8) -> i64
+#         b + a              # error: arithmetic operator requires numeric type, got *u8
+#
+# Without this the emitter lowered `a * 2` as a `mul` of a `ptrtoint`, and
+# `@buf[3] - @buf[0]` (two references, LARB R16) as a distance.
+#
+# An `@T` / `@&T` local under `+` / `-` is left to the emitter's
+# refuse_ref_arith (emitter_expr_arith.ritz, AGAST #3037), whose words both
+# compilers already say; `r + 1` on an `@[N]T` row walk is legal (§7.8).
+# Operand types come from Sema's typer: an operand it can't type is left
+# alone.  ritz0's tests: test_pointer_difference_typing.py, every compiler.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.strview
+
+import ast
+import ast_query
+import sema
+import sema_type
+import types
+import wrapping   # wrapping_ty_eprint
+
+# 1 for a `*T`, 2 for an `@T` / `@&T`, else 0.  Sema types `@x` as the
+# `*T` the emitter makes of it; the source wrote a reference, so `t` is
+# retyped as one here, for the refusal's words.
+fn pa_ptr_kind(x: *Expr, t: *SemaTy) -> i32
+    if x.kind == ExprKind.Unary and (x.op == OpKind.Addr or x.op == OpKind.AddrMut)
+        t.kind = TypeKind.Ref
+        if x.op == OpKind.AddrMut
+            t.kind = TypeKind.MutRef
+        return 2
+    match t.kind
+        TypeKind.Ptr | TypeKind.PtrPtr => 1
+        TypeKind.Ref | TypeKind.MutRef => 2
+        _ => 0
+
+# 1 when `x` is a name whose type is a reference: refuse_ref_arith's case.
+fn pa_ref_local(x: *Expr, kind: i32) -> i32
+    if x.kind == ExprKind.Ident and kind == 2
+        return 1
+    0
+
+fn pa_refuse(sm: *Sema, side: *Expr, t: *SemaTy)
+    if sm.ptr_err_line == side.span.line and sm.ptr_err_col == side.span.col
+        return
+    sm.ptr_err_line = side.span.line
+    sm.ptr_err_col = side.span.col
+    sema_error_at(sm, side.span.line, side.span.col)
+    eprints("arithmetic operator requires numeric type, got ")
+    wrapping_ty_eprint(t)
+    eprint_char('\n')
+
+# The walk's per-expression check.  A wrapping `+%` is wrapping_check's.
+pub fn ptr_arith_check(sm: *Sema, e: *Expr)
+    if e == null or e.kind != ExprKind.Binary or e.wrapping == 1
+        return
+    let op: OpKind = e.op
+    if op != OpKind.Add and op != OpKind.Sub and op != OpKind.Mul and op != OpKind.Div and op != OpKind.Mod
+        return
+    var l: SemaTy
+    var r: SemaTy
+    if sema_expr_ty(sm, e.left, @l) == TypeKind.Unknown
+        return
+    if sema_expr_ty(sm, e.right, @r) == TypeKind.Unknown
+        return
+    let lp: i32 = pa_ptr_kind(e.left, @l)
+    let rp: i32 = pa_ptr_kind(e.right, @r)
+    if lp == 0 and rp == 0
+        return
+    if op == OpKind.Add or op == OpKind.Sub
+        if pa_ref_local(e.left, lp) == 1 or pa_ref_local(e.right, rp) == 1
+            return
+        if lp != 0 and sema_is_int_kind(r.kind) == 1
+            return   # p + i, p - i
+        if op == OpKind.Add and rp != 0 and sema_is_int_kind(l.kind) == 1
+            return   # i + p
+        if op == OpKind.Sub and lp == 1 and rp == 1
+            return   # q - p: a distance (two pointees: the emitter's #2957)
+    if lp != 0
+        pa_refuse(sm, e.left, @l)
+    else
+        pa_refuse(sm, e.right, @r)

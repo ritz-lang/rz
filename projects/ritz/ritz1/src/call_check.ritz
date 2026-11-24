@@ -899,6 +899,8 @@ fn cc_builtin(name_sv: StrView) -> i32
         return 1
     if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"aesimc"), len: (6) as i64 }) == 1 or name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"aeskeygenassist"), len: (15) as i64 }) == 1
         return 1
+    if name_eq(StrView { ptr: (name), len: (len) as i64 }, "xgetbv") == 1
+        return 1   # AGAST #4657
     (mem_builtin_id(StrView { ptr: (name), len: (len) as i64 }) != 0) as i32
 
 # 1 for a println/eprintln/write/writeln call emit_expr_call lowers through
@@ -1184,15 +1186,38 @@ pub fn call_check_variant(sm: *Sema, e: *Expr)
         eprint_bytes(en)
         eprint_char('\n')
 
-# `x?` of a value Sema types as a scalar: no Result or Option to test.
-# ritz1 took the enclosing fn's carrier for it and lowered a tag read of an
-# i64 (ritz0: _emit_try_op).
+# 1 when Sema's `t` is surely no Option or Result: a scalar, a float, a
+# pointer or reference, an array, or a struct or enum the program declares
+# (AGAST #4657).  A carrier is a mangled `Option$T` / `Result$T$E`; a name
+# Sema can't place (an alias, a generic's T) is left to the emitter.
+fn cc_not_carrier(sm: *Sema, t: *SemaTy) -> i32
+    if type_is_scalar_leaf(t.kind)
+        return 1
+    match t.kind
+        TypeKind.F32 | TypeKind.F64 | TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef | TypeKind.Array =>
+            return 1
+        TypeKind.Struct => pass
+        _ =>
+            return 0
+    if t.name == null or t.name_len <= 0
+        return 0
+    let n: StrView = StrView { ptr: (t.name), len: (t.name_len) as i64 }
+    if name_eq(n, "Option") == 1 or name_eq(n, "Result") == 1 or n.starts_with("Option$") or n.starts_with("Result$")
+        return 0
+    if sema_find_struct(sm, n) != null or enum_find(sm.pctx, n) >= 0
+        return 1
+    0
+
+# `x?` of a value that is no Result or Option (cc_not_carrier).  ritz1 took
+# the enclosing fn's carrier for it and lowered a tag read of an i64 or a
+# struct (ritz0: _emit_try_op).
 pub fn call_check_try(sm: *Sema, e: *Expr)
     if g_cc_mute > 0 or e.left == null
         return
     var t: SemaTy
-    sema_expr_ty(sm, e.left, @t)
-    if type_is_scalar_leaf(t.kind) == false
+    if sema_expr_ty(sm, e.left, @t) == TypeKind.Unknown
+        return
+    if cc_not_carrier(sm, @t) == 0
         return
     if cc_report(sm, e.span.line, e.span.col) == 1
         eprints("Try operator requires a Result or an Option\n")
