@@ -334,7 +334,7 @@ Simple mmap-based heap for when you need per-allocation free.
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `heap_alloc` | `fn(size: i64) -> *u8` | Allocate from heap |
-| `heap_free` | `fn(ptr: *u8, size: i64) -> i32` | Free (requires size) |
+| `heap_free` | `fn(ptr: *u8, size: i64)` | Free (requires size) |
 | `heap_realloc` | `fn(ptr: *u8, old_size: i64, new_size: i64) -> *u8` | Reallocate |
 
 #### jemalloc-style Allocator
@@ -495,8 +495,20 @@ it is the compiler's, not for direct use.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `memzero` | `fn(dst: *u8, n: i64)` | Zero n bytes at dst |
-| `secure_zero` | `fn(dst: *u8, n: i64)` | Zero n bytes at dst with volatile stores the optimiser cannot remove; use it to wipe secrets (LANGUAGE_SPEC §18.4) |
+| `memzero` | `fn(dst: *u8, n: i64)` | Zero n bytes at dst. Outside ritzlib, use `s.zero()` on a `Span` |
+| `secure_zero` | `fn(dst: *u8, n: i64)` | Zero n bytes at dst with volatile stores the optimiser cannot remove; use it to wipe secrets (LANGUAGE_SPEC §18.4). Outside ritzlib, use `key.secure_zero()` on a `Span` |
+
+#### mapping
+
+`import ritzlib.mapping`: anonymous memory as a `Result`, the typed layer
+over `sys_mmap` / `sys_munmap` (which return `-errno` in a pointer and an
+`i32`). The `Span` from `mmap_anon` owns the mapping: pass it, whole, to
+`munmap` once (a `Mapping` owner with Drop waits on #1854).
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `mmap_anon` | `fn(len: i64) -> Result<Span<u8>, Errno>` | `len` zeroed, private, read-write bytes; `Err(Inval)` for `len <= 0`, the kernel's errno otherwise |
+| `munmap` | `fn(m: Span<u8>) -> Result<(), Errno>` | Unmap what `mmap_anon` returned; `Err(Inval)` for an unaligned start |
 
 ---
 
@@ -916,6 +928,8 @@ struct Span<T>
 | `s.to(end)` | `fn(end: i64) -> Span<T>` | From the beginning to `end` |
 | `s.copy_from(src)` | `fn(src: Span<T>) -> i64` | Copy `min(s.len, src.len)` elements of `src` to the front of `s`, overlap-safe; returns the count. Replaces `memcpy`/`memmove` |
 | `s.fill(v)` | `fn(v: T)` | Set every element to `v`. Replaces `memset` |
+| `s.zero()` | `fn()` | Zero every byte (`len * sizeof(T)`). Replaces `memzero(p, n)` |
+| `s.secure_zero()` | `fn()` | Zero every byte with volatile stores the optimiser cannot remove: wipe keys with `key.secure_zero()`. Replaces `secure_zero(p, n)` |
 
 **Slicing** (free functions):
 
@@ -1064,6 +1078,7 @@ New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
 | `strrchr` | `s.rfind(t)` |
 | `strstr` | `s.find(t)`, `s.contains(t)` |
 | `memcpy`, `memmove`, `memset`, `memcmp` | `dst.copy_from(src)`, `s.fill(b)`, `span_cmp(@a, @b)` on a `Span` |
+| `bzero`, `explicit_bzero` | `s.zero()`, `s.secure_zero()` on a `Span` |
 | `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `s.take(n)` to bound it |
 | `strcat` | `s.push_str(v)`, `s.push_string(other)` |
 | `atoi` | `s.parse_i64() -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |

@@ -32,6 +32,7 @@ pytestmark = pytest.mark.integration
 # aligned words. The key is dead after the wipe: exactly the cryptosec shape.
 DEAD_KEY = """\
 import ritzlib.memory
+import ritzlib.span
 
 [[noinline]]
 fn derive(seed: u8) -> i32
@@ -49,6 +50,10 @@ fn main() -> i32
 """
 
 SECURE_WIPE = "secure_zero(@key[0], 37)"
+# AGAST #4638: the Span method cryptosec's key wipes use. Its volatile stores
+# are memory.secure_zero's, reached through a generic method instantiated in
+# the caller's module, so -O2 sees the whole chain.
+SPAN_WIPE = "var ks: Span<u8> = span_from_ptr<u8>(@key[0], 37)\n    ks.secure_zero()"
 PLAIN_WIPE = "for j in 0..37\n        key[j] = 0"
 
 
@@ -131,6 +136,22 @@ def test_secure_zero_survives_O2(compiler, tmp_path):
              if re.search(r"\bstore\b", ln) and "store volatile" not in ln]
     assert not plain and "memset" not in own, (
         f"{compiler}: secure_zero has a non-volatile write at -O2:\n{own}")
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_span_secure_zero_survives_O2(compiler, tmp_path):
+    """`key.secure_zero()` on a Span wipes a dead key as secure_zero does:
+    the method must not fall back to plain stores (or Span.zero's memset)."""
+    ir = _o2(compiler, tmp_path, DEAD_KEY.replace("{wipe}", SPAN_WIPE), "spansz")
+    body = _fn_body(ir, "derive")
+    # Inlined, or behind the method and/or secure_zero: follow the calls.
+    m = re.search(r"call [^\n]*@(\S*Span\S*secure_zero\S*)\(", body)
+    if m:
+        body = _fn_body(ir, m.group(1))
+    if re.search(rf"call [^\n]*{test_ir.symbol('secure_zero')}\(", body):
+        body = _fn_body(ir, "secure_zero")
+    assert re.search(r"store volatile i8 ", body), f"{compiler}: Span wipe elided at -O2:\n{body}"
+    assert re.search(r"store volatile i64 ", body), f"{compiler}: Span wipe elided at -O2:\n{body}"
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

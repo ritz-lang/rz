@@ -1,0 +1,71 @@
+# Tests for ritzlib.mapping: anonymous mmap as Result<Span<u8>, Errno>
+# (AGAST #4638), the typed layer over sys_mmap's -errno-in-a-pointer return.
+
+import ritzlib.mapping
+import ritzlib.span
+import ritzlib.errno
+import ritzlib.result
+
+[[test]]
+fn test_mmap_anon_is_zeroed_and_writable() -> i32
+    match mmap_anon(8192)
+        Ok(m) =>
+            var s: Span<u8> = m
+            assert s.len == 8192
+            assert s.get(0) == 0
+            assert s.get(8191) == 0
+            s.fill(0x5A)
+            assert s.get(4096) == 0x5A
+            assert munmap(s).is_ok()
+        Err(e) =>
+            return 1
+    0
+
+[[test]]
+fn test_mmap_anon_zero_length_is_inval() -> i32
+    # mmap(2) refuses length 0 with EINVAL; mmap_anon must say so as an Err,
+    # not hand back a pointer holding -22.
+    match mmap_anon(0)
+        Ok(m) =>
+            return 1
+        Err(e) =>
+            assert e.code() == 22
+    0
+
+[[test]]
+fn test_mmap_anon_negative_length_is_err() -> i32
+    match mmap_anon(0 - 1)
+        Ok(m) =>
+            return 1
+        Err(e) =>
+            assert e.code() > 0
+    0
+
+[[test]]
+fn test_munmap_unaligned_is_inval() -> i32
+    match mmap_anon(4096)
+        Ok(m) =>
+            var s: Span<u8> = m
+            # munmap(2) needs a page-aligned address: one byte in is EINVAL.
+            let bad: Span<u8> = s.from(1)
+            match munmap(bad)
+                Ok(u) =>
+                    return 2
+                Err(e) =>
+                    assert e.code() == 22
+            assert munmap(s).is_ok()
+        Err(e) =>
+            return 1
+    0
+
+[[test]]
+fn test_mmap_anon_kernel_error_is_decoded() -> i32
+    # 2^62 bytes exceeds any user address space: the kernel returns -ENOMEM
+    # in the pointer, which must come back as Err(NoMem), not Ok of a
+    # pointer at -12.
+    match mmap_anon(1 << 62)
+        Ok(m) =>
+            return 1
+        Err(e) =>
+            assert e.code() == 12
+    0

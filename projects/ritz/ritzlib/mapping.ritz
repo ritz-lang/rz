@@ -1,0 +1,47 @@
+# ritzlib/mapping.ritz - mmap_anon and munmap: anonymous memory as Result<Span<u8>, Errno>
+#
+# The typed layer over sys.ritz's sys_mmap / sys_munmap (AGAST #4638). The
+# raw syscalls return a pointer that holds -errno on failure (-12, not -1)
+# and an i32 status; these return a Result whose Err is a ritzlib.errno
+# `Errno`, and a mapping is a Span<u8> that carries its own length:
+#
+#     match mmap_anon(64 * 1024)
+#         Ok(m) =>
+#             var buf: Span<u8> = m        # zeroed, read-write, private
+#             ...
+#             munmap(buf)                  # Result<(), Errno>
+#         Err(e) => ...                    # NoMem, Inval (length <= 0), ...
+#
+# Ownership: the Span from mmap_anon owns the mapping and must be passed to
+# munmap once, whole (munmap of a sub-span unmaps just those pages, and an
+# unaligned start is Err(Inval)). A `Mapping` owner with Drop waits on
+# AGAST #1854. sys_mmap / sys_mmap_anon stay the raw boundary for the page
+# source and kernels.
+import ritzlib.sys
+import ritzlib.span
+import ritzlib.result
+# Errno is part of this API (every Err), so importers get it too.
+pub import ritzlib.errno
+
+# `len` bytes of zeroed, private, read-write memory, or the kernel's error:
+# Err(Inval) for a length of 0 or less (mmap(2) would refuse 0 the same way;
+# a negative one is refused here before it becomes a huge unsigned size).
+pub fn mmap_anon(len: i64) -> Result<Span<u8>, Errno>
+    if len <= 0
+        return Err(Errno.Inval)
+    let p: *u8 = sys_mmap_anon(len)
+    let raw: i64 = p as i64
+    # Linux returns -errno in [-4095, -1]; harland -errno too. No user
+    # mapping is at 0 or in the negative (kernel) half (memory.mmap_failed).
+    if raw <= 0
+        if raw == 0
+            return Err(Errno.NoMem)
+        return Err(errno_from_raw(raw as i32))
+    Ok(span_from_ptr<u8>(p, len))
+
+# Unmap what one mmap_anon returned. Err(Inval) for an unaligned start.
+pub fn munmap(m: Span<u8>) -> Result<(), Errno>
+    let rc: i32 = sys_munmap(m.ptr, m.len)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(())

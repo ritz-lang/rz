@@ -545,9 +545,14 @@ def _ritz_files(root: Path, skip: Path):
                 yield d / n
 
 
-def count_callers(lib: Path, roots: list[Path]) -> list[CallSite]:
-    """Every call of an exempt API of `lib` under `roots`, outside `lib`."""
-    apis = exempt_apis(lib)
+def count_callers(lib: Path, roots: list[Path],
+                  apis: dict[str, set[str]] | None = None) -> list[CallSite]:
+    """Every call of an exempt API of `lib` under `roots`, outside `lib`.
+
+    `apis` ({name: {module}}) replaces the exempt set: #4638's memory pin
+    also counts sys_mmap, which is raw but not exempt."""
+    if apis is None:
+        apis = exempt_apis(lib)
     skip = lib.resolve()
     sites: list[CallSite] = []
     for root in roots:

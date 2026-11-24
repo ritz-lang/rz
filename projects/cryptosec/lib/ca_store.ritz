@@ -22,9 +22,9 @@ import ritzlib.io
 import cryptosec.mem
 import cryptosec.pem
 import cryptosec.x509
-import ritzlib.memory { memzero }
 import ritzlib.strview { StrView }
-import ritzlib.span { Span }
+import ritzlib.span
+import ritzlib.mapping
 import ritzlib.fd { Fd, fd_open, O_RDONLY, SEEK_SET, SEEK_END }
 
 # ============================================================================
@@ -43,10 +43,6 @@ const CA_STORE_MAX_FILE_SIZE: i64 = 10485760
 # Buffer size for DER decoding
 const CA_STORE_DER_BUFFER_SIZE: i64 = 8192
 
-# mmap flags for portable usage
-const PROT_READ_WRITE: i32 = 3      # PROT_READ | PROT_WRITE
-const MAP_PRIVATE_ANON: i32 = 34    # MAP_PRIVATE | MAP_ANONYMOUS
-
 # ============================================================================
 # CA Store Structure
 # ============================================================================
@@ -57,19 +53,14 @@ pub struct CaStore
     certs: [256]*X509Certificate
     cert_count: i32
 
-    # Arena for certificate data
-    arena_base: *u8
-    arena_size: i64
+    # Arena for certificate data: the mapping from mmap_anon, empty when
+    # none (ritzlib.mapping)
+    arena: Span<u8>
     arena_offset: i64
 
 # ============================================================================
 # Arena Helpers (inline for CA store)
 # ============================================================================
-
-# sys_mmap is the raw syscall: it fails with -errno (-4095..-1), not just -1.
-fn ca_mmap_failed(p: *u8) -> bool
-    let v: i64 = p as i64
-    return v < 0 && v >= -4095
 
 # Allocate from store's arena
 fn ca_arena_alloc(store: *CaStore, size: i64) -> *u8
@@ -79,21 +70,21 @@ fn ca_arena_alloc(store: *CaStore, size: i64) -> *u8
     # Align to 8 bytes
     let aligned_size: i64 = (size + 7) & (0 - 8)
 
-    if store.arena_offset + aligned_size > store.arena_size
+    if store.arena_offset + aligned_size > store.arena.len
         return null
 
-    let ptr: *u8 = store.arena_base + store.arena_offset
+    let ptr: *u8 = store.arena.ptr + store.arena_offset
     store.arena_offset = store.arena_offset + aligned_size
     return ptr
 
 # Allocate a certificate struct from arena
 fn ca_alloc_cert(store: *CaStore) -> *X509Certificate
-    let cert: *u8 = ca_arena_alloc(store, sizeof(X509Certificate))
+    let cert: *X509Certificate = ca_arena_alloc(store, sizeof(X509Certificate)) as *X509Certificate
     if cert == null
         return null
     # Zero initialize
-    memzero(cert, sizeof(X509Certificate))
-    return cert as *X509Certificate
+    span_from_ptr<X509Certificate>(cert, 1).zero()
+    return cert
 
 # ============================================================================
 # Public API
@@ -109,26 +100,22 @@ pub fn ca_store_init(store: *CaStore)
     store.cert_count = 0
 
     # Allocate arena
-    store.arena_base = sys_mmap(0, CA_STORE_ARENA_SIZE, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
-    if ca_mmap_failed(store.arena_base)
-        store.arena_base = null
-        store.arena_size = 0
-    else
-        store.arena_size = CA_STORE_ARENA_SIZE
+    match mmap_anon(CA_STORE_ARENA_SIZE)
+        Ok(m) => store.arena = m
+        Err(_) => store.arena = span_empty<u8>()
     store.arena_offset = 0
 
 # Destroy CA store and free memory
 pub fn ca_store_destroy(store: *CaStore)
-    if store.arena_base != null && store.arena_size > 0
-        sys_munmap(store.arena_base, store.arena_size)
-    store.arena_base = null
-    store.arena_size = 0
+    if store.arena.len > 0
+        munmap(store.arena)
+    store.arena = span_empty<u8>()
     store.arena_offset = 0
     store.cert_count = 0
 
 # Check if store is valid (arena allocated)
 pub fn ca_store_valid(store: *CaStore) -> i32
-    if store.arena_base != null
+    if store.arena.len > 0
         return 1
     return 0
 
@@ -244,17 +231,18 @@ pub fn ca_store_load_pem_file(store: *CaStore, path: StrView) -> i32
     f.seek(0, SEEK_SET)
 
     # Allocate buffer for file content
-    let file_buf: *u8 = sys_mmap(0, size, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
-    if ca_mmap_failed(file_buf)
-        f.close()
-        return -1
+    var file: Span<u8> = span_empty<u8>()
+    match mmap_anon(size)
+        Ok(m) => file = m
+        Err(_) =>
+            f.close()
+            return -1
 
     # Read file
     var total_read: i64 = 0
     while total_read < size
-        let to_read: i64 = size - total_read
         var n: i64 = 0
-        match f.read(Span<u8> { ptr: file_buf + total_read, len: to_read })
+        match f.read(file.from(total_read))
             Ok(k) => n = k
             Err(_) => pass
         if n <= 0
@@ -264,14 +252,14 @@ pub fn ca_store_load_pem_file(store: *CaStore, path: StrView) -> i32
     f.close()
 
     if total_read != size
-        sys_munmap(file_buf, size)
+        munmap(file)
         return -1
 
     # Parse PEM bundle
-    let loaded: i32 = ca_store_load_pem_bundle(store, file_buf, size)
+    let loaded: i32 = ca_store_load_pem_bundle(store, file.ptr, size)
 
     # Free file buffer
-    sys_munmap(file_buf, size)
+    munmap(file)
 
     return loaded
 
