@@ -6,8 +6,9 @@
 
 This document specifies the Ritz programming language. It is not a wish list:
 every fenced ` ```ritz ` block below is compiled by
-`tools/check_doc_examples.py` against `ritz0` on every build (`make
-check-doc-examples`). A block that stops compiling fails the build, so the
+`tools/check_doc_examples.py` against `ritz0` (`make check-doc-examples`, part
+of `make test`), and against `ritz1` and `ritz1_selfhosted` by `make
+check-doc-examples-ritz1`. A block that stops compiling fails the build, so the
 syntax you read here is the syntax the compiler currently accepts.
 
 Fences carry their own contract:
@@ -17,11 +18,16 @@ Fences carry their own contract:
 - ` ```ritz expect-error="..." ` — an example the compiler **rejects**; the
   checker asserts it keeps failing with exactly that diagnostic. This is how
   removed syntax is documented: the removal itself is a test.
+- ` ```ritz expect-runtime-error="..." ` — a program that must compile, then
+  exit non-zero with that text on stderr when run.
 
-The previous edition of this file was stamped "0.2.0, February 2026" and sat
-unchanged through the entire RERITZ migration while teaching syntax the
-compiler had started rejecting. Sections describing features that were removed
-now say so, next to a block proving the compiler rejects them.
+Sections describing features that were removed say so, next to a block
+proving the compiler rejects them.
+
+Text is a `StrView` (a `"..."` literal) or a `String`. A `c"..."` literal and
+any NUL-terminated `*u8` text are for C interop only, at a boundary whose callee
+can't take a length ([§2.6](#string-literals), [STANDARD.md](STANDARD.md) S-TEXT-1,
+[RITZ_NOT_C.md](RITZ_NOT_C.md)).
 
 ---
 
@@ -56,17 +62,22 @@ now say so, next to a block proving the compiler rejects them.
 
 Ritz is a systems programming language with five core design pillars:
 
-1. **Minimal syntax, big library** - Python-style indentation, no semicolons or braces
+1. **Minimal syntax, big library** - Python-style indentation, no semicolons or block braces
 2. **Type-safe with inference** - Static types with extensive type inference
 3. **References without lifetimes** - `@T` / `@&T`, no borrow annotations
 4. **One language for everything** - From kernel to script, same syntax
-5. **Bootstrappable** - Self-hosting compiler shipped as LLVM IR
+5. **Bootstrappable** - the Python reference compiler (`ritz0`) builds the
+   self-hosted one (`ritz1`), which then compiles itself
 
 ### 1.2 Target Environment
 
-- **Architecture:** x86-64 (primary), ARM64 (planned)
-- **Operating System:** Linux (primary), other POSIX (planned)
-- **Runtime:** None. No garbage collector, no libc dependency
+- **Architecture:** x86-64. Both compilers emit x86-64 code only;
+  `[[target_arch]]` ([§17](#17-attributes)) selects conditional items, not the
+  code generator
+- **Operating System:** Linux (`x86_64-unknown-linux-gnu`, the default), or
+  freestanding (`ritz0 --target x86_64-none-elf`) for kernel code
+- **Runtime:** None. No garbage collector, no libc dependency: programs make
+  Linux syscalls directly
 - **Backend:** LLVM IR
 
 ### 1.3 Hello World
@@ -122,7 +133,8 @@ fn tabbed() -> i32
 
 **Line continuation.** A line ends its statement, except when its last
 token is a binary operator (`and`, `or`, `&&`, `||`, `|`, `^`, `&`, a
-comparison, `<<`, `>>`, `+`, `-`, `*`, `/`, `%`) or `as`: the expression then
+comparison, `<<`, `>>`, `+`, `-`, `*`, `/`, `%`, the wrapping `+%`, `-%`,
+`*%`, or a range `..` / `..=`) or `as`: the expression then
 continues on the next line, at the **same** indent (AGAST #2954). Blank and
 comment-only lines between the two are skipped.
 
@@ -205,16 +217,16 @@ Block comments are not supported.
 
 ### 2.4 Keywords
 
-The 39 reserved words recognised by the lexer (`ritz0/tokens.py:KEYWORDS`):
+The 40 reserved words recognised by the lexer (`ritz0/tokens.py:KEYWORDS`):
 
 ```
 and       as        asm       assert    async     await
-break     const     continue  dyn       else      enum
-extern    false     fn        for       heap      if
-impl      import    in        let       loop      match
-mut       not       null      or        pub       return
-static_assert       struct    then      trait     true
-type      unsafe    var       while
+break     const     continue  defer     dyn       else
+enum      extern    false     fn        for       heap
+if        impl      import    in        let       loop
+match     mut       not       null      or        pub
+return    static_assert       struct    then      trait
+true      type      unsafe    var       while
 ```
 
 `self` and `pass` are **not** keywords — they are ordinary identifiers with
@@ -254,7 +266,8 @@ let sized = 100u16      # Typed suffix
 ```
 
 There is no octal literal form. `0o77` lexes as `0` followed by the identifier
-`o77` and fails at name resolution.
+`o77`, and is refused at the `o77` as a second statement on the line
+([§2.2](#22-indentation)).
 
 A type suffix is lowercase: `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`,
 `i32`, `i64`, `isize` (and `f32`, `f64` on a float). `1U32` is no typed
@@ -306,39 +319,68 @@ let nul: u8 = '\0'      # Null byte
 
 #### String Literals
 
-Two forms of string literal exist:
+`"..."` is the string literal. It is a `StrView`: a `{ ptr, len }` view of the
+literal's bytes, with no allocation. Text APIs take `StrView` ([§3.5](#35-string-types)),
+so a literal passes straight to them:
 
-```ritz body
-let s: StrView = "hello"        # StrView: a { ptr, len } pair, no allocation
-let c: *u8 = c"hello"           # *u8: NUL-terminated C string
+```ritz
+import ritzlib.io
+
+fn greet(name: StrView)
+    prints("hello, ")
+    prints(name)
+    prints("\n")
+
+fn main() -> i32
+    let s = "world"                 # StrView
+    greet(s)
+    0
 ```
+
+`c"..."` is the C-interop form: a `*u8` to NUL-terminated bytes. It is for a
+callee that can't take a length and needs the NUL, such as an `extern fn` or a
+syscall's path or argv argument, and belongs inside the ritzlib wrapper for
+that boundary. Null termination is unsafe (the length lives in the data, so one
+missing NUL reads past the end), and app code doesn't use it: if the only API
+for something takes a NUL-terminated `*u8`, the fix is a `StrView` API in
+ritzlib, not a `c"..."` at the call site ([STANDARD.md](STANDARD.md) S-TEXT-1).
 
 A literal has no fixed type until a slot gives it one, as `5`, `null` and
 `[1, 2]` already behave. `"..."` is `StrView` by default and `*u8` in a `*u8`
 slot, wherever that slot is: `let`, `var`, `=`, `return`, a tail, a field, an
 array element, an `if` or `match` arm, an argument (LARB R3, AGAST #2341).
-`c"..."` is always `*u8`, so it is what an untyped `let` needs:
+That conversion serves the same boundary: it lets a literal fill a C-facing
+`*u8` slot without a `c` prefix. It is no reason to give a text API a `*u8`
+parameter. `c"..."` is always `*u8`, so it is what an untyped `let` needs:
 
 ```ritz
-struct Name
+extern fn puts(s: *u8) -> i32       # C reads up to the NUL: no length
+
+struct CName                        # mirrors a C struct's `const char *`
     text: *u8
 
-fn pick(short: bool) -> *u8
+fn c_greeting(short: bool) -> *u8   # its caller hands the result to C
     if short
-        "a"
+        "hi"
     else
-        "alpha"
+        "hello"
 
 fn main() -> i32
-    let p: *u8 = "hello"
-    let n = Name { text: "hi" }
-    let names: [2]*u8 = ["x", "y"]
-    (*p as i32) - 104 + (*n.text as i32) - 104 + (*names[1] as i32) - 121 + (*pick(true) as i32) - 97
+    let n = CName { text: "Ritz" }
+    let argv: [3]*u8 = ["/bin/ls", "-l", null]   # execve's argv
+    puts(c_greeting(true))
+    puts(n.text)
+    puts(argv[1])
+    puts("an argument")
+    let p = c"untyped"
+    puts(p)
+    0
 ```
 
 **Every string literal is stored NUL-terminated**, `"..."` and `c"..."` alike:
 the terminator follows the literal's bytes and isn't counted in a `StrView`'s
-`len`.
+`len`. That is what makes the `*u8` slot sound for a literal; a `StrView` in
+general carries no NUL.
 
 Only the literal converts. A literal is retyped, a value isn't, so a `StrView`
 that happens to hold a literal doesn't reach `*u8` (see [String
@@ -375,15 +417,17 @@ string left alone on a line is also a statement with no effect
 ([§6.6](#66-statements-with-no-effect)); the parse error comes first.
 
 **Escape sequences:** `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`, `\e` (ESC,
-0x1B), `\xNN`, and `\{` / `\}` for a literal brace anywhere. They mean the same
-in `"..."`, `c"..."` and `'.'` literals (AGAST #1872).
+0x1B) and `\xNN` mean the same in `"..."`, `c"..."` and `'.'` literals
+(AGAST #1872). `"..."` and `'.'` also take `\{` / `\}`, a literal brace in any
+context (below); `c"..."` has no interpolation and refuses them as unknown
+escapes.
 
 `\xNN` is exactly two hex digits, in either case, and gives that byte. The byte
 must be ASCII, at most `\x7F`: a literal is UTF-8 text, and a lone byte above
 that would be half a character, so a non-ASCII character is written as itself.
 
 ```ritz body
-let clear: *u8 = c"\e[2J\e[H"   # ANSI clear screen, cursor home
+let clear: StrView = "\e[2J\e[H" # ANSI clear screen, cursor home
 let esc: u8 = '\x1B'            # the same byte as '\e'
 let del: u8 = '\x7f'
 let csi: StrView = "\x1b["
@@ -396,14 +440,17 @@ let bad: u8 = '\x1'
 ```
 
 ```ritz body expect-error="is above '\x7F'"
-let half: *u8 = c"\xC3"
+let half: StrView = "\xC3"
 ```
 
 **String interpolation:** `{expr}` inside a **plain** string literal passed to
 the `print` or `eprint` builtin substitutes the value of `expr`. `print` writes
 to stdout (fd 1) and `eprint` to stderr (fd 2); otherwise the two are the same
-(AGAST #1641). A placeholder is not restricted to bare variable names. Any
-expression works, including a call:
+(AGAST #1641). `println` and `eprintln` add a newline, and `write(w, "...")` /
+`writeln(w, "...")` write through an explicit `ritzlib.fmt` `Writer` `w`
+(AGAST #202). Those four are the builtin only when their literal holds a
+placeholder; otherwise the name resolves like any other call. A placeholder is
+not restricted to bare variable names. Any expression works, including a call:
 
 ```ritz
 fn twice(n: i64) -> i64
@@ -418,37 +465,35 @@ fn main() -> i32
     return 0
 ```
 
-Interpolation is a rule of the two builtins (and of `format_into`, below),
-not of the string literal. The
-same `"{x}"` anywhere else, such as a `let`, an argument to any other function,
-a `return` or a struct field, is the three bytes `{`, `x`, `}`. A bare
-`"{x}"` statement prints nothing (AGAST #2102).
+Interpolation is a rule of these builtins (and of `format_into`, below), not
+of the string literal. The same `"{x}"` anywhere else, such as a `let`, an
+argument to any other function, a `return` or a struct field, is the three
+bytes `{`, `x`, `}`. A bare `"{x}"` statement prints nothing; it is refused as
+a statement with no effect (AGAST #2102, [§6.6](#66-statements-with-no-effect)).
 
-Inside a `print` or `eprint` literal, `{{` prints one `{` and `}}` one `}`.
+Inside a print literal, `{{` prints one `{` and `}}` one `}`.
 That escape belongs to print interpolation, not to the string literal: a plain
 `"..."` used anywhere else keeps both braces, so `"x{{y"` is four bytes and
 `prints("{{")` writes two braces (AGAST #1913). Write `\{` / `\}` for a
-literal brace that means the same thing in every context.
+literal brace that means the same thing in every `"..."` context.
 
-**Interpolation does NOT apply to `c"..."` literals** (AGAST #1374). A
-c-string is opaque bytes, so `print(c"x = {x}\n")` would print the placeholder
-verbatim. That used to compile clean and exit 0 with wrong output; it is now a
-compile error directing you at the plain-string form.
-
-The asymmetry is deliberate rather than an oversight. Making c-strings
-interpolate would break 48 sites across the workspace that rely on `{...}`
-staying opaque -- including ritz1's own emitter, which builds LLVM inline-asm
-constraint strings such as `"={rax},{rax},{rdi},~{rcx}"`, where `{rax}` and
-`{rdi}` are register constraints. Interpolating those corrupts every syscall
-the self-hosted compiler emits. A c-string containing braces is therefore
-still perfectly legal; only passing one to `print` or `eprint` is rejected.
+**Interpolation does NOT apply to `c"..."` literals** (AGAST #1374). Its
+bytes are for a C callee, not for a print builtin, so a placeholder in
+it would print verbatim. That used to compile clean and exit 0 with wrong
+output; a `c"..."` holding a placeholder passed to `print`, `eprint` or
+`format_into` is now a compile error directing you at the plain-string form.
+One containing braces is otherwise legal: to a C callee they are just bytes.
 
 A placeholder is `{` with a matching `}` before the end of the literal; a `{`
 with no match is a literal brace, as is a lone `}`, `}}`, `\{` or `\}`.
 Whitespace around the expression is ignored, and an empty or unparseable
 placeholder is a compile error.
 
-What a placeholder prints depends on the value's type:
+A placeholder `{x}` prints through `x`'s `Display` impl (its `show` method,
+`ritzlib.fmt`), and `{x:?}` through `Debug` (AGAST #202). `ritzlib.fmt`
+implements both for the integers, `bool`, `StrView`, `Span<u8>`, `String` and
+`*u8`, and a struct can implement its own. A reference prints as the value it
+refers to. With no impl in scope, the compiler's built-in form prints these:
 
 | Type | Prints |
 |------|--------|
@@ -458,10 +503,12 @@ What a placeholder prints depends on the value's type:
 | `StrView`, `@StrView`, `*StrView` | exactly `len` bytes from `ptr` (no NUL needed, none past `len`) |
 | other pointers (`*u8`, ...) | the NUL-terminated bytes they point at |
 
-A `String` prints through its view: `print("s = {s.as_view()}\n")`
-(`ritzlib.string`). Every other type, including floats and other structs, is a
-compile error. ritz0 and ritz1 follow the same rules and print the same bytes
-(AGAST #1521, #1641).
+The last row is a C-interop form: print text as a `StrView`. A `String`
+prints as `{s}` with `ritzlib.fmt` imported, or through its view,
+`{s.as_view()}`, without it. Any type with neither an impl nor a built-in form,
+floats included, is a compile error naming the impl to add (``type `f64`
+doesn't implement Display``). ritz0 and ritz1 follow the same rules and print
+the same bytes (AGAST #1521, #1641, #4381).
 
 Signedness comes from the value's Ritz type, wherever the value comes from: a
 local, a field, a call result or an `as` cast (AGAST #2128).
@@ -550,19 +597,17 @@ fn main() -> i32
 whose method `push_bytes(data: Span<u8>)` resolves statically, exactly
 as `sink.push_bytes(data)` would (§12.2). `String`, `GrowBuf` and
 `Writer` provide it (`String.push_bytes`, `GrowBuf.push_bytes`,
-`Writer.push_bytes`). `Vec<u8>.push_bytes`, the impl method #4537 moved
-off `vec_push_bytes`, still takes `(data: *u8, len: i64)`, and both
-compilers accept that shape as well. Any type can be a sink by
-implementing the Span form:
+`Writer.push_bytes`). `Vec<u8>.push_bytes` (`ritzlib.gvec`) still takes
+`(data: *u8, len: i64)`, and both compilers accept that shape as well. Any
+type can be a sink by implementing the Span form:
 
 ```ritz
 struct Count
     bytes: i64
 
 impl Count
-    fn push_bytes(self: @&Count, data: Span<u8>) -> i32
+    fn push_bytes(self: @&Count, data: Span<u8>)
         self.bytes = self.bytes + data.len
-        return 0
 
 fn main() -> i32
     var c: Count = Count { bytes: 0 }
@@ -573,8 +618,8 @@ fn main() -> i32
 
 The sink is evaluated once, before any placeholder. Placeholders are then
 evaluated left to right, each once. `format_into` only appends and never
-clears the buffer, and it produces no value. `push_bytes`'s result is
-discarded, as `print` discards `write`'s.
+clears the buffer, and it produces no value. `push_bytes`'s result, if it has
+one, is discarded.
 
 A placeholder formats exactly as `print` prints it (the table above), so a
 `u64` holding 2^64 - 1 appends `18446744073709551615`. Both use the same
@@ -619,10 +664,11 @@ placeholder of a type with no formatted form.
 - `write(buf, "...")` reads well, but `write` belongs to programs: the
   workspace defines it as an `extern fn` and as methods. A builtin of that
   name would take the call away from them. That is why `write`, `read`,
-  `open`, `close` and `nanosleep` are ordinary identifiers with no built-in
-  meaning (AGAST #3243): a call to one resolves like any other call, and
-  the syscalls are ritzlib.sys's `sys_write`, `sys_read`, `sys_open`,
-  `sys_close` and `sys_nanosleep`.
+  `open`, `close` and `nanosleep` are ordinary identifiers (AGAST #3243): a
+  call to one resolves like any other call, and the syscalls are
+  ritzlib.sys's `sys_write`, `sys_read`, `sys_open`, `sys_close` and
+  `sys_nanosleep`. The one exception came later: `write(w, "...{x}...")`,
+  whose literal holds a placeholder, is the explicit-Writer print (AGAST #202).
 - `String.fmt(...)` would tie formatting to one type and need an
   associated-builtin form neither compiler has. ritz1's own emitter, the
   motivating user, writes into a `Vec<u8>`, not a `String`.
@@ -636,11 +682,11 @@ builtin.
 
 | Category | Operators |
 |----------|-----------|
-| Arithmetic | `+`, `-`, `*`, `/`, `%` |
+| Arithmetic | `+`, `-`, `*`, `/`, `%`; wrapping `+%`, `-%`, `*%` |
 | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` |
 | Logical | `and` / `&&`, `or` / `\|\|`, `not` / `!` |
 | Bitwise | `&`, `\|`, `^`, `~`, `<<`, `>>` |
-| Assignment | `=`, `+=`, `-=`, `*=`, `/=` |
+| Assignment | `=`, `+=`, `-=`, `*=`, `/=`, `+%=`, `-%=`, `*%=` |
 | Reference | `@x` (immutable), `@&x` (mutable), `*p` (dereference) |
 | Cast | `as` |
 | Try | `?` |
@@ -648,7 +694,8 @@ builtin.
 | Index | `[]` |
 | Range | `..`, `..=` |
 
-`&` is bitwise-AND only. `::` is not an operator in Ritz — see
+The wrapping operators are in [§7.1](#71-arithmetic). `&` is bitwise-AND
+only. `::` is not an operator in Ritz — see
 [§15.3](#153-qualified-access).
 
 ---
@@ -906,6 +953,9 @@ The `null` keyword represents a null pointer:
 let p: *u8 = null
 ```
 
+`null` is for a raw pointer at a C or hardware boundary. A value that may be
+absent is an `Option<T>` (§10), not a pointer that may be `null`.
+
 ### 3.3 Array Types
 
 Fixed-size, stack-allocated arrays are written `[N]T`. Declare them with `var`
@@ -985,9 +1035,10 @@ element type is one of:
 
 - an integer (`[N]u32`, `[N]u64`, ...), each element a constant expression
   (§4.3), hex literals with the top bit set included;
-- `StrView`, each element a `"..."`;
-- `*u8`, each element a `"..."`, a `c"..."` or `null`; either string points at
-  its NUL-terminated bytes;
+- `StrView`, each element a `"..."`: the form for a table of text;
+- `*u8`, each element a string literal or `null`; the element points at the
+  literal's NUL-terminated bytes. This is for a table handed to C, such as an
+  argv array for `execve`, and belongs in the ritzlib wrapper for that call;
 - a struct `S`, each element an `S { ... }` literal whose fields are constants of
   the field's type: an integer, a `bool`, a float, `null`, a `"..."` into a
   `StrView` or `Span<u8>` field, a string into a `*u8` field, or a nested struct
@@ -1016,7 +1067,6 @@ const HEADERS: [2]Header = [
 ]
 
 const DAYS: [2]StrView = ["Mon", "Tue"]
-const ARGV0: [3]*u8 = ["ls", c"cat", null]
 const K: [2]u32 = [0x428a2f98, 0xb5c0fbcf]
 
 fn reason(code: i32) -> StrView
@@ -1040,6 +1090,17 @@ const BLANK: [4]StrView = ["-"; 4]
 fn main() -> i32
     var i: i32 = 3
     BLANK[i].len as i32 - 1
+```
+
+A `*u8` table is the C-interop case: a NUL-terminated argv array, ending in
+`null`, for a callee that takes `char *const argv[]`:
+
+```ritz
+const ARGV: [3]*u8 = [c"/bin/ls", c"-l", null]   # execve's argv
+
+fn main() -> i32
+    let p: *u8 = ARGV[0]
+    (*p - 47) as i32
 ```
 
 A `*u8` element that is not a string or `null` is an error at the element. A
@@ -1130,10 +1191,17 @@ fn main() -> i32
 
 | Type | Description |
 |------|-------------|
-| `String` | Owned, heap-allocated, growable |
-| `StrView` | Borrowed `{ ptr, len }` view — the default type of a `"..."` literal |
-| `*u8` | C-style NUL-terminated string — the type of a `c"..."` literal, and of a `"..."` literal in a `*u8` slot |
-| `Span<u8>` | Borrowed byte slice with length — also the type of a `"..."` literal in a `Span<u8>` slot |
+| `StrView` | Borrowed `{ ptr, len }` view of text: the type of a `"..."` literal, and what text parameters take |
+| `String` | Owned, heap-allocated, growable text |
+| `Span<u8>` | Borrowed bytes with a length: the type of a `"..."` literal in a `Span<u8>` slot |
+| `*u8` | NUL-terminated bytes, for C interop only: the type of a `c"..."` literal |
+
+Text is a `StrView` when borrowed and a `String` when owned; a function that
+takes text takes a `StrView`, and `"..."` passes straight in. A `*u8` string
+carries no length, so every read of it scans for the NUL, and one missing NUL
+reads past the end. It belongs only where a callee can't take a length and
+needs the NUL (a syscall's path or argv, an `extern fn`), ideally inside the
+ritzlib wrapper for that call.
 
 ```ritz
 import ritzlib.string
@@ -1157,10 +1225,9 @@ fn main() -> i32
     0
 ```
 
-A string literal fits a `*u8` slot ([§2.6](#26-literals)). Nothing else converts,
-because a `StrView` may be a slice with no terminator and a `String` has to be
-asked for one. `sv as *u8` is refused too. Write `.ptr` if you know the view is
-NUL-terminated, and `s.as_ptr()` for a `String`:
+At a C boundary a string literal also fits a `*u8` slot ([§2.6](#26-literals)).
+Nothing else converts, because a `StrView` may be a slice with no terminator and
+a `String` has to be asked for one. `sv as *u8` is refused too:
 
 ```ritz body expect-error="a StrView is not a `*u8`"
 let s: StrView = "hello"
@@ -1176,24 +1243,27 @@ fn main() -> i32
     0
 ```
 
+To hand text to a C callee, the wrapper takes a `StrView` and makes the
+NUL-terminated copy itself: `string_from(sv)`, then `s.as_ptr()`. `sv.ptr` is
+the view's first byte with no terminator promised; only a view of a whole
+literal has one.
+
 ```ritz
 import ritzlib.string
 import ritzlib.strview
 
+extern fn strlen(s: *u8) -> i64            # the C side: no length, needs the NUL
+
+fn c_len(text: StrView) -> i64             # the wrapper: callers pass a StrView
+    var owned: String = string_from(text)
+    strlen(owned.as_ptr())
+
 fn main() -> i32
-    let view: StrView = "hello"
-    let a: *u8 = view.ptr              # You know this view is terminated
-    var s: String = string_from("hello")
-    let b: *u8 = s.as_ptr()
-    let same: bool = *a == *b
-    if same
-        return 0
-    1
+    (c_len("hello") - 5) as i32
 ```
 
-In a `Span<u8>` slot a `"..."` literal is a `Span<u8>` of its bytes; a `StrView`
-value, a `c"..."` literal and a `String` don't convert (LARB R62, AGAST #3483).
-The slot may be a `let`, an argument or a return value. Escapes are decoded, so
+In a `Span<u8>` slot a `"..."` literal is a `Span<u8>` of its bytes (LARB R62,
+AGAST #3483). The slot may be a `let`, an argument or a return value. Escapes are decoded, so
 `"a\tc"` is three bytes:
 
 ```ritz
@@ -1297,26 +1367,39 @@ See section on [Generics](#11-generics).
 
 ### 3.8 Type Aliases
 
+An alias is another name for its target type, resolved wherever it is used
+(AGAST #1475): an `IntPtr` is a `*i32`, and either fits where the other does.
+
 ```ritz
 type IntPtr = *i32
+type Count = i64
+
+fn get(p: IntPtr) -> i32
+    *p
+
+fn main() -> i32
+    var x: i32 = 3
+    let p: IntPtr = @&x
+    let q: *i32 = p
+    let n: Count = 4
+    let m: i64 = n + 1
+    get(q) + (m as i32) - 8
 ```
 
-Two limitations in ritz0 today, both worth knowing before you reach for `type`:
+An alias takes no type parameters. `type Res<T> = Result<T, E>` is an error at
+the `<` (AGAST #3813):
 
-- Generic aliases (`type Res<T> = Result<T, Error>`) do not parse — the parser
-  wants `=` where the `<` is.
-- An alias is accepted at its declaration but is not resolved at use sites, so
-  a variable annotated `IntPtr` does not behave as `*i32`. Prefer spelling the
-  underlying type until this is fixed.
+```ritz expect-error="generic type aliases are not supported: `type Res<T>`"
+type Res<T> = Result<T, i64>
+```
 
 An `impl` can't target an alias. `type Id = Foo` then `impl Id` is an error at
 `Id`: "`Id` is a type alias for `Foo`: write `impl Foo`" (LARB R35, AGAST
 #3287). A type's methods live under the one name it was declared with.
 
 An alias names one type. `A | B` isn't a type, and a type name isn't a pattern
-(LARB R52, AGAST #1622). ritz0 accepted an untagged-looking `type V = i64 | bool`
-whose members were read out with an unchecked `v as i64`. For a value that is
-one of several kinds, write an enum with payloads and `match` it; each variant
+(LARB R52, AGAST #1622): `type V = i64 | bool` is an error at the `|`. For a
+value that is one of several kinds, write an enum with payloads and `match` it; each variant
 names its kind, so two kinds of the same type stay apart:
 
 ```ritz
@@ -1356,7 +1439,7 @@ let (a, _, c) = (1, 2, 3)   # a is 1, c is 3
 
 It destructures tuples only. A named struct is read by its fields: binding
 them by position would silently rebind every name after a field added to the
-struct (LARB R67). There is no named-field pattern yet.
+struct (LARB R67). There is no named-field pattern.
 
 ```ritz expect-error="`Bounds` is a struct, not a tuple: read its fields"
 struct Bounds
@@ -1445,7 +1528,7 @@ A `var` with no initialiser, `var x: T`, owns nothing yet. When T can be split
 (`splittable`: a struct with no `drop` of its own), it may be written field by
 field: each part with drop glue starts unwritten, and writing every such part
 on every path before x is moved, lent, returned or dropped is enough. LARB
-R59, narrowed on 2026-11-20 (AGAST #4328), covers only a T that cannot be
+R59, as narrowed by AGAST #4328, covers only a T that cannot be
 split (its own `drop`, an enum, an array, a tuple): that T starts unwritten
 whole and must be assigned whole, `x = T { … }`, before any field store, read,
 borrow, move or return. §13.6 has the rule.
@@ -1515,8 +1598,9 @@ Module-level values are `const` and `var`; there is no module-level `let`
 needs its type (above), and its initialiser, like a const's, is a *constant
 initialiser* (LARB R60, R75; AGAST #3479):
 
-- a literal: an integer, float, bool or char, `"…"` (a `StrView`, or a `*u8`
-  in a `*u8` slot), `c"…"`, or `null` in a pointer slot;
+- a literal: an integer, float, bool or char, `"…"` (a `StrView`), `c"…"`
+  (C interop only, S-TEXT-1), or `null` in a pointer slot. A `"…"` in a `*u8`
+  slot is a `*u8`, the C-boundary path, not the way to hold text;
 - a const;
 - arithmetic or a cast of constant initialisers (`K * 2 + 1`, `F * 2.0`,
   `(1 + 2) as i64`, `4096 as *u8`);
@@ -1653,8 +1737,9 @@ Local variable types are inferred from the initializer:
 ```ritz body
 let x = 42            # i64
 let n: i32 = 42       # i32, because it is annotated
+let f = 1.5           # f64
+let b = true          # bool
 let s = "hello"       # StrView
-let c = c"hello"      # *u8
 ```
 
 A generic call takes its type arguments from its arguments. A call `f(args)` to a
@@ -1735,6 +1820,9 @@ extern fn memcpy(dst: *u8, src: *u8, n: i64) -> *u8
 ```
 
 `extern fn` is a C-style symbol: top level only, no `pub`, no attributes.
+It is the C boundary, so its signature takes raw pointers; keep each one
+inside a ritzlib wrapper that takes `StrView`, `Span<T>` or a typed value,
+and call the wrapper (S-TEXT-1).
 
 **Declaration-only fns.** A fn or method header ending in `= extern`
 instead of a body declares the fn without defining it. The body lives in
@@ -1958,32 +2046,26 @@ struct Task
 
 Function pointers lower to opaque LLVM `ptr`, so `null` ([§3.2](#32-pointer-and-reference-types))
 fits a fn-pointer slot, and a fn pointer compares with `null` by `==` / `!=`
-(AGAST #3601): `h.handler = null`, `if h.handler != null`. A parameter whose type is written
-out **inline** is callable, and passing a named function as the argument works:
+(AGAST #3601): `h.handler = null`, `if h.handler != null`. A named function is a
+value of its `fn(...)` type: pass it as an argument, bind it to a local, and
+call either one. The type may be written inline or through a type alias:
 
 ```ritz
+type BinaryOp = fn(i32, i32) -> i32
+
 fn add(a: i32, b: i32) -> i32
     a + b
 
 fn apply(f: fn(i32, i32) -> i32, a: i32, b: i32) -> i32
     f(a, b)
 
+fn apply_op(f: BinaryOp, a: i32, b: i32) -> i32
+    f(a, b)
+
 fn main() -> i32
-    return apply(add, 1, 2)
+    let g = add                 # g: fn(i32, i32) -> i32
+    apply(add, 1, 2) + apply_op(g, 1, 1) + g(1, 1) - 7
 ```
-
-Two spellings do *not* work, both failing with `Unknown function: f`:
-
-- the parameter type written through a **type alias** (`type BinaryOp =
-  fn(i32, i32) -> i32` then `fn apply(f: BinaryOp, ...)`). This is the alias
-  resolution bug in [§3.8](#38-type-aliases), not a function-pointer
-  limitation — aliases are accepted at their declaration and then not resolved
-  at use sites.
-- calling through a **local binding** (`let f = add` then `f(1, 2)`). ritz0 has
-  no lowering for a function-valued `let`.
-
-Until those are fixed, spell the `fn(...)` type out at the parameter, or
-dispatch through an `impl` method or a `match`.
 
 A struct field of function type is called like a method (LARB R41, AGAST #2218):
 `h.f(1)` calls the method `f` if the type has one, and otherwise the field `f` if
@@ -2138,13 +2220,11 @@ else
     2
 ```
 
-This document claimed the opposite until 2026-09-12 ("`if` is a statement, not
-an expression; use `match` where you want a value"). `match` remains the better
-choice when you are discriminating a tagged union, but not because `if` cannot
-produce a value.
+`match` remains the better choice when you are discriminating a tagged union,
+but not because `if` cannot produce a value.
 
-An `if`-expression **must** have its `else` arm, and ritz0 rejects one that
-does not:
+An `if`-expression **must** have its `else` arm; one without it is a compile
+error:
 
 ```ritz body expect-error="an `if` with no `else` has no value"
 let c = true
@@ -2153,11 +2233,9 @@ let x = if c
 ```
 
 An `if` with no `else` has no value on the path where the condition is false,
-so there is nothing for the binding to name. Before AGAST #1406 this compiled
-at exit 0: no `phi` was emitted, the `1` was discarded, and `x` was silently
-bound to `0` whichever way the condition went. It is rejected rather than
-defaulted because synthesising a zero for the missing arm would keep those
-programs compiling and merely make the wrong answer deliberate.
+so there is nothing for the binding to name. It is rejected rather than
+defaulted because a synthesised zero for the missing arm would make a wrong
+answer deliberate (AGAST #1406).
 
 The rule applies wherever a `let`, `var`, assignment or `return` takes the
 `if`'s value — including through the arms of an enclosing `if`/`else`, the
@@ -2241,8 +2319,8 @@ A function that declares a return type is different. It is an error for such
 a function to be able to reach its end without producing a value, whether its
 last statement is an `if`, a loop, an assignment, a `pass` arm or a call to a
 procedure. There is no implicit `0`. An `if`/`else` whose arms all return, or a
-`loop` with no `break`, never reaches the end and needs nothing after it, and
-may have nothing after it. The
+`loop` with no `break`, never reaches the end: it needs nothing after it, and
+anything after it is unreachable code (below). The
 condition of a `while` counts as always true only when it is the literal
 `true`. `-> void` declares no value, so it follows the rules for a procedure.
 
@@ -2316,7 +2394,8 @@ fn main() -> i32
     sum_to(4) - 10
 ```
 
-Iterator for loops walk a `Vec<T>`:
+A `for` also walks the elements of an array, a `Vec<T>`, a `Span<T>` or a
+`StrView` (its bytes, as `u8`):
 
 ```ritz
 import ritzlib.gvec
@@ -2599,7 +2678,7 @@ To get an `f32` back from `z`, write `z as f32`: without the `as`,
 `p + n` and `p - n` on a `*T` step by whole elements of `T`. `q - p` on two pointers
 to the same `T` is the inverse: their distance in elements of `T`, an `i64`, so
 `(p + n) - p == n`. It's negative when `q` comes before `p`. Two pointers to
-different types have no common element to count in, and ritz0 refuses them.
+different types have no common element to count in, and the compiler refuses them.
 
 ```ritz body
 var a: [8]i32
@@ -2621,9 +2700,7 @@ fn f(p: @&i32) -> i32
     *q
 ```
 
-For a struct `T` the element is `sizeof(T)`, padding included. Before AGAST #2928
-ritz0 emitted `sub` on two pointers, which clang rejected, and ritz1 gave
-`q - p * sizeof(T)`, except for an element of a `[N]*T` array, which gave bytes.
+For a struct `T` the element is `sizeof(T)`, padding included.
 
 ### 7.2 Comparison
 
@@ -2808,9 +2885,12 @@ let c = a & b
 ### 7.5 Type Casting
 
 ```ritz body
-let x: i64 = 42 as i64
-let p: *u8 = null as *u8
-let addr: i64 = p as i64
+let n: i32 = 42
+let x = n as i64                 # widen
+let b: u8 = 200
+let c = b as i8                  # -56: reinterpret the bits
+var buf: [4]u8
+let addr = @buf[0] as i64        # a pointer's address
 ```
 
 `as` binds tighter than every binary operator, and its type ends at the first
@@ -2878,10 +2958,9 @@ let b = 256 as bool
 A `bool` has no cast to a float or a pointer.
 
 ritz0, ritz1 and ritz1_selfhosted give the same located error for each of these,
-and `ritz0/test_bool_type.py` runs one table through all three. ritz0 reads the
-type off the value it just emitted. ritz1 keeps a `bool` in an `i64` register, so
-it works the type out from the expression. A condition ritz1 can't type is an
-error, not a guess.
+and `ritz0/tests/test_bool_type.py` runs one table through all three. ritz1 works
+the type out from the expression, and a condition it can't type is an error, not
+a guess.
 
 #### Integer and float conversions
 
@@ -2909,7 +2988,7 @@ let d = x as i8                  # 127
 ```
 
 This is LLVM's `fptoui.sat` / `fptosi.sat`, and it's the same rule on all three
-compilers (`ritz0/test_unsigned_float_cast.py`, AGAST #2192). A bare
+compilers (`ritz0/tests/test_unsigned_float_cast.py`, AGAST #2192). A bare
 `fptosi` gives poison out of range, and the optimiser is then free to delete
 code that depends on the result.
 
@@ -2945,16 +3024,17 @@ let d: f64 = n                   # would round to 9007199254740992.0
 Integer literals are exempt: `let d: f64 = 4000000000` and `let f: f32 = -3`
 need no `as`. This follows Rust's `From` conversions: f64 has a 53-bit
 significand and f32 has a 24-bit one. It's the same rule on all three
-compilers (`ritz0/test_implicit_int_to_float.py`, AGAST #2945). ritz1 works
-out the integer's type from its Ritz types. Where it can't, for example for an
-unannotated local, it converts without checking rather than guess.
+compilers (`ritz0/tests/test_implicit_int_to_float.py`, AGAST #2945). ritz1 works
+out the integer's type from its Ritz types, and where it can't type the value it
+converts without checking rather than guess (AGAST #3501).
 
 A pointer never converts into a float slot, as the whole initialiser or as an
-`if` / `match` arm (AGAST #2093, `ritz0/test_let_float_pointer.py`). Neither
+`if` / `match` arm (AGAST #2093, `ritz0/tests/test_let_float_pointer.py`). Neither
 does a `bool` (above):
 
 ```ritz body expect-error="cannot use a pointer as a float"
-let p: *u8 = c"x"
+var b: u8 = 0
+let p: *u8 = @b
 let a: f64 = p
 ```
 
@@ -2995,8 +3075,8 @@ let e: f32 = d
 let n: f32 = x as f32
 ```
 
-ritz0 enforces this (`ritz0/test_f64_into_f32.py`, AGAST #3802); ritz1 still
-narrows silently until AGAST #3998.
+ritz0 and ritz1 both enforce this (`ritz0/tests/test_f64_into_f32.py`, AGAST
+#3802, #3998).
 
 #### Implicit narrowing is an error
 
@@ -3096,13 +3176,14 @@ let a: [2]u8 = [1, k]
 ```
 
 ritz0 and ritz1 both enforce this rule at every slot above (a struct literal
-field since AGAST #4157 / #4218). `ritz0/test_ritz1_implicit_narrowing.py` checks that they
-give the same verdict on every case in `ritz0/test_implicit_narrowing.py` (a
-`let`/`var` initialiser), and `ritz0/test_ritz1_implicit_narrowing_slots.py`
-does the same for `ritz0/test_implicit_narrowing_slots.py` (an assignment, an
-argument, a `return` and a struct literal field, AGAST #1444 / #4081 / #4218). ritz1 infers the value's type from its
-Ritz types. Where that inference is unsure, for example for an unannotated
-local, ritz1 accepts the value rather than guess (#1364).
+field since AGAST #4157 / #4218). `ritz0/tests/test_ritz1_implicit_narrowing.py`
+checks that they give the same verdict on every case in
+`ritz0/tests/test_implicit_narrowing.py` (a `let`/`var` initialiser), and
+`ritz0/tests/test_ritz1_implicit_narrowing_slots.py` does the same for
+`ritz0/tests/test_implicit_narrowing_slots.py` (an assignment, an argument, a
+`return` and a struct literal field, AGAST #1444 / #4081 / #4218). ritz1 infers
+the value's type from its Ritz types, and where it can't type the value it
+accepts it rather than guess (AGAST #1364, #3501).
 
 ### 7.6 Reference Operations
 
@@ -3615,7 +3696,7 @@ fn main() -> i32
 ```
 
 `StrView` isn't one of the built-ins, so `s[i]` on one is the same error (read a byte
-with `s.ptr[i]`):
+with `s.get(i)`):
 
 ```ritz expect-error="`StrView` can't be indexed: it doesn't implement `Index` (§7.8)"
 fn count_spaces(s: StrView) -> i64
@@ -3677,10 +3758,11 @@ fn main() -> i32
 
 `HashMapI64` implements all three in `ritzlib.hashmap`, at `K` = `V` = `i64`. Its
 `index` and `index_mut` end the program on a missing key (status 101, with
-`HashMapI64: key not found: <k>` on stderr), and `index_set` is
-`hashmap_i64_insert`. A generic `HashMap<K, V>` (AGAST #1858) implements them with
-`impl<K, V> Index for HashMap<K, V>`, the same way `ritzlib.box` writes
-`impl<T> Drop for Box<T>`.
+`HashMapI64: key not found: <k>` on stderr), and `index_set` is its `insert`. A
+generic type implements them as `impl<T> Index for W<T>`, the same way
+`ritzlib.box` writes `impl<T> Drop for Box<T>`. The generic `HashMap<K, V>`
+(AGAST #1858) doesn't implement them: use its `get` (an `Option<V>`), `insert`
+and `contains`.
 
 ### 7.9 Sizeof
 
@@ -3698,7 +3780,9 @@ or an expression. For an expression, `sizeof` measures the expression's *type*
 and never evaluates it: `sizeof(f())` does not call `f`, and `sizeof(key)` does
 not move or use `key`. An identifier is taken as a value when one is in scope,
 and as a type name otherwise. A comparison or `and`/`or` has size 1; any other
-binary operation has the size of its left operand.
+binary operation has the size of its type (§7.1), so with `m: u32`,
+`sizeof(m + 1)` and `sizeof(1 + m)` are both 4. (ritz1 still sizes a literal
+on the left as an `i64`, giving 8 for `sizeof(1 + m)`: a ritz1 bug, not the rule.)
 
 A name that is neither a value nor a type, such as `sizeof(Nope)`, is a compile
 error. So is an expression whose type the compiler can't determine. Neither
