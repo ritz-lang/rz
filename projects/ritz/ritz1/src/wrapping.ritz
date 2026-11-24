@@ -26,6 +26,8 @@ import ast_query   # TypeKind.Unknown & co., off emitter_core (AGAST #3513)
 import sema
 import sema_type
 import types
+import ast_helpers   # int_op_overflows, arith_op_cstr
+import bool_check    # sbk_const
 
 # `t` as the source spells it, for a refusal that names an operand's type: a
 # primitive, a struct, or a pointer or reference to one.  ritz0's _type_str,
@@ -86,3 +88,166 @@ pub fn wrapping_check(sm: *Sema, e: *Expr)
         return
     if sema_is_int_kind(r.kind) != 1
         wrapping_refuse(sm, e, @r)
+
+# =============================================================================
+# Constant operands (LARB R63, AGAST #4665)
+# =============================================================================
+#
+# "Overflow in a constant expression is a compile error": an operation whose
+# operands are all literals (or integer consts no local shadows) and that can
+# only stop the program is refused where it is written, in ritz0's words:
+#
+#     let n: u8 = (1 << 62) * 4 >> 60   # error: integer overflow in `*`
+#
+# ritz0 folds such operands to llvmlite constants as it emits them; ritz1's
+# emitter refused only an operation of two literals, so a nested one ran to
+# its trap, and in a narrower slot the narrowing check fired first.  Folded
+# as signed i64, as ritz0 does whatever the slot (`let x: u64 =
+# 9223372036854775807 + 1` is an overflow there too).  A u64-only literal or
+# const is not folded.
+
+# 0: computes; 1: overflow; 2: division by zero; 3: shift count out of range.
+fn ca_trap(e: *Expr, a: i64, b: i64) -> i32
+    match e.op
+        OpKind.Add | OpKind.Sub | OpKind.Mul =>
+            if e.wrapping == 1
+                return 0
+            if int_op_overflows(e.op, a, b, 64, 0) == 1
+                return 1
+            return 0
+        OpKind.Div | OpKind.Mod =>
+            if b == 0
+                return 2
+            return 0
+        OpKind.Shl | OpKind.Shr =>
+            if b < 0 or b >= 64
+                return 3
+            return 0
+        _ => pass
+    0
+
+# `a op b` for an op ca_value folds; 1 if it is one.
+fn ca_apply(e: *Expr, a: i64, b: i64, out: *i64) -> i32
+    match e.op
+        OpKind.Add =>
+            *out = a +% b
+        OpKind.Sub =>
+            *out = a -% b
+        OpKind.Mul =>
+            *out = a *% b
+        OpKind.Div =>
+            if b == -1
+                *out = 0 -% a
+            else
+                *out = a / b
+        OpKind.Mod =>
+            if b == -1
+                *out = 0
+            else
+                *out = a % b
+        OpKind.Shl =>
+            *out = a << b
+        OpKind.Shr =>
+            *out = a >> b
+        OpKind.BitAnd =>
+            *out = a & b
+        OpKind.BitOr =>
+            *out = a | b
+        OpKind.BitXor =>
+            *out = a ^ b
+        _ =>
+            return 0
+    1
+
+# The value of constant `e`, into `out`: 1 if it has one.
+fn ca_value(sm: *Sema, e: *Expr, out: *i64) -> i32
+    if e == null
+        return 0
+    match e.kind
+        ExprKind.IntLit =>
+            if e.lit_kind != LIT_PLAIN or e.int_val < 0
+                return 0
+            *out = e.int_val
+            return 1
+        ExprKind.Ident =>
+            let name: StrView = StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }
+            if sema_is_local(sm, name) == 1
+                return 0
+            let ce: *ConstEntry = sbk_const(sm, name)
+            if ce == null or ce.fold_state != CONST_FOLD_DONE or ty_is_int(ce.const_type) == 0 or ce.const_type == TypeKind.U64
+                return 0
+            *out = ce.value
+            return 1
+        ExprKind.Unary =>
+            var v: i64 = 0
+            if ca_value(sm, e.operand, @v) == 0
+                return 0
+            if e.op == OpKind.Neg and v != 0 - 9223372036854775807 - 1
+                *out = 0 - v
+                return 1
+            if e.op == OpKind.BitNot
+                *out = (0 - 1) - v
+                return 1
+            return 0
+        ExprKind.Binary => pass
+        _ =>
+            return 0
+    var a: i64 = 0
+    var b: i64 = 0
+    if ca_value(sm, e.left, @a) == 0 or ca_value(sm, e.right, @b) == 0
+        return 0
+    if ca_trap(e, a, b) != 0
+        return 0
+    ca_apply(e, a, b, out)
+
+# The trap of `e` itself (ca_trap), its operands constant; 0 if none.
+fn ca_own_trap(sm: *Sema, e: *Expr) -> i32
+    if e == null or e.kind != ExprKind.Binary
+        return 0
+    var a: i64 = 0
+    var b: i64 = 0
+    if ca_value(sm, e.left, @a) == 0 or ca_value(sm, e.right, @b) == 0
+        return 0
+    ca_trap(e, a, b)
+
+# The innermost constant operation in `e` that can only trap; null if none.
+pub fn const_arith_site(sm: *Sema, e: *Expr) -> *Expr
+    if e == null
+        return null
+    if e.kind == ExprKind.Unary
+        return const_arith_site(sm, e.operand)
+    if e.kind != ExprKind.Binary
+        return null
+    let l: *Expr = const_arith_site(sm, e.left)
+    if l != null
+        return l
+    let r: *Expr = const_arith_site(sm, e.right)
+    if r != null
+        return r
+    if ca_own_trap(sm, e) != 0
+        return e
+    null
+
+fn ca_op(op: OpKind) -> *u8
+    match op
+        OpKind.Shl =>
+            return c"<<"
+        OpKind.Shr =>
+            return c">>"
+        _ => pass
+    arith_op_cstr(op)
+
+# sema_walk calls this for every expression: refuse `e` if it is such an operation.
+pub fn const_arith_check(sm: *Sema, e: *Expr)
+    let trap: i32 = ca_own_trap(sm, e)
+    if trap == 0
+        return
+    sema_error_at(sm, e.span.line, e.span.col)
+    if trap == 1
+        eprints_cstr(c"integer overflow in `")
+    else if trap == 2
+        eprints_cstr(c"division by zero in `")
+    else
+        eprints_cstr(c"shift count out of range in `")
+    eprints_cstr(ca_op(e.op))
+    eprints_cstr(c"`\n")

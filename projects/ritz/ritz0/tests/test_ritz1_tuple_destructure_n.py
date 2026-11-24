@@ -137,7 +137,9 @@ def test_a_name_repeated_in_the_tail_is_refused(compile_with, compiler):
 @pytest.mark.parametrize("compiler", RITZ1S)
 def test_more_names_than_elements_is_refused(compile_with, compiler):
     out = _refused(compile_with, compiler, "arity", "let (a, b, c) = g()\nreturn a + b + c",
-                   "a field for each name", (1, 1))
+                   # ritz0's words, from Sema (AGAST #4665); the emitter's
+                   # "a field for each name" is now only its fallback.
+                   "Tuple destructuring mismatch: expected 2 elements, got 3 names", (1, 1))
     # Every name is still bound (a placeholder), so `c` is no second error.
     assert out.count("error") == 1, out[-1000:]
 

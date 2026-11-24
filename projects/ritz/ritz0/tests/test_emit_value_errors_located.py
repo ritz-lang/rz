@@ -396,22 +396,83 @@ def test_corrected_program_still_compiles(tmp_path, row):
 # at the `^`.  ritz1 named an emitter failure ("ritz1 cannot emit: unhandled
 # EXPR_MEMBER") or a later, unrelated fault, or compiled the row.  A row
 # listed here is a known ritz1 gap: a strict xfail.
-RITZ1_GAPS = {
-    "array_fill_zero": 4654, "bitop_arity": 4654, "const_array_scalar_type": 4654,
-    "empty_array_untyped": 4654, "float_intrinsic_arity": 4654,
-    "method_on_untyped": 4654, "no_method": 4654, "simd_builtin_arity": 4654,
-    "strview_builtin_arity": 4654, "try_on_plain_value": 4654,
-    "tuple_destructure_count": 4654, "unknown_variant": 4654,
+RITZ1_GAPS = {}
+
+
+# AGAST #4665: refusals ritz1 reported under another, later cause, because
+# Sema ran its value checks before it resolved the names (or folded the
+# constants) involved.  ritz0's rows: test_checker_corpus_gaps.py,
+# test_async_poll_typing.py and test_implicit_narrowing.py, which test
+# ritz0's passes alone.
+ASYNC_ADD_ONE = "async fn add_one(x: i32) -> i32\n    x + 1\n\n"
+NARROW = "fn f(x: i32) -> i32\n    {}\n    return 0\n" + MAIN0
+WRONG_CAUSE = {
+    # "ritz1 cannot emit: unknown identifier 'nope'": the emitter was the
+    # first to parse a placeholder.  ritz0 locates it at the literal.
+    "interp_unknown_name": (
+        'fn main() -> i32\n    print(^"n={nope}\\n")\n    0\n', "Unknown identifier: nope"),
+    # "statement has no effect: the value of `nope` is discarded".
+    "unsafe_body_unknown_name": (
+        "fn main() -> i32\n    unsafe\n        ^nope\n    0\n", "Unknown identifier: nope"),
+    # "unreachable match arm": `token.A` was taken for a binding.
+    "pattern_unknown_qualifier": (
+        "enum E\n    A\n\nfn f(e: E) -> i32\n    match e\n        ^token.A => 1\n"
+        "        _ => 0\n" + MAIN0, "Unknown enum: token"),
+    # "operand of `not` must be bool, and ritz1 cannot tell that it is".
+    "async_poll_is_no_fn": (
+        ASYNC_ADD_ONE + "fn main() -> i32\n    var future = add_one(10)\n"
+        "    if !^add_one_poll(@future)\n        return 1\n    0\n",
+        "Unknown function: add_one_poll"),
+    "plain_fn_has_no_poll": (
+        "fn add_one(x: i32) -> i32\n    x + 1\n\nfn main() -> i32\n    let x: i32 = 3\n"
+        "    if !^add_one_poll(@x)\n        return 1\n    0\n",
+        "Unknown function: add_one_poll"),
+    # "implicit narrowing: `n` is declared `u8` ...": LARB R63 refuses the
+    # constant first.  ritz1 compiled the two overflows in an i64 slot.
+    "const_shift_by_64": (NARROW.format("let n: u8 = ^0 << 64"), "shift count out of range in `<<`"),
+    "const_shift_right_by_64": (NARROW.format("let n: u8 = ^1 >> 64"), "shift count out of range in `>>`"),
+    "const_division_by_zero": (NARROW.format("let n: u8 = ^8 / 0"), "division by zero in `/`"),
+    "const_wraps_before_shift": (NARROW.format("let n: u8 = (^1 << 62) * 4 >> 60"), "integer overflow in `*`"),
+    "const_operand_wraps_i64": (NARROW.format("let n: i32 = x + ((^1 << 62) * 4 >> 60)"),
+                                "integer overflow in `*`"),
+    # A receiver Sema can't type, the emitter can: "ritz1 cannot emit:
+    # wrong number of arguments to integer BitOps method".
+    "bitop_arity_on_a_chain": ("fn main() -> i32\n    let a: u32 = 5\n    let b = ^a.rotl(1).rotr()\n    0\n",
+                               "rotr() requires exactly 1 argument"),
+    # The const's type as written: LLVM spelled a u8 `i8`.
+    "const_array_u8_type": ("const B: u8 = ^[1, 2]\n" + MAIN0,
+                            "Const array 'B' must have array type, got u8"),
+    "const_wraps_in_i64_slot": (NARROW.format("let n: i64 = (^1 << 62) * 4"), "integer overflow in `*`"),
+    # In an argument slot too, and signed whatever the slot: this product
+    # fits u64, and ritz1 let it through to the narrowing check.
+    "const_overflow_in_argument": ("fn take(x: i32) -> i32\n    x\n\nfn main() -> i32\n"
+                                   "    return take(^3037000500 * 3037000500)\n",
+                                   "integer overflow in `*`"),
+    "const_overflow_fits_only_u64": (NARROW.format("let n: u32 = ^3037000500 * 3037000500"),
+                                     "integer overflow in `*`"),
 }
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_every_compiler_says_it_there(tmp_path, compiler):
-    gaps = {} if compiler == "ritz0" else RITZ1_GAPS
-    assert_refusals(compiler, tmp_path,
-                    {row: (marked, message) for row, (marked, message, _) in ROWS.items()},
-                    gaps)
+    rows = {row: (marked, message) for row, (marked, message, _) in ROWS.items()}
+    rows.update(WRONG_CAUSE)
+    assert_refusals(compiler, tmp_path, rows, {} if compiler == "ritz0" else RITZ1_GAPS)
+
+
+# The cause is the only error: before #4665 ritz1 also said the later fault
+# ("statement has no effect", "operand of `not` must be bool") at the place.
+@pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
+def test_ritz1_names_only_the_cause(tmp_path, compiler):
+    bad = []
+    for row, (marked, message) in sorted(WRONG_CAUSE.items()):
+        src, where = _located(marked)
+        comp, _, _ = _compile3(compiler, tmp_path, row, src)
+        found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", comp.stdout + comp.stderr)
+        if found != [(where, message)]:
+            bad.append(f"{row}: want only {where}: {message}, got {found}")
+    assert not bad, "\n".join(bad)
 
 
 @pytest.mark.integration

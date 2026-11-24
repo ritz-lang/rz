@@ -199,6 +199,7 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discar
         # AGAST #3907: `E.V =>` / `E.V(v) =>` names the enum E.
         if arm.qualifier != null and sema_is_local(sm, StrView { ptr: (arm.qualifier), len: (arm.qualifier_len) as i64 }) == 0
             sema_vis_use(sm, arm.head_span.line, arm.head_span.col, StrView { ptr: (arm.qualifier), len: (arm.qualifier_len) as i64 })
+        call_check_pattern_qualifier(sm, arm)   # AGAST #4665
         let mark: i32 = sm.scope_top
         ref_loan_enter()   # AGAST #3506: an arm is a block for loans
 
@@ -292,6 +293,17 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discar
 
     own_check_arms_end(sm, scrut)   # AGAST #3507
 
+# 0 when `e` is a `not` / `and` / `or` whose operand names nothing
+# (call_check_names_nothing): call_check reports the name, as ritz0's name
+# resolver does before any typing (AGAST #4665).
+fn sema_bool_operand_named(sm: *Sema, e: *Expr) -> i32
+    if e.kind == ExprKind.Unary and call_check_names_nothing(sm, e.operand) == 1
+        return 0
+
+    if e.kind == ExprKind.Binary and (call_check_names_nothing(sm, e.left) == 1 or call_check_names_nothing(sm, e.right) == 1)
+        return 0
+    1
+
 # Every sub-expression, for the probe; a match or an if/else expression's
 # arms hold statements.
 fn sema_walk_expr(sm: *Sema, e: *Expr)
@@ -301,7 +313,8 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
     sema_note_expr_ty(sm, e)   # AGAST #4404: the emitter reads this
     sema_probe_record(sm, e)
 
-    bool_check_expr(sm, e)   # AGAST #2342
+    if sema_bool_operand_named(sm, e) == 1   # AGAST #4665: call_check says it
+        bool_check_expr(sm, e)   # AGAST #2342
 
     float_check_compare(sm, e)   # AGAST #3607
 
@@ -311,6 +324,8 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
         literal_expr(sm, e)   # AGAST #2341 / #3510: before its operands
 
     wrapping_check(sm, e)   # LARB R63 (AGAST #3486): integer operands
+
+    const_arith_check(sm, e)   # LARB R63 (AGAST #4665): constant operands
 
     if e.kind == ExprKind.Ident
         call_check_ident(sm, e)   # AGAST #4595: "Unknown identifier"
@@ -344,7 +359,13 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
             sema_walk_expr(sm, e.operand)
         ExprKind.Cast | ExprKind.Member | ExprKind.Try | ExprKind.ArrayFill =>
             if k == ExprKind.Member and e.left != null and e.left.kind == ExprKind.Ident
+                call_check_variant(sm, e)      # AGAST #4665: `E.C`, no such variant
+
+            if k == ExprKind.Member and e.left != null and e.left.kind == ExprKind.Ident
                 call_check_qualifier(e.left)   # AGAST #4595: `E.V` names no value
+
+            if k == ExprKind.Try
+                call_check_try(sm, e)          # AGAST #4665
 
             sema_walk_expr(sm, e.left)
         ExprKind.Call =>
@@ -585,6 +606,7 @@ fn sema_tuple_pattern_check(sm: *Sema, st: *Stmt, tup: *SemaTy)
         if sd == null
             return
     if sd.fields != null and sd.fields.name_len == 1 and *sd.fields.name == '0'
+        sema_tuple_count_check(sm, st, sd)   # AGAST #4665
         return   # a tuple: its elements are fields "0", "1", ...
     var len: i32 = name_len
     var i: i32 = 0
@@ -592,6 +614,28 @@ fn sema_tuple_pattern_check(sm: *Sema, st: *Stmt, tup: *SemaTy)
         i += 1
     sm.error_count = sm.error_count + 1
     diag_error_name(sema_file(sm), st.paren_span, c"`", StrView { ptr: (name), len: (i) as i64 }, c"` is a struct, not a tuple: read its fields")
+
+# `let (a, b) = t` of a 3-tuple: ritz0's words, at the `let` (AGAST #4665).
+# ritz1 bound the first two and dropped the third.
+fn sema_tuple_count_check(sm: *Sema, st: *Stmt, sd: *StructDef)
+    var want: i32 = 0
+    var f: *StructField = sd.fields
+    while f != null
+        want += 1
+        f = f.next
+    var got: i32 = 2
+    var tn: *TupleName = st.tuple_more
+    while tn != null
+        got += 1
+        tn = tn.next
+    if want == got
+        return
+    sema_error_at(sm, st.span.line, st.span.col)
+    eprints_cstr(c"Tuple destructuring mismatch: expected ")
+    eprint_i64(want as i64)
+    eprints_cstr(c" elements, got ")
+    eprint_i64(got as i64)
+    eprints_cstr(c" names\n")
 
 # AGAST #4428: a `**T` tuple element binds with its packed inner, so `**w`
 # (a `let (w, ..)` of a `(**u8, i32)`) loads a u8, as the emitter's binding
@@ -733,7 +777,8 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
                 own_check_loop_exit(sm)
                 sm.scope_top = for_mark
             StmtKind.If =>
-                bool_check_cond(sm, st.if_cond, c"if condition")
+                if call_check_names_nothing(sm, st.if_cond) == 0   # AGAST #4665
+                    bool_check_cond(sm, st.if_cond, c"if condition")
                 sema_walk_expr(sm, st.if_cond)
                 var in_tail: i32 = (tail_value == 1 and st.next == null) as i32
                 # An arm's else-less tail already has if_arm_value's "no value"
@@ -816,7 +861,9 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
 
                 # LARB R64 / R69 (AGAST #3492): a statement that computes a value
                 # and throws it away.  The same positions as the two above.
-                if st.next != null or void_tail == 1 or tail_value == 0
+                # AGAST #4665: a name nothing declares is call_check's
+                # "Unknown identifier", not a discarded value.
+                if (st.next != null or void_tail == 1 or tail_value == 0) and call_check_names_nothing(sm, st.expr) == 0
                     no_effect_check_value(sm, st.expr)
                 sema_walk_expr(sm, st.expr)
             StmtKind.Assert =>

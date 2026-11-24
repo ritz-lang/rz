@@ -784,6 +784,7 @@ pub fn call_check_call(sm: *Sema, e: *Expr)
         return
     if cc_builtin(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1 or cc_interp_literal_call(e) == 1
         cc_print_arg(sm, e)
+        cc_interp_names(sm, e)   # AGAST #4665
         return
     var full_len: i32 = 0
     let full: *u8 = cc_full_name(e, @full_len)
@@ -849,6 +850,157 @@ fn cc_known_ident(sm: *Sema, name: StrView) -> i32
     if enum_of_variant_unique(sm.pctx, name, @vi, @other) != 0 - 1
         return 1
     (generic_enum_of_variant(sm.pctx, name, @vi) >= 0) as i32
+
+# --- Names a later check would misread (AGAST #4665) -----------------------------
+#
+# ritz0 resolves every name before it types anything, so an unknown one is
+# "Unknown identifier: x" / "Unknown function: f", never the fault a typing
+# check finds in the value it can't type.  sema_walk runs the bool and
+# no-effect checks on an expression before its names are walked: this tells
+# them to stay quiet where call_check will report the name.
+
+# 1 when `e` is a name nothing declares (`nope`) or a call of one
+# (`nope(..)`): call_check refuses it when sema_walk reaches it.
+pub fn call_check_names_nothing(sm: *Sema, e: *Expr) -> i32
+    if e == null or g_cc_mute > 0
+        return 0
+    if e.kind == ExprKind.Ident
+        return (cc_known_ident(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0) as i32
+    if e.kind != ExprKind.Call or e.func_name_len == 0 or e.call_type_suffix_len > 0
+        return 0
+    let name: StrView = StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }
+    if cc_builtin(name) == 1 or cc_interp_literal_call(e) == 1 or cc_known_ident(sm, name) == 1
+        return 0
+    if name_eq(name, StrView { ptr: (c"Some"), len: (4) as i64 }) == 1 or name_eq(name, StrView { ptr: (c"Ok"), len: (2) as i64 }) == 1 or name_eq(name, StrView { ptr: (c"Err"), len: (3) as i64 }) == 1
+        return 0
+    (cc_named_fn(sm, e) == null) as i32
+
+# The names in a print / format_into / println / write literal's `{expr}`
+# placeholders (ritz0's InterpString, name_resolver.py): the emitter parses
+# them only as it lowers the call, so it was the first to see `{nope}`.
+fn cc_interp_names(sm: *Sema, e: *Expr)
+    if e.args == null
+        return
+    var lit: *Expr = e.args
+    let n: *u8 = e.func_name
+    let l: i32 = e.func_name_len
+    if name_eq(StrView { ptr: (n), len: (l) as i64 }, StrView { ptr: (c"format_into"), len: (11) as i64 }) == 1 or name_eq(StrView { ptr: (n), len: (l) as i64 }, StrView { ptr: (c"write"), len: (5) as i64 }) == 1 or name_eq(StrView { ptr: (n), len: (l) as i64 }, StrView { ptr: (c"writeln"), len: (7) as i64 }) == 1
+        lit = e.args.next
+    if lit == null or lit.kind != ExprKind.StringLit or lit.ident_ptr == null or lit.ident_len < 3
+        return
+    let body: *u8 = lit.ident_ptr + 1
+    let size: i32 = lit.ident_len - 2
+    var i: i32 = 0
+    while i < size
+        let c: i32 = *(body + i) as i32
+        if c == '\\'
+            i = i + 2
+        else if (c == '{' or c == '}') and i + 1 < size and *(body + i + 1) as i32 == c
+            i = i + 2
+        else if c == '{' and interp_match_brace(StrView { ptr: (body), len: (size) as i64 }, i) >= 0
+            let close: i32 = interp_match_brace(StrView { ptr: (body), len: (size) as i64 }, i)
+            var plen: i32 = close - i - 1
+            let colon: i32 = interp_spec_colon(StrView { ptr: (body + i + 1), len: (plen) as i64 })
+            if colon >= 0
+                plen = colon
+            cc_interp_walk(sm, interp_parse_expr(sm.pctx, StrView { ptr: (body + i + 1), len: (plen) as i64 }, lit.span.line, lit.span.col))
+            i = close + 1
+        else
+            i = i + 1
+
+# A placeholder's names, as sema_walk would judge them: a qualifier (`E.V`,
+# `T.m(..)`) names no value.
+fn cc_interp_walk(sm: *Sema, x: *Expr)
+    if x == null
+        return
+    match x.kind
+        ExprKind.Ident =>
+            call_check_ident(sm, x)
+        ExprKind.Member | ExprKind.Method =>
+            if x.left != null and x.left.kind == ExprKind.Ident
+                call_check_qualifier(x.left)
+            cc_interp_walk(sm, x.left)
+            if x.kind == ExprKind.Method
+                cc_interp_list(sm, x.args)
+        ExprKind.Binary | ExprKind.Index =>
+            cc_interp_walk(sm, x.left)
+            cc_interp_walk(sm, x.right)
+        ExprKind.Unary =>
+            cc_interp_walk(sm, x.operand)
+        ExprKind.Cast =>
+            cc_interp_walk(sm, x.left)
+        ExprKind.Call =>
+            cc_interp_list(sm, x.args)
+        _ => pass
+
+fn cc_interp_list(sm: *Sema, first: *Expr)
+    var a: *Expr = first
+    while a != null
+        cc_interp_walk(sm, a)
+        a = a.next
+
+# `E.C` with `E` an enum that declares no `C`: ritz0's "Unknown variant C in
+# enum E", where it is written.  The emitter said "unhandled EXPR_MEMBER".
+pub fn call_check_variant(sm: *Sema, e: *Expr)
+    let q: *Expr = e.left
+    if g_cc_mute > 0 or q == null or q.kind != ExprKind.Ident or cc_is_value_name(sm, q) == 1
+        return
+    let en: StrView = StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }
+    if sema_is_local(sm, en) == 1 or enum_find(sm.pctx, en) < 0
+        return
+    if enum_variant_index(sm.pctx, en, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
+        return
+    if cc_report(sm, e.span.line, e.span.col) == 1
+        eprints_cstr(c"Unknown variant ")
+        eprint_bytes(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        eprints_cstr(c" in enum ")
+        eprint_bytes(en)
+        eprint_char('\n')
+
+# `x?` of a value Sema types as a scalar: no Result or Option to test.
+# ritz1 took the enclosing fn's carrier for it and lowered a tag read of an
+# i64 (ritz0: _emit_try_op).
+pub fn call_check_try(sm: *Sema, e: *Expr)
+    if g_cc_mute > 0 or e.left == null
+        return
+    var t: SemaTy
+    sema_expr_ty(sm, e.left, @t)
+    if type_is_scalar_leaf(t.kind) == false
+        return
+    if cc_report(sm, e.span.line, e.span.col) == 1
+        eprints_cstr(c"Try operator requires a Result or an Option\n")
+
+# 1 when `q` is a module the file imports (any segment of an import's path):
+# ritz0's module_names, which qualify a pattern (`token.X =>`).
+fn cc_is_import_name(sm: *Sema, q: StrView) -> i32
+    var d: *ImportDecl = sm.module.imports
+    while d != null
+        var p: *ImportPath = d.path
+        while p != null
+            if name_eq(StrView { ptr: (p.segment), len: (p.segment_len) as i64 }, q) == 1
+                return 1
+            p = p.next
+        d = d.next
+    0
+
+# `token.A =>` / `token.A(v) =>`, each alternative of an or-pattern: a
+# qualifier that is no enum and no imported module is ritz0's "Unknown enum:
+# token", at the pattern.  ritz1 took `token.A` for a binding, and reported
+# the arm after it as unreachable.  `m.K` of a module item is emitter_match's
+# "module item access" error; a built-in carrier qualifies its own variants.
+pub fn call_check_pattern_qualifier(sm: *Sema, arm: *MatchArm)
+    var pat: *MatchArm = arm
+    while pat != null
+        if pat.qualifier != null and pat.qualifier_len > 0
+            let q: StrView = StrView { ptr: (pat.qualifier), len: (pat.qualifier_len) as i64 }
+            let known: i32 = (enum_find(sm.pctx, q) >= 0 or sema_find_struct(sm, q) != null or sema_is_local(sm, q) == 1 or cc_is_import_name(sm, q) == 1) as i32
+            let carrier: i32 = (name_eq(q, StrView { ptr: (c"Option"), len: (6) as i64 }) == 1 or name_eq(q, StrView { ptr: (c"Result"), len: (6) as i64 }) == 1) as i32
+            let item: i32 = (sbk_const(sm, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 }) != null or sbk_global(sm, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 }) != null or sema_find_fn(sm, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 }) != null) as i32
+            if known == 0 and carrier == 0 and item == 0 and cc_report(sm, pat.head_span.line, pat.head_span.col) == 1
+                eprints_cstr(c"Unknown enum: ")
+                eprint_bytes(q)
+                eprint_char('\n')
+        pat = pat.or_next
 
 # An ExprKind.Ident, as sema_walk visits it.
 pub fn call_check_ident(sm: *Sema, e: *Expr)
@@ -948,6 +1100,62 @@ fn cc_inline_method(type_name_sv: StrView, e: *Expr) -> i32
         return 1
     (type_name_len > 5 and memcmp(type_name, c"Span$", 5) == 0) as i32
 
+# The words for `m`'s argument count, when `m` is a BitOps intrinsic on an
+# integer (rotl / rotr take one, clz / ctz / popcnt / swap_bytes none) or a
+# float one (ceil / floor / round / abs take none); null if it is neither, or
+# the count is right.  ritz0: emitter/intrinsics.py, _try_emit_float_intrinsic.
+fn cc_intrinsic_arity(m: StrView, nargs: i32, is_float: i32) -> *u8
+    if is_float == 1
+        if name_eq(m, StrView { ptr: (c"ceil"), len: (4) as i64 }) == 1 or name_eq(m, StrView { ptr: (c"floor"), len: (5) as i64 }) == 1 or name_eq(m, StrView { ptr: (c"round"), len: (5) as i64 }) == 1 or name_eq(m, StrView { ptr: (c"abs"), len: (3) as i64 }) == 1
+            if nargs == 0
+                return c""
+            return c"() takes no arguments\n"
+        return null
+    if name_eq(m, StrView { ptr: (c"rotl"), len: (4) as i64 }) == 1 or name_eq(m, StrView { ptr: (c"rotr"), len: (4) as i64 }) == 1
+        if nargs == 1
+            return c""
+        return c"() requires exactly 1 argument\n"
+    if name_eq(m, StrView { ptr: (c"clz"), len: (3) as i64 }) == 1 or name_eq(m, StrView { ptr: (c"ctz"), len: (3) as i64 }) == 1 or name_eq(m, StrView { ptr: (c"popcnt"), len: (6) as i64 }) == 1 or name_eq(m, StrView { ptr: (c"swap_bytes"), len: (10) as i64 }) == 1
+        if nargs == 0
+            return c""
+        return c"() takes no arguments\n"
+    null
+
+# `x.m(..)` on an integer or float Sema types (AGAST #4665): an intrinsic's
+# argument count, at the call; and a float method that is neither an
+# intrinsic nor a trait impl's, at the method's name, in ritz0's words.  The
+# emitter said "cannot determine receiver type for method call".  An integer
+# method that is no intrinsic is left to the emitter.
+fn cc_scalar_method(sm: *Sema, e: *Expr)
+    var t: SemaTy
+    sema_expr_ty(sm, e.left, @t)
+    let is_float: i32 = ty_is_float(t.kind)
+    if is_float == 0 and ty_is_int(t.kind) == 0
+        return
+    let tname: *u8 = ty_name(t.kind)
+    let m: StrView = StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }
+    if sema_impl_method(sm, StrView { ptr: (tname), len: (strlen(tname)) as i64 }, m) != null
+        return
+    let words: *u8 = cc_intrinsic_arity(m, cc_count_args(e.args), is_float)
+    if words != null
+        if *words != 0 and cc_report(sm, e.span.line, e.span.col) == 1
+            eprint_bytes(m)
+            eprints_cstr(words)
+        return
+    if is_float == 0
+        return
+    var line: i32 = e.bracket.line
+    var col: i32 = e.bracket.col
+    if line <= 0
+        line = e.span.line
+        col = e.span.col
+    if cc_report(sm, line, col) == 1
+        eprints_cstr(c"No method '")
+        eprint_bytes(m)
+        eprints_cstr(c"' found for type '")
+        eprints_cstr(tname)
+        eprints_cstr(c"'\n")
+
 # A method call `r.m(args)` / `T.m(args)` (ExprKind.Method), after its receiver
 # is walked and before its arguments are.
 pub fn call_check_method(sm: *Sema, e: *Expr)
@@ -968,6 +1176,11 @@ pub fn call_check_method(sm: *Sema, e: *Expr)
     var tn_len: i32 = 0
     let tn: *u8 = cc_recv_type(sm, e, @tn_len)
     if tn == null or tn_len <= 0
+        cc_scalar_method(sm, e)   # AGAST #4665
+        return
+    if e.args != null and name_eq(StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1 and name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"as_bytes"), len: (8) as i64 }) == 1
+        if cc_report(sm, e.span.line, e.span.col) == 1   # AGAST #4665
+            eprints_cstr(c"as_bytes() takes no arguments\n")
         return
     if cc_inline_method(StrView { ptr: (tn), len: (tn_len) as i64 }, e) == 1
         return

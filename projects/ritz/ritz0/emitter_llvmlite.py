@@ -2013,8 +2013,10 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             elem_type = strview_ty
         else:
             if not isinstance(llvm_type, ir.ArrayType):
-                raise self._err(f"Const array '{name}' must have array type, got {llvm_type}",
-                                value.span)
+                # The type as the source spells it (AGAST #4665), as ritz1
+                # says it: LLVM's `i8` is a u8 or an i8.
+                raise self._err(f"Const array '{name}' must have array type, "
+                                f"got {self._show_type(ritz_type)}", value.span)
             elem_type = llvm_type.element
 
         # Extract element values

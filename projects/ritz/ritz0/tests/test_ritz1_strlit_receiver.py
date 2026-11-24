@@ -72,8 +72,9 @@ C_LIT_REFUSAL = {
     # Since #4294 ritz0 names a `*u8` receiver instead of calling it unknown
     # (a `*u8` can carry the Display/Debug impls); the refusal is the same.
     "ritz0": "No method 'len' found for type '*u8'",
-    "ritz1": "cannot determine receiver type for method call",
-    "ritz1_selfhosted": "cannot determine receiver type for method call",
+    # AGAST #4665: ritz0's older words, not an emitter failure.
+    "ritz1": "Cannot call method 'len' on unknown type",
+    "ritz1_selfhosted": "Cannot call method 'len' on unknown type",
 }
 
 

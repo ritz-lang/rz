@@ -46,7 +46,7 @@ CASES = {
 fn main() -> i32
     let n: i32 = 5
     n.rotl()
-""", 3, 5, "ritz1 cannot emit: wrong number of arguments to integer BitOps method"),
+""", 3, 5, "rotl() requires exactly 1 argument"),   # ritz0's words (AGAST #4665)
     # emitter_stmt: emit_ir_error_begin/_end, at the assignment.
     "stmt_unknown_variable": ("""\
 fn main() -> i32

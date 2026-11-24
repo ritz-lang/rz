@@ -103,7 +103,8 @@ CASES = {
     ),
     "emit_ir_error": (
         _BITOPS_ARITY,
-        ["unit.ritz:3:5: error: ritz1 cannot emit: wrong number of arguments to integer BitOps method"],
+        # AGAST #4665: ritz0's words; still the emitter's located error.
+        ["unit.ritz:3:5: error: rotl() requires exactly 1 argument"],
         None,
     ),
     "unlocated_only": (_BAD_STRVIEW, [_STRVIEW], f"error: ritz1 emitted 1 {SUMMARY}"),

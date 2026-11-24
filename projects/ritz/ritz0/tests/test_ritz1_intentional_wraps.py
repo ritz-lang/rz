@@ -20,20 +20,23 @@ from test_ritz1_move_param import _compile, _run
 
 pytestmark = [pytest.mark.integration]
 
-# name -> program ritz1 must refuse with a narrowing error, not a trap.
+# name -> (program, the located error). ritz1 must refuse each where it is
+# written, in ritz0's words, rather than trap inside the compiler. Before
+# AGAST #4665 ritz1 answered with an implicit-narrowing error here: the
+# narrowing check ran before the constant was computed.
 REFUSED = {
-    "mul_overflow_let": """\
+    "mul_overflow_let": ("""\
 pub fn main() -> i32
     let x: i32 = 4294967296 * 4294967296
     return 0
-""",
-    "mul_overflow_arg": """\
+""", "main.ritz:2:18: error: integer overflow in `*`"),
+    "mul_overflow_arg": ("""\
 fn take(x: i32) -> i32
     x
 
 pub fn main() -> i32
     return take(3037000500 * 3037000500)
-""",
+""", "main.ritz:5:17: error: integer overflow in `*`"),
 }
 
 # name -> (program, expected exit status); ritz0 is the oracle.
@@ -74,13 +77,16 @@ pub fn main() -> i32
 }
 
 
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_ritz1_refuses_overflowing_product(tmp_path, compiler, name):
-    comp, _ = _compile(compiler, tmp_path, REFUSED[name])
+    program, located = REFUSED[name]
+    comp, _ = _compile(compiler, tmp_path, program)
     out = comp.stdout + comp.stderr
-    assert "integer overflow" not in out, f"{compiler} trapped:\n{out[-2000:]}"
-    assert comp.returncode != 0 and "implicit narrowing" in out, out[-2000:]
+    assert comp.returncode != 0, out[-2000:]
+    # ritz0 omits "error: "; a trap inside the compiler carries no location.
+    path, message = located.split(" error: ")
+    assert path in out and message in out, f"{compiler}:\n{out[-2000:]}"
 
 
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])

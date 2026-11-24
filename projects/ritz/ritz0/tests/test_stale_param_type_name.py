@@ -170,8 +170,9 @@ fn main() -> i32
 
 REJECTED_BY = {
     "ritz0": "Cannot call method 'peek' on unknown type",
-    "ritz1": "cannot determine receiver type for method call",
-    "ritz1_selfhosted": "cannot determine receiver type for method call",
+    # AGAST #4665: ritz1 says it in ritz0's words, not as an emitter failure.
+    "ritz1": "Cannot call method 'peek' on unknown type",
+    "ritz1_selfhosted": "Cannot call method 'peek' on unknown type",
 }
 
 # #4294 lets a trait impl target `u8` and `*u8`, so ritz0 now names those
