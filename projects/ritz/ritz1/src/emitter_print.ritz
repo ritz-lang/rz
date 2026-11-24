@@ -2036,13 +2036,19 @@ pub fn emit_match_no_variant_trap(s: *EmitterState, enum_name_sv: StrView, slot:
 
 # @__ritz_match_trap(head, hlen, v, signed): ritz0's _match_trap_fn as text.
 # The message is built in a stack buffer, then written with its newline and
-# the process exits 1.
+# the process exits 1.  A freestanding --target stops through one
+# `ritz_platform_fatal(buf, len, 1)` instead, which writes the newline itself,
+# so the tail drops it and the IR holds no syscall (AGAST #4616).
 pub fn emit_match_trap_helper(s: *EmitterState)
     if g_match_trap_used == 0
         return
     g_match_trap_used = 0
+    let free: i32 = s.platform_stop & PSTOP_FREESTANDING
     emit_str(s, c"\n; match with no arm for a repr enum's value (AGAST #4586)\n")
-    emit_str(s, c"@.ritz_match_tail = private unnamed_addr constant [18 x i8] c\" names no variant\\0A\"\n")
+    if free == 1
+        emit_str(s, c"@.ritz_match_tail = private unnamed_addr constant [17 x i8] c\" names no variant\"\n")
+    else
+        emit_str(s, c"@.ritz_match_tail = private unnamed_addr constant [18 x i8] c\" names no variant\\0A\"\n")
     emit_str(s, c"define internal void @__ritz_match_trap(ptr %head, i64 %hlen, i64 %v, i64 %signed) \"no-builtins\"")
     emit_no_red_zone_attr(s)
     emit_str(s, c" {\n")
@@ -2080,8 +2086,16 @@ pub fn emit_match_trap_helper(s: *EmitterState)
     emit_str(s, c"  call void @__ritz_sret_copy(ptr %dd, ptr %first, i64 %dl)\n")
     emit_str(s, c"  %at = add i64 %hlen, %dl\n")
     emit_str(s, c"  %td = getelementptr i8, ptr %buf, i64 %at\n")
-    emit_str(s, c"  call void @__ritz_sret_copy(ptr %td, ptr @.ritz_match_tail, i64 18)\n")
-    emit_str(s, c"  %len = add i64 %at, 18\n")
+    let tail_len: i64 = 18 - (free as i64)   # the hook writes the newline
+    emit_str(s, c"  call void @__ritz_sret_copy(ptr %td, ptr @.ritz_match_tail, i64 ")
+    emit_int(s, tail_len)
+    emit_str(s, c")\n  %len = add i64 %at, ")
+    emit_int(s, tail_len)
+    emit_str(s, c"\n")
+    if free == 1
+        s.platform_stop = s.platform_stop | PSTOP_USED
+        emit_str(s, c"  call void @ritz_platform_fatal(ptr %buf, i64 %len, i32 1)\n  unreachable\n}\n")
+        return
     emit_str(s, c"  %bi = ptrtoint ptr %buf to i64\n")
     emit_str(s, c"  %w = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %bi, i64 %len)\n")
     emit_str(s, c"  %x = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 60, i64 1)\n")

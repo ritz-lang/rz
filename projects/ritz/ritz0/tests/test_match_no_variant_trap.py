@@ -23,12 +23,13 @@ compilers must agree byte for byte.
 """
 
 import os
+import re
 import subprocess
 
 import fast_link
 import pytest
-from ritz0_inproc import run_ritz0
 from test_enum_discriminants import COMPILERS, RITZ_ROOT, RITZ_START, _ir
+from test_integer_overflow_traps import _freestanding_ir
 
 pytestmark = pytest.mark.integration
 
@@ -162,20 +163,21 @@ def test_catch_all_and_valid_values_do_not_trap(compiler, tmp_path):
     assert _run_full(compiler, tmp_path, NO_TRAP) == (42, "", "")
 
 
-def test_freestanding_trap_calls_the_platform_hook(tmp_path):
-    """A kernel has no exit syscall (#4119): ritz0's freestanding trap stops
-    through `ritz_platform_fatal`, and its IR holds no syscall."""
-    path = tmp_path / "kernel.ritz"
-    path.write_text("enum W: i32\n    Neg = -1\n    Big = 1024\n\n"
-                    "pub fn kpick(w: W) -> i32\n    match w\n"
-                    "        Neg => 1\n        Big => 2\n")
-    out = tmp_path / "kernel.ll"
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    comp = run_ritz0([str(path), "-o", str(out), "--no-runtime",
-                      "--target", "x86_64-none-elf"],
-                     cwd=tmp_path, env=env, timeout=300)
-    assert comp.returncode == 0 and out.exists(), comp.stdout + comp.stderr
-    ir = out.read_text()
-    assert "syscall" not in ir, "a freestanding trap issued a syscall"
-    assert "call void @\"ritz_platform_fatal\"" in ir, ir
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_freestanding_trap_calls_the_platform_hook(compiler, request, tmp_path):
+    """A kernel has no exit syscall (#4119): a freestanding trap stops
+    through `ritz_platform_fatal`, and its IR holds no syscall.  ritz1 too
+    (#4616): a harland module it builds holds no syscall either.  The
+    message's tail carries no newline: the hook writes its own."""
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    ir = _freestanding_ir(compiler, tmp_path,
+                          "enum W: i32\n    Neg = -1\n    Big = 1024\n\n"
+                          "pub fn kpick(w: W) -> i32\n    match w\n"
+                          "        Neg => 1\n        Big => 2\n")
+    assert "syscall" not in ir, f"{compiler}: a freestanding trap issued a syscall"
     assert "__ritz_match_trap" in ir, ir
+    assert re.search(r'call void @"?ritz_platform_fatal"?\(', ir), \
+        f"{compiler}: the trap did not reach the platform hook:\n{ir}"
+    assert "names no variant" in ir and "names no variant\\0A" not in ir, \
+        f"{compiler}: the tail should leave the newline to the hook:\n{ir}"
