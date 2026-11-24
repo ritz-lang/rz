@@ -174,7 +174,7 @@ def test_unit_file_mode_runs_in_the_shadow(buildpy, overlay, tmp_path, monkeypat
     shared, via_a = overlay
     seen = []
     monkeypatch.setattr(build_cli, "unit_file",
-                        lambda run_dir, *a: seen.append(run_dir) or 0)
+                        lambda run_dir, *a, **kw: seen.append(run_dir) or 0)
     args = SimpleNamespace(all=False, name=str(via_a), unit_plan=None,
                            unit_file="t.ritz", unit_result="r.json",
                            unit_test_sh=False)

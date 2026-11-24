@@ -500,11 +500,50 @@ def closure_memo_put(material: dict, value: dict, files) -> None:
         pass  # a memo is an optimisation; never fail a build over it
 
 
+# A top-level private fn, whose symbol carries its file (AGAST #1858), and a
+# generic declaration, whose instance is emitted in another file's object and
+# may call that fn by its symbol (#4356, #4608). Line-based and generous: a
+# false match only costs a store hit.
+_PRIVATE_FN_RE = re.compile(r"^(?:(?:async|const|unsafe)\s+)*fn\s+(?!main\b)\w", re.M)
+_GENERIC_DECL_RE = re.compile(
+    r"^\s*(?:pub\s+)?(?:fn\s+\w+\s*<|impl\s*<|struct\s+\w+\s*<|enum\s+\w+\s*<)", re.M)
+
+
+def _path_bound_modules(src: Path, closure) -> List[str]:
+    """Resolved paths of the modules among `src` and `closure` whose symbols
+    an object built in another directory would spell differently.
+
+    A private fn's symbol hashes its file's path relative to its checkout
+    (ritz0 symbol_file_key, ritz1 fn_symbol; AGAST #4626), which
+    cas.module_identity's repository-relative identity already pins. A file
+    outside the repository (a test's tmp_path fixture, another checkout) has
+    identity `ext/<name>` only, so two directories' copies shared a key while
+    their objects named different symbols: a harness compiled in one linked
+    against the other's object and failed with an undefined `helper__<hash>`.
+    Such a module's path joins the key when it has a private fn that a
+    generic's instance can reach from another object.
+    """
+    bound = []
+    for p in {Path(p).resolve() for p in [src, *closure]}:
+        if not cas.module_identity(p).startswith("ext/"):
+            continue
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        if _PRIVATE_FN_RE.search(text) and _GENERIC_DECL_RE.search(text):
+            bound.append(str(p))
+    return sorted(bound)
+
+
 def _cas_key(src: Path, closure, cache: BuildCache, compiler: str,
              flags: dict) -> Optional[str]:
     """cas.module_key for `src` built by `compiler`, its imports digested the
     way that compiler reads them. None if an import does not parse."""
     flags = dict(flags)
+    bound = _path_bound_modules(src, closure)
+    if bound:
+        flags["symbol_paths"] = bound
     dep_digest = None
     # G9 (AGAST #1810): ritz0 reads its imports' interfaces, not their
     # sources, so its objects depend on interface hashes: a body-only edit
@@ -1094,16 +1133,23 @@ def ritz_path_for_tests(caller_path: str) -> str:
     return ":".join([root_str] + kept)
 
 
-def test_env_for_files() -> dict:
+def test_env_for_files(use_cache: bool = True) -> dict:
     """Environment for `ritz0 --test` children.
 
     Preserve any caller-provided RITZ_PATH — the workspace `rz` CLI builds a
     per-project dependency path list and passes it down; this used to
     REPLACE it with just the ritz root, silently breaking `lib.*` imports
     from path-dependencies in tests (AGAST #1324).
+
+    `use_cache=False` (`build.py test --no-cache`) sets test_runner's
+    RITZ_NO_CAS too, so the test binaries' objects and harness are compiled,
+    not served from the artifact store: the flag only reached the package
+    build, and a stale store object kept failing a test link (AGAST #4626).
     """
     test_env = os.environ.copy()
     test_env["RITZ_PATH"] = ritz_path_for_tests(test_env.get("RITZ_PATH", ""))
+    if not use_cache:
+        test_env["RITZ_NO_CAS"] = "1"  # test_runner.NO_CAS_ENV
     return test_env
 
 

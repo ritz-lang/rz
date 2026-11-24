@@ -170,8 +170,11 @@ def module_identity(path: Path, repo_root: Optional[Path] = None) -> str:
 
     Inside the repository: its repo-relative path. Outside it (a test's
     scratch copy of a helper, a tmp_path fixture): just the file name. The
-    path only reaches the IR through DWARF `DIFile`, and the content and
-    closure are keyed separately, so that is enough to tell modules apart.
+    path reaches the IR through DWARF `DIFile` and through private fns'
+    symbols (AGAST #1858), which hash the path relative to the file's
+    checkout, so they agree across worktrees (AGAST #4626). Outside a
+    checkout they hash the absolute path: build_pipeline._path_bound_modules
+    adds that path to the key where an object's symbols can depend on it.
     """
     root = repo_root if repo_root is not None else REPO_ROOT
     p = Path(path).resolve()

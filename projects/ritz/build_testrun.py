@@ -495,7 +495,7 @@ def run_test_sh(pkg_dir: Path) -> bool:
 
 
 def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0",
-              run_dir: Optional[Path] = None) -> bool:
+              run_dir: Optional[Path] = None, use_cache: bool = True) -> bool:
     """Run tests for a package with `compiler`, with cwd `run_dir`
     (test_run_dir; default pkg_dir).
 
@@ -523,7 +523,7 @@ def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0",
         # accurate aggregate results and let one bad file fail in isolation.
         # (`rz test --all -j N` runs these same per-file units concurrently
         # across the workspace via --unit-file; AGAST #1809.)
-        test_env = test_env_for_files()
+        test_env = test_env_for_files(use_cache)
         timeout = per_file_timeout()
         t0 = time.perf_counter()
         outcomes = [run_test_file(t, run_dir, test_env, timeout, compiler)
@@ -605,11 +605,11 @@ def unit_plan(pkg_dir: Path, config: dict, plan_path: Path, *,
 
 
 def unit_file(run_dir: Path, tfile: Path, result_path: Path,
-              compiler: str = "ritz0") -> int:
+              compiler: str = "ritz0", use_cache: bool = True) -> int:
     """Run one test file with cwd `run_dir` (test_run_dir); write its
     run_test_file outcome as JSON."""
     import json
-    outcome = run_test_file(tfile, run_dir, test_env_for_files(),
+    outcome = run_test_file(tfile, run_dir, test_env_for_files(use_cache),
                             per_file_timeout(), compiler)
     result_path.write_text(json.dumps(outcome))
     return 0 if outcome["status"] == "pass" else 1

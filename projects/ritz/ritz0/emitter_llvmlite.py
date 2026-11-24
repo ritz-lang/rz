@@ -636,6 +636,40 @@ def emits_definition(item: rast.Item, source_file: Optional[str],
     return defines_body(item, source_file, cached_fn_names) or inline_import(item, source_file)
 
 
+_SYMBOL_FILE_KEYS: Dict[str, str] = {}
+
+
+def symbol_file_key(path: str) -> str:
+    """What a private fn's symbol hashes for its defining file (AGAST #4626).
+
+    The file's resolved path relative to the nearest directory above it that
+    holds a `.git` (a checkout or a worktree), else its resolved absolute
+    path.  Two worktrees of one repository therefore name a file's private
+    fns alike, so the artifact store, which every worktree on a host shares
+    and which keys an in-repository module by its repository-relative path,
+    may serve one worktree's object to another: the absolute path made the
+    symbol, and every harness declaring it, differ per worktree.  A file
+    outside any checkout keeps its absolute path, and the store adds it to
+    the key (build_pipeline._cas_key).  ritz1's emitter_core fn_symbol
+    computes the same key.
+    """
+    real = os.path.realpath(path)
+    key = _SYMBOL_FILE_KEYS.get(real)
+    if key is None:
+        key = real
+        d = os.path.dirname(real)
+        while True:
+            if os.path.lexists(os.path.join(d, '.git')):
+                key = os.path.relpath(real, d)
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        _SYMBOL_FILE_KEYS[real] = key
+    return key
+
+
 class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                   layout.LayoutEmitter, patterns.PatternEmitter):
     """
@@ -5615,9 +5649,10 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
     def _symbol_name(fn_def: rast.FnDef) -> str:
         """A private fn's symbol: its name and its defining file's hash, so
         two files' `be16`s are two symbols (AGAST #1858).  The path is
-        resolved, as the file's own compile and every importer see it."""
+        resolved, as the file's own compile and every importer see it, and
+        hashed relative to its checkout (symbol_file_key, AGAST #4626)."""
         digest = hashlib.sha256(
-            os.path.realpath(fn_def.source_file).encode()).hexdigest()[:8]
+            symbol_file_key(fn_def.source_file).encode()).hexdigest()[:8]
         return f"{fn_def.name}__{digest}"
 
     def _set_debug_loc(self, node) -> None:

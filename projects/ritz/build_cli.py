@@ -187,7 +187,7 @@ def cmd_test(args):
         # run dir; recomputed rather than read from the plan.
         if unit == "file":
             return unit_file(run_dir(pkg_dir, config, invoked_as), Path(args.unit_file),
-                             Path(args.unit_result), compiler)
+                             Path(args.unit_result), compiler, use_cache=use_cache)
         return 0 if run_test_sh(run_dir(pkg_dir, config, invoked_as)) else 1
 
     all_passed = True
@@ -200,7 +200,7 @@ def cmd_test(args):
             # For test-only packages, run tests directly without building a binary
             print(f"📦 {config['package']['name']} (test-only)")
             if not run_tests(pkg_dir, config, compiler,
-                             run_dir=run_dir(pkg_dir, config, invoked)):
+                             run_dir=run_dir(pkg_dir, config, invoked), use_cache=use_cache):
                 all_passed = False
         else:
             # Normal package: build then test
@@ -220,7 +220,7 @@ def cmd_test(args):
                       file=sys.stderr)
                 all_passed = False
             elif not run_tests(pkg_dir, config, compiler,
-                               run_dir=run_dir(pkg_dir, config, invoked)):
+                               run_dir=run_dir(pkg_dir, config, invoked), use_cache=use_cache):
                 all_passed = False
 
     if keep_artifacts:
