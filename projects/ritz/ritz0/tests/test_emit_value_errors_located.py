@@ -463,6 +463,7 @@ def test_every_compiler_says_it_there(tmp_path, compiler):
 
 # The cause is the only error: before #4665 ritz1 also said the later fault
 # ("statement has no effect", "operand of `not` must be bool") at the place.
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
 def test_ritz1_names_only_the_cause(tmp_path, compiler):
     bad = []
