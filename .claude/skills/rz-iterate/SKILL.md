@@ -10,6 +10,39 @@ The `rz` room is a **coordinator only**. Rooms do the work and vouch for it; thi
 room picks the work, spawns rooms, merges their commits and keeps the pipeline
 full. It keeps looping until the goal at the bottom of this file is met.
 
+## Operating mode: go fast with optimistic speculative trains (Aaron, 2026-11-24)
+
+This is the default every turn. Aaron shouldn't have to ask for it again. The
+sections below give the mechanics; this is the policy they serve:
+
+1. **As much in parallel as the fleet holds.** Every turn, fill every free
+   slot on every ready host (see "Hosts") with `ready` tickets, and with
+   survey rooms when a milestone runs dry. **Draining** (no new spawns) only
+   when Aaron asks for it, and only until he lifts it.
+2. **Up to 8 cars per train.** The first train waits **60 s** after its last
+   car for more to join, then gates. The **second train** queues up to 8
+   cars behind the gating first train, stacked on its tail, then gates
+   speculatively on another host. A pass of a deeper train lands every
+   train below it ("Merge trains", `train.sh pending`).
+3. **New work starts from the back of the train**, not `origin/main`.
+   While a train is built, every new room is based on the deepest tail
+   (`train.sh tail`), so its car boards as `KEPT` ("Spawning a room").
+4. **Cars smoke-check, trains gate.** A room runs `smoke-plan.sh run`: smoke
+   plus every subsystem its commit touches, each in full. It never runs a full gate
+   unless it chooses to. The full gate runs once per train, on its tip.
+   `main` never moves without a full gate on the landed SHA.
+5. **Disjoint work rebases optimistically.** A room moved to a newer tail by
+   a clean rebase pushes it and stops: no re-check, no new REAP. The train
+   gate covers it. Only a rebase that conflicted or made the room change
+   code is re-checked and REAPed again ("Keep running rooms on the deepest
+   tail"). Never bounce a REAP because `main` moved: `build` cherry-picks it.
+6. **A red train is fixed in the train** (Reaping step 6, "Fix forward
+   first"). Name the culprit from the failing lines, hold the train's cars
+   with `train.sh fail` (trains behind it keep moving), and have the
+   culprit's room commit a fix on the red tail. The held cars and the fix
+   then board together. Innocent cars never go back to their rooms.
+   Bisect only when no culprit can be named.
+
 ## The loop
 
 Repeat until the goal is met:
@@ -403,8 +436,10 @@ on DeepSeek or crashes it with `[claude-code:unrecognized_model]
 `room.env`, a harness drop-in, and a `"model": "deepseek-flash"` entry for the
 room in `~/.adele/rooms.json` (the agent logs `Model: (stored, else CLI
 default)` and then the stored value). Clear all three (#203, 2026-11-23).
-Active hosts: omegalisk and huburght only (bangerang, toffee, chungus and
-starbux are out of rotation). huburght got its `~/.claude-bettercomp` copied
+Hosts in use for rooms (2026-11-24): omegalisk, huburght, starbux, toffee
+and chungus. Train gates run on huburght or bangerang, not omegalisk
+(Aaron, 2026-11-24: omegalisk's WSL on Windows 10 has no KVM, and the
+harland boot tests need it). huburght got its `~/.claude-bettercomp` copied
 from omegalisk on 2026-11-23.
 
 **"START poke sent" doesn't mean the room started.** Within ~2 minutes of
@@ -1257,7 +1292,40 @@ one to train 1.
    carrying the same subject, is corroboration only, never the proof; the
    host's `room rm` guard (which needs the branch intact) is the actual
    safety gate. The slot is free once the host answers `TORNDOWN`.
-6. **Gate fails: reason first, then bisect.** Read the failing lines
+6. **Gate fails: fix forward first** (Aaron, 2026-11-24: "If things fail
+   in the train, try to fix it in the train"). A flake (the failing test
+   passes on a rerun of the same tree, or the failure is a host setup
+   error) is re-gated once (`gate <k>`, or `gate --next <host>` after a
+   `discard`), not fixed. Otherwise:
+   1. **Name the culprit** from the failing lines, as in the paragraph
+      below: the car whose diff touches the failing test, file, compiler
+      stage or package. An **interaction failure** (no single car is
+      wrong, e.g. two cars each fine and together over a ratchet's budget)
+      names the pair.
+   2. **Hold the train:** `train.sh fail <log>`. It prints `HELD` for the
+      red train's cars and rebuilds every later train on the train below,
+      so the rest of the queue keeps gating and landing meanwhile. Bounce
+      each `DROPPED` tail's rooms as the paragraph below says.
+   3. **Ask for the fix on the red tail.** Send the culprit's room one
+      line: "fix forward on <red tail12>: `git fetch origin
+      rz-train/<red tail12> && git reset --hard FETCH_HEAD`, commit only
+      the fix on top (a new commit; don't amend your car), smoke-check it
+      and REAP the fix", with the gate's failing lines. Keep the red tail's
+      `rz-train/<tip12>` ref on origin until the fix is in: `fail` may
+      delete it, so re-push it first if it's gone (`git push origin
+      <tip>:refs/heads/rz-train/<tip12>`). For an interaction failure, or
+      a culprit room that's gone, file a ticket and spawn a fix room on
+      that tail instead.
+   4. **Board them together:** when the fix's REAP arrives, `build --next`
+      (a plain `build` when nothing is gating) with the HELD cars in their
+      old order, then the fix car, then the rest of the queue. The HELD
+      cars land unchanged; none goes back to its room.
+   5. **Fall back to ejecting** (below) when no culprit can be named, the
+      culprit's room says the fix isn't one small commit, no fix REAP has
+      come in 45 minutes, or the fixed train goes red again. Then the
+      HELD cars other than the culprit board without it.
+
+   **Reason first, then bisect** (the fallback). Read the failing lines
    (`train.sh wait` / `run-gate.sh --wait` prints them; a remote gate's
    whole log is the fetched `...@<host>.log`) against each car's diff
    (`git show --stat <car>`, then the hunks near the failure): which car
