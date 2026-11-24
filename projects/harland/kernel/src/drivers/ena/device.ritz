@@ -9,6 +9,8 @@ import io
 import klog { klog, klog_dec, klog_hex, klog_hex_width }
 import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
 import drivers.pci { PciDevice, pci_find_ena, pci_enable_bus_master, pci_enable_memory }
+import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count }
+import drivers.irq_wait { irq_wait_vector }
 import drivers.ena.regs {
     ENA_REGS_VERSION_OFF, ENA_REGS_VERSION_MAJOR_MASK, ENA_REGS_VERSION_MAJOR_SHIFT,
     ENA_REGS_VERSION_MINOR_MASK, ENA_REGS_CONTROLLER_VERSION_OFF,
@@ -23,7 +25,7 @@ import drivers.ena.regs {
     ENA_REGS_ACQ_CAPS_OFF, ENA_REGS_ACQ_CAPS_ENTRY_SIZE_SHIFT, ENA_REGS_AQ_DB_OFF,
     ENA_REGS_ACQ_TAIL_OFF, ENA_REGS_RESET_NORMAL,
     ENA_REGS_AENQ_BASE_LO_OFF, ENA_REGS_AENQ_BASE_HI_OFF, ENA_REGS_AENQ_CAPS_OFF,
-    ENA_REGS_AENQ_CAPS_ENTRY_SIZE_SHIFT
+    ENA_REGS_AENQ_CAPS_ENTRY_SIZE_SHIFT, ENA_REGS_INTR_MASK_OFF
 }
 import drivers.ena.admin {
     EnaAdminAqEntry, EnaAdminAcqEntry, EnaAdminGetFeatureCmd, EnaAdminCreateCqCmd,
@@ -45,7 +47,7 @@ import drivers.ena.io_desc {
     ENA_TX_DESC_SIZE, ENA_RX_DESC_SIZE, ENA_RX_CDESC_BASE_SIZE, ENA_TX_CDESC_EXT_SIZE,
     ena_tx_build_len_ctrl, ena_tx_build_meta_ctrl_simple, ena_rx_build_ctrl,
     ena_rx_cdesc_phase_matches, ena_rx_cdesc_get_length, ena_rx_cdesc_get_req_id,
-    ena_tx_cdesc_phase_matches
+    ena_tx_cdesc_phase_matches, ENA_INTR_UNMASK_MASK
 }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
 import mm.vmm { vmm_virt_to_phys, vmm_map_mmio, phys_to_virt }
@@ -79,6 +81,24 @@ const ENA_TX_ROOM_TIMEOUT_US: u64 = 1000000
 # Local constants to avoid module access issues
 const SQ_DIR_TX: u8 = 1
 const SQ_DIR_RX: u8 = 2
+
+# MSI-X (AGAST #4581). ENA signals the admin CQ and the AENQ on table entry
+# 0, the "management" vector; each I/O CQ signals on the entry its CreateCQ
+# names (msix_vector). Without MSI-X (or with too small a table) every CQ is
+# created on entry 0 with no table programmed, and the driver polls, as it
+# did before.
+pub const ENA_MSIX_ADMIN_ENTRY: u16 = 0
+pub const ENA_MSIX_TX_ENTRY: u16 = 1
+pub const ENA_MSIX_RX_ENTRY: u16 = 2
+const ENA_MSIX_ENTRIES: u16 = 3
+# Writing 0 to ENA_REGS_INTR_MASK unmasks the admin/AENQ interrupt; 1 masks it.
+const ENA_ADMIN_INTR_UNMASKED: u32 = 0
+# Each sleep lasts at most this many LAPIC ticks (bus clock / 16) before the
+# wait re-checks its queue (drivers/irq_wait.ritz). Admin waits use
+# virtio-blk's bound (a command takes far longer than a frame), RX waits
+# virtio-net's (~2 ms at 1 GHz), so the caller's own timers stay live.
+const ENA_ADMIN_WATCHDOG_TICKS: u32 = 0x00100000
+const ENA_RX_WAIT_TICKS: u32 = 0x00020000
 
 # ============================================================================
 # Admin Queue State
@@ -156,6 +176,16 @@ pub struct EnaDevice
 
 # Global device instance
 var ena_dev: EnaDevice
+
+# MSI-X state (AGAST #4581): the function's table, whether it is on, and the
+# IDT vector behind each entry (ENA_MSIX_*_ENTRY). Waits never park the
+# process: the queues have no lock across a wait, so a second caller would
+# share the admin queue or the RX ring mid-operation.
+var ena_msix: MsixInfo
+var ena_msix_on: bool = false
+var ena_msix_vectors: [3]u8
+var ena_irq_waits: u64 = 0
+var ena_irq_halts: u64 = 0
 
 # Pre-allocated RX/TX buffers
 var ena_rx_buffers: [16384]u8       # 8 * 2048 = 16KB
@@ -585,7 +615,16 @@ fn ena_admin_wait_completion(dev: *EnaDevice, cmd_id: u16) -> i32
     let aq: *EnaAdminQueue = @(*dev).admin_queue
 
     let deadline: u64 = deadline_after_us(ENA_ADMIN_TIMEOUT_US as u64)
+    # With MSI-X and IF=1 the wait sleeps on the management vector between
+    # checks (#4581); at boot (IF=0) it polls, since no interrupt can wake it.
+    let vec: u8 = ena_msix_vectors[ENA_MSIX_ADMIN_ENTRY as i32]
+    let sleep: bool = ena_msix_on and interrupts_enabled()
+    var waited: bool = false
     while not deadline_passed(deadline)
+        # Snapshot before the check: a completion landing after it ends the sleep
+        var seen: u64 = 0
+        if sleep
+            seen = msix_vector_count(vec)
         # Read memory barrier before checking completion
         read_barrier()
 
@@ -624,8 +663,14 @@ fn ena_admin_wait_completion(dev: *EnaDevice, cmd_id: u16) -> i32
                     klog(")\n")
                     return -(status as i32)
 
-        # Pause to avoid hammering the bus
-        cpu_pause()
+        if not sleep
+            # Pause to avoid hammering the bus
+            cpu_pause()
+            continue
+        if not waited
+            ena_irq_waits = ena_irq_waits + 1
+            waited = true
+        irq_wait_vector(vec, seen, ENA_ADMIN_WATCHDOG_TICKS, 1, false, @ena_irq_halts)
 
     klog("[ena] Admin command timeout (cmd_id=")
     klog_dec(cmd_id as i64)
@@ -821,7 +866,7 @@ fn ena_set_aenq_config(dev: *EnaDevice) -> i32
 # I/O Queue Setup
 # ============================================================================
 
-fn ena_create_cq(dev: *EnaDevice, qid: u16, depth: u16, direction: u8, cq_out: *EnaIoCq) -> i32
+fn ena_create_cq(dev: *EnaDevice, qid: u16, depth: u16, direction: u8, msix_entry: u16, cq_out: *EnaIoCq) -> i32
     klog("[ena] Creating CQ ")
     klog_dec(qid as i64)
     if direction == SQ_DIR_TX
@@ -870,7 +915,7 @@ fn ena_create_cq(dev: *EnaDevice, qid: u16, depth: u16, direction: u8, cq_out: *
     cmd.cq_caps_1 = 0x20  # Interrupt mode enabled mask
     cmd.cq_caps_2 = entry_size_words  # Entry size in words (TX=2, RX=4)
     cmd.cq_depth = depth
-    cmd.msix_vector = 0
+    cmd.msix_vector = msix_entry as u32
     cmd.cq_ba_lo = ((*cq_out).phys & 0xFFFFFFFF) as u32
     cmd.cq_ba_hi = (((*cq_out).phys >> 32) & 0xFFFF) as u16
     cmd.cq_ba_reserved = 0
@@ -881,7 +926,9 @@ fn ena_create_cq(dev: *EnaDevice, qid: u16, depth: u16, direction: u8, cq_out: *
     klog_dec(entry_size_words as i64)
     klog(" words (")
     klog_dec(entry_size_bytes)
-    klog(" bytes)\n")
+    klog(" bytes) msix_entry=")
+    klog_dec(msix_entry as i64)
+    klog("\n")
 
     var cqe: *EnaAdminAcqEntry = 0 as *EnaAdminAcqEntry
     let result: i32 = ena_admin_exec(dev, @cmd as *EnaAdminAqEntry, @cqe)
@@ -1001,11 +1048,63 @@ fn ena_create_sq(dev: *EnaDevice, qid: u16, cq_idx: u16, direction: u8, depth: u
 
     return 0
 
+# The MSI-X entry an I/O CQ is created on: its own with MSI-X on, else 0
+# (the device then signals nothing the driver listens to, and it polls).
+fn ena_cq_msix_entry(entry: u16) -> u16
+    if ena_msix_on
+        return entry
+    return 0
+
+# ============================================================================
+# MSI-X Setup (AGAST #4581)
+# ============================================================================
+
+# Put the ENA function in MSI-X mode: one IDT vector per entry
+# (ENA_MSIX_ENTRIES), entry 0 for admin + AENQ, then unmask the admin
+# interrupt. Runs after the admin queue is set up and before the first admin
+# command, so every command after it can sleep on the management vector.
+# Returns 0, or -1 with ena_msix_on false: the driver polls.
+fn ena_setup_msix(dev: *EnaDevice) -> i32
+    ena_msix_on = false
+    if msix_probe((*dev).pci_dev, @ena_msix) != 0
+        klog("[msix] ena: no MSI-X capability, polling\n")
+        return -1
+    if ena_msix.table_size < ENA_MSIX_ENTRIES
+        klog("[msix] ena: MSI-X table too small, polling\n")
+        return -1
+    var i: i32 = 0
+    while i < ENA_MSIX_ENTRIES as i32
+        ena_msix_vectors[i] = msix_vector_alloc()
+        if ena_msix_vectors[i] == 0
+            klog("[msix] ena: out of MSI-X vectors, polling\n")
+            return -1
+        i = i + 1
+    if msix_enable(@ena_msix) != 0
+        klog("[msix] ena: can't map the MSI-X table, polling\n")
+        return -1
+    i = 0
+    while i < ENA_MSIX_ENTRIES as i32
+        if msix_set_entry(@ena_msix, i as u16, ena_msix_vectors[i]) != 0
+            klog("[msix] ena: MSI-X entry not set, polling\n")
+            return -1
+        i = i + 1
+    ena_msix_on = true
+    ena_write32(dev, ENA_REGS_INTR_MASK_OFF, ENA_ADMIN_INTR_UNMASKED)
+    klog("[msix] ena: MSI-X on, vectors admin=")
+    klog_dec(ena_msix_vectors[0] as i64)
+    klog(" tx=")
+    klog_dec(ena_msix_vectors[1] as i64)
+    klog(" rx=")
+    klog_dec(ena_msix_vectors[2] as i64)
+    klog("\n")
+    return 0
+
 fn ena_setup_io_queues(dev: *EnaDevice) -> i32
     klog("[ena] Setting up I/O queues...\n")
 
     # Create TX CQ (queue 0)
-    var result: i32 = ena_create_cq(dev, 0, ENA_IO_QUEUE_DEPTH as u16, SQ_DIR_TX, @(*dev).tx_cq)
+    var result: i32 = ena_create_cq(dev, 0, ENA_IO_QUEUE_DEPTH as u16, SQ_DIR_TX,
+                                    ena_cq_msix_entry(ENA_MSIX_TX_ENTRY), @(*dev).tx_cq)
     if result != 0
         return result
 
@@ -1020,7 +1119,8 @@ fn ena_setup_io_queues(dev: *EnaDevice) -> i32
         return result
 
     # Create RX CQ (queue 1)
-    result = ena_create_cq(dev, 1, ENA_IO_QUEUE_DEPTH as u16, SQ_DIR_RX, @(*dev).rx_cq)
+    result = ena_create_cq(dev, 1, ENA_IO_QUEUE_DEPTH as u16, SQ_DIR_RX,
+                           ena_cq_msix_entry(ENA_MSIX_RX_ENTRY), @(*dev).rx_cq)
     if result != 0
         return result
 
@@ -1174,6 +1274,10 @@ pub fn ena_init() -> i32
     result = ena_admin_queue_init(@ena_dev)
     if result != 0
         return result
+
+    # MSI-X before the first admin command, so it can sleep on its vector.
+    # Failing leaves the driver polling, as before #4581.
+    ena_setup_msix(@ena_dev)
 
     # Get device attributes (includes MAC)
     result = ena_get_device_attributes(@ena_dev)
@@ -1390,6 +1494,47 @@ pub fn ena_poll(buf: *u8, max_len: u32) -> i32
     ena_cq_head_doorbell(@ena_dev, rx_cq)
 
     return copy_len as i32
+
+# True if the NIC signals through MSI-X (ena_setup_msix succeeded)
+pub fn ena_msix_enabled() -> bool
+    return ena_msix_on
+
+# The IDT vector behind MSI-X entry `entry` (ENA_MSIX_*_ENTRY), 0 without MSI-X
+pub fn ena_msix_vector(entry: u16) -> u8
+    if not ena_msix_on or entry >= ENA_MSIX_ENTRIES
+        return 0
+    return ena_msix_vectors[entry as i32]
+
+# Sleep until a frame arrives (the RX CQ's vector fires) or a short watchdog
+# runs out: what a receive loop does between ena_poll calls (via
+# netdev_wait_rx). Returns at once if a frame is already waiting. Returns
+# false, without waiting, when it can't sleep (no MSI-X, or IF=0): the caller
+# then delays. ENA masks a CQ's interrupt when it fires, so every wait
+# unmasks the RX CQ first (cq_interrupt_unmask_offset from its CreateCQ).
+pub fn ena_wait_rx() -> bool
+    if ena_dev.initialized == 0 or not ena_msix_on or not interrupts_enabled()
+        return false
+    let rx_cq: *EnaIoCq = @ena_dev.rx_cq
+    let vec: u8 = ena_msix_vectors[ENA_MSIX_RX_ENTRY as i32]
+    # Snapshot before unmasking and checking: a frame landing after either
+    # ends the sleep
+    let seen: u64 = msix_vector_count(vec)
+    if (*rx_cq).unmask_offset != 0
+        ena_write32(@ena_dev, (*rx_cq).unmask_offset, ENA_INTR_UNMASK_MASK)
+    read_barrier()
+    let cqe: *EnaRxCdescBase = ena_io_cq_entry_addr(rx_cq, (*rx_cq).head, ENA_RX_CDESC_BASE_SIZE) as *EnaRxCdescBase
+    if ena_rx_cdesc_phase_matches(cqe, (*rx_cq).phase)
+        return true
+    ena_irq_waits = ena_irq_waits + 1
+    irq_wait_vector(vec, seen, ENA_RX_WAIT_TICKS, 1, false, @ena_irq_halts)
+    return true
+
+# Waits that slept on a vector (admin and RX), and the hlts they slept in
+pub fn ena_irq_wait_count() -> u64
+    return ena_irq_waits
+
+pub fn ena_irq_halt_count() -> u64
+    return ena_irq_halts
 
 pub fn ena_is_ready() -> u8
     return ena_dev.initialized

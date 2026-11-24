@@ -82,8 +82,65 @@ pub fn klog_hex_prefix(n: u64) -> i32
 
 # Barriers become the fake device's clock: every MMIO write is followed by
 # memory_barrier(), so the emulated ENA gets to answer a doorbell.
+#
+# The CPU's IF flag, sti_hlt, the LAPIC watchdog and the wait queue that
+# drivers/irq_wait.ritz calls (extern) are stand-ins too (AGAST #4581): a hlt
+# is where the emulated ENA delivers what it holds back for an interrupt, and
+# the watchdog expires on its third check.
 IO_STUB = """\
-import fakeena { on_barrier }
+import fakeena { on_barrier, on_hlt }
+
+var g_if: bool = false
+var g_hlts: u64 = 0
+var g_wd_checks: i32 = 0
+var g_parks: u64 = 0
+
+pub fn fake_cpu_set_if(on: bool) -> i32
+    g_if = on
+    return 0
+
+pub fn fake_cpu_halts() -> u64
+    return g_hlts
+
+pub fn fake_waitq_parks() -> u64
+    return g_parks
+
+pub fn interrupts_enabled() -> bool
+    return g_if
+
+pub fn enable_interrupts() -> i32
+    g_if = true
+    return 0
+
+pub fn disable_interrupts() -> i32
+    g_if = false
+    return 0
+
+pub fn sti_hlt() -> i32
+    g_if = true
+    g_hlts = g_hlts + 1
+    on_hlt()
+    return 0
+
+pub fn lapic_watchdog_arm(ticks: u32) -> i32
+    g_wd_checks = 0
+    return 0
+
+pub fn lapic_watchdog_expired() -> bool
+    g_wd_checks = g_wd_checks + 1
+    return g_wd_checks >= 3
+
+pub fn lapic_watchdog_stop() -> i32
+    return 0
+
+# The ENA driver must never park: its queues have no lock across a wait.
+pub fn waitq_can_park() -> bool
+    return true
+
+pub fn waitq_park() -> i32
+    g_parks = g_parks + 1
+    on_hlt()
+    return 0
 
 pub fn cpu_pause() -> i32
     return 0
@@ -207,7 +264,7 @@ import drivers.ena.regs {
     ENA_REGS_ACQ_BASE_LO_OFF, ENA_REGS_ACQ_BASE_HI_OFF, ENA_REGS_AQ_DB_OFF,
     ENA_REGS_DEV_CTL_OFF, ENA_REGS_DEV_STS_OFF,
     ENA_REGS_DEV_CTL_DEV_RESET_MASK, ENA_REGS_DEV_STS_READY_MASK,
-    ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK
+    ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK, ENA_REGS_INTR_MASK_OFF
 }
 import drivers.ena.admin {
     ENA_ADMIN_GET_FEATURE, ENA_ADMIN_SET_FEATURE, ENA_ADMIN_CREATE_CQ,
@@ -237,6 +294,79 @@ var g_last_tx_db: u32 = 0
 # device answers admin doorbells at all (false: every command times out).
 var g_admin_status: u8 = 0
 var g_admin_hold: bool = false
+# MSI-X (AGAST #4581), absent unless fake_msix_present(true). The table has
+# 4 entries; vectors 64..79 are counted when the entry naming them fires.
+# Each CreateCQ's msix_vector is kept by hardware CQ index. Enabling MSI-X
+# masks the admin interrupt (INTR_MASK = 1), as at reset; the driver unmasks
+# it by writing 0. In irq-only mode the device answers an admin doorbell only
+# while the CPU sleeps in sti_hlt, and only with the admin interrupt
+# unmasked: a driver that spins never sees the reply. A frame queued with
+# fake_rx_on_irq arrives the same way, and only once the driver has written
+# the RX CQ's unmask register; firing masks it again, as ENA does.
+var g_msix_present: bool = false
+var g_msix_on: bool = false
+var g_entry_vec: [4]u8
+var g_irqs: [16]u64
+var g_cq_msix: [8]u32
+var g_rx_cq_hw: u16 = 0
+var g_admin_irq_only: bool = false
+var g_rx_held: bool = false
+var g_rx_held_req: u16 = 0
+var g_rx_held_len: u16 = 0
+
+pub fn fake_msix_present(on: bool) -> i32
+    g_msix_present = on
+    return 0
+
+pub fn fake_msix_is_present() -> bool
+    return g_msix_present
+
+pub fn fake_msix_enable() -> i32
+    g_msix_on = true
+    wr32(ENA_REGS_INTR_MASK_OFF, 1)
+    return 0
+
+pub fn fake_msix_is_on() -> bool
+    return g_msix_on
+
+pub fn fake_msix_set_entry(entry: u16, vector: u8) -> i32
+    if entry < 4
+        g_entry_vec[entry as i32] = vector
+    return 0
+
+pub fn fake_msix_entry_vector(entry: u16) -> u8
+    if entry >= 4
+        return 0
+    return g_entry_vec[entry as i32]
+
+pub fn fake_msix_count(vector: u8) -> u64
+    if vector >= 64 and vector < 80
+        return g_irqs[(vector - 64) as i32]
+    return 0
+
+pub fn fake_cq_msix_vector(hw: u16) -> u32
+    return g_cq_msix[hw as i32]
+
+pub fn fake_admin_intr_mask() -> u32
+    return rd32(ENA_REGS_INTR_MASK_OFF)
+
+pub fn fake_admin_irq_only(on: bool) -> i32
+    g_admin_irq_only = on
+    return 0
+
+pub fn fake_rx_on_irq(req_id: u16, length: u16) -> i32
+    g_rx_held = true
+    g_rx_held_req = req_id
+    g_rx_held_len = length
+    return 0
+
+# Fire MSI-X table entry `entry`, if MSI-X is on and the entry is programmed.
+fn raise_entry(entry: u32)
+    if not g_msix_on or entry >= 4
+        return
+    let v: u8 = g_entry_vec[entry as i32]
+    if v >= 64 and v < 80
+        g_irqs[(v - 64) as i32] = g_irqs[(v - 64) as i32] + 1
 
 pub fn fake_admin_status(status: u8) -> i32
     g_admin_status = status
@@ -312,6 +442,7 @@ fn service()
         let ba: u64 = (hi << 32) | lo
         let hw: u16 = g_next_cq
         g_next_cq = g_next_cq + 1
+        g_cq_msix[hw as i32] = *((cmd + 8) as *u32)
         *((cqe + 8) as *u16) = hw
         *((cqe + 10) as *u16) = cq_depth
         *((cqe + 12) as *u32) = 0
@@ -320,6 +451,7 @@ fn service()
         if (caps2 & 0x1F) == 4
             g_rx_cq_base = ba
             g_rx_cq_depth = cq_depth
+            g_rx_cq_hw = hw
         else if (caps2 & 0x1F) == 2
             g_tx_cq_base = ba
             g_tx_cq_depth = cq_depth
@@ -358,7 +490,7 @@ fn post_tx_complete()
 
 pub fn on_barrier() -> i32
     let sq: u64 = rd_addr(ENA_REGS_AQ_BASE_LO_OFF, ENA_REGS_AQ_BASE_HI_OFF)
-    if sq != 0 and not g_admin_hold
+    if sq != 0 and not g_admin_hold and not g_admin_irq_only
         let db: u32 = rd32(ENA_REGS_AQ_DB_OFF)
         if db != g_last_db
             g_last_db = db
@@ -374,6 +506,27 @@ pub fn on_barrier() -> i32
         wr32(ENA_REGS_DEV_STS_OFF, ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK)
     else
         wr32(ENA_REGS_DEV_STS_OFF, ENA_REGS_DEV_STS_READY_MASK)
+    return 0
+
+# The CPU sleeps: deliver what was held back for an interrupt. An admin reply
+# needs the admin interrupt unmasked and fires entry 0; a held frame needs
+# the RX CQ unmasked, fires the RX CQ's entry and masks it again.
+pub fn on_hlt() -> i32
+    let sq: u64 = rd_addr(ENA_REGS_AQ_BASE_LO_OFF, ENA_REGS_AQ_BASE_HI_OFF)
+    if g_admin_irq_only and not g_admin_hold and sq != 0 and g_msix_on
+        if (rd32(ENA_REGS_INTR_MASK_OFF) & 1) == 0
+            let db: u32 = rd32(ENA_REGS_AQ_DB_OFF)
+            if db != g_last_db
+                g_last_db = db
+                service()
+                raise_entry(0)
+    if g_rx_held and g_msix_on
+        let unmask_off: u32 = 0x500 + g_rx_cq_hw as u32
+        if (rd32(unmask_off) & 0x40000000) != 0
+            g_rx_held = false
+            post_rx_complete(g_rx_held_req, g_rx_held_len)
+            wr32(unmask_off, 0)
+            raise_entry(g_cq_msix[g_rx_cq_hw as i32])
     return 0
 
 # Post an RX completion the way the device would: status phase bit, then
@@ -394,6 +547,51 @@ pub fn post_rx_complete(req_id: u16, length: u16) -> i32
     return 0
 """
 
+# drivers/msix.ritz (AGAST #4581): the table lives in the emulated ENA.
+MSIX_STUB = """\
+import drivers.pci { PciDevice }
+import fakeena { fake_msix_is_present, fake_msix_enable, fake_msix_set_entry, fake_msix_count }
+
+pub struct MsixInfo
+    dev: *PciDevice
+    cap: u8
+    table_bar: u8
+    table_size: u16
+    table_offset: u32
+    table_virt: u64
+
+var g_msix_next: u8 = 64
+
+pub fn msix_probe(dev: *PciDevice, out: *MsixInfo) -> i32
+    (*out).dev = dev
+    (*out).table_virt = 0
+    if not fake_msix_is_present()
+        return -1
+    (*out).table_size = 4
+    return 0
+
+pub fn msix_enable(info: *MsixInfo) -> i32
+    fake_msix_enable()
+    (*info).table_virt = 1
+    return 0
+
+pub fn msix_vector_alloc() -> u8
+    if g_msix_next >= 80
+        return 0
+    let v: u8 = g_msix_next
+    g_msix_next = g_msix_next + 1
+    return v
+
+pub fn msix_set_entry(info: *MsixInfo, entry: u16, vector: u8) -> i32
+    if (*info).table_virt == 0 or entry >= (*info).table_size
+        return -1
+    fake_msix_set_entry(entry, vector)
+    return 0
+
+pub fn msix_vector_count(vector: u8) -> u64
+    return fake_msix_count(vector)
+"""
+
 STUBS = {
     "serial.ritz": SERIAL_STUB,
     "klog.ritz": KLOG_STUB,
@@ -402,9 +600,11 @@ STUBS = {
     "drivers/pci.ritz": PCI_STUB,
     "mm/pmm.ritz": PMM_STUB,
     "mm/vmm.ritz": VMM_STUB,
+    "drivers/msix.ritz": MSIX_STUB,
     "fakeena.ritz": FAKEENA_STUB,
 }
 REAL = [
+    "drivers/irq_wait.ritz",
     "drivers/ena/device.ritz",
     "drivers/ena/admin.ritz",
     "drivers/ena/regs.ritz",
