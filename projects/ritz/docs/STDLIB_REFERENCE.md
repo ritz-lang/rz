@@ -1143,7 +1143,7 @@ formatting surface below.
 | `fmt_i64_into` | `fn(buf: *u8, n: i64) -> i64` | Decimal with `-` when negative; needs 20 bytes |
 | `fmt_u64_into` | `fn(buf: *u8, n: u64) -> i64` | Unsigned decimal; needs 20 bytes |
 | `fmt_u64_hex_into` | `fn(buf: *u8, n: u64) -> i64` | Lowercase hex, no `0x`, no leading zeros; needs 16 bytes |
-| `fmt_u64_radix_into` | `fn(buf: *u8, n: u64, radix: u64, upper: i32) -> i64` | Base 2..16, `upper != 0` for `A`..`F`; needs 64 bytes |
+| `fmt_u64_radix_into` | `fn(buf: *u8, n: u64, radix: u64, upper: bool) -> i64` | Base 2..16, `upper` for `A`..`F`; needs 64 bytes |
 
 ```ritz
 import ritzlib.fmt.digits
