@@ -54,7 +54,7 @@ The assembly stubs are already wider than those Ritz tests. `SWAPGS_IF_USER` and
 
 1. One driver privilege level: CPL 1, DPL-1 non-conforming code and a DPL-1 data segment, a ring-1 stack in the iret frame, and an iret return to that RPL.
 2. Any non-zero CPL is a process for the timer, for faults, and for console Ctrl-C. CPL 0 stays non-preemptible and a kernel fault still panics.
-3. One waitable device interrupt: the existing `BLOCK_IRQ` park. The kernel owns the IDT and the LAPIC EOI.
+3. One waitable device interrupt, scoped to that device's IRQ object. The kernel owns the IDT and the LAPIC EOI. In-kernel drivers keep `BLOCK_IRQ`.
 4. MMIO and DMA mappings into that process only, under new syscall numbers past the live ABI. A private translated DMA domain is installed before the driver may program queue addresses or bus-master the NIC.
 5. A portable SPSC frame ring. Harland maps it and wakes with the scheduler. The publication rule is `seq_cst` atomics, which Linux and Win64-on-ARM can honor.
 6. virtio-net queues, BAR access, RX/TX, and the MAC/link record move into the ring-1 process. `NetInfo` (224) copies that record. The device process is authorized with capabilities, the same table `FbMap` already checks.
@@ -203,12 +203,12 @@ Processes run on the BSP only (`sched.ritz`: APs halt after the syscall-stack se
 1. Mask the device's MSI-X table entries through the kernel mapping. The process never receives that table.
 2. Through the kernel's existing `vmm_map_mmio` window, write virtio status 0. That write starts the reset. The kernel then reads status until it is 0, bounded by `VIRTIO_RESET_TIMEOUT_US` (100 ms). That constant lives with the virtio code. It is not `VTD_TIMEOUT_US`, which is private to `vtd.ritz`. A 0 readback is the completion Virtio 1.2 requires before the device may be treated as idle. The kernel BAR map outlives the Proc. Queues are not left `DRIVER_OK` with no owner.
 3. Invalidate every IOVA in this requester's DMA domain and wait for the IOTLB invalidation to finish. The domain is the device's access. Clearing a CPU page table does not revoke it.
-4. Invalidate the kernel link snapshot (section 7). Clear `driver_registered` and the kernel's pointer at the shared region. Do not write the shared `NetInfo`. The driver was its only writer, and the pages are about to go away.
-5. Wake the frame endpoint's one waiter. Do not call `proc_wake` on a shared reason. The consumer's recheck then observes "no driver" and does not sleep, and does not load a ring pointer. On this one CPU the consumer is not running during exit: CPL 0 is not preempted, so the wake only marks it runnable.
+4. Invalidate the kernel link snapshot (section 7). Clear `driver_registered`. Do not write the shared `NetInfo`. The driver was its only writer. Retire the frame object's identity. Do not free its pages here.
+5. Latch `DRIVER_GONE` on that retired object id and wake the frame endpoint's one waiter with `ShmWait`. Do not call `proc_wake` on a shared reason. The consumer's recheck observes driver death as that event. It does not treat a later object's generation 2 as this object. On this one CPU the consumer is not running during exit: CPL 0 is not preempted, so the wake only marks it runnable.
 
 `vmm_free_pml4` then frees the shared ring and any DMA run whose reset completed and whose invalidation completed. Those leaves are not `PTE_DEVICE`. `driver_quiesce` does not call `dma_free_pages`, and `DrvDmaAlloc` does not insert the same frames into `dma_regions`. A second free would hand the PMM a page it has already taken back. `PTE_DEVICE` stays on the MMIO leaves, so `vmm_free_user_pt` does not free a device frame.
 
-If the status readback does not return 0, or the IOTLB invalidation does not complete, those queue and packet pages are not returned to the PMM. `vmm_free_user_pt` frees every present user leaf that lacks `PTE_DEVICE`, so a list by itself does not save them. Before `vmm_free_pml4`, `driver_quiesce` records each such frame on `dma_quarantine` and sets `PTE_DEVICE` on its user leaf. The free walk then skips it. The list owns the frame until reboot. Pages whose reset and invalidation both finished keep `PTE_DEVICE` clear and are freed once. The shared frame rings are not in the device domain, so they are not marked and they are still freed once the consumer has dropped its pointer.
+If the status readback does not return 0, or the IOTLB invalidation does not complete, those queue and packet pages are not returned to the PMM. `vmm_free_user_pt` frees every present user leaf that lacks `PTE_DEVICE`, so a list by itself does not save them. Before `vmm_free_pml4`, `driver_quiesce` records each such frame on `dma_quarantine` and sets `PTE_DEVICE` on its user leaf. The free walk then skips it. The list owns the frame until reboot. Pages whose reset and invalidation both finished keep `PTE_DEVICE` clear and are freed once. The shared frame rings are not in the device domain, so they are not marked `PTE_DEVICE`. `vmm_free_user_pt` does not free them either. The shared object in section 6 owns those pages.
 
 `NetInfo` then returns `Errno.NoDev` (-19). That is the same result as "no driver has registered". A zeroed struct with `link_up = 0` would look like a NIC. The kernel does not synthesize `link_up = 0` with a remembered MAC. Quiesce is the device side of "link down". `Errno.NoDev` is the userspace side.
 
@@ -218,12 +218,19 @@ Syscall `DrvIrqWait` = 220. The argument is a `CAP_TYPE_IRQ` handle. The handler
 
 ```ritz
 disable_interrupts()
-lapic_watchdog_arm(VIRTIO_NET_RX_WAIT_TICKS)   # 0x00020000, one round
-waitq_park()                                   # proc_block(BLOCK_IRQ, 0); sched_block
-lapic_watchdog_stop()
+if irq_object.latched != irq_object.seen
+    irq_object.seen = irq_object.latched
+    enable_interrupts()
+    return 0
+irq_object.deadline = now + device_deadline
+park_on(irq_object)                            # this object only, not BLOCK_IRQ
 enable_interrupts()
 return 0
 ```
+
+Decided. `DrvIrqWait` parks on that device's own latched generation and deadline, and an interrupt for a different device does not complete it.
+
+The latch is per `CAP_TYPE_IRQ` object. The MSI-X handler for this device's vector increments `latched` and wakes only the waiter registered on this object. NVMe, the timer, and any other vector do not. An interrupt that arrives before the park is still observed, because the handler latches it and the wait returns before parking when `latched != seen`. The deadline lives on this object. `sched_tick` wakes the object whose deadline has passed and does not wake any other device wait. This syscall does not call `lapic_watchdog_arm` or `lapic_watchdog_stop`. The in-kernel `irq_wait_vector` path keeps that shared watchdog. Two device waits therefore cannot clear each other's timeouts.
 
 `waitq_park` is entered and left with interrupts off. `VIRTIO_NET_RX_WAIT_TICKS` is the bound `virtio_net_wait_rx` already passes to `irq_wait_vector` with `max_rounds` 1 (`drivers/virtio/net.ritz`). The driver re-reads the used ring and the TX ring after every return, including a watchdog wake, then parks again if both are idle.
 
@@ -253,6 +260,9 @@ Numbers sit past the last userspace ABI group. Framebuffer is 210–211. Debug i
 | 225 | `NetAddr` | user pointer | 0, or `Errno.NoDev` / `Errno.Fault` |
 | 226 | `NetPublish` | `CAP_TYPE_SHM` handle | 0, or `Errno.Perm` / `Errno.Again` |
 | 227 | `ShmMap` | `CAP_TYPE_SHM` handle | user VA, or a negative errno |
+| 228 | `NetAttach` | none | app `CAP_TYPE_SHM` handle, or a negative errno |
+| 229 | `ShmWait` | `CAP_TYPE_SHM` handle, event mask, deadline | observed events, or `Errno.Again` |
+| 230 | `ShmNotify` | `CAP_TYPE_SHM` handle, event | 0, or `Errno.Perm` |
 
 60 and 61 are not in this table. `numbers.ritz` keeps them free for their Linux meanings, which is why `Sync` is 162 (AGAST #4321). `net_ping` is not given a number.
 
@@ -266,7 +276,7 @@ Virtio capability ranges are byte-sized and can share a page. `vio_find_mmio_cap
 
 `DrvDmaAlloc` and `DrvRingKick` take the device's `CAP_TYPE_IRQ` handle. That handle is what used to be proposed as a process-wide driver bit. The bytes at `0x0300` in the shared region are a convenience copy of the window list and the MSI-X indexes. The page is writable because it also holds the rings, so those bytes are advisory. Overwriting them does not change what `DrvMmioMap` maps.
 
-`DrvDmaAlloc` zeroes each page before the bytes are reachable from the device or from the process. A failure halfway through unmaps and frees the pages this call already installed, and does not publish their IOVAs.
+`DrvDmaAlloc` zeroes each page before the bytes are reachable from the device or from the process. A failure halfway through unmaps every page this call already installed. Any IOVA already entered in the domain is treated as reachable even though the syscall never copied it out. The kernel removes that IOVA and waits for the IOTLB invalidation before the page returns to the PMM. If the invalidation does not finish, the page is recorded on `dma_quarantine` with `PTE_DEVICE` set and is not returned. That is the same rule as exit.
 
 Pages are mapped at `DRV_MMIO_BASE` = `0x7E8000000000` (PML4[253]), bumping a per-process cursor inside that 512 GiB slot. PML4[254] is the framebuffer (`0x7F0000000000`). PML4[255] is the user stack. Flags passed to `vmm_map_page`, which ORs `PTE_PRESENT` itself:
 
@@ -282,7 +292,7 @@ No `PTE_CACHE_DISABLE`, no `PTE_WRITE_THROUGH`, no `PTE_DEVICE`. The pages are P
 
 ### DMA domain
 
-Write access to virtio queue-address registers lets the NIC DMA wherever its requester is allowed to. CPU page tables do not constrain that. `vtd.ritz` never sets TE, and `amdvi.ritz` builds device-table entries as DMA pass-through. The cutover therefore installs a private translated domain for this requester before bus mastering is enabled for the driver and before any page that contains a queue-address register is mapped into the process.
+Write access to virtio queue-address registers lets the NIC DMA wherever its requester is allowed to. CPU page tables do not constrain that. `vtd.ritz` never sets TE, and `amdvi.ritz` builds device-table entries as DMA pass-through. The cutover therefore installs a private translated domain for this requester before bus mastering is enabled for the driver and before any page that contains a queue-address register is mapped into the process. Translation enable is per remapping unit, so the kernel first installs a context for every other requester that unit names. virtio-blk and NVMe stay in the kernel on the translating MSI-X boot and keep an identity context, including the firmware RMRR or IVMD regions those devices already require. The NIC's context is the private domain only. The NIC is not put in the identity map. Bus mastering for the NIC stays off, and the queue-register grant stays unmapped, until that private context is live and every DMA alias of the requester is named. The current virtio probe enables bus mastering before it discovers modern capabilities. On this boot the NIC's bus-master bit is not set until isolation is confirmed. Storage devices that are already bus-mastering keep working because their contexts exist before TE is set. A requester alias that cannot be named refuses the NIC's bus master and the queue-register grant. The existing storage and NIC assertions stay on this boot.
 
 The requester is PCI segment and device identity, `segment << 16 | bus:dev.fn`, plus the DMA aliases the DMAR or IVRS table names for it. A unit that cannot translate, or a requester that cannot be named, refuses the cutover. Virtio stays in the kernel on that boot, and `virtio_net_init` stays in the tree for as long as untranslated boots are supported. Both owners are maintained. `\harland\net-selftest` without an IOMMU keeps the in-kernel path.
 
@@ -294,11 +304,11 @@ The translating boot is a second run of `test_msix_boot.sh`, in CI, added with t
 -device virtio-net-pci,disable-legacy=on,iommu_platform=on
 ```
 
-The ring-1 driver negotiates `VIRTIO_F_ACCESS_PLATFORM` (feature bit 33). Without the flag and the bit, the device DMAs to guest-physical addresses and a domain walk can pass while proving nothing. The acceptance check is a fault from the IOMMU when the device is given an IOVA outside the domain. A walk that merely shows the framebuffer unmapped is not that check.
+The ring-1 driver negotiates `VIRTIO_F_ACCESS_PLATFORM` (feature bit 33). Without the flag and the bit, the device DMAs to guest-physical addresses and a domain walk can pass while proving nothing. Decided. Translation enable installs a context for every requester on the unit, virtio-blk and NVMe keep identity contexts, the NIC stays bus-master-off until its private context and aliases are live, a partial `DrvDmaAlloc` invalidates or quarantines every installed IOVA before the page returns to the PMM, and acceptance is a successful DMA into a granted page plus a fault attributed to the NIC. A domain walk is supplementary and is not the acceptance check.
 
-The domain maps only the granted queue pages and the packet pages from `DrvDmaAlloc`. The frame rings, the framebuffer, kernel RAM, and every other device's buffers are absent. Device permission on those IOVAs is read-write. The mapping lives until `driver_quiesce` invalidates it. The acceptance check is that the NIC writes an allocated buffer, and a walk of the domain shows the framebuffer and a kernel page have no mapping.
+The domain maps only the granted queue pages and the packet pages from `DrvDmaAlloc`. The frame rings, the framebuffer, kernel RAM, and every other device's buffers are absent. Device permission on those IOVAs is read-write. The mapping lives until `driver_quiesce` invalidates it.
 
-The shared ring is not allocated through `DrvDmaAlloc` and is not entered in the domain. The kernel allocates it at spawn with `pmm_alloc_contig`, maps it user at `DRV_RING_BASE` = `0x7D8000000000` (PML4[251]) with the DMA leaf flags (write-back, user, NX, not `PTE_DEVICE`), and reads it through the physmap. One physical run, two CPU views. The physmap is not a second owner of the frames. `vmm_free_pml4` is the one `pmm_free_page` of those leaves, and only after `driver_quiesce` has cleared the kernel pointer and finished the domain invalidation.
+The shared ring is not allocated through `DrvDmaAlloc` and is not entered in the domain. The kernel allocates it at spawn with `pmm_alloc_contig` and maps non-owning leaves at `DRV_RING_BASE` = `0x7D8000000000` (PML4[251]) with the DMA leaf flags (write-back, user, NX, not `PTE_DEVICE`). The kernel reads the same pages through the physmap. The physmap view is not an owner and is not a mapping that keeps the object alive. The shared object owns the frames.
 
 `USER_MMAP_END` is `0x7FFFFFF00000`, above these windows, and `mmap_cursor_pick` will occupy a present page only by skipping it. `sys_mmap_impl` and `sys_munmap_impl` both reject any range that overlaps `[DRV_RING_BASE, USER_STACK_BASE)`, including a request that starts below the window and runs into it. A `MAP_FIXED` request there returns `Errno.Inval`. `sys_munmap_impl` today frees any page-aligned address inside `[USER_MMAP_START, USER_MMAP_END)`, and these windows sit in that span, so the overlap check is the change. The framebuffer address stays where it is.
 
@@ -358,7 +368,7 @@ A full ring stalls that direction's producer until `read_idx` advances. It does 
 - RX. The driver does not take the virtio used element, and does not replenish that descriptor, until the RX ring has a free slot. The frame stays on the device queue. While it waits it keeps draining TX, so a full RX ring still reclaims send buffers and still completes the device's used ring. Each time the ring is still full it calls `Yield` (syscall 24). `sched_yield` switches even when `sched_running` is 0, which is the window before `sched_start`, where the timer does not preempt. The driver does not park on the frame endpoint. A `cli` spin would deadlock: the consumer cannot run while the producer holds the CPU with interrupts off.
 - TX, while the kernel holds the seat. The kernel send does not return success while the TX ring is full. With interrupts disabled it rechecks `read_idx`. While the ring is full and `driver_registered` is set, it wakes the driver pid and `sched_yield`. `proc_pick_next` returns the first runnable slot after the current one, so the wake has to happen before the yield or the yield finds only pid 1 and returns. The driver drains TX and blocks again in `DrvIrqWait`. The yield returns with interrupts still off, because `sched_yield` restores the caller's IF and the caller had cleared it. The send then rechecks. Success is the `atomic_store` of `write_idx` after a free slot was observed. If `driver_registered` is clear, the send returns `Errno.NoDev` and does not count as a transmitted packet. A CPL-0 spin on `read_idx` without yielding never runs the driver, so that is not the wait. The ring-2 service, which is both consumer and producer, does not block itself on this wait. Its pending-send cap is in `RING2_NET.md`.
 
-The frame ring has one registered waiter, the current RX consumer. `proc_wake(reason)` in `proc/table.ritz` marks every `PROC_BLOCKED` process with that reason runnable. The frame path does not call it. A kick, a deadline, and `driver_quiesce` wake that one pid. A second waiter, including a later app attachment, is a different endpoint. `BLOCK_IRQ` stays the device park in section 4, and this cutover has one driver on it.
+The frame ring has one registered waiter, the current RX consumer. `proc_wake(reason)` in `proc/table.ritz` marks every `PROC_BLOCKED` process with that reason runnable. The frame path does not call it. A kick, a deadline, and `driver_quiesce` wake that one pid. A second waiter, including a later app attachment, is a different endpoint. The device park is the per-device IRQ object in section 4. `BLOCK_IRQ` stays the in-kernel wait. This cutover's userspace driver does not share it with NVMe.
 
 A kick that lands after an empty check and before `proc_block` is overwritten by the block, and `sched_block` then sleeps on a ring that already holds a frame. The RX consumer uses the same section `wait_for_child` uses, and the same one `irq_wait_vector` uses before `waitq_park`, and it also leaves when its deadline passes:
 
@@ -375,9 +385,13 @@ fn take_rx(ctrl: *SpscCtrl, deadline: u64) -> RxWait
     while driver_registered and not deadline_passed(deadline)
         let w = atomic_load(@ctrl.write_idx)
         let r = atomic_load(@ctrl.read_idx)
+        if w < r
+            enable_interrupts()
+            endpoint_fail(ctrl)
+            return NoDriver
         if w - r > 256
             enable_interrupts()
-            kill_device_owner()
+            endpoint_fail(ctrl)
             return NoDriver
         if w == r
             block_on_frame_endpoint(deadline)
@@ -402,9 +416,11 @@ fn take_rx(ctrl: *SpscCtrl, deadline: u64) -> RxWait
 
 `RxWait` is the kernel function's result. It is not a syscall return, and it is not `1`, `0`, and `-1`, which collide with an errno. `Frame` means a slot was copied for dispatch. A rejected slot stores `read_idx` past itself and continues the wait. It does not return `Frame`. `Timeout` is a quiet link: the caller rechecks its window. `NoDriver` means the owner is gone.
 
-An occupancy above 256 is the producer writing a `write_idx` the ring cannot hold. The consumer does not walk it and does not advance `read_idx` across it, because there is no honest slot to skip to. On the RX ring that producer is the device owner, so the consumer kills that process and `driver_quiesce` runs. The ring does not stay wedged under a live driver. On the TX ring the producer is whoever holds the seat. While that is pid 1, a bad occupancy is a kernel bug and the send path stops and logs. It does not kill init. Once the service holds the seat, a bad TX occupancy kills the service and runs the frame-seat fault path in `RING2_NET.md`.
+Indexes are monotonic `u64` values and do not wrap. Ritz traps on a wrapping subtract, so the consumer compares before it subtracts. Decided. A frame object is retired and the peer acks at a slot boundary before a replacement is used, another process is torn down only by `process_mark_exit` which refuses pid 1 and is not `process_kill_current`, and a backwards index is rejected before any subtraction. A pair near the top of the `u64` range is legal when `w >= r` and `w - r` is at most 256. An occupancy above 256 closes the endpoint the same way.
 
-`sched_tick` wakes the frame endpoint when that deadline has passed. It still wakes `BLOCK_IRQ` only for the device watchdog. The copy finishes before the next park. The consumer does not resume a copy after a wake that sees `driver_registered` clear. `driver_quiesce` wakes the frame endpoint so a consumer blocked in the DHCP window takes the empty recheck and leaves. A quiet link, including one that goes silent after DHCP, returns `Timeout` instead of sleeping until a frame that is not coming.
+`endpoint_fail` closes the ring endpoint and stops using it. It does not call `process_kill_current`, because that helper exits the caller and would exit pid 1 when the kernel seat is the consumer. When the producer is some other pid, the kernel marks that pid with `process_mark_exit`. The scheduler does not resume a marked pid. Teardown of its mappings and DMA runs later on the kernel stack as that pid's exit, which is the same `driver_quiesce` or service-exit path, not the caller's exit. `process_mark_exit` refuses pid 1. A bad TX occupancy while the kernel holds the seat stops and logs. A bad occupancy while the service holds the seat marks the service and closes the endpoint. The ring does not stay wedged, and the caller's process is not the one that exits.
+
+`sched_tick` wakes the frame endpoint when that deadline has passed. It still wakes `BLOCK_IRQ` only for the in-kernel watchdog. The userspace device wait is not that reason. The copy finishes before the next park. The consumer does not resume a copy after a wake that sees `driver_registered` clear. `driver_quiesce` wakes the frame endpoint so a consumer blocked in the DHCP window takes the empty recheck and leaves. A quiet link, including one that goes silent after DHCP, returns `Timeout` instead of sleeping until a frame that is not coming.
 
 Before any copy or dispatch the consumer checks the peer's words. DMA isolation does not make them trustworthy: the driver still has the shared CPU mapping.
 
@@ -438,23 +454,61 @@ OS mapping of that same layout:
 
 | OS | Share | Wake |
 |---|---|---|
-| Harland | PMM pages. `CAP_TYPE_SHM` names the region. `ShmMap` (227) maps it. The kernel grants that capability and calls the same map path at spawn, into the driver CR3 at `DRV_RING_BASE`. A later attach, including a ring-3 app, uses `ShmMap` again. Kernel reads the physmap. `CapRevoke` (41) drops the handle and the mapping. | Device: `DrvIrqWait` parks `BLOCK_IRQ`; the ISR and a TX publish wake the driver pid. Frames: `DrvRingKick` wakes the frame endpoint's one waiter. The shared `wake` `u32` is still incremented so the bytes match the other ports. No futex, no memfd. |
+| Harland | PMM pages owned by the `ShmObject`, not by either PML4. `CAP_TYPE_SHM` names the object. `ShmMap` (227) adds a non-owning leaf. A second map of the same object increments the mapping count and allocates nothing. `CapRevoke` drops the caller's handle and, when that process has no handle left, unmaps only that process. | Device: `DrvIrqWait` parks on that IRQ object. Frames: `ShmNotify` after the index store. `DrvRingKick` remains the kernel-seat RX wake and requires `CAP_TYPE_IRQ`. The shared `wake` `u32` is still incremented so the bytes match the other ports. No futex, no memfd. |
 | Linux | `memfd_create` + `mmap(MAP_SHARED)`. The fd crosses processes with `SCM_RIGHTS`, the mechanism `projects/zeus/src/main.ritz` already uses for a different layout. | `FUTEX_WAIT` / `FUTEX_WAKE` on the `u32` at `wake`. Not `FUTEX_PRIVATE`: the word is cross-process, which Zeus already requires. |
 | Win64 | A pagefile-backed section, `MapViewOfFile`. The event handle crosses processes with `DuplicateHandle`. | A shared event, plus a recheck of the index after the wait returns. `WakeByAddressSingle` and `WaitOnAddress` are process-local and are not the wake. |
 
 No Win64 code. The Harland wake word is still updated with `atomic_fetch_add` so a later port waits on the same bytes. The add is on the `u32`.
 
-The kernel is the RX consumer and the TX producer until the ring-2 service takes that seat. Replacement is a change of who maps the consumer side, not a change of `FrameDesc`. The service then owns the address record. The kernel releases its own lease with DHCPRELEASE and does not copy it into that page. Frames the in-kernel consumer does not handle keep today's behavior, in `handle_ipv4_packet` and `handle_udp_packet`: TCP returns 0, UDP only DHCP. This slice does not grow that consumer.
+The kernel is the RX consumer and the TX producer until the ring-2 service takes that seat. Replacement is a new shared object, not a reset of the indexes and not a change of `FrameDesc`. The service then owns the address record. DHCPRELEASE at that handoff is best-effort, and the seat switch is not inside `NetPublish`. `RING2_NET.md` states both. Frames the in-kernel consumer does not handle keep today's behavior, in `handle_ipv4_packet` and `handle_udp_packet`: TCP returns 0, UDP only DHCP. This slice does not grow that consumer.
 
 `channel.ritz` is not used for frames, for the link record, or for the kick. A 16-deep copied queue is a different transport with a different failure mode. One dataplane.
 
-`DrvRingKick` (223) is the producer's wake on Harland. It checks the `CAP_TYPE_IRQ` handle, wakes the frame endpoint's consumer pid, increments that ring's `wake` `u32`, and returns 0. It does not copy a frame and it does not call `proc_wake` on a shared reason. The consumer parks with the `cli` recheck above, not with a bare `proc_block`. During the self-test that consumer is pid 1, still on the boot stack at CPL 0, which is how `sched_switch` already returns to whoever called it. After the window the same wait is what a later kernel poll calls. A ring-2 process later blocks on the same endpoint, with the same recheck, once it is the registered consumer. The driver does not block on that endpoint. Its full-ring wait is the preemptible spin, which keeps draining the other direction, and its device wait is `BLOCK_IRQ`.
+`DrvRingKick` (223) is the kernel-seat producer's wake of the RX consumer. It checks the `CAP_TYPE_IRQ` handle, wakes that one pid, increments that ring's `wake` `u32`, and returns 0. It does not copy a frame, it does not sample `NetInfo`, and it does not call `proc_wake` on a shared reason. It is not the service's wait and it is not a TX-space wake. The service has no IRQ handle. During the self-test the consumer is pid 1, still on the boot stack at CPL 0. A ring-2 process waits with `ShmWait` once it is the registered consumer. The driver does not block on that endpoint. Its full-ring wait is the preemptible spin, which keeps draining the other direction, and its device wait is the per-device IRQ object.
+
+### Shared object
+
+Decided. The shared object owns its backing pages, mappings are non-owning, and the pages stay allocated until every live mapping and in-flight slot-boundary operation in either death order has released them.
+
+A `ShmObject` is kernel memory. It holds the page list, a mapping count, an in-flight count, a retired flag, and an object id that is never reused. `ShmMap` records `(object id, pid, virtual address)` and installs leaves that `vmm_free_user_pt` skips. Freeing a PML4 therefore cannot return these frames to the PMM. A duplicate `ShmMap` of the same object adds another record and does not allocate. The same rules cover the frame rings, the address page, every app exchange, and a second map of any of them.
+
+Detach unmaps one process and decrements the mapping count. Invalidation sets the retired flag, bumps nothing on a replacement, and latches `DRIVER_GONE` or `PEER_CLOSE` on this id. Reclaim calls `pmm_free_page` only when the object is retired, the mapping count is 0, and the in-flight count is 0.
+
+Driver exit first. `driver_quiesce` retires the frame object and latches `DRIVER_GONE` on its id. The service mapping stays. Pages stay allocated while that mapping is live. A service preempted inside a slot keeps its saved pointer until it reaches the next slot boundary, acks, and detaches. The kernel then unmaps it. A cleared kernel pointer is not that ack, and it does not free the pages under the saved pointer.
+
+Service exit first. The kernel retires the frame object and asks the driver to stop at the next slot boundary. The driver may commit the slot it has already copied, and then it acks. It does not start another slot, and it does not store an index computed from a ring the kernel has zeroed, because the kernel does not zero the old indexes. After the ack the kernel unmaps the driver. Pages stay allocated until that mapping is gone. A replacement is a new object with a new id. Its generation 2 does not resume the retired id.
+
+### Grants
+
+`CapGrant` (40) copies a handle the caller already holds into another process's table and returns the new packed handle to the caller. It does not create an object, and it does not by itself tell the target the index. `CapRevoke` (41) removes one handle from the caller's table. Today it does not unmap and does not touch another process's copy. This design adds the missing effects. It does not add a second sharing mechanism.
+
+Decided. The kernel creates each attachment and returns the app's handle from `NetAttach`, device capabilities cannot be transferred, `CapRevoke` unmaps only the caller's leaves, and `NetPublish` requires `CAP_RIGHT_PUBLISH` on the registered link or address object so an app-exchange handle cannot publish or take the frame seat.
+
+`CAP_RIGHT_PUBLISH` is bit 4096, the next right after `CAP_RIGHT_LIST`. The kernel sets it only on the driver's handle for the link object and only on the service's handle for the address object. `NetPublish` checks three things: the caller holds the handle, the handle's object id is the registered link object or the registered address object, and the publish right is set. Any other handle, including every app-exchange handle, returns `Errno.Perm`. An exchange handle also cannot register its holder as the frame-seat consumer.
+
+`NetAttach` (228) is how an app receives an exchange. The kernel creates the `ShmObject`, inserts a read-write handle with no publish right into the app, inserts the same kind of handle into the service, returns the app's handle, and wakes the service with the service's handle in the attach event. The app does not grant its handle onward. The service does not grant its handle to the app. Spawn of the driver and of the service is the same create-and-insert path, with the handles passed in the new process's entry arguments.
+
+`CapGrant` of `CAP_TYPE_MMIO` or `CAP_TYPE_IRQ` returns `Errno.Perm`. Only the kernel grants those, to the process it spawned for that device. `CapRevoke` of a shm, MMIO, or IRQ handle drops the caller's handle and, when that process holds no remaining handle for the object, unmaps that process's leaves. Other processes keep their handles and their mappings. Revoking the driver's MMIO cap unmaps its BAR pages. The kernel still quiesces the device when the IRQ-cap owner exits or the last IRQ cap for that device is revoked. The revoked process is not left responsible for bus mastering.
+
+Page 0 of a ring is mapped writable in both processes. The producer writes `write_idx`. The consumer writes `read_idx`. Page-granular protection cannot split those words, so the page is peer-writable and each side validates the other's index with the occupancy rule above. Neither side writes the other's index.
+
+### Wait and notify
+
+Decided. `ShmWait` names the object handle, the event mask, and the deadline, `ShmNotify` publishes the index before the wake, a `SPACE` event delivers a pending send with no new frame, and `DRIVER_GONE` on the retired object id is not satisfied by a replacement object's generation 2.
+
+The event bits are `DATA` (1), `SPACE` (2), `PEER_CLOSE` (4), `DRIVER_GONE` (8), `LINK` (16), and `ACK` (32). `ShmWait` (229) parks the caller on that object until one of the masked events is latched or the deadline passes. The kernel does not read the service's private pending-TX queue. The service puts `SPACE` in its mask when that queue is non-empty and the TX ring is full, and it leaves `SPACE` out when the queue is empty. A free TX slot with an empty queue is idle.
+
+Publish-before-wake applies in both directions. The producer stores the index, then `ShmNotify` with `DATA`. The consumer stores `read_idx`, then `ShmNotify` with `SPACE`. A `SPACE` wake with no `DATA` is how a pending send leaves while the RX ring is empty. An app request is `DATA` on that attachment's object. An app event is `DATA` on the same object, waited by the app. `DrvRingKick` is not either of those wakes.
+
+Driver death latches `DRIVER_GONE` on the retired id. A wait on the old handle observes that bit. A new object publishing generation 2 has a different id and a different handle. It does not clear the old latch and does not complete the old wait. `LINK` is the `NetPublish` wake and is separate from `DRIVER_GONE`.
+
+The kernel asks a peer to pause by latching a retire request on that peer's wait. The peer finishes the slot it has already copied, then `ShmNotify` with `ACK`. The kernel does not unmap that peer and does not hand out a replacement object before the ack. A peer preempted between the copy and the index store is still inside that slot. The ack is the slot boundary.
 
 TX publish from the kernel is the mirror once a slot is free: fill the slot, `atomic_store` the TX `write_idx`, `atomic_fetch_add` the TX `wake`, wake the driver pid. The driver treats that as a spurious device wake and drains TX before it waits again. The full-ring yield above is what happens when that publish cannot yet store the index. A group that still fits in the ring also yields. Section 9 says when, because fitting in 256 slots is the usual case for a group of four.
 
 ### 7. Link snapshot
 
-`Syscall.NetInfo = 224`, added to the enum in the same change as its handler. `numbers.ritz` forbids a variant without a handler, and `test_every_declared_syscall_is_dispatched` enforces it. The header comment keeps 60 and 61 free for their Linux meanings. It does not reserve them for `net_info` or `net_ping`. The ABI dict gains `"NetInfo": 224`, `"NetAddr": 225`, `"NetPublish": 226`, and `"ShmMap": 227`. `ritzlib/sys.ritz` gains the matching `[[target_os = "harland"]]` constants. Linux `SYS_EXIT` is 60 and stays a Linux number. Harland `SYS_EXIT` stays 20.
+`Syscall.NetInfo = 224`, added to the enum in the same change as its handler. `numbers.ritz` forbids a variant without a handler, and `test_every_declared_syscall_is_dispatched` enforces it. The header comment keeps 60 and 61 free for their Linux meanings. It does not reserve them for `net_info` or `net_ping`. The ABI dict gains `"NetInfo": 224`, `"NetAddr": 225`, `"NetPublish": 226`, `"ShmMap": 227`, `"NetAttach": 228`, `"ShmWait": 229`, and `"ShmNotify": 230`. `ritzlib/sys.ritz` gains the matching `[[target_os = "harland"]]` constants. Linux `SYS_EXIT` is 60 and stays a Linux number. Harland `SYS_EXIT` stays 20.
 
 ```ritz
 struct NetInfo
@@ -546,7 +600,7 @@ With `net_via_ring` set, the three I/O functions are the section 6 endpoints. Wi
 
 - `net_get_mac` copies `mac[6]` from the kernel snapshot. `dhcp_discover` calls it before `net_send` (`dhcp.ritz`, the client MAC at offset 28). A zero MAC from `netdev_get_mac(null)`, or from a snapshot that was never published, is not a discover. The copy requires generation >= 2, which the first park already published.
 - `net_send` is the TX producer. Success is the `atomic_store` of the TX `write_idx` from section 6. A missing driver is `Errno.NoDev`, not the `-1` from a null `NetDevice`, and not a success. After each published group the burst yields to the driver even when the ring still has room. Section 9 is that yield.
-- `net_poll` pops one RX frame if `take_rx` would see one without waiting, validates it, and dispatches it through the existing Ethernet switch. It does not park. Empty returns 0. An occupancy above 256 kills the device owner. TCP still returns 0. UDP is still DHCP only.
+- `net_poll` pops one RX frame if `take_rx` would see one without waiting, validates it, and dispatches it through the existing Ethernet switch. It does not park. Empty returns 0. A backwards index, or an occupancy above 256, closes the endpoint and does not exit pid 1. TCP still returns 0. UDP is still DHCP only.
 - `net_wait_rx(deadline)` is `take_rx`. It returns `RxWait.Frame`, `RxWait.Timeout`, or `RxWait.NoDriver`. The DHCP loop passes the sooner of `window_end` and `ping_after` until the gateway ping has been sent, then `window_end`. `Timeout` does not call `delay_us(2000)`. The loop body runs, so the window deadline and the deferred ping are checked on a quiet link and on a link that goes quiet after DHCP. The ENA path has no MSI-X park and keeps today's 2 ms delay when its wait cannot block. On the ring path the wait blocks, so pid 1 at CPL 0 lets the driver run until a frame arrives or the deadline does.
 
 `net_is_ready` has no caller outside its definition. It becomes `net_initialized == 1 and (net_via_ring or (net_device != null and netdev_is_running(net_device)))`, so a later caller does not treat a live ring as absent.
@@ -604,7 +658,7 @@ The return selectors are not a syscall. Ring 3 cannot store `0x429` into its own
 
 Copy-out shapes follow `sys_fb_info_handler`: the user pointer is checked, then the kernel writes a `sizeof` struct. `NetInfo` returns 0 or an errno. `DrvDmaAlloc` returns the VA or an errno and writes `DmaAlloc` through rsi. `DrvMmioMap` returns the VA or an errno.
 
-The frame endpoint records one waiter pid. Waking it marks that pid runnable and does not scan other blocked processes. `proc_wake(reason)` stays the broadcast it is, and the frame path does not call it. `BLOCK_IRQ` stays the device reason.
+The frame endpoint records one waiter pid. Waking it marks that pid runnable and does not scan other blocked processes. `proc_wake(reason)` stays the broadcast it is, and the frame path does not call it. The userspace device wait is not `BLOCK_IRQ`.
 
 ## Data model
 
@@ -719,7 +773,7 @@ TDD order. Each test is named as the file it extends or the boot log it adds. No
 | One-shot watchdog left armed across `lapic_timer_start` | High. `lapic_watchdog_oneshot` stays 1, and `lapic_watchdog_expired` then reads the periodic counter. | Vector 96 does not call `sched_tick`. Pid 1 calls `lapic_watchdog_stop` before `sched_start`. Later parks ride the tick. |
 | A frame kick is lost, a full ring drops a frame, or a quiet link stalls the DHCP window | High. The window sleeps with a frame queued, the deferred ping never runs, or the 300-send burst reports fewer than 300 successes. | The consumer parks only under `cli` after a reload of `write_idx`, and `sched_tick` wakes that one endpoint when its deadline passes. A full RX ring leaves the used element in place and the driver keeps draining TX. A full TX ring yields to the driver and returns success only after `read_idx` advances. The burst yields after every group of four, including a group that fits. Death wakes the frame endpoint. |
 | ENA and virtio both claim `netdev` | High on a machine that has both, and on any boot that still calls `virtio_net_init` | `netdev_init` drops virtio in the cutover. ENA remains. The ring is not registered as a `NetDevice`. |
-| The NIC's requester can DMA the framebuffer or kernel RAM | High. A CPU allowlist does not constrain the device. | No queue-address page is mapped, and bus mastering for the driver stays off, until a private translated domain holds only the granted queue and packet pages. A requester that cannot be named refuses the cutover. The acceptance walk shows the framebuffer and a kernel page absent from the domain. |
+| The NIC's requester can DMA the framebuffer or kernel RAM | High. A CPU allowlist does not constrain the device. | No queue-address page is mapped, and bus mastering for the NIC stays off, until its private context is live. Other requesters on the unit, including virtio-blk and NVMe, get identity contexts before translation is enabled. Acceptance is a successful DMA into a granted page and a fault attributed to the NIC. A walk is supplementary. |
 | `irq_route_dest` moves the MSI-X off the BSP and `waitq_wake_irq` ignores it | Medium | Refuse to start the driver unless the routed destination is the BSP. The BSP is the only CPU that runs Procs. |
 | `test_harland_percpu.py` equality on `GDT_ENTRIES` | Low, caught at CI | Updated in the GDT PR, not discovered later. |
 | `mmap` or `munmap` reaches PML4[251]–[253], including a range that starts below the window | High if it happens. `sys_munmap_impl` today frees any mapped phys in that span. | Both `sys_mmap_impl` and `sys_munmap_impl` reject any overlap of `[DRV_RING_BASE, USER_STACK_BASE)`. A partial `DrvMmioMap` or `DrvDmaAlloc` rolls its own pages back. |
@@ -732,10 +786,10 @@ TDD order. Each test is named as the file it extends or the boot log it adds. No
 4. **Non-zero CPL is a process** in `exception_handler`, `sched_tick`, and `tty_console_irq`. The asm stubs already use that predicate.
 5. **IOPL 0, no IOPB, modern MMIO virtio only.** Legacy port I/O is not given a proxy.
 6. **Device authority is a capability, not a `Proc` bit and not a hardcoded path.** `DrvIrqWait` and `DrvDmaAlloc` and `DrvRingKick` check `CAP_TYPE_IRQ`. `DrvMmioMap` checks `CAP_TYPE_MMIO` and maps from the kernel's window record. The frame rings, the app exchange, and the address page are `CAP_TYPE_SHM`, mapped by `ShmMap` (227) and revoked by `CapRevoke`. Spawn is the kernel exercising that path. `Proc` stores return CS/SS. The handler's CS is `0x08`, so it cannot authorize by CPL. Refusal is `Errno.Perm`.
-7. **`DrvIrqWait` = 220 reuses `BLOCK_IRQ` and arms the LAPIC watchdog around `waitq_park`.** The bound is `VIRTIO_NET_RX_WAIT_TICKS` (`0x00020000`), one round. After `sched_start` the arm rides the periodic tick and `sched_tick` wakes `BLOCK_IRQ` when it expires. The first park is before that tick. Vector 96 does not enter `sched_tick`, so pid 1 calls `lapic_watchdog_stop` before `lapic_timer_start`. The kernel keeps the IDT and the EOI. User-mode IRQ delivery is rejected.
-8. **`DrvMmioMap` = 221, `DrvDmaAlloc` = 222, `DrvRingKick` = 223, `NetInfo` = 224, `NetAddr` = 225, `NetPublish` = 226, `ShmMap` = 227.** `net_ping` is not numbered. Contract numbers 50–64 are not reused. 4, 29, 32, 60, and 61 stay free for their Linux meanings.
+7. **`DrvIrqWait` = 220 parks on that device's IRQ object.** The object has its own latched generation and its own deadline. An interrupt for another device does not complete the wait. The syscall does not arm the shared LAPIC watchdog. In-kernel `irq_wait_vector` still does. The kernel keeps the IDT and the EOI. User-mode IRQ delivery is rejected.
+8. **`DrvMmioMap` = 221, `DrvDmaAlloc` = 222, `DrvRingKick` = 223, `NetInfo` = 224, `NetAddr` = 225, `NetPublish` = 226, `ShmMap` = 227, `NetAttach` = 228, `ShmWait` = 229, `ShmNotify` = 230.** `net_ping` is not numbered. Contract numbers 50–64 are not reused. 4, 29, 32, 60, and 61 stay free for their Linux meanings. `NetPublish` requires `CAP_RIGHT_PUBLISH` on the registered link or address object.
 9. **MMIO grants are complete pages of a recorded window, uncached, in that CR3 only.** `DrvMmioMap` takes a capability whose object is that window. A page that also holds the MSI-X table or the PBA is refused. DMA pages are zeroed before they are reachable, and `DrvDmaAlloc` returns the IOVA. The shared ring is write-back, matching the physmap virtio already uses, and it is not in the device's DMA domain. The bytes at `0x0300` are advisory.
-10. **Two SPSC rings, depth 256, 2048-byte frames, `sizeof` for every slot, indexes on separate cache lines, a `u32` wake, `seq_cst` index stores.** The region is `0x103000` bytes, with both controls and `NetInfo` on page 0. The consumer derives `arena_off` from the slot. A bad length or a mismatched offset is skipped. An occupancy above 256 kills the device owner. A full ring stalls that direction and keeps draining the other. The driver's full-RX wait calls `Yield` (24). The kernel seat yields when TX is full. The consumer parks under `cli` with a recheck and a deadline, and returns `RxWait`. The wake names the frame endpoint, not every waiter of a shared reason. Linux waits on the `u32` with `FUTEX_WAIT` / `FUTEX_WAKE`. Win64 uses a shared event and rechecks the index. The frame ring needs no extra `fence()`. The link seqlock does. Zeus HTTP slots and Zeus plain stores are not the protocol. `channel.ritz` is not the dataplane.
+10. **Two SPSC rings, depth 256, 2048-byte frames, `sizeof` for every slot, indexes on separate cache lines, a `u32` wake, `seq_cst` index stores.** The region is `0x103000` bytes, with both controls and `NetInfo` on page 0. The consumer derives `arena_off` from the slot. A bad length or a mismatched offset is skipped. A backwards index is rejected before subtraction, and an occupancy above 256 closes the endpoint through `endpoint_fail`. That path is not `process_kill_current` and it does not exit pid 1. A full ring stalls that direction and keeps draining the other. The driver's full-RX wait calls `Yield` (24). The kernel seat yields when TX is full. The consumer parks under `cli` with a recheck and a deadline, and returns `RxWait`. The wake names the frame endpoint, not every waiter of a shared reason. Linux waits on the `u32` with `FUTEX_WAIT` / `FUTEX_WAKE`. Win64 uses a shared event and rechecks the index. The frame ring needs no extra `fence()`. The link seqlock does. Zeus HTTP slots and Zeus plain stores are not the protocol. `channel.ritz` is not the dataplane.
 11. **The driver is the only writer of shared `NetInfo`, and the kernel snapshot is what `NetInfo` returns.** `link_seq` 0 is unpublished. The first stable generation is 2. The writer fences after the odd store. The sampler fences before the second load. `NetPublish` is the only refresh, and it wakes the frame endpoint. MAC, link, MTU, device type. Address fields stay zero. The lease stays with the stack and moves to ring 2 with it. Readers use `NetAddr`. No snapshot, or a snapshot `driver_quiesce` has invalidated, is `Errno.NoDev`. The kernel does not write the shared record. Quarantined DMA pages get `PTE_DEVICE` before `vmm_free_pml4`. Virtio reset waits on `VIRTIO_RESET_TIMEOUT_US`.
 12. **ENA stays in-kernel. virtio leaves `netdev_init` only on a boot with a translated DMA domain.** The first switch is `sched_yield` while `sched_running` is 0, after `proc_start` and before `sched_start`. The driver publishes generation 2 and drains TX before that first `DrvIrqWait`. `sched_start` runs once after the yield returns and after `lapic_watchdog_stop`, still before any send. `net_stack_init` returns 0 when the snapshot is published and `netdev_init` returns 0, and does not register a `NetDevice`. `net_get_mac`, `net_send`, `net_poll`, and `net_wait_rx` are the ring endpoints only while `net_via_ring` is set. `net_wait_rx` returns at its deadline on a quiet link. The 300-send burst yields to the driver after every group. An `ena_init` success keeps the `NetDevice` path and does not set that flag. A boot with no IOMMU keeps `virtio_net_init`. `run_init` does not reset the table. `MAX_PROCS`, `FS_MAX_PROCS`, and `KSTACK_SLOTS` stay 8. The halt assertion moves to a park counter on the translating boot. Death is `driver_quiesce` before `vmm_free_pml4`, with status readback, IOTLB invalidation, and `dma_quarantine` for pages that cannot be proven idle.
 
@@ -783,17 +837,17 @@ None. The trade-offs above are decided. A weaker-than-`seq_cst` order is a later
 
 **Depends on:** PR 3. PR 4 does not add a handler until this lands, so the numbers are not frozen against a driver bit.
 
-**Description:** Grant `CAP_TYPE_IRQ`, `CAP_TYPE_MMIO`, and `CAP_TYPE_SHM` through the existing cap table. `CapGrant` (40) and `CapRevoke` (41) are the grant and revoke. `ShmMap` (227) maps a shm capability into the caller. No `Proc.driver`. No hardcoded `/bin/virtio-net` check. A caller without the handle gets `Errno.Perm`. This PR does not move the NIC. It is the path PR 6 and the ring-2 attach both call.
+**Description:** Grant `CAP_TYPE_IRQ`, `CAP_TYPE_MMIO`, and `CAP_TYPE_SHM` through the existing cap table. `CapGrant` (40) copies a handle and does not create an object. `CapRevoke` (41) drops the caller's handle and unmaps only that process's leaves. `ShmMap` (227) maps a shm capability into the caller as a non-owning leaf. `CAP_RIGHT_PUBLISH` is granted only on the registered link object and the registered address object. Device MMIO and IRQ capabilities cannot be transferred. No `Proc.driver`. No hardcoded `/bin/virtio-net` check. A caller without the handle gets `Errno.Perm`. This PR does not move the NIC. It is the path PR 6 and the ring-2 attach both call.
 
 ### PR 4. IRQ wait
 
-**Title:** harland: Park a driver process on BLOCK_IRQ
+**Title:** harland: Park a driver process on its own IRQ object
 
 **Files:** `syscall/numbers.ritz`, `syscall/runtime/entry.ritz`, a new handler module under `syscall/runtime/`, `ritzlib/sys.ritz`, `test_harland_syscall_dispatch.py`, the boot-test stub.
 
 **Depends on:** PR 3b.
 
-**Description:** `DrvIrqWait` = 220 checks the caller's `CAP_TYPE_IRQ` handle. A caller without that handle, including every ring-3 process, gets `Errno.Perm`. The handler arms `lapic_watchdog_arm(VIRTIO_NET_RX_WAIT_TICKS)` before `waitq_park` and calls `lapic_watchdog_stop` after it. The driver stub waits, a kernel MSI-X or the tick-riding watchdog wakes it, the stub exits. The vector is not injected. Virtio is still in the kernel, so this test uses the watchdog wake or a test IPI, not the NIC. The test that runs before `sched_start` checks that pid 1's `lapic_watchdog_stop` clears `lapic_watchdog_oneshot` and that `lapic_timer_start` still installs vector 32.
+**Description:** `DrvIrqWait` = 220 checks the caller's `CAP_TYPE_IRQ` handle and parks on that object's latch and deadline. A caller without that handle, including every ring-3 process, gets `Errno.Perm`. An interrupt for a different device does not complete the wait. The handler does not arm the shared LAPIC watchdog. The driver stub waits, a kernel MSI-X for this object wakes it, the stub exits. The vector is not injected. Virtio is still in the kernel, so this test uses a latched test event for this object, not NVMe and not the shared watchdog. The test that runs before `sched_start` checks that `lapic_timer_start` still installs vector 32.
 
 ### PR 5. MMIO map and DMA alloc
 
@@ -852,6 +906,8 @@ None. The trade-offs above are decided. A weaker-than-`seq_cst` order is a later
 - `projects/harland/kernel/src/ipc/channel.ritz`
 - `projects/harland/docs/RING1_DRIVER_FEEDBACK.md` — the review this text absorbs. The feedback file stays the review record.
 - `projects/harland/docs/RING1_RING2_REVIEW.md` — the review of both drafts against the tree. The feedback file stays the review record.
+- `projects/harland/docs/RING1_RING2_REREVIEW.md` — the re-review this text absorbs. The review file stays the review record.
+- `projects/harland/docs/stack_example/` — host traversal of the designed path
 - `projects/harland/kernel/src/cap/types.ritz` — `CAP_TYPE_MMIO`, `CAP_TYPE_IRQ`, `CAP_TYPE_SHM`
 - `projects/indium/` — userspace programs, including the virtio-net driver
 - `projects/harland/kernel/src/drivers/iommu/vtd.ritz`, `drivers/iommu/amdvi.ritz` — translation is off, and AMD-Vi is pass-through, until PR 5b
