@@ -95,7 +95,7 @@ That includes `is_*`, `has_*`, `can_*`, `contains`, `*_eq`, `starts_with` and
 answer returns a `Result` (S-RESULT-1), not a third integer value.
 
 Report: `bool-return`. Counts API fns with an integer return and a predicate
-name.
+name, including the C ctype spelling `is<letters>` (`isdigit`, `isspace`).
 
 ```ritz
 fn is_digit(c: u8) -> bool
@@ -165,6 +165,46 @@ fn parse_u32(s: StrView) -> Result<u32, ParseError>
 differently, or a struct carrying one. It isn't a bare `i32` code. A
 syscall's negative errno is converted at the wrapper that made the syscall.
 Qualify a variant with `.`: `ParseError.Empty`.
+
+The raw `sys_*` syscall wrappers are that boundary, so they return the raw
+result and are exempt (`standard-exempt-file(sys_*)` in `sys`, `net` and
+`uring`). Everything above them converts.
+
+Report: `status-return`. Counts API fns with an integer return that
+`return -NAME` (a named code such as `-EINVAL`) or return a `syscallN(` or
+`sys_*(` result unconverted.
+
+#### S-RESULT-3 A result is returned, not written through a parameter
+
+**Status: ADVISORY**
+
+A function hands back what it computed in its return value: a struct, an
+`Option` or a `Result`. It doesn't write a scalar, a `StrView`, a `String` or
+a pointer into a caller's `x:& T`, `@&T` or `*T` and return a status beside
+it. `@&T` is for a callee that *updates* a value the caller owns, such as a
+`Vec` it appends to (S-PTR-1), not a second return slot. The kernel ABI's own
+out-pointers (`pipe(2)`'s fds, `accept(2)`'s `addrlen`) are exempt at the
+`sys_*` layer, and converted above it.
+
+Report: `out-param`. Counts each `:&`, `@&` or `*` parameter of a scalar,
+`StrView`, `String` or pointer pointee that the body assigns or passes to a
+`sys_*(`/`syscallN(` call. A `*u8` byte buffer is S-PTR-1/S-PTR-2's.
+
+```ritz
+import ritzlib.option
+
+struct Split
+    before: StrView
+    after: StrView
+
+fn split_once(s: StrView, delim: u8) -> Option<Split>
+    for i in 0..s.len
+        if *(s.ptr + i) == delim
+            let before = StrView { ptr: s.ptr, len: i }
+            let after = StrView { ptr: s.ptr + i + 1, len: s.len - i - 1 }
+            return Some(Split { before: before, after: after })
+    None
+```
 
 ## 3. Propagating errors
 

@@ -15,6 +15,7 @@ Usage:
     python3 tools/standard_report.py [PATH ...]          # default: ritzlib
     python3 tools/standard_report.py --list KEY [PATH ...]
     python3 tools/standard_report.py --json [PATH ...]
+    python3 tools/standard_report.py --callers [--json] [--lib LIB] [PATH ...]
 
 THE COUNTING RULES (each is the "Report:" line of a rule in STANDARD.md)
 -----------------------------------------------------------------------
@@ -26,10 +27,23 @@ directories (``tests/``, ``test/``) and ``[[test]]`` / ``[[test_helper]]``
 fns are never counted.
 
   bool-return      API fn with an integer return whose name is a predicate:
-                   a ``_``-separated word in PREDICATE_WORDS, or a name
-                   ending in ``eq`` (``streq``, ``memeq``).
+                   a ``_``-separated word in PREDICATE_WORDS, a name
+                   ending in ``eq`` (``streq``, ``memeq``), or a C ctype
+                   name matching ``^is[a-z]+$`` (``isdigit``).
   sentinel-return  API fn with an integer return whose body has
                    ``return -<digit>``.
+  status-return    API fn with an integer return whose body has
+                   ``return -IDENT`` (a named code such as ``-EINVAL``) or
+                   passes a syscall's raw result straight through:
+                   ``return syscallN(`` / ``return sys_*(``.
+  out-param        each non-self parameter that carries a result back
+                   through itself: a ``:&`` / ``@&`` / ``*`` parameter
+                   whose pointee is a scalar, ``StrView``, ``String`` or
+                   a pointer (``*u8``/``*i8`` byte buffers excepted), and
+                   that the body assigns (``p = ``, ``*p = ``, ``p.f = ``,
+                   ``p[i] = ``, ``*(p + k) = ``, compound ``+=`` ...) or,
+                   unless the pointee is itself a pointer (an argv array),
+                   hands to a ``sys_*(`` / ``syscallN(`` call.
   null-return      API fn returning ``*T``/``@T``/``@&T`` whose body has
                    ``return null``.
   raw-ptr-param    each ``*T`` parameter of an API fn.
@@ -58,15 +72,35 @@ For a whole module, put this in the file's leading comment block:
 
     # standard-exempt-file: raw-alloc: this module is the allocator
 
+A file exemption may be scoped to the fns whose names match a glob, so a
+module's kernel-ABI layer is excused without excusing the rest of it:
+
+    # standard-exempt-file(sys_*): status-return: the kernel returns -errno
+
 A reason under MIN_REASON characters, or a key that isn't a counting rule,
 is itself counted, as ``exempt-malformed``.  Exempt sites are still listed
 and counted, in their own column, so exemptions can't pile up unseen.
+
+CALLERS (#4636)
+---------------
+
+An exemption says a raw boundary is raw by nature; it doesn't say the rest
+of the tree should use it.  ``--callers`` counts how far the raw layer
+escapes: for each *exempt API* (a ``pub`` module-level fn of the library
+with at least one exempt site), every call ``name(`` in the given trees,
+outside the library, in a file that imports the defining module
+(``import ritzlib.<mod>``, and when the import lists names, lists this
+one).  A method call ``x.name(`` is not a call of the free fn.  Totals are
+grouped by project (the first directory under each PATH; default:
+``projects/``).
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -76,6 +110,8 @@ from pathlib import Path
 RULES: dict[str, tuple[str, str]] = {
     "bool-return": ("S-BOOL-2", "predicate returns an integer, not bool"),
     "sentinel-return": ("S-RESULT-1", "failure signalled by a negative integer return"),
+    "status-return": ("S-RESULT-2", "bare integer status: named -code or raw syscall result"),
+    "out-param": ("S-RESULT-3", "result written through a parameter"),
     "null-return": ("S-OPTION-1", "absence signalled by returning null"),
     "raw-ptr-param": ("S-PTR-1", "raw *T parameter on an API fn"),
     "ptr-len-param": ("S-PTR-2", "(*T, length) pair instead of Span<T>/StrView"),
@@ -87,6 +123,10 @@ MALFORMED = "exempt-malformed"
 MIN_REASON = 12
 
 INT_TYPES = {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize"}
+# A pointee an out-param writes back: a scalar, a text handle or a pointer.
+OUT_SCALARS = INT_TYPES | {"bool", "f32", "f64"}
+OUT_HANDLES = {"StrView", "String"}
+BYTE_TYPES = {"u8", "i8"}  # `*u8` is a byte buffer: S-PTR-1/S-PTR-2 count it
 PREDICATE_WORDS = {
     "is", "has", "can", "contains", "exists", "eq", "equals", "starts", "ends",
     "valid", "empty", "matches",
@@ -98,12 +138,20 @@ ALLOC_FNS = ("malloc", "free", "realloc", "calloc", "heap_alloc", "heap_free",
 ALLOC_RE = re.compile(r"(?<![\w.])(" + "|".join(ALLOC_FNS) + r")\s*\(")
 EXIT_RE = re.compile(r"(?<![\w.])sys_exit\s*\(")
 NEG_RETURN_RE = re.compile(r"^\s*return\s+-\s*\d")
+NAMED_NEG_RETURN_RE = re.compile(r"^\s*return\s+-\s*[A-Za-z_]")
+SYSCALL_CALL = r"(?<![\w.])(?:sys_\w+|syscall\d)\s*\("
+PASSTHROUGH_RE = re.compile(r"^\s*return\s+" + SYSCALL_CALL)
+SYSCALL_RE = re.compile(SYSCALL_CALL)
+# The assignment operator of a statement: `=` or a compound `op=`, never
+# `==`, `!=`, `<=`, `>=` or `=>`.
+ASSIGN_OP_RE = re.compile(r"(?:<<|>>|[-+*/%|&^])?(?<![=!<>])=(?![=>])")
+CTYPE_PRED_RE = re.compile(r"^is[a-z]+$")
 NULL_RETURN_RE = re.compile(r"^\s*return\s+null\b")
 FN_RE = re.compile(r"^(\s*)(pub\s+)?(?:async\s+)?fn\s+(\w+)")
 TYPE_DECL_RE = re.compile(r"^(?:pub\s+)?(struct|enum)\s+(\w+)")
 IMPL_RE = re.compile(r"^(\s*)impl\b(?:<[^>]*>)?\s*(.*)$")
 EXEMPT_RE = re.compile(r"^\s*#\s*standard-exempt:\s*(.*)$")
-EXEMPT_FILE_RE = re.compile(r"^\s*#\s*standard-exempt-file:\s*(.*)$")
+EXEMPT_FILE_RE = re.compile(r"^\s*#\s*standard-exempt-file(?:\(([\w*?]+)\))?:\s*(.*)$")
 TEST_ATTR_RE = re.compile(r"^\s*\[\[\s*test(_helper)?\s*\]\]")
 TEST_DIRS = {"tests", "test"}
 
@@ -163,6 +211,12 @@ def split_top(text: str, sep: str = ",") -> list[str]:
     return [p.strip() for p in parts]
 
 
+def param_mode(param: str) -> str:
+    """The modifier of one parameter: `&` for `a:& T`, `=` for `a:= T`, else ``""``."""
+    m = re.match(r"\w+\s*:\s*([&=])", param.strip())
+    return m.group(1) if m else ""
+
+
 def param_type(param: str) -> tuple[str, str]:
     """(name, type) of one parameter: `a: T`, `a:& T`, `a:= T`, `self`, `self:&`."""
     m = re.match(r"(\w+)\s*(?::\s*[&=]?\s*(.*))?$", param.strip())
@@ -181,7 +235,43 @@ def base_type(ty: str) -> str:
 
 def is_predicate(name: str) -> bool:
     words = name.split("_")
-    return bool(PREDICATE_WORDS.intersection(words)) or name.endswith("eq")
+    return (bool(PREDICATE_WORDS.intersection(words)) or name.endswith("eq")
+            or bool(CTYPE_PRED_RE.match(name)))
+
+
+def out_pointee(ty: str, mode: str) -> str | None:
+    """The type an out-param writes back through, or None if `ty` can't be one."""
+    ty = ty.strip()
+    if mode == "&":
+        return ty
+    if ty.startswith("@&"):
+        return ty[2:].strip()
+    if ty.startswith("*"):
+        pointee = ty[1:].strip()
+        return None if pointee in BYTE_TYPES else pointee
+    return None
+
+
+def writes_back(pointee: str) -> bool:
+    return (pointee in OUT_SCALARS or base_type(pointee) in OUT_HANDLES
+            or pointee[:1] in ("*", "@"))
+
+
+def assigns(code: str, name: str) -> bool:
+    """`code` is a statement assigning through `name`: `name = `, `*name = `,
+    `name.f = `, `name[i] = `, `*(name + k) = ` or a compound `op=`."""
+    m = ASSIGN_OP_RE.search(code)
+    if not m:
+        return False
+    lhs = code[:m.start()].strip()
+    if re.match(r"(let|var|if|while|elif|return)\b", lhs):
+        return False
+    return bool(re.match(r"\*?\s*\(?\s*" + re.escape(name) + r"\b", lhs))
+
+
+def hands_to_syscall(code: str, name: str) -> bool:
+    m = SYSCALL_RE.search(code)
+    return bool(m) and re.search(r"\b" + re.escape(name) + r"\b", code[m.end():]) is not None
 
 
 def parse_exemption(spec: str) -> tuple[set[str], str | None]:
@@ -208,6 +298,7 @@ class Fn:
     body: list[tuple[int, str]]  # (line, code without comments)
     is_test: bool
     exemptions: list[tuple[set[str], str | None]]
+    modes: list[str] | None = None  # param_mode of each parameter
 
 
 def _leading_block(lines: list[str], idx: int) -> list[str]:
@@ -224,7 +315,8 @@ def _leading_block(lines: list[str], idx: int) -> list[str]:
     return out
 
 
-def parse_fns(text: str) -> tuple[list[Fn], set[str], list[tuple[set[str], str | None]]]:
+def parse_fns(text: str) -> tuple[list[Fn], set[str], list[tuple[set[str], str | None, str | None]]]:
+    """(fns, declared type names, file exemptions as (keys, reason, name glob))."""
     lines = text.split("\n")
     types = {m.group(2) for ln in lines if (m := TYPE_DECL_RE.match(ln))}
     file_exempt = []
@@ -233,7 +325,7 @@ def parse_fns(text: str) -> tuple[list[Fn], set[str], list[tuple[set[str], str |
         if s and not s.startswith("#"):
             break
         if m := EXEMPT_FILE_RE.match(ln):
-            file_exempt.append(parse_exemption(m.group(1)))
+            file_exempt.append((*parse_exemption(m.group(2)), m.group(1)))
 
     fns: list[Fn] = []
     impl_stack: list[tuple[int, str]] = []  # (indent, kind)
@@ -272,7 +364,8 @@ def parse_fns(text: str) -> tuple[list[Fn], set[str], list[tuple[set[str], str |
                 if depth == 0:
                     close_at = k
                     break
-        params = [param_type(p) for p in split_top(sig[open_at + 1:close_at])] if open_at >= 0 else []
+        raw_params = split_top(sig[open_at + 1:close_at]) if open_at >= 0 else []
+        params = [param_type(p) for p in raw_params]
         rest = sig[close_at + 1:] if close_at >= 0 else ""
         ret = rest.split("->", 1)[1].strip() if "->" in rest else ""
         # Body: following lines indented deeper than the fn, or blank.
@@ -298,6 +391,7 @@ def parse_fns(text: str) -> tuple[list[Fn], set[str], list[tuple[set[str], str |
             body=body,
             is_test=any(TEST_ATTR_RE.match(b) for b in block),
             exemptions=exemptions,
+            modes=[param_mode(p) for p in raw_params],
         ))
         i = j
     return fns, types, file_exempt
@@ -313,6 +407,19 @@ def _fn_sites(fn: Fn, types: set[str]) -> list[tuple[str, int, str]]:
             out.append(("bool-return", fn.line, f"-> {fn.ret}"))
         if ret_int and any(NEG_RETURN_RE.match(c) for _, c in fn.body):
             out.append(("sentinel-return", fn.line, f"-> {fn.ret}"))
+        if ret_int and any(NAMED_NEG_RETURN_RE.match(c) or PASSTHROUGH_RE.match(c)
+                           for _, c in fn.body):
+            out.append(("status-return", fn.line, f"-> {fn.ret}"))
+        for (name, ty), mode in zip(fn.params, fn.modes or [""] * len(fn.params)):
+            pointee = out_pointee(ty, mode)
+            if name == "self" or pointee is None or not writes_back(pointee):
+                continue
+            # A C array of pointers (argv) is read by the kernel, not written.
+            to_kernel = pointee[:1] not in ("*", "@")
+            if any(assigns(c, name) or (to_kernel and hands_to_syscall(c, name))
+                   for _, c in fn.body):
+                sig = f"{name}:& {ty}" if mode == "&" else f"{name}: {ty}"
+                out.append(("out-param", fn.line, sig))
         if fn.ret[:1] in ("*", "@") and any(NULL_RETURN_RE.match(c) for _, c in fn.body):
             out.append(("null-return", fn.line, f"-> {fn.ret}"))
         for k, (name, ty) in enumerate(fn.params):
@@ -339,11 +446,13 @@ def _fn_sites(fn: Fn, types: set[str]) -> list[tuple[str, int, str]]:
 
 
 def scan_source(text: str, path: str) -> list[Site]:
-    fns, types, file_exempt = parse_fns(text)
+    fns, types, file_exempts = parse_fns(text)
     sites: list[Site] = []
     for fn in fns:
         if fn.is_test:
             continue
+        file_exempt = [(ks, r) for ks, r, glob in file_exempts
+                       if glob is None or fnmatch.fnmatchcase(fn.name, glob)]
         for ks, reason in fn.exemptions + file_exempt:
             if reason is None:
                 sites.append(Site(MALFORMED, path, fn.line, fn.name,
@@ -373,10 +482,139 @@ def scan_tree(paths: list[Path]) -> list[Site]:
     return sites
 
 
+# ---------------------------------------------------------------------------
+# --callers (#4636): how far the exempt raw layer escapes the library.
+# ---------------------------------------------------------------------------
+
+IMPORT_RE = re.compile(r"^import\s+ritzlib\.([\w.]+)\s*(?:\{([^}]*)\}?)?")
+CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\(")
+DEF_RE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?(?:extern\s+)?fn\s+")
+
+
+@dataclass(frozen=True)
+class CallSite:
+    api: str
+    path: str
+    line: int
+
+
+def exempt_apis(lib: Path) -> dict[str, set[str]]:
+    """{name: {defining module, dotted from `lib`}} of every exempt API.
+
+    An exempt API is a ``pub`` module-level fn with at least one exempt site.
+    """
+    out: dict[str, set[str]] = {}
+    for f in iter_sources([lib]):
+        module = ".".join(f.relative_to(lib).with_suffix("").parts)
+        text = f.read_text(errors="replace")
+        fns, _, _ = parse_fns(text)
+        public = {fn.name for fn in fns if fn.public and fn.in_impl is None}
+        for s in scan_source(text, str(f)):
+            if s.exempt is not None and s.fn in public:
+                out.setdefault(s.fn, set()).add(module)
+    return out
+
+
+def _imports(lines: list[str]) -> dict[str, set[str] | None]:
+    """{module: names listed, or None for the whole module} of a file's ritzlib imports."""
+    out: dict[str, set[str] | None] = {}
+    for ln in lines:
+        m = IMPORT_RE.match(ln)
+        if not m:
+            continue
+        mod, names = m.group(1), m.group(2)
+        if names is None or "{" not in ln:
+            out[mod] = None
+        elif out.get(mod, set()) is not None:
+            out.setdefault(mod, set()).update(n.strip() for n in names.split(",") if n.strip())
+    return out
+
+
+# Build output and caches: generated, untracked, and different per host.
+SKIP_DIRS = {"build", "target"}
+
+
+def _ritz_files(root: Path, skip: Path):
+    """Every .ritz file under `root`, outside `skip`, hidden dirs and SKIP_DIRS."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        d = Path(dirpath)
+        dirnames[:] = sorted(n for n in dirnames if not n.startswith(".")
+                             and n not in SKIP_DIRS and (d / n).resolve() != skip)
+        for n in sorted(filenames):
+            if n.endswith(".ritz"):
+                yield d / n
+
+
+def count_callers(lib: Path, roots: list[Path]) -> list[CallSite]:
+    """Every call of an exempt API of `lib` under `roots`, outside `lib`."""
+    apis = exempt_apis(lib)
+    skip = lib.resolve()
+    sites: list[CallSite] = []
+    for root in roots:
+        for f in _ritz_files(root, skip):
+            lines = f.read_text(errors="replace").split("\n")
+            imports = _imports(lines)
+            if not imports:
+                continue
+            for i, raw in enumerate(lines):
+                if DEF_RE.match(raw):
+                    continue
+                for m in CALL_RE.finditer(strip_comment(raw)):
+                    mods = apis.get(m.group(1))
+                    if mods and any(mod in imports and (imports[mod] is None
+                                                       or m.group(1) in imports[mod])
+                                    for mod in mods):
+                        sites.append(CallSite(m.group(1), str(f), i + 1))
+    return sites
+
+
+def callers_by_project(sites: list[CallSite], root: Path) -> dict[str, int]:
+    """Call counts grouped by the first directory under `root`."""
+    out: dict[str, int] = {}
+    for s in sites:
+        rel = Path(s.path).relative_to(root)
+        key = rel.parts[0] if len(rel.parts) > 1 else "."
+        out[key] = out.get(key, 0) + 1
+    return dict(sorted(out.items()))
+
+
+def callers_by_api(sites: list[CallSite]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for s in sites:
+        out[s.api] = out.get(s.api, 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 def summarise(sites: list[Site]) -> dict[str, dict[str, int]]:
     out = {k: {"violations": 0, "exempt": 0} for k in [*RULES, MALFORMED]}
     for s in sites:
         out[s.key]["exempt" if s.exempt is not None else "violations"] += 1
+    return out
+
+
+# The C shapes #4636 pins down-only, per module (tools/test_standard_pins/).
+C_SHAPE_KEYS = ("bool-return", "status-return", "out-param")
+
+
+def ratchet_breaches(summary: dict[str, dict[str, int]],
+                     pins: dict[str, tuple[int, int]]) -> list[str]:
+    """What `summary` has above `pins` = {key: (violations, violations + exempt)}.
+
+    A down-only ratchet: a count under its pin passes (a migration lowered
+    it; tighten the pin when convenient), a count over it is a new C-shaped
+    site.  Exempting a site keeps the total and lowers the violations, so it
+    passes; a new site, exempt or not, raises the total and fails.  A key
+    with no pin is pinned at (0, 0).
+    """
+    out = []
+    for key in C_SHAPE_KEYS:
+        v = summary[key]["violations"]
+        total = v + summary[key]["exempt"]
+        pv, ptotal = pins.get(key, (0, 0))
+        if v > pv:
+            out.append(f"{key}: {v} violations > pin {pv}")
+        if total > ptotal:
+            out.append(f"{key}: {total} sites (violations + exempt) > pin {ptotal}")
     return out
 
 
@@ -386,8 +624,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="print the summary as JSON")
     ap.add_argument("--list", metavar="KEY", choices=[*RULES, MALFORMED],
                     help="list every site of one counting rule")
+    ap.add_argument("--callers", action="store_true",
+                    help="count calls of the library's exempt APIs under PATHs (default: projects/)")
+    ap.add_argument("--lib", type=Path, help="the library for --callers (default: ritzlib)")
     args = ap.parse_args(argv)
-    paths = args.paths or [Path(__file__).resolve().parent.parent / "ritzlib"]
+    ritz = Path(__file__).resolve().parent.parent
+    if args.callers:
+        return _main_callers(args.lib or ritz / "ritzlib", args.paths or [ritz.parent], args.json)
+    paths = args.paths or [ritz / "ritzlib"]
     sites = scan_tree(paths)
     if args.list:
         for s in sites:
@@ -407,6 +651,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{rule:<11} {key:<17} {c['violations']:>10} {c['exempt']:>7}  {what}")
     c = summary[MALFORMED]
     print(f"{'-':<11} {MALFORMED:<17} {c['violations']:>10} {'':>7}  standard-exempt without known keys and a reason")
+    return 0
+
+
+def _main_callers(lib: Path, roots: list[Path], as_json: bool) -> int:
+    sites = count_callers(lib, roots)
+    by_project: dict[str, int] = {}
+    for root in roots:
+        for k, v in callers_by_project([s for s in sites if Path(s.path).is_relative_to(root)],
+                                       root).items():
+            by_project[k] = by_project.get(k, 0) + v
+    by_api = callers_by_api(sites)
+    if as_json:
+        print(json.dumps({"total": len(sites), "by_project": by_project, "by_api": by_api},
+                         indent=2))
+        return 0
+    print(f"exempt {lib.name} APIs called outside it: {len(sites)} call site(s)")
+    print("by project:")
+    for k, v in sorted(by_project.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"  {v:>6}  {k}")
+    print("by API:")
+    for k, v in by_api.items():
+        print(f"  {v:>6}  {k}")
     return 0
 
 
