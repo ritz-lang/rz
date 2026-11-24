@@ -42,123 +42,8 @@ const HASH_MASK: i32 = 32767       # HASH_SIZE - 1
 const MAX_STORED_BLOCK: i32 = 65535
 
 
-# ============================================================================
-# Fixed Huffman Encode Tables
-# ============================================================================
-
-var g_fixed_litlen_enc: HuffmanEncodeTable
-var g_fixed_dist_enc: HuffmanEncodeTable
-var g_fixed_enc_init: i32 = 0
-
-fn init_fixed_encode_tables()
-    if g_fixed_enc_init != 0
-        return
-
-    # Build literal/length encode table (same lengths as decode)
-    var litlen_lengths: [288]u8
-    for i in 0..144
-        litlen_lengths[i] = 8
-    for i in 144..256
-        litlen_lengths[i] = 9
-    for i in 256..280
-        litlen_lengths[i] = 7
-    for i in 280..288
-        litlen_lengths[i] = 8
-
-    huffman_build_encode_table(@g_fixed_litlen_enc, @litlen_lengths[0], 288)
-
-    # Build distance encode table (all 5 bits)
-    var dist_lengths: [32]u8
-    for i in 0..32
-        dist_lengths[i] = 5
-
-    huffman_build_encode_table(@g_fixed_dist_enc, @dist_lengths[0], 32)
-
-    g_fixed_enc_init = 1
-    return
-
-
-# ============================================================================
-# Length and Distance Code Tables
-# ============================================================================
-
-# Length base values for codes 257-285
-const DEF_LENGTH_BASE: [29]i32 = [
-    3, 4, 5, 6, 7, 8, 9, 10,
-    11, 13, 15, 17,
-    19, 23, 27, 31,
-    35, 43, 51, 59,
-    67, 83, 99, 115,
-    131, 163, 195, 227,
-    258
-]
-
-# Extra bits for length codes 257-285
-const DEF_LENGTH_EXTRA: [29]i32 = [
-    0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1,
-    2, 2, 2, 2,
-    3, 3, 3, 3,
-    4, 4, 4, 4,
-    5, 5, 5, 5,
-    0
-]
-
-# Distance base values for codes 0-29
-const DEF_DIST_BASE: [30]i32 = [
-    1, 2, 3, 4,
-    5, 7, 9, 13,
-    17, 25, 33, 49,
-    65, 97, 129, 193,
-    257, 385, 513, 769,
-    1025, 1537, 2049, 3073,
-    4097, 6145, 8193, 12289,
-    16385, 24577
-]
-
-# Extra bits for distance codes 0-29
-const DEF_DIST_EXTRA: [30]i32 = [
-    0, 0, 0, 0,
-    1, 1, 2, 2,
-    3, 3, 4, 4,
-    5, 5, 6, 6,
-    7, 7, 8, 8,
-    9, 9, 10, 10,
-    11, 11, 12, 12,
-    13, 13
-]
-
-
-# Get length code (257-285) for a given match length (3-258)
-fn get_length_code(length: i32) -> i32
-    if length < 3
-        return 257
-    if length == 258
-        return 285
-
-    # Search for the right code
-    for i in 0..28 as i32
-        if length < DEF_LENGTH_BASE[i + 1]
-            return 257 + i
-
-    return 285
-
-
-# Get distance code (0-29) for a given distance (1-32768)
-# Uses binary search for O(log n) instead of O(n) linear search
-fn get_distance_code(dist: i32) -> i32
-    # Binary search for the code where DEF_DIST_BASE[code] <= dist < DEF_DIST_BASE[code+1]
-    var lo: i32 = 0
-    var hi: i32 = 29
-
-    while lo < hi
-        let mid: i32 = (lo + hi + 1) / 2
-        if DEF_DIST_BASE[mid] <= dist
-            lo = mid
-        else
-            hi = mid - 1
-
-    return lo
+# Fixed Huffman tables and the length/distance code lookup live in
+# huffman.ritz (huffman_fixed_*_enc, deflate_length_code, ...; AGAST #4605).
 
 
 # ============================================================================
@@ -263,7 +148,7 @@ fn deflate_stored(input: *u8, input_len: i64, output: *u8, output_cap: i64) -> i
 # ============================================================================
 
 fn deflate_compressed(input: *u8, input_len: i64, output: *u8, output_cap: i64, level: i32) -> i64
-    init_fixed_encode_tables()
+    let litlen_enc: *HuffmanEncodeTable = huffman_fixed_litlen_enc()
 
     # For now, use fixed Huffman encoding (Type 1)
     # Dynamic Huffman (Type 2) can be added later for better compression
@@ -339,25 +224,7 @@ fn deflate_compressed(input: *u8, input_len: i64, output: *u8, output_cap: i64, 
 
         if best_len >= MIN_MATCH
             # Emit length/distance pair
-            let len_code: i32 = get_length_code(best_len)
-            huffman_encode(@g_fixed_litlen_enc, len_code, @writer)
-
-            # Write length extra bits
-            let len_idx: i32 = len_code - 257
-            let len_extra: i32 = DEF_LENGTH_EXTRA[len_idx]
-            if len_extra > 0
-                let len_base: i32 = DEF_LENGTH_BASE[len_idx]
-                bits_write(@writer, (best_len - len_base) as u32, len_extra)
-
-            # Emit distance code
-            let dist_code: i32 = get_distance_code(best_dist)
-            huffman_encode(@g_fixed_dist_enc, dist_code, @writer)
-
-            # Write distance extra bits
-            let dist_extra: i32 = DEF_DIST_EXTRA[dist_code]
-            if dist_extra > 0
-                let dist_base: i32 = DEF_DIST_BASE[dist_code]
-                bits_write(@writer, (best_dist - dist_base) as u32, dist_extra)
+            huffman_encode_fixed_match(@writer, best_len, best_dist)
 
             # Update hash chains for all bytes in match
             for i in 1..best_len
@@ -372,11 +239,11 @@ fn deflate_compressed(input: *u8, input_len: i64, output: *u8, output_cap: i64, 
         else
             # Emit literal
             let byte: i32 = input[pos] as i32
-            huffman_encode(@g_fixed_litlen_enc, byte, @writer)
+            huffman_encode(litlen_enc, byte, @writer)
             pos = pos + 1
 
     # Write end-of-block marker (symbol 256)
-    huffman_encode(@g_fixed_litlen_enc, 256, @writer)
+    huffman_encode(litlen_enc, 256, @writer)
 
     # Flush remaining bits
     bits_flush(@writer)
@@ -722,14 +589,11 @@ pub fn deflate_dynamic(input: *u8, input_len: i64, output: *u8, output_cap: i64,
             head[h] = pos as i32
 
         if best_len >= MIN_MATCH
-            let len_code: i32 = get_length_code(best_len)
-            let len_idx: i32 = len_code - 257
-            let len_extra: i32 = DEF_LENGTH_EXTRA[len_idx]
-            let len_base: i32 = DEF_LENGTH_BASE[len_idx]
+            let len_code: i32 = deflate_length_code(best_len)
+            let len_base: i32 = deflate_length_base(len_code)
 
-            let dist_code: i32 = get_distance_code(best_dist)
-            let dist_extra: i32 = DEF_DIST_EXTRA[dist_code]
-            let dist_base: i32 = DEF_DIST_BASE[dist_code]
+            let dist_code: i32 = deflate_distance_code(best_dist)
+            let dist_base: i32 = deflate_distance_base(dist_code)
 
             lz_symbols[lz_count] = len_code
             lz_extra[lz_count] = best_len - len_base
@@ -860,15 +724,14 @@ pub fn deflate_dynamic(input: *u8, input_len: i64, output: *u8, output_cap: i64,
             let len_code: i32 = lz_symbols[i]
             huffman_encode(@litlen_enc, len_code, @writer)
 
-            let len_idx: i32 = len_code - 257
-            let len_extra_bits: i32 = DEF_LENGTH_EXTRA[len_idx]
+            let len_extra_bits: i32 = deflate_length_extra(len_code)
             if len_extra_bits > 0
                 bits_write(@writer, lz_extra[i] as u32, len_extra_bits)
 
             let dist_code: i32 = lz_dist[i]
             huffman_encode(@dist_enc, dist_code, @writer)
 
-            let dist_extra_bits: i32 = DEF_DIST_EXTRA[dist_code]
+            let dist_extra_bits: i32 = deflate_distance_extra(dist_code)
             if dist_extra_bits > 0
                 bits_write(@writer, lz_dist_extra[i] as u32, dist_extra_bits)
 

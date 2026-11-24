@@ -1,0 +1,324 @@
+# lib/deflate_stream.ritz - Streaming fixed-Huffman Deflate core (RFC 1951)
+#
+# The compressor behind GzipWriter (gzip_stream.ritz) and ZlibWriter
+# (zlib_stream.ritz). Each wraps one DeflateStream and adds only its
+# container's header, checksum and trailer (AGAST #4605; the two writers
+# were ~88% identical copies of this code before).
+#
+# The stream is a run of non-final fixed-Huffman blocks (BTYPE=01): each
+# flush ends one with end-of-block and opens the next, and finish closes it
+# with a final empty block. LZ77 state (32KB window, hash chains) persists
+# across writes, so matches can reach into earlier chunks.
+#
+# Output goes to the caller's buffer of the current call. Bits that don't
+# fill a byte stay in the bit buffer until the next call. Bytes past the
+# buffer's capacity are dropped, as before.
+#
+# API:
+# - deflate_stream_init(s, level)
+# - deflate_stream_write(s, data, len, out, out_start, cap) -> end position
+# - deflate_stream_flush(s, out, cap) -> bytes written
+# - deflate_stream_finish(s, out, out_start, cap) -> end position
+# - deflate_stream_free(s)
+
+import ritzlib.sys
+
+import huffman
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+
+# Stream states (DeflateStream.state)
+pub const DEFLATE_STREAM_INIT: i32 = 0          # no block opened yet
+pub const DEFLATE_STREAM_COMPRESSING: i32 = 2   # a non-final block is open
+pub const DEFLATE_STREAM_FINISHED: i32 = 3      # final block written
+
+# LZ77 parameters
+const DSTREAM_WINDOW_SIZE: i32 = 32768
+const DSTREAM_WINDOW_MASK: i32 = 32767
+const DSTREAM_HASH_SIZE: i32 = 32768
+const DSTREAM_HASH_MASK: i32 = 32767
+const DSTREAM_MIN_MATCH: i32 = 3
+const DSTREAM_MAX_MATCH: i32 = 258
+
+
+# ============================================================================
+# DeflateStream
+# ============================================================================
+
+# Streaming compressor state: LZ77 window and hash chains, plus the bit
+# writer over the current call's output buffer. Fixed size; no allocation.
+pub struct DeflateStream
+    state: i32                      # DEFLATE_STREAM_*
+    level: i32                      # Compression level (0-9)
+
+    # LZ77 sliding window
+    window: [32768]u8               # 32KB window
+    window_pos: i64                 # Position in window (mod window size)
+    window_fill: i64                # How much of window is valid
+
+    # Hash chains for match finding
+    head: [32768]i32                # Head of hash chains
+    prev: [32768]i32                # Previous positions in chain
+
+    # Bit writer state
+    out_buf: *u8                    # Current output buffer
+    out_pos: i64                    # Position in output buffer
+    out_cap: i64                    # Output buffer capacity
+    bit_buf: u32                    # Bit buffer (pending bits)
+    bit_count: i32                  # Number of bits in buffer
+
+
+# Reset `s` for a new stream at compression `level` (0-9; the caller checks
+# the range).
+pub fn deflate_stream_init(s: *DeflateStream, level: i32)
+    s.state = DEFLATE_STREAM_INIT
+    s.level = level
+    s.window_pos = 0
+    s.window_fill = 0
+    s.bit_buf = 0
+    s.bit_count = 0
+
+    # Initialize hash chains to -1 (no entry)
+    for i in 0..DSTREAM_HASH_SIZE
+        s.head[i] = -1
+        s.prev[i] = 0
+
+    # Build the shared fixed tables now, not inside the first write.
+    huffman_fixed_litlen_enc()
+    return
+
+
+# Mark `s` unused. Holds no resources.
+pub fn deflate_stream_free(s: *DeflateStream)
+    s.state = DEFLATE_STREAM_INIT
+    return
+
+
+# ============================================================================
+# Bit Writer
+# ============================================================================
+
+fn dstream_set_output(s: *DeflateStream, out: *u8, pos: i64, cap: i64)
+    s.out_buf = out
+    s.out_pos = pos
+    s.out_cap = cap
+    return
+
+
+# Write n bits LSB-first; whole bytes go to the output, past-capacity bytes
+# are dropped.
+fn dstream_write_bits(s: *DeflateStream, value: u32, n: i32)
+    s.bit_buf = s.bit_buf | (value << s.bit_count)
+    s.bit_count = s.bit_count + n
+
+    while s.bit_count >= 8
+        if s.out_pos < s.out_cap
+            s.out_buf[s.out_pos] = (s.bit_buf & 0xFF) as u8
+            s.out_pos = s.out_pos + 1
+        s.bit_buf = s.bit_buf >> 8
+        s.bit_count = s.bit_count - 8
+
+    return
+
+
+# Write the pending partial byte, if any.
+fn dstream_flush_bits(s: *DeflateStream)
+    if s.bit_count > 0
+        if s.out_pos < s.out_cap
+            s.out_buf[s.out_pos] = (s.bit_buf & 0xFF) as u8
+            s.out_pos = s.out_pos + 1
+        s.bit_buf = 0
+        s.bit_count = 0
+    return
+
+
+# Write one fixed literal/length symbol.
+fn dstream_write_symbol(s: *DeflateStream, sym: i32)
+    let enc: *HuffmanEncodeTable = huffman_fixed_litlen_enc()
+    dstream_write_bits(s, enc.codes[sym] as u32, enc.lengths[sym] as i32)
+    return
+
+
+# Open a fixed-Huffman block: BFINAL, then BTYPE = 01.
+fn dstream_block_header(s: *DeflateStream, bfinal: u32)
+    dstream_write_bits(s, bfinal, 1)
+    dstream_write_bits(s, 1, 2)
+    return
+
+
+# Write one length/distance pair with the fixed codes.
+fn dstream_write_match(s: *DeflateStream, length: i32, distance: i32)
+    let len_code: i32 = deflate_length_code(length)
+    dstream_write_symbol(s, len_code)
+    let len_extra: i32 = deflate_length_extra(len_code)
+    if len_extra > 0
+        dstream_write_bits(s, (length - deflate_length_base(len_code)) as u32, len_extra)
+
+    let dist_code: i32 = deflate_distance_code(distance)
+    let dist_enc: *HuffmanEncodeTable = huffman_fixed_dist_enc()
+    dstream_write_bits(s, dist_enc.codes[dist_code] as u32, dist_enc.lengths[dist_code] as i32)
+    let dist_extra: i32 = deflate_distance_extra(dist_code)
+    if dist_extra > 0
+        dstream_write_bits(s, (distance - deflate_distance_base(dist_code)) as u32, dist_extra)
+    return
+
+
+# ============================================================================
+# Compression
+# ============================================================================
+
+# Hash 3 bytes
+fn dstream_hash3(data: *u8, pos: i64) -> i32
+    let b0: u32 = data[pos] as u32
+    let b1: u32 = data[pos + 1] as u32
+    let b2: u32 = data[pos + 2] as u32
+    let h: u32 = ((b0 << 10) ^ (b1 << 5) ^ b2) & (DSTREAM_HASH_MASK as u32)
+    return h as i32
+
+
+# Compress `len` bytes of `data` into `out`, starting at `out_start` (the
+# caller's header, if any, sits before it). The first write opens a
+# non-final block. Returns the end position in `out`.
+pub fn deflate_stream_write(s: *DeflateStream, data: *u8, len: i64, out: *u8, out_start: i64, out_cap: i64) -> i64
+    dstream_set_output(s, out, out_start, out_cap)
+    if s.state == DEFLATE_STREAM_INIT
+        # BFINAL=0: more data may follow
+        dstream_block_header(s, 0)
+        s.state = DEFLATE_STREAM_COMPRESSING
+
+    # Determine max chain length based on level
+    var max_chain: i32 = 4
+    if s.level >= 4
+        max_chain = 16
+    if s.level >= 7
+        max_chain = 128
+
+    # Process input data
+    var pos: i64 = 0
+
+    while pos < len
+        # Copy byte to window
+        let win_idx: i32 = (s.window_pos as i32) & DSTREAM_WINDOW_MASK
+        s.window[win_idx] = data[pos]
+
+        # Try to find a match (need at least 3 bytes)
+        var best_len: i32 = 0
+        var best_dist: i32 = 0
+
+        if s.window_fill >= (DSTREAM_MIN_MATCH - 1) as i64
+            if pos + 2 < len
+                # We can hash using input data directly
+                let h: i32 = dstream_hash3(data, pos)
+                var chain_pos: i32 = s.head[h]
+                var chain_count: i32 = 0
+
+                while chain_pos >= 0
+                    if chain_count >= max_chain
+                        break
+
+                    # Calculate distance in the window
+                    let dist: i64 = s.window_pos - chain_pos as i64
+                    if dist <= 0
+                        break
+                    if dist > DSTREAM_WINDOW_SIZE as i64
+                        break
+
+                    # Check match length
+                    var match_len: i32 = 0
+                    let max_len: i64 = len - pos
+                    var max_match_len: i32 = DSTREAM_MAX_MATCH
+                    if max_len < DSTREAM_MAX_MATCH as i64
+                        max_match_len = max_len as i32
+
+                    # Compares past window_pos read unwritten window bytes:
+                    # AGAST #4611.
+                    while match_len < max_match_len
+                        let win_match_idx: i32 = (chain_pos + match_len) & DSTREAM_WINDOW_MASK
+                        if s.window[win_match_idx] != data[pos + match_len as i64]
+                            break
+                        match_len = match_len + 1
+
+                    if match_len >= DSTREAM_MIN_MATCH
+                        if match_len > best_len
+                            best_len = match_len
+                            best_dist = dist as i32
+
+                    let prev_idx: i32 = chain_pos & DSTREAM_WINDOW_MASK
+                    chain_pos = s.prev[prev_idx]
+                    chain_count = chain_count + 1
+
+                # Update hash chain for current position
+                s.prev[win_idx] = s.head[h]
+                s.head[h] = s.window_pos as i32
+
+        if best_len >= DSTREAM_MIN_MATCH
+            dstream_write_match(s, best_len, best_dist)
+
+            # Advance position and update hash for matched bytes
+            for i in 1..best_len
+                pos = pos + 1
+                if pos < len
+                    let next_win_idx: i32 = ((s.window_pos + 1) as i32) & DSTREAM_WINDOW_MASK
+                    s.window[next_win_idx] = data[pos]
+                    s.window_pos = s.window_pos + 1
+                    if s.window_fill < DSTREAM_WINDOW_SIZE as i64
+                        s.window_fill = s.window_fill + 1
+
+                    if pos + 2 < len
+                        let nh: i32 = dstream_hash3(data, pos)
+                        s.prev[next_win_idx] = s.head[nh]
+                        s.head[nh] = s.window_pos as i32 - 1
+
+            pos = pos + 1
+            s.window_pos = s.window_pos + 1
+            if s.window_fill < DSTREAM_WINDOW_SIZE as i64
+                s.window_fill = s.window_fill + 1
+        else
+            # Emit literal
+            dstream_write_symbol(s, data[pos] as i32)
+            pos = pos + 1
+            s.window_pos = s.window_pos + 1
+            if s.window_fill < DSTREAM_WINDOW_SIZE as i64
+                s.window_fill = s.window_fill + 1
+
+    return s.out_pos
+
+
+# End the open block and open a new non-final one, so everything written so
+# far can be decoded. The bit stream is not byte-aligned afterwards: pending
+# bits stay buffered for the next call. Returns bytes written to `out`, or 0
+# if no block is open.
+pub fn deflate_stream_flush(s: *DeflateStream, out: *u8, out_cap: i64) -> i64
+    if s.state != DEFLATE_STREAM_COMPRESSING
+        return 0
+
+    dstream_set_output(s, out, 0, out_cap)
+    dstream_write_symbol(s, 256)        # end-of-block
+    dstream_block_header(s, 0)          # BFINAL = 0
+    return s.out_pos
+
+
+# Close the stream: end the open block (or, with nothing written, open one)
+# and write a final empty block, then pad to a byte. Output starts at
+# `out_start` only when nothing was written yet (the caller's header goes
+# first); otherwise at 0. Returns the end position in `out`, or 0 if the
+# stream was already finished.
+pub fn deflate_stream_finish(s: *DeflateStream, out: *u8, out_start: i64, out_cap: i64) -> i64
+    if s.state == DEFLATE_STREAM_INIT
+        dstream_set_output(s, out, out_start, out_cap)
+        dstream_block_header(s, 1)      # BFINAL = 1
+        dstream_write_symbol(s, 256)
+    else if s.state == DEFLATE_STREAM_COMPRESSING
+        dstream_set_output(s, out, 0, out_cap)
+        dstream_write_symbol(s, 256)    # end the open block
+        dstream_block_header(s, 1)      # final empty block
+        dstream_write_symbol(s, 256)
+    else
+        return 0
+
+    dstream_flush_bits(s)
+    s.state = DEFLATE_STREAM_FINISHED
+    return s.out_pos

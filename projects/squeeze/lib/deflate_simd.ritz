@@ -36,111 +36,8 @@ const SIMD_MAX_STORED_BLOCK: i32 = 65535
 const SIMD_ERR_OUTPUT_FULL: i64 = -1
 const SIMD_ERR_INVALID_LEVEL: i64 = -2
 
-# ============================================================================
-# Fixed Huffman Encode Tables
-# ============================================================================
-
-var g_simd_fixed_litlen_enc: HuffmanEncodeTable
-var g_simd_fixed_dist_enc: HuffmanEncodeTable
-var g_simd_fixed_enc_init: i32 = 0
-
-fn init_simd_fixed_encode_tables()
-    if g_simd_fixed_enc_init != 0
-        return
-
-    var litlen_lengths: [288]u8
-    for i in 0..144
-        litlen_lengths[i] = 8
-    for i in 144..256
-        litlen_lengths[i] = 9
-    for i in 256..280
-        litlen_lengths[i] = 7
-    for i in 280..288
-        litlen_lengths[i] = 8
-
-    huffman_build_encode_table(@g_simd_fixed_litlen_enc, @litlen_lengths[0], 288)
-
-    var dist_lengths: [32]u8
-    for i in 0..32
-        dist_lengths[i] = 5
-
-    huffman_build_encode_table(@g_simd_fixed_dist_enc, @dist_lengths[0], 32)
-
-    g_simd_fixed_enc_init = 1
-    return
-
-
-# Length base values for codes 257-285
-const SIMD_LENGTH_BASE: [29]i32 = [
-    3, 4, 5, 6, 7, 8, 9, 10,
-    11, 13, 15, 17,
-    19, 23, 27, 31,
-    35, 43, 51, 59,
-    67, 83, 99, 115,
-    131, 163, 195, 227,
-    258
-]
-
-# Extra bits for length codes 257-285
-const SIMD_LENGTH_EXTRA: [29]i32 = [
-    0, 0, 0, 0, 0, 0, 0, 0,
-    1, 1, 1, 1,
-    2, 2, 2, 2,
-    3, 3, 3, 3,
-    4, 4, 4, 4,
-    5, 5, 5, 5,
-    0
-]
-
-# Distance base values for codes 0-29
-const SIMD_DIST_BASE: [30]i32 = [
-    1, 2, 3, 4,
-    5, 7, 9, 13,
-    17, 25, 33, 49,
-    65, 97, 129, 193,
-    257, 385, 513, 769,
-    1025, 1537, 2049, 3073,
-    4097, 6145, 8193, 12289,
-    16385, 24577
-]
-
-# Extra bits for distance codes 0-29
-const SIMD_DIST_EXTRA: [30]i32 = [
-    0, 0, 0, 0,
-    1, 1, 2, 2,
-    3, 3, 4, 4,
-    5, 5, 6, 6,
-    7, 7, 8, 8,
-    9, 9, 10, 10,
-    11, 11, 12, 12,
-    13, 13
-]
-
-fn simd_get_length_code(length: i32) -> i32
-    if length < 3
-        return 257
-    if length == 258
-        return 285
-
-    for i in 0..28 as i32
-        if length < SIMD_LENGTH_BASE[i + 1]
-            return 257 + i
-
-    return 285
-
-
-fn simd_get_distance_code(dist: i32) -> i32
-    var lo: i32 = 0
-    var hi: i32 = 29
-
-    while lo < hi
-        let mid: i32 = (lo + hi + 1) / 2
-        if SIMD_DIST_BASE[mid] <= dist
-            lo = mid
-        else
-            hi = mid - 1
-
-    return lo
+# Fixed Huffman tables and the length/distance code lookup come from
+# huffman.ritz (AGAST #4605).
 
 
 # ============================================================================
@@ -484,7 +381,7 @@ fn deflate_simd_stored(input: *u8, input_len: i64, output: *u8, output_cap: i64)
 # ============================================================================
 
 fn deflate_simd_compressed(input: *u8, in_len: i64, output: *u8, out_cap: i64, level: i32) -> i64
-    init_simd_fixed_encode_tables()
+    let litlen_enc: *HuffmanEncodeTable = huffman_fixed_litlen_enc()
 
     var writer: BitWriter = bits_writer_init(output, out_cap)
 
@@ -575,22 +472,7 @@ fn deflate_simd_compressed(input: *u8, in_len: i64, output: *u8, out_cap: i64, l
 
         if best_len >= SIMD_MIN_MATCH
             # Emit length/distance pair
-            let len_code: i32 = simd_get_length_code(best_len)
-            huffman_encode(@g_simd_fixed_litlen_enc, len_code, @writer)
-
-            let len_idx: i32 = len_code - 257
-            let len_extra: i32 = SIMD_LENGTH_EXTRA[len_idx]
-            if len_extra > 0
-                let len_base: i32 = SIMD_LENGTH_BASE[len_idx]
-                bits_write(@writer, (best_len - len_base) as u32, len_extra)
-
-            let dist_code: i32 = simd_get_distance_code(best_dist)
-            huffman_encode(@g_simd_fixed_dist_enc, dist_code, @writer)
-
-            let dist_extra: i32 = SIMD_DIST_EXTRA[dist_code]
-            if dist_extra > 0
-                let dist_base: i32 = SIMD_DIST_BASE[dist_code]
-                bits_write(@writer, (best_dist - dist_base) as u32, dist_extra)
+            huffman_encode_fixed_match(@writer, best_len, best_dist)
 
             # Update hash chains for all bytes in match
             for i in 1..best_len
@@ -609,11 +491,11 @@ fn deflate_simd_compressed(input: *u8, in_len: i64, output: *u8, out_cap: i64, l
         else
             # Emit literal
             let byte: i32 = input[pos] as i32
-            huffman_encode(@g_simd_fixed_litlen_enc, byte, @writer)
+            huffman_encode(litlen_enc, byte, @writer)
             pos = pos + 1
 
     # Write end-of-block marker (symbol 256)
-    huffman_encode(@g_simd_fixed_litlen_enc, 256, @writer)
+    huffman_encode(litlen_enc, 256, @writer)
 
     # Flush remaining bits
     bits_flush(@writer)

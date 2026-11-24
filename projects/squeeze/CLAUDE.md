@@ -17,9 +17,10 @@ squeeze/
 │   ├── crc32_simd.ritz     # SIMD-accelerated CRC32 (PCLMULQDQ)
 │   ├── deflate.ritz        # Deflate compression (RFC 1951)
 │   ├── deflate_simd.ritz   # SIMD-accelerated deflate
+│   ├── deflate_stream.ritz # Streaming fixed-Huffman core behind GzipWriter/ZlibWriter
 │   ├── gzip.ritz           # Gzip container format (RFC 1952)
 │   ├── gzip_stream.ritz    # Streaming gzip (GzipReader/GzipWriter)
-│   ├── huffman.ritz        # Huffman coding
+│   ├── huffman.ritz        # Huffman coding; the one fixed-code + length/distance source
 │   ├── inflate.ritz        # Deflate decompression
 │   ├── squeeze.ritz        # Main module (re-exports)
 │   ├── zlib.ritz           # Zlib container format (RFC 1950)
@@ -32,6 +33,7 @@ squeeze/
 │   ├── test_crc32_simd.ritz
 │   ├── test_crossval.ritz  # Cross-validation against system gzip/zlib
 │   ├── test_deflate.ritz
+│   ├── test_fixed_huffman_pin.ritz  # Byte-identity pins for every fixed-Huffman writer
 │   ├── test_gzip.ritz
 │   ├── test_gzip_stream.ritz
 │   ├── test_hashchain_simd.ritz
@@ -57,7 +59,7 @@ file documented both. squeeze is `test_only = true` with no `[[bin]]`, so
 Run from the **monorepo root**. `rz` sets `RITZ_PATH` itself.
 
 ```bash
-# Run all tests — 15 .ritz test files, 199 [[test]] functions.
+# Run all tests — 16 .ritz test files, 209 [[test]] functions.
 # Takes several minutes; budget for it.
 ./rz test squeeze
 ```
@@ -272,7 +274,9 @@ Type 2: Dynamic Huffman codes (code length tree + literal/distance trees)
 
 ## Streaming API
 
-The streaming API (`gzip_stream.ritz`, `zlib_stream.ritz`) is designed for:
+The streaming API (`gzip_stream.ritz`, `zlib_stream.ritz`) is designed for
+(both writers wrap one compressor, `deflate_stream.ritz`, and add only their
+header, checksum and trailer):
 - **Large files** - Process data in chunks without loading entire file
 - **HTTP responses** - Valet uses this for chunked transfer compression
 - **Fixed memory** - No dynamic allocation after initialization

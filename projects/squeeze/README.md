@@ -36,7 +36,7 @@ Squeeze is a pure Ritz implementation with no C dependencies, targeting both cor
 # reports "nothing to build" — that is the correct, successful outcome.
 ./rz build squeeze
 
-# Run the test suite (199 [[test]] functions; takes several minutes)
+# Run the test suite (209 [[test]] functions; takes several minutes)
 ./rz test squeeze
 ```
 
@@ -87,7 +87,7 @@ let checksum: u32 = crc32_final(state)
 Deflate (compress and decompress), the Gzip and Zlib container formats, the
 streaming reader/writer pair for both, and the SIMD paths are all implemented in
 `lib/`; `CLAUDE.md` marks phases 1-6 complete. This README described Deflate and
-the containers as "in progress" long after they landed. 199 `[[test]]` functions
+the containers as "in progress" long after they landed. 209 `[[test]]` functions
 are present; run `./rz test squeeze` for the current pass count (it takes several
 minutes).
 

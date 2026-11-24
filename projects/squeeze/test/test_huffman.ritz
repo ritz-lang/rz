@@ -541,5 +541,133 @@ fn print_hex8(val: u8)
     sys_write(1, @hex[0], 2)
 
 
+
+# ============================================================================
+# Shared fixed-Huffman source and length/distance lookup (AGAST #4605)
+# ============================================================================
+
+[[test]]
+fn test_fixed_lengths_shared() -> i32
+    # RFC 1951 3.2.6: the one source every fixed encoder and inflate reads.
+    var litlen: [288]u8 = [0; 288]
+    var dist: [32]u8 = [0; 32]
+    huffman_fixed_litlen_lengths(@litlen[0])
+    huffman_fixed_dist_lengths(@dist[0])
+    for i in 0..288
+        var want: u8 = 8
+        if i >= 144 and i < 256
+            want = 9
+        if i >= 256 and i < 280
+            want = 7
+        if litlen[i] != want
+            print("FAIL: test_fixed_lengths_shared litlen\n")
+            return 1
+    for i in 0..32
+        if dist[i] != 5
+            print("FAIL: test_fixed_lengths_shared dist\n")
+            return 1
+    0
+
+
+[[test]]
+fn test_fixed_encode_tables_shared() -> i32
+    # The shared tables equal a table built from the RFC lengths, and are
+    # built once: every call hands back the same table.
+    var lengths: [288]u8
+    huffman_fixed_litlen_lengths(@lengths[0])
+    var ref: HuffmanEncodeTable
+    huffman_build_encode_table(@ref, @lengths[0], 288)
+    let lit: *HuffmanEncodeTable = huffman_fixed_litlen_enc()
+    if lit != huffman_fixed_litlen_enc()
+        print("FAIL: test_fixed_encode_tables_shared litlen not stable\n")
+        return 1
+    for i in 0..288
+        if lit.codes[i] != ref.codes[i] or lit.lengths[i] != ref.lengths[i]
+            print("FAIL: test_fixed_encode_tables_shared litlen\n")
+            return 1
+    var dlens: [32]u8
+    huffman_fixed_dist_lengths(@dlens[0])
+    var dref: HuffmanEncodeTable
+    huffman_build_encode_table(@dref, @dlens[0], 32)
+    let d: *HuffmanEncodeTable = huffman_fixed_dist_enc()
+    for i in 0..32
+        if d.codes[i] != dref.codes[i] or d.lengths[i] != dref.lengths[i]
+            print("FAIL: test_fixed_encode_tables_shared dist\n")
+            return 1
+    0
+
+
+[[test]]
+fn test_deflate_length_code_covers_every_length() -> i32
+    # Every match length 3..258 lands in the code whose range holds it;
+    # 258 is code 285 (0 extra bits), never 284 + 31.
+    for len in 3..259
+        let code: i32 = deflate_length_code(len as i32)
+        if code < 257 or code > 285
+            print("FAIL: length code out of range\n")
+            return 1
+        let base: i32 = deflate_length_base(code)
+        let extra: i32 = deflate_length_extra(code)
+        if (len as i32) < base or (len as i32) >= base + (1 << extra)
+            print("FAIL: length ")
+            print_i64(len as i64)
+            print(" outside its code's range\n")
+            return 1
+    if deflate_length_code(258) != 285 or deflate_length_extra(285) != 0
+        print("FAIL: length 258 is not code 285\n")
+        return 1
+    if deflate_length_code(227) != 284 or deflate_length_code(257) != 284
+        print("FAIL: code 284 range\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_deflate_distance_code_covers_every_distance() -> i32
+    for d in 1..32769
+        let code: i32 = deflate_distance_code(d as i32)
+        if code < 0 or code > 29
+            print("FAIL: distance code out of range\n")
+            return 1
+        let base: i32 = deflate_distance_base(code)
+        let extra: i32 = deflate_distance_extra(code)
+        if (d as i32) < base or (d as i32) >= base + (1 << extra)
+            print("FAIL: distance ")
+            print_i64(d as i64)
+            print(" outside its code's range\n")
+            return 1
+    if deflate_distance_code(32768) != 29 or deflate_distance_code(24577) != 29
+        print("FAIL: code 29 range\n")
+        return 1
+    0
+
+
+[[test]]
+fn test_fixed_encode_match_bits() -> i32
+    # length 100 = code 279 + 1 (4 extra bits); distance 1000 = code 19 +
+    # 231 (8 extra bits).  The shared emitter must write exactly what the
+    # four separate steps write.
+    var want: [8]u8 = [0; 8]
+    var wr: BitWriter = bits_writer_init(@want[0], 8)
+    huffman_encode(huffman_fixed_litlen_enc(), 279, @wr)
+    bits_write(@wr, 1, 4)
+    huffman_encode(huffman_fixed_dist_enc(), 19, @wr)
+    bits_write(@wr, 231, 8)
+    bits_flush(@wr)
+
+    var got: [8]u8 = [0; 8]
+    var gw: BitWriter = bits_writer_init(@got[0], 8)
+    huffman_encode_fixed_match(@gw, 100, 1000)
+    bits_flush(@gw)
+
+    if bits_written(@gw) != bits_written(@wr)
+        print("FAIL: test_fixed_encode_match_bits length\n")
+        return 1
+    for i in 0..8
+        if got[i] != want[i]
+            print("FAIL: test_fixed_encode_match_bits byte\n")
+            return 1
+    0
+
 # Note: Tests are automatically discovered and run by ritzunit.
 # Each @test function is found via ELF symbol table scanning.

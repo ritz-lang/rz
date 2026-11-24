@@ -1,0 +1,296 @@
+# test/test_fixed_huffman_pin.ritz - Byte-identity pins for every fixed-Huffman writer
+#
+# AGAST #4605 folded four copies of the fixed-Huffman encoder (deflate,
+# deflate_simd, gzip_stream, zlib_stream) into one table source, one
+# length/distance lookup and one streaming core.  These tests pin each
+# writer's exact output, recorded before that refactor, as (length, CRC-32)
+# over a corpus built to reach every code class:
+#
+# - all 256 byte values as literals (8- and 9-bit literal codes)
+# - LCG-chosen slices of a phrase: many short matches, varied distances
+# - a 700-byte run: length-258 matches at distance 1 (code 285)
+# - LCG noise: literal-heavy stretches
+# - a 400-byte copy from ~30000 bytes back: distance code 29 (13 extra bits)
+#
+# A changed byte anywhere changes the CRC; a dropped or added byte changes the
+# length.  If one of these goes red the encoder's output changed: that is a
+# compatibility break for anything that compares compressed bytes, not a
+# number to re-record.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+
+import lib.crc32
+import lib.deflate
+import lib.deflate_simd
+import lib.gzip
+import lib.gzip_stream
+import lib.zlib
+import lib.zlib_stream
+
+const CORPUS_CAP: i64 = 40000
+const OUT_CAP: i64 = 65536
+
+var g_corpus: [40000]u8
+var g_out: [65536]u8
+var g_chunk: [65536]u8
+var g_back: [40000]u8
+
+
+# Deterministic LCG step; stays below 2^31 so i64 never overflows.
+fn pin_lcg(seed: i64) -> i64
+    return (seed * 1103515245 + 12345) & 0x7FFFFFFF
+
+
+# Build the corpus described in the file header; returns its length.
+fn pin_build_corpus() -> i64
+    var pos: i64 = 0
+
+    # Every byte value, twice.
+    for r in 0..2
+        for b in 0..256
+            g_corpus[pos] = b as u8
+            pos = pos + 1
+
+    # Slices of a phrase, chosen by an LCG.
+    let phrase: StrView = "the quick brown fox jumps over the lazy dog while huffman codes deflate a sliding window stream "
+    var seed: i64 = 4605
+    while pos < 27000
+        seed = pin_lcg(seed)
+        let start: i64 = (seed >> 8) % (phrase.len - 20)
+        seed = pin_lcg(seed)
+        let n: i64 = 3 + (seed >> 8) % 17
+        for i in 0..n
+            g_corpus[pos] = phrase.ptr[start + i]
+            pos = pos + 1
+
+    # A long run.
+    for i in 0..700
+        g_corpus[pos] = 'z'
+        pos = pos + 1
+
+    # Noise.
+    for i in 0..3000
+        seed = pin_lcg(seed)
+        g_corpus[pos] = ((seed >> 16) & 0xFF) as u8
+        pos = pos + 1
+
+    # A copy from far back (distance > 24577).
+    let src: i64 = pos - 30000   # pos > 30400 here, so src is in range
+    for i in 0..400
+        g_corpus[pos] = g_corpus[src + i]
+        pos = pos + 1
+
+    return pos
+
+
+# Compare (len, crc32(out[0..len])) with the pinned pair; print on mismatch.
+fn pin_check(name: StrView, len: i64, want_len: i64, want_crc: u32) -> i32
+    if len < 0
+        prints(name)
+        print(": writer returned error ")
+        print_i64(len)
+        print("\n")
+        return 1
+    let got_crc: u32 = crc32(@g_out[0], len)
+    if len != want_len or got_crc != want_crc
+        prints(name)
+        print(": len=")
+        print_i64(len)
+        print(" crc=")
+        print_i64(got_crc as i64)
+        print(" want len=")
+        print_i64(want_len)
+        print(" crc=")
+        print_i64(want_crc as i64)
+        print("\n")
+        return 1
+    return 0
+
+
+# Append n bytes of g_chunk to g_out at *pos.
+fn pin_append(pos: *i64, n: i64) -> i32
+    if n < 0
+        return 1
+    for i in 0..n
+        g_out[pos[0] + i] = g_chunk[i]
+    pos[0] = pos[0] + n
+    return 0
+
+
+# The writer is zeroed before init: the stream writers' match search can read
+# window bytes it has not written yet, and init does not clear the window, so
+# without this the chunked output depends on stack garbage (ritz0 and ritz1
+# then disagree on the same source).  AGAST #4611 tracks the fix.
+#
+# GzipWriter over the corpus. chunk == 0: one write; else writes of `chunk`
+# bytes with a flush after every write.  empty: no write at all.
+fn pin_gzip(clen: i64, level: i32, chunk: i64, empty: bool) -> i64
+    var w: GzipWriter
+    memzero(@w as *u8, sizeof(GzipWriter))
+    gzip_writer_init(@w, level)
+    var pos: i64 = 0
+    if not empty
+        var off: i64 = 0
+        while off < clen
+            var n: i64 = clen - off
+            if chunk > 0 and n > chunk
+                n = chunk
+            if pin_append(@pos, gzip_writer_write(@w, @g_corpus[off], n, @g_chunk[0], OUT_CAP)) != 0
+                return -100
+            if chunk > 0
+                if pin_append(@pos, gzip_writer_flush(@w, @g_chunk[0], OUT_CAP)) != 0
+                    return -101
+            off = off + n
+    if pin_append(@pos, gzip_writer_finish(@w, @g_chunk[0], OUT_CAP)) != 0
+        return -102
+    gzip_writer_free(@w)
+    return pos
+
+
+# ZlibWriter twin of pin_gzip (zeroed for the same reason).
+fn pin_zlib(clen: i64, level: i32, chunk: i64, empty: bool) -> i64
+    var w: ZlibWriter
+    memzero(@w as *u8, sizeof(ZlibWriter))
+    zlib_writer_init(@w, level)
+    var pos: i64 = 0
+    if not empty
+        var off: i64 = 0
+        while off < clen
+            var n: i64 = clen - off
+            if chunk > 0 and n > chunk
+                n = chunk
+            if pin_append(@pos, zlib_writer_write(@w, @g_corpus[off], n, @g_chunk[0], OUT_CAP)) != 0
+                return -100
+            if chunk > 0
+                if pin_append(@pos, zlib_writer_flush(@w, @g_chunk[0], OUT_CAP)) != 0
+                    return -101
+            off = off + n
+    if pin_append(@pos, zlib_writer_finish(@w, @g_chunk[0], OUT_CAP)) != 0
+        return -102
+    zlib_writer_free(@w)
+    return pos
+
+
+# The pinned stream must also decode back to the corpus.
+fn pin_roundtrip(name: StrView, len: i64, clen: i64, is_gzip: bool) -> i32
+    if len < 0
+        return 1
+    var n: i64 = 0
+    if is_gzip
+        n = gzip_decompress(@g_out[0], len, @g_back[0], CORPUS_CAP)
+    else
+        n = zlib_decompress(@g_out[0], len, @g_back[0], CORPUS_CAP)
+    var bad: bool = n != clen
+    if not bad
+        for i in 0..clen
+            if g_back[i] != g_corpus[i]
+                bad = true
+                break
+    if bad
+        prints(name)
+        print(": does not round-trip, got ")
+        print_i64(n)
+        print(" bytes\n")
+        return 1
+    return 0
+
+
+[[test]]
+fn test_pin_corpus_shape() -> i32
+    # The corpus itself must not drift, or every pin below is meaningless.
+    let clen: i64 = pin_build_corpus()
+    let c: u32 = crc32(@g_corpus[0], clen)
+    if clen != PIN_CORPUS_LEN or c != PIN_CORPUS_CRC
+        print("corpus len ")
+        print_i64(clen)
+        print(" crc ")
+        print_i64(c as i64)
+        print("\n")
+        return 1
+    return 0
+
+
+[[test]]
+fn test_pin_deflate_fixed_levels() -> i32
+    # Levels 1, 6 and 9 pick chain limits 4, 16 and 128.
+    let clen: i64 = pin_build_corpus()
+    var fails: i32 = 0
+    fails = fails + pin_check("deflate L1", deflate(@g_corpus[0], clen, @g_out[0], OUT_CAP, 1), PIN_DEFLATE_L1_LEN, PIN_DEFLATE_L1_CRC)
+    fails = fails + pin_check("deflate L6", deflate(@g_corpus[0], clen, @g_out[0], OUT_CAP, 6), PIN_DEFLATE_L6_LEN, PIN_DEFLATE_L6_CRC)
+    fails = fails + pin_check("deflate L9", deflate(@g_corpus[0], clen, @g_out[0], OUT_CAP, 9), PIN_DEFLATE_L9_LEN, PIN_DEFLATE_L9_CRC)
+    # deflate_dynamic is not a fixed-Huffman writer, but it reads the same
+    # length/distance lookup, so it is pinned too.
+    fails = fails + pin_check("deflate_dynamic L6", deflate_dynamic(@g_corpus[0], clen, @g_out[0], OUT_CAP, 6), PIN_DYNAMIC_L6_LEN, PIN_DYNAMIC_L6_CRC)
+    return fails
+
+
+[[test]]
+fn test_pin_deflate_simd() -> i32
+    let clen: i64 = pin_build_corpus()
+    var fails: i32 = 0
+    fails = fails + pin_check("deflate_simd L1", deflate_simd(@g_corpus[0], clen, @g_out[0], OUT_CAP, 1), PIN_SIMD_L1_LEN, PIN_SIMD_L1_CRC)
+    fails = fails + pin_check("deflate_simd L9", deflate_simd(@g_corpus[0], clen, @g_out[0], OUT_CAP, 9), PIN_SIMD_L9_LEN, PIN_SIMD_L9_CRC)
+    return fails
+
+
+[[test]]
+fn test_pin_gzip_stream() -> i32
+    let clen: i64 = pin_build_corpus()
+    var fails: i32 = 0
+    var n: i64 = pin_gzip(clen, 6, 0, false)
+    fails = fails + pin_check("gzip one-shot L6", n, PIN_GZ_ONE_LEN, PIN_GZ_ONE_CRC)
+    fails = fails + pin_roundtrip("gzip one-shot L6", n, clen, true)
+    n = pin_gzip(clen, 1, 1000, false)
+    fails = fails + pin_check("gzip chunked+flush L1", n, PIN_GZ_CHUNK_LEN, PIN_GZ_CHUNK_CRC)
+    fails = fails + pin_roundtrip("gzip chunked+flush L1", n, clen, true)
+    fails = fails + pin_check("gzip empty", pin_gzip(clen, 6, 0, true), PIN_GZ_EMPTY_LEN, PIN_GZ_EMPTY_CRC)
+    return fails
+
+
+[[test]]
+fn test_pin_zlib_stream() -> i32
+    let clen: i64 = pin_build_corpus()
+    var fails: i32 = 0
+    var n: i64 = pin_zlib(clen, 6, 0, false)
+    fails = fails + pin_check("zlib one-shot L6", n, PIN_ZL_ONE_LEN, PIN_ZL_ONE_CRC)
+    fails = fails + pin_roundtrip("zlib one-shot L6", n, clen, false)
+    n = pin_zlib(clen, 9, 1000, false)
+    fails = fails + pin_check("zlib chunked+flush L9", n, PIN_ZL_CHUNK_LEN, PIN_ZL_CHUNK_CRC)
+    fails = fails + pin_roundtrip("zlib chunked+flush L9", n, clen, false)
+    fails = fails + pin_check("zlib empty", pin_zlib(clen, 6, 0, true), PIN_ZL_EMPTY_LEN, PIN_ZL_EMPTY_CRC)
+    return fails
+
+
+# ============================================================================
+# Pinned values, recorded on train tail 446fd9d7723c before the refactor
+# (the squeeze sources are unchanged on bf037d60a5df, the base this landed on).
+# ============================================================================
+
+const PIN_CORPUS_LEN: i64 = 31107
+const PIN_CORPUS_CRC: u32 = 0x93D7E591
+const PIN_DEFLATE_L1_LEN: i64 = 10490
+const PIN_DEFLATE_L1_CRC: u32 = 0xB4314B4F
+const PIN_DEFLATE_L6_LEN: i64 = 9718
+const PIN_DEFLATE_L6_CRC: u32 = 0x9E215321
+const PIN_DEFLATE_L9_LEN: i64 = 9411
+const PIN_DEFLATE_L9_CRC: u32 = 0x95D1EACD
+const PIN_DYNAMIC_L6_LEN: i64 = 9431
+const PIN_DYNAMIC_L6_CRC: u32 = 0xFA2CCB67
+const PIN_SIMD_L1_LEN: i64 = 10490
+const PIN_SIMD_L1_CRC: u32 = 0xB4314B4F
+const PIN_SIMD_L9_LEN: i64 = 9411
+const PIN_SIMD_L9_CRC: u32 = 0x95D1EACD
+const PIN_GZ_ONE_LEN: i64 = 16911
+const PIN_GZ_ONE_CRC: u32 = 0x4A888DE8
+const PIN_GZ_CHUNK_LEN: i64 = 17044
+const PIN_GZ_CHUNK_CRC: u32 = 0xED01F524
+const PIN_GZ_EMPTY_LEN: i64 = 20
+const PIN_GZ_EMPTY_CRC: u32 = 0xC6EE70FB
+const PIN_ZL_ONE_LEN: i64 = 16899
+const PIN_ZL_ONE_CRC: u32 = 0x5A09FD81
+const PIN_ZL_CHUNK_LEN: i64 = 14683
+const PIN_ZL_CHUNK_CRC: u32 = 0x58C20DAA
+const PIN_ZL_EMPTY_LEN: i64 = 8
+const PIN_ZL_EMPTY_CRC: u32 = 0xC36C0B3C
