@@ -703,7 +703,7 @@ pub fn emit_name(s: *EmitterState, name_sv: StrView)
     # whether N is a pointer into packed memory.
     let line: StrView = packed_line(s)
     if line.ends_with(strview_from_cstr(c" = getelementptr %"))
-        if struct_is_packed(find_struct(s, name_sv)) == 1
+        if struct_is_packed(s.mono.pctx, find_struct(s, name_sv)) == 1
             packed_mark(s, packed_gep_dst(s))
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
@@ -2873,7 +2873,7 @@ pub fn is_concrete_payload_type(s: *EmitterState, name_sv: StrView, allow_enum: 
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
     if st != null
         return (st.type_params == null) as i32
-    if allow_enum == 1 and user_enum_index(StrView { ptr: (name), len: (len) as i64 }) >= 0
+    if allow_enum == 1 and user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) >= 0
         return 1
     0
 
@@ -2996,7 +2996,7 @@ const TAGGED_ENUM_FALLBACK_BYTES: i64 = 144
 pub fn tagged_enum_arg(s: *EmitterState, name_sv: StrView, variant: i32, out_len: *i32) -> *u8
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    tagged_enum_arg_in(@s.struct_map, s.module, StrView { ptr: (name), len: (len) as i64 }, variant, out_len)
+    tagged_enum_arg_in(s.mono.pctx, @s.struct_map, s.module, StrView { ptr: (name), len: (len) as i64 }, variant, out_len)
 
 # AGAST #2272: is a mangled argument `unit`, the `()` type?  It is zero bytes,
 # 1-aligned: `Result<(), i32>` is { i8, [3 x i8], [4 x i8] }, as in ritz0.
@@ -3028,11 +3028,11 @@ pub fn mangled_type_size_align(s: *EmitterState, name_sv: StrView, align: *i64) 
         return 1 + pad + n   # all-i8 struct: 1-aligned
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
     if st == null
-        let uei: i32 = user_enum_index(StrView { ptr: (name), len: (len) as i64 })
+        let uei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
         if uei >= 0
-            *align = user_enum_align(uei)   # 1 unless a repr enum (#1797, #4574)
+            *align = user_enum_align(s.mono.pctx, uei)   # 1 unless a repr enum (#1797, #4574)
             return user_enum_size(s, uei)
-        if is_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
+        if is_enum_type(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) == 1
             return 1   # generic user enum: unmeasured, tag only
         return 0
     if st.type_params != null
@@ -3093,12 +3093,12 @@ pub fn tagged_enum_layout(s: *EmitterState, name_sv: StrView, pad: *i64) -> i64
 # AGAST #2453: a let's type a bare constructor can build: an Option / Result,
 # or a user enum, whose `Ok(5)` / `Some(5)` is its own variant
 # (users_variant_wins).  resolve_enum_ctx still takes only the builtins.
-pub fn is_ctor_slot_enum(name_sv: StrView) -> i32
+pub fn is_ctor_slot_enum(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
         return 1
-    if user_enum_index(StrView { ptr: (name), len: (len) as i64 }) >= 0
+    if user_enum_index(ctx, StrView { ptr: (name), len: (len) as i64 }) >= 0
         return 1
     0
 
@@ -3167,10 +3167,10 @@ pub fn user_enum_layout(s: *EmitterState, ei: i32, pad: *i64) -> i64
     *pad = 0
     var max_size: i64 = 0
     var max_align: i64 = 1
-    let count: i32 = enum_variant_count(ei)
+    let count: i32 = enum_variant_count(s.mono.pctx, ei)
     for vi in 0..count
         var a: i64 = 1
-        let sz: i64 = variant_payload_size_align(s, enum_variant_fields(ei, vi), @a)
+        let sz: i64 = variant_payload_size_align(s, enum_variant_fields(s.mono.pctx, ei, vi), @a)
         if sz > max_size
             max_size = sz
         if a > max_align
@@ -3185,34 +3185,34 @@ pub fn user_enum_size(s: *EmitterState, ei: i32) -> i64
     var pad: i64 = 0
     let n: i64 = user_enum_layout(s, ei, @pad)
     if n == 0
-        return enum_tag_size(ei)
+        return enum_tag_size(s.mono.pctx, ei)
     1 + pad + n
 
 # Field 0 of the enum named `name_sv` (AGAST #4574): its LLVM type, and
 # the value variant index `vi` stores there -- the repr type and the
 # discriminant for an `enum E: <int>`, else i8 and the index (Option /
 # Result and generic instances included).
-pub fn enum_tag_ty_named(name_sv: StrView) -> *u8
-    let ei: i32 = user_enum_index(name_sv)
+pub fn enum_tag_ty_named(ctx: *ParseCtx, name_sv: StrView) -> *u8
+    let ei: i32 = user_enum_index(ctx, name_sv)
     if ei < 0
         return IR_TY_I8
-    enum_tag_llvm(ei)
+    enum_tag_llvm(ctx, ei)
 
-pub fn enum_tag_value_named(name_sv: StrView, vi: i32) -> i64
-    let ei: i32 = user_enum_index(name_sv)
+pub fn enum_tag_value_named(ctx: *ParseCtx, name_sv: StrView, vi: i32) -> i64
+    let ei: i32 = user_enum_index(ctx, name_sv)
     if ei < 0
         return vi as i64
-    enum_tag_value(ei, vi)
+    enum_tag_value(ctx, ei, vi)
 
 # Alignment of user enum `ei`: its repr type's for `enum E: <int>`
 # (AGAST #4574), else 1 (an all-i8 struct, #1797).
-pub fn user_enum_align(ei: i32) -> i64
-    enum_tag_size(ei)
+pub fn user_enum_align(ctx: *ParseCtx, ei: i32) -> i64
+    enum_tag_size(ctx, ei)
 
 # Field count of variant `vi` of user enum `ei` (0 for a unit variant).
-pub fn enum_variant_field_count(ei: i32, vi: i32) -> i32
+pub fn enum_variant_field_count(ctx: *ParseCtx, ei: i32, vi: i32) -> i32
     var n: i32 = 0
-    var f: *StructField = enum_variant_fields(ei, vi)
+    var f: *StructField = enum_variant_fields(ctx, ei, vi)
     while f != null
         n += 1
         f = f.next
@@ -3226,13 +3226,13 @@ pub fn variant_sel_offset(s: *EmitterState, name_sv: StrView, sel: i32) -> i64
     var len: i32 = name_sv.len as i32
     if sel < VARIANT_FIELD_STRIDE
         return 0
-    let ei: i32 = user_enum_index(StrView { ptr: (name), len: (len) as i64 })
+    let ei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
     if ei < 0
         return 0
     let vi: i32 = sel % VARIANT_FIELD_STRIDE
-    if vi >= enum_variant_count(ei)
+    if vi >= enum_variant_count(s.mono.pctx, ei)
         return 0
-    variant_field_offset(s, enum_variant_fields(ei, vi), sel / VARIANT_FIELD_STRIDE)
+    variant_field_offset(s, enum_variant_fields(s.mono.pctx, ei, vi), sel / VARIANT_FIELD_STRIDE)
 
 # AGAST #1295: a pointer to the payload field `sel` names in the enum at
 # `slot_reg`: field 2 (the `[N x i8]` buffer, AGAST #1898), then the field's
@@ -3274,7 +3274,7 @@ pub fn tagged_enum_scalar_bits(s: *EmitterState, name_sv: StrView, variant: i32,
     var len: i32 = name_sv.len as i32
     *signed = 1
     if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
-        let uf: *StructField = user_enum_tuple_field(StrView { ptr: (name), len: (len) as i64 }, variant)
+        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, variant)
         if uf == null
             return 64
         return type_code_scalar_bits(uf.field_type, signed)
@@ -3316,22 +3316,22 @@ pub fn tagged_enum_narrow_int_type(s: *EmitterState, name_sv: StrView, variant: 
 pub fn tagged_enum_int_type(s: *EmitterState, name_sv: StrView, variant: i32) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    tagged_enum_int_type_in(@s.struct_map, s.module, StrView { ptr: (name), len: (len) as i64 }, variant)
+    tagged_enum_int_type_in(s.mono.pctx, @s.struct_map, s.module, StrView { ptr: (name), len: (len) as i64 }, variant)
 
 # tagged_enum_int_type over a struct map of `m`: Sema's narrowing check reads
 # a match binding's payload type with it (AGAST #3505).
-pub fn tagged_enum_int_type_in(structs: *HashMapI64, m: *Module, name_sv: StrView, variant: i32) -> TypeKind
+pub fn tagged_enum_int_type_in(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, name_sv: StrView, variant: i32) -> TypeKind
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var t: TypeKind = TypeKind.Void
     if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
-        let uf: *StructField = user_enum_tuple_field(StrView { ptr: (name), len: (len) as i64 }, variant)
+        let uf: *StructField = user_enum_tuple_field(ctx, StrView { ptr: (name), len: (len) as i64 }, variant)
         if uf == null or uf.array_size != 0
             return TypeKind.Void
         t = uf.field_type
     else
         var c_len: i32 = 0
-        let c: *u8 = tagged_enum_arg_in(structs, m, StrView { ptr: (name), len: (len) as i64 }, variant, @c_len)
+        let c: *u8 = tagged_enum_arg_in(ctx, structs, m, StrView { ptr: (name), len: (len) as i64 }, variant, @c_len)
         if c == null
             return TypeKind.Void
         if name_eq(StrView { ptr: (c), len: (c_len) as i64 }, StrView { ptr: (c"i8"), len: (2) as i64 }) == 1
@@ -3363,7 +3363,7 @@ pub fn tagged_enum_float_type(s: *EmitterState, name_sv: StrView, variant: i32) 
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 0
-        let uf: *StructField = user_enum_tuple_field(StrView { ptr: (name), len: (len) as i64 }, variant)
+        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, variant)
         if uf == null
             return TypeKind.Void
         if uf.field_type == TypeKind.F32 or uf.field_type == TypeKind.F64
@@ -4248,10 +4248,10 @@ pub fn bare_unit_variant_enum(s: *EmitterState, e: *Expr, out_vi: *i32, out_othe
         return 0 - 1
     if find_fn(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
         return 0 - 1
-    let ei: i32 = enum_of_variant_unique(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, out_vi, out_other)
+    let ei: i32 = enum_of_variant_unique(s.mono.pctx, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, out_vi, out_other)
     if ei < 0
         return ei
-    if enum_variant_kind(ei, *out_vi) != ENUM_VARIANT_UNIT
+    if enum_variant_kind(s.mono.pctx, ei, *out_vi) != ENUM_VARIANT_UNIT
         *out_vi = 0 - 1
         return 0 - 1
     return ei
@@ -4274,10 +4274,10 @@ pub fn qualified_variant(s: *EmitterState, e: *Expr, out_vi: *i32) -> i32
         return 0 - 1
     if find_global(s, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }) != null
         return 0 - 1
-    let ei: i32 = enum_find(StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 })
+    let ei: i32 = enum_find(s.mono.pctx, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 })
     if ei < 0
         return 0 - 1
-    let vi: i32 = enum_variant_index(StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let vi: i32 = enum_variant_index(s.mono.pctx, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if vi < 0
         return 0 - 1
     *out_vi = vi
@@ -4291,9 +4291,9 @@ pub fn qualified_variant_enum(s: *EmitterState, e: *Expr, out_name: **u8, out_le
     *out_len = 0
     var vi: i32 = 0
     let ei: i32 = qualified_variant(s, e, @vi)
-    if ei < 0 or enum_is_generic(ei) == 1
+    if ei < 0 or enum_is_generic(s.mono.pctx, ei) == 1
         return
-    *out_name = enum_name_at(ei, out_len)
+    *out_name = enum_name_at(s.mono.pctx, ei, out_len)
 
 # AGAST #1466: a qualified variant ritz1 cannot build, as
 # `<file>:<line>:<col>: error: 'E.V' <msg>`.  Counted like emit_ir_error, so
@@ -4327,7 +4327,7 @@ pub fn is_module_item(s: *EmitterState, q: *u8, ql: i32, n: *u8, nl: i32) -> i32
         return 0
     if is_const(s, StrView { ptr: (q), len: (ql) as i64 }) == 1 or find_fn(s, StrView { ptr: (q), len: (ql) as i64 }) != null
         return 0
-    if is_enum_type(StrView { ptr: (q), len: (ql) as i64 }) == 1 or find_struct(s, StrView { ptr: (q), len: (ql) as i64 }) != null
+    if is_enum_type(s.mono.pctx, StrView { ptr: (q), len: (ql) as i64 }) == 1 or find_struct(s, StrView { ptr: (q), len: (ql) as i64 }) != null
         return 0
     if name_eq(StrView { ptr: (q), len: (ql) as i64 }, StrView { ptr: (c"Span"), len: (4) as i64 }) == 1 or name_eq(StrView { ptr: (q), len: (ql) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1
         return 0
@@ -4372,9 +4372,9 @@ pub fn emit_ambiguous_variant_error(s: *EmitterState, name_sv: StrView, span: Sr
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var a_len: i32 = 0
-    let a: *u8 = enum_name_at(ea, @a_len)
+    let a: *u8 = enum_name_at(s.mono.pctx, ea, @a_len)
     var b_len: i32 = 0
-    let b: *u8 = enum_name_at(eb, @b_len)
+    let b: *u8 = enum_name_at(s.mono.pctx, eb, @b_len)
     emit_str(s, c"  ; ERROR: ambiguous enum variant '")
     emit_name(s, StrView { ptr: (name), len: (len) as i64 })
     emit_str(s, c"'\n")
@@ -4487,12 +4487,12 @@ pub fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_
             var other: i32 = 0
             let ei: i32 = bare_unit_variant_enum(s, e, @vi, @other)
             if ei >= 0
-                *out_name = enum_name_at(ei, out_len)
+                *out_name = enum_name_at(s.mono.pctx, ei, out_len)
             return
         # Function-call return-type lookup.
         ExprKind.Call =>
             # AGAST #1797: a user-enum payload ctor `Holds(x)` is the enum.
-            user_variant_ctor_enum(e, out_name, out_len)
+            user_variant_ctor_enum(s.mono.pctx, e, out_name, out_len)
             if *out_name != null
                 return
             let fdr: *FnDef = find_call_fn(s, e)
@@ -4633,14 +4633,14 @@ pub fn unwrap_payload_pointer_type(s: *EmitterState, init: *Expr, out_kind: *Typ
             if find_struct(s, StrView { ptr: (inner), len: (inner_len) as i64 }) != null
                 *out_name = inner
                 *out_len = inner_len
-            else if ty_from_name(StrView { ptr: (inner), len: (inner_len) as i64 }) == TypeKind.Void and is_tagged_enum_type(StrView { ptr: (inner), len: (inner_len) as i64 }) == 0 and user_enum_index(StrView { ptr: (inner), len: (inner_len) as i64 }) < 0
+            else if ty_from_name(StrView { ptr: (inner), len: (inner_len) as i64 }) == TypeKind.Void and is_tagged_enum_type(StrView { ptr: (inner), len: (inner_len) as i64 }) == 0 and user_enum_index(s.mono.pctx, StrView { ptr: (inner), len: (inner_len) as i64 }) < 0
                 return 0
         else
             *out_kind = kind
         *out_pointee = TypeKind.Ptr
         return 1
     let st: *StructDef = find_struct(s, StrView { ptr: (base), len: (base_len) as i64 })
-    if st != null or is_tagged_enum_type(StrView { ptr: (base), len: (base_len) as i64 }) == 1 or user_enum_index(StrView { ptr: (base), len: (base_len) as i64 }) >= 0
+    if st != null or is_tagged_enum_type(StrView { ptr: (base), len: (base_len) as i64 }) == 1 or user_enum_index(s.mono.pctx, StrView { ptr: (base), len: (base_len) as i64 }) >= 0
         *out_kind = kind
         *out_name = base
         *out_len = base_len
@@ -5220,8 +5220,8 @@ pub fn unit_enum_expr_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: 
         ExprKind.Member =>
             # Qualified variant `Kind.A` (same test as emit_expr_member).
             if e.left != null and e.left.kind == ExprKind.Ident
-                if is_enum_type(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == 1
-                    if enum_variant_index(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
+                if is_enum_type(s.mono.pctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == 1
+                    if enum_variant_index(s.mono.pctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
                         name = e.left.ident_ptr as *u8
                         name_len = e.left.ident_len
             # Enum-typed struct field, at any depth / through any pointer.
@@ -5265,7 +5265,7 @@ pub fn unit_enum_expr_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: 
         return
     if is_tagged_enum_type(StrView { ptr: (name), len: (name_len) as i64 }) == 1
         return
-    if is_enum_type(StrView { ptr: (name), len: (name_len) as i64 }) == 0
+    if is_enum_type(s.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 }) == 0
         return
     *out_name = name
     *out_len = name_len
@@ -5284,7 +5284,7 @@ pub fn ptr_index_user_enum(s: *EmitterState, e: *Expr, out_name: **u8, out_len: 
     var name: *u8 = null
     var len: i32 = 0
     deref_pointee_struct_name(s, e.left, @name, @len)
-    if is_user_enum_name(StrView { ptr: (name), len: (len) as i64 }) == 0
+    if is_user_enum_name(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) == 0
         return
     # Only now ask expr_is_pointer: its ptr_arith_elem_size fails closed with
     # an emitter error on a pointee it can't size (`h()[i]` with `h` returning
@@ -5298,12 +5298,12 @@ pub fn ptr_index_user_enum(s: *EmitterState, e: *Expr, out_name: **u8, out_len: 
 # AGAST #4450: 1 when `name` is a user enum held as its own `%E` aggregate
 # (`{ i8 }` for a fieldless one), the type unit_enum_expr_name answers;
 # Option$ / Result$ carriers are not.
-pub fn is_user_enum_name(name_sv: StrView) -> i32
+pub fn is_user_enum_name(ctx: *ParseCtx, name_sv: StrView) -> i32
     if name_sv.ptr == null or name_sv.len <= 0
         return 0
     if is_tagged_enum_type(name_sv) == 1
         return 0
-    is_enum_type(name_sv)
+    is_enum_type(ctx, name_sv)
 
 # AGAST #4450: 1 when a `*T` / `[N]T` element named `name` is an aggregate
 # loaded and stored whole as its `%T` and strode by sizeof(T): a struct
@@ -5315,7 +5315,7 @@ pub fn is_elem_aggregate_name(s: *EmitterState, name_sv: StrView) -> i32
         return 0
     if find_struct(s, name_sv) != null
         return 1
-    is_user_enum_name(name_sv)
+    is_user_enum_name(s.mono.pctx, name_sv)
 
 # AGAST #176 — Span$u8 / StrView -> i64 coercion at call-site arg passing.
 #
@@ -5479,13 +5479,13 @@ pub fn get_struct_size_by_name(s: *EmitterState, name_sv: StrView) -> i64
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (name_len) as i64 })
     if st == null
         # AGAST #1797: a user enum, `{ i8 }` or `{ i8, [P x i8], [N x i8] }`.
-        let uei: i32 = user_enum_index(StrView { ptr: (name), len: (name_len) as i64 })
+        let uei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 })
         if uei >= 0
             return user_enum_size(s, uei)
         return 8
     # `[[packed]]` (AGAST #1847): fields back to back, no tail padding —
     # the layout of the `<{ ... }>` type emit_one_struct_type writes.
-    let packed: i32 = struct_is_packed(st)
+    let packed: i32 = struct_is_packed(s.mono.pctx, st)
     var offset: i64 = 0
     var max_align: i64 = 1
     var f: *StructField = st.fields
@@ -5528,11 +5528,11 @@ fn get_struct_align_by_name(s: *EmitterState, name_sv: StrView) -> i64
         return 1   # AGAST #1898: { i8, [P x i8], [N x i8] } is 1-aligned
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (name_len) as i64 })
     if st == null
-        let uei: i32 = user_enum_index(StrView { ptr: (name), len: (name_len) as i64 })
+        let uei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 })
         if uei >= 0
-            return user_enum_align(uei)   # AGAST #1797, #4574
+            return user_enum_align(s.mono.pctx, uei)   # AGAST #1797, #4574
         return 8
-    if struct_is_packed(st) == 1
+    if struct_is_packed(s.mono.pctx, st) == 1
         return 1   # `[[packed]]`: an LLVM packed struct is 1-aligned (#1847)
     var max_align: i64 = 1
     var f: *StructField = st.fields
@@ -5616,7 +5616,7 @@ pub fn ptr_pointee_size(s: *EmitterState, pointee: TypeKind, name_sv: StrView) -
             return ps
         # AGAST #2411: and `Vec$C.data + i` over a non-generic user enum
         # strides at the enum's own layout (#1797).
-        let uei: i32 = user_enum_index(StrView { ptr: (name), len: (name_len) as i64 })
+        let uei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (name_len) as i64 })
         if uei >= 0
             return user_enum_size(s, uei)
         return 0
@@ -7310,7 +7310,7 @@ pub fn synth_slot_ty(s: *EmitterState, e: *Expr) -> TypeKind
             # its enum, as emit_expr_call builds it ahead of any fn of the name.
             var uen: *u8 = null
             var uen_len: i32 = 0
-            user_enum_ctor_call(e, @uen, @uen_len)
+            user_enum_ctor_call(s.mono.pctx, e, @uen, @uen_len)
             if uen != null
                 return TypeKind.Struct
             # Look up function return type

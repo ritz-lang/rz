@@ -663,7 +663,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     # paying ~80 bytes per declare for fns this module doesn't reach.
     # AGAST #3585: an eligible [[inline]] import is the exception, defined
     # available_externally below (fn_inline_import, ast_helpers.ritz).
-    if f.is_local == 0 and f.body != null and fn_inline_import(f) == 0
+    if f.is_local == 0 and f.body != null and fn_inline_import(s.mono.pctx, f) == 0
         # Side-channel: register so emit_extern_declarations doesn't
         # accidentally emit a `(...)` fallback declare for fns we'd
         # otherwise resolve concretely.  Actually we don't add_extern
@@ -680,7 +680,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
 
     emitter_set_current_fn(f)   # AGAST #1813: locates emit_fatal_limit
     frame_begin_fn(s, f.line, f.col)   # AGAST #3739
-    s.fn_assert_kind = assert_fn_kind(f)   # AGAST #1869
+    s.fn_assert_kind = assert_fn_kind(s.mono.pctx, f)   # AGAST #1869
     s.reg_counter = 1
     packed_marks_reset(s)   # AGAST #4462: register numbers restart per fn
     s.label_counter = 0
@@ -729,7 +729,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             if fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated)
                 emit_odr_comdat_start(s, StrView { ptr: (f.name), len: (f.name_len) as i64 }, StrView { ptr: (null), len: (0) as i64 })
             emit_str(s, fn_linkage(is_main, is_monomorph, f.is_pub, f.from_generated))
-    emit_str(s, fn_callconv_kw(f))   # [[callconv = "win64"]] (AGAST #1879)
+    emit_str(s, fn_callconv_kw(s.mono.pctx, f))   # [[callconv = "win64"]] (AGAST #1879)
     if s.ret_sret == 1
         emit_str(s, c"void")
     else
@@ -769,13 +769,13 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     # body is asm only (emit_naked_fn_body drops every other statement), so
     # loop-idiom has no loop to rewrite, and there is no prologue to align.
     # Same for `_start` below and runtime/*.ll.  Revisit if that changes.
-    if fn_is_naked(f) == 1
+    if fn_is_naked(s.mono.pctx, f) == 1
         emit_str(s, c") naked noinline {\nentry:\n")
         emit_naked_fn_body(s, f)
         emit_str(s, c"}\n\n")
         return
     emit_fn_attrs(s)
-    emit_str(s, fn_inline_attr(f))   # [[inline]] / [[always_inline]] / [[noinline]] (#1847)
+    emit_str(s, fn_inline_attr(s.mono.pctx, f))   # [[inline]] / [[always_inline]] / [[noinline]] (#1847)
     let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
     # After attr_pos: an attribute inserted there must precede `comdat`.
     if f.is_local == 1 and fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated)
@@ -1430,8 +1430,8 @@ fn emit_string_constants(s: *EmitterState)
 # AGAST #3585: 1 if this .ll defines imported `f` available_externally: an
 # eligible [[inline]] fn (fn_inline_import) whose name this file doesn't
 # define itself.  emit_module's fn loop emits exactly these.
-fn inline_import_defines(m: *Module, f: *FnDef) -> i32
-    if f.is_local != 0 or fn_inline_import(f) == 0
+fn inline_import_defines(ctx: *ParseCtx, m: *Module, f: *FnDef) -> i32
+    if f.is_local != 0 or fn_inline_import(ctx, f) == 0
         return 0
     if is_local_function(m, StrView { ptr: (f.name), len: (f.name_len) as i64 }) == 1
         return 0
@@ -1439,12 +1439,12 @@ fn inline_import_defines(m: *Module, f: *FnDef) -> i32
 
 # 1 if some fn named `name` is one inline_import_defines picks, so no
 # `declare` of it may be emitted beside its definition.
-fn inline_import_defined(m: *Module, name_sv: StrView) -> i32
+fn inline_import_defined(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var f: *FnDef = m.functions
     while f != null
-        if f.name_len == len and memcmp(f.name, name, len as i64) == 0 and inline_import_defines(m, f) == 1
+        if f.name_len == len and memcmp(f.name, name, len as i64) == 0 and inline_import_defines(ctx, m, f) == 1
             return 1
         f = f.next
     0
@@ -1612,7 +1612,7 @@ fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name_sv: StrView, i
     var name_len: i32 = name_sv.len as i32
     let sret: i32 = struct_ret_uses_sret(s, f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
     emit_str(s, c"declare ")
-    emit_str(s, fn_callconv_kw(f))
+    emit_str(s, fn_callconv_kw(s.mono.pctx, f))
     if sret == 1
         emit_str(s, c"void")
     else
@@ -1659,7 +1659,7 @@ fn emit_extern_declarations(s: *EmitterState)
             continue
         # Skip if this function is defined in this module (an [[inline]]
         # import defined available_externally included, AGAST #3585)
-        if is_local_function(s.module, StrView { ptr: (ex_name), len: (ex_len) as i64 }) == 0 and inline_import_defined(s.module, StrView { ptr: (ex_name), len: (ex_len) as i64 }) == 0
+        if is_local_function(s.module, StrView { ptr: (ex_name), len: (ex_len) as i64 }) == 0 and inline_import_defined(s.mono.pctx, s.module, StrView { ptr: (ex_name), len: (ex_len) as i64 }) == 0
                 # Look up the function's return type from its definition
                 var fn_def: *FnDef = find_fn(s, StrView { ptr: (ex_name), len: (ex_len) as i64 })
                 # AGAST #1518: an imported impl method (`Type_method`) is not
@@ -1683,14 +1683,14 @@ fn emit_extern_declarations(s: *EmitterState)
                 else if fn_def != null and struct_ret_uses_sret(s, fn_def.return_type, StrView { ptr: (fn_def.return_type_name), len: (fn_def.return_type_name_len) as i64 }) == 1
                     # AGAST #1730 — the call sites pass `ptr sret(%T)`.
                     emit_str(s, c"declare ")
-                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, fn_callconv_kw(s.mono.pctx, fn_def))
                     emit_str(s, c"void @")
                     emit_name(s, StrView { ptr: (sym_name), len: (sym_len) as i64 })
                     emit_str(s, c"(...)")
                     emit_declare_attrs_nl(s)
                 else if fn_def != null and fn_def.return_type == TypeKind.Struct
                     emit_str(s, c"declare ")
-                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, fn_callconv_kw(s.mono.pctx, fn_def))
                     emit_str(s, IR_PCT)
                     emit_name(s, StrView { ptr: (fn_def.return_type_name), len: (fn_def.return_type_name_len) as i64 })
                     emit_str(s, c" @")
@@ -1699,21 +1699,21 @@ fn emit_extern_declarations(s: *EmitterState)
                     emit_declare_attrs_nl(s)
                 else if fn_def != null and fn_def.return_type == TypeKind.I32
                     emit_str(s, c"declare ")
-                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, fn_callconv_kw(s.mono.pctx, fn_def))
                     emit_str(s, c"i32 @")
                     emit_name(s, StrView { ptr: (sym_name), len: (sym_len) as i64 })
                     emit_str(s, c"(...)")
                     emit_declare_attrs_nl(s)
                 else if fn_def != null and fn_def.return_type == TypeKind.Void
                     emit_str(s, c"declare ")
-                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, fn_callconv_kw(s.mono.pctx, fn_def))
                     emit_str(s, c"void @")
                     emit_name(s, StrView { ptr: (sym_name), len: (sym_len) as i64 })
                     emit_str(s, c"(...)")
                     emit_declare_attrs_nl(s)
                 else
                     emit_str(s, c"declare ")
-                    emit_str(s, fn_callconv_kw(fn_def))
+                    emit_str(s, fn_callconv_kw(s.mono.pctx, fn_def))
                     emit_str(s, c"i64 @")
                     emit_name(s, StrView { ptr: (sym_name), len: (sym_len) as i64 })
                     emit_str(s, c"(...)")
@@ -1757,7 +1757,7 @@ fn emit_one_struct_type(s: *EmitterState, st: *StructDef)
     emit_str(s, IR_PCT)
     emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
     # `[[packed]]` (AGAST #1847): an LLVM packed struct, no padding.
-    let packed: i32 = struct_is_packed(st)
+    let packed: i32 = struct_is_packed(s.mono.pctx, st)
     if packed == 1
         emit_str(s, c" = type <{")
     else
@@ -1955,10 +1955,10 @@ fn emit_tagged_enum_types(s: *EmitterState)
     # AGAST #2926: a user enum's (or instance's) payload `Has(Option<i32>)`
     # names one too: built by `Has(Some(6))`, undeclared it was an unsized
     # `alloca %Option$i32` clang refused.  A template's `Option$T` isn't.
-    for ei in 0..enum_count()
-        if enum_is_generic(ei) != 1
-            for vi in 0..enum_variant_count(ei)
-                var vf: *StructField = enum_variant_fields(ei, vi)
+    for ei in 0..enum_count(s.mono.pctx)
+        if enum_is_generic(s.mono.pctx, ei) != 1
+            for vi in 0..enum_variant_count(s.mono.pctx, ei)
+                var vf: *StructField = enum_variant_fields(s.mono.pctx, ei, vi)
                 while vf != null
                     emit_tagged_enum_decl_once(s, StrView { ptr: (vf.field_type_name), len: (vf.field_type_name_len) as i64 })
                     vf = vf.next
@@ -2049,7 +2049,7 @@ fn emit_enum_fallback_decl(s: *EmitterState, name_sv: StrView)
         return
     # AGAST #2975: a tuple over a generic parameter (`tuple_T_T`, a template
     # fn's `-> (T, T)`) is a template, never a type.
-    let tr: *TupleReg = tuple_reg_lookup(StrView { ptr: (name), len: (len) as i64 })
+    let tr: *TupleReg = tuple_reg_lookup(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
     if tr != null and tr.def.type_params != null
         return
     # Skip generic instantiations (`Vec$String`, `Span$u8`, `Pair$i32`, ...).
@@ -2058,7 +2058,7 @@ fn emit_enum_fallback_decl(s: *EmitterState, name_sv: StrView)
     # Without this filter we'd emit `%Vec$String = type { i8 }` and clobber
     # the real Vec$T layout that emit_struct_types instantiates lazily.
     # A generic enum's instance (`Slot$i32`, AGAST #2422) is a recorded enum.
-    if user_enum_index(StrView { ptr: (name), len: (len) as i64 }) < 0
+    if user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) < 0
         var i: i32 = 0
         while i < len
             if *(name + i) == '$'
@@ -2069,7 +2069,7 @@ fn emit_enum_fallback_decl(s: *EmitterState, name_sv: StrView)
     emit_name(s, StrView { ptr: (name), len: (len) as i64 })
     # AGAST #1797: a user enum with payload variants gets ritz0's layout
     # (emitter_core user_enum_layout); tag-only enums stay `{ i8 }`.
-    let uei: i32 = user_enum_index(StrView { ptr: (name), len: (len) as i64 })
+    let uei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
     if uei >= 0
         var pad: i64 = 0
         let n: i64 = user_enum_layout(s, uei, @pad)
@@ -2082,7 +2082,7 @@ fn emit_enum_fallback_decl(s: *EmitterState, name_sv: StrView)
             return
         # AGAST #4574: `enum E: <int>` is `{ <int> }`, holding the discriminant.
         emit_str(s, c" = type { ")
-        emit_str(s, enum_tag_llvm(uei))
+        emit_str(s, enum_tag_llvm(s.mono.pctx, uei))
         emit_str(s, c" }\n")
         return
     emit_str(s, c" = type { i8 }\n")
@@ -2113,11 +2113,11 @@ fn emit_enum_fallback_types(s: *EmitterState)
     # AGAST #1797: every non-generic enum the parser recorded, referenced by
     # a signature or not — `let b = Holds(20)` allocas %Opt with nothing
     # else naming it.  Real structs were marked emitted first and win.
-    let n_enums: i32 = enum_count()
+    let n_enums: i32 = enum_count(s.mono.pctx)
     for ei in 0..n_enums
-        if enum_is_generic(ei) != 1   # instances too (AGAST #2422)
+        if enum_is_generic(s.mono.pctx, ei) != 1   # instances too (AGAST #2422)
             var en_len: i32 = 0
-            let en: *u8 = enum_name_at(ei, @en_len)
+            let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
             emit_enum_fallback_decl(s, StrView { ptr: (en), len: (en_len) as i64 })
     # Function signatures.
     var f: *FnDef = s.module.functions
@@ -2157,7 +2157,7 @@ fn emit_enum_fallback_types(s: *EmitterState)
     while sd != null
         var sf: *StructField = sd.fields
         while sf != null
-            if sf.field_type == TypeKind.Struct and is_enum_type(StrView { ptr: (sf.field_type_name), len: (sf.field_type_name_len) as i64 }) == 1
+            if sf.field_type == TypeKind.Struct and is_enum_type(s.mono.pctx, StrView { ptr: (sf.field_type_name), len: (sf.field_type_name_len) as i64 }) == 1
                 emit_enum_fallback_decl(s, StrView { ptr: (sf.field_type_name), len: (sf.field_type_name_len) as i64 })
             sf = sf.next
         sd = sd.next
@@ -2967,7 +2967,7 @@ fn emit_const_struct_body(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *
     # the `<{ ... }>` type emit_one_struct_type declares; an unpacked one is
     # `{ ... }`.  A mismatch is `packed'ness of initializer and type don't
     # match` from clang, so the value side tracks the type side.
-    let packed: i32 = struct_is_packed(st)
+    let packed: i32 = struct_is_packed(s.mono.pctx, st)
     if packed == 1
         emit_str(s, c"<{ ")
     else
@@ -3112,7 +3112,7 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
                 return
             emit_const_struct_body(s, c, elem_idx, st, v.args as *FieldInit, path)
             return
-        let ei: i32 = user_enum_index(StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
+        let ei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
         if ei >= 0
             emit_const_unit_variant(s, c, elem_idx, ei, v, path)
             return
@@ -3130,7 +3130,7 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
 # constructed (`E.V(x)`, `V(x)`) or named bare.
 fn emit_const_unit_variant(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ei: i32, v: *Expr, path: *ConstFieldPath)
     var en_len: i32 = 0
-    let en: *u8 = enum_name_at(ei, @en_len)
+    let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
     var name: *u8 = null
     var len: i32 = 0
     var constructed: i32 = 0
@@ -3148,7 +3148,7 @@ fn emit_const_unit_variant(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ei: 
         len = v.ident_len
     var vi: i32 = 0 - 1
     if name != null
-        vi = enum_variant_index(StrView { ptr: (en), len: (en_len) as i64 }, StrView { ptr: (name), len: (len) as i64 })
+        vi = enum_variant_index(s.mono.pctx, StrView { ptr: (en), len: (en_len) as i64 }, StrView { ptr: (name), len: (len) as i64 })
     if vi < 0
         emit_str(s, c"zeroinitializer")
         const_field_error_head(s, c, elem_idx, path)
@@ -3156,15 +3156,15 @@ fn emit_const_unit_variant(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ei: 
         eprint_bytes(StrView { ptr: (en), len: (en_len) as i64 })
         eprints_cstr(c"`\n")
         return
-    if constructed == 1 or enum_variant_kind(ei, vi) != ENUM_VARIANT_UNIT
+    if constructed == 1 or enum_variant_kind(s.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
         emit_str(s, c"zeroinitializer")
         const_field_error(s, c, elem_idx, path, c"is a variant with a payload, which isn't a constant initialiser")
         return
     # AGAST #4574: a repr enum's field 0 is its discriminant in the repr type.
     emit_str(s, c"{ ")
-    emit_str(s, enum_tag_llvm(ei))
+    emit_str(s, enum_tag_llvm(s.mono.pctx, ei))
     emit_str(s, IR_SP)
-    emit_int(s, enum_tag_value(ei, vi))
+    emit_int(s, enum_tag_value(s.mono.pctx, ei, vi))
     var pad: i64 = 0
     let n: i64 = user_enum_layout(s, ei, @pad)
     if n > 0
@@ -3748,7 +3748,7 @@ fn emit_const_strview_fill(s: *EmitterState, c: *ConstEntry)
 # (`[1.0e1, 0.1]`), an enum table (`[Color.Red, Color.Blue]`), a nested
 # array, and any of their fills.  The evaluator emits the same
 # `[N x T] [T v, ...]` an integer table gets.
-fn const_array_shared(c: *ConstEntry) -> i32
+fn const_array_shared(ctx: *ParseCtx, c: *ConstEntry) -> i32
     match c.array_elem_type
         TypeKind.F32 | TypeKind.F64 =>
             return 1
@@ -3756,7 +3756,7 @@ fn const_array_shared(c: *ConstEntry) -> i32
             return 1
         _ => pass
     if c.array_elem_type == TypeKind.Struct and c.array_elem_type_name_len > 0
-        if user_enum_index(StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 }) >= 0
+        if user_enum_index(ctx, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 }) >= 0
             return 1
     return 0
 
@@ -3804,7 +3804,7 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
         is_fill = 1
     if c.value_expr.kind != ExprKind.ArrayLit and is_fill == 0
         return
-    if const_array_shared(c) == 1
+    if const_array_shared(s.mono.pctx, c) == 1
         emit_const_array_shared_entry(s, c)
         return
     # AGAST #1606: the fill form `const Z: [N]T = [v; N]` of a primitive
@@ -4290,10 +4290,10 @@ fn emit_test_table(s: *EmitterState)
     # [[test]] fns too; only the input file's (is_local) count.
     var n: i64 = 0
     var k: i64 = 0
-    let total: i64 = test_fn_count()
+    let total: i64 = test_fn_count(s.mono.pctx)
     var idx: *i64 = malloc((total + 1) * 8) as *i64
     while k < total
-        let f: *FnDef = test_fn_at(k)
+        let f: *FnDef = test_fn_at(s.mono.pctx, k)
         k = k + 1
         if f.is_local != 1 or f.body == null
             continue
@@ -4606,7 +4606,7 @@ pub fn emit_module(m: *Module, out: *Vec<u8>, mono: *MonoCtx) -> i32
         # available_externally, unless this file defines the name itself;
         # marked, so emit_extern_declarations doesn't also declare it.
         if f.is_local == 0
-            if inline_import_defines(m, f) == 1 and was_fn_emitted(@s, StrView { ptr: (f.name), len: (f.name_len) as i64 }) == 0
+            if inline_import_defines(mono.pctx, m, f) == 1 and was_fn_emitted(@s, StrView { ptr: (f.name), len: (f.name_len) as i64 }) == 0
                 mark_fn_emitted(@s, StrView { ptr: (f.name), len: (f.name_len) as i64 })
                 emit_fn(@s, f)
             f = f.next

@@ -346,7 +346,10 @@ class RitzGenerator:
         return self._get_output()
 
     def _generate_parser_init(self):
-        self._emit('pub fn parser_init(p: *Parser, tokens: *Token, count: i32, arena_ptr: *u8)')
+        # AGAST #4623: the compile's ParseCtx, which every grammar action
+        # reaches as p.ctx (the parse state that was ast_helpers' globals).
+        self._emit('pub fn parser_init(p: *Parser, ctx: *ParseCtx, tokens: *Token, count: i32, arena_ptr: *u8)')
+        self._emit('    p.ctx = ctx')
         self._emit('    p.tokens = tokens')
         self._emit('    p.token_count = count')
         self._emit('    p.pos = 0')

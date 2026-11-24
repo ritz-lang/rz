@@ -71,10 +71,10 @@ fn tb_has_bounds(tps: *TypeParam) -> i32
 # Unknown traits, at the bound
 # ----------------------------------------------------------------------------
 
-fn tb_trait_known(name_sv: StrView) -> i32
+fn tb_trait_known(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if trait_declared(StrView { ptr: (name), len: (len) as i64 }) == 1 or is_compiler_trait(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if trait_declared(ctx, StrView { ptr: (name), len: (len) as i64 }) == 1 or is_compiler_trait(StrView { ptr: (name), len: (len) as i64 }) == 1
         return 1
     0
 
@@ -83,7 +83,7 @@ fn tb_unknown_in(sm: *Sema, tps: *TypeParam)
     while tp != null
         var b: *TraitBound = tp.bounds
         while b != null
-            if tb_trait_known(StrView { ptr: (b.name), len: (b.name_len) as i64 }) == 0
+            if tb_trait_known(sm.pctx, StrView { ptr: (b.name), len: (b.name_len) as i64 }) == 0
                 diag_error_at(tb_file(sm, b.file), b.span)
                 eprints_cstr(c"unknown trait `")
                 tb_write(StrView { ptr: (b.name), len: (b.name_len) as i64 })
@@ -104,9 +104,9 @@ fn tb_unknown_check(sm: *Sema)
     while st != null
         tb_unknown_in(sm, st.type_params)
         st = st.next
-    for ei in 0..enum_count()
-        if enum_is_generic(ei) == 1
-            tb_unknown_in(sm, generic_enum_params(ei))
+    for ei in 0..enum_count(sm.pctx)
+        if enum_is_generic(sm.pctx, ei) == 1
+            tb_unknown_in(sm, generic_enum_params(sm.pctx, ei))
     var ib: *ImplBlock = m.impls
     while ib != null
         tb_unknown_in(sm, ib.type_params)
@@ -120,20 +120,20 @@ fn tb_unknown_check(sm: *Sema)
 # one-argument suffix `$ai` (split_mangled_args).  One parameter takes the
 # whole suffix (`Bag$Bag$Nope`), as monomorph's own split does.  Returns the
 # count, or -1 when the suffix doesn't split into `n`.
-fn tb_split(m: *Module, n: i32, suffix_sv: StrView, starts: *i32, lens: *i32) -> i32
+fn tb_split(ctx: *ParseCtx, m: *Module, n: i32, suffix_sv: StrView, starts: *i32, lens: *i32) -> i32
     var suffix: *u8 = suffix_sv.ptr
     var suffix_len: i32 = suffix_sv.len as i32
     if n == 1
         *starts = 0
         *lens = suffix_len
         return 1
-    if split_mangled_args(m, StrView { ptr: (suffix), len: (suffix_len) as i64 }, starts, lens) != n
+    if split_mangled_args(ctx, m, StrView { ptr: (suffix), len: (suffix_len) as i64 }, starts, lens) != n
         return -1
     n
 
 # The first (param index, bound) of `tps` that the args of `suffix` miss, as
 # `*out_bound`; -1 when every bound is met or the suffix doesn't split.
-fn tb_unmet(m: *Module, tps: *TypeParam, suffix_sv: StrView, out_bound: **TraitBound) -> i32
+fn tb_unmet(ctx: *ParseCtx, m: *Module, tps: *TypeParam, suffix_sv: StrView, out_bound: **TraitBound) -> i32
     var suffix: *u8 = suffix_sv.ptr
     var suffix_len: i32 = suffix_sv.len as i32
     let n: i32 = count_type_params(tps)
@@ -143,7 +143,7 @@ fn tb_unmet(m: *Module, tps: *TypeParam, suffix_sv: StrView, out_bound: **TraitB
     let starts: *i32 = malloc(cap) as *i32
     let lens: *i32 = malloc(cap) as *i32
     var miss: i32 = -1
-    if tb_split(m, n, StrView { ptr: (suffix), len: (suffix_len) as i64 }, starts, lens) == n
+    if tb_split(ctx, m, n, StrView { ptr: (suffix), len: (suffix_len) as i64 }, starts, lens) == n
         var tp: *TypeParam = tps
         var i: i32 = 0
         while tp != null and miss < 0
@@ -152,7 +152,7 @@ fn tb_unmet(m: *Module, tps: *TypeParam, suffix_sv: StrView, out_bound: **TraitB
             let arg_len: i32 = *(lens + i) - 1
             var b: *TraitBound = tp.bounds
             while b != null and miss < 0
-                if tb_implements(m, StrView { ptr: (arg), len: (arg_len) as i64 }, StrView { ptr: (b.name), len: (b.name_len) as i64 }) == 0
+                if tb_implements(ctx, m, StrView { ptr: (arg), len: (arg_len) as i64 }, StrView { ptr: (b.name), len: (b.name_len) as i64 }) == 0
                     miss = i
                     *out_bound = b
                 b = b.next
@@ -166,7 +166,7 @@ fn tb_unmet(m: *Module, tps: *TypeParam, suffix_sv: StrView, out_bound: **TraitB
 # Exactly, by a non-generic impl for its name, or through a generic impl of
 # its generic type whose own bounds its args meet (§12.2: an impl covers
 # every instantiation).  A pointer, reference, array or primitive has none.
-fn tb_implements(m: *Module, arg_sv: StrView, tname_sv: StrView) -> i32
+fn tb_implements(ctx: *ParseCtx, m: *Module, arg_sv: StrView, tname_sv: StrView) -> i32
     var arg: *u8 = arg_sv.ptr
     var arg_len: i32 = arg_sv.len as i32
     var tname: *u8 = tname_sv.ptr
@@ -179,7 +179,7 @@ fn tb_implements(m: *Module, arg_sv: StrView, tname_sv: StrView) -> i32
                 return 1
             if k < arg_len and ib.type_params != null
                 var unused: *TraitBound = null
-                if tb_unmet(m, ib.type_params, StrView { ptr: (arg + k), len: (arg_len - k) as i64 }, @unused) < 0
+                if tb_unmet(ctx, m, ib.type_params, StrView { ptr: (arg + k), len: (arg_len - k) as i64 }, @unused) < 0
                     return 1
                 return 0
         ib = ib.next
@@ -189,40 +189,40 @@ fn tb_implements(m: *Module, arg_sv: StrView, tname_sv: StrView) -> i32
 # Spelling a mangled type as written: `Bag$Nope` is `Bag<Nope>`
 # ----------------------------------------------------------------------------
 
-fn tb_eprint_type(m: *Module, s_sv: StrView)
+fn tb_eprint_type(ctx: *ParseCtx, m: *Module, s_sv: StrView)
     var s: *u8 = s_sv.ptr
     var len: i32 = s_sv.len as i32
     if len > 7 and memcmp(s, c"refmut_", 7) == 0
         eprints_cstr(c"@&")
-        tb_eprint_type(m, StrView { ptr: (s + 7), len: (len - 7) as i64 })
+        tb_eprint_type(ctx, m, StrView { ptr: (s + 7), len: (len - 7) as i64 })
         return
     if len > 4 and memcmp(s, c"ref_", 4) == 0
         eprint_char('@')
-        tb_eprint_type(m, StrView { ptr: (s + 4), len: (len - 4) as i64 })
+        tb_eprint_type(ctx, m, StrView { ptr: (s + 4), len: (len - 4) as i64 })
         return
     if len > 4 and memcmp(s, c"ptr_", 4) == 0
         eprint_char('*')
-        tb_eprint_type(m, StrView { ptr: (s + 4), len: (len - 4) as i64 })
+        tb_eprint_type(ctx, m, StrView { ptr: (s + 4), len: (len - 4) as i64 })
         return
     let k: i32 = tb_dollar(StrView { ptr: (s), len: (len) as i64 })
     tb_write(StrView { ptr: (s), len: (k) as i64 })
     if k >= len
         return
-    let arity: i32 = mangled_component_arity(m, StrView { ptr: (s), len: (k) as i64 })
+    let arity: i32 = mangled_component_arity(ctx, m, StrView { ptr: (s), len: (k) as i64 })
     if arity <= 0
         tb_write(StrView { ptr: (s + k), len: (len - k) as i64 })   # no template to say how it nests
         return
     let cap: i64 = 4 * (mangled_arg_capacity(StrView { ptr: (s + k), len: (len - k) as i64 }) + 1) as i64
     let starts: *i32 = malloc(cap) as *i32
     let lens: *i32 = malloc(cap) as *i32
-    if tb_split(m, arity, StrView { ptr: (s + k), len: (len - k) as i64 }, starts, lens) != arity
+    if tb_split(ctx, m, arity, StrView { ptr: (s + k), len: (len - k) as i64 }, starts, lens) != arity
         tb_write(StrView { ptr: (s + k), len: (len - k) as i64 })
     else
         eprint_char('<')
         for i in 0..arity
             if i > 0
                 eprints_cstr(c", ")
-            tb_eprint_type(m, StrView { ptr: (s + k + *(starts + i) + 1), len: (*(lens + i) - 1) as i64 })
+            tb_eprint_type(ctx, m, StrView { ptr: (s + k + *(starts + i) + 1), len: (*(lens + i) - 1) as i64 })
         eprint_char('>')
     free(starts as *u8)
     free(lens as *u8)
@@ -234,7 +234,7 @@ fn tb_eprint_type(m: *Module, s_sv: StrView)
 # Is the instance's argument still a parameter (`W$T`, a template's own
 # spelling of its type, or `total$U` inside another generic)?  Such a
 # spelling is no instance: the one its parameters become is judged.
-fn tb_has_free_param(m: *Module, suffix_sv: StrView) -> i32
+fn tb_has_free_param(ctx: *ParseCtx, m: *Module, suffix_sv: StrView) -> i32
     var suffix: *u8 = suffix_sv.ptr
     var suffix_len: i32 = suffix_sv.len as i32
     var pos: i32 = 0
@@ -250,7 +250,7 @@ fn tb_has_free_param(m: *Module, suffix_sv: StrView) -> i32
             j = j - 1
         c = c + j + 1
         clen = clen - j - 1
-        if clen > 0 and *c >= 'A' and *c <= 'Z' and module_declares_type(m, StrView { ptr: (c), len: (clen) as i64 }) == 0 and find_generic_struct(m, StrView { ptr: (c), len: (clen) as i64 }) == null and trait_declared(StrView { ptr: (c), len: (clen) as i64 }) == 0
+        if clen > 0 and *c >= 'A' and *c <= 'Z' and module_declares_type(ctx, m, StrView { ptr: (c), len: (clen) as i64 }) == 0 and find_generic_struct(m, StrView { ptr: (c), len: (clen) as i64 }) == null and trait_declared(ctx, StrView { ptr: (c), len: (clen) as i64 }) == 0
             return 1
         pos = end
     0
@@ -258,13 +258,13 @@ fn tb_has_free_param(m: *Module, suffix_sv: StrView) -> i32
 # A transitive instance (`total$Nope` from `outer<Nope>`'s `total<U>(x)`) was
 # never written as such: its first use is the generic one, `total<U>`, whose
 # argument ritz0 reports at too (its monomorph substitutes into that call).
-fn tb_use_in_generic(m: *Module, name_sv: StrView) -> *GenericUse
+fn tb_use_in_generic(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> *GenericUse
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     var found: *GenericUse = null
-    var u: *GenericUse = generic_use_list()
+    var u: *GenericUse = generic_use_list(ctx)
     while u != null
-        if tb_eq(StrView { ptr: (u.name), len: (u.name_len) as i64 }, StrView { ptr: (name), len: (name_len) as i64 }) == 1 and tb_has_free_param(m, StrView { ptr: (u.suffix), len: (u.suffix_len) as i64 }) == 1
+        if tb_eq(StrView { ptr: (u.name), len: (u.name_len) as i64 }, StrView { ptr: (name), len: (name_len) as i64 }) == 1 and tb_has_free_param(ctx, m, StrView { ptr: (u.suffix), len: (u.suffix_len) as i64 }) == 1
             found = u
         u = u.next
     found
@@ -280,10 +280,10 @@ fn tb_check_instance(sm: *Sema, owner_sv: StrView, is_impl: i32, tps: *TypeParam
     var suffix: *u8 = suffix_sv.ptr
     var suffix_len: i32 = suffix_sv.len as i32
     let m: *Module = sm.module
-    if tb_has_bounds(tps) == 0 or tb_has_free_param(m, StrView { ptr: (suffix), len: (suffix_len) as i64 }) == 1
+    if tb_has_bounds(tps) == 0 or tb_has_free_param(sm.pctx, m, StrView { ptr: (suffix), len: (suffix_len) as i64 }) == 1
         return 0
     var bound: *TraitBound = null
-    let i: i32 = tb_unmet(m, tps, StrView { ptr: (suffix), len: (suffix_len) as i64 }, @bound)
+    let i: i32 = tb_unmet(sm.pctx, m, tps, StrView { ptr: (suffix), len: (suffix_len) as i64 }, @bound)
     if i < 0
         return 0
     var tp: *TypeParam = tps
@@ -293,9 +293,9 @@ fn tb_check_instance(sm: *Sema, owner_sv: StrView, is_impl: i32, tps: *TypeParam
     # transitive instance the generic call it came from; else the bound.
     var file: *u8 = bound.file
     var at: SrcSpan = bound.span
-    var u: *GenericUse = generic_use_first(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (suffix), len: (suffix_len) as i64 })
+    var u: *GenericUse = generic_use_first(sm.pctx, StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (suffix), len: (suffix_len) as i64 })
     if u == null
-        u = tb_use_in_generic(m, StrView { ptr: (name), len: (name_len) as i64 })
+        u = tb_use_in_generic(sm.pctx, m, StrView { ptr: (name), len: (name_len) as i64 })
     if u != null
         var ga: *GenericArg = u.args
         for k in 0..i
@@ -310,10 +310,10 @@ fn tb_check_instance(sm: *Sema, owner_sv: StrView, is_impl: i32, tps: *TypeParam
     let cap: i64 = 4 * (mangled_arg_capacity(StrView { ptr: (suffix), len: (suffix_len) as i64 }) + 1) as i64
     let starts: *i32 = malloc(cap) as *i32
     let lens: *i32 = malloc(cap) as *i32
-    tb_split(m, count_type_params(tps), StrView { ptr: (suffix), len: (suffix_len) as i64 }, starts, lens)
+    tb_split(sm.pctx, m, count_type_params(tps), StrView { ptr: (suffix), len: (suffix_len) as i64 }, starts, lens)
     diag_error_at(tb_file(sm, file), at)
     eprint_char('`')
-    tb_eprint_type(m, StrView { ptr: (suffix + *(starts + i) + 1), len: (*(lens + i) - 1) as i64 })
+    tb_eprint_type(sm.pctx, m, StrView { ptr: (suffix + *(starts + i) + 1), len: (*(lens + i) - 1) as i64 })
     eprints_cstr(c"` doesn't implement `")
     tb_write(StrView { ptr: (bound.name), len: (bound.name_len) as i64 })
     eprints_cstr(c"`, which `")
@@ -368,14 +368,14 @@ pub fn trait_bound_check(mono: *MonoCtx, sm: *Sema)
             tps = st.type_params
         tb_check_type_instance(sm, tps, StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (get_struct_instantiation_suffix(mono, i)), len: (get_struct_instantiation_suffix_len(mono, i)) as i64 })
     # A generic enum's instances (`Slot$Nope`) are recorded as enums.
-    for ei in 0..enum_count()
+    for ei in 0..enum_count(sm.pctx)
         var len: i32 = 0
-        let ename: *u8 = enum_name_at(ei, @len)
+        let ename: *u8 = enum_name_at(sm.pctx, ei, @len)
         let k: i32 = tb_dollar(StrView { ptr: (ename), len: (len) as i64 })
         if k < len
-            let base: i32 = enum_find(StrView { ptr: (ename), len: (k) as i64 })
-            if base >= 0 and enum_is_generic(base) == 1
-                tb_check_instance(sm, StrView { ptr: (ename), len: (k) as i64 }, 0, generic_enum_params(base), StrView { ptr: (ename), len: (k) as i64 }, StrView { ptr: (ename + k), len: (len - k) as i64 })
+            let base: i32 = enum_find(sm.pctx, StrView { ptr: (ename), len: (k) as i64 })
+            if base >= 0 and enum_is_generic(sm.pctx, base) == 1
+                tb_check_instance(sm, StrView { ptr: (ename), len: (k) as i64 }, 0, generic_enum_params(sm.pctx, base), StrView { ptr: (ename), len: (k) as i64 }, StrView { ptr: (ename + k), len: (len - k) as i64 })
     for i in 0..get_instantiation_count(mono)
         let name: *u8 = get_instantiation_name(mono, i)
         let name_len: i32 = get_instantiation_name_len(mono, i)

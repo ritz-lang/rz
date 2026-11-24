@@ -322,15 +322,15 @@ pub fn type_code_scalar_bits(t: TypeKind, signed: *i32) -> i32
     64
 
 # Tracker index of the non-generic user enum `name`, or -1.
-pub fn user_enum_index(name_sv: StrView) -> i32
+pub fn user_enum_index(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if name == null or len <= 0
         return 0 - 1
-    let ei: i32 = enum_find(StrView { ptr: (name), len: (len) as i64 })
+    let ei: i32 = enum_find(ctx, StrView { ptr: (name), len: (len) as i64 })
     if ei < 0
         return 0 - 1
-    if enum_is_generic(ei) == 1
+    if enum_is_generic(ctx, ei) == 1
         return 0 - 1
     ei
 
@@ -347,10 +347,10 @@ pub fn variant_sel(vi: i32, k: i32) -> i32
 # AGAST #1295: the payload selector of the binding `arm` has selected
 # (arm_select_bind) in user enum `name`: field pattern_field_sel of the
 # variant it names.  -1 when `name` declares no such variant.
-pub fn arm_variant_sel(name_sv: StrView, arm: *MatchArm) -> i32
+pub fn arm_variant_sel(ctx: *ParseCtx, name_sv: StrView, arm: *MatchArm) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let vi: i32 = enum_variant_index(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+    let vi: i32 = enum_variant_index(ctx, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
     if vi < 0
         return vi
     variant_sel(vi, arm.pattern_field_sel)
@@ -359,20 +359,20 @@ pub fn arm_variant_sel(name_sv: StrView, arm: *MatchArm) -> i32
 # field k of a tuple variant, or of a struct variant matched / built
 # positionally (docs/ENUM_VARIANTS.md: same layout).  Null when there is none:
 # a unit variant, a generic or unknown enum, k past the last field.
-pub fn user_enum_tuple_field(name_sv: StrView, sel: i32) -> *StructField
+pub fn user_enum_tuple_field(ctx: *ParseCtx, name_sv: StrView, sel: i32) -> *StructField
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let ei: i32 = user_enum_index(StrView { ptr: (name), len: (len) as i64 })
+    let ei: i32 = user_enum_index(ctx, StrView { ptr: (name), len: (len) as i64 })
     if ei < 0 or sel < 0
         return null
     let vi: i32 = sel % VARIANT_FIELD_STRIDE
     var k: i32 = sel / VARIANT_FIELD_STRIDE
-    if vi >= enum_variant_count(ei)
+    if vi >= enum_variant_count(ctx, ei)
         return null
-    let kind: i32 = enum_variant_kind(ei, vi)
+    let kind: i32 = enum_variant_kind(ctx, ei, vi)
     if kind != ENUM_VARIANT_TUPLE and kind != ENUM_VARIANT_STRUCT
         return null
-    var f: *StructField = enum_variant_fields(ei, vi)
+    var f: *StructField = enum_variant_fields(ctx, ei, vi)
     while f != null and k > 0
         f = f.next
         k -= 1
@@ -385,17 +385,17 @@ pub fn user_enum_tuple_field(name_sv: StrView, sel: i32) -> *StructField
 # with no payload; it used to fall through to a fn call returning i64).
 # AGAST #2039: a name two enums declare is no ctor here (null): the caller,
 # try_emit_user_variant_ctor, reports it via user_variant_ctor_ambiguous.
-pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
+pub fn user_variant_ctor_enum(ctx: *ParseCtx, e: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0
     if e == null or e.kind != ExprKind.Call
         return
     var vi: i32 = 0
     var other: i32 = 0
-    let ei: i32 = enum_of_variant_unique(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi, @other)
+    let ei: i32 = enum_of_variant_unique(ctx, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi, @other)
     if ei < 0
         return
-    let kind: i32 = enum_variant_kind(ei, vi)
+    let kind: i32 = enum_variant_kind(ctx, ei, vi)
     if kind == ENUM_VARIANT_UNIT
         if e.args != null
             return
@@ -406,13 +406,13 @@ pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
             return
     else
         return
-    *out_name = enum_name_at(ei, out_len)
+    *out_name = enum_name_at(ctx, ei, out_len)
 
 # AGAST #3995: the user enum a call constructs whatever its slot, for the two
 # typers (get_expr_type, Sema's sema_call_ty): user_variant_ctor_enum, less
 # a variant named Some / Ok / Err / None, whose call is the builtin Option /
 # Result one unless the slot is the user's enum (users_variant_wins).
-pub fn user_enum_ctor_call(e: *Expr, out_name: **u8, out_len: *i32)
+pub fn user_enum_ctor_call(ctx: *ParseCtx, e: *Expr, out_name: **u8, out_len: *i32)
     *out_name = null
     *out_len = 0
     if e == null or e.kind != ExprKind.Call
@@ -421,7 +421,7 @@ pub fn user_enum_ctor_call(e: *Expr, out_name: **u8, out_len: *i32)
     let l: i32 = e.func_name_len
     if name_eq(StrView { ptr: (n), len: (l) as i64 }, StrView { ptr: (c"Some"), len: (4) as i64 }) == 1 or name_eq(StrView { ptr: (n), len: (l) as i64 }, StrView { ptr: (c"Ok"), len: (2) as i64 }) == 1 or name_eq(StrView { ptr: (n), len: (l) as i64 }, StrView { ptr: (c"Err"), len: (3) as i64 }) == 1 or name_eq(StrView { ptr: (n), len: (l) as i64 }, StrView { ptr: (c"None"), len: (4) as i64 }) == 1
         return
-    user_variant_ctor_enum(e, out_name, out_len)
+    user_variant_ctor_enum(ctx, e, out_name, out_len)
 
 # The dims of `sh` from dimension `from` inward, and its leaf, as a shape of
 # their own: `[3][4]T` from 1 of `[2][3][4]T`.  AGAST #3379: a plane a `for`
@@ -578,7 +578,7 @@ pub fn struct_map_find(map: *HashMapI64, m: *Module, name_sv: StrView) -> *Struc
 # Option 1, a generic struct or enum template its parameter count; 0 for a leaf
 # (primitive, concrete struct, pointer to a leaf).  `ptr_` prefixes are
 # skipped: `ptr_Vec$u8` is one argument.
-fn te_component_arity(structs: *HashMapI64, m: *Module, name_sv: StrView) -> i32
+fn te_component_arity(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var p: *u8 = name
@@ -596,7 +596,7 @@ fn te_component_arity(structs: *HashMapI64, m: *Module, name_sv: StrView) -> i32
     if st == null
         # AGAST #3021: a generic enum template's parameter count, so
         # `Option$Slot$i32` splits into Option's one argument `Slot$i32`.
-        return enum_type_param_count(enum_find(StrView { ptr: (p), len: (n) as i64 }))
+        return enum_type_param_count(ctx, enum_find(ctx, StrView { ptr: (p), len: (n) as i64 }))
     if st.type_params == null
         return 0
     var k: i32 = 0
@@ -608,18 +608,18 @@ fn te_component_arity(structs: *HashMapI64, m: *Module, name_sv: StrView) -> i32
 
 # End (exclusive) of the mangled type argument starting at buf[pos]: its
 # first component plus one nested argument per generic parameter.
-fn te_arg_end(structs: *HashMapI64, m: *Module, buf_sv: StrView, pos: i32) -> i32
+fn te_arg_end(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, buf_sv: StrView, pos: i32) -> i32
     var buf: *u8 = buf_sv.ptr
     var len: i32 = buf_sv.len as i32
     var end: i32 = pos
     while end < len and *(buf + end) != '$'   # '$'
         end = end + 1
-    let arity: i32 = te_component_arity(structs, m, StrView { ptr: (buf + pos), len: (end - pos) as i64 })
+    let arity: i32 = te_component_arity(ctx, structs, m, StrView { ptr: (buf + pos), len: (end - pos) as i64 })
     var k: i32 = 0
     while k < arity
         if end >= len
             return end
-        end = te_arg_end(structs, m, StrView { ptr: (buf), len: (len) as i64 }, end + 1)
+        end = te_arg_end(ctx, structs, m, StrView { ptr: (buf), len: (len) as i64 }, end + 1)
         k = k + 1
     end
 
@@ -629,7 +629,7 @@ fn te_arg_end(structs: *HashMapI64, m: *Module, buf_sv: StrView, pos: i32) -> i3
 # arguments.  `Result$Vec$u8$i32`, variant 0 -> `Vec$u8`, 1 -> `i32`.
 #
 # The EmitterState wrapper (tagged_enum_arg) stays in emitter_core.
-pub fn tagged_enum_arg_in(structs: *HashMapI64, m: *Module, name_sv: StrView, variant: i32, out_len: *i32) -> *u8
+pub fn tagged_enum_arg_in(ctx: *ParseCtx, structs: *HashMapI64, m: *Module, name_sv: StrView, variant: i32, out_len: *i32) -> *u8
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     *out_len = 0
@@ -639,7 +639,7 @@ pub fn tagged_enum_arg_in(structs: *HashMapI64, m: *Module, name_sv: StrView, va
     if start >= len
         return null
     let is_result: i32 = name_eq(StrView { ptr: (name), len: (6) as i64 }, StrView { ptr: (c"Result"), len: (6) as i64 })
-    let end0: i32 = te_arg_end(structs, m, StrView { ptr: (name), len: (len) as i64 }, start)
+    let end0: i32 = te_arg_end(ctx, structs, m, StrView { ptr: (name), len: (len) as i64 }, start)
     if is_result == 0
         if variant != 0 or end0 != len
             return null
@@ -648,7 +648,7 @@ pub fn tagged_enum_arg_in(structs: *HashMapI64, m: *Module, name_sv: StrView, va
     if end0 + 1 >= len
         return null
     let e_start: i32 = end0 + 1
-    let e_end: i32 = te_arg_end(structs, m, StrView { ptr: (name), len: (len) as i64 }, e_start)
+    let e_end: i32 = te_arg_end(ctx, structs, m, StrView { ptr: (name), len: (len) as i64 }, e_start)
     if e_end != len
         return null
     if variant == 0
@@ -1304,15 +1304,15 @@ pub fn array_ptr_elem_name(loc: *LocalVar, out_len: *i32) -> *u8
 # list user_variant_ctor_enum leaves to a fn of that name: values for a bare
 # variant, `Z(1)`, or none for a payload one, `One()`.  *out_ei / *out_vi
 # name the variant.  With no such fn it was "Unknown function: Z".
-pub fn user_variant_ctor_miscounted(e: *Expr, out_ei: *i32, out_vi: *i32) -> i32
+pub fn user_variant_ctor_miscounted(ctx: *ParseCtx, e: *Expr, out_ei: *i32, out_vi: *i32) -> i32
     if e == null or e.kind != ExprKind.Call
         return 0
     var other: i32 = 0
-    let ei: i32 = enum_of_variant_unique(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, out_vi, @other)
+    let ei: i32 = enum_of_variant_unique(ctx, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, out_vi, @other)
     if ei < 0
         return 0
     *out_ei = ei
-    let kind: i32 = enum_variant_kind(ei, *out_vi)
+    let kind: i32 = enum_variant_kind(ctx, ei, *out_vi)
     if kind == ENUM_VARIANT_UNIT
         return (e.args != null) as i32
     if kind == ENUM_VARIANT_TUPLE or kind == ENUM_VARIANT_STRUCT
@@ -1322,10 +1322,10 @@ pub fn user_variant_ctor_miscounted(e: *Expr, out_ei: *i32, out_vi: *i32) -> i32
 # AGAST #2039: a call `B()` / `Holds(x)` whose callee name two or more
 # non-generic enums declare as a variant.  Returns 1 and fills *out_a /
 # *out_b with the two enums to name (enum_of_variant_unique's -2), else 0.
-pub fn user_variant_ctor_ambiguous(e: *Expr, out_a: *i32, out_b: *i32) -> i32
+pub fn user_variant_ctor_ambiguous(ctx: *ParseCtx, e: *Expr, out_a: *i32, out_b: *i32) -> i32
     if e == null or e.kind != ExprKind.Call
         return 0
-    if enum_of_variant_unique(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, out_a, out_b) == 0 - 2
+    if enum_of_variant_unique(ctx, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, out_a, out_b) == 0 - 2
         return 1
     return 0
 
@@ -1626,7 +1626,7 @@ pub fn ptr_ptr_ident_levels(slot: i32) -> i32
 # scrutinee (§8.2): not a variant the enum declares (Option/Result's when no
 # declaration is tracked), and not a qualified `C.G` (no span of its own).
 # The emitter binds by it and Sema types the binding by it, so they agree.
-pub fn arm_binds_enum_value(arm: *MatchArm, enum_name_sv: StrView) -> i32
+pub fn arm_binds_enum_value(ctx: *ParseCtx, arm: *MatchArm, enum_name_sv: StrView) -> i32
     if arm.pattern_kind != PAT_IDENT or arm.pattern_span.line == 0
         return 0
     let name: StrView = StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }
@@ -1634,11 +1634,11 @@ pub fn arm_binds_enum_value(arm: *MatchArm, enum_name_sv: StrView) -> i32
     var base: i64 = 0
     while base < enum_name_sv.len and *(enum_name_sv.ptr + base) != '$'
         base = base + 1
-    let ei: i32 = enum_find(StrView { ptr: (enum_name_sv.ptr), len: (base) })
+    let ei: i32 = enum_find(ctx, StrView { ptr: (enum_name_sv.ptr), len: (base) })
     if ei >= 0
-        for vi in 0..enum_variant_count(ei)
+        for vi in 0..enum_variant_count(ctx, ei)
             var vlen: i32 = 0
-            let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+            let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
             if name.eq(StrView { ptr: (vname), len: (vlen) as i64 })
                 return 0
         return 1

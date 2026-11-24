@@ -171,7 +171,7 @@ fn emit_variant_tag_check_eq(s: *EmitterState, slot_reg: i32, enum_name_sv: StrV
     emit_reg(s, slot_reg)
     emit_str(s, c", i32 0, i32 0\n")
     # AGAST #4574: a repr enum holds its discriminant in the repr type.
-    let tag_ty: *u8 = enum_tag_ty_named(enum_name_sv)
+    let tag_ty: *u8 = enum_tag_ty_named(s.mono.pctx, enum_name_sv)
     let tag_reg: i32 = next_reg(s)
     emit_load_into(s, tag_ty, tag_reg, tag_ptr)
     let cmp_reg: i32 = next_reg(s)
@@ -182,7 +182,7 @@ fn emit_variant_tag_check_eq(s: *EmitterState, slot_reg: i32, enum_name_sv: StrV
     emit_str(s, IR_SP)
     emit_reg(s, tag_reg)
     emit_str(s, IR_COMMA)
-    emit_int(s, enum_tag_value_named(enum_name_sv, tag_value))
+    emit_int(s, enum_tag_value_named(s.mono.pctx, enum_name_sv, tag_value))
     emit_str(s, IR_NL)
     return cmp_reg
 
@@ -258,12 +258,12 @@ fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: i32) ->
 # or -1 (not a user enum, or no such variant).
 # AGAST #1295: as the payload selector (variant_sel) of the binding the arm
 # has selected (arm_select_bind): field pattern_field_sel of that variant.
-fn user_arm_variant(enum_name_sv: StrView, arm: *MatchArm) -> i32
+fn user_arm_variant(ctx: *ParseCtx, enum_name_sv: StrView, arm: *MatchArm) -> i32
     var enum_name: *u8 = enum_name_sv.ptr
     var enum_name_len: i32 = enum_name_sv.len as i32
-    if user_enum_index(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) < 0
+    if user_enum_index(ctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) < 0
         return 0 - 1
-    let vi: i32 = enum_variant_index(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+    let vi: i32 = enum_variant_index(ctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
     if vi < 0
         return vi
     return variant_sel(vi, arm.pattern_field_sel)
@@ -283,7 +283,7 @@ fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrVie
         return
     if is_tagged_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 0
         # AGAST #1797: a user enum's tuple variant declares its payload.
-        let uf: *StructField = user_enum_tuple_field(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
+        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
         if uf != null
             if uf.field_type == TypeKind.Struct and uf.field_type_name_len > 0
                 *out_name = uf.field_type_name
@@ -326,7 +326,7 @@ fn carrier_payload_ptr_struct(s: *EmitterState, arm: *MatchArm, enum_name_sv: St
     if enum_name == null or enum_name_len <= 0
         return TypeKind.Void
     if is_tagged_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 0
-        let uf: *StructField = user_enum_tuple_field(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
+        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
         if uf == null or uf.array_size != 0 or uf.field_type_name_len <= 0
             return TypeKind.Void
         if uf.field_type != TypeKind.Ptr and uf.field_type != TypeKind.PtrPtr and uf.field_type != TypeKind.Ref and uf.field_type != TypeKind.MutRef
@@ -394,7 +394,7 @@ fn carrier_payload_ptr_primitive(s: *EmitterState, arm: *MatchArm, enum_name: *u
     if enum_name == null or enum_name_len <= 0
         return TypeKind.Void
     if is_tagged_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 0
-        let uf: *StructField = user_enum_tuple_field(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
+        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
         if uf == null or uf.field_type != TypeKind.Ptr
             return TypeKind.Void
         let p: TypeKind = uf.ptr_pointee
@@ -413,7 +413,7 @@ fn carrier_payload_ptr_primitive(s: *EmitterState, arm: *MatchArm, enum_name: *u
 # deref paths see the pointer, not an i64.
 fn emit_primitive_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: *u8, enum_name_len: i32, pointee: TypeKind)
     var sel: i32 = 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-    let uvi: i32 = user_arm_variant(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
+    let uvi: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
     if uvi >= 0
         sel = uvi
     let raw: i32 = emit_variant_payload(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, sel)
@@ -432,7 +432,7 @@ fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enu
     var enum_name_len: i32 = enum_name_sv.len as i32
     var st_name: *u8 = st_name_sv.ptr
     var st_name_len: i32 = st_name_sv.len as i32
-    var sel: i32 = user_arm_variant(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
+    var sel: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
     if sel < 0
         sel = 0   # Result / Option: the payload is at offset 0
     let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, sel)
@@ -454,7 +454,7 @@ fn emit_array_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum
     var enum_name: *u8 = enum_name_sv.ptr
     var enum_name_len: i32 = enum_name_sv.len as i32
     var tag: i32 = 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-    let uvi: i32 = user_arm_variant(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
+    let uvi: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
     if uvi >= 0
         tag = uvi
     var arr: ArrayArg
@@ -527,7 +527,7 @@ fn instance_ctor_arm_type(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *
         ExprKind.Call =>
             ei = slot_instance_variant(s, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi)
             if ei >= 0
-                let kind: i32 = enum_variant_kind(ei, vi)
+                let kind: i32 = enum_variant_kind(s.mono.pctx, ei, vi)
                 if not ((kind == ENUM_VARIANT_UNIT and e.args == null) or (kind == ENUM_VARIANT_TUPLE and e.args != null and e.args.next == null))
                     return
         ExprKind.Ident =>
@@ -536,23 +536,23 @@ fn instance_ctor_arm_type(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *
             if find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null or find_fn(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
                 return
             ei = slot_instance_variant(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, @vi)
-            if ei >= 0 and enum_variant_kind(ei, vi) != ENUM_VARIANT_UNIT
+            if ei >= 0 and enum_variant_kind(s.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
                 return
         _ => pass
     if ei >= 0
-        *out_name = enum_name_at(ei, out_len)
+        *out_name = enum_name_at(s.mono.pctx, ei, out_len)
 
 # AGAST #3205: an arm yielding a qualified unit variant (`0 => A.V`) is the
 # `%A` emit_expr_member builds, under the same test, so the merge phi has
 # that type.  The phi was i64 over `%A`s, which clang rejected.
-fn qualified_unit_variant_arm_type(e: *Expr, out_name: **u8, out_len: *i32)
+fn qualified_unit_variant_arm_type(ctx: *ParseCtx, e: *Expr, out_name: **u8, out_len: *i32)
     if e.kind != ExprKind.Member or e.left == null or e.left.kind != ExprKind.Ident
         return
-    if is_enum_type(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == 0
+    if is_enum_type(ctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == 0
         return
-    if enum_variant_index(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0
+    if enum_variant_index(ctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0
         return
-    if enum_is_generic(enum_find(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })) == 1
+    if enum_is_generic(ctx, enum_find(ctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })) == 1
         return   # emit_expr_member refuses it (#1466)
     *out_name = e.left.ident_ptr
     *out_len = e.left.ident_len
@@ -805,7 +805,7 @@ fn payload_bool_kind(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrView) ->
         return BK_UNSURE
     if is_tagged_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
         return bk_tagged_binding(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }))   # AGAST #4280: `ptr_T` too
-    let uf: *StructField = user_enum_tuple_field(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
+    let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
     if uf == null
         return BK_UNSURE
     bk_of_type(uf.field_type, StrView { ptr: (uf.field_type_name), len: (uf.field_type_name_len) as i64 })
@@ -817,13 +817,13 @@ fn payload_bool_kind(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrView) ->
 fn user_arm_arity_ok(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrView) -> i32
     var enum_name: *u8 = enum_name_sv.ptr
     var enum_name_len: i32 = enum_name_sv.len as i32
-    let ei: i32 = user_enum_index(StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
+    let ei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
     if ei < 0
         return 1
-    let vi: i32 = enum_variant_index(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+    let vi: i32 = enum_variant_index(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
     if vi < 0
         return 1
-    let nf: i32 = enum_variant_field_count(ei, vi)
+    let nf: i32 = enum_variant_field_count(s.mono.pctx, ei, vi)
     let nb: i32 = arm_bind_count(arm)
     if nf == 0 or nf == nb
         return 1
@@ -869,7 +869,7 @@ fn emit_arm_payload_bind(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut
             if is_wildcard == 0 and ptr_kind != TypeKind.Void
                 # AGAST #2436: `Some(v)` over `Option<*Pair>`: v is a `*Pair`.
                 var ptr_variant: i32 = 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-                let puvi: i32 = user_arm_variant(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
+                let puvi: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
                 if puvi >= 0
                     ptr_variant = puvi
                 emit_ptr_payload_bind(s, arm, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, ptr_variant, ptr_kind, StrView { ptr: (ptr_struct), len: (ptr_struct_len) as i64 })
@@ -897,7 +897,7 @@ fn emit_arm_payload_bind(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut
                     # Result/Option: 0 Ok-Some, 1 Err; a user enum: the
                     # variant's own tag (AGAST #1797), for its width.
                     var pay_variant: i32 = 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-                    let uvi: i32 = user_arm_variant(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
+                    let uvi: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
                     if uvi >= 0
                         pay_variant = uvi
                     payload_reg = emit_variant_payload(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, pay_variant)
@@ -993,7 +993,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     # `other as i32` sees a discriminant naming no variant.  ritz0's twin is
     # `binds_scrutinee` in _emit_enum_match.
     if arm.pattern_kind == PAT_IDENT and enum_name != null and enum_name_len > 0
-        if arm_binds_enum_value(arm, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
+        if arm_binds_enum_value(s.mono.pctx, arm, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
             let enum_bind: i32 = next_reg(s)
             entry_alloca_reg_begin_named(s, enum_bind)
             emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
@@ -1101,7 +1101,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         if arm_ty == null
             span_assoc_arm_type(s, arm.body, @arm_ty, @arm_ty_len)   # AGAST #4194
         if arm_ty == null
-            qualified_unit_variant_arm_type(arm.body, @arm_ty, @arm_ty_len)   # AGAST #3205
+            qualified_unit_variant_arm_type(s.mono.pctx, arm.body, @arm_ty, @arm_ty_len)   # AGAST #3205
         if arm_ty == null
             resolve_expr_struct_name(s, arm.body, @arm_ty, @arm_ty_len)
         # #4408: resolve reads a struct literal's own `ident_ptr`; a tuple
@@ -1282,8 +1282,8 @@ fn emit_pattern_test(s: *EmitterState, pat: *MatchArm, scrut_reg: i32, scrut_slo
         # First try the user-enum tracker so user-declared variants resolve
         # to their proper tag index; fall back to None/Err special-casing
         # for tagged enums; otherwise treat as a binding (*always).
-        if is_enum_match == 1 and is_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
-            let user_idx: i32 = enum_variant_index(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 })
+        if is_enum_match == 1 and is_enum_type(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
+            let user_idx: i32 = enum_variant_index(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 })
             if user_idx >= 0
                 cond_reg = emit_variant_tag_check_eq(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_idx)
         if cond_reg == 0 and pat.pattern_name_len == 4
@@ -1313,8 +1313,8 @@ fn emit_pattern_test(s: *EmitterState, pat: *MatchArm, scrut_reg: i32, scrut_slo
         # User-declared enum: look up the variant's tag index from the
         # parser's enum tracker (Shade.Light=0, Shade.Dark=1).  Falls back
         # to the binary Some/Ok-vs-None/Err mapping for tagged enums.
-        if is_enum_match == 1 and is_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
-            let user_idx: i32 = enum_variant_index(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 })
+        if is_enum_match == 1 and is_enum_type(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
+            let user_idx: i32 = enum_variant_index(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 })
             if user_idx >= 0
                 cond_reg = emit_variant_tag_check_eq(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_idx)
             else
@@ -1400,10 +1400,10 @@ pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty:
     let ei: i32 = user_enum_value_of(s, cast.left, @en, @en_len)
     if ei < 0
         return 0 - 1
-    let n: i32 = enum_variant_count(ei)
+    let n: i32 = enum_variant_count(s.mono.pctx, ei)
     for vi in 0..n
-        if enum_variant_kind(ei, vi) != ENUM_VARIANT_UNIT
-            var vf: *StructField = enum_variant_fields(ei, vi)
+        if enum_variant_kind(s.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
+            var vf: *StructField = enum_variant_fields(s.mono.pctx, ei, vi)
             diag_error_at(emitter_source_file(), cast.span)
             eprints_cstr(c"cannot convert enum '")
             eprint_bytes(StrView { ptr: (en), len: (en_len) as i64 })
@@ -1417,10 +1417,10 @@ pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty:
             emit_reg(s, z)
             emit_str(s, IR_ADD_ZERO)
             return z
-    *out_src_ty = enum_repr(ei)
+    *out_src_ty = enum_repr(s.mono.pctx, ei)
     if *out_src_ty == TypeKind.Void
         *out_src_ty = TypeKind.I64
-    let tag_ty: *u8 = enum_tag_llvm(ei)
+    let tag_ty: *u8 = enum_tag_llvm(s.mono.pctx, ei)
     let tag: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, tag)
@@ -1431,12 +1431,12 @@ pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty:
     emit_str(s, IR_COMMA_0)
     # AGAST #4574: a repr enum's tag IS its discriminant; widen it as its
     # repr type would be (an i64 / u64 repr is already i64).
-    if ty_int_bits(enum_repr(ei)) == 64
+    if ty_int_bits(enum_repr(s.mono.pctx, ei)) == 64
         return tag
     var r: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, r)
-    if enum_tag_signed(ei) == 1
+    if enum_tag_signed(s.mono.pctx, ei) == 1
         emit_str(s, c" = sext ")
     else
         emit_str(s, c" = zext ")
@@ -1444,13 +1444,13 @@ pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty:
     emit_str(s, IR_SP)
     emit_reg(s, tag)
     emit_str(s, IR_TO_I64)
-    if enum_discr_is_index(ei) == 1 or ty_int_bits(enum_repr(ei)) > 0
+    if enum_discr_is_index(s.mono.pctx, ei) == 1 or ty_int_bits(enum_repr(s.mono.pctx, ei)) > 0
         return r
     let first: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, first)
     emit_str(s, c" = add i64 0, ")
-    emit_int(s, enum_variant_discr(ei, 0))
+    emit_int(s, enum_variant_discr(s.mono.pctx, ei, 0))
     emit_str(s, IR_NL)
     r = first
     for vi in 1..n
@@ -1468,7 +1468,7 @@ pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty:
         emit_str(s, c" = select i1 ")
         emit_reg(s, is_vi)
         emit_str(s, IR_I64_SEP)
-        emit_int(s, enum_variant_discr(ei, vi as i32))
+        emit_int(s, enum_variant_discr(s.mono.pctx, ei, vi as i32))
         emit_str(s, IR_I64_SEP)
         emit_reg(s, r)
         emit_str(s, IR_NL)
@@ -1485,14 +1485,14 @@ pub fn user_enum_value_of(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *
         return 0 - 1
     var ei: i32 = 0 - 1
     if resolve_scrutinee_enum(s, e, out_name, out_len) == 1
-        ei = enum_find(StrView { ptr: (*out_name), len: (*out_len) as i64 })
+        ei = enum_find(s.mono.pctx, StrView { ptr: (*out_name), len: (*out_len) as i64 })
     else
         var vi: i32 = 0
         var other: i32 = 0
         ei = bare_unit_variant_enum(s, e, @vi, @other)
         if ei >= 0
-            *out_name = enum_name_at(ei, out_len)
-    if ei < 0 or enum_is_generic(ei) == 1
+            *out_name = enum_name_at(s.mono.pctx, ei, out_len)
+    if ei < 0 or enum_is_generic(s.mono.pctx, ei) == 1
         return 0 - 1
     ei
 
@@ -1524,7 +1524,7 @@ pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_
                     # Also recognize user-declared enums (Shade, etc.) via the
                     # parser's per-enum tracker.  The tag is field 0 and the
                     # payload field 2, as for Result/Option (AGAST #1797).
-                    if is_enum_type(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
+                    if is_enum_type(s.mono.pctx, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
                         *out_name = lv_type_name(loc)
                         *out_len = lv_type_name_len(loc)
                         return 1
@@ -1535,7 +1535,7 @@ pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_
                 return 1
         ExprKind.Call =>
             # AGAST #1466: `match Holds(40)`, an unqualified user-enum ctor.
-            user_variant_ctor_enum(scr, out_name, out_len)
+            user_variant_ctor_enum(s.mono.pctx, scr, out_name, out_len)
             if *out_name != null
                 return 1
             let fd: *FnDef = find_call_fn(s, scr)
@@ -1546,7 +1546,7 @@ pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_
                             *out_name = fd.return_type_name
                             *out_len = fd.return_type_name_len
                             return 1
-                        if is_enum_type(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) == 1
+                        if is_enum_type(s.mono.pctx, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) == 1
                             *out_name = fd.return_type_name
                             *out_len = fd.return_type_name_len
                             return 1
@@ -1559,7 +1559,7 @@ pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_
                     let ploc: *LocalVar = find_local_struct_name(s, StrView { ptr: (opnd.ident_ptr), len: (opnd.ident_len) as i64 })
                     if ploc != null and lv_var_type(ploc) == TypeKind.Ptr and lv_pointee_type(ploc) == TypeKind.Struct
                         if lv_type_name_len(ploc) > 0
-                            if is_tagged_enum_type(StrView { ptr: (lv_type_name(ploc)), len: (lv_type_name_len(ploc)) as i64 }) == 1 or is_enum_type(StrView { ptr: (lv_type_name(ploc)), len: (lv_type_name_len(ploc)) as i64 }) == 1
+                            if is_tagged_enum_type(StrView { ptr: (lv_type_name(ploc)), len: (lv_type_name_len(ploc)) as i64 }) == 1 or is_enum_type(s.mono.pctx, StrView { ptr: (lv_type_name(ploc)), len: (lv_type_name_len(ploc)) as i64 }) == 1
                                 *out_name = lv_type_name(ploc)
                                 *out_len = lv_type_name_len(ploc)
                                 return 1
@@ -1578,7 +1578,7 @@ pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_
             # the aggregate register as an i64 and fell through.
             let fld: *StructField = resolve_member_chain_field(s, scr)
             if fld != null and fld.field_type == TypeKind.Struct and fld.field_type_name_len > 0
-                if is_tagged_enum_type(StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 }) == 1 or is_enum_type(StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 }) == 1
+                if is_tagged_enum_type(StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 }) == 1 or is_enum_type(s.mono.pctx, StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 }) == 1
                     *out_name = fld.field_type_name
                     *out_len = fld.field_type_name_len
                     return 1
@@ -1686,12 +1686,12 @@ fn match_scrutinee_is_strview(s: *EmitterState, scr: *Expr) -> i32
     match_scrutinee_type(s, scr, @name, @len)
     (name != null and name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1) as i32
 
-fn enum_declares_variant(ei: i32, name_sv: StrView) -> i32
+fn enum_declares_variant(ctx: *ParseCtx, ei: i32, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    for vi in 0..enum_variant_count(ei)
+    for vi in 0..enum_variant_count(ctx, ei)
         var vlen: i32 = 0
-        let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+        let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
         if name_eq(StrView { ptr: (vname), len: (vlen) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             return 1
     0
@@ -1704,30 +1704,30 @@ fn match_arms_enum_arm(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> *MatchA
     var arm: *MatchArm = arms
     while arm != null
         if arm.pattern_kind == PAT_VARIANT or arm.pattern_kind == PAT_IDENT
-            if user_enum_declares(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 1
+            if user_enum_declares(s.mono.pctx, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 1
                 return arm
         arm = arm.next
     null
 
 # 1 when enum `ei` is one the source declares (no `G$i32` instance, whose
 # template is recorded too) and it declares `name`.
-fn declared_enum_has_variant(ei: i32, name_sv: StrView) -> i32
+fn declared_enum_has_variant(ctx: *ParseCtx, ei: i32, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var nlen: i32 = 0
-    let ename: *u8 = enum_name_at(ei, @nlen)
+    let ename: *u8 = enum_name_at(ctx, ei, @nlen)
     for i in 0..nlen
         if *(ename + i) == '$'
             return 0
-    enum_declares_variant(ei, StrView { ptr: (name), len: (len) as i64 })
+    enum_declares_variant(ctx, ei, StrView { ptr: (name), len: (len) as i64 })
 
 # How many enums the source declares `name` in.
-fn user_enums_declaring(name_sv: StrView) -> i32
+fn user_enums_declaring(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var n: i32 = 0
-    for ei in 0..enum_count()
-        n = n + declared_enum_has_variant(ei, StrView { ptr: (name), len: (len) as i64 })
+    for ei in 0..enum_count(ctx)
+        n = n + declared_enum_has_variant(ctx, ei, StrView { ptr: (name), len: (len) as i64 })
     n
 
 # The enum an arm names, for a scrutinee no rule above could type, or -1.  ritz0
@@ -1738,10 +1738,10 @@ fn user_enums_declaring(name_sv: StrView) -> i32
 # (match_refuse_ambiguous_arms refuses that match instead).
 fn match_arms_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
     let arm: *MatchArm = match_arms_enum_arm(s, scr, arms)
-    if arm == null or user_enums_declaring(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) != 1
+    if arm == null or user_enums_declaring(s.mono.pctx, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) != 1
         return 0 - 1
-    for ei in 0..enum_count()
-        if enum_declares_variant(ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 1
+    for ei in 0..enum_count(s.mono.pctx)
+        if enum_declares_variant(s.mono.pctx, ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 1
             return ei
     0 - 1
 
@@ -1749,7 +1749,7 @@ fn match_arms_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
 # the scrutinee's enum and two or more enums declare the name they give.
 fn match_refuse_ambiguous_arms(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> i32
     let arm: *MatchArm = match_arms_enum_arm(s, scr, arms)
-    if arm == null or user_enums_declaring(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) < 2
+    if arm == null or user_enums_declaring(s.mono.pctx, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) < 2
         return 0
     eprints_cstr(fn_source_file(emitter_current_fn()))
     eprint_char(':')
@@ -1760,12 +1760,12 @@ fn match_refuse_ambiguous_arms(s: *EmitterState, scr: *Expr, arms: *MatchArm) ->
     eprint_bytes(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
     eprints_cstr(c" is of: ")
     var seen: i32 = 0
-    for ei in 0..enum_count()
-        if declared_enum_has_variant(ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 1
+    for ei in 0..enum_count(s.mono.pctx)
+        if declared_enum_has_variant(s.mono.pctx, ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 1
             if seen > 0
                 eprints_cstr(c", ")
             var nlen: i32 = 0
-            let ename: *u8 = enum_name_at(ei, @nlen)
+            let ename: *u8 = enum_name_at(s.mono.pctx, ei, @nlen)
             eprint_bytes(StrView { ptr: (ename), len: (nlen) as i64 })
             seen = seen + 1
     eprints_cstr(c" declare it, and ritz1 can't type the scrutinee; bind it to a typed local first\n")
@@ -1782,11 +1782,11 @@ fn match_refuse_ambiguous_arms(s: *EmitterState, scr: *Expr, arms: *MatchArm) ->
 # default too; no arm can read it.
 
 # 1 when a user enum declares `name`, whichever one or how many.
-fn user_enum_declares(name_sv: StrView) -> i32
+fn user_enum_declares(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    for ei in 0..enum_count()
-        if enum_declares_variant(ei, StrView { ptr: (name), len: (len) as i64 }) == 1
+    for ei in 0..enum_count(ctx)
+        if enum_declares_variant(ctx, ei, StrView { ptr: (name), len: (len) as i64 }) == 1
             return 1
     0
 
@@ -1800,7 +1800,7 @@ pub fn is_tagged_ctor(s: *EmitterState, e: *Expr) -> i32
         return 0
     if is_const(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1 or find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
         return 0
-    if user_enum_declares(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+    if user_enum_declares(s.mono.pctx, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
         return 0
     (find_local(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0) as i32
 
@@ -1827,7 +1827,7 @@ pub fn match_scrutinee_builds(s: *EmitterState, e: *Expr) -> i32
     var len: i32 = 0
     match e.kind
         ExprKind.Call =>
-            user_variant_ctor_enum(e, @name, @len)
+            user_variant_ctor_enum(s.mono.pctx, e, @name, @len)
         ExprKind.Method =>
             qualified_variant_enum(s, e, @name, @len)
         _ => pass
@@ -1964,11 +1964,11 @@ fn generic_ctor_enum(s: *EmitterState, e: *Expr, out_vi: *i32) -> i32
             return 0 - 1
     if name == null or find_fn(s, StrView { ptr: (name), len: (len) as i64 }) != null
         return 0 - 1
-    let ei: i32 = generic_enum_of_variant(StrView { ptr: (name), len: (len) as i64 }, out_vi)
+    let ei: i32 = generic_enum_of_variant(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, out_vi)
     if ei < 0
         return 0 - 1
     var en_len: i32 = 0
-    let en: *u8 = enum_name_at(ei, @en_len)
+    let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
     if en_len == 6 and (memcmp(en, c"Option", 6) == 0 or memcmp(en, c"Result", 6) == 0)
         return 0 - 1
     ei
@@ -2002,7 +2002,7 @@ fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out
         name = scr.func_name
         len = scr.func_name_len
         args = scr.args
-    let tps: *TypeParam = generic_enum_params(ei)
+    let tps: *TypeParam = generic_enum_params(s.mono.pctx, ei)
     let n: i32 = count_type_params(tps)
     if n == 0
         return
@@ -2014,7 +2014,7 @@ fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out
     # A payload field typed exactly `T` binds T to its argument's type, spelled
     # as a mangled name (ctor_payload_spelling: a literal is i64).  A second
     # binding that disagrees leaves it unbound, as ritz0's conflict does.
-    var f: *StructField = enum_variant_fields(ei, vi)
+    var f: *StructField = enum_variant_fields(s.mono.pctx, ei, vi)
     var arg: *Expr = args
     while f != null and arg != null
         if f.field_type == TypeKind.Struct and f.field_type_name != null
@@ -2030,7 +2030,7 @@ fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out
         f = f.next
         arg = arg.next
     var en_len: i32 = 0
-    let en: *u8 = enum_name_at(ei, @en_len)
+    let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
     var full: *u8 = ctor_join(StrView { ptr: (en), len: (en_len) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, out_len)
     var tp: *TypeParam = tps
     var i: i32 = 0
@@ -2044,7 +2044,7 @@ fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out
         tp = tp.next
         i = i + 1
     add_enum_instance(s.mono, s.module, StrView { ptr: (full), len: (*out_len) as i64 }, en_len)
-    if user_enum_index(StrView { ptr: (full), len: (*out_len) as i64 }) < 0
+    if user_enum_index(s.mono.pctx, StrView { ptr: (full), len: (*out_len) as i64 }) < 0
         *out_len = 0
         return   # not an instance monomorph could record: no enum to build
     if namelist_find(@s.late_enums, StrView { ptr: (full), len: (*out_len) as i64 }) < 0
@@ -2082,7 +2082,7 @@ fn resolve_match_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm, out_name: *
     var name: *u8 = null
     var len: i32 = 0
     match_scrutinee_type(s, scr, @name, @len)
-    if name != null and (is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1 or is_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1)
+    if name != null and (is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1 or is_enum_type(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) == 1)
         *out_name = name
         *out_len = len
         return 1
@@ -2090,8 +2090,8 @@ fn resolve_match_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm, out_name: *
     *out_len = 0
     if name == null
         let ei: i32 = match_arms_enum(s, scr, arms)
-        if ei >= 0 and enum_is_generic(ei) == 0
-            *out_name = enum_name_at(ei, out_len)
+        if ei >= 0 and enum_is_generic(s.mono.pctx, ei) == 0
+            *out_name = enum_name_at(s.mono.pctx, ei, out_len)
             return MATCH_ENUM_FROM_ARMS
     0
 
@@ -2159,13 +2159,13 @@ fn match_check_enum(s: *EmitterState, arms: *MatchArm, ei: i32, line: i32, col: 
     while arm != null
         if arm.pattern_kind == PAT_WILDCARD
             return
-        if arm.pattern_kind == PAT_IDENT and enum_declares_variant(ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 0
+        if arm.pattern_kind == PAT_IDENT and enum_declares_variant(s.mono.pctx, ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 0
             return
         arm = arm.next
     var count: i32 = 0
-    for vi in 0..enum_variant_count(ei)
+    for vi in 0..enum_variant_count(s.mono.pctx, ei)
         var vlen: i32 = 0
-        let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+        let vname: *u8 = enum_variant_name(s.mono.pctx, ei, vi, @vlen)
         if match_arms_name(arms, StrView { ptr: (vname), len: (vlen) as i64 }) == 0
             match_gap_name(line, col, @count, StrView { ptr: (vname), len: (vlen) as i64 })
     match_gap_end(s, count)
@@ -2239,13 +2239,13 @@ fn match_check_pair(s: *EmitterState, arms: *MatchArm, a_sv: StrView, b_sv: StrV
     match_gap_end(s, count)
 
 # The enum a `Name$args` instantiation, or a plain name, was declared as.
-fn match_enum_index(name_sv: StrView) -> i32
+fn match_enum_index(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var base: i32 = 0
     while base < len and *(name + base) != '$'
         base = base + 1
-    enum_find(StrView { ptr: (name), len: (base) as i64 })
+    enum_find(ctx, StrView { ptr: (name), len: (base) as i64 })
 
 # --- A bare arm name that binds (AGAST #2407; LANGUAGE_SPEC §4.3, §8.2) -------
 #
@@ -2256,7 +2256,7 @@ fn match_enum_index(name_sv: StrView) -> i32
 # every other binder, and ritz0's twin is _refuse_arm_names.
 fn match_arm_name_tests(s: *EmitterState, arm: *MatchArm, ei: i32, builtin: i32) -> i32
     if ei >= 0
-        return enum_declares_variant(ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+        return enum_declares_variant(s.mono.pctx, ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
     if builtin == MATCH_OPTION
         return (name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Some"), len: (4) as i64 }) == 1 or name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"None"), len: (4) as i64 }) == 1) as i32
     if builtin == MATCH_RESULT
@@ -2277,7 +2277,7 @@ fn match_refuse_arm_names(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i
     while arm != null
         # A qualified `E.V` has no span: it is always a variant.
         if arm.pattern_kind == PAT_IDENT and arm.pattern_span.line > 0 and match_arm_name_tests(s, arm, ei, builtin) == 0
-            let kind: i32 = binder_module_value_kind(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+            let kind: i32 = binder_module_value_kind(s.mono.pctx, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
             if kind != BINDER_NONE
                 binder_report(fn_source_file(emitter_current_fn()), arm.pattern_span.line, arm.pattern_span.col, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, kind)
                 emit_str(s, c"  ; ERROR: a match arm binds a module value's name\n")
@@ -2308,7 +2308,7 @@ fn match_refuse_foreign_arms(s: *EmitterState, arms: *MatchArm, name_sv: StrView
     var base: i32 = 0
     while base < len and *(name + base) != '$'
         base = base + 1
-    let ei: i32 = match_enum_index(StrView { ptr: (name), len: (len) as i64 })
+    let ei: i32 = match_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
     var builtin: i32 = 0
     if ei < 0 and is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
         builtin = MATCH_RESULT
@@ -2377,23 +2377,23 @@ fn match_refuse_or_alternatives(s: *EmitterState, arms: *MatchArm, ei: i32, buil
 
 # How many fields variant `name` of the scrutinee has, or -1 if it has none so
 # called: that is match_refuse_foreign_arms' error, after coverage.
-fn match_variant_field_count(ei: i32, builtin: i32, name_sv: StrView) -> i32
+fn match_variant_field_count(ctx: *ParseCtx, ei: i32, builtin: i32, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if ei < 0
         if builtin == MATCH_OPTION and name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"None"), len: (4) as i64 }) == 1
             return 0
         return 1
-    for vi in 0..enum_variant_count(ei)
+    for vi in 0..enum_variant_count(ctx, ei)
         var vlen: i32 = 0
-        let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+        let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
         if name_eq(StrView { ptr: (vname), len: (vlen) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
-            let kind: i32 = enum_variant_kind(ei, vi)
+            let kind: i32 = enum_variant_kind(ctx, ei, vi)
             if kind == ENUM_VARIANT_UNIT
                 return 0
             # AGAST #1295: a tuple variant has as many as it declares too.
             var n: i32 = 0
-            var f: *StructField = enum_variant_fields(ei, vi)
+            var f: *StructField = enum_variant_fields(ctx, ei, vi)
             while f != null
                 n = n + 1
                 f = f.next
@@ -2409,7 +2409,7 @@ fn match_refuse_field_counts(s: *EmitterState, arms: *MatchArm, ei: i32, builtin
     var arm: *MatchArm = arms
     while arm != null
         if arm.pattern_kind == PAT_VARIANT
-            let has: i32 = match_variant_field_count(ei, builtin, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+            let has: i32 = match_variant_field_count(s.mono.pctx, ei, builtin, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
             let lists: i32 = arm_bind_count(arm)   # AGAST #1295
             if has >= 0 and has != lists
                 eprints_cstr(fn_source_file(emitter_current_fn()))
@@ -2507,7 +2507,7 @@ fn match_check_reachable(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i3
     # an integer never closes.
     var total: i32 = 0
     if ei >= 0
-        total = enum_variant_count(ei)
+        total = enum_variant_count(s.mono.pctx, ei)
     else if builtin != 0
         total = 2
     else if is_bool == 1
@@ -2563,7 +2563,7 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
         match_scrutinee_type(s, scrutinee, @name, @len)
     var ei: i32 = 0 - 1
     if name != null
-        ei = match_enum_index(StrView { ptr: (name), len: (len) as i64 })
+        ei = match_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
     # AGAST #2512: an Option / Result scrutinee is judged as one.  Asked which
     # enum its arms name, `Ok(v)` beside a user `enum E { Ok(i32), Bad }` said
     # E, and the match was "non-exhaustive: missing Bad".
@@ -2709,8 +2709,8 @@ fn emit_match_no_arm(s: *EmitterState, arms: *MatchArm, enum_name_sv: StrView, i
 fn match_traps_no_variant(s: *EmitterState, arms: *MatchArm, enum_name_sv: StrView) -> i32
     if enum_name_sv.ptr == null
         return 0
-    let ei: i32 = user_enum_index(enum_name_sv)
-    if ei < 0 or ty_int_bits(enum_repr(ei)) == 0
+    let ei: i32 = user_enum_index(s.mono.pctx, enum_name_sv)
+    if ei < 0 or ty_int_bits(enum_repr(s.mono.pctx, ei)) == 0
         return 0
     var arm: *MatchArm = arms
     while arm != null

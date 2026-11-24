@@ -422,11 +422,11 @@ pub fn own_has_drop_impl_in(m: *Module, name_sv: StrView) -> i32
 fn own_move_only_depth(s: *EmitterState, name_sv: StrView, depth: i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    own_move_only_in(s.module, @s.struct_map, StrView { ptr: (name), len: (len) as i64 }, depth)
+    own_move_only_in(s.mono.pctx, s.module, @s.struct_map, StrView { ptr: (name), len: (len) as i64 }, depth)
 
 # own_move_only_depth over `m` and a struct map of its (struct_map_find): the
 # emitter's, or Sema's (AGAST #4011).
-fn own_move_only_in(m: *Module, map: *HashMapI64, name_sv: StrView, depth: i32) -> i32
+fn own_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, name_sv: StrView, depth: i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if name == null or len <= 0 or depth > OWN_MAX_DEPTH
@@ -441,22 +441,22 @@ fn own_move_only_in(m: *Module, map: *HashMapI64, name_sv: StrView, depth: i32) 
         var j: i32 = start
         while j < len and *(name + j) != '$'
             j += 1
-        if j > start and own_move_only_in(m, map, StrView { ptr: (name + start), len: (j - start) as i64 }, depth + 1) == 1
+        if j > start and own_move_only_in(ctx, m, map, StrView { ptr: (name + start), len: (j - start) as i64 }, depth + 1) == 1
             return 1
         i = j
     let st: *StructDef = struct_map_find(map, m, StrView { ptr: (name), len: (len) as i64 })
     if st == null
         # A user enum is move-only when a variant's payload is (AGAST #2165).
-        let ei: i32 = user_enum_index(StrView { ptr: (name), len: (len) as i64 })
+        let ei: i32 = user_enum_index(ctx, StrView { ptr: (name), len: (len) as i64 })
         if ei < 0
             return 0
         var vi: i32 = 0
-        while vi < enum_variant_count(ei)
-            if own_fields_move_only_in(m, map, enum_variant_fields(ei, vi), depth + 1) == 1
+        while vi < enum_variant_count(ctx, ei)
+            if own_fields_move_only_in(ctx, m, map, enum_variant_fields(ctx, ei, vi), depth + 1) == 1
                 return 1
             vi += 1
         return 0
-    own_fields_move_only_in(m, map, st.fields, depth + 1)
+    own_fields_move_only_in(ctx, m, map, st.fields, depth + 1)
 
 # The leaf elements of an N-D array shape, when they are structs: 1, with
 # their total count and type.
@@ -489,25 +489,25 @@ fn own_field_array(f: *StructField, out_n: *i32, out_name: **u8, out_len: *i32) 
 
 # 1 when field `f` (of a struct or an enum payload) holds a move-only value.
 fn own_field_move_only(s: *EmitterState, f: *StructField, depth: i32) -> i32
-    own_field_move_only_in(s.module, @s.struct_map, f, depth)
+    own_field_move_only_in(s.mono.pctx, s.module, @s.struct_map, f, depth)
 
-pub fn own_field_move_only_in(m: *Module, map: *HashMapI64, f: *StructField, depth: i32) -> i32
+pub fn own_field_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, f: *StructField, depth: i32) -> i32
     if f.field_type == TypeKind.Struct
-        return own_move_only_in(m, map, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, depth)
+        return own_move_only_in(ctx, m, map, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, depth)
     var n: i32 = 0
     var en: *u8 = null
     var el: i32 = 0
     if own_field_array(f, @n, @en, @el) == 1
-        return own_move_only_in(m, map, StrView { ptr: (en), len: (el) as i64 }, depth)
+        return own_move_only_in(ctx, m, map, StrView { ptr: (en), len: (el) as i64 }, depth)
     0
 
 fn own_fields_move_only(s: *EmitterState, fields: *StructField, depth: i32) -> i32
-    own_fields_move_only_in(s.module, @s.struct_map, fields, depth)
+    own_fields_move_only_in(s.mono.pctx, s.module, @s.struct_map, fields, depth)
 
-pub fn own_fields_move_only_in(m: *Module, map: *HashMapI64, fields: *StructField, depth: i32) -> i32
+pub fn own_fields_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, fields: *StructField, depth: i32) -> i32
     var f: *StructField = fields
     while f != null
-        if own_field_move_only_in(m, map, f, depth) == 1
+        if own_field_move_only_in(ctx, m, map, f, depth) == 1
             return 1
         f = f.next
     0
@@ -535,13 +535,13 @@ pub fn own_type_is_move_only(s: *EmitterState, name_sv: StrView) -> i32
     own_move_only_depth(s, StrView { ptr: (name), len: (len) as i64 }, 0)
 
 # own_type_is_move_only over `m` and a struct map of its: Sema's (AGAST #4011).
-pub fn own_type_is_move_only_in(m: *Module, map: *HashMapI64, name_sv: StrView) -> i32
+pub fn own_type_is_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var ib: *ImplBlock = m.impls
     while ib != null
         if ib.trait_name != null and name_eq(StrView { ptr: (ib.trait_name), len: (ib.trait_name_len) as i64 }, StrView { ptr: (c"Drop"), len: (4) as i64 }) == 1
-            return own_move_only_in(m, map, StrView { ptr: (name), len: (len) as i64 }, 0)
+            return own_move_only_in(ctx, m, map, StrView { ptr: (name), len: (len) as i64 }, 0)
         ib = ib.next
     0
 
@@ -602,7 +602,7 @@ fn own_emit_glue(s: *EmitterState, ptr: i32, name_sv: StrView, depth: i32)
         return
     let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
     if st == null
-        let ei: i32 = user_enum_index(StrView { ptr: (name), len: (len) as i64 })
+        let ei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
         if ei >= 0
             own_emit_enum_glue(s, ptr, StrView { ptr: (name), len: (len) as i64 }, ei, depth)
         return
@@ -935,8 +935,8 @@ fn own_emit_enum_glue(s: *EmitterState, ptr: i32, name_sv: StrView, ei: i32, dep
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var vi: i32 = 0
-    while vi < enum_variant_count(ei)
-        let fields: *StructField = enum_variant_fields(ei, vi)
+    while vi < enum_variant_count(s.mono.pctx, ei)
+        let fields: *StructField = enum_variant_fields(s.mono.pctx, ei, vi)
         if own_fields_move_only(s, fields, depth + 1) == 1
             var next: i32 = 0
             let pp: i32 = own_case_begin(s, ptr, StrView { ptr: (name), len: (len) as i64 }, vi, @next)

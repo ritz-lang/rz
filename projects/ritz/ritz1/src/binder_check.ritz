@@ -52,17 +52,17 @@ fn binder_is_builtin_variant(name_sv: StrView) -> i32
         return 1
     (name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"Ok"), len: (2) as i64 }) == 1 or name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"Err"), len: (3) as i64 }) == 1) as i32
 
-fn binder_is_variant(name_sv: StrView) -> i32
+fn binder_is_variant(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if binder_is_builtin_variant(StrView { ptr: (name), len: (len) as i64 }) == 1
         return 1
     var ei: i32 = 0
-    while ei < enum_count()
+    while ei < enum_count(ctx)
         var vi: i32 = 0
-        while vi < enum_variant_count(ei)
+        while vi < enum_variant_count(ctx, ei)
             var vlen: i32 = 0
-            let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+            let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
             if name_eq(StrView { ptr: (vname), len: (vlen) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
                 return 1
             vi = vi + 1
@@ -71,7 +71,7 @@ fn binder_is_variant(name_sv: StrView) -> i32
 
 # What `name` is, by the lists themselves: a const outranks a global, and both
 # a variant.
-fn binder_kind_exact(m: *Module, name_sv: StrView) -> i32
+fn binder_kind_exact(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var c: *ConstEntry = m.constants
@@ -84,7 +84,7 @@ fn binder_kind_exact(m: *Module, name_sv: StrView) -> i32
         if name_eq(StrView { ptr: (g.name), len: (g.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
             return BINDER_GLOBAL
         g = g.next
-    if binder_is_variant(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if binder_is_variant(ctx, StrView { ptr: (name), len: (len) as i64 }) == 1
         return BINDER_VARIANT
     BINDER_NONE
 
@@ -94,7 +94,7 @@ fn binder_map_note(name_sv: StrView, kind: i32)
     (*g_binder_map).insert(fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64, kind as i64)
 
 # The table every lookup reads: built once, from the merged module.
-fn binder_build_map(m: *Module)
+fn binder_build_map(ctx: *ParseCtx, m: *Module)
     g_binder_module = m
     g_binder_map = malloc(sizeof(HashMapI64)) as *HashMapI64
     *g_binder_map = hashmap_i64_with_cap(1024)
@@ -103,11 +103,11 @@ fn binder_build_map(m: *Module)
     binder_map_note(StrView { ptr: (c"Ok"), len: (2) as i64 }, BINDER_VARIANT)
     binder_map_note(StrView { ptr: (c"Err"), len: (3) as i64 }, BINDER_VARIANT)
     var ei: i32 = 0
-    while ei < enum_count()
+    while ei < enum_count(ctx)
         var vi: i32 = 0
-        while vi < enum_variant_count(ei)
+        while vi < enum_variant_count(ctx, ei)
             var vlen: i32 = 0
-            let vname: *u8 = enum_variant_name(ei, vi, @vlen)
+            let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
             binder_map_note(StrView { ptr: (vname), len: (vlen) as i64 }, BINDER_VARIANT)
             vi = vi + 1
         ei = ei + 1
@@ -121,14 +121,14 @@ fn binder_build_map(m: *Module)
         c = c.next
 
 # The BINDER_* kind of module value `name` names, BINDER_NONE for none.
-pub fn binder_module_value_kind(name_sv: StrView) -> i32
+pub fn binder_module_value_kind(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if g_binder_module == null or name == null or len <= 0
         return BINDER_NONE
     if (*g_binder_map).get(fnv1a_str(Span<u8> { ptr: (name), len: (len) as i64 }) as i64) == 0
         return BINDER_NONE
-    binder_kind_exact(g_binder_module, StrView { ptr: (name), len: (len) as i64 })
+    binder_kind_exact(ctx, g_binder_module, StrView { ptr: (name), len: (len) as i64 })
 
 fn binder_kind_word(kind: i32) -> *u8
     if kind == BINDER_CONST
@@ -203,12 +203,12 @@ fn binder_reuse_report(file: *u8, span: SrcSpan, name_sv: StrView, at_line: i32,
 
 # 1 when `name` takes a module value's name or one still in scope, after
 # saying so.  `_` is never bound (binder_bind), so it passes.
-fn binder_judge(file: *u8, span: SrcSpan, name_sv: StrView) -> i32
+fn binder_judge(ctx: *ParseCtx, file: *u8, span: SrcSpan, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if name == null or len <= 0
         return 0
-    let kind: i32 = binder_module_value_kind(StrView { ptr: (name), len: (len) as i64 })
+    let kind: i32 = binder_module_value_kind(ctx, StrView { ptr: (name), len: (len) as i64 })
     if kind != BINDER_NONE
         return binder_report(file, span.line, span.col, StrView { ptr: (name), len: (len) as i64 }, kind)
     let at: i32 = binder_scope_find(StrView { ptr: (name), len: (len) as i64 })
@@ -217,12 +217,12 @@ fn binder_judge(file: *u8, span: SrcSpan, name_sv: StrView) -> i32
     binder_reuse_report(file, span, StrView { ptr: (name), len: (len) as i64 }, g_scope_line[at], g_scope_col[at])
 
 # Put `name` in scope.  A module value's name is never a local's.
-fn binder_bind(span: SrcSpan, name_sv: StrView)
+fn binder_bind(ctx: *ParseCtx, span: SrcSpan, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if name == null or len <= 0 or binder_is_wildcard(StrView { ptr: (name), len: (len) as i64 }) == 1
         return
-    if binder_module_value_kind(StrView { ptr: (name), len: (len) as i64 }) != BINDER_NONE or g_scope_top >= BINDER_SCOPE_CAP
+    if binder_module_value_kind(ctx, StrView { ptr: (name), len: (len) as i64 }) != BINDER_NONE or g_scope_top >= BINDER_SCOPE_CAP
         return
     g_scope_name[g_scope_top] = name
     g_scope_len[g_scope_top] = len
@@ -233,13 +233,13 @@ fn binder_bind(span: SrcSpan, name_sv: StrView)
 # AGAST #109: the names of tuple decl `s` after its second.  Each is judged
 # as the first two are, and against the names before it in `s` (none is
 # bound yet), as ritz0's binder_names does: `let (a, b, a)` reuses `a`.
-fn binder_check_tail(file: *u8, s: *Stmt) -> i32
+fn binder_check_tail(ctx: *ParseCtx, file: *u8, s: *Stmt) -> i32
     var errors: i32 = 0
     var tn: *TupleName = s.tuple_more
     while tn != null
-        let judged: i32 = binder_judge(file, tn.span, StrView { ptr: (tn.name), len: (tn.len) as i64 })
+        let judged: i32 = binder_judge(ctx, file, tn.span, StrView { ptr: (tn.name), len: (tn.len) as i64 })
         errors = errors + judged
-        if judged == 0 and binder_is_wildcard(StrView { ptr: (tn.name), len: (tn.len) as i64 }) == 0 and binder_module_value_kind(StrView { ptr: (tn.name), len: (tn.len) as i64 }) == BINDER_NONE
+        if judged == 0 and binder_is_wildcard(StrView { ptr: (tn.name), len: (tn.len) as i64 }) == 0 and binder_module_value_kind(ctx, StrView { ptr: (tn.name), len: (tn.len) as i64 }) == BINDER_NONE
             var at: SrcSpan = s.name_span
             var hit: i32 = name_eq(StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, StrView { ptr: (tn.name), len: (tn.len) as i64 })
             if hit == 0
@@ -255,14 +255,14 @@ fn binder_check_tail(file: *u8, s: *Stmt) -> i32
         tn = tn.next
     errors
 
-fn binder_judge_bind(file: *u8, span: SrcSpan, name_sv: StrView) -> i32
+fn binder_judge_bind(ctx: *ParseCtx, file: *u8, span: SrcSpan, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let errors: i32 = binder_judge(file, span, StrView { ptr: (name), len: (len) as i64 })
-    binder_bind(span, StrView { ptr: (name), len: (len) as i64 })
+    let errors: i32 = binder_judge(ctx, file, span, StrView { ptr: (name), len: (len) as i64 })
+    binder_bind(ctx, span, StrView { ptr: (name), len: (len) as i64 })
     errors
 
-fn binder_check_arms(file: *u8, arms: *MatchArm) -> i32
+fn binder_check_arms(ctx: *ParseCtx, file: *u8, arms: *MatchArm) -> i32
     var errors: i32 = 0
     var arm: *MatchArm = arms
     while arm != null
@@ -273,15 +273,15 @@ fn binder_check_arms(file: *u8, arms: *MatchArm) -> i32
             for k in 0..nb
                 arm_select_bind(arm, k)
                 if arm.pattern_inner_kind == PAT_IDENT
-                    errors = errors + binder_judge_bind(file, arm.pattern_inner_span, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 })
+                    errors = errors + binder_judge_bind(ctx, file, arm.pattern_inner_span, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 })
             arm_select_bind(arm, 0)
         # A bare top-level name naming a module value is the match lowering's
         # (binder_arm_refuse); any other binds.  A qualified `E.V` has no span.
         else if arm.pattern_kind == PAT_IDENT and arm.pattern_span.line > 0
-            if binder_module_value_kind(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == BINDER_NONE
-                errors = errors + binder_judge_bind(file, arm.pattern_span, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-        errors = errors + binder_check_stmts(file, arm.body_stmts)
-        errors = errors + binder_check_expr(file, arm.body)
+            if binder_module_value_kind(ctx, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == BINDER_NONE
+                errors = errors + binder_judge_bind(ctx, file, arm.pattern_span, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+        errors = errors + binder_check_stmts(ctx, file, arm.body_stmts)
+        errors = errors + binder_check_expr(ctx, file, arm.body)
         g_scope_top = mark
         arm = arm.next
     errors
@@ -289,70 +289,70 @@ fn binder_check_arms(file: *u8, arms: *MatchArm) -> i32
 # Only a match or an if/else expression holds statements, so only those are
 # walked: no other expression binds, and parser_alloc does not zero the fields
 # another kind leaves unset.
-fn binder_check_expr(file: *u8, e: *Expr) -> i32
+fn binder_check_expr(ctx: *ParseCtx, file: *u8, e: *Expr) -> i32
     if e == null
         return 0
     if e.kind == ExprKind.Match or e.kind == ExprKind.If
-        return binder_check_arms(file, e.args as *MatchArm)
+        return binder_check_arms(ctx, file, e.args as *MatchArm)
     0
 
 # A block: what it binds goes out of scope at its end.  A `let`'s name is
 # judged before its initialiser and bound after it, as ritz0 does.
-fn binder_check_stmts(file: *u8, first: *Stmt) -> i32
+fn binder_check_stmts(ctx: *ParseCtx, file: *u8, first: *Stmt) -> i32
     let mark: i32 = g_scope_top
     var errors: i32 = 0
     var s: *Stmt = first
     while s != null
         match s.kind
             StmtKind.VarDecl =>
-                errors = errors + binder_judge(file, s.name_span, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 })
-                errors = errors + binder_check_expr(file, s.var_init)
-                binder_bind(s.name_span, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 })
+                errors = errors + binder_judge(ctx, file, s.name_span, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 })
+                errors = errors + binder_check_expr(ctx, file, s.var_init)
+                binder_bind(ctx, s.name_span, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 })
             StmtKind.TupleDecl =>
-                errors = errors + binder_judge(file, s.name_span, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 })
+                errors = errors + binder_judge(ctx, file, s.name_span, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 })
                 # The second name against the first too: neither is bound yet.
-                if binder_is_wildcard(StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }) == 0 and binder_module_value_kind(StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }) == BINDER_NONE and binder_module_value_kind(StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }) == BINDER_NONE and binder_scope_find(StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }) < 0 and name_eq(StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }) == 1
+                if binder_is_wildcard(StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }) == 0 and binder_module_value_kind(ctx, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }) == BINDER_NONE and binder_module_value_kind(ctx, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }) == BINDER_NONE and binder_scope_find(StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }) < 0 and name_eq(StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }) == 1
                     errors = errors + binder_reuse_report(file, s.name2_span, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }, s.name_span.line, s.name_span.col)
                 else
-                    errors = errors + binder_judge(file, s.name2_span, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 })
-                errors = errors + binder_check_tail(file, s)   # AGAST #109
-                errors = errors + binder_check_expr(file, s.var_init)
-                binder_bind(s.name_span, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 })
-                binder_bind(s.name2_span, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 })
+                    errors = errors + binder_judge(ctx, file, s.name2_span, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 })
+                errors = errors + binder_check_tail(ctx, file, s)   # AGAST #109
+                errors = errors + binder_check_expr(ctx, file, s.var_init)
+                binder_bind(ctx, s.name_span, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 })
+                binder_bind(ctx, s.name2_span, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 })
                 var tn: *TupleName = s.tuple_more
                 while tn != null
-                    binder_bind(tn.span, StrView { ptr: (tn.name), len: (tn.len) as i64 })
+                    binder_bind(ctx, tn.span, StrView { ptr: (tn.name), len: (tn.len) as i64 })
                     tn = tn.next
             StmtKind.For =>
                 let for_mark: i32 = g_scope_top
-                errors = errors + binder_judge_bind(file, s.name_span, StrView { ptr: (s.for_var), len: (s.for_var_len) as i64 })
-                errors = errors + binder_check_stmts(file, s.for_body)
+                errors = errors + binder_judge_bind(ctx, file, s.name_span, StrView { ptr: (s.for_var), len: (s.for_var_len) as i64 })
+                errors = errors + binder_check_stmts(ctx, file, s.for_body)
                 g_scope_top = for_mark
             StmtKind.If =>
-                errors = errors + binder_check_expr(file, s.if_cond)
-                errors = errors + binder_check_stmts(file, s.if_then)
-                errors = errors + binder_check_stmts(file, s.if_else)
+                errors = errors + binder_check_expr(ctx, file, s.if_cond)
+                errors = errors + binder_check_stmts(ctx, file, s.if_then)
+                errors = errors + binder_check_stmts(ctx, file, s.if_else)
             StmtKind.While =>
-                errors = errors + binder_check_expr(file, s.while_cond)
-                errors = errors + binder_check_stmts(file, s.while_body)
+                errors = errors + binder_check_expr(ctx, file, s.while_cond)
+                errors = errors + binder_check_stmts(ctx, file, s.while_body)
             StmtKind.Loop | StmtKind.Defer | StmtKind.Unsafe =>
-                errors = errors + binder_check_stmts(file, s.while_body)
+                errors = errors + binder_check_stmts(ctx, file, s.while_body)
             StmtKind.Asm =>
                 pass   # binds nothing; its operands are uses (AGAST #3394)
             StmtKind.Match =>
-                errors = errors + binder_check_arms(file, s.if_then as *MatchArm)
+                errors = errors + binder_check_arms(ctx, file, s.if_then as *MatchArm)
             StmtKind.Return =>
-                errors = errors + binder_check_expr(file, s.return_value)
+                errors = errors + binder_check_expr(ctx, file, s.return_value)
             StmtKind.Expr =>
-                errors = errors + binder_check_expr(file, s.expr)
+                errors = errors + binder_check_expr(ctx, file, s.expr)
             StmtKind.Assign =>
-                errors = errors + binder_check_expr(file, s.assign_value)
+                errors = errors + binder_check_expr(ctx, file, s.assign_value)
             _ => pass
         s = s.next
     g_scope_top = mark
     errors
 
-fn binder_check_fn(path: *u8, f: *FnDef) -> i32
+fn binder_check_fn(ctx: *ParseCtx, path: *u8, f: *FnDef) -> i32
     var file: *u8 = path
     if f.def_file != null
         file = f.def_file
@@ -361,9 +361,9 @@ fn binder_check_fn(path: *u8, f: *FnDef) -> i32
     var p: *Param = f.params
     while p != null
         if p.name != null
-            errors = errors + binder_judge_bind(file, p.name_span, StrView { ptr: (p.name), len: (p.name_len) as i64 })
+            errors = errors + binder_judge_bind(ctx, file, p.name_span, StrView { ptr: (p.name), len: (p.name_len) as i64 })
         p = p.next
-    errors = errors + binder_check_stmts(file, f.body)
+    errors = errors + binder_check_stmts(ctx, file, f.body)
     g_scope_top = 0
     errors
 
@@ -381,13 +381,13 @@ pub fn binder_judges(f: *FnDef, generic_owner: i32) -> i32
 # Every binder in the fns binder_judges picks, generic templates included.
 # Runs before monomorphisation, so no clone is judged a second time.  Returns
 # how many it refused; the caller stops on any.
-pub fn binder_check_module(m: *Module, path: *u8) -> i32
-    binder_build_map(m)
+pub fn binder_check_module(ctx: *ParseCtx, m: *Module, path: *u8) -> i32
+    binder_build_map(ctx, m)
     var errors: i32 = 0
     var f: *FnDef = m.functions
     while f != null
         if binder_judges(f, 0) == 1
-            errors = errors + binder_check_fn(path, f)
+            errors = errors + binder_check_fn(ctx, path, f)
         f = f.next
     var ib: *ImplBlock = m.impls
     while ib != null
@@ -395,7 +395,7 @@ pub fn binder_check_module(m: *Module, path: *u8) -> i32
         var method: *FnDef = ib.methods
         while method != null
             if binder_judges(method, generic) == 1
-                errors = errors + binder_check_fn(path, method)
+                errors = errors + binder_check_fn(ctx, path, method)
             method = method.next
         ib = ib.next
     errors

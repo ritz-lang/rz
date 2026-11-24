@@ -17,6 +17,32 @@ import ritzlib.str
 import ritzlib.strview    # strview_eq (was the local buf_eq)
 
 # =============================================================================
+# ParseCtx: the compile's parse state (AGAST #4623)
+# =============================================================================
+#
+# One per compile, made by main (parse_ctx_new) and shared by every file's
+# Parser (parser_init stores it in p.ctx), so a grammar action reaches it as
+# p.ctx and a helper without a Parser takes `ctx: *ParseCtx`.  Sema and
+# MonoCtx hold it as `pctx` (the emitter as s.mono.pctx) for the registries
+# the later passes read (enum_find, tuple_reg_lookup, trait_declared, ...).
+# These were module globals; each field's notes stay where its
+# `# State: ParseCtx.x` line marks the old declaration.  The struct is in
+# ast.ritz, beside Parser, which holds it.
+pub fn parse_ctx_new() -> *ParseCtx
+    let ctx: *ParseCtx = calloc(1, sizeof(ParseCtx)) as *ParseCtx
+    ctx.last_drop_at = -1
+    ctx.var_ptr_array_elem = TypeKind.Void
+    ctx.var_ptr_array_elem_pointee = TypeKind.Void
+    ctx.nd_reject_line = -1
+    ctx.nd_reject_col = -1
+    ctx.lit_len_line = -1
+    ctx.lit_len_col = -1
+    ctx.array_len_line = -1
+    ctx.array_len_col = -1
+    ctx.open_if_end = 0 - 1
+    ctx
+
+# =============================================================================
 # Parser allocation (bump allocator using parser's arena)
 # =============================================================================
 
@@ -25,10 +51,10 @@ import ritzlib.strview    # strview_eq (was the local buf_eq)
 # no bound: ritz1's own emitter_stmt.ritz overran the fixed 4 MB arena by
 # ~7.5k nodes and silently corrupted the heap until a small change made it
 # fatal.  0 = unknown (no check).
-var g_parser_arena_cap: i64 = 0
+# State: ParseCtx.parser_arena_cap
 
-pub fn parser_arena_set_cap(cap: i64)
-    g_parser_arena_cap = cap
+pub fn parser_arena_set_cap(ctx: *ParseCtx, cap: i64)
+    ctx.parser_arena_cap = cap
 
 pub fn parser_alloc(p: *Parser, size: i64) -> *u8
     # Bump allocator using the parser's heap arena
@@ -36,7 +62,7 @@ pub fn parser_alloc(p: *Parser, size: i64) -> *u8
     let aligned_offset: i64 = (p.heap_offset + 7) & (0 - 8)
     let result: *u8 = p.heap_base + aligned_offset
     p.heap_offset = aligned_offset + size
-    if g_parser_arena_cap > 0 and p.heap_offset > g_parser_arena_cap
+    if p.ctx.parser_arena_cap > 0 and p.heap_offset > p.ctx.parser_arena_cap
         eprints_cstr(c"error: ritz1 parser arena exhausted; refusing to overrun the heap\n")
         sys_exit(70)
     # AGAST #3509: zeroed, so a field a constructor doesn't set (Expr.deref_step)
@@ -48,16 +74,16 @@ pub fn parser_alloc(p: *Parser, size: i64) -> *u8
 # Module helpers
 # =============================================================================
 
-var g_fn_count: i32 = 0
+# State: ParseCtx.fn_count
 
-pub fn get_fn_count() -> i32
-    g_fn_count
+pub fn get_fn_count(ctx: *ParseCtx) -> i32
+    ctx.fn_count
 
 pub fn module_new(p: *Parser) -> *Module
     # One module_new per file parsed, so this is the per-parse reset point
     # for the dropped-item counter checked by module_require_eof.
-    parser_reset_diagnostics()
-    g_tuple_lits = 0   # AGAST #2956: a failed parse's literals are not this file's
+    parser_reset_diagnostics(p.ctx)
+    p.ctx.tuple_lits = 0   # AGAST #2956: a failed parse's literals are not this file's
     let m: *Module = parser_alloc(p, sizeof(Module)) as *Module
     m.imports = null
     m.constants = null
@@ -69,8 +95,8 @@ pub fn module_new(p: *Parser) -> *Module
     p.module = m
     return m
 
-pub fn module_add_fn(m: *Module, f: *FnDef)
-    g_fn_count = g_fn_count + 1
+pub fn module_add_fn(ctx: *ParseCtx, m: *Module, f: *FnDef)
+    ctx.fn_count = ctx.fn_count + 1
     if m.functions == null
         m.functions = f
     else
@@ -100,25 +126,23 @@ pub fn module_add_fn(m: *Module, f: *FnDef)
 # the module.
 
 # The target OS.  null means the default, "linux".  Set once by main.
-var g_target_os: *u8 = null
-var g_target_os_len: i32 = 0
+# State: ParseCtx.target_os, .target_os_len
 
 # The target architecture.  null means the default, "x86_64".  Set once by
 # main.
-var g_target_arch: *u8 = null
-var g_target_arch_len: i32 = 0
+# State: ParseCtx.target_arch, .target_arch_len
 
-pub fn set_target_os(os_sv: StrView)
+pub fn set_target_os(ctx: *ParseCtx, os_sv: StrView)
     var os: *u8 = os_sv.ptr
     var os_len: i32 = os_sv.len as i32
-    g_target_os = os
-    g_target_os_len = os_len
+    ctx.target_os = os
+    ctx.target_os_len = os_len
 
-pub fn set_target_arch(arch_sv: StrView)
+pub fn set_target_arch(ctx: *ParseCtx, arch_sv: StrView)
     var arch: *u8 = arch_sv.ptr
     var arch_len: i32 = arch_sv.len as i32
-    g_target_arch = arch
-    g_target_arch_len = arch_len
+    ctx.target_arch = arch
+    ctx.target_arch_len = arch_len
 
 pub fn check_target_os_filter(p: *Parser, ident_start_sv: StrView, str_val_sv: StrView)
     var ident_start: *u8 = ident_start_sv.ptr
@@ -131,82 +155,80 @@ pub fn check_target_os_filter(p: *Parser, ident_start_sv: StrView, str_val_sv: S
     if is_os == 0 and is_arch == 0
         return
     if is_os == 1
-        if g_target_os == null
+        if p.ctx.target_os == null
             if (StrView { ptr: (str_val), len: (str_len) as i64 }).eq(StrView { ptr: (c"linux"), len: (5) as i64 })
                 return
-        else if (StrView { ptr: (str_val), len: (str_len) as i64 }).eq(StrView { ptr: (g_target_os), len: (g_target_os_len) as i64 })
+        else if (StrView { ptr: (str_val), len: (str_len) as i64 }).eq(StrView { ptr: (p.ctx.target_os), len: (p.ctx.target_os_len) as i64 })
             return
     else
-        if g_target_arch == null
+        if p.ctx.target_arch == null
             if (StrView { ptr: (str_val), len: (str_len) as i64 }).eq(StrView { ptr: (c"x86_64"), len: (6) as i64 })
                 return
-        else if (StrView { ptr: (str_val), len: (str_len) as i64 }).eq(StrView { ptr: (g_target_arch), len: (g_target_arch_len) as i64 })
+        else if (StrView { ptr: (str_val), len: (str_len) as i64 }).eq(StrView { ptr: (p.ctx.target_arch), len: (p.ctx.target_arch_len) as i64 })
             return
     p.skip_item = 1
 
 # AGAST #1908: `[[test]]` (LANGUAGE_SPEC §17.1).  attr_flag notes it for the
-# item being parsed (ATTR_TEST in g_attr_bits); item_dispatch_fn records that
-# FnDef in g_test_fns, and every dispatcher clears the note.  A side list
+# item being parsed (ATTR_TEST in ctx.attr_bits); item_dispatch_fn records that
+# FnDef in ctx.test_fns, and every dispatcher clears the note.  A side list
 # rather than an FnDef field: FnDefs come from parser_alloc (not zeroed) and
 # monomorph's malloc'd clones, so a new field would be garbage on every
 # allocation site that did not set it.  Pointers are compared by identity: a
 # clone is never a test.
-var g_test_fns: *i64 = null
-var g_test_fn_count: i64 = 0
-var g_test_fn_cap: i64 = 0
+# State: ParseCtx.test_fns, .test_fn_count, .test_fn_cap
 
-fn test_fn_record(f: *FnDef)
-    if g_test_fn_count == g_test_fn_cap
-        var cap: i64 = g_test_fn_cap * 2
+fn test_fn_record(ctx: *ParseCtx, f: *FnDef)
+    if ctx.test_fn_count == ctx.test_fn_cap
+        var cap: i64 = ctx.test_fn_cap * 2
         if cap == 0
             cap = 16
-        let grown: *i64 = realloc(g_test_fns as *u8, cap * 8) as *i64
+        let grown: *i64 = realloc(ctx.test_fns as *u8, cap * 8) as *i64
         if grown == null
             eprints_cstr(c"error: ritz1: out of memory recording [[test]] functions\n")
             sys_exit(70)
-        g_test_fns = grown
-        g_test_fn_cap = cap
-    *(g_test_fns + g_test_fn_count) = f as i64
-    g_test_fn_count = g_test_fn_count + 1
+        ctx.test_fns = grown
+        ctx.test_fn_cap = cap
+    *(ctx.test_fns + ctx.test_fn_count) = f as i64
+    ctx.test_fn_count = ctx.test_fn_count + 1
 
 # 1 if `f` was declared `[[test]]` (by identity; see above).
-pub fn is_test_fn(f: *FnDef) -> i32
+pub fn is_test_fn(ctx: *ParseCtx, f: *FnDef) -> i32
     let key: i64 = f as i64
     var i: i64 = 0
-    while i < g_test_fn_count
-        if *(g_test_fns + i) == key
+    while i < ctx.test_fn_count
+        if *(ctx.test_fns + i) == key
             return 1
         i = i + 1
     0
 
 # 1 if `f` was declared `[[test_helper]]` (AGAST #1869), or is a monomorph
 # instance of such a fn (fn_copy_instance_attrs marks those).
-pub fn is_test_helper_fn(f: *FnDef) -> i32
-    if (item_attr_bits(f as *u8) & ATTR_TEST_HELPER) != 0
+pub fn is_test_helper_fn(ctx: *ParseCtx, f: *FnDef) -> i32
+    if (item_attr_bits(ctx, f as *u8) & ATTR_TEST_HELPER) != 0
         return 1
     0
 
 # 1 if `f` was declared `[[must_use]]` (AGAST #2137), or is a monomorph
 # instance of such a fn (fn_copy_instance_attrs marks those).
-pub fn is_must_use_fn(f: *FnDef) -> i32
-    if f != null and (item_attr_bits(f as *u8) & ATTR_MUST_USE) != 0
+pub fn is_must_use_fn(ctx: *ParseCtx, f: *FnDef) -> i32
+    if f != null and (item_attr_bits(ctx, f as *u8) & ATTR_MUST_USE) != 0
         return 1
     0
 
-pub fn test_fn_count() -> i64
-    g_test_fn_count
+pub fn test_fn_count(ctx: *ParseCtx) -> i64
+    ctx.test_fn_count
 
-pub fn test_fn_at(i: i64) -> *FnDef
-    *(g_test_fns + i) as *FnDef
+pub fn test_fn_at(ctx: *ParseCtx, i: i64) -> *FnDef
+    *(ctx.test_fns + i) as *FnDef
 
 # Forget every recorded test fn: the driver re-parses from scratch (#1475).
-pub fn test_fns_reset()
-    g_test_fn_count = 0
-    g_attr_bits = 0
-    g_attr_target_os = 0
-    g_attr_target_arch = 0
+pub fn test_fns_reset(ctx: *ParseCtx)
+    ctx.test_fn_count = 0
+    ctx.attr_bits = 0
+    ctx.attr_target_os = 0
+    ctx.attr_target_arch = 0
     # The re-parse allocates new items, possibly at a freed item's address.
-    g_item_attr_count = 0
+    ctx.item_attr_count = 0
 
 # =============================================================================
 # Item dispatchers — honour p.skip_item set by attrs (5F.3c)
@@ -231,114 +253,111 @@ pub fn test_fns_reset()
 # module defines: ritzlib.sys's harland-only names may be listed in an
 # `import ritzlib.sys { … }` built for linux, as ritz0 accepts.  import_vis
 # marks the log before a file is parsed and reads what the file added.
-var g_gated_names: **u8 = null
-var g_gated_lens: *i32 = null
-var g_gated_count: i32 = 0
-var g_gated_cap: i32 = 0
+# State: ParseCtx.gated_names, .gated_lens, .gated_count, .gated_cap
 
-fn gated_decl_log(name_sv: StrView)
+fn gated_decl_log(ctx: *ParseCtx, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if g_gated_count >= g_gated_cap
-        var cap: i32 = g_gated_cap * 2
+    if ctx.gated_count >= ctx.gated_cap
+        var cap: i32 = ctx.gated_cap * 2
         if cap == 0
             cap = 64
-        g_gated_names = realloc(g_gated_names as *u8, (cap as i64) * 8) as **u8
-        g_gated_lens = realloc(g_gated_lens as *u8, (cap as i64) * 4) as *i32
-        g_gated_cap = cap
-    *(g_gated_names + g_gated_count) = name
-    *(g_gated_lens + g_gated_count) = len
-    g_gated_count = g_gated_count + 1
+        ctx.gated_names = realloc(ctx.gated_names as *u8, (cap as i64) * 8) as **u8
+        ctx.gated_lens = realloc(ctx.gated_lens as *u8, (cap as i64) * 4) as *i32
+        ctx.gated_cap = cap
+    *(ctx.gated_names + ctx.gated_count) = name
+    *(ctx.gated_lens + ctx.gated_count) = len
+    ctx.gated_count = ctx.gated_count + 1
 
-pub fn gated_decl_count() -> i32
-    g_gated_count
+pub fn gated_decl_count(ctx: *ParseCtx) -> i32
+    ctx.gated_count
 
-pub fn gated_decl_at(i: i32, out_len: *i32) -> *u8
-    *out_len = *(g_gated_lens + i)
-    *(g_gated_names + i)
+pub fn gated_decl_at(ctx: *ParseCtx, i: i32, out_len: *i32) -> *u8
+    *out_len = *(ctx.gated_lens + i)
+    *(ctx.gated_names + i)
 
 pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
     # AGAST #4055: a fn gated out never reaches the module, so main's
     # fn-conflict checks can't see two gated to one other target; note it.
-    if p.skip_item != 0 and (g_attr_bits & ATTR_TARGET_ANY) != 0 and fn_def.body != null
-        fn_variant_note(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, fn_def.line, parse_file_copy_shared(p), attr_target_key())
+    if p.skip_item != 0 and (p.ctx.attr_bits & ATTR_TARGET_ANY) != 0 and fn_def.body != null
+        fn_variant_note(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, fn_def.line, parse_file_copy_shared(p), attr_target_key(p.ctx))
     if p.skip_item != 0
-        gated_decl_log(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 })   # AGAST #3467
+        gated_decl_log(p.ctx, StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
-        module_add_fn(p.module, fn_def)
+        module_add_fn(p.ctx, p.module, fn_def)
         # AGAST #2148: what main.ritz's fn-conflict checks read.
         fn_def.def_file = parse_file_copy_shared(p)
-        if (g_attr_bits & ATTR_TARGET_ANY) != 0
+        if (p.ctx.attr_bits & ATTR_TARGET_ANY) != 0
             fn_def.target_gated = 1
-        if (g_attr_bits & ATTR_TEST) != 0
-            if fn_is_decl(fn_def) == 1
-                decl_refused(tok_span_of(p, fn_def.name, fn_def.line), c"[[test]] fn", StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, StrView { ptr: (null), len: (0) as i64 }, c"a test needs its body")
-            test_fn_record(fn_def)
-        if (g_attr_bits & ATTR_NAKED) != 0
-            if fn_is_decl(fn_def) == 1
-                decl_refused(tok_span_of(p, fn_def.name, fn_def.line), c"[[naked]] fn", StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, StrView { ptr: (null), len: (0) as i64 }, c"a naked fn is its asm body")
-            asm_check_naked(fn_def)
-        let fn_bits: i32 = g_attr_bits & (ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_WIN64 | ATTR_TEST_HELPER | ATTR_MUST_USE | ATTR_NAKED)
+        if (p.ctx.attr_bits & ATTR_TEST) != 0
+            if fn_is_decl(p.ctx, fn_def) == 1
+                decl_refused(p.ctx, tok_span_of(p, fn_def.name, fn_def.line), c"[[test]] fn", StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, StrView { ptr: (null), len: (0) as i64 }, c"a test needs its body")
+            test_fn_record(p.ctx, fn_def)
+        if (p.ctx.attr_bits & ATTR_NAKED) != 0
+            if fn_is_decl(p.ctx, fn_def) == 1
+                decl_refused(p.ctx, tok_span_of(p, fn_def.name, fn_def.line), c"[[naked]] fn", StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, StrView { ptr: (null), len: (0) as i64 }, c"a naked fn is its asm body")
+            asm_check_naked(p.ctx, fn_def)
+        let fn_bits: i32 = p.ctx.attr_bits & (ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_WIN64 | ATTR_TEST_HELPER | ATTR_MUST_USE | ATTR_NAKED)
         if fn_bits != 0
-            item_attr_record(fn_def as *u8, fn_bits)
+            item_attr_record(p.ctx, fn_def as *u8, fn_bits)
     p.skip_item = 0
-    g_attr_bits = 0
-    g_attr_target_os = 0
-    g_attr_target_arch = 0
+    p.ctx.attr_bits = 0
+    p.ctx.attr_target_os = 0
+    p.ctx.attr_target_arch = 0
     return 1
 
 pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
     # AGAST #4111: noted kept or not; main checks same-named ones conflict.
     var target: u64 = 0
-    if (g_attr_bits & ATTR_TARGET_ANY) != 0
-        target = attr_target_key()
+    if (p.ctx.attr_bits & ATTR_TARGET_ANY) != 0
+        target = attr_target_key(p.ctx)
     var exists: i32 = 1
     if p.skip_item != 0
         exists = 0
     struct_variant_note(p.tokens, p.pos, StrView { ptr: (st.name), len: (st.name_len) as i64 }, parse_file_copy_shared(p), target, exists)
     if p.skip_item != 0
-        gated_decl_log(StrView { ptr: (st.name), len: (st.name_len) as i64 })   # AGAST #3467
+        gated_decl_log(p.ctx, StrView { ptr: (st.name), len: (st.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
         module_add_struct(p.module, st)
-        if (g_attr_bits & ATTR_PACKED) != 0
-            item_attr_record(st as *u8, ATTR_PACKED)
+        if (p.ctx.attr_bits & ATTR_PACKED) != 0
+            item_attr_record(p.ctx, st as *u8, ATTR_PACKED)
     p.skip_item = 0
-    g_attr_bits = 0
-    g_attr_target_os = 0
-    g_attr_target_arch = 0
+    p.ctx.attr_bits = 0
+    p.ctx.attr_target_os = 0
+    p.ctx.attr_target_arch = 0
     return 1
 
 pub fn item_dispatch_const(p: *Parser, c: *ConstEntry) -> i32
     if p.skip_item != 0
-        gated_decl_log(StrView { ptr: (c.name), len: (c.name_len) as i64 })   # AGAST #3467
+        gated_decl_log(p.ctx, StrView { ptr: (c.name), len: (c.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
-        if (g_attr_bits & ATTR_TARGET_ANY) != 0
+        if (p.ctx.attr_bits & ATTR_TARGET_ANY) != 0
             c.target_gated = 1
         module_add_const(p.module, c)
     p.skip_item = 0
-    g_attr_bits = 0
-    g_attr_target_os = 0
-    g_attr_target_arch = 0
+    p.ctx.attr_bits = 0
+    p.ctx.attr_target_os = 0
+    p.ctx.attr_target_arch = 0
     return 1
 
 pub fn item_dispatch_global(p: *Parser, g: *GlobalVarDef) -> i32
     if p.skip_item != 0 and g != null
-        gated_decl_log(StrView { ptr: (g.name), len: (g.name_len) as i64 })   # AGAST #3467
+        gated_decl_log(p.ctx, StrView { ptr: (g.name), len: (g.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
         module_add_global_var(p.module, g)
     p.skip_item = 0
-    g_attr_bits = 0
-    g_attr_target_os = 0
-    g_attr_target_arch = 0
+    p.ctx.attr_bits = 0
+    p.ctx.attr_target_os = 0
+    p.ctx.attr_target_arch = 0
     return 1
 
 pub fn item_dispatch_enum(p: *Parser) -> i32
     # The enum's EnumDef is already in p.module.enums (enum_def_header built
     # it); just reset skip flag and report progress.
     p.skip_item = 0
-    g_attr_bits = 0
-    g_attr_target_os = 0
-    g_attr_target_arch = 0
+    p.ctx.attr_bits = 0
+    p.ctx.attr_target_os = 0
+    p.ctx.attr_target_arch = 0
     return 1
 
 # =============================================================================
@@ -362,47 +381,47 @@ pub fn item_dispatch_enum(p: *Parser) -> i32
 
 # Path of the file currently being parsed, for diagnostics.  Set by the
 # driver (main.ritz) before each parse; null renders as "<input>".
-var g_parse_file: *u8
+# State: ParseCtx.parse_file
 
 # Count of top-level items the anchor-skip recovery had to throw away for
 # the module currently being parsed.  Reset by module_new (i.e. once per
 # file), checked by module_require_eof.  Non-zero ⇒ hard parse failure.
-var g_dropped_items: i32 = 0
+# State: ParseCtx.dropped_items
 
 # AGAST #2943: the failure point (Parser.max_pos) of the last dropped item
 # reported, -1 for none.  Recovery skips one token and re-tries from the next
 # anchor, so `pub fn f` fails twice, at `pub` then at `fn`; both attempts stop
 # at the same token, and only the first is reported (and counted).
-var g_last_drop_at: i32 = -1
+# State: ParseCtx.last_drop_at
 
 # AGAST #3691: set when module_require_eof fails the parse, each of whose
 # failure branches has already printed a located error (or, for
-# g_attr_errors, the refusals were printed where they were written).  The
+# ctx.attr_errors, the refusals were printed where they were written).  The
 # driver prints its own fallback only when this is 0.
-var g_parse_reported: i32 = 0
+# State: ParseCtx.parse_reported
 
-pub fn parser_set_source_file(path: *u8)
-    g_parse_file = path
+pub fn parser_set_source_file(ctx: *ParseCtx, path: *u8)
+    ctx.parse_file = path
 
-pub fn parser_reset_diagnostics()
-    g_dropped_items = 0
-    g_last_drop_at = -1
-    g_parse_reported = 0
-    g_attr_errors = 0
-    g_attr_last_err = null
-    g_asm_last_block = null   # AGAST #3394
-    g_dyn_last = null   # AGAST #2298
-    g_closure_last = null   # AGAST #3471
-    g_array_len_line = -1
-    g_array_len_col = -1
+pub fn parser_reset_diagnostics(ctx: *ParseCtx)
+    ctx.dropped_items = 0
+    ctx.last_drop_at = -1
+    ctx.parse_reported = 0
+    ctx.attr_errors = 0
+    ctx.attr_last_err = null
+    ctx.asm_last_block = null   # AGAST #3394
+    ctx.dyn_last = null   # AGAST #2298
+    ctx.closure_last = null   # AGAST #3471
+    ctx.array_len_line = -1
+    ctx.array_len_col = -1
 
-pub fn parser_dropped_items() -> i32
-    g_dropped_items
+pub fn parser_dropped_items(ctx: *ParseCtx) -> i32
+    ctx.dropped_items
 
 # A failed parse that no located diagnostic covered: report it at token
 # p.pos (AGAST #3691).  A no-op when module_require_eof already reported it.
 pub fn parser_report_unreported(p: *Parser)
-    if g_parse_reported != 0
+    if p.ctx.parse_reported != 0
         return
     parse_error_at(p, p.pos)
     eprints_cstr(c"cannot parse '")
@@ -429,7 +448,7 @@ fn parse_span_at(p: *Parser, pos: i32) -> SrcSpan
 
 # `<file>:<line>:<col>: error: ` at token `pos`; the caller writes the rest.
 fn parse_error_at(p: *Parser, pos: i32)
-    diag_error_at(g_parse_file, parse_span_at(p, pos))
+    diag_error_at(p.ctx.parse_file, parse_span_at(p, pos))
 
 # Where the token starting at `at` (a name in the source) is; `line`:0 when
 # no token starts there.  For an item that keeps only its line (FnDef).
@@ -473,7 +492,7 @@ fn eprint_construct(p: *Parser)
 # `[[naked]]` fn a prologue — silently.  Now each attribute is honoured or
 # is a located error, and ritz0/parser.py ATTRS holds the same table:
 #
-#   test           fn      g_test_fns (the test table, #1908)
+#   test           fn      ctx.test_fns (the test table, #1908)
 #   target_os=".." fn, struct, const   item filtered out unless it matches
 #   packed         struct  `<{ ... }>`, no padding, alignment 1
 #   inline         fn      LLVM inlinehint
@@ -489,10 +508,10 @@ fn eprint_construct(p: *Parser)
 # The grammar runs these actions before it knows which item follows, and it
 # backtracks: `attrs` is re-parsed for every `item` alternative tried.  So
 # the item kind comes from token lookahead (attr_item_kind), the bits for the
-# item are noted in g_attr_bits and committed by the item_dispatch_* that
+# item are noted in ctx.attr_bits and committed by the item_dispatch_* that
 # succeeds, and an error is printed once per attribute token.
 # p.error cannot carry the failure — it is the generated parser's
-# backtracking signal — so module_require_eof checks g_attr_errors.
+# backtracking signal — so module_require_eof checks ctx.attr_errors.
 
 const ATTR_TEST: i32 = 1
 const ATTR_PACKED: i32 = 2
@@ -515,25 +534,20 @@ const ATTR_ITEM_CONST: i32 = 3
 const ATTR_ITEM_EXTERN_FN: i32 = 4
 const ATTR_ITEM_FN_ALIAS: i32 = 5    # `type X = fn(..) ..`
 
-var g_attr_bits: i32 = 0
+# State: ParseCtx.attr_bits
 # The [[target_os]] / [[target_arch]] value hashes, read only while their
-# bits are noted.  Reset with g_attr_bits after each item.
-var g_attr_target_os: u64 = 0
-var g_attr_target_arch: u64 = 0
-var g_attr_errors: i32 = 0
-var g_attr_last_err: *u8 = null
+# bits are noted.  Reset with ctx.attr_bits after each item.
+# State: ParseCtx.attr_target_os, .attr_target_arch, .attr_errors, .attr_last_err
 
 # The identity of one gated item's target: the pair of hashes, in a fixed
 # order so that two definitions of one name conflict iff they are gated to
 # the same pair (0 when ungated).  A single hash cannot tell `linux` from
 # `x86_64`, and two attributes must not let the last one win.
-fn attr_target_key() -> u64
-    struct_variant_target_pair_key(g_attr_target_os, g_attr_target_arch)
+fn attr_target_key(ctx: *ParseCtx) -> u64
+    struct_variant_target_pair_key(ctx.attr_target_os, ctx.attr_target_arch)
 
 # (item pointer, ATTR_* bits) pairs, for attributes the emitter reads.
-var g_item_attrs: *i64 = null
-var g_item_attr_count: i64 = 0
-var g_item_attr_cap: i64 = 0
+# State: ParseCtx.item_attrs, .item_attr_count, .item_attr_cap
 
 # The kind of item the attribute list at p.pos is attached to: skip the rest
 # of the attribute lines and a `pub`, then look at the keyword.  The grammar
@@ -570,27 +584,27 @@ fn attr_item_kind(p: *Parser) -> i32
     ATTR_ITEM_OTHER
 
 # `<file>:<line>:<col>: error: attribute '<name>' <msg>`, once per token.
-fn attr_error(name_sv: StrView, line: i32, col: i32, msg: *u8)
+fn attr_error(ctx: *ParseCtx, name_sv: StrView, line: i32, col: i32, msg: *u8)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if name == g_attr_last_err
+    if name == ctx.attr_last_err
         return
-    g_attr_last_err = name
-    g_attr_errors = g_attr_errors + 1
-    diag_error_at(g_parse_file, diag_span(line, col))
+    ctx.attr_last_err = name
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error_at(ctx.parse_file, diag_span(line, col))
     eprints_cstr(c"attribute '")
     eprint_lexeme(StrView { ptr: (name), len: (len) as i64 })
     eprints_cstr(c"' ")
     eprintln_cstr(msg)
 
-fn attr_unknown(name_sv: StrView, line: i32, col: i32)
+fn attr_unknown(ctx: *ParseCtx, name_sv: StrView, line: i32, col: i32)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if name == g_attr_last_err
+    if name == ctx.attr_last_err
         return
-    g_attr_last_err = name
-    g_attr_errors = g_attr_errors + 1
-    diag_error_name(g_parse_file, diag_span(line, col), c"unknown attribute '", StrView { ptr: (name), len: (len) as i64 }, c"' (known: always_inline, callconv, inline, must_use, naked, noinline, packed, target_arch, target_os, test, test_helper)")
+    ctx.attr_last_err = name
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error_name(ctx.parse_file, diag_span(line, col), c"unknown attribute '", StrView { ptr: (name), len: (len) as i64 }, c"' (known: always_inline, callconv, inline, must_use, naked, noinline, packed, target_arch, target_os, test, test_helper)")
 
 # 1 for the attributes written bare, `[[name]]`.
 fn attr_is_bare_name(name_sv: StrView) -> i32
@@ -630,24 +644,24 @@ pub fn attr_flag(p: *Parser, name_sv: StrView, line: i32, col: i32) -> i32
     else if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"naked"), len: (5) as i64 })
         bit = ATTR_NAKED
     else if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"target_os"), len: (9) as i64 })
-        attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"needs a value: [[target_os = <os name string>]]")
+        attr_error(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col, c"needs a value: [[target_os = <os name string>]]")
         return 0
     else if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"target_arch"), len: (11) as i64 })
-        attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"needs a value: [[target_arch = <arch name string>]]")
+        attr_error(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col, c"needs a value: [[target_arch = <arch name string>]]")
         return 0
     else if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"callconv"), len: (8) as i64 })
-        attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"needs a value: [[callconv = \"win64\"]] or [[callconv = \"c\"]]")
+        attr_error(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col, c"needs a value: [[callconv = \"win64\"]] or [[callconv = \"c\"]]")
         return 0
     else
-        attr_unknown(StrView { ptr: (name), len: (len) as i64 }, line, col)
+        attr_unknown(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col)
         return 0
     if attr_item_kind(p) != applies_to
         if applies_to == ATTR_ITEM_STRUCT
-            attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to struct items only")
+            attr_error(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to struct items only")
         else
-            attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn items only")
+            attr_error(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn items only")
         return 0
-    g_attr_bits = g_attr_bits | bit
+    p.ctx.attr_bits = p.ctx.attr_bits | bit
     0
 
 # Grammar action for `[[name = "value"]]`.
@@ -659,81 +673,81 @@ pub fn attr_kv(p: *Parser, name_sv: StrView, line: i32, col: i32, str_val_sv: St
     if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"target_os"), len: (9) as i64 })
         let tk: i32 = attr_item_kind(p)
         if tk != ATTR_ITEM_FN and tk != ATTR_ITEM_STRUCT and tk != ATTR_ITEM_CONST
-            attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn, struct or const items only")
+            attr_error(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn, struct or const items only")
             return 0
-        g_attr_bits = g_attr_bits | ATTR_TARGET_OS
-        g_attr_target_os = struct_variant_target_hash(StrView { ptr: (c"target_os"), len: (9) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })   # AGAST #4111
+        p.ctx.attr_bits = p.ctx.attr_bits | ATTR_TARGET_OS
+        p.ctx.attr_target_os = struct_variant_target_hash(StrView { ptr: (c"target_os"), len: (9) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })   # AGAST #4111
         check_target_os_filter(p, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })
         return 0
     if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"target_arch"), len: (11) as i64 })
         let ak: i32 = attr_item_kind(p)
         if ak != ATTR_ITEM_FN and ak != ATTR_ITEM_STRUCT and ak != ATTR_ITEM_CONST
-            attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn, struct or const items only")
+            attr_error(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn, struct or const items only")
             return 0
-        g_attr_bits = g_attr_bits | ATTR_TARGET_ARCH
-        g_attr_target_arch = struct_variant_target_hash(StrView { ptr: (c"target_arch"), len: (11) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })
+        p.ctx.attr_bits = p.ctx.attr_bits | ATTR_TARGET_ARCH
+        p.ctx.attr_target_arch = struct_variant_target_hash(StrView { ptr: (c"target_arch"), len: (11) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })
         check_target_os_filter(p, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })
         return 0
     if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"callconv"), len: (8) as i64 })
         # LANGUAGE_SPEC §17.7 (AGAST #1879).
         let ck: i32 = attr_item_kind(p)
         if ck != ATTR_ITEM_FN and ck != ATTR_ITEM_EXTERN_FN and ck != ATTR_ITEM_FN_ALIAS
-            attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn, extern fn or fn-type alias items only")
+            attr_error(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn, extern fn or fn-type alias items only")
             return 0
         if (StrView { ptr: (str_val), len: (str_len) as i64 }).eq(StrView { ptr: (c"win64"), len: (5) as i64 })
-            g_attr_bits = g_attr_bits | ATTR_WIN64
+            p.ctx.attr_bits = p.ctx.attr_bits | ATTR_WIN64
         else if not (StrView { ptr: (str_val), len: (str_len) as i64 }).eq(StrView { ptr: (c"c"), len: (1) as i64 })
-            if name != g_attr_last_err
-                g_attr_last_err = name
-                g_attr_errors = g_attr_errors + 1
-                diag_error_name(g_parse_file, diag_span(line, col), c"unknown calling convention '", StrView { ptr: (str_val), len: (str_len) as i64 }, c"' (known: c, win64)")
+            if name != p.ctx.attr_last_err
+                p.ctx.attr_last_err = name
+                p.ctx.attr_errors = p.ctx.attr_errors + 1
+                diag_error_name(p.ctx.parse_file, diag_span(line, col), c"unknown calling convention '", StrView { ptr: (str_val), len: (str_len) as i64 }, c"' (known: c, win64)")
         return 0
     if attr_is_bare_name(StrView { ptr: (name), len: (len) as i64 }) == 1
-        attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"takes no value")
+        attr_error(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col, c"takes no value")
         return 0
-    attr_unknown(StrView { ptr: (name), len: (len) as i64 }, line, col)
+    attr_unknown(p.ctx, StrView { ptr: (name), len: (len) as i64 }, line, col)
     0
 
-fn item_attr_record(item: *u8, bits: i32)
-    if g_item_attr_count + 2 > g_item_attr_cap
-        var cap: i64 = g_item_attr_cap * 2
+fn item_attr_record(ctx: *ParseCtx, item: *u8, bits: i32)
+    if ctx.item_attr_count + 2 > ctx.item_attr_cap
+        var cap: i64 = ctx.item_attr_cap * 2
         if cap == 0
             cap = 32
-        let grown: *i64 = realloc(g_item_attrs as *u8, cap * 8) as *i64
+        let grown: *i64 = realloc(ctx.item_attrs as *u8, cap * 8) as *i64
         if grown == null
             eprints_cstr(c"error: ritz1: out of memory recording attributes\n")
             sys_exit(70)
-        g_item_attrs = grown
-        g_item_attr_cap = cap
-    *(g_item_attrs + g_item_attr_count) = item as i64
-    *(g_item_attrs + g_item_attr_count + 1) = bits as i64
-    g_item_attr_count = g_item_attr_count + 2
+        ctx.item_attrs = grown
+        ctx.item_attr_cap = cap
+    *(ctx.item_attrs + ctx.item_attr_count) = item as i64
+    *(ctx.item_attrs + ctx.item_attr_count + 1) = bits as i64
+    ctx.item_attr_count = ctx.item_attr_count + 2
 
 # ATTR_* bits recorded for `item` (by identity), 0 if none.
-fn item_attr_bits(item: *u8) -> i32
+fn item_attr_bits(ctx: *ParseCtx, item: *u8) -> i32
     let key: i64 = item as i64
     var i: i64 = 0
-    while i < g_item_attr_count
-        if *(g_item_attrs + i) == key
-            return *(g_item_attrs + i + 1) as i32
+    while i < ctx.item_attr_count
+        if *(ctx.item_attrs + i) == key
+            return *(ctx.item_attrs + i + 1) as i32
         i = i + 2
     0
 
 # 1 if `st` was declared `[[packed]]` (or is a clone of one: monomorph marks
 # its specialisations with struct_mark_packed).
-pub fn struct_is_packed(st: *StructDef) -> i32
+pub fn struct_is_packed(ctx: *ParseCtx, st: *StructDef) -> i32
     if st == null
         return 0
-    if (item_attr_bits(st as *u8) & ATTR_PACKED) != 0
+    if (item_attr_bits(ctx, st as *u8) & ATTR_PACKED) != 0
         return 1
     0
 
-pub fn struct_mark_packed(st: *StructDef)
-    item_attr_record(st as *u8, ATTR_PACKED)
+pub fn struct_mark_packed(ctx: *ParseCtx, st: *StructDef)
+    item_attr_record(ctx, st as *u8, ATTR_PACKED)
 
 # 1 if `f` was declared `[[naked]]` (§17.5, AGAST #3395).
-pub fn fn_is_naked(f: *FnDef) -> i32
-    if (item_attr_bits(f as *u8) & ATTR_NAKED) != 0
+pub fn fn_is_naked(ctx: *ParseCtx, f: *FnDef) -> i32
+    if (item_attr_bits(ctx, f as *u8) & ATTR_NAKED) != 0
         return 1
     0
 
@@ -742,10 +756,10 @@ pub fn fn_is_naked(f: *FnDef) -> i32
 # the tokens, so iface_text.ritz writes the same text without a Module;
 # ritz0's module_interface.inline_kept.  fn_inline_import below decides
 # whether the importer defines it.
-pub fn fn_inline_kept(f: *FnDef) -> i32
+pub fn fn_inline_kept(ctx: *ParseCtx, f: *FnDef) -> i32
     if f.is_pub == 0
         return 0
-    if (item_attr_bits(f as *u8) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
+    if (item_attr_bits(ctx, f as *u8) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
         return 0
     1
 
@@ -760,12 +774,12 @@ pub fn fn_inline_kept(f: *FnDef) -> i32
 # refuses an if-expression and a field or index store; ritz0 inlines those,
 # which only costs ritz1 the inlining.  Its body is kept (fn_inline_kept);
 # emitter.ritz emit_fn defines it.
-pub fn fn_inline_import(f: *FnDef) -> i32
-    if (item_attr_bits(f as *u8) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
+pub fn fn_inline_import(ctx: *ParseCtx, f: *FnDef) -> i32
+    if (item_attr_bits(ctx, f as *u8) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
         return 0
     if f.is_pub == 0 or f.type_params != null or f.is_async != 0 or f.from_generated != 0
         return 0
-    if f.body == null or fn_is_decl(f) == 1 or fn_is_naked(f) == 1
+    if f.body == null or fn_is_decl(ctx, f) == 1 or fn_is_naked(ctx, f) == 1
         return 0
     if f.body.kind == StmtKind.Stripped
         return 0
@@ -868,8 +882,8 @@ fn ii_expr(f: *FnDef, e: *Expr) -> i32
 
 # LLVM fn attribute text for `f`'s inline attribute (with a leading space),
 # or "" when it has none.
-pub fn fn_inline_attr(f: *FnDef) -> *u8
-    let bits: i32 = item_attr_bits(f as *u8)
+pub fn fn_inline_attr(ctx: *ParseCtx, f: *FnDef) -> *u8
+    let bits: i32 = item_attr_bits(ctx, f as *u8)
     if (bits & ATTR_INLINE) != 0
         return c" inlinehint"
     if (bits & ATTR_ALWAYS_INLINE) != 0
@@ -882,8 +896,8 @@ pub fn fn_inline_attr(f: *FnDef) -> *u8
 # ("win64cc "), or "" for the C convention (LANGUAGE_SPEC §17.7, AGAST
 # #1879).  `f` is a fn, an extern fn, or the signature of a fn type (a
 # `[[callconv]]` fn-type alias's, which type_alias_record marks).
-pub fn fn_callconv_kw(f: *FnDef) -> *u8
-    if f != null and (item_attr_bits(f as *u8) & ATTR_WIN64) != 0
+pub fn fn_callconv_kw(ctx: *ParseCtx, f: *FnDef) -> *u8
+    if f != null and (item_attr_bits(ctx, f as *u8) & ATTR_WIN64) != 0
         return c"win64cc "
     c""
 
@@ -893,12 +907,12 @@ pub fn fn_callconv_kw(f: *FnDef) -> *u8
 # #3633): it calls, is called, may assert, inlines and gets a prologue as the
 # template does.  One record: an item's bits are read from its first record
 # only (item_attr_bits).
-pub fn fn_copy_instance_attrs(dst: *FnDef, src: *FnDef)
+pub fn fn_copy_instance_attrs(ctx: *ParseCtx, dst: *FnDef, src: *FnDef)
     if src == null
         return
-    let bits: i32 = item_attr_bits(src as *u8) & (ATTR_WIN64 | ATTR_TEST_HELPER | ATTR_MUST_USE | ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_NAKED)
+    let bits: i32 = item_attr_bits(ctx, src as *u8) & (ATTR_WIN64 | ATTR_TEST_HELPER | ATTR_MUST_USE | ATTR_INLINE | ATTR_ALWAYS_INLINE | ATTR_NOINLINE | ATTR_NAKED)
     if bits != 0
-        item_attr_record(dst as *u8, bits)
+        item_attr_record(ctx, dst as *u8, bits)
 
 # Describe token `pos` for a diagnostic: its quoted lexeme, or a name for
 # the layout tokens whose lexeme is whitespace or empty.
@@ -1276,17 +1290,17 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
     # and the emitter refuses it; ritz1 refuses it at the `let`, with the same
     # wording, so one rule reads the same under both.
     if module_let_at(p, p.pos) == 1
-        g_dropped_items = g_dropped_items + 1
+        p.ctx.dropped_items = p.ctx.dropped_items + 1
         parse_error_at(p, p.pos)
         eprints_cstr(c"there is no module-level `let`")
         eprintln_cstr(c"")
         return 1
     let fail_at: i32 = p.max_pos
     if fail_at > p.pos
-        if fail_at == g_last_drop_at
+        if fail_at == p.ctx.last_drop_at
             return 1
-        g_last_drop_at = fail_at
-        g_dropped_items = g_dropped_items + 1
+        p.ctx.last_drop_at = fail_at
+        p.ctx.dropped_items = p.ctx.dropped_items + 1
         let qual: i32 = qualified_access_at(p, fail_at)
         let dotted: i32 = dotted_type_at(p, fail_at)
         let legacy_amp: i32 = legacy_amp_type_at(p, fail_at)
@@ -1318,10 +1332,10 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
                 p_eprint_expected(p)
         eprintln_cstr(c"")
         eprints_cstr(c"note: ")
-        diag_loc(g_parse_file, parse_span_at(p, p.pos))
+        diag_loc(p.ctx.parse_file, parse_span_at(p, p.pos))
         eprints_cstr(c": ")
     else
-        g_dropped_items = g_dropped_items + 1
+        p.ctx.dropped_items = p.ctx.dropped_items + 1
         parse_error_at(p, p.pos)
     eprints_cstr(c"cannot parse item starting at '")
     eprint_construct(p)
@@ -1336,18 +1350,18 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
 pub fn module_require_eof(p: *Parser) -> i32
     tuple_resolve_module(p)   # AGAST #2956: may report, so first
     # A rejected attribute was reported where it was written (#1847).
-    if g_attr_errors > 0
-        g_parse_reported = 1
+    if p.ctx.attr_errors > 0
+        p.ctx.parse_reported = 1
         p.error = 1
         return 1
 
     # Any item the recovery skipped is a dropped top-level definition.
     # A file-wide tally, not at a line: `<file>: error: N ...` (#3445).
-    if g_dropped_items > 0
-        diag_file_error_at(g_parse_file)
-        eprint_i64(g_dropped_items as i64)
+    if p.ctx.dropped_items > 0
+        diag_file_error_at(p.ctx.parse_file)
+        eprint_i64(p.ctx.dropped_items as i64)
         eprintln_cstr(c" top-level item(s) failed to parse; refusing to emit a partial module")
-        g_parse_reported = 1
+        p.ctx.parse_reported = 1
         p.error = 1
         return 1
 
@@ -1363,7 +1377,7 @@ pub fn module_require_eof(p: *Parser) -> i32
     eprint_construct(p)
     eprintln_cstr(c"'")
     eprintln_cstr(c"note: the rest of the file was not parsed; refusing to emit a partial module")
-    g_parse_reported = 1
+    p.ctx.parse_reported = 1
     p.error = 1
     return 1
 
@@ -1428,7 +1442,7 @@ pub fn module_add_impl(m: *Module, impl_block: *ImplBlock)
 # or `IndexSet`.  Located at the type's name; ritz0 says the same
 # (ritz0/index_rules.py builtin_impl).  Backtracking can build a block twice:
 # its name is reported once.
-var g_index_impl_last_err: *u8 = null
+# State: ParseCtx.index_impl_last_err
 
 fn index_impl_on_builtin(p: *Parser, trait_name_sv: StrView, type_name_sv: StrView)
     var trait_name: *u8 = trait_name_sv.ptr
@@ -1439,11 +1453,11 @@ fn index_impl_on_builtin(p: *Parser, trait_name_sv: StrView, type_name_sv: StrVi
         return
     if not (StrView { ptr: (type_name), len: (type_len) as i64 }).eq(StrView { ptr: (c"Vec"), len: (3) as i64 }) and not (StrView { ptr: (type_name), len: (type_len) as i64 }).eq(StrView { ptr: (c"Span"), len: (4) as i64 }) and not (StrView { ptr: (type_name), len: (type_len) as i64 }).eq(StrView { ptr: (c"String"), len: (6) as i64 })
         return
-    if type_name == g_index_impl_last_err
+    if type_name == p.ctx.index_impl_last_err
         return
-    g_index_impl_last_err = type_name
-    g_attr_errors = g_attr_errors + 1
-    diag_error_at(g_parse_file, tok_span_of(p, type_name, 0))
+    p.ctx.index_impl_last_err = type_name
+    p.ctx.attr_errors = p.ctx.attr_errors + 1
+    diag_error_at(p.ctx.parse_file, tok_span_of(p, type_name, 0))
     eprints_cstr(c"`")
     sys_write(2, type_name, type_len as i64)
     eprints_cstr(c"` is indexed by the language: it can't implement `")
@@ -1569,11 +1583,11 @@ fn impl_block_core(p: *Parser, trait_name_sv: StrView, type_name_sv: StrView, ty
         # m.functions before monomorph appends the specialised methods.
         mt.def_file = parse_file_copy_shared(p)
         if mt.type_params != null
-            generic_method_error(tok_span_of(p, mt.name, mt.line), mt, StrView { ptr: (type_name), len: (type_len) as i64 })
-        if type_params != null and fn_is_decl(mt) == 1
-            decl_refused(tok_span_of(p, mt.name, mt.line), c"method", StrView { ptr: (mt.name), len: (mt.name_len) as i64 }, StrView { ptr: (type_name), len: (type_len) as i64 }, c"importers instantiate its body")
+            generic_method_error(p.ctx, tok_span_of(p, mt.name, mt.line), mt, StrView { ptr: (type_name), len: (type_len) as i64 })
+        if type_params != null and fn_is_decl(p.ctx, mt) == 1
+            decl_refused(p.ctx, tok_span_of(p, mt.name, mt.line), c"method", StrView { ptr: (mt.name), len: (mt.name_len) as i64 }, StrView { ptr: (type_name), len: (type_len) as i64 }, c"importers instantiate its body")
         if trait_len == 4 and name_is_drop(trait_name) == 1 and mt.name_len == 4 and name_is_drop_fn(mt.name) == 1
-            drop_by_value_error(tok_span_of(p, mt.name, mt.line), mt)
+            drop_by_value_error(p.ctx, tok_span_of(p, mt.name, mt.line), mt)
         impl_spell_self(p, mt, StrView { ptr: (type_name), len: (type_len) as i64 }, type_params)   # AGAST #3249
         if ptr_target == 1
             impl_spell_self_ptr(mt, StrView { ptr: (ptr_pointee), len: (ptr_pointee_len) as i64 })   # AGAST #4294
@@ -1585,7 +1599,7 @@ fn impl_block_core(p: *Parser, trait_name_sv: StrView, type_name_sv: StrView, ty
         if type_params == null
             impl_name_bare_self(mt, StrView { ptr: (type_name), len: (type_len) as i64 })
         mt = mt.next
-    tn_claim_impl(type_params, methods)   # AGAST #4021
+    tn_claim_impl(p.ctx, type_params, methods)   # AGAST #4021
     return ib
 
 # AGAST #3249: `Self` in a method's params and return type is the impl's
@@ -1749,17 +1763,17 @@ fn impl_self_spelling(p: *Parser, type_name_sv: StrView, type_params: *TypeParam
 # ritz0 erased T instead.  The spec does not have them, and ritz0's
 # parse_impl rejects them with the same message.  Printed once per method
 # (the grammar may re-run the action on backtracking); module_require_eof
-# fails the parse via g_attr_errors, the parse-time error count.
-var g_generic_method_last_err: *u8 = null
+# fails the parse via ctx.attr_errors, the parse-time error count.
+# State: ParseCtx.generic_method_last_err
 
-fn generic_method_error(at: SrcSpan, mt: *FnDef, type_name_sv: StrView)
+fn generic_method_error(ctx: *ParseCtx, at: SrcSpan, mt: *FnDef, type_name_sv: StrView)
     var type_name: *u8 = type_name_sv.ptr
     var type_len: i32 = type_name_sv.len as i32
-    if mt.name == g_generic_method_last_err
+    if mt.name == ctx.generic_method_last_err
         return
-    g_generic_method_last_err = mt.name
-    g_attr_errors = g_attr_errors + 1
-    diag_error_at(g_parse_file, at)
+    ctx.generic_method_last_err = mt.name
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error_at(ctx.parse_file, at)
     eprints_cstr(c"method '")
     eprint_lexeme(StrView { ptr: (mt.name), len: (mt.name_len) as i64 })
     eprints_cstr(c"' of '")
@@ -1776,34 +1790,34 @@ fn generic_method_error(at: SrcSpan, mt: *FnDef, type_name_sv: StrView)
 # `declare`s it, and emitting it is a hard error.  It can't be null:
 # `body == null` means `extern fn`.
 
-var g_stripped_body: Stmt
+# State: ParseCtx.stripped_body
 
-pub fn stripped_body() -> *Stmt
-    g_stripped_body.kind = StmtKind.Stripped
-    g_stripped_body.next = null
-    @g_stripped_body
+pub fn stripped_body(ctx: *ParseCtx) -> *Stmt
+    ctx.stripped_body.kind = StmtKind.Stripped
+    ctx.stripped_body.next = null
+    @ctx.stripped_body
 
-pub fn fn_is_decl(f: *FnDef) -> i32
-    if f.body == @g_stripped_body
+pub fn fn_is_decl(ctx: *ParseCtx, f: *FnDef) -> i32
+    if f.body == @ctx.stripped_body
         return 1
     0
 
 # One error per item name (the grammar may re-run an action on
-# backtracking); counted in g_attr_errors, which fails the parse.  ritz0
+# backtracking); counted in ctx.attr_errors, which fails the parse.  ritz0
 # prints the same words (parser.py DECL_REFUSED).
-var g_decl_last_err: *u8 = null
+# State: ParseCtx.decl_last_err
 
 # `owner` (a generic impl's type name) may be null.
-fn decl_refused(at: SrcSpan, what: *u8, name_sv: StrView, owner_sv: StrView, why: *u8)
+fn decl_refused(ctx: *ParseCtx, at: SrcSpan, what: *u8, name_sv: StrView, owner_sv: StrView, why: *u8)
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     var owner: *u8 = owner_sv.ptr
     var owner_len: i32 = owner_sv.len as i32
-    if name == g_decl_last_err
+    if name == ctx.decl_last_err
         return
-    g_decl_last_err = name
-    g_attr_errors = g_attr_errors + 1
-    diag_error_at(g_parse_file, at)
+    ctx.decl_last_err = name
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error_at(ctx.parse_file, at)
     eprints_cstr(what)
     eprints_cstr(c" '")
     eprint_lexeme(StrView { ptr: (name), len: (name_len) as i64 })
@@ -1818,8 +1832,8 @@ pub fn decl_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam, pa
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if type_params != null
-        decl_refused(diag_span(line, col), c"generic fn", StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (null), len: (0) as i64 }, c"importers instantiate its body")
-    let f: *FnDef = generic_fn_def_new(p, StrView { ptr: (name), len: (len) as i64 }, type_params, params, ret, stripped_body(), line, col)
+        decl_refused(p.ctx, diag_span(line, col), c"generic fn", StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (null), len: (0) as i64 }, c"importers instantiate its body")
+    let f: *FnDef = generic_fn_def_new(p, StrView { ptr: (name), len: (len) as i64 }, type_params, params, ret, stripped_body(p.ctx), line, col)
     # AGAST #3419: as written.  Read from an interface text, where every
     # stripped body is one of these too, load_and_parse corrects it.
     f.extern_decl = 1
@@ -1828,13 +1842,10 @@ pub fn decl_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam, pa
 # AGAST #4211: every trait declared, in any file parsed (imports count), so
 # `impl Nonesuch for X` is "unknown trait" (refuse_impls_on_unknown_types).
 # Grammar action of trait_def; a re-parse records a name twice, harmlessly.
-var g_trait_names: **u8 = null
-var g_trait_lens: *i32 = null
+# State: ParseCtx.trait_names, .trait_lens
 # AGAST #4294: the file each trait was declared in, so a trait impl on a
 # primitive/built-in can be admitted only in the trait's file.
-var g_trait_files: **u8 = null
-var g_trait_count: i32 = 0
-var g_trait_cap: i32 = 0
+# State: ParseCtx.trait_files, .trait_count, .trait_cap
 
 fn dup_parse_file_name(path: *u8) -> *u8
     if path == null
@@ -1849,39 +1860,39 @@ fn dup_parse_file_name(path: *u8) -> *u8
         i = i + 1
     buf
 
-pub fn trait_declared_record(name_sv: StrView) -> i32
+pub fn trait_declared_record(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if g_trait_count >= g_trait_cap
-        var cap: i32 = g_trait_cap * 2
+    if ctx.trait_count >= ctx.trait_cap
+        var cap: i32 = ctx.trait_cap * 2
         if cap == 0
             cap = 64
-        g_trait_names = realloc(g_trait_names as *u8, (cap as i64) * 8) as **u8
-        g_trait_lens = realloc(g_trait_lens as *u8, (cap as i64) * 4) as *i32
-        g_trait_files = realloc(g_trait_files as *u8, (cap as i64) * 8) as **u8
-        g_trait_cap = cap
-    *(g_trait_names + g_trait_count) = name
-    *(g_trait_lens + g_trait_count) = len
-    *(g_trait_files + g_trait_count) = dup_parse_file_name(g_parse_file)
-    g_trait_count = g_trait_count + 1
+        ctx.trait_names = realloc(ctx.trait_names as *u8, (cap as i64) * 8) as **u8
+        ctx.trait_lens = realloc(ctx.trait_lens as *u8, (cap as i64) * 4) as *i32
+        ctx.trait_files = realloc(ctx.trait_files as *u8, (cap as i64) * 8) as **u8
+        ctx.trait_cap = cap
+    *(ctx.trait_names + ctx.trait_count) = name
+    *(ctx.trait_lens + ctx.trait_count) = len
+    *(ctx.trait_files + ctx.trait_count) = dup_parse_file_name(ctx.parse_file)
+    ctx.trait_count = ctx.trait_count + 1
     0
 
 # The log in parse order, never reset: import_vis marks it before a file is
 # parsed and reads what the file added, for R54's selective-list check
 # (AGAST #3467), as with type_decl_log.
-pub fn trait_declared_count() -> i32
-    g_trait_count
+pub fn trait_declared_count(ctx: *ParseCtx) -> i32
+    ctx.trait_count
 
-pub fn trait_declared_at(i: i32, out_len: *i32) -> *u8
-    *out_len = *(g_trait_lens + i)
-    *(g_trait_names + i)
+pub fn trait_declared_at(ctx: *ParseCtx, i: i32, out_len: *i32) -> *u8
+    *out_len = *(ctx.trait_lens + i)
+    *(ctx.trait_names + i)
 
-pub fn trait_declared(name_sv: StrView) -> i32
+pub fn trait_declared(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var i: i32 = 0
-    while i < g_trait_count
-        if (StrView { ptr: (*(g_trait_names + i)), len: (*(g_trait_lens + i)) as i64 }).eq(StrView { ptr: (name), len: (len) as i64 })
+    while i < ctx.trait_count
+        if (StrView { ptr: (*(ctx.trait_names + i)), len: (*(ctx.trait_lens + i)) as i64 }).eq(StrView { ptr: (name), len: (len) as i64 })
             return 1
         i += 1
     0
@@ -1898,25 +1909,25 @@ fn cstr_eq(a: *u8, b: *u8) -> i32
 
 # AGAST #4294: is `name` a trait declared in `file`?  The file of the impl
 # (ImplBlock.def_file) is compared with the file the trait was parsed from.
-pub fn trait_declared_in_file(name_sv: StrView, file: *u8) -> i32
+pub fn trait_declared_in_file(ctx: *ParseCtx, name_sv: StrView, file: *u8) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if file == null
         return 0
     var i: i32 = 0
-    while i < g_trait_count
-        if (StrView { ptr: (*(g_trait_names + i)), len: (*(g_trait_lens + i)) as i64 }).eq(StrView { ptr: (name), len: (len) as i64 })
-            if cstr_eq(*(g_trait_files + i), file) == 1
+    while i < ctx.trait_count
+        if (StrView { ptr: (*(ctx.trait_names + i)), len: (*(ctx.trait_lens + i)) as i64 }).eq(StrView { ptr: (name), len: (len) as i64 })
+            if cstr_eq(*(ctx.trait_files + i), file) == 1
                 return 1
         i += 1
     0
 
 # Grammar action: `fn name(params) [-> R] = extern` in a trait, at the `fn`
 # token, as ritz0 reports it (it passed the line only, so col 0: AGAST #3621).
-pub fn trait_decl_refused(name_sv: StrView, line: i32, col: i32) -> i32
+pub fn trait_decl_refused(ctx: *ParseCtx, name_sv: StrView, line: i32, col: i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    decl_refused(diag_span(line, col), c"trait method", StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (null), len: (0) as i64 }, c"a trait method is a signature already; drop '= extern'")
+    decl_refused(ctx, diag_span(line, col), c"trait method", StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (null), len: (0) as i64 }, c"a trait method is a signature already; drop '= extern'")
     0
 
 # =============================================================================
@@ -2045,8 +2056,8 @@ pub fn extern_var_init_refused(p: *Parser, name_sv: StrView, line: i32, col: i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if p.skip_item == 0
-        diag_error_name(g_parse_file, diag_span(line, col), c"extern var cannot have an initializer: '", StrView { ptr: (name), len: (len) as i64 }, c"' is defined in another object")
-        g_attr_errors = g_attr_errors + 1
+        diag_error_name(p.ctx.parse_file, diag_span(line, col), c"extern var cannot have an initializer: '", StrView { ptr: (name), len: (len) as i64 }, c"' is defined in another object")
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
     extern_var_new(p, StrView { ptr: (name), len: (len) as i64 }, type_prim(p, TypeKind.I64), line, col)
 
 # The type a declaration would spell for an untyped global's initializer, as
@@ -2083,7 +2094,7 @@ pub fn global_var_untyped_refused(p: *Parser, name_sv: StrView, init_expr: *Expr
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if p.skip_item == 0
-        diag_error_at(g_parse_file, diag_span(eq_line, eq_col))
+        diag_error_at(p.ctx.parse_file, diag_span(eq_line, eq_col))
         eprints_cstr(c"a global needs a type: write `var ")
         var i: i32 = 0
         while i < len
@@ -2092,43 +2103,43 @@ pub fn global_var_untyped_refused(p: *Parser, name_sv: StrView, init_expr: *Expr
         eprints_cstr(c": ")
         eprints_cstr(untyped_global_shown(init_expr))
         eprints_cstr(c" = ...`\n")
-        g_attr_errors = g_attr_errors + 1
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
     global_var_new(p, StrView { ptr: (name), len: (len) as i64 }, type_prim(p, TypeKind.I64), 0 as *Expr, line, col)
 
 # Copy of the current parse file's path in the parser arena, or null.
-# g_parse_file itself is borrowed: for an import it points into a String the
+# ctx.parse_file itself is borrowed: for an import it points into a String the
 # driver drops as soon as that import is parsed, long before emission.
 fn parse_file_copy(p: *Parser) -> *u8
-    if g_parse_file == null
+    if p.ctx.parse_file == null
         return null
     var n: i64 = 0
-    while *(g_parse_file + n) != 0
+    while *(p.ctx.parse_file + n) != 0
         n = n + 1
     let buf: *u8 = parser_alloc(p, n + 1)
     var i: i64 = 0
     while i <= n
-        *(buf + i) = *(g_parse_file + i)
+        *(buf + i) = *(p.ctx.parse_file + i)
         i = i + 1
     buf
 
 # parse_file_copy, shared between consecutive callers that see the same path.
 # AGAST #1364 records a path on every narrow-integer let/var, and a fresh copy
 # each time would grow the arena by a path per declaration.  The cache is
-# keyed on CONTENT, never on the g_parse_file pointer: that String is freed
+# keyed on CONTENT, never on the ctx.parse_file pointer: that String is freed
 # after each import, so a later file can arrive at the same address.
-var g_shared_file_copy: *u8 = null
+# State: ParseCtx.shared_file_copy
 
 fn parse_file_copy_shared(p: *Parser) -> *u8
-    if g_parse_file == null
+    if p.ctx.parse_file == null
         return null
-    if g_shared_file_copy != null
+    if p.ctx.shared_file_copy != null
         var i: i64 = 0
-        while *(g_parse_file + i) != 0 and *(g_parse_file + i) == *(g_shared_file_copy + i)
+        while *(p.ctx.parse_file + i) != 0 and *(p.ctx.parse_file + i) == *(p.ctx.shared_file_copy + i)
             i = i + 1
-        if *(g_parse_file + i) == 0 and *(g_shared_file_copy + i) == 0
-            return g_shared_file_copy
-    g_shared_file_copy = parse_file_copy(p)
-    g_shared_file_copy
+        if *(p.ctx.parse_file + i) == 0 and *(p.ctx.shared_file_copy + i) == 0
+            return p.ctx.shared_file_copy
+    p.ctx.shared_file_copy = parse_file_copy(p)
+    p.ctx.shared_file_copy
 
 # =============================================================================
 # Function definition helpers
@@ -2293,7 +2304,7 @@ pub fn param_new(p: *Parser, name_sv: StrView, ty: *TypeRef, line: i32, col: i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     # AGAST #3634: a by-value `[N][M]T` keeps its shape (param_of_type).
-    note_pass_binding(StrView { ptr: (name), len: (len) as i64 })   # AGAST #3320
+    note_pass_binding(p.ctx, StrView { ptr: (name), len: (len) as i64 })   # AGAST #3320
     let param: *Param = param_of_type(p, StrView { ptr: (name), len: (len) as i64 }, ty)
     param.name_span.line = line   # AGAST #2407
     param.name_span.col = col
@@ -2467,15 +2478,15 @@ fn name_is_drop_fn(n: *u8) -> i32
 # `fn drop(self)`: its own `self` would drop when it returned, and call it again
 # (AGAST #2393).  ritz0 prints the same words (ref_rules.DROP_BY_VALUE).  Once per
 # method: the grammar may re-run the action on backtracking.
-var g_drop_last_err: *FnDef = null
+# State: ParseCtx.drop_last_err
 
-fn drop_by_value_error(at: SrcSpan, m: *FnDef)
+fn drop_by_value_error(ctx: *ParseCtx, at: SrcSpan, m: *FnDef)
     let p: *Param = m.params
-    if param_is_self(p) == 0 or p.param_type != TypeKind.Struct or p.is_self_borrow == 1 or m == g_drop_last_err
+    if param_is_self(p) == 0 or p.param_type != TypeKind.Struct or p.is_self_borrow == 1 or m == ctx.drop_last_err
         return
-    g_drop_last_err = m
-    g_attr_errors = g_attr_errors + 1
-    diag_error(g_parse_file, at, c"`drop` can't take `self` by value: it would drop itself: write `self: @&T`")
+    ctx.drop_last_err = m
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error(ctx.parse_file, at, c"`drop` can't take `self` by value: it would drop itself: write `self: @&T`")
 
 # A bare `self` is `self: T` (AGAST #2393).  A generic impl's T is named when it's
 # specialised, so that one stays as it was parsed.
@@ -2684,7 +2695,7 @@ pub fn type_param_link(first: *TypeParam, rest: *TypeParam) -> *TypeParam
 pub fn generic_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam, params: *Param, ret: *TypeRef, body: *Stmt, line: i32, col: i32) -> *FnDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    g_pass_bound = 0   # AGAST #3320: this fn's `pass` bindings end with it
+    p.ctx.pass_bound = 0   # AGAST #3320: this fn's `pass` bindings end with it
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
     f.name = name as *u8
     f.name_len = len
@@ -3610,7 +3621,7 @@ pub fn type_named(p: *Parser, name_sv: StrView) -> *TypeRef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     # AGAST #1475: a type alias resolves to its target's TypeRef.
-    if g_alias_count > 0
+    if p.ctx.alias_count > 0
         let alias_ty: *TypeRef = type_alias_resolve(p, StrView { ptr: (name), len: (len) as i64 })
         if tr_is_void(alias_ty) == 0
             alias_use_log(p, StrView { ptr: (name), len: (len) as i64 })   # AGAST #3907
@@ -3643,15 +3654,9 @@ pub fn type_named(p: *Parser, name_sv: StrView) -> *TypeRef
 # alternative the parser backtracks out of (`a < b` tried as `a<b>(..)`)
 # leaves its entry behind; nothing in the AST points at it, so it is never
 # looked up.  A name the compiler builds (`Vec$u8`) has no entry.
-struct TypeNameAt
-    name: *u8
-    line: i32
-    col: i32
-    file: *u8
-    reported: i32
-    next: *TypeNameAt
+# struct TypeNameAt: ast.ritz, beside ParseCtx (AGAST #4623).
 
-var g_type_name_at: *TypeNameAt = null
+# State: ParseCtx.type_name_at
 
 fn note_type_name_at(p: *Parser, name: *u8)
     # The action runs just past the IDENT it names.
@@ -3669,8 +3674,8 @@ fn note_type_name_written(p: *Parser, name: *u8, line: i32, col: i32)
     at.col = col
     at.file = parse_file_copy_shared(p)
     at.reported = 0
-    at.next = g_type_name_at
-    g_type_name_at = at
+    at.next = p.ctx.type_name_at
+    p.ctx.type_name_at = at
 
 # AGAST #4021: a type name written where the AST keeps no source spelling:
 # a generic argument (the slot holds the mangled `Option$Nope`), an enum
@@ -3683,21 +3688,11 @@ fn note_type_name_written(p: *Parser, name: *u8, line: i32, col: i32)
 #
 # A note is the IDENT a type ended with (`Nope` of `*Nope`); one type_named
 # did not record (a primitive, an alias's name) is never reported.
-struct TnNote
-    name: *u8
-    len: i32
-    next: *TnNote
+# struct TnNote: ast.ritz, beside ParseCtx (AGAST #4623).
 
-struct TnScope
-    inner: *TypeParam   # the item's own type parameters
-    outer: *TypeParam   # a method's impl's
-    notes: *TnNote
-    fn_def: *FnDef      # the method impl_block_new looks for, else null
-    next: *TnScope
+# struct TnScope: ast.ritz, beside ParseCtx (AGAST #4623).
 
-var g_tn_pending: *TnNote = null   # noted, no item has claimed them yet
-var g_tn_scopes: *TnScope = null
-var g_tn_enum_params: *TypeParam = null   # the enum being parsed
+# State: ParseCtx.tn_pending, .tn_scopes, .tn_enum_params
 
 fn tn_note(p: *Parser, name_sv: StrView)
     var name: *u8 = name_sv.ptr
@@ -3707,8 +3702,8 @@ fn tn_note(p: *Parser, name_sv: StrView)
     let n: *TnNote = parser_alloc(p, sizeof(TnNote)) as *TnNote
     n.name = name
     n.len = len
-    n.next = g_tn_pending
-    g_tn_pending = n
+    n.next = p.ctx.tn_pending
+    p.ctx.tn_pending = n
 
 # The token `back` before p.pos when it is an IDENT (the type just parsed
 # ended with a name), else null.
@@ -3772,25 +3767,25 @@ fn tn_note_fields(p: *Parser, fields: *StructField)
 
 # The item whose action is running claims every pending note.
 fn tn_claim(p: *Parser, inner: *TypeParam, f: *FnDef)
-    if g_tn_pending == null
+    if p.ctx.tn_pending == null
         return
     let s: *TnScope = parser_alloc(p, sizeof(TnScope)) as *TnScope
     s.inner = inner
     s.outer = null
-    s.notes = g_tn_pending
+    s.notes = p.ctx.tn_pending
     s.fn_def = f
-    s.next = g_tn_scopes
-    g_tn_scopes = s
-    g_tn_pending = null
+    s.next = p.ctx.tn_scopes
+    p.ctx.tn_scopes = s
+    p.ctx.tn_pending = null
 
 # impl_block_new: its methods see its type parameters.  A method's scope is
 # near the list's head: methods claim just before their impl's action runs.
-fn tn_claim_impl(params: *TypeParam, methods: *FnDef)
+fn tn_claim_impl(ctx: *ParseCtx, params: *TypeParam, methods: *FnDef)
     if params == null
         return
     var f: *FnDef = methods
     while f != null
-        var s: *TnScope = g_tn_scopes
+        var s: *TnScope = ctx.tn_scopes
         while s != null and s.fn_def != f
             s = s.next
         if s != null
@@ -3806,22 +3801,22 @@ fn tn_drop_after_as(p: *Parser)
     if i < 0
         return
     let as_at: *u8 = (p.tokens + i).start
-    while g_tn_pending != null and (g_tn_pending.name as i64) > (as_at as i64)
-        g_tn_pending = g_tn_pending.next
+    while p.ctx.tn_pending != null and (p.ctx.tn_pending.name as i64) > (as_at as i64)
+        p.ctx.tn_pending = p.ctx.tn_pending.next
 
-pub fn tn_scopes() -> *TnScope
-    g_tn_scopes
+pub fn tn_scopes(ctx: *ParseCtx) -> *TnScope
+    ctx.tn_scopes
 
 # The driver's alias re-parse (main.ritz) builds every module afresh.
-pub fn tn_notes_reset()
-    g_tn_pending = null
-    g_tn_scopes = null
-    g_tn_enum_params = null
+pub fn tn_notes_reset(ctx: *ParseCtx)
+    ctx.tn_pending = null
+    ctx.tn_scopes = null
+    ctx.tn_enum_params = null
 
 # Where the type name at `name` was written; null for one no source spells.
 # Linear, so asked only about a name already found unknown.
-pub fn type_name_written_at(name: *u8) -> *TypeNameAt
-    var at: *TypeNameAt = g_type_name_at
+pub fn type_name_written_at(ctx: *ParseCtx, name: *u8) -> *TypeNameAt
+    var at: *TypeNameAt = ctx.type_name_at
     while at != null
         if at.name == name
             return at
@@ -3921,17 +3916,10 @@ pub fn capture_fn_return_type(p: *Parser, ret: *TypeRef) -> *TypeRef
 # into as well, so it's latched here, whole.  A typed `let` nested in the
 # initializer (a block arm) replaces the latch, as it does var_type_name, and a
 # nested reference then wins.
-var g_var_ref: *Param = null
+# State: ParseCtx.var_ref
 # AGAST #2822: likewise a `[N]T` annotation's shape (`<[M]U>` in the
 # initializer re-sets last_array_*), and a `*[N]T`'s pointee array.
-var g_var_array: *ArrayElem = null
-var g_var_array_size: i32 = 0
-var g_var_ptr_array_size: i32 = 0
-var g_var_ptr_array_elem: TypeKind = TypeKind.Void
-var g_var_ptr_array_elem_pointee: TypeKind = TypeKind.Void
-var g_var_ptr_array_shape: *ArrayShape = null   # AGAST #2098: `*[N][M]T`
-var g_var_ptr_array_elem_name: *u8 = null   # AGAST #3663: S in `*[N]S`
-var g_var_ptr_array_elem_name_len: i32 = 0
+# State: ParseCtx.var_array, .var_array_size, .var_ptr_array_size, .var_ptr_array_elem, .var_ptr_array_elem_pointee, .var_ptr_array_shape, .var_ptr_array_elem_name, .var_ptr_array_elem_name_len
 
 # AGAST #2822: one record of all the latches above per typed decl, so a typed
 # `let` nested in the initializer (a block arm) can't replace the outer decl's.
@@ -3940,28 +3928,9 @@ var g_var_ptr_array_elem_name_len: i32 = 0
 # records sit above it) and drops it and everything above it.  The grammar
 # backtracks: a re-capture first drops the records at or after its own end,
 # which a failed alternative left behind.
-struct VarLatch
-    tokens: *Token
-    line: i32
-    col: i32
-    below: *VarLatch
-    type_name: *u8
-    type_name_len: i32
-    pointee: TypeKind
-    inner_pointee: i32
-    inner_ref: i32   # AGAST #2399
-    fn_sig: *FnDef
-    ref: *Param
-    array: *ArrayElem
-    array_size: i32
-    ptr_array_size: i32
-    ptr_array_elem: TypeKind
-    ptr_array_elem_pointee: TypeKind
-    ptr_array_shape: *ArrayShape
-    ptr_array_elem_name: *u8
-    ptr_array_elem_name_len: i32
+# struct VarLatch: ast.ritz, beside ParseCtx (AGAST #4623).
 
-var g_var_latch: *VarLatch = null
+# State: ParseCtx.var_latch
 
 # (line, col) strictly after (line2, col2).
 fn pos_after(line: i32, col: i32, line2: i32, col2: i32) -> i32
@@ -3973,81 +3942,81 @@ fn push_var_latch(p: *Parser)
     let end: *Token = p.tokens + (p.pos - 1)
     # A record from another file's parse, or one at/after this annotation
     # (a failed alternative's), is stale.
-    while g_var_latch != null and (g_var_latch.tokens != p.tokens or pos_after(end.line, end.col, g_var_latch.line, g_var_latch.col) == 0)
-        g_var_latch = g_var_latch.below
+    while p.ctx.var_latch != null and (p.ctx.var_latch.tokens != p.tokens or pos_after(end.line, end.col, p.ctx.var_latch.line, p.ctx.var_latch.col) == 0)
+        p.ctx.var_latch = p.ctx.var_latch.below
     let r: *VarLatch = parser_alloc(p, sizeof(VarLatch)) as *VarLatch
     r.tokens = p.tokens
     r.line = end.line
     r.col = end.col
-    r.below = g_var_latch
+    r.below = p.ctx.var_latch
     r.type_name = p.var_type_name
     r.type_name_len = p.var_type_name_len
     r.pointee = p.var_pointee
     r.inner_pointee = p.var_inner_pointee
     r.inner_ref = p.var_inner_ref
     r.fn_sig = p.var_fn_sig
-    r.ref = g_var_ref
-    r.array = g_var_array
-    r.array_size = g_var_array_size
-    r.ptr_array_size = g_var_ptr_array_size
-    r.ptr_array_elem = g_var_ptr_array_elem
-    r.ptr_array_elem_pointee = g_var_ptr_array_elem_pointee
-    r.ptr_array_shape = g_var_ptr_array_shape
-    r.ptr_array_elem_name = g_var_ptr_array_elem_name
-    r.ptr_array_elem_name_len = g_var_ptr_array_elem_name_len
-    g_var_latch = r
+    r.ref = p.ctx.var_ref
+    r.array = p.ctx.var_array
+    r.array_size = p.ctx.var_array_size
+    r.ptr_array_size = p.ctx.var_ptr_array_size
+    r.ptr_array_elem = p.ctx.var_ptr_array_elem
+    r.ptr_array_elem_pointee = p.ctx.var_ptr_array_elem_pointee
+    r.ptr_array_shape = p.ctx.var_ptr_array_shape
+    r.ptr_array_elem_name = p.ctx.var_ptr_array_elem_name
+    r.ptr_array_elem_name_len = p.ctx.var_ptr_array_elem_name_len
+    p.ctx.var_latch = r
 
 # Restore the latches of the typed decl whose `let` is at (line, col).
 fn pop_var_latch(p: *Parser, line: i32, col: i32)
     var mine: *VarLatch = null
-    var r: *VarLatch = g_var_latch
+    var r: *VarLatch = p.ctx.var_latch
     while r != null and r.tokens == p.tokens and pos_after(r.line, r.col, line, col) != 0
         mine = r
         r = r.below
     if mine == null
         return
-    g_var_latch = mine.below
+    p.ctx.var_latch = mine.below
     p.var_type_name = mine.type_name
     p.var_type_name_len = mine.type_name_len
     p.var_pointee = mine.pointee
     p.var_inner_pointee = mine.inner_pointee
     p.var_inner_ref = mine.inner_ref
     p.var_fn_sig = mine.fn_sig
-    g_var_ref = mine.ref
-    g_var_array = mine.array
-    g_var_array_size = mine.array_size
-    g_var_ptr_array_size = mine.ptr_array_size
-    g_var_ptr_array_elem = mine.ptr_array_elem
-    g_var_ptr_array_elem_pointee = mine.ptr_array_elem_pointee
-    g_var_ptr_array_shape = mine.ptr_array_shape
-    g_var_ptr_array_elem_name = mine.ptr_array_elem_name
-    g_var_ptr_array_elem_name_len = mine.ptr_array_elem_name_len
+    p.ctx.var_ref = mine.ref
+    p.ctx.var_array = mine.array
+    p.ctx.var_array_size = mine.array_size
+    p.ctx.var_ptr_array_size = mine.ptr_array_size
+    p.ctx.var_ptr_array_elem = mine.ptr_array_elem
+    p.ctx.var_ptr_array_elem_pointee = mine.ptr_array_elem_pointee
+    p.ctx.var_ptr_array_shape = mine.ptr_array_shape
+    p.ctx.var_ptr_array_elem_name = mine.ptr_array_elem_name
+    p.ctx.var_ptr_array_elem_name_len = mine.ptr_array_elem_name_len
 
 pub fn capture_var_type(p: *Parser, tr: *TypeRef) -> *TypeRef
     let ty: TypeKind = tr_kind(tr)
     let facts: *TypeFacts = type_facts(p, tr)
-    g_var_ref = null
+    p.ctx.var_ref = null
     if ty == TypeKind.Ref or ty == TypeKind.MutRef
-        g_var_ref = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
-    g_var_array = null
-    g_var_array_size = 0
+        p.ctx.var_ref = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
+    p.ctx.var_array = null
+    p.ctx.var_array_size = 0
     if ty == TypeKind.Array
-        g_var_array = array_elem_of_type(p, tr)
-        g_var_array_size = facts.array_size
-    g_var_ptr_array_size = ptr_array_pointee_size(p, tr)
-    g_var_ptr_array_elem = ptr_array_pointee_elem(p, tr)
-    g_var_ptr_array_elem_pointee = ptr_array_elem_pointee(p, tr)
-    g_var_ptr_array_shape = ptr_nd_pointee_shape(p, tr)   # AGAST #2098
-    if g_var_ptr_array_shape != null
-        g_var_ptr_array_size = nd_shape_count(g_var_ptr_array_shape)
-        g_var_ptr_array_elem = g_var_ptr_array_shape.leaf_type
-        g_var_ptr_array_elem_pointee = g_var_ptr_array_shape.leaf_pointee
+        p.ctx.var_array = array_elem_of_type(p, tr)
+        p.ctx.var_array_size = facts.array_size
+    p.ctx.var_ptr_array_size = ptr_array_pointee_size(p, tr)
+    p.ctx.var_ptr_array_elem = ptr_array_pointee_elem(p, tr)
+    p.ctx.var_ptr_array_elem_pointee = ptr_array_elem_pointee(p, tr)
+    p.ctx.var_ptr_array_shape = ptr_nd_pointee_shape(p, tr)   # AGAST #2098
+    if p.ctx.var_ptr_array_shape != null
+        p.ctx.var_ptr_array_size = nd_shape_count(p.ctx.var_ptr_array_shape)
+        p.ctx.var_ptr_array_elem = p.ctx.var_ptr_array_shape.leaf_type
+        p.ctx.var_ptr_array_elem_pointee = p.ctx.var_ptr_array_shape.leaf_pointee
     # AGAST #3663: and the element's name, as a `*[N]T` param's (#2321).
-    g_var_ptr_array_elem_name = null
-    g_var_ptr_array_elem_name_len = 0
-    if ty == TypeKind.Ptr and g_var_ptr_array_shape == null and (g_var_ptr_array_elem == TypeKind.Struct or (g_var_ptr_array_elem == TypeKind.Ptr and g_var_ptr_array_elem_pointee == TypeKind.Struct))
-        g_var_ptr_array_elem_name = facts.type_name
-        g_var_ptr_array_elem_name_len = facts.type_name_len
+    p.ctx.var_ptr_array_elem_name = null
+    p.ctx.var_ptr_array_elem_name_len = 0
+    if ty == TypeKind.Ptr and p.ctx.var_ptr_array_shape == null and (p.ctx.var_ptr_array_elem == TypeKind.Struct or (p.ctx.var_ptr_array_elem == TypeKind.Ptr and p.ctx.var_ptr_array_elem_pointee == TypeKind.Struct))
+        p.ctx.var_ptr_array_elem_name = facts.type_name
+        p.ctx.var_ptr_array_elem_name_len = facts.type_name_len
     if ty == TypeKind.Struct
         p.var_type_name = facts.type_name
         p.var_type_name_len = facts.type_name_len
@@ -4148,8 +4117,7 @@ pub fn is_nd_array_type(p: *Parser, tr: *TypeRef) -> i32
         return 1
     0
 
-var g_nd_reject_line: i32 = -1
-var g_nd_reject_col: i32 = -1
+# State: ParseCtx.nd_reject_line, .nd_reject_col
 
 # AGAST #1509: fail closed where ritz1 cannot lower a multi-dimensional
 # array type.  Only local and global `var` declarations, (AGAST #2097)
@@ -4158,21 +4126,21 @@ var g_nd_reject_col: i32 = -1
 # `[N][M]T` used to be laid out as `[N x i64]` and miscompiled silently.
 # `what` names the site ("a struct field", ...).  Reported once per source
 # position (the grammar can re-run an action while backtracking); the
-# parse-time error count (g_attr_errors) fails the compile.
+# parse-time error count (ctx.attr_errors) fails the compile.
 # Returns 1 when it rejected `ty`.
 pub fn nd_array_reject(p: *Parser, tr: *TypeRef, line: i32, col: i32, what: *u8) -> i32
     if is_nd_array_type(p, tr) == 0
         return 0
-    return nd_array_report(line, col, what)
+    return nd_array_report(p.ctx, line, col, what)
 
 # The diagnostic itself, for sites that already know the type is N-D.
-fn nd_array_report(line: i32, col: i32, what: *u8) -> i32
-    if line == g_nd_reject_line and col == g_nd_reject_col
+fn nd_array_report(ctx: *ParseCtx, line: i32, col: i32, what: *u8) -> i32
+    if line == ctx.nd_reject_line and col == ctx.nd_reject_col
         return 1
-    g_nd_reject_line = line
-    g_nd_reject_col = col
-    g_attr_errors = g_attr_errors + 1
-    diag_error_at(g_parse_file, diag_span(line, col))
+    ctx.nd_reject_line = line
+    ctx.nd_reject_col = col
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error_at(ctx.parse_file, diag_span(line, col))
     eprints_cstr(c"a multi-dimensional array type is not supported as ")
     eprints_cstr(what)
     eprintln_cstr(c" in ritz1 (only a local or global `var` or a struct field can be one)")
@@ -4270,29 +4238,28 @@ pub fn array_lit_length_report(file: *u8, e: *Expr, shape: *ArrayShape, at: i32)
 
 # The last place a const or global literal was reported: the grammar can re-run
 # an action while backtracking.
-var g_lit_len_line: i32 = -1
-var g_lit_len_col: i32 = -1
+# State: ParseCtx.lit_len_line, .lit_len_col
 
 # `e` and every literal nested in it, row by row, against `shape` from `at`: a
 # const's or a global's initialiser.  Each is a parse error.
-fn array_lit_length_walk(e: *Expr, shape: *ArrayShape, at: i32)
+fn array_lit_length_walk(ctx: *ParseCtx, e: *Expr, shape: *ArrayShape, at: i32)
     if e == null or at >= shape.rank
         return
     if array_lit_wrong_length(e, shape, at) == 1
-        if e.span.line == g_lit_len_line and e.span.col == g_lit_len_col
+        if e.span.line == ctx.lit_len_line and e.span.col == ctx.lit_len_col
             return
-        g_lit_len_line = e.span.line
-        g_lit_len_col = e.span.col
-        g_attr_errors = g_attr_errors + 1
-        array_lit_length_report(g_parse_file, e, shape, at)
+        ctx.lit_len_line = e.span.line
+        ctx.lit_len_col = e.span.col
+        ctx.attr_errors = ctx.attr_errors + 1
+        array_lit_length_report(ctx.parse_file, e, shape, at)
         return
     match e.kind
         ExprKind.ArrayFill =>
-            array_lit_length_walk(e.left, shape, at + 1)
+            array_lit_length_walk(ctx, e.left, shape, at + 1)
         ExprKind.ArrayLit =>
             var el: *Expr = e.args
             while el != null
-                array_lit_length_walk(el, shape, at + 1)
+                array_lit_length_walk(ctx, el, shape, at + 1)
                 el = el.next
         _ => pass
 
@@ -4303,7 +4270,7 @@ pub fn array_lit_length_decl(p: *Parser, tr: *TypeRef, init: *Expr)
         return
     let facts: *TypeFacts = type_facts(p, tr)
     if facts.array_shape != null
-        array_lit_length_walk(init, facts.array_shape, 0)
+        array_lit_length_walk(p.ctx, init, facts.array_shape, 0)
         return
     var one: ArrayShape
     one.rank = 1
@@ -4312,17 +4279,17 @@ pub fn array_lit_length_decl(p: *Parser, tr: *TypeRef, init: *Expr)
     one.leaf_name = facts.array_elem_type_name
     one.leaf_name_len = facts.array_elem_type_name_len
     one.leaf_pointee = facts.array_elem_pointee
-    array_lit_length_walk(init, @one, 0)
+    array_lit_length_walk(p.ctx, init, @one, 0)
 
 # AGAST #2298: the furthest `dyn` reported in this file, null for none.  The
 # grammar re-runs dyn_kw's action each time it backtracks over a `dyn`, and a
 # backtrack only ever returns to an earlier token of the same source, so a
 # `dyn` at or before this one has been reported already.
-var g_dyn_last: *u8 = null
+# State: ParseCtx.dyn_last
 
 # Grammar action for dyn_kw (AGAST #2298): fail the alternative (p.error)
 # unless the IDENT is `dyn`; otherwise refuse it where it is written, once,
-# and count it in g_attr_errors, which fails the compile.  ritz1 has no trait
+# and count it in ctx.attr_errors, which fails the compile.  ritz1 has no trait
 # objects; whether the language does is AGAST #1620's decision.
 pub fn dyn_kw_refuse(p: *Parser, name_sv: StrView, line: i32, col: i32) -> i32
     var name: *u8 = name_sv.ptr
@@ -4330,16 +4297,16 @@ pub fn dyn_kw_refuse(p: *Parser, name_sv: StrView, line: i32, col: i32) -> i32
     if not (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"dyn"), len: (3) as i64 })
         p.error = 1
         return 0
-    if g_dyn_last != null and name <= g_dyn_last
+    if p.ctx.dyn_last != null and name <= p.ctx.dyn_last
         return 0
-    g_dyn_last = name
-    g_attr_errors = g_attr_errors + 1
-    diag_error(g_parse_file, diag_span(line, col), c"`dyn Trait` is not supported (AGAST #1620)")
+    p.ctx.dyn_last = name
+    p.ctx.attr_errors = p.ctx.attr_errors + 1
+    diag_error(p.ctx.parse_file, diag_span(line, col), c"`dyn Trait` is not supported (AGAST #1620)")
     return 0
 
 # AGAST #3471: the furthest closure reported in this file, null for none.
-# As with g_dyn_last, a backtrack re-runs the action over the same `|` / `fn`.
-var g_closure_last: *u8 = null
+# As with ctx.dyn_last, a backtrack re-runs the action over the same `|` / `fn`.
+# State: ParseCtx.closure_last
 
 # Grammar action for closure_ahead (AGAST #3471): a `|` that follows a type
 # is a union (`-> A | B`), not a closure; fail without reading a token.
@@ -4350,12 +4317,12 @@ pub fn closure_ahead_check(p: *Parser) -> i32
 
 # Grammar action for a closure or lambda expression (LARB R56, AGAST #3471):
 # refuse it at its `|` / `||` / `fn`, once, in ritz0's words, and count it in
-# g_attr_errors, which fails the compile.  The value is a placeholder `null`.
+# ctx.attr_errors, which fails the compile.  The value is a placeholder `null`.
 pub fn closure_refused(p: *Parser, at: *u8, line: i32, col: i32) -> *Expr
-    if p.skip_item == 0 and (g_closure_last == null or at > g_closure_last)
-        g_closure_last = at
-        g_attr_errors = g_attr_errors + 1
-        diag_error(g_parse_file, diag_span(line, col), c"closures aren't supported: write a named fn and pass it by name (§5.5)")
+    if p.skip_item == 0 and (p.ctx.closure_last == null or at > p.ctx.closure_last)
+        p.ctx.closure_last = at
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
+        diag_error(p.ctx.parse_file, diag_span(line, col), c"closures aren't supported: write a named fn and pass it by name (§5.5)")
     expr_nil(p, line, col)
 
 # Grammar action for `[pub] async fn` (AGAST #1456): mark `f` async.
@@ -4433,64 +4400,61 @@ pub fn type_array(p: *Parser, size_str_sv: StrView, elem: *TypeRef) -> *TypeRef
 # folded value: nothing downstream knows a length was ever pending.  What
 # still doesn't fold on the second pass is a located error, never a silently
 # wrong length.
-var g_array_len_pending: i32 = 0
-var g_array_len_reparse: i32 = 0
-var g_array_len_seed: *ConstEntry = null
+# State: ParseCtx.array_len_pending, .array_len_reparse, .array_len_seed
 
 # 1 when the first pass left a length to the second.
-pub fn array_len_pending() -> i32
-    g_array_len_pending
+pub fn array_len_pending(ctx: *ParseCtx) -> i32
+    ctx.array_len_pending
 
 # Before the second pass: fold a length the file's own consts can't against
 # `consts` (the first pass's merged list), and report what still doesn't.
-pub fn array_len_seed(consts: *ConstEntry)
-    g_array_len_seed = consts
-    g_array_len_reparse = 1
-    g_array_len_pending = 0
+pub fn array_len_seed(ctx: *ParseCtx, consts: *ConstEntry)
+    ctx.array_len_seed = consts
+    ctx.array_len_reparse = 1
+    ctx.array_len_pending = 0
 
 pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem: *TypeRef) -> *TypeRef
     var v: i64 = 0
     var folded: i32 = const_fold_int(p.module.constants, len_expr, 0, @v)
-    if folded == 0 and g_array_len_seed != null
-        folded = const_fold_int(g_array_len_seed, len_expr, 1, @v)
+    if folded == 0 and p.ctx.array_len_seed != null
+        folded = const_fold_int(p.ctx.array_len_seed, len_expr, 1, @v)
     if folded == 0
-        if g_array_len_reparse == 0
-            g_array_len_pending = 1
+        if p.ctx.array_len_reparse == 0
+            p.ctx.array_len_pending = 1
         else if array_len_overflow(p, len_expr) == 0
-            array_len_report(line, col, c"is not a constant integer expression")
+            array_len_report(p.ctx, line, col, c"is not a constant integer expression")
         v = 0
     else if v < 0 or v > 2147483647
-        array_len_report(line, col, c"is out of range (it must be 0 to 2147483647)")
+        array_len_report(p.ctx, line, col, c"is out of range (it must be 0 to 2147483647)")
         v = 0
     type_array_sized(p, v as i32, elem)
 
 # The backtracking parser re-runs an action each time it retries the
 # alternative: report each `[` once, as nd_array_report does.
-var g_array_len_line: i32 = -1
-var g_array_len_col: i32 = -1
+# State: ParseCtx.array_len_line, .array_len_col
 
 # LARB R63 (AGAST #3489): a length that overflows, `[9223372036854775807 + 1]u8`,
 # says so at the operation, as ritz0's const evaluator does.  1 if reported.
 fn array_len_overflow(p: *Parser, len_expr: *Expr) -> i32
     var site: *Expr = const_overflow_site(p.module.constants, len_expr, 0)
-    if site == null and g_array_len_seed != null
-        site = const_overflow_site(g_array_len_seed, len_expr, 1)
+    if site == null and p.ctx.array_len_seed != null
+        site = const_overflow_site(p.ctx.array_len_seed, len_expr, 1)
     if site == null
         return 0
-    if site.span.line != g_array_len_line or site.span.col != g_array_len_col
-        g_array_len_line = site.span.line
-        g_array_len_col = site.span.col
-        g_attr_errors = g_attr_errors + 1
-        const_overflow_report(g_parse_file, site)
+    if site.span.line != p.ctx.array_len_line or site.span.col != p.ctx.array_len_col
+        p.ctx.array_len_line = site.span.line
+        p.ctx.array_len_col = site.span.col
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
+        const_overflow_report(p.ctx.parse_file, site)
     1
 
-fn array_len_report(line: i32, col: i32, why: *u8)
-    if line == g_array_len_line and col == g_array_len_col
+fn array_len_report(ctx: *ParseCtx, line: i32, col: i32, why: *u8)
+    if line == ctx.array_len_line and col == ctx.array_len_col
         return
-    g_array_len_line = line
-    g_array_len_col = col
-    g_attr_errors = g_attr_errors + 1
-    diag_error_at(g_parse_file, diag_span(line, col))
+    ctx.array_len_line = line
+    ctx.array_len_col = col
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error_at(ctx.parse_file, diag_span(line, col))
     eprints_cstr(c"array length ")
     eprintln_cstr(why)
 
@@ -4551,8 +4515,8 @@ fn array_shape_prepend_type(p: *Parser, size: i32, elem: *TypeRef) -> *ArrayShap
         sh.leaf_pointee = tr_elem_pointee(elem)
         return sh
     if inner.rank >= MAX_ARRAY_RANK
-        diag_error(g_parse_file, parse_span_at(p, p.pos), c"array type has more than 8 dimensions")
-        g_attr_errors = g_attr_errors + 1
+        diag_error(p.ctx.parse_file, parse_span_at(p, p.pos), c"array type has more than 8 dimensions")
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
         return null
     sh.rank = inner.rank + 1
     var d: i32 = 0
@@ -4704,88 +4668,80 @@ struct AliasEntry
 
 const MAX_TYPE_ALIASES: i32 = 1024
 
-var g_alias_table: **u8 = null
-var g_alias_count: i32 = 0
+# State: ParseCtx.alias_table, .alias_count
 
-pub fn type_alias_count() -> i32
-    g_alias_count
+pub fn type_alias_count(ctx: *ParseCtx) -> i32
+    ctx.alias_count
 
 # AGAST #3907: every enum and type alias declared, in parse order, across
 # every file and both parse passes; never reset.  The tables above record no
 # file, so import_vis marks the log before a file is parsed and reads what
 # the file added after (type_decl_log_count / type_decl_log_at).
-var g_tdl_names: **u8 = null
-var g_tdl_lens: *i32 = null
-var g_tdl_count: i32 = 0
-var g_tdl_cap: i32 = 0
+# State: ParseCtx.tdl_names, .tdl_lens, .tdl_count, .tdl_cap
 
-fn type_decl_log(name_sv: StrView)
+fn type_decl_log(ctx: *ParseCtx, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if g_tdl_count >= g_tdl_cap
-        var cap: i32 = g_tdl_cap * 2
+    if ctx.tdl_count >= ctx.tdl_cap
+        var cap: i32 = ctx.tdl_cap * 2
         if cap == 0
             cap = 256
-        g_tdl_names = realloc(g_tdl_names as *u8, (cap as i64) * 8) as **u8
-        g_tdl_lens = realloc(g_tdl_lens as *u8, (cap as i64) * 4) as *i32
-        g_tdl_cap = cap
-    *(g_tdl_names + g_tdl_count) = name
-    *(g_tdl_lens + g_tdl_count) = len
-    g_tdl_count = g_tdl_count + 1
+        ctx.tdl_names = realloc(ctx.tdl_names as *u8, (cap as i64) * 8) as **u8
+        ctx.tdl_lens = realloc(ctx.tdl_lens as *u8, (cap as i64) * 4) as *i32
+        ctx.tdl_cap = cap
+    *(ctx.tdl_names + ctx.tdl_count) = name
+    *(ctx.tdl_lens + ctx.tdl_count) = len
+    ctx.tdl_count = ctx.tdl_count + 1
 
-pub fn type_decl_log_count() -> i32
-    g_tdl_count
+pub fn type_decl_log_count(ctx: *ParseCtx) -> i32
+    ctx.tdl_count
 
-pub fn type_decl_log_at(i: i32, out_len: *i32) -> *u8
-    *out_len = *(g_tdl_lens + i)
-    *(g_tdl_names + i)
+pub fn type_decl_log_at(ctx: *ParseCtx, i: i32, out_len: *i32) -> *u8
+    *out_len = *(ctx.tdl_lens + i)
+    *(ctx.tdl_names + i)
 
 # AGAST #3907: each type alias written, in parse order: type_named replaces
 # it with its target, so sema never sees the name.  `name` points into the
 # file's tokens, so a use the parser backtracks over and parses again is
 # logged once.  Never reset; parse_program marks the input file's range.
-var g_aul_names: **u8 = null
-var g_aul_lens: *i32 = null
-var g_aul_spans: *SrcSpan = null
-var g_aul_count: i32 = 0
-var g_aul_cap: i32 = 0
+# State: ParseCtx.aul_names, .aul_lens, .aul_spans, .aul_count, .aul_cap
 
 fn alias_use_log(p: *Parser, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    var i: i32 = g_aul_count - 1
-    while i >= 0 and i >= g_aul_count - 64
-        if *(g_aul_names + i) == name
+    var i: i32 = p.ctx.aul_count - 1
+    while i >= 0 and i >= p.ctx.aul_count - 64
+        if *(p.ctx.aul_names + i) == name
             return
         i = i - 1
-    if g_aul_count >= g_aul_cap
-        var cap: i32 = g_aul_cap * 2
+    if p.ctx.aul_count >= p.ctx.aul_cap
+        var cap: i32 = p.ctx.aul_cap * 2
         if cap == 0
             cap = 256
-        g_aul_names = realloc(g_aul_names as *u8, (cap as i64) * 8) as **u8
-        g_aul_lens = realloc(g_aul_lens as *u8, (cap as i64) * 4) as *i32
-        g_aul_spans = realloc(g_aul_spans as *u8, (cap as i64) * sizeof(SrcSpan)) as *SrcSpan
-        g_aul_cap = cap
-    *(g_aul_names + g_aul_count) = name
-    *(g_aul_lens + g_aul_count) = len
+        p.ctx.aul_names = realloc(p.ctx.aul_names as *u8, (cap as i64) * 8) as **u8
+        p.ctx.aul_lens = realloc(p.ctx.aul_lens as *u8, (cap as i64) * 4) as *i32
+        p.ctx.aul_spans = realloc(p.ctx.aul_spans as *u8, (cap as i64) * sizeof(SrcSpan)) as *SrcSpan
+        p.ctx.aul_cap = cap
+    *(p.ctx.aul_names + p.ctx.aul_count) = name
+    *(p.ctx.aul_lens + p.ctx.aul_count) = len
     # The alias's IDENT is the token just taken.
-    *(g_aul_spans + g_aul_count) = parse_span_at(p, p.pos - 1)
-    g_aul_count = g_aul_count + 1
+    *(p.ctx.aul_spans + p.ctx.aul_count) = parse_span_at(p, p.pos - 1)
+    p.ctx.aul_count = p.ctx.aul_count + 1
 
-pub fn alias_use_count() -> i32
-    g_aul_count
+pub fn alias_use_count(ctx: *ParseCtx) -> i32
+    ctx.aul_count
 
-pub fn alias_use_at(i: i32, out_len: *i32, out_span: *SrcSpan) -> *u8
-    *out_len = *(g_aul_lens + i)
-    *out_span = *(g_aul_spans + i)
-    *(g_aul_names + i)
+pub fn alias_use_at(ctx: *ParseCtx, i: i32, out_len: *i32, out_span: *SrcSpan) -> *u8
+    *out_len = *(ctx.aul_lens + i)
+    *out_span = *(ctx.aul_spans + i)
+    *(ctx.aul_names + i)
 
-fn type_alias_find(name_sv: StrView) -> *AliasEntry
+fn type_alias_find(ctx: *ParseCtx, name_sv: StrView) -> *AliasEntry
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var i: i32 = 0
-    while i < g_alias_count
-        let e: *AliasEntry = *(g_alias_table + i) as *AliasEntry
+    while i < ctx.alias_count
+        let e: *AliasEntry = *(ctx.alias_table + i) as *AliasEntry
         if (StrView { ptr: (e.name), len: (e.name_len) as i64 }).eq(StrView { ptr: (name), len: (len) as i64 })
             return e
         i = i + 1
@@ -4793,10 +4749,10 @@ fn type_alias_find(name_sv: StrView) -> *AliasEntry
 
 # AGAST #3264: 1 if a `type` alias of that name was declared (an impl on it
 # is on a known type).
-pub fn type_alias_declared(name_sv: StrView) -> i32
+pub fn type_alias_declared(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    if type_alias_find(StrView { ptr: (name), len: (len) as i64 }) != null
+    if type_alias_find(ctx, StrView { ptr: (name), len: (len) as i64 }) != null
         return 1
     0
 
@@ -4804,10 +4760,10 @@ pub fn type_alias_declared(name_sv: StrView) -> i32
 # Foo`" (LARB R35), with its length in *out_len; null if it wasn't recorded.
 # The alias's own tokens (#3625), since the table keeps a pointer, array or
 # generic instance (`Box$u8`) only in replay form.
-pub fn type_alias_target_spelling(name_sv: StrView, out_len: *i32) -> *u8
+pub fn type_alias_target_spelling(ctx: *ParseCtx, name_sv: StrView, out_len: *i32) -> *u8
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let e: *AliasEntry = type_alias_find(StrView { ptr: (name), len: (len) as i64 })
+    let e: *AliasEntry = type_alias_find(ctx, StrView { ptr: (name), len: (len) as i64 })
     if e == null
         return null
     *out_len = e.spelling_len
@@ -4888,26 +4844,26 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if p.skip_item != 0
-        gated_decl_log(StrView { ptr: (name), len: (len) as i64 })   # AGAST #3467
+        gated_decl_log(p.ctx, StrView { ptr: (name), len: (len) as i64 })   # AGAST #3467
         return tr
     # AGAST #4021: the target, before NEWLINE, judged even if the alias is
     # never used (a use replays it, and is judged as the target).
     tn_note_last(p, 2)
     tn_claim(p, null, null)
-    var e: *AliasEntry = type_alias_find(StrView { ptr: (name), len: (len) as i64 })
+    var e: *AliasEntry = type_alias_find(p.ctx, StrView { ptr: (name), len: (len) as i64 })
     if e == null
-        if g_alias_table == null
-            g_alias_table = malloc((MAX_TYPE_ALIASES as i64) * 8) as **u8
-        if g_alias_count >= MAX_TYPE_ALIASES
+        if p.ctx.alias_table == null
+            p.ctx.alias_table = malloc((MAX_TYPE_ALIASES as i64) * 8) as **u8
+        if p.ctx.alias_count >= MAX_TYPE_ALIASES
             # Never drop a declaration silently: an unrecorded alias would
             # surface much later as an unknown struct type.
-            diag_error(g_parse_file, parse_span_at(p, p.pos), c"too many type aliases (raise MAX_TYPE_ALIASES)")
+            diag_error(p.ctx.parse_file, parse_span_at(p, p.pos), c"too many type aliases (raise MAX_TYPE_ALIASES)")
             p.error = 1
             return tr
         e = malloc(sizeof(AliasEntry)) as *AliasEntry
-        *(g_alias_table + g_alias_count) = e as *u8
-        g_alias_count = g_alias_count + 1
-    type_decl_log(StrView { ptr: (name), len: (len) as i64 })   # AGAST #3907: a redeclaration too
+        *(p.ctx.alias_table + p.ctx.alias_count) = e as *u8
+        p.ctx.alias_count = p.ctx.alias_count + 1
+    type_decl_log(p.ctx, StrView { ptr: (name), len: (len) as i64 })   # AGAST #3907: a redeclaration too
     # The alias table is process-wide (it must outlive this Parser's arena), so
     # it keeps the flat snapshot, and type_alias_resolve rebuilds a *TypeRef
     # from it.  Nothing is latched on the Parser any more (#4035).
@@ -4930,8 +4886,8 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     e.inner_ref = f.inner_ref   # AGAST #2399
     # AGAST #1879: a fn-type alias keeps its signature.
     e.fn_sig = f.fn_sig
-    if e.fn_sig != null and (g_attr_bits & ATTR_WIN64) != 0
-        item_attr_record(e.fn_sig as *u8, ATTR_WIN64)
+    if e.fn_sig != null and (p.ctx.attr_bits & ATTR_WIN64) != 0
+        item_attr_record(p.ctx, e.fn_sig as *u8, ATTR_WIN64)
     var slen: i32 = 0
     e.spelling = type_alias_spell(p, name, @slen)
     e.spelling_len = slen
@@ -5086,7 +5042,7 @@ fn alias_pointer_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
 pub fn type_alias_resolve(p: *Parser, name_sv: StrView) -> *TypeRef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let e: *AliasEntry = type_alias_find(StrView { ptr: (name), len: (len) as i64 })
+    let e: *AliasEntry = type_alias_find(p.ctx, StrView { ptr: (name), len: (len) as i64 })
     if e == null
         return null
     var t: *TypeRef = null
@@ -5112,10 +5068,10 @@ pub fn type_alias_resolve(p: *Parser, name_sv: StrView) -> *TypeRef
 # kind `*leaf` (struct `*leaf_name` for TypeKind.Struct).  0 when `name` is no
 # alias.  The emitter sizes the leaf; an alias of a pointer is one pointer.
 # #4035: reads the alias table's flat snapshot, which outlives the Parser.
-pub fn type_alias_sizeof_shape(name_sv: StrView, count: *i64, leaf: *TypeKind, leaf_name: **u8, leaf_len: *i32) -> i32
+pub fn type_alias_sizeof_shape(ctx: *ParseCtx, name_sv: StrView, count: *i64, leaf: *TypeKind, leaf_name: **u8, leaf_len: *i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let e: *AliasEntry = type_alias_find(StrView { ptr: (name), len: (len) as i64 })
+    let e: *AliasEntry = type_alias_find(ctx, StrView { ptr: (name), len: (len) as i64 })
     if e == null
         return 0
     *count = 1
@@ -5145,9 +5101,9 @@ pub fn type_alias_sizeof_shape(name_sv: StrView, count: *i64, leaf: *TypeKind, l
 # has no AST node (it lives in the alias table), so only reset skip_item.
 pub fn item_dispatch_alias(p: *Parser) -> i32
     p.skip_item = 0
-    g_attr_bits = 0
-    g_attr_target_os = 0
-    g_attr_target_arch = 0
+    p.ctx.attr_bits = 0
+    p.ctx.attr_target_os = 0
+    p.ctx.attr_target_arch = 0
     return 1
 
 # Handle immutable reference type @T
@@ -5547,8 +5503,8 @@ fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token, out_len: *i32)
     # is `vec_new$u64`, returning the `Vec$u64` a `Vec<usize>` local is.
     if is_word_type_name(StrView { ptr: (tok.start), len: (tok.len) as i64 }) == 1
         spell_len = primitive_arg_spelling(word_type(tok.start), @spell)
-    else if g_alias_count > 0
-        let e: *AliasEntry = type_alias_find(StrView { ptr: (tok.start), len: (tok.len) as i64 })
+    else if p.ctx.alias_count > 0
+        let e: *AliasEntry = type_alias_find(p.ctx, StrView { ptr: (tok.start), len: (tok.len) as i64 })
         if e != null
             var n: i32 = 0
             match e.kind
@@ -5639,7 +5595,7 @@ pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericAr
     var len: i32 = 0
     let mangled: *u8 = mangle_generic_args(p, StrView { ptr: (base_name), len: (base_len) as i64 }, ga, @len)
     if p.skip_item == 0
-        generic_use_note_mangled(StrView { ptr: (mangled), len: (len) as i64 }, ga, diag_span(0, 0), parse_file_copy_shared(p))
+        generic_use_note_mangled(p.ctx, StrView { ptr: (mangled), len: (len) as i64 }, ga, diag_span(0, 0), parse_file_copy_shared(p))
     let t: *TypeRef = typeref_new(p, TypeKind.Struct)
     t.name = mangled
     t.name_len = len
@@ -5657,19 +5613,11 @@ pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericAr
 # inferred call, after them.  trait_bound.ritz asks only once a bound has
 # failed, so a list is enough; it is newest first, so the first use is the
 # last match.
-struct GenericUse
-    name: *u8          # `Holder`, `total`
-    name_len: i32
-    suffix: *u8        # `$Nope`
-    suffix_len: i32
-    args: *GenericArg  # as written, each with its `at`; null when inferred
-    at: SrcSpan        # an inferred call: the call; line 0 otherwise
-    file: *u8          # null: the main file
-    next: *GenericUse
+# struct GenericUse: ast.ritz, beside ParseCtx (AGAST #4623).
 
-var g_generic_uses: *GenericUse = null
+# State: ParseCtx.generic_uses
 
-pub fn generic_use_note(name_sv: StrView, suffix_sv: StrView, args: *GenericArg, at: SrcSpan, file: *u8)
+pub fn generic_use_note(ctx: *ParseCtx, name_sv: StrView, suffix_sv: StrView, args: *GenericArg, at: SrcSpan, file: *u8)
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     var suffix: *u8 = suffix_sv.ptr
@@ -5684,32 +5632,32 @@ pub fn generic_use_note(name_sv: StrView, suffix_sv: StrView, args: *GenericArg,
     u.args = args
     u.at = at
     u.file = file
-    u.next = g_generic_uses
-    g_generic_uses = u
+    u.next = ctx.generic_uses
+    ctx.generic_uses = u
 
 # A generic type's mangled name `Holder$Nope` is the instance `Holder` with
 # suffix `$Nope`, as monomorph tracks it.
-fn generic_use_note_mangled(mangled_sv: StrView, args: *GenericArg, at: SrcSpan, file: *u8)
+fn generic_use_note_mangled(ctx: *ParseCtx, mangled_sv: StrView, args: *GenericArg, at: SrcSpan, file: *u8)
     var mangled: *u8 = mangled_sv.ptr
     var len: i32 = mangled_sv.len as i32
     var k: i32 = 0
     while k < len and *(mangled + k) != '$'   # '$'
         k = k + 1
     if k > 0 and k < len
-        generic_use_note(StrView { ptr: (mangled), len: (k) as i64 }, StrView { ptr: (mangled + k), len: (len - k) as i64 }, args, at, file)
+        generic_use_note(ctx, StrView { ptr: (mangled), len: (k) as i64 }, StrView { ptr: (mangled + k), len: (len - k) as i64 }, args, at, file)
 
 # Every noted use, newest first (trait_bound.ritz's own searches).
-pub fn generic_use_list() -> *GenericUse
-    g_generic_uses
+pub fn generic_use_list(ctx: *ParseCtx) -> *GenericUse
+    ctx.generic_uses
 
 # The first noted use of the instance (name, suffix), or null.
-pub fn generic_use_first(name_sv: StrView, suffix_sv: StrView) -> *GenericUse
+pub fn generic_use_first(ctx: *ParseCtx, name_sv: StrView, suffix_sv: StrView) -> *GenericUse
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     var suffix: *u8 = suffix_sv.ptr
     var suffix_len: i32 = suffix_sv.len as i32
     var found: *GenericUse = null
-    var u: *GenericUse = g_generic_uses
+    var u: *GenericUse = ctx.generic_uses
     while u != null
         if u.name_len == name_len and u.suffix_len == suffix_len
             if memcmp(u.name, name, name_len as i64) == 0 and memcmp(u.suffix, suffix, suffix_len as i64) == 0
@@ -5748,22 +5696,14 @@ pub fn type_slice(p: *Parser, elem: *GenericArg) -> *TypeRef
 # tuple_split_decl binds each name to its element (AGAST #2974).  One left
 # nameless is a located error.
 
-struct TupleElem
-    ga: *GenericArg       # the element's mangled spelling
-    field: *StructField   # the element as a field of the synthesized struct
-    next: *TupleElem
+# struct TupleElem: ast.ritz, beside ParseCtx (AGAST #4623).
 
-struct TupleReg
-    def: *StructDef
-    fresh: i32       # 1 until the module that registered it ends
-    next: *TupleReg
-    elems: *TupleElem   # AGAST #2975: each element's spelling, for tuple_subst
-    placed: i32         # 1 once def is in a module's struct list
+# struct TupleReg: ast.ritz, beside ParseCtx (AGAST #4623).
 
-var g_tuple_regs: *TupleReg = null
+# State: ParseCtx.tuple_regs
 
 # 1 once the current module's parse built a tuple literal (tuple_lit).
-var g_tuple_lits: i32 = 0
+# State: ParseCtx.tuple_lits
 
 # Called from grammar rule tuple_type_elem with the element's parsed
 # *TypeRef (AGAST #4035: the type is the chain, not parser side state).
@@ -5782,8 +5722,8 @@ pub fn tuple_elem_link(first: *TupleElem, rest: *TupleElem) -> *TupleElem
 # (AGAST #1475) builds every module afresh; a registry kept from the first
 # pass would make type_tuple skip declaring a spelling in the new module, so
 # `type Mixed = (i32, i32)` named a struct no module declared.
-pub fn tuple_regs_reset()
-    g_tuple_regs = null
+pub fn tuple_regs_reset(ctx: *ParseCtx)
+    ctx.tuple_regs = null
 
 # The decimal spelling of element index i ("0", "1", ...), arena-allocated.
 # sign + 10 digits of an i32 + NUL (AGAST #1820: no magic alloc sizes).
@@ -5797,32 +5737,32 @@ fn tuple_index_name(p: *Parser, i: i32, out_len: *i32) -> *u8
     return buf
 
 # The registered tuple spelled (name, len), or null.
-pub fn tuple_reg_lookup(name_sv: StrView) -> *TupleReg
+pub fn tuple_reg_lookup(ctx: *ParseCtx, name_sv: StrView) -> *TupleReg
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    var r: *TupleReg = g_tuple_regs
+    var r: *TupleReg = ctx.tuple_regs
     while r != null
         if r.def.name_len == len and memcmp(r.def.name, name, len as i64) == 0
             return r
         r = r.next
     return null
 
-fn tuple_reg_find(name_sv: StrView) -> *StructDef
+fn tuple_reg_find(ctx: *ParseCtx, name_sv: StrView) -> *StructDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let r: *TupleReg = tuple_reg_lookup(StrView { ptr: (name), len: (len) as i64 })
+    let r: *TupleReg = tuple_reg_lookup(ctx, StrView { ptr: (name), len: (len) as i64 })
     if r == null
         return null
     return r.def
 
 # AGAST #2975: register a tuple monomorphization made (`tuple_i32_i32` from
 # `tuple_T_T`), not yet in any module (tuple_reg_place puts it in one).
-pub fn tuple_reg_add(def: *StructDef, elems: *TupleElem) -> *TupleReg
+pub fn tuple_reg_add(ctx: *ParseCtx, def: *StructDef, elems: *TupleElem) -> *TupleReg
     let r: *TupleReg = calloc(1, sizeof(TupleReg)) as *TupleReg
     r.def = def
     r.elems = elems
-    r.next = g_tuple_regs
-    g_tuple_regs = r
+    r.next = ctx.tuple_regs
+    ctx.tuple_regs = r
     return r
 
 # Add r's struct to m, once, when it is concrete: one still over a
@@ -5856,7 +5796,7 @@ pub fn type_tuple(p: *Parser, elems: *TupleElem) -> *TypeRef
             pos = pos + 1
         cur = cur.next
     *(name + pos) = 0
-    if tuple_reg_find(StrView { ptr: (name), len: (pos) as i64 }) == null
+    if tuple_reg_find(p.ctx, StrView { ptr: (name), len: (pos) as i64 }) == null
         var fields: *StructField = null
         var last: *StructField = null
         var i: i32 = 0
@@ -5881,8 +5821,8 @@ pub fn type_tuple(p: *Parser, elems: *TupleElem) -> *TypeRef
         r.fresh = 1
         r.elems = elems
         r.placed = 1
-        r.next = g_tuple_regs
-        g_tuple_regs = r
+        r.next = p.ctx.tuple_regs
+        p.ctx.tuple_regs = r
     let t: *TypeRef = typeref_new(p, TypeKind.Struct)
     t.name = name
     t.name_len = pos
@@ -5917,34 +5857,34 @@ pub fn tuple_lit(p: *Parser, first: *Expr, rest: *Expr, line: i32, col: i32) -> 
     e.ident_len = 0
     e.args = inits as *Expr   # a struct literal's FieldInit list, recast
     e.next = null
-    g_tuple_lits = 1
+    p.ctx.tuple_lits = 1
     return e
 
 # The synthesized tuple struct a slot of struct type `name` names, or null.
-fn tuple_slot(ty: TypeKind, name_sv: StrView) -> *StructDef
+fn tuple_slot(ctx: *ParseCtx, ty: TypeKind, name_sv: StrView) -> *StructDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if ty != TypeKind.Struct or name == null
         return null
-    return tuple_reg_find(StrView { ptr: (name), len: (len) as i64 })
+    return tuple_reg_find(ctx, StrView { ptr: (name), len: (len) as i64 })
 
 # The return-type slot of the fn being walked (null when not a tuple).
-var g_tuple_ret_slot: *StructDef = null
+# State: ParseCtx.tuple_ret_slot
 
-fn tuple_resolve_arms(arm: *MatchArm, slot: *StructDef)
+fn tuple_resolve_arms(ctx: *ParseCtx, arm: *MatchArm, slot: *StructDef)
     while arm != null
-        tuple_resolve_stmts(arm.body_stmts, null)
-        tuple_resolve_expr(arm.body, slot)
+        tuple_resolve_stmts(ctx, arm.body_stmts, null)
+        tuple_resolve_expr(ctx, arm.body, slot)
         arm = arm.next
 
 # Name the tuple literal `e` (if it is one) from `slot`, and its nested
 # literals from slot's element types.  An if/match expression passes its
 # slot to each arm's value.
-fn tuple_resolve_expr(e: *Expr, slot: *StructDef)
+fn tuple_resolve_expr(ctx: *ParseCtx, e: *Expr, slot: *StructDef)
     if e == null
         return
     if e.kind == ExprKind.If or e.kind == ExprKind.Match
-        tuple_resolve_arms(e.args as *MatchArm, slot)
+        tuple_resolve_arms(ctx, e.args as *MatchArm, slot)
         return
     if e.kind != ExprKind.StructLit or e.ident_len != 0 or slot == null
         return
@@ -5966,7 +5906,7 @@ fn tuple_resolve_expr(e: *Expr, slot: *StructDef)
     fi = e.args as *FieldInit
     f = slot.fields
     while fi != null
-        tuple_resolve_expr(fi.value, tuple_slot(f.field_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }))
+        tuple_resolve_expr(ctx, fi.value, tuple_slot(ctx, f.field_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }))
         fi = fi.next
         f = f.next
 
@@ -6000,8 +5940,7 @@ fn tuple_resolve_expr(e: *Expr, slot: *StructDef)
 # its tuple, a `Some(v) =>` or bare `v =>` arm) stays a StmtKind.TupleDecl: the
 # emitter names each arm's tuple as it emits it (tuple_lit_name, #3005).
 
-var g_tuple_p: *Parser = null      # tuple_resolve_module's, for the AST built here
-var g_tuple_split_n: i32 = 0       # numbers the arm-index locals, unique per compile
+# State: ParseCtx.tuple_p, .tuple_split_n
 
 # A nameless tuple literal of exactly `n` elements, one per name of the
 # destructure (AGAST #109: was two)?
@@ -6051,7 +5990,7 @@ fn tuple_split_leaves(e: *Expr, names: i32) -> i32
 
 # Replace each tuple literal of tree `e` by its index (0, 1, .. in arm
 # order), recording the literal at leaves[index].  Returns the new tree.
-fn tuple_split_index(e: *Expr, leaves: **Expr, next_idx: *i32, names: i32) -> *Expr
+fn tuple_split_index(ctx: *ParseCtx, e: *Expr, leaves: **Expr, next_idx: *i32, names: i32) -> *Expr
     if tuple_split_pair(e, names) == 1
         let i: i32 = *next_idx
         *(leaves + i) = e
@@ -6059,10 +5998,10 @@ fn tuple_split_index(e: *Expr, leaves: **Expr, next_idx: *i32, names: i32) -> *E
         # Consumed: its elements moved into the split `let`s.
         e.ident_ptr = c"(split)"
         e.ident_len = 7
-        return expr_int(g_tuple_p, i as i64, e.span.line, e.span.col)
+        return expr_int(ctx.tuple_p, i as i64, e.span.line, e.span.col)
     var arm: *MatchArm = e.args as *MatchArm
     while arm != null
-        arm.body = tuple_split_index(arm.body, leaves, next_idx, names)
+        arm.body = tuple_split_index(ctx, arm.body, leaves, next_idx, names)
         arm = arm.next
     e
 
@@ -6076,26 +6015,26 @@ fn tuple_split_elem(lit: *Expr, j: i32) -> *Expr
     fi.value
 
 # `if k == 0 L0.j else if k == 1 L1.j .. else Ln-1.j`
-fn tuple_split_pick(leaves: **Expr, n: i32, j: i32, k_sv: StrView, line: i32, col: i32) -> *Expr
+fn tuple_split_pick(ctx: *ParseCtx, leaves: **Expr, n: i32, j: i32, k_sv: StrView, line: i32, col: i32) -> *Expr
     var k: *u8 = k_sv.ptr
     var k_len: i32 = k_sv.len as i32
     var acc: *Expr = tuple_split_elem(*(leaves + (n - 1)), j)
     var i: i32 = n - 2
     while i >= 0
-        let lhs: *Expr = expr_ident(g_tuple_p, StrView { ptr: (k), len: (k_len) as i64 }, line, col)
-        let cond: *Expr = expr_binary(g_tuple_p, OpKind.Eq, lhs, expr_int(g_tuple_p, i as i64, line, col))
-        acc = expr_if_inline(g_tuple_p, cond, tuple_split_elem(*(leaves + i), j), acc, line, col)
+        let lhs: *Expr = expr_ident(ctx.tuple_p, StrView { ptr: (k), len: (k_len) as i64 }, line, col)
+        let cond: *Expr = expr_binary(ctx.tuple_p, OpKind.Eq, lhs, expr_int(ctx.tuple_p, i as i64, line, col))
+        acc = expr_if_inline(ctx.tuple_p, cond, tuple_split_elem(*(leaves + i), j), acc, line, col)
         i = i - 1
     acc
 
 # `let x = ..` for the destructure's name `which` (0, 1, then its tail).
-fn tuple_split_let(s: *Stmt, which: i32, init: *Expr) -> *Stmt
+fn tuple_split_let(ctx: *ParseCtx, s: *Stmt, which: i32, init: *Expr) -> *Stmt
     var d: *Stmt = null
     if which == 0
-        d = stmt_let_decl(g_tuple_p, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, 0, init, s.span.line, s.span.col)
+        d = stmt_let_decl(ctx.tuple_p, StrView { ptr: (s.var_name), len: (s.var_name_len) as i64 }, 0, init, s.span.line, s.span.col)
         d.name_span = s.name_span
     else if which == 1
-        d = stmt_let_decl(g_tuple_p, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }, 0, init, s.span.line, s.span.col)
+        d = stmt_let_decl(ctx.tuple_p, StrView { ptr: (s.assign_target), len: (s.assign_target_len) as i64 }, 0, init, s.span.line, s.span.col)
         d.name_span = s.name2_span
     else
         var t: *TupleName = s.tuple_more
@@ -6103,7 +6042,7 @@ fn tuple_split_let(s: *Stmt, which: i32, init: *Expr) -> *Stmt
         while i < which
             t = t.next
             i = i + 1
-        d = stmt_let_decl(g_tuple_p, StrView { ptr: (t.name), len: (t.len) as i64 }, 0, init, s.span.line, s.span.col)
+        d = stmt_let_decl(ctx.tuple_p, StrView { ptr: (t.name), len: (t.len) as i64 }, 0, init, s.span.line, s.span.col)
         d.name_span = t.span
     d
 
@@ -6112,7 +6051,7 @@ const TUPLE_SPLIT_NAME_BUF: i64 = 16
 
 # Rewrite StmtKind.TupleDecl `s` in place into the `let`s above, when its init
 # is a tuple literal or a splittable if / match of them.
-fn tuple_split_decl(s: *Stmt)
+fn tuple_split_decl(ctx: *ParseCtx, s: *Stmt)
     let init: *Expr = s.var_init
     let names: i32 = tuple_decl_arity(s)   # AGAST #109
     let n: i32 = tuple_split_leaves(init, names)
@@ -6126,7 +6065,7 @@ fn tuple_split_decl(s: *Stmt)
         init.ident_len = 7
         var j: i32 = 0
         while j < names
-            let d: *Stmt = tuple_split_let(s, j, tuple_split_elem(init, j))
+            let d: *Stmt = tuple_split_let(ctx, s, j, tuple_split_elem(init, j))
             if first == null
                 first = d
             else
@@ -6134,22 +6073,22 @@ fn tuple_split_decl(s: *Stmt)
             last = d
             j = j + 1
     else
-        let leaves: **Expr = parser_alloc(g_tuple_p, (n as i64) * 8) as **Expr
+        let leaves: **Expr = parser_alloc(ctx.tuple_p, (n as i64) * 8) as **Expr
         var idx: i32 = 0
-        let tree: *Expr = tuple_split_index(init, leaves, @idx, names)
+        let tree: *Expr = tuple_split_index(ctx, init, leaves, @idx, names)
         # "$tk<N>": no source name can collide with it.
-        let k: *u8 = parser_alloc(g_tuple_p, TUPLE_SPLIT_NAME_BUF)
+        let k: *u8 = parser_alloc(ctx.tuple_p, TUPLE_SPLIT_NAME_BUF)
         memcpy(k, c"$tk", 3)
-        let k_len: i32 = 3 + write_dec_i32(k + 3, g_tuple_split_n)
+        let k_len: i32 = 3 + write_dec_i32(k + 3, ctx.tuple_split_n)
         *(k + k_len) = 0
-        g_tuple_split_n = g_tuple_split_n + 1
-        first = stmt_let_decl(g_tuple_p, StrView { ptr: (k), len: (k_len) as i64 }, 0, tree, s.span.line, s.span.col)
+        ctx.tuple_split_n = ctx.tuple_split_n + 1
+        first = stmt_let_decl(ctx.tuple_p, StrView { ptr: (k), len: (k_len) as i64 }, 0, tree, s.span.line, s.span.col)
         last = first
         let line: i32 = s.span.line
         let col: i32 = s.span.col
         var j: i32 = 0
         while j < names
-            let d: *Stmt = tuple_split_let(s, j, tuple_split_pick(leaves, n, j, StrView { ptr: (k), len: (k_len) as i64 }, line, col))
+            let d: *Stmt = tuple_split_let(ctx, s, j, tuple_split_pick(ctx, leaves, n, j, StrView { ptr: (k), len: (k_len) as i64 }, line, col))
             last.next = d
             last = d
             j = j + 1
@@ -6159,7 +6098,7 @@ fn tuple_split_decl(s: *Stmt)
 
 # Walk a statement list for tuple-literal slots.  `tail` is the slot of the
 # list's last statement when it is the enclosing value (a fn body's tail).
-fn tuple_resolve_stmts(first: *Stmt, tail: *StructDef)
+fn tuple_resolve_stmts(ctx: *ParseCtx, first: *Stmt, tail: *StructDef)
     var s: *Stmt = first
     while s != null
         var here: *StructDef = null
@@ -6168,31 +6107,31 @@ fn tuple_resolve_stmts(first: *Stmt, tail: *StructDef)
         let k: StmtKind = s.kind
         match k
             StmtKind.Expr =>
-                tuple_resolve_expr(s.expr, here)
+                tuple_resolve_expr(ctx, s.expr, here)
             StmtKind.Return =>
-                tuple_resolve_expr(s.return_value, g_tuple_ret_slot)
+                tuple_resolve_expr(ctx, s.return_value, ctx.tuple_ret_slot)
             StmtKind.VarDecl =>
-                tuple_resolve_expr(s.var_init, tuple_slot(s.var_type, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 }))
+                tuple_resolve_expr(ctx, s.var_init, tuple_slot(ctx, s.var_type, StrView { ptr: (s.var_type_name), len: (s.var_type_name_len) as i64 }))
             StmtKind.TupleDecl =>
-                tuple_split_decl(s)   # AGAST #2974
+                tuple_split_decl(ctx, s)   # AGAST #2974
             StmtKind.If =>
-                tuple_resolve_stmts(s.if_then, here)
-                tuple_resolve_stmts(s.if_else, here)
+                tuple_resolve_stmts(ctx, s.if_then, here)
+                tuple_resolve_stmts(ctx, s.if_else, here)
             StmtKind.Match =>
-                tuple_resolve_arms(s.if_then as *MatchArm, here)
+                tuple_resolve_arms(ctx, s.if_then as *MatchArm, here)
             StmtKind.While | StmtKind.Loop | StmtKind.Defer | StmtKind.Unsafe =>
-                tuple_resolve_stmts(s.while_body, null)
+                tuple_resolve_stmts(ctx, s.while_body, null)
             StmtKind.Asm =>
                 pass   # StmtKind.Asm holds no statement, expression or type (AGAST #3394).
             StmtKind.For =>
-                tuple_resolve_stmts(s.for_body, null)
+                tuple_resolve_stmts(ctx, s.for_body, null)
             _ => pass
         s = s.next
 
-fn tuple_resolve_fn(f: *FnDef)
-    g_tuple_ret_slot = tuple_slot(f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
-    tuple_resolve_stmts(f.body, g_tuple_ret_slot)
-    g_tuple_ret_slot = null
+fn tuple_resolve_fn(ctx: *ParseCtx, f: *FnDef)
+    ctx.tuple_ret_slot = tuple_slot(ctx, f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
+    tuple_resolve_stmts(ctx, f.body, ctx.tuple_ret_slot)
+    ctx.tuple_ret_slot = null
 
 fn type_params_name(tp: *TypeParam, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
@@ -6244,7 +6183,7 @@ fn tuple_param_add(acc: *TypeParam, name_sv: StrView) -> *TypeParam
 # The generic parameters of m that the struct-type name (name, len) names:
 # a `$`-component that is one (`T`, `Vec$T`), or one a component that is a
 # tuple names (`tuple_T_T`, `Vec$tuple_K_V`), added to `acc`.
-fn tuple_name_params(m: *Module, name_sv: StrView, acc: *TypeParam) -> *TypeParam
+fn tuple_name_params(ctx: *ParseCtx, m: *Module, name_sv: StrView, acc: *TypeParam) -> *TypeParam
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var out: *TypeParam = acc
@@ -6256,12 +6195,12 @@ fn tuple_name_params(m: *Module, name_sv: StrView, acc: *TypeParam) -> *TypePara
         if module_names_type_param(m, StrView { ptr: (name + pos), len: (end - pos) as i64 }) == 1
             out = tuple_param_add(out, StrView { ptr: (name + pos), len: (end - pos) as i64 })
         else
-            let inner: *StructDef = tuple_reg_find(StrView { ptr: (name + pos), len: (end - pos) as i64 })
+            let inner: *StructDef = tuple_reg_find(ctx, StrView { ptr: (name + pos), len: (end - pos) as i64 })
             if inner != null
                 var f: *StructField = inner.fields
                 while f != null
                     if f.field_type == TypeKind.Struct and f.field_type_name != null
-                        out = tuple_name_params(m, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, out)
+                        out = tuple_name_params(ctx, m, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, out)
                     f = f.next
         pos = end + 1
     out
@@ -6276,14 +6215,14 @@ fn tuple_name_params(m: *Module, name_sv: StrView, acc: *TypeParam) -> *TypePara
 # Checks the spellings this module registered, against every generic
 # parameter name it declares.
 fn tuple_mark_generic(p: *Parser)
-    var r: *TupleReg = g_tuple_regs
+    var r: *TupleReg = p.ctx.tuple_regs
     while r != null and r.fresh == 1
         r.fresh = 0
         var params: *TypeParam = null
         var f: *StructField = r.def.fields
         while f != null
             if f.field_type == TypeKind.Struct and f.field_type_name != null
-                params = tuple_name_params(p.module, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, params)
+                params = tuple_name_params(p.ctx, p.module, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, params)
                 f = f.next
             else if (f.field_type == TypeKind.Ptr or f.field_type == TypeKind.PtrPtr or f.field_type == TypeKind.Ref or f.field_type == TypeKind.MutRef) and f.field_type_name != null and module_names_type_param(p.module, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == 1
                 # AGAST #3173: `*T` / `@T` / `@&T`, and `**T` (#3184);
@@ -6300,21 +6239,21 @@ fn tuple_mark_generic(p: *Parser)
 # named by the emitter (tuple_lit_name, AGAST #3005).
 pub fn tuple_resolve_module(p: *Parser)
     tuple_mark_generic(p)
-    if g_tuple_lits == 0
+    if p.ctx.tuple_lits == 0
         return
-    g_tuple_p = p
+    p.ctx.tuple_p = p
     var f: *FnDef = p.module.functions
     while f != null
-        tuple_resolve_fn(f)
+        tuple_resolve_fn(p.ctx, f)
         f = f.next
     var ib: *ImplBlock = p.module.impls
     while ib != null
         var mt: *FnDef = ib.methods
         while mt != null
-            tuple_resolve_fn(mt)
+            tuple_resolve_fn(p.ctx, mt)
             mt = mt.next
         ib = ib.next
-    g_tuple_lits = 0
+    p.ctx.tuple_lits = 0
 
 # =============================================================================
 # Statement helpers
@@ -6347,7 +6286,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     var len: i32 = name_sv.len as i32
     let ty: TypeKind = tr_kind(tr)
     let facts: *TypeFacts = type_facts(p, tr)
-    note_pass_binding(StrView { ptr: (name), len: (len) as i64 })   # AGAST #3320
+    note_pass_binding(p.ctx, StrView { ptr: (name), len: (len) as i64 })   # AGAST #3320
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = StmtKind.VarDecl
     s.var_is_let = 0
@@ -6418,12 +6357,12 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     s.var_pointee_array_shape = null   # AGAST #2570: inference sets it; #2098: or `*[N][M]T` below
     # AGAST #2822: latched by capture_var_type (every typed decl goes through
     # it) before a `<[M]U>` in the initializer re-set last_array_*.
-    let arr: *ArrayElem = g_var_array
+    let arr: *ArrayElem = p.ctx.var_array
     s.var_array_elem_pointee = TypeKind.Void
     s.var_array = null
     if ty == TypeKind.Array and arr != null
         s.var_array = arr   # AGAST #2995
-        s.var_array_size = g_var_array_size
+        s.var_array_size = p.ctx.var_array_size
         s.var_array_elem_type = arr.elem
         s.var_array_shape = arr.shape  # AGAST #1509
         s.var_array_elem_pointee = arr.pointee
@@ -6468,21 +6407,21 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     s.var_pointee_array_elem_name = null
     s.var_pointee_array_elem_name_len = 0
     if ty != TypeKind.Void
-        s.var_pointee_array_elem_name = g_var_ptr_array_elem_name
-        s.var_pointee_array_elem_name_len = g_var_ptr_array_elem_name_len
-        s.var_pointee_array_size = g_var_ptr_array_size
-        s.var_pointee_array_elem_type = g_var_ptr_array_elem
-        s.var_pointee_array_elem_pointee = g_var_ptr_array_elem_pointee
+        s.var_pointee_array_elem_name = p.ctx.var_ptr_array_elem_name
+        s.var_pointee_array_elem_name_len = p.ctx.var_ptr_array_elem_name_len
+        s.var_pointee_array_size = p.ctx.var_ptr_array_size
+        s.var_pointee_array_elem_type = p.ctx.var_ptr_array_elem
+        s.var_pointee_array_elem_pointee = p.ctx.var_ptr_array_elem_pointee
         # AGAST #2098: and its shape, consumed: a decl that captured nothing (an
         # alias `var b: PA`) must not take an earlier `*[N][M]T`'s.
         if ty == TypeKind.Ptr or ty == TypeKind.PtrPtr   # #3635: `**[N][M]T` too
-            s.var_pointee_array_shape = g_var_ptr_array_shape
+            s.var_pointee_array_shape = p.ctx.var_ptr_array_shape
         if ty == TypeKind.Ref or ty == TypeKind.MutRef   # #4122: `@*[N][M]T` / `@&*[N][M]T`
-            s.var_pointee_array_shape = g_var_ptr_array_shape
-        g_var_ptr_array_shape = null
+            s.var_pointee_array_shape = p.ctx.var_ptr_array_shape
+        p.ctx.var_ptr_array_shape = null
     s.var_ref = null
-    if (ty == TypeKind.Ref or ty == TypeKind.MutRef) and g_var_ref != null
-        s.var_ref = g_var_ref
+    if (ty == TypeKind.Ref or ty == TypeKind.MutRef) and p.ctx.var_ref != null
+        s.var_ref = p.ctx.var_ref
         stmt_take_var_ref(s)
     s.var_init = init
     s.next = null
@@ -6561,14 +6500,14 @@ pub fn stmt_unsafe(p: *Parser, body: *Stmt, line: i32, col: i32) -> *Stmt
 # The arch name of the last block reported on, so a block the parser
 # backtracks over and builds again is reported once.  Blocks are built in
 # source order; reset per file by parser_reset_diagnostics.
-var g_asm_last_block: *u8 = null
+# State: ParseCtx.asm_last_block
 
 # `<file>:<line>:<col>: error: <pre><name><post>`, counted as a parse error.
-fn asm_error(line: i32, col: i32, pre: *u8, name_sv: StrView, post: *u8)
+fn asm_error(ctx: *ParseCtx, line: i32, col: i32, pre: *u8, name_sv: StrView, post: *u8)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    g_attr_errors = g_attr_errors + 1
-    diag_error_name(g_parse_file, diag_span(line, col), pre, StrView { ptr: (name), len: (len) as i64 }, post)
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error_name(ctx.parse_file, diag_span(line, col), pre, StrView { ptr: (name), len: (len) as i64 }, post)
 
 # The x86_64 general register `name` names by its 64-bit name, as an index
 # (the order of the hardware encoding), or ASM_REG_NONE.
@@ -6695,22 +6634,22 @@ fn asm_append_operand(b: *AsmBlock, o: *AsmOperand)
 
 # 1 if register `reg`, written `text` at `at`, may be pinned or clobbered;
 # reports it (when `report` is 1) if not.
-fn asm_reg_ok(reg: i32, text_sv: StrView, at: SrcSpan, report: i32) -> i32
+fn asm_reg_ok(ctx: *ParseCtx, reg: i32, text_sv: StrView, at: SrcSpan, report: i32) -> i32
     var text: *u8 = text_sv.ptr
     var len: i32 = text_sv.len as i32
     if reg == ASM_REG_NONE
         if report == 1
-            asm_error(at.line, at.col, c"'", StrView { ptr: (text), len: (len) as i64 }, c"' is not a general register (rax, rbx, rcx, rdx, rsi, rdi, r8-r15)")
+            asm_error(ctx, at.line, at.col, c"'", StrView { ptr: (text), len: (len) as i64 }, c"' is not a general register (rax, rbx, rcx, rdx, rsi, rdi, r8-r15)")
         return 0
     if reg == ASM_REG_RSP or reg == ASM_REG_RBP
         if report == 1
-            asm_error(at.line, at.col, c"asm can't pin or clobber '", StrView { ptr: (text), len: (len) as i64 }, c"'")
+            asm_error(ctx, at.line, at.col, c"asm can't pin or clobber '", StrView { ptr: (text), len: (len) as i64 }, c"'")
         return 0
     1
 
 # Sort a block's clauses, in order: a clobber sets its bit in b.clobbers,
 # any other is appended to b.operands.  Reports what is wrong with each.
-fn asm_take_clauses(b: *AsmBlock, clauses: *AsmOperand, report: i32)
+fn asm_take_clauses(ctx: *ParseCtx, b: *AsmBlock, clauses: *AsmOperand, report: i32)
     var pinned: i32 = 0
     var o: *AsmOperand = clauses
     while o != null
@@ -6720,25 +6659,25 @@ fn asm_take_clauses(b: *AsmBlock, clauses: *AsmOperand, report: i32)
             b.first_clause = o.kind_span
         if o.dir == ASM_UNKNOWN
             if report == 1
-                asm_error(o.kind_span.line, o.kind_span.col, c"unknown asm clause '", StrView { ptr: (o.kind), len: (o.kind_len) as i64 }, c"' (in, out, inout or clobber)")
+                asm_error(ctx, o.kind_span.line, o.kind_span.col, c"unknown asm clause '", StrView { ptr: (o.kind), len: (o.kind_len) as i64 }, c"' (in, out, inout or clobber)")
         else if o.dir == ASM_CLOBBER
             if o.reg_name != null
                 if report == 1
-                    asm_error(o.reg_span.line, o.reg_span.col, c"'clobber' takes one register, not '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c": ...'")
+                    asm_error(ctx, o.reg_span.line, o.reg_span.col, c"'clobber' takes one register, not '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c": ...'")
             else
                 let reg: i32 = asm_reg_index(StrView { ptr: (o.name), len: (o.name_len) as i64 })
-                if asm_reg_ok(reg, StrView { ptr: (o.name), len: (o.name_len) as i64 }, o.span, report) == 1
+                if asm_reg_ok(ctx, reg, StrView { ptr: (o.name), len: (o.name_len) as i64 }, o.span, report) == 1
                     b.clobbers = b.clobbers | (1 << reg)
         else if asm_find_operand(b, StrView { ptr: (o.name), len: (o.name_len) as i64 }) != null
             if report == 1
-                asm_error(o.span.line, o.span.col, c"'", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c"' is named in two asm clauses")
+                asm_error(ctx, o.span.line, o.span.col, c"'", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c"' is named in two asm clauses")
         else
             if o.reg_name != null
-                if asm_reg_ok(o.reg, StrView { ptr: (o.reg_name), len: (o.reg_name_len) as i64 }, o.reg_span, report) == 0
+                if asm_reg_ok(ctx, o.reg, StrView { ptr: (o.reg_name), len: (o.reg_name_len) as i64 }, o.reg_span, report) == 0
                     o.reg = ASM_REG_NONE
                 else if (pinned & (1 << o.reg)) != 0
                     if report == 1
-                        asm_error(o.reg_span.line, o.reg_span.col, c"asm register '", StrView { ptr: (o.reg_name), len: (o.reg_name_len) as i64 }, c"' is pinned twice")
+                        asm_error(ctx, o.reg_span.line, o.reg_span.col, c"asm register '", StrView { ptr: (o.reg_name), len: (o.reg_name_len) as i64 }, c"' is pinned twice")
                 else
                     pinned = pinned | (1 << o.reg)
             asm_append_operand(b, o)
@@ -6746,7 +6685,7 @@ fn asm_take_clauses(b: *AsmBlock, clauses: *AsmOperand, report: i32)
 
 # A named label at the start of line `l` (`loop:`, `.L1:`), reported; only
 # numeric local labels (`1:`) are allowed (§18.6, #1371).
-fn asm_check_label(l: *AsmLine, report: i32)
+fn asm_check_label(ctx: *ParseCtx, l: *AsmLine, report: i32)
     if l.len == 0
         return
     let c0: i32 = (*l.text) as i32
@@ -6757,7 +6696,7 @@ fn asm_check_label(l: *AsmLine, report: i32)
         i = i + 1
     if i < l.len and *(l.text + i) == ':'   # ':'
         if report == 1
-            asm_error(l.span.line, l.span.col, c"named label '", StrView { ptr: (l.text), len: (i) as i64 }, c"' in asm: use a numeric local label (1:, jumped to as 1b or 1f)")
+            asm_error(ctx, l.span.line, l.span.col, c"named label '", StrView { ptr: (l.text), len: (i) as i64 }, c"' in asm: use a numeric local label (1:, jumped to as 1b or 1f)")
 
 # The `{name}`s of line `l`: each name no operand has yet becomes an ASM_IN
 # operand; each operand found is marked as in the text.  `{{` and `}}` are a
@@ -6807,9 +6746,9 @@ fn asm_scan_line(p: *Parser, b: *AsmBlock, l: *AsmLine, report: i32)
                             closed = 1
                         k = k + 1
                     if closed == 0
-                        asm_error(l.span.line, l.span.col + i, c"'{' in asm is not closed", StrView { ptr: (null), len: (0) as i64 }, c" (write '{{' for a literal '{')")
+                        asm_error(p.ctx, l.span.line, l.span.col + i, c"'{' in asm is not closed", StrView { ptr: (null), len: (0) as i64 }, c" (write '{{' for a literal '{')")
                     else
-                        asm_error(l.span.line, l.span.col + i, c"'{' in asm must be followed by a name and '}'", StrView { ptr: (null), len: (0) as i64 }, c" (write '{{' for a literal '{')")
+                        asm_error(p.ctx, l.span.line, l.span.col + i, c"'{' in asm must be followed by a name and '}'", StrView { ptr: (null), len: (0) as i64 }, c" (write '{{' for a literal '{')")
                 i = l.len
         else
             i = i + 1
@@ -6820,9 +6759,9 @@ pub fn stmt_asm(p: *Parser, arch_sv: StrView, aline: i32, acol: i32, clauses: *A
     var arch_len: i32 = arch_sv.len as i32
     # A block the parser backtracked over and builds again is not re-reported.
     var report: i32 = 0
-    if g_asm_last_block == null or (arch as i64) > (g_asm_last_block as i64)
+    if p.ctx.asm_last_block == null or (arch as i64) > (p.ctx.asm_last_block as i64)
         report = 1
-        g_asm_last_block = arch
+        p.ctx.asm_last_block = arch
     let b: *AsmBlock = parser_alloc(p, sizeof(AsmBlock)) as *AsmBlock
     b.arch = arch
     b.arch_len = arch_len
@@ -6833,18 +6772,18 @@ pub fn stmt_asm(p: *Parser, arch_sv: StrView, aline: i32, acol: i32, clauses: *A
     b.first_clause.line = 0
     b.first_clause.col = 0
     if not (StrView { ptr: (arch), len: (arch_len) as i64 }).eq(StrView { ptr: (c"x86_64"), len: (6) as i64 }) and report == 1
-        asm_error(aline, acol, c"unknown asm architecture '", StrView { ptr: (arch), len: (arch_len) as i64 }, c"' (known: x86_64)")
-    asm_take_clauses(b, clauses, report)
+        asm_error(p.ctx, aline, acol, c"unknown asm architecture '", StrView { ptr: (arch), len: (arch_len) as i64 }, c"' (known: x86_64)")
+    asm_take_clauses(p.ctx, b, clauses, report)
     var l: *AsmLine = lines
     while l != null
-        asm_check_label(l, report)
+        asm_check_label(p.ctx, l, report)
         asm_scan_line(p, b, l, report)
         l = l.next
     # An unpinned clause operand has no register but the one {name} picks.
     var o: *AsmOperand = b.operands
     while o != null
         if o.in_clause == 1 and o.reg_name == null and o.text_span.line == 0 and report == 1
-            asm_error(o.span.line, o.span.col, c"asm operand '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c"' is in a clause but not in the text: write {name} or pin it to a register")
+            asm_error(p.ctx, o.span.line, o.span.col, c"asm operand '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c"' is in a clause but not in the text: write {name} or pin it to a register")
         o = o.next
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = StmtKind.Asm
@@ -6856,19 +6795,19 @@ pub fn stmt_asm(p: *Parser, arch_sv: StrView, aline: i32, acol: i32, clauses: *A
 
 # The [[naked]] rules for fn `f` (§18.6, §17.5): its body holds only asm
 # blocks, and they take no clause and no `{name}`: there is no frame.
-fn asm_check_naked(f: *FnDef)
+fn asm_check_naked(ctx: *ParseCtx, f: *FnDef)
     var st: *Stmt = f.body
     while st != null
         if st.kind != StmtKind.Asm
-            asm_error(st.span.line, st.span.col, c"a [[naked]] fn body may contain only asm blocks", StrView { ptr: (null), len: (0) as i64 }, c"")
+            asm_error(ctx, st.span.line, st.span.col, c"a [[naked]] fn body may contain only asm blocks", StrView { ptr: (null), len: (0) as i64 }, c"")
         else
             let b: *AsmBlock = st.asm_block
             if b.clause_count > 0
-                asm_error(b.first_clause.line, b.first_clause.col, c"an asm block in a [[naked]] fn takes no clauses", StrView { ptr: (null), len: (0) as i64 }, c"")
+                asm_error(ctx, b.first_clause.line, b.first_clause.col, c"an asm block in a [[naked]] fn takes no clauses", StrView { ptr: (null), len: (0) as i64 }, c"")
             var o: *AsmOperand = b.operands
             while o != null
                 if o.text_span.line != 0
-                    asm_error(o.text_span.line, o.text_span.col, c"an asm block in a [[naked]] fn takes no {name}: '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c"' has no frame to live in")
+                    asm_error(ctx, o.text_span.line, o.text_span.col, c"an asm block in a [[naked]] fn takes no {name}: '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c"' has no frame to live in")
                 o = o.next
         st = st.next
 
@@ -6911,11 +6850,11 @@ pub fn stmt_assert(p: *Parser, cond: *Expr, msg_sv: StrView, line: i32, col: i32
 # `assert <cond>, c"..."`: the message is a "..." (StrView) literal only, so a
 # c-string message is a located error at the literal, worded as ritz0's
 # ASSERT_CSTRING_MESSAGE (AGAST #3794).  Returns a message-less assert so the
-# parse goes on; g_attr_errors fails the compile.
+# parse goes on; ctx.attr_errors fails the compile.
 pub fn assert_cstring_message_refused(p: *Parser, cond: *Expr, lit_line: i32, lit_col: i32, line: i32, col: i32) -> *Stmt
     if p.skip_item == 0
-        diag_error(g_parse_file, diag_span(lit_line, lit_col), c"an assert message is a \"...\" literal: drop the `c`")
-        g_attr_errors = g_attr_errors + 1
+        diag_error(p.ctx.parse_file, diag_span(lit_line, lit_col), c"an assert message is a \"...\" literal: drop the `c`")
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
     stmt_assert(p, cond, StrView { ptr: (null), len: (0) as i64 }, line, col)
 
 # `let (x, y, ...) = expr` — destructure.  First binding name lives in
@@ -7686,12 +7625,12 @@ pub fn expr_false(p: *Parser, line: i32, col: i32) -> *Expr
 # AGAST #3320: `pass` is an identifier (LANGUAGE_SPEC §2), so it lexes as
 # IDENT and names fns, params, locals and fields like any other.  As ritz0
 # reads it, a bare `pass` is the binding of that name when one is in scope,
-# and otherwise the no-op.  g_pass_bound is "the fn being parsed binds `pass`"
+# and otherwise the no-op.  ctx.pass_bound is "the fn being parsed binds `pass`"
 # (a param or a let/var/for), set as each binding is parsed and cleared at
 # the fn's end, so it covers the reads after the binding.  It is per fn, not
 # per block: a no-op `pass` after an inner block's `let pass` reads as the
 # out-of-scope name.
-var g_pass_bound: i32 = 0
+# State: ParseCtx.pass_bound
 
 fn is_pass_name(name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
@@ -7700,23 +7639,23 @@ fn is_pass_name(name_sv: StrView) -> i32
         return 1
     return 0
 
-pub fn note_pass_binding(name_sv: StrView)
+pub fn note_pass_binding(ctx: *ParseCtx, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if is_pass_name(StrView { ptr: (name), len: (len) as i64 }) == 1
-        g_pass_bound = 1
+        ctx.pass_bound = 1
 
 # Grammar action for a `for` variable: noted before the body is parsed, which
 # stmt_for's action (after the body) would be too late for.
-pub fn for_var_name(tok: Token) -> Token
-    note_pass_binding(StrView { ptr: (tok.start), len: (tok.len) as i64 })
+pub fn for_var_name(ctx: *ParseCtx, tok: Token) -> Token
+    note_pass_binding(ctx, StrView { ptr: (tok.start), len: (tok.len) as i64 })
     return tok
 
 # A primary with no postfix ops (apply_postfix_p): a bare `pass` with no
 # binding of that name in the fn is the no-op.  `pass(2)`, `s.pass` and a
 # bound `pass` stay identifiers.
 fn pass_or_ident(p: *Parser, e: *Expr) -> *Expr
-    if e.kind == ExprKind.Ident and g_pass_bound == 0 and is_pass_name(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+    if e.kind == ExprKind.Ident and p.ctx.pass_bound == 0 and is_pass_name(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
         return expr_pass(p, e.span.line, e.span.col)
     return e
 
@@ -8211,17 +8150,17 @@ pub fn block_ended_check(p: *Parser) -> i32
 # else-less `if` (expr_if_open, #4543), `if`/`else` (expr_if_operand, #4553)
 # and `match` (expr_match_operand, #4049).  Keyed by position, so a node
 # built by a speculative alternative over different tokens cannot satisfy it.
-var g_open_if_end: i32 = 0 - 1
+# State: ParseCtx.open_if_end
 
-pub fn open_if_note(end: i32)
-    g_open_if_end = end
+pub fn open_if_note(ctx: *ParseCtx, end: i32)
+    ctx.open_if_end = end
 
 # The grammar's open_if_ended: matches nothing and fails unless this is
 # exactly where a block operand ended.  A block operand (`5 + if c` + its
 # body, AGAST #4543; `5 + if c` + body + `else` + body, #4553; `5 + match c`
 # + its arms, #4049) ends the statement here.
 pub fn open_if_ended_check(p: *Parser) -> i32
-    if p.pos != g_open_if_end or p.pos == 0 or (p.tokens + (p.pos - 1)).kind != TOK_DEDENT
+    if p.pos != p.ctx.open_if_end or p.pos == 0 or (p.tokens + (p.pos - 1)).kind != TOK_DEDENT
         p.error = 1
     0
 
@@ -8458,7 +8397,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
                     result.call_type_suffix_len = op.call_type_suffix_len
                     result.args = op.args
                     if op.call_type_suffix != null and p.skip_item == 0
-                        generic_use_note(StrView { ptr: (result.func_name), len: (result.func_name_len) as i64 }, StrView { ptr: (op.call_type_suffix), len: (op.call_type_suffix_len) as i64 }, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p))
+                        generic_use_note(p.ctx, StrView { ptr: (result.func_name), len: (result.func_name_len) as i64 }, StrView { ptr: (op.call_type_suffix), len: (op.call_type_suffix_len) as i64 }, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p))
                 ExprKind.Member =>
                     # Method call: expr.method(args)
                     # ExprKind.Member has: left = receiver, ident_ptr/len = method name
@@ -8624,25 +8563,16 @@ pub fn qualified_struct_lit(p: *Parser, qual: Token, name: Token, lit: *FieldIni
 # field positions once the whole closure is parsed.  An alternative the
 # parser backtracks out of leaves its note behind; nothing points at its
 # node, and named_variants reports each source position once.
-struct NamedForm
-    arm: *MatchArm   # a named pattern, else null
-    lit: *Expr       # a struct literal (ExprKind.StructLit), else null
-    name: *u8        # the variant's name (a literal's, which may be a struct's)
-    name_len: i32
-    qual: *u8        # the `E` of `E.V { .. }`, else null
-    qual_len: i32
-    span: SrcSpan    # where the form begins, for its errors
-    file: *u8
-    next: *NamedForm
+# struct NamedForm: ast.ritz, beside ParseCtx (AGAST #4623).
 
-var g_named_forms: *NamedForm = null
+# State: ParseCtx.named_forms
 
-pub fn named_forms() -> *NamedForm
-    g_named_forms
+pub fn named_forms(ctx: *ParseCtx) -> *NamedForm
+    ctx.named_forms
 
 # The driver re-parses from scratch (#1475).
-pub fn named_forms_reset()
-    g_named_forms = null
+pub fn named_forms_reset(ctx: *ParseCtx)
+    ctx.named_forms = null
 
 # `head` is where the form begins: the qualifier of `E.V { .. }`.
 fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual_sv: StrView)
@@ -8664,8 +8594,8 @@ fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual_sv:
     f.span.line = head.line
     f.span.col = head.col
     f.file = parse_file_copy_shared(p)
-    f.next = g_named_forms
-    g_named_forms = f
+    f.next = p.ctx.named_forms
+    p.ctx.named_forms = f
 
 # pattern : [IDENT '.'] IDENT '{' IDENT (',' IDENT)* '}'  (AGAST #4187).  The
 # names bind as written until named_variants.ritz puts them in field order.
@@ -9111,7 +9041,7 @@ pub fn expr_if_open(p: *Parser, cond: *Expr, then_body: *Stmt, line: i32, col: i
     e.left = cond
     e.args = then_arm as *Expr  # Reinterpret arm list as Expr* slot
     e.next = null
-    open_if_note(p.pos)
+    open_if_note(p.ctx, p.pos)
     return e
 
 # Create ExprKind.If for a block `if`/`else` used as an OPERAND (`5 + if c` +
@@ -9122,7 +9052,7 @@ pub fn expr_if_open(p: *Parser, cond: *Expr, then_body: *Stmt, line: i32, col: i
 # `let x = if … else …` forms (`if_expr_rhs`) are untouched.
 pub fn expr_if_operand(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line: i32, col: i32) -> *Expr
     let e: *Expr = expr_if(p, cond, then_body, else_body, line, col)
-    open_if_note(p.pos)
+    open_if_note(p.ctx, p.pos)
     return e
 
 # Create ExprKind.Match for a block `match` in primary_expr, which is only
@@ -9132,7 +9062,7 @@ pub fn expr_if_operand(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *St
 # `open_if_ended`, as for a block `if` operand (#4553).
 pub fn expr_match_operand(p: *Parser, scrutinee: *Expr, arms: *MatchArm, line: i32, col: i32) -> *Expr
     let e: *Expr = expr_match(p, scrutinee, arms, line, col)
-    open_if_note(p.pos)
+    open_if_note(p.ctx, p.pos)
     return e
 
 # Create ExprKind.If for the inline form `if cond then a else b` (AGAST #1753).
@@ -9417,8 +9347,8 @@ pub fn enum_def_skip(p: *Parser) -> i32
 # enum_def's action: as enum_def_skip, latching `pub` for the enum just
 # parsed (its generated `from` is `pub` iff it is, LANGUAGE_SPEC §10.4).
 pub fn enum_def_end(p: *Parser, is_pub: i32) -> i32
-    tn_claim(p, g_tn_enum_params, null)   # AGAST #4021
-    g_tn_enum_params = null
+    tn_claim(p, p.ctx.tn_enum_params, null)   # AGAST #4021
+    p.ctx.tn_enum_params = null
     let e: *EnumDef = enum_cur(p)
     if e != null
         e.is_pub = is_pub
@@ -9429,7 +9359,7 @@ pub fn enum_def_end(p: *Parser, is_pub: i32) -> i32
 # ============================================================================
 # When the parser sees `enum Shade ... Light ... Dark` it builds an EnumDef
 # (ast.ritz) whose EnumVariant list holds Light then Dark.  Those nodes are
-# the file's Module.enums; g_program_enums roots the merged program list once
+# the file's Module.enums; ctx.program_enums roots the merged program list once
 # imports have resolved (main.ritz), so downstream references like
 # `Shade.Light` still resolve to the variant's tag value (0, 1, ...).
 #
@@ -9445,17 +9375,17 @@ pub const ENUM_VARIANT_STRUCT: i32 = 2
 # has resolved every import.  It points at the AST's own nodes (a root, not a
 # side table); `ei` in every accessor below indexes this chain in
 # declaration order.
-var g_program_enums: *EnumDef = null
+# State: ParseCtx.program_enums
 
 # Set the program's enum root from the module parse_program just resolved.
-pub fn enum_program_set(m: *Module)
-    g_program_enums = m.enums
+pub fn enum_program_set(ctx: *ParseCtx, m: *Module)
+    ctx.program_enums = m.enums
 
 # Forget the program's enum root.  The driver's alias re-parse (AGAST #1475)
 # parses every module a second time; the fresh Module carries the only enums
 # that matter, so the root is cleared until that re-parse finishes.
-pub fn enum_program_reset()
-    g_program_enums = null
+pub fn enum_program_reset(ctx: *ParseCtx)
+    ctx.program_enums = null
 
 # Append `e` to the EnumDef chain rooted at `head`.
 fn enum_list_append(head: *EnumDef, e: *EnumDef)
@@ -9474,10 +9404,10 @@ fn enum_list_tail(head: *EnumDef) -> *EnumDef
     cur
 
 # The program's `ei`-th enum, or null.
-fn enum_node_at(ei: i32) -> *EnumDef
+fn enum_node_at(ctx: *ParseCtx, ei: i32) -> *EnumDef
     if ei < 0
         return null
-    var cur: *EnumDef = g_program_enums
+    var cur: *EnumDef = ctx.program_enums
     var i: i32 = 0
     while cur != null and i < ei
         cur = cur.next
@@ -9553,7 +9483,7 @@ fn enum_def_start_full(p: *Parser, name_sv: StrView, generic: i32, repr: TypeKin
     var len: i32 = name_sv.len as i32
     enum_new(p, StrView { ptr: (name), len: (len) as i64 }, generic, repr, line)
     if generic != ENUM_INSTANCE   # `Slot$i32` is declared by no file
-        type_decl_log(StrView { ptr: (name), len: (len) as i64 })   # AGAST #3907
+        type_decl_log(p.ctx, StrView { ptr: (name), len: (len) as i64 })   # AGAST #3907
     return 0
 
 # Called from grammar rule enum_def_header: starts a new EnumDef.
@@ -9566,7 +9496,7 @@ pub fn enum_def_start(p: *Parser, name_sv: StrView) -> i32
 pub fn enum_def_start_generic(p: *Parser, name_sv: StrView, params: *TypeParam) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    g_tn_enum_params = params   # AGAST #4021: in scope in its payloads
+    p.ctx.tn_enum_params = params   # AGAST #4021: in scope in its payloads
     return enum_def_start_impl(p, StrView { ptr: (name), len: (len) as i64 }, 1)
 
 # `enum E: T` (LANGUAGE_SPEC §10.4): as enum_def_start, with representation
@@ -9578,11 +9508,11 @@ pub fn enum_def_start_repr(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32
     var r: TypeKind = repr
     if is_int_const_type(repr) == 0 or repr == TypeKind.Bool
         if p.skip_item == 0
-            diag_error_at(g_parse_file, diag_span(line, col))
+            diag_error_at(p.ctx.parse_file, diag_span(line, col))
             eprints_cstr(c"representation type of enum '")
             eprint_lexeme(StrView { ptr: (name), len: (len) as i64 })
             eprintln_cstr(c"' must be an integer type")
-            g_attr_errors = g_attr_errors + 1
+            p.ctx.attr_errors = p.ctx.attr_errors + 1
         r = TypeKind.I64
     return enum_def_start_full(p, StrView { ptr: (name), len: (len) as i64 }, 0, r, line)
 
@@ -9601,7 +9531,7 @@ pub fn enum_variant_record_tuple(p: *Parser, name_sv: StrView, tr: *TypeRef, lin
     var len: i32 = name_sv.len as i32
     let f: *StructField = field_new(p, StrView { ptr: (name), len: (len) as i64 }, tr, 0, 0)
     f.next = null
-    nd_payload_reject(f, line, col)
+    nd_payload_reject(p.ctx, f, line, col)
     return enum_variant_record_impl(p, StrView { ptr: (name), len: (len) as i64 }, ENUM_VARIANT_TUPLE, f, 0, 0, 0, line, col)
 
 # AGAST #1295: one payload type of a multi-field tuple variant `Name(T1, T2,
@@ -9627,18 +9557,18 @@ pub fn enum_variant_record_tuple_n(p: *Parser, name_sv: StrView, fields: *Struct
         f.name = name
         f.name_len = len
         f = f.next
-    nd_payload_reject(fields, line, col)
+    nd_payload_reject(p.ctx, fields, line, col)
     return enum_variant_record_impl(p, StrView { ptr: (name), len: (len) as i64 }, ENUM_VARIANT_TUPLE, fields, 0, 0, 0, line, col)
 
 # AGAST #2097: field_new now keeps an N-D field's shape, but an enum
 # payload binding (`A(g) => g[i][j]`) has no N-D lowering: it was bound as
 # one i64 and indexed as a byte pointer.  Keep #1509's located error there
 # (ritz0 cannot index such a binding either).
-fn nd_payload_reject(fields: *StructField, line: i32, col: i32)
+fn nd_payload_reject(ctx: *ParseCtx, fields: *StructField, line: i32, col: i32)
     var f: *StructField = fields
     while f != null
         if f.array_shape != null
-            nd_array_report(line, col, c"an enum variant payload")
+            nd_array_report(ctx, line, col, c"an enum variant payload")
             return
         f = f.next
 
@@ -9646,7 +9576,7 @@ fn nd_payload_reject(fields: *StructField, line: i32, col: i32)
 pub fn enum_variant_record_struct(p: *Parser, name_sv: StrView, fields: *StructField, line: i32, col: i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    nd_payload_reject(fields, line, col)
+    nd_payload_reject(p.ctx, fields, line, col)
     tn_note_fields(p, fields)   # AGAST #4171
     return enum_variant_record_impl(p, StrView { ptr: (name), len: (len) as i64 }, ENUM_VARIANT_STRUCT, fields, 0, 0, 0, line, col)
 
@@ -9721,28 +9651,28 @@ fn enum_variant_check(p: *Parser, e: *EnumDef, v: i32, kind: i32, explicit: i32,
     let vname: *u8 = vnode.name
     let vlen: i32 = vnode.name_len
     if repr != TypeKind.Void and kind != ENUM_VARIANT_UNIT
-        diag_error_at(g_parse_file, diag_span(line, col))
+        diag_error_at(p.ctx.parse_file, diag_span(line, col))
         eprints_cstr(c"variant '")
         eprint_lexeme(StrView { ptr: (vname), len: (vlen) as i64 })
         eprints_cstr(c"' of enum '")
         eprint_lexeme(StrView { ptr: (ename), len: (elen) as i64 })
         eprintln_cstr(c"' carries data, so the enum cannot have a representation type")
-        g_attr_errors = g_attr_errors + 1
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
         return
     if repr == TypeKind.Void
         if explicit == 1
-            diag_error_at(g_parse_file, diag_span(line, col))
+            diag_error_at(p.ctx.parse_file, diag_span(line, col))
             eprints_cstr(c"discriminant of variant '")
             eprint_lexeme(StrView { ptr: (vname), len: (vlen) as i64 })
             eprints_cstr(c"' needs a representation type: write 'enum ")
             eprint_lexeme(StrView { ptr: (ename), len: (elen) as i64 })
             eprintln_cstr(c": <integer type>'")
-            g_attr_errors = g_attr_errors + 1
+            p.ctx.attr_errors = p.ctx.attr_errors + 1
         return
     let bits: i64 = vnode.discr
     let neg: i32 = vnode.discr_neg
     if discr_fits(repr, bits, neg) == 0
-        diag_error_at(g_parse_file, diag_span(line, col))
+        diag_error_at(p.ctx.parse_file, diag_span(line, col))
         eprints_cstr(c"discriminant ")
         eprint_discr(bits, neg)
         eprints_cstr(c" of variant '")
@@ -9751,13 +9681,13 @@ fn enum_variant_check(p: *Parser, e: *EnumDef, v: i32, kind: i32, explicit: i32,
         eprint_lexeme(StrView { ptr: (ename), len: (elen) as i64 })
         eprints_cstr(c"''s representation type ")
         eprintln_cstr(primitive_name_from_type(repr))
-        g_attr_errors = g_attr_errors + 1
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
         return
     var w: i32 = 0
     var wv: *EnumVariant = e.variants
     while wv != null and w < v
         if wv.discr == bits
-            diag_error_at(g_parse_file, diag_span(line, col))
+            diag_error_at(p.ctx.parse_file, diag_span(line, col))
             eprints_cstr(c"variants '")
             eprint_lexeme(StrView { ptr: (wv.name), len: (wv.name_len) as i64 })
             eprints_cstr(c"' and '")
@@ -9767,7 +9697,7 @@ fn enum_variant_check(p: *Parser, e: *EnumDef, v: i32, kind: i32, explicit: i32,
             eprints_cstr(c"' have the same discriminant ")
             eprint_discr(bits, neg)
             eprintln_cstr(c"")
-            g_attr_errors = g_attr_errors + 1
+            p.ctx.attr_errors = p.ctx.attr_errors + 1
             return
         wv = wv.next
         w = w + 1
@@ -9814,21 +9744,21 @@ fn enum_variant_record_impl(p: *Parser, name_sv: StrView, kind: i32, fields: *St
 
 # Lookup: returns the variant's tag index (0-based) within an enum, or -1
 # when either the enum or the variant is unknown.
-pub fn enum_variant_index(enum_name_sv: StrView, var_name_sv: StrView) -> i32
+pub fn enum_variant_index(ctx: *ParseCtx, enum_name_sv: StrView, var_name_sv: StrView) -> i32
     var enum_name: *u8 = enum_name_sv.ptr
     var enum_name_len: i32 = enum_name_sv.len as i32
     var var_name: *u8 = var_name_sv.ptr
     var var_name_len: i32 = var_name_sv.len as i32
-    let e: *EnumDef = enum_find_node(StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
+    let e: *EnumDef = enum_find_node(ctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
     if e == null
         return 0 - 1
     enum_variant_slot_node(e, StrView { ptr: (var_name), len: (var_name_len) as i64 })
 
 # Returns 1 if name is a known enum type, 0 otherwise.
-pub fn is_enum_type(name_sv: StrView) -> i32
+pub fn is_enum_type(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    (enum_find_node(StrView { ptr: (name), len: (len) as i64 }) != null) as i32
+    (enum_find_node(ctx, StrView { ptr: (name), len: (len) as i64 }) != null) as i32
 
 # --- AGAST #1797: enum / variant accessors for the emitter -----------------
 
@@ -9848,10 +9778,10 @@ fn enum_name_eq(e: *EnumDef, name_sv: StrView) -> i32
 
 # The EnumDef named `name`, or null.  The first one recorded wins, as in
 # enum_variant_index.
-pub fn enum_find_node(name_sv: StrView) -> *EnumDef
+pub fn enum_find_node(ctx: *ParseCtx, name_sv: StrView) -> *EnumDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    var e: *EnumDef = g_program_enums
+    var e: *EnumDef = ctx.program_enums
     while e != null
         if enum_name_eq(e, StrView { ptr: (name), len: (len) as i64 }) == 1
             return e
@@ -9859,10 +9789,10 @@ pub fn enum_find_node(name_sv: StrView) -> *EnumDef
     null
 
 # Index of the enum `name`, or -1.  The first one recorded wins.
-pub fn enum_find(name_sv: StrView) -> i32
+pub fn enum_find(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    var e: *EnumDef = g_program_enums
+    var e: *EnumDef = ctx.program_enums
     var ei: i32 = 0
     while e != null
         if enum_name_eq(e, StrView { ptr: (name), len: (len) as i64 }) == 1
@@ -9871,24 +9801,24 @@ pub fn enum_find(name_sv: StrView) -> i32
         ei = ei + 1
     return 0 - 1
 
-pub fn enum_count() -> i32
+pub fn enum_count(ctx: *ParseCtx) -> i32
     var n: i32 = 0
-    var e: *EnumDef = g_program_enums
+    var e: *EnumDef = ctx.program_enums
     while e != null
         n = n + 1
         e = e.next
     n
 
-pub fn enum_name_at(ei: i32, out_len: *i32) -> *u8
-    let e: *EnumDef = enum_node_at(ei)
+pub fn enum_name_at(ctx: *ParseCtx, ei: i32, out_len: *i32) -> *u8
+    let e: *EnumDef = enum_node_at(ctx, ei)
     if e == null
         *out_len = 0
         return null
     *out_len = e.name_len
     e.name
 
-pub fn enum_is_generic(ei: i32) -> i32
-    let e: *EnumDef = enum_node_at(ei)
+pub fn enum_is_generic(ctx: *ParseCtx, ei: i32) -> i32
+    let e: *EnumDef = enum_node_at(ctx, ei)
     if e == null
         return 0
     e.generic
@@ -9902,10 +9832,10 @@ pub const ENUM_INSTANCE: i32 = 2
 # Record `name` (`Slot$i32`) as an instance of generic enum `base`: its variants
 # in order, with their kinds and discriminants, variant `vi` carrying
 # *(fields + vi).  Returns its index.
-pub fn enum_record_instance(base: i32, name_sv: StrView, fields: **StructField) -> i32
+pub fn enum_record_instance(ctx: *ParseCtx, base: i32, name_sv: StrView, fields: **StructField) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let be: *EnumDef = enum_node_at(base)
+    let be: *EnumDef = enum_node_at(ctx, base)
     if be == null
         return 0 - 1
     let e: *EnumDef = malloc(sizeof(EnumDef)) as *EnumDef
@@ -9918,10 +9848,10 @@ pub fn enum_record_instance(base: i32, name_sv: StrView, fields: **StructField) 
     e.variants = null
     e.next = null
     e.def_file = null   # AGAST #3494 (R65): an instance is declared by no file
-    if g_program_enums == null
-        g_program_enums = e
+    if ctx.program_enums == null
+        ctx.program_enums = e
     else
-        enum_list_append(g_program_enums, e)
+        enum_list_append(ctx.program_enums, e)
     var vi: i32 = 0
     var bv: *EnumVariant = be.variants
     var last: *EnumVariant = null
@@ -9941,14 +9871,14 @@ pub fn enum_record_instance(base: i32, name_sv: StrView, fields: **StructField) 
         last = vnode
         bv = bv.next
         vi = vi + 1
-    enum_count() - 1
+    enum_count(ctx) - 1
 
-pub fn enum_variant_count(ei: i32) -> i32
-    enum_variant_count_node(enum_node_at(ei))
+pub fn enum_variant_count(ctx: *ParseCtx, ei: i32) -> i32
+    enum_variant_count_node(enum_node_at(ctx, ei))
 
 # Name of variant `vi` of enum `ei`.
-pub fn enum_variant_name(ei: i32, vi: i32, out_len: *i32) -> *u8
-    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ei), vi)
+pub fn enum_variant_name(ctx: *ParseCtx, ei: i32, vi: i32, out_len: *i32) -> *u8
+    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ctx, ei), vi)
     if v == null
         *out_len = 0
         return null
@@ -9956,28 +9886,28 @@ pub fn enum_variant_name(ei: i32, vi: i32, out_len: *i32) -> *u8
     v.name
 
 # Kind (ENUM_VARIANT_*) and payload fields of variant `vi` of enum `ei`.
-pub fn enum_variant_kind(ei: i32, vi: i32) -> i32
-    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ei), vi)
+pub fn enum_variant_kind(ctx: *ParseCtx, ei: i32, vi: i32) -> i32
+    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ctx, ei), vi)
     if v == null
         return ENUM_VARIANT_UNIT
     v.kind
 
-pub fn enum_variant_fields(ei: i32, vi: i32) -> *StructField
-    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ei), vi)
+pub fn enum_variant_fields(ctx: *ParseCtx, ei: i32, vi: i32) -> *StructField
+    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ctx, ei), vi)
     if v == null
         return null
     v.fields
 
 # LANGUAGE_SPEC §10.4: enum `ei`'s representation type (0: none) and the
 # discriminant bits of its variant `vi`.
-pub fn enum_repr(ei: i32) -> TypeKind
-    let e: *EnumDef = enum_node_at(ei)
+pub fn enum_repr(ctx: *ParseCtx, ei: i32) -> TypeKind
+    let e: *EnumDef = enum_node_at(ctx, ei)
     if e == null
         return TypeKind.Void
     e.repr
 
-pub fn enum_variant_discr(ei: i32, vi: i32) -> i64
-    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ei), vi)
+pub fn enum_variant_discr(ctx: *ParseCtx, ei: i32, vi: i32) -> i64
+    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ctx, ei), vi)
     if v == null
         return 0 as i64
     v.discr
@@ -9988,18 +9918,18 @@ pub fn enum_variant_discr(ei: i32, vi: i32) -> i64
 # enum_tag_value is variant `vi`'s value there, as a signed literal of that
 # width (`i32 -1`, never `i32 4294967295`).  Same layout as ritz0's
 # _set_enum_body / _enum_tag_const.
-pub fn enum_tag_llvm(ei: i32) -> *u8
-    let r: TypeKind = enum_repr(ei)
+pub fn enum_tag_llvm(ctx: *ParseCtx, ei: i32) -> *u8
+    let r: TypeKind = enum_repr(ctx, ei)
     if ty_int_bits(r) == 0
         return c"i8"
     ty_mem_llvm(r)
 
-pub fn enum_tag_value(ei: i32, vi: i32) -> i64
-    let r: TypeKind = enum_repr(ei)
+pub fn enum_tag_value(ctx: *ParseCtx, ei: i32, vi: i32) -> i64
+    let r: TypeKind = enum_repr(ctx, ei)
     let bits: i32 = ty_int_bits(r)
     if bits == 0
         return vi as i64
-    let d: i64 = enum_variant_discr(ei, vi)
+    let d: i64 = enum_variant_discr(ctx, ei, vi)
     if bits == 8
         return const_wrap_to_type(TypeKind.I8, d)
     if bits == 16
@@ -10010,20 +9940,20 @@ pub fn enum_tag_value(ei: i32, vi: i32) -> i64
 
 # Bytes (and alignment) field 0 of enum `ei` occupies: its repr type's size,
 # else 1 (the index tag).
-pub fn enum_tag_size(ei: i32) -> i64
-    let bits: i32 = ty_int_bits(enum_repr(ei))
+pub fn enum_tag_size(ctx: *ParseCtx, ei: i32) -> i64
+    let bits: i32 = ty_int_bits(enum_repr(ctx, ei))
     if bits == 0
         return 1
     (bits / 8) as i64
 
 # 1 when enum `ei`'s field 0 holds a signed discriminant (an `iN` repr).
-pub fn enum_tag_signed(ei: i32) -> i32
-    ty_is_signed(enum_repr(ei))
+pub fn enum_tag_signed(ctx: *ParseCtx, ei: i32) -> i32
+    ty_is_signed(enum_repr(ctx, ei))
 
 # 1 when every variant's discriminant is its index (no `= N` moved one).
-pub fn enum_discr_is_index(ei: i32) -> i32
-    for vi in 0..enum_variant_count(ei)
-        if enum_variant_discr(ei, vi) != vi as i64
+pub fn enum_discr_is_index(ctx: *ParseCtx, ei: i32) -> i32
+    for vi in 0..enum_variant_count(ctx, ei)
+        if enum_variant_discr(ctx, ei, vi) != vi as i64
             return 0
     return 1
 
@@ -10043,12 +9973,12 @@ pub fn enum_from_fn_name(name_sv: StrView, out_len: *i32) -> *u8
     return buf
 
 # Is `e` the method call `E.from(...)` on the bare name of an enum?
-pub fn is_enum_from_call(e: *Expr) -> i32
+pub fn is_enum_from_call(ctx: *ParseCtx, e: *Expr) -> i32
     if e.kind != ExprKind.Method or e.left == null or e.left.kind != ExprKind.Ident
         return 0
     if e.ident_len != 4 or memcmp(e.ident_ptr, c"from", 4) != 0
         return 0
-    if enum_find(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) < 0
+    if enum_find(ctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) < 0
         return 0
     return 1
 
@@ -10065,35 +9995,33 @@ pub fn is_enum_from_call(e: *Expr) -> i32
 # preceded by enough newlines that it starts on the enum's line.  The driver
 # parses it into the enum's module (main.ritz, add_enum_from_fns).
 
-var g_gen_buf: *u8 = null
-var g_gen_len: i64 = 0
-var g_gen_cap: i64 = 0
+# State: ParseCtx.gen_buf, .gen_len, .gen_cap
 
-fn gen_push(b: *u8, n: i64)
-    if g_gen_len + n + 1 > g_gen_cap
-        var cap: i64 = g_gen_cap * 2 + n + 256
-        g_gen_buf = realloc(g_gen_buf, cap)
-        g_gen_cap = cap
+fn gen_push(ctx: *ParseCtx, b: *u8, n: i64)
+    if ctx.gen_len + n + 1 > ctx.gen_cap
+        var cap: i64 = ctx.gen_cap * 2 + n + 256
+        ctx.gen_buf = realloc(ctx.gen_buf, cap)
+        ctx.gen_cap = cap
     for i in 0..n
-        *(g_gen_buf + g_gen_len + i) = *(b + i)
-    g_gen_len = g_gen_len + n
-    *(g_gen_buf + g_gen_len) = 0
+        *(ctx.gen_buf + ctx.gen_len + i) = *(b + i)
+    ctx.gen_len = ctx.gen_len + n
+    *(ctx.gen_buf + ctx.gen_len) = 0
 
-fn gen_cstr(c: *u8)
+fn gen_cstr(ctx: *ParseCtx, c: *u8)
     var n: i64 = 0
     while *(c + n) != 0
         n = n + 1
-    gen_push(c, n)
+    gen_push(ctx, c, n)
 
 # sign + 20 digits of a u64 + NUL (AGAST #1820: no magic alloc sizes).
 const I64_DEC_BUF: i64 = 24
 
 # The discriminant as a literal: decimal, or hex for a u64 >= 2^63.
-fn gen_discr(bits: i64, neg: i32)
+fn gen_discr(ctx: *ParseCtx, bits: i64, neg: i32)
     let digits: *u8 = malloc(I64_DEC_BUF)
     var n: i32 = 0
     if neg == 0 and bits < 0
-        gen_cstr(c"0x")
+        gen_cstr(ctx, c"0x")
         while n < 16
             let nib: i64 = (bits >> ((15 - n) * 4) as i64) & 15
             if nib < 10
@@ -10101,15 +10029,15 @@ fn gen_discr(bits: i64, neg: i32)
             else
                 *(digits + n) = (87 + nib) as u8
             n = n + 1
-        gen_push(digits, 16)
+        gen_push(ctx, digits, 16)
         free(digits)
         return
     var m: i64 = bits
     if neg == 1
-        gen_cstr(c"-")
+        gen_cstr(ctx, c"-")
         m = 0 - bits
         if m < 0
-            gen_cstr(c"9223372036854775808")
+            gen_cstr(ctx, c"9223372036854775808")
             free(digits)
             return
     while m > 0 or n == 0
@@ -10118,17 +10046,17 @@ fn gen_discr(bits: i64, neg: i32)
         n = n + 1
     var i: i32 = n - 1
     while i >= 0
-        gen_push(digits + i, 1)
+        gen_push(ctx, digits + i, 1)
         i = i - 1
     free(digits)
 
 # Source of `from` for every enum with a representation type in `m` (the
 # module just parsed), or null if there is none.  *out_len gets its length.
 # The buffer is the caller's to keep.
-pub fn enum_from_source(m: *Module, out_len: *i64) -> *u8
-    g_gen_buf = null
-    g_gen_len = 0
-    g_gen_cap = 0
+pub fn enum_from_source(ctx: *ParseCtx, m: *Module, out_len: *i64) -> *u8
+    ctx.gen_buf = null
+    ctx.gen_len = 0
+    ctx.gen_cap = 0
     var line: i32 = 1
     var e: *EnumDef = m.enums
     while e != null
@@ -10137,34 +10065,34 @@ pub fn enum_from_source(m: *Module, out_len: *i64) -> *u8
             let ename: *u8 = e.name
             let elen: i64 = e.name_len as i64
             while line < e.line
-                gen_cstr(c"\n")
+                gen_cstr(ctx, c"\n")
                 line = line + 1
             if e.is_pub == 1
-                gen_cstr(c"pub ")
-            gen_cstr(c"fn ")
-            gen_push(ename, elen)
-            gen_cstr(c"__from(v: ")
-            gen_cstr(primitive_name_from_type(repr))
-            gen_cstr(c") -> Option<")
-            gen_push(ename, elen)
-            gen_cstr(c">\n")
+                gen_cstr(ctx, c"pub ")
+            gen_cstr(ctx, c"fn ")
+            gen_push(ctx, ename, elen)
+            gen_cstr(ctx, c"__from(v: ")
+            gen_cstr(ctx, primitive_name_from_type(repr))
+            gen_cstr(ctx, c") -> Option<")
+            gen_push(ctx, ename, elen)
+            gen_cstr(ctx, c">\n")
             line = line + 1
             var v: *EnumVariant = e.variants
             while v != null
-                gen_cstr(c"    if v == ")
-                gen_discr(v.discr, v.discr_neg)
-                gen_cstr(c"\n        return Some(")
-                gen_push(ename, elen)
-                gen_cstr(c".")
-                gen_push(v.name, v.name_len as i64)
-                gen_cstr(c")\n")
+                gen_cstr(ctx, c"    if v == ")
+                gen_discr(ctx, v.discr, v.discr_neg)
+                gen_cstr(ctx, c"\n        return Some(")
+                gen_push(ctx, ename, elen)
+                gen_cstr(ctx, c".")
+                gen_push(ctx, v.name, v.name_len as i64)
+                gen_cstr(ctx, c")\n")
                 line = line + 2
                 v = v.next
-            gen_cstr(c"    return None\n")
+            gen_cstr(ctx, c"    return None\n")
             line = line + 1
         e = e.next
-    *out_len = g_gen_len
-    return g_gen_buf
+    *out_len = ctx.gen_len
+    return ctx.gen_buf
 
 # 1 when enum `a`'s name sorts before enum `b`'s (bytewise; a proper prefix
 # sorts first), else 0.
@@ -10217,7 +10145,7 @@ fn enum_variant_slot_node(e: *EnumDef, name_sv: StrView) -> i32
 # names the same two; declaration order differs between the compilers across
 # imports).  -1 when no enum declares the name.  Otherwise the enum index,
 # with *out_vi the variant's tag.
-pub fn enum_of_variant_unique(name_sv: StrView, out_vi: *i32, out_other: *i32) -> i32
+pub fn enum_of_variant_unique(ctx: *ParseCtx, name_sv: StrView, out_vi: *i32, out_other: *i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     *out_vi = 0 - 1
@@ -10228,7 +10156,7 @@ pub fn enum_of_variant_unique(name_sv: StrView, out_vi: *i32, out_other: *i32) -
     var lo_vi: i32 = 0 - 1
     var hi: *EnumDef = null
     var hi_i: i32 = 0 - 1
-    var e: *EnumDef = g_program_enums
+    var e: *EnumDef = ctx.program_enums
     var ei: i32 = 0
     while e != null
         if e.generic == 0
@@ -10417,8 +10345,8 @@ pub fn primitive_type_from_name(name_sv: StrView) -> TypeKind
 # `enum Slot<A, B>`'s parameters, read off the source after its name: the
 # grammar's action records the enum as generic but drops the list
 # (enum_def_header).  null when no `<...>` follows the name.
-pub fn generic_enum_params(ei: i32) -> *TypeParam
-    let e: *EnumDef = enum_node_at(ei)
+pub fn generic_enum_params(ctx: *ParseCtx, ei: i32) -> *TypeParam
+    let e: *EnumDef = enum_node_at(ctx, ei)
     if e == null
         return null
     let name: *u8 = e.name
@@ -10453,11 +10381,11 @@ pub fn generic_enum_params(ei: i32) -> *TypeParam
 
 # AGAST #3021: how many type parameters generic enum `ei` declares
 # (`enum Two<A, B>` 2), 0 for a concrete enum or an instance.
-pub fn enum_type_param_count(ei: i32) -> i32
-    if ei < 0 or enum_is_generic(ei) != 1
+pub fn enum_type_param_count(ctx: *ParseCtx, ei: i32) -> i32
+    if ei < 0 or enum_is_generic(ctx, ei) != 1
         return 0
     var n: i32 = 0
-    var tp: *TypeParam = generic_enum_params(ei)
+    var tp: *TypeParam = generic_enum_params(ctx, ei)
     while tp != null
         n = n + 1
         tp = tp.next
@@ -10468,13 +10396,13 @@ pub fn enum_type_param_count(ei: i32) -> i32
 # (#2039's ambiguity, reported where the constructor is emitted).  An instance
 # (ENUM_INSTANCE) declares nothing of its own, and an enum recorded twice
 # through an import cycle is one enum.
-pub fn generic_enum_of_variant(name_sv: StrView, out_vi: *i32) -> i32
+pub fn generic_enum_of_variant(ctx: *ParseCtx, name_sv: StrView, out_vi: *i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     *out_vi = 0 - 1
     var found: *EnumDef = null
     var found_i: i32 = 0 - 1
-    var e: *EnumDef = g_program_enums
+    var e: *EnumDef = ctx.program_enums
     var ei: i32 = 0
     while e != null
         if e.generic != ENUM_INSTANCE

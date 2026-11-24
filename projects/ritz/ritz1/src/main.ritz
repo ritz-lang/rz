@@ -172,7 +172,7 @@ fn tokenize(path: *u8, src_sv: StrView, tokens: *Vec<Token>) -> i32
 # Parser
 # =============================================================================
 
-fn parse_tokens(tokens: *Vec<Token>) -> *Module
+fn parse_tokens(ctx: *ParseCtx, tokens: *Vec<Token>) -> *Module
     var p: Parser
     # Arena for AST nodes, sized to the input (AGAST #1730).  A fixed 4 MB
     # was NOT plenty: ritz1's own emitter_stmt.ritz overran it, and with no
@@ -186,8 +186,8 @@ fn parse_tokens(tokens: *Vec<Token>) -> *Module
     if arena == null
         eprintln("Error: Failed to allocate parser arena")
         return null
-    parser_arena_set_cap(arena_bytes)
-    parser_init(@p, tokens.data, tokens.len as i32, arena)
+    parser_arena_set_cap(ctx, arena_bytes)
+    parser_init(@p, ctx, tokens.data, tokens.len as i32, arena)
 
     let m: *Module = parse_module(@p)
 
@@ -221,18 +221,18 @@ fn imports_option(m: *Module) -> i32
 # its source: ritz0 does the same (parser.py, _enum_from_fns).  Only for a
 # module that imports ritzlib.option; elsewhere `E.from` is a located error
 # (emit_expr_method).  Returns -1 on a lex/parse failure of the generated text.
-fn add_enum_from_fns(m: *Module, path: *u8) -> i32
+fn add_enum_from_fns(ctx: *ParseCtx, m: *Module, path: *u8) -> i32
     if imports_option(m) == 0
         return 0
     var gen_len: i64 = 0
-    let gen: *u8 = enum_from_source(m, @gen_len)
+    let gen: *u8 = enum_from_source(ctx, m, @gen_len)
     if gen == null or gen_len == 0
         return 0
     var tokens: Vec<Token> = vec_with_cap<Token>(1024)
     if tokenize(path, StrView { ptr: (gen), len: (gen_len) }, @tokens) > 0
         err2("Lexer errors in the generated from() of: ", path)
         return -1
-    let gm: *Module = parse_tokens(@tokens)
+    let gm: *Module = parse_tokens(ctx, @tokens)
     if gm == null
         err2("Parse error in the generated from() of: ", path)
         return -1
@@ -262,13 +262,13 @@ var g_test_table: i32 = 0
 # local and go through every later pass like any other.  An async main is
 # left to async_lower, which gives it its own synchronous wrapper.  Returns
 # -1 on an error (already reported); the module is unchanged then.
-fn lower_main(m: *Module, path: *u8) -> i32
+fn lower_main(ctx: *ParseCtx, m: *Module, path: *u8) -> i32
     if g_test_table == 1
         return 0
     let f: *FnDef = main_abi_find(m)
     if f == null or f.is_async == 1
         return 0
-    if main_abi_check(f, path) > 0
+    if main_abi_check(ctx, f, path) > 0
         return -1
     if main_abi_needs_adapter(f) == 0
         return 0
@@ -280,7 +280,7 @@ fn lower_main(m: *Module, path: *u8) -> i32
     if tokenize(path, StrView { ptr: (gen), len: (gen_len) }, @tokens) > 0
         err2("Lexer errors in the generated main adapter of: ", path)
         return -1
-    let gm: *Module = parse_tokens(@tokens)
+    let gm: *Module = parse_tokens(ctx, @tokens)
     if gm == null
         err2("Parse error in the generated main adapter of: ", path)
         return -1
@@ -1121,7 +1121,7 @@ fn iface_fix_extern_decls(m: *Module, text_sv: StrView, src_sv: StrView)
 # there is one, else its source.  Returns a parsed Module, or null on any
 # failure (already reported to stderr).  Steals the buffers' data to keep
 # the AST-pointed-into bytes alive via keep_source_alive().
-fn load_and_parse(path: @&String) -> *Module
+fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
     let path_ptr: *u8 = path.as_ptr()
     var src: Vec<u8> = read_file(path_ptr)
     if src.len == 0
@@ -1149,8 +1149,8 @@ fn load_and_parse(path: @&String) -> *Module
         made_ok = true
 
     # Name the file in parse diagnostics (AGAST #1301).
-    parser_set_source_file(path_ptr)
-    let mod: *Module = parse_tokens(@tokens)
+    parser_set_source_file(ctx, path_ptr)
+    let mod: *Module = parse_tokens(ctx, @tokens)
     if mod == null
         err2("Parse error in: ", path_ptr)
         return null
@@ -1168,7 +1168,7 @@ fn load_and_parse(path: @&String) -> *Module
         if iface_text_store(StrView { ptr: (src.data), len: (src.len - 1) }, StrView { ptr: (made.data), len: (made.len) }) == 0
             dep_buf = made.data
             dep_len = made.len
-    if add_enum_from_fns(mod, path_ptr) < 0
+    if add_enum_from_fns(ctx, mod, path_ptr) < 0
         return null
 
     dep_record_note(path_ptr, StrView { ptr: (dep_buf), len: (dep_len) })
@@ -1208,8 +1208,8 @@ fn load_and_parse(path: @&String) -> *Module
 # declaration-only `fn ... = extern` too (#1900).  Non-null on purpose:
 # `body == null` means `extern fn`.
 
-fn strip_to_interface(m: *Module)
-    let body: *Stmt = stripped_body()
+fn strip_to_interface(ctx: *ParseCtx, m: *Module)
+    let body: *Stmt = stripped_body(ctx)
     var f: *FnDef = m.functions
     while f != null
         # An async fn keeps its body, as in ritz0: the importer builds its
@@ -1217,7 +1217,7 @@ fn strip_to_interface(m: *Module)
         # A pub [[inline]] fn keeps its body too, as in the interface text:
         # an eligible one the importer defines available_externally, so -O2
         # can inline it (fn_inline_kept, fn_inline_import; AGAST #3585).
-        if f.type_params == null and f.body != null and f.is_async == 0 and fn_inline_kept(f) == 0
+        if f.type_params == null and f.body != null and f.is_async == 0 and fn_inline_kept(ctx, f) == 0
             f.body = body
         f = f.next
     var ib: *ImplBlock = m.impls
@@ -1232,7 +1232,7 @@ fn strip_to_interface(m: *Module)
 
 # Resolve imports recursively, merging into the main module.
 # `m_path` is m's own file (AGAST #2148: check_fn_conflicts' ordering).
-fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrView) -> i32
+fn resolve_imports(ctx: *ParseCtx, m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrView) -> i32
     var m_key: String = import_key(m_path)
     let vm: *VisMod = vis_module(m_key.as_ptr())
     var imp: *ImportDecl = m.imports
@@ -1256,16 +1256,16 @@ fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrV
             continue
         mark_import_processed(key)
 
-        let decl_mark: i32 = type_decl_log_count()   # AGAST #3907
-        let trait_mark: i32 = trait_declared_count()   # AGAST #3467
-        let gated_mark: i32 = gated_decl_count()
-        let import_module: *Module = load_and_parse(@&path)
+        let decl_mark: i32 = type_decl_log_count(ctx)   # AGAST #3907
+        let trait_mark: i32 = trait_declared_count(ctx)   # AGAST #3467
+        let gated_mark: i32 = gated_decl_count(ctx)
+        let import_module: *Module = load_and_parse(ctx, @&path)
         if import_module == null
             return -1
-        strip_to_interface(import_module)
+        strip_to_interface(ctx, import_module)
         vis_names(import_vm, import_module)   # before its imports merge in
-        vis_type_names(import_vm, decl_mark)   # its enums and aliases
-        vis_r54_names(import_vm, trait_mark, gated_mark)   # R54's extra names
+        vis_type_names(ctx, import_vm, decl_mark)   # its enums and aliases
+        vis_r54_names(ctx, import_vm, trait_mark, gated_mark)   # R54's extra names
         if check_fn_dups_in_file(import_module) < 0
             return -1
 
@@ -1282,7 +1282,7 @@ fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrV
         # special-cases ritzlib.* and skips source_dir for those, so
         # they continue to flow through RITZ_PATH.
         let child_dir: StrView = path_dir(path.as_ptr())
-        let res: i32 = resolve_imports(import_module, path.as_ptr(), child_dir, ritz_path)
+        let res: i32 = resolve_imports(ctx, import_module, path.as_ptr(), child_dir, ritz_path)
         if res < 0
             return -1
 
@@ -1561,18 +1561,18 @@ fn print_usage()
 # Parse the main file's tokens, mark its fns local, and resolve (parse and
 # merge) its imports.  Returns null on any failure (already reported).
 # Called twice when the first pass records a type alias (AGAST #1475).
-fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz_path: StrView) -> *Module
+fn parse_program(ctx: *ParseCtx, tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz_path: StrView) -> *Module
     # Parse
-    parser_set_source_file(input_path)
-    let decl_mark: i32 = type_decl_log_count()   # AGAST #3907
-    let alias_mark: i32 = alias_use_count()
-    let m: *Module = parse_tokens(tokens)
-    vis_alias_uses_set(alias_mark, alias_use_count())
+    parser_set_source_file(ctx, input_path)
+    let decl_mark: i32 = type_decl_log_count(ctx)   # AGAST #3907
+    let alias_mark: i32 = alias_use_count(ctx)
+    let m: *Module = parse_tokens(ctx, tokens)
+    vis_alias_uses_set(alias_mark, alias_use_count(ctx))
     if m == null
         return null
-    if add_enum_from_fns(m, input_path) < 0
+    if add_enum_from_fns(ctx, m, input_path) < 0
         return null
-    if lower_main(m, input_path) < 0
+    if lower_main(ctx, m, input_path) < 0
         return null
     if check_fn_dups_in_file(m) < 0
         return null
@@ -1587,14 +1587,14 @@ fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz
     # object: it stays is_local=0 and is declared as an import is.
     var local_fn: *FnDef = m.functions
     while local_fn != null
-        if fn_is_decl(local_fn) == 0
+        if fn_is_decl(ctx, local_fn) == 0
             local_fn.is_local = 1
         local_fn = local_fn.next
     var local_ib: *ImplBlock = m.impls
     while local_ib != null
         var local_method: *FnDef = local_ib.methods
         while local_method != null
-            if fn_is_decl(local_method) == 0
+            if fn_is_decl(ctx, local_method) == 0
                 local_method.is_local = 1
             local_method = local_method.next
         local_ib = local_ib.next
@@ -1607,9 +1607,9 @@ fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz
     let main_vm: *VisMod = vis_module(main_key.as_ptr())
     vis_edges_reset(main_vm)   # a second pass lists its imports afresh
     vis_names(main_vm, m)   # AGAST #3891: before its imports merge in
-    vis_type_names(main_vm, decl_mark)   # AGAST #3907: its enums and aliases
+    vis_type_names(ctx, main_vm, decl_mark)   # AGAST #3907: its enums and aliases
     mark_import_processed(import_key(input_path))
-    if resolve_imports(m, input_path, source_dir, ritz_path) < 0
+    if resolve_imports(ctx, m, input_path, source_dir, ritz_path) < 0
         eprintln("Error: Import resolution failed")
         return null
     keep_one_fn(m)   # AGAST #1858: one of each name the input sees
@@ -1632,12 +1632,13 @@ fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz
 # =============================================================================
 
 fn main(argc: i32, argv: **u8) -> i32
+    let ctx: *ParseCtx = parse_ctx_new()   # AGAST #4623: the compile's parse state
     let args: CliArgs = parse_cli(argc, argv)
     if args.input_path == null
         print_usage()
         return 1
-    set_target_os(StrView { ptr: (args.target_os.ptr), len: (args.target_os.len as i32) as i64 })
-    set_target_arch(StrView { ptr: (args.target_arch.ptr), len: (args.target_arch.len as i32) as i64 })
+    set_target_os(ctx, StrView { ptr: (args.target_os.ptr), len: (args.target_os.len as i32) as i64 })
+    set_target_arch(ctx, StrView { ptr: (args.target_arch.ptr), len: (args.target_arch.len as i32) as i64 })
     # Cached IR depends on the compiler, the target OS, the target arch and
     # the import roots (see cache_fingerprint in fn_cache.ritz).
     g_dep_ptr = args.deps_ptr
@@ -1704,7 +1705,7 @@ fn main(argc: i32, argv: **u8) -> i32
 
     # Parse this file and everything it imports.
     let parse_start: i64 = if parse_only == 1 then now_nanos() else 0
-    var m: *Module = parse_program(@tokens, args.input_path, source_dir, ritz_path)
+    var m: *Module = parse_program(ctx, @tokens, args.input_path, source_dir, ritz_path)
     if m == null
         return 1
 
@@ -1717,21 +1718,21 @@ fn main(argc: i32, argv: **u8) -> i32
     # AGAST #2167: likewise an array length naming a const the first pass
     # hadn't parsed yet (imported, or declared later): the second pass folds
     # it against every const the first one merged.
-    if type_alias_count() > 0 or array_len_pending() > 0
-        array_len_seed(m.constants)
+    if type_alias_count(ctx) > 0 or array_len_pending(ctx) > 0
+        array_len_seed(ctx, m.constants)
         processed_vec().clear()
         dep_record_reset()
-        enum_program_reset()
-        tuple_regs_reset()   # AGAST #3030
-        tn_notes_reset()     # AGAST #4021
-        test_fns_reset()
+        enum_program_reset(ctx)
+        tuple_regs_reset(ctx)   # AGAST #3030
+        tn_notes_reset(ctx)     # AGAST #4021
+        test_fns_reset(ctx)
         struct_variants_reset()
-        named_forms_reset()   # AGAST #4187
+        named_forms_reset(ctx)   # AGAST #4187
         # Fresh views: ritz0's move checker treats StrView as move-only
         # (AGAST #1489), so the first pass's copies can't be passed again.
         let source_dir2: StrView = path_dir(args.input_path)
         let ritz_path2: StrView = normalize_ritz_path(args.ritz_path)
-        m = parse_program(@tokens, args.input_path, source_dir2, ritz_path2)
+        m = parse_program(ctx, @tokens, args.input_path, source_dir2, ritz_path2)
         if m == null
             return 1
     let parse_end: i64 = if parse_only == 1 then now_nanos() else 0
@@ -1752,11 +1753,11 @@ fn main(argc: i32, argv: **u8) -> i32
     # AGAST #3994: the program's enum nodes are the merged Module.enums; the
     # accessors every later pass calls (sema, emitter, monomorph) index that
     # root.  Set it before the first reader (named_variants_resolve).
-    enum_program_set(m)
+    enum_program_set(ctx, m)
 
     # `V { b, a } =>` and `V { a: 1, b: 2 }` -> their positional forms
     # (AGAST #4187), before any pass reads a pattern or a literal.
-    if named_variants_resolve(m) > 0
+    if named_variants_resolve(ctx, m) > 0
         return 1
 
     # Test mode (LANGUAGE_SPEC §17.1): ritzunit supplies `main`, so the
@@ -1767,14 +1768,14 @@ fn main(argc: i32, argv: **u8) -> i32
 
     # An `impl` on a built-in type no module declares (AGAST #3162): before
     # the template below makes `Span` look declared.
-    if refuse_impls_on_builtin_types(m, args.input_path) > 0
+    if refuse_impls_on_builtin_types(ctx, m, args.input_path) > 0
         return 1
     # ...or on a type nothing declares or imports (AGAST #3264).
-    if refuse_impls_on_unknown_types(m, args.input_path) > 0
+    if refuse_impls_on_unknown_types(ctx, m, args.input_path) > 0
         return 1
     # ...or outside its type's (or trait's) file, or on one instantiation
     # (LARB R65, AGAST #3494).
-    if refuse_misplaced_impls(m, args.input_path) > 0
+    if refuse_misplaced_impls(ctx, m, args.input_path) > 0
         return 1
 
     # `Span<T>` without `import ritzlib.span` (AGAST #3127): before anything
@@ -1783,7 +1784,7 @@ fn main(argc: i32, argv: **u8) -> i32
 
     # A local named like a const, global or variant (AGAST #2407).  Before
     # monomorphisation, so a generic fn is judged once, used or not.
-    if binder_check_module(m, args.input_path) > 0
+    if binder_check_module(ctx, m, args.input_path) > 0
         return 1
 
     # `async fn` / `await` become ritz0's state machine (AGAST #3814), once,
@@ -1796,7 +1797,7 @@ fn main(argc: i32, argv: **u8) -> i32
 
     # A written type name that names nothing (AGAST #3932): it emitted `%Nope`
     # IR clang refused, unlocated.  Before monomorphisation, as binder_check.
-    if refuse_unknown_type_names(m) > 0
+    if refuse_unknown_type_names(ctx, m) > 0
         return 1
 
     # A statement that can never run (AGAST #2520, LARB): before
@@ -1811,7 +1812,7 @@ fn main(argc: i32, argv: **u8) -> i32
     # #1982), so monomorph sees it as the spelled-out `f<T>(args)`.
     # Monomorphisation's tables, from generic inference through emission
     # (AGAST #4454: they were module globals).
-    let mono: *MonoCtx = mono_ctx_new()
+    let mono: *MonoCtx = mono_ctx_new(ctx)
     if infer_generic_calls(mono, m, args.input_path) > 0
         return 1
     struct_index_set_file(args.input_path)

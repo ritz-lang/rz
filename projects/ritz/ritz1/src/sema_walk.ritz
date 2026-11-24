@@ -128,7 +128,7 @@ fn sema_vis_alias_uses(sm: *Sema)
     while i < end
         var len: i32 = 0
         var span: SrcSpan
-        let name: *u8 = alias_use_at(i, @len, @span)
+        let name: *u8 = alias_use_at(sm.pctx, i, @len, @span)
         sema_vis_report(sm, span.line, span.col, StrView { ptr: (name), len: (len) as i64 })
         i = i + 1
 
@@ -183,7 +183,7 @@ fn sema_bind_arm_name(sm: *Sema, arm: *MatchArm, scrut: *Expr)
         var t: SemaTy
         if sema_expr_ty(sm, scrut, @t) == TypeKind.Struct and t.name != null and t.name_len > 0
             let tn: StrView = StrView { ptr: (t.name), len: (t.name_len) as i64 }
-            if (user_enum_index(tn) >= 0 or is_tagged_enum_type(tn) == 1) and arm_binds_enum_value(arm, tn) == 1
+            if (user_enum_index(sm.pctx, tn) >= 0 or is_tagged_enum_type(tn) == 1) and arm_binds_enum_value(sm.pctx, arm, tn) == 1
                 sema_bind_ty(sm, name, @t, 0)
                 return
     sema_bind(sm, name)
@@ -866,7 +866,7 @@ fn sema_enum_as_int(sm: *Sema, st: *Stmt, first: *Stmt)
         enum_as_int_stmt(sm, st, sm.cur_fn.return_type)
 
 fn sema_walk_fn(sm: *Sema, f: *FnDef)
-    if f.body == null or fn_is_naked(f) == 1
+    if f.body == null or fn_is_naked(sm.pctx, f) == 1
         return
     sm.scope_top = 0
     sm.cur_fn = f
@@ -926,8 +926,8 @@ fn fv_named_future(name: *u8, len: i32) -> i32
         return 0
     name_eq(StrView { ptr: (name), len: (6) as i64 }, StrView { ptr: (c"Future"), len: (6) as i64 })
 
-fn fv_error(name: *u8) -> i32
-    let at: *TypeNameAt = type_name_written_at(name)
+fn fv_error(ctx: *ParseCtx, name: *u8) -> i32
+    let at: *TypeNameAt = type_name_written_at(ctx, name)
     if at == null or at.reported == 1
         return 0
     at.reported = 1
@@ -935,7 +935,7 @@ fn fv_error(name: *u8) -> i32
     1
 
 # 1 when `ty` (a `TypeKind.Array` of `elem`) is `Future` by value, refused.
-fn fv_slot(ty: TypeKind, elem: TypeKind, name: *u8, len: i32) -> i32
+fn fv_slot(ctx: *ParseCtx, ty: TypeKind, elem: TypeKind, name: *u8, len: i32) -> i32
     var by_value: i32 = 0
     if ty == TypeKind.Struct
         by_value = 1
@@ -943,68 +943,68 @@ fn fv_slot(ty: TypeKind, elem: TypeKind, name: *u8, len: i32) -> i32
         by_value = 1
     if by_value == 0 or fv_named_future(name, len) == 0
         return 0
-    fv_error(name)
+    fv_error(ctx, name)
 
-fn fv_stmts(s: *Stmt) -> i32
+fn fv_stmts(ctx: *ParseCtx, s: *Stmt) -> i32
     var n: i32 = 0
     var cur: *Stmt = s
     while cur != null
         let k: StmtKind = cur.kind
         match k
             StmtKind.VarDecl =>
-                n = n + fv_slot(cur.var_type, cur.var_array_elem_type, cur.var_type_name, cur.var_type_name_len)
+                n = n + fv_slot(ctx, cur.var_type, cur.var_array_elem_type, cur.var_type_name, cur.var_type_name_len)
                 if cur.var_array != null
-                    n = n + fv_slot(cur.var_type, cur.var_array.elem, cur.var_array.name, cur.var_array.name_len)
+                    n = n + fv_slot(ctx, cur.var_type, cur.var_array.elem, cur.var_array.name, cur.var_array.name_len)
             StmtKind.If =>
-                n = n + fv_stmts(cur.if_then)
-                n = n + fv_stmts(cur.if_else)
+                n = n + fv_stmts(ctx, cur.if_then)
+                n = n + fv_stmts(ctx, cur.if_else)
             StmtKind.While | StmtKind.Loop | StmtKind.Defer | StmtKind.Unsafe =>
-                n = n + fv_stmts(cur.while_body)
+                n = n + fv_stmts(ctx, cur.while_body)
             StmtKind.For =>
-                n = n + fv_stmts(cur.for_body)
+                n = n + fv_stmts(ctx, cur.for_body)
             StmtKind.Match =>
                 var arm: *MatchArm = cur.if_then as *MatchArm
                 while arm != null
-                    n = n + fv_stmts(arm.body_stmts)
+                    n = n + fv_stmts(ctx, arm.body_stmts)
                     arm = arm.next
             _ => pass
         cur = cur.next
     n
 
-fn fv_fn(f: *FnDef) -> i32
-    var n: i32 = fv_slot(f.return_type, TypeKind.Void, f.return_type_name, f.return_type_name_len)
+fn fv_fn(ctx: *ParseCtx, f: *FnDef) -> i32
+    var n: i32 = fv_slot(ctx, f.return_type, TypeKind.Void, f.return_type_name, f.return_type_name_len)
     if f.ret_array_param != null
-        n = n + fv_slot(TypeKind.Array, f.ret_array_param.param_array_elem_type, f.ret_array_param.param_type_name, f.ret_array_param.param_type_name_len)
+        n = n + fv_slot(ctx, TypeKind.Array, f.ret_array_param.param_array_elem_type, f.ret_array_param.param_type_name, f.ret_array_param.param_type_name_len)
     var p: *Param = f.params
     while p != null
-        n = n + fv_slot(p.param_type, p.param_array_elem_type, p.param_type_name, p.param_type_name_len)
+        n = n + fv_slot(ctx, p.param_type, p.param_array_elem_type, p.param_type_name, p.param_type_name_len)
         p = p.next
-    n + fv_stmts(f.body)
+    n + fv_stmts(ctx, f.body)
 
-fn fv_module(m: *Module) -> i32
+fn fv_module(ctx: *ParseCtx, m: *Module) -> i32
     var n: i32 = 0
     var st: *StructDef = m.structs
     while st != null
         var fld: *StructField = st.fields
         while fld != null
-            n = n + fv_slot(fld.field_type, fld.array_elem_type, fld.field_type_name, fld.field_type_name_len)
-            n = n + fv_slot(TypeKind.Array, fld.array_elem_type, fld.array_elem_type_name, fld.array_elem_type_name_len)
+            n = n + fv_slot(ctx, fld.field_type, fld.array_elem_type, fld.field_type_name, fld.field_type_name_len)
+            n = n + fv_slot(ctx, TypeKind.Array, fld.array_elem_type, fld.array_elem_type_name, fld.array_elem_type_name_len)
             fld = fld.next
         st = st.next
     var g: *GlobalVarDef = m.globals
     while g != null
-        n = n + fv_slot(g.var_type, g.array_elem_type, g.type_name, g.type_name_len)
-        n = n + fv_slot(TypeKind.Array, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
+        n = n + fv_slot(ctx, g.var_type, g.array_elem_type, g.type_name, g.type_name_len)
+        n = n + fv_slot(ctx, TypeKind.Array, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
         g = g.next
     var f: *FnDef = m.functions
     while f != null
-        n = n + fv_fn(f)
+        n = n + fv_fn(ctx, f)
         f = f.next
     var ib: *ImplBlock = m.impls
     while ib != null
         var method: *FnDef = ib.methods
         while method != null
-            n = n + fv_fn(method)
+            n = n + fv_fn(ctx, method)
             method = method.next
         ib = ib.next
     n
@@ -1013,7 +1013,7 @@ fn fv_module(m: *Module) -> i32
 # errors it reported; main stops the compile on any.
 pub fn sema_check_module(mono: *MonoCtx, m: *Module, path: *u8) -> i32
     let sm: *Sema = malloc(sizeof(Sema)) as *Sema
-    sema_init(sm, m, path)
+    sema_init(mono.pctx, sm, m, path)
     deref_impls_check(sm)   # AGAST #3015: a `DerefMut` impl needs its `Deref`
 
     trait_bound_check(mono, sm)   # AGAST #3469: `<T: A + B>`, at each instance
@@ -1026,7 +1026,7 @@ pub fn sema_check_module(mono: *MonoCtx, m: *Module, path: *u8) -> i32
 
     sema_vis_alias_uses(sm)  # AGAST #3907
 
-    sm.error_count = sm.error_count + fv_module(m)   # LARB R79 / AGAST #4007
+    sm.error_count = sm.error_count + fv_module(mono.pctx, m)   # LARB R79 / AGAST #4007
 
     var seen: HashMapI64 = hashmap_i64_with_cap(4096)
     var f: *FnDef = m.functions

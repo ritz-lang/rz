@@ -21,11 +21,11 @@ pytestmark = pytest.mark.unit
 SRC = Path(__file__).resolve().parent.parent / "ritz1" / "src"
 
 # Column-0 `var`s across ritz1/src.  317 on #4454's base; monomorph's 50 went
-# into MonoCtx.
-BUDGET = 267
+# into MonoCtx, ast_helpers' 86 into ParseCtx (#4623).
+BUDGET = 181
 
 # Files whose state is a ctx struct: no module `var` at all.
-CONVERTED = ("monomorph.ritz",)
+CONVERTED = ("monomorph.ritz", "ast_helpers.ritz")
 
 VAR = re.compile(r"^var ", re.M)
 

@@ -108,7 +108,7 @@ fn fs_push(t: *FsTy, k: TypeKind)
 
 # A struct name ritz0 spells the same: not a mangled generic instance
 # (`Box$u8`), and not an alias, which ritz0 resolves first.
-fn fs_name_ok(name_sv: StrView) -> i32
+fn fs_name_ok(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if name == null or len <= 0
@@ -119,17 +119,17 @@ fn fs_name_ok(name_sv: StrView) -> i32
             return 0
         i = i + 1
     var alias_len: i32 = 0
-    if type_alias_target_spelling(StrView { ptr: (name), len: (len) as i64 }, @alias_len) != null
+    if type_alias_target_spelling(ctx, StrView { ptr: (name), len: (len) as i64 }, @alias_len) != null
         return 0
     1
 
 # The base `kind` (a primitive, or a struct `name`).
-fn fs_base(t: *FsTy, kind: TypeKind, name_sv: StrView)
+fn fs_base(ctx: *ParseCtx, t: *FsTy, kind: TypeKind, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if fs_prim(kind) == 1
         t.base = kind
-    else if kind == TypeKind.Struct and fs_name_ok(StrView { ptr: (name), len: (len) as i64 }) == 1
+    else if kind == TypeKind.Struct and fs_name_ok(ctx, StrView { ptr: (name), len: (len) as i64 }) == 1
         t.base = TypeKind.Struct
         t.name = name
         t.name_len = len
@@ -137,7 +137,7 @@ fn fs_base(t: *FsTy, kind: TypeKind, name_sv: StrView)
         t.ok = 0
 
 # A 1-D `[size]E`, E a primitive or struct (`name`), or a `*U` (`elem_pointee`).
-fn fs_array(t: *FsTy, size: i32, elem_kind: TypeKind, name_sv: StrView, elem_pointee: TypeKind, shape: *ArrayShape)
+fn fs_array(ctx: *ParseCtx, t: *FsTy, size: i32, elem_kind: TypeKind, name_sv: StrView, elem_pointee: TypeKind, shape: *ArrayShape)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if shape != null or size <= 0
@@ -148,18 +148,18 @@ fn fs_array(t: *FsTy, size: i32, elem_kind: TypeKind, name_sv: StrView, elem_poi
     let el: *FsTy = fs_new()
     if elem_kind == TypeKind.Ptr
         fs_push(el, TypeKind.Ptr)
-        fs_base(el, elem_pointee, StrView { ptr: (name), len: (len) as i64 })
+        fs_base(ctx, el, elem_pointee, StrView { ptr: (name), len: (len) as i64 })
     else
-        fs_base(el, elem_kind, StrView { ptr: (name), len: (len) as i64 })
+        fs_base(ctx, el, elem_kind, StrView { ptr: (name), len: (len) as i64 })
     t.elem = el
     if el.ok == 0
         t.ok = 0
 
 # What a one-level pointer / reference param `p` of kind `k` points at.
-fn fs_pointee(t: *FsTy, p: *Param, k: TypeKind)
+fn fs_pointee(ctx: *ParseCtx, t: *FsTy, p: *Param, k: TypeKind)
     let pt: TypeKind = p.param_pointee_type
     if pt == TypeKind.Array
-        fs_array(t, p.param_pointee_array_size, p.param_pointee_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, p.param_pointee_array_elem_pointee, p.param_pointee_array_shape)
+        fs_array(ctx, t, p.param_pointee_array_size, p.param_pointee_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, p.param_pointee_array_elem_pointee, p.param_pointee_array_shape)
     else if pt == TypeKind.Ptr and k != TypeKind.Ptr
         # `@*U` / `@&*U` / `:& *U`; `@@U` is held as an `@*U` (INNER_REF_*)
         var lk: TypeKind = TypeKind.Ptr
@@ -168,18 +168,18 @@ fn fs_pointee(t: *FsTy, p: *Param, k: TypeKind)
         else if p.is_borrow == 0 and p.param_inner_ref == INNER_REF_MUT
             lk = TypeKind.MutRef
         fs_push(t, lk)
-        fs_base(t, p.param_ref_ptr_pointee, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+        fs_base(ctx, t, p.param_ref_ptr_pointee, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
     else
-        fs_base(t, pt, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+        fs_base(ctx, t, pt, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
 
 # The type param `p` declares.
-fn fs_param(p: *Param, t: *FsTy)
+fn fs_param(ctx: *ParseCtx, p: *Param, t: *FsTy)
     fs_clear(t)
     let k: TypeKind = p.param_type
     if fs_prim(k) == 1 or k == TypeKind.Struct
-        fs_base(t, k, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+        fs_base(ctx, t, k, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
     else if k == TypeKind.Array
-        fs_array(t, p.param_array_size, p.param_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, p.param_array_elem_pointee, p.param_array_shape)
+        fs_array(ctx, t, p.param_array_size, p.param_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, p.param_array_elem_pointee, p.param_array_shape)
     else if k == TypeKind.Ptr and p.fn_sig != null
         t.base = TypeKind.FnSig
         t.sig = p.fn_sig
@@ -187,7 +187,7 @@ fn fs_param(p: *Param, t: *FsTy)
         match k
             TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
                 fs_push(t, k)
-                fs_pointee(t, p, k)
+                fs_pointee(ctx, t, p, k)
             TypeKind.PtrPtr =>
                 let slot: i32 = p.param_inner_pointee_type
                 let levels: i32 = ptr_ptr_slot_levels(slot)
@@ -198,7 +198,7 @@ fn fs_param(p: *Param, t: *FsTy)
                 while i < levels
                     fs_push(t, TypeKind.Ptr)
                     i = i + 1
-                fs_base(t, ptr_ptr_slot_inner(slot), StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+                fs_base(ctx, t, ptr_ptr_slot_inner(slot), StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
             _ =>
                 t.ok = 0
     if p.is_borrow == 1 or p.is_self_borrow == 1
@@ -221,11 +221,11 @@ fn fs_ret(sm: *Sema, fd: *FnDef, t: *FsTy)
         t.base = TypeKind.FnSig
         t.sig = fd.ret_fn_sig
     else if fd.ret_ref != null
-        fs_param(fd.ret_ref, t)
+        fs_param(sm.pctx, fd.ret_ref, t)
     else if fd.ret_ptr_array != null
-        fs_param(fd.ret_ptr_array, t)
+        fs_param(sm.pctx, fd.ret_ptr_array, t)
     else if fd.ret_array_param != null
-        fs_param(fd.ret_array_param, t)
+        fs_param(sm.pctx, fd.ret_array_param, t)
     else
         match rt
             TypeKind.Void =>
@@ -238,11 +238,11 @@ fn fs_ret(sm: *Sema, fd: *FnDef, t: *FsTy)
                 if pt != TypeKind.Void
                     t.base = pt
                 else if sema_find_struct(sm, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) != null
-                    fs_base(t, TypeKind.Struct, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
+                    fs_base(sm.pctx, t, TypeKind.Struct, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
                 else
                     t.ok = 0
             _ =>
-                fs_base(t, rt, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
+                fs_base(sm.pctx, t, rt, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 })
 
 # 1 when every part of `t` decoded, nested signatures too.
 fn fs_ok(sm: *Sema, t: *FsTy) -> i32
@@ -263,7 +263,7 @@ fn fs_sig_ok(sm: *Sema, fd: *FnDef) -> i32
     var p: *Param = fd.params
     while p != null
         var t: FsTy
-        fs_param(p, @t)
+        fs_param(sm.pctx, p, @t)
         if fs_ok(sm, @t) == 0
             return 0
         p = p.next
@@ -352,8 +352,8 @@ fn fs_sig_fits(sm: *Sema, a: *FnDef, e: *FnDef) -> i32
     while pa != null and pe != null
         var x: FsTy
         var y: FsTy
-        fs_param(pa, @x)
-        fs_param(pe, @y)
+        fs_param(sm.pctx, pa, @x)
+        fs_param(sm.pctx, pe, @y)
         var fits: i32 = (fs_compat(sm, @x, 0, @y, 0) == 1 and fs_agree(@x, 0, @y, 0) == 1) as i32
         # A `name:& T` param is physically a `*T` (AGAST #3034).
         if fits == 0 and x.lent == 1 and y.n > 0
@@ -404,7 +404,7 @@ fn fs_print_sig(sm: *Sema, fd: *FnDef)
     var p: *Param = fd.params
     while p != null
         var t: FsTy
-        fs_param(p, @t)
+        fs_param(sm.pctx, p, @t)
         fs_print(sm, @t)
         if p.next != null
             eprints_cstr(c", ")

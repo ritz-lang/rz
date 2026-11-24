@@ -983,7 +983,7 @@ fn rv_into_variant(sm: *Sema, e: *Expr, slot: *RefTy)
     else if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"Some"), len: (4) as i64 }) == 0 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"Ok"), len: (2) as i64 }) == 0
         return
     var len: i32 = 0
-    let name: *u8 = tagged_enum_arg_in(@sm.struct_map, sm.module, StrView { ptr: (slot.name), len: (slot.name_len) as i64 }, variant, @len)
+    let name: *u8 = tagged_enum_arg_in(sm.pctx, @sm.struct_map, sm.module, StrView { ptr: (slot.name), len: (slot.name_len) as i64 }, variant, @len)
     if name == null
         return
     var part: RefTy
@@ -1159,7 +1159,7 @@ fn rv_check_fill(sm: *Sema, e: *Expr)
             return
         name = t.name
         len = t.name_len
-    if len == 0 or own_type_is_move_only_in(sm.module, @sm.struct_map, StrView { ptr: (name), len: (len) as i64 }) == 0
+    if len == 0 or own_type_is_move_only_in(sm.pctx, sm.module, @sm.struct_map, StrView { ptr: (name), len: (len) as i64 }) == 0
         return
     rv_error_at(sm, e, c"`[v; n]` copies `v` into every element: a move-only value fills one, `[v; 1]`\n")
 
@@ -1192,7 +1192,7 @@ fn rv_cast_value_to_ref(sm: *Sema, e: *Expr)
 fn rv_cast_move_only(sm: *Sema, e: *Expr)
     if e.type_kind != TypeKind.Struct or e.ident_len == 0
         return
-    if own_type_is_move_only_in(sm.module, @sm.struct_map, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0
+    if own_type_is_move_only_in(sm.pctx, sm.module, @sm.struct_map, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0
         return
     var target: RefTy
     ref_set(@target, TypeKind.Struct, TypeKind.Void, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
@@ -1257,12 +1257,12 @@ fn rv_named_holds_ptr(sm: *Sema, name_sv: StrView, depth: i32) -> i32
     let st: *StructDef = sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 })
     if st != null
         return rv_fields_hold_ptr(sm, st.fields, depth + 1)
-    let ei: i32 = user_enum_index(StrView { ptr: (name), len: (len) as i64 })
+    let ei: i32 = user_enum_index(sm.pctx, StrView { ptr: (name), len: (len) as i64 })
     if ei < 0
         return 0
     var vi: i32 = 0
-    while vi < enum_variant_count(ei)
-        if rv_fields_hold_ptr(sm, enum_variant_fields(ei, vi), depth + 1) == 1
+    while vi < enum_variant_count(sm.pctx, ei)
+        if rv_fields_hold_ptr(sm, enum_variant_fields(sm.pctx, ei, vi), depth + 1) == 1
             return 1
         vi += 1
     0
@@ -1325,7 +1325,7 @@ fn rv_walk_list(sm: *Sema, a0: *Expr)
 # A variant's payload, into its fields' slots.
 fn rv_payload(sm: *Sema, a0: *Expr, ei: i32, vi: i32)
     var a: *Expr = a0
-    var f: *StructField = enum_variant_fields(ei, vi)
+    var f: *StructField = enum_variant_fields(sm.pctx, ei, vi)
     while a != null and f != null
         var slot: RefTy
         rv_field_slot(f, @slot)
@@ -1393,8 +1393,8 @@ fn rv_walk_struct(sm: *Sema, e: *Expr)
 fn rv_qualified_variant(sm: *Sema, e: *Expr, vi: *i32) -> i32
     if rl_qualified_variant(sm, e) == 0
         return 0 - 1
-    *vi = enum_variant_index(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    enum_find(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+    *vi = enum_variant_index(sm.pctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    enum_find(sm.pctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
 
 # The fn a named call `e` calls, as emit_call does: a local named like a fn is
 # the local (#2407, #2417), and `C_bump(c)` of a `self:& C` lends c (#3278).
@@ -1430,11 +1430,11 @@ fn rv_walk(sm: *Sema, e: *Expr)
                 return
             var en: *u8 = null
             var el: i32 = 0
-            user_variant_ctor_enum(e, @en, @el)
+            user_variant_ctor_enum(sm.pctx, e, @en, @el)
             if en != null
                 var vi: i32 = 0
                 var other: i32 = 0
-                let ei: i32 = enum_of_variant_unique(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi, @other)
+                let ei: i32 = enum_of_variant_unique(sm.pctx, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi, @other)
                 if ei >= 0
                     rv_payload(sm, e.args, ei, vi)
                 rv_walk_list(sm, e.args)
@@ -1938,9 +1938,9 @@ pub fn ref_value_note_arm(sm: *Sema, arm: *MatchArm, scrut: *Expr)
     var t: SemaTy
     sema_expr_ty(sm, scrut, @t)
     sm.scope_top = sm.scope_top + 1
-    if t.kind == TypeKind.Unknown or t.name == null or t.name_len <= 0 or user_enum_index(StrView { ptr: (t.name), len: (t.name_len) as i64 }) < 0
+    if t.kind == TypeKind.Unknown or t.name == null or t.name_len <= 0 or user_enum_index(sm.pctx, StrView { ptr: (t.name), len: (t.name_len) as i64 }) < 0
         return
-    let f: *StructField = user_enum_tuple_field(StrView { ptr: (t.name), len: (t.name_len) as i64 }, arm_variant_sel(StrView { ptr: (t.name), len: (t.name_len) as i64 }, arm))
+    let f: *StructField = user_enum_tuple_field(sm.pctx, StrView { ptr: (t.name), len: (t.name_len) as i64 }, arm_variant_sel(sm.pctx, StrView { ptr: (t.name), len: (t.name_len) as i64 }, arm))
     if f == null or f.field_shared_ref == 0 and f.field_mut_ref == 0
         return
     let n: *RsNote = rs_note_new(sm, v)

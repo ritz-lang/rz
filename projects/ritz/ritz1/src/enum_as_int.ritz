@@ -67,14 +67,14 @@ var g_eai_notes: *HashMapI64 = null
 var g_eai_note_lens: *HashMapI64 = null
 var g_eai_notes_ready: i32 = 0
 
-fn eai_is_enum_name(name_sv: StrView) -> i32
+fn eai_is_enum_name(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if name == null or len <= 0
         return 0
     if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
         return 1
-    is_enum_type(StrView { ptr: (name), len: (len) as i64 })
+    is_enum_type(ctx, StrView { ptr: (name), len: (len) as i64 })
 
 fn eai_set(name_sv: StrView, out_name: **u8, out_len: *i32) -> i32
     var name: *u8 = name_sv.ptr
@@ -104,14 +104,14 @@ fn eai_qualified(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
         return 0
     if sbk_global(sm, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }) != null
         return 0
-    let ei: i32 = enum_find(StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 })
+    let ei: i32 = enum_find(sm.pctx, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 })
     if ei < 0
         return 0
-    if enum_variant_index(StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0
+    if enum_variant_index(sm.pctx, StrView { ptr: (q.ident_ptr), len: (q.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0
         return 0
-    if enum_is_generic(ei) == 1
+    if enum_is_generic(sm.pctx, ei) == 1
         return 0
-    *out_name = enum_name_at(ei, out_len)
+    *out_name = enum_name_at(sm.pctx, ei, out_len)
     1
 
 # The fn a named call `e` calls, as find_call_fn: a typed fn-pointer local
@@ -139,17 +139,17 @@ fn eai_resolve(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
             # type_name says.
             if v.kind == TypeKind.Ptr or v.kind == TypeKind.PtrPtr
                 return 0
-            if eai_is_enum_name(StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) == 1
+            if eai_is_enum_name(sm.pctx, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) == 1
                 return eai_set(StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, out_name, out_len)
             return 0
         ExprKind.Method =>
             return eai_qualified(sm, e, out_name, out_len)   # `Opt.Holds(40)`
         ExprKind.Call =>
-            user_variant_ctor_enum(e, out_name, out_len)     # `Holds(40)`
+            user_variant_ctor_enum(sm.pctx, e, out_name, out_len)     # `Holds(40)`
             if *out_name != null
                 return 1
             let fd: *FnDef = eai_call_fn(sm, e)
-            if fd != null and fd.return_type == TypeKind.Struct and eai_is_enum_name(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) == 1
+            if fd != null and fd.return_type == TypeKind.Struct and eai_is_enum_name(sm.pctx, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) == 1
                 return eai_set(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }, out_name, out_len)
             return 0
         ExprKind.Unary =>
@@ -160,7 +160,7 @@ fn eai_resolve(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
                 # `*p` of a `p: *E` local: E, from the pointee's name.
                 let pv: *SemaVar = sema_find_local(sm, StrView { ptr: (opnd.ident_ptr), len: (opnd.ident_len) as i64 })
                 if pv != null and pv.kind == TypeKind.Ptr and pv.pointee == TypeKind.Struct
-                    if eai_is_enum_name(StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 }) == 1
+                    if eai_is_enum_name(sm.pctx, StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 }) == 1
                         return eai_set(StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 }, out_name, out_len)
                     return 0
             return eai_resolve(sm, e.operand, out_name, out_len)
@@ -169,7 +169,7 @@ fn eai_resolve(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
                 return 1
             # An enum-typed struct field, `h.d` (AGAST #1797).
             var t: SemaTy
-            if sema_expr_ty(sm, e, @t) == TypeKind.Struct and eai_is_enum_name(StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 1
+            if sema_expr_ty(sm, e, @t) == TypeKind.Struct and eai_is_enum_name(sm.pctx, StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 1
                 return eai_set(StrView { ptr: (t.name), len: (t.name_len) as i64 }, out_name, out_len)
             return 0
         _ => pass
@@ -190,10 +190,10 @@ fn eai_bare_unit(sm: *Sema, e: *Expr) -> i32
         return 0 - 1
     var vi: i32 = 0
     var other: i32 = 0
-    let ei: i32 = enum_of_variant_unique(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, @vi, @other)
+    let ei: i32 = enum_of_variant_unique(sm.pctx, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, @vi, @other)
     if ei < 0
         return 0 - 1
-    if enum_variant_kind(ei, vi) != ENUM_VARIANT_UNIT
+    if enum_variant_kind(sm.pctx, ei, vi) != ENUM_VARIANT_UNIT
         return 0 - 1
     ei
 
@@ -203,12 +203,12 @@ fn eai_enum_of(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
         return 0
     var ei: i32 = 0 - 1
     if eai_resolve(sm, e, out_name, out_len) == 1
-        ei = enum_find(StrView { ptr: (*out_name), len: (*out_len) as i64 })
+        ei = enum_find(sm.pctx, StrView { ptr: (*out_name), len: (*out_len) as i64 })
     else
         ei = eai_bare_unit(sm, e)
         if ei >= 0
-            *out_name = enum_name_at(ei, out_len)
-    (ei >= 0 and enum_is_generic(ei) == 0) as i32
+            *out_name = enum_name_at(sm.pctx, ei, out_len)
+    (ei >= 0 and enum_is_generic(sm.pctx, ei) == 0) as i32
 
 # sema_walk, at the start of each fn: its notes are its own (a generic's
 # instances share their declarations).

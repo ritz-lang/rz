@@ -41,7 +41,7 @@ pub fn users_none_wins(s: *EmitterState, e: *Expr) -> i32
         return 0
     if ei >= 0 and s.ctx_enum_name != null
         var en_len: i32 = 0
-        let en: *u8 = enum_name_at(ei, @en_len)
+        let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
         if name_eq(StrView { ptr: (s.ctx_enum_name), len: (s.ctx_enum_name_len) as i64 }, StrView { ptr: (en), len: (en_len) as i64 }) == 1
             return 1
     var bn: *u8 = null
@@ -310,9 +310,9 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
     # AGAST #2422: `Empty` where the slot is a `Slot<i32>`.
     var ivi: i32 = 0
     let iei: i32 = slot_instance_variant(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, @ivi)
-    if iei >= 0 and enum_variant_kind(iei, ivi) == ENUM_VARIANT_UNIT
+    if iei >= 0 and enum_variant_kind(s.mono.pctx, iei, ivi) == ENUM_VARIANT_UNIT
         var in_len: i32 = 0
-        let in_name: *u8 = enum_name_at(iei, @in_len)
+        let in_name: *u8 = enum_name_at(s.mono.pctx, iei, @in_len)
         return emit_unit_variant_value(s, StrView { ptr: (in_name), len: (in_len) as i64 }, ivi)
 
     # AGAST #1600 / #1610: a bare unit variant `B` of a user enum, as the
@@ -323,7 +323,7 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
     let var_ei: i32 = bare_unit_variant_enum(s, e, @vi, @other_ei)
     if var_ei >= 0
         var en_len: i32 = 0
-        let en: *u8 = enum_name_at(var_ei, @en_len)
+        let en: *u8 = enum_name_at(s.mono.pctx, var_ei, @en_len)
         return emit_unit_variant_value(s, StrView { ptr: (en), len: (en_len) as i64 }, vi)
     if var_ei == 0 - 2
         return emit_ambiguous_variant_error(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, e.span, vi, other_ei)
@@ -1632,13 +1632,13 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
 # struct-typed SSA value usable as a call arg or var-decl initializer.
 # AGAST #2422: 1 when (name, len) is an instance of a generic enum
 # (`Slot$i32`), which monomorph recorded as an enum of that name.
-pub fn is_enum_instance(name_sv: StrView) -> i32
+pub fn is_enum_instance(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if name == null or len <= 0
         return 0
-    let ei: i32 = enum_find(StrView { ptr: (name), len: (len) as i64 })
-    (ei >= 0 and enum_is_generic(ei) == ENUM_INSTANCE) as i32
+    let ei: i32 = enum_find(ctx, StrView { ptr: (name), len: (len) as i64 })
+    (ei >= 0 and enum_is_generic(ctx, ei) == ENUM_INSTANCE) as i32
 
 # AGAST #2422: a generic enum's variant has no enum of its own to build:
 # `Full(5)` is a `Slot<i32>` only because its slot says so, as in ritz0.  The
@@ -1653,13 +1653,13 @@ pub fn slot_instance_variant(s: *EmitterState, name_sv: StrView, out_vi: *i32) -
     if en == null and s.ctx_enum_arg == 0
         en = s.ret_type_name
         en_len = s.ret_type_name_len
-    if is_enum_instance(StrView { ptr: (en), len: (en_len) as i64 }) == 0
+    if is_enum_instance(s.mono.pctx, StrView { ptr: (en), len: (en_len) as i64 }) == 0
         return 0 - 1
-    let vi: i32 = enum_variant_index(StrView { ptr: (en), len: (en_len) as i64 }, StrView { ptr: (name), len: (len) as i64 })
+    let vi: i32 = enum_variant_index(s.mono.pctx, StrView { ptr: (en), len: (en_len) as i64 }, StrView { ptr: (name), len: (len) as i64 })
     if vi < 0
         return 0 - 1
     *out_vi = vi
-    enum_find(StrView { ptr: (en), len: (en_len) as i64 })
+    enum_find(s.mono.pctx, StrView { ptr: (en), len: (en_len) as i64 })
 
 # AGAST #3021: a generic enum's bare constructor (`Full(6)`, `Empty`) whose
 # slot names no instance of it, refused at the constructor:
@@ -1673,11 +1673,11 @@ pub fn emit_no_instance_error(s: *EmitterState, name_sv: StrView, span: SrcSpan)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     var vi: i32 = 0
-    let ei: i32 = generic_enum_of_variant(StrView { ptr: (name), len: (len) as i64 }, @vi)
+    let ei: i32 = generic_enum_of_variant(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, @vi)
     if ei < 0
         return 0
     var en_len: i32 = 0
-    let en: *u8 = enum_name_at(ei, @en_len)
+    let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
     emit_str(s, c"  ; ERROR: generic enum constructor with no instance\n")
     diag_error_at(emitter_source_file(), span)
     eprints_cstr(c"can't infer the `")
@@ -1717,7 +1717,7 @@ fn emit_unit_variant_value(s: *EmitterState, enum_name_sv: StrView, tag: i32) ->
     emit_str(s, IR_PTR_SEP)
     emit_reg(s, slot)
     emit_str(s, c", i32 0, i32 0\n")
-    emit_store_imm(s, enum_tag_ty_named(enum_name_sv), enum_tag_value_named(enum_name_sv, tag), tag_ptr)
+    emit_store_imm(s, enum_tag_ty_named(s.mono.pctx, enum_name_sv), enum_tag_value_named(s.mono.pctx, enum_name_sv, tag), tag_ptr)
     let val: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, val)
@@ -1755,7 +1755,7 @@ fn unknown_field_refused(s: *EmitterState, e: *Expr) -> i32
         f = f.next
     # R17 rule 5(a)'s words, at the field name (AGAST #3015): "`S` has no field
     # `f`".  Sema (deref_field.ritz) has usually said it already; it says it once.
-    let words: *u8 = df_no_field_once(s.module, e, st)
+    let words: *u8 = df_no_field_once(s.mono.pctx, s.module, e, st)
     if words != null
         emit_nd_error(s, df_line(e), df_col(e), words)
     return 1
@@ -1898,13 +1898,13 @@ pub fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
     # or var-decl initializer; downstream var-decl narrowing handles the
     # alloca-width / store-type so `let a = Shade.Light` packs correctly.
     if e.left.kind == ExprKind.Ident
-        if is_enum_type(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == 1
-            let variant_idx: i32 = enum_variant_index(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        if is_enum_type(s.mono.pctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == 1
+            let variant_idx: i32 = enum_variant_index(s.mono.pctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
             if variant_idx >= 0
                 # AGAST #1466: `Option.None` built `alloca %Option`, which
                 # clang rejects (ritz1 has no generic-enum specialisation;
                 # ritz0 rejects the form).
-                if enum_is_generic(enum_find(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })) == 1
+                if enum_is_generic(s.mono.pctx, enum_find(s.mono.pctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })) == 1
                     return emit_qualified_variant_error(s, e, c"is a variant of a generic enum: a qualified generic enum value is not supported (ritz0 rejects it too); write the unqualified form, e.g. None")
                 return emit_unit_variant_value(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, variant_idx)
     if e.left.kind == ExprKind.StringLit

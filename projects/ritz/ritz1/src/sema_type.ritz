@@ -128,7 +128,7 @@ fn sema_call_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
     # of a local or fn of that name (emit_expr_call's order).
     var en: *u8 = null
     var en_len: i32 = 0
-    user_enum_ctor_call(e, @en, @en_len)
+    user_enum_ctor_call(sm.pctx, e, @en, @en_len)
     if en != null
         return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (en), len: (en_len) as i64 }, TypeKind.Void, null)
     # A call through a local is its signature's, never a fn of that name.
@@ -151,7 +151,7 @@ fn sema_is_ptr_kind(k: TypeKind) -> i32
 pub fn sema_enum_name(sm: *Sema, x: *Expr) -> *Expr
     if x == null or x.kind != ExprKind.Ident or sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) != null
         return null
-    if user_enum_index(StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) < 0
+    if user_enum_index(sm.pctx, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) < 0
         return null
     x
 
@@ -174,7 +174,7 @@ fn sema_member_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
         return sema_ty_none(t)
     # AGAST #4251: `E.V`, a user enum's unit variant, builds the enum E.
     let en: *Expr = sema_enum_name(sm, e.left)
-    if en != null and enum_variant_index(StrView { ptr: (en.ident_ptr), len: (en.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
+    if en != null and enum_variant_index(sm.pctx, StrView { ptr: (en.ident_ptr), len: (en.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
         return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (en.ident_ptr), len: (en.ident_len) as i64 }, TypeKind.Void, null)
     var r: SemaTy
     if sema_expr_ty(sm, e.left, @r) == TypeKind.Unknown
@@ -290,7 +290,7 @@ fn sema_unary_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> TypeKind
         if sema_is_ptr_kind(o.kind) == 1 and sema_recv_struct(sm, @o) != null
             return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (o.name), len: (o.name_len) as i64 }, TypeKind.Void, null)
         # AGAST #4251: or to a user enum (`match *p` of a `p: *E`).
-        if sema_is_ptr_kind(o.kind) == 1 and (o.pointee == TypeKind.Struct or o.pointee == TypeKind.Void) and user_enum_index(StrView { ptr: (o.name), len: (o.name_len) as i64 }) >= 0
+        if sema_is_ptr_kind(o.kind) == 1 and (o.pointee == TypeKind.Struct or o.pointee == TypeKind.Void) and user_enum_index(sm.pctx, StrView { ptr: (o.name), len: (o.name_len) as i64 }) >= 0
             return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (o.name), len: (o.name_len) as i64 }, TypeKind.Void, null)
     sema_ty_none(t)
 
@@ -517,7 +517,7 @@ pub fn sema_tagged_payload(sm: *Sema, name_sv: StrView, is_err: i32) -> *StructD
 # `Result$T$E` carries in Some / Ok (is_err 0) or Err (1), as a slice of `name`
 # into `out_len`; null if that payload is no (non-generic) user enum.  A
 # Result's split is the first `$` with a user enum on the side wanted.
-fn sema_tagged_enum_payload(name_sv: StrView, is_err: i32, out_len: *i32) -> *u8
+fn sema_tagged_enum_payload(ctx: *ParseCtx, name_sv: StrView, is_err: i32, out_len: *i32) -> *u8
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     *out_len = 0
@@ -529,7 +529,7 @@ fn sema_tagged_enum_payload(name_sv: StrView, is_err: i32, out_len: *i32) -> *u8
     let sfx: *u8 = name + d + 1
     let sfx_len: i32 = len - d - 1
     if name_eq(StrView { ptr: (name), len: (d) as i64 }, StrView { ptr: (c"Option"), len: (6) as i64 }) == 1
-        if is_err == 1 or user_enum_index(StrView { ptr: (sfx), len: (sfx_len) as i64 }) < 0
+        if is_err == 1 or user_enum_index(ctx, StrView { ptr: (sfx), len: (sfx_len) as i64 }) < 0
             return null
         *out_len = sfx_len
         return sfx
@@ -538,10 +538,10 @@ fn sema_tagged_enum_payload(name_sv: StrView, is_err: i32, out_len: *i32) -> *u8
     var cut: i32 = 0
     while cut < sfx_len
         if *(sfx + cut) == '$'
-            if is_err == 0 and user_enum_index(StrView { ptr: (sfx), len: (cut) as i64 }) >= 0
+            if is_err == 0 and user_enum_index(ctx, StrView { ptr: (sfx), len: (cut) as i64 }) >= 0
                 *out_len = cut
                 return sfx
-            if is_err == 1 and user_enum_index(StrView { ptr: (sfx + cut + 1), len: (sfx_len - cut - 1) as i64 }) >= 0
+            if is_err == 1 and user_enum_index(ctx, StrView { ptr: (sfx + cut + 1), len: (sfx_len - cut - 1) as i64 }) >= 0
                 *out_len = sfx_len - cut - 1
                 return sfx + cut + 1
         cut += 1
@@ -641,7 +641,7 @@ pub fn sema_named_payload_ty(sm: *Sema, arm: *MatchArm, name_sv: StrView, t: *Se
             return sema_struct_ty(st, t)
         # AGAST #4265: a user-enum payload is that enum, as a `let x: E` is.
         var en_len: i32 = 0
-        let en: *u8 = sema_tagged_enum_payload(StrView { ptr: (s.name), len: (s.name_len) as i64 }, is_err, @en_len)
+        let en: *u8 = sema_tagged_enum_payload(sm.pctx, StrView { ptr: (s.name), len: (s.name_len) as i64 }, is_err, @en_len)
         if en != null
             return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (en), len: (en_len) as i64 }, TypeKind.Void, null)
         # AGAST #4448: a one-level pointer payload (`Option<*u8>`'s
@@ -656,8 +656,8 @@ pub fn sema_named_payload_ty(sm: *Sema, arm: *MatchArm, name_sv: StrView, t: *Se
         if pk != TypeKind.Void
             return sema_ty_set(t, pk, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Void, null)
         return sema_ty_none(t)
-    if user_enum_index(StrView { ptr: (s.name), len: (s.name_len) as i64 }) >= 0
-        let uf: *StructField = user_enum_tuple_field(StrView { ptr: (s.name), len: (s.name_len) as i64 }, arm_variant_sel(StrView { ptr: (s.name), len: (s.name_len) as i64 }, arm))
+    if user_enum_index(sm.pctx, StrView { ptr: (s.name), len: (s.name_len) as i64 }) >= 0
+        let uf: *StructField = user_enum_tuple_field(sm.pctx, StrView { ptr: (s.name), len: (s.name_len) as i64 }, arm_variant_sel(sm.pctx, StrView { ptr: (s.name), len: (s.name_len) as i64 }, arm))
         # A u64 payload stays unknown: the emitter binds it as an i64 local
         # (its u64 is kept for the lossy-conversion check alone).
         if uf != null and uf.field_type != TypeKind.U64
@@ -1523,7 +1523,7 @@ fn sx_member_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
     if e.left == null
         return TypeKind.I64
     let en: *Expr = sema_enum_name(sm, e.left)
-    if en != null and enum_variant_index(StrView { ptr: (en.ident_ptr), len: (en.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
+    if en != null and enum_variant_index(sm.pctx, StrView { ptr: (en.ident_ptr), len: (en.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
         return TypeKind.I64
     let f: *StructField = sx_member_field(sm, e)
     if f != null and f.field_type != TypeKind.Unknown and f.field_type != TypeKind.Void
@@ -1855,7 +1855,7 @@ fn sx_index_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
         sema_expr_ty(sm, base, @pt)
         if sema_is_ptr_kind(pt.kind) == 1 and pt.pointee == TypeKind.Struct and pt.name_len > 0
             let pn: StrView = StrView { ptr: (pt.name), len: (pt.name_len) as i64 }
-            if is_enum_type(pn) == 1 and is_tagged_enum_type(pn) == 0
+            if is_enum_type(sm.pctx, pn) == 1 and is_tagged_enum_type(pn) == 0
                 return TypeKind.Struct
     var kind: TypeKind = TypeKind.Void
     var pointee: TypeKind = TypeKind.Void
@@ -2181,7 +2181,7 @@ fn sx_call_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
         return sx_mem_pointee(sm, e.args)
     var en: *u8 = null
     var en_len: i32 = 0
-    user_enum_ctor_call(e, @en, @en_len)
+    user_enum_ctor_call(sm.pctx, e, @en, @en_len)
     if en != null
         return TypeKind.Struct
     let fd: *FnDef = sx_call_fn(sm, e)
