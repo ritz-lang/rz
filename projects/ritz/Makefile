@@ -110,10 +110,28 @@ TOOLS_RATCHETS = tools/test_ritz1_*.py tools/test_ritz0_*.py tools/test_ritzgen_
 	tools/test_grammar_*.py tools/test_enum_ast_nodes.py tools/test_corpus_parses.py \
 	tools/test_known_failures.py tools/test_ci_local.py
 
-.PHONY: tools-ratchets
+#
+# The ratchets under ritz0/tests run too (AGAST #4622: train 2026-11-24 went
+# red on test_ritz1_sema_walk_layout.py, which this target never collected).
+# They are picked by rule, not by list, so a new one cannot drift out:
+# `-m inproc` (ritz0/conftest.py item 13) is every ritz0 test that is not
+# `integration` and asks for no ritz1-building fixture, so it compiles
+# nothing (spawn_guard, item 9).  ~2300 tests, ~60 s serial; serial because
+# under xdist the controller builds ritz1 first (item 4).  A separate pytest
+# from tools/ (the read guard, #4032, fails tools tests in a ritz0 session),
+# and run alongside it, so the target takes about as long as the slower half.
+# tools/test_ritz0_source_ratchets.py holds the target to this.
+.PHONY: tools-ratchets tools-ratchets-tools tools-ratchets-ritz0
 tools-ratchets:
+	@$(MAKE) --no-print-directory -j2 --output-sync=target tools-ratchets-tools tools-ratchets-ritz0
+
+tools-ratchets-tools:
 	@echo "=== Running tools/ source-reading ratchets (-n $(PYTEST_J)) ==="
 	@$(PYTHON) -m pytest -q -n $(PYTEST_J) --dist loadgroup $(wildcard $(TOOLS_RATCHETS))
+
+tools-ratchets-ritz0:
+	@echo "=== Running ritz0 in-process tests: source ratchets (-m inproc, serial) ==="
+	@cd ritz0 && $(PYTHON) -m pytest -q --disable-plugin-autoload -m inproc
 
 # ritz1's measurements: modules, sizes, import graph and cycles, where each
 # check runs, long functions.  Printed, never committed (AGAST #3896: a block

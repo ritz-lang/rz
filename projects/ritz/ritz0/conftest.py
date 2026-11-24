@@ -132,6 +132,14 @@ AGAST #1392. Two things live here, and they are independent.
    listed files, in the listed order.  The gate's likely-first pre-pass uses
    it: as 60 file arguments the same files cost every xdist worker ~8 s of
    collection, since pytest re-walks this directory once per file argument.
+
+13. `inproc` (AGAST #4622) — every test that is not `integration`-marked and
+   asks for no ritz1-building fixture (`is_inproc_item`, the rule smoke uses
+   within its files).  It compiles nothing (item 9), so it runs before ritz1
+   is built.  `make tools-ratchets` runs `-m inproc` serially, which is how a
+   room's smoke reaches the ritz1 source-layout ratchets kept here
+   (test_ritz1_sema_walk_layout.py and the like).  A test that only reads
+   source needs no marker: leave off `integration` and it is in.
 """
 
 import os
@@ -215,13 +223,22 @@ _SMOKE_PATHS = frozenset((Path(__file__).resolve().parent / f) for f in SMOKE_FI
 _BUILD_FIXTURES = ("ritz1_bin", "ritz_start", "ritz1_selfhosted")
 
 
+def is_inproc_item(item) -> bool:
+    """Whether a collected test compiles nothing and builds nothing (item 13).
+
+    Not `integration`-marked (spawn_guard, item 9, fails such a test that
+    starts a process) and asks for no fixture that builds ritz1.
+    """
+    if item.get_closest_marker("integration") is not None:
+        return False
+    return not any(f in item.fixturenames for f in _BUILD_FIXTURES)
+
+
 def is_smoke_item(item) -> bool:
     """Whether a collected test belongs to the smoke tier (item 7)."""
     if Path(item.path).resolve() not in _SMOKE_PATHS:
         return False
-    if item.get_closest_marker("integration") is not None:
-        return False
-    return not any(f in item.fixturenames for f in _BUILD_FIXTURES)
+    return is_inproc_item(item)
 
 
 collect_ignore_glob = [
@@ -322,6 +339,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "batched: matrix rows share one compile per compiler (item 11)"
     )
+    config.addinivalue_line(
+        "markers", "inproc: no integration mark, no ritz1 build fixture (item 13)"
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -342,6 +362,8 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if is_smoke_item(item):
             item.add_marker(pytest.mark.smoke)
+        if is_inproc_item(item):
+            item.add_marker(pytest.mark.inproc)
 
     def rank(item):
         if item.get_closest_marker("slow") is not None:

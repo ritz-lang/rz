@@ -37,9 +37,11 @@
 #                                        matrix (the compiler set rz briefs,
 #                                        2026-11-23; tools-ratchets is the
 #                                        tools/ tests that read compiler
-#                                        sources, `make tools-ratchets`, ~1
-#                                        min: #4587, train 814a64f4 went red
-#                                        on one; full tools-unit is 4-6 min)
+#                                        sources plus ritz0's in-process
+#                                        tests (`-m inproc`), `make
+#                                        tools-ratchets`, ~1 min: #4587 and
+#                                        #4622, trains went red on one of
+#                                        each; full tools-unit is 4-6 min)
 #   projects/ritz/ritzlib/**             ritzlib matrix
 #   projects/ritz/test/**                ritz-tests matrix
 #   projects/ritz/examples/**            examples
@@ -57,8 +59,9 @@
 #   rz, rz.toml                          build-all
 #   anything else (.github, known-failures)  smoke alone; the
 #                                        train's full gate covers it
-# tools-unit subsumes tools-ratchets: a diff that plans both runs only
-# tools-unit.
+# tools-unit and unit together subsume tools-ratchets (tools/ and all of
+# ritz0): a diff that plans both runs only tools-unit.  Every path that plans
+# tools-ratchets also plans unit, so tools-unit alone is the test.
 #
 # Env (tests): RZ_SMOKE_RUNNER, a program run as `<runner> <target>
 # <command>` instead of `bash -c <command>`.
@@ -138,7 +141,8 @@ plan_targets() {
         [[ -n "$f" ]] || continue
         while IFS= read -r t; do [[ -n "$t" ]] && want[$t]=1; done < <(targets_of "$f")
     done <<<"$files"
-    # tools-unit runs all of tools/, tools-ratchets included (#4587).
+    # tools-unit runs all of tools/ (#4587); unit, always planned with
+    # tools-ratchets, runs all of ritz0, its -m inproc half included (#4622).
     [[ -z "${want[tools-unit]:-}" ]] || unset 'want[tools-ratchets]'
     for o in "${ORDER[@]}"; do [[ -n "${want[$o]:-}" ]] && echo "$o"; done
     for t in "${!want[@]}"; do case "$t" in pkg:*|skill:*) extra+=("$t") ;; esac; done

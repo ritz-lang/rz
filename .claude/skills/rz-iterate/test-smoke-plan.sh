@@ -53,7 +53,8 @@ change .github/workflows/main.yml >/dev/null;   eq "$(targets)" "smoke" "CI conf
 # ratchet that reads ritz1 sources, which the compiler set never ran.
 change projects/ritz/grammars/h.grammar >/dev/null
 has "$(bash "$SP" plan)" "^tools-ratchets	make -C projects/ritz tools-ratchets$" "tools-ratchets runs the Makefile's source-reading subset"
-# tools-unit runs all of tools/, so a diff that needs both runs it alone.
+# tools-unit runs all of tools/ and unit all of ritz0, so a diff that needs
+# both runs them instead (#4587, #4622).
 change projects/ritz/ritz1/src/k.ritz projects/ritz/tools/k.py >/dev/null
 eq "$(targets)" "smoke tools-unit unit ritz1-bootstrap matrix" "tools-unit subsumes tools-ratchets"
 change projects/ritz/ritz1/src/k.ritz .claude/settings.json >/dev/null
