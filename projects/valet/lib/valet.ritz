@@ -20,7 +20,6 @@ import ritzlib.str
 import ritzlib.strview { StrView, strview_from_cstr }
 import ritzlib.uring
 import ritzlib.async_net
-import ritzlib.net { sys_setsockopt }
 import ritzlib.async.tasks
 import ritzlib.fd
 import ritzlib.span
@@ -1399,10 +1398,12 @@ fn valet_conn_next_or_close(task: *Task, app: *Valet) -> i32
     if task.request_count < app.keepalive_requests
         let ret = valet_next_request(task)
         if ret < 0
-            tcp_shutdown(task.fd, SHUT_WR)
+            var s: Socket = socket_from_raw(task.fd)
+            s.shutdown(SHUT_WR)
             return 0
         return -1
-    tcp_shutdown(task.fd, SHUT_WR)
+    var s: Socket = socket_from_raw(task.fd)
+    s.shutdown(SHUT_WR)
     return 0
 
 
@@ -2209,7 +2210,8 @@ fn valet_tls_close(task: *Task, tls_data: *TlsTaskData) -> i32
         if tls_task_send(task, tls_data, close_len as i32) == 0
             return -1
 
-    tcp_shutdown(task.fd, SHUT_WR)
+    var s: Socket = socket_from_raw(task.fd)
+    s.shutdown(SHUT_WR)
     return valet_tls_drop(task, tls_data, 0)
 
 
@@ -2247,7 +2249,8 @@ fn valet_tls_close_sent(task: *Task, tls_data: *TlsTaskData) -> i32
         if task.write_pos < task.write_len
             if tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
                 return -1
-    tcp_shutdown(task.fd, SHUT_WR)
+    var s: Socket = socket_from_raw(task.fd)
+    s.shutdown(SHUT_WR)
     return valet_tls_drop(task, tls_data, 0)
 
 
@@ -2332,29 +2335,38 @@ pub fn valet_run(app: *Valet) -> i32
     set_g_app(app)
 
     # Create server socket
-    var server: Fd = fd_adopt(tcp_socket())
-    let server_fd: i32 = server.raw()
-    if server_fd < 0
-        prints("Failed to create socket\n")
-        return 1
+    var server: Socket
+    match socket_tcp()
+        Ok(sk) => server = sk
+        Err(_) =>
+            prints("Failed to create socket\n")
+            return 1
 
-    set_reuseaddr(server_fd)
-    set_reuseport(server_fd)
+    server.set_reuseaddr()
+    server.set_reuseport()
     if app.sndbuf > 0
-        var sndbuf: i32 = app.sndbuf
-        sys_setsockopt(server_fd, 1, 7, @sndbuf as *u8, 4)  # SOL_SOCKET, SO_SNDBUF
+        server.set_opt_int(SOL_SOCKET, SO_SNDBUF, app.sndbuf)
 
-    var ret_bind: i32 = tcp_bind(server_fd, inaddr_any(), app.port)
-    if ret_bind < 0
+    var bound: bool = false
+    match server.bind("0.0.0.0", app.port)
+        Ok(_) => bound = true
+        Err(_) => bound = false
+    if not bound
         print("Failed to bind to port {app.port}\n")
         server.close()
         return 1
 
-    var ret_listen: i32 = tcp_listen(server_fd, app.backlog)
-    if ret_listen < 0
+    var listening: bool = false
+    match server.listen(app.backlog)
+        Ok(_) => listening = true
+        Err(_) => listening = false
+    if not listening
         prints("Failed to listen\n")
         server.close()
         return 1
+
+    # The task server and the shutdown path below hold the bare descriptor.
+    var server_fd: i32 = server.raw()
 
     # Fork workers
     if app.workers > 1

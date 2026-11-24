@@ -103,6 +103,11 @@ const SO_KEEPALIVE: i32 = 9
 const SO_RCVBUF: i32 = 8
 const SO_SNDBUF: i32 = 7
 
+# shutdown(2) `how`
+const SHUT_RD: i32 = 0
+const SHUT_WR: i32 = 1
+const SHUT_RDWR: i32 = 2
+
 # TCP options
 const IPPROTO_TCP: i32 = 6
 const TCP_NODELAY: i32 = 1
@@ -244,15 +249,19 @@ pub fn inaddr_loopback() -> u32
 # ============================================================================
 # Socket syscall wrappers
 # ============================================================================
+# The ones with a pointer argument are pub, for callers that need a sockaddr
+# or option Socket has no method for.  socket / listen / shutdown /
+# epoll_create1 are private: net is their only caller, and Socket (or
+# epoll_create) is the API (AGAST #4645).
 
-pub fn sys_socket(domain: i32, socktype: i32, protocol: i32) -> i32
+fn sys_socket(domain: i32, socktype: i32, protocol: i32) -> i32
     return syscall3(SYS_SOCKET, domain as i64, socktype as i64, protocol as i64) as i32
 
 # standard-exempt: raw-ptr-param: bind(2) syscall ABI
 pub fn sys_bind(fd: i32, addr: *u8, addrlen: i32) -> i32
     return syscall3(SYS_BIND, fd as i64, addr as i64, addrlen as i64) as i32
 
-pub fn sys_listen(fd: i32, backlog: i32) -> i32
+fn sys_listen(fd: i32, backlog: i32) -> i32
     return syscall2(SYS_LISTEN, fd as i64, backlog as i64) as i32
 
 # standard-exempt: raw-ptr-param: accept(2) syscall ABI
@@ -275,14 +284,14 @@ pub fn sys_setsockopt(fd: i32, level: i32, optname: i32, optval: *u8, optlen: i3
 pub fn sys_getsockopt(fd: i32, level: i32, optname: i32, optval: *u8, optlen: *i32) -> i32
     return syscall5(SYS_GETSOCKOPT, fd as i64, level as i64, optname as i64, optval as i64, optlen as i64) as i32
 
-pub fn sys_shutdown(fd: i32, how: i32) -> i32
+fn sys_shutdown(fd: i32, how: i32) -> i32
     return syscall2(SYS_SHUTDOWN, fd as i64, how as i64) as i32
 
 # standard-exempt: raw-ptr-param: getsockname(2) syscall ABI
 pub fn sys_getsockname(fd: i32, addr: *u8, addrlen: *i32) -> i32
     return syscall3(SYS_GETSOCKNAME, fd as i64, addr as i64, addrlen as i64) as i32
 
-pub fn sys_epoll_create1(flags: i32) -> i32
+fn sys_epoll_create1(flags: i32) -> i32
     return syscall1(SYS_EPOLL_CREATE1, flags as i64) as i32
 
 # standard-exempt: raw-ptr-param: epoll_ctl(2) syscall ABI
@@ -321,6 +330,17 @@ pub fn socket_tcp_nonblock() -> Result<Socket, Errno>
 # A UDP socket (IPv4), or Err(errno) from socket(2).
 pub fn socket_udp() -> Result<Socket, Errno>
     socket_open(SOCK_DGRAM, SOCK_DGRAM)
+
+# Adopt a TCP descriptor something other than Socket opened, e.g. one the
+# io_uring runtime accepted (ritzlib.async), as a Socket.  The Socket is the
+# same descriptor, not a dup: closing either closes both.  Its inverse is
+# Socket.raw().
+pub fn socket_from_raw(fd: i32) -> Socket
+    var sock: Socket
+    sock.fd = fd
+    sock.family = AF_INET
+    sock.socktype = SOCK_STREAM
+    sock
 
 # A syscall's 0-or-negative-errno return as Ok(()) or Err(its Errno).
 fn unit_result(rc: i32) -> Result<(), Errno>
@@ -408,6 +428,27 @@ impl Socket
     # Whether the socket holds an open descriptor (false once closed)
     pub fn valid(self: @Socket) -> bool
         self.fd >= 0
+
+    # The descriptor, for code that drives it outside Socket (the io_uring
+    # runtime's SQEs).  -1 once closed.
+    pub fn raw(self: @Socket) -> i32
+        self.fd
+
+    # The local port (host byte order) the socket is bound to, e.g. the one
+    # the kernel chose for a bind to port 0.  Err(errno) from getsockname(2).
+    pub fn local_port(self: @Socket) -> Result<i32, Errno>
+        var addr: SockAddrIn
+        var addrlen: i32 = 16
+        let rc: i32 = sys_getsockname(self.fd, @addr as *u8, @addrlen)
+        if rc < 0
+            return Err(errno_from_raw(rc))
+        Ok(ntohs(addr.port))
+
+    # Shut down part of a full-duplex connection: SHUT_RD, SHUT_WR (the peer
+    # reads end of stream) or SHUT_RDWR.  The descriptor stays open; close()
+    # still releases it.  Err(errno) from shutdown(2), e.g. NotConn.
+    pub fn shutdown(self: @&Socket, how: i32) -> Result<(), Errno>
+        unit_result(sys_shutdown(self.fd, how))
 
     # Close the socket and mark it closed (fd = -1), so a second close, or a
     # close of a socket that never opened, is Ok(()) and closes nothing.

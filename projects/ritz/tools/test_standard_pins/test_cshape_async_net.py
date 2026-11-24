@@ -1,7 +1,7 @@
 """AGAST #4636: async_net.ritz's C-shaped API fns, pinned down-only.
 
 tcp_socket/bind/listen/... return bare i32 fds and statuses; #4645 ports them
-onto net.Socket's Result API.  tcp_getsockname writes ip/port back.
+onto net.Socket's Result API and deletes them: nothing C-shaped is left.
 
 The pin is a ceiling of (violations, violations + exempt) per counting rule
 (standard_report.ratchet_breaches): a migration that lowers a count passes,
@@ -22,7 +22,7 @@ pytestmark = pytest.mark.unit
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent.parent
 
-PINS = {"out-param": (2, 2), "status-return": (12, 12)}
+PINS = {}
 
 
 def test_async_net_c_shapes_only_go_down():

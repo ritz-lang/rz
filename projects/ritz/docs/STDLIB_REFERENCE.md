@@ -2153,11 +2153,15 @@ struct EpollEvent
 | `socket_tcp` | `fn() -> Result<Socket, Errno>` | A TCP socket, or `Err(errno)` from socket(2) (e.g. `Other(24)`, EMFILE) |
 | `socket_tcp_nonblock` | `fn() -> Result<Socket, Errno>` | A non-blocking TCP socket, or `Err(errno)` |
 | `socket_udp` | `fn() -> Result<Socket, Errno>` | A UDP socket, or `Err(errno)` |
+| `socket_from_raw` | `fn(fd: i32) -> Socket` | Adopt a TCP fd opened elsewhere (e.g. accepted by the io_uring runtime); the same fd, not a dup |
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `s.valid()` | `fn() -> bool` | Holds an open fd (false once closed) |
 | `s.close()` | `fn() -> Result<(), Errno>` | Close and set `fd = -1`; `Ok(())` if already closed, else `Err(errno)` from close(2) |
+| `s.raw()` | `fn() -> i32` | The fd, for io_uring SQEs and other code that drives it directly; -1 once closed |
+| `s.local_port()` | `fn() -> Result<i32, Errno>` | The bound port (host order), e.g. the kernel's pick for port 0; `Err(errno)` from getsockname(2) |
+| `s.shutdown(how)` | `fn(how: i32) -> Result<(), Errno>` | `SHUT_RD` / `SHUT_WR` / `SHUT_RDWR`; the fd stays open; `Err(errno)`, e.g. `NotConn` |
 
 **Socket Options**:
 
@@ -2206,37 +2210,15 @@ struct EpollEvent
 
 **Module**: `ritzlib.async_net`
 
-Async TCP networking using io_uring.
-
-**Socket Operations**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `tcp_socket` | `fn() -> i32` | Create TCP socket |
-| `tcp_socket_nonblock` | `fn() -> i32` | Create non-blocking |
-| `set_reuseaddr` | `fn(fd: i32) -> i32` | Enable SO_REUSEADDR |
-| `set_reuseport` | `fn(fd: i32) -> i32` | Enable SO_REUSEPORT |
-| `set_nodelay` | `fn(fd: i32) -> i32` | Disable Nagle |
-| `tcp_bind` | `fn(fd: i32, ip: i32, port: i32) -> i32` | Bind socket |
-| `tcp_listen` | `fn(fd: i32, backlog: i32) -> i32` | Start listening |
-| `tcp_accept` | `fn(fd: i32) -> i32` | Accept (blocking) |
-| `tcp_connect` | `fn(fd: i32, ip: i32, port: i32) -> i32` | Connect |
-
-**Runtime-based Async Operations**:
+Socket I/O through the io_uring runtime.  Sockets are [net](#net)'s `Socket`
+(`pub import`ed); `runtime_send` / `runtime_recv` take its `s.raw()`.  The
+i32-fd `tcp_*` / `set_*` / `ipv4` functions were deleted by AGAST #4645.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `runtime_accept` | `fn(rt: *Runtime, server_fd: i32) -> Result<i32, Errno>` | Async accept |
-| `runtime_send` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64` | Async send |
-| `runtime_recv` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64` | Async receive |
-
-**IP Helpers**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `ipv4` | `fn(a: i32, b: i32, c: i32, d: i32) -> i32` | Create IPv4 address |
-| `localhost` | `fn() -> i32` | 127.0.0.1 |
-| `inaddr_any` | `fn() -> i32` | 0.0.0.0 |
+| `runtime_accept` | `fn(rt: @&Runtime, server: @Socket) -> Result<Socket, Errno>` | Async accept |
+| `runtime_send` | `fn(rt: @&Runtime, fd: i32, buf: Span<u8>) -> Result<i64, Errno>` | Async send |
+| `runtime_recv` | `fn(rt: @&Runtime, fd: i32, buf: Span<u8>) -> Result<i64, Errno>` | Async receive; `Ok(0)` at EOF |
 
 ---
 
@@ -2439,13 +2421,13 @@ syscall, so nothing overlaps. For I/O that suspends, use
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `async_open` | `async fn(path: *u8, flags: i32) -> i32` | Open file |
-| `async_open3` | `async fn(path: *u8, flags: i32, mode: i32) -> i32` | Open with mode |
+| `async_open` | `async fn(path: StrView, flags: i32) -> Result<i32, Errno>` | Open file: `Ok(fd)` |
+| `async_open3` | `async fn(path: StrView, flags: i32, mode: i32) -> Result<i32, Errno>` | Open with mode |
 | `async_read` | `async fn(fd: i32, buf: *u8, count: i64) -> i64` | Read from fd |
 | `async_write` | `async fn(fd: i32, buf: *u8, count: i64) -> i64` | Write to fd |
 | `async_close` | `async fn(fd: i32) -> i32` | Close fd |
-| `async_read_file` | `async fn(path: *u8, buf: *u8, buf_size: i64) -> i64` | Read entire file |
-| `async_write_file` | `async fn(path: *u8, buf: *u8, count: i64) -> i64` | Write file |
+| `async_read_file` | `async fn(path: StrView, buf: Span<u8>) -> Result<i64, Errno>` | Read the file into `buf`: `Ok(bytes)` |
+| `async_write_file` | `async fn(path: StrView, buf: Span<u8>) -> Result<i64, Errno>` | Create/truncate (0644) and write all of `buf` |
 
 ---
 
@@ -3150,13 +3132,12 @@ fn show_file(path: StrView) -> i32
 ```ritz
 import ritzlib.async_net
 
-fn serve() -> i32
-    let fd: i32 = tcp_socket()
-    set_reuseaddr(fd)
-    tcp_bind(fd, inaddr_any(), 8080)
-    tcp_listen(fd, 128)
-    let client: i32 = tcp_accept(fd)
-    client
+fn serve() -> Result<Socket, Errno>
+    var srv: Socket = socket_tcp()?
+    srv.set_reuseaddr()?
+    srv.bind("0.0.0.0", 8080)?
+    srv.listen(128)?
+    srv.accept()
 ```
 
 **Using Vec**:

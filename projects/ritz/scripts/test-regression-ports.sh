@@ -222,7 +222,7 @@ for ex in tier5_async/59_async_net tier5_async/60_echo_server; do
     check "$ex binds no literal port" "" \
         "$(fixed_listen_ports "$RITZ_ROOT/examples/$ex")"
     check "$ex asks the kernel for its port" yes \
-        "$(grep -q 'tcp_getsockname' "$RITZ_ROOT/examples/$ex/src/main.ritz" && echo yes || echo no)"
+        "$(grep -q '\.local_port()' "$RITZ_ROOT/examples/$ex/src/main.ritz" && echo yes || echo no)"
     check "$ex/test.sh pins no port" no \
         "$(grep -qE 'PORT|[^0-9][1-9][0-9]{3,4}([^0-9]|$)' "$RITZ_ROOT/examples/$ex/test.sh" && echo yes || echo no)"
 done
@@ -232,7 +232,7 @@ mkdir -p "$SCRATCH/fx_loose"
 printf 'fn main() -> i32\n    addr.sin_port = htons(9000)\n' > "$SCRATCH/fx_loose/raw.ritz"
 printf '# RITZ_EXAMPLE_PORT\nfn main() -> i32\n    addr.sin_port = htons(9000)\n' > "$SCRATCH/fx_loose/raw_env.ritz"
 printf 'fn main() -> i32\n    addr.sin_port = htons(port)\n' > "$SCRATCH/fx_loose/raw_var.ritz"
-printf 'fn main() -> i32\n    tcp_bind(fd, inaddr_any(), 9000)\n' > "$SCRATCH/fx_loose/nested.ritz"
+printf 'fn main() -> i32\n    srv.bind(any_addr(), 9000)\n' > "$SCRATCH/fx_loose/nested.ritz"
 printf '#!/bin/bash\nPORT=9001\nnc localhost $PORT\n' > "$SCRATCH/fx_loose/fixed.sh"
 printf '#!/bin/bash\nPORT=${RITZ_EXAMPLE_PORT:-9001}\n' > "$SCRATCH/fx_loose/env.sh"
 check "a literal htons() port in a loose file is unmovable" yes \
@@ -278,16 +278,16 @@ check "no example script pins a fixed PORT without RITZ_EXAMPLE_PORT" "" \
 #    `port` or passed straight to a bind is allowed only in an example that
 #    reads RITZ_EXAMPLE_PORT (keeping it as the default when unset).  A
 #    self-test that needs a port of its own binds port 0 and asks the kernel
-#    which one it got (tcp_getsockname).
+#    which one it got (Socket.local_port).
 # ---------------------------------------------------------------------------
 # (fixed_listen_ports / unmovable_port are defined above section 4.)
 
 # The detector itself, on fixtures, so a broken regex cannot pass vacuously.
 mkdir -p "$SCRATCH/fx_fixed/src" "$SCRATCH/fx_env/src" "$SCRATCH/fx_zero/src"
 printf 'fn main() -> i32\n    var port: i32 = 8080\n' > "$SCRATCH/fx_fixed/src/main.ritz"
-printf 'fn main() -> i32\n    let x: i32 = tcp_bind(fd, lh, 9876)\n' >> "$SCRATCH/fx_fixed/src/main.ritz"
+printf 'fn main() -> i32\n    match srv.bind("127.0.0.1", 9876)\n' >> "$SCRATCH/fx_fixed/src/main.ritz"
 printf '# RITZ_EXAMPLE_PORT\nfn main() -> i32\n    var port: i32 = 8080\n' > "$SCRATCH/fx_env/src/main.ritz"
-printf 'fn main() -> i32\n    let port: i32 = 0\n    tcp_bind(fd, lh, port)\n' > "$SCRATCH/fx_zero/src/main.ritz"
+printf 'fn main() -> i32\n    let port: i32 = 0\n    srv.bind("127.0.0.1", port)\n' > "$SCRATCH/fx_zero/src/main.ritz"
 check "the detector finds a literal port and a literal bind" 2 \
     "$(fixed_listen_ports "$SCRATCH/fx_fixed" | wc -l)"
 check "a literal port with no RITZ_EXAMPLE_PORT is unmovable" yes \

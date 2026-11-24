@@ -5,9 +5,14 @@
 # acceptable.  For I/O that suspends, use ritzlib.async.runtime or
 # ritzlib.async.tasks.
 #
+# Paths are StrViews and the path calls return Result: Err(Errno) from
+# open(2), read(2) or write(2), never a negative number (AGAST #4645).
+#
 # Usage:
-#   async fn read_file(path: *u8) -> i64
-#       let fd: i32 = await async_open(path, O_RDONLY)
+#   async fn read_file(path: StrView) -> i64
+#       let fd: i32 = match await async_open(path, O_RDONLY)
+#           Ok(fd) => fd
+#           Err(e) => return -(e.code() as i64)
 #       var buf: [1024]u8
 #       let n: i64 = await async_read(fd, Span<u8> { ptr: (@buf[0]), len: (1024) as i64 })
 #       await async_close(fd)
@@ -16,20 +21,40 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.uring
+import ritzlib.strview
+import ritzlib.result
+# Errno is part of this API (every Err), so importers get it too.
+pub import ritzlib.errno
+
+# PATH_MAX, the NUL included.  A longer path is Err(NameTooLong).
+const BFS_PATH_MAX: i64 = 4096
+const BFS_ENAMETOOLONG: i32 = 36
+
+# open(2) of a StrView path: a view carries no terminator, so it is copied
+# into a NUL-terminated buffer first.  Ok(fd) or Err(errno).
+fn blocking_open(path: StrView, flags: i32, mode: i32) -> Result<i32, Errno>
+    if path.len >= BFS_PATH_MAX
+        return Err(errno_from_raw(BFS_ENAMETOOLONG))
+    var cpath: [4096]u8
+    for i in 0..path.len
+        cpath[i] = *(path.ptr + i)
+    cpath[path.len] = 0
+    let fd: i32 = sys_open3(@cpath[0], flags, mode)
+    if fd < 0
+        return Err(errno_from_raw(fd))
+    Ok(fd)
 
 # ============================================================================
 # File Operations
 # ============================================================================
 
-# Open a file and return the file descriptor
-# standard-exempt: raw-ptr-param: C string ABI: a NUL-terminated path passed to open(2)
-pub async fn async_open(path: *u8, flags: i32) -> i32
-    sys_open(path, flags)
+# Open a file: Ok(its descriptor) or Err(errno), e.g. NoEnt.
+pub async fn async_open(path: StrView, flags: i32) -> Result<i32, Errno>
+    blocking_open(path, flags, 0)
 
-# Open a file with a mode
-# standard-exempt: raw-ptr-param: C string ABI: a NUL-terminated path passed to open(2)
-pub async fn async_open3(path: *u8, flags: i32, mode: i32) -> i32
-    sys_open3(path, flags, mode)
+# Open a file, creating it with `mode` if `flags` say so.
+pub async fn async_open3(path: StrView, flags: i32, mode: i32) -> Result<i32, Errno>
+    blocking_open(path, flags, mode)
 
 # Read from a file descriptor into a buffer
 pub async fn async_read(fd: i32, buf: Span<u8>) -> i64
@@ -47,50 +72,45 @@ pub async fn async_close(fd: i32) -> i32
 # Whole-file helpers
 # ============================================================================
 
-# Read entire file contents into a buffer
-# Returns number of bytes read, or negative on error
-# standard-exempt: raw-ptr-param: C string ABI: a NUL-terminated path passed to open(2)
-pub async fn async_read_file(path: *u8, buf_sv: Span<u8>) -> i64
-    let buf: *u8 = buf_sv.ptr
-    let buf_size: i64 = buf_sv.len
-    let fd: i32 = await async_open(path, O_RDONLY)
-    if fd < 0
-        return fd as i64
+# Read the file into `buf`, up to its length: Ok(the bytes read) or
+# Err(errno) from open(2) or read(2).
+pub async fn async_read_file(path: StrView, buf: Span<u8>) -> Result<i64, Errno>
+    let buf_size: i64 = buf.len
+    let fd: i32 = match blocking_open(path, O_RDONLY, 0)
+        Ok(f) => f
+        Err(e) => return Err(e)
 
     var total: i64 = 0
     while total < buf_size
-        let n: i64 = await async_read(fd, Span<u8> { ptr: (buf + total), len: (buf_size - total) as i64 })
+        let n: i64 = await async_read(fd, Span<u8> { ptr: (buf.ptr + total), len: (buf_size - total) as i64 })
         if n < 0
             await async_close(fd)
-            return n
+            return Err(errno_from_raw(n as i32))
         if n == 0
             break
         total += n
 
     await async_close(fd)
-    return total
+    Ok(total)
 
-# Write buffer contents to a file
-# Creates the file if it doesn't exist, truncates if it does
-# Returns number of bytes written, or negative on error
-# standard-exempt: raw-ptr-param: C string ABI: a NUL-terminated path passed to open(2)
-pub async fn async_write_file(path: *u8, buf_sv: Span<u8>) -> i64
-    let buf: *u8 = buf_sv.ptr
-    let count: i64 = buf_sv.len
-    # O_WRONLY | O_CREAT | O_TRUNC = 1 + 64 + 512 = 577
-    let fd: i32 = await async_open3(path, 577, 420)  # 0644 = 420
-    if fd < 0
-        return fd as i64
+# Write all of `buf` to the file, created (mode 0644) or truncated:
+# Ok(the bytes written) or Err(errno) from open(2) or write(2).
+pub async fn async_write_file(path: StrView, buf: Span<u8>) -> Result<i64, Errno>
+    let count: i64 = buf.len
+    # O_WRONLY | O_CREAT | O_TRUNC = 1 + 64 + 512 = 577; 0644 = 420
+    let fd: i32 = match blocking_open(path, 577, 420)
+        Ok(f) => f
+        Err(e) => return Err(e)
 
     var total: i64 = 0
     while total < count
-        let n: i64 = await async_write(fd, Span<u8> { ptr: (buf + total), len: (count - total) as i64 })
+        let n: i64 = await async_write(fd, Span<u8> { ptr: (buf.ptr + total), len: (count - total) as i64 })
         if n < 0
             await async_close(fd)
-            return n
+            return Err(errno_from_raw(n as i32))
         if n == 0
             break
         total += n
 
     await async_close(fd)
-    return total
+    Ok(total)

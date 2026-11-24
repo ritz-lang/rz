@@ -11,6 +11,7 @@ import ritzlib.io
 import ritzlib.fmt
 import ritzlib.str
 import ritzlib.memory
+import ritzlib.strview
 import ritzlib.async_net
 # Use the fully-qualified `tome.resp` form so this module is consumable
 # from outside the tome project (e.g. spire.repo.tome).  The relative
@@ -40,28 +41,32 @@ pub fn client_new() -> TomeClient
 
 # Parse "localhost" or a dotted-decimal IPv4 address.  Returns the address
 # in HOST byte order (127.0.0.1 -> 0x7F000001), which is what
-# client_connect / tcp_connect take: they byte-swap it themselves.  Returns 0
+# client_connect takes: it formats it as a dotted quad for Socket.connect.  Returns 0
 # on error.  (AGAST #2457: tome-cli returned network order here, so the
 # double swap dialled 1.0.0.127 and hung in connect().)
-pub fn client_parse_host(s: *u8) -> i32
-    if strcmp(s, c"localhost") == 0
+pub fn client_parse_host(s: StrView) -> i32
+    if s.eq("localhost")
         return 0x7F000001
 
     var ip: i32 = 0
     var octets: i32 = 0
     var current: i32 = 0
     var digits: i32 = 0
-    var i: i32 = 0
+    var i: i64 = 0
     loop
-        let c: u8 = *(s + i)
-        if c == 0 || c == 46  # NUL or '.'
+        # The end of `s` closes the last octet, as '.' closes the others.
+        let at_end: bool = i >= s.len
+        var c: u8 = 0
+        if not at_end
+            c = *(s.ptr + i)
+        if at_end || c == 46  # end or '.'
             if digits == 0 || octets >= 4
                 return 0
             ip = (ip << 8) | current
             octets += 1
             current = 0
             digits = 0
-            if c == 0
+            if at_end
                 break
         else if c >= 48 && c <= 57
             current = current * 10 + (c - 48) as i32
@@ -77,22 +82,49 @@ pub fn client_parse_host(s: *u8) -> i32
     return ip
 
 
+# Write the host-byte-order IPv4 address `ip` into `buf` (at least 16
+# bytes) as a dotted quad, the form Socket.connect takes; returns its length.
+pub fn client_format_host(ip: i32, buf: *u8) -> i64
+    var n: i64 = 0
+    var shift: i32 = 24
+    while shift >= 0
+        let octet: i32 = (ip >> shift) & 255
+        if octet >= 100
+            *(buf + n) = (48 + octet / 100) as u8
+            n += 1
+        if octet >= 10
+            *(buf + n) = (48 + (octet / 10) % 10) as u8
+            n += 1
+        *(buf + n) = (48 + octet % 10) as u8
+        n += 1
+        if shift > 0
+            *(buf + n) = 46
+            n += 1
+        shift -= 8
+    return n
+
+
 # Connect to a Tome server (host in host byte order: see client_parse_host)
 # Returns 0 on success, negative error code on failure
 pub fn client_connect(c: *TomeClient, host: i32, port: i32) -> i32
     # Create socket
-    let fd: i32 = tcp_socket()
-    if fd < 0
-        return fd
+    var sock: Socket
+    match socket_tcp()
+        Ok(s) => sock = s
+        Err(e) => return -e.code()
 
     # Connect to server
-    var conn: Fd = fd_adopt(fd)
-    let ret: i32 = tcp_connect(fd, host, port)
-    if ret < 0
-        conn.close()
-        return ret
+    var addr: [16]u8
+    let addr_len: i64 = client_format_host(host, @addr[0])
+    var err: i32 = 0
+    match sock.connect(strview_from_ptr(@addr[0], addr_len), port)
+        Ok(_) => err = 0
+        Err(e) => err = e.code()
+    if err != 0
+        sock.close()
+        return -err
 
-    c.fd = conn
+    c.fd = fd_adopt(sock.raw())
     c.connected = 1
     c.read_len = 0
     return 0

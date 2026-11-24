@@ -2,28 +2,60 @@
 #
 # AGAST #2457: tome-cli handed tcp_connect 127.0.0.1 already in network
 # byte order; tcp_connect byte-swaps again, so it dialled 1.0.0.127 and
-# hung in connect().  client_parse_host returns host byte order.
+# hung in connect().  client_parse_host returns host byte order, and
+# client_connect formats it as a dotted quad for Socket.connect.
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.strview
 import lib.client
 
 
 [[test]]
 fn test_client_parse_host_is_host_order() -> i32
-    if client_parse_host(c"127.0.0.1") != 0x7F000001
+    if client_parse_host("127.0.0.1") != 0x7F000001
         return 1
-    if client_parse_host(c"localhost") != 0x7F000001
+    if client_parse_host("localhost") != 0x7F000001
         return 2
-    if client_parse_host(c"10.1.2.3") != 0x0A010203
+    if client_parse_host("10.1.2.3") != 0x0A010203
         return 3
-    if client_parse_host(c"256.0.0.1") != 0
+    if client_parse_host("256.0.0.1") != 0
         return 4
-    if client_parse_host(c"1.2.3") != 0
+    if client_parse_host("1.2.3") != 0
         return 5
-    if client_parse_host(c"example.com") != 0
+    if client_parse_host("example.com") != 0
         return 6
+    # The host is parsed by length, not to a NUL: "10.1.2.34" cut to 8
+    # bytes is 10.1.2.3, and cut to 7 ("10.1.2.") is no address.
+    let long: StrView = "10.1.2.34"
+    if client_parse_host(StrView { ptr: long.ptr, len: 8 }) != 0x0A010203
+        return 7
+    if client_parse_host(StrView { ptr: long.ptr, len: 7 }) != 0
+        return 8
+    return 0
+
+
+# Whether client_format_host(client_parse_host(text)) gives back `want`,
+# the dotted quad client_connect hands Socket.connect.
+fn host_round_trips(text: StrView, want: StrView) -> bool
+    var buf: [16]u8
+    let n: i64 = client_format_host(client_parse_host(text), @buf[0])
+    return want.eq(StrView { ptr: @buf[0], len: n })
+
+
+# AGAST #2457 end to end: the host-order address is dialled as written,
+# not byte-swapped (127.0.0.1 must not come out as 1.0.0.127).
+[[test]]
+fn test_client_format_host_dials_parsed_host() -> i32
+    if not host_round_trips("127.0.0.1", "127.0.0.1")
+        return 1
+    if not host_round_trips("localhost", "127.0.0.1")
+        return 2
+    if not host_round_trips("10.1.2.3", "10.1.2.3")
+        return 3
+    if not host_round_trips("192.168.0.255", "192.168.0.255")
+        return 4
     return 0
 
 

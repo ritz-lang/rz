@@ -41,10 +41,10 @@ PINS = {
     "indium": 123,
     "larb": 3,
     "lexis": 10,
-    "mausoleum": 653,
+    "mausoleum": 651,
     "nexus": 73,
     "prism": 7,
-    "ritz": 3071,
+    "ritz": 2997,
     "ritz-lsp": 87,
     "ritzunit": 43,
     "rzrz": 11,
@@ -53,8 +53,8 @@ PINS = {
     "spire": 90,
     "squeeze": 2,
     "tempest": 1,
-    "tome": 369,
-    "valet": 240,
+    "tome": 368,
+    "valet": 239,
     "zeus": 77,
 }
 

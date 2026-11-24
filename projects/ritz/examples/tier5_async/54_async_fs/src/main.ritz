@@ -8,24 +8,30 @@ import ritzlib.io
 import ritzlib.fmt
 import ritzlib.async.blocking_fs
 import ritzlib.str
+import ritzlib.strview
 import ritzlib.os.env
 
-# Build "$TMPDIR/<stem>_<pid>.txt" into buf (>= 512 bytes) and return buf;
+# Build "$TMPDIR/<stem>_<pid>.txt" into buf (>= 512 bytes, so stem <= 64
+# bytes) and return it NUL-terminated, the path sys_open3/sys_unlink take;
 # TMPDIR unset, empty or overlong means /tmp.  Concurrent runs of this binary
 # -- two gates on one host, or two stages of one gate -- must never share a
 # file: with a fixed /tmp name one run's unlink landed between another's
 # write and read, and regression Stage 1 flaked (AGAST #4207).
-fn scratch_path(buf: *u8, stem: *u8) -> *u8
+fn scratch_path(buf: *u8, stem: StrView) -> *u8
     var dir: StrView = env_get_or("TMPDIR", "/tmp")
     if dir.len == 0 or dir.len > 400
         dir = "/tmp"
     memcpy(buf, dir.ptr, dir.len)
-    *(buf + dir.len) = 0
-    strcat(buf, c"/")
-    strcat(buf, stem)
-    strcat(buf, c"_")
-    itoa(sys_getpid() as i64, buf + strlen(buf))
-    strcat(buf, c".txt")
+    var n: i64 = dir.len
+    *(buf + n) = 47  # '/'
+    n += 1
+    memcpy(buf + n, stem.ptr, stem.len)
+    n += stem.len
+    *(buf + n) = 95  # '_'
+    n += 1
+    *(buf + n) = 0
+    itoa(sys_getpid() as i64, buf + n)
+    strcat(buf, ".txt")
     buf
 
 # Test 1: Async write and read back
@@ -34,7 +40,7 @@ fn test_async_write_read() -> bool
 
     var path_buf: [512]u8
 
-    let path: *u8 = scratch_path(@path_buf[0], c"ritz_async_test")
+    let path: *u8 = scratch_path(@path_buf[0], "ritz_async_test")
 
     # Write data
     var write_buf: [32]u8
@@ -46,7 +52,9 @@ fn test_async_write_read() -> bool
     write_buf[5] = 33   # !
     write_buf[6] = 10   # \n
 
-    let written: i64 = await async_write_file(path, Span<u8> { ptr: (@write_buf[0]), len: (7) as i64 })
+    let written: i64 = match await async_write_file(strview_from_cstr(path), Span<u8> { ptr: (@write_buf[0]), len: (7) as i64 })
+        Ok(n) => n
+        Err(e) => -(e.code() as i64)
     if written != 7
         print("FAIL: write returned {written}\n")
         return false
@@ -58,7 +66,9 @@ fn test_async_write_read() -> bool
         read_buf[i] = 0
         i += 1
 
-    let read_count: i64 = await async_read_file(path, Span<u8> { ptr: (@read_buf[0]), len: (32) as i64 })
+    let read_count: i64 = match await async_read_file(strview_from_cstr(path), Span<u8> { ptr: (@read_buf[0]), len: (32) as i64 })
+        Ok(n) => n
+        Err(e) => -(e.code() as i64)
     if read_count != 7
         print("FAIL: read returned {read_count}\n")
         sys_unlink(path)
@@ -77,9 +87,9 @@ fn test_async_write_read() -> bool
 
 # Test 2: Async open/read/close
 async fn read_small_file(path: *u8, buf: *u8) -> i64
-    let fd: i32 = await async_open(path, O_RDONLY)
-    if fd < 0
-        return fd as i64
+    let fd: i32 = match await async_open(strview_from_cstr(path), O_RDONLY)
+        Ok(f) => f
+        Err(e) => return -(e.code() as i64)
     let n: i64 = await async_read(fd, Span<u8> { ptr: (buf), len: (100) as i64 })
     await async_close(fd)
     n
@@ -89,7 +99,7 @@ fn test_async_open_read_close() -> bool
 
     # First create a test file
     var path_buf: [512]u8
-    let path: *u8 = scratch_path(@path_buf[0], c"ritz_async_test2")
+    let path: *u8 = scratch_path(@path_buf[0], "ritz_async_test2")
     let fd: i32 = sys_open3(path, O_CREAT | O_WRONLY | O_TRUNC, 420)
     if fd < 0
         print("FAIL: couldn't create test file\n")
@@ -126,23 +136,27 @@ fn test_async_open_read_close() -> bool
     return true
 
 # Test 3: Error handling - file not found
+# The errno of a failed open, 0 if it opened.
 async fn try_open_missing(path: *u8) -> i32
-    let fd: i32 = await async_open(path, O_RDONLY)
-    fd
+    match await async_open(strview_from_cstr(path), O_RDONLY)
+        Ok(fd) =>
+            await async_close(fd)
+            0
+        Err(e) => e.code()
 
 fn test_async_error_handling() -> bool
     print("test_async_error_handling... ")
 
     # Never created: a per-run name, so no other run can make it exist.
     var path_buf: [512]u8
-    let fd: i32 = await try_open_missing(scratch_path(@path_buf[0], c"ritz_async_missing"))
-    if fd >= 0
-        print("FAIL: expected error, got fd {fd}\n")
+    let err: i32 = await try_open_missing(scratch_path(@path_buf[0], "ritz_async_missing"))
+    if err == 0
+        print("FAIL: expected an error, the open succeeded\n")
         return false
 
-    # fd should be -2 (ENOENT) or similar negative error
-    if fd >= 0
-        print("FAIL: expected negative error code\n")
+    # Err(NoEnt), errno 2
+    if err != 2
+        print("FAIL: expected ENOENT (2), got {err}\n")
         return false
 
     print("OK\n")

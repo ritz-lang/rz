@@ -1,200 +1,38 @@
 # ritzlib/async_net.ritz - Async TCP networking
 #
-# TCP socket operations using io_uring for async I/O.
-#
-# This module provides:
-#   - Socket creation (tcp_socket)
-#   - Server operations (tcp_bind, tcp_listen, tcp_accept)
-#   - Client operations (tcp_connect)
-#   - Async I/O via runtime (runtime_accept, runtime_recv, runtime_send)
+# io_uring I/O on sockets.  Sockets themselves are ritzlib.net's Socket:
+# socket_tcp, Socket.bind / listen / connect / accept / shutdown and the
+# option setters, all Result.  This module adds only what goes through the
+# runtime's ring: runtime_accept, runtime_send, runtime_recv.
 #
 # Example server:
-#   let fd: i32 = tcp_socket()
-#   tcp_bind(fd, 0, 8080)    # 0.0.0.0:8080
-#   tcp_listen(fd, 128)
-#   let client: i32 = runtime_accept(@&rt, fd)
+#   var srv: Socket = socket_tcp()?
+#   srv.set_reuseaddr()?
+#   srv.bind("0.0.0.0", 8080)?
+#   srv.listen(128)?
+#   var client: Socket = runtime_accept(@&rt, @srv)?
+#   runtime_send(@&rt, client.raw(), "hello")
+#
+# Until AGAST #4645 this module duplicated net's API on bare i32 fds with
+# 0-or-negative-errno returns (tcp_socket, tcp_bind, tcp_listen, tcp_accept,
+# tcp_connect, tcp_shutdown, tcp_getsockname, set_reuseaddr, ...).  Those
+# are gone, with no wrappers; tools/test_async_net_api.py keeps them gone.
 
 import ritzlib.sys
 import ritzlib.uring
 import ritzlib.async.runtime
 import ritzlib.result
 import ritzlib.errno
-
-# Socket syscall wrappers + byte-order helpers live in ritzlib.net.  This
-# was historically duplicated here as `pub fn`, which made async_net and
-# net mutually unlinkable (e.g. valet+mausoleum).  See
-# docs/RITZLIB_NET_DEDUP.md for the original triage.
-import ritzlib.net {
-    sys_socket,
-    sys_bind,
-    sys_listen,
-    sys_accept,
-    sys_accept4,
-    sys_connect,
-    sys_setsockopt,
-    sys_getsockopt,
-    sys_getsockname,
-    sys_shutdown,
-    htons,
-    ntohs,
-    htonl,
-    ntohl
-}
-
-# ============================================================================
-# Socket syscall numbers
-# ============================================================================
-# Syscall numbers come from ritzlib.sys, the only place ritzlib declares them
-# (AGAST #1857).
-
-# ============================================================================
-# Socket constants
-# ============================================================================
-
-# Address families
-const AF_UNIX: i32 = 1
-const AF_INET: i32 = 2
-const AF_INET6: i32 = 10
-
-# Socket types
-const SOCK_STREAM: i32 = 1    # TCP
-const SOCK_DGRAM: i32 = 2     # UDP
-const SOCK_RAW: i32 = 3
-const SOCK_NONBLOCK: i32 = 2048   # 0x800
-const SOCK_CLOEXEC: i32 = 524288  # 0x80000
-
-# IP protocol
-const IPPROTO_TCP: i32 = 6
-const IPPROTO_UDP: i32 = 17
-
-# Socket options
-const SOL_SOCKET: i32 = 1
-const SO_REUSEADDR: i32 = 2
-const SO_REUSEPORT: i32 = 15
-const SO_KEEPALIVE: i32 = 9
-const SO_RCVBUF: i32 = 8
-const SO_SNDBUF: i32 = 7
-
-const IPPROTO_IP: i32 = 0
-const TCP_NODELAY: i32 = 1
-
-# Shutdown options
-const SHUT_RD: i32 = 0
-const SHUT_WR: i32 = 1
-const SHUT_RDWR: i32 = 2
-
-# ============================================================================
-# sockaddr_in structure (IPv4)
-# ============================================================================
-# Size: 16 bytes
-# struct sockaddr_in {
-#     sa_family_t sin_family;  // 2 bytes: AF_INET
-#     in_port_t sin_port;      // 2 bytes: port in network byte order
-#     struct in_addr sin_addr; // 4 bytes: IP address
-#     char sin_zero[8];        // 8 bytes: padding
-# };
-
-struct SockaddrIn
-    sin_family: u16    # 0: AF_INET (2)
-    sin_port: u16      # 2: port (network byte order = big endian)
-    sin_addr: i32      # 4: IPv4 address (network byte order)
-    sin_zero: i64      # 8: padding (8 bytes)
-
-const SOCKADDR_IN_SIZE: i32 = 16
-
-# ============================================================================
-# Byte-order helpers and socket-syscall wrappers were historically
-# duplicated here.  They now live in ritzlib.net and are imported above.
-# Only async_net-unique syscalls remain in this file: sys_send / sys_recv
-# (used by tome and others that want non-uring socket I/O).
-# ============================================================================
-
-pub fn sys_send(fd: i32, buf: Span<u8>, flags: i32) -> i64
-    return syscall4(SYS_SENDTO, fd as i64, buf.ptr as i64, buf.len, flags as i64)
-
-pub fn sys_recv(fd: i32, buf: Span<u8>, flags: i32) -> i64
-    return syscall4(SYS_RECVFROM, fd as i64, buf.ptr as i64, buf.len, flags as i64)
-
-# ============================================================================
-# High-level TCP socket operations
-# ============================================================================
-
-# Create a TCP socket
-pub fn tcp_socket() -> i32
-    return sys_socket(AF_INET, SOCK_STREAM, 0)
-
-# Create a non-blocking TCP socket
-pub fn tcp_socket_nonblock() -> i32
-    return sys_socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0)
-
-# Set SO_REUSEADDR option (useful for servers)
-pub fn set_reuseaddr(fd: i32) -> i32
-    var optval: i32 = 1
-    return sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, @optval as *u8, 4)
-
-# Set SO_REUSEPORT option (useful for load balancing)
-pub fn set_reuseport(fd: i32) -> i32
-    var optval: i32 = 1
-    return sys_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, @optval as *u8, 4)
-
-# Set TCP_NODELAY (disable Nagle's algorithm)
-pub fn set_nodelay(fd: i32) -> i32
-    var optval: i32 = 1
-    return sys_setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, @optval as *u8, 4)
-
-# A SockaddrIn is the subject of every operation on it (S-IMPL-1).
-impl SockaddrIn
-    # Initialize a sockaddr_in structure
-    pub fn init(self: *SockaddrIn, ip: i32, port: i32)
-        self.sin_family = AF_INET as u16
-        self.sin_port = htons(port)
-        self.sin_addr = htonl(ip)
-        self.sin_zero = 0
-
-# Bind a socket to an IP address and port
-# ip=0 means INADDR_ANY (0.0.0.0)
-pub fn tcp_bind(fd: i32, ip: i32, port: i32) -> i32
-    var addr: SockaddrIn
-    addr.init(ip, port)
-    return sys_bind(fd, @addr as *u8, SOCKADDR_IN_SIZE)
-
-# Start listening for connections
-pub fn tcp_listen(fd: i32, backlog: i32) -> i32
-    return sys_listen(fd, backlog)
-
-# Accept a connection (blocking)
-pub fn tcp_accept(fd: i32) -> i32
-    var addr: SockaddrIn
-    var addrlen: i32 = SOCKADDR_IN_SIZE
-    return sys_accept(fd, @addr as *u8, @addrlen)
-
-# Connect to a remote server (blocking)
-pub fn tcp_connect(fd: i32, ip: i32, port: i32) -> i32
-    var addr: SockaddrIn
-    addr.init(ip, port)
-    return sys_connect(fd, @addr as *u8, SOCKADDR_IN_SIZE)
-
-# Shutdown the socket
-pub fn tcp_shutdown(fd: i32, how: i32) -> i32
-    return sys_shutdown(fd, how)
-
-# Get the local address of a socket
-pub fn tcp_getsockname(fd: i32, ip: @&i32, port: @&i32) -> i32
-    var addr: SockaddrIn
-    var addrlen: i32 = SOCKADDR_IN_SIZE
-    let ret: i32 = sys_getsockname(fd, @addr as *u8, @addrlen)
-    if ret >= 0
-        *ip = ntohl(addr.sin_addr)
-        *port = ntohs(addr.sin_port)
-    return ret
+# Socket is part of this API (runtime_accept), so importers get it too.
+pub import ritzlib.net
 
 # ============================================================================
 # Async operations via runtime
 # ============================================================================
 
-# Accept a connection asynchronously via io_uring.
-# Ok(the new fd) or Err(errno) from submission or the completion.
-pub fn runtime_accept(rt: @&Runtime, server_fd: i32) -> Result<i32, Errno>
+# Accept a connection on the listening `server` asynchronously via io_uring.
+# Ok(the connected Socket) or Err(errno) from submission or the completion.
+pub fn runtime_accept(rt: @&Runtime, server: @Socket) -> Result<Socket, Errno>
     let user_data: i64 = rt.next_user_data
     rt.next_user_data = rt.next_user_data + 1
 
@@ -204,7 +42,7 @@ pub fn runtime_accept(rt: @&Runtime, server_fd: i32) -> Result<i32, Errno>
         None => return Err(Errno.NoMem)
 
     # Prepare accept SQE
-    sqe.prep_accept(server_fd, 0, user_data)
+    sqe.prep_accept(server.raw(), 0, user_data)
     rt.ring.sqe_submit()
 
     # Submit and wait for completion
@@ -222,7 +60,7 @@ pub fn runtime_accept(rt: @&Runtime, server_fd: i32) -> Result<i32, Errno>
     if result < 0
         return Err(errno_from_raw(result))
 
-    return Ok(result)
+    return Ok(socket_from_raw(result))
 
 # Send data asynchronously via io_uring.
 # Ok(bytes written) or Err(errno) from submission or the completion.
@@ -281,19 +119,3 @@ pub fn runtime_recv(rt: @&Runtime, fd: i32, buf_sv: Span<u8>) -> Result<i64, Err
         return Err(errno_from_raw(result as i32))
 
     return Ok(result)
-
-# ============================================================================
-# IP address helpers
-# ============================================================================
-
-# Create an IPv4 address from 4 octets (a.b.c.d)
-pub fn ipv4(a: i32, b: i32, c: i32, d: i32) -> i32
-    return (a << 24) | (b << 16) | (c << 8) | d
-
-# Localhost address (127.0.0.1)
-pub fn localhost() -> i32
-    return ipv4(127, 0, 0, 1)
-
-# Any address (0.0.0.0)
-pub fn inaddr_any() -> i32
-    return 0

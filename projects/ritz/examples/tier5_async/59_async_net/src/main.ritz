@@ -34,12 +34,10 @@ fn assert_ge(a: i32, b: i32, msg: *u8) -> i32
 # The port a bound socket was given.  The self-tests below bind port 0 so the
 # kernel picks a free one: a fixed port failed (or hung) whenever anything else
 # on the host held it, e.g. two gates sharing a machine (AGAST #3136).
-fn bound_port(fd: i32) -> i32
-    var ip: i32 = 0
-    var port: i32 = 0
-    if tcp_getsockname(fd, @&ip, @&port) < 0
-        return -1
-    return port
+fn bound_port(sock: @Socket) -> i32
+    match sock.local_port()
+        Ok(p) => return p
+        Err(_) => return -1
 
 # ============================================================================
 # Test 1: Create and close a TCP socket
@@ -49,13 +47,15 @@ fn test_socket_create() -> i32
     print("test_socket_create... ")
 
     # Create a TCP socket
-    let fd: i32 = tcp_socket()
-    if fd < 0
-        print("FAIL: socket creation failed with {fd as i64}\n")
-        return 1
+    var sock: Socket = match socket_tcp()
+        Ok(s) => s
+        Err(e) =>
+            let code: i32 = e.code()
+            print("FAIL: socket creation failed with {code as i64}\n")
+            return 1
 
     # Close it
-    sys_close(fd)
+    sock.close()
 
     print("OK\n")
     return 0
@@ -67,19 +67,22 @@ fn test_socket_create() -> i32
 fn test_socket_bind() -> i32
     print("test_socket_bind... ")
 
-    let fd: i32 = tcp_socket()
-    if fd < 0
-        print("FAIL: socket creation failed\n")
-        return 1
+    var sock: Socket = match socket_tcp()
+        Ok(s) => s
+        Err(_) =>
+            print("FAIL: socket creation failed\n")
+            return 1
 
-    # Bind to localhost:0 (kernel assigns port)
-    let ret: i32 = tcp_bind(fd, 0, 0)  # 0.0.0.0:0
-    if ret < 0
-        print("FAIL: bind failed with {ret as i64}\n")
-        sys_close(fd)
-        return 1
+    # Bind to 0.0.0.0:0 (kernel assigns port)
+    match sock.bind("0.0.0.0", 0)
+        Ok(_) => pass
+        Err(e) =>
+            let code: i32 = e.code()
+            print("FAIL: bind failed with {code as i64}\n")
+            sock.close()
+            return 1
 
-    sys_close(fd)
+    sock.close()
     print("OK\n")
     return 0
 
@@ -90,29 +93,33 @@ fn test_socket_bind() -> i32
 fn test_socket_listen() -> i32
     print("test_socket_listen... ")
 
-    let fd: i32 = tcp_socket()
-    if fd < 0
-        return 1
+    var sock: Socket = match socket_tcp()
+        Ok(s) => s
+        Err(_) => return 1
 
     # Enable address reuse
-    let ret1: i32 = set_reuseaddr(fd)
-    if ret1 < 0
-        print("FAIL: setsockopt failed\n")
-        sys_close(fd)
-        return 1
+    match sock.set_reuseaddr()
+        Ok(_) => pass
+        Err(_) =>
+            print("FAIL: setsockopt failed\n")
+            sock.close()
+            return 1
 
-    let ret2: i32 = tcp_bind(fd, 0, 0)
-    if ret2 < 0
-        sys_close(fd)
-        return 1
+    match sock.bind("0.0.0.0", 0)
+        Ok(_) => pass
+        Err(_) =>
+            sock.close()
+            return 1
 
-    let ret3: i32 = tcp_listen(fd, 128)
-    if ret3 < 0
-        print("FAIL: listen failed with {ret3 as i64}\n")
-        sys_close(fd)
-        return 1
+    match sock.listen(128)
+        Ok(_) => pass
+        Err(e) =>
+            let code: i32 = e.code()
+            print("FAIL: listen failed with {code as i64}\n")
+            sock.close()
+            return 1
 
-    sys_close(fd)
+    sock.close()
     print("OK\n")
     return 0
 
@@ -124,64 +131,70 @@ fn test_connect_localhost() -> i32
     print("test_connect_localhost... ")
 
     # Create server socket
-    let server_fd: i32 = tcp_socket()
-    if server_fd < 0
-        return 1
+    var server: Socket = match socket_tcp()
+        Ok(s) => s
+        Err(_) => return 1
 
-    set_reuseaddr(server_fd)
+    server.set_reuseaddr()
 
     # Bind to localhost on a port the kernel picks
-    let lh: i32 = localhost()
-    let ret1: i32 = tcp_bind(server_fd, lh, 0)
-    let port: i32 = bound_port(server_fd)
-    if ret1 < 0
-        print("FAIL: server bind failed\n")
-        sys_close(server_fd)
-        return 1
+    match server.bind("127.0.0.1", 0)
+        Ok(_) => pass
+        Err(_) =>
+            print("FAIL: server bind failed\n")
+            server.close()
+            return 1
+    let port: i32 = bound_port(@server)
 
-    let ret2: i32 = tcp_listen(server_fd, 1)
-    if ret2 < 0
-        print("FAIL: listen failed\n")
-        sys_close(server_fd)
-        return 1
+    match server.listen(1)
+        Ok(_) => pass
+        Err(_) =>
+            print("FAIL: listen failed\n")
+            server.close()
+            return 1
 
     # Fork - child will connect, parent will accept
     let pid: i32 = sys_fork()
 
     if pid == 0
         # Child: connect to server
-        let client_fd: i32 = tcp_socket()
-        let ret: i32 = tcp_connect(client_fd, lh, port)
-        if ret < 0
-            sys_exit(1)
+        var client: Socket
+        match socket_tcp()
+            Ok(s) => client = s
+            Err(_) => sys_exit(1)
+        match client.connect("127.0.0.1", port)
+            Ok(_) => pass
+            Err(_) => sys_exit(1)
 
         # Send a byte
         var msg: [4]u8
         msg[0] = 72  # 'H'
         msg[1] = 105 # 'i'
         msg[2] = 0
-        sys_write(client_fd, @msg[0], 2)
+        sys_write(client.raw(), @msg[0], 2)
 
-        sys_close(client_fd)
+        client.close()
         sys_exit(0)
     else
         # Parent: accept connection
-        let client_fd: i32 = tcp_accept(server_fd)
-        if client_fd < 0
-            print("FAIL: accept failed with {client_fd as i64}\n")
-            sys_close(server_fd)
-            return 1
+        var client: Socket = match server.accept()
+            Ok(c) => c
+            Err(e) =>
+                let code: i32 = e.code()
+                print("FAIL: accept failed with {code as i64}\n")
+                server.close()
+                return 1
 
         # Read the message
         var buf: [16]u8
-        let n: i64 = sys_read(client_fd, @buf[0], 16)
+        let n: i64 = sys_read(client.raw(), @buf[0], 16)
 
         # Wait for child
         var status: i32 = 0
         sys_wait4(pid, @status, 0, null)
 
-        sys_close(client_fd)
-        sys_close(server_fd)
+        client.close()
+        server.close()
 
         if n != 2
             print("FAIL: expected 2 bytes, got {n}\n")
@@ -209,17 +222,17 @@ fn test_async_accept() -> i32
         return 1
 
     # Create server socket
-    let server_fd: i32 = tcp_socket()
-    if server_fd < 0
-        rt.destroy()
-        return 1
+    var server: Socket = match socket_tcp()
+        Ok(s) => s
+        Err(_) =>
+            rt.destroy()
+            return 1
 
-    set_reuseaddr(server_fd)
+    server.set_reuseaddr()
 
-    let lh: i32 = localhost()
-    tcp_bind(server_fd, lh, 0)
-    let port: i32 = bound_port(server_fd)
-    tcp_listen(server_fd, 1)
+    server.bind("127.0.0.1", 0)
+    let port: i32 = bound_port(@server)
+    server.listen(1)
 
     # Fork - child connects
     let pid: i32 = sys_fork()
@@ -233,29 +246,32 @@ fn test_async_accept() -> i32
         *(ts_ptr + 1) = 10000000  # 10ms in nanoseconds
         sys_nanosleep(@ts[0] as *i64, null)
 
-        let client_fd: i32 = tcp_socket()
-        tcp_connect(client_fd, lh, port)
-        sys_close(client_fd)
+        var client: Socket
+        match socket_tcp()
+            Ok(s) => client = s
+            Err(_) => sys_exit(1)
+        client.connect("127.0.0.1", port)
+        client.close()
         sys_exit(0)
     else
         # Parent: async accept via io_uring
-        let client_fd: i32 = match runtime_accept(@&rt, server_fd)
-            Ok(fd) => fd
-            Err(_) => -1
+        let accepted: Result<Socket, Errno> = runtime_accept(@&rt, @server)
 
         # Wait for child
         var status: i32 = 0
         sys_wait4(pid, @status, 0, null)
 
-        if client_fd < 0
-            print("FAIL: async accept failed\n")
-            sys_close(server_fd)
-            rt.destroy()
-            return 1
+        var client: Socket = match accepted
+            Ok(c) => c
+            Err(_) =>
+                print("FAIL: async accept failed\n")
+                server.close()
+                rt.destroy()
+                return 1
 
-        sys_close(client_fd)
+        client.close()
 
-    sys_close(server_fd)
+    server.close()
     rt.destroy()
     print("OK\n")
     return 0

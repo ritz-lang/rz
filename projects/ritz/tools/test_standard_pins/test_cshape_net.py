@@ -21,7 +21,7 @@ pytestmark = pytest.mark.unit
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent.parent
 
-PINS = {"out-param": (0, 4), "status-return": (0, 13)}
+PINS = {"out-param": (0, 4), "status-return": (0, 9)}
 
 
 def test_net_c_shapes_only_go_down():

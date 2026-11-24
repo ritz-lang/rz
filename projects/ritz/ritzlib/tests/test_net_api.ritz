@@ -929,3 +929,76 @@ fn test_epoll_wait_events_returns_fd_in_data() -> i32
     sys_close(b[1])
     sys_close(ep)
     0
+
+# ============================================================================
+# shutdown / raw / local_port / socket_from_raw (AGAST #4645)
+#
+# What async_net's i32-fd API (tcp_shutdown, tcp_getsockname, ...) did,
+# on the Socket.
+# ============================================================================
+
+[[test]]
+fn test_local_port_is_the_kernel_chosen_port() -> i32
+    var s: Socket = tcp()
+    assert unit_ok(s.bind("127.0.0.1", 0)) == 1
+    let got: i32 = int_of(s.local_port())
+    assert got > 0
+    assert got == bound_port(@s)
+    s.close()
+    0
+
+[[test]]
+fn test_local_port_of_closed_socket_is_ebadf() -> i32
+    var s: Socket = tcp()
+    s.close()
+    assert int_of(s.local_port()) == -1000 - E_BADF
+    0
+
+[[test]]
+fn test_raw_is_the_descriptor() -> i32
+    var s: Socket = tcp()
+    assert s.raw() == s.fd
+    assert s.raw() >= 0
+    s.close()
+    assert s.raw() == -1
+    0
+
+[[test]]
+fn test_socket_from_raw_adopts_the_descriptor() -> i32
+    var s: Socket = tcp()
+    var t: Socket = socket_from_raw(s.raw())
+    assert t.fd == s.fd
+    assert t.family == AF_INET and t.socktype == SOCK_STREAM
+    # The same descriptor: an option set through one is seen through the other.
+    assert unit_ok(t.set_reuseaddr()) == 1
+    assert unit_ok(t.bind("127.0.0.1", 0)) == 1
+    assert int_of(s.local_port()) == int_of(t.local_port())
+    s.close()
+    0
+
+[[test]]
+fn test_shutdown_write_gives_peer_eof() -> i32
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    var c: Socket = tcp()
+    assert unit_ok(c.connect("127.0.0.1", port)) == 1
+    var peer: Socket = peer_of(srv.accept())
+    assert peer.valid()
+    assert count_of(c.send_str("hi")) == 2
+    assert unit_ok(c.shutdown(SHUT_WR)) == 1
+    var buf: Vec<u8> = vec_new<u8>()
+    assert count_of(peer.recv_into(@&buf, 8)) == 2
+    # The half-close reached the peer: the next read is end of stream.
+    assert count_of(peer.recv_into(@&buf, 8)) == 0
+    peer.close()
+    c.close()
+    srv.close()
+    0
+
+[[test]]
+fn test_shutdown_unconnected_is_enotconn() -> i32
+    var s: Socket = tcp()
+    assert unit_err(s.shutdown(SHUT_RDWR)) == 107
+    s.close()
+    assert unit_err(s.shutdown(SHUT_RDWR)) == E_BADF
+    0
