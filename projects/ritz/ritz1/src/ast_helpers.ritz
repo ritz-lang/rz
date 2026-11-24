@@ -2959,9 +2959,123 @@ pub fn const_fold_int(consts: *ConstEntry, e: *Expr, resolve: i32, out: *i64) ->
             if const_fold_unsigned_op(e.op) == 1
                 if const_expr_is_u64(consts, e.left) == 1 or const_expr_is_u64(consts, e.right) == 1
                     return const_fold_unsigned(e.op, a as u64, b as u64, out)
+            if const_fold_traps(consts, e, a, b) == 1
+                return 0   # LARB R63 (AGAST #3489): const_overflow_site names it
             return const_fold_binary(e.op, a, b, out)
         _ => pass
     0
+
+# =============================================================================
+# Integer overflow (LARB R63, AGAST #3489)
+# =============================================================================
+# `+`, `-` and `*` stop the program on overflow at their type, as do signed
+# `/` and `%` of the minimum by -1; `+%`, `-%` and `*%` wrap.  A run can only
+# stop, so a constant expression has no value there: "overflow in a constant
+# expression is a compile error" (ritz0's ConstEvaluator._wrap_if_requested).
+
+# `+`, `-`, `*`, `/` or `%`, as the source spells it.
+pub fn arith_op_cstr(op: OpKind) -> *u8
+    match op
+        OpKind.Add =>
+            return c"+"
+        OpKind.Sub =>
+            return c"-"
+        OpKind.Mul =>
+            return c"*"
+        OpKind.Div =>
+            return c"/"
+        _ => pass
+    c"%"
+
+# 1 when `a op b` (`+`, `-` or `*`) leaves the `bits`-wide type, signed or
+# (uns == 1) unsigned.  `a` and `b` are values of that type held in an i64: a
+# u64 as its bit pattern.  Computed with the wrapping operators, so the
+# question never stops ritz1 itself.
+pub fn int_op_overflows(op: OpKind, a: i64, b: i64, bits: i32, uns: i32) -> i32
+    var r: i64 = a +% b
+    match op
+        OpKind.Sub =>
+            r = a -% b
+        OpKind.Mul =>
+            r = a *% b
+        _ => pass
+    if bits < 64
+        # Exact: two operands of at most 32 bits have a sum, difference and
+        # product a 64-bit pattern holds (a u32 product as a u64).
+        if uns == 1
+            return ((r as u64) > ((1 as u64) << (bits as u64)) - 1) as i32
+        let hi: i64 = (1 << (bits as i64 - 1)) - 1
+        return (r > hi or r < 0 - hi - 1) as i32
+    if uns == 1
+        match op
+            OpKind.Add =>
+                return ((r as u64) < (a as u64)) as i32
+            OpKind.Sub =>
+                return ((a as u64) < (b as u64)) as i32
+            _ =>
+                return (a != 0 and (r as u64) / (a as u64) != (b as u64)) as i32
+    match op
+        OpKind.Add =>
+            return ((a >= 0) == (b >= 0) and (r >= 0) != (a >= 0)) as i32
+        OpKind.Sub =>
+            return ((a >= 0) != (b >= 0) and (r >= 0) != (a >= 0)) as i32
+        _ => pass
+    if a == 0
+        return 0
+    if a == -1
+        return (b == 0 - 9223372036854775807 - 1) as i32
+    (r / a != b) as i32
+
+# 1 when folding `e` (operands `a` and `b`, already folded) is an overflow:
+# a plain `+ - *` outside i64 (u64 over a u64 operand), or signed MIN / -1.
+fn const_fold_traps(consts: *ConstEntry, e: *Expr, a: i64, b: i64) -> i32
+    if e.wrapping == 1
+        return 0
+    var uns: i32 = 0
+    if const_expr_is_u64(consts, e.left) == 1 or const_expr_is_u64(consts, e.right) == 1
+        uns = 1
+    match e.op
+        OpKind.Add | OpKind.Sub | OpKind.Mul =>
+            return int_op_overflows(e.op, a, b, 64, uns)
+        OpKind.Div | OpKind.Mod =>
+            return (uns == 0 and b == -1 and a == 0 - 9223372036854775807 - 1) as i32
+        _ => pass
+    0
+
+# The operation in constant expression `e` whose overflow keeps it from
+# folding (const_fold_traps), innermost first; null if there is none.
+pub fn const_overflow_site(consts: *ConstEntry, e: *Expr, resolve: i32) -> *Expr
+    if e == null
+        return null
+    match e.kind
+        ExprKind.Unary =>
+            return const_overflow_site(consts, e.operand, resolve)
+        ExprKind.Cast =>
+            return const_overflow_site(consts, e.left, resolve)
+        ExprKind.Binary => pass
+        _ =>
+            return null
+    let inner: *Expr = const_overflow_site(consts, e.left, resolve)
+    if inner != null
+        return inner
+    let inner_r: *Expr = const_overflow_site(consts, e.right, resolve)
+    if inner_r != null
+        return inner_r
+    var a: i64 = 0
+    var b: i64 = 0
+    if const_fold_int(consts, e.left, resolve, @a) == 0 or const_fold_int(consts, e.right, resolve, @b) == 0
+        return null
+    if const_fold_traps(consts, e, a, b) == 1
+        return e
+    null
+
+# `<file>:<line>:<col>: error: integer overflow in `+` in constant
+# expression`, ritz0's ConstEvalError text, at the operation.
+pub fn const_overflow_report(file: *u8, site: *Expr)
+    diag_error_at(file, diag_span(site.span.line, site.span.col))
+    eprints_cstr(c"integer overflow in `")
+    eprints_cstr(arith_op_cstr(site.op))
+    eprints_cstr(c"` in constant expression\n")
 
 # Is constant expression `e` a u64?  The rule of int_operand_shape in
 # emitter_expr_arith.ritz, for the two widths a fold can tell apart: a literal
@@ -3028,8 +3142,9 @@ fn const_fold_unsigned(op: OpKind, a: u64, b: u64, out: *i64) -> i32
     *out = r as i64
     1
 
-# Folding wraps: ritz1's fold runs for `+%` too, and #3489 owns the
-# plain-operator trap (LARB R63).
+# Folding wraps: a plain `+ - *` that would wrap, and signed MIN / -1, were
+# refused before here (const_fold_traps, LARB R63), so what reaches this is
+# `+%` and its kin, or a value that fits.
 fn const_fold_binary(op: OpKind, a: i64, b: i64, out: *i64) -> i32
     match op
         OpKind.Add =>
@@ -4341,7 +4456,7 @@ pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem: *
     if folded == 0
         if g_array_len_reparse == 0
             g_array_len_pending = 1
-        else
+        else if array_len_overflow(p, len_expr) == 0
             array_len_report(line, col, c"is not a constant integer expression")
         v = 0
     else if v < 0 or v > 2147483647
@@ -4353,6 +4468,21 @@ pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem: *
 # alternative: report each `[` once, as nd_array_report does.
 var g_array_len_line: i32 = -1
 var g_array_len_col: i32 = -1
+
+# LARB R63 (AGAST #3489): a length that overflows, `[9223372036854775807 + 1]u8`,
+# says so at the operation, as ritz0's const evaluator does.  1 if reported.
+fn array_len_overflow(p: *Parser, len_expr: *Expr) -> i32
+    var site: *Expr = const_overflow_site(p.module.constants, len_expr, 0)
+    if site == null and g_array_len_seed != null
+        site = const_overflow_site(g_array_len_seed, len_expr, 1)
+    if site == null
+        return 0
+    if site.span.line != g_array_len_line or site.span.col != g_array_len_col
+        g_array_len_line = site.span.line
+        g_array_len_col = site.span.col
+        g_attr_errors = g_attr_errors + 1
+        const_overflow_report(g_parse_file, site)
+    1
 
 fn array_len_report(line: i32, col: i32, why: *u8)
     if line == g_array_len_line and col == g_array_len_col

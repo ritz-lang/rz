@@ -21,6 +21,7 @@ import emitter_match
 import float_slot            # fs_literal_only (AGAST #4285)
 import ritzlib.io
 import ritzlib.str
+import ritzlib.memory      # malloc: a trap's message (AGAST #3489)
 
 
 # The Option / Result `e` is, by its type, or as a constructor naming one; null.
@@ -579,6 +580,11 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
         s.assert_cap_r = scaled_right
         s.assert_cap_ok = 1
 
+    # LARB R63 (AGAST #3489): `+ - *` checked; `/ %` and a shift count guarded.
+    let checked: i32 = arith_trap_guard(s, e, left_reg, scaled_right)
+    if checked >= 0
+        return checked
+
     let result: i32 = next_reg(s)
 
     emit_str(s, IR_INDENT)
@@ -840,10 +846,13 @@ pub fn vec_name_elem_type(name_sv: StrView) -> TypeKind
 
 # AGAST #3225: the slot `/` or `%` node `e` lands in directly, when it's wider
 # than `e`'s own integer type (literal_slot.ritz, lit_slot_arith); else
-# TypeKind.Void.  ritz0's _wider_slot.
+# TypeKind.Void.  ritz0's _wider_slot.  LARB R63 (AGAST #3489): `+ - *` and
+# `<<` record it too, since that is the type their overflow is checked at.
 fn wider_slot_type(s: *EmitterState, e: *Expr) -> TypeKind
-    if e.op != OpKind.Div and e.op != OpKind.Mod
-        return TypeKind.Void
+    match e.op
+        OpKind.Div | OpKind.Mod | OpKind.Add | OpKind.Sub | OpKind.Mul | OpKind.Shl => pass
+        _ =>
+            return TypeKind.Void
     let t: TypeKind = e.slot_type
     let bits: i32 = ty_bits(t)
     if bits <= 1
@@ -2359,3 +2368,379 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
                     _ => pass
     return 0
 
+
+# =============================================================================
+# Integer overflow traps (LARB R63, AGAST #3489)
+# =============================================================================
+# ritz0's #3488 (emitter/exprs.py, _emit_checked_int_arith and its guards), on
+# ritz1's i64 value model.  `+`, `-` and `*` stop the program on overflow at
+# their type: the wider slot's (#3225) when they land directly in one, else
+# int_operand_shape's.  `+%`, `-%` and `*%` wrap and never come here.  `/` and
+# `%` stop on a zero divisor and on signed MIN / -1, and a shift on a count
+# outside 0..width-1; bits `<<` shifts out are not an overflow.
+#
+# The operands are brought to the operation's type (trunc), run through
+# `llvm.<s|u><op>.with.overflow.iN`, and the result is extended back to the
+# i64 every integer is held in, by the type's signedness.  The overflow flag
+# branches to a block that calls @__ritz_overflow_trap, a cold module-local
+# fn that writes the located message to stderr and exits 1, then
+# `unreachable`.  The message is ritz0's: `<file>:<line>:<col>: integer
+# overflow in `+``.  Two constant operands make the trap certain, so that is
+# a compile error instead, as in ritz0.
+#
+# A freestanding target would stop through ritz_platform_fatal; ritz1 has no
+# freestanding target yet (AGAST #4607).
+
+# The intrinsics this module called, and whether it called the trap fn:
+# bit (op * 2 + unsigned) * 4 + width index, and OVF_TRAP_USED.  Read and
+# cleared by emit_overflow_helpers at the end of the module.
+var g_ovf_used: i32 = 0
+const OVF_TRAP_USED: i32 = 16777216    # 1 << 24, past the 24 intrinsic bits
+
+fn ovf_width_index(bits: i32) -> i32
+    if bits == 8
+        return 0
+    if bits == 16
+        return 1
+    if bits == 32
+        return 2
+    3
+
+fn ovf_op_index(op: OpKind) -> i32
+    match op
+        OpKind.Add =>
+            return 0
+        OpKind.Sub =>
+            return 1
+        _ => pass
+    2
+
+# The width (8, 16, 32 or 64) and signedness `e` runs at: its wider slot's,
+# else its operands' (int_operand_shape, ritz0's unified operand type).
+fn ovf_op_type(s: *EmitterState, e: *Expr, uns: *i32) -> i32
+    var bits: i32 = 0
+    let wider: TypeKind = wider_slot_type(s, e)
+    if wider != TypeKind.Void
+        *uns = ty_is_unsigned(wider)
+        bits = ty_bits(wider)
+    else
+        bits = int_operand_shape(s, e, uns)
+    if bits != 8 and bits != 16 and bits != 32
+        bits = 64
+    bits
+
+# The minimum of the signed `bits`-wide type; `-%` because at 64 bits it is
+# 0 -% i64::MIN, which wraps to itself (LARB R63).
+fn ovf_type_min(bits: i32) -> i64
+    0 -% (1 << (bits as i64 - 1))
+
+# `v` (not negative) in decimal at `p`; the number of digits written.
+fn ovf_put_dec(p: *u8, v: i64) -> i32
+    var n: i32 = 1
+    var t: i64 = v
+    while t >= 10
+        t = t / 10
+        n += 1
+    var i: i32 = n
+    t = v
+    while i > 0
+        i -= 1
+        *(p + i) = (48 + t % 10) as u8
+        t = t / 10
+    n
+
+fn ovf_put(p: *u8, text: *u8) -> i32
+    let n: i64 = strlen(text)
+    memcpy(p, text, n)
+    n as i32
+
+# `<file>:<line>:<col>: <what> `<op>`\n` as a string-table entry (its index);
+# its length in *out_len.  The file is the source's base name, as an assert's.
+fn ovf_message(s: *EmitterState, e: *Expr, what: *u8, out_len: *i32) -> i32
+    var file: *u8 = emitter_source_file()
+    if file == null
+        file = c"?"
+    var start: i64 = 0
+    var k: i64 = 0
+    while *(file + k) != 0
+        if *(file + k) == '/'
+            start = k + 1
+        k += 1
+    let base: *u8 = file + start
+    let m: *u8 = malloc(strlen(base) + strlen(what) + 64)
+    var n: i32 = ovf_put(m, base)
+    *(m + n) = ':'
+    n += 1
+    n += ovf_put_dec(m + n, e.span.line as i64)
+    *(m + n) = ':'
+    n += 1
+    n += ovf_put_dec(m + n, e.span.col as i64)
+    n += ovf_put(m + n, c": ")
+    n += ovf_put(m + n, what)
+    n += ovf_put(m + n, c" `")
+    n += ovf_put(m + n, binary_op_spelling(e.op))
+    n += ovf_put(m + n, c"`\n")
+    *(m + n) = 0
+    *out_len = n
+    add_string(s, StrView { ptr: m, len: n as i64 })
+
+# Stop the program, with `<what>` at `e`, when i1 register `cond` is true;
+# the builder continues in the block where it is false.
+fn ovf_guard(s: *EmitterState, e: *Expr, cond: i32, what: *u8)
+    var mlen: i32 = 0
+    let idx: i32 = ovf_message(s, e, what, @mlen)
+    let bad: i32 = next_label(s)
+    let ok: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cond)
+    emit_str(s, IR_LABEL_SEP)
+    emit_label(s, bad)
+    emit_str(s, IR_LABEL_SEP)
+    emit_label(s, ok)
+    emit_str(s, IR_NL)
+    begin_block(s, bad)
+    emit_str(s, c"  call void @__ritz_overflow_trap(ptr @.str.")
+    emit_int(s, idx as i64)
+    emit_str(s, IR_I64_SEP)
+    emit_int(s, mlen as i64)
+    emit_str(s, c")\n  unreachable\n")
+    begin_block(s, ok)
+    g_ovf_used = g_ovf_used | OVF_TRAP_USED
+
+# The value of a constant operand: a literal, `-literal`, or an integer const
+# no local or global shadows.  1 if `e` is one.
+fn ovf_const_operand(s: *EmitterState, e: *Expr, out: *i64) -> i32
+    if lit_int_value(e, out) == 1
+        return 1
+    if e.kind != ExprKind.Ident
+        return 0
+    let ce: *ConstEntry = unshadowed_const(s, StrView { ptr: e.ident_ptr, len: e.ident_len as i64 })
+    if ce == null or ce.fold_state != CONST_FOLD_DONE or is_int_const_type(ce.const_type) == 0
+        return 0
+    *out = ce.value
+    1
+
+# Refuse a constant `e` whose operation can only stop the program: 1 if
+# refused.  ritz0's _check_constant_arith, _guard_division and
+# _guard_shift_count on two constants (one, the count, for a shift).
+fn ovf_const_refused(s: *EmitterState, e: *Expr, bits: i32, uns: i32) -> i32
+    var a: i64 = 0
+    var b: i64 = 0
+    if ovf_const_operand(s, e.right, @b) == 0
+        return 0
+    if e.op == OpKind.Shl or e.op == OpKind.Shr
+        if b >= 0 and b < bits as i64
+            return 0
+        emit_nd_error_begin(s, e.span.line, e.span.col)
+        eprints_cstr(c"shift count out of range in `")
+    else
+        if ovf_const_operand(s, e.left, @a) == 0
+            return 0
+        if bits < 64 and uns == 1
+            let mask: i64 = (1 << (bits as i64)) - 1
+            a = a & mask
+            b = b & mask
+        if e.op == OpKind.Div or e.op == OpKind.Mod
+            if b == 0
+                emit_nd_error_begin(s, e.span.line, e.span.col)
+                eprints_cstr(c"division by zero in `")
+            else if uns == 0 and b == -1 and a == ovf_type_min(bits)
+                emit_nd_error_begin(s, e.span.line, e.span.col)
+                eprints_cstr(c"integer overflow in `")
+            else
+                return 0
+        else if int_op_overflows(e.op, a, b, bits, uns) == 1
+            emit_nd_error_begin(s, e.span.line, e.span.col)
+            eprints_cstr(c"integer overflow in `")
+        else
+            return 0
+    eprints_cstr(binary_op_spelling(e.op))
+    eprints_cstr(c"`\n")
+    1
+
+# `{ iN, i1 }`: what a with.overflow intrinsic returns.
+fn ovf_emit_pair_ty(s: *EmitterState, bits: i32)
+    emit_str(s, c"{ i")
+    emit_int(s, bits as i64)
+    emit_str(s, c", i1 }")
+
+fn ovf_emit_intrinsic(s: *EmitterState, opi: i32, uns: i32, bits: i32)
+    emit_str(s, c"@llvm.")
+    if uns == 1
+        emit_str(s, c"u")
+    else
+        emit_str(s, c"s")
+    if opi == 0
+        emit_str(s, c"add")
+    else if opi == 1
+        emit_str(s, c"sub")
+    else
+        emit_str(s, c"mul")
+    emit_str(s, c".with.overflow.i")
+    emit_int(s, bits as i64)
+
+# `reg` (an i64) at `bits`, a new register.
+fn ovf_trunc(s: *EmitterState, reg: i32, bits: i32) -> i32
+    let r: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, r)
+    emit_str(s, IR_TRUNC)
+    emit_reg(s, reg)
+    emit_str(s, c" to i")
+    emit_int(s, bits as i64)
+    emit_str(s, IR_NL)
+    r
+
+# `left op right` (`+`, `-` or `*`) at e's type, stopping on overflow; the
+# result is an i64 register, 0 if the operation was refused.
+fn ovf_checked_arith(s: *EmitterState, e: *Expr, left: i32, right: i32) -> i32
+    var uns: i32 = 0
+    let bits: i32 = ovf_op_type(s, e, @uns)
+    if ovf_const_refused(s, e, bits, uns) == 1
+        return 0
+    var a: i32 = left
+    var b: i32 = right
+    if bits < 64
+        a = ovf_trunc(s, left, bits)
+        b = ovf_trunc(s, right, bits)
+    let opi: i32 = ovf_op_index(e.op)
+    g_ovf_used = g_ovf_used | (1 << ((opi * 2 + uns) * 4 + ovf_width_index(bits)))
+    let pair: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, pair)
+    emit_str(s, c" = call ")
+    ovf_emit_pair_ty(s, bits)
+    emit_str(s, IR_SP)
+    ovf_emit_intrinsic(s, opi, uns, bits)
+    emit_str(s, c"(i")
+    emit_int(s, bits as i64)
+    emit_str(s, IR_SP)
+    emit_reg(s, a)
+    emit_str(s, c", i")
+    emit_int(s, bits as i64)
+    emit_str(s, IR_SP)
+    emit_reg(s, b)
+    emit_str(s, IR_CLOSE)
+    let val: i32 = ovf_extract(s, pair, bits, 0)
+    let flag: i32 = ovf_extract(s, pair, bits, 1)
+    ovf_guard(s, e, flag, c"integer overflow in")
+    if bits == 64
+        return val
+    let wide: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, wide)
+    if uns == 1
+        emit_str(s, c" = zext i")
+    else
+        emit_str(s, c" = sext i")
+    emit_int(s, bits as i64)
+    emit_str(s, IR_SP)
+    emit_reg(s, val)
+    emit_str(s, IR_TO_I64)
+    wide
+
+fn ovf_extract(s: *EmitterState, pair: i32, bits: i32, field: i32) -> i32
+    let r: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, r)
+    emit_str(s, c" = extractvalue ")
+    ovf_emit_pair_ty(s, bits)
+    emit_str(s, IR_SP)
+    emit_reg(s, pair)
+    emit_str(s, IR_COMMA)
+    emit_int(s, field as i64)
+    emit_str(s, IR_NL)
+    r
+
+# An i1 register: `reg pred value` on i64s.
+fn ovf_icmp(s: *EmitterState, pred: *u8, reg: i32, value: i64) -> i32
+    let r: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, r)
+    emit_str(s, c" = icmp ")
+    emit_str(s, pred)
+    emit_str(s, c" i64 ")
+    emit_reg(s, reg)
+    emit_str(s, IR_COMMA)
+    emit_int(s, value)
+    emit_str(s, IR_NL)
+    r
+
+# `/` and `%`: stop on a zero divisor, and on signed MIN / -1 at e's type.
+# The operands are already read back at that type (emit_expr_binary).
+fn ovf_division_guard(s: *EmitterState, e: *Expr, left: i32, right: i32) -> i32
+    var uns: i32 = 0
+    let bits: i32 = ovf_op_type(s, e, @uns)
+    if ovf_const_refused(s, e, bits, uns) == 1
+        return 0
+    ovf_guard(s, e, ovf_icmp(s, c"eq", right, 0), c"division by zero in")
+    if uns == 1
+        return 1
+    let is_min: i32 = ovf_icmp(s, c"eq", left, ovf_type_min(bits))
+    let is_m1: i32 = ovf_icmp(s, c"eq", right, -1)
+    let both: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, both)
+    emit_str(s, c" = and i1 ")
+    emit_reg(s, is_min)
+    emit_str(s, IR_COMMA)
+    emit_reg(s, is_m1)
+    emit_str(s, IR_NL)
+    ovf_guard(s, e, both, c"integer overflow in")
+    1
+
+# `<<` and `>>`: stop unless the count is in 0..width-1.  An unsigned compare
+# catches a negative count too: as a u64 it is far above the width.
+fn ovf_shift_guard(s: *EmitterState, e: *Expr, count: i32) -> i32
+    var uns: i32 = 0
+    let bits: i32 = ovf_op_type(s, e, @uns)
+    if ovf_const_refused(s, e, bits, uns) == 1
+        return 0
+    ovf_guard(s, e, ovf_icmp(s, c"uge", count, bits as i64), c"shift count out of range in")
+    1
+
+# emit_expr_binary's integer step: the result register of a checked `+ - *`
+# (0 if refused), 0 for a refused `/ % << >>`, else -1: the caller emits the
+# operation itself, after any guard this emitted.
+fn arith_trap_guard(s: *EmitterState, e: *Expr, left: i32, right: i32) -> i32
+    match e.op
+        OpKind.Add | OpKind.Sub | OpKind.Mul =>
+            if e.wrapping == 1
+                return -1
+            return ovf_checked_arith(s, e, left, right)
+        OpKind.Div | OpKind.Mod =>
+            if ovf_division_guard(s, e, left, right) == 0
+                return 0
+        OpKind.Shl | OpKind.Shr =>
+            if ovf_shift_guard(s, e, right) == 0
+                return 0
+        _ => pass
+    -1
+
+# The declarations of the intrinsics this module called and its trap fn;
+# resets the record for the next module.  `cold` keeps the trap blocks off
+# the hot path; `noinline` keeps each a call, not a copy of the syscalls.
+pub fn emit_overflow_helpers(s: *EmitterState)
+    var bit: i32 = 0
+    while bit < 24
+        if (g_ovf_used & (1 << bit)) != 0
+            var bits: i32 = 64
+            if bit % 4 < 3
+                bits = 8 << (bit % 4)
+            emit_str(s, c"declare ")
+            ovf_emit_pair_ty(s, bits)
+            emit_str(s, IR_SP)
+            ovf_emit_intrinsic(s, bit / 8, (bit / 4) % 2, bits)
+            emit_str(s, c"(i")
+            emit_int(s, bits as i64)
+            emit_str(s, c", i")
+            emit_int(s, bits as i64)
+            emit_str(s, c")\n")
+        bit += 1
+    if (g_ovf_used & OVF_TRAP_USED) != 0
+        emit_str(s, c"define internal void @__ritz_overflow_trap(ptr %msg, i64 %len) cold noinline noreturn nounwind")
+        emit_no_red_zone_attr(s)
+        emit_str(s, c" {\nentry:\n")
+        emit_str(s, c"  %w = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, ptr %msg, i64 %len)\n")
+        emit_str(s, c"  %x = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 60, i64 1)\n  unreachable\n}\n")
+    g_ovf_used = 0

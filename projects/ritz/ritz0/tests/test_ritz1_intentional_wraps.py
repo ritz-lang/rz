@@ -11,8 +11,8 @@ wrapping, so the ritz1 binary itself stopped with `integer overflow in ...`:
   pointer globals) negate and complement an i64 that also holds u64 values, so
   `-9223372036854775808` and `~0x8000000000000000` negate i64::MIN.
 
-ritz1_selfhosted is built by ritz1, which still wraps until #3489, so only
-ritz1 can show the trap.
+ritz1_selfhosted is built by ritz1, which traps too since #3489, so both
+binaries run every row.
 """
 
 import pytest
@@ -74,15 +74,16 @@ pub fn main() -> i32
 }
 
 
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
 @pytest.mark.parametrize("name", sorted(REFUSED))
-def test_ritz1_refuses_overflowing_product(tmp_path, name):
-    comp, _ = _compile("ritz1", tmp_path, REFUSED[name])
+def test_ritz1_refuses_overflowing_product(tmp_path, compiler, name):
+    comp, _ = _compile(compiler, tmp_path, REFUSED[name])
     out = comp.stdout + comp.stderr
-    assert "integer overflow" not in out, f"ritz1 trapped:\n{out[-2000:]}"
+    assert "integer overflow" not in out, f"{compiler} trapped:\n{out[-2000:]}"
     assert comp.returncode != 0 and "implicit narrowing" in out, out[-2000:]
 
 
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
 @pytest.mark.parametrize("name", sorted(RUNS))
 def test_global_initialiser_folds_i64_min(tmp_path, compiler, name):
     program, want = RUNS[name]

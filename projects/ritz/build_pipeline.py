@@ -1200,7 +1200,7 @@ def module_compile_cmd(compiler: str, src: Path, ll_path: Path, target: Target, 
         # The triple, when the build has one (AGAST #3488): the emitter reads
         # it to know a kernel's traps stop through ritz_platform_fatal.
         # ritz1's own compiler_args carry no --target; it ignores unknown
-        # options and its traps are #3489.
+        # options, and has no freestanding trap path yet (AGAST #4607).
         if target.triple:
             cmd.extend(["--target", target.triple])
         # Pass dependencies if any (RFC #109 Phase 2)

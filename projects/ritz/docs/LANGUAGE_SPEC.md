@@ -2488,7 +2488,12 @@ the operation runs at the slot's type, so it stops only if the result leaves
 that type. `/` and `%` stop the program, likewise, on division or remainder by
 zero and on the signed minimum divided by -1. `+%`, `-%` and `*%` wrap instead,
 by request (§ Wrapping operators); `as` truncates, and bits shifted out by `<<`
-are not an overflow.
+are not an overflow. ritz0, ritz1 and ritz1_selfhosted all stop on these, in
+every build profile (AGAST #3488, #3489).
+
+```ritz body expect-error="integer overflow in `+`"
+let z = 9223372036854775807 + 1
+```
 
 #### Wider slots
 
@@ -2770,6 +2775,11 @@ type, stops the program (LARB R63): it writes
 `<file>:<line>:<col>: shift count out of range in `<op>`` to stderr and exits 1.
 A constant count outside that range is a compile error. Bits shifted out by `<<`
 are not an overflow: `255 << 4` is `240` in a `u8`.
+
+```ritz body expect-error="shift count out of range in `<<`"
+let x: u8 = 1
+let y = x << 8
+```
 
 Bitwise operators bind looser than `==`, so `x & 1 == 1` is `x & (1 == 1)`, which
 is an error. Parenthesise it:
