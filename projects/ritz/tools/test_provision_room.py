@@ -526,3 +526,33 @@ def test_briefing_teardown_proves_land_by_the_commits_own_changes():
     assert "patch identity" not in flat
     # The room rm guard is the actual safety gate.
     assert "room rm" in flat
+
+
+@pytest.mark.unit
+def test_briefing_says_write_ritz_not_c():
+    """AGAST #4673: every room is told the c"" POLICY, and rz checks for it.
+
+    The step sits between "Test first" (2) and "Subagents" (3); it is `2a`
+    so the 40-odd "step N" references to the later steps stay true.
+    """
+    text = SKILL.read_text()
+    brief_at = text.index("### The briefing (send verbatim")
+    brief_end = text.index("**Remote additions to the briefing**", brief_at)
+    briefing = text[brief_at:brief_end]
+    step2 = briefing.index("2. **Test first.**")
+    step3 = briefing.index("3. **Subagents (Agent tool)")
+    at = briefing.index("2a. **Write Ritz, not C.**")
+    assert step2 < at < step3
+    flat = " ".join(briefing[at:step3].split())
+    assert "only for C interop" in flat
+    assert "NUL termination" in flat
+    assert 'no new `c""` outside an interop boundary' in flat
+    assert "take `StrView`" in flat
+    assert "docs/RITZ_NOT_C.md" in flat
+    # The reap side: rz reads a REAP's diff for added c"" and bounces it.
+    reap_at = text.index("2. **Check each REAP line before it boards.**")
+    reap_end = text.index("3. **Build the train**", reap_at)
+    reap = " ".join(text[reap_at:reap_end].split())
+    assert 'added `c"`' in reap
+    assert "interop boundary" in reap
+    assert "Bounce any added literal outside an interop boundary" in reap

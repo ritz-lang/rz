@@ -246,27 +246,18 @@ git diff --name-only main | grep "^projects/"
 
 **You are not a C developer. Write Ritz, not C-with-indentation.**
 
-### Anti-Patterns → Idiomatic Ritz
+`c"strings"` are only for C interop, where the callee can't take a length and
+needs NUL termination; null termination is unsafe and heavily discouraged
+wherever a safer API exists. App code passes `StrView`/`String`, returns
+`Result`/`Option` rather than `i32` status codes and out-params, and uses owning
+types rather than raw `*u8` + length. If the only API for something takes
+NUL-terminated `*u8`, the fix is a `StrView` API in ritzlib, not a `c""` at the
+call site.
 
-| ❌ C-Style (Bad) | ✅ Idiomatic Ritz (Good) |
-|------------------|--------------------------|
-| `fn process(data: *Data)` | `fn process(data: Data)` — const borrow |
-| `fn update(data: *mut Data)` | `fn update(data:& Data)` — mutable borrow |
-| `fn consume(data: *Data)` | `fn consume(data:= Data)` — move ownership |
-| `c"hello"` | `"hello"` — StrView is default |
-| `@test` | `[[test]]` — new attribute syntax |
-| `if a && b \|\| !c` | `if a and b or not c` — keywords, not symbols |
-| `if ptr != null` | `match opt { Some(x) => ... }` — use Option |
-| Manual cleanup | `defer close(fd)` — automatic cleanup |
-| `var x = 42` | `let x = 42` — immutable by default |
-
-### Ownership Modifiers (The Ritz Way)
-
-| Syntax | Meaning | When to Use |
-|--------|---------|-------------|
-| `x: T` | Const borrow | Default — ~70% of parameters |
-| `x:& T` | Mutable borrow | When you modify the value |
-| `x:= T` | Move ownership | When caller gives up the value |
+**Start here:** `projects/ritz/docs/RITZ_NOT_C.md` (the C habit → Ritz form
+table, every example compiled), then `projects/ritz/docs/STANDARD.md` (the
+rules). A review applies `projects/ritz/docs/REVIEW.md` (`/ritz-review`).
+`projects/ritz/docs/LANGUAGE_SPEC.md` is the reference.
 
 ---
 
@@ -400,9 +391,9 @@ ritzlib,squeeze,valet: 🤖 <description>
   - `PascalCase` for types and structs
   - `SCREAMING_SNAKE` for constants
 - **Logical operators:** `and`, `or`, `not` (not `&&`, `||`, `!`)
-- **Strings:** Plain `"string"` (not `c"string"`)
+- **Strings:** Plain `"string"`; `c"string"` only at a C-interop boundary (STANDARD.md S-TEXT-1)
 - **Attributes:** `[[test]]` (not `@test`)
-- **Borrows:** Use `:`, `:&`, `:=` modifiers (not raw pointers)
+- **Parameters:** `x: T`, `x: @T`, `x: @&T` / `x:& T`, `Span<T>`, `StrView` (not raw pointers; STANDARD.md S-PTR-1)
 
 ---
 
@@ -410,7 +401,9 @@ ritzlib,squeeze,valet: 🤖 <description>
 
 | Resource | Location |
 |----------|----------|
-| Language Spec | `projects/ritz/docs/LANGUAGE_SPEC.md` |
+| Ritz, not C (start here) | `projects/ritz/docs/RITZ_NOT_C.md` |
+| Review checklist | `projects/ritz/docs/REVIEW.md` |
+| Language Spec (reference) | `projects/ritz/docs/LANGUAGE_SPEC.md` |
 | Design Decisions | `projects/larb/docs/DESIGN_DECISIONS.md` |
 | Ritz Standard (idioms and style) | `projects/ritz/docs/STANDARD.md` |
 | Ecosystem Overview | `projects/ritz/docs/ECOSYSTEM.md` |
@@ -428,7 +421,7 @@ spec, style guide, stdlib reference and ecosystem overview moved from
 ## Remember
 
 1. **No Concessions** — Fix the language, don't work around it
-2. **Write Ritz, not C** — Use borrows, Option, defer, keywords
+2. **Write Ritz, not C** — StrView, Result, Option, defer; `c""` only for C interop
 3. **Atomic Changes** — Cross-project changes in one commit
 4. **Test First** — TDD is not optional
 5. **Main is Green** — Always branch from stable main

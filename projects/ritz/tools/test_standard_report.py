@@ -25,7 +25,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from standard_report import (
     RULES,
+    c_literal_breaches,
+    c_literals_by_project,
     callers_by_project,
+    count_c_literals,
     count_callers,
     exempt_apis,
     ratchet_breaches,
@@ -503,6 +506,57 @@ def test_cli_callers(tmp_path):
     ).stdout
     data = json.loads(out)
     assert data["by_api"] == {"sys_pipe": 1} and data["by_project"] == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
+# --c-literals (#4673): `c"..."` literals per project, pinned down-only
+# (test_standard_callers.py).  S-TEXT-1: c"" is for C interop only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("line, want", [
+    ('    sys_open(c"/tmp/x", 0)', 1),
+    ('    let a = c"one" ; let b = c"two"', 2),
+    ('    print("plain")', 0),
+    ('    print("c")', 0),                       # a plain literal holding c
+    ('    print("\\"c")', 0),                  # an escaped quote, then c, inside a plain one
+    ("    let q = '\"'  ; f(c\"x\")", 1),        # a char literal holding a quote
+    ('    let abc = 1  # c"in a comment"', 0),
+    ('    print("#") ; f(c"after a hash in a string")', 1),
+    ('    magic"x"', 0),                         # some other identifier, not the c prefix
+], ids=["call", "two", "plain", "c-inside", "escaped", "char-quote", "comment",
+        "hash-in-string", "other-prefix"])
+def test_c_literals_counts_only_the_c_prefix(line, want):
+    assert count_c_literals(line) == want
+
+
+def test_c_literals_totals_per_project(tmp_path):
+    _tree(tmp_path, {
+        "proj/a/m.ritz": 'fn f()\n    g(c"x")\n    g(c"y")\n',
+        "proj/a/tests/t.ritz": 'fn t()\n    g(c"z")\n',     # tests count too
+        "proj/b/src/m.ritz": 'fn f()\n    g("x")\n',
+        "proj/b/build/gen.ritz": 'fn f()\n    g(c"gen")\n',  # build output isn't the tree
+        "proj/a/notes.md": 'c"not ritz"\n',
+    })
+    assert c_literals_by_project([tmp_path / "proj"]) == {"a": 3, "b": 0}
+
+
+def test_c_literal_pin_fails_on_an_added_literal_and_passes_on_a_removed_one():
+    pins = {"a": 3, "b": 0}
+    assert c_literal_breaches({"a": 3, "b": 0}, pins) == []
+    assert c_literal_breaches({"a": 2, "b": 0}, pins) == []          # removed one: passes
+    assert c_literal_breaches({"a": 4, "b": 0}, pins) == ["a: 4 c\"\" literals > pin 3"]
+    assert c_literal_breaches({"new": 1}, pins) == ["new: 1 c\"\" literals > pin 0"]
+
+
+@pytest.mark.integration
+def test_cli_c_literals(tmp_path):
+    _tree(tmp_path, {"proj/a/m.ritz": 'fn f()\n    g(c"x")\n'})
+    out = subprocess.run(
+        [sys.executable, str(TOOL), "--c-literals", "--json", str(tmp_path / "proj")],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert json.loads(out) == {"total": 1, "by_project": {"a": 1}}
 
 
 # ---------------------------------------------------------------------------

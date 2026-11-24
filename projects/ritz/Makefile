@@ -57,6 +57,7 @@ DOC_EXAMPLE_DOCS := \
 	docs/LANGUAGE_SPEC.md \
 	docs/STDLIB_REFERENCE.md \
 	docs/STANDARD.md \
+	docs/RITZ_NOT_C.md \
 	docs/ECOSYSTEM.md
 
 .PHONY: check-doc-examples

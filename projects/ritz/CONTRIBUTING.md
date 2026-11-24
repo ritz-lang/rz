@@ -459,7 +459,8 @@ Fixes #123
 
 | Document | Purpose |
 |----------|---------|
-| `docs/LANGUAGE.md` | Language specification |
+| `docs/RITZ_NOT_C.md` | Write Ritz, not C (start here) |
+| `docs/LANGUAGE_SPEC.md` | Language specification |
 | `docs/DOCTRINE.md` | Development principles |
 | `docs/TESTING.md` | Test syntax and practices |
 | `docs/BOOTSTRAP.md` | Self-hosting strategy |
