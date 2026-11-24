@@ -32,7 +32,7 @@ def _summary(module: str) -> dict[str, dict[str, int]]:
 @pytest.mark.parametrize(
     ("module", "exempt"),
     [
-        ("span.ritz", 5),     # 5 raw-pair / C-string constructor boundaries
+        ("span.ritz", 3),     # 3 raw-pair constructor boundaries (#4639 deleted span_from_cstr, span_eq_cstr)
         ("strview.ritz", 4),  # 4 C-string / raw-pair boundaries (#4639 deleted cmp_cstr)
         ("string.ritz", 6),   # 2 *Allocator + 4 C-string; push_bytes is a Span (#4555)
     ],

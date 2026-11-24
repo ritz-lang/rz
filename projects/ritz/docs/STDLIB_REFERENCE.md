@@ -899,7 +899,7 @@ struct Span<T>
 | `span_empty` | `fn<T>() -> Span<T>` | Create empty span |
 | `span_from_ptr` | `fn<T>(ptr: *T, len: i64) -> Span<T>` | From raw pointer |
 | `span_from_vec` | `fn<T>(v: @Vec<T>) -> Span<T>` | From Vec |
-| `span_from_cstr` | `fn(cstr: *u8) -> Span<u8>` | From C string |
+| `span_from_strview` | `fn(sv: StrView) -> Span<u8>` | Same bytes as a StrView, no copy |
 | `span_literal` | `fn(ptr: *u8, len: i64) -> Span<u8>` | From literal with known length |
 
 **Methods** (`impl<T> Span<T>`, AGAST #4445):
@@ -935,7 +935,6 @@ the same name (`span_eq` calls `.eq`), and `span_as_strview` / `span_from_strvie
 | `span_as_strview` | `fn(s: @Span<u8>) -> StrView` | View the same bytes as a StrView |
 | `span_eq` | `fn(a: @Span<u8>, b: @Span<u8>) -> bool` | Compare equality |
 | `span_cmp` | `fn(a: @Span<u8>, b: @Span<u8>) -> Ordering` | Bytewise order, as `StrView.cmp`. Replaces `memcmp` |
-| `span_eq_cstr` | `fn(s: @Span<u8>, cstr: *u8) -> bool` | Compare to C string |
 | `span_contains` | `fn(haystack: @Span<u8>, needle: @Span<u8>) -> bool` | Contains check |
 | `span_starts_with` | `fn(s: @Span<u8>, prefix: @Span<u8>) -> bool` | Prefix check |
 | `span_ends_with` | `fn(s: @Span<u8>, suffix: @Span<u8>) -> bool` | Suffix check |
@@ -955,8 +954,9 @@ type of a bare `"..."` literal. It never allocates or frees, is not
 NUL-terminated, and must not outlive the bytes it points at. Use `String`
 (`ritzlib.string`) when you need to own or grow the text. Every method takes
 the view by value; slicing returns a new view of the same bytes. The module
-is bare (no allocator in its imports); for a `malloc`ed NUL-terminated copy,
-`ritzlib.string`'s `strview_to_cstr(sv)` (the caller `free`s it).
+is bare (no allocator in its imports); for an owned NUL-terminated copy, use
+`ritzlib.string`'s `string_from(sv)` and its `as_ptr()` (the `String`'s drop
+frees it).
 
 **Construction** (free fns; no method form):
 

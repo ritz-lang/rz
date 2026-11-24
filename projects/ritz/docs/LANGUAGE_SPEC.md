@@ -1237,7 +1237,8 @@ fn main() -> i32
 ```
 
 Ask for the conversion by name: `span_from_strview` for a `StrView` (via
-`s.as_view()` for a `String`) and `span_from_cstr` for a `*u8`:
+`s.as_view()` for a `String`); a bare literal also goes straight into a
+`Span<u8>` slot:
 
 ```ritz
 import ritzlib.span
@@ -1247,7 +1248,7 @@ import ritzlib.strview
 fn main() -> i32
     let v: StrView = "abc"
     let a: Span<u8> = span_from_strview(v)
-    let b: Span<u8> = span_from_cstr(c"abc")
+    let b: Span<u8> = "abc"
     var t: String = string_from("abc")
     let c: Span<u8> = span_from_strview(t.as_view())
     let n = a.len + b.len + c.len

@@ -52,7 +52,6 @@ def test_string_eq_family_returns_bool(method):
 PREDICATES = {
     "span.ritz": [
         "span_eq",
-        "span_eq_cstr",
         "span_contains",
         "span_starts_with",
         "span_ends_with",

@@ -13,8 +13,8 @@ hosted program, and a freestanding one defines its own.
 
 BARE is the heap-free part of the core: modules that import only BARE
 modules, so they reach no allocator and a target with no heap (the UEFI
-loader, HWINV) can import them.  ritzlib.strview is one (AGAST #4601): its
-one malloc user, to_cstr, is ritzlib.string's strview_to_cstr.
+loader, HWINV) can import them.  ritzlib.strview is one (AGAST #4601): an
+owned NUL-terminated copy is ritzlib.string's string_from(sv).as_ptr().
 
     python3 tools/ritzlib_layers.py [RITZLIB]   # exit 1 naming each violation
 
