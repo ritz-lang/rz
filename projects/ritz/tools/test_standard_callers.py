@@ -34,7 +34,7 @@ PROJECTS = RITZ_ROOT.parent
 
 PINS = {
     "angelo": 7,
-    "cryptosec": 391,
+    "cryptosec": 109,
     "goliath": 36,
     "harland": 25,
     "http": 125,
