@@ -66,8 +66,13 @@ import ritzlib.sys
 import ritzlib.io
 
 import ast
+import types
 import ast_helpers
+import ast_query    # name_eq, eprint_bytes, user_enum_index
 import sema
+import sema_type    # sema_expr_ty
+import field_slot   # eprint_source_type
+import tail_value   # tail_stmts_diverge
 
 # The last statement of the arm's body, or null.
 fn if_arm_last(arm: *MatchArm) -> *Stmt
@@ -125,3 +130,183 @@ pub fn if_arm_check_match_arm(sm: *Sema, arm: *MatchArm)
     let last: *Stmt = if_arm_last(arm)
     if last != null and last.kind == StmtKind.If and last.if_else == null
         if_arm_no_else_report(sm, last.span.line, last.span.col)
+
+# =============================================================================
+# A match used as a value whose arms don't yield one value type (AGAST #4656)
+# =============================================================================
+#
+# ritz0 refuses a match whose value is wanted (a `let`, an assignment, a
+# `return`, an operand, a fn's tail) when an arm yields no value (a block
+# ending in a statement that doesn't leave it) or the arms' values can't
+# merge: a struct beside an integer, two different structs, `()` beside an
+# integer.  It says so at the match, or, for a typed `let`'s initialiser, at
+# the `let`, naming the annotation (test_match_no_value_consumed.py).
+#
+# sema_walk_arms notes each arm (match_value_note) with its bindings and
+# `let`s still in scope, then settles the match (match_value_settle).  Only
+# what ritz0 certainly refuses counts: a plain struct beside an integer, `()`,
+# an enum or another struct, and `()` beside an integer.  A tuple, a pointer,
+# a float (float_slot's), a `bool` or a nested `if` / `match` arm is left
+# unjudged, and two enums or an enum and an integer are (a variant's typing
+# varies with its generic).
+
+const MV_SKIP: i32 = 0     # unjudged
+const MV_NONE: i32 = 1     # no value
+const MV_INT: i32 = 2      # an integer
+const MV_UNIT: i32 = 3     # `()`
+const MV_STRUCT: i32 = 4   # a plain struct, named
+const MV_ENUM: i32 = 5     # an enum
+
+pub struct MatchValue
+    want: i32        # the arms are judged: the match's value is wanted
+    stmt: i32        # a match statement (the fn's tail): no-value arms aren't judged
+    line: i32        # where the match is
+    col: i32
+    seen: i32        # a bit per MV_* an arm yields
+    name: *u8        # the first struct arm's name
+    name_len: i32
+    clash: i32       # two struct arms name different structs
+
+# The match statement `st` is the next whose arms sema_walk_arms walks
+# (match_value_begin takes it).
+pub fn match_value_stmt_at(sm: *Sema, st: *Stmt)
+    sm.mv_stmt = st
+
+# `st` is a `let` / `var`: if it is typed and its initialiser a match, that
+# match's refusal names it.
+pub fn match_value_let(sm: *Sema, st: *Stmt)
+    if st.var_init != null and st.var_init.kind == ExprKind.Match and st.var_declared_type != TypeKind.Void
+        sm.mv_let = st
+
+# Start judging the arms of `owner` (an ExprKind.Match), or of a match
+# statement (owner null) at match_value_stmt_at's place.
+pub fn match_value_begin(sm: *Sema, mv: *MatchValue, owner: *Expr, discard: i32)
+    mv.want = 0
+    mv.stmt = (owner == null) as i32
+    mv.seen = 0
+    mv.name = null
+    mv.name_len = 0
+    mv.clash = 0
+    if owner == null
+        let st: *Stmt = sm.mv_stmt
+        sm.mv_stmt = null
+        if discard == 0 and st != null
+            mv.want = 1
+            mv.line = st.span.line
+            mv.col = st.span.col
+        return
+    if owner.kind == ExprKind.Match and discard == 0
+        mv.want = 1
+        mv.line = owner.span.line
+        mv.col = owner.span.col
+
+# The MV_* of arm `arm`'s value; a struct's name into `t`.
+fn mv_class(sm: *Sema, arm: *MatchArm, t: *SemaTy) -> i32
+    if arm.is_pass != 0
+        let last: *Stmt = if_arm_last(arm)
+        if last == null or last.kind == StmtKind.Break or last.kind == StmtKind.Continue or tail_stmts_diverge(arm.body_stmts) == 1
+            return MV_SKIP
+        # An else-less `if` tail has #1406's error (if_arm_check_match_arm).
+        if last.kind == StmtKind.If and last.if_else == null
+            return MV_SKIP
+        return MV_NONE
+    mv_value_class(sm, arm.body, t)
+
+# The MV_* of the value `v`; a struct's name into `t`.
+fn mv_value_class(sm: *Sema, v: *Expr, t: *SemaTy) -> i32
+    if v == null or v.kind == ExprKind.If or v.kind == ExprKind.Match
+        return MV_SKIP
+    if is_unit_expr(v) == 1
+        return MV_UNIT
+    if v.kind == ExprKind.StructLit and v.ident_len == 0
+        return MV_SKIP   # a tuple, which ritz0 merges element-wise
+    let k: TypeKind = sema_expr_ty(sm, v, t)
+    if ty_is_int(k) == 1
+        return MV_INT
+    if k != TypeKind.Struct or t.name == null or t.name_len <= 0
+        return MV_SKIP
+    let tn: StrView = StrView { ptr: (t.name), len: (t.name_len) as i64 }
+    if user_enum_index(sm.pctx, tn) >= 0 or is_tagged_enum_type(tn) == 1
+        return MV_ENUM
+    if t.name_len > 6 and name_eq(StrView { ptr: (t.name), len: (6) as i64 }, "tuple_") == 1
+        return MV_SKIP
+    MV_STRUCT
+
+# Note arm `arm` of the match `mv` judges, its bindings in scope.
+pub fn match_value_note(sm: *Sema, mv: *MatchValue, arm: *MatchArm)
+    if mv.want == 0
+        return
+    var t: SemaTy
+    let c: i32 = mv_class(sm, arm, @t)
+    if c == MV_SKIP or (c == MV_NONE and mv.stmt == 1)
+        return
+    if c == MV_STRUCT
+        if mv.name == null
+            mv.name = t.name
+            mv.name_len = t.name_len
+        else if name_eq(StrView { ptr: (mv.name), len: (mv.name_len) as i64 }, StrView { ptr: (t.name), len: (t.name_len) as i64 }) == 0
+            mv.clash = 1
+    mv.seen = mv.seen | (1 << c)
+
+fn mv_has(mv: *MatchValue, c: i32) -> i32
+    ((mv.seen & (1 << c)) != 0) as i32
+
+# 1 if the arms `mv` noted yield no one value type.
+fn mv_no_value(mv: *MatchValue) -> i32
+    if mv.clash == 1 or mv_has(mv, MV_NONE) == 1
+        return 1
+    if mv_has(mv, MV_STRUCT) == 1 and (mv_has(mv, MV_INT) == 1 or mv_has(mv, MV_UNIT) == 1 or mv_has(mv, MV_ENUM) == 1)
+        return 1
+    (mv_has(mv, MV_UNIT) == 1 and mv_has(mv, MV_INT) == 1) as i32
+
+# Every arm was noted: refuse the match if it has no value.
+pub fn match_value_settle(sm: *Sema, mv: *MatchValue, owner: *Expr)
+    if mv.want == 0 or mv_no_value(mv) == 0
+        return
+    let st: *Stmt = sm.mv_let
+    if owner != null and st != null and st.var_init == owner
+        sm.mv_let = null
+        sema_error_at(sm, st.span.line, st.span.col)
+        eprint_char('`')
+        eprint_bytes(StrView { ptr: (st.var_name), len: (st.var_name_len) as i64 })
+        eprints("` is declared `")
+        if st.var_declared_type == TypeKind.Struct and st.var_type_name != null
+            eprint_source_type(StrView { ptr: (st.var_type_name), len: (st.var_type_name_len) as i64 })
+        else
+            let t: TypeKind = st.var_declared_type
+            eprint_bytes(StrView { ptr: (primitive_name_from_type(t)), len: (primitive_name_len(t)) as i64 })
+        eprints("` but its initialiser has no single value type: its match / if arms yield values that cannot be merged at that type\n")
+        return
+    sema_error_at(sm, mv.line, mv.col)
+    eprints("this match has no value: its arms don't yield one value type, so it can't be used where a value is wanted\n")
+
+# AGAST #4656: an array literal's elements are one type, element 0's (or the
+# declared element type, which element 0 fits): `[1, t]` with `t` a struct
+# is refused at `t`, in ritz0's words.  The same pairs as a match's arms
+# count; ritz1 used to type the array from whichever element named a struct
+# and emit IR clang refused.
+pub fn array_lit_one_type(sm: *Sema, e: *Expr)
+    if e == null or e.kind != ExprKind.ArrayLit or e.args == null
+        return
+    var t0: SemaTy
+    let c0: i32 = mv_value_class(sm, e.args, @t0)
+    if c0 != MV_INT and c0 != MV_STRUCT and c0 != MV_ENUM
+        return
+    var i: i32 = 1
+    var it: *Expr = e.args.next
+    while it != null
+        var t: SemaTy
+        let c: i32 = mv_value_class(sm, it, @t)
+        var bad: i32 = 0
+        if c == MV_STRUCT and c0 == MV_STRUCT
+            bad = 1 - name_eq(StrView { ptr: (t0.name), len: (t0.name_len) as i64 }, StrView { ptr: (t.name), len: (t.name_len) as i64 })
+        else if c == MV_STRUCT or c0 == MV_STRUCT
+            bad = (c == MV_INT or c == MV_ENUM or c0 == MV_INT or c0 == MV_ENUM) as i32
+        if bad == 1
+            sema_error_at(sm, it.span.line, it.span.col)
+            eprints("array literal element ")
+            eprint_i64(i as i64)
+            eprints(" is not the array's element type\n")
+            return
+        i += 1
+        it = it.next

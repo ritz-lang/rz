@@ -2747,7 +2747,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, TUPLE_PTR_ELEM),
+""", 1, {}),  # #3024 closed by #4656: `(@t, 2)` names its `@T` element,
 
     "tuple_element_try": (TUPLES + SLOT + """\
 fn g(r: (Result<Tracked, i32>, i32)) -> Result<i32, i32>

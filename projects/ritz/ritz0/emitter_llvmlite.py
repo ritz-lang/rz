@@ -3596,8 +3596,10 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             variant_name = expr.func.name
             return self._emit_enum_variant_constructor_for_type(variant_name, expr.args, enum_type_name, expr.span)
         elif isinstance(expr, rast.Ident):
-            # Unit variant without parens
-            return self._emit_enum_variant_constructor_for_type(expr.name, [], enum_type_name)
+            # Unit variant without parens.  Its span locates a name the
+            # slot's enum doesn't declare: `return Block` in an
+            # `Option<i32>` fn is refused at `Block` (AGAST #4656).
+            return self._emit_enum_variant_constructor_for_type(expr.name, [], enum_type_name, expr.span)
         else:
             # Fallback to regular expression emission
             return self._emit_expr(expr)
@@ -3724,6 +3726,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         """
         if enum_name not in self.enum_types:
             raise self._err(f"Unknown enum type: {enum_name}")
+        if call_span is not None:
+            self._require_enum_variant(enum_name, variant_name, call_span)
 
         enum_type, variants = self.enum_types[enum_name]
         tag = self._get_enum_variant_tag(enum_name, variant_name)
@@ -10052,6 +10056,13 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             if element_type is not None:
                 self._check_element_narrowing(element, val.type, elem_type, element_type)
             converted.append(self._convert_type(val, elem_type, element))
+        # AGAST #4656: an element no conversion brings to the element type
+        # (a struct beside an integer) is refused at itself; llvmlite's
+        # insert_value used to raise a TypeError traceback with no position.
+        for i, (element, val) in enumerate(zip(expr.elements, converted)):
+            if val.type != elem_type:
+                raise self._err(f"array literal element {i} is not the array's "
+                                "element type", element.span)
 
         # Create array type
         count = declared_count if isinstance(declared_count, int) else len(converted)

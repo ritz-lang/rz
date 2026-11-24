@@ -2798,7 +2798,7 @@ pub fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: 
 # declares it.
 
 # Is `e` a tuple literal (fields "0", "1", ..) nothing has named yet?
-fn tuple_lit_nameless(e: *Expr) -> i32
+pub fn tuple_lit_nameless(e: *Expr) -> i32
     if e == null or e.kind != ExprKind.StructLit or e.ident_len != 0
         return 0
     let fi: *FieldInit = e.args as *FieldInit
@@ -2955,6 +2955,8 @@ fn tuple_elem_type(s: *EmitterState, v: *Expr, f: *StructField, spell: **u8) -> 
                 f.field_type_name_len = nnl
     else if bool_kind(s, v) == BK_BOOL
         f.field_type = TypeKind.Bool
+    else if v.kind == ExprKind.Unary and (v.op == OpKind.Addr or v.op == OpKind.AddrMut)
+        return tuple_elem_ref(s, v, f, spell)   # AGAST #4656
     else
         let t: TypeKind = expr_slot_ty(v)
         match t
@@ -2962,7 +2964,9 @@ fn tuple_elem_type(s: *EmitterState, v: *Expr, f: *StructField, spell: **u8) -> 
                 return tuple_elem_ptr(s, v, f, spell)
             TypeKind.Array =>
                 return tuple_elem_array(s, v, f, spell)
-            TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
+            TypeKind.Ref | TypeKind.MutRef =>
+                return tuple_elem_ref(s, v, f, spell)
+            TypeKind.PtrPtr =>
                 return 0
             _ => pass
         f.field_type = t
@@ -2979,6 +2983,41 @@ fn tuple_elem_type(s: *EmitterState, v: *Expr, f: *StructField, spell: **u8) -> 
         *spell = f.field_type_name
         return f.field_type_name_len
     primitive_arg_spelling(f.field_type, spell)
+
+# AGAST #4656: a reference to a struct, `@x` / `@&x` of a struct local or a
+# local or param that is one: f is the `@S` / `@&S` field an annotated
+# `(@S, ..)` has, spelled "ref_" / "refmut_" S as ritz0's mangle_type_name
+# spells a RefType.  0 for any other (a reference to a scalar).
+fn tuple_elem_ref(s: *EmitterState, v: *Expr, f: *StructField, spell: **u8) -> i32
+    var x: *Expr = v
+    var kind: TypeKind = TypeKind.Ref
+    if v.kind == ExprKind.Unary and (v.op == OpKind.Addr or v.op == OpKind.AddrMut)
+        x = v.operand
+        if v.op == OpKind.AddrMut
+            kind = TypeKind.MutRef
+    if x == null or x.kind != ExprKind.Ident
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+    if loc == null or lv_type_name_len(loc) <= 0
+        return 0
+    let lt: TypeKind = lv_var_type(loc)
+    if x == v
+        if lt != TypeKind.Ref and lt != TypeKind.MutRef
+            return 0
+        kind = lt
+    else if lt != TypeKind.Struct
+        return 0
+    # Lowered as a `*S` field is (lowered_field_type, field_new's note).
+    f.field_type = TypeKind.Ptr
+    f.ptr_pointee = TypeKind.Struct
+    f.field_type_name = lv_type_name(loc)
+    f.field_type_name_len = lv_type_name_len(loc)
+    var prefix: StrView = "ref_"
+    if kind == TypeKind.MutRef
+        prefix = "refmut_"
+    var n: i32 = 0
+    *spell = tuple_spell_join(prefix, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, @n)
+    n
 
 # up to 10 digits of an i32 field index + NUL (AGAST #1820).
 const TUPLE_FIELD_NAME_BUF: i64 = 12

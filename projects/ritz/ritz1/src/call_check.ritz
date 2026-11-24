@@ -637,9 +637,54 @@ fn skf_slot(sm: *Sema, t: TypeKind, name_sv: StrView, pointee: TypeKind, out: *S
 fn skf_wide_int(name: StrView) -> i32
     (name.eq("i64") or name.eq("u64")) as i32
 
+# The enum a slot's type names: `Option$i32` is Option's.
+fn skf_enum_base(slot: StrView) -> StrView
+    var n: i64 = 0
+    while n < slot.len and *(slot.ptr + n) != '$'
+        n = n + 1
+    StrView { ptr: (slot.ptr), len: (n) }
+
+# 1 if the enum slot `slot` declares variant `v`; 1 too for a slot that is no
+# enum.  A built-in Option / Result declares its own variants whether or not
+# ritzlib's enum is in scope.
+fn skf_enum_declares(sm: *Sema, slot: StrView, v: StrView) -> i32
+    let en: StrView = skf_enum_base(slot)
+    if enum_find(sm.pctx, en) >= 0
+        return (enum_variant_index(sm.pctx, en, v) >= 0) as i32
+    if name_eq(en, "Option") == 1
+        return (name_eq(v, "Some") == 1 or name_eq(v, "None") == 1) as i32
+    if name_eq(en, "Result") == 1
+        return (name_eq(v, "Ok") == 1 or name_eq(v, "Err") == 1) as i32
+    1
+
+# A bare unit variant of one enum in a slot of an enum that declares no such
+# variant (`return Block` in a `-> Option<i32>` fn, `Block` Display's): ritz0's
+# "Unknown variant Block in enum Option", at `Block`, in every slot (AGAST
+# #4656).  The emitter built the other enum's variant into the slot.
+fn skf_bare_variant(sm: *Sema, a: *Expr, slot: StrView) -> i32
+    if g_cc_mute > 0 or a.kind != ExprKind.Ident or slot.ptr == null or slot.len <= 0
+        return 0
+    let v: StrView = StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 }
+    if sema_is_local(sm, v) == 1 or sbk_const(sm, v) != null or sbk_global(sm, v) != null or sema_find_fn(sm, v) != null
+        return 0
+    var vi: i32 = 0 - 1
+    var other: i32 = 0 - 1
+    let ei: i32 = enum_of_variant_unique(sm.pctx, v, @vi, @other)
+    if ei < 0 or enum_variant_kind(sm.pctx, ei, vi) != ENUM_VARIANT_UNIT or skf_enum_declares(sm, slot, v) == 1
+        return 0
+    if cc_report(sm, a.span.line, a.span.col) == 1
+        eprints("Unknown variant ")
+        eprint_bytes(v)
+        eprints(" in enum ")
+        eprint_bytes(skf_enum_base(slot))
+        eprint_char('\n')
+    1
+
 # Does `a` fit a slot of kind `t` named `name` (a pointer's: its pointee's),
 # pointing at `pointee`?  SKF_FITS, or the misfit's class with what was found
-# in `out`.  `other` 1: a struct of another struct is judged here too.
+# in `out`.  `other` 1: a struct of another struct is judged here too.  A bare
+# variant of another enum in an enum slot is said here, the same in every slot
+# (skf_bare_variant), and then fits: the slot has nothing to add.
 pub fn slot_kind_fit(sm: *Sema, a: *Expr, t: TypeKind, name_sv: StrView, pointee: TypeKind, other: i32, out: *SlotFit) -> i32
     out.slot_class = SKS_NONE
     out.value_class = SKV_NONE
@@ -647,7 +692,7 @@ pub fn slot_kind_fit(sm: *Sema, a: *Expr, t: TypeKind, name_sv: StrView, pointee
     out.name_len = 0
     out.slot_pointee = pointee
     out.value_pointee = TypeKind.Void
-    if a == null
+    if a == null or skf_bare_variant(sm, a, name_sv) == 1
         return SKF_FITS
     let sc: i32 = skf_slot(sm, t, name_sv, pointee, out)
     out.slot_class = sc

@@ -26,14 +26,15 @@ declarer.  A generic enum (ritzlib's Option) never makes a name ambiguous
 scrutinee, so neither is reported.
 
 These run the checker alone: the emitter already compiles each program.
+The last two tables (AGAST #4656) run all three compilers.
 """
 
 import pytest
 
 from parser import parse
+from test_ref_into_value import COMPILERS
+from test_table_rows import assert_refusals, assert_runs
 from type_checker import TypeChecker
-
-pytestmark = pytest.mark.unit
 
 OPTION = "enum Option<T>\n    Some(T)\n    None\n\n"
 DISPLAY = "enum Display\n    None\n    Block\n\n"
@@ -63,6 +64,7 @@ SLOTS = (
     "    k(None)\n")
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize("decls", [
     pytest.param(DISPLAY, id="no-ritzlib-option"),
     pytest.param(OPTION + DISPLAY, id="option-first"),
@@ -72,6 +74,7 @@ def test_none_in_an_option_slot_is_options(decls):
     assert types(decls + SLOTS) == []
 
 
+@pytest.mark.unit
 def test_none_in_the_other_enums_slot_is_still_its_own():
     # Control: the slot names Display, so `None` is Display's.
     src = OPTION + DISPLAY + (
@@ -83,6 +86,7 @@ def test_none_in_the_other_enums_slot_is_still_its_own():
     assert types(src) == []
 
 
+@pytest.mark.unit
 def test_a_slot_that_doesnt_declare_the_name_still_mismatches():
     # Control: the slot doesn't decide, so `Block` stays Display's and the
     # mismatch is still reported.
@@ -91,6 +95,7 @@ def test_a_slot_that_doesnt_declare_the_name_still_mismatches():
         "<stdin>:10:5: return type Display doesn't match expected Option<i32>"]
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize("decls", [
     pytest.param(OPTION + WRAP, id="option-first"),
     pytest.param(WRAP + OPTION, id="wrap-first"),
@@ -109,6 +114,7 @@ MESSAGE = ("ambiguous enum variant '{n}': declared by enum '{a}' and enum '{b}';
            "qualify it, e.g. '{a}.{n}'")
 
 
+@pytest.mark.unit
 def test_an_ambiguous_bare_variant_is_reported():
     src = AMBIGUOUS + (
         "fn f() -> i32\n"
@@ -121,6 +127,7 @@ def test_an_ambiguous_bare_variant_is_reported():
     ]
 
 
+@pytest.mark.unit
 def test_unambiguous_neighbours_and_match_arms_are_not_reported():
     # Control: `A` has one declarer, Option's generic `None` doesn't clash
     # with Display's, and a bare arm resolves against the scrutinee.
@@ -132,3 +139,64 @@ def test_unambiguous_neighbours_and_match_arms_are_not_reported():
         "        A => 0\n"
         "        B => 1\n")
     assert types(src) == []
+
+
+# --- A bare variant the slot's enum doesn't declare (AGAST #4656) --------------
+#
+# `return Block` in a `-> Option<i32>` fn, `Block` a variant of Display only.
+# ritz1 built Display's `Block` into the Option slot and exited 0; ritz0
+# refused it at the statement, as `Unknown variant Block in enum Option$i32`.
+# Both now say it at `Block`, naming the enum as declared (as
+# test_match_foreign_variant.py's pattern does), in every slot.
+
+FOREIGN = "Unknown variant Block in enum Option"
+
+
+def _program(body, ret="i32"):
+    return OPTION + DISPLAY + f"fn f() -> {ret}\n{body}\n" + (
+        "fn k(o: Option<i32>) -> i32\n    0\n\n"
+        "fn main() -> i32\n    f()\n    0\n")
+
+
+FOREIGN_ROWS = {
+    "return": (_program("    return ^Block\n", "Option<i32>"), FOREIGN),
+    "fn_tail": (_program("    ^Block\n", "Option<i32>"), FOREIGN),
+    "typed_let": (_program("    let x: Option<i32> = ^Block\n    0\n"), FOREIGN),
+    "assign": (_program("    var y: Option<i32> = None\n    y = ^Block\n    0\n"), FOREIGN),
+    "argument": (_program("    k(^Block)\n"), FOREIGN),
+    # No ritzlib Option in scope: the built-in one declares Some / None only.
+    "builtin_option": (DISPLAY + "fn f() -> Option<i32>\n    return ^Block\n\n"
+                       "fn main() -> i32\n    f()\n    0\n", FOREIGN),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_another_enums_bare_variant_in_an_enum_slot_is_refused(compiler, tmp_path):
+    assert_refusals(compiler, tmp_path, FOREIGN_ROWS)
+
+
+# Control: the slot's own variant still lands in it: `None` in an Option slot
+# whichever enum declares `None` last, `Block` in a Display one.
+OWN_ROWS = {
+    "none_in_option": (OPTION + DISPLAY + (
+        "fn f() -> Option<i32>\n    return None\n\n"
+        "fn k(o: Option<i32>) -> i32\n"
+        "    match o\n        Some(v) => v\n        None => 3\n\n"
+        "fn main() -> i32\n"
+        "    let x: Option<i32> = None\n"
+        "    k(f()) + k(x) + k(None)\n"), 9),
+    "block_in_display": (OPTION + DISPLAY + (
+        "fn f() -> Display\n    return Block\n\n"
+        "fn k(d: Display) -> i32\n"
+        "    match d\n        None => 1\n        Block => 4\n\n"
+        "fn main() -> i32\n"
+        "    let d: Display = Block\n"
+        "    k(f()) + k(d) + k(Block)\n"), 12),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_the_slots_own_bare_variant_still_runs(compiler, tmp_path):
+    assert_runs(compiler, tmp_path, OWN_ROWS)
