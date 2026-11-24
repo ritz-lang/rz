@@ -5,7 +5,6 @@ Each helper negated a value that can be i64::MIN with `0 - n`, which has no
 i64 result, so under LARB R63 (#3488) it stopped the program instead of
 printing:
 
-  - ritz1/runtime/io_minimal.ritz print_int / eprint_int;
   - ritz1/src/deref_field.ritz df_put_call_part, which spells an integer
     argument in the method-and-fn-field diagnostic: a u64 literal
     0x8000000000000000 is held in the AST as i64::MIN;
@@ -13,15 +12,12 @@ printing:
     const's float field: the same literal, negated.  Unnegated, it was read
     as -2^63 rather than 2^63.
 
+ritz1/runtime/io_minimal.ritz print_int / eprint_int had it too; that file
+was dead (nothing imported it) and #4565 deleted it with the legacy printers.
+
 sage's push_i64 had the same bug; its test is the `[[test]]` beside it in
 projects/sage/src/float.ritz.
 """
-
-import importlib.util
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 from ref_rules import method_and_field
@@ -29,48 +25,6 @@ from test_fn_field_call import FNS
 from test_ref_into_value import COMPILERS, _assert_refused, _run
 
 pytestmark = pytest.mark.integration
-
-RITZ_ROOT = Path(__file__).resolve().parents[2]
-IO_MINIMAL = RITZ_ROOT / "ritz1" / "runtime" / "io_minimal.ritz"
-BUILD_PY = RITZ_ROOT / "build.py"
-
-_spec = importlib.util.spec_from_file_location("ritz_build_i64_min", BUILD_PY)
-_build = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_build)
-
-# The runtime's helpers with a main that prints the extremes to both streams.
-PRINT_MAIN = """
-pub fn main() -> i32
-    let lo: i64 = 0 - 9223372036854775807 - 1
-    print_int(lo)
-    print_char(32)
-    print_int(9223372036854775807)
-    print_char(32)
-    print_int(0 - 305)
-    print_char(32)
-    print_int(0)
-    eprint_int(lo)
-    eprint_char(32)
-    eprint_int(7)
-    0
-"""
-
-
-# The runtime is source, not a compiler: one compiler covers it.  It imports
-# ritzlib.sys, so it goes through `build.py run` to link that.
-def test_runtime_print_int_extremes(tmp_path):
-    src = tmp_path / "main.ritz"
-    src.write_text(IO_MINIMAL.read_text() + PRINT_MAIN)
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT),
-               RITZ_BUILD_CACHE_DIR=str(tmp_path / "build-cache"))
-    build = subprocess.run([sys.executable, str(BUILD_PY), "run", str(src)],
-                           cwd=tmp_path, env=env, capture_output=True, timeout=300)
-    exe = _build.run_output_dir(src) / "main"
-    assert exe.exists(), (build.stdout + build.stderr)[-2000:]
-    run = subprocess.run([str(exe)], capture_output=True, timeout=60)
-    assert run.returncode == 0, run.stderr
-    assert run.stdout == b"-9223372036854775808 9223372036854775807 -305 0"
-    assert run.stderr == b"-9223372036854775808 7"
 
 
 # The method-and-fn-field diagnostic spells an integer argument as ritz0's

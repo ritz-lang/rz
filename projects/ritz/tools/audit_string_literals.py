@@ -18,7 +18,7 @@ chosen by a cheap heuristic that looks at:
                           `let x: StrView = "..."` => s;
                           `let x: String = "..."` => string)
   * Function call sites with well-known stdlib signatures
-    (`prints_cstr("..")` => c,  `prints("..")` => s,
+    (`prints("..")` => s,
      `panic("..")` / `eprintln_cstr("..")` / `eprints_cstr("..")` => c,
      `assert ... , "..."` => c, etc.)
   * Fallback: `c` (matches the dominant current-code shape -- almost all
@@ -61,8 +61,6 @@ REPO_ROOT = RITZ_ROOT.parent.parent                       # workspace root
 
 CALL_SIG: dict[str, dict[int, str]] = {
     # io.ritz -- C-string sinks expect *u8
-    "prints_cstr":   {0: "c"},
-    "println_cstr":  {0: "c"},
     "eprints_cstr":  {0: "c"},
     "eprintln_cstr": {0: "c"},
     "print_cstr":    {0: "c"},

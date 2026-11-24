@@ -1,0 +1,84 @@
+# Golden output of the ritz-stats binary (AGAST #4565).
+#
+# The report was a prints/print_int chain; #4565 made each line one
+# interpolated print and main take Span<StrView>.  These pin the exact bytes
+# so the port cannot change a column, a percentage or an exit code.
+
+import ritzlib.testlib
+import ritzlib.fs
+
+# Write `src` to a sandbox file, run ./ritz-stats on it, and check the exit
+# code and that the output holds every one of `want`.
+[[test_helper]]
+fn stats_of(src: StrView, want_exit: i32, want: Span<StrView>) -> i32
+    var path: String = sandbox_path("ritz_stats", "ritz")
+    assert write_file(path.as_view(), src).is_ok(), "write fixture"
+    var args: [1]StrView
+    args[0] = path.as_view()
+    match exec_capture("./ritz-stats", Span<StrView> { ptr: @args[0], len: 1 }, span_empty<StrView>(), "")
+        Ok(c) =>
+            assert c.status.exit_code == want_exit, "exit code"
+            var i: i64 = 0
+            while i < want.len
+                let w: StrView = *(want.ptr + i)
+                assert buf_contains(c.output(), Span<u8> { ptr: w.ptr, len: w.len }), "report line"
+                i += 1
+        Err(_) =>
+            assert false, "spawn ./ritz-stats"
+    0
+
+[[test]]
+fn test_report_counts_and_percentages() -> i32
+    var want: [12]StrView
+    want[0] = "  Total lines:      13\n"
+    want[1] = "  Code lines:       9 (69%)\n"
+    want[2] = "  Comment lines:    1 (7%)\n"
+    want[3] = "  Blank lines:      3 (23%)\n"
+    want[4] = "  Functions:        1\n"
+    want[5] = "  Structs:          1\n"
+    want[6] = "  Enums:            1\n"
+    want[7] = "  Files:            1\n"
+    want[8] = "  Avg fn length:    3 lines\n"
+    want[9] = "  Avg complexity:   2\n"
+    want[10] = "  Max complexity:   2\n"
+    want[11] = "  Max nesting:      2 levels\n\n"
+    let src: StrView = "# header\nimport ritzlib.sys\n\nstruct S\n    x: i32\n\nenum E\n    A\n\nfn f(n: i32) -> i32\n    if n > 0\n        return 1\n    0\n"
+    stats_of(src, 0, Span<StrView> { ptr: @want[0], len: 12 })
+
+# No functions: the averages print 0 rather than divide by zero.
+[[test]]
+fn test_report_without_functions() -> i32
+    var want: [6]StrView
+    want[0] = "  Code lines:       1 (100%)\n"
+    want[1] = "  Comment lines:    0 (0%)\n"
+    want[2] = "  Functions:        0\n"
+    want[3] = "  Avg fn length:    0 lines\n"
+    want[4] = "  Avg complexity:   0\n"
+    want[5] = "  Max nesting:      0 levels\n"
+    stats_of("const X: i32 = 1\n", 0, Span<StrView> { ptr: @want[0], len: 6 })
+
+[[test_helper]]
+fn run_args(args: Span<StrView>, want_exit: i32, want: StrView) -> i32
+    match exec_capture("./ritz-stats", args, span_empty<StrView>(), "")
+        Ok(c) =>
+            assert c.status.exit_code == want_exit, "exit code"
+            assert buf_eq(c.output(), Span<u8> { ptr: want.ptr, len: want.len }), "whole output"
+        Err(_) =>
+            assert false, "spawn ./ritz-stats"
+    0
+
+[[test]]
+fn test_help_exits_zero() -> i32
+    var a: [1]StrView
+    a[0] = "--help"
+    run_args(Span<StrView> { ptr: @a[0], len: 1 }, 0, "Usage: ritz-stats <file.ritz>\n  Prints line, function and complexity statistics for one Ritz source file.\n")
+
+[[test]]
+fn test_no_args_is_usage_error() -> i32
+    run_args(span_empty<StrView>(), 1, "Usage: ritz-stats <file.ritz>\n")
+
+[[test]]
+fn test_missing_file_is_an_error() -> i32
+    var a: [1]StrView
+    a[0] = "/nonexistent/ritz_stats_input.ritz"
+    run_args(Span<StrView> { ptr: @a[0], len: 1 }, 1, "Error reading file\n")

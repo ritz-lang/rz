@@ -7,9 +7,13 @@ it establishes, following ritzlib/argspec.ritz (#1448):
 
 * a String is taken as `@String` (a borrow), never as a raw `*String` --
   matching every other String API (`s.len()`, ...);
-* the only raw pointers in io's public surface are the four `*_cstr`
+* the only raw pointers in io's public surface are the two stderr `*_cstr`
   functions, which exist for C-string interop and say so in their doc
-  comment, pointing callers at prints/println(StrView) instead.
+  comment, pointing callers at eprints/eprintln(StrView) instead.
+
+#4565 deleted the legacy printers (prints_cstr, println_cstr, print_int,
+print_hex, print_string) with no wrappers: interpolated `print("..{x}..")`
+replaces them.  test_legacy_printers_stay_deleted pins that.
 
 Neither ritz0 nor ritz1 distinguishes `@String` from `*String` at a call site
 (both lower to the same pointer and both accept `@s` for either), so a
@@ -27,14 +31,13 @@ from lexer import tokenize
 from parser import Parser
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
+LEGACY_PRINTERS = ("prints_cstr", "println_cstr", "print_int", "print_hex", "print_string")
 IO_RITZ = RITZ_ROOT / "ritzlib" / "io.ritz"
 
-STRING_PRINTERS = ("print_string", "eprint_string", "println_string", "eprintln_string")
+STRING_PRINTERS = ("eprint_string", "println_string", "eprintln_string")
 # Each _cstr fn -> the StrView function its doc comment must point callers at.
 CSTR_INTEROP = {
-    "prints_cstr": "prints",
     "eprints_cstr": "eprints",
-    "println_cstr": "println",
     "eprintln_cstr": "eprintln",
 }
 
@@ -108,3 +111,12 @@ def test_cstr_fns_are_kept_and_documented_as_c_interop(name):
     assert target in fns, f"{target} (the StrView alternative) missing from io.ritz"
     preferred = f"{target}(StrView)"
     assert f"prefer {preferred}" in doc, f"{name} doc comment must say 'prefer {preferred}':\n{doc}"
+
+
+
+@pytest.mark.unit
+def test_legacy_printers_stay_deleted():
+    """#4565 deleted these with no wrappers; tools/test_legacy_printers_deleted.py
+    pins that no workspace code calls them."""
+    fns = _pub_fns()
+    assert [n for n in LEGACY_PRINTERS if n in fns] == []

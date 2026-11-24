@@ -1130,8 +1130,8 @@ the compiler emits calls to those symbols.
 
 **Module**: `ritzlib.fmt.digits` (core)
 
-The one integer digit routine. Every ritzlib integer formatter (`print_int`,
-`eprint_int`, `print_hex`, `itoa`, `String.push_i64`, `string_from_hex`,
+The one integer digit routine. Every ritzlib integer formatter (`print("{n}")`
+interpolation, `eprint_int`, `itoa`, `String.push_i64`, `string_from_hex`,
 `IoVecBuilder.append_int`/`append_uint`, `ritzlib.fmt`'s Display) calls it, so all of them
 handle i64's minimum (AGAST #1856). Each writes into a caller buffer, returns
 the byte count, and writes no NUL. It has no imports, so freestanding code can
@@ -1658,7 +1658,10 @@ workspace migrates (AGAST #203). They are removed in #204.
 
 **Module**: `ritzlib.io`
 
-High-level console I/O functions.
+High-level console I/O functions. Numbers and Strings print through the
+`print("{x}")` / `eprint("{x}")` builtins' interpolation; `prints_cstr`,
+`println_cstr`, `print_int`, `print_hex` and `print_string` were deleted
+(AGAST #4565).
 
 **Output to stdout**:
 
@@ -1666,11 +1669,7 @@ High-level console I/O functions.
 |----------|-----------|-------------|
 | `prints` | `fn(s: StrView)` | Print a StrView (`"text"` literal) |
 | `println` | `fn(s: StrView)` | Print a StrView with newline |
-| `prints_cstr` | `fn(s: *u8)` | C interop: print a NUL-terminated C string (`c"text"`, argv). Prefer `prints` |
-| `println_cstr` | `fn(s: *u8)` | C interop: print a C string with newline. Prefer `println` |
 | `print_char` | `fn(c: u8)` | Print character |
-| `print_int` | `fn(n: i64)` | Print integer |
-| `print_hex` | `fn(n: i64)` | Print hex with 0x prefix (a negative prints its two's-complement bits) |
 | `print_size_human` | `fn(size: i64)` | Print human-readable size (K/M/G/T) |
 | `newline` | `fn()` | Print newline |
 
@@ -1689,7 +1688,6 @@ High-level console I/O functions.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `print_string` | `fn(s: @String)` | Print String |
 | `println_string` | `fn(s: @String)` | Print String with newline |
 | `eprint_string` | `fn(s: @String)` | Print String to stderr |
 | `eprintln_string` | `fn(s: @String)` | Print String to stderr with newline |
@@ -2810,8 +2808,7 @@ fn main() -> i32
     prints(port)
     prints("\n")
     let entries: Span<StrView> = env_iter()
-    print_int(entries.len)
-    prints(" variables\n")
+    print("{entries.len} variables\n")
     0
 ```
 
@@ -3161,7 +3158,7 @@ fn show_file(path: StrView) -> i32
     var r: Result<String, Errno> = read_file(path)
     match r
         Ok(content) =>
-            print_string(@content)
+            prints(content.as_view())
             0
         Err(e) => e.code()
 ```

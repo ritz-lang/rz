@@ -248,6 +248,27 @@ reqs = [
     req(14, "textDocument/hover", uri, 0, 20),        # helper, in a comment
     req(15, "textDocument/definition", uri, 5, 20),   # helper, in a string
 ]
+# The stderr log names what it handled, as text (#4565: these were
+# eprints_cstr chains; the uri now comes as a StrView from the JSON value).
+log_msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"processId": None, "rootUri": None, "capabilities": {}}},
+            did_open(uri, "fn f() -> i32\n    0\n"),
+            did_change(uri, "fn g() -> i32\n    0\n", 2),
+            {"jsonrpc": "2.0", "method": "textDocument/didClose",
+             "params": {"textDocument": {"uri": uri}}},
+            {"jsonrpc": "2.0", "id": 7, "method": "no/such-method"},
+            {"jsonrpc": "2.0", "id": 99, "method": "shutdown"},
+            {"jsonrpc": "2.0", "method": "exit"}]
+p = subprocess.run([BIN], input=b"".join(map(frame, log_msgs)),
+                   capture_output=True, timeout=20, env=NO_RITZ1)
+log = p.stderr.decode(errors="replace")
+for line in (f"[ritz-lsp] Document opened: {uri}\n",
+             f"[ritz-lsp] Document changed: {uri}\n",
+             f"[ritz-lsp] Document closed: {uri}\n",
+             "[ritz-lsp] Unknown method: no/such-method\n",
+             "[ritz-lsp] Handling shutdown\n"):
+    check("stderr log has " + repr(line), line in log, repr(log[-400:]))
+
 for argv in ([], ["--stdio"]):
     tag = " ".join(["ritz-lsp", *argv]) + ": "
     rc, out = session([did_open(uri, src), *reqs], argv, env=NO_RITZ1)

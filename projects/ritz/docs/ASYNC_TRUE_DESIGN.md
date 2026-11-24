@@ -32,7 +32,7 @@ async fn read_file(path: *u8) -> i64
 fn main() -> i32
     # block_on runs the future to completion
     let result = block_on(read_file("test.txt\0".ptr))
-    print_int(result)
+    print("{result}\n")
     0
 ```
 

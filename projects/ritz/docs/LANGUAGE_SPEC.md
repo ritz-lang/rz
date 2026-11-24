@@ -1706,9 +1706,8 @@ No return type means the function returns nothing:
 ```ritz
 import ritzlib.io
 
-fn greet(name: *u8)
-    prints("Hello, ")
-    prints_cstr(name)
+fn greet(name: StrView)
+    print("Hello, {name}\n")
 ```
 
 Such a function is a *procedure*, and a call to one has no value. Both compilers
@@ -2271,9 +2270,9 @@ import ritzlib.io
 
 fn main() -> i32
     for i in 0..10          # 0 to 9 (exclusive)
-        print_int(i)
+        print("{i}\n")
     for j in 0..=10         # 0 to 10 (inclusive)
-        print_int(j)
+        print("{j}\n")
     0
 ```
 
@@ -2317,7 +2316,7 @@ import ritzlib.io
 fn main() -> i32
     let v = vec_new<i32>()
     for item in v
-        print_int(item as i64)
+        print("{item}\n")
     0
 ```
 
@@ -4598,7 +4597,7 @@ fn get(flag: i32) -> Option<i64>
 
 fn main() -> i32
     match get(1)
-        Some(value) => print_int(value)
+        Some(value) => print("{value}\n")
         None => prints("none\n")
     0
 ```
@@ -5081,11 +5080,7 @@ trait Printable
 
 impl Printable for Point
     fn show(self: @Point)
-        prints("Point(")
-        print_int(self.x as i64)
-        prints(", ")
-        print_int(self.y as i64)
-        prints(")\n")
+        print("Point({self.x}, {self.y})\n")
 
 fn main() -> i32
     let p = Point { x: 1, y: 2 }
@@ -8032,7 +8027,8 @@ let s = "hi"
 print(s)
 ```
 
-Everything else is a library function that must be imported. The printing
+Everything else is a library function that must be imported. Numbers and
+strings print through `print("{x}")` interpolation; the rest of the printing
 surface in `ritzlib.io` is:
 
 ```ritz
@@ -8040,12 +8036,14 @@ import ritzlib.io
 
 fn main() -> i32
     prints("StrView\n")             # prints(s: StrView)
-    prints_cstr(c"C string\n")      # prints_cstr(s: *u8)
-    print_int(42)                   # print_int(n: i64)
+    println("line")                 # println(s: StrView)
     print_char('!')                 # print_char(c: u8)
     newline()
     0
 ```
+
+`prints_cstr`, `println_cstr`, `print_int`, `print_hex` and `print_string` were
+deleted (AGAST #4565): interpolate instead.
 
 ---
 

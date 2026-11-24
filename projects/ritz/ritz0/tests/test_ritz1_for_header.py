@@ -300,7 +300,7 @@ def test_every_holder_runs(run_with, compiler, name):
 
 # The example in §6.3, as the spec has it: an unannotated `let`, and nothing in it.
 SPEC = (GVEC + "import ritzlib.io\n\nfn main() -> i32\n    let v = vec_new<i32>()\n"
-        "    for item in v\n        print_int(item as i64)\n    0\n")
+        "    for item in v\n        print(\"{item}\\n\")\n    0\n")
 
 
 @pytest.mark.integration

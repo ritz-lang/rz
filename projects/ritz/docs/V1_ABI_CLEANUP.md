@@ -477,7 +477,9 @@ wins.
 2. Convert ritzlib's chained-print usage to interpolation.
 3. Convert nexus / mausoleum / zeus / valet / spire to interpolation.
 4. Delete legacy `prints_cstr` / `print_int` / `print_hex` etc. — no
-   wrappers, no aliases. The tutorial says one thing, the STYLE.md says one
+   wrappers, no aliases.  Done by AGAST #4565: `prints_cstr`,
+   `println_cstr`, `print_int`, `print_hex` and `print_string` are gone
+   (`tools/test_legacy_printers_deleted.py` keeps them gone). The tutorial says one thing, the STYLE.md says one
    thing, the workspace `grep` returns zero hits for the old style.
 
 ### Phase 5 — final cleanup (#204)
