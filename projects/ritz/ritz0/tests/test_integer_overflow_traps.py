@@ -15,9 +15,9 @@ The rule (LANGUAGE_SPEC §7.1, §7.4):
 - `as` still truncates, and bits shifted out by `<<` don't trap;
 - a freestanding target stops through `ritz_platform_fatal`, not a syscall.
 
-Every row runs on all three compilers, except the freestanding one: ritz1
-has no freestanding target (no `--target`), so its traps always stop through
-the exit syscall (AGAST #4607).
+Every row runs on all three compilers.  The freestanding rows (AGAST #4607)
+pass ritz1 `--target` as build_pipeline does; a failing assert, the overflow
+trap's twin, stops through `ritz_platform_fatal` there as well.
 """
 
 import os
@@ -82,22 +82,82 @@ def _compile_run(tmp_path, name, src, compiler):
     return subprocess.run([str(exe)], capture_output=True, text=True, timeout=60)
 
 
-def test_a_freestanding_trap_calls_the_platform_hook(tmp_path):
+FREESTANDING = "x86_64-none-elf"
+
+
+def _freestanding_ir(compiler, tmp_path, src, env=None):
+    """`src` as kernel.ritz, compiled by `compiler` for --target
+    x86_64-none-elf as build_pipeline compiles a kernel module (AGAST #4607),
+    and checked to be IR clang accepts: its text."""
+    path = tmp_path / "kernel.ritz"
+    path.write_text(src)
+    out = tmp_path / f"kernel_{compiler}.ll"
+    env = dict(env or os.environ, RITZ_PATH=str(RITZ_ROOT))
+    if compiler == "ritz0":
+        comp = run_ritz0([str(path), "-o", str(out), "--no-runtime",
+                          "--target", FREESTANDING],
+                         cwd=tmp_path, env=env, timeout=300)
+    else:
+        binary = RITZ1_BUILD / compiler
+        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+        assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+        comp = subprocess.run([str(binary), str(path), "-o", str(out),
+                               "--target", FREESTANDING],
+                              cwd=tmp_path, env=env, capture_output=True,
+                              text=True, timeout=300)
+    assert comp.returncode == 0 and out.exists(), \
+        f"{compiler}: {comp.stdout + comp.stderr}"
+    obj = subprocess.run(["clang", "-c", "-Wno-override-module", f"--target={FREESTANDING}",
+                          str(out), "-o", str(tmp_path / f"kernel_{compiler}.o")],
+                         capture_output=True, text=True)
+    assert obj.returncode == 0, f"{compiler}: clang refused the IR:\n{obj.stderr[-2000:]}"
+    return out.read_text()
+
+
+def test_a_freestanding_trap_calls_the_platform_hook(compiler, tmp_path):
     """A kernel has no exit syscall (AGAST #4119): the stop is the
     `ritz_platform_fatal` hook a kernel already defines, so its IR must hold
     no syscall at all."""
-    path = tmp_path / "kernel.ritz"
-    path.write_text("fn f(a: i64) -> i64\n    a + 1\n\n"
-                    "pub fn kmain() -> i32\n    return f(0) as i32\n")
-    out = tmp_path / "kernel.ll"
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    comp = run_ritz0([str(path), "-o", str(out), "--no-runtime",
-                      "--target", "x86_64-none-elf"],
-                     cwd=tmp_path, env=env, timeout=300)
-    assert comp.returncode == 0 and out.exists(), comp.stdout + comp.stderr
-    ir = out.read_text()
+    ir = _freestanding_ir(compiler, tmp_path,
+                          "fn f(a: i64) -> i64\n    a + 1\n\n"
+                          "pub fn kmain() -> i32\n    return f(0) as i32\n")
     assert "syscall" not in ir, "a freestanding trap issued a syscall"
     assert "ritz_platform_fatal" in ir, "the trap did not reach the platform hook"
+
+
+# A failing assert's stop, the overflow trap's twin (AGAST #4607): one
+# `ritz_platform_fatal(msg, len, 1)` with the report's head line, in a
+# [[test]] fn and a [[test_helper]] alike.  The hook may be absent from the
+# module (declared for it), declared by it, or defined by it.
+_ASSERT_BODY = ("[[test_helper]]\n"
+                "fn check(x: i64)\n"
+                "    assert x == 2\n\n"
+                "fn k() -> i64\n    7\n\n"
+                "[[test]]\n"
+                "fn test_k() -> i32\n"
+                "    check(2)\n"
+                "    assert k() == 7, \"k is seven\"\n"
+                "    0\n")
+ASSERT_HOOKS = {
+    "absent": "",
+    "declared": "extern fn ritz_platform_fatal(msg: *u8, len: i64, status: i32)\n\n",
+    "defined": ("var FATAL: i32 = 0\n\n"
+                "pub fn ritz_platform_fatal(msg: *u8, len: i64, status: i32)\n"
+                "    FATAL = status\n\n"),
+}
+
+
+@pytest.mark.parametrize("hook", sorted(ASSERT_HOOKS))
+def test_a_freestanding_assert_calls_the_platform_hook(compiler, hook, tmp_path):
+    ir = _freestanding_ir(compiler, tmp_path, ASSERT_HOOKS[hook] + _ASSERT_BODY)
+    assert "syscall" not in ir, f"{compiler}: a freestanding assert issued a syscall"
+    calls = re.findall(r'call \w+ @"?ritz_platform_fatal"?\(', ir)
+    assert len(calls) == 2, f"{compiler}: wanted both asserts to stop through the hook:\n{ir}"
+    # The head line, located at the assert itself (no newline: the hook
+    # writes its own).
+    line = 3 + ASSERT_HOOKS[hook].count("\n")
+    assert f"kernel.ritz:{line}: assertion failed: left == right" in ir, ir
+    assert f"kernel.ritz:{line + 8}: assertion failed: k is seven" in ir, ir
 
 
 def _located(src):
@@ -105,6 +165,23 @@ def _located(src):
     before = src[:src.index("^")]
     line = before.count("\n") + 1
     return src.replace("^", "", 1), f"{FILE}:{line}:{len(before) - before.rfind(chr(10))}"
+
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+def test_a_hosted_compile_does_not_feed_a_freestanding_one(compiler, ritz1_bin, tmp_path):
+    """ritz1's fn cache keys on a freestanding --target (fn_cache.ritz
+    cache_fingerprint): the same source compiled hosted first must not hand
+    its exit-syscall IR to the kernel build."""
+    src = "fn f(a: i64) -> i64\n    a + 1\n\npub fn kmain() -> i32\n    return f(0) as i32\n"
+    env = dict(os.environ, RITZ_CACHE_DIR=str(tmp_path / "cache"))
+    hosted = tmp_path / "kernel.ritz"
+    hosted.write_text(src)
+    comp = subprocess.run([str(RITZ1_BUILD / compiler), str(hosted), "-o", str(tmp_path / "h.ll")],
+                          cwd=tmp_path, env=dict(env, RITZ_PATH=str(RITZ_ROOT)),
+                          capture_output=True, text=True, timeout=300)
+    assert comp.returncode == 0, comp.stderr
+    assert "syscall" in (tmp_path / "h.ll").read_text()
+    ir = _freestanding_ir(compiler, tmp_path, src, env=env)
+    assert "syscall" not in ir and "ritz_platform_fatal" in ir, ir
 
 
 # --- every operator, both type classes --------------------------------------------

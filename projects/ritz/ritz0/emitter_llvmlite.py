@@ -8641,6 +8641,21 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             head += f": {stmt.message}"
         elif operands is not None:
             head += f": left {cond_expr.op} right"
+
+        if getattr(self, "is_freestanding", False):
+            # A kernel has no exit syscall and no fd 2 (AGAST #4607): the
+            # head line at the assert's own location goes to
+            # ritz_platform_fatal, which adds the newline, in one call.  The
+            # operand values and a helper's call site, which take a write
+            # each, are a hosted report's.
+            text = (f"{own_loc}: " if own_loc else "") + head
+            buf = self._get_string_constant(text)
+            zero = ir.Constant(self.i64, 0)
+            self._emit_platform_fatal_stop(
+                self.builder.gep(buf, [zero, zero]),
+                ir.Constant(self.i64, len(text.encode("utf-8"))))
+            self.builder.position_at_end(pass_block)
+            return None
         head += "\n"
 
         if self.in_test_helper:

@@ -1313,6 +1313,11 @@ struct CliArgs
     # the triple ritz1 emits (emitter.ritz); ritz0 derives its default from
     # --target's triple.
     target_arch: StrView
+    # `--target <triple>` (AGAST #4607): the triple build_pipeline passes
+    # ritz0 too.  ritz1 reads only whether it is freestanding (`-none-`):
+    # a trap or a failing assert then stops through ritz_platform_fatal.
+    # Empty when not given.
+    target: StrView
     # `--test-table` (AGAST #1908): compile as the root of a test binary
     # (LANGUAGE_SPEC §17.1), as ritz0's --test-table does.
     test_table: i32
@@ -1399,6 +1404,7 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
     args.dash_dash = 0
     args.target_os = strview_from_cstr(c"linux")
     args.target_arch = strview_from_cstr(c"x86_64")
+    args.target = strview_empty()
     args.test_table = 0
     args.iface_text = 0
     args.parse_only = 0
@@ -1437,6 +1443,7 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
     #                      `-I` like gcc's: prepends to the lookup list.
     #   --target-os <os>   see CliArgs.target_os.
     #   --target-arch <a>  see CliArgs.target_arch.
+    #   --target <triple>  see CliArgs.target.
     #   --test-table       see CliArgs.test_table.
     #   --iface-text       see CliArgs.iface_text.
     #   --parse-only       see CliArgs.parse_only.
@@ -1453,6 +1460,7 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
         let is_dash_i: bool = opt.eq_cstr(c"-I")
         let is_target_os: bool = opt.eq_cstr(c"--target-os")
         let is_target_arch: bool = opt.eq_cstr(c"--target-arch")
+        let is_target: bool = opt.eq_cstr(c"--target")
         let is_dep: bool = opt.eq_cstr(c"--dep")
         if opt.eq_cstr(c"--test-table")
             args.test_table = 1
@@ -1476,12 +1484,14 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
                 return args
             deps_append(@&args.deps_ptr, @&args.deps_len, argv[i + 1])
             i = i + 2
-        else if is_dash_i or is_target_os or is_target_arch
+        else if is_dash_i or is_target_os or is_target_arch or is_target
             if i + 1 >= argc
                 if is_dash_i
                     eprintln("Error: -I needs a path")
                 else if is_target_os
                     eprintln("Error: --target-os needs an OS name")
+                else if is_target
+                    eprintln("Error: --target needs a target triple")
                 else
                     eprintln("Error: --target-arch needs an architecture name")
                 args.input_path = null
@@ -1490,6 +1500,8 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
                 dash_i_view = strview_from_cstr(argv[i + 1])
             else if is_target_os
                 args.target_os = strview_from_cstr(argv[i + 1])
+            else if is_target
+                args.target = strview_from_cstr(argv[i + 1])
             else
                 args.target_arch = strview_from_cstr(argv[i + 1])
             i = i + 2
@@ -1555,7 +1567,7 @@ fn drop_local_main(m: *Module)
         f = next
 
 fn print_usage()
-    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>] [--target-os <os>] [--target-arch <arch>] [--test-table] [--iface-text] [--parse-only] [--stack-protector] [--no-red-zone] [--dep <name>=<dir>]...")
+    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>] [--target-os <os>] [--target-arch <arch>] [--target <triple>] [--test-table] [--iface-text] [--parse-only] [--stack-protector] [--no-red-zone] [--dep <name>=<dir>]...")
     eprintln("       ritz1 -- <input.ritz>")
 
 # Parse the main file's tokens, mark its fns local, and resolve (parse and
@@ -1646,7 +1658,8 @@ fn main(argc: i32, argv: **u8) -> i32
     g_test_table = args.test_table   # lower_main (AGAST #200)
     emitter_set_stack_protector(args.stack_protector)   # AGAST #2590
     emitter_set_no_red_zone(args.no_red_zone)           # AGAST #4308
-    let cache_fp: u64 = cache_fingerprint(StrView { ptr: (args.target_os.ptr), len: (args.target_os.len) }, StrView { ptr: (args.target_arch.ptr), len: (args.target_arch.len) }, StrView { ptr: (args.ritz_path.ptr), len: (args.ritz_path.len) }, args.input_path, StrView { ptr: (args.deps_ptr), len: (args.deps_len) }, args.stack_protector, args.no_red_zone)
+    let freestanding: i32 = target_is_freestanding(args.target)   # AGAST #4607
+    let cache_fp: u64 = cache_fingerprint(StrView { ptr: (args.target_os.ptr), len: (args.target_os.len) }, StrView { ptr: (args.target_arch.ptr), len: (args.target_arch.len) }, StrView { ptr: (args.ritz_path.ptr), len: (args.ritz_path.len) }, args.input_path, StrView { ptr: (args.deps_ptr), len: (args.deps_len) }, args.stack_protector, args.no_red_zone, freestanding)
 
     # Read source file
     var src: Vec<u8> = read_file(args.input_path)
@@ -1833,7 +1846,7 @@ fn main(argc: i32, argv: **u8) -> i32
     # Emit IR
     var ir: Vec<u8> = vec_with_cap<u8>(131072)  # 128KB seed; realloc as needed
     emitter_set_source_file(args.input_path)   # AGAST #1813
-    let emit_errors: i32 = emit_module(m, @ir, mono)
+    let emit_errors: i32 = emit_module(m, @ir, mono, freestanding)
     sema_probe_report()
 
     # AGAST #1369.  This return value was previously discarded, and it was a

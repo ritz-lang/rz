@@ -1736,6 +1736,11 @@ pub fn emit_assert_stmt(s: *EmitterState, stmt: *Stmt)
     emit_str(s, IR_NL)
     begin_block(s, a_fail)
 
+    if (s.platform_stop & PSTOP_FREESTANDING) != 0
+        assert_fatal_stop(s, stmt, c.op, show)
+        begin_block(s, a_ok)
+        return
+
     if s.fn_assert_kind == ASSERT_FN_HELPER
         s.assert_site_used = 1
         let l_site: i32 = next_label(s)
@@ -1821,6 +1826,70 @@ pub fn emit_assert_stmt(s: *EmitterState, stmt: *Stmt)
     emit_str(s, c"(i64 60, i64 1)\n")
     emit_str(s, c"  unreachable\n")
     begin_block(s, a_ok)
+
+# `ritz_platform_fatal(@.str.<idx>, <len>, 1)`, then `unreachable`: a
+# freestanding stop with a constant message.
+pub fn emit_platform_fatal_str(s: *EmitterState, idx: i32, len: i64)
+    s.platform_stop = s.platform_stop | PSTOP_USED
+    emit_str(s, c"  call void @ritz_platform_fatal(ptr @.str.")
+    emit_int(s, idx as i64)
+    emit_str(s, c", i64 ")
+    emit_int(s, len)
+    emit_str(s, c", i32 1)\n  unreachable\n")
+
+# Copy `text` (NUL-terminated) to `p`: the bytes written.
+fn assert_put(p: *u8, text: *u8) -> i64
+    let n: i64 = assert_cstr_len(text) as i64
+    memcpy(p, text, n)
+    n
+
+# `v` (>= 0) in decimal at `p`: the bytes written.
+fn assert_put_dec(p: *u8, v: i64) -> i64
+    var n: i64 = 1
+    var t: i64 = v
+    while t >= 10
+        t = t / 10
+        n += 1
+    var i: i64 = n
+    t = v
+    while i > 0
+        i -= 1
+        *(p + i) = (48 + t % 10) as u8
+        t = t / 10
+    n
+
+# A freestanding target's failing assert (AGAST #4607): a kernel has no exit
+# syscall and no fd 2, so the head line at the assert's own location,
+#
+#     <file>:<line>: assertion failed[: <message> | : left OP right]
+#
+# goes to ritz_platform_fatal (which writes the newline) in one call, byte
+# for byte ritz0's.  The operand values and a helper's call site take a
+# write each: they are a hosted report's.
+fn assert_fatal_stop(s: *EmitterState, stmt: *Stmt, op: OpKind, show: i32)
+    var blen: i32 = 0
+    let base: *u8 = assert_file_base(@blen)
+    var mlen: i64 = 0
+    if stmt.assert_msg != null and stmt.assert_msg_len > 0
+        mlen = stmt.assert_msg_len as i64
+    let m: *u8 = malloc(blen as i64 + mlen + 64)
+    memcpy(m, base, blen as i64)
+    var n: i64 = blen as i64
+    *(m + n) = ':'
+    n += 1
+    n += assert_put_dec(m + n, stmt.span.line as i64)
+    n += assert_put(m + n, c": assertion failed")
+    if mlen > 0
+        n += assert_put(m + n, c": ")
+        memcpy(m + n, stmt.assert_msg, mlen)
+        n += mlen
+    else if show == 1
+        n += assert_put(m + n, c": left ")
+        n += assert_put(m + n, assert_op_text(op))
+        n += assert_put(m + n, c" right")
+    *(m + n) = 0
+    let idx: i32 = add_string(s, StrView { ptr: m, len: n })
+    emit_platform_fatal_str(s, idx, n)
 
 # The call-site globals (weak: one copy across every module of a test
 # binary; ritz0 defines the same symbols) and @__ritz_assert_val, the value

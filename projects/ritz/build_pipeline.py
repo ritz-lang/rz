@@ -813,9 +813,9 @@ def ritz1_compile_cmd(compiler: str, src: Path, ll_path: Path,
     """The ritz1-family command that compiles one source to LLVM IR.
 
     ritz1's CLI is minimal: <input> -o <output> [-I <ritz_path>]
-    [--target-os <os>] [--dep <name>=<dir>]... It doesn't understand
-    --no-runtime, --deps, --sources or --project-root; callers append
-    --target-os when they need it.
+    [--target-os <os>] [--target <triple>] [--dep <name>=<dir>]... It doesn't
+    understand --no-runtime, --deps, --sources or --project-root; callers
+    append --target-os and --target (Target.compiler_args) when they need them.
     Its default emitter is non-freestanding (no _start embedded), so the
     "--no-runtime" semantics come for free. Import resolution: ritz1 tries
     the `--dep` dirs first, then source_dir, then RITZ_PATH (see
@@ -1021,16 +1021,18 @@ class Target:
     gets `noredzone`. The `-mno-red-zone` in `clang_flags` is a frontend
     flag that does nothing for .ll input, so without this harland's functions
     used the red zone.  A freestanding module's `triple` also goes to the
-    compiler as --target (AGAST #3488): it has to know a kernel from a hosted
-    program to choose a trap's stop (ritz_platform_fatal, not exit).
+    compiler as --target (AGAST #3488; ritz1's too, #4607): it has to know a
+    kernel from a hosted program to choose a trap's stop (ritz_platform_fatal,
+    not exit).
     """
     freestanding: bool = False
     clang_flags: Tuple[str, ...] = ()
     target_os: str = ""
     stack_protector: bool = False
     no_red_zone: bool = False
-    # ritz0's --target, so the compiler knows the triple (AGAST #3488): the
-    # kernel's traps must reach ritz_platform_fatal, not an exit syscall.
+    # The compiler's --target, so it knows the triple (AGAST #3488, #4607):
+    # the kernel's traps and asserts must reach ritz_platform_fatal, not an
+    # exit syscall.
     triple: str = ""
 
     @property
@@ -1063,6 +1065,8 @@ class Target:
     def compiler_args(self) -> List[str]:
         """Arguments the compiler (ritz0 or ritz1) takes for this target."""
         args = ["--target-os", self.target_os] if self.target_os else []
+        if self.triple:
+            args.extend(["--target", self.triple])
         if self.stack_protector:
             args.append("--stack-protector")
         if self.no_red_zone:
@@ -1243,12 +1247,6 @@ def module_compile_cmd(compiler: str, src: Path, ll_path: Path, target: Target, 
             return None
     else:
         cmd = [sys.executable, str(RITZ0), str(src), "-o", str(ll_path), "--no-runtime"]
-        # The triple, when the build has one (AGAST #3488): the emitter reads
-        # it to know a kernel's traps stop through ritz_platform_fatal.
-        # ritz1's own compiler_args carry no --target; it ignores unknown
-        # options, and has no freestanding trap path yet (AGAST #4607).
-        if target.triple:
-            cmd.extend(["--target", target.triple])
         # Pass dependencies if any (RFC #109 Phase 2)
         if dependencies:
             cmd.extend(["--deps", _deps_json(dependencies)])

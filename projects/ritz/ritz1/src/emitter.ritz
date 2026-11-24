@@ -4143,6 +4143,16 @@ pub fn emitter_set_stack_protector(on: i32)
 pub fn emitter_set_no_red_zone(on: i32)
     set_no_red_zone_attr(on)
 
+# `--target <triple>` (AGAST #4607): 1 when it names no OS (`-none-`, as
+# ritz0's is_freestanding).  main passes it to emit_module and the cache key.
+pub fn target_is_freestanding(triple: StrView) -> i32
+    var i: i64 = 0
+    while i + 6 <= triple.len
+        if memcmp(triple.ptr + i, c"-none-", 6) == 0
+            return 1
+        i = i + 1
+    0
+
 # The attributes every non-naked Ritz fn's `define` carries.
 #
 # alignstack(16) ensures proper 16-byte stack alignment for SIMD instructions
@@ -4257,6 +4267,21 @@ fn module_has_local_fn(s: *EmitterState, name_sv: StrView) -> i32
         f = f.next
     0
 
+# `declare void @ritz_platform_fatal(ptr, i64, i32)` when a freestanding
+# stop called it (AGAST #4607) and nothing else in this .ll defines or
+# declares it: not the module (a kernel defines it), not
+# emit_extern_declarations (a called `extern fn`), not emit_platform_hooks.
+fn emit_platform_fatal_decl(s: *EmitterState)
+    if (s.platform_stop & PSTOP_USED) == 0 or (s.platform_stop & PSTOP_DEFINED) != 0
+        return
+    let name: StrView = StrView { ptr: (c"ritz_platform_fatal"), len: (19) as i64 }
+    if is_local_function(s.module, name) == 1 or inline_import_defined(s.mono.pctx, s.module, name) == 1
+        return
+    if namelist_find(@s.externs, name) >= 0
+        return
+    emit_str(s, c"declare void @ritz_platform_fatal(ptr, i64, i32)")
+    emit_declare_attrs_nl(s)
+
 # AGAST #4119: ritzlib's core (memory, hashmap) declares these platform hooks
 # instead of importing ritzlib.sys, so it builds freestanding.  sys defines
 # them; a test binary that links no sys gets these weak Linux copies, as
@@ -4277,6 +4302,7 @@ fn emit_platform_hooks(s: *EmitterState)
         emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},~{rcx},~{r11},~{memory}\"(i64 11, i64 %a, i64 %len)\n")
         emit_str(s, c"  %t = trunc i64 %r to i32\n  ret i32 %t\n}\n")
     if module_has_local_fn(s, StrView { ptr: (c"ritz_platform_fatal"), len: (19) as i64 }) == 0
+        s.platform_stop = s.platform_stop | PSTOP_DEFINED
         emit_str(s, c"define weak void @ritz_platform_fatal(ptr %msg, i64 %len, i32 %status)")
         emit_no_red_zone_attr(s)
         emit_str(s, c" {\nentry:\n  %nl = alloca i8\n  store i8 10, ptr %nl\n")
@@ -4418,7 +4444,7 @@ fn lower_ref_fields(m: *Module)
             f = f.next
         st = st.next
 
-pub fn emit_module(m: *Module, out: *Vec<u8>, mono: *MonoCtx) -> i32
+pub fn emit_module(m: *Module, out: *Vec<u8>, mono: *MonoCtx, freestanding: i32) -> i32
     # Built whole (AGAST #3592): EmitterState is move-only (its HashMapI64
     # maps have Drop).  This was R59's migration site; R59 now allows a
     # splittable struct to be written field by field (AGAST #4328).
@@ -4505,6 +4531,7 @@ pub fn emit_module(m: *Module, out: *Vec<u8>, mono: *MonoCtx) -> i32
         narrow_decl_count: 0,
         narrow_decl_overflow: 0,
         fn_assert_kind: ASSERT_FN_PLAIN,   # AGAST #1869 — see emit_assert_stmt
+        platform_stop: freestanding * PSTOP_FREESTANDING,   # AGAST #4607
         assert_helpers_used: 0,
         assert_site_used: 0,
         assert_cap_expr: null,
@@ -4673,6 +4700,8 @@ pub fn emit_module(m: *Module, out: *Vec<u8>, mono: *MonoCtx) -> i32
 
     if g_emit_test_table == 1
         emit_test_table(@s)
+    # Last: the stops above (asserts, the overflow trap) note their calls.
+    emit_platform_fatal_decl(@s)   # AGAST #4607
 
     # Note: _start is provided by runtime/ritz_crt0.o which properly sets up argc/argv
 

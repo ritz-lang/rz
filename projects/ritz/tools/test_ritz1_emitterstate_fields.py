@@ -63,7 +63,12 @@ SEMA_TYPE = SRC / "sema_type.ritz"
 #
 # #4454 added `mono`: monomorphisation's tables, which were module globals.
 # Lowering records a generic enum first named at emission there.
-MEASURED_FIELDS = 101
+#
+# #4607 added one: platform_stop, the PSTOP_* bits for a freestanding
+# module's stops (is the target a kernel; did a stop call
+# ritz_platform_fatal; did emit_platform_hooks define it).  Lowering state,
+# moved off three module globals so #4454's budget holds.
+MEASURED_FIELDS = 102
 
 # The three names the superseded acceptance grep counted (101 hits on main).
 # They are lowering state: every file that touches them is emitter-side.

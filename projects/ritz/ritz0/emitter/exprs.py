@@ -641,6 +641,22 @@ class ExprEmitter:
         self._emit_trap(expr, message)
         self.builder.position_at_end(ok)
 
+    def _emit_platform_fatal_stop(self, ptr, length) -> None:
+        """`ritz_platform_fatal(ptr, length, 1)`, then `unreachable`.
+
+        A freestanding target's stop for a trap or a failing assert (AGAST
+        #4119, #4607): a kernel's stop is its own, never an exit syscall, or
+        freestanding IR would hold one.  The hook is declared here unless
+        the module already declares or defines it."""
+        fn = self.module.globals.get("ritz_platform_fatal")
+        if fn is None:
+            fn = ir.Function(
+                self.module,
+                ir.FunctionType(self.void, [self.i8_ptr, self.i64, self.i32]),
+                name="ritz_platform_fatal")
+        self.builder.call(fn, [ptr, length, ir.Constant(self.i32, 1)])
+        self.builder.unreachable()
+
     def _emit_trap(self, expr, message: str) -> None:
         """Write `<file>:<line>:<col>: <message>` to stderr and exit 1.
 
@@ -657,17 +673,7 @@ class ExprEmitter:
         ptr = self.builder.gep(buf, [zero, zero])
         length = ir.Constant(self.i64, len(text.encode("utf-8")))
         if getattr(self, "is_freestanding", False):
-            # A kernel's stop is its own: ritz_platform_fatal (the hook the
-            # core already declares, AGAST #4119), never an exit syscall, or
-            # freestanding IR would hold one.
-            fn = self.module.globals.get("ritz_platform_fatal")
-            if fn is None:
-                fn = ir.Function(
-                    self.module,
-                    ir.FunctionType(self.void, [self.i8_ptr, self.i64, self.i32]),
-                    name="ritz_platform_fatal")
-            self.builder.call(fn, [ptr, length, ir.Constant(self.i32, 1)])
-            self.builder.unreachable()
+            self._emit_platform_fatal_stop(ptr, length)
             return
         self._emit_write_syscall(ir.Constant(self.i64, 2), ptr, length)
         asm_ty = ir.FunctionType(self.i64, [self.i64, self.i64])

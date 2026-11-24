@@ -160,7 +160,9 @@ def test_failing_ritz1_fails_the_freestanding_build(
 
 def test_ritz1_command_matches_hosted_path(buildpy, stubs, fs_pkg, monkeypatch):
     # Same CLI shape as compile_binary: `<bin> <src> -o <ll> -I <ROOT> --dep ...`, with
-    # RITZ_PATH carrying ROOT and ROOT.parent. No ritz0-only flags.
+    # RITZ_PATH carrying ROOT and ROOT.parent. No ritz0-only flags. The bin's
+    # triple follows as --target, as ritz0 gets it (AGAST #4607); a hosted
+    # build has no triple, so compile_binary passes none.
     stubs.set_ritz1(fail=False)
     monkeypatch.setenv("RITZ_PATH", "/caller/extra")
     _build(buildpy, monkeypatch, fs_pkg, "ritz1")  # link outcome irrelevant here
@@ -175,7 +177,8 @@ def test_ritz1_command_matches_hosted_path(buildpy, stubs, fs_pkg, monkeypatch):
     # The self namespace's source roots, as ritz0 gets them in --deps
     # (AGAST #3825).
     assert parts[3:] == ["-I", str(buildpy.ROOT),
-                         "--dep", f"fs_pkg={fs_pkg.resolve() / 'src'}"]
+                         "--dep", f"fs_pkg={fs_pkg.resolve() / 'src'}",
+                         "--target", "x86_64-unknown-none"]
     # fs_pkg's parent, so ritz1 can resolve the package's own `fs_pkg.*`
     # imports (its self namespace, AGAST #1538); ahead of projects/, so a
     # declared namespace outranks a workspace project of its name (#3255).
@@ -203,7 +206,8 @@ def test_ritz1_is_passed_target_os(
     assert parts[1] == "-o" and parts[2].endswith(".ll")
     assert parts[3:] == ["-I", str(buildpy.ROOT),
                          "--dep", f"fs_pkg={fs_pkg_target_os.resolve() / 'src'}",
-                         "--target-os", "harland"]
+                         "--target-os", "harland",
+                         "--target", "x86_64-unknown-none"]
     assert "does not support freestanding target_os" not in text
 
 
