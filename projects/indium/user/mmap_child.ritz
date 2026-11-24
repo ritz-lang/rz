@@ -3,9 +3,12 @@
 # init mmaps PAGES pages (kernel-chosen address), fills them, and spawns this
 # with that address as argv[1] in decimal. Each process has its own mmap
 # region and cursor, so:
-#   1. this process's first kernel-chosen mmap of PAGES pages lands at the
-#      same address init got (exit 2 otherwise), and
-#   2. the pages there are this process's own: zero-filled, not init's
+#   1. this process's first kernel-chosen mmap lands at the same address init
+#      got (exit 2 otherwise). That mmap is the entry adapter's: `main` takes
+#      `Span<StrView>` (#200), and the views live in one mmapped page, so
+#      `args.ptr` is it (AGAST #4564).
+#   2. the page there is this process's own: it holds the views, not init's
+#      pattern; and the next mapping's pages are zero-filled, not init's
 #      pattern (exit 3). Writing them must not change init's (init checks
 #      that after this exits).
 #   3. a larger mapping spanning several page tables (BIG_PAGES, > 2 MiB)
@@ -13,25 +16,24 @@
 #   4. munmap of both succeeds (exit 7).
 # Exit 0 = PASS; 1 = bad argv.
 
-import libharland { print_str, print_int }
 import ritzlib.sys { sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
 
 const PAGE: i64 = 4096
 const PAGES: i64 = 4
 # 3 MiB: crosses at least one 2 MiB page-table boundary.
 const BIG_PAGES: i64 = 768
+# init's pattern in the first word of its page `pg` is INIT_PATTERN + pg.
+const INIT_PATTERN: u64 = 0x1717171700000000
 
-fn fail(step: i32, msg: *u8) -> i32
-    print_str(c"[mmap_child] FAIL: ")
-    print_str(msg)
-    print_str(c"\n")
+fn fail(step: i32, msg: StrView) -> i32
+    print("[mmap_child] FAIL: {msg}\n")
     return step
 
-fn parse_dec(s: *u8) -> i64
+fn parse_dec(s: StrView) -> i64
     var v: i64 = 0
     var i: i64 = 0
-    while *(s + i) >= 48 and *(s + i) <= 57
-        v = v * 10 + (*(s + i) - 48) as i64
+    while i < s.len and s.ptr[i] >= 48 and s.ptr[i] <= 57
+        v = v * 10 + (s.ptr[i] - 48) as i64
         i = i + 1
     return v
 
@@ -46,29 +48,30 @@ fn map_pages(n: i64) -> i64
 fn word(addr: i64) -> *u64
     return addr as *u64
 
-pub fn main(argc: i32, argv: **u8) -> i32
-    if argc < 2
-        return fail(1, c"usage: mmap_child <parent mmap address>")
-    let parent_addr: i64 = parse_dec(*(argv + 1))
+pub fn main(args: Span<StrView>) -> i32
+    if args.len < 2
+        return fail(1, "usage: mmap_child <parent mmap address>")
+    let parent_addr: i64 = parse_dec(args[1])
 
-    # 1. Same first address as the parent: the cursor is per process.
+    # 1. Same first address as the parent: the cursor is per process. The
+    # adapter's mmap for the views was this process's first.
+    let first: i64 = args.ptr as i64
+    if first != parent_addr
+        print("[mmap_child] first mmap at {first}, parent's at {parent_addr}\n")
+        return fail(2, "mmap cursor is not per process")
+
+    # 2. The page at the parent's address is this process's own (the views,
+    # not init's pattern), and fresh pages are zero; overwrite them.
+    if *word(first) == INIT_PATTERN
+        return fail(3, "page at the parent's address holds init's pattern")
     let a: i64 = map_pages(PAGES)
     if a == 0
-        return fail(2, c"mmap failed")
-    if a != parent_addr
-        print_str(c"[mmap_child] first mmap at ")
-        print_int(a)
-        print_str(c", parent's at ")
-        print_int(parent_addr)
-        print_str(c"\n")
-        return fail(2, c"mmap cursor is not per process")
-
-    # 2. Own, zeroed pages at the parent's address; overwrite them.
+        return fail(2, "mmap failed")
     var pg: i64 = 0
     while pg < PAGES
         let base: i64 = a + pg * PAGE
         if *word(base) != 0 or *word(base + PAGE - 8) != 0
-            return fail(3, c"fresh page is not zero (aliases the parent's?)")
+            return fail(3, "fresh page is not zero (aliases the parent's?)")
         *word(base) = 0xC0C0C0C000000000 as u64 + pg as u64
         *word(base + PAGE - 8) = 0xC1C1C1C100000000 as u64 + pg as u64
         pg = pg + 1
@@ -76,9 +79,9 @@ pub fn main(argc: i32, argv: **u8) -> i32
     # 3. A mapping spanning several page tables.
     let b: i64 = map_pages(BIG_PAGES)
     if b == 0
-        return fail(4, c"big mmap failed")
+        return fail(4, "big mmap failed")
     if b < a + PAGES * PAGE
-        return fail(5, c"big mmap overlaps the first one")
+        return fail(5, "big mmap overlaps the first one")
     pg = 0
     while pg < BIG_PAGES
         let base: i64 = b + pg * PAGE
@@ -89,22 +92,18 @@ pub fn main(argc: i32, argv: **u8) -> i32
     while pg < BIG_PAGES
         let base: i64 = b + pg * PAGE
         if *word(base) != 0x5A5A000000000000 as u64 + pg as u64 or *word(base + 2048) != 0xA5A5000000000000 as u64 + pg as u64
-            print_str(c"[mmap_child] big mapping: bad page ")
-            print_int(pg)
-            print_str(c"\n")
-            return fail(6, c"big mapping lost a write")
+            print("[mmap_child] big mapping: bad page {pg}\n")
+            return fail(6, "big mapping lost a write")
         pg = pg + 1
     pg = 0
     while pg < PAGES
         if *word(a + pg * PAGE) != 0xC0C0C0C000000000 as u64 + pg as u64
-            return fail(6, c"first mapping changed by the big one")
+            return fail(6, "first mapping changed by the big one")
         pg = pg + 1
 
     # 4. Unmap both.
     if sys_munmap(b as *u8, BIG_PAGES * PAGE) != 0 or sys_munmap(a as *u8, PAGES * PAGE) != 0
-        return fail(7, c"munmap failed")
+        return fail(7, "munmap failed")
 
-    print_str(c"[mmap_child] PASS: own region at the parent's address, ")
-    print_int(BIG_PAGES)
-    print_str(c"-page mapping ok\n")
+    print("[mmap_child] PASS: own region at the parent's address, {BIG_PAGES}-page mapping ok\n")
     return 0
