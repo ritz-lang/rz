@@ -356,10 +356,127 @@ fn test_every_quote_style_ends_an_attribute() -> i32
         return 1
     if tok.start_tag.attr_count != 4
         return 1
-    # Every Attribute aliases the shared name/value buffers, so only the
-    # last one reads back intact (separate bug, see AGAST follow-up).
-    if not (tok.start_tag.attrs[3].name).eq("w")
+    # Each Attribute owns its bytes (#4561): a later attribute must not
+    # overwrite an earlier one's name or value.
+    if not (tok.start_tag.attrs[0].name).eq("x")
         return 2
+    if not (tok.start_tag.attrs[0].value).eq("1")
+        return 3
+    if not (tok.start_tag.attrs[1].name).eq("y")
+        return 4
+    if not (tok.start_tag.attrs[1].value).eq("2")
+        return 5
+    if not (tok.start_tag.attrs[2].name).eq("z")
+        return 6
+    if not (tok.start_tag.attrs[2].value).eq("3")
+        return 7
+    if not (tok.start_tag.attrs[3].name).eq("w")
+        return 8
+    if tok.start_tag.attrs[3].value.len != 0
+        return 9
+    expect_eof(t)
+
+# The arena is per tag: the next tag's attributes reuse it, but the
+# lengths of names and values that differ in size must still read back.
+[[test]]
+fn test_attributes_of_a_second_tag_read_back() -> i32
+    var t = tokenizer_new("<a href=\"long-value\" id=k><b class=c title=\"tt\">")
+    let a = tokenizer_next(t)
+    if a.kind != TOKEN_START_TAG or a.start_tag.attr_count != 2
+        return 1
+    if not (a.start_tag.attrs[0].value).eq("long-value")
+        return 2
+    if not (a.start_tag.attrs[1].name).eq("id")
+        return 3
+    let b = tokenizer_next(t)
+    if b.kind != TOKEN_START_TAG or b.start_tag.attr_count != 2
+        return 4
+    if not (b.start_tag.attrs[0].name).eq("class")
+        return 5
+    if not (b.start_tag.attrs[0].value).eq("c")
+        return 6
+    if not (b.start_tag.attrs[1].name).eq("title")
+        return 7
+    if not (b.start_tag.attrs[1].value).eq("tt")
+        return 8
+    expect_eof(t)
+
+# Fill `buf` from `at` with `<a v=XXXX...>` (value of `vlen` X's); return
+# the new end.
+fn put_tag_with_value(buf: *u8, at: u64, vlen: u64) -> u64
+    var n = at
+    buf[n] = '<'
+    buf[n + 1] = 'a'
+    buf[n + 2] = ' '
+    buf[n + 3] = 'v'
+    buf[n + 4] = '='
+    n = n + 5
+    var i: u64 = 0
+    while i < vlen
+        buf[n] = 'X'
+        n = n + 1
+        i = i + 1
+    buf[n] = '>'
+    n + 1
+
+# The attribute arena is reset per tag: 40 tags x 1000-byte values is more
+# than one arena's worth, yet every tag's value reads back whole.
+[[test]]
+fn test_attribute_arena_is_reused_per_tag() -> i32
+    var buf: [41000]u8
+    var n: u64 = 0
+    var k: u32 = 0
+    while k < 40
+        n = put_tag_with_value(@buf[0], n, 1000)
+        k = k + 1
+    var t = tokenizer_new(StrView { ptr: @buf[0], len: n })
+    k = 0
+    while k < 40
+        let tok = tokenizer_next(t)
+        if tok.kind != TOKEN_START_TAG or tok.start_tag.attr_count != 1
+            return 1
+        if tok.start_tag.attrs[0].value.len != 1000
+            return 2
+        k = k + 1
+    expect_eof(t)
+
+# One tag whose attributes overflow the 32768-byte arena: the attribute
+# that crosses the end keeps its name and a truncated value, earlier ones
+# stay whole.
+[[test]]
+fn test_attribute_arena_overflow_truncates_the_last_value() -> i32
+    var buf: [40000]u8
+    var n: u64 = 0
+    buf[0] = '<'
+    buf[1] = 'a'
+    n = 2
+    var k: u32 = 0
+    while k < 9
+        buf[n] = ' '
+        buf[n + 1] = 'a' + k as u8
+        buf[n + 2] = '='
+        n = n + 3
+        var i: u64 = 0
+        while i < 4000
+            buf[n] = 'X'
+            n = n + 1
+            i = i + 1
+        k = k + 1
+    buf[n] = '>'
+    n = n + 1
+    var t = tokenizer_new(StrView { ptr: @buf[0], len: n })
+    let tok = tokenizer_next(t)
+    if tok.kind != TOKEN_START_TAG or tok.start_tag.attr_count != 9
+        return 1
+    if tok.start_tag.attrs[7].value.len != 4000
+        return 2
+    if not (tok.start_tag.attrs[8].name).eq("i")
+        return 3
+    # 8 x (1 + 4000) = 32008 used; 1 byte for "i" leaves 759.
+    if tok.start_tag.attrs[8].value.len != 759
+        return 4
+    if not (tok.start_tag.attrs[0].name).eq("a")
+        return 5
     expect_eof(t)
 
 [[test]]

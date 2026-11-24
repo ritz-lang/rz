@@ -158,6 +158,10 @@ const MAX_TAG_NAME_LEN: u32 = 256
 const MAX_ATTR_NAME_LEN: u32 = 256
 const MAX_ATTR_VALUE_LEN: u32 = 4096
 const MAX_ATTRS: u32 = 64
+# Bytes shared by one tag's attribute names and values (#4561). Holds at
+# least seven attributes of maximal name+value length; past that, a name
+# that no longer fits drops its attribute and a value is truncated.
+const MAX_ATTR_BYTES: u32 = 32768
 const MAX_COMMENT_LEN: u32 = 65536
 
 # =============================================================================
@@ -187,9 +191,14 @@ pub struct Tokenizer
     attr_value: [MAX_ATTR_VALUE_LEN]u8
     attr_value_len: u32
 
-    # Attribute storage
+    # Attribute storage. Each finished attribute's name and value are
+    # copied into attr_bytes, so attrs[i] stays intact when the next
+    # attribute reuses attr_name/attr_value (#4561). Like tag_name, the
+    # bytes live until the next tag starts (clear_tag); no heap, no free.
     attrs: [MAX_ATTRS]Attribute
     attr_count: u32
+    attr_bytes: [MAX_ATTR_BYTES]u8
+    attr_bytes_len: u32
 
     # Self-closing flag
     self_closing: i32
@@ -240,6 +249,7 @@ pub fn tokenizer_new(input: StrView) -> Tokenizer
     t.attr_name_len = 0
     t.attr_value_len = 0
     t.attr_count = 0
+    t.attr_bytes_len = 0
     t.self_closing = 0
 
     t.comment_len = 0
@@ -295,6 +305,7 @@ fn clear_tag(t:& Tokenizer)
     t.tag_name_len = 0
     t.is_end_tag = 0
     t.attr_count = 0
+    t.attr_bytes_len = 0
     t.self_closing = 0
 
 fn append_to_tag_name(t:& Tokenizer, c: u8)
@@ -326,13 +337,34 @@ fn finish_attr(t:& Tokenizer)
         # must be removed from the token."
 
         # For now, just add it (TODO: check duplicates)
+        # Copy into the per-tag arena so the next attribute can't clobber
+        # this one (#4561).
+        if t.attr_name_len > MAX_ATTR_BYTES - t.attr_bytes_len
+            return
+        let name_start = t.attr_bytes_len
+        var i: u32 = 0
+        while i < t.attr_name_len
+            t.attr_bytes[name_start + i] = t.attr_name[i]
+            i = i + 1
+        t.attr_bytes_len = name_start + t.attr_name_len
+
+        var value_len = t.attr_value_len
+        if value_len > MAX_ATTR_BYTES - t.attr_bytes_len
+            value_len = MAX_ATTR_BYTES - t.attr_bytes_len
+        let value_start = t.attr_bytes_len
+        i = 0
+        while i < value_len
+            t.attr_bytes[value_start + i] = t.attr_value[i]
+            i = i + 1
+        t.attr_bytes_len = value_start + value_len
+
         let name = StrView {
-            ptr: @t.attr_name[0],
+            ptr: @t.attr_bytes[name_start],
             len: t.attr_name_len as u64
         }
         let value = StrView {
-            ptr: @t.attr_value[0],
-            len: t.attr_value_len as u64
+            ptr: @t.attr_bytes[value_start],
+            len: value_len as u64
         }
         t.attrs[t.attr_count] = attribute_new(name, value)
         t.attr_count = t.attr_count + 1
