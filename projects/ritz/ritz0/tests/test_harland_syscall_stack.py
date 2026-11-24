@@ -91,8 +91,12 @@ def test_per_cpu_area_holds_the_syscall_frame():
     assert "movq %rsp, %gs:PC_USER_RSP" in entry
     assert "movq %rax, %gs:PC_USER_RAX" in entry
     assert "pushq %gs:PC_USER_RSP" in entry
-    # ...and returns to the user's GS before iretq.
-    assert entry.rindex("swapgs") > entry.index("pushq $0x1B")
+    # ...and returns to the user's GS before each exit: sysretq on the fast
+    # path, iretq for a non-canonical return RIP (AGAST #4610).
+    sysret = entry.index("sysretq")
+    assert entry.rindex("swapgs", 0, sysret) > entry.index("popq %rsp")
+    iret = entry.index("iretq")
+    assert entry.rindex("swapgs", 0, iret) > entry.index("pushq $USER_SS")
     # The accessors read this CPU's area too.
     for fn, off in (("get_syscall_user_rip", "PC_USER_RIP"),
                     ("get_syscall_user_rsp", "PC_USER_RSP"),

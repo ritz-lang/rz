@@ -23,8 +23,10 @@
 # Before this change the BSP's user-frame globals and one shared TSS stack
 # made step 3 impossible: the two CPUs overwrote each other's frame.
 
-import klog { klog, klog_dec }
-import io { memory_barrier, cpu_pause, sti_hlt }
+import klog { klog, klog_dec, klog_hex }
+import io { memory_barrier, cpu_pause, sti_hlt, rdmsr, interrupts_enabled, enable_interrupts }
+import arch.x86_64.gdt { gdt_get_sysret_base, gdt_user_segments_ok }
+import arch.x86_64.sysret_catch { sysret_catch_arm, sysret_catch_disarm, sysret_catch_caught, sysret_catch_vector, sysret_catch_rip, sysret_catch_cs }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page }
 import mm.vmm { PTE_USER, PTE_WRITABLE, phys_to_virt, vmm_map_page }
 import arch.x86_64.cpu_map { MAX_CPUS, cpu_map_started }
@@ -38,6 +40,7 @@ extern fn smp_test_enter_user(entry: u64, stack: u64) -> u64
 extern fn smp_test_resume_bsp() -> u64
 extern fn jump_to_userspace(entry: u64, stack: u64)
 extern fn kstack_set_current(top: u64)
+extern fn syscall_iret_exit_count() -> u64
 
 # The stub and its stacks, below the kernel half and clear of the user ELF
 # (4 GiB) and user stack (top of the lower half). PML4 index 128.
@@ -53,6 +56,22 @@ const SMP_START_US: u64 = 10000000
 # The phase-1/phase-2 argument the stub passes in RDI.
 const SMP_PHASE_PING: u64 = 1
 const SMP_PHASE_DONE: u64 = 2
+# The "sysret" self-test's phases (AGAST #4610): a round trip that must come
+# back through SYSRETQ, then one whose return RIP the handler makes
+# non-canonical, then DONE (reached only if that one came back).
+const SYSRET_PHASE_PING: u64 = 3
+const SYSRET_PHASE_BAD_RIP: u64 = 4
+
+# The "sysret" self-test's stub and stack, next to the SMP test's.
+const SYSRET_CODE_VA: u64 = 0x400000200000
+const SYSRET_STACK_VA: u64 = 0x400000300000
+# The first address past the lower canonical half (4-level paging).
+const NONCANONICAL_RIP: u64 = 0x0000800000000000
+const MSR_STAR: u32 = 0xC0000081
+const STAR_SYSRET_BASE_SHIFT: u64 = 48
+# syscall_entry.s's frame, from the kernel stack's top down: user RSP,
+# RFLAGS, then the return RIP.
+const FRAME_RIP_BELOW_TOP: u64 = 24
 
 var smp_expected: u32 = 0            # CPUs that must reach the handler
 var smp_in_syscall: u32 = 0          # how many are inside right now
@@ -64,69 +83,47 @@ var smp_bsp_inside: u32 = 0          # 1 only while the BSP runs the test
 var smp_barrier_deadline: u64 = 0
 var smp_bsp_cpu: i32 = -1
 
-# Write the ring-3 stub: SYSCALL phase 1, SYSCALL phase 2, spin if either
-# returns. RAX = syscall number, RDI = phase.
-fn smp_write_stub(code: *u8)
+var sysret_inside: u32 = 0           # 1 only while sysret_selftest runs
+var sysret_cpu: i32 = -1
+var sysret_pinged: u32 = 0
+var sysret_iret_at_ping: u64 = 0     # syscall_iret_exits in each handler
+var sysret_iret_at_bad: u64 = 0
+
+# Write `mov $Syscall.Smp, %eax; mov $phase, %edi; syscall` at code + p.
+# Returns the offset past it.
+fn stub_syscall(code: *u8, p: i32, phase: u64) -> i32
     let nr: u8 = Syscall.Smp as u8
-    var p: i32 = 0
+    var q: i32 = p
     # mov $nr, %eax
-    *(code + p) = 0xB8
-    p = p + 1
-    *(code + p) = nr
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    # mov $SMP_PHASE_PING, %edi
-    *(code + p) = 0xBF
-    p = p + 1
-    *(code + p) = SMP_PHASE_PING as u8
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
+    *(code + q) = 0xB8
+    *(code + q + 1) = nr
+    *(code + q + 2) = 0
+    *(code + q + 3) = 0
+    *(code + q + 4) = 0
+    q = q + 5
+    # mov $phase, %edi
+    *(code + q) = 0xBF
+    *(code + q + 1) = phase as u8
+    *(code + q + 2) = 0
+    *(code + q + 3) = 0
+    *(code + q + 4) = 0
+    q = q + 5
     # syscall
-    *(code + p) = 0x0F
-    p = p + 1
-    *(code + p) = 0x05
-    p = p + 1
-    # mov $nr, %eax
-    *(code + p) = 0xB8
-    p = p + 1
-    *(code + p) = nr
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    # mov $SMP_PHASE_DONE, %edi
-    *(code + p) = 0xBF
-    p = p + 1
-    *(code + p) = SMP_PHASE_DONE as u8
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    *(code + p) = 0
-    p = p + 1
-    # syscall
-    *(code + p) = 0x0F
-    p = p + 1
-    *(code + p) = 0x05
-    p = p + 1
-    # jmp . (never reached: phase 2 does not return to ring 3 here)
+    *(code + q) = 0x0F
+    *(code + q + 1) = 0x05
+    return q + 2
+
+# Write the ring-3 stub: SYSCALL each phase in turn, then spin (never
+# reached: the last phase does not return to ring 3). RAX = syscall number,
+# RDI = phase. `phase3` 0 means two phases.
+fn smp_write_stub(code: *u8, phase1: u64, phase2: u64, phase3: u64)
+    var p: i32 = stub_syscall(code, 0, phase1)
+    p = stub_syscall(code, p, phase2)
+    if phase3 != 0
+        p = stub_syscall(code, p, phase3)
+    # jmp .
     *(code + p) = 0xEB
-    p = p + 1
-    *(code + p) = 0xFE
+    *(code + p + 1) = 0xFE
 
 # A zeroed, user-mapped page at `va`. Returns its physical address, or 0.
 fn smp_map_user_page(va: u64) -> u64
@@ -173,7 +170,7 @@ pub fn smp_syscall_selftest(bsp_cpu: i32) -> i32
     if code_phys == 0
         klog("[smp] cannot map the syscall test stub\n")
         return 1
-    smp_write_stub(phys_to_virt(code_phys) as *u8)
+    smp_write_stub(phys_to_virt(code_phys) as *u8, SMP_PHASE_PING, SMP_PHASE_DONE, 0)
     cpu = 0
     while cpu < MAX_CPUS
         if smp_participant[cpu] != 0
@@ -274,6 +271,8 @@ pub fn sys_smp_test_handler(phase: u64, a2: u64, a3: u64, a4: u64) -> i64
     let cpu: i32 = cpu_index()
     if cpu < 0 or cpu >= MAX_CPUS
         return 0
+    if sysret_inside != 0 and cpu == sysret_cpu
+        return sysret_test_phase(phase)
     if smp_bsp_inside == 0
         # Outside the boot self-test SYS_SMP is not a user ABI. An AP can
         # only be our stub finishing phase 2 (the BSP resumed first): let it
@@ -300,3 +299,88 @@ pub fn sys_smp_test_handler(phase: u64, a2: u64, a3: u64, a4: u64) -> i64
         return 0
     smp_ap_idle()
     return 0
+
+# ============================================================================
+# The "sysret" boot self-test (AGAST #4610)
+# ============================================================================
+# syscall_entry.s returns to ring 3 with SYSRETQ, which needs STAR[63:48] =
+# gdt.ritz GDT_SYSRET_BASE and the GDT in user data, user code order, and
+# with IRETQ when the return RIP is non-canonical (SYSRETQ to one #GPs in
+# ring 0 on Intel CPUs, with the user's RSP). This runs a ring-3 stub on
+# this CPU through both exits:
+#
+#   1. PING: the handler notes syscall_iret_exits; the stub only reaches
+#      phase 2 if the return to ring 3 worked.
+#   2. BAD_RIP: the handler checks syscall_iret_exits did not move (PING
+#      came back through SYSRETQ), overwrites the frame's return RIP with
+#      NONCANONICAL_RIP and arms arch/x86_64/sysret_catch.ritz. The exit
+#      must take the IRETQ path, which faults; exceptions.ritz hands the
+#      fault to the catcher, and it resumes us here.
+#   3. DONE: only reached if phase 2 came back to ring 3 somehow. Resumes
+#      us here with nothing caught: a failure.
+fn sysret_test_phase(phase: u64) -> i64
+    if phase == SYSRET_PHASE_PING
+        sysret_iret_at_ping = syscall_iret_exit_count()
+        sysret_pinged = 1
+        return 0
+    if phase == SYSRET_PHASE_BAD_RIP
+        sysret_iret_at_bad = syscall_iret_exit_count()
+        let rip_slot: *u64 = (cpu_kstack_top() - FRAME_RIP_BELOW_TOP) as *u64
+        *rip_slot = NONCANONICAL_RIP
+        sysret_catch_arm()
+        return 0
+    # DONE, or anything else: leave ring 3 for the test's caller.
+    sysret_catch_disarm()
+    smp_test_resume_bsp()
+    return 0
+
+fn sysret_fail(why: StrView) -> bool
+    klog("[sysret] FAILED: ")
+    klog(why)
+    klog("\n")
+    return false
+
+pub fn sysret_selftest() -> bool
+    let base: u64 = rdmsr(MSR_STAR) >> STAR_SYSRET_BASE_SHIFT
+    if base != gdt_get_sysret_base() as u64
+        klog("[sysret] STAR[63:48] = ")
+        klog_hex(base)
+        klog("\n")
+        return sysret_fail("STAR[63:48] is not GDT_SYSRET_BASE")
+    if not gdt_user_segments_ok()
+        return sysret_fail("GDT is not user data then 64-bit user code")
+
+    let code_phys: u64 = smp_map_user_page(SYSRET_CODE_VA)
+    if code_phys == 0 or smp_map_user_page(SYSRET_STACK_VA) == 0
+        return sysret_fail("cannot map the test stub")
+    smp_write_stub(phys_to_virt(code_phys) as *u8, SYSRET_PHASE_PING, SYSRET_PHASE_BAD_RIP, SMP_PHASE_DONE)
+
+    let had_if: bool = interrupts_enabled()
+    sysret_pinged = 0
+    sysret_cpu = cpu_index()
+    memory_barrier()
+    sysret_inside = 1
+    smp_test_enter_user(SYSRET_CODE_VA, SYSRET_STACK_VA + PAGE_SIZE - 16)
+    # Resumed by the catcher (or by DONE), with IF=0 from the fault's gate.
+    sysret_inside = 0
+    sysret_catch_disarm()
+    if had_if
+        enable_interrupts()
+    let iret_after: u64 = syscall_iret_exit_count()
+
+    if sysret_pinged == 0
+        return sysret_fail("the stub never made its first syscall")
+    if sysret_iret_at_bad != sysret_iret_at_ping
+        return sysret_fail("a canonical return went through IRETQ, not SYSRETQ")
+    if not sysret_catch_caught()
+        return sysret_fail("a non-canonical return RIP came back to ring 3")
+    if iret_after != sysret_iret_at_bad + 1
+        return sysret_fail("a non-canonical return RIP did not take the IRETQ exit")
+    klog("[sysret] SYSRETQ fast path OK; non-canonical return RIP took IRETQ, caught vector ")
+    klog_dec(sysret_catch_vector() as i64)
+    klog(" at RIP ")
+    klog_hex(sysret_catch_rip())
+    klog(" CS ")
+    klog_hex(sysret_catch_cs())
+    klog("\n")
+    return true

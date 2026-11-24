@@ -391,7 +391,7 @@ PY
 # The kernel self-tests every boot-test boot must pass (postinit.ritz's
 # boot_self_tests). channel-close and channel-debug-print were skipped as
 # page faults until AGAST #1887; the gate now requires both.
-BOOT_TESTS="vmm higher-half heap ipc channel-close channel-debug-print munmap mmap-failure pmm-above-4g mmap-overlap mmap-cursor elf-loader virtio-blk-read"
+BOOT_TESTS="vmm higher-half heap ipc channel-close channel-debug-print munmap mmap-failure pmm-above-4g mmap-overlap mmap-cursor elf-loader sysret virtio-blk-read"
 
 # boot_tests_passed NAME: pass only if the kernel's boot-test summary is in
 # the log (before any ring dump, which repeats it) with 0 failed, no test logged FAIL, and every BOOT_TESTS name

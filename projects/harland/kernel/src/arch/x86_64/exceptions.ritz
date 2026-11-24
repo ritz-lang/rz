@@ -14,10 +14,21 @@ import syscall.stack { syscall_stack_guard_hit }
 import proc.sched { sched_tick }
 import proc.waitq { waitq_wake_irq }
 import arch.x86_64.apcall { ap_call_dispatch }
+import arch.x86_64.sysret_catch { sysret_selftest_catch }
 
 # External functions from main.ritz
 extern fn ring_dump() -> i32
 extern fn lapic_eoi() -> i32
+
+# syscall_entry.s: the IRETQ a syscall returns through when its return RIP
+# is non-canonical (AGAST #4610).
+extern fn syscall_exit_iret()
+
+# A fault on syscall_exit_iret is the user's, though CS is still the
+# kernel's: the IRETQ to a non-canonical RIP #GPs before it leaves ring 0.
+# The user's RIP is in the IRETQ frame the fault interrupted (at its RSP).
+fn fault_on_syscall_iret(frame: *InterruptFrame) -> bool
+    return ((*frame).cs & 3) == 0 and (*frame).rip == syscall_exit_iret as u64
 
 # ============================================================================
 # Interrupt Frame Structure
@@ -199,6 +210,27 @@ fn read_cr2() -> u64
         movq %rax, (%rcx)
     return cr2
 
+# The "[fault]" line for a user-mode exception. It must not print
+# "EXCEPTION" or "PANIC": the boot tests read those as a kernel failure.
+# The "sysret" boot self-test's expected fault resumes the test first
+# (arch/x86_64/sysret_catch.ritz); no-op when it isn't running.
+fn log_user_fault(frame: *InterruptFrame, user_rip: u64, bad_iret: bool)
+    sysret_selftest_catch((*frame).vector, (*frame).rip, (*frame).cs)
+    klog("[fault] PID ")
+    klog_dec(current_pid() as i64)
+    klog(": ")
+    klog_cstr(exception_name((*frame).vector as u8))
+    klog(" (vector ")
+    klog_dec((*frame).vector)
+    klog(") at RIP ")
+    klog_hex(user_rip)
+    if bad_iret
+        klog(" (non-canonical syscall return)")
+    if (*frame).vector == 14
+        klog(" CR2 ")
+        klog_hex(read_cr2())
+    klog(", killing the process\n")
+
 # ============================================================================
 # Exception Handler
 # ============================================================================
@@ -209,22 +241,16 @@ fn read_cr2() -> u64
 # A kernel-mode exception prints diagnostic information and halts.
 
 pub fn exception_handler(frame: *InterruptFrame) -> i32
-    # CPL of the interrupted code: ring 3 is user mode. This line must not
-    # print "EXCEPTION" or "PANIC": the boot tests read those as a kernel
-    # failure.
+    # A #GP on the syscall exit's IRETQ to a non-canonical RIP is the
+    # user's fault, though CS is still the kernel's (AGAST #4610).
+    if fault_on_syscall_iret(frame)
+        log_user_fault(frame, *((*frame).rsp as *u64), true)
+        process_kill_current(128 + ((*frame).vector as i32))
+        return 0
+
+    # CPL of the interrupted code: ring 3 is user mode.
     if ((*frame).cs & 3) == 3
-        klog("[fault] PID ")
-        klog_dec(current_pid() as i64)
-        klog(": ")
-        klog_cstr(exception_name((*frame).vector as u8))
-        klog(" (vector ")
-        klog_dec((*frame).vector)
-        klog(") at RIP ")
-        klog_hex((*frame).rip)
-        if (*frame).vector == 14
-            klog(" CR2 ")
-            klog_hex(read_cr2())
-        klog(", killing the process\n")
+        log_user_fault(frame, (*frame).rip, false)
         process_kill_current(128 + ((*frame).vector as i32))
         # Never reached: the parent resumed, or the machine powered off.
         return 0

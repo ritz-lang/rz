@@ -4,8 +4,8 @@
 # - Null descriptor (required)
 # - Kernel code segment (64-bit)
 # - Kernel data segment
-# - User code segment (64-bit)
 # - User data segment
+# - User code segment (64-bit)
 # - TSS descriptor (16 bytes, for task state segment)
 #
 # In 64-bit mode, most of the GDT fields are ignored, but we still
@@ -23,9 +23,14 @@ import arch.x86_64.cpu_map { MAX_CPUS }
 const GDT_NULL: u16 = 0x00          # Null segment
 const GDT_KERNEL_CODE: u16 = 0x08   # Index 1, ring 0
 const GDT_KERNEL_DATA: u16 = 0x10   # Index 2, ring 0
-const GDT_USER_CODE: u16 = 0x1B     # Index 3, ring 3 (0x18 | 3)
-const GDT_USER_DATA: u16 = 0x23     # Index 4, ring 3 (0x20 | 3)
+const GDT_USER_DATA: u16 = 0x1B     # Index 3, ring 3 (0x18 | 3)
+const GDT_USER_CODE: u16 = 0x23     # Index 4, ring 3 (0x20 | 3)
 const GDT_TSS: u16 = 0x28           # Index 5, TSS
+
+# STAR[63:48] (AGAST #4610). SYSRETQ loads SS = base + 8 and CS = base + 16,
+# both with RPL 3, so user data must sit right before 64-bit user code.
+# syscall/runtime/entry.ritz and syscall_entry.s write it; keep them in step.
+pub const GDT_SYSRET_BASE: u16 = 0x13   # GDT_KERNEL_DATA | 3
 
 # ============================================================================
 # GDT Access Byte Flags
@@ -37,6 +42,7 @@ const GDT_ACCESS_RING3: u8 = 0x60       # Ring 3 (user)
 const GDT_ACCESS_CODE: u8 = 0x1A        # Executable, readable
 const GDT_ACCESS_DATA: u8 = 0x12        # Writable
 const GDT_ACCESS_TSS: u8 = 0x89         # 64-bit TSS (available)
+const GDT_ACCESS_IGNORE_ACCESSED: u8 = 0xFE  # mask off the CPU-set Accessed bit
 
 # ============================================================================
 # GDT Flags (high nibble of flags_limit byte)
@@ -117,7 +123,7 @@ struct Tss
 const GDT_TSS_FIRST: i32 = 5
 const GDT_ENTRIES: i32 = 133
 
-# GDT with 133 entries: null, kernel code, kernel data, user code, user data,
+# GDT with 133 entries: null, kernel code, kernel data, user data, user code,
 # then 64 pairs of TSS descriptors.
 var gdt: [133]GdtEntry
 
@@ -221,15 +227,15 @@ pub fn gdt_init() -> i32
     let kdata_flags: u8 = GDT_FLAG_GRANULARITY
     gdt[2] = make_gdt_entry(0, 0xFFFFF, kdata_access, kdata_flags)
 
-    # Entry 3: User code segment (64-bit)
-    let ucode_access: u8 = GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 | GDT_ACCESS_CODE
-    let ucode_flags: u8 = GDT_FLAG_LONG | GDT_FLAG_GRANULARITY
-    gdt[3] = make_gdt_entry(0, 0xFFFFF, ucode_access, ucode_flags)
-
-    # Entry 4: User data segment
+    # Entry 3: User data segment, then entry 4: user code (64-bit). This
+    # order is SYSRETQ's (GDT_SYSRET_BASE + 8, + 16).
     let udata_access: u8 = GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 | GDT_ACCESS_DATA
     let udata_flags: u8 = GDT_FLAG_GRANULARITY
-    gdt[4] = make_gdt_entry(0, 0xFFFFF, udata_access, udata_flags)
+    gdt[3] = make_gdt_entry(0, 0xFFFFF, udata_access, udata_flags)
+
+    let ucode_access: u8 = GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 | GDT_ACCESS_CODE
+    let ucode_flags: u8 = GDT_FLAG_LONG | GDT_FLAG_GRANULARITY
+    gdt[4] = make_gdt_entry(0, 0xFFFFF, ucode_access, ucode_flags)
 
     # CPU 0's TSS with the early fallback stacks. cpu_bringup replaces them
     # with PMM-backed, guard-paged stacks once the VMM is up.
@@ -307,3 +313,23 @@ pub fn gdt_get_user_code_selector() -> u16
 
 pub fn gdt_get_user_data_selector() -> u16
     return GDT_USER_DATA
+
+pub fn gdt_get_sysret_base() -> u16
+    return GDT_SYSRET_BASE
+
+# The live GDT is in SYSRETQ's order (the "sysret" boot self-test, #4610):
+# base + 8 is a ring-3 data segment and base + 16 a ring-3 long-mode code
+# segment, matching the user selectors.
+pub fn gdt_user_segments_ok() -> bool
+    let data_idx: i32 = ((GDT_SYSRET_BASE + 8) >> 3) as i32
+    let code_idx: i32 = ((GDT_SYSRET_BASE + 16) >> 3) as i32
+    if (((GDT_SYSRET_BASE + 8) | 3) != GDT_USER_DATA) or (((GDT_SYSRET_BASE + 16) | 3) != GDT_USER_CODE)
+        return false
+    # The CPU sets the Accessed bit (bit 0) when it loads a selector.
+    let data_access: u8 = GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 | GDT_ACCESS_DATA
+    let code_access: u8 = GDT_ACCESS_PRESENT | GDT_ACCESS_RING3 | GDT_ACCESS_CODE
+    if (gdt[data_idx].access & GDT_ACCESS_IGNORE_ACCESSED) != data_access or (gdt[data_idx].flags_limit & GDT_FLAG_LONG) != 0
+        return false
+    if (gdt[code_idx].access & GDT_ACCESS_IGNORE_ACCESSED) != code_access or (gdt[code_idx].flags_limit & GDT_FLAG_LONG) == 0
+        return false
+    return true

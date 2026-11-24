@@ -16,6 +16,12 @@
 
 .set SYSCALL_STACK_SIZE, 65536
 
+# Ring-3 selectors (arch/x86_64/gdt.ritz GDT_USER_CODE/GDT_USER_DATA): user
+# data at index 3, 64-bit user code at index 4, the order SYSRETQ needs
+# (AGAST #4610). ritz0/test_harland_sysret.py pins them to gdt.ritz.
+.set USER_SS, 0x1B
+.set USER_CS, 0x23
+
 .set KSTACK_GUARD_SIZE, 4096
 .set KSTACK_STRIDE, KSTACK_GUARD_SIZE + SYSCALL_STACK_SIZE
 .set KSTACK_SLOTS, 8                # proc/table.ritz MAX_PROCS
@@ -90,6 +96,13 @@ proc_kstacks_end:
 smp_test_bsp_rsp:
     .quad 0
 
+# How many syscalls returned through the IRETQ exit (non-canonical return
+# RIP) rather than SYSRETQ: the "sysret" boot self-test reads it (#4610).
+.align 8
+.global syscall_iret_exits
+syscall_iret_exits:
+    .quad 0
+
 # ============================================================================
 # Exported User Context (for spawn/exit)
 # ============================================================================
@@ -103,6 +116,14 @@ smp_test_bsp_rsp:
 # User Context Accessor Functions
 # ============================================================================
 # These functions allow Ritz code to read the saved user context.
+
+# u64 syscall_iret_exit_count(void): syscall_iret_exits (AGAST #4610).
+.global syscall_iret_exit_count
+.type syscall_iret_exit_count, @function
+syscall_iret_exit_count:
+    movq syscall_iret_exits(%rip), %rax
+    ret
+.size syscall_iret_exit_count, . - syscall_iret_exit_count
 
 .global get_syscall_user_rip
 .type get_syscall_user_rip, @function
@@ -296,31 +317,54 @@ syscall_entry:
     popq %r10                    # arg4
     popq %r8                     # arg5
     popq %r9                     # arg6
+
+    # Left on the stack: return RIP, RFLAGS, user RSP. RCX and R11 are free:
+    # SYSCALL clobbers them, and they get the return RIP and RFLAGS below.
+    #
+    # Return to ring 3 with SYSRETQ (AGAST #4610): RCX -> RIP, R11 -> RFLAGS,
+    # SS = STAR[63:48] + 8, CS = STAR[63:48] + 16 (gdt.ritz GDT_SYSRET_BASE).
+    # Except for a non-canonical return RIP: SYSRETQ to one #GPs in ring 0
+    # on Intel CPUs with the user's RSP already loaded (the SYSRET erratum).
+    # That RIP takes the IRETQ exit instead. Canonical (4-level paging) means
+    # bits 63:47 all equal bit 47: shifting it to bit 63 and back is a no-op.
+    movq 0(%rsp), %rcx
+    movq %rcx, %r11
+    shlq $16, %r11
+    sarq $16, %r11
+    cmpq %rcx, %r11
+    jne .Lsyscall_exit_iret
+
     popq %rcx                    # return RIP
     popq %r11                    # saved RFLAGS
-    popq %rsp                    # Restore user stack (user_rsp)
-
-    # Return to userspace
-    # SYSRETQ: RCX → RIP, R11 → RFLAGS, switch to Ring 3
-    #
-    # NOTE: SYSRET has strict requirements on segment selectors.
-    # For now, we use IRETQ which is more flexible (but slower).
-    # TODO: Optimize to use SYSRETQ once GDT is properly ordered.
-
-    # Use IRETQ for safe return to Ring 3
-    # Build IRET frame: SS, RSP, RFLAGS, CS, RIP
-
-    # Push in reverse order (IRET pops: RIP, CS, RFLAGS, RSP, SS)
-    pushq $0x23                  # SS (user data segment, ring 3)
-    pushq %rsp                   # RSP (will be adjusted)
-    addq $8, 0(%rsp)             # Adjust for the push we just did
-    pushq %r11                   # RFLAGS (from R11)
-    pushq $0x1B                  # CS (user code segment, ring 3)
-    pushq %rcx                   # RIP (from RCX)
-
+    popq %rsp                    # user stack (user_rsp)
     # Back to the user's GS before ring 3 (AGAST #4192): the next SYSCALL's
     # swapgs then puts this CPU's area back.
     swapgs
+    sysretq
+
+.Lsyscall_exit_iret:
+    # The return RIP is non-canonical. Build an IRETQ frame at the top of
+    # this kernel stack (the three slots above are popped into this CPU's
+    # area first, the only free scratch). The IRETQ still #GPs, in ring 0 but
+    # on the kernel stack: isr_stubs.s's #GP stub sees the fault is at
+    # syscall_exit_iret and swaps GS back, and exceptions.ritz takes it as
+    # the user's fault. syscall_iret_exits counts these exits for the
+    # "sysret" boot self-test (arch/x86_64/cpu_smp.ritz).
+    popq %gs:PC_USER_RIP
+    popq %gs:PC_USER_RFLAGS
+    popq %gs:PC_USER_RSP
+    pushq $USER_SS
+    pushq %gs:PC_USER_RSP
+    pushq %gs:PC_USER_RFLAGS
+    pushq $USER_CS
+    pushq %gs:PC_USER_RIP
+    # RCX/R11 as SYSRETQ would leave them, not kernel values.
+    movq %gs:PC_USER_RIP, %rcx
+    movq %gs:PC_USER_RFLAGS, %r11
+    lock incq syscall_iret_exits(%rip)
+    swapgs
+.global syscall_exit_iret
+syscall_exit_iret:
     iretq
 
 .size syscall_entry, . - syscall_entry
@@ -345,12 +389,12 @@ jump_to_userspace:
     # Build IRET frame for Ring 3
     # Stack layout for IRETQ: RIP, CS, RFLAGS, RSP, SS
 
-    pushq $0x23                  # SS (user data, ring 3)
+    pushq $USER_SS               # SS (user data, ring 3)
     pushq %rsi                   # RSP (user stack)
     # Enable interrupts in userspace for true preemption
     # IF (bit 9) = 0x200, reserved bit 1 = 0x002
     pushq $0x202                 # RFLAGS (IF=1, reserved bit 1 = 1)
-    pushq $0x1B                  # CS (user code, ring 3)
+    pushq $USER_CS               # CS (64-bit user code, ring 3)
     pushq %rdi                   # RIP (entry point)
 
     # Clear all general purpose registers (security)
@@ -430,10 +474,10 @@ jump_to_userspace_with_args:
     # Build IRET frame for Ring 3
     # Stack layout for IRETQ: RIP, CS, RFLAGS, RSP, SS
 
-    pushq $0x23                  # SS (user data, ring 3)
+    pushq $USER_SS               # SS (user data, ring 3)
     pushq %rsi                   # RSP (user stack)
     pushq $0x202                 # RFLAGS (IF=1, reserved bit 1 = 1)
-    pushq $0x1B                  # CS (user code, ring 3)
+    pushq $USER_CS               # CS (64-bit user code, ring 3)
     pushq %rdi                   # RIP (entry point)
 
     # Set up main() arguments per SysV AMD64 ABI:
@@ -556,7 +600,8 @@ kstack_get_current:
 # ============================================================================
 # SYSCALL MSRs (AGAST #4192)
 # ============================================================================
-# EFER.SCE, STAR (kernel CS 0x08), LSTAR (syscall_entry) and SFMASK (IF) are
+# EFER.SCE, STAR (kernel CS 0x08 in 47:32, SYSRETQ's base 0x13 in 63:48),
+# LSTAR (syscall_entry) and SFMASK (IF) are
 # per-CPU MSRs: every CPU sets its own in cpu_bringup, before it can enter
 # ring 3. Same values syscall/runtime/entry.ritz writes on the BSP.
 .set MSR_EFER, 0xC0000080
@@ -565,6 +610,7 @@ kstack_get_current:
 .set MSR_SFMASK, 0xC0000084
 .set EFER_SCE, 1
 .set KERNEL_CS, 0x08                   # arch/x86_64/gdt.ritz GDT_KERNEL_CODE
+.set SYSRET_BASE, 0x13                 # arch/x86_64/gdt.ritz GDT_SYSRET_BASE
 .set RFLAGS_IF, 0x200
 .global syscall_msr_init
 .type syscall_msr_init, @function
@@ -574,10 +620,11 @@ syscall_msr_init:
     rdmsr
     orl $EFER_SCE, %eax
     wrmsr
-    # STAR: bits 47:32 (EDX's low half) = kernel CS
+    # STAR: bits 47:32 (EDX's low half) = kernel CS, bits 63:48 (EDX's high
+    # half) = SYSRETQ's base (AGAST #4610)
     movl $MSR_STAR, %ecx
     xorl %eax, %eax
-    movl $KERNEL_CS, %edx
+    movl $(KERNEL_CS | (SYSRET_BASE << 16)), %edx
     wrmsr
     # LSTAR = syscall_entry
     movabsq $syscall_entry, %rax

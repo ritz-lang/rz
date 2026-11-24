@@ -79,7 +79,7 @@ def test_syscall_entry_swaps_gs_and_uses_this_cpus_frame():
     assert "movq %gs:PC_KSTACK_TOP, %rsp" in entry
     assert "pushq %gs:PC_USER_RSP" in entry
     # And back to the user's GS for the return.
-    assert entry.rindex("swapgs") > entry.index("pushq $0x1B") > entry.index("swapgs")
+    assert entry.rindex("swapgs") > entry.index("popq %rsp") > entry.index("swapgs")
     # The single-CPU globals must be gone, not merely unused.
     for gone in ("user_rsp_save", "syscall_user_rip", "syscall_user_rsp",
                  "syscall_user_rflags", "syscall_user_rax", "kstack_current_top"):
@@ -100,7 +100,7 @@ def test_ring3_entries_and_interrupts_keep_the_gs_convention():
     # An exception with a CPU-pushed error code has CS at 16, not 8: testing
     # 8 would read RIP and leave GS on the user's during the handler.
     err = isr[isr.index(".macro ISR_ERR num"):isr.index(".endm", isr.index(".macro ISR_ERR num"))]
-    assert "SWAPGS_IF_USER_AT 16" in err
+    assert "SWAPGS_IF_USER_ERR" in err and "testq $3, 16(%rsp)" in isr
     for macro in (".macro ISR_NOERR num", ".macro IRQ_STUB num irq"):
         body = isr[isr.index(macro):isr.index(".endm", isr.index(macro))]
         assert "SWAPGS_IF_USER\n" in body, macro
@@ -145,7 +145,7 @@ def test_each_cpu_brings_up_its_own_state_before_use():
 
 def test_stub_syscalls_and_the_handler_barriers():
     smp = CPU_SMP.read_text()
-    stub = _body(smp, "smp_write_stub")
+    stub = _body(smp, "stub_syscall") + _body(smp, "smp_write_stub")
     assert "Syscall.Smp as u8" in stub and "0x0F" in stub and "0x05" in stub
     handler = _body(smp, "sys_smp_test_handler")
     assert handler.index("smp_seen_top[cpu] = cpu_kstack_top()") < \

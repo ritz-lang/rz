@@ -59,6 +59,24 @@ gdt_flush:
     SWAPGS_IF_USER_AT 8
 .endm
 
+# The same for an exception with a CPU-pushed error code (CS at 16, RIP at
+# 8), plus one kernel-mode case (AGAST #4610): a fault on syscall_entry.s's
+# syscall_exit_iret, the IRETQ to a non-canonical user RIP. It faults with
+# the kernel's CS but after the exit's swapgs, so GS is already the user's.
+# exceptions.ritz treats it as the user's fault.
+.macro SWAPGS_IF_USER_ERR
+    testq $3, 16(%rsp)
+    jnz 7f
+    pushq %rax
+    leaq syscall_exit_iret(%rip), %rax
+    cmpq %rax, 16(%rsp)          # RIP, past the error code and saved RAX
+    popq %rax                    # popq leaves the flags alone
+    jne 8f
+7:
+    swapgs
+8:
+.endm
+
 # ============================================================================
 # Common ISR Handler
 # ============================================================================
@@ -173,7 +191,7 @@ isr_stub_\num:
 .macro ISR_ERR num
 .global isr_stub_\num
 isr_stub_\num:
-    SWAPGS_IF_USER_AT 16
+    SWAPGS_IF_USER_ERR
     # Error code already pushed by CPU
     # Push interrupt vector number
     pushq $\num
