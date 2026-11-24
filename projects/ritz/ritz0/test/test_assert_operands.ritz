@@ -11,6 +11,10 @@
 # moves its `test_assert_operands.ritz:N`; update the expectation with it.
 
 import ritzlib.sys
+import ritzlib.fd
+import ritzlib.process
+import ritzlib.span
+import ritzlib.result
 import test_assert_helper_lib
 
 # ============================================================================
@@ -23,12 +27,12 @@ var g_pipe: [2]i32
 var g_bumps: i64 = 0
 
 fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
+    let src: Fd = fd_borrow(fd)
     var got: i64 = 0
     var n: i64 = 1
     while n > 0 and got < cap
-        n = sys_read(fd, buf + got, cap - got)
-        if n > 0
-            got = got + n
+        n = count_or_zero(src.read(Span<u8> { ptr: buf + got, len: cap - got }))
+        got = got + n
     got
 
 # 0 when buf[0..len] is exactly `want`.
@@ -44,22 +48,22 @@ fn bytes_differ(buf: *u8, len: i64, want: StrView) -> i32
 
 # Fork with the child's stderr on a pipe.  Returns the pid; 0 in the child.
 fn capture_begin() -> i32
-    sys_pipe(@g_pipe[0])
-    let pid: i32 = sys_fork()
+    open_g_pipe()
+    let pid: i32 = fork_pid()
     if pid == 0
-        sys_dup2(g_pipe[1], 2)
-        sys_close(g_pipe[0])
-        sys_close(g_pipe[1])
+        fd_borrow(g_pipe[1]).dup_to(2)
+        close_raw(g_pipe[0])
+        close_raw(g_pipe[1])
     pid
 
 # In the parent: the child's stderr into g_err, and its exit status.
 fn capture_end(pid: i32) -> i32
-    sys_close(g_pipe[1])
+    close_raw(g_pipe[1])
     g_err_len = read_all(g_pipe[0], @g_err[0], 512)
-    sys_close(g_pipe[0])
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    (status >> 8) & 255
+    close_raw(g_pipe[0])
+    # The child's exit code; 0 if a signal ended it, as status >> 8 gave.
+    let r: Result<ProcessResult, Errno> = wait_pid(pid)
+    exit_code_of(r)
 
 fn stderr_differs(want: StrView) -> i32
     bytes_differ(@g_err[0], g_err_len, want)
@@ -68,7 +72,7 @@ fn bump() -> i64
     g_bumps = g_bumps + 1
     g_bumps
 
-# A helper in this module.  Its assert is test_assert_operands.ritz:75.
+# A helper in this module.  Its assert is test_assert_operands.ritz:79.
 [[test_helper]]
 fn expect_sum(a: i64, b: i64, want: i64)
     let sum: i64 = a + b
@@ -87,7 +91,7 @@ fn test_eq_prints_both_operands() -> i32
         assert a == b
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:87: assertion failed: left == right\n  left:  3\n  right: 4\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:91: assertion failed: left == right\n  left:  3\n  right: 4\n") == 0
     0
 
 [[test]]
@@ -98,7 +102,7 @@ fn test_message_keeps_operands() -> i32
         assert a != 7, "ids must differ"
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:98: assertion failed: ids must differ\n  left:  7\n  right: 7\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:102: assertion failed: ids must differ\n  left:  7\n  right: 7\n") == 0
     0
 
 [[test]]
@@ -110,7 +114,7 @@ fn test_unsigned_operand_prints_unsigned() -> i32
         assert big < 5
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:110: assertion failed: left < right\n  left:  18446744073709551615\n  right: 5\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:114: assertion failed: left < right\n  left:  18446744073709551615\n  right: 5\n") == 0
     0
 
 [[test]]
@@ -121,7 +125,7 @@ fn test_i64_min_prints_exactly() -> i32
         assert lo >= -1
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:121: assertion failed: left >= right\n  left:  -9223372036854775808\n  right: -1\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:125: assertion failed: left >= right\n  left:  -9223372036854775808\n  right: -1\n") == 0
     0
 
 [[test]]
@@ -132,7 +136,7 @@ fn test_bool_operands_print_as_words() -> i32
         assert ok == true
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:132: assertion failed: left == right\n  left:  false\n  right: true\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:136: assertion failed: left == right\n  left:  false\n  right: true\n") == 0
     0
 
 [[test]]
@@ -143,7 +147,7 @@ fn test_pointer_operands_print_as_hex() -> i32
         assert p != null
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:143: assertion failed: left != right\n  left:  0x0\n  right: 0x0\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:147: assertion failed: left != right\n  left:  0x0\n  right: 0x0\n") == 0
     0
 
 # Not a comparison: nothing to show beyond the location (and message).
@@ -155,7 +159,7 @@ fn test_plain_condition_has_no_operands() -> i32
         assert ok, "flag"
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:155: assertion failed: flag\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:159: assertion failed: flag\n") == 0
     0
 
 # The operands are evaluated once: the comparison and the report share them.
@@ -169,7 +173,7 @@ fn test_operands_evaluate_once() -> i32
         assert bump() == 7
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:169: assertion failed: left == right\n  left:  2\n  right: 7\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:173: assertion failed: left == right\n  left:  2\n  right: 7\n") == 0
     0
 
 # ============================================================================
@@ -183,7 +187,7 @@ fn test_helper_reports_test_call_site() -> i32
         expect_sum(2, 2, 5)
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:183: assertion failed: left == right\n  left:  4\n  right: 5\n  in helper expect_sum at test_assert_operands.ritz:75\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:187: assertion failed: left == right\n  left:  4\n  right: 5\n  in helper expect_sum at test_assert_operands.ritz:79\n") == 0
     0
 
 # Through a helper in another module that calls another helper.
@@ -194,7 +198,7 @@ fn test_nested_imported_helper_reports_test_call_site() -> i32
         lib_expect_pair(1, 2)
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:194: assertion failed: left == right\n  left:  1\n  right: 2\n  in helper lib_expect_eq at test_assert_helper_lib.ritz:14\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:198: assertion failed: left == right\n  left:  1\n  right: 2\n  in helper lib_expect_eq at test_assert_helper_lib.ritz:14\n") == 0
     0
 
 [[test]]
@@ -205,7 +209,7 @@ fn test_passing_helper_returns() -> i32
 
 # A generic helper: one definition serves every operand type (the per-type
 # assert_eq_i32 / _i64 / _u64 copies this replaces).  Its assert is
-# test_assert_operands.ritz:211, and it reports its source name.
+# test_assert_operands.ritz:215, and it reports its source name.
 [[test_helper]]
 fn expect_same<T>(a: T, b: T)
     assert a == b
@@ -218,5 +222,49 @@ fn test_generic_helper_reports_test_call_site() -> i32
         expect_same<i32>(-1, 2)
         sys_exit(0)
     assert capture_end(pid) == 1
-    assert stderr_differs("test_assert_operands.ritz:218: assertion failed: left == right\n  left:  -1\n  right: 2\n  in helper expect_same at test_assert_operands.ritz:211\n") == 0
+    assert stderr_differs("test_assert_operands.ritz:222: assertion failed: left == right\n  left:  -1\n  right: 2\n  in helper expect_same at test_assert_operands.ritz:215\n") == 0
     0
+
+# ============================================================================
+# Harness helpers (kept below every test: the expected messages above carry
+# their line numbers)
+# ============================================================================
+
+# Bytes read, or 0 at EOF or on an error (the loop above stops at 0).
+fn count_or_zero(r: Result<i64, Errno>) -> i64
+    match r
+        Ok(n) => n
+        Err(_) => 0
+
+# A new pipe into g_pipe (raw numbers: the child's dup_to needs them).
+fn open_g_pipe()
+    match pipe()
+        Ok(p) =>
+            g_pipe[0] = p.read.raw()
+            g_pipe[1] = p.write.raw()
+        Err(_) =>
+            g_pipe[0] = -1
+            g_pipe[1] = -1
+
+# fork(2) as the harness wants it: 0 in the child, the pid in the parent,
+# -errno if it failed.
+fn fork_pid() -> i32
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child => 0
+                Parent(pid) => pid
+        Err(e) => -e.code()
+
+# Close a raw descriptor this harness owns.
+fn close_raw(fd: i32)
+    var f: Fd = fd_adopt(fd)
+    f.close()
+
+fn exit_code_of(r: Result<ProcessResult, Errno>) -> i32
+    match r
+        Ok(pr) =>
+            if pr.signaled != 0
+                return 0
+            pr.exit_code
+        Err(_) => 0

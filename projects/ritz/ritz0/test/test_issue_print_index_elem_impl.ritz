@@ -11,6 +11,10 @@
 # the oracle for the bytes.
 
 import ritzlib.sys
+import ritzlib.strview
+import ritzlib.result
+import ritzlib.span
+import ritzlib.fd
 import ritzlib.fmt
 import ritzlib.string
 
@@ -29,34 +33,45 @@ var g_saved: i32 = 0
 var g_fd: i32 = 0
 
 fn capture_begin(fd: i32) -> i32
-    var fds: [2]i32
-    if sys_pipe(@fds[0]) != 0
-        return 1
     g_fd = fd
-    g_rd = fds[0]
-    g_saved = sys_dup(fd)
-    sys_dup2(fds[1], fd)
-    sys_close(fds[1])
-    0
+    capture_into(fd)
+
+# Point descriptor `fd` at a new pipe, saving the old one in g_saved and the
+# pipe's read end in g_rd (raw numbers: globals hold no Fd). 0, or 1 on error.
+fn capture_into(fd: i32) -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            match fd_borrow(fd).dup()
+                Ok(saved) => g_saved = saved.raw()
+                Err(_) => return 1
+            p.write.dup_to(fd)
+            p.write.close()
+            g_rd = p.read.raw()
+            0
+        Err(_) => 1
 
 # Restore the captured fd, read what was written, compare it with `want`.
 # Returns 0 on an exact byte match.
-fn capture_end_expect(want: *u8) -> i32
-    sys_dup2(g_saved, g_fd)
-    sys_close(g_saved)
+fn capture_end_expect(want: StrView) -> i32
+    var saved: Fd = fd_adopt(g_saved)
+    saved.dup_to(g_fd)
+    saved.close()
+    var rd: Fd = fd_adopt(g_rd)
     var buf: [256]u8
     var got: i64 = 0
     var n: i64 = 1
     while n > 0 and got < 256
-        n = sys_read(g_rd, @buf[got], 256 - got)
-        if n > 0
-            got = got + n
-    sys_close(g_rd)
+        match rd.read(Span<u8> { ptr: @buf[got], len: 256 - got })
+            Ok(k) => n = k
+            Err(_) => n = 0
+        got = got + n
+    rd.close()
     var i: i64 = 0
-    while *(want + i) != 0
+    while i < want.len
         if i >= got
             return 2
-        if buf[i] != *(want + i)
+        if buf[i] != *(want.ptr + i)
             return 3
         i = i + 1
     if i != got
@@ -67,7 +82,7 @@ fn capture_end_expect(want: *u8) -> i32
 fn show_args(args: Span<StrView>) -> i32
     assert capture_begin(1) == 0
     print("a0={args[0]} a1={args[1]}\n")
-    capture_end_expect(c"a0=prog a1=-v\n")
+    capture_end_expect("a0=prog a1=-v\n")
 
 [[test]]
 fn test_span_strview_index_display() -> i32
@@ -79,7 +94,7 @@ fn test_span_strview_index_display() -> i32
 fn show_points(pts: Span<Point>) -> i32
     assert capture_begin(1) == 0
     print("{pts[1]}\n")
-    capture_end_expect(c"(3, 4)\n")
+    capture_end_expect("(3, 4)\n")
 
 [[test]]
 fn test_span_struct_index_display() -> i32
@@ -92,7 +107,7 @@ fn test_array_struct_index_display() -> i32
     var pts: [2]Point = [Point { x: 1, y: 2 }, Point { x: -5, y: 6 }]
     assert capture_begin(1) == 0
     print("{pts[0]}|{pts[1]}\n")
-    assert capture_end_expect(c"(1, 2)|(-5, 6)\n") == 0
+    assert capture_end_expect("(1, 2)|(-5, 6)\n") == 0
     0
 
 [[test]]
@@ -101,7 +116,7 @@ fn test_ptr_struct_index_display() -> i32
     let p: *Point = @pts[0]
     assert capture_begin(1) == 0
     print("{p[1]}\n")
-    assert capture_end_expect(c"(7, 8)\n") == 0
+    assert capture_end_expect("(7, 8)\n") == 0
     0
 
 # `:?` on a struct with no Debug impl auto-derives its fields.
@@ -110,7 +125,7 @@ fn test_array_struct_index_debug() -> i32
     var pts: [1]Point = [Point { x: 9, y: 0 }]
     assert capture_begin(1) == 0
     print("{pts[0]:?}\n")
-    assert capture_end_expect(c"Point { x: 9, y: 0 }\n") == 0
+    assert capture_end_expect("Point { x: 9, y: 0 }\n") == 0
     0
 
 # AGAST #4585: an element of a `[N]*Point` is a pointer, and a pointer other
@@ -124,7 +139,7 @@ fn test_array_ptr_struct_index_prints_bytes() -> i32
     var ps: [1]*Point = [@a]
     assert capture_begin(1) == 0
     print("<{ps[0]}>\n")
-    assert capture_end_expect(c"<HI>\n") == 0
+    assert capture_end_expect("<HI>\n") == 0
     0
 
 # The same rule on a plain `*Point` local, the path #4585 named a workaround.
@@ -134,5 +149,5 @@ fn test_ptr_struct_local_prints_bytes() -> i32
     let q: *Point = @a
     assert capture_begin(1) == 0
     print("<{q}>\n")
-    assert capture_end_expect(c"<HI>\n") == 0
+    assert capture_end_expect("<HI>\n") == 0
     0

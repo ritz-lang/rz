@@ -12,91 +12,56 @@
 # falls back to a cold rebuild, defeating the AGAST #192 speedup.
 
 import ritzlib.sys
+import ritzlib.fs
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.result
+import ritzlib.span
+import ritzlib.fmt.digits { fmt_i64_into }
 
 
-fn cstr_len(s: *u8) -> i64
-    var n: i64 = 0
-    while *(s + n) != 0
-        n = n + 1
-    n
-
-
-# Build "/tmp/test_fn_cache_roundtrip_<pid>.ritz.sig" into buf (>= 64 bytes).
+# "/tmp/test_fn_cache_roundtrip_<pid>.ritz.sig".
 # The regression matrix runs this file under ritz0, ritz1 and
 # ritz1_selfhosted concurrently, so a fixed path let one run's O_TRUNC or
 # unlink land inside another's write/read-back (AGAST #1735).
-fn sig_tmp_path(buf: *u8) -> *u8
-    let prefix: *u8 = c"/tmp/test_fn_cache_roundtrip_"
-    let suffix: *u8 = c".ritz.sig"
-    var len: i64 = 0
-    while *(prefix + len) != 0
-        *(buf + len) = *(prefix + len)
-        len = len + 1
-    var pid: i64 = sys_getpid() as i64
-    var digits: [20]u8
-    var nd: i64 = 0
-    while pid > 0
-        digits[nd] = (48 + pid % 10) as u8
-        pid = pid / 10
-        nd = nd + 1
-    while nd > 0
-        nd = nd - 1
-        *(buf + len) = digits[nd]
-        len = len + 1
-    var i: i64 = 0
-    while *(suffix + i) != 0
-        *(buf + len) = *(suffix + i)
-        len = len + 1
-        i = i + 1
-    *(buf + len) = 0
-    buf
+fn sig_tmp_path() -> String
+    var s: String = string_from("/tmp/test_fn_cache_roundtrip_")
+    var digits: [24]u8
+    let nd: i64 = fmt_i64_into(@digits[0], sys_getpid() as i64)
+    s.push_span(Span<u8> { ptr: @digits[0], len: nd })
+    s.push_str(".ritz.sig")
+    s
 
 
 [[test]]
 fn test_fn_cache_sig_roundtrip() -> i32
     # Sample sig contents matching the format documented in fn_cache.py.
     # Hex hashes are arbitrary but exactly 16 chars (width matches both
-    # SHA-256-trunc in ritz0 and FNV1a-64 in ritz1).  Inlined as a cstring
-    # because ritz0 doesn't accept `const X: *u8 = c"…"`.
-    let fixture: *u8 = c"{\n  \"source_hash\": \"deadbeefcafef00d\",\n  \"functions\": {\n    \"add\": {\n      \"hash\": \"0123456789abcdef\",\n      \"sig_hash\": \"fedcba9876543210\",\n      \"ir\": \"define i32 @add(i32 %a, i32 %b) { ret i32 0 }\"\n    }\n  },\n  \"imports\": [\"ritzlib.sys\"]\n}\n"
-    var path_buf: [64]u8
-    let path: *u8 = sig_tmp_path(@path_buf[0])
-    let n: i64 = cstr_len(fixture)
+    # SHA-256-trunc in ritz0 and FNV1a-64 in ritz1).
+    let fixture: StrView = "{\n  \"source_hash\": \"deadbeefcafef00d\",\n  \"functions\": {\n    \"add\": {\n      \"hash\": \"0123456789abcdef\",\n      \"sig_hash\": \"fedcba9876543210\",\n      \"ir\": \"define i32 @add(i32 %a, i32 %b) { ret i32 0 }\"\n    }\n  },\n  \"imports\": [\"ritzlib.sys\"]\n}\n"
+    let path_s: String = sig_tmp_path()
+    let path: StrView = path_s.as_view()
+    let n: i64 = fixture.len
 
-    # Write fixture.  Flags: O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512 = 577,
-    # mode 0644 = 420.
-    let wfd: i32 = sys_open3(path, 577, 420)
-    if wfd < 0
-        return 1
-    let written: i64 = sys_write(wfd, fixture, n)
-    sys_close(wfd)
-    if written != n
-        return 2
+    # Write fixture (created or truncated, mode 0644).
+    match write_file(path, fixture)
+        Ok(written) =>
+            if written != n
+                return 2
+        Err(_) => return 1
 
     # Read back.
-    let rfd: i32 = sys_open(path, 0)  # O_RDONLY
-    if rfd < 0
-        return 3
-    var buf: [4096]u8
-    var total: i64 = 0
-    var done: i32 = 0
-    while done == 0
-        let got: i64 = sys_read(rfd, @buf[total], 4096 - total)
-        if got <= 0
-            done = 1
-        else
-            total = total + got
-    sys_close(rfd)
+    var back: String = string_new()
+    match read_file(path)
+        Ok(contents) => back = contents
+        Err(_) => return 3
 
-    if total != n
+    if back.len() != n
         return 4
 
     # Bytewise compare.
-    var i: i64 = 0
-    while i < n
-        if buf[i] != *(fixture + i)
-            return 5
-        i = i + 1
+    if not back.as_view().eq(fixture)
+        return 5
 
-    sys_unlink(path)
+    unlink(path)
     0

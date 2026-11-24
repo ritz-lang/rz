@@ -13,6 +13,10 @@
 # the oracle for the bytes.
 
 import ritzlib.sys
+import ritzlib.strview
+import ritzlib.result
+import ritzlib.span
+import ritzlib.fd
 import ritzlib.string
 
 var g_rd: i32 = 0
@@ -20,34 +24,45 @@ var g_saved: i32 = 0
 var g_fd: i32 = 0
 
 fn capture_begin(fd: i32) -> i32
-    var fds: [2]i32
-    if sys_pipe(@fds[0]) != 0
-        return 1
     g_fd = fd
-    g_rd = fds[0]
-    g_saved = sys_dup(fd)
-    sys_dup2(fds[1], fd)
-    sys_close(fds[1])
-    0
+    capture_into(fd)
+
+# Point descriptor `fd` at a new pipe, saving the old one in g_saved and the
+# pipe's read end in g_rd (raw numbers: globals hold no Fd). 0, or 1 on error.
+fn capture_into(fd: i32) -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            match fd_borrow(fd).dup()
+                Ok(saved) => g_saved = saved.raw()
+                Err(_) => return 1
+            p.write.dup_to(fd)
+            p.write.close()
+            g_rd = p.read.raw()
+            0
+        Err(_) => 1
 
 # Restore the captured fd, read what was written, compare it with `want`.
 # Returns 0 on an exact byte match.
-fn capture_end_expect(want: *u8) -> i32
-    sys_dup2(g_saved, g_fd)
-    sys_close(g_saved)
+fn capture_end_expect(want: StrView) -> i32
+    var saved: Fd = fd_adopt(g_saved)
+    saved.dup_to(g_fd)
+    saved.close()
+    var rd: Fd = fd_adopt(g_rd)
     var buf: [256]u8
     var got: i64 = 0
     var n: i64 = 1
     while n > 0 and got < 256
-        n = sys_read(g_rd, @buf[got], 256 - got)
-        if n > 0
-            got = got + n
-    sys_close(g_rd)
+        match rd.read(Span<u8> { ptr: @buf[got], len: 256 - got })
+            Ok(k) => n = k
+            Err(_) => n = 0
+        got = got + n
+    rd.close()
     var i: i64 = 0
-    while *(want + i) != 0
+    while i < want.len
         if i >= got
             return 2
-        if buf[i] != *(want + i)
+        if buf[i] != *(want.ptr + i)
             return 3
         i = i + 1
     if i != got
@@ -58,13 +73,13 @@ fn capture_end_expect(want: *u8) -> i32
 fn show_span(args: Span<StrView>) -> i32
     assert capture_begin(1) == 0
     print("a0={args[0]} a1={args[1]}\n")
-    capture_end_expect(c"a0=prog a1=--flag\n")
+    capture_end_expect("a0=prog a1=--flag\n")
 
 [[test_helper]]
 fn show_span_var_index(args: Span<StrView>, i: i64) -> i32
     assert capture_begin(1) == 0
     print("[{args[i]}]\n")
-    capture_end_expect(c"[--flag]\n")
+    capture_end_expect("[--flag]\n")
 
 [[test]]
 fn test_span_strview_index_placeholder() -> i32
@@ -78,7 +93,7 @@ fn test_array_strview_index_placeholder() -> i32
     var arr: [2]StrView = ["x", "yz"]
     assert capture_begin(1) == 0
     print("{arr[0]}-{arr[1]}\n")
-    assert capture_end_expect(c"x-yz\n") == 0
+    assert capture_end_expect("x-yz\n") == 0
     0
 
 [[test]]
@@ -87,7 +102,7 @@ fn test_ptr_strview_index_placeholder() -> i32
     let p: *StrView = @arr[0]
     assert capture_begin(1) == 0
     print("{p[1]}\n")
-    assert capture_end_expect(c"p1\n") == 0
+    assert capture_end_expect("p1\n") == 0
     0
 
 # A pointer element (`[N]*u8`) is no struct: it prints as its C string.
@@ -96,7 +111,7 @@ fn test_array_cstr_index_placeholder() -> i32
     var names: [2]*u8 = [c"ab", c"cde"]
     assert capture_begin(1) == 0
     print("{names[1]}\n")
-    assert capture_end_expect(c"cde\n") == 0
+    assert capture_end_expect("cde\n") == 0
     0
 
 # A `[N]*StrView` element is a pointer to a view, not a `%StrView`: it prints
@@ -108,7 +123,7 @@ fn test_array_strview_ptr_index_placeholder() -> i32
     let q: *StrView = ps[0]
     assert capture_begin(1) == 0
     print("[{q}] [{ps[0]}]\n")
-    assert capture_end_expect(c"[hey] [hey]\n") == 0
+    assert capture_end_expect("[hey] [hey]\n") == 0
     0
 
 struct ViewPtrs
@@ -122,7 +137,7 @@ fn test_field_strview_ptrptr_index_placeholder() -> i32
     let h: ViewPtrs = ViewPtrs { ps: @arr[0] }
     assert capture_begin(1) == 0
     print("[{h.ps[0]}]\n")
-    assert capture_end_expect(c"[hi]\n") == 0
+    assert capture_end_expect("[hi]\n") == 0
     0
 
 # And of a `**StrView` local.
@@ -133,7 +148,7 @@ fn test_local_strview_ptrptr_index_placeholder() -> i32
     let pp: **StrView = @arr[0]
     assert capture_begin(1) == 0
     print("[{pp[0]}]\n")
-    assert capture_end_expect(c"[yo]\n") == 0
+    assert capture_end_expect("[yo]\n") == 0
     0
 
 # Control: an integer element still prints as a number.
@@ -143,5 +158,5 @@ fn test_span_int_index_placeholder() -> i32
     let s: Span<i64> = @arr
     assert capture_begin(1) == 0
     print("{s[0]} {s[1]}\n")
-    assert capture_end_expect(c"7 -3\n") == 0
+    assert capture_end_expect("7 -3\n") == 0
     0

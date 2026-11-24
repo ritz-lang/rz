@@ -12,6 +12,9 @@
 # ritz1_selfhosted.
 
 import ritzlib.sys
+import ritzlib.fd
+import ritzlib.process
+import ritzlib.span
 import ritzlib.io
 import ritzlib.str
 import ritzlib.strview
@@ -29,14 +32,39 @@ var g_out_len: i64 = 0
 var g_err: [256]u8
 var g_err_len: i64 = 0
 
-fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
+fn read_all(src: @Fd, buf: *u8, cap: i64) -> i64
     var got: i64 = 0
     var n: i64 = 1
     while n > 0 and got < cap
-        n = sys_read(fd, buf + got, cap - got)
-        if n > 0
-            got = got + n
+        match src.read(Span<u8> { ptr: buf + got, len: cap - got })
+            Ok(k) => n = k
+            Err(_) => n = 0
+        got = got + n
     got
+
+# A new pipe; two closed Fds if pipe(2) fails (reads then see nothing).
+fn new_pipe() -> Pipe
+    match pipe()
+        Ok(p) => p
+        Err(_) => Pipe { read: fd_adopt(-1), write: fd_adopt(-1) }
+
+# fork(2): 0 in the child, the pid in the parent, -errno on failure.
+fn fork_pid() -> i32
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child => 0
+                Parent(pid) => pid
+        Err(e) => -e.code()
+
+# The child's exit code; 0 if a signal ended it (as status >> 8 gave).
+fn exit_code_of(r: Result<ProcessResult, Errno>) -> i32
+    match r
+        Ok(pr) =>
+            if pr.signaled != 0
+                return 0
+            pr.exit_code
+        Err(_) => 0
 
 # 0 when buf[0..len] is exactly `want`.
 fn bytes_differ(buf: *u8, len: i64, want: StrView) -> i32
@@ -78,28 +106,22 @@ fn case_body(which: i32) -> i32
     0
 
 fn run_case(which: i32) -> i32
-    var o: [2]i32
-    var e: [2]i32
-    sys_pipe(@o[0])
-    sys_pipe(@e[0])
-    let pid: i32 = sys_fork()
+    var out: Pipe = new_pipe()
+    var err: Pipe = new_pipe()
+    let pid: i32 = fork_pid()
     if pid == 0
-        sys_dup2(o[1], 1)
-        sys_dup2(e[1], 2)
-        sys_close(o[0])
-        sys_close(o[1])
-        sys_close(e[0])
-        sys_close(e[1])
+        out.write.dup_to(1)
+        err.write.dup_to(2)
+        out.close()
+        err.close()
         sys_exit(case_body(which))
-    sys_close(o[1])
-    sys_close(e[1])
-    g_out_len = read_all(o[0], @g_out[0], 256)
-    g_err_len = read_all(e[0], @g_err[0], 256)
-    sys_close(o[0])
-    sys_close(e[0])
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    (status >> 8) & 255
+    out.write.close()
+    err.write.close()
+    g_out_len = read_all(@out.read, @g_out[0], 256)
+    g_err_len = read_all(@err.read, @g_err[0], 256)
+    out.read.close()
+    err.read.close()
+    exit_code_of(wait_pid(pid))
 
 # ============================================================================
 # Tests

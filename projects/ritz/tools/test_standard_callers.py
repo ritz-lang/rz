@@ -44,7 +44,7 @@ PINS = {
     "mausoleum": 651,
     "nexus": 73,
     "prism": 7,
-    "ritz": 2997,
+    "ritz": 2925,
     "ritz-lsp": 87,
     "ritzunit": 43,
     "rzrz": 11,

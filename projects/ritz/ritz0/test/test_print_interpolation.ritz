@@ -9,39 +9,49 @@
 # bytes that came out of the pipe with what ritz0 prints.
 
 import ritzlib.sys
+import ritzlib.strview
+import ritzlib.result
+import ritzlib.span
+import ritzlib.fd
 
 # The capture's state: the pipe's read end, and the saved stdout.
 var g_rd: i32 = 0
 var g_saved: i32 = 0
 
 fn capture_begin() -> i32
-    var fds: [2]i32
-    if sys_pipe(@fds[0]) != 0
-        return 1
-    g_rd = fds[0]
-    g_saved = sys_dup(1)
-    sys_dup2(fds[1], 1)
-    sys_close(fds[1])
-    0
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            match fd_stdout().dup()
+                Ok(saved) => g_saved = saved.raw()
+                Err(_) => return 1
+            p.write.dup_to(1)
+            p.write.close()
+            g_rd = p.read.raw()
+            0
+        Err(_) => 1
 
 # Restore stdout, read what was printed, and compare it with `want`.
 # Returns 0 on an exact byte match.
-fn capture_end_expect(want: *u8) -> i32
-    sys_dup2(g_saved, 1)
-    sys_close(g_saved)
+fn capture_end_expect(want: StrView) -> i32
+    var saved: Fd = fd_adopt(g_saved)
+    saved.dup_to(1)
+    saved.close()
+    var rd: Fd = fd_adopt(g_rd)
     var buf: [256]u8
     var got: i64 = 0
     var n: i64 = 1
     while n > 0 and got < 256
-        n = sys_read(g_rd, @buf[got], 256 - got)
-        if n > 0
-            got = got + n
-    sys_close(g_rd)
+        match rd.read(Span<u8> { ptr: @buf[got], len: 256 - got })
+            Ok(k) => n = k
+            Err(_) => n = 0
+        got = got + n
+    rd.close()
     var i: i64 = 0
-    while *(want + i) != 0
+    while i < want.len
         if i >= got
             return 2
-        if buf[i] != *(want + i)
+        if buf[i] != *(want.ptr + i)
             return 3
         i = i + 1
     if i != got
@@ -56,7 +66,7 @@ fn test_interp_repro() -> i32
     assert capture_begin() == 0
     let x: i64 = 5
     print("x={x}\n")
-    assert capture_end_expect(c"x=5\n") == 0
+    assert capture_end_expect("x=5\n") == 0
     0
 
 [[test]]
@@ -67,7 +77,7 @@ fn test_interp_types() -> i32
     let t: bool = true
     let s: *u8 = c"str"
     print("{a},{b},{t},{a > 0},{s}\n")
-    assert capture_end_expect(c"-120,0,true,false,str\n") == 0
+    assert capture_end_expect("-120,0,true,false,str\n") == 0
     0
 
 [[test]]
@@ -75,7 +85,7 @@ fn test_interp_expressions() -> i32
     assert capture_begin() == 0
     let x: i64 = 21
     print("{twice(x)} { x + 1 }\n")
-    assert capture_end_expect(c"42 22\n") == 0
+    assert capture_end_expect("42 22\n") == 0
     0
 
 [[test]]
@@ -83,5 +93,5 @@ fn test_interp_braces() -> i32
     assert capture_begin() == 0
     let x: i64 = 1
     print("{{x}} \{x\} a } b { c\n")
-    assert capture_end_expect(c"{x} {x} a } b { c\n") == 0
+    assert capture_end_expect("{x} {x} a } b { c\n") == 0
     0
