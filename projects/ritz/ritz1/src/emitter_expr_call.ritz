@@ -367,13 +367,17 @@ fn emit_strview_from_lit(s: *EmitterState, arg: *Expr, reg: i32) -> i32
             p = next_reg(s)
             emit_str(s, IR_INDENT)
             emit_reg(s, p)
-            emit_str(s, c" = extractvalue %Span$u8 ")
+            emit_sv(s, " = extractvalue %")
+            emit_name(s, strlit_struct(s))   # AGAST #4666
+            emit_str(s, IR_SP)
             emit_reg(s, reg)
             emit_str(s, IR_COMMA_0)
             l = next_reg(s)
             emit_str(s, IR_INDENT)
             emit_reg(s, l)
-            emit_str(s, c" = extractvalue %Span$u8 ")
+            emit_sv(s, " = extractvalue %")
+            emit_name(s, strlit_struct(s))
+            emit_str(s, IR_SP)
             emit_reg(s, reg)
             emit_str(s, IR_COMMA_1)
         ExprKind.CstringLit =>
@@ -854,6 +858,49 @@ pub fn coerce_array_to_span(s: *EmitterState, e: *Expr, reg: i32, name_sv: StrVi
     span_array_elem_fits(s, e, loc, StrView { ptr: (name), len: (name_len) as i64 })   # AGAST #2781
     return emit_span_of_array(s, loc, StrView { ptr: (name), len: (name_len) as i64 })
 
+# The `%Span$T` (span_sv) `{ v.data, v.len }` of the `%Vec$T` (vec_sv) at
+# `vec_ptr`: a view of the Vec's elements, as ritz0 coerces `@v` (bedc85b).
+fn emit_span_of_vec_ptr(s: *EmitterState, vec_sv: StrView, vec_ptr: i32, span_sv: StrView) -> i32
+    let data_pp: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, data_pp)
+    emit_str(s, IR_GEP_NAMED)
+    emit_name(s, vec_sv)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, vec_ptr)
+    emit_sv(s, ", i32 0, i32 0\n")
+    let data: i32 = next_reg(s)
+    emit_load_into(s, IR_TY_PTR, data, data_pp)
+    let len_p: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, len_p)
+    emit_str(s, IR_GEP_NAMED)
+    emit_name(s, vec_sv)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, vec_ptr)
+    emit_sv(s, ", i32 0, i32 1\n")
+    let len: i32 = next_reg(s)
+    emit_load_into(s, IR_TY_I64, len, len_p)
+    let sp1: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, sp1)
+    emit_sv(s, " = insertvalue %")
+    emit_name(s, span_sv)
+    emit_sv(s, " undef, ptr ")
+    emit_reg(s, data)
+    emit_str(s, IR_COMMA_0)
+    let sp2: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, sp2)
+    emit_sv(s, " = insertvalue %")
+    emit_name(s, span_sv)
+    emit_str(s, IR_SP)
+    emit_reg(s, sp1)
+    emit_str(s, IR_I64_SEP)
+    emit_reg(s, len)
+    emit_str(s, IR_COMMA_1)
+    sp2
+
 # AGAST #2305: `Span { &x[0], N }` for `@x` into the `Span$T` slot (name,
 # name_len), where `x` is a whole 1-D array that isn't a local: a global, an
 # inline field, `*p` for `p: *[N]T`.  ritz0 takes each (`g(@G)`, `g(@h.a)`);
@@ -868,6 +915,19 @@ fn emit_span_of_addr_place(s: *EmitterState, e: *Expr, name_sv: StrView) -> i32
     if e.kind != ExprKind.Unary or (e.op != OpKind.Addr and e.op != OpKind.AddrMut) or e.operand == null
         return 0
     let x: *Expr = e.operand
+    # AGAST #4666 (was #4671): `@b.v` with `b.v` a `Vec<T>` field is
+    # `{ b.v.data, b.v.len }`, as `@v` of a Vec local is (span_param_arg).
+    # It passed the field's address, a ptrtoint, where the %Span$T goes.
+    if x.kind == ExprKind.Member
+        let vf: *StructField = resolve_member_chain_field(s, x)
+        if vf != null and vf.field_type == TypeKind.Struct and vf.field_type_name_len > 4 and name_eq(StrView { ptr: (vf.field_type_name), len: 4 }, "Vec$") == 1
+            if name_eq(StrView { ptr: (vf.field_type_name + 4), len: (vf.field_type_name_len - 4) as i64 }, StrView { ptr: (name + 5), len: (name_len - 5) as i64 }) == 0
+                return 0   # `@Vec<A>` into `Span<B>`: the arg checks judge it
+            var vmr: MemberPtrResult
+            emit_member_ptr(s, x, @vmr)
+            if vmr.success != 1
+                return 0
+            return emit_span_of_vec_ptr(s, StrView { ptr: (vf.field_type_name), len: (vf.field_type_name_len) as i64 }, vmr.reg, name_sv)
     var src: ArraySrc
     if arg_array_shape(s, x, @src) == 0
         return 0
@@ -5469,48 +5529,7 @@ fn span_param_arg(s: *EmitterState, arg: *Expr, p: *Param, reg: i32) -> i32
                         emit_str(s, IR_INTTOPTR)
                         emit_reg(s, reg)
                         emit_str(s, c" to ptr\n")
-                    # GEP to data field (offset 0)
-                    let sp_data_pp: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, sp_data_pp)
-                    emit_str(s, IR_GEP_NAMED)
-                    emit_name(s, StrView { ptr: (lv_type_name(src_loc)), len: (lv_type_name_len(src_loc)) as i64 })
-                    emit_str(s, IR_PTR_SEP)
-                    emit_reg(s, span_vec_ptr)
-                    emit_str(s, c", i32 0, i32 0\n")
-                    let sp_data: i32 = next_reg(s)
-                    emit_load_into(s, IR_TY_PTR, sp_data, sp_data_pp)
-                    # GEP to len field (offset 1)
-                    let sp_len_p: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, sp_len_p)
-                    emit_str(s, IR_GEP_NAMED)
-                    emit_name(s, StrView { ptr: (lv_type_name(src_loc)), len: (lv_type_name_len(src_loc)) as i64 })
-                    emit_str(s, IR_PTR_SEP)
-                    emit_reg(s, span_vec_ptr)
-                    emit_str(s, c", i32 0, i32 1\n")
-                    let sp_len: i32 = next_reg(s)
-                    emit_load_into(s, IR_TY_I64, sp_len, sp_len_p)
-                    # Build Span { data, len }
-                    let sp1: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, sp1)
-                    emit_str(s, c" = insertvalue %")
-                    emit_name(s, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-                    emit_str(s, c" undef, ptr ")
-                    emit_reg(s, sp_data)
-                    emit_str(s, IR_COMMA_0)
-                    let sp2: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, sp2)
-                    emit_str(s, c" = insertvalue %")
-                    emit_name(s, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-                    emit_str(s, IR_SP)
-                    emit_reg(s, sp1)
-                    emit_str(s, IR_I64_SEP)
-                    emit_reg(s, sp_len)
-                    emit_str(s, IR_COMMA_1)
-                    res = sp2
+                    res = emit_span_of_vec_ptr(s, StrView { ptr: (lv_type_name(src_loc)), len: (lv_type_name_len(src_loc)) as i64 }, span_vec_ptr, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
                     coerced = 1
         # @array_ident -> Span<T>: construct Span { &arr[0], N }.
         # (test_issue_span_slice_range: `tail_sum(@buf)` where

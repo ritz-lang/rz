@@ -1172,10 +1172,6 @@ pub fn main() -> i32
 
 CASES.update(UNTYPED_DEREF)
 
-# Strict xfails: ritz0 lowers each of these and ritz1 refuses it, which is safe
-# but isn't parity.  test_ritz1_gap_is_refused_not_wrong keeps it safe: a wrong
-# value would satisfy the xfail just as a refusal does.
-
 # AGAST #2305: whole-array sources and targets ritz1 refused or failed closed on
 # (they were SOURCE_GAPS).  ritz0 is the oracle for each.  The Span programs
 # take `@`: a bare array into a `Span<T>` is ritz0's "write `@x` to borrow it",
@@ -1702,22 +1698,9 @@ pub fn main() -> i32
 assert not set(ND_WHOLE) & set(CASES)
 CASES.update(ND_WHOLE)
 
-ROW_GAPS = {
-    "aoa_row_store": """\
-pub fn main() -> i32
-    var m: [2][4]i32
-    var r: [4]i32 = [0, 0, 0, 3]
-    m[1] = r
-    return m[1][3]
-""",
-    # `aoa_whole`, `var n: [2][4]i32 = m`, is lowered since #3299:
-    # test_nd_array_field_copy.py's annotated_local_copy, and `nd_global_store`
-    # since #3634 (ND_WHOLE).
-}
-
-GAPS = [
-    (ROW_GAPS, "AGAST #2099: a whole row of a multi-dimensional array"),
-]
+# `aoa_row_store`, a whole row of an N-D array (`m[1] = r`), was the last strict
+# xfail here; ritz1 lowers it since AGAST #4666 (test_ritz1_parity_emit_gaps.py),
+# so the gap tests that guarded it went with it.
 
 # Programs ritz0 refuses.  ritz1 has to refuse them too, and write no .ll: most of
 # these used to read the array's first 8 bytes, and the `wrong_elem` ones went
@@ -2249,51 +2232,6 @@ assert set(ANSWERS) <= set(CASES)
 
 MATCH_ROWS = [Row(f"matches_ritz0[{name}]", COMPILERS, Run(CASES[name], ANSWERS.get(name, 3)))
               for name in sorted(CASES)]
-
-
-def _gap_params():
-    return [pytest.param(program, id=name,
-                         marks=pytest.mark.xfail(strict=True, reason=reason))
-            for programs, reason in GAPS for name, program in sorted(programs.items())]
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("program", _gap_params())
-def test_ritz1_gap(ritz1_bin, tmp_path, program):
-    want = _run("ritz0", tmp_path, "gap", program)
-    assert _run("ritz1", tmp_path, "gap", program) == want
-
-
-# AGAST #2305: a gap is ritz0's answer that ritz1 doesn't give.  The xfail above
-# can't tell ritz0 refusing from ritz1 refusing: four of #2305's gaps had gone
-# stale that way (a bare array into a Span is "write `@x`" on ritz0 now).
-@pytest.mark.integration
-@pytest.mark.parametrize("program", [pytest.param(p, id=n) for programs, _ in GAPS
-                                     for n, p in sorted(programs.items())])
-def test_ritz0_answers_every_gap(tmp_path, program):
-    assert _run("ritz0", tmp_path, "gap", program) == 3
-
-
-def _refused_not_wrong():
-    return [pytest.param(p, id=n) for programs, _ in GAPS for n, p in sorted(programs.items())]
-
-
-# A gap is safe only while ritz1 refuses it.  Compiling is fine once it gives
-# ritz0's answer, which is what turns test_ritz1_gap's xfail into a failure.
-@pytest.mark.integration
-@pytest.mark.parametrize("program", _refused_not_wrong())
-def test_ritz1_gap_is_refused_not_wrong(ritz1_bin, tmp_path, program):
-    comp, ll = _compile("ritz1", ritz1_bin, tmp_path, "gap", program)
-    assert comp.returncode != 0 or not ll.exists() or _links_and_matches(tmp_path, program)
-
-
-def _links_and_matches(tmp_path, program):
-    """clang refusing the IR is also a refusal; a linked program has to agree."""
-    try:
-        got = _run("ritz1", tmp_path, "gap2", program)
-    except AssertionError:
-        return True
-    return got == _run("ritz0", tmp_path, "gap0", program)
 
 
 # ritz0 refuses this `R.m(a)` where it takes `r.m(a)`: its static calls don't take

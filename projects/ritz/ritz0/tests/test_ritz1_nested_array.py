@@ -1657,7 +1657,7 @@ pub fn main() -> i32
     var s: M
     s.m[1] = 0
     return 0
-""", ":6:", "assigning a row or a whole struct element"),
+""", ":6:", "whole-array assignment to a local array from this value"),
     # A nested array literal does not even parse in ritz1 (closed already).
     "nested_literal": ("""\
 pub fn main() -> i32
@@ -1729,12 +1729,14 @@ pub fn main() -> i32
     g = 0
     return 0
 """, ":4:", "assigning a whole multi-dimensional array is not supported"),
+    # AGAST #4666: a row store is lowered (test_ritz1_parity_emit_gaps.py); a
+    # scalar is no row, refused as a whole-array store from it is.
     "row_assign": ("""\
 pub fn main() -> i32
     var g: [2][3]u8
     g[1] = 0
     return 0
-""", ":3:", "assigning a row or a whole struct element"),
+""", ":3:", "whole-array assignment to a local array from this value"),
     # AGAST #3306: a struct element is a value only where a struct goes.
     "struct_elem_int_slot": ("""\
 struct P

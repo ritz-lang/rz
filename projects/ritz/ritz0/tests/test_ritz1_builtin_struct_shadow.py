@@ -31,7 +31,8 @@ and a cloned `data: *T` lost its pointee, breaking `v.data + i` stride).
 
 One type stays compiler-supplied: `Span$u8`, which bare string literals
 lower to. It is added only when the source lacks it; a source `Span$u8`
-wins, and one whose layout is not `{ ptr, i64 }` is an error.
+wins, and when its layout is not `{ ptr, i64 }` literals lower to the
+layout-equal `StrView` instead (AGAST #4666; it was an error).
 
 THE TESTS
 
@@ -414,24 +415,13 @@ def test_ritz1_source_span_u8_wins(ritz1_bin, tmp_path):
     assert _run_pkg("ritz1", tmp_path, "span_src", SPAN_FROM_SOURCE) == 42
 
 
+# AGAST #4666: `Span` is not reserved.  A program's own `Span<T>` of another
+# layout is its own (ritz0 takes it); string literals lower to the
+# layout-equal %StrView then.  ritz1 refused it ("Span$u8 must be { ptr, len }").
 @pytest.mark.integration
-def test_ritz1_rejects_span_u8_it_cannot_honour(ritz1_bin, tmp_path):
-    src = tmp_path / "span_bad.ritz"
-    src.write_text(SPAN_MISMATCHED)
-    ll = tmp_path / "span_bad.ll"
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(
-        [str(RITZ1_BIN), str(src), "-o", str(ll)],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    assert proc.returncode != 0, (
-        "ritz1 accepted a Span$u8 that string literals cannot use"
-    )
-    assert "Span$u8" in proc.stderr, proc.stderr[-2000:]
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+def test_program_span_u8_of_another_layout_is_its_own(ritz1_bin, tmp_path, compiler):
+    assert _run(compiler, tmp_path, "span_own", SPAN_MISMATCHED) == 3
 
 
 # --- static: no second copy of a source layout ----------------------------

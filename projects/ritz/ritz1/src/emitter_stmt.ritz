@@ -1879,8 +1879,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             ExprKind.StringLit =>
                 var_type = TypeKind.Struct
                 dt.var_type = TypeKind.Struct
-                dt.var_type_name = c"Span$u8"
-                dt.var_type_name_len = 7
+                let lit_sv: StrView = strlit_struct(s)   # AGAST #4666
+                dt.var_type_name = lit_sv.ptr
+                dt.var_type_name_len = lit_sv.len as i32
             # AGAST #2131: `let s = "..." as StrView`.  A struct-target cast
             # emits its operand's register unchanged, so the local takes the
             # operand's struct type (the `%Span$u8` of the bare-literal arm above).
@@ -2557,9 +2558,51 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                     emit_reg(s, alloca_reg)
                     emit_str(s, IR_NL)
 
+# AGAST #4666: `m[i] = r`, a whole row (or plane) of an N-D array: `dst` is
+# the sub-array the index chain stopped at, `dst.depth` short of the leaf.
+# The value is copied over it as a whole-array store into a local of the
+# sub-array's type would be: a row `[M]T` by emit_array_local_whole_assign
+# (a `[M]T` local, global, field, `*p`, literal or fill) or as a row of
+# another N-D array (`m[1] = n[0]`); a plane by emit_nd_plane_store.  A
+# move-only leaf stays refused, as for a whole N-D array (#3634): the old
+# elements would never drop and the source's would drop twice.
+fn emit_nd_sub_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
+    let sh: *ArrayShape = dst.shape
+    let v: *Expr = stmt.assign_value
+    if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0 and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }) == 1
+        emit_nd_error_sv(s, stmt.span.line, stmt.span.col, "assigning a row of a multi-dimensional array of a move-only type is not supported in ritz1 (assign each element)")
+        return
+    if sh.rank - dst.depth >= 2
+        emit_nd_plane_store(s, dst.reg, nd_shape_from(sh, dst.depth), v)
+        return
+    let m: i32 = sh.dims[sh.rank - 1]
+    let leaf_sv: StrView = StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }
+    # A row of another N-D array, `n[0]`: copied from the address its GEP gives.
+    var vd: i32 = 0
+    let vsh: *ArrayShape = nd_index_shape(s, v, @vd)
+    if vsh != null and vd == vsh.rank - 1
+        if vsh.dims[vsh.rank - 1] != m or vsh.leaf_pointee != sh.leaf_pointee or array_elem_types_match(vsh.leaf_type, StrView { ptr: (vsh.leaf_name), len: (vsh.leaf_name_len) as i64 }, sh.leaf_type, leaf_sv) == 0
+            emit_ir_error_sv(s, v.span, "this row's type is not the multi-dimensional array's row type")
+            return
+        var src: NdIndexPtr
+        emit_nd_index_ptr(s, v, @src)
+        emit_local_array_copy(s, m, sh.leaf_type, leaf_sv, src.reg, dst.reg)
+        return
+    emit_array_local_whole_assign(s, dst.reg, m, sh.leaf_type, leaf_sv, v)
+
+# AGAST #4666: `g[i] = v` / `h.m[i] = v` statements over an N-D array, as the
+# index chain `place` (built by the caller) names: one index short of a 2-D
+# array's leaf, so a row store.
+fn emit_nd_stmt_row_store(s: *EmitterState, stmt: *Stmt, place: *Expr)
+    var dst: NdIndexPtr
+    if emit_nd_index_ptr(s, place, @dst) == 0
+        emit_nd_error_sv(s, stmt.span.line, stmt.span.col, "assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
+        return
+    emit_nd_elem_store(s, stmt, @dst)
+
 # AGAST #1509: store stmt.assign_value into the N-D element `dst` points
 # at, at the leaf's width (as a 1-D local array element store does).  A row
-# is a located error.
+# or plane is copied over by emit_nd_sub_store (AGAST #4666).
 #
 # AGAST #2099: a whole struct element `g[i][j] = q` stores the `%P` at the
 # element's address, as the 1-D `[N]P` element store does (#190), dropping
@@ -2571,6 +2614,9 @@ fn emit_nd_elem_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
     var leaf_st: *StructDef = null
     if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0
         leaf_st = find_struct(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+    if dst.depth < sh.rank and (sh.leaf_type != TypeKind.Struct or leaf_st != null)
+        emit_nd_sub_store(s, stmt, dst)   # AGAST #4666
+        return
     if dst.depth < sh.rank or (sh.leaf_type == TypeKind.Struct and leaf_st == null)
         emit_nd_error(s, stmt.span.line, stmt.span.col, c"assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
         return
@@ -6689,7 +6735,11 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
             if stmt.kind == StmtKind.LocalFieldIndexAssign and local_field_nd_shape(s, stmt) != null
                 # AGAST #2097: `s.m[i] = v` with m an N-D field assigns a whole row
                 # (`s.m[i][j] = v` is an expression assignment, see emit_assign).
-                emit_nd_error(s, stmt.span.line, stmt.span.col, c"assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
+                # AGAST #4666: copied over it (emit_nd_sub_store).
+                var rf_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident_ptr: stmt.var_name, ident_len: stmt.var_name_len }
+                var rf_field: Expr = Expr { kind: ExprKind.Member, span: stmt.span, left: @rf_var, ident_ptr: stmt.assign_target, ident_len: stmt.assign_target_len }
+                var rf_place: Expr = Expr { kind: ExprKind.Index, span: stmt.span, left: @rf_field, right: stmt.while_cond }
+                emit_nd_stmt_row_store(s, stmt, @rf_place)
             else if stmt.kind == StmtKind.LocalFieldIndexAssign
                 # local_var.field[index] = value
                 # stmt.var_name = variable name
@@ -6778,7 +6828,10 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
             else if stmt.kind == StmtKind.IndexAssign and nd_array_name_shape(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }) != null
                 # AGAST #1509: `g[i] = v` with g multi-dimensional assigns a whole
                 # row (`g[i][j] = v` is an expression assignment, see emit_assign).
-                emit_nd_error(s, stmt.span.line, stmt.span.col, c"assigning a row or a whole struct element of a multi-dimensional array is not supported in ritz1 (assign each element or field)")
+                # AGAST #4666: copied over it (emit_nd_sub_store).
+                var rg_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident_ptr: stmt.assign_target, ident_len: stmt.assign_target_len }
+                var rg_place: Expr = Expr { kind: ExprKind.Index, span: stmt.span, left: @rg_var, right: stmt.while_cond }
+                emit_nd_stmt_row_store(s, stmt, @rg_place)
             else if stmt.kind == StmtKind.IndexAssign and array_ptr_named(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }) != null
                 # AGAST #2321: refused, as ritz0 refuses a scalar here.  It stored an i64
                 # at stride 8: past the element, and past the array at the top end.

@@ -622,6 +622,29 @@ fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                             emit_member_gep_from_ptr(s, result, loaded, st, field_idx, field)
                             return
 
+        # AGAST #4666: a field of a struct literal, `Cell<u32> { v: 1 }.v`,
+        # `P { a: Q { x: 7 } }.a.x` (the nested arm above recurses into here).
+        # The literal is no place: build it in an entry alloca of its struct,
+        # as emit_struct_lit_value does, and GEP the field out of that.  It fell
+        # to "unhandled EXPR_MEMBER"; ritz0 compiled it.
+        ExprKind.StructLit =>
+            var sl_name: *u8 = null
+            var sl_len: i32 = 0
+            tuple_lit_name(s, e.left, StrView { ptr: (null), len: (0) as i64 }, @sl_name, @sl_len)
+            if sl_name != null
+                let sl_st: *StructDef = find_struct(s, StrView { ptr: (sl_name), len: (sl_len) as i64 })
+                if sl_st != null
+                    let sl_idx: i32 = find_field_index(sl_st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+                    if sl_idx >= 0
+                        let sl_slot: i32 = next_reg(s)
+                        entry_alloca_reg_begin_named(s, sl_slot)
+                        emit_name(s, StrView { ptr: (sl_st.name), len: (sl_st.name_len) as i64 })
+                        emit_sv(s, "  ; struct-literal member\n")
+                        entry_alloca_reg_end(s)
+                        emit_struct_lit_to_alloca(s, e.left, sl_slot)
+                        emit_member_gep_from_ptr(s, result, sl_slot, sl_st, sl_idx, get_field_type(sl_st, sl_idx))
+                        return
+
         # AGAST #1647: a field of a struct returned BY VALUE, `mk(true).b`,
         # `p.pair().a`, `Q.make(1).x`, `mko(1).inner.x` (the nested arm above
         # recurses into here).  Emit the call once, spill the aggregate into an
@@ -1995,13 +2018,17 @@ fn emit_expr_body(s: *EmitterState, e: *Expr) -> i32
             let sv1: i32 = next_reg(s)
             emit_str(s, IR_INDENT)
             emit_reg(s, sv1)
-            emit_str(s, c" = insertvalue %Span$u8 undef, ptr ")
+            emit_sv(s, " = insertvalue %")
+            emit_name(s, strlit_struct(s))   # AGAST #4666
+            emit_sv(s, " undef, ptr ")
             emit_reg(s, gep_reg)
             emit_str(s, IR_COMMA_0)
             let sv2: i32 = next_reg(s)
             emit_str(s, IR_INDENT)
             emit_reg(s, sv2)
-            emit_str(s, c" = insertvalue %Span$u8 ")
+            emit_sv(s, " = insertvalue %")
+            emit_name(s, strlit_struct(s))
+            emit_str(s, IR_SP)
             emit_reg(s, sv1)
             emit_str(s, IR_I64_SEP)
             emit_int(s, e.string_len as i64)

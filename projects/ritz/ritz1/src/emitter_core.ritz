@@ -685,6 +685,14 @@ pub fn emit_str(s: *EmitterState, text: *u8)
         i += 1
     s.out.push_span(Span<u8> { ptr: (text), len: (i as i64) as i64 })
 
+# AGAST #4666: emit_str for a StrView (`"..."`, no NUL needed), with the
+# same `ret` hook.
+pub fn emit_sv(s: *EmitterState, text: StrView)
+    if text.starts_with("  ret ") or text.starts_with("  ret\n")
+        let before_ret: fn(*EmitterState) = s.own_before_ret_fn
+        before_ret(s)
+    s.out.push_span(Span<u8> { ptr: text.ptr, len: text.len })
+
 # `  ret ...` / `  ret\n`: the start of a `ret` instruction.
 fn emit_str_is_ret(text: *u8) -> i32
     if *(text + 1) != ' '
@@ -778,6 +786,17 @@ pub fn emit_ir_error(s: *EmitterState, span: SrcSpan, msg: *u8)
     eprint_char('\n')
     s.error_count = s.error_count + 1
 
+# AGAST #4666: emit_ir_error for a StrView message.
+pub fn emit_ir_error_sv(s: *EmitterState, span: SrcSpan, msg: StrView)
+    emit_sv(s, "  ; ERROR: ")
+    emit_sv(s, msg)
+    emit_str(s, IR_NL)
+    diag_error_at(diag_source_file(), span)
+    eprints("ritz1 cannot emit: ")
+    eprints(msg)
+    eprints("\n")
+    s.error_count = s.error_count + 1
+
 # Same, for the sites that append a name to the message before the newline.
 # The caller follows this with emit_ir_error_end, which counts the error.
 pub fn emit_ir_error_begin(s: *EmitterState, span: SrcSpan, msg: *u8)
@@ -852,6 +871,12 @@ pub fn emit_nd_error(s: *EmitterState, line: i32, col: i32, msg: *u8)
     emit_nd_error_begin(s, line, col)
     eprints_cstr(msg)
     eprints_cstr(c"\n")
+
+# AGAST #4666: emit_nd_error for a StrView message.
+pub fn emit_nd_error_sv(s: *EmitterState, line: i32, col: i32, msg: StrView)
+    emit_nd_error_begin(s, line, col)
+    eprints(msg)
+    eprints("\n")
 
 # AGAST #1295: emit_nd_error for a message the caller finishes itself (it
 # prints the rest, then a newline): `<file>:<line>:<col>: error: `, counted.
@@ -4409,6 +4434,16 @@ pub fn emit_ambiguous_variant_error(s: *EmitterState, name_sv: StrView, span: Sr
     emit_str(s, IR_ADD_ZERO)
     return zero
 
+# AGAST #4666: the struct a bare "..." lowers to: `Span$u8` (AGAST #98), or
+# the layout-equal `StrView` when the program declares its own `Span<T>` of
+# another layout, whose `Span$u8` a literal is not (ritz0: the program's Span
+# shadows the builtin; a literal is a StrView there).
+pub fn strlit_struct(s: *EmitterState) -> StrView
+    let own: *StructDef = find_struct(s, "Span$u8")
+    if own != null and view_layout_ok(own) == 0
+        return "StrView"
+    "Span$u8"
+
 # Best-effort resolve the LLVM struct type-name produced by an expression.
 # Writes the name pointer and length into the out-pointers, or null/0 if
 # the producer's struct type isn't statically known.  Used to detect
@@ -4420,8 +4455,9 @@ pub fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_
         return
     # Bare "..." literal lowers to %Span$u8 (AGAST #98).
     if e.kind == ExprKind.StringLit
-        *out_name = c"Span$u8"
-        *out_len = 7
+        let lit_sv: StrView = strlit_struct(s)
+        *out_name = lit_sv.ptr
+        *out_len = lit_sv.len as i32
         return
     # AGAST #2131: a struct-target cast (`"..." as StrView`) emits its
     # operand's register unchanged, so its LLVM type is the operand's.
