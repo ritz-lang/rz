@@ -1,9 +1,12 @@
-"""AGAST #3937: lexis's HTML tokenizer is one fn per state, dispatched by a
-`match` over `enum State`, and no fn in it is over 150 SLOC / CC 80
-(measured by ritz-metrics).
+"""AGAST #3937, #4566: no fn in lexis is over 150 SLOC / CC 80 (measured by
+ritz-metrics).
 
-tokenizer_next was a 510 SLOC, CC 173 if-chain over 80 `STATE_*` i32 consts.
-This keeps the next state from being bolted back onto one giant fn.
+#3937 split tokenizer_next (510 SLOC, CC 173, an if-chain over 80 `STATE_*`
+i32 consts) into one fn per state, dispatched by a `match` over `enum State`.
+#4566 took the guard lexis-wide: process_start_tag_in_body (CC 95) became a
+name -> group lookup plus one fn per group, and ritz-metrics counts a pure
+lookup `match` as one decision (tag_name, tag_from_name, tag_is_special).
+This keeps the next feature from being bolted back onto one giant fn.
 """
 
 import functools
@@ -16,7 +19,10 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 METRICS_PY = REPO / "projects" / "larb" / "tools" / "ritz-metrics" / "ritz_metrics.py"
-TOKENIZER = REPO / "projects" / "lexis" / "lib" / "html" / "tokenizer.ritz"
+LEXIS = REPO / "projects" / "lexis"
+TOKENIZER = LEXIS / "lib" / "html" / "tokenizer.ritz"
+# Sources only: build output and fetched deps are not lexis's code.
+SOURCE_DIRS = ("lib", "src", "test")
 
 MAX_SLOC = 150
 MAX_CC = 80
@@ -31,12 +37,29 @@ def _metrics():
     return mod
 
 
+def _lexis_sources():
+    return sorted(p for d in SOURCE_DIRS for p in (LEXIS / d).rglob("*.ritz"))
+
+
+def _over_the_limit(path):
+    lines = path.read_text().splitlines()
+    fns = _metrics().extract_functions(path, lines, "ritz")
+    return [f"{path.relative_to(LEXIS)}: {f.name} (line {f.line}): "
+            f"{f.sloc} SLOC, CC {f.complexity}"
+            for f in fns if f.sloc > MAX_SLOC or f.complexity > MAX_CC]
+
+
 @pytest.mark.unit
-def test_no_tokenizer_function_over_the_limit():
-    lines = TOKENIZER.read_text().splitlines()
-    fns = _metrics().extract_functions(TOKENIZER, lines, "ritz")
-    found = [f"{f.name} (line {f.line}): {f.sloc} SLOC, CC {f.complexity}"
-             for f in fns if f.sloc > MAX_SLOC or f.complexity > MAX_CC]
+def test_the_guard_sees_all_of_lexis():
+    # A path typo would make the guard below pass on nothing.
+    files = {p.relative_to(LEXIS).as_posix() for p in _lexis_sources()}
+    assert {"lib/html/tokenizer.ritz", "lib/html/tree_builder.ritz",
+            "lib/dom/tag.ritz"} <= files, sorted(files)
+
+
+@pytest.mark.unit
+def test_no_lexis_function_over_the_limit():
+    found = [row for p in _lexis_sources() for row in _over_the_limit(p)]
     assert not found, (f"over {MAX_SLOC} SLOC / CC {MAX_CC}; split it:\n  "
                        + "\n  ".join(found))
 

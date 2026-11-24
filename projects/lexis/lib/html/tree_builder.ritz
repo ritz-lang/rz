@@ -490,157 +490,152 @@ fn process_in_body<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
         # For now, just emit document end
         close_all_elements(tb)
 
+# What a start tag does in "in body", by name.  Grouped by name, not Tag:
+# tag_from_name leaves some of these names (center, nobr, font, ...) Unknown.
+enum BodyStart
+    Ignore          # html, body, frameset: attributes not merged yet
+    HeadContent     # processed as in "in head"
+    Block           # closes an open <p>, then opens
+    Pre             # Block, and frameset_ok = 0
+    Form
+    ListItem        # li, dd, dt
+    Formatting      # a, b, ..., nobr: joins the active formatting list
+    Table
+    Void            # area, br, ..., input: self-closing, not pushed
+    Hr
+    Textarea
+    Iframe
+    Select
+    Option          # optgroup, option
+    Generic
+
+fn body_start_kind(name: StrView) -> BodyStart
+    match name
+        "html" | "body" | "frameset" => BodyStart.Ignore
+        "base" | "basefont" | "bgsound" | "link" | "meta" => BodyStart.HeadContent
+        "noframes" | "script" | "style" | "template" | "title" => BodyStart.HeadContent
+        "address" | "article" | "aside" | "blockquote" | "center" | "details" => BodyStart.Block
+        "dialog" | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" => BodyStart.Block
+        "footer" | "header" | "hgroup" | "main" | "menu" | "nav" | "ol" | "p" => BodyStart.Block
+        "search" | "section" | "summary" | "ul" => BodyStart.Block
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => BodyStart.Block
+        "pre" | "listing" => BodyStart.Pre
+        "form" => BodyStart.Form
+        "li" | "dd" | "dt" => BodyStart.ListItem
+        "a" | "b" | "big" | "code" | "em" | "font" | "i" | "nobr" => BodyStart.Formatting
+        "s" | "small" | "strike" | "strong" | "tt" | "u" => BodyStart.Formatting
+        "table" => BodyStart.Table
+        "area" | "br" | "embed" | "img" | "keygen" | "wbr" | "input" => BodyStart.Void
+        "hr" => BodyStart.Hr
+        "textarea" => BodyStart.Textarea
+        "iframe" => BodyStart.Iframe
+        "select" => BodyStart.Select
+        "optgroup" | "option" => BodyStart.Option
+        _ => BodyStart.Generic
+
 fn process_start_tag_in_body<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
-    let name = token.start_tag.name
-    let tag = tag_from_name(name)
+    let tag = tag_from_name(token.start_tag.name)
+    match body_start_kind(token.start_tag.name)
+        BodyStart.Ignore => return
+        BodyStart.HeadContent => process_in_head(tb, token)
+        BodyStart.Block => start_block(tb, tag, token)
+        BodyStart.Pre => start_pre(tb, tag, token)
+        BodyStart.Form => start_form(tb, token)
+        BodyStart.ListItem => start_list_item(tb, tag, token)
+        BodyStart.Formatting => start_formatting(tb, tag, token)
+        BodyStart.Table => start_table(tb, token)
+        BodyStart.Void => start_void(tb, tag, token)
+        BodyStart.Hr => start_hr(tb, token)
+        BodyStart.Textarea => start_textarea(tb, token)
+        BodyStart.Iframe => start_iframe(tb, token)
+        BodyStart.Select => start_select(tb, token)
+        BodyStart.Option => open_element(tb, tag, token)
+        BodyStart.Generic => start_generic(tb, tag, token)
 
-    if name.eq("html")
-        # Merge attributes into existing html element
-        # For now, ignore
+# Emit the start tag as `tag` and push it on the stack of open elements.
+fn open_element<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag, token: Token)
+    emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
+    push_element(tb, tag)
+
+# Emit the start tag as a self-closing `tag`; nothing is pushed.
+fn emit_void<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag, token: Token)
+    emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 1)
+    tb.frameset_ok = 0
+
+fn close_p_in_button_scope<S: EventSink>(tb:& TreeBuilder<S>)
+    if has_p_in_button_scope(@tb) == 1
+        close_p_element(tb)
+
+# address, article, ..., h1-h6: close an open <p>, then open.
+fn start_block<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag, token: Token)
+    close_p_in_button_scope(tb)
+    open_element(tb, tag, token)
+
+fn start_pre<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag, token: Token)
+    start_block(tb, tag, token)
+    tb.frameset_ok = 0
+    # TODO: Skip next newline
+
+fn start_form<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
+    if tb.form_element_idx >= 0 and stack_has_template(@tb) == 0
+        # Parse error, ignore
         return
+    start_block(tb, Tag.Form, token)
+    if stack_has_template(@tb) == 0
+        tb.form_element_idx = tb.stack_len as i32 - 1
 
-    else if name.eq("base") or name.eq("basefont") or name.eq("bgsound") or name.eq("link") or name.eq("meta") or name.eq("noframes") or name.eq("script") or name.eq("style") or name.eq("template") or name.eq("title")
-        process_in_head(tb, token)
+fn start_list_item<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag, token: Token)
+    tb.frameset_ok = 0
+    # TODO: Close a previous <li> / <dd> / <dt> if any
+    start_block(tb, tag, token)
 
-    else if name.eq("body")
-        # Parse error: second body
-        # Merge attributes
-        return
+fn start_formatting<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag, token: Token)
+    # TODO: <a>: check for an existing <a> in the formatting list; <nobr>:
+    # check for nobr in scope and run the adoption agency
+    reconstruct_active_formatting(tb)
+    open_element(tb, tag, token)
+    push_formatting_element(tb, tag, token.start_tag.attrs, token.start_tag.attr_count)
 
-    else if name.eq("frameset")
-        # Complex rules for frameset
-        return
+fn start_table<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
+    # TODO: Close <p> in button scope only if not quirks mode
+    start_block(tb, Tag.Table, token)
+    tb.frameset_ok = 0
+    tb.mode = MODE_IN_TABLE
 
-    else if name.eq("address") or name.eq("article") or name.eq("aside") or name.eq("blockquote") or name.eq("center") or name.eq("details") or name.eq("dialog") or name.eq("dir") or name.eq("div") or name.eq("dl") or name.eq("fieldset") or name.eq("figcaption") or name.eq("figure") or name.eq("footer") or name.eq("header") or name.eq("hgroup") or name.eq("main") or name.eq("menu") or name.eq("nav") or name.eq("ol") or name.eq("p") or name.eq("search") or name.eq("section") or name.eq("summary") or name.eq("ul")
-        # Close any open <p> in button scope
-        if has_p_in_button_scope(@tb) == 1
-            close_p_element(tb)
-        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, tag)
+fn start_void<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag, token: Token)
+    # TODO: <input type=hidden> leaves frameset_ok alone
+    reconstruct_active_formatting(tb)
+    emit_void(tb, tag, token)
 
-    else if name.eq("h1") or name.eq("h2") or name.eq("h3") or name.eq("h4") or name.eq("h5") or name.eq("h6")
-        if has_p_in_button_scope(@tb) == 1
-            close_p_element(tb)
-        # Check for nesting h1-h6
-        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, tag)
+fn start_hr<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
+    close_p_in_button_scope(tb)
+    emit_void(tb, Tag.Hr, token)
 
-    else if name.eq("pre") or name.eq("listing")
-        if has_p_in_button_scope(@tb) == 1
-            close_p_element(tb)
-        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, tag)
-        tb.frameset_ok = 0
-        # TODO: Skip next newline
+fn start_textarea<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
+    open_element(tb, Tag.Textarea, token)
+    # TODO: Skip next newline, switch to RCDATA
+    tb.frameset_ok = 0
+    tb.original_mode = tb.mode
+    tb.mode = MODE_TEXT
 
-    else if name.eq("form")
-        if tb.form_element_idx >= 0 and stack_has_template(@tb) == 0
-            # Parse error, ignore
-            return
-        if has_p_in_button_scope(@tb) == 1
-            close_p_element(tb)
-        emit_element_start(tb.sink, Tag.Form, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, Tag.Form)
-        if stack_has_template(@tb) == 0
-            tb.form_element_idx = tb.stack_len as i32 - 1
+fn start_iframe<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
+    tb.frameset_ok = 0
+    open_element(tb, Tag.Iframe, token)
+    tb.original_mode = tb.mode
+    tb.mode = MODE_TEXT
 
-    else if name.eq("li")
-        tb.frameset_ok = 0
-        # TODO: Close previous <li> if any
-        if has_p_in_button_scope(@tb) == 1
-            close_p_element(tb)
-        emit_element_start(tb.sink, Tag.Li, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, Tag.Li)
-
-    else if name.eq("dd") or name.eq("dt")
-        tb.frameset_ok = 0
-        # TODO: Close previous <dd>/<dt> if any
-        if has_p_in_button_scope(@tb) == 1
-            close_p_element(tb)
-        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, tag)
-
-    else if name.eq("a")
-        # TODO: Check for existing <a> in formatting elements
-        reconstruct_active_formatting(tb)
-        emit_element_start(tb.sink, Tag.A, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, Tag.A)
-        push_formatting_element(tb, Tag.A, token.start_tag.attrs, token.start_tag.attr_count)
-
-    else if name.eq("b") or name.eq("big") or name.eq("code") or name.eq("em") or name.eq("font") or name.eq("i") or name.eq("s") or name.eq("small") or name.eq("strike") or name.eq("strong") or name.eq("tt") or name.eq("u")
-        reconstruct_active_formatting(tb)
-        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, tag)
-        push_formatting_element(tb, tag, token.start_tag.attrs, token.start_tag.attr_count)
-
-    else if name.eq("nobr")
-        reconstruct_active_formatting(tb)
-        # TODO: Check for nobr in scope, run adoption agency
-        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, tag)
-        push_formatting_element(tb, tag, token.start_tag.attrs, token.start_tag.attr_count)
-
-    else if name.eq("table")
-        # TODO: Close <p> in button scope if not quirks mode
-        if has_p_in_button_scope(@tb) == 1
-            close_p_element(tb)
-        emit_element_start(tb.sink, Tag.Table, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, Tag.Table)
-        tb.frameset_ok = 0
-        tb.mode = MODE_IN_TABLE
-
-    else if name.eq("area") or name.eq("br") or name.eq("embed") or name.eq("img") or name.eq("keygen") or name.eq("wbr")
-        reconstruct_active_formatting(tb)
-        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 1)
-        tb.frameset_ok = 0
-
-    else if name.eq("input")
-        reconstruct_active_formatting(tb)
-        emit_element_start(tb.sink, Tag.Input, token.start_tag.attrs, token.start_tag.attr_count, 1)
-        # Check if type=hidden, affects frameset_ok
-        tb.frameset_ok = 0
-
-    else if name.eq("hr")
-        if has_p_in_button_scope(@tb) == 1
-            close_p_element(tb)
-        emit_element_start(tb.sink, Tag.Hr, token.start_tag.attrs, token.start_tag.attr_count, 1)
-        tb.frameset_ok = 0
-
-    else if name.eq("textarea")
-        emit_element_start(tb.sink, Tag.Textarea, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, Tag.Textarea)
-        # TODO: Skip next newline, switch to RCDATA
-        tb.frameset_ok = 0
-        tb.original_mode = tb.mode
-        tb.mode = MODE_TEXT
-
-    else if name.eq("iframe")
-        tb.frameset_ok = 0
-        emit_element_start(tb.sink, Tag.Iframe, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, Tag.Iframe)
-        tb.original_mode = tb.mode
-        tb.mode = MODE_TEXT
-
-    else if name.eq("select")
-        reconstruct_active_formatting(tb)
-        emit_element_start(tb.sink, Tag.Select, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, Tag.Select)
-        tb.frameset_ok = 0
-        if tb.mode == MODE_IN_TABLE or tb.mode == MODE_IN_CAPTION or tb.mode == MODE_IN_TABLE_BODY or tb.mode == MODE_IN_ROW or tb.mode == MODE_IN_CELL
-            tb.mode = MODE_IN_SELECT_IN_TABLE
-        else
-            tb.mode = MODE_IN_SELECT
-
-    else if name.eq("optgroup") or name.eq("option")
-        # Close previous option if open
-        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, tag)
-
+fn start_select<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
+    reconstruct_active_formatting(tb)
+    open_element(tb, Tag.Select, token)
+    tb.frameset_ok = 0
+    if tb.mode == MODE_IN_TABLE or tb.mode == MODE_IN_CAPTION or tb.mode == MODE_IN_TABLE_BODY or tb.mode == MODE_IN_ROW or tb.mode == MODE_IN_CELL
+        tb.mode = MODE_IN_SELECT_IN_TABLE
     else
-        # Generic element
-        reconstruct_active_formatting(tb)
-        emit_element_start(tb.sink, tag, token.start_tag.attrs, token.start_tag.attr_count, 0)
-        push_element(tb, tag)
+        tb.mode = MODE_IN_SELECT
+
+fn start_generic<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag, token: Token)
+    reconstruct_active_formatting(tb)
+    open_element(tb, tag, token)
 
 fn process_end_tag_in_body<S: EventSink>(tb:& TreeBuilder<S>, token: Token)
     let name = token.end_tag.name

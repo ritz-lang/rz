@@ -6,7 +6,8 @@ source files only (no compiler, no build) and reports:
 
   * per-function length (lines, from `fn` header to the last indented line)
   * per-function cyclomatic complexity (1 + decision points), counting
-    if / elif / while / for / match-arm `=>` lines / `and` / `or` / `?`-try
+    if / elif / while / for / match-arm `=>` lines / `and` / `or` / `?`-try,
+    with a pure lookup `match` counted once (AGAST #4566)
   * per-function max nesting depth (indent levels below the fn header)
   * duplication: identical normalised N-line windows within and across files
   * string-handling smells (C-in-Ritz-clothing indicators), per file and fn
@@ -75,6 +76,51 @@ RITZ_DECISIONS = [
     re.compile(r"\bor\b"),
     re.compile(r"\?\s*$|\?\)|\?\s*[,.]"),  # `expr?` early-return try operator
 ]
+# A lookup `match` (AGAST #4566) counts as one decision, not one per arm: every
+# arm is a single line mapping constant patterns to a constant value, so it is
+# a data table spelled as a match.  A const array table (LANGUAGE_SPEC §4.3)
+# scores 1, and Ritz can't index one by an enum that carries data (`e as i32`
+# is an error there, §10.4), so for such an enum the match *is* the table.
+# Anything that computes keeps one decision per arm: a call (lower-case name
+# before `(`), an operator, a field read, a guard, a block arm.  Lines here
+# are already string/comment-stripped, so a literal string is `""`.
+_LIT = r"(?:\"\"|''|-?\d[\w.]*|true|false|null)"
+_NAME = r"[A-Za-z_]\w*"
+_BINDERS = rf"\(\s*{_NAME}(?:\s*,\s*{_NAME})*\s*\)"
+_PATTERN = rf"(?:{_LIT}|{_NAME}(?:\.{_NAME})*(?:{_BINDERS})?)"
+_CTOR = rf"(?:{_NAME}\.)*[A-Z]\w*(?:\(\s*(?:{_LIT}|{_NAME})(?:\s*,\s*(?:{_LIT}|{_NAME}))*\s*\))?"
+_LOOKUP_ARM_RE = re.compile(
+    rf"^\s*{_PATTERN}(?:\s*\|\s*{_PATTERN})*\s*=>\s*(?:{_LIT}|{_CTOR}|[a-z_]\w*)\s*$"
+)
+# A line that opens a match whose arms follow on deeper lines.
+_MATCH_HEAD_RE = re.compile(r"\bmatch\s+(?!.*=>).+$")
+
+
+def lookup_arm_lines(body: list[str]) -> set[int]:
+    """Indices into `body` of lookup-match arms past each match's first.
+
+    Their `=>` is not counted, so each lookup match adds one decision.
+    """
+    skip: set[int] = set()
+    for i, line in enumerate(body):
+        if not is_code(line) or not _MATCH_HEAD_RE.search(
+            strip_strings_and_comment(line)
+        ):
+            continue
+        head = indent_of(line)
+        arms = []
+        for j in range(i + 1, len(body)):
+            if not is_code(body[j]):
+                continue
+            if indent_of(body[j]) <= head:
+                break
+            arms.append(j)
+        # A block arm's head (`P =>`) and its body lines fail the arm regex.
+        if arms and all(_LOOKUP_ARM_RE.match(strip_strings_and_comment(body[j])) for j in arms):
+            skip.update(arms[1:])
+    return skip
+
+
 PY_DECISIONS = [
     re.compile(r"^\s*(?:if|elif|while|for|except|case)\b"),
     re.compile(r"\bif\b.*\belse\b"),  # conditional expression
@@ -192,13 +238,15 @@ def extract_functions(path: Path, lines: list[str], lang: str) -> list[FnMetric]
         )
         unit = (body_indents[0] - base) if body_indents else 4
         unit = unit or 4
-        for b in body[1:]:
+        lookup_arms = lookup_arm_lines(body) if lang == "ritz" else set()
+        for k_line, b in enumerate(body[1:], start=1):
             if not is_code(b):
                 continue
             sloc += 1
             code = strip_strings_and_comment(b)
-            for d in decisions:
-                cc += len(d.findall(code))
+            if k_line not in lookup_arms:
+                for d in decisions:
+                    cc += len(d.findall(code))
             depth = max(depth, (indent_of(b) - base) // unit)
             for k, rx in smells.items():
                 if rx.search(b if k == "cstr_literal" else code):

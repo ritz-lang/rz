@@ -1,0 +1,192 @@
+# test/test_tree_builder_start_tag.ritz - start tags in body, one per group (#4566)
+#
+# process_start_tag_in_body was one if-chain of name.eq() tests at CC 95. It
+# was split into a name -> group classifier and one fn per group with no
+# behaviour change; these pin what each group does: the element events it
+# emits (name, `/` when self-closing, `-name` for an end), and the builder
+# state it leaves (mode, frameset_ok, open elements, formatting list, form).
+
+import ritzlib.strview
+import lib.event { EventSink, ElementStartEvent, ElementEndEvent, TextEvent, CommentEvent, DoctypeEvent, ParseErrorEvent, ParseWarningEvent }
+import lib.dom.tag { Tag, tag_name }
+import lib.lexis { HtmlParser, html_parser_new, html_parser_run }
+import lib.html.tree_builder { MODE_IN_TABLE, MODE_IN_SELECT }
+
+const TRACE_CAP: i64 = 512
+
+# Records element events as text: "html head body div -div ".
+struct Trace
+    buf: [512]u8
+    len: i64
+
+fn trace_new() -> Trace
+    var t: Trace
+    t.len = 0
+    t
+
+fn trace_byte(t:& Trace, c: u8)
+    if t.len < TRACE_CAP
+        t.buf[t.len] = c
+        t.len = t.len + 1
+
+fn trace_name(t:& Trace, tag: Tag)
+    let name = tag_name(tag)
+    var i: i64 = 0
+    while i < name.len
+        trace_byte(t, name.get(i))
+        i = i + 1
+
+impl EventSink for Trace
+    fn on_document_start(self:&)
+        return
+
+    fn on_document_end(self:&)
+        return
+
+    fn on_element_start(self:&, event: @ElementStartEvent)
+        trace_name(self, event.tag)
+        if event.self_closing != 0
+            trace_byte(self, '/')
+        trace_byte(self, ' ')
+
+    fn on_element_end(self:&, event: @ElementEndEvent)
+        trace_byte(self, '-')
+        trace_name(self, event.tag)
+        trace_byte(self, ' ')
+
+    fn on_text(self:&, event: @TextEvent)
+        return
+
+    fn on_comment(self:&, event: @CommentEvent)
+        return
+
+    fn on_doctype(self:&, event: @DoctypeEvent)
+        return
+
+    fn on_error(self:&, event: @ParseErrorEvent)
+        return
+
+    fn on_warning(self:&, event: @ParseWarningEvent)
+        return
+
+# Runs `src` to EOF. The state read afterwards is EOF's, so each test picks
+# inputs whose group leaves a mark that survives it.
+fn parse(src: StrView) -> HtmlParser<Trace>
+    var hp = html_parser_new(src, trace_new())
+    html_parser_run(hp)
+    hp
+
+fn trace_is(hp: @HtmlParser<Trace>, want: StrView) -> bool
+    let t = @hp.tree_builder.sink
+    strview_from_ptr(@t.buf[0] as *u8, t.len).eq(want)
+
+# A body start tag that is ignored (html, body, frameset) emits nothing.
+[[test]]
+fn test_ignored_start_tags_emit_nothing() -> i32
+    let hp = parse("<span><html><body><frameset>")
+    assert trace_is(@hp, "html head -head body span -span -body -html ")
+    assert hp.tree_builder.frameset_ok == 1
+    0
+
+# Head content in body goes through "in head": <meta> comes out self-closing.
+[[test]]
+fn test_head_content_goes_through_in_head() -> i32
+    let hp = parse("<span><meta>")
+    assert trace_is(@hp, "html head -head body span meta/ -span -body -html ")
+    0
+
+# Block containers close an open <p> in button scope, then open.
+[[test]]
+fn test_block_closes_open_p() -> i32
+    let hp = parse("<p><div><h2><p><center>")
+    assert trace_is(@hp, "html head -head body p -p div h2 p -p center -center -h2 -div -body -html ")
+    assert hp.tree_builder.frameset_ok == 1
+    0
+
+# <pre> and <listing> also clear frameset_ok.
+[[test]]
+fn test_pre_clears_frameset_ok() -> i32
+    let hp = parse("<p><listing>")
+    assert trace_is(@hp, "html head -head body p -p listing -listing -body -html ")
+    assert hp.tree_builder.frameset_ok == 0
+    0
+
+# <form> records the form element; a second one is ignored.
+[[test]]
+fn test_form_is_recorded_once() -> i32
+    let hp = parse("<p><form><form>")
+    assert trace_is(@hp, "html head -head body p -p form -form -body -html ")
+    assert hp.tree_builder.form_element_idx == 2
+    0
+
+# <li>, <dd> and <dt> clear frameset_ok and close an open <p>.
+[[test]]
+fn test_list_items_clear_frameset_ok() -> i32
+    let hp = parse("<p><li><p><dt>")
+    assert trace_is(@hp, "html head -head body p -p li p -p dt -dt -li -body -html ")
+    assert hp.tree_builder.frameset_ok == 0
+    0
+
+# <a>, <b>, <nobr> ... open and join the active formatting list.
+[[test]]
+fn test_formatting_elements_join_the_list() -> i32
+    let hp = parse("<a><b><nobr>")
+    assert trace_is(@hp, "html head -head body a b nobr -nobr -b -a -body -html ")
+    assert hp.tree_builder.formatting_len == 3
+    let font = parse("<font>")
+    assert trace_is(@font, "html head -head body font -font -body -html ")
+    assert font.tree_builder.formatting_len == 1
+    0
+
+# <table> closes an open <p> and switches to "in table".
+[[test]]
+fn test_table_switches_mode() -> i32
+    let hp = parse("<p><table>")
+    assert trace_is(@hp, "html head -head body p -p table -table -body -html ")
+    assert hp.tree_builder.mode == MODE_IN_TABLE
+    assert hp.tree_builder.frameset_ok == 0
+    0
+
+# Void elements emit self-closing and push nothing; <hr> closes an open <p>.
+[[test]]
+fn test_void_elements_push_nothing() -> i32
+    let hp = parse("<p><br><input><hr><keygen>")
+    assert trace_is(@hp, "html head -head body p br/ input/ -p hr/ keygen/ -body -html ")
+    assert hp.tree_builder.frameset_ok == 0
+    assert hp.tree_builder.stack_len == 0
+    0
+
+# <textarea> and <iframe> switch to text mode, where EOF leaves them open
+# (no `-textarea`): a generic element would be closed.
+[[test]]
+fn test_textarea_switches_to_text() -> i32
+    let hp = parse("<textarea>")
+    assert trace_is(@hp, "html head -head body textarea -body -html ")
+    assert hp.tree_builder.frameset_ok == 0
+    0
+
+[[test]]
+fn test_iframe_switches_to_text() -> i32
+    let hp = parse("<iframe>")
+    assert trace_is(@hp, "html head -head body iframe -body -html ")
+    assert hp.tree_builder.frameset_ok == 0
+    0
+
+# <select> switches to "in select" from body, where EOF closes nothing.
+[[test]]
+fn test_select_switches_mode() -> i32
+    let hp = parse("<select>")
+    assert trace_is(@hp, "html head -head body select ")
+    assert hp.tree_builder.mode == MODE_IN_SELECT
+    assert hp.tree_builder.stack_len == 3
+    0
+
+# <option> opens without touching the formatting list; anything else is a
+# generic element.
+[[test]]
+fn test_option_and_generic() -> i32
+    let hp = parse("<option><span><blink>")
+    assert trace_is(@hp, "html head -head body option span blink -blink -span -option -body -html ")
+    assert hp.tree_builder.formatting_len == 0
+    assert hp.tree_builder.frameset_ok == 1
+    0

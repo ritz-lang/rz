@@ -37,8 +37,8 @@ def test_function_extraction_and_complexity(tmp_path):
     assert set(fns) == {"simple", "branchy"}
     assert fns["simple"].complexity == 1
     assert fns["simple"].line == 4
-    # if, and, while, elif, or, two match arms => 1 + 7
-    assert fns["branchy"].complexity == 8
+    # if, and, while, elif, or, and a lookup match (one decision) => 1 + 6
+    assert fns["branchy"].complexity == 7
     assert fns["branchy"].max_depth == 3  # fn -> if -> while -> stmt
     assert (
         fns["branchy"].smells.get("ptr_len_param_pair", 0) == 0
@@ -65,3 +65,78 @@ def test_cli_runs_on_directory(tmp_path, capsys):
     assert rm.main([str(tmp_path), "--top", "5"]) == 0
     out = capsys.readouterr().out
     assert "branchy" in out and "## Duplicated" in out
+
+
+# AGAST #4566: a `match` whose every arm maps a constant pattern to a constant
+# value is a lookup table.  A const array would score 1; Ritz can't index one
+# by an enum that carries data (`Tag.Unknown(StrView)`, LANGUAGE_SPEC §10.4),
+# so the match is the table, and it counts as one decision, not one per arm.
+def _cc(src: str) -> int:
+    fns = rm.extract_functions(Path("x.ritz"), src.splitlines(), "ritz")
+    assert len(fns) == 1, fns
+    return fns[0].complexity
+
+
+def _fn(*arms: str, scrutinee: str = "tag") -> str:
+    return "fn f(tag: Tag) -> i32\n    match " + scrutinee + "\n" + "".join(
+        f"        {a}\n" for a in arms
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "arms",
+    [
+        # enum -> bool set membership (tag_is_special)
+        ("Tag.Area => true", "Tag.Base => true", "Tag.Br => true", "_ => false"),
+        # string -> variant, default wrapping the scrutinee (tag_from_name)
+        ('"html" => Tag.Html', '"head" => Tag.Head', "_ => Tag.Unknown(name)"),
+        # variant -> string, a payload echoed back (tag_name)
+        ('Tag.Html => "html"', 'Tag.Head => "head"', "Tag.Unknown(name) => name"),
+        # or-patterns, chars, negative ints, consts
+        ("' ' | '\\t' => 1", "Kind.A | Kind.B => -1", "_ => MODE_IN_BODY"),
+    ],
+    ids=["enum-to-bool", "string-to-variant", "variant-to-string", "or-patterns"],
+)
+def test_a_lookup_match_counts_once(arms):
+    assert _cc(_fn(*arms)) == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "arms",
+    [
+        # a call is work, not data: a dispatch match still counts every arm
+        ("Op.Read => sys_read(a)", "Op.Write => 1", "_ => 0"),
+        # an operator computes
+        ("Op.Read => n + 1", "Op.Write => 1", "_ => 0"),
+        # a field read depends on state
+        ("Op.Read => tb.mode", "Op.Write => 1", "_ => 0"),
+        # a guard tests state
+        ("Op.Read if n > 0 => 1", "Op.Write => 1", "_ => 0"),
+    ],
+    ids=["call", "operator", "field", "guard"],
+)
+def test_a_match_that_computes_counts_every_arm(arms):
+    assert _cc(_fn(*arms)) == 4
+
+
+@pytest.mark.unit
+def test_a_block_arm_counts_every_arm():
+    src = _fn("Op.Read =>", "    1", "Op.Write => 1", "_ => 0")
+    assert _cc(src) == 4
+
+
+@pytest.mark.unit
+def test_a_lookup_nested_in_a_dispatch_counts_once_inside_it():
+    src = (
+        "fn f(x: Option<Op>) -> i32\n"
+        "    match x\n"
+        "        Some(s) => match s\n"
+        "            Op.Read => 1\n"
+        "            Op.Write => 2\n"
+        "            _ => 3\n"
+        "        None => 0\n"
+    )
+    # outer: two arms (its first is a nested match, not a constant); inner: one
+    assert _cc(src) == 1 + 2 + 1
