@@ -96,7 +96,7 @@ modules links without sys. A freestanding program defines all three itself.
    - [net](#net) - TCP/IP socket operations
    - [async_net](#async_net) - Async TCP networking
 8. [Async Runtime](#async-runtime)
-   - [async.runtime](#asyncruntime) - Drive one future with `block_on`
+   - [async.runtime](#asyncruntime) - Drive one future with `rt.block_on`
    - [async.tasks](#asynctasks) - Multi-task executor
    - [async.blocking_fs](#asyncblocking_fs) - Blocking file calls behind `async fn`
    - [uring](#uring) - io_uring bindings
@@ -166,15 +166,15 @@ enum Result<T, E>
     Err(E)
 ```
 
-**Functions**:
+**Methods** (`impl<T, E> Result<T, E>`, AGAST #4445):
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `result_is_ok` | `fn<T, E>(res: *Result<T, E>) -> i32` | Returns 1 if Ok |
-| `result_is_err` | `fn<T, E>(res: *Result<T, E>) -> i32` | Returns 1 if Err |
-| `result_unwrap_or` | `fn<T, E>(res: *Result<T, E>, default: T) -> T` | Returns value or default |
-| `result_ok` | `fn<T, E>(res: *Result<T, E>) -> Option<T>` | Convert to Option, discarding error |
-| `result_err` | `fn<T, E>(res: *Result<T, E>) -> Option<E>` | Convert to Option of error |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `r.is_ok()` | `fn() -> bool` | Whether it is `Ok` |
+| `r.is_err()` | `fn() -> bool` | Whether it is `Err` |
+| `r.unwrap_or(default)` | `fn(default: T) -> T` | The `Ok` value, or `default` |
+| `r.ok()` | `fn() -> Option<T>` | The `Ok` value as an Option, discarding the error |
+| `r.err()` | `fn() -> Option<E>` | The `Err` value as an Option |
 
 **Example**:
 ```ritz
@@ -311,6 +311,11 @@ struct Arena
 |----------|-----------|-------------|
 | `arena_new` | `fn(size: i64) -> Arena` | Create arena with given capacity |
 | `arena_default` | `fn() -> Arena` | Create 1 MB arena |
+
+**Methods** (`impl Arena`):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `a.alloc(size)` | `fn(size: i64) -> *u8` | Allocate bytes (8-byte aligned) |
 | `a.alloc_zero(size)` | `fn(size: i64) -> *u8` | Allocate and zero-initialize |
 | `a.alloc_array(count, elem_size)` | `fn(count: i64, elem_size: i64) -> *u8` | Allocate array |
@@ -381,9 +386,12 @@ fn main() -> i32
     return 1
 ```
 
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `src.set()` | `fn() -> PageSource` | Install `src`; returns the source it replaces |
+
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `page_source_set` | `fn(src: PageSource) -> PageSource` | Install `src`; returns the source it replaces |
 | `page_source_get` | `fn() -> PageSource` | The installed source (the platform hooks until set) |
 | `mmap_failed` | `fn(p: *u8) -> bool` | True for null and `-errno` (any `p <= 0`) |
 
@@ -433,8 +441,11 @@ block it handed out is live, because the header points at it.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `a.malloc(size)` | `fn(size: i64) -> *u8` | `size` bytes owned by `a` (null `a`: `malloc`) |
 | `allocator_of` | `fn(p: *u8) -> *Allocator` | `p`'s owner; null for the global heap and for null |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `a.malloc(size)` | `fn(size: i64) -> *u8` | `size` bytes owned by `a` (null `a`: `malloc`) |
 | `ar.allocator()` | `fn() -> Allocator` | Bump from `ar`; `free` gives nothing back until reset/destroy |
 | `src.allocator()` | `fn() -> Allocator` | Each block its own whole-page mapping from `src`, unmapped there |
 | `h.init(src)` | `fn(src: PageSource)` | Fill `h` as a size-class heap whose slabs and large blocks map from `src` |
@@ -496,6 +507,131 @@ Heap-allocated container for a single value with automatic cleanup.
 ```ritz
 struct Box<T>
     ptr: *T    # Pointer to heap-allocated T
+```
+
+**Constructors**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `box_new` | `fn<T>(value: T) -> Box<T>` | Create box containing value |
+| `box_new_in` | `fn<T>(a: *Allocator, value: T) -> Box<T>` | `box_new` with the value in memory from `a`; empty if `a` is out of memory |
+
+**Operations** are methods (AGAST #4445):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `b.get()` | `fn() -> T` | Get value (returns copy) |
+| `b.as_ptr()` | `fn() -> *T` | Get pointer to value |
+| `b.set(value)` | `fn(value: T)` | Set new value |
+| `b.valid()` | `fn() -> bool` | Check if valid |
+| `b.drop()` | `fn()` | Free the box now (`Box` implements `Drop`: it also runs at scope end) |
+
+**The `heap` keyword is not a `Box`.** `heap 42` is a raw allocation
+expression of type `*i64`: dereference it with `*p` and free it with
+`free(p as *u8)`. `box_new<i64>(42)` returns a `Box<i64>`, which is what
+`b.get` / `b.set` / `b.drop()` and the `Drop` impl operate on. Passing a
+`heap`-keyword pointer to `b.get` is a type error.
+
+```ritz
+import ritzlib.box
+
+fn heap_vs_box() -> i64
+    var p = heap 42            # `heap` keyword: a bare *i64, deref with `*p`
+    var q = box_new<i64>(42)   # constructor: a Box<i64> wrapper
+    *p + q.get()
+```
+
+ritzlib once also had `ritzlib.heap`, a `Heap<T>` identical to `Box<T>` with a
+`heap_` prefix; it was folded into `box` (AGAST #3916).
+
+---
+
+## Collections
+
+### gvec
+
+**Module**: `ritzlib.gvec`
+
+Generic dynamic array (growable vector).
+
+```ritz
+struct Vec<T>
+    data: *T       # Pointer to heap-allocated array
+    len: i64       # Current number of elements
+    cap: i64       # Allocated capacity
+```
+
+**Constructors**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `vec_new` | `fn<T>() -> Vec<T>` | Create empty Vec |
+| `vec_with_cap` | `fn<T>(cap: i64) -> Vec<T>` | Create with pre-allocated capacity |
+| `vec_new_in` | `fn<T>(a: *Allocator) -> Vec<T>` | Empty, every grow from `a` (reserves 8 elements) |
+| `vec_with_cap_in` | `fn<T>(a: *Allocator, cap: i64) -> Vec<T>` | With capacity, from `a` |
+
+**Core Operations** are methods (`impl<T> Vec<T>`, AGAST #4445):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `v.push(item)` | `fn(item: T) -> bool` | Push element (false only if the growth allocation fails) |
+| `v.pop()` | `fn() -> T` | Pop last element (caller ensures non-empty) |
+| `v.get(idx)` | `fn(idx: i64) -> T` | Get element by index (caller ensures in range) |
+| `v.get_ptr(idx)` | `fn(idx: i64) -> *T` | Get pointer to element |
+| `v.set(idx, item)` | `fn(idx: i64, item: T) -> i32` | Set element (caller ensures in range); returns 0 |
+| `v.len()` | `fn() -> i64` | Get length |
+| `v.cap()` | `fn() -> i64` | Get capacity |
+| `v.is_empty()` | `fn() -> bool` | Check if empty |
+| `v.valid()` | `fn() -> bool` | Always true: an empty Vec with null data is valid |
+| `v.grow(new_cap)` | `fn(new_cap: i64) -> bool` | Grow to `new_cap`; true when the Vec has the capacity |
+| `v.ensure_cap(needed)` | `fn(needed: i64) -> bool` | Ensure at least `needed` capacity; true on success |
+| `v.clear()` | `fn()` | Clear (keeps capacity) |
+| `v.deinit()` | `fn()` | Free the Vec now, for one in raw memory; an owned Vec is freed by its `Drop` impl at scope end (AGAST #2159) |
+
+A zero-size element (a field-less struct) allocates nothing: `len` and `cap`
+count elements as usual, and `data` is a non-null dangling pointer that
+`v.deinit()` never frees.
+
+**Utilities**:
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `v.first()` | `fn() -> T` | Get first element |
+| `v.last()` | `fn() -> T` | Get last element |
+| `v.as_ptr()` | `fn() -> *T` | Get raw pointer |
+| `v.slice(start, end)` | `fn(start: i64, end: i64) -> Vec<T>` | Copy of `[start, end)`, bounds clamped |
+| `v.clone()` | `fn() -> Vec<T>` | Copy every element; shallow, so a heap-owning `T` ends up owned twice |
+| `v.swap(i, j)` | `fn(i: i64, j: i64) -> bool` | Swap elements; false if either index is out of range |
+| `v.push_bytes(data, len)` | `fn(data: *T, len: i64) -> bool` | Push `len` elements (the print-sink protocol, LANGUAGE_SPEC §2.6) |
+| `v.push_span(data)` | `fn(data: Span<T>) -> bool` | Push every element of a span |
+| `v.push_str(s)` | `fn(s: *T) -> bool` | Push a NUL-terminated C string, without the NUL |
+| `v.as_str()` | `fn() -> Option<*T>` | NUL-terminate (not counted in `len`) and return the data pointer; `None` if that can't be allocated |
+
+**Line Utilities** (to read a whole fd into a `Vec<u8>`, use `vec_read_all_fd` in [io](#io)):
+
+```ritz
+struct LineBounds
+    start: i64      # Start offset in buffer
+    length: i64     # Length in bytes
+```
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `v.find_lines(lines)` | `fn(lines: @&Vec<LineBounds>) -> bool` | Append each line's bounds (trailing newline included) to `lines`; `Vec<u8>` only; false if a push fails |
+
+---
+
+### string
+
+**Module**: `ritzlib.string`
+
+Owned, growable UTF-8 string. Always null-terminated for C interop.
+
+```ritz
+import ritzlib.gvec
+
+struct String
+    data: Vec<u8>    # Underlying byte storage
 ```
 
 **Constructors** (free fns; also reachable as `String.new(...)`, `String.from(...)`, ...):
@@ -729,29 +865,31 @@ struct Span<T>
 | `span_from_cstr` | `fn(cstr: *u8) -> Span<u8>` | From C string |
 | `span_literal` | `fn(ptr: *u8, len: i64) -> Span<u8>` | From literal with known length |
 
-**Accessors**:
+**Methods** (`impl<T> Span<T>`, AGAST #4445):
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `span_len` | `fn<T>(s: *Span<T>) -> i64` | Get length |
-| `span_is_empty` | `fn<T>(s: *Span<T>) -> bool` | Check if empty |
-| `span_get` | `fn<T>(s: *Span<T>, idx: i64) -> T` | Get element |
-| `span_as_ptr` | `fn<T>(s: *Span<T>) -> *T` | Get raw pointer |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.len()` | `fn() -> i64` | Get length |
+| `s.is_empty()` | `fn() -> bool` | Check if empty |
+| `s.get(idx)` | `fn(idx: i64) -> T` | Get element |
+| `s.get_ptr(idx)` | `fn(idx: i64) -> *T` | Pointer to element `idx` |
+| `s.as_ptr()` | `fn() -> *T` | Get raw pointer |
+| `s.slice(start, end)` | `fn(start: i64, end: i64) -> Span<T>` | Sub-span `[start, end)` |
+| `s.from(start)` | `fn(start: i64) -> Span<T>` | From `start` to the end |
+| `s.to(end)` | `fn(end: i64) -> Span<T>` | From the beginning to `end` |
 
-**Slicing**:
+**Slicing** (free functions):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `span_slice` | `fn<T>(s: @Span<T>, start: i64, end: i64) -> Span<T>` | Sub-span |
-| `span_from` | `fn<T>(s: *Span<T>, start: i64) -> Span<T>` | From start to end |
-| `span_to` | `fn<T>(s: *Span<T>, end: i64) -> Span<T>` | From beginning to end |
 | `span_take` | `fn(s: @Span<u8>, n: i64) -> Span<u8>` | First n bytes |
 | `span_skip` | `fn(s: @Span<u8>, n: i64) -> Span<u8>` | Skip first n bytes |
 
 **String Operations** (for `Span<u8>`):
 
-`Span<u8>` has StrView's layout; these delegate to the `strview_*` function of
-the same name, and `span_as_strview` / `span_from_strview` convert between the two.
+`Span<u8>` has StrView's layout; these delegate to the `StrView` method of
+the same name (`span_eq` calls `.eq`), and `span_as_strview` / `span_from_strview` convert between the two.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -909,7 +1047,6 @@ the compiler emits calls to those symbols.
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `strchr` | `fn(s: *u8, c: u8) -> *u8` | Find first char |
-| `strrchr` | `fn(s: *u8, c: u8) -> *u8` | Find last char |
 | `strstr` | `fn(haystack: *u8, needle: *u8) -> *u8` | Find substring |
 
 **Copy/Concatenate**:
@@ -917,7 +1054,6 @@ the compiler emits calls to those symbols.
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `strcpy` | `fn(dest: *u8, src: *u8) -> *u8` | Copy string |
-| `strncpy` | `fn(dest: *u8, src: *u8, n: i64) -> *u8` | Copy up to n chars |
 | `strcat` | `fn(dest: *u8, src: *u8) -> *u8` | Concatenate |
 
 **Conversion**:
@@ -956,7 +1092,7 @@ the compiler emits calls to those symbols.
 
 The one integer digit routine. Every ritzlib integer formatter (`print_int`,
 `eprint_int`, `print_hex`, `itoa`, `String.push_i64`, `string_from_hex`,
-`iovec_append_int`/`_uint`, `ritzlib.fmt`'s Display) calls it, so all of them
+`IoVecBuilder.append_int`/`append_uint`, `ritzlib.fmt`'s Display) calls it, so all of them
 handle i64's minimum (AGAST #1856). Each writes into a caller buffer, returns
 the byte count, and writes no NUL. It has no imports, so freestanding code can
 use it too. It was `ritzlib.fmt` until AGAST #201 made that name the hosted
@@ -1000,14 +1136,20 @@ is a `format_into` sink: it has `push_bytes`.
 | `string_writer` | `fn(s: @&String) -> Writer` | Appends to `*s` |
 | `span_writer` | `fn(buf: Span<u8>) -> Writer` | Fills `buf`; a write that doesn't fit is -1 and writes nothing |
 | `null_writer` | `fn() -> Writer` | Discards; `w.len` measures |
-| `writer_write` | `fn(w: @&Writer, data: *u8, len: i64) -> i64` | `len` bytes |
-| `writer_write_str` | `fn(w: @&Writer, s: StrView) -> i64` | A view's bytes |
-| `writer_write_byte` | `fn(w: @&Writer, b: u8) -> i64` | One byte |
-| `writer_write_fill` | `fn(w: @&Writer, b: u8, n: i64) -> i64` | `b`, `n` times |
-| `writer_len` | `fn(w: @Writer) -> i64` | Bytes accepted so far |
-| `writer_view` | `fn(w: @Writer) -> StrView` | What a `span_writer` holds |
 | `write` / `writeln` | `fn(w: @&Writer, s: StrView) -> i64` | `s` (and a newline) to `w` |
 | `format` | `fn(s: StrView) -> String` | `s` copied into a new String |
+
+**Methods** (`impl Writer`, AGAST #4445):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `w.write(data, len)` | `fn(data: *u8, len: i64) -> i64` | `len` bytes |
+| `w.write_str(s)` | `fn(s: StrView) -> i64` | A view's bytes |
+| `w.write_byte(b)` | `fn(b: u8) -> i64` | One byte |
+| `w.write_fill(b, n)` | `fn(b: u8, n: i64) -> i64` | `b`, `n` times |
+| `w.push_bytes(data)` | `fn(data: Span<u8>) -> i32` | The `format_into` sink: 0 if every byte was accepted, else -1 |
+| `w.len()` | `fn() -> i64` | Bytes accepted so far |
+| `w.view()` | `fn() -> StrView` | What a `span_writer` holds |
 
 **Display and Debug** (`ritzlib.fmt.display`). `{v}` is Display and `{v:?}`
 is Debug. A user type opts in with an impl; the methods need no `pub`
@@ -1133,13 +1275,16 @@ struct Buffer
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `buf_new` | `fn(s: StrView) -> Buffer` | Cursor at the start of `s` (borrows its bytes) |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `b.from_str(s)` | `fn(s: StrView) -> i32` | Re-point an existing cursor at `s` |
 | `b.init(data)` | `fn(data: Span<u8>) -> i32` | From a `Span<u8>` |
 
 **Position**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `b.pos()` | `fn() -> i64` | Current position |
 | `b.len()` | `fn() -> i64` | Total length |
 | `b.remaining()` | `fn() -> i64` | Remaining bytes |
@@ -1150,40 +1295,40 @@ struct Buffer
 
 **Peek (Don't Advance)**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `b.peek()` | `fn() -> u8` | Peek current byte (0 at end) |
 | `b.peek_at(offset)` | `fn(offset: i64) -> u8` | Peek at offset (0 out of range) |
 | `b.peek_view(n)` | `fn(n: i64) -> StrView` | Up to `n` bytes, as a slice |
 
 **Consume (Advance)**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `b.advance()` | `fn() -> u8` | Read and advance |
 | `b.advance_n(n)` | `fn(n: i64) -> i64` | Advance n bytes (clamped) |
 | `b.skip(n)` | `fn(n: i64) -> i32` | Skip n bytes (clamped) |
 
 **Pattern Matching**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `b.match_char(c)` | `fn(c: u8) -> bool` | Consume `c` if next |
 | `b.match_str(s)` | `fn(s: StrView) -> bool` | Consume `s` if next |
 | `b.starts_with(s)` | `fn(s: StrView) -> bool` | Check prefix (no advance) |
 
 **Skip Utilities**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `b.skip_whitespace()` | `fn() -> i64` | Skip space/tab/CR/LF |
 | `b.skip_until(c)` | `fn(c: u8) -> i64` | Skip until char |
 | `b.skip_while(pred)` | `fn(pred: fn(u8) -> bool) -> i64` | Skip a run matching `pred`; returns the count |
 
 **Zero-Copy Reads** (each returns a slice of the buffer's bytes):
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `b.take_until(c)` | `fn(c: u8) -> StrView` | Up to (not including) `c`, or to the end |
 | `b.take_digits()` | `fn() -> StrView` | Run of `[0-9]` |
 | `b.take_ident()` | `fn() -> StrView` | Run of `[A-Za-z0-9_]` |
@@ -1202,8 +1347,8 @@ struct Buffer
 copy into a caller-sized `out`, NUL-terminate within `max_len` (so `max_len`
 4 yields at most 3 bytes) and silently truncate:
 
-| Function | Signature | Use instead |
-|----------|-----------|-------------|
+| Method | Signature | Use instead |
+|--------|-----------|-------------|
 | `b.peek_n(out)` | `fn(out: Span<u8>) -> i64` | `b.peek_view(n)` |
 | `b.read_until(c, out)` | `fn(c: u8, out: Span<u8>) -> i64` | `b.take_until(c)` |
 | `b.read_while_digit(out)` | `fn(out: Span<u8>) -> i64` | `b.take_digits()` |
@@ -1219,8 +1364,8 @@ struct BufLoc
     offset: i64
 ```
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `b.get_loc(loc)` | `fn(loc: @&BufLoc) -> i32` | Get line/column |
 
 #### GrowBuf (Growable Buffer)
@@ -1244,6 +1389,9 @@ explicit release. To read a whole file descriptor, use `vec_read_all_fd`
 |----------|-----------|-------------|
 | `growbuf_new` | `fn() -> GrowBuf` | Create empty |
 | `growbuf_with_cap` | `fn(cap: i64) -> GrowBuf` | Create with capacity |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
 | `b.free()` | `fn() -> i32` | Free (deprecated, use Drop) |
 | `b.grow(new_cap)` | `fn(new_cap: i64) -> bool` | Grow capacity |
 | `b.ensure_cap(needed)` | `fn(needed: i64) -> bool` | Ensure capacity |
@@ -1559,12 +1707,17 @@ pub enum Errno
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `errno_from_raw` | `fn(code: i32) -> Errno` | The Errno for `code`; either sign, so a raw `-errno` syscall return converts directly |
-| `errno_code` | `fn(e: Errno) -> i32` | The positive number (`NoEnt` -> 2, `Other(n)` -> n) |
-| `errno_name` | `fn(e: Errno) -> StrView` | `"ENOENT"`, ...; `"EUNKNOWN"` for `Other` |
-| `errno_message` | `fn(e: Errno) -> StrView` | strerror(3)'s text (`"No such file or directory"`); `"Unknown error"` for `Other` |
 | `errno_write` | `fn(fd: i32, e: Errno) -> i64` | Write the message to `fd`, no newline; `Other(n)` gives `"Unknown error <n>"` |
 
-`Errno` carries data, so `e as i32` is an error: use `errno_code`.
+**Methods** (`impl Errno`, AGAST #4445):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `e.code()` | `fn() -> i32` | The positive number (`NoEnt` -> 2, `Other(n)` -> n) |
+| `e.name()` | `fn() -> StrView` | `"ENOENT"`, ...; `"EUNKNOWN"` for `Other` |
+| `e.message()` | `fn() -> StrView` | strerror(3)'s text (`"No such file or directory"`); `"Unknown error"` for `Other` |
+
+`Errno` carries data, so `e as i32` is an error: use `e.code()`.
 
 ```ritz
 import ritzlib.fs
@@ -1655,14 +1808,19 @@ fn size_or_minus_one(path: StrView) -> i64
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `dir_open` | `fn(path: StrView) -> Result<DirIter, Errno>` | Open a directory (`Err(NoEnt)`, `Err(NotDir)`, ...) |
-| `dir_next` | `fn(dir: *DirIter) -> bool` | Advance; true if an entry is available, false at the end |
-| `dir_close` | `fn(dir: *DirIter)` | Close the iterator |
-| `dir_entry` | `fn(dir: @DirIter) -> DirEntry` | Current entry after `dir_next` returns true |
-| `dir_next_entry` | `fn(dir: @&DirIter) -> Option<DirEntry>` | Advance and return the next entry, `None` at the end |
-| `dir_entry_type` | `fn(dir: *DirIter) -> Option<u8>` | Type of the current entry (`DT_REG`, `DT_DIR`, ...), `None` if there is none |
-| `dir_entry_is_dir` | `fn(dir: *DirIter) -> bool` | Is the current entry a directory? |
-| `dir_entry_is_file` | `fn(dir: *DirIter) -> bool` | Is the current entry a regular file? |
-| `dir_entry_is_link` | `fn(dir: *DirIter) -> bool` | Is the current entry a symlink? |
+
+**Methods** (`impl DirIter`, AGAST #4445):
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `d.next()` | `fn() -> bool` | Advance; true if an entry is available, false at the end |
+| `d.close()` | `fn()` | Close the iterator |
+| `d.entry()` | `fn() -> DirEntry` | Current entry after `d.next()` returns true |
+| `d.next_entry()` | `fn() -> Option<DirEntry>` | Advance and return the next entry, `None` at the end |
+| `d.entry_type()` | `fn() -> Option<u8>` | Type of the current entry (`DT_REG`, `DT_DIR`, ...), `None` if there is none |
+| `d.entry_is_dir()` | `fn() -> bool` | Is the current entry a directory? |
+| `d.entry_is_file()` | `fn() -> bool` | Is the current entry a regular file? |
+| `d.entry_is_link()` | `fn() -> bool` | Is the current entry a symlink? |
 
 ```ritz
 import ritzlib.sys
@@ -1684,7 +1842,7 @@ fn count_files(path: StrView) -> i64
 ```
 
 `DirEntry.name` points into the iterator's buffer and doesn't include the NUL.
-It is valid until the next `dir_next`/`dir_next_entry` or `dir_close` call.
+It is valid until the next `d.next()`/`d.next_entry()` or `d.close()` call.
 
 **The raw `linux_dirent64` record** (what `DirIter` decodes):
 
@@ -1762,33 +1920,38 @@ struct IoVecBuilder
     pool_used: i32
 ```
 
+The builder's operations are methods (`impl IoVecBuilder`, AGAST #4445).
+Every append returns `Result<i32, IovecError>`, written `R` below;
+`IovecError` is `TooManyVecs` or `PoolFull`.
+
 **Builder Operations**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `iovec_builder_init` | `fn(b: *IoVecBuilder)` | Initialize builder |
-| `iovec_builder_reset` | `fn(b: *IoVecBuilder)` | Reset for reuse |
-| `iovec_ptr` | `fn(b: *IoVecBuilder) -> *Iovec` | Get iovec array |
-| `iovec_count` | `fn(b: *IoVecBuilder) -> i32` | Get count |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `b.init()` | `fn()` | Initialize builder |
+| `b.reset()` | `fn()` | Reset for reuse |
+| `b.ptr()` | `fn() -> *Iovec` | Get iovec array |
+| `b.count()` | `fn() -> i32` | Get count |
 
 **Append Operations**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `iovec_append_span` | `fn(b: *IoVecBuilder, s: Span<u8>) -> i32` | Append span (zero-copy) |
-| `iovec_append_static` | `fn(b: *IoVecBuilder, s: *u8) -> i32` | Append C string |
-| `iovec_append_bytes` | `fn(b: *IoVecBuilder, data: *u8, len: i32) -> i32` | Append bytes |
-| `iovec_append_copy` | `fn(b: *IoVecBuilder, s: *u8) -> i32` | Append (copy to pool) |
-| `iovec_append_int` | `fn(b: *IoVecBuilder, n: i64) -> i32` | Append integer |
-| `iovec_append_uint` | `fn(b: *IoVecBuilder, n: u64) -> i32` | Append unsigned int |
-| `iovec_append_crlf` | `fn(b: *IoVecBuilder) -> i32` | Append CRLF |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `b.append_span(s)` | `fn(s: Span<u8>) -> R` | Append span (zero-copy) |
+| `b.append_static(s)` | `fn(s: StrView) -> R` | Append a view's bytes (zero-copy) |
+| `b.append_bytes(data)` | `fn(data: Span<u8>) -> R` | Append bytes (zero-copy) |
+| `b.append_str(s)` | `fn(s: Span<u8>) -> R` | Append a slice (zero-copy) |
+| `b.append_copy(s)` | `fn(s: StrView) -> R` | Append (copy to pool) |
+| `b.append_int(n)` | `fn(n: i64) -> R` | Append integer |
+| `b.append_uint(n)` | `fn(n: u64) -> R` | Append unsigned int |
+| `b.append_crlf()` | `fn() -> R` | Append CRLF |
 
 **Utilities**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `iovec_total_len` | `fn(b: *IoVecBuilder) -> i64` | Total bytes |
-| `iovec_debug_print` | `fn(b: *IoVecBuilder)` | Debug output |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `b.total_len()` | `fn() -> i64` | Total bytes |
+| `b.debug_print()` | `fn()` | Debug output |
 
 ---
 
@@ -1872,37 +2035,42 @@ struct EpollEvent
 | `socket_tcp` | `fn() -> Result<Socket, Errno>` | A TCP socket, or `Err(errno)` from socket(2) (e.g. `Other(24)`, EMFILE) |
 | `socket_tcp_nonblock` | `fn() -> Result<Socket, Errno>` | A non-blocking TCP socket, or `Err(errno)` |
 | `socket_udp` | `fn() -> Result<Socket, Errno>` | A UDP socket, or `Err(errno)` |
-| `socket_valid` | `fn(sock: @Socket) -> bool` | Holds an open fd (false once closed) |
-| `socket_close` | `fn(sock: @&Socket) -> Result<(), Errno>` | Close and set `fd = -1`; `Ok(())` if already closed, else `Err(errno)` from close(2) |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.valid()` | `fn() -> bool` | Holds an open fd (false once closed) |
+| `s.close()` | `fn() -> Result<(), Errno>` | Close and set `fd = -1`; `Ok(())` if already closed, else `Err(errno)` from close(2) |
 
 **Socket Options**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `socket_set_opt_int` | `fn(sock: @&Socket, level: i32, optname: i32, value: i32) -> Result<(), Errno>` | setsockopt with an int; `Err(errno)` |
-| `socket_set_reuseaddr` | `fn(sock: @&Socket) -> Result<(), Errno>` | Enable SO_REUSEADDR |
-| `socket_set_reuseport` | `fn(sock: @&Socket) -> Result<(), Errno>` | Enable SO_REUSEPORT |
-| `socket_set_nodelay` | `fn(sock: @&Socket) -> Result<(), Errno>` | Disable Nagle |
-| `socket_set_io_timeout` | `fn(sock: @&Socket, timeout_ms: i32) -> Result<(), Errno>` | SO_RCVTIMEO + SO_SNDTIMEO; 0 clears |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.set_opt_int(level, optname, value)` | `fn(level: i32, optname: i32, value: i32) -> Result<(), Errno>` | setsockopt with an int; `Err(errno)` |
+| `s.set_reuseaddr()` | `fn() -> Result<(), Errno>` | Enable SO_REUSEADDR |
+| `s.set_reuseport()` | `fn() -> Result<(), Errno>` | Enable SO_REUSEPORT |
+| `s.set_nodelay()` | `fn() -> Result<(), Errno>` | Disable Nagle |
+| `s.set_io_timeout(timeout_ms)` | `fn(timeout_ms: i32) -> Result<(), Errno>` | SO_RCVTIMEO + SO_SNDTIMEO; 0 clears |
 
 **Server Operations**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `socket_bind` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>` | Bind; `Err(Inval)` for a bad address, else `Err(errno)` |
-| `socket_listen` | `fn(sock: @&Socket, backlog: i32) -> Result<(), Errno>` | Start listening; `Err(errno)` |
-| `socket_accept` | `fn(sock: @&Socket) -> Result<Socket, Errno>` | Accept (blocking); `Err(errno)`, e.g. `Inval` if not listening |
-| `socket_accept_nonblock` | `fn(sock: @&Socket) -> Result<Socket, Errno>` | Accept without blocking (peer is non-blocking too); `Err(Again)` if none pending |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.bind(addr, port)` | `fn(addr: StrView, port: i32) -> Result<(), Errno>` | Bind; `Err(Inval)` for a bad address, else `Err(errno)` |
+| `s.listen(backlog)` | `fn(backlog: i32) -> Result<(), Errno>` | Start listening; `Err(errno)` |
+| `s.accept()` | `fn() -> Result<Socket, Errno>` | Accept (blocking); `Err(errno)`, e.g. `Inval` if not listening |
+| `s.accept_nonblock()` | `fn() -> Result<Socket, Errno>` | Accept without blocking (peer is non-blocking too); `Err(Again)` if none pending |
 
 **Client Operations**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `socket_connect` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>` | Connect; `Err(Inval)` for a bad address, else `Err(errno)` |
-| `socket_connect_timeout` | `fn(sock: @&Socket, addr: StrView, port: i32, timeout_ms: i32) -> Result<(), Errno>` | Connect within `timeout_ms`; `Err(Inval)` bad address, `Err(TimedOut)`, else `Err(errno)` |
-| `socket_send_all` | `fn(sock: @&Socket, data: Span<u8>) -> Result<i64, Errno>` | Send every byte (retries short writes and EINTR) |
-| `socket_send_str` | `fn(sock: @&Socket, s: StrView) -> Result<i64, Errno>` | `socket_send_all` for text |
-| `socket_recv_into` | `fn(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, Errno>` | Append up to `max` bytes; `Ok(0)` at EOF |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.connect(addr, port)` | `fn(addr: StrView, port: i32) -> Result<(), Errno>` | Connect; `Err(Inval)` for a bad address, else `Err(errno)` |
+| `s.connect_timeout(addr, port, timeout_ms)` | `fn(addr: StrView, port: i32, timeout_ms: i32) -> Result<(), Errno>` | Connect within `timeout_ms`; `Err(Inval)` bad address, `Err(TimedOut)`, else `Err(errno)` |
+| `s.send_all(data)` | `fn(data: Span<u8>) -> Result<i64, Errno>` | Send every byte (retries short writes and EINTR) |
+| `s.send_str(s)` | `fn(s: StrView) -> Result<i64, Errno>` | `s.send_all` for text |
+| `s.recv_into(buf, max)` | `fn(buf: @&Vec<u8>, max: i64) -> Result<i64, Errno>` | Append up to `max` bytes; `Ok(0)` at EOF |
+| `s.send(data)` | `fn(data: Span<u8>) -> Result<i64, Errno>` | Alias for `s.send_all(data)` |
+| `s.recv(buf, max)` | `fn(buf: @&Vec<u8>, max: i64) -> Result<i64, Errno>` | Alias for `s.recv_into(buf, max)` |
 
 **Epoll Operations**:
 
@@ -1994,34 +2162,37 @@ is waiting, so a read at EOF returns `Some(0)` rather than being resubmitted
 `Some(v)` when Ready, so an -EPERM result it was handed is `Some(-1)`, never
 read as Pending (AGAST #4558).
 
-`spawn`/`run_spawned` queue several held futures on one runtime (LARB R79).
+`rt.spawn`/`rt.run_spawned` queue several held futures on one runtime (LARB R79).
 Each queued task has its own waker slot (`SpawnTask`): while a task's poll
 runs, `current_task` names it, so `runtime_poll_*` records the operation's
 `user_data` and result in that task rather than the runtime's single waker.
-With `current_task` at -1 — `block_on` and the legacy poll-fn drivers — the
-single waker behaves exactly as before. `run_spawned` fails loudly (exit 101),
-as `block_on` does, when a poll reports Pending without suspending on the ring
+With `current_task` at -1 — `rt.block_on` and the legacy poll-fn drivers — the
+single waker behaves exactly as before. `rt.run_spawned` fails loudly (exit 101),
+as `rt.block_on` does, when a poll reports Pending without suspending on the ring
 (LARB R78).
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `runtime_init` | `fn(rt: *Runtime) -> i32` | Initialize runtime |
-| `runtime_destroy` | `fn(rt: *Runtime)` | Destroy runtime |
-| `runtime_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> Result<i64, Errno>` | Read, waiting for the result |
-| `runtime_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> Result<i64, Errno>` | Write, waiting for the result |
-| `runtime_close` | `fn(rt: *Runtime, fd: i32) -> Result<(), Errno>` | Close, waiting for the result |
-| `block_on` | `fn(rt: *Runtime, f: @&Future)` | Poll a future to completion; read the result with `await p` (LARB R79) |
-| `spawn` | `fn(rt: *Runtime, f: @&Future)` | Queue a held future for `run_spawned`; the caller keeps it alive until the drain returns |
-| `run_spawned` | `fn(rt: *Runtime) -> i32` | Poll every spawned future until finished, waiting on the ring; 0 once the queue is drained |
-| `runtime_poll_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a read and return Pending, then return its result |
-| `runtime_poll_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a write and return Pending, then return its result |
-| `runtime_wait_for_io` | `fn(rt: *Runtime) -> i32` | Wait for a completion and record it for the waker |
-| `runtime_waker_register` | `fn(rt: *Runtime, user_data: i64)` | Suspend on an operation submitted by hand |
-| `runtime_waker_clear` | `fn(rt: *Runtime)` | Stop waiting for that operation |
 | `get_runtime` | `fn() -> *Runtime` | Get global runtime |
 | `cleanup_runtime` | `fn()` | Cleanup global runtime |
 
-`runtime_poll_*` uses the waker's ready flag, not its result value, so a read at
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `rt.init()` | `fn() -> i32` | Initialize runtime |
+| `rt.destroy()` | `fn()` | Destroy runtime |
+| `rt.read(fd, buf_sv, offset)` | `fn(fd: i32, buf_sv: Span<u8>, offset: i64) -> Result<i64, Errno>` | Read, waiting for the result |
+| `rt.write(fd, buf_sv, offset)` | `fn(fd: i32, buf_sv: Span<u8>, offset: i64) -> Result<i64, Errno>` | Write, waiting for the result |
+| `rt.close(fd)` | `fn(fd: i32) -> Result<(), Errno>` | Close, waiting for the result |
+| `rt.block_on(f)` | `fn(f: @&Future)` | Poll a future to completion; read the result with `await p` (LARB R79) |
+| `rt.spawn(f)` | `fn(f: @&Future)` | Queue a held future for `rt.run_spawned()`; the caller keeps it alive until the drain returns |
+| `rt.run_spawned()` | `fn() -> i32` | Poll every spawned future until finished, waiting on the ring; 0 once the queue is drained |
+| `rt.poll_read(fd, buf_sv, offset)` | `fn(fd: i32, buf_sv: Span<u8>, offset: i64) -> Option<i32>` | Inside a poll function: submit a read; `None` while it is in flight, then `Some(result)` |
+| `rt.poll_write(fd, buf_sv, offset)` | `fn(fd: i32, buf_sv: Span<u8>, offset: i64) -> Option<i32>` | Inside a poll function: submit a write; `None` while it is in flight, then `Some(result)` |
+| `rt.wait_for_io()` | `fn() -> i32` | Wait for a completion and record it for the waker |
+| `rt.waker_register(user_data)` | `fn(user_data: i64)` | Suspend on an operation submitted by hand |
+| `rt.waker_clear()` | `fn()` | Stop waiting for that operation |
+
+`rt.poll_read` / `rt.poll_write` use the waker's ready flag, not its result value, so a read at
 EOF (0) or a -EPERM completion (-1) is returned as a result rather than
 resubmitted (AGAST #2328, #4485).
 
@@ -2081,37 +2252,62 @@ struct TaskServer
 
 **Task Pool Operations**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `task_pool_init` | `fn(pool: *TaskPool, ring: *IoUring)` | Initialize pool |
-| `spawn_task` | `fn(pool: *TaskPool, fd: i32, handler: fn(*Task) -> i32) -> i32` | Spawn task |
-| `task_complete` | `fn(pool: *TaskPool, task: *Task)` | Complete task |
-| `run_tasks` | `fn(pool: *TaskPool) -> i32` | Run all tasks |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `pool.init(ring)` | `fn(ring: @&IoUring)` | Initialize pool |
+| `pool.spawn(fd, handler)` | `fn(fd: i32, handler: fn(*Task) -> i32) -> bool` | Spawn task |
+| `pool.complete(task)` | `fn(task: @&Task)` | Complete task |
+| `pool.run()` | `fn() -> i32` | Run all tasks |
+| `pool.alloc()` | `fn() -> Option<*Task>` | A free task slot, or `None` if the pool is full |
+| `pool.find(task_id)` | `fn(task_id: i64) -> Option<*Task>` | A live task by its ID (`user_data`), or `None` |
+| `pool.submit_recv(task)` | `fn(task: @&Task) -> bool` | Queue a recv into `task.read_buf`; false if no SQE was free |
+| `pool.submit_send(task, len)` | `fn(task: @&Task, len: i32) -> bool` | Queue a send of `len` bytes of `task.write_buf` |
+| `pool.submit_timeout(task, ts)` | `fn(task: @&Task, ts: @&KernelTimespec) -> bool` | Queue a relative timeout that wakes `task` (`io_result` is the kernel's code, e.g. -ETIME) |
+| `pool.submit_nop(task)` | `fn(task: @&Task) -> bool` | Queue a NOP that wakes `task` on the next batch (a cooperative yield) |
+| `pool.submit_send_buf(task, buf_sv)` | `fn(task: @&Task, buf_sv: Span<u8>) -> bool` | Send from an external buffer, valid until the CQE; short sends are the caller's to resume |
+| `pool.submit_recv_buf(task, buf_sv)` | `fn(task: @&Task, buf_sv: Span<u8>) -> bool` | Recv into an external buffer, valid until the CQE |
+| `pool.submit_sendv(task, iov)` | `fn(task: @&Task, iov: Span<Iovec>) -> bool` | Queue a vectored send |
+| `pool.submit_send_zc(task, len)` | `fn(task: @&Task, len: i32) -> bool` | Zero-copy send from `task.write_buf`, valid until completion |
+| `pool.submit_send_zc_buf(task, buf_sv)` | `fn(task: @&Task, buf_sv: Span<u8>) -> bool` | Zero-copy send from an external buffer, valid until the CQE |
+| `pool.submit_splice(task, fd_out, fd_in, off_in, len, splice_flags)` | `fn(task: @&Task, fd_out: i32, fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> bool` | Splice `len` bytes from `fd_in` (offset `off_in`, -1 for the file position) to `fd_out` |
 
 **Task I/O Operations**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `task_recv` | `fn(task: *Task) -> bool` | Submit recv |
-| `task_send` | `fn(task: *Task, len: i32) -> bool` | Submit send |
-| `task_sendv` | `fn(task: *Task, iov: *u8, iovcnt: i32) -> bool` | Submit writev |
-| `task_sendv_builder` | `fn(task: *Task) -> bool` | Send from IoVecBuilder |
-| `task_send_zc` | `fn(task: *Task, len: i32) -> bool` | Zero-copy send |
-| `task_splice` | `fn(task: *Task, fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> i32` | Splice |
-| `task_reset_for_recv` | `fn(task: *Task) -> i32` | Reset for keep-alive |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `t.recv()` | `fn() -> bool` | Submit recv |
+| `t.send(len)` | `fn(len: i32) -> bool` | Submit send |
+| `t.sendv(iov)` | `fn(iov: Span<Iovec>) -> bool` | Submit writev |
+| `t.sendv_builder()` | `fn() -> bool` | Send from IoVecBuilder |
+| `t.send_zc(len)` | `fn(len: i32) -> bool` | Zero-copy send |
+| `t.splice(fd_in, off_in, len, splice_flags)` | `fn(fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> bool` | Splice |
+| `t.reset_for_recv()` | `fn() -> bool` | Reset for keep-alive |
+| `t.timeout(ts)` | `fn(ts: @&KernelTimespec) -> bool` | `pool.submit_timeout` for this task |
+| `t.yield()` | `fn() -> bool` | `pool.submit_nop` for this task |
+| `t.send_buf(buf)` | `fn(buf: Span<u8>) -> bool` | `pool.submit_send_buf` for this task |
+| `t.recv_buf(buf)` | `fn(buf: Span<u8>) -> bool` | `pool.submit_recv_buf` for this task |
+| `t.send_zc_buf(buf)` | `fn(buf: Span<u8>) -> bool` | `pool.submit_send_zc_buf` for this task |
 
 **Server Operations**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `task_server_init` | `fn(srv: *TaskServer, listen_fd: i32) -> i32` | Initialize server |
-| `task_server_destroy` | `fn(srv: *TaskServer)` | Destroy server |
-| `task_server_run` | `fn(srv: *TaskServer, handler: fn(*Task) -> i32) -> i32` | Run server |
-| `task_server_run_multishot` | `fn(srv: *TaskServer, handler: fn(*Task) -> i32) -> i32` | Run with multishot accept |
-| `task_server_stop` | `fn(srv: *TaskServer)` | Stop server |
-| `task_server_set_shutdown_hook` | `fn(srv: *TaskServer, hook: fn() -> i32)` | Set shutdown hook |
-| `task_server_set_idle_timeout` | `fn(srv: *TaskServer, timeout_secs: i32)` | Set idle timeout |
-| `task_server_set_max_connections` | `fn(srv: *TaskServer, max_conns: i32)` | Set max connections |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `srv.init(listen_fd)` | `fn(listen_fd: i32) -> i32` | Initialize server |
+| `srv.destroy()` | `fn()` | Destroy server |
+| `srv.run(handler)` | `fn(handler: fn(*Task) -> i32) -> i32` | Run server |
+| `srv.run_multishot(handler)` | `fn(handler: fn(*Task) -> i32) -> i32` | Run with multishot accept |
+| `srv.stop()` | `fn()` | Stop server |
+| `srv.set_shutdown_hook(hook)` | `fn(hook: fn() -> i32)` | Set shutdown hook |
+| `srv.set_idle_timeout(timeout_secs)` | `fn(timeout_secs: i32)` | Set idle timeout |
+| `srv.set_max_connections(max_conns)` | `fn(max_conns: i32)` | Set max connections |
+| `srv.free()` | `fn()` | Free a heap-allocated TaskServer |
+| `srv.submit_accept()` | `fn() -> bool` | Queue an accept |
+| `srv.submit_accept_multishot()` | `fn() -> bool` | Queue one multishot accept (5.19+) that yields a CQE per connection |
+| `srv.submit_idle_timeout()` | `fn() -> i32` | Queue the periodic idle-check timeout (currently disabled: EINVAL on some kernels) |
+| `srv.poll_tasks()` | `fn()` | Run the handler of every READY task |
+| `srv.handle_accept(client_fd, handler)` | `fn(client_fd: i32, handler: fn(*Task) -> i32)` | Start a task for a new connection |
+| `srv.wake_task(task_id, result)` | `fn(task_id: i64, result: i32)` | Wake a task with an I/O result |
+| `srv.check_idle()` | `fn() -> i32` | Close idle connections; returns how many |
 
 ---
 
@@ -2182,34 +2378,42 @@ struct IoUring
 
 **Ring Operations**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `uring_init` | `fn(ring: *IoUring, entries: i32) -> i32` | Initialize ring |
-| `uring_destroy` | `fn(ring: *IoUring)` | Destroy ring |
-| `uring_get_sqe` | `fn(ring: *IoUring) -> Option<*IoUringSqe>` | Get SQE (None when the ring is full) |
-| `uring_sqe_submit` | `fn(ring: *IoUring)` | Advance SQ tail |
-| `uring_submit` | `fn(ring: *IoUring) -> i32` | Submit pending SQEs |
-| `uring_submit_and_wait` | `fn(ring: *IoUring, min_complete: i32) -> i32` | Submit and wait |
-| `uring_peek_cqe` | `fn(ring: *IoUring) -> Option<*IoUringCqe>` | Peek CQE (None when none is ready) |
-| `uring_wait_cqe` | `fn(ring: *IoUring) -> Option<*IoUringCqe>` | Wait for CQE |
-| `uring_cqe_seen` | `fn(ring: *IoUring, cqe: @IoUringCqe)` | Mark CQE consumed |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `ring.init(entries)` | `fn(entries: i32) -> i32` | Initialize ring |
+| `ring.destroy()` | `fn()` | Destroy ring |
+| `ring.get_sqe()` | `fn() -> Option<*IoUringSqe>` | Get SQE (None when the ring is full) |
+| `ring.sqe_submit()` | `fn()` | Advance SQ tail |
+| `ring.submit()` | `fn() -> i32` | Submit pending SQEs |
+| `ring.submit_and_wait(min_complete)` | `fn(min_complete: i32) -> i32` | Submit and wait |
+| `ring.peek_cqe()` | `fn() -> Option<*IoUringCqe>` | Peek CQE (None when none is ready) |
+| `ring.wait_cqe()` | `fn() -> Option<*IoUringCqe>` | Wait for CQE |
+| `ring.cqe_seen(cqe)` | `fn(cqe: @IoUringCqe)` | Mark CQE consumed |
+| `ring.cleanup()` | `fn()` | Alias for `ring.destroy()` |
 
 **SQE Preparation**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `uring_prep_read` | `fn(sqe: *IoUringSqe, fd: i32, buf: *u8, len: i32, offset: i64, user_data: i64)` | Prepare read |
-| `uring_prep_write` | `fn(sqe: *IoUringSqe, fd: i32, buf: *u8, len: i32, offset: i64, user_data: i64)` | Prepare write |
-| `uring_prep_accept` | `fn(sqe: *IoUringSqe, fd: i32, addr: *u8, addrlen: *i32, flags: i32, user_data: i64)` | Prepare accept |
-| `uring_prep_accept_multishot` | `fn(sqe: *IoUringSqe, fd: i32, addr: *u8, addrlen: *i32, flags: i32, user_data: i64)` | Multishot accept (5.19+) |
-| `uring_prep_close` | `fn(sqe: *IoUringSqe, fd: i32, user_data: i64)` | Prepare close |
-| `uring_prep_recv` | `fn(sqe: *IoUringSqe, fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | Prepare recv |
-| `uring_prep_send` | `fn(sqe: *IoUringSqe, fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | Prepare send |
-| `uring_prep_send_zc` | `fn(sqe: *IoUringSqe, fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | Zero-copy send (6.0+) |
-| `uring_prep_readv` | `fn(sqe: *IoUringSqe, fd: i32, iov: *u8, nr_vecs: i32, offset: i64, user_data: i64)` | Vectored read |
-| `uring_prep_writev` | `fn(sqe: *IoUringSqe, fd: i32, iov: *u8, nr_vecs: i32, offset: i64, user_data: i64)` | Vectored write |
-| `uring_prep_splice` | `fn(sqe: *IoUringSqe, fd_out: i32, off_out: i64, fd_in: i32, off_in: i64, len: u32, splice_flags: i32, user_data: i64)` | Splice |
-| `uring_prep_timeout` | `fn(sqe: *IoUringSqe, ts: *KernelTimespec, count: u32, flags: u32, user_data: i64)` | Timeout |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `sqe.prep_read(fd, buf, len, offset, user_data)` | `fn(fd: i32, buf: *u8, len: i32, offset: i64, user_data: i64)` | Prepare read |
+| `sqe.prep_write(fd, buf, len, offset, user_data)` | `fn(fd: i32, buf: *u8, len: i32, offset: i64, user_data: i64)` | Prepare write |
+| `sqe.prep_accept(fd, addr, addrlen, flags, user_data)` | `fn(fd: i32, addr: *u8, addrlen: *i32, flags: i32, user_data: i64)` | Prepare accept |
+| `sqe.prep_accept_multishot(fd, addr, addrlen, flags, user_data)` | `fn(fd: i32, addr: *u8, addrlen: *i32, flags: i32, user_data: i64)` | Multishot accept (5.19+) |
+| `sqe.prep_close(fd, user_data)` | `fn(fd: i32, user_data: i64)` | Prepare close |
+| `sqe.prep_recv(fd, buf, len, flags, user_data)` | `fn(fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | Prepare recv |
+| `sqe.prep_send(fd, buf, len, flags, user_data)` | `fn(fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | Prepare send |
+| `sqe.prep_send_zc(fd, buf, len, flags, user_data)` | `fn(fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | Zero-copy send (6.0+) |
+| `sqe.prep_readv(fd, iov, nr_vecs, offset, user_data)` | `fn(fd: i32, iov: *u8, nr_vecs: i32, offset: i64, user_data: i64)` | Vectored read |
+| `sqe.prep_writev(fd, iov, nr_vecs, offset, user_data)` | `fn(fd: i32, iov: *u8, nr_vecs: i32, offset: i64, user_data: i64)` | Vectored write |
+| `sqe.prep_splice(fd_out, off_out, fd_in, off_in, len, splice_flags, user_data)` | `fn(fd_out: i32, off_out: i64, fd_in: i32, off_in: i64, len: u32, splice_flags: i32, user_data: i64)` | Splice |
+| `sqe.prep_timeout(ts, count, flags, user_data)` | `fn(ts: *KernelTimespec, count: u32, flags: u32, user_data: i64)` | Timeout |
+| `sqe.prep_connect(fd, addr, addrlen, user_data)` | `fn(fd: i32, addr: *u8, addrlen: i32, user_data: i64)` | Prepare connect |
+| `sqe.prep_nop(user_data)` | `fn(user_data: i64)` | An immediate CQE with no work (a cooperative yield) |
+| `sqe.prep_send_zc_report(fd, buf, len, flags, user_data)` | `fn(fd: i32, buf: *u8, len: u64, flags: i32, user_data: i64)` | `prep_send_zc` that asks the kernel to report whether zero-copy was used |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `cqe.get_data64()` | `fn() -> i64` | The CQE's `user_data` |
 
 **Safety Note**: Zero-copy operations (`IORING_OP_SEND_ZC`) require the buffer to remain valid until the CQE is received.
 
@@ -2222,7 +2426,7 @@ struct IoUring
 **Module**: `ritzlib.process`
 
 Subprocess spawning with connected pipes. Every fn on a live `Process` takes
-`@&Process` (they close fds and record the wait); `process_valid` only reads
+`@&Process` (they close fds and record the wait); `p.valid()` only reads
 it (AGAST #3750). Every fallible fn returns `Result<T, Errno>` (`ritzlib.errno`,
 which `ritzlib.process` re-exports), never `-1` or a negative errno (#4298).
 
@@ -2246,34 +2450,38 @@ struct ProcessResult
 |----------|-----------|-------------|
 | `spawn` | `fn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>` | Spawn `cmd` (found by `find_command`) with `args` as argv[1..]; argv[0] is `cmd` as given. `Err` is an `Errno`: `NoEnt` not found, `Acces` not executable, `NoMem`, or a pipe/fork failure |
 | `spawn_env` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>) -> Result<Process, Errno>` | `spawn`, but the child's environment is exactly `env` (`"KEY=VALUE"` views, nothing of ours merged in; an empty span is empty). `spawn` inherits ours |
-| `process_valid` | `fn(p: @Process) -> i32` | 1 if the spawn gave a live pid |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `p.valid()` | `fn() -> bool` | Whether the spawn gave a live pid |
 
 **I/O Operations**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `process_write_all` | `fn(p: @&Process, data: StrView) -> Result<i64, Errno>` | Write all of `data` to stdin (retries short writes and EINTR); `Ok(data.len)`, `Err(BadF)` once stdin is closed, `Err(Pipe)` once the child closed it |
-| `process_close_stdin` | `fn(p: @&Process)` | Close stdin (EOF) |
-| `process_read_stdout` | `fn(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>` | Read up to `max` bytes of stdout: `Ok(n)`, `Ok(0)` at EOF, `Err(BadF)` once the pipe is closed |
-| `process_read_stdout_all` | `fn(p: @&Process) -> Vec<u8>` | Read all stdout |
-| `process_read_line` | `fn(p: @&Process) -> Vec<u8>` | Read line |
-| `process_read_stderr` | `fn(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>` | `process_read_stdout` for stderr |
-| `process_read_stderr_all` | `fn(p: @&Process) -> Vec<u8>` | Read all stderr |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `p.write_all(data)` | `fn(data: StrView) -> Result<i64, Errno>` | Write all of `data` to stdin (retries short writes and EINTR); `Ok(data.len)`, `Err(BadF)` once stdin is closed, `Err(Pipe)` once the child closed it |
+| `p.close_stdin()` | `fn()` | Close stdin (EOF) |
+| `p.read_stdout(buf)` | `fn(buf: Span<u8>) -> Result<i64, Errno>` | Read up to `buf.len` bytes of stdout into `buf`: `Ok(n)`, `Ok(0)` at EOF, `Err(BadF)` once the pipe is closed |
+| `p.read_stdout_all()` | `fn() -> Vec<u8>` | Read all stdout |
+| `p.read_line()` | `fn() -> Vec<u8>` | Read line |
+| `p.read_stderr(buf)` | `fn(buf: Span<u8>) -> Result<i64, Errno>` | `p.read_stdout` for stderr |
+| `p.read_stderr_all()` | `fn() -> Vec<u8>` | Read all stderr |
 
 **Lifecycle**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `process_wait` | `fn(p: @&Process) -> Result<ProcessResult, Errno>` | Close stdin and block until exit; `Err(Child)` if nothing is left to wait for (already waited), else `Err` from wait4 |
-| `process_kill` | `fn(p: @&Process)` | Kill process |
-| `process_close_pipes` | `fn(p: @&Process)` | Close all pipes |
-| `process_cleanup` | `fn(p: @&Process)` | Full cleanup |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `p.wait()` | `fn() -> Result<ProcessResult, Errno>` | Close stdin and block until exit; `Err(Child)` if nothing is left to wait for (already waited), else `Err` from wait4 |
+| `p.try_wait()` | `fn() -> Option<ProcessResult>` | The result if the child has exited (reaping it), else `None`; never blocks |
+| `p.kill()` | `fn()` | Kill process |
+| `p.close_pipes()` | `fn()` | Close all pipes |
+| `p.cleanup()` | `fn()` | Full cleanup |
 
 **Result Helpers**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `result_success` | `fn(r: @ProcessResult) -> bool` | Exited normally with code 0? The code itself is `r.exit_code` |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `r.success()` | `fn() -> bool` | Exited normally with code 0? The code itself is `r.exit_code` |
 
 **PATH Search**:
 
@@ -2467,28 +2675,29 @@ struct Stopwatch
 
 **Timer**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `timer_init` | `fn(t: *Timer) -> i32` | Initialize |
-| `timer_start` | `fn(t: *Timer) -> i32` | Start timer |
-| `timer_stop` | `fn(t: *Timer) -> i32` | Stop timer |
-| `timer_elapsed_nanos` | `fn(t: *Timer) -> i64` | Get elapsed ns |
-| `timer_elapsed_micros` | `fn(t: *Timer) -> i64` | Get elapsed us |
-| `timer_elapsed_millis` | `fn(t: *Timer) -> i64` | Get elapsed ms |
-| `timer_print` | `fn(t: *Timer) -> i32` | Print human-readable |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `t.init()` | `fn() -> i32` | Initialize |
+| `t.start()` | `fn() -> i32` | Start timer |
+| `t.stop()` | `fn() -> i32` | Stop timer |
+| `t.elapsed_nanos()` | `fn() -> i64` | Get elapsed ns |
+| `t.elapsed_micros()` | `fn() -> i64` | Get elapsed us |
+| `t.elapsed_millis()` | `fn() -> i64` | Get elapsed ms |
+| `t.elapsed_secs_x1000()` | `fn() -> i64` | Named for seconds x1000, but returns the same value as `elapsed_micros()` (AGAST #4613) |
+| `t.print()` | `fn() -> i32` | Print human-readable |
 
 **Stopwatch** (cumulative timing):
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `stopwatch_init` | `fn(sw: *Stopwatch) -> i32` | Initialize |
-| `stopwatch_start` | `fn(sw: *Stopwatch) -> bool` | Start (false if already running) |
-| `stopwatch_stop` | `fn(sw: *Stopwatch) -> bool` | Stop (false if not running) |
-| `stopwatch_reset` | `fn(sw: *Stopwatch) -> i32` | Reset |
-| `stopwatch_total_nanos` | `fn(sw: *Stopwatch) -> i64` | Total ns |
-| `stopwatch_avg_nanos` | `fn(sw: *Stopwatch) -> i64` | Average ns |
-| `stopwatch_count` | `fn(sw: *Stopwatch) -> i64` | Number of samples |
-| `stopwatch_print` | `fn(sw: *Stopwatch) -> i32` | Print stats |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `sw.init()` | `fn() -> i32` | Initialize |
+| `sw.start()` | `fn() -> bool` | Start (false if already running) |
+| `sw.stop()` | `fn() -> bool` | Stop (false if not running) |
+| `sw.reset()` | `fn() -> i32` | Reset |
+| `sw.total_nanos()` | `fn() -> i64` | Total ns |
+| `sw.avg_nanos()` | `fn() -> i64` | Average ns |
+| `sw.count()` | `fn() -> i64` | Number of samples |
+| `sw.print()` | `fn() -> i32` | Print stats |
 
 ---
 
@@ -2523,14 +2732,17 @@ struct JsonError
 |----------|-----------|-------------|
 | `json_parse` | `fn(input: StrView) -> Result<*JsonValue, JsonError>` | Parse the first JSON value in `input` |
 | `json_parse2` | `fn(input: *u8, len: i64) -> Result<*JsonValue, JsonError>` | Deprecated wrapper: `json_parse(strview_from_ptr(input, len))` |
-| `json_free` | `fn(v: *JsonValue)` | Free JSON tree |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `v.free()` | `fn()` | Free JSON tree |
 
 Strings are decoded to UTF-8: `\n \t \r \b \f \/ \" \\` and `\uXXXX`, with a
 surrogate pair (`😀`) combined into one 4-byte sequence. Bad hex
 digits, a short `\u`, a surrogate without its other half, or any other
 escape (`\q`, `\x41`) fail with `JSON_ERR_INVALID_ESCAPE` at the escape's
 backslash. `\u0000` is kept in a string value (`str_len` and
-`json_get_string` count it) but rejected in an object key, which is stored as
+`v.get_string()` count it) but rejected in an object key, which is stored as
 a NUL-terminated `*u8`. A raw control character (U+0000–U+001F) inside a
 string, key or value, fails with `JSON_ERR_CONTROL_CHAR` at that byte: RFC
 8259 requires them escaped. Tabs and newlines between tokens are whitespace
@@ -2538,25 +2750,28 @@ and stay legal.
 
 **Value Access**:
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `json_get_field` | `fn(obj: *JsonValue, key: StrView) -> Option<*JsonValue>` | Object field; None if missing or not an object |
-| `json_get_index` | `fn(arr: *JsonValue, idx: i64) -> Option<*JsonValue>` | Array element; None if out of range or not an array |
-| `json_get_string` | `fn(v: *JsonValue) -> Option<StrView>` | String value, borrowed from `v`; None if not a string |
-| `json_get_number` | `fn(v: *JsonValue) -> Option<i64>` | Number value; None if not a number |
-| `json_get_bool` | `fn(v: *JsonValue) -> Option<bool>` | Bool value; None if not a bool |
-| `json_is_null` | `fn(v: *JsonValue) -> i32` | Check if null |
-| `json_array_len` | `fn(v: *JsonValue) -> i64` | Get array length |
-| `json_object_len` | `fn(v: *JsonValue) -> i64` | Get object size |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `v.get_field(key)` | `fn(key: StrView) -> Option<*JsonValue>` | Object field; None if missing or not an object |
+| `v.get_index(idx)` | `fn(idx: i64) -> Option<*JsonValue>` | Array element; None if out of range or not an array |
+| `v.get_string()` | `fn() -> Option<StrView>` | String value, borrowed from `v`; None if not a string |
+| `v.get_number()` | `fn() -> Option<i64>` | Number value; None if not a number |
+| `v.get_bool()` | `fn() -> Option<bool>` | Bool value; None if not a bool |
+| `v.is_null()` | `fn() -> bool` | Check if null |
+| `v.array_len()` | `fn() -> i64` | Get array length |
+| `v.object_len()` | `fn() -> i64` | Get object size |
 
 **Serialization**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `json_emit_value` | `fn(v: *JsonValue, buf: *Vec<u8>) -> i32` | Emit to buffer |
 | `json_emit_bytes` | `fn(s: *u8, len: i64, buf: *Vec<u8>) -> i32` | Emit `s[0..len)` as a string; control characters as `\b \f \n \r \t` or `\u00XX` |
 | `json_emit_string` | `fn(s: *u8, buf: *Vec<u8>) -> i32` | `json_emit_bytes` up to the first NUL |
-| `json_to_string` | `fn(v: *JsonValue) -> String` | JSON text; the caller owns it, and its `Drop` impl frees it at scope end |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `v.emit(buf)` | `fn(buf: @&Vec<u8>) -> i32` | Emit to buffer |
+| `v.to_string()` | `fn() -> String` | JSON text; the caller owns it, and its `Drop` impl frees it at scope end |
 
 **Error Messages**:
 
@@ -2627,15 +2842,18 @@ struct ElfReader
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `elf_init` | `fn(reader: *ElfReader, data: *u8, size: i64) -> Result<(), ElfError>` | Initialize |
-| `elf_parse_sections` | `fn(reader: *ElfReader) -> Result<(), ElfError>` | Parse sections |
-| `elf_get_symbol_name` | `fn(reader: *ElfReader, sym_index: i64) -> *u8` | Get symbol name |
-| `elf_get_symbol_info` | `fn(reader: *ElfReader, sym_index: i64) -> u8` | Get symbol info |
 | `elf_is_function` | `fn(info: u8) -> i32` | Is function? |
 | `elf_is_global` | `fn(info: u8) -> i32` | Is global? |
-| `elf_symbol_count` | `fn(reader: *ElfReader) -> i64` | Get symbol count |
-| `elf_find_test_functions` | `fn(reader: *ElfReader, callback: *u8, user_data: *u8) -> i32` | Find test_* functions |
-| `elf_print_test_functions` | `fn(reader: *ElfReader)` | Print test functions |
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `elf.init(data_sv)` | `fn(data_sv: Span<u8>) -> Result<(), ElfError>` | Initialize |
+| `elf.parse_sections()` | `fn() -> Result<(), ElfError>` | Parse sections |
+| `elf.get_symbol_name(sym_index)` | `fn(sym_index: i64) -> Option<*u8>` | Get symbol name |
+| `elf.get_symbol_info(sym_index)` | `fn(sym_index: i64) -> u8` | Get symbol info |
+| `elf.symbol_count()` | `fn() -> i64` | Get symbol count |
+| `elf.find_test_functions(callback, user_data)` | `fn(callback: *u8, user_data: *u8) -> i32` | Find test_* functions |
+| `elf.print_test_functions()` | `fn()` | Print test functions |
 
 ---
 
