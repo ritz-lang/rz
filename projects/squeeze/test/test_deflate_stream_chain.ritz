@@ -1,0 +1,140 @@
+# test/test_deflate_stream_chain.ritz - Hash chain heads inserted while
+# skipping a match name the hashed position (AGAST #4615)
+#
+# After emitting a match, deflate_stream_write inserts every skipped position
+# into the hash chains.  The chain head must be the slot whose three bytes
+# were hashed.  Recording the slot one byte early sends the next search to
+# the byte before the triple (which fails the compare) and from there down
+# that slot's chain, a different one: the match is lost and the bytes go out
+# as literals.  Not corruption (every candidate is compared byte by byte),
+# only worse compression, so these tests pin that the match is found and
+# that the stream still decodes.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+
+import lib.gzip
+import lib.gzip_stream
+import lib.zlib
+import lib.zlib_stream
+
+const CH_IN_CAP: i64 = 4096
+const CH_OUT_CAP: i64 = 8192
+
+var c_in: [4096]u8
+var c_out: [8192]u8
+var c_back: [4096]u8
+var c_gz: GzipWriter
+var c_zl: ZlibWriter
+
+
+# BLOCK, BLOCK, then for each k in 1..BLOCK_LEN-3 a '#' and BLOCK[k..].
+# The second BLOCK is one match; every position it skips is reachable only
+# through the chains that match path inserted, so each suffix after '#' is
+# a match exactly when those heads are right.  Each suffix's own literal
+# fallback would insert its triples correctly, so the suffixes start at
+# different offsets and never repeat one another's first triple.
+# Returns the length.
+fn chain_build() -> i64
+    let block: StrView = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    let blen: i64 = block.len as i64
+    var pos: i64 = 0
+    for r in 0..2
+        for i in 0..blen
+            c_in[pos] = block.ptr[i]
+            pos = pos + 1
+    var k: i64 = 1
+    while k + 3 < blen
+        c_in[pos] = '#'
+        pos = pos + 1
+        for i in k..blen
+            c_in[pos] = block.ptr[i]
+            pos = pos + 1
+        k = k + 7
+    return pos
+
+
+# One-shot gzip of c_in[0..len] at `level`.  Returns the stream length.
+fn chain_gzip(len: i64, level: i32) -> i64
+    gzip_writer_init(@c_gz, level)
+    let w: i64 = gzip_writer_write(@c_gz, @c_in[0], len, @c_out[0], CH_OUT_CAP)
+    if w < 0
+        return -100
+    let t: i64 = gzip_writer_finish(@c_gz, @c_out[w], CH_OUT_CAP - w)
+    if t < 0
+        return -101
+    return w + t
+
+
+# One-shot zlib of c_in[0..len] at `level`.  Returns the stream length.
+fn chain_zlib(len: i64, level: i32) -> i64
+    zlib_writer_init(@c_zl, level)
+    let w: i64 = zlib_writer_write(@c_zl, @c_in[0], len, @c_out[0], CH_OUT_CAP)
+    if w < 0
+        return -100
+    let t: i64 = zlib_writer_finish(@c_zl, @c_out[w], CH_OUT_CAP - w)
+    if t < 0
+        return -101
+    return w + t
+
+
+# 0 if c_out[0..n] decodes to c_in[0..len] and n <= max; prints and 1
+# otherwise.
+fn chain_check(name: StrView, n: i64, len: i64, max: i64, is_gzip: bool) -> i32
+    if n < 0
+        prints(name)
+        print(": writer error ")
+        print_i64(n)
+        print("\n")
+        return 1
+    var got: i64 = 0
+    if is_gzip
+        got = gzip_decompress(@c_out[0], n, @c_back[0], CH_IN_CAP)
+    else
+        got = zlib_decompress(@c_out[0], n, @c_back[0], CH_IN_CAP)
+    var bad: i64 = -1
+    if got == len
+        for i in 0..len
+            if c_back[i] != c_in[i]
+                bad = i
+                break
+    if got != len or bad >= 0
+        prints(name)
+        print(": does not round-trip, got ")
+        print_i64(got)
+        print(" bytes, first bad byte ")
+        print_i64(bad)
+        print("\n")
+        return 1
+    if n > max
+        prints(name)
+        print(": ")
+        print_i64(n)
+        print(" bytes, want at most ")
+        print_i64(max)
+        print(": suffixes went out as literals, chain heads point one byte early\n")
+        return 1
+    return 0
+
+
+[[test]]
+fn test_stream_chain_match_path_gzip() -> i32
+    # 62 literals + one match + 9 x ('#' + match): 90 bytes of deflate plus
+    # 18 of gzip framing, 108 at every level (zlib: 96).  With the heads one
+    # byte early the nine suffixes go out as literals: 235 (zlib: 223).
+    let len: i64 = chain_build()
+    var fails: i32 = 0
+    fails = fails + chain_check("gzip L1", chain_gzip(len, 1), len, 130, true)
+    fails = fails + chain_check("gzip L6", chain_gzip(len, 6), len, 130, true)
+    fails = fails + chain_check("gzip L9", chain_gzip(len, 9), len, 130, true)
+    return fails
+
+
+[[test]]
+fn test_stream_chain_match_path_zlib() -> i32
+    let len: i64 = chain_build()
+    var fails: i32 = 0
+    fails = fails + chain_check("zlib L1", chain_zlib(len, 1), len, 120, false)
+    fails = fails + chain_check("zlib L9", chain_zlib(len, 9), len, 120, false)
+    return fails
