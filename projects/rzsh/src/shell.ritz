@@ -31,9 +31,11 @@ import os {
 }
 
 import ritzlib.sys { sys_write, sys_exit }
-import ritzlib.strview { StrView, strview_from_cstr }
-import ritzlib.str { strlen, strcmp }
 import ritzlib.gvec
+import ritzlib.option
+import ritzlib.string
+import ritzlib.span { Span, span_from_vec }
+import ritzlib.strview { StrView }
 
 # ============================================================================
 # stderr
@@ -43,28 +45,25 @@ import ritzlib.gvec
 fn eputs(s: StrView)
     sys_write(2, s.ptr, s.len)
 
-# `a`, the C string `b` (an argument or path from the parsed line), then `c`.
-fn eputs3(a: StrView, b: *u8, c: StrView)
+fn eputs3(a: StrView, b: StrView, c: StrView)
     eputs(a)
-    eputs(strview_from_cstr(b))
+    eputs(b)
     eputs(c)
 
 # ============================================================================
 # Builtins
 # ============================================================================
-# Each takes the command's words as argv[0..argc]; argv[argc] is null.
+# Each takes the command's words; args[0] is the builtin's name.
 
-fn cmd_cd(argc: i32, argv: **u8) -> i32
-    var dir: *u8 = null
-    if argc > 2
+fn cmd_cd(args: Span<StrView>) -> i32
+    if args.len > 2
         eputs("rzsh: cd: too many arguments\n")
         return 1
-    if argc == 2
-        dir = *(argv + 1)
+    var dir: StrView = "/"
+    if args.len == 2
+        dir = args[1]
     else
-        dir = var_lookup(c"HOME", 4)
-        if dir == null
-            dir = c"/"
+        dir = var_lookup("HOME").unwrap_or("/")
     if os_chdir(dir) != 0
         eputs3("rzsh: cd: ", dir, ": cannot change directory\n")
         return 1
@@ -72,118 +71,117 @@ fn cmd_cd(argc: i32, argv: **u8) -> i32
 
 fn cmd_pwd() -> i32
     var buf: [4096]u8
-    if os_getcwd(@buf[0], 4096) < 0
-        eputs("rzsh: pwd: cannot get working directory\n")
-        return 1
-    println(@buf[0])
+    match os_getcwd(@buf)
+        Some(cwd) => println(cwd)
+        None =>
+            eputs("rzsh: pwd: cannot get working directory\n")
+            return 1
     return 0
 
-fn cmd_export(argc: i32, argv: **u8) -> i32
-    if argc == 1
+fn cmd_export(args: Span<StrView>) -> i32
+    if args.len == 1
         var idx: i64 = 0
         while idx < vars_count()
-            let name: *u8 = var_exported_name(idx)
-            if name != null
-                puts(c"export ")
-                puts(name)
-                puts(c"=")
-                println(var_value(idx))
+            match var_exported_name(idx)
+                Some(name) =>
+                    puts("export ")
+                    puts(name)
+                    puts("=")
+                    println(var_value(idx))
+                None => pass
             idx = idx + 1
         return 0
 
     var status: i32 = 0
-    var i: i32 = 1
-    while i < argc
-        let arg: *u8 = *(argv + i)
+    var i: i64 = 1
+    while i < args.len
+        let arg: StrView = args[i]
         let eq: i64 = assignment_pos(arg)
         if eq >= 0
-            if var_set(arg, eq, arg + eq + 1, strlen(arg + eq + 1), 1) != 0
+            if var_set(arg.take(eq), arg.skip(eq + 1), 1) != 0
                 eputs3("rzsh: export: cannot set ", arg, "\n")
                 status = 1
-        else if is_valid_name(arg, strlen(arg))
-            var_export(arg, strlen(arg))  # exporting an unset name is a no-op
+        else if is_valid_name(arg)
+            var_export(arg)  # exporting an unset name is a no-op
         else
             eputs3("rzsh: export: not a valid name: ", arg, "\n")
             status = 1
         i = i + 1
     return status
 
-fn cmd_unset(argc: i32, argv: **u8) -> i32
-    var i: i32 = 1
-    while i < argc
-        var_unset(*(argv + i), strlen(*(argv + i)))
+fn cmd_unset(args: Span<StrView>) -> i32
+    var i: i64 = 1
+    while i < args.len
+        var_unset(args[i])
         i = i + 1
     return 0
 
-pub fn cmd_ls(argc: i32, argv: **u8) -> i32
-    var path: *u8 = os_default_ls_path()
-    if argc > 1
-        path = *(argv + 1)
+pub fn cmd_ls(args: Span<StrView>) -> i32
+    var path: StrView = os_default_ls_path()
+    if args.len > 1
+        path = args[1]
 
-    var buf: [4096]u8
-    let n: i64 = os_readdir(path, @buf[0], 4096)
-
-    if n < 0
+    var names: String = string_new()
+    if not os_readdir(path, @&names)
         eputs3("ls: cannot access '", path, "'\n")
         return 1
 
-    var pos: i64 = 0
-    while pos < n
-        let entry: *u8 = @buf[0] + pos
-        let entry_len: i64 = strlen(entry)
-        if entry_len > 0
-            puts(c"  ")
+    # names is "a\0b\0...": one entry per NUL.
+    var rest: StrView = names.as_view()
+    while rest.len > 0
+        let end: i64 = rest.find_byte(0)
+        let entry: StrView = rest.take(end)
+        if entry.len > 0
+            puts("  ")
             println(entry)
-        pos = pos + entry_len + 1
+        rest = rest.skip(end + 1)
 
     return 0
 
-fn exec_external(argv: **u8) -> i32
+fn exec_external(args: Span<StrView>) -> i32
     var envp: Envp = vars_build_envp()
-    var search: *u8 = var_lookup(c"PATH", 4)
-    if search == null
-        search = os_default_path()
+    let search: StrView = var_lookup("PATH").unwrap_or(os_default_path())
     let was_raw: bool = os_tty_suspend()
-    if var_lookup(c"RZSH_DEBUG_TTY_WINDOW", 21) != null
+    if var_lookup("RZSH_DEBUG_TTY_WINDOW").is_some()
         os_tty_window_probe()
-    let status: i32 = os_spawn_search(*argv, search, argv, envp_ptr(@envp))
+    let status: i32 = os_spawn_search(args, search, envp_ptr(@envp))
     os_tty_resume(was_raw)
     return status
 
 # The builtin `ls` takes only `ls [DIR]`; with options, the system's ls runs.
-fn has_option(argc: i32, argv: **u8) -> bool
-    var i: i32 = 1
-    while i < argc
-        if **(argv + i) == 45
+fn has_option(args: Span<StrView>) -> bool
+    var i: i64 = 1
+    while i < args.len
+        if args[i].starts_with("-")
             return true
         i = i + 1
     return false
 
-# Runs argv[0..argc] (argv[argc] null) as a builtin or external command.
-fn dispatch(argc: i32, argv: **u8) -> i32
-    let cmd: *u8 = *argv
-    if strcmp(cmd, c"cd") == 0
-        return cmd_cd(argc, argv)
-    if strcmp(cmd, c"pwd") == 0
+# Runs the command `args` (args[0] names it) as a builtin or external command.
+fn dispatch(args: Span<StrView>) -> i32
+    let cmd: StrView = args[0]
+    if cmd.eq("cd")
+        return cmd_cd(args)
+    if cmd.eq("pwd")
         return cmd_pwd()
-    if strcmp(cmd, c"export") == 0
-        return cmd_export(argc, argv)
-    if strcmp(cmd, c"unset") == 0
-        return cmd_unset(argc, argv)
-    if strcmp(cmd, c"help") == 0
+    if cmd.eq("export")
+        return cmd_export(args)
+    if cmd.eq("unset")
+        return cmd_unset(args)
+    if cmd.eq("help")
         return cmd_help()
-    if strcmp(cmd, c"exit") == 0
+    if cmd.eq("exit")
         os_disable_raw_mode()
-        return cmd_exit(argc, argv)
-    if strcmp(cmd, c"pid") == 0
+        return cmd_exit(args)
+    if cmd.eq("pid")
         return cmd_pid()
-    if strcmp(cmd, c"echo") == 0
-        return cmd_echo(argc, argv)
-    if strcmp(cmd, c"ls") == 0 and not has_option(argc, argv)
-        return cmd_ls(argc, argv)
-    if strcmp(cmd, c"clear") == 0
+    if cmd.eq("echo")
+        return cmd_echo(args)
+    if cmd.eq("ls") and not has_option(args)
+        return cmd_ls(args)
+    if cmd.eq("clear")
         return cmd_clear()
-    return exec_external(argv)
+    return exec_external(args)
 
 # ============================================================================
 # Simple command: words + redirections over tokens [start, end)
@@ -192,15 +190,15 @@ fn dispatch(argc: i32, argv: **u8) -> i32
 # argv is built per command, so a command takes any number of words (it was a
 # global [32]*u8: "too many arguments" past 31, AGAST #3529).
 fn run_command(tk: @Tokens, start: i64, end: i64) -> i32
-    var argv: Vec<*u8> = vec_new<*u8>()
-    let status: i32 = run_command_with(tk, start, end, @&argv)
+    var words: Vec<StrView> = vec_new<StrView>()
+    let status: i32 = run_command_with(tk, start, end, @&words)
     return status
 
 # Collects the words of [start, end) into `words` (empty on entry) and runs them.
-fn run_command_with(tk: @Tokens, start: i64, end: i64, words: @&Vec<*u8>) -> i32
-    var out_path: *u8 = null
+fn run_command_with(tk: @Tokens, start: i64, end: i64, words: @&Vec<StrView>) -> i32
+    var out_path: Option<StrView> = None
     var out_append: bool = false
-    var in_path: *u8 = null
+    var in_path: Option<StrView> = None
 
     var t: i64 = start
     while t < end
@@ -214,42 +212,39 @@ fn run_command_with(tk: @Tokens, start: i64, end: i64, words: @&Vec<*u8>) -> i32
                 eputs("rzsh: syntax error: redirection needs a file name\n")
                 return 2
             if kind == TokKind.In
-                in_path = tokens_word(tk, t + 1)
+                in_path = Some(tokens_word(tk, t + 1))
             else
-                out_path = tokens_word(tk, t + 1)
+                out_path = Some(tokens_word(tk, t + 1))
                 out_append = kind == TokKind.Append
             t = t + 1
         t = t + 1
 
-    let argc: i32 = words.len as i32
-    if not words.push(null)
-        eputs("rzsh: out of memory\n")
-        return 1
-    let argv: **u8 = words.data
+    let args: Span<StrView> = span_from_vec(words)
+    let argc: i64 = args.len
 
     # NAME=VALUE ... with no command sets shell variables.
-    if argc > 0 and assignment_pos(*argv) >= 0
+    if argc > 0 and assignment_pos(args[0]) >= 0
         var all: bool = true
-        var i: i32 = 0
+        var i: i64 = 0
         while i < argc
-            if assignment_pos(*(argv + i)) < 0
+            if assignment_pos(args[i]) < 0
                 all = false
             i = i + 1
         if all
             i = 0
             while i < argc
-                let a: *u8 = *(argv + i)
+                let a: StrView = args[i]
                 let eq: i64 = assignment_pos(a)
-                if var_set(a, eq, a + eq + 1, strlen(a + eq + 1), 0) != 0
+                if var_set(a.take(eq), a.skip(eq + 1), 0) != 0
                     eputs3("rzsh: cannot set ", a, "\n")
                     return 1
                 i = i + 1
             return 0
 
-    if out_path == null and in_path == null
+    if out_path.is_none() and in_path.is_none()
         if argc == 0
             return 0
-        return dispatch(argc, argv)
+        return dispatch(args)
 
     if not os_has_fd_control()
         eputs("rzsh: redirection is not supported on this system\n")
@@ -257,29 +252,33 @@ fn run_command_with(tk: @Tokens, start: i64, end: i64, words: @&Vec<*u8>) -> i32
 
     var saved_in: i32 = -1
     var saved_out: i32 = -1
-    if in_path != null
-        let fd: i32 = os_open_read(in_path)
-        if fd < 0
-            eputs3("rzsh: cannot open ", in_path, "\n")
-            return 1
-        saved_in = os_dup(0)
-        os_dup2(fd, 0)
-        os_close(fd)
-    if out_path != null
-        let fd: i32 = os_open_write(out_path, out_append)
-        if fd < 0
-            eputs3("rzsh: cannot create ", out_path, "\n")
-            if saved_in >= 0
-                os_dup2(saved_in, 0)
-                os_close(saved_in)
-            return 1
-        saved_out = os_dup(1)
-        os_dup2(fd, 1)
-        os_close(fd)
+    match in_path
+        Some(p) =>
+            let fd: i32 = os_open_read(p)
+            if fd < 0
+                eputs3("rzsh: cannot open ", p, "\n")
+                return 1
+            saved_in = os_dup(0)
+            os_dup2(fd, 0)
+            os_close(fd)
+        None => pass
+    match out_path
+        Some(p) =>
+            let fd: i32 = os_open_write(p, out_append)
+            if fd < 0
+                eputs3("rzsh: cannot create ", p, "\n")
+                if saved_in >= 0
+                    os_dup2(saved_in, 0)
+                    os_close(saved_in)
+                return 1
+            saved_out = os_dup(1)
+            os_dup2(fd, 1)
+            os_close(fd)
+        None => pass
 
     var status: i32 = 0
     if argc > 0
-        status = dispatch(argc, argv)
+        status = dispatch(args)
 
     if saved_out >= 0
         os_dup2(saved_out, 1)
@@ -371,7 +370,7 @@ fn run_pipeline_with(tk: @Tokens, start: i64, end: i64, bounds: @&Vec<i64>, pids
 # ============================================================================
 
 # Runs one input line; returns (and records for `$?`) the last status.
-pub fn run_line(line: *u8) -> i32
+pub fn run_line(line: StrView) -> i32
     var pos: i64 = 0
     while pos >= 0
         var tk: Tokens = tokenize(line, pos)

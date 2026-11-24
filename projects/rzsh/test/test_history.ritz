@@ -1,9 +1,10 @@
 # Tests for command history
 
 import ritzlib.fd { fd_stdout }
-import ritzlib.strview { strview_from_cstr }
 import ritzlib.fmt
-import ritzlib.str { strlen, strcmp }
+import ritzlib.option
+import ritzlib.string
+import ritzlib.strview { StrView }
 
 import src.history {
     history_add, history_reset_nav, history_up, history_down,
@@ -11,9 +12,31 @@ import src.history {
     HISTORY_SIZE
 }
 
-# A C string from the history API (history_get) on stdout.
-fn puts(s: *u8)
-    fd_stdout().write_str(strview_from_cstr(s))
+fn puts(s: StrView)
+    fd_stdout().write_str(s)
+
+# 0 when `got` is `want`; else reports what came back and returns 1.
+fn expect(got: Option<StrView>, want: StrView, what: StrView) -> i32
+    match got
+        Some(h) =>
+            if h.eq(want)
+                return 0
+            puts("  FAIL: expected '")
+            puts(want)
+            puts("', got '")
+            puts(h)
+            print("'\n")
+        None =>
+            puts("  FAIL: ")
+            puts(what)
+            print(" returned null\n")
+    return 1
+
+# True when `got` is exactly `want`.
+fn is(got: Option<StrView>, want: StrView) -> bool
+    match got
+        Some(h) => h.eq(want)
+        None => false
 
 # ============================================================================
 # Test: Basic add and count
@@ -28,19 +51,19 @@ fn test_history_add() -> i32
         print("  FAIL: count should be 0 after clear\n")
         return 1
 
-    history_add(c"first command")
+    history_add("first command")
     if history_count() != 1
         let n: i32 = history_count()
         print("  FAIL: count should be 1, got {n}\n")
         return 1
 
-    history_add(c"second command")
+    history_add("second command")
     if history_count() != 2
         print("  FAIL: count should be 2\n")
         return 1
 
     # Empty strings should not be added
-    history_add(c"")
+    history_add("")
     if history_count() != 2
         print("  FAIL: empty string should not be added\n")
         return 1
@@ -57,15 +80,15 @@ fn test_history_no_duplicates() -> i32
     print("Testing history duplicate detection...\n")
     history_clear()
 
-    history_add(c"cmd1")
-    history_add(c"cmd1")  # Duplicate - should not be added
+    history_add("cmd1")
+    history_add("cmd1")  # Duplicate - should not be added
     if history_count() != 1
         let n: i32 = history_count()
         print("  FAIL: count should be 1, got {n}\n")
         return 1
 
-    history_add(c"cmd2")
-    history_add(c"cmd1")  # Different from last - should be added
+    history_add("cmd2")
+    history_add("cmd1")  # Different from last - should be added
     if history_count() != 3
         let n: i32 = history_count()
         print("  FAIL: count should be 3, got {n}\n")
@@ -83,47 +106,25 @@ fn test_history_up() -> i32
     print("Testing history navigation up...\n")
     history_clear()
 
-    history_add(c"oldest")
-    history_add(c"middle")
-    history_add(c"newest")
+    history_add("oldest")
+    history_add("middle")
+    history_add("newest")
     history_reset_nav()
 
     # First up should get "newest"
-    let h1: *u8 = history_up()
-    if h1 == null
-        print("  FAIL: first up returned null\n")
-        return 1
-    if strcmp(h1, c"newest") != 0
-        print("  FAIL: expected 'newest', got '")
-        puts(h1)
-        print("'\n")
+    if expect(history_up(), "newest", "first up") != 0
         return 1
 
     # Second up should get "middle"
-    let h2: *u8 = history_up()
-    if h2 == null
-        print("  FAIL: second up returned null\n")
-        return 1
-    if strcmp(h2, c"middle") != 0
-        print("  FAIL: expected 'middle', got '")
-        puts(h2)
-        print("'\n")
+    if expect(history_up(), "middle", "second up") != 0
         return 1
 
     # Third up should get "oldest"
-    let h3: *u8 = history_up()
-    if h3 == null
-        print("  FAIL: third up returned null\n")
-        return 1
-    if strcmp(h3, c"oldest") != 0
-        print("  FAIL: expected 'oldest', got '")
-        puts(h3)
-        print("'\n")
+    if expect(history_up(), "oldest", "third up") != 0
         return 1
 
     # Fourth up should return null (at oldest)
-    let h4: *u8 = history_up()
-    if h4 != null
+    if history_up().is_some()
         print("  FAIL: fourth up should return null\n")
         return 1
 
@@ -139,8 +140,8 @@ fn test_history_down() -> i32
     print("Testing history navigation down...\n")
     history_clear()
 
-    history_add(c"oldest")
-    history_add(c"newest")
+    history_add("oldest")
+    history_add("newest")
     history_reset_nav()
 
     # Go up twice (to oldest)
@@ -148,19 +149,11 @@ fn test_history_down() -> i32
     history_up()  # oldest
 
     # Now go down - should get "newest"
-    let h1: *u8 = history_down()
-    if h1 == null
-        print("  FAIL: first down returned null\n")
-        return 1
-    if strcmp(h1, c"newest") != 0
-        print("  FAIL: expected 'newest', got '")
-        puts(h1)
-        print("'\n")
+    if expect(history_down(), "newest", "first down") != 0
         return 1
 
     # Second down should return null (back at prompt)
-    let h2: *u8 = history_down()
-    if h2 != null
+    if history_down().is_some()
         print("  FAIL: second down should return null (at prompt)\n")
         return 1
 
@@ -182,30 +175,26 @@ fn test_history_get() -> i32
     print("Testing history_get...\n")
     history_clear()
 
-    history_add(c"cmd0")
-    history_add(c"cmd1")
-    history_add(c"cmd2")
+    history_add("cmd0")
+    history_add("cmd1")
+    history_add("cmd2")
 
     # Index 0 should be oldest
-    let h0: *u8 = history_get(0)
-    if h0 == null or strcmp(h0, c"cmd0") != 0
+    if not is(history_get(0), "cmd0")
         print("  FAIL: get(0) should return 'cmd0'\n")
         return 1
 
     # Index 2 should be newest
-    let h2: *u8 = history_get(2)
-    if h2 == null or strcmp(h2, c"cmd2") != 0
+    if not is(history_get(2), "cmd2")
         print("  FAIL: get(2) should return 'cmd2'\n")
         return 1
 
     # Out of range should return null
-    let h3: *u8 = history_get(3)
-    if h3 != null
+    if history_get(3).is_some()
         print("  FAIL: get(3) should return null\n")
         return 1
 
-    let h_neg: *u8 = history_get(-1)
-    if h_neg != null
+    if history_get(-1).is_some()
         print("  FAIL: get(-1) should return null\n")
         return 1
 
@@ -222,11 +211,11 @@ fn test_history_empty() -> i32
     history_clear()
     history_reset_nav()
 
-    if history_up() != null
+    if history_up().is_some()
         print("  FAIL: up on empty history should return null\n")
         return 1
 
-    if history_down() != null
+    if history_down().is_some()
         print("  FAIL: down on empty history should return null\n")
         return 1
 
@@ -238,34 +227,32 @@ fn test_history_empty() -> i32
 # ============================================================================
 # Entries were fixed [512]u8 rows: a longer line came back cut at byte 511.
 
-var g_long: [2001]u8
-
-# Fills g_long with `n` bytes ending in `last`, NUL-terminated.
-fn fill_long(n: i64, last: u8) -> *u8
+# `n` bytes ending in `last`.
+fn long_line(n: i64, last: u8) -> String
+    var s: String = string_new()
     var i: i64 = 0
-    while i < n
-        g_long[i as i32] = 97 + ((i % 26) as u8)
+    while i < n - 1
+        s.push(97 + ((i % 26) as u8))
         i = i + 1
-    g_long[(n - 1) as i32] = last
-    g_long[n as i32] = 0
-    return @g_long[0]
+    s.push(last)
+    return s
 
 [[test]]
 fn test_history_long_entry() -> i32
     history_clear()
     history_reset_nav()
-    history_add(fill_long(2000, 90))
-    let up: *u8 = history_up()
-    if up == null or strlen(up) != 2000 or strcmp(up, fill_long(2000, 90)) != 0
+    let z: String = long_line(2000, 90)
+    history_add(z.as_view())
+    if not is(history_up(), z.as_view())
         print("  FAIL: up should recall all 2000 bytes\n")
         return 1
     # A line that differs only past byte 511 is a new entry, not a duplicate.
-    history_add(fill_long(2000, 89))
+    let y: String = long_line(2000, 89)
+    history_add(y.as_view())
     if history_count() != 2
         print("  FAIL: lines differing past byte 511 are distinct\n")
         return 2
-    let got: *u8 = history_get(1)
-    if got == null or strcmp(got, fill_long(2000, 89)) != 0
+    if not is(history_get(1), y.as_view())
         return 3
     return 0
 
@@ -279,18 +266,17 @@ fn test_history_ring_wraps() -> i32
     var i: i32 = 0
     while i < HISTORY_SIZE + 3
         # Distinct entries: length i+1 (and a 600-byte tail to exercise reuse).
-        history_add(fill_long((i + 1) as i64 + 600, 65))
+        let entry: String = long_line((i + 1) as i64 + 600, 65)
+        history_add(entry.as_view())
         i = i + 1
     if history_count() != HISTORY_SIZE
         return 1
     # Oldest surviving is entry 3 (length 604); newest is length HISTORY_SIZE+603.
-    let oldest: *u8 = history_get(0)
-    if oldest == null or strlen(oldest) != 604
+    if not is(history_get(0), long_line(604, 65).as_view())
         return 2
-    let newest: *u8 = history_get(HISTORY_SIZE - 1)
-    if newest == null or strlen(newest) != (HISTORY_SIZE + 603) as i64
+    if not is(history_get(HISTORY_SIZE - 1), long_line((HISTORY_SIZE + 603) as i64, 65).as_view())
         return 3
     history_clear()
-    if history_count() != 0 or history_get(0) != null
+    if history_count() != 0 or history_get(0).is_some()
         return 4
     return 0

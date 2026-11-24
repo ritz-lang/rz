@@ -9,8 +9,8 @@ import ritzlib.sys {
     sys_read, sys_pipe, sys_fork, sys_dup2, sys_close, sys_exit, sys_wait4,
     sys_mkdir, sys_rmdir, sys_unlink, sys_getpid
 }
-import ritzlib.str { strlen, strcpy, strcat }
-import ritzlib.fmt.digits { fmt_i64_into }
+import ritzlib.string
+import ritzlib.strview { StrView }
 
 import src.shell { run_line }
 
@@ -27,19 +27,18 @@ fn read_all(fd: i32, buf: *u8, cap: i64) -> i64
     got
 
 # 0 when the captured stdout is exactly `want`.
-fn out_differs(want: *u8) -> i32
-    let wl: i64 = strlen(want)
-    if g_out_len != wl
+fn out_differs(want: StrView) -> i32
+    if g_out_len != want.len
         return 1
     var i: i64 = 0
     while i < g_out_len
-        if g_out[i as i32] != *(want + i)
+        if g_out[i as i32] != want.get(i)
             return 2
         i += 1
     0
 
 # Runs `line` in a child; returns run_line's status, stdout in g_out.
-fn run(line: *u8) -> i32
+fn run(line: StrView) -> i32
     var o: [2]i32
     sys_pipe(@o[0])
     let pid: i32 = sys_fork()
@@ -56,109 +55,102 @@ fn run(line: *u8) -> i32
     (status >> 8) & 255
 
 # A scratch dir in the cwd, named per process: ".rzsh_test_<pid>".
-var g_dir: [64]u8
-var g_path: [128]u8
+fn scratch_dir() -> String
+    var dir: String = string_from(".rzsh_test_")
+    dir.push_i64(sys_getpid() as i64)
+    sys_mkdir(dir.as_ptr(), 448)
+    dir
 
-fn scratch_dir() -> *u8
-    strcpy(@g_dir[0], c".rzsh_test_")
-    let len: i64 = strlen(@g_dir[0])
-    let n: i64 = fmt_i64_into(@g_dir[0] + len, sys_getpid() as i64)
-    g_dir[(len + n) as i32] = 0
-    sys_mkdir(@g_dir[0], 448)
-    @g_dir[0]
-
-fn in_dir(name: *u8) -> *u8
-    strcpy(@g_path[0], @g_dir[0])
-    strcat(@g_path[0], c"/")
-    strcat(@g_path[0], name)
-    @g_path[0]
+fn in_dir(dir: @String, name: StrView) -> String
+    var path: String = dir.clone()
+    path.push_str("/")
+    path.push_str(name)
+    path
 
 # ----------------------------------------------------------------------------
 
 [[test]]
 fn test_cd_changes_directory() -> i32
-    assert run(c"cd / ; pwd") == 0
-    assert out_differs(c"/\n") == 0
-    assert run(c"cd /nonexistent_2461 ; pwd") == 0
-    assert out_differs(c"") != 0   # pwd still ran, in the old directory
-    assert run(c"cd /nonexistent_2461") == 1
+    assert run("cd / ; pwd") == 0
+    assert out_differs("/\n") == 0
+    assert run("cd /nonexistent_2461 ; pwd") == 0
+    assert out_differs("") != 0   # pwd still ran, in the old directory
+    assert run("cd /nonexistent_2461") == 1
     0
 
 [[test]]
 fn test_variables_expand() -> i32
-    assert run(c"export X=5 ; echo X=$X") == 0
-    assert out_differs(c"X=5\n") == 0
-    assert run(c"Y=a ; Y=${Y}b ; echo \"$Y\" '$Y'") == 0
-    assert out_differs(c"ab $Y\n") == 0
+    assert run("export X=5 ; echo X=$X") == 0
+    assert out_differs("X=5\n") == 0
+    assert run("Y=a ; Y=${Y}b ; echo \"$Y\" '$Y'") == 0
+    assert out_differs("ab $Y\n") == 0
     0
 
 [[test]]
 fn test_exported_reaches_child() -> i32
     # Only exported variables go into an external command's environment.
-    assert run(c"export X=5 ; L=1 ; env | grep -c -e ^X=5 -e ^L=") == 0
-    assert out_differs(c"1\n") == 0
+    assert run("export X=5 ; L=1 ; env | grep -c -e ^X=5 -e ^L=") == 0
+    assert out_differs("1\n") == 0
     0
 
 [[test]]
 fn test_status_expands() -> i32
-    assert run(c"false ; echo status=$?") == 0
-    assert out_differs(c"status=1\n") == 0
-    assert run(c"true ; echo status=$?") == 0
-    assert out_differs(c"status=0\n") == 0
-    assert run(c"no_such_command_2461 ; echo $?") == 0
-    assert out_differs(c"127\n") == 0
-    assert run(c"false") == 1
+    assert run("false ; echo status=$?") == 0
+    assert out_differs("status=1\n") == 0
+    assert run("true ; echo status=$?") == 0
+    assert out_differs("status=0\n") == 0
+    assert run("no_such_command_2461 ; echo $?") == 0
+    assert out_differs("127\n") == 0
+    assert run("false") == 1
     0
 
 [[test]]
 fn test_redirect_out_append_in() -> i32
-    scratch_dir()
+    var dir: String = scratch_dir()
     # Paths name the scratch dir directly, so a broken `cd` or `;` can't
     # make the test write into its cwd.
-    let f: *u8 = in_dir(c"f.txt")
-    var line: [256]u8
-    strcpy(@line[0], c"echo one > ")
-    strcat(@line[0], f)
-    strcat(@line[0], c" ; echo two >> ")
-    strcat(@line[0], f)
-    strcat(@line[0], c" ; echo shown ; cat < ")
-    strcat(@line[0], f)
-    let st: i32 = run(@line[0])
-    sys_unlink(f)
-    sys_rmdir(@g_dir[0])
+    var f: String = in_dir(@dir, "f.txt")
+    var line: String = string_from("echo one > ")
+    line.push_string(@f)
+    line.push_str(" ; echo two >> ")
+    line.push_string(@f)
+    line.push_str(" ; echo shown ; cat < ")
+    line.push_string(@f)
+    let st: i32 = run(line.as_view())
+    sys_unlink(f.as_ptr())
+    sys_rmdir(dir.as_ptr())
     assert st == 0
     # The builtin's redirect is undone: "shown" reached the real stdout.
-    assert out_differs(c"shown\none\ntwo\n") == 0
+    assert out_differs("shown\none\ntwo\n") == 0
     0
 
 [[test]]
 fn test_redirect_truncates_external() -> i32
-    scratch_dir()
-    let g: *u8 = in_dir(c"g.txt")
-    var line: [256]u8
-    strcpy(@line[0], c"echo long-line > ")
-    strcat(@line[0], g)
-    strcat(@line[0], c" ; printf x > ")
-    strcat(@line[0], g)
-    strcat(@line[0], c" ; cat ")
-    strcat(@line[0], g)
-    let st: i32 = run(@line[0])
-    sys_unlink(g)
-    sys_rmdir(@g_dir[0])
+    var dir: String = scratch_dir()
+    var g: String = in_dir(@dir, "g.txt")
+    var line: String = string_from("echo long-line > ")
+    line.push_string(@g)
+    line.push_str(" ; printf x > ")
+    line.push_string(@g)
+    line.push_str(" ; cat ")
+    line.push_string(@g)
+    let st: i32 = run(line.as_view())
+    sys_unlink(g.as_ptr())
+    sys_rmdir(dir.as_ptr())
     assert st == 0
-    assert out_differs(c"x") == 0
+    assert out_differs("x") == 0
     0
 
 [[test]]
 fn test_pipe() -> i32
-    assert run(c"echo piped | tr p P") == 0
-    assert out_differs(c"PiPed\n") == 0
-    assert run(c"echo abc | tr a A | tr c C") == 0
-    assert out_differs(c"AbC\n") == 0
+    assert run("echo piped | tr p P") == 0
+    assert out_differs("PiPed\n") == 0
+    assert run("echo abc | tr a A | tr c C") == 0
+    assert out_differs("AbC\n") == 0
     # A pipeline's status is its last command's.
-    assert run(c"echo x | false") == 1
-    assert run(c"false | cat ; echo $?") == 0
-    assert out_differs(c"0\n") == 0
+    assert run("echo x | false") == 1
+    assert run("false | cat ; echo $?") == 0
+    assert out_differs("0\n") == 0
     0
 
 # ----------------------------------------------------------------------------
@@ -166,70 +158,54 @@ fn test_pipe() -> i32
 # an 8 KB child envp in global arrays. Each line below is sized to cross one.
 # ----------------------------------------------------------------------------
 
-var g_long: [16384]u8
-
-fn long_reset() -> *u8
-    g_long[0] = 0
-    @g_long[0]
-
-fn long_add(s: *u8)
-    strcat(@g_long[0], s)
-
-fn long_add_int(n: i64)
-    var num: [24]u8
-    let k: i64 = fmt_i64_into(@num[0], n)
-    num[k as i32] = 0
-    strcat(@g_long[0], @num[0])
-
 [[test]]
 fn test_hundred_tokens_run() -> i32
     # `echo ok` plus 49 `< /dev/null` is 100 tokens; 64 was the cap.
-    long_reset()
-    long_add(c"echo ok")
+    var long: String = string_from("echo ok")
     var i: i32 = 0
     while i < 49
-        long_add(c" < /dev/null")
+        long.push_str(" < /dev/null")
         i += 1
-    assert run(@g_long[0]) == 0
-    assert out_differs(c"ok\n") == 0
+    assert run(long.as_view()) == 0
+    assert out_differs("ok\n") == 0
     0
 
 [[test]]
 fn test_sixty_four_variables() -> i32
     # V0=0 ; ... ; V63=63 ; echo $V0 $V31 $V32 $V63 — the 33rd failed.
-    long_reset()
+    var long: String = string_new()
     var i: i64 = 0
     while i < 64
-        long_add(c"V")
-        long_add_int(i)
-        long_add(c"=")
-        long_add_int(i)
-        long_add(c" ; ")
+        long.push_str("V")
+        long.push_i64(i)
+        long.push_str("=")
+        long.push_i64(i)
+        long.push_str(" ; ")
         i += 1
-    long_add(c"echo $V0 $V31 $V32 $V63")
-    assert run(@g_long[0]) == 0
-    assert out_differs(c"0 31 32 63\n") == 0
+    long.push_str("echo $V0 $V31 $V32 $V63")
+    assert run(long.as_view()) == 0
+    assert out_differs("0 31 32 63\n") == 0
     0
 
 [[test]]
 fn test_exported_past_8k_reach_child() -> i32
     # 32 exported "EXPORTED_NN=<250 x>" entries are 263 bytes each, 8416 in
     # all: past the old 8 KB envp buffer, which silently dropped the last two.
-    long_reset()
+    var long: String = string_new()
     var i: i64 = 10
     while i < 42
-        long_add(c"export EXPORTED_")
-        long_add_int(i)
-        long_add(c"=")
+        long.push_str("export EXPORTED_")
+        long.push_i64(i)
+        long.push_str("=")
         var k: i32 = 0
         while k < 250
-            long_add(c"x")
+            long.push_str("x")
             k += 1
-        long_add(c" ; ")
+        long.push_str(" ; ")
         i += 1
-    long_add(c"env | grep -c ^EXPORTED_")
-    assert run(@g_long[0]) == 0
-    assert out_differs(c"32\n") == 0
+    long.push_str("env | grep -c ^EXPORTED_")
+    assert run(long.as_view()) == 0
+    assert out_differs("32\n") == 0
     0
 
 # ----------------------------------------------------------------------------
@@ -238,48 +214,41 @@ fn test_exported_past_8k_reach_child() -> i32
 # with "too many arguments" and a 17th stage with "pipeline too long".
 # ----------------------------------------------------------------------------
 
-var g_want: [1024]u8
-
 [[test]]
 fn test_echo_hundred_args() -> i32
     # echo 0 1 ... 99 prints all hundred, space-separated.
-    long_reset()
-    long_add(c"echo")
-    g_want[0] = 0
+    var long: String = string_from("echo")
+    var want: String = string_new()
     var i: i64 = 0
     while i < 100
-        long_add(c" ")
-        long_add_int(i)
-        var num: [24]u8
-        let k: i64 = fmt_i64_into(@num[0], i)
-        num[k as i32] = 0
+        long.push_str(" ")
+        long.push_i64(i)
         if i > 0
-            strcat(@g_want[0], c" ")
-        strcat(@g_want[0], @num[0])
+            want.push_str(" ")
+        want.push_i64(i)
         i += 1
-    strcat(@g_want[0], c"\n")
-    assert run(@g_long[0]) == 0
-    assert out_differs(@g_want[0]) == 0
+    want.push_str("\n")
+    assert run(long.as_view()) == 0
+    assert out_differs(want.as_view()) == 0
     0
 
 [[test]]
 fn test_twenty_stage_pipeline() -> i32
     # echo deep | cat | ... — 20 stages; 16 was the cap.
-    long_reset()
-    long_add(c"echo deep")
+    var long: String = string_from("echo deep")
     var i: i32 = 1
     while i < 20
-        long_add(c" | cat")
+        long.push_str(" | cat")
         i += 1
-    assert run(@g_long[0]) == 0
-    assert out_differs(c"deep\n") == 0
+    assert run(long.as_view()) == 0
+    assert out_differs("deep\n") == 0
     0
 
 [[test]]
 fn test_syntax_errors() -> i32
-    assert run(c"echo 'open") == 2
-    assert run(c"echo a | | cat") == 2
-    assert run(c"echo a >") == 2
-    assert run(c"| cat") == 2
-    assert out_differs(c"") == 0
+    assert run("echo 'open") == 2
+    assert run("echo a | | cat") == 2
+    assert run("echo a >") == 2
+    assert run("| cat") == 2
+    assert out_differs("") == 0
     0

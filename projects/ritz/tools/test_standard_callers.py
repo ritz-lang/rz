@@ -48,7 +48,7 @@ PINS = {
     "ritz-lsp": 87,
     "ritzunit": 43,
     "rzrz": 11,
-    "rzsh": 98,
+    "rzsh": 18,
     "sage": 13,
     "spire": 90,
     "squeeze": 2,

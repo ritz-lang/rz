@@ -20,12 +20,12 @@
 # left out of a child's environment. They are now a Vec<Token>, a
 # Vec<ShellVar> and an Envp built in a String, with no size limit but memory.
 
-import ritzlib.str { strlen }
 import ritzlib.gvec
 import ritzlib.memory
+import ritzlib.option
 import ritzlib.ptr { ptr_read }
 import ritzlib.string
-import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.strview { StrView, strview_from_cstr }
 
 # ============================================================================
 # Tokens
@@ -39,8 +39,7 @@ pub enum TokKind
     In        # <
 
 # A token. For a Word, `word` is its text after quoting and expansion; the
-# bytes are NUL-terminated (word.ptr works as a C string) and owned by the
-# Tokens it came from. Operators have an empty word.
+# bytes are owned by the Tokens it came from. Operators have an empty word.
 pub struct Token
     kind: TokKind
     word: StrView
@@ -68,12 +67,10 @@ pub fn tokens_kind(t: @Tokens, idx: i64) -> TokKind
 pub fn tokens_is_word(t: @Tokens, idx: i64) -> bool
     return tokens_kind(t, idx) == TokKind.Word
 
-# Word `idx` as a C string (null for an operator).
-pub fn tokens_word(t: @Tokens, idx: i64) -> *u8
+# Word `idx` (empty for an operator). Valid until tokens_drop.
+pub fn tokens_word(t: @Tokens, idx: i64) -> StrView
     let tok: Token = t.toks.get(idx)
-    if tok.kind != TokKind.Word
-        return null
-    return tok.word.ptr
+    return tok.word
 
 pub fn tokens_drop(t: @&Tokens)
     # A Vec's own drop frees its buffer, not the Strings in it; pop each one
@@ -104,34 +101,40 @@ pub fn is_name_char(c: u8) -> bool
 # ============================================================================
 
 struct Lexer
-    line: *u8
+    line: StrView
     i: i64
     word: String     # the word being built
     quoted: bool     # it had quotes or an escape, so it's kept even if empty
     out: Tokens
 
+# The byte `off` past the cursor; '\0' past the end of the line.
 fn at(lx: @Lexer, off: i64) -> u8
-    return *(lx.line + lx.i + off)
+    let k: i64 = lx.i + off
+    if k >= lx.line.len
+        return '\0'
+    return lx.line.get(k)
+
+# The rest of the line from `off` past the cursor.
+fn rest(lx: @Lexer, off: i64) -> StrView
+    return lx.line.skip(lx.i + off)
 
 fn emit(lx: @&Lexer, c: u8)
     (lx.word).push(c)
 
-fn emit_cstr(lx: @&Lexer, s: *u8)
-    (lx.word).push_cstr(s)
+fn emit_str(lx: @&Lexer, s: StrView)
+    (lx.word).push_str(s)
 
 fn push_op(lx: @&Lexer, kind: TokKind, width: i64)
-    lx.out.toks.push(Token { kind: kind, word: strview_from_ptr(c"", 0) })
+    lx.out.toks.push(Token { kind: kind, word: "" })
     lx.i += width
 
 # Ends the current word: a token if it has text or was quoted, else nothing.
 # The String moves into out.words, whose growth moves only the String header,
 # never the bytes the token's StrView points at.
 fn finish_word(lx: @&Lexer)
-    let n: i64 = (lx.word).len()
-    if not lx.quoted and n == 0
+    if not lx.quoted and (lx.word).len() == 0
         return
-    let p: *u8 = (lx.word).as_ptr()   # NUL-terminates
-    let view: StrView = strview_from_ptr(p, n)
+    let view: StrView = (lx.word).as_view()
     lx.out.toks.push(Token { kind: TokKind.Word, word: view })
     # `lx` is a mutable borrow, so moving `lx.word` out of it is refused
     # (§13.2). ptr_read takes the value out of the field's memory; the raw
@@ -145,19 +148,19 @@ fn finish_word(lx: @&Lexer)
 # $-expansion
 # ============================================================================
 
-# Length of the variable name at `p` (0 if none).
-fn name_len(p: *u8) -> i64
-    if not is_name_start(*p)
+# Length of the variable name at the start of `s` (0 if none).
+fn name_len(s: StrView) -> i64
+    if s.len == 0 or not is_name_start(s.get(0))
         return 0
     var n: i64 = 1
-    while is_name_char(*(p + n))
+    while n < s.len and is_name_char(s.get(n))
         n += 1
     return n
 
-fn emit_var(lx: @&Lexer, name: *u8, len: i64)
-    let v: *u8 = var_lookup(name, len)
-    if v != null
-        emit_cstr(lx, v)
+fn emit_var(lx: @&Lexer, name: StrView)
+    match var_lookup(name)
+        Some(v) => emit_str(lx, v)
+        None => pass
 
 # lx is at '$'. Emits the expansion and moves past it.
 fn expand_dollar(lx: @&Lexer)
@@ -167,22 +170,22 @@ fn expand_dollar(lx: @&Lexer)
         lx.i += 2
         return
     if c == '{'
-        let n: i64 = name_len(lx.line + lx.i + 2)
+        let n: i64 = name_len(rest(lx, 2))
         if n == 0 or at(lx, 2 + n) != '}'
             # Not a well-formed ${NAME}: keep the '$' literally.
             emit(lx, '$')
             lx.i += 1
             return
-        emit_var(lx, lx.line + lx.i + 2, n)
+        emit_var(lx, rest(lx, 2).take(n))
         lx.i += n + 3
         return
-    let n: i64 = name_len(lx.line + lx.i + 1)
+    let n: i64 = name_len(rest(lx, 1))
     if n == 0
         # A lone '$' (end of word, "$ ", "$1"...) stays literal.
         emit(lx, '$')
         lx.i += 1
         return
-    emit_var(lx, lx.line + lx.i + 1, n)
+    emit_var(lx, rest(lx, 1).take(n))
     lx.i += n + 1
 
 # ============================================================================
@@ -276,7 +279,7 @@ fn lex_operator(lx: @&Lexer) -> bool
 # the end. Items are tokenized one at a time, right before they run, so
 # `export X=5 ; echo $X` and `false ; echo $?` see the earlier item's effect.
 # The caller owns the result and frees it with tokens_drop.
-pub fn tokenize(line: *u8, pos: i64) -> Tokens
+pub fn tokenize(line: StrView, pos: i64) -> Tokens
     var lx: Lexer
     lx.line = line
     lx.i = pos
@@ -305,7 +308,7 @@ pub fn tokenize(line: *u8, pos: i64) -> Tokens
 
 pub struct ShellVar
     name: String
-    value: String    # kept NUL-terminated (see var_store)
+    value: String
     exported: bool
     hidden: bool     # unset tombstone: hides an inherited environ entry
 
@@ -328,34 +331,36 @@ pub var g_environ: **u8 = null
 fn var_at(idx: i64) -> *ShellVar
     return vars_vec().get_ptr(idx)
 
-# True when `name` (len bytes) is a valid shell variable name.
-pub fn is_valid_name(name: *u8, len: i64) -> bool
-    return len > 0 and name_len(name) >= len
+# True when `name` is a valid shell variable name.
+pub fn is_valid_name(name: StrView) -> bool
+    return name.len > 0 and name_len(name) >= name.len
 
-fn var_find(name: *u8, len: i64) -> i64
-    let want: StrView = strview_from_ptr(name, len)
+fn var_find(name: StrView) -> i64
     var idx: i64 = 0
     while idx < vars_vec().len
         let v: *ShellVar = var_at(idx)
-        if (v.name).eq(want)
+        if (v.name).eq(name)
             return idx
         idx += 1
     return -1
 
-# The value part of the environ entry for `name`, or null.
-fn env_find(name: *u8, len: i64) -> *u8
-    if g_environ == null
-        return null
+# Entry `k` of g_environ ("K=V"), or None past its end. The environ array is
+# C's, so this is where its NUL-terminated strings become StrViews.
+fn environ_at(k: i64) -> Option<StrView>
+    if g_environ == null or *(g_environ + k) == null
+        return None
+    return Some(strview_from_cstr(*(g_environ + k)))
+
+# The value part of the environ entry for `name`, or None.
+fn env_find(name: StrView) -> Option<StrView>
     var k: i64 = 0
-    while *(g_environ + k) != null
-        let e: *u8 = *(g_environ + k)
-        var i: i64 = 0
-        while i < len and *(e + i) == *(name + i)
-            i += 1
-        if i == len and *(e + len) == '='
-            return e + len + 1
+    while true
+        match environ_at(k)
+            Some(e) =>
+                if e.len > name.len and e.take(name.len).eq(name) and e.get(name.len) == '='
+                    return Some(e.skip(name.len + 1))
+            None => return None
         k += 1
-    return null
 
 fn var_free(v: *ShellVar)
     (v.name).deinit()
@@ -372,79 +377,74 @@ pub fn vars_clear()
 
 # The slot for `name`. A new one is appended, exported when the name is
 # inherited from the environment (an inherited variable stays exported).
-fn var_slot(name: *u8, len: i64) -> *ShellVar
-    let idx: i64 = var_find(name, len)
+fn var_slot(name: StrView) -> *ShellVar
+    let idx: i64 = var_find(name)
     if idx >= 0
         return var_at(idx)
     let v: ShellVar = ShellVar {
-        name: string_from_bytes(Span<u8> { ptr: (name), len: (len) as i64 }), value: string_new(),
-        exported: env_find(name, len) != null, hidden: false
+        name: string_from(name), value: string_new(),
+        exported: env_find(name).is_some(), hidden: false
     }
     vars_vec().push(v)
     return var_at(vars_vec().len - 1)
 
-fn var_store(v: *ShellVar, value: *u8, vlen: i64)
+fn var_store(v: *ShellVar, value: StrView)
     (v.value).clear()
-    (v.value).push_span(Span<u8> { ptr: (value), len: (vlen) as i64 })
-    (v.value).as_ptr()   # NUL-terminate, so lookups can hand out *u8
+    (v.value).push_str(value)
 
-# Sets `name` to `value` (byte lengths given). export != 0 marks it exported;
-# a variable inherited from the environment stays exported. Returns 0, or -1
-# for a bad name.
-pub fn var_set(name: *u8, len: i64, value: *u8, vlen: i64, export: i32) -> i32
-    if not is_valid_name(name, len)
+# Sets `name` to `value`. export != 0 marks it exported; a variable inherited
+# from the environment stays exported. Returns 0, or -1 for a bad name.
+pub fn var_set(name: StrView, value: StrView, export: i32) -> i32
+    if not is_valid_name(name)
         return -1
-    let v: *ShellVar = var_slot(name, len)
+    let v: *ShellVar = var_slot(name)
     v.hidden = false
-    var_store(v, value, vlen)
+    var_store(v, value)
     if export != 0
         v.exported = true
     return 0
 
 # Marks an existing variable exported, importing it from the environment
 # first if needed. Returns 0, or -1 if it isn't set anywhere.
-pub fn var_export(name: *u8, len: i64) -> i32
-    let idx: i64 = var_find(name, len)
+pub fn var_export(name: StrView) -> i32
+    let idx: i64 = var_find(name)
     if idx >= 0
         let v: *ShellVar = var_at(idx)
         if v.hidden
             return -1
         v.exported = true
         return 0
-    if idx < 0
-        let e: *u8 = env_find(name, len)
-        if e != null
-            return var_set(name, len, e, strlen(e), 1)
-    return -1
+    match env_find(name)
+        Some(e) => var_set(name, e, 1)
+        None => -1
 
-pub fn var_unset(name: *u8, len: i64)
-    let idx: i64 = var_find(name, len)
-    let inherited: bool = env_find(name, len) != null
+pub fn var_unset(name: StrView)
+    let idx: i64 = var_find(name)
+    let inherited: bool = env_find(name).is_some()
     if idx < 0 and not inherited
         return
     # An inherited variable keeps a hidden slot as a tombstone, to hide the
     # environ entry from lookups and from children.
-    let v: *ShellVar = var_slot(name, len)
+    let v: *ShellVar = var_slot(name)
     v.hidden = true
     v.exported = false
     (v.value).clear()
 
-# The value of `name`, or null when unset. Shell table first, then environ.
-pub fn var_lookup(name: *u8, len: i64) -> *u8
-    let idx: i64 = var_find(name, len)
+# The value of `name`, or None when unset. Shell table first, then environ.
+# Valid until the variable is next set or unset.
+pub fn var_lookup(name: StrView) -> Option<StrView>
+    let idx: i64 = var_find(name)
     if idx < 0
-        return env_find(name, len)
+        return env_find(name)
     let v: *ShellVar = var_at(idx)
     if v.hidden
-        return null
-    return (v.value).as_ptr()
+        return None
+    return Some((v.value).as_view())
 
 # Index of '=' when `word` is an assignment (NAME=...), else -1.
-pub fn assignment_pos(word: *u8) -> i64
-    var i: i64 = 0
-    while *(word + i) != '\0' and *(word + i) != '='
-        i += 1
-    if *(word + i) != '=' or not is_valid_name(word, i)
+pub fn assignment_pos(word: StrView) -> i64
+    let i: i64 = word.find_byte('=')
+    if i >= word.len or not is_valid_name(word.take(i))
         return -1
     return i
 
@@ -452,18 +452,18 @@ pub fn assignment_pos(word: *u8) -> i64
 pub fn vars_count() -> i64
     return vars_vec().len
 
-# The name of slot `idx` if it holds an exported variable, else null.
-pub fn var_exported_name(idx: i64) -> *u8
+# The name of slot `idx` if it holds an exported variable, else None.
+pub fn var_exported_name(idx: i64) -> Option<StrView>
     if idx < 0 or idx >= vars_vec().len
-        return null
+        return None
     let v: *ShellVar = var_at(idx)
     if v.hidden or not v.exported
-        return null
-    return (v.name).as_ptr()
+        return None
+    return Some((v.name).as_view())
 
-pub fn var_value(idx: i64) -> *u8
+pub fn var_value(idx: i64) -> StrView
     let v: *ShellVar = var_at(idx)
-    return (v.value).as_ptr()
+    return (v.value).as_view()
 
 # ============================================================================
 # Child environment
@@ -489,16 +489,13 @@ pub fn envp_drop(e: @&Envp)
 
 # Inherited entries the shell table doesn't shadow (a tombstone shadows too).
 fn envp_add_inherited(e: @&Envp)
-    if g_environ == null
-        return
     var k: i64 = 0
-    while *(g_environ + k) != null
-        let ent: *u8 = *(g_environ + k)
-        var nl: i64 = 0
-        while *(ent + nl) != '\0' and *(ent + nl) != '='
-            nl += 1
-        if var_find(ent, nl) < 0
-            e.ptrs.push(ent)
+    while true
+        match environ_at(k)
+            Some(ent) =>
+                if var_find(ent.take(ent.find_byte('='))) < 0
+                    e.ptrs.push(ent.ptr)
+            None => return
         k += 1
 
 # Builds the envp for a child: exported shell variables, then inherited
@@ -520,10 +517,14 @@ pub fn vars_build_envp() -> Envp
         idx += 1
 
     var p: *u8 = (e.buf).as_ptr()
+    idx = 0
     while count > 0
-        e.ptrs.push(p)
-        p = p + strlen(p) + 1
-        count -= 1
+        let v: *ShellVar = var_at(idx)
+        if v.exported and not v.hidden
+            e.ptrs.push(p)
+            p = p + (v.name).len() + (v.value).len() + 2   # "K=V\0"
+            count -= 1
+        idx += 1
 
     envp_add_inherited(@&e)
     e.ptrs.push(null)

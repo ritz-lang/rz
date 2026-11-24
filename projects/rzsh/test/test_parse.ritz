@@ -3,9 +3,10 @@
 # Before #2461 a line was split on whitespace only, so `$X`, `$?`, `>` and
 # `|` reached the command as literal arguments.
 
-import ritzlib.str { strlen, strcmp, strcat }
-import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.memory
+import ritzlib.option
+import ritzlib.string
+import ritzlib.strview { StrView, strview_from_cstr }
 
 import src.parse {
     TokKind, Tokens, tokenize, tokens_len, tokens_kind, tokens_word,
@@ -19,7 +20,7 @@ import src.parse {
 var g_tk: *Tokens = null
 
 # Tokenizes `line` from `pos`: the token count, or PARSE_UNTERMINATED.
-fn lex(line: *u8, pos: i64) -> i64
+fn lex(line: StrView, pos: i64) -> i64
     var tk: Tokens = tokenize(line, pos)
     if g_tk == null
         g_tk = malloc(sizeof(Tokens)) as *Tokens
@@ -36,8 +37,14 @@ fn next() -> i64
 fn kind_is(idx: i64, want: TokKind) -> bool
     tokens_kind(@*g_tk, idx) == want
 
-fn word_is(idx: i64, want: *u8) -> bool
-    return kind_is(idx, TokKind.Word) and strcmp(tokens_word(@*g_tk, idx), want) == 0
+fn word_is(idx: i64, want: StrView) -> bool
+    return kind_is(idx, TokKind.Word) and tokens_word(@*g_tk, idx).eq(want)
+
+# True when `name` is set to exactly `want`.
+fn lookup_is(name: StrView, want: StrView) -> bool
+    match var_lookup(name)
+        Some(v) => v.eq(want)
+        None => false
 
 # ----------------------------------------------------------------------------
 # Words and operators
@@ -46,26 +53,26 @@ fn word_is(idx: i64, want: *u8) -> bool
 [[test]]
 fn test_tokenize_words() -> i32
     vars_clear()
-    assert lex(c"  echo   hello\tworld ", 0) == 3
-    assert word_is(0, c"echo")
-    assert word_is(1, c"hello")
-    assert word_is(2, c"world")
+    assert lex("  echo   hello\tworld ", 0) == 3
+    assert word_is(0, "echo")
+    assert word_is(1, "hello")
+    assert word_is(2, "world")
     0
 
 [[test]]
 fn test_tokenize_operators() -> i32
     vars_clear()
     # Operators split words even without surrounding blanks.
-    assert lex(c"a|b>d>>e<f", 0) == 9
-    assert word_is(0, c"a")
+    assert lex("a|b>d>>e<f", 0) == 9
+    assert word_is(0, "a")
     assert kind_is(1, TokKind.Pipe)
-    assert word_is(2, c"b")
+    assert word_is(2, "b")
     assert kind_is(3, TokKind.Out)
-    assert word_is(4, c"d")
+    assert word_is(4, "d")
     assert kind_is(5, TokKind.Append)
-    assert word_is(6, c"e")
+    assert word_is(6, "e")
     assert kind_is(7, TokKind.In)
-    assert word_is(8, c"f")
+    assert word_is(8, "f")
     assert next() == -1
     0
 
@@ -74,15 +81,15 @@ fn test_tokenize_semicolon_items() -> i32
     vars_clear()
     # Each ';' item is tokenized on its own, so expansion in a later item
     # sees what an earlier item set.
-    let line: *u8 = c"X=1;echo $X ; ';' ;"
+    let line: StrView = "X=1;echo $X ; ';' ;"
     assert lex(line, 0) == 1
-    assert word_is(0, c"X=1")
+    assert word_is(0, "X=1")
     assert next() == 4
-    var_set(c"X", 1, c"1", 1, 0)
+    var_set("X", "1", 0)
     assert lex(line, next()) == 2
-    assert word_is(1, c"1")
+    assert word_is(1, "1")
     assert lex(line, next()) == 1
-    assert word_is(0, c";")
+    assert word_is(0, ";")
     assert lex(line, next()) == 0
     assert next() == -1
     0
@@ -90,23 +97,23 @@ fn test_tokenize_semicolon_items() -> i32
 [[test]]
 fn test_tokenize_quotes() -> i32
     vars_clear()
-    var_set(c"X", 1, c"5", 1, 0)
+    var_set("X", "5", 0)
     # '' is literal, "" expands, \ escapes; quoted operators are words.
-    assert lex(c"'$X | y' \"x=$X >\" a\\ b \"\"", 0) == 4
-    assert word_is(0, c"$X | y")
-    assert word_is(1, c"x=5 >")
-    assert word_is(2, c"a b")
-    assert word_is(3, c"")
-    assert lex(c"echo 'oops", 0) == PARSE_UNTERMINATED
-    assert lex(c"echo \"oops", 0) == PARSE_UNTERMINATED
+    assert lex("'$X | y' \"x=$X >\" a\\ b \"\"", 0) == 4
+    assert word_is(0, "$X | y")
+    assert word_is(1, "x=5 >")
+    assert word_is(2, "a b")
+    assert word_is(3, "")
+    assert lex("echo 'oops", 0) == PARSE_UNTERMINATED
+    assert lex("echo \"oops", 0) == PARSE_UNTERMINATED
     0
 
 [[test]]
 fn test_tokenize_comment() -> i32
     vars_clear()
-    assert lex(c"echo a # b c", 0) == 2
-    assert lex(c"echo a#b", 0) == 2
-    assert word_is(1, c"a#b")
+    assert lex("echo a # b c", 0) == 2
+    assert lex("echo a#b", 0) == 2
+    assert word_is(1, "a#b")
     0
 
 # ----------------------------------------------------------------------------
@@ -116,32 +123,32 @@ fn test_tokenize_comment() -> i32
 [[test]]
 fn test_expand_var() -> i32
     vars_clear()
-    assert var_set(c"X", 1, c"5", 1, 0) == 0
-    assert lex(c"echo X=$X ${X}y $Xy", 0) == 3
-    assert word_is(1, c"X=5")
-    assert word_is(2, c"5y")
+    assert var_set("X", "5", 0) == 0
+    assert lex("echo X=$X ${X}y $Xy", 0) == 3
+    assert word_is(1, "X=5")
+    assert word_is(2, "5y")
     # $Xy names the unset variable Xy: the unquoted empty word is dropped.
     0
 
 [[test]]
 fn test_expand_unset_and_literal_dollar() -> i32
     vars_clear()
-    assert lex(c"echo $NOPE \"$NOPE\" $ a$ ${", 0) == 5
-    assert word_is(1, c"")
-    assert word_is(2, c"$")
-    assert word_is(3, c"a$")
-    assert word_is(4, c"${")
+    assert lex("echo $NOPE \"$NOPE\" $ a$ ${", 0) == 5
+    assert word_is(1, "")
+    assert word_is(2, "$")
+    assert word_is(3, "a$")
+    assert word_is(4, "${")
     0
 
 [[test]]
 fn test_expand_status() -> i32
     vars_clear()
     g_last_status = 1
-    assert lex(c"echo status=$?", 0) == 2
-    assert word_is(1, c"status=1")
+    assert lex("echo status=$?", 0) == 2
+    assert word_is(1, "status=1")
     g_last_status = 127
-    assert lex(c"echo \"$?\"", 0) == 2
-    assert word_is(1, c"127")
+    assert lex("echo \"$?\"", 0) == 2
+    assert word_is(1, "127")
     g_last_status = 0
     0
 
@@ -152,24 +159,28 @@ fn test_expand_status() -> i32
 [[test]]
 fn test_var_table() -> i32
     vars_clear()
-    assert var_set(c"1X", 2, c"v", 1, 0) == -1
-    assert var_set(c"FOO", 3, c"one", 3, 0) == 0
-    assert var_set(c"FOO", 3, c"two", 3, 0) == 0
-    assert strcmp(var_lookup(c"FOO", 3), c"two") == 0
-    assert var_lookup(c"FO", 2) == null
-    var_unset(c"FOO", 3)
-    assert var_lookup(c"FOO", 3) == null
-    assert assignment_pos(c"X=5") == 1
-    assert assignment_pos(c"LONG_NAME=") == 9
-    assert assignment_pos(c"=5") == -1
-    assert assignment_pos(c"1X=5") == -1
-    assert assignment_pos(c"echo") == -1
+    assert var_set("1X", "v", 0) == -1
+    assert var_set("FOO", "one", 0) == 0
+    assert var_set("FOO", "two", 0) == 0
+    assert lookup_is("FOO", "two")
+    assert var_lookup("FO").is_none()
+    var_unset("FOO")
+    assert var_lookup("FOO").is_none()
+    assert assignment_pos("X=5") == 1
+    assert assignment_pos("LONG_NAME=") == 9
+    assert assignment_pos("=5") == -1
+    assert assignment_pos("1X=5") == -1
+    assert assignment_pos("echo") == -1
     0
 
-fn envp_has(out: **u8, want: *u8) -> bool
+# Entry `k` of a child's envp: the C array exec takes, so a C string.
+fn envp_entry(out: **u8, k: i64) -> StrView
+    return strview_from_cstr(*(out + k))
+
+fn envp_has(out: **u8, want: StrView) -> bool
     var k: i64 = 0
     while *(out + k) != null
-        if strcmp(*(out + k), want) == 0
+        if envp_entry(out, k).eq(want)
             return true
         k += 1
     false
@@ -184,27 +195,27 @@ fn test_envp_inherit_and_export() -> i32
     g_environ = @env[0]
 
     # Lookups fall back to the inherited environment.
-    assert strcmp(var_lookup(c"HOME", 4), c"/home/u") == 0
+    assert lookup_is("HOME", "/home/u")
 
     # Unexported shell variables stay out of the child; exported ones and
     # overrides of inherited ones go in.
-    var_set(c"LOCAL", 5, c"x", 1, 0)
-    var_set(c"X", 1, c"5", 1, 1)
-    var_set(c"PATH", 4, c"/usr/bin", 8, 0)
-    var_unset(c"HOME", 4)
-    assert var_lookup(c"HOME", 4) == null
+    var_set("LOCAL", "x", 0)
+    var_set("X", "5", 1)
+    var_set("PATH", "/usr/bin", 0)
+    var_unset("HOME")
+    assert var_lookup("HOME").is_none()
 
     var e: Envp = vars_build_envp()
     assert envp_len(@e) == 2
     let out: **u8 = envp_ptr(@e)
     assert *(out + 2) == null
-    assert envp_has(out, c"X=5")
-    assert envp_has(out, c"PATH=/usr/bin")
+    assert envp_has(out, "X=5")
+    assert envp_has(out, "PATH=/usr/bin")
     envp_drop(@&e)
 
     # export of an unset name fails; of a local one marks it exported.
-    assert var_export(c"NOPE", 4) == -1
-    assert var_export(c"LOCAL", 5) == 0
+    assert var_export("NOPE") == -1
+    assert var_export("LOCAL") == 0
     e = vars_build_envp()
     assert envp_len(@e) == 3
     envp_drop(@&e)
@@ -218,52 +229,49 @@ fn test_envp_inherit_and_export() -> i32
 # were hard limits.
 # ----------------------------------------------------------------------------
 
-var g_line: [16384]u8
-
-fn num_cstr(buf: *u8, n: i64) -> *u8
-    let k: i64 = fmt_i64_into(buf, n)
-    *(buf + k) = 0
-    buf
+# `prefix` followed by `n` in decimal.
+fn numbered(prefix: StrView, n: i64) -> String
+    var s: String = string_from(prefix)
+    s.push_i64(n)
+    s
 
 [[test]]
 fn test_tokenize_hundred_tokens() -> i32
     vars_clear()
     # 50 words alternating with 50 pipes: 100 tokens.
-    g_line[0] = 0
+    var line: String = string_new()
     var i: i32 = 0
     while i < 50
-        strcat(@g_line[0], c"w |")
+        line.push_str("w |")
         i += 1
-    assert lex(@g_line[0], 0) == 100
-    assert word_is(0, c"w")
+    assert lex(line.as_view(), 0) == 100
+    assert word_is(0, "w")
     assert kind_is(99, TokKind.Pipe)
-    assert word_is(98, c"w")
+    assert word_is(98, "w")
     # A long word: the old 2048-byte word buffer overflowed.
-    g_line[0] = 0
+    line.clear()
     i = 0
     while i < 300
-        strcat(@g_line[0], c"abcdefgh")
+        line.push_str("abcdefgh")
         i += 1
-    assert lex(@g_line[0], 0) == 1
-    assert strlen(tokens_word(@*g_tk, 0)) == 2400
+    assert lex(line.as_view(), 0) == 1
+    assert tokens_word(@*g_tk, 0).len == 2400
     0
 
 [[test]]
 fn test_sixty_four_variables() -> i32
     vars_clear()
-    var name: [32]u8
-    var value: [32]u8
     var i: i64 = 0
     while i < 64
-        name[0] = 'V'
-        let nl: i64 = strlen(num_cstr(@name[1], i)) + 1
-        assert var_set(@name[0], nl, num_cstr(@value[0], i * 7), strlen(@value[0]), 0) == 0
+        let name: String = numbered("V", i)
+        let value: String = numbered("", i * 7)
+        assert var_set(name.as_view(), value.as_view(), 0) == 0
         i += 1
     i = 0
     while i < 64
-        name[0] = 'V'
-        let nl: i64 = strlen(num_cstr(@name[1], i)) + 1
-        assert strcmp(var_lookup(@name[0], nl), num_cstr(@value[0], i * 7)) == 0
+        let name: String = numbered("V", i)
+        let value: String = numbered("", i * 7)
+        assert lookup_is(name.as_view(), value.as_view())
         i += 1
     vars_clear()
     0
@@ -273,24 +281,21 @@ fn test_envp_past_8k() -> i32
     vars_clear()
     # 30 exported 400-byte values (under the old 32-variable cap): ~12 KB of
     # environment, all of it present.
-    var big: [401]u8
+    var big: String = string_new()
     var k: i32 = 0
     while k < 400
-        big[k] = 'x'
+        big.push('x')
         k += 1
-    big[400] = 0
-    var name: [32]u8
     var i: i64 = 0
     while i < 30
-        name[0] = 'E'
-        let nl: i64 = strlen(num_cstr(@name[1], i)) + 1
-        big[0] = ('a' as i64 + i % 26) as u8
-        assert var_set(@name[0], nl, @big[0], 400, 1) == 0
+        let name: String = numbered("E", i)
+        big.set_char(0, ('a' as i64 + i % 26) as u8)
+        assert var_set(name.as_view(), big.as_view(), 1) == 0
         i += 1
     var e: Envp = vars_build_envp()
     assert envp_len(@e) == 30
     let out: **u8 = envp_ptr(@e)
-    assert strlen(*(out + 29)) == 404          # "E29=" + 400
+    assert envp_entry(out, 29).len == 404          # "E29=" + 400
     assert *(*(out + 29) + 4) == ('a' as i64 + 29 % 26) as u8
     assert *(out + 30) == null
     envp_drop(@&e)

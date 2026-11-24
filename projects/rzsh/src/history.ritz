@@ -2,10 +2,11 @@
 #
 # Simple ring buffer for command history with navigation.
 
-import ritzlib.str { strlen, strcmp }
 import ritzlib.gvec
 import ritzlib.memory
+import ritzlib.option
 import ritzlib.string { String, string_new }
+import ritzlib.strview { StrView }
 
 # ============================================================================
 # History configuration
@@ -40,28 +41,24 @@ fn history_vec() -> *Vec<String>
         g_history = p
     g_history
 
-# The entry in ring slot `slot`, NUL-terminated (null when out of memory).
-# Valid until that slot is next written.
-fn slot_ptr(slot: i32) -> *u8
-    return (history_vec().get_ptr(slot as i64)).as_ptr()
+# The entry in ring slot `slot`. Valid until that slot is next written.
+fn slot_view(slot: i32) -> StrView
+    return (history_vec().get_ptr(slot as i64)).as_view()
 
 # ============================================================================
 # Add a line to history
 # ============================================================================
 # Only adds non-empty lines that differ from the previous entry.
 
-pub fn history_add(line: *u8)
-    let len: i64 = strlen(line)
-
+pub fn history_add(line: StrView)
     # Skip empty lines
-    if len == 0
+    if line.len == 0
         return
 
     # Skip if same as last entry
     if g_history_count > 0
         let last: i32 = (g_history_write + HISTORY_SIZE - 1) % HISTORY_SIZE
-        let prev: *u8 = slot_ptr(last)
-        if prev != null and strcmp(line, prev) == 0
+        if slot_view(last).eq(line)
             return
 
     # A slot past the end of g_history is new; otherwise reuse its String.
@@ -70,13 +67,9 @@ pub fn history_add(line: *u8)
             return  # Out of memory: drop the entry
     let entry: *String = history_vec().get_ptr(g_history_write as i64)
     entry.clear()
-    if not entry.push_span(Span<u8> { ptr: (line), len: (len) as i64 })
+    if not entry.push_str(line)
         entry.clear()
         return  # Out of memory: the slot stays unused
-    # Reserve the NUL now so slot_ptr cannot fail for this entry.
-    if entry.as_ptr() == null
-        entry.clear()
-        return
 
     # Advance write pointer
     g_history_write = (g_history_write + 1) % HISTORY_SIZE
@@ -96,49 +89,49 @@ pub fn history_reset_nav()
 # ============================================================================
 # Navigate up (older entries)
 # ============================================================================
-# Returns pointer to history line, or null if at oldest entry.
+# Returns the history line, or None if at oldest entry.
 
-pub fn history_up() -> *u8
+pub fn history_up() -> Option<StrView>
     if g_history_count == 0
-        return null
+        return None
 
     # If at prompt (nav = -1), start at most recent
     if g_history_nav == -1
         g_history_nav = g_history_count - 1
         let idx: i32 = (g_history_write + HISTORY_SIZE - 1) % HISTORY_SIZE
-        return slot_ptr(idx)
+        return Some(slot_view(idx))
 
-    # If already at oldest, return null
+    # If already at oldest, return None
     if g_history_nav == 0
-        return null
+        return None
 
     # Move to older entry
     g_history_nav = g_history_nav - 1
     let idx: i32 = (g_history_write + HISTORY_SIZE - g_history_count + g_history_nav) % HISTORY_SIZE
-    return slot_ptr(idx)
+    return Some(slot_view(idx))
 
 # ============================================================================
 # Navigate down (newer entries)
 # ============================================================================
-# Returns pointer to history line, or null if at prompt position.
+# Returns the history line, or None if at prompt position.
 
-pub fn history_down() -> *u8
+pub fn history_down() -> Option<StrView>
     if g_history_count == 0
-        return null
+        return None
 
     # If at prompt, stay there
     if g_history_nav == -1
-        return null
+        return None
 
     # If at most recent, return to prompt
     if g_history_nav >= g_history_count - 1
         g_history_nav = -1
-        return null
+        return None
 
     # Move to newer entry
     g_history_nav = g_history_nav + 1
     let idx: i32 = (g_history_write + HISTORY_SIZE - g_history_count + g_history_nav) % HISTORY_SIZE
-    return slot_ptr(idx)
+    return Some(slot_view(idx))
 
 # ============================================================================
 # Get current navigation position
@@ -159,12 +152,12 @@ pub fn history_count() -> i32
 # Get history entry by index (0 = oldest)
 # ============================================================================
 
-pub fn history_get(index: i32) -> *u8
+pub fn history_get(index: i32) -> Option<StrView>
     if index < 0 or index >= g_history_count
-        return null
+        return None
 
     let idx: i32 = (g_history_write + HISTORY_SIZE - g_history_count + index) % HISTORY_SIZE
-    return slot_ptr(idx)
+    return Some(slot_view(idx))
 
 # ============================================================================
 # Clear history
