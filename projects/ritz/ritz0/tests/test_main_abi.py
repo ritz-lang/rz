@@ -33,7 +33,6 @@ import main_abi
 from conftest import RITZ_ROOT
 from test_ref_into_value import COMPILERS, _assert_refused, _compile, _link
 
-pytestmark = [pytest.mark.integration]
 
 ARGS = ["hello", "wor"]
 ENV = {"FOO": "1", "BAR": "22"}
@@ -83,6 +82,7 @@ fn main(argc: i32, argv: **u8) -> i32
 }
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(RUNS))
 def test_main_shape_runs(tmp_path, compiler, name):
@@ -118,6 +118,7 @@ REFUSED = {
 }
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_main_shape_refused(tmp_path, compiler, name):

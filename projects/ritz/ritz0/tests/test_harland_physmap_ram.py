@@ -23,7 +23,6 @@ import pytest
 
 from test_harland_syscall_dispatch import KERNEL_SRC, _run
 
-pytestmark = pytest.mark.integration
 
 VMM_SRC = KERNEL_SRC / "mm" / "vmm.ritz"
 
@@ -141,6 +140,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 def test_physmap_maps_only_ram_chunks(tmp_path):
     rc = _run("ritz0", tmp_path, PHYSMAP_PROGRAM, VMM_MODULES)
     assert rc == 0, f"physmap check {rc} failed (see PHYSMAP_PROGRAM)"

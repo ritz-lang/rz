@@ -40,8 +40,6 @@ import test_ir
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 
-pytestmark = pytest.mark.integration
-
 
 def _compile(tmp_path, source, name="unit"):
     src = tmp_path / f"{name}.ritz"
@@ -94,6 +92,7 @@ fn arg_slot(v: i32) -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_the_ticket_rows_compile_at_the_sibling_width(tmp_path):
     """Accepted, and computed at the operand's width: no i64, no trunc."""
@@ -109,6 +108,7 @@ def test_the_ticket_rows_compile_at_the_sibling_width(tmp_path):
         assert not wide, f"{fn}: the all-literal operand was computed in i64: {wide}"
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_a_folded_value_that_does_not_fit_keeps_the_old_path(tmp_path):
     """`x + (1 << 40)` with x: u32 is not an error: it widens, as it did."""
@@ -161,6 +161,7 @@ def _expr(src):
     return Parser(list(Lexer(src, "test").tokenize())).parse_expr()
 
 
+@pytest.mark.integration
 @pytest.mark.unit
 def test_folded_operands_give_the_same_answers(tmp_path):
     """Each check fails with its own exit code; 0 is all right.

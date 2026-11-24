@@ -132,7 +132,6 @@ def test_ritz0_and_ritz1_emit_identical_guid_images(ritz1_bin, tmp_path):
         )
 
 
-@pytest.mark.integration
 def test_boot_source_initialises_guids_in_place():
     """No hand-filling remains: `init_guids` is gone and each var has a literal."""
     source = BOOT_SRC.read_text()

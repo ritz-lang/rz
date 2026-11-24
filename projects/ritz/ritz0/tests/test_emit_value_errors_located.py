@@ -35,7 +35,6 @@ import pytest
 
 from ritz0_inproc import run_ritz0
 
-pytestmark = pytest.mark.integration
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 
@@ -322,6 +321,7 @@ fn main() -> i32
 }
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("row", sorted(ROWS))
 def test_user_error_is_located_not_a_traceback(tmp_path, row):
     marked, message, _ = ROWS[row]
@@ -332,6 +332,7 @@ def test_user_error_is_located_not_a_traceback(tmp_path, row):
     assert f"main.ritz:{where}: {message}" in comp.stderr, comp.stderr[-3000:]
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("row", sorted(ROWS))
 def test_corrected_program_still_compiles(tmp_path, row):
     good = ROWS[row][2]

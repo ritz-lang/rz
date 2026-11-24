@@ -37,7 +37,6 @@ import test_ir
 
 from ritz0_inproc import run_ritz0
 
-pytestmark = pytest.mark.integration
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
@@ -158,6 +157,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_syscall_enum_discriminants_are_the_abi(compiler, tmp_path):
     rc = _run(compiler, tmp_path, _abi_program(), ["syscall.numbers"])
@@ -223,6 +223,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_dispatch_table(compiler, tmp_path):
     assert _run(compiler, tmp_path, DISPATCH, ["syscall.errno", "syscall.numbers", "syscall.dispatch"]) == 0
@@ -230,6 +231,7 @@ def test_dispatch_table(compiler, tmp_path):
 
 # --- the kernel's use of it ------------------------------------------------------
 
+@pytest.mark.integration
 def test_syscall_handler_cc_at_most_15(tmp_path):
     out = tmp_path / "m.json"
     proc = subprocess.run([sys.executable, str(METRICS), "--json", str(out),
@@ -249,6 +251,7 @@ def test_kernel_registers_every_dispatched_syscall():
     assert not re.search(r"\brax == SYS_", src), "the `if rax ==` ladder is back"
 
 
+@pytest.mark.integration
 def test_syscall_init_fills_the_table(tmp_path):
     """syscall/runtime/entry.ritz compiles as `rz build harland` does, and
     syscall_init (run before any user program) fills the table: without it every

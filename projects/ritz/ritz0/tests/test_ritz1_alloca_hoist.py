@@ -675,7 +675,6 @@ def test_ritz1_splice_is_a_no_op_without_allocas(ritz1_bin, tmp_path):
 # The ticket deletes the text re-parse pass.  Behaviour alone cannot tell the
 # two mechanisms apart, so pin the source: no pass over the finished body, and
 # the emission-time buffer present.
-@pytest.mark.integration
 def test_ritz1_has_no_text_reparse_hoist_pass():
     src = (RITZ_ROOT / "ritz1" / "src" / "emitter.ritz").read_text()
     for gone in (

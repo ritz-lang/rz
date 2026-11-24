@@ -22,7 +22,6 @@ import pytest
 
 from test_harland_syscall_dispatch import KERNEL_SRC, _run
 
-pytestmark = pytest.mark.integration
 
 VMM_SRC = KERNEL_SRC / "mm" / "vmm.ritz"
 
@@ -88,6 +87,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 def test_mmio_window_pdpt_exists_before_the_first_process_and_is_shared(tmp_path):
     rc = _run("ritz0", tmp_path, WINDOW_PROGRAM, VMM_MODULES)
     assert rc == 0, f"MMIO window check {rc} failed (see WINDOW_PROGRAM)"

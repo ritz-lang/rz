@@ -550,7 +550,6 @@ class TestPathToImportName:
 class TestFullRoundTrip:
     """Integration tests for the complete cache flow."""
 
-    @pytest.mark.integration
     def test_build_write_read_check(self):
         """Full round-trip: build hashes, write sig, read back, check cache."""
         src = "fn foo() -> i32\n    42\n\nfn bar() -> i32\n    99\n"

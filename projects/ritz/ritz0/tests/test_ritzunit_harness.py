@@ -27,7 +27,6 @@ sys.path.insert(0, str(RITZ0_DIR))
 import test_runner  # noqa: E402
 
 # Every test builds and runs a binary.
-pytestmark = pytest.mark.integration
 
 # AGAST #1909: every test below runs both sequentially and under `-j 4`, so
 # crash, timeout and output attribution are pinned for the pool too. This is
@@ -86,6 +85,7 @@ def _run(exe: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run([exe, *args, *extra], capture_output=True, timeout=120)
 
 
+@pytest.mark.integration
 def test_attribute_not_name_prefix_decides_what_runs(package, tmp_path):
     """(c) `fn test_helper` is not a test; `[[test]] fn check_x` is."""
     exe = _binary(package("""\
@@ -103,6 +103,7 @@ def test_attribute_not_name_prefix_decides_what_runs(package, tmp_path):
     assert proc.returncode == 0
 
 
+@pytest.mark.integration
 def test_three_hundred_failures_exit_nonzero(package, tmp_path):
     """(d) ritzunit exited with the failure count: 256 failures exited 0."""
     tests = "".join(f"[[test]]\nfn fails_{i}() -> i32\n    1\n\n" for i in range(300))
@@ -116,6 +117,7 @@ def test_three_hundred_failures_exit_nonzero(package, tmp_path):
     assert test_runner.run_test_file(str(test_file))[:2] == (0, 300)
 
 
+@pytest.mark.integration
 def test_printing_tests_leave_json_parseable(package, tmp_path):
     """(e) Child output used to go straight to the runner's stdout."""
     exe = _binary(package("""\
@@ -146,6 +148,7 @@ def test_printing_tests_leave_json_parseable(package, tmp_path):
     assert failed["output"] == 'quote " backslash \\ tab \t bell \x07 done\non stderr\n'
 
 
+@pytest.mark.integration
 def test_human_output_shows_a_failing_tests_output(package, tmp_path):
     exe = _binary(package("""\
         import ritzlib.io
@@ -160,6 +163,7 @@ def test_human_output_shows_a_failing_tests_output(package, tmp_path):
     assert b"the reason" in proc.stdout
 
 
+@pytest.mark.integration
 def test_result_256_fails(package, tmp_path):
     """An exit status keeps 8 bits: a test returning 256 used to pass."""
     test_file = package("""\
@@ -186,6 +190,7 @@ def _run_filtered(exe: str, monkeypatch, pattern: str, timeout_ms: int):
         monkeypatch.setattr(test_runner, "runner_args", base)
 
 
+@pytest.mark.integration
 def test_crash_assert_and_timeout_are_attributed(package, tmp_path, monkeypatch):
     """AGAST #2070: only `hangs` races a short deadline.
 
@@ -288,6 +293,7 @@ fn via_helper() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 def test_assert_location_names_the_test_file(package, tmp_path, request, compiler):
     """AGAST #2181: a failing assert names the test's own file and line.
@@ -311,6 +317,7 @@ def test_assert_location_names_the_test_file(package, tmp_path, request, compile
     assert "test_main" not in "".join(output.values()), output
 
 
+@pytest.mark.integration
 def test_runner_symbols_cannot_clash_with_the_program(package, tmp_path):
     """The runner is linked with every symbol but `main` made local.
 
@@ -347,6 +354,7 @@ def test_runner_symbols_cannot_clash_with_the_program(package, tmp_path):
     assert test_runner.run_test_file(str(test_file))[:2] == (1, 0)
 
 
+@pytest.mark.integration
 def test_runner_arguments_reach_the_runner(package, tmp_path):
     """`main(argc, argv)` gets real arguments: --list and --filter work."""
     exe = _binary(package("""\

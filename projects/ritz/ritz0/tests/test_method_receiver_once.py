@@ -26,7 +26,6 @@ from lexer import tokenize
 from parser import Parser
 from ritz0_inproc import run_ritz0
 
-pytestmark = pytest.mark.integration
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
@@ -592,6 +591,7 @@ def _run(request, tmp_path, compiler, program):
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler,name", _params(CASES))
 def test_receiver_evaluated_once(request, tmp_path, compiler, name):
     body, made, drops, _ = CASES[name]
@@ -601,6 +601,7 @@ def test_receiver_evaluated_once(request, tmp_path, compiler, name):
         f"{compiler} {name}: exit {rc}, expected MADE={made} DROPS={drops}")
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
 def test_array_temporary_spilled_once(request, tmp_path, compiler):
     """ritz1's `mkt()[1].peek()` reads the element from the slot its drop is
@@ -613,6 +614,7 @@ def test_array_temporary_spilled_once(request, tmp_path, compiler):
     assert len(re.findall(r"= alloca \[2 x %T\]", g)) == 1, g
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler,name", _params(PROGRAMS))
 def test_receiver_program(request, tmp_path, compiler, name):
     program, expected, _ = PROGRAMS[name]

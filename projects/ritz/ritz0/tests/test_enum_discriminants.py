@@ -38,8 +38,6 @@ SPEC = RITZ_ROOT / "docs" / "LANGUAGE_SPEC.md"
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
-pytestmark = pytest.mark.integration
-
 
 def _compile(compiler, tmp_path, src, name="t", extra=()):
     path = tmp_path / f"{name}.ritz"
@@ -163,6 +161,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_as_integer(compiler, tmp_path):
     assert _run(compiler, tmp_path, AS_INT) == 42
@@ -230,6 +229,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_from(compiler, tmp_path):
     assert _run(compiler, tmp_path, FROM) == 42
@@ -256,6 +256,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_from_in_generic_fn(compiler, tmp_path):
     assert _run(compiler, tmp_path, FROM_GENERIC) == 46
@@ -312,6 +313,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_const_patterns(compiler, tmp_path):
     assert _run(compiler, tmp_path, CONST_PATTERNS) == 42
@@ -367,6 +369,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_across_modules(compiler, tmp_path):
     assert _run(compiler, tmp_path, CROSS, {"numbers": NUMBERS}) == 42
@@ -571,6 +574,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_enum_positions_ok(compiler, tmp_path):
     assert _run(compiler, tmp_path, ENUM_POSITIONS_OK) == 41
@@ -605,6 +609,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_ptr_cast_beside_enum_field(compiler, tmp_path):
     assert _run(compiler, tmp_path, PTR_CAST_BESIDE_ENUM_FIELD) == 42
@@ -635,6 +640,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_deref_enum_ptr(compiler, tmp_path):
     assert _run(compiler, tmp_path, DEREF_ENUM_PTR) == 42
@@ -674,11 +680,13 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_enum_identity_cast(compiler, tmp_path):
     assert _run(compiler, tmp_path, ENUM_IDENTITY_CAST) == 47
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(REJECTS))
 def test_rejected(compiler, case, tmp_path):
@@ -701,6 +709,7 @@ def _spec_examples():
     return blocks
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_spec_examples(compiler, tmp_path):
     for i, block in enumerate(_spec_examples()):

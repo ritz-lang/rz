@@ -37,8 +37,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from resolve import package_import_namespaces, read_manifest  # noqa: E402
 
 
-pytestmark = pytest.mark.integration   # each fixture runs ritz0 (AGAST #1805)
-
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ0 = RITZ0_DIR / "ritz0.py"
 HARLAND = RITZ0_DIR.parents[1] / "harland"
@@ -106,11 +104,13 @@ def boot_ir(tmp_path_factory):
 
 # --- main.ritz and arch/x86_64/apic.ritz: AP counter and linker symbols -----
 
+@pytest.mark.integration
 def test_ap_count_increment_is_atomic(apic_ir):
     body = _body(apic_ir, "ap_entry")
     assert re.search(r'atomicrmw add i32\* @"ap_count", i32 \S+ seq_cst', body), body
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("module,sym", [("main", "__bss_start"), ("main", "__bss_end"),
                                         ("apic", "ap_trampoline_start"), ("apic", "ap_trampoline_end")])
 def test_linker_symbols_are_extern_vars(request, module, sym):
@@ -123,6 +123,7 @@ def test_linker_symbols_are_extern_vars(request, module, sym):
 
 # --- drivers/virtio/common.ritz: ring publish and MMIO ---------------------
 
+@pytest.mark.integration
 def test_vq_submit_fences_before_idx_publish(virtio_ir):
     body = _body(virtio_ir, "vq_submit")
     stores = [m.start() for m in re.finditer(r"^\s+store ", body, re.M)]
@@ -132,12 +133,14 @@ def test_vq_submit_fences_before_idx_publish(virtio_ir):
     assert any(s < fence for s in stores) and any(s > fence for s in stores), body
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("width", [8, 16, 32])
 def test_virtio_mmio_accesses_are_volatile(virtio_ir, width):
     assert re.search(rf"load volatile i{width}, ", _body(virtio_ir, f"mmio_read{width}"))
     assert re.search(rf"store volatile i{width} ", _body(virtio_ir, f"mmio_write{width}"))
 
 
+@pytest.mark.integration
 def test_io_memory_barrier_is_fence(tmp_path_factory):
     # ENA and virtio-net call this instead of open-coding mfence.
     body = _body(_compile(tmp_path_factory, "io.ritz"), "memory_barrier")
@@ -146,6 +149,7 @@ def test_io_memory_barrier_is_fence(tmp_path_factory):
 
 # --- boot/src/main.ritz: UEFI calls ---------------------------------------
 
+@pytest.mark.integration
 def test_boot_calls_uefi_through_win64_fn_types(boot_ir):
     assert not re.search(r'^define [^\n]*@"uefi_call\d', boot_ir, re.M), \
         "the uefi_call* MS-x64 asm shims are still defined"

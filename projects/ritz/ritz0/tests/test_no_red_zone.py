@@ -43,7 +43,6 @@ RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 HARLAND = RITZ_ROOT.parent / "harland"
 CHECKER = HARLAND / "tools" / "check_no_red_zone.py"
 
-pytestmark = pytest.mark.integration
 
 # A leaf fn (no call, so no `sub rsp`: its locals go in the red zone, as
 # ioapic_read's did), an impl method (a separate define path in ritz1) and a
@@ -178,19 +177,23 @@ needs_toolchain = pytest.mark.skipif(
 
 # --- ritz0 -----------------------------------------------------------------
 
+@pytest.mark.integration
 def test_ritz0_flag_marks_every_defined_fn(tmp_path, program):
     _assert_all_noredzone(_ritz0(tmp_path, program, "--no-red-zone"), "Ctr_bump")
 
 
+@pytest.mark.integration
 def test_ritz0_default_hosted_emits_no_noredzone(tmp_path, program):
     _assert_none_noredzone(_ritz0(tmp_path, program))
 
 
+@pytest.mark.integration
 def test_ritz0_freestanding_triple_still_marks_every_fn(tmp_path, program):
     _assert_all_noredzone(_ritz0(tmp_path, program, "--target", "x86_64-none-elf"),
                           "Ctr_bump")
 
 
+@pytest.mark.integration
 def test_ritz0_warm_compile_keys_on_the_flag(tmp_path, program):
     """Same source, same output path: off, then on, then off again."""
     _assert_none_noredzone(_ritz0(tmp_path, program))
@@ -198,6 +201,7 @@ def test_ritz0_warm_compile_keys_on_the_flag(tmp_path, program):
     _assert_none_noredzone(_ritz0(tmp_path, program))
 
 
+@pytest.mark.integration
 @needs_toolchain
 def test_ritz0_object_never_addresses_below_rsp(tmp_path, program):
     """The control proves the program does use the red zone without the flag,
@@ -208,6 +212,7 @@ def test_ritz0_object_never_addresses_below_rsp(tmp_path, program):
     assert _below_rsp(on) == []
 
 
+@pytest.mark.integration
 def test_ritz0_llvmlite_attrs_keep_no_builtins(tmp_path, program):
     """noredzone and sspstrong are llvmlite attributes, printed between a
     define's `)` and `!dbg`. The text pass that adds alignstack(16) and
@@ -232,26 +237,31 @@ def _assert_every_define_noredzone(ir: str) -> None:
         assert _has_noredzone(ir, line), f"{name} lacks noredzone: {line}"
 
 
+@pytest.mark.integration
 def test_ritz0_every_define_carries_noredzone(tmp_path, program):
     _assert_every_define_noredzone(_ritz0(tmp_path, program, "--no-red-zone"))
 
 
 # --- ritz1 (the gate builds it first, as for test_stack_protector.py) -------
 
+@pytest.mark.integration
 def test_ritz1_flag_marks_every_defined_fn(tmp_path, program):
     _assert_all_noredzone(_ritz1(tmp_path, program, "--no-red-zone"), "Ctr_bump")
 
 
+@pytest.mark.integration
 def test_ritz1_every_define_carries_noredzone(tmp_path, program):
     ir = _ritz1(tmp_path, program, "--no-red-zone")
     assert "__ritz_sret_copy" in _define_lines(ir), "expected an sret helper"
     _assert_every_define_noredzone(ir)
 
 
+@pytest.mark.integration
 def test_ritz1_default_emits_no_noredzone(tmp_path, program):
     _assert_none_noredzone(_ritz1(tmp_path, program))
 
 
+@pytest.mark.integration
 def test_ritz1_warm_compile_keys_on_the_flag(tmp_path, program):
     """ritz1's sig fast path (AGAST #1807) must not hand back red-zone IR."""
     _assert_none_noredzone(_ritz1(tmp_path, program))
@@ -300,6 +310,7 @@ def test_checker_passes_clean_code(checker):
     assert checker.red_zone_functions(clean) == {}
 
 
+@pytest.mark.integration
 @needs_toolchain
 def test_checker_cli_exit_codes(tmp_path, program):
     off = _compile_obj(tmp_path, _ritz0(tmp_path, program), "off")

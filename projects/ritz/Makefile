@@ -116,7 +116,7 @@ TOOLS_RATCHETS = tools/test_ritz1_*.py tools/test_ritz0_*.py tools/test_ritzgen_
 # They are picked by rule, not by list, so a new one cannot drift out:
 # `-m inproc` (ritz0/conftest.py item 13) is every ritz0 test that is not
 # `integration` and asks for no ritz1-building fixture, so it compiles
-# nothing (spawn_guard, item 9).  ~2300 tests, ~60 s serial; serial because
+# nothing (spawn_guard, item 9).  ~2400 tests, ~60 s serial; serial because
 # under xdist the controller builds ritz1 first (item 4).  A separate pytest
 # from tools/ (the read guard, #4032, fails tools tests in a ritz0 session),
 # and run alongside it, so the target takes about as long as the slower half.

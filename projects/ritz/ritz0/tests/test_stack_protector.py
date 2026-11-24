@@ -46,7 +46,6 @@ RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
 HARLAND = RITZ_ROOT.parent / "harland"
 KERNEL_SRC = HARLAND / "kernel" / "src"
 
-pytestmark = pytest.mark.integration
 
 # One plain fn with a stack array (the case sspstrong instruments), one
 # impl method (a separate define path in ritz1), one [[naked]] fn (must be
@@ -129,14 +128,17 @@ def program(tmp_path):
 
 # --- ritz0 -----------------------------------------------------------------
 
+@pytest.mark.integration
 def test_ritz0_flag_protects_every_defined_fn_but_naked(tmp_path, program):
     _assert_protected(_ritz0(tmp_path, program, "--stack-protector"), "Ctr_bump")
 
 
+@pytest.mark.integration
 def test_ritz0_default_emits_no_stack_protector(tmp_path, program):
     assert "sspstrong" not in _ritz0(tmp_path, program)
 
 
+@pytest.mark.integration
 def test_ritz0_warm_compile_keys_on_the_flag(tmp_path, program):
     """Same source, same output path: off, then on, then off again."""
     assert "sspstrong" not in _ritz0(tmp_path, program)
@@ -146,10 +148,12 @@ def test_ritz0_warm_compile_keys_on_the_flag(tmp_path, program):
 
 # --- ritz1 (the gate builds it first, as for test_ritz1_target_os.py) -------
 
+@pytest.mark.integration
 def test_ritz1_flag_protects_every_defined_fn_but_naked(tmp_path, program):
     _assert_protected(_ritz1(tmp_path, program, "--stack-protector"), "Ctr_bump")
 
 
+@pytest.mark.integration
 def test_ritz1_warm_compile_keys_on_the_flag(tmp_path, program):
     """ritz1's sig fast path (AGAST #1807) must not hand back unprotected IR."""
     assert "sspstrong" not in _ritz1(tmp_path, program)
@@ -172,6 +176,7 @@ def test_harland_kernel_opts_in_and_the_uefi_loader_does_not():
     assert not bins["bootx64"].get("bootx64", {}).get("flags", {}).get("stack-protector")
 
 
+@pytest.mark.integration
 def test_harland_defines_the_guard_and_the_failure_handler(tmp_path):
     # serial (which stack_protector imports) re-exports boot_abi.serial, a
     # harland [dependency] (#4578): passed as `rz build harland` does.
@@ -223,6 +228,7 @@ def test_harland_boot_mixes_rdrand_only_when_cpuid_reports_it():
         "the CPUID check and RDRAND must precede the guard store"
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(shutil.which("clang") is None, reason="clang not on PATH")
 def test_freestanding_object_reads_the_global_guard(tmp_path, program):
     """On x86_64-none-elf the canary comes from the global harland defines."""

@@ -26,7 +26,6 @@ from float_rules import mixed_float_compare
 from test_ref_into_value import COMPILERS
 from test_table_rows import assert_refusals, assert_runs
 
-pytestmark = pytest.mark.integration
 
 OPS = ["==", "!=", "<", "<=", ">", ">="]
 
@@ -119,11 +118,13 @@ pub fn main() -> i32
 }
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_mixed_float_compare_is_refused(tmp_path, compiler):
     assert_refusals(compiler, tmp_path, _refused())
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_widening_and_explicit_as_run(tmp_path, compiler):
     assert_runs(compiler, tmp_path, RUNS)

@@ -21,7 +21,6 @@ import pytest
 from ritz0_inproc import run_ritz0
 from test_typing_pass_only import compile_typing_only
 
-pytestmark = pytest.mark.integration
 
 PRELUDE = """\
 struct M
@@ -112,6 +111,7 @@ fn step2(op: u8, c: bool) -> Result<(), i32>
 }
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(DISCARDED))
 def test_discarded_match_or_if_arms_needn_t_agree(tmp_path, name):
     result = _check(tmp_path, DISCARDED[name])

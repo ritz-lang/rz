@@ -26,7 +26,7 @@ import pytest
 from no_effect import STRING_HINT, no_effect_message
 from test_ref_into_value import _assert_refused, _run
 
-pytestmark = [pytest.mark.integration, pytest.mark.batched]
+pytestmark = pytest.mark.batched
 
 COMPILER = "ritz0"
 
@@ -182,6 +182,7 @@ def _expr_text(marked: str) -> str:
     return marked[marked.index("^") + 1:].split("\n", 1)[0]
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_no_effect_statement_is_refused(tmp_path, name):
     marked = PRELUDE + REFUSED[name]
@@ -189,6 +190,7 @@ def test_no_effect_statement_is_refused(tmp_path, name):
                     no_effect_message(_expr_text(marked), is_string=False))
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(INLINE))
 def test_quoted_expression_ends_with_it(tmp_path, name):
     marked, text = INLINE[name]
@@ -196,6 +198,7 @@ def test_quoted_expression_ends_with_it(tmp_path, name):
                     no_effect_message(text, is_string=False))
 
 
+@pytest.mark.integration
 def test_string_statement_names_print(tmp_path):
     marked = PRELUDE + STRING
     message = no_effect_message(_expr_text(marked), is_string=True)
@@ -210,6 +213,7 @@ def test_message_words():
     assert STRING_HINT == "a string on its own line prints nothing: call print"
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(LEGAL))
 def test_effectful_statement_is_legal(tmp_path, name):
     assert _run(COMPILER, tmp_path, name, PRELUDE + LEGAL[name]) == 0

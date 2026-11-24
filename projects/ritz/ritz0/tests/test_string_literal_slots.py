@@ -623,7 +623,6 @@ def _type_check_wrong(here, accepted, name):
     return None
 
 
-@pytest.mark.integration
 def test_type_check_rows(tmp_path):
     """A literal in a pointer slot passes the typing pass; a non-literal is
     refused in the checker's own words.  Every failing row is named."""

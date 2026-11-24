@@ -37,8 +37,6 @@ RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 NEEDLE = "cannot be declaration-only"
 
-pytestmark = pytest.mark.integration
-
 
 def _compile(compiler, tmp_path, files, main, extra=()):
     for name, src in files.items():
@@ -131,6 +129,7 @@ def _declares(ll: Path) -> dict:
     return found
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_declare_matches_import(compiler, tmp_path):
     """The declaration form produces the same `declare` as an import does."""
@@ -141,6 +140,7 @@ def test_declare_matches_import(compiler, tmp_path):
     assert decl == imp
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_decl_defines_nothing(compiler, tmp_path):
     """A declared fn is never `define`d by the declaring module."""
@@ -151,6 +151,7 @@ def test_decl_defines_nothing(compiler, tmp_path):
             f"{compiler} defined {sym}:\n{ir}"
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_links_against_definition(compiler, tmp_path):
     files = {"lib": LIB, "main_decl": MAIN_DECL}
@@ -170,6 +171,7 @@ def test_links_against_definition(compiler, tmp_path):
     assert run.returncode == EXPECTED_EXIT
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_unused_decl_compiles(compiler, tmp_path):
     src = DECLS + "\nfn main() -> i32\n    0\n"
@@ -218,6 +220,7 @@ fn main() -> i32
 }
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(REJECTS))
 def test_rejected(compiler, case, tmp_path):
@@ -231,6 +234,7 @@ def test_rejected(compiler, case, tmp_path):
     assert f"'{name}'" in out, f"{compiler}: error does not name '{name}':\n{out}"
 
 
+@pytest.mark.integration
 def test_async_rejected_ritz0(tmp_path):
     src = "async fn later() -> i64 = extern\n\nfn main() -> i32\n    0\n"
     proc, _ = _compile("ritz0", tmp_path, {"t": src}, "t")

@@ -37,7 +37,6 @@ import pytest
 
 from test_ref_into_value import RITZ1_BUILD, RITZ_ROOT, _compile, _emit
 
-pytestmark = pytest.mark.integration
 
 COMPILERS = ["ritz1", "ritz1_selfhosted"]
 
@@ -123,6 +122,7 @@ def _probe(value):
     return dict(os.environ, RITZ_PATH=str(RITZ_ROOT), RITZ1_SEMA_PROBE=value)
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_sema_annotates_the_node_local_slot_types(request, tmp_path, compiler, monkeypatch):
     request.getfixturevalue("ritz1_bin")
@@ -141,6 +141,7 @@ def test_sema_annotates_the_node_local_slot_types(request, tmp_path, compiler, m
             f"{compiler}: e{kind} got a slot {sorted(seen[kind])}; it needs Sema's scope\n{out}"
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_the_annotation_changes_no_ir(request, tmp_path, compiler):
     request.getfixturevalue("ritz1_bin")
@@ -165,6 +166,7 @@ def test_the_annotation_changes_no_ir(request, tmp_path, compiler):
         f"{compiler}: the annotation changed the emitted IR"
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_print_placeholder_still_prints(request, tmp_path, compiler):
     request.getfixturevalue("ritz1_bin")
@@ -179,6 +181,7 @@ SLOT_SUMMARY = re.compile(r"sema-probe-slot: (\d+) compared, (\d+) mismatched, "
 SLOT_CORPUS_FLOOR = 15000
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_sema_slot_agrees_with_the_emitter_on_the_matrix_corpus(request, tmp_path, compiler):
     """The whole former get_expr_type rule, checked against the emitter's own

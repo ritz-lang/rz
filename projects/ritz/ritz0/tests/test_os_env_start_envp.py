@@ -35,8 +35,6 @@ from ritz0_inproc import run_ritz0
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from build import ensure_runtime_object
 
-pytestmark = pytest.mark.integration
-
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME = RITZ_ROOT / "runtime"
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
@@ -118,6 +116,7 @@ def _build_pkg(compiler: str, tmp_path: Path, name: str, program: str) -> Path:
     return exe
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "compiler,arity",
     [
@@ -230,11 +229,13 @@ def _compile_link_run(
     ).returncode
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("arity", sorted(MAINS))
 def test_ritz0_inline_start_sets_ritz_envp(request, tmp_path, arity):
     assert _compile_link_run(request, tmp_path, "ritz0", _reads_global(arity)) == 0
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("arity", sorted(MAINS))
 def test_linux_shim_sets_ritz_envp(request, tmp_path, arity):
     """One `_start` for every shape of `main` (AGAST #200)."""

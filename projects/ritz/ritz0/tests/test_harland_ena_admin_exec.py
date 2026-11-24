@@ -32,7 +32,6 @@ import pytest
 
 from test_harland_ena_tx_buffers import KERNEL_SRC, _run
 
-pytestmark = pytest.mark.integration
 
 DEVICE = KERNEL_SRC / "drivers" / "ena" / "device.ritz"
 
@@ -115,6 +114,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 def test_ena_admin_exec_success_error_and_timeout(tmp_path):
     rc = _run(tmp_path, PROGRAM)
     assert rc == 0, f"check {rc}: {CHECKS.get(rc, 'crashed or unknown exit code')}"

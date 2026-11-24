@@ -24,7 +24,6 @@ import pytest
 import fast_link
 from ritz0_inproc import run_ritz0
 
-pytestmark = pytest.mark.integration
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 RITZ_ROOT = RITZ0_DIR.parent
@@ -257,6 +256,7 @@ def _run(tmp_path):
     return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
 
 
+@pytest.mark.integration
 def test_echo_requests_are_answered_and_counted(tmp_path):
     rc = _run(tmp_path)
     assert rc == 0, f"check {rc}: {CHECKS.get(rc, 'crashed or unknown exit code')}"

@@ -19,7 +19,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from emitter import intrinsics  # noqa: E402
 from ritz0_inproc import run_ritz0  # noqa: E402
 
-pytestmark = pytest.mark.integration
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 LOCATED = r"main\.ritz:\d+:\d+: "
@@ -73,6 +72,7 @@ def test_tables_cover_exactly_the_documented_builtins():
     assert set(intrinsics.BITOPS_METHODS) == set(BITOPS_ARITY)
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(SIMD_ARITY))
 def test_simd_builtin_arity_is_located(tmp_path, name):
     comp = _compile(tmp_path, f"fn f() -> i32\n    {name}()\n    0\n\nfn main() -> i32\n    0\n")
@@ -81,6 +81,7 @@ def test_simd_builtin_arity_is_located(tmp_path, name):
     assert re.search(LOCATED + re.escape(SIMD_ARITY[name]), comp.stderr), comp.stderr[-3000:]
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("method", sorted(BITOPS_ARITY))
 def test_bitops_arity_is_located(tmp_path, method):
     call, message = BITOPS_ARITY[method]
@@ -90,6 +91,7 @@ def test_bitops_arity_is_located(tmp_path, method):
     assert re.search(LOCATED + re.escape(message), comp.stderr), comp.stderr[-3000:]
 
 
+@pytest.mark.integration
 def test_xgetbv_combines_edx_eax_into_u64(tmp_path):
     comp = _compile(tmp_path, "fn f(x: u32) -> u64\n    xgetbv(x)\n\nfn main() -> i32\n    0\n")
     assert comp.returncode == 0, comp.stderr[-3000:]
@@ -98,6 +100,7 @@ def test_xgetbv_combines_edx_eax_into_u64(tmp_path):
     assert re.search(r"shl i64 %\S+, 32", ll) and "or i64" in ll
 
 
+@pytest.mark.integration
 def test_swap_bytes_of_u8_is_the_value(tmp_path):
     comp = _compile(tmp_path, "fn f(x: u8) -> u8\n    x.swap_bytes()\n\n"
                               "fn g(x: u16) -> u16\n    x.swap_bytes()\n\nfn main() -> i32\n    0\n")

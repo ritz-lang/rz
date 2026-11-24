@@ -31,7 +31,6 @@ import pytest
 
 import shellcheck_tool
 
-pytestmark = pytest.mark.integration
 
 RITZ0_DIR = Path(__file__).resolve().parents[1]
 INDIUM = RITZ0_DIR.parent.parent / "indium"
@@ -81,12 +80,14 @@ def steps(out):
 
 # --- the files -----------------------------------------------------------------
 
+@pytest.mark.integration
 def test_run_sh_is_executable_bash():
     assert RUN_SH.is_file()
     assert os.access(RUN_SH, os.X_OK), "run.sh is not executable"
     subprocess.run(["bash", "-n", str(RUN_SH)], check=True)
 
 
+@pytest.mark.integration
 def test_run_sh_shellcheck_clean():
     """AGAST #4359: this used to skip silently wherever shellcheck was not
     installed (the gate host), so a runner-only finding hid for weeks. The
@@ -153,6 +154,7 @@ def test_boot_run_outputs_the_peer_for_the_log_header():
     assert 'output "peer_ip"' in out
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
 def test_boot_run_terraform_fmt_clean():
     subprocess.run(["terraform", "fmt", "-check", "-recursive", str(BOOT_RUN)], check=True)
@@ -160,12 +162,14 @@ def test_boot_run_terraform_fmt_clean():
 
 # --- argument handling -----------------------------------------------------------
 
+@pytest.mark.integration
 def test_help(env):
     p = run(env, "--help")
     assert p.returncode == 0
     assert "--dry-run" in p.stdout and "--poll-timeout" in p.stdout
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("args", [
     ["--bogus"],
     ["--poll-timeout"],
@@ -181,6 +185,7 @@ def test_bad_arguments_exit_2_before_anything_runs(env, args):
     assert steps(p.stdout) == []
 
 
+@pytest.mark.integration
 def test_missing_image_with_no_build_is_an_error(env, tmp_path):
     p = run(env, "--dry-run", "--no-build", "--image", str(tmp_path / "nope.img"))
     assert p.returncode == 2
@@ -189,6 +194,7 @@ def test_missing_image_with_no_build_is_an_error(env, tmp_path):
 
 # --- the happy path ------------------------------------------------------------------
 
+@pytest.mark.integration
 def test_dry_run_steps_in_order_and_log_saved(env):
     p = dry(env)
     assert p.returncode == 0, p.stdout + p.stderr
@@ -205,12 +211,14 @@ def test_dry_run_steps_in_order_and_log_saved(env):
     assert "reached rzsh" in p.stdout
 
 
+@pytest.mark.integration
 def test_dry_run_reports_instance_seconds_and_cost(env):
     p = dry(env)
     assert re.search(r"billed seconds: \d+", p.stdout)
     assert re.search(r"cost: \$\d+\.\d{4}", p.stdout)
 
 
+@pytest.mark.integration
 def test_terminate_requested_before_terraform_destroy(env):
     """A halted guest took 4m23s to finish terminating in the first live run.
     Billing stops at shutting-down, so run.sh asks for termination directly
@@ -221,6 +229,7 @@ def test_terminate_requested_before_terraform_destroy(env):
     assert term < err.index("DRY terraform destroy")
 
 
+@pytest.mark.integration
 def test_kernel_panic_stops_polling_at_once(env):
     p = dry(env, "--poll-timeout", "600", extra={"DRY_CONSOLE": "panic"})
     assert p.returncode == 4, p.stdout + p.stderr
@@ -230,6 +239,7 @@ def test_kernel_panic_stops_polling_at_once(env):
     assert "# result: kernel panic" in log
 
 
+@pytest.mark.integration
 def test_build_runs_make_ec2_disk_unless_no_build(env):
     p = run(env, "--dry-run", "--image", str(env["image"]), "--log-dir", str(env["logs"]))
     assert p.returncode == 0, p.stdout + p.stderr
@@ -238,6 +248,7 @@ def test_build_runs_make_ec2_disk_unless_no_build(env):
 
 # --- the guards ------------------------------------------------------------------------
 
+@pytest.mark.integration
 def test_wrong_account_stops_before_anything_is_created(env):
     p = dry(env, extra={"DRY_ACCOUNT": "111111111111"})
     assert p.returncode == 3, p.stdout + p.stderr
@@ -247,6 +258,7 @@ def test_wrong_account_stops_before_anything_is_created(env):
     assert not env["logs"].exists() or not list(env["logs"].iterdir())
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("step", ["snapshot", "apply", "poll"])
 def test_failure_still_destroys_and_deletes_snapshot(env, step):
     p = dry(env, extra={"DRY_FAIL": step})
@@ -256,6 +268,7 @@ def test_failure_still_destroys_and_deletes_snapshot(env, step):
     assert "DRY terraform destroy" in p.stdout + p.stderr
 
 
+@pytest.mark.integration
 def test_no_prompt_times_out_saves_log_and_destroys(env):
     p = dry(env, "--poll-timeout", "1", extra={"DRY_CONSOLE": "none"})
     assert p.returncode == 4, p.stdout + p.stderr
@@ -264,12 +277,14 @@ def test_no_prompt_times_out_saves_log_and_destroys(env):
     assert len(list(env["logs"].iterdir())) == 1
 
 
+@pytest.mark.integration
 def test_leftover_state_is_reported_as_a_leak(env):
     p = dry(env, extra={"DRY_STATE_LEFT": "1"})
     assert p.returncode == 5, p.stdout + p.stderr
     assert "LEAK" in p.stderr
 
 
+@pytest.mark.integration
 def test_sigterm_mid_poll_still_destroys(env):
     e = dict(env["env"], DRY_CONSOLE="none", POLL_INTERVAL="0.2")
     argv = ["bash", str(RUN_SH), "--dry-run", "--no-build", "--image", str(env["image"]),
@@ -397,6 +412,7 @@ def test_mkec2disk_can_ask_for_the_peer_ping_window(tmp_path):
     assert files["harland/net-responder"] == b""
 
 
+@pytest.mark.integration
 def test_apply_asks_for_the_ping_peer_by_default(env):
     # Without --no-build: the dry run prints the make command it would run.
     p = run(env, "--dry-run", "--image", str(env["image"]), "--log-dir", str(env["logs"]))
@@ -405,6 +421,7 @@ def test_apply_asks_for_the_ping_peer_by_default(env):
     assert "EC2_NET_RESPONDER=1" in p.stdout
 
 
+@pytest.mark.integration
 def test_no_peer_flag_leaves_the_peer_out(env):
     p = run(env, "--dry-run", "--image", str(env["image"]), "--log-dir", str(env["logs"]),
             "--no-peer")
@@ -415,6 +432,7 @@ def test_no_peer_flag_leaves_the_peer_out(env):
     assert "# peer: none" in text
 
 
+@pytest.mark.integration
 def test_log_header_names_the_peer_for_correlation(env):
     p = dry(env)
     assert p.returncode == 0, p.stdout + p.stderr
@@ -422,6 +440,7 @@ def test_log_header_names_the_peer_for_correlation(env):
     assert "# peer: i-peer-dry 172.31.32.10" in text
 
 
+@pytest.mark.integration
 def test_two_instances_are_billed_when_the_peer_runs(env):
     p = dry(env)
     assert re.search(r"billed seconds: \d+ x 2 instances", p.stdout), p.stdout

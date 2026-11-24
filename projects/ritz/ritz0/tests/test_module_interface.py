@@ -406,8 +406,9 @@ class TestCompiler:
 # build.py: importers' artifact keys follow interface hashes (ritz0 only)
 # ---------------------------------------------------------------------------
 
-# cas_module_key hashes the compiler's identity, which runs it (#1805 guard).
-@pytest.mark.integration
+# In-process: cas_module_key's one spawn, cas.target_id()'s `clang
+# --version`, is a per-process memo ritz0/conftest.py fills before any test
+# (AGAST #4627), so these run under `-m inproc`.
 class TestBuildKey:
     def _key(self, proj, compiler):
         import build

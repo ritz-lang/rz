@@ -24,7 +24,6 @@ import pytest
 
 from ritz0_inproc import run_ritz0
 
-pytestmark = pytest.mark.integration
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 
@@ -85,6 +84,7 @@ pub fn main() -> i32
 
 # One call per compile: the first refused call ends the compile. Column 5 is
 # the call, 7 a method's name after `p.`.
+@pytest.mark.integration
 @pytest.mark.parametrize("call,display,col,decl", [
     pytest.param("helper()", "helper", 5, "8:1", id="free_fn"),
     pytest.param("p.get()", "P.get", 7, "5:5", id="method"),
@@ -102,12 +102,14 @@ def test_cross_file_private_call_is_a_located_error(tmp_path, call, display,
     ]
 
 
+@pytest.mark.integration
 def test_first_of_several_private_calls_is_the_error(tmp_path):
     lines = _refused(tmp_path, A_PRIVATE, MAIN_CALLS)
     assert lines[0] == ("Compiler error: main.ritz:5:5: `helper` is private "
                         "to a.ritz; mark it `pub` (#3413)")
 
 
+@pytest.mark.integration
 def test_a_deferred_private_call_is_an_error(tmp_path):
     a = "fn helper()\n    return\n"
     main = """\
@@ -230,6 +232,7 @@ pub fn main() -> i32
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("a_src,main_src", [
     pytest.param(A_PUB, MAIN_CALLS, id="pub"),
     pytest.param("", SAME_FILE, id="same_file"),
@@ -245,6 +248,7 @@ def test_allowed(tmp_path, a_src, main_src):
     assert "private to" not in comp.stderr
 
 
+@pytest.mark.integration
 def test_module_calling_its_own_private_fn_is_silent(tmp_path):
     """Compiling a.ritz itself: helper is called from its own file."""
     (tmp_path / "a.ritz").write_text(A_INTERNAL)
@@ -314,6 +318,7 @@ with open(args[args.index("-o") + 1], "w") as f:
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("bin_config", [
     pytest.param("", id="hosted"),
     pytest.param('[[bin]]\nname = "kern"\ntarget = "x86_64-unknown-none"\n'

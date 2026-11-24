@@ -111,6 +111,11 @@ AGAST #1392. Two things live here, and they are independent.
 9. `spawn_guard` (AGAST #1805) — a test that starts any process (or runs
    ritz0 in-process) without `@pytest.mark.integration` fails, naming the
    command.  So `-m "not integration"` really is the no-subprocess tier.
+   The converse (AGAST #4627): a passing `integration` test that started
+   nothing, itself or through a fixture, fails too, since the mark is what
+   keeps a source-only ratchet out of `-m inproc` (item 13).  A test asking
+   for a ritz1-building fixture is exempt (it is not inproc anyway), and
+   harness/integration_without_spawn.txt lists the known offenders.
 
 10. `fast_link` (AGAST #2793) — `fast_link.clang(cmd, **kw)` stands in for
    `subprocess.run(clang_cmd, **kw)` on a link expected to succeed: llvmlite
@@ -221,6 +226,8 @@ SMOKE_FILES = (
 _SMOKE_PATHS = frozenset((Path(__file__).resolve().parent / f) for f in SMOKE_FILES)
 # Fixtures that build ritz1; a test that asks for one is not smoke.
 _BUILD_FIXTURES = ("ritz1_bin", "ritz_start", "ritz1_selfhosted")
+# Item 9's `integration` tests let off starting nothing; only remove entries.
+NOSPAWN_ALLOWLIST = Path(HARNESS_DIR) / "integration_without_spawn.txt"
 
 
 def is_inproc_item(item) -> bool:
@@ -319,6 +326,25 @@ def _session_verdict(config) -> str:
     return config.stash[_build_verdict]
 
 
+def _warm_process_memos() -> None:
+    """Item 9: fill the per-process memos that spawn, before any test runs.
+
+    cas.target_id() runs `clang --version` once per process.  Left to the
+    tests, whichever test reached it first on an xdist worker spawned and the
+    rest did not, so spawn_guard's "an `integration` test must start
+    something" passed or failed a test by scheduling (AGAST #4627).  Filled
+    here, no test spawns through it, on every run.
+    """
+    import importlib.util
+    cas = sys.modules.get("cas")
+    if cas is None:
+        spec = importlib.util.spec_from_file_location("cas", RITZ_ROOT / "cas.py")
+        cas = importlib.util.module_from_spec(spec)
+        sys.modules["cas"] = cas
+        spec.loader.exec_module(cas)
+    cas.target_id()
+
+
 def pytest_configure(config):
     global _SESSION_CACHE
     if not os.environ.get("RITZ_CACHE_DIR"):
@@ -342,6 +368,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "inproc: no integration mark, no ritz1 build fixture (item 13)"
     )
+    # Item 9: an `integration` test must start something (AGAST #4627).
+    config.pluginmanager.get_plugin("spawn_guard").require_spawns(
+        config, allowlist=NOSPAWN_ALLOWLIST, exempt_fixtures=_BUILD_FIXTURES)
+    _warm_process_memos()
 
 
 @pytest.hookimpl(tryfirst=True)

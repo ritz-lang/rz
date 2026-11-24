@@ -71,8 +71,6 @@ POSITION_RE = re.compile(r"unit\.ritz:(\d+):(\d+):")
 COMPILERS = ("ritz0", "ritz1", "ritz1_selfhosted")
 CRASH = "Traceback (most recent call last)"
 
-pytestmark = pytest.mark.integration
-
 
 def _load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)

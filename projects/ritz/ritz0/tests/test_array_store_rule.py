@@ -28,7 +28,6 @@ import test_table_rows as table_rows
 from test_ref_into_value import _batch_build, _batch_compile, _compile, _located, _main
 from test_table_rows import Refused, Row, Run
 
-pytestmark = pytest.mark.integration
 
 # A fill can lower to a call to memset, and these programs link nothing else.
 PRELUDE = """\
@@ -385,6 +384,7 @@ TABLE = [
 ]
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
                          ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
 def test_every_row(tmp_path, compiler, chunk):
@@ -404,6 +404,7 @@ def test_the_emitter_refuses_what_the_checker_could_not_name():
         LLVMEmitter._convert_type(host, value, ir.ArrayType(ir.IntType(32), 4))
 
 
+@pytest.mark.integration
 def test_a_constant_fill_stays_cheap(tmp_path):
     failures = []
     for name, (body, wanted) in sorted(FILL_IR.items()):

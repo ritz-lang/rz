@@ -24,7 +24,6 @@ import pytest
 
 from test_harland_syscall_dispatch import COMPILERS, KERNEL_SRC, RITZ_ROOT, _compile, _run
 
-pytestmark = pytest.mark.integration
 
 ERRNO_SRC = KERNEL_SRC / "syscall" / "errno.ritz"
 RITZLIB_SYS = RITZ_ROOT / "ritzlib" / "sys.ritz"
@@ -98,6 +97,7 @@ def test_errno_matches_ritzlib_constants():
         assert -declared[variant] == lib[name], f"Errno.{variant} = {declared[variant]}, ritzlib {name} = {lib[name]}"
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_errno_discriminants(compiler, tmp_path):
     cases = [(f"Errno.{k} as i64", -v) for k, v in LINUX.items()]
@@ -117,6 +117,7 @@ def test_kernel_contract_lists_the_enum():
 
 # --- uptr, vfs, knamespace, ipc, dispatch return Errno values -----------------------
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", ASM_DEPS)
 def test_uptr_faults_are_errno_fault(compiler, tmp_path):
     kernel = "0xFFFF800000001000 as *u8"
@@ -134,6 +135,7 @@ def test_uptr_faults_are_errno_fault(compiler, tmp_path):
            ["syscall.errno", "mm.uptr", "mm.vmm", "mm.pmm", *SERIAL])
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", ASM_DEPS)
 def test_vfs_errors_are_errno(compiler, tmp_path):
     # The fd table moved from vfs to fs/fd.ritz, one per process (#2753).
@@ -169,6 +171,7 @@ CHANNEL_PRELUDE = """\
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", ASM_DEPS)
 def test_ipc_errors_are_errno(compiler, tmp_path):
     """channel.ritz returned -1..-5 labelled EINVAL/EBADF/EPIPE/EAGAIN/ENOMEM,
@@ -194,6 +197,7 @@ def test_ipc_errors_are_errno(compiler, tmp_path):
            prelude=CHANNEL_PRELUDE)
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_unknown_syscall_is_errno_nosys(compiler, tmp_path):
     cases = [("syscall_dispatch(5, 0, 0, 0, 0)", "Errno.NoSys as i64"),
@@ -257,6 +261,7 @@ pub fn jump_to_userspace(entry: u64, stack: u64)
 """
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", ASM_DEPS)
 def test_elf_validate_header_returns_elf_status(compiler, tmp_path):
     src = ("import ritzlib.option\nimport loader.elf\n\n" + ELF_STUBS + "fn main() -> i32\n"

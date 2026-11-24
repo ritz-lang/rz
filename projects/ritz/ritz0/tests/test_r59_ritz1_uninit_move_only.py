@@ -83,7 +83,6 @@ def test_hook_sees_an_uninitialised_move_only_var(tmp_path, uninit_move_only):
     assert {(line, name) for _f, line, name in uninit_move_only} == {(12, "w")}
 
 
-@pytest.mark.integration
 def test_emit_module_builds_emitter_state_whole(tmp_path, uninit_move_only):
     """emitter.ritz (with its imports) has no uninitialised move-only `var`."""
     _check(EMITTER, tmp_path / "emitter.ll", no_runtime=True)

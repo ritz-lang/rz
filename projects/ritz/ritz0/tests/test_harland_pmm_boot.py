@@ -21,7 +21,6 @@ import pytest
 
 from test_harland_syscall_dispatch import KERNEL_SRC, _run
 
-pytestmark = pytest.mark.integration
 
 MAIN_SRC = KERNEL_SRC / "main.ritz"
 
@@ -67,6 +66,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 def test_pmm_never_hands_out_or_frees_page_zero(tmp_path):
     rc = _run("ritz0", tmp_path, PMM_PAGE_ZERO, PMM_MODULES)
     assert rc == 0, f"PMM page-0 check {rc} failed (see PMM_PAGE_ZERO)"
@@ -111,6 +111,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 def test_pmm_alloc_contig_finds_a_free_run(tmp_path):
     rc = _run("ritz0", tmp_path, PMM_CONTIG, PMM_MODULES)
     assert rc == 0, f"PMM contig check {rc} failed (see PMM_CONTIG)"
@@ -264,6 +265,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 def test_pmm_tracks_memory_above_4gib_on_both_boot_paths(tmp_path):
     rc = _run("ritz0", tmp_path, PMM_ABOVE_4G, PMM_MODULES)
     assert rc == 0, f"PMM above-4G check {rc} failed (see PMM_ABOVE_4G)"
@@ -305,6 +307,7 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 def test_pmm_alloc_uses_a_next_free_hint(tmp_path):
     rc = _run("ritz0", tmp_path, PMM_HINT, PMM_MODULES)
     assert rc == 0, f"PMM hint check {rc} failed (see PMM_HINT)"

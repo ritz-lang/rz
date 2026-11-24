@@ -58,6 +58,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -603,6 +604,11 @@ def _ask(kind, compiler, program, filename, at, worker):
                 fh.write(f"{os.getpid()} miss {why} {ctx.item.nodeid}\n")
         return None
     ctx.used = True
+    # The answer is this row's compile, made by the chunk's batch (perhaps on
+    # another worker): spawn_guard counts it as the row's spawn (AGAST #4627).
+    guard = sys.modules.get("spawn_guard")
+    if guard is not None:
+        guard.note_spawn(f"batched {kind} answer ({compiler})")
     return got[1]
 
 
