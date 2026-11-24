@@ -123,6 +123,12 @@ def test_a_freestanding_trap_calls_the_platform_hook(compiler, tmp_path):
                           "pub fn kmain() -> i32\n    return f(0) as i32\n")
     assert "syscall" not in ir, "a freestanding trap issued a syscall"
     assert "ritz_platform_fatal" in ir, "the trap did not reach the platform hook"
+    # The message bytes end at the op, with no newline: the hook writes its
+    # own, as for an assert (AGAST #4617; a kernel report got a blank line).
+    # The NUL is the constant's terminator, outside the length passed.
+    msgs = re.findall(r'c"(kernel\.ritz:2:5: integer overflow in `\+`[^"]*)"', ir)
+    assert msgs == ["kernel.ritz:2:5: integer overflow in `+`\\00"], \
+        f"{compiler}: wanted the trap message without a newline, got {msgs}"
 
 
 # A failing assert's stop, the overflow trap's twin (AGAST #4607): one
@@ -235,8 +241,10 @@ def test_arithmetic_overflow_stops_the_program(tmp_path, compiler, name):
     src, where = _located(marked)
     got = _compile_run(tmp_path, name, src, compiler)
     assert got.returncode == 1, f"{name}: expected exit 1, got {got.returncode}\n{got.stderr}"
-    want = f"{where}: integer overflow in `{op}`"
-    assert want in got.stderr, f"{name}: wanted {want!r} in {got.stderr!r}"
+    # Hosted, the trap writes its own newline (AGAST #4617: only a
+    # freestanding message drops it, for ritz_platform_fatal adds one).
+    want = f"{where}: integer overflow in `{op}`\n"
+    assert got.stderr == want, f"{name}: wanted {want!r}, got {got.stderr!r}"
 
 
 # `op=` follows its operator: the same trap, same message.

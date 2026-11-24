@@ -661,18 +661,20 @@ class ExprEmitter:
         """Write `<file>:<line>:<col>: <message>` to stderr and exit 1.
 
         A freestanding target has no exit syscall: it stops through
-        `ritz_platform_fatal(msg, len, 1)` instead (AGAST #4119)."""
+        `ritz_platform_fatal(msg, len, 1)` instead (AGAST #4119), with no
+        trailing newline: the hook writes its own, as for an assert (#4617)."""
         span = getattr(expr, "span", None)
         if span is not None:
             where = f"{self._assert_basename(span.file)}:{span.line}:{span.column}: "
         else:
             where = ""
-        text = f"{where}{message}\n"
+        freestanding = getattr(self, "is_freestanding", False)
+        text = f"{where}{message}" if freestanding else f"{where}{message}\n"
         buf = self._get_string_constant(text)
         zero = ir.Constant(self.i64, 0)
         ptr = self.builder.gep(buf, [zero, zero])
         length = ir.Constant(self.i64, len(text.encode("utf-8")))
-        if getattr(self, "is_freestanding", False):
+        if freestanding:
             self._emit_platform_fatal_stop(ptr, length)
             return
         self._emit_write_syscall(ir.Constant(self.i64, 2), ptr, length)
