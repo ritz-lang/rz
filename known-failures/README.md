@@ -21,6 +21,7 @@ agast    = 1621                 # the ticket; must equal the file name
 | `regression` | `scripts/regression.sh` (via the CLI) | ritz0, ritz1 (covers ritz1_selfhosted) | example key: path under `examples/`, `/` → `_` |
 | `examples` | `tools/example_tests.py` | ritz0 | test file under `examples/` |
 | `doc` | `tools/check_doc_examples.py` | ritz1, ritz1_selfhosted | `<DOC.md> <12-hex block digest>` |
+| `refusal` | `tools/refusal_parity.py` (in the "ritz0 unit tests" step) | ritz1 | ritz0 test id, `tests/test_x.py::name[param]`, of a ritz0-only file |
 
 ## Rules (enforced by the parser, so no gate can honour a bad excuse)
 

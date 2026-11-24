@@ -70,6 +70,9 @@ LOCAL_MODULES = {
     "smoke_stack",
     "shellcheck_tool",  # ritz0/harness/, the pinned shellcheck (AGAST #4360)
     "tracked",  # ritz0/harness/, tracked files for the ratchets (AGAST #4672)
+    "refusal_parity",  # tools/refusal_parity.py, the refusal replay (AGAST #4669)
+    "refusal_capture",  # ritz0/harness/, its capture hook (AGAST #4669)
+    "ritz0_inproc",  # ritz0/harness/, the forked ritz0 the replay compiles with
     "sweep_pytest_tmp",  # ages out /tmp/pytest-of-$USER (AGAST #4274)
     "standard_report",  # docs/STANDARD.md's conformance report (AGAST #1344)
     "ritzgen_py",

@@ -199,6 +199,7 @@ HARNESS = Step(
            "projects/ritz/ritz0/harness/batching.py",
            "projects/ritz/ritz0/harness/fast_link.py",
            "projects/ritz/ritz0/harness/ritz0_inproc.py",
+           "projects/ritz/ritz0/harness/refusal_capture.py",
            "projects/ritz/ritz0/harness/spawn_guard.py",
            "projects/ritz/ritz0/tests/test_reject_parity.py",
            "projects/ritz/ritz0/tests/test_if_expression_requires_else.py",

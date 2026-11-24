@@ -193,6 +193,7 @@ if TESTS_DIR not in sys.path:
 import batching  # noqa: E402
 import fast_link  # noqa: E402
 import ritz0_inproc  # noqa: E402
+import refusal_capture  # noqa: E402
 
 pytest_plugins = ["spawn_guard", "cost_meter", "only_files", "read_guard"]
 
@@ -371,6 +372,9 @@ def _warm_process_memos() -> None:
 
 def pytest_configure(config):
     global _SESSION_CACHE
+    # AGAST #4669: with RITZ_REFUSAL_CAPTURE set, record the in-process
+    # sources the ritz0-only test files lex (ritz0/harness/refusal_capture.py).
+    refusal_capture.install_lexer_hook()
     if not os.environ.get("RITZ_CACHE_DIR"):
         _SESSION_CACHE = tempfile.mkdtemp(prefix="ritz-test-cache-")
         os.environ["RITZ_CACHE_DIR"] = _SESSION_CACHE
@@ -496,3 +500,10 @@ def run_ritz0():
 def clang_link():
     """`clang_link(cmd, **kw)`: `subprocess.run` for a clang link (item 10)."""
     return fast_link.clang
+
+
+def pytest_runtest_logreport(report):
+    # AGAST #4669: the ritz0-only tests that ran, for tools/refusal_parity.py's
+    # strict-xpass rule.  Off (one environ lookup) unless capturing.
+    if report.when == "call" and os.environ.get(refusal_capture.ENV):
+        refusal_capture.on_test_ran(report.nodeid)

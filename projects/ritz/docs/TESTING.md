@@ -482,6 +482,31 @@ Every 30 minutes it removes the `pytest-*` dirs untouched for 3 hours (or
 dated in the future: gate-queue tests set future mtimes) whose
 `.lock` names no live process.
 
+### ritz0-only test files: ritz1 must refuse what they see ritz0 refuse
+
+A test file that never names ritz1 checks ritz0 alone, and survey #4631
+found every goal-3 gap ("ritz1 rejects everything ritz0 rejects") in such
+files.  So the gate's "ritz0 unit tests" step runs pytest with
+`RITZ_REFUSAL_CAPTURE` set (AGAST #4669).  For each test in a file with no
+`ritz1` in it, `ritz0/harness/refusal_capture.py` records the programs ritz0's
+CLI refused (`run_ritz0`) and the sources the test lexed in-process.  Then
+`tools/refusal_parity.py replay` compiles each program with ritz0's CLI and
+ritz1, each in a private copy.  A ritz0 refusal counts only if a second
+compile repeats it, because the forkserver occasionally misreports an exit
+status.  Every refusal ritz0 makes, ritz1 must make too,
+reporting ritz0's first `<file>.ritz:LINE`.  ~20 s on top of the step; `make unit`
+does not capture.
+
+When it fails, do one of two things: fix ritz1, or make the test 3-compiler
+(add ritz1 to it, which also takes it out of the replay).  If the gap has an
+open ticket, cite it in `known-failures/<agast>.toml` (`gate = "refusal"`,
+`compiler = "ritz1"`, `unit` = the test id).  The list is strict: an entry
+whose test now agrees fails the step, so the list only shrinks.  An entry
+whose test was renamed fails `tools/test_known_failures.py`.  A gap no
+open ticket covers cites the goal ticket (`1828.toml`); some of those are
+ritz0's own bugs (its CLI refuses a fixture its checker accepts), kept so
+the replay stays exact.
+
 ---
 
 ## Test attributes reference

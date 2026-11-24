@@ -11,6 +11,7 @@ by the parser, and pinned here.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -142,6 +143,16 @@ def test_every_checked_in_entry_names_something_that_exists():
             assert (ritz / "examples" / e.unit).is_file(), e
         elif e.gate == "doc":
             assert (ritz / "docs" / e.unit.split()[0]).is_file(), e
+        elif e.gate == "refusal":
+            # AGAST #4669: the replay judges only tests that ran, so a
+            # renamed or deleted test's entry would never xpass: catch it here.
+            rel, _, name = e.unit.partition("::")
+            src = ritz / "ritz0" / rel
+            assert src.is_file(), e
+            fn = name.split("[", 1)[0].rsplit("::", 1)[-1]
+            assert re.search(rf"def {re.escape(fn)}\b", src.read_text()), e
+            assert "ritz1" not in src.read_text(), (
+                f"{e}: {rel} now runs ritz1, so the replay no longer judges it")
         elif e.gate == "regression":
             keys = {str(p.relative_to(ritz / "examples")).replace("/", "_")
                     for p in (ritz / "examples").glob("**/") if "build" not in p.parts}

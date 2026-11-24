@@ -50,6 +50,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import refusal_capture
+
 RITZ0_DIR = Path(__file__).resolve().parent.parent  # this file is in ritz0/harness/
 RITZ_ROOT = RITZ0_DIR.parent
 RITZ0_PY = RITZ0_DIR / "ritz0.py"
@@ -246,6 +248,9 @@ def run_ritz0(args, *, cwd=None, env=None, timeout=None, text=True,
                     old_out.encode(), out_s.encode())
                 return _completed(args, rc, so, se, text, check)
     rc, so, se = _fork_ritz0(args, cwd, env, timeout)
+    if rc and os.environ.get(refusal_capture.ENV):
+        # AGAST #4669: a ritz0-only test's refusal, for tools/refusal_parity.py.
+        refusal_capture.on_cli(args, cwd, env, rc, se)
     if key is not None:
         ll = out.read_bytes() if rc == 0 and out.is_file() else None
         with _lock:

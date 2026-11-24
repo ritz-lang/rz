@@ -89,6 +89,12 @@ GATES: dict[str, tuple[tuple[str, ...], str]] = {
     "parity": (("ritz1", "ritz1_selfhosted"),
                "an rz project id whose tests pass under ritz0 "
                "(`rz test --all --compiler ritz1`)"),
+    # AGAST #4669: a ritz0-only test whose program ritz0 refuses and ritz1
+    # does not refuse at the same line (tools/refusal_parity.py, run by the
+    # "ritz0 unit tests" step).  ritz1 only: the replay compiles with it.
+    "refusal": (("ritz1",),
+                "a ritz0 test id `tests/test_x.py::name[param]` "
+                "(tools/refusal_parity.py)"),
 }
 
 NEVER_EXCUSED = {
