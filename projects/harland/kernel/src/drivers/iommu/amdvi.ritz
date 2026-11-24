@@ -60,9 +60,9 @@ import drivers.iommu.ivrs {
 # How long an IOMMU gets to work through its command buffer.
 const AMDVI_TIMEOUT_US: u64 = 100000
 
-var amdvi_on: u8 = 0
-var amdvi_ga: u8 = 0                # 128-bit IRTEs
-var amdvi_xt: u8 = 0                # 32-bit destinations
+var amdvi_on: bool = false
+var amdvi_ga: bool = false           # 128-bit IRTEs
+var amdvi_xt: bool = false           # 32-bit destinations
 var amdvi_units: i32 = 0
 var amdvi_regs: [8]u64              # kernel virtual address of each IOMMU's registers
 var amdvi_ia: [8]u8                 # EFR.IASup: INVALIDATE_ALL works
@@ -76,10 +76,10 @@ var amdvi_status_phys: u64 = 0      # COMPLETION_WAIT stores its sequence number
 var amdvi_seq: u64 = 0
 
 pub fn amdvi_ir_enabled() -> bool
-    return amdvi_on != 0
+    return amdvi_on
 
 pub fn amdvi_ir_x2apic() -> bool
-    return amdvi_on != 0 and amdvi_xt != 0
+    return amdvi_on and amdvi_xt
 
 # ============================================================================
 # Registers
@@ -224,7 +224,7 @@ fn amdvi_irt(dev: u32) -> u64
 # should be masked. Returns 0, or -1 if remapping is off, the handle or
 # device is out of range, or an IOMMU didn't confirm.
 pub fn amdvi_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -> i32
-    if amdvi_on == 0 or handle >= AMDVI_IRT_ENTRIES
+    if not amdvi_on or handle >= AMDVI_IRT_ENTRIES
         return -1
     let dev: u32 = amdvi_devid(sid)
     if dev == IVRS_DEVID_NONE
@@ -232,7 +232,7 @@ pub fn amdvi_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -
     let irt: u64 = amdvi_irt(dev)
     if irt == 0
         return -1
-    if amdvi_ga != 0
+    if amdvi_ga
         let e: u64 = phys_to_virt(irt) + (handle as u64) * 16
         # RemapEn off while the vector and high destination change.
         volatile_store(e as *u64, 0)
@@ -250,7 +250,7 @@ pub fn amdvi_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -
 # The destination IRTE `handle` of requester `sid` holds, for the boot
 # log; 0xFFFFFFFF if there is none.
 pub fn amdvi_ir_get_dest(handle: u32, sid: u32) -> u32
-    if amdvi_on == 0 or handle >= AMDVI_IRT_ENTRIES
+    if not amdvi_on or handle >= AMDVI_IRT_ENTRIES
         return 0xFFFFFFFF
     let dev: u32 = amdvi_devid(sid)
     if dev == IVRS_DEVID_NONE
@@ -259,7 +259,7 @@ pub fn amdvi_ir_get_dest(handle: u32, sid: u32) -> u32
     if not dte_q2_is_remap(q2)
         return 0xFFFFFFFF
     let irt: u64 = phys_to_virt(dte_q2_irt(q2))
-    if amdvi_ga != 0
+    if amdvi_ga
         let lo: u64 = volatile_load((irt + (handle as u64) * 16) as *u64)
         let hi: u64 = volatile_load((irt + (handle as u64) * 16 + 8) as *u64)
         return irte_ga_dest(lo, hi)
@@ -302,7 +302,7 @@ fn amdvi_unit_enable(u: i32) -> i32
     amdvi_wreg64(u, AMDVI_REG_CMD_HEAD, 0)
     amdvi_wreg64(u, AMDVI_REG_CMD_TAIL, 0)
     amdvi_wreg64(u, AMDVI_REG_DEVTAB, amdvi_devtab_reg(amdvi_seg_devtab_phys[si], amdvi_devtab_pages(last)))
-    amdvi_wcontrol(u, amdvi_control(ctrl, amdvi_ga != 0, amdvi_xt != 0))
+    amdvi_wcontrol(u, amdvi_control(ctrl, amdvi_ga, amdvi_xt))
     let deadline: u64 = deadline_after_us(AMDVI_TIMEOUT_US)
     while (amdvi_reg32(u, AMDVI_REG_STATUS) & STATUS_CMDBUF_RUN) == 0
         if deadline_passed(deadline)
@@ -350,7 +350,7 @@ fn amdvi_devtab_init(si: i32) -> i32
 # -1 with it off (logged why), -2 if there is no IVRS table (nothing
 # logged: drivers/iommu/ir.ritz says so).
 pub fn amdvi_ir_init(x2apic: bool) -> i32
-    amdvi_on = 0
+    amdvi_on = false
     amdvi_units = 0
     let ivrs: u64 = acpi_find_table(ACPI_SIG_IVRS)
     if ivrs == 0
@@ -390,8 +390,8 @@ pub fn amdvi_ir_init(x2apic: bool) -> i32
         if amdvi_cmd_phys[u] == 0
             return amdvi_fail(u, "no page for the command buffer")
         u = u + 1
-    amdvi_ga = (modes & 1) as u8
-    amdvi_xt = ((modes >> 1) & 1) as u8
+    amdvi_ga = (modes & 1) != 0
+    amdvi_xt = ((modes >> 1) & 1) != 0
     # A device table per PCI segment: every device DMA pass-through,
     # interrupts blocked.
     amdvi_status_phys = amdvi_alloc_page()
@@ -415,7 +415,7 @@ pub fn amdvi_ir_init(x2apic: bool) -> i32
             amdvi_units = 0
             return -1
         u = u + 1
-    amdvi_on = 1
+    amdvi_on = true
     klog("      Interrupt remapping: AMD-Vi on, ")
     klog_dec(n as i64)
     if ivrs_num_segs == 1
@@ -432,9 +432,9 @@ pub fn amdvi_ir_init(x2apic: bool) -> i32
             klog_dec(ivrs_seg_id[si] as i64)
             klog(")")
             si = si + 1
-    if amdvi_xt != 0
+    if amdvi_xt
         klog(", 32-bit x2APIC destinations (GA, XT)\n")
-    else if amdvi_ga != 0
+    else if amdvi_ga
         klog(", 8-bit xAPIC destinations (GA)\n")
     else
         klog(", 8-bit xAPIC destinations (legacy IRTEs)\n")

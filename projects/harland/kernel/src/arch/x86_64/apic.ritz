@@ -38,7 +38,7 @@ import drivers.iommu.dmar { ir_handle_ioapic }
 # PIC (Programmable Interrupt Controller) - Remap to vectors 32-47
 # ============================================================================
 
-pub fn pic_remap() -> i32
+pub fn pic_remap()
     # Save masks
     let mask1: u8 = inb(0x21)
     let mask2: u8 = inb(0xA1)
@@ -62,8 +62,6 @@ pub fn pic_remap() -> i32
     # Restore masks (mask all for now)
     outb(0x21, 0xFF)
     outb(0xA1, 0xFF)
-
-    return 0
 
 # ============================================================================
 # Local APIC
@@ -115,17 +113,16 @@ fn cpu_has_x2apic() -> bool
 # Switch this CPU's LAPIC to x2APIC mode if the BSP chose it. Each CPU has
 # its own IA32_APIC_BASE, and INIT leaves an AP's in xAPIC mode, so every
 # AP calls this before it touches its LAPIC.
-pub fn x2apic_enable_local() -> i32
+pub fn x2apic_enable_local()
     if x2apic_mode == 0
-        return 0
+        return
     let base: u64 = rdmsr(IA32_APIC_BASE)
     if (base & APIC_BASE_EXTD) == 0
         wrmsr(IA32_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_EXTD)
-    return 0
 
 # Choose the LAPIC mode on the BSP, after the MADT is parsed and before the
 # LAPIC is first touched.
-fn apic_select_mode() -> i32
+fn apic_select_mode()
     if cpu_has_x2apic()
         x2apic_mode = 1
         x2apic_enable_local()
@@ -137,7 +134,7 @@ fn apic_select_mode() -> i32
     # The BSP's ID, before ioapic_init routes the legacy IRQs to it: it is
     # not always 0 (#4233). ap_boot_all reads it again; it can't change.
     bsp_apic_id = lapic_id()
-    bsp_apic_known = 1
+    bsp_apic_known = true
     irq_ext_dest_detect()
     # Interrupt remapping (VT-d #4316, AMD-Vi #4329: drivers/iommu/ir.ritz)
     # before the I/O APIC is programmed:
@@ -145,7 +142,6 @@ fn apic_select_mode() -> i32
     # in x2APIC mode reaches any APIC ID.
     ir_init(x2apic_mode != 0)
     irq_dest_print_mode()
-    return 0
 
 # CPUID.1:ECX bit 31: running under a hypervisor (its leaves start at
 # 0x40000000).
@@ -153,36 +149,34 @@ const CPUID1_ECX_HYPERVISOR: u32 = 0x80000000
 
 # 1 if device interrupts can carry the extended destination ID (15-bit APIC
 # IDs): KVM advertises it in CPUID 0x40000001 (arch/x86_64/irq_dest.ritz).
-var irq_ext_dest: u8 = 0
+var irq_ext_dest: bool = false
 
-fn irq_ext_dest_detect() -> i32
-    irq_ext_dest = 0
+fn irq_ext_dest_detect()
+    irq_ext_dest = false
     let r1: CpuidResult = cpuid(1)
     if (r1.ecx & CPUID1_ECX_HYPERVISOR) != 0
         let sig: CpuidResult = cpuid(0x40000000)
         let feat: CpuidResult = cpuid(0x40000001)
         if irq_ext_dest_from_cpuid(sig.eax, sig.ebx, sig.ecx, sig.edx, feat.eax)
-            irq_ext_dest = 1
-    return 0
+            irq_ext_dest = true
 
 # How far device interrupts reach, for the boot log (the boot tests read it).
-fn irq_dest_print_mode() -> i32
+fn irq_dest_print_mode()
     if ir_x2apic()
         klog("      Device interrupt destinations: interrupt remapping (32-bit APIC IDs)\n")
     else if ir_enabled()
         klog("      Device interrupt destinations: 8-bit through interrupt remapping (xAPIC mode)\n")
-    else if irq_ext_dest != 0
+    else if irq_ext_dest
         klog("      Device interrupt destinations: extended destination ID (APIC IDs up to 32767)\n")
     else
         klog("      Device interrupt destinations: 8-bit (APIC IDs up to 254; no interrupt remapping or extended destination ID)\n")
-    return 0
 
 # The CPU a device interrupt (MSI or I/O APIC) meant for APIC ID `want`
 # goes to: `want` if an interrupt message can reach it, else the BSP, else
 # the first CPU that can be reached. IRQ_DEST_NONE if none can. drivers/msix
 # calls this for the CPU it runs on.
 pub fn irq_route_dest(want: u32) -> u32
-    return irq_dest_pick(want, bsp_apic_id, @cpu_apic_ids[0], num_cpus as i32, irq_ext_dest != 0 and not ir_enabled(), ir_x2apic())
+    return irq_dest_pick(want, bsp_apic_id, @cpu_apic_ids[0], num_cpus as i32, irq_ext_dest and not ir_enabled(), ir_x2apic())
 
 # Why irq_route_dest(id) isn't id.
 pub fn irq_route_print_reason(apic_id: u32) -> i32
@@ -192,14 +186,14 @@ pub fn irq_route_print_reason(apic_id: u32) -> i32
         klog("beyond the 8-bit destination of interrupt remapping in xAPIC mode")
     else if apic_id == 255
         klog("APIC ID 255 is the broadcast ID")
-    else if irq_ext_dest != 0
+    else if irq_ext_dest
         klog("beyond the extended destination ID's 15 bits")
     else
         klog("beyond the 8-bit MSI/I/O APIC destination; no interrupt remapping or extended destination ID")
     return 0
 
 # Log every CPU whose device interrupts go elsewhere, and where.
-fn irq_route_report() -> i32
+fn irq_route_report()
     var i: i32 = 0
     while i < num_cpus as i32 && i < MAX_CPUS
         let id: u32 = cpu_apic_ids[i]
@@ -220,7 +214,6 @@ fn irq_route_report() -> i32
                 klog(")")
             klog("\n")
         i = i + 1
-    return 0
 
 # Kernel virtual base of the LAPIC and I/O APIC register windows. Both are
 # mapped once in apic_map_registers, through the kernel-half MMIO window
@@ -255,13 +248,12 @@ fn lapic_read(offset: u64) -> u32
     return *addr
 
 # Write LAPIC register (pub for scheduler timer)
-pub fn lapic_write(offset: u64, value: u32) -> i32
+pub fn lapic_write(offset: u64, value: u32)
     if x2apic_mode != 0
         wrmsr(X2APIC_MSR_BASE + (offset >> 4) as u32, value as u64)
-        return 0
+        return
     let addr: *u32 = (lapic_mmio + offset) as *u32
     *addr = value
-    return 0
 
 # Get current CPU's APIC ID (32 bits in x2APIC mode, 8 in xAPIC mode)
 pub fn lapic_id() -> u32
@@ -289,21 +281,21 @@ const LAPIC_TIMER_VECTOR: u32 = 32
 const LAPIC_TIMER_MASKED: u32 = 0x10000
 const LAPIC_TIMER_DIV16: u32 = 0x3
 
-var lapic_watchdog_active: u8 = 0
-var lapic_watchdog_oneshot: u8 = 0
+var lapic_watchdog_active: bool = false
+var lapic_watchdog_oneshot: bool = false
 var lapic_watchdog_ticks_left: u32 = 0
 
 # Is this the bootstrap processor? Before ap_boot_all records the BSP's APIC
 # ID every CPU is treated as the BSP (there are no APs yet).
 pub fn lapic_is_bsp() -> bool
-    if bsp_apic_known == 0
+    if not bsp_apic_known
         return true
     return lapic_id() == bsp_apic_id
 
 # Arm the watchdog for `ticks` (bus clock / 16) or, when the periodic tick is
 # running on this CPU, for the same interval in scheduler ticks.
 pub fn lapic_watchdog_arm(ticks: u32) -> i32
-    lapic_watchdog_active = 1
+    lapic_watchdog_active = true
     if lapic_tick_initial != 0 and lapic_is_bsp()
         # Ride the periodic tick: convert bus-clock ticks to tick periods.
         var periods: u64 = 1
@@ -311,13 +303,13 @@ pub fn lapic_watchdog_arm(ticks: u32) -> i32
             periods = ((ticks as u64) * lapic_tick_hz + lapic_timer_rate_hz - 1) / lapic_timer_rate_hz
             if periods == 0
                 periods = 1
-        lapic_watchdog_oneshot = 0
+        lapic_watchdog_oneshot = false
         if periods > 0xFFFFFFFF
             lapic_watchdog_ticks_left = 0xFFFFFFFF
         else
             lapic_watchdog_ticks_left = periods as u32
         return 0
-    lapic_watchdog_oneshot = 1
+    lapic_watchdog_oneshot = true
     lapic_watchdog_ticks_left = 0
     lapic_write(LAPIC_TIMER_DIVIDE, LAPIC_TIMER_DIV16)
     lapic_write(LAPIC_TIMER, LAPIC_WATCHDOG_VECTOR)
@@ -327,28 +319,27 @@ pub fn lapic_watchdog_arm(ticks: u32) -> i32
 # True once the armed interval has passed: the tick countdown reached 0
 # (riding the tick), or the one-shot counted down to zero (it fired).
 pub fn lapic_watchdog_expired() -> bool
-    if lapic_watchdog_active == 0
+    if not lapic_watchdog_active
         return false
-    if lapic_watchdog_oneshot != 0
+    if lapic_watchdog_oneshot
         return lapic_read(LAPIC_TIMER_CURRENT) == 0
     return lapic_watchdog_ticks_left == 0
 
 # One scheduler tick passed on this CPU: count it against the watchdog.
-pub fn lapic_tick_advance() -> i32
-    if lapic_watchdog_active != 0 and lapic_watchdog_oneshot == 0 and lapic_watchdog_ticks_left > 0
+pub fn lapic_tick_advance()
+    if lapic_watchdog_active and not lapic_watchdog_oneshot and lapic_watchdog_ticks_left > 0
         lapic_watchdog_ticks_left = lapic_watchdog_ticks_left - 1
-    return 0
 
 # Stop the watchdog: a one-shot is masked, and the periodic tick is restored
 # if this BSP had one (riding the tick never touched the timer).
 pub fn lapic_watchdog_stop() -> i32
-    if lapic_watchdog_oneshot != 0
+    if lapic_watchdog_oneshot
         lapic_write(LAPIC_TIMER_INITIAL, 0)
         lapic_write(LAPIC_TIMER, LAPIC_TIMER_MASKED)
         if lapic_is_bsp()
             lapic_timer_resume()
-    lapic_watchdog_active = 0
-    lapic_watchdog_oneshot = 0
+    lapic_watchdog_active = false
+    lapic_watchdog_oneshot = false
     lapic_watchdog_ticks_left = 0
     return 0
 
@@ -409,13 +400,12 @@ pub fn lapic_timer_start(tick_hz: u64) -> i32
     return 0
 
 # (Re)arm the periodic tick, if lapic_timer_start set one up.
-pub fn lapic_timer_resume() -> i32
+pub fn lapic_timer_resume()
     if lapic_tick_initial == 0
-        return 0
+        return
     lapic_write(LAPIC_TIMER_DIVIDE, LAPIC_TIMER_DIV16)
     lapic_write(LAPIC_TIMER, LAPIC_TIMER_VECTOR | LAPIC_TIMER_PERIODIC)
     lapic_write(LAPIC_TIMER_INITIAL, lapic_tick_initial)
-    return 0
 
 # The calibrated LAPIC timer rate (divide by 16) in Hz; 0 before
 # lapic_timer_start.
@@ -423,7 +413,7 @@ pub fn lapic_timer_rate() -> u64
     return lapic_timer_rate_hz
 
 # Initialize Local APIC
-fn lapic_init() -> i32
+fn lapic_init()
     # Enable LAPIC via SVR (Spurious Vector Register)
     # Set spurious vector to 0xFF and enable bit
     lapic_write(LAPIC_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VEC)
@@ -462,8 +452,6 @@ fn lapic_init() -> i32
     klog_hex(lapic_read(LAPIC_VERSION) as u64)
     klog("\n")
 
-    return 0
-
 # ============================================================================
 # I/O APIC
 # ============================================================================
@@ -490,12 +478,11 @@ fn ioapic_read(reg: u8) -> u32
     return *window
 
 # Write I/O APIC register
-fn ioapic_write(reg: u8, value: u32) -> i32
+fn ioapic_write(reg: u8, value: u32)
     let regsel: *u32 = ioapic_mmio as *u32
     let window: *u32 = (ioapic_mmio + IOAPIC_WINDOW) as *u32
     *regsel = reg as u32
     *window = value
-    return 0
 
 # The I/O APIC's own ID (IOAPIC_ID bits 27:24): DMAR names its source ID by it.
 var ioapic_hw_id: u8 = 0
@@ -695,11 +682,10 @@ fn ioapic_irq_dest(irq: u8) -> u32
     return ioapic_rte_dest(hi)
 
 # Disable legacy 8259 PIC
-fn pic_disable() -> i32
+fn pic_disable()
     # Mask all interrupts on both PICs
     outb(0xA1, 0xFF)
     outb(0x21, 0xFF)
-    return 0
 
 # ============================================================================
 # AP (Application Processor) Bootstrap
@@ -713,7 +699,7 @@ fn pic_disable() -> i32
 var ap_stack_tops: [64]u64      # Trampoline stack top by CPU index (0 = none)
 var ap_count: u32 = 0           # Number of APs that have started
 var bsp_apic_id: u32 = 0        # BSP's APIC ID
-var bsp_apic_known: u8 = 0      # bsp_apic_id is recorded (0 is a valid ID)
+var bsp_apic_known: bool = false      # bsp_apic_id is recorded (0 is a valid ID)
 
 # The stack top the AP trampoline starts an AP on: its per-CPU kernel stack's
 # identity-mapped top (syscalls then use the kernel-half alias). 0 for an
@@ -752,11 +738,11 @@ const IPI_DELIVERY_INIT: u8 = 5
 const IPI_DELIVERY_SIPI: u8 = 6
 
 # Write the ICR: destination APIC ID and the low 32 bits.
-fn lapic_send_icr(dest_apic: u32, icr_lo: u32) -> i32
+fn lapic_send_icr(dest_apic: u32, icr_lo: u32)
     if x2apic_mode != 0
         # One 64-bit MSR write sends it; there is no delivery-status bit.
         wrmsr(X2APIC_ICR, ((dest_apic as u64) << 32) | (icr_lo as u64))
-        return 0
+        return
 
     # Wait for previous IPI to complete
     while (lapic_read(LAPIC_ICR_LO) & 0x1000) != 0
@@ -765,10 +751,9 @@ fn lapic_send_icr(dest_apic: u32, icr_lo: u32) -> i32
     # Destination in ICR high bits 31:24 (8 bits: xAPIC)
     lapic_write(LAPIC_ICR_HI, (dest_apic & 0xFF) << 24)
     lapic_write(LAPIC_ICR_LO, icr_lo)
-    return 0
 
 # Send IPI (Inter-Processor Interrupt)
-fn lapic_send_ipi(dest_apic: u32, vector: u8, delivery_mode: u8) -> i32
+fn lapic_send_ipi(dest_apic: u32, vector: u8, delivery_mode: u8)
     # ICR low:
     # Bits 0-7: Vector
     # Bits 8-10: Delivery mode (000=Fixed, 101=INIT, 110=Startup)
@@ -777,12 +762,12 @@ fn lapic_send_ipi(dest_apic: u32, vector: u8, delivery_mode: u8) -> i32
     # Bit 14: Level (1 for INIT)
     # Bit 15: Trigger mode (0=Edge, 1=Level)
     let icr_lo: u32 = (vector as u32) | ((delivery_mode as u32) << 8)
-    return lapic_send_icr(dest_apic, icr_lo)
+    lapic_send_icr(dest_apic, icr_lo)
 
 # Send a fixed-delivery IPI carrying `vector` to one CPU. Other modules use
 # this to make an AP run kernel code (arch/x86_64/apcall.ritz, #4220).
-pub fn lapic_send_fixed_ipi(dest_apic: u32, vector: u8) -> i32
-    return lapic_send_ipi(dest_apic, vector, IPI_DELIVERY_FIXED)
+pub fn lapic_send_fixed_ipi(dest_apic: u32, vector: u8)
+    lapic_send_ipi(dest_apic, vector, IPI_DELIVERY_FIXED)
 
 # Park this CPU for good: interrupts off, halt forever. An AP whose boot the
 # BSP abandoned (or never opened) ends here, touching nothing shared (#4140).
@@ -864,7 +849,7 @@ pub fn ap_entry() -> i32
             hlt
 
 # Copy trampoline code to low memory and set up parameters
-fn ap_setup_trampoline(stack_top: u64) -> i32
+fn ap_setup_trampoline(stack_top: u64)
     # Calculate trampoline size
     let tramp_start: u64 = @ap_trampoline_start as u64
     let tramp_end: u64 = @ap_trampoline_end as u64
@@ -883,8 +868,6 @@ fn ap_setup_trampoline(stack_top: u64) -> i32
     *(AP_PML4_SLOT as *u32) = vmm_pml4_phys as u32
     *(AP_STACK_SLOT as *u64) = stack_top
     *(AP_ENTRY_SLOT as *u64) = ap_entry as u64
-
-    return 0
 
 # Boot a single AP
 # cpu_idx is the AP's CPU index (cpu_map), whose started flag it sets.
@@ -943,10 +926,10 @@ fn ap_boot_one(apic_id: u32, cpu_idx: i32, stack_top: u64) -> i32
         return -1
 
 # Boot all APs
-pub fn ap_boot_all() -> i32
+pub fn ap_boot_all()
     # Record BSP's APIC ID
     bsp_apic_id = lapic_id()
-    bsp_apic_known = 1
+    bsp_apic_known = true
 
     klog("  [..] Boot APs\n")
     klog("    BSP APIC ID: ")
@@ -980,8 +963,6 @@ pub fn ap_boot_all() -> i32
     klog_dec(ap_count as i64)
     klog(" APs started)\n")
     irq_route_report()
-
-    return 0
 
 # Everything after ACPI parsing, shared by both boot paths: map the LAPIC and
 # I/O APIC, pick xAPIC/x2APIC, bring up the BSP's LAPIC and the I/O APIC, and

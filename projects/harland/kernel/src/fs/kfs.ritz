@@ -90,12 +90,12 @@ var g_kfs_ns: Namespace
 var g_kfs_pstore: MemoryBlobStore
 var g_kfs_pns: Namespace
 var g_kfs_dev: BlockDevice
-var g_kfs_has_dev: u8 = 0
-var g_kfs_initialized: u8 = 0
+var g_kfs_has_dev: bool = false
+var g_kfs_initialized: bool = false
 # When kfs_save last ran (time_ns; 0 = never) and whether a debounced save
 # was skipped since (fs_sync/power-off clear it).
 var g_kfs_last_save_ns: u64 = 0
-var g_kfs_save_pending: u8 = 0
+var g_kfs_save_pending: bool = false
 
 # Start the kernel namespace. The storage device holds the persistent /var
 # subtree's goliath image (what the last boot saved); a blank device starts
@@ -105,7 +105,7 @@ var g_kfs_save_pending: u8 = 0
 # is logged and not used, so a save can't replace what may still be
 # recoverable.
 pub fn kfs_init(storage: *VirtioBlkDevice) -> i32
-    if g_kfs_initialized != 0
+    if g_kfs_initialized
         return 0
     g_kfs_store = memory_store_new_in(kfs_allocator())
     g_kfs_pstore = memory_store_new_in(kfs_allocator())
@@ -115,9 +115,9 @@ pub fn kfs_init(storage: *VirtioBlkDevice) -> i32
         g_kfs_dev = BlockDevice { dev: storage as *u8, sectors: (*storage).capacity, read: kfs_dev_read, write: kfs_dev_write }
         let rc: ErrorCode = block_store_load(@g_kfs_dev, @g_kfs_pstore, @g_kfs_pns)
         if rc == ErrorCode.Ok
-            g_kfs_has_dev = 1
+            g_kfs_has_dev = true
         else if rc == ErrorCode.NotFound
-            g_kfs_has_dev = 1
+            g_kfs_has_dev = true
         else
             klog("kfs: storage image unreadable (goliath error " as StrView)
             klog_dec(rc as i64)
@@ -125,7 +125,7 @@ pub fn kfs_init(storage: *VirtioBlkDevice) -> i32
             # A failed load may have stored part of the image
             g_kfs_pstore = memory_store_new_in(kfs_allocator())
             g_kfs_pns = namespace_new(@g_kfs_pstore)
-    g_kfs_initialized = 1
+    g_kfs_initialized = true
     if namespace_exists(@g_kfs_ns, "/") == false
         return -1
     0
@@ -133,19 +133,19 @@ pub fn kfs_init(storage: *VirtioBlkDevice) -> i32
 # The kernel namespace (null before kfs_init): the runtime tree the initramfs
 # loads into.
 pub fn kfs_get() -> *Namespace
-    if g_kfs_initialized == 0
+    if not g_kfs_initialized
         return 0 as *Namespace
     @g_kfs_ns
 
 # The namespace that persists: its root is /var's contents.
 pub fn kfs_persist_get() -> *Namespace
-    if g_kfs_initialized == 0
+    if not g_kfs_initialized
         return 0 as *Namespace
     @g_kfs_pns
 
 # Whether the namespace has a storage device to save to
 pub fn kfs_has_storage() -> bool
-    g_kfs_initialized != 0 and g_kfs_has_dev != 0
+    g_kfs_initialized and g_kfs_has_dev
 
 # Blobs the runtime namespace holds
 pub fn kfs_blob_count() -> i32
@@ -161,7 +161,7 @@ pub fn kfs_save() -> i32
     # debounce interval away.
     g_kfs_last_save_ns = time_ns()
     if rc == KFS_OK
-        g_kfs_save_pending = 0
+        g_kfs_save_pending = false
     rc
 
 # How long a save on close is deferred after the last one: a burst of
@@ -179,13 +179,13 @@ pub fn kfs_save_later() -> i32
         return Errno.NoDev as i32
     let now: u64 = time_ns()
     if g_kfs_last_save_ns != 0 and now - g_kfs_last_save_ns < SAVE_DEBOUNCE_NS
-        g_kfs_save_pending = 1
+        g_kfs_save_pending = true
         return KFS_OK
     kfs_save()
 
 # Whether a debounced save is owed to the storage device
 pub fn kfs_save_pending() -> bool
-    g_kfs_save_pending != 0
+    g_kfs_save_pending
 
 # ============================================================================
 # The persistent subtree (/var)
@@ -209,7 +209,7 @@ pub fn kfs_is_persist(path: StrView) -> bool
 # The namespace a path lives in: the persistent /var subtree for /var and
 # below, else the runtime tree.
 pub fn kfs_ns_for(path: StrView) -> *Namespace
-    if kfs_is_persist(path) and g_kfs_initialized != 0
+    if kfs_is_persist(path) and g_kfs_initialized
         return @g_kfs_pns
     kfs_get()
 

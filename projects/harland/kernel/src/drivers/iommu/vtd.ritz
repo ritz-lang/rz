@@ -57,8 +57,8 @@ const VTD_TIMEOUT_US: u64 = 100000
 const VTD_REG_FSTS: u64 = 0x34
 const FSTS_IQE: u32 = 0x10
 
-var vtd_on: u8 = 0
-var vtd_x2: u8 = 0
+var vtd_on: bool = false
+var vtd_x2: bool = false
 var vtd_units: i32 = 0
 var vtd_regs: [8]u64            # kernel virtual address of each unit's registers
 var vtd_coherent: [8]u8         # ECAP.C: the unit snoops the IRT, no flush needed
@@ -71,11 +71,11 @@ var vtd_seq: u32 = 0
 # Is interrupt remapping on? Then every MSI and redirection entry must be
 # programmed in the remappable format.
 pub fn vtd_ir_enabled() -> bool
-    return vtd_on != 0
+    return vtd_on
 
 # ... and are IRTE destinations 32-bit x2APIC IDs (EIM)?
 pub fn vtd_ir_x2apic() -> bool
-    return vtd_on != 0 and vtd_x2 != 0
+    return vtd_on and vtd_x2
 
 # ============================================================================
 # Registers
@@ -114,11 +114,10 @@ fn vtd_gcmd(u: i32, set: u32, clear: u32, wait_bits: u32, want_set: bool) -> boo
     return vtd_wait_gsts(u, wait_bits, want_set)
 
 # Write back an IRTE's cache line when the unit doesn't snoop the table.
-fn vtd_clflush(addr: u64) -> i32
+fn vtd_clflush(addr: u64)
     asm x86_64:
         movq {addr}, %r8
         clflush (%r8)
-    return 0
 
 # ============================================================================
 # Queued invalidation
@@ -192,9 +191,9 @@ fn vtd_irte_write(si: i32, handle: u32, lo: u64, hi: u64) -> i32
 # out of range, no unit is on the segment or a unit didn't confirm the
 # invalidation.
 pub fn vtd_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -> i32
-    if vtd_on == 0 or handle >= IRT_ENTRIES
+    if not vtd_on or handle >= IRT_ENTRIES
         return -1
-    let lo: u64 = irte_lo(vector, dest, level, vtd_x2 != 0)
+    let lo: u64 = irte_lo(vector, dest, level, vtd_x2)
     let hi: u64 = irte_hi(sid, IRTE_SVT_VERIFY_SID)
     let si: i32 = dmar_sid_seg_index(sid)
     if si == DMAR_SEG_ALL
@@ -214,7 +213,7 @@ pub fn vtd_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -> 
 # is off or no unit is on the segment. DMAR_SID_NONE entries are the same
 # in every table: read the first.
 pub fn vtd_ir_get_lo(handle: u32, sid: u32) -> u64
-    if vtd_on == 0 or handle >= IRT_ENTRIES
+    if not vtd_on or handle >= IRT_ENTRIES
         return 0
     var si: i32 = dmar_sid_seg_index(sid)
     if si == DMAR_SEG_ALL
@@ -292,7 +291,7 @@ fn vtd_units_disable(n: i32)
 # in x2APIC mode, so IRTEs carry 32-bit destinations (EIM). ACPI must be
 # parsed. Returns 0 with remapping on, -1 with it off (logged why).
 pub fn vtd_ir_init(x2apic: bool) -> i32
-    vtd_on = 0
+    vtd_on = false
     vtd_units = 0
     let dmar: u64 = acpi_find_table(ACPI_SIG_DMAR)
     if dmar == 0
@@ -362,10 +361,10 @@ pub fn vtd_ir_init(x2apic: bool) -> i32
             return -1
         u = u + 1
     vtd_units = n
-    vtd_x2 = 0
+    vtd_x2 = false
     if x2apic
-        vtd_x2 = 1
-    vtd_on = 1
+        vtd_x2 = true
+    vtd_on = true
     klog("      Interrupt remapping: VT-d on, ")
     klog_dec(n as i64)
     if dmar_num_segs == 1

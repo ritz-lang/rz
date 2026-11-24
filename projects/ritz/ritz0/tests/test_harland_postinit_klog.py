@@ -156,7 +156,8 @@ def test_postinit_module_defines_the_self_tests():
     body = _body(code, "boot_self_tests")
     assert body.count("boot_test_result(") >= 13, body
     assert '"channel-close", channel_close_self_test(pair)' in body
-    assert '"channel-debug-print", channel_debug_print() == 0' in body
+    # channel_debug_print returns nothing (#4600): it passes by returning.
+    assert body.index("channel_debug_print()") < body.index('"channel-debug-print", true')
     assert body.index("if boot_tests_failed != 0") < body.index("halt_loop()")
 
 

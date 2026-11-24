@@ -72,16 +72,18 @@ def _run(tmp_path, src):
 
 NESTING = """\
 import syscall.errno { Errno }
+import ritzlib.strview { StrView }
 import proc.table
 
-fn cwd_is(want: *u8, n: i64) -> bool
-    var len: u16 = 0
-    let c: *u8 = proc_cwd(@len)
-    if len as i64 != n or *(c + n) != 0
+# proc_cwd is a StrView over the Proc's Cwd holder, NUL-terminated just past
+# its length for getcwd's copy-out (AGAST #4600).
+fn cwd_is(want: StrView) -> bool
+    let c: StrView = proc_cwd()
+    if c.len != want.len or *(c.ptr + c.len) != 0
         return false
     var i: i64 = 0
-    while i < n
-        if *(c + i) != *(want + i)
+    while i < want.len
+        if *(c.ptr + i) != *(want.ptr + i)
             return false
         i = i + 1
     true
@@ -115,24 +117,24 @@ fn main() -> i32
     proc_table_reset()
     if proc_current() != 0 as *Proc or proc_current_pid() != 0
         return 1
-    if proc_enter_init(4096) != 0 or proc_current_pid() != 1 or not cwd_is(c"/", 1)
+    if proc_enter_init(4096) != 0 or proc_current_pid() != 1 or not cwd_is("/")
         return 2
     let init: *Proc = proc_current()
     if init.pml4 != 4096 or init.parent != -1 or not proc_is_init(init)
         return 3
     # init -> rzsh -> script -> command, each a new pid with the cwd it
     # inherited, the parent blocked on its child
-    if spawn_blocking() != 0 or proc_current_pid() != 2 or not cwd_is(c"/", 1)
+    if spawn_blocking() != 0 or proc_current_pid() != 2 or not cwd_is("/")
         return 4
     let rzsh: *Proc = proc_current()
-    if proc_set_cwd(c"/etc", 4) != 0
+    if proc_set_cwd("/etc") != 0
         return 5
-    if spawn_blocking() != 0 or proc_current_pid() != 3 or not cwd_is(c"/etc", 4)
+    if spawn_blocking() != 0 or proc_current_pid() != 3 or not cwd_is("/etc")
         return 6
     let script: *Proc = proc_current()
-    if proc_set_cwd(c"/bin", 4) != 0
+    if proc_set_cwd("/bin") != 0
         return 7
-    if spawn_blocking() != 0 or proc_current_pid() != 4 or not cwd_is(c"/bin", 4)
+    if spawn_blocking() != 0 or proc_current_pid() != 4 or not cwd_is("/bin")
         return 8
     let cmd: *Proc = proc_current()
     if init.state != PROC_BLOCKED or rzsh.state != PROC_BLOCKED or script.state != PROC_BLOCKED
@@ -145,12 +147,12 @@ fn main() -> i32
     # command exits 42: script runs again in /bin and reaps it, once
     if exit_to_parent(42) != script or proc_current() != script
         return 12
-    if script.state != PROC_RUNNING or not cwd_is(c"/bin", 4)
+    if script.state != PROC_RUNNING or not cwd_is("/bin")
         return 13
     if proc_wait(4) != 42 or proc_wait(4) != Errno.Child as i64
         return 14
     # script exits 42: rzsh runs again in /etc
-    if exit_to_parent(42) != rzsh or proc_current_pid() != 2 or not cwd_is(c"/etc", 4)
+    if exit_to_parent(42) != rzsh or proc_current_pid() != 2 or not cwd_is("/etc")
         return 15
     # rzsh can't reap its parent or a pid that never was
     if proc_wait(1) != Errno.Child as i64 or proc_wait(99) != Errno.Child as i64
@@ -158,10 +160,24 @@ fn main() -> i32
     if proc_wait(3) != 42
         return 17
     # rzsh exits 7: init runs again in "/", untouched by its children's chdir
-    if exit_to_parent(7) != init or proc_current_pid() != 1 or not cwd_is(c"/", 1)
+    if exit_to_parent(7) != init or proc_current_pid() != 1 or not cwd_is("/")
         return 18
     if proc_wait(2) != 7 or proc_live_count() != 1
         return 19
+    # The holder takes PROC_CWD_MAX (255) bytes and refuses one more,
+    # leaving the cwd as it was (AGAST #4600)
+    var long: [256]u8
+    var i: i64 = 0
+    while i < 256
+        long[i] = 97  # 'a'
+        i = i + 1
+    long[0] = 47  # '/'
+    if proc_set_cwd(StrView { ptr: @long[0], len: 256 }) != Errno.NameTooLong as i32 or not cwd_is("/")
+        return 20
+    if proc_set_cwd(StrView { ptr: @long[0], len: 255 }) != 0
+        return 21
+    if not cwd_is(StrView { ptr: @long[0], len: 255 })
+        return 22
     0
 """
 

@@ -297,7 +297,7 @@ def test_irq_route_counts_remapping_as_reachable():
     route = _body(code, "irq_route_dest")
     assert re.search(r"irq_dest_pick\(.*\bir_x2apic\(\)", route), "irq_route_dest ignores IR"
     # with IR on the table entry holds the destination: no extended-destination-ID bits
-    assert re.search(r"irq_ext_dest != 0 and not ir_enabled\(\)", route), route
+    assert re.search(r"irq_ext_dest and not ir_enabled\(\)", route), route
 
 
 @pytest.mark.unit

@@ -28,6 +28,7 @@
 # and its own exit frees its slot instead of leaving a zombie.
 
 import syscall.errno { Errno }
+import ritzlib.strview { StrView }
 
 # Live and zombie processes at once; fs/syscall.ritz has FS_MAX_PROCS FsProcs
 # and syscall_entry.s one kernel stack per slot (PROC_KSTACK_SLOTS).
@@ -51,6 +52,13 @@ pub const PROC_CHILD_LIVE: i32 = 1
 
 pub const PROC_CWD_MAX: i64 = 255
 
+# A working directory: up to PROC_CWD_MAX path bytes and their count, with a
+# NUL just past them for getcwd's copy-out. Read it as a StrView
+# (proc_cwd); write it from one (proc_set_cwd) (AGAST #4600).
+pub struct Cwd
+    bytes: [256]u8
+    len: u16
+
 pub struct Proc
     pid: u64
     parent: i32             # procs index of the spawning process; -1 for init or detached
@@ -61,8 +69,7 @@ pub struct Proc
     ksp: u64                # kernel RSP saved by sched_switch while it isn't running
     wait_pid: u64           # BLOCK_CHILD: the child it waits for
     exit_code: i64          # valid in PROC_ZOMBIE
-    cwd: [256]u8            # null-terminated
-    cwd_len: u16
+    cwd: Cwd
 
 var procs: [8]Proc
 var proc_cur: i32 = -1
@@ -143,9 +150,9 @@ pub fn proc_enter_init(pml4: u64) -> i32
     (*p).ksp = 0
     (*p).wait_pid = 0
     (*p).exit_code = 0
-    (*p).cwd[0] = 47  # '/'
-    (*p).cwd[1] = 0
-    (*p).cwd_len = 1
+    (*p).cwd.bytes[0] = 47  # '/'
+    (*p).cwd.bytes[1] = 0
+    (*p).cwd.len = 1
     proc_cur = slot
     0
 
@@ -172,11 +179,7 @@ pub fn proc_new_child() -> i32
     (*c).ksp = 0
     (*c).wait_pid = 0
     (*c).exit_code = 0
-    var i: i32 = 0
-    while i <= (*parent).cwd_len as i32
-        (*c).cwd[i] = (*parent).cwd[i]
-        i = i + 1
-    (*c).cwd_len = (*parent).cwd_len
+    (*c).cwd = (*parent).cwd
     slot
 
 # A NEW child is built: it becomes runnable.
@@ -292,24 +295,23 @@ pub fn proc_pick_next() -> i32
 pub fn proc_set_current(slot: i32)
     proc_cur = slot
 
-# The running process's cwd, null-terminated; its length goes to *len.
-pub fn proc_cwd(len: *u16) -> *u8
-    let p: *Proc = @procs[proc_cur]
-    *len = (*p).cwd_len
-    @(*p).cwd[0]
+# The running process's cwd. A NUL follows it (ptr[len] == 0).
+pub fn proc_cwd() -> StrView
+    let c: *Cwd = @procs[proc_cur].cwd
+    StrView { ptr: @(*c).bytes[0], len: (*c).len as i64 }
 
-# Set the running process's cwd to path[0..n] (the caller checked it
-# exists). 0, or Errno.NameTooLong.
-pub fn proc_set_cwd(path: *u8, n: i64) -> i32
-    if n > PROC_CWD_MAX
+# Set the running process's cwd to `path` (the caller checked it exists).
+# 0, or Errno.NameTooLong.
+pub fn proc_set_cwd(path: StrView) -> i32
+    if path.len > PROC_CWD_MAX
         return Errno.NameTooLong as i32
-    let p: *Proc = @procs[proc_cur]
+    let c: *Cwd = @procs[proc_cur].cwd
     var i: i64 = 0
-    while i < n
-        (*p).cwd[i] = *(path + i)
+    while i < path.len
+        (*c).bytes[i] = *(path.ptr + i)
         i = i + 1
-    (*p).cwd[n] = 0
-    (*p).cwd_len = n as u16
+    (*c).bytes[path.len] = 0
+    (*c).len = path.len as u16
     0
 
 # The running process descends from pid `root` (through `parent`), or is

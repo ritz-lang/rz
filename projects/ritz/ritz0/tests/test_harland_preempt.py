@@ -211,7 +211,7 @@ def test_tick_preempts_only_ring_3_after_its_eoi():
     timer = irq[irq.index("if irq_num == 0"):irq.index("if irq_num == 4")]
     assert timer.index("lapic_eoi()") < timer.index("sched_tick(((*frame).cs & 3) == 3)")
     tick = _body(_code(SCHED), "sched_tick")
-    assert "if not from_user or sched_running == 0" in tick and "sched_switch_to(next)" in tick
+    assert "if not from_user or not sched_running" in tick and "sched_switch_to(next)" in tick
 
 
 # --- the switch ----------------------------------------------------------------------

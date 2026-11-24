@@ -112,7 +112,7 @@ var virtio_tx_next: u32 = 0
 # queue and entry 2 the TX queue, each on its own IDT vector. Without MSI-X
 # the device stays on INTx (masked at the I/O APIC) and is only polled.
 var virtio_net_msix: MsixInfo
-var virtio_net_msix_on: u8 = 0
+var virtio_net_msix_on: bool = false
 var virtio_net_vectors: [3]u8
 
 # RX waits (AGAST #3631): a caller with nothing to do until a frame arrives
@@ -176,7 +176,7 @@ fn virtio_net_setup_queue(queue_index: u16) -> *Virtqueue
     let vdev: *VirtioDevice = virtio_net.vdev
     let max: u16 = vio_get_queue_size(vdev, queue_index)
     var vector: u16 = VIRTIO_MSI_NO_VECTOR
-    if virtio_net_msix_on != 0
+    if virtio_net_msix_on
         vector = queue_index + 1
     let vq: *Virtqueue = vio_setup_queue_vec(vdev, queue_index, vector)
     if vq == 0 as *Virtqueue
@@ -225,7 +225,7 @@ fn virtio_net_setup_msix(pci_dev: *PciDevice) -> i32
         msix_set_entry(@virtio_net_msix, i as u16, virtio_net_vectors[i])
         i = i + 1
 
-    virtio_net_msix_on = 1
+    virtio_net_msix_on = true
     vio_note_msix_on(virtio_net.vdev)
     if vio_set_config_msix_vector(virtio_net.vdev, 0) != 0
         klog("[virtio-net] WARNING: config change vector refused\n")
@@ -275,7 +275,7 @@ pub fn virtio_net_init() -> i32
         klog(")\n")
 
     # MSI-X before any device-config read: it moves the legacy config to 24
-    virtio_net_msix_on = 0
+    virtio_net_msix_on = false
     virtio_net_setup_msix(pci_dev)
 
     # Read device features (bits 0-31; the common layer handles VERSION_1)
@@ -512,8 +512,8 @@ pub fn virtio_net_get_mac(mac_out: *u8)
 pub fn virtio_net_get_device() -> *VirtioNetDevice
     return @virtio_net
 
-# 1 if the NIC signals through MSI-X (virtio_net_setup_msix succeeded)
-pub fn virtio_net_msix_enabled() -> u8
+# True if the NIC signals through MSI-X (virtio_net_setup_msix succeeded)
+pub fn virtio_net_msix_enabled() -> bool
     return virtio_net_msix_on
 
 # Sleep until a frame arrives (the RX vector fires) or a short watchdog
@@ -522,7 +522,7 @@ pub fn virtio_net_msix_enabled() -> u8
 # it can't sleep (no MSI-X, or IF=0): the caller then delays as it did
 # before. Returns with IF unchanged.
 pub fn virtio_net_wait_rx() -> bool
-    if virtio_net.initialized == 0 or virtio_net_msix_on == 0 or not interrupts_enabled()
+    if virtio_net.initialized == 0 or not virtio_net_msix_on or not interrupts_enabled()
         return false
     let vec: u8 = virtio_net_vectors[1]
     # Snapshot before the check: a frame landing after it ends the sleep
@@ -542,7 +542,7 @@ pub fn virtio_net_rx_halt_count() -> u64
 
 # MSI-X interrupts the NIC has delivered so far, over all its vectors
 pub fn virtio_net_irq_count() -> u64
-    if virtio_net_msix_on == 0
+    if not virtio_net_msix_on
         return 0
     var total: u64 = 0
     var i: i32 = 0

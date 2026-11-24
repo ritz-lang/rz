@@ -49,7 +49,7 @@ METRICS = RITZ0_DIR.parents[1] / "larb" / "tools" / "ritz-metrics" / "ritz_metri
 AREAS = {
     "entry": ["syscall_init", "syscall_table_init", "syscall_handler"],
     "process": [
-        "current_pid", "syscall_strlen", "process_enter_init",
+        "current_pid", "process_enter_init",
         "elf_status_errno", "sys_spawn_impl", "sys_spawn_args_impl", "sys_exit_impl", "sys_wait_impl",
         "sys_exit_handler", "sys_open_handler", "sys_spawn_handler", "sys_spawn_args_handler",
         "sys_spawn_bg_handler", "spawn_process", "wait_for_child",
