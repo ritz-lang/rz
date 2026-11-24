@@ -33,15 +33,6 @@ TREES = ["kernel/src", "boot/src"]
 ALLOWED = {
     # Its shape is #1887's (kernel_main's structure).
     "kernel_main": "#1887",
-    # Declared through a cycle-breaking `extern fn` elsewhere: ritz0 lowers
-    # a unit extern to void but a unit definition to i32, and a module that
-    # holds both emits invalid IR (#4625). Make them unit when it lands.
-    "ring_dump": "#4625",
-    "lapic_eoi": "#4625",
-    "lapic_watchdog_arm": "#4625",
-    "lapic_watchdog_stop": "#4625",
-    "irq_route_print_reason": "#4625",
-    "waitq_wake_irq": "#4625",
 }
 
 FN = re.compile(r"^(\s*)(?:pub\s+)?fn\s+(\w+)\s*\(.*\)\s*->\s*i32\s*(?:#.*)?$")

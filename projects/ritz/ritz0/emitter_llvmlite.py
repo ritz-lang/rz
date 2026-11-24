@@ -5442,7 +5442,14 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         """Declare an external function in the LLVM module, so it can be
         linked with external object files."""
         param_types = [self._ritz_type_to_llvm(p.type) for p in extern.params]
-        ret_type = self._ritz_type_to_llvm(extern.ret_type) if extern.ret_type else self.void
+        # A procedure has one lowering, extern or defined (AGAST #4625): the
+        # i32 with a dummy return that _declare_function gives `fn f()`. A
+        # module whose closure holds both `extern fn f()` (harland's
+        # cycle-breaking externs) and `fn f()`'s body takes the first
+        # declaration's type, so a `void` extern turned the body's
+        # `ret i32 0` into invalid IR. The caller discards the i32, so a C
+        # or asm `void` callee is still called correctly.
+        ret_type = self._ritz_type_to_llvm(extern.ret_type) if extern.ret_type else self.i32
 
         fn_type = ir.FunctionType(ret_type, param_types)
 

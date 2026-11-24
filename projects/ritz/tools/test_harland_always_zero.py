@@ -6,8 +6,8 @@ and boot/src:
   - ~99 `-> i32` functions whose every result is 0. A caller can learn
     nothing from them, and some checked it anyway. They return nothing now;
     projects/harland/tools/always_zero.py counts what is left, and its
-    ALLOWED names each one that stays, with why (kernel_main for #1887; six
-    declared through cycle-breaking externs for #4625).
+    ALLOWED names each one that stays, with why (kernel_main for #1887; the
+    six declared through cycle-breaking externs went unit with #4625).
   - ~34 `var x: u8 = 0` globals, most of them flags written only 0 and 1 and
     compared only with 0 and 1. Those are `bool`.
   - syscall_strlen and open-coded `while *(p + n) != 0` length loops beside

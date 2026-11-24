@@ -383,16 +383,15 @@ pub fn sti_hlt() -> i32
         fake_dev_service()
     0
 
-pub fn lapic_watchdog_arm(ticks: u32) -> i32
+pub fn lapic_watchdog_arm(ticks: u32)
     g_wd_checks = 0
-    0
 
 pub fn lapic_watchdog_expired() -> bool
     g_wd_checks = g_wd_checks + 1
     g_wd_checks >= WD_CHECKS
 
-pub fn lapic_watchdog_stop() -> i32
-    0
+pub fn lapic_watchdog_stop()
+    pass
 
 # The wait queue: parking is possible only after fake_waitq_allow(true);
 # a park counts and, like the woken process, sees the interrupt delivered.

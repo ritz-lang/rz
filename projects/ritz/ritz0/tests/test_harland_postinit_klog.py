@@ -245,7 +245,7 @@ def test_kernel_main_keeps_the_boot_order():
 
 def test_ring_dump_stays_bound_from_exceptions():
     """exceptions.ritz binds ring_dump by bare name; it must stay pub."""
-    assert re.search(r"^extern fn ring_dump\(\) -> i32$",
+    assert re.search(r"^extern fn ring_dump\(\)$",
                      _code(KERNEL_SRC / "arch" / "x86_64" / "exceptions.ritz"), re.M)
     assert _fns(_code(KLOG))["ring_dump"]
 
