@@ -46,6 +46,13 @@ def test_a_package_merely_named_archive_is_still_found(tmp_path):
     assert found == [pkg.resolve()]
 
 
+def test_a_package_under_docs_outside_the_archive_is_still_found(tmp_path):
+    # AGAST #4638: the skip is docs/archive, not all of docs/.
+    pkg = _pkg(tmp_path, "docs/guide_pkg")
+    found = [p for p, _ in manifest.find_all_packages(tmp_path)]
+    assert found == [pkg.resolve()]
+
+
 def test_the_real_tree_has_no_archive_package():
     found = manifest.find_all_packages(RITZ)
     archive = (RITZ / "docs" / "archive").resolve()

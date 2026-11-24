@@ -44,7 +44,7 @@ PINS = {
     "nexus": 6,
     "prism": 3,
     "ritz-lsp": 15,
-    "ritz/examples": 77,
+    "ritz/examples": 30,
     "ritz/ritz0": 18,
     "ritz/ritz1": 511,
     "ritzunit": 7,
