@@ -13724,7 +13724,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # Get the enum name from the expression type
         enum_name = self._get_enum_name_from_expr(expr.expr)
         if not enum_name:
-            raise self._err(f"Try operator requires a Result type, got expression: {type(expr.expr)}")
+            # Ritz-level words, as ritz1 says them (AGAST #4665): no Python
+            # class name.
+            raise self._err("Try operator requires a Result or an Option")
 
         if enum_name == 'Option' or enum_name.startswith("Option$"):
             # `opt?` on an Option<T>: unwrap Some, or return None early.

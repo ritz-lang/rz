@@ -34,6 +34,8 @@ from pathlib import Path
 import pytest
 
 from ritz0_inproc import run_ritz0
+from test_ref_into_value import COMPILERS, _compile as _compile3
+from test_table_rows import assert_refusals
 
 
 RITZ_ROOT = Path(__file__).resolve().parents[2]
@@ -56,6 +58,8 @@ def _located(marked):
 
 
 MAIN0 = "\nfn main() -> i32\n    0\n"
+GEN = "fn id<T>(x: T) -> T\n    x\n\nfn ap(f: fn(i32) -> i32) -> i32\n    f(3)\n\n"
+GENERIC_FN_VALUE = "`id` is generic, so it can't be used as a value: call it"
 
 # row -> (refused program with `^`, message, corrected program)
 ROWS = {
@@ -197,7 +201,7 @@ fn f() -> Option<i64>
 fn g() -> i64
     let x = ^f()?
     x
-""" + MAIN0, "Try operator on an Option used in a function that does not return an Option", """\
+""" + MAIN0, "Try operator on an Option used in a function that does not return an Option (got None)", """\
 fn f() -> Option<i64>
     Some(1)
 
@@ -213,7 +217,7 @@ fn f() -> i64
 fn g() -> Option<i64>
     let b = ^f()?
     Some(b)
-""" + MAIN0, "Try operator requires a Result type", """\
+""" + MAIN0, "Try operator requires a Result or an Option", """\
 fn f() -> Option<i64>
     Some(5)
 
@@ -247,13 +251,41 @@ struct P
 fn main() -> i32
     let p = P { x: 1, y: ^2 }
     0
-""", "Unknown field y in struct P", """\
+""", "`P` has no field `y`", """\
 struct P
     x: i64
     y: i64
 
 fn main() -> i32
     let p = P { x: 1, y: 2 }
+    0
+"""),
+    # AGAST #4655: a generic instance's literal, and the built-in Span's.
+    # ritz1 dropped the field and compiled each.
+    "struct_lit_generic_unknown_field": ("""\
+struct H<T>
+    v: T
+
+fn main() -> i32
+    let h = H<u8> { v: 1, w: ^2 }
+    0
+""", "`H<u8>` has no field `w`", """\
+struct H<T>
+    v: T
+
+fn main() -> i32
+    let h = H<u8> { v: 1 }
+    0
+"""),
+    "span_lit_unknown_field": ("""\
+fn main() -> i32
+    var a: [3]u8 = [1, 2, 3]
+    let s = Span<u8> { ptr: @a[0], size: ^3 }
+    0
+""", "`Span<u8>` has no field `size`", """\
+fn main() -> i32
+    var a: [3]u8 = [1, 2, 3]
+    let s = Span<u8> { ptr: @a[0], len: 3 }
     0
 """),
     # _emit_array_fill: `[0; 0]`.
@@ -271,7 +303,7 @@ fn main() -> i32
 fn main() -> i32
     let a = ^[]
     0
-""", "Empty array literal needs a declared array type", """\
+""", "Empty array literal needs a declared array type (e.g. `let a: [0]u8 = []`)", """\
 fn main() -> i32
     let a: [0]u8 = []
     0
@@ -302,15 +334,18 @@ fn main() -> i32
     let p = heap P { x: 1 }
     0
 """),
-    # _emit_expr_core: a generic fn named as a value.
-    "unknown_identifier": ("""\
+    # A generic fn named as a value (AGAST #4661): a template has no
+    # address, so only a call names it.  ritz0's name resolver said "Unknown
+    # identifier: id", though `id` is declared; ritz1 emitted a reference to
+    # the uninstantiated template.  `id<i32>` as a value doesn't parse.
+    "generic_fn_value": ("""\
 fn id<T>(x: T) -> T
     x
 
 fn main() -> i32
     let f = ^id
     0
-""", "Unknown identifier: id", """\
+""", GENERIC_FN_VALUE, """\
 fn id<T>(x: T) -> T
     x
 
@@ -318,6 +353,23 @@ fn main() -> i32
     let f = id(1)
     0
 """),
+    "generic_fn_value_argument": (GEN + """\
+fn main() -> i32
+    ap(^id) - 3
+""", GENERIC_FN_VALUE, GEN + """\
+fn main() -> i32
+    ap(id_i32) - 3
+
+fn id_i32(x: i32) -> i32
+    id(x)
+"""),
+    "generic_fn_value_return": (GEN + """\
+fn g() -> fn(i32) -> i32
+    return ^id
+""" + MAIN0, GENERIC_FN_VALUE, GEN + """\
+fn g(x: i32) -> i32
+    return id(x)
+""" + MAIN0),
 }
 
 
@@ -338,6 +390,37 @@ def test_corrected_program_still_compiles(tmp_path, row):
     good = ROWS[row][2]
     comp = _compile(tmp_path, good)
     assert comp.returncode == 0, f"{row}:\n{good}\n{comp.stderr[-3000:]}"
+
+
+# AGAST #4654 / #4665: every compiler refuses each row with ritz0's words,
+# at the `^`.  ritz1 named an emitter failure ("ritz1 cannot emit: unhandled
+# EXPR_MEMBER") or a later, unrelated fault, or compiled the row.  A row
+# listed here is a known ritz1 gap: a strict xfail.
+RITZ1_GAPS = {
+    "array_fill_zero": 4654, "bitop_arity": 4654, "const_array_scalar_type": 4654,
+    "empty_array_untyped": 4654, "float_intrinsic_arity": 4654,
+    "method_on_untyped": 4654, "no_method": 4654, "simd_builtin_arity": 4654,
+    "strview_builtin_arity": 4654, "try_on_plain_value": 4654,
+    "tuple_destructure_count": 4654, "unknown_variant": 4654,
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_every_compiler_says_it_there(tmp_path, compiler):
+    gaps = {} if compiler == "ritz0" else RITZ1_GAPS
+    assert_refusals(compiler, tmp_path,
+                    {row: (marked, message) for row, (marked, message, _) in ROWS.items()},
+                    gaps)
+
+
+@pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
+def test_ritz1_compiles_each_corrected_program(tmp_path, compiler):
+    bad = []
+    for row, (_, _, good) in sorted(ROWS.items()):
+        comp, _, _ = _compile3(compiler, tmp_path, row, good)
+        if comp.returncode != 0:
+            bad.append(f"{row}: {(comp.stdout + comp.stderr)[-500:]}")
+    assert not bad, "\n".join(bad)
 
 
 def test_no_bare_value_error_left_in_the_emitter():

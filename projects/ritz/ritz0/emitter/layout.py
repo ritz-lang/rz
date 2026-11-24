@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 
 from llvmlite import ir
 
+import deref_rules
 import ritz_ast as rast
 from monomorph import resolve_alias_in
 from monomorph_core import note_instance_display
@@ -891,14 +892,17 @@ class LayoutEmitter:
             raise self._err(f"Unknown struct: {expr.name}")
         return self.struct_types[expr.name], self.struct_fields[expr.name]
 
-    @staticmethod
-    def _struct_lit_field_indices(expr: rast.StructLit, field_defs):
-        """[(field index, initialiser)] in source (= evaluation) order."""
+    def _struct_lit_field_indices(self, expr: rast.StructLit, field_defs):
+        """[(field index, initialiser)] in source (= evaluation) order.  A
+        field the struct lacks is R17 rule 5(a)'s "`S` has no field `f`", as
+        ritz1 says it, at the field's value (AGAST #4655)."""
         field_indices = {name: i for i, (name, _) in enumerate(field_defs)}
         out = []
         for field_name, field_expr in expr.fields:
             if field_name not in field_indices:
-                raise SourceError(f"Unknown field {field_name} in struct {expr.name}",
+                shown = (rast.NamedType(expr.span, expr.name, list(expr.type_args))
+                         if expr.type_args else expr.name)
+                raise SourceError(deref_rules.no_field(self._show_type(shown), field_name),
                                   getattr(field_expr, 'span', None) or expr.span)
             out.append((field_indices[field_name], field_expr))
         return out

@@ -57,6 +57,11 @@ BUILTIN_VARIANTS = frozenset({'Some', 'None', 'Ok', 'Err'})
 BUILTIN_GENERICS = frozenset({'Option', 'Result', 'Span'})
 
 
+def generic_fn_value(name: str) -> str:
+    """A generic fn named as a value (AGAST #4661); ritz1 says the same."""
+    return f"`{name}` is generic, so it can't be used as a value: call it"
+
+
 def _interp_print(name: str, args) -> bool:
     """`println("..{x}..")` / `eprintln` and `write(w, "..{x}..")` /
     `writeln`: the emitter lowers these itself, only with an interpolated
@@ -125,6 +130,8 @@ class NameResolver:
         # `W_bump` -> (`bump`, `W`, [`T`]): a method of a generic impl, which
         # has no free name (instantiate.Generics.method_names, LARB R37).
         self.generic_methods: Dict[str, tuple] = {}
+        # Fns with type parameters: no value until called (AGAST #4661).
+        self.generic_fns: Set[str] = set()
 
         # Generic parameters of the items being walked (`T` in `fn f<T>`)
         self.type_params: Set[str] = set()
@@ -153,6 +160,8 @@ class NameResolver:
         for item in module.items:
             if isinstance(item, rast.FnDef):
                 self.functions.add(item.name)
+                if item.type_params:
+                    self.generic_fns.add(item.name)
             elif isinstance(item, rast.ExternFn):
                 self.functions.add(item.name)
             elif isinstance(item, rast.StructDef):
@@ -403,6 +412,10 @@ class NameResolver:
                     f"Unknown identifier: {name}",
                     expr.span
                 ))
+            elif name in self.generic_fns and not scope.contains(name):
+                # `let f = id`: a template has no address; only a call
+                # instantiates it (AGAST #4661, ritz1: call_check.ritz).
+                self.errors.append(NameError(generic_fn_value(name), expr.span))
 
         elif isinstance(expr, rast.Call):
             # `sizeof(i32)`: the argument is a type that reads as an expression

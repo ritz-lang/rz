@@ -75,6 +75,14 @@ REFUSED = {
     "generic_call_ref": "fn g<T>(x: @T) -> i32\n    0\n\nfn f(p: @i32) -> i32\n    g<@^Nope>(p)\n",
     "generic_call_array": "fn g<T>(x: i64) -> i64\n    x\n\nfn f() -> i64\n    g<[2]^Nope>(3)\n",
     "generic_call_list":"fn g<T, U>(x: i64) -> i64\n    x\n\nfn f() -> i64\n    g<i32, *^Nope>(3)\n",
+    # AGAST #4654: a generic type's own name.  ritz1's slot keeps only the
+    # mangled `Zork$u8`, so nothing judged `Zork`; nor `Vec` with no import.
+    "generic_base_param": "fn f(a: ^Zork<u8>) -> i64\n    0\n",
+    "generic_base_let": "fn f() -> i32\n    var q: *^Zork<u8> = null\n    0\n",
+    "generic_base_field": "struct P\n    a: ^Zork<i64>\n",
+    "generic_base_ret": "fn f() -> *^Zork<u8>\n    null\n",
+    "generic_base_in_arg": "struct P\n    a: Option<*^Zork<u8>>\n",
+    "vec_without_import": "fn f(a: @^Vec<u8>) -> i64\n    0\n",
 }
 
 ROWS = [(c, site) for c in COMPILERS for site in sorted(REFUSED)]
@@ -103,7 +111,7 @@ def test_one_located_message(tmp_path, compiler):
 
 
 KNOWN = (
-    "import ritzlib.strview\n\n"
+    "import ritzlib.strview\nimport ritzlib.gvec\n\n"
     "enum E\n    A\n    B\n\n"
     "type Id = i32\n\n"
     "struct Box<T>\n    v: T\n\n"
@@ -134,6 +142,10 @@ KNOWN = (
     # A comparison after a cast: `b` and `c` are values, not `Id<b, c>`.
     "fn two(x: bool, y: bool) -> i32\n    0\n\n"
     "fn cmp(a: i32, b: i32, c: i32, d: i32) -> i32\n    two(a as Id < b, c > d)\n\n"
+    # AGAST #4654: a generic's own name, declared, built in or imported.
+    "fn built(a: Span<u8>, o: Option<i32>, r: Result<i32, i32>, x: Opt<i32>) -> i64\n"
+    "    a.len\n\n"
+    "fn vec_len(v: @Vec<u8>) -> i64\n    v.len\n\n"
     "pub fn main() -> i32\n    var l: Later = Later { x: 3 }\n"
     "    let p: *Later = l.me()\n    var b: Box<i32> = Box<i32> { v: p.x }\n"
     "    first<i32>(@b.v)\n"
