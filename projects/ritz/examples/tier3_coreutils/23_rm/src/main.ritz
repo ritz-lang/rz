@@ -36,36 +36,35 @@ struct RmOptions
 # Diagnostic helpers — see 24_cp for the rationale.
 #
 # Bare-string ("...") arguments are StrViews (length-tagged, no NUL,
-# zero-copy).  *u8 is reserved for runtime path data from argv/syscalls.
+# zero-copy); paths from argv are StrViews too.
 # Each helper returns 1 (rm's error exit code) so call sites can `return
 # rm_err2(...)` directly.
 # ============================================================================
 
-fn rm_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
+fn rm_err2(prefix: StrView, path: StrView, suffix: StrView) -> i32
     eprint("{prefix}{path}{suffix}\n")
     return 1
 
-fn rm_print2(prefix: StrView, path: *u8, suffix: StrView)
+fn rm_print2(prefix: StrView, path: StrView, suffix: StrView)
     print("{prefix}{path}{suffix}\n")
 
 # ============================================================================
 # Removal functions
 # ============================================================================
 
-fn remove_file(path: *u8, opts: *RmOptions) -> i32
-    let result: i32 = sys_unlink(path)
-    if result != 0
+fn remove_file(path: StrView, opts: *RmOptions) -> i32
+    if unlink(path).is_err()
         if opts.force == 0
             rm_err2("rm: cannot remove '", path, "'")
-        return result
+        return 1
 
     if opts.verbose != 0
         rm_print2("removed '", path, "'")
 
     return 0
 
-fn remove_dir_recursive(path: *u8, opts: *RmOptions) -> i32
-    var dir: DirIter = match dir_open(strview_from_cstr(path))
+fn remove_dir_recursive(path: StrView, opts: *RmOptions) -> i32
+    var dir: DirIter = match dir_open(path)
         Ok(it) => it
         Err(_) =>
             if opts.force == 0
@@ -76,12 +75,11 @@ fn remove_dir_recursive(path: *u8, opts: *RmOptions) -> i32
 
     while dir.next()
         let e: DirEntry = dir.entry()
-        let name: *u8 = e.name.ptr
 
         # Skip . and ..
-        if not streq(name, c".") and not streq(name, c"..")
-            var child: String = path_join(strview_from_cstr(path), e.name)
-            let child_path: *u8 = child.as_ptr()
+        if not e.name.eq(".") and not e.name.eq("..")
+            var child: String = path_join(path, e.name)
+            let child_path: StrView = child.as_view()
 
             if is_dir(child.as_view())
                 let r: i32 = remove_dir_recursive(child_path, opts)
@@ -95,8 +93,7 @@ fn remove_dir_recursive(path: *u8, opts: *RmOptions) -> i32
     dir.close()
 
     # Now remove the empty directory
-    let r: i32 = sys_rmdir(path)
-    if r != 0
+    if rmdir(path).is_err()
         if opts.force == 0
             rm_err2("rm: cannot remove directory '", path, "'")
         return 1
@@ -106,21 +103,20 @@ fn remove_dir_recursive(path: *u8, opts: *RmOptions) -> i32
 
     return result
 
-fn remove_path(path: *u8, opts: *RmOptions) -> i32
+fn remove_path(path: StrView, opts: *RmOptions) -> i32
     # Check if path exists
-    if not path_exists(strview_from_cstr(path))
+    if not path_exists(path)
         if opts.force == 0
             return rm_err2("rm: cannot remove '", path, "': No such file or directory")
         return 0  # -f ignores nonexistent
 
     # Check if it's a directory
-    if is_dir(strview_from_cstr(path))
+    if is_dir(path)
         if opts.recursive != 0
             return remove_dir_recursive(path, opts)
         else if opts.dir != 0
             # Try to remove empty directory
-            let r: i32 = sys_rmdir(path)
-            if r != 0
+            if rmdir(path).is_err()
                 return rm_err2("rm: cannot remove '", path, "': Is a directory")
             if opts.verbose != 0
                 rm_print2("removed directory '", path, "'")
@@ -149,12 +145,6 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Positional i as a C string.  A positional is always a whole argv entry, so
-# its view ends at argv's NUL and .ptr is a valid C string.
-fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
-    let v: StrView = pos.get(i)
-    v.ptr
-
 fn rm_all(p: @ParsedArgs) -> i32
     var opts: RmOptions
     opts.recursive = (p.switch("recursive") or p.switch("R")) as i32
@@ -165,7 +155,7 @@ fn rm_all(p: @ParsedArgs) -> i32
     var result: i32 = 0
     let pos = p.positionals()
     for i in 0..pos.len
-        let path: *u8 = positional_cstr(@pos, i)
+        let path: StrView = pos.get(i)
         let r: i32 = remove_path(path, @opts)
         if r != 0
             result = 1

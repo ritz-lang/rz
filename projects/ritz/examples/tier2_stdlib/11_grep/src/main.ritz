@@ -26,20 +26,22 @@ import ritzlib.result
 import ritzlib.strview
 import ritzlib.argspec
 import ritzlib.fmt
+import ritzlib.fd { Fd, fd_open, fd_adopt, fd_stdin, fd_stdout, O_RDONLY }
 
 # ===== I/O with Vec<u8> =====
 
 # Write a line from a Vec<u8> to stdout
 fn write_line(line: *Vec<u8>)
+    let out: Fd = fd_stdout()
     if line.len() > 0
-        sys_write(STDOUT, line.as_ptr(), line.len())
-    sys_write(STDOUT, c"\n" as *u8, 1)
+        out.write_all(Span<u8> { ptr: line.as_ptr(), len: line.len() })
+    out.write_str("\n")
 
 # ===== Grep implementation =====
 
-# Process a file descriptor, printing lines that match pattern
+# Read an open file, printing lines that match pattern
 # Returns number of matching lines
-fn grep_fd(fd: i32, pattern: @Span<u8>) -> i64
+fn grep_fd(f: @Fd, pattern: @Span<u8>) -> i64
     var matches: i64 = 0
 
     # Read buffer for file I/O
@@ -55,7 +57,9 @@ fn grep_fd(fd: i32, pattern: @Span<u8>) -> i64
         read_buf.ensure_cap(4096)
 
         # Read directly into the Vec's buffer
-        let n: i64 = sys_read(fd, read_buf.as_ptr() + read_buf.len(), 4096)
+        let n: i64 = match f.read(Span<u8> { ptr: read_buf.as_ptr() + read_buf.len(), len: 4096 })
+            Ok(k) => k
+            Err(_) => -1
         if n <= 0
             done = 1
         else
@@ -85,17 +89,19 @@ fn grep_fd(fd: i32, pattern: @Span<u8>) -> i64
     matches
 
 # Process a file by path
-fn grep_file(path: *u8, pattern: @Span<u8>) -> i64
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
-        # Error opening file - print error message
-        sys_write(STDERR, c"grep: " as *u8, 6)
-        sys_write(STDERR, path, strlen(path))
-        sys_write(STDERR, c": No such file\n" as *u8, 15)
-        return -1
+fn grep_file(path: StrView, pattern: @Span<u8>) -> i64
+    var file: Fd = fd_adopt(-1)
+    match fd_open(path, O_RDONLY, 0)
+        Ok(f) => file = f
+        Err(_) =>
+            # Error opening file - print error message
+            eprints("grep: ")
+            eprints(path)
+            eprints(": No such file\n")
+            return -1
 
-    let matches: i64 = grep_fd(fd, pattern)
-    sys_close(fd)
+    let matches: i64 = grep_fd(@file, pattern)
+    file.close()
     matches
 
 # ===== Main =====
@@ -111,10 +117,9 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Search FILE (a positional, so a view of an argv string: NUL-terminated, as
-# sys_open needs).  Returns 1 when the file couldn't be read.
+# Search FILE (a positional).  Returns 1 when the file couldn't be read.
 fn grep_path(path: StrView, pattern: @Span<u8>, total: @&i64) -> i32
-    let matches: i64 = grep_file(path.as_cstr_unchecked(), pattern)
+    let matches: i64 = grep_file(path, pattern)
     if matches < 0
         return 1
     *total = *total + matches
@@ -130,7 +135,8 @@ fn grep(p: @ParsedArgs) -> i32
 
     if positionals.len == 1
         # No files - read from stdin
-        let matches: i64 = grep_fd(STDIN, @pattern)
+        let input: Fd = fd_stdin()
+        let matches: i64 = grep_fd(@input, @pattern)
         if matches < 0
             had_error = 1
         else

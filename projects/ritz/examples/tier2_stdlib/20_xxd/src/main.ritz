@@ -35,6 +35,7 @@ import ritzlib.strview
 import ritzlib.span
 import ritzlib.argspec
 import ritzlib.fmt
+import ritzlib.fd { Fd, fd_open, fd_stdin, fd_stdout, O_RDONLY }
 
 # ============================================================================
 # Options
@@ -82,7 +83,7 @@ fn is_printable(c: u8) -> i32
 # Hex dump (forward)
 # ============================================================================
 
-fn dump_fd(fd: i32, opts: *XxdOptions) -> i32
+fn dump_fd(f: @Fd, opts: *XxdOptions) -> i32
     var buf: [4096]u8
     var offset: i64 = 0
 
@@ -91,7 +92,9 @@ fn dump_fd(fd: i32, opts: *XxdOptions) -> i32
     var line_bytes: i32 = 0
 
     loop
-        let n: i64 = sys_read(fd, @buf[0], 4096)
+        let n: i64 = match f.read(Span<u8> { ptr: @buf[0], len: 4096 })
+            Ok(k) => k
+            Err(_) => -1
         if n < 0
             return 1
         if n == 0
@@ -127,7 +130,7 @@ fn output_line(data: *u8, len: i32, offset: i64, opts: *XxdOptions)
             out_pos += 2
         outbuf[out_pos] = 10  # newline
         out_pos += 1
-        sys_write(STDOUT, @outbuf[0], out_pos)
+        fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_pos })
         return
 
     # Full format: offset: hex  ASCII
@@ -175,7 +178,7 @@ fn output_line(data: *u8, len: i32, offset: i64, opts: *XxdOptions)
     outbuf[out_pos] = 10  # newline
     out_pos += 1
 
-    sys_write(STDOUT, @outbuf[0], out_pos)
+    fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_pos })
 
 # ============================================================================
 # Reverse (hex to binary)
@@ -190,7 +193,7 @@ fn hex_char_val(c: u8) -> i32
         return (c - 97 + 10) as i32
     return -1
 
-fn reverse_fd(fd: i32) -> i32
+fn reverse_fd(f: @Fd) -> i32
     var buf: [4096]u8
     var outbuf: [2048]u8
     var out_len: i64 = 0
@@ -198,7 +201,9 @@ fn reverse_fd(fd: i32) -> i32
     var hi_nibble: i32 = -1  # Waiting for second nibble
 
     loop
-        let n: i64 = sys_read(fd, @buf[0], 4096)
+        let n: i64 = match f.read(Span<u8> { ptr: @buf[0], len: 4096 })
+            Ok(k) => k
+            Err(_) => -1
         if n < 0
             return 1
         if n == 0
@@ -219,7 +224,7 @@ fn reverse_fd(fd: i32) -> i32
                     hi_nibble = -1
 
                     if out_len >= 2000
-                        sys_write(STDOUT, @outbuf[0], out_len)
+                        fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_len })
                         out_len = 0
             # Skip non-hex characters (whitespace, colons, etc.)
 
@@ -227,7 +232,7 @@ fn reverse_fd(fd: i32) -> i32
 
     # Flush remaining
     if out_len > 0
-        sys_write(STDOUT, @outbuf[0], out_len)
+        fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_len })
 
     return 0
 
@@ -258,12 +263,11 @@ fn switch_flag(p: @ParsedArgs, name: StrView) -> i32
         return 1
     0
 
-# The input: FILE when given (a view of an argv string, so NUL-terminated as
-# sys_open needs), else stdin.  Negative when FILE can't be opened.
-fn open_input(o: Option<StrView>) -> i32
+# The input: FILE when given, else stdin.  Err when FILE can't be opened.
+fn open_input(o: Option<StrView>) -> Result<Fd, Errno>
     match o
-        Some(path) => sys_open(path.as_cstr_unchecked(), O_RDONLY)
-        None => STDIN
+        Some(path) => fd_open(path, O_RDONLY, 0)
+        None => Ok(fd_stdin())
 
 fn xxd(p: @ParsedArgs, cols: i64, group: i64) -> i32
     # Build XxdOptions from parsed values
@@ -280,19 +284,22 @@ fn xxd(p: @ParsedArgs, cols: i64, group: i64) -> i32
     if opts.group <= 0
         opts.group = 1
 
-    let fd: i32 = open_input(p.positional(0))
-    if fd < 0
-        sys_write(STDERR, c"xxd: cannot open file\n" as *u8, 22)
-        return 1
+    var input: Fd = fd_stdin()
+    match open_input(p.positional(0))
+        Ok(f) => input = f
+        Err(_) =>
+            eprints("xxd: cannot open file\n")
+            return 1
 
     var result: i32 = 0
     if opts.reverse != 0
-        result = reverse_fd(fd)
+        result = reverse_fd(@input)
     else
-        result = dump_fd(fd, @opts)
+        result = dump_fd(@input, @opts)
 
-    if fd != STDIN
-        sys_close(fd)
+    # Close file if we opened one (never stdin)
+    if input.raw() != STDIN
+        input.close()
 
     result
 

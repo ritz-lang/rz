@@ -23,6 +23,10 @@ import ritzlib.option
 import ritzlib.span
 import ritzlib.fmt
 import ritzlib.os.env
+import ritzlib.fs { access }
+import ritzlib.process { fork, wait_pid }
+import ritzlib.time { now }
+import ritzlib.result
 import ritzlib.fmt
 
 # Diagnostic helper — see 24_cp.
@@ -79,7 +83,7 @@ fn find_in_path(name: *u8, result: *u8) -> i32
             *(result + j) = 0
 
             # Check if executable
-            if sys_access(result, X_OK) == 0
+            if access(StrView { ptr: result, len: j }, X_OK).is_ok()
                 return 0
             return 1
         i += 1
@@ -119,7 +123,7 @@ fn find_in_path(name: *u8, result: *u8) -> i32
         *(result + j) = 0
 
         # Check if executable
-        if sys_access(result, X_OK) == 0
+        if access(StrView { ptr: result, len: j }, X_OK).is_ok()
             return 0
 
         # Move to next PATH component
@@ -128,6 +132,17 @@ fn find_in_path(name: *u8, result: *u8) -> i32
             pos += 1
 
     return 1
+
+# In the forked child: exec `cmd_path` (a NUL-terminated full path) with the
+# stack-built `argv`. The raw execve: nothing may allocate between fork and
+# exec. Never returns.
+fn exec_child(cmd_path: *u8, argv: **u8) -> i32
+    sys_execve(cmd_path, argv, env_raw_envp())
+
+    # If execve returns, it failed.
+    time_err2("time: ", cmd_path, ": exec failed")
+    sys_exit(126)
+    126
 
 # ============================================================================
 # Main
@@ -160,32 +175,26 @@ pub fn main(args: Span<StrView>) -> i32
     child_argv[max_args] = null
 
     # Get start time
-    var start_time: Timeval
-    sys_gettimeofday(@start_time, null)
+    let start_time: Timeval = now()
 
     # Fork
-    let pid: i32 = sys_fork()
+    let pid: i32 = match fork()
+        Ok(fr) =>
+            match fr
+                Child => exec_child(@cmd_path[0], @child_argv[0])
+                Parent(child) => child
+        Err(_) =>
+            eprint("time: fork failed\n")
+            return 1
 
-    if pid < 0
-        eprint("time: fork failed\n")
-        return 1
-
-    if pid == 0
-        # Child process
-        # Execute the command with its full path
-        sys_execve(@cmd_path[0], @child_argv[0], env_raw_envp())
-
-        # If execve returns, it failed.
-        time_err2("time: ", @cmd_path[0], ": exec failed")
-        sys_exit(126)
-
-    # Parent process: wait for child
-    var status: i32 = 0
-    let wait_result: i32 = sys_wait4(pid, @status, 0, null)
+    # Parent process: wait for child. Its exit code if it exited, 128 +
+    # the signal if one killed it; 0 if the wait failed.
+    let exit_status: i32 = match wait_pid(pid)
+        Ok(r) => r.exit_code
+        Err(_) => 0
 
     # Get end time
-    var end_time: Timeval
-    sys_gettimeofday(@end_time, null)
+    let end_time: Timeval = now()
 
     # Calculate elapsed time in microseconds
     var elapsed_usec: i64 = (end_time.tv_sec - start_time.tv_sec) * 1000000
@@ -208,13 +217,4 @@ pub fn main(args: Span<StrView>) -> i32
     else
         eprint("\nreal\t{minutes}m{seconds}.{msec}s\n")
 
-    # Extract exit code from status
-    # Status format: bits 0-7 are signal, bits 8-15 are exit code if normal exit
-    # If terminated normally, low 7 bits are 0
-    if (status & 127) == 0
-        # Normal termination - exit code is in upper byte
-        # Divide by 256 to get bits 8-15 (equivalent to >> 8)
-        return (status / 256) & 255
-    else
-        # Killed by signal
-        return 128 + (status & 127)
+    return exit_status

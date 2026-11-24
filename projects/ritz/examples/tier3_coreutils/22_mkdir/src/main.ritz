@@ -43,11 +43,11 @@ struct MkdirOptions
 # Diagnostic helpers — see 24_cp.
 # ============================================================================
 
-fn mk_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
+fn mk_err2(prefix: StrView, path: StrView, suffix: StrView) -> i32
     eprint("{prefix}{path}{suffix}\n")
     return 1
 
-fn mk_print2(prefix: StrView, path: *u8, suffix: StrView)
+fn mk_print2(prefix: StrView, path: StrView, suffix: StrView)
     print("{prefix}{path}{suffix}\n")
 
 # ============================================================================
@@ -66,54 +66,43 @@ fn parse_mode(s: StrView) -> i32
         i += 1
     return mode
 
+# Create the parent `prefix` of a -p path unless it exists (an EEXIST race
+# is not an error).
+fn make_parent(prefix: StrView, opts: *MkdirOptions) -> i32
+    if path_exists(prefix)
+        return 0
+    match mkdir(prefix, opts.mode)
+        Ok(_) => pass
+        Err(e) =>
+            if e.code() != EEXIST
+                return mk_err2("mkdir: cannot create directory '", prefix, "'")
+    if opts.verbose != 0
+        mk_print2("mkdir: created directory '", prefix, "'")
+    return 0
+
+# Create directory `path`, printing it under -v.
+fn make_one(path: StrView, opts: *MkdirOptions) -> i32
+    if mkdir(path, opts.mode).is_err()
+        return mk_err2("mkdir: cannot create directory '", path, "'")
+    if opts.verbose != 0
+        mk_print2("mkdir: created directory '", path, "'")
+    return 0
+
 # Create directory with parents if -p is set
-fn make_dir(path: *u8, opts: *MkdirOptions) -> i32
+fn make_dir(path: StrView, opts: *MkdirOptions) -> i32
     if opts.parents != 0
-        # Need to create parent directories
-        var buf: [4096]u8
-        strcpy(@buf[0], path)
-        let pathlen: i64 = strlen(path)
-        let bufptr: *u8 = @buf[0]
-
-        # Walk through path creating directories
-        var i: i64 = 0
-        while i < pathlen
-            if *(bufptr + i) == '/'  # '/'
-                if i > 0  # Not leading slash
-                    # Temporarily null-terminate here
-                    *(bufptr + i) = 0
-
-                    # Create parent if it doesn't exist
-                    if not path_exists(strview_from_cstr(bufptr))
-                        let result: i32 = sys_mkdir(bufptr, opts.mode)
-                        if result != 0 and result != 0 - EEXIST
-                            return mk_err2("mkdir: cannot create directory '", bufptr, "'")
-
-                        if opts.verbose != 0
-                            mk_print2("mkdir: created directory '", bufptr, "'")
-
-                    # Restore slash
-                    *(bufptr + i) = 47
-            i += 1
+        # Walk through path creating each parent (the prefix before a '/')
+        for i in 1..path.len
+            if path.get(i) == '/'
+                if make_parent(StrView { ptr: path.ptr, len: i }, opts) != 0
+                    return 1
 
         # Create final directory
-        if not path_exists(strview_from_cstr(path))
-            let result: i32 = sys_mkdir(path, opts.mode)
-            if result != 0
-                return mk_err2("mkdir: cannot create directory '", path, "'")
-
-            if opts.verbose != 0
-                mk_print2("mkdir: created directory '", path, "'")
-    else
-        # Simple case: just create the directory
-        let result: i32 = sys_mkdir(path, opts.mode)
-        if result != 0
-            return mk_err2("mkdir: cannot create directory '", path, "'")
-
-        if opts.verbose != 0
-            mk_print2("mkdir: created directory '", path, "'")
-
-    return 0
+        if not path_exists(path)
+            return make_one(path, opts)
+        return 0
+    # Simple case: just create the directory
+    return make_one(path, opts)
 
 # ============================================================================
 # Main
@@ -131,12 +120,6 @@ fn build_spec() -> ArgSpec
 fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
-
-# Positional i as a C string.  A positional is always a whole argv entry, so
-# its view ends at argv's NUL and .ptr is a valid C string.
-fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
-    let v: StrView = pos.get(i)
-    v.ptr
 
 fn or_empty(o: Option<StrView>) -> StrView
     match o
@@ -158,7 +141,7 @@ fn mkdir_all(p: @ParsedArgs) -> i32
     var result: i32 = 0
     let pos = p.positionals()
     for i in 0..pos.len
-        let dir: *u8 = positional_cstr(@pos, i)
+        let dir: StrView = pos.get(i)
         let r: i32 = make_dir(dir, @opts)
         if r != 0
             result = 1

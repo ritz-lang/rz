@@ -9,30 +9,25 @@
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.io
+import ritzlib.span
+import ritzlib.fs
+import ritzlib.testlib
 
-# Test isspace function
-# Build "/tmp/ritz_test_wc_<pid>" into buf (>= 64 bytes) and return buf.
-# The pid keeps concurrent runs (rooms gating on one host) off each other's
-# file: a shared fixed path let one run's O_TRUNC race another's read
-# (AGAST #1735, #1738).
-fn wc_tmp_path(buf: *u8) -> *u8
-    strcpy(buf, c"/tmp/ritz_test_wc_")
-    itoa(sys_getpid() as i64, buf + strlen(buf))
-    buf
+# This test's scratch file, "/tmp/ritz_test_wc_<pid>_in" (testlib's
+# sandbox_path). The pid keeps concurrent runs (rooms gating on one host) off
+# each other's file: a shared fixed path let one run's O_TRUNC race another's
+# read (AGAST #1735, #1738).
+fn wc_tmp_path() -> String
+    sandbox_path("test_wc", "in")
 
 [[test]]
 fn test_wc_tmp_path_is_per_process() -> i32
-    var buf: [64]u8
-    var pid: [24]u8
-    wc_tmp_path(@buf[0])
-    itoa(sys_getpid() as i64, @pid[0])
-    let plen: i64 = strlen(@pid[0])
-    let blen: i64 = strlen(@buf[0])
-    assert blen > plen
-    for i in 0..plen
-        assert buf[blen - plen + i] == pid[i]
+    let path: String = wc_tmp_path()
+    let pid: String = string_from_i64(sys_getpid() as i64)
+    assert path.as_view().contains(pid.as_view())
     0
 
+# Test isspace function
 [[test]]
 fn test_isspace() -> i32
     assert isspace(32) == 1   # space
@@ -188,74 +183,25 @@ fn test_mixed_whitespace() -> i32
 # Integration test: verify ./wc outputs correct counts
 # ============================================================================
 
-fn wc_starts_with(buf: *u8, prefix: *u8) -> i32
-    var i: i64 = 0
-    while *(prefix + i) != 0
-        if *(buf + i) != *(prefix + i)
-            return 0
-        i += 1
-    return 1
+# Whether what the child wrote starts with `prefix`
+fn wc_output_starts_with(c: @Captured, prefix: Span<u8>) -> bool
+    var out: Span<u8> = c.output()
+    var want: Span<u8> = prefix
+    span_starts_with(@out, @want)
 
 [[test]]
 fn test_wc_file() -> i32
-    # Create test file: "hello world\nfoo bar baz\n"
-    # Expected: 2 lines, 5 words, 24 bytes
-    var path_buf: [64]u8
-    let path: *u8 = wc_tmp_path(@path_buf[0])
-    let content: *u8 = c"hello world\nfoo bar baz\n"
-
-    let fd_w: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 420)
-    if fd_w < 0
-        return 1
-    sys_write(fd_w, content, 24)
-    sys_close(fd_w)
-
-    # Create pipe for capturing output
-    var pipefd: [2]i32
-    if sys_pipe(@pipefd[0]) < 0
-        return 2
-
-    let pid: i32 = sys_fork()
-    if pid < 0
-        sys_close(pipefd[0])
-        sys_close(pipefd[1])
-        return 3
-
-    if pid == 0
-        sys_dup2(pipefd[1], 1)
-        sys_close(pipefd[0])
-        sys_close(pipefd[1])
-
-        var argv: [3]*u8
-        argv[0] = c"./wc"
-        argv[1] = path
-        argv[2] = null
-
-        sys_execve(c"./wc", @argv[0], null)
-        sys_exit(127)
-
-    sys_close(pipefd[1])
-
-    var out: [256]u8
-    # Read until EOF (or the buffer is full): one read can return part
-    # of the output when the child writes it in pieces (docs/TESTING.md).
-    var n: i64 = 0
-    while n < 255
-        let r: i64 = sys_read(pipefd[0], @out[0] + n, 255 - n)
-        if r <= 0
-            break
-        n += r
-    sys_close(pipefd[0])
-
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-
-    sys_unlink(path)
-
-    if n <= 0
-        return 4
-
-    out[n] = 0
-    # wc should output "2 5 24 ..."
-    assert wc_starts_with(@out[0], c"2 5 24") == 1, "expected 2 5 24"
-    return 0
+    # "hello world\nfoo bar baz\n": 2 lines, 5 words, 24 bytes
+    let path: String = wc_tmp_path()
+    match write_file(path.as_view(), "hello world\nfoo bar baz\n")
+        Ok(_) => pass
+        Err(_) => return 1
+    let args: [1]StrView = [path.as_view()]
+    let r: Result<Captured, Errno> = exec_capture("./wc", @args, span_empty<StrView>(), "")
+    unlink(path.as_view())
+    match r
+        Ok(c) =>
+            assert wc_output_starts_with(@c, "2 5 24"), "expected 2 5 24"
+        Err(_) =>
+            assert false, "spawn ./wc"
+    0

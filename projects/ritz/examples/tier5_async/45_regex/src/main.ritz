@@ -36,6 +36,7 @@ import ritzlib.option
 import ritzlib.result
 import ritzlib.strview
 import ritzlib.argspec
+import ritzlib.fd { Fd, fd_open, fd_stdin, fd_stdout, O_RDONLY }
 
 # ============================================================================
 # Regex matcher using recursive backtracking
@@ -305,12 +306,12 @@ fn process_line(pattern: *u8, line: *u8, len: i64) -> i32
 
     if regex_match(pattern, line, match_len) != 0
         # Print matching line
-        sys_write(1, line, len)
+        fd_stdout().write(Span<u8> { ptr: line, len: len })
         return 1
 
     return 0
 
-fn process_stream(pattern: *u8, fd: i32) -> i32
+fn process_stream(pattern: *u8, f: @Fd) -> i32
     var buf: [4096]u8
     var line_start: i64 = 0
     var buf_len: i64 = 0
@@ -318,9 +319,9 @@ fn process_stream(pattern: *u8, fd: i32) -> i32
 
     while 1 == 1
         # Read more data
-        let n: i64 = sys_read(fd, @buf[0] + buf_len, 4096 - buf_len)
-        if n < 0
-            return -1
+        let n: i64 = match f.read(Span<u8> { ptr: @buf[0] + buf_len, len: 4096 - buf_len })
+            Ok(got) => got
+            Err(_) => return -1
         if n == 0
             # Process remaining data as last line
             if buf_len > line_start
@@ -372,22 +373,23 @@ fn match_status(found: i32) -> i32
         return 0
     1
 
-# Both positionals are views of argv strings, so NUL-terminated, as
-# process_stream and sys_open need.
+# PATTERN is a view of an argv string, so NUL-terminated, as process_stream
+# needs.
 fn regex(pattern: *u8, file: Option<StrView>) -> i32
     match file
         Some(f) => regex_path(pattern, f)
-        None => match_status(process_stream(pattern, 0))
+        None => match_status(process_stream(pattern, @fd_stdin()))
 
 fn regex_path(pattern: *u8, file: StrView) -> i32
-    let path: *u8 = file.as_cstr_unchecked()
-    let fd: i32 = sys_open(path, 0)
-    if fd < 0
-        eprint("regex: cannot open file: {path}\n")
-        return 1
-    let result = match_status(process_stream(pattern, fd))
-    sys_close(fd)
-    result
+    match fd_open(file, O_RDONLY, 0)
+        Ok(opened) =>
+            var f: Fd = opened
+            let result = match_status(process_stream(pattern, @f))
+            f.close()
+            result
+        Err(_) =>
+            eprint("regex: cannot open file: {file}\n")
+            1
 
 # argspec_parse has checked that PATTERN is there (min 1).
 fn run(p: ParsedArgs) -> i32

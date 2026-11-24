@@ -15,6 +15,7 @@ import ritzlib.str
 import ritzlib.strview
 import ritzlib.string
 import ritzlib.fs
+import ritzlib.fd { Fd, fd_open }
 import ritzlib.option
 import ritzlib.result
 import ritzlib.span
@@ -41,15 +42,14 @@ struct CpOptions
 #
 # Bare string literals (`"..."`) are StrViews — length-tagged, no NUL,
 # zero-copy.  This is the idiomatic ritz form; we use it everywhere the
-# argument is a build-time-fixed message (vs `*u8` for runtime path data
-# that comes from argv/syscalls).
+# argument is a build-time-fixed message; paths from argv are StrViews too.
 # ============================================================================
 
-fn cp_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
+fn cp_err2(prefix: StrView, path: StrView, suffix: StrView) -> i32
     eprint("{prefix}{path}{suffix}\n")
     return 1
 
-fn cp_verbose_link(src: *u8, dst: *u8)
+fn cp_verbose_link(src: StrView, dst: StrView)
     # `'src' -> 'dst'` to stdout — only when -v is set.
     print("'{src}' -> '{dst}'\n")
 
@@ -57,57 +57,54 @@ fn cp_verbose_link(src: *u8, dst: *u8)
 # Copy functions
 # ============================================================================
 
-fn copy_file_data(src_fd: i32, dst_fd: i32) -> i32
+fn copy_file_data(src_fd: @Fd, dst_fd: @Fd) -> i32
     var buf: [8192]u8
 
     loop
-        let nread: i64 = sys_read(src_fd, @buf[0], 8192)
-        if nread < 0
-            return 1
+        let nread: i64 = match src_fd.read(Span<u8> { ptr: @buf[0], len: 8192 })
+            Ok(n) => n
+            Err(_) => return 1
         if nread == 0
             break
 
-        var written: i64 = 0
-        while written < nread
-            let n: i64 = sys_write(dst_fd, @buf[0] + written, nread - written)
-            if n < 0
-                return 1
-            written += n
+        if dst_fd.write_all(Span<u8> { ptr: @buf[0], len: nread }).is_err()
+            return 1
 
     return 0
 
-fn cp_copy_file(src: *u8, dst: *u8, opts: *CpOptions) -> i32
+fn cp_copy_file(src: StrView, dst: StrView, opts: *CpOptions) -> i32
     # Check if destination exists and -n is set
-    if opts.no_clobber != 0 and path_exists(strview_from_cstr(dst))
+    if opts.no_clobber != 0 and path_exists(dst)
         return 0  # Silently skip
 
     # Get source mode for preserve
     var src_mode: i32 = 420  # 0644 default
     if opts.preserve != 0
-        match lstat(strview_from_cstr(src))
+        match lstat(src)
             Ok(st) => src_mode = st.st_mode % 4096  # Lower 12 bits
             Err(_) => src_mode = 420
 
     # Open source
-    let src_fd: i32 = sys_open(src, O_RDONLY)
-    if src_fd < 0
-        return cp_err2("cp: cannot open '", src, "'")
+    var src_fd: Fd = match fd_open(src, O_RDONLY, 0)
+        Ok(f) => f
+        Err(_) => return cp_err2("cp: cannot open '", src, "'")
 
-    # Open destination: O_WRONLY | O_CREAT | O_TRUNC = 577
-    let dst_fd: i32 = sys_open3(dst, 577, 420)  # mode 0644
-    if dst_fd < 0
-        sys_close(src_fd)
-        return cp_err2("cp: cannot create '", dst, "'")
+    # Open destination: O_WRONLY | O_CREAT | O_TRUNC
+    var dst_fd: Fd = match fd_open(dst, O_WRONLY + O_CREAT + O_TRUNC, 420)  # mode 0644
+        Ok(f) => f
+        Err(_) =>
+            src_fd.close()
+            return cp_err2("cp: cannot create '", dst, "'")
 
     # Copy data
-    let result: i32 = copy_file_data(src_fd, dst_fd)
+    let result: i32 = copy_file_data(@src_fd, @dst_fd)
 
     # Preserve mode
     if opts.preserve != 0 and result == 0
-        sys_fchmod(dst_fd, src_mode)
+        dst_fd.chmod(src_mode)
 
-    sys_close(src_fd)
-    sys_close(dst_fd)
+    src_fd.close()
+    dst_fd.close()
 
     if result != 0
         return cp_err2("cp: error copying '", src, "'")
@@ -117,24 +114,23 @@ fn cp_copy_file(src: *u8, dst: *u8, opts: *CpOptions) -> i32
 
     return 0
 
-fn copy_dir(src: *u8, dst: *u8, opts: *CpOptions) -> i32
+fn copy_dir(src: StrView, dst: StrView, opts: *CpOptions) -> i32
     # Create destination directory
     var src_mode: i32 = 493  # 0755 default
     if opts.preserve != 0
-        match lstat(strview_from_cstr(src))
+        match lstat(src)
             Ok(st) => src_mode = st.st_mode % 4096
             Err(_) => src_mode = 493
 
-    if not path_exists(strview_from_cstr(dst))
-        let r: i32 = sys_mkdir(dst, src_mode)
-        if r != 0
+    if not path_exists(dst)
+        if mkdir(dst, src_mode).is_err()
             return cp_err2("cp: cannot create directory '", dst, "'")
 
         if opts.verbose != 0
             cp_verbose_link(src, dst)
 
     # Open source directory
-    var dir: DirIter = match dir_open(strview_from_cstr(src))
+    var dir: DirIter = match dir_open(src)
         Ok(it) => it
         Err(_) => return cp_err2("cp: cannot open directory '", src, "'")
 
@@ -142,14 +138,13 @@ fn copy_dir(src: *u8, dst: *u8, opts: *CpOptions) -> i32
 
     while dir.next()
         let e: DirEntry = dir.entry()
-        let name: *u8 = e.name.ptr
 
         # Skip . and ..
-        if not streq(name, c".") and not streq(name, c"..")
-            var src_child: String = path_join(strview_from_cstr(src), e.name)
-            var dst_child: String = path_join(strview_from_cstr(dst), e.name)
-            let src_path: *u8 = src_child.as_ptr()
-            let dst_path: *u8 = dst_child.as_ptr()
+        if not e.name.eq(".") and not e.name.eq("..")
+            var src_child: String = path_join(src, e.name)
+            var dst_child: String = path_join(dst, e.name)
+            let src_path: StrView = src_child.as_view()
+            let dst_path: StrView = dst_child.as_view()
 
             if is_dir(src_child.as_view())
                 let r: i32 = copy_dir(src_path, dst_path, opts)
@@ -163,13 +158,13 @@ fn copy_dir(src: *u8, dst: *u8, opts: *CpOptions) -> i32
     dir.close()
     return result
 
-fn copy_path(src: *u8, dst: *u8, opts: *CpOptions) -> i32
+fn copy_path(src: StrView, dst: StrView, opts: *CpOptions) -> i32
     # Check if source exists
-    if not path_exists(strview_from_cstr(src))
+    if not path_exists(src)
         return cp_err2("cp: cannot stat '", src, "': No such file or directory")
 
     # Check if source is a directory
-    if is_dir(strview_from_cstr(src))
+    if is_dir(src)
         if opts.recursive == 0
             return cp_err2("cp: -r not specified; omitting directory '", src, "'")
         return copy_dir(src, dst, opts)
@@ -195,12 +190,6 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Positional i as a C string.  A positional is always a whole argv entry, so
-# its view ends at argv's NUL and .ptr is a valid C string.
-fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
-    let v: StrView = pos.get(i)
-    v.ptr
-
 fn cp_all(p: @ParsedArgs) -> i32
     var opts: CpOptions
     opts.recursive = (p.switch("recursive") or p.switch("R")) as i32
@@ -211,8 +200,8 @@ fn cp_all(p: @ParsedArgs) -> i32
     # Last positional is DEST, all others are SOURCEs.
     let pos = p.positionals()
     let num_args: i64 = pos.len
-    let last_arg: *u8 = positional_cstr(@pos, num_args - 1)
-    let dst_is_dir: i32 = is_dir(strview_from_cstr(last_arg)) as i32
+    let last_arg: StrView = pos.get(num_args - 1)
+    let dst_is_dir: i32 = is_dir(last_arg) as i32
 
     # Multi-source case requires directory destination.
     if num_args > 2 and dst_is_dir == 0
@@ -221,20 +210,20 @@ fn cp_all(p: @ParsedArgs) -> i32
     var result: i32 = 0
 
     if num_args == 2
-        let src: *u8 = positional_cstr(@pos, 0)
-        let dst: *u8 = positional_cstr(@pos, 1)
+        let src: StrView = pos.get(0)
+        let dst: StrView = pos.get(1)
 
         if dst_is_dir != 0
-            var dst_path: String = path_join(strview_from_cstr(dst), path_basename(strview_from_cstr(src)))
-            result = copy_path(src, dst_path.as_ptr(), @opts)
+            var dst_path: String = path_join(dst, path_basename(src))
+            result = copy_path(src, dst_path.as_view(), @opts)
         else
             result = copy_path(src, dst, @opts)
     else
         for i in 0..(num_args - 1)
-            let src: *u8 = positional_cstr(@pos, i)
-            var dst_path: String = path_join(strview_from_cstr(last_arg), path_basename(strview_from_cstr(src)))
+            let src: StrView = pos.get(i)
+            var dst_path: String = path_join(last_arg, path_basename(src))
 
-            let r: i32 = copy_path(src, dst_path.as_ptr(), @opts)
+            let r: i32 = copy_path(src, dst_path.as_view(), @opts)
             if r != 0
                 result = 1
 

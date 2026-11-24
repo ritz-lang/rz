@@ -5,20 +5,26 @@
 # Usage: head [-n NUM] [FILE...]
 # Default: 10 lines from stdin
 
-import ritzlib.sys
 import ritzlib.str
+import ritzlib.fd { Fd, fd_open, fd_adopt, fd_stdin, fd_stdout, O_RDONLY }
 import ritzlib.strview { StrView }
 import ritzlib.span { Span }
 
 const BUFSIZE: i64 = 4096
 
-# Print first n lines from fd
-fn head_fd(fd: i32, n: i32, buf: *u8) -> i32
+# Write buf[0..len] to stdout
+fn put_bytes(buf: *u8, len: i64)
+  fd_stdout().write_all(Span<u8> { ptr: buf, len: len })
+
+# Print first n lines from an open file
+fn head_fd(f: @Fd, n: i32, buf: *u8) -> i32
   var lines: i32 = 0
   let start: i64 = 0  # NOTE: This appears to be dead code - start is never assigned
 
   while lines < n
-    let bytes_read: i64 = sys_read(fd, buf, BUFSIZE)
+    let bytes_read: i64 = match f.read(Span<u8> { ptr: buf, len: BUFSIZE })
+      Ok(k) => k
+      Err(_) => -1
 
     if bytes_read < 0
       return 1
@@ -26,7 +32,7 @@ fn head_fd(fd: i32, n: i32, buf: *u8) -> i32
     if bytes_read == 0
       # EOF - flush any remaining content
       if start > 0
-        sys_write(STDOUT, buf, start)
+        put_bytes(buf, start)
       return 0
 
     # Scan for newlines
@@ -36,12 +42,12 @@ fn head_fd(fd: i32, n: i32, buf: *u8) -> i32
         lines += 1
         if lines >= n
           # Print up to and including this newline
-          sys_write(STDOUT, buf, i + 1)
+          put_bytes(buf, i + 1)
           return 0
       i += 1
 
     # Print entire buffer if no complete line limit hit
-    sys_write(STDOUT, buf, bytes_read)
+    put_bytes(buf, bytes_read)
 
   0
 
@@ -65,19 +71,19 @@ pub fn main(args: Span<StrView>) -> i32
 
   # No files specified - read stdin
   if args.len <= file_start
-    return head_fd(STDIN, num_lines, buf)
+    let input: Fd = fd_stdin()
+    return head_fd(@input, num_lines, buf)
 
   # Process each file
   var i: i64 = file_start
   while i < args.len
-    let path: *u8 = args[i].ptr
-    let fd: i32 = sys_open(path, O_RDONLY)
+    var file: Fd = fd_adopt(-1)
+    match fd_open(args[i], O_RDONLY, 0)
+      Ok(f) => file = f
+      Err(_) => return 1
 
-    if fd < 0
-      return 1
-
-    let result: i32 = head_fd(fd, num_lines, buf)
-    sys_close(fd)
+    let result: i32 = head_fd(@file, num_lines, buf)
+    file.close()
 
     if result != 0
       return result

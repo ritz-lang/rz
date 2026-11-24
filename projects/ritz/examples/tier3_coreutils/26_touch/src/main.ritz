@@ -23,6 +23,7 @@ import ritzlib.io
 import ritzlib.strview
 import ritzlib.string
 import ritzlib.fs
+import ritzlib.fd { Fd, fd_open }
 import ritzlib.option
 import ritzlib.result
 import ritzlib.span
@@ -31,7 +32,7 @@ import ritzlib.gvec
 import ritzlib.argspec
 
 # Diagnostic helper — see 24_cp.
-fn touch_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
+fn touch_err2(prefix: StrView, path: StrView, suffix: StrView) -> i32
     eprint("{prefix}{path}{suffix}\n")
     return 1
 
@@ -48,45 +49,31 @@ struct TouchOptions
 # Touch function
 # ============================================================================
 
-fn touch_file(path: *u8, opts: *TouchOptions) -> i32
+fn touch_file(path: StrView, opts: *TouchOptions) -> i32
     # Create file if needed
-    if not path_exists(strview_from_cstr(path))
+    if not path_exists(path)
         if opts.no_create != 0
             return 0  # -c: silently skip
 
-        # Create empty file: O_CREAT | O_WRONLY = 65
-        let fd: i32 = sys_open3(path, 65, 420)  # mode 0644
-        if fd < 0
-            return touch_err2("touch: cannot create '", path, "'")
-        sys_close(fd)
+        # Create empty file: O_CREAT | O_WRONLY
+        var f: Fd = match fd_open(path, O_CREAT + O_WRONLY, 420)  # mode 0644
+            Ok(opened) => opened
+            Err(_) => return touch_err2("touch: cannot create '", path, "'")
+        f.close()
         return 0  # File created with current timestamp
 
-    # Update timestamps using utimensat
-    # times is array of 2 timespec structs (16 bytes each)
-    # timespec { tv_sec: i64, tv_nsec: i64 }
-    var times: [4]i64
-
+    # Update timestamps (utimensat): Now sets one to the current time, Omit
+    # leaves it unchanged.
+    var atime: FileTime = FileTime.Now
+    var mtime: FileTime = FileTime.Now
     if opts.access_only != 0
         # Update atime only
-        times[0] = 0
-        times[1] = UTIME_NOW  # for atime
-        times[2] = 0
-        times[3] = UTIME_OMIT  # for mtime
+        mtime = FileTime.Omit
     else if opts.modify_only != 0
         # Update mtime only
-        times[0] = 0
-        times[1] = UTIME_OMIT  # for atime
-        times[2] = 0
-        times[3] = UTIME_NOW  # for mtime
-    else
-        # Update both
-        times[0] = 0
-        times[1] = UTIME_NOW  # for atime
-        times[2] = 0
-        times[3] = UTIME_NOW  # for mtime
+        atime = FileTime.Omit
 
-    let result: i32 = sys_utimensat(at_fdcwd(), path, @times[0], 0)
-    if result != 0
+    if set_times(path, atime, mtime).is_err()
         return touch_err2("touch: cannot touch '", path, "'")
 
     return 0
@@ -108,12 +95,6 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Positional i as a C string.  A positional is always a whole argv entry, so
-# its view ends at argv's NUL and .ptr is a valid C string.
-fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
-    let v: StrView = pos.get(i)
-    v.ptr
-
 fn touch_all(p: @ParsedArgs) -> i32
     var opts: TouchOptions
     opts.access_only = p.switch("access") as i32
@@ -124,7 +105,7 @@ fn touch_all(p: @ParsedArgs) -> i32
     var result: i32 = 0
     let pos = p.positionals()
     for i in 0..pos.len
-        let path: *u8 = positional_cstr(@pos, i)
+        let path: StrView = pos.get(i)
         let r: i32 = touch_file(path, @opts)
         if r != 0
             result = 1

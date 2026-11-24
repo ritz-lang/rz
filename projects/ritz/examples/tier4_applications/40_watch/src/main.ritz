@@ -26,14 +26,8 @@ import ritzlib.gvec
 import ritzlib.result
 import ritzlib.argspec
 import ritzlib.os.env
-
-# ============================================================================
-# TimeSpec struct for nanosleep
-# ============================================================================
-
-struct TimeSpec
-    tv_sec: i64
-    tv_nsec: i64
+import ritzlib.process { fork, wait_pid }
+import ritzlib.time { sleep, duration_secs }
 
 # ============================================================================
 # Screen clearing
@@ -51,15 +45,7 @@ fn clear_screen()
     buf[5] = 91   # [
     buf[6] = 72   # H
     buf[7] = 0
-    sys_write(STDOUT, @buf[0], 7)
-
-# ============================================================================
-# Sleep function
-# ============================================================================
-
-fn do_sleep(seconds: i64)
-    var ts: TimeSpec = TimeSpec { tv_sec: seconds, tv_nsec: 0 }
-    sys_nanosleep(@ts as *i64, null)
+    prints(StrView { ptr: @buf[0], len: 7 })
 
 # ============================================================================
 # Command execution
@@ -71,11 +57,16 @@ fn run_command(cmd_string: *u8) -> i32
     let envp: **u8 = env_raw_envp()
 
     # Fork a child process
-    let pid: i32 = sys_fork()
-
-    if pid < 0
-        eprint("watch: fork failed\n")
-        return 1
+    # pid 0 in the child, which execs with the raw execve below: its argv is
+    # on the stack, so nothing allocates between fork and exec.
+    let pid: i32 = match fork()
+        Ok(fr) =>
+            match fr
+                Child => 0
+                Parent(child) => child
+        Err(_) =>
+            eprint("watch: fork failed\n")
+            return 1
 
     if pid == 0
         # Child process - execute via /bin/sh -c "command"
@@ -92,16 +83,15 @@ fn run_command(cmd_string: *u8) -> i32
         sys_exit(127)
 
     # Parent process - wait for child
-    var status: i32 = 0
-    let wait_result: i32 = sys_wait4(pid, @status, 0, null)
-
-    if wait_result < 0
-        eprint("watch: wait failed\n")
-        return 1
-
-    # Extract exit status (bits 8-15 of status)
-    # status >> 8 gives exit code if child exited normally
-    return (status / 256) as i32
+    # Exit status if the child exited normally (0 if a signal killed it)
+    match wait_pid(pid)
+        Ok(r) =>
+            if r.signaled != 0
+                return 0
+            r.exit_code
+        Err(_) =>
+            eprint("watch: wait failed\n")
+            1
 
 # ============================================================================
 # Build command string from positional args
@@ -174,7 +164,7 @@ fn watch(p: @ParsedArgs, interval: i64) -> i32
         run_command(@cmd_string[0])
 
         # Sleep for the interval
-        do_sleep(interval)
+        sleep(duration_secs(interval))
 
     return 0
 

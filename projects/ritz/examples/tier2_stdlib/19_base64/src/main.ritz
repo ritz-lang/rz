@@ -26,6 +26,7 @@ import ritzlib.strview
 import ritzlib.span
 import ritzlib.argspec
 import ritzlib.fmt
+import ritzlib.fd { Fd, fd_open, fd_stdin, fd_stdout, O_RDONLY }
 
 # ============================================================================
 # Base64 alphabet
@@ -64,7 +65,7 @@ fn b64_decode_char(c: u8) -> i32
 # Encoding
 # ============================================================================
 
-fn encode_fd(fd: i32, wrap_at: i32) -> i32
+fn encode_fd(f: @Fd, wrap_at: i32) -> i32
     var buf: [4096]u8
     var outbuf: [8192]u8
     var out_len: i64 = 0
@@ -75,7 +76,9 @@ fn encode_fd(fd: i32, wrap_at: i32) -> i32
     var leftover_count: i32 = 0
 
     loop
-        let n: i64 = sys_read(fd, @buf[0], 4096)
+        let n: i64 = match f.read(Span<u8> { ptr: @buf[0], len: 4096 })
+            Ok(k) => k
+            Err(_) => -1
         if n < 0
             return 1
         if n == 0
@@ -139,7 +142,7 @@ fn encode_fd(fd: i32, wrap_at: i32) -> i32
 
             # Flush if buffer getting full
             if out_len >= 8000
-                sys_write(STDOUT, @outbuf[0], out_len)
+                fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_len })
                 out_len = 0
 
         # Save leftover bytes
@@ -176,7 +179,7 @@ fn encode_fd(fd: i32, wrap_at: i32) -> i32
     if out_len > 0
         outbuf[out_len] = 10
         out_len += 1
-        sys_write(STDOUT, @outbuf[0], out_len)
+        fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_len })
 
     return 0
 
@@ -184,7 +187,7 @@ fn encode_fd(fd: i32, wrap_at: i32) -> i32
 # Decoding
 # ============================================================================
 
-fn decode_fd(fd: i32) -> i32
+fn decode_fd(f: @Fd) -> i32
     var buf: [4096]u8
     var outbuf: [4096]u8
     var out_len: i64 = 0
@@ -194,7 +197,9 @@ fn decode_fd(fd: i32) -> i32
     var accum_count: i32 = 0
 
     loop
-        let n: i64 = sys_read(fd, @buf[0], 4096)
+        let n: i64 = match f.read(Span<u8> { ptr: @buf[0], len: 4096 })
+            Ok(k) => k
+            Err(_) => -1
         if n < 0
             return 1
         if n == 0
@@ -238,14 +243,14 @@ fn decode_fd(fd: i32) -> i32
 
                 # Flush if buffer getting full
                 if out_len >= 4000
-                    sys_write(STDOUT, @outbuf[0], out_len)
+                    fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_len })
                     out_len = 0
 
             i += 1
 
     # Flush remaining
     if out_len > 0
-        sys_write(STDOUT, @outbuf[0], out_len)
+        fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_len })
 
     return 0
 
@@ -267,30 +272,31 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# The input: FILE when given (a view of an argv string, so NUL-terminated as
-# sys_open needs), else stdin.  Negative when FILE can't be opened.
-fn open_input(o: Option<StrView>) -> i32
+# The input: FILE when given, else stdin.  Err when FILE can't be opened.
+fn open_input(o: Option<StrView>) -> Result<Fd, Errno>
     match o
-        Some(path) => sys_open(path.as_cstr_unchecked(), O_RDONLY)
-        None => STDIN
+        Some(path) => fd_open(path, O_RDONLY, 0)
+        None => Ok(fd_stdin())
 
 fn base64(p: @ParsedArgs, wrap_at: i64) -> i32
     # Open input file or use stdin
-    let fd: i32 = open_input(p.positional(0))
-    if fd < 0
-        eprint("base64: cannot open file\n")
-        return 1
+    var input: Fd = fd_stdin()
+    match open_input(p.positional(0))
+        Ok(f) => input = f
+        Err(_) =>
+            eprint("base64: cannot open file\n")
+            return 1
 
     # Encode or decode
     var result: i32 = 0
     if p.switch("decode")
-        result = decode_fd(fd)
+        result = decode_fd(@input)
     else
-        result = encode_fd(fd, wrap_at as i32)
+        result = encode_fd(@input, wrap_at as i32)
 
-    # Close file if we opened one
-    if fd != STDIN
-        sys_close(fd)
+    # Close file if we opened one (never stdin)
+    if input.raw() != STDIN
+        input.close()
 
     result
 

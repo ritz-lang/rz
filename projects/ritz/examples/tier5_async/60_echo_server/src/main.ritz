@@ -16,6 +16,10 @@ import ritzlib.uring
 import ritzlib.async.runtime
 import ritzlib.async_net
 import ritzlib.fmt
+import ritzlib.span
+import ritzlib.fd { Fd, fd_adopt, fd_borrow }
+import ritzlib.process { fork, wait_pid }
+import ritzlib.time { sleep_ms }
 
 # The port a bound socket was given.  The self-tests below bind port 0 so the
 # kernel picks a free one: a fixed port failed (or hung) whenever anything else
@@ -24,6 +28,29 @@ fn bound_port(sock: @Socket) -> i32
     match sock.local_port()
         Ok(p) => return p
         Err(_) => return -1
+
+# fork(): 0 in the child, the child's pid in the parent, -1 if it failed.
+fn fork_pid() -> i32
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child => 0
+                Parent(pid) => pid
+        Err(_) => -1
+
+# Reap child `pid`: its exit code (-1 if it was killed or can't be waited for).
+fn child_exit_code(pid: i32) -> i32
+    match wait_pid(pid)
+        Ok(r) => r.exit_code
+        Err(_) => -1
+
+# A connected client socket's read(2), as the byte count or -errno.  The
+# borrowed Fd reads into a caller's buffer; the Socket keeps ownership.
+fn sock_read(sock: @Socket, buf: Span<u8>) -> i64
+    let io: Fd = fd_borrow(sock.raw())
+    match io.read(buf)
+        Ok(n) => n
+        Err(e) => -(e.code() as i64)
 
 # ============================================================================
 # Echo server implementation
@@ -52,7 +79,8 @@ fn handle_client(rt: *Runtime, client_fd: i32) -> i32
 
         total_bytes += n
 
-    sys_close(client_fd)
+    var client: Fd = fd_adopt(client_fd)
+    client.close()
     return total_bytes as i32
 
 # Run the echo server
@@ -145,16 +173,12 @@ fn test_echo_server() -> i32
     server.listen(1)
 
     # Fork - child is client, parent is server
-    let pid: i32 = sys_fork()
+    let pid: i32 = fork_pid()
 
     if pid == 0
         # Child: client
         # Small delay
-        var ts: [16]u8
-        let ts_ptr: *i64 = @ts[0] as *i64
-        *ts_ptr = 0
-        *(ts_ptr + 1) = 10000000
-        sys_nanosleep(@ts[0] as *i64, null)
+        sleep_ms(10)
 
         var client: Socket
         match socket_tcp()
@@ -171,11 +195,11 @@ fn test_echo_server() -> i32
         send_buf[2] = 108  # l
         send_buf[3] = 108  # l
         send_buf[4] = 111  # o
-        sys_write(client.raw(), @send_buf[0], 5)
+        client.send(Span<u8> { ptr: @send_buf[0], len: 5 })
 
         # Read echo
         var recv_buf: [32]u8
-        let n: i64 = sys_read(client.raw(), @recv_buf[0], 32)
+        let n: i64 = sock_read(@client, Span<u8> { ptr: @recv_buf[0], len: 32 })
 
         client.close()
 
@@ -210,11 +234,7 @@ fn test_echo_server() -> i32
         client.close()
 
         # Wait for child
-        var status: i32 = 0
-        sys_wait4(pid, @status, 0, null)
-
-        # Check child exit status
-        let exit_code: i32 = (status >> 8) & 255
+        let exit_code: i32 = child_exit_code(pid)
         if exit_code != 0
             print("FAIL: client exit code {exit_code as i64}\n")
             server.close()
@@ -244,15 +264,11 @@ fn test_multiple_messages() -> i32
     let port: i32 = bound_port(@server)
     server.listen(1)
 
-    let pid: i32 = sys_fork()
+    let pid: i32 = fork_pid()
 
     if pid == 0
         # Child: client - send multiple messages
-        var ts: [16]u8
-        let ts_ptr: *i64 = @ts[0] as *i64
-        *ts_ptr = 0
-        *(ts_ptr + 1) = 10000000
-        sys_nanosleep(@ts[0] as *i64, null)
+        sleep_ms(10)
 
         var client: Socket
         match socket_tcp()
@@ -266,11 +282,11 @@ fn test_multiple_messages() -> i32
             var send_buf: [8]u8
             send_buf[0] = (65 + i) as u8  # A, B, C, D, E
             send_buf[1] = 10              # newline
-            sys_write(client.raw(), @send_buf[0], 2)
+            client.send(Span<u8> { ptr: @send_buf[0], len: 2 })
 
             # Read echo
             var recv_buf: [8]u8
-            sys_read(client.raw(), @recv_buf[0], 2)
+            sock_read(@client, Span<u8> { ptr: @recv_buf[0], len: 2 })
 
             # Verify
             if recv_buf[0] != send_buf[0]
@@ -298,10 +314,7 @@ fn test_multiple_messages() -> i32
 
         client.close()
 
-        var status: i32 = 0
-        sys_wait4(pid, @status, 0, null)
-
-        let exit_code: i32 = (status >> 8) & 255
+        let exit_code: i32 = child_exit_code(pid)
         if exit_code != 0
             print("FAIL: client exit {exit_code as i64}\n")
             server.close()
@@ -331,15 +344,11 @@ fn test_large_data() -> i32
     let port: i32 = bound_port(@server)
     server.listen(1)
 
-    let pid: i32 = sys_fork()
+    let pid: i32 = fork_pid()
 
     if pid == 0
         # Child: client - send 1KB of data
-        var ts: [16]u8
-        let ts_ptr: *i64 = @ts[0] as *i64
-        *ts_ptr = 0
-        *(ts_ptr + 1) = 10000000
-        sys_nanosleep(@ts[0] as *i64, null)
+        sleep_ms(10)
 
         var client: Socket
         match socket_tcp()
@@ -354,13 +363,13 @@ fn test_large_data() -> i32
             send_buf[i] = (i % 256) as u8
             i += 1
 
-        sys_write(client.raw(), @send_buf[0], 1024)
+        client.send(Span<u8> { ptr: @send_buf[0], len: 1024 })
 
         # Read echo
         var recv_buf: [1024]u8
         var total: i64 = 0
         while total < 1024
-            let n: i64 = sys_read(client.raw(), @recv_buf[0] + total, 1024 - total)
+            let n: i64 = sock_read(@client, Span<u8> { ptr: @recv_buf[0] + total, len: 1024 - total })
             if n <= 0
                 break
             total += n
@@ -398,10 +407,7 @@ fn test_large_data() -> i32
 
         client.close()
 
-        var status: i32 = 0
-        sys_wait4(pid, @status, 0, null)
-
-        let exit_code: i32 = (status >> 8) & 255
+        let exit_code: i32 = child_exit_code(pid)
         if exit_code != 0
             print("FAIL: exit {exit_code as i64}\n")
             server.close()

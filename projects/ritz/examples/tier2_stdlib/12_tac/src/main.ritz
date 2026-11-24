@@ -19,6 +19,7 @@ import ritzlib.gvec
 import ritzlib.result
 import ritzlib.strview { StrView }
 import ritzlib.span { Span }
+import ritzlib.fd { Fd, fd_open, fd_adopt, fd_stdin, fd_stdout, O_RDONLY }
 
 # ============================================================================
 # Core tac logic
@@ -28,15 +29,15 @@ fn print_lines_reversed(buf: @Vec<u8>, lines: @Vec<LineBounds>)
     var i: i64 = lines.len - 1
     while i >= 0
         let bounds: *LineBounds = lines.data + i
-        sys_write(STDOUT, buf.data + bounds.start, bounds.length)
+        fd_stdout().write_all(Span<u8> { ptr: buf.data + bounds.start, len: bounds.length })
         i -= 1
 
-fn tac_fd(fd: i32) -> i32
+fn tac_fd(f: @Fd) -> i32
     # Process a file descriptor, return 0 on success, 1 on error
     var buf: Vec<u8> = vec_with_cap<u8>(4096)
     var lines: Vec<LineBounds> = vec_with_cap<LineBounds>(64)
 
-    match vec_read_all_fd(fd, @&buf)
+    match vec_read_all_fd(f.raw(), @&buf)
         Ok(_) => pass
         Err(_) => return 1
 
@@ -45,14 +46,16 @@ fn tac_fd(fd: i32) -> i32
 
     return 0
 
-fn tac_file(path: *u8) -> i32
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
-        sys_write(STDERR, c"tac: cannot open file\n" as *u8, 22)
-        return 1
+fn tac_file(path: StrView) -> i32
+    var file: Fd = fd_adopt(-1)
+    match fd_open(path, O_RDONLY, 0)
+        Ok(f) => file = f
+        Err(_) =>
+            eprints("tac: cannot open file\n")
+            return 1
 
-    let result: i32 = tac_fd(fd)
-    sys_close(fd)
+    let result: i32 = tac_fd(@file)
+    file.close()
     return result
 
 # ============================================================================
@@ -62,14 +65,14 @@ fn tac_file(path: *u8) -> i32
 pub fn main(args: Span<StrView>) -> i32
     if args.len < 2
         # No files - read from stdin
-        return tac_fd(STDIN)
+        let input: Fd = fd_stdin()
+        return tac_fd(@input)
 
     var exit_code: i32 = 0
     var i: i64 = 1
 
     while i < args.len
-        let path: *u8 = args[i].ptr
-        let result: i32 = tac_file(path)
+        let result: i32 = tac_file(args[i])
         if result != 0
             exit_code = result
         i += 1

@@ -19,6 +19,7 @@ import ritzlib.option
 import ritzlib.span
 import ritzlib.os.env
 import ritzlib.fmt
+import ritzlib.fd { Fd, fd_adopt }
 
 
 # ============================================================================
@@ -206,14 +207,14 @@ fn run_server(port: i32)
         srv.close()
         return
 
-    # Connection state arrays
-    let conn_fds: *i32 = malloc((MAX_CONNS * 4) as u64) as *i32
+    # Connection state arrays (an Fd is one i32; closed = free slot)
+    let conn_fds: *Fd = malloc((MAX_CONNS * 4) as u64) as *Fd
     let conn_keep_alive: *i32 = malloc((MAX_CONNS * 4) as u64) as *i32
     let recv_bufs: **u8 = malloc((MAX_CONNS * 8) as u64) as **u8
     let send_bufs: **u8 = malloc((MAX_CONNS * 8) as u64) as **u8
 
     for i in 0..MAX_CONNS
-        conn_fds[i] = -1
+        conn_fds[i] = fd_adopt(-1)
         conn_keep_alive[i] = 0
         recv_bufs[i] = malloc(BUF_SIZE as u64)
         memzero(recv_bufs[i], BUF_SIZE as i64)
@@ -260,12 +261,12 @@ fn run_server(port: i32)
                     # Find free slot
                     var found_slot: i32 = -1
                     for i in 0..MAX_CONNS
-                        if conn_fds[i] < 0
+                        if not conn_fds[i].valid()
                             found_slot = i
                             break
 
                     if found_slot >= 0
-                        conn_fds[found_slot] = result
+                        conn_fds[found_slot] = fd_adopt(result)
                         conn_keep_alive[found_slot] = 0
 
                         # Submit recv for this connection
@@ -274,14 +275,14 @@ fn run_server(port: i32)
                             Some(p) => recv_sqe = p
                             None =>
                                 # SQ full - close connection
-                                sys_close(result)
-                                conn_fds[found_slot] = -1
+                                conn_fds[found_slot].close()
                         if recv_sqe != null
                             recv_sqe.prep_recv(result, Span<u8> { ptr: recv_bufs[found_slot], len: BUF_SIZE as i64 }, 0, encode_user_data(found_slot, OP_RECV))
                             ring.sqe_submit()
                     else
                         # No free slots
-                        sys_close(result)
+                        var rejected: Fd = fd_adopt(result)
+                        rejected.close()
 
                 # Always re-submit accept
                 match ring.get_sqe()
@@ -293,13 +294,12 @@ fn run_server(port: i32)
 
             else if op == OP_RECV
                 # Validate slot is still active
-                if slot < 0 or slot >= MAX_CONNS or conn_fds[slot] < 0
+                if slot < 0 or slot >= MAX_CONNS or not conn_fds[slot].valid()
                     continue  # Stale completion - connection already closed
 
                 if result <= 0
                     # Connection closed or error
-                    sys_close(conn_fds[slot])
-                    conn_fds[slot] = -1
+                    conn_fds[slot].close()
                     conn_keep_alive[slot] = 0
                 else
                     # Parse request (req, resp_buf, resp_len, keep_alive pre-allocated outside loop)
@@ -340,21 +340,19 @@ fn run_server(port: i32)
                         Some(p) => send_sqe = p
                         None =>
                             # SQ full - close connection
-                            sys_close(conn_fds[slot])
-                            conn_fds[slot] = -1
+                            conn_fds[slot].close()
                     if send_sqe != null
-                        send_sqe.prep_send(conn_fds[slot], Span<u8> { ptr: send_bufs[slot], len: resp_len as i64 }, 0, encode_user_data(slot, OP_SEND))
+                        send_sqe.prep_send(conn_fds[slot].raw(), Span<u8> { ptr: send_bufs[slot], len: resp_len as i64 }, 0, encode_user_data(slot, OP_SEND))
                         ring.sqe_submit()
 
             else if op == OP_SEND
                 # Validate slot is still active
-                if slot < 0 or slot >= MAX_CONNS or conn_fds[slot] < 0
+                if slot < 0 or slot >= MAX_CONNS or not conn_fds[slot].valid()
                     continue  # Stale completion - connection already closed
 
                 if result < 0
                     # Send error - close connection
-                    sys_close(conn_fds[slot])
-                    conn_fds[slot] = -1
+                    conn_fds[slot].close()
                     conn_keep_alive[slot] = 0
                 else
                     if conn_keep_alive[slot] != 0
@@ -364,15 +362,13 @@ fn run_server(port: i32)
                             Some(p) => recv_sqe2 = p
                             None =>
                                 # SQ full - close connection
-                                sys_close(conn_fds[slot])
-                                conn_fds[slot] = -1
+                                conn_fds[slot].close()
                         if recv_sqe2 != null
-                            recv_sqe2.prep_recv(conn_fds[slot], Span<u8> { ptr: recv_bufs[slot], len: BUF_SIZE as i64 }, 0, encode_user_data(slot, OP_RECV))
+                            recv_sqe2.prep_recv(conn_fds[slot].raw(), Span<u8> { ptr: recv_bufs[slot], len: BUF_SIZE as i64 }, 0, encode_user_data(slot, OP_RECV))
                             ring.sqe_submit()
                     else
                         # Close connection
-                        sys_close(conn_fds[slot])
-                        conn_fds[slot] = -1
+                        conn_fds[slot].close()
 
 
 # Port to listen on.  regression.sh passes a free per-run port in

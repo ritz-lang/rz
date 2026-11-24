@@ -6,9 +6,10 @@
 # - Infinite loop patterns
 # - Character manipulation
 
-import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
+import ritzlib.span
+import ritzlib.process
 
 # Test buffer fill with repeated pattern
 [[test]]
@@ -138,62 +139,35 @@ fn test_char_codes() -> i32
 # Integration test: verify ./yes outputs repeated lines
 # ============================================================================
 
-fn yes_starts_with(buf: *u8, prefix: *u8) -> i32
-    var i: i64 = 0
-    while *(prefix + i) != 0
-        if *(buf + i) != *(prefix + i)
-            return 0
-        i += 1
-    return 1
-
-[[test]]
-fn test_yes_output() -> i32
-    # Create pipe for capturing output
-    var pipefd: [2]i32
-    if sys_pipe(@pipefd[0]) < 0
-        return 1
-
-    let pid: i32 = sys_fork()
-    if pid < 0
-        sys_close(pipefd[0])
-        sys_close(pipefd[1])
-        return 2
-
-    if pid == 0
-        sys_dup2(pipefd[1], 1)
-        sys_close(pipefd[0])
-        sys_close(pipefd[1])
-
-        var argv: [2]*u8
-        argv[0] = c"./yes"
-        argv[1] = null
-
-        sys_execve(c"./yes", @argv[0], null)
-        sys_exit(127)
-
-    sys_close(pipefd[1])
-
-    # Read a small amount (yes outputs infinitely)
-    var out: [32]u8
-    # Read until EOF (or the buffer is full): one read can return part
-    # of the output when the child writes it in pieces (docs/TESTING.md).
+# Read up to buf.len bytes of the child's output: one read can return part
+# of it when the child writes in pieces (docs/TESTING.md).
+fn yes_read_some(p: @&Process, buf: Span<u8>) -> i64
     var n: i64 = 0
-    while n < 31
-        let r: i64 = sys_read(pipefd[0], @out[0] + n, 31 - n)
+    while n < buf.len
+        let r: i64 = p.read_stdout(Span<u8> { ptr: buf.ptr + n, len: buf.len - n }).unwrap_or(0)
         if r <= 0
             break
         n += r
-    sys_close(pipefd[0])
+    n
+
+[[test]]
+fn test_yes_output() -> i32
+    var p: Process
+    match spawn("./yes", span_empty<StrView>())
+        Ok(q) => p = q
+        Err(_) => return 1
+
+    # Read a small amount (yes outputs infinitely)
+    var out: [31]u8
+    let n: i64 = yes_read_some(@&p, Span<u8> { ptr: @out[0], len: 31 })
 
     # Kill the child since it runs forever
-    sys_kill(pid, 9)  # SIGKILL
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
+    p.kill()
+    p.wait()
+    p.cleanup()
 
-    if n <= 0
-        return 3
-
-    out[n] = 0
     # yes should output "y\ny\ny\n..."
-    assert yes_starts_with(@out[0], c"y\ny\ny\n") == 1, "expected y y y"
-    return 0
+    var got: Span<u8> = Span<u8> { ptr: @out[0], len: n }
+    var want: Span<u8> = "y\ny\ny\n"
+    assert span_starts_with(@got, @want), "expected y y y"
+    0

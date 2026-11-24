@@ -35,6 +35,7 @@ import ritzlib.span
 import ritzlib.fmt
 import ritzlib.os.env
 import ritzlib.process
+import ritzlib.time { sleep_ms }
 
 # Diagnostic helper — see 24_cp.  Used for the many timeout error
 # messages that embed an argv-derived path/value.
@@ -49,14 +50,6 @@ const EXIT_TIMEDOUT: i32 = 124
 const EXIT_CANCELED: i32 = 125
 const EXIT_CANNOT_INVOKE: i32 = 126
 const EXIT_ENOENT: i32 = 127
-
-# ============================================================================
-# TimeSpec struct for nanosleep
-# ============================================================================
-
-struct TimeSpec
-    tv_sec: i64
-    tv_nsec: i64
 
 # ============================================================================
 # Duration parsing
@@ -109,26 +102,52 @@ fn parse_duration(s: *u8, out_sec: *i64, out_nsec: *i64) -> i32
 # standard directories when it is unset or empty, as execvp(3) does; a name
 # with a '/' is used as is.
 
-# ============================================================================
-# Wait status helpers
-# ============================================================================
+# In the forked child: exec `cmd_path` with argv = cmd_args (argv[0]
+# replaced by the full path). Builds argv on the stack and execs with the
+# raw execve: nothing may allocate between fork and exec. Never returns.
+fn exec_child(cmd_path: *u8, cmd_args: Span<StrView>) -> i32
+    # Build null-terminated argv array.  Each argv StrView ends at
+    # argv's NUL, so .ptr is a valid C string.
+    var child_argv: [256]*u8
+    let max_args: i64 = if cmd_args.len < 255 then cmd_args.len else 255
+    for i in 0..max_args
+        let a: StrView = cmd_args[i]
+        child_argv[i] = a.ptr
+    child_argv[max_args] = null
 
-# WIFEXITED(status) - true if child exited normally
-fn wifexited(status: i32) -> i32
-    return ((status & 127) == 0) as i32
+    # Replace first arg with full path for execve
+    child_argv[0] = cmd_path
 
-# WEXITSTATUS(status) - exit code if exited normally
-fn wexitstatus(status: i32) -> i32
-    # (status >> 8) & 255 - use division by 256 instead of right shift
-    return (status / 256) & 255
+    let ret: i32 = sys_execve(cmd_path, @child_argv[0], env_raw_envp())
 
-# WIFSIGNALED(status) - true if child was killed by signal
-fn wifsignaled(status: i32) -> i32
-    return ((status & 127) != 0 and (status & 127) != 127) as i32
+    # If we get here, exec failed
+    if ret == (0 - ENOENT) or ret == (0 - EACCES)
+        sys_exit(EXIT_CANNOT_INVOKE)
+    sys_exit(EXIT_CANCELED)
+    EXIT_CANCELED
 
-# WTERMSIG(status) - signal number if signaled
-fn wtermsig(status: i32) -> i32
-    return status & 127
+# timeout's exit status for a child that has exited as `r`.
+fn finished_status(r: @ProcessResult, sent_signal: i32) -> i32
+    if r.signaled != 0
+        # Child was killed by signal
+        if sent_signal != 0
+            return EXIT_TIMEDOUT
+        # Return 128 + signal number
+        return 128 + r.signal
+    if r.exit_code >= 0
+        return r.exit_code
+    return EXIT_CANCELED
+
+# Check (without blocking) whether child `pid` has exited: its exit status
+# for timeout, or -1 while it is still running.
+fn poll_child(pid: i32, sent_signal: i32) -> i32
+    match try_wait_pid(pid)
+        Ok(done) =>
+            match done
+                Some(r) => finished_status(@r, sent_signal)
+                None => -1
+        # Wait failed (child doesn't exist)
+        Err(_) => EXIT_CANCELED
 
 # ============================================================================
 # Main timeout logic
@@ -146,33 +165,15 @@ fn run_timeout(timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, kill_nsec: i6
             return EXIT_ENOENT
     let cmd_path: *u8 = found.as_ptr()
 
-    # Fork
-    let pid: i32 = sys_fork()
-
-    if pid < 0
-        eprint("timeout: fork failed\n")
-        return EXIT_CANCELED
-
-    if pid == 0
-        # Child process: exec the command
-        # Build null-terminated argv array.  Each argv StrView ends at
-        # argv's NUL, so .ptr is a valid C string.
-        var child_argv: [256]*u8
-        let max_args: i64 = if cmd_args.len < 255 then cmd_args.len else 255
-        for i in 0..max_args
-            let a: StrView = cmd_args[i]
-            child_argv[i] = a.ptr
-        child_argv[max_args] = null
-
-        # Replace first arg with full path for execve
-        child_argv[0] = cmd_path
-
-        let ret: i32 = sys_execve(cmd_path, @child_argv[0], env_raw_envp())
-
-        # If we get here, exec failed
-        if ret == (0 - ENOENT) or ret == (0 - EACCES)
-            sys_exit(EXIT_CANNOT_INVOKE)
-        sys_exit(EXIT_CANCELED)
+    # Fork; the child execs the command
+    let pid: i32 = match fork()
+        Ok(fr) =>
+            match fr
+                Child => exec_child(cmd_path, cmd_args)
+                Parent(child) => child
+        Err(_) =>
+            eprint("timeout: fork failed\n")
+            return EXIT_CANCELED
 
     # Parent process: wait with timeout
     var elapsed_sec: i64 = 0
@@ -180,36 +181,17 @@ fn run_timeout(timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, kill_nsec: i6
     var sent_signal: i32 = 0
     var sent_kill: i32 = 0
 
-    # Poll interval: 10ms
-    var poll_ts: TimeSpec = TimeSpec { tv_sec: 0, tv_nsec: 10000000 }
-
     loop
         # Check if child has exited (non-blocking)
-        var status: i32 = 0
-        let wait_result: i32 = sys_wait4(pid, @status, WNOHANG, null)
-
-        if wait_result > 0
-            # Child exited
-            if wifexited(status) != 0
-                return wexitstatus(status)
-            if wifsignaled(status) != 0
-                # Child was killed by signal
-                let sig: i32 = wtermsig(status)
-                if sent_signal != 0
-                    return EXIT_TIMEDOUT
-                # Return 128 + signal number
-                return 128 + sig
-            return EXIT_CANCELED
-
-        if wait_result < 0
-            # Wait failed (child doesn't exist)
-            return EXIT_CANCELED
+        let finished: i32 = poll_child(pid, sent_signal)
+        if finished >= 0
+            return finished
 
         # Check if we've exceeded the timeout
         if sent_signal == 0
             if elapsed_sec > timeout_sec or (elapsed_sec == timeout_sec and elapsed_nsec >= timeout_nsec)
                 # Send the termination signal
-                sys_kill(pid, signal)
+                kill(pid, signal)
                 sent_signal = 1
 
         # Check if we should send SIGKILL
@@ -224,11 +206,11 @@ fn run_timeout(timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, kill_nsec: i6
                 adj_nsec += 1000000000
 
             if adj_sec > kill_sec or (adj_sec == kill_sec and adj_nsec >= kill_nsec)
-                sys_kill(pid, SIGKILL)
+                kill(pid, SIGKILL)
                 sent_kill = 1
 
-        # Sleep for the poll interval
-        sys_nanosleep(@poll_ts as *i64, null)
+        # Sleep for the poll interval: 10ms
+        sleep_ms(10)
 
         # Update elapsed time
         elapsed_nsec += 10000000

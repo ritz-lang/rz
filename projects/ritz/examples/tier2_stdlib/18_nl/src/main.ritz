@@ -29,6 +29,7 @@ import ritzlib.span
 import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.argspec
 import ritzlib.fmt
+import ritzlib.fd { Fd, fd_open, fd_adopt, fd_stdin, fd_stdout, O_RDONLY }
 
 # ============================================================================
 # Options
@@ -37,8 +38,7 @@ import ritzlib.fmt
 struct NlOptions
     body_style: i32    # 0=none, 1=non-empty (default), 2=all
     width: i32         # line number width (default 6)
-    separator: *u8     # separator after number
-    sep_len: i64       # length of separator
+    separator: StrView # separator after number
     format: i32        # 0=right justified, 1=left justified, 2=right with zeros
 
 # ============================================================================
@@ -58,7 +58,7 @@ fn write_pad(c: u8, count: i64)
         var chunk: i64 = left
         if chunk > 64
             chunk = 64
-        sys_write(STDOUT, @pad[0], chunk)
+        fd_stdout().write_all(Span<u8> { ptr: @pad[0], len: chunk })
         left -= chunk
 
 # Write n padded to `width` columns in `format` (0=right, 1=left, 2=right
@@ -71,16 +71,16 @@ fn write_number(n: i64, width: i32, format: i32)
 
     if format == 1
         # Left justified: digits first, then spaces
-        sys_write(STDOUT, @digits[0], digit_count)
+        fd_stdout().write_all(Span<u8> { ptr: @digits[0], len: digit_count })
         write_pad(32, padding)
     else if format == 2
         # Right justified with zeros
         write_pad(48, padding)
-        sys_write(STDOUT, @digits[0], digit_count)
+        fd_stdout().write_all(Span<u8> { ptr: @digits[0], len: digit_count })
     else
         # Right justified with spaces (default)
         write_pad(32, padding)
-        sys_write(STDOUT, @digits[0], digit_count)
+        fd_stdout().write_all(Span<u8> { ptr: @digits[0], len: digit_count })
 
 # ============================================================================
 # Processing
@@ -94,13 +94,15 @@ fn is_empty_line(line: *u8, len: i64) -> i32
         return 1
     return 0
 
-fn process_fd(fd: i32, opts: *NlOptions, line_num: *i64) -> i32
+fn process_fd(f: @Fd, opts: *NlOptions, line_num: *i64) -> i32
     var buf: [4096]u8
     var linebuf: [8192]u8
     var line_len: i64 = 0
 
     loop
-        let n: i64 = sys_read(fd, @buf[0], 4096)
+        let n: i64 = match f.read(Span<u8> { ptr: @buf[0], len: 4096 })
+            Ok(k) => k
+            Err(_) => -1
         if n < 0
             return 1
         if n == 0
@@ -124,15 +126,15 @@ fn process_fd(fd: i32, opts: *NlOptions, line_num: *i64) -> i32
                 if should_number != 0
                     # Format and write line number
                     write_number(*line_num, opts.width, opts.format)
-                    sys_write(STDOUT, opts.separator, opts.sep_len)
+                    fd_stdout().write_str(opts.separator)
                     *line_num = *line_num + 1
                 else
                     # Write blank prefix for unnumbered lines
                     write_pad(32, opts.width as i64)
-                    sys_write(STDOUT, opts.separator, opts.sep_len)
+                    fd_stdout().write_str(opts.separator)
 
                 # Write line content
-                sys_write(STDOUT, @linebuf[0], line_len)
+                fd_stdout().write_all(Span<u8> { ptr: @linebuf[0], len: line_len })
                 line_len = 0
 
             i += 1
@@ -148,14 +150,14 @@ fn process_fd(fd: i32, opts: *NlOptions, line_num: *i64) -> i32
 
         if should_number != 0
             write_number(*line_num, opts.width, opts.format)
-            sys_write(STDOUT, opts.separator, opts.sep_len)
+            fd_stdout().write_str(opts.separator)
             *line_num = *line_num + 1
         else
             write_pad(32, opts.width as i64)
-            sys_write(STDOUT, opts.separator, opts.sep_len)
+            fd_stdout().write_str(opts.separator)
 
-        sys_write(STDOUT, @linebuf[0], line_len)
-        sys_write(STDOUT, c"\n" as *u8, 1)
+        fd_stdout().write_all(Span<u8> { ptr: @linebuf[0], len: line_len })
+        fd_stdout().write_str("\n")
 
     return 0
 
@@ -224,17 +226,18 @@ fn format_value(o: Option<StrView>) -> StrView
         Some(s) => s
         None => "rn"
 
-# Number one FILE (a view of an argv string: NUL-terminated, as sys_open
-# needs).  Returns 1 on failure.
+# Number one FILE.  Returns 1 on failure.
 fn nl_path(path: StrView, opts: *NlOptions, line_num: *i64) -> i32
-    let fd: i32 = sys_open(path.as_cstr_unchecked(), O_RDONLY)
-    if fd < 0
-        sys_write(STDERR, c"nl: cannot open file\n" as *u8, 21)
-        return 1
+    var file: Fd = fd_adopt(-1)
+    match fd_open(path, O_RDONLY, 0)
+        Ok(f) => file = f
+        Err(_) =>
+            eprints("nl: cannot open file\n")
+            return 1
     var status: i32 = 0
-    if process_fd(fd, opts, line_num) != 0
+    if process_fd(@file, opts, line_num) != 0
         status = 1
-    sys_close(fd)
+    file.close()
     status
 
 fn nl(p: @ParsedArgs, width: i64) -> i32
@@ -243,22 +246,19 @@ fn nl(p: @ParsedArgs, width: i64) -> i32
     # Interpret -b (body numbering style)
     opts.body_style = body_style_of(style_value(p.value("b")))
     if opts.body_style < 0
-        sys_write(STDERR, c"nl: invalid body style\n" as *u8, 23)
+        eprints("nl: invalid body style\n")
         return 1
 
     # -w (width), already parsed by the caller
     opts.width = width as i32
 
-    # Interpret -s (separator).  The value is a view of an argv string or of
-    # the default literal, so its pointer is NUL-terminated as well.
-    let sep = separator_value(p.value("s"))
-    opts.separator = sep.as_cstr_unchecked()
-    opts.sep_len = sep.len
+    # Interpret -s (separator)
+    opts.separator = separator_value(p.value("s"))
 
     # Interpret -n (number format)
     opts.format = format_of(format_value(p.value("n")))
     if opts.format < 0
-        sys_write(STDERR, c"nl: invalid number format\n" as *u8, 26)
+        eprints("nl: invalid number format\n")
         return 1
 
     var line_num: i64 = 1
@@ -266,7 +266,8 @@ fn nl(p: @ParsedArgs, width: i64) -> i32
     let files = p.positionals()
 
     if files.len == 0
-        if process_fd(STDIN, @opts, @line_num) != 0
+        let input: Fd = fd_stdin()
+        if process_fd(@input, @opts, @line_num) != 0
             exit_code = 1
     else
         var i: i64 = 0

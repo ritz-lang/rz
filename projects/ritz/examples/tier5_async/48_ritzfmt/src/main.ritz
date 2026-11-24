@@ -33,6 +33,7 @@ import ritzlib.option
 import ritzlib.result
 import ritzlib.strview
 import ritzlib.argspec
+import ritzlib.fd { Fd, fd_open, fd_stdin, fd_stdout, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC }
 
 # ============================================================================
 # Lexer token types
@@ -327,12 +328,59 @@ fn flag_i32(b: bool) -> i32
         return 1
     0
 
-# A positional as a C string: a view of an argv string, so NUL-terminated;
-# null when not given.
-fn value_cstr(o: Option<StrView>) -> *u8
-    match o
-        Some(s) => s.as_cstr_unchecked()
-        None => null
+# Append everything `f` yields until EOF to `buf`: 0, or -1 on a read error.
+fn read_all_into(f: @Fd, buf: *Vec<u8>) -> i32
+    var tmp: [4096]u8
+    loop
+        match f.read(Span<u8> { ptr: @tmp[0], len: 4096 })
+            Ok(n) =>
+                if n == 0
+                    return 0
+                buf.push_span(Span<u8> { ptr: (@tmp[0]), len: n })
+            Err(_) => return -1
+
+# Read FILE (or stdin when there is none) into `input`: 0, or 1 after a
+# failure (reported when FILE cannot be opened).
+fn read_input(file: Option<StrView>, input: *Vec<u8>) -> i32
+    match file
+        Some(path) => read_path_input(path, input)
+        None =>
+            if read_all_into(@fd_stdin(), input) != 0
+                return 1
+            0
+
+fn read_path_input(path: StrView, input: *Vec<u8>) -> i32
+    match fd_open(path, O_RDONLY, 0)
+        Ok(opened) =>
+            var f: Fd = opened
+            let rc: i32 = read_all_into(@f, input)
+            f.close()
+            if rc != 0
+                return 1
+            0
+        Err(_) =>
+            eprint("ritzfmt: cannot open file: {path}\n")
+            1
+
+# The formatted source to FILE (-w with a FILE) or stdout: 0, or 1.
+fn emit_output(target: Option<StrView>, output: @Vec<u8>) -> i32
+    match target
+        Some(path) => write_back(path, output)
+        None =>
+            fd_stdout().write(Span<u8> { ptr: output.data, len: output.len })
+            0
+
+# Write the formatted source back to FILE (-w): 0, or 1 after reporting.
+fn write_back(path: StrView, output: @Vec<u8>) -> i32
+    match fd_open(path, O_WRONLY | O_CREAT | O_TRUNC, 420)
+        Ok(opened) =>
+            var f: Fd = opened
+            f.write(Span<u8> { ptr: output.data, len: output.len })
+            f.close()
+            0
+        Err(_) =>
+            eprint("ritzfmt: cannot write file: {path}\n")
+            1
 
 # -i has a default, so parsed_int only fails on a value that isn't a whole
 # number ("-i abc"), now a usage error rather than a silent fallback to 4.
@@ -348,34 +396,9 @@ fn ritzfmt(p: @ParsedArgs, indent_width: i32) -> i32
 
     # Read input
     var input: Vec<u8> = vec_new<u8>()
-    # FILE is a view of an argv string, so NUL-terminated, as sys_open needs.
-    let path: *u8 = value_cstr(p.positional(0))
-
-    if path != null
-        let fd: i32 = sys_open(path, 0)
-        if fd < 0
-            eprint("ritzfmt: cannot open file: {path}\n")
-            return 1
-
-        var buf: [4096]u8
-        while 1 == 1
-            let n: i64 = sys_read(fd, @buf[0], 4096)
-            if n < 0
-                sys_close(fd)
-                return 1
-            if n == 0
-                break
-            input.push_span(Span<u8> { ptr: (@buf[0]), len: (n) as i64 })
-        sys_close(fd)
-    else
-        var buf: [4096]u8
-        while 1 == 1
-            let n: i64 = sys_read(0, @buf[0], 4096)
-            if n < 0
-                return 1
-            if n == 0
-                break
-            input.push_span(Span<u8> { ptr: (@buf[0]), len: (n) as i64 })
+    let file: Option<StrView> = p.positional(0)
+    if read_input(file, @input) != 0
+        return 1
 
     # Format
     var output: Vec<u8> = vec_new<u8>()
@@ -396,18 +419,11 @@ fn ritzfmt(p: @ParsedArgs, indent_width: i32) -> i32
         return 0
 
     # Write mode
-    if write_mode != 0 and path != null
-        let fd: i32 = sys_open(path, 577)  # O_WRONLY | O_CREAT | O_TRUNC
-        if fd < 0
-            eprint("ritzfmt: cannot write file: {path}\n")
-            return 1
-        sys_write(fd, output.data, output.len)
-        sys_close(fd)
-    else
-        sys_write(1, output.data, output.len)
-
+    var target: Option<StrView> = None
+    if write_mode != 0
+        target = file
     # Drop is automatic via RAII
-    return 0
+    return emit_output(target, @output)
 
 fn run(spec: @ArgSpec, p: ParsedArgs) -> i32
     var parsed = p

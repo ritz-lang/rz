@@ -17,24 +17,35 @@ import ritzlib.result
 import ritzlib.str
 import ritzlib.os.env
 import ritzlib.fmt
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new }
+import ritzlib.fd { Fd, fd_open, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC }
 
-# Build "$TMPDIR/<stem>_<pid>.txt" into buf (>= 512 bytes) and return buf;
-# TMPDIR unset, empty or overlong means /tmp.  Concurrent runs of this binary
-# -- two gates on one host, or two stages of one gate -- must never share a
-# file: with a fixed /tmp name one run's unlink landed between another's
-# write and read, and regression Stage 1 flaked (AGAST #4207).
-fn scratch_path(buf: *u8, stem: *u8) -> *u8
+# "$TMPDIR/<stem>_<pid>.txt"; TMPDIR unset, empty or overlong means /tmp.
+# Concurrent runs of this binary -- two gates on one host, or two stages of
+# one gate -- must never share a file: with a fixed /tmp name one run's
+# unlink landed between another's write and read, and regression Stage 1
+# flaked (AGAST #4207).
+fn scratch_path(stem: StrView) -> String
     var dir: StrView = env_get_or("TMPDIR", "/tmp")
     if dir.len == 0 or dir.len > 400
         dir = "/tmp"
-    memcpy(buf, dir.ptr, dir.len)
-    *(buf + dir.len) = 0
-    strcat(buf, c"/")
-    strcat(buf, stem)
-    strcat(buf, c"_")
-    itoa(sys_getpid() as i64, buf + strlen(buf))
-    strcat(buf, c".txt")
-    buf
+    var path: String = string_new()
+    path.push_str(dir)
+    path.push_str("/")
+    path.push_str(stem)
+    path.push_str("_")
+    path.push_i64(sys_getpid() as i64)
+    path.push_str(".txt")
+    path
+
+# Create (or truncate) the test file for writing, mode 0644.
+fn create_test_file(path: @String) -> Result<Fd, Errno>
+    fd_open(path.as_view(), O_WRONLY | O_CREAT | O_TRUNC, 420)
+
+fn open_test_file(path: @String) -> Result<Fd, Errno>
+    fd_open(path.as_view(), O_RDONLY, 0)
 
 # ============================================================================
 # Test 1: Runtime initialization
@@ -61,19 +72,20 @@ fn test_runtime_read() -> bool
     print("test_runtime_read... ")
 
     # Create test file
-    var test_file_buf: [512]u8
-    let test_file: *u8 = scratch_path(@test_file_buf[0], c"ritz_runtime_read_test")
-    let test_data = c"Hello from runtime!"
+    let test_file: String = scratch_path("ritz_runtime_read_test")
+    let test_data: StrView = "Hello from runtime!"
     let test_len: i32 = 19
 
-    # Write using direct syscall first
-    # 0x241 = O_WRONLY | O_CREAT | O_TRUNC, 420 = 0644 octal
-    let fd: i32 = sys_open3(test_file, 0x241, 420)
-    if fd < 0
-        print("FAIL: could not create test file\n")
-        return false
-    let written: i64 = sys_write(fd, test_data, test_len as i64)
-    sys_close(fd)
+    # Write directly first
+    var f: Fd = match create_test_file(@test_file)
+        Ok(opened) => opened
+        Err(_) =>
+            print("FAIL: could not create test file\n")
+            return false
+    let written: i64 = match f.write(Span<u8> { ptr: test_data.ptr, len: test_len as i64 })
+        Ok(n) => n
+        Err(_) => -1
+    f.close()
     if written != test_len as i64
         print("FAIL: write failed\n")
         return false
@@ -84,17 +96,18 @@ fn test_runtime_read() -> bool
         print("FAIL: runtime_init failed\n")
         return false
 
-    let rfd: i32 = sys_open(test_file, 0)  # O_RDONLY
-    if rfd < 0
-        print("FAIL: could not open test file for reading\n")
-        rt.destroy()
-        return false
+    var rf: Fd = match open_test_file(@test_file)
+        Ok(opened) => opened
+        Err(_) =>
+            print("FAIL: could not open test file for reading\n")
+            rt.destroy()
+            return false
 
     var buf: [64]u8
-    let bytes_read: i64 = match rt.read(rfd, Span<u8> { ptr: (@buf[0]), len: (64) as i64 }, 0)
+    let bytes_read: i64 = match rt.read(rf.raw(), Span<u8> { ptr: (@buf[0]), len: (64) as i64 }, 0)
         Ok(n) => n
         Err(_) => -1
-    sys_close(rfd)
+    rf.close()
     rt.destroy()
 
     if bytes_read != test_len as i64
@@ -104,7 +117,7 @@ fn test_runtime_read() -> bool
     # Verify content
     var i: i32 = 0
     while i < test_len
-        if buf[i] != test_data[i]
+        if buf[i] != test_data.get(i as i64)
             print("FAIL: byte mismatch at {i as i64}\n")
             return false
         i += 1
@@ -120,44 +133,46 @@ fn test_runtime_read() -> bool
 fn test_runtime_write() -> bool
     print("test_runtime_write... ")
 
-    var test_file_buf: [512]u8
-
-    let test_file: *u8 = scratch_path(@test_file_buf[0], c"ritz_runtime_write_test")
-    let test_data = c"Runtime write test!"
+    let test_file: String = scratch_path("ritz_runtime_write_test")
+    let test_data: StrView = "Runtime write test!"
     let test_len: i32 = 19
 
-    # Create/open file (420 = 0644 octal)
-    let fd: i32 = sys_open3(test_file, 0x241, 420)
-    if fd < 0
-        print("FAIL: could not create test file\n")
-        return false
+    # Create/open file
+    var f: Fd = match create_test_file(@test_file)
+        Ok(opened) => opened
+        Err(_) =>
+            print("FAIL: could not create test file\n")
+            return false
 
     var rt: Runtime
     if rt.init() < 0
         print("FAIL: runtime_init failed\n")
-        sys_close(fd)
+        f.close()
         return false
 
     # Write via runtime
-    let bytes_written: i64 = match rt.write(fd, Span<u8> { ptr: (test_data), len: (test_len) as i64 }, 0)
+    let bytes_written: i64 = match rt.write(f.raw(), Span<u8> { ptr: (test_data.ptr), len: (test_len) as i64 }, 0)
         Ok(n) => n
         Err(_) => -1
-    sys_close(fd)
+    f.close()
     rt.destroy()
 
     if bytes_written != test_len as i64
         print("FAIL: expected to write {test_len as i64} bytes, wrote {bytes_written}\n")
         return false
 
-    # Verify by reading back via syscall
-    let rfd: i32 = sys_open(test_file, 0)  # O_RDONLY
-    if rfd < 0
-        print("FAIL: could not open for verification\n")
-        return false
+    # Verify by reading back directly
+    var rf: Fd = match open_test_file(@test_file)
+        Ok(opened) => opened
+        Err(_) =>
+            print("FAIL: could not open for verification\n")
+            return false
 
     var buf: [64]u8
-    let bytes_read: i64 = sys_read(rfd, @buf[0], 64)
-    sys_close(rfd)
+    let bytes_read: i64 = match rf.read(Span<u8> { ptr: @buf[0], len: 64 })
+        Ok(n) => n
+        Err(_) => -1
+    rf.close()
 
     if bytes_read != test_len as i64
         print("FAIL: verification read got wrong size\n")
@@ -165,7 +180,7 @@ fn test_runtime_write() -> bool
 
     var i: i32 = 0
     while i < test_len
-        if buf[i] != test_data[i]
+        if buf[i] != test_data.get(i as i64)
             print("FAIL: byte mismatch at {i as i64}\n")
             return false
         i += 1
@@ -181,10 +196,8 @@ fn test_runtime_write() -> bool
 fn test_runtime_roundtrip() -> bool
     print("test_runtime_roundtrip... ")
 
-    var test_file_buf: [512]u8
-
-    let test_file: *u8 = scratch_path(@test_file_buf[0], c"ritz_runtime_roundtrip")
-    let test_data = c"Round trip test data 12345!"
+    let test_file: String = scratch_path("ritz_runtime_roundtrip")
+    let test_data: StrView = "Round trip test data 12345!"
     let test_len: i32 = 27
 
     var rt: Runtime
@@ -192,17 +205,18 @@ fn test_runtime_roundtrip() -> bool
         print("FAIL: runtime_init failed\n")
         return false
 
-    # Write (420 = 0644 octal)
-    let wfd: i32 = sys_open3(test_file, 0x241, 420)
-    if wfd < 0
-        print("FAIL: could not create test file\n")
-        rt.destroy()
-        return false
+    # Write
+    var wf: Fd = match create_test_file(@test_file)
+        Ok(opened) => opened
+        Err(_) =>
+            print("FAIL: could not create test file\n")
+            rt.destroy()
+            return false
 
-    let bytes_written: i64 = match rt.write(wfd, Span<u8> { ptr: (test_data), len: (test_len) as i64 }, 0)
+    let bytes_written: i64 = match rt.write(wf.raw(), Span<u8> { ptr: (test_data.ptr), len: (test_len) as i64 }, 0)
         Ok(n) => n
         Err(_) => -1
-    sys_close(wfd)
+    wf.close()
 
     if bytes_written != test_len as i64
         print("FAIL: write failed\n")
@@ -210,17 +224,18 @@ fn test_runtime_roundtrip() -> bool
         return false
 
     # Read back using same runtime
-    let rfd: i32 = sys_open(test_file, 0)  # O_RDONLY
-    if rfd < 0
-        print("FAIL: could not open for read\n")
-        rt.destroy()
-        return false
+    var rf: Fd = match open_test_file(@test_file)
+        Ok(opened) => opened
+        Err(_) =>
+            print("FAIL: could not open for read\n")
+            rt.destroy()
+            return false
 
     var buf: [64]u8
-    let bytes_read: i64 = match rt.read(rfd, Span<u8> { ptr: (@buf[0]), len: (64) as i64 }, 0)
+    let bytes_read: i64 = match rt.read(rf.raw(), Span<u8> { ptr: (@buf[0]), len: (64) as i64 }, 0)
         Ok(n) => n
         Err(_) => -1
-    sys_close(rfd)
+    rf.close()
     rt.destroy()
 
     if bytes_read != test_len as i64
@@ -229,7 +244,7 @@ fn test_runtime_roundtrip() -> bool
 
     var i: i32 = 0
     while i < test_len
-        if buf[i] != test_data[i]
+        if buf[i] != test_data.get(i as i64)
             print("FAIL: content mismatch at {i as i64}\n")
             return false
         i += 1
@@ -245,24 +260,23 @@ fn test_runtime_roundtrip() -> bool
 fn test_runtime_close() -> bool
     print("test_runtime_close... ")
 
-    var test_file_buf: [512]u8
+    let test_file: String = scratch_path("ritz_runtime_close_test")
 
-    let test_file: *u8 = scratch_path(@test_file_buf[0], c"ritz_runtime_close_test")
-
-    # Create a file (420 = 0644 octal)
-    let fd: i32 = sys_open3(test_file, 0x241, 420)
-    if fd < 0
-        print("FAIL: could not create test file\n")
-        return false
+    # Create a file
+    var f: Fd = match create_test_file(@test_file)
+        Ok(opened) => opened
+        Err(_) =>
+            print("FAIL: could not create test file\n")
+            return false
 
     var rt: Runtime
     if rt.init() < 0
         print("FAIL: runtime_init failed\n")
-        sys_close(fd)
+        f.close()
         return false
 
     # Close via runtime
-    let ret: i32 = match rt.close(fd)
+    let ret: i32 = match rt.close(f.raw())
         Ok(_) => 0
         Err(_) => -1
     rt.destroy()
@@ -271,9 +285,10 @@ fn test_runtime_close() -> bool
         print("FAIL: runtime_close returned {ret as i64}\n")
         return false
 
-    # Verify fd is closed (second close should fail)
-    # Note: We don't check ret2 since behavior varies by system
-    let ret2: i32 = sys_close(fd)
+    # Verify fd is closed (second close should fail): the runtime closed the
+    # number, so this close(2) of it again gets EBADF.
+    # Note: We don't check the result since behavior varies by system
+    f.close()
 
     # Note: File cleanup skipped (unlink not implemented)
     print("OK\n")

@@ -32,7 +32,7 @@ import ritzlib.gvec
 import ritzlib.argspec
 
 # Diagnostic helper — see 24_cp.
-fn chmod_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
+fn chmod_err2(prefix: StrView, path: StrView, suffix: StrView) -> i32
     eprint("{prefix}{path}{suffix}\n")
     return 1
 
@@ -59,14 +59,14 @@ fn print_octal(n: i32)
         buf[i] = ((val % 8) + '0') as u8
         val /= 8
         i -= 1
-    sys_write(STDOUT, @buf[0], 4)
+    prints(StrView { ptr: @buf[0], len: 4 })
 
 # Parse octal mode like "755"
-fn parse_octal_mode(s: *u8) -> i32
+fn parse_octal_mode(s: StrView) -> i32
     var mode: i32 = 0
     var i: i64 = 0
-    while *(s + i) != 0
-        let c: u8 = *(s + i)
+    while i < s.len
+        let c: u8 = s.get(i)
         if c < '0' or c > '7'
             return -1
         mode = mode * 8 + (c - '0') as i32
@@ -74,15 +74,15 @@ fn parse_octal_mode(s: *u8) -> i32
     return mode
 
 # Parse symbolic mode like "+x", "-w", "=rw"
-fn parse_symbolic_mode(s: *u8, opts: *ChmodOptions) -> i32
-    let c: u8 = *s
+fn parse_symbolic_mode(s: StrView, opts: *ChmodOptions) -> i32
+    let c: u8 = s.get(0)
     if c != '+' and c != '-' and c != '='
         return -1
 
     var bits: i32 = 0
     var i: i64 = 1
-    while *(s + i) != 0
-        let ch: u8 = *(s + i)
+    while i < s.len
+        let ch: u8 = s.get(i)
         if ch == 'r'  # 'r'
             bits += 292  # 0444
         else if ch == 'w'  # 'w'
@@ -106,13 +106,13 @@ fn parse_symbolic_mode(s: *u8, opts: *ChmodOptions) -> i32
 # Chmod functions
 # ============================================================================
 
-fn chmod_file(path: *u8, opts: *ChmodOptions) -> i32
+fn chmod_file(path: StrView, opts: *ChmodOptions) -> i32
     var new_mode: i32 = opts.mode
 
     # Handle symbolic modes
     if opts.mode_add != 0 or opts.mode_remove != 0
         var current: i32 = 0
-        match lstat(strview_from_cstr(path))
+        match lstat(path)
             Ok(st) => current = st.st_mode % 4096
             Err(_) => return chmod_err2("chmod: cannot access '", path, "'")
         new_mode = current
@@ -132,8 +132,7 @@ fn chmod_file(path: *u8, opts: *ChmodOptions) -> i32
             if opts.mode_remove % 8 >= 1  # other bits
                 new_mode -= new_mode % 8
 
-    let result: i32 = sys_chmod(path, new_mode)
-    if result != 0
+    if chmod(path, new_mode).is_err()
         return chmod_err2("chmod: cannot change permissions of '", path, "'")
 
     if opts.verbose != 0
@@ -144,24 +143,23 @@ fn chmod_file(path: *u8, opts: *ChmodOptions) -> i32
 
     return 0
 
-fn chmod_recursive(path: *u8, opts: *ChmodOptions) -> i32
+fn chmod_recursive(path: StrView, opts: *ChmodOptions) -> i32
     var result: i32 = chmod_file(path, opts)
 
-    if not is_dir(strview_from_cstr(path))
+    if not is_dir(path)
         return result
 
-    var dir: DirIter = match dir_open(strview_from_cstr(path))
+    var dir: DirIter = match dir_open(path)
         Ok(it) => it
         Err(_) => return 1
 
     while dir.next()
         let e: DirEntry = dir.entry()
-        let name: *u8 = e.name.ptr
 
-        if not streq(name, c".") and not streq(name, c"..")
-            var child: String = path_join(strview_from_cstr(path), e.name)
+        if not e.name.eq(".") and not e.name.eq("..")
+            var child: String = path_join(path, e.name)
 
-            let r: i32 = chmod_recursive(child.as_ptr(), opts)
+            let r: i32 = chmod_recursive(child.as_view(), opts)
             if r != 0
                 result = 1
 
@@ -185,12 +183,6 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Positional i as a C string.  A positional is always a whole argv entry, so
-# its view ends at argv's NUL and .ptr is a valid C string.
-fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
-    let v: StrView = pos.get(i)
-    v.ptr
-
 fn chmod_all(p: @ParsedArgs) -> i32
     var opts: ChmodOptions
     opts.verbose = p.switch("verbose") as i32
@@ -201,10 +193,12 @@ fn chmod_all(p: @ParsedArgs) -> i32
 
     # First positional is MODE (argspec_parse guarantees at least 2)
     let pos = p.positionals()
-    let mode_arg: *u8 = positional_cstr(@pos, 0)
+    let mode_arg: StrView = pos.get(0)
 
-    # Parse MODE - try octal first, then symbolic
-    let first_char: u8 = *mode_arg
+    # Parse MODE - try octal first, then symbolic (an empty MODE is invalid)
+    var first_char: u8 = 0
+    if mode_arg.len > 0
+        first_char = mode_arg.get(0)
     if first_char >= '0' and first_char <= '7'
         opts.mode = parse_octal_mode(mode_arg)
         if opts.mode < 0
@@ -222,7 +216,7 @@ fn chmod_all(p: @ParsedArgs) -> i32
     var result: i32 = 0
     var i: i64 = 1
     while i < pos.len
-        let path: *u8 = positional_cstr(@pos, i)
+        let path: StrView = pos.get(i)
         if opts.recursive != 0
             let r: i32 = chmod_recursive(path, @opts)
             if r != 0

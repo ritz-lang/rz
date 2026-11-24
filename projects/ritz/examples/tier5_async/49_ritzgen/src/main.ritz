@@ -13,6 +13,7 @@ import ritzlib.option
 import ritzlib.result
 import ritzlib.strview
 import ritzlib.argspec
+import ritzlib.fd { Fd, fd_open, fd_stdout, O_WRONLY, O_CREAT, O_TRUNC }
 
 import tokens
 import ast
@@ -25,21 +26,12 @@ import parser
 # File testing
 # =============================================================================
 
-fn test_file(path: *u8, defs: *TokenDefs, verbose: i32) -> i32
+fn test_file(path: StrView, defs: *TokenDefs, verbose: i32) -> i32
     # Read file
     var buf: Vec<u8> = vec_new<u8>()
-    let fd: i32 = sys_open(path, 0)
-    if fd < 0
+    if not slurp_path(path, @buf)
         eprint("Cannot open: {path}\n")
         return -1
-
-    var chunk: [4096]u8
-    while 1 == 1
-        let n: i64 = sys_read(fd, @chunk[0], 4096)
-        if n <= 0
-            break
-        buf.push_span(Span<u8> { ptr: (@chunk[0]), len: (n) as i64 })
-    sys_close(fd)
 
     # Lex file
     var lex: Lexer
@@ -63,7 +55,7 @@ fn test_file(path: *u8, defs: *TokenDefs, verbose: i32) -> i32
 
             if tok.len > 0 and tok.kind != TOK_NEWLINE
                 print(" '")
-                sys_write(1, tok.start, tok.len as i64)
+                prints(strview_from_ptr(tok.start, tok.len as i64))
                 print("'")
             print("\n")
 
@@ -71,7 +63,7 @@ fn test_file(path: *u8, defs: *TokenDefs, verbose: i32) -> i32
             error_count += 1
             if verbose == 0
                 eprint("{path}:{tok.line}:{tok.col}: error: unexpected character '")
-                sys_write(2, tok.start, 1)
+                eprints(strview_from_ptr(tok.start, 1))
                 eprint("'\n")
 
         if tok.kind == TOK_EOF
@@ -115,12 +107,25 @@ fn flag_i32(b: bool) -> i32
         return 1
     0
 
-# Positional i as a C string: a view of an argv string, so NUL-terminated.
-# Callers stay below positional_count; past it is null.
-fn positional_cstr(p: @ParsedArgs, i: i32) -> *u8
+# Positional i. Callers stay below positional_count; past it is empty.
+fn positional_view(p: @ParsedArgs, i: i32) -> StrView
     match p.positional(i as i64)
-        Some(s) => s.as_cstr_unchecked()
-        None => null
+        Some(s) => s
+        None => strview_empty()
+
+# Write `code` to `path` (created or truncated, mode 0644) and report it:
+# 0, or 1 after "Cannot write".
+fn write_generated(path: StrView, code: @Vec<u8>) -> i32
+    match fd_open(path, O_WRONLY | O_CREAT | O_TRUNC, 420)  # 420 = 0644
+        Ok(opened) =>
+            var f: Fd = opened
+            f.write(Span<u8> { ptr: code.data, len: code.len })
+            f.close()
+            print("{path}: OK ({code.len} bytes)\n")
+            0
+        Err(_) =>
+            eprint("Cannot write: {path}\n")
+            1
 
 fn ritzgen(p: @ParsedArgs) -> i32
     let test_mode: i32 = flag_i32(p.switch("t"))
@@ -132,21 +137,12 @@ fn ritzgen(p: @ParsedArgs) -> i32
     let positional_count: i32 = p.positionals().len as i32
 
     # Read grammar file
-    let grammar_path: *u8 = positional_cstr(p, 0)
+    let grammar_path: StrView = positional_view(p, 0)
 
     var grammar_buf: Vec<u8> = vec_new<u8>()
-    let gfd: i32 = sys_open(grammar_path, 0)
-    if gfd < 0
+    if not slurp_path(grammar_path, @grammar_buf)
         eprint("Cannot open grammar file: {grammar_path}\n")
         return 1
-
-    var chunk: [4096]u8
-    while 1 == 1
-        let n: i64 = sys_read(gfd, @chunk[0], 4096)
-        if n <= 0
-            break
-        grammar_buf.push_span(Span<u8> { ptr: (@chunk[0]), len: (n) as i64 })
-    sys_close(gfd)
 
     # Parse grammar
     var gp: GrammarParser
@@ -174,7 +170,7 @@ fn ritzgen(p: @ParsedArgs) -> i32
     if gen_tokens != 0
         var code: Vec<u8> = vec_new<u8>()
         generate_tokens(@defs, @code)
-        sys_write(1, code.data, code.len)
+        fd_stdout().write(Span<u8> { ptr: code.data, len: code.len })
         # code and grammar_buf auto-dropped
         return 0
 
@@ -182,7 +178,7 @@ fn ritzgen(p: @ParsedArgs) -> i32
     if gen_lexer != 0
         var code: Vec<u8> = vec_new<u8>()
         generate_lexer_setup(@defs, @code)
-        sys_write(1, code.data, code.len)
+        fd_stdout().write(Span<u8> { ptr: code.data, len: code.len })
         # code and grammar_buf auto-dropped
         return 0
 
@@ -190,52 +186,33 @@ fn ritzgen(p: @ParsedArgs) -> i32
     if generate != 0 and gram.rule_count > 0
         var code: Vec<u8> = vec_new<u8>()
         generate_parser(@defs, @gram, @code)
-        sys_write(1, code.data, code.len)
+        fd_stdout().write(Span<u8> { ptr: code.data, len: code.len })
         # code and grammar_buf auto-dropped
         return 0
 
     # Special mode: 4 positional args = grammar + 3 output files
     # Usage: ritzgen GRAMMAR TOKENS_OUT LEXER_OUT PARSER_OUT
     if positional_count == 4 and gram.rule_count > 0
-        let tokens_path: *u8 = positional_cstr(p, 1)
-        let lexer_path: *u8 = positional_cstr(p, 2)
-        let parser_path: *u8 = positional_cstr(p, 3)
+        let tokens_path: StrView = positional_view(p, 1)
+        let lexer_path: StrView = positional_view(p, 2)
+        let parser_path: StrView = positional_view(p, 3)
 
         # Generate and write tokens
         var tokens_code: Vec<u8> = vec_new<u8>()
         generate_tokens(@defs, @tokens_code)
-        # O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512 = 577
-        let tfd: i32 = sys_open3(tokens_path, 577, 420)  # 420 = 0644
-        if tfd >= 0
-            sys_write(tfd, tokens_code.data, tokens_code.len)
-            sys_close(tfd)
-            print("{tokens_path}: OK ({tokens_code.len} bytes)\n")
-        else
-            eprint("Cannot write: {tokens_path}\n")
+        if write_generated(tokens_path, @tokens_code) != 0
             return 1
 
         # Generate and write lexer setup
         var lexer_code: Vec<u8> = vec_new<u8>()
         generate_lexer_setup(@defs, @lexer_code)
-        let lfd: i32 = sys_open3(lexer_path, 577, 420)
-        if lfd >= 0
-            sys_write(lfd, lexer_code.data, lexer_code.len)
-            sys_close(lfd)
-            print("{lexer_path}: OK ({lexer_code.len} bytes)\n")
-        else
-            eprint("Cannot write: {lexer_path}\n")
+        if write_generated(lexer_path, @lexer_code) != 0
             return 1
 
         # Generate and write parser
         var parser_code: Vec<u8> = vec_new<u8>()
         generate_parser(@defs, @gram, @parser_code)
-        let pfd: i32 = sys_open3(parser_path, 577, 420)
-        if pfd >= 0
-            sys_write(pfd, parser_code.data, parser_code.len)
-            sys_close(pfd)
-            print("{parser_path}: OK ({parser_code.len} bytes)\n")
-        else
-            eprint("Cannot write: {parser_path}\n")
+        if write_generated(parser_path, @parser_code) != 0
             return 1
 
         return 0
@@ -245,7 +222,7 @@ fn ritzgen(p: @ParsedArgs) -> i32
         var i: i32 = 1
         var errors: i32 = 0
         while i < positional_count
-            let input_path: *u8 = positional_cstr(p, i)
+            let input_path: StrView = positional_view(p, i)
             let result: i32 = parse_file_ast(input_path, @defs, verbose)
             if result != 0
                 errors += 1
@@ -260,7 +237,7 @@ fn ritzgen(p: @ParsedArgs) -> i32
         var i: i32 = 1
         var errors: i32 = 0
         while i < positional_count
-            let input_path: *u8 = positional_cstr(p, i)
+            let input_path: StrView = positional_view(p, i)
             let result: i32 = test_file(input_path, @defs, verbose)
             if result != 0
                 errors += 1

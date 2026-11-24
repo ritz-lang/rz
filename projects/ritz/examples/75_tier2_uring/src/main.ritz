@@ -19,6 +19,7 @@ import ritzlib.option
 import ritzlib.span
 import ritzlib.os.env
 import ritzlib.fmt
+import ritzlib.fd { Fd, fd_adopt }
 
 
 # Operation types
@@ -80,13 +81,13 @@ fn run_server(port: i32, max_handled: i32)
         srv.close()
         return
 
-    # Allocate connection tracking arrays
-    let conn_fds: *i32 = malloc((MAX_CONNS * 4) as u64) as *i32
+    # Allocate connection tracking arrays (an Fd is one i32)
+    let conn_fds: *Fd = malloc((MAX_CONNS * 4) as u64) as *Fd
     let conn_bufs: **u8 = malloc((MAX_CONNS * 8) as u64) as **u8
 
-    # Initialize to 0 (free)
+    # Initialize to closed (free)
     for i in 0..MAX_CONNS
-        conn_fds[i] = 0  # 0 = free slot
+        conn_fds[i] = fd_adopt(-1)  # closed = free slot
         conn_bufs[i] = malloc(BUF_SIZE as u64)
 
     var accept_pending: i32 = 0
@@ -133,12 +134,12 @@ fn run_server(port: i32, max_handled: i32)
                     # Find free slot
                     var found_slot: i32 = 0
                     for i in 0..MAX_CONNS
-                        if conn_fds[i] == 0
+                        if not conn_fds[i].valid()
                             found_slot = i
                             break
 
                     if found_slot >= 0 and found_slot < MAX_CONNS
-                        conn_fds[found_slot] = result
+                        conn_fds[found_slot] = fd_adopt(result)
                         active_conns += 1
 
                         # Submit recv (user_data is last param)
@@ -150,7 +151,8 @@ fn run_server(port: i32, max_handled: i32)
                                 ring.sqe_submit()
                             None => pass
                     else
-                        sys_close(result)
+                        var rejected: Fd = fd_adopt(result)
+                        rejected.close()
 
                 # Re-submit accept if we want more connections
                 if total_handled < max_handled
@@ -166,8 +168,7 @@ fn run_server(port: i32, max_handled: i32)
             else if op == OP_RECV
                 if result <= 0
                     # Client closed or error
-                    sys_close(conn_fds[slot])
-                    conn_fds[slot] = 0
+                    conn_fds[slot].close()
                     active_conns -= 1
                     total_handled += 1
                 else
@@ -176,15 +177,14 @@ fn run_server(port: i32, max_handled: i32)
                         Some(p) =>
                             let send_sqe: *IoUringSqe = p
                             let send_ud: i64 = encode_user_data(slot, OP_SEND)
-                            send_sqe.prep_send(conn_fds[slot], Span<u8> { ptr: conn_bufs[slot], len: result as i64 }, 0, send_ud)
+                            send_sqe.prep_send(conn_fds[slot].raw(), Span<u8> { ptr: conn_bufs[slot], len: result as i64 }, 0, send_ud)
                             ring.sqe_submit()
                         None => pass
 
             else if op == OP_SEND
                 if result < 0
                     # Send error
-                    sys_close(conn_fds[slot])
-                    conn_fds[slot] = 0
+                    conn_fds[slot].close()
                     active_conns -= 1
                     total_handled += 1
                 else
@@ -193,15 +193,14 @@ fn run_server(port: i32, max_handled: i32)
                         Some(p) =>
                             let next_recv: *IoUringSqe = p
                             let next_recv_ud: i64 = encode_user_data(slot, OP_RECV)
-                            next_recv.prep_recv(conn_fds[slot], Span<u8> { ptr: conn_bufs[slot], len: BUF_SIZE as i64 }, 0, next_recv_ud)
+                            next_recv.prep_recv(conn_fds[slot].raw(), Span<u8> { ptr: conn_bufs[slot], len: BUF_SIZE as i64 }, 0, next_recv_ud)
                             ring.sqe_submit()
                         None => pass
 
     # Cleanup
     for i in 0..MAX_CONNS
         free(conn_bufs[i])
-        if conn_fds[i] > 0
-            sys_close(conn_fds[i])
+        conn_fds[i].close()  # Ok and a no-op for a free slot
     free(conn_fds as *u8)
     free(conn_bufs as *u8)
 

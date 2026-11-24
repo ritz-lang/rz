@@ -10,6 +10,8 @@ import ritzlib.async.blocking_fs
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.os.env
+import ritzlib.fd { Fd, fd_open, O_CREAT, O_WRONLY, O_TRUNC }
+import ritzlib.fs { unlink }
 
 # Build "$TMPDIR/<stem>_<pid>.txt" into buf (>= 512 bytes, so stem <= 64
 # bytes) and return it NUL-terminated, the path sys_open3/sys_unlink take;
@@ -33,6 +35,11 @@ fn scratch_path(buf: *u8, stem: StrView) -> *u8
     itoa(sys_getpid() as i64, buf + n)
     strcat(buf, ".txt")
     buf
+
+# Delete a scratch file (`path` is the NUL-terminated buffer scratch_path
+# built, which the async_* calls take as is).
+fn remove_scratch(path: *u8)
+    unlink(strview_from_cstr(path))
 
 # Test 1: Async write and read back
 fn test_async_write_read() -> bool
@@ -71,17 +78,17 @@ fn test_async_write_read() -> bool
         Err(e) => -(e.code() as i64)
     if read_count != 7
         print("FAIL: read returned {read_count}\n")
-        sys_unlink(path)
+        remove_scratch(path)
         return false
 
     # Verify content
     if read_buf[0] != 72 or read_buf[1] != 101 or read_buf[2] != 108
         print("FAIL: content mismatch\n")
-        sys_unlink(path)
+        remove_scratch(path)
         return false
 
     # Cleanup
-    sys_unlink(path)
+    remove_scratch(path)
     print("OK\n")
     return true
 
@@ -100,18 +107,19 @@ fn test_async_open_read_close() -> bool
     # First create a test file
     var path_buf: [512]u8
     let path: *u8 = scratch_path(@path_buf[0], "ritz_async_test2")
-    let fd: i32 = sys_open3(path, O_CREAT | O_WRONLY | O_TRUNC, 420)
-    if fd < 0
-        print("FAIL: couldn't create test file\n")
-        return false
+    var f: Fd = match fd_open(strview_from_cstr(path), O_CREAT | O_WRONLY | O_TRUNC, 420)
+        Ok(opened) => opened
+        Err(_) =>
+            print("FAIL: couldn't create test file\n")
+            return false
 
     var data: [8]u8
     data[0] = 84   # T
     data[1] = 101  # e
     data[2] = 115  # s
     data[3] = 116  # t
-    sys_write(fd, @data[0], 4)
-    sys_close(fd)
+    f.write(Span<u8> { ptr: @data[0], len: 4 })
+    f.close()
 
     # Now read it with async functions
     var buf: [100]u8
@@ -123,15 +131,15 @@ fn test_async_open_read_close() -> bool
     let n: i64 = await read_small_file(path, @buf[0])
     if n != 4
         print("FAIL: expected 4 bytes, got {n}\n")
-        sys_unlink(path)
+        remove_scratch(path)
         return false
 
     if buf[0] != 84 or buf[1] != 101 or buf[2] != 115 or buf[3] != 116
         print("FAIL: content mismatch\n")
-        sys_unlink(path)
+        remove_scratch(path)
         return false
 
-    sys_unlink(path)
+    remove_scratch(path)
     print("OK\n")
     return true
 

@@ -26,6 +26,7 @@ import ritzlib.option
 import ritzlib.result
 import ritzlib.strview
 import ritzlib.argspec
+import ritzlib.fd { Fd, fd_open, fd_stdin, fd_stdout, O_RDONLY }
 
 # ============================================================================
 # JSON Value Types
@@ -352,34 +353,28 @@ fn parse_value(p: *JsonParser) -> i32
 # File reading
 # ============================================================================
 
-fn read_file(path: *u8, buf: *Vec<u8>) -> i32
-    let fd: i32 = sys_open(path, 0)  # O_RDONLY
-    if fd < 0
-        return -1
-
+# Append everything `f` yields until EOF to `buf`: 0, or -1 on a read error.
+fn read_all_into(f: @Fd, buf: *Vec<u8>) -> i32
     var tmp: [4096]u8
-    while 1 == 1
-        let n: i64 = sys_read(fd, @tmp[0], 4096)
-        if n < 0
-            sys_close(fd)
-            return -1
-        if n == 0
-            break
-        buf.push_span(Span<u8> { ptr: (@tmp[0]), len: (n) as i64 })
+    loop
+        match f.read(Span<u8> { ptr: @tmp[0], len: 4096 })
+            Ok(n) =>
+                if n == 0
+                    return 0
+                buf.push_span(Span<u8> { ptr: (@tmp[0]), len: n })
+            Err(_) => return -1
 
-    sys_close(fd)
-    return 0
+fn read_path_into(path: StrView, buf: *Vec<u8>) -> i32
+    match fd_open(path, O_RDONLY, 0)
+        Ok(opened) =>
+            var f: Fd = opened
+            let rc: i32 = read_all_into(@f, buf)
+            f.close()
+            rc
+        Err(_) => -1
 
 fn read_stdin(buf: *Vec<u8>) -> i32
-    var tmp: [4096]u8
-    while 1 == 1
-        let n: i64 = sys_read(0, @tmp[0], 4096)
-        if n < 0
-            return -1
-        if n == 0
-            break
-        buf.push_span(Span<u8> { ptr: (@tmp[0]), len: (n) as i64 })
-    return 0
+    read_all_into(@fd_stdin(), buf)
 
 # ============================================================================
 # Main
@@ -403,17 +398,15 @@ fn flag_i32(b: bool) -> i32
         return 1
     0
 
-# Read FILE (a view of an argv string, so NUL-terminated, as read_file
-# needs), or stdin when there is none.  Returns 1 after reporting a failure.
+# Read FILE, or stdin when there is none.  Returns 1 after reporting a failure.
 fn read_input(file: Option<StrView>, input: *Vec<u8>) -> i32
     match file
         Some(f) => read_path(f, input)
         None => read_stdin_or_report(input)
 
 fn read_path(file: StrView, input: *Vec<u8>) -> i32
-    let path: *u8 = file.as_cstr_unchecked()
-    if read_file(path, input) != 0
-        eprint("json: cannot read file: {path}\n")
+    if read_path_into(file, input) != 0
+        eprint("json: cannot read file: {file}\n")
         return 1
     0
 
@@ -453,8 +446,9 @@ fn json(p: @ParsedArgs) -> i32
 
     # Output result
     if validate_only == 0
-        sys_write(1, output.data, output.len)
-        sys_write(1, c"\n", 1)
+        let out: Fd = fd_stdout()
+        out.write(Span<u8> { ptr: output.data, len: output.len })
+        out.write_str("\n")
 
     # Drop is automatic via RAII
     return 0

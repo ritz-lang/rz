@@ -26,6 +26,7 @@ import ritzlib.str
 import ritzlib.strview
 import ritzlib.result
 import ritzlib.fs
+import ritzlib.fd { Fd, fd_open }
 import ritzlib.string
 import ritzlib.option
 import ritzlib.span
@@ -65,7 +66,7 @@ fn print_int_width(n: i64, width: i32)
         print(" ")
         spaces -= 1
 
-    sys_write(STDOUT, @buf[0], len)
+    prints(StrView { ptr: @buf[0], len: len })
 
 # Format a number into a buffer, returns length
 # Decimal of val into buf (>= 20 bytes); ritzlib.fmt (AGAST #4118).
@@ -172,7 +173,7 @@ fn print_mode(mode: i32)
     else
         buf[9] = 45   # '-'
 
-    sys_write(STDOUT, @buf[0], 10)
+    prints(StrView { ptr: @buf[0], len: 10 })
 
 # ============================================================================
 # Entry sorting (simple insertion sort on names)
@@ -247,14 +248,14 @@ fn print_long_entry(name: *u8, st: @Stat, opts: *LsOptions)
 fn print_unstatable_entry(name: *u8)
     print("?????????? ??? ???????? {name}")
 
-fn list_entry(dir: *u8, name: *u8, d_type: i32, opts: *LsOptions)
+fn list_entry(dir: StrView, name: *u8, d_type: i32, opts: *LsOptions)
     # Skip hidden files unless -a
     if opts.show_all == 0 and *name == '.'  # '.'
         return
 
     if opts.long_list != 0
         # Build full path for stat
-        var path: String = path_join(strview_from_cstr(dir), strview_from_cstr(name))
+        var path: String = path_join(dir, strview_from_cstr(name))
 
         # Get file info
         var info: Result<Stat, Errno> = lstat(path.as_view())
@@ -302,8 +303,8 @@ fn store_entry(entries: *DirEntries, e: @DirEntry)
     entries.names_len = entries.names_len + name_len + 1
     entries.count = entries.count + 1
 
-fn list_directory(path: *u8, opts: *LsOptions, show_dirname: i32) -> i32
-    var dir: DirIter = match dir_open(strview_from_cstr(path))
+fn list_directory(path: StrView, opts: *LsOptions, show_dirname: i32) -> i32
+    var dir: DirIter = match dir_open(path)
         Ok(d) => d
         Err(_) =>
             print("ls: cannot access '{path}'\n")
@@ -368,11 +369,15 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Positional i as a C string.  A positional is always a whole argv entry, so
-# its view ends at argv's NUL and .ptr is a valid C string.
-fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
-    let v: StrView = pos.get(i)
-    v.ptr
+# Whether `path` opens as a directory (open(2) with O_DIRECTORY): an
+# unreadable directory does not, and is printed as a plain name.
+fn opens_as_dir(path: StrView) -> bool
+    match fd_open(path, O_RDONLY + O_DIRECTORY, 0)
+        Ok(opened) =>
+            var f: Fd = opened
+            f.close()
+            true
+        Err(_) => false
 
 fn ls(p: @ParsedArgs) -> i32
     var opts: LsOptions
@@ -389,10 +394,10 @@ fn ls(p: @ParsedArgs) -> i32
 
     if num_paths == 0
         # List current directory
-        result = list_directory(c".", @opts, 0)
+        result = list_directory(".", @opts, 0)
     else if num_paths == 1
         # Single path
-        let path: *u8 = positional_cstr(@pos, 0)
+        let path: StrView = pos.get(0)
 
         # Check if it's a file or directory
         if opts.dir_only != 0
@@ -400,9 +405,7 @@ fn ls(p: @ParsedArgs) -> i32
             print("{path}\n")
         else
             # Try as directory first
-            let fd: i32 = sys_open(path, O_DIRECTORY)
-            if fd >= 0
-                sys_close(fd)
+            if opens_as_dir(path)
                 result = list_directory(path, @opts, 0)
             else
                 # Must be a file, just print it
@@ -410,7 +413,7 @@ fn ls(p: @ParsedArgs) -> i32
     else
         # Multiple paths - show each with header
         for i in 0..num_paths
-            let path: *u8 = positional_cstr(@pos, i)
+            let path: StrView = pos.get(i)
 
             if i > 0
                 print("\n")  # Blank line between

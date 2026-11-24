@@ -28,6 +28,9 @@ import ritzlib.span
 import ritzlib.fmt
 import ritzlib.os.env
 import ritzlib.process
+import ritzlib.fd { Fd, fd_open, fd_stdout }
+import ritzlib.fs { access }
+import ritzlib.result
 import ritzlib.gvec
 
 # ============================================================================
@@ -64,24 +67,22 @@ fn print_error_ln(msg: StrView)
     eprint("{msg}\n")
 
 # err2-style helper for diagnostics with an embedded path.
-fn nohup_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
+fn nohup_err2(prefix: StrView, path: StrView, suffix: StrView) -> i32
     eprint("{prefix}{path}{suffix}\n")
     return 1
 
-fn open_nohup_out() -> i32
+fn open_nohup_out() -> Result<Fd, Errno>
     # Try to open nohup.out in current directory
     # Create with mode 0600 (owner read/write only)
     let flags: i32 = O_WRONLY | O_CREAT | O_APPEND
     let mode: i32 = S_IRUSR | S_IWUSR   # 0600
-    let fd: i32 = sys_open3(c"nohup.out", flags, mode)
-
-    if fd >= 0
-        eprint("nohup: appending output to 'nohup.out'\n")
-        return fd
-
-    # If current directory failed, try $HOME/nohup.out
-    # For simplicity, we just fail if current dir doesn't work
-    return -1
+    # If current directory failed, we could try $HOME/nohup.out; for
+    # simplicity, we just fail if current dir doesn't work
+    match fd_open("nohup.out", flags, mode)
+        Ok(f) =>
+            eprint("nohup: appending output to 'nohup.out'\n")
+            Ok(f)
+        Err(e) => Err(e)
 
 # Run `cmd` found through ritzlib.process's find_command (AGAST #1481):
 # $PATH, or the standard directories when it is unset or empty, as
@@ -91,8 +92,10 @@ fn exec_from_path(cmd: StrView, exec_args: **u8) -> i32
     match find_command(cmd)
         Some(path) =>
             var full: String = path
+            # Raw execve: argv[0] stays the name as typed (process.exec
+            # would make it the resolved path).
             sys_execve(full.as_ptr(), exec_args, env_raw_envp())
-            nohup_err2("nohup: failed to run '", full.as_ptr(), "'")
+            nohup_err2("nohup: failed to run '", full.as_view(), "'")
             EXIT_CANNOT_INVOKE
         None => 0
 
@@ -126,21 +129,21 @@ pub fn main(args: Span<StrView>) -> i32
 
     # If stdout is a terminal, redirect to nohup.out
     if isatty(STDOUT) != 0
-        let out_fd: i32 = open_nohup_out()
-        if out_fd < 0
-            print_error_ln("nohup: failed to open 'nohup.out'")
-            return EXIT_NOHUP_FAILURE
+        var out: Fd = match open_nohup_out()
+            Ok(f) => f
+            Err(_) =>
+                print_error_ln("nohup: failed to open 'nohup.out'")
+                return EXIT_NOHUP_FAILURE
         # Redirect stdout to nohup.out
-        sys_dup2(out_fd, STDOUT)
-        sys_close(out_fd)
+        out.dup_to(STDOUT)
+        out.close()
 
     # If stderr is a terminal, redirect to stdout
     if isatty(STDERR) != 0
-        sys_dup2(STDOUT, STDERR)
+        fd_stdout().dup_to(STDERR)
 
     # Get the command to execute (args[1])
-    let cmd_sv: StrView = args[1]
-    let cmd: *u8 = cmd_sv.ptr
+    let cmd: StrView = args[1]
 
     # Build argv for execve: args[1], args[2], ..., NULL
     var child_argv: Vec<*u8> = exec_argv(args)
@@ -148,20 +151,21 @@ pub fn main(args: Span<StrView>) -> i32
 
     # Execute the command
     # A name with a '/' is a path; anything else is searched for.
-    if cmd_sv.find_byte('/') == cmd_sv.len
-        let rc: i32 = exec_from_path(cmd_sv, new_args)
+    if cmd.find_byte('/') == cmd.len
+        let rc: i32 = exec_from_path(cmd, new_args)
         if rc != 0
             return rc
 
     # If we have a path with slash or PATH search failed, try direct exec
-    sys_execve(cmd, new_args, env_raw_envp())
+    # (argv[0] = cmd, as typed)
+    exec(cmd, args.from(2))
 
     # If we get here, execve failed.
-    if sys_access(cmd, F_OK) != 0
+    if access(cmd, F_OK).is_err()
         nohup_err2("nohup: '", cmd, "': No such file or directory")
         return EXIT_NOT_FOUND
 
-    if sys_access(cmd, X_OK) != 0
+    if access(cmd, X_OK).is_err()
         nohup_err2("nohup: '", cmd, "': Permission denied")
         return EXIT_CANNOT_INVOKE
 

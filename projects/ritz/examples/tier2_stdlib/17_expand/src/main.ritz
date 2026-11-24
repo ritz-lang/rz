@@ -26,6 +26,7 @@ import ritzlib.strview
 import ritzlib.span
 import ritzlib.argspec
 import ritzlib.fmt
+import ritzlib.fd { Fd, fd_open, fd_adopt, fd_stdin, fd_stdout, O_RDONLY }
 
 # ============================================================================
 # Options
@@ -39,7 +40,7 @@ struct ExpandOptions
 # Processing
 # ============================================================================
 
-fn process_fd(fd: i32, opts: *ExpandOptions) -> i32
+fn process_fd(f: @Fd, opts: *ExpandOptions) -> i32
     var buf: [4096]u8
     var outbuf: [8192]u8  # Larger to handle tab expansion
     var out_len: i64 = 0
@@ -47,7 +48,9 @@ fn process_fd(fd: i32, opts: *ExpandOptions) -> i32
     var at_line_start: i32 = 1 # Are we at the start of a line?
 
     loop
-        let n: i64 = sys_read(fd, @buf[0], 4096)
+        let n: i64 = match f.read(Span<u8> { ptr: @buf[0], len: 4096 })
+            Ok(k) => k
+            Err(_) => -1
         if n < 0
             return 1
         if n == 0
@@ -75,7 +78,7 @@ fn process_fd(fd: i32, opts: *ExpandOptions) -> i32
 
                         # Flush if buffer getting full
                         if out_len >= 8000
-                            sys_write(STDOUT, @outbuf[0], out_len)
+                            fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_len })
                             out_len = 0
                 else
                     # Keep literal tab
@@ -100,14 +103,14 @@ fn process_fd(fd: i32, opts: *ExpandOptions) -> i32
 
             # Flush if buffer getting full
             if out_len >= 8000
-                sys_write(STDOUT, @outbuf[0], out_len)
+                fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_len })
                 out_len = 0
 
             i += 1
 
     # Flush remaining
     if out_len > 0
-        sys_write(STDOUT, @outbuf[0], out_len)
+        fd_stdout().write_all(Span<u8> { ptr: @outbuf[0], len: out_len })
 
     return 0
 
@@ -128,17 +131,18 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Expand one FILE (a view of an argv string: NUL-terminated, as sys_open
-# needs).  Returns 1 on failure.
+# Expand one FILE.  Returns 1 on failure.
 fn expand_path(path: StrView, opts: *ExpandOptions) -> i32
-    let fd: i32 = sys_open(path.as_cstr_unchecked(), O_RDONLY)
-    if fd < 0
-        sys_write(STDERR, c"expand: cannot open file\n" as *u8, 25)
-        return 1
+    var file: Fd = fd_adopt(-1)
+    match fd_open(path, O_RDONLY, 0)
+        Ok(f) => file = f
+        Err(_) =>
+            eprints("expand: cannot open file\n")
+            return 1
     var status: i32 = 0
-    if process_fd(fd, opts) != 0
+    if process_fd(@file, opts) != 0
         status = 1
-    sys_close(fd)
+    file.close()
     status
 
 # Expand with tab stops every `width` columns; a width under 1 means the
@@ -157,7 +161,8 @@ fn expand(p: @ParsedArgs, width: i64) -> i32
 
     if files.len == 0
         # Read from stdin
-        if process_fd(STDIN, @opts) != 0
+        let input: Fd = fd_stdin()
+        if process_fd(@input, @opts) != 0
             exit_code = 1
     else
         var i: i64 = 0

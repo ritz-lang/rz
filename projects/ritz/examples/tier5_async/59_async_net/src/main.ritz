@@ -14,6 +14,10 @@ import ritzlib.uring
 import ritzlib.async.runtime
 import ritzlib.async_net
 import ritzlib.fmt
+import ritzlib.span
+import ritzlib.fd { Fd, fd_borrow }
+import ritzlib.process { fork, wait_pid }
+import ritzlib.time { sleep_ms }
 
 # ============================================================================
 # Test helpers
@@ -38,6 +42,23 @@ fn bound_port(sock: @Socket) -> i32
     match sock.local_port()
         Ok(p) => return p
         Err(_) => return -1
+
+# A connected client socket's read(2), as the byte count or -errno.  The
+# borrowed Fd reads into a caller's buffer; the Socket keeps ownership.
+fn sock_read(sock: @Socket, buf: Span<u8>) -> i64
+    let io: Fd = fd_borrow(sock.raw())
+    match io.read(buf)
+        Ok(n) => n
+        Err(e) => -(e.code() as i64)
+
+# fork(): 0 in the child, the child's pid in the parent, -1 if it failed.
+fn fork_pid() -> i32
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child => 0
+                Parent(pid) => pid
+        Err(_) => -1
 
 # ============================================================================
 # Test 1: Create and close a TCP socket
@@ -154,7 +175,7 @@ fn test_connect_localhost() -> i32
             return 1
 
     # Fork - child will connect, parent will accept
-    let pid: i32 = sys_fork()
+    let pid: i32 = fork_pid()
 
     if pid == 0
         # Child: connect to server
@@ -171,7 +192,7 @@ fn test_connect_localhost() -> i32
         msg[0] = 72  # 'H'
         msg[1] = 105 # 'i'
         msg[2] = 0
-        sys_write(client.raw(), @msg[0], 2)
+        client.send(Span<u8> { ptr: @msg[0], len: 2 })
 
         client.close()
         sys_exit(0)
@@ -187,11 +208,10 @@ fn test_connect_localhost() -> i32
 
         # Read the message
         var buf: [16]u8
-        let n: i64 = sys_read(client.raw(), @buf[0], 16)
+        let n: i64 = sock_read(@client, Span<u8> { ptr: @buf[0], len: 16 })
 
         # Wait for child
-        var status: i32 = 0
-        sys_wait4(pid, @status, 0, null)
+        wait_pid(pid)
 
         client.close()
         server.close()
@@ -235,16 +255,12 @@ fn test_async_accept() -> i32
     server.listen(1)
 
     # Fork - child connects
-    let pid: i32 = sys_fork()
+    let pid: i32 = fork_pid()
 
     if pid == 0
         # Child: connect
         # Small delay to let parent setup accept
-        var ts: [16]u8
-        let ts_ptr: *i64 = @ts[0] as *i64
-        *ts_ptr = 0           # seconds
-        *(ts_ptr + 1) = 10000000  # 10ms in nanoseconds
-        sys_nanosleep(@ts[0] as *i64, null)
+        sleep_ms(10)
 
         var client: Socket
         match socket_tcp()
@@ -258,8 +274,7 @@ fn test_async_accept() -> i32
         let accepted: Result<Socket, Errno> = runtime_accept(@&rt, @server)
 
         # Wait for child
-        var status: i32 = 0
-        sys_wait4(pid, @status, 0, null)
+        wait_pid(pid)
 
         var client: Socket = match accepted
             Ok(c) => c

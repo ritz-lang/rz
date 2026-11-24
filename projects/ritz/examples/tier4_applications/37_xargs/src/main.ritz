@@ -29,6 +29,9 @@ import ritzlib.gvec
 import ritzlib.result
 import ritzlib.argspec
 import ritzlib.fmt
+import ritzlib.fd { fd_stdin }
+import ritzlib.fs { access }
+import ritzlib.process { ProcessResult, fork, wait_pid }
 
 # ============================================================================
 # Constants
@@ -50,57 +53,49 @@ struct XargsOptions
 # Command execution
 # ============================================================================
 
-fn search_path(name: *u8, result: *u8) -> i32
+# Copy `src` into `dst` as a NUL-terminated C string (an execve path).
+fn copy_cstr(dst: *u8, src: StrView)
+    for i in 0..src.len
+        *(dst + i) = src.get(i)
+    *(dst + src.len) = 0
+
+fn search_path(name: StrView, result: *u8) -> i32
     # Search PATH for the given command name
-    # Copies the full path to result if found
+    # Copies the full path to result (NUL-terminated, for execve) if found
     # Returns 1 if found, 0 if not found
 
     # If name contains a /, use it directly
-    var i: i64 = 0
-    while *(name + i) != 0
-        if *(name + i) == '/'  # '/'
-            if sys_access(name, X_OK) == 0
-                strcpy(result, name)
-                return 1
-            return 0
-        i += 1
+    if name.find_byte('/') != name.len
+        if access(name, X_OK).is_ok()
+            copy_cstr(result, name)
+            return 1
+        return 0
 
     # Get PATH from environment.  Unset and empty both search nothing.
     let path: StrView = env_get_or("PATH", "")
 
     var pos: i64 = 0
-    var path_buf: [4096]u8
 
     while pos < path.len
         # Extract next PATH component (up to ':' or end)
         var len: i64 = 0
         while pos + len < path.len and *(path.ptr + pos + len) != 58  # ':'
-            path_buf[len] = *(path.ptr + pos + len)
+            *(result + len) = *(path.ptr + pos + len)
             len += 1
 
-        path_buf[len] = 0  # Null terminate
-
         # Build full path: dir/name
-        var j: i64 = 0
-        while j < len
-            *(result + j) = path_buf[j]
-            j += 1
+        var j: i64 = len
 
         # Add '/' separator
         *(result + j) = 47  # '/'
         j += 1
 
         # Add command name
-        var k: i64 = 0
-        while *(name + k) != 0
-            *(result + j) = *(name + k)
-            j += 1
-            k += 1
-
-        *(result + j) = 0  # Null terminate
+        copy_cstr(result + j, name)
+        j += name.len
 
         # Check if executable
-        if sys_access(result, X_OK) == 0
+        if access(StrView { ptr: result, len: j }, X_OK).is_ok()
             return 1
 
         # Move to next PATH component
@@ -110,34 +105,39 @@ fn search_path(name: *u8, result: *u8) -> i32
 
     return 0
 
+# WEXITSTATUS of a reaped child: its exit code, or 0 for a signal death
+# (whose wait status has no exit byte).
+fn wait_exit_status(r: @ProcessResult) -> i32
+    if r.signaled != 0
+        return 0
+    return r.exit_code
+
 fn run_command(cmd_path: *u8, args: **u8) -> i32
     # Fork and exec the command
     # Returns the exit status of the child process
 
-    let pid: i32 = sys_fork()
-
-    if pid < 0
-        eprint("xargs: fork failed\n")
-        return 1
-
-    if pid == 0
-        # Child process
-        let result: i32 = sys_execve(cmd_path, args, env_raw_envp())
-        # If we get here, execve failed
-        eprint("xargs: execve failed\n")
-        sys_exit(127)
+    let pid: i32 = match fork()
+        Ok(fr) =>
+            match fr
+                Child =>
+                    # Raw execve: argv is the caller's stack array, and
+                    # nothing may allocate between fork and exec.
+                    sys_execve(cmd_path, args, env_raw_envp())
+                    # If we get here, execve failed
+                    eprint("xargs: execve failed\n")
+                    sys_exit(127)
+                    127
+                Parent(child) => child
+        Err(_) =>
+            eprint("xargs: fork failed\n")
+            return 1
 
     # Parent process - wait for child
-    var status: i32 = 0
-    let wait_result: i32 = sys_wait4(pid, @status, 0, null)
-
-    if wait_result < 0
-        eprint("xargs: wait failed\n")
-        return 1
-
-    # Extract exit status from wait status
-    # On Linux, WEXITSTATUS is (status >> 8) & 0xff
-    return (status / 256) & 255
+    match wait_pid(pid)
+        Ok(r) => wait_exit_status(@r)
+        Err(_) =>
+            eprint("xargs: wait failed\n")
+            1
 
 # ============================================================================
 # Input parsing
@@ -241,12 +241,12 @@ fn xargs(p: @ParsedArgs, max_args: i64) -> i32
     opts.max_args = max_args as i32
 
     # Get command and initial args
-    var cmd: *u8 = c"echo"
+    var cmd: StrView = "echo"
     var cmd_args_start: i64 = 0
 
     let cmd_pos = p.positionals()
     if cmd_pos.len > 0
-        cmd = positional_cstr(@cmd_pos, 0)
+        cmd = cmd_pos.get(0)
         cmd_args_start = 1
 
     # Find the command in PATH
@@ -260,7 +260,9 @@ fn xargs(p: @ParsedArgs, max_args: i64) -> i32
     var total_read: i64 = 0
 
     while total_read < BUF_SIZE - 1
-        let n: i64 = sys_read(STDIN, @input_buf[0] + total_read, BUF_SIZE - 1 - total_read)
+        let n: i64 = match fd_stdin().read(Span<u8> { ptr: @input_buf[0] + total_read, len: BUF_SIZE - 1 - total_read })
+            Ok(got) => got
+            Err(_) => 0
         if n <= 0
             break
         total_read += n

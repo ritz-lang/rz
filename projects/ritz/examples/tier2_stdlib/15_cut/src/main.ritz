@@ -35,6 +35,7 @@ import ritzlib.strview
 import ritzlib.span
 import ritzlib.argspec
 import ritzlib.fmt
+import ritzlib.fd { Fd, fd_open, fd_adopt, fd_stdin, fd_stdout, O_RDONLY }
 
 # ============================================================================
 # Options struct
@@ -269,13 +270,15 @@ fn process_line(line: *u8, len: i64, opts: *CutOptions, outbuf: @&Vec<u8>)
 # File processing
 # ============================================================================
 
-fn process_fd(fd: i32, opts: *CutOptions) -> i32
+fn process_fd(f: @Fd, opts: *CutOptions) -> i32
     var buf: Vec<u8> = vec_with_cap<u8>(4096)
     var linebuf: Vec<u8> = vec_with_cap<u8>(1024)
     var outbuf: Vec<u8> = vec_with_cap<u8>(1024)
 
     loop
-        let n: i64 = sys_read(fd, buf.data, buf.cap)
+        let n: i64 = match f.read(Span<u8> { ptr: buf.data, len: buf.cap })
+            Ok(k) => k
+            Err(_) => -1
         if n < 0
             return 1
         if n == 0
@@ -293,7 +296,7 @@ fn process_fd(fd: i32, opts: *CutOptions) -> i32
 
                 # Flush output
                 if outbuf.len > 0
-                    sys_write(STDOUT, outbuf.data, outbuf.len)
+                    fd_stdout().write_all(Span<u8> { ptr: outbuf.data, len: outbuf.len })
                     outbuf.clear()
 
                 linebuf.clear()
@@ -304,7 +307,7 @@ fn process_fd(fd: i32, opts: *CutOptions) -> i32
     if linebuf.len > 0
         process_line(linebuf.data, linebuf.len, opts, @&outbuf)
         if outbuf.len > 0
-            sys_write(STDOUT, outbuf.data, outbuf.len)
+            fd_stdout().write_all(Span<u8> { ptr: outbuf.data, len: outbuf.len })
 
     return 0
 
@@ -347,17 +350,18 @@ fn first_byte(s: StrView) -> u8
         return s.get(0)
     0
 
-# Cut one FILE (a view of an argv string: NUL-terminated, as sys_open needs).
-# Returns 1 on failure.
+# Cut one FILE.  Returns 1 on failure.
 fn cut_path(path: StrView, opts: *CutOptions) -> i32
-    let fd: i32 = sys_open(path.as_cstr_unchecked(), O_RDONLY)
-    if fd < 0
-        eprint("cut: cannot open file\n")
-        return 1
+    var file: Fd = fd_adopt(-1)
+    match fd_open(path, O_RDONLY, 0)
+        Ok(f) => file = f
+        Err(_) =>
+            eprint("cut: cannot open file\n")
+            return 1
     var status: i32 = 0
-    if process_fd(fd, opts) != 0
+    if process_fd(@file, opts) != 0
         status = 1
-    sys_close(fd)
+    file.close()
     status
 
 fn cut(p: @ParsedArgs) -> i32
@@ -405,7 +409,8 @@ fn cut(p: @ParsedArgs) -> i32
 
     if files.len == 0
         # Read from stdin
-        if process_fd(STDIN, @opts) != 0
+        let input: Fd = fd_stdin()
+        if process_fd(@input, @opts) != 0
             exit_code = 1
     else
         var i: i64 = 0

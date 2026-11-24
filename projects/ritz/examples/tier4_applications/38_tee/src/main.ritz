@@ -30,10 +30,11 @@ import ritzlib.span
 import ritzlib.fmt
 import ritzlib.gvec
 import ritzlib.argspec
+import ritzlib.fd { Fd, fd_open, fd_stdin, fd_stdout }
 
 # Diagnostic helper — see 24_cp.  StrView prefix/suffix for fixed
-# message text; *u8 path comes from argv.
-fn tee_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
+# message text; the path comes from argv.
+fn tee_err2(prefix: StrView, path: StrView, suffix: StrView) -> i32
     eprint("{prefix}{path}{suffix}\n")
     return 1
 
@@ -43,21 +44,6 @@ fn tee_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
 
 const BUF_SIZE: i64 = 4096
 const MAX_FILES: i32 = 64
-
-# ============================================================================
-# Helper functions
-# ============================================================================
-
-# Write all bytes to a file descriptor
-# Returns 0 on success, -1 on error
-fn write_all(fd: i32, buf: *u8, count: i64) -> i32
-    var written: i64 = 0
-    while written < count
-        let n: i64 = sys_write(fd, buf + written, count - written)
-        if n < 0
-            return -1
-        written += n
-    return 0
 
 # ============================================================================
 # Main
@@ -75,23 +61,17 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Positional i as a C string.  A positional is always a whole argv entry, so
-# its view ends at argv's NUL and .ptr is a valid C string.
-fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
-    let v: StrView = pos.get(i)
-    v.ptr
-
 fn tee(p: @ParsedArgs) -> i32
     let append_mode: i32 = p.switch("append") as i32
 
     # Open output files
-    var fds: [64]i32  # MAX_FILES
+    var files: [64]Fd  # MAX_FILES
     var num_fds: i32 = 0
     var exit_code: i32 = 0
 
     let pos = p.positionals()
     for i in 0..pos.len
-        let path: *u8 = positional_cstr(@pos, i)
+        let path: StrView = pos.get(i)
 
         # Determine flags for open
         var flags: i32 = O_WRONLY | O_CREAT
@@ -102,22 +82,23 @@ fn tee(p: @ParsedArgs) -> i32
 
         # Open with mode 0644 (rw-r--r--)
         let mode: i32 = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH
-        let fd: i32 = sys_open3(path, flags, mode)
-
-        if fd < 0
-            tee_err2("tee: ", path, ": cannot open file")
-            exit_code = 1
-        else
-            if num_fds < MAX_FILES
-                fds[num_fds] = fd
-                num_fds += 1
+        match fd_open(path, flags, mode)
+            Ok(opened) =>
+                if num_fds < MAX_FILES
+                    files[num_fds] = opened
+                    num_fds += 1
+            Err(_) =>
+                tee_err2("tee: ", path, ": cannot open file")
+                exit_code = 1
 
     # Read from stdin, write to stdout and all files
     var buf: [4096]u8  # Stack-allocated buffer (idiomatic Ritz)
 
     var done: i32 = 0
     while done == 0
-        let n: i64 = sys_read(STDIN, @buf[0], BUF_SIZE)
+        let n: i64 = match fd_stdin().read(Span<u8> { ptr: @buf[0], len: BUF_SIZE })
+            Ok(got) => got
+            Err(_) => -1
 
         if n < 0
             eprint("tee: read error\n")
@@ -128,7 +109,8 @@ fn tee(p: @ParsedArgs) -> i32
             done = 1
         else
             # Write to stdout
-            if write_all(STDOUT, @buf[0], n) < 0
+            let chunk: Span<u8> = Span<u8> { ptr: @buf[0], len: n }
+            if fd_stdout().write_all(chunk).is_err()
                 eprint("tee: write error\n")
                 exit_code = 1
                 done = 1
@@ -136,13 +118,13 @@ fn tee(p: @ParsedArgs) -> i32
             # Write to all output files
             if done == 0
                 for j in 0..num_fds
-                    if write_all(fds[j], @buf[0], n) < 0
+                    if files[j].write_all(chunk).is_err()
                         eprint("tee: write error\n")
                         exit_code = 1
 
     # Close all output files
     for k in 0..num_fds
-        sys_close(fds[k])
+        files[k].close()
 
     return exit_code
 
