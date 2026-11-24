@@ -10,7 +10,8 @@
 #   wait for `rzsh> `, then type
 #     echo hi          -> hi
 #     pwd              -> /
-#     ls /bin          -> lists rzsh, cat and init
+#     cd /bin; ls      -> lists rzsh, cat and init in columns
+#     ls -1            -> lists /bin one name per line in sorted order
 #     cat /etc/motd    -> Welcome to Harland! (a spawned program)
 #     echo after-cat   -> after-cat (the shell survives a child's exit)
 #     exit             -> Goodbye!, "[init] Shell exited", "[exit] init

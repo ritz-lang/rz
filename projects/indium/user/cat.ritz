@@ -1,90 +1,51 @@
-# cat - Concatenate and display files
-#
-# Usage: cat [file...]
-#
-# Reads files sequentially and writes them to stdout.
-# If no files specified, reads from stdin.
-
-import ritzlib.sys {
-    sys_read, sys_write, sys_exit, sys_open, sys_close,
-    O_RDONLY, STDIN, STDOUT, STDERR
-}
+# Concatenate files, using stdin for an operand of "-" or an empty operand list.
+import ritzlib.errno { errno_from_raw, errno_write }
+import ritzlib.io { eprints }
+import ritzlib.span { Span, span_from_ptr }
 import ritzlib.strview { StrView }
+import ritzlib.sys { sys_close, O_RDONLY, STDIN, STDOUT, STDERR }
+import tool_io { open_path, read_bytes, write_bytes }
 
-# Print error message
-fn print_error(msg: StrView)
-    sys_write(STDERR, msg.ptr, msg.len)
-
-fn print_error_path(prefix: StrView, path: StrView, suffix: StrView)
-    print_error(prefix)
-    print_error(path)
-    print_error(suffix)
-
-# Cat a single file to stdout. `path` is an argv view: argv strings are
-# NUL-terminated, so its ptr opens as a path.
-fn cat_file(path: StrView) -> i32
-    let fd: i32 = sys_open(path.ptr, O_RDONLY)
-    if fd < 0
-        print_error_path("cat: ", path, ": No such file or directory\n")
-        return 1
-
-    var buf: [4096]u8
-    var status: i32 = 0
-
-    var reading: bool = true
-    while reading
-        let n: i64 = sys_read(fd, @buf[0], 4096)
-        if n > 0
-            sys_write(STDOUT, @buf[0], n)
-        else if n == 0
-            reading = false
-        else
-            print_error_path("cat: ", path, ": read error\n")
-            status = 1
-            reading = false
-
-    sys_close(fd)
-    return status
-
-# Cat stdin to stdout
-fn cat_stdin() -> i32
-    var buf: [4096]u8
-
-    var reading: bool = true
-    while reading
-        let n: i64 = sys_read(STDIN, @buf[0], 4096)
-        if n > 0
-            sys_write(STDOUT, @buf[0], n)
-        else if n == 0
-            reading = false
-        else
-            print_error("cat: stdin: read error\n")
+fn cat_stream(fd: i32, label: StrView) -> i32
+    var bytes: [4096]u8
+    let buffer: Span<u8> = span_from_ptr<u8>(@bytes[0], 4096)
+    loop
+        let count: i64 = read_bytes(fd, buffer)
+        if count == 0
+            return 0
+        if count < 0
+            eprints("cat: ")
+            eprints(label)
+            eprints(": read error\n")
+            return 1
+        if not write_bytes(STDOUT, buffer.slice(0, count))
+            eprints("cat: write error\n")
             return 1
 
-    return 0
+fn cat_file(path: StrView) -> i32
+    let fd: i32 = open_path(path, O_RDONLY)
+    if fd < 0
+        eprints("cat: ")
+        eprints(path)
+        eprints(": ")
+        errno_write(STDERR, errno_from_raw(fd))
+        eprints("\n")
+        return 1
+    defer sys_close(fd)
+    cat_stream(fd, path)
 
-# Main entry point.
 pub fn main(args: Span<StrView>) -> i32
-    # If no files specified, read from stdin
     if args.len <= 1
-        return cat_stdin()
+        return cat_stream(STDIN, "stdin")
 
     var status: i32 = 0
-    var i: i64 = 1
-
-    while i < args.len
-        let path: StrView = args[i]
-
-        # "-" means stdin
+    for index in 1..args.len
+        let path: StrView = args.get(index)
+        var result: i32
         if path.eq("-")
-            let result: i32 = cat_stdin()
-            if result != 0
-                status = result
+            result = cat_stream(STDIN, "stdin")
         else
-            let result: i32 = cat_file(path)
-            if result != 0
-                status = result
-
-        i = i + 1
-
-    return status
+            result = cat_file(path)
+        if result != 0
+            status = result
+    status

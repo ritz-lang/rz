@@ -3,7 +3,7 @@
 
 projects/harland/tools/test_shell_boot.sh boots the `make -C projects/indium
 shell` image (init_interactive as /bin/init) under OVMF, and
-tools/shell_session.py types a scripted session on COM1: echo, pwd, ls /bin,
+tools/shell_session.py types a scripted session on COM1: echo, pwd, cd /bin, ls,
 cat /etc/motd, a command after cat exits, then `exit`, which returns to
 init_interactive ("[init] Shell exited", #1882); init then exits and the VM
 powers off.
@@ -149,11 +149,12 @@ open(out, "wb").close()
 REPLIES = {
     "echo hi": "hi\n",
     "pwd": "/\n",
-    "ls /bin": "  cat\n  init\n  rzsh\n",
+    "ls": "cat   init  rzsh\n",
+    "ls -1": "cat\ninit\nrzsh\n",
     "cat /etc/motd": "Welcome to Harland!\n",
     "ping --help": "Usage: ping <host>\n",
     "ping 1.1.1.1": "ping: ICMP is unavailable from Harland userspace\n",
-    "ls /shell-fs-test": "child\n",
+    "ls -1 /shell-fs-test": "child\n",
     "echo after-cat": "after-cat\n",
 }
 # tty_session()'s commands (#4254), kept apart so the wrong-answer cases above

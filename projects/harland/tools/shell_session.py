@@ -51,6 +51,10 @@ def _lines(out: bytes) -> list[str]:
     return [ln.strip() for ln in text.split("\n")[1:]]
 
 
+def _listing(lines: list[str]) -> list[str]:
+    return [line for line in lines if line and not line.startswith("[mmap] ")]
+
+
 # (command, description, check(lines) -> bool). Each command's output is
 # what the guest sent between the typed line and the next prompt.
 SESSION = [
@@ -58,8 +62,16 @@ SESSION = [
      lambda ls: "hi" in ls),
     ("pwd", "pwd prints the root directory",
      lambda ls: "/" in ls),
-    ("ls /bin", "ls /bin lists rzsh, cat and init",
-     lambda ls: all(n in ls for n in ("rzsh", "cat", "init"))),
+    ("cd /bin", "changes the shell's working directory to /bin",
+     lambda ls: not any(line.startswith("cd:") for line in ls)),
+    ("ls", "lists /bin in columns after cd",
+     lambda ls: all(name in " ".join(_listing(ls)).split() for name in ("cat", "init", "rzsh"))
+     and any(len(line.split()) > 1 for line in _listing(ls))),
+    ("ls -1", "lists /bin one name per line in sorted order",
+     lambda ls: all(name in ls for name in ("cat", "init", "rzsh"))
+     and _listing(ls) == sorted(_listing(ls))),
+    ("cd /", "returns to the root directory",
+     lambda ls: not any(line.startswith("cd:") for line in ls)),
     ("cat /etc/motd", "/bin/cat (a spawned program) prints /etc/motd",
      lambda ls: "Welcome to Harland!" in ls
      and not any(line.startswith(("[spawn]", "[spawn_args]")) for line in ls)),
@@ -74,7 +86,7 @@ SESSION = [
      lambda ls: not any(line.startswith("cd:") for line in ls)),
     ("mkdir child", "creates a directory relative to the inherited cwd",
      lambda ls: not any(line.startswith("mkdir:") for line in ls)),
-    ("ls /shell-fs-test", "lists the new child directory",
+    ("ls -1 /shell-fs-test", "lists the new child directory",
      lambda ls: "child" in ls),
     ("cd /", "returns to the root directory",
      lambda ls: not any(line.startswith("cd:") for line in ls)),

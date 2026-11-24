@@ -24,7 +24,7 @@ import parse {
 }
 
 import os {
-    os_readdir, os_default_ls_path, os_default_path, os_spawn_search,
+    os_directory_names, os_stdout_is_terminal, os_default_path, os_spawn_search,
     os_has_fd_control, os_fork, os_pipe, os_dup, os_dup2, os_close,
     os_open_write, os_open_read, os_wait, os_chdir, os_getcwd,
     os_disable_raw_mode, os_tty_suspend, os_tty_resume, os_tty_window_probe
@@ -34,6 +34,7 @@ import ritzlib.sys { sys_exit }
 import rawio { err_str }
 import ritzlib.gvec
 import ritzlib.option
+import ritzlib.cmp { Ordering }
 import ritzlib.string
 import ritzlib.span { Span, span_from_vec }
 import ritzlib.strview { StrView }
@@ -115,26 +116,71 @@ fn cmd_unset(args: Span<StrView>) -> i32
         i = i + 1
     return 0
 
+# Default to the width of a conventional serial terminal.
+const LS_WIDTH: i64 = 80
+
 pub fn cmd_ls(args: Span<StrView>) -> i32
-    var path: StrView = os_default_ls_path()
-    if args.len > 1
-        path = args[1]
+    var columns: bool = os_stdout_is_terminal()
+    var arg: i64 = 1
+    while arg < args.len and args.get(arg).starts_with("-")
+        let option: StrView = args.get(arg)
+        arg += 1
+        if option.eq("--")
+            break
+        if option.eq("-1")
+            columns = false
+        else if option.eq("-C")
+            columns = true
+        else
+            err_str("ls: unknown option '")
+            err_str(option)
+            err_str("'\n")
+            return 2
+    if args.len - arg > 1
+        err_str("Usage: ls [-1|-C] [directory]\n")
+        return 2
 
-    var names: String = string_new()
-    if not os_readdir(path, @&names)
-        eputs3("ls: cannot access '", path, "'\n")
+    var path: StrView = "."
+    if arg < args.len
+        path = args.get(arg)
+    var entries: String = string_new()
+    var names: Vec<StrView> = vec_new<StrView>()
+    if not os_directory_names(path, @&entries, @&names)
+        err_str("ls: cannot access '")
+        err_str(path)
+        err_str("'\n")
         return 1
+    if names.is_empty()
+        return 0
 
-    # names is "a\0b\0...": one entry per NUL.
-    var rest: StrView = names.as_view()
-    while rest.len > 0
-        let end: i64 = rest.find_byte(0)
-        let entry: StrView = rest.take(end)
-        if entry.len > 0
-            puts("  ")
-            println(entry)
-        rest = rest.skip(end + 1)
+    var widest: i64 = 0
+    for position in 0..names.len
+        let name: StrView = names.get(position)
+        var index: i64 = position
+        while index > 0 and names.get(index - 1).cmp(name) == Ordering.Greater
+            names.swap(index - 1, index)
+            index -= 1
+        if name.len > widest
+            widest = name.len
 
+    let stride: i64 = widest + 2
+    var rows: i64 = names.len
+    if columns and stride <= LS_WIDTH
+        let per_row: i64 = LS_WIDTH / stride
+        rows = (names.len + per_row - 1) / per_row
+
+    # Fill columns top to bottom, as ls -C does.
+    let spaces: StrView = "                                                                                "
+    for row in 0..rows
+        var index: i64 = row
+        while index < names.len
+            let name: StrView = names.get(index)
+            print("{name}")
+            index += rows
+            if index < names.len
+                let padding: StrView = spaces.take(stride - name.len)
+                print("{padding}")
+        print("\n")
     return 0
 
 fn exec_external(args: Span<StrView>) -> i32
@@ -147,14 +193,20 @@ fn exec_external(args: Span<StrView>) -> i32
     os_tty_resume(was_raw)
     return status
 
-# The builtin `ls` takes only `ls [DIR]`; with options, the system's ls runs.
-fn has_option(args: Span<StrView>) -> bool
-    var i: i64 = 1
-    while i < args.len
-        if args[i].starts_with("-")
+# Linux can delegate richer options to its system ls.
+[[target_os = "linux"]]
+fn ls_uses_builtin(args: Span<StrView>) -> bool
+    for index in 1..args.len
+        let arg: StrView = args.get(index)
+        if arg.eq("--")
             return true
-        i = i + 1
-    return false
+        if arg.starts_with("-") and not arg.eq("-1") and not arg.eq("-C")
+            return false
+    return true
+
+[[target_os = "harland"]]
+fn ls_uses_builtin(args: Span<StrView>) -> bool
+    return true
 
 # Runs the command `args` (args[0] names it) as a builtin or external command.
 fn dispatch(args: Span<StrView>) -> i32
@@ -176,7 +228,7 @@ fn dispatch(args: Span<StrView>) -> i32
         return cmd_pid()
     if cmd.eq("echo")
         return cmd_echo(args)
-    if cmd.eq("ls") and not has_option(args)
+    if cmd.eq("ls") and ls_uses_builtin(args)
         return cmd_ls(args)
     if cmd.eq("clear")
         return cmd_clear()
