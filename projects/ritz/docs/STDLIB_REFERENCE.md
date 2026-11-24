@@ -2683,7 +2683,7 @@ struct Stopwatch
 | `t.elapsed_nanos()` | `fn() -> i64` | Get elapsed ns |
 | `t.elapsed_micros()` | `fn() -> i64` | Get elapsed us |
 | `t.elapsed_millis()` | `fn() -> i64` | Get elapsed ms |
-| `t.elapsed_secs_x1000()` | `fn() -> i64` | Named for seconds x1000, but returns the same value as `elapsed_micros()` (AGAST #4613) |
+| `t.elapsed_secs_x1000()` | `fn() -> i64` | Elapsed seconds x1000 (3 decimal places), truncated: the same value as `elapsed_millis()` |
 | `t.print()` | `fn() -> i32` | Print human-readable |
 
 **Stopwatch** (cumulative timing):
