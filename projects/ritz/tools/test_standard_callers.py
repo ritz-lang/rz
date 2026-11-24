@@ -53,7 +53,7 @@ PINS = {
     "spire": 85,
     "squeeze": 2,
     "tempest": 1,
-    "tome": 159,
+    "tome": 151,
     "valet": 96,
     "zeus": 76,
 }
