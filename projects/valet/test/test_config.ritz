@@ -8,6 +8,11 @@ import ritzlib.str
 import ritzlib.memory
 import ritzlib.fmt.digits { fmt_i64_into }
 
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.fd
+import ritzlib.fs { unlink }
+
 import lib.config
 
 # ============================================================================
@@ -266,15 +271,18 @@ fn test_config_load_from_file() -> i32
     let json_len: i64 = build_test_config_json(@json_buf[0])
 
     # Write to this process's own temp file (AGAST #4052: a fixed /tmp path
-    # races concurrent test runs) - O_WRONLY | O_CREAT | O_TRUNC = 577, 0644 = 420
+    # races concurrent test runs) - 0644 = 420
     var pathbuf: [128]u8
     let path: *u8 = pid_tmp_path(@pathbuf[0], c"config.json")
-    let fd: i32 = sys_open3(path, 577, 420)
-    if fd < 0
-        return 10  # FAIL: could not create temp file
-    let written: i64 = sys_write(fd, @json_buf[0], json_len)
-    sys_close(fd)
-    if written != json_len
+    var f: Fd = match fd_open(strview_from_cstr(path), O_WRONLY + O_CREAT + O_TRUNC, 420)
+        Ok(opened) => opened
+        Err(_) => return 10  # FAIL: could not create temp file
+    var write_ok: bool = true
+    match f.write_all(Span<u8> { ptr: @json_buf[0], len: json_len })
+        Ok(_) => pass
+        Err(_) => write_ok = false
+    f.close()
+    if not write_ok
         return 11  # FAIL: write error
 
     # Now test config_load
@@ -284,7 +292,7 @@ fn test_config_load_from_file() -> i32
     let ret: i32 = config_load(@cfg, path)
 
     # Clean up temp file
-    sys_unlink(path)
+    unlink(strview_from_cstr(path))
 
     if ret != 0
         return 1  # FAIL: file load should succeed

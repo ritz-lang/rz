@@ -42,6 +42,8 @@ import ritzlib.option
 import ritzlib.result
 import ritzlib.strview
 import ritzlib.json
+import ritzlib.fd
+import ritzlib.span
 
 # ============================================================================
 # Configuration struct
@@ -259,40 +261,44 @@ fn config_apply_root(cfg: *ValetConfig, root: *JsonValue) -> i32
 # Returns 0 on success, negative on error
 pub fn config_load(cfg: *ValetConfig, path: *u8) -> i32
     # Open file
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
-        let shown: StrView = strview_from_cstr(path)
-        eprint("config: cannot open {shown}\n")
-        return -1
+    var f: Fd = fd_adopt(-1)
+    match fd_open(strview_from_cstr(path), O_RDONLY, 0)
+        Ok(opened) => f = opened
+        Err(_) =>
+            let shown: StrView = strview_from_cstr(path)
+            eprint("config: cannot open {shown}\n")
+            return -1
 
     # Get file size
-    var statbuf: [144]u8
-    if sys_fstat(fd, @statbuf[0]) != 0
-        sys_close(fd)
-        let shown: StrView = strview_from_cstr(path)
-        eprint("config: cannot stat {shown}\n")
-        return -2
-
-    # Read file size from stat buffer (offset 48 = st_size)
-    let size: i64 = *((@statbuf[0] + 48) as *i64)
+    var size: i64 = 0
+    match f.stat()
+        Ok(st) => size = st.st_size
+        Err(_) =>
+            f.close()
+            let shown: StrView = strview_from_cstr(path)
+            eprint("config: cannot stat {shown}\n")
+            return -2
 
     if size > 65536
-        sys_close(fd)
+        f.close()
         eprints("config: file too large (max 64KB)\n")
         return -3
 
     # Allocate buffer
     let buf: *u8 = malloc(size + 1)
     if buf == null
-        sys_close(fd)
+        f.close()
         eprints("config: out of memory\n")
         return -4
 
     # Read file contents
-    let bytes_read: i64 = sys_read(fd, buf, size)
-    sys_close(fd)
+    var read_ok: bool = true
+    match f.read_exact(Span<u8> { ptr: buf, len: size })
+        Ok(_) => pass
+        Err(_) => read_ok = false
+    f.close()
 
-    if bytes_read != size
+    if not read_ok
         free(buf)
         eprints("config: read error\n")
         return -5

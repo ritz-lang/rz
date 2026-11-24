@@ -17,6 +17,9 @@ import ritzlib.strview
 import ritzlib.memory
 import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.async.tasks
+import ritzlib.fd
+import ritzlib.span
+import ritzlib.fs { mkdir, unlink, rmdir }
 
 import lib.request
 import lib.static
@@ -68,18 +71,21 @@ fn contains(hay: *u8, len: i32, needle: StrView) -> i32
 # Create the fixture tree: static_root()/<name> holding "hello\n", and
 # static_root()/dir/ for the directory listing.  0 on success.
 fn fixture(name: *u8) -> i32
-    sys_mkdir(static_root(), 493)                     # 0755; EEXIST is fine
+    mkdir(strview_from_cstr(static_root()), 493)      # 0755; EEXIST is fine
     var path: [256]u8
     under_root(c"dir", @path[0])
-    sys_mkdir(@path[0], 493)
+    mkdir(strview_from_cstr(@path[0]), 493)
     under_root(name, @path[0])
-    # O_WRONLY | O_CREAT | O_TRUNC = 577, mode 0644 = 420
-    let fd: i32 = sys_open3(@path[0], 577, 420)
-    if fd < 0
-        return 1
-    let n: i64 = sys_write(fd, c"hello\n", 6)
-    sys_close(fd)
-    if n != 6
+    # mode 0644 = 420
+    var f: Fd = match fd_open(strview_from_cstr(@path[0]), O_WRONLY + O_CREAT + O_TRUNC, 420)
+        Ok(opened) => opened
+        Err(_) => return 1
+    var write_ok: bool = true
+    match f.write_str("hello\n")
+        Ok(_) => pass
+        Err(_) => write_ok = false
+    f.close()
+    if not write_ok
         return 2
     0
 
@@ -88,16 +94,19 @@ fn fixture(name: *u8) -> i32
 fn teardown(name: *u8)
     var path: [256]u8
     under_root(name, @path[0])
-    sys_unlink(@path[0])
+    unlink(strview_from_cstr(@path[0]))
     under_root(c"dir", @path[0])
-    sys_rmdir(@path[0])
-    sys_rmdir(static_root())
+    rmdir(strview_from_cstr(@path[0]))
+    rmdir(strview_from_cstr(static_root()))
 
-# Drain `fd` into out[0..cap); returns bytes read.
-fn drain(fd: i32, out: *u8, cap: i32) -> i32
+# Drain `f` into out[0..cap); returns bytes read.
+fn drain(f: @Fd, out: *u8, cap: i32) -> i32
     var total: i32 = 0
     while total < cap
-        let n: i64 = sys_read(fd, out + total, (cap - total) as i64)
+        var n: i64 = 0
+        match f.read(Span<u8> { ptr: out + total, len: (cap - total) as i64 })
+            Ok(got) => n = got
+            Err(_) => n = -1
         if n <= 0
             break
         total += n as i32
@@ -126,14 +135,14 @@ fn static_reply(raw: StrView, count: i32, out: *u8, cap: i32) -> i32
     if valet_keep_alive(@req, task.request_count, app.keepalive_requests) == 0
         task.request_count = app.keepalive_requests
 
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return -2
-    task.fd = p[1]
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return -2
+    task.fd = p.write.raw()
     let handled: i32 = valet_try_static(@app, @task, req.path_ptr, req.path_len)
-    sys_close(p[1])
-    let n: i32 = drain(p[0], out, cap)
-    sys_close(p[0])
+    p.write.close()
+    let n: i32 = drain(@p.read, out, cap)
+    p.read.close()
     set_g_app(null)
     if handled != 1
         return -3
@@ -212,13 +221,13 @@ fn test_static_file_http11_keeps_alive() -> i32
 [[test]]
 fn test_static_304_connection_close_gets_close() -> i32
     var buf: [512]u8
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return 90
-    static_send_304(p[1], c"\"abc\"", 5, 0)
-    sys_close(p[1])
-    let n: i32 = drain(p[0], @buf[0], 512)
-    sys_close(p[0])
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 90
+    static_send_304(p.write.raw(), "\"abc\"", 0)
+    p.write.close()
+    let n: i32 = drain(@p.read, @buf[0], 512)
+    p.read.close()
     if contains(@buf[0], n, "304 Not Modified") != 1
         return 91
     says_close(@buf[0], n)
@@ -226,13 +235,13 @@ fn test_static_304_connection_close_gets_close() -> i32
 [[test]]
 fn test_static_304_keeps_alive() -> i32
     var buf: [512]u8
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return 90
-    static_send_304(p[1], c"\"abc\"", 5, 1)
-    sys_close(p[1])
-    let n: i32 = drain(p[0], @buf[0], 512)
-    sys_close(p[0])
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 90
+    static_send_304(p.write.raw(), "\"abc\"", 1)
+    p.write.close()
+    let n: i32 = drain(@p.read, @buf[0], 512)
+    p.read.close()
     if contains(@buf[0], n, "Connection: keep-alive\r\n\r\n") != 1
         return 1
     0
@@ -284,21 +293,22 @@ fn test_static_serve_file_close_and_keep_alive() -> i32
     var fpath: [256]u8
     under_root(c"f.txt", @fpath[0])
     var buf: [1024]u8
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return 91
-    static_serve_file(p[1], @fpath[0], 0)
-    sys_close(p[1])
-    var n: i32 = drain(p[0], @buf[0], 1024)
-    sys_close(p[0])
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 91
+    static_serve_file(p.write.raw(), @fpath[0], 0)
+    p.write.close()
+    var n: i32 = drain(@p.read, @buf[0], 1024)
+    p.read.close()
     if says_close(@buf[0], n) != 0
         return 1
-    if sys_pipe(@p[0]) != 0
-        return 92
-    static_serve_file(p[1], @fpath[0], 1)
-    sys_close(p[1])
-    n = drain(p[0], @buf[0], 1024)
-    sys_close(p[0])
+    p = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 92
+    static_serve_file(p.write.raw(), @fpath[0], 1)
+    p.write.close()
+    n = drain(@p.read, @buf[0], 1024)
+    p.read.close()
     if contains(@buf[0], n, "Connection: keep-alive\r\n\r\nhello\n") != 1
         return 2
     0

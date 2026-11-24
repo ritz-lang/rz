@@ -18,6 +18,8 @@ import ritzlib.fs
 import ritzlib.memory
 import ritzlib.fmt.digits
 import ritzlib.option
+import ritzlib.fd
+import ritzlib.span
 import ritzlib.strview { StrView, strview_from_cstr, strview_from_ptr }
 
 import lib.log
@@ -395,6 +397,15 @@ pub fn static_connection_header(buf: *u8, keep_alive: i32) -> i32
     return 19
 
 
+# One write(2) of `len` bytes at `p` to the socket `sock` (borrowed, never
+# closed here): the bytes written, or -errno, as callers expect.
+fn static_sock_write(sock: i32, p: *u8, len: i64) -> i64
+    let s: Fd = fd_borrow(sock)
+    match s.write(Span<u8> { ptr: p, len: len })
+        Ok(n) => return n
+        Err(e) => return -(e.code() as i64)
+
+
 # Serve a static file
 # fd: socket to write to
 # path: full filesystem path to file
@@ -402,21 +413,22 @@ pub fn static_connection_header(buf: *u8, keep_alive: i32) -> i32
 # Returns: bytes sent on success, negative on error
 pub fn static_serve_file(fd: i32, path: *u8, keep_alive: i32) -> i64
     # Open the file
-    let file_fd: i32 = sys_open(path, O_RDONLY)
-    if file_fd < 0
-        return -1  # File not found or permission denied
+    var file: Fd = match fd_open(strview_from_cstr(path), O_RDONLY, 0)
+        Ok(f) => f
+        Err(_) => return -1  # File not found or permission denied
 
     # Get file size using fstat
-    var statbuf: Stat
-    if sys_fstat2(file_fd, @&statbuf) != 0
-        sys_close(file_fd)
-        return -2
+    var statbuf: Stat = match file.stat()
+        Ok(st) => st
+        Err(_) =>
+            file.close()
+            return -2
 
     let file_size: i64 = statbuf.st_size
 
     # Check if it's a regular file
     if (statbuf.st_mode & S_IFMT) != S_IFREG
-        sys_close(file_fd)
+        file.close()
         return -3  # Not a regular file
 
     # Get MIME type
@@ -472,9 +484,9 @@ pub fn static_serve_file(fd: i32, path: *u8, keep_alive: i32) -> i64
     pos += 1
 
     # Send headers
-    let header_sent: i64 = sys_write(fd, @headers[0], pos as i64)
+    let header_sent: i64 = static_sock_write(fd, @headers[0], pos as i64)
     if header_sent < 0
-        sys_close(file_fd)
+        file.close()
         return header_sent
 
     # Send file content using sendfile (zero-copy)
@@ -483,7 +495,7 @@ pub fn static_serve_file(fd: i32, path: *u8, keep_alive: i32) -> i64
     var total_sent: i64 = 0
 
     while remaining > 0
-        let sent: i64 = sys_sendfile(fd, file_fd, @offset, remaining)
+        let sent: i64 = sys_sendfile(fd, file.raw(), @offset, remaining)
         if sent <= 0
             if sent < 0
                 log_error(c"sendfile failed")
@@ -491,7 +503,7 @@ pub fn static_serve_file(fd: i32, path: *u8, keep_alive: i32) -> i64
         remaining -= sent
         total_sent += sent
 
-    sys_close(file_fd)
+    file.close()
     return header_sent + total_sent
 
 
@@ -520,21 +532,22 @@ pub fn format_int64(buf: *u8, buf_size: i32, value: i64) -> i32
 # Returns: bytes sent on success, negative on error
 pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32, if_none_match: *u8, if_none_match_len: i32, keep_alive: i32) -> i64
     # Open the file
-    let file_fd: i32 = sys_open(path, O_RDONLY)
-    if file_fd < 0
-        return -1  # File not found or permission denied
+    var file: Fd = match fd_open(strview_from_cstr(path), O_RDONLY, 0)
+        Ok(f) => f
+        Err(_) => return -1  # File not found or permission denied
 
     # Get file size using fstat
-    var statbuf: Stat
-    if sys_fstat2(file_fd, @&statbuf) != 0
-        sys_close(file_fd)
-        return -2
+    var statbuf: Stat = match file.stat()
+        Ok(st) => st
+        Err(_) =>
+            file.close()
+            return -2
 
     let file_size: i64 = statbuf.st_size
 
     # Check if it's a regular file
     if (statbuf.st_mode & S_IFMT) != S_IFREG
-        sys_close(file_fd)
+        file.close()
         return -3  # Not a regular file
 
     # Generate ETag from file metadata
@@ -544,9 +557,9 @@ pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32
     # Check If-None-Match for conditional request
     if if_none_match != null && if_none_match_len > 0
         if etag_matches(if_none_match, if_none_match_len, @etag_buf[0], etag_len) != 0
-            sys_close(file_fd)
+            file.close()
             # Return 304 Not Modified
-            return static_send_304(fd, @etag_buf[0], etag_len, keep_alive)
+            return static_send_304(fd, strview_from_ptr(@etag_buf[0], etag_len as i64), keep_alive)
 
     # Parse range if provided
     var send_start: i64 = 0
@@ -556,7 +569,7 @@ pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32
     if range_hdr != null && range_len > 0
         let range: RangeResult = parse_range(range_hdr, range_len, file_size)
         if range.valid == RANGE_UNSATISFIABLE
-            sys_close(file_fd)
+            file.close()
             return static_send_416(fd, file_size, keep_alive)
         if range.valid == RANGE_OK
             send_start = range.start
@@ -669,9 +682,9 @@ pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32
     pos += 1
 
     # Send headers
-    let header_sent: i64 = sys_write(fd, @headers[0], pos as i64)
+    let header_sent: i64 = static_sock_write(fd, @headers[0], pos as i64)
     if header_sent < 0
-        sys_close(file_fd)
+        file.close()
         return header_sent
 
     # Send file content using sendfile (zero-copy)
@@ -680,7 +693,7 @@ pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32
     var total_sent: i64 = 0
 
     while remaining > 0
-        let sent: i64 = sys_sendfile(fd, file_fd, @offset, remaining)
+        let sent: i64 = sys_sendfile(fd, file.raw(), @offset, remaining)
         if sent <= 0
             if sent < 0
                 log_error(c"sendfile failed")
@@ -688,12 +701,12 @@ pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32
         remaining -= sent
         total_sent += sent
 
-    sys_close(file_fd)
+    file.close()
     return header_sent + total_sent
 
 
 # Send a 304 Not Modified response with ETag
-pub fn static_send_304(fd: i32, etag: *u8, etag_len: i32, keep_alive: i32) -> i64
+pub fn static_send_304(fd: i32, etag: StrView, keep_alive: i32) -> i64
     var resp: [256]u8
     var pos: i32 = 0
 
@@ -704,8 +717,8 @@ pub fn static_send_304(fd: i32, etag: *u8, etag_len: i32, keep_alive: i32) -> i6
         pos += 1
 
     # Copy ETag
-    for i in 0..etag_len
-        resp[pos] = *(etag + i)
+    for i in 0..etag.len
+        resp[pos] = *(etag.ptr + i)
         pos += 1
 
     # End the ETag line, then Connection and the blank line (304 has no body)
@@ -717,7 +730,7 @@ pub fn static_send_304(fd: i32, etag: *u8, etag_len: i32, keep_alive: i32) -> i6
     resp[pos + 1] = '\n'
     pos += 2
 
-    return sys_write(fd, @resp[0], pos as i64)
+    return static_sock_write(fd, @resp[0], pos as i64)
 
 
 # Backward-compatible wrapper that calls full version
@@ -749,7 +762,7 @@ pub fn static_send_416(fd: i32, file_size: i64, keep_alive: i32) -> i64
     memcpy(@resp[pos], end.ptr, end.len)
     pos += end.len as i32
 
-    return sys_write(fd, @resp[0], pos as i64)
+    return static_sock_write(fd, @resp[0], pos as i64)
 
 
 # Send a 404 Not Found response
@@ -762,7 +775,7 @@ pub fn static_send_404(fd: i32, keep_alive: i32) -> i64
     pos += static_connection_header(@resp[pos], keep_alive)
     memcpy(@resp[pos], c"\r\n404 Not Found\n", 16)
     pos += 16
-    return sys_write(fd, @resp[0], pos as i64)
+    return static_sock_write(fd, @resp[0], pos as i64)
 
 
 # Send a 403 Forbidden response
@@ -778,7 +791,7 @@ pub fn static_send_403(fd: i32, keep_alive: i32) -> i64
     let end = "\r\n403 Forbidden\n"
     memcpy(@resp[pos], end.ptr, end.len)
     pos += end.len as i32
-    return sys_write(fd, @resp[0], pos as i64)
+    return static_sock_write(fd, @resp[0], pos as i64)
 
 
 # ============================================================================
@@ -787,10 +800,9 @@ pub fn static_send_403(fd: i32, keep_alive: i32) -> i64
 
 # Check if path is a directory
 pub fn static_is_directory(path: *u8) -> i32
-    var statbuf: Stat
-    if sys_stat2(path, @&statbuf) != 0
-        return 0
-    return ((statbuf.st_mode & S_IFMT) == S_IFDIR) as i32
+    match stat(strview_from_cstr(path))
+        Ok(st) => return ((st.st_mode & S_IFMT) == S_IFDIR) as i32
+        Err(_) => return 0
 
 
 # Serve a directory listing as HTML
@@ -940,13 +952,13 @@ pub fn static_serve_directory(fd: i32, path: *u8, url_path: *u8, url_path_len: i
     hpos += 1
 
     # Send headers
-    let header_sent: i64 = sys_write(fd, @headers[0], hpos as i64)
+    let header_sent: i64 = static_sock_write(fd, @headers[0], hpos as i64)
     if header_sent < 0
         free(html_buf)
         return header_sent
 
     # Send body
-    let body_sent: i64 = sys_write(fd, html_buf, html_pos)
+    let body_sent: i64 = static_sock_write(fd, html_buf, html_pos)
     free(html_buf)
 
     return header_sent + body_sent

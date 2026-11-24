@@ -10,6 +10,10 @@ import ritzlib.strview
 import ritzlib.memory
 import ritzlib.fmt.digits { fmt_i64_into }
 
+import ritzlib.fd
+import ritzlib.span
+import ritzlib.fs { unlink }
+
 import lib.static
 
 # /tmp/valet_<pid>_<name> into dst (NUL-terminated); returns dst.  The pid
@@ -159,11 +163,14 @@ fn test_range_invalid_is_ignored() -> i32
     0
 
 
-# Drain `fd` into out[0..cap); returns bytes read.
-fn drain(fd: i32, out: *u8, cap: i32) -> i32
+# Drain `f` into out[0..cap); returns bytes read.
+fn drain(f: @Fd, out: *u8, cap: i32) -> i32
     var total: i32 = 0
     while total < cap
-        let n: i64 = sys_read(fd, out + total, (cap - total) as i64)
+        var n: i64 = 0
+        match f.read(Span<u8> { ptr: out + total, len: (cap - total) as i64 })
+            Ok(got) => n = got
+            Err(_) => n = -1
         if n <= 0
             break
         total += n as i32
@@ -187,19 +194,19 @@ fn starts_with(out: *u8, n: i32, want: StrView) -> i32
 fn serve_range(range: *u8, out: *u8, cap: i32) -> i32
     var pathbuf: [128]u8
     let path: *u8 = pid_tmp_path(@pathbuf[0], c"static_range.txt")
-    let fd: i32 = sys_open3(path, 577, 420)    # O_WRONLY | O_CREAT | O_TRUNC, 0644
-    if fd < 0
-        return -1
-    sys_write(fd, c"0123456789ABCDEFGHIJ", 20)
-    sys_close(fd)
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return -2
-    static_serve_file_full(p[1], path, range, strlen(range) as i32, null, 0, 0)
-    sys_close(p[1])
-    let n: i32 = drain(p[0], out, cap)
-    sys_close(p[0])
-    sys_unlink(path)
+    var f: Fd = match fd_open(strview_from_cstr(path), O_WRONLY + O_CREAT + O_TRUNC, 420)    # 0644
+        Ok(opened) => opened
+        Err(_) => return -1
+    f.write_str("0123456789ABCDEFGHIJ")
+    f.close()
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return -2
+    static_serve_file_full(p.write.raw(), path, range, strlen(range) as i32, null, 0, 0)
+    p.write.close()
+    let n: i32 = drain(@p.read, out, cap)
+    p.read.close()
+    unlink(strview_from_cstr(path))
     n
 
 [[test]]

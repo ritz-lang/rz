@@ -10,17 +10,21 @@
 # Each test writes the response into a pipe and compares every byte.  Both
 # take valet's keep-alive decision since #3899; 0 is the close form.
 
-import ritzlib.sys
 import ritzlib.strview
+import ritzlib.fd
+import ritzlib.span
 import ritzlib.memory
 
 import lib.static
 
-# Drain `fd` into out[0..cap); returns bytes read.
-fn drain(fd: i32, out: *u8, cap: i32) -> i32
+# Drain `f` into out[0..cap); returns bytes read.
+fn drain(f: @Fd, out: *u8, cap: i32) -> i32
     var total: i32 = 0
     while total < cap
-        let n: i64 = sys_read(fd, out + total, (cap - total) as i64)
+        var n: i64 = 0
+        match f.read(Span<u8> { ptr: out + total, len: (cap - total) as i64 })
+            Ok(got) => n = got
+            Err(_) => n = -1
         if n <= 0
             break
         total += n as i32
@@ -40,14 +44,14 @@ fn equals(out: *u8, n: i32, want: StrView) -> i32
 # The 403 is its headers and the 14-byte "403 Forbidden\n" body, nothing more.
 [[test]]
 fn test_static_403_ends_at_body() -> i32
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return 90
-    let sent: i64 = static_send_403(p[1], 0)
-    sys_close(p[1])
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 90
+    let sent: i64 = static_send_403(p.write.raw(), 0)
+    p.write.close()
     var buf: [512]u8
-    let n: i32 = drain(p[0], @buf[0], 512)
-    sys_close(p[0])
+    let n: i32 = drain(@p.read, @buf[0], 512)
+    p.read.close()
     let want = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: close\r\n\r\n403 Forbidden\n"
     if sent != want.len
         return 1
@@ -60,14 +64,14 @@ fn test_static_403_ends_at_body() -> i32
 # The 416 says "Content-Range: bytes */<size>" and ends at its 22-byte body.
 [[test]]
 fn test_static_416_content_range_and_ends_at_body() -> i32
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return 90
-    let sent: i64 = static_send_416(p[1], 1234, 0)
-    sys_close(p[1])
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 90
+    let sent: i64 = static_send_416(p.write.raw(), 1234, 0)
+    p.write.close()
     var buf: [512]u8
-    let n: i32 = drain(p[0], @buf[0], 512)
-    sys_close(p[0])
+    let n: i32 = drain(@p.read, @buf[0], 512)
+    p.read.close()
     let want = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: text/plain\r\nContent-Length: 22\r\nContent-Range: bytes */1234\r\nConnection: close\r\n\r\nRange Not Satisfiable\n"
     if sent != want.len
         return 1
@@ -80,14 +84,14 @@ fn test_static_416_content_range_and_ends_at_body() -> i32
 # A zero-size file still gets "*/0" (format_int64 writes the size in place).
 [[test]]
 fn test_static_416_zero_size() -> i32
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return 90
-    static_send_416(p[1], 0, 0)
-    sys_close(p[1])
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 90
+    static_send_416(p.write.raw(), 0, 0)
+    p.write.close()
     var buf: [512]u8
-    let n: i32 = drain(p[0], @buf[0], 512)
-    sys_close(p[0])
+    let n: i32 = drain(@p.read, @buf[0], 512)
+    p.read.close()
     let want = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: text/plain\r\nContent-Length: 22\r\nContent-Range: bytes */0\r\nConnection: close\r\n\r\nRange Not Satisfiable\n"
     if equals(@buf[0], n, want) != 1
         return 1
@@ -96,14 +100,14 @@ fn test_static_416_zero_size() -> i32
 # The keep-alive forms (#3899): the same bytes with "Connection: keep-alive".
 [[test]]
 fn test_static_403_keep_alive_ends_at_body() -> i32
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return 90
-    let sent: i64 = static_send_403(p[1], 1)
-    sys_close(p[1])
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 90
+    let sent: i64 = static_send_403(p.write.raw(), 1)
+    p.write.close()
     var buf: [512]u8
-    let n: i32 = drain(p[0], @buf[0], 512)
-    sys_close(p[0])
+    let n: i32 = drain(@p.read, @buf[0], 512)
+    p.read.close()
     let want = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: keep-alive\r\n\r\n403 Forbidden\n"
     if sent != want.len
         return 1
@@ -113,14 +117,14 @@ fn test_static_403_keep_alive_ends_at_body() -> i32
 
 [[test]]
 fn test_static_416_keep_alive_ends_at_body() -> i32
-    var p: [2]i32
-    if sys_pipe(@p[0]) != 0
-        return 90
-    let sent: i64 = static_send_416(p[1], 1234, 1)
-    sys_close(p[1])
+    var p: Pipe = match pipe()
+        Ok(pp) => pp
+        Err(_) => return 90
+    let sent: i64 = static_send_416(p.write.raw(), 1234, 1)
+    p.write.close()
     var buf: [512]u8
-    let n: i32 = drain(p[0], @buf[0], 512)
-    sys_close(p[0])
+    let n: i32 = drain(@p.read, @buf[0], 512)
+    p.read.close()
     let want = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Type: text/plain\r\nContent-Length: 22\r\nContent-Range: bytes */1234\r\nConnection: keep-alive\r\n\r\nRange Not Satisfiable\n"
     if sent != want.len
         return 1

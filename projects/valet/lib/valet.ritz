@@ -22,6 +22,9 @@ import ritzlib.uring
 import ritzlib.async_net
 import ritzlib.net { sys_setsockopt }
 import ritzlib.async.tasks
+import ritzlib.fd
+import ritzlib.span
+import ritzlib.process { fork, ForkResult }
 
 import request
 import response
@@ -201,28 +204,36 @@ pub fn valet_tls(app: *Valet, cert_pem: *u8, cert_pem_len: i64, key_pem: *u8, ke
 pub fn valet_tls_files(app: *Valet, cert_path: *u8, key_path: *u8) -> i32
     # Read certificate file
     var cert_buf: [8192]u8
-    let cert_fd: i32 = sys_open(cert_path, 0)  # O_RDONLY
-    if cert_fd < 0
-        let cert_shown: StrView = strview_from_cstr(cert_path)
-        print("Error: Failed to open certificate file: {cert_shown}\n")
-        return -1
+    var cert_file: Fd = match fd_open(strview_from_cstr(cert_path), O_RDONLY, 0)
+        Ok(f) => f
+        Err(_) =>
+            let cert_shown: StrView = strview_from_cstr(cert_path)
+            print("Error: Failed to open certificate file: {cert_shown}\n")
+            return -1
 
-    let cert_len: i64 = sys_read(cert_fd, @cert_buf[0], 8192)
-    sys_close(cert_fd)
+    var cert_len: i64 = -1
+    match cert_file.read(Span<u8> { ptr: @cert_buf[0], len: 8192 })
+        Ok(n) => cert_len = n
+        Err(_) => pass
+    cert_file.close()
     if cert_len <= 0
         prints("Error: Failed to read certificate file\n")
         return -2
 
     # Read key file
     var key_buf: [4096]u8
-    let key_fd: i32 = sys_open(key_path, 0)  # O_RDONLY
-    if key_fd < 0
-        let key_shown: StrView = strview_from_cstr(key_path)
-        print("Error: Failed to open key file: {key_shown}\n")
-        return -3
+    var key_file: Fd = match fd_open(strview_from_cstr(key_path), O_RDONLY, 0)
+        Ok(f) => f
+        Err(_) =>
+            let key_shown: StrView = strview_from_cstr(key_path)
+            print("Error: Failed to open key file: {key_shown}\n")
+            return -3
 
-    let key_len: i64 = sys_read(key_fd, @key_buf[0], 4096)
-    sys_close(key_fd)
+    var key_len: i64 = -1
+    match key_file.read(Span<u8> { ptr: @key_buf[0], len: 4096 })
+        Ok(n) => key_len = n
+        Err(_) => pass
+    key_file.close()
     if key_len <= 0
         prints("Error: Failed to read key file\n")
         return -4
@@ -2299,12 +2310,30 @@ pub fn valet_check_shutdown() -> i32
 # Server startup
 # ============================================================================
 
+# True in a newly forked child; false in the parent, or if fork failed.
+fn valet_forked_child() -> bool
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child => true
+                Parent(_) => false
+        Err(_) => false
+
+# Fork `workers` - 1 children that all serve the same listen socket. A child
+# returns at once (it must not fork workers of its own); the parent forks them
+# all. A failed fork leaves one worker fewer, as before.
+fn valet_fork_workers(workers: i32)
+    for i in 1..workers
+        if valet_forked_child()
+            return
+
 pub fn valet_run(app: *Valet) -> i32
     # Set global app pointer for handler access
     set_g_app(app)
 
     # Create server socket
-    var server_fd: i32 = tcp_socket()
+    var server: Fd = fd_adopt(tcp_socket())
+    let server_fd: i32 = server.raw()
     if server_fd < 0
         prints("Failed to create socket\n")
         return 1
@@ -2318,21 +2347,18 @@ pub fn valet_run(app: *Valet) -> i32
     var ret_bind: i32 = tcp_bind(server_fd, inaddr_any(), app.port)
     if ret_bind < 0
         print("Failed to bind to port {app.port}\n")
-        sys_close(server_fd)
+        server.close()
         return 1
 
     var ret_listen: i32 = tcp_listen(server_fd, app.backlog)
     if ret_listen < 0
         prints("Failed to listen\n")
-        sys_close(server_fd)
+        server.close()
         return 1
 
     # Fork workers
     if app.workers > 1
-        for i in 1..app.workers
-            var pid: i32 = sys_fork()
-            if pid == 0
-                break
+        valet_fork_workers(app.workers)
 
     let listen_pid: i64 = sys_getpid() as i64
     if app.tls_enabled != 0
@@ -2351,7 +2377,7 @@ pub fn valet_run(app: *Valet) -> i32
         Some(s) => srv = s
         None =>
             prints("Failed to create task server\n")
-            sys_close(server_fd)
+            server.close()
             return 1
 
     srv.pool.ring = @srv.ring
@@ -2384,5 +2410,5 @@ pub fn valet_run(app: *Valet) -> i32
 
     prints("Server shutting down...\n")
     srv.free()
-    sys_close(server_fd)
+    server.close()
     return ret

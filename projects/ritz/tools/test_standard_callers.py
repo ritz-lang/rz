@@ -54,7 +54,7 @@ PINS = {
     "squeeze": 6,
     "tempest": 1,
     "tome": 397,
-    "valet": 319,
+    "valet": 240,
     "zeus": 156,
 }
 
