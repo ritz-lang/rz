@@ -29,12 +29,22 @@ fn trace_byte(t:& Trace, c: u8)
         t.buf[t.len] = c
         t.len = t.len + 1
 
+# A name of 16 bytes or more is traced as `#<len>`, so long names fit.
 fn trace_name(t:& Trace, tag: Tag)
     let name = tag_name(tag)
+    if name.len >= 16
+        trace_byte(t, '#')
+        trace_u64(t, name.len as u64)
+        return
     var i: i64 = 0
     while i < name.len
         trace_byte(t, name.get(i))
         i = i + 1
+
+fn trace_u64(t:& Trace, n: u64)
+    if n >= 10
+        trace_u64(t, n / 10)
+    trace_byte(t, ('0' as u64 + n % 10) as u8)
 
 impl EventSink for Trace
     fn on_document_start(self:&)
@@ -207,8 +217,73 @@ fn test_select_switches_mode() -> i32
 # generic element.
 [[test]]
 fn test_option_and_generic() -> i32
-    let hp = parse("<option><span><blink>")
-    assert trace_is(@hp, "html head -head body option span blink -blink -span -option -body -html ")
+    let hp = parse("<option><blink><span>")
+    assert trace_is(@hp, "html head -head body option blink span -span -blink -option -body -html ")
     assert hp.tree_builder.formatting_len == 0
     assert hp.tree_builder.frameset_ok == 1
+    0
+
+# An unknown tag's name outlives the tokenizer's tag-name buffer, which the
+# next tag overwrites (#4621): its end event names it, not a later tag.
+[[test]]
+fn test_unknown_name_survives_later_tags() -> i32
+    let hp = parse("<p><div><blink><h2>")
+    assert trace_is(@hp, "html head -head body p -p div blink h2 -h2 -blink -div -body -html ")
+    let fmt = parse("<a><x-y><font>")
+    assert trace_is(@fmt, "html head -head body a x-y font -font -x-y -a -body -html ")
+    0
+
+# Nested unknown names each keep their own bytes, through a pop and a push.
+[[test]]
+fn test_nested_unknown_names_stay_apart() -> i32
+    let hp = parse("<foo><barbaz></barbaz><qux><i>")
+    assert trace_is(@hp, "html head -head body foo barbaz -barbaz qux i -i -qux -foo -body -html ")
+    0
+
+const LONG_NAME_LEN: i64 = 250
+
+fn put(buf:& [4400]u8, at: i64, c: u8) -> i64
+    buf[at] = c
+    at + 1
+
+fn put_str(buf:& [4400]u8, at: i64, s: StrView) -> i64
+    var n = at
+    var i: i64 = 0
+    while i < s.len
+        n = put(buf, n, s.get(i))
+        i = i + 1
+    n
+
+# The name arena holds 4096 bytes. Sixteen 250-byte unknown names take 4000;
+# the 17th keeps the 96 left and <zz> keeps "", which their end events show
+# (start events still carry the tokenizer's full name). Popping those two
+# frees their bytes, so <qq> keeps its name.
+[[test]]
+fn test_unknown_names_past_the_arena_truncate_then_reclaim() -> i32
+    var buf: [4400]u8
+    var n: i64 = 0
+    var k = 0
+    while k < 17
+        n = put(buf, n, '<')
+        var i: i64 = 0
+        while i < LONG_NAME_LEN
+            n = put(buf, n, 'a')
+            i = i + 1
+        n = put(buf, n, '>')
+        k = k + 1
+    n = put_str(buf, n, "<zz></x></x><qq>")
+    let hp = parse(strview_from_ptr(@buf[0] as *u8, n))
+    var want: [4400]u8
+    var w = put_str(want, 0, "html head -head body ")
+    k = 0
+    while k < 17
+        w = put_str(want, w, "#250 ")
+        k = k + 1
+    w = put_str(want, w, "zz - -#96 qq -qq ")
+    k = 0
+    while k < 16
+        w = put_str(want, w, "-#250 ")
+        k = k + 1
+    w = put_str(want, w, "-body -html ")
+    assert trace_is(@hp, strview_from_ptr(@want[0] as *u8, w))
     0

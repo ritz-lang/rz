@@ -47,7 +47,20 @@ const MAX_STACK_DEPTH: u32 = 512
 
 pub struct StackEntry
     tag: Tag
+    # Tag.Unknown only: its name is names[name_off, name_off + name_len)
+    # (#4621). The tag's own StrView is not read back: it points into the
+    # tokenizer's tag-name buffer, which the next tag overwrites.
+    name_off: u32
+    name_len: u32
     # TODO: namespace for SVG/MathML
+
+# Bytes for the names of open Tag.Unknown elements. Names go in and come out
+# in stack order, so popping an entry frees its bytes. A name that doesn't fit
+# in what's left is truncated to it (to "" when the arena is full): the
+# element still opens and closes, but its end event carries the shorter name
+# (the start event is emitted from the token, before the push). Offsets, not
+# pointers, so a TreeBuilder moved by value keeps its names.
+const NAME_ARENA_CAP: u32 = 4096
 
 # =============================================================================
 # Active Formatting Elements
@@ -97,6 +110,11 @@ pub struct TreeBuilder<S: EventSink>
     pending_text: [4096]u8
     pending_text_len: u32
 
+    # Names of open Tag.Unknown elements; see StackEntry. Inline, no heap,
+    # so nothing to free.
+    names: [NAME_ARENA_CAP]u8
+    names_len: u32
+
 # =============================================================================
 # Initialization
 # =============================================================================
@@ -115,6 +133,7 @@ pub fn tree_builder_new<S: EventSink>(sink: S) -> TreeBuilder<S>
     tb.scripting = 0
     tb.fragment_context = 0
     tb.pending_text_len = 0
+    tb.names_len = 0
 
     tb
 
@@ -125,17 +144,43 @@ pub fn tree_builder_new<S: EventSink>(sink: S) -> TreeBuilder<S>
 fn push_element<S: EventSink>(tb:& TreeBuilder<S>, tag: Tag)
     if tb.stack_len < MAX_STACK_DEPTH
         tb.stack[tb.stack_len].tag = tag
+        tb.stack[tb.stack_len].name_off = tb.names_len
+        tb.stack[tb.stack_len].name_len = 0
+        match tag
+            Tag.Unknown(name) => copy_unknown_name(tb, name)
+            _ => pass
         tb.stack_len = tb.stack_len + 1
 
+# Copy `name` into the arena for the entry being pushed at stack_len.
+fn copy_unknown_name<S: EventSink>(tb:& TreeBuilder<S>, name: StrView)
+    var n = name.len as u32
+    if n > NAME_ARENA_CAP - tb.names_len
+        n = NAME_ARENA_CAP - tb.names_len
+    var i: u32 = 0
+    while i < n
+        tb.names[tb.names_len + i] = name.get(i as i64)
+        i = i + 1
+    tb.stack[tb.stack_len].name_len = n
+    tb.names_len = tb.names_len + n
+
+# The tag of stack entry `idx`, an Unknown's name read from the arena.
+fn stack_tag<S: EventSink>(tb: @TreeBuilder<S>, idx: u32) -> Tag
+    let entry = @tb.stack[idx]
+    match entry.tag
+        Tag.Unknown(_) => Tag.Unknown(strview_from_ptr(@tb.names[entry.name_off] as *u8, entry.name_len as i64))
+        _ => entry.tag
+
+# The returned Unknown's name stays valid until the next push.
 fn pop_element<S: EventSink>(tb:& TreeBuilder<S>) -> Tag
     if tb.stack_len > 0
         tb.stack_len = tb.stack_len - 1
-        return tb.stack[tb.stack_len].tag
+        tb.names_len = tb.stack[tb.stack_len].name_off
+        return stack_tag(@tb, tb.stack_len)
     Tag.Unknown("")
 
 fn current_node<S: EventSink>(tb: @TreeBuilder<S>) -> Tag
     if tb.stack_len > 0
-        return tb.stack[tb.stack_len - 1].tag
+        return stack_tag(tb, tb.stack_len - 1)
     Tag.Unknown("")
 
 fn stack_has_element_in_scope<S: EventSink>(tb: @TreeBuilder<S>, target: Tag) -> i32
