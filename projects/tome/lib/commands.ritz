@@ -17,6 +17,7 @@
 import ritzlib.ct
 import ritzlib.fmt.digits
 import ritzlib.memory
+import ritzlib.option
 import ritzlib.str
 import ritzlib.string
 import ritzlib.strview
@@ -46,7 +47,7 @@ struct CommandContext
     resp_buf: *u8       # Response output buffer
     resp_len: i32       # Length of response written
     resp_cap: i32       # Capacity of buffer
-    password: *u8       # Required password (null = no auth required)
+    password: Option<StrView>  # Required password (None = no auth required)
     is_authenticated: i32   # 1 if client is authenticated, 0 otherwise
     overflow: i32       # 1 if the reply did not fit resp_cap (see ctx_too_large)
 
@@ -57,13 +58,13 @@ pub fn cmd_ctx_init(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32)
     ctx.resp_buf = buf
     ctx.resp_len = 0
     ctx.resp_cap = cap
-    ctx.password = null
+    ctx.password = None
     ctx.is_authenticated = 1  # No auth required = already authenticated
     ctx.overflow = 0
 
 
 # Initialize command context with authentication
-pub fn cmd_ctx_init_auth(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32, password: *u8, is_authenticated: i32)
+pub fn cmd_ctx_init_auth(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32, password: Option<StrView>, is_authenticated: i32)
     ctx.store = store
     ctx.resp_buf = buf
     ctx.resp_len = 0
@@ -93,35 +94,22 @@ fn ctx_too_large(ctx: *CommandContext)
     ctx.overflow = 1
     let err: StrView = "ERR reply too large"
     if ctx_fits(ctx, err.len)
-        ctx.resp_len = resp_write_error_sv(ctx.resp_buf, err)
+        ctx.resp_len = resp_write_error(ctx.resp_buf, err)
     else
         ctx.resp_len = 0
 
-# Write response helpers (C-string versions - for FFI compatibility)
-fn ctx_write_simple(ctx: *CommandContext, s: *u8)
-    if not ctx_fits(ctx, strlen(s))
+# Write response helpers
+fn ctx_write_simple(ctx: *CommandContext, s: StrView)
+    if not ctx_fits(ctx, s.len)
         ctx_too_large(ctx)
         return
     ctx.resp_len = resp_write_simple(ctx.resp_buf, s)
 
-fn ctx_write_error(ctx: *CommandContext, s: *u8)
-    if not ctx_fits(ctx, strlen(s))
+fn ctx_write_error(ctx: *CommandContext, s: StrView)
+    if not ctx_fits(ctx, s.len)
         ctx_too_large(ctx)
         return
     ctx.resp_len = resp_write_error(ctx.resp_buf, s)
-
-# Write response helpers (StrView versions - preferred)
-fn ctx_write_simple_sv(ctx: *CommandContext, s: StrView)
-    if not ctx_fits(ctx, s.len)
-        ctx_too_large(ctx)
-        return
-    ctx.resp_len = resp_write_simple_sv(ctx.resp_buf, s)
-
-fn ctx_write_error_sv(ctx: *CommandContext, s: StrView)
-    if not ctx_fits(ctx, s.len)
-        ctx_too_large(ctx)
-        return
-    ctx.resp_len = resp_write_error_sv(ctx.resp_buf, s)
 
 fn ctx_write_int(ctx: *CommandContext, n: i64)
     if not ctx_fits(ctx, 0)
@@ -129,11 +117,11 @@ fn ctx_write_int(ctx: *CommandContext, n: i64)
         return
     ctx.resp_len = resp_write_i64(ctx.resp_buf, n)
 
-fn ctx_write_bulk(ctx: *CommandContext, data: *u8, len: i64)
-    if not ctx_fits(ctx, len)
+fn ctx_write_bulk(ctx: *CommandContext, data: StrView)
+    if not ctx_fits(ctx, data.len)
         ctx_too_large(ctx)
         return
-    ctx.resp_len = resp_write_bulk(ctx.resp_buf, data, len)
+    ctx.resp_len = resp_write_bulk(ctx.resp_buf, data)
 
 fn ctx_write_null(ctx: *CommandContext)
     if not ctx_fits(ctx, 0)
@@ -160,8 +148,7 @@ fn ctx_write_bulk_array(ctx: *CommandContext, items: *StrView, count: i64)
     else
         var pos: i32 = resp_write_array(ctx.resp_buf, count)
         for i in 0..count
-            let v: StrView = items[i]
-            pos += resp_write_bulk(ctx.resp_buf + pos, v.ptr, v.len)
+            pos += resp_write_bulk(ctx.resp_buf + pos, items[i])
         ctx.resp_len = pos
     if items != null
         free(items as *u8)
@@ -175,14 +162,14 @@ fn ctx_write_bulk_array(ctx: *CommandContext, items: *StrView, count: i64)
 fn cmd_ping(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc == 1
         let pong: StrView = "PONG"
-        ctx_write_simple_sv(ctx, pong)
+        ctx_write_simple(ctx, pong)
         return CMD_OK
     if cmd.argc == 2
         let arg: *RespArg = @cmd.args[1]
-        ctx_write_bulk(ctx, arg.data, arg.len)
+        ctx_write_bulk(ctx, resp_arg_sv(arg))
         return CMD_OK
     let err: StrView = "ERR wrong number of arguments for 'ping' command"
-    ctx_write_error_sv(ctx, err)
+    ctx_write_error(ctx, err)
     return CMD_ERR_ARGC
 
 
@@ -190,10 +177,10 @@ fn cmd_ping(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_echo(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'echo' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
     let arg: *RespArg = @cmd.args[1]
-    ctx_write_bulk(ctx, arg.data, arg.len)
+    ctx_write_bulk(ctx, resp_arg_sv(arg))
     return CMD_OK
 
 
@@ -201,7 +188,7 @@ fn cmd_echo(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_get(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'get' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -211,7 +198,7 @@ fn cmd_get(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if val.ptr == null
         ctx_write_null(ctx)
     else
-        ctx_write_bulk(ctx, val.ptr, val.len)
+        ctx_write_bulk(ctx, val)
     return CMD_OK
 
 
@@ -219,7 +206,7 @@ fn cmd_get(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_set(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 3
         let err: StrView = "ERR wrong number of arguments for 'set' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -227,7 +214,7 @@ fn cmd_set(ctx: *CommandContext, cmd: *RespCommand) -> i32
 
     store_set(ctx.store, key_sv, val_sv)
     let ok: StrView = "OK"
-    ctx_write_simple_sv(ctx, ok)
+    ctx_write_simple(ctx, ok)
     return CMD_OK
 
 
@@ -242,87 +229,71 @@ fn incr_by(ctx: *CommandContext, cmd: *RespCommand, delta: i64) -> i32
         # store_get_strview answers null for a missing key and a non-string alike.
         if store_exists(ctx.store, key_sv) == 1
             let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-            ctx_write_error_sv(ctx, wrongtype)
+            ctx_write_error(ctx, wrongtype)
             return CMD_ERR_TYPE
-    else if resp_parse_i64(val.ptr, val.len, @cur) == 0
+    else if resp_parse_i64(val, @cur) == 0
         let err: StrView = "ERR value is not an integer or out of range"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
 
     let max: i64 = 9223372036854775807
     let min: i64 = -9223372036854775807 - 1
     if (delta > 0 and cur > max - delta) or (delta < 0 and cur < min - delta)
         let err: StrView = "ERR increment or decrement would overflow"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
     let next: i64 = cur + delta
 
     var digits: [24]u8
     let n: i64 = fmt_i64_into(@digits[0], next)
-    digits[n] = 0
-    var next_sv: StrView = strview_from_cstr(@digits[0])
+    var next_sv: StrView = strview_from_ptr(@digits[0], n)
     store_set(ctx.store, key_sv, next_sv)
     ctx_write_int(ctx, next)
     return CMD_OK
 
 
 # INCR key / DECR key
-fn cmd_incr(ctx: *CommandContext, cmd: *RespCommand, delta: i64, name: *u8) -> i32
+fn cmd_incr(ctx: *CommandContext, cmd: *RespCommand, delta: i64, name: StrView) -> i32
     if cmd.argc != 2
-        var err: [96]u8
-        argc_error(@err[0], name)
-        ctx_write_error(ctx, @err[0])
+        argc_error(ctx, name)
         return CMD_ERR_ARGC
     return incr_by(ctx, cmd, delta)
 
 
 # INCRBY key increment / DECRBY key decrement (sign is -1 for DECRBY)
-fn cmd_incrby(ctx: *CommandContext, cmd: *RespCommand, sign: i64, name: *u8) -> i32
+fn cmd_incrby(ctx: *CommandContext, cmd: *RespCommand, sign: i64, name: StrView) -> i32
     if cmd.argc != 3
-        var err: [96]u8
-        argc_error(@err[0], name)
-        ctx_write_error(ctx, @err[0])
+        argc_error(ctx, name)
         return CMD_ERR_ARGC
     var by: i64 = 0
     let arg: *RespArg = @cmd.args[2]
-    if resp_parse_i64(arg.data, arg.len, @by) == 0
+    if resp_parse_i64(resp_arg_sv(arg), @by) == 0
         let err: StrView = "ERR value is not an integer or out of range"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
     if sign < 0
         let min: i64 = -9223372036854775807 - 1
         if by == min
             let err: StrView = "ERR decrement would overflow"
-            ctx_write_error_sv(ctx, err)
+            ctx_write_error(ctx, err)
             return CMD_ERR_SYNTAX
         by = -by
     return incr_by(ctx, cmd, by)
 
 
-# Write "ERR wrong number of arguments for '<name>' command" (NUL-terminated)
-# into buf (>= 96 bytes; names are short literals).  Returns its length.
-fn argc_error(buf: *u8, name: *u8) -> i32
-    let head: *u8 = c"ERR wrong number of arguments for '"
-    let tail: *u8 = c"' command"
-    var pos: i64 = 0
-    let hl: i64 = strlen(head)
-    memcpy(buf, head, hl)
-    pos += hl
-    let nl: i64 = strlen(name)
-    memcpy(buf + pos, name, nl)
-    pos += nl
-    let tl: i64 = strlen(tail)
-    memcpy(buf + pos, tail, tl)
-    pos += tl
-    *(buf + pos) = 0
-    return pos as i32
+# Answer "ERR wrong number of arguments for '<name>' command".
+fn argc_error(ctx: *CommandContext, name: StrView)
+    var msg: String = string_from("ERR wrong number of arguments for '")
+    msg.push_str(name)
+    msg.push_str("' command")
+    ctx_write_error(ctx, msg.as_view())
 
 
 # SETEX key seconds value
 fn cmd_setex(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 4
         let err: StrView = "ERR wrong number of arguments for 'setex' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -332,12 +303,12 @@ fn cmd_setex(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let ttl: i64 = resp_arg_to_int(@cmd.args[2], @ok)
     if ok == 0 || ttl <= 0
         let err: StrView = "ERR invalid expire time in 'setex' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
 
     store_setex(ctx.store, key_sv, val_sv, ttl)
     let reply: StrView = "OK"
-    ctx_write_simple_sv(ctx, reply)
+    ctx_write_simple(ctx, reply)
     return CMD_OK
 
 
@@ -345,7 +316,7 @@ fn cmd_setex(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_del(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 2
         let err: StrView = "ERR wrong number of arguments for 'del' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var count: i64 = 0
@@ -363,7 +334,7 @@ fn cmd_del(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_exists(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 2
         let err: StrView = "ERR wrong number of arguments for 'exists' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var count: i64 = 0
@@ -380,7 +351,7 @@ fn cmd_exists(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_ttl(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'ttl' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -394,7 +365,7 @@ fn cmd_ttl(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_expire(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 3
         let err: StrView = "ERR wrong number of arguments for 'expire' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -403,7 +374,7 @@ fn cmd_expire(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let ttl: i64 = resp_arg_to_int(@cmd.args[2], @ok)
     if ok == 0 || ttl <= 0
         let err: StrView = "ERR invalid expire time in 'expire' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
 
     let result: i32 = store_expire(ctx.store, key_sv, ttl)
@@ -415,7 +386,7 @@ fn cmd_expire(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_persist(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'persist' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -433,7 +404,7 @@ fn cmd_persist(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_lpush(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 3
         let err: StrView = "ERR wrong number of arguments for 'lpush' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -444,7 +415,7 @@ fn cmd_lpush(ctx: *CommandContext, cmd: *RespCommand) -> i32
         len = store_lpush(ctx.store, key_sv, val_sv)
         if len < 0
             let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-            ctx_write_error_sv(ctx, wrongtype)
+            ctx_write_error(ctx, wrongtype)
             return CMD_ERR_TYPE
 
     ctx_write_int(ctx, len)
@@ -455,7 +426,7 @@ fn cmd_lpush(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_rpush(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 3
         let err: StrView = "ERR wrong number of arguments for 'rpush' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -466,7 +437,7 @@ fn cmd_rpush(ctx: *CommandContext, cmd: *RespCommand) -> i32
         len = store_rpush(ctx.store, key_sv, val_sv)
         if len < 0
             let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-            ctx_write_error_sv(ctx, wrongtype)
+            ctx_write_error(ctx, wrongtype)
             return CMD_ERR_TYPE
 
     ctx_write_int(ctx, len)
@@ -477,7 +448,7 @@ fn cmd_rpush(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_lpop(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'lpop' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -486,8 +457,7 @@ fn cmd_lpop(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if result.len() == 0
         ctx_write_null(ctx)
     else
-        let vlen: i64 = result.len()
-        ctx_write_bulk(ctx, result.as_ptr(), vlen)
+        ctx_write_bulk(ctx, result.as_view())
     return CMD_OK
 
 
@@ -495,7 +465,7 @@ fn cmd_lpop(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_rpop(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'rpop' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -504,8 +474,7 @@ fn cmd_rpop(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if result.len() == 0
         ctx_write_null(ctx)
     else
-        let vlen: i64 = result.len()
-        ctx_write_bulk(ctx, result.as_ptr(), vlen)
+        ctx_write_bulk(ctx, result.as_view())
     return CMD_OK
 
 
@@ -513,7 +482,7 @@ fn cmd_rpop(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_llen(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'llen' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -521,7 +490,7 @@ fn cmd_llen(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let len: i64 = store_llen(ctx.store, key_sv)
     if len < 0
         let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-        ctx_write_error_sv(ctx, wrongtype)
+        ctx_write_error(ctx, wrongtype)
         return CMD_ERR_TYPE
 
     ctx_write_int(ctx, len)
@@ -532,7 +501,7 @@ fn cmd_llen(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_lindex(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 3
         let err: StrView = "ERR wrong number of arguments for 'lindex' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -541,14 +510,14 @@ fn cmd_lindex(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let idx: i64 = resp_arg_to_int(@cmd.args[2], @ok)
     if ok == 0
         let notint: StrView = "ERR value is not an integer or out of range"
-        ctx_write_error_sv(ctx, notint)
+        ctx_write_error(ctx, notint)
         return CMD_ERR_SYNTAX
 
     let val: StrView = store_lindex(ctx.store, key_sv, idx)
     if val.ptr == null
         ctx_write_null(ctx)
     else
-        ctx_write_bulk(ctx, val.ptr, val.len)
+        ctx_write_bulk(ctx, val)
     return CMD_OK
 
 
@@ -556,7 +525,7 @@ fn cmd_lindex(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_lrange(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 4
         let err: StrView = "ERR wrong number of arguments for 'lrange' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -565,13 +534,13 @@ fn cmd_lrange(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let start: i64 = resp_arg_to_int(@cmd.args[2], @ok)
     if ok == 0
         let notint: StrView = "ERR value is not an integer or out of range"
-        ctx_write_error_sv(ctx, notint)
+        ctx_write_error(ctx, notint)
         return CMD_ERR_SYNTAX
 
     let stop: i64 = resp_arg_to_int(@cmd.args[3], @ok)
     if ok == 0
         let notint2: StrView = "ERR value is not an integer or out of range"
-        ctx_write_error_sv(ctx, notint2)
+        ctx_write_error(ctx, notint2)
         return CMD_ERR_SYNTAX
 
     var count: i64 = 0
@@ -589,7 +558,7 @@ fn cmd_lrange(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_sadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 3
         let err: StrView = "ERR wrong number of arguments for 'sadd' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -600,7 +569,7 @@ fn cmd_sadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
         let ret: i64 = store_sadd(ctx.store, key_sv, member_sv)
         if ret < 0
             let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-            ctx_write_error_sv(ctx, wrongtype)
+            ctx_write_error(ctx, wrongtype)
             return CMD_ERR_TYPE
         added += ret
 
@@ -612,7 +581,7 @@ fn cmd_sadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_srem(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 3
         let err: StrView = "ERR wrong number of arguments for 'srem' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -623,7 +592,7 @@ fn cmd_srem(ctx: *CommandContext, cmd: *RespCommand) -> i32
         let ret: i64 = store_srem(ctx.store, key_sv, member_sv)
         if ret < 0
             let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-            ctx_write_error_sv(ctx, wrongtype)
+            ctx_write_error(ctx, wrongtype)
             return CMD_ERR_TYPE
         removed += ret
 
@@ -635,7 +604,7 @@ fn cmd_srem(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_sismember(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 3
         let err: StrView = "ERR wrong number of arguments for 'sismember' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -644,7 +613,7 @@ fn cmd_sismember(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let result: i32 = store_sismember(ctx.store, key_sv, member_sv)
     if result < 0
         let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-        ctx_write_error_sv(ctx, wrongtype)
+        ctx_write_error(ctx, wrongtype)
         return CMD_ERR_TYPE
 
     ctx_write_int(ctx, result as i64)
@@ -655,7 +624,7 @@ fn cmd_sismember(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_scard(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'scard' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -663,7 +632,7 @@ fn cmd_scard(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let count: i64 = store_scard(ctx.store, key_sv)
     if count < 0
         let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-        ctx_write_error_sv(ctx, wrongtype)
+        ctx_write_error(ctx, wrongtype)
         return CMD_ERR_TYPE
 
     ctx_write_int(ctx, count)
@@ -674,7 +643,7 @@ fn cmd_scard(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_smembers(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'smembers' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -694,7 +663,7 @@ fn cmd_smembers(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_hset(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 4 || (cmd.argc - 2) % 2 != 0
         let err: StrView = "ERR wrong number of arguments for 'hset' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -708,7 +677,7 @@ fn cmd_hset(ctx: *CommandContext, cmd: *RespCommand) -> i32
         let ret: i32 = store_hset(ctx.store, key_sv, field_sv, val_sv)
         if ret < 0
             let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-            ctx_write_error_sv(ctx, wrongtype)
+            ctx_write_error(ctx, wrongtype)
             return CMD_ERR_TYPE
         added += ret as i64
         i += 2
@@ -721,7 +690,7 @@ fn cmd_hset(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_hget(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 3
         let err: StrView = "ERR wrong number of arguments for 'hget' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -731,7 +700,7 @@ fn cmd_hget(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if val.ptr == null
         ctx_write_null(ctx)
     else
-        ctx_write_bulk(ctx, val.ptr, val.len)
+        ctx_write_bulk(ctx, val)
     return CMD_OK
 
 
@@ -739,7 +708,7 @@ fn cmd_hget(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_hdel(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 3
         let err: StrView = "ERR wrong number of arguments for 'hdel' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -750,7 +719,7 @@ fn cmd_hdel(ctx: *CommandContext, cmd: *RespCommand) -> i32
         let ret: i32 = store_hdel(ctx.store, key_sv, field_sv)
         if ret < 0
             let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-            ctx_write_error_sv(ctx, wrongtype)
+            ctx_write_error(ctx, wrongtype)
             return CMD_ERR_TYPE
         deleted += ret as i64
 
@@ -762,7 +731,7 @@ fn cmd_hdel(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_hexists(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 3
         let err: StrView = "ERR wrong number of arguments for 'hexists' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -771,7 +740,7 @@ fn cmd_hexists(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let result: i32 = store_hexists(ctx.store, key_sv, field_sv)
     if result < 0
         let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-        ctx_write_error_sv(ctx, wrongtype)
+        ctx_write_error(ctx, wrongtype)
         return CMD_ERR_TYPE
 
     ctx_write_int(ctx, result as i64)
@@ -782,7 +751,7 @@ fn cmd_hexists(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_hlen(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'hlen' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -790,7 +759,7 @@ fn cmd_hlen(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let len: i64 = store_hlen(ctx.store, key_sv)
     if len < 0
         let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-        ctx_write_error_sv(ctx, wrongtype)
+        ctx_write_error(ctx, wrongtype)
         return CMD_ERR_TYPE
 
     ctx_write_int(ctx, len)
@@ -801,7 +770,7 @@ fn cmd_hlen(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_hkeys(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'hkeys' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -817,7 +786,7 @@ fn cmd_hkeys(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_hvals(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'hvals' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -833,7 +802,7 @@ fn cmd_hvals(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_hgetall(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'hgetall' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -858,7 +827,7 @@ fn cmd_hgetall(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn zset_wrongtype(ctx: *CommandContext, key: StrView) -> bool
     if store_zcard(ctx.store, key) < 0
         let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
-        ctx_write_error_sv(ctx, wrongtype)
+        ctx_write_error(ctx, wrongtype)
         return true
     return false
 
@@ -879,17 +848,17 @@ fn zadd_flag(arg: *RespArg) -> i32
     let lt: StrView = "LT"
     let ch: StrView = "CH"
     let incr: StrView = "INCR"
-    if resp_arg_eq_ci_sv(arg, nx) == 1
+    if resp_arg_eq_ci(arg, nx) == 1
         return ZADD_NX
-    if resp_arg_eq_ci_sv(arg, xx) == 1
+    if resp_arg_eq_ci(arg, xx) == 1
         return ZADD_XX
-    if resp_arg_eq_ci_sv(arg, gt) == 1
+    if resp_arg_eq_ci(arg, gt) == 1
         return ZADD_GT
-    if resp_arg_eq_ci_sv(arg, lt) == 1
+    if resp_arg_eq_ci(arg, lt) == 1
         return ZADD_LT
-    if resp_arg_eq_ci_sv(arg, ch) == 1
+    if resp_arg_eq_ci(arg, ch) == 1
         return ZADD_CH
-    if resp_arg_eq_ci_sv(arg, incr) == 1
+    if resp_arg_eq_ci(arg, incr) == 1
         return ZADD_INCR
     return 0
 
@@ -913,19 +882,19 @@ fn zadd_apply(ctx: *CommandContext, cmd: *RespCommand, scoreidx: i32, flags: i32
     let elements: i32 = cmd.argc - scoreidx
     if elements % 2 != 0 or elements == 0
         let err: StrView = "ERR syntax error"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
     if nx and xx
         let err: StrView = "ERR XX and NX options at the same time are not compatible"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
     if (gt and nx) or (lt and nx) or (gt and lt)
         let err: StrView = "ERR GT, LT, and/or NX options at the same time are not compatible"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
     if incr and elements > 2
         let err: StrView = "ERR INCR option supports a single increment-element pair"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
 
     # Every score is checked before anything is added, so a bad one leaves
@@ -934,9 +903,9 @@ fn zadd_apply(ctx: *CommandContext, cmd: *RespCommand, scoreidx: i32, flags: i32
     while i < cmd.argc
         var score: f64 = 0.0
         let arg: *RespArg = @cmd.args[i]
-        if score_parse(arg.data, arg.len, @score) == 0
+        if score_parse(resp_arg_sv(arg), @score) == 0
             let err: StrView = "ERR value is not a valid float"
-            ctx_write_error_sv(ctx, err)
+            ctx_write_error(ctx, err)
             return CMD_ERR_SYNTAX
         i += 2
 
@@ -954,7 +923,7 @@ fn zadd_apply(ctx: *CommandContext, cmd: *RespCommand, scoreidx: i32, flags: i32
     while i < cmd.argc
         var score: f64 = 0.0
         let arg: *RespArg = @cmd.args[i]
-        score_parse(arg.data, arg.len, @score)
+        score_parse(resp_arg_sv(arg), @score)
         var member_sv: StrView = resp_arg_sv(@cmd.args[i + 1])
         i += 2
 
@@ -966,7 +935,7 @@ fn zadd_apply(ctx: *CommandContext, cmd: *RespCommand, scoreidx: i32, flags: i32
                 score = cur + score
                 if score_is_nan(score)
                     let err: StrView = "ERR resulting score is not a number (NaN)"
-                    ctx_write_error_sv(ctx, err)
+                    ctx_write_error(ctx, err)
                     return CMD_ERR_SYNTAX
             if (lt and score >= cur) or (gt and score <= cur)
                 continue
@@ -987,7 +956,7 @@ fn zadd_apply(ctx: *CommandContext, cmd: *RespCommand, scoreidx: i32, flags: i32
         else
             var digits: [32]u8
             let n: i64 = score_format(newscore, @digits[0])
-            ctx_write_bulk(ctx, @digits[0], n)
+            ctx_write_bulk(ctx, strview_from_ptr(@digits[0], n))
         return CMD_OK
     if ch
         ctx_write_int(ctx, added + updated)
@@ -1000,7 +969,7 @@ fn zadd_apply(ctx: *CommandContext, cmd: *RespCommand, scoreidx: i32, flags: i32
 fn cmd_zadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 4
         let err: StrView = "ERR wrong number of arguments for 'zadd' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
     var flags: i32 = 0
     var scoreidx: i32 = 2
@@ -1017,7 +986,7 @@ fn cmd_zadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_zincrby(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 4
         let err: StrView = "ERR wrong number of arguments for 'zincrby' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
     return zadd_apply(ctx, cmd, 2, ZADD_INCR)
 
@@ -1026,7 +995,7 @@ fn cmd_zincrby(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_zrem(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc < 3
         let err: StrView = "ERR wrong number of arguments for 'zrem' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -1046,7 +1015,7 @@ fn cmd_zrem(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_zscore(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 3
         let err: StrView = "ERR wrong number of arguments for 'zscore' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -1061,26 +1030,24 @@ fn cmd_zscore(ctx: *CommandContext, cmd: *RespCommand) -> i32
 
     var digits: [32]u8
     let n: i64 = score_format(score, @digits[0])
-    ctx_write_bulk(ctx, @digits[0], n)
+    ctx_write_bulk(ctx, strview_from_ptr(@digits[0], n))
     return CMD_OK
 
 
 # ZRANK / ZREVRANK key member [WITHSCORE]: the 0-based rank as an integer,
 # nil if the member (or the key) is missing.  With WITHSCORE the reply is
 # [rank, score], and a miss is a nil array.
-fn cmd_zrank(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> i32
+fn cmd_zrank(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: StrView) -> i32
     if cmd.argc < 3 or cmd.argc > 4
-        var err: [96]u8
-        argc_error(@err[0], name)
-        ctx_write_error(ctx, @err[0])
+        argc_error(ctx, name)
         return CMD_ERR_ARGC
 
     var withscore: bool = false
     if cmd.argc == 4
         let opt: StrView = "WITHSCORE"
-        if resp_arg_eq_ci_sv(@cmd.args[3], opt) != 1
+        if resp_arg_eq_ci(@cmd.args[3], opt) != 1
             let err: StrView = "ERR syntax error"
-            ctx_write_error_sv(ctx, err)
+            ctx_write_error(ctx, err)
             return CMD_ERR_SYNTAX
         withscore = true
 
@@ -1113,7 +1080,7 @@ fn cmd_zrank(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> i
         return CMD_OK
     var pos: i32 = resp_write_array(ctx.resp_buf, 2)
     pos += resp_write_i64(ctx.resp_buf + pos, rank)
-    pos += resp_write_bulk(ctx.resp_buf + pos, @digits[0], n)
+    pos += resp_write_bulk(ctx.resp_buf + pos, strview_from_ptr(@digits[0], n))
     ctx.resp_len = pos
     return CMD_OK
 
@@ -1122,7 +1089,7 @@ fn cmd_zrank(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> i
 fn cmd_zcard(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'zcard' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -1162,14 +1129,12 @@ fn ctx_write_zitems(ctx: *CommandContext, items: *ZItem, count: i64, withscores:
 # The score is read with Redis's raw strtod, not string2d: "" or a bare "("
 # is 0, 1e400 is inf, leading space and hex are taken (AGAST #4311).
 fn parse_score_bound(arg: *RespArg, out: *f64, excl: *bool) -> bool
-    var p: *u8 = arg.data
-    var len: i64 = arg.len
+    var text: StrView = resp_arg_sv(arg)
     *excl = false
-    if len > 0 and *p == 40                 # '('
+    if text.len > 0 and text.get(0) == 40   # '('
         *excl = true
-        p = p + 1
-        len -= 1
-    return score_parse_bound(p, len, out) == 1
+        text = text.skip(1)
+    return score_parse_bound(text, out) == 1
 
 
 # Parse a lexicographic bound as Redis's zslParseLexRangeItem: "-", "+",
@@ -1192,7 +1157,7 @@ fn parse_lex_bound(arg: *RespArg, b: *ZLexBound) -> bool
         return false
     b.kind = ZLEX_VALUE
     b.excl = c == 40
-    b.value = strview_from_ptr(arg.data + 1, arg.len - 1)
+    b.value = resp_arg_sv(arg).skip(1)
     return true
 
 
@@ -1226,11 +1191,9 @@ struct ZRangeOpts
 #
 # Options, bounds and the rank reply are cmd_zrange_<step> helpers (AGAST
 # #4619: one fn was over the LARB v4 complexity line).
-fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direction_in: i32, name: *u8) -> i32
+fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direction_in: i32, name: StrView) -> i32
     if cmd.argc < 4
-        var err: [96]u8
-        argc_error(@err[0], name)
-        ctx_write_error(ctx, @err[0])
+        argc_error(ctx, name)
         return CMD_ERR_ARGC
 
     var opts: ZRangeOpts
@@ -1281,9 +1244,9 @@ fn cmd_zrange_opts(ctx: *CommandContext, cmd: *RespCommand, opts: *ZRangeOpts) -
     while j < cmd.argc
         let opt: *RespArg = @cmd.args[j]
         let left: i32 = cmd.argc - j - 1
-        if resp_arg_eq_ci_sv(opt, o_withscores) == 1
+        if resp_arg_eq_ci(opt, o_withscores) == 1
             opts.withscores = true
-        else if resp_arg_eq_ci_sv(opt, o_limit) == 1 and left >= 2
+        else if resp_arg_eq_ci(opt, o_limit) == 1 and left >= 2
             var ok: i32 = 0
             var ok2: i32 = 0
             opts.offset = resp_arg_to_int(@cmd.args[j + 1], @ok)
@@ -1291,18 +1254,18 @@ fn cmd_zrange_opts(ctx: *CommandContext, cmd: *RespCommand, opts: *ZRangeOpts) -
                 opts.limit = resp_arg_to_int(@cmd.args[j + 2], @ok2)
             if ok == 0 or ok2 == 0
                 let notint: StrView = "ERR value is not an integer or out of range"
-                ctx_write_error_sv(ctx, notint)
+                ctx_write_error(ctx, notint)
                 return CMD_ERR_SYNTAX
             j += 2
-        else if opts.direction == ZDIR_AUTO and resp_arg_eq_ci_sv(opt, o_rev) == 1
+        else if opts.direction == ZDIR_AUTO and resp_arg_eq_ci(opt, o_rev) == 1
             opts.direction = ZDIR_REVERSE
-        else if opts.rangetype == ZRANGE_AUTO and resp_arg_eq_ci_sv(opt, o_bylex) == 1
+        else if opts.rangetype == ZRANGE_AUTO and resp_arg_eq_ci(opt, o_bylex) == 1
             opts.rangetype = ZRANGE_BY_LEX
-        else if opts.rangetype == ZRANGE_AUTO and resp_arg_eq_ci_sv(opt, o_byscore) == 1
+        else if opts.rangetype == ZRANGE_AUTO and resp_arg_eq_ci(opt, o_byscore) == 1
             opts.rangetype = ZRANGE_BY_SCORE
         else
             let err: StrView = "ERR syntax error"
-            ctx_write_error_sv(ctx, err)
+            ctx_write_error(ctx, err)
             return CMD_ERR_SYNTAX
         j += 1
 
@@ -1310,11 +1273,11 @@ fn cmd_zrange_opts(ctx: *CommandContext, cmd: *RespCommand, opts: *ZRangeOpts) -
         opts.rangetype = ZRANGE_RANK
     if opts.limit != -1 and opts.rangetype == ZRANGE_RANK
         let err: StrView = "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
     if opts.withscores and opts.rangetype == ZRANGE_BY_LEX
         let err: StrView = "ERR syntax error, WITHSCORES not supported in combination with BYLEX"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
     return CMD_OK
 
@@ -1336,17 +1299,17 @@ fn cmd_zrange_bounds(ctx: *CommandContext, cmd: *RespCommand, rangetype: i32, re
         *stop = resp_arg_to_int(@cmd.args[3], @ok2)
         if ok == 0 or ok2 == 0
             let notint: StrView = "ERR value is not an integer or out of range"
-            ctx_write_error_sv(ctx, notint)
+            ctx_write_error(ctx, notint)
             return CMD_ERR_SYNTAX
     else if rangetype == ZRANGE_BY_SCORE
         if not parse_score_bound(@cmd.args[minidx], @spec.min, @spec.minex) or not parse_score_bound(@cmd.args[maxidx], @spec.max, @spec.maxex)
             let err: StrView = "ERR min or max is not a float"
-            ctx_write_error_sv(ctx, err)
+            ctx_write_error(ctx, err)
             return CMD_ERR_SYNTAX
     else
         if not parse_lex_bound(@cmd.args[minidx], @spec.lmin) or not parse_lex_bound(@cmd.args[maxidx], @spec.lmax)
             let err: StrView = "ERR min or max not valid string range item"
-            ctx_write_error_sv(ctx, err)
+            ctx_write_error(ctx, err)
             return CMD_ERR_SYNTAX
     return CMD_OK
 
@@ -1378,14 +1341,14 @@ fn cmd_zrange_by_rank(ctx: *CommandContext, key_sv: StrView, start: i64, stop: i
 fn cmd_zcount(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 4
         let err: StrView = "ERR wrong number of arguments for 'zcount' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
 
     var spec: ZRangeSpec
     spec.by = ZRANGE_BY_SCORE
     if not parse_score_bound(@cmd.args[2], @spec.min, @spec.minex) or not parse_score_bound(@cmd.args[3], @spec.max, @spec.maxex)
         let err: StrView = "ERR min or max is not a float"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
@@ -1403,7 +1366,7 @@ fn cmd_zcount(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_command(ctx: *CommandContext, cmd: *RespCommand) -> i32
     # Return minimal info - list of supported commands
     let ok: StrView = "OK"
-    ctx_write_simple_sv(ctx, ok)
+    ctx_write_simple(ctx, ok)
     return CMD_OK
 
 
@@ -1411,7 +1374,7 @@ fn cmd_command(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_info(ctx: *CommandContext, cmd: *RespCommand) -> i32
     # Return minimal server info
     let info: StrView = "# Server\r\ntome_version:0.1.0\r\n"
-    ctx_write_bulk(ctx, info.ptr, info.len)
+    ctx_write_bulk(ctx, info)
     return CMD_OK
 
 
@@ -1426,7 +1389,7 @@ fn cmd_dbsize(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_flushdb(ctx: *CommandContext, cmd: *RespCommand) -> i32
     store_clear(ctx.store)
     let ok: StrView = "OK"
-    ctx_write_simple_sv(ctx, ok)
+    ctx_write_simple(ctx, ok)
     return CMD_OK
 
 
@@ -1435,36 +1398,33 @@ fn cmd_flushdb(ctx: *CommandContext, cmd: *RespCommand) -> i32
 fn cmd_auth(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc != 2
         let err: StrView = "ERR wrong number of arguments for 'auth' command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_ARGC
-
-    # Check if password is required
-    if ctx.password == null
-        let err: StrView = "ERR Client sent AUTH, but no password is set"
-        ctx_write_error_sv(ctx, err)
-        return CMD_ERR_SYNTAX
 
     # Compare the whole argument (data, len) with the required password in
     # constant time (AGAST #1863). The old copy-then-strcmp leaked the match
     # length through timing and ignored anything after an embedded NUL or
     # past byte 255.
-    let provided: *RespArg = @cmd.args[1]
-    let given: StrView = strview_from_ptr(provided.data, provided.len)
-    if ct_eq(given, strview_from_cstr(ctx.password))
-        ctx.is_authenticated = 1
-        let ok: StrView = "OK"
-        ctx_write_simple_sv(ctx, ok)
-        return CMD_OK
-    else
-        let err: StrView = "ERR invalid password"
-        ctx_write_error_sv(ctx, err)
-        return CMD_ERR_SYNTAX
+    match ctx.password
+        None =>
+            let err: StrView = "ERR Client sent AUTH, but no password is set"
+            ctx_write_error(ctx, err)
+            return CMD_ERR_SYNTAX
+        Some(required) =>
+            if ct_eq(resp_arg_sv(@cmd.args[1]), required)
+                ctx.is_authenticated = 1
+                let ok: StrView = "OK"
+                ctx_write_simple(ctx, ok)
+                return CMD_OK
+            let err: StrView = "ERR invalid password"
+            ctx_write_error(ctx, err)
+            return CMD_ERR_SYNTAX
 
 
 # Check if client is authenticated (for use in dispatcher)
 fn require_auth(ctx: *CommandContext) -> i32
     # No password required = always authenticated
-    if ctx.password == null
+    if ctx.password.is_none()
         return 1
     # Check authentication state
     return ctx.is_authenticated
@@ -1483,22 +1443,22 @@ const DISPATCH_MISS: i32 = -100
 # Server commands; DISPATCH_MISS if c names none of them
 fn dispatch_server(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_ping_name: StrView = "PING"
-    if resp_arg_eq_ci_sv(c, cmd_ping_name) == 1
+    if resp_arg_eq_ci(c, cmd_ping_name) == 1
         return cmd_ping(ctx, cmd)
     let cmd_echo_name: StrView = "ECHO"
-    if resp_arg_eq_ci_sv(c, cmd_echo_name) == 1
+    if resp_arg_eq_ci(c, cmd_echo_name) == 1
         return cmd_echo(ctx, cmd)
     let cmd_command_name: StrView = "COMMAND"
-    if resp_arg_eq_ci_sv(c, cmd_command_name) == 1
+    if resp_arg_eq_ci(c, cmd_command_name) == 1
         return cmd_command(ctx, cmd)
     let cmd_info_name: StrView = "INFO"
-    if resp_arg_eq_ci_sv(c, cmd_info_name) == 1
+    if resp_arg_eq_ci(c, cmd_info_name) == 1
         return cmd_info(ctx, cmd)
     let cmd_dbsize_name: StrView = "DBSIZE"
-    if resp_arg_eq_ci_sv(c, cmd_dbsize_name) == 1
+    if resp_arg_eq_ci(c, cmd_dbsize_name) == 1
         return cmd_dbsize(ctx, cmd)
     let cmd_flushdb_name: StrView = "FLUSHDB"
-    if resp_arg_eq_ci_sv(c, cmd_flushdb_name) == 1
+    if resp_arg_eq_ci(c, cmd_flushdb_name) == 1
         return cmd_flushdb(ctx, cmd)
     return DISPATCH_MISS
 
@@ -1506,40 +1466,40 @@ fn dispatch_server(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
 # String commands; DISPATCH_MISS if c names none of them
 fn dispatch_string(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_get_name: StrView = "GET"
-    if resp_arg_eq_ci_sv(c, cmd_get_name) == 1
+    if resp_arg_eq_ci(c, cmd_get_name) == 1
         return cmd_get(ctx, cmd)
     let cmd_set_name: StrView = "SET"
-    if resp_arg_eq_ci_sv(c, cmd_set_name) == 1
+    if resp_arg_eq_ci(c, cmd_set_name) == 1
         return cmd_set(ctx, cmd)
     let cmd_incr_name: StrView = "INCR"
-    if resp_arg_eq_ci_sv(c, cmd_incr_name) == 1
-        return cmd_incr(ctx, cmd, 1, c"incr")
+    if resp_arg_eq_ci(c, cmd_incr_name) == 1
+        return cmd_incr(ctx, cmd, 1, "incr")
     let cmd_decr_name: StrView = "DECR"
-    if resp_arg_eq_ci_sv(c, cmd_decr_name) == 1
-        return cmd_incr(ctx, cmd, -1, c"decr")
+    if resp_arg_eq_ci(c, cmd_decr_name) == 1
+        return cmd_incr(ctx, cmd, -1, "decr")
     let cmd_incrby_name: StrView = "INCRBY"
-    if resp_arg_eq_ci_sv(c, cmd_incrby_name) == 1
-        return cmd_incrby(ctx, cmd, 1, c"incrby")
+    if resp_arg_eq_ci(c, cmd_incrby_name) == 1
+        return cmd_incrby(ctx, cmd, 1, "incrby")
     let cmd_decrby_name: StrView = "DECRBY"
-    if resp_arg_eq_ci_sv(c, cmd_decrby_name) == 1
-        return cmd_incrby(ctx, cmd, -1, c"decrby")
+    if resp_arg_eq_ci(c, cmd_decrby_name) == 1
+        return cmd_incrby(ctx, cmd, -1, "decrby")
     let cmd_setex_name: StrView = "SETEX"
-    if resp_arg_eq_ci_sv(c, cmd_setex_name) == 1
+    if resp_arg_eq_ci(c, cmd_setex_name) == 1
         return cmd_setex(ctx, cmd)
     let cmd_del_name: StrView = "DEL"
-    if resp_arg_eq_ci_sv(c, cmd_del_name) == 1
+    if resp_arg_eq_ci(c, cmd_del_name) == 1
         return cmd_del(ctx, cmd)
     let cmd_exists_name: StrView = "EXISTS"
-    if resp_arg_eq_ci_sv(c, cmd_exists_name) == 1
+    if resp_arg_eq_ci(c, cmd_exists_name) == 1
         return cmd_exists(ctx, cmd)
     let cmd_ttl_name: StrView = "TTL"
-    if resp_arg_eq_ci_sv(c, cmd_ttl_name) == 1
+    if resp_arg_eq_ci(c, cmd_ttl_name) == 1
         return cmd_ttl(ctx, cmd)
     let cmd_expire_name: StrView = "EXPIRE"
-    if resp_arg_eq_ci_sv(c, cmd_expire_name) == 1
+    if resp_arg_eq_ci(c, cmd_expire_name) == 1
         return cmd_expire(ctx, cmd)
     let cmd_persist_name: StrView = "PERSIST"
-    if resp_arg_eq_ci_sv(c, cmd_persist_name) == 1
+    if resp_arg_eq_ci(c, cmd_persist_name) == 1
         return cmd_persist(ctx, cmd)
     return DISPATCH_MISS
 
@@ -1547,25 +1507,25 @@ fn dispatch_string(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
 # List commands; DISPATCH_MISS if c names none of them
 fn dispatch_list(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_lpush_name: StrView = "LPUSH"
-    if resp_arg_eq_ci_sv(c, cmd_lpush_name) == 1
+    if resp_arg_eq_ci(c, cmd_lpush_name) == 1
         return cmd_lpush(ctx, cmd)
     let cmd_rpush_name: StrView = "RPUSH"
-    if resp_arg_eq_ci_sv(c, cmd_rpush_name) == 1
+    if resp_arg_eq_ci(c, cmd_rpush_name) == 1
         return cmd_rpush(ctx, cmd)
     let cmd_lpop_name: StrView = "LPOP"
-    if resp_arg_eq_ci_sv(c, cmd_lpop_name) == 1
+    if resp_arg_eq_ci(c, cmd_lpop_name) == 1
         return cmd_lpop(ctx, cmd)
     let cmd_rpop_name: StrView = "RPOP"
-    if resp_arg_eq_ci_sv(c, cmd_rpop_name) == 1
+    if resp_arg_eq_ci(c, cmd_rpop_name) == 1
         return cmd_rpop(ctx, cmd)
     let cmd_llen_name: StrView = "LLEN"
-    if resp_arg_eq_ci_sv(c, cmd_llen_name) == 1
+    if resp_arg_eq_ci(c, cmd_llen_name) == 1
         return cmd_llen(ctx, cmd)
     let cmd_lindex_name: StrView = "LINDEX"
-    if resp_arg_eq_ci_sv(c, cmd_lindex_name) == 1
+    if resp_arg_eq_ci(c, cmd_lindex_name) == 1
         return cmd_lindex(ctx, cmd)
     let cmd_lrange_name: StrView = "LRANGE"
-    if resp_arg_eq_ci_sv(c, cmd_lrange_name) == 1
+    if resp_arg_eq_ci(c, cmd_lrange_name) == 1
         return cmd_lrange(ctx, cmd)
     return DISPATCH_MISS
 
@@ -1573,19 +1533,19 @@ fn dispatch_list(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
 # Set commands; DISPATCH_MISS if c names none of them
 fn dispatch_set(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_sadd_name: StrView = "SADD"
-    if resp_arg_eq_ci_sv(c, cmd_sadd_name) == 1
+    if resp_arg_eq_ci(c, cmd_sadd_name) == 1
         return cmd_sadd(ctx, cmd)
     let cmd_srem_name: StrView = "SREM"
-    if resp_arg_eq_ci_sv(c, cmd_srem_name) == 1
+    if resp_arg_eq_ci(c, cmd_srem_name) == 1
         return cmd_srem(ctx, cmd)
     let cmd_sismember_name: StrView = "SISMEMBER"
-    if resp_arg_eq_ci_sv(c, cmd_sismember_name) == 1
+    if resp_arg_eq_ci(c, cmd_sismember_name) == 1
         return cmd_sismember(ctx, cmd)
     let cmd_scard_name: StrView = "SCARD"
-    if resp_arg_eq_ci_sv(c, cmd_scard_name) == 1
+    if resp_arg_eq_ci(c, cmd_scard_name) == 1
         return cmd_scard(ctx, cmd)
     let cmd_smembers_name: StrView = "SMEMBERS"
-    if resp_arg_eq_ci_sv(c, cmd_smembers_name) == 1
+    if resp_arg_eq_ci(c, cmd_smembers_name) == 1
         return cmd_smembers(ctx, cmd)
     return DISPATCH_MISS
 
@@ -1593,28 +1553,28 @@ fn dispatch_set(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
 # Hash commands; DISPATCH_MISS if c names none of them
 fn dispatch_hash(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_hset_name: StrView = "HSET"
-    if resp_arg_eq_ci_sv(c, cmd_hset_name) == 1
+    if resp_arg_eq_ci(c, cmd_hset_name) == 1
         return cmd_hset(ctx, cmd)
     let cmd_hget_name: StrView = "HGET"
-    if resp_arg_eq_ci_sv(c, cmd_hget_name) == 1
+    if resp_arg_eq_ci(c, cmd_hget_name) == 1
         return cmd_hget(ctx, cmd)
     let cmd_hdel_name: StrView = "HDEL"
-    if resp_arg_eq_ci_sv(c, cmd_hdel_name) == 1
+    if resp_arg_eq_ci(c, cmd_hdel_name) == 1
         return cmd_hdel(ctx, cmd)
     let cmd_hexists_name: StrView = "HEXISTS"
-    if resp_arg_eq_ci_sv(c, cmd_hexists_name) == 1
+    if resp_arg_eq_ci(c, cmd_hexists_name) == 1
         return cmd_hexists(ctx, cmd)
     let cmd_hlen_name: StrView = "HLEN"
-    if resp_arg_eq_ci_sv(c, cmd_hlen_name) == 1
+    if resp_arg_eq_ci(c, cmd_hlen_name) == 1
         return cmd_hlen(ctx, cmd)
     let cmd_hkeys_name: StrView = "HKEYS"
-    if resp_arg_eq_ci_sv(c, cmd_hkeys_name) == 1
+    if resp_arg_eq_ci(c, cmd_hkeys_name) == 1
         return cmd_hkeys(ctx, cmd)
     let cmd_hvals_name: StrView = "HVALS"
-    if resp_arg_eq_ci_sv(c, cmd_hvals_name) == 1
+    if resp_arg_eq_ci(c, cmd_hvals_name) == 1
         return cmd_hvals(ctx, cmd)
     let cmd_hgetall_name: StrView = "HGETALL"
-    if resp_arg_eq_ci_sv(c, cmd_hgetall_name) == 1
+    if resp_arg_eq_ci(c, cmd_hgetall_name) == 1
         return cmd_hgetall(ctx, cmd)
     return DISPATCH_MISS
 
@@ -1622,47 +1582,47 @@ fn dispatch_hash(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
 # Sorted set commands; DISPATCH_MISS if c names none of them
 fn dispatch_zset(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
     let cmd_zadd_name: StrView = "ZADD"
-    if resp_arg_eq_ci_sv(c, cmd_zadd_name) == 1
+    if resp_arg_eq_ci(c, cmd_zadd_name) == 1
         return cmd_zadd(ctx, cmd)
     let cmd_zrem_name: StrView = "ZREM"
-    if resp_arg_eq_ci_sv(c, cmd_zrem_name) == 1
+    if resp_arg_eq_ci(c, cmd_zrem_name) == 1
         return cmd_zrem(ctx, cmd)
     let cmd_zscore_name: StrView = "ZSCORE"
-    if resp_arg_eq_ci_sv(c, cmd_zscore_name) == 1
+    if resp_arg_eq_ci(c, cmd_zscore_name) == 1
         return cmd_zscore(ctx, cmd)
     let cmd_zrank_name: StrView = "ZRANK"
-    if resp_arg_eq_ci_sv(c, cmd_zrank_name) == 1
-        return cmd_zrank(ctx, cmd, false, c"zrank")
+    if resp_arg_eq_ci(c, cmd_zrank_name) == 1
+        return cmd_zrank(ctx, cmd, false, "zrank")
     let cmd_zrevrank_name: StrView = "ZREVRANK"
-    if resp_arg_eq_ci_sv(c, cmd_zrevrank_name) == 1
-        return cmd_zrank(ctx, cmd, true, c"zrevrank")
+    if resp_arg_eq_ci(c, cmd_zrevrank_name) == 1
+        return cmd_zrank(ctx, cmd, true, "zrevrank")
     let cmd_zcard_name: StrView = "ZCARD"
-    if resp_arg_eq_ci_sv(c, cmd_zcard_name) == 1
+    if resp_arg_eq_ci(c, cmd_zcard_name) == 1
         return cmd_zcard(ctx, cmd)
     let cmd_zcount_name: StrView = "ZCOUNT"
-    if resp_arg_eq_ci_sv(c, cmd_zcount_name) == 1
+    if resp_arg_eq_ci(c, cmd_zcount_name) == 1
         return cmd_zcount(ctx, cmd)
     let cmd_zincrby_name: StrView = "ZINCRBY"
-    if resp_arg_eq_ci_sv(c, cmd_zincrby_name) == 1
+    if resp_arg_eq_ci(c, cmd_zincrby_name) == 1
         return cmd_zincrby(ctx, cmd)
     let cmd_zrange_name: StrView = "ZRANGE"
-    if resp_arg_eq_ci_sv(c, cmd_zrange_name) == 1
-        return cmd_zrange(ctx, cmd, ZRANGE_AUTO, ZDIR_AUTO, c"zrange")
+    if resp_arg_eq_ci(c, cmd_zrange_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_AUTO, ZDIR_AUTO, "zrange")
     let cmd_zrevrange_name: StrView = "ZREVRANGE"
-    if resp_arg_eq_ci_sv(c, cmd_zrevrange_name) == 1
-        return cmd_zrange(ctx, cmd, ZRANGE_RANK, ZDIR_REVERSE, c"zrevrange")
+    if resp_arg_eq_ci(c, cmd_zrevrange_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_RANK, ZDIR_REVERSE, "zrevrange")
     let cmd_zrangebyscore_name: StrView = "ZRANGEBYSCORE"
-    if resp_arg_eq_ci_sv(c, cmd_zrangebyscore_name) == 1
-        return cmd_zrange(ctx, cmd, ZRANGE_BY_SCORE, ZDIR_FORWARD, c"zrangebyscore")
+    if resp_arg_eq_ci(c, cmd_zrangebyscore_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_BY_SCORE, ZDIR_FORWARD, "zrangebyscore")
     let cmd_zrevrangebyscore_name: StrView = "ZREVRANGEBYSCORE"
-    if resp_arg_eq_ci_sv(c, cmd_zrevrangebyscore_name) == 1
-        return cmd_zrange(ctx, cmd, ZRANGE_BY_SCORE, ZDIR_REVERSE, c"zrevrangebyscore")
+    if resp_arg_eq_ci(c, cmd_zrevrangebyscore_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_BY_SCORE, ZDIR_REVERSE, "zrevrangebyscore")
     let cmd_zrangebylex_name: StrView = "ZRANGEBYLEX"
-    if resp_arg_eq_ci_sv(c, cmd_zrangebylex_name) == 1
-        return cmd_zrange(ctx, cmd, ZRANGE_BY_LEX, ZDIR_FORWARD, c"zrangebylex")
+    if resp_arg_eq_ci(c, cmd_zrangebylex_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_BY_LEX, ZDIR_FORWARD, "zrangebylex")
     let cmd_zrevrangebylex_name: StrView = "ZREVRANGEBYLEX"
-    if resp_arg_eq_ci_sv(c, cmd_zrevrangebylex_name) == 1
-        return cmd_zrange(ctx, cmd, ZRANGE_BY_LEX, ZDIR_REVERSE, c"zrevrangebylex")
+    if resp_arg_eq_ci(c, cmd_zrevrangebylex_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_BY_LEX, ZDIR_REVERSE, "zrevrangebylex")
     return DISPATCH_MISS
 
 
@@ -1670,14 +1630,14 @@ fn dispatch_zset(ctx: *CommandContext, cmd: *RespCommand, c: *RespArg) -> i32
 pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if cmd.argc == 0
         let err: StrView = "ERR empty command"
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
 
     let c: *RespArg = @cmd.args[0]
 
     # AUTH command - always allowed (needed to authenticate)
     let cmd_auth_name: StrView = "AUTH"
-    if resp_arg_eq_ci_sv(c, cmd_auth_name) == 1
+    if resp_arg_eq_ci(c, cmd_auth_name) == 1
         return cmd_auth(ctx, cmd)
 
     # Check authentication for all other commands. PING is NOT exempt: with
@@ -1685,7 +1645,7 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     # (only AUTH/HELLO/QUIT are no-auth), and so does tome (AGAST #1686).
     if require_auth(ctx) == 0
         let err: StrView = "NOAUTH Authentication required."
-        ctx_write_error_sv(ctx, err)
+        ctx_write_error(ctx, err)
         return CMD_ERR_SYNTAX
 
     # Families in the original match order: server, string, list, set,
@@ -1711,5 +1671,5 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
 
     # Unknown command
     let err: StrView = "ERR unknown command"
-    ctx_write_error_sv(ctx, err)
+    ctx_write_error(ctx, err)
     return CMD_ERR_UNKNOWN

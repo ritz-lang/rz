@@ -67,10 +67,10 @@ struct RespParser
     command: RespCommand # Parsed command output
 
 
-# Initialize parser with a buffer
-pub fn resp_parser_init(p: *RespParser, buf: *u8, len: i64)
-    p.buf = buf
-    p.len = len
+# Initialize parser over `input` (borrowed: args point into it)
+pub fn resp_parser_init(p: *RespParser, input: StrView)
+    p.buf = input.ptr
+    p.len = input.len
     p.pos = 0
     p.command.argc = 0
 
@@ -118,13 +118,13 @@ fn resp_read_crlf(p: *RespParser) -> i32
     return -1
 
 
-# A RESP integer, data[0..len): '-' and digits only (Redis takes no '+'),
-# within i64, read by ritzlib's strview_parse_i64 (#1958).  Returns 1 and
-# sets *out, or 0.
-pub fn resp_parse_i64(data: *u8, len: i64, out: *i64) -> i32
-    if len > 0 and *data == 43  # '+'
+# A RESP integer, the whole of `text`: '-' and digits only (Redis takes no
+# '+'), within i64, read by StrView.parse_i64 (#1958).  Returns 1 and sets
+# *out, or 0.
+pub fn resp_parse_i64(text: StrView, out: *i64) -> i32
+    if text.starts_with("+")
         return 0
-    match (strview_from_ptr(data, len)).parse_i64()
+    match text.parse_i64()
         Some(n) => resp_set_i64(out, n)
         None => 0
 
@@ -134,11 +134,11 @@ fn resp_set_i64(out: *i64, n: i64) -> i32
 
 
 # A command-line integer (tome-server's --port / --workers, tome-cli's
-# --port): the whole NUL-terminated `s` as a RESP integer within [lo, hi].
+# --port): the whole of `s` as a RESP integer within [lo, hi].
 # Returns 1 and sets *out, or 0.
-pub fn tome_parse_int_arg(s: *u8, lo: i64, hi: i64, out: *i64) -> i32
+pub fn tome_parse_int_arg(s: StrView, lo: i64, hi: i64, out: *i64) -> i32
     var n: i64 = 0
-    if resp_parse_i64(s, strlen(s), @n) == 0 or n < lo or n > hi
+    if resp_parse_i64(s, @n) == 0 or n < lo or n > hi
         return 0
     return resp_set_i64(out, n)
 
@@ -168,7 +168,7 @@ pub fn resp_read_int(p: *RespParser, ok: *i32) -> i64
         end += 1
 
     var val: i64 = 0
-    if resp_parse_i64(p.buf + start, end - start, @val) == 0
+    if resp_parse_i64(strview_from_ptr(p.buf + start, end - start), @val) == 0
         *ok = -1
         return 0  # No digits, a bare '-', or outside i64
     p.pos = end
@@ -350,29 +350,7 @@ fn resp_parse_inline(p: *RespParser) -> i32
 
 # Write a simple string: +<string>\r\n
 # Returns bytes written
-pub fn resp_write_simple(buf: *u8, s: *u8) -> i32
-    var pos: i32 = 0
-    let ptr0: *u8 = buf + pos
-    *ptr0 = 43  # '+'
-    pos += 1
-
-    let len: i64 = strlen(s)
-    memcpy(buf + pos, s, len)
-    pos += len as i32
-
-    let ptr1: *u8 = buf + pos
-    *ptr1 = 13  # '\r'
-    pos += 1
-    let ptr2: *u8 = buf + pos
-    *ptr2 = 10  # '\n'
-    pos += 1
-
-    return pos
-
-
-# Write a simple string from StrView: +<string>\r\n
-# Returns bytes written
-pub fn resp_write_simple_sv(buf: *u8, s: StrView) -> i32
+pub fn resp_write_simple(buf: *u8, s: StrView) -> i32
     var pos: i32 = 0
     let ptr0: *u8 = buf + pos
     *ptr0 = 43  # '+'
@@ -392,28 +370,7 @@ pub fn resp_write_simple_sv(buf: *u8, s: StrView) -> i32
 
 
 # Write an error: -<error>\r\n
-pub fn resp_write_error(buf: *u8, s: *u8) -> i32
-    var pos: i32 = 0
-    let ptr0: *u8 = buf + pos
-    *ptr0 = 45  # '-'
-    pos += 1
-
-    let len: i64 = strlen(s)
-    memcpy(buf + pos, s, len)
-    pos += len as i32
-
-    let ptr1: *u8 = buf + pos
-    *ptr1 = 13  # '\r'
-    pos += 1
-    let ptr2: *u8 = buf + pos
-    *ptr2 = 10  # '\n'
-    pos += 1
-
-    return pos
-
-
-# Write an error from StrView: -<error>\r\n
-pub fn resp_write_error_sv(buf: *u8, s: StrView) -> i32
+pub fn resp_write_error(buf: *u8, s: StrView) -> i32
     var pos: i32 = 0
     let ptr0: *u8 = buf + pos
     *ptr0 = 45  # '-'
@@ -443,8 +400,9 @@ pub fn resp_write_i64(buf: *u8, n: i64) -> i32
     return (pos + 2) as i32
 
 
-# Write a bulk string: $<len>\r\n<data>\r\n
-pub fn resp_write_bulk(buf: *u8, data: *u8, len: i64) -> i32
+# Write a bulk string: $<len>\r\n<data>\r\n, every byte of `data`
+pub fn resp_write_bulk(buf: *u8, data: StrView) -> i32
+    let len: i64 = data.len
     var pos: i32 = 0
     let ptr0: *u8 = buf + pos
     *ptr0 = 36  # '$'
@@ -461,7 +419,7 @@ pub fn resp_write_bulk(buf: *u8, data: *u8, len: i64) -> i32
     pos += 1
 
     # Write data
-    memcpy(buf + pos, data, len)
+    memcpy(buf + pos, data.ptr, len)
     pos += len as i32
 
     let ptr3: *u8 = buf + pos
@@ -527,29 +485,8 @@ pub fn resp_write_null_array(buf: *u8) -> i32
 # Argument helpers
 # ============================================================================
 
-# Compare an argument to a string (case-insensitive)
-pub fn resp_arg_eq_ci(arg: *RespArg, s: *u8) -> i32
-    let slen: i64 = strlen(s)
-    if arg.len != slen
-        return 0
-
-    for i in 0..slen
-        let a_ptr: *u8 = arg.data + i
-        let s_ptr: *u8 = s + i
-        var a: u8 = *a_ptr
-        var b: u8 = *s_ptr
-        # Convert to uppercase
-        if a >= 97 && a <= 122
-            a = a - 32
-        if b >= 97 && b <= 122
-            b = b - 32
-        if a != b
-            return 0
-    return 1
-
-
 # Compare an argument to a StrView (case-insensitive)
-pub fn resp_arg_eq_ci_sv(arg: *RespArg, s: StrView) -> i32
+pub fn resp_arg_eq_ci(arg: *RespArg, s: StrView) -> i32
     if arg.len != s.len
         return 0
 
@@ -568,18 +505,11 @@ pub fn resp_arg_eq_ci_sv(arg: *RespArg, s: StrView) -> i32
     return 1
 
 
-# Compare an argument to a string (exact match)
-pub fn resp_arg_eq(arg: *RespArg, s: *u8) -> i32
-    let slen: i64 = strlen(s)
-    if arg.len != slen
-        return 0
-
-    for i in 0..slen
-        let a_ptr: *u8 = arg.data + i
-        let s_ptr: *u8 = s + i
-        if *a_ptr != *s_ptr
-            return 0
-    return 1
+# Compare an argument to a StrView (exact match)
+pub fn resp_arg_eq(arg: *RespArg, s: StrView) -> i32
+    if resp_arg_sv(arg).eq(s)
+        return 1
+    return 0
 
 
 # View an argument in place: every byte of it, NULs included, and no
@@ -589,23 +519,10 @@ pub fn resp_arg_sv(arg: *RespArg) -> StrView
     return strview_from_ptr(arg.data, arg.len)
 
 
-# Get argument as null-terminated string (copies to buffer).  Truncates
-# to buflen-1 bytes and stops reading at an embedded NUL: not for keys or
-# values, see resp_arg_sv.
-pub fn resp_arg_copy(arg: *RespArg, buf: *u8, buflen: i64) -> i32
-    var len: i64 = arg.len
-    if len >= buflen
-        len = buflen - 1
-    memcpy(buf, arg.data, len)
-    let term: *u8 = buf + len
-    *term = 0
-    return len as i32
-
-
 # Parse argument as integer (returns 0 on parse error, ok=1 on success)
 pub fn resp_arg_to_int(arg: *RespArg, ok: *i32) -> i64
     var val: i64 = 0
-    *ok = resp_parse_i64(arg.data, arg.len, @val)
+    *ok = resp_parse_i64(resp_arg_sv(arg), @val)
     return val
 
 

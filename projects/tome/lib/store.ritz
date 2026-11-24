@@ -422,50 +422,36 @@ pub fn store_set(s: *Store, key: StrView, value: StrView)
     # Evict if needed
     store_evict_if_needed(s)
 
-# Get a value by key. Returns null if not found or expired.
-# NOTE: Returns a borrowed pointer - valid until key is modified/deleted.
-# Implements lazy expiration - expired keys are deleted on access.
-pub fn store_get(s: *Store, key: StrView) -> *u8
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return null
-    let now: i64 = time_now_secs()
+# The string value at `key` as a borrowed view (every byte, NULs included),
+# or None if the key is missing, expired or not a string.  The view is valid
+# until the key is modified or deleted.  Expired keys are deleted on access.
+pub fn store_get(s: *Store, key: StrView) -> Option<StrView>
+    let v: StrView = store_get_strview(s, key)
+    if v.ptr == null
+        return None
+    return Some(v)
 
-    # Check expiration (lazy expiration)
-    if entry.expires_at > 0
-        if now >= entry.expires_at
-            store_erase_entry(s, entry)
-            return null
-
-    # Update access time for LRU
-    entry.last_access = now
-
-    if entry.value_type == VALUE_STRING
-        return (entry.value).as_ptr()
-    return null
-
-# Like `store_get` but returns the value as a `StrView` (ptr + len).
-# Necessary for binary-safe values where the caller needs to know the
-# length without scanning for a NUL terminator.  Returns an empty
-# StrView (ptr=null, len=0) on miss / expired / non-string value.
+# Like `store_get`, with a miss / expired / non-string value as an empty
+# view whose ptr is null (a hit's ptr never is, even for "").
 # Triggers lazy expiration like `store_get`.
 pub fn store_get_strview(s: *Store, key: StrView) -> StrView
     let entry: *Entry = store_find_entry(s, key)
     if entry == null
-        return strview_from_ptr(null, 0)
+        return strview_empty()
     let now: i64 = time_now_secs()
 
     if entry.expires_at > 0
         if now >= entry.expires_at
             store_erase_entry(s, entry)
-            return strview_from_ptr(null, 0)
+            return strview_empty()
 
     # Update access time for LRU
     entry.last_access = now
 
     if entry.value_type == VALUE_STRING
+        # as_ptr, not as_view: it is never null, so a hit on "" stays a hit.
         return strview_from_ptr((entry.value).as_ptr(), (entry.value).len())
-    return strview_from_ptr(null, 0)
+    return strview_empty()
 
 # Check if a key exists (not expired).
 # NOTE: This is a const operation - does not trigger lazy expiration.
@@ -597,46 +583,6 @@ pub fn store_expire_sweep(s: *Store) -> i64
     return deleted
 
 # ============================================================================
-# C-string convenience wrappers
-# ============================================================================
-# These functions accept *u8 (null-terminated C strings) for backward
-# compatibility with existing code. They wrap the *StrView-based API.
-
-pub fn store_set_cstr(s: *Store, key: *u8, value: *u8)
-    var key_sv: StrView = strview_from_cstr(key)
-    var val_sv: StrView = strview_from_cstr(value)
-    store_set(s, key_sv, val_sv)
-
-pub fn store_get_cstr(s: *Store, key: *u8) -> *u8
-    var key_sv: StrView = strview_from_cstr(key)
-    return store_get(s, key_sv)
-
-pub fn store_del_cstr(s: *Store, key: *u8) -> i32
-    var key_sv: StrView = strview_from_cstr(key)
-    return store_del(s, key_sv)
-
-pub fn store_exists_cstr(s: *Store, key: *u8) -> i32
-    var key_sv: StrView = strview_from_cstr(key)
-    return store_exists(s, key_sv)
-
-pub fn store_setex_cstr(s: *Store, key: *u8, value: *u8, ttl_secs: i64)
-    var key_sv: StrView = strview_from_cstr(key)
-    var val_sv: StrView = strview_from_cstr(value)
-    store_setex(s, key_sv, val_sv, ttl_secs)
-
-pub fn store_expire_cstr(s: *Store, key: *u8, ttl_secs: i64) -> i32
-    var key_sv: StrView = strview_from_cstr(key)
-    return store_expire(s, key_sv, ttl_secs)
-
-pub fn store_ttl_cstr(s: *Store, key: *u8) -> i64
-    var key_sv: StrView = strview_from_cstr(key)
-    return store_ttl(s, key_sv)
-
-pub fn store_persist_cstr(s: *Store, key: *u8) -> i32
-    var key_sv: StrView = strview_from_cstr(key)
-    return store_persist(s, key_sv)
-
-# ============================================================================
 # Method syntax support
 # ============================================================================
 
@@ -649,29 +595,29 @@ impl Store
             return 1
         return 0
 
-    fn set(self: @&Store, key: *u8, value: *u8)
-        store_set_cstr(self, key, value)
+    fn set(self: @&Store, key: StrView, value: StrView)
+        store_set(self, key, value)
 
-    fn get(self: @&Store, key: *u8) -> *u8
-        return store_get_cstr(self, key)
+    fn get(self: @&Store, key: StrView) -> Option<StrView>
+        return store_get(self, key)
 
-    fn exists(self: @Store, key: *u8) -> i32
-        return store_exists_cstr(self, key)
+    fn exists(self: @Store, key: StrView) -> i32
+        return store_exists(self, key)
 
-    fn del(self: @&Store, key: *u8) -> i32
-        return store_del_cstr(self, key)
+    fn del(self: @&Store, key: StrView) -> i32
+        return store_del(self, key)
 
-    fn setex(self: @&Store, key: *u8, value: *u8, ttl_secs: i64)
-        store_setex_cstr(self, key, value, ttl_secs)
+    fn setex(self: @&Store, key: StrView, value: StrView, ttl_secs: i64)
+        store_setex(self, key, value, ttl_secs)
 
-    fn expire(self: @&Store, key: *u8, ttl_secs: i64) -> i32
-        return store_expire_cstr(self, key, ttl_secs)
+    fn expire(self: @&Store, key: StrView, ttl_secs: i64) -> i32
+        return store_expire(self, key, ttl_secs)
 
-    fn ttl(self: @Store, key: *u8) -> i64
-        return store_ttl_cstr(self, key)
+    fn ttl(self: @Store, key: StrView) -> i64
+        return store_ttl(self, key)
 
-    fn persist(self: @&Store, key: *u8) -> i32
-        return store_persist_cstr(self, key)
+    fn persist(self: @&Store, key: StrView) -> i32
+        return store_persist(self, key)
 
     fn expire_sweep(self: @&Store) -> i64
         return store_expire_sweep(self)

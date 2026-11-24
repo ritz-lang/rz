@@ -54,12 +54,12 @@ pub fn client_parse_host(s: StrView) -> i32
     var digits: i32 = 0
     var i: i64 = 0
     loop
-        # The end of `s` closes the last octet, as '.' closes the others.
+        # The end of `s` closes the last octet, as a '.' closes the others.
         let at_end: bool = i >= s.len
-        var c: u8 = 0
+        var c: u8 = 46
         if not at_end
-            c = *(s.ptr + i)
-        if at_end || c == 46  # end or '.'
+            c = s.get(i)
+        if c == 46  # '.' or the end
             if digits == 0 || octets >= 4
                 return 0
             ip = (ip << 8) | current
@@ -157,62 +157,52 @@ pub fn client_send_raw(c: *TomeClient, data: *u8, len: i64) -> i64
 
 
 # Send a simple command with no arguments (e.g., PING)
-pub fn client_send_cmd0(c: *TomeClient, cmd: *u8) -> i64
+pub fn client_send_cmd0(c: *TomeClient, cmd: StrView) -> i64
     var buf: [256]u8
     var pos: i32 = 0
 
     # *1\r\n$<len>\r\n<cmd>\r\n
     pos += resp_write_array(@buf[0], 1)
-    let cmd_len: i64 = strlen(cmd)
-    pos += resp_write_bulk(@buf[0] + pos, cmd, cmd_len)
+    pos += resp_write_bulk(@buf[0] + pos, cmd)
 
     return client_send_raw(c, @buf[0], pos as i64)
 
 
 # Send a command with 1 argument (e.g., GET key)
-pub fn client_send_cmd1(c: *TomeClient, cmd: *u8, arg1: *u8) -> i64
+pub fn client_send_cmd1(c: *TomeClient, cmd: StrView, arg1: StrView) -> i64
     var buf: [512]u8
     var pos: i32 = 0
 
     pos += resp_write_array(@buf[0], 2)
-    let cmd_len: i64 = strlen(cmd)
-    pos += resp_write_bulk(@buf[0] + pos, cmd, cmd_len)
-    let arg1_len: i64 = strlen(arg1)
-    pos += resp_write_bulk(@buf[0] + pos, arg1, arg1_len)
+    pos += resp_write_bulk(@buf[0] + pos, cmd)
+    pos += resp_write_bulk(@buf[0] + pos, arg1)
 
     return client_send_raw(c, @buf[0], pos as i64)
 
 
 # Send a command with 2 arguments (e.g., SET key value)
-pub fn client_send_cmd2(c: *TomeClient, cmd: *u8, arg1: *u8, arg2: *u8) -> i64
+pub fn client_send_cmd2(c: *TomeClient, cmd: StrView, arg1: StrView, arg2: StrView) -> i64
     var buf: [8192]u8
     var pos: i32 = 0
 
     pos += resp_write_array(@buf[0], 3)
-    let cmd_len: i64 = strlen(cmd)
-    pos += resp_write_bulk(@buf[0] + pos, cmd, cmd_len)
-    let arg1_len: i64 = strlen(arg1)
-    pos += resp_write_bulk(@buf[0] + pos, arg1, arg1_len)
-    let arg2_len: i64 = strlen(arg2)
-    pos += resp_write_bulk(@buf[0] + pos, arg2, arg2_len)
+    pos += resp_write_bulk(@buf[0] + pos, cmd)
+    pos += resp_write_bulk(@buf[0] + pos, arg1)
+    pos += resp_write_bulk(@buf[0] + pos, arg2)
 
     return client_send_raw(c, @buf[0], pos as i64)
 
 
 # Send a command with 3 arguments
-pub fn client_send_cmd3(c: *TomeClient, cmd: *u8, arg1: *u8, arg2: *u8, arg3: *u8) -> i64
+pub fn client_send_cmd3(c: *TomeClient, cmd: StrView, arg1: StrView, arg2: StrView, arg3: StrView) -> i64
     var buf: [8192]u8
     var pos: i32 = 0
 
     pos += resp_write_array(@buf[0], 4)
-    let cmd_len: i64 = strlen(cmd)
-    pos += resp_write_bulk(@buf[0] + pos, cmd, cmd_len)
-    let arg1_len: i64 = strlen(arg1)
-    pos += resp_write_bulk(@buf[0] + pos, arg1, arg1_len)
-    let arg2_len: i64 = strlen(arg2)
-    pos += resp_write_bulk(@buf[0] + pos, arg2, arg2_len)
-    let arg3_len: i64 = strlen(arg3)
-    pos += resp_write_bulk(@buf[0] + pos, arg3, arg3_len)
+    pos += resp_write_bulk(@buf[0] + pos, cmd)
+    pos += resp_write_bulk(@buf[0] + pos, arg1)
+    pos += resp_write_bulk(@buf[0] + pos, arg2)
+    pos += resp_write_bulk(@buf[0] + pos, arg3)
 
     return client_send_raw(c, @buf[0], pos as i64)
 
@@ -255,18 +245,17 @@ pub fn client_get_response_len(c: *TomeClient) -> i32
 # ============================================================================
 
 # A reply header's integer (an array count after '*', a bulk length after
-# '$'): buf[start..] up to the '\r' before `end`, read by resp_parse_i64
+# '$'): reply[start..] up to the next '\r', read by resp_parse_i64
 # (AGAST #4040).  Sets *out and returns the index of that '\r', or -1 if
 # there is none or the digits are not an i64.
-pub fn client_reply_int(buf: *u8, start: i32, end: i32, out: *i64) -> i32
-    var i: i32 = start
-    while i < end and *(buf + i) != 13
-        i += 1
-    if i >= end
+pub fn client_reply_int(reply: StrView, start: i32, out: *i64) -> i32
+    let rest: StrView = reply.skip(start as i64)
+    let cr: i64 = rest.find_byte(13)
+    if cr >= rest.len
         return -1
-    if resp_parse_i64(buf + start, (i - start) as i64, out) == 0
+    if resp_parse_i64(rest.take(cr), out) == 0
         return -1
-    return i
+    return start + cr as i32
 
 
 # Print a RESP response in human-readable format
@@ -276,6 +265,7 @@ pub fn client_print_response(c: *TomeClient)
         return
 
     let buf: *u8 = @c.read_buf[0]
+    let reply: StrView = strview_from_ptr(buf, c.read_len as i64)
     let first: u8 = *buf
 
     if first == 43  # '+' Simple string
@@ -338,7 +328,7 @@ pub fn client_print_response(c: *TomeClient)
 
         # Parse array count
         var count: i64 = 0
-        var i: i32 = client_reply_int(buf, 1, c.read_len, @count)
+        var i: i32 = client_reply_int(reply, 1, @count)
         if i < 0
             prints("(protocol error) bad array count\n")
             return
@@ -365,7 +355,7 @@ pub fn client_print_response(c: *TomeClient)
 
                 # Parse length
                 var blen: i64 = 0
-                i = client_reply_int(buf, i, c.read_len, @blen)
+                i = client_reply_int(reply, i, @blen)
                 if i < 0
                     prints("(protocol error) bad bulk length\n")
                     return

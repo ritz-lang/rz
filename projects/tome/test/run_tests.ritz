@@ -1,6 +1,6 @@
 # test/run_tests.ritz - Basic store and authentication tests for Tome
 #
-# Store basics (string, list, set, hash via the _cstr wrappers) plus AUTH
+# Store basics (string, list, set, hash) plus AUTH
 # gating through the command layer (cmd_ctx_init_auth + cmd_dispatch).
 #
 # Deliberately does not import lib.server: `ritz0 --test` recompiles the file
@@ -10,12 +10,17 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
+import ritzlib.option
 import ritzlib.strview
 import lib.tome
 import lib.resp
 import lib.commands
 import ritzlib.string
+
+
+# Whether the `len`-byte reply at `buf` is exactly `want`.
+fn written(buf: *u8, len: i32, want: StrView) -> bool
+    return len >= 0 and strview_from_ptr(buf, len as i64).eq(want)
 
 # ============================================================================
 # Basic Store Tests (inline)
@@ -24,66 +29,66 @@ import ritzlib.string
 [[test]]
 fn test_basic_set_get() -> i32
     var store: Store = store_new()
-    store_set_cstr(@store, c"hello", c"world")
-    let val: *u8 = store_get_cstr(@store, c"hello")
-    if val == null
-        return 1
-    if strcmp(val, c"world") != 0
-        return 2
+    store_set(@store, "hello", "world")
+    match store_get(@store, "hello")
+        Some(val) =>
+            if not val.eq("world")
+                return 2
+        None => return 1
     return 0
 
 [[test]]
 fn test_basic_del() -> i32
     var store: Store = store_new()
-    store_set_cstr(@store, c"key", c"value")
-    if store_exists_cstr(@store, c"key") != 1
+    store_set(@store, "key", "value")
+    if store_exists(@store, "key") != 1
         return 1
-    let deleted: i32 = store_del_cstr(@store, c"key")
+    let deleted: i32 = store_del(@store, "key")
     if deleted != 1
         return 2
-    if store_exists_cstr(@store, c"key") != 0
+    if store_exists(@store, "key") != 0
         return 3
     return 0
 
 [[test]]
 fn test_basic_list() -> i32
     var store: Store = store_new()
-    store_lpush_cstr(@store, c"mylist", c"a")
-    store_rpush_cstr(@store, c"mylist", c"b")
-    store_lpush_cstr(@store, c"mylist", c"c")
+    store_lpush(@store, "mylist", "a")
+    store_rpush(@store, "mylist", "b")
+    store_lpush(@store, "mylist", "c")
     # List is now: c, a, b
-    if store_llen_cstr(@store, c"mylist") != 3
+    if store_llen(@store, "mylist") != 3
         return 1
-    var first: String = store_lpop_cstr(@store, c"mylist")
-    if strcmp(first.as_ptr(), c"c") != 0
+    var first: String = store_lpop(@store, "mylist")
+    if not first.eq("c")
         return 2
     return 0
 
 [[test]]
 fn test_basic_set() -> i32
     var store: Store = store_new()
-    store_sadd_cstr(@store, c"myset", c"a")
-    store_sadd_cstr(@store, c"myset", c"b")
-    store_sadd_cstr(@store, c"myset", c"a")  # Duplicate
-    if store_scard_cstr(@store, c"myset") != 2
+    store_sadd(@store, "myset", "a")
+    store_sadd(@store, "myset", "b")
+    store_sadd(@store, "myset", "a")  # Duplicate
+    if store_scard(@store, "myset") != 2
         return 1
-    if store_sismember_cstr(@store, c"myset", c"a") != 1
+    if store_sismember(@store, "myset", "a") != 1
         return 2
-    if store_sismember_cstr(@store, c"myset", c"c") != 0
+    if store_sismember(@store, "myset", "c") != 0
         return 3
     return 0
 
 [[test]]
 fn test_basic_hash() -> i32
     var store: Store = store_new()
-    store_hset_cstr(@store, c"myhash", c"field1", c"value1")
-    store_hset_cstr(@store, c"myhash", c"field2", c"value2")
-    let val: StrView = store_hget_cstr(@store, c"myhash", c"field1")
+    store_hset(@store, "myhash", "field1", "value1")
+    store_hset(@store, "myhash", "field2", "value2")
+    let val: StrView = store_hget(@store, "myhash", "field1")
     if val.ptr == null
         return 1
-    if not val.eq_cstr(c"value1")
+    if not val.eq("value1")
         return 2
-    if store_hlen_cstr(@store, c"myhash") != 2
+    if store_hlen(@store, "myhash") != 2
         return 3
     return 0
 
@@ -98,20 +103,18 @@ fn test_no_password_allows_all() -> i32
     var buf: [8192]u8
 
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, null, 0)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, None, 0)
 
     # Parse and execute SET (which requires auth when password is set)
     var parser: RespParser
-    resp_parser_init(@parser, c"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", 33)
+    resp_parser_init(@parser, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 1
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return OK (not NOAUTH error)
-    if strcmp(@buf[0], c"+OK\r\n") != 0
+    if not written(@buf[0], ctx.resp_len, "+OK\r\n")
         return 2
 
     return 0
@@ -123,18 +126,16 @@ fn test_password_blocks_before_auth() -> i32
 
     # Password set, not authenticated
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, Some("secret123"), 0)
 
     # Parse and execute SET
     var parser: RespParser
-    resp_parser_init(@parser, c"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", 33)
+    resp_parser_init(@parser, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 1
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return error (starts with -)
     if buf[0] != 45  # '-'
         return 2
@@ -148,20 +149,18 @@ fn test_password_allows_after_auth() -> i32
 
     # Password set, IS authenticated
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 1)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, Some("secret123"), 1)
 
     # Parse and execute SET
     var parser: RespParser
-    resp_parser_init(@parser, c"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", 33)
+    resp_parser_init(@parser, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 1
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return OK
-    if strcmp(@buf[0], c"+OK\r\n") != 0
+    if not written(@buf[0], ctx.resp_len, "+OK\r\n")
         return 2
 
     return 0
@@ -173,7 +172,7 @@ fn test_auth_command_sets_flag() -> i32
 
     # Password set, not authenticated
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, Some("secret123"), 0)
 
     # Verify initially not authenticated
     if ctx.is_authenticated != 0
@@ -181,16 +180,14 @@ fn test_auth_command_sets_flag() -> i32
 
     # Execute AUTH with correct password
     var parser: RespParser
-    resp_parser_init(@parser, c"*2\r\n$4\r\nAUTH\r\n$9\r\nsecret123\r\n", 32)
+    resp_parser_init(@parser, "*2\r\n$4\r\nAUTH\r\n$9\r\nsecret123\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 2
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return OK
-    if strcmp(@buf[0], c"+OK\r\n") != 0
+    if not written(@buf[0], ctx.resp_len, "+OK\r\n")
         return 3
 
     # Flag should now be set
@@ -205,18 +202,16 @@ fn test_auth_wrong_password() -> i32
     var buf: [8192]u8
 
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, Some("secret123"), 0)
 
     # Execute AUTH with wrong password
     var parser: RespParser
-    resp_parser_init(@parser, c"*2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n", 28)
+    resp_parser_init(@parser, "*2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 1
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return error
     if buf[0] != 45  # '-'
         return 2
@@ -234,21 +229,19 @@ fn test_ping_requires_auth_when_password_set() -> i32
 
     # Password set, NOT authenticated
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, Some("secret123"), 0)
 
     # PING is rejected before AUTH, as in Redis (AGAST #1686; agrees with
     # test_server_password_blocks_before_auth in test_server_auth.ritz)
     var parser: RespParser
-    resp_parser_init(@parser, c"*1\r\n$4\r\nPING\r\n", 14)
+    resp_parser_init(@parser, "*1\r\n$4\r\nPING\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 1
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return NOAUTH, not PONG
-    if strcmp(@buf[0], c"-NOAUTH Authentication required.\r\n") != 0
+    if not written(@buf[0], ctx.resp_len, "-NOAUTH Authentication required.\r\n")
         return 2
 
     return 0

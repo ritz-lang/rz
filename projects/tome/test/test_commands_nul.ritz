@@ -12,9 +12,8 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
+import ritzlib.string
 import ritzlib.strview
-import ritzlib.fmt.digits
 import ritzlib.memory
 import lib.tome
 import lib.resp
@@ -28,52 +27,47 @@ import lib.commands
 const REQ_CAP: i64 = 4096
 
 struct Req
-    buf: *u8
-    len: i64
+    buf: String
 
 fn req_new() -> Req
-    return Req { buf: malloc(REQ_CAP), len: 0 }
+    return Req { buf: string_new() }
 
-fn req_put(r: *Req, p: *u8, n: i64)
-    memcpy(r.buf + r.len, p, n)
-    r.len = r.len + n
-
+# `tag` then the decimal `n` then CRLF: "*3\r\n", "$300\r\n".
 fn req_put_num(r: *Req, tag: u8, n: i64)
-    var hdr: [24]u8
-    hdr[0] = tag
-    let k: i64 = fmt_i64_into(@hdr[1], n)
-    req_put(r, @hdr[0], k + 1)
-    req_put(r, c"\r\n", 2)
+    (r.buf).push(tag)
+    (r.buf).push_i64(n)
+    (r.buf).push_str("\r\n")
 
-fn req_bulk(r: *Req, p: *u8, n: i64)
-    req_put_num(r, 36, n)  # '$'
-    req_put(r, p, n)
-    req_put(r, c"\r\n", 2)
+fn req_bulk(r: *Req, v: StrView)
+    req_put_num(r, 36, v.len)  # '$'
+    (r.buf).push_str(v)
+    (r.buf).push_str("\r\n")
 
-fn req_cmd(r: *Req, argc: i64, name: *u8)
-    r.len = 0
+# Start a fresh frame of `argc` args (the command name included).
+fn req_cmd(r: *Req, argc: i64, name: StrView)
+    (r.buf).clear()
     req_put_num(r, 42, argc)  # '*'
-    req_bulk(r, name, strlen(name))
+    req_bulk(r, name)
 
-fn req1(r: *Req, name: *u8, a: *u8, an: i64)
+fn req1(r: *Req, name: StrView, a: StrView)
     req_cmd(r, 2, name)
-    req_bulk(r, a, an)
+    req_bulk(r, a)
 
-fn req2(r: *Req, name: *u8, a: *u8, an: i64, b: *u8, bn: i64)
+fn req2(r: *Req, name: StrView, a: StrView, b: StrView)
     req_cmd(r, 3, name)
-    req_bulk(r, a, an)
-    req_bulk(r, b, bn)
+    req_bulk(r, a)
+    req_bulk(r, b)
 
-fn req3(r: *Req, name: *u8, a: *u8, an: i64, b: *u8, bn: i64, c: *u8, cn: i64)
+fn req3(r: *Req, name: StrView, a: StrView, b: StrView, c: StrView)
     req_cmd(r, 4, name)
-    req_bulk(r, a, an)
-    req_bulk(r, b, bn)
-    req_bulk(r, c, cn)
+    req_bulk(r, a)
+    req_bulk(r, b)
+    req_bulk(r, c)
 
-# Run the frame in `r`; 0 when the reply is exactly `want_len` bytes of `want`.
-fn reply_is_n(store: *Store, r: *Req, want: *u8, want_len: i64) -> i32
+# Run the frame in `r`; 0 when the reply is exactly `want`.
+fn reply_is(store: *Store, r: *Req, want: StrView) -> i32
     var parser: RespParser
-    resp_parser_init(@parser, r.buf, r.len)
+    resp_parser_init(@parser, (r.buf).as_view())
     if resp_parse(@parser) != RESP_OK
         return 1
     let out: *u8 = malloc(REQ_CAP)
@@ -81,29 +75,20 @@ fn reply_is_n(store: *Store, r: *Req, want: *u8, want_len: i64) -> i32
     cmd_ctx_init(@ctx, store, out, REQ_CAP as i32)
     cmd_dispatch(@ctx, @parser.command)
     var rc: i32 = 0
-    if ctx.resp_len as i64 != want_len
-        rc = 1
-    else if memcmp(out, want, want_len) != 0
+    if not strview_from_ptr(out, ctx.resp_len as i64).eq(want)
         rc = 1
     free(out)
     return rc
 
-fn reply_is(store: *Store, r: *Req, want: *u8) -> i32
-    return reply_is_n(store, r, want, strlen(want))
-
-# 0 when the reply is the bulk string of `n` bytes at `p`.
-fn reply_is_bulk(store: *Store, r: *Req, p: *u8, n: i64) -> i32
+# 0 when the reply is the bulk string `v`.
+fn reply_is_bulk(store: *Store, r: *Req, v: StrView) -> i32
     var w: Req = req_new()
-    req_bulk(@w, p, n)
-    let rc: i32 = reply_is_n(store, r, w.buf, w.len)
-    free(w.buf)
-    return rc
+    req_bulk(@w, v)
+    return reply_is(store, r, (w.buf).as_view())
 
+# 0 when the reply is the bytes built in `w`.
 fn reply_is_req(store: *Store, r: *Req, w: *Req) -> i32
-    return reply_is_n(store, r, w.buf, w.len)
-
-fn sv3(p: *u8) -> StrView
-    return strview_from_ptr(p, 3)
+    return reply_is(store, r, (w.buf).as_view())
 
 
 # ============================================================================
@@ -114,29 +99,29 @@ fn sv3(p: *u8) -> StrView
 fn test_set_members_with_nul() -> i32
     var store: Store = store_new()
     var r: Req = req_new()
-    req2(@r, c"SADD", c"s", 1, c"m\0a", 3)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req2(@r, "SADD", "s", "m\0a")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 1
     # "m\0b" is a different member, not a duplicate of "m".
-    req2(@r, c"SADD", c"s", 1, c"m\0b", 3)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req2(@r, "SADD", "s", "m\0b")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 2
-    req1(@r, c"SCARD", c"s", 1)
-    if reply_is(@store, @r, c":2\r\n") != 0
+    req1(@r, "SCARD", "s")
+    if reply_is(@store, @r, ":2\r\n") != 0
         return 3
-    req2(@r, c"SISMEMBER", c"s", 1, c"m", 1)
-    if reply_is(@store, @r, c":0\r\n") != 0
+    req2(@r, "SISMEMBER", "s", "m")
+    if reply_is(@store, @r, ":0\r\n") != 0
         return 4
-    req2(@r, c"SREM", c"s", 1, c"m\0b", 3)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req2(@r, "SREM", "s", "m\0b")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 5
-    req2(@r, c"SISMEMBER", c"s", 1, c"m\0a", 3)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req2(@r, "SISMEMBER", "s", "m\0a")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 6
     var want: Req = req_new()
     req_put_num(@want, 42, 1)
-    req_bulk(@want, c"m\0a", 3)
-    req1(@r, c"SMEMBERS", c"s", 1)
+    req_bulk(@want, "m\0a")
+    req1(@r, "SMEMBERS", "s")
     if reply_is_req(@store, @r, @want) != 0
         return 7
     return 0
@@ -145,24 +130,24 @@ fn test_set_members_with_nul() -> i32
 [[test]]
 fn test_set_algebra_with_nul() -> i32
     var store: Store = store_new()
-    let k1: StrView = strview_from_ptr(c"a", 1)
-    let k2: StrView = strview_from_ptr(c"b", 1)
-    store_sadd(@store, k1, sv3(c"m\0a"))
-    store_sadd(@store, k1, sv3(c"m\0b"))
-    store_sadd(@store, k2, sv3(c"m\0b"))
-    store_sadd(@store, k2, sv3(c"m\0c"))
+    let k1: StrView = "a"
+    let k2: StrView = "b"
+    store_sadd(@store, k1, "m\0a")
+    store_sadd(@store, k1, "m\0b")
+    store_sadd(@store, k2, "m\0b")
+    store_sadd(@store, k2, "m\0c")
     let u: *Set = store_sunion(@store, k1, k2)
     if set_len(u) != 3
         return 1
     let i: *Set = store_sinter(@store, k1, k2)
     if set_len(i) != 1
         return 2
-    if set_contains(i, sv3(c"m\0b")) != 1
+    if set_contains(i, "m\0b") != 1
         return 3
     let d: *Set = store_sdiff(@store, k1, k2)
     if set_len(d) != 1
         return 4
-    if set_contains(d, sv3(c"m\0a")) != 1
+    if set_contains(d, "m\0a") != 1
         return 5
     set_drop(u)
     set_drop(i)
@@ -178,56 +163,56 @@ fn test_set_algebra_with_nul() -> i32
 fn test_hash_fields_values_with_nul() -> i32
     var store: Store = store_new()
     var r: Req = req_new()
-    req3(@r, c"HSET", c"h", 1, c"f\0a", 3, c"v\0x", 3)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req3(@r, "HSET", "h", "f\0a", "v\0x")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 1
     # "f\0b" is a different field, not an update of "f".
-    req3(@r, c"HSET", c"h", 1, c"f\0b", 3, c"two", 3)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req3(@r, "HSET", "h", "f\0b", "two")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 2
-    req2(@r, c"HGET", c"h", 1, c"f\0a", 3)
-    if reply_is_bulk(@store, @r, c"v\0x", 3) != 0
+    req2(@r, "HGET", "h", "f\0a")
+    if reply_is_bulk(@store, @r, "v\0x") != 0
         return 3
-    req2(@r, c"HGET", c"h", 1, c"f\0b", 3)
-    if reply_is(@store, @r, c"$3\r\ntwo\r\n") != 0
+    req2(@r, "HGET", "h", "f\0b")
+    if reply_is(@store, @r, "$3\r\ntwo\r\n") != 0
         return 4
-    req2(@r, c"HEXISTS", c"h", 1, c"f", 1)
-    if reply_is(@store, @r, c":0\r\n") != 0
+    req2(@r, "HEXISTS", "h", "f")
+    if reply_is(@store, @r, ":0\r\n") != 0
         return 5
-    req2(@r, c"HGET", c"h", 1, c"f", 1)
-    if reply_is(@store, @r, c"$-1\r\n") != 0
+    req2(@r, "HGET", "h", "f")
+    if reply_is(@store, @r, "$-1\r\n") != 0
         return 6
-    req2(@r, c"HDEL", c"h", 1, c"f\0b", 3)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req2(@r, "HDEL", "h", "f\0b")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 7
-    req2(@r, c"HEXISTS", c"h", 1, c"f\0a", 3)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req2(@r, "HEXISTS", "h", "f\0a")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 8
     # An empty value is a value, not a miss.
-    req3(@r, c"HSET", c"e", 1, c"f", 1, c"", 0)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req3(@r, "HSET", "e", "f", "")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 13
-    req2(@r, c"HGET", c"e", 1, c"f", 1)
-    if reply_is(@store, @r, c"$0\r\n\r\n") != 0
+    req2(@r, "HGET", "e", "f")
+    if reply_is(@store, @r, "$0\r\n\r\n") != 0
         return 14
     # h is now {"f\0a": "v\0x"}.
     var want: Req = req_new()
     req_put_num(@want, 42, 1)
-    req_bulk(@want, c"f\0a", 3)
-    req1(@r, c"HKEYS", c"h", 1)
+    req_bulk(@want, "f\0a")
+    req1(@r, "HKEYS", "h")
     if reply_is_req(@store, @r, @want) != 0
         return 9
-    want.len = 0
+    (want.buf).clear()
     req_put_num(@want, 42, 1)
-    req_bulk(@want, c"v\0x", 3)
-    req1(@r, c"HVALS", c"h", 1)
+    req_bulk(@want, "v\0x")
+    req1(@r, "HVALS", "h")
     if reply_is_req(@store, @r, @want) != 0
         return 10
-    want.len = 0
+    (want.buf).clear()
     req_put_num(@want, 42, 2)
-    req_bulk(@want, c"f\0a", 3)
-    req_bulk(@want, c"v\0x", 3)
-    req1(@r, c"HGETALL", c"h", 1)
+    req_bulk(@want, "f\0a")
+    req_bulk(@want, "v\0x")
+    req1(@r, "HGETALL", "h")
     if reply_is_req(@store, @r, @want) != 0
         return 11
     return 0
@@ -237,22 +222,20 @@ fn test_hash_fields_values_with_nul() -> i32
 fn test_hash_grows_with_nul_fields() -> i32
     # Past the initial capacity, so the table rehashes NUL-bearing fields.
     var store: Store = store_new()
-    let k: StrView = strview_from_ptr(c"h", 1)
-    var f: [3]u8
-    f[0] = 102  # 'f'
-    f[1] = 0
+    let k: StrView = "h"
+    var f: String = string_from("f\0A")
     for i in 0..40
-        f[2] = (65 + i) as u8
-        if store_hset(@store, k, strview_from_ptr(@f[0], 3), strview_from_ptr(@f[0], 3)) != 1
+        f.set_char(2, (65 + i) as u8)
+        if store_hset(@store, k, f.as_view(), f.as_view()) != 1
             return 1
     if store_hlen(@store, k) != 40
         return 2
     for i in 0..40
-        f[2] = (65 + i) as u8
-        let v: StrView = store_hget(@store, k, strview_from_ptr(@f[0], 3))
+        f.set_char(2, (65 + i) as u8)
+        let v: StrView = store_hget(@store, k, f.as_view())
         if v.ptr == null
             return 3
-        if not v.eq(strview_from_ptr(@f[0], 3))
+        if not v.eq(f.as_view())
             return 4
     return 0
 
@@ -265,20 +248,20 @@ fn test_hash_grows_with_nul_fields() -> i32
 fn test_list_replies_with_nul() -> i32
     var store: Store = store_new()
     var r: Req = req_new()
-    req2(@r, c"RPUSH", c"l", 1, c"a\0b", 3)
-    if reply_is(@store, @r, c":1\r\n") != 0
+    req2(@r, "RPUSH", "l", "a\0b")
+    if reply_is(@store, @r, ":1\r\n") != 0
         return 1
-    req2(@r, c"RPUSH", c"l", 1, c"c\0d", 3)
-    if reply_is(@store, @r, c":2\r\n") != 0
+    req2(@r, "RPUSH", "l", "c\0d")
+    if reply_is(@store, @r, ":2\r\n") != 0
         return 2
-    req2(@r, c"LINDEX", c"l", 1, c"1", 1)
-    if reply_is_bulk(@store, @r, c"c\0d", 3) != 0
+    req2(@r, "LINDEX", "l", "1")
+    if reply_is_bulk(@store, @r, "c\0d") != 0
         return 3
     var want: Req = req_new()
     req_put_num(@want, 42, 2)
-    req_bulk(@want, c"a\0b", 3)
-    req_bulk(@want, c"c\0d", 3)
-    req3(@r, c"LRANGE", c"l", 1, c"0", 1, c"-1", 2)
+    req_bulk(@want, "a\0b")
+    req_bulk(@want, "c\0d")
+    req3(@r, "LRANGE", "l", "0", "-1")
     if reply_is_req(@store, @r, @want) != 0
         return 4
     return 0
@@ -291,44 +274,44 @@ fn test_list_replies_with_nul() -> i32
 [[test]]
 fn test_zset_members_with_nul() -> i32
     var store: Store = store_new()
-    let k: StrView = strview_from_ptr(c"z", 1)
-    if store_zadd(@store, k, 2, sv3(c"m\0b")) != 1
+    let k: StrView = "z"
+    if store_zadd(@store, k, 2, "m\0b") != 1
         return 1
-    if store_zadd(@store, k, 1, sv3(c"m\0a")) != 1
+    if store_zadd(@store, k, 1, "m\0a") != 1
         return 2
     # Equal scores order by the whole member: "m\0a" < "m\0c".
-    if store_zadd(@store, k, 1, sv3(c"m\0c")) != 1
+    if store_zadd(@store, k, 1, "m\0c") != 1
         return 3
     if store_zcard(@store, k) != 3
         return 4
     var score: f64 = 0.0
-    if store_zscore(@store, k, strview_from_ptr(c"m", 1), @&score) != 0
+    if store_zscore(@store, k, "m", @&score) != 0
         return 5
-    if store_zscore(@store, k, sv3(c"m\0b"), @&score) != 1
+    if store_zscore(@store, k, "m\0b", @&score) != 1
         return 6
     if score != 2.0
         return 7
-    if store_zrank(@store, k, sv3(c"m\0c")) != 1
+    if store_zrank(@store, k, "m\0c") != 1
         return 8
     var count: i64 = 0
     let all: *StrView = store_zrange(@store, k, 0, -1, @&count)
     if count != 3
         return 9
-    if not (all[0]).eq(sv3(c"m\0a"))
+    if not (all[0]).eq("m\0a")
         return 10
-    if not (all[1]).eq(sv3(c"m\0c"))
+    if not (all[1]).eq("m\0c")
         return 11
-    if not (all[2]).eq(sv3(c"m\0b"))
+    if not (all[2]).eq("m\0b")
         return 12
     free(all as *u8)
-    if store_zrem(@store, k, sv3(c"m\0c")) != 1
+    if store_zrem(@store, k, "m\0c") != 1
         return 13
     if store_zcard(@store, k) != 2
         return 14
     let rev: *StrView = store_zrevrange(@store, k, 0, 0, @&count)
     if count != 1
         return 15
-    if not (rev[0]).eq(sv3(c"m\0b"))
+    if not (rev[0]).eq("m\0b")
         return 16
     free(rev as *u8)
     return 0

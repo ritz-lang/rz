@@ -5,12 +5,19 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
+import ritzlib.option
+import ritzlib.string
+import ritzlib.strview
 import ritzlib.memory
 import lib.tome
 import lib.resp
 import lib.commands
 import lib.server
+
+
+# Whether the `len`-byte reply at `buf` is exactly `want`.
+fn written(buf: *u8, len: i32, want: StrView) -> bool
+    return len >= 0 and strview_from_ptr(buf, len as i64).eq(want)
 
 
 # ============================================================================
@@ -54,20 +61,18 @@ fn test_server_no_password_allows_all() -> i32
     var buf: [8192]u8
 
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, null, 0)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, None, 0)
 
     # Parse and execute PING
     var parser: RespParser
-    resp_parser_init(@parser, c"*1\r\n$4\r\nPING\r\n", 14)
+    resp_parser_init(@parser, "*1\r\n$4\r\nPING\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 1
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return PONG (not NOAUTH error)
-    if strcmp(@buf[0], c"+PONG\r\n") != 0
+    if not written(@buf[0], ctx.resp_len, "+PONG\r\n")
         return 2
 
     return 0
@@ -80,18 +85,16 @@ fn test_server_password_blocks_before_auth() -> i32
 
     # Password set, not authenticated
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, Some("secret123"), 0)
 
     # Parse and execute PING
     var parser: RespParser
-    resp_parser_init(@parser, c"*1\r\n$4\r\nPING\r\n", 14)
+    resp_parser_init(@parser, "*1\r\n$4\r\nPING\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 1
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return error (starts with -)
     if buf[0] != 45  # '-'
         return 2
@@ -106,20 +109,18 @@ fn test_server_password_allows_after_auth() -> i32
 
     # Password set, IS authenticated
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 1)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, Some("secret123"), 1)
 
     # Parse and execute PING
     var parser: RespParser
-    resp_parser_init(@parser, c"*1\r\n$4\r\nPING\r\n", 14)
+    resp_parser_init(@parser, "*1\r\n$4\r\nPING\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 1
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return PONG
-    if strcmp(@buf[0], c"+PONG\r\n") != 0
+    if not written(@buf[0], ctx.resp_len, "+PONG\r\n")
         return 2
 
     return 0
@@ -136,7 +137,7 @@ fn test_auth_sets_flag() -> i32
 
     # Password set, not authenticated
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, c"secret123", 0)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, Some("secret123"), 0)
 
     # Verify initially not authenticated
     if ctx.is_authenticated != 0
@@ -144,16 +145,14 @@ fn test_auth_sets_flag() -> i32
 
     # Execute AUTH with correct password
     var parser: RespParser
-    resp_parser_init(@parser, c"*2\r\n$4\r\nAUTH\r\n$9\r\nsecret123\r\n", 32)
+    resp_parser_init(@parser, "*2\r\n$4\r\nAUTH\r\n$9\r\nsecret123\r\n")
     let parse_result: i32 = resp_parse(@parser)
     if parse_result != RESP_OK
         return 2
 
     cmd_dispatch(@ctx, @parser.command)
-    buf[ctx.resp_len] = 0
-
     # Should return OK
-    if strcmp(@buf[0], c"+OK\r\n") != 0
+    if not written(@buf[0], ctx.resp_len, "+OK\r\n")
         return 3
 
     # Flag should now be set
@@ -171,13 +170,13 @@ fn test_auth_sets_flag() -> i32
 # strcmp it: an embedded NUL or a suffix past byte 255 was ignored. It now
 # compares (data, len) against the password in constant time.
 
-fn auth_with(password: *u8, request: *u8, request_len: i64) -> i32
+fn auth_with(password: StrView, request: StrView) -> i32
     var store: Store = store_new()
     var buf: [8192]u8
     var ctx: CommandContext
-    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, password, 0)
+    cmd_ctx_init_auth(@ctx, @store, @buf[0], 8192, Some(password), 0)
     var parser: RespParser
-    resp_parser_init(@parser, request, request_len)
+    resp_parser_init(@parser, request)
     if resp_parse(@parser) != RESP_OK
         return -1
     cmd_dispatch(@ctx, @parser.command)
@@ -186,19 +185,19 @@ fn auth_with(password: *u8, request: *u8, request_len: i64) -> i32
 [[test]]
 fn test_auth_rejects_embedded_nul_suffix() -> i32
     # "secret123\0x" must not authenticate as "secret123".
-    if auth_with(c"secret123", c"*2\r\n$4\r\nAUTH\r\n$11\r\nsecret123\0x\r\n", 32) != 0
+    if auth_with("secret123", "*2\r\n$4\r\nAUTH\r\n$11\r\nsecret123\0x\r\n") != 0
         return 1
     return 0
 
 [[test]]
 fn test_auth_rejects_wrong_password() -> i32
-    if auth_with(c"secret123", c"*2\r\n$4\r\nAUTH\r\n$9\r\nsecret124\r\n", 29) != 0
+    if auth_with("secret123", "*2\r\n$4\r\nAUTH\r\n$9\r\nsecret124\r\n") != 0
         return 1
     return 0
 
 [[test]]
 fn test_auth_rejects_prefix() -> i32
-    if auth_with(c"secret123", c"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n", 26) != 0
+    if auth_with("secret123", "*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n") != 0
         return 1
     return 0
 
@@ -206,44 +205,35 @@ fn test_auth_rejects_prefix() -> i32
 fn test_auth_rejects_suffix_past_copy_buffer() -> i32
     # A 255-byte password followed by extra bytes: the old 256-byte copy
     # truncated the argument back to the password and accepted it.
-    var pw: [256]u8
+    var pw: String = string_new()
     for i in 0..255
-        pw[i] = 0x61  # 'a'
-    pw[255] = 0
-    var req: [300]u8
-    var p: i64 = 0
-    let head: *u8 = c"*2\r\n$4\r\nAUTH\r\n$258\r\n"
-    for i in 0..20
-        req[p] = *(head + i)
-        p += 1
+        pw.push(0x61)  # 'a'
+    var req: String = string_from("*2\r\n$4\r\nAUTH\r\n$258\r\n")
     for i in 0..258
-        req[p] = 0x61
-        p += 1
-    req[p] = 13
-    req[p + 1] = 10
-    p += 2
-    if auth_with(@pw[0], @req[0], p) != 0
+        req.push(0x61)
+    req.push_str("\r\n")
+    if auth_with(pw.as_view(), req.as_view()) != 0
         return 1
     return 0
 
 [[test]]
 fn test_auth_accepts_long_exact_password() -> i32
-    var pw: [256]u8
+    var pw: String = string_new()
     for i in 0..255
-        pw[i] = 0x61
-    pw[255] = 0
-    var req: [300]u8
-    var p: i64 = 0
-    let head: *u8 = c"*2\r\n$4\r\nAUTH\r\n$255\r\n"
-    for i in 0..20
-        req[p] = *(head + i)
-        p += 1
+        pw.push(0x61)  # 'a'
+    var req: String = string_from("*2\r\n$4\r\nAUTH\r\n$255\r\n")
     for i in 0..255
-        req[p] = 0x61
-        p += 1
-    req[p] = 13
-    req[p + 1] = 10
-    p += 2
-    if auth_with(@pw[0], @req[0], p) != 1
+        req.push(0x61)
+    req.push_str("\r\n")
+    if auth_with(pw.as_view(), req.as_view()) != 1
         return 1
+    return 0
+
+[[test]]
+fn test_empty_password_is_required() -> i32
+    # Some(""): AUTH is required, and only the empty argument satisfies it.
+    if auth_with("", "*2\r\n$4\r\nAUTH\r\n$0\r\n\r\n") != 1
+        return 1
+    if auth_with("", "*2\r\n$4\r\nAUTH\r\n$1\r\nx\r\n") != 0
+        return 2
     return 0

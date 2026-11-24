@@ -21,7 +21,9 @@
 # replies have drained.
 
 import ritzlib.memory
+import ritzlib.option
 import ritzlib.str
+import ritzlib.span
 import ritzlib.strview
 import lib.tome
 import lib.resp
@@ -38,7 +40,7 @@ const SESSION_OUT_RESERVE: i64 = 24576
 
 pub struct Session
     store: *Store
-    password: *u8           # required password (null = no AUTH)
+    password: Option<StrView>  # required password (None = no AUTH)
     is_authenticated: i32
     closing: i32            # 1 after a protocol error: flush, then close
     in_len: i64             # bytes of in_buf received, not yet consumed
@@ -48,7 +50,7 @@ pub struct Session
     out_buf: [65536]u8
 
 
-pub fn session_init(s: *Session, store: *Store, password: *u8)
+pub fn session_init(s: *Session, store: *Store, password: Option<StrView>)
     s.store = store
     s.password = password
     s.is_authenticated = 0
@@ -59,7 +61,7 @@ pub fn session_init(s: *Session, store: *Store, password: *u8)
 
 
 # Heap-allocate a session (it is ~128 KiB: too big for a task's stack).
-pub fn session_new(store: *Store, password: *u8) -> *Session
+pub fn session_new(store: *Store, password: Option<StrView>) -> *Session
     let s: *Session = malloc(sizeof(Session)) as *Session
     if s == null
         return null
@@ -79,6 +81,10 @@ pub fn session_recv_ptr(s: *Session) -> *u8
 pub fn session_recv_room(s: *Session) -> i64
     return SESSION_IN_CAP - s.in_len
 
+# The same free space as a Span.
+pub fn session_recv_buf(s: *Session) -> Span<u8>
+    return span_from_ptr(session_recv_ptr(s), session_recv_room(s))
+
 # Record that recv() wrote n bytes at session_recv_ptr().
 pub fn session_received(s: *Session, n: i64)
     if n > 0
@@ -91,6 +97,10 @@ pub fn session_pending_ptr(s: *Session) -> *u8
 
 pub fn session_pending_len(s: *Session) -> i64
     return s.out_len - s.out_pos
+
+# The queued replies not yet sent, as a view.
+pub fn session_pending(s: *Session) -> StrView
+    return strview_from_ptr(session_pending_ptr(s), session_pending_len(s))
 
 # Record that send() took n bytes from session_pending_ptr().
 pub fn session_sent(s: *Session, n: i64)
@@ -109,7 +119,7 @@ pub fn session_should_close(s: *Session) -> i32
     return 0
 
 
-fn session_error(s: *Session, msg: *u8)
+fn session_error(s: *Session, msg: StrView)
     s.out_len += resp_write_error(@s.out_buf[0] + s.out_len, msg) as i64
     s.closing = 1
     s.in_len = 0
@@ -125,17 +135,17 @@ pub fn session_process(s: *Session) -> i32
             break  # flush first; the rest of the input waits
 
         var parser: RespParser
-        resp_parser_init(@parser, @s.in_buf[0] + consumed, s.in_len - consumed)
+        resp_parser_init(@parser, strview_from_ptr(@s.in_buf[0] + consumed, s.in_len - consumed))
         let r: i32 = resp_parse(@parser)
         if r == RESP_INCOMPLETE
             if consumed == 0 and s.in_len == SESSION_IN_CAP
                 # A full buffer and still no complete command: it can
                 # never fit.
-                session_error(s, c"ERR Protocol error: request too large")
+                session_error(s, "ERR Protocol error: request too large")
                 return ran
             break
         if r != RESP_OK
-            session_error(s, c"ERR Protocol error")
+            session_error(s, "ERR Protocol error")
             return ran
 
         var ctx: CommandContext
