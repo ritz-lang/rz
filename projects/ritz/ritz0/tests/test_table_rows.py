@@ -629,7 +629,7 @@ pub fn main() -> i32
     var m = hashmap_i64_new()
     m.insert(3, 40)
     m.insert(5, 2)
-    return (m.get(3) + m.get(5)) as i32
+    return (m.get(3).unwrap_or(0) + m.get(5).unwrap_or(0)) as i32
 """
 
 

@@ -122,7 +122,7 @@ pub fn main() -> i32
     m.insert(1000, 1)
     m.insert(1000, 2)
     m.insert(7, 3)
-    var r: i64 = m.get(1000)
+    var r: i64 = m.get(1000).unwrap_or(0)
     r = r + m.contains(1000) as i64 * 10
     r = r + m.remove(7) as i64 * 20
     r = r + m.len() * 40

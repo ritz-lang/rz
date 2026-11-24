@@ -32,8 +32,10 @@ import ritzlib.string
 import ritzlib.option
 import ritzlib.span
 import ritzlib.fmt
-import ritzlib.os.env
 import ritzlib.process
+import ritzlib.result
+import ritzlib.errno
+import ritzlib.gvec
 import ritzlib.time { sleep_ms }
 
 # Diagnostic helper — see 24_cp.  Used for the many timeout error
@@ -116,28 +118,13 @@ fn parse_signal(sig: StrView) -> i32
 # standard directories when it is unset or empty, as execvp(3) does; a name
 # with a '/' is used as is.
 
-# In the forked child: exec `cmd_path` with argv = cmd_args (argv[0]
-# replaced by the full path). Builds argv on the stack and execs with the
-# raw execve: nothing may allocate between fork and exec. Never returns.
-fn exec_child(cmd_path: *u8, cmd_args: Span<StrView>) -> i32
-    # Build null-terminated argv array.  Each argv StrView ends at
-    # argv's NUL, so .ptr is a valid C string.
-    var child_argv: [256]*u8
-    let max_args: i64 = if cmd_args.len < 255 then cmd_args.len else 255
-    for i in 0..max_args
-        let a: StrView = cmd_args[i]
-        child_argv[i] = a.ptr
-    child_argv[max_args] = null
-
-    # Replace first arg with full path for execve
-    child_argv[0] = cmd_path
-
-    let ret: i32 = sys_execve(cmd_path, @child_argv[0], env_raw_envp())
-
-    # If we get here, exec failed
-    if ret == (0 - ENOENT) or ret == (0 - EACCES)
-        sys_exit(EXIT_CANNOT_INVOKE)
-    sys_exit(EXIT_CANCELED)
+# In the forked child: run `ex`, prepared before fork so nothing allocates
+# between fork and exec. Never returns.
+fn exec_child(ex: @Exec) -> i32
+    match ex.run()
+        NoEnt => sys_exit(EXIT_CANNOT_INVOKE)
+        Acces => sys_exit(EXIT_CANNOT_INVOKE)
+        _ => sys_exit(EXIT_CANCELED)
     EXIT_CANCELED
 
 # timeout's exit status for a child that has exited as `r`.
@@ -176,17 +163,30 @@ fn run_timeout(timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, kill_nsec: i6
         None =>
             timeout_err2("timeout: '", cmd0, "': No such file or directory")
             return EXIT_ENOENT
-    let cmd_path: *u8 = found.as_ptr()
+    # The child's argv: cmd_args with the full path as argv[0].  Prepared
+    # before fork, so the child allocates nothing.
+    var child_argv = vec_new<StrView>()
+    child_argv.push(found.as_view())
+    child_argv.push_span(cmd_args.from(1))
+    let prepared: Result<Exec, Errno> = exec_prepare(found.as_view(), span_from_vec(@child_argv))
+    child_argv.deinit()
+    var ex: Exec = match prepared
+        Ok(e) => e
+        Err(_) =>
+            eprint("timeout: out of memory\n")
+            return EXIT_CANCELED
 
     # Fork; the child execs the command
     let pid: i32 = match fork()
         Ok(fr) =>
             match fr
-                Child => exec_child(cmd_path, cmd_args)
+                Child => exec_child(@ex)
                 Parent(child) => child
         Err(_) =>
+            ex.free()
             eprint("timeout: fork failed\n")
             return EXIT_CANCELED
+    ex.free()
 
     # Parent process: wait with timeout
     var elapsed_sec: i64 = 0

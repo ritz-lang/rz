@@ -175,7 +175,7 @@ fn cstr_array(head: Span<StrView>, rest: Span<StrView>) -> **u8
 # is Err(Acces), not a child that exits 127.  Pipe or fork
 # failure is Err(errno) too.  The child inherits this process's environment.
 pub fn spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>
-    spawn_with_envp(cmd, args, null, -1, false)
+    spawn_env(cmd, args, env_iter())
 
 # spawn, but the child's environment is exactly `env`, one "KEY=VALUE" view
 # per entry, in that order: nothing of ours is merged in, and an empty span
@@ -214,8 +214,55 @@ pub fn spawn_env_merged(cmd: StrView, args: Span<StrView>, env: Span<StrView>, s
     free(envp as *u8)
     r
 
-# spawn / spawn_env / spawn_env_merged: resolve `cmd`, build argv, fork.  A
-# null envp inherits; `stdin_fd` and `merge` are spawn_fork's.
+# ============================================================================
+# Exec - execve(2) in place, prepared before fork
+# ============================================================================
+
+# `path` run with argv `args` (args[0] is argv[0]) and this process's
+# environment.  Everything execve(2) needs is built by exec_prepare, so a
+# forked child can run() it without allocating.  The arrays are private: the
+# raw argv/envp never leave this module (AGAST #4648).
+struct Exec
+    path: **u8   # cstr_array of [path]: path[0] is the C string
+    argv: **u8
+    envp: **u8
+
+# An Exec of `path` with argv `args` and this process's environment.
+# `path` is used as given: no $PATH search (find_command does that).
+# Err(NoMem) if the arrays can't be allocated.
+pub fn exec_prepare(path: StrView, args: Span<StrView>) -> Result<Exec, Errno>
+    var p: StrView = path
+    let pathv: **u8 = cstr_array(span_from_ptr<StrView>(@p, 1), span_empty<StrView>())
+    let argv: **u8 = cstr_array(args, span_empty<StrView>())
+    let envp: **u8 = cstr_array(env_iter(), span_empty<StrView>())
+    var ex: Exec = Exec { path: pathv, argv: argv, envp: envp }
+    if pathv == null or argv == null or envp == null
+        ex.free()
+        return Err(Errno.NoMem)
+    Ok(ex)
+
+impl Exec
+    # Replace this process with the prepared command.  Returns only if
+    # execve(2) fails, with its Errno.
+    pub fn run(self: @Exec) -> Errno
+        errno_from_raw(sys_execve(*self.path, self.argv, self.envp))
+
+    # Release the arrays (the parent's copy after fork, or after a failed run).
+    #
+    # standard-exempt: raw-alloc: frees the argv/envp blocks exec_prepare built for execve(2)
+    pub fn free(self: @&Exec)
+        if self.path != null
+            free(self.path as *u8)
+            self.path = null
+        if self.argv != null
+            free(self.argv as *u8)
+            self.argv = null
+        if self.envp != null
+            free(self.envp as *u8)
+            self.envp = null
+
+# spawn / spawn_env / spawn_env_merged: resolve `cmd`, build argv, fork.
+# `envp` is never null; `stdin_fd` and `merge` are spawn_fork's.
 #
 # standard-exempt: raw-alloc: frees the transient argv block after execve(2); the fork/exec boundary owns it
 fn spawn_with_envp(cmd: StrView, args: Span<StrView>, envp: **u8, stdin_fd: i32, merge: bool) -> Result<Process, Errno>
@@ -239,9 +286,8 @@ fn spawn_with_envp(cmd: StrView, args: Span<StrView>, envp: **u8, stdin_fd: i32,
 # The pipe/fork/exec under spawn.  `path` is already resolved (find_command
 # results always hold a '/'), so the child execs it as is.  Err is the
 # Errno of a failed pipe or fork; a failed exec is the child's exit
-# 127.  A null envp means INHERIT this process's environment (ritzlib.os.env's
-# env_raw_envp()): passing null straight to execve would give the child an
-# empty one (AGAST #1750).
+# 127.  `envp` is never null: spawn passes env_iter()'s entries, since a null
+# envp would give the child an empty environment (AGAST #1750).
 #
 # `stdin_fd` >= 0 is dup'd onto the child's stdin instead of the stdin pipe,
 # and `merge` sends its stderr down the stdout pipe; the unused pipe ends are
@@ -250,10 +296,7 @@ fn spawn_with_envp(cmd: StrView, args: Span<StrView>, envp: **u8, stdin_fd: i32,
 #
 # standard-exempt: lib-exit: the forked child before execve(2) has no caller to return to (S-ERR-3)
 fn spawn_fork(path: *u8, argv: **u8, envp: **u8, stdin_fd: i32, merge: bool) -> Result<Process, Errno>
-    # Resolved before fork: env_raw_envp() may allocate on first use.
-    var child_envp: **u8 = envp
-    if child_envp == null
-        child_envp = env_raw_envp()
+    let child_envp: **u8 = envp
 
     var p: Process
     p.pid = -1
@@ -625,14 +668,19 @@ pub fn fork() -> Result<ForkResult, Errno>
 # find_command), argv[0] = `path`, argv[1..] = `args`, this process's
 # environment. Returns only if execve(2) failed, with why (NoEnt, Acces, ...).
 #
-# standard-exempt: raw-alloc: frees the argv block when execve(2) returns; the fork/exec boundary owns it
+# standard-exempt: raw-alloc: frees the argv/envp blocks when execve(2) returns; the fork/exec boundary owns it
 pub fn exec(path: StrView, args: Span<StrView>) -> Errno
     var argv0: StrView = path
     let argv: **u8 = cstr_array(span_from_ptr<StrView>(@argv0, 1), args)
     if argv == null
         return Errno.NoMem
+    let envp: **u8 = cstr_array(env_iter(), span_empty<StrView>())
+    if envp == null
+        free(argv as *u8)
+        return Errno.NoMem
     # argv[0] is a NUL-terminated copy of `path`: hand that to the kernel.
-    let rc: i32 = sys_execve(*argv, argv, env_raw_envp())
+    let rc: i32 = sys_execve(*argv, argv, envp)
+    free(envp as *u8)
     free(argv as *u8)
     errno_from_raw(rc)
 

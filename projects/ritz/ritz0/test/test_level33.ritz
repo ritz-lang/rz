@@ -4,6 +4,7 @@
 
 import ritzlib.hashmap
 import ritzlib.hash
+import ritzlib.option
 
 # ============================================================================
 # Basic HashMapI64 tests
@@ -24,8 +25,9 @@ fn test_hashmap_insert_get() -> i32
     m.insert(42, 100)
     assert m.len() == 1, "len should be 1"
 
-    let val: i64 = m.get(42)
-    assert val == 100, "value should be 100"
+    let val: Option<i64> = m.get(42)
+    assert val.is_some(), "42 is present"
+    assert val.unwrap_or(-1) == 100, "value should be 100"
 
     m.free()
     0
@@ -48,10 +50,10 @@ fn test_hashmap_update() -> i32
     var m: HashMapI64 = hashmap_i64_new()
 
     m.insert(42, 100)
-    assert m.get(42) == 100, "initial value"
+    assert m.get(42).unwrap_or(-1) == 100, "initial value"
 
     m.insert(42, 200)
-    assert m.get(42) == 200, "updated value"
+    assert m.get(42).unwrap_or(-1) == 200, "updated value"
     assert m.len() == 1, "len should still be 1"
 
     m.free()
@@ -66,9 +68,9 @@ fn test_hashmap_multiple_keys() -> i32
     m.insert(3, 30)
 
     assert m.len() == 3, "len should be 3"
-    assert m.get(1) == 10, "key 1"
-    assert m.get(2) == 20, "key 2"
-    assert m.get(3) == 30, "key 3"
+    assert m.get(1).unwrap_or(-1) == 10, "key 1"
+    assert m.get(2).unwrap_or(-1) == 20, "key 2"
+    assert m.get(3).unwrap_or(-1) == 30, "key 3"
 
     m.free()
     0
@@ -80,8 +82,8 @@ fn test_hashmap_remove() -> i32
     m.insert(42, 100)
     assert m.contains(42), "should contain 42"
 
-    let removed: i32 = m.remove(42)
-    assert removed == 1, "should return 1 on successful remove"
+    let removed: bool = m.remove(42)
+    assert removed, "should return true on successful remove"
     assert not m.contains(42), "should not contain 42 after remove"
     assert m.len() == 0, "len should be 0"
 
@@ -92,8 +94,8 @@ fn test_hashmap_remove() -> i32
 fn test_hashmap_remove_not_found() -> i32
     var m: HashMapI64 = hashmap_i64_new()
 
-    let removed: i32 = m.remove(42)
-    assert removed == 0, "should return 0 when key not found"
+    let removed: bool = m.remove(42)
+    assert not removed, "should return false when key not found"
 
     m.free()
     0
@@ -113,7 +115,7 @@ fn test_hashmap_many_keys() -> i32
     # Verify all keys
     i = 0
     while i < 50
-        let val: i64 = m.get(i)
+        let val: i64 = m.get(i).unwrap_or(-1)
         if val != i * 10
             return 1  # Fail
         i = i + 1
@@ -138,7 +140,7 @@ fn test_hashmap_grow() -> i32
     # Verify all values still correct after growth
     i = 0
     while i < 20
-        if m.get(i) != i * 2
+        if m.get(i).unwrap_or(-1) != i * 2
             return 1
         i = i + 1
 
@@ -155,10 +157,23 @@ fn test_hashmap_collision() -> i32
     m.insert(16, 200)
     m.insert(32, 300)
 
-    assert m.get(0) == 100, "key 0"
-    assert m.get(16) == 200, "key 16"
-    assert m.get(32) == 300, "key 32"
+    assert m.get(0).unwrap_or(-1) == 100, "key 0"
+    assert m.get(16).unwrap_or(-1) == 200, "key 16"
+    assert m.get(32).unwrap_or(-1) == 300, "key 32"
 
+    m.free()
+    0
+
+# A stored 0 and a missing key are told apart: get is an Option (AGAST #4648).
+[[test]]
+fn test_hashmap_get_zero_value_vs_missing() -> i32
+    var m: HashMapI64 = hashmap_i64_new()
+    m.insert(7, 0)
+    let got: i64 = match m.get(7)
+        Some(v) => v
+        None => -1
+    assert got == 0, "stored 0 reads back as Some(0)"
+    assert m.get(8).is_none(), "8 is missing"
     m.free()
     0
 
@@ -183,7 +198,7 @@ fn test_hashmap_index_get() -> i32
 
     # `m[k]` on a missing key ends the program (LANGUAGE_SPEC §7.8): test with
     # get or contains instead.
-    assert m.get(999) == 0, "get(999) should be 0 (not found)"
+    assert m.get(999).is_none(), "get(999) should be None (not found)"
 
     m.free()
     0
@@ -221,7 +236,7 @@ fn test_hashmap_index_mixed() -> i32
     m[2] = 20
 
     # Read via function
-    assert m.get(1) == 10, "get via function"
+    assert m.get(1).unwrap_or(-1) == 10, "get via function"
 
     # Insert via function
     m.insert(3, 30)
@@ -258,17 +273,17 @@ fn hashmap_i64_tomb_check(keys: *i64, gone_at: i64) -> i32
     if m.cap() != 16
         return 1
     let gone: i64 = keys[gone_at]
-    if m.remove(gone) != 1
+    if not m.remove(gone)
         return 2
     # The removed key is gone from every lookup.
     if m.contains(gone)
         return 3
-    if m.get(gone) != 0
+    if m.get(gone).is_some()
         return 4
     match m.value_ptr(gone)
         Some(_) => return 5
         None => pass
-    if m.remove(gone) != 0
+    if m.remove(gone)
         return 6
     # Every other key is still reached across the tombstone.
     for i in 0..11
@@ -276,7 +291,7 @@ fn hashmap_i64_tomb_check(keys: *i64, gone_at: i64) -> i32
             let k: i64 = keys[i]
             if not m.contains(k)
                 return 7
-            if m.get(k) != i * 10 + 1
+            if m.get(k).unwrap_or(-1) != i * 10 + 1
                 return 8
             var p: *i64 = null
             match m.value_ptr(k)
@@ -292,7 +307,7 @@ fn hashmap_i64_tomb_check(keys: *i64, gone_at: i64) -> i32
         return 12
     if m.len() != 11
         return 13
-    if m.get(gone) != 777
+    if m.get(gone).unwrap_or(-1) != 777
         return 14
     m.free()
     0

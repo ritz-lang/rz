@@ -20,7 +20,6 @@ import ritzlib.span { Span }
 import ritzlib.option
 import ritzlib.process
 import ritzlib.gvec
-import ritzlib.os.env
 import src.args
 
 # ============================================================================
@@ -103,31 +102,38 @@ fn rz_argv(cmd: *u8) -> Vec<*u8>
 # Callers build the whole argv, so nothing here indexes through
 # `vec_as_ptr(...) + i`: ritz1 does not scale that (AGAST #2791).
 fn delegate(argv: @&Vec<*u8>) -> i32
-    argv.push(null)
+    var views: Vec<StrView> = vec_new<StrView>()
+    for i in 0..argv.len
+        views.push(strview_from_cstr(argv.get(i)))
 
-    # Resolved before fork: both may allocate.  python3 is found through
+    # Resolved before fork: all of it may allocate.  python3 is found through
     # $PATH (or the standard dirs without one); not found, execve fails and
     # the child exits 127.
-    let envp: **u8 = env_raw_envp()
     var cmd: String = string_new()
     match find_command("python3")
         Some(found) => cmd = found
         None => cmd.push_str("python3")
-    let cmd_path: *u8 = cmd.as_ptr()
+    var ex: Exec = match exec_prepare(cmd.as_view(), Span<StrView> { ptr: views.as_ptr(), len: views.len })
+        Ok(e) => e
+        Err(_) =>
+            eprint("Error: Could not spawn python3 ./rz\n")
+            return 1
 
     var pid: i32 = 0
     match fork()
         Ok(side) =>
             match side
                 Child =>
-                    # Raw execve, not process.exec: exec allocates its argv
-                    # block, and the child must not allocate after fork.
-                    sys_execve(cmd_path, argv.as_ptr(), envp)
+                    # The arrays were built before fork: the child allocates
+                    # nothing.
+                    ex.run()
                     sys_exit(127)
                 Parent(child) => pid = child
         Err(_) =>
+            ex.free()
             eprint("Error: Could not spawn python3 ./rz\n")
             return 1
+    ex.free()
 
     # exit_code is already 128+N for a child killed by signal N.
     match wait_pid(pid)

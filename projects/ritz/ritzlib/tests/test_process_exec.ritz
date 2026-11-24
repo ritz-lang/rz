@@ -1,0 +1,105 @@
+# ritzlib.process's Exec: execve(2) in place, prepared before fork (AGAST
+# #4648, which retired ritzlib.os.env's raw **u8 env_raw_envp).
+#
+#   exec_prepare(path, args)  -> Ok(Exec): `path` and argv `args` (argv[0]
+#                                included), with THIS process's environment,
+#                                built before fork so the child allocates
+#                                nothing
+#   ex.run()                  -> replaces the process; returns only on
+#                                failure, with the Errno
+#
+# The child is /usr/bin/env: it prints its environment as "KEY=VALUE\n"
+# lines in environ order, so the expected output is the parent's env_iter().
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
+import ritzlib.errno
+import ritzlib.process
+import ritzlib.os.env
+
+
+[[test]]
+fn test_exec_inherits_parent_env() -> i32
+    assert env_iter().len > 0
+    var argv: [1]StrView
+    argv[0] = "env"
+    var ex: Exec = match exec_prepare("/usr/bin/env", span_from_ptr<StrView>(@argv[0], 1))
+        Ok(e) => e
+        Err(_) => return 1
+
+    var fds: [2]i32
+    assert sys_pipe(@fds[0]) == 0
+    let pid: i32 = sys_fork()
+    if pid == 0
+        sys_dup2(fds[1], 1)
+        sys_close(fds[0])
+        sys_close(fds[1])
+        ex.run()
+        sys_exit(126)
+    sys_close(fds[1])
+    ex.free()
+
+    var got: Vec<u8> = vec_new<u8>()
+    var chunk: [4096]u8
+    loop
+        let n: i64 = sys_read(fds[0], @chunk[0], 4096)
+        if n <= 0
+            break
+        got.push_span(Span<u8> { ptr: @chunk[0], len: n })
+    sys_close(fds[0])
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    assert status == 0
+
+    var want: Vec<u8> = vec_new<u8>()
+    let entries: Span<StrView> = env_iter()
+    for i in 0..entries.len
+        let e: *StrView = entries.ptr + i
+        want.push_span(Span<u8> { ptr: e.ptr, len: e.len })
+        want.push('\n' as u8)
+    assert got.len == want.len
+    for i in 0..want.len
+        assert got.get(i) == want.get(i)
+    0
+
+[[test]]
+fn test_exec_missing_path_returns_enoent() -> i32
+    # A failed execve(2) returns, so this needs no fork.
+    var argv: [1]StrView
+    argv[0] = "nope"
+    var ex: Exec = match exec_prepare("/ritz-no-such-dir/nope", span_from_ptr<StrView>(@argv[0], 1))
+        Ok(e) => e
+        Err(_) => return 1
+    let e: Errno = ex.run()
+    ex.free()
+    match e
+        NoEnt => pass
+        _ =>
+            assert false
+    0
+
+[[test]]
+fn test_exec_args_use_view_length() -> i32
+    # Views into longer strings: each argv entry is exactly `len` bytes.
+    # /bin/sh -c 'exit 7' x: the exit status shows argv reached the child.
+    var argv: [3]StrView
+    argv[0] = ("shXX").slice(0, 2)
+    argv[1] = ("-cZZ").slice(0, 2)
+    argv[2] = ("exit 7;;;").slice(0, 6)
+    var ex: Exec = match exec_prepare(("/bin/shQQ").slice(0, 7), span_from_ptr<StrView>(@argv[0], 3))
+        Ok(e) => e
+        Err(_) => return 1
+    let pid: i32 = sys_fork()
+    if pid == 0
+        ex.run()
+        sys_exit(126)
+    ex.free()
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    assert ((status >> 8) & 255) == 7
+    0

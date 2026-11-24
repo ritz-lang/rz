@@ -115,7 +115,7 @@ echo -n "Test env (environment passthrough): "
 
 # Environment passthrough: the child inherits our environment exactly — same entries, same
 # order, '=' inside a value and empty values intact (AGAST #1480: the envp
-# handed to execve comes from ritzlib.os.env's env_raw_envp).
+# handed to execve comes from ritzlib.process's exec_prepare, AGAST #4648).
 expected=$(printf 'A=1\nB==2\nEMPTY=\nPATH=/usr/bin:/bin')
 result=$(env -i A=1 B==2 EMPTY= PATH=/usr/bin:/bin "$TIMEOUT" 5 env)
 if [ "$result" = "$expected" ]; then

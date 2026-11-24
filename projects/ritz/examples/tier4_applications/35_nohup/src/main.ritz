@@ -26,12 +26,11 @@ import ritzlib.string
 import ritzlib.option
 import ritzlib.span
 import ritzlib.fmt
-import ritzlib.os.env
 import ritzlib.process
 import ritzlib.fd { Fd, fd_open, fd_stdout }
 import ritzlib.fs { access }
 import ritzlib.result
-import ritzlib.gvec
+import ritzlib.errno
 
 # ============================================================================
 # Constants
@@ -88,13 +87,19 @@ fn open_nohup_out() -> Result<Fd, Errno>
 # $PATH, or the standard directories when it is unset or empty, as
 # execvp(3) does.  Returns 0 if it is not found; if it is found but will not
 # exec, reports that and returns EXIT_CANNOT_INVOKE.  Never returns on success.
-fn exec_from_path(cmd: StrView, exec_args: **u8) -> i32
+fn exec_from_path(cmd: StrView, exec_args: Span<StrView>) -> i32
     match find_command(cmd)
         Some(path) =>
             var full: String = path
-            # Raw execve: argv[0] stays the name as typed (process.exec
-            # would make it the resolved path).
-            sys_execve(full.as_ptr(), exec_args, env_raw_envp())
+            # argv[0] stays the name as typed (process.exec would make it
+            # the resolved path).
+            var ex: Exec = match exec_prepare(full.as_view(), exec_args)
+                Ok(e) => e
+                Err(_) =>
+                    print_error_ln("nohup: out of memory")
+                    return EXIT_NOHUP_FAILURE
+            ex.run()
+            ex.free()
             nohup_err2("nohup: failed to run '", full.as_view(), "'")
             EXIT_CANNOT_INVOKE
         None => 0
@@ -102,18 +107,6 @@ fn exec_from_path(cmd: StrView, exec_args: **u8) -> i32
 # ============================================================================
 # Main
 # ============================================================================
-
-# args[1..] as a NULL-terminated *u8 array for execve.  Each argv StrView
-# ends at argv's NUL, so .ptr is a valid C string.
-fn exec_argv(args: Span<StrView>) -> Vec<*u8>
-    var av = vec_new<*u8>()
-    var i: i64 = 1
-    while i < args.len
-        let a: StrView = args[i]
-        av.push(a.ptr)
-        i += 1
-    av.push(null)
-    av
 
 pub fn main(args: Span<StrView>) -> i32
     # Check for at least one argument (the command)
@@ -145,9 +138,8 @@ pub fn main(args: Span<StrView>) -> i32
     # Get the command to execute (args[1])
     let cmd: StrView = args[1]
 
-    # Build argv for execve: args[1], args[2], ..., NULL
-    var child_argv: Vec<*u8> = exec_argv(args)
-    let new_args: **u8 = child_argv.as_ptr()
+    # The child's argv: args[1], args[2], ...
+    let new_args: Span<StrView> = args.from(1)
 
     # Execute the command
     # A name with a '/' is a path; anything else is searched for.

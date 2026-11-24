@@ -63,7 +63,7 @@ fn crashes() -> i32
 # AGAST #3725: a non-dumpable child cannot read /proc/self/environ (the kernel
 # makes /proc/self/* root-owned), which is where ritzlib.os.env loads from.
 # Exit codes: 30 empty environment, 31 the variable is missing or wrong,
-# 32 env_raw_envp() is empty, 0 the child sees its environment.
+# 0 the child sees its environment.
 ENV_PROBE = """\
 import ritzlib.strview
 import ritzlib.span
@@ -75,8 +75,6 @@ fn probe_env() -> i32
         return 30
     if not env_get_or("RITZUNIT_ENV_PROBE", "").eq("seen")
         return 31
-    if *env_raw_envp() == null
-        return 32
     0
 """
 

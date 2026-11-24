@@ -3,8 +3,8 @@
 os/env used to read only /proc/self/environ.  Once a process is not dumpable
 (prctl(PR_SET_DUMPABLE, 0), or a setuid/setgid/cap-changing exec) the kernel
 makes /proc/self/* root-owned, the open fails with EACCES, and env_load
-silently cached an EMPTY environment: env_get returned None and env_raw_envp
-handed an empty env to exec'd children.  #3725 only fixed ritzunit's children.
+silently cached an EMPTY environment: env_get returned None and exec'd
+children got an empty env.  #3725 only fixed ritzunit's children.
 
 Every `_start` now stores the kernel's envp in one global, `__ritz_envp`, and
 os/env reads that first, with /proc/self/environ as the fallback:
@@ -68,8 +68,7 @@ const PR_SET_DUMPABLE: i64 = 4
     if fd >= 0
         sys_close(fd)
         return 3
-    let raw: **u8 = env_raw_envp()
-    if raw == null or *raw == null
+    if env_iter().len == 0
         return 4
     match env_get("PATH")
         Some(v) =>

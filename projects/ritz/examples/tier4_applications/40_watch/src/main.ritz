@@ -25,8 +25,8 @@ import ritzlib.fmt
 import ritzlib.gvec
 import ritzlib.result
 import ritzlib.argspec
-import ritzlib.os.env
-import ritzlib.process { fork, wait_pid }
+import ritzlib.errno
+import ritzlib.process { Exec, exec_prepare, fork, wait_pid }
 import ritzlib.time { sleep, duration_secs }
 
 # ============================================================================
@@ -51,36 +51,38 @@ fn clear_screen()
 # Command execution
 # ============================================================================
 
-fn run_command(cmd_string: *u8) -> i32
-    # The child runs with our environment.  Resolved before fork:
-    # env_raw_envp() builds (and caches) its array on first use.
-    let envp: **u8 = env_raw_envp()
+fn run_command(cmd: StrView) -> i32
+    # Execute via /bin/sh -c "command", with our environment.  Prepared
+    # before fork, so the child allocates nothing.
+    var sh_argv = vec_new<StrView>()
+    sh_argv.push("/bin/sh")
+    sh_argv.push("-c")
+    sh_argv.push(cmd)
+    let prepared: Result<Exec, Errno> = exec_prepare("/bin/sh", span_from_vec(@sh_argv))
+    sh_argv.deinit()
+    var ex: Exec = match prepared
+        Ok(e) => e
+        Err(_) =>
+            eprint("watch: out of memory\n")
+            return 1
 
-    # Fork a child process
-    # pid 0 in the child, which execs with the raw execve below: its argv is
-    # on the stack, so nothing allocates between fork and exec.
+    # Fork a child process (pid 0 in the child)
     let pid: i32 = match fork()
         Ok(fr) =>
             match fr
                 Child => 0
                 Parent(child) => child
         Err(_) =>
+            ex.free()
             eprint("watch: fork failed\n")
             return 1
 
     if pid == 0
-        # Child process - execute via /bin/sh -c "command"
-        # Build argv: ["/bin/sh", "-c", "command", NULL]
-        var sh_argv: [4]*u8
-        sh_argv[0] = c"/bin/sh"
-        sh_argv[1] = c"-c"
-        sh_argv[2] = cmd_string
-        sh_argv[3] = null
-
-        let result: i32 = sys_execve(c"/bin/sh", @sh_argv[0], envp)
+        ex.run()
         # If execve returns, it failed
         eprint("watch: cannot execute /bin/sh\n")
         sys_exit(127)
+    ex.free()
 
     # Parent process - wait for child
     # Exit status if the child exited normally (0 if a signal killed it)
@@ -161,7 +163,7 @@ fn watch(p: @ParsedArgs, interval: i64) -> i32
         print("Every {interval}s: {cmd_cstr}\n\n")
 
         # Run the command
-        run_command(@cmd_string[0])
+        run_command(StrView { ptr: @cmd_string[0], len: cmd_len })
 
         # Sleep for the interval
         sleep(duration_secs(interval))

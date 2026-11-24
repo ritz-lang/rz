@@ -580,7 +580,7 @@ struct Vec<T>
 | `v.pop()` | `fn() -> T` | Pop last element (caller ensures non-empty) |
 | `v.get(idx)` | `fn(idx: i64) -> T` | Get element by index (caller ensures in range) |
 | `v.get_ptr(idx)` | `fn(idx: i64) -> *T` | Get pointer to element |
-| `v.set(idx, item)` | `fn(idx: i64, item: T) -> i32` | Set element (caller ensures in range); returns 0 |
+| `v.set(idx, item)` | `fn(idx: i64, item: T)` | Set element; an index outside `0..len` ends the program with status 101 |
 | `v.len()` | `fn() -> i64` | Get length |
 | `v.cap()` | `fn() -> i64` | Get capacity |
 | `v.is_empty()` | `fn() -> bool` | Check if empty |
@@ -814,10 +814,10 @@ struct HashMapI64
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `m.insert(key, value)` | `fn(key: i64, value: i64)` | Insert or update |
-| `m.get(key)` | `fn(key: i64) -> i64` | Get value (0 if not found) |
+| `m.get(key)` | `fn(key: i64) -> Option<i64>` | The value, or `None` if not found (a stored 0 is `Some(0)`) |
 | `m.find(key)` | `fn(key: i64) -> Option<i64>` | The key's slot index, or `None` |
 | `m.contains(key)` | `fn(key: i64) -> bool` | Check if key exists |
-| `m.remove(key)` | `fn(key: i64) -> i32` | Remove key (1 if removed) |
+| `m.remove(key)` | `fn(key: i64) -> bool` | Remove key (true if it was there) |
 | `m.len()` | `fn() -> i64` | Get entry count |
 | `m.cap()` | `fn() -> i64` | Get capacity |
 | `m.is_empty()` | `fn() -> bool` | Check if empty |
@@ -1445,7 +1445,7 @@ explicit release. To read a whole file descriptor, use `vec_read_all_fd`
 | `b.get(idx)` | `fn(idx: i64) -> u8` | Byte at index (0 out of range) |
 | `b.is_empty()` | `fn() -> bool` | Empty? |
 | `b.view()` | `fn() -> StrView` | Contents as a slice (invalidated by the next append) |
-| `b.data()` | `fn() -> *u8` | Data pointer (C interop) |
+| `b.as_span()` | `fn() -> Span<u8>` | Contents as a byte span (invalidated by the next append) |
 
 ---
 
@@ -1547,7 +1547,7 @@ struct Stat
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `sys_mmap` | `fn(addr: i64, length: i64, prot: i32, flags: i32, fd: i32, offset: i64) -> *u8` | Map memory |
+| `sys_mmap` | `fn(addr: i64, length: i64, prot: i32, flags: i32, fd: i32, offset: i64) -> *u8` | Map memory (kernel ABI: an address or -errno; prefer `sys_mmap_anon` / `ritzlib.memory`) |
 | `sys_munmap` | `fn(addr: *u8, length: i64) -> i32` | Unmap memory |
 | `sys_mprotect` | `fn(addr: *u8, length: i64, prot: i32) -> i32` | Change protection |
 
@@ -2599,6 +2599,15 @@ struct ProcessResult
 |--------|-----------|-------------|
 | `p.valid()` | `fn() -> bool` | Whether the spawn gave a live pid |
 
+**Exec in place** (execve(2), for a program that forks and sets up the child
+itself, or replaces itself):
+
+| Function / Method | Signature | Description |
+|----------|-----------|-------------|
+| `exec_prepare` | `fn(path: StrView, args: Span<StrView>) -> Result<Exec, Errno>` | `path` (as given, no `$PATH` search) with argv `args` (`args[0]` is argv[0]) and this process's environment. Built before fork, so the child allocates nothing; `Err(NoMem)` |
+| `ex.run()` | `fn() -> Errno` | execve(2); returns only on failure, with its `Errno` |
+| `ex.free()` | `fn()` | Release the prepared arrays |
+
 **I/O Operations**:
 
 | Method | Signature | Description |
@@ -2779,7 +2788,6 @@ value is a zero-copy `StrView` into that cache.
 | `env_get_p` | `fn(name: *StrView) -> Option<StrView>` | `env_get` taking the name by pointer |
 | `env_get_or` | `fn(name: StrView, default: StrView) -> StrView` | Value of `name`, or `default` |
 | `env_iter` | `fn() -> Span<StrView>` | Every `"KEY=VALUE"` entry, in order |
-| `env_raw_envp` | `fn() -> **u8` | The same entries as a NULL-terminated C `envp`, for `sys_execve` only |
 
 A get-or-die `env_must` helper deliberately does *not* live here: S-ERR-3 says
 a library returns its failure to the caller, so only a program decides to
@@ -2812,9 +2820,9 @@ fn main() -> i32
     0
 ```
 
-To run a child with the current environment, pass `env_raw_envp()` as
-`sys_execve`'s third argument. It is the only raw-pointer accessor, kept for
-that interop; the strings are the cached entries, so it costs no copying.
+There is no raw `**u8` envp accessor. To run a child with the current
+environment, use `ritzlib.process`: `spawn`, or `exec_prepare` then `run` in a
+forked child (AGAST #4648).
 
 ---
 
@@ -2980,12 +2988,12 @@ and stay legal.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `json_emit_bytes` | `fn(s: *u8, len: i64, buf: *Vec<u8>) -> i32` | Emit `s[0..len)` as a string; control characters as `\b \f \n \r \t` or `\u00XX` |
-| `json_emit_string` | `fn(s: *u8, buf: *Vec<u8>) -> i32` | `json_emit_bytes` up to the first NUL |
+| `json_emit_bytes` | `fn(s: Span<u8>, buf: @&Vec<u8>)` | Emit `s[0..len)` as a string; control characters as `\b \f \n \r \t` or `\u00XX` |
+| `json_emit_string` | `fn(s: StrView, buf: @&Vec<u8>)` | `json_emit_bytes` of a StrView |
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `v.emit(buf)` | `fn(buf: @&Vec<u8>) -> i32` | Emit to buffer |
+| `v.emit(buf)` | `fn(buf: @&Vec<u8>)` | Append the JSON text to buffer |
 | `v.to_string()` | `fn() -> String` | JSON text; the caller owns it, and its `Drop` impl frees it at scope end |
 
 **Error Messages**:

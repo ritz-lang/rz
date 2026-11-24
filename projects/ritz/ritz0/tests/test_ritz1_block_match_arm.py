@@ -320,7 +320,7 @@ def test_ritz1_compiles_os_env(ritz1_bin, tmp_path):
     assert comp.returncode == 0 and ll.exists(), (
         f"ritz1 refused ritzlib/os/env.ritz:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
     )
-    assert "@env_raw_envp" in ll.read_text(), "env.ritz functions were not emitted"
+    assert "@env_iter" in ll.read_text(), "env.ritz functions were not emitted"
 
 
 @pytest.mark.integration

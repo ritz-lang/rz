@@ -863,8 +863,13 @@ def find_all_packages(search_dir: Path = None) -> list[tuple[Path, dict]]:
     search_dir = search_dir.resolve()
     packages = []
 
-    # Search for all ritz.toml files recursively
+    # Search for all ritz.toml files recursively.  docs/archive is retired
+    # code that nothing should build: rz.toml's [workspace.exclude] keeps it
+    # out of the workspace, and `--all` skips it the same way (AGAST #4648).
     for toml_path in sorted(search_dir.glob("**/ritz.toml")):
+        parts = toml_path.relative_to(search_dir).parts
+        if any(parts[i:i + 2] == ("docs", "archive") for i in range(len(parts))):
+            continue
         packages.append((toml_path.parent, load(toml_path)))
 
     return packages

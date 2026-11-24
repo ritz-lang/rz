@@ -24,7 +24,8 @@ import ritzlib.span
 import ritzlib.fmt
 import ritzlib.os.env
 import ritzlib.fs { access }
-import ritzlib.process { fork, wait_pid }
+import ritzlib.errno
+import ritzlib.process { Exec, exec_prepare, fork, wait_pid }
 import ritzlib.time { now }
 import ritzlib.result
 import ritzlib.fmt
@@ -67,9 +68,9 @@ fn format_time(total_usec: i64)
 # Command execution
 # ============================================================================
 
-fn find_in_path(name: *u8, result: *u8) -> i32
+fn find_in_path(name: *u8, result: *u8) -> i64
     # Find command in PATH, store full path in result
-    # Returns 0 on success, 1 on failure
+    # Returns the full path's length on success, -1 on failure
 
     # If name contains a '/', use it directly
     var i: i64 = 0
@@ -84,8 +85,8 @@ fn find_in_path(name: *u8, result: *u8) -> i32
 
             # Check if executable
             if access(StrView { ptr: result, len: j }, X_OK).is_ok()
-                return 0
-            return 1
+                return j
+            return -1
         i += 1
 
     # Get PATH from environment.  Unset and empty both search nothing.
@@ -124,20 +125,20 @@ fn find_in_path(name: *u8, result: *u8) -> i32
 
         # Check if executable
         if access(StrView { ptr: result, len: j }, X_OK).is_ok()
-            return 0
+            return j
 
         # Move to next PATH component
         pos += len
         if pos < path.len and *(path.ptr + pos) == ':'  # ':'
             pos += 1
 
-    return 1
+    return -1
 
-# In the forked child: exec `cmd_path` (a NUL-terminated full path) with the
-# stack-built `argv`. The raw execve: nothing may allocate between fork and
-# exec. Never returns.
-fn exec_child(cmd_path: *u8, argv: **u8) -> i32
-    sys_execve(cmd_path, argv, env_raw_envp())
+# In the forked child: run `ex`, prepared before fork so nothing allocates
+# between fork and exec.  `cmd_path` (NUL-terminated) is for the error.
+# Never returns.
+fn exec_child(ex: @Exec, cmd_path: *u8) -> i32
+    ex.run()
 
     # If execve returns, it failed.
     time_err2("time: ", cmd_path, ": exec failed")
@@ -160,19 +161,18 @@ pub fn main(args: Span<StrView>) -> i32
 
     # Find command in PATH
     var cmd_path: [4096]u8
-    if find_in_path(cmd_name, @cmd_path[0]) != 0
+    let cmd_path_len: i64 = find_in_path(cmd_name, @cmd_path[0])
+    if cmd_path_len < 0
         time_err2("time: ", cmd_name, ": command not found")
         return 127
 
-    # Build argv for child process (skip our "time" args[0])
-    # We need to create a new argv array starting from args[1].  Each argv
-    # StrView ends at argv's NUL, so .ptr is a valid C string.
-    var child_argv: [256]*u8
-    let max_args: i64 = if args.len - 1 < 255 then args.len - 1 else 255
-    for i in 0..max_args
-        let a: StrView = args[1 + i]
-        child_argv[i] = a.ptr
-    child_argv[max_args] = null
+    # The child's argv is args[1..] (skip our "time" args[0]).  Prepared
+    # before fork, so the child allocates nothing.
+    var ex: Exec = match exec_prepare(StrView { ptr: @cmd_path[0], len: cmd_path_len }, args.from(1))
+        Ok(e) => e
+        Err(_) =>
+            eprint("time: out of memory\n")
+            return 1
 
     # Get start time
     let start_time: Timeval = now()
@@ -181,11 +181,13 @@ pub fn main(args: Span<StrView>) -> i32
     let pid: i32 = match fork()
         Ok(fr) =>
             match fr
-                Child => exec_child(@cmd_path[0], @child_argv[0])
+                Child => exec_child(@ex, @cmd_path[0])
                 Parent(child) => child
         Err(_) =>
+            ex.free()
             eprint("time: fork failed\n")
             return 1
+    ex.free()
 
     # Parent process: wait for child. Its exit code if it exited, 128 +
     # the signal if one killed it; 0 if the wait failed.

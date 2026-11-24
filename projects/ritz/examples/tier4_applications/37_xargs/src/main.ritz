@@ -31,7 +31,8 @@ import ritzlib.argspec
 import ritzlib.fmt
 import ritzlib.fd { fd_stdin }
 import ritzlib.fs { access }
-import ritzlib.process { ProcessResult, fork, wait_pid }
+import ritzlib.errno
+import ritzlib.process { Exec, ProcessResult, exec_prepare, fork, wait_pid }
 
 # ============================================================================
 # Constants
@@ -59,16 +60,16 @@ fn copy_cstr(dst: *u8, src: StrView)
         *(dst + i) = src.get(i)
     *(dst + src.len) = 0
 
-fn search_path(name: StrView, result: *u8) -> i32
+fn search_path(name: StrView, result: *u8) -> i64
     # Search PATH for the given command name
-    # Copies the full path to result (NUL-terminated, for execve) if found
-    # Returns 1 if found, 0 if not found
+    # Copies the full path to result (NUL-terminated) if found
+    # Returns the full path's length if found, 0 if not found
 
     # If name contains a /, use it directly
     if name.find_byte('/') != name.len
         if access(name, X_OK).is_ok()
             copy_cstr(result, name)
-            return 1
+            return name.len
         return 0
 
     # Get PATH from environment.  Unset and empty both search nothing.
@@ -96,7 +97,7 @@ fn search_path(name: StrView, result: *u8) -> i32
 
         # Check if executable
         if access(StrView { ptr: result, len: j }, X_OK).is_ok()
-            return 1
+            return j
 
         # Move to next PATH component
         pos += len
@@ -112,25 +113,32 @@ fn wait_exit_status(r: @ProcessResult) -> i32
         return 0
     return r.exit_code
 
-fn run_command(cmd_path: *u8, args: **u8) -> i32
+fn run_command(cmd_path: StrView, args: Span<StrView>) -> i32
     # Fork and exec the command
     # Returns the exit status of the child process
+
+    # Prepared before fork, so the child allocates nothing.
+    var ex: Exec = match exec_prepare(cmd_path, args)
+        Ok(e) => e
+        Err(_) =>
+            eprint("xargs: out of memory\n")
+            return 1
 
     let pid: i32 = match fork()
         Ok(fr) =>
             match fr
                 Child =>
-                    # Raw execve: argv is the caller's stack array, and
-                    # nothing may allocate between fork and exec.
-                    sys_execve(cmd_path, args, env_raw_envp())
+                    ex.run()
                     # If we get here, execve failed
                     eprint("xargs: execve failed\n")
                     sys_exit(127)
                     127
                 Parent(child) => child
         Err(_) =>
+            ex.free()
             eprint("xargs: fork failed\n")
             return 1
+    ex.free()
 
     # Parent process - wait for child
     match wait_pid(pid)
@@ -153,9 +161,9 @@ fn skip_whitespace(buf: *u8, buf_len: i64, pos: *i64)
         p += 1
     *pos = p
 
-fn read_arg_whitespace(buf: *u8, buf_len: i64, pos: *i64) -> *u8
+fn read_arg_whitespace(buf: *u8, buf_len: i64, pos: *i64) -> Option<StrView>
     # Read the next whitespace-separated argument
-    # Returns pointer to the argument (null-terminated in place), or null if done
+    # Returns the argument (a view into buf), or None if done
 
     var p: i64 = *pos
 
@@ -168,9 +176,9 @@ fn read_arg_whitespace(buf: *u8, buf_len: i64, pos: *i64) -> *u8
 
     if p >= buf_len
         *pos = p
-        return null
+        return None
 
-    let arg_start: *u8 = buf + p
+    let arg_start: i64 = p
 
     # Find end of argument
     while p < buf_len
@@ -179,26 +187,26 @@ fn read_arg_whitespace(buf: *u8, buf_len: i64, pos: *i64) -> *u8
             break
         p += 1
 
-    # Null-terminate in place
-    *(buf + p) = 0
     *pos = p + 1
 
-    return arg_start
+    Some(StrView { ptr: buf + arg_start, len: p - arg_start })
 
-fn read_arg_null(buf: *u8, buf_len: i64, pos: *i64) -> *u8
+fn read_arg_null(buf: *u8, buf_len: i64, pos: *i64) -> Option<StrView>
     # Read the next NUL-separated argument
-    # Returns pointer to the argument, or null if done
+    # Returns the argument (a view into buf), or None if done
 
     var p: i64 = *pos
 
     if p >= buf_len
-        return null
+        return None
 
-    let arg_start: *u8 = buf + p
+    let arg_start: i64 = p
 
     # Find NUL terminator
     while p < buf_len and *(buf + p) != 0
         p += 1
+
+    let len: i64 = p - arg_start
 
     # Skip the NUL
     if p < buf_len
@@ -206,11 +214,11 @@ fn read_arg_null(buf: *u8, buf_len: i64, pos: *i64) -> *u8
 
     *pos = p
 
-    # Return null if empty argument
-    if arg_start == buf + p - 1 and *(arg_start) == 0
-        return null
+    # An empty argument ends the input
+    if len == 0
+        return None
 
-    return arg_start
+    Some(StrView { ptr: buf + arg_start, len: len })
 
 # ============================================================================
 # Main
@@ -229,12 +237,6 @@ fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     1
 
-# Positional i as a C string.  A positional is always a whole argv entry, so
-# its view ends at argv's NUL and .ptr is a valid C string.
-fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
-    let v: StrView = pos.get(i)
-    v.ptr
-
 fn xargs(p: @ParsedArgs, max_args: i64) -> i32
     var opts: XargsOptions
     opts.null_sep = p.switch("null") as u8
@@ -251,9 +253,11 @@ fn xargs(p: @ParsedArgs, max_args: i64) -> i32
 
     # Find the command in PATH
     var cmd_path: [4096]u8
-    if search_path(cmd, @cmd_path[0]) == 0
+    let cmd_path_len: i64 = search_path(cmd, @cmd_path[0])
+    if cmd_path_len == 0
         eprint("xargs: {cmd}: command not found\n")
         return 127
+    let cmd_view: StrView = StrView { ptr: @cmd_path[0], len: cmd_path_len }
 
     # Read all input into a buffer
     var input_buf: [65536]u8
@@ -269,73 +273,66 @@ fn xargs(p: @ParsedArgs, max_args: i64) -> i32
 
     input_buf[total_read] = 0
 
-    # Storage for arguments to pass to each command
+    # Arguments to pass to each command
     # args[0] is the command, followed by initial args from command line,
-    # then args from stdin, then null terminator
-    var args: [1024]*u8
-    var arg_count: i32 = 0
+    # then args from stdin
+    var args = vec_new<StrView>()
     var stdin_arg_count: i32 = 0
 
     # Set up command as first argument
-    args[0] = @cmd_path[0]
-    arg_count = 1
+    args.push(cmd_view)
 
     # Add initial arguments from command line
     var i: i64 = cmd_args_start
     while i < cmd_pos.len
-        args[arg_count] = positional_cstr(@cmd_pos, i)
-        arg_count += 1
+        args.push(cmd_pos.get(i))
         i += 1
 
-    let initial_arg_count: i32 = arg_count
+    let initial_arg_count: i64 = args.len()
 
     # Parse stdin arguments
     var pos: i64 = 0
     var exit_code: i32 = 0
 
     while pos < total_read
-        var arg: *u8 = null
+        var next: Option<StrView> = None
         if opts.null_sep != 0
-            arg = read_arg_null(@input_buf[0], total_read, @pos)
+            next = read_arg_null(@input_buf[0], total_read, @pos)
         else
-            arg = read_arg_whitespace(@input_buf[0], total_read, @pos)
+            next = read_arg_whitespace(@input_buf[0], total_read, @pos)
 
-        if arg == null
-            break
+        let arg: StrView = match next
+            Some(a) => a
+            None => break
 
         # Skip empty arguments
-        if *arg == 0
+        if arg.len == 0
             continue
 
         # Add argument to list
-        args[arg_count] = arg
-        arg_count += 1
+        args.push(arg)
         stdin_arg_count += 1
 
         # Check if we've reached max args
         if opts.max_args > 0 and stdin_arg_count >= opts.max_args
-            # Null terminate args array
-            args[arg_count] = null
-
             # Run the command
-            let result: i32 = run_command(@cmd_path[0], @args[0])
+            let result: i32 = run_command(cmd_view, span_from_vec(@args))
             if result != 0
                 exit_code = result
 
             # Reset for next batch
-            arg_count = initial_arg_count
+            while args.len() > initial_arg_count
+                args.pop()
             stdin_arg_count = 0
 
     # Run final batch if there are remaining arguments
-    if arg_count > initial_arg_count
-        # Null terminate args array
-        args[arg_count] = null
-
+    if args.len() > initial_arg_count
         # Run the command
-        let result: i32 = run_command(@cmd_path[0], @args[0])
+        let result: i32 = run_command(cmd_view, span_from_vec(@args))
         if result != 0
             exit_code = result
 
+    args.deinit()
     return exit_code
 
 fn run(spec: @ArgSpec, p: ParsedArgs) -> i32
