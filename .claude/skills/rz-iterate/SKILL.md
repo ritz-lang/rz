@@ -16,9 +16,9 @@ This is the default every turn. Aaron shouldn't have to ask for it again. The
 sections below give the mechanics; this is the policy they serve:
 
 1. **As much in parallel as the fleet holds.** Every turn, fill every free
-   slot on every ready host (see "Hosts") with `ready` tickets, and with
-   survey rooms when a milestone runs dry. **Draining** (no new spawns) only
-   when Aaron asks for it, and only until he lifts it.
+   slot on every ready host (see "Hosts") with `ready` tickets that move a
+   goal (item 7). Survey rooms only under item 7's cap. **Draining** (no new
+   spawns) only when Aaron asks for it, and only until he lifts it.
 2. **Up to 8 cars per train.** The first train waits **60 s** after its last
    car for more to join, then gates. The **second train** queues up to 8
    cars behind the gating first train, stacked on its tail, then gates
@@ -42,6 +42,30 @@ sections below give the mechanics; this is the policy they serve:
    culprit's room commit a fix on the red tail. The held cars and the fix
    then board together. Innocent cars never go back to their rooms.
    Bisect only when no culprit can be named.
+7. **Finish work; don't breed follow-ons** (Aaron, 2026-11-24: "We are now
+   at 2250 total cards, we were barely at 1000 before the big push started
+   ... we are walking in circles instead of walking towards the
+   objective"). Every ticket and every room must move one of the five goals
+   at the bottom of this file. In practice:
+   - **A room finishes its ticket's objective in its own commit**,
+     including the small adjacent fixes the change needs: a caller to
+     port, a stale comment it touched, a test row next door. "Out of scope"
+     is not a reason to file a ticket. Things that don't block a goal
+     (style, docs drift, metrics, cleanups, "consider ...") go in the REAP
+     line's one-liner or nowhere. A room files **at most one** new ticket,
+     and only for a gap that blocks a goal and can't fit in its commit.
+     The ticket names the goal (briefing step 4).
+   - **`rz` files tickets only** for a new failure on `main` or in a train
+     that no running room owns, or when Aaron asks. Spawn and host hiccups
+     go in the turn report, not into AGAST. Fold related tickets into one
+     room ("do #a and #b in one commit") rather than spawning two.
+   - **Survey rooms** run only when the next goal has no `ready` ticket.
+     Each files **at most 5 tickets**, one per root cause, ordered by how
+     much of the goal each closes. They never file tickets for findings
+     that block no goal.
+   - **Spawn only for goal work.** A `ready` ticket that moves no goal stays
+     parked. Don't spawn it to fill a slot, and don't break it into more
+     tickets.
 
 ## The loop
 
@@ -120,9 +144,10 @@ Repeat until the goal is met:
      Place anything else you find.
    - **Briefing `<milestone>`** is the parent of the ticket being worked
      (Triage #3788 if it has none).
-5. **No tickets for the milestone?** Spawn a **survey room**: it measures the
-   milestone, files one AGAST ticket per defect found, and REAPs with only its
-   notes (or no commit at all; see "Survey rooms").
+5. **No tickets for the next goal?** Spawn a **survey room**: it measures
+   the goal, files at most 5 tickets, one per root cause (Operating mode
+   item 7), and REAPs with only its notes, or no commit at all (see "Survey
+   rooms").
 6. **Wait.** Schedule a long fallback wakeup (`ScheduleWakeup`, 1800s,
    prompt `/rz-iterate`). REAP messages arrive with `ask_claude=True` and wake
    the room sooner.
@@ -543,12 +568,15 @@ host's `~/dev/ritz-lang/rz` checkout for the gate.
 Room and branch `ritz-task-<id>`, worktree `~/dev/ritz-lang/rz-task-<id>`,
 callback room `rz`.
 
-**If your SPAWN named a train tail `<tail12>`:** the host created the
-worktree off `origin/main`; base it on the deepest train tail instead:
-`git fetch origin rz-train/<tail12> && git reset --hard FETCH_HEAD`. Make
-and check your commit on that base: it boards the train as KEPT. Do not
+**Your base is the train tail `<tail12>`, not `origin/main`.** Before
+any edit, run `git fetch origin rz-train/<tail12> && git reset --hard
+FETCH_HEAD`: the host created your worktree off `origin/main`. Make and
+check your commit on that base: it boards the train as KEPT. Do not
 rebase onto `origin/main` before you REAP (step 5) unless `rz` tells you to:
 that would replay the train's cars and stop you boarding as KEPT.
+(`rz` deletes this paragraph when no train is built; then you branch from
+`origin/main`. Rooms used to skip it as "If your SPAWN named a train
+tail", because a room never sees its SPAWN line: #4651.)
 
 ### You own this: your REAP vouches for your commit
 
@@ -571,10 +599,20 @@ you changed pass **in full** on that exact commit (step 6).
    the cross product, and read "What a ritz0 pytest case costs" in
    `projects/ritz/docs/TESTING.md` before adding hundreds of cases.
 3. **Subagents (Agent tool) for parallel work.** No rooms of your own.
-4. **Out of scope?** File an AGAST ticket. Don't widen the change. File it
-   with `project_id=1` and `parent_task_id=<milestone>` (the parent of your
-   own ticket). If it fits no milestone, use the Triage bucket `#3788`.
-   Never file a ritz ticket with no project or no parent.
+4. **Finish the job; don't file follow-ons.** Aaron, 2026-11-24: the
+   board went from ~1,000 to 2,250 cards in one push, and follow-on
+   tickets are overhead that walks in circles. Do the whole of your
+   ticket's objective in your commit, including the small adjacent fixes
+   it needs: a caller to port, a stale comment or test row you touched, a
+   pin to update. "Out of scope" is not a reason to file a ticket. Anything
+   that blocks none of the five self-hosting goals (the end of
+   `.claude/skills/rz-iterate/SKILL.md`), such as style, docs drift,
+   metrics, cleanups or "consider ...", goes in your REAP line's one-liner,
+   or nowhere. File **at most one** ticket, and only for a gap that blocks
+   a goal and can't fit in your commit. Its first line names the goal; file
+   it with `project_id=1` and `parent_task_id=<milestone>` (the parent of
+   your own ticket), and say it in your REAP. Never split your ticket into
+   more tickets.
 5. **Finish on main:** `git fetch origin && git rebase origin/main` (not
    when you were spawned on a train tail: that tail is your base, and a
    rebase onto `origin/main` would replay the train's cars and stop you
@@ -719,11 +757,12 @@ so:
   <sha12> [<targets>] EXIT=0` line, or `gate <log name> SHA=<first 12>
   EXIT=0` for a full gate. `rz` checks it against the SHA you REAP with
   `smoke-plan.sh check`.
-- **AGAST:** read your ticket and file new ones as a local room would. The
-  ticket is claimed as `ritz-task-<id>@<host>`; leave its status alone
-  (step 1). The ticket text is also pasted below. If an AGAST call fails, say so in your REAP, list
-  follow-ups there (one line each: title, file:line, why) for `rz` to file,
-  and for step 1 REAP `none` with the evidence.
+- **AGAST:** read your ticket. File a new one only under step 4's rule (at
+  most one, for a gap that blocks a goal). The ticket is claimed as
+  `ritz-task-<id>@<host>`; leave its status alone (step 1). The ticket
+  text is also pasted below. If an AGAST call fails, say so in your REAP,
+  name that one blocking gap there if you have one (title, file:line, the
+  goal it blocks), and for step 1 REAP `none` with the evidence.
 - **Self-restart** (`room-unit.sh restart-self` under "An MCP call
   rejected", below) works the same on this host.
 
@@ -1473,11 +1512,14 @@ high-priority ticket and a room. Don't block merges on CI.
 
 ## Survey rooms
 
-When a milestone has no ready tickets, spawn `ritz-survey-<slug>` with the
-same briefing, but its job is: measure, file one AGAST ticket per defect
-(with repro, file:line, and suggested fix), and add dependencies between
-them. If it commits nothing, its REAP line is `REAP ritz-survey-<slug> none`,
-and reaping it means only cleanup.
+Only when the next goal has no `ready` ticket (Operating mode item 7).
+Spawn `ritz-survey-<slug>` with the same briefing, but its job is: measure
+the goal, then file **at most 5 tickets**, one per root cause (repro,
+file:line, suggested fix), ordered by how much of the goal each closes, with
+dependencies between them. Findings that block no goal go in the REAP
+line's counts, not into AGAST. If it commits nothing, its REAP line is
+`REAP ritz-survey-<slug> none`, and reaping it means only cleanup.
+(2026-11-24: two uncapped surveys filed 13 and 18 tickets in one pass.)
 
 ## Goal: a working self-hosted ritz compiler
 
