@@ -55,7 +55,7 @@ PINS = {
     "larb": 3,
     "lexis": 10,
     "mausoleum": 501,
-    "nexus": 73,
+    "nexus": 45,
     "prism": 7,
     "ritz": 2024,
     "ritz-lsp": 87,

@@ -31,7 +31,7 @@
 import ritzlib.memory
 import ritzlib.strview { StrView }
 import ritzlib.string { String, string_from }
-import ritzlib.gvec { Vec, vec_new }
+import ritzlib.gvec { Vec, vec_new, vec_with_cap }
 
 import spire.repo.mausoleum {
     Db,
@@ -423,11 +423,13 @@ fn find_slug(repo: *WikiPageRepository, slug: StrView, scan: *SlugScan) -> Resul
         # Any other failure falls through too: the scan below redials and
         # reports the error the way every operation does.
 
-    scan.tmp = malloc(slug.len() + 1)
+    # scan.tmp borrows this buffer for the scan only.
+    var tmp: Vec<u8> = vec_with_cap<u8>(slug.len() + 1)
+    scan.tmp = tmp.as_ptr()
     if scan.tmp == null
         return Err(RepoError.DatabaseError(string_from("Out of memory")))
     let scanned: i64 = doc_scan(repo, slug_scan_step as *u8, slug_scan_reset as *u8, scan as *u8)
-    free(scan.tmp)
+    scan.tmp = null
     if scanned < 0
         return Err(doc_error(scanned, "Scan failed"))
     Ok(())
@@ -452,16 +454,14 @@ pub fn wiki_page_repo_get_by_slug(repo: *WikiPageRepository, slug: StrView) -> R
 # Encode and insert `page`, returning its new document id.
 fn insert_document(repo: *WikiPageRepository, page: *WikiPage) -> Result<i64, RepoError>
     let bound: i64 = wiki_page_encode_bound(page)
-    let buf: *u8 = malloc(bound)
-    if buf == null
+    var buf: Vec<u8> = vec_with_cap<u8>(bound)
+    if buf.as_ptr() == null
         return Err(RepoError.SerializationError)
-    let n: i64 = wiki_page_encode(page, buf, bound)
+    let n: i64 = wiki_page_encode(page, buf.as_ptr(), bound)
     if n < 0
-        free(buf)
         return Err(RepoError.SerializationError)
 
-    let doc_id: i64 = doc_insert(repo, buf, n as i32)
-    free(buf)
+    let doc_id: i64 = doc_insert(repo, buf.as_ptr(), n as i32)
     if doc_id < 0
         return Err(doc_error(doc_id, "Insert failed"))
     Ok(doc_id)

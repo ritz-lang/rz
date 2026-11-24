@@ -33,6 +33,7 @@ import ritzlib.str
 import ritzlib.memory
 import ritzlib.strview { StrView, strview_from_ptr }
 import ritzlib.string { String, string_new }
+import ritzlib.gvec { Vec, vec_new }
 
 import zeus.worker { WorkerContext }
 import zeus.worker { worker_init, worker_destroy }
@@ -269,20 +270,17 @@ fn send_presented(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, body: @
     return send_html(ctx, resp, status, body)
 
 
-# Form field `name` of the request body, URL-decoded, as a view of a fresh
-# allocation the caller frees (no field can be longer than the body).
-# Returns the field's length, or -1 if absent (*buf_out is then null).
-fn form_field(body: *u8, body_len: i32, name: *u8, buf_out: **u8) -> i32
-    *buf_out = null
-    let buf: *u8 = malloc(body_len as i64)
-    if buf == null
-        return -1
-    let n: i32 = parse_form_field(body, body_len, name, buf, body_len)
+# Form field `name` of the request body, URL-decoded into `buf` (grown to
+# the body's size: no field can be longer).  Returns a view of it in `buf`,
+# or None if the field is absent.
+fn form_field(body: StrView, name: *u8, buf: @&Vec<u8>) -> Option<StrView>
+    let cap: i32 = body.len as i32
+    if not buf.ensure_cap(body.len)
+        return None
+    let n: i32 = parse_form_field(body.ptr, cap, name, buf.as_ptr(), cap)
     if n < 0
-        free(buf)
-        return -1
-    *buf_out = buf
-    return n
+        return None
+    Some(strview_from_ptr(buf.as_ptr(), n as i64))
 
 
 # The request's path.  Views into it (the slug) live as long as the request.
@@ -343,27 +341,24 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     if body_len <= 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Empty request body.")
 
-    var slug: *u8 = null
-    let slug_len: i32 = form_field(body_ptr, body_len, c"slug", @slug)
-    if slug_len < 0
-        return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'slug' field.")
-    let slug_view: StrView = strview_from_ptr(slug, slug_len as i64)
+    let body: StrView = strview_from_ptr(body_ptr, body_len as i64)
+    var slug_buf: Vec<u8> = vec_new<u8>()
+    var slug_view: StrView
+    match form_field(body, c"slug", @&slug_buf)
+        Some(v) => slug_view = v
+        None => return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'slug' field.")
     if not slug_valid(slug_view)
-        free(slug)
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9] or '-', in segments separated by '/'.")
 
-    var content: *u8 = null
-    let content_len: i32 = form_field(body_ptr, body_len, c"content", @content)
-    if content_len < 0
-        free(slug)
-        return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
+    var content_buf: Vec<u8> = vec_new<u8>()
+    var content: StrView
+    match form_field(body, c"content", @&content_buf)
+        Some(v) => content = v
+        None => return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
 
-    var body: String = string_new()
-    let status: i32 = present_page_create(@g_svc, slug_view, slug_view, strview_from_ptr(content, content_len as i64), @&body)
-    let rc: i32 = send_presented(ctx, resp, status, @&body, slug_view)
-    free(content)
-    free(slug)
-    return rc
+    var page: String = string_new()
+    let status: i32 = present_page_create(@g_svc, slug_view, slug_view, content, @&page)
+    return send_presented(ctx, resp, status, @&page, slug_view)
 
 
 # POST /wiki/:slug - Update a page, creating it if it is new.
@@ -380,16 +375,15 @@ fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     if body_len <= 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Empty request body.")
 
-    var content: *u8 = null
-    let content_len: i32 = form_field(body_ptr, body_len, c"content", @content)
-    if content_len < 0
-        return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
+    var content_buf: Vec<u8> = vec_new<u8>()
+    var content: StrView
+    match form_field(strview_from_ptr(body_ptr, body_len as i64), c"content", @&content_buf)
+        Some(v) => content = v
+        None => return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
 
-    var body: String = string_new()
-    let status: i32 = present_page_save(@g_svc, slug_view, slug_view, strview_from_ptr(content, content_len as i64), @&body)
-    let rc: i32 = send_presented(ctx, resp, status, @&body, slug_view)
-    free(content)
-    return rc
+    var page: String = string_new()
+    let status: i32 = present_page_save(@g_svc, slug_view, slug_view, content, @&page)
+    return send_presented(ctx, resp, status, @&page, slug_view)
 
 
 # GET /wiki/:slug/edit - the edit form pre-populated with the current page
