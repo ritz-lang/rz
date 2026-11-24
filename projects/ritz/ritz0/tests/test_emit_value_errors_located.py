@@ -405,6 +405,7 @@ RITZ1_GAPS = {
 }
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_every_compiler_says_it_there(tmp_path, compiler):
     gaps = {} if compiler == "ritz0" else RITZ1_GAPS
@@ -413,6 +414,7 @@ def test_every_compiler_says_it_there(tmp_path, compiler):
                     gaps)
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
 def test_ritz1_compiles_each_corrected_program(tmp_path, compiler):
     bad = []

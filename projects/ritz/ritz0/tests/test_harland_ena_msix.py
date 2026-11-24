@@ -33,8 +33,6 @@ import re
 import pytest
 from test_harland_ena_tx_buffers import KERNEL_SRC, _run
 
-pytestmark = pytest.mark.integration
-
 DEVICE = KERNEL_SRC / "drivers" / "ena" / "device.ritz"
 NETDEV = KERNEL_SRC / "drivers" / "netdev.ritz"
 
@@ -231,11 +229,13 @@ fn main() -> i32
 """
 
 
+@pytest.mark.integration
 def test_ena_msix_vectors_and_interrupt_driven_waits(tmp_path):
     rc = _run(tmp_path, MSIX_PROGRAM)
     assert rc == 0, f"check {rc}: {MSIX_CHECKS.get(rc, 'crashed or unknown exit code')}"
 
 
+@pytest.mark.integration
 def test_ena_without_msix_still_polls(tmp_path):
     rc = _run(tmp_path, POLL_PROGRAM)
     assert rc == 0, f"check {rc}: {POLL_CHECKS.get(rc, 'crashed or unknown exit code')}"
