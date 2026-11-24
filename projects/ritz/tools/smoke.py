@@ -253,9 +253,11 @@ def pytest_smoke(out: TextIO = sys.stdout) -> int:
     # worker starts (ritz0/conftest.py item 4) — step 3's job, not this one's.
     # -p no:cacheprovider: smoke must not leave .pytest_cache state behind.
     # --disable-plugin-autoload: none of a venv's other plugins (AGAST #2793).
+    # Only failed tests' tmp_path dirs are kept (AGAST #4674).
     return _run([sys.executable, "-m", "pytest", "-q", "-m", "smoke",
                  "--disable-plugin-autoload",
-                 "-p", "no:cacheprovider", "-o", "addopts="],
+                 "-p", "no:cacheprovider", "-o", "addopts=",
+                 "-o", "tmp_path_retention_policy=failed"],
                 cwd=RITZ_ROOT / "ritz0", out=out, timeout=600)
 
 

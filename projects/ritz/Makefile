@@ -141,7 +141,7 @@ tools-ratchets-tools:
 
 tools-ratchets-ritz0:
 	@echo "=== Running ritz0 in-process tests: source ratchets (-m inproc, -n $(RATCHETS_J)) ==="
-	@cd ritz0 && $(PYTHON) -m pytest -q --disable-plugin-autoload -p xdist -n $(RATCHETS_J) --dist loadgroup --no-ritz1-build -m inproc
+	@cd ritz0 && $(PYTHON) -m pytest -o tmp_path_retention_policy=failed -q --disable-plugin-autoload -p xdist -n $(RATCHETS_J) --dist loadgroup --no-ritz1-build -m inproc
 
 # ritz1's measurements: modules, sizes, import graph and cycles, where each
 # check runs, long functions.  Printed, never committed (AGAST #3896: a block
@@ -244,7 +244,7 @@ ci-local:
 PYTEST_J ?= 8
 unit:
 	@echo "=== Running ritz0 unit tests (-n $(PYTEST_J)) ==="
-	@cd ritz0 && $(PYTHON) -m pytest -q --disable-plugin-autoload -p xdist -n $(PYTEST_J) --dist loadgroup
+	@cd ritz0 && $(PYTHON) -m pytest -o tmp_path_retention_policy=failed -q --disable-plugin-autoload -p xdist -n $(PYTEST_J) --dist loadgroup
 
 # Run .ritz language tests (test levels)
 ritz:
