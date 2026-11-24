@@ -2450,6 +2450,7 @@ struct ProcessResult
 |----------|-----------|-------------|
 | `spawn` | `fn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>` | Spawn `cmd` (found by `find_command`) with `args` as argv[1..]; argv[0] is `cmd` as given. `Err` is an `Errno`: `NoEnt` not found, `Acces` not executable, `NoMem`, or a pipe/fork failure |
 | `spawn_env` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>) -> Result<Process, Errno>` | `spawn`, but the child's environment is exactly `env` (`"KEY=VALUE"` views, nothing of ours merged in; an empty span is empty). `spawn` inherits ours |
+| `spawn_env_merged` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>, stdin_fd: i32) -> Result<Process, Errno>` | `spawn_env`, but the child reads stdin from `stdin_fd` (dup'd; the caller still closes it; negative is `Err(BadF)`) and its stderr goes down the stdout pipe (`2>&1`), so `read_stdout_all` gets both in order. The `Process` has no stdin or stderr pipe. For test harnesses: `ritzlib.testlib`'s `exec_capture` |
 
 | Method | Signature | Description |
 |--------|-----------|-------------|

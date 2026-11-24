@@ -1,148 +1,136 @@
 # Tests for 38_tee — read from stdin, write to stdout and files.
 #
-# Helpers (exec_capture, make_sandbox_path, read_file, buf_eq) live in
-# ritzlib.testlib; see docs/TESTING.md.
+# Helpers (exec_capture, sandbox_path, buf_eq) live in ritzlib.testlib,
+# read_file in ritzlib.fs; see docs/TESTING.md.
 
 import ritzlib.sys
 import ritzlib.testlib
-import ritzlib.result
+import ritzlib.fs
 
 [[test]]
 fn test_tee_single_file() -> i32
-    var path: [128]u8
-    make_sandbox_path(@path[0], c"tee", c"single")
-    sys_unlink(@path[0])
+    var path: String = sandbox_path("tee", "single")
+    sys_unlink(path.as_ptr())
 
-    var argv: [3]*u8
-    argv[0] = c"./tee"
-    argv[1] = @path[0]
-    argv[2] = null
+    let args: [1]StrView = [path.as_view()]
+    let r: Result<Captured, Errno> = exec_capture("./tee", @args, span_empty<StrView>(), "hello")
+    let back: Result<String, Errno> = read_file(path.as_view())
+    sys_unlink(path.as_ptr())
 
-    var out: [1024]u8
-    var n: i64 = 0
-    let exit_code: i32 = exec_capture(c"./tee", @argv[0], null, Span<u8> { ptr: (c"hello"), len: (5) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
-
-    var rd_buf: [64]u8
-    let rd: i64 = match read_file(@path[0], Span<u8> { ptr: (@rd_buf[0]), len: (64) as i64 })
-        Ok(v) => v
-        Err(_) => -1
-    sys_unlink(@path[0])
-
-    assert exit_code == 0, "tee single should exit 0"
-    assert n == 5, "stdout should be 5 bytes"
-    assert buf_eq(Span<u8> { ptr: (@out[0]), len: (5) }, Span<u8> { ptr: (c"hello"), len: (5) }), "stdout mismatch"
-    assert rd == 5, "file should be 5 bytes"
-    assert buf_eq(Span<u8> { ptr: (@rd_buf[0]), len: (5) }, Span<u8> { ptr: (c"hello"), len: (5) }), "file content mismatch"
+    match r
+        Ok(c) =>
+            assert c.status.exit_code == 0, "tee single should exit 0"
+            assert c.out.len == 5, "stdout should be 5 bytes"
+            assert buf_eq(c.output(), "hello"), "stdout mismatch"
+        Err(_) =>
+            assert false, "spawn ./tee"
+    match back
+        Ok(s) =>
+            assert s.len() == 5, "file should be 5 bytes"
+            assert s.eq("hello"), "file content mismatch"
+        Err(_) =>
+            assert false, "file should be readable"
     0
 
 [[test]]
 fn test_tee_multiple_files() -> i32
-    var p1: [128]u8
-    var p2: [128]u8
-    make_sandbox_path(@p1[0], c"tee", c"a")
-    make_sandbox_path(@p2[0], c"tee", c"b")
-    sys_unlink(@p1[0])
-    sys_unlink(@p2[0])
+    var p1: String = sandbox_path("tee", "a")
+    var p2: String = sandbox_path("tee", "b")
+    sys_unlink(p1.as_ptr())
+    sys_unlink(p2.as_ptr())
 
-    var argv: [4]*u8
-    argv[0] = c"./tee"
-    argv[1] = @p1[0]
-    argv[2] = @p2[0]
-    argv[3] = null
+    let args: [2]StrView = [p1.as_view(), p2.as_view()]
+    let r: Result<Captured, Errno> = exec_capture("./tee", @args, span_empty<StrView>(), "world")
+    let b1: Result<String, Errno> = read_file(p1.as_view())
+    let b2: Result<String, Errno> = read_file(p2.as_view())
+    sys_unlink(p1.as_ptr())
+    sys_unlink(p2.as_ptr())
 
-    var out: [1024]u8
-    var n: i64 = 0
-    let exit_code: i32 = exec_capture(c"./tee", @argv[0], null, Span<u8> { ptr: (c"world"), len: (5) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
-
-    var b1: [64]u8
-    var b2: [64]u8
-    let r1: i64 = match read_file(@p1[0], Span<u8> { ptr: (@b1[0]), len: (64) as i64 })
-        Ok(v) => v
-        Err(_) => -1
-    let r2: i64 = match read_file(@p2[0], Span<u8> { ptr: (@b2[0]), len: (64) as i64 })
-        Ok(v) => v
-        Err(_) => -1
-    sys_unlink(@p1[0])
-    sys_unlink(@p2[0])
-
-    assert exit_code == 0, "tee multi should exit 0"
-    assert n == 5, "stdout 5 bytes"
-    assert r1 == 5, "file 1 should have 5 bytes"
-    assert buf_eq(Span<u8> { ptr: (@b1[0]), len: (5) }, Span<u8> { ptr: (c"world"), len: (5) }), "file 1 content mismatch"
-    assert r2 == 5, "file 2 should have 5 bytes"
-    assert buf_eq(Span<u8> { ptr: (@b2[0]), len: (5) }, Span<u8> { ptr: (c"world"), len: (5) }), "file 2 content mismatch"
+    match r
+        Ok(c) =>
+            assert c.status.exit_code == 0, "tee multi should exit 0"
+            assert c.out.len == 5, "stdout 5 bytes"
+        Err(_) =>
+            assert false, "spawn ./tee"
+    match b1
+        Ok(s) =>
+            assert s.len() == 5, "file 1 should have 5 bytes"
+            assert s.eq("world"), "file 1 content mismatch"
+        Err(_) =>
+            assert false, "file 1 should be readable"
+    match b2
+        Ok(s) =>
+            assert s.len() == 5, "file 2 should have 5 bytes"
+            assert s.eq("world"), "file 2 content mismatch"
+        Err(_) =>
+            assert false, "file 2 should be readable"
     0
 
 [[test]]
 fn test_tee_overwrite_default() -> i32
-    var path: [128]u8
-    make_sandbox_path(@path[0], c"tee", c"ow")
-    sys_unlink(@path[0])
+    var path: String = sandbox_path("tee", "ow")
+    sys_unlink(path.as_ptr())
 
-    var argv1: [3]*u8
-    argv1[0] = c"./tee"
-    argv1[1] = @path[0]
-    argv1[2] = null
-    var out: [1024]u8
-    var n: i64 = 0
-    exec_capture(c"./tee", @argv1[0], null, Span<u8> { ptr: (c"first"), len: (5) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
+    let args: [1]StrView = [path.as_view()]
+    let first: Result<Captured, Errno> = exec_capture("./tee", @args, span_empty<StrView>(), "first")
+    let r: Result<Captured, Errno> = exec_capture("./tee", @args, span_empty<StrView>(), "second")
+    let back: Result<String, Errno> = read_file(path.as_view())
+    sys_unlink(path.as_ptr())
 
-    let exit_code: i32 = exec_capture(c"./tee", @argv1[0], null, Span<u8> { ptr: (c"second"), len: (6) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
-
-    var rd_buf: [64]u8
-    let rd: i64 = match read_file(@path[0], Span<u8> { ptr: (@rd_buf[0]), len: (64) as i64 })
-        Ok(v) => v
-        Err(_) => -1
-    sys_unlink(@path[0])
-
-    assert exit_code == 0, "second tee should exit 0"
-    assert rd == 6, "file should be 6 bytes after overwrite"
-    assert buf_eq(Span<u8> { ptr: (@rd_buf[0]), len: (6) }, Span<u8> { ptr: (c"second"), len: (6) }), "file should contain 'second'"
+    match first
+        Ok(_) => pass
+        Err(_) =>
+            assert false, "spawn ./tee (first)"
+    match r
+        Ok(c) =>
+            assert c.status.exit_code == 0, "second tee should exit 0"
+        Err(_) =>
+            assert false, "spawn ./tee"
+    match back
+        Ok(s) =>
+            assert s.len() == 6, "file should be 6 bytes after overwrite"
+            assert s.eq("second"), "file should contain 'second'"
+        Err(_) =>
+            assert false, "file should be readable"
     0
 
 [[test]]
 fn test_tee_append_flag() -> i32
-    var path: [128]u8
-    make_sandbox_path(@path[0], c"tee", c"ap")
-    sys_unlink(@path[0])
+    var path: String = sandbox_path("tee", "ap")
+    sys_unlink(path.as_ptr())
 
-    var argv1: [3]*u8
-    argv1[0] = c"./tee"
-    argv1[1] = @path[0]
-    argv1[2] = null
-    var out: [1024]u8
-    var n: i64 = 0
-    exec_capture(c"./tee", @argv1[0], null, Span<u8> { ptr: (c"line1\n"), len: (6) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
+    let args1: [1]StrView = [path.as_view()]
+    let first: Result<Captured, Errno> = exec_capture("./tee", @args1, span_empty<StrView>(), "line1\n")
 
-    var argv2: [4]*u8
-    argv2[0] = c"./tee"
-    argv2[1] = c"-a"
-    argv2[2] = @path[0]
-    argv2[3] = null
-    let exit_code: i32 = exec_capture(c"./tee", @argv2[0], null, Span<u8> { ptr: (c"line2\n"), len: (6) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
+    let args2: [2]StrView = ["-a", path.as_view()]
+    let r: Result<Captured, Errno> = exec_capture("./tee", @args2, span_empty<StrView>(), "line2\n")
+    let back: Result<String, Errno> = read_file(path.as_view())
+    sys_unlink(path.as_ptr())
 
-    var rd_buf: [64]u8
-    let rd: i64 = match read_file(@path[0], Span<u8> { ptr: (@rd_buf[0]), len: (64) as i64 })
-        Ok(v) => v
-        Err(_) => -1
-    sys_unlink(@path[0])
-
-    assert exit_code == 0, "tee -a should exit 0"
-    assert rd == 12, "file should have 12 bytes after append"
-    assert buf_eq(Span<u8> { ptr: (@rd_buf[0]), len: (12) }, Span<u8> { ptr: (c"line1\nline2\n"), len: (12) }), "appended content mismatch"
+    match first
+        Ok(_) => pass
+        Err(_) =>
+            assert false, "spawn ./tee (first)"
+    match r
+        Ok(c) =>
+            assert c.status.exit_code == 0, "tee -a should exit 0"
+        Err(_) =>
+            assert false, "spawn ./tee"
+    match back
+        Ok(s) =>
+            assert s.len() == 12, "file should have 12 bytes after append"
+            assert s.eq("line1\nline2\n"), "appended content mismatch"
+        Err(_) =>
+            assert false, "file should be readable"
     0
 
 [[test]]
 fn test_tee_no_files_passthrough() -> i32
-    var argv: [2]*u8
-    argv[0] = c"./tee"
-    argv[1] = null
-
-    var out: [1024]u8
-    var n: i64 = 0
-    let exit_code: i32 = exec_capture(c"./tee", @argv[0], null, Span<u8> { ptr: (c"passthrough"), len: (11) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
-
-    assert exit_code == 0, "tee should exit 0"
-    assert n == 11, "stdout should be 11 bytes"
-    assert buf_eq(Span<u8> { ptr: (@out[0]), len: (11) }, Span<u8> { ptr: (c"passthrough"), len: (11) }), "passthrough mismatch"
+    match exec_capture("./tee", span_empty<StrView>(), span_empty<StrView>(), "passthrough")
+        Ok(c) =>
+            assert c.status.exit_code == 0, "tee should exit 0"
+            assert c.out.len == 11, "stdout should be 11 bytes"
+            assert buf_eq(c.output(), "passthrough"), "passthrough mismatch"
+        Err(_) =>
+            assert false, "spawn ./tee"
     0

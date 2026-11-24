@@ -3,12 +3,14 @@
 # Centralises the boilerplate that was previously copy-pasted across every
 # tier 2-4 test_*.ritz file:
 #
-#   * buf_eq / buf_contains / cstr_len  — buffer/cstring primitives
-#   * make_sandbox_path                  — pid-suffixed /tmp paths
-#   * write_file / read_file             — byte-level file I/O
-#   * exec_capture                       — fork+exec a binary with optional
-#                                          stdin (delivered race-free via a
-#                                          temp file) and capture stdout
+#   * buf_eq / buf_contains  — byte-span comparison
+#   * sandbox_path           — pid-suffixed /tmp paths
+#   * exec_capture           — run a binary with the given args, env and stdin
+#                              (delivered race-free via a temp file) and
+#                              capture its stdout and stderr, merged
+#
+# File I/O is ritzlib.fs's read_file / write_file (AGAST #4643 deleted the
+# cstr copies here, which also collided with fs's names).
 #
 # Lessons baked in here:
 #
@@ -21,13 +23,21 @@
 #     Temp file is race-free; the child sees a regular file with full
 #     contents and a clean EOF.
 #
-# All paths use null-terminated cstr (*u8); test code is at the syscall
-# boundary so cstr is the natural shape.  Returns and counts are i64.
+# Every input is a StrView, a Span<StrView> or a Span<u8>, and every failure an
+# Err(Errno) (AGAST #4643): this file is the template every example test
+# copies, so a C-string shape here spreads to all of them.  The fork and exec
+# live in ritzlib.process (spawn_env_merged), not here.
 
 import ritzlib.sys
-import ritzlib.fmt.digits
-import ritzlib.result
-import ritzlib.errno
+# Every type this API names comes with it (#3891): String (sandbox_path),
+# Vec (Captured.out), StrView and Span (the params), Result, and
+# ritzlib.process's ProcessResult and Errno (exec_capture).
+pub import ritzlib.gvec
+pub import ritzlib.string
+pub import ritzlib.strview
+pub import ritzlib.span
+pub import ritzlib.result
+pub import ritzlib.process
 
 # ============================================================================
 # Buffer primitives
@@ -59,193 +69,85 @@ pub fn buf_contains(hay: Span<u8>, needle: Span<u8>) -> bool
         i += 1
     return false
 
-# Length of a null-terminated cstring (excluding the terminator).
-# standard-exempt: raw-ptr-param: C string ABI: strlen of a NUL-terminated string
-pub fn cstr_len(s: *u8) -> i64
-    var n: i64 = 0
-    while *(s + n) != 0
-        n += 1
-    return n
-
 # ============================================================================
 # Sandbox paths
 # ============================================================================
 
-# Build "/tmp/ritz_<prefix>_<pid>_<suffix>" into the caller-supplied dst.
-# Returns the length written (excluding the trailing NUL).
-#
-# Pid uniqueness keeps parallel test workers from colliding; the suffix
-# disambiguates within a single test (e.g. "src", "dst", "subdir").  The
-# caller is responsible for ensuring dst is large enough — for the tiers
-# 3-4 use case, [128]u8 has comfortable headroom (prefix ≤ 12 chars,
-# 10-digit max-i32 pid, suffix ≤ 32 chars → ~55 chars max).
-# standard-exempt: raw-ptr-param: C string ABI: builds a NUL-terminated path into a caller buffer
-pub fn make_sandbox_path(dst: *u8, prefix: *u8, suffix: *u8) -> i64
-    # "/tmp/ritz_"
-    let head: *u8 = c"/tmp/ritz_"
-    var i: i64 = 0
-    while *(head + i) != 0
-        *(dst + i) = *(head + i)
-        i += 1
-    # prefix
-    var k: i64 = 0
-    while *(prefix + k) != 0
-        *(dst + i) = *(prefix + k)
-        i += 1
-        k += 1
-    *(dst + i) = '_' as u8
-    i += 1
-    # pid in decimal — i32 max is 10 digits
-    i += fmt_i64_into(dst + i, sys_getpid() as i64)
-    *(dst + i) = '_' as u8
-    i += 1
-    # suffix
-    var s: i64 = 0
-    while *(suffix + s) != 0
-        *(dst + i) = *(suffix + s)
-        i += 1
-        s += 1
-    *(dst + i) = 0
-    return i
-
-# ============================================================================
-# File I/O
-# ============================================================================
-
-# Write content to path, creating/truncating with 0o600 perms.
-# true when every byte was written (false on open or write failure).
-# standard-exempt: raw-ptr-param: C string ABI: a NUL-terminated path passed to open(2)
-pub fn write_file(path: *u8, content: Span<u8>) -> bool
-    let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 384)
-    if fd < 0
-        return false
-    if content.len > 0
-        let w: i64 = sys_write(fd, content.ptr, content.len)
-        if w < 0
-            sys_close(fd)
-            return false
-    sys_close(fd)
-    return true
-
-# Read up to buf.len bytes from path into buf.  Loops on sys_read until EOF —
-# critical because sys_read returns as soon as ANY data is available, not
-# when the writer is done.  Ok(bytes read), or Err(errno) from open/read.
-# standard-exempt: raw-ptr-param: C string ABI: a NUL-terminated path passed to open(2)
-pub fn read_file(path: *u8, buf: Span<u8>) -> Result<i64, Errno>
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
-        return Err(errno_from_raw(fd))
-    var total: i64 = 0
-    while total < buf.len
-        let r: i64 = sys_read(fd, buf.ptr + total, buf.len - total)
-        if r < 0
-            sys_close(fd)
-            return Err(errno_from_raw(r as i32))
-        if r == 0
-            break
-        total += r
-    sys_close(fd)
-    return Ok(total)
+# "/tmp/ritz_<prefix>_<pid>_<suffix>".  The pid keeps parallel test workers
+# (gate slots, compiler variants) from colliding; the suffix tells a test's
+# own paths apart ("src", "dst", "subdir").  A path the kernel wants as a C
+# string is `p.as_ptr()`; one going to a StrView API is `p.as_view()`.
+pub fn sandbox_path(prefix: StrView, suffix: StrView) -> String
+    var p: String = string_from("/tmp/ritz_")
+    p.push_str(prefix)
+    p.push('_')
+    let pid: String = string_from_i64(sys_getpid() as i64)
+    p.push_string(@pid)
+    p.push('_')
+    p.push_str(suffix)
+    p
 
 # ============================================================================
 # Process exec / capture
 # ============================================================================
 
-# fork + exec `bin` with the given argv (null-terminated) and envp (or
-# null for empty env), capture up to out_max bytes of merged stdout/stderr
-# into out_buf, write byte count to *out_len, and return the child's exit
-# code.  Negative return is a setup failure (pipe/fork/exec).
+# What exec_capture saw: how the child exited (status.exit_code, or
+# status.signaled / status.signal), and everything it wrote to stdout and
+# stderr, merged in the order written.  c.output() is that as a Span<u8>,
+# for buf_eq / buf_contains.
+pub struct Captured
+    status: ProcessResult
+    out: Vec<u8>
+
+impl Captured
+    # The captured bytes as a view.  span_from_vec, not `@self.out`: ritz1
+    # emits a ptrtoint, not a Span, for `@` of a Vec field in a Span slot.
+    pub fn output(self: @Captured) -> Span<u8>
+        span_from_vec<u8>(@self.out)
+
+# Run `bin` with `args` (argv[1..]; argv[0] is `bin`), environment exactly
+# `env` ("KEY=VALUE" views; empty is an empty environment, not ours), and
+# `stdin` as its whole input; wait for it and capture its output.
 #
-# stdin handling:
-#   * stdin_data == null: child inherits parent's stdin (typically /dev/null
-#     or the test harness's stdin).
-#   * stdin_data != null: stdin_data[..stdin_len] is written to a unique
-#     temp file under /tmp/ritz_stdin_<pid>_<bin>, opened RDONLY, and dup'd
-#     into the child's fd 0.  Race-free.  Temp file is unlinked after wait.
+# `bin` is a path ("./grep", "/bin/sh"): with an empty env there is no PATH to
+# search.  A `bin` that is missing or not executable is Err(NoEnt) / Err(Acces)
+# before anything forks, not a child that exits 127.
 #
-# bin must be a path that exec can resolve (absolute, or relative to cwd
-# like "./grep").  argv[0] should typically match bin.
-#
-# standard-exempt: lib-exit: the forked child before execve(2) has no caller to return to (S-ERR-3)
-# standard-exempt: sentinel-return: process status: a non-negative return is the child's exit code (0-255); a negative one is a setup failure that happened before exec (pipe/fork/exec), a separate channel, not an in-band error code
-# standard-exempt: raw-ptr-param: execve(2) ABI: the path, argv and envp vectors
-pub fn exec_capture(
-    bin: *u8,
-    argv: **u8,
-    envp: **u8,
-    stdin: Span<u8>,
-    out: Span<u8>,
-    out_len: @&i64,
-) -> i32
-    # Stage stdin via temp file if requested.  We use a fixed "in" suffix
-    # (pid keeps it unique across parallel test workers); each test runs
-    # its exec_capture calls serially so a single in-flight temp file per
-    # process is sufficient.  Don't try to encode `bin` here — bin paths
-    # can contain '/' (e.g. "./tee"), which would make the sandbox path
-    # nonsensical.
-    var stdin_path: [128]u8
-    var fd_r: i32 = -1
-    if stdin.ptr != null
-        make_sandbox_path(@stdin_path[0], c"stdin", c"in")
-        let fd_w: i32 = sys_open3(@stdin_path[0], O_WRONLY + O_CREAT + O_TRUNC, 384)
-        if fd_w < 0
-            return -1
-        if stdin.len > 0
-            sys_write(fd_w, stdin.ptr, stdin.len)
-        sys_close(fd_w)
-        fd_r = sys_open(@stdin_path[0], O_RDONLY)
-        if fd_r < 0
-            sys_unlink(@stdin_path[0])
-            return -2
+# stdin is written to a temp file (sandbox_path("stdin", "in")) that the child
+# reads as fd 0: it sees all of it and then a clean EOF, an empty `stdin`
+# included, never the harness's own stdin.  Pipe-fed stdin had a ~5% flake
+# under the harness on contended boxes, and can SIGPIPE the parent when the
+# child never reads it.  The file is unlinked as soon as it is open, so it
+# never outlives the call.  Output is read until EOF, not one read(2): a
+# read returns on any data, and stopping early truncates (see the header).
+pub fn exec_capture(bin: StrView, args: Span<StrView>, env: Span<StrView>, stdin: Span<u8>) -> Result<Captured, Errno>
+    var path: String = sandbox_path("stdin", "in")
+    let fd_w: i32 = sys_open3(path.as_ptr(), O_WRONLY + O_CREAT + O_TRUNC, 384)
+    if fd_w < 0
+        return Err(errno_from_raw(fd_w))
+    var done: i64 = 0
+    while done < stdin.len
+        let w: i64 = sys_write(fd_w, stdin.ptr + done, stdin.len - done)
+        if w <= 0
+            sys_close(fd_w)
+            sys_unlink(path.as_ptr())
+            return Err(errno_from_raw(w as i32))
+        done += w
+    sys_close(fd_w)
+    let fd_r: i32 = sys_open(path.as_ptr(), O_RDONLY)
+    sys_unlink(path.as_ptr())
+    if fd_r < 0
+        return Err(errno_from_raw(fd_r))
 
-    # Pipe for capturing the child's stdout (and stderr — we dup2 both
-    # onto the write end so error messages from the binary surface in the
-    # captured output, useful for negative-path tests).
-    var stdout_pipe: [2]i32
-    if sys_pipe(@stdout_pipe[0]) < 0
-        if fd_r >= 0
-            sys_close(fd_r)
-            sys_unlink(@stdin_path[0])
-        return -3
-
-    let pid: i32 = sys_fork()
-    if pid < 0
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        if fd_r >= 0
-            sys_close(fd_r)
-            sys_unlink(@stdin_path[0])
-        return -4
-
-    if pid == 0
-        # Child: rewire fds and exec.
-        if fd_r >= 0
-            sys_dup2(fd_r, 0)
-            sys_close(fd_r)
-        sys_dup2(stdout_pipe[1], 1)
-        sys_dup2(stdout_pipe[1], 2)
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        sys_execve(bin, argv, envp)
-        sys_exit(127)
-
-    # Parent: close write end + child-side stdin fd, then drain output.
-    sys_close(stdout_pipe[1])
-    if fd_r >= 0
-        sys_close(fd_r)
-
-    var total: i64 = 0
-    while total < out.len
-        let r: i64 = sys_read(stdout_pipe[0], out.ptr + total, out.len - total)
-        if r <= 0
-            break
-        total += r
-    sys_close(stdout_pipe[0])
-    *out_len = total
-
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    if stdin.ptr != null
-        sys_unlink(@stdin_path[0])
-    # POSIX wait status: high byte is exit code.
-    return (status >> 8) & 0xFF
+    let spawned: Result<Process, Errno> = spawn_env_merged(bin, args, env, fd_r)
+    sys_close(fd_r)
+    match spawned
+        Ok(p) =>
+            var q: Process = p
+            let out: Vec<u8> = q.read_stdout_all()
+            let waited: Result<ProcessResult, Errno> = q.wait()
+            q.cleanup()
+            match waited
+                Ok(st) => Ok(Captured { status: st, out: out })
+                Err(e) => Err(e)
+        Err(e) => Err(e)

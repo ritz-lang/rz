@@ -1,6 +1,7 @@
 """AGAST #4636: testlib.ritz's C-shaped API fns, pinned down-only.
 
-exec_capture's out_len: @&i64; #4643 returns a Captured instead.
+exec_capture's out_len: @&i64 was the one; #4643 returns a Captured instead,
+so every rule is pinned at zero.
 
 The pin is a ceiling of (violations, violations + exempt) per counting rule
 (standard_report.ratchet_breaches): a migration that lowers a count passes,
@@ -21,7 +22,7 @@ pytestmark = pytest.mark.unit
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent.parent
 
-PINS = {"out-param": (1, 1)}
+PINS = {}
 
 
 def test_testlib_c_shapes_only_go_down():

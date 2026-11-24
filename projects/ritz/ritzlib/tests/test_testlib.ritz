@@ -1,0 +1,129 @@
+# ritzlib.testlib: the helpers every example's [[test]] suite is built on
+# (AGAST #4643).
+#
+#   exec_capture(bin, args, env, stdin) -> Result<Captured, Errno>
+#       Captured { status: ProcessResult, out: Vec<u8> }: stdout and stderr
+#       merged (2>&1), stdin staged through a temp file, env exactly `env`.
+#   sandbox_path(prefix, suffix) -> String: "/tmp/ritz_<prefix>_<pid>_<suffix>"
+#
+# Children are absolute paths (/bin/sh, /bin/cat, /usr/bin/env): the env they
+# get is exactly the one given, so PATH is not there to resolve a bare name.
+
+import ritzlib.sys
+import ritzlib.gvec
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.result
+import ritzlib.testlib
+
+# `sh -c <script>` with no env and no stdin.
+fn sh(script: StrView) -> Result<Captured, Errno>
+    let args: [2]StrView = ["-c", script]
+    exec_capture("/bin/sh", @args, span_empty<StrView>(), "")
+
+[[test]]
+fn test_exec_capture_stdout_and_exit_code() -> i32
+    match sh("echo hello")
+        Ok(c) =>
+            assert c.status.exit_code == 0
+            assert buf_eq(c.output(), "hello\n")
+        Err(_) =>
+            assert false, "spawn /bin/sh"
+    0
+
+[[test]]
+fn test_exec_capture_nonzero_exit_code() -> i32
+    match sh("echo partial; exit 3")
+        Ok(c) =>
+            assert c.status.exit_code == 3
+            assert c.status.signaled == 0
+            assert buf_eq(c.output(), "partial\n")
+        Err(_) =>
+            assert false, "spawn /bin/sh"
+    0
+
+[[test]]
+fn test_exec_capture_merges_stderr_in_order() -> i32
+    # One pipe for both, so a usage message on stderr lands in `out`, between
+    # the stdout lines written around it.
+    match sh("echo a; echo b >&2; echo c")
+        Ok(c) =>
+            assert buf_eq(c.output(), "a\nb\nc\n")
+        Err(_) =>
+            assert false, "spawn /bin/sh"
+    0
+
+[[test]]
+fn test_exec_capture_delivers_stdin() -> i32
+    let none: [0]StrView = []
+    match exec_capture("/bin/cat", @none, span_empty<StrView>(), "one\ntwo\n")
+        Ok(c) =>
+            assert c.status.exit_code == 0
+            assert buf_eq(c.output(), "one\ntwo\n")
+        Err(_) =>
+            assert false, "spawn /bin/cat"
+    0
+
+[[test]]
+fn test_exec_capture_empty_stdin_is_eof() -> i32
+    # cat must see EOF at once, not inherit the harness's stdin.
+    match exec_capture("/bin/cat", span_empty<StrView>(), span_empty<StrView>(), "")
+        Ok(c) =>
+            assert c.status.exit_code == 0
+            assert c.out.len == 0
+        Err(_) =>
+            assert false, "spawn /bin/cat"
+    0
+
+[[test]]
+fn test_exec_capture_env_is_exact() -> i32
+    let env: [2]StrView = ["A=1", "B=two"]
+    match exec_capture("/usr/bin/env", span_empty<StrView>(), @env, "")
+        Ok(c) =>
+            assert buf_eq(c.output(), "A=1\nB=two\n")
+        Err(_) =>
+            assert false, "spawn /usr/bin/env"
+    0
+
+[[test]]
+fn test_exec_capture_reads_until_eof() -> i32
+    # Far past one pipe buffer (64 KiB) and one read(2): every byte arrives.
+    match sh("head -c 200000 /dev/zero")
+        Ok(c) =>
+            assert c.status.exit_code == 0
+            assert c.out.len == 200000
+        Err(_) =>
+            assert false, "spawn /bin/sh"
+    0
+
+[[test]]
+fn test_exec_capture_missing_binary_is_err() -> i32
+    match exec_capture("./ritz-no-such-binary", span_empty<StrView>(), span_empty<StrView>(), "x")
+        Ok(_) =>
+            assert false, "a missing binary must be Err, not a child exit"
+        Err(e) => match e
+            NoEnt => pass
+            _ =>
+                assert false, "expected NoEnt"
+    0
+
+[[test]]
+fn test_exec_capture_removes_its_stdin_file() -> i32
+    match sh("exit 0")
+        Ok(_) => pass
+        Err(_) =>
+            assert false, "spawn /bin/sh"
+    var staged: String = sandbox_path("stdin", "in")
+    assert sys_access(staged.as_ptr(), F_OK) < 0, "stdin temp file left behind"
+    0
+
+[[test]]
+fn test_sandbox_path_shape() -> i32
+    var want: String = string_from("/tmp/ritz_pfx_")
+    var pid: String = string_from_i64(sys_getpid() as i64)
+    want.push_string(@pid)
+    want.push_str("_sfx")
+    let got: String = sandbox_path("pfx", "sfx")
+    assert got.eq_string(@want)
+    0

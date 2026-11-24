@@ -5,10 +5,10 @@ valet's test_static_range wrote, served and unlinked
 one box, compiler variants) truncated or unlinked each other's file between
 the write and the serve, and gates flaked with "7 passed, 1 failed". A test's
 scratch path takes the process id instead: ritzlib.testlib's
-make_sandbox_path builds /tmp/ritz_<prefix>_<pid>_<suffix>, and a file whose
-imports collide with testlib's pub read_file (ritzlib.fs has one too; valet's
-lib.static imports it) keeps a local pid_tmp_path built from a prefix such as
-"/tmp/valet_".
+sandbox_path builds /tmp/ritz_<prefix>_<pid>_<suffix>, and a file whose
+imports collided with testlib's old pub read_file (AGAST #4643 deleted it in
+favour of ritzlib.fs's) keeps a local pid_tmp_path built from a prefix such
+as "/tmp/valet_".
 
 #4052 swept valet and http; #4084 swept the rest of projects/ and widened this
 check to every .ritz file under a test/ or tests/ directory. A test that only
@@ -81,5 +81,5 @@ def test_the_check_sees_the_whole_tree():
 def test_no_fixed_tmp_path_in_tests():
     hits = fixed_tmp_paths(PROJECTS)
     assert not hits, ("fixed /tmp paths race concurrent test runs; put the "
-                      "pid in them (ritzlib.testlib make_sandbox_path, or a "
+                      "pid in them (ritzlib.testlib sandbox_path, or a "
                       "local pid_tmp_path):\n" + "\n".join(hits))

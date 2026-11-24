@@ -104,11 +104,12 @@ fn test_arithmetic() -> i32
 
 ## Canonical integration-test template
 
-For example packages (tier 2+), the most valuable tests fork+exec the
-built binary with controlled stdin and assert on captured stdout + exit
-code. The template below is the pattern from `tier2_stdlib/11_grep/test`
-— validated stable across 50+ runs after the harness gotchas (next
-section) were sorted.
+For example packages (tier 2+), the most valuable tests run the built
+binary with controlled args, env and stdin and assert on its captured
+output and exit code. `ritzlib.testlib` does the running; every example
+test copies this shape, so it takes StrViews and returns a `Result`, never
+a C argv and an out-param (AGAST #4643). The template is
+`tier2_stdlib/11_grep/test/test_grep.ritz`.
 
 Tests run with cwd = the package dir, where the build links `./<name>` to
 the binary. A package reached through another tree's symlink (an overlay
@@ -118,125 +119,44 @@ that root's binary (AGAST #3818, #3831); `build.py clean` removes it. Open
 package files by paths relative to the package, never `../`.
 
 ```ritz
-import ritzlib.sys
-import ritzlib.io
-import ritzlib.str
-import ritzlib.fmt.digits { fmt_i64_into }
-
-# ==== Helpers ====
-
-# Compare two byte buffers up to `len` bytes. 1 if equal, else 0.
-fn buf_eq(a: *u8, b: *u8, len: i64) -> i32
-    var i: i64 = 0
-    while i < len
-        if *(a + i) != *(b + i)
-            return 0
-        i += 1
-    return 1
-
-# Run ./<binary> with given argv and stdin content; return exit code.
-# Captures up to 1024 bytes of stdout into out_buf; writes byte count to
-# *out_len. argv must be null-terminated.
-#
-# Stdin is delivered via a TEMP FILE (not a pipe) — see "Harness gotchas"
-# below for why pipes are flaky here.
-fn util_exec(argv: **u8, stdin_content: *u8, stdin_len: i64,
-             out_buf: *u8, out_len: *i64) -> i32
-    # 1. Build a unique temp path: /tmp/ritz_<bin>_stdin_<pid>
-    var path_buf: [64]u8
-    let prefix: *u8 = c"/tmp/ritz_<bin>_stdin_"
-    var i: i64 = 0
-    while *(prefix + i) != 0
-        path_buf[i] = *(prefix + i)
-        i += 1
-    # The pid's digits via ritzlib.fmt.digits, not a hand-rolled digit loop.
-    i += fmt_i64_into(@path_buf[i], sys_getpid() as i64)
-    path_buf[i] = 0
-
-    # 2. Write stdin to temp file
-    let fd_w: i32 = sys_open3(@path_buf[0], O_WRONLY + O_CREAT + O_TRUNC, 384)
-    if fd_w < 0
-        return -1
-    if stdin_len > 0
-        sys_write(fd_w, stdin_content, stdin_len)
-    sys_close(fd_w)
-
-    # 3. Open it for reading (becomes child's fd 0)
-    let fd_r: i32 = sys_open(@path_buf[0], O_RDONLY)
-    if fd_r < 0
-        sys_unlink(@path_buf[0])
-        return -2
-
-    # 4. Pipe for stdout capture
-    var stdout_pipe: [2]i32
-    if sys_pipe(@stdout_pipe[0]) < 0
-        sys_close(fd_r)
-        sys_unlink(@path_buf[0])
-        return -3
-
-    # 5. Fork
-    let pid: i32 = sys_fork()
-    if pid < 0
-        sys_close(fd_r)
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        sys_unlink(@path_buf[0])
-        return -4
-
-    if pid == 0
-        sys_dup2(fd_r, 0)             # stdin = temp file
-        sys_dup2(stdout_pipe[1], 1)   # stdout = pipe write
-        sys_close(fd_r)
-        sys_close(stdout_pipe[0])
-        sys_close(stdout_pipe[1])
-        sys_execve(c"./<bin>", argv, null)
-        sys_exit(127)
-
-    # 6. Parent: read stdout until EOF
-    sys_close(fd_r)
-    sys_close(stdout_pipe[1])
-
-    var total: i64 = 0
-    while total < 1024
-        let r: i64 = sys_read(stdout_pipe[0], out_buf + total, 1024 - total)
-        if r <= 0
-            break
-        total += r
-    sys_close(stdout_pipe[0])
-    *out_len = total
-
-    # 7. Reap child, clean up
-    var status: i32 = 0
-    sys_wait4(pid, @status, 0, null)
-    sys_unlink(@path_buf[0])
-    return (status >> 8) & 0xFF   # WEXITSTATUS
-
-# ==== Tests ====
+import ritzlib.testlib
 
 [[test]]
 fn test_basic_invocation() -> i32
-    var argv: [3]*u8
-    argv[0] = c"./<bin>"
-    argv[1] = c"some-arg"
-    argv[2] = null
-
-    var out: [1024]u8
-    var n: i64 = 0
-    let exit_code: i32 = util_exec(@argv[0], c"input data", 10, @out[0], @n)
-
-    assert exit_code == 0, "binary should exit 0"
-    assert n == 12, "expected 12 bytes back"
-    assert buf_eq(@out[0], c"expected out", 12) == 1, "output mismatch"
+    let args: [1]StrView = ["some-arg"]
+    match exec_capture("./<bin>", @args, span_empty<StrView>(), "input data")
+        Ok(c) =>
+            assert c.status.exit_code == 0, "binary should exit 0"
+            assert buf_eq(c.output(), "expected out"), "output mismatch"
+        Err(_) =>
+            assert false, "spawn ./<bin>"
     0
 ```
+
+`exec_capture(bin, args, env, stdin) -> Result<Captured, Errno>`:
+
+- `args` is argv[1..]; argv[0] is `bin`.
+- `env` is the child's whole environment (`"KEY=VALUE"` views); an empty
+  span is an empty one, so `bin` must be a path, not a name to search.
+- `stdin` is the child's whole input, then EOF (gotcha 2); `""` for none.
+  The child never inherits the harness's stdin.
+- `Captured.status` is a `ProcessResult` (`exit_code`, `signaled`,
+  `signal`); `Captured.out` holds stdout and stderr merged in the order
+  written, read until EOF (gotcha 1). `c.output()` is it as a `Span<u8>`.
+- A missing or non-executable `bin` is `Err(NoEnt)` / `Err(Acces)`, not a
+  child that exits 127.
+
+Scratch files go under `sandbox_path(prefix, suffix) -> String`
+(`/tmp/ritz_<prefix>_<pid>_<suffix>`; `p.as_ptr()` for a syscall,
+`p.as_view()` for a StrView API), read and written with `ritzlib.fs`'s
+`read_file` / `write_file`. A test that cleans up before it asserts binds
+the `Result` first, cleans up, then matches it.
 
 **To use this template for a new utility:**
 
 1. Copy `tier2_stdlib/11_grep/test/test_grep.ritz` as a starting point.
-2. Rename the helper to `<util>_exec`, change every `./grep` and
-   `ritz_grep_stdin_` reference to your binary's name.
-3. Adjust `argv` size and contents per the binary's CLI.
-4. Mirror the scenarios from `test.sh` as `[[test]]` functions, plus
+2. Change `./grep` and its args to your binary's.
+3. Mirror the scenarios from `test.sh` as `[[test]]` functions, plus
    any unit tests for internal helpers (only useful when there's
    real logic to test — most coreutils-style binaries are pure I/O
    and don't have such helpers).
@@ -255,8 +175,8 @@ catch the first chunk and silently lose the rest if the child writes
 more later (e.g., grep emitting one match, computing the next, then
 emitting again).
 
-**Fix**: always loop until `sys_read` returns `0` (EOF). The template
-above shows the canonical loop. `0` arrives only when the writer's
+**Fix**: always loop until `sys_read` returns `0` (EOF), as
+`exec_capture` (through `Process.read_stdout_all`) does. `0` arrives only when the writer's
 pipe end is closed (child exited and the OS reaped the fd).
 
 ```ritz
@@ -275,9 +195,11 @@ flake under `ritz0 --test`'s harness — usually one test in 10-15
 runs would see grep get no input, exit 1 ("no match"), and trip an
 assert.
 
-**Fix**: deliver stdin via a temp file (`/tmp/ritz_<bin>_stdin_<pid>`).
-Write content, close, open for read, `dup2` into child's fd 0. The
-child sees a regular file with full contents and EOF at end. Race-free.
+**Fix**: deliver stdin via a temp file, as `exec_capture` does
+(`sandbox_path("stdin", "in")`, unlinked as soon as it is open; the
+child gets it as fd 0 through `process.spawn_env_merged`). The child
+sees a regular file with full contents and EOF at end. Race-free, and
+the parent can't take a SIGPIPE from a child that never reads its input.
 
 The pid suffix is a `sys_getpid()` call inside the test process — each
 `[[test]]` function compiles to its own binary and runs as its own

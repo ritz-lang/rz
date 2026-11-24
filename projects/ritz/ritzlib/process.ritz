@@ -33,6 +33,8 @@
 # Every fn on a live Process takes `@&Process`: they close fds and record the
 # wait.  process_valid only reads it, so it takes `@Process` (AGAST #3750).
 # spawn_env(cmd, args, env) gives the child exactly `env`; spawn inherits ours.
+# spawn_env_merged(cmd, args, env, stdin_fd) also reads stdin from a file and
+# merges stderr into stdout (2>&1), for test harnesses (AGAST #4643).
 #
 # Every Err is a ritzlib.errno `Errno`, never a -1 or a negative errno
 # (AGAST #4298).
@@ -173,7 +175,7 @@ fn cstr_array(head: Span<StrView>, rest: Span<StrView>) -> **u8
 # is Err(Acces), not a child that exits 127.  Pipe or fork
 # failure is Err(errno) too.  The child inherits this process's environment.
 pub fn spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>
-    spawn_with_envp(cmd, args, null)
+    spawn_with_envp(cmd, args, null, -1, false)
 
 # spawn, but the child's environment is exactly `env`, one "KEY=VALUE" view
 # per entry, in that order: nothing of ours is merged in, and an empty span
@@ -184,14 +186,39 @@ pub fn spawn_env(cmd: StrView, args: Span<StrView>, env: Span<StrView>) -> Resul
     let envp: **u8 = cstr_array(span_empty<StrView>(), env)
     if envp == null
         return Err(Errno.NoMem)
-    let r: Result<Process, Errno> = spawn_with_envp(cmd, args, envp)
+    let r: Result<Process, Errno> = spawn_with_envp(cmd, args, envp, -1, false)
     free(envp as *u8)
     r
 
-# spawn / spawn_env: resolve `cmd`, build argv, fork.  A null envp inherits.
+# spawn_env, but wired the way a test harness wants (AGAST #4643): the child
+# reads its stdin from `stdin_fd` (dup'd onto its fd 0; the caller still owns
+# and closes `stdin_fd`), and its stderr goes down the stdout pipe, as
+# `cmd <&stdin_fd 2>&1` would, so read_stdout_all gets both, interleaved in
+# the order the child wrote them.  The Process has no stdin or stderr pipe:
+# stdin_fd and stderr_fd are -1.  A negative `stdin_fd` is Err(BadF).
+#
+# Use a regular file for `stdin_fd`, not a pipe the parent fills afterwards:
+# the child sees the whole input and a clean EOF, the parent can't take a
+# SIGPIPE from a child that never reads it, and nothing deadlocks on a full
+# pipe (ritzlib.testlib's exec_capture, whose temp-file stdin fixed a ~5%
+# flake that pipe-fed stdin had).
+#
+# standard-exempt: raw-alloc: frees the transient envp block after execve(2); the fork/exec boundary owns it
+pub fn spawn_env_merged(cmd: StrView, args: Span<StrView>, env: Span<StrView>, stdin_fd: i32) -> Result<Process, Errno>
+    if stdin_fd < 0
+        return Err(Errno.BadF)
+    let envp: **u8 = cstr_array(span_empty<StrView>(), env)
+    if envp == null
+        return Err(Errno.NoMem)
+    let r: Result<Process, Errno> = spawn_with_envp(cmd, args, envp, stdin_fd, true)
+    free(envp as *u8)
+    r
+
+# spawn / spawn_env / spawn_env_merged: resolve `cmd`, build argv, fork.  A
+# null envp inherits; `stdin_fd` and `merge` are spawn_fork's.
 #
 # standard-exempt: raw-alloc: frees the transient argv block after execve(2); the fork/exec boundary owns it
-fn spawn_with_envp(cmd: StrView, args: Span<StrView>, envp: **u8) -> Result<Process, Errno>
+fn spawn_with_envp(cmd: StrView, args: Span<StrView>, envp: **u8, stdin_fd: i32, merge: bool) -> Result<Process, Errno>
     var path: String = string_new()
     match find_command(cmd)
         Some(found) => path = found
@@ -205,7 +232,7 @@ fn spawn_with_envp(cmd: StrView, args: Span<StrView>, envp: **u8) -> Result<Proc
     if argv == null
         return Err(Errno.NoMem)
 
-    let r: Result<Process, Errno> = spawn_fork(path.as_ptr(), argv, envp)
+    let r: Result<Process, Errno> = spawn_fork(path.as_ptr(), argv, envp, stdin_fd, merge)
     free(argv as *u8)
     r
 
@@ -216,8 +243,13 @@ fn spawn_with_envp(cmd: StrView, args: Span<StrView>, envp: **u8) -> Result<Proc
 # env_raw_envp()): passing null straight to execve would give the child an
 # empty one (AGAST #1750).
 #
+# `stdin_fd` >= 0 is dup'd onto the child's stdin instead of the stdin pipe,
+# and `merge` sends its stderr down the stdout pipe; the unused pipe ends are
+# closed in the parent and left -1 in the Process.  All three pipes are made
+# either way, so the error paths stay one shape.
+#
 # standard-exempt: lib-exit: the forked child before execve(2) has no caller to return to (S-ERR-3)
-fn spawn_fork(path: *u8, argv: **u8, envp: **u8) -> Result<Process, Errno>
+fn spawn_fork(path: *u8, argv: **u8, envp: **u8, stdin_fd: i32, merge: bool) -> Result<Process, Errno>
     # Resolved before fork: env_raw_envp() may allocate on first use.
     var child_envp: **u8 = envp
     if child_envp == null
@@ -268,9 +300,20 @@ fn spawn_fork(path: *u8, argv: **u8, envp: **u8) -> Result<Process, Errno>
     if pid == 0
         # Child process
         # Redirect stdin/stdout/stderr to pipes
-        sys_dup2(stdin_pipe[0], STDIN)    # stdin reads from pipe
-        sys_dup2(stdout_pipe[1], STDOUT)  # stdout writes to pipe
-        sys_dup2(stderr_pipe[1], STDERR)  # stderr writes to pipe
+        # stdin reads from the pipe, or from stdin_fd; stdout writes to its
+        # pipe; stderr to its own pipe, or (merge) to stdout's.  Two one-armed
+        # ifs, not if/else (ritz1, AGAST #3749).
+        var child_in: i32 = stdin_pipe[0]
+        if stdin_fd >= 0
+            child_in = stdin_fd
+        var child_err: i32 = stderr_pipe[1]
+        if merge
+            child_err = stdout_pipe[1]
+        sys_dup2(child_in, STDIN)
+        sys_dup2(stdout_pipe[1], STDOUT)
+        sys_dup2(child_err, STDERR)
+        if stdin_fd > STDERR
+            sys_close(stdin_fd)
 
         # Close unused pipe ends
         sys_close(stdin_pipe[0])
@@ -296,6 +339,12 @@ fn spawn_fork(path: *u8, argv: **u8, envp: **u8) -> Result<Process, Errno>
     p.stdin_fd = stdin_pipe[1]   # We write to child's stdin
     p.stdout_fd = stdout_pipe[0]  # We read from child's stdout
     p.stderr_fd = stderr_pipe[0]  # We read from child's stderr
+    if stdin_fd >= 0
+        sys_close(p.stdin_fd)
+        p.stdin_fd = -1
+    if merge
+        sys_close(p.stderr_fd)
+        p.stderr_fd = -1
 
     Ok(p)
 

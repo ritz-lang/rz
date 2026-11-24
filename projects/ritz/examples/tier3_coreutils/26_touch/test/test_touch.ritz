@@ -1,5 +1,6 @@
 # Tests for 26_touch — create/update file timestamps.
 import ritzlib.sys
+import ritzlib.fs
 import ritzlib.testlib
 import ritzlib.result
 
@@ -11,29 +12,26 @@ fn now_seconds() -> i64
 
 [[test]]
 fn test_touch_creates_new_file() -> i32
-    var path: [128]u8
-    make_sandbox_path(@path[0], c"touch", c"new")
-    sys_unlink(@path[0])
+    var path: String = sandbox_path("touch", "new")
+    sys_unlink(path.as_ptr())
 
     let t_before: i64 = now_seconds()
 
-    var argv: [3]*u8
-    argv[0] = c"./touch"
-    argv[1] = @path[0]
-    argv[2] = null
-
-    var out: [1024]u8
-    var n: i64 = 0
-    let exit_code: i32 = exec_capture(c"./touch", @argv[0], null, Span<u8> { ptr: (null), len: (0) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
+    let args: [1]StrView = [path.as_view()]
+    let r: Result<Captured, Errno> = exec_capture("./touch", @args, span_empty<StrView>(), "")
 
     var st: Stat
-    let stat_rc: i32 = sys_stat2(@path[0], @&st)
+    let stat_rc: i32 = sys_stat2(path.as_ptr(), @&st)
     let size: i64 = st.st_size
     let mtime: i64 = st.st_mtime
     let t_after: i64 = now_seconds()
-    sys_unlink(@path[0])
+    sys_unlink(path.as_ptr())
 
-    assert exit_code == 0, "touch new file should exit 0"
+    match r
+        Ok(c) =>
+            assert c.status.exit_code == 0, "touch new file should exit 0"
+        Err(_) =>
+            assert false, "spawn ./touch"
     assert stat_rc == 0, "file should exist"
     assert size == 0, "new file should be empty"
     # touch's defining job is setting mtime — verify the new file's
@@ -45,36 +43,33 @@ fn test_touch_creates_new_file() -> i32
 
 [[test]]
 fn test_touch_preserves_content_updates_mtime() -> i32
-    var path: [128]u8
-    make_sandbox_path(@path[0], c"touch", c"existing")
-    sys_unlink(@path[0])
-    if not write_file(@path[0], Span<u8> { ptr: (c"keep me\n"), len: (8) })
-        assert 0 == 1, "setup: write existing"
+    var path: String = sandbox_path("touch", "existing")
+    sys_unlink(path.as_ptr())
+    assert write_file(path.as_view(), "keep me\n").is_ok(), "setup: write existing"
 
     let t_before: i64 = now_seconds()
 
-    var argv: [3]*u8
-    argv[0] = c"./touch"
-    argv[1] = @path[0]
-    argv[2] = null
+    let args: [1]StrView = [path.as_view()]
+    let r: Result<Captured, Errno> = exec_capture("./touch", @args, span_empty<StrView>(), "")
 
-    var out: [1024]u8
-    var n: i64 = 0
-    let exit_code: i32 = exec_capture(c"./touch", @argv[0], null, Span<u8> { ptr: (null), len: (0) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
-
-    var rd_buf: [32]u8
-    let rd: i64 = match read_file(@path[0], Span<u8> { ptr: (@rd_buf[0]), len: (32) as i64 })
-        Ok(v) => v
-        Err(_) => -1
+    let back: Result<String, Errno> = read_file(path.as_view())
     var st: Stat
-    sys_stat2(@path[0], @&st)
+    sys_stat2(path.as_ptr(), @&st)
     let mtime: i64 = st.st_mtime
     let t_after: i64 = now_seconds()
-    sys_unlink(@path[0])
+    sys_unlink(path.as_ptr())
 
-    assert exit_code == 0, "touch existing should exit 0"
-    assert rd == 8, "content length unchanged"
-    assert buf_eq(Span<u8> { ptr: (@rd_buf[0]), len: (8) }, Span<u8> { ptr: (c"keep me\n"), len: (8) }), "content preserved"
+    match r
+        Ok(c) =>
+            assert c.status.exit_code == 0, "touch existing should exit 0"
+        Err(_) =>
+            assert false, "spawn ./touch"
+    match back
+        Ok(s) =>
+            assert s.len() == 8, "content length unchanged"
+            assert s.eq("keep me\n"), "content preserved"
+        Err(_) =>
+            assert false, "read existing"
     # The defining behavior of `touch <existing>` is to bring its mtime
     # forward to "now"; verify the new mtime falls within [before-2, after+2].
     assert mtime >= t_before - 2, "mtime should be updated to the 'before' window"
@@ -83,36 +78,29 @@ fn test_touch_preserves_content_updates_mtime() -> i32
 
 [[test]]
 fn test_touch_multiple_files() -> i32
-    var p1: [128]u8
-    var p2: [128]u8
-    var p3: [128]u8
-    make_sandbox_path(@p1[0], c"touch", c"m_a")
-    make_sandbox_path(@p2[0], c"touch", c"m_b")
-    make_sandbox_path(@p3[0], c"touch", c"m_c")
-    sys_unlink(@p1[0])
-    sys_unlink(@p2[0])
-    sys_unlink(@p3[0])
+    var p1: String = sandbox_path("touch", "m_a")
+    var p2: String = sandbox_path("touch", "m_b")
+    var p3: String = sandbox_path("touch", "m_c")
+    sys_unlink(p1.as_ptr())
+    sys_unlink(p2.as_ptr())
+    sys_unlink(p3.as_ptr())
 
-    var argv: [5]*u8
-    argv[0] = c"./touch"
-    argv[1] = @p1[0]
-    argv[2] = @p2[0]
-    argv[3] = @p3[0]
-    argv[4] = null
-
-    var out: [1024]u8
-    var n: i64 = 0
-    let exit_code: i32 = exec_capture(c"./touch", @argv[0], null, Span<u8> { ptr: (null), len: (0) }, Span<u8> { ptr: (@out[0]), len: (1024) }, @&n)
+    let args: [3]StrView = [p1.as_view(), p2.as_view(), p3.as_view()]
+    let r: Result<Captured, Errno> = exec_capture("./touch", @args, span_empty<StrView>(), "")
 
     var st: Stat
-    let stat1: i32 = sys_stat2(@p1[0], @&st)
-    let stat2: i32 = sys_stat2(@p2[0], @&st)
-    let stat3: i32 = sys_stat2(@p3[0], @&st)
-    sys_unlink(@p1[0])
-    sys_unlink(@p2[0])
-    sys_unlink(@p3[0])
+    let stat1: i32 = sys_stat2(p1.as_ptr(), @&st)
+    let stat2: i32 = sys_stat2(p2.as_ptr(), @&st)
+    let stat3: i32 = sys_stat2(p3.as_ptr(), @&st)
+    sys_unlink(p1.as_ptr())
+    sys_unlink(p2.as_ptr())
+    sys_unlink(p3.as_ptr())
 
-    assert exit_code == 0, "touch multi should exit 0"
+    match r
+        Ok(c) =>
+            assert c.status.exit_code == 0, "touch multi should exit 0"
+        Err(_) =>
+            assert false, "spawn ./touch"
     assert stat1 == 0, "a should exist"
     assert stat2 == 0, "b should exist"
     assert stat3 == 0, "c should exist"
