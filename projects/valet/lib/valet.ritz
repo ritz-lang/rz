@@ -26,6 +26,7 @@ import ritzlib.async.tasks
 import ritzlib.fd
 import ritzlib.span
 import ritzlib.process { fork, ForkResult }
+import ritzlib.mapping
 
 import request
 import response
@@ -983,7 +984,7 @@ fn bigbuf_release(b: *BigBuf)
     if b.mode != BIGBUF_NONE
         g_bigbuf_active = g_bigbuf_active - 1
     if b.ptr != null and b.cap > 0
-        sys_munmap(b.ptr, b.cap)
+        munmap(span_from_ptr<u8>(b.ptr, b.cap))
     b.ptr = null
     b.cap = 0
     b.len = 0
@@ -1014,10 +1015,9 @@ fn bigbuf_acquire(b: *BigBuf, size: i64, mode: i32) -> *BigBuf
         return null
     bigbuf_release(b)
     let cap: i64 = ((size + 4095) / 4096) * 4096
-    let mem: *u8 = sys_mmap(0, cap, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
-    if mem == (-1) as *u8
-        return null
-    b.ptr = mem
+    match mmap_anon(cap)
+        Ok(m) => b.ptr = m.ptr
+        Err(_) => return null
     b.cap = cap
     b.len = 0
     b.pos = 0
@@ -1741,18 +1741,14 @@ fn tls_task_data_size() -> i64
 
 # Allocate TLS task data (zeroed: anonymous mmap)
 pub fn tls_task_data_alloc() -> *TlsTaskData
-    let size: i64 = tls_task_data_size()
-    let flags: i32 = 0x02 | 0x20  # MAP_PRIVATE | MAP_ANONYMOUS
-    let prot: i32 = 0x01 | 0x02   # PROT_READ | PROT_WRITE
-    let ptr: *u8 = sys_mmap(0, size, prot, flags, -1, 0)
-    if (ptr as i64) < 0
-        return null
-    return ptr as *TlsTaskData
+    match mmap_anon(tls_task_data_size())
+        Ok(m) => return m.ptr as *TlsTaskData
+        Err(_) => return null
 
 pub fn tls_task_data_free(data: *TlsTaskData)
     if data != null
         tls_server_free(@data.tls)
-        sys_munmap(data as *u8, tls_task_data_size())
+        munmap(span_from_ptr<u8>(data as *u8, tls_task_data_size()))
 
 # TLS-specific I/O helpers that use the pool from TlsTaskData
 pub fn tls_task_recv(task: *Task, tls_data: *TlsTaskData) -> i32
