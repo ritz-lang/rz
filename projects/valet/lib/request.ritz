@@ -4,7 +4,8 @@
 # Parses directly from a u8 buffer without allocations.
 
 import ritzlib.io
-import ritzlib.str
+import ritzlib.option
+import ritzlib.strview
 import http.h1_framing
 
 
@@ -27,13 +28,10 @@ const REQ_ERR_TOO_LARGE: i32 = -3       # Request exceeds size limit
 # ============================================================================
 
 struct Request
-    # Request line components (pointers into raw buffer)
-    method_ptr: *u8
-    method_len: i32
-    path_ptr: *u8
-    path_len: i32
-    version_ptr: *u8
-    version_len: i32
+    # Request line components (views into the raw buffer)
+    method: StrView
+    path: StrView
+    version: StrView
 
     # Headers end position (for body access)
     headers_end: i32
@@ -48,12 +46,9 @@ struct Request
 
 # Initialize a request struct
 pub fn request_init(req: *Request)
-    req.method_ptr = null
-    req.method_len = 0
-    req.path_ptr = null
-    req.path_len = 0
-    req.version_ptr = null
-    req.version_len = 0
+    req.method = strview_empty()
+    req.path = strview_empty()
+    req.version = strview_empty()
     req.headers_end = 0
     req.content_length = 0
     req.keep_alive = 0
@@ -76,10 +71,9 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
 
     # Parse method
     # SAFETY: pos is bounds-checked against len in the while condition
-    req.method_ptr = buf
     while pos < len
         if *(buf + pos) == ' '
-            req.method_len = pos
+            req.method = strview_from_ptr(buf, pos as i64)
             pos += 1
             break
         # A line break before the space: a junk line, not the start of a
@@ -92,11 +86,10 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
         return -1
 
     # Parse path
-    req.path_ptr = buf + pos
     let path_start: i32 = pos
     while pos < len
         if *(buf + pos) == ' '
-            req.path_len = pos - path_start
+            req.path = strview_from_ptr(buf + path_start, (pos - path_start) as i64)
             pos += 1
             break
         if *(buf + pos) == '\r' || *(buf + pos) == '\n'
@@ -107,11 +100,10 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
         return -1
 
     # Parse version
-    req.version_ptr = buf + pos
     let version_start: i32 = pos
     while pos < len
         if *(buf + pos) == '\r'
-            req.version_len = pos - version_start
+            req.version = strview_from_ptr(buf + version_start, (pos - version_start) as i64)
             break
         pos += 1
 
@@ -132,7 +124,7 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
     # "Connection: close"; HTTP/1.0 persists only with "Connection:
     # keep-alive".  This used to be a flat `keep_alive = 1`, so HTTP/1.0
     # clients such as ApacheBench waited forever for a close (AGAST #2106).
-    req.keep_alive = request_version_is_11(req)
+    req.keep_alive = req.version.eq("HTTP/1.1") as i32
     var conn_close: i32 = 0
     var conn_keep: i32 = 0
 
@@ -148,7 +140,7 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
                 return req.headers_end
 
         # Connection header: scan its comma-separated tokens.
-        if header_name_is(buf, pos, len, c"connection", 10) == 1
+        if header_name_is(buf, pos, len, "connection") == 1
             let tok: i32 = connection_tokens(buf, pos + 11, len)
             if (tok & CONN_TOKEN_CLOSE) != 0
                 conn_close = 1
@@ -166,31 +158,21 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
     return -1  # Incomplete - didn't find end of headers
 
 
-# 1 when the request line's version is exactly "HTTP/1.1".
-fn request_version_is_11(req: *Request) -> i32
-    if req.version_len != 8
-        return 0
-    let v: *u8 = c"HTTP/1.1"
-    for i in 0..8
-        if *(req.version_ptr + i) != *(v + i)
-            return 0
-    return 1
-
-
 fn ascii_lower(ch: u8) -> u8
     if ch >= 'A' and ch <= 'Z'
         return ch + 32
     return ch
 
 
-# 1 when the header line at `pos` is `name` (lowercase, `name_len` bytes)
-# followed directly by ':' — case-insensitive, so "Connection-Foo:" and
-# "X-Connection:" do not match "connection".
-fn header_name_is(buf: *u8, pos: i32, len: i32, name: *u8, name_len: i32) -> i32
+# 1 when the header line at `pos` is `name` (lowercase) followed directly
+# by ':' — case-insensitive, so "Connection-Foo:" and "X-Connection:" do
+# not match "connection".
+fn header_name_is(buf: *u8, pos: i32, len: i32, name: StrView) -> i32
+    let name_len: i32 = name.len as i32
     if pos + name_len >= len
         return 0
     for i in 0..name_len
-        if ascii_lower(*(buf + pos + i)) != *(name + i)
+        if ascii_lower(*(buf + pos + i)) != name.get(i as i64)
             return 0
     if *(buf + pos + name_len) != ':'
         return 0
@@ -202,11 +184,11 @@ const CONN_TOKEN_KEEP_ALIVE: i32 = 2
 
 
 # 1 when bytes [start, end) equal `word` (lowercase) case-insensitively.
-fn token_eq(buf: *u8, start: i32, end: i32, word: *u8, word_len: i32) -> i32
-    if end - start != word_len
+fn token_eq(buf: *u8, start: i32, end: i32, word: StrView) -> i32
+    if (end - start) as i64 != word.len
         return 0
-    for i in 0..word_len
-        if ascii_lower(*(buf + start + i)) != *(word + i)
+    for i in 0..(end - start)
+        if ascii_lower(*(buf + start + i)) != word.get(i as i64)
             return 0
     return 1
 
@@ -223,9 +205,9 @@ fn connection_tokens(buf: *u8, pos: i32, len: i32) -> i32
         let start: i32 = p
         while p < len and *(buf + p) != ',' and *(buf + p) != '\r' and *(buf + p) != ' ' and *(buf + p) != '\t'
             p += 1
-        if token_eq(buf, start, p, c"close", 5) == 1
+        if token_eq(buf, start, p, "close") == 1
             mask = mask | CONN_TOKEN_CLOSE
-        if token_eq(buf, start, p, c"keep-alive", 10) == 1
+        if token_eq(buf, start, p, "keep-alive") == 1
             mask = mask | CONN_TOKEN_KEEP_ALIVE
     return mask
 
@@ -257,28 +239,12 @@ pub fn request_frame(buf: *u8, len: i32, max_body: i64, f: *H1Frame) -> i64
 
 # Check if method matches
 pub fn request_is_get(req: *Request) -> i32
-    if req.method_len != 3
-        return 0
-    if *(req.method_ptr) != 'G'
-        return 0
-    if *(req.method_ptr + 1) != 'E'
-        return 0
-    if *(req.method_ptr + 2) != 'T'
-        return 0
-    return 1
+    return req.method.eq("GET") as i32
 
 
 # Check if path matches (simple exact match)
-pub fn request_path_eq(req: *Request, path: *u8) -> i32
-    let path_len: i32 = strlen(path) as i32
-    if req.path_len != path_len
-        return 0
-
-    for i in 0..path_len
-        if *(req.path_ptr + i) != *(path + i)
-            return 0
-
-    return 1
+pub fn request_path_eq(req: *Request, path: StrView) -> i32
+    return req.path.eq(path) as i32
 
 
 # ============================================================================
@@ -297,23 +263,14 @@ pub fn request_check_size(len: i32, max_size: i32) -> i32
 # Header search
 # ============================================================================
 
-# Header search result
-struct HeaderResult
-    found: i32       # 1 if header found, 0 otherwise
-    value_ptr: *u8   # Pointer to header value (after ": ")
-    value_len: i32   # Length of header value (excluding CRLF)
-
-
 # Find a header in the raw request buffer (case-insensitive)
 # buf: raw HTTP request buffer
 # buf_len: buffer length
 # name: header name to search for (e.g., "Range")
-# name_len: length of header name
-pub fn request_find_header(buf: *u8, buf_len: i32, name: *u8, name_len: i32) -> HeaderResult
-    var result: HeaderResult
-    result.found = 0
-    result.value_ptr = null
-    result.value_len = 0
+# Returns the value (after ": ", without the CRLF) as a view into `buf`, or
+# None when the header isn't there.
+pub fn request_find_header(buf: *u8, buf_len: i32, name: StrView) -> Option<StrView>
+    let name_len: i32 = name.len as i32
 
     # Find end of request line (first CRLF)
     var pos: i32 = 0
@@ -327,22 +284,13 @@ pub fn request_find_header(buf: *u8, buf_len: i32, name: *u8, name_len: i32) -> 
     while pos < buf_len - 1
         # Check for end of headers
         if *(buf + pos) == '\r' && *(buf + pos + 1) == '\n'
-            return result  # Not found
+            return None  # Not found
 
         # Check if this header matches (case-insensitive)
         var is_match: i32 = 1
         if pos + name_len + 1 < buf_len
             for i in 0..name_len
-                let c1: u8 = *(buf + pos + i)
-                let c2: u8 = *(name + i)
-                # Convert to lowercase for comparison
-                var l1: u8 = c1
-                var l2: u8 = c2
-                if l1 >= 'A' && l1 <= 'Z'
-                    l1 = l1 + 32
-                if l2 >= 'A' && l2 <= 'Z'
-                    l2 = l2 + 32
-                if l1 != l2
+                if ascii_lower(*(buf + pos + i)) != ascii_lower(name.get(i as i64))
                     is_match = 0
                     break
 
@@ -359,10 +307,7 @@ pub fn request_find_header(buf: *u8, buf_len: i32, name: *u8, name_len: i32) -> 
                 let actual_start: i32 = vpos
                 while vpos < buf_len - 1
                     if *(buf + vpos) == '\r' && *(buf + vpos + 1) == '\n'
-                        result.found = 1
-                        result.value_ptr = buf + actual_start
-                        result.value_len = vpos - actual_start
-                        return result
+                        return Some(strview_from_ptr(buf + actual_start, (vpos - actual_start) as i64))
                     vpos += 1
 
         # Skip to next line
@@ -372,4 +317,4 @@ pub fn request_find_header(buf: *u8, buf_len: i32, name: *u8, name_len: i32) -> 
                 break
             pos += 1
 
-    return result
+    return None

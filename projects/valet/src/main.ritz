@@ -16,12 +16,12 @@
 
 import ritzlib.sys
 import ritzlib.fmt
-import ritzlib.str
+import ritzlib.str { memcpy }
 import ritzlib.option
 import ritzlib.result
 import ritzlib.strview
-import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.span { Span }
+import ritzlib.string
 import ritzlib.gvec
 import ritzlib.argspec
 import ritzlib.async.tasks
@@ -95,16 +95,12 @@ import zeus.arena {
 
 # Logging middleware - logs every request
 fn logging_middleware(path: *u8, path_len: i32) -> i32
-    log_info(c"Request: ")
-    # Print path (need to copy for null termination)
-    var path_buf: [256]u8
-    var copy_len: i32 = path_len
-    if copy_len > 255
-        copy_len = 255
-    for i in 0..copy_len
-        path_buf[i] = *(path + i)
-    path_buf[copy_len] = 0
-    let shown: StrView = strview_from_ptr(@path_buf[0], copy_len as i64)
+    log_info("Request: ")
+    # Print path (at most 255 bytes of it)
+    var shown_len: i32 = path_len
+    if shown_len > 255
+        shown_len = 255
+    let shown: StrView = strview_from_ptr(path, shown_len as i64)
     print("{shown}\n")
     return MW_CONTINUE  # Continue to next middleware/handler
 
@@ -113,45 +109,39 @@ fn logging_middleware(path: *u8, path_len: i32) -> i32
 # Route handlers
 # ============================================================================
 
+# Route parameter `idx` when it is shorter than `max` bytes, else None: the
+# limit each handler's fixed copy buffer used to set, kept so an over-long
+# parameter is still answered as a missing one.
+fn param_shorter_than(idx: i32, max: i64) -> Option<StrView>
+    match ctx_param(idx)
+        Some(v) =>
+            if v.len >= max
+                return None
+            Some(v)
+        None => None
+
+
 # GET / - Benchmark endpoint
 fn handle_index(path: *u8, path_len: i32) -> i32
-    return ctx_ok(c"Hello, World!")
+    return ctx_ok("Hello, World!")
 
 
 # GET /hello - Greeting
 fn handle_hello(path: *u8, path_len: i32) -> i32
-    return ctx_ok(c"Hello from Valet!\n")
+    return ctx_ok("Hello from Valet!\n")
 
 
 # GET /users/:id - User by ID
 fn handle_user(path: *u8, path_len: i32) -> i32
-    var id_buf: [64]u8
-    let len: i32 = ctx_param(0, @id_buf[0], 64)
-    if len < 0
-        return ctx_text(400, c"Missing user ID\n")
+    let id: StrView = match param_shorter_than(0, 64)
+        Some(v) => v
+        None => return ctx_text(400, "Missing user ID\n")
 
     # Build response: "User ID: <id>\n"
-    var response_buf: [128]u8
-    var pos: i32 = 0
-
-    # "User ID: "
-    let prefix = c"User ID: "
-    let prefix_len: i32 = 9
-    for i in 0..prefix_len
-        response_buf[pos] = *(prefix + i)
-        pos += 1
-
-    # Copy ID
-    for i in 0..len
-        response_buf[pos] = id_buf[i]
-        pos += 1
-
-    # Newline
-    response_buf[pos] = '\n'
-    pos += 1
-    response_buf[pos] = 0  # null terminate
-
-    return ctx_ok(@response_buf[0])
+    var body: String = string_from("User ID: ")
+    body.push_str(id)
+    body.push('\n')
+    return ctx_ok(body.as_view())
 
 
 # GET /json - JSON response
@@ -159,49 +149,42 @@ fn handle_json(path: *u8, path_len: i32) -> i32
     # Build JSON using builder (much cleaner than character-by-character)
     var buf: [256]u8
     var jb: JsonBuilder
-    json_init(@jb, @buf[0], 256)
+    json_init(@jb, @buf)
     json_object_start(@jb)
-    json_key_str(@jb, c"msg", c"Hello Valet")
-    json_key_int(@jb, c"version", 1)
-    json_key_bool(@jb, c"active", 1)
+    json_key_str(@jb, "msg", "Hello Valet")
+    json_key_int(@jb, "version", 1)
+    json_key_bool(@jb, "active", 1)
     json_object_end(@jb)
-    return ctx_json(200, json_ptr(@jb), json_len(@jb))
+    return ctx_json(200, json_bytes(@jb))
 
 
 # GET /echo/:msg - Echo message back
 fn handle_echo(path: *u8, path_len: i32) -> i32
-    var msg_buf: [256]u8
-    let len: i32 = ctx_param(0, @msg_buf[0], 255)
-    if len < 0
-        return ctx_text(400, c"Missing message\n")
+    let msg: StrView = match param_shorter_than(0, 255)
+        Some(v) => v
+        None => return ctx_text(400, "Missing message\n")
 
     # Add newline
-    msg_buf[len] = '\n'
-    msg_buf[len + 1] = 0
-
-    return ctx_ok(@msg_buf[0])
+    var body: String = string_from(msg)
+    body.push('\n')
+    return ctx_ok(body.as_view())
 
 
 # POST /echo - "<body length> <first ECHO_MAX bytes of the body>\n". Shows
 # which bytes valet framed as the body: test/test_framing.sh (AGAST #1865).
-const ECHO_MAX: i32 = 1000
+const ECHO_MAX: i64 = 1000
 
 fn handle_echo_body(path: *u8, path_len: i32) -> i32
     let c: *HandlerContext = ctx()
     if c == null
         return 1
-    var out: [1040]u8
-    var pos: i32 = 0
-    # The length, in decimal (ritzlib.fmt; at most 20 bytes, AGAST #4118).
-    pos += fmt_i64_into(@out[pos], c.req.content_length) as i32
-    out[pos] = ' '
-    pos += 1
-    let n: i32 = ctx_body(@out[pos], ECHO_MAX)
-    if n > 0
-        pos += n
-    out[pos] = '\n'
-    out[pos + 1] = 0
-    return ctx_ok(@out[0])
+    var out: String = string_new()
+    out.push_i64(c.req.content_length)
+    out.push(' ')
+    let body: Span<u8> = ctx_body_bytes()
+    out.push_span(body.to(ECHO_MAX))
+    out.push('\n')
+    return ctx_ok(out.as_view())
 
 
 # POST /mirror - the request body, whole, as the response body, sent the
@@ -219,11 +202,11 @@ fn handle_mirror(path: *u8, path_len: i32) -> i32
         return 1
     let idx: i32 = valet_task_slot_idx(c.task)
     if idx < 0
-        return ctx_text(503, c"mirror: no task slot\n")
+        return ctx_text(503, "mirror: no task slot\n")
     g_mirror_body[idx] = (c.raw_buf + c.req.headers_end as i64) as i64
     g_mirror_len[idx] = c.req.content_length
     if valet_proxy_arm_yield(c.task, 0) < 0
-        return ctx_text(503, c"mirror: failed to arm yield\n")
+        return ctx_text(503, "mirror: failed to arm yield\n")
     return STATUS_PROXY_PENDING
 
 
@@ -237,10 +220,10 @@ fn handle_mirror_continuation(task: *Task) -> i32
     var hres: Response
     response_init(@hres, @hdr[0], 256)
     response_status(@hres, 200)
-    response_header(@hres, c"Content-Type", c"application/octet-stream")
+    response_header(@hres, "Content-Type", "application/octet-stream")
     response_content_length(@hres, body_len)
     if valet_task_closing(task) != 0
-        response_header(@hres, c"Connection", c"close")
+        response_header(@hres, "Connection", "close")
     response_end_headers(@hres)
     let hdr_len: i64 = hres.len as i64
 
@@ -261,60 +244,43 @@ const BYTES_MAX: i32 = 3500
 
 fn handle_bytes(path: *u8, path_len: i32) -> i32
     # Room for any i64 and then some: a longer count is "Missing" (AGAST #4037).
-    var n_buf: [32]u8
-    let len: i32 = ctx_param(0, @n_buf[0], 31)
-    if len <= 0
-        return ctx_text(400, c"Missing byte count\n")
-    # Digits only: strview_parse_i64 would also take a sign.
-    if n_buf[0] < '0' || n_buf[0] > '9'
-        return ctx_text(400, c"Bad byte count\n")
+    let count: StrView = match param_shorter_than(0, 31)
+        Some(v) => v
+        None => return ctx_text(400, "Missing byte count\n")
+    if count.is_empty()
+        return ctx_text(400, "Missing byte count\n")
+    # Digits only: parse_i64 would also take a sign.
+    if count.get(0) < '0' || count.get(0) > '9'
+        return ctx_text(400, "Bad byte count\n")
     var n: i32 = 0
-    match (strview_from_ptr(@n_buf[0], len as i64)).parse_i64()
+    match count.parse_i64()
         Some(v) =>
             if v > BYTES_MAX as i64
-                return ctx_text(400, c"Bad byte count\n")
+                return ctx_text(400, "Bad byte count\n")
             n = v as i32
-        None => return ctx_text(400, c"Bad byte count\n")
-    var body: [3501]u8
+        None => return ctx_text(400, "Bad byte count\n")
     # "0123456789" repeated: a test pattern indexed by byte offset, not a
     # number in decimal, so not a ritzlib.fmt job.
+    var body: String = string_with_cap(n as i64)
     for i in 0..n
-        body[i] = '0' + (i % 10) as u8
-    body[n] = 0
-    return ctx_ok(@body[0])
+        body.push('0' + (i % 10) as u8)
+    return ctx_ok(body.as_view())
 
 
 # GET /api/** - Catch-all API route
 fn handle_api_catchall(path: *u8, path_len: i32) -> i32
-    var remainder_buf: [256]u8
-    let len: i32 = ctx_param(0, @remainder_buf[0], 255)
+    let rest: StrView = match param_shorter_than(0, 255)
+        Some(v) => v
+        None => ""
 
-    # Build response: "API path: <remainder>\n"
-    var response_buf: [512]u8
-    var pos: i32 = 0
-
-    # "API path: "
-    let prefix = c"API path: "
-    let prefix_len: i32 = 10
-    for i in 0..prefix_len
-        response_buf[pos] = *(prefix + i)
-        pos += 1
-
-    # Copy remainder (or "/" if empty)
-    if len <= 0
-        response_buf[pos] = '/'
-        pos += 1
+    # Build response: "API path: <remainder>\n" (or "/" if empty)
+    var body: String = string_from("API path: ")
+    if rest.is_empty()
+        body.push('/')
     else
-        for i in 0..len
-            response_buf[pos] = remainder_buf[i]
-            pos += 1
-
-    # Newline
-    response_buf[pos] = '\n'
-    pos += 1
-    response_buf[pos] = 0
-
-    return ctx_ok(@response_buf[0])
+        body.push_str(rest)
+    body.push('\n')
+    return ctx_ok(body.as_view())
 
 
 # ============================================================================
@@ -346,20 +312,20 @@ fn get_zeus_client() -> *ZeusClient
 
 # Map an HTTP method string from the request line to zeus's HTTP_METHOD_*
 # code.  Returns 0 (unknown) if the method isn't one we proxy.
-fn http_method_code(method_ptr: *u8, method_len: i32) -> u8
-    if method_len == 3 and *method_ptr == 'G' and *(method_ptr + 1) == 'E' and *(method_ptr + 2) == 'T'
+fn http_method_code(method: StrView) -> u8
+    if method.eq("GET")
         return HTTP_METHOD_GET
-    if method_len == 4 and *method_ptr == 'P' and *(method_ptr + 1) == 'O' and *(method_ptr + 2) == 'S' and *(method_ptr + 3) == 'T'
+    if method.eq("POST")
         return HTTP_METHOD_POST
-    if method_len == 3 and *method_ptr == 'P' and *(method_ptr + 1) == 'U' and *(method_ptr + 2) == 'T'
+    if method.eq("PUT")
         return HTTP_METHOD_PUT
-    if method_len == 6 and *method_ptr == 'D' and *(method_ptr + 1) == 'E' and *(method_ptr + 2) == 'L' and *(method_ptr + 3) == 'E' and *(method_ptr + 4) == 'T' and *(method_ptr + 5) == 'E'
+    if method.eq("DELETE")
         return HTTP_METHOD_DELETE
-    if method_len == 4 and *method_ptr == 'H' and *(method_ptr + 1) == 'E' and *(method_ptr + 2) == 'A' and *(method_ptr + 3) == 'D'
+    if method.eq("HEAD")
         return HTTP_METHOD_HEAD
-    if method_len == 7 and *method_ptr == 'O' and *(method_ptr + 1) == 'P' and *(method_ptr + 2) == 'T' and *(method_ptr + 3) == 'I' and *(method_ptr + 4) == 'O' and *(method_ptr + 5) == 'N' and *(method_ptr + 6) == 'S'
+    if method.eq("OPTIONS")
         return HTTP_METHOD_OPTIONS
-    if method_len == 5 and *method_ptr == 'P' and *(method_ptr + 1) == 'A' and *(method_ptr + 2) == 'T' and *(method_ptr + 3) == 'C' and *(method_ptr + 4) == 'H'
+    if method.eq("PATCH")
         return HTTP_METHOD_PATCH
     return 0
 
@@ -387,16 +353,16 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
 
     let client: *ZeusClient = get_zeus_client()
     if client == null
-        return ctx_text(503, c"zeus client not configured\n")
+        return ctx_text(503, "zeus client not configured\n")
 
     # Pick a worker
     let worker_idx: i32 = zeus_client_select_worker(client)
     if worker_idx < 0
-        return ctx_text(503, c"no zeus worker available\n")
+        return ctx_text(503, "no zeus worker available\n")
 
     let handle: *WorkerHandle = zeus_client_get_worker(client, worker_idx)
     if handle == null
-        return ctx_text(503, c"zeus worker handle null\n")
+        return ctx_text(503, "zeus worker handle null\n")
 
     # Per-slot arena: peek the slot the next submit will write to and
     # allocate path / body bytes inside that slot's exclusive region.
@@ -406,18 +372,18 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     let claimed_slot: i64 = zeus_client_peek_request_slot(client, worker_idx)
     if claimed_slot < 0
         g_proxy_ring_full = g_proxy_ring_full + 1
-        return ctx_text(503, c"zeus request ring full\n")
+        return ctx_text(503, "zeus request ring full\n")
 
     var arena: DataArena
     worker_handle_get_slot_arena(handle, claimed_slot, @arena)
     if arena.base == null
-        return ctx_text(503, c"zeus arena unavailable\n")
+        return ctx_text(503, "zeus arena unavailable\n")
 
     # Allocate + copy path bytes
     let path_dst: *u8 = data_arena_alloc(@arena, path_len as i64)
     if path_dst == null
         g_proxy_arena_oversize = g_proxy_arena_oversize + 1
-        return ctx_text(503, c"zeus arena: out of space for path\n")
+        return ctx_text(503, "zeus arena: out of space for path\n")
     for i in 0..path_len
         *(path_dst + i) = *(path + i)
     let path_offset: i64 = data_arena_ptr_to_offset(@arena, path_dst)
@@ -431,11 +397,11 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     let want: i32 = c.req.content_length as i32
     if want > 0
         if c.req.headers_end < 0 or c.req.headers_end + want > c.raw_len
-            return ctx_text(400, c"incomplete request body\n")
+            return ctx_text(400, "incomplete request body\n")
         let body_dst: *u8 = data_arena_alloc(@arena, want as i64)
         if body_dst == null
             g_proxy_arena_oversize = g_proxy_arena_oversize + 1
-            return ctx_text(413, c"request body too large for zeus slot\n")
+            return ctx_text(413, "request body too large for zeus slot\n")
         memcpy(body_dst, c.raw_buf + c.req.headers_end, want as i64)
         body_offset = data_arena_ptr_to_offset(@arena, body_dst)
         body_len = want
@@ -444,9 +410,9 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     var req: RequestSlot
     request_slot_init(@req)
     req.id = zeus_client_next_request_id(client)
-    req.method = http_method_code(c.req.method_ptr, c.req.method_len)
+    req.method = http_method_code(c.req.method)
     if req.method == 0
-        return ctx_text(405, c"unsupported method\n")
+        return ctx_text(405, "unsupported method\n")
     req.flags = REQ_FLAG_COMPLETE
     req.path_offset = path_offset as u32
     req.path_len = path_len as u16
@@ -456,7 +422,7 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     let submit_rc: i32 = zeus_client_submit_request(client, worker_idx, @req)
     if submit_rc != 0
         g_proxy_submit_fail = g_proxy_submit_fail + 1
-        return ctx_text(503, c"zeus submit failed\n")
+        return ctx_text(503, "zeus submit failed\n")
     g_proxy_total_submits = g_proxy_total_submits + 1
 
     # Cooperative yield: stash per-task state, arm a NOP SQE, return
@@ -466,11 +432,11 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     # actually overlap.
     let task: *Task = ctx_task()
     if task == null
-        return ctx_text(503, c"zeus: no task in ctx\n")
+        return ctx_text(503, "zeus: no task in ctx\n")
 
     let st: *ProxyState = valet_proxy_state(task)
     if st == null
-        return ctx_text(503, c"zeus: proxy state unavailable\n")
+        return ctx_text(503, "zeus: proxy state unavailable\n")
 
     st.in_use = 1
     st.worker_idx = worker_idx
@@ -483,7 +449,7 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     if arm_rc < 0
         g_proxy_arm_fail = g_proxy_arm_fail + 1
         valet_proxy_state_clear(task)
-        return ctx_text(503, c"zeus: failed to arm yield\n")
+        return ctx_text(503, "zeus: failed to arm yield\n")
 
     g_proxy_pending_returned = g_proxy_pending_returned + 1
     return STATUS_PROXY_PENDING
@@ -491,16 +457,15 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
 
 # Send a short plain-text error from the proxy continuation (status 5xx,
 # Connection: close) and move to CONN_STATE_SEND.
-fn proxy_send_error(task: *Task, status: i32, msg: *u8) -> i32
-    let msg_len: i32 = strlen(msg) as i32
+fn proxy_send_error(task: *Task, status: i32, msg: StrView) -> i32
     var res: Response
     response_init(@res, @task.write_buf[0], 8192)
     response_status(@res, status)
-    response_header(@res, c"Content-Type", c"text/plain")
-    response_header(@res, c"Connection", c"close")
-    response_content_length(@res, msg_len as i64)
+    response_header(@res, "Content-Type", "text/plain")
+    response_header(@res, "Connection", "close")
+    response_content_length(@res, msg.len)
     response_end_headers(@res)
-    response_body(@res, msg, msg_len)
+    response_body(@res, msg.as_bytes())
     return valet_task_send_response(task, @task.write_buf[0], res.len as i64)
 
 
@@ -613,7 +578,7 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
         let total: i64 = proxy_response_bytes(arena.offset, arena.size, resp.headers_offset as i64, headers_len, resp.body_offset as i64, body_len)
         if total < 0
             g_proxy_bad_response = g_proxy_bad_response + 1
-            return proxy_send_error(task, 502, c"zeus worker response out of bounds\n")
+            return proxy_send_error(task, 502, "zeus worker response out of bounds\n")
 
         # Defensive fallback: worker didn't populate headers (e.g. nexus's
         # bare 500 when its arena is full).  Build a minimal header block.
@@ -624,7 +589,7 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
             var hres: Response
             response_init(@hres, @fallback[0], 256)
             response_status(@hres, resp.status as i32)
-            response_header(@hres, c"Content-Type", c"text/html; charset=utf-8")
+            response_header(@hres, "Content-Type", "text/html; charset=utf-8")
             response_content_length(@hres, body_len)
             # No Connection header: proxy_copy_headers below appends
             # valet's own, "close" when valet_task_closing (AGAST #2117).
@@ -638,11 +603,11 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
         let out: *u8 = valet_response_buffer(task, cap)
         if out == null
             g_proxy_bad_response = g_proxy_bad_response + 1
-            return proxy_send_error(task, 502, c"zeus worker response too large\n")
+            return proxy_send_error(task, 502, "zeus worker response too large\n")
         let out_hdr_len: i64 = proxy_copy_headers(out, hdr_len + PROXY_CONNECTION_EXTRA, hdr_ptr, hdr_len, valet_task_closing(task))
         if out_hdr_len < 0
             g_proxy_bad_response = g_proxy_bad_response + 1
-            return proxy_send_error(task, 502, c"zeus worker response headers malformed\n")
+            return proxy_send_error(task, 502, "zeus worker response headers malformed\n")
         if body_len > 0
             memcpy(out + out_hdr_len, data_arena_offset_to_ptr(@arena, resp.body_offset as i64), body_len)
         let out_len: i64 = out_hdr_len + body_len
@@ -659,7 +624,7 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
     if now_sec >= st.deadline_sec
         g_proxy_deadline_504 = g_proxy_deadline_504 + 1
         valet_proxy_state_clear(task)
-        return proxy_send_error(task, 504, c"zeus worker timeout\n")
+        return proxy_send_error(task, 504, "zeus worker timeout\n")
 
     # Re-arm the yield, backing off from NOPs to timers of up to 1 ms
     # (AGAST #183): NOP-only yields from many waiters starved the loop.
@@ -674,13 +639,13 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
 
 # Register the proxy handler under every method as a catch-all.
 fn register_zeus_proxy(app: *Valet)
-    valet_get(app, c"/**", handle_zeus_proxy)
-    valet_post(app, c"/**", handle_zeus_proxy)
-    valet_put(app, c"/**", handle_zeus_proxy)
-    valet_add_route(app, c"DELETE", c"/**", handle_zeus_proxy)
-    valet_add_route(app, c"HEAD", c"/**", handle_zeus_proxy)
-    valet_add_route(app, c"OPTIONS", c"/**", handle_zeus_proxy)
-    valet_add_route(app, c"PATCH", c"/**", handle_zeus_proxy)
+    valet_get(app, "/**", handle_zeus_proxy)
+    valet_post(app, "/**", handle_zeus_proxy)
+    valet_put(app, "/**", handle_zeus_proxy)
+    valet_add_route(app, "DELETE", "/**", handle_zeus_proxy)
+    valet_add_route(app, "HEAD", "/**", handle_zeus_proxy)
+    valet_add_route(app, "OPTIONS", "/**", handle_zeus_proxy)
+    valet_add_route(app, "PATCH", "/**", handle_zeus_proxy)
 
 
 # ============================================================================
@@ -807,7 +772,7 @@ pub fn main(args: Span<StrView>) -> i32
 
     # Configure static file serving if enabled in config
     if cfg.static_enabled != 0
-        valet_static(@app, @cfg.static_prefix[0], @cfg.static_root[0])
+        valet_static(@app, config_str(@cfg.static_prefix), config_str(@cfg.static_root))
 
     # Configure TLS if enabled
     if cfg.tls_enabled != 0
@@ -817,7 +782,7 @@ pub fn main(args: Span<StrView>) -> i32
             return 1
 
     # Register middleware
-    valet_use_named(@app, c"logging", logging_middleware)
+    valet_use_named(@app, "logging", logging_middleware)
 
     # Reverse-proxy mode: --zeus-socket <path>.  When set, valet stops
     # serving its built-in routes and instead forwards every request to a
@@ -876,16 +841,16 @@ pub fn main(args: Span<StrView>) -> i32
         register_zeus_proxy(@app)
     else
         # Stand-alone mode: register the built-in routes
-        valet_get(@app, c"/", handle_index)
-        valet_get(@app, c"/hello", handle_hello)
-        valet_get(@app, c"/json", handle_json)
-        valet_get(@app, c"/users/:id", handle_user)
-        valet_get(@app, c"/echo/:msg", handle_echo)
-        valet_get(@app, c"/bytes/:n", handle_bytes)
-        valet_post(@app, c"/echo", handle_echo_body)
-        valet_post(@app, c"/mirror", handle_mirror)
+        valet_get(@app, "/", handle_index)
+        valet_get(@app, "/hello", handle_hello)
+        valet_get(@app, "/json", handle_json)
+        valet_get(@app, "/users/:id", handle_user)
+        valet_get(@app, "/echo/:msg", handle_echo)
+        valet_get(@app, "/bytes/:n", handle_bytes)
+        valet_post(@app, "/echo", handle_echo_body)
+        valet_post(@app, "/mirror", handle_mirror)
         valet_set_proxy_continuation(handle_mirror_continuation)
-        valet_get(@app, c"/api/**", handle_api_catchall)  # Catch-all for /api/*
+        valet_get(@app, "/api/**", handle_api_catchall)  # Catch-all for /api/*
 
     # Run the server
     return valet_run(@app)

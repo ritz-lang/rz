@@ -12,50 +12,39 @@
 # and reads the response back from a pipe.
 
 import ritzlib.sys
-import ritzlib.str
+import ritzlib.span
+import ritzlib.string
 import ritzlib.strview
-import ritzlib.memory
-import ritzlib.fmt.digits { fmt_i64_into }
 import ritzlib.async.tasks
 import ritzlib.fd
-import ritzlib.span
 import ritzlib.fs { mkdir, unlink, rmdir }
 
 import lib.request
 import lib.static
 import lib.valet
 
-# /tmp/valet_<pid>_<name> into dst (NUL-terminated); returns dst.  The pid
-# keeps concurrent test runs off each other's files (AGAST #4052); ritzunit
-# forks each test, so each test gets its own.
-fn pid_tmp_path(dst: *u8, name: *u8) -> *u8
-    let head: *u8 = c"/tmp/valet_"
-    let head_len: i64 = strlen(head)
-    memcpy(dst, head, head_len)
-    var i: i64 = head_len + fmt_i64_into(dst + head_len, sys_getpid() as i64)
-    *(dst + i) = '_'
-    i += 1
-    let name_len: i64 = strlen(name)
-    memcpy(dst + i, name, name_len)
-    *(dst + i + name_len) = 0
-    dst
+# /tmp/valet_<pid>_<name>.  The pid keeps concurrent test runs off each
+# other's files (AGAST #4052); ritzunit forks each test, so each test gets
+# its own.
+fn pid_tmp_path(name: StrView) -> String
+    var path: String = string_from("/tmp/valet_")
+    path.push_i64(sys_getpid() as i64)
+    path.push('_')
+    path.push_str(name)
+    path
 
 # This process's own fixture root, /tmp/valet_<pid>_static_ka (AGAST #4052).
 # A fixed /tmp path let two concurrent valet test runs (gate slots, compiler
 # variants) O_TRUNC each other's fixture between write and serve.
-var g_root: [128]u8
+fn root_dir() -> String
+    pid_tmp_path("static_ka")
 
-fn static_root() -> *u8
-    pid_tmp_path(@g_root[0], c"static_ka")
-
-# static_root()/<name> into out (NUL-terminated).
-fn under_root(name: *u8, out: *u8)
-    let root_len: i64 = strlen(static_root())
-    memcpy(out, static_root(), root_len)
-    *(out + root_len) = '/'
-    let name_len: i64 = strlen(name)
-    memcpy(out + root_len + 1, name, name_len)
-    *(out + root_len + 1 + name_len) = 0
+# root_dir()/<name>
+fn root_path(name: StrView) -> String
+    var path: String = root_dir()
+    path.push('/')
+    path.push_str(name)
+    path
 
 fn contains(hay: *u8, len: i32, needle: StrView) -> i32
     var i: i32 = 0
@@ -68,16 +57,16 @@ fn contains(hay: *u8, len: i32, needle: StrView) -> i32
         i += 1
     0
 
-# Create the fixture tree: static_root()/<name> holding "hello\n", and
-# static_root()/dir/ for the directory listing.  0 on success.
-fn fixture(name: *u8) -> i32
-    mkdir(strview_from_cstr(static_root()), 493)      # 0755; EEXIST is fine
-    var path: [256]u8
-    under_root(c"dir", @path[0])
-    mkdir(strview_from_cstr(@path[0]), 493)
-    under_root(name, @path[0])
+# Create the fixture tree: root_dir()/<name> holding "hello\n", and
+# root_dir()/dir/ for the directory listing.  0 on success.
+fn fixture(name: StrView) -> i32
+    let root: String = root_dir()
+    mkdir(root.as_view(), 493)                       # 0755; EEXIST is fine
+    let dir: String = root_path("dir")
+    mkdir(dir.as_view(), 493)
+    let file: String = root_path(name)
     # mode 0644 = 420
-    var f: Fd = match fd_open(strview_from_cstr(@path[0]), O_WRONLY + O_CREAT + O_TRUNC, 420)
+    var f: Fd = match fd_open(file.as_view(), O_WRONLY + O_CREAT + O_TRUNC, 420)
         Ok(opened) => opened
         Err(_) => return 1
     var write_ok: bool = true
@@ -91,13 +80,13 @@ fn fixture(name: *u8) -> i32
 
 # Undo fixture(name): remove the file, dir/ and the root.  Deferred by each
 # test that builds a fixture, so a per-process root does not pile up in /tmp.
-fn teardown(name: *u8)
-    var path: [256]u8
-    under_root(name, @path[0])
-    unlink(strview_from_cstr(@path[0]))
-    under_root(c"dir", @path[0])
-    rmdir(strview_from_cstr(@path[0]))
-    rmdir(strview_from_cstr(static_root()))
+fn teardown(name: StrView)
+    let file: String = root_path(name)
+    unlink(file.as_view())
+    let dir: String = root_path("dir")
+    rmdir(dir.as_view())
+    let root: String = root_dir()
+    rmdir(root.as_view())
 
 # Drain `f` into out[0..cap); returns bytes read.
 fn drain(f: @Fd, out: *u8, cap: i32) -> i32
@@ -118,11 +107,13 @@ fn drain(f: @Fd, out: *u8, cap: i32) -> i32
 fn static_reply(raw: StrView, count: i32, out: *u8, cap: i32) -> i32
     var app: Valet
     valet_init(@app, 0)
-    valet_static(@app, c"/s/*", static_root())
+    let root: String = root_dir()
+    valet_static(@app, "/s/*", root.as_view())
     set_g_app(@app)
 
     var task: Task
-    memcpy(@task.read_buf[0], raw.ptr, raw.len)
+    let read_buf: Span<u8> = @task.read_buf
+    read_buf.copy_from(raw.as_bytes())
     task.read_len = raw.len as i32
 
     var req: Request
@@ -139,7 +130,7 @@ fn static_reply(raw: StrView, count: i32, out: *u8, cap: i32) -> i32
         Ok(pp) => pp
         Err(_) => return -2
     task.fd = p.write.raw()
-    let handled: i32 = valet_try_static(@app, @task, req.path_ptr, req.path_len)
+    let handled: i32 = valet_try_static(@app, @task, req.path)
     p.write.close()
     let n: i32 = drain(@p.read, out, cap)
     p.read.close()
@@ -162,8 +153,8 @@ fn says_close(out: *u8, n: i32) -> i32
 
 [[test]]
 fn test_static_file_http10_client_gets_close() -> i32
-    defer teardown(c"a.txt")
-    if fixture(c"a.txt") != 0
+    defer teardown("a.txt")
+    if fixture("a.txt") != 0
         return 90
     var buf: [2048]u8
     let n: i32 = static_reply("GET /s/a.txt HTTP/1.0\r\nHost: x\r\n\r\n", 1, @buf[0], 2048)
@@ -175,8 +166,8 @@ fn test_static_file_http10_client_gets_close() -> i32
 
 [[test]]
 fn test_static_file_connection_close_gets_close() -> i32
-    defer teardown(c"b.txt")
-    if fixture(c"b.txt") != 0
+    defer teardown("b.txt")
+    if fixture("b.txt") != 0
         return 90
     var buf: [2048]u8
     let n: i32 = static_reply("GET /s/b.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 1, @buf[0], 2048)
@@ -186,8 +177,8 @@ fn test_static_file_connection_close_gets_close() -> i32
 
 [[test]]
 fn test_static_file_last_keepalive_request_gets_close() -> i32
-    defer teardown(c"c.txt")
-    if fixture(c"c.txt") != 0
+    defer teardown("c.txt")
+    if fixture("c.txt") != 0
         return 90
     var buf: [2048]u8
     # keepalive_requests defaults to 100: the 100th response is the last.
@@ -198,8 +189,8 @@ fn test_static_file_last_keepalive_request_gets_close() -> i32
 
 [[test]]
 fn test_static_file_http11_keeps_alive() -> i32
-    defer teardown(c"d.txt")
-    if fixture(c"d.txt") != 0
+    defer teardown("d.txt")
+    if fixture("d.txt") != 0
         return 90
     var buf: [2048]u8
     let n: i32 = static_reply("GET /s/d.txt HTTP/1.1\r\nHost: x\r\n\r\n", 1, @buf[0], 2048)
@@ -248,8 +239,8 @@ fn test_static_304_keeps_alive() -> i32
 
 [[test]]
 fn test_static_directory_http10_client_gets_close() -> i32
-    defer teardown(c"dir/e.txt")
-    if fixture(c"dir/e.txt") != 0
+    defer teardown("dir/e.txt")
+    if fixture("dir/e.txt") != 0
         return 90
     var buf: [8192]u8
     let n: i32 = static_reply("GET /s/dir HTTP/1.0\r\n\r\n", 1, @buf[0], 8192)
@@ -287,16 +278,15 @@ fn test_static_404_keeps_alive_and_ends_at_body() -> i32
 # static_serve_file: the plain (no Range/ETag) variant.
 [[test]]
 fn test_static_serve_file_close_and_keep_alive() -> i32
-    defer teardown(c"f.txt")
-    if fixture(c"f.txt") != 0
+    defer teardown("f.txt")
+    if fixture("f.txt") != 0
         return 90
-    var fpath: [256]u8
-    under_root(c"f.txt", @fpath[0])
+    let fpath: String = root_path("f.txt")
     var buf: [1024]u8
     var p: Pipe = match pipe()
         Ok(pp) => pp
         Err(_) => return 91
-    static_serve_file(p.write.raw(), @fpath[0], 0)
+    static_serve_file(p.write.raw(), fpath.as_view(), 0)
     p.write.close()
     var n: i32 = drain(@p.read, @buf[0], 1024)
     p.read.close()
@@ -305,7 +295,7 @@ fn test_static_serve_file_close_and_keep_alive() -> i32
     p = match pipe()
         Ok(pp) => pp
         Err(_) => return 92
-    static_serve_file(p.write.raw(), @fpath[0], 1)
+    static_serve_file(p.write.raw(), fpath.as_view(), 1)
     p.write.close()
     n = drain(@p.read, @buf[0], 1024)
     p.read.close()
@@ -320,8 +310,8 @@ fn test_static_serve_file_close_and_keep_alive() -> i32
 
 [[test]]
 fn test_static_416_keeps_alive() -> i32
-    defer teardown(c"h.txt")
-    if fixture(c"h.txt") != 0
+    defer teardown("h.txt")
+    if fixture("h.txt") != 0
         return 90
     var buf: [1024]u8
     let n: i32 = static_reply("GET /s/h.txt HTTP/1.1\r\nRange: bytes=100-\r\n\r\n", 1, @buf[0], 1024)
@@ -337,8 +327,8 @@ fn test_static_416_keeps_alive() -> i32
 
 [[test]]
 fn test_static_416_last_keepalive_request_gets_close() -> i32
-    defer teardown(c"i.txt")
-    if fixture(c"i.txt") != 0
+    defer teardown("i.txt")
+    if fixture("i.txt") != 0
         return 90
     var buf: [1024]u8
     let n: i32 = static_reply("GET /s/i.txt HTTP/1.1\r\nRange: bytes=100-\r\n\r\n", 100, @buf[0], 1024)
@@ -385,8 +375,8 @@ fn test_static_403_last_keepalive_request_gets_close() -> i32
 # A conditional GET that matches answers 304 through static_serve_file_full.
 [[test]]
 fn test_static_304_via_if_none_match_connection_close_gets_close() -> i32
-    defer teardown(c"g.txt")
-    if fixture(c"g.txt") != 0
+    defer teardown("g.txt")
+    if fixture("g.txt") != 0
         return 90
     var buf: [1024]u8
     let n: i32 = static_reply("GET /s/g.txt HTTP/1.1\r\nIf-None-Match: *\r\nConnection: close\r\n\r\n", 1, @buf[0], 1024)

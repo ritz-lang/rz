@@ -36,14 +36,13 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.fmt
-import ritzlib.str
 import ritzlib.memory
 import ritzlib.option
 import ritzlib.result
+import ritzlib.span
 import ritzlib.strview
 import ritzlib.json
 import ritzlib.fd
-import ritzlib.span
 
 # ============================================================================
 # Configuration struct
@@ -124,23 +123,25 @@ fn config_field(obj: *JsonValue, key: StrView) -> *JsonValue
         None => null as *JsonValue
 
 
-# Copy a JSON string value into a fixed-size buffer
-pub fn config_copy_string(dst: *u8, max_len: i32, json_val: *JsonValue) -> i32
+# Copy a JSON string value into a fixed-size buffer, cut to fit with its
+# NUL.  Returns 1, or 0 (leaving `dst` alone) if the value isn't a string.
+pub fn config_copy_string(dst: Span<u8>, json_val: *JsonValue) -> i32
     if json_val == null
         return 0
-    if json_val.kind != JSON_STRING
-        return 0
-    if json_val.str_val == null
-        return 0
+    match json_val.get_string()
+        Some(s) =>
+            let n: i64 = dst.to(dst.len - 1).copy_from(s.as_bytes())
+            dst[n] = 0
+            1
+        None => 0
 
-    let src_len: i64 = json_val.str_len
-    var copy_len: i64 = src_len
-    if copy_len >= max_len as i64
-        copy_len = (max_len - 1) as i64
 
-    memcpy(dst, json_val.str_val, copy_len)
-    *(dst + copy_len) = 0
-    return 1
+# The text in a NUL-terminated config buffer (static_prefix, tls_cert, ...)
+pub fn config_str(buf: Span<u8>) -> StrView
+    var n: i64 = 0
+    while n < buf.len and buf[n] != 0
+        n += 1
+    return strview_from_ptr(buf.ptr, n)
 
 
 # Get an integer from a JSON value with a default
@@ -203,8 +204,8 @@ pub fn config_parse_static(cfg: *ValetConfig, static_obj: *JsonValue)
     let prefix_val: *JsonValue = config_field(static_obj, "prefix")
     let root_val: *JsonValue = config_field(static_obj, "root")
 
-    if config_copy_string(@cfg.static_prefix[0], 256, prefix_val) != 0
-        if config_copy_string(@cfg.static_root[0], 256, root_val) != 0
+    if config_copy_string(@cfg.static_prefix, prefix_val) != 0
+        if config_copy_string(@cfg.static_root, root_val) != 0
             cfg.static_enabled = 1
 
 
@@ -218,8 +219,8 @@ pub fn config_parse_tls(cfg: *ValetConfig, tls_obj: *JsonValue)
     cfg.tls_enabled = config_get_bool(config_field(tls_obj, "enabled"), cfg.tls_enabled)
 
     if cfg.tls_enabled != 0
-        config_copy_string(@cfg.tls_cert[0], 256, config_field(tls_obj, "cert"))
-        config_copy_string(@cfg.tls_key[0], 256, config_field(tls_obj, "key"))
+        config_copy_string(@cfg.tls_cert, config_field(tls_obj, "cert"))
+        config_copy_string(@cfg.tls_key, config_field(tls_obj, "key"))
 
 
 # ============================================================================
@@ -228,8 +229,8 @@ pub fn config_parse_tls(cfg: *ValetConfig, tls_obj: *JsonValue)
 
 # Parse a JSON string into config
 # Returns 0 on success, negative on error
-pub fn config_parse_json(cfg: *ValetConfig, json_str: *u8, json_len: i64) -> i32
-    match json_parse(strview_from_ptr(json_str, json_len))
+pub fn config_parse_json(cfg: *ValetConfig, json: StrView) -> i32
+    match json_parse(json)
         Ok(root) => config_apply_root(cfg, root)
         Err(err) => config_parse_error(err)
 
@@ -260,12 +261,13 @@ fn config_apply_root(cfg: *ValetConfig, root: *JsonValue) -> i32
 # Load config from a file
 # Returns 0 on success, negative on error
 pub fn config_load(cfg: *ValetConfig, path: *u8) -> i32
+    let shown: StrView = strview_from_cstr(path)
+
     # Open file
     var f: Fd = fd_adopt(-1)
-    match fd_open(strview_from_cstr(path), O_RDONLY, 0)
+    match fd_open(shown, O_RDONLY, 0)
         Ok(opened) => f = opened
         Err(_) =>
-            let shown: StrView = strview_from_cstr(path)
             eprint("config: cannot open {shown}\n")
             return -1
 
@@ -275,7 +277,6 @@ pub fn config_load(cfg: *ValetConfig, path: *u8) -> i32
         Ok(st) => size = st.st_size
         Err(_) =>
             f.close()
-            let shown: StrView = strview_from_cstr(path)
             eprint("config: cannot stat {shown}\n")
             return -2
 
@@ -306,12 +307,13 @@ pub fn config_load(cfg: *ValetConfig, path: *u8) -> i32
     *(buf + size) = 0  # null terminate
 
     # Store config path for reload
-    let path_len: i64 = strlen(path)
-    if path_len < 256
-        memcpy(@cfg.config_path[0], path, path_len + 1)
+    if shown.len < 256
+        let stored: Span<u8> = @cfg.config_path
+        stored.copy_from(shown.as_bytes())
+        stored[shown.len] = 0
 
     # Parse JSON
-    let ret: i32 = config_parse_json(cfg, buf, size)
+    let ret: i32 = config_parse_json(cfg, strview_from_ptr(buf, size))
     free(buf)
 
     return ret
@@ -346,11 +348,11 @@ pub fn config_reload(cfg: *ValetConfig) -> i32
     cfg.keepalive_requests = new_cfg.keepalive_requests
     cfg.idle_timeout = new_cfg.idle_timeout
     cfg.static_enabled = new_cfg.static_enabled
-    memcpy(@cfg.static_prefix[0], @new_cfg.static_prefix[0], 256)
-    memcpy(@cfg.static_root[0], @new_cfg.static_root[0], 256)
+    cfg.static_prefix = new_cfg.static_prefix
+    cfg.static_root = new_cfg.static_root
     cfg.tls_enabled = new_cfg.tls_enabled
-    memcpy(@cfg.tls_cert[0], @new_cfg.tls_cert[0], 256)
-    memcpy(@cfg.tls_key[0], @new_cfg.tls_key[0], 256)
+    cfg.tls_cert = new_cfg.tls_cert
+    cfg.tls_key = new_cfg.tls_key
 
     prints("config: reloaded successfully\n")
     return 0
@@ -383,15 +385,15 @@ pub fn config_print(cfg: *ValetConfig)
     print("    idle_timeout: {cfg.idle_timeout}s\n")
 
     if cfg.static_enabled != 0
-        let prefix: StrView = strview_from_cstr(@cfg.static_prefix[0])
-        let root: StrView = strview_from_cstr(@cfg.static_root[0])
+        let prefix: StrView = config_str(@cfg.static_prefix)
+        let root: StrView = config_str(@cfg.static_root)
         print("  Static:\n")
         print("    prefix: {prefix}\n")
         print("    root: {root}\n")
 
     if cfg.tls_enabled != 0
-        let cert: StrView = strview_from_cstr(@cfg.tls_cert[0])
-        let key: StrView = strview_from_cstr(@cfg.tls_key[0])
+        let cert: StrView = config_str(@cfg.tls_cert)
+        let key: StrView = config_str(@cfg.tls_key)
         print("  TLS:\n")
         print("    cert: {cert}\n")
         print("    key: {key}\n")

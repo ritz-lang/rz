@@ -11,7 +11,7 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
+import ritzlib.strview
 import ritzlib.uring
 
 import lib.request
@@ -73,23 +73,23 @@ fn test_proxy_bytes_negative_length() -> i32
 # request_frame(buf, len, max_body, *H1Frame)
 # ----------------------------------------------------------------------------
 
-fn frame_cstr(r: *u8) -> i64
+fn frame(r: StrView) -> i64
     var f: H1Frame
-    return request_frame(r, strlen(r) as i32, 0, @f)
+    return request_frame(r.ptr, r.len as i32, 0, @f)
 
 [[test]]
 fn test_frame_get_without_body() -> i32
-    let r = c"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
-    if frame_cstr(r) != strlen(r)
+    let r = "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    if frame(r) != r.len
         return 1
     return 0
 
 [[test]]
 fn test_frame_post_body_not_yet_received() -> i32
     # Headers are 46 bytes; Content-Length says 20000 more follow.
-    let r = c"POST /wiki HTTP/1.1\r\nContent-Length: 20000\r\n\r\nslug="
+    let r = "POST /wiki HTTP/1.1\r\nContent-Length: 20000\r\n\r\nslug="
     var f: H1Frame
-    if request_frame(r, strlen(r) as i32, 0, @f) != H1F_INCOMPLETE
+    if request_frame(r.ptr, r.len as i32, 0, @f) != H1F_INCOMPLETE
         return 1
     if f.total != 46 + 20000 or f.headers_end != 46
         return 2
@@ -97,14 +97,14 @@ fn test_frame_post_body_not_yet_received() -> i32
 
 [[test]]
 fn test_frame_headers_incomplete() -> i32
-    if frame_cstr(c"POST /wiki HTTP/1.1\r\nContent-Len") != H1F_INCOMPLETE
+    if frame("POST /wiki HTTP/1.1\r\nContent-Len") != H1F_INCOMPLETE
         return 1
     return 0
 
 [[test]]
 fn test_frame_request_line_only_is_incomplete() -> i32
     # The first record or read of a split request (AGAST #2201).
-    if frame_cstr(c"GET / HTTP/1.1\r\n") != H1F_INCOMPLETE
+    if frame("GET / HTTP/1.1\r\n") != H1F_INCOMPLETE
         return 1
     return 0
 
@@ -112,62 +112,62 @@ fn test_frame_request_line_only_is_incomplete() -> i32
 fn test_frame_malformed_is_not_incomplete() -> i32
     # No amount of further input completes this, so the caller must not
     # wait for more (AGAST #2201).
-    if frame_cstr(c"GET / HTTP/1.1\rX\nHost: x\r\n\r\n") != H1F_BAD_REQUEST
+    if frame("GET / HTTP/1.1\rX\nHost: x\r\n\r\n") != H1F_BAD_REQUEST
         return 1
     return 0
 
 [[test]]
 fn test_frame_junk_line_is_malformed() -> i32
     # No space before the line break: not a request line (AGAST #2201).
-    if frame_cstr(c"hello there\r\n\r\n") != H1F_BAD_REQUEST
+    if frame("hello there\r\n\r\n") != H1F_BAD_REQUEST
         return 1
-    if frame_cstr(c"GET /index.html\r\nHost: x\r\n\r\n") != H1F_BAD_REQUEST
+    if frame("GET /index.html\r\nHost: x\r\n\r\n") != H1F_BAD_REQUEST
         return 2
     return 0
 
 [[test]]
 fn test_frame_content_length_is_i64() -> i32
     # 3000000000 overflowed the old i32 parser; it is a length, still to come.
-    let r = c"POST / HTTP/1.1\r\nContent-Length: 3000000000\r\n\r\n"
+    let r = "POST / HTTP/1.1\r\nContent-Length: 3000000000\r\n\r\n"
     var f: H1Frame
-    if request_frame(r, strlen(r) as i32, 0, @f) != H1F_INCOMPLETE
+    if request_frame(r.ptr, r.len as i32, 0, @f) != H1F_INCOMPLETE
         return 1
     if f.body_len != 3000000000
         return 2
     # Over the server's limit: 413, never a wrapped size.
-    if request_frame(r, strlen(r) as i32, 1048576, @f) != H1F_TOO_LARGE
+    if request_frame(r.ptr, r.len as i32, 1048576, @f) != H1F_TOO_LARGE
         return 3
     return 0
 
 [[test]]
 fn test_frame_cl_and_te_is_bad() -> i32
-    if frame_cstr(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n0\r\n\r\n") != H1F_BAD_REQUEST
+    if frame("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n0\r\n\r\n") != H1F_BAD_REQUEST
         return 1
     return 0
 
 [[test]]
 fn test_frame_duplicate_cl_is_bad() -> i32
-    if frame_cstr(c"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na") != H1F_BAD_REQUEST
+    if frame("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na") != H1F_BAD_REQUEST
         return 1
     return 0
 
 [[test]]
 fn test_frame_invalid_cl_is_bad() -> i32
     # Was "no body": the body was then read as the next request.
-    if frame_cstr(c"POST / HTTP/1.1\r\nContent-Length: 1a\r\n\r\nGET / HTTP/1.1\r\n\r\n") != H1F_BAD_REQUEST
+    if frame("POST / HTTP/1.1\r\nContent-Length: 1a\r\n\r\nGET / HTTP/1.1\r\n\r\n") != H1F_BAD_REQUEST
         return 1
     return 0
 
 [[test]]
 fn test_frame_unsupported_te_is_not_implemented() -> i32
-    if frame_cstr(c"POST / HTTP/1.1\r\nTransfer-Encoding: deflate\r\n\r\n") != H1F_NOT_IMPLEMENTED
+    if frame("POST / HTTP/1.1\r\nTransfer-Encoding: deflate\r\n\r\n") != H1F_NOT_IMPLEMENTED
         return 1
     return 0
 
 [[test]]
 fn test_frame_pipelined_stops_at_first() -> i32
-    let r = c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\nGET / HTTP/1.1\r\n\r\n"
-    if frame_cstr(r) != strlen(r) - 18
+    let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n\r\nGET / HTTP/1.1\r\n\r\n"
+    if frame(r) != r.len - 18
         return 1
     return 0
 
@@ -182,56 +182,56 @@ fn test_frame_pipelined_stops_at_first() -> i32
 # error (~1% under wrk, AGAST #2459).
 # ----------------------------------------------------------------------------
 
-fn copied_is(dst: *u8, n: i64, want: *u8) -> i32
-    if n != strlen(want)
+fn copied_is(dst: *u8, n: i64, want: StrView) -> i32
+    if n != want.len
         return 0
     for i in 0..n
-        if *(dst + i) != *(want + i)
+        if *(dst + i) != want.get(i)
             return 0
     return 1
 
 [[test]]
 fn test_proxy_headers_last_response_says_close() -> i32
-    let src: *u8 = c"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n"
+    let src: StrView = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n"
     var dst: [256]u8
-    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 1)
-    if copied_is(@dst[0], n, c"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n") == 0
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src.ptr, src.len, 1)
+    if copied_is(@dst[0], n, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n") == 0
         return 1
     return 0
 
 [[test]]
 fn test_proxy_headers_reused_connection_says_keep_alive() -> i32
-    let src: *u8 = c"HTTP/1.1 303 See Other\r\nconnection: close\r\nLocation: /wiki/x\r\n\r\n"
+    let src: StrView = "HTTP/1.1 303 See Other\r\nconnection: close\r\nLocation: /wiki/x\r\n\r\n"
     var dst: [256]u8
-    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 0)
-    if copied_is(@dst[0], n, c"HTTP/1.1 303 See Other\r\nLocation: /wiki/x\r\nConnection: keep-alive\r\n\r\n") == 0
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src.ptr, src.len, 0)
+    if copied_is(@dst[0], n, "HTTP/1.1 303 See Other\r\nLocation: /wiki/x\r\nConnection: keep-alive\r\n\r\n") == 0
         return 1
     return 0
 
 [[test]]
 fn test_proxy_headers_without_connection_gain_one() -> i32
-    let src: *u8 = c"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+    let src: StrView = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
     var dst: [256]u8
-    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 1)
-    if copied_is(@dst[0], n, c"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") == 0
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src.ptr, src.len, 1)
+    if copied_is(@dst[0], n, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") == 0
         return 1
     return 0
 
 [[test]]
 fn test_proxy_headers_keep_lookalike_names() -> i32
     # Only the Connection header itself is valet's.
-    let src: *u8 = c"HTTP/1.1 200 OK\r\nX-Connection-Id: 7\r\n\r\n"
+    let src: StrView = "HTTP/1.1 200 OK\r\nX-Connection-Id: 7\r\n\r\n"
     var dst: [256]u8
-    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 0)
-    if copied_is(@dst[0], n, c"HTTP/1.1 200 OK\r\nX-Connection-Id: 7\r\nConnection: keep-alive\r\n\r\n") == 0
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src.ptr, src.len, 0)
+    if copied_is(@dst[0], n, "HTTP/1.1 200 OK\r\nX-Connection-Id: 7\r\nConnection: keep-alive\r\n\r\n") == 0
         return 1
     return 0
 
 [[test]]
 fn test_proxy_headers_refuse_a_small_buffer() -> i32
-    let src: *u8 = c"HTTP/1.1 200 OK\r\n\r\n"
+    let src: StrView = "HTTP/1.1 200 OK\r\n\r\n"
     var dst: [32]u8
-    if proxy_copy_headers(@dst[0], 20, src, strlen(src), 0) != -1
+    if proxy_copy_headers(@dst[0], 20, src.ptr, src.len, 0) != -1
         return 1
     return 0
 
@@ -239,10 +239,10 @@ fn test_proxy_headers_refuse_a_small_buffer() -> i32
 fn test_proxy_headers_extra_bound_covers_growth() -> i32
     # Replacing a short Connection line, or adding one, grows the block by at
     # most PROXY_CONNECTION_EXTRA bytes: callers size their buffer with it.
-    let src: *u8 = c"HTTP/1.1 200 OK\r\n\r\n"
+    let src: StrView = "HTTP/1.1 200 OK\r\n\r\n"
     var dst: [256]u8
-    let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 0)
-    if n < 0 or n > strlen(src) + PROXY_CONNECTION_EXTRA
+    let n: i64 = proxy_copy_headers(@dst[0], 256, src.ptr, src.len, 0)
+    if n < 0 or n > src.len + PROXY_CONNECTION_EXTRA
         return 1
     return 0
 

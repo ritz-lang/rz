@@ -5,10 +5,9 @@
 # that starts at or past the end of the file is unsatisfiable: 416.
 
 import ritzlib.sys
-import ritzlib.str
+import ritzlib.option
+import ritzlib.string
 import ritzlib.strview
-import ritzlib.memory
-import ritzlib.fmt.digits { fmt_i64_into }
 
 import ritzlib.fd
 import ritzlib.span
@@ -16,26 +15,21 @@ import ritzlib.fs { unlink }
 
 import lib.static
 
-# /tmp/valet_<pid>_<name> into dst (NUL-terminated); returns dst.  The pid
-# keeps concurrent test runs off each other's files (AGAST #4052); ritzunit
-# forks each test, so each test gets its own.
-fn pid_tmp_path(dst: *u8, name: *u8) -> *u8
-    let head: *u8 = c"/tmp/valet_"
-    let head_len: i64 = strlen(head)
-    memcpy(dst, head, head_len)
-    var i: i64 = head_len + fmt_i64_into(dst + head_len, sys_getpid() as i64)
-    *(dst + i) = '_'
-    i += 1
-    let name_len: i64 = strlen(name)
-    memcpy(dst + i, name, name_len)
-    *(dst + i + name_len) = 0
-    dst
+# /tmp/valet_<pid>_<name>.  The pid keeps concurrent test runs off each
+# other's files (AGAST #4052); ritzunit forks each test, so each test gets
+# its own.
+fn pid_tmp_path(name: StrView) -> String
+    var path: String = string_from("/tmp/valet_")
+    path.push_i64(sys_getpid() as i64)
+    path.push('_')
+    path.push_str(name)
+    path
 
-fn range_of(hdr: *u8, size: i64) -> RangeResult
-    return parse_range(hdr, strlen(hdr) as i32, size)
+fn range_of(hdr: StrView, size: i64) -> RangeResult
+    return parse_range(hdr, size)
 
 # 0 when `hdr` on a `size`-byte file is RANGE_OK start..end.
-fn expect_ok(hdr: *u8, size: i64, start: i64, end: i64) -> i32
+fn expect_ok(hdr: StrView, size: i64, start: i64, end: i64) -> i32
     let r: RangeResult = range_of(hdr, size)
     if r.valid != RANGE_OK
         return 1
@@ -47,36 +41,36 @@ fn expect_ok(hdr: *u8, size: i64, start: i64, end: i64) -> i32
 
 [[test]]
 fn test_range_open_ended_past_end_is_unsatisfiable() -> i32
-    if range_of(c"bytes=100-", 20).valid != RANGE_UNSATISFIABLE
+    if range_of("bytes=100-", 20).valid != RANGE_UNSATISFIABLE
         return 1
-    if range_of(c"bytes=20-", 20).valid != RANGE_UNSATISFIABLE
+    if range_of("bytes=20-", 20).valid != RANGE_UNSATISFIABLE
         return 2
     0
 
 [[test]]
 fn test_range_closed_past_end_is_unsatisfiable() -> i32
-    if range_of(c"bytes=20-25", 20).valid != RANGE_UNSATISFIABLE
+    if range_of("bytes=20-25", 20).valid != RANGE_UNSATISFIABLE
         return 1
     0
 
 [[test]]
 fn test_range_empty_file_is_unsatisfiable() -> i32
-    if range_of(c"bytes=0-", 0).valid != RANGE_UNSATISFIABLE
+    if range_of("bytes=0-", 0).valid != RANGE_UNSATISFIABLE
         return 1
-    if range_of(c"bytes=-5", 0).valid != RANGE_UNSATISFIABLE
+    if range_of("bytes=-5", 0).valid != RANGE_UNSATISFIABLE
         return 2
-    if range_of(c"bytes=-0", 20).valid != RANGE_UNSATISFIABLE
+    if range_of("bytes=-0", 20).valid != RANGE_UNSATISFIABLE
         return 3
     0
 
 [[test]]
 fn test_range_huge_numbers_do_not_wrap() -> i32
     # 20 digits overflow an i64: the old parser wrapped them negative.
-    if range_of(c"bytes=99999999999999999999-", 20).valid != RANGE_UNSATISFIABLE
+    if range_of("bytes=99999999999999999999-", 20).valid != RANGE_UNSATISFIABLE
         return 1
-    if expect_ok(c"bytes=-99999999999999999999", 20, 0, 19) != 0
+    if expect_ok("bytes=-99999999999999999999", 20, 0, 19) != 0
         return 2
-    if expect_ok(c"bytes=3-99999999999999999999", 20, 3, 19) != 0
+    if expect_ok("bytes=3-99999999999999999999", 20, 3, 19) != 0
         return 3
     0
 
@@ -86,79 +80,79 @@ fn test_range_huge_numbers_do_not_wrap() -> i32
 [[test]]
 fn test_range_i64_extremes() -> i32
     # i64::MAX and i64::MAX + 1 as a start: past any file.
-    if range_of(c"bytes=9223372036854775807-", 20).valid != RANGE_UNSATISFIABLE
+    if range_of("bytes=9223372036854775807-", 20).valid != RANGE_UNSATISFIABLE
         return 1
-    if range_of(c"bytes=9223372036854775808-", 20).valid != RANGE_UNSATISFIABLE
+    if range_of("bytes=9223372036854775808-", 20).valid != RANGE_UNSATISFIABLE
         return 2
     # ... as an end: clamped to the file.
-    if expect_ok(c"bytes=0-9223372036854775807", 20, 0, 19) != 0
+    if expect_ok("bytes=0-9223372036854775807", 20, 0, 19) != 0
         return 3
-    if expect_ok(c"bytes=0-9223372036854775808", 20, 0, 19) != 0
+    if expect_ok("bytes=0-9223372036854775808", 20, 0, 19) != 0
         return 4
     # ... as a suffix length: the whole file.
-    if expect_ok(c"bytes=-9223372036854775807", 20, 0, 19) != 0
+    if expect_ok("bytes=-9223372036854775807", 20, 0, 19) != 0
         return 5
-    if expect_ok(c"bytes=-9223372036854775808", 20, 0, 19) != 0
+    if expect_ok("bytes=-9223372036854775808", 20, 0, 19) != 0
         return 6
     # 0 as a start and an end.
-    if expect_ok(c"bytes=0-0", 20, 0, 0) != 0
+    if expect_ok("bytes=0-0", 20, 0, 0) != 0
         return 7
     # i64::MIN is not a position: "-" introduces a suffix, and a second
     # "-" is not a digit.
-    if range_of(c"bytes=--9223372036854775808", 20).valid != RANGE_IGNORE
+    if range_of("bytes=--9223372036854775808", 20).valid != RANGE_IGNORE
         return 8
-    if range_of(c"bytes=0--9223372036854775808", 20).valid != RANGE_IGNORE
+    if range_of("bytes=0--9223372036854775808", 20).valid != RANGE_IGNORE
         return 9
     0
 
 [[test]]
 fn test_range_signs_and_junk_are_ignored() -> i32
-    if range_of(c"bytes=+5-", 20).valid != RANGE_IGNORE
+    if range_of("bytes=+5-", 20).valid != RANGE_IGNORE
         return 1
-    if range_of(c"bytes=0-+5", 20).valid != RANGE_IGNORE
+    if range_of("bytes=0-+5", 20).valid != RANGE_IGNORE
         return 2
-    if range_of(c"bytes=-+5", 20).valid != RANGE_IGNORE
+    if range_of("bytes=-+5", 20).valid != RANGE_IGNORE
         return 3
-    if range_of(c"bytes=0-4x", 20).valid != RANGE_IGNORE
+    if range_of("bytes=0-4x", 20).valid != RANGE_IGNORE
         return 4
-    if range_of(c"bytes=1x-4", 20).valid != RANGE_IGNORE
+    if range_of("bytes=1x-4", 20).valid != RANGE_IGNORE
         return 5
-    if range_of(c"bytes=-5x", 20).valid != RANGE_IGNORE
+    if range_of("bytes=-5x", 20).valid != RANGE_IGNORE
         return 6
     # An empty position (a NUL ends it) is not a number, not an overflow.
-    if parse_range(c"bytes=-\0", 8, 20).valid != RANGE_IGNORE
+    if parse_range("bytes=-\0", 20).valid != RANGE_IGNORE
         return 7
-    if parse_range(c"bytes=0-\0", 9, 20).valid != RANGE_IGNORE
+    if parse_range("bytes=0-\0", 20).valid != RANGE_IGNORE
         return 8
     0
 
 [[test]]
 fn test_range_in_file() -> i32
-    if expect_ok(c"bytes=0-4", 20, 0, 4) != 0
+    if expect_ok("bytes=0-4", 20, 0, 4) != 0
         return 1
-    if expect_ok(c"bytes=15-", 20, 15, 19) != 0
+    if expect_ok("bytes=15-", 20, 15, 19) != 0
         return 2
-    if expect_ok(c"bytes=10-1000", 20, 10, 19) != 0
+    if expect_ok("bytes=10-1000", 20, 10, 19) != 0
         return 3
-    if expect_ok(c"bytes=-5", 20, 15, 19) != 0
+    if expect_ok("bytes=-5", 20, 15, 19) != 0
         return 4
-    if expect_ok(c"bytes=-500", 20, 0, 19) != 0
+    if expect_ok("bytes=-500", 20, 0, 19) != 0
         return 5
-    if expect_ok(c"bytes=19-19", 20, 19, 19) != 0
+    if expect_ok("bytes=19-19", 20, 19, 19) != 0
         return 6
     0
 
 [[test]]
 fn test_range_invalid_is_ignored() -> i32
-    if range_of(c"bytes=5-2", 20).valid != RANGE_IGNORE
+    if range_of("bytes=5-2", 20).valid != RANGE_IGNORE
         return 1
-    if range_of(c"bytes=a-", 20).valid != RANGE_IGNORE
+    if range_of("bytes=a-", 20).valid != RANGE_IGNORE
         return 2
-    if range_of(c"items=0-4", 20).valid != RANGE_IGNORE
+    if range_of("items=0-4", 20).valid != RANGE_IGNORE
         return 3
-    if range_of(c"bytes=-", 20).valid != RANGE_IGNORE
+    if range_of("bytes=-", 20).valid != RANGE_IGNORE
         return 4
-    if range_of(c"bytes=4", 20).valid != RANGE_IGNORE
+    if range_of("bytes=4", 20).valid != RANGE_IGNORE
         return 5
     0
 
@@ -191,10 +185,9 @@ fn starts_with(out: *u8, n: i32, want: StrView) -> i32
 # The file is this process's own (AGAST #4052): a fixed /tmp path let two
 # concurrent valet test runs (gate slots, compiler variants) truncate or
 # unlink each other's file between the write and the serve.
-fn serve_range(range: *u8, out: *u8, cap: i32) -> i32
-    var pathbuf: [128]u8
-    let path: *u8 = pid_tmp_path(@pathbuf[0], c"static_range.txt")
-    var f: Fd = match fd_open(strview_from_cstr(path), O_WRONLY + O_CREAT + O_TRUNC, 420)    # 0644
+fn serve_range(range: StrView, out: *u8, cap: i32) -> i32
+    var tmp: String = pid_tmp_path("static_range.txt")
+    var f: Fd = match fd_open(tmp.as_view(), O_WRONLY + O_CREAT + O_TRUNC, 420)    # 0644
         Ok(opened) => opened
         Err(_) => return -1
     f.write_str("0123456789ABCDEFGHIJ")
@@ -202,17 +195,17 @@ fn serve_range(range: *u8, out: *u8, cap: i32) -> i32
     var p: Pipe = match pipe()
         Ok(pp) => pp
         Err(_) => return -2
-    static_serve_file_full(p.write.raw(), path, range, strlen(range) as i32, null, 0, 0)
+    static_serve_file_full(p.write.raw(), tmp.as_view(), Some(range), None, 0)
     p.write.close()
     let n: i32 = drain(@p.read, out, cap)
     p.read.close()
-    unlink(strview_from_cstr(path))
+    unlink(tmp.as_view())
     n
 
 [[test]]
 fn test_serve_open_ended_past_end_sends_416() -> i32
     var buf: [1024]u8
-    let n: i32 = serve_range(c"bytes=100-", @buf[0], 1024)
+    let n: i32 = serve_range("bytes=100-", @buf[0], 1024)
     if n <= 0
         return 90
     if starts_with(@buf[0], n, "HTTP/1.1 416 ") != 1
@@ -222,7 +215,7 @@ fn test_serve_open_ended_past_end_sends_416() -> i32
 [[test]]
 fn test_serve_in_file_range_sends_206() -> i32
     var buf: [1024]u8
-    let n: i32 = serve_range(c"bytes=15-", @buf[0], 1024)
+    let n: i32 = serve_range("bytes=15-", @buf[0], 1024)
     if n <= 0
         return 90
     if starts_with(@buf[0], n, "HTTP/1.1 206 ") != 1

@@ -16,8 +16,10 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.fmt
-import ritzlib.str
-import ritzlib.strview { StrView, strview_from_cstr }
+import ritzlib.str { memcpy }
+import ritzlib.option
+import ritzlib.span
+import ritzlib.strview { StrView, strview_empty, strview_from_cstr }
 import ritzlib.uring
 import ritzlib.async_net
 import ritzlib.async.tasks
@@ -73,9 +75,9 @@ struct Valet
     backlog: i32                    # Listen backlog
     sndbuf: i32                     # SO_SNDBUF per connection (0 = kernel default)
     multishot: i32                  # Use multishot accept
-    static_root: *u8                # Static file root directory (or null)
-    static_prefix: *u8              # Static URL prefix (e.g., "/static/")
-    static_prefix_len: i32          # Length of static prefix
+    static_root: Option<StrView>    # Static file root directory, if serving
+    static_prefix: StrView          # Static URL prefix (e.g., "/static/"),
+                                    # empty when not serving static files
     idle_timeout: i32               # Connection idle timeout (seconds, 0 = disabled)
     keepalive_requests: i32         # Max requests per keep-alive connection
     max_request_size: i32           # Max request size in bytes (0 = unlimited)
@@ -115,8 +117,7 @@ struct HandlerContext
     req: *Request                   # Parsed request
     res: *Response                  # Response builder
     route_result: *RouteMatch       # Route match with params
-    path: *u8                       # Request path
-    path_len: i32                   # Path length
+    path: StrView                   # Request path
     raw_buf: *u8                    # Raw request buffer (for header access)
     raw_len: i32                    # Length of raw request data
     task: *Task                     # Owning task (cooperative-yield proxy uses this
@@ -134,9 +135,8 @@ pub fn valet_init(app: *Valet, port: i32)
     app.backlog = 1024
     app.sndbuf = 0
     app.multishot = 0
-    app.static_root = null
-    app.static_prefix = null
-    app.static_prefix_len = 0
+    app.static_root = None
+    app.static_prefix = strview_empty()
     app.idle_timeout = 0
     app.keepalive_requests = 100  # Default
     app.max_request_size = 0      # Unlimited by default
@@ -266,29 +266,29 @@ pub fn valet_keepalive_requests(app: *Valet, max_requests: i32)
 # Internal wrapper to adapt RouteHandler to router's fn(*u8, i32) -> i32
 # The actual handler lookup happens in the connection handler
 
-pub fn valet_add_route(app: *Valet, method: *u8, pattern: *u8, handler: fn(*u8, i32) -> i32) -> i32
-    return router_add(@app.router, method, pattern, handler)
+pub fn valet_add_route(app: *Valet, method: StrView, pattern: StrView, handler: fn(*u8, i32) -> i32) -> i32
+    return router_add(@app.router, Some(method), pattern, handler)
 
 
 # Convenience methods for common HTTP methods
-pub fn valet_get(app: *Valet, pattern: *u8, handler: fn(*u8, i32) -> i32) -> i32
-    return router_add(@app.router, c"GET", pattern, handler)
+pub fn valet_get(app: *Valet, pattern: StrView, handler: fn(*u8, i32) -> i32) -> i32
+    return router_add(@app.router, Some("GET"), pattern, handler)
 
 
-pub fn valet_post(app: *Valet, pattern: *u8, handler: fn(*u8, i32) -> i32) -> i32
-    return router_add(@app.router, c"POST", pattern, handler)
+pub fn valet_post(app: *Valet, pattern: StrView, handler: fn(*u8, i32) -> i32) -> i32
+    return router_add(@app.router, Some("POST"), pattern, handler)
 
 
-pub fn valet_put(app: *Valet, pattern: *u8, handler: fn(*u8, i32) -> i32) -> i32
-    return router_add(@app.router, c"PUT", pattern, handler)
+pub fn valet_put(app: *Valet, pattern: StrView, handler: fn(*u8, i32) -> i32) -> i32
+    return router_add(@app.router, Some("PUT"), pattern, handler)
 
 
-pub fn valet_delete(app: *Valet, pattern: *u8, handler: fn(*u8, i32) -> i32) -> i32
-    return router_add(@app.router, c"DELETE", pattern, handler)
+pub fn valet_delete(app: *Valet, pattern: StrView, handler: fn(*u8, i32) -> i32) -> i32
+    return router_add(@app.router, Some("DELETE"), pattern, handler)
 
 
-pub fn valet_any(app: *Valet, pattern: *u8, handler: fn(*u8, i32) -> i32) -> i32
-    return router_add(@app.router, null, pattern, handler)
+pub fn valet_any(app: *Valet, pattern: StrView, handler: fn(*u8, i32) -> i32) -> i32
+    return router_add(@app.router, None, pattern, handler)
 
 
 # Add middleware to the request pipeline
@@ -299,7 +299,7 @@ pub fn valet_use(app: *Valet, handler: fn(*u8, i32) -> i32) -> i32
 
 
 # Add named middleware (for debugging)
-pub fn valet_use_named(app: *Valet, name: *u8, handler: fn(*u8, i32) -> i32) -> i32
+pub fn valet_use_named(app: *Valet, name: StrView, handler: fn(*u8, i32) -> i32) -> i32
     return router_use_named(@app.router, name, handler)
 
 
@@ -323,16 +323,15 @@ pub fn valet_after(app: *Valet, handler: fn(*u8, i32) -> i32) -> i32
     return router_route_after(@app.router, handler)
 
 
-# Configure static file serving
-pub fn valet_static(app: *Valet, prefix: *u8, root: *u8)
-    app.static_prefix = prefix
-    app.static_prefix_len = strlen(prefix) as i32
-    app.static_root = root
+# Configure static file serving.  Both views must outlive the app.
+pub fn valet_static(app: *Valet, prefix: StrView, root: StrView)
+    app.static_root = Some(root)
 
     # Remove trailing * from prefix for matching
-    if app.static_prefix_len > 0
-        if *(prefix + app.static_prefix_len - 1) == '*'
-            app.static_prefix_len -= 1
+    if prefix.ends_with("*")
+        app.static_prefix = prefix.take(prefix.len - 1)
+    else
+        app.static_prefix = prefix
 
 
 # ============================================================================
@@ -354,46 +353,46 @@ pub fn ctx_task() -> *Task
     return c.task
 
 
-# Get captured route parameter by index
-pub fn ctx_param(idx: i32, buf: *u8, buf_len: i32) -> i32
+# Captured route parameter `idx` (a view into the request path), or None
+# outside a handler or when there is no such parameter
+pub fn ctx_param(idx: i32) -> Option<StrView>
     let c: *HandlerContext = get_g_ctx()
-    if c == null
-        return -1
-    return route_match_get_param(c.route_result, idx, buf, buf_len)
+    if c == null or c.route_result == null
+        return None
+    return route_match_param(c.route_result, idx)
 
 
-# Get request body (for POST/PUT requests)
-# Copies up to buf_len bytes of body to buf
-# Returns number of bytes copied, or -1 on error
-pub fn ctx_body(buf: *u8, buf_len: i32) -> i32
+# The request body (for POST/PUT requests) as it sits in the raw request
+# buffer: empty outside a handler or when there is none
+pub fn ctx_body_bytes() -> Span<u8>
     let c: *HandlerContext = get_g_ctx()
     if c == null
-        return -1
+        return span_empty<u8>()
 
     # Body starts after headers_end in the raw buffer (a chunked body was
     # decoded there, AGAST #1865).
     let body_start: i64 = c.req.headers_end as i64
-    let body_len: i64 = c.req.content_length
+    var body_len: i64 = c.req.content_length
 
     if body_start < 0 or body_len <= 0
-        return 0
+        return span_empty<u8>()
 
-    # Calculate actual length to copy
-    var copy_len: i64 = body_len
-    if copy_len > buf_len as i64
-        copy_len = buf_len as i64
+    # Don't read past end of raw buffer
+    if body_start + body_len > c.raw_len as i64
+        body_len = c.raw_len as i64 - body_start
+        if body_len < 0
+            return span_empty<u8>()
 
-    # Check we don't read past end of raw buffer
-    if body_start + copy_len > c.raw_len as i64
-        copy_len = c.raw_len as i64 - body_start
-        if copy_len < 0
-            return 0
+    return span_from_ptr(c.raw_buf + body_start, body_len)
 
-    # Copy body data
-    for i in 0..copy_len
-        *(buf + i) = *(c.raw_buf + body_start + i)
 
-    return copy_len as i32
+# Get request body (for POST/PUT requests)
+# Copies as much of the body as fits into `out`
+# Returns number of bytes copied, or -1 on error
+pub fn ctx_body(out: Span<u8>) -> i32
+    if get_g_ctx() == null
+        return -1
+    return out.copy_from(ctx_body_bytes()) as i32
 
 
 # 1 when the connection should stay open after answering `req`, the
@@ -422,204 +421,156 @@ pub fn valet_task_closing(task: *Task) -> i32
 # Connection header value for the response being built in `c`: "close"
 # when valet will close after it, so the header never promises reuse the
 # server won't honour.
-fn ctx_connection_value(c: *HandlerContext) -> *u8
+fn ctx_connection_value(c: *HandlerContext) -> StrView
     if c.req != null and c.req.keep_alive == 0
-        return c"close"
+        return "close"
     let app: *Valet = get_g_app()
     if c.task != null and app != null
         if c.task.request_count >= app.keepalive_requests
-            return c"close"
-    return c"keep-alive"
+            return "close"
+    return "keep-alive"
+
+
+# A whole response: status, Content-Type, Content-Length, Connection, body.
+fn ctx_send(c: *HandlerContext, status: i32, content_type: StrView, body: Span<u8>) -> i32
+    response_status(c.res, status)
+    response_header(c.res, "Content-Type", content_type)
+    response_content_length(c.res, body.len)
+    response_header(c.res, "Connection", ctx_connection_value(c))
+    response_end_headers(c.res)
+    response_body(c.res, body)
+    return 0
 
 
 # Send a plain text response
-pub fn ctx_text(status: i32, body: *u8) -> i32
+pub fn ctx_text(status: i32, body: StrView) -> i32
     let c: *HandlerContext = get_g_ctx()
     if c == null
         return -1
-    let body_len: i32 = strlen(body) as i32
-    response_status(c.res, status)
-    response_header(c.res, c"Content-Type", c"text/plain")
-    response_content_length(c.res, body_len as i64)
-    response_header(c.res, c"Connection", ctx_connection_value(c))
-    response_end_headers(c.res)
-    response_body(c.res, body, body_len)
-    return 0
+    return ctx_send(c, status, "text/plain", body.as_bytes())
 
 
 # Send a JSON response
-pub fn ctx_json(status: i32, json: *u8, json_len: i32) -> i32
+pub fn ctx_json(status: i32, json: Span<u8>) -> i32
     let c: *HandlerContext = get_g_ctx()
     if c == null
         return -1
-    response_status(c.res, status)
-    response_header(c.res, c"Content-Type", c"application/json")
-    response_content_length(c.res, json_len as i64)
-    response_header(c.res, c"Connection", ctx_connection_value(c))
-    response_end_headers(c.res)
-    response_body(c.res, json, json_len)
-    return 0
+    return ctx_send(c, status, "application/json", json)
 
 
 # Send a 200 OK with text body
-pub fn ctx_ok(body: *u8) -> i32
+pub fn ctx_ok(body: StrView) -> i32
     return ctx_text(200, body)
 
 
 # Send a 404 Not Found
 pub fn ctx_not_found() -> i32
-    return ctx_text(404, c"404 Not Found\n")
+    return ctx_text(404, "404 Not Found\n")
 
 
 # Send an HTML response
-pub fn ctx_html(status: i32, body: *u8) -> i32
+pub fn ctx_html(status: i32, body: StrView) -> i32
     let c: *HandlerContext = get_g_ctx()
     if c == null
         return -1
-    let body_len: i32 = strlen(body) as i32
-    response_status(c.res, status)
-    response_header(c.res, c"Content-Type", c"text/html; charset=utf-8")
-    response_content_length(c.res, body_len as i64)
-    response_header(c.res, c"Connection", ctx_connection_value(c))
-    response_end_headers(c.res)
-    response_body(c.res, body, body_len)
-    return 0
+    return ctx_send(c, status, "text/html; charset=utf-8", body.as_bytes())
 
 
 # Send a redirect response (302 Found)
-pub fn ctx_redirect(location: *u8) -> i32
+pub fn ctx_redirect(location: StrView) -> i32
     let c: *HandlerContext = get_g_ctx()
     if c == null
         return -1
     response_status(c.res, 302)
-    response_header(c.res, c"Location", location)
+    response_header(c.res, "Location", location)
     response_content_length(c.res, 0)
-    response_header(c.res, c"Connection", ctx_connection_value(c))
+    response_header(c.res, "Connection", ctx_connection_value(c))
     response_end_headers(c.res)
     return 0
 
 
 # Get a request header by name
-# Searches case-insensitively. Returns HeaderResult with found=1 if found.
-# The value_ptr points into the raw request buffer (zero-copy).
-pub fn ctx_get_header(name: *u8, name_len: i32) -> HeaderResult
+# Searches case-insensitively. The value is a view into the raw request
+# buffer (zero-copy); None if the request has no such header.
+pub fn ctx_get_header(name: StrView) -> Option<StrView>
     let c: *HandlerContext = get_g_ctx()
     if c == null
-        var empty: HeaderResult
-        empty.found = 0
-        empty.value_ptr = null
-        empty.value_len = 0
-        return empty
-    return request_find_header(c.raw_buf, c.raw_len, name, name_len)
+        return None
+    return request_find_header(c.raw_buf, c.raw_len, name)
 
 
 # Get Accept-Encoding header and return encoding flags
 # Returns bitmask of ENCODING_GZIP, ENCODING_DEFLATE, ENCODING_IDENTITY
 pub fn ctx_accept_encoding() -> i32
-    let hdr: HeaderResult = ctx_get_header(c"Accept-Encoding", 15)
-    if hdr.found == 0
-        return ENCODING_IDENTITY
-    return accept_encoding_parse(hdr.value_ptr, hdr.value_len)
+    match ctx_get_header("Accept-Encoding")
+        Some(value) => accept_encoding_parse(value)
+        None => ENCODING_IDENTITY
+
+
+# The Content-Encoding header of a compressed response (none for identity)
+fn ctx_encoding_header(c: *HandlerContext, encoding: i32)
+    match encoding_header_value(encoding)
+        Some(value) => response_header(c.res, "Content-Encoding", value)
+        None => pass
 
 
 # ============================================================================
 # Compression-aware response helpers
 # ============================================================================
 
-# Send a text response with automatic gzip compression if client accepts it.
-# For small responses (<256 bytes), no compression is used.
+# Send `body` with automatic gzip or deflate compression if the client
+# accepts it.  For small responses (<256 bytes), no compression is used.
 # For larger responses, gzip or deflate compression is applied if beneficial.
-pub fn ctx_text_compressed(status: i32, body: *u8) -> i32
+fn ctx_send_compressed(status: i32, content_type: StrView, body: Span<u8>) -> i32
     let c: *HandlerContext = get_g_ctx()
     if c == null
         return -1
 
-    let body_len: i64 = strlen(body) as i64
+    let body_len: i64 = body.len
 
     # Check if we should try compression (gzip or deflate)
     let accepted: i32 = ctx_accept_encoding()
     let selected: i32 = encoding_select(accepted)
     if selected != ENCODING_IDENTITY && body_len >= COMPRESS_MIN_SIZE && body_len <= COMPRESS_MAX_INPUT
         var compress_buf: [70000]u8
+        let compressed: Span<u8> = @compress_buf
         var compressed_len: i64 = 0
 
         if selected == ENCODING_GZIP
-            compressed_len = compress_gzip(body, body_len, @compress_buf[0], 70000)
+            compressed_len = compress_gzip(body, compressed)
         else if selected == ENCODING_DEFLATE
-            compressed_len = compress_deflate(body, body_len, @compress_buf[0], 70000)
+            compressed_len = compress_deflate(body, compressed)
 
         if compressed_len > 0 && compressed_len < body_len
             # Compression was beneficial
             response_status(c.res, status)
-            response_header(c.res, c"Content-Type", c"text/plain")
-            let enc_header: *u8 = encoding_header_value(selected)
-            if enc_header != null
-                response_header(c.res, c"Content-Encoding", enc_header)
+            response_header(c.res, "Content-Type", content_type)
+            ctx_encoding_header(c, selected)
             response_content_length(c.res, compressed_len)
-            response_header(c.res, c"Connection", ctx_connection_value(c))
-            response_header(c.res, c"Vary", c"Accept-Encoding")
+            response_header(c.res, "Connection", ctx_connection_value(c))
+            response_header(c.res, "Vary", "Accept-Encoding")
             response_end_headers(c.res)
-            response_body(c.res, @compress_buf[0], compressed_len as i32)
+            response_body(c.res, compressed.to(compressed_len))
             return 0
 
     # Fall back to uncompressed
-    response_status(c.res, status)
-    response_header(c.res, c"Content-Type", c"text/plain")
-    response_content_length(c.res, body_len)
-    response_header(c.res, c"Connection", ctx_connection_value(c))
-    response_end_headers(c.res)
-    response_body(c.res, body, body_len as i32)
-    return 0
+    return ctx_send(c, status, content_type, body)
+
+
+# Send a text response with automatic gzip compression if client accepts it.
+pub fn ctx_text_compressed(status: i32, body: StrView) -> i32
+    return ctx_send_compressed(status, "text/plain", body.as_bytes())
 
 
 # Send a JSON response with automatic gzip or deflate compression if client accepts it.
-pub fn ctx_json_compressed(status: i32, json: *u8, json_len: i32) -> i32
-    let c: *HandlerContext = get_g_ctx()
-    if c == null
-        return -1
-
-    let body_len: i64 = json_len as i64
-
-    # Check if we should try compression (gzip or deflate)
-    let accepted: i32 = ctx_accept_encoding()
-    let selected: i32 = encoding_select(accepted)
-    if selected != ENCODING_IDENTITY && body_len >= COMPRESS_MIN_SIZE && body_len <= COMPRESS_MAX_INPUT
-        var compress_buf: [70000]u8
-        var compressed_len: i64 = 0
-
-        if selected == ENCODING_GZIP
-            compressed_len = compress_gzip(json, body_len, @compress_buf[0], 70000)
-        else if selected == ENCODING_DEFLATE
-            compressed_len = compress_deflate(json, body_len, @compress_buf[0], 70000)
-
-        if compressed_len > 0 && compressed_len < body_len
-            # Compression was beneficial
-            response_status(c.res, status)
-            response_header(c.res, c"Content-Type", c"application/json")
-            let enc_header: *u8 = encoding_header_value(selected)
-            if enc_header != null
-                response_header(c.res, c"Content-Encoding", enc_header)
-            response_content_length(c.res, compressed_len)
-            response_header(c.res, c"Connection", ctx_connection_value(c))
-            response_header(c.res, c"Vary", c"Accept-Encoding")
-            response_end_headers(c.res)
-            response_body(c.res, @compress_buf[0], compressed_len as i32)
-            return 0
-
-    # Fall back to uncompressed
-    response_status(c.res, status)
-    response_header(c.res, c"Content-Type", c"application/json")
-    response_content_length(c.res, body_len)
-    response_header(c.res, c"Connection", ctx_connection_value(c))
-    response_end_headers(c.res)
-    response_body(c.res, json, json_len)
-    return 0
+pub fn ctx_json_compressed(status: i32, json: Span<u8>) -> i32
+    return ctx_send_compressed(status, "application/json", json)
 
 
 # Send a large body (up to 1MB) with automatic compression.
 # Uses heap allocation for compression buffer.
-# content_type should be a static string like c"text/html" or c"application/json"
-pub fn ctx_body_large_compressed(status: i32, body: *u8, body_len: i64, content_type: *u8) -> i32
+# content_type should be a static string like "text/html" or "application/json"
+pub fn ctx_body_large_compressed(status: i32, body: Span<u8>, content_type: StrView) -> i32
     let c: *HandlerContext = get_g_ctx()
     if c == null
         return -1
@@ -627,31 +578,23 @@ pub fn ctx_body_large_compressed(status: i32, body: *u8, body_len: i64, content_
     # Try compression
     let accepted: i32 = ctx_accept_encoding()
     var result: CompressResult
-    let compressed: i32 = compress_large(body, body_len, accepted, content_type, @result)
+    let compressed: i32 = compress_large(body, accepted, content_type, @result)
 
     if compressed == 1
         # Send compressed response
         response_status(c.res, status)
-        response_header(c.res, c"Content-Type", content_type)
-        let enc_header: *u8 = encoding_header_value(result.encoding)
-        if enc_header != null
-            response_header(c.res, c"Content-Encoding", enc_header)
+        response_header(c.res, "Content-Type", content_type)
+        ctx_encoding_header(c, result.encoding)
         response_content_length(c.res, result.len)
-        response_header(c.res, c"Connection", ctx_connection_value(c))
-        response_header(c.res, c"Vary", c"Accept-Encoding")
+        response_header(c.res, "Connection", ctx_connection_value(c))
+        response_header(c.res, "Vary", "Accept-Encoding")
         response_end_headers(c.res)
-        response_body(c.res, result.data, result.len as i32)
+        response_append_bytes(c.res, result.data, result.len as i32)
         compress_result_free(@result)
         return 0
 
     # Send uncompressed
-    response_status(c.res, status)
-    response_header(c.res, c"Content-Type", content_type)
-    response_content_length(c.res, body_len)
-    response_header(c.res, c"Connection", ctx_connection_value(c))
-    response_end_headers(c.res)
-    response_body(c.res, body, body_len as i32)
-    return 0
+    return ctx_send(c, status, content_type, body)
 
 
 # Send a very large body (>1MB) using chunked transfer encoding with streaming compression.
@@ -660,7 +603,7 @@ pub fn ctx_body_large_compressed(status: i32, body: *u8, body_len: i64, content_
 #
 # Note: This function sends data directly to the socket, bypassing the response buffer.
 # It should only be used for responses that exceed COMPRESS_MAX_HEAP_INPUT (1MB).
-pub fn ctx_body_streaming_compressed(status: i32, body: *u8, body_len: i64, content_type: *u8) -> i32
+pub fn ctx_body_streaming_compressed(status: i32, body: Span<u8>, content_type: StrView) -> i32
     let c: *HandlerContext = get_g_ctx()
     if c == null
         return -1
@@ -670,30 +613,29 @@ pub fn ctx_body_streaming_compressed(status: i32, body: *u8, body_len: i64, cont
     var sc: StreamCompressor
     if stream_compressor_init(@sc, accepted) != 0
         # Allocation failed - fall back to uncompressed chunked
-        return ctx_body_chunked_uncompressed(status, body, body_len, content_type)
+        return ctx_body_chunked_uncompressed(status, body, content_type)
 
     # Send headers for chunked transfer
     response_status(c.res, status)
-    response_header(c.res, c"Content-Type", content_type)
-    response_header(c.res, c"Transfer-Encoding", c"chunked")
+    response_header(c.res, "Content-Type", content_type)
+    response_header(c.res, "Transfer-Encoding", "chunked")
 
     # Add Content-Encoding if compressing
     if sc.encoding != ENCODING_IDENTITY
-        let enc_header: *u8 = encoding_header_value(sc.encoding)
-        if enc_header != null
-            response_header(c.res, c"Content-Encoding", enc_header)
+        ctx_encoding_header(c, sc.encoding)
 
-    response_header(c.res, c"Connection", ctx_connection_value(c))
-    response_header(c.res, c"Vary", c"Accept-Encoding")
+    response_header(c.res, "Connection", ctx_connection_value(c))
+    response_header(c.res, "Vary", "Accept-Encoding")
     response_end_headers(c.res)
 
     # Send headers to socket
     # Note: We need the fd from the task - this is a limitation of the current design
     # For now, response_body handles this via the task pointer
     let headers_len: i32 = c.res.len
-    response_body(c.res, null, 0)  # Flush headers only
+    response_body(c.res, span_empty<u8>())  # Flush headers only
 
     # Process body in chunks
+    let body_len: i64 = body.len
     var offset: i64 = 0
     var chunk_header: [32]u8
 
@@ -703,7 +645,7 @@ pub fn ctx_body_streaming_compressed(status: i32, body: *u8, body_len: i64, cont
             chunk_len = COMPRESS_CHUNK_SIZE
 
         # Compress chunk
-        let compressed_len: i64 = stream_compress_chunk(@sc, body + offset, chunk_len)
+        let compressed_len: i64 = stream_compress_chunk(@sc, body.slice(offset, offset + chunk_len))
         if compressed_len < 0
             # Compression failed - send uncompressed
             stream_compressor_free(@sc)
@@ -715,40 +657,41 @@ pub fn ctx_body_streaming_compressed(status: i32, body: *u8, body_len: i64, cont
         # Send chunk header
         response_init(c.res, c.res.buf, c.res.cap)
         response_append_bytes(c.res, @chunk_header[0], header_len)
-        response_body(c.res, null, 0)
+        response_body(c.res, span_empty<u8>())
 
         # Send chunk data
         response_init(c.res, c.res.buf, c.res.cap)
         response_append_bytes(c.res, sc.compress_buf, compressed_len as i32)
-        response_append(c.res, c"\r\n")
-        response_body(c.res, null, 0)
+        response_append(c.res, "\r\n")
+        response_body(c.res, span_empty<u8>())
 
         offset = offset + chunk_len
 
     # Send final chunk (0\r\n\r\n)
     response_init(c.res, c.res.buf, c.res.cap)
-    response_append(c.res, c"0\r\n\r\n")
-    response_body(c.res, null, 0)
+    response_append(c.res, "0\r\n\r\n")
+    response_body(c.res, span_empty<u8>())
 
     stream_compressor_free(@sc)
     return 0
 
 
 # Send chunked response without compression (fallback)
-pub fn ctx_body_chunked_uncompressed(status: i32, body: *u8, body_len: i64, content_type: *u8) -> i32
+pub fn ctx_body_chunked_uncompressed(status: i32, body: Span<u8>, content_type: StrView) -> i32
     let c: *HandlerContext = get_g_ctx()
     if c == null
         return -1
 
     # Send headers
     response_status(c.res, status)
-    response_header(c.res, c"Content-Type", content_type)
-    response_header(c.res, c"Transfer-Encoding", c"chunked")
-    response_header(c.res, c"Connection", ctx_connection_value(c))
+    response_header(c.res, "Content-Type", content_type)
+    response_header(c.res, "Transfer-Encoding", "chunked")
+    response_header(c.res, "Connection", ctx_connection_value(c))
     response_end_headers(c.res)
-    response_body(c.res, null, 0)
+    response_body(c.res, span_empty<u8>())
 
     # Send in chunks
+    let body_len: i64 = body.len
     var offset: i64 = 0
     var chunk_header: [32]u8
 
@@ -761,20 +704,20 @@ pub fn ctx_body_chunked_uncompressed(status: i32, body: *u8, body_len: i64, cont
         let header_len: i32 = format_chunk_header(@chunk_header[0], 32, chunk_len)
         response_init(c.res, c.res.buf, c.res.cap)
         response_append_bytes(c.res, @chunk_header[0], header_len)
-        response_body(c.res, null, 0)
+        response_body(c.res, span_empty<u8>())
 
         # Send chunk data
         response_init(c.res, c.res.buf, c.res.cap)
-        response_append_bytes(c.res, body + offset, chunk_len as i32)
-        response_append(c.res, c"\r\n")
-        response_body(c.res, null, 0)
+        response_body(c.res, body.slice(offset, offset + chunk_len))
+        response_append(c.res, "\r\n")
+        response_body(c.res, span_empty<u8>())
 
         offset = offset + chunk_len
 
     # Final chunk
     response_init(c.res, c.res.buf, c.res.cap)
-    response_append(c.res, c"0\r\n\r\n")
-    response_body(c.res, null, 0)
+    response_append(c.res, "0\r\n\r\n")
+    response_body(c.res, span_empty<u8>())
 
     return 0
 
@@ -790,10 +733,10 @@ pub fn format_chunk_header(buf: *u8, buf_len: i32, size: i64) -> i32
     var temp: [16]u8
     var temp_pos: i32 = 15
     var v: i64 = size
-    let hex_chars = c"0123456789abcdef"
+    let hex_chars: StrView = "0123456789abcdef"
 
     while v > 0
-        temp[temp_pos] = *(hex_chars + (v & 15))
+        temp[temp_pos] = hex_chars.get(v & 15)
         temp_pos = temp_pos - 1
         v = v >> 4
 
@@ -1125,33 +1068,27 @@ pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
 # Check if path matches static prefix and serve file if so
 # Returns 1 if static file was handled (caller should transition to keep-alive or close)
 # Returns 0 if not a static path (caller should try routing)
-pub fn valet_try_static(app: *Valet, task: *Task, path: *u8, path_len: i32) -> i32
-    return valet_try_static_raw(app, task, path, path_len, @task.read_buf[0], task.read_len)
+pub fn valet_try_static(app: *Valet, task: *Task, path: StrView) -> i32
+    return valet_try_static_raw(app, task, path, @task.read_buf[0], task.read_len)
 
 
 # valet_try_static for a request in raw[0..raw_len): its headers (Range,
 # If-None-Match) are read there, not from task.read_buf, which can hold the
 # next pipelined request instead (AGAST #1865).
-pub fn valet_try_static_raw(app: *Valet, task: *Task, path: *u8, path_len: i32, raw: *u8, raw_len: i32) -> i32
+pub fn valet_try_static_raw(app: *Valet, task: *Task, path: StrView, raw: *u8, raw_len: i32) -> i32
     # Check if static serving is enabled
-    if app.static_root == null
-        return 0
-    if app.static_prefix == null
-        return 0
-    if app.static_prefix_len == 0
+    let root: StrView = match app.static_root
+        Some(r) => r
+        None => return 0
+    if app.static_prefix.len == 0
         return 0
 
     # Check if path starts with static prefix
-    if path_len < app.static_prefix_len
+    if not path.starts_with(app.static_prefix)
         return 0
 
-    for i in 0..app.static_prefix_len
-        if *(path + i) != *(app.static_prefix + i)
-            return 0
-
     # Path matches static prefix - extract relative path
-    let rel_path: *u8 = path + app.static_prefix_len
-    let rel_path_len: i32 = path_len - app.static_prefix_len
+    let rel_path: StrView = path.skip(app.static_prefix.len)
 
     # valet closes after this response once request_count reaches the cap
     # (the handler saturates it for HTTP/1.0 and "Connection: close"): the
@@ -1159,47 +1096,33 @@ pub fn valet_try_static_raw(app: *Valet, task: *Task, path: *u8, path_len: i32, 
     let keep_alive: i32 = (task.request_count < app.keepalive_requests) as i32
 
     # Security check
-    if path_is_safe(rel_path, rel_path_len) == 0
-        log_warn(c"Static file request blocked: path traversal attempt")
+    if path_is_safe(rel_path) == 0
+        log_warn("Static file request blocked: path traversal attempt")
         static_send_403(task.fd, keep_alive)
         return 1
 
     # Build full filesystem path
     var full_path: [512]u8
-    let built: i32 = static_build_path(@full_path[0], 512, app.static_root, rel_path, rel_path_len)
-    if built < 0
-        log_error(c"Static file path too long")
-        static_send_404(task.fd, keep_alive)
-        return 1
+    let file: StrView = match static_build_path(@full_path, root, rel_path)
+        Some(f) => f
+        None =>
+            log_error("Static file path too long")
+            static_send_404(task.fd, keep_alive)
+            return 1
 
     # Check if path is a directory
-    if static_is_directory(@full_path[0]) != 0
+    if static_is_directory(file) != 0
         # Serve directory listing
-        let sent: i64 = static_serve_directory(task.fd, @full_path[0], path, path_len, keep_alive)
+        let sent: i64 = static_serve_directory(task.fd, file, path, keep_alive)
         if sent < 0
             static_send_404(task.fd, keep_alive)
         return 1
 
-    # Check for Range header in the request
-    let range_hdr: HeaderResult = request_find_header(raw, raw_len, c"Range", 5)
-
-    # Check for If-None-Match header (ETag validation)
-    let if_none_match: HeaderResult = request_find_header(raw, raw_len, c"If-None-Match", 13)
-
-    # Serve the file with optional range and ETag support
-    var range_ptr: *u8 = null
-    var range_len: i32 = 0
-    if range_hdr.found != 0
-        range_ptr = range_hdr.value_ptr
-        range_len = range_hdr.value_len
-
-    var inm_ptr: *u8 = null
-    var inm_len: i32 = 0
-    if if_none_match.found != 0
-        inm_ptr = if_none_match.value_ptr
-        inm_len = if_none_match.value_len
-
-    let sent: i64 = static_serve_file_full(task.fd, @full_path[0], range_ptr, range_len, inm_ptr, inm_len, keep_alive)
+    # Serve the file with the request's Range and If-None-Match (ETag
+    # validation) headers, if it has them
+    let range_hdr: Option<StrView> = request_find_header(raw, raw_len, "Range")
+    let if_none_match: Option<StrView> = request_find_header(raw, raw_len, "If-None-Match")
+    let sent: i64 = static_serve_file_full(task.fd, file, range_hdr, if_none_match, keep_alive)
 
     if sent < 0
         static_send_404(task.fd, keep_alive)
@@ -1224,22 +1147,19 @@ pub fn valet_task_send(task: *Task, len: i32) -> i32
 # (AGAST #1865).  Any other code is answered as a 400.
 fn valet_build_error(res: *Response, code: i32)
     var status: i32 = 400
-    var body: *u8 = c"400 Bad Request\n"
-    var body_len: i32 = 16
+    var body: StrView = "400 Bad Request\n"
     if code == 413
         status = 413
-        body = c"413 Request Entity Too Large\n"
-        body_len = 29
+        body = "413 Request Entity Too Large\n"
     else if code == 501
         status = 501
-        body = c"501 Not Implemented\n"
-        body_len = 20
+        body = "501 Not Implemented\n"
     response_status(res, status)
-    response_header(res, c"Content-Type", c"text/plain")
-    response_header(res, c"Connection", c"close")
-    response_content_length(res, body_len as i64)
+    response_header(res, "Content-Type", "text/plain")
+    response_header(res, "Connection", "close")
+    response_content_length(res, body.len)
     response_end_headers(res)
-    response_body(res, body, body_len)
+    response_body(res, body.as_bytes())
 
 
 # Body limit for request_frame: max_request_size, or the buffering ceiling
@@ -1315,7 +1235,8 @@ fn valet_next_request(task: *Task) -> i32
         if task.reset_for_recv()
             return 0
         return -12
-    memmove(@task.read_buf[0], @task.read_buf[consumed], rest as i64)
+    let read_buf: Span<u8> = @task.read_buf
+    read_buf.copy_from(read_buf.slice(consumed as i64, (consumed + rest) as i64))
     task.read_len = rest
     task.write_len = 0
     task.write_pos = 0
@@ -1332,7 +1253,7 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
     if big != null
         let room: i64 = big.cap - big.len
         if room <= 0
-            log_warn(c"Request too large, closing connection")
+            log_warn("Request too large, closing connection")
             bigbuf_release(big)
             return valet_send_413(task)
         if not task.recv_buf(Span<u8> { ptr: (big.ptr + big.len), len: (room as i32) as i64 })
@@ -1343,10 +1264,10 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
     if f.headers_end == 0
         # Headers split across reads: read the rest in behind them.
         if app.max_request_size > 0 && task.read_len > app.max_request_size
-            log_warn(c"Request too large, closing connection")
+            log_warn("Request too large, closing connection")
             return valet_send_413(task)
         if task.read_len >= VALET_READ_BUF
-            log_warn(c"Request headers exceed the read buffer")
+            log_warn("Request headers exceed the read buffer")
             return valet_send_413(task)
         if not task.recv_buf(Span<u8> { ptr: (@task.read_buf[task.read_len]), len: (VALET_READ_BUF - task.read_len) as i64 })
             return 1
@@ -1360,7 +1281,7 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
         if want > VALET_MAX_BUFFERED
             want = VALET_MAX_BUFFERED
     else if app.max_request_size > 0 && want > app.max_request_size as i64
-        log_warn(c"Request too large, closing connection")
+        log_warn("Request too large, closing connection")
         return valet_send_413(task)
     if (f.total >= 0 and want <= VALET_READ_BUF as i64) or (f.total < 0 and task.read_len < VALET_READ_BUF)
         if not task.recv_buf(Span<u8> { ptr: (@task.read_buf[task.read_len]), len: (VALET_READ_BUF - task.read_len) as i64 })
@@ -1419,13 +1340,13 @@ fn valet_conn_start_send(task: *Task, res: *Response) -> i32
 
 
 # A text/plain 500 that closes the connection.
-fn valet_res_500_close(res: *Response, body: *u8, len: i32)
+fn valet_res_500_close(res: *Response, body: StrView)
     response_status(res, 500)
-    response_header(res, c"Content-Type", c"text/plain")
-    response_header(res, c"Connection", c"close")
-    response_content_length(res, len as i64)
+    response_header(res, "Content-Type", "text/plain")
+    response_header(res, "Connection", "close")
+    response_content_length(res, body.len)
     response_end_headers(res)
-    response_body(res, body, len)
+    response_body(res, body.as_bytes())
 
 
 # Point the handler context at this request and make it current.
@@ -1433,8 +1354,7 @@ fn valet_ctx_enter(ctx: *HandlerContext, req: *Request, res: *Response, raw: *u8
     ctx.req = req
     ctx.res = res
     ctx.route_result = null
-    ctx.path = req.path_ptr
-    ctx.path_len = req.path_len
+    ctx.path = req.path
     ctx.raw_buf = raw
     ctx.raw_len = raw_len
     ctx.task = task
@@ -1534,13 +1454,13 @@ fn valet_conn_frame(task: *Task, v: *ValetReqView, added: i32) -> i32
     if total < 0
         let code: i32 = h1_frame_status(total)
         if code == 413
-            log_warn(c"Request too large, closing connection")
+            log_warn("Request too large, closing connection")
         else
-            log_warn(c"Bad request framing, closing connection")
+            log_warn("Bad request framing, closing connection")
         bigbuf_release_task(task)
         return valet_send_error(task, code)
     if app.max_request_size > 0 && total > app.max_request_size as i64
-        log_warn(c"Request too large, closing connection")
+        log_warn("Request too large, closing connection")
         bigbuf_release_task(task)
         return valet_send_413(task)
 
@@ -1561,7 +1481,7 @@ fn valet_conn_frame(task: *Task, v: *ValetReqView, added: i32) -> i32
 # cooperative-yield proxy (state PROXY_WAIT, nothing to send yet), else 0.
 fn valet_conn_run_route(task: *Task, req: *Request, res: *Response, rr: *RouteMatch) -> i32
     # Run per-route before interceptors
-    let before_result: i32 = route_run_before(rr.route, req.path_ptr, req.path_len)
+    let before_result: i32 = route_run_before(rr.route, req.path.ptr, req.path.len as i32)
     if before_result == MW_HANDLED
         # Before interceptor handled the request
         set_g_ctx(null)
@@ -1569,12 +1489,12 @@ fn valet_conn_run_route(task: *Task, req: *Request, res: *Response, rr: *RouteMa
     if before_result == MW_ERROR
         # Before interceptor error - send 500
         set_g_ctx(null)
-        valet_res_500_close(res, c"Interceptor Error\n", 18)
+        valet_res_500_close(res, "Interceptor Error\n")
         return 0
 
     # Call the matched handler
     let h: fn(*u8, i32) -> i32 = rr.handler
-    let status: i32 = h(req.path_ptr, req.path_len)
+    let status: i32 = h(req.path.ptr, req.path.len as i32)
 
     # Cooperative-yield proxy: handler armed a yield SQE and asked for
     # re-entry on CQE.  Don't send any response yet — transition to
@@ -1587,14 +1507,14 @@ fn valet_conn_run_route(task: *Task, req: *Request, res: *Response, rr: *RouteMa
         return 1
 
     # Run per-route after interceptors (in reverse order)
-    route_run_after(rr.route, req.path_ptr, req.path_len)
+    route_run_after(rr.route, req.path.ptr, req.path.len as i32)
 
     # Clear context
     set_g_ctx(null)
 
     # If handler returns non-zero and didn't write response, send 500
     if status != 0 && res.len == 0
-        valet_res_500_close(res, c"Internal Server Error\n", 22)
+        valet_res_500_close(res, "Internal Server Error\n")
     return 0
 
 
@@ -1630,7 +1550,7 @@ fn valet_conn_serve(task: *Task, v: *ValetReqView) -> i32
 
     # Check for static file request first (only for GET requests)
     if request_is_get(@req) != 0
-        if valet_try_static_raw(app, task, req.path_ptr, req.path_len, v.buf, v.len) != 0
+        if valet_try_static_raw(app, task, req.path, v.buf, v.len) != 0
             # Static file was served - check keep-alive
             return valet_conn_next_or_close(task, app)
 
@@ -1642,7 +1562,7 @@ fn valet_conn_serve(task: *Task, v: *ValetReqView) -> i32
     valet_ctx_enter(@handler_ctx, @req, @res, v.buf, v.len, task)
 
     # Run middleware pipeline
-    let mw_result: i32 = router_run_middleware(@app.router, req.path_ptr, req.path_len)
+    let mw_result: i32 = router_run_middleware(@app.router, req.path.ptr, req.path.len as i32)
     if mw_result == MW_HANDLED
         # Middleware handled the request - send response if any
         set_g_ctx(null)
@@ -1653,12 +1573,12 @@ fn valet_conn_serve(task: *Task, v: *ValetReqView) -> i32
     if mw_result == MW_ERROR
         # Middleware error - send 500
         set_g_ctx(null)
-        valet_res_500_close(@res, c"Middleware Error\n", 17)
+        valet_res_500_close(@res, "Middleware Error\n")
         return valet_conn_start_send(task, @res)
 
     # Try to match route
     var route_result: RouteMatch
-    let matched: i32 = router_match(@app.router, req.method_ptr, req.path_ptr, req.path_len, @route_result)
+    let matched: i32 = router_match(@app.router, req.method, req.path, @route_result)
 
     if matched == 1
         # Update context with route result
@@ -1854,7 +1774,7 @@ fn tls_task_recv_app(task: *Task, tls_data: *TlsTaskData) -> i32
 # Encrypt and send a 413, then close (the SEND state sees the saturated
 # request count).  Returns the handler convention.
 fn valet_tls_send_413(task: *Task, tls_data: *TlsTaskData) -> i32
-    log_warn(c"TLS request too large, closing connection")
+    log_warn("TLS request too large, closing connection")
     return valet_tls_send_error(task, tls_data, 413)
 
 # Encrypt and send a request-error response (valet_build_error), then close.
@@ -1887,7 +1807,7 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
     while tls_data.rx_len - off >= 5
         let rec_len: i64 = 5 + (((tls_data.rx[off + 3] as i64) << 8) | (tls_data.rx[off + 4] as i64))
         if rec_len > TLS_RX_CAP
-            log_warn(c"TLS record too large")
+            log_warn("TLS record too large")
             tls_task_data_free(tls_data)
             task.user_data = null
             return 1
@@ -1900,22 +1820,25 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
             off = tls_data.rx_len
             break
         if plaintext_len == TLS_SERVER_READ_ALERT
-            log_warn(c"TLS alert from client, closing connection")
+            log_warn("TLS alert from client, closing connection")
             tls_task_data_free(tls_data)
             task.user_data = null
             return 1
         if plaintext_len < 0
-            log_warn(c"TLS decrypt failed")
+            log_warn("TLS decrypt failed")
             tls_task_data_free(tls_data)
             task.user_data = null
             return 1
         off = off + rec_len
         if tls_data.req_len + plaintext_len > TLS_REQ_CAP
             return valet_tls_send_413(task, tls_data)
-        memcpy(@tls_data.req[tls_data.req_len], @plaintext[0], plaintext_len)
+        let req_buf: Span<u8> = @tls_data.req
+        let decrypted: Span<u8> = @plaintext
+        req_buf.from(tls_data.req_len).copy_from(decrypted.to(plaintext_len))
         tls_data.req_len = tls_data.req_len + plaintext_len
     if off > 0
-        memmove(@tls_data.rx[0], @tls_data.rx[off], tls_data.rx_len - off)
+        let rx: Span<u8> = @tls_data.rx
+        rx.copy_from(rx.slice(off, tls_data.rx_len))
         tls_data.rx_len = tls_data.rx_len - off
 
     let req_len: i64 = tls_data.req_len
@@ -1927,7 +1850,7 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
     if total == H1F_TOO_LARGE or f.total > TLS_REQ_CAP
         return valet_tls_send_413(task, tls_data)
     if total < 0 and total != H1F_INCOMPLETE
-        log_warn(c"TLS: bad request framing, closing connection")
+        log_warn("TLS: bad request framing, closing connection")
         return valet_tls_send_error(task, tls_data, h1_frame_status(total))
     if total == H1F_INCOMPLETE
         # The client closed (AGAST #2197 item 4): a normal hangup, and the
@@ -1951,7 +1874,7 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
 
     let parsed = request_parse(@req, @tls_data.req[0], total as i32)
     if parsed < 0
-        log_warn(c"TLS: malformed HTTP request, closing connection")
+        log_warn("TLS: malformed HTTP request, closing connection")
         tls_task_data_free(tls_data)
         task.user_data = null
         return 0
@@ -1974,39 +1897,40 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
     valet_ctx_enter(@handler_ctx, @req, @res, @tls_data.req[0], total as i32, task)
 
     # Run middleware
-    let mw_result: i32 = router_run_middleware(@app.router, req.path_ptr, req.path_len)
+    let mw_result: i32 = router_run_middleware(@app.router, req.path.ptr, req.path.len as i32)
     if mw_result != MW_CONTINUE
         set_g_ctx(null)
     else
         # Try to match route
         var route_result: RouteMatch
-        let matched: i32 = router_match(@app.router, req.method_ptr, req.path_ptr, req.path_len, @route_result)
+        let matched: i32 = router_match(@app.router, req.method, req.path, @route_result)
 
         if matched == 1
             handler_ctx.route_result = @route_result
             let h: fn(*u8, i32) -> i32 = route_result.handler
-            let status: i32 = h(req.path_ptr, req.path_len)
+            let status: i32 = h(req.path.ptr, req.path.len as i32)
             set_g_ctx(null)
             if status != 0 && res.len == 0
                 response_status(@res, 500)
-                response_header(@res, c"Content-Type", c"text/plain")
-                let body = c"Internal Server Error\n"
-                response_content_length(@res, 22)
+                response_header(@res, "Content-Type", "text/plain")
+                let body: StrView = "Internal Server Error\n"
+                response_content_length(@res, body.len)
                 response_end_headers(@res)
-                response_body(@res, body, 22)
+                response_body(@res, body.as_bytes())
         else
             set_g_ctx(null)
             response_not_found(@res)
 
     # The request is answered: drop it, keeping any pipelined bytes behind it.
     let rest: i64 = req_len - total
-    memmove(@tls_data.req[0], @tls_data.req[total], rest)
+    let req_buf: Span<u8> = @tls_data.req
+    req_buf.copy_from(req_buf.slice(total, req_len))
     tls_data.req_len = rest
 
     # Encrypt and send response
     let encrypted_len: i64 = tls_server_write(@tls_data.tls, @http_res[0], res.len as i64, @task.write_buf[0], 8192)
     if encrypted_len <= 0
-        log_error(c"TLS encrypt failed")
+        log_error("TLS encrypt failed")
         tls_task_data_free(tls_data)
         task.user_data = null
         return 1
@@ -2133,7 +2057,7 @@ fn valet_tls_feed(task: *Task, tls_data: *TlsTaskData) -> i32
     if result == TLS_RESULT_ERROR
         let tls_error: i64 = tls_server_error(@tls_data.tls) as i64
         print("[TLS] ERROR: Handshake error, tls_error={tls_error}\n")
-        log_error(c"TLS handshake error")
+        log_error("TLS handshake error")
         return valet_tls_drop(task, tls_data, 1)
 
     if result == TLS_RESULT_HAVE_OUTPUT

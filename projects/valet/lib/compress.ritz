@@ -5,17 +5,20 @@
 #
 # Usage:
 #   # In middleware or handler:
-#   let encoding: i32 = accept_encoding_parse(header_value, header_len)
+#   let encoding: i32 = accept_encoding_parse(header_value)
 #   if encoding & ENCODING_GZIP != 0
 #       # Client accepts gzip, compress response
 #
 # Integration with Valet:
-#   valet_use_named(@app, c"compression", compression_middleware)
+#   valet_use_named(@app, "compression", compression_middleware)
 #
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
+import ritzlib.str { memcpy }
 import ritzlib.memory
+import ritzlib.option
+import ritzlib.span
+import ritzlib.strview
 
 import squeeze.gzip             # Squeeze gzip compression (RFC 1952)
 import squeeze.deflate          # Raw deflate compression (RFC 1951)
@@ -69,48 +72,48 @@ pub const COMPRESS_ERR_NO_BENEFIT: i64 = 0  # Compression didn't help (returns 0
 #   - "*"
 #
 # Returns a bitmask of ENCODING_* flags.
-pub fn accept_encoding_parse(value: *u8, value_len: i32) -> i32
-    if value == null || value_len <= 0
+pub fn accept_encoding_parse(value: StrView) -> i32
+    if value.len <= 0
         return ENCODING_IDENTITY
 
     var result: i32 = 0
-    var pos: i32 = 0
+    var pos: i64 = 0
 
-    while pos < value_len
+    while pos < value.len
         # Skip leading whitespace and commas
-        while pos < value_len
-            let c: u8 = *(value + pos)
+        while pos < value.len
+            let c: u8 = value.get(pos)
             if c != ' ' && c != '\t' && c != ','
                 break
             pos = pos + 1
 
-        if pos >= value_len
+        if pos >= value.len
             break
 
         # Find end of encoding name (space, comma, semicolon, or end)
-        let start: i32 = pos
-        while pos < value_len
-            let c: u8 = *(value + pos)
+        let start: i64 = pos
+        while pos < value.len
+            let c: u8 = value.get(pos)
             if c == ' ' || c == '\t' || c == ',' || c == ';'
                 break
             pos = pos + 1
 
-        let name_len: i32 = pos - start
+        let name: StrView = value.slice(start, pos)
 
         # Check for known encodings
-        if encoding_matches(value + start, name_len, c"gzip", 4) != 0
+        if encoding_matches(name, "gzip") != 0
             result = result | ENCODING_GZIP
-        else if encoding_matches(value + start, name_len, c"deflate", 7) != 0
+        else if encoding_matches(name, "deflate") != 0
             result = result | ENCODING_DEFLATE
-        else if encoding_matches(value + start, name_len, c"identity", 8) != 0
+        else if encoding_matches(name, "identity") != 0
             result = result | ENCODING_IDENTITY
-        else if encoding_matches(value + start, name_len, c"*", 1) != 0
+        else if encoding_matches(name, "*") != 0
             # Wildcard - accept gzip and deflate
             result = result | ENCODING_GZIP | ENCODING_DEFLATE | ENCODING_IDENTITY
 
         # Skip quality value if present (;q=...)
-        if pos < value_len && *(value + pos) == ';'
-            while pos < value_len && *(value + pos) != ','
+        if pos < value.len && value.get(pos) == ';'
+            while pos < value.len && value.get(pos) != ','
                 pos = pos + 1
 
     # Default to identity if nothing specified
@@ -120,22 +123,19 @@ pub fn accept_encoding_parse(value: *u8, value_len: i32) -> i32
     return result
 
 
+fn ascii_lower(c: u8) -> u8
+    if c >= 'A' && c <= 'Z'
+        return c + 32
+    return c
+
+
 # Case-insensitive encoding name comparison
-pub fn encoding_matches(a: *u8, a_len: i32, b: *u8, b_len: i32) -> i32
-    if a_len != b_len
+pub fn encoding_matches(a: StrView, b: StrView) -> i32
+    if a.len != b.len
         return 0
 
-    for i in 0..a_len
-        var c1: u8 = *(a + i)
-        var c2: u8 = *(b + i)
-
-        # Convert to lowercase
-        if c1 >= 'A' && c1 <= 'Z'
-            c1 = c1 + 32
-        if c2 >= 'A' && c2 <= 'Z'
-            c2 = c2 + 32
-
-        if c1 != c2
+    for i in 0..a.len
+        if ascii_lower(a.get(i)) != ascii_lower(b.get(i))
             return 0
 
     return 1
@@ -182,73 +182,53 @@ pub fn encoding_select(accepted: i32) -> i32
     return ENCODING_IDENTITY
 
 
-# Get Content-Encoding header value for an encoding
-pub fn encoding_header_value(encoding: i32) -> *u8
+# Get Content-Encoding header value for an encoding (None for identity: no
+# header needed)
+pub fn encoding_header_value(encoding: i32) -> Option<StrView>
     if encoding == ENCODING_GZIP
-        return c"gzip"
+        return Some("gzip")
     if encoding == ENCODING_DEFLATE
-        return c"deflate"
-    return null  # No header needed for identity
+        return Some("deflate")
+    return None
 
 
 # Check if a MIME type should be compressed.
 # Compress text-based types, don't compress already-compressed types.
-pub fn should_compress_mime(mime_type: *u8) -> i32
-    if mime_type == null
-        return 0
-
+pub fn should_compress_mime(mime_type: StrView) -> i32
     # Compressible types (text, JSON, XML, JavaScript, CSS)
-    if str_starts_with(mime_type, c"text/") != 0
+    if mime_type.starts_with("text/")
         return 1
-    if str_starts_with(mime_type, c"application/json") != 0
+    if mime_type.starts_with("application/json")
         return 1
-    if str_starts_with(mime_type, c"application/javascript") != 0
+    if mime_type.starts_with("application/javascript")
         return 1
-    if str_starts_with(mime_type, c"application/xml") != 0
+    if mime_type.starts_with("application/xml")
         return 1
-    if str_starts_with(mime_type, c"application/xhtml") != 0
+    if mime_type.starts_with("application/xhtml")
         return 1
-    if str_starts_with(mime_type, c"image/svg") != 0
+    if mime_type.starts_with("image/svg")
         return 1
 
     # Don't compress binary, images (except SVG), video, audio, archives
     return 0
 
 
-# Helper: check if string starts with prefix
-pub fn str_starts_with(s: *u8, prefix: *u8) -> i32
-    if s == null || prefix == null
-        return 0
-
-    var i: i32 = 0
-    while *(prefix + i) != 0
-        if *(s + i) == 0
-            return 0
-        if *(s + i) != *(prefix + i)
-            return 0
-        i = i + 1
-
-    return 1
-
-
-# Compress data using gzip.
+# Compress data using gzip into `output`.
 # Returns compressed length on success, negative error code on failure.
-# Caller must provide output buffer of sufficient size.
-pub fn compress_gzip(input: *u8, input_len: i64, output: *u8, output_cap: i64) -> i64
-    return gzip_compress(input, input_len, output, output_cap)
+pub fn compress_gzip(input: Span<u8>, output: Span<u8>) -> i64
+    return gzip_compress(input.ptr, input.len, output.ptr, output.len)
 
 
 # Compress data using deflate (RFC 1951, raw deflate without gzip/zlib wrapper).
 # Returns compressed length on success, negative error code on failure.
-# Caller must provide output buffer of sufficient size.
 # Level: 0=stored, 1-3=fast, 4-6=default, 7-9=best compression.
-pub fn compress_deflate_level(input: *u8, input_len: i64, output: *u8, output_cap: i64, level: i32) -> i64
-    return deflate(input, input_len, output, output_cap, level)
+pub fn compress_deflate_level(input: Span<u8>, output: Span<u8>, level: i32) -> i64
+    return deflate(input.ptr, input.len, output.ptr, output.len, level)
 
 
 # Compress data using deflate with default compression level (6).
-pub fn compress_deflate(input: *u8, input_len: i64, output: *u8, output_cap: i64) -> i64
-    return deflate(input, input_len, output, output_cap, 6)
+pub fn compress_deflate(input: Span<u8>, output: Span<u8>) -> i64
+    return deflate(input.ptr, input.len, output.ptr, output.len, 6)
 
 
 # Compress data if beneficial.
@@ -258,9 +238,11 @@ pub fn compress_deflate(input: *u8, input_len: i64, output: *u8, output_cap: i64
 # - Returns original data if compression not beneficial
 #
 # Caller must check result.allocated and free if needed.
-pub fn compress_if_beneficial(data: *u8, data_len: i64, accepted_encodings: i32, mime_type: *u8, result: *CompressResult) -> i32
+pub fn compress_if_beneficial(data: Span<u8>, accepted_encodings: i32, mime_type: StrView, result: *CompressResult) -> i32
+    let data_len: i64 = data.len
+
     # Initialize result with original data
-    compress_result_init(result, data, data_len)
+    compress_result_init(result, data.ptr, data_len)
 
     # Select encoding (gzip preferred, then deflate)
     let selected: i32 = encoding_select(accepted_encodings)
@@ -287,9 +269,9 @@ pub fn compress_if_beneficial(data: *u8, data_len: i64, accepted_encodings: i32,
     # Compress using selected encoding
     var compressed_len: i64 = 0
     if selected == ENCODING_GZIP
-        compressed_len = gzip_compress(data, data_len, output, output_cap)
+        compressed_len = gzip_compress(data.ptr, data_len, output, output_cap)
     else if selected == ENCODING_DEFLATE
-        compressed_len = deflate(data, data_len, output, output_cap, 6)
+        compressed_len = deflate(data.ptr, data_len, output, output_cap, 6)
     else
         free(output)
         return 0  # Unknown encoding
@@ -319,9 +301,11 @@ pub fn compress_if_beneficial(data: *u8, data_len: i64, accepted_encodings: i32,
 # Caller must check result.allocated and free if needed.
 #
 # Returns: 1 if compressed, 0 if not (original data in result), -1 on error
-pub fn compress_large(data: *u8, data_len: i64, accepted_encodings: i32, mime_type: *u8, result: *CompressResult) -> i32
+pub fn compress_large(data: Span<u8>, accepted_encodings: i32, mime_type: StrView, result: *CompressResult) -> i32
+    let data_len: i64 = data.len
+
     # Initialize result with original data
-    compress_result_init(result, data, data_len)
+    compress_result_init(result, data.ptr, data_len)
 
     # Select encoding
     let selected: i32 = encoding_select(accepted_encodings)
@@ -348,9 +332,9 @@ pub fn compress_large(data: *u8, data_len: i64, accepted_encodings: i32, mime_ty
     # Compress
     var compressed_len: i64 = 0
     if selected == ENCODING_GZIP
-        compressed_len = gzip_compress(data, data_len, output, output_cap)
+        compressed_len = gzip_compress(data.ptr, data_len, output, output_cap)
     else if selected == ENCODING_DEFLATE
-        compressed_len = deflate(data, data_len, output, output_cap, 6)
+        compressed_len = deflate(data.ptr, data_len, output, output_cap, 6)
     else
         free(output)
         return 0
@@ -463,24 +447,29 @@ pub fn stream_compressor_free(sc: *StreamCompressor)
 # May or may not produce output depending on internal buffering.
 # Returns bytes written to output buffer, or negative on error.
 # Output is written to sc.compress_buf.
-pub fn stream_compressor_write(sc: *StreamCompressor, data: *u8, data_len: i64) -> i64
+pub fn stream_compressor_write(sc: *StreamCompressor, data: Span<u8>) -> i64
     if sc.compress_buf == null
         return -1
 
     if sc.encoding == ENCODING_GZIP
         if sc.gzip_writer == null
             return -1
-        return gzip_writer_write(sc.gzip_writer, data, data_len, sc.compress_buf, sc.compress_cap)
+        return gzip_writer_write(sc.gzip_writer, data.ptr, data.len, sc.compress_buf, sc.compress_cap)
     else if sc.encoding == ENCODING_DEFLATE
         if sc.zlib_writer == null
             return -1
-        return zlib_writer_write(sc.zlib_writer, data, data_len, sc.compress_buf, sc.compress_cap)
+        return zlib_writer_write(sc.zlib_writer, data.ptr, data.len, sc.compress_buf, sc.compress_cap)
     else
-        # Identity - just copy
-        if data_len > sc.compress_cap
-            return -1
-        memcpy(sc.compress_buf, data, data_len)
-        return data_len
+        return stream_copy_identity(sc, data)
+
+
+# Identity "compression": copy `data` to the output buffer.  Returns its
+# length, or -1 if it doesn't fit.
+fn stream_copy_identity(sc: *StreamCompressor, data: Span<u8>) -> i64
+    if data.len > sc.compress_cap
+        return -1
+    memcpy(sc.compress_buf, data.ptr, data.len)
+    return data.len
 
 
 # Flush pending data from the compressor.
@@ -529,20 +518,16 @@ pub fn stream_compressor_output(sc: *StreamCompressor) -> *u8
 # Legacy API: Compress a single chunk independently (deprecated).
 # For true streaming with cross-chunk compression, use:
 #   stream_compressor_write() + stream_compressor_flush() + stream_compressor_finish()
-pub fn stream_compress_chunk(sc: *StreamCompressor, data: *u8, data_len: i64) -> i64
+pub fn stream_compress_chunk(sc: *StreamCompressor, data: Span<u8>) -> i64
     if sc.compress_buf == null
         return -1
 
     if sc.encoding == ENCODING_GZIP
-        return gzip_compress(data, data_len, sc.compress_buf, sc.compress_cap)
+        return gzip_compress(data.ptr, data.len, sc.compress_buf, sc.compress_cap)
     else if sc.encoding == ENCODING_DEFLATE
-        return deflate(data, data_len, sc.compress_buf, sc.compress_cap, 6)
+        return deflate(data.ptr, data.len, sc.compress_buf, sc.compress_cap, 6)
     else
-        # Identity - just copy
-        if data_len > sc.compress_cap
-            return -1
-        memcpy(sc.compress_buf, data, data_len)
-        return data_len
+        return stream_copy_identity(sc, data)
 
 
 # Check if response needs streaming compression

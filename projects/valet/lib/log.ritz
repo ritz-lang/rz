@@ -12,7 +12,9 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
+import ritzlib.span
+import ritzlib.strview
+import ritzlib.string
 import ritzlib.fmt.digits
 import ritzlib.fd
 import ritzlib.span
@@ -172,7 +174,12 @@ pub fn format_int(buf: *u8, val: i64, width: i32) -> i32
 # Core logging functions
 # ============================================================================
 
-pub fn log_write(level: i32, level_str: *u8, msg: *u8)
+# Copy `s` into out[pos..end), as much as fits; returns the position after it.
+fn log_put(out: Span<u8>, pos: i32, end: i64, s: StrView) -> i32
+    return pos + out.slice(pos as i64, end).copy_from(s.as_bytes()) as i32
+
+
+pub fn log_write(level: i32, level_str: StrView, msg: StrView)
     if level < g_log_level
         return
 
@@ -196,10 +203,7 @@ pub fn log_write(level: i32, level_str: *u8, msg: *u8)
     pos += 1
 
     # Level string
-    let level_len: i64 = strlen(level_str)
-    for i in 0..level_len
-        buf[pos] = *(level_str + i)
-        pos += 1
+    pos = log_put(@buf, pos, 512, level_str)
 
     # Close level
     buf[pos] = ']'
@@ -207,15 +211,8 @@ pub fn log_write(level: i32, level_str: *u8, msg: *u8)
     buf[pos] = ' '
     pos += 1
 
-    # Message
-    let msg_len: i64 = strlen(msg)
-    var copy_len: i64 = msg_len
-    if pos as i64 + copy_len > 500
-        copy_len = 500 - pos as i64
-
-    for i in 0..copy_len
-        buf[pos] = *(msg + i)
-        pos += 1
+    # Message, cut to leave room for the newline
+    pos = log_put(@buf, pos, 500, msg)
 
     # Newline
     buf[pos] = '\n'
@@ -229,56 +226,51 @@ pub fn log_write(level: i32, level_str: *u8, msg: *u8)
 # Convenience logging functions
 # ============================================================================
 
-pub fn log_debug(msg: *u8)
-    log_write(LOG_DEBUG, c"DEBUG", msg)
+pub fn log_debug(msg: StrView)
+    log_write(LOG_DEBUG, "DEBUG", msg)
 
 
-pub fn log_info(msg: *u8)
-    log_write(LOG_INFO, c"INFO", msg)
+pub fn log_info(msg: StrView)
+    log_write(LOG_INFO, "INFO", msg)
 
 
-pub fn log_warn(msg: *u8)
-    log_write(LOG_WARN, c"WARN", msg)
+pub fn log_warn(msg: StrView)
+    log_write(LOG_WARN, "WARN", msg)
 
 
-pub fn log_error(msg: *u8)
-    log_write(LOG_ERROR, c"ERROR", msg)
+pub fn log_error(msg: StrView)
+    log_write(LOG_ERROR, "ERROR", msg)
 
 
 # ============================================================================
 # Formatted logging (with single integer argument)
 # ============================================================================
 
-# Write `msg` then `val` in decimal into buf, NUL-terminated. The message
+# Write `msg` then `val` in decimal into `out`, NUL-terminated. The message
 # is cut short if it would leave no room for the number and the NUL.
-# cap must be at least 21. Returns the length, NUL excluded.
-pub fn log_format_i(buf: *u8, cap: i32, msg: *u8, val: i64) -> i32
+# out.len must be at least 21. Returns the length, NUL excluded.
+pub fn log_format_i(out: Span<u8>, msg: StrView, val: i64) -> i32
     var num: [20]u8
-    let num_len: i32 = fmt_i64_into(@num[0], val) as i32
+    let num_len: i64 = fmt_i64_into(@num[0], val)
+    let digits: Span<u8> = @num
 
-    var msg_len: i64 = strlen(msg)
-    let room: i64 = (cap - num_len - 1) as i64
-    if msg_len > room
-        msg_len = room
-
-    var pos: i32 = 0
-    for i in 0..msg_len
-        *(buf + pos) = *(msg + i)
-        pos += 1
-    for i in 0..num_len
-        *(buf + pos) = num[i]
-        pos += 1
-    *(buf + pos) = 0
-    return pos
+    let room: i64 = out.len - num_len - 1
+    var pos: i64 = out.to(room).copy_from(msg.as_bytes())
+    pos += out.from(pos).copy_from(digits.to(num_len))
+    out[pos] = 0
+    return pos as i32
 
 
-pub fn log_error_i(msg: *u8, val: i64)
-    var buf: [256]u8
-    log_format_i(@buf[0], 256, msg, val)
-    log_error(@buf[0])
+# `msg` followed by `val` in decimal, as one line at `level`.
+fn log_write_i(level: i32, level_str: StrView, msg: StrView, val: i64)
+    var line: String = string_from(msg)
+    line.push_i64(val)
+    log_write(level, level_str, line.as_view())
 
 
-pub fn log_info_i(msg: *u8, val: i64)
-    var buf: [256]u8
-    log_format_i(@buf[0], 256, msg, val)
-    log_info(@buf[0])
+pub fn log_error_i(msg: StrView, val: i64)
+    log_write_i(LOG_ERROR, "ERROR", msg, val)
+
+
+pub fn log_info_i(msg: StrView, val: i64)
+    log_write_i(LOG_INFO, "INFO", msg, val)

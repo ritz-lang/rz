@@ -18,19 +18,20 @@
 #   var router: Router
 #   router_init(@router)
 #   router_use(@router, logging_middleware)  # Global middleware
-#   router_add(@router, "GET", "/", handle_index)
-#   router_add(@router, "GET", "/users/:id", handle_user)
-#   router_add(@router, "GET", "/static/*", handle_static)
-#   router_add(@router, "GET", "/files/**", handle_files)  # Catch-all
+#   router_add(@router, Some("GET"), "/", handle_index)
+#   router_add(@router, Some("GET"), "/users/:id", handle_user)
+#   router_add(@router, Some("GET"), "/static/*", handle_static)
+#   router_add(@router, Some("GET"), "/files/**", handle_files)  # Catch-all
 #
 #   var match: RouteMatch
 #   if router_match(@router, "GET", "/users/42", @match) == 1
 #       # match.handler is the handler function
-#       # match.params[0] contains "42"
+#       # route_match_param(@match, 0) is Some("42")
 
-import ritzlib.str
 import ritzlib.io
 import ritzlib.fmt
+import ritzlib.option
+import ritzlib.strview
 
 # ============================================================================
 # Constants
@@ -64,9 +65,10 @@ const ROUTER_ERR_MW_FULL: i32 = -1  # Middleware list is full
 # ============================================================================
 
 struct Route
-    method: *u8                     # HTTP method (GET, POST, etc.) or null for any
-    pattern: *u8                    # URL pattern
-    pattern_len: i32                # Length of pattern
+    method: Option<StrView>         # HTTP method (GET, POST, etc.) or None for any
+    pattern: StrView                # URL pattern, as registered
+    stem: StrView                   # What a path is matched against: the
+                                    # pattern without a trailing * or **
     route_type: i32                 # EXACT, PREFIX, or PARAM
     handler: fn(*u8, i32) -> i32    # Handler function (path, path_len) -> status
     param_count: i32                # Number of :param segments
@@ -86,8 +88,7 @@ struct RouteMatch
     handler: fn(*u8, i32) -> i32    # Matched handler
     route: *Route                   # Pointer to matched route
     param_count: i32                # Number of captured parameters
-    param_starts: [8]*u8            # Start pointers into original path
-    param_lens: [8]i32              # Lengths of captured parameters
+    params: [8]StrView              # Captured parameters, views into the path
 
 
 # ============================================================================
@@ -111,7 +112,7 @@ struct MiddlewareContext
 
 struct Middleware
     handler: fn(*u8, i32) -> i32    # Middleware function (path, path_len) -> status
-    name: *u8                       # Optional name for debugging
+    name: Option<StrView>           # Optional name for debugging
 
 
 # ============================================================================
@@ -130,12 +131,13 @@ pub fn router_init(r: *Router)
     r.count = 0
     r.mw_count = 0
     for i in 0..MAX_ROUTES
-        r.routes[i].method = null
-        r.routes[i].pattern = null
+        r.routes[i].method = None
+        r.routes[i].pattern = strview_empty()
+        r.routes[i].stem = strview_empty()
         r.routes[i].handler = null
     for i in 0..MAX_MIDDLEWARE
         r.middleware[i].handler = null
-        r.middleware[i].name = null
+        r.middleware[i].name = None
 
 
 # Add middleware to the router
@@ -145,17 +147,17 @@ pub fn router_use(r: *Router, handler: fn(*u8, i32) -> i32) -> i32
     if r.mw_count >= MAX_MIDDLEWARE
         return -1
     r.middleware[r.mw_count].handler = handler
-    r.middleware[r.mw_count].name = null
+    r.middleware[r.mw_count].name = None
     r.mw_count += 1
     return 0
 
 
 # Add named middleware (for debugging)
-pub fn router_use_named(r: *Router, name: *u8, handler: fn(*u8, i32) -> i32) -> i32
+pub fn router_use_named(r: *Router, name: StrView, handler: fn(*u8, i32) -> i32) -> i32
     if r.mw_count >= MAX_MIDDLEWARE
         return -1
     r.middleware[r.mw_count].handler = handler
-    r.middleware[r.mw_count].name = name
+    r.middleware[r.mw_count].name = Some(name)
     r.mw_count += 1
     return 0
 
@@ -174,9 +176,9 @@ pub fn router_run_middleware(r: *Router, path: *u8, path_len: i32) -> i32
     return MW_CONTINUE
 
 
-# Add a route to the router
+# Add a route to the router; `method` None matches any method
 # Returns 0 on success, -1 if router is full
-pub fn router_add(r: *Router, method: *u8, pattern: *u8, handler: fn(*u8, i32) -> i32) -> i32
+pub fn router_add(r: *Router, method: Option<StrView>, pattern: StrView, handler: fn(*u8, i32) -> i32) -> i32
     if r.count >= MAX_ROUTES
         return -1
 
@@ -185,7 +187,6 @@ pub fn router_add(r: *Router, method: *u8, pattern: *u8, handler: fn(*u8, i32) -
 
     route.method = method
     route.pattern = pattern
-    route.pattern_len = strlen(pattern) as i32
     route.handler = handler
     route.param_count = 0
     route.before_count = 0
@@ -196,20 +197,21 @@ pub fn router_add(r: *Router, method: *u8, pattern: *u8, handler: fn(*u8, i32) -
 
     # Analyze pattern to determine type and find parameters
     route.route_type = ROUTE_EXACT
+    var stem_len: i64 = pattern.len
     var pos: i32 = 0
-    while pos < route.pattern_len
-        let c: u8 = *(pattern + pos)
+    while (pos as i64) < pattern.len
+        let c: u8 = pattern.get(pos as i64)
 
         if c == '*'
             # Check for catch-all /** at end
-            if pos == route.pattern_len - 2 && *(pattern + pos + 1) == '*'
+            if pos as i64 == pattern.len - 2 && pattern.get(pos as i64 + 1) == '*'
                 route.route_type = ROUTE_CATCHALL
-                route.pattern_len -= 2  # Remove ** from matching
+                stem_len -= 2  # Remove ** from matching
                 break
             # Single * at end means prefix match
-            if pos == route.pattern_len - 1
+            if pos as i64 == pattern.len - 1
                 route.route_type = ROUTE_PREFIX
-                route.pattern_len -= 1  # Don't include * in matching
+                stem_len -= 1  # Don't include * in matching
             break
 
         if c == ':'
@@ -221,6 +223,7 @@ pub fn router_add(r: *Router, method: *u8, pattern: *u8, handler: fn(*u8, i32) -
 
         pos += 1
 
+    route.stem = pattern.take(stem_len)
     r.count += 1
     return 0
 
@@ -285,48 +288,39 @@ pub fn route_run_after(route: *Route, path: *u8, path_len: i32) -> i32
 
 
 # Match a request against registered routes
-# method/path are pointers into the request buffer (not null-terminated)
+# method/path are views into the request buffer
 # Returns 1 if match found (result populated), 0 if no match
-pub fn router_match(r: *Router, method: *u8, path: *u8, path_len: i32, result: *RouteMatch) -> i32
-    # Calculate method length by finding space or assuming common methods
-    var method_len: i32 = 0
-    while *(method + method_len) != ' ' && *(method + method_len) != 0 && method_len < 10
-        method_len += 1
-
+pub fn router_match(r: *Router, method: StrView, path: StrView, result: *RouteMatch) -> i32
     for i in 0..r.count
         let route: *Route = @r.routes[i]
 
-        # Check method (null means any method)
-        if route.method != null
-            let route_method_len: i32 = strlen(route.method) as i32
-            if method_len != route_method_len
-                continue
-            if not strneq(method, route.method, method_len as i64)
-                continue
+        # Check method (None means any method)
+        if not route_method_matches(route, method)
+            continue
 
         # Try to match based on route type
         if route.route_type == ROUTE_EXACT
-            if route_match_exact(route, path, path_len) == 1
+            if route_match_exact(route, path) == 1
                 result.handler = route.handler
                 result.route = route
                 result.param_count = 0
                 return 1
         else
             if route.route_type == ROUTE_PREFIX
-                if route_match_prefix(route, path, path_len) == 1
+                if route_match_prefix(route, path) == 1
                     result.handler = route.handler
                     result.route = route
                     result.param_count = 0
                     return 1
             else
                 if route.route_type == ROUTE_CATCHALL
-                    if route_match_catchall(route, path, path_len, result) == 1
+                    if route_match_catchall(route, path, result) == 1
                         result.handler = route.handler
                         result.route = route
                         return 1
                 else
                     if route.route_type == ROUTE_PARAM
-                        if route_match_params(route, path, path_len, result) == 1
+                        if route_match_params(route, path, result) == 1
                             result.handler = route.handler
                             result.route = route
                             return 1
@@ -338,28 +332,21 @@ pub fn router_match(r: *Router, method: *u8, path: *u8, path_len: i32, result: *
 # Internal matching functions
 # ============================================================================
 
+# The route takes `method`: it names it, or takes any (None)
+fn route_method_matches(route: *Route, method: StrView) -> bool
+    match route.method
+        Some(m) => m.eq(method)
+        None => true
+
+
 # Exact match: pattern must equal path exactly
-pub fn route_match_exact(route: *Route, path: *u8, path_len: i32) -> i32
-    if route.pattern_len != path_len
-        return 0
-
-    for i in 0..path_len
-        if *(route.pattern + i) != *(path + i)
-            return 0
-
-    return 1
+pub fn route_match_exact(route: *Route, path: StrView) -> i32
+    return route.stem.eq(path) as i32
 
 
 # Prefix match: path must start with pattern (minus trailing *)
-pub fn route_match_prefix(route: *Route, path: *u8, path_len: i32) -> i32
-    if path_len < route.pattern_len
-        return 0
-
-    for i in 0..route.pattern_len
-        if *(route.pattern + i) != *(path + i)
-            return 0
-
-    return 1
+pub fn route_match_prefix(route: *Route, path: StrView) -> i32
+    return path.starts_with(route.stem) as i32
 
 
 # Catch-all match: pattern/** matches everything after the prefix
@@ -368,39 +355,25 @@ pub fn route_match_prefix(route: *Route, path: *u8, path_len: i32) -> i32
 # Path:    /files/foo/bar/baz  -> captures "foo/bar/baz"
 # Path:    /files/             -> captures ""
 # Path:    /files              -> captures "" (exact prefix match also allowed)
-pub fn route_match_catchall(route: *Route, path: *u8, path_len: i32, result: *RouteMatch) -> i32
+pub fn route_match_catchall(route: *Route, path: StrView, result: *RouteMatch) -> i32
+    let stem: StrView = route.stem
     # Handle exact prefix match (e.g., "/api" matches "/api/**")
-    # We need to check if path matches prefix without trailing slash
-    var prefix_len: i32 = route.pattern_len
     # If pattern ends with '/', also allow matching without it
-    if prefix_len > 0 && *(route.pattern + prefix_len - 1) == '/'
-        # Pattern has trailing slash, check without it too
-        if path_len == prefix_len - 1
-            for i in 0..(prefix_len - 1)
-                if *(route.pattern + i) != *(path + i)
-                    return 0
-            # Exact match without trailing slash
-            result.param_count = 1
-            result.param_starts[0] = path + path_len  # Empty remainder
-            result.param_lens[0] = 0
-            return 1
+    if stem.ends_with("/") && path.len == stem.len - 1
+        if not stem.starts_with(path)
+            return 0
+        # Exact match without trailing slash
+        result.param_count = 1
+        result.params[0] = path.skip(path.len)  # Empty remainder
+        return 1
 
-    # Path must be at least as long as the prefix
-    if path_len < route.pattern_len
+    # Path must start with the prefix
+    if not path.starts_with(stem)
         return 0
 
-    # Check that prefix matches
-    for i in 0..route.pattern_len
-        if *(route.pattern + i) != *(path + i)
-            return 0
-
     # Capture the remainder of the path as param[0]
-    let remainder_start: i32 = route.pattern_len
-    let remainder_len: i32 = path_len - route.pattern_len
-
     result.param_count = 1
-    result.param_starts[0] = path + remainder_start
-    result.param_lens[0] = remainder_len
+    result.params[0] = path.skip(stem.len)
 
     return 1
 
@@ -409,47 +382,46 @@ pub fn route_match_catchall(route: *Route, path: *u8, path_len: i32, result: *Ro
 # Pattern: /users/:id/posts/:post_id
 # Path:    /users/42/posts/100
 # Captures: ["42", "100"]
-pub fn route_match_params(route: *Route, path: *u8, path_len: i32, result: *RouteMatch) -> i32
-    var pat_pos: i32 = 0
-    var path_pos: i32 = 0
+pub fn route_match_params(route: *Route, path: StrView, result: *RouteMatch) -> i32
+    let pattern: StrView = route.stem
+    var pat_pos: i64 = 0
+    var path_pos: i64 = 0
     var param_idx: i32 = 0
 
     result.param_count = 0
 
-    while pat_pos < route.pattern_len && path_pos < path_len
-        let pat_c: u8 = *(route.pattern + pat_pos)
+    while pat_pos < pattern.len && path_pos < path.len
+        let pat_c: u8 = pattern.get(pat_pos)
 
         if pat_c == ':'
             # Start of parameter - skip param name in pattern
             pat_pos += 1
-            while pat_pos < route.pattern_len
-                let c: u8 = *(route.pattern + pat_pos)
-                if c == '/'
+            while pat_pos < pattern.len
+                if pattern.get(pat_pos) == '/'
                     break
                 pat_pos += 1
 
             # Capture value from path until next '/' or end
-            let value_start: i32 = path_pos
-            while path_pos < path_len
-                if *(path + path_pos) == '/'
+            let value_start: i64 = path_pos
+            while path_pos < path.len
+                if path.get(path_pos) == '/'
                     break
                 path_pos += 1
 
             # Store captured parameter
             if param_idx < MAX_PARAMS
-                result.param_starts[param_idx] = path + value_start
-                result.param_lens[param_idx] = path_pos - value_start
+                result.params[param_idx] = path.slice(value_start, path_pos)
                 param_idx += 1
                 result.param_count = param_idx
         else
             # Literal character must match
-            if *(path + path_pos) != pat_c
+            if path.get(path_pos) != pat_c
                 return 0
             pat_pos += 1
             path_pos += 1
 
     # Both must be fully consumed (or pattern ends with param that consumed rest)
-    if pat_pos == route.pattern_len && path_pos == path_len
+    if pat_pos == pattern.len && path_pos == path.len
         return 1
 
     return 0
@@ -459,22 +431,12 @@ pub fn route_match_params(route: *Route, path: *u8, path_len: i32, result: *Rout
 # Helper: Get captured parameter by index
 # ============================================================================
 
-# Copy captured parameter to a buffer
-# Returns length copied, or -1 if index out of range
-pub fn route_match_get_param(result: *RouteMatch, idx: i32, buf: *u8, buf_len: i32) -> i32
+# Captured parameter `idx`, a view into the matched path, or None if the
+# index is out of range
+pub fn route_match_param(result: *RouteMatch, idx: i32) -> Option<StrView>
     if idx < 0 || idx >= result.param_count
-        return -1
-
-    let len: i32 = result.param_lens[idx]
-    if len >= buf_len
-        return -1  # Buffer too small
-
-    let src: *u8 = result.param_starts[idx]
-    for i in 0..len
-        *(buf + i) = *(src + i)
-    *(buf + len) = 0  # Null terminate
-
-    return len
+        return None
+    return Some(result.params[idx])
 
 
 # ============================================================================
@@ -490,10 +452,9 @@ pub fn router_debug(r: *Router)
         for i in 0..r.mw_count
             let mw: *Middleware = @r.middleware[i]
             print("    [{i}] ")
-            if mw.name != null
-                print("{mw.name}")
-            else
-                print("(anonymous)")
+            match mw.name
+                Some(name) => print("{name}")
+                None => print("(anonymous)")
             print("\n")
 
     # Print routes
@@ -501,11 +462,11 @@ pub fn router_debug(r: *Router)
     for i in 0..r.count
         let route: *Route = @r.routes[i]
         print("    [{i}] ")
-        if route.method != null
-            print("{route.method}")
-        else
-            print("*")
-        print(" {route.pattern} (")
+        match route.method
+            Some(m) => print("{m}")
+            None => print("*")
+        let pattern: StrView = route.pattern
+        print(" {pattern} (")
         if route.route_type == ROUTE_EXACT
             print("exact")
         else
