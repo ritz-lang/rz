@@ -834,6 +834,25 @@ def test_the_harness_audit_covers_the_reject_parity_pytest_run():
     assert ritz0_scope.audit(REAL, ritz0_scope.HARNESS, log) == []
 
 
+def test_the_harness_audit_covers_conftests_cas_and_nospawn_list(real_scopes):
+    """The exact trace shape CI rejected at a53766b0 (AGAST #4676): the
+    harness's pytest run loads ritz0/conftest.py, which loads cas.py by file
+    location (not an import, so the import test cannot see it) and reads
+    spawn_guard's allowlist harness/integration_without_spawn.txt (#4627).
+    Both are inputs: a change to either runs the harness."""
+    log = _trace(
+        REAL,
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0>, "../cas.py", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/cas.py>',
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0/harness>, "integration_without_spawn.txt", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/ritz0/harness/integration_without_spawn.txt>',
+    )
+    assert ritz0_scope.audit(REAL, ritz0_scope.HARNESS, log) == []
+    assert ritz0_scope.audit(REAL, ritz0_scope.REGRESSION, log) == []
+    for rel in ("projects/ritz/cas.py",
+                "projects/ritz/ritz0/harness/integration_without_spawn.txt"):
+        for step in (ritz0_scope.HARNESS, ritz0_scope.REGRESSION):
+            assert _real(step, "M", rel, real_scopes) is None, (step.name, rel)
+
+
 def test_the_harness_glob_is_in_its_read_set(real_scopes):
     mk = (REAL / "projects/ritz/Makefile").read_text()
     assert "scripts/test-regression-*.sh" in mk

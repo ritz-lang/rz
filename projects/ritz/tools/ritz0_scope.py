@@ -189,6 +189,8 @@ HARNESS = Step(
            "projects/ritz/examples/",
            "projects/ritz/Makefile",
            "projects/ritz/cache.py",
+           # conftest.py loads cas.py by file location (AGAST #4676).
+           "projects/ritz/cas.py",
            "projects/ritz/tools/known_failures.py",
            "projects/ritz/tools/ritz0_scope.py",
            "projects/ritz/ritz0/compiler_identity.py",
@@ -198,6 +200,8 @@ HARNESS = Step(
            "projects/ritz/ritz0/read_guard.py",
            "projects/ritz/ritz0/harness/batching.py",
            "projects/ritz/ritz0/harness/fast_link.py",
+           # spawn_guard's allowlist, read by conftest.py (#4627, #4676).
+           "projects/ritz/ritz0/harness/integration_without_spawn.txt",
            "projects/ritz/ritz0/harness/ritz0_inproc.py",
            "projects/ritz/ritz0/harness/refusal_capture.py",
            "projects/ritz/ritz0/harness/spawn_guard.py",
