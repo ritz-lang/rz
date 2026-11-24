@@ -56,6 +56,8 @@
 # The per-CPU areas themselves: index * PERCPU_SIZE. .bss, zeroed at boot.
 .section .bss
 .align 64
+.global percpu_areas
+.global percpu_areas_end
 percpu_areas:
     .space PERCPU_SIZE * PERCPU_SLOTS
 percpu_areas_end:
@@ -675,3 +677,33 @@ smp_test_resume_bsp:
     xorl %eax, %eax
     ret
 .size smp_test_resume_bsp, . - smp_test_resume_bsp
+
+# uint64 sysret_ring0_iret_probe(u64 user_rip, u64 user_rsp): drive #4610's
+# ring-0 fixup on any CPU (AGAST #4612). The non-canonical exit #GPs in ring
+# 0 only where the IRETQ checks the RIP (KVM, real hardware); TCG loads it
+# and faults on the fetch in ring 3. This IRETQs from syscall_exit_iret,
+# with the exit's GS state (the user's), to a ring-3 frame with a null SS,
+# which #GPs in ring 0 on every x86-64: the #GP stub must swap GS back for a
+# fault at syscall_exit_iret and exceptions.ritz must take it as the user's
+# fault. Its catcher (arch/x86_64/sysret_catch.ritz, armed by the caller)
+# resumes here through smp_test_resume_bsp, like smp_test_enter_user. It
+# jumps past the exit's syscall_iret_exits count.
+.global sysret_ring0_iret_probe
+.type sysret_ring0_iret_probe, @function
+sysret_ring0_iret_probe:
+    pushq %rbp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, smp_test_bsp_rsp(%rip)
+    cli
+    pushq $0                     # SS: null, with a ring-3 CS: #GP(0) in ring 0
+    pushq %rsi                   # RSP
+    pushq $2                     # RFLAGS: IF=0
+    pushq $USER_CS
+    pushq %rdi                   # RIP
+    swapgs                       # the exit's GS: the user's
+    jmp syscall_exit_iret
+.size sysret_ring0_iret_probe, . - sysret_ring0_iret_probe

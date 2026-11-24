@@ -629,8 +629,10 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/valet/test/test_static_conn.sh",
         "bash projects/valet/test/test_cli.sh",
         "python3 projects/ritz/tools/smoke_stack",
+        # The tier1 step ends with its KVM boot (#4612; SKIP, exit 0, without
+        # /dev/kvm; exit 3 only for the same missing tools).
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
-        "bash projects/harland/tools/test_tier1_boot.sh",
+        "bash projects/harland/tools/test_tier1_boot.sh kvm",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs/inventory" '
         "bash projects/harland/inventory/test.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '

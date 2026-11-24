@@ -78,6 +78,80 @@ gdt_flush:
 .endm
 
 # ============================================================================
+# Paranoid entry: NMI and #MC decide by GS_BASE, not CS (AGAST #4612)
+# ============================================================================
+# An NMI or #MC is not masked by IF, so it can land where the CPU is in ring
+# 0 with the user's GS: between an exit's swapgs and its sysretq/iretq
+# (syscall_entry.s, jump_to_userspace, the ISR exits below) or between
+# SYSCALL and syscall_entry's first swapgs. The frame's CS is the kernel's
+# there, so SWAPGS_IF_USER would not swap and the handler would run on the
+# user's GS_BASE. Like Linux's paranoid_entry, these read MSR_GS_BASE: a
+# value that is not one of syscall_entry.s's percpu_areas is the user's, so
+# swapgs, and note it in %ebx (callee-saved: exception_handler keeps it) to
+# swap back on exit. Both run on IST1.
+.set MSR_GS_BASE, 0xC0000101
+
+.macro ISR_PARANOID num
+.global isr_stub_\num
+isr_stub_\num:
+    pushq $0
+    pushq $\num
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movl $MSR_GS_BASE, %ecx
+    rdmsr
+    shlq $32, %rdx
+    orq %rax, %rdx               # RDX = GS_BASE
+    xorl %ebx, %ebx              # no swap on exit
+    leaq percpu_areas(%rip), %rax
+    cmpq %rax, %rdx
+    jb 1f
+    leaq percpu_areas_end(%rip), %rax
+    cmpq %rax, %rdx
+    jb 2f                        # already this CPU's area
+1:
+    swapgs
+    movl $1, %ebx
+2:
+    movq %rsp, %rdi
+    call exception_handler
+    testl %ebx, %ebx
+    jz 3f
+    swapgs                       # back to the GS it interrupted
+3:
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+    addq $16, %rsp
+    iretq
+.endm
+
+# ============================================================================
 # Common ISR Handler
 # ============================================================================
 
@@ -254,7 +328,7 @@ irq_stub_\num:
 # Exceptions WITHOUT error code
 ISR_NOERR 0     # Divide Error
 ISR_NOERR 1     # Debug
-ISR_NOERR 2     # NMI
+ISR_PARANOID 2  # NMI (paranoid: GS by MSR, AGAST #4612)
 ISR_NOERR 3     # Breakpoint
 ISR_NOERR 4     # Overflow
 ISR_NOERR 5     # Bound Range Exceeded
@@ -270,7 +344,7 @@ ISR_ERR   14    # Page Fault (has error code)
 ISR_NOERR 15    # Reserved
 ISR_NOERR 16    # x87 Floating-Point Exception
 ISR_ERR   17    # Alignment Check (has error code)
-ISR_NOERR 18    # Machine Check
+ISR_PARANOID 18 # Machine Check (paranoid)
 ISR_NOERR 19    # SIMD Floating-Point Exception
 ISR_NOERR 20    # Virtualization Exception
 ISR_ERR   21    # Control Protection Exception (has error code)
@@ -417,3 +491,68 @@ irq_stub_timer:
     pushq %r14
     pushq %r15
     jmp irq_common
+
+# ============================================================================
+# The "nmi-gs" boot self-test's probe (AGAST #4612)
+# ============================================================================
+# u64 nmi_gs_probe(u64 icr_lo, u64 apic_id): sit in ring 0 on the user's GS
+# (swapgs, as every exit does just before its sysretq/iretq), send this CPU
+# an NMI and wait for its handler (arch/x86_64/nmi_probe.ritz, through the
+# paranoid entry above) to call nmi_probe_mark. Returns GS_BASE as the NMI's
+# exit left it (the user's, if the paranoid exit swapped back), then swaps
+# back to this CPU's area. icr_lo is the xAPIC ICR's mapped low word, or 0
+# in x2APIC mode (the ICR is then MSR 0x830). Interrupts stay off; an NMI
+# ignores IF.
+.set X2APIC_ICR_MSR, 0x830
+.set ICR_NMI_ASSERT, 0x4400           # delivery mode NMI, level assert
+.set NMI_PROBE_SPIN, 50000000
+
+.section .bss
+.align 4
+nmi_probe_hit:
+    .long 0
+.section .text
+
+.global nmi_probe_mark
+.type nmi_probe_mark, @function
+nmi_probe_mark:
+    movl $1, nmi_probe_hit(%rip)
+    ret
+.size nmi_probe_mark, . - nmi_probe_mark
+
+.global nmi_gs_probe
+.type nmi_gs_probe, @function
+nmi_gs_probe:
+    pushfq
+    cli
+    movl $0, nmi_probe_hit(%rip)
+    movq %rsi, %r8                    # destination: this CPU's APIC ID
+    swapgs                            # GS = the user's, in ring 0
+    movl $ICR_NMI_ASSERT, %eax
+    testq %rdi, %rdi
+    jnz 1f
+    movl %r8d, %edx                   # x2APIC: destination in ICR[63:32]
+    movl $X2APIC_ICR_MSR, %ecx
+    wrmsr
+    jmp 2f
+1:
+    shll $24, %r8d                    # xAPIC: destination in ICR_HI[31:24]
+    movl %r8d, 0x10(%rdi)
+    movl %eax, (%rdi)                 # writing ICR_LO sends it
+2:
+    movl $NMI_PROBE_SPIN, %ecx
+3:
+    cmpl $0, nmi_probe_hit(%rip)
+    jne 4f
+    pause
+    decl %ecx
+    jnz 3b
+4:
+    movl $MSR_GS_BASE, %ecx
+    rdmsr
+    shlq $32, %rdx
+    orq %rdx, %rax                    # GS_BASE after the NMI
+    swapgs                            # back to this CPU's area
+    popfq
+    ret
+.size nmi_gs_probe, . - nmi_gs_probe

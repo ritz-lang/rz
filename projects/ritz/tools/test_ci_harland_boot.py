@@ -213,7 +213,7 @@ PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
 BOOT_TESTS = (
     "vmm", "higher-half", "heap", "ipc", "channel-close", "channel-debug-print",
     "munmap", "mmap-failure", "pmm-above-4g", "mmap-overlap", "mmap-cursor",
-    "elf-loader", "sysret", "virtio-blk-read",
+    "elf-loader", "sysret", "nmi-gs", "virtio-blk-read",
 )
 BOOT_TEST_OK = "".join(f"[boot-test] PASS {t}\n" for t in BOOT_TESTS) + (
     f"[boot-test] {len(BOOT_TESTS)} passed, 0 failed\n"

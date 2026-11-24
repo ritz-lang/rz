@@ -55,7 +55,14 @@
 # qemu-system-x86_64, OVMF, grub-mkstandalone (x86_64-efi) and python3.
 # mtools, mkfs.vfat and xorriso are not needed.
 #
-# Usage: tools/test_tier1_boot.sh [native|grub|all]   (default: all)
+# Usage: tools/test_tier1_boot.sh [native|grub|kvm|all]   (default: all)
+#        kvm: only the native ESP, under KVM (-accel kvm -cpu host). It
+#             requires the "sysret" self-test's non-canonical return RIP to
+#             fault in ring 0 ("... CS 8"): only an IRETQ that checks the RIP
+#             (KVM, hardware) takes #4610's syscall_exit_iret fixup, and TCG
+#             never does (AGAST #4612). Skipped (exit 0, "SKIP (kvm): <why>")
+#             where /dev/kvm is absent, can't be opened read-write, or QEMU's
+#             KVM accelerator fails to start; never part of `all`.
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_STALL=N   fail a boot whose serial log is idle N seconds (default 90;
 #                       OVMF + GRUB print nothing for 20 s at a tenth of a core)
@@ -103,7 +110,7 @@ MODE="${1:-all}"
 EXIT_SETUP=3
 setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
 
-case "$MODE" in native|grub|all) ;; *) echo "usage: $0 [native|grub|all]" >&2; exit 2 ;; esac
+case "$MODE" in native|grub|kvm|all) ;; *) echo "usage: $0 [native|grub|kvm|all]" >&2; exit 2 ;; esac
 COMPILER="${COMPILER:-}"
 case "$COMPILER" in
     ""|ritz0|ritz1|ritz1_selfhosted) ;;
@@ -111,6 +118,22 @@ case "$COMPILER" in
 esac
 
 command -v qemu-system-x86_64 >/dev/null || setup_error "qemu-system-x86_64 not found"
+# kvm mode runs only where KVM really works, and SKIPs (exit 0, saying why)
+# elsewhere. [ -r ] / [ -w ] are not enough: as root in a user namespace they
+# pass on a /dev/kvm owned by an unmapped nobody:nogroup that open() refuses
+# (WSL2's gate, AGAST #4612), and that boot printed nothing. So really open the
+# device read-write, then have QEMU itself bring up its KVM accelerator.
+# KVM_DEV overrides the device path for the tests. Past this point a boot that
+# fails under working KVM is a FAIL like any other.
+skip_kvm() { echo "SKIP (kvm): $*; the KVM boot did not run"; exit 0; }
+if [ "$MODE" = kvm ]; then
+    KVM_DEV="${KVM_DEV:-/dev/kvm}"
+    [ -e "$KVM_DEV" ] || skip_kvm "$KVM_DEV is absent"
+    ( exec 3<>"$KVM_DEV" ) 2>/dev/null || skip_kvm "$KVM_DEV can't be opened read-write"
+    kvm_probe=$(printf 'quit\n' | timeout 60 qemu-system-x86_64 -accel kvm -machine none \
+        -display none -nodefaults -monitor stdio 2>&1 >/dev/null) \
+        || skip_kvm "QEMU's KVM accelerator failed to start ($(printf '%s' "$kvm_probe" | tr '\n' ' ' | cut -c1-200))"
+fi
 # Each boot writes a qcow2 overlay; without qemu-img that read as a boot
 # that never reported a verdict (a FAIL) rather than a missing tool.
 command -v qemu-img >/dev/null || setup_error "qemu-img not found (qemu-utils)"
@@ -217,7 +240,7 @@ boot() {
     qemu-img create -q -f qcow2 -F qcow2 -b "$WORK/initramfs.qcow2" "$WORK/$name-initramfs.qcow2"
     # The loop below enforces $TIMEOUT; this one only backs it up, late enough
     # that a hung guest's monitor is still there to report on.
-    timeout "$((TIMEOUT + 30))" qemu-system-x86_64 -cpu Haswell-v1 -smp "$SMP" -m "$MEM" \
+    timeout "$((TIMEOUT + 30))" qemu-system-x86_64 -cpu "${QEMU_CPU:-Haswell-v1}" -smp "$SMP" -m "$MEM" \
         -display none -no-reboot -monitor "unix:$SOCK_DIR/$name-mon.sock,server,nowait" \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$esp" \
@@ -391,7 +414,7 @@ PY
 # The kernel self-tests every boot-test boot must pass (postinit.ritz's
 # boot_self_tests). channel-close and channel-debug-print were skipped as
 # page faults until AGAST #1887; the gate now requires both.
-BOOT_TESTS="vmm higher-half heap ipc channel-close channel-debug-print munmap mmap-failure pmm-above-4g mmap-overlap mmap-cursor elf-loader sysret virtio-blk-read"
+BOOT_TESTS="vmm higher-half heap ipc channel-close channel-debug-print munmap mmap-failure pmm-above-4g mmap-overlap mmap-cursor elf-loader sysret nmi-gs virtio-blk-read"
 
 # boot_tests_passed NAME: pass only if the kernel's boot-test summary is in
 # the log (before any ring dump, which repeats it) with 0 failed, no test logged FAIL, and every BOOT_TESTS name
@@ -666,6 +689,20 @@ smp_stacks() {
     fi
 }
 
+# sysret_ring0 NAME: pass only if the "sysret" self-test's non-canonical
+# return RIP faulted in ring 0 at syscall_exit_iret (CS 8), the path #4610's
+# fixup covers and TCG never takes (AGAST #4612).
+sysret_ring0() {
+    local line
+    line="$(grep -a '^\[sysret\] SYSRETQ fast path OK' "$WORK/$1.log" | head -1 | tr -d '\r')"
+    if printf '%s\n' "$line" | grep -qE ' CS 8$'; then
+        echo "PASS ($1): the non-canonical syscall return faulted in ring 0 and was the user's: $line"
+    else
+        echo "FAIL ($1): no ring-0 (CS 8) verdict from the sysret self-test (got: ${line:-none})"
+        return 1
+    fi
+}
+
 rc=0
 HIGH_MEM=0
 [ "$(mem_mib "$MEM")" -gt 4096 ] 2>/dev/null && HIGH_MEM=1
@@ -676,6 +713,22 @@ if [ "$MODE" != grub ]; then
     cp "$KERNEL_ELF" "$WORK/esp-native/harland/kernel.elf"
     : > "$WORK/esp-native/harland/klog-dump"
     : > "$WORK/esp-native/harland/boot-test"
+fi
+
+if [ "$MODE" = kvm ]; then
+    # The native ESP under KVM (AGAST #4612): the boot self-tests, with the
+    # non-canonical return RIP's fault taken in ring 0 at syscall_exit_iret.
+    QEMU_CPU=host boot kvm "$WORK/esp-native" ",disable-legacy=on,queue-size=1024" \
+        -accel kvm \
+        -drive "driver=null-co,size=1M,read-zeroes=on,latency-ns=100000000,if=none,id=persist" \
+        -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1
+    boot_tests_passed kvm || rc=1
+    sysret_ring0 kvm || rc=1
+    no_exception kvm || rc=1
+    exit $rc
+fi
+
+if [ "$MODE" != grub ]; then
     boot native "$WORK/esp-native" ",disable-legacy=on,queue-size=1024" \
         -drive "driver=null-co,size=1M,read-zeroes=on,latency-ns=100000000,if=none,id=persist" \
         -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1

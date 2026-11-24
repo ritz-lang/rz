@@ -1,0 +1,89 @@
+# The "nmi-gs" boot self-test (AGAST #4612)
+#
+# An NMI (or #MC) can arrive while the CPU is in ring 0 on the user's GS:
+# between an exit's swapgs and its sysretq/iretq, or between SYSCALL and
+# syscall_entry's first swapgs. isr_stubs.s's paranoid entry decides by
+# MSR_GS_BASE, not the frame's CS, so the handler runs on this CPU's area
+# and the exit puts the user's GS back. This proves both halves: isr_stubs.s
+# nmi_gs_probe swapgs's to a recognisable user GS, sends this CPU an NMI and
+# waits; the handler (exception_handler, first thing) records GS_BASE here.
+#
+# A leaf module so exceptions.ritz can call it: postinit.ritz passes the
+# LAPIC's ICR (apic.ritz lapic_icr_lo_mmio, 0 in x2APIC mode) and APIC ID.
+
+import io { memory_barrier, rdmsr, wrmsr }
+import klog { klog, klog_hex }
+
+extern fn nmi_gs_probe(icr_lo: u64, apic_id: u64) -> u64
+extern fn nmi_probe_mark()
+
+const GS_BASE_MSR: u32 = 0xC0000101
+const KERNEL_GS_BASE_MSR: u32 = 0xC0000102
+
+# The user's GS during the probe: canonical, in the user half, and neither 0
+# nor a kernel address, so a swap that went the wrong way can't pass.
+const USER_GS_SENTINEL: u64 = 0x00005A5A00000000
+
+var nmi_probe_armed: bool = false
+var nmi_probe_seen: bool = false
+var nmi_probe_gs: u64 = 0
+var nmi_probe_cs: u64 = 0
+
+# An NMI while the probe is armed: record the GS_BASE its handler runs on and
+# let it return. False, doing nothing, when not armed.
+pub fn nmi_probe_catch(cs: u64) -> bool
+    if not nmi_probe_armed
+        return false
+    nmi_probe_armed = false
+    nmi_probe_gs = rdmsr(GS_BASE_MSR)
+    nmi_probe_cs = cs
+    nmi_probe_seen = true
+    memory_barrier()
+    nmi_probe_mark()
+    return true
+
+fn nmi_gs_fail(why: StrView) -> bool
+    klog("[nmi-gs] FAILED: ")
+    klog(why)
+    klog("\n")
+    return false
+
+pub fn nmi_gs_selftest(x2apic: bool, icr: u64, apic_id: u32) -> bool
+    if not x2apic and icr == 0
+        return nmi_gs_fail("no LAPIC to send the NMI from")
+    let area: u64 = rdmsr(GS_BASE_MSR)
+    # In the kernel KERNEL_GS_BASE holds the user's GS (percpu.ritz): give it
+    # the sentinel for the probe, and 0 back after.
+    wrmsr(KERNEL_GS_BASE_MSR, USER_GS_SENTINEL)
+    nmi_probe_seen = false
+    nmi_probe_gs = 0
+    nmi_probe_cs = 0
+    memory_barrier()
+    nmi_probe_armed = true
+    let gs_after_nmi: u64 = nmi_gs_probe(icr, apic_id as u64)
+    nmi_probe_armed = false
+    let gs_end: u64 = rdmsr(GS_BASE_MSR)
+    wrmsr(KERNEL_GS_BASE_MSR, 0)
+
+    if not nmi_probe_seen
+        return nmi_gs_fail("the NMI never arrived")
+    if (nmi_probe_cs & 3) != 0
+        return nmi_gs_fail("the NMI came from ring 3")
+    if nmi_probe_gs != area
+        klog("[nmi-gs] handler GS_BASE ")
+        klog_hex(nmi_probe_gs)
+        klog("\n")
+        return nmi_gs_fail("the NMI handler ran on the user's GS")
+    if gs_after_nmi != USER_GS_SENTINEL
+        klog("[nmi-gs] GS_BASE after the NMI ")
+        klog_hex(gs_after_nmi)
+        klog("\n")
+        return nmi_gs_fail("the NMI's exit did not restore the user's GS")
+    if gs_end != area
+        return nmi_gs_fail("GS is not back on this CPU's area")
+    klog("[nmi-gs] NMI in ring 0 on the user's GS ran on GS_BASE ")
+    klog_hex(nmi_probe_gs)
+    klog("; its exit restored the user's GS ")
+    klog_hex(gs_after_nmi)
+    klog("\n")
+    return true

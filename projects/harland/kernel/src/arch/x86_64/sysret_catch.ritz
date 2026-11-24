@@ -10,9 +10,16 @@
 #
 # A leaf module so exceptions.ritz can call it without importing cpu_smp.
 
-import io { memory_barrier }
+import io { memory_barrier, rdmsr, interrupts_enabled, enable_interrupts }
+import klog { klog, klog_dec, klog_hex }
 
 extern fn smp_test_resume_bsp() -> u64
+extern fn sysret_ring0_iret_probe(user_rip: u64, user_rsp: u64) -> u64
+extern fn syscall_exit_iret()
+
+const GS_BASE_MSR: u32 = 0xC0000101
+const KERNEL_CS: u64 = 0x08
+const GP_VECTOR: u64 = 13
 
 var sysret_armed: u32 = 0
 var sysret_caught: u32 = 0
@@ -56,4 +63,49 @@ pub fn sysret_selftest_catch(vector: u64, rip: u64, cs: u64) -> bool
     sysret_caught = 1
     memory_barrier()
     smp_test_resume_bsp()
+    return true
+
+fn ring0_fail(why: StrView) -> bool
+    klog("[sysret] FAILED: ")
+    klog(why)
+    klog("\n")
+    return false
+
+# #4610's ring-0 fixup on any CPU (AGAST #4612). A #GP on syscall_exit_iret
+# comes with the kernel's CS after the exit's swapgs: the #GP stub must put
+# this CPU's area back in GS and exceptions.ritz must take it as the user's
+# fault. The real case (a non-canonical return RIP) only faults there under
+# KVM or on hardware, so syscall_entry.s sysret_ring0_iret_probe makes the
+# same IRETQ fault in ring 0 with a null SS, which every CPU checks before
+# leaving ring 0, TCG included.
+pub fn sysret_ring0_selftest() -> bool
+    let area: u64 = rdmsr(GS_BASE_MSR)
+    let had_if: bool = interrupts_enabled()
+    sysret_catch_arm()
+    sysret_ring0_iret_probe(0, 0)
+    # Resumed by the catcher, IF=0 from the fault's gate.
+    sysret_catch_disarm()
+    let gs_after: u64 = rdmsr(GS_BASE_MSR)
+    if had_if
+        enable_interrupts()
+    if sysret_caught == 0
+        return ring0_fail("the ring-0 IRETQ fault was not caught")
+    if sysret_fault_vector != GP_VECTOR or sysret_fault_rip != syscall_exit_iret as u64 or sysret_fault_cs != KERNEL_CS
+        klog("[sysret] ring-0 probe caught vector ")
+        klog_dec(sysret_fault_vector as i64)
+        klog(" at RIP ")
+        klog_hex(sysret_fault_rip)
+        klog(" CS ")
+        klog_hex(sysret_fault_cs)
+        klog("\n")
+        return ring0_fail("the ring-0 IRETQ fault was not vector 13 at syscall_exit_iret in ring 0")
+    if gs_after != area
+        return ring0_fail("GS is not back on this CPU's area after the ring-0 IRETQ fault")
+    klog("[sysret] ring-0 IRETQ fault on syscall_exit_iret (null SS) caught: vector ")
+    klog_dec(sysret_fault_vector as i64)
+    klog(" at RIP ")
+    klog_hex(sysret_fault_rip)
+    klog(" CS ")
+    klog_hex(sysret_fault_cs)
+    klog(", GS back on this CPU's area\n")
     return true
