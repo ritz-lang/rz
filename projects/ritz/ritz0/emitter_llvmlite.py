@@ -5537,11 +5537,19 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # file's scope end), and `T_m` cannot clash.
         is_pub = fn_def.is_pub or getattr(
             getattr(fn_def, 'declared_method', None), 'is_pub', False)
+        #
+        # AGAST #4608: a runtime-linked compile (a test file's harness) keeps
+        # its own private fns internal, but one it only declares (another
+        # file's, called by that file's generic's instance emitted here) is
+        # defined by that file's `--no-runtime` object under its file's
+        # symbol, so it is declared under that symbol too.
         if getattr(self, 'no_runtime', False):
             if self._private_free(fn_def, is_pub):
                 fn.name = self._symbol_name(fn_def)
         elif not is_pub and fn_def.name != 'main' and self._should_emit_body(fn_def):
             fn.linkage = 'internal'
+        elif self._private_free(fn_def, is_pub):
+            fn.name = self._symbol_name(fn_def)
 
         # Create DISubprogram for debug info (only for functions we'll define, not declarations)
         if self.emit_debug and self.di_file and self._should_emit_body(fn_def):
