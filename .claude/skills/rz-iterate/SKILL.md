@@ -31,11 +31,22 @@ sections below give the mechanics; this is the policy they serve:
    plus every subsystem its commit touches, each in full. It never runs a full gate
    unless it chooses to. The full gate runs once per train, on its tip.
    `main` never moves without a full gate on the landed SHA.
-5. **Disjoint work rebases optimistically.** A room moved to a newer tail by
-   a clean rebase pushes it and stops: no re-check, no new REAP. The train
-   gate covers it. Only a rebase that conflicted or made the room change
-   code is re-checked and REAPed again ("Keep running rooms on the deepest
-   tail"). Never bounce a REAP because `main` moved: `build` cherry-picks it.
+5. **Rooms never chase the train; the conductor catches them up** (Aaron,
+   2026-11-25: "We are speculatively & optimistically rebasing off the back
+   of the train, but it's up to the train orchestrator to rebase and catch
+   up. We shouldn't be chasing main in every branch."). A room is based on
+   the deepest tail **once, at spawn** (item 3), and stays on that base
+   until it REAPs. When trains stack, land or are rebuilt, `rz` sends **no**
+   "newer tail", "rebase onto" or "base update" message: `train.sh build`
+   cherry-picks the REAPed commit onto whatever the tail is by then
+   (`APPLIED`), and the train gate covers it. A `CONFLICT` whose resolution
+   is obvious is also the conductor's: `rz` resolves it in the train
+   (Reaping step 7). A room hears about its base only when its car can't
+   board: a `CONFLICT` that isn't obvious (sent to the room that arrived
+   later), a `BAD`, or a red gate that names it (Reaping steps 6 and 7).
+   Never bounce a REAP because `main` or a tail moved. (On 2026-11-24, #4639 was sent four
+   "newer tail" rebases in two hours, and #4677 and #4657 were told to move
+   tails mid-work. That is what this rule forbids.)
 6. **A red train is fixed in the train** (Reaping step 6, "Fix forward
    first"). Name the culprit from the failing lines, hold the train's cars
    with `train.sh fail` (trains behind it keep moving), and have the
@@ -79,8 +90,8 @@ Repeat until the goal is met:
 
 1. **Drain the reap queue** (see "Reaping"). Merges first. Queued REAPs land
    together as one merge train with one gate; a room's car joins it without
-   the room rebasing for the merge (rooms do rebase preemptively onto a newer
-   tail: "Keep running rooms on the deepest tail").
+   the room rebasing, whatever has landed or stacked since it spawned
+   (Operating mode item 5).
    **First, recover dropped REAPs:** a REAP turn can be interrupted by the
    next REAP's turn before it queues anything (1485 was lost this way twice).
    `get_conversation_messages(room_id="rz", message_type="chat", since=<last check>)`,
@@ -399,11 +410,14 @@ trains with `train.sh` (see "Reaping"), which cherry-picks REAPed commits
 unchanged and runs `run-gate.sh` on the stack.
 
 **Must not:** edit code, run any test or gate other than a train's, resolve a
-conflict, edit, rebase or squash a room's branch, or investigate a failure.
-**The two exceptions** (Aaron, 2026-11-24), both on a train only, never a
-room's branch: the ratchet **precheck** of a train tip (Reaping step 3b),
-and a **reconcile car** that touches only pin, baseline and allowlist data
-files, written by the guard's own update command (step 6).
+conflict that isn't obvious, edit, rebase or squash a room's branch, or
+investigate a failure.
+**The three exceptions** (Aaron, 2026-11-24 and 2026-11-25), all on a train
+only, never a room's branch: the ratchet **precheck** of a train tip
+(Reaping step 3b); a **reconcile car** that touches only pin, baseline and
+allowlist data files, written by the guard's own update command (step 6);
+and an **obvious conflict resolution** of a car that won't apply to the
+tail (step 7).
 Anything like that becomes an AGAST ticket and a room. If CI on `main` goes red with a *new* failure, file it at high priority
 and spawn a room for it. Don't fix it here.
 
@@ -623,11 +637,10 @@ you changed pass **in full** on that exact commit (step 6).
    it with `project_id=1` and `parent_task_id=<milestone>` (the parent of
    your own ticket), and say it in your REAP. Never split your ticket into
    more tickets.
-5. **Finish on main:** `git fetch origin && git rebase origin/main` (not
-   when you were spawned on a train tail: that tail is your base, and a
-   rebase onto `origin/main` would replay the train's cars and stop you
-   boarding as KEPT), then squash to one commit: `ritz-task-<id>: 🤖
-   <terse description>`.
+5. **Finish on your base:** don't rebase, onto `origin/main` or a newer
+   tail (step 9). `rz` cherry-picks your commit onto the current tail when
+   it boards. Squash to one commit: `ritz-task-<id>: 🤖 <terse
+   description>`.
 6. **Smoke-check your subsystems, in full** (Aaron, 2026-11-23, AGAST
    #4580): no full room gate is needed before REAP. The train's full gate
    runs on the whole train before it lands. Run, in the foreground:
@@ -708,19 +721,15 @@ you changed pass **in full** on that exact commit (step 6).
    <log name> SHA=<first 12> EXIT=0 — <one line>`.
    Don't `complete_task`: the REAP line is your evidence, and `rz` closes the
    ticket once your commit is on `main`.
-9. **On "rebase onto <sha7>"** (a preemptive move to the deepest tail, or
-   your commit conflicted with `main` or failed the train's gate; the
-   message says which, with the failing lines): rebase.
-   - **Clean** (no conflict, no code changed to fit, and not a failed gate):
-     push the rebased commit (`--force-with-lease`) and **don't re-run step
-     6**. If you already REAPed, send **no** new REAP: `rz` boards your
-     first REAP and the train gate covers the rebased commit. If you're
-     still working, carry on on the new base and check once, when you
-     finish.
-   - **It conflicted, you changed code to fit, or the message names a
-     failed gate:** fix, re-run step 6, push and REAP again.
-
-   Until that message, stay on your base, even after REAPing.
+9. **Stay on your base. Don't chase the train.** Trains will stack, land
+   and be rebuilt above you while you work. That's `rz`'s to catch up:
+   it cherry-picks your REAPed commit onto the tail at boarding time. Don't
+   rebase because `main` or a tail moved, even if you notice it.
+   `rz` asks you to rebase only when your car can't board: **"rebase onto
+   <sha12>"** because your commit conflicted with a car in the train, or a
+   train gate failed and names your commit. The message says which, with
+   the conflicting files or the failing lines. Then rebase onto exactly that
+   commit, resolve or fix, re-run step 6, push and REAP again.
 
 **Never end a turn with work pending:** nothing wakes you when a gate,
 mutation run or subagent finishes (#1533). Wait in the foreground, in slices
@@ -1468,101 +1477,93 @@ one to train 1.
    1..k-1 and their gates are left alone. Then bisect the HELD cars as above
    with `build --next <halved HELD cars> <the rest of the queue>` (a plain
    `build` for k = 1), and gate per `pending`. A failed train with nothing
-   behind it is just dropped. **Each `DROPPED` tail is a base some running
-   room may sit on** (AGAST #4413 point 5): a room spawned on it must move
-   even when no newer tail carries its cars, so bounce it now rather than
-   waiting for a conflict (the preemptive loop below explains the input):
-   ```bash
-   printf '%s %s idle\n' ritz-task-1234 "$(git -C ~/dev/ritz-lang/rz-task-1234 merge-base "$DROP" HEAD)" |
-       .claude/skills/rz-iterate/train.sh rebase-plan --dropped "$DROP"
-   ```
-   It answers `ROOM ... dropped` and one `BOUNCE <room> onto <new tail|main>`
-   per room whose base is that tail, skipping a room mid-gate. Send each
-   `BOUNCE` line's message; a `fail` that rebuilds later cars prints
-   `DROPPED` for their old tails too, so bounce those rooms as well. If
+   behind it is just dropped. **A `DROPPED` tail needs no message to the
+   rooms based on it** (Operating mode item 5): the HELD cars under them
+   board again unchanged with the fix, so their REAPs still board
+   (`APPLIED`). Only if `build` later answers `BAD ... not in the train` for
+   such a car (a car below it was ejected, step 6.5) does its room get a
+   "rebase onto <tail>" line, as for a `CONFLICT` (step 7). If
    **train 1 passes and train 2 fails**, land train 1 (step 5), then `fail`
    train 2's log. A stale verdict can't land anything by mistake: it names
    the old tip, and `land` refuses a log for another commit.
-7. **`CONFLICT`:** bounce it now, not after the train lands. The line names
-   what it hit: `CONFLICT <branch> <sha12> with <car>[,<car>] on
-   <file>[,<file>]` (the train cars touching the conflicted files, or
-   `main` when no train car does). Check its item and send its room one
-   line: "your commit conflicts with <car> on <files> in the train; rebase
-   onto <tail sha12>, resolve, re-check and REAP". `<tail>` is the `tip=` of
-   the last `TRAIN` line, so the rebased car stacks onto the back of the
-   trains; `build` then accepts it (step 3). Its next REAP joins
-   the back of the queue. **`BAD` or a missing gate quote** leave that
+7. **`CONFLICT`: resolve it here if it's obvious; otherwise bounce it now**
+   (Aaron, 2026-11-25: "Disjoint file edits can come to you to resolve.
+   Conflicts can be resolved by you if the resolution is obvious. If it's
+   not obvious, it should be sent back to the room that arrived later.").
+   The line names what it hit: `CONFLICT <branch> <sha12> with
+   <car>[,<car>] on <file>[,<file>]` (the train cars touching the
+   conflicted files, or `main` when no train car does).
+
+   **Obvious** means the resolution keeps both sides' intent with no new
+   logic:
+   - disjoint edits that only touch adjacent or overlapping lines, kept
+     side by side;
+   - both sides appending to the same list, table or import block (keep
+     both, in order);
+   - a pin, count or allowlist both sides changed (re-measure on the
+     merged tree with the guard's own command, as for a reconcile car,
+     step 6);
+   - one side's line moved or reworded and the other side's edit applied
+     to it unchanged.
+
+   **Not obvious:** both sides changed the same logic differently, the
+   merge needs new code, a call or signature one side changed is used by
+   the other side's new lines, or you aren't sure. Those go back to the
+   room whose car **arrived later**, which is the car `build` was boarding,
+   never the car already in the train.
+
+   **To resolve:**
+   1. Work in the train's own worktree (`train.sh show` names it; never a
+      room's branch, never the shared checkout), on the tail that `build`
+      was stacking onto.
+   2. `git cherry-pick <car sha>`, then fix only the conflicted hunks, and
+      keep the room's commit message with a `Conflict-resolved-by: rz (<car
+      it hit>, <files>)` trailer.
+   3. `git diff <car sha> HEAD` must show only the conflicted hunks. Run
+      `train.sh precheck` after the build.
+   4. Push it as `rz-resolve/<room>-<sha12>` and board that in the car's
+      place, keeping the room's original REAP line and quote:
+      `build [--next] ... rz-resolve/<room>-<sha12>:<resolved sha> ...`.
+   5. Tell the room in one line that it boarded and needs no rebase. The
+      train gate is what checks the resolution, so name the resolved car in
+      the turn report.
+   6. At land, close the room's ticket with both SHAs. Its TEARDOWN says
+      that the gated commit landed as rz's resolution `<main sha12>`, so the
+      two diffs differ in exactly the named hunks.
+
+   **To bounce:** check its item and send the later room one line: "your
+   commit conflicts with <car> on <files> in the train, and the resolution
+   isn't mechanical (<why>); rebase onto <tail sha12>, resolve, re-check and
+   REAP". `<tail>` is the `tip=` of the last `TRAIN` line, so the rebased
+   car stacks onto the back of the trains; `build` then accepts it (step 3).
+   Its next REAP joins the back of the queue. **`BAD` or a missing gate quote** leave that
    item out too: tell its room which check failed. **`EMPTY`** means the
    patch is already on `main`: check the item, then close and clean up as
    in step 5.
 8. **All items checked:** `clear_scratchpad`.
 
-**Keep running rooms on the deepest tail (AGAST #4413).** A room's car is
-gated on whatever base it branched from. Once a newer train stacks a tail
-above it, that base is stale: the room's next gate covers a tree that main
-will no longer match, and its REAP then cherry-picks (`APPLIED`) instead of
-boarding as-is (`KEPT`). Each loop turn, learn the deepest **built** tail and
-which running rooms are behind it:
+**Rooms don't chase the train (Aaron, 2026-11-25; replaces AGAST #4413's
+per-turn rebase loop).** `train.sh tail` is used **at spawn only**: it
+prints the deepest built tail (`<tip12> rz-train/<tip12>`, nothing when no
+train is built; exit 2 when origin can't be asked), checking that
+`refs/heads/rz-train/<tip12>` is still on origin, and a new room is based
+there ("Spawning a room"). After that, `rz` doesn't track running rooms'
+bases and sends no rebase when a newer train stacks, lands or is rebuilt.
+A car based on an older tail boards `APPLIED` (cherry-picked onto the
+current tail), and the train gate is what checks it on that tree. That's
+the whole optimistic model: one gate per train covers every catch-up.
+`train.sh rebase-plan` still exists. Use it only to work out the exact
+`rebase onto` line for a car `build` refused, never as a per-turn sweep.
 
-```bash
-.claude/skills/rz-iterate/train.sh tail
-# <tip12> rz-train/<tip12>, or nothing when no train is built
-```
+**When a room does rebase** (only after a `CONFLICT`, `BAD` or red gate that
+names it), it rebases onto the tail named in the message, resolves, re-runs
+`smoke-plan.sh run` and REAPs again. A room that rebased cleanly on its own
+anyway (it shouldn't) pushes and sends no new REAP: its original REAP
+boards `APPLIED` by patch-id (Reaping step 2).
 
-`tail` reads each train's `TIP=` **and** confirms
-`refs/heads/rz-train/<tip12>` is still on origin, so a train whose build was
-replaced, failed or landed is never offered (a stale `TIP=` in a dead slot is
-skipped and the next-deepest built train wins); it exits 2 when origin can't
-be asked, because "no answer" is not "no ref". Then feed it one line per
-running room and act on its lines:
-
-```bash
-printf '%s %s %s\n' \
-    ritz-task-1234 "$BASE" idle \
-    ritz-task-5678 "$BASE2" gating |
-    .claude/skills/rz-iterate/train.sh rebase-plan
-```
-
-Each line is `<room> <base> [<gate>]`. `<base>` is the room HEAD's
-merge-base with the reference (local: `git -C <wt> merge-base <ref> HEAD`;
-a remote room's comes from its host's `STATUS`), full or 12-char SHA, or `-`
-when unknown. `<gate>` is `gating`/`idle` when the caller already knows it —
-**that is how a remote room's liveness is fed in**, from its host's `STATUS`
-gate list; omit it (or pass `-`) for a local room and `rebase-plan` asks this
-host's `ritz-gate-<room>` unit. Output is one status line per room, then at
-most one action line:
-
-    ROOM <room> base=<b12> tail=<t12|main> on-tail|behind|unknown|other
-    SKIP <room>: gate live (<why>); not rebasing mid-gate
-    REBASE <room> onto <t12>: rebase onto <t12>: `git fetch origin
-           rz-train/<t12> && git rebase FETCH_HEAD`; clean: push it, no
-           re-check and no new REAP (the train gate covers it; still working:
-           check once when done); conflicted or changed code: resolve,
-           re-check (smoke-plan.sh run) and REAP
-
-**A clean rebase is not re-gated** (AGAST #4580; Aaron, 2026-11-23:
-"Disjoint work can be optimistically rebased without re-gating in the envs;
-save the re-gating for the merge train to save on total runs"). A room that
-rebases cleanly pushes and stops there: if it already REAPed, its original
-REAP boards as `APPLIED` (Reaping step 2), and the train gate tests it. Only
-a rebase that conflicted, or that made the room change code, is re-checked
-(`smoke-plan.sh run`) and REAPed again.
-
-The reference is the deepest built tail, or `origin/main` when no train is
-built (`tail=main`); an `unknown` base is listed, never messaged. A room
-whose base is not the tail is `behind` and gets **exactly one** `REBASE`
-line; a room on a live gate (fed, or a local `ritz-gate-<room>` unit) is
-`SKIP`ped with the reason and **never rebased mid-gate**. Send each `REBASE`
-line's message to its room verbatim; that is all `rz` does with it.
-`rebase-plan` is **advisory only**: it moves no branch, rewinds nothing and
-touches no worktree. A room that already gated on its base may still land;
-let it, and its REAP boards normally (if its base is still a train's tail it
-boards `KEPT`).
-
-**Never broadcast that `main` moved.** The loop above is per-room and tracked
-to the tail, not a "main moved" broadcast; broadcasting made five rooms
+**Never broadcast that `main` moved.** Broadcasting made five rooms
 re-gate at once, filling both gate slots with work that was stale again by
-the next merge. A room rebases on its own schedule; a REAP whose commit
+the next merge. A room doesn't rebase unless its car can't board: a REAP whose commit
 conflicted or failed is bounced individually (steps 6 and 7). Committing to
 `main` from this room (skill edits and the like) needs no message either; it
 just becomes the next train's base.
