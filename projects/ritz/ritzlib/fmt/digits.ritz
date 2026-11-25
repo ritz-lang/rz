@@ -4,24 +4,79 @@
 # formatting surface (Writer, Display), and this file stays core, importable
 # by freestanding code (tools/ritzlib_layers.py).
 #
-# Every ritzlib integer formatter (eprint_int, itoa, string_push_i64,
+# Every ritzlib integer formatter (eprint_int, string_push_i64,
 # string_from_hex, iovec_append_int/uint, testlib's pid suffix,
 # ritzlib.fmt.impls) writes its digits through these functions. Add
 # a formatter by calling them, not by writing another `% 10` loop: AGAST
 # #1856 found seven copies, and four printed only "-" for i64's minimum
 # because `0 - n` wraps.
 #
-# Each writes into a caller buffer, returns the byte count, and writes no
-# NUL. Sizes: fmt_i64_into needs 20 bytes, fmt_u64_into 20, fmt_u64_hex_into
-# 16, fmt_u64_radix_into 64 (base 2). No imports, so any module (and
-# freestanding code) can use it.
+# Each writes into a caller span and returns a StrView of the digits it
+# wrote, from buf's start; it writes no NUL. The span must hold the widest
+# result: fmt_i64_into and fmt_u64_into need 20 bytes, fmt_u64_hex_into 16,
+# fmt_u64_radix_into 64 (base 2). A shorter span traps, whatever n is, so a
+# caller's undersized buffer shows up on its first call, not on the first
+# big value (AGAST #4685; it took a bare `*u8` and trusted the caller).
+#
+#     var buf: [20]u8
+#     let digits: StrView = fmt_i64_into(@buf, n)
+#
+# Text that is being built goes through string_push_i64 or `{n}` instead.
+# `[u8]` and StrView are built in, so this needs no imports and any module
+# (and freestanding code) can use it.
 
-# Decimal digits of n into buf. Returns the count (1..20).
-# standard-exempt: ptr-len-param: false positive: `n` is the integer being formatted, not a buffer length
-# standard-exempt: raw-ptr-param: format buffer sink: caller sizes buf for the documented 20 bytes
-pub fn fmt_u64_into(buf: *u8, n: u64) -> i64
-    # Count digits first so they can be written in place, most significant
-    # first, with no temporary buffer.
+# Core (tools/ritzlib_layers.py): no ritzlib.sys, so a short span ends the
+# program through this platform hook, as gvec's and hashmap's invariants do.
+# ritzlib.sys defines it for a hosted program (stderr, then exit 101); a
+# freestanding one (harland's kernel) defines its own.
+extern fn ritz_platform_fatal(msg: *u8, len: i64, status: i32)
+
+# The widest result of each routine: u64's maximum (or i64's minimum, with
+# its '-') in decimal, in hex, and in base 2.
+pub const FMT_DEC_MAX: i64 = 20
+pub const FMT_HEX_MAX: i64 = 16
+pub const FMT_RADIX_MAX: i64 = 64
+
+# Decimal digits of n at the start of buf (1..20 bytes).
+pub fn fmt_u64_into(buf: [u8], n: u64) -> StrView
+    fmt_need(buf, FMT_DEC_MAX, "fmt_u64_into: buffer shorter than 20 bytes")
+    fmt_u64_digits(buf, 0, n)
+
+# n in decimal, with a leading '-' when negative (1..20 bytes).
+pub fn fmt_i64_into(buf: [u8], n: i64) -> StrView
+    fmt_need(buf, FMT_DEC_MAX, "fmt_i64_into: buffer shorter than 20 bytes")
+    if n < 0
+        buf[0] = '-'
+        # Negate in u64: 0 - n wraps for i64's minimum in i64, but its
+        # magnitude 2^63 is representable as a u64.
+        let bits: u64 = n as u64
+        return fmt_u64_digits(buf, 1, 0 -% bits)
+    fmt_u64_digits(buf, 0, n as u64)
+
+# Lowercase hex digits of n, no "0x" prefix, no leading zeros ("0" for
+# zero) (1..16 bytes).
+pub fn fmt_u64_hex_into(buf: [u8], n: u64) -> StrView
+    fmt_need(buf, FMT_HEX_MAX, "fmt_u64_hex_into: buffer shorter than 16 bytes")
+    fmt_u64_radix_digits(buf, n, 16, false)
+
+# Digits of n in base `radix` (2..16), no prefix, no leading zeros ("0" for
+# zero) (1..64 bytes). `upper` gives 'A'..'F' above 9. Covers the {x:x} /
+# {x:X} / {x:b} / {x:o} format specs.
+pub fn fmt_u64_radix_into(buf: [u8], n: u64, radix: u64, upper: bool) -> StrView
+    fmt_need(buf, FMT_RADIX_MAX, "fmt_u64_radix_into: buffer shorter than 64 bytes")
+    if radix < 2 or radix > 16
+        let msg: StrView = "fmt_u64_radix_into: radix outside 2..16"
+        ritz_platform_fatal(msg.ptr, msg.len, 101)
+    fmt_u64_radix_digits(buf, n, radix, upper)
+
+# Stop the program, rather than write past buf, when it can't hold `need`.
+fn fmt_need(buf: [u8], need: i64, msg: StrView)
+    if buf.len < need
+        ritz_platform_fatal(msg.ptr, msg.len, 101)
+
+# n's decimal digits into buf after `at` bytes already there (a '-'), most
+# significant first, with no temporary buffer. The view covers buf[0..at+len].
+fn fmt_u64_digits(buf: [u8], at: i64, n: u64) -> StrView
     var len: i64 = 1
     var t: u64 = n / 10
     while t != 0
@@ -29,55 +84,14 @@ pub fn fmt_u64_into(buf: *u8, n: u64) -> i64
         t = t / 10
 
     var v: u64 = n
-    var i: i64 = len - 1
-    while i >= 0
-        *(buf + i) = ((v % 10) + 48) as u8  # '0' + digit
+    var i: i64 = at + len - 1
+    while i >= at
+        buf[i] = ((v % 10) + 48) as u8  # '0' + digit
         v = v / 10
         i -= 1
-    len
+    StrView { ptr: buf.ptr, len: at + len }
 
-# n in decimal, with a leading '-' when negative. Returns the count (1..20).
-# standard-exempt: ptr-len-param: false positive: `n` is the integer being formatted, not a buffer length
-# standard-exempt: raw-ptr-param: format buffer sink: caller sizes buf for the documented 20 bytes
-pub fn fmt_i64_into(buf: *u8, n: i64) -> i64
-    if n < 0
-        *buf = 45  # '-'
-        # Negate in u64: 0 - n wraps for i64's minimum in i64, but its
-        # magnitude 2^63 is representable as a u64.
-        let bits: u64 = n as u64
-        let mag: u64 = 0 -% bits
-        return 1 + fmt_u64_into(buf + 1, mag)
-    fmt_u64_into(buf, n as u64)
-
-# Lowercase hex digits of n into buf, no "0x" prefix, no leading zeros
-# ("0" for zero). Returns the count (1..16).
-# standard-exempt: ptr-len-param: false positive: `n` is the integer being formatted, not a buffer length
-# standard-exempt: raw-ptr-param: format buffer sink: caller sizes buf for the documented 16 bytes
-pub fn fmt_u64_hex_into(buf: *u8, n: u64) -> i64
-    var len: i64 = 1
-    var t: u64 = n / 16
-    while t != 0
-        len += 1
-        t = t / 16
-
-    var v: u64 = n
-    var i: i64 = len - 1
-    while i >= 0
-        let digit: u64 = v % 16
-        if digit < 10
-            *(buf + i) = (digit + 48) as u8  # '0'..'9'
-        else
-            *(buf + i) = (digit + 87) as u8  # 'a'..'f' (97 - 10)
-        v = v / 16
-        i -= 1
-    len
-
-# Digits of n in base `radix` (2..16) into buf, no prefix, no leading zeros
-# ("0" for zero). `upper` gives 'A'..'F' above 9. Returns the count
-# (1..64). Covers the {x:x} / {x:X} / {x:b} / {x:o} format specs.
-# standard-exempt: ptr-len-param: false positive: `n` is the integer being formatted, not a buffer length
-# standard-exempt: raw-ptr-param: format buffer sink: caller sizes buf for the documented 64 bytes
-pub fn fmt_u64_radix_into(buf: *u8, n: u64, radix: u64, upper: bool) -> i64
+fn fmt_u64_radix_digits(buf: [u8], n: u64, radix: u64, upper: bool) -> StrView
     var len: i64 = 1
     var t: u64 = n / radix
     while t != 0
@@ -92,9 +106,9 @@ pub fn fmt_u64_radix_into(buf: *u8, n: u64, radix: u64, upper: bool) -> i64
     while i >= 0
         let digit: u64 = v % radix
         if digit < 10
-            *(buf + i) = (digit + 48) as u8
+            buf[i] = (digit + 48) as u8
         else
-            *(buf + i) = (digit + letter) as u8
+            buf[i] = (digit + letter) as u8
         v = v / radix
         i -= 1
-    len
+    StrView { ptr: buf.ptr, len: len }

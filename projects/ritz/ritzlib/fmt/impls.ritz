@@ -7,8 +7,9 @@
 #                                  `?` is Debug
 #     fmt_debug_T(v, w)            Debug: what `{v:?}` prints
 #
-# for T in i8 i16 i32 i64 u8 u16 u32 u64 bool strview string cstr (*u8) and
-# bytes (Span<u8>). Each returns the bytes written, or a negative value from
+# for T in i8 i16 i32 i64 u8 u16 u32 u64 bool strview string and bytes
+# (Span<u8>). A C string (*u8) has no fns of its own: its Display and Debug
+# impls in ritzlib.fmt.display view it with strview_from_cstr (AGAST #4685). Each returns the bytes written, or a negative value from
 # the Writer (or -1 for a spec outside the v1 set).
 #
 # These fns are still the bodies.  R36's revisit (Aaron, 2026-11-20,
@@ -78,12 +79,13 @@ fn fmt_write_padded(w: @&Writer, body: *u8, len: i64, sign: i64, spec: @FmtSpec,
 fn fmt_write_int(w: @&Writer, neg: bool, mag: u64, spec: @FmtSpec) -> i64
     if not spec.ok
         return -1
-    var buf: [66]u8
+    var buf: [65]u8
     var sign: i64 = 0
     if neg
-        buf[0] = 45  # '-'
+        buf[0] = '-'
         sign = 1
-    let n: i64 = fmt_u64_radix_into(@buf[sign] as *u8, mag, spec.radix, spec.upper)
+    let digits: [u8] = Span<u8> { ptr: @buf[sign], len: 65 - sign }
+    let n: i64 = fmt_u64_radix_into(digits, mag, spec.radix, spec.upper).len
     fmt_write_padded(w, @buf[0] as *u8, sign + n, sign, spec, FMT_ALIGN_RIGHT)
 
 # A signed value `bits` wide. Decimal is signed; x X b o print the value's
@@ -230,35 +232,6 @@ pub fn fmt_show_string_with(v: @String, w: @&Writer, spec: StrView) -> i64
 pub fn fmt_debug_string(v: @String, w: @&Writer) -> i64
     fmt_debug_strview(v.as_view(), w)
 
-fn fmt_cstr_len(p: *u8) -> i64
-    var n: i64 = 0
-    while *(p + n) != 0
-        n += 1
-    n
-
-# A NUL-terminated C string; a null pointer writes nothing.
-# standard-exempt: raw-ptr-param: C string ABI: the NUL-terminated C string Display impl
-pub fn fmt_show_cstr(v: *u8, w: @&Writer) -> i64
-    if v == null
-        return 0
-    w.write(v, fmt_cstr_len(v))
-
-# standard-exempt: raw-ptr-param: C string ABI: the NUL-terminated C string Display impl
-pub fn fmt_show_cstr_with(v: *u8, w: @&Writer, spec: StrView) -> i64
-    let s: FmtSpec = fmt_spec_parse(spec)
-    if s.ok and s.debug
-        return fmt_debug_cstr(v, w)
-    if v == null
-        return fmt_text_with(w, v, 0, @s)
-    fmt_text_with(w, v, fmt_cstr_len(v), @s)
-
-# Quoted and escaped, as fmt_debug_strview; a null pointer is `null`.
-# standard-exempt: raw-ptr-param: C string ABI: the NUL-terminated C string debug impl
-pub fn fmt_debug_cstr(v: *u8, w: @&Writer) -> i64
-    if v == null
-        return w.write_str("null")
-    fmt_debug_strview(StrView { ptr: v, len: fmt_cstr_len(v) }, w)
-
 # A Span<u8>'s bytes, as they are.
 pub fn fmt_show_bytes(v: Span<u8>, w: @&Writer) -> i64
     w.write(v.ptr, v.len)
@@ -310,10 +283,16 @@ fn fmt_escape(c: u8, esc: *u8) -> i64
     if c < 32 or c > 126
         *esc = 92
         *(esc + 1) = 120        # x
-        fmt_u64_radix_into(esc + 2, (c >> 4) as u64, 16, false)
-        fmt_u64_radix_into(esc + 3, (c & 15) as u64, 16, false)
+        *(esc + 2) = fmt_hex_digit(c >> 4)
+        *(esc + 3) = fmt_hex_digit(c & 15)
         return 4
     0
+
+# One lowercase hex digit for a nibble (0..15): \xNN's two.
+fn fmt_hex_digit(nibble: u8) -> u8
+    if nibble < 10
+        return '0' + nibble
+    'a' + (nibble - 10)
 
 # `"a\"b\n"`: quoted; '"', '\\', \n \t \r escaped, other bytes outside
 # ' '..'~' as \xNN. Runs of plain bytes go to the Writer in one write.

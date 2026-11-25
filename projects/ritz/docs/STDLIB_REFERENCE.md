@@ -1082,7 +1082,7 @@ New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
 | `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `s.take(n)` to bound it |
 | `strcat` | `s.push_str(v)`, `s.push_string(other)` |
 | `atoi` | `s.parse_i64() -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |
-| `itoa` | `s.push_i64(n) -> bool` / `string_from_i64`: no caller-sized buffer |
+| `itoa` (deleted, AGAST #4685) | `s.push_i64(n) -> bool` / `string_from_i64` / `{n}`; `fmt_i64_into(@buf, n)` with no allocation |
 
 The byte predicates (`isdigit` .. `tolower`) take a `u8`, not a C string, and
 are fine to use. `memset`/`memcpy`/`memcmp`/`bcmp`/`memmove` stay here because
@@ -1116,7 +1116,6 @@ the compiler emits calls to those symbols.
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `atoi` | `fn(s: *u8) -> i64` | String to integer |
-| `itoa` | `fn(n: i64, buf: *u8) -> *u8` | Integer to string |
 
 **Character Classification**:
 
@@ -1146,26 +1145,33 @@ the compiler emits calls to those symbols.
 **Module**: `ritzlib.fmt.digits` (core)
 
 The one integer digit routine. Every ritzlib integer formatter (`print("{n}")`
-interpolation, `eprint_int`, `itoa`, `String.push_i64`, `string_from_hex`,
+interpolation, `eprint_int`, `String.push_i64`, `string_from_hex`,
 `IoVecBuilder.append_int`/`append_uint`, `ritzlib.fmt`'s Display) calls it, so all of them
-handle i64's minimum (AGAST #1856). Each writes into a caller buffer, returns
-the byte count, and writes no NUL. It has no imports, so freestanding code can
+handle i64's minimum (AGAST #1856). Each writes into a caller `[u8]` and
+returns a `StrView` of the digits at its start; it writes no NUL. The span
+must hold the widest result (`FMT_DEC_MAX` 20, `FMT_HEX_MAX` 16,
+`FMT_RADIX_MAX` 64): a shorter one ends the program through
+`ritz_platform_fatal(.., 101)` whatever the value, rather than writing past it
+(AGAST #4685; they took a bare `*u8`). Pass an array as `@buf`. Text being
+built goes through `String.push_i64` or `{n}` instead. It needs no imports
+(a freestanding image defines `ritz_platform_fatal`), so freestanding code can
 use it too. It was `ritzlib.fmt` until AGAST #201 made that name the hosted
 formatting surface below.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `fmt_i64_into` | `fn(buf: *u8, n: i64) -> i64` | Decimal with `-` when negative; needs 20 bytes |
-| `fmt_u64_into` | `fn(buf: *u8, n: u64) -> i64` | Unsigned decimal; needs 20 bytes |
-| `fmt_u64_hex_into` | `fn(buf: *u8, n: u64) -> i64` | Lowercase hex, no `0x`, no leading zeros; needs 16 bytes |
-| `fmt_u64_radix_into` | `fn(buf: *u8, n: u64, radix: u64, upper: bool) -> i64` | Base 2..16, `upper` for `A`..`F`; needs 64 bytes |
+| `fmt_i64_into` | `fn(buf: [u8], n: i64) -> StrView` | Decimal with `-` when negative; needs 20 bytes |
+| `fmt_u64_into` | `fn(buf: [u8], n: u64) -> StrView` | Unsigned decimal; needs 20 bytes |
+| `fmt_u64_hex_into` | `fn(buf: [u8], n: u64) -> StrView` | Lowercase hex, no `0x`, no leading zeros; needs 16 bytes |
+| `fmt_u64_radix_into` | `fn(buf: [u8], n: u64, radix: u64, upper: bool) -> StrView` | Base 2..16, `upper` for `A`..`F`; needs 64 bytes |
 
 ```ritz
 import ritzlib.fmt.digits
 
 fn fmt_example() -> i64
     var buf: [20]u8
-    fmt_i64_into(@buf[0], -9223372036854775807 - 1)  # "-9223372036854775808", returns 20
+    let digits: StrView = fmt_i64_into(@buf, -9223372036854775807 - 1)
+    digits.len   # 20: "-9223372036854775808"
 ```
 
 ---

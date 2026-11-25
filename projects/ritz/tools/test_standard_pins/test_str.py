@@ -18,10 +18,12 @@ def test_str_module_has_no_raw_pointer_parameters():
     """AGAST #4534: str is C-string interop only; every raw *u8 is a C ABI.
 
     The two functions with a StrView/String equivalent and no callers
-    (strrchr, strncpy) were deleted; the remaining 25 raw pointer parameters
-    across 15 functions are exempted against the C ABI they exist to serve.
-    strchr and strstr stay because nexus/zeus test suites still call them.
+    (strrchr, strncpy) were deleted, and itoa went with AGAST #4685
+    (String.push_i64 / `{n}` / fmt_i64_into(@buf, n)); the remaining 24 raw
+    pointer parameters across 14 functions are exempted against the C ABI
+    they exist to serve. strchr and strstr stay because nexus/zeus test
+    suites still call them.
     """
     summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "str.ritz"]))
-    assert summary["raw-ptr-param"] == {"violations": 0, "exempt": 25}
+    assert summary["raw-ptr-param"] == {"violations": 0, "exempt": 24}
     assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}

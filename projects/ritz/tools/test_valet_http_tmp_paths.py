@@ -8,7 +8,8 @@ scratch path takes the process id instead: ritzlib.testlib's
 sandbox_path builds /tmp/ritz_<prefix>_<pid>_<suffix>, and a file whose
 imports collided with testlib's old pub read_file (AGAST #4643 deleted it in
 favour of ritzlib.fs's) keeps a local pid_tmp_path built from a prefix such
-as "/tmp/valet_".
+as "/tmp/valet_", or interpolates it: format_into(@&s, "/tmp/m7m_{pid}_db")
+(AGAST #4685 moved the hand-rolled digit appenders to `{pid}`).
 
 #4052 swept valet and http; #4084 swept the rest of projects/ and widened this
 check to every .ritz file under a test/ or tests/ directory. A test that only
@@ -25,8 +26,9 @@ REPO = Path(__file__).resolve().parents[3]
 PROJECTS = REPO / "projects"
 
 # A string literal naming a path under /tmp: "/tmp/x" or c"/tmp/x". One that
-# ends in "_" or "-" is a prefix a pid is appended to, not a path.
-FIXED_TMP = re.compile(r'"/tmp/[^"]*[^_\-"]"')
+# ends in "_" or "-" is a prefix a pid is appended to, not a path, and one
+# that interpolates `{pid}` carries it.
+FIXED_TMP = re.compile(r'"/tmp/(?![^"]*\{pid\})[^"]*[^_\-"]"')
 
 
 def ritz_test_files(root: Path) -> list[Path]:
@@ -53,9 +55,12 @@ def test_the_check_finds_a_fixed_tmp_path(tmp_path):
     (t / "test_x.ritz").write_text(
         '# was c"/tmp/old"\nfn f() -> *u8\n    c"/tmp/valet_x.txt"\n'
         '    let head: *u8 = c"/tmp/valet_"\n'
-        '    let dash: StrView = "/tmp/goliath-fs-"\n')
+        '    let dash: StrView = "/tmp/goliath-fs-"\n'
+        '    format_into(@&s, "/tmp/m7m_{pid}_{seq}_wal")\n'
+        '    format_into(@&s, "/tmp/m7m_{seq}_wal")\n')
     assert fixed_tmp_paths(tmp_path / "pkg", tmp_path) == [
-        'pkg/test/test_x.ritz:3: c"/tmp/valet_x.txt"']
+        'pkg/test/test_x.ritz:3: c"/tmp/valet_x.txt"',
+        'pkg/test/test_x.ritz:7: format_into(@&s, "/tmp/m7m_{seq}_wal")']
 
 
 @pytest.mark.unit
