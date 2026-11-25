@@ -25,7 +25,7 @@ import drivers.ena.regs {
     ENA_REGS_ACQ_CAPS_OFF, ENA_REGS_ACQ_CAPS_ENTRY_SIZE_SHIFT, ENA_REGS_AQ_DB_OFF,
     ENA_REGS_ACQ_TAIL_OFF, ENA_REGS_RESET_NORMAL,
     ENA_REGS_AENQ_BASE_LO_OFF, ENA_REGS_AENQ_BASE_HI_OFF, ENA_REGS_AENQ_CAPS_OFF,
-    ENA_REGS_AENQ_CAPS_ENTRY_SIZE_SHIFT, ENA_REGS_INTR_MASK_OFF
+    ENA_REGS_AENQ_CAPS_ENTRY_SIZE_SHIFT, ENA_REGS_AENQ_HEAD_DB_OFF, ENA_REGS_INTR_MASK_OFF
 }
 import drivers.ena.admin {
     EnaAdminAqEntry, EnaAdminAcqEntry, EnaAdminGetFeatureCmd, EnaAdminCreateCqCmd,
@@ -40,7 +40,8 @@ import drivers.ena.admin {
     ENA_ADMIN_SQ_IDENTITY_DIRECTION_SHIFT, ENA_ADMIN_SQ_CAPS2_COMPLETION_SHIFT,
     ENA_ADMIN_SQ_CAPS3_CONTIGUOUS_MASK,
     ENA_ADMIN_AENQ_LINK_CHANGE, ENA_ADMIN_AENQ_FATAL_ERROR, ENA_ADMIN_AENQ_WARNING,
-    ENA_ADMIN_AENQ_NOTIFICATION, ENA_ADMIN_AENQ_KEEP_ALIVE
+    ENA_ADMIN_AENQ_NOTIFICATION, ENA_ADMIN_AENQ_KEEP_ALIVE,
+    ENA_ADMIN_AENQ_COMMON_DESC_PHASE_MASK, ENA_ADMIN_AENQ_LINK_STATUS_MASK
 }
 import drivers.ena.io_desc {
     EnaTxDesc, EnaRxDesc, EnaRxCdescBase, EnaTxCdesc,
@@ -122,11 +123,14 @@ struct EnaAdminQueue
 # AENQ State (Async Event Notification Queue)
 # ============================================================================
 
+# head counts entries consumed, starting at depth, and wraps at 2^16 (depth
+# divides it); head % depth is the next entry. This is the value the AENQ head
+# doorbell takes, as in Linux's ena_com: the device may post up to head.
 struct EnaAenq
     entries: *EnaAdminAenqEntry    # AENQ entries
     phys: u64                            # Physical address
     depth: u16
-    head: u16                            # Next entry to process
+    head: u16                            # Entries consumed, from depth
     phase: u8                            # Expected phase bit
 
 # ============================================================================
@@ -186,6 +190,12 @@ var ena_msix_on: bool = false
 var ena_msix_vectors: [3]u8
 var ena_irq_waits: u64 = 0
 var ena_irq_halts: u64 = 0
+
+# AENQ events consumed, by group (ENA_ADMIN_AENQ_*, #4649), and the link state
+# the last link-change event reported.
+const ENA_AENQ_GROUPS: u16 = 5
+var ena_aenq_counts: [5]u64
+var ena_link_up: bool = false
 
 # Pre-allocated RX/TX buffers
 var ena_rx_buffers: [16384]u8       # 8 * 2048 = 16KB
@@ -286,6 +296,9 @@ fn ena_io_cq_entry_addr(cq: *EnaIoCq, idx: u16, entry_size: u32) -> u64
     let base: u64 = (*cq).entries as u64
     let offset: u64 = (idx as u64) * (entry_size as u64)
     base + offset
+
+fn ena_aenq_entry_addr(aenq: *EnaAenq, idx: u16) -> u64
+    ((*aenq).entries as u64) + (idx as u64) * (ENA_ADMIN_AENQ_ENTRY_SIZE as u64)
 
 fn ena_get_prev_cq_head(aq: *EnaAdminQueue) -> u16
     if (*aq).cq_head == 0
@@ -540,7 +553,7 @@ fn ena_aenq_init(dev: *EnaDevice) -> i32
 
     # Initialize AENQ state
     (*aenq).depth = ENA_AENQ_DEPTH as u16
-    (*aenq).head = 0
+    (*aenq).head = ENA_AENQ_DEPTH as u16
     (*aenq).phase = 1
 
     # Write AENQ base address to registers
@@ -561,6 +574,71 @@ fn ena_aenq_init(dev: *EnaDevice) -> i32
     klog("\n")
 
     return 0
+
+# Give the device the whole AENQ: write the initial head (its depth). Until
+# this, the device has no room to post an event. Linux's
+# ena_com_admin_aenq_enable does the same once the AENQ is configured.
+fn ena_aenq_enable(dev: *EnaDevice)
+    let aenq: *EnaAenq = @(*dev).aenq
+    if (*aenq).entries == 0 as *EnaAdminAenqEntry
+        return
+    ena_write32(dev, ENA_REGS_AENQ_HEAD_DB_OFF, (*aenq).head as u32)
+
+# Act on one AENQ event. Keep-alives (~1/s on Nitro) are only counted.
+fn ena_aenq_handle(e: *EnaAdminAenqEntry)
+    let group: u16 = (*e).aenq_common_desc.group
+    let syndrome: u16 = (*e).aenq_common_desc.syndrome
+    if group < ENA_AENQ_GROUPS
+        ena_aenq_counts[group as i32] = ena_aenq_counts[group as i32] + 1
+    if group == ENA_ADMIN_AENQ_KEEP_ALIVE as u16
+        return
+    if group == ENA_ADMIN_AENQ_LINK_CHANGE as u16
+        ena_link_up = ((*e).inline_data[0] & ENA_ADMIN_AENQ_LINK_STATUS_MASK) != 0
+        if ena_link_up
+            klog("[ena] AENQ: link up\n")
+        else
+            klog("[ena] AENQ: link down\n")
+        return
+    if group == ENA_ADMIN_AENQ_FATAL_ERROR as u16
+        klog("[ena] AENQ: FATAL device error, syndrome 0x")
+    else if group == ENA_ADMIN_AENQ_WARNING as u16
+        klog("[ena] AENQ: device warning, syndrome 0x")
+    else if group == ENA_ADMIN_AENQ_NOTIFICATION as u16
+        klog("[ena] AENQ: notification, syndrome 0x")
+    else
+        klog("[ena] AENQ: unknown group ")
+        klog_dec(group as i64)
+        klog(", syndrome 0x")
+    klog_hex(syndrome as u64)
+    klog("\n")
+
+# Consume the AENQ entries the device has posted (phase-valid), at most one
+# queue's worth per call, and write the head doorbell so it can post more.
+# Without this the device stops after `depth` events (AGAST #4649). Returns
+# the number consumed. Called from ena_poll (net_poll's periodic path) and
+# from the admin wait when the management vector, shared with the admin CQ,
+# wakes it.
+fn ena_aenq_poll(dev: *EnaDevice) -> u32
+    let aenq: *EnaAenq = @(*dev).aenq
+    if (*aenq).entries == 0 as *EnaAdminAenqEntry or (*aenq).depth == 0
+        return 0
+    var n: u32 = 0
+    while n < (*aenq).depth as u32
+        read_barrier()
+        let idx: u16 = (*aenq).head % (*aenq).depth
+        let e: *EnaAdminAenqEntry = ena_aenq_entry_addr(aenq, idx) as *EnaAdminAenqEntry
+        if ((*e).aenq_common_desc.flags & ENA_ADMIN_AENQ_COMMON_DESC_PHASE_MASK) != (*aenq).phase
+            break
+        # Read the rest of the entry only after its phase bit
+        read_barrier()
+        ena_aenq_handle(e)
+        (*aenq).head = (*aenq).head + 1
+        if idx + 1 == (*aenq).depth
+            (*aenq).phase = (*aenq).phase ^ 1
+        n = n + 1
+    if n > 0
+        ena_write32(dev, ENA_REGS_AENQ_HEAD_DB_OFF, (*aenq).head as u32)
+    n
 
 fn ena_admin_submit_cmd(dev: *EnaDevice, cmd: *EnaAdminAqEntry) -> u16
     let aq: *EnaAdminQueue = @(*dev).admin_queue
@@ -671,6 +749,10 @@ fn ena_admin_wait_completion(dev: *EnaDevice, cmd_id: u16) -> i32
             ena_irq_waits = ena_irq_waits + 1
             waited = true
         irq_wait_vector(vec, seen, ENA_ADMIN_WATCHDOG_TICKS, 1, false, @ena_irq_halts)
+        # The AENQ shares the management vector (#4649): the wake may be an
+        # event rather than this command's completion.
+        if msix_vector_count(vec) != seen
+            ena_aenq_poll(dev)
 
     klog("[ena] Admin command timeout (cmd_id=")
     klog_dec(cmd_id as i64)
@@ -1299,6 +1381,7 @@ pub fn ena_init() -> i32
     result = ena_set_aenq_config(@ena_dev)
     if result != 0
         klog("[ena] Warning: AENQ config failed, continuing anyway\n")
+    ena_aenq_enable(@ena_dev)
 
     # Setup I/O queues
     result = ena_setup_io_queues(@ena_dev)
@@ -1423,6 +1506,9 @@ pub fn ena_poll(buf: *u8, max_len: u32) -> i32
     if ena_dev.initialized == 0
         return -1
 
+    # net_poll's periodic path also drains the AENQ (#4649)
+    ena_aenq_poll(@ena_dev)
+
     let rx_cq: *EnaIoCq = @ena_dev.rx_cq
     let rx_sq: *EnaIoSq = @ena_dev.rx_sq
 
@@ -1535,6 +1621,16 @@ pub fn ena_irq_wait_count() -> u64
 
 pub fn ena_irq_halt_count() -> u64
     return ena_irq_halts
+
+# AENQ events consumed in `group` (ENA_ADMIN_AENQ_*), and the link state the
+# last link-change event reported (#4649)
+pub fn ena_aenq_event_count(group: u8) -> u64
+    if group as u16 >= ENA_AENQ_GROUPS
+        return 0
+    return ena_aenq_counts[group as i32]
+
+pub fn ena_link_is_up() -> bool
+    return ena_link_up
 
 pub fn ena_is_ready() -> u8
     return ena_dev.initialized

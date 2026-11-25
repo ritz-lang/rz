@@ -258,13 +258,18 @@ pub fn phys_to_virt(paddr: u64) -> u64
 # driver just copied into the AQ. Responses are the subset ena_init asks for:
 # device attributes, max queues, AENQ config, and the CQ/SQ create replies.
 # It also models DEV_STS across a reset, and posts RX completions on request.
+# AENQ events (AGAST #4649) are posted the way Nitro posts them: only while the
+# driver's AENQ head doorbell leaves room, so a driver that never writes it
+# (or never consumes) loses every event after the queue fills.
 FAKEENA_STUB = """\
 import drivers.ena.regs {
     ENA_REGS_AQ_BASE_LO_OFF, ENA_REGS_AQ_BASE_HI_OFF, ENA_REGS_AQ_CAPS_OFF,
     ENA_REGS_ACQ_BASE_LO_OFF, ENA_REGS_ACQ_BASE_HI_OFF, ENA_REGS_AQ_DB_OFF,
     ENA_REGS_DEV_CTL_OFF, ENA_REGS_DEV_STS_OFF,
     ENA_REGS_DEV_CTL_DEV_RESET_MASK, ENA_REGS_DEV_STS_READY_MASK,
-    ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK, ENA_REGS_INTR_MASK_OFF
+    ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK, ENA_REGS_INTR_MASK_OFF,
+    ENA_REGS_AENQ_BASE_LO_OFF, ENA_REGS_AENQ_BASE_HI_OFF, ENA_REGS_AENQ_CAPS_OFF,
+    ENA_REGS_AENQ_HEAD_DB_OFF
 }
 import drivers.ena.admin {
     ENA_ADMIN_GET_FEATURE, ENA_ADMIN_SET_FEATURE, ENA_ADMIN_CREATE_CQ,
@@ -313,6 +318,45 @@ var g_admin_irq_only: bool = false
 var g_rx_held: bool = false
 var g_rx_held_req: u16 = 0
 var g_rx_held_len: u16 = 0
+# AENQ (#4649): the device's producer count (free-running, as the driver's
+# head is) and phase, and one event held back for the management interrupt.
+var g_aenq_prod: u32 = 0
+var g_aenq_phase: u8 = 1
+var g_aenq_held: bool = false
+var g_aenq_held_group: u16 = 0
+var g_aenq_held_data: u8 = 0
+
+# Post an AENQ event: 16-byte common descriptor (group, syndrome, phase at
+# offset 4), then the payload's first byte. -1 if the queue is not set up or
+# the head doorbell leaves no room: the event is lost.
+pub fn fake_aenq_post(group: u16, syndrome: u16, data0: u8) -> i32
+    let base: u64 = rd_addr(ENA_REGS_AENQ_BASE_LO_OFF, ENA_REGS_AENQ_BASE_HI_OFF)
+    let depth: u32 = rd32(ENA_REGS_AENQ_CAPS_OFF) & 0xFFFF
+    if base == 0 or depth == 0
+        return -1
+    let head: u32 = rd32(ENA_REGS_AENQ_HEAD_DB_OFF)
+    if ((head - g_aenq_prod) & 0xFFFF) == 0 or ((head - g_aenq_prod) & 0xFFFF) > depth
+        return -1
+    let e: u64 = base + ((g_aenq_prod % depth) as u64) * 64
+    zero(e, 64)
+    *(e as *u16) = group
+    *((e + 2) as *u16) = syndrome
+    *((e + 16) as *u8) = data0
+    *((e + 4) as *u8) = g_aenq_phase
+    g_aenq_prod = g_aenq_prod + 1
+    if (g_aenq_prod % depth) == 0
+        g_aenq_phase = g_aenq_phase ^ 1
+    return 0
+
+pub fn fake_aenq_head_db() -> u32
+    return rd32(ENA_REGS_AENQ_HEAD_DB_OFF)
+
+# Hold an event back until the CPU sleeps; it arrives on MSI-X entry 0.
+pub fn fake_aenq_on_irq(group: u16, data0: u8) -> i32
+    g_aenq_held = true
+    g_aenq_held_group = group
+    g_aenq_held_data = data0
+    return 0
 
 pub fn fake_msix_present(on: bool) -> i32
     g_msix_present = on
@@ -520,6 +564,10 @@ pub fn on_hlt() -> i32
                 g_last_db = db
                 service()
                 raise_entry(0)
+    if g_aenq_held and g_msix_on and (rd32(ENA_REGS_INTR_MASK_OFF) & 1) == 0
+        g_aenq_held = false
+        if fake_aenq_post(g_aenq_held_group, 0, g_aenq_held_data) == 0
+            raise_entry(0)
     if g_rx_held and g_msix_on
         let unmask_off: u32 = 0x500 + g_rx_cq_hw as u32
         if (rd32(unmask_off) & 0x40000000) != 0
@@ -749,3 +797,128 @@ def _run(tmp_path, src):
 def test_ena_descriptors_name_buffers_the_driver_owns(tmp_path):
     rc = _run(tmp_path, PROGRAM)
     assert rc == 0, f"check {rc}: {CHECKS.get(rc, 'crashed or unknown exit code')}"
+
+
+# --- AENQ (AGAST #4649) ------------------------------------------------------
+#
+# ena_aenq_init set up the AENQ and ena_set_aenq_config enabled its groups, but
+# nothing read an entry or wrote ENA_REGS_AENQ_HEAD_DB: the device could post
+# at most a queue's worth (32) of events, keep-alives (~1/s on Nitro) used them
+# up, and fatal-error and link events were lost after that. As Linux does
+# (ena_com_admin_aenq_enable, ena_com_aenq_intr_handler), the driver writes
+# the initial head (the queue's depth) once the AENQ is configured, and
+# ena_aenq_poll consumes phase-valid entries and writes the head back. It runs
+# from ena_poll (net_poll's periodic path) and from the admin wait when the
+# management vector, which the AENQ shares with the admin CQ, wakes it.
+
+AENQ_CHECKS = {
+    1: "ena_init failed against the emulated device",
+    40: "the AENQ head doorbell was not written after AENQ config: the device "
+    "has no room to post a single event",
+    41: "the device could not post a queue's worth (32) of events",
+    42: "the device posted into a full AENQ (fake model is wrong)",
+    43: "ena_poll did not drain the AENQ (keep-alive count wrong)",
+    44: "the AENQ head doorbell was not advanced past the consumed entries",
+    45: "after draining, the device still has no room to post",
+    46: "events after the AENQ wrapped (phase flip) were not consumed",
+    47: "a fatal-error, warning or notification event was not counted",
+    48: "a link-change event did not update the link state",
+    49: "an admin command answered by interrupt failed",
+    50: "an AENQ event that woke the admin wait was not consumed there",
+    51: "a stale entry (old phase) was consumed again",
+}
+
+AENQ_PROGRAM = """\
+import drivers.ena.device {
+    EnaDevice, ena_init, ena_get_device, ena_admin_exec, ena_poll,
+    ena_aenq_event_count, ena_link_is_up
+}
+import drivers.ena.admin {
+    EnaAdminAqEntry, EnaAdminAcqEntry, EnaAdminGetFeatureCmd,
+    ENA_ADMIN_GET_FEATURE, ENA_ADMIN_MAX_QUEUES_NUM,
+    ENA_ADMIN_AENQ_LINK_CHANGE, ENA_ADMIN_AENQ_FATAL_ERROR, ENA_ADMIN_AENQ_WARNING,
+    ENA_ADMIN_AENQ_NOTIFICATION, ENA_ADMIN_AENQ_KEEP_ALIVE
+}
+import fakeena {
+    fake_msix_present, fake_admin_irq_only, fake_aenq_post, fake_aenq_head_db,
+    fake_aenq_on_irq
+}
+import io { fake_cpu_set_if }
+
+var g_cmd: EnaAdminGetFeatureCmd
+var g_out: [64]u8
+
+fn main() -> i32
+    fake_msix_present(true)
+    if ena_init() != 0
+        return 1
+    let keep_alive: u16 = ENA_ADMIN_AENQ_KEEP_ALIVE as u16
+
+    # The initial head doorbell gives the device the whole queue.
+    if fake_aenq_head_db() != 32
+        return 40
+    var i: u32 = 0
+    while i < 32
+        if fake_aenq_post(keep_alive, 0, 0) != 0
+            return 41
+        i = i + 1
+    if fake_aenq_post(keep_alive, 0, 0) == 0
+        return 42
+
+    # net_poll's path drains it and hands the entries back.
+    if ena_poll(@g_out[0], 64) != 0
+        return 43
+    if ena_aenq_event_count(ENA_ADMIN_AENQ_KEEP_ALIVE) != 32
+        return 43
+    if fake_aenq_head_db() != 64
+        return 44
+    if fake_aenq_post(ENA_ADMIN_AENQ_FATAL_ERROR as u16, 7, 0) != 0
+        return 45
+
+    # Second lap of the ring: the phase has flipped.
+    fake_aenq_post(ENA_ADMIN_AENQ_WARNING as u16, 1, 0)
+    fake_aenq_post(ENA_ADMIN_AENQ_NOTIFICATION as u16, 2, 0)
+    fake_aenq_post(ENA_ADMIN_AENQ_LINK_CHANGE as u16, 0, 1)
+    ena_poll(@g_out[0], 64)
+    if fake_aenq_head_db() != 68
+        return 46
+    if ena_aenq_event_count(ENA_ADMIN_AENQ_FATAL_ERROR) != 1
+        return 47
+    if ena_aenq_event_count(ENA_ADMIN_AENQ_WARNING) != 1
+        return 47
+    if ena_aenq_event_count(ENA_ADMIN_AENQ_NOTIFICATION) != 1
+        return 47
+    if not ena_link_is_up()
+        return 48
+
+    # An event on the management vector, during an admin wait: the wake
+    # that ends the sleep consumes it, with no ena_poll.
+    fake_cpu_set_if(true)
+    fake_admin_irq_only(true)
+    fake_aenq_on_irq(ENA_ADMIN_AENQ_LINK_CHANGE as u16, 0)
+    i = 0
+    while i < 64
+        *((@g_cmd as u64 + i as u64) as *u8) = 0
+        i = i + 1
+    g_cmd.common_desc.opcode = ENA_ADMIN_GET_FEATURE
+    g_cmd.feature_id = ENA_ADMIN_MAX_QUEUES_NUM
+    if ena_admin_exec(ena_get_device(), @g_cmd as *EnaAdminAqEntry, 0 as **EnaAdminAcqEntry) != 0
+        return 49
+    if ena_aenq_event_count(ENA_ADMIN_AENQ_LINK_CHANGE) != 2 or ena_link_is_up()
+        return 50
+    if fake_aenq_head_db() != 69
+        return 50
+    fake_admin_irq_only(false)
+    fake_cpu_set_if(false)
+
+    # Nothing new posted: the entries already consumed stay consumed.
+    ena_poll(@g_out[0], 64)
+    if fake_aenq_head_db() != 69 or ena_aenq_event_count(ENA_ADMIN_AENQ_KEEP_ALIVE) != 32
+        return 51
+    0
+"""
+
+
+def test_ena_aenq_is_drained_and_its_head_returned(tmp_path):
+    rc = _run(tmp_path, AENQ_PROGRAM)
+    assert rc == 0, f"check {rc}: {AENQ_CHECKS.get(rc, 'crashed or unknown exit code')}"
