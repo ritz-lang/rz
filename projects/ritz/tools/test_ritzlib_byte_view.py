@@ -47,17 +47,8 @@ def test_string_eq_family_returns_bool(method):
 
 
 # AGAST #1943: the rest of the predicate family follows string_eq to bool.
-# Since #4533 the String/StrView predicates are impl methods; Span's are free
-# fns in this file still.
-PREDICATES = {
-    "span.ritz": [
-        "span_eq",
-        "span_contains",
-        "span_starts_with",
-        "span_ends_with",
-    ],
-}
-
+# Since #4533 the String/StrView predicates are impl methods; since #4684
+# Span<u8>'s are methods of span.ritz's Bytes trait (`impl Bytes for Span<u8>`).
 PREDICATE_METHODS = {
     "string.ritz": [
         "eq", "eq_string", "eq_strview", "eq_cstr", "is_empty",
@@ -68,19 +59,8 @@ PREDICATE_METHODS = {
         "is_empty", "eq", "eq_cstr", "starts_with", "starts_with_cstr",
         "ends_with", "contains",
     ],
-    "span.ritz": ["is_empty"],
+    "span.ritz": ["is_empty", "eq", "contains", "starts_with", "ends_with"],
 }
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "fname,fn", [(f, fn) for f, fns in PREDICATES.items() for fn in fns]
-)
-def test_predicate_family_returns_bool(fname, fn):
-    src = (RITZLIB / fname).read_text()
-    m = re.search(rf"^pub fn {fn}(<\w+>)?\([^)]*\)\s*->\s*(\w+)", src, re.M)
-    assert m, f"{fn} not found in {fname}"
-    assert m.group(2) == "bool", f"{fn} returns {m.group(2)}"
 
 
 @pytest.mark.unit
@@ -116,14 +96,6 @@ def test_predicate_bodies_return_no_int_literals():
     """A bool predicate saying `return 1` compiles (silent coercion) but is the
     i32 shape in disguise; pin the bodies too."""
     bad = []
-    for fname, fns in PREDICATES.items():
-        src = (RITZLIB / fname).read_text()
-        for fn in fns:
-            m = re.search(rf"^pub fn {fn}\b.*?\n(?=\S)", src + "\n#", re.M | re.S)
-            assert m, fn
-            for line in m.group(0).splitlines():
-                if re.match(r"\s*return\s+[01]\b", line):
-                    bad.append(f"{fname}:{fn}: {line.strip()}")
     for fname, methods in PREDICATE_METHODS.items():
         src = (RITZLIB / fname).read_text()
         for meth in methods:
@@ -138,12 +110,10 @@ def test_predicate_bodies_return_no_int_literals():
 @pytest.mark.integration
 def test_no_int_comparisons_against_predicates():
     """Callers must not compare a (now bool) predicate against 1 / 0."""
-    free = [fn for fns in PREDICATES.values() for fn in fns]
     meth = [m for ms in PREDICATE_METHODS.values() for m in ms]
-    free_pat = "|".join(re.escape(x) for x in free)
     meth_pat = "|".join(re.escape(x) for x in meth)
     pat = re.compile(
-        rf"(?:\b(?:{free_pat})(?:<\w+>)?|\.(?:{meth_pat}))\("
+        rf"\.(?:{meth_pat})\("
         rf"[^()]*(\([^()]*\)[^()]*)*\)\s*[!=]=\s*[01]\b")
     tracked = subprocess.run(
         ["git", "ls-files", "*.ritz"],

@@ -235,6 +235,40 @@ CASES = {
         "pub fn string_bump(s: @&String)\n    pass\n",
         [],
     ),
+    # S-IMPL-3 (#4682): a pub method whose receiver is a raw pointer.
+    "raw-receiver hit: self: *T": (
+        "struct Foo\n    n: i64\n\nimpl Foo\n    pub fn m(self: *Foo) -> i64\n        self.n\n",
+        [("raw-receiver", "m")],
+    ),
+    "raw-receiver hit: self: **T, generic impl, multi-line signature": (
+        (
+            "struct W<T>\n    p: *T\n\nimpl<T> W<T>\n    pub fn aim(\n        self: **W<T>,\n"
+            "        to: @W<T>\n    )\n        pass\n"
+        ),
+        [("raw-receiver", "aim")],
+    ),
+    "raw-receiver miss: @T, @&T, self:& and bare self": (
+        (
+            "struct Foo\n    n: i64\n\nimpl Foo\n"
+            "    pub fn a(self: @Foo) -> i64\n        self.n\n"
+            "    pub fn b(self: @&Foo)\n        self.n = 1\n"
+            "    pub fn c(self:&)\n        self.n = 1\n"
+            "    pub fn d(self) -> i64\n        self.n\n"
+        ),
+        [],
+    ),
+    "raw-receiver miss: private method": (
+        "struct Foo\n    n: i64\n\nimpl Foo\n    fn m(self: *Foo) -> i64\n        self.n\n",
+        [],
+    ),
+    "raw-receiver miss: trait impl": (
+        "struct Foo\n    n: i64\n\nimpl Drop for Foo\n    pub fn drop(self: *Foo)\n        pass\n",
+        [],
+    ),
+    "raw-receiver miss: a raw non-self parameter is raw-ptr-param's": (
+        "struct Foo\n    n: i64\n\nimpl Foo\n    pub fn m(self: @Foo, p: *Foo)\n        pass\n",
+        [("raw-ptr-param", "m")],
+    ),
     # S-OWN-2: raw allocation outside the functions of the owning type.
     "raw-alloc hit": (
         "fn scratch(n: i64) -> i64\n    let p = malloc(n)\n    free(p)\n    n\n",
@@ -398,6 +432,12 @@ def test_ratchet_fails_on_a_new_site_exempt_or_not():
 def test_ratchet_pins_an_unnamed_key_at_zero():
     assert ratchet_breaches(_summary(out_param=(1, 0)), {}) == [
         "out-param: 1 violations > pin 0", "out-param: 1 sites (violations + exempt) > pin 0"]
+
+
+def test_ratchet_pins_raw_receivers_too():
+    """#4682: a new `pub fn m(self: *Foo)` breaks every module pin."""
+    assert ratchet_breaches(_summary(raw_receiver=(1, 0)), {}) == [
+        "raw-receiver: 1 violations > pin 0", "raw-receiver: 1 sites (violations + exempt) > pin 0"]
 
 
 def test_summary_counts_violations_and_exemptions():

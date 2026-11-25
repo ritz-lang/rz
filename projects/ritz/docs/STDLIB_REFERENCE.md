@@ -861,7 +861,7 @@ fn main() -> i32
 
 **Module**: `ritzlib.cmp` (core, bare)
 
-`Ordering`, what every three-way compare returns (`StrView.cmp`, `span_cmp`,
+`Ordering`, what every three-way compare returns (`StrView.cmp`, `Span<u8>`'s `cmp`,
 `cmp_i64`) in place of C's -1/0/1 `i32`.
 
 ```ritz
@@ -931,29 +931,29 @@ struct Span<T>
 | `s.zero()` | `fn()` | Zero every byte (`len * sizeof(T)`). Replaces `memzero(p, n)` |
 | `s.secure_zero()` | `fn()` | Zero every byte with volatile stores the optimiser cannot remove: wipe keys with `key.secure_zero()`. Replaces `secure_zero(p, n)` |
 
-**Slicing** (free functions):
+`span_slice(@s, start, end)` is `s.slice(start, end)`; it stays as a free fn
+only because ritz1 looks the symbol up to detect `ritzlib.span`. Take the
+first `n` with `s.to(n)` and skip `n` with `s.from(n)`.
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `span_slice` | `fn<T>(s: @Span<T>, start: i64, end: i64) -> Span<T>` | Sub-span |
-| `span_take` | `fn(s: @Span<u8>, n: i64) -> Span<u8>` | First n bytes |
-| `span_skip` | `fn(s: @Span<u8>, n: i64) -> Span<u8>` | Skip first n bytes |
+**Byte operations** (`trait Bytes`, `impl Bytes for Span<u8>`, AGAST #4684):
 
-**String Operations** (for `Span<u8>`):
+`Span<u8>` has StrView's layout; each method delegates to the `StrView`
+method of the same name. They are methods of a trait declared in
+`span.ritz` because an inherent `impl Span<u8>` beside `impl<T> Span<T>` is
+refused, while a trait impl on one instantiation is allowed in the trait's
+file (LANGUAGE_SPEC §12). The methods resolve from the receiver's type, so a
+selective `import ritzlib.span { Span }` reaches them too.
 
-`Span<u8>` has StrView's layout; these delegate to the `StrView` method of
-the same name (`span_eq` calls `.eq`), and `span_as_strview` / `span_from_strview` convert between the two.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `span_as_strview` | `fn(s: @Span<u8>) -> StrView` | View the same bytes as a StrView |
-| `span_eq` | `fn(a: @Span<u8>, b: @Span<u8>) -> bool` | Compare equality |
-| `span_cmp` | `fn(a: @Span<u8>, b: @Span<u8>) -> Ordering` | Bytewise order, as `StrView.cmp`. Replaces `memcmp` |
-| `span_contains` | `fn(haystack: @Span<u8>, needle: @Span<u8>) -> bool` | Contains check |
-| `span_starts_with` | `fn(s: @Span<u8>, prefix: @Span<u8>) -> bool` | Prefix check |
-| `span_ends_with` | `fn(s: @Span<u8>, suffix: @Span<u8>) -> bool` | Suffix check |
-| `span_find` | `fn(haystack: @Span<u8>, needle: @Span<u8>) -> i64` | Find substring |
-| `span_find_byte` | `fn(s: @Span<u8>, c: u8) -> i64` | Find byte |
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `s.as_strview()` | `fn() -> StrView` | View the same bytes as a StrView (`span_from_strview` goes back) |
+| `a.eq(@b)` | `fn(other: @Span<u8>) -> bool` | Compare equality |
+| `a.cmp(@b)` | `fn(other: @Span<u8>) -> Ordering` | Bytewise order, as `StrView.cmp`. Replaces `memcmp` |
+| `h.contains(@n)` | `fn(needle: @Span<u8>) -> bool` | Contains check |
+| `s.starts_with(@p)` | `fn(prefix: @Span<u8>) -> bool` | Prefix check |
+| `s.ends_with(@x)` | `fn(suffix: @Span<u8>) -> bool` | Suffix check |
+| `h.find(@n)` | `fn(needle: @Span<u8>) -> i64` | Index of `n`, or `h.len` when absent |
+| `s.find_byte(c)` | `fn(c: u8) -> i64` | Index of `c`, or `s.len` when absent |
 
 ---
 
@@ -1077,7 +1077,7 @@ New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
 | `strchr` | `s.find_byte(c)` |
 | `strrchr` | `s.rfind(t)` |
 | `strstr` | `s.find(t)`, `s.contains(t)` |
-| `memcpy`, `memmove`, `memset`, `memcmp` | `dst.copy_from(src)`, `s.fill(b)`, `span_cmp(@a, @b)` on a `Span` |
+| `memcpy`, `memmove`, `memset`, `memcmp` | `dst.copy_from(src)`, `s.fill(b)`, `a.cmp(@b)` on a `Span` |
 | `bzero`, `explicit_bzero` | `s.zero()`, `s.secure_zero()` on a `Span` |
 | `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `s.take(n)` to bound it |
 | `strcat` | `s.push_str(v)`, `s.push_string(other)` |

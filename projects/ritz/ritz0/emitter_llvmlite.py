@@ -3834,15 +3834,20 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         for method in impl_block.methods:
             # Mangle name: Type_method
             mangled_name = f"{impl_block.type_name}_{method.name}"
-            self.method_lookup[(impl_block.type_name, method.name)] = mangled_name
             # R36's revisit (#4294): `impl Display for Span<u8>` names one
             # instantiation.  A receiver of that type is spelled `Span$u8`
-            # by inference, so register the method under both keys.
+            # by inference, so register the method under both keys.  Its
+            # symbol is the instance's, `Span$u8_eq`, as ritz1 spells it
+            # (AGAST #4684): the matrix links ritz0's ritzlib objects into
+            # ritz1's programs, and `Span_eq` would also clash with a second
+            # instantiation's impl in the same trait file.
             impl_type = impl_block.impl_type
             if (not impl_block.type_params
                     and isinstance(impl_type, rast.NamedType) and impl_type.args):
                 instance = mangle_generic_name(impl_type.name, impl_type.args)
+                mangled_name = f"{instance}_{method.name}"
                 self.method_lookup[(instance, method.name)] = mangled_name
+            self.method_lookup[(impl_block.type_name, method.name)] = mangled_name
 
             # Create a copy of the method with the mangled name
             # We need to declare and emit it like a regular function
@@ -3877,7 +3882,10 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
                 if not self._should_emit_body(method):
                     continue
 
-                mangled_name = f"{type_name}_{method.name}"
+                # The name _register_impl declared (`Span$u8_eq` for a
+                # concrete instantiation's trait impl, #4684).
+                mangled_name = self.method_lookup.get(
+                    (type_name, method.name), f"{type_name}_{method.name}")
                 # Create mangled method def for emission
                 mangled_method = rast.FnDef(
                     span=method.span,

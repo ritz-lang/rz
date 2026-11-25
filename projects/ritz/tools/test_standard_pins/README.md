@@ -38,11 +38,13 @@ The original module-group comment from `test_standard_report.py` (#1347):
 ## C-shape ratchets (AGAST #4636)
 
 `test_cshape_<module>.py` pin the C shapes `standard_report.py` counts for
-goal 5 (`bool-return`, `status-return`, `out-param`) as down-only ceilings
+goal 5 (`bool-return`, `status-return`, `out-param`, and since #4682
+`raw-receiver`) as down-only ceilings
 (`standard_report.ratchet_breaches`): a migration that lowers a count passes,
 a new C-shaped fn fails.  `test_cshape_ritzlib.py` pins the whole tree, so a
 module with no file of its own is covered too.  Lower a pin when you lower
 its count.
+`test_raw_receiver.py` pins `raw-receiver` per module (#4682: all zero).
 
 The `--callers` ratchet (calls of exempt raw APIs from outside ritzlib, per
 project) is `tools/test_standard_callers.py`: it names every package, and

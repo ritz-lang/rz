@@ -48,8 +48,9 @@ def test_free_fn_method_is_clear_across_ritzlib():
     """
     summary = summarise(scan_tree([RITZ_ROOT / "ritzlib"]))
     assert summary["free-fn-method"]["violations"] == 0
-    # 14 are deliberate, documented exemptions (span.ritz 11, sys.ritz 2,
-    # time.ritz's sleep(d: Duration), AGAST #4637; #4639 added span_cmp
-    # and deleted span_eq_cstr).
-    assert summary["free-fn-method"]["exempt"] == 14
+    # 4 are deliberate, documented exemptions: span.ritz's span_slice
+    # (ritz1 looks the symbol up), sys.ritz's 2 target-gated wrappers and
+    # time.ritz's sleep(d: Duration) (AGAST #4637).  #4684 made span.ritz's
+    # other 10 (span_eq and the byte family) methods of its Bytes trait.
+    assert summary["free-fn-method"]["exempt"] == 4
     assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}

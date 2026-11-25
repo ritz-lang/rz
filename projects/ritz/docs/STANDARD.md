@@ -594,6 +594,16 @@ caller's value. Use a bare `self`, which is by value, only to consume it or to
 work on a copy (LANGUAGE_SPEC §5.4, LARB R10). A constructor has no `self`, is
 named `new` or `with_<what>`, and is called as `Type.new()`.
 
+A raw `self: *Type` says nothing about what the method does, and lets a null
+or dangling pointer in where a borrow can't be one. Keep it only where `self`
+really is a raw pointer that is not a borrow (a kernel-shared ring entry, say),
+marked `standard-exempt` with that reason (AGAST #4682). `x.m()` lends `x` to
+an `@Type` or `@&Type` receiver through any number of pointer levels (§5.4 of
+LANGUAGE_SPEC), so callers holding a `*Type` don't change.
+
+Report: `raw-receiver`. Counts each `pub` method of an inherent `impl` whose
+`self` is a raw pointer (`self: *T`, `self: **T`).
+
 ```ritz
 struct Range
     lo: i64

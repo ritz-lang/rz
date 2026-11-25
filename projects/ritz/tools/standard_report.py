@@ -54,6 +54,8 @@ fns are never counted.
   free-fn-method   a public module-level fn whose first parameter's type,
                    with references, pointers and generics stripped, is a
                    struct or enum declared in the same file.
+  raw-receiver     a ``pub`` method of an inherent impl whose ``self`` is a
+                   raw pointer (``self: *T``, ``self: **T``).
   raw-alloc        each call to an ALLOC_FNS function, except in a method,
                    or in a fn whose first parameter or return type is a
                    struct declared in the same file (the owning type's own
@@ -129,6 +131,7 @@ RULES: dict[str, tuple[str, str]] = {
     "raw-ptr-param": ("S-PTR-1", "raw *T parameter on an API fn"),
     "ptr-len-param": ("S-PTR-2", "(*T, length) pair instead of Span<T>/StrView"),
     "free-fn-method": ("S-IMPL-1", "free fn on a type this module declares"),
+    "raw-receiver": ("S-IMPL-3", "method takes a raw *T self, not @T / @&T"),
     "raw-alloc": ("S-OWN-2", "raw allocation outside the owning type"),
     "lib-exit": ("S-ERR-3", "library code ends the program"),
 }
@@ -443,6 +446,10 @@ def _fn_sites(fn: Fn, types: set[str]) -> list[tuple[str, int, str]]:
                 nname, nty = fn.params[k + 1]
                 if nty in INT_TYPES and (nname in LENGTH_NAMES or nname.endswith("_len")):
                     out.append(("ptr-len-param", fn.line, f"{name}: {ty}, {nname}: {nty}"))
+    if fn.in_impl == "inherent" and fn.public and fn.params:
+        name, ty = fn.params[0]
+        if name == "self" and ty.startswith("*"):
+            out.append(("raw-receiver", fn.line, f"self: {ty}"))
     if fn.in_impl is None and fn.public and fn.params:
         name, ty = fn.params[0]
         if name != "self" and base_type(ty) in types:
@@ -659,7 +666,8 @@ def summarise(sites: list[Site]) -> dict[str, dict[str, int]]:
 
 
 # The C shapes #4636 pins down-only, per module (tools/test_standard_pins/).
-C_SHAPE_KEYS = ("bool-return", "status-return", "out-param")
+# #4682 adds raw-receiver: a `self: *T` method reads as C's `T_m(T *p)`.
+C_SHAPE_KEYS = ("bool-return", "status-return", "out-param", "raw-receiver")
 
 
 def ratchet_breaches(summary: dict[str, dict[str, int]],
