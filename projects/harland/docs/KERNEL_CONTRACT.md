@@ -14,9 +14,9 @@ This document defines the stable interface that Harland provides to filesystem d
 
 ## Overview
 
-Goliath runs as a Ring 2 service and communicates with:
+Goliath runs as a system service and communicates with:
 1. **Applications** (Ring 3) - via IPC channels
-2. **Block drivers** (Ring 2) - via IPC channels
+2. **Block drivers** (Ring 1) - via IPC channels
 3. **Kernel** (Ring 0) - via syscalls
 
 This contract specifies the syscall interface Goliath depends on.
@@ -252,107 +252,38 @@ pub struct CapInfo
 
 ### Memory Syscalls
 
-#### SYS_SHM_CREATE (50)
+> **Struck.** This draft once numbered `SYS_SHM_CREATE` 50, `SYS_SHM_MAP` 51,
+> `SYS_SHM_UNMAP` 52, `SYS_IRQ_WAIT` 60, `SYS_DMA_ALLOC` 61, `SYS_DMA_FREE` 62,
+> `SYS_MMIO_MAP` 63 and `SYS_IRQ_ACK` 64. None of them exist, and none of 50–64
+> is allocated for a driver ABI: 50 and 51 are `InputPoll` and `InputRead`
+> (`syscall/numbers.ritz`), and 60 and 61 stay free for their Linux meanings.
+> Do not reintroduce these numbers.
 
-```ritz
-# Create a shared memory region
-fn sys_shm_create(
-    size: u64,           # Size in bytes (rounded up to page)
-    flags: u32           # Flags (SHM_READ, SHM_WRITE, SHM_EXEC)
-) -> CapHandle
-```
+#### Shared memory: `CAP_TYPE_SHM`
 
-- **Returns**: Capability for shared memory
-- **Errors**: -ENOMEM if out of memory
-
-#### SYS_SHM_MAP (51)
-
-```ritz
-# Map shared memory into address space
-fn sys_shm_map(
-    shm_cap: CapHandle,  # Shared memory capability
-    addr_hint: *u8,      # Desired address (null for any)
-    flags: u32           # MAP_FIXED, etc.
-) -> *u8
-```
-
-- **Returns**: Mapped address on success
-- **Errors**: -ENOMEM, -EINVAL
-
-#### SYS_SHM_UNMAP (52)
-
-```ritz
-# Unmap shared memory
-fn sys_shm_unmap(addr: *u8, size: u64) -> i32
-```
-
-- **Returns**: 0 on success
-
-#### SYS_DMA_ALLOC (61)
-
-```ritz
-# Allocate DMA-capable memory (for drivers only)
-fn sys_dma_alloc(size: u64) -> DmaRegion
-
-pub struct DmaRegion
-    virt: *u8            # Virtual address
-    phys: u64            # Physical address (for hardware)
-    size: u64            # Actual size allocated
-```
-
-- **Requires**: Driver privilege (Ring 2)
-- **Properties**: Physically contiguous, not pageable
-- **Errors**: -ENOMEM, -EPERM if not a driver
-
-#### SYS_DMA_FREE (62)
-
-```ritz
-# Free DMA memory
-fn sys_dma_free(virt: *u8) -> i32
-```
-
-- **Returns**: 0 on success
+Shared memory is a `CAP_TYPE_SHM` capability (`cap/types.ritz`), granted and
+revoked with `SYS_CAP_GRANT` (40) and `SYS_CAP_REVOKE` (41) and mapped with
+`ShmMap` (227). There is no separate `SYS_SHM_*` family.
 
 ---
 
-### Device Syscalls (Ring 2 Drivers Only)
+### Device Syscalls (Ring 1 Drivers Only)
 
-#### SYS_MMIO_MAP (63)
+Drivers run in ring 1. Device authority is a capability, not a privilege bit;
+a missing capability is `Errno.Perm`. The numbers below are reserved by
+[`RING1_DRIVER.md`](RING1_DRIVER.md), which defines their arguments and
+returns; they are not yet in `syscall/numbers.ritz`.
 
-```ritz
-# Map device MMIO region
-fn sys_mmio_map(
-    mmio_cap: CapHandle, # MMIO capability (granted by kernel)
-    size: u64            # Size to map
-) -> *u8
-```
+| Number | Name | Capability | Purpose |
+|--------|------|------------|---------|
+| 220 | `DrvIrqWait` | `CAP_TYPE_IRQ` | Park on the process wait set, including this device's IRQ object, with a deadline |
+| 221 | `DrvMmioMap` | `CAP_TYPE_MMIO` | Map whole pages of a recorded MMIO window, uncached, into this process |
+| 222 | `DrvDmaAlloc` | `CAP_TYPE_IRQ` | Allocate zeroed DMA pages in the device's translated domain; reports the IOVA |
+| 223 | `DrvDmaFree` | `CAP_TYPE_IRQ` | Return a completed DMA run |
+| 227 | `ShmMap` | `CAP_TYPE_SHM` | Map a shared-memory object (frame rings) |
 
-- **Requires**: MMIO capability for specific device
-- **Properties**: Uncached, device memory
-- **Returns**: Virtual address of mapped region
-
-#### SYS_IRQ_WAIT (60)
-
-```ritz
-# Wait for interrupt
-fn sys_irq_wait(
-    irq_cap: CapHandle,  # IRQ capability (granted by kernel)
-    timeout_ms: i64      # Timeout (-1 = infinite)
-) -> i32
-```
-
-- **Blocking**: Until interrupt fires or timeout
-- **Returns**: 0 on interrupt, -ETIMEDOUT on timeout
-
-#### SYS_IRQ_ACK (64)
-
-```ritz
-# Acknowledge interrupt (re-enable)
-fn sys_irq_ack(irq_cap: CapHandle) -> i32
-```
-
-- **Must call**: After handling interrupt
-- **Returns**: 0 on success
+**IRQ acknowledgement is not a syscall.** The kernel owns the IDT and sends
+the LAPIC EOI itself; a driver never acknowledges an interrupt.
 
 ---
 

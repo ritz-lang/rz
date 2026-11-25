@@ -26,7 +26,7 @@ Everything else runs in lower privilege rings.
 │   └─ ~5KB code, deterministic latency                       │
 ├─────────────────────────────────────────────────────────────┤
 │ Ring 1 - Device Drivers                                     │
-│   • Direct hardware access (MMIO, port I/O)                 │
+│   • Direct hardware access (MMIO; port I/O not granted)     │
 │   • Interrupt handling (delegated from ring 0)              │
 │   • NIC driver, storage drivers, etc.                       │
 │   • Can modify ring buffers shared with ring 2/3            │
@@ -74,6 +74,11 @@ Each connection/channel uses a **shared ring buffer**:
 - Kernel flips bits back, returns to ring 3
 - **No data copying**, just permission changes
 
+> **Superseded.** The per-call page-table flip above is not the design.
+> [`RING1_DRIVER.md`](RING1_DRIVER.md) uses persistent SPSC rings in
+> `CAP_TYPE_SHM` regions, mapped once by `ShmMap` (227), so a message neither
+> edits page tables nor shoots down the TLB.
+
 ## Networking Architecture
 
 ```
@@ -116,7 +121,14 @@ Each connection/channel uses a **shared ring buffer**:
 
 ## Milestone Roadmap to TCP/IP
 
-### Phase 1: Multi-core & APIC (Current Focus)
+> **Historical.** Phases 1–4 below are the original plan. Much of that work now
+> exists, all of it in ring 0: LAPIC, I/O APIC, AP startup, per-CPU data,
+> preemptive scheduling (AGAST #3629), ring-3 syscalls (`syscall` entry,
+> `iretq` return, not SYSRET), capabilities, and an in-kernel virtio-net
+> driver. Ring-1 drivers are designed in [`RING1_DRIVER.md`](RING1_DRIVER.md).
+> That design grants MMIO, DMA and IRQ wait but not port I/O.
+
+### Phase 1: Multi-core & APIC
 1. **Local APIC initialization**
 2. **I/O APIC for interrupt routing**
 3. **AP (Application Processor) startup**
@@ -139,7 +151,7 @@ Each connection/channel uses a **shared ring buffer**:
 
 ### Phase 4: Device Driver Framework
 1. **Driver isolation model**
-2. **MMIO/port access from ring 1**
+2. **MMIO access from ring 1** (port I/O is not granted)
 3. **Interrupt delegation**
 4. **DMA buffer management**
 5. **virtio-net driver (QEMU)**

@@ -375,8 +375,11 @@ import net.ip { ip_is_configured, ip_get_our_ip, ip_get_gateway }
 import net.icmp { icmp_ping }
 import drivers.virtio.net { virtio_net_get_mac }
 
-pub const SYS_NET_INFO: i64 = 40
-pub const SYS_NET_PING: i64 = 41
+# 40 and 41 are CapGrant / CapRevoke (syscall/numbers.ritz), not network
+# syscalls. RING1_DRIVER.md reserves NetInfo = 224 and NetAddr = 225;
+# net_ping is not numbered. 60 and 61 stay free for their Linux meanings.
+pub const SYS_NET_INFO: i64 = 224   # NetInfo (reserved, RING1_DRIVER.md)
+pub const SYS_NET_ADDR: i64 = 225   # NetAddr (reserved, RING1_DRIVER.md)
 
 pub struct NetInfo
     configured: u8
@@ -391,9 +394,13 @@ pub fn sys_net_info(info_ptr: *NetInfo) -> i64
     # Copy network config to userspace
     ...
 
-pub fn sys_net_ping(ip_ptr: *u8, timeout_ms: i64) -> i64
-    # Send ICMP echo, wait for reply
+pub fn sys_net_addr(addr_ptr: *u8) -> i64
+    # Copy the stack's IPv4 lease to userspace. RING1_DRIVER.md splits this
+    # sketch's struct: NetInfo is the link record (MAC, link, MTU, device
+    # type) and NetAddr carries the addresses.
     ...
+
+# No sys_net_ping: net_ping is not numbered (RING1_DRIVER.md non-goals).
 ```
 
 ---
@@ -437,8 +444,11 @@ pub fn sys_net_ping(ip_ptr: *u8, timeout_ms: i64) -> i64
 - Test: full stack integration
 
 ### Step 9: Create net/syscall.ritz
-- sys_net_info
-- sys_net_ping
+> Not present. Superseded by `NetInfo` (224) and `NetAddr` (225) in
+> [`RING1_DRIVER.md`](RING1_DRIVER.md); `net_ping` is not numbered.
+
+- sys_net_info (`NetInfo` 224)
+- sys_net_addr (`NetAddr` 225)
 - Test: userspace can query network
 
 ### Step 10: Update main.ritz
@@ -447,12 +457,21 @@ pub fn sys_net_ping(ip_ptr: *u8, timeout_ms: i64) -> i64
 - Call net_stack_init() and net_poll()
 
 ### Step 11: Userspace utilities
+> Not present. UDP is DHCP-only and TCP frames are dropped.
+
 - /bin/ping
 - Shell ifconfig/ping commands
 
 ---
 
 ## Ring 1/2 Infrastructure (Future)
+
+> **Superseded for ring 1.** [`RING1_DRIVER.md`](RING1_DRIVER.md) is the
+> ring-1 design. It grants MMIO (`DrvMmioMap` 221), DMA (`DrvDmaAlloc` 222)
+> and IRQ wait (`DrvIrqWait` 220) by capability, and frames move over SPSC
+> rings in `CAP_TYPE_SHM` regions (`ShmMap` 227), not an IPC channel.
+> `IOPORT` / port-I/O grants are rejected. The ring-2 `netd` split is still
+> future work.
 
 Once the stack is properly organized, we can split it:
 
