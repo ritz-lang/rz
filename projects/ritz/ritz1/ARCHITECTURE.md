@@ -389,7 +389,8 @@ empty. A note that belongs to a move goes on that check's own entry.
 | Module | Responsibility |
 |---|---|
 | `emitter` | `emit_module`, `emit_fn`, impl methods; post-passes over the emitted IR text. |
-| `emitter_core` | `EmitterState`, struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. |
+| `emitter_core` | `EmitterState`, struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. Imports no emitter module above it (AGAST #1818), so it is outside the emitter import cycle: a fn that needs one belongs in `emitter_types`. |
+| `emitter_types` | What an expression's type, struct, pointee or element is, asked before it is emitted: the half of the old `emitter_core` that reaches up into method lookup (`emitter_expr_call`), index-through views (`index_through`), deref pointee names (`emitter_expr_arith`) or `emit_expr` for a spill (AGAST #1818). |
 | `emitter_ir` | Typed IR builders (casts, load/store, alloca, branches): the spelling of an instruction lives here, not at each site. A leaf module, so it stays out of the emitter import cycle (AGAST #1817). |
 | `emitter_expr` | `emit_expr` dispatch and struct literals. |
 | `emitter_expr_access`, `emitter_expr_arith`, `emitter_expr_call` | Identifiers/index/member; binary/unary; calls and methods. |
@@ -427,7 +428,8 @@ Tracked under AGAST #1812 (M1.3). `make arch-report` shows its shape.
   checks still run inside the emitter. Sema exists; the move is #1816.
 - **The emitter import cycle** — the emitter modules, the emitter-side checks
   and monomorph form one strongly connected component (`make arch-report`,
-  "Import cycles"), around `emitter_core`'s `EmitterState`. No module may
+  "Import cycles"), over `emitter_core`'s `EmitterState` (#1818 moved
+  `emitter_core` itself below it, into `emitter_types`). No module may
   join it (`CYCLE_BASELINE` in `tools/ritz1_arch.py`, checked by the gate).
   Breaking it, dissolving `emitter_core` and splitting the long functions
   the report lists is #1818.

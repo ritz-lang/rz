@@ -4,7 +4,7 @@ struct field whose type is a pointer to a float or bool (`p: *f64`,
 
 Before the fix ritz1 lowered `*r.p` to `load i8, ptr` and `*r.p = v` to
 `store i64 %double, ptr`: the member-pointee lookups (get_member_pointee_type
-and ptr_field_elem_kind, emitter_core.ritz) knew integer pointees only, so a
+and ptr_field_elem_kind, now emitter_types.ritz / ast_query.ritz) knew integer pointees only, so a
 float pointee fell to their `u8` / `i64` defaults. The IR did not even pass
 llc (`'%.12' defined with type 'i64' but expected 'double'`).
 

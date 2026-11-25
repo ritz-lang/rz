@@ -2,7 +2,7 @@
 
 THE DEFECT
 
-`ptr_arith_elem_size` (ritz1/src/emitter_core.ritz) decides whether the left
+`ptr_arith_elem_size` (ritz1/src/emitter_types.ritz) decides whether the left
 operand of `+`/`-` is a pointer, and with what stride, by its AST shape. It
 knew identifiers, member accesses and left-associated chains of those — but
 not an address-of. `@arr[0] + 2` classified as "not a pointer" and lowered to

@@ -38,6 +38,7 @@ SOURCES = \
 	impl_placement \
 	generic_infer \
 	emitter_core \
+	emitter_types \
 	emitter_ir \
 	frame_limit \
 	binder_check \

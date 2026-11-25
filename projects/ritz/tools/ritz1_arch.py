@@ -60,8 +60,6 @@ CYCLE_BASELINE = frozenset(
     (
         "binder_check",
         "bool_kind",
-        "emitter_asm",
-        "emitter_core",
         "emitter_expr",
         "emitter_expr_access",
         "emitter_expr_arith",
@@ -69,6 +67,7 @@ CYCLE_BASELINE = frozenset(
         "emitter_match",
         "emitter_print",
         "emitter_stmt",
+        "emitter_types",
         "float_slot",
         "index_through",
         "let_check",

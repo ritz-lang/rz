@@ -12,7 +12,7 @@ A bare `"..."` is a StrView (AGAST #98), so its methods resolve as on a
 StrView local: an `impl StrView` method, or ritz1's `strview_*` UFCS
 fallback.  emit_expr_method (ritz1/src/emitter_expr_call.ritz) had no arm for
 an EXPR_STRING_LIT receiver, and method_recv_type_name
-(ritz1/src/emitter_core.ritz) didn't name one, so the bool check couldn't type
+(ritz1/src/emitter_types.ritz since #1818) didn't name one, so the bool check couldn't type
 `if "hello".starts_with("he")` either ("if condition must be bool, and ritz1
 cannot tell that it is").
 
