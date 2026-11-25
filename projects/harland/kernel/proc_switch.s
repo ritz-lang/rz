@@ -51,6 +51,9 @@ sched_switch:
 .global proc_first_entry
 .type proc_first_entry, @function
 proc_first_entry:
+    # A process marked PROC_REAP before it ever ran does not enter user mode
+    # either (#4714, syscall_entry.s reap_if_marked).
+    call reap_if_marked
     popq %r15
     popq %r14
     popq %r13

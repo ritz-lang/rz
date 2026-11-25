@@ -304,6 +304,11 @@ syscall_entry:
     # Disable interrupts for exit sequence
     cli
 
+    # A PROC_REAP process does not return to user (#4714): reap_if_marked
+    # enters sys_exit_impl instead, before the sysretq / IRETQ choice. The
+    # call clobbers only registers popped from the frame below.
+    call reap_if_marked
+
     # Restore callee-saved registers (CRITICAL: must restore user's RBX!)
     popq %r15
     popq %r14
@@ -371,6 +376,35 @@ syscall_exit_iret:
     iretq
 
 .size syscall_entry, . - syscall_entry
+
+# ============================================================================
+# The PROC_REAP check on every return to user (AGAST #4714)
+# ============================================================================
+# void reap_if_marked(void): called by the syscall exit above, by
+# isr_stubs.s's isr_common and irq_common for a frame whose CS has a
+# non-zero RPL, and by proc_switch.s's proc_first_entry, each with IF=0, GS
+# on this CPU's area, RSP 16-byte aligned, and the user's registers still in
+# the frame. Returns when the running process is not marked
+# (proc/table.ritz proc_reap_current). A marked one (process_mark_exit)
+# never goes back to user: the frame it was returning through is abandoned,
+# RSP moves to the top of its own kernel stack (PC_KSTACK_TOP, which is
+# TSS.rsp0) -- an IRQ from user may be on IST2/IST3 here -- and
+# process_reap_exit runs sys_exit_impl there. RCX, RDX, RSI, RDI, R8-R11
+# are clobbered, as by any call.
+.global reap_if_marked
+.type reap_if_marked, @function
+reap_if_marked:
+    subq $8, %rsp                # 16-byte aligned for the call
+    call proc_reap_current
+    addq $8, %rsp
+    testq %rax, %rax
+    jnz 1f
+    ret
+1:
+    movq %gs:PC_KSTACK_TOP, %rsp
+    call process_reap_exit
+    ud2                          # process_reap_exit does not return
+.size reap_if_marked, . - reap_if_marked
 
 # ============================================================================
 # Jump to Userspace (Initial Entry)

@@ -275,6 +275,13 @@ isr_common:
     movq %rsp, %rdi
     call exception_handler
 
+    # A return to user (CS RPL != 0, InterruptFrame word 18) of a PROC_REAP
+    # process enters sys_exit_impl instead (#4714, syscall_entry.s).
+    testq $3, 144(%rsp)
+    jz 1f
+    call reap_if_marked
+1:
+
     # Restore all general-purpose registers
     popq %r15
     popq %r14
@@ -310,6 +317,13 @@ irq_common:
     # Call the Ritz IRQ handler
     movq %rsp, %rdi
     call irq_handler
+
+    # A return to user (CS RPL != 0, InterruptFrame word 18) of a PROC_REAP
+    # process enters sys_exit_impl instead (#4714, syscall_entry.s).
+    testq $3, 144(%rsp)
+    jz 1f
+    call reap_if_marked
+1:
 
     # Restore all general-purpose registers
     popq %r15

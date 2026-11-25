@@ -38,11 +38,11 @@ import cap.selftest { cap_device_selftest }
 import cap.shm_selftest { shm_map_selftest }
 import arch.x86_64.percpu { CPU_KSTACK, cpu_index, cpu_stack_guard }
 import arch.x86_64.apic { x2apic_mode, lapic_id, lapic_icr_lo_mmio }
-import proc.table { Proc, PROC_CHILD_LIVE, proc_child_status, proc_at, proc_current, proc_current_pid, proc_current_slot, proc_is_init, proc_live_count }
+import proc.table { Proc, PROC_CHILD_LIVE, proc_child_status, proc_at, proc_current, proc_current_pid, proc_current_slot, proc_is_init, proc_live_count, proc_reap_pending, MarkError }
 import proc.sched { sched_is_running, sched_start, sched_stop, sched_yield, sched_preemption_count }
 import fs.syscall { fs_process_pid }
 import syscall.stack { kstack_top }
-import syscall.runtime.process { process_create_init, process_destroy_init, process_spawn_image, process_wait }
+import syscall.runtime.process { PROC_REAP_STATUS, process_create_init, process_destroy_init, process_spawn_image, process_wait, process_mark_exit }
 import ritzlib.span { Span, span_from_ptr }
 
 # ============================================================================
@@ -473,12 +473,62 @@ fn driver_preempt_self_test() -> bool
     klog("\n")
     return ok and preempted > 0
 
+# driver-reap (#4714, RING1_DRIVER.md Tests 4): pid 1 marks a spinning stub
+# with process_mark_exit. The stub never makes a syscall, so only the return
+# from the timer IRQ that preempted it can reap it: it leaves through
+# sys_exit_impl on its own kernel stack with PROC_REAP_STATUS, not by an
+# exit of its own (whose status would be its report). Pid 1 runs on,
+# unmarked, and process_mark_exit(1) is refused.
+const DRIVER_REAP_SPIN: u64 = 0x7FFFFFFFFFFFFFFF   # never ends on its own
+const DRIVER_REAP_WAIT_US: u64 = 1000000
+
+fn driver_reap_self_test() -> bool
+    klog("\nTesting process_mark_exit on a kernel-spawned process...\n")
+    sched_start(proc_current_slot())
+    let pid: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_SPIN, DRIVER_REAP_SPIN)
+    if pid <= 0
+        sched_stop()
+        klog("  spawn failed\n")
+        return false
+    # It is at CPL 3, spinning, once a tick has preempted it back to pid 1.
+    let before: u64 = sched_preemption_count()
+    var deadline: u64 = deadline_after_us(DRIVER_REAP_WAIT_US)
+    while sched_preemption_count() == before and not deadline_passed(deadline)
+        sched_yield()
+    let spun: bool = sched_preemption_count() != before
+    let refused: bool = match process_mark_exit(1)
+        Err(e) => e == MarkError.Init
+        Ok(_) => false
+    let marked: bool = process_mark_exit(pid as u64).is_ok()
+    var code: i64 = 0
+    deadline = deadline_after_us(DRIVER_REAP_WAIT_US)
+    while proc_child_status(pid as u64, @code) == PROC_CHILD_LIVE and not deadline_passed(deadline)
+        sched_yield()
+    var status: i64 = -1
+    if proc_child_status(pid as u64, @code) != PROC_CHILD_LIVE
+        status = process_wait(pid as i32)
+    sched_stop()
+    let runs_on: bool = proc_current_pid() == 1 and not proc_reap_pending(proc_current())
+    klog("  status ")
+    klog_dec(status)
+    if not spun
+        klog(", never reached CPL 3")
+    if not refused
+        klog(", process_mark_exit(1) not refused")
+    if not marked
+        klog(", mark failed")
+    if not runs_on
+        klog(", pid 1 is not running unmarked")
+    klog("\n")
+    return spun and refused and marked and status == PROC_REAP_STATUS as i64 and runs_on
+
 # The driver-* tests, as pid 1 with its scheduler stopped (on pid 1's kernel
 # stack: boot_process_tests).
 fn driver_process_tests()
     boot_test_result("driver-enter", driver_enter_self_test())
     boot_test_result("driver-fault", driver_fault_self_test())
     boot_test_result("driver-preempt", driver_preempt_self_test())
+    boot_test_result("driver-reap", driver_reap_self_test())
 
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before

@@ -26,9 +26,15 @@
 #
 # A process whose parent exits first is detached: nobody can wait for it,
 # and its own exit frees its slot instead of leaving a zombie.
+#
+# PROC_REAP in `flags` (proc_mark_exit, #4714): the kernel has told this
+# process to exit. It is not killed where it stands: its next return to user
+# (syscall_entry.s reap_if_marked) enters sys_exit_impl on its own kernel
+# stack instead.
 
 import syscall.errno { Errno }
 import ritzlib.strview { StrView }
+import ritzlib.result { Result }
 
 # Live and zombie processes at once; fs/syscall.ritz has FS_MAX_PROCS FsProcs
 # and syscall_entry.s one kernel stack per slot (PROC_KSTACK_SLOTS).
@@ -45,6 +51,14 @@ pub const BLOCK_NONE: u8 = 0
 pub const BLOCK_CHILD: u8 = 1       # for child wait_pid to exit (wait, blocking spawn)
 pub const BLOCK_TTY: u8 = 2         # for console input (read(0))
 pub const BLOCK_IRQ: u8 = 3         # for a device interrupt (a driver wait, #4220)
+
+# Proc.flags
+pub const PROC_REAP: u8 = 1         # exit at the next return to user (proc_mark_exit)
+
+# Why proc_mark_exit refused.
+pub enum MarkError
+    Init            # pid 1: init is never reaped this way
+    NoProcess       # no live process (not a zombie) has that pid
 
 # proc_child_status
 pub const PROC_CHILD_EXITED: i32 = 0
@@ -65,6 +79,7 @@ pub struct Proc
     state: u8
     block: u8               # BLOCKED: why (BLOCK_*)
     detached: u8            # its parent exited: its exit frees it, no zombie
+    flags: u8               # PROC_REAP
     pml4: u64               # page table (CR3)
     ksp: u64                # kernel RSP saved by sched_switch while it isn't running
     wait_pid: u64           # BLOCK_CHILD: the child it waits for
@@ -81,6 +96,7 @@ fn proc_free(i: i32)
     procs[i].parent = -1
     procs[i].block = BLOCK_NONE
     procs[i].detached = 0
+    procs[i].flags = 0
     procs[i].wait_pid = 0
 
 # Empty table, nothing running (boot; the host tests).
@@ -146,6 +162,7 @@ pub fn proc_enter_init(pml4: u64) -> i32
     (*p).state = PROC_RUNNING
     (*p).block = BLOCK_NONE
     (*p).detached = 0
+    (*p).flags = 0
     (*p).pml4 = pml4
     (*p).ksp = 0
     (*p).wait_pid = 0
@@ -175,6 +192,7 @@ pub fn proc_new_child() -> i32
     (*c).state = PROC_NEW
     (*c).block = BLOCK_NONE
     (*c).detached = 0
+    (*c).flags = 0
     (*c).pml4 = 0
     (*c).ksp = 0
     (*c).wait_pid = 0
@@ -211,6 +229,39 @@ pub fn proc_wake(reason: u8)
             procs[i].state = PROC_RUNNING
             procs[i].block = BLOCK_NONE
         i = i + 1
+
+# The kernel tells process `pid` to exit (RING1_DRIVER.md "Driver death",
+# #4714): PROC_REAP is set, and a parked pid is woken so it reaches its return
+# to user, where the reap happens. The caller is not the process that exits,
+# and nothing is torn down here.
+pub fn proc_mark_exit(pid: u64) -> Result<(), MarkError>
+    if pid == 0
+        return Err(MarkError.NoProcess)
+    var i: i32 = 0
+    while i < MAX_PROCS
+        let p: *Proc = @procs[i]
+        if p.pid == pid and p.state != PROC_FREE and p.state != PROC_ZOMBIE
+            if proc_is_init(p)
+                return Err(MarkError.Init)
+            (*p).flags = p.flags | PROC_REAP
+            if p.state == PROC_BLOCKED
+                (*p).state = PROC_RUNNING
+                (*p).block = BLOCK_NONE
+                (*p).wait_pid = 0
+            return Ok(())
+        i = i + 1
+    Err(MarkError.NoProcess)
+
+# `p` is marked to exit at its next return to user.
+pub fn proc_reap_pending(p: *Proc) -> bool
+    p != 0 as *Proc and (p.flags & PROC_REAP) != 0
+
+# The running process is marked PROC_REAP: 1, else 0. A u64 for
+# syscall_entry.s reap_if_marked, which tests it in RAX.
+pub fn proc_reap_current() -> u64
+    if proc_cur >= 0 and proc_reap_pending(@procs[proc_cur])
+        return 1
+    0
 
 # The running process exits with `code`. Its unreaped children go with it,
 # its live children are detached, and it becomes a zombie for its parent's

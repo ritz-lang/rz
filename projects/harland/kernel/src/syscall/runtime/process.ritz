@@ -38,7 +38,8 @@ import loader.elf { USER_IMAGE_BASE, ElfLoadResult, elf_load }
 import syscall.errno { Errno }
 import syscall.runtime.memory { USER_STACK_TOP, alloc_user_stack }
 import syscall.runtime.argv { ArgvStatus, ArgvCapture, argv_capture, argv_buf, argv_offsets }
-import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait }
+import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait, proc_mark_exit, MarkError }
+import ritzlib.result { Result }
 import proc.sched { sched_start, sched_yield, sched_block, sched_exit, sched_prepare_user, sched_report }
 import cap.table { CapTable, cap_process_has, cap_table_alloc, cap_table_free_pid, cap_inherit_ambient }
 import cap.types { CAP_TYPE_POWER, CAP_TYPE_NAMESPACE, CAP_RIGHT_EXECUTE, CAP_RIGHT_READ, CAP_RIGHT_CREATE }
@@ -446,6 +447,27 @@ fn sys_exit_impl(code: i32) -> i64
 # console for Ctrl-C (#4254). Never returns.
 pub fn process_kill_current(status: i32) -> i64
     return sys_exit_impl(status)
+
+# The exit status of a process reaped through PROC_REAP: 128 + 9, as if it
+# had been sent SIGKILL (a fault is 128 + its vector, Ctrl-C 130).
+pub const PROC_REAP_STATUS: i32 = 137
+
+# The kernel tells process `pid` to exit (RING1_DRIVER.md "Driver death",
+# #4714). Not process_kill_current: that exits the caller, and the caller here
+# (pid 1, the kernel seat) is never the process that exits. The pid is marked
+# PROC_REAP and woken if parked; its next return to user enters
+# sys_exit_impl through process_reap_exit instead of resuming at CPL 3.
+# MarkError.Init for pid 1, MarkError.NoProcess for no live process.
+pub fn process_mark_exit(pid: u64) -> Result<(), MarkError>
+    return proc_mark_exit(pid)
+
+# The return to user of a PROC_REAP process (syscall_entry.s reap_if_marked,
+# #4714): the frame it was returning through is abandoned and this runs at
+# the top of the process's own kernel stack. It exits as if it had called
+# exit(PROC_REAP_STATUS), with interrupts on as in a syscall. Never returns.
+pub fn process_reap_exit()
+    enable_interrupts()
+    sys_exit_impl(PROC_REAP_STATUS)
 
 # Reap the running process's child `pid`, sleeping until it exits: its exit
 # code, or Errno.Child. The kernel's own wait, for a child it spawned with

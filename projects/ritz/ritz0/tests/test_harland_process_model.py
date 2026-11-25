@@ -351,6 +351,85 @@ fn main() -> i32
     0
 """
 
+# process_mark_exit (#4714, RING1_DRIVER.md "Driver death"): the kernel marks
+# another pid PROC_REAP; its next return to user enters sys_exit_impl. The
+# table half refuses pid 1 and wakes a parked pid without exiting the caller.
+REAP = """\
+import syscall.errno { Errno }
+import proc.table
+import ritzlib.result { Result }
+
+fn refused(r: Result<(), MarkError>, why: MarkError) -> bool
+    match r
+        Err(e) => e == why
+        Ok(_) => false
+
+fn main() -> i32
+    proc_table_reset()
+    if not refused(proc_mark_exit(1), MarkError.NoProcess)
+        return 1
+    proc_enter_init(0)
+    let init: i32 = proc_current_slot()
+    let d: i32 = proc_new_child()
+    proc_start(d)
+    let d_pid: u64 = proc_at(d).pid
+    let b: i32 = proc_new_child()
+    proc_start(b)
+    let b_pid: u64 = proc_at(b).pid
+    # pid 1 is refused, and stays unmarked
+    if not refused(proc_mark_exit(1), MarkError.Init) or proc_reap_pending(proc_at(init))
+        return 2
+    # an unknown pid, and pid 0, are no process
+    if not refused(proc_mark_exit(99), MarkError.NoProcess) or not refused(proc_mark_exit(0), MarkError.NoProcess)
+        return 3
+    # a running pid is marked; nothing else changes, the caller least of all
+    if proc_reap_pending(proc_at(d)) or not proc_mark_exit(d_pid).is_ok()
+        return 4
+    if not proc_reap_pending(proc_at(d)) or proc_at(d).state != PROC_RUNNING
+        return 5
+    if proc_current_slot() != init or proc_at(init).state != PROC_RUNNING or proc_reap_pending(proc_at(init))
+        return 6
+    if proc_reap_pending(proc_at(b))
+        return 7
+    # a parked pid is woken, so it reaches its return to user
+    proc_set_current(b)
+    proc_block(BLOCK_IRQ, 0)
+    proc_set_current(init)
+    if not proc_mark_exit(b_pid).is_ok()
+        return 8
+    if proc_at(b).state != PROC_RUNNING or proc_at(b).block != BLOCK_NONE or not proc_reap_pending(proc_at(b))
+        return 9
+    # the marked pid's exit: a zombie for init, and the mark goes with the slot
+    proc_set_current(d)
+    proc_exit_current(137)
+    proc_set_current(init)
+    if proc_wait(d_pid) != 137
+        return 10
+    let n: i32 = proc_new_child()
+    if proc_reap_pending(proc_at(n))
+        return 11
+    # a zombie is not marked: it has already exited
+    proc_set_current(b)
+    proc_exit_current(0)
+    proc_set_current(init)
+    if not refused(proc_mark_exit(b_pid), MarkError.NoProcess)
+        return 12
+    0
+"""
+
+REAP_CLAIMS = {1: "no process before init: nothing to mark",
+               2: "process_mark_exit refuses pid 1",
+               3: "an unknown pid is Errno.Srch",
+               4: "a running child is marked",
+               5: "the mark is PROC_REAP; the pid stays runnable",
+               6: "the caller is not the process that exits",
+               7: "only the named pid is marked",
+               8: "a parked pid is marked",
+               9: "marking a parked pid wakes it",
+               10: "the marked pid's exit is reaped as any exit",
+               11: "a reused slot carries no mark",
+               12: "a zombie can't be marked"}
+
 NESTING_CLAIMS = {1: "no process before init", 2: "init is pid 1 in /",
                   3: "init records its page table and has no parent",
                   4: "rzsh is pid 2 and inherits /", 5: "rzsh can chdir",
@@ -412,6 +491,12 @@ def test_round_robin_blocking_and_detached_children(tmp_path):
     rc = _run(tmp_path, SCHED)
     assert rc == 0, SCHED_CLAIMS.get(rc, f"exit {rc}")
 
+
+@pytest.mark.integration
+def test_mark_exit_refuses_init_and_wakes_a_parked_pid(tmp_path):
+    rc = _run(tmp_path, REAP)
+    assert rc == 0, REAP_CLAIMS.get(rc, f"exit {rc}")
+
 # --- source-level acceptance -------------------------------------------------------
 
 def _code(path):
@@ -456,6 +541,73 @@ def test_process_layer_runs_spawn_wait_and_cwd_on_the_table():
     assert not re.search(r"pid\s*=\s*2\b", process)
     cwd = _code(KERNEL_SRC / "syscall" / "runtime" / "cwd.ritz")
     assert re.search(r"\bproc_cwd\(", cwd) and re.search(r"\bproc_set_cwd\(", cwd)
+
+
+def _asm_code(path):
+    """Assembly with `#` comments stripped."""
+    return "\n".join(line.split("#", 1)[0].rstrip() for line in path.read_text().splitlines())
+
+
+def _asm_body(src, start, end):
+    """The text of `src` from label `start:` up to the first `end` after it."""
+    head = src.split(f"\n{start}:", 1)
+    assert len(head) == 2, f"no {start}: label"
+    return head[1].split(end, 1)[0]
+
+
+KERNEL = HARLAND / "kernel"
+
+
+# A PROC_REAP pid enters sys_exit_impl from the return to user instead of
+# returning there (#4714): the syscall exit before it picks sysretq or the
+# IRETQ fallback, and every interrupt return to CPL 3. reap_if_marked
+# (syscall_entry.s) is the only way in, and it runs process_reap_exit on the
+# pid's own kernel stack (PC_KSTACK_TOP).
+@pytest.mark.parametrize("path, start, end", [
+    ("syscall_entry.s", "syscall_entry", "sysretq"),
+    ("isr_stubs.s", "isr_common", "iretq"),
+    ("isr_stubs.s", "irq_common", "iretq"),
+    ("proc_switch.s", "proc_first_entry", "iretq"),
+])
+def test_return_to_user_checks_proc_reap(path, start, end):
+    body = _asm_body(_asm_code(KERNEL / path), start, end)
+    assert "call reap_if_marked" in body, f"{start} returns to user without the PROC_REAP check"
+    # the check runs before the GPRs come off the frame: a call clobbers them
+    assert body.index("call reap_if_marked") < body.index("popq %r15")
+    if start == "syscall_entry":
+        tail = body.split("call syscall_handler", 1)[1]
+        # after the handler, with IF=0, before the sysretq / IRETQ choice
+        assert tail.index("cli") < tail.index("call reap_if_marked") < tail.index("jne .Lsyscall_exit_iret")
+    elif start != "proc_first_entry":
+        # an interrupt return checks only a frame whose CS has a non-zero RPL
+        pre = body.split("call reap_if_marked", 1)[0]
+        assert re.search(r"testq \$3, 144\(%rsp\)\s*\n\s*jz ", pre), "no CPL check"
+
+
+def test_reap_check_enters_sys_exit_impl_on_the_pid_kernel_stack():
+    fn = _asm_body(_asm_code(KERNEL / "syscall_entry.s"), "reap_if_marked", ".size reap_if_marked")
+    assert "call proc_reap_current" in fn
+    # the frame being returned through is abandoned: the pid's own stack top
+    switch = fn.index("movq %gs:PC_KSTACK_TOP, %rsp")
+    assert fn.index("call proc_reap_current") < switch < fn.index("call process_reap_exit")
+    process = _code(KERNEL_SRC / "syscall" / "runtime" / "process.ritz")
+    reap = process.split("pub fn process_reap_exit", 1)[1].split("\npub fn ", 1)[0].split("\nfn ", 1)[0]
+    assert re.search(r"\bsys_exit_impl\(PROC_REAP_STATUS\)", reap)
+    assert "process_kill_current" not in reap
+
+
+def test_mark_exit_is_not_kill_current_and_no_wait_loop_grows_the_check():
+    process = _code(KERNEL_SRC / "syscall" / "runtime" / "process.ritz")
+    mark = process.split("pub fn process_mark_exit", 1)[1].split("\npub fn ", 1)[0]
+    assert re.search(r"\bproc_mark_exit\(", mark)
+    assert "process_kill_current" not in mark and "sys_exit_impl" not in mark
+    # round-3 item 15: wait_for_child, the tty read and BLOCK_IRQ don't check it
+    wait = process.split("fn wait_for_child", 1)[1].split("\nfn ", 1)[0]
+    assert "proc_reap" not in wait and "PROC_REAP" not in wait
+    for rel in ("proc/sched.ritz", "tty/fg.ritz"):
+        p = KERNEL_SRC / rel
+        if p.exists():
+            assert "PROC_REAP" not in _code(p), rel
 
 
 def test_init_boot_suite_runs_three_level_nesting():
