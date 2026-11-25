@@ -4799,32 +4799,20 @@ fn clone_struct_fields(mono: *MonoCtx, fields: *StructField, type_param_sv: StrV
     if fields == null
         return null
 
+    # AGAST #4680: the whole field, then what substitution rewrites.  Copied
+    # member by member, a member the copy missed (ptr_pointee, so `w.ptr` of
+    # `W$Point` was an untyped pointer any slot took) was malloc's garbage.
     let cloned: *StructField = malloc(sizeof(StructField)) as *StructField
-    cloned.name = fields.name
-    cloned.name_len = fields.name_len
-    cloned.inner_pointee_type = fields.inner_pointee_type  # AGAST #1924
-    cloned.fn_sig = fields.fn_sig  # AGAST #2120
-    cloned.elem_fn_sig = fields.elem_fn_sig  # AGAST #3666
+    *cloned = *fields
     cloned.array_shape = array_shape_mangled_subst(mono, fields.array_shape, StrView { ptr: (type_param), len: (type_param_len) as i64 }, StrView { ptr: (suffix), len: (suffix_len) as i64 })  # AGAST #2097, #3119
     # AGAST #3141: a bare `[2][3]T` leaf is the struct named `T` until
     # substituted; kept, `w.a[1][2] = x` read as assigning a whole element.
     cloned.array_shape = array_shape_subst(cloned.array_shape, StrView { ptr: (type_param), len: (type_param_len) as i64 }, subst_type, StrView { ptr: (subst_name), len: (subst_len) as i64 })
     cloned.ptr_array = ptr_array_unless_generic(fields.ptr_array)  # AGAST #2329
-
-    # Copy array info first: substituting `v: T` at an array T writes it
-    # (AGAST #2832).
-    cloned.array_size = fields.array_size
-    cloned.array_elem_type = fields.array_elem_type
-    cloned.array_elem_pointee = fields.array_elem_pointee   # AGAST #2332
-    cloned.field_mut_ref = fields.field_mut_ref
-    cloned.field_shared_ref = fields.field_shared_ref
-    cloned.field_inner_ref = fields.field_inner_ref  # AGAST #2399
     # AGAST #3151: a struct U may be the parameter; a scalar U is itself.
     cloned.field_ref_ptr_pointee = TypeKind.Void
     if ref_field_scalar_pointee(fields) == 1
         cloned.field_ref_ptr_pointee = fields.field_ref_ptr_pointee
-    cloned.array_elem_type_name = fields.array_elem_type_name
-    cloned.array_elem_type_name_len = fields.array_elem_type_name_len
 
     # Check if field type is the type parameter
     if fields.field_type == TypeKind.Struct
@@ -4981,11 +4969,19 @@ fn subst_value_field(cloned: *StructField, subst_type: TypeKind, subst_name_sv: 
         cloned.array_shape = a.shape   # AGAST #3634: `[N][M]E`
 
 # A `*T` / `@T` / `@&T` field at T = the argument.  The parser records a
-# struct pointee in field_type_name and a primitive one in array_elem_type.
+# struct pointee in field_type_name and a primitive one in array_elem_type;
+# field_new records a `*X`'s pointee kind in ptr_pointee too (TypeKind.Void
+# for a `**X`), which Sema types the field by (AGAST #4680).
 fn subst_pointee_field(cloned: *StructField, subst_type: TypeKind, subst_name_sv: StrView)
     var subst_name: *u8 = subst_name_sv.ptr
     var subst_len: i32 = subst_name_sv.len as i32
     let prim: TypeKind = primitive_type_from_name(StrView { ptr: (subst_name), len: (subst_len) as i64 })
+    if cloned.field_type == TypeKind.Ptr
+        cloned.ptr_pointee = TypeKind.Struct
+        if subst_type == TypeKind.Ptr
+            cloned.ptr_pointee = TypeKind.Void
+        else if prim != TypeKind.Void
+            cloned.ptr_pointee = prim
     if subst_type == TypeKind.Ptr
         # `*T` at T = *X is `**X`: the element is a pointer.  Checked before
         # the primitive case: a `$ptr_u8` argument arrives as the name "u8"
@@ -5041,12 +5037,7 @@ fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypePara
         return null
 
     let cloned: *StructField = malloc(sizeof(StructField)) as *StructField
-    cloned.name = fields.name
-    cloned.name_len = fields.name_len
-    cloned.inner_pointee_type = fields.inner_pointee_type  # AGAST #1924
-    cloned.fn_sig = fields.fn_sig  # AGAST #2120
-    cloned.elem_fn_sig = fields.elem_fn_sig  # AGAST #3666
-    cloned.array_shape = fields.array_shape  # AGAST #2097
+    *cloned = *fields   # AGAST #4680, as clone_struct_fields
     # AGAST #3141: a bare `[2][3]T` leaf, T one of the parameters.
     let sh: *ArrayShape = fields.array_shape
     if sh != null and sh.leaf_name != null
@@ -5068,21 +5059,10 @@ fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypePara
             msh.leaf_name_len = msh_len
             cloned.array_shape = msh
     cloned.ptr_array = ptr_array_unless_generic(fields.ptr_array)  # AGAST #2329
-    cloned.field_type = fields.field_type
-    cloned.field_type_name = fields.field_type_name
-    cloned.field_type_name_len = fields.field_type_name_len
-    cloned.array_size = fields.array_size
-    cloned.array_elem_type = fields.array_elem_type
-    cloned.array_elem_pointee = fields.array_elem_pointee   # AGAST #2332
-    cloned.field_mut_ref = fields.field_mut_ref
-    cloned.field_shared_ref = fields.field_shared_ref
-    cloned.field_inner_ref = fields.field_inner_ref  # AGAST #2399
     # AGAST #3151: a struct U may be the parameter; a scalar U is itself.
     cloned.field_ref_ptr_pointee = TypeKind.Void
     if ref_field_scalar_pointee(fields) == 1
         cloned.field_ref_ptr_pointee = fields.field_ref_ptr_pointee
-    cloned.array_elem_type_name = fields.array_elem_type_name
-    cloned.array_elem_type_name_len = fields.array_elem_type_name_len
 
     let ft: TypeKind = fields.field_type
     var by_value: i32 = 0

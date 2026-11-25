@@ -69,6 +69,7 @@ import sema_type
 import bool_check    # BK_*, bk_of_type, sema_bool_kind and its sbk_* readers
 import tail_value    # tail_note_callee (AGAST #3511)
 import ref_check     # RefEnv, ref_local_in, rs_field (AGAST #4173)
+import field_slot    # eprint_source_type
 import ritzlib.memory
 import ritzlib.str
 import ritzlib.strview
@@ -458,15 +459,22 @@ fn cc_kind_error(sm: *Sema, a: *Expr, fname_sv: StrView, argno: i32, p: *Param) 
     1
 
 # Argument `argno` of `fname`, `a`, for param `p`: slot_kind_fit's rule.  An
-# argument is refused here for a struct on either side; a float, `null` or
-# pointer into an integer param (SKF_NUM) is the argument checks' own.
-fn cc_kind(sm: *Sema, fname_sv: StrView, argno: i32, a: *Expr, p: *Param)
+# argument is refused here for a struct on either side; with `num` 1 (a call
+# of a named fn: ritz0 judges no method's argument) a float, `null` or pointer
+# into an integer param, or a narrow integer into a pointer one (SKF_NUM),
+# too, in ritz0's typing pass's words (AGAST #4680).
+fn cc_kind(sm: *Sema, fname_sv: StrView, argno: i32, a: *Expr, p: *Param, num: i32)
     var fname: *u8 = fname_sv.ptr
     var flen: i32 = fname_sv.len as i32
     if a == null or p == null or p.is_borrow == 1
         return
     var fit: SlotFit
-    if slot_kind_fit(sm, a, p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, p.param_pointee_type, 0, @fit) != SKF_AGG
+    let pname: StrView = StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }
+    let k: i32 = slot_kind_fit(sm, a, p.param_type, pname, p.param_pointee_type, 0, @fit)
+    if k == SKF_NUM and num == 1
+        cc_num_error(sm, a, argno, p, @fit)
+        return
+    if k != SKF_AGG
         return
     if fit.slot_class == SKS_STRUCT
         if cc_kind_error(sm, a, StrView { ptr: (fname), len: (flen) as i64 }, argno, p) == 1
@@ -734,15 +742,61 @@ pub fn slot_kind_fit(sm: *Sema, a: *Expr, t: TypeKind, name_sv: StrView, pointee
             return SKF_NUM
     SKF_FITS
 
+# How slot_kind_fit's two sides are spelled in a refusal: here, beside SlotFit,
+# for cc_num_error and slot_kind.ritz's sites.
+pub fn sk_eprint_kind(t: TypeKind)
+    let n: *u8 = primitive_name_from_type(t)
+    if n == null
+        eprint_char('?')
+    else
+        eprints(strview_from_cstr(n))
+
+# The slot's type, as its declaration wrote it.
+pub fn sk_eprint_slot(t: TypeKind, name_sv: StrView, f: *SlotFit)
+    if f.slot_class == SKS_STRUCT
+        eprint_source_type(name_sv)
+    else if f.slot_class == SKS_PTR
+        eprint_char('*')
+        if f.slot_pointee == TypeKind.Struct
+            eprint_source_type(name_sv)
+        else
+            sk_eprint_kind(f.slot_pointee)
+    else
+        sk_eprint_kind(t)
+
+# The value's type: a struct's name, a pointer's `*T`, a scalar's or `null`.
+pub fn sk_eprint_value(f: *SlotFit)
+    if f.value_class == SKV_PTR
+        eprint_char('*')
+    if f.name == null
+        eprint_char('?')
+    else
+        eprint_source_type(StrView { ptr: (f.name), len: (f.name_len) as i64 })
+
+# A float, `null` or pointer argument for an integer param, or a narrow
+# integer for a pointer one: ritz0's typing pass's words, at the argument.
+fn cc_num_error(sm: *Sema, a: *Expr, argno: i32, p: *Param, fit: *SlotFit)
+    if cc_report(sm, a.span.line, a.span.col) == 0
+        return
+    eprints("argument ")
+    eprint_int(argno as i64)
+    eprints(" ('")
+    eprint_bytes(StrView { ptr: (p.name), len: (p.name_len) as i64 })
+    eprints("'): expected ")
+    sk_eprint_slot(p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, fit)
+    eprints(", got ")
+    sk_eprint_value(fit)
+    eprint_char('\n')
+
 # Each argument of `fname(args)` against `params`, numbered from `argno`.
-fn cc_kinds(sm: *Sema, fname_sv: StrView, argno: i32, params: *Param, args: *Expr)
+fn cc_kinds(sm: *Sema, fname_sv: StrView, argno: i32, params: *Param, args: *Expr, num: i32)
     var fname: *u8 = fname_sv.ptr
     var flen: i32 = fname_sv.len as i32
     var p: *Param = params
     var a: *Expr = args
     var n: i32 = argno
     while p != null and a != null
-        cc_kind(sm, StrView { ptr: (fname), len: (flen) as i64 }, n, a, p)
+        cc_kind(sm, StrView { ptr: (fname), len: (flen) as i64 }, n, a, p, num)
         p = p.next
         a = a.next
         n = n + 1
@@ -833,7 +887,7 @@ fn cc_method(sm: *Sema, e: *Expr, fd: *FnDef, recv: i32)
     var p: *Param = fd.params
     if recv == 1
         p = p.next
-    cc_kinds(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, 1 + recv, p, e.args)
+    cc_kinds(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, 1 + recv, p, e.args, 0)
     ca_args(sm, e, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, 1 + recv, p, e.args)   # AGAST #4173
 
 # --- Free calls ------------------------------------------------------------------
@@ -997,7 +1051,7 @@ pub fn call_check_call(sm: *Sema, e: *Expr)
         # named `<expression>` as ritz0 names it (#3348).
         let sig: *FnDef = sbk_value_fn_sig(sm, e.left)
         if sig != null and cc_arity(sm, e.span.line, e.span.col, StrView { ptr: (c"<expression>"), len: (12) as i64 }, sig, e.args) == 0
-            cc_kinds(sm, StrView { ptr: (c"<expression>"), len: (12) as i64 }, 1, sig.params, e.args)
+            cc_kinds(sm, StrView { ptr: (c"<expression>"), len: (12) as i64 }, 1, sig.params, e.args, 0)
             ca_args(sm, e, StrView { ptr: (c"<expression>"), len: (12) as i64 }, 1, sig.params, e.args)
         return
     if cc_variant_ctor(sm, e) == 1
@@ -1030,7 +1084,7 @@ pub fn call_check_call(sm: *Sema, e: *Expr)
     # R10's `C_get(c)` of a `self:&` method (AGAST #3260, #3278) lends c:
     # that param is a bare `self:&` or an `@&C`, neither of which cc_kind
     # judges, so it needs no lent view here.
-    cc_kinds(sm, StrView { ptr: (full), len: (full_len) as i64 }, 1, fd.params, e.args)
+    cc_kinds(sm, StrView { ptr: (full), len: (full_len) as i64 }, 1, fd.params, e.args, (v == null) as i32)
     # What each argument points at (AGAST #4173), against the params the
     # emitter lowers the call with: `C_get(c)` lends c to a `self:&`.
     var cf: *FnDef = fd

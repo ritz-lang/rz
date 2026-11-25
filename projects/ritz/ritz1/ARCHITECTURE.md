@@ -334,8 +334,11 @@ empty. A note that belongs to a move goes on that check's own entry.
   tail (#4653): a struct into a scalar or pointer, a scalar, `null` or
   pointer into a struct, a float or `null` into an integer, an int narrower
   than i64 / u64 to or from a pointer. The rule is call_check's
-  `slot_kind_fit`, which a call's argument asks too; this module says it in
-  ritz0's words for each slot.
+  `slot_kind_fit`, which a call's argument asks too (`cc_kind`: a named fn's
+  scalar misfits since #4680, as ritz0 judges no method's); this module says
+  it in ritz0's words for each slot. A generic instance's `*T` field carries
+  its substituted pointee kind (monomorph's `subst_pointee_field`), so the
+  rule sees `w.ptr` as the `*Point` it is.
 
 - `slot_narrowing` — the same rule at an assignment, a call argument, a
   `return`, a fn's tail value (§7.5, #4081) and a struct literal field
