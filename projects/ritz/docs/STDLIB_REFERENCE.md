@@ -3016,7 +3016,8 @@ fn port_of(input: StrView) -> i64
         Ok(root) =>
             match root.get_field("port")
                 Some(v) =>
-                    match v.get_number()
+                    let r: @Json = v
+                    match r.get_number()
                         Some(n) => n
                         None => 0 - 1
                 None => 0 - 1
