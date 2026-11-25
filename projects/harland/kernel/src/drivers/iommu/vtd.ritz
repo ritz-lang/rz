@@ -23,10 +23,27 @@
 # ioapic_set_irq (arch/x86_64/apic.ritz) program their sources in the
 # remappable format with handles from ir_handle_msi / ir_handle_ioapic.
 #
-# DMA remapping (translation) stays off: TE is never set.
+# DMA remapping (AGAST #4722) has its mechanics here and is not turned on:
+# TE is never set, so no DMA is translated yet. For a requester on a
+# segment where vtd_translation_capable holds:
+#   - vtd_domain_new makes a domain: a domain ID and an empty second-level
+#     page table; vtd_domain_map / vtd_domain_unmap map and unmap one 4 KiB
+#     IOVA in it, and unmap waits for the IOTLB invalidation;
+#   - vtd_context_attach points the requester's context entry (in its
+#     segment's root and context tables, the root table installed in the
+#     segment's units on first use) at the domain; vtd_context_detach
+#     clears it and waits for the context-cache and IOTLB invalidations;
+#   - vtd_fault_next reads and clears a pending fault record: the requester,
+#     the page, the reason.
+# Every invalidation waits on the queue for at most VTD_TIMEOUT_US and
+# reports a unit that didn't confirm (VtdDma.Timeout): the old entry
+# may still be cached, so the caller must not hand the page out again.
+# The firmware's RMRRs (dmar_rmrr_*) are what an identity context for a
+# device that DMAs behind the OS's back must map.
 #
-# vtd_ir_set takes no lock: today only the BSP calls it, during boot. A
-# caller on another CPU needs one around the IRTE write and the queue.
+# vtd_ir_set and the DMA functions take no lock: today only the BSP calls
+# them, during boot. A caller on another CPU needs one around the table
+# writes and the queue.
 #
 # AMD-Vi (IVRS) is drivers/iommu/amdvi.ritz (AGAST #4329); drivers/iommu/ir.ritz
 # picks between them, and the rest of the kernel calls only it.
@@ -36,6 +53,7 @@ import io { memory_barrier, cpu_pause }
 import mm.pmm { pmm_alloc_page }
 import mm.vmm { vmm_map_mmio, vmm_ensure_mapped, phys_to_virt }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import ritzlib.option
 import drivers.acpi.tables { acpi_find_table }
 import drivers.iommu.dmar {
     ACPI_SIG_DMAR, DMAR_INTR_REMAP, DMAR_X2APIC_OPT_OUT,
@@ -43,19 +61,23 @@ import drivers.iommu.dmar {
     dmar_ioapic_source_id, dmar_num_segs, dmar_seg_id, dmar_unit_seg_index,
     dmar_sid_seg_index, DMAR_SEG_ALL,
     irte_lo, irte_hi, IRTE_SVT_VERIFY_SID, IRT_ENTRIES,
-    VTD_REG_ECAP, VTD_REG_GCMD, VTD_REG_GSTS,
+    VTD_REG_CAP, VTD_REG_ECAP, VTD_REG_GCMD, VTD_REG_GSTS, VTD_REG_RTADDR, VTD_REG_FSTS,
     VTD_REG_IQH, VTD_REG_IQT, VTD_REG_IQA, VTD_REG_IRTA,
-    ECAP_C, GCMD_QIE, GCMD_IRE, GCMD_SIRTP, GCMD_CFI,
+    ECAP_C, GCMD_QIE, GCMD_IRE, GCMD_SIRTP, GCMD_CFI, GCMD_SRTP, GCMD_WBF,
     vtd_gcmd_from_gsts, vtd_irta, vtd_ecap_can_remap,
-    QI_DESC_SIZE, qi_iec_global_lo, qi_iec_index_lo, qi_wait_lo, qi_wait_hi, qi_next_tail
+    QI_DESC_SIZE, qi_iec_global_lo, qi_iec_index_lo, qi_wait_lo, qi_wait_hi, qi_next_tail,
+    CAP_RWBF, CAP_CM, CAP_SAGAW_39, CAP_SAGAW_48, DMAR_SID_NONE, vtd_cap_domains, vtd_cap_sl_levels, vtd_iova_bits,
+    vtd_cap_fault_offset, vtd_cap_fault_count, vtd_can_translate,
+    FSTS_PFO, FSTS_PPF, FSTS_IQE, FSTS_ITE, fsts_fri,
+    vtd_rtaddr, vtd_sid_bus, vtd_sid_devfn, vtd_root_lo, vtd_ctx_lo, vtd_ctx_hi, vtd_ctx_did,
+    vtd_entry_present, vtd_entry_addr, sl_index, sl_table, sl_leaf, sl_present,
+    frcd_pending, frcd_sid, frcd_reason, frcd_is_read, frcd_addr,
+    QI_G_GLOBAL, QI_G_DOMAIN, qi_cc_global_lo, qi_cc_device_lo, qi_iotlb_lo,
+    qi_iotlb_unmap_lo, qi_iotlb_unmap_hi
 }
 
 # How long a unit gets to acknowledge a command or finish the queue.
 const VTD_TIMEOUT_US: u64 = 100000
-
-# Fault status register: IQE (bit 4), an invalid queue descriptor.
-const VTD_REG_FSTS: u64 = 0x34
-const FSTS_IQE: u32 = 0x10
 
 var vtd_on: bool = false
 var vtd_x2: bool = false
@@ -67,6 +89,36 @@ var vtd_qi_tail: [8]u32         # its next free descriptor
 var vtd_seg_irt_phys: [8]u64     # each PCI segment's IRT, by dmar_seg_id index
 var vtd_status_phys: u64 = 0    # wait descriptors write their sequence number here
 var vtd_seq: u32 = 0
+var vtd_cap: [8]u64             # each unit's CAP and ECAP
+var vtd_ecap: [8]u64
+
+# DMA remapping (AGAST #4722). Domain d (0-based) has domain ID d + 1: with
+# caching mode, ID 0 tags cached not-present entries.
+pub const VTD_MAX_DOMAINS: i32 = 8
+var vtd_seg_root_phys: [8]u64   # each segment's root table, 0 until a context is attached
+var vtd_num_doms: i32 = 0
+var vtd_dom_sl_phys: [8]u64     # each domain's second-level table
+var vtd_dom_seg: [8]i32         # the segment index it serves
+var vtd_dom_levels: [8]u32      # its depth: 3 or 4
+
+# Why a DMA remapping call failed (or Ok).
+pub enum VtdDma
+    Ok
+    NoSegment       # remapping is off, no source ID, or no unit on the requester's segment
+    NoDomain        # not a domain, or not one of the requester's segment
+    NoPage          # out of physical pages for a table
+    BadAddress      # not page-aligned, or past what the domain translates
+    Mapped          # the IOVA is mapped already
+    NotMapped       # the IOVA isn't mapped
+    Busy            # the requester's context names another domain
+    Timeout         # a unit didn't confirm a command or an invalidation: the old entry may be cached
+
+# A recorded DMA fault.
+pub struct VtdFault
+    sid: u32        # the requester: segment << 16 | bus:dev.fn
+    iova: u64       # the page it addressed
+    reason: u8      # the fault reason (VT-d specification, appendix A)
+    read: bool      # a read; else a write
 
 # Is interrupt remapping on? Then every MSI and redirection entry must be
 # programmed in the remappable format.
@@ -140,7 +192,7 @@ fn vtd_qi_sync(u: i32) -> bool
     vtd_qi_submit(u, qi_wait_lo(vtd_seq), qi_wait_hi(vtd_status_phys))
     let deadline: u64 = deadline_after_us(VTD_TIMEOUT_US)
     while volatile_load(status) != vtd_seq
-        if (vtd_reg32(u, VTD_REG_FSTS) & FSTS_IQE) != 0
+        if (vtd_reg32(u, VTD_REG_FSTS) & (FSTS_IQE | FSTS_ITE)) != 0
             klog("      [vtd] unit ")
             klog_dec(u as i64)
             klog(": invalidation queue error\n")
@@ -293,6 +345,11 @@ fn vtd_units_disable(n: i32)
 pub fn vtd_ir_init(x2apic: bool) -> i32
     vtd_on = false
     vtd_units = 0
+    vtd_num_doms = 0
+    var k: i32 = 0
+    while k < 8
+        vtd_seg_root_phys[k] = 0
+        k = k + 1
     let dmar: u64 = acpi_find_table(ACPI_SIG_DMAR)
     if dmar == 0
         klog("      Interrupt remapping: off (no DMAR table)\n")
@@ -334,6 +391,8 @@ pub fn vtd_ir_init(x2apic: bool) -> i32
             klog_hex(ecap)
             klog("\n")
             return vtd_fail(u, "no IR, queued invalidation or EIM")
+        vtd_ecap[u] = ecap
+        vtd_cap[u] = vtd_reg64(u, VTD_REG_CAP)
         vtd_coherent[u] = 0
         if (ecap & ECAP_C) != 0
             vtd_coherent[u] = 1
@@ -379,3 +438,354 @@ pub fn vtd_ir_init(x2apic: bool) -> i32
     else
         klog(", 8-bit xAPIC destinations\n")
     return 0
+
+# ============================================================================
+# DMA remapping (AGAST #4722): tables, domains, contexts, faults
+# ============================================================================
+
+# Make segment `si`'s units see a table write at `addr`: write the cache
+# line back where a unit doesn't snoop the tables (ECAP.C clear), and flush
+# the write buffer where a unit needs that (CAP.RWBF).
+fn vtd_seg_publish(si: i32, addr: u64)
+    memory_barrier()
+    var u: i32 = 0
+    while u < vtd_units
+        if dmar_unit_seg_index[u] == si
+            if vtd_coherent[u] == 0
+                vtd_clflush(addr)
+                memory_barrier()
+            if (vtd_cap[u] & CAP_RWBF) != 0
+                vtd_gcmd(u, GCMD_WBF, 0, GCMD_WBF, false)
+        u = u + 1
+
+# ... a whole new (zeroed) table page.
+fn vtd_seg_publish_page(si: i32, phys: u64)
+    let v: u64 = phys_to_virt(phys)
+    var off: u64 = 0
+    while off < 4096
+        vtd_seg_publish(si, v + off)
+        off = off + 64
+
+# The segment index whose root table and units serve requester `sid`, or
+# -1: remapping is off, `sid` has no source ID or no unit is on its segment.
+fn vtd_sid_seg(sid: u32) -> i32
+    if not vtd_on or sid == DMAR_SID_NONE
+        return -1
+    let si: i32 = dmar_sid_seg_index(sid)
+    if si == DMAR_SEG_ALL
+        return -1
+    return si
+
+# The second-level depth every unit on segment `si` walks; 0 if one can't
+# translate (or none is there).
+fn vtd_seg_levels(si: i32) -> u32
+    var sagaw: u64 = CAP_SAGAW_48 | CAP_SAGAW_39
+    var any: bool = false
+    var u: i32 = 0
+    while u < vtd_units
+        if dmar_unit_seg_index[u] == si
+            if not vtd_can_translate(vtd_cap[u], vtd_ecap[u])
+                return 0
+            sagaw = sagaw & vtd_cap[u]
+            any = true
+        u = u + 1
+    if not any
+        return 0
+    return vtd_cap_sl_levels(sagaw)
+
+# Can DMA from requester `sid` (segment << 16 | bus:dev.fn) be translated:
+# remapping is on and every unit on its segment can walk a second-level
+# table? The ring-1 cutover refuses a requester for which this is false.
+pub fn vtd_translation_capable(sid: u32) -> bool
+    let si: i32 = vtd_sid_seg(sid)
+    return si >= 0 and vtd_seg_levels(si) != 0
+
+# Domain `dom`'s index, -1 if it isn't one.
+fn vtd_dom_index(dom: u32) -> i32
+    if dom == 0 or dom > (vtd_num_doms as u32)
+        return -1
+    return (dom - 1) as i32
+
+# A new, empty domain for requesters on `sid`'s segment: its domain ID,
+# the handle vtd_domain_map and vtd_context_attach take. None if the
+# segment can't translate, every domain or ID is taken, or there's no page.
+pub fn vtd_domain_new(sid: u32) -> Option<u32>
+    let si: i32 = vtd_sid_seg(sid)
+    if si < 0
+        return None
+    let levels: u32 = vtd_seg_levels(si)
+    if levels == 0 or vtd_num_doms >= VTD_MAX_DOMAINS
+        return None
+    let d: i32 = vtd_num_doms
+    let did: u32 = (d + 1) as u32
+    var u: i32 = 0
+    while u < vtd_units
+        if dmar_unit_seg_index[u] == si and did >= vtd_cap_domains(vtd_cap[u])
+            return None
+        u = u + 1
+    let sl: u64 = vtd_alloc_page()
+    if sl == 0
+        return None
+    vtd_seg_publish_page(si, sl)
+    vtd_dom_sl_phys[d] = sl
+    vtd_dom_seg[d] = si
+    vtd_dom_levels[d] = levels
+    vtd_num_doms = d + 1
+    return Some(did)
+
+# Is `iova` a page every unit of domain index `d`'s segment translates?
+fn vtd_dom_iova_ok(d: i32, iova: u64) -> bool
+    if (iova & 0xFFF) != 0
+        return false
+    let si: i32 = vtd_dom_seg[d]
+    var u: i32 = 0
+    while u < vtd_units
+        if dmar_unit_seg_index[u] == si and (iova >> vtd_iova_bits(vtd_cap[u], vtd_dom_levels[d])) != 0
+            return false
+        u = u + 1
+    return true
+
+# The kernel address of the leaf entry for `iova` in domain index `d`. A
+# missing table is made with `alloc`; else (or with no page for it) 0.
+# Internal; 0 is never a table entry's address (as pmm_alloc_page's 0).
+fn vtd_sl_leaf_entry(d: i32, iova: u64, alloc: bool) -> u64
+    let si: i32 = vtd_dom_seg[d]
+    var table: u64 = vtd_dom_sl_phys[d]
+    var level: u32 = vtd_dom_levels[d]
+    while level > 1
+        let e: u64 = phys_to_virt(table) + sl_index(iova, level) * 8
+        var v: u64 = volatile_load(e as *u64)
+        if not sl_present(v)
+            if not alloc
+                return 0
+            let next: u64 = vtd_alloc_page()
+            if next == 0
+                return 0
+            vtd_seg_publish_page(si, next)
+            v = sl_table(next)
+            volatile_store(e as *u64, v)
+            vtd_seg_publish(si, e)
+        table = vtd_entry_addr(v)
+        level = level - 1
+    return phys_to_virt(table) + sl_index(iova, 1) * 8
+
+# Drop domain `did`'s mapping of `iova` from every IOTLB on segment `si`
+# (with `cm_only`, only units in caching mode, which may have cached the
+# entry while it was not present) and wait. False if a unit didn't confirm.
+fn vtd_seg_iotlb_page(si: i32, did: u32, iova: u64, cm_only: bool) -> bool
+    var ok: bool = true
+    var u: i32 = 0
+    while u < vtd_units
+        if dmar_unit_seg_index[u] == si and (not cm_only or (vtd_cap[u] & CAP_CM) != 0)
+            vtd_qi_submit(u, qi_iotlb_unmap_lo(did, vtd_cap[u]), qi_iotlb_unmap_hi(iova, vtd_cap[u]))
+            if not vtd_qi_sync(u)
+                ok = false
+        u = u + 1
+    return ok
+
+# Map the 4 KiB page at `iova` in domain `dom` to physical `phys`: the
+# device reads it, and writes it if `write`.
+pub fn vtd_domain_map(dom: u32, iova: u64, phys: u64, write: bool) -> VtdDma
+    let d: i32 = vtd_dom_index(dom)
+    if d < 0
+        return VtdDma.NoDomain
+    if not vtd_dom_iova_ok(d, iova) or (phys & 0xFFF) != 0
+        return VtdDma.BadAddress
+    let e: u64 = vtd_sl_leaf_entry(d, iova, true)
+    if e == 0
+        return VtdDma.NoPage
+    if sl_present(volatile_load(e as *u64))
+        return VtdDma.Mapped
+    volatile_store(e as *u64, sl_leaf(phys, write))
+    vtd_seg_publish(vtd_dom_seg[d], e)
+    if not vtd_seg_iotlb_page(vtd_dom_seg[d], dom, iova, true)
+        return VtdDma.Timeout
+    return VtdDma.Ok
+
+# Unmap `iova` from domain `dom` and wait until no unit can still use the
+# old entry. On Timeout the page may still be reachable by the device: the
+# caller keeps it out of the PMM (RING1_DRIVER.md, dma_quarantine).
+pub fn vtd_domain_unmap(dom: u32, iova: u64) -> VtdDma
+    let d: i32 = vtd_dom_index(dom)
+    if d < 0
+        return VtdDma.NoDomain
+    if not vtd_dom_iova_ok(d, iova)
+        return VtdDma.BadAddress
+    let e: u64 = vtd_sl_leaf_entry(d, iova, false)
+    if e == 0 or not sl_present(volatile_load(e as *u64))
+        return VtdDma.NotMapped
+    volatile_store(e as *u64, 0)
+    vtd_seg_publish(vtd_dom_seg[d], e)
+    if not vtd_seg_iotlb_page(vtd_dom_seg[d], dom, iova, false)
+        return VtdDma.Timeout
+    return VtdDma.Ok
+
+# Domain `dom`'s leaf entry for `iova` (sl_leaf: the page and R/W), None
+# if it isn't mapped.
+pub fn vtd_domain_entry(dom: u32, iova: u64) -> Option<u64>
+    let d: i32 = vtd_dom_index(dom)
+    if d < 0 or not vtd_dom_iova_ok(d, iova)
+        return None
+    let e: u64 = vtd_sl_leaf_entry(d, iova, false)
+    if e == 0
+        return None
+    let v: u64 = volatile_load(e as *u64)
+    if not sl_present(v)
+        return None
+    return Some(v)
+
+# Segment `si`'s root table, installed in its units on first use: RTADDR,
+# SRTP, then the context caches and IOTLBs dropped (firmware may have
+# translated with tables of its own). TE stays as it is: clear.
+fn vtd_seg_root(si: i32) -> VtdDma
+    if vtd_seg_root_phys[si] != 0
+        return VtdDma.Ok
+    let root: u64 = vtd_alloc_page()
+    if root == 0
+        return VtdDma.NoPage
+    vtd_seg_publish_page(si, root)
+    var u: i32 = 0
+    while u < vtd_units
+        if dmar_unit_seg_index[u] == si
+            vtd_wreg64(u, VTD_REG_RTADDR, vtd_rtaddr(root))
+            if not vtd_gcmd(u, GCMD_SRTP, 0, GCMD_SRTP, true)
+                klog("      [vtd] unit ")
+                klog_dec(u as i64)
+                klog(": root table pointer not taken\n")
+                return VtdDma.Timeout
+            vtd_qi_submit(u, qi_cc_global_lo(), 0)
+            vtd_qi_submit(u, qi_iotlb_lo(QI_G_GLOBAL, 0, vtd_cap[u]), 0)
+            if not vtd_qi_sync(u)
+                return VtdDma.Timeout
+        u = u + 1
+    vtd_seg_root_phys[si] = root
+    return VtdDma.Ok
+
+# The kernel address of requester `sid`'s context entry on segment `si`.
+# A missing context table is made with `alloc`; else (or with no root
+# table, or no page) 0.
+# Internal; 0 is never an entry's address (as pmm_alloc_page's 0).
+fn vtd_ctx_entry(si: i32, sid: u32, alloc: bool) -> u64
+    if vtd_seg_root_phys[si] == 0
+        return 0
+    let re: u64 = phys_to_virt(vtd_seg_root_phys[si]) + vtd_sid_bus(sid) * 16
+    var lo: u64 = volatile_load(re as *u64)
+    if not vtd_entry_present(lo)
+        if not alloc
+            return 0
+        let ctx: u64 = vtd_alloc_page()
+        if ctx == 0
+            return 0
+        vtd_seg_publish_page(si, ctx)
+        lo = vtd_root_lo(ctx)
+        volatile_store((re + 8) as *u64, 0)
+        volatile_store(re as *u64, lo)
+        vtd_seg_publish(si, re)
+    return phys_to_virt(vtd_entry_addr(lo)) + vtd_sid_devfn(sid) * 16
+
+# Point requester `sid`'s context entry at domain `dom`, which must serve
+# its segment. Attaching it to the domain it has already is Ok; to another,
+# Busy. Translation isn't on (TE clear), so nothing is translated yet.
+pub fn vtd_context_attach(dom: u32, sid: u32) -> VtdDma
+    let d: i32 = vtd_dom_index(dom)
+    if d < 0
+        return VtdDma.NoDomain
+    let si: i32 = vtd_sid_seg(sid)
+    if si < 0
+        return VtdDma.NoSegment
+    if si != vtd_dom_seg[d]
+        return VtdDma.NoDomain
+    let r: VtdDma = vtd_seg_root(si)
+    if r != VtdDma.Ok
+        return r
+    let ce: u64 = vtd_ctx_entry(si, sid, true)
+    if ce == 0
+        return VtdDma.NoPage
+    if vtd_entry_present(volatile_load(ce as *u64))
+        if vtd_ctx_did(volatile_load((ce + 8) as *u64)) == dom
+            return VtdDma.Ok
+        return VtdDma.Busy
+    # The domain first, then present: the unit never sees half an entry.
+    volatile_store((ce + 8) as *u64, vtd_ctx_hi(dom, vtd_dom_levels[d]))
+    memory_barrier()
+    volatile_store(ce as *u64, vtd_ctx_lo(vtd_dom_sl_phys[d]))
+    vtd_seg_publish(si, ce)
+    # A unit in caching mode may have cached the not-present entry, under
+    # domain ID 0.
+    var ok: bool = true
+    var u: i32 = 0
+    while u < vtd_units
+        if dmar_unit_seg_index[u] == si and (vtd_cap[u] & CAP_CM) != 0
+            vtd_qi_submit(u, qi_cc_device_lo(0, sid), 0)
+            vtd_qi_submit(u, qi_iotlb_lo(QI_G_DOMAIN, 0, vtd_cap[u]), 0)
+            if not vtd_qi_sync(u)
+                ok = false
+        u = u + 1
+    if not ok
+        return VtdDma.Timeout
+    return VtdDma.Ok
+
+# The domain requester `sid`'s context entry names, None if it has none.
+pub fn vtd_context_domain(sid: u32) -> Option<u32>
+    let si: i32 = vtd_sid_seg(sid)
+    if si < 0
+        return None
+    let ce: u64 = vtd_ctx_entry(si, sid, false)
+    if ce == 0 or not vtd_entry_present(volatile_load(ce as *u64))
+        return None
+    return Some(vtd_ctx_did(volatile_load((ce + 8) as *u64)))
+
+# Clear requester `sid`'s context entry and wait until no unit on its
+# segment has the entry or a translation under its domain cached. On
+# Timeout the requester may still reach the domain's pages.
+pub fn vtd_context_detach(sid: u32) -> VtdDma
+    let si: i32 = vtd_sid_seg(sid)
+    if si < 0
+        return VtdDma.NoSegment
+    let ce: u64 = vtd_ctx_entry(si, sid, false)
+    if ce == 0 or not vtd_entry_present(volatile_load(ce as *u64))
+        return VtdDma.NotMapped
+    let did: u32 = vtd_ctx_did(volatile_load((ce + 8) as *u64))
+    volatile_store(ce as *u64, 0)
+    vtd_seg_publish(si, ce)
+    var ok: bool = true
+    var u: i32 = 0
+    while u < vtd_units
+        if dmar_unit_seg_index[u] == si
+            vtd_qi_submit(u, qi_cc_device_lo(did, sid), 0)
+            vtd_qi_submit(u, qi_iotlb_lo(QI_G_DOMAIN, did, vtd_cap[u]), 0)
+            if not vtd_qi_sync(u)
+                ok = false
+        u = u + 1
+    if not ok
+        return VtdDma.Timeout
+    return VtdDma.Ok
+
+# The next recorded DMA fault, cleared so the unit can record another; None
+# if no unit has one. Records past the mapped register page are skipped.
+pub fn vtd_fault_next() -> Option<VtdFault>
+    if not vtd_on
+        return None
+    var u: i32 = 0
+    while u < vtd_units
+        let fsts: u32 = vtd_reg32(u, VTD_REG_FSTS)
+        if (fsts & FSTS_PFO) != 0
+            # write 1 to clear: the unit records faults again once a record is free
+            vtd_wreg32(u, VTD_REG_FSTS, FSTS_PFO)
+        if (fsts & FSTS_PPF) != 0
+            let base: u64 = vtd_cap_fault_offset(vtd_cap[u])
+            let n: u32 = vtd_cap_fault_count(vtd_cap[u])
+            var i: u32 = 0
+            while i < n
+                let off: u64 = base + (((fsts_fri(fsts) + i) % n) as u64) * 16
+                if off + 16 <= 4096
+                    let hi: u64 = vtd_reg64(u, off + 8)
+                    if frcd_pending(hi)
+                        let lo: u64 = vtd_reg64(u, off)
+                        # F (bit 127) is write 1 to clear
+                        vtd_wreg32(u, off + 12, 0x80000000)
+                        let seg: u32 = dmar_seg_id[dmar_unit_seg_index[u]] as u32
+                        return Some(VtdFault { sid: (seg << 16) | frcd_sid(hi), iova: frcd_addr(lo), reason: frcd_reason(hi), read: frcd_is_read(hi) })
+                i = i + 1
+        u = u + 1
+    return None

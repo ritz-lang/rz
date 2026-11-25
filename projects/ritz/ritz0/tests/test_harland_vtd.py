@@ -16,6 +16,14 @@ exit code names the failed claim. Source-level tests pin how the kernel uses
 it: MSI-X and the I/O APIC switch to the remappable formats when remapping
 is on, and remapping comes up before the I/O APIC is programmed.
 tools/test_irq_dest_boot.sh boots it on q35 with -device intel-iommu.
+
+DMA remapping (AGAST #4722): the same host program checks the RMRR parse and
+the translation formats (CAP, root and context entries, second-level entries,
+context-cache and IOTLB descriptors, fault records); a second one runs the
+real vtd.ritz against an emulated unit, mapping and unmapping IOVAs,
+attaching and detaching a requester, reading a fault record, and checking
+the invalidations each step queues and that a unit which stops answering
+ends the wait with a reported timeout. TE is never set.
 """
 
 import os
@@ -39,7 +47,7 @@ IR = KERNEL_SRC / "drivers" / "iommu" / "ir.ritz"
 PROGRAM = """\
 import drivers.iommu.dmar
 
-var t: [160]u8
+var t: [192]u8
 
 fn put8(off: i32, v: u32)
     t[off] = (v & 0xFF) as u8
@@ -89,6 +97,53 @@ fn build(len: u32)
     put8(110, 1)
     put16(112, 1)
     put64(114, 0x1FED91000)
+
+# DMAR with RMRRs (AGAST #4722): header (48) | DRHD (16) | RMRR 0x7F000000-
+# 0x7F00FFFF with an endpoint 00:14.0, an endpoint behind a bridge and an
+# I/O APIC scope (50) | RMRR ending before it starts (24) | RMRR 0x9000-
+# 0x9FFF on segment 1 for 03:02.1 (32)
+fn build_rmrr(len: u32)
+    var i: i32 = 0
+    while i < 192
+        t[i] = 0
+        i = i + 1
+    put32(0, 0x52414D44)
+    put32(4, len)
+    put8(37, 1)
+    put16(48, 0)              # DRHD, INCLUDE_PCI_ALL
+    put16(50, 16)
+    put8(52, 1)
+    put64(56, 0xFED90000)
+    put16(64, 1)              # RMRR
+    put16(66, 50)
+    put64(72, 0x7F000000)
+    put64(80, 0x7F00FFFF)
+    put8(88, 1)               # endpoint 00:14.0
+    put8(89, 8)
+    put8(94, 0x14)
+    put8(96, 1)               # endpoint behind a bridge (two path steps)
+    put8(97, 10)
+    put8(102, 1)
+    put8(106, 3)              # an I/O APIC scope: not a DMA requester
+    put8(107, 8)
+    put8(110, 2)
+    put8(111, 0xFF)
+    put8(112, 0x1E)
+    put8(113, 7)
+    put16(114, 1)             # RMRR: limit below base, dropped
+    put16(116, 24)
+    put64(122, 0x80000000)
+    put64(130, 0x7FFFFFFF)
+    put16(138, 1)             # RMRR on segment 1
+    put16(140, 32)
+    put16(144, 1)
+    put64(146, 0x9000)
+    put64(154, 0x9FFF)
+    put8(162, 1)              # endpoint 03:02.1
+    put8(163, 8)
+    put8(167, 3)
+    put8(168, 2)
+    put8(169, 1)
 
 fn main() -> i32
     build(122)
@@ -198,6 +253,72 @@ fn main() -> i32
         return 37
     if dmar_ioapic_source_id(2) != 0x1FFF7 or dmar_ioapic_source_id(9) != DMAR_SID_NONE
         return 38
+
+    # RMRRs (AGAST #4722): the regions, and each endpoint that uses one
+    build(122)
+    if dmar_parse(@t[0], 122) != 2 or dmar_num_rmrrs != 0 or dmar_num_rmrr_devs != 0
+        return 39
+    build_rmrr(170)
+    if dmar_parse(@t[0], 170) != 1 or dmar_num_rmrrs != 2 or dmar_num_ioapics != 0
+        return 40
+    if dmar_rmrr_base[0] != 0x7F000000 or dmar_rmrr_limit[0] != 0x7F00FFFF or dmar_rmrr_segment[0] != 0
+        return 41
+    if dmar_rmrr_base[1] != 0x9000 or dmar_rmrr_limit[1] != 0x9FFF or dmar_rmrr_segment[1] != 1
+        return 42
+    if dmar_num_rmrr_devs != 3 or dmar_rmrr_dev_sid[0] != 0xA0 or dmar_rmrr_dev_region[0] != 0
+        return 43
+    if dmar_rmrr_dev_sid[1] != DMAR_SID_NONE or dmar_rmrr_dev_region[1] != 0
+        return 44
+    if dmar_rmrr_dev_sid[2] != 0x10311 or dmar_rmrr_dev_region[2] != 1
+        return 45
+    if dmar_rmrr_next(0xA0, 0) != 0 or dmar_rmrr_next(0xA0, 1) != -1 or dmar_rmrr_next(0x10311, 0) != 2 or dmar_rmrr_next(0x100A0, 0) != -1
+        return 46
+    put64(72, 0x7F000800)     # not page-aligned: dropped with its devices
+    if dmar_parse(@t[0], 170) != 1 or dmar_num_rmrrs != 1 or dmar_num_rmrr_devs != 1 or dmar_rmrr_dev_region[0] != 0
+        return 47
+
+    # CAP
+    if vtd_cap_domains(0) != 16 or vtd_cap_domains(2) != 256 or vtd_cap_domains(6) != 65536
+        return 48
+    if vtd_cap_sl_levels(CAP_SAGAW_48 | CAP_SAGAW_39) != 4 or vtd_cap_sl_levels(CAP_SAGAW_39) != 3 or vtd_cap_sl_levels(0x100) != 0
+        return 49
+    if vtd_cap_mgaw(0x2F0000) != 48 or vtd_iova_bits(0x2F0000, 4) != 48 or vtd_iova_bits(0x260000, 4) != 39 or vtd_iova_bits(0x2F0000, 3) != 39
+        return 50
+    if vtd_cap_fault_offset(0x22000000) != 0x220 or vtd_cap_fault_count(0x70000000000) != 8 or vtd_cap_fault_count(0) != 1
+        return 51
+    if not vtd_can_translate(CAP_SAGAW_48, ECAP_QI) or vtd_can_translate(CAP_SAGAW_48, 0) or vtd_can_translate(0x100, ECAP_QI)
+        return 52
+    if fsts_fri(0x0302) != 3
+        return 53
+    # root and context entries
+    if vtd_rtaddr(0x12345678) != 0x12345000 or vtd_root_lo(0x5000) != 0x5001 or vtd_sid_bus(0x10311) != 3 or vtd_sid_devfn(0x10311) != 0x11
+        return 54
+    if vtd_ctx_lo(0x7000) != 0x7001 or vtd_ctx_hi(5, 4) != 0x502 or vtd_ctx_hi(0x1234, 3) != 0x123401 or vtd_ctx_did(vtd_ctx_hi(0x1234, 3)) != 0x1234
+        return 55
+    if not vtd_entry_present(0x7001) or vtd_entry_present(0x7000) or vtd_entry_addr(0xFFF0000000007001) != 0x7000
+        return 56
+    # second-level entries: 9 IOVA bits per level above the page offset
+    let iova: u64 = (3 << 39) | (5 << 30) | (7 << 21) | (9 << 12) | 0x123
+    if sl_index(iova, 4) != 3 or sl_index(iova, 3) != 5 or sl_index(iova, 2) != 7 or sl_index(iova, 1) != 9
+        return 57
+    if sl_table(0x8000) != 0x8003 or sl_leaf(0x9000, true) != 0x9003 or sl_leaf(0x9000, false) != 0x9001 or sl_leaf(0xFFF0000000001FFF, false) != 0x1001
+        return 58
+    if sl_present(0) or not sl_present(sl_leaf(0x9000, false))
+        return 59
+    # fault records
+    if not frcd_pending(0xC000000600000008) or not frcd_is_read(0xC000000600000008) or frcd_reason(0xC000000600000008) != 6 or frcd_sid(0xC000000600000108) != 0x108
+        return 60
+    if frcd_pending(0x0000000500000108) or frcd_is_read(0x8000000500000108) or frcd_addr(0x20ABC) != 0x20000
+        return 61
+    # context-cache and IOTLB descriptors
+    if qi_cc_global_lo() != 0x11 or qi_cc_device_lo(3, 0x10308) != 0x0000030800030031
+        return 62
+    if qi_iotlb_lo(QI_G_GLOBAL, 0, 0) != 0x12 or qi_iotlb_lo(QI_G_DOMAIN, 3, CAP_DRD | CAP_DWD) != 0x300E2
+        return 63
+    if qi_iotlb_unmap_lo(3, CAP_PSI) != 0x30032 or qi_iotlb_unmap_hi(0x10ABC, CAP_PSI) != 0x10000
+        return 64
+    if qi_iotlb_unmap_lo(3, 0) != 0x30022 or qi_iotlb_unmap_hi(0x10ABC, 0) != 0
+        return 65
     0
 """
 
@@ -210,7 +331,15 @@ CLAIMS = {1: "two DRHD units", 2: "DMAR flags", 3: "unit register bases", 4: "IN
           25: "GCMD from GSTS", 26: "IRTA", 27: "ECAP EIM", 28: "ECAP IR/QI", 29: "IEC descriptors",
           30: "wait descriptor", 31: "queue tail", 32: "segment list", 33: "unit -> segment index",
           34: "requester ID -> segment table", 35: "no source ID -> every table", 36: "IRTE SID drops the segment",
-          37: "shared segment, one table", 38: "I/O APIC source ID carries its segment"}
+          37: "shared segment, one table", 38: "I/O APIC source ID carries its segment",
+          39: "no valid RMRR in the IR table", 40: "RMRR count", 41: "RMRR 0 region", 42: "RMRR on segment 1",
+          43: "RMRR endpoint", 44: "RMRR endpoint behind a bridge", 45: "RMRR endpoint carries its segment",
+          46: "dmar_rmrr_next", 47: "unaligned RMRR dropped", 48: "CAP.ND", 49: "CAP.SAGAW levels",
+          50: "MGAW / IOVA bits", 51: "fault record offset/count", 52: "translation capable",
+          53: "FSTS.FRI", 54: "RTADDR / root entry / SID split", 55: "context entry", 56: "entry present/addr",
+          57: "second-level index", 58: "second-level entries", 59: "second-level present",
+          60: "fault record decode", 61: "fault record not pending / write", 62: "context-cache descriptors",
+          63: "IOTLB descriptors + drain", 64: "IOTLB page-selective unmap", 65: "IOTLB unmap without PSI"}
 
 
 @pytest.mark.integration
@@ -329,3 +458,360 @@ def test_vtd_picks_the_ir_table_by_the_requesters_segment():
     get = _body(code, "vtd_ir_get_lo")
     assert re.search(r"fn vtd_ir_get_lo\(handle: u32, sid: u32\)", get) and "dmar_sid_seg_index(sid)" in get, get
     assert "vtd_ir_get_lo(handle, sid)" in _body(_code(IR), "ir_get_dest")
+
+
+# --- DMA remapping on an emulated unit (AGAST #4722) ---------------------------
+#
+# The real vtd.ritz and dmar.ritz, compiled for the host with stand-ins for
+# the kernel modules they import. The fake unit is a register page and a
+# clock (cpu_pause): GSTS follows GCMD, and the invalidation queue runs,
+# writing each wait descriptor's status and logging every other descriptor
+# in order, so the test reads back the invalidation sequence a call queued.
+# With the unit "dead" the queue stops: every wait must end in a reported
+# timeout, not a hang. Nothing turns translation on: GCMD.TE stays clear.
+
+DMA_SERIAL_STUB = """\
+pub struct StrView
+    ptr: *u8
+    len: i64
+"""
+
+DMA_KLOG_STUB = """\
+import serial { StrView }
+
+pub fn klog(s: StrView)
+    return
+
+pub fn klog_dec(n: i64)
+    return
+
+pub fn klog_hex(n: u64)
+    return
+"""
+
+DMA_IO_STUB = """\
+import fakevtd { fake_tick }
+
+pub fn memory_barrier()
+    return
+
+pub fn cpu_pause()
+    fake_tick()
+"""
+
+DMA_TSC_STUB = """\
+var g_now: u64 = 0
+
+pub fn deadline_after_us(us: u64) -> u64
+    return g_now + 1000
+
+pub fn deadline_passed(deadline: u64) -> bool
+    g_now = g_now + 1
+    return g_now >= deadline
+"""
+
+DMA_PMM_STUB = """\
+var g_mem: [196608]u8
+var g_next: u64 = 0
+
+pub fn pmm_alloc_page() -> u64
+    let base: u64 = @g_mem[0] as u64
+    if g_next == 0
+        g_next = (base + 4095) & (0xFFFFFFFFFFFFFFFF ^ 4095)
+    if g_next + 4096 > base + 196608
+        return 0
+    let p: u64 = g_next
+    g_next = g_next + 4096
+    return p
+"""
+
+DMA_VMM_STUB = """\
+import fakevtd { fake_regs }
+
+pub fn vmm_map_mmio(paddr: u64, size: u64) -> u64
+    return fake_regs()
+
+pub fn vmm_ensure_mapped(paddr: u64, size: u64) -> i32
+    return 0
+
+pub fn phys_to_virt(paddr: u64) -> u64
+    return paddr
+"""
+
+DMA_ACPI_STUB = """\
+import fakevtd { fake_dmar }
+
+pub fn acpi_find_table(sig: u32) -> u64
+    return fake_dmar()
+"""
+
+FAKEVTD = """\
+import drivers.iommu.dmar { VTD_REG_GCMD, VTD_REG_GSTS, VTD_REG_IQH, VTD_REG_IQT, VTD_REG_IQA, GCMD_WBF, QI_TYPE_WAIT, QI_WAIT_SW }
+
+var g_regs: [4096]u8
+var g_dmar: [64]u8
+var g_dead: bool = false
+pub var fake_log_lo: [64]u64
+pub var fake_log_hi: [64]u64
+pub var fake_log_n: i32 = 0
+
+pub fn fake_regs() -> u64
+    return @g_regs[0] as u64
+
+pub fn fake_reg32(off: u64) -> u32
+    return volatile_load((fake_regs() + off) as *u32)
+
+pub fn fake_set_reg32(off: u64, v: u32)
+    volatile_store((fake_regs() + off) as *u32, v)
+
+pub fn fake_reg64(off: u64) -> u64
+    return (fake_reg32(off) as u64) | ((fake_reg32(off + 4) as u64) << 32)
+
+pub fn fake_set_reg64(off: u64, v: u64)
+    fake_set_reg32(off, (v & 0xFFFFFFFF) as u32)
+    fake_set_reg32(off + 4, (v >> 32) as u32)
+
+# A dead unit still answers GCMD but never runs its queue.
+pub fn fake_set_dead(dead: bool)
+    g_dead = dead
+
+# One unit clock: GSTS shows GCMD (a write-buffer flush is done at once),
+# and the queue runs from IQH to IQT.
+pub fn fake_tick()
+    fake_set_reg32(VTD_REG_GSTS, fake_reg32(VTD_REG_GCMD) & (0xFFFFFFFF ^ GCMD_WBF))
+    if g_dead
+        return
+    let q: u64 = fake_reg64(VTD_REG_IQA) & 0xFFFFFFFFFFFFF000
+    var head: u64 = fake_reg64(VTD_REG_IQH)
+    let tail: u64 = fake_reg64(VTD_REG_IQT)
+    while head != tail
+        let lo: u64 = volatile_load((q + head) as *u64)
+        let hi: u64 = volatile_load((q + head + 8) as *u64)
+        if (lo & 0xF) == QI_TYPE_WAIT
+            if (lo & QI_WAIT_SW) != 0
+                volatile_store(hi as *u32, (lo >> 32) as u32)
+        else if fake_log_n < 64
+            fake_log_lo[fake_log_n] = lo
+            fake_log_hi[fake_log_n] = hi
+            fake_log_n = fake_log_n + 1
+        head = (head + 16) & 0xFFF
+    fake_set_reg64(VTD_REG_IQH, head)
+
+fn put8(off: i32, v: u32)
+    g_dmar[off] = (v & 0xFF) as u8
+
+fn put16(off: i32, v: u32)
+    put8(off, v)
+    put8(off + 1, v >> 8)
+
+fn put32(off: i32, v: u32)
+    put16(off, v)
+    put16(off + 2, v >> 16)
+
+# DMAR: one unit, every device on segment 0, interrupt remapping supported.
+pub fn fake_dmar() -> u64
+    put32(0, 0x52414D44)
+    put32(4, 64)
+    put8(37, 1)
+    put16(48, 0)
+    put16(50, 16)
+    put8(52, 1)
+    put32(56, 0xFED90000)
+    return @g_dmar[0] as u64
+"""
+
+DMA_STUBS = {
+    "serial.ritz": DMA_SERIAL_STUB,
+    "klog.ritz": DMA_KLOG_STUB,
+    "io.ritz": DMA_IO_STUB,
+    "arch/x86_64/tsc.ritz": DMA_TSC_STUB,
+    "mm/pmm.ritz": DMA_PMM_STUB,
+    "mm/vmm.ritz": DMA_VMM_STUB,
+    "drivers/acpi/tables.ritz": DMA_ACPI_STUB,
+    "fakevtd.ritz": FAKEVTD,
+}
+
+DMA_PROGRAM = """\
+import drivers.iommu.dmar
+import drivers.iommu.vtd
+import fakevtd
+import ritzlib.option
+
+# SAGAW 4-level, 256 domain IDs, MGAW 48, fault records at 0x220 (4 of
+# them), page-selective invalidation, read drain; no caching mode.
+const CAP: u64 = 0x800380222F0402
+const ECAP: u64 = 0x0A                       # IR, QI; tables not snooped
+const NO_FAULT: VtdFault = VtdFault { sid: 0, iova: 0, reason: 0, read: false }
+
+fn logged(k: i32, lo: u64, hi: u64) -> bool
+    return k < fake_log_n and fake_log_lo[k] == lo and fake_log_hi[k] == hi
+
+fn te_clear() -> bool
+    return (fake_reg32(VTD_REG_GCMD) & GCMD_TE) == 0 and (fake_reg32(VTD_REG_GSTS) & GCMD_TE) == 0
+
+fn main() -> i32
+    fake_set_reg64(VTD_REG_CAP, CAP)
+    fake_set_reg64(VTD_REG_ECAP, ECAP)
+    if vtd_translation_capable(0x08) or vtd_domain_new(0x08).is_some()
+        return 1
+    if vtd_ir_init(false) != 0
+        return 2
+    if not vtd_translation_capable(0x08) or vtd_translation_capable(DMAR_SID_NONE) or vtd_translation_capable(0x10008)
+        return 3
+    let dom: u32 = vtd_domain_new(0x08).unwrap_or(0)
+    if dom != 1 or vtd_domain_new(0x10008).is_some()
+        return 4
+
+    # map: a 4-level walk, tables made on the way; no caching mode, so
+    # nothing is queued
+    let n0: i32 = fake_log_n
+    if vtd_domain_map(dom, 0x10000, 0x12345000, true) != VtdDma.Ok
+        return 5
+    if vtd_domain_entry(dom, 0x10000).unwrap_or(0) != sl_leaf(0x12345000, true) or vtd_domain_entry(dom, 0x11000).is_some()
+        return 6
+    if vtd_domain_map(dom, 0x10000, 0x5000, false) != VtdDma.Mapped
+        return 7
+    if vtd_domain_map(dom, 0x10800, 0x5000, false) != VtdDma.BadAddress or vtd_domain_map(dom, 0x20000, 0x5001, false) != VtdDma.BadAddress
+        return 8
+    if vtd_domain_map(dom, 0x1000000000000, 0x5000, false) != VtdDma.BadAddress or vtd_domain_map(9, 0x20000, 0x5000, false) != VtdDma.NoDomain
+        return 9
+    if vtd_domain_map(dom, 0xFFFFFFFFF000, 0x6000, false) != VtdDma.Ok or vtd_domain_entry(dom, 0xFFFFFFFFF000).unwrap_or(0) != sl_leaf(0x6000, false)
+        return 10
+    if fake_log_n != n0
+        return 11
+
+    # attach: the root table goes in (RTADDR, SRTP), then the context cache
+    # and IOTLB are dropped globally, once; the context entry names the domain
+    if vtd_context_attach(dom, 0x08) != VtdDma.Ok
+        return 12
+    let root: u64 = fake_reg64(VTD_REG_RTADDR)
+    if root == 0 or (root & 0xFFF) != 0 or (fake_reg32(VTD_REG_GCMD) & GCMD_SRTP) == 0
+        return 13
+    if fake_log_n != n0 + 2 or not logged(n0, qi_cc_global_lo(), 0) or not logged(n0 + 1, qi_iotlb_lo(QI_G_GLOBAL, 0, CAP), 0)
+        return 14
+    let re: u64 = volatile_load(root as *u64)
+    let ce: u64 = vtd_entry_addr(re) + 0x08 * 16
+    if not vtd_entry_present(re) or not vtd_entry_present(volatile_load(ce as *u64)) or volatile_load((ce + 8) as *u64) != vtd_ctx_hi(dom, 4)
+        return 15
+    # the context's table, walked by hand: IOVA 0x10000 is entries 0, 0, 0, 16
+    var t: u64 = vtd_entry_addr(volatile_load(ce as *u64))
+    var lvl: i32 = 0
+    while lvl < 3
+        let e: u64 = volatile_load(t as *u64)
+        if (e & 3) != 3
+            return 33
+        t = vtd_entry_addr(e)
+        lvl = lvl + 1
+    if volatile_load((t + 16 * 8) as *u64) != sl_leaf(0x12345000, true)
+        return 33
+    if vtd_context_domain(0x08).unwrap_or(0) != dom or vtd_context_domain(0x10).is_some()
+        return 16
+    # the interrupt remapping that was on stays on; translation stays off
+    if not te_clear() or (fake_reg32(VTD_REG_GSTS) & GCMD_IRE) == 0
+        return 17
+    if vtd_context_attach(dom, 0x08) != VtdDma.Ok or fake_log_n != n0 + 2
+        return 18
+    let dom2: u32 = vtd_domain_new(0x08).unwrap_or(0)
+    if dom2 != 2 or vtd_context_attach(dom2, 0x08) != VtdDma.Busy or vtd_context_attach(dom2, 0x10) != VtdDma.Ok
+        return 19
+    if vtd_context_attach(dom, DMAR_SID_NONE) != VtdDma.NoSegment or vtd_context_attach(dom, 0x10008) != VtdDma.NoSegment
+        return 20
+
+    # unmap: the entry goes, then a page-selective IOTLB invalidation, waited on
+    let n1: i32 = fake_log_n
+    if vtd_domain_unmap(dom, 0x10000) != VtdDma.Ok or vtd_domain_entry(dom, 0x10000).is_some()
+        return 21
+    if fake_log_n != n1 + 1 or not logged(n1, qi_iotlb_unmap_lo(dom, CAP), 0x10000)
+        return 22
+    if vtd_domain_unmap(dom, 0x10000) != VtdDma.NotMapped or vtd_domain_unmap(dom, 0x5000000) != VtdDma.NotMapped
+        return 23
+
+    # a fault record: requester, page, reason, read; F written back to clear it
+    if vtd_fault_next().is_some()
+        return 24
+    fake_set_reg64(0x230, 0x20ABC)
+    fake_set_reg64(0x238, 0xC000000600000010)
+    fake_set_reg32(VTD_REG_FSTS, FSTS_PPF | 0x100)
+    let f: VtdFault = vtd_fault_next().unwrap_or(NO_FAULT)
+    if f.sid != 0x10 or f.iova != 0x20000 or f.reason != 6 or not f.read
+        return 25
+    if fake_reg32(0x23C) != 0x80000000
+        return 26
+    fake_set_reg32(0x23C, 0)
+    fake_set_reg32(VTD_REG_FSTS, 0)
+
+    # detach: the entry goes, then the requester's context-cache entry and
+    # its domain's IOTLB entries, waited on
+    let n2: i32 = fake_log_n
+    if vtd_context_detach(0x08) != VtdDma.Ok or vtd_context_domain(0x08).is_some()
+        return 27
+    if fake_log_n != n2 + 2 or not logged(n2, qi_cc_device_lo(dom, 0x08), 0) or not logged(n2 + 1, qi_iotlb_lo(QI_G_DOMAIN, dom, CAP), 0)
+        return 28
+    if vtd_context_detach(0x08) != VtdDma.NotMapped
+        return 29
+
+    # a unit that stops answering: the bounded wait reports it
+    fake_set_dead(true)
+    if vtd_domain_map(dom, 0x30000, 0x7000, true) != VtdDma.Ok or vtd_domain_unmap(dom, 0x30000) != VtdDma.Timeout
+        return 30
+    if vtd_context_detach(0x10) != VtdDma.Timeout
+        return 31
+    if not te_clear()
+        return 32
+    # a unit with no second-level depth this driver builds: interrupt
+    # remapping still comes up, translation is refused
+    fake_set_dead(false)
+    fake_set_reg64(VTD_REG_CAP, CAP & (0xFFFFFFFFFFFFFFFF ^ (CAP_SAGAW_48 | CAP_SAGAW_39)))
+    if vtd_ir_init(false) != 0 or vtd_translation_capable(0x08) or vtd_domain_new(0x08).is_some()
+        return 34
+    0
+"""
+
+DMA_CLAIMS = {1: "nothing before remapping is on", 2: "IR init on the fake unit", 3: "translation capable query",
+              4: "domain per segment", 5: "map", 6: "leaf entry", 7: "double map refused",
+              8: "unaligned IOVA/page refused", 9: "IOVA past the width / bad domain", 10: "map at the top of 48 bits",
+              11: "map queues nothing without caching mode", 12: "attach", 13: "root table installed",
+              14: "root install invalidates context cache + IOTLB once", 15: "root/context entry contents",
+              16: "context domain query", 17: "TE clear, IRE kept", 18: "attach twice is Ok, no re-install",
+              19: "attach to another domain is Busy", 20: "attach without a segment", 21: "unmap",
+              22: "unmap: page-selective IOTLB invalidation", 23: "unmap of a hole", 24: "no fault",
+              25: "fault record decoded", 26: "fault record cleared", 27: "detach",
+              28: "detach: context-cache device + IOTLB domain invalidation", 29: "detach twice",
+              30: "unmap on a dead unit times out", 31: "detach on a dead unit times out", 32: "TE never set",
+              33: "second-level table walked by hand", 34: "a unit that can't translate is refused"}
+
+
+@pytest.mark.integration
+def test_vtd_dma_remapping_on_an_emulated_unit(tmp_path):
+    tree = tmp_path / "tree"
+    sources = dict(DMA_STUBS)
+    for rel in ("drivers/iommu/dmar.ritz", "drivers/iommu/vtd.ritz"):
+        sources[rel] = (KERNEL_SRC / rel).read_text()
+    for rel, text in sources.items():
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tree / rel).write_text(text)
+    (tmp_path / "t.ritz").write_text(DMA_PROGRAM)
+    env = dict(os.environ, RITZ_PATH=f"{tree}:{RITZ_ROOT}:{tmp_path}")
+    objs = []
+    for src, extra in [(tmp_path / "t.ritz", ()), *[(tree / rel, ("--no-runtime",)) for rel in sources]]:
+        ll = tmp_path / (str(src.relative_to(tmp_path))[:-5].replace("/", "_") + ".ll")
+        proc = run_ritz0([str(src), "-o", str(ll), *extra], cwd=tmp_path, env=env, timeout=300)
+        assert proc.returncode == 0 and ll.exists(), f"ritz0 rejected {src.name}:\n{proc.stdout}{proc.stderr}"
+        objs.append(str(ll))
+    exe = tmp_path / "t"
+    link = subprocess.run(["clang", "-Wno-override-module", *objs, "-o", str(exe), "-nostdlib", "-no-pie"],
+                          capture_output=True, text=True)
+    assert link.returncode == 0, link.stderr[-3000:]
+    rc = subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
+    assert rc == 0, f"exit {rc}: {DMA_CLAIMS.get(rc, 'crash')}"
+
+
+@pytest.mark.unit
+def test_vtd_dma_never_sets_translation_enable():
+    # AGAST #4722: the mechanics exist, translation stays off until the cutover
+    code = _code(VTD)
+    assert "GCMD_TE" not in code, "vtd.ritz must not set TE yet"
+    # and the boot path doesn't touch the DMA tables: the vtd boot is unchanged
+    init = _body(code, "vtd_ir_init")
+    for fn in ("vtd_seg_root(", "vtd_domain_new(", "vtd_context_attach(", "VTD_REG_RTADDR"):
+        assert fn not in init, fn
