@@ -464,16 +464,16 @@ def test_emitter_has_no_hardcoded_source_layouts():
 
 _STRUCTDEF_BUILDERS = {
     # The parser's declarations: the layout is the source it parsed.
-    ("ast_helpers.ritz", "struct_def_new"): 1,
+    ("ast_type_syntax.ritz", "struct_def_new"): 1,
     ("ast_helpers.ritz", "generic_struct_def_new"): 1,
     # The one compiler-supplied view, `{ ptr, len }` (#4545).
     ("types.ritz", "view_struct_new"): 1,
     # Tuple structs: nameless literals the source cannot spell.
     ("sema.ritz", "sema_tuple_new"): 1,
     ("emitter_expr.ritz", "tuple_struct_new"): 1,
-    ("monomorph.ritz", "tuple_subst"): 1,
+    ("mono_clone.ritz", "tuple_subst"): 1,
     # A generic specialisation clones its fields from the source template.
-    ("monomorph.ritz", "clone_and_specialize_struct"): 2,
+    ("mono_clone.ritz", "clone_and_specialize_struct"): 2,
     # The async lowering's per-coroutine and root `Future` structs.
     ("async_lower.ritz", "al_future_struct"): 1,
     ("async_lower.ritz", "al_inject_future"): 1,
@@ -537,16 +537,18 @@ def test_view_layout_is_built_once():
     assert "pub fn view_len_name(" in types_rz, "field names not exposed"
 
     # All three former builders now go through the one constructor...
-    for mod in ("sema.ritz", "emitter.ritz", "monomorph.ritz"):
+    # emitter_consts.ritz was split out of emitter.ritz (AGAST #1818).
+    for mod in ("sema.ritz", "emitter_consts.ritz", "monomorph.ritz"):
         assert "view_struct_new(" in src[mod], (
             f"{mod} still builds the {{ ptr, len }} layout itself"
         )
     # ...and the emitter validates a source layout through the shared check.
-    assert "view_layout_ok(" in src["emitter.ritz"]
+    assert "view_layout_ok(" in src["emitter_consts.ritz"]
 
     # No private copy of the shape, its names, or its validator survives.
     assert "g_sema_view_ptr" not in src["sema.ritz"]
-    assert "string_literal_field" not in src["emitter.ritz"]
-    assert "is_string_literal_layout" not in src["emitter.ritz"]
+    for mod in ("emitter.ritz", "emitter_consts.ritz"):
+        assert "string_literal_field" not in src[mod]
+        assert "is_string_literal_layout" not in src[mod]
     assert "view_ptr_name(" in src["monomorph.ritz"]
     assert "view_len_name(" in src["monomorph.ritz"]

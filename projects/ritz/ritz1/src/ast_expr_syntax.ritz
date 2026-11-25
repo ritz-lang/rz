@@ -1,0 +1,3180 @@
+# ritz1/src/ast_expr_syntax.ritz - parser actions for expressions: binary chains, casts, postfix, struct literals, numbers, match patterns
+#
+# Split from ast_helpers.ritz by AGAST #1818 (no hand-written file over 3,000
+# SLOC); ast_helpers `pub import`s it, so its importers see these unchanged.
+
+import ast
+import types
+import diag          # every located error's prefix (AGAST #3445)
+import tokens_gen
+import lexer
+import struct_variants   # every struct, and gated-out fns (AGAST #4111, #4055)
+import ritzlib.memory
+import ritzlib.io
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.strview    # strview_eq (was the local buf_eq)
+
+pub fn parser_alloc(p: *Parser, size: i64) -> *u8
+    # Bump allocator using the parser's heap arena
+    # Align to 8-byte boundary for pointers
+    let aligned_offset: i64 = (p.heap_offset + 7) & (0 - 8)
+    let result: *u8 = p.heap_base + aligned_offset
+    p.heap_offset = aligned_offset + size
+    if p.ctx.parser_arena_cap > 0 and p.heap_offset > p.ctx.parser_arena_cap
+        eprints("error: ritz1 parser arena exhausted; refusing to overrun the heap\n")
+        sys_exit(70)
+    # AGAST #3509: zeroed, so a field a constructor doesn't set (Expr.deref_step)
+    # reads null, not the arena's last contents.
+    memzero(result, size)
+    return result
+
+# =============================================================================
+# Module helpers
+# =============================================================================
+
+# State: ParseCtx.fn_count
+
+# Where token `pos` is (0:0 past the end).
+pub fn parse_span_at(p: *Parser, pos: i32) -> SrcSpan
+    if pos >= 0 and pos < p.token_count
+        let tok: *Token = p.tokens + pos
+        return diag_span(tok.line, tok.col)
+    diag_span(0, 0)
+
+# Copy of the current parse file's path in the parser arena, or null.
+# ctx.parse_file itself is borrowed: for an import it points into a String the
+# driver drops as soon as that import is parsed, long before emission.
+pub fn parse_file_copy(p: *Parser) -> *u8
+    if p.ctx.parse_file == null
+        return null
+    var n: i64 = 0
+    while *(p.ctx.parse_file + n) != 0
+        n = n + 1
+    let buf: *u8 = parser_alloc(p, n + 1)
+    var i: i64 = 0
+    while i <= n
+        *(buf + i) = *(p.ctx.parse_file + i)
+        i = i + 1
+    buf
+
+# parse_file_copy, shared between consecutive callers that see the same path.
+# AGAST #1364 records a path on every narrow-integer let/var, and a fresh copy
+# each time would grow the arena by a path per declaration.  The cache is
+# keyed on CONTENT, never on the ctx.parse_file pointer: that String is freed
+# after each import, so a later file can arrive at the same address.
+# State: ParseCtx.shared_file_copy
+
+pub fn parse_file_copy_shared(p: *Parser) -> *u8
+    if p.ctx.parse_file == null
+        return null
+    if p.ctx.shared_file_copy != null
+        var i: i64 = 0
+        while *(p.ctx.parse_file + i) != 0 and *(p.ctx.parse_file + i) == *(p.ctx.shared_file_copy + i)
+            i = i + 1
+        if *(p.ctx.parse_file + i) == 0 and *(p.ctx.shared_file_copy + i) == 0
+            return p.ctx.shared_file_copy
+    p.ctx.shared_file_copy = parse_file_copy(p)
+    p.ctx.shared_file_copy
+
+# =============================================================================
+# Function definition helpers
+# =============================================================================
+
+# AGAST #2139: 1 when the just-parsed param type `tr` names a struct: a struct,
+# or a pointer / reference whose (innermost) pointee is one.  `*[N]S` /
+# `@[N]S` keep S, and `name:& *S` (a TypeKind.MutRef to a TypeKind.Ptr, #2075) keeps
+# S, as before.
+fn param_type_names_pointee(p: *Parser, tr: *TypeRef) -> i32
+    if tr == null
+        return 0
+    match tr.kind
+        TypeKind.Struct =>
+            return 1
+        TypeKind.Ptr =>
+            # AGAST #2145: a `fn(...) -> T` type is a TypeKind.Ptr too but names no
+            # pointee; copying one made `f.w` GEP into an earlier param's S.
+            if tr.fn_sig != null
+                return 0
+            let po: *TypeRef = tr.pointee
+            if po == null
+                return 0
+            if po.kind == TypeKind.Struct
+                return 1
+            if po.kind == TypeKind.Array and po.elem != null
+                if po.elem.kind == TypeKind.Struct
+                    return 1
+                # AGAST #2343: `*[N]*S`, as a by-value `[N]*S` is named.
+                if po.elem.kind == TypeKind.Ptr and tr_pointee_kind(po.elem) == TypeKind.Struct
+                    return 1
+            return 0
+        TypeKind.PtrPtr =>
+            if ptr_ptr_slot_inner(tr_ptr_ptr_inner_pointee(tr)) == TypeKind.Struct
+                return 1
+            let arr: *TypeRef = tr_ptr_array(tr)
+            if arr != null and arr.elem != null and arr.elem.kind == TypeKind.Struct
+                return 1   # AGAST #2553: `**[N]S`
+            if ptr_names_array_of_struct_ptrs(p, tr) == 1   # AGAST #3074: `**[N]*S`
+                return 1
+            return 0
+        TypeKind.Ref | TypeKind.MutRef =>
+            if tr.ref_inner == TypeKind.Struct
+                return 1
+            if tr.ref_inner == TypeKind.Ptr and tr_pointee_kind(tr.pointee) == TypeKind.Struct
+                return 1
+            # AGAST #2331: `@*[N]S` and `@&*[N]S`, as `**[N]S` (name_array_ptr_param).
+            let arr: *TypeRef = tr_ptr_array(tr)
+            if arr != null and arr.elem != null and arr.elem.kind == TypeKind.Struct
+                return 1
+            if ptr_names_array_of_struct_ptrs(p, tr) == 1   # AGAST #3074: `@*[N]*S`
+                return 1
+            # AGAST #2372: `@**S`, as `**S` is named above.
+            if tr.ref_inner == TypeKind.PtrPtr and ptr_ptr_slot_inner(tr_ptr_ptr_inner_pointee(tr)) == TypeKind.Struct
+                return 1
+            if tr.ref_inner == TypeKind.Array and tr.pointee != null and tr.pointee.elem != null
+                if tr.pointee.elem.kind == TypeKind.Struct
+                    return 1
+                if tr.pointee.elem.kind == TypeKind.Ptr and tr_pointee_kind(tr.pointee.elem) == TypeKind.Struct
+                    return 1   # AGAST #2343: `@[N]*S`
+            return 0
+        _ => pass
+    return 0
+
+# AGAST #3074: 1 for `**[N]*S`, `@*[N]*S` or `@&*[N]*S`, one level out from the
+# `*[N]*S` named above.  Unnamed, `(*q)[i].f` was "unhandled EXPR_MEMBER".  The
+# emitter keeps S off the local's type_name (name_array_ptr_param).
+pub fn ptr_names_array_of_struct_ptrs(p: *Parser, tr: *TypeRef) -> i32
+    if tr == null or tr.kind == TypeKind.Ptr or tr_ptr_array(tr) == null
+        return 0
+    let arr: *TypeRef = tr_ptr_array(tr)
+    if arr.elem == null
+        return 0
+    (arr.elem.kind == TypeKind.Ptr and tr_pointee_kind(arr.elem) == TypeKind.Struct) as i32
+
+# The just-parsed type `tr` as a param declares it.  AGAST #2308: a `@T` local
+# or return type is recorded this way too, so they all know the same things.
+pub fn param_of_type(p: *Parser, name_sv: StrView, ty: *TypeRef) -> *Param
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let kind: TypeKind = tr_kind(ty)
+    let param: *Param = parser_alloc(p, sizeof(Param)) as *Param
+    param.name = name as *u8
+    param.param_ty = ty   # AGAST #4528
+    param.name_span.line = 0
+    param.name_span.col = 0
+    param.name_len = len
+    param.param_type = kind
+    # Copy the struct type name for a struct, or a pointer / reference whose
+    # pointee is a named type.  AGAST #2139: only then.
+    var nm_len: i32 = 0
+    if param_type_names_pointee(p, ty) == 1
+        param.param_type_name = tr_name(ty, @nm_len)
+        param.param_type_name_len = nm_len
+    else if kind == TypeKind.Array
+        param.param_type_name = tr_elem_name(ty, @nm_len)
+        param.param_type_name_len = nm_len
+    else
+        param.param_type_name = null
+        param.param_type_name_len = 0
+    # Copy pointee/inner type if this is a pointer or reference type.
+    match kind
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            param.param_pointee_type = tr_pointee_kind(ty)
+        TypeKind.Ref | TypeKind.MutRef =>
+            param.param_pointee_type = tr_ref_inner(ty)
+        _ =>
+            param.param_pointee_type = TypeKind.I64  # Default
+    param.param_inner_pointee_type = tr_ptr_ptr_inner_pointee(ty)
+    param.param_inner_ref = tr_inner_ref(ty)   # AGAST #2399
+    param.param_pointee_array_size = ptr_array_pointee_size(p, ty)
+    param.param_pointee_array_elem_type = ptr_array_pointee_elem(p, ty)
+    param.param_pointee_array_elem_pointee = ptr_array_elem_pointee(p, ty)
+    # AGAST #2279, #2287: `@[N]T` and `@&[N]T` keep N and T, as `*[N]T` does.
+    param.param_pointee_array_shape = null
+    if (kind == TypeKind.Ref or kind == TypeKind.MutRef) and tr_ref_inner(ty) == TypeKind.Array and ty.pointee != null
+        let arr: *TypeRef = ty.pointee
+        param.param_pointee_array_size = tr_count(arr) as i32
+        param.param_pointee_array_elem_type = tr_elem_kind(arr)
+        param.param_pointee_array_elem_pointee = tr_elem_pointee(arr)
+        param.param_pointee_array_shape = tr_shape(arr)
+    let nd: *ArrayShape = ptr_nd_pointee_shape(p, ty)   # AGAST #2098: `*[N][M]T`
+    if nd != null
+        param.param_pointee_array_size = nd_shape_count(nd)
+        param.param_pointee_array_elem_type = nd.leaf_type
+        param.param_pointee_array_elem_pointee = nd.leaf_pointee
+        param.param_pointee_array_shape = nd
+    param.param_ref_ptr_pointee = TypeKind.Void
+    if (kind == TypeKind.Ref or kind == TypeKind.MutRef) and tr_ref_inner(ty) == TypeKind.Ptr
+        param.param_ref_ptr_pointee = tr_pointee_kind(ty.pointee)
+    param.param_array_size = 0
+    param.param_array_elem_type = TypeKind.Void
+    param.param_array_elem_pointee = TypeKind.Void
+    param.param_array_shape = null
+    if kind == TypeKind.Array
+        param.param_array_size = tr_count(ty) as i32
+        param.param_array_elem_type = tr_elem_kind(ty)
+        param.param_array_elem_pointee = tr_elem_pointee(ty)
+        param.param_array_shape = tr_shape(ty)   # AGAST #3634: `[N][M]T`
+    param.next = null
+    param.is_borrow = 0
+    param.is_self_borrow = 0
+    # AGAST #1671: a `fn(...) -> T` param keeps its signature.
+    param.fn_sig = null
+    if kind == TypeKind.Ptr
+        param.fn_sig = tr_fn_sig(ty)
+    return param
+
+# AGAST #2329: the just-parsed `tr` as a param would hold it, when it's a
+# `*[N]T`, `@[N]T` or `@&[N]T`, so a field, a global or a return type knows N
+# and T, and `x[i]` on one is element i at stride T, as on a local (#2330,
+# LARB R9).  null for any other type.
+pub fn ptr_array_of_type(p: *Parser, tr: *TypeRef) -> *Param
+    if tr == null
+        return null
+    if tr.kind == TypeKind.Ptr and tr.pointee != null and tr.pointee.kind == TypeKind.Array
+        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
+    if (tr.kind == TypeKind.Ref or tr.kind == TypeKind.MutRef) and tr_ref_inner(tr) == TypeKind.Array
+        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
+    # AGAST #4122: and a `**[N][M]..T`, the shape of the `*[N][M]..T` that `*x`
+    # reads (plane_ptr_shape; base_ptr_array itself answers for `*` only).
+    if tr.kind == TypeKind.PtrPtr and ptr_nd_pointee_shape(p, tr) != null
+        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
+    null
+
+# 1 if `ty` is a declared type whose const must fold to an integer.
+pub fn is_int_const_type(ty: TypeKind) -> i32
+    if ty_is_signed(ty) == 1
+        return 1
+    if ty_is_unsigned(ty) == 1
+        return 1
+    if ty == TypeKind.Bool
+        return 1
+    0
+
+# `v` wrapped to the declared integer type `ty`, as runtime arithmetic at that
+# width would leave it (AGAST #2154): `const M: u8 = 200 + 100` is 44, not
+# 300.  Signed types sign-extend back to i64 (i8 200 is -56); unsigned ones
+# zero-extend (u8 200 stays 200); bool keeps the low bit, as ritz0 does.
+# i64/u64 and non-integer types are returned unchanged.
+pub fn const_wrap_to_type(ty: TypeKind, v: i64) -> i64
+    match ty
+        TypeKind.Bool =>
+            return v & 1
+        TypeKind.U8 =>
+            return v & 0xFF
+        TypeKind.U16 =>
+            return v & 0xFFFF
+        TypeKind.U32 =>
+            return v & 0xFFFFFFFF
+        # Sign-extend as ((v & mask) ^ sign) - sign, not (v << k) >> k: ritz1's
+        # `>>` is always a logical shift (AGAST #1637), so the shift form only
+        # works when ritz0 builds this file.
+        TypeKind.I8 =>
+            return ((v & 0xFF) ^ 0x80) - 0x80
+        TypeKind.I16 =>
+            return ((v & 0xFFFF) ^ 0x8000) - 0x8000
+        TypeKind.I32 =>
+            return ((v & 0xFFFFFFFF) ^ 0x80000000) - 0x80000000
+        _ => pass
+    v
+
+fn const_name_eq(c: *ConstEntry, name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if c.name_len != len
+        return 0
+    var i: i32 = 0
+    while i < len
+        if *(c.name + i) != *(name + i)
+            return 0
+        i += 1
+    1
+
+# Resolve a PENDING integer const in place against `consts`: 1 and DONE if
+# it folds, 0 and BAD otherwise (including a cycle back to itself).
+pub fn const_resolve(consts: *ConstEntry, c: *ConstEntry) -> i32
+    if c.fold_state == CONST_FOLD_DONE
+        return 1
+    if c.fold_state != CONST_FOLD_PENDING
+        return 0
+    c.fold_state = CONST_FOLD_ACTIVE
+    var v: i64 = 0
+    if c.value_expr != null and const_fold_int(consts, c.value_expr, 1, @v) == 1
+        c.value = const_wrap_to_type(c.const_type, v)
+        c.fold_state = CONST_FOLD_DONE
+        return 1
+    c.fold_state = CONST_FOLD_BAD
+    0
+
+# The value of the integer const `name` in `consts` (first occurrence wins,
+# as in the emitter's const_map).  With resolve == 0 (parse time) only an
+# already-folded const counts; with resolve == 1 (emit time, every module
+# merged) a PENDING one is resolved first.
+fn const_fold_ident(consts: *ConstEntry, name_sv: StrView, resolve: i32, out: *i64) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    var c: *ConstEntry = consts
+    while c != null
+        if const_name_eq(c, StrView { ptr: (name), len: (len) as i64 }) == 1
+            if c.fold_state == CONST_FOLD_PENDING and resolve == 1
+                const_resolve(consts, c)
+            if c.fold_state != CONST_FOLD_DONE
+                return 0
+            # A float/struct const's `value` is not its value.
+            if is_int_const_type(c.const_type) == 0
+                return 0
+            *out = c.value
+            return 1
+        c = c.next
+    0
+
+# Fold a constant integer expression into *out: int / char / bool literals,
+# unary - ~ !, `as` casts (the value is kept; the const's own type governs its
+# use), binary arithmetic, bitwise, shift, comparison and logical operators,
+# and references to integer consts in `consts`.  Returns 1 on success, 0 if
+# `e` is not such an expression (a call, an unknown name, division by zero,
+# an out-of-range shift, ...).
+pub fn const_fold_int(consts: *ConstEntry, e: *Expr, resolve: i32, out: *i64) -> i32
+    if e == null
+        return 0
+    match e.kind
+        ExprKind.IntLit | ExprKind.CharLit =>
+            *out = e.int_val
+            return 1
+        ExprKind.Ident =>
+            return const_fold_ident(consts, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, resolve, out)
+        ExprKind.Cast =>
+            return const_fold_int(consts, e.left, resolve, out)
+        ExprKind.Unary =>
+            var x: i64 = 0
+            if const_fold_int(consts, e.operand, resolve, @x) == 0
+                return 0
+            # The i64 holds u64 values too (0x8000000000000000 is i64::MIN), so
+            # negation is two's complement and wraps by design (LARB R63).
+            match e.op
+                OpKind.Neg =>
+                    *out = 0 -% x
+                    return 1
+                OpKind.BitNot =>
+                    *out = 0 -% x -% 1
+                    return 1
+                OpKind.Not =>
+                    if x == 0
+                        *out = 1
+                    else
+                        *out = 0
+                    return 1
+                _ => pass
+            return 0
+        ExprKind.Binary =>
+            var a: i64 = 0
+            var b: i64 = 0
+            if const_fold_int(consts, e.left, resolve, @a) == 0
+                return 0
+            if const_fold_int(consts, e.right, resolve, @b) == 0
+                return 0
+            # AGAST #2356: the i64 `a` has lost whether it was a u64.
+            if e.op == OpKind.Shr and b >= 0 and b <= 63 and const_expr_is_u64(consts, e.left) == 1
+                *out = ((a as u64) >> (b as u64)) as i64
+                return 1
+            # AGAST #3062: so are `/`, `%` and the ordering compares over a u64.
+            if const_fold_unsigned_op(e.op) == 1
+                if const_expr_is_u64(consts, e.left) == 1 or const_expr_is_u64(consts, e.right) == 1
+                    return const_fold_unsigned(e.op, a as u64, b as u64, out)
+            if const_fold_traps(consts, e, a, b) == 1
+                return 0   # LARB R63 (AGAST #3489): const_overflow_site names it
+            return const_fold_binary(e.op, a, b, out)
+        _ => pass
+    0
+
+# =============================================================================
+# Integer overflow (LARB R63, AGAST #3489)
+# =============================================================================
+# `+`, `-` and `*` stop the program on overflow at their type, as do signed
+# `/` and `%` of the minimum by -1; `+%`, `-%` and `*%` wrap.  A run can only
+# stop, so a constant expression has no value there: "overflow in a constant
+# expression is a compile error" (ritz0's ConstEvaluator._wrap_if_requested).
+
+# `+`, `-`, `*`, `/` or `%`, as the source spells it.
+pub fn arith_op_cstr(op: OpKind) -> *u8
+    match op
+        OpKind.Add =>
+            return c"+"
+        OpKind.Sub =>
+            return c"-"
+        OpKind.Mul =>
+            return c"*"
+        OpKind.Div =>
+            return c"/"
+        _ => pass
+    c"%"
+
+# 1 when `a op b` (`+`, `-` or `*`) leaves the `bits`-wide type, signed or
+# (uns == 1) unsigned.  `a` and `b` are values of that type held in an i64: a
+# u64 as its bit pattern.  Computed with the wrapping operators, so the
+# question never stops ritz1 itself.
+pub fn int_op_overflows(op: OpKind, a: i64, b: i64, bits: i32, uns: i32) -> i32
+    var r: i64 = a +% b
+    match op
+        OpKind.Sub =>
+            r = a -% b
+        OpKind.Mul =>
+            r = a *% b
+        _ => pass
+    if bits < 64
+        # Exact: two operands of at most 32 bits have a sum, difference and
+        # product a 64-bit pattern holds (a u32 product as a u64).
+        if uns == 1
+            return ((r as u64) > ((1 as u64) << (bits as u64)) - 1) as i32
+        let hi: i64 = (1 << (bits as i64 - 1)) - 1
+        return (r > hi or r < 0 - hi - 1) as i32
+    if uns == 1
+        match op
+            OpKind.Add =>
+                return ((r as u64) < (a as u64)) as i32
+            OpKind.Sub =>
+                return ((a as u64) < (b as u64)) as i32
+            _ =>
+                return (a != 0 and (r as u64) / (a as u64) != (b as u64)) as i32
+    match op
+        OpKind.Add =>
+            return ((a >= 0) == (b >= 0) and (r >= 0) != (a >= 0)) as i32
+        OpKind.Sub =>
+            return ((a >= 0) != (b >= 0) and (r >= 0) != (a >= 0)) as i32
+        _ => pass
+    if a == 0
+        return 0
+    if a == -1
+        return (b == 0 - 9223372036854775807 - 1) as i32
+    (r / a != b) as i32
+
+# 1 when folding `e` (operands `a` and `b`, already folded) is an overflow:
+# a plain `+ - *` outside i64 (u64 over a u64 operand), or signed MIN / -1.
+fn const_fold_traps(consts: *ConstEntry, e: *Expr, a: i64, b: i64) -> i32
+    if e.wrapping == 1
+        return 0
+    var uns: i32 = 0
+    if const_expr_is_u64(consts, e.left) == 1 or const_expr_is_u64(consts, e.right) == 1
+        uns = 1
+    match e.op
+        OpKind.Add | OpKind.Sub | OpKind.Mul =>
+            return int_op_overflows(e.op, a, b, 64, uns)
+        OpKind.Div | OpKind.Mod =>
+            return (uns == 0 and b == -1 and a == 0 - 9223372036854775807 - 1) as i32
+        _ => pass
+    0
+
+# The operation in constant expression `e` whose overflow keeps it from
+# folding (const_fold_traps), innermost first; null if there is none.
+pub fn const_overflow_site(consts: *ConstEntry, e: *Expr, resolve: i32) -> *Expr
+    if e == null
+        return null
+    match e.kind
+        ExprKind.Unary =>
+            return const_overflow_site(consts, e.operand, resolve)
+        ExprKind.Cast =>
+            return const_overflow_site(consts, e.left, resolve)
+        ExprKind.Binary => pass
+        _ =>
+            return null
+    let inner: *Expr = const_overflow_site(consts, e.left, resolve)
+    if inner != null
+        return inner
+    let inner_r: *Expr = const_overflow_site(consts, e.right, resolve)
+    if inner_r != null
+        return inner_r
+    var a: i64 = 0
+    var b: i64 = 0
+    if const_fold_int(consts, e.left, resolve, @a) == 0 or const_fold_int(consts, e.right, resolve, @b) == 0
+        return null
+    if const_fold_traps(consts, e, a, b) == 1
+        return e
+    null
+
+# `<file>:<line>:<col>: error: integer overflow in `+` in constant
+# expression`, ritz0's ConstEvalError text, at the operation.
+pub fn const_overflow_report(file: *u8, site: *Expr)
+    diag_error_at(file, diag_span(site.span.line, site.span.col))
+    eprints("integer overflow in `")
+    eprints_cstr(arith_op_cstr(site.op))
+    eprints("` in constant expression\n")
+
+# Is constant expression `e` a u64?  The rule of int_operand_shape in
+# emitter_expr_arith.ritz, for the two widths a fold can tell apart: a literal
+# only a u64 can hold, a u64 const, `as u64`, and any operator over those.
+fn const_expr_is_u64(consts: *ConstEntry, e: *Expr) -> i32
+    match e.kind
+        ExprKind.IntLit =>
+            if e.int_val < 0
+                return 1
+            return 0
+        ExprKind.Cast =>
+            if e.type_kind == TypeKind.U64
+                return 1
+            return 0
+        ExprKind.Ident =>
+            var c: *ConstEntry = consts
+            while c != null
+                if const_name_eq(c, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+                    if c.const_type == TypeKind.U64
+                        return 1
+                    return 0
+                c = c.next
+            return 0
+        ExprKind.Unary =>
+            return const_expr_is_u64(consts, e.operand)
+        _ => pass
+    if e.kind == ExprKind.Binary
+        if const_expr_is_u64(consts, e.left) == 1
+            return 1
+        if e.op != OpKind.Shl and e.op != OpKind.Shr
+            return const_expr_is_u64(consts, e.right)
+    0
+
+# 1 for the operators whose result depends on the operands' signedness
+# (`>>` aside, which reads only its left operand).
+fn const_fold_unsigned_op(op: OpKind) -> i32
+    if op == OpKind.Div or op == OpKind.Mod or op == OpKind.Lt or op == OpKind.Le or op == OpKind.Gt or op == OpKind.Ge
+        return 1
+    0
+
+# `op` (one const_fold_unsigned_op accepts) on two u64 operands.
+fn const_fold_unsigned(op: OpKind, a: u64, b: u64, out: *i64) -> i32
+    var r: u64 = 0
+    match op
+        OpKind.Div | OpKind.Mod =>
+            if b == 0
+                return 0
+            if op == OpKind.Div
+                r = a / b
+            else
+                r = a % b
+        OpKind.Lt =>
+            if a < b
+                r = 1
+        OpKind.Le =>
+            if a <= b
+                r = 1
+        OpKind.Gt =>
+            if a > b
+                r = 1
+        _ =>
+            if a >= b
+                r = 1
+    *out = r as i64
+    1
+
+# Folding wraps: a plain `+ - *` that would wrap, and signed MIN / -1, were
+# refused before here (const_fold_traps, LARB R63), so what reaches this is
+# `+%` and its kin, or a value that fits.
+fn const_fold_binary(op: OpKind, a: i64, b: i64, out: *i64) -> i32
+    match op
+        OpKind.Add =>
+            *out = a +% b
+        OpKind.Sub =>
+            *out = a -% b
+        OpKind.Mul =>
+            *out = a *% b
+        OpKind.Div | OpKind.Mod =>
+            if b == 0
+                return 0
+            if op == OpKind.Div
+                *out = a / b
+            else
+                *out = a % b
+        OpKind.BitAnd =>
+            *out = a & b
+        OpKind.BitOr =>
+            *out = a | b
+        OpKind.BitXor =>
+            *out = a ^ b
+        OpKind.Shl | OpKind.Shr =>
+            if b < 0 or b > 63
+                return 0
+            if op == OpKind.Shl
+                *out = a << b
+            else
+                *out = a >> b
+        _ =>
+            let t: i32 = const_fold_compare(op, a, b)
+            if t < 0
+                return 0
+            *out = t as i64
+    1
+
+# 1 / 0 for a comparison or logical operator, -1 if `op` is neither.
+fn const_fold_compare(op: OpKind, a: i64, b: i64) -> i32
+    var t: i32 = 0
+    match op
+        OpKind.Eq =>
+            if a == b
+                t = 1
+        OpKind.Ne =>
+            if a != b
+                t = 1
+        OpKind.Lt =>
+            if a < b
+                t = 1
+        OpKind.Gt =>
+            if a > b
+                t = 1
+        OpKind.Le =>
+            if a <= b
+                t = 1
+        OpKind.Ge =>
+            if a >= b
+                t = 1
+        OpKind.And =>
+            if a != 0 and b != 0
+                t = 1
+        OpKind.Or =>
+            if a != 0 or b != 0
+                t = 1
+        _ =>
+            return -1
+    t
+
+# =============================================================================
+# Import helpers
+# =============================================================================
+
+# AGAST #2198: 1 if `name` is `usize` or `isize`.  Neither is a keyword in
+# ritz1's lexer, so both reach type_named as an IDENT.
+pub fn is_word_type_name(name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if len != 5 or name == null
+        return 0
+    let c0: u8 = *name
+    if c0 != 'u' and c0 != 'i'  # 'u' / 'i'
+        return 0
+    if *(name + 1) == 's' and *(name + 2) == 'i' and *(name + 3) == 'z' and *(name + 4) == 'e'  # "size"
+        return 1
+    0
+
+# AGAST #3464 (LARB R53): the type a word type name is, given
+# is_word_type_name(name, ..) == 1: `usize` is u64, `isize` is i64.
+pub fn word_type(name: *u8) -> TypeKind
+    if *name == 'u'  # 'u'
+        return TypeKind.U64
+    TypeKind.I64
+
+# =============================================================================
+# TypeRef (AGAST #4035): the parser's type, and the accessors that replace the
+# 17 `Parser.last_*` type side channels.
+# =============================================================================
+
+pub fn typeref_new(p: *Parser, kind: TypeKind) -> *TypeRef
+    let t: *TypeRef = parser_alloc(p, sizeof(TypeRef)) as *TypeRef
+    t.kind = kind
+    t.name = null
+    t.name_len = 0
+    t.pointee = null
+    t.elem = null
+    t.count = 0
+    t.shape = null
+    t.array_rec = null
+    t.fn_sig = null
+    t.inner_ref = 0
+    t.ref_inner = TypeKind.Void
+    return t
+
+pub fn tr_kind(tr: *TypeRef) -> TypeKind
+    if tr == null
+        return TypeKind.Void
+    tr.kind
+
+# `last_pointee_type`: the immediate pointee of a `*T`/`**T`, or of the
+# pointer a reference wraps (`@*T` recorded T).
+pub fn tr_pointee_kind(tr: *TypeRef) -> TypeKind
+    if tr == null or tr.pointee == null
+        return TypeKind.Void
+    tr.pointee.kind
+
+pub fn tr_inner_ref(tr: *TypeRef) -> i32
+    if tr == null
+        return 0
+    if is_indirection_kind(tr.kind) == 0
+        return 0
+    tr.inner_ref
+
+pub fn is_indirection_kind(kind: TypeKind) -> i32
+    (kind == TypeKind.Ptr or kind == TypeKind.PtrPtr or kind == TypeKind.Ref or kind == TypeKind.MutRef) as i32
+
+# `last_ptr_depth` (`tr_depth`) lives in types.ritz with the other accessors.
+
+# `last_ref_inner_type`: the referent's flat kind of `@T` / `@&T`.
+pub fn tr_ref_inner(tr: *TypeRef) -> TypeKind
+    if tr == null
+        return TypeKind.Void
+    if tr.kind != TypeKind.Ref and tr.kind != TypeKind.MutRef
+        return TypeKind.Void
+    tr.ref_inner
+
+# `last_fn_sig`: the signature of the fn type just parsed (null otherwise).
+pub fn tr_fn_sig(tr: *TypeRef) -> *FnDef
+    if tr == null
+        return null
+    tr.fn_sig
+
+# `last_array_shape`: the shape of a `[N][M]..T`.
+pub fn tr_shape(tr: *TypeRef) -> *ArrayShape
+    if tr == null
+        return null
+    tr.shape
+
+pub fn tr_count(tr: *TypeRef) -> i64
+    if tr == null
+        return 0
+    tr.count
+
+# `tr_elem` / `tr_pointee` live in types.ritz with the other accessors.
+
+# `last_array_elem_type`.
+pub fn tr_elem_kind(tr: *TypeRef) -> TypeKind
+    if tr == null or tr.elem == null
+        return TypeKind.Void
+    tr.elem.kind
+
+# `last_array_elem_pointee`: U for `[N]*U` / `[N]**U` / `[N]@U` / `[N]@&U`.
+pub fn tr_elem_pointee(tr: *TypeRef) -> TypeKind
+    if tr == null or tr.elem == null
+        return TypeKind.Void
+    let e: *TypeRef = tr.elem
+    match e.kind
+        TypeKind.Ptr =>
+            return tr_pointee_kind(e)
+        TypeKind.PtrPtr =>
+            return ptr_slot_flat(tr_ptr_ptr_inner_pointee(e))
+        TypeKind.Ref | TypeKind.MutRef =>
+            return tr_ref_inner(e)
+        _ => pass
+    TypeKind.Void
+
+# `last_array_elem_type_name`: the struct an array's element (or the struct
+# it points at / refers to) is named, null otherwise.
+pub fn tr_elem_name(tr: *TypeRef, out_len: *i32) -> *u8
+    *out_len = 0
+    if tr == null or tr.elem == null
+        return null
+    let e: *TypeRef = tr.elem
+    match e.kind
+        TypeKind.Struct =>
+            *out_len = e.name_len
+            return e.name
+        TypeKind.Ref | TypeKind.MutRef =>
+            if tr_ref_inner(e) == TypeKind.Struct
+                return tr_name(e.pointee, out_len)
+            return null
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            if tr_slot_inner(e) == TypeKind.Struct
+                return tr_name(e, out_len)
+            return null
+        _ => pass
+    null
+
+# The `[N]..T` a pointer names via `*[N]T`, `**[N]T` or `@*[N]T`; null for any
+# other pointer.  This is `ptr_names_array`'s subject.
+fn tr_ptr_array(tr: *TypeRef) -> *TypeRef
+    if tr == null
+        return null
+    match tr.kind
+        TypeKind.Ptr =>
+            if tr.pointee != null and tr.pointee.kind == TypeKind.Array
+                return tr.pointee
+            return null
+        TypeKind.PtrPtr =>
+            if tr_depth(tr) == 2 and tr.pointee != null and tr.pointee.kind == TypeKind.Ptr and tr.pointee.pointee != null and tr.pointee.pointee.kind == TypeKind.Array
+                return tr.pointee.pointee
+            return null
+        TypeKind.Ref | TypeKind.MutRef =>
+            if tr.ref_inner == TypeKind.Ptr and tr.pointee != null and tr.pointee.pointee != null and tr.pointee.pointee.kind == TypeKind.Array
+                return tr.pointee.pointee
+            return null
+        _ => pass
+    null
+
+# `last_inner_pointee_type`: the deepest non-pointer kind of a `*..T`.
+pub fn tr_slot_inner(tr: *TypeRef) -> TypeKind
+    if tr == null
+        return TypeKind.Void
+    var p: *TypeRef = tr
+    while p != null and (p.kind == TypeKind.Ptr or p.kind == TypeKind.PtrPtr)
+        p = p.pointee
+    if p == null
+        return TypeKind.Void
+    p.kind
+
+# AGAST #4450: tr_slot_inner as an inner-pointee slot: the leaf's kind, or the
+# packed slot a DeepPtr leaf stands for (TypeRef.deep_slot).
+pub fn tr_slot_inner_slot(tr: *TypeRef) -> i32
+    var p: *TypeRef = tr
+    while p != null and (p.kind == TypeKind.Ptr or p.kind == TypeKind.PtrPtr)
+        p = p.pointee
+    if p == null
+        return TypeKind.Void as i32
+    if p.kind == TypeKind.DeepPtr
+        return p.deep_slot
+    p.kind as i32
+
+# AGAST #1815 / #1924: `ptr_ptr_inner_pointee`.  A `***T` packs its extra
+# levels as multiples of PTR_DEPTH_UNIT, exactly as the flat slot did.
+pub fn tr_ptr_ptr_inner_pointee(tr: *TypeRef) -> i32
+    var slot: *TypeRef = tr
+    if tr != null and (tr.kind == TypeKind.Ref or tr.kind == TypeKind.MutRef)
+        slot = tr.pointee
+    if slot == null or slot.kind != TypeKind.PtrPtr
+        return (TypeKind.Void as i32)
+    let d: i32 = tr_depth(slot)
+    let deep: i32 = tr_slot_inner_slot(slot)
+    if d <= 2
+        return deep
+    if d < 3 or deep == (TypeKind.Void as i32)
+        return (TypeKind.Void as i32)
+    ptr_slot_deepen(deep, d - 2)
+
+# The first `[N]T` in this type's chain: the type itself, or the array a
+# pointer / reference wraps.  Its facts are the ones the flat parser state
+# described after parsing the type.
+fn tr_array_node(tr: *TypeRef) -> *TypeRef
+    var t: *TypeRef = tr
+    while t != null
+        if t.kind == TypeKind.Array
+            return t
+        t = t.pointee
+    null
+
+fn tr_array_node_elem(tr: *TypeRef) -> *TypeRef
+    let a: *TypeRef = tr_array_node(tr)
+    if a == null
+        return null
+    a.elem
+
+# The fn signature of this type: its own, or the one an array's element holds.
+fn tr_chain_fn_sig(tr: *TypeRef) -> *FnDef
+    var t: *TypeRef = tr
+    while t != null
+        if t.fn_sig != null
+            return t.fn_sig
+        if t.elem != null
+            t = t.elem
+        else
+            t = t.pointee
+    null
+
+# One flat snapshot of a `*TypeRef`: exactly the facts the 17 `Parser.last_*`
+# side channels held after `type_spec` parsed it.  #4035 keeps the flat
+# consumers (Param / StructField / GlobalVarDef / Stmt) unchanged by deriving
+# that snapshot from the chain instead of latching it on the Parser.
+pub struct TypeFacts
+    kind: TypeKind
+    type_name: *u8
+    type_name_len: i32
+    pointee_type: TypeKind
+    inner_pointee_type: i32
+    ptr_depth: i32
+    array_size: i32
+    array_elem_type: TypeKind
+    array_elem_type_name: *u8
+    array_elem_type_name_len: i32
+    array_elem_pointee: TypeKind
+    array_shape: *ArrayShape
+    ref_inner_type: TypeKind
+    inner_ref: i32
+    fn_sig: *FnDef
+
+pub fn type_facts(p: *Parser, tr: *TypeRef) -> *TypeFacts
+    let f: *TypeFacts = parser_alloc(p, sizeof(TypeFacts)) as *TypeFacts
+    let kind: TypeKind = tr_kind(tr)
+    f.kind = kind
+    f.type_name = tr_name(tr, @f.type_name_len)
+    # `last_pointee_type`: the pointer's pointee, or, for a reference, the
+    # pointer it wraps one level in (`@*T` recorded T) -- and for a reference
+    # to a value, that value's own kind (`@S` recorded S, which is what a
+    # member or `*g` of a global `@S` reads).
+    f.pointee_type = TypeKind.Void
+    match kind
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            f.pointee_type = tr_pointee_kind(tr)
+        TypeKind.Ref | TypeKind.MutRef =>
+            if tr.pointee != null
+                if tr.ref_inner == TypeKind.Ptr or tr.ref_inner == TypeKind.PtrPtr
+                    f.pointee_type = tr_pointee_kind(tr.pointee)
+                else
+                    f.pointee_type = tr.pointee.kind
+        _ => pass
+    # `last_inner_pointee_type`: the deepest non-pointer kind, with a
+    # reference unwrapped to the pointer it holds (a `@*T` recorded T).
+    f.inner_pointee_type = (TypeKind.Void as i32)
+    match kind
+        TypeKind.Ref | TypeKind.MutRef =>
+            f.inner_pointee_type = (tr_slot_inner(tr.pointee) as i32)
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            f.inner_pointee_type = (tr_slot_inner(tr) as i32)
+        _ => pass
+    # `last_ptr_depth`: a reference inherited the pointer's depth from its
+    # referent's parse (`@*T` was depth 1).
+    f.ptr_depth = 0
+    match kind
+        TypeKind.Ref | TypeKind.MutRef =>
+            f.ptr_depth = tr_depth(tr.pointee)
+        TypeKind.Ptr | TypeKind.PtrPtr =>
+            f.ptr_depth = tr_depth(tr)
+        _ => pass
+    # `last_array_*` / `last_array_shape`: the first `[N]T` in the chain, which
+    # for a `*[N]T` / `@[N]T` is the pointee's.
+    let a: *TypeRef = tr_array_node(tr)
+    f.array_size = 0
+    f.array_elem_type = TypeKind.Void
+    f.array_elem_pointee = TypeKind.Void
+    f.array_elem_type_name = null
+    f.array_elem_type_name_len = 0
+    f.array_shape = null
+    if a != null
+        f.array_size = tr_count(a) as i32
+        f.array_elem_type = tr_elem_kind(a)
+        f.array_elem_pointee = tr_elem_pointee(a)
+        f.array_elem_type_name = tr_elem_name(a, @f.array_elem_type_name_len)
+        f.array_shape = tr_shape(a)
+    f.ref_inner_type = tr_ref_inner(tr)
+    f.inner_ref = tr_inner_ref(tr)
+    f.fn_sig = tr_chain_fn_sig(tr)
+    f
+
+pub fn note_type_name_written(p: *Parser, name: *u8, line: i32, col: i32)
+    let at: *TypeNameAt = parser_alloc(p, sizeof(TypeNameAt)) as *TypeNameAt
+    at.name = name
+    at.line = line
+    at.col = col
+    at.file = parse_file_copy_shared(p)
+    at.reported = 0
+    at.next = p.ctx.type_name_at
+    p.ctx.type_name_at = at
+
+# AGAST #4021: a type name written where the AST keeps no source spelling:
+# a generic argument (the slot holds the mangled `Option$Nope`), an enum
+# payload (enums have no AST node), an alias's target and a cast's type.
+# Each is noted as it parses, and the item it sits in claims the notes when
+# its action runs (items end after their contents), with the type parameters
+# in scope there: a fn's (and, for a method, its impl's, which
+# impl_block_new adds), a struct's or an enum's; an alias's or a global's
+# none.  type_name_check.ritz judges each note in its scope.
+#
+# A note is the IDENT a type ended with (`Nope` of `*Nope`); one type_named
+# did not record (a primitive, an alias's name) is never reported.
+# struct TnNote: ast.ritz, beside ParseCtx (AGAST #4623).
+
+# struct TnScope: ast.ritz, beside ParseCtx (AGAST #4623).
+
+# State: ParseCtx.tn_pending, .tn_scopes, .tn_enum_params
+
+pub fn tn_note(p: *Parser, name_sv: StrView)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if p.skip_item != 0 or name == null or len <= 0
+        return
+    let n: *TnNote = parser_alloc(p, sizeof(TnNote)) as *TnNote
+    n.name = name
+    n.len = len
+    n.next = p.ctx.tn_pending
+    p.ctx.tn_pending = n
+
+# The token `back` before p.pos when it is an IDENT (the type just parsed
+# ended with a name), else null.
+pub fn tn_last_written(p: *Parser, back: i32) -> *Token
+    let i: i32 = p.pos - back
+    if i < 0 or i >= p.token_count
+        return null
+    let t: *Token = p.tokens + i
+    if t.kind != TOK_IDENT
+        return null
+    t
+
+# Note the type that ended `back` tokens before p.pos, if it ended with a name.
+pub fn tn_note_last(p: *Parser, back: i32)
+    let t: *Token = tn_last_written(p, back)
+    if t != null
+        tn_note(p, StrView { ptr: (t.start), len: (t.len) as i64 })
+
+# AGAST #4171: a generic call's type argument `g<Nope>(3)` / `g<*Nope>(p)` /
+# `g<@Nope>(r)` is a bare token (type_name), never a type_spec, so type_named
+# neither saw nor located it: locate it here and note it.
+pub fn tn_note_tok(p: *Parser, tok: Token)
+    if p.skip_item != 0 or tok.kind != TOK_IDENT
+        return
+    note_type_name_written(p, tok.start, tok.line, tok.col)
+    tn_note(p, StrView { ptr: (tok.start), len: (tok.len) as i64 })
+
+# AGAST #4171: a generic call's full argument list `g<i32, *Nope>(3)`.  Each
+# argument is a type_spec (type_named located it), but only
+# type_generic_with_saved noted them.
+fn tn_note_args(p: *Parser, ga: *GenericArg)
+    var cur: *GenericArg = ga
+    while cur != null
+        tn_note(p, StrView { ptr: (cur.written), len: (cur.written_len) as i64 })
+        cur = cur.next
+
+# cast_type_end_check: a cast's type ran on into a comparison (`a as Id < b,
+# c > d`), so the generic arguments noted after the `as` are values: drop them.
+fn tn_drop_after_as(p: *Parser)
+    var i: i32 = p.pos - 1
+    while i >= 0 and (p.tokens + i).kind != TOK_AS
+        i = i - 1
+    if i < 0
+        return
+    let as_at: *u8 = (p.tokens + i).start
+    while p.ctx.tn_pending != null and (p.ctx.tn_pending.name as i64) > (as_at as i64)
+        p.ctx.tn_pending = p.ctx.tn_pending.next
+
+pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem: *TypeRef) -> *TypeRef
+    var v: i64 = 0
+    var folded: i32 = const_fold_int(p.module.constants, len_expr, 0, @v)
+    if folded == 0 and p.ctx.array_len_seed != null
+        folded = const_fold_int(p.ctx.array_len_seed, len_expr, 1, @v)
+    if folded == 0
+        if p.ctx.array_len_reparse == 0
+            p.ctx.array_len_pending = 1
+        else if array_len_overflow(p, len_expr) == 0
+            array_len_report(p.ctx, line, col, c"is not a constant integer expression")
+        v = 0
+    else if v < 0 or v > 2147483647
+        array_len_report(p.ctx, line, col, c"is out of range (it must be 0 to 2147483647)")
+        v = 0
+    type_array_sized(p, v as i32, elem)
+
+# The backtracking parser re-runs an action each time it retries the
+# alternative: report each `[` once, as nd_array_report does.
+# State: ParseCtx.array_len_line, .array_len_col
+
+# LARB R63 (AGAST #3489): a length that overflows, `[9223372036854775807 + 1]u8`,
+# says so at the operation, as ritz0's const evaluator does.  1 if reported.
+fn array_len_overflow(p: *Parser, len_expr: *Expr) -> i32
+    var site: *Expr = const_overflow_site(p.module.constants, len_expr, 0)
+    if site == null and p.ctx.array_len_seed != null
+        site = const_overflow_site(p.ctx.array_len_seed, len_expr, 1)
+    if site == null
+        return 0
+    if site.span.line != p.ctx.array_len_line or site.span.col != p.ctx.array_len_col
+        p.ctx.array_len_line = site.span.line
+        p.ctx.array_len_col = site.span.col
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
+        const_overflow_report(p.ctx.parse_file, site)
+    1
+
+fn array_len_report(ctx: *ParseCtx, line: i32, col: i32, why: *u8)
+    if line == ctx.array_len_line and col == ctx.array_len_col
+        return
+    ctx.array_len_line = line
+    ctx.array_len_col = col
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error_at(ctx.parse_file, diag_span(line, col))
+    eprints("array length ")
+    eprintln_cstr(why)
+
+# AGAST #2343: the element of the `[N]T` this type wraps, as an ArrayElem.
+pub fn array_elem_of_type(p: *Parser, tr: *TypeRef) -> *ArrayElem
+    let a: *TypeRef = tr_array_node(tr)
+    let e: *TypeRef = tr_array_node_elem(tr)
+    let ae: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
+    ae.elem = tr_kind(e)
+    ae.pointee = tr_elem_pointee(a)
+    ae.name = tr_elem_name(a, @ae.name_len)
+    ae.shape = tr_shape(a)
+    # AGAST #2995: the `[M]T` that the element of `[N]*[M]T` points at.
+    ae.ptr_array = null
+    ae.ptr_array_size = 0
+    ae.ptr_plane = null
+    if e != null and e.kind == TypeKind.Ptr
+        if e.pointee != null and e.pointee.kind == TypeKind.Array
+            if e.pointee.shape == null
+                let inner: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
+                inner.elem = tr_elem_kind(e.pointee)
+                inner.pointee = tr_elem_pointee(e.pointee)
+                inner.name = tr_elem_name(e.pointee, @inner.name_len)
+                inner.shape = null
+                inner.ptr_array = null
+                inner.ptr_array_size = 0
+                inner.ptr_plane = null
+                ae.ptr_array = inner
+                ae.ptr_array_size = tr_count(e.pointee) as i32
+            else
+                ae.ptr_plane = e.pointee.shape
+    return ae
+
+# AGAST #2995 / #1509: `[N]T` from an already-parsed element type `elem`.
+pub fn type_array_sized(p: *Parser, size: i32, elem: *TypeRef) -> *TypeRef
+    let t: *TypeRef = typeref_new(p, TypeKind.Array)
+    t.elem = elem
+    t.count = size as i64
+    # AGAST #1509: `[size]<array>` is multi-dimensional.  `elem` is the inner
+    # `[M]T`, so prepend `size` to its shape.
+    t.shape = null
+    if elem != null
+        if elem.kind == TypeKind.Array
+            t.shape = array_shape_prepend_type(p, size, elem)
+    t
+
+# AGAST #1509: rank-2 shape for `[size][M]T`, or one leading dim on a deeper
+# inner shape.  null (and reported) past MAX_ARRAY_RANK.
+fn array_shape_prepend_type(p: *Parser, size: i32, elem: *TypeRef) -> *ArrayShape
+    let inner: *ArrayShape = tr_shape(elem)
+    let sh: *ArrayShape = parser_alloc(p, sizeof(ArrayShape)) as *ArrayShape
+    sh.dims[0] = size
+    if inner == null
+        sh.rank = 2
+        sh.dims[1] = tr_count(elem) as i32
+        sh.leaf_type = tr_elem_kind(elem)
+        sh.leaf_name = tr_elem_name(elem, @sh.leaf_name_len)
+        sh.leaf_pointee = tr_elem_pointee(elem)
+        return sh
+    if inner.rank >= MAX_ARRAY_RANK
+        diag_error(p.ctx.parse_file, parse_span_at(p, p.pos), c"array type has more than 8 dimensions")
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
+        return null
+    sh.rank = inner.rank + 1
+    var d: i32 = 0
+    while d < inner.rank
+        sh.dims[d + 1] = inner.dims[d]
+        d = d + 1
+    sh.leaf_type = inner.leaf_type
+    sh.leaf_name = inner.leaf_name
+    sh.leaf_name_len = inner.leaf_name_len
+    sh.leaf_pointee = inner.leaf_pointee
+    return sh
+
+# AGAST #1815: the innermost pointee of `**T`, for Param / Stmt /
+# GlobalVarDef / StructField.  AGAST #1924: a `***T` (or deeper) packs its
+# extra levels in as multiples of PTR_DEPTH_UNIT.
+pub fn ptr_ptr_inner_pointee(p: *Parser, tr: *TypeRef) -> i32
+    tr_ptr_ptr_inner_pointee(tr)
+
+# AGAST #2343: U for `*[N]*U` (TypeKind.Void otherwise).
+pub fn ptr_array_elem_pointee(p: *Parser, tr: *TypeRef) -> TypeKind
+    if ptr_names_array(p, tr) == 0
+        return TypeKind.Void
+    let a: *TypeRef = tr_array_node(tr)
+    tr_elem_pointee(a)
+
+# AGAST #2539: 1 for `*[N]T` / `**[N]T` / `@*[N]T` / `@&*[N]T`.
+fn ptr_names_array(p: *Parser, tr: *TypeRef) -> i32
+    let a: *TypeRef = tr_array_node(tr)
+    if a == null
+        return 0
+    if tr == null
+        return 0
+    match tr.kind
+        TypeKind.Ptr =>
+            return (a == tr.pointee) as i32
+        TypeKind.PtrPtr =>
+            if tr_depth(tr) != 2 or tr.pointee == null
+                return 0
+            if a == tr.pointee.pointee
+                return 1
+            return 0
+        TypeKind.Ref | TypeKind.MutRef =>
+            if tr.ref_inner == TypeKind.Ptr and a == tr.pointee.pointee
+                return 1
+            return 0
+        _ => pass
+    0
+
+# AGAST #2098: the shape of `*[N][M]..T`; null for any other type.  #3635: and
+# a `**[N][M]..T`; #4122: `@*[N][M]..T` / `@&*[N][M]..T`.
+pub fn ptr_nd_pointee_shape(p: *Parser, tr: *TypeRef) -> *ArrayShape
+    if ptr_names_array(p, tr) == 0
+        return null
+    let a: *TypeRef = tr_array_node(tr)
+    tr_shape(a)
+
+# The element count of `sh`, every dimension multiplied.
+pub fn nd_shape_count(sh: *ArrayShape) -> i32
+    var n: i32 = 1
+    var i: i32 = 0
+    while i < sh.rank
+        n = n * sh.dims[i]
+        i = i + 1
+    n
+
+# AGAST #1953: N for `*[N]T` (0 otherwise), or `**[N]T` (#2539).
+pub fn ptr_array_pointee_size(p: *Parser, tr: *TypeRef) -> i32
+    if ptr_names_array(p, tr) == 0
+        return 0
+    let a: *TypeRef = tr_array_node(tr)
+    tr_count(a) as i32
+
+# AGAST #1953: T for `*[N]T` (TypeKind.Void otherwise), or `**[N]T` (#2539).
+pub fn ptr_array_pointee_elem(p: *Parser, tr: *TypeRef) -> TypeKind
+    if ptr_names_array(p, tr) == 0
+        return TypeKind.Void
+    let a: *TypeRef = tr_array_node(tr)
+    tr_elem_kind(a)
+
+pub struct AliasEntry
+    name: *u8
+    name_len: i32
+    kind: TypeKind
+    type_name: *u8
+    type_name_len: i32
+    pointee_type: TypeKind
+    inner_pointee_type: i32
+    array_size: i32
+    array_elem_type: TypeKind
+    array_elem_pointee: TypeKind
+    array_elem_type_name: *u8
+    array_elem_type_name_len: i32
+    ref_inner_type: TypeKind
+    inner_ref: i32  # AGAST #2399
+    ptr_depth: i32         # AGAST #1924
+    array_shape: *ArrayShape  # AGAST #1509
+    fn_sig: *FnDef         # AGAST #1879: a fn type's signature (type_fn)
+    spelling: *u8          # AGAST #3625: the target as written (type_alias_spell)
+    spelling_len: i32
+
+pub fn type_alias_find(ctx: *ParseCtx, name_sv: StrView) -> *AliasEntry
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    var i: i32 = 0
+    while i < ctx.alias_count
+        let e: *AliasEntry = *(ctx.alias_table + i) as *AliasEntry
+        if (StrView { ptr: (e.name), len: (e.name_len) as i64 }).eq(StrView { ptr: (name), len: (len) as i64 })
+            return e
+        i = i + 1
+    return null
+
+# Spelling of a primitive type argument, as ritz0 mangles it (its type
+# name).  Returns its length (0 for a non-primitive) and the bytes in *out.
+# AGAST #1922: only u8/i8/i32/i64/u64 were spelled, so `Option<u32>` mangled
+# as `Option$` and tagged_enum_layout could not measure it.
+pub fn primitive_arg_spelling(ty: TypeKind, out: **u8) -> i32
+    match ty
+        TypeKind.U8 =>
+            *out = c"u8"
+            return 2
+        TypeKind.I8 =>
+            *out = c"i8"
+            return 2
+        TypeKind.U16 =>
+            *out = c"u16"
+            return 3
+        TypeKind.I16 =>
+            *out = c"i16"
+            return 3
+        TypeKind.U32 =>
+            *out = c"u32"
+            return 3
+        TypeKind.I32 =>
+            *out = c"i32"
+            return 3
+        TypeKind.U64 =>
+            *out = c"u64"
+            return 3
+        TypeKind.I64 =>
+            *out = c"i64"
+            return 3
+        TypeKind.F32 =>
+            *out = c"f32"
+            return 3
+        TypeKind.F64 =>
+            *out = c"f64"
+            return 3
+        TypeKind.Bool =>
+            *out = c"bool"
+            return 4
+        _ => pass
+    *out = null
+    return 0
+
+# spell_ptr_generic_arg over explicit parts, so an alias table entry (which
+# saved the same fields) spells without replaying itself into p.
+pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, type_name_sv: StrView, out_len: *i32) -> *u8
+    var type_name: *u8 = type_name_sv.ptr
+    var type_name_len: i32 = type_name_sv.len as i32
+    var depth: i32 = 1
+    var leaf: TypeKind = ptr_slot_flat(inner)
+    if ty == TypeKind.PtrPtr
+        if pointee != TypeKind.Ptr
+            *out_len = 0
+            return null
+        # AGAST #3686: `inner` is depth-packed past two levels (`***u8` is
+        # u8 + PTR_DEPTH_UNIT).  Read raw, it named no primitive, so the
+        # argument spelled "" and `first<***u8>` became `first$`, a
+        # procedure.
+        depth = ptr_ptr_slot_levels(inner)
+        leaf = ptr_ptr_slot_inner(inner)
+    var base: *u8 = null
+    var base_len: i32 = 0
+    if leaf == TypeKind.Struct
+        base = type_name
+        base_len = type_name_len
+    else
+        base_len = primitive_arg_spelling(leaf, @base)
+    if base_len <= 0
+        *out_len = 0
+        return null
+    let total: i32 = depth * 4 + base_len
+    let name: *u8 = parser_alloc(p, (total + 1) as i64)
+    var pos: i32 = 0
+    for d in 0..depth
+        *(name + pos) = 112      # 'p'
+        *(name + pos + 1) = 116  # 't'
+        *(name + pos + 2) = 114  # 'r'
+        *(name + pos + 3) = 95   # '_'
+        pos = pos + 4
+    for i in 0..base_len
+        *(name + pos) = *(base + i)
+        pos = pos + 1
+    *(name + pos) = 0
+    *out_len = pos
+    return name
+
+# AGAST #2037: build a single-token generic call's suffix — "$" + prefix +
+# the type argument's mangled spelling.  The token rules (`f<T>`, `f<*T>`,
+# `f<@T>`) never pass the token through type_named, so an alias (`type Id =
+# u32`) used to mangle by its own name ("$Id"), instantiating `Vec$Id` where
+# a `Vec<Id>` field had resolved to `Vec$u32`.  An alias spells as its
+# target, exactly as generic_arg_spelling would after type_named replayed it
+# (the table entry holds the final target, so alias-of-alias is settled).
+# Anything else spells as the token text.  Reads the table without touching
+# parser state.
+pub fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token, out_len: *i32) -> *u8
+    var prefix: *u8 = prefix_sv.ptr
+    var prefix_len: i32 = prefix_sv.len as i32
+    var spell: *u8 = tok.start
+    var spell_len: i32 = tok.len
+    # AGAST #3935 (LARB R53): `usize` / `isize` spell as `u64` / `i64`, as a
+    # type_spec argument does (capture_first_generic_arg): `vec_new<usize>`
+    # is `vec_new$u64`, returning the `Vec$u64` a `Vec<usize>` local is.
+    if is_word_type_name(StrView { ptr: (tok.start), len: (tok.len) as i64 }) == 1
+        spell_len = primitive_arg_spelling(word_type(tok.start), @spell)
+    else if p.ctx.alias_count > 0
+        let e: *AliasEntry = type_alias_find(p.ctx, StrView { ptr: (tok.start), len: (tok.len) as i64 })
+        if e != null
+            var n: i32 = 0
+            match e.kind
+                TypeKind.Struct =>
+                    spell = e.type_name
+                    n = e.type_name_len
+                TypeKind.Ptr | TypeKind.PtrPtr =>
+                    spell = spell_ptr_parts(p, e.kind, e.pointee_type, e.inner_pointee_type, StrView { ptr: (e.type_name), len: (e.type_name_len) as i64 }, @n)
+                _ =>
+                    n = primitive_arg_spelling(e.kind, @spell)
+            # A target with no spelling (array, fn type, ...) keeps the alias
+            # name: no worse than before, and the mismatch stays visible.
+            if n > 0
+                spell_len = n
+            else
+                spell = tok.start
+    let total: i32 = 1 + prefix_len + spell_len
+    let buf: *u8 = parser_alloc(p, (total + 1) as i64)
+    *buf = 36  # '$'
+    for i in 0..prefix_len
+        *(buf + 1 + i) = *(prefix + i)
+    for i in 0..spell_len
+        *(buf + 1 + prefix_len + i) = *(spell + i)
+    *(buf + total) = 0
+    *out_len = total
+    return buf
+
+# Mangled spelling of one argument: the primitive's name, or the captured
+# struct/generic/pointer name.  The one speller for generic type annotations,
+# struct literals and generic-call suffixes.  Returns its length and stores
+# the bytes' address in *out.
+pub fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
+    if ga.ty == TypeKind.Struct or ga.ty == TypeKind.Ptr or ga.ty == TypeKind.PtrPtr or ga.ty == TypeKind.Array or ga.ty == TypeKind.Void or ga.ty == TypeKind.Ref or ga.ty == TypeKind.MutRef
+        *out = ga.name
+        return ga.name_len
+    # AGAST #2198: `usize` / `isize`, as written (`Vec$usize`).  AGAST #3464:
+    # `usize` is TypeKind.U64 now; its spelling is unchanged.
+    if (ty_int_bits(ga.ty) == 64) and ga.name != null and ga.name_len > 0
+        *out = ga.name
+        return ga.name_len
+    return primitive_arg_spelling(ga.ty, out)
+
+# Mangle `base<a1, a2, ...>` as "base$a1$a2..." (AGAST #1574), from the
+# captured argument list.  Returns an arena-allocated, NUL-terminated name
+# and its length in *out_len.
+pub fn mangle_generic_args(p: *Parser, base_name_sv: StrView, ga: *GenericArg, out_len: *i32) -> *u8
+    var base_name: *u8 = base_name_sv.ptr
+    var base_len: i32 = base_name_sv.len as i32
+    var total: i32 = base_len
+    var spell: *u8 = null
+    var cur: *GenericArg = ga
+    while cur != null
+        total = total + 1 + generic_arg_spelling(cur, @spell)
+        cur = cur.next
+    let mangled: *u8 = parser_alloc(p, (total + 1) as i64)
+    var pos: i32 = 0
+    for i in 0..base_len
+        *(mangled + pos) = *(base_name + i)
+        pos = pos + 1
+    cur = ga
+    while cur != null
+        *(mangled + pos) = 36  # '$'
+        pos = pos + 1
+        let n: i32 = generic_arg_spelling(cur, @spell)
+        for j in 0..n
+            *(mangled + pos) = *(spell + j)
+            pos = pos + 1
+        cur = cur.next
+    *(mangled + pos) = 0
+    *out_len = pos
+    return mangled
+
+# Mangle a generic type like Result<Vec<u8>, StrView> → Result$Vec$u8$StrView
+# from the arguments captured by capture_first_generic_arg.  Returns
+# TypeKind.Struct with the name in the last_type_name side channel, like type_generic.
+# AGAST #4654: a generic type's base name (`Zork` of `Zork<u8>`, `Vec` of
+# `Vec<u8>` with no import) is a token no type_named call saw, and the slot
+# keeps only the mangled `Zork$u8`, so nothing judged it.  Locate it at its
+# token and note it for type_name_check.ritz, which knows a generic struct
+# or enum template by its base name.  `[T]`'s builtin "Span" is no token.
+fn tn_note_base(p: *Parser, name_sv: StrView)
+    if p.skip_item != 0 or name_sv.ptr == null
+        return
+    var i: i32 = p.pos - 1
+    if i >= p.token_count
+        i = p.token_count - 1
+    let stop: i32 = i - 512   # the base precedes only its own `<...>`
+    while i >= 0 and i > stop
+        let t: *Token = p.tokens + i
+        if t.start == name_sv.ptr
+            if t.kind == TOK_IDENT
+                note_type_name_written(p, t.start, t.line, t.col)
+                tn_note(p, name_sv)
+            return
+        i = i - 1
+
+pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericArg) -> *TypeRef
+    var base_name: *u8 = base_name_sv.ptr
+    var base_len: i32 = base_name_sv.len as i32
+    tn_note_base(p, StrView { ptr: (base_name), len: (base_len) as i64 })   # AGAST #4654
+    var cur: *GenericArg = ga
+    while cur != null
+        tn_note(p, StrView { ptr: (cur.written), len: (cur.written_len) as i64 })   # AGAST #4021
+        cur = cur.next
+    var len: i32 = 0
+    let mangled: *u8 = mangle_generic_args(p, StrView { ptr: (base_name), len: (base_len) as i64 }, ga, @len)
+    if p.skip_item == 0
+        generic_use_note_mangled(p.ctx, StrView { ptr: (mangled), len: (len) as i64 }, ga, diag_span(0, 0), parse_file_copy_shared(p))
+    let t: *TypeRef = typeref_new(p, TypeKind.Struct)
+    t.name = mangled
+    t.name_len = len
+    t
+
+# =============================================================================
+# Where each generic instance is first written (AGAST #3469)
+# =============================================================================
+#
+# A failed trait bound is an error at the type argument as first written
+# (`Holder<Nope>`, `total<Nope>(..)`), or at the call when its arguments were
+# inferred (LANGUAGE_SPEC §11.5), as ritz0's monomorph notes an instance's
+# first use.  ritz1's instance trackers keep only mangled names, so the parser
+# notes each generic type and explicit call here, and infer_generic_calls each
+# inferred call, after them.  trait_bound.ritz asks only once a bound has
+# failed, so a list is enough; it is newest first, so the first use is the
+# last match.
+# struct GenericUse: ast.ritz, beside ParseCtx (AGAST #4623).
+
+# State: ParseCtx.generic_uses
+
+pub fn generic_use_note(ctx: *ParseCtx, name_sv: StrView, suffix_sv: StrView, args: *GenericArg, at: SrcSpan, file: *u8)
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    var suffix: *u8 = suffix_sv.ptr
+    var suffix_len: i32 = suffix_sv.len as i32
+    if name == null or name_len <= 0 or suffix == null or suffix_len <= 0
+        return
+    let u: *GenericUse = malloc(sizeof(GenericUse)) as *GenericUse
+    u.name = name
+    u.name_len = name_len
+    u.suffix = suffix
+    u.suffix_len = suffix_len
+    u.args = args
+    u.at = at
+    u.file = file
+    u.next = ctx.generic_uses
+    ctx.generic_uses = u
+
+# A generic type's mangled name `Holder$Nope` is the instance `Holder` with
+# suffix `$Nope`, as monomorph tracks it.
+fn generic_use_note_mangled(ctx: *ParseCtx, mangled_sv: StrView, args: *GenericArg, at: SrcSpan, file: *u8)
+    var mangled: *u8 = mangled_sv.ptr
+    var len: i32 = mangled_sv.len as i32
+    var k: i32 = 0
+    while k < len and *(mangled + k) != '$'   # '$'
+        k = k + 1
+    if k > 0 and k < len
+        generic_use_note(ctx, StrView { ptr: (mangled), len: (k) as i64 }, StrView { ptr: (mangled + k), len: (len - k) as i64 }, args, at, file)
+
+# AGAST #3015: where the token starting at `at` is, from the last few tokens
+# before the parser's position (a field name just parsed); 0:0 if not there.
+pub fn tok_span_back(p: *Parser, at: *u8, out: *SrcSpan)
+    out.line = 0
+    out.col = 0
+    var i: i32 = p.pos
+    if i >= p.token_count
+        i = p.token_count - 1
+    var n: i32 = 0
+    while i >= 0 and n < 512
+        let t: *Token = p.tokens + i
+        if t.start == at
+            out.line = t.line
+            out.col = t.col
+            return
+        i -= 1
+        n += 1
+
+pub fn stmt_expr(p: *Parser, e: *Expr, line: i32, col: i32) -> *Stmt
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Expr
+    s.span.line = line
+    s.span.col = col
+    s.expr = e
+    s.next = null
+    return s
+
+pub fn expr_int(p: *Parser, val: i64, line: i32, col: i32) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.IntLit
+    e.span.line = line
+    e.span.col = col
+    e.int_val = val
+    e.lit_kind = LIT_PLAIN
+    e.ident_ptr = null      # no overflowed source text (expr_int_lit)
+    e.ident_len = 0
+    e.next = null
+    return e
+
+# `true` is the integer 1 to everything but tail_value.ritz, which needs it to
+# judge `while true` (AGAST #2236), and bool_check.ritz.
+pub fn expr_true(p: *Parser, line: i32, col: i32) -> *Expr
+    let e: *Expr = expr_int(p, 1, line, col)
+    e.lit_kind = LIT_TRUE
+    return e
+
+# `false` is the integer 0 to everything but bool_check.ritz (AGAST #2342).
+pub fn expr_false(p: *Parser, line: i32, col: i32) -> *Expr
+    let e: *Expr = expr_int(p, 0, line, col)
+    e.lit_kind = LIT_FALSE
+    return e
+
+# `pass` in expression position is the integer 0 to everything but
+# tail_value.ritz, where it is the absence of a value (AGAST #2236).
+# AGAST #3320: `pass` is an identifier (LANGUAGE_SPEC §2), so it lexes as
+# IDENT and names fns, params, locals and fields like any other.  As ritz0
+# reads it, a bare `pass` is the binding of that name when one is in scope,
+# and otherwise the no-op.  ctx.pass_bound is "the fn being parsed binds `pass`"
+# (a param or a let/var/for), set as each binding is parsed and cleared at
+# the fn's end, so it covers the reads after the binding.  It is per fn, not
+# per block: a no-op `pass` after an inner block's `let pass` reads as the
+# out-of-scope name.
+# State: ParseCtx.pass_bound
+
+fn is_pass_name(name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if len == 4 and name != null and *name == 'p' and *(name + 1) == 'a' and *(name + 2) == 's' and *(name + 3) == 's'
+        return 1
+    return 0
+
+pub fn note_pass_binding(ctx: *ParseCtx, name_sv: StrView)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if is_pass_name(StrView { ptr: (name), len: (len) as i64 }) == 1
+        ctx.pass_bound = 1
+
+# Grammar action for a `for` variable: noted before the body is parsed, which
+# stmt_for's action (after the body) would be too late for.
+pub fn for_var_name(ctx: *ParseCtx, tok: Token) -> Token
+    note_pass_binding(ctx, StrView { ptr: (tok.start), len: (tok.len) as i64 })
+    return tok
+
+# A primary with no postfix ops (apply_postfix_p): a bare `pass` with no
+# binding of that name in the fn is the no-op.  `pass(2)`, `s.pass` and a
+# bound `pass` stay identifiers.
+fn pass_or_ident(p: *Parser, e: *Expr) -> *Expr
+    if e.kind == ExprKind.Ident and p.ctx.pass_bound == 0 and is_pass_name(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+        return expr_pass(p, e.span.line, e.span.col)
+    return e
+
+pub fn expr_pass(p: *Parser, line: i32, col: i32) -> *Expr
+    let e: *Expr = expr_int(p, 0, line, col)
+    e.lit_kind = LIT_PASS
+    return e
+
+# `()` in expression position (AGAST #2272): integer 0 marked LIT_UNIT, as
+# `pass` is.  A variant ctor stores no payload for it (`Ok(())`), so the 0
+# never reaches a unit payload's zero bytes.
+pub fn expr_unit(p: *Parser, line: i32, col: i32) -> *Expr
+    let e: *Expr = expr_int(p, 0, line, col)
+    e.lit_kind = LIT_UNIT
+    return e
+
+# Is `e` the unit value `()`?
+pub fn is_unit_expr(e: *Expr) -> i32
+    if e == null
+        return 0
+    (e.kind == ExprKind.IntLit and e.lit_kind == LIT_UNIT) as i32
+
+# Float literal — store the raw source bytes (digits + dot) in
+# string_ptr/string_len so the emitter can re-parse to the right LLVM
+# constant.  Default kind context (f32 vs f64) is decided by surrounding
+# type info at use-site; the literal itself just carries the digits.
+pub fn expr_float(p: *Parser, src_sv: StrView, line: i32, col: i32) -> *Expr
+    var src: *u8 = src_sv.ptr
+    var len: i32 = src_sv.len as i32
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.FloatLit
+    e.span.line = line
+    e.span.col = col
+    e.string_ptr = src as *u8
+    e.string_len = len
+    e.next = null
+    # AGAST #1615: a `f32` / `f64` suffix (absorbed by the lexer) types the
+    # literal: `2.5f32` is `2.5 as f32`, as in ritz0. The digits keep their
+    # own slot so the emitter never sees the suffix.
+    if len > 3 and *(src + len - 3) == 'f'  # 'f'
+        let s1: u8 = *(src + len - 2)
+        let s2: u8 = *(src + len - 1)
+        var sfx: TypeKind = TypeKind.Void
+        if s1 == 51 and s2 == 50  # "32"
+            sfx = TypeKind.F32
+        else if s1 == 54 and s2 == 52  # "64"
+            sfx = TypeKind.F64
+        if sfx != TypeKind.Void
+            e.string_len = len - 3
+            float_text_with_point(p, e)
+            let c: *Expr = expr_cast(p, e, sfx, TypeKind.Void)
+            c.cast_pointee = TypeKind.Void
+            return c
+    float_text_with_point(p, e)
+    return e
+
+# AGAST #3929: the emitter writes a float literal's text into the IR as is,
+# and LLVM reads a decimal float only with a `.` in it: `1e-5` is no LLVM
+# constant.  An exponent literal with no fraction gets one, `1.0e-5`, in a
+# copy (the same value); every other literal keeps its source bytes.
+fn float_text_with_point(p: *Parser, e: *Expr)
+    let src: *u8 = e.string_ptr
+    let len: i32 = e.string_len
+    var at: i32 = 0
+    while at < len and *(src + at) != 'e' and *(src + at) != 'E'   # e E
+        if *(src + at) == '.'                                       # .
+            return
+        at = at + 1
+    if at == len
+        return
+    let out: *u8 = parser_alloc(p, (len + 2) as i64) as *u8
+    var i: i32 = 0
+    while i < at
+        *(out + i) = *(src + i)
+        i = i + 1
+    *(out + at) = 46                                               # .
+    *(out + at + 1) = 48                                           # 0
+    while i < len
+        *(out + i + 2) = *(src + i)
+        i = i + 1
+    e.string_ptr = out
+    e.string_len = len + 2
+
+pub fn expr_string(p: *Parser, tok: Token) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    # Distinguish c"..." / "..." based on lexer token kind. Kept in separate
+    # AST nodes so the emitter types each one correctly:
+    #   c"..."  (TOK_CSTRING)  -> *u8  (null-terminated)
+    #   "..."   (TOK_STRING)   -> StrView { ptr, len }   (AGAST #98)
+    # (s"..." / TOK_SSTRING was removed in AGAST #98.)
+    if tok.kind == TOK_CSTRING
+        e.kind = ExprKind.CstringLit
+    else
+        e.kind = ExprKind.StringLit
+    e.span.line = tok.line
+    e.span.col = tok.col
+    # Use cooked string from lexer (escapes already processed)
+    e.string_ptr = tok.string_val as *u8
+    e.string_len = tok.string_len
+    # AGAST #1521: also keep the RAW token text, quotes included. print's
+    # interpolation splits the raw text, because the cooked text cannot tell
+    # `\{x}` (a literal brace) from `{x}` (a placeholder). See
+    # emitter_print.ritz. Nothing else reads these slots on a string literal.
+    e.ident_ptr = tok.start
+    e.ident_len = tok.len
+    e.next = null
+    return e
+
+# The byte a TOK_CHAR token denotes, its escapes cooked.  One reader for both
+# a char expression and a char pattern, so `'\x41' =>` is the int `'A' =>` is.
+pub fn char_token_value(tok: Token) -> i64
+    # Token format: 'x' or '\n' etc.
+    let src: *u8 = tok.start
+    if tok.len == 3
+        # Simple char: 'x'
+        return *(src + 1) as i64
+    if tok.len >= 4
+        # Escaped char: '\n', '\\', '\e', '\x1B' ...  The lexer already rejected
+        # a bad escape (AGAST #1978, #1872), so the shared table always cooks.
+        return lexer_cook_escape_at(src + 2, (tok.len - 3) as i64, 1) as i64
+    0
+
+pub fn expr_char(p: *Parser, tok: Token) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.CharLit
+    e.span.line = tok.line
+    e.span.col = tok.col
+    e.int_val = char_token_value(tok)
+    e.next = null
+    return e
+
+pub fn expr_nil(p: *Parser, line: i32, col: i32) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.NilLit
+    e.span.line = line
+    e.span.col = col
+    e.int_val = 0
+    e.next = null
+    return e
+
+pub fn expr_ident(p: *Parser, name_sv: StrView, line: i32, col: i32) -> *Expr
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.Ident
+    e.span.line = line
+    e.span.col = col
+    e.ident_ptr = name as *u8
+    e.ident_len = len
+    e.next = null
+    return e
+
+# `op` on an ExprKind.Binary, unwrapping a parser-side _WRAP code (LARB R63,
+# AGAST #3486): `+%` is `OpKind.Add` with Expr.wrapping set, and so for `-%` and
+# `*%`.  Every rule for `+` then applies unchanged; only the wider-slot walk
+# and the integer-operand check read the flag.
+pub fn binary_set_op(e: *Expr, op: OpKind)
+    match op
+        OpKind.AddWrap =>
+            e.op = OpKind.Add
+            e.wrapping = 1
+        OpKind.SubWrap =>
+            e.op = OpKind.Sub
+            e.wrapping = 1
+        OpKind.MulWrap =>
+            e.op = OpKind.Mul
+            e.wrapping = 1
+        _ =>
+            e.op = op
+
+pub fn expr_binary(p: *Parser, op: OpKind, left: *Expr, right: *Expr) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.Binary
+    e.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    # Inherit span from left operand
+    e.span.line = left.span.line
+    e.span.col = left.span.col
+    binary_set_op(e, op)
+    e.left = left
+    e.right = right
+    e.next = null
+    return e
+
+pub fn expr_unary(p: *Parser, op: OpKind, operand: *Expr, line: i32, col: i32) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.Unary
+    e.span.line = line
+    e.span.col = col
+    e.op = op
+    e.operand = operand
+    e.next = null
+    return e
+
+pub fn expr_cast(p: *Parser, left: *Expr, target_type: TypeKind, cast_pointee: TypeKind) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.Cast
+    e.span = left.span
+    e.left = left
+    e.type_kind = target_type
+    e.cast_pointee = cast_pointee
+    e.cast_array = null
+    e.cast_ptr_array = null
+    e.fn_sig = null
+    e.int_val = 0
+    e.cast_ptr_kind = (TypeKind.Void as i32)
+    e.ident_ptr = null
+    e.ident_len = 0
+    e.bracket.line = 0   # no `as` written (AGAST #3040)
+    e.bracket.col = 0
+    e.next = null
+    return e
+
+# ExprKind.TypeOperand (AGAST #2124): `count` values of leaf kind `t` (struct
+# `name` when t == TypeKind.Struct).
+pub fn expr_type_operand(p: *Parser, count: i64, t: TypeKind, name_sv: StrView, line: i32, col: i32) -> *Expr
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.TypeOperand
+    e.span.line = line
+    e.span.col = col
+    e.int_val = count
+    e.type_kind = t
+    e.ident_ptr = null
+    e.ident_len = 0
+    if t == TypeKind.Struct
+        e.ident_ptr = name
+        e.ident_len = name_len
+    e.next = null
+    return e
+
+# `sizeof([N]..T)` (AGAST #2124): an array type is no expression, so the
+# grammar reads `IDENT ( [N] type_spec )` here.  Any callee but `sizeof`
+# rejects (p.error) — `f([8]u8)` is not a program.  type_array_expr builds the
+# whole `[N]..T` TypeRef; type_facts reads its shape.
+pub fn sizeof_array_type_call(p: *Parser, name_tok: Token, lbracket: Token, len_expr: *Expr, elem: *TypeRef) -> *Expr
+    if name_tok.len != 6 or memcmp(name_tok.start, c"sizeof", 6) != 0
+        p.error = 1
+        return null
+    # AGAST #2167: any constant length, folded as a declaration's is.
+    let t: *TypeRef = type_array_expr(p, len_expr, lbracket.line, lbracket.col, elem)
+    let facts: *TypeFacts = type_facts(p, t)
+    var count: i64 = facts.array_size as i64
+    var leaf: TypeKind = facts.array_elem_type
+    var leaf_name: *u8 = facts.array_elem_type_name
+    var leaf_len: i32 = facts.array_elem_type_name_len
+    let sh: *ArrayShape = facts.array_shape
+    if sh != null
+        count = 1
+        var d: i32 = 0
+        while d < sh.rank
+            count = count * (sh.dims[d] as i64)
+            d = d + 1
+        leaf = sh.leaf_type
+        leaf_name = sh.leaf_name
+        leaf_len = sh.leaf_name_len
+    let arg: *Expr = expr_type_operand(p, count, leaf, StrView { ptr: (leaf_name), len: (leaf_len) as i64 }, lbracket.line, lbracket.col)
+    return expr_call(p, StrView { ptr: (name_tok.start), len: (name_tok.len) as i64 }, arg, name_tok.line, name_tok.col)
+
+# `sizeof(Box<i64>)` (AGAST #3268): a generic instance as sizeof's operand.
+# The grammar reads `IDENT ( IDENT < generic_args )`; any callee but `sizeof`
+# rejects, as for sizeof_array_type_call.  The operand is one value of the
+# struct type_spec would name: the same mangled "Box$i64".
+pub fn sizeof_generic_type_call(p: *Parser, name_tok: Token, base_tok: Token, ga: *GenericArg) -> *Expr
+    if name_tok.len != 6 or memcmp(name_tok.start, c"sizeof", 6) != 0
+        p.error = 1
+        return null
+    let t: *TypeRef = type_generic_with_saved(p, StrView { ptr: (base_tok.start), len: (base_tok.len) as i64 }, ga)
+    let facts: *TypeFacts = type_facts(p, t)
+    let arg: *Expr = expr_type_operand(p, 1, facts.kind, StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 }, base_tok.line, base_tok.col)
+    return expr_call(p, StrView { ptr: (name_tok.start), len: (name_tok.len) as i64 }, arg, name_tok.line, name_tok.col)
+
+pub fn expr_call(p: *Parser, name_sv: StrView, args: *Expr, line: i32, col: i32) -> *Expr
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.Call
+    e.span.line = line
+    e.span.col = col
+    e.func_name = name as *u8
+    e.func_name_len = len
+    e.args = args
+    e.call_type_suffix = null
+    e.call_type_suffix_len = 0
+    e.next = null
+    return e
+
+# Generic function call: name<type>(args) -> mangled_name(args)
+# Mangles the function name like type_generic does for types
+pub fn expr_generic_call(p: *Parser, name_sv: StrView, type_arg: *TypeRef, args: *Expr, line: i32, col: i32) -> *Expr
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let ta: TypeKind = tr_kind(type_arg)
+    var tn_len: i32 = 0
+    let tn: *u8 = tr_name(type_arg, @tn_len)
+    # Build mangled name: name$type (e.g., vec_new$u8)
+    # name + '$' + type suffix + NUL.  A struct type can be as long as its
+    # parsed name; primitives add at most 3 chars ("i32").
+    var suffix_cap: i32 = 3
+    if ta == TypeKind.Struct
+        suffix_cap = tn_len
+    var mangled: *u8 = parser_alloc(p, (len + 1 + suffix_cap + 1) as i64) as *u8
+    var pos: i32 = 0
+
+    # Copy function name
+    for i in 0..len
+        *(mangled + pos) = *(name + i)
+        pos = pos + 1
+
+    # Add "$" separator
+    *(mangled + pos) = 36  # '$'
+    pos = pos + 1
+
+    # Add type argument name based on type
+    match ta
+        TypeKind.U8 =>
+            *(mangled + pos) = 117  # 'u'
+            pos = pos + 1
+            *(mangled + pos) = 56   # '8'
+            pos = pos + 1
+        TypeKind.I8 =>
+            *(mangled + pos) = 105  # 'i'
+            pos = pos + 1
+            *(mangled + pos) = 56   # '8'
+            pos = pos + 1
+        TypeKind.I32 =>
+            *(mangled + pos) = 105  # 'i'
+            pos = pos + 1
+            *(mangled + pos) = 51   # '3'
+            pos = pos + 1
+            *(mangled + pos) = 50   # '2'
+            pos = pos + 1
+        TypeKind.I64 =>
+            *(mangled + pos) = 105  # 'i'
+            pos = pos + 1
+            *(mangled + pos) = 54   # '6'
+            pos = pos + 1
+            *(mangled + pos) = 52   # '4'
+            pos = pos + 1
+        TypeKind.Struct =>
+            # Generic type or struct - use the parsed type's name
+            for i in 0..tn_len
+                *(mangled + pos) = *(tn + i)
+                pos = pos + 1
+        _ => pass
+
+    # Create call expression with mangled name
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.Call
+    e.span.line = line
+    e.span.col = col
+    e.func_name = mangled
+    e.func_name_len = pos
+    e.args = args
+    e.call_type_suffix = null
+    e.call_type_suffix_len = 0
+    e.next = null
+    return e
+
+pub fn expr_link(first: *Expr, rest: *Expr) -> *Expr
+    first.next = rest
+    return first
+
+# Array literal: [e1, e2, ...]
+# Stores the linked element list in `args` (parse_args already returns one).
+# This kind is currently parser-only — emit_expr falls through to its
+# unknown-kind branch. For const arrays this is harmless because the emitter
+# inlines const values via find_const, never re-walking the original Expr.
+pub fn expr_array(p: *Parser, head: *Expr, line: i32, col: i32) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.ArrayLit
+    e.span.line = line
+    e.span.col = col
+    e.args = head
+    e.int_val = 0
+    e.next = null
+    return e
+
+# Array fill literal: `[value; N]` — repeated initializer (AGAST #178).
+# Stores the value expression in `left`; the count is extracted from the
+# count token directly (the grammar matches NUMBER, not a generic expr, to
+# keep parity with ritz0 and avoid having to constant-fold here).
+pub fn expr_array_fill(p: *Parser, value: *Expr, count_start_sv: StrView, line: i32, col: i32) -> *Expr
+    var count_start: *u8 = count_start_sv.ptr
+    var count_len: i32 = count_start_sv.len as i32
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.ArrayFill
+    e.span.line = line
+    e.span.col = col
+    e.left = value
+    e.int_val = parse_int(StrView { ptr: (count_start), len: (count_len) as i64 })
+    e.next = null
+    return e
+
+# =============================================================================
+# Binary operation chain helpers (for left-factored grammar)
+# =============================================================================
+
+pub fn binary_op_new(p: *Parser, op: OpKind, right: *Expr, next: *BinaryOp) -> *BinaryOp
+    let b: *BinaryOp = parser_alloc(p, sizeof(BinaryOp)) as *BinaryOp
+    b.op = op
+    b.right = right
+    b.next = next
+    return b
+
+# Apply binary operation chain with parser for allocations
+pub fn apply_binary_opt_p(p: *Parser, left: *Expr, chain: *BinaryOp) -> *Expr
+    if chain == null
+        return left
+
+    var result: *Expr = left
+    var op: *BinaryOp = chain
+    while op != null
+        result = expr_binary(p, op.op, result, op.right)
+        op = op.next
+    return result
+
+# =============================================================================
+# Cast tail helpers (for cast expression parsing)
+# =============================================================================
+
+pub fn cast_tail_new(p: *Parser, tr: *TypeRef, next: *CastTail, as_line: i32, as_col: i32) -> *CastTail
+    let ct: *CastTail = parser_alloc(p, sizeof(CastTail)) as *CastTail
+    let ty: TypeKind = tr_kind(tr)
+    let f: *TypeFacts = type_facts(p, tr)
+    ct.cast_type = ty
+    ct.next = next
+    ct.as_at.line = as_line
+    ct.as_at.col = as_col
+    ct.cast_pointee = f.pointee_type
+    # AGAST #2120: `as EfiFn` keeps the signature (with the alias's
+    # [[callconv]]).  Only the outermost cast (next == null) takes it.
+    ct.fn_sig = null
+    if next == null and ty == TypeKind.Ptr
+        ct.fn_sig = f.fn_sig
+    ct.array = null
+    if next == null and ty == TypeKind.Array
+        ct.array = array_elem_of_type(p, tr)
+    # AGAST #4122: `as *[N][M]..T` keeps its shape, as a `*[N][M]..T` return does.
+    # AGAST #4154: and `as *[N]T` its element's name, for the `p#` view of a
+    # `let p = x as *[N]S` (inferred_array_elem_name reads it via base_ptr_array).
+    ct.ptr_array = null
+    if next == null and ty == TypeKind.Ptr and f.pointee_type == TypeKind.Array
+        ct.ptr_array = ptr_array_of_type(p, tr)
+    ct.pointee_type = (TypeKind.Void as i32)
+    ct.pointee_name = null
+    ct.pointee_name_len = 0
+    # AGAST #1453: record the pointee of `as *T` for the outermost cast only —
+    # earlier tails stay unknown rather than pick up a later type's name.
+    if next == null and ty == TypeKind.Ptr
+        ct.pointee_type = (f.pointee_type as i32)
+        if f.pointee_type == TypeKind.Struct
+            ct.pointee_name = f.type_name
+            ct.pointee_name_len = f.type_name_len
+    # AGAST #3443: and the struct of `as @S` / `as @&S`.
+    if next == null and (ty == TypeKind.Ref or ty == TypeKind.MutRef) and f.ref_inner_type == TypeKind.Struct
+        ct.pointee_type = (TypeKind.Struct as i32)
+        ct.pointee_name = f.type_name
+        ct.pointee_name_len = f.type_name_len
+    # AGAST #3757: and the scalar of `as @T` / `as @&T` (`(p as @&i32)[i] = v`
+    # strides by it).
+    if next == null and (ty == TypeKind.Ref or ty == TypeKind.MutRef) and primitive_name_len(f.ref_inner_type) > 0
+        ct.pointee_type = (f.ref_inner_type as i32)
+    # AGAST #2288: and the struct of `as C`, so `c as C` with `c:& C` can
+    # read the referent.  pointee_type stays TypeKind.Void: there's no pointee.
+    if next == null and ty == TypeKind.Struct
+        ct.pointee_name = f.type_name
+        ct.pointee_name_len = f.type_name_len
+    # AGAST #2544: and of `as **S` (`***S`, ...): pointee_type is the packed
+    # inner-pointee slot a `**S` local records (ptr_ptr_inner_pointee).
+    if next == null and ty == TypeKind.PtrPtr
+        ct.pointee_type = ptr_ptr_inner_pointee(p, tr)
+        if ptr_ptr_slot_inner(ct.pointee_type) == TypeKind.Struct
+            ct.pointee_name = f.type_name
+            ct.pointee_name_len = f.type_name_len
+    return ct
+
+# AGAST #3435: the grammar's block_ended.  Matches nothing, and fails unless
+# the token before p.pos is a DEDENT: a block operand (`5 + match x` + its
+# arms) has ended, and the next line, whatever it starts with, is a new
+# statement (§2.2).  Each operator tail tries it first, so it ends there.
+pub fn block_ended_check(p: *Parser) -> i32
+    if p.pos == 0 or (p.tokens + (p.pos - 1)).kind != TOK_DEDENT
+        p.error = 1
+    0
+
+# AGAST #4543, #4553, #4049: where the last block `if` / `match` built as an
+# expression operand ended (the token index after its DEDENT), or -1.  A
+# statement whose value expression ends in that block has no NEWLINE after
+# it — the block consumed the DEDENT — so the statement's terminator is
+# `open_if_ended`, not `expr NEWLINE`.  Every operand form records it:
+# else-less `if` (expr_if_open, #4543), `if`/`else` (expr_if_operand, #4553)
+# and `match` (expr_match_operand, #4049).  Keyed by position, so a node
+# built by a speculative alternative over different tokens cannot satisfy it.
+# State: ParseCtx.open_if_end
+
+pub fn open_if_note(ctx: *ParseCtx, end: i32)
+    ctx.open_if_end = end
+
+# The grammar's open_if_ended: matches nothing and fails unless this is
+# exactly where a block operand ended.  A block operand (`5 + if c` + its
+# body, AGAST #4543; `5 + if c` + body + `else` + body, #4553; `5 + match c`
+# + its arms, #4049) ends the statement here.
+pub fn open_if_ended_check(p: *Parser) -> i32
+    if p.pos != p.ctx.open_if_end or p.pos == 0 or (p.tokens + (p.pos - 1)).kind != TOK_DEDENT
+        p.error = 1
+    0
+
+# The grammar's else_absent: fails when an `else` follows, so the else-less
+# alternatives in if_expr_rhs / primary_expr do not claim a block `if` that
+# has one.  The form with an `else` is the first alternative and wins when it
+# parses; this keeps a malformed one failing where it did (AGAST #4543).
+pub fn else_absent_check(p: *Parser) -> i32
+    if p.pos < p.token_count and (p.tokens + p.pos).kind == TOK_ELSE
+        p.error = 1
+    0
+
+# AGAST #3124: the grammar's cast_type_end.  A cast's type is never followed
+# by an operand, so one there means the type ran on into a comparison
+# (`a as Sz < b, c > d` read as `Sz<b, c>`): fail, and cast_type retries the
+# bare name.  ritz0's _OPERAND_START is the same set.
+pub fn cast_type_end_check(p: *Parser) -> i32
+    if p.pos < p.token_count
+        let k: i32 = (p.tokens + p.pos).kind
+        if k == TOK_IDENT or k == TOK_NUMBER or k == TOK_FLOAT or k == TOK_STRING
+            p.error = 1
+        else if k == TOK_CSTRING or k == TOK_CHAR or k == TOK_TRUE or k == TOK_FALSE
+            p.error = 1
+        else if k == TOK_NULL or k == TOK_NIL or k == TOK_SELF or k == TOK_LPAREN
+            p.error = 1
+        else if k == TOK_LBRACKET or k == TOK_AT or k == TOK_NOT or k == TOK_BANG or k == TOK_TILDE
+            p.error = 1
+    # AGAST #4021: a cast's type is noted; one that ran on into a comparison
+    # drops the arguments it noted.
+    if p.error != 0
+        tn_drop_after_as(p)
+    else
+        tn_note_last(p, 1)
+    return 0
+
+pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
+    if tail == null
+        return expr
+    var result: *Expr = expr
+    var ct: *CastTail = tail
+    while ct != null
+        result = expr_cast(p, result, ct.cast_type, ct.cast_pointee)
+        result.cast_ptr_kind = ct.pointee_type
+        result.ident_ptr = ct.pointee_name
+        result.ident_len = ct.pointee_name_len
+        result.fn_sig = ct.fn_sig
+        result.cast_array = ct.array
+        result.cast_ptr_array = ct.ptr_array   # AGAST #4122
+        result.bracket = ct.as_at   # AGAST #3040
+        ct = ct.next
+    return result
+
+# =============================================================================
+# Postfix operation helpers
+# =============================================================================
+
+pub fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    op.kind = POSTFIX_CALL
+    op.args = args
+    # #4035: the parser never records a call type suffix (it was always null),
+    # so nothing carries one here.
+    op.call_type_suffix = null
+    op.call_type_suffix_len = 0
+    op.next = null
+    return op
+
+# Generic function call - creates a call with type suffix from the type token
+# The type_tok is the token for the type name (e.g., "u8", "String", etc.)
+# Builds a suffix like "$u8" to be appended to the function name
+# A generic call's one-token type argument (`g<Nope>`, `g<*Nope>`) as a
+# GenericArg that only says where it is written (AGAST #3469).
+pub fn generic_tok_arg(p: *Parser, tok: Token) -> *GenericArg
+    let ga: *GenericArg = parser_alloc(p, sizeof(GenericArg)) as *GenericArg
+    ga.ty = TypeKind.Void
+    ga.name = null
+    ga.name_len = 0
+    ga.next = null
+    ga.written = tok.start
+    ga.written_len = tok.len
+    ga.at = diag_span(tok.line, tok.col)
+    ga
+
+pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    op.kind = POSTFIX_CALL
+    op.args = args
+    # Type suffix: "$" + type_name (an alias spelled as its target, #2037).
+    var len: i32 = 0
+    tn_note_tok(p, type_tok)   # AGAST #4171
+    op.call_type_suffix = generic_tok_suffix(p, StrView { ptr: (null), len: (0) as i64 }, type_tok, @len)
+    op.call_type_suffix_len = len
+    op.call_targs = generic_tok_arg(p, type_tok)
+    op.next = null
+    return op
+
+# Pointer-typed generic call (AGAST #186): `option_is_none<*Page>(@p)` builds
+# a mangled suffix of `$ptr_Page` matching ritz0's name mangling so cross-
+# module symbols line up.  Without this rule the parser silently dropped the
+# enclosing fn definition (parse_item's anchor-skip recovery), and downstream
+# the call fell through to `call i64 @<name>(...)` while the surrounding
+# `ret %Option$` kept the struct type — clang IR verifier then rejected the
+# i64-into-struct mismatch (mausoleum/concurrent_bench, btree_scan path).
+pub fn postfix_generic_call_ptr(p: *Parser, type_tok: Token, args: *Expr) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    op.kind = POSTFIX_CALL
+    op.args = args
+    # Type suffix: "$ptr_" + type_name (an alias spelled as its target, #2037).
+    var len: i32 = 0
+    tn_note_tok(p, type_tok)   # AGAST #4171
+    op.call_type_suffix = generic_tok_suffix(p, StrView { ptr: (c"ptr_"), len: (4) as i64 }, type_tok, @len)
+    op.call_type_suffix_len = len
+    op.call_targs = generic_tok_arg(p, type_tok)
+    op.next = null
+    return op
+
+# Generic call whose type argument is a full type_spec rather than a single
+# token — `vec_new<Vec<i64>>()` (AGAST #1300).  Suffix is "$" + the argument's
+# mangled name ("$Vec$i64"), or its primitive spelling for a primitive.
+pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    op.kind = POSTFIX_CALL
+    op.args = args
+    tn_note_args(p, ga)   # AGAST #4171
+    # "" + "$" + arg → "$<arg>", from the same speller as type annotations.
+    var len: i32 = 0
+    op.call_type_suffix = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga, @len)
+    op.call_type_suffix_len = len
+    op.call_targs = ga
+    op.next = null
+    return op
+
+# Is this captured type argument spelled like a VALUE — a bare lowercase
+# identifier such as `b` in `f(a < b, c > (d))`?  Types are primitive
+# keywords (lexed as their own tokens, never TypeKind.Struct), PascalCase names,
+# or lowercase primitives that lex as IDENT but type_named turns into their
+# own kinds (f32/f64; usize/isize, AGAST #2198).  A generic instantiation's
+# captured name contains '$' and is a type whatever its case.
+fn generic_arg_is_value_like(ga: *GenericArg) -> i32
+    if ga.ty != TypeKind.Struct or ga.name == null or ga.name_len <= 0
+        return 0
+    let c0: u8 = *ga.name
+    if c0 != '_' and (c0 < 'a' or c0 > 'z')  # not '_' and not 'a'..'z'
+        return 0
+    for i in 0..ga.name_len
+        if *(ga.name + i) == '$'  # '$'
+            return 0
+    return 1
+
+# Generic call with a full type-argument list (AGAST #1612): `second<i64,
+# i32>(a, b)` → suffix "$i64$i32", the same per-argument mangling as generic
+# struct types (#1574) and ritz0's fn instantiation names.
+#
+# `f(a < b, c > (d))` produces the same token stream.  A single-argument list
+# is always a call (unchanged since #1300).  A list of two or more is a call
+# unless an argument is value-like (generic_arg_is_value_like); then this
+# action fails — p.error = 1 makes postfix_ops backtrack to before the `<`,
+# which then parses as a comparison.  ritz0 differs here: it takes any list
+# followed by `(` as type arguments (test_ritz1_multi_arg_generic_call.py).
+pub fn postfix_generic_call_list(p: *Parser, ga: *GenericArg, args: *Expr) -> *PostfixOp
+    if ga.next == null
+        return postfix_generic_call_arg(p, ga, args)
+    var cur: *GenericArg = ga
+    while cur != null
+        if generic_arg_is_value_like(cur) == 1
+            p.error = 1
+            return null
+        cur = cur.next
+    tn_note_args(p, ga)   # AGAST #4171: a call, not a comparison
+    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    op.kind = POSTFIX_CALL
+    op.args = args
+    var len: i32 = 0
+    op.call_type_suffix = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga, @len)
+    op.call_type_suffix_len = len
+    op.call_targs = ga
+    op.next = null
+    return op
+
+pub fn postfix_index(p: *Parser, index: *Expr, line: i32, col: i32) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    op.kind = POSTFIX_INDEX
+    op.index = index
+    op.bracket.line = line
+    op.bracket.col = col
+    op.next = null
+    return op
+
+pub fn postfix_member(p: *Parser, name_sv: StrView) -> *PostfixOp
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    op.kind = POSTFIX_MEMBER
+    op.member_name = name as *u8
+    op.member_len = len
+    tok_span_back(p, name, @op.bracket)   # AGAST #3015: the field name's place
+    op.next = null
+    return op
+
+pub fn postfix_cast(p: *Parser, ty: TypeKind) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    op.kind = POSTFIX_CAST
+    op.cast_type = ty
+    op.next = null
+    return op
+
+pub fn postfix_link(first: *PostfixOp, rest: *PostfixOp) -> *PostfixOp
+    first.next = rest
+    return first
+
+# Old apply_postfix kept for reference - use apply_postfix_p instead
+pub fn apply_postfix(base: *Expr, ops: *PostfixOp) -> *Expr
+    return base
+
+# Apply postfix operations with parser for allocation
+pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
+    if ops == null
+        return pass_or_ident(p, base)
+
+    # Apply each postfix operation, creating new expression nodes
+    var result: *Expr = base
+    var op: *PostfixOp = ops
+    while op != null
+        if op.kind == POSTFIX_CALL
+            # Create call expression
+            match result.kind
+                ExprKind.Ident =>
+                    # Modify ident to call in place (ident becomes call target)
+                    result.kind = ExprKind.Call
+                    result.func_name = result.ident_ptr
+                    result.func_name_len = result.ident_len
+                    # Copy type suffix for generic calls (e.g., "$u8" for vec_new<u8>())
+                    result.call_type_suffix = op.call_type_suffix
+                    result.call_type_suffix_len = op.call_type_suffix_len
+                    result.args = op.args
+                    if op.call_type_suffix != null and p.skip_item == 0
+                        generic_use_note(p.ctx, StrView { ptr: (result.func_name), len: (result.func_name_len) as i64 }, StrView { ptr: (op.call_type_suffix), len: (op.call_type_suffix_len) as i64 }, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p))
+                ExprKind.Member =>
+                    # Method call: expr.method(args)
+                    # ExprKind.Member has: left = receiver, ident_ptr/len = method name
+                    # Convert to ExprKind.Method by changing kind and adding args
+                    result.kind = ExprKind.Method
+                    result.args = op.args
+                    # left and ident_ptr/ident_len are already set from POSTFIX_MEMBER
+                _ =>
+                    # AGAST #1747: a call through any other callee (`fs[1](3)`,
+                    # `f(1)(2)`) is an indirect call: ExprKind.Call with no name,
+                    # the callee expression in `left`.  This arm used to drop
+                    # the call, so `fs[1](3)` evaluated to the fn pointer.
+                    result = expr_nameless_call(p, result, op.args)
+        else if op.kind == POSTFIX_INDEX
+            # Create new index expression
+            let index_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+            index_expr.kind = ExprKind.Index
+            index_expr.span = result.span
+            index_expr.bracket = op.bracket
+            index_expr.left = result
+            index_expr.right = postfix_index_of(p, result, op)
+            index_expr.next = null
+            result = index_expr
+        else if op.kind == POSTFIX_MEMBER
+            # Create new member expression
+            let member_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+            member_expr.kind = ExprKind.Member
+            member_expr.span = result.span
+            member_expr.left = result
+            member_expr.ident_ptr = op.member_name
+            member_expr.ident_len = op.member_len
+            member_expr.bracket = op.bracket   # AGAST #3015
+            member_expr.next = null
+            result = member_expr
+        else if op.kind == POSTFIX_CAST
+            # Create new cast expression
+            let cast_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+            cast_expr.kind = ExprKind.Cast
+            cast_expr.fn_sig = null
+            cast_expr.cast_array = null
+            cast_expr.cast_ptr_array = null
+            cast_expr.span = result.span
+            cast_expr.left = result
+            cast_expr.type_kind = op.cast_type
+            cast_expr.cast_ptr_kind = (TypeKind.Void as i32)
+            cast_expr.next = null
+            result = cast_expr
+        else if op.kind == POSTFIX_TRY
+            # Try operator `expr?` — wrap running result in ExprKind.Try.
+            # emit_expr_try propagates Err/None via early return. (AGAST #134)
+            let try_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+            try_expr.kind = ExprKind.Try
+            try_expr.span = result.span
+            try_expr.left = result
+            try_expr.next = null
+            result = try_expr
+        op = op.next
+    return result
+
+# A call through a callee expression (AGAST #1747): ExprKind.Call with no name
+# and the callee in `left`; emit_call evaluates it to the fn's address.
+fn expr_nameless_call(p: *Parser, callee: *Expr, args: *Expr) -> *Expr
+    let call_expr: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    call_expr.kind = ExprKind.Call
+    call_expr.span = callee.span
+    call_expr.func_name = null
+    call_expr.func_name_len = 0
+    call_expr.call_type_suffix = null
+    call_expr.call_type_suffix_len = 0
+    call_expr.args = args
+    call_expr.left = callee
+    call_expr.right = null
+    call_expr.operand = null
+    call_expr.ident_ptr = null
+    call_expr.ident_len = 0
+    call_expr.next = null
+    return call_expr
+
+# apply_postfix_p for a parenthesised primary `(e)`.  AGAST #2120: `(t.f)(..)`
+# calls the fn pointer stored in field f, as in ritz0; only the unparenthesised
+# `t.f(..)` is a method call.  Without the parens to tell them apart, the
+# call became `Tbl_f(t, ..)`, an undefined symbol.
+pub fn apply_postfix_paren_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
+    if ops != null and ops.kind == POSTFIX_CALL and base.kind == ExprKind.Member and ops.call_type_suffix_len == 0
+        return apply_postfix_p(p, expr_nameless_call(p, base, ops.args), ops.next)
+    return apply_postfix_p(p, base, ops)
+
+# =============================================================================
+# Struct literal helpers
+# =============================================================================
+
+pub fn field_init_new(p: *Parser, name_sv: StrView, val: *Expr) -> *FieldInit
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let f: *FieldInit = parser_alloc(p, sizeof(FieldInit)) as *FieldInit
+    f.name = name as *u8
+    f.name_len = len
+    f.value = val
+    f.next = null
+    return f
+
+pub fn field_init_link(first: *FieldInit, rest: *FieldInit) -> *FieldInit
+    first.next = rest
+    return first
+
+pub fn ident_or_struct(p: *Parser, tok: Token, lit: *FieldInit) -> *Expr
+    if lit == null
+        # Just an identifier
+        return expr_ident(p, StrView { ptr: (tok.start), len: (tok.len) as i64 }, tok.line, tok.col)
+    return struct_lit_expr(p, tok, lit)
+
+# `Unit {}` (AGAST #2955): a struct literal with no field inits.  Its null
+# field list is what ident_or_struct reads as "just an identifier".
+pub fn struct_lit_empty(p: *Parser, tok: Token) -> *Expr
+    return struct_lit_expr(p, tok, null)
+
+fn struct_lit_expr(p: *Parser, tok: Token, lit: *FieldInit) -> *Expr
+    # AGAST #3993: the literal's name is a type name the AST keeps no slot
+    # for; note it (#4021) so type_name_check.ritz refuses one that names
+    # nothing, at the name.  An unannotated `let a = Nope { .. }` compiled to
+    # an uninitialised alloca.  A token, not the action's p.pos: the
+    # literal's fields have been parsed since its name.
+    note_type_name_written(p, tok.start, tok.line, tok.col)
+    tn_note(p, StrView { ptr: (tok.start), len: (tok.len) as i64 })
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.StructLit
+    e.span.line = tok.line
+    e.span.col = tok.col
+    e.ident_ptr = tok.start as *u8
+    e.ident_len = tok.len
+    # Store field inits in args field (reuse)
+    e.args = lit as *Expr
+    e.next = null
+    # AGAST #4187: a struct variant's name builds the variant
+    # (`Log { level: 4 }`); named_variants.ritz turns it into the positional
+    # call and accepts the name noted above.
+    named_form_note(p, null, e, tok, StrView { ptr: (null), len: (0) as i64 })
+    return e
+
+# `E.V { a: 1, b: 2 }` (AGAST #4275): a qualified named variant literal.
+# ExprKind.StructLit named `V`, with the receiver `E` in `left`;
+# named_variants.ritz turns it into the method-call shape `E.V(1, 2)` parses
+# to (ExprKind.Method), whatever `V` is.  `V` names no type: not noted as one.
+pub fn qualified_struct_lit(p: *Parser, qual: Token, name: Token, lit: *FieldInit) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.StructLit
+    e.span.line = qual.line
+    e.span.col = qual.col
+    e.ident_ptr = name.start as *u8
+    e.ident_len = name.len
+    e.left = expr_ident(p, StrView { ptr: (qual.start), len: (qual.len) as i64 }, qual.line, qual.col)
+    e.bracket.line = name.line   # AGAST #3015: the member name's place
+    e.bracket.col = name.col
+    e.args = lit as *Expr
+    e.next = null
+    named_form_note(p, null, e, qual, StrView { ptr: (qual.start), len: (qual.len) as i64 })
+    return e
+
+# AGAST #4187: the named forms of a struct-declared variant
+# (docs/ENUM_VARIANTS.md §4-5), a pattern `V { b, a }` / `E.V { .. }` and a
+# struct literal that may name one, noted as they parse.  The variant may be
+# declared later or in an import, so named_variants.ritz maps the names to
+# field positions once the whole closure is parsed.  An alternative the
+# parser backtracks out of leaves its note behind; nothing points at its
+# node, and named_variants reports each source position once.
+# struct NamedForm: ast.ritz, beside ParseCtx (AGAST #4623).
+
+# State: ParseCtx.named_forms
+
+pub fn named_forms(ctx: *ParseCtx) -> *NamedForm
+    ctx.named_forms
+
+# The driver re-parses from scratch (#1475).
+pub fn named_forms_reset(ctx: *ParseCtx)
+    ctx.named_forms = null
+
+# `head` is where the form begins: the qualifier of `E.V { .. }`.
+fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual_sv: StrView)
+    var qual: *u8 = qual_sv.ptr
+    var qual_len: i32 = qual_sv.len as i32
+    if p.skip_item != 0
+        return
+    let f: *NamedForm = parser_alloc(p, sizeof(NamedForm)) as *NamedForm
+    f.arm = arm
+    f.lit = lit
+    if arm != null
+        f.name = arm.pattern_name
+        f.name_len = arm.pattern_name_len
+    else
+        f.name = lit.ident_ptr
+        f.name_len = lit.ident_len
+    f.qual = qual
+    f.qual_len = qual_len
+    f.span.line = head.line
+    f.span.col = head.col
+    f.file = parse_file_copy_shared(p)
+    f.next = p.ctx.named_forms
+    p.ctx.named_forms = f
+
+# pattern : [IDENT '.'] IDENT '{' IDENT (',' IDENT)* '}'  (AGAST #4187).  The
+# names bind as written until named_variants.ritz puts them in field order.
+# `head` is the pattern's first token, `name` the variant's.
+pub fn pattern_variant_named(p: *Parser, head: Token, name: Token, binds: *TupleName) -> *MatchArm
+    let a: *MatchArm = pattern_variant_binds(p, StrView { ptr: (name.start), len: (name.len) as i64 }, binds)
+    if head.start == name.start
+        named_form_note(p, a, null, head, StrView { ptr: (null), len: (0) as i64 })
+    else
+        named_form_note(p, a, null, head, StrView { ptr: (head.start), len: (head.len) as i64 })
+    return a
+
+# Generic struct literal parsed through generic_args (AGAST #1300):
+# `Pair<i64, Vec<i64>> { ... }`.  Mangles on every argument (AGAST #1574),
+# from the capture records: parsing the literal's fields clobbers
+# the last_type_name side channel.
+pub fn generic_struct_lit_arg(p: *Parser, tok: Token, ga: *GenericArg, lit: *FieldInit) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.StructLit
+    e.span.line = tok.line
+    e.span.col = tok.col
+    var len: i32 = 0
+    e.ident_ptr = mangle_generic_args(p, StrView { ptr: (tok.start), len: (tok.len) as i64 }, ga, @len)
+    e.ident_len = len
+    # Store field inits in args field (reuse)
+    e.args = lit as *Expr
+    e.next = null
+    return e
+
+# =============================================================================
+# Numeric parsing
+# =============================================================================
+
+# A NUMBER token's literal.  One of 2^64 or more doesn't fit an i64, which
+# parse_int wraps it into: it keeps its source text in ident_ptr/ident_len, so
+# literal_slot.ritz can refuse it and name it (AGAST #3083).  Null otherwise.
+pub fn expr_int_lit(p: *Parser, start_sv: StrView, line: i32, col: i32) -> *Expr
+    var start: *u8 = start_sv.ptr
+    var len: i32 = start_sv.len as i32
+    let e: *Expr = expr_int(p, parse_int(StrView { ptr: (start), len: (len) as i64 }), line, col)
+    if parse_int_overflows(StrView { ptr: (start), len: (len) as i64 }) == 1
+        e.ident_ptr = start
+        e.ident_len = len
+    # AGAST #4245: a typed suffix (absorbed by the lexer, #107) types the
+    # literal: `1u32` is `1 as u32`, as ritz0's _apply_literal_suffix has it
+    # and as expr_float does for `2.5f32`.  Dropping it made `let p = 1u32`
+    # an i64 local, so `take_u32(p)` was refused as a narrowing.
+    let sfx: TypeKind = int_lit_suffix_type(StrView { ptr: (start), len: (len) as i64 })
+    if sfx != TypeKind.Void
+        let c: *Expr = expr_cast(p, e, sfx, TypeKind.Void)
+        c.cast_pointee = TypeKind.Void
+        return c
+    return e
+
+# The integer type a NUMBER token's suffix names (ritz0's NUMBER_SUFFIXES:
+# `u8` .. `i64`, `usize`, `isize`), else TypeKind.Void.  No digit of any base is
+# `u` or `i`, so the first one starts the suffix.  The lexer's `U` / `I`
+# forms are not ritz0's and stay untyped, as before.
+fn int_lit_suffix_type(start_sv: StrView) -> TypeKind
+    var start: *u8 = start_sv.ptr
+    var len: i32 = start_sv.len as i32
+    var at: i32 = 0
+    while at < len and *(start + at) != 'u' and *(start + at) != 'i'   # 'u' 'i'
+        at = at + 1
+    let n: i32 = len - at - 1
+    if n <= 0
+        return TypeKind.Void
+    let s: *u8 = start + at
+    let uns: i32 = (*s == 'u') as i32
+    if is_word_type_name(StrView { ptr: (s), len: (n + 1) as i64 }) == 1
+        return word_type(s)
+    if n == 1 and *(s + 1) == '8'   # 8
+        if uns == 1
+            return TypeKind.U8
+        return TypeKind.I8
+    if n != 2
+        return TypeKind.Void
+    let c1: u8 = *(s + 1)
+    let c2: u8 = *(s + 2)
+    if c1 == '1' and c2 == '6'   # 16
+        if uns == 1
+            return TypeKind.U16
+        return TypeKind.I16
+    if c1 == '3' and c2 == '2'   # 32
+        if uns == 1
+            return TypeKind.U32
+        return TypeKind.I32
+    if c1 == '6' and c2 == '4'   # 64
+        if uns == 1
+            return TypeKind.U64
+        return TypeKind.I64
+    TypeKind.Void
+
+# The value of an integer literal (literal_slot.ritz, the emitter's R21
+# operand typing), `-1` included: 1, and `out` set, if it is one.
+pub fn lit_int_value(e: *Expr, out: *i64) -> i32
+    if e.kind == ExprKind.IntLit and e.lit_kind == LIT_PLAIN
+        *out = e.int_val
+        return 1
+    if e.kind == ExprKind.Unary and e.op == OpKind.Neg and e.operand != null
+        if e.operand.kind == ExprKind.IntLit and e.operand.lit_kind == LIT_PLAIN
+            # `-9223372036854775808`: the negation wraps, by request (R63).
+            *out = 0 -% e.operand.int_val
+            return 1
+    0
+
+# The base of a NUMBER token's digits (10, 16 or 2), and where they start.
+pub fn int_lit_base(start_sv: StrView, digits: **u8) -> i64
+    var start: *u8 = start_sv.ptr
+    var len: i32 = start_sv.len as i32
+    *digits = start
+    if len >= 3 and *start == '0'  # '0'
+        let prefix: i32 = *(start + 1) as i32
+        if prefix == 120 or prefix == 88  # 'x' or 'X'
+            *digits = start + 2
+            return 16
+        if prefix == 98 or prefix == 66   # 'b' or 'B'
+            *digits = start + 2
+            return 2
+    10
+
+# The value of one digit of `base`, or -1 if `ch` isn't one (a suffix).
+pub fn int_lit_digit(ch: i32, base: i64) -> i64
+    var d: i64 = -1
+    if ch >= '0' and ch <= '9'
+        d = (ch - 48) as i64
+    else if base == 16 and ch >= 'A' and ch <= 'F'
+        d = (ch - 55) as i64
+    else if base == 16 and ch >= 'a' and ch <= 'f'
+        d = (ch - 87) as i64
+    if d >= base
+        return -1
+    d
+
+# 1 if the literal is 2^64 or more: past every integer type.
+pub fn parse_int_overflows(start_sv: StrView) -> i32
+    var start: *u8 = start_sv.ptr
+    var len: i32 = start_sv.len as i32
+    var digits: *u8 = null
+    let base: i64 = int_lit_base(StrView { ptr: (start), len: (len) as i64 }, @digits)
+    let n: i32 = len - (digits - start) as i32
+    let max: u64 = 0xFFFFFFFFFFFFFFFF
+    var val: u64 = 0
+    for i in 0..n
+        let d: i64 = int_lit_digit(*(digits + i) as i32, base)
+        if d < 0
+            return 0
+        if val > (max - d as u64) / base as u64
+            return 1
+        val = val * base as u64 + d as u64
+    0
+
+pub fn parse_int(start_sv: StrView) -> i64
+    var start: *u8 = start_sv.ptr
+    var len: i32 = start_sv.len as i32
+    # Check for hex prefix (0x or 0X)
+    if len >= 3 and *start == '0'  # '0'
+        let prefix: i32 = *(start + 1) as i32
+        if prefix == 120 or prefix == 88  # 'x' or 'X'
+            return parse_hex(StrView { ptr: (start + 2), len: (len - 2) as i64 })
+        if prefix == 98 or prefix == 66   # 'b' or 'B'
+            return parse_binary(StrView { ptr: (start + 2), len: (len - 2) as i64 })
+    # Decimal parsing.  Stops on the first non-digit so typed-int literal
+    # suffixes (`42i32`, `100u16`, etc.) are naturally ignored — caller
+    # used to have to pre-trim via int_lit_len; that's no longer required.
+    var val: i64 = 0
+    for i in 0..len
+        let ch: i32 = *(start + i) as i32
+        if ch < '0' or ch > '9'  # not '0'-'9'
+            return val
+        # Literal parsing keeps the value's low bits: a u64 literal's
+        # magnitude wraps (LARB R63, `+%` / `*%`).
+        val = val *% 10 +% (ch - 48) as i64
+    return val
+
+pub fn parse_hex(start_sv: StrView) -> i64
+    var start: *u8 = start_sv.ptr
+    var len: i32 = start_sv.len as i32
+    # Stops on the first non-hex-digit so a `42u8` style suffix on a hex
+    # literal (`0xFFi32`) doesn't leak into the value.
+    var val: i64 = 0
+    for i in 0..len
+        let ch: i32 = *(start + i) as i32
+        var digit: i64 = -1
+        if ch >= '0' and ch <= '9'       # '0'-'9'
+            digit = (ch - 48) as i64
+        else if ch >= 'A' and ch <= 'F'  # 'A'-'F'
+            digit = (ch - 55) as i64
+        else if ch >= 'a' and ch <= 'f' # 'a'-'f'
+            digit = (ch - 87) as i64
+        if digit < 0
+            return val
+        val = val *% 16 +% digit
+    return val
+
+pub fn parse_binary(start_sv: StrView) -> i64
+    var start: *u8 = start_sv.ptr
+    var len: i32 = start_sv.len as i32
+    # Stops on the first non-bit-digit (typed-int suffix tolerance).
+    var val: i64 = 0
+    for i in 0..len
+        let ch: i32 = *(start + i) as i32
+        if ch == '1'        # '1'
+            val = val *% 2 +% 1
+        else if ch == '0'   # '0'
+            val = val *% 2
+        else
+            return val
+    return val
+
+# =============================================================================
+# Match / pattern helpers
+# =============================================================================
+
+# Allocate a new MatchArm with int-literal pattern. Caller fills body + is_pass.
+pub fn match_arm_int(p: *Parser, val: i64) -> *MatchArm
+    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
+    a.pattern_kind = PAT_INT_LIT
+    a.pattern_int = val
+    a.pattern_name = null
+    a.pattern_name_len = 0
+    a.pattern_inner_kind = 0
+    a.pattern_inner_name = null
+    a.pattern_inner_name_len = 0
+    a.body = null
+    a.is_pass = 0
+    a.body_stmts = null
+    a.is_block = 0   # AGAST #3028
+    a.next = null
+    a.pass_span.line = 0
+    a.pass_span.col = 0
+    a.pattern_span.line = 0
+    a.pattern_span.col = 0
+    a.pattern_binds = null
+    a.pattern_bind_count = 0
+    a.pattern_field_sel = 0
+    return a
+
+# Allocate a new MatchArm with wildcard pattern (_). Caller fills body + is_pass.
+pub fn match_arm_wildcard(p: *Parser) -> *MatchArm
+    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
+    a.pattern_kind = PAT_WILDCARD
+    a.pattern_int = 0
+    a.pattern_name = null
+    a.pattern_name_len = 0
+    a.pattern_inner_kind = 0
+    a.pattern_inner_name = null
+    a.pattern_inner_name_len = 0
+    a.body = null
+    a.is_pass = 0
+    a.body_stmts = null
+    a.is_block = 0   # AGAST #3028
+    a.next = null
+    a.pass_span.line = 0
+    a.pass_span.col = 0
+    a.pattern_span.line = 0
+    a.pattern_span.col = 0
+    a.pattern_binds = null
+    a.pattern_bind_count = 0
+    a.pattern_field_sel = 0
+    return a
+
+# Allocate a new MatchArm with identifier binding OR unit-variant (e.g. x, None).
+pub fn match_arm_ident(p: *Parser, name_sv: StrView) -> *MatchArm
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
+    a.pattern_kind = PAT_IDENT
+    a.pattern_int = 0
+    a.pattern_name = name
+    a.pattern_name_len = name_len
+    a.pattern_inner_kind = 0
+    a.pattern_inner_name = null
+    a.pattern_inner_name_len = 0
+    a.body = null
+    a.is_pass = 0
+    a.body_stmts = null
+    a.is_block = 0   # AGAST #3028
+    a.next = null
+    a.pass_span.line = 0
+    a.pass_span.col = 0
+    a.pattern_span.line = 0
+    a.pattern_span.col = 0
+    a.qualifier = null
+    a.qualifier_len = 0
+    a.pattern_binds = null
+    a.pattern_bind_count = 0
+    a.pattern_field_sel = 0
+    return a
+
+# Allocate a new MatchArm with variant pattern Name(inner).
+# inner_kind is PAT_WILDCARD or PAT_IDENT.
+pub fn match_arm_variant(p: *Parser, name_sv: StrView, inner_kind: i32, inner_name_sv: StrView) -> *MatchArm
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    var inner_name: *u8 = inner_name_sv.ptr
+    var inner_name_len: i32 = inner_name_sv.len as i32
+    let a: *MatchArm = parser_alloc(p, sizeof(MatchArm)) as *MatchArm
+    a.pattern_kind = PAT_VARIANT
+    a.pattern_int = 0
+    a.pattern_name = name
+    a.pattern_name_len = name_len
+    a.pattern_inner_kind = inner_kind
+    a.pattern_inner_name = inner_name
+    a.pattern_inner_name_len = inner_name_len
+    a.body = null
+    a.is_pass = 0
+    a.body_stmts = null
+    a.is_block = 0   # AGAST #3028
+    a.next = null
+    a.pass_span.line = 0
+    a.pass_span.col = 0
+    a.pattern_span.line = 0
+    a.pattern_span.col = 0
+    a.pattern_binds = null
+    a.pattern_bind_count = 1
+    a.pattern_field_sel = 0
+    return a
+
+# AGAST #1295: `V(a, b, ..)` / `E.V(a, b, ..)`, every positional binding of a
+# multi-field variant; `binds` lists them in order (a `_` is a wildcard
+# slot).  The arm starts with the first one selected (arm_select_bind).
+pub fn pattern_variant_binds(p: *Parser, name_sv: StrView, binds: *TupleName) -> *MatchArm
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    let a: *MatchArm = pattern_variant_inner(p, StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (binds.name), len: (binds.len) as i64 }, binds.span.line, binds.span.col)
+    a.pattern_binds = binds
+    var n: i32 = 0
+    var b: *TupleName = binds
+    while b != null
+        n += 1
+        b = b.next
+    a.pattern_bind_count = n
+    return a
+
+# AGAST #1295: how many positional bindings `arm` names (0 unless it is a
+# variant pattern; 1 for `Some(v)`).
+pub fn arm_bind_count(arm: *MatchArm) -> i32
+    if arm.pattern_kind != PAT_VARIANT
+        return 0
+    if arm.pattern_bind_count < 1
+        return 1
+    arm.pattern_bind_count
+
+# AGAST #1295: make binding `k` of a multi-binding variant arm the one its
+# pattern_inner_* fields describe, as field `k` of the variant
+# (pattern_field_sel).  Passes written for the single `Some(v)` binding run
+# once per binding this way; each loop ends with arm_select_bind(arm, 0),
+# which restores the arm as the parser built it.  A no-op for an arm with
+# one binding.
+pub fn arm_select_bind(arm: *MatchArm, k: i32)
+    if arm.pattern_binds == null
+        return
+    var b: *TupleName = arm.pattern_binds
+    var i: i32 = 0
+    while b != null and i < k
+        b = b.next
+        i += 1
+    if b == null
+        return
+    arm.pattern_field_sel = k
+    arm.pattern_inner_name = b.name
+    arm.pattern_inner_name_len = b.len
+    arm.pattern_inner_span.line = b.span.line
+    arm.pattern_inner_span.col = b.span.col
+    arm.pattern_inner_kind = PAT_IDENT
+    if b.len == 1 and *b.name == '_'   # '_'
+        arm.pattern_inner_kind = PAT_WILDCARD
+
+# Set arm body (optionally marks is_pass when body_expr is null).
+pub fn match_arm_set_body(arm: *MatchArm, body: *Expr, is_pass: i32)
+    arm.body = body
+    arm.is_pass = is_pass
+
+# Link arms into a linked list (first.next = rest, returns first).
+pub fn match_arm_link(first: *MatchArm, rest: *MatchArm) -> *MatchArm
+    if first == null
+        return rest
+    first.next = rest
+    return first
+
+# Create StmtKind.Match: scrutinee stored in if_cond, arms stored in if_then (recast).
+pub fn stmt_match(p: *Parser, scrutinee: *Expr, arms: *MatchArm, line: i32, col: i32) -> *Stmt
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Match
+    s.span.line = line
+    s.span.col = col
+    s.if_cond = scrutinee
+    s.if_then = arms as *Stmt  # Reinterpret arm list as Stmt* slot (never dereferenced as Stmt)
+    s.if_else = null
+    s.next = null
+    return s
+
+# Create ExprKind.Match: scrutinee stored in left, arms stored in args (recast).
+pub fn expr_match(p: *Parser, scrutinee: *Expr, arms: *MatchArm, line: i32, col: i32) -> *Expr
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.Match
+    e.span.line = line
+    e.span.col = col
+    e.left = scrutinee
+    e.args = arms as *Expr  # Reinterpret arm list as Expr* slot
+    e.next = null
+    return e
+
+# Create ExprKind.If (AGAST #1613): `if cond` + then block + `else` + else block,
+# used as a value.  Each block becomes a wildcard MatchArm whose value is the
+# block's trailing bare expression (match_arm_set_block), so emit_if_expr,
+# monomorph and narrowing read the arms exactly as they read ExprKind.Match arms.
+# `args` holds the then-arm; its `next` is the else-arm.
+pub fn expr_if(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line: i32, col: i32) -> *Expr
+    let then_arm: *MatchArm = if_arm_from_block(p, then_body)
+    let else_arm: *MatchArm = if_arm_from_block(p, else_body)
+    then_arm.next = else_arm
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.If
+    e.span.line = line
+    e.span.col = col
+    e.left = cond
+    e.args = then_arm as *Expr  # Reinterpret arm list as Expr* slot
+    e.next = null
+    return e
+
+# Create ExprKind.If for an else-less block form used as a value (AGAST #4543):
+# `let x = if c` + then body, or `5 + if c` + then body.  The missing `else`
+# is #1406's error, reported by if_arm_value at the `if` when the value is
+# wanted — exactly where ritz0 points — instead of failing the parse at the
+# next token.  The missing arm is a `pass` arm: every reader of an ExprKind.If
+# already handles one (narrowing, bool_check, float_slot, ...), and
+# if_arm_check tells it apart by the arm's `else_missing` marker.  Only the
+# refused program reaches it, since every value-wanted else-less `if` is an
+# error before emit.  `open_if_note` records where the block ended so the
+# statement terminator (open_if_ended) can accept it.
+pub fn expr_if_open(p: *Parser, cond: *Expr, then_body: *Stmt, line: i32, col: i32) -> *Expr
+    let then_arm: *MatchArm = if_arm_from_block(p, then_body)
+    let else_arm: *MatchArm = match_arm_wildcard(p)
+    match_arm_set_body(else_arm, null, 1)
+    else_arm.else_missing = 1
+    then_arm.next = else_arm
+    let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    e.kind = ExprKind.If
+    e.span.line = line
+    e.span.col = col
+    e.left = cond
+    e.args = then_arm as *Expr  # Reinterpret arm list as Expr* slot
+    e.next = null
+    open_if_note(p.ctx, p.pos)
+    return e
+
+# Create ExprKind.If for a block `if`/`else` used as an OPERAND (`5 + if c` +
+# then body + `else` + else body), which ritz0 accepts (AGAST #4553).  The
+# node is the same expr_if builds; this wrapper only records where the else
+# block ended (open_if_note) so the statement holding the operand terminates
+# with `open_if_ended`.  Kept apart from expr_if so the statement-level
+# `let x = if … else …` forms (`if_expr_rhs`) are untouched.
+pub fn expr_if_operand(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line: i32, col: i32) -> *Expr
+    let e: *Expr = expr_if(p, cond, then_body, else_body, line, col)
+    open_if_note(p.ctx, p.pos)
+    return e
+
+# Create ExprKind.Match for a block `match` in primary_expr, which is only
+# reached as an operand (`5 + match c` + its arms, AGAST #4049): match_stmt
+# and match_expr_rhs claim the bare forms first.  Notes where the arms ended
+# (open_if_note) so the statement holding the operand terminates with
+# `open_if_ended`, as for a block `if` operand (#4553).
+pub fn expr_match_operand(p: *Parser, scrutinee: *Expr, arms: *MatchArm, line: i32, col: i32) -> *Expr
+    let e: *Expr = expr_match(p, scrutinee, arms, line, col)
+    open_if_note(p.ctx, p.pos)
+    return e
+
+# Create ExprKind.If for the inline form `if cond then a else b` (AGAST #1753).
+# Each arm expression becomes a one-statement block (a bare expression
+# statement), which is exactly the block form's shape for `if c` NEWLINE
+# INDENT a DEDENT, so expr_if / if_arm_from_block build the same node.
+pub fn expr_if_inline(p: *Parser, cond: *Expr, then_val: *Expr, else_val: *Expr, line: i32, col: i32) -> *Expr
+    let then_body: *Stmt = stmt_expr(p, then_val, then_val.span.line, then_val.span.col)
+    let else_body: *Stmt = stmt_expr(p, else_val, else_val.span.line, else_val.span.col)
+    return expr_if(p, cond, then_body, else_body, line, col)
+
+# A block ending in an `if`/`else` or a `match` STATEMENT takes its value: the
+# grammar parses a nested `if` (and an `else if` chain, whose else block is a
+# single if_stmt) as StmtKind.If and a nested `match` as StmtKind.Match, so the last
+# one is rewritten here into a trailing ExprKind.If / ExprKind.Match expression
+# statement, which match_arm_set_block then detaches as the value.  An
+# else-less trailing `if` is left alone: it has no value.  Returns the head.
+#
+# AGAST #2429: match arms skipped this, so `Some(v) =>` + a block ending in
+# `match v` / `if`..`else` yielded 0, silently.  The rewritten tail is an
+# expression arm like `=> match v`, so a valueless one (void-call arms) is the
+# located error #2046 gives that form when the outer value is wanted.
+fn block_tail_as_value(p: *Parser, stmts: *Stmt) -> *Stmt
+    var head: *Stmt = stmts
+    var prev: *Stmt = null
+    var last: *Stmt = stmts
+    while last != null and last.next != null
+        prev = last
+        last = last.next
+    var inner: *Expr = null
+    if last != null and last.kind == StmtKind.If and last.if_else != null
+        inner = expr_if(p, last.if_cond, last.if_then, last.if_else, last.span.line, last.span.col)
+    else if last != null and last.kind == StmtKind.Match
+        inner = expr_match(p, last.if_cond, last.if_then as *MatchArm, last.span.line, last.span.col)
+    if inner != null
+        let st: *Stmt = stmt_expr(p, inner, last.span.line, last.span.col)
+        if prev == null
+            head = st
+        else
+            prev.next = st
+    return head
+
+# One arm of an ExprKind.If: a wildcard arm whose value is the block's tail.
+fn if_arm_from_block(p: *Parser, stmts: *Stmt) -> *MatchArm
+    return match_arm_set_block(match_arm_wildcard(p), block_tail_as_value(p, stmts))
+
+# A block-bodied match arm (`Some(v) =>` + indented statements, #1454): its
+# value is the block's tail, a trailing match or if/else included (#2429).
+pub fn match_arm_set_block_tail(p: *Parser, arm: *MatchArm, stmts: *Stmt) -> *MatchArm
+    return match_arm_set_block(arm, block_tail_as_value(p, stmts))
+
+# =============================================================================
+# Wave 5F.2 — wrappers called from the canonical grammar (ritz1.grammar)
+# =============================================================================
+# These wrap the lower-level helpers above with the names / shapes the
+# grammar productions reference.  Kept thin so generator output stays a
+# direct translation of the grammar.
+
+# pattern : IDENT '(' IDENT ')'  →  PAT_VARIANT with inner = wildcard or bind.
+# Inner ident `_` becomes a wildcard payload; any other ident is a binding, and
+# binder_check.ritz refuses one named like a const, global or variant (#2407).
+pub fn pattern_variant_inner(p: *Parser, name_sv: StrView, inner_sv: StrView, line: i32, col: i32) -> *MatchArm
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    var inner: *u8 = inner_sv.ptr
+    var inner_len: i32 = inner_sv.len as i32
+    if inner_len == 1
+        if *inner == '_'  # '_'
+            return match_arm_variant(p, StrView { ptr: (name), len: (name_len) as i64 }, PAT_WILDCARD, StrView { ptr: (null), len: (0) as i64 })
+    let a: *MatchArm = match_arm_variant(p, StrView { ptr: (name), len: (name_len) as i64 }, PAT_IDENT, StrView { ptr: (inner), len: (inner_len) as i64 })
+    a.pattern_inner_span.line = line
+    a.pattern_inner_span.col = col
+    return a
+
+# match_arm action for a statement-bodied arm (AGAST #1454 / #1617):
+#   `None =>` NEWLINE INDENT stmts DEDENT     (block arm)
+#   `5 => r = 5`                              (assignment arm, one stmt)
+# Like an `if` branch or a fn body, the block's value is its trailing bare
+# expression.  That expression is detached from the statement list into
+# arm.body, so emit_match_arm_body, narrowing and monomorph keep reading the
+# arm's value from `body` exactly as for an expression arm; the remaining
+# statements go to arm.body_stmts and are emitted first.  A block that does
+# not end in a bare expression yields no value and is marked is_pass, the
+# same default (`i64 0`) a `pass` arm contributes.
+pub fn match_arm_set_block(arm: *MatchArm, stmts: *Stmt) -> *MatchArm
+    arm.is_block = 1   # AGAST #3028
+    var prev: *Stmt = null
+    var last: *Stmt = stmts
+    while last != null and last.next != null
+        prev = last
+        last = last.next
+    if last != null and last.kind == StmtKind.Expr and last.expr != null
+        arm.body = last.expr
+        arm.is_pass = 0
+        if prev == null
+            arm.body_stmts = null
+        else
+            prev.next = null
+            arm.body_stmts = stmts
+    else
+        arm.body = null
+        arm.is_pass = 1
+        arm.body_stmts = stmts
+    return arm
+
+# The index of `op` applied to `recv`: an open-ended range (postfix_open_end_slice)
+# gets `recv.len()` as its end, in a node of its own so the op is never mutated.
+fn postfix_index_of(p: *Parser, recv: *Expr, op: *PostfixOp) -> *Expr
+    let ix: *Expr = op.index
+    if ix == null or ix.kind != ExprKind.Range or ix.right != null
+        return ix
+    let r: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    r.kind = ExprKind.Range
+    r.span = ix.span
+    r.left = ix.left
+    r.right = method_call_expr(p, recv, StrView { ptr: (c"len"), len: (3) as i64 }, null)
+    r.next = null
+    return r
+
+# The method call `recv.name(args)` (no generic suffix) as ExprKind.Method.
+pub fn method_call_expr(p: *Parser, recv: *Expr, name_sv: StrView, args: *Expr) -> *Expr
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    let m: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    m.kind = ExprKind.Method
+    m.span = recv.span
+    m.left = recv
+    m.ident_ptr = name
+    m.ident_len = name_len
+    m.args = args
+    m.call_type_suffix = null
+    m.call_type_suffix_len = 0
+    m.bracket.line = 0   # no name written here: errors fall back to span (#3419)
+    m.bracket.col = 0
+    m.next = null
+    return m
+
+# The TYPE_* kind a primitive type name spells ("u8", "i32", ..., "bool"),
+# else 0.  Shared by monomorph (suffix -> substituted kind) and the let-path
+# narrowing of a `-> *T` generic call (AGAST #1980).
+# AGAST #1984: the inverse of primitive_type_from_name.  null / 0 for a
+# non-primitive kind (struct, pointer, array, ...).
+pub fn primitive_name_from_type(t: TypeKind) -> *u8
+    match t
+        TypeKind.U8 =>
+            return c"u8"
+        TypeKind.I8 =>
+            return c"i8"
+        TypeKind.U16 =>
+            return c"u16"
+        TypeKind.I16 =>
+            return c"i16"
+        TypeKind.U32 =>
+            return c"u32"
+        TypeKind.I32 =>
+            return c"i32"
+        TypeKind.U64 =>
+            return c"u64"
+        TypeKind.I64 =>
+            return c"i64"
+        TypeKind.F32 =>
+            return c"f32"
+        TypeKind.F64 =>
+            return c"f64"
+        TypeKind.Bool =>
+            return c"bool"
+        _ => pass
+    null
+
+pub fn primitive_name_len(t: TypeKind) -> i32
+    if ty_int_bits(t) == 8
+        return 2
+    if t == TypeKind.Bool
+        return 4
+    if primitive_name_from_type(t) != null
+        return 3
+    0

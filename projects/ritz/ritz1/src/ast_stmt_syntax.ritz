@@ -1,0 +1,1276 @@
+# ritz1/src/ast_stmt_syntax.ritz - parser actions for statements: inline assembly, lvalue assignment, the statements left over from the grammar's wrappers
+#
+# Split from ast_helpers.ritz by AGAST #1818 (no hand-written file over 3,000
+# SLOC); ast_helpers `pub import`s it, so its importers see these unchanged.
+
+import ast
+import types
+import diag          # every located error's prefix (AGAST #3445)
+import tokens_gen
+import lexer
+import struct_variants   # every struct, and gated-out fns (AGAST #4111, #4055)
+import ritzlib.memory
+import ritzlib.io
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.strview    # strview_eq (was the local buf_eq)
+import ast_expr_syntax   # AGAST #1818: split out of this file
+import ast_type_syntax   # AGAST #1818: split out of this file
+
+# `<file>:<line>:<col>: error: <pre><name><post>`, counted as a parse error.
+fn asm_error(ctx: *ParseCtx, line: i32, col: i32, pre: *u8, name_sv: StrView, post: *u8)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    ctx.attr_errors = ctx.attr_errors + 1
+    diag_error_name(ctx.parse_file, diag_span(line, col), pre, StrView { ptr: (name), len: (len) as i64 }, post)
+
+# The x86_64 general register `name` names by its 64-bit name, as an index
+# (the order of the hardware encoding), or ASM_REG_NONE.
+pub fn asm_reg_index(name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"rax"), len: (3) as i64 })
+        return 0
+    if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"rcx"), len: (3) as i64 })
+        return 1
+    if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"rdx"), len: (3) as i64 })
+        return 2
+    if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"rbx"), len: (3) as i64 })
+        return 3
+    if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"rsp"), len: (3) as i64 })
+        return ASM_REG_RSP
+    if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"rbp"), len: (3) as i64 })
+        return ASM_REG_RBP
+    if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"rsi"), len: (3) as i64 })
+        return 6
+    if (StrView { ptr: (name), len: (len) as i64 }).eq(StrView { ptr: (c"rdi"), len: (3) as i64 })
+        return 7
+    # r8 .. r15
+    if len >= 2 and len <= 3 and *name == 'r'
+        var n: i32 = 0
+        var i: i32 = 1
+        while i < len
+            let c: i32 = (*(name + i)) as i32
+            if c < '0' or c > '9'
+                return ASM_REG_NONE
+            n = n * 10 + (c - 48)
+            i = i + 1
+        if *(name + 1) != '0' and n >= 8 and n <= 15
+            return n
+    ASM_REG_NONE
+
+fn asm_is_name_start(c: i32) -> i32
+    ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_') as i32
+
+fn asm_is_name_char(c: i32) -> i32
+    (asm_is_name_start(c) == 1 or (c >= '0' and c <= '9')) as i32
+
+# Grammar action for one clause, `<kind> <name> (: <reg>)?`; `reg` is null
+# without `: reg`.  The kind word is judged in stmt_asm: `in` is a keyword,
+# the others are IDENTs.  For `clobber r11` the register is the "name".
+pub fn asm_clause_new(p: *Parser, kind_sv: StrView, kline: i32, kcol: i32, name_sv: StrView, line: i32, col: i32, reg_sv: StrView, rline: i32, rcol: i32) -> *AsmOperand
+    var kind: *u8 = kind_sv.ptr
+    var kind_len: i32 = kind_sv.len as i32
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    var reg: *u8 = reg_sv.ptr
+    var reg_len: i32 = reg_sv.len as i32
+    let o: *AsmOperand = parser_alloc(p, sizeof(AsmOperand)) as *AsmOperand
+    o.name = name
+    o.name_len = name_len
+    o.span.line = line
+    o.span.col = col
+    o.kind = kind
+    o.kind_len = kind_len
+    o.kind_span.line = kline
+    o.kind_span.col = kcol
+    o.dir = ASM_UNKNOWN
+    if (StrView { ptr: (kind), len: (kind_len) as i64 }).eq(StrView { ptr: (c"in"), len: (2) as i64 })
+        o.dir = ASM_IN
+    else if (StrView { ptr: (kind), len: (kind_len) as i64 }).eq(StrView { ptr: (c"out"), len: (3) as i64 })
+        o.dir = ASM_OUT
+    else if (StrView { ptr: (kind), len: (kind_len) as i64 }).eq(StrView { ptr: (c"inout"), len: (5) as i64 })
+        o.dir = ASM_INOUT
+    else if (StrView { ptr: (kind), len: (kind_len) as i64 }).eq(StrView { ptr: (c"clobber"), len: (7) as i64 })
+        o.dir = ASM_CLOBBER
+    o.reg = ASM_REG_NONE
+    o.reg_name = reg
+    o.reg_name_len = reg_len
+    o.reg_span.line = rline
+    o.reg_span.col = rcol
+    if reg != null
+        o.reg = asm_reg_index(StrView { ptr: (reg), len: (reg_len) as i64 })
+    o.in_clause = 1
+    o.text_span.line = 0
+    o.text_span.col = 0
+    o.next = null
+    o
+
+pub fn asm_operand_link(first: *AsmOperand, rest: *AsmOperand) -> *AsmOperand
+    first.next = rest
+    first
+
+pub fn asm_line_new(p: *Parser, text_sv: StrView, line: i32, col: i32) -> *AsmLine
+    var text: *u8 = text_sv.ptr
+    var len: i32 = text_sv.len as i32
+    let l: *AsmLine = parser_alloc(p, sizeof(AsmLine)) as *AsmLine
+    l.text = text
+    l.len = len
+    l.span.line = line
+    l.span.col = col
+    l.next = null
+    l
+
+pub fn asm_line_link(first: *AsmLine, rest: *AsmLine) -> *AsmLine
+    first.next = rest
+    first
+
+# The operand of `b` named `name`, or null.
+fn asm_find_operand(b: *AsmBlock, name_sv: StrView) -> *AsmOperand
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    var o: *AsmOperand = b.operands
+    while o != null
+        if (StrView { ptr: (o.name), len: (o.name_len) as i64 }).eq(StrView { ptr: (name), len: (len) as i64 })
+            return o
+        o = o.next
+    null
+
+# Append `o` to b.operands.
+fn asm_append_operand(b: *AsmBlock, o: *AsmOperand)
+    o.next = null
+    if b.operands == null
+        b.operands = o
+        return
+    var t: *AsmOperand = b.operands
+    while t.next != null
+        t = t.next
+    t.next = o
+
+# 1 if register `reg`, written `text` at `at`, may be pinned or clobbered;
+# reports it (when `report` is 1) if not.
+fn asm_reg_ok(ctx: *ParseCtx, reg: i32, text_sv: StrView, at: SrcSpan, report: i32) -> i32
+    var text: *u8 = text_sv.ptr
+    var len: i32 = text_sv.len as i32
+    if reg == ASM_REG_NONE
+        if report == 1
+            asm_error(ctx, at.line, at.col, c"'", StrView { ptr: (text), len: (len) as i64 }, c"' is not a general register (rax, rbx, rcx, rdx, rsi, rdi, r8-r15)")
+        return 0
+    if reg == ASM_REG_RSP or reg == ASM_REG_RBP
+        if report == 1
+            asm_error(ctx, at.line, at.col, c"asm can't pin or clobber '", StrView { ptr: (text), len: (len) as i64 }, c"'")
+        return 0
+    1
+
+# Sort a block's clauses, in order: a clobber sets its bit in b.clobbers,
+# any other is appended to b.operands.  Reports what is wrong with each.
+fn asm_take_clauses(ctx: *ParseCtx, b: *AsmBlock, clauses: *AsmOperand, report: i32)
+    var pinned: i32 = 0
+    var o: *AsmOperand = clauses
+    while o != null
+        let nxt: *AsmOperand = o.next
+        b.clause_count = b.clause_count + 1
+        if b.first_clause.line == 0
+            b.first_clause = o.kind_span
+        if o.dir == ASM_UNKNOWN
+            if report == 1
+                asm_error(ctx, o.kind_span.line, o.kind_span.col, c"unknown asm clause '", StrView { ptr: (o.kind), len: (o.kind_len) as i64 }, c"' (in, out, inout or clobber)")
+        else if o.dir == ASM_CLOBBER
+            if o.reg_name != null
+                if report == 1
+                    asm_error(ctx, o.reg_span.line, o.reg_span.col, c"'clobber' takes one register, not '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c": ...'")
+            else
+                let reg: i32 = asm_reg_index(StrView { ptr: (o.name), len: (o.name_len) as i64 })
+                if asm_reg_ok(ctx, reg, StrView { ptr: (o.name), len: (o.name_len) as i64 }, o.span, report) == 1
+                    b.clobbers = b.clobbers | (1 << reg)
+        else if asm_find_operand(b, StrView { ptr: (o.name), len: (o.name_len) as i64 }) != null
+            if report == 1
+                asm_error(ctx, o.span.line, o.span.col, c"'", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c"' is named in two asm clauses")
+        else
+            if o.reg_name != null
+                if asm_reg_ok(ctx, o.reg, StrView { ptr: (o.reg_name), len: (o.reg_name_len) as i64 }, o.reg_span, report) == 0
+                    o.reg = ASM_REG_NONE
+                else if (pinned & (1 << o.reg)) != 0
+                    if report == 1
+                        asm_error(ctx, o.reg_span.line, o.reg_span.col, c"asm register '", StrView { ptr: (o.reg_name), len: (o.reg_name_len) as i64 }, c"' is pinned twice")
+                else
+                    pinned = pinned | (1 << o.reg)
+            asm_append_operand(b, o)
+        o = nxt
+
+# A named label at the start of line `l` (`loop:`, `.L1:`), reported; only
+# numeric local labels (`1:`) are allowed (§18.6, #1371).
+fn asm_check_label(ctx: *ParseCtx, l: *AsmLine, report: i32)
+    if l.len == 0
+        return
+    let c0: i32 = (*l.text) as i32
+    if asm_is_name_start(c0) == 0 and c0 != '.'   # '.'
+        return
+    var i: i32 = 1
+    while i < l.len and (asm_is_name_char((*(l.text + i)) as i32) == 1 or *(l.text + i) == '.' or *(l.text + i) == '$')
+        i = i + 1
+    if i < l.len and *(l.text + i) == ':'   # ':'
+        if report == 1
+            asm_error(ctx, l.span.line, l.span.col, c"named label '", StrView { ptr: (l.text), len: (i) as i64 }, c"' in asm: use a numeric local label (1:, jumped to as 1b or 1f)")
+
+# The `{name}`s of line `l`: each name no operand has yet becomes an ASM_IN
+# operand; each operand found is marked as in the text.  `{{` and `}}` are a
+# literal brace.  A `{` that isn't closed, or isn't a name, is reported.
+fn asm_scan_line(p: *Parser, b: *AsmBlock, l: *AsmLine, report: i32)
+    var i: i32 = 0
+    while i < l.len
+        let c: i32 = (*(l.text + i)) as i32
+        if c == '{' and i + 1 < l.len and *(l.text + i + 1) == '{'   # `{{`
+            i = i + 2
+        else if c == '}' and i + 1 < l.len and *(l.text + i + 1) == '}'   # `}}`
+            i = i + 2
+        else if c == '{'
+            var j: i32 = i + 1
+            if j < l.len and asm_is_name_start((*(l.text + j)) as i32) == 1
+                while j < l.len and asm_is_name_char((*(l.text + j)) as i32) == 1
+                    j = j + 1
+            if j < l.len and j > i + 1 and *(l.text + j) == '}'
+                let name: *u8 = l.text + i + 1
+                let len: i32 = j - i - 1
+                var o: *AsmOperand = asm_find_operand(b, StrView { ptr: (name), len: (len) as i64 })
+                if o == null
+                    o = parser_alloc(p, sizeof(AsmOperand)) as *AsmOperand
+                    o.name = name
+                    o.name_len = len
+                    o.span.line = l.span.line
+                    o.span.col = l.span.col + i + 1
+                    o.dir = ASM_IN
+                    o.reg = ASM_REG_NONE
+                    o.reg_name = null
+                    o.reg_name_len = 0
+                    o.in_clause = 0
+                    o.text_span.line = 0
+                    o.kind = null
+                    o.kind_len = 0
+                    asm_append_operand(b, o)
+                if o.text_span.line == 0
+                    o.text_span.line = l.span.line
+                    o.text_span.col = l.span.col + i
+                i = j + 1
+            else
+                if report == 1
+                    var closed: i32 = 0
+                    var k: i32 = i + 1
+                    while k < l.len
+                        if *(l.text + k) == '}'
+                            closed = 1
+                        k = k + 1
+                    if closed == 0
+                        asm_error(p.ctx, l.span.line, l.span.col + i, c"'{' in asm is not closed", StrView { ptr: (null), len: (0) as i64 }, c" (write '{{' for a literal '{')")
+                    else
+                        asm_error(p.ctx, l.span.line, l.span.col + i, c"'{' in asm must be followed by a name and '}'", StrView { ptr: (null), len: (0) as i64 }, c" (write '{{' for a literal '{')")
+                i = l.len
+        else
+            i = i + 1
+
+# Grammar action for an asm block (LANGUAGE_SPEC §18.6, AGAST #3394).
+pub fn stmt_asm(p: *Parser, arch_sv: StrView, aline: i32, acol: i32, clauses: *AsmOperand, lines: *AsmLine, line: i32, col: i32) -> *Stmt
+    var arch: *u8 = arch_sv.ptr
+    var arch_len: i32 = arch_sv.len as i32
+    # A block the parser backtracked over and builds again is not re-reported.
+    var report: i32 = 0
+    if p.ctx.asm_last_block == null or (arch as i64) > (p.ctx.asm_last_block as i64)
+        report = 1
+        p.ctx.asm_last_block = arch
+    let b: *AsmBlock = parser_alloc(p, sizeof(AsmBlock)) as *AsmBlock
+    b.arch = arch
+    b.arch_len = arch_len
+    b.lines = lines
+    b.operands = null
+    b.clobbers = 0
+    b.clause_count = 0
+    b.first_clause.line = 0
+    b.first_clause.col = 0
+    if not (StrView { ptr: (arch), len: (arch_len) as i64 }).eq(StrView { ptr: (c"x86_64"), len: (6) as i64 }) and report == 1
+        asm_error(p.ctx, aline, acol, c"unknown asm architecture '", StrView { ptr: (arch), len: (arch_len) as i64 }, c"' (known: x86_64)")
+    asm_take_clauses(p.ctx, b, clauses, report)
+    var l: *AsmLine = lines
+    while l != null
+        asm_check_label(p.ctx, l, report)
+        asm_scan_line(p, b, l, report)
+        l = l.next
+    # An unpinned clause operand has no register but the one {name} picks.
+    var o: *AsmOperand = b.operands
+    while o != null
+        if o.in_clause == 1 and o.reg_name == null and o.text_span.line == 0 and report == 1
+            asm_error(p.ctx, o.span.line, o.span.col, c"asm operand '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c"' is in a clause but not in the text: write {name} or pin it to a register")
+        o = o.next
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Asm
+    s.span.line = line
+    s.span.col = col
+    s.asm_block = b
+    s.next = null
+    return s
+
+# The [[naked]] rules for fn `f` (§18.6, §17.5): its body holds only asm
+# blocks, and they take no clause and no `{name}`: there is no frame.
+pub fn asm_check_naked(ctx: *ParseCtx, f: *FnDef)
+    var st: *Stmt = f.body
+    while st != null
+        if st.kind != StmtKind.Asm
+            asm_error(ctx, st.span.line, st.span.col, c"a [[naked]] fn body may contain only asm blocks", StrView { ptr: (null), len: (0) as i64 }, c"")
+        else
+            let b: *AsmBlock = st.asm_block
+            if b.clause_count > 0
+                asm_error(ctx, b.first_clause.line, b.first_clause.col, c"an asm block in a [[naked]] fn takes no clauses", StrView { ptr: (null), len: (0) as i64 }, c"")
+            var o: *AsmOperand = b.operands
+            while o != null
+                if o.text_span.line != 0
+                    asm_error(ctx, o.text_span.line, o.text_span.col, c"an asm block in a [[naked]] fn takes no {name}: '", StrView { ptr: (o.name), len: (o.name_len) as i64 }, c"' has no frame to live in")
+                o = o.next
+        st = st.next
+
+pub fn stmt_continue(p: *Parser, line: i32, col: i32) -> *Stmt
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Continue
+    s.span.line = line
+    s.span.col = col
+    s.next = null
+    return s
+
+pub fn stmt_if(p: *Parser, cond: *Expr, then_body: *Stmt, else_body: *Stmt, line: i32, col: i32) -> *Stmt
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.If
+    s.span.line = line
+    s.span.col = col
+    s.if_cond = cond
+    s.if_then = then_body
+    s.if_else = else_body
+    s.next = null
+    return s
+
+# `assert <cond>[, "message"]` — a runtime check that exits 1 on a falsy
+# cond.  Condition lives in if_cond (slot reused from StmtKind.If); the message
+# (null / 0 if none) in assert_msg.  emit_assert_stmt (emitter_print.ritz)
+# lowers it (AGAST #1869).
+pub fn stmt_assert(p: *Parser, cond: *Expr, msg_sv: StrView, line: i32, col: i32) -> *Stmt
+    var msg: *u8 = msg_sv.ptr
+    var msg_len: i32 = msg_sv.len as i32
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Assert
+    s.span.line = line
+    s.span.col = col
+    s.if_cond = cond
+    s.assert_msg = msg
+    s.assert_msg_len = msg_len
+    s.next = null
+    return s
+
+# `assert <cond>, c"..."`: the message is a "..." (StrView) literal only, so a
+# c-string message is a located error at the literal, worded as ritz0's
+# ASSERT_CSTRING_MESSAGE (AGAST #3794).  Returns a message-less assert so the
+# parse goes on; ctx.attr_errors fails the compile.
+pub fn assert_cstring_message_refused(p: *Parser, cond: *Expr, lit_line: i32, lit_col: i32, line: i32, col: i32) -> *Stmt
+    if p.skip_item == 0
+        diag_error(p.ctx.parse_file, diag_span(lit_line, lit_col), c"an assert message is a \"...\" literal: drop the `c`")
+        p.ctx.attr_errors = p.ctx.attr_errors + 1
+    stmt_assert(p, cond, StrView { ptr: (null), len: (0) as i64 }, line, col)
+
+# `let (x, y, ...) = expr` — destructure.  First binding name lives in
+# var_name (reuse), second in assign_target (reuse), any after the second
+# in tuple_more (AGAST #109, stmt_tuple_more).  Init expr in var_init.  Emitter (see StmtKind.TupleDecl handler) emits the init as a
+# struct value, alloca two i64 slots, extractvalue fields 0/1 with
+# appropriate widening to i64, and registers both names as locals.
+# `paren_line` / `paren_col` are where the pattern's `(` is: LARB R67's
+# refusal points there (AGAST #3500), as ritz0's paren_span does (AGAST #3499).
+pub fn stmt_tuple_decl(p: *Parser, name1_sv: StrView, name2_sv: StrView, init: *Expr, line: i32, col: i32, paren_line: i32, paren_col: i32) -> *Stmt
+    var name1: *u8 = name1_sv.ptr
+    var len1: i32 = name1_sv.len as i32
+    var name2: *u8 = name2_sv.ptr
+    var len2: i32 = name2_sv.len as i32
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.TupleDecl
+    s.name_span.line = 0   # AGAST #2407: stmt_named and stmt_named2 set them
+    s.name_span.col = 0
+    s.name2_span.line = 0
+    s.name2_span.col = 0
+    s.span.line = line
+    s.span.col = col
+    s.paren_span.line = paren_line
+    s.paren_span.col = paren_col
+    s.var_name = name1 as *u8
+    s.var_name_len = len1
+    s.assign_target = name2 as *u8
+    s.assign_target_len = len2
+    s.tuple_more = null   # AGAST #109: stmt_tuple_more sets the tail
+    s.var_init = init
+    s.next = null
+    return s
+
+# AGAST #109: one name of a destructure's tail (`c` of `let (a, b, c) = e`).
+pub fn tuple_name_new(p: *Parser, name_sv: StrView, line: i32, col: i32) -> *TupleName
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let t: *TupleName = parser_alloc(p, sizeof(TupleName)) as *TupleName
+    t.name = name
+    t.len = len
+    t.span.line = line
+    t.span.col = col
+    t.next = null
+    return t
+
+pub fn tuple_name_link(first: *TupleName, rest: *TupleName) -> *TupleName
+    first.next = rest
+    return first
+
+# AGAST #109: give tuple decl `s` its names after the second.
+pub fn stmt_tuple_more(s: *Stmt, more: *TupleName) -> *Stmt
+    s.tuple_more = more
+    return s
+
+pub fn stmt_while(p: *Parser, cond: *Expr, body: *Stmt, line: i32, col: i32) -> *Stmt
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.While
+    s.span.line = line
+    s.span.col = col
+    s.while_cond = cond
+    s.while_body = body
+    s.next = null
+    return s
+
+pub fn stmt_for(p: *Parser, var_name_sv: StrView, start: *Expr, end: *Expr, body: *Stmt, line: i32, col: i32) -> *Stmt
+    var var_name: *u8 = var_name_sv.ptr
+    var var_len: i32 = var_name_sv.len as i32
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.For
+    s.name_span.line = 0   # AGAST #2407: stmt_named sets it
+    s.name_span.col = 0
+    s.span.line = line
+    s.span.col = col
+    s.for_var = var_name
+    s.for_var_len = var_len
+    s.for_start = start
+    s.for_end = end
+    s.for_body = body
+    s.for_inclusive = 0
+    s.next = null
+    return s
+
+# for_stmt : FOR IDENT IN expr DOTDOTEQ expr block  (AGAST #1530)
+# Same StmtKind.For as `start..end`; emit_stmt lowers the bound as `<=`.
+pub fn stmt_for_inclusive(p: *Parser, var_name_sv: StrView, start: *Expr, end: *Expr, body: *Stmt, line: i32, col: i32) -> *Stmt
+    var var_name: *u8 = var_name_sv.ptr
+    var var_len: i32 = var_name_sv.len as i32
+    let s: *Stmt = stmt_for(p, StrView { ptr: (var_name), len: (var_len) as i64 }, start, end, body, line, col)
+    s.for_inclusive = 1
+    return s
+
+# Infinite loop: loop { body } - use break to exit
+# Reuses while_body field for the loop body (no condition needed)
+pub fn stmt_loop(p: *Parser, body: *Stmt, line: i32, col: i32) -> *Stmt
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Loop
+    s.span.line = line
+    s.span.col = col
+    s.while_cond = null  # No condition for infinite loop
+    s.while_body = body
+    s.next = null
+    return s
+
+pub fn stmt_assign_name(p: *Parser, name_sv: StrView, val: *Expr, line: i32, col: i32) -> *Stmt
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Assign
+    s.span.line = line
+    s.span.col = col
+    s.assign_target = name as *u8
+    s.assign_target_len = len
+    s.assign_value = val
+    s.next = null
+    return s
+
+pub fn stmt_assign_index(p: *Parser, name_sv: StrView, idx: *Expr, val: *Expr, line: i32, col: i32, bline: i32, bcol: i32) -> *Stmt
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.IndexAssign
+    s.span.line = line
+    s.span.col = col
+    s.bracket.line = bline
+    s.bracket.col = bcol
+    s.assign_target = name as *u8
+    s.assign_target_len = len
+    s.assign_value = val
+    # Store index expression in while_cond (reuse, like StmtKind.MemberIndexAssign)
+    s.while_cond = idx
+    s.next = null
+    return s
+
+pub fn stmt_assign_deref(p: *Parser, target: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Assign
+    s.span.line = line
+    s.span.col = col
+    # Store target expression in assign_value's place, we need to reinterpret
+    # For now, use target directly - emitter needs to handle ExprKind.Unary(DEREF) case
+    s.assign_target = null
+    s.assign_target_len = 0
+    s.assign_value = val
+    # AGAST #1304: store the target WRAPPED in ExprKind.Unary/OpKind.Deref.
+    #
+    # This used to stash the bare deref OPERAND, which made `*b.p = v`
+    # indistinguishable from `b.p = v` — both produced StmtKind.Assign with
+    # assign_target_len == 0 and an ExprKind.Member in if_cond.  emit_assign
+    # checks ExprKind.Member first, so every `*expr.field = value` compiled to
+    # a plain field store: it overwrote the POINTER instead of writing
+    # through it.  That is what corrupted IoUring.sq_tail in
+    # uring_sqe_submit (`*ring.sq_tail = tail + 1`) and segfaulted the
+    # async_net / echo_server examples.
+    #
+    # Keeping the `*` in the AST matches ritz0, whose emitter likewise
+    # tests UnaryOp('*') before Field.
+    s.if_cond = expr_unary(p, OpKind.Deref, target, line, col)
+    s.next = null
+    return s
+
+# Where the token after the one starting at `at` is: the `[` of `h.t[k] = v`
+# after its field name (AGAST #2847).  Line 0 when it isn't found.
+fn tok_span_after(p: *Parser, at: *u8, out: *SrcSpan)
+    out.line = 0
+    out.col = 0
+    var i: i32 = p.pos
+    if i >= p.token_count
+        i = p.token_count - 1
+    var n: i32 = 0
+    while i >= 0 and n < 512
+        let t: *Token = p.tokens + i
+        if t.start == at
+            if i + 1 < p.token_count
+                let after: *Token = p.tokens + i + 1
+                out.line = after.line
+                out.col = after.col
+            return
+        i -= 1
+        n += 1
+
+# Member assignment through pointer: ptr.field = value
+pub fn stmt_assign_member(p: *Parser, ptr_expr: *Expr, field_sv: StrView, val: *Expr, line: i32, col: i32) -> *Stmt
+    var field: *u8 = field_sv.ptr
+    var field_len: i32 = field_sv.len as i32
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.MemberAssign
+    s.span.line = line
+    s.span.col = col
+    # Store pointer expression in if_cond
+    s.if_cond = ptr_expr
+    # Store field name in assign_target
+    s.assign_target = field as *u8
+    s.assign_target_len = field_len
+    tok_span_back(p, field, @s.bracket)   # AGAST #3015
+    # Store value in assign_value
+    s.assign_value = val
+    s.next = null
+    return s
+
+# Indexed member assignment through pointer: ptr.field[index] = value
+pub fn stmt_assign_member_index(p: *Parser, ptr_expr: *Expr, field_sv: StrView, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
+    var field: *u8 = field_sv.ptr
+    var field_len: i32 = field_sv.len as i32
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.MemberIndexAssign
+    s.span.line = line
+    s.span.col = col
+    # Store pointer expression in if_cond
+    s.if_cond = ptr_expr
+    # Store field name in assign_target
+    s.assign_target = field as *u8
+    s.assign_target_len = field_len
+    tok_span_back(p, field, @s.bracket)   # AGAST #3015
+    tok_span_after(p, field, @s.index_at)   # AGAST #2847
+    # Store index expression in while_cond (reuse)
+    s.while_cond = idx
+    # Store value in assign_value
+    s.assign_value = val
+    s.next = null
+    return s
+
+# General expression assignment: expr = value
+# This handles nested member access like r.origin.x = 10
+pub fn stmt_assign_expr(p: *Parser, target: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Assign
+    s.span.line = line
+    s.span.col = col
+    # Store target expression in if_cond (reuse)
+    s.if_cond = target
+    # Signal this is an expression assignment by setting assign_target_len = 0
+    s.assign_target = null
+    s.assign_target_len = 0
+    # Store value in assign_value
+    s.assign_value = val
+    s.next = null
+    return s
+
+# Local struct field assignment: var.field = value
+pub fn stmt_assign_local_field(p: *Parser, var_name_sv: StrView, field_sv: StrView, val: *Expr, line: i32, col: i32) -> *Stmt
+    var var_name: *u8 = var_name_sv.ptr
+    var var_len: i32 = var_name_sv.len as i32
+    var field: *u8 = field_sv.ptr
+    var field_len: i32 = field_sv.len as i32
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.LocalFieldAssign
+    s.span.line = line
+    s.span.col = col
+    # Store variable name in var_name/var_name_len
+    s.var_name = var_name as *u8
+    s.var_name_len = var_len
+    # Store field name in assign_target/assign_target_len
+    s.assign_target = field as *u8
+    s.assign_target_len = field_len
+    tok_span_back(p, field, @s.bracket)   # AGAST #3015
+    # Store value in assign_value
+    s.assign_value = val
+    s.next = null
+    return s
+
+# Local struct field array assignment: var.field[index] = value
+pub fn stmt_assign_local_field_index(p: *Parser, var_name_sv: StrView, field_sv: StrView, idx: *Expr, val: *Expr, line: i32, col: i32) -> *Stmt
+    var var_name: *u8 = var_name_sv.ptr
+    var var_len: i32 = var_name_sv.len as i32
+    var field: *u8 = field_sv.ptr
+    var field_len: i32 = field_sv.len as i32
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.LocalFieldIndexAssign
+    s.span.line = line
+    s.span.col = col
+    # Store variable name in var_name/var_name_len
+    s.var_name = var_name as *u8
+    s.var_name_len = var_len
+    # Store field name in assign_target/assign_target_len
+    s.assign_target = field as *u8
+    s.assign_target_len = field_len
+    tok_span_back(p, field, @s.bracket)   # AGAST #3015
+    tok_span_after(p, field, @s.index_at)   # AGAST #2847
+    # Store index expression in while_cond (reuse)
+    s.while_cond = idx
+    # Store value in assign_value
+    s.assign_value = val
+    s.next = null
+    return s
+
+# Desugar compound assignment: `name op= val` -> `name = name op val`
+# op should be OpKind.Add, OpKind.Sub, OpKind.Mul, OpKind.Div
+pub fn stmt_compound_assign(p: *Parser, name_sv: StrView, op: OpKind, val: *Expr, line: i32, col: i32) -> *Stmt
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    # Create identifier expression for the variable
+    let ident: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    ident.kind = ExprKind.Ident
+    ident.span.line = line
+    ident.span.col = col
+    ident.ident_ptr = name
+    ident.ident_len = len
+    ident.next = null
+    # Create binary expression: name op val
+    let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    binary.kind = ExprKind.Binary
+    binary.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    binary.span.line = line
+    binary.span.col = col
+    binary_set_op(binary, op)
+    binary.left = ident
+    binary.right = val
+    binary.next = null
+    # Create assignment statement: name = (name op val)
+    let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
+    s.kind = StmtKind.Assign
+    s.span.line = line
+    s.span.col = col
+    s.assign_target = name
+    s.assign_target_len = len
+    s.assign_value = binary
+    s.next = null
+    return s
+
+# Compound assignment for array index: arr[idx] op= val -> arr[idx] = arr[idx] op val
+pub fn stmt_compound_assign_index(p: *Parser, name_sv: StrView, idx: *Expr, op: OpKind, val: *Expr, line: i32, col: i32, bline: i32, bcol: i32) -> *Stmt
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    # Create identifier expression for array
+    let ident: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    ident.kind = ExprKind.Ident
+    ident.span.line = line
+    ident.span.col = col
+    ident.ident_ptr = name
+    ident.ident_len = len
+    ident.next = null
+    # Create index expression for reading: arr[idx]
+    let read_idx: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    read_idx.kind = ExprKind.Index
+    read_idx.span.line = line
+    read_idx.span.col = col
+    read_idx.bracket.line = 0
+    read_idx.left = ident
+    read_idx.right = idx
+    read_idx.next = null
+    # Create binary expression: arr[idx] op val
+    let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    binary.kind = ExprKind.Binary
+    binary.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    binary.span.line = line
+    binary.span.col = col
+    binary_set_op(binary, op)
+    binary.left = read_idx
+    binary.right = val
+    binary.next = null
+    # Create index assignment: arr[idx] = (arr[idx] op val)
+    return stmt_assign_index(p, StrView { ptr: (name), len: (len) as i64 }, idx, binary, line, col, bline, bcol)
+
+# Compound assignment for dereference: *ptr op= val -> *ptr = *ptr op val
+pub fn stmt_compound_assign_deref(p: *Parser, target: *Expr, op: OpKind, val: *Expr, line: i32, col: i32) -> *Stmt
+    # Create deref expression for reading: *ptr
+    let read_deref: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    read_deref.kind = ExprKind.Unary
+    read_deref.span.line = line
+    read_deref.span.col = col
+    read_deref.op = OpKind.Deref
+    read_deref.operand = target
+    read_deref.next = null
+    # Create binary expression: *ptr op val
+    let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    binary.kind = ExprKind.Binary
+    binary.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    binary.span.line = line
+    binary.span.col = col
+    binary_set_op(binary, op)
+    binary.left = read_deref
+    binary.right = val
+    binary.next = null
+    # Create deref assignment: *ptr = (*ptr op val)
+    return stmt_assign_deref(p, target, binary, line, col)
+
+# Compound assignment for member: (*ptr).field op= val
+#
+# The statement is at the `(` (line, col); the `(*ptr).field op val` it
+# synthesizes is at the `*` (star_line, star_col), where ritz0 places that
+# binary's left operand and so reports a value narrowed into it (AGAST #4288).
+pub fn stmt_compound_assign_member(p: *Parser, ptr_expr: *Expr, field_sv: StrView, op: OpKind, val: *Expr, line: i32, col: i32, star_line: i32, star_col: i32) -> *Stmt
+    var field: *u8 = field_sv.ptr
+    var field_len: i32 = field_sv.len as i32
+    # Create deref expression: *ptr
+    let deref: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    deref.kind = ExprKind.Unary
+    deref.span.line = star_line
+    deref.span.col = star_col
+    deref.op = OpKind.Deref
+    deref.operand = ptr_expr
+    deref.next = null
+    # Create member access expression: (*ptr).field
+    let member: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    member.kind = ExprKind.Member
+    member.span.line = star_line
+    member.span.col = star_col
+    member.left = deref
+    member.ident_ptr = field
+    member.ident_len = field_len
+    tok_span_back(p, field, @member.bracket)   # AGAST #3015
+    member.next = null
+    # Create binary expression: (*ptr).field op val
+    let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    binary.kind = ExprKind.Binary
+    binary.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    binary.span.line = star_line
+    binary.span.col = star_col
+    binary_set_op(binary, op)
+    binary.left = member
+    binary.right = val
+    binary.next = null
+    # Create member assignment
+    return stmt_assign_member(p, ptr_expr, StrView { ptr: (field), len: (field_len) as i64 }, binary, line, col)
+
+# Compound assignment for indexed member: (*ptr).field[idx] op= val
+# Synthesized at the `*`, as stmt_compound_assign_member is.
+pub fn stmt_compound_assign_member_index(p: *Parser, ptr_expr: *Expr, field_sv: StrView, idx: *Expr, op: OpKind, val: *Expr, line: i32, col: i32, star_line: i32, star_col: i32) -> *Stmt
+    var field: *u8 = field_sv.ptr
+    var field_len: i32 = field_sv.len as i32
+    # Create deref expression: *ptr
+    let deref: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    deref.kind = ExprKind.Unary
+    deref.span.line = star_line
+    deref.span.col = star_col
+    deref.op = OpKind.Deref
+    deref.operand = ptr_expr
+    deref.next = null
+    # Create member access expression: (*ptr).field
+    let member: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    member.kind = ExprKind.Member
+    member.span.line = star_line
+    member.span.col = star_col
+    member.left = deref
+    member.ident_ptr = field
+    member.ident_len = field_len
+    tok_span_back(p, field, @member.bracket)   # AGAST #3015
+    member.next = null
+    # Create index expression: (*ptr).field[idx]
+    let indexed: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    indexed.kind = ExprKind.Index
+    indexed.span.line = star_line
+    indexed.span.col = star_col
+    indexed.bracket.line = 0
+    indexed.left = member
+    indexed.right = idx
+    indexed.next = null
+    # Create binary expression: (*ptr).field[idx] op val
+    let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    binary.kind = ExprKind.Binary
+    binary.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    binary.span.line = star_line
+    binary.span.col = star_col
+    binary_set_op(binary, op)
+    binary.left = indexed
+    binary.right = val
+    binary.next = null
+    # Create member index assignment
+    return stmt_assign_member_index(p, ptr_expr, StrView { ptr: (field), len: (field_len) as i64 }, idx, binary, line, col)
+
+# Compound assignment for local field: var.field op= val
+pub fn stmt_compound_assign_local_field(p: *Parser, var_name_sv: StrView, field_sv: StrView, op: OpKind, val: *Expr, line: i32, col: i32) -> *Stmt
+    var var_name: *u8 = var_name_sv.ptr
+    var var_len: i32 = var_name_sv.len as i32
+    var field: *u8 = field_sv.ptr
+    var field_len: i32 = field_sv.len as i32
+    # Create identifier for variable
+    let ident: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    ident.kind = ExprKind.Ident
+    ident.span.line = line
+    ident.span.col = col
+    ident.ident_ptr = var_name
+    ident.ident_len = var_len
+    ident.next = null
+    # Create member access: var.field
+    let member: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    member.kind = ExprKind.Member
+    member.span.line = line
+    member.span.col = col
+    member.left = ident
+    member.ident_ptr = field
+    member.ident_len = field_len
+    tok_span_back(p, field, @member.bracket)   # AGAST #3015
+    member.next = null
+    # Create binary: var.field op val
+    let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    binary.kind = ExprKind.Binary
+    binary.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    binary.span.line = line
+    binary.span.col = col
+    binary_set_op(binary, op)
+    binary.left = member
+    binary.right = val
+    binary.next = null
+    # Create local field assignment
+    return stmt_assign_local_field(p, StrView { ptr: (var_name), len: (var_len) as i64 }, StrView { ptr: (field), len: (field_len) as i64 }, binary, line, col)
+
+# Compound assignment for local field index: var.field[idx] op= val
+pub fn stmt_compound_assign_local_field_index(p: *Parser, var_name_sv: StrView, field_sv: StrView, idx: *Expr, op: OpKind, val: *Expr, line: i32, col: i32) -> *Stmt
+    var var_name: *u8 = var_name_sv.ptr
+    var var_len: i32 = var_name_sv.len as i32
+    var field: *u8 = field_sv.ptr
+    var field_len: i32 = field_sv.len as i32
+    # Create identifier for variable
+    let ident: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    ident.kind = ExprKind.Ident
+    ident.span.line = line
+    ident.span.col = col
+    ident.ident_ptr = var_name
+    ident.ident_len = var_len
+    ident.next = null
+    # Create member access: var.field
+    let member: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    member.kind = ExprKind.Member
+    member.span.line = line
+    member.span.col = col
+    member.left = ident
+    member.ident_ptr = field
+    member.ident_len = field_len
+    tok_span_back(p, field, @member.bracket)   # AGAST #3015
+    member.next = null
+    # Create index expression: var.field[idx]
+    let indexed: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    indexed.kind = ExprKind.Index
+    indexed.span.line = line
+    indexed.span.col = col
+    indexed.bracket.line = 0
+    indexed.left = member
+    indexed.right = idx
+    indexed.next = null
+    # Create binary: var.field[idx] op val
+    let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    binary.kind = ExprKind.Binary
+    binary.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    binary.span.line = line
+    binary.span.col = col
+    binary_set_op(binary, op)
+    binary.left = indexed
+    binary.right = val
+    binary.next = null
+    # Create local field index assignment
+    return stmt_assign_local_field_index(p, StrView { ptr: (var_name), len: (var_len) as i64 }, StrView { ptr: (field), len: (field_len) as i64 }, idx, binary, line, col)
+
+# Compound assignment for general expression: expr op= val
+pub fn stmt_compound_assign_expr(p: *Parser, target: *Expr, op: OpKind, val: *Expr, line: i32, col: i32) -> *Stmt
+    # Create binary: target op val
+    let binary: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    binary.kind = ExprKind.Binary
+    binary.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    binary.span.line = line
+    binary.span.col = col
+    binary_set_op(binary, op)
+    binary.left = target
+    binary.right = val
+    binary.next = null
+    # Create expression assignment
+    return stmt_assign_expr(p, target, binary, line, col)
+
+# =============================================================================
+# One lvalue assignment (AGAST #1819)
+# =============================================================================
+#
+# assign_stmt parses every non-name, non-`*` target as one `postfix_expr`;
+# these two classify the parsed lvalue into the statement the grammar's
+# twelve special-case alternatives used to build, with the same nodes and
+# spans, so Sema and the emitter see an unchanged AST:
+#
+#   n[i]        StmtKind.IndexAssign             (stmt_assign_index)
+#   v.f         StmtKind.LocalFieldAssign       (stmt_assign_local_field)
+#   v.f[i]      StmtKind.LocalFieldIndexAssign (stmt_assign_local_field_index)
+#   (*e).f      StmtKind.MemberAssign            (stmt_assign_member)
+#   (*e).f[i]   StmtKind.MemberIndexAssign      (stmt_assign_member_index)
+#   anything    StmtKind.Assign on the expression (stmt_assign_expr)
+#
+# `at` is the token index the lvalue starts at (assign_stmt's start_pos; the
+# zero-width assign_pos wrapper was dropped in AGAST #4378).  The old
+# alternatives matched tokens, so a shape counts only when its tokens are
+# the ones they named: an IDENT (not `self`, which lexes as SELF), a field
+# that is an IDENT (not `self` or a tuple's `0`), exactly one `(` before
+# the `*`, and a plain `[expr]` index (not a slice's range).
+
+# The position of the lvalue's first token.  assign_stmt used to reach it
+# through a zero-width `assign_pos` grammar rule; it now passes start_pos
+# directly (AGAST #4378).  Kept because the pre-#4378 generated parser, and
+# any out-of-tree caller, still names it.
+pub fn assign_pos(p: *Parser) -> i32
+    p.pos
+
+fn lv_tok(p: *Parser, at: i32, k: i32) -> *Token
+    if at + k >= p.token_count
+        return p.tokens + (p.token_count - 1)
+    p.tokens + (at + k)
+
+# A field name the old `DOT IDENT` matched: not `self`, not a digit.
+fn lv_field_is_ident(e: *Expr) -> i32
+    if e.ident_len < 1
+        return 0
+    let c: u8 = *e.ident_ptr
+    if c >= '0' and c <= '9'
+        return 0
+    # `self`
+    if e.ident_len == 4 and c == 's' and *(e.ident_ptr + 1) == 'e' and *(e.ident_ptr + 2) == 'l' and *(e.ident_ptr + 3) == 'f'
+        return 0
+    1
+
+# A plain `[expr]` index, not a `[lo..hi]` / `[lo:hi]` slice.
+fn lv_plain_index(e: *Expr) -> i32
+    (e.kind == ExprKind.Index and (e.right == null or e.right.kind != ExprKind.Range)) as i32
+
+# `v` of `v.f` / `v[i]`: an IDENT-token identifier at `at`.
+fn lv_is_ident_at(p: *Parser, at: i32, e: *Expr) -> i32
+    (e.kind == ExprKind.Ident and lv_tok(p, at, 0).kind == TOK_IDENT) as i32
+
+# `(*e)` at `at`: one `(`, then the `*` the ExprKind.Unary is.
+fn lv_is_paren_deref_at(p: *Parser, at: i32, e: *Expr) -> i32
+    if e.kind != ExprKind.Unary or e.op != OpKind.Deref
+        return 0
+    (lv_tok(p, at, 0).kind == TOK_LPAREN and lv_tok(p, at, 1).kind == TOK_STAR) as i32
+
+# `lhs = val`: classify, then build what the matching alternative built.
+# op 0 is plain `=`; otherwise the compound `op=` (compound_op's OP_*).
+pub fn stmt_assign_lvalue(p: *Parser, at: i32, lhs: *Expr, op: OpKind, val: *Expr) -> *Stmt
+    let t0: *Token = lv_tok(p, at, 0)
+    # n[i]
+    if lv_plain_index(lhs) == 1 and lv_is_ident_at(p, at, lhs.left) == 1
+        let n: *Expr = lhs.left
+        if op == OpKind.Unset
+            return stmt_assign_index(p, StrView { ptr: (n.ident_ptr), len: (n.ident_len) as i64 }, lhs.right, val, t0.line, t0.col, lhs.bracket.line, lhs.bracket.col)
+        return stmt_compound_assign_index(p, StrView { ptr: (n.ident_ptr), len: (n.ident_len) as i64 }, lhs.right, op, val, t0.line, t0.col, lhs.bracket.line, lhs.bracket.col)
+    # v.f
+    if lhs.kind == ExprKind.Member and lv_is_ident_at(p, at, lhs.left) == 1 and lv_tok(p, at, 2).kind == TOK_IDENT
+        let v: *Expr = lhs.left
+        if op == OpKind.Unset
+            return stmt_assign_local_field(p, StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 }, StrView { ptr: (lhs.ident_ptr), len: (lhs.ident_len) as i64 }, val, t0.line, t0.col)
+        return stmt_compound_assign_local_field(p, StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 }, StrView { ptr: (lhs.ident_ptr), len: (lhs.ident_len) as i64 }, op, val, t0.line, t0.col)
+    # v.f[i]
+    if lv_plain_index(lhs) == 1 and lhs.left.kind == ExprKind.Member and lv_is_ident_at(p, at, lhs.left.left) == 1 and lv_tok(p, at, 2).kind == TOK_IDENT
+        let m: *Expr = lhs.left
+        let v: *Expr = m.left
+        if op == OpKind.Unset
+            return stmt_assign_local_field_index(p, StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 }, StrView { ptr: (m.ident_ptr), len: (m.ident_len) as i64 }, lhs.right, val, t0.line, t0.col)
+        return stmt_compound_assign_local_field_index(p, StrView { ptr: (v.ident_ptr), len: (v.ident_len) as i64 }, StrView { ptr: (m.ident_ptr), len: (m.ident_len) as i64 }, lhs.right, op, val, t0.line, t0.col)
+    # (*e).f
+    if lhs.kind == ExprKind.Member and lv_is_paren_deref_at(p, at, lhs.left) == 1 and lv_field_is_ident(lhs) == 1
+        let d: *Expr = lhs.left
+        if op == OpKind.Unset
+            return stmt_assign_member(p, d.operand, StrView { ptr: (lhs.ident_ptr), len: (lhs.ident_len) as i64 }, val, t0.line, t0.col)
+        return stmt_compound_assign_member(p, d.operand, StrView { ptr: (lhs.ident_ptr), len: (lhs.ident_len) as i64 }, op, val, t0.line, t0.col, d.span.line, d.span.col)
+    # (*e).f[i]
+    if lv_plain_index(lhs) == 1 and lhs.left.kind == ExprKind.Member and lv_is_paren_deref_at(p, at, lhs.left.left) == 1 and lv_field_is_ident(lhs.left) == 1
+        let m: *Expr = lhs.left
+        let d: *Expr = m.left
+        if op == OpKind.Unset
+            return stmt_assign_member_index(p, d.operand, StrView { ptr: (m.ident_ptr), len: (m.ident_len) as i64 }, lhs.right, val, t0.line, t0.col)
+        return stmt_compound_assign_member_index(p, d.operand, StrView { ptr: (m.ident_ptr), len: (m.ident_len) as i64 }, lhs.right, op, val, t0.line, t0.col, d.span.line, d.span.col)
+    if op == OpKind.Unset
+        return stmt_assign_expr(p, lhs, val, lhs.span.line, lhs.span.col)
+    return stmt_compound_assign_expr(p, lhs, op, val, lhs.span.line, lhs.span.col)
+
+# Helper to convert compound assignment token to binary operator
+pub fn compound_tok_to_op(tok: i32) -> OpKind
+    if tok == TOK_PLUS_EQ
+        return OpKind.Add
+    if tok == TOK_MINUS_EQ
+        return OpKind.Sub
+    if tok == TOK_STAR_EQ
+        return OpKind.Mul
+    if tok == TOK_SLASH_EQ
+        return OpKind.Div
+    # LARB R63 (AGAST #3486): the _WRAP code; binary_set_op splits it.
+    if tok == TOK_PLUSPCT_EQ
+        return OpKind.AddWrap
+    if tok == TOK_MINUSPCT_EQ
+        return OpKind.SubWrap
+    if tok == TOK_STARPCT_EQ
+        return OpKind.MulWrap
+    return OpKind.Unset
+
+# Helper to check if token is a compound assignment operator
+pub fn is_compound_assign_tok(tok: i32) -> i32
+    if tok == TOK_PLUS_EQ
+        return 1
+    if tok == TOK_MINUS_EQ
+        return 1
+    if tok == TOK_STAR_EQ
+        return 1
+    if tok == TOK_SLASH_EQ
+        return 1
+    if tok == TOK_PLUSPCT_EQ
+        return 1
+    if tok == TOK_MINUSPCT_EQ
+        return 1
+    if tok == TOK_STARPCT_EQ
+        return 1
+    return 0
+
+pub fn stmt_link(first: *Stmt, rest: *Stmt) -> *Stmt
+    first.next = rest
+    return first
+
+# =============================================================================
+# Expression helpers
+# =============================================================================
+
+# pattern : NUMBER  →  PAT_INT_LIT.  Token text comes raw from the lexer; we
+# parse it into an i64 here so the action stays a single function call.
+pub fn pattern_lit_int(p: *Parser, start_sv: StrView) -> *MatchArm
+    var start: *u8 = start_sv.ptr
+    var len: i32 = start_sv.len as i32
+    return match_arm_int(p, parse_int(StrView { ptr: (start), len: (len) as i64 }))
+
+# pattern : CHAR  →  PAT_CHAR, its byte in pattern_int.  A char literal is u8
+# (§2.6), so its pattern is an integer literal pattern typed u8 (LANGUAGE_SPEC
+# §8.2, LARB R72, AGAST #4196): it compares as PAT_INT_LIT does, and only a u8
+# scrutinee takes it (match_check_reachable).
+pub fn pattern_char(p: *Parser, tok: Token) -> *MatchArm
+    let a: *MatchArm = match_arm_int(p, char_token_value(tok))
+    a.pattern_kind = PAT_CHAR
+    return a
+
+# pattern : TRUE | FALSE  →  PAT_BOOL.  A PAT_INT_LIT of 1 or 0 would not do:
+# a bool match must be covered by `true` and `false`, not by the integers they
+# lower to, and neither may stand on an integer scrutinee (AGAST #2344).
+pub fn pattern_bool(p: *Parser, val: i64, line: i32, col: i32) -> *MatchArm
+    let a: *MatchArm = match_arm_int(p, val)
+    a.pattern_kind = PAT_BOOL
+    a.bool_span.line = line
+    a.bool_span.col = col
+    return a
+
+# pattern : STRING  →  PAT_STR, holding the literal's cooked bytes, the ones a
+# "..." expression has, so an arm equals exactly the values it reads as.  It
+# compares a StrView scrutinee (LANGUAGE_SPEC §8.2, AGAST #1876).
+pub fn pattern_str(p: *Parser, tok: Token) -> *MatchArm
+    let a: *MatchArm = match_arm_int(p, 0)
+    a.pattern_kind = PAT_STR
+    a.pattern_name = tok.string_val as *u8
+    a.pattern_name_len = tok.string_len
+    return a
+
+# pattern : IDENT  →  PAT_WILDCARD if `_`, else PAT_IDENT.
+pub fn pattern_ident_or_wildcard(p: *Parser, name_sv: StrView) -> *MatchArm
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    if name_len == 1
+        if *name == '_'  # '_'
+            return match_arm_wildcard(p)
+    return match_arm_ident(p, StrView { ptr: (name), len: (name_len) as i64 })
+
+# pattern : IDENT, with where it is: a bare name binds unless the match finds
+# it tests, and a binding can't take a module value's name (AGAST #2407).
+pub fn pattern_ident_at(p: *Parser, name_sv: StrView, line: i32, col: i32) -> *MatchArm
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    let a: *MatchArm = pattern_ident_or_wildcard(p, StrView { ptr: (name), len: (name_len) as i64 })
+    if a.pattern_kind == PAT_IDENT
+        a.pattern_span.line = line
+        a.pattern_span.col = col
+    return a
+
+# Where an arm's pattern begins, kept for the error when the scrutinee's enum
+# declares no variant of that name (AGAST #2431).  Returns arm.
+pub fn pattern_head_at(arm: *MatchArm, line: i32, col: i32) -> *MatchArm
+    arm.head_span.line = line
+    arm.head_span.col = col
+    return arm
+
+# An or-pattern (AGAST #4450): `rest` is the alternatives after `first`, each
+# chained from the one before by or_next.  Returns first.
+pub fn pattern_or_link(first: *MatchArm, rest: *MatchArm) -> *MatchArm
+    first.or_next = rest
+    return first
+
+# The pattern after `pat` in arm order, every alternative of an or-pattern
+# counted (AGAST #4450); `arm` is `pat`'s arm, moved on when the walk leaves
+# it.  Start with both at the first arm; null at the end.
+pub fn arm_pattern_next(arm: **MatchArm, pat: *MatchArm) -> *MatchArm
+    if pat.or_next != null
+        return pat.or_next
+    let a: *MatchArm = *arm
+    *arm = a.next
+    a.next
+
+# `Q.N =>`: record Q (AGAST #2215), so emitter_match can tell `E.V` from `m.K`.
+pub fn pattern_qualified_by(arm: *MatchArm, start_sv: StrView) -> *MatchArm
+    var start: *u8 = start_sv.ptr
+    var len: i32 = start_sv.len as i32
+    arm.qualifier = start
+    arm.qualifier_len = len
+    return arm
+
+# match_arm action: arm_body returns an expr_pass for the `pass` keyword, the
+# expression otherwise.  A `pass` sets is_pass=1 with no body, and keeps only
+# its position (AGAST #2236); otherwise store the body expr.  Returns arm.
+pub fn match_arm_set_body_or_pass(arm: *MatchArm, body: *Expr) -> *MatchArm
+    if body.kind == ExprKind.IntLit and body.lit_kind == LIT_PASS
+        match_arm_set_body(arm, null as *Expr, 1)
+        arm.pass_span.line = body.span.line
+        arm.pass_span.col = body.span.col
+    else
+        match_arm_set_body(arm, body, 0)
+    return arm
+
+# postfix_op : '?'  →  POSTFIX_TRY.  apply_postfix_p wraps the running
+# postfix result in an ExprKind.Try node when it sees this op (AGAST #134).
+pub fn postfix_try_new(p: *Parser) -> *PostfixOp
+    let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
+    op.kind = POSTFIX_TRY
+    op.next = null
+    return op
+
+# postfix_op : '[' expr '..' expr ']'  →  POSTFIX_INDEX wrapping an
+# ExprKind.Range { lo, hi }.  Monomorph rewrites a String, Vec or Span slice
+# into `.slice(lo, hi)`; emit_expr_index refuses the rest (AGAST #2521).
+pub fn postfix_range_index(p: *Parser, lo: *Expr, hi: *Expr) -> *PostfixOp
+    let r: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    r.kind = ExprKind.Range
+    r.span = lo.span
+    r.left = lo
+    r.right = hi
+    r.next = null
+    return postfix_index(p, r, 0, 0)   # a slice's errors name the base
+
+# postfix_op : '[' expr '..=' expr ']'  →  `[lo..hi + 1]`, as ritz0 lowers it
+# (_emit_index).  ritz1 had no inclusive slice, so `v[1..=2]` didn't parse
+# (AGAST #2451).
+pub fn postfix_range_index_inclusive(p: *Parser, lo: *Expr, hi: *Expr) -> *PostfixOp
+    let one: *Expr = expr_int(p, 1, hi.span.line, hi.span.col)
+    return postfix_range_index(p, lo, expr_binary(p, OpKind.Add, hi, one))
+
+# postfix_op : '[' ':' expr ']'  →  `[0..hi]`, ritz0's colon slice with the
+# start left out (AGAST #3766).
+pub fn postfix_open_start_slice(p: *Parser, hi: *Expr) -> *PostfixOp
+    return postfix_range_index(p, expr_int(p, 0, hi.span.line, hi.span.col), hi)
+
+# postfix_op : '[' expr ':' ']'  →  `[lo..a.len()]` (AGAST #3766).  The end
+# needs the receiver, which isn't built yet: the range's `right` stays null
+# and apply_postfix_p fills it in.
+pub fn postfix_open_end_slice(p: *Parser, lo: *Expr) -> *PostfixOp
+    let r: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
+    r.kind = ExprKind.Range
+    r.span = lo.span
+    r.left = lo
+    r.right = null
+    r.next = null
+    return postfix_index(p, r, 0, 0)
+
+# for_stmt : FOR IDENT IN expr block  →  StmtKind.For with iter expression
+# stored in for_end (start = null sentinel).  emit_for handles the
+# Vec/Span/Range iteration shapes (ritz-task-84 — for-iterables).
+pub fn stmt_for_iter(p: *Parser, name_sv: StrView, iter: *Expr, body: *Stmt, line: i32, col: i32) -> *Stmt
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    # The iterable form stores the iterable in for_start with for_end=null;
+    # emit_for_iterable dispatches on for_end==null vs the range form's
+    # for_end!=null.  Swapping these (start=null, end=iter) produced the
+    # `store i64 %.0, ptr %.4` undefined-value crash because the range
+    # path's emit_expr(for_start=null) never wrote to %.0.
+    return stmt_for(p, StrView { ptr: (name), len: (name_len) as i64 }, iter, null as *Expr, body, line, col)
+
+# enum_def : ENUM ... { skip-and-return-zero }
+# Kept for grammar rules that record nothing (item_dispatch_enum does the
+# bookkeeping for a real enum_def, whose variants the enum_def actions build).
+pub fn enum_def_skip(p: *Parser) -> i32
+    return 0
+
+# enum_def's action: as enum_def_skip, latching `pub` for the enum just
+# parsed (its generated `from` is `pub` iff it is, LANGUAGE_SPEC §10.4).
+pub fn enum_def_end(p: *Parser, is_pub: i32) -> i32
+    tn_claim(p, p.ctx.tn_enum_params, null)   # AGAST #4021
+    p.ctx.tn_enum_params = null
+    let e: *EnumDef = enum_cur(p)
+    if e != null
+        e.is_pub = is_pub
+        # AGAST #4609: noted for type_twins.ritz, as structs are.
+        if p.skip_item == 0
+            type_note(p.tokens, p.pos, StrView { ptr: (e.name), len: (e.name_len) as i64 }, parse_file_copy_shared(p), 0, 1, TYPE_NOTE_ENUM)
+    return 0
+
+# ============================================================================
+# Enum declarations (AGAST #3994)
+# ============================================================================
+# When the parser sees `enum Shade ... Light ... Dark` it builds an EnumDef
+# (ast.ritz) whose EnumVariant list holds Light then Dark.  Those nodes are
+# the file's Module.enums; ctx.program_enums roots the merged program list once
+# imports have resolved (main.ritz), so downstream references like
+# `Shade.Light` still resolve to the variant's tag value (0, 1, ...).
+#
+# Lookup: enum_variant_index(enum_name, variant_name) returns index or -1.
+
+# The last EnumDef in a chain, or null.
+fn enum_list_tail(head: *EnumDef) -> *EnumDef
+    if head == null
+        return null
+    var cur: *EnumDef = head
+    while cur.next != null
+        cur = cur.next
+    cur
+
+# The enum this file started last (the one its variants append to), or null.
+pub fn enum_cur(p: *Parser) -> *EnumDef
+    if p.module == null
+        return null
+    enum_list_tail(p.module.enums)

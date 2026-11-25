@@ -1,6 +1,6 @@
 """Regression tests for AGAST #1649: ritz1 must allocate whole AST nodes.
 
-`monomorph.ritz` cloned every statement of every generic fn body into
+`monomorph.ritz` (now `mono_clone.ritz`) cloned every statement of every generic fn body into
 `malloc(160)` although `Stmt` is 192 bytes, and cloned expressions into
 `malloc(160)` / `malloc(96)` (the `sizeof(T)` argument), so cloning wrote
 past the end of the block.  The parser allocated `Expr` nodes with
@@ -66,7 +66,7 @@ def _copies_span(body: str, src: str, node: str) -> bool:
 
 def test_clone_stmt_copies_span():
     """A cloned statement keeps its source position."""
-    body = _fn_body((RITZ1_SRC / "monomorph.ritz").read_text(), "clone_stmt")
+    body = _fn_body((RITZ1_SRC / "mono_clone.ritz").read_text(), "clone_stmt")   # split from monomorph (AGAST #1818)
     assert _copies_span(body, "s", "Stmt"), (
         "clone_stmt does not copy s.span into the clone"
     )
@@ -74,7 +74,7 @@ def test_clone_stmt_copies_span():
 
 def test_clone_expr_copies_span():
     """A cloned expression keeps its source position (static half)."""
-    body = _fn_body((RITZ1_SRC / "monomorph.ritz").read_text(), "clone_expr")
+    body = _fn_body((RITZ1_SRC / "mono_clone.ritz").read_text(), "clone_expr")   # split from monomorph (AGAST #1818)
     assert _copies_span(body, "e", "Expr"), (
         "clone_expr does not copy e.span into the clone"
     )

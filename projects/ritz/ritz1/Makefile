@@ -26,6 +26,9 @@ SOURCES = \
 	types \
 	diag \
 	ast_helpers \
+	ast_expr_syntax \
+	ast_type_syntax \
+	ast_stmt_syntax \
 	ast_query \
 	async_ast \
 	async_lower \
@@ -35,10 +38,12 @@ SOURCES = \
 	struct_index \
 	struct_variants \
 	monomorph \
+	mono_clone \
 	impl_placement \
 	generic_infer \
 	emitter_core \
 	emitter_types \
+	emitter_abi \
 	emitter_ir \
 	frame_limit \
 	binder_check \
@@ -91,6 +96,7 @@ SOURCES = \
 	reachability \
 	emitter_asm \
 	emitter_stmt \
+	emitter_consts \
 	emitter \
 	iface_text \
 	fn_cache \

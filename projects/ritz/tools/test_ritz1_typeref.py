@@ -34,6 +34,8 @@ RITZ1 = TOOLS.parent / "ritz1"
 SRC = RITZ1 / "src"
 AST = SRC / "ast.ritz"
 AST_HELPERS = SRC / "ast_helpers.ritz"
+# ast_helpers `pub import`s the grammar actions split out of it (AGAST #1818).
+AST_ACTIONS = [AST_HELPERS] + [SRC / f"ast_{k}_syntax.ritz" for k in ("expr", "type", "stmt")]
 GRAMMAR = TOOLS.parent / "grammars" / "ritz1.grammar"
 PARSER_GEN = SRC / "parser_gen.ritz"
 TYPES = SRC / "types.ritz"
@@ -138,7 +140,7 @@ def test_stmt_and_param_carry_the_typeref():
         "ast.ritz: Stmt.var_ty is missing or not *TypeRef"
     assert re.search(r"param_ty\s*:\s*\*TypeRef", param_fields.get("param_ty", "")), \
         "ast.ritz: Param.param_ty is missing or not *TypeRef"
-    helpers = AST_HELPERS.read_text()
+    helpers = "\n".join(p.read_text() for p in AST_ACTIONS)
     assert re.search(r"^\s*s\.var_ty = tr\b", helpers, re.MULTILINE), \
         "ast_helpers.ritz: stmt_var_decl does not record Stmt.var_ty"
     assert re.search(r"^\s*param\.param_ty = ty\b", helpers, re.MULTILINE), \

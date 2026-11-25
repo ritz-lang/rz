@@ -133,6 +133,9 @@ an entry here, and every entry names a module that exists (`--check`).
 | `parser_gen` | Recursive-descent parser. Generated. |
 | `ast` | AST node structs (`Expr`, `Stmt`, `FnDef`, `StructDef`, `Module`, ...) and kind constants. |
 | `ast_helpers` | AST constructors the grammar's actions call, the parser arena, type-alias and array-length folding, and AST queries used everywhere downstream. Hand-written (see below). |
+| `ast_expr_syntax` | The grammar's expression actions: binary chains, casts, postfix, struct literals, numbers, match patterns, and the `TypeRef` the parser builds types into. Split from `ast_helpers` (AGAST #1818), which `pub import`s it. |
+| `ast_type_syntax` | The grammar's type actions: fn-pointer types, type aliases, array-literal lengths, generic instance sites, tuple types. Split from `ast_helpers` (AGAST #1818), which `pub import`s it. |
+| `ast_stmt_syntax` | The grammar's statement actions: inline assembly, lvalue assignment and the statement wrappers. Split from `ast_helpers` (AGAST #1818), which `pub import`s it. |
 | `ast_query` | Pure queries over the AST, the enum tables and the type table (`name_eq`, `find_field_index`, `user_enum_index`, `mem_builtin_id`, ...): no `EmitterState`, no Sema. Moved out of `emitter_core` by #3513 so Sema and the checks import no emitter module; `emitter_core` `pub import`s it. Also the data-only types the Sema checks type their places from (`LocalVar`, `OwnPath`, `ArrayDims`) and the pure helpers that fill them (array dims, local placement, struct pointer levels), moved there by #4319 and #4391. |
 | `types` | The one table of primitive type facts (AGAST #1889): LLVM spelling in memory and as a value, store size, alignment, bit width, signedness, Ritz name, name→kind. Struct/enum kinds answer "unknown"; the emitter's struct table sizes them. Also the one definition of the compiler-supplied `{ ptr, len }` view (AGAST #4545): `view_struct_new` builds it and `view_ptr_name` / `view_len_name` expose its field names, so the emitter's fallback, Sema's copy, monomorph's `Span<T>` template and `v[lo..hi]` lowering cannot drift. |
 | `diag` | Located diagnostics: one `<file>:<line>:<col>: error: <message>` line per error, and the input-file global (`diag_source_file`, #4319) that locates them. |
@@ -157,6 +160,7 @@ an entry here, and every entry names a module that exists (`--check`).
 |---|---|
 | `generic_infer` | Infers a generic call's type args from its arguments (LANGUAGE_SPEC §4.4). |
 | `monomorph` | Specialises generic fns, structs and impls per instantiation. |
+| `mono_clone` | Monomorphization's cloning: a generic fn, struct or impl method copied with its type parameters substituted. Nothing in `monomorph` calls it; `main` and the generic call sites import it (AGAST #1818). |
 | `struct_index` | `[]` on a struct through `Index` / `IndexMut` / `IndexSet` (§7.8). |
 
 **Checking phase (Sema)**
@@ -389,8 +393,10 @@ empty. A note that belongs to a move goes on that check's own entry.
 | Module | Responsibility |
 |---|---|
 | `emitter` | `emit_module`, `emit_fn`, impl methods; post-passes over the emitted IR text. |
+| `emitter_consts` | Module-level data: global initializers, integer const resolution, const arrays of struct literals, scalar struct consts. Split from `emitter` (AGAST #1818), which `pub import`s it. |
 | `emitter_core` | `EmitterState`, struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. Imports no emitter module above it (AGAST #1818), so it is outside the emitter import cycle: a fn that needs one belongs in `emitter_types`. |
 | `emitter_types` | What an expression's type, struct, pointee or element is, asked before it is emitted: the half of the old `emitter_core` that reaches up into method lookup (`emitter_expr_call`), index-through views (`index_through`), deref pointee names (`emitter_expr_arith`) or `emit_expr` for a spill (AGAST #1818). |
+| `emitter_abi` | How a struct or array crosses a call: sret returns and byval params (AGAST #1730, #1739, #2306, #3181), their attributes, and the deferred large-struct loads and copies. Above `emitter_core`, below the emitter modules (AGAST #1818). |
 | `emitter_ir` | Typed IR builders (casts, load/store, alloca, branches): the spelling of an instruction lives here, not at each site. A leaf module, so it stays out of the emitter import cycle (AGAST #1817). |
 | `emitter_expr` | `emit_expr` dispatch and struct literals. |
 | `emitter_expr_access`, `emitter_expr_arith`, `emitter_expr_call` | Identifiers/index/member; binary/unary; calls and methods. |
