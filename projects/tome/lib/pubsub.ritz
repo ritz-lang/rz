@@ -2,16 +2,12 @@
 #
 # Channel and pattern subscriptions and message publishing.
 
-import ritzlib.memory
-import ritzlib.hash
-import ritzlib.str
+import ritzlib.gvec
+import ritzlib.hashmap
+import ritzlib.option
 import ritzlib.string
 import ritzlib.strview
-import ritzlib.ptr
-import ritzlib.drop
-import ritzlib.sys
-import tome.store_types
-import tome.store
+import tome.pool
 
 # ============================================================================
 # Pub/Sub System
@@ -27,181 +23,73 @@ import tome.store
 # PUBLISH is binary-safe, so "c\0a" and "c\0b" are different channels and a
 # message with an embedded NUL reaches the callback whole (#4223).
 
-# A single subscriber entry in a channel's subscriber list
+# One subscriber of a channel
 struct Subscriber
     callback: fn(StrView, StrView, *u8) -> i32  # (channel, message, ctx)
-    context: *u8                          # User-provided context
-    next: *Subscriber                     # Next subscriber in list
+    context: *u8                          # User-provided context (opaque)
 
-# A channel entry in the channel hash table
-struct ChannelEntry
-    name: String                 # Channel name (owned)
-    subscribers: *Subscriber     # Linked list of subscribers
-    state: i32                   # 0=empty, 1=occupied, 2=tombstone
+# A channel and its subscribers, oldest first
+struct Channel
+    name: String                 # Channel name (owned; the index's key views it)
+    subscribers: Vec<Subscriber>
 
-# A pattern subscription entry
+fn channel_blank() -> Channel
+    Channel { name: string_new(), subscribers: vec_new<Subscriber>() }
+
+# A pattern subscription
 struct PatternEntry
     pattern: String              # Glob pattern (owned)
     callback: fn(StrView, StrView, *u8) -> i32
     context: *u8
-    next: *PatternEntry          # Next pattern in list
 
-# The Pub/Sub registry
+fn pattern_blank() -> PatternEntry
+    PatternEntry { pattern: string_new(), callback: null, context: null }
+
+# The Pub/Sub registry.  Dropping it releases every channel and pattern.
 struct PubSub
-    channels: *ChannelEntry      # Hash table of channels
-    channel_cap: i64             # Capacity
-    channel_len: i64             # Number of channels
-    channel_tombstones: i64      # Number of tombstones
-    patterns: *PatternEntry      # Linked list of pattern subscriptions
-    pattern_count: i64           # Number of pattern subscriptions
+    channels: Pool<Channel>
+    index: HashMap<StrView, i64>  # channel name -> slot in channels
+    patterns: Pool<PatternEntry>
 
 # ============================================================================
-# Pub/Sub Constructor and Destructor
+# Pub/Sub Constructor
 # ============================================================================
 
 pub fn pubsub_new() -> PubSub
-    var ps: PubSub
-    ps.channel_cap = 16
-    ps.channel_len = 0
-    ps.channel_tombstones = 0
-    let size: i64 = ps.channel_cap * sizeof(ChannelEntry)
-    ps.channels = malloc(size) as *ChannelEntry
-    for i in 0..ps.channel_cap
-        let entry: *ChannelEntry = ps.channels + i
-        entry.state = 0
-    ps.patterns = null
-    ps.pattern_count = 0
-    return ps
-
-pub fn pubsub_drop(ps: @&PubSub)
-    # Free all channels and their subscribers
-    if ps.channels != null
-        for i in 0..ps.channel_cap
-            let entry: *ChannelEntry = ps.channels + i
-            if entry.state == 1
-                (entry.name).deinit()
-                # Free subscriber list
-                var sub: *Subscriber = entry.subscribers
-                while sub != null
-                    let next: *Subscriber = sub.next
-                    free(sub as *u8)
-                    sub = next
-        free(ps.channels as *u8)
-    ps.channels = null
-
-    # Free all pattern subscriptions
-    var pat: *PatternEntry = ps.patterns
-    while pat != null
-        let next: *PatternEntry = pat.next
-        (pat.pattern).deinit()
-        free(pat as *u8)
-        pat = next
-    ps.patterns = null
+    PubSub {
+        channels: pool_new<Channel>(channel_blank),
+        index: hashmap_new<StrView, i64>(),
+        patterns: pool_new<PatternEntry>(pattern_blank)
+    }
 
 # ============================================================================
 # Channel Operations
 # ============================================================================
 
-# Grow the channel hash table
-fn pubsub_grow_channels(ps: @&PubSub)
-    let old_channels: *ChannelEntry = ps.channels
-    let old_cap: i64 = ps.channel_cap
+# The channel's slot, made (with no subscribers) if it is new.
+fn pubsub_get_or_create_channel(ps: @&PubSub, channel: StrView) -> i64
+    match ps.index.get(channel)
+        Some(slot) => return slot
+        None => pass
+    let slot: i64 = ps.channels.insert(Channel { name: string_from_strview(channel), subscribers: vec_new<Subscriber>() })
+    ps.index.insert((ps.channels.get(slot).name).as_view(), slot)
+    return slot
 
-    ps.channel_cap = old_cap * 2
-    ps.channel_len = 0
-    ps.channel_tombstones = 0
-    let size: i64 = ps.channel_cap * sizeof(ChannelEntry)
-    ps.channels = malloc(size) as *ChannelEntry
-    for i in 0..ps.channel_cap
-        let entry: *ChannelEntry = ps.channels + i
-        entry.state = 0
+# The index in subs of the subscriber (callback, context), or -1.
+fn subscriber_find(subs: @Vec<Subscriber>, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i64
+    for i in 0..subs.len()
+        let sub: Subscriber = subs.get(i)
+        if sub.callback == callback && sub.context == context
+            return i
+    return -1
 
-    # Rehash existing entries
-    for i in 0..old_cap
-        let old: *ChannelEntry = old_channels + i
-        if old.state == 1
-            let h: u64 = (old.name).hash()
-            let mask: i64 = ps.channel_cap - 1
-            var idx: i64 = (h as i64) & mask
-            var j: i64 = 0
-            while j < ps.channel_cap
-                let entry: *ChannelEntry = ps.channels + idx
-                if entry.state == 0
-                    entry.name = ptr_read<String>(@old.name)
-                    entry.subscribers = old.subscribers
-                    entry.state = 1
-                    ps.channel_len += 1
-                    break
-                idx = (idx + 1) & mask
-                j += 1
-
-    free(old_channels as *u8)
-
-# Get or create a channel entry
-fn pubsub_get_or_create_channel(ps: @&PubSub, channel: StrView) -> *ChannelEntry
-    # Check load factor
-    let load: i64 = (ps.channel_len + ps.channel_tombstones + 1) * 100 / ps.channel_cap
-    if load > 75
-        pubsub_grow_channels(ps)
-
-    let h: u64 = hash_strview(channel)
-    let mask: i64 = ps.channel_cap - 1
-    var idx: i64 = (h as i64) & mask
-    var first_tombstone: i64 = -1
-    var i: i64 = 0
-
-    while i < ps.channel_cap
-        let entry: *ChannelEntry = ps.channels + idx
-
-        if entry.state == 0  # Empty - insert here
-            var insert_idx: i64 = idx
-            if first_tombstone >= 0
-                insert_idx = first_tombstone
-                ps.channel_tombstones -= 1
-            let target: *ChannelEntry = ps.channels + insert_idx
-            target.name = string_from_strview(channel)
-            target.subscribers = null
-            target.state = 1
-            ps.channel_len += 1
-            return target
-
-        if entry.state == 2  # Tombstone
-            if first_tombstone < 0
-                first_tombstone = idx
-
-        if entry.state == 1  # Occupied
-            if (entry.name).eq_strview(channel)
-                return entry
-
-        idx = (idx + 1) & mask
-        i += 1
-
-    return null
-
-# Find a channel (don't create)
-fn pubsub_find_channel(ps: @PubSub, channel: StrView) -> *ChannelEntry
-    if ps.channel_len == 0
-        return null
-
-    let h: u64 = hash_strview(channel)
-    let mask: i64 = ps.channel_cap - 1
-    var idx: i64 = (h as i64) & mask
-    var i: i64 = 0
-
-    while i < ps.channel_cap
-        let entry: *ChannelEntry = ps.channels + idx
-
-        if entry.state == 0
-            return null
-
-        if entry.state == 1
-            if (entry.name).eq_strview(channel)
-                return entry
-
-        idx = (idx + 1) & mask
-        i += 1
-
-    return null
+# Remove subs[i], keeping the others in order.
+fn subscriber_remove(subs: @&Vec<Subscriber>, i: i64)
+    var j: i64 = i
+    while j + 1 < subs.len()
+        subs.set(j, subs.get(j + 1))
+        j += 1
+    subs.pop()
 
 # ============================================================================
 # Subscribe Operations
@@ -209,91 +97,52 @@ fn pubsub_find_channel(ps: @PubSub, channel: StrView) -> *ChannelEntry
 
 # Subscribe to a channel with a callback
 pub fn pubsub_subscribe(ps: @&PubSub, channel: StrView, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i32
-    let entry: *ChannelEntry = pubsub_get_or_create_channel(ps, channel)
-    if entry == null
-        return -1
-
-    # Check if already subscribed (same callback + context)
-    var sub: *Subscriber = entry.subscribers
-    while sub != null
-        if sub.callback == callback && sub.context == context
-            return 0  # Already subscribed
-        sub = sub.next
-
-    # Add new subscriber at head
-    let new_sub: *Subscriber = malloc(sizeof(Subscriber)) as *Subscriber
-    new_sub.callback = callback
-    new_sub.context = context
-    new_sub.next = entry.subscribers
-    entry.subscribers = new_sub
+    let slot: i64 = pubsub_get_or_create_channel(ps, channel)
+    let ch: @&Channel = ps.channels.at(slot)
+    if subscriber_find(@ch.subscribers, callback, context) >= 0
+        return 0  # Already subscribed
+    ch.subscribers.push(Subscriber { callback: callback, context: context })
     return 1
 
 # Unsubscribe from a channel
 pub fn pubsub_unsubscribe(ps: @&PubSub, channel: StrView, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i32
-    let entry: *ChannelEntry = pubsub_find_channel(ps, channel)
-    if entry == null
+    let slot: i64 = match ps.index.get(channel)
+        Some(sl) => sl
+        None => return 0
+    let ch: @&Channel = ps.channels.at(slot)
+    let i: i64 = subscriber_find(@ch.subscribers, callback, context)
+    if i < 0
         return 0
-
-    var prev: *Subscriber = null
-    var sub: *Subscriber = entry.subscribers
-    while sub != null
-        if sub.callback == callback && sub.context == context
-            # Remove from list
-            if prev == null
-                entry.subscribers = sub.next
-            else
-                prev.next = sub.next
-            free(sub as *u8)
-            return 1
-        prev = sub
-        sub = sub.next
-
-    return 0
+    subscriber_remove(@&ch.subscribers, i)
+    return 1
 
 # ============================================================================
 # Pattern Subscribe Operations
 # ============================================================================
 
+# The slot of the subscription (pattern, callback, context), or -1.
+fn pubsub_find_pattern(ps: @PubSub, pattern: StrView, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i64
+    for i in 0..ps.patterns.slots()
+        if ps.patterns.is_live(i)
+            let pat: @PatternEntry = ps.patterns.get(i)
+            if (pat.pattern).eq_strview(pattern) && pat.callback == callback && pat.context == context
+                return i
+    return -1
+
 # Subscribe to a pattern (glob-style)
 pub fn pubsub_psubscribe(ps: @&PubSub, pattern: StrView, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i32
-    # Check if already subscribed
-    var pat: *PatternEntry = ps.patterns
-    while pat != null
-        if (pat.pattern).eq_strview(pattern)
-            if pat.callback == callback && pat.context == context
-                return 0  # Already subscribed
-        pat = pat.next
-
-    # Add new pattern at head
-    let new_pat: *PatternEntry = malloc(sizeof(PatternEntry)) as *PatternEntry
-    new_pat.pattern = string_from_strview(pattern)
-    new_pat.callback = callback
-    new_pat.context = context
-    new_pat.next = ps.patterns
-    ps.patterns = new_pat
-    ps.pattern_count += 1
+    if pubsub_find_pattern(ps, pattern, callback, context) >= 0
+        return 0  # Already subscribed
+    ps.patterns.insert(PatternEntry { pattern: string_from_strview(pattern), callback: callback, context: context })
     return 1
 
 # Unsubscribe from a pattern
 pub fn pubsub_punsubscribe(ps: @&PubSub, pattern: StrView, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i32
-    var prev: *PatternEntry = null
-    var pat: *PatternEntry = ps.patterns
-    while pat != null
-        if (pat.pattern).eq_strview(pattern)
-            if pat.callback == callback && pat.context == context
-                # Remove from list
-                if prev == null
-                    ps.patterns = pat.next
-                else
-                    prev.next = pat.next
-                (pat.pattern).deinit()
-                free(pat as *u8)
-                ps.pattern_count -= 1
-                return 1
-        prev = pat
-        pat = pat.next
-
-    return 0
+    let i: i64 = pubsub_find_pattern(ps, pattern, callback, context)
+    if i < 0
+        return 0
+    ps.patterns.remove(i)
+    return 1
 
 # ============================================================================
 # Pattern Matching (glob-style)
@@ -344,55 +193,31 @@ fn tome_glob_match(pattern: StrView, str: StrView) -> i32
 pub fn pubsub_publish(ps: @&PubSub, channel: StrView, message: StrView) -> i64
     var count: i64 = 0
 
-    # Direct channel subscribers
-    let entry: *ChannelEntry = pubsub_find_channel(ps, channel)
-    if entry != null
-        var prev: *Subscriber = null
-        var sub: *Subscriber = entry.subscribers
-        while sub != null
-            let cb: fn(StrView, StrView, *u8) -> i32 = sub.callback
-            let result: i32 = cb(channel, message, sub.context)
-            count += 1
-
-            if result != 0
-                # Subscriber wants to unsubscribe
-                let next: *Subscriber = sub.next
-                if prev == null
-                    entry.subscribers = next
-                else
-                    prev.next = next
-                free(sub as *u8)
-                sub = next
-            else
-                prev = sub
-                sub = sub.next
+    # Direct channel subscribers, newest first
+    match ps.index.get(channel)
+        Some(slot) =>
+            let subs: @&Vec<Subscriber> = @&ps.channels.at(slot).subscribers
+            var i: i64 = subs.len() - 1
+            while i >= 0
+                let sub: Subscriber = subs.get(i)
+                let cb: fn(StrView, StrView, *u8) -> i32 = sub.callback
+                count += 1
+                if cb(channel, message, sub.context) != 0
+                    # Subscriber wants to unsubscribe
+                    subscriber_remove(subs, i)
+                i -= 1
+        None => pass
 
     # Pattern subscribers
-    var prev_pat: *PatternEntry = null
-    var pat: *PatternEntry = ps.patterns
-    while pat != null
-        if tome_glob_match((pat.pattern).as_view(), channel) == 1
-            let pcb: fn(StrView, StrView, *u8) -> i32 = pat.callback
-            let result: i32 = pcb(channel, message, pat.context)
-            count += 1
-
-            if result != 0
-                # Subscriber wants to unsubscribe
-                let next: *PatternEntry = pat.next
-                if prev_pat == null
-                    ps.patterns = next
-                else
-                    prev_pat.next = next
-                (pat.pattern).deinit()
-                free(pat as *u8)
-                ps.pattern_count -= 1
-                pat = next
-            else
-                prev_pat = pat
-                pat = pat.next
-        else
-            prev_pat = pat
-            pat = pat.next
+    for i in 0..ps.patterns.slots()
+        if ps.patterns.is_live(i)
+            let pat: @PatternEntry = ps.patterns.get(i)
+            if tome_glob_match((pat.pattern).as_view(), channel) == 1
+                let pcb: fn(StrView, StrView, *u8) -> i32 = pat.callback
+                count += 1
+                if pcb(channel, message, pat.context) != 0
+                    # Subscriber wants to unsubscribe
+                    ps.patterns.remove(i)
 
     return count
 
@@ -402,47 +227,21 @@ pub fn pubsub_publish(ps: @&PubSub, channel: StrView, message: StrView) -> i64
 
 # Get count of subscribers to a specific channel
 pub fn pubsub_numsub(ps: @PubSub, channel: StrView) -> i64
-    let entry: *ChannelEntry = pubsub_find_channel(ps, channel)
-    if entry == null
-        return 0
-
-    var count: i64 = 0
-    var sub: *Subscriber = entry.subscribers
-    while sub != null
-        count += 1
-        sub = sub.next
-    return count
+    match ps.index.get(channel)
+        Some(slot) => return ps.channels.get(slot).subscribers.len()
+        None => return 0
 
 # Get count of pattern subscriptions
 pub fn pubsub_numpat(ps: @PubSub) -> i64
-    return ps.pattern_count
+    return ps.patterns.len()
 
-# Get list of channels with subscribers: a malloc'd array of `*out_count`
-# views borrowing the registry's names (lengths kept; free the array only).
-pub fn pubsub_channels(ps: @PubSub, out_count: @&i64) -> *StrView
-    *out_count = 0
-    if ps.channel_len == 0
-        return null
-
-    # Count channels with actual subscribers
-    var active: i64 = 0
-    for i in 0..ps.channel_cap
-        let entry: *ChannelEntry = ps.channels + i
-        if entry.state == 1 && entry.subscribers != null
-            active += 1
-
-    if active == 0
-        return null
-
-    let arr: *StrView = malloc(active * sizeof(StrView)) as *StrView
-    var j: i64 = 0
-    for i in 0..ps.channel_cap
-        let entry: *ChannelEntry = ps.channels + i
-        if entry.state == 1 && entry.subscribers != null
-            *(arr + j) = (entry.name).as_view()
-            j += 1
-            if j >= active
-                break
-
-    *out_count = j
-    return arr
+# The channels with subscribers, borrowing the registry's names (lengths
+# kept).
+pub fn pubsub_channels(ps: @PubSub) -> Vec<StrView>
+    var names: Vec<StrView> = vec_new<StrView>()
+    for i in 0..ps.channels.slots()
+        if ps.channels.is_live(i)
+            let ch: @Channel = ps.channels.get(i)
+            if ch.subscribers.len() > 0
+                names.push((ch.name).as_view())
+    return names

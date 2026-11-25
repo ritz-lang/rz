@@ -17,7 +17,6 @@
 import ritzlib.ct
 import ritzlib.fmt.digits
 import ritzlib.gvec
-import ritzlib.memory
 import ritzlib.option
 import ritzlib.span
 import ritzlib.str
@@ -46,38 +45,35 @@ const CMD_ERR_UNKNOWN: i32 = -4 # Unknown command
 
 struct CommandContext
     store: *Store
-    resp_buf: *u8       # Response output buffer
+    resp_buf: [u8]      # Response output buffer (its len is the capacity)
     resp_len: i32       # Length of response written
-    resp_cap: i32       # Capacity of buffer
     password: Option<StrView>  # Required password (None = no auth required)
     is_authenticated: i32   # 1 if client is authenticated, 0 otherwise
-    overflow: i32       # 1 if the reply did not fit resp_cap (see ctx_too_large)
+    overflow: i32       # 1 if the reply did not fit resp_buf (see ctx_too_large)
 
 
 # Initialize command context (no auth - backwards compatible)
-pub fn cmd_ctx_init(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32)
+pub fn cmd_ctx_init(ctx: *CommandContext, store: *Store, buf: [u8])
     ctx.store = store
     ctx.resp_buf = buf
     ctx.resp_len = 0
-    ctx.resp_cap = cap
     ctx.password = None
     ctx.is_authenticated = 1  # No auth required = already authenticated
     ctx.overflow = 0
 
 
 # Initialize command context with authentication
-pub fn cmd_ctx_init_auth(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32, password: Option<StrView>, is_authenticated: i32)
+pub fn cmd_ctx_init_auth(ctx: *CommandContext, store: *Store, buf: [u8], password: Option<StrView>, is_authenticated: i32)
     ctx.store = store
     ctx.resp_buf = buf
     ctx.resp_len = 0
-    ctx.resp_cap = cap
     ctx.password = password
     ctx.is_authenticated = is_authenticated
     ctx.overflow = 0
 
 
 # Every reply goes through these helpers, and each one checks that the
-# whole reply fits resp_cap before writing a byte of it (AGAST #3068: list
+# whole reply fits resp_buf before writing a byte of it (AGAST #3068: list
 # replies such as SMEMBERS had no bound and ran off the end of the buffer).
 # A reply that does not fit becomes ctx_too_large's error instead.
 
@@ -86,7 +82,7 @@ pub fn cmd_ctx_init_auth(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32
 const RESP_FRAME_OVERHEAD: i64 = 26
 
 fn ctx_fits(ctx: *CommandContext, payload: i64) -> bool
-    return payload + RESP_FRAME_OVERHEAD <= ctx.resp_cap as i64
+    return payload + RESP_FRAME_OVERHEAD <= ctx.resp_buf.len
 
 # Answer "-ERR reply too large" and flag the overflow.  A session that has
 # other replies queued uses the flag to retry the command once they are
@@ -137,23 +133,21 @@ fn ctx_write_null_array(ctx: *CommandContext)
         return
     ctx.resp_len = resp_write_null_array(ctx.resp_buf)
 
-# Write an array of `count` bulk strings, each its view's whole (ptr, len),
-# embedded NULs included (AGAST #4210), then free the `items` array (the
-# bytes are borrowed).  The size of the whole reply is checked before
-# anything is written.
-fn ctx_write_bulk_array(ctx: *CommandContext, items: *StrView, count: i64)
+# Write an array of bulk strings, each its view's whole (ptr, len),
+# embedded NULs included (AGAST #4210).  The size of the whole reply is
+# checked before anything is written.
+fn ctx_write_bulk_array(ctx: *CommandContext, items: @Vec<StrView>)
+    let count: i64 = items.len()
     var need: i64 = RESP_FRAME_OVERHEAD
     for i in 0..count
-        need += items[i].len + RESP_FRAME_OVERHEAD
-    if need > ctx.resp_cap as i64
+        need += items.get(i).len + RESP_FRAME_OVERHEAD
+    if need > ctx.resp_buf.len
         ctx_too_large(ctx)
-    else
-        var pos: i32 = resp_write_array(ctx.resp_buf, count)
-        for i in 0..count
-            pos += resp_write_bulk(ctx.resp_buf + pos, items[i])
-        ctx.resp_len = pos
-    if items != null
-        free(items as *u8)
+        return
+    var pos: i32 = resp_write_array(ctx.resp_buf, count)
+    for i in 0..count
+        pos += resp_write_bulk(ctx.resp_buf.from(pos as i64), items.get(i))
+    ctx.resp_len = pos
 
 
 # ============================================================================
@@ -543,10 +537,8 @@ fn cmd_lrange(ctx: *CommandContext, cmd: *RespCommand) -> i32
         ctx_write_error(ctx, notint2)
         return CMD_ERR_SYNTAX
 
-    var count: i64 = 0
-    let results: *StrView = store_lrange(ctx.store, key_sv, start, stop, @&count)
-
-    ctx_write_bulk_array(ctx, results, count)
+    let results: Vec<StrView> = store_lrange(ctx.store, key_sv, start, stop)
+    ctx_write_bulk_array(ctx, @results)
     return CMD_OK
 
 
@@ -648,10 +640,8 @@ fn cmd_smembers(ctx: *CommandContext, cmd: *RespCommand) -> i32
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
 
-    var count: i64 = 0
-    let results: *StrView = store_smembers(ctx.store, key_sv, @&count)
-
-    ctx_write_bulk_array(ctx, results, count)
+    let results: Vec<StrView> = store_smembers(ctx.store, key_sv)
+    ctx_write_bulk_array(ctx, @results)
     return CMD_OK
 
 
@@ -775,10 +765,8 @@ fn cmd_hkeys(ctx: *CommandContext, cmd: *RespCommand) -> i32
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
 
-    var count: i64 = 0
-    let results: *StrView = store_hkeys(ctx.store, key_sv, @&count)
-
-    ctx_write_bulk_array(ctx, results, count)
+    let results: Vec<StrView> = store_hkeys(ctx.store, key_sv)
+    ctx_write_bulk_array(ctx, @results)
     return CMD_OK
 
 
@@ -791,10 +779,8 @@ fn cmd_hvals(ctx: *CommandContext, cmd: *RespCommand) -> i32
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
 
-    var count: i64 = 0
-    let results: *StrView = store_hvals(ctx.store, key_sv, @&count)
-
-    ctx_write_bulk_array(ctx, results, count)
+    let results: Vec<StrView> = store_hvals(ctx.store, key_sv)
+    ctx_write_bulk_array(ctx, @results)
     return CMD_OK
 
 
@@ -807,11 +793,9 @@ fn cmd_hgetall(ctx: *CommandContext, cmd: *RespCommand) -> i32
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
 
-    var count: i64 = 0
     # store_hgetall returns interleaved key,val,key,val...
-    let results: *StrView = store_hgetall(ctx.store, key_sv, @&count)
-
-    ctx_write_bulk_array(ctx, results, count)
+    let results: Vec<StrView> = store_hgetall(ctx.store, key_sv)
+    ctx_write_bulk_array(ctx, @results)
     return CMD_OK
 
 
@@ -954,9 +938,8 @@ fn zadd_apply(ctx: *CommandContext, cmd: *RespCommand, scoreidx: i32, flags: i32
         if processed == 0
             ctx_write_null(ctx)
         else
-            var digits: [32]u8
-            let n: i64 = score_format(newscore, @digits[0])
-            ctx_write_bulk(ctx, strview_from_ptr(@digits[0], n))
+            var digits: [SCORE_FMT_MAX]u8
+            ctx_write_bulk(ctx, score_format(newscore, @digits))
         return CMD_OK
     if ch
         ctx_write_int(ctx, added + updated)
@@ -1028,9 +1011,8 @@ fn cmd_zscore(ctx: *CommandContext, cmd: *RespCommand) -> i32
         ctx_write_null(ctx)
         return CMD_OK
 
-    var digits: [32]u8
-    let n: i64 = score_format(score, @digits[0])
-    ctx_write_bulk(ctx, strview_from_ptr(@digits[0], n))
+    var digits: [SCORE_FMT_MAX]u8
+    ctx_write_bulk(ctx, score_format(score, @digits))
     return CMD_OK
 
 
@@ -1073,14 +1055,14 @@ fn cmd_zrank(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: StrView) 
 
     var score: f64 = 0.0
     store_zscore(ctx.store, key_sv, member_sv, @&score)
-    var digits: [32]u8
-    let n: i64 = score_format(score, @digits[0])
-    if not ctx_fits(ctx, n + 2 * RESP_FRAME_OVERHEAD)
+    var digits: [SCORE_FMT_MAX]u8
+    let text: StrView = score_format(score, @digits)
+    if not ctx_fits(ctx, text.len + 2 * RESP_FRAME_OVERHEAD)
         ctx_too_large(ctx)
         return CMD_OK
     var pos: i32 = resp_write_array(ctx.resp_buf, 2)
-    pos += resp_write_i64(ctx.resp_buf + pos, rank)
-    pos += resp_write_bulk(ctx.resp_buf + pos, strview_from_ptr(@digits[0], n))
+    pos += resp_write_i64(ctx.resp_buf.from(pos as i64), rank)
+    pos += resp_write_bulk(ctx.resp_buf.from(pos as i64), text)
     ctx.resp_len = pos
     return CMD_OK
 
@@ -1104,8 +1086,8 @@ fn cmd_zcard(ctx: *CommandContext, cmd: *RespCommand) -> i32
 # when `withscores`.  A score's text is formatted into a stack buffer as it
 # is written (once while sizing the reply, once while writing it), so the
 # reply needs no scratch allocation.  `items` is borrowed.
-fn ctx_write_zitems(ctx: *CommandContext, items: Span<ZItem>, withscores: bool)
-    let count: i64 = items.len
+fn ctx_write_zitems(ctx: *CommandContext, items: @Vec<ZItem>, withscores: bool)
+    let count: i64 = items.len()
     var n: i64 = count
     if withscores
         n = 2 * count
@@ -1115,17 +1097,16 @@ fn ctx_write_zitems(ctx: *CommandContext, items: Span<ZItem>, withscores: bool)
         let it: ZItem = items.get(i)
         need += it.member.len + RESP_FRAME_OVERHEAD
         if withscores
-            need += score_format(it.score, @digits[0]) + RESP_FRAME_OVERHEAD
-    if need > ctx.resp_cap as i64
+            need += score_format(it.score, @digits).len + RESP_FRAME_OVERHEAD
+    if need > ctx.resp_buf.len
         ctx_too_large(ctx)
         return
     var pos: i32 = resp_write_array(ctx.resp_buf, n)
     for i in 0..count
         let it: ZItem = items.get(i)
-        pos += resp_write_bulk(ctx.resp_buf + pos, it.member)
+        pos += resp_write_bulk(ctx.resp_buf.from(pos as i64), it.member)
         if withscores
-            let len: i64 = score_format(it.score, @digits[0])
-            pos += resp_write_bulk(ctx.resp_buf + pos, strview_from_ptr(@digits[0], len))
+            pos += resp_write_bulk(ctx.resp_buf.from(pos as i64), score_format(it.score, @digits))
     ctx.resp_len = pos
 
 
@@ -1146,12 +1127,13 @@ fn parse_score_bound(arg: *RespArg, out: *f64, excl: *bool) -> bool
 # "[member" (inclusive) or "(member" (exclusive).  The member is borrowed
 # from the argument.
 fn parse_lex_bound(arg: *RespArg, b: *ZLexBound) -> bool
-    if arg.len < 1
+    let text: StrView = resp_arg_sv(arg)
+    if text.len < 1
         return false
-    let c: u8 = *arg.data
+    let c: u8 = text.get(0)
     b.excl = false
     if c == 43 or c == 45                   # '+' '-'
-        if arg.len != 1
+        if text.len != 1
             return false
         if c == 43
             b.kind = ZLEX_POS_INF
@@ -1226,11 +1208,8 @@ fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direct
         return CMD_ERR_TYPE
 
     if rangetype != ZRANGE_RANK
-        var count: i64 = 0
-        let items: *ZItem = store_zrange_spec(ctx.store, key_sv, @spec, rev, opts.offset, opts.limit, @&count)
-        ctx_write_zitems(ctx, span_from_ptr<ZItem>(items, count), opts.withscores)
-        if items != null
-            free(items as *u8)
+        let items: Vec<ZItem> = store_zrange_spec(ctx.store, key_sv, @spec, rev, opts.offset, opts.limit)
+        ctx_write_zitems(ctx, @items, opts.withscores)
         return CMD_OK
 
     cmd_zrange_by_rank(ctx, key_sv, start, stop, rev, opts.withscores)
@@ -1324,25 +1303,18 @@ fn cmd_zrange_bounds(ctx: *CommandContext, cmd: *RespCommand, rangetype: i32, re
 # A rank range's reply: the members from start to stop (from the end when
 # reversed), each with its score looked up when WITHSCORES asks.
 fn cmd_zrange_by_rank(ctx: *CommandContext, key_sv: StrView, start: i64, stop: i64, rev: bool, withscores: bool)
-    var count: i64 = 0
-    var members: *StrView = null
+    var members: Vec<StrView> = vec_new<StrView>()
     if rev
-        members = store_zrevrange(ctx.store, key_sv, start, stop, @&count)
+        members = store_zrevrange(ctx.store, key_sv, start, stop)
     else
-        members = store_zrange(ctx.store, key_sv, start, stop, @&count)
-    var items: Vec<ZItem> = vec_with_cap<ZItem>(count)
-    for i in 0..count
-        var item: ZItem
-        item.member = members[i]
-        item.score = 0.0
+        members = store_zrange(ctx.store, key_sv, start, stop)
+    var items: Vec<ZItem> = vec_with_cap<ZItem>(members.len())
+    for i in 0..members.len()
+        var score: f64 = 0.0
         if withscores
-            var score: f64 = 0.0
-            store_zscore(ctx.store, key_sv, members[i], @&score)
-            item.score = score
-        items.push(item)
-    if members != null
-        free(members as *u8)
-    ctx_write_zitems(ctx, span_from_vec<ZItem>(@items), withscores)
+            store_zscore(ctx.store, key_sv, members.get(i), @&score)
+        items.push(ZItem { member: members.get(i), score: score })
+    ctx_write_zitems(ctx, @items, withscores)
 
 
 # ZCOUNT key min max: the number of members whose score is in [min, max]

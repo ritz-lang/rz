@@ -1,0 +1,109 @@
+# test/test_pool.ritz - Pool<T>: stable slots, free-list reuse, drops
+
+import ritzlib.gvec
+import ritzlib.string
+import ritzlib.strview
+import lib.pool
+
+# A value that counts its drops.  id 0 is the blank: it owns nothing, so its
+# drop is not counted.
+var g_drops: i64 = 0
+
+struct Tracked
+    id: i64
+
+impl Drop for Tracked
+    fn drop(self: @&Tracked)
+        if self.id != 0
+            g_drops += 1
+
+fn tracked_blank() -> Tracked
+    Tracked { id: 0 }
+
+[[test]]
+fn test_pool_insert_and_get() -> i32
+    var p: Pool<String> = pool_new<String>(string_new)
+    let a: i64 = p.insert(string_from("a"))
+    let b: i64 = p.insert(string_from("b"))
+    if a == b or p.len() != 2 or p.slots() != 2
+        return 1
+    if not p.get(a).eq("a") or not p.get(b).eq("b")
+        return 2
+    p.at(b).push_str("c")
+    if not p.get(b).eq("bc")
+        return 3
+    return 0
+
+# Slots keep their values across growth of the underlying Vec.
+[[test]]
+fn test_pool_grow_keeps_slots() -> i32
+    var p: Pool<String> = pool_new<String>(string_new)
+    var name: String = string_from("k0")
+    for i in 0..200
+        name.set_char(1, (48 + i % 10) as u8)
+        if p.insert(string_from(name.as_view())) != i
+            return 1
+    if p.len() != 200
+        return 2
+    for i in 0..200
+        if p.get(i).get(1) != (48 + i % 10) as u8
+            return 3
+    return 0
+
+# take moves the value out; the freed slot is the next insert's.
+[[test]]
+fn test_pool_take_and_reuse() -> i32
+    var p: Pool<String> = pool_new<String>(string_new)
+    let a: i64 = p.insert(string_from("a"))
+    let b: i64 = p.insert(string_from("b"))
+    let c: i64 = p.insert(string_from("c"))
+    let got: String = p.take(b)
+    if not got.eq("b")
+        return 1
+    if p.is_live(b) or p.len() != 2
+        return 2
+    p.remove(a)
+    # Last freed, first reused; no new slot while one is free.
+    if p.insert(string_from("x")) != a
+        return 3
+    if p.insert(string_from("y")) != b
+        return 4
+    if p.slots() != 3 or p.len() != 3
+        return 5
+    if not p.get(c).eq("c") or not p.get(a).eq("x") or not p.get(b).eq("y")
+        return 6
+    return 0
+
+# remove drops the value at once; the pool's drop drops every live value,
+# each once, and never a free slot's blank.
+[[test]]
+fn test_pool_drops_values() -> i32
+    g_drops = 0
+    if true
+        var p: Pool<Tracked> = pool_new<Tracked>(tracked_blank)
+        p.insert(Tracked { id: 1 })
+        let two: i64 = p.insert(Tracked { id: 2 })
+        p.insert(Tracked { id: 3 })
+        p.remove(two)
+        if g_drops != 1
+            return 1
+        p.insert(Tracked { id: 4 })
+        if g_drops != 1
+            return 2
+    if g_drops != 4
+        return 3
+    return 0
+
+# clear drops everything and starts the slots again from 0.
+[[test]]
+fn test_pool_clear() -> i32
+    g_drops = 0
+    var p: Pool<Tracked> = pool_new<Tracked>(tracked_blank)
+    p.insert(Tracked { id: 1 })
+    p.insert(Tracked { id: 2 })
+    p.clear()
+    if g_drops != 2 or p.len() != 0 or p.slots() != 0
+        return 1
+    if p.insert(Tracked { id: 5 }) != 0
+        return 2
+    return 0

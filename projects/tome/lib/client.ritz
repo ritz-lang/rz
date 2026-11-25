@@ -10,7 +10,6 @@ import ritzlib.result
 import ritzlib.io
 import ritzlib.fmt
 import ritzlib.str
-import ritzlib.memory
 import ritzlib.strview
 import ritzlib.async_net
 # Use the fully-qualified `tome.resp` form so this module is consumable
@@ -82,26 +81,27 @@ pub fn client_parse_host(s: StrView) -> i32
     return ip
 
 
-# Write the host-byte-order IPv4 address `ip` into `buf` (at least 16
-# bytes) as a dotted quad, the form Socket.connect takes; returns its length.
-pub fn client_format_host(ip: i32, buf: *u8) -> i64
+# Write the host-byte-order IPv4 address `ip` into `buf` (at least 15
+# bytes) as a dotted quad, the form Socket.connect takes; returns the text,
+# a view of buf's front.
+pub fn client_format_host(ip: i32, buf: [u8]) -> StrView
     var n: i64 = 0
     var shift: i32 = 24
     while shift >= 0
         let octet: i32 = (ip >> shift) & 255
         if octet >= 100
-            *(buf + n) = (48 + octet / 100) as u8
+            buf[n] = (48 + octet / 100) as u8
             n += 1
         if octet >= 10
-            *(buf + n) = (48 + (octet / 10) % 10) as u8
+            buf[n] = (48 + (octet / 10) % 10) as u8
             n += 1
-        *(buf + n) = (48 + octet % 10) as u8
+        buf[n] = (48 + octet % 10) as u8
         n += 1
         if shift > 0
-            *(buf + n) = 46
+            buf[n] = 46
             n += 1
         shift -= 8
-    return n
+    return buf.to(n).as_strview()
 
 
 # Connect to a Tome server (host in host byte order: see client_parse_host)
@@ -115,9 +115,8 @@ pub fn client_connect(c: *TomeClient, host: i32, port: i32) -> i32
 
     # Connect to server
     var addr: [16]u8
-    let addr_len: i64 = client_format_host(host, @addr[0])
     var err: i32 = 0
-    match sock.connect(strview_from_ptr(@addr[0], addr_len), port)
+    match sock.connect(client_format_host(host, @addr), port)
         Ok(_) => err = 0
         Err(e) => err = e.code()
     if err != 0
@@ -147,11 +146,11 @@ pub fn client_is_connected(c: *TomeClient) -> i32
 
 # Send a raw RESP-encoded command
 # Returns bytes sent or negative error
-pub fn client_send_raw(c: *TomeClient, data: *u8, len: i64) -> i64
+pub fn client_send_raw(c: *TomeClient, data: [u8]) -> i64
     if c.connected == 0
         return -1
     # write(2), not send(2), for WSL compatibility
-    match c.fd.write(Span<u8> { ptr: data, len: len })
+    match c.fd.write(data)
         Ok(n) => n
         Err(e) => -(e.code() as i64)
 
@@ -159,52 +158,56 @@ pub fn client_send_raw(c: *TomeClient, data: *u8, len: i64) -> i64
 # Send a simple command with no arguments (e.g., PING)
 pub fn client_send_cmd0(c: *TomeClient, cmd: StrView) -> i64
     var buf: [256]u8
+    let b: [u8] = @buf
     var pos: i32 = 0
 
     # *1\r\n$<len>\r\n<cmd>\r\n
-    pos += resp_write_array(@buf[0], 1)
-    pos += resp_write_bulk(@buf[0] + pos, cmd)
+    pos += resp_write_array(b, 1)
+    pos += resp_write_bulk(b.from(pos as i64), cmd)
 
-    return client_send_raw(c, @buf[0], pos as i64)
+    return client_send_raw(c, b.to(pos as i64))
 
 
 # Send a command with 1 argument (e.g., GET key)
 pub fn client_send_cmd1(c: *TomeClient, cmd: StrView, arg1: StrView) -> i64
     var buf: [512]u8
+    let b: [u8] = @buf
     var pos: i32 = 0
 
-    pos += resp_write_array(@buf[0], 2)
-    pos += resp_write_bulk(@buf[0] + pos, cmd)
-    pos += resp_write_bulk(@buf[0] + pos, arg1)
+    pos += resp_write_array(b, 2)
+    pos += resp_write_bulk(b.from(pos as i64), cmd)
+    pos += resp_write_bulk(b.from(pos as i64), arg1)
 
-    return client_send_raw(c, @buf[0], pos as i64)
+    return client_send_raw(c, b.to(pos as i64))
 
 
 # Send a command with 2 arguments (e.g., SET key value)
 pub fn client_send_cmd2(c: *TomeClient, cmd: StrView, arg1: StrView, arg2: StrView) -> i64
     var buf: [8192]u8
+    let b: [u8] = @buf
     var pos: i32 = 0
 
-    pos += resp_write_array(@buf[0], 3)
-    pos += resp_write_bulk(@buf[0] + pos, cmd)
-    pos += resp_write_bulk(@buf[0] + pos, arg1)
-    pos += resp_write_bulk(@buf[0] + pos, arg2)
+    pos += resp_write_array(b, 3)
+    pos += resp_write_bulk(b.from(pos as i64), cmd)
+    pos += resp_write_bulk(b.from(pos as i64), arg1)
+    pos += resp_write_bulk(b.from(pos as i64), arg2)
 
-    return client_send_raw(c, @buf[0], pos as i64)
+    return client_send_raw(c, b.to(pos as i64))
 
 
 # Send a command with 3 arguments
 pub fn client_send_cmd3(c: *TomeClient, cmd: StrView, arg1: StrView, arg2: StrView, arg3: StrView) -> i64
     var buf: [8192]u8
+    let b: [u8] = @buf
     var pos: i32 = 0
 
-    pos += resp_write_array(@buf[0], 4)
-    pos += resp_write_bulk(@buf[0] + pos, cmd)
-    pos += resp_write_bulk(@buf[0] + pos, arg1)
-    pos += resp_write_bulk(@buf[0] + pos, arg2)
-    pos += resp_write_bulk(@buf[0] + pos, arg3)
+    pos += resp_write_array(b, 4)
+    pos += resp_write_bulk(b.from(pos as i64), cmd)
+    pos += resp_write_bulk(b.from(pos as i64), arg1)
+    pos += resp_write_bulk(b.from(pos as i64), arg2)
+    pos += resp_write_bulk(b.from(pos as i64), arg3)
 
-    return client_send_raw(c, @buf[0], pos as i64)
+    return client_send_raw(c, b.to(pos as i64))
 
 
 # ============================================================================
@@ -219,7 +222,7 @@ pub fn client_recv(c: *TomeClient) -> i32
 
     # read(2), not recv(2), for WSL compatibility
     var ret: i64 = 0
-    match c.fd.read(Span<u8> { ptr: @c.read_buf[0], len: 8192 })
+    match c.fd.read(@c.read_buf)
         Ok(n) => ret = n
         Err(e) => ret = -(e.code() as i64)
     if ret <= 0
@@ -265,7 +268,8 @@ pub fn client_print_response(c: *TomeClient)
         return
 
     let buf: *u8 = @c.read_buf[0]
-    let reply: StrView = strview_from_ptr(buf, c.read_len as i64)
+    let read: [u8] = @c.read_buf
+    let reply: StrView = read.to(c.read_len as i64).as_strview()
     let first: u8 = *buf
 
     if first == 43  # '+' Simple string

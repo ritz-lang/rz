@@ -67,7 +67,7 @@ COMPILERS = ("ritz0", "ritz1", "ritz1_selfhosted")
 VEC_METHODS = {
     "deinit", "valid", "len", "cap", "is_empty", "grow", "ensure_cap", "push",
     "pop", "get", "get_ptr", "set", "clear", "first", "last", "as_ptr",
-    "slice", "clone", "push_bytes", "push_span", "push_view", "swap",
+    "slice", "clone", "push_bytes", "push_span", "push_view", "swap", "replace",
     "find_lines",
 }
 # The operations that were free fns at 60b73372, whose names the twin check

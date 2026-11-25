@@ -75,4 +75,8 @@ def test_nexus_worlds_are_built_whole(tmp_path, monkeypatch, uninit_move_only):
         _check(NEXUS / "test" / f"{name}.ritz", tmp_path / f"{name}.ll",
                dependencies=deps, source_roots=["src", "."],
                project_root=str(NEXUS), test_mode=True)
-    assert sorted(set(uninit_move_only)) == []
+    # ritzlib.ptr's ptr_read is the move-out primitive under Vec.pop/replace:
+    # its `var out: T` is filled by a bitwise copy, never lent half-built.
+    # tome's Pool<T> instantiates it at a move-only T (AGAST #4692).
+    ptr_read = str(RITZ_ROOT / "ritzlib" / "ptr.ritz")
+    assert sorted({h for h in uninit_move_only if h[0] != ptr_read}) == []

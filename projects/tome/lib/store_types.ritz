@@ -1,22 +1,26 @@
 # lib/store_types.ritz - Tome value types
 #
-# Value-type tags and the List, Set, ZSet and Hash structures with their
-# destructors. Kept apart from their operations so that the Store core
-# (store.ritz) can free any value without importing the typed modules.
+# Value-type tags and the List, Set, ZSet and Hash structures.  Each owns
+# its memory through Vec, HashMap and Pool fields, so dropping one releases
+# everything in it; the Store keeps each kind in a Pool of its own
+# (store.ritz).  Kept apart from their operations so that the Store core
+# can hold and drop any value without importing the typed modules.
+#
+# Each type has a *blank*: a value that owns nothing, what a free Pool slot
+# holds (lib/pool.ritz).
 
-import ritzlib.memory
+import ritzlib.gvec
 import ritzlib.hash
-import ritzlib.str
+import ritzlib.hashmap
 import ritzlib.string
 import ritzlib.strview
 import ritzlib.drop
-import ritzlib.sys
+import tome.pool
 
 # ============================================================================
 # Value Types
 # ============================================================================
 # Tome supports multiple value types, similar to Redis.
-# For now, we start with strings (binary-safe byte sequences).
 
 const VALUE_NONE: i32 = 0
 const VALUE_STRING: i32 = 1
@@ -28,147 +32,92 @@ const VALUE_HASH: i32 = 5
 # Skip list constants for Sorted Set
 const ZSET_MAX_LEVEL: i32 = 16
 
-# ============================================================================
-# List Type - Doubly Linked List (defined early for use in Store Drop)
-# ============================================================================
-# Each element is a string value stored in a doubly-linked node.
-# Supports O(1) push/pop from both ends, O(n) range access.
+# A member -> slot index that owns nothing, for the blank Set / ZSet / Hash.
+# A blank is only ever replaced, never used as a table, so it has no slots.
+fn index_blank() -> HashMap<StrView, i64>
+    HashMap<StrView, i64> { slots: vec_new<HashMapEntry<StrView, i64>>(), len: 0, tombstones: 0 }
 
-struct ListNode
-    value: String        # The string value (owned)
-    prev: *ListNode      # Previous node (null for head)
-    next: *ListNode      # Next node (null for tail)
+# ============================================================================
+# List Type - a ring buffer of Strings
+# ============================================================================
+# O(1) push and pop at both ends, O(1) index.  Every slot of `ring` holds a
+# String; those outside the live run are empty, owning nothing.  The ring's
+# length is 0 or a power of 2.
 
 struct List
-    head: *ListNode      # First node (null if empty)
-    tail: *ListNode      # Last node (null if empty)
+    ring: Vec<String>    # the slots: element k is at (head + k) & (len - 1)
+    head: i64            # ring index of the first element
     len: i64             # Number of elements
 
-# Free a list and all its nodes
-pub fn list_drop(list: *List)
-    if list == null
-        return
-    var node: *ListNode = list.head
-    while node != null
-        let next: *ListNode = node.next
-        (node.value).deinit()
-        free(node as *u8)
-        node = next
-    free(list as *u8)
+# Vec drops only its buffer, so release each slot's String first.
+impl Drop for List
+    fn drop(self: @&List)
+        for i in 0..self.ring.len()
+            self.ring.replace(i, string_new())
+
+pub fn list_new() -> List
+    List { ring: vec_new<String>(), head: 0, len: 0 }
 
 # ============================================================================
-# Set Type - Hash Set (defined early for use in Store Drop)
+# Set Type
 # ============================================================================
-# A set is an unordered collection of unique string members.
-# Uses open addressing with linear probing (same as Store).
-
-struct SetEntry
-    value: String        # The member value (owned)
-    state: i32           # 0=empty, 1=occupied, 2=tombstone
+# An unordered collection of unique members, each any bytes (NUL included).
+# The index's keys view the member Strings in `members`: a String's bytes
+# don't move when the Pool's Vec does, so a key is good until its member is
+# removed, and it leaves the index first.
 
 struct Set
-    entries: *SetEntry   # Array of entries
-    cap: i64             # Capacity (power of 2)
-    len: i64             # Number of members
-    tombstones: i64      # Number of tombstones
+    members: Pool<String>
+    index: HashMap<StrView, i64>  # member bytes -> slot in members
 
-# Free a set and all its entries
-pub fn set_drop(set: *Set)
-    if set == null
-        return
-    if set.entries != null
-        for i in 0..set.cap
-            let entry: *SetEntry = set.entries + i
-            if entry.state == 1  # OCCUPIED
-                (entry.value).deinit()
-        free(set.entries as *u8)
-    free(set as *u8)
+pub fn set_blank() -> Set
+    Set { members: pool_new<String>(string_new), index: index_blank() }
 
 # ============================================================================
-# Sorted Set Type - Skip List (defined early for use in Store Drop)
+# Sorted Set Type - Skip List
 # ============================================================================
 # A sorted set associates a score (f64, as in Redis; never NaN) with each
-# unique member (string).
-# Members are sorted by score, then lexicographically for equal scores.
-# Uses a skip list for O(log n) insert/delete/rank operations.
-# Also maintains a hash table for O(1) score lookup by member.
+# unique member.  Members are sorted by score, then bytewise for equal
+# scores.  The skip list gives O(log n) insert and delete, the index O(1)
+# member -> node lookup.  Nodes live in a Pool and link by slot.
 
-# Skip list node - each node has a member, score, and forward pointers
+const ZNIL: i64 = -1         # the end of a level
+const ZHEAD: i64 = 0         # the header (sentinel) node's slot
+
+# Skip list node: a member, its score and its successor on each level.
 struct ZSetNode
-    member: String           # The member value (owned)
+    member: String           # The member value (owned; empty for the header)
     score: f64               # The score for sorting (lib/score.ritz parses it)
-    forward: **ZSetNode      # Array of forward pointers (one per level)
-    level: i32               # Number of levels this node participates in
+    forward: Vec<i64>        # the next node's slot on each level, or ZNIL
 
-# Hash entry for O(1) member->node lookup
-struct ZSetHashEntry
-    member: String           # Copy of member for hash lookup (owned)
-    node: *ZSetNode          # Pointer to skip list node
-    state: i32               # 0=empty, 1=occupied, 2=tombstone
+pub fn zset_node_blank() -> ZSetNode
+    ZSetNode { member: string_new(), score: 0.0, forward: vec_new<i64>() }
 
 struct ZSet
-    header: *ZSetNode        # Skip list header (sentinel node)
+    nodes: Pool<ZSetNode>    # slot ZHEAD is the header, on every level
     level: i32               # Current max level of skip list
     len: i64                 # Number of elements
-    # Hash table for O(1) lookup
-    hash_entries: *ZSetHashEntry
-    hash_cap: i64
-    hash_tombstones: i64
+    index: HashMap<StrView, i64>  # member bytes -> node slot
 
-# Free a sorted set and all its nodes
-pub fn zset_drop(zset: *ZSet)
-    if zset == null
-        return
-
-    # Free all skip list nodes
-    if zset.header != null
-        var node: *ZSetNode = zset.header.forward[0]
-        while node != null
-            let next: *ZSetNode = node.forward[0]
-            (node.member).deinit()
-            free(node.forward as *u8)
-            free(node as *u8)
-            node = next
-        # Free header node
-        free(zset.header.forward as *u8)
-        free(zset.header as *u8)
-
-    # Free hash table entries (just the member strings, nodes already freed)
-    if zset.hash_entries != null
-        for i in 0..zset.hash_cap
-            let entry: *ZSetHashEntry = zset.hash_entries + i
-            if entry.state == 1
-                (entry.member).deinit()
-        free(zset.hash_entries as *u8)
-
-    free(zset as *u8)
+pub fn zset_blank() -> ZSet
+    ZSet { nodes: pool_new<ZSetNode>(zset_node_blank), level: 1, len: 0, index: index_blank() }
 
 # ============================================================================
-# Hash Type - Field-Value Hash Map (defined early for use in Store Drop)
+# Hash Type - Field-Value Hash Map
 # ============================================================================
-# A hash is a map from string fields to string values.
-# Uses open addressing with linear probing (same as Store and Set).
+# A map from fields to values, each any bytes.  The index's keys view the
+# field Strings, as Set's do.
 
-struct HashEntry
+struct HashField
     field: String        # The field name (owned)
     value: String        # The field value (owned)
-    state: i32           # 0=empty, 1=occupied, 2=tombstone
+
+pub fn hash_field_blank() -> HashField
+    HashField { field: string_new(), value: string_new() }
 
 struct Hash
-    entries: *HashEntry  # Array of entries
-    cap: i64             # Capacity (power of 2)
-    len: i64             # Number of fields
-    tombstones: i64      # Number of tombstones
+    fields: Pool<HashField>
+    index: HashMap<StrView, i64>  # field bytes -> slot in fields
 
-# Free a hash and all its entries
-pub fn hash_drop(h: *Hash)
-    if h == null
-        return
-    if h.entries != null
-        for i in 0..h.cap
-            let entry: *HashEntry = h.entries + i
-            if entry.state == 1  # OCCUPIED
-                (entry.field).deinit()
-                (entry.value).deinit()
-        free(h.entries as *u8)
-    free(h as *u8)
+pub fn hash_blank() -> Hash
+    Hash { fields: pool_new<HashField>(hash_field_blank), index: index_blank() }

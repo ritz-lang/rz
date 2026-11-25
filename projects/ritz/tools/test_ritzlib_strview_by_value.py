@@ -85,9 +85,6 @@ PACKAGE_ALLOWED = {
     ("spire", "test/support/test_utils.ritz", "response_find_header", "out"): (
         "output param: the header value is written through it"
     ),
-    ("tome", "lib/commands.ritz", "ctx_write_bulk_array", "items"): (
-        "an array of `count` views (LRANGE/SMEMBERS/HKEYS... replies, #4210), not one view"
-    ),
 }
 
 

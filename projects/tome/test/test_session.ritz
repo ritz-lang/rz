@@ -13,12 +13,11 @@ import ritzlib.option
 import ritzlib.span
 import ritzlib.string
 import ritzlib.strview
-import ritzlib.memory
 import lib.tome
 import lib.session
 
 
-fn feed(s: *Session, data: StrView) -> i64
+fn feed(s: @&Session, data: StrView) -> i64
     if data.len > session_recv_room(s)
         return -1
     var room: Span<u8> = session_recv_buf(s)
@@ -28,7 +27,7 @@ fn feed(s: *Session, data: StrView) -> i64
 
 
 # `n` bytes of `b` into the input.
-fn feed_fill(s: *Session, b: u8, n: i64)
+fn feed_fill(s: @&Session, b: u8, n: i64)
     var room: Span<u8> = session_recv_buf(s)
     var part: Span<u8> = room.to(n)
     part.fill(b)
@@ -36,7 +35,7 @@ fn feed_fill(s: *Session, b: u8, n: i64)
 
 
 # The queued output equals `want` exactly.  0 on match.
-fn output_is(s: *Session, want: StrView) -> i32
+fn output_is(s: @&Session, want: StrView) -> i32
     if session_pending(s).eq(want)
         return 0
     return 1
@@ -45,7 +44,8 @@ fn output_is(s: *Session, want: StrView) -> i32
 [[test]]
 fn test_session_pipeline_answers_every_command() -> i32
     var store: Store = store_new()
-    let s: *Session = session_new(@store, None)
+    var session: Session = session_new(@store, None)
+    let s: @&Session = @&session
     feed(s, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\npiped\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n")
     if session_process(s) != 2
         return 1
@@ -56,14 +56,14 @@ fn test_session_pipeline_answers_every_command() -> i32
         return 3
     if session_should_close(s) != 0
         return 4
-    session_free(s)
     return 0
 
 
 [[test]]
 fn test_session_command_split_across_reads() -> i32
     var store: Store = store_new()
-    let s: *Session = session_new(@store, None)
+    var session: Session = session_new(@store, None)
+    let s: @&Session = @&session
     feed(s, "*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nEC")
     if session_process(s) != 1
         return 1
@@ -77,14 +77,14 @@ fn test_session_command_split_across_reads() -> i32
         return 4
     if output_is(s, "NG\r\n$2\r\nhi\r\n") != 0
         return 5
-    session_free(s)
     return 0
 
 
 [[test]]
 fn test_session_protocol_error_closes() -> i32
     var store: Store = store_new()
-    let s: *Session = session_new(@store, None)
+    var session: Session = session_new(@store, None)
+    let s: @&Session = @&session
     # The PING before the bad frame is answered; nothing after it runs.
     feed(s, "*1\r\n$4\r\nPING\r\n*1\r\n$x\r\n*1\r\n$4\r\nPING\r\n")
     session_process(s)
@@ -95,7 +95,6 @@ fn test_session_protocol_error_closes() -> i32
     session_sent(s, session_pending_len(s))
     if session_should_close(s) != 1
         return 3
-    session_free(s)
     return 0
 
 
@@ -104,7 +103,8 @@ fn test_session_output_backpressure() -> i32
     # More replies than the output buffer holds: process stops short,
     # and resumes from the unread input once the output drains.
     var store: Store = store_new()
-    let s: *Session = session_new(@store, None)
+    var session: Session = session_new(@store, None)
+    let s: @&Session = @&session
     let n: i64 = SESSION_IN_CAP / 6  # "PING\r\n" is 6 bytes
     for i in 0..n
         feed(s, "PING\r\n")
@@ -123,14 +123,14 @@ fn test_session_output_backpressure() -> i32
         return 3  # the buffer never filled: this test checks nothing
     if session_recv_room(s) != SESSION_IN_CAP
         return 4
-    session_free(s)
     return 0
 
 
 [[test]]
 fn test_session_oversized_request_closes() -> i32
     var store: Store = store_new()
-    let s: *Session = session_new(@store, None)
+    var session: Session = session_new(@store, None)
+    let s: @&Session = @&session
     # A bulk header promising more than the input buffer can ever hold.
     feed(s, "*2\r\n$4\r\nECHO\r\n$999999\r\n")
     while session_recv_room(s) > 0
@@ -141,7 +141,6 @@ fn test_session_oversized_request_closes() -> i32
     session_sent(s, session_pending_len(s))
     if session_should_close(s) != 1
         return 2
-    session_free(s)
     return 0
 
 
@@ -163,7 +162,8 @@ fn test_session_big_reply_waits_for_flush() -> i32
     # reply queued ahead of it has gone out (AGAST #3068).
     var store: Store = store_new()
     fill_set(@store, 500)
-    let s: *Session = session_new(@store, None)
+    var session: Session = session_new(@store, None)
+    let s: @&Session = @&session
     feed(s, "*2\r\n$4\r\nECHO\r\n$20000\r\n")
     feed_fill(s, 98, 20000)
     feed(s, "\r\nSMEMBERS big\r\n")
@@ -176,9 +176,8 @@ fn test_session_big_reply_waits_for_flush() -> i32
         return 3
     if session_pending_len(s) != 6 + 500 * 108
         return 4
-    if *session_pending_ptr(s) != 42  # '*'
+    if session_pending(s).get(0) != 42  # '*'
         return 5
-    session_free(s)
     return 0
 
 
@@ -187,7 +186,8 @@ fn test_session_too_large_reply_errors() -> i32
     # ~75 KiB can never fit: an error, and the connection carries on.
     var store: Store = store_new()
     fill_set(@store, 700)
-    let s: *Session = session_new(@store, None)
+    var session: Session = session_new(@store, None)
+    let s: @&Session = @&session
     feed(s, "SMEMBERS big\r\nPING\r\n")
     if session_process(s) != 2
         return 1
@@ -196,7 +196,6 @@ fn test_session_too_large_reply_errors() -> i32
     session_sent(s, session_pending_len(s))
     if session_should_close(s) != 0
         return 3
-    session_free(s)
     return 0
 
 
@@ -204,11 +203,11 @@ fn test_session_too_large_reply_errors() -> i32
 fn test_session_empty_password_gates_commands() -> i32
     # Some(""): an empty password is still a password, so PING waits for AUTH.
     var store: Store = store_new()
-    let s: *Session = session_new(@store, Some(""))
+    var session: Session = session_new(@store, Some(""))
+    let s: @&Session = @&session
     feed(s, "PING\r\n*2\r\n$4\r\nAUTH\r\n$0\r\n\r\nPING\r\n")
     if session_process(s) != 3
         return 1
     if output_is(s, "-NOAUTH Authentication required.\r\n+OK\r\n+PONG\r\n") != 0
         return 2
-    session_free(s)
     return 0

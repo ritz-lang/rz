@@ -14,13 +14,13 @@
 #       session_process(s)
 #       if session_pending_len(s) > 0: send pending, session_sent(s, n); continue
 #       if session_should_close(s): close
-#       recv into session_recv_ptr(s) / session_recv_room(s); session_received(s, n)
+#       recv into session_recv_buf(s); session_received(s, n)
 #
 # Sending before receiving again matters: when the output buffer fills,
 # process stops with complete commands still unread, and they run once the
 # replies have drained.
 
-import ritzlib.memory
+import ritzlib.gvec
 import ritzlib.option
 import ritzlib.str
 import ritzlib.span
@@ -38,73 +38,86 @@ pub const SESSION_OUT_CAP: i64 = 65536
 const SESSION_OUT_RESERVE: i64 = 24576
 
 
+# The buffers are Vecs of fixed length (SESSION_IN_CAP, SESSION_OUT_CAP),
+# ~128 KiB together: too big for a task's stack, and a Session moves
+# cheaply.  Their bytes never move, so a recv or send in flight on one
+# stays good while the Session itself is moved.
 pub struct Session
-    store: *Store
+    store: *Store              # borrowed: the server's store outlives it
     password: Option<StrView>  # required password (None = no AUTH)
     is_authenticated: i32
     closing: i32            # 1 after a protocol error: flush, then close
     in_len: i64             # bytes of in_buf received, not yet consumed
     out_len: i64            # bytes of out_buf queued
     out_pos: i64            # bytes of out_buf already sent
-    in_buf: [65536]u8
-    out_buf: [65536]u8
+    in_buf: Vec<u8>
+    out_buf: Vec<u8>
 
 
-pub fn session_init(s: *Session, store: *Store, password: Option<StrView>)
-    s.store = store
-    s.password = password
-    s.is_authenticated = 0
-    s.closing = 0
-    s.in_len = 0
-    s.out_len = 0
-    s.out_pos = 0
+# n zero bytes.
+fn session_buf(n: i64) -> Vec<u8>
+    var v: Vec<u8> = vec_with_cap<u8>(n)
+    for i in 0..n
+        v.push(0)
+    return v
 
 
-# Heap-allocate a session (it is ~128 KiB: too big for a task's stack).
-pub fn session_new(store: *Store, password: Option<StrView>) -> *Session
-    let s: *Session = malloc(sizeof(Session)) as *Session
-    if s == null
-        return null
-    session_init(s, store, password)
-    return s
+pub fn session_new(store: *Store, password: Option<StrView>) -> Session
+    Session {
+        store: store,
+        password: password,
+        is_authenticated: 0,
+        closing: 0,
+        in_len: 0,
+        out_len: 0,
+        out_pos: 0,
+        in_buf: session_buf(SESSION_IN_CAP),
+        out_buf: session_buf(SESSION_OUT_CAP)
+    }
 
 
-pub fn session_free(s: *Session)
-    if s != null
-        free(s as *u8)
+# A Session that owns nothing: what a free slot of a Pool<Session> holds.
+pub fn session_blank() -> Session
+    Session {
+        store: null,
+        password: None,
+        is_authenticated: 0,
+        closing: 0,
+        in_len: 0,
+        out_len: 0,
+        out_pos: 0,
+        in_buf: vec_new<u8>(),
+        out_buf: vec_new<u8>()
+    }
 
 
-# Where the next recv() should write, and how much it may write.
-pub fn session_recv_ptr(s: *Session) -> *u8
-    return @s.in_buf[0] + s.in_len
-
-pub fn session_recv_room(s: *Session) -> i64
+# How much the next recv() may write.
+pub fn session_recv_room(s: @Session) -> i64
     return SESSION_IN_CAP - s.in_len
 
-# The same free space as a Span.
-pub fn session_recv_buf(s: *Session) -> Span<u8>
-    # Explicit <u8>: ritz1 can't infer T from a call-result argument.
-    return span_from_ptr<u8>(session_recv_ptr(s), session_recv_room(s))
+# Where the next recv() should write: the input's free space.
+pub fn session_recv_buf(s: @&Session) -> Span<u8>
+    return s.in_buf[s.in_len..SESSION_IN_CAP]
 
-# Record that recv() wrote n bytes at session_recv_ptr().
-pub fn session_received(s: *Session, n: i64)
+# Record that recv() wrote n bytes into session_recv_buf().
+pub fn session_received(s: @&Session, n: i64)
     if n > 0
         s.in_len += n
 
 
-# Queued replies not yet sent.
-pub fn session_pending_ptr(s: *Session) -> *u8
-    return @s.out_buf[0] + s.out_pos
-
-pub fn session_pending_len(s: *Session) -> i64
+pub fn session_pending_len(s: @Session) -> i64
     return s.out_len - s.out_pos
 
-# The queued replies not yet sent, as a view.
-pub fn session_pending(s: *Session) -> StrView
-    return strview_from_ptr(session_pending_ptr(s), session_pending_len(s))
+# The queued replies not yet sent.
+pub fn session_pending_buf(s: @&Session) -> Span<u8>
+    return s.out_buf[s.out_pos..s.out_len]
 
-# Record that send() took n bytes from session_pending_ptr().
-pub fn session_sent(s: *Session, n: i64)
+# The same bytes, as a view.
+pub fn session_pending(s: @&Session) -> StrView
+    return session_pending_buf(s).as_strview()
+
+# Record that send() took n bytes from session_pending_buf().
+pub fn session_sent(s: @&Session, n: i64)
     if n > 0
         s.out_pos += n
     if s.out_pos >= s.out_len
@@ -114,21 +127,21 @@ pub fn session_sent(s: *Session, n: i64)
 
 # 1 once the connection should close: a protocol error has been answered
 # and the answer has gone out.
-pub fn session_should_close(s: *Session) -> i32
+pub fn session_should_close(s: @Session) -> i32
     if s.closing != 0 and s.out_len == s.out_pos
         return 1
     return 0
 
 
-fn session_error(s: *Session, msg: StrView)
-    s.out_len += resp_write_error(@s.out_buf[0] + s.out_len, msg) as i64
+fn session_error(s: @&Session, msg: StrView)
+    s.out_len += resp_write_error(s.out_buf[s.out_len..SESSION_OUT_CAP], msg) as i64
     s.closing = 1
     s.in_len = 0
 
 
 # Run every complete command in the input buffer while there is room for
 # its reply.  Returns the number of commands run.
-pub fn session_process(s: *Session) -> i32
+pub fn session_process(s: @&Session) -> i32
     var consumed: i64 = 0
     var ran: i32 = 0
     while s.closing == 0 and consumed < s.in_len
@@ -136,7 +149,8 @@ pub fn session_process(s: *Session) -> i32
             break  # flush first; the rest of the input waits
 
         var parser: RespParser
-        resp_parser_init(@parser, strview_from_ptr(@s.in_buf[0] + consumed, s.in_len - consumed))
+        let input: [u8] = s.in_buf[consumed..s.in_len]
+        resp_parser_init(@parser, input.as_strview())
         let r: i32 = resp_parse(@parser)
         if r == RESP_INCOMPLETE
             if consumed == 0 and s.in_len == SESSION_IN_CAP
@@ -150,7 +164,7 @@ pub fn session_process(s: *Session) -> i32
             return ran
 
         var ctx: CommandContext
-        cmd_ctx_init_auth(@ctx, s.store, @s.out_buf[0] + s.out_len, (SESSION_OUT_CAP - s.out_len) as i32, s.password, s.is_authenticated)
+        cmd_ctx_init_auth(@ctx, s.store, s.out_buf[s.out_len..SESSION_OUT_CAP], s.password, s.is_authenticated)
         cmd_dispatch(@ctx, @parser.command)
         if ctx.overflow != 0 and s.out_len > 0
             # The reply did not fit beside the replies already queued:
@@ -168,6 +182,8 @@ pub fn session_process(s: *Session) -> i32
     if consumed > 0
         let rest: i64 = s.in_len - consumed
         if rest > 0
-            memmove(@s.in_buf[0], @s.in_buf[0] + consumed, rest)
+            let dst: [u8] = s.in_buf[0..rest]
+            let src: [u8] = s.in_buf[consumed..s.in_len]
+            dst.copy_from(src)
         s.in_len = rest
     return ran

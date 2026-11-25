@@ -66,7 +66,7 @@ PINS = {
     "spire": 28,
     "squeeze": 2,
     "tempest": 0,
-    "tome": 139,
+    "tome": 0,
     # valet: ritzlib.mapping's munmap x2, lib/valet.ritz: the request/response
     # heap buffers (BigBuf, up to 16 MB, handed to io_uring) and the TLS
     # per-task state reached through task.user_data are mmap_anon mappings;
@@ -130,7 +130,7 @@ C_LITERAL_PINS = {
     "rzsh": 2,
     "sage": 1,
     "spire": 25,
-    "tome": 9,
+    "tome": 0,
     "valet": 0,
     "zeus": 133,
 }

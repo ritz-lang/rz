@@ -13,7 +13,6 @@
 #   blocking_server_init(@&server, 6379)
 #   blocking_server_run(@server)
 
-import ritzlib.memory
 import ritzlib.option
 import ritzlib.str
 import ritzlib.string
@@ -44,7 +43,6 @@ import lib.session
 # is not a constant initialiser, §4.3).
 var g_blk_password: StrView
 var g_blk_password_required: bool     # false until blocking_server_set_password
-var g_blk_store: *Store = null     # Store for blocking server
 var g_blk_running: i32     # Server running flag
 
 
@@ -71,45 +69,41 @@ fn blocking_server_password() -> Option<StrView>
 
 
 
-fn handle_client(client_fd: i32) -> i32
-    let s: *Session = session_new(g_blk_store, blocking_server_password())
-    if s == null
-        return -12  # ENOMEM
+fn handle_client(store: *Store, client_fd: i32) -> i32
+    var s: Session = session_new(store, blocking_server_password())
 
     # The connection is the caller's: it closes it after this returns.
     let conn: Fd = fd_borrow(client_fd)
     var ret: i64 = 0
     loop
-        session_process(s)
+        session_process(@&s)
 
         # Replies go out before the next read: when the output buffer
         # filled, unread commands are still waiting in the input.
-        let pending: i64 = session_pending_len(s)
-        if pending > 0
+        if session_pending_len(@s) > 0
             # Fd.write retries EINTR itself.
             var sent: i64 = 0
-            match conn.write(Span<u8> { ptr: session_pending_ptr(s), len: pending })
+            match conn.write(session_pending_buf(@&s))
                 Ok(n) => sent = n
                 Err(e) =>
                     ret = -(e.code() as i64)
                     break
-            session_sent(s, sent)
+            session_sent(@&s, sent)
             continue
 
-        if session_should_close(s) != 0
+        if session_should_close(@s) != 0
             break
 
         var n: i64 = 0
-        match conn.read(Span<u8> { ptr: session_recv_ptr(s), len: session_recv_room(s) })
+        match conn.read(session_recv_buf(@&s))
             Ok(got) => n = got
             Err(e) =>
                 ret = -(e.code() as i64)
                 break
         if n == 0
             break  # client closed
-        session_received(s, n)
+        session_received(@&s, n)
 
-    session_free(s)
     return ret as i32
 
 
@@ -125,9 +119,6 @@ pub struct BlockingTomeServer
 pub fn blocking_server_init(srv: @&BlockingTomeServer, port: i32) -> i32
     srv.port = port
 
-    # Initialize store
-    g_blk_store = malloc(sizeof(Store)) as *Store
-    *g_blk_store = store_new()
     g_blk_running = 1
 
     # Create TCP socket
@@ -163,6 +154,8 @@ pub fn blocking_server_init(srv: @&BlockingTomeServer, port: i32) -> i32
 
 pub fn blocking_server_run(srv: @BlockingTomeServer) -> i32
     var listen_sock: Socket = socket_from_raw(srv.listen_fd)
+    # The store lives as long as the server runs.
+    var store: Store = store_new()
 
     while g_blk_running == 1
         # Accept connection (blocking)
@@ -178,7 +171,7 @@ pub fn blocking_server_run(srv: @BlockingTomeServer) -> i32
             continue
 
         # Handle client (blocking - one at a time for now)
-        handle_client(client_fd)
+        handle_client(@&store, client_fd)
 
         # Close client connection
         var client: Fd = fd_adopt(client_fd)

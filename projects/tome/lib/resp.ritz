@@ -15,7 +15,7 @@
 #   *3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n  -> ["SET", "foo", "bar"]
 
 import ritzlib.fmt.digits
-import ritzlib.memory
+import ritzlib.span
 import ritzlib.str
 import ritzlib.string
 import ritzlib.strview
@@ -44,11 +44,10 @@ const RESP_MAX_BULK_LEN: i64 = 536870912  # 512MB
 # Parsed Command
 # ============================================================================
 # A command is an array of bulk strings (arguments).
-# We store pointers into the original buffer to avoid copying.
+# Each is a view of the parser's input, to avoid copying.
 
 struct RespArg
-    data: *u8           # Pointer to start of argument data
-    len: i64            # Length of argument
+    text: StrView       # The argument's bytes, borrowed from the input
 
 struct RespCommand
     args: [128]RespArg  # Fixed-size array of arguments
@@ -61,16 +60,14 @@ struct RespCommand
 # Parser state for incremental parsing across recv() calls.
 
 struct RespParser
-    buf: *u8            # Buffer being parsed
-    len: i64            # Total length of buffer
+    input: StrView      # Bytes being parsed (borrowed)
     pos: i64            # Current parse position
     command: RespCommand # Parsed command output
 
 
 # Initialize parser over `input` (borrowed: args point into it)
 pub fn resp_parser_init(p: *RespParser, input: StrView)
-    p.buf = input.ptr
-    p.len = input.len
+    p.input = input
     p.pos = 0
     p.command.argc = 0
 
@@ -83,35 +80,33 @@ pub fn resp_parser_reset(p: *RespParser)
 
 # Check if there's at least n bytes available
 fn resp_available(p: *RespParser, n: i64) -> i32
-    if p.pos + n <= p.len
+    if p.pos + n <= p.input.len
         return 1
     return 0
 
 
 # Read a byte without advancing
 fn resp_peek(p: *RespParser) -> i32
-    if p.pos >= p.len
+    if p.pos >= p.input.len
         return -1
-    let ptr: *u8 = p.buf + p.pos
-    return *ptr as i32
+    return p.input.get(p.pos) as i32
 
 
 # Read a byte and advance
 fn resp_read_byte(p: *RespParser) -> i32
-    if p.pos >= p.len
+    if p.pos >= p.input.len
         return -1
-    let ptr: *u8 = p.buf + p.pos
+    let c: u8 = p.input.get(p.pos)
     p.pos += 1
-    return *ptr as i32
+    return c as i32
 
 
 # Skip past \r\n, returns 0 on success, -1 if not found
 fn resp_read_crlf(p: *RespParser) -> i32
     if resp_available(p, 2) == 0
         return -1
-    let ptr: *u8 = p.buf + p.pos
-    let c1: u8 = *ptr
-    let c2: u8 = *(ptr + 1)
+    let c1: u8 = p.input.get(p.pos)
+    let c2: u8 = p.input.get(p.pos + 1)
     if c1 == 13 && c2 == 10  # \r\n
         p.pos += 2
         return 0
@@ -156,9 +151,9 @@ pub fn resp_read_int(p: *RespParser, ok: *i32) -> i64
     let start: i64 = p.pos
     var end: i64 = start
     loop
-        if end >= p.len
+        if end >= p.input.len
             return 0  # Incomplete
-        let c: u8 = *(p.buf + end)
+        let c: u8 = p.input.get(end)
         if c == 13  # \r
             break
         let sign: bool = end == start and c == 45  # leading '-'
@@ -168,7 +163,7 @@ pub fn resp_read_int(p: *RespParser, ok: *i32) -> i64
         end += 1
 
     var val: i64 = 0
-    if resp_parse_i64(strview_from_ptr(p.buf + start, end - start), @val) == 0
+    if resp_parse_i64(p.input.slice(start, end), @val) == 0
         *ok = -1
         return 0  # No digits, a bare '-', or outside i64
     p.pos = end
@@ -209,8 +204,7 @@ fn resp_parse_bulk(p: *RespParser, arg: *RespArg) -> i32
 
     # Null bulk string
     if len == -1
-        arg.data = null
-        arg.len = 0
+        arg.text = strview_empty()
         return RESP_OK
 
     # Validate length
@@ -223,8 +217,7 @@ fn resp_parse_bulk(p: *RespParser, arg: *RespArg) -> i32
         return RESP_INCOMPLETE
 
     # Store pointer to data
-    arg.data = p.buf + p.pos
-    arg.len = len
+    arg.text = p.input.slice(p.pos, p.pos + len)
     p.pos += len
 
     # Expect trailing \r\n
@@ -242,7 +235,7 @@ pub fn resp_parse(p: *RespParser) -> i32
     p.command.argc = 0
 
     # Check for empty buffer
-    if p.len == 0
+    if p.input.len == 0
         return RESP_INCOMPLETE
 
     # Expect array prefix
@@ -289,19 +282,17 @@ fn resp_parse_inline(p: *RespParser) -> i32
 
     # Find the \r\n at end of line
     var end: i64 = p.pos
-    while end < p.len
-        let ptr: *u8 = p.buf + end
-        if *ptr == 13  # \r
+    while end < p.input.len
+        if p.input.get(end) == 13  # \r
             break
         end += 1
 
     # Check if we found \r\n
-    if end >= p.len
+    if end >= p.input.len
         return RESP_INCOMPLETE
-    if end + 1 >= p.len
+    if end + 1 >= p.input.len
         return RESP_INCOMPLETE
-    let next_ptr: *u8 = p.buf + end + 1
-    if *next_ptr != 10  # \n
+    if p.input.get(end + 1) != 10  # \n
         return RESP_ERROR_PARSE
 
     # Parse space-separated tokens
@@ -310,16 +301,14 @@ fn resp_parse_inline(p: *RespParser) -> i32
     var i: i64 = p.pos
 
     while i < end
-        let ptr: *u8 = p.buf + i
-        let c: u8 = *ptr
+        let c: u8 = p.input.get(i)
 
         if c == 32 || c == 9  # space or tab
             if in_token != 0
                 # End of token
                 if p.command.argc < RESP_MAX_ARGS
                     let arg: *RespArg = @p.command.args[p.command.argc]
-                    arg.data = p.buf + token_start
-                    arg.len = i - token_start
+                    arg.text = p.input.slice(token_start, i)
                     p.command.argc += 1
                 in_token = 0
         else
@@ -333,8 +322,7 @@ fn resp_parse_inline(p: *RespParser) -> i32
     if in_token != 0
         if p.command.argc < RESP_MAX_ARGS
             let arg: *RespArg = @p.command.args[p.command.argc]
-            arg.data = p.buf + token_start
-            arg.len = end - token_start
+            arg.text = p.input.slice(token_start, end)
             p.command.argc += 1
 
     # Skip past \r\n
@@ -348,146 +336,65 @@ fn resp_parse_inline(p: *RespParser) -> i32
 # ============================================================================
 # Functions to write RESP-encoded responses into a buffer.
 
+# Each writer puts its frame at the front of `buf` and returns the bytes
+# written.  The caller sizes `buf` for the frame (commands.ritz checks each
+# reply against its buffer before writing it).
+
+# `text` at buf[at..], then CRLF; returns the position after them.
+fn resp_put_line(buf: [u8], at: i64, text: StrView) -> i64
+    let dst: [u8] = buf.from(at)
+    let n: i64 = dst.copy_from(span_from_strview(text))
+    buf[at + n] = 13  # '\r'
+    buf[at + n + 1] = 10  # '\n'
+    return at + n + 2
+
+# n in decimal at buf[at..], then CRLF; returns the position after them.
+fn resp_put_i64_line(buf: [u8], at: i64, n: i64) -> i64
+    var tmp: [20]u8
+    return resp_put_line(buf, at, fmt_i64_into(@tmp, n))
+
 # Write a simple string: +<string>\r\n
 # Returns bytes written
-pub fn resp_write_simple(buf: *u8, s: StrView) -> i32
-    var pos: i32 = 0
-    let ptr0: *u8 = buf + pos
-    *ptr0 = 43  # '+'
-    pos += 1
-
-    memcpy(buf + pos, s.ptr, s.len)
-    pos += s.len as i32
-
-    let ptr1: *u8 = buf + pos
-    *ptr1 = 13  # '\r'
-    pos += 1
-    let ptr2: *u8 = buf + pos
-    *ptr2 = 10  # '\n'
-    pos += 1
-
-    return pos
+pub fn resp_write_simple(buf: [u8], s: StrView) -> i32
+    buf[0] = 43  # '+'
+    return resp_put_line(buf, 1, s) as i32
 
 
 # Write an error: -<error>\r\n
-pub fn resp_write_error(buf: *u8, s: StrView) -> i32
-    var pos: i32 = 0
-    let ptr0: *u8 = buf + pos
-    *ptr0 = 45  # '-'
-    pos += 1
-
-    memcpy(buf + pos, s.ptr, s.len)
-    pos += s.len as i32
-
-    let ptr1: *u8 = buf + pos
-    *ptr1 = 13  # '\r'
-    pos += 1
-    let ptr2: *u8 = buf + pos
-    *ptr2 = 10  # '\n'
-    pos += 1
-
-    return pos
-
-
-# n in decimal at `at` (up to 20 bytes, no NUL); returns the count written.
-fn resp_put_i64(at: *u8, n: i64) -> i64
-    var tmp: [20]u8
-    let digits: StrView = fmt_i64_into(@tmp, n)
-    for i in 0..digits.len
-        *(at + i) = tmp[i]
-    return digits.len
+pub fn resp_write_error(buf: [u8], s: StrView) -> i32
+    buf[0] = 45  # '-'
+    return resp_put_line(buf, 1, s) as i32
 
 
 # Write an integer: :<integer>\r\n
 # Digits come from ritzlib.fmt (AGAST #1932: the old `val = -n` loop wrote
 # ":-\r\n" for i64's minimum). buf needs 23 bytes.
-pub fn resp_write_i64(buf: *u8, n: i64) -> i32
-    *buf = 58  # ':'
-    let pos: i64 = 1 + resp_put_i64(buf + 1, n)
-    *(buf + pos) = 13  # '\r'
-    *(buf + pos + 1) = 10  # '\n'
-    return (pos + 2) as i32
+pub fn resp_write_i64(buf: [u8], n: i64) -> i32
+    buf[0] = 58  # ':'
+    return resp_put_i64_line(buf, 1, n) as i32
 
 
 # Write a bulk string: $<len>\r\n<data>\r\n, every byte of `data`
-pub fn resp_write_bulk(buf: *u8, data: StrView) -> i32
-    let len: i64 = data.len
-    var pos: i32 = 0
-    let ptr0: *u8 = buf + pos
-    *ptr0 = 36  # '$'
-    pos += 1
-
-    # Write length
-    pos += resp_put_i64(buf + pos, len) as i32
-
-    let ptr1: *u8 = buf + pos
-    *ptr1 = 13  # '\r'
-    pos += 1
-    let ptr2: *u8 = buf + pos
-    *ptr2 = 10  # '\n'
-    pos += 1
-
-    # Write data
-    memcpy(buf + pos, data.ptr, len)
-    pos += len as i32
-
-    let ptr3: *u8 = buf + pos
-    *ptr3 = 13  # '\r'
-    pos += 1
-    let ptr4: *u8 = buf + pos
-    *ptr4 = 10  # '\n'
-    pos += 1
-
-    return pos
+pub fn resp_write_bulk(buf: [u8], data: StrView) -> i32
+    buf[0] = 36  # '$'
+    let pos: i64 = resp_put_i64_line(buf, 1, data.len)
+    return resp_put_line(buf, pos, data) as i32
 
 
 # Write null bulk string: $-1\r\n
-pub fn resp_write_null(buf: *u8) -> i32
-    let ptr0: *u8 = buf
-    *ptr0 = 36  # '$'
-    let ptr1: *u8 = buf + 1
-    *ptr1 = 45  # '-'
-    let ptr2: *u8 = buf + 2
-    *ptr2 = 49  # '1'
-    let ptr3: *u8 = buf + 3
-    *ptr3 = 13  # '\r'
-    let ptr4: *u8 = buf + 4
-    *ptr4 = 10  # '\n'
-    return 5
+pub fn resp_write_null(buf: [u8]) -> i32
+    return resp_put_line(buf, 0, "$-1") as i32
 
 
 # Write array header: *<count>\r\n
-pub fn resp_write_array(buf: *u8, count: i64) -> i32
-    var pos: i32 = 0
-    let ptr0: *u8 = buf + pos
-    *ptr0 = 42  # '*'
-    pos += 1
-
-    pos += resp_put_i64(buf + pos, count) as i32
-
-    let ptr1: *u8 = buf + pos
-    *ptr1 = 13  # '\r'
-    pos += 1
-    let ptr2: *u8 = buf + pos
-    *ptr2 = 10  # '\n'
-    pos += 1
-
-    return pos
+pub fn resp_write_array(buf: [u8], count: i64) -> i32
+    buf[0] = 42  # '*'
+    return resp_put_i64_line(buf, 1, count) as i32
 
 
 # Write null array: *-1\r\n
-pub fn resp_write_null_array(buf: *u8) -> i32
-    let ptr0: *u8 = buf
-    *ptr0 = 42  # '*'
-    let ptr1: *u8 = buf + 1
-    *ptr1 = 45  # '-'
-    let ptr2: *u8 = buf + 2
-    *ptr2 = 49  # '1'
-    let ptr3: *u8 = buf + 3
-    *ptr3 = 13  # '\r'
-    let ptr4: *u8 = buf + 4
-    *ptr4 = 10  # '\n'
-    return 5
+pub fn resp_write_null_array(buf: [u8]) -> i32
+    return resp_put_line(buf, 0, "*-1") as i32
 
 
 # ============================================================================
@@ -496,14 +403,12 @@ pub fn resp_write_null_array(buf: *u8) -> i32
 
 # Compare an argument to a StrView (case-insensitive)
 pub fn resp_arg_eq_ci(arg: *RespArg, s: StrView) -> i32
-    if arg.len != s.len
+    if arg.text.len != s.len
         return 0
 
     for i in 0..s.len
-        let a_ptr: *u8 = arg.data + i
-        let s_ptr: *u8 = s.ptr + i
-        var a: u8 = *a_ptr
-        var b: u8 = *s_ptr
+        var a: u8 = arg.text.get(i)
+        var b: u8 = s.get(i)
         # Convert to uppercase
         if a >= 97 && a <= 122
             a = a - 32
@@ -525,7 +430,7 @@ pub fn resp_arg_eq(arg: *RespArg, s: StrView) -> i32
 # length cap.  Borrows the parser's input, so it lives as long as that.
 # Command handlers use this for keys/values (AGAST #3069).
 pub fn resp_arg_sv(arg: *RespArg) -> StrView
-    return strview_from_ptr(arg.data, arg.len)
+    return arg.text
 
 
 # Parse argument as integer (returns 0 on parse error, ok=1 on success)

@@ -13,7 +13,7 @@
 #   tome_server_init(@server, 6379)
 #   tome_server_run(@server)
 
-import ritzlib.memory
+import ritzlib.hashmap
 import ritzlib.option
 import ritzlib.str
 import ritzlib.string
@@ -24,6 +24,7 @@ import ritzlib.io
 import ritzlib.uring
 import ritzlib.async_net
 import ritzlib.async.tasks
+import lib.pool
 import lib.tome
 import lib.resp
 import lib.commands
@@ -54,11 +55,11 @@ pub fn conn_state_init(state: *ConnectionState)
     state.is_authenticated = 0
 
 
-# What a connection task keeps in task.user_data.  spawn_task puts the
-# TaskPool there, so the first poll moves it here before taking the slot.
-struct TomeConn
-    pool: *TaskPool
-    session: *Session
+# The live connections' sessions, by task id.  task.user_data stays the
+# TaskPool spawn_task put there; a session is found by its task's id.
+struct Conns
+    sessions: Pool<Session>
+    by_task: HashMapI64          # task.id -> slot in sessions
 
 
 # ============================================================================
@@ -88,11 +89,14 @@ fn server_password() -> Option<StrView>
 # ============================================================================
 # Global Store
 # ============================================================================
-# Single shared store for all connections.
+# Single shared store for all connections, and their sessions.  Both are
+# owned by tome_server_run, which runs the whole event loop: these point at
+# its locals while it runs, and are null otherwise.
 # In a multi-process model, each worker would have its own store,
 # or use shared memory (Phase 11).
 
 var g_store: *Store = null
+var g_conns: *Conns = null
 
 
 # ============================================================================
@@ -108,60 +112,56 @@ var g_store: *Store = null
 # sentinel as a 1 GiB recv, and kept its auth state in task.user_data,
 # which spawn_task had already filled with the TaskPool.
 
-fn conn_close(task: *Task, conn: *TomeConn) -> i32
-    session_free(conn.session)
-    free(conn as *u8)
-    task.user_data = null
+# Drop the connection's session (in `slot`); 0, to finish the task.
+fn conn_close(task: *Task, slot: i64) -> i32
+    g_conns.by_task.remove(task.id)
+    g_conns.sessions.remove(slot)
     return 0
 
 
 # Run what the session holds, then submit the next I/O: replies first,
 # then (when nothing is queued) the next recv.
-fn conn_pump(task: *Task, conn: *TomeConn) -> i32
-    let s: *Session = conn.session
+fn conn_pump(task: *Task, slot: i64) -> i32
+    let pool: *TaskPool = task.user_data as *TaskPool
+    let s: @&Session = g_conns.sessions.at(slot)
     session_process(s)
 
-    let pending: i64 = session_pending_len(s)
-    if pending > 0
+    if session_pending_len(s) > 0
         task.handler_state = STATE_SEND
-        if not conn.pool.submit_send_buf(task, Span<u8> { ptr: (session_pending_ptr(s)), len: (pending as i32) as i64 })
-            return conn_close(task, conn)
+        if not pool.submit_send_buf(task, session_pending_buf(s))
+            return conn_close(task, slot)
         return -1
 
     if session_should_close(s) != 0
-        return conn_close(task, conn)
+        return conn_close(task, slot)
 
     task.handler_state = STATE_RECV
-    if not conn.pool.submit_recv_buf(task, Span<u8> { ptr: (session_recv_ptr(s)), len: (session_recv_room(s) as i32) as i64 })
-        return conn_close(task, conn)
+    if not pool.submit_recv_buf(task, session_recv_buf(s))
+        return conn_close(task, slot)
     return -1
 
 
 fn handle_connection(task: *Task) -> i32
     if task.handler_state == STATE_INIT
-        let conn: *TomeConn = malloc(sizeof(TomeConn)) as *TomeConn
-        if conn == null
-            return 0
-        conn.pool = task.user_data as *TaskPool
-        conn.session = session_new(g_store, server_password())
-        if conn.session == null
-            free(conn as *u8)
-            return 0
-        task.user_data = conn as *u8
-        return conn_pump(task, conn)
+        let fresh: i64 = g_conns.sessions.insert(session_new(g_store, server_password()))
+        g_conns.by_task.insert(task.id, fresh)
+        return conn_pump(task, fresh)
 
-    let conn: *TomeConn = task.user_data as *TomeConn
+    let slot: i64 = match g_conns.by_task.get(task.id)
+        Some(sl) => sl
+        None => return 0  # no session: nothing to serve
+    let s: @&Session = g_conns.sessions.at(slot)
     if task.handler_state == STATE_RECV
         if task.io_result <= 0
-            return conn_close(task, conn)  # client closed, or recv failed
-        session_received(conn.session, task.io_result as i64)
+            return conn_close(task, slot)  # client closed, or recv failed
+        session_received(s, task.io_result as i64)
     else if task.handler_state == STATE_SEND
         if task.io_result <= 0
-            return conn_close(task, conn)
-        session_sent(conn.session, task.io_result as i64)
+            return conn_close(task, slot)
+        session_sent(s, task.io_result as i64)
     else
-        return conn_close(task, conn)
-    return conn_pump(task, conn)
+        return conn_close(task, slot)
+    return conn_pump(task, slot)
 
 
 # ============================================================================
@@ -209,10 +209,6 @@ fn server_create_listen_socket(port: i32) -> i32
 pub fn tome_server_init(srv: *TomeServer, port: i32) -> i32
     srv.port = port
 
-    # Initialize global store
-    g_store = malloc(sizeof(Store)) as *Store
-    *g_store = store_new()
-
     # Create listening socket
     let listen_fd: i32 = server_create_listen_socket(port)
     if listen_fd < 0
@@ -237,10 +233,6 @@ pub fn tome_server_init_with_fd(srv: *TomeServer, port: i32, listen_fd: i32) -> 
     srv.port = port
     srv.listen_fd = listen_fd
 
-    # Initialize global store (each worker has its own store)
-    g_store = malloc(sizeof(Store)) as *Store
-    *g_store = store_new()
-
     # Initialize task server with inherited listen fd
     let ret: i32 = srv.task_server.init(listen_fd)
     if ret < 0
@@ -252,9 +244,17 @@ pub fn tome_server_init_with_fd(srv: *TomeServer, port: i32, listen_fd: i32) -> 
     return 0
 
 
-# Run the server (blocking)
+# Run the server (blocking).  The store and the sessions live here, for as
+# long as the event loop does (each worker process has its own).
 pub fn tome_server_run(srv: *TomeServer) -> i32
-    return srv.task_server.run_multishot(handle_connection)
+    var store: Store = store_new()
+    var conns: Conns = Conns { sessions: pool_new<Session>(session_blank), by_task: hashmap_i64_new() }
+    g_store = @&store
+    g_conns = @&conns
+    let ret: i32 = srv.task_server.run_multishot(handle_connection)
+    g_conns = null
+    g_store = null
+    return ret
 
 
 # Stop the server

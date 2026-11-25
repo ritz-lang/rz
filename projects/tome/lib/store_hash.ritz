@@ -2,14 +2,12 @@
 #
 # Field-value hash map operations and the store_h* commands on a Store.
 
-import ritzlib.memory
-import ritzlib.hash
-import ritzlib.str
+import ritzlib.gvec
+import ritzlib.hashmap
+import ritzlib.option
 import ritzlib.string
 import ritzlib.strview
-import ritzlib.ptr
-import ritzlib.drop
-import ritzlib.sys
+import tome.pool
 import tome.store_types
 import tome.store
 
@@ -17,345 +15,164 @@ import tome.store
 # Hash Operations (internal functions)
 # ============================================================================
 
-# The inner table stores and compares fields as whole byte strings (hash
-# and compare by (ptr, len)), so a field or value may hold any byte,
-# NUL included (AGAST #4210).
+# Fields and values are stored and compared as whole byte strings (hash
+# and compare by (ptr, len)), so either may hold any byte, NUL included
+# (AGAST #4210).
 
 # A missing field: ptr is null.  A present one, even empty, has a non-null
 # ptr (string_from_bytes always reserves room for the NUL).
 fn hash_missing() -> StrView
     return StrView { ptr: null, len: 0 }
 
-# Create a new hash with initial capacity
-fn hash_new() -> *Hash
-    let h: *Hash = malloc(sizeof(Hash)) as *Hash
-    h.cap = 8
-    h.len = 0
-    h.tombstones = 0
-    h.entries = malloc(h.cap * sizeof(HashEntry)) as *HashEntry
-    for i in 0..h.cap
-        let entry: *HashEntry = h.entries + i
-        entry.state = 0  # EMPTY
-    return h
-
-# Resize hash when load factor too high
-fn hash_resize(h: *Hash)
-    let old_entries: *HashEntry = h.entries
-    let old_cap: i64 = h.cap
-
-    # Double capacity
-    h.cap = old_cap * 2
-    h.len = 0
-    h.tombstones = 0
-    h.entries = malloc(h.cap * sizeof(HashEntry)) as *HashEntry
-    for i in 0..h.cap
-        let entry: *HashEntry = h.entries + i
-        entry.state = 0
-
-    # Rehash all entries
-    for i in 0..old_cap
-        let old: *HashEntry = old_entries + i
-        if old.state == 1  # OCCUPIED
-            # Insert into new table
-            let hash_val: u64 = hash_strview((old.field).as_view())
-            let mask: i64 = h.cap - 1
-            var idx: i64 = (hash_val as i64) & mask
-            var j: i64 = 0
-            while j < h.cap
-                let entry: *HashEntry = h.entries + idx
-                if entry.state != 1  # EMPTY or TOMBSTONE
-                    entry.field = ptr_read<String>(@old.field)
-                    entry.value = ptr_read<String>(@old.value)
-                    entry.state = 1
-                    h.len += 1
-                    break
-                idx = (idx + 1) & mask
-                j += 1
-
-    free(old_entries as *u8)
-
-# Index of the occupied entry holding `field`, or -1.
-fn hash_find(h: *Hash, field: StrView) -> i64
-    if h.len == 0
-        return -1
-
-    let hash_val: u64 = hash_strview(field)
-    let mask: i64 = h.cap - 1
-    var idx: i64 = (hash_val as i64) & mask
-    var i: i64 = 0
-
-    while i < h.cap
-        let entry: *HashEntry = h.entries + idx
-
-        if entry.state == 0
-            return -1
-
-        if entry.state == 1
-            if (entry.field).eq_strview(field)
-                return idx
-
-        idx = (idx + 1) & mask
-        i += 1
-
-    return -1
+# A new empty hash.
+fn hash_new() -> Hash
+    Hash { fields: pool_new<HashField>(hash_field_blank), index: hashmap_with_cap<StrView, i64>(8) }
 
 # Set a field in the hash. Returns 1 if new field, 0 if updated existing.
-fn hash_set(h: *Hash, field: StrView, value: StrView) -> i32
-    # Check load factor (> 70%)
-    if (h.len + h.tombstones) * 10 > h.cap * 7
-        hash_resize(h)
-
-    let hash_val: u64 = hash_strview(field)
-    let mask: i64 = h.cap - 1
-    var idx: i64 = (hash_val as i64) & mask
-    var first_tombstone: i64 = -1
-    var i: i64 = 0
-
-    while i < h.cap
-        let entry: *HashEntry = h.entries + idx
-
-        if entry.state == 0  # EMPTY - insert here or at tombstone
-            var insert_idx: i64 = idx
-            if first_tombstone >= 0
-                insert_idx = first_tombstone
-                h.tombstones -= 1
-            let target: *HashEntry = h.entries + insert_idx
-            target.field = string_from_strview(field)
-            target.value = string_from_strview(value)
-            target.state = 1
-            h.len += 1
-            return 1
-
-        if entry.state == 2  # TOMBSTONE
-            if first_tombstone < 0
-                first_tombstone = idx
-
-        if entry.state == 1  # OCCUPIED
-            if (entry.field).eq_strview(field)
-                # Update existing field
-                (entry.value).deinit()
-                entry.value = string_from_strview(value)
-                return 0
-
-        idx = (idx + 1) & mask
-        i += 1
-
-    # Table full (shouldn't happen with proper resize)
-    return -1
+fn hash_set(h: @&Hash, field: StrView, value: StrView) -> i32
+    match h.index.get(field)
+        Some(slot) =>
+            # Update existing field: the old value drops here.
+            h.fields.at(slot).value = string_from_strview(value)
+            return 0
+        None => pass
+    let slot: i64 = h.fields.insert(HashField { field: string_from_strview(field), value: string_from_strview(value) })
+    h.index.insert((h.fields.get(slot).field).as_view(), slot)
+    return 1
 
 # Get a field value from the hash, borrowed. ptr is null if not found.
-fn hash_get(h: *Hash, field: StrView) -> StrView
-    let idx: i64 = hash_find(h, field)
-    if idx < 0
-        return hash_missing()
-    let entry: *HashEntry = h.entries + idx
-    return (entry.value).as_view()
+fn hash_get(h: @Hash, field: StrView) -> StrView
+    match h.index.get(field)
+        Some(slot) => return (h.fields.get(slot).value).as_view()
+        None => return hash_missing()
 
 # Check if field exists in hash. Returns 1 if exists, 0 if not.
-fn hash_exists(h: *Hash, field: StrView) -> i32
-    if hash_find(h, field) >= 0
+fn hash_exists(h: @Hash, field: StrView) -> i32
+    if h.index.contains(field)
         return 1
     return 0
 
 # Delete a field from the hash. Returns 1 if deleted, 0 if not found.
-fn hash_del(h: *Hash, field: StrView) -> i32
-    let idx: i64 = hash_find(h, field)
-    if idx < 0
-        return 0
-    let entry: *HashEntry = h.entries + idx
-    (entry.field).deinit()
-    (entry.value).deinit()
-    entry.state = 2  # TOMBSTONE
-    h.len -= 1
-    h.tombstones += 1
-    return 1
+fn hash_del(h: @&Hash, field: StrView) -> i32
+    match h.index.get(field)
+        Some(slot) =>
+            # Out of the index first: its key views the field's bytes.
+            h.index.remove(field)
+            h.fields.remove(slot)
+            return 1
+        None => return 0
 
 # Get number of fields in hash
-fn hash_len(h: *Hash) -> i64
-    return h.len
+fn hash_len(h: @Hash) -> i64
+    return h.index.len()
 
-# Collect borrowed views of the fields (which=0), the values (which=1) or
-# both interleaved [field, value, ...] (which=2).  Caller frees the array.
-fn hash_collect(h: *Hash, which: i32, out_count: @&i64) -> *StrView
-    *out_count = 0
-    if h.len == 0
-        return null
-
+# Borrowed views of the fields (which=0), the values (which=1) or both
+# interleaved [field, value, ...] (which=2).
+fn hash_collect(h: @Hash, which: i32) -> Vec<StrView>
     var per: i64 = 1
     if which == 2
         per = 2
-    let arr: *StrView = malloc(h.len * per * sizeof(StrView)) as *StrView
-    var j: i64 = 0
-    for i in 0..h.cap
-        let entry: *HashEntry = h.entries + i
-        if entry.state == 1
+    var arr: Vec<StrView> = vec_with_cap<StrView>(h.fields.len() * per)
+    for i in 0..h.fields.slots()
+        if h.fields.is_live(i)
+            let f: @HashField = h.fields.get(i)
             if which != 1
-                arr[j] = (entry.field).as_view()
-                j += 1
+                arr.push((f.field).as_view())
             if which != 0
-                arr[j] = (entry.value).as_view()
-                j += 1
-            if j >= h.len * per
-                break
-
-    *out_count = j
+                arr.push((f.value).as_view())
     return arr
-
-# Get all fields. Returns array of borrowed views. Caller must free the array.
-fn hash_keys(h: *Hash, out_count: @&i64) -> *StrView
-    return hash_collect(h, 0, out_count)
-
-# Get all values. Returns array of borrowed views. Caller must free the array.
-fn hash_vals(h: *Hash, out_count: @&i64) -> *StrView
-    return hash_collect(h, 1, out_count)
-
-# Get all field-value pairs. Returns interleaved array [field, value, field, value, ...].
-# Caller must free the array.
-fn hash_getall(h: *Hash, out_count: @&i64) -> *StrView
-    return hash_collect(h, 2, out_count)
 
 # ============================================================================
 # Hash Store Operations
 # ============================================================================
 
-# Helper to get or create a hash for a key
-fn store_get_or_create_hash(s: *Store, key: StrView) -> *Hash
-    var entry: *Entry = store_find_entry(s, key)
-
-    if entry != null
-        # Check expiration
-        if entry.expires_at > 0
-            let now: i64 = time_now_secs()
-            if now >= entry.expires_at
+# Helper to get or create a hash for a key.  None if the key holds another
+# type; an expired key is replaced.
+fn store_get_or_create_hash(s: *Store, key: StrView) -> Option<@&Hash>
+    match store_find_entry(s, key)
+        Some(entry) =>
+            if entry.expires_at > 0 and time_now_secs() >= entry.expires_at
                 # Expired - clean up and treat as new
                 store_erase_entry(s, entry)
-                entry = null
-
-    if entry != null
-        # Return existing hash
-        if entry.value_type == VALUE_HASH
-            return entry.value_ptr as *Hash
-        # Wrong type - return null
-        return null
+            else if entry.value_type == VALUE_HASH
+                return Some(s.hashes.at(entry.value_slot))
+            else
+                return None  # Wrong type
+        None => pass
 
     # Key doesn't exist - create new hash
-    let h: *Hash = hash_new()
-    let fresh: *Entry = store_create_entry(s, key)
-    fresh.value_ptr = h as *u8
+    let slot: i64 = s.hashes.insert(hash_new())
+    let fresh: @&Entry = store_create_entry(s, key)
+    fresh.value_slot = slot
     fresh.value_type = VALUE_HASH
     # Track initial memory
-    s.used_memory += entry_memory(fresh)
-    return h
+    s.used_memory += entry_memory(s, fresh)
+    return Some(s.hashes.at(slot))
 
-# Helper to get existing hash for a key
-fn store_get_hash(s: *Store, key: StrView) -> *Hash
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return null
-
-    if entry.expires_at > 0
-        let now: i64 = time_now_secs()
-        if now >= entry.expires_at
-            return null
-
-    if entry.value_type == VALUE_HASH
-        return entry.value_ptr as *Hash
-    return null
+# Helper to get existing hash for a key: None if missing, expired or of
+# another type.
+fn store_get_hash(s: *Store, key: StrView) -> Option<@&Hash>
+    match store_live_entry(s, key)
+        Some(entry) =>
+            if entry.value_type == VALUE_HASH
+                return Some(s.hashes.at(entry.value_slot))
+            return None
+        None => return None
 
 # HSET: Set field in hash. Returns 1 if new, 0 if updated, -1 if wrong type.
 pub fn store_hset(s: *Store, key: StrView, field: StrView, value: StrView) -> i32
-    # Check if key exists with wrong type.  An expired key is replaced, not a
-    # type conflict.
-    let entry: *Entry = store_find_entry(s, key)
-    if entry != null
-        var live: i32 = 1
-        if entry.expires_at > 0
-            let now: i64 = time_now_secs()
-            if now >= entry.expires_at
-                live = 0
-        if live == 1 && entry.value_type != VALUE_HASH
-            return -1  # Wrong type
-
-    let h: *Hash = store_get_or_create_hash(s, key)
-    if h == null
-        return -1
-    return hash_set(h, field, value)
+    match store_get_or_create_hash(s, key)
+        Some(h) => return hash_set(h, field, value)
+        None => return -1  # Wrong type
 
 # HGET: Get field value, borrowed. ptr is null if not found or wrong type.
 pub fn store_hget(s: *Store, key: StrView, field: StrView) -> StrView
-    let h: *Hash = store_get_hash(s, key)
-    if h == null
-        return hash_missing()
-    return hash_get(h, field)
+    match store_get_hash(s, key)
+        Some(h) => return hash_get(h, field)
+        None => return hash_missing()
 
 # HDEL: Delete field from hash. Returns 1 if deleted, 0 if not found, -1 if wrong type.
 pub fn store_hdel(s: *Store, key: StrView, field: StrView) -> i32
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return 0
-
-    if entry.expires_at > 0
-        let now: i64 = time_now_secs()
-        if now >= entry.expires_at
-            return 0
-
-    if entry.value_type != VALUE_HASH
-        return -1
-    let h: *Hash = entry.value_ptr as *Hash
-    return hash_del(h, field)
+    match store_live_entry(s, key)
+        Some(entry) =>
+            if entry.value_type != VALUE_HASH
+                return -1
+            return hash_del(s.hashes.at(entry.value_slot), field)
+        None => return 0
 
 # HEXISTS: Check if field exists. Returns 1 if exists, 0 if not, -1 if wrong type.
 pub fn store_hexists(s: *Store, key: StrView, field: StrView) -> i32
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return 0
-
-    if entry.expires_at > 0
-        let now: i64 = time_now_secs()
-        if now >= entry.expires_at
-            return 0
-
-    if entry.value_type != VALUE_HASH
-        return -1
-    let h: *Hash = entry.value_ptr as *Hash
-    return hash_exists(h, field)
+    match store_live_entry(s, key)
+        Some(entry) =>
+            if entry.value_type != VALUE_HASH
+                return -1
+            return hash_exists(s.hashes.get(entry.value_slot), field)
+        None => return 0
 
 # HLEN: Get number of fields. Returns count, 0 if not found, -1 if wrong type.
 pub fn store_hlen(s: *Store, key: StrView) -> i64
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return 0
+    match store_live_entry(s, key)
+        Some(entry) =>
+            if entry.value_type != VALUE_HASH
+                return -1
+            return hash_len(s.hashes.get(entry.value_slot))
+        None => return 0
 
-    if entry.expires_at > 0
-        let now: i64 = time_now_secs()
-        if now >= entry.expires_at
-            return 0
+# The fields (which=0), values (1) or interleaved pairs (2) of key's hash,
+# borrowed; empty if there is none.
+fn store_hash_collect(s: *Store, key: StrView, which: i32) -> Vec<StrView>
+    match store_get_hash(s, key)
+        Some(h) => return hash_collect(h, which)
+        None => return vec_new<StrView>()
 
-    if entry.value_type != VALUE_HASH
-        return -1
-    let h: *Hash = entry.value_ptr as *Hash
-    return hash_len(h)
+# HKEYS: Get all field names as borrowed views.
+pub fn store_hkeys(s: *Store, key: StrView) -> Vec<StrView>
+    return store_hash_collect(s, key, 0)
 
-# HKEYS: Get all field names. Returns array of borrowed views.
-pub fn store_hkeys(s: *Store, key: StrView, out_count: @&i64) -> *StrView
-    *out_count = 0
-    let h: *Hash = store_get_hash(s, key)
-    if h == null
-        return null
-    return hash_keys(h, out_count)
+# HVALS: Get all field values as borrowed views.
+pub fn store_hvals(s: *Store, key: StrView) -> Vec<StrView>
+    return store_hash_collect(s, key, 1)
 
-# HVALS: Get all field values. Returns array of borrowed views.
-pub fn store_hvals(s: *Store, key: StrView, out_count: @&i64) -> *StrView
-    *out_count = 0
-    let h: *Hash = store_get_hash(s, key)
-    if h == null
-        return null
-    return hash_vals(h, out_count)
-
-# HGETALL: Get all field-value pairs. Returns interleaved array.
-pub fn store_hgetall(s: *Store, key: StrView, out_count: @&i64) -> *StrView
-    *out_count = 0
-    let h: *Hash = store_get_hash(s, key)
-    if h == null
-        return null
-    return hash_getall(h, out_count)
+# HGETALL: Get all field-value pairs, interleaved [field, value, ...].
+pub fn store_hgetall(s: *Store, key: StrView) -> Vec<StrView>
+    return store_hash_collect(s, key, 2)

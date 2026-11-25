@@ -1,0 +1,95 @@
+# lib/pool.ritz - Values at stable i64 slots, with a free list
+#
+# A Pool<T> keeps its values in one Vec<T> and names each by its slot.  A
+# slot stays the value's until `take` (or `remove`) frees it, whatever else
+# is inserted or removed meanwhile; a freed slot goes on the free list and
+# the next `insert` reuses it.  So structures that used to link heap nodes
+# by pointer (the store's entries, a skip list's nodes, pub/sub patterns)
+# link by slot instead: nothing is allocated per node, and dropping the pool
+# drops every value still in it.
+#
+# A free slot holds a *blank*: a value that owns nothing (an empty String,
+# an empty Vec), made by the function the pool was built with.  That is
+# what lets a value leave the middle of the Vec whole (Vec.replace), and it
+# must own nothing because a free slot is never dropped.
+#
+# `at` and `get` borrow a value in place.  The borrow is good until the next
+# `insert`, which may move the Vec's buffer; the slot number stays good.
+
+import ritzlib.gvec
+import ritzlib.drop
+
+struct Pool<T>
+    slots: Vec<T>         # every slot, live or free
+    live: Vec<bool>       # live[i]: slot i holds a value
+    free: Vec<i64>        # free slots, reused last-freed first
+    len: i64              # live slots
+    blank: fn() -> T      # makes what a free slot holds
+
+# Drop every live value; the fields' drops then free the Vecs' buffers.
+impl<T> Drop for Pool<T>
+    fn drop(self: @&Pool<T>)
+        self.clear()
+
+# An empty pool whose free slots hold `blank()`, which must own nothing.
+pub fn pool_new<T>(blank: fn() -> T) -> Pool<T>
+    Pool<T> { slots: vec_new<T>(), live: vec_new<bool>(), free: vec_new<i64>(), len: 0, blank: blank }
+
+impl<T> Pool<T>
+    # The number of live values.
+    pub fn len(self: @Pool<T>) -> i64
+        self.len
+
+    # One past the highest slot ever used: a walk over every value is
+    #   for i in 0..p.slots()
+    #       if p.is_live(i)
+    pub fn slots(self: @Pool<T>) -> i64
+        self.slots.len()
+
+    # Whether slot i holds a value.
+    pub fn is_live(self: @Pool<T>, i: i64) -> bool
+        i >= 0 and i < self.live.len() and self.live.get(i)
+
+    # Store v in a free slot (a new one when none is free) and return it.
+    pub fn insert(self: @&Pool<T>, v: T) -> i64
+        self.len += 1
+        if self.free.len() > 0
+            let i: i64 = self.free.pop()
+            # The blank that comes back owns nothing; it drops here.
+            self.slots.replace(i, v)
+            self.live.set(i, true)
+            return i
+        self.slots.push(v)
+        self.live.push(true)
+        self.slots.len() - 1
+
+    # Move slot i's value out and free the slot.  i must be live.
+    pub fn take(self: @&Pool<T>, i: i64) -> T
+        let blank: fn() -> T = self.blank
+        self.live.set(i, false)
+        self.free.push(i)
+        self.len -= 1
+        self.slots.replace(i, blank())
+
+    # Drop slot i's value and free the slot.  i must be live.
+    pub fn remove(self: @&Pool<T>, i: i64)
+        self.take(i)
+
+    # Slot i's value, to change in place.  i must be live.
+    pub fn at(self: @&Pool<T>, i: i64) -> @&T
+        @&*self.slots.get_ptr(i)
+
+    # Slot i's value, to read.  i must be live.
+    pub fn get(self: @Pool<T>, i: i64) -> @T
+        @*(self.slots.as_ptr() + i)
+
+    # Drop every value and forget every slot (the buffers stay allocated).
+    pub fn clear(self: @&Pool<T>)
+        let blank: fn() -> T = self.blank
+        for i in 0..self.slots.len()
+            if self.live.get(i)
+                self.slots.replace(i, blank())
+        self.slots.clear()
+        self.live.clear()
+        self.free.clear()
+        self.len = 0

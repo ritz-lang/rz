@@ -1,19 +1,20 @@
 # lib/store.ritz - Tome key-value store core
 #
-# The Store: a ritzlib HashMap<StrView, *Entry> (AGAST #4357) plus memory
-# accounting and eviction, string get/set/del, TTL, C-string wrappers and
-# method syntax.
+# The Store: a ritzlib HashMap<StrView, i64> (AGAST #4357) from each key to
+# its Entry's slot in a Pool, plus memory accounting and eviction, string
+# get/set/del, TTL and method syntax.
 
-import ritzlib.memory
+import ritzlib.gvec
 import ritzlib.hash
 import ritzlib.hashmap
 import ritzlib.option
+import ritzlib.span
 import ritzlib.str
 import ritzlib.string
 import ritzlib.strview
 import ritzlib.drop
-import ritzlib.sys
 import ritzlib.time { now }
+import tome.pool
 import tome.store_types
 
 # ============================================================================
@@ -28,33 +29,20 @@ pub fn time_now_secs() -> i64
 # Entry - A single key-value pair with metadata
 # ============================================================================
 
-# Heap-allocated and never moved, because Store.map keys are StrViews that
-# borrow the bytes `key` owns: the key is written once, at creation, and the
-# String's buffer is never reallocated while the entry is in the map.
+# Kept in Store.entries, whose slot never changes while the entry lives.
+# Store.map's keys are StrViews of the bytes `key` owns: the key is written
+# once, at creation, and the String's buffer (which a move of the Entry
+# doesn't move) is never reallocated while the entry is in the map.
 struct Entry
     key: String          # The key (owned string; the map's key views it)
     value: String        # The value (owned string, for VALUE_STRING)
-    value_ptr: *u8       # Pointer to complex value (for LIST, SET, etc.)
+    value_slot: i64      # LIST, SET, ZSET, HASH: the value's slot in its Store pool
     value_type: i32      # Type tag (VALUE_NONE, VALUE_STRING, etc.)
     expires_at: i64      # Unix timestamp for expiration (0 = never)
     last_access: i64     # Unix timestamp of last access (for LRU)
 
-# Free the key, the value and any complex value an entry owns, then the
-# entry.  The caller has already removed it from Store.map.
-fn entry_free(entry: *Entry)
-    if entry == null
-        return
-    (entry.key).deinit()
-    if entry.value_type == VALUE_LIST
-        list_drop(entry.value_ptr as *List)
-    else if entry.value_type == VALUE_SET
-        set_drop(entry.value_ptr as *Set)
-    else if entry.value_type == VALUE_ZSET
-        zset_drop(entry.value_ptr as *ZSet)
-    else if entry.value_type == VALUE_HASH
-        hash_drop(entry.value_ptr as *Hash)
-    (entry.value).deinit()
-    free(entry as *u8)
+fn entry_blank() -> Entry
+    Entry { key: string_new(), value: string_new(), value_slot: -1, value_type: VALUE_NONE, expires_at: 0, last_access: 0 }
 
 # ============================================================================
 # Eviction Policies
@@ -71,30 +59,22 @@ const EVICT_VOLATILE_TTL: i32 = 5    # Evict keys closest to expiration
 # Store - The main key-value store
 # ============================================================================
 # The table (probing, growth, tombstones) is ritzlib's HashMap; the Store
-# keeps only what is its own: entry memory, eviction and the RNG.  The map's
-# key view and the entry it points at have the same lifetime (see Entry).
+# keeps only what is its own: the entries and complex values, eviction and
+# the RNG.  The map's key view and the entry it names have the same
+# lifetime (see Entry).  Everything is owned by a field, so dropping a
+# Store releases every key and value.
 
 struct Store
-    map: HashMap<StrView, *Entry>  # key view -> heap Entry
+    map: HashMap<StrView, i64>  # key view -> slot in entries
+    entries: Pool<Entry>
+    lists: Pool<List>    # complex values, named by Entry.value_slot
+    sets: Pool<Set>
+    zsets: Pool<ZSet>
+    hashes: Pool<Hash>
     used_memory: i64     # Total memory used by keys and values (bytes)
     maxmemory: i64       # Maximum memory limit (0 = unlimited)
     eviction_policy: i32 # Eviction policy when maxmemory reached
     rng_state: u64       # Random state for EVICT_RANDOM
-
-# ============================================================================
-# Drop trait implementation
-# ============================================================================
-
-impl Drop for Store
-    fn drop(self: @&Store)
-        # Free all entries' owned strings, lists, sets, and zsets.  The map
-        # never frees a value, so this walk owns that job.
-        for i in 0..self.map.cap()
-            if self.map.slot_state(i) == Slot.Full
-                let entry: *Entry = self.map.slot_value(i)
-                entry_free(entry)
-        self.map.free()
-        self.used_memory = 0
 
 # ============================================================================
 # Constructor
@@ -104,9 +84,13 @@ pub fn store_new() -> Store
     return store_with_cap(16)
 
 pub fn store_with_cap(cap: i64) -> Store
-    var m: HashMap<StrView, *Entry> = hashmap_with_cap<StrView, *Entry>(cap)
     var s: Store = Store {
-        map: m,
+        map: hashmap_with_cap<StrView, i64>(cap),
+        entries: pool_new<Entry>(entry_blank),
+        lists: pool_new<List>(list_new),
+        sets: pool_new<Set>(set_blank),
+        zsets: pool_new<ZSet>(zset_blank),
+        hashes: pool_new<Hash>(hash_blank),
         used_memory: 0,
         maxmemory: 0,                # No limit by default
         eviction_policy: EVICT_NONE,
@@ -122,64 +106,60 @@ pub fn store_with_cap(cap: i64) -> Store
 fn string_memory(s: @String) -> i64
     return s.len() + 1  # Length + null terminator
 
-# Calculate memory used by an entry's value
-fn entry_value_memory(entry: *Entry) -> i64
+# Calculate memory used by an entry's value: an estimate of what its
+# structures hold, plus the bytes of every String in them.
+fn entry_value_memory(s: *Store, entry: *Entry) -> i64
     if entry.value_type == VALUE_STRING
         return string_memory(@entry.value)
     else if entry.value_type == VALUE_LIST
-        let list: *List = entry.value_ptr as *List
-        if list == null
-            return 0
+        let list: @List = s.lists.get(entry.value_slot)
         # List memory: struct + nodes + string data
         var mem: i64 = 24  # List struct
-        var node: *ListNode = list.head
-        while node != null
-            mem += 40  # ListNode struct (String + 2 pointers)
-            mem += string_memory(@node.value)
-            node = node.next
+        mem += list.len * 40  # a slot per element
+        for k in 0..list.len
+            mem += list_elem(list, k).len + 1
         return mem
     else if entry.value_type == VALUE_SET
-        let set: *Set = entry.value_ptr as *Set
-        if set == null
-            return 0
-        # Set memory: struct + entries array + string data
+        let set: @Set = s.sets.get(entry.value_slot)
+        # Set memory: struct + index table + string data
         var mem: i64 = 32  # Set struct
-        mem += set.cap * 24  # SetEntry array
-        for i in 0..set.cap
-            let se: *SetEntry = set.entries + i
-            if se.state == 1
-                mem += string_memory(@se.value)
+        mem += set.index.cap() * 24  # index slots
+        for i in 0..set.members.slots()
+            if set.members.is_live(i)
+                mem += string_memory(set.members.get(i))
         return mem
     else if entry.value_type == VALUE_ZSET
-        let zset: *ZSet = entry.value_ptr as *ZSet
-        if zset == null
-            return 0
-        # ZSet memory: struct + skip list nodes + hash entries + strings
+        let zset: @ZSet = s.zsets.get(entry.value_slot)
+        # ZSet memory: struct + skip list nodes + index + strings
         var mem: i64 = 48  # ZSet struct estimate
-        mem += zset.hash_cap * 32  # Hash entries
+        mem += zset.index.cap() * 32  # index slots
         # Skip list nodes (estimate based on length)
-        mem += zset.len * 64  # Average node size with forward pointers
+        mem += zset.len * 64  # Average node size with forward links
         return mem
     else if entry.value_type == VALUE_HASH
-        let h: *Hash = entry.value_ptr as *Hash
-        if h == null
-            return 0
-        # Hash memory: struct + entries array + string data
+        let h: @Hash = s.hashes.get(entry.value_slot)
+        # Hash memory: struct + index table + string data
         var mem: i64 = 32  # Hash struct
-        mem += h.cap * 36  # HashEntry array (field + value + state)
-        for i in 0..h.cap
-            let he: *HashEntry = h.entries + i
-            if he.state == 1
-                mem += string_memory(@he.field)
-                mem += string_memory(@he.value)
+        mem += h.index.cap() * 36  # index slots (field + value + state)
+        for i in 0..h.fields.slots()
+            if h.fields.is_live(i)
+                let f: @HashField = h.fields.get(i)
+                mem += string_memory(@f.field)
+                mem += string_memory(@f.value)
         return mem
     return 0
 
 # Calculate total memory used by an entry
-pub fn entry_memory(entry: *Entry) -> i64
+pub fn entry_memory(s: *Store, entry: *Entry) -> i64
     var mem: i64 = string_memory(@entry.key)
-    mem += entry_value_memory(entry)
+    mem += entry_value_memory(s, entry)
     return mem
+
+# Element k (in 0..len) of a list, borrowed.
+pub fn list_elem(list: @List, k: i64) -> StrView
+    let slots: [String] = span_from_vec<String>(@list.ring)
+    let at: @String = @slots[(list.head + k) & (slots.len - 1)]
+    return at.as_view()
 
 # Simple LCG random number generator
 fn store_random(s: *Store) -> u64
@@ -203,154 +183,127 @@ pub fn store_get_maxmemory(s: *Store) -> i64
     return s.maxmemory
 
 # ============================================================================
-# Map access - the table is a HashMap<StrView, *Entry>
+# Map access - the table is a HashMap<StrView, i64>
 # ============================================================================
 # Keys compare by value: a StrView hashes its bytes and compares (ptr, len),
 # so a lookup from any buffer finds an entry stored from another one, and an
 # embedded NUL is data, not a terminator.
 
-# The occupied entry for key, or null.  Expiration is the caller's concern
-# (some paths delete lazily, some just report a miss).
-pub fn store_find_entry(s: *Store, key: StrView) -> *Entry
-    var found: *Entry = null
+# The occupied entry for key, or None.  Expiration is the caller's concern
+# (some paths delete lazily, some just report a miss).  The borrow is good
+# until the next entry is created.
+pub fn store_find_entry(s: *Store, key: StrView) -> Option<@&Entry>
     match s.map.get(key)
-        Some(e) => found = e
-        None => found = null
-    return found
+        Some(slot) => Some(s.entries.at(slot))
+        None => None
 
 # A new entry for key, inserted into the map under its own key bytes.  The
 # caller must have checked that key is absent; this would otherwise replace
-# the stored value and leak the old entry.
-pub fn store_create_entry(s: *Store, key: StrView) -> *Entry
-    let entry: *Entry = malloc(sizeof(Entry)) as *Entry
-    entry.key = string_from_strview(key)
-    entry.value = string_new()
-    entry.value_ptr = null
-    entry.value_type = VALUE_NONE
-    entry.expires_at = 0
-    entry.last_access = time_now_secs()
-    s.map.insert((entry.key).as_view(), entry)
+# the stored slot and leak the old entry.
+pub fn store_create_entry(s: *Store, key: StrView) -> @&Entry
+    let slot: i64 = s.entries.insert(Entry {
+        key: string_from_strview(key),
+        value: string_new(),
+        value_slot: -1,
+        value_type: VALUE_NONE,
+        expires_at: 0,
+        last_access: time_now_secs()
+    })
+    let entry: @&Entry = s.entries.at(slot)
+    s.map.insert((entry.key).as_view(), slot)
     return entry
 
-# Remove entry from the map, free it and account for its memory.
-pub fn store_erase_entry(s: *Store, entry: *Entry)
-    if entry == null
-        return
-    let mem: i64 = entry_memory(entry)
-    let key: StrView = (entry.key).as_view()
-    s.map.remove(key)
-    entry_free(entry)
+# Drop the complex value an entry holds, if any.
+fn store_drop_value(s: *Store, entry: *Entry)
+    if entry.value_type == VALUE_LIST
+        s.lists.remove(entry.value_slot)
+    else if entry.value_type == VALUE_SET
+        s.sets.remove(entry.value_slot)
+    else if entry.value_type == VALUE_ZSET
+        s.zsets.remove(entry.value_slot)
+    else if entry.value_type == VALUE_HASH
+        s.hashes.remove(entry.value_slot)
+
+# Remove the entry in `slot` from the map, drop it and account for its
+# memory.
+fn store_erase_slot(s: *Store, slot: i64)
+    let entry: @&Entry = s.entries.at(slot)
+    let mem: i64 = entry_memory(s, entry)
+    # Out of the map first: its key views the bytes the entry is about to free.
+    s.map.remove((entry.key).as_view())
+    store_drop_value(s, entry)
+    s.entries.remove(slot)
     s.used_memory -= mem
+
+# Remove entry (found by store_find_entry) from the store.
+pub fn store_erase_entry(s: *Store, entry: *Entry)
+    match s.map.get((entry.key).as_view())
+        Some(slot) => store_erase_slot(s, slot)
+        None => pass
 
 # Remove key's entry, if any.  Returns 1 when there was one.
 pub fn store_erase(s: *Store, key: StrView) -> i32
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return 0
-    store_erase_entry(s, entry)
-    return 1
+    match s.map.get(key)
+        Some(slot) =>
+            store_erase_slot(s, slot)
+            return 1
+        None => return 0
 
-# Find a key to evict based on policy. Returns the entry, or null if none.
-fn store_find_evict_candidate(s: *Store) -> *Entry
-    if s.eviction_policy == EVICT_NONE
-        return null
+# The live entry for key, or None: an expired one counts as missing (it is
+# not deleted here).
+pub fn store_live_entry(s: *Store, key: StrView) -> Option<@&Entry>
+    match store_find_entry(s, key)
+        Some(entry) =>
+            if entry.expires_at > 0 and time_now_secs() >= entry.expires_at
+                return None
+            return Some(entry)
+        None => return None
 
+# Sample random map slots for an eviction victim: up to `want` entries that
+# pass the policy's filter (all entries, or only those with a TTL), in at
+# most `tries` probes, keeping the best by the policy's measure.  The
+# victim's entry slot, or None.
+fn store_sample_victim(s: *Store, volatile: bool, by_ttl: bool, want: i32, tries: i32) -> Option<i64>
     let cap: i64 = s.map.cap()
-    if s.map.len() == 0
-        return null
+    var best: i64 = -1
+    var best_key: i64 = 9223372036854775807  # i64 max
+    var samples: i32 = 0
+    var attempts: i32 = 0
+    while samples < want && attempts < tries
+        attempts += 1
+        let idx: i64 = (store_random(s) as i64) % cap
+        if idx < 0 or s.map.slot_state(idx) != Slot.Full
+            continue
+        let slot: i64 = s.map.slot_value(idx)
+        let entry: @Entry = s.entries.get(slot)
+        if volatile and entry.expires_at <= 0
+            continue
+        var measure: i64 = entry.last_access
+        if by_ttl
+            measure = entry.expires_at
+        if measure < best_key or best < 0
+            best_key = measure
+            best = slot
+        samples += 1
+    if best < 0
+        return None
+    return Some(best)
 
-    let now: i64 = time_now_secs()
-
+# Find a key to evict based on policy: its entry slot, or None.
+fn store_find_evict_candidate(s: *Store) -> Option<i64>
+    if s.eviction_policy == EVICT_NONE or s.map.len() == 0
+        return None
     if s.eviction_policy == EVICT_RANDOM
-        # Random eviction - sample up to 5 keys and pick one
-        var attempts: i32 = 0
-        while attempts < 20
-            let idx: i64 = (store_random(s) as i64) % cap
-            if idx < 0
-                continue
-            if s.map.slot_state(idx) == Slot.Full
-                return s.map.slot_value(idx)
-            attempts += 1
-        return null
-
+        return store_sample_victim(s, false, false, 1, 20)
     if s.eviction_policy == EVICT_LRU
-        # LRU - sample 5 keys and evict the oldest access
-        var oldest: *Entry = null
-        var oldest_time: i64 = 9223372036854775807  # i64 max
-        var samples: i32 = 0
-        var attempts: i32 = 0
-        while samples < 5 && attempts < 20
-            let idx: i64 = (store_random(s) as i64) % cap
-            if idx < 0
-                attempts += 1
-                continue
-            if s.map.slot_state(idx) == Slot.Full
-                let entry: *Entry = s.map.slot_value(idx)
-                if entry.last_access < oldest_time
-                    oldest_time = entry.last_access
-                    oldest = entry
-                samples += 1
-            attempts += 1
-        return oldest
-
+        return store_sample_victim(s, false, false, 5, 20)
     if s.eviction_policy == EVICT_VOLATILE_LRU
-        # LRU among keys with TTL
-        var oldest: *Entry = null
-        var oldest_time: i64 = 9223372036854775807
-        var samples: i32 = 0
-        var attempts: i32 = 0
-        while samples < 5 && attempts < 50
-            let idx: i64 = (store_random(s) as i64) % cap
-            if idx < 0
-                attempts += 1
-                continue
-            if s.map.slot_state(idx) == Slot.Full
-                let entry: *Entry = s.map.slot_value(idx)
-                if entry.expires_at > 0
-                    if entry.last_access < oldest_time
-                        oldest_time = entry.last_access
-                        oldest = entry
-                    samples += 1
-            attempts += 1
-        return oldest
-
+        return store_sample_victim(s, true, false, 5, 50)
     if s.eviction_policy == EVICT_VOLATILE_RANDOM
-        # Random among keys with TTL
-        var attempts: i32 = 0
-        while attempts < 50
-            let idx: i64 = (store_random(s) as i64) % cap
-            if idx < 0
-                attempts += 1
-                continue
-            if s.map.slot_state(idx) == Slot.Full
-                let entry: *Entry = s.map.slot_value(idx)
-                if entry.expires_at > 0
-                    return entry
-            attempts += 1
-        return null
-
+        return store_sample_victim(s, true, false, 1, 50)
     if s.eviction_policy == EVICT_VOLATILE_TTL
-        # Evict key closest to expiration
-        var best: *Entry = null
-        var earliest_expire: i64 = 9223372036854775807
-        var samples: i32 = 0
-        var attempts: i32 = 0
-        while samples < 5 && attempts < 50
-            let idx: i64 = (store_random(s) as i64) % cap
-            if idx < 0
-                attempts += 1
-                continue
-            if s.map.slot_state(idx) == Slot.Full
-                let entry: *Entry = s.map.slot_value(idx)
-                if entry.expires_at > 0
-                    if entry.expires_at < earliest_expire
-                        earliest_expire = entry.expires_at
-                        best = entry
-                    samples += 1
-            attempts += 1
-        return best
-
-    return null
+        return store_sample_victim(s, true, true, 5, 50)
+    return None
 
 # Evict keys until we're under maxmemory. Returns number of keys evicted.
 fn store_evict_if_needed(s: *Store) -> i64
@@ -359,36 +312,13 @@ fn store_evict_if_needed(s: *Store) -> i64
 
     var evicted: i64 = 0
     while s.used_memory > s.maxmemory
-        let entry: *Entry = store_find_evict_candidate(s)
-        if entry == null
-            break  # Can't evict anything
-
-        store_erase_entry(s, entry)
-        evicted += 1
+        match store_find_evict_candidate(s)
+            Some(slot) =>
+                store_erase_slot(s, slot)
+                evicted += 1
+            None => break  # Can't evict anything
 
     return evicted
-
-# ============================================================================
-# Hash function for string keys
-# ============================================================================
-
-# Hash a StrView (uses length, not null-terminator)
-pub fn hash_strview(key: StrView) -> u64
-    var h: u64 = fnv1a_init()
-    for i in 0..key.len
-        h = fnv1a_byte(h, *(key.ptr + i))
-    return h
-
-# Compare a String to a StrView for equality
-pub fn tome_string_eq_strview(s: *String, sv: StrView) -> i32
-    let slen: i64 = s.len()
-    if slen != sv.len
-        return 0
-    let sptr: *u8 = s.as_ptr()
-    for i in 0..slen
-        if *(sptr + i) != *(sv.ptr + i)
-            return 0
-    return 1
 
 # ============================================================================
 # Core operations
@@ -397,27 +327,21 @@ pub fn tome_string_eq_strview(s: *String, sv: StrView) -> i32
 # Set a key to a string value.
 pub fn store_set(s: *Store, key: StrView, value: StrView)
     let now: i64 = time_now_secs()
-    let entry: *Entry = store_find_entry(s, key)
-
-    if entry != null  # Update existing
-        # Track old memory
-        let old_mem: i64 = entry_value_memory(entry)
-        # Free old value, set new
-        (entry.value).deinit()
-        entry.value = string_from_strview(value)
-        entry.value_type = VALUE_STRING
-        entry.last_access = now
-        # Update memory tracking
-        let new_mem: i64 = entry_value_memory(entry)
-        s.used_memory += new_mem - old_mem
-    else
-        # New entry
-        let fresh: *Entry = store_create_entry(s, key)
-        fresh.value = string_from_strview(value)
-        fresh.value_type = VALUE_STRING
-        fresh.last_access = now
-        # Track memory
-        s.used_memory += entry_memory(fresh)
+    match store_find_entry(s, key)
+        Some(entry) =>
+            # Update existing: a value of another type goes first
+            let old_mem: i64 = entry_value_memory(s, entry)
+            store_drop_value(s, entry)
+            entry.value = string_from_strview(value)
+            entry.value_type = VALUE_STRING
+            entry.last_access = now
+            s.used_memory += entry_value_memory(s, entry) - old_mem
+        None =>
+            let fresh: @&Entry = store_create_entry(s, key)
+            fresh.value = string_from_strview(value)
+            fresh.value_type = VALUE_STRING
+            fresh.last_access = now
+            s.used_memory += entry_memory(s, fresh)
 
     # Evict if needed
     store_evict_if_needed(s)
@@ -432,12 +356,13 @@ pub fn store_get(s: *Store, key: StrView) -> Option<StrView>
     return Some(v)
 
 # Like `store_get`, with a miss / expired / non-string value as an empty
-# view whose ptr is null (a hit's ptr never is, even for "").
+# view whose ptr is null (a hit's ptr never is, even for "": a value's
+# String always holds room for its NUL).
 # Triggers lazy expiration like `store_get`.
 pub fn store_get_strview(s: *Store, key: StrView) -> StrView
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return strview_empty()
+    let entry: @&Entry = match store_find_entry(s, key)
+        Some(e) => e
+        None => return strview_empty()
     let now: i64 = time_now_secs()
 
     if entry.expires_at > 0
@@ -449,23 +374,16 @@ pub fn store_get_strview(s: *Store, key: StrView) -> StrView
     entry.last_access = now
 
     if entry.value_type == VALUE_STRING
-        # as_ptr, not as_view: it is never null, so a hit on "" stays a hit.
-        return strview_from_ptr((entry.value).as_ptr(), (entry.value).len())
+        return (entry.value).as_view()
     return strview_empty()
 
 # Check if a key exists (not expired).
 # NOTE: This is a const operation - does not trigger lazy expiration.
 # Use store_get() if you want expired keys to be cleaned up.
 pub fn store_exists(s: *Store, key: StrView) -> i32
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return 0
-    # Check if expired
-    if entry.expires_at > 0
-        let now: i64 = time_now_secs()
-        if now >= entry.expires_at
-            return 0  # Expired
-    return 1
+    match store_live_entry(s, key)
+        Some(_) => return 1
+        None => return 0
 
 # Delete a key. Returns 1 if deleted, 0 if not found.
 pub fn store_del(s: *Store, key: StrView) -> i32
@@ -484,10 +402,12 @@ pub fn store_is_empty(s: *Store) -> i32
 
 # Clear all keys from the store.
 pub fn store_clear(s: *Store)
-    for i in 0..s.map.cap()
-        if s.map.slot_state(i) == Slot.Full
-            entry_free(s.map.slot_value(i))
     s.map.clear()
+    s.entries.clear()
+    s.lists.clear()
+    s.sets.clear()
+    s.zsets.clear()
+    s.hashes.clear()
     s.used_memory = 0
 
 
@@ -502,20 +422,20 @@ pub fn store_setex(s: *Store, key: StrView, value: StrView, ttl_secs: i64)
     store_set(s, key, value)
 
     # Then find the entry and set expiration
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return  # Not found (shouldn't happen after set)
-    if ttl_secs > 0
-        entry.expires_at = time_now_secs() + ttl_secs
-    else
-        entry.expires_at = 0  # No expiration
+    match store_find_entry(s, key)
+        Some(entry) =>
+            if ttl_secs > 0
+                entry.expires_at = time_now_secs() + ttl_secs
+            else
+                entry.expires_at = 0  # No expiration
+        None => pass  # Evicted at once (shouldn't happen after set)
 
 # Set expiration on an existing key. Returns 1 if key exists, 0 otherwise.
 # Similar to Redis EXPIRE.
 pub fn store_expire(s: *Store, key: StrView, ttl_secs: i64) -> i32
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return 0  # Key not found
+    let entry: @&Entry = match store_find_entry(s, key)
+        Some(e) => e
+        None => return 0  # Key not found
 
     # Check if already expired
     if entry.expires_at > 0
@@ -535,9 +455,9 @@ pub fn store_expire(s: *Store, key: StrView, ttl_secs: i64) -> i32
 # Returns: -2 if key doesn't exist, -1 if no expiration, >= 0 for TTL.
 # Similar to Redis TTL.
 pub fn store_ttl(s: *Store, key: StrView) -> i64
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return -2  # Key does not exist
+    let entry: @&Entry = match store_find_entry(s, key)
+        Some(e) => e
+        None => return -2  # Key does not exist
 
     if entry.expires_at == 0
         return -1  # Key exists but has no expiration
@@ -551,9 +471,9 @@ pub fn store_ttl(s: *Store, key: StrView) -> i64
 # Remove expiration from a key. Returns 1 if key exists and had TTL, 0 otherwise.
 # Similar to Redis PERSIST.
 pub fn store_persist(s: *Store, key: StrView) -> i32
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return 0
+    let entry: @&Entry = match store_find_entry(s, key)
+        Some(e) => e
+        None => return 0
 
     # Check if already expired
     if entry.expires_at > 0
@@ -572,13 +492,13 @@ pub fn store_expire_sweep(s: *Store) -> i64
     var deleted: i64 = 0
     let now: i64 = time_now_secs()
 
-    for i in 0..s.map.cap()
-        if s.map.slot_state(i) == Slot.Full
-            let entry: *Entry = s.map.slot_value(i)
-            if entry.expires_at > 0
-                if now >= entry.expires_at
-                    store_erase_entry(s, entry)
-                    deleted += 1
+    # A walk over the entries, not the map: erasing changes the map.
+    for slot in 0..s.entries.slots()
+        if s.entries.is_live(slot)
+            let expires_at: i64 = s.entries.get(slot).expires_at
+            if expires_at > 0 and now >= expires_at
+                store_erase_slot(s, slot)
+                deleted += 1
 
     return deleted
 

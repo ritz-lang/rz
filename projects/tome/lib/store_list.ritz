@@ -1,15 +1,12 @@
 # lib/store_list.ritz - Tome list values
 #
-# Doubly linked list operations and the store_l* commands on a Store.
+# Ring buffer list operations (List is in store_types.ritz) and the
+# store_l* commands on a Store.
 
-import ritzlib.memory
-import ritzlib.hash
-import ritzlib.str
+import ritzlib.gvec
+import ritzlib.option
 import ritzlib.string
 import ritzlib.strview
-import ritzlib.ptr
-import ritzlib.drop
-import ritzlib.sys
 import tome.store_types
 import tome.store
 
@@ -17,91 +14,60 @@ import tome.store
 # List Operations
 # ============================================================================
 
-# Create a new empty list
-fn list_new() -> *List
-    let list: *List = malloc(sizeof(List)) as *List
-    list.head = null
-    list.tail = null
-    list.len = 0
-    return list
+# Ring index of element k.
+fn list_slot(list: @List, k: i64) -> i64
+    return (list.head + k) & (list.ring.len() - 1)
+
+# Double the ring (8 slots the first time), moving the elements to its
+# front in order.
+fn list_grow(list: @&List)
+    var cap: i64 = list.ring.len() * 2
+    if cap == 0
+        cap = 8
+    var bigger: Vec<String> = vec_with_cap<String>(cap)
+    for k in 0..list.len
+        bigger.push(list.ring.replace(list_slot(list, k), string_new()))
+    while bigger.len() < cap
+        bigger.push(string_new())
+    # The old ring holds only empty Strings now: its drop frees the buffer.
+    list.ring = bigger
+    list.head = 0
 
 # Push a value to the left (head) of the list. Returns new length.
-fn list_lpush(list: *List, value: StrView) -> i64
-    let node: *ListNode = malloc(sizeof(ListNode)) as *ListNode
-    node.value = string_from_strview(value)
-    node.prev = null
-    node.next = list.head
-
-    if list.head != null
-        list.head.prev = node
-    else
-        # List was empty, new node is also tail
-        list.tail = node
-
-    list.head = node
+fn list_lpush(list: @&List, value: StrView) -> i64
+    if list.len == list.ring.len()
+        list_grow(list)
+    list.head = (list.head - 1) & (list.ring.len() - 1)
+    list.ring.replace(list.head, string_from_strview(value))
     list.len += 1
     return list.len
 
 # Push a value to the right (tail) of the list. Returns new length.
-fn list_rpush(list: *List, value: StrView) -> i64
-    let node: *ListNode = malloc(sizeof(ListNode)) as *ListNode
-    node.value = string_from_strview(value)
-    node.prev = list.tail
-    node.next = null
-
-    if list.tail != null
-        list.tail.next = node
-    else
-        # List was empty, new node is also head
-        list.head = node
-
-    list.tail = node
+fn list_rpush(list: @&List, value: StrView) -> i64
+    if list.len == list.ring.len()
+        list_grow(list)
+    list.ring.replace(list_slot(list, list.len), string_from_strview(value))
     list.len += 1
     return list.len
 
-# Pop a value from the left (head). Returns owned string, caller must drop.
+# Pop a value from the left (head). Returns the owned string.
 # Returns empty string if list is empty.
-fn list_lpop(list: *List) -> String
-    if list.head == null
+fn list_lpop(list: @&List) -> String
+    if list.len == 0
         return string_new()
-
-    let node: *ListNode = list.head
-    let result: String = ptr_read<String>(@node.value)  # Move ownership
-
-    list.head = node.next
-    if list.head != null
-        list.head.prev = null
-    else
-        list.tail = null
-
+    let result: String = list.ring.replace(list.head, string_new())
+    list.head = (list.head + 1) & (list.ring.len() - 1)
     list.len -= 1
-    free(node as *u8)
     return result
 
-# Pop a value from the right (tail). Returns owned string, caller must drop.
+# Pop a value from the right (tail). Returns the owned string.
 # Returns empty string if list is empty.
-fn list_rpop(list: *List) -> String
-    if list.tail == null
+fn list_rpop(list: @&List) -> String
+    if list.len == 0
         return string_new()
-
-    let node: *ListNode = list.tail
-    let result: String = ptr_read<String>(@node.value)  # Move ownership
-
-    list.tail = node.prev
-    if list.tail != null
-        list.tail.next = null
-    else
-        list.head = null
-
+    let result: String = list.ring.replace(list_slot(list, list.len - 1), string_new())
     list.len -= 1
-    free(node as *u8)
     return result
-
-# Get list length
-fn list_len(list: *List) -> i64
-    if list == null
-        return 0
-    return list.len
 
 # A missing element: ptr is null (a present one, even empty, is non-null).
 fn list_missing() -> StrView
@@ -110,10 +76,7 @@ fn list_missing() -> StrView
 # Get element at index (0-based) as a borrowed view, whole even with an
 # embedded NUL (AGAST #4210); ptr is null if out of bounds.
 # Negative indices count from end (-1 = last).
-fn list_index(list: *List, index: i64) -> StrView
-    if list == null || list.len == 0
-        return list_missing()
-
+fn list_index(list: @List, index: i64) -> StrView
     # Normalize negative index
     var idx: i64 = index
     if idx < 0
@@ -121,136 +84,94 @@ fn list_index(list: *List, index: i64) -> StrView
 
     if idx < 0 || idx >= list.len
         return list_missing()
-
-    # Traverse from nearest end
-    var node: *ListNode = null
-    if idx <= list.len / 2
-        # Traverse from head
-        node = list.head
-        var i: i64 = 0
-        while i < idx
-            node = node.next
-            i += 1
-    else
-        # Traverse from tail
-        node = list.tail
-        var i: i64 = list.len - 1
-        while i > idx
-            node = node.prev
-            i -= 1
-
-    return (node.value).as_view()
+    return list_elem(list, idx)
 
 # ============================================================================
 # Store List Operations
 # ============================================================================
 
-# Helper: Get or create list for key. Returns null if key exists with wrong type.
-fn store_get_or_create_list(s: *Store, key: StrView) -> *List
-    let entry: *Entry = store_find_entry(s, key)
-
-    if entry != null
-        # Check type
-        if entry.value_type == VALUE_LIST
-            return entry.value_ptr as *List
-        # Wrong type
-        return null
+# Helper: Get or create list for key. None if key exists with wrong type.
+fn store_get_or_create_list(s: *Store, key: StrView) -> Option<@&List>
+    match store_find_entry(s, key)
+        Some(entry) =>
+            if entry.value_type == VALUE_LIST
+                return Some(s.lists.at(entry.value_slot))
+            return None  # Wrong type
+        None => pass
 
     # Create new list
-    let list: *List = list_new()
-    let fresh: *Entry = store_create_entry(s, key)
-    fresh.value_ptr = list as *u8
+    let slot: i64 = s.lists.insert(list_new())
+    let fresh: @&Entry = store_create_entry(s, key)
+    fresh.value_slot = slot
     fresh.value_type = VALUE_LIST
 
     # Track initial memory (key + empty list struct)
-    s.used_memory += entry_memory(fresh)
+    s.used_memory += entry_memory(s, fresh)
 
-    return list
+    return Some(s.lists.at(slot))
 
-# Helper: Get existing list for key (read-only). Returns null if not found or wrong type.
-fn store_get_list(s: *Store, key: StrView) -> *List
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return null
-
-    # Check expiration
-    if entry.expires_at > 0
-        let now: i64 = time_now_secs()
-        if now >= entry.expires_at
-            return null  # Expired
-
-    if entry.value_type == VALUE_LIST
-        return entry.value_ptr as *List
-    return null  # Wrong type
+# Helper: Get existing list for key. None if not found, expired or wrong type.
+fn store_get_list(s: *Store, key: StrView) -> Option<@&List>
+    match store_live_entry(s, key)
+        Some(entry) =>
+            if entry.value_type == VALUE_LIST
+                return Some(s.lists.at(entry.value_slot))
+            return None  # Wrong type
+        None => return None
 
 # LPUSH: Push value(s) to head of list. Returns new length.
 # Creates list if key doesn't exist.
 pub fn store_lpush(s: *Store, key: StrView, value: StrView) -> i64
-    let list: *List = store_get_or_create_list(s, key)
-    if list == null
-        return -1  # Key exists with wrong type
-    return list_lpush(list, value)
+    match store_get_or_create_list(s, key)
+        Some(list) => return list_lpush(list, value)
+        None => return -1  # Key exists with wrong type
 
 # RPUSH: Push value(s) to tail of list. Returns new length.
 # Creates list if key doesn't exist.
 pub fn store_rpush(s: *Store, key: StrView, value: StrView) -> i64
-    let list: *List = store_get_or_create_list(s, key)
-    if list == null
-        return -1  # Key exists with wrong type
-    return list_rpush(list, value)
+    match store_get_or_create_list(s, key)
+        Some(list) => return list_rpush(list, value)
+        None => return -1  # Key exists with wrong type
 
 # LPOP: Remove and return head element. Returns owned string (caller drops).
 # Returns empty string if key doesn't exist or is empty.
 pub fn store_lpop(s: *Store, key: StrView) -> String
-    let list: *List = store_get_list(s, key)
-    if list == null
-        return string_new()
-    return list_lpop(list)
+    match store_get_list(s, key)
+        Some(list) => return list_lpop(list)
+        None => return string_new()
 
 # RPOP: Remove and return tail element. Returns owned string (caller drops).
 # Returns empty string if key doesn't exist or is empty.
 pub fn store_rpop(s: *Store, key: StrView) -> String
-    let list: *List = store_get_list(s, key)
-    if list == null
-        return string_new()
-    return list_rpop(list)
+    match store_get_list(s, key)
+        Some(list) => return list_rpop(list)
+        None => return string_new()
 
 # LLEN: Get length of list. Returns 0 if key doesn't exist.
 # Returns -1 if key exists with wrong type.
 pub fn store_llen(s: *Store, key: StrView) -> i64
-    let entry: *Entry = store_find_entry(s, key)
-    if entry == null
-        return 0  # Key not found
-
-    # Check expiration
-    if entry.expires_at > 0
-        let now: i64 = time_now_secs()
-        if now >= entry.expires_at
-            return 0  # Expired
-
-    if entry.value_type == VALUE_LIST
-        let list: *List = entry.value_ptr as *List
-        return list.len
-    return -1  # Wrong type
+    match store_live_entry(s, key)
+        Some(entry) =>
+            if entry.value_type == VALUE_LIST
+                return s.lists.get(entry.value_slot).len
+            return -1  # Wrong type
+        None => return 0  # Key not found or expired
 
 # LINDEX: Get element at index as a borrowed view; ptr is null if out of bounds.
 # Negative indices: -1 = last, -2 = second to last, etc.
 pub fn store_lindex(s: *Store, key: StrView, index: i64) -> StrView
-    let list: *List = store_get_list(s, key)
-    if list == null
-        return list_missing()
-    return list_index(list, index)
+    match store_get_list(s, key)
+        Some(list) => return list_index(list, index)
+        None => return list_missing()
 
-# LRANGE: Get elements from start to stop (inclusive). Returns array of borrowed views.
-# Negative indices supported. Out of range indices are clamped.
-# Caller must free the returned array (but not the strings - they're borrowed).
-# Returns count via out parameter.
-pub fn store_lrange(s: *Store, key: StrView, start: i64, stop: i64, out_count: @&i64) -> *StrView
-    *out_count = 0
-
-    let list: *List = store_get_list(s, key)
-    if list == null || list.len == 0
-        return null
+# LRANGE: Get elements from start to stop (inclusive) as borrowed views.
+# Negative indices supported. Out of range indices are clamped.  Empty if
+# the key is missing.
+pub fn store_lrange(s: *Store, key: StrView, start: i64, stop: i64) -> Vec<StrView>
+    var result: Vec<StrView> = vec_new<StrView>()
+    let list: @&List = match store_get_list(s, key)
+        Some(l) => l
+        None => return result
 
     # Normalize indices
     var s_idx: i64 = start
@@ -266,25 +187,9 @@ pub fn store_lrange(s: *Store, key: StrView, start: i64, stop: i64, out_count: @
         s_idx = 0
     if e_idx >= list.len
         e_idx = list.len - 1
-    if s_idx > e_idx
-        return null
 
-    let count: i64 = e_idx - s_idx + 1
-    let result: *StrView = malloc(count * sizeof(StrView)) as *StrView
-
-    # Traverse to start
-    var node: *ListNode = list.head
-    var i: i64 = 0
-    while i < s_idx
-        node = node.next
-        i += 1
-
-    # Collect elements
-    var j: i64 = 0
-    while j < count && node != null
-        result[j] = (node.value).as_view()
-        node = node.next
-        j += 1
-
-    *out_count = count
+    var k: i64 = s_idx
+    while k <= e_idx
+        result.push(list_elem(list, k))
+        k += 1
     return result
