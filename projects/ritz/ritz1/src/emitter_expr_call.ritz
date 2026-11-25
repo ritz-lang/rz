@@ -314,7 +314,7 @@ fn emit_span_of_addr_place(s: *EmitterState, e: *Expr, name: StrView) -> i32
 # `x` points at it.
 fn emit_strview_of_array(s: *EmitterState, x: *Expr) -> i32
     var src: ArraySrc
-    if strview_array_ptr(s, x) == 1
+    if strview_array_ptr(s, x)
         array_ptr_shape(s, x, @src)
         return emit_span_value(s, emit_array_ptr_value(s, x), src.size, "StrView")
     arg_array_shape(s, x, @src)
@@ -378,7 +378,7 @@ fn emit_array_arg_addr(s: *EmitterState, arg: *Expr, p: *Param) -> i32
         ptr = lent.reg
     else if array_place_shape(s, arg, @place) == 1
         ptr = emit_array_place_ptr(s, arg)
-    else if arg.kind == ExprKind.Member and arg_field_is_array(s, arg) == 1
+    else if arg.kind == ExprKind.Member and arg_field_is_array(s, arg)
         var mr: MemberPtrResult
         emit_member_ptr(s, arg, @mr)
         ptr = mr.reg
@@ -492,7 +492,7 @@ pub fn emit_expr_into_field(s: *EmitterState, e: *Expr, field: *StructField) -> 
 # AGAST #2354: every slot reads `arg` as expr_is_ptr_valued says it is, and an
 # `@&U` local is a `ptr`, so its place's address stays one.
 fn emit_borrowed_place(s: *EmitterState, arg: *Expr, p: *Param) -> i32
-    if borrow_arg_kind(s, arg, p) != BORROW_PLACE
+    if borrow_arg_kind(s, arg, p) != BorrowKind.Place
         return 0
     let ptr: i32 = emit_lvalue_ptr(s, arg)
     if ptr < 0
@@ -510,12 +510,10 @@ fn emit_borrowed_place(s: *EmitterState, arg: *Expr, p: *Param) -> i32
 # the loaded struct value.  `ctor` is the constructor, for the error when
 # nothing names its enum.
 fn emit_variant_struct(s: *EmitterState, tag: i32, ctor: *Expr) -> i32
-    var enum_name: *u8 = null
-    var enum_name_len: i32 = 0
-    let ok: i32 = resolve_enum_ctx(s, @enum_name, @enum_name_len)
-    if ok == 0
+    let enum_name: StrView = resolve_enum_ctx(s)
+    if unnamed(enum_name)
         return emit_no_enum_ctx_error(s, ctor)
-    return emit_variant_build(s, StrView { ptr: enum_name, len: enum_name_len as i64 }, tag, ctor.args)
+    return emit_variant_build(s, enum_name, tag, ctor.args)
 
 # AGAST #1797: `Holds(x)`, a payload variant of a user enum (unqualified, as
 # ritz0's variant_to_enum resolves it: enum_of_variant), with its payload:
@@ -588,11 +586,10 @@ fn emit_qualified_variant_ctor(s: *EmitterState, e: *Expr, ei: i32, vi: i32) -> 
 fn emit_lent_payload(s: *EmitterState, enum_name: StrView, tag: i32, e: *Expr) -> i32
     if lent_referent_local(s, e) == null
         return 0
-    var pay_len: i32 = 0
-    let pay: *u8 = variant_payload_type_name(s, enum_name, tag, @pay_len)
-    if pay == null or pay_len <= 0
+    let pay: StrView = variant_payload_type_name(s, enum_name, tag)
+    if pay.len <= 0
         return 0
-    return emit_lent_referent(s, e, StrView { ptr: (pay), len: (pay_len) as i64 })
+    return emit_lent_referent(s, e, pay)
 
 # AGAST #2926: emit a variant's payload with the enum context its declared
 # type gives, as emit_call_arg does for a parameter: `Has(Some(6))` with
@@ -600,10 +597,11 @@ fn emit_lent_payload(s: *EmitterState, enum_name: StrView, tag: i32, e: *Expr) -
 # bars the outer one.  Only a payload whose type is known takes a slot; any
 # other keeps the context it had.
 fn emit_payload_into_slot(s: *EmitterState, enum_name: StrView, tag: i32, e: *Expr) -> i32
-    var pay_len: i32 = 0
-    let pay: *u8 = variant_payload_type_name(s, enum_name, tag, @pay_len)
-    if pay == null or pay_len <= 0
+    let pay_ty: StrView = variant_payload_type_name(s, enum_name, tag)
+    if pay_ty.len <= 0
         return emit_expr(s, e)
+    let pay: *u8 = pay_ty.ptr
+    let pay_len: i32 = pay_ty.len as i32
     let saved_name: *u8 = s.ctx_enum_name
     let saved_len: i32 = s.ctx_enum_name_len
     let saved_arg: i32 = s.ctx_enum_arg
@@ -704,7 +702,7 @@ fn store_variant_value(s: *EmitterState, slot: i32, enum_name: StrView, sel: i32
 # The struct or enum payload field `sel` of `enum_name` holds, as `e` builds
 # it; unnamed for a scalar.
 fn payload_aggregate_name(s: *EmitterState, enum_name: StrView, sel: i32, e: *Expr) -> StrView
-    let built: StrView = named_by(variant_payload_aggregate, s, e)
+    let built: StrView = variant_payload_aggregate(s, e)
     if not unnamed(built)
         return built
     # AGAST #1797: a user enum's tuple variant declares its payload type; a
@@ -833,7 +831,7 @@ fn emit_simd_binop(s: *EmitterState, e: *Expr, opname: StrView) -> i32
         return simd_zero(s)
     let a_reg: i32 = emit_expr(s, e.args)
     let b_reg: i32 = emit_expr(s, e.args.next)
-    var vec_name: StrView = simd_resolved(s, e.args)
+    var vec_name: StrView = resolve_simd_arg_type(s, e.args)
     if unnamed(vec_name)
         vec_name = simd_type_of(s, e.args.next)
     let vt: StrView = simd_vec_llvm(vec_name)
@@ -989,19 +987,9 @@ fn simd_zero(s: *EmitterState) -> i32
     format_into(s, "  %.{z} = add i64 0, 0\n")
     z
 
-# The SIMD vector type name (`v4i32`) `arg` resolves to
-# (resolve_simd_arg_type: the operand, then the binding context); unnamed
-# when it resolves to none.
-fn simd_resolved(s: *EmitterState, arg: *Expr) -> StrView
-    var name: *u8 = null
-    var len: i32 = 0
-    if resolve_simd_arg_type(s, arg, @name, @len) == 0
-        return no_name()
-    StrView { ptr: name, len: len as i64 }
-
-# As simd_resolved, defaulting to v4i32 (the most common SSE2 shape).
+# As resolve_simd_arg_type, defaulting to v4i32 (the most common SSE2 shape).
 fn simd_type_of(s: *EmitterState, arg: *Expr) -> StrView
-    let name: StrView = simd_resolved(s, arg)
+    let name: StrView = resolve_simd_arg_type(s, arg)
     if unnamed(name)
         return "v4i32"
     name
@@ -1104,7 +1092,7 @@ fn emit_x86_intrinsic_v2i64(s: *EmitterState, e: *Expr, llvm_name: StrView, arit
     var arg_it: *Expr = e.args
     while arg_it != null and arg_count < 4 and (not has_imm or arg_count < arity)
         var reg: i32 = emit_expr(s, arg_it)
-        let a_name: StrView = simd_arg_type(s, arg_it)
+        let a_name: StrView = resolve_simd_arg_type(s, arg_it)
         if not unnamed(a_name)
             if arg_count == 0
                 res_name = a_name
@@ -1136,15 +1124,6 @@ fn emit_x86_intrinsic_v2i64(s: *EmitterState, e: *Expr, llvm_name: StrView, arit
     emit_simd_vector_type(s, res_name)
     format_into(s, "\n")
     return cast_out
-
-# The SIMD vector type resolve_simd_arg_type names for `arg`; unnamed when it
-# names none.
-fn simd_arg_type(s: *EmitterState, arg: *Expr) -> StrView
-    var name: *u8 = null
-    var len: i32 = 0
-    if resolve_simd_arg_type(s, arg, @name, @len) == 0
-        return no_name()
-    StrView { ptr: name, len: len as i64 }
 
 # `%.N = bitcast <from> %.reg to <to>`: `reg`, of the SIMD vector type named
 # `from`, as the vector type spelled `to`.
@@ -1370,7 +1349,7 @@ fn try_emit_call_builtin(s: *EmitterState, e: *Expr) -> Option<i32>
     # match/return paths get a type-correct aggregate (ritz-task-133).
     # AGAST #2453: a user enum declaring `Ok` / `Some` (or `Err` / `None`)
     # builds its own variant unless an Option / Result slot names the builtin.
-    if users_variant_wins(s, e) == 1
+    if users_variant_wins(s, e)
         return Some(try_emit_user_variant_ctor(s, e))
     if is_variant_carrier(name) == 1
         # Ok / Some = tag 0
@@ -1587,7 +1566,7 @@ fn call_convert_value_arg(s: *EmitterState, e: *Expr, j: i32, param_ptr: *Param,
         TypeKind.F32 | TypeKind.F64 =>
             converted_regs[j] = call_convert_float_arg(s, arg_expr, reg, param_ptr.param_type)
         _ =>
-            if is_span_param(param_ptr) == 1
+            if is_span_param(param_ptr)
                 converted_regs[j] = span_param_arg(s, arg_expr, param_ptr, reg)
             else if param_ptr.param_type != TypeKind.Struct or type_name.len == 0
                 converted_regs[j] = reg
@@ -1644,7 +1623,7 @@ fn call_ref_struct_arg(s: *EmitterState, ref_arg: *Expr, param_ptr: *Param, reg:
     # @Struct.  `reg` holds the %Struct value the call returned: spill it
     # to a stack slot and pass the slot's address as i64.  Without this,
     # the struct-typed reg gets cast to i64 implicitly (clang rejects).
-    if (ref_arg.kind == ExprKind.Method or ref_arg.kind == ExprKind.Call) and call_returns_address(s, ref_arg) == 0
+    if (ref_arg.kind == ExprKind.Method or ref_arg.kind == ExprKind.Call) and not call_returns_address(s, ref_arg)
         let type_name: StrView = StrView { ptr: param_ptr.param_type_name, len: param_ptr.param_type_name_len as i64 }
         let spill: i32 = next_reg(s)
         entry_alloca_reg_begin_named(s, spill)
@@ -1816,7 +1795,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         arg2 = arg2.next
 
     # fn_def is a direct callee or the signature of a fn value.
-    if refuse_array_return(s, e, fn_def) == 1
+    if refuse_array_return(s, e, fn_def)
         return 0
     var ret_type: TypeKind = TypeKind.I64  # Default for unknown functions
     var ret_struct: StrView = no_name()
@@ -1857,7 +1836,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     else
         call_result = next_reg(s)
         format_into(s, "  %.{call_result}")
-        emit_call_ret_kw(s, fn_def, ret_type, ret_struct, call_cc)
+        emit_call_ret_kw(s, fn_def, ret_type, ret_struct, llvm_text(call_cc))
     if icall_fp_reg >= 0
         format_into(s, "%.{icall_fp_reg}(")
     else
@@ -2331,15 +2310,15 @@ fn static_method_args(s: *EmitterState, e: *Expr, sm_method: *FnDef, sm_conv: *i
     for k in 0..sm_arg_count
         sm_conv[k] = sm_arg_regs[k]
         if sm_p != null
-            let sm_nrw: *u8 = method_arg_narrow_suffix(s, sm_p, sm_arg_e)
+            let sm_nrw: StrView = method_arg_narrow_ty(sm_p)
             let sm_sv: i32 = method_strview_arg(s, sm_p, sm_arg_e, sm_arg_regs[k])   # AGAST #3495
             if sm_sv >= 0
                 sm_conv[k] = sm_sv
-            else if sm_nrw != null
+            else if not unnamed(sm_nrw)
                 sm_conv[k] = emit_method_arg_trunc(s, sm_arg_regs[k], sm_nrw)
-            else if is_span_param(sm_p) == 1
+            else if is_span_param(sm_p)
                 sm_conv[k] = span_param_arg(s, sm_arg_e, sm_p, sm_arg_regs[k])   # AGAST #3246
-            else if param_takes_addr_value(s, sm_arg_e, sm_p) == 1
+            else if param_takes_addr_value(s, sm_arg_e, sm_p)
                 sm_conv[k] = i64_value_to_ptr(s, sm_arg_e, sm_arg_regs[k])   # AGAST #2287
             else if sm_p.param_type == TypeKind.F32 or sm_p.param_type == TypeKind.F64
                 # A float literal is a double, an int one an i64
@@ -2388,14 +2367,13 @@ fn try_emit_static_method(s: *EmitterState, e: *Expr) -> Option<i32>
     var sm_method: *FnDef = found.def
     # The callee's symbol: `<Type>_<method>`, or for a generic impl
     # the slot's instance's (AGAST #3309).
-    var sm_name: *u8 = null
-    var sm_name_len: i32 = 0
-    if sm_ib.type_params != null
-        sm_method = generic_static_method(s, e, @sm_name, @sm_name_len)
+    let sm_generic: bool = sm_ib.type_params != null
+    if sm_generic
+        sm_method = generic_static_method(s, e)
         if sm_method == null
             return Some(0)
     note_method_callee(s, e, sm_method)   # AGAST #2237
-    if refuse_array_return(s, e, sm_method) == 1
+    if refuse_array_return(s, e, sm_method)
         return Some(0)
     # A receiver is what `self` takes, and a type isn't one, as in
     # ritz0 (AGAST #2393): a lent `self` either (#3236).
@@ -2424,8 +2402,8 @@ fn try_emit_static_method(s: *EmitterState, e: *Expr) -> Option<i32>
         sm_result = next_reg(s)
         format_into(s, "  %.{sm_result} = call ")
         emit_fn_ret_llvm_type(s, sm_method)   # AGAST #2302: `-> [N]T` is `[N x T]`
-    if sm_name != null
-        let callee_ir: String = ir_name(StrView { ptr: (sm_name), len: (sm_name_len) as i64 })
+    if sm_generic
+        let callee_ir: String = ir_name(StrView { ptr: (sm_method.name), len: (sm_method.name_len) as i64 })
         format_into(s, " @{callee_ir.as_view()}(")
     else
         let type_ir: String = ir_name(type_sv)
@@ -2452,7 +2430,7 @@ fn try_emit_static_method(s: *EmitterState, e: *Expr) -> Option<i32>
     # emit_extern_declarations skips one this .ll defines
     # (is_local_function), so no local check is needed here.
     # A generic impl's instance is specialised into this module.
-    if sm_name == null
+    if not sm_generic
         add_method_extern(s, type_sv, method_sv)
     if sm_sret > 0
         return Some(emit_call_sret_result(s, sm_method, sm_result, sm_sret, ret_name))
@@ -2758,15 +2736,14 @@ fn method_recv_ptr_ptr(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
     # array's element is a place, so a `self: **S` (#3071) takes it there.
     if r.type_name.len != 0 or r.receiver_reg != 0 or r.recv_value_reg >= 0
         return
-    var pp_name: *u8 = null
-    var pp_len: i32 = 0
-    let pp_levels: i32 = recv_ptr_ptr_levels(s, recv, @pp_name, @pp_len)
+    let pp: PtrLevels = recv_ptr_ptr_levels(s, recv)
+    let pp_levels: i32 = pp.levels
     if pp_levels < 2
         return
-    r.type_name = StrView { ptr: (pp_name), len: (pp_len) as i64 }
+    r.type_name = pp.name
     r.recv_is_ptr_of_ptr = true
     r.recv_levels = pp_levels
-    if recv.kind == ExprKind.Ident or recv_elem_is_local_array(s, recv) == 1
+    if recv.kind == ExprKind.Ident or recv_elem_is_local_array(s, recv)
         r.recv_base = emit_lvalue_ptr(s, recv)
         r.receiver_reg = emit_load_levels(s, r.recv_base, pp_levels - 1)
     else
@@ -2852,7 +2829,7 @@ fn method_recv_index(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
     else if array_elem_pointee(s, recv, @elem_name, @elem_len) == TypeKind.Struct
         # AGAST #2332: `a[i].m()` with `a: [N]*S`: the element IS the receiver.
         var elem_ptr: i32 = 0
-        if recv_elem_is_local_array(s, recv) == 1
+        if recv_elem_is_local_array(s, recv)
             # AGAST #3071: a local array's element is a place, so a `self: **S`
             # can take it.  Its index runs once: the element loads from it.
             r.recv_base = emit_lvalue_ptr(s, recv)
@@ -2928,10 +2905,8 @@ fn try_emit_method_builtin(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRe
         # trait impl on that built-in type (only legal in the trait's file).  Only
         # when such a method exists: otherwise the BitOps intrinsics below keep
         # their no-impl-name path (`x.count_ones()`).
-        var br_len: i32 = 0
-        let br: *u8 = builtin_receiver_name(s, recv, @br_len)
-        if br != null
-            let br_name: StrView = StrView { ptr: (br), len: (br_len) as i64 }
+        let br_name: StrView = builtin_receiver_name(s, recv)
+        if not unnamed(br_name)
             if find_impl_method(s, br_name, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
                 r.type_name = br_name
 
@@ -2994,18 +2969,18 @@ fn method_coerce_args(s: *EmitterState, e: *Expr, mfn: *FnDef, arg_regs: *i32, c
             # Integer args are i64 registers; narrow them to the param width
             # like the free-fn and UFCS paths do, or the call passes an i64
             # register under an iN type (AGAST #1607, #1580).
-            let narrow_to: *u8 = method_arg_narrow_suffix(s, mp, mbe)
+            let narrow_to: StrView = method_arg_narrow_ty(mp)
             let sv_arg: i32 = method_strview_arg(s, mp, mbe, arg_regs[j])   # AGAST #3495
             if sv_arg >= 0
                 conv_regs[j] = sv_arg
-            else if narrow_to != null
+            else if not unnamed(narrow_to)
                 conv_regs[j] = emit_method_arg_trunc(s, arg_regs[j], narrow_to)
-            else if is_span_param(mp) == 1 and mbe != null
+            else if is_span_param(mp) and mbe != null
                 # AGAST #2305: `r.len(@a)` builds its Span as `len(@a)` does.
                 conv_regs[j] = span_param_arg(s, mbe, mp, arg_regs[j])
             else if mp.param_type == TypeKind.F32 or mp.param_type == TypeKind.F64
                 conv_regs[j] = method_float_arg(s, mp, mbe, arg_regs[j])   # AGAST #2561
-            else if param_takes_addr_value(s, mbe, mp) == 1
+            else if param_takes_addr_value(s, mbe, mp)
                 # AGAST #2287: as the free-call cascade does for any `@&T`.
                 conv_regs[j] = i64_value_to_ptr(s, mbe, arg_regs[j])
             else if mp.param_type == TypeKind.MutRef
@@ -3077,12 +3052,12 @@ fn emit_impl_method_call(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv
     if mfn == null
         mfn = find_spec_impl_method(s, r.type_name, method_sv)
         mfn_is_spec = mfn != null
-    if mfn == null and refuse_no_method(s, e, r.type_name) == 1
+    if mfn == null and refuse_no_method(s, e, r.type_name)
         return 0
     note_method_callee(s, e, mfn)   # AGAST #2237
-    if refuse_array_return(s, e, mfn) == 1
+    if refuse_array_return(s, e, mfn)
         return 0
-    if refuse_receiver_short_of_self(s, recv, mfn, r.recv_levels) == 1
+    if refuse_receiver_short_of_self(s, recv, mfn, r.recv_levels)
         return 0
     # AGAST #3071: a `self` two levels or more from its struct is the pointer
     # at those levels: the place of a receiver one short (lent, §5.4), or what
