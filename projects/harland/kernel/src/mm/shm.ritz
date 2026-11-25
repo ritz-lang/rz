@@ -1,0 +1,272 @@
+# Harland Shared Objects (AGAST #4717)
+#
+# docs/RING1_DRIVER.md, "Shared object" and "Grants". A ShmObject is kernel
+# memory: its page list, a mapping count, a retired flag and an object id
+# that is never reused. The object owns its pages; a mapping is a
+# non-owning leaf (PTE_SHM) that vmm_free_user_pt skips, so freeing a
+# process's PML4 can't return the object's frames to the PMM.
+#
+# ShmMap (227) maps an object into a process from the process's cursor in
+# the ring window, PML4[251] (DRV_RING_BASE), and records (object id, pid,
+# virtual address). A second map by the same process returns the address it
+# already has and adds nothing; a map by another process allocates no page
+# for the object (only page tables, if its window has none yet). CapRevoke
+# of a process's last handle unmaps that process only (shm_unmap); its exit
+# forgets its records (shm_forget_pid) and its PML4's teardown leaves the
+# leaves' frames alone.
+#
+# Not here: retire, detach, the detach timeout and event latches (ring plan
+# T21 and T23). Nothing outside the shm-map boot test creates an object yet.
+#
+# Like the capability tables, these tables take no lock: they are reached
+# from syscalls of the calling process and from boot, as the cap tables are.
+
+import ritzlib.option
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
+import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_SHM, DRV_RING_BASE, DRV_DMA_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, phys_to_virt }
+import syscall.errno { Errno }
+
+# Pages one object holds: a frame ring or an app exchange fits.
+pub const SHM_MAX_PAGES: u64 = 16
+const MAX_SHM_OBJECTS: i32 = 16
+# Live (object, process) mappings, system-wide.
+const MAX_SHM_MAPS: i32 = 32
+# Processes with a ring-window cursor.
+const MAX_SHM_CURSORS: i32 = 16
+
+pub struct ShmObject
+    id: u64                 # never reused; the slot is free when in_use is false
+    pages: [16]u64          # SHM_MAX_PAGES physical frames, owned by the object
+    page_count: u64
+    map_count: u32          # live mappings: one per process that mapped it
+    retired: bool           # set by retire (later tasks); a retired object maps nothing
+    in_use: bool
+    _padding: [2]u8
+
+# One process's mapping of one object.
+struct ShmMapping
+    object_id: u64
+    pml4: u64               # the process's page table, for CapRevoke's unmap
+    vaddr: u64
+    pid: u32
+    in_use: bool
+    _padding: [3]u8
+
+# A process's next free address in the ring window. It only moves up, so
+# an address an unmapped object used is never handed to another object in
+# that process: a stale pointer can't reach a replacement's pages.
+struct ShmCursor
+    next: u64
+    pid: u32
+    in_use: bool
+    _padding: [3]u8
+
+var shm_objects: [16]ShmObject
+var shm_maps: [32]ShmMapping
+var shm_cursors: [16]ShmCursor
+var shm_next_id: u64 = 1
+
+# ============================================================================
+# Objects
+# ============================================================================
+
+# The slot holding object `id`, or -1.
+fn shm_object_slot(id: u64) -> i32
+    var i: i32 = 0
+    while i < MAX_SHM_OBJECTS
+        if shm_objects[i].in_use and shm_objects[i].id == id
+            return i
+        i = i + 1
+    return -1
+
+fn shm_free_pages(slot: i32, count: u64)
+    var p: u64 = 0
+    while p < count
+        pmm_free_page(shm_objects[slot].pages[p as i32])
+        shm_objects[slot].pages[p as i32] = 0
+        p = p + 1
+
+# A new object of `page_count` zeroed pages, by its id, or None when
+# page_count is 0 or over SHM_MAX_PAGES, no slot is free, or the PMM ran
+# out (nothing is left allocated). Ids start at 1 and are never reused.
+pub fn shm_create(page_count: u64) -> Option<u64>
+    if page_count == 0 or page_count > SHM_MAX_PAGES
+        return None
+    var slot: i32 = 0
+    while slot < MAX_SHM_OBJECTS and shm_objects[slot].in_use
+        slot = slot + 1
+    if slot == MAX_SHM_OBJECTS
+        return None
+    var p: u64 = 0
+    while p < page_count
+        let frame: u64 = pmm_alloc_page()
+        if frame == 0
+            shm_free_pages(slot, p)
+            return None
+        # A frame comes back holding its last owner's bytes (#4332)
+        let words: *u64 = phys_to_virt(frame) as *u64
+        var w: i64 = 0
+        while w < 512
+            *(words + w) = 0
+            w = w + 1
+        shm_objects[slot].pages[p as i32] = frame
+        p = p + 1
+    let id: u64 = shm_next_id
+    shm_next_id = shm_next_id + 1
+    shm_objects[slot].id = id
+    shm_objects[slot].page_count = page_count
+    shm_objects[slot].map_count = 0
+    shm_objects[slot].retired = false
+    shm_objects[slot].in_use = true
+    return Some(id)
+
+# Free object `id` and its pages. Only an object no process maps: false (and
+# nothing freed) while any mapping is live, or for an unknown id. Until
+# retire lands (T21) only the shm-map boot test frees an object.
+pub fn shm_destroy(id: u64) -> bool
+    let slot: i32 = shm_object_slot(id)
+    if slot < 0 or shm_objects[slot].map_count != 0
+        return false
+    shm_free_pages(slot, shm_objects[slot].page_count)
+    shm_objects[slot].in_use = false
+    shm_objects[slot].page_count = 0
+    return true
+
+# Frame `index` of object `id`, or 0.
+pub fn shm_page(id: u64, index: u64) -> u64
+    let slot: i32 = shm_object_slot(id)
+    if slot < 0 or index >= shm_objects[slot].page_count
+        return 0
+    return shm_objects[slot].pages[index as i32]
+
+# How many processes map object `id` (0 for an unknown id).
+pub fn shm_map_count(id: u64) -> u32
+    let slot: i32 = shm_object_slot(id)
+    if slot < 0
+        return 0
+    return shm_objects[slot].map_count
+
+# ============================================================================
+# Mappings
+# ============================================================================
+
+# The mapping record of `pid`'s map of object `id`, or -1.
+fn shm_mapping_slot(pid: u32, id: u64) -> i32
+    var i: i32 = 0
+    while i < MAX_SHM_MAPS
+        if shm_maps[i].in_use and shm_maps[i].pid == pid and shm_maps[i].object_id == id
+            return i
+        i = i + 1
+    return -1
+
+# `pid`'s cursor slot, made (at DRV_RING_BASE) if it has none; -1 if full.
+fn shm_cursor_slot(pid: u32) -> i32
+    var free: i32 = -1
+    var i: i32 = 0
+    while i < MAX_SHM_CURSORS
+        if shm_cursors[i].in_use and shm_cursors[i].pid == pid
+            return i
+        if free < 0 and not shm_cursors[i].in_use
+            free = i
+        i = i + 1
+    if free >= 0
+        shm_cursors[free].pid = pid
+        shm_cursors[free].next = DRV_RING_BASE
+        shm_cursors[free].in_use = true
+    return free
+
+# Clear `pages` non-owning leaves from vaddr in pml4; the frames stay the
+# object's.
+fn shm_clear_leaves(pml4: u64, vaddr: u64, pages: u64)
+    var p: u64 = 0
+    while p < pages
+        vmm_unmap_page_in(pml4, vaddr + p * PAGE_SIZE)
+        p = p + 1
+
+# ShmMap: map object `id` into process `pid`, whose page table is `pml4`,
+# as user, NX, write-back leaves (writable if `writable`), from the
+# process's ring-window cursor. The address, or a negative errno:
+#   - the address it already has when `pid` maps `id` (no new mapping, and
+#     `writable` is not revisited);
+#   - Errno.NoDev for an unknown or retired object;
+#   - Errno.NoMem when the mapping or cursor table is full, the ring window
+#     has no room left, or a page table could not be had (no leaf is left).
+# The syscall's argument checks (the caller holds a shm handle) are
+# sys_shm_map's, in cap/syscall.ritz.
+pub fn shm_map(pid: u32, pml4: u64, id: u64, writable: bool) -> i64
+    let slot: i32 = shm_object_slot(id)
+    if slot < 0 or shm_objects[slot].retired
+        return Errno.NoDev as i64
+    let mapped: i32 = shm_mapping_slot(pid, id)
+    if mapped >= 0
+        return shm_maps[mapped].vaddr as i64
+    var m: i32 = 0
+    while m < MAX_SHM_MAPS and shm_maps[m].in_use
+        m = m + 1
+    if m == MAX_SHM_MAPS
+        return Errno.NoMem as i64
+    let c: i32 = shm_cursor_slot(pid)
+    if c < 0
+        return Errno.NoMem as i64
+    let pages: u64 = shm_objects[slot].page_count
+    let vaddr: u64 = shm_cursors[c].next
+    if pages > (DRV_DMA_BASE - vaddr) / PAGE_SIZE
+        return Errno.NoMem as i64
+
+    var flags: u64 = PTE_USER | PTE_SHM | vmm_nx_flag()
+    if writable
+        flags = flags | PTE_WRITABLE
+    var p: u64 = 0
+    while p < pages
+        if vmm_map_page_in(pml4, vaddr + p * PAGE_SIZE, shm_objects[slot].pages[p as i32], flags) != 0
+            shm_clear_leaves(pml4, vaddr, p)
+            return Errno.NoMem as i64
+        p = p + 1
+
+    shm_maps[m].object_id = id
+    shm_maps[m].pml4 = pml4
+    shm_maps[m].vaddr = vaddr
+    shm_maps[m].pid = pid
+    shm_maps[m].in_use = true
+    shm_objects[slot].map_count = shm_objects[slot].map_count + 1
+    shm_cursors[c].next = vaddr + pages * PAGE_SIZE
+    return vaddr as i64
+
+# Drop mapping record `m` and its count on the object.
+fn shm_drop_mapping(m: i32)
+    let slot: i32 = shm_object_slot(shm_maps[m].object_id)
+    if slot >= 0 and shm_objects[slot].map_count > 0
+        shm_objects[slot].map_count = shm_objects[slot].map_count - 1
+    shm_maps[m].in_use = false
+    shm_maps[m].pid = 0
+    shm_maps[m].object_id = 0
+
+# Unmap object `id` from process `pid` only: clear its leaves (the frames
+# stay the object's) and drop its mapping. Another process's mapping is not
+# touched. False when `pid` doesn't map `id`. CapRevoke of `pid`'s last
+# handle for the object calls it (cap/table.ritz).
+pub fn shm_unmap(pid: u32, id: u64) -> bool
+    let m: i32 = shm_mapping_slot(pid, id)
+    if m < 0
+        return false
+    let slot: i32 = shm_object_slot(id)
+    if slot >= 0
+        shm_clear_leaves(shm_maps[m].pml4, shm_maps[m].vaddr, shm_objects[slot].page_count)
+    shm_drop_mapping(m)
+    return true
+
+# Process `pid` is going away (its capability table is being freed: exit or
+# a spawn undone): drop its mappings and its cursor. Its leaves are left in
+# place: its PML4 is freed next, and vmm_free_user_pt skips PTE_SHM frames.
+pub fn shm_forget_pid(pid: u32)
+    var m: i32 = 0
+    while m < MAX_SHM_MAPS
+        if shm_maps[m].in_use and shm_maps[m].pid == pid
+            shm_drop_mapping(m)
+        m = m + 1
+    var c: i32 = 0
+    while c < MAX_SHM_CURSORS
+        if shm_cursors[c].in_use and shm_cursors[c].pid == pid
+            shm_cursors[c].in_use = false
+            shm_cursors[c].pid = 0
+        c = c + 1

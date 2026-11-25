@@ -4,7 +4,8 @@
 # kernel objects with associated rights.
 
 import klog { klog, klog_dec }
-import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_IRQ, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid, cap_type_is_device, cap_type_is_kernel_granted }
+import mm.shm { shm_unmap, shm_forget_pid }
+import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_IRQ, CAP_TYPE_SHM, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid, cap_type_is_device, cap_type_is_kernel_granted }
 
 # ============================================================================
 # Constants
@@ -97,6 +98,9 @@ pub fn cap_table_free(table: *CapTable) -> i32
         return -1
 
     irq_owner_release_pid((*table).pid)
+    # Its shm mappings end with it; its PML4's teardown leaves their frames
+    # to the objects (#4717)
+    shm_forget_pid((*table).pid)
     (*table).in_use = false
     (*table).pid = 0
     (*table).active_count = 0
@@ -484,14 +488,16 @@ fn cap_table_holds_object(table: *CapTable, cap_type: u8, object_id: u64) -> boo
     return false
 
 # The CapRevoke hook: `table`'s process dropped its last handle of
-# `cap_type` for `object_id`. An IRQ owner stops owning the device's IRQ.
-# MMIO and SHM leaves are unmapped here once a later ring-1 task maps them
-# (docs/RING1_DRIVER.md, Grants); today nothing maps them, so there is
-# nothing to unmap. Other types have no per-process mapping. Another
-# process's handles and mappings are never touched.
+# `cap_type` for `object_id`. An IRQ owner stops owning the device's IRQ. A
+# shm object is unmapped from that process only (#4717). MMIO leaves are
+# unmapped here once a later ring-1 task maps them (docs/RING1_DRIVER.md,
+# Grants); today nothing maps them. Other types have no per-process
+# mapping. Another process's handles and mappings are never touched.
 fn cap_last_handle_dropped(table: *CapTable, cap_type: u8, object_id: u64)
     if cap_type == CAP_TYPE_IRQ
         irq_owner_release(object_id, (*table).pid)
+    else if cap_type == CAP_TYPE_SHM
+        shm_unmap((*table).pid, object_id)
 
 # CapRevoke: remove `handle` from `table` (only the caller's copy) and, when
 # the caller holds no other handle for the same object, run the hook. False

@@ -121,7 +121,11 @@ def test_vmm_frees_no_device_frame():
     body = _fn(VMM, "vmm_free_user_pt")
     frees = re.findall(r"^(\s+)(?:if .*\n\s+)?pmm_free_page\(", body, re.M)
     assert len(frees) == 1, body
-    assert re.search(r"if \(pt_entry & PTE_PRESENT\) != 0 and \(pt_entry & PTE_DEVICE\) == 0\n"
+    # A PTE_SHM leaf is a shared object's frame, not the process's (#4717):
+    # skipped too, and on its own bit.
+    m_shm = re.search(r"^pub const PTE_SHM: u64 = (\d+)$", src, re.M)
+    assert m_shm and int(m_shm.group(1)) in (1 << 10, 1 << 11), "vmm.ritz defines no PTE_SHM on a free OS bit"
+    assert re.search(r"if \(pt_entry & PTE_PRESENT\) != 0 and \(pt_entry & \(PTE_DEVICE \| PTE_SHM\)\) == 0\n"
                      r"\s+pmm_free_page\(pt_entry & PTE_ADDR_MASK\)", body), body
 
 

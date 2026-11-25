@@ -27,6 +27,10 @@ pub const PTE_NO_EXECUTE: u64 = 9223372036854775808
 # as the user framebuffer) that the PMM never owned. vmm_free_user_pt leaves
 # such frames alone (#2755).
 pub const PTE_DEVICE: u64 = 512
+# Bit 10, also the OS's: a non-owning leaf onto a shared object's RAM page
+# (mm/shm.ritz, AGAST #4717). The ShmObject owns the frame, not the address
+# space mapping it, so vmm_free_user_pt leaves it to the object.
+pub const PTE_SHM: u64 = 1024
 
 # Address masks
 # Physical address mask (bits 12-51) = 0x000FFFFFFFFFF000
@@ -960,6 +964,33 @@ pub fn vmm_map_page_in(pml4: u64, vaddr: u64, paddr: u64, flags: u64) -> i32
 
     return result
 
+# vmm_unmap_page in a specific page table: the frame that was mapped at
+# vaddr, or 0. The tables stay. Its invlpg reaches only the current address
+# space; a pml4 that is not loaded has no TLB entries for vaddr on this CPU.
+pub fn vmm_unmap_page_in(pml4: u64, vaddr: u64) -> u64
+    let saved_pml4: u64 = vmm_pml4_phys
+    vmm_pml4_phys = pml4
+    let paddr: u64 = vmm_unmap_page(vaddr)
+    vmm_pml4_phys = saved_pml4
+    return paddr
+
+# The 4 KiB leaf PTE mapping vaddr in `pml4`, flags and all, or 0 when
+# vaddr has none (absent, or inside a huge page).
+pub fn vmm_pte_in(pml4: u64, vaddr: u64) -> u64
+    let pml4_entry: u64 = vmm_get_entry(pml4, vmm_pml4_index(vaddr))
+    if (pml4_entry & PTE_PRESENT) == 0
+        return 0
+    let pdpt_entry: u64 = vmm_get_entry(pml4_entry & PTE_ADDR_MASK, vmm_pdpt_index(vaddr))
+    if (pdpt_entry & PTE_PRESENT) == 0 or (pdpt_entry & PTE_HUGE) != 0
+        return 0
+    let pd_entry: u64 = vmm_get_entry(pdpt_entry & PTE_ADDR_MASK, vmm_pd_index(vaddr))
+    if (pd_entry & PTE_PRESENT) == 0 or (pd_entry & PTE_HUGE) != 0
+        return 0
+    let pt_entry: u64 = vmm_get_entry(pd_entry & PTE_ADDR_MASK, vmm_pt_index(vaddr))
+    if (pt_entry & PTE_PRESENT) == 0
+        return 0
+    return pt_entry
+
 # Free all user-space pages in a page table (for process cleanup)
 # Does NOT free the kernel mappings or the PML4 itself
 #
@@ -1011,14 +1042,15 @@ fn vmm_free_user_pd(pd_phys: u64)
             pmm_free_page(pt_phys)
         pd_idx = pd_idx + 1
 
-# Free every present RAM page mapped by a PT (not the PT page itself).
+# Free every present RAM page a PT's process owns (not the PT page itself).
 fn vmm_free_user_pt(pt_phys: u64)
     var pt_idx: u64 = 0
     while pt_idx < 512
         let pt_entry: u64 = vmm_get_entry(pt_phys, pt_idx)
-        # RAM-backed pages only: a PTE_DEVICE frame is MMIO, not the PMM's,
-        # and may lie below the top of RAM (#2755).
-        if (pt_entry & PTE_PRESENT) != 0 and (pt_entry & PTE_DEVICE) == 0
+        # Owned pages only: a PTE_DEVICE frame is MMIO, not the PMM's, and
+        # may lie below the top of RAM (#2755); a PTE_SHM frame belongs to
+        # its ShmObject, which outlives this mapping (#4717).
+        if (pt_entry & PTE_PRESENT) != 0 and (pt_entry & (PTE_DEVICE | PTE_SHM)) == 0
             pmm_free_page(pt_entry & PTE_ADDR_MASK)
         pt_idx = pt_idx + 1
 

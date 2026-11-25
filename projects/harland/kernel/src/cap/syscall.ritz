@@ -4,7 +4,8 @@
 
 import klog { klog, klog_dec }
 import syscall.errno { Errno }
-import cap.types { CapHandle, CapEntry, CapInfo, cap_handle_init, cap_type_is_device }
+import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, cap_handle_init, cap_type_is_device }
+import mm.shm { shm_map }
 import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_revoke, cap_table_derive, cap_grant, cap_table_info, cap_has_rights }
 
 # ============================================================================
@@ -84,6 +85,37 @@ pub fn sys_cap_revoke(caller_pid: u32, handle_packed: u64) -> i64
     if not cap_revoke(table, handle)
         return Errno.BadF as i64  # no such capability
     return 0
+
+# ============================================================================
+# SYS_SHM_MAP (227)
+# ============================================================================
+#
+# Map the shared object a CAP_TYPE_SHM handle names into the caller, whose
+# page table is `pml4` (AGAST #4717, docs/RING1_DRIVER.md §5 and "Shared
+# object"). The leaves are non-owning, user, NX and write-back; writable
+# only with CAP_RIGHT_WRITE. A second map of the same object returns the
+# same address.
+# Args:
+#   handle: CAP_TYPE_SHM handle (packed) with CAP_RIGHT_READ
+# Returns:
+#   The user virtual address, in the ring window (PML4[251])
+#   Errno.Perm: no table, a handle the caller doesn't hold, not a shm
+#   handle, or no READ right
+#   Errno.NoDev / Errno.NoMem: see shm_map
+
+pub fn sys_shm_map(caller_pid: u32, pml4: u64, handle_packed: u64) -> i64
+    let index: u32 = (handle_packed & 0xFFFFFFFF) as u32
+    let generation: u32 = ((handle_packed >> 32) & 0xFFFFFFFF) as u32
+    let table: *CapTable = cap_table_get(caller_pid)
+    if table == 0 as *CapTable
+        return Errno.Perm as i64
+    let entry: *CapEntry = cap_table_lookup(table, cap_handle_init(index, generation))
+    if entry == 0 as *CapEntry or (*entry).cap_type != CAP_TYPE_SHM
+        return Errno.Perm as i64
+    if ((*entry).rights & CAP_RIGHT_READ) == 0
+        return Errno.Perm as i64
+    let writable: bool = ((*entry).rights & CAP_RIGHT_WRITE) != 0
+    return shm_map(caller_pid, pml4, (*entry).object_id, writable)
 
 # ============================================================================
 # SYS_CAP_DERIVE

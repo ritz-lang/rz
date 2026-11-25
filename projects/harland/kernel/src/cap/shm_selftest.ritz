@@ -1,0 +1,192 @@
+# Harland Shared Objects - "shm-map" boot self-test (AGAST #4717)
+#
+# docs/RING1_DRIVER.md, "Shared object" and "Grants": two processes map one
+# ShmObject through ShmMap (227) and share its pages; a second map by the
+# same process returns the same address and allocates nothing, and the
+# other's map allocates no page for the object; CapRevoke of a process's
+# last handle unmaps that process only; and when one process exits, the
+# other keeps its mapping and the pages stay allocated.
+#
+# The two processes are what the kernel builds for a CPL-3 process (D8 =
+# (b)): a capability table and an isolated user PML4 each. The test drives
+# the handlers ring 3 reaches (sys_shm_map, sys_cap_revoke) with each one's
+# pid and page table, and "exits" one the way sys_exit_impl does: its
+# capability table is freed, then its PML4. It runs in boot_self_tests on
+# the kernel PML4 with no process and interrupts off, so the PMM free count
+# is deterministic, and it gives back every page it took.
+
+import ritzlib.option
+import mm.pmm { PAGE_SIZE, pmm_get_free_pages, pmm_range_has_free }
+import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_NO_EXECUTE, PTE_DEVICE, PTE_SHM, PTE_ADDR_MASK, DRV_RING_BASE, vmm_create_user_pml4, vmm_free_pml4, vmm_pte_in, vmm_nx_flag, phys_to_virt }
+import mm.shm { shm_create, shm_destroy, shm_page, shm_map_count }
+import syscall.errno { Errno }
+import cap.types { CapHandle, CAP_TYPE_SHM, CAP_TYPE_MMIO, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_ALL }
+import cap.table { CapTable, cap_table_alloc, cap_table_free_pid, cap_kernel_grant }
+import cap.syscall { sys_shm_map, sys_cap_revoke }
+
+# Pids no process gets: the test runs before /bin/init and frees both.
+const SHM_PID_A: u32 = 0xFFFFFE00
+const SHM_PID_B: u32 = 0xFFFFFE01
+const SHM_PID_NONE: u32 = 0xFFFFFE02     # has no capability table
+const SHM_TEST_BAR: u64 = 0xFFFF0004
+const SHM_OBJ_PAGES: u64 = 4
+# A fresh user PML4's first map in the ring window builds its PDPT, PD and
+# PT; every later map there reuses them.
+const SHM_WINDOW_TABLES: u64 = 3
+const SHM_MARKER: u64 = 0x53484D4D41500001
+# Added to a packed handle: the same index, a generation never issued.
+const SHM_STALE_GENERATION: u64 = 0x0000100000000000
+
+# What the test made, so teardown frees it whichever step failed.
+var g_pml4_a: u64 = 0
+var g_pml4_b: u64 = 0
+var g_obj: u64 = 0
+var g_obj2: u64 = 0
+
+fn shm_pack(h: CapHandle) -> u64
+    return (h.index as u64) | ((h.generation as u64) << 32)
+
+# A read-write shm handle for object `id` in `pid`'s table, packed.
+fn shm_granted(pid: u32, id: u64) -> u64
+    return shm_pack(cap_kernel_grant(pid, CAP_TYPE_SHM, CAP_RIGHT_READ | CAP_RIGHT_WRITE, id))
+
+fn shm_invalid(packed: u64) -> bool
+    return (packed & 0xFFFFFFFF) == 0xFFFFFFFF
+
+# True when `pml4` maps object `id`'s `pages` frames, in order, from vaddr
+# as non-owning, user, writable, write-back leaves, NX where the CPU has it.
+fn shm_leaves_ok(pml4: u64, vaddr: u64, id: u64, pages: u64) -> bool
+    let need: u64 = PTE_PRESENT | PTE_USER | PTE_WRITABLE | PTE_SHM
+    let never: u64 = PTE_DEVICE | PTE_WRITE_THROUGH | PTE_CACHE_DISABLE
+    var p: u64 = 0
+    while p < pages
+        let pte: u64 = vmm_pte_in(pml4, vaddr + p * PAGE_SIZE)
+        if (pte & PTE_ADDR_MASK) != shm_page(id, p) or (pte & need) != need
+            return false
+        if (pte & never) != 0 or (pte & PTE_NO_EXECUTE) != vmm_nx_flag()
+            return false
+        p = p + 1
+    return true
+
+fn shm_map_steps() -> i32
+    g_obj = shm_create(SHM_OBJ_PAGES).unwrap_or(0)
+    g_obj2 = shm_create(1).unwrap_or(0)
+    if g_obj == 0 or g_obj2 == 0
+        return 3
+    *(phys_to_virt(shm_page(g_obj, 0)) as *u64) = SHM_MARKER
+    let a: u64 = shm_granted(SHM_PID_A, g_obj)
+    let b: u64 = shm_granted(SHM_PID_B, g_obj)
+    let a2: u64 = shm_granted(SHM_PID_A, g_obj2)
+    let b2: u64 = shm_granted(SHM_PID_B, g_obj2)
+    if shm_invalid(a) or shm_invalid(b) or shm_invalid(a2) or shm_invalid(b2)
+        return 4
+
+    # A's first map: at the window base, onto the object's own frames; the
+    # only pages it takes are A's window tables
+    var free: u64 = pmm_get_free_pages()
+    if sys_shm_map(SHM_PID_A, g_pml4_a, a) != DRV_RING_BASE as i64
+        return 5
+    if free - pmm_get_free_pages() != SHM_WINDOW_TABLES
+        return 6
+    if not shm_leaves_ok(g_pml4_a, DRV_RING_BASE, g_obj, SHM_OBJ_PAGES)
+        return 7
+    # A's second map: the same address, nothing allocated, one mapping
+    free = pmm_get_free_pages()
+    if sys_shm_map(SHM_PID_A, g_pml4_a, a) != DRV_RING_BASE as i64 or pmm_get_free_pages() != free
+        return 8
+    if shm_map_count(g_obj) != 1
+        return 9
+    # B's map: its own cursor, the same frames, no page for the object
+    if sys_shm_map(SHM_PID_B, g_pml4_b, b) != DRV_RING_BASE as i64
+        return 10
+    if free - pmm_get_free_pages() != SHM_WINDOW_TABLES
+        return 11
+    if not shm_leaves_ok(g_pml4_b, DRV_RING_BASE, g_obj, SHM_OBJ_PAGES) or shm_map_count(g_obj) != 2
+        return 12
+    # Each process's next object lands past its first
+    let after: u64 = DRV_RING_BASE + SHM_OBJ_PAGES * PAGE_SIZE
+    if sys_shm_map(SHM_PID_A, g_pml4_a, a2) != after as i64 or sys_shm_map(SHM_PID_B, g_pml4_b, b2) != after as i64
+        return 13
+
+    # No table, a stale handle or a non-shm handle: Errno.Perm
+    let bar: u64 = shm_pack(cap_kernel_grant(SHM_PID_B, CAP_TYPE_MMIO, CAP_RIGHT_ALL, SHM_TEST_BAR))
+    if sys_shm_map(SHM_PID_NONE, g_pml4_b, b) != Errno.Perm as i64
+        return 14
+    if sys_shm_map(SHM_PID_B, g_pml4_b, b + SHM_STALE_GENERATION) != Errno.Perm as i64
+        return 15
+    if shm_invalid(bar) or sys_shm_map(SHM_PID_B, g_pml4_b, bar) != Errno.Perm as i64
+        return 16
+
+    # CapRevoke of a handle that is not A's last for obj2 unmaps nothing;
+    # of its last, A's leaves go and B's stay
+    let a2_extra: u64 = shm_granted(SHM_PID_A, g_obj2)
+    if shm_invalid(a2_extra) or sys_cap_revoke(SHM_PID_A, a2_extra) != 0 or vmm_pte_in(g_pml4_a, after) == 0
+        return 17
+    if sys_cap_revoke(SHM_PID_A, a2) != 0 or vmm_pte_in(g_pml4_a, after) != 0
+        return 18
+    if shm_map_count(g_obj2) != 1 or not shm_leaves_ok(g_pml4_b, after, g_obj2, 1)
+        return 19
+
+    # A exits still mapping obj: freeing its PML4 returns its tables (the
+    # window's and the PML4) and none of the object's pages
+    free = pmm_get_free_pages()
+    cap_table_free_pid(SHM_PID_A)
+    vmm_free_pml4(g_pml4_a)
+    g_pml4_a = 0
+    if pmm_get_free_pages() - free != SHM_WINDOW_TABLES + 1
+        return 20
+    var p: u64 = 0
+    while p < SHM_OBJ_PAGES
+        if pmm_range_has_free(shm_page(g_obj, p), PAGE_SIZE)
+            return 21
+        p = p + 1
+    if shm_map_count(g_obj) != 1
+        return 22
+    # B keeps its mapping and what the pages hold
+    if not shm_leaves_ok(g_pml4_b, DRV_RING_BASE, g_obj, SHM_OBJ_PAGES)
+        return 23
+    if *(phys_to_virt(vmm_pte_in(g_pml4_b, DRV_RING_BASE) & PTE_ADDR_MASK) as *u64) != SHM_MARKER
+        return 24
+    # A mapped object can't be freed
+    if shm_destroy(g_obj)
+        return 25
+    # B revokes its last handle: its leaves go, and nobody maps the object
+    if sys_cap_revoke(SHM_PID_B, b) != 0 or vmm_pte_in(g_pml4_b, DRV_RING_BASE) != 0 or shm_map_count(g_obj) != 0
+        return 26
+    return 0
+
+# 0 on pass, else the number of the step that failed (an i32 for the boot
+# log, as cap_device_selftest). Gives back every page it took: a leak is
+# step 28.
+pub fn shm_map_selftest() -> i32
+    let base: u64 = pmm_get_free_pages()
+    g_obj = 0
+    g_obj2 = 0
+    if cap_table_alloc(SHM_PID_A) == 0 as *CapTable
+        return 1
+    if cap_table_alloc(SHM_PID_B) == 0 as *CapTable
+        cap_table_free_pid(SHM_PID_A)
+        return 1
+    g_pml4_a = vmm_create_user_pml4()
+    g_pml4_b = vmm_create_user_pml4()
+    var step: i32 = 2
+    if g_pml4_a != 0 and g_pml4_b != 0
+        step = shm_map_steps()
+
+    # Teardown whichever step failed: both processes exit, then the objects
+    # (mapped by nobody once both tables are freed) go
+    cap_table_free_pid(SHM_PID_A)
+    cap_table_free_pid(SHM_PID_B)
+    if g_pml4_a != 0
+        vmm_free_pml4(g_pml4_a)
+    if g_pml4_b != 0
+        vmm_free_pml4(g_pml4_b)
+    g_pml4_a = 0
+    g_pml4_b = 0
+    let freed: bool = g_obj == 0 or shm_destroy(g_obj)
+    let freed2: bool = g_obj2 == 0 or shm_destroy(g_obj2)
+    if step == 0 and not (freed and freed2)
+        step = 27
+    if step == 0 and pmm_get_free_pages() != base
+        step = 28
+    return step

@@ -66,6 +66,7 @@ AREAS = {
         "sys_channel_create_handler", "sys_ipc_send_handler", "sys_ipc_recv_handler",
         "sys_ipc_close_handler", "sys_cap_grant_handler", "sys_cap_revoke_handler",
         "sys_cap_derive_handler", "sys_cap_info_handler", "sys_cap_check_handler",
+        "sys_shm_map_handler",  # ShmMap (227), #4717
     ],
     "memory": [
         "alloc_user_stack", "free_user_stack", "sys_mmap_impl", "sys_munmap_impl",
@@ -218,7 +219,8 @@ def test_table_registers_handlers_imported_from_their_area():
     each taken from the area module that defines it."""
     code = _code(_area("entry"))
     regs = re.findall(r"^\s+syscall_register\(Syscall\.(\w+),\s*(\w+)\)", _body(code, "syscall_table_init"), re.M)
-    assert len(regs) == 37, regs
+    # 38 since ShmMap (227, #4717).
+    assert len(regs) == 38, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

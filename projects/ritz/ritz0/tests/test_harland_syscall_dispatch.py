@@ -79,6 +79,9 @@ ABI = {
     "Sync": 162,
     "AcpiPoweroff": 200,
     "FbInfo": 210, "FbMap": 211,
+    # ShmMap (227): map a CAP_TYPE_SHM handle into the caller (#4717,
+    # RING1_DRIVER.md §5). The 220-230 device group is otherwise unassigned.
+    "ShmMap": 227,
     "Smp": 254,
     "DebugPrint": 255,
 }
@@ -93,7 +96,7 @@ DISPATCHED = {
     "IpcRecv", "IpcClose", "CapGrant", "CapRevoke", "CapDerive", "CapInfo",
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
-    "Sync", "Smp",
+    "Sync", "Smp", "ShmMap",
 }
 
 
