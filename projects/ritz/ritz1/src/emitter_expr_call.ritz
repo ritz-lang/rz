@@ -17,7 +17,6 @@ import emitter_stmt   # the whole-array copy (AGAST #2287)
 import emitter_expr_access   # emit_whole_array_error (AGAST #2287)
 import emitter_expr_arith    # emit_nd_index_ptr (AGAST #3306)
 import narrowing
-import index_through # emit_through_elem_ptr (AGAST #2443)
 import monomorph     # array_arg_decode (AGAST #3029)
 import ownership     # own_temp_slot_of (AGAST #2262)
 import ritzlib.memory
@@ -419,52 +418,6 @@ fn emit_strview_from_lit(s: *EmitterState, arg: *Expr, reg: i32) -> i32
     emit_str(s, IR_COMMA_1)
     return sv2
 
-# The impl method `type_name.method` defined in this module, or null.
-pub fn find_impl_method(s: *EmitterState, type_name_sv: StrView, method_sv: StrView) -> *FnDef
-    var type_name: *u8 = type_name_sv.ptr
-    var type_name_len: i32 = type_name_sv.len as i32
-    var method: *u8 = method_sv.ptr
-    var method_len: i32 = method_sv.len as i32
-    let exact: *FnDef = find_impl_method_exact(s, StrView { ptr: (type_name), len: (type_name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 })
-    if exact != null
-        return exact
-    # AGAST #4294 (R36's revisit): a concrete built-in target —
-    # `impl Display for Span<u8>` — is one impl block for every instantiation
-    # (R65), so its target is the base name and the receiver is `Span$u8`.
-    # Match the base only for a non-generic impl: a generic impl's methods are
-    # monomorphized into the module's functions (find_spec_impl_method).
-    var base_len: i32 = 0
-    while base_len < type_name_len and *(type_name + base_len) != '$'
-        base_len = base_len + 1
-    if base_len == type_name_len
-        return null
-    var ib: *ImplBlock = s.module.impls
-    while ib != null
-        if ib.type_params == null and name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (type_name), len: (base_len) as i64 }) == 1
-            var mm: *FnDef = ib.methods
-            while mm != null
-                if name_eq(StrView { ptr: (mm.name), len: (mm.name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 }) == 1
-                    return mm
-                mm = mm.next
-        ib = ib.next
-    return null
-
-fn find_impl_method_exact(s: *EmitterState, type_name_sv: StrView, method_sv: StrView) -> *FnDef
-    var type_name: *u8 = type_name_sv.ptr
-    var type_name_len: i32 = type_name_sv.len as i32
-    var method: *u8 = method_sv.ptr
-    var method_len: i32 = method_sv.len as i32
-    var ib: *ImplBlock = s.module.impls
-    while ib != null
-        if name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (type_name), len: (type_name_len) as i64 }) == 1
-            var mm: *FnDef = ib.methods
-            while mm != null
-                if name_eq(StrView { ptr: (mm.name), len: (mm.name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 }) == 1
-                    return mm
-                mm = mm.next
-        ib = ib.next
-    return null
-
 # `<type><sep><method>`, heap-allocated; `lower` lowercases the type's ASCII
 # letters (`Foo`, `cmp` -> `foo_cmp`).  *out_len is its length.
 fn method_fn_name(type_name_sv: StrView, method_sv: StrView, lower: i32, out_len: *i32) -> *u8
@@ -599,42 +552,6 @@ fn eprint_free_call_args(e: *Expr)
         eprint_bytes(StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 })
         a = a.next
     eprint_char(')')
-
-# The function a method call `type_name.method(..)` dispatches to, in
-# emit_expr_method's order: a method of a non-generic impl, else a
-# specialized generic impl method `Type$T_method` (monomorph adds those to the
-# module's functions, not to its impls).  Null when unknown.  No free fn: the
-# UFCS table went with LARB R66 (#3497).  let_check.ritz reads its params
-# (AGAST #2032).
-pub fn method_callee_def(s: *EmitterState, type_name_sv: StrView, method_sv: StrView) -> *FnDef
-    var type_name: *u8 = type_name_sv.ptr
-    var type_name_len: i32 = type_name_sv.len as i32
-    var method: *u8 = method_sv.ptr
-    var method_len: i32 = method_sv.len as i32
-    let m: *FnDef = find_impl_method(s, StrView { ptr: (type_name), len: (type_name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 })
-    if m != null
-        return m
-    return find_spec_impl_method(s, StrView { ptr: (type_name), len: (type_name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 })
-
-# The specialized generic impl method `Type$T_method` (`W$i32_dup`), or null.
-# monomorph's specialize_impl_method adds these to the module's functions as
-# free fns, not to an impl block, so an impl-table walk never finds them.
-pub fn find_spec_impl_method(s: *EmitterState, type_name_sv: StrView, method_sv: StrView) -> *FnDef
-    var type_name: *u8 = type_name_sv.ptr
-    var type_name_len: i32 = type_name_sv.len as i32
-    var method: *u8 = method_sv.ptr
-    var method_len: i32 = method_sv.len as i32
-    let n: i32 = type_name_len + 1 + method_len
-    let buf: *u8 = malloc(n as i64 + 1)
-    for i in 0..type_name_len
-        *(buf + i) = *(type_name + i)
-    *(buf + type_name_len) = '_'
-    for i in 0..method_len
-        *(buf + type_name_len + 1 + i) = *(method + i)
-    *(buf + n) = 0
-    let fd: *FnDef = find_fn(s, StrView { ptr: (buf), len: (n) as i64 })
-    free(buf)
-    return fd
 
 # The by-value `self` argument read from the receiver at `recv`, a `ptr`.  It's
 # read here, before the arguments, because that's when a call evaluates its
@@ -1769,50 +1686,6 @@ pub fn span_assoc_arm_type(s: *EmitterState, e: *Expr, out: **u8, out_len: *i32)
     if tname != null and tlen > 5 and memcmp(tname, c"Span$", 5) == 0
         *out = tname
         *out_len = tlen
-
-fn method_recv_type(s: *EmitterState, recv: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
-    if recv == null
-        return null
-    match recv.kind
-        ExprKind.Ident =>
-            let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
-            if loc != null
-                *out_len = lv_type_name_len(loc)
-                return lv_type_name(loc)
-            let g: *GlobalVarDef = find_global(s, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
-            if g != null
-                *out_len = g.type_name_len
-                return g.type_name
-            # `S.make(..)`: a static method's receiver is the type.
-            *out_len = recv.ident_len
-            return recv.ident_ptr as *u8
-        ExprKind.Member =>
-            let f: *StructField = member_field_def(s, recv)
-            if f == null
-                return null
-            *out_len = f.field_type_name_len
-            return f.field_type_name
-        # AGAST #4180: `(*p).me()` / `(p as @C).me()`, so their callee is known.
-        ExprKind.Unary | ExprKind.Cast =>
-            return deref_cast_recv_struct(s, recv, out_len)
-        _ => pass
-    # AGAST #3360: `PS[i].m()`, so let_check sees a `self:&` lend of the
-    # const's read-only element.
-    let ce: *ConstEntry = const_struct_array_elem(s, recv)
-    if ce != null
-        *out_len = ce.array_elem_type_name_len
-        return ce.array_elem_type_name
-    return null
-
-# The function a method call dispatches to (UFCS helper, impl method or
-# specialized generic impl method), or null.
-pub fn method_call_def(s: *EmitterState, e: *Expr) -> *FnDef
-    var tlen: i32 = 0
-    let tname: *u8 = method_recv_type(s, e.left, @tlen)
-    if tname == null or tlen <= 0
-        return null
-    return method_callee_def(s, StrView { ptr: (tname), len: (tlen) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
 
 # AGAST #2394: 1 when the call or method `arg` already returns an address
 # (`-> @T`, `-> @&T` or `-> *T`, all i64 at a call), so an `@T` param takes

@@ -16,7 +16,7 @@ pointee, `[N]T`, and is how to walk rows, so `p[i]` isn't `*(p + i)` here.
 #2321 made the read right on ritz1 and refused the rest, because ritz0 stored and
 took addresses at stride `[N]T`, against its own read: `@p[1]` pointed a row on and
 `p[1] = b` overwrote the next row.  #2330 made ritz0 agree with itself and lowers
-every position on ritz1 (index_through.ritz's `*(p# + i)`).
+every position on ritz1 (emitter_types.ritz's `*(p# + i)`).
 
 A byte-wide element hides all of this, and `[2]i32` is 8 bytes, which hides a
 wrong-size access, so the grids cover several sizes and element types, and pass

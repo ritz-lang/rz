@@ -18,7 +18,6 @@ import emitter_core
 import emitter_abi   # AGAST #1818: sret / byval moved out of emitter_core
 import emitter_types   # AGAST #1818: type inference moved out of emitter_core
 import emitter_ir
-import index_through
 import emitter_expr_arith    # emit_expr_binary, emit_expr_unary
 import emitter_expr_access   # emit_expr_ident, emit_expr_index, emit_expr_member
 import emitter_expr_call     # emit_expr_call, emit_expr_method
@@ -44,23 +43,6 @@ import ritzlib.hashmap
 # Helper to emit GEP for local variable member access
 # AGAST #2372: pointers and references between a local's slot and the struct `.`
 # names: 0 for a struct, 1 for `*S` and `@S`, 2 for `**S` and `@*S`, and so on.
-pub fn local_struct_levels(loc: *LocalVar) -> i32
-    match lv_var_type(loc)
-        TypeKind.PtrPtr =>
-            return ptr_ptr_ident_levels(lv_inner_pointee_type(loc))
-        TypeKind.Ref | TypeKind.MutRef =>
-            match lv_pointee_type(loc)
-                TypeKind.Ptr =>
-                    return 2
-                TypeKind.PtrPtr =>
-                    return 1 + ptr_ptr_ident_levels(lv_inner_pointee_type(loc))
-                _ => pass
-            return 1
-        TypeKind.Ptr =>
-            return 1
-        _ => pass
-    0
-
 # The same for a field.  An `@S` field is a `*S` by now (lower_ref_fields).
 pub fn field_struct_levels(f: *StructField) -> i32
     if f.field_type == TypeKind.PtrPtr
@@ -3335,3 +3317,104 @@ fn emit_struct_lit_value(s: *EmitterState, e: *Expr) -> i32
 # =============================================================================
 # Statement Emission
 # =============================================================================
+
+var g_base_spills: i32 = 0
+
+# "#" + up to 20 digits of an i64 + NUL (AGAST #1820: no magic alloc sizes).
+const BASE_SPILL_NAME_BUF: i64 = 24
+
+# =============================================================================
+# Spills and through-index places that emit their operand (AGAST #1818: moved
+# up from emitter_types / index_through, which no longer reach emit_expr).
+# =============================================================================
+# AGAST #2329: `view`, bound, at an emitting site.  A base_array_view's base is
+# evaluated once, into a `*T` local named `#k`, so `x[i]` is `*(#k + i)` the way a
+# local's is `*(p# + i)`; anything else is `view` itself.
+pub fn through_spill(s: *EmitterState, view: *LocalVar) -> *LocalVar
+    if view == null or lv_array_base(view) == null
+        return view
+    let val: i32 = emit_expr(s, lv_array_base(view))
+    let slot: i32 = entry_alloca(s, c"i64", null)
+    emit_store_typed(s, IR_TY_I64, val, slot)
+    g_base_spills = g_base_spills + 1
+    let name: *u8 = malloc(BASE_SPILL_NAME_BUF)
+    *name = 35   # '#': no identifier has one
+    let len: i32 = 1 + fmt_i64_into(Span<u8> { ptr: name + 1, len: BASE_SPILL_NAME_BUF - 1 }, g_base_spills as i64).len as i32
+    add_local_full(s, StrView { ptr: (name), len: (len) as i64 }, slot, TypeKind.Ptr, StrView { ptr: (lv_type_name(view)), len: (lv_type_name_len(view)) as i64 }, lv_pointee_type(view), 0, TypeKind.Void)
+    let bound: *LocalVar = local_at(s, s.local_count - 1)
+    lv_mark_array_view(bound)
+    bound
+
+# AGAST #2098 / #3635: the `ptr` a plane_ptr_shape base `e` is, in a register:
+# a local's slot loaded (twice for `*r`, r a `**`), else `e` (or the X of a
+# `*X`) evaluated.
+pub fn emit_plane_ptr(s: *EmitterState, e: *Expr) -> i32
+    var x: *Expr = e
+    if e.kind == ExprKind.Unary and e.op == OpKind.Deref and e.operand != null
+        x = e.operand
+    if x.kind == ExprKind.Ident
+        let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+        if lv != null
+            var r: i32 = next_reg(s)
+            emit_load_into(s, IR_TY_PTR, r, lv.reg)
+            if local_holds_plane_ptr(lv) == 1   # AGAST #4122: a ref too
+                let r2: i32 = next_reg(s)
+                emit_load_into(s, IR_TY_PTR, r2, r)
+                r = r2
+            return r
+    let v: i32 = emit_expr(s, x)
+    let ptr: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, ptr)
+    emit_str(s, IR_INTTOPTR)
+    emit_reg(s, v)
+    emit_str(s, c" to ptr\n")
+    # AGAST #4122: `*s.q` / `*gq` / `*f()` loads the `*[N][M]T` the `**` holds.
+    if x != e and base_plane_ptr_ptr(s, x) != null
+        let held: i32 = next_reg(s)
+        emit_load_into(s, IR_TY_PTR, held, ptr)
+        return held
+    ptr
+
+# The address of the struct `e`, an index through, is or points at, as a `ptr`
+# register, and its name; 0 if `e` isn't one or its element isn't a struct.  An
+# element that's a pointer holds the struct's address; otherwise the sum is it.
+pub fn emit_through_elem_ptr(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    let loc: *LocalVar = index_through(s, e)
+    if loc == null
+        return 0
+    var name: *u8 = null
+    var name_len: i32 = 0
+    let held: TypeKind = through_elem_struct(s, loc, @name, @name_len)
+    if name == null
+        return 0
+    var t: ThroughIndex
+    index_through_fill(s, e, through_spill(s, loc), @t)
+    var val: i32 = 0
+    if held == TypeKind.PtrPtr
+        val = emit_expr(s, @t.deref)
+    else
+        val = emit_expr(s, @t.sum)
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, val)
+    emit_str(s, c" to ptr\n")
+    *out_name = name
+    *out_len = name_len
+    elem_ptr
+
+# `p[i].f`'s address, for `e` = the ExprKind.Member.  Returns 1 when it took `e`.
+pub fn emit_through_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult) -> i32
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if index_through_struct(s, e.left, @name, @name_len) == 0 or name == null
+        return 0
+    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (name_len) as i64 })
+    let field_idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    if field_idx < 0
+        return 0
+    let elem_ptr: i32 = emit_through_elem_ptr(s, e.left, @name, @name_len)
+    emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, get_field_type(st, field_idx))
+    1

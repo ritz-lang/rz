@@ -20,7 +20,7 @@ AGAST #2885 does the same for a `*x` outside a `[]` (`*n` on an i32, `*v = ...`,
     an element with nothing to index    index_rules.needs_index, at the second `[`
                                         (§7.8's words; ritz1: struct_index.ritz)
     `*v` on a struct by value           array_rules.NOT_A_POINTER, at the `*`
-                                        (ritz1: index_through.ritz)
+                                        (ritz1: emitter_types.ritz)
 
 ritz1 had no record of where a `[` is, so an index's errors named the start of its
 base; the parser now keeps it (Expr.bracket).

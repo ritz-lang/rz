@@ -1685,16 +1685,6 @@ fn match_scrutinee_is_strview(s: *EmitterState, scr: *Expr) -> i32
     match_scrutinee_type(s, scr, @name, @len)
     (name != null and name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1) as i32
 
-fn enum_declares_variant(ctx: *ParseCtx, ei: i32, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    for vi in 0..enum_variant_count(ctx, ei)
-        var vlen: i32 = 0
-        let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
-        if name_eq(StrView { ptr: (vname), len: (vlen) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
-            return 1
-    0
-
 # The first arm that names a user enum's variant, for a scrutinee no rule above
 # could type, or null.  A scalar scrutinee keeps its bindings.
 fn match_arms_enum_arm(s: *EmitterState, scr: *Expr, arms: *MatchArm) -> *MatchArm
@@ -1780,29 +1770,6 @@ fn match_refuse_ambiguous_arms(s: *EmitterState, scr: *Expr, arms: *MatchArm) ->
 # an i64.  A type argument nothing gives (None's, Ok's E, Err's T) takes that
 # default too; no arm can read it.
 
-# 1 when a user enum declares `name`, whichever one or how many.
-fn user_enum_declares(ctx: *ParseCtx, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    for ei in 0..enum_count(ctx)
-        if enum_declares_variant(ctx, ei, StrView { ptr: (name), len: (len) as i64 }) == 1
-            return 1
-    0
-
-# 1 when emit_expr lowers `e` as Some/Ok/Err(x), or `e` is the Option's None: one
-# no name shadows and no user enum declares.  A user's None is its enum's bare unit
-# variant (match_scrutinee_is_ctor, #2434), never an Option's tag.
-pub fn is_tagged_ctor(s: *EmitterState, e: *Expr) -> i32
-    if e.kind == ExprKind.Call
-        return (is_variant_carrier(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1 or is_variant_null(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1) as i32
-    if e.kind != ExprKind.Ident or is_ident_none(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0
-        return 0
-    if is_const(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1 or find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
-        return 0
-    if user_enum_declares(s.mono.pctx, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
-        return 0
-    (find_local(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0) as i32
-
 # 1 when `e` is a constructor that takes its enum from its context: a tagged one,
 # or a user's bare unit variant, which is no place to take the address of.
 fn match_scrutinee_is_ctor(s: *EmitterState, e: *Expr) -> i32
@@ -1813,24 +1780,6 @@ fn match_scrutinee_is_ctor(s: *EmitterState, e: *Expr) -> i32
     if generic_ctor_enum(s, e, @vi) >= 0   # AGAST #2437
         return 1
     (bare_unit_variant_enum(s, e, @vi, @other) >= 0) as i32
-
-# 1 when `e` builds its enum where it stands, payload and all: nothing but the
-# match can own that value (own_scrutinee_moved).
-pub fn match_scrutinee_builds(s: *EmitterState, e: *Expr) -> i32
-    if is_tagged_ctor(s, e) == 1
-        return 1
-    var gvi: i32 = 0
-    if e.kind == ExprKind.Call and generic_ctor_enum(s, e, @gvi) >= 0   # AGAST #2437
-        return 1
-    var name: *u8 = null
-    var len: i32 = 0
-    match e.kind
-        ExprKind.Call =>
-            user_variant_ctor_enum(s.mono.pctx, e, @name, @len)
-        ExprKind.Method =>
-            qualified_variant_enum(s, e, @name, @len)
-        _ => pass
-    (name != null) as i32
 
 # `a`, `b` and `c` as one NUL-terminated name, its length in *out_len.
 pub fn ctor_join(a_sv: StrView, b_sv: StrView, c_sv: StrView, out_len: *i32) -> *u8
@@ -1945,32 +1894,6 @@ pub fn ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len
 # A T the payload leaves unbound, every one of a unit variant's, is the located
 # error ritz0's Monomorphizer._infer_variant_scrutinee gives.  Here, not in
 # generic_infer: a generic fn's `match Hold(x)` is emitted specialised, x typed.
-
-# The generic enum the bare constructor `e` builds (*out_vi its variant), or -1:
-# not a constructor, a name a local / const / global / fn takes, or a variant
-# another enum declares too.  Option and Result are the tagged constructors'.
-fn generic_ctor_enum(s: *EmitterState, e: *Expr, out_vi: *i32) -> i32
-    *out_vi = 0 - 1
-    var name: *u8 = null
-    var len: i32 = 0
-    if e.kind == ExprKind.Call and e.call_type_suffix_len == 0
-        name = e.func_name
-        len = e.func_name_len
-    else if e.kind == ExprKind.Ident
-        name = e.ident_ptr
-        len = e.ident_len
-        if find_local(s, StrView { ptr: (name), len: (len) as i64 }) >= 0 or is_const(s, StrView { ptr: (name), len: (len) as i64 }) == 1 or find_global(s, StrView { ptr: (name), len: (len) as i64 }) != null
-            return 0 - 1
-    if name == null or find_fn(s, StrView { ptr: (name), len: (len) as i64 }) != null
-        return 0 - 1
-    let ei: i32 = generic_enum_of_variant(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, out_vi)
-    if ei < 0
-        return 0 - 1
-    var en_len: i32 = 0
-    let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
-    if en_len == 6 and (memcmp(en, c"Option", 6) == 0 or memcmp(en, c"Result", 6) == 0)
-        return 0 - 1
-    ei
 
 var g_gctor_refused: *Expr = null   # the scrutinee generic_ctor_scrutinee_enum refused
 

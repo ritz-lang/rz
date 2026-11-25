@@ -168,7 +168,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | Module | Responsibility |
 |---|---|
 | `sema` | The `Sema` context: typed scope, name lookup, error reporting. |
-| `sema_type` | Types an expression from the AST and Sema's scope alone, including what `x[i]` holds (index_through's type facts: a Vec, Span, String or `*[N]T` element, an `[N]*T` element's pointee). |
+| `sema_type` | Types an expression from the AST and Sema's scope alone, including what `x[i]` holds (the through-index views' type facts, in `emitter_types` since #1818: a Vec, Span, String or `*[N]T` element, an `[N]*T` element's pointee). |
 | `sema_walk` | Walks the module and calls each Sema check. |
 | `sema_probe` | Test-only: compares Sema's typing with the emitter's (`RITZ1_SEMA_PROBE`). |
 | `struct_cast` | `as` between two different struct types is refused (§7.5, LARB R72, #4000). |
@@ -244,14 +244,6 @@ empty. A note that belongs to a move goes on that check's own entry.
   `(*p)[i]` of a scalar or a struct without `Index`, `*v` of a value, a whole
   array stored into `p[i]`. On Sema, its locals typed as the emitter's
   (`rs_local`), at every index and `*` the walk visits.
-
-- `index_through` — `[]` through a pointer or reference (R9): the view it
-  lowers (`index_through_fill`, `through_spill`). Its type facts (what `x[i]`
-  holds) are `sema_type`'s, on Sema (#3510), and its rules `index_refuse`'s
-  (#3893); it keeps one refusal, a slice through a pointer it doesn't lower,
-  a limit of the lowering. Emitter-side readers of its facts (bool_kind,
-  ownership, emitter_stmt / _core / _expr_call, ref_check's `env.s` side)
-  go with their own moves (#3506, #3507).
 
 - `intrinsic_check` — the AES-NI, SHA-NI, `simd_add` / `simd_xor` /
   `simd_rotl` and `xgetbv` intrinsics as one table (#4657): each one's arity,
@@ -395,7 +387,7 @@ empty. A note that belongs to a move goes on that check's own entry.
 | `emitter` | `emit_module`, `emit_fn`, impl methods; post-passes over the emitted IR text. |
 | `emitter_consts` | Module-level data: global initializers, integer const resolution, const arrays of struct literals, scalar struct consts. Split from `emitter` (AGAST #1818), which `pub import`s it. |
 | `emitter_core` | `EmitterState`, struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. Imports no emitter module above it (AGAST #1818), so it is outside the emitter import cycle: a fn that needs one belongs in `emitter_types`. |
-| `emitter_types` | What an expression's type, struct, pointee or element is, asked before it is emitted: the half of the old `emitter_core` that reaches up into method lookup (`emitter_expr_call`), index-through views (`index_through`), deref pointee names (`emitter_expr_arith`) or `emit_expr` for a spill (AGAST #1818). |
+| `emitter_types` | What an expression's type, struct, pointee or element is, asked before it is emitted: the expression typing the old `emitter_core` did, the through-index views (the old `index_through`), and the method-callee and deref-pointee lookups (AGAST #1818). It reaches no emission module, so it and the Sema-side checks that read it sit below the emitter import cycle. |
 | `emitter_abi` | How a struct or array crosses a call: sret returns and byval params (AGAST #1730, #1739, #2306, #3181), their attributes, and the deferred large-struct loads and copies. Above `emitter_core`, below the emitter modules (AGAST #1818). |
 | `emitter_ir` | Typed IR builders (casts, load/store, alloca, branches): the spelling of an instruction lives here, not at each site. A leaf module, so it stays out of the emitter import cycle (AGAST #1817). |
 | `emitter_expr` | `emit_expr` dispatch and struct literals. |
@@ -434,8 +426,10 @@ Tracked under AGAST #1812 (M1.3). `make arch-report` shows its shape.
   checks still run inside the emitter. Sema exists; the move is #1816.
 - **The emitter import cycle** — the emitter modules, the emitter-side checks
   and monomorph form one strongly connected component (`make arch-report`,
-  "Import cycles"), over `emitter_core`'s `EmitterState` (#1818 moved
-  `emitter_core` itself below it, into `emitter_types`). No module may
+  "Import cycles"): the seven emission modules (`emitter_expr`, `_access`,
+  `_arith`, `_call`, `emitter_match`, `emitter_print`, `emitter_stmt`), which
+  call each other because statements and expressions nest. #1818 moved
+  `emitter_core`, the typing (`emitter_types`) and the checks out of it. No module may
   join it (`CYCLE_BASELINE` in `tools/ritz1_arch.py`, checked by the gate).
   Breaking it, dissolving `emitter_core` and splitting the long functions
   the report lists is #1818.

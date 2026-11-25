@@ -49,7 +49,6 @@ SOURCES = \
 	binder_check \
 	type_name_check \
 	named_variants \
-	index_through \
 	narrowing \
 	let_check \
 	ref_check \

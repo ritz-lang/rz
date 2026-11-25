@@ -2,7 +2,7 @@
 
 THE CHANGE
 
-index_through.ritz refused, mid-lowering on EmitterState, what has nothing to
+emitter_types.ritz refused, mid-lowering on EmitterState, what has nothing to
 index or no pointer to follow (LANGUAGE_SPEC §7.8, LARB R9):
 
 - index_refused's reference arm: `p[i]` with `p` an `@T` / `@&T` (an inferred

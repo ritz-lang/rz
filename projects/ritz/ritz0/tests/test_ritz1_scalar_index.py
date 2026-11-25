@@ -2,7 +2,7 @@
 
 `var n: i64 = 0` then `n[0] = 5` (a STMT_INDEX_ASSIGN) or `let x: i64 = n[0]`
 compiled on ritz1 and ritz1_selfhosted, and the binary SIGSEGVd: the emitter
-read `n`'s value as an address.  The emitter's own refusal (index_through.ritz,
+read `n`'s value as an address.  The emitter's own refusal (emitter_types.ritz,
 scalar_local_refused) leaves an `i64` / `u64` local alone, since its locals may
 carry a pointer as one; Sema binds the declared type, so it can tell.  ritz0
 refuses each at the `[`, in index_rules.needs_index's words, and ritz1's Sema

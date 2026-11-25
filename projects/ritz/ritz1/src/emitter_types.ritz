@@ -22,15 +22,12 @@ import diag            # diag_error_at, fn_display_name (AGAST #3445, #3621, #40
 import types           # the one primitive type table (AGAST #1889)
 import sha256          # sha256_hex, for a private fn's symbol (AGAST #4356)
 import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
-import index_through # index_through (AGAST #2440)
 import tokens_gen
 import emitter_ir      # ir_alloca (AGAST #4460)
-import emitter_expr
-import emitter_expr_arith
-import emitter_expr_call
 import monomorph       # MonoCtx, EmitterState.mono (AGAST #4454)
 import emitter_core
 import emitter_abi   # AGAST #1818: sret / byval moved out of emitter_core
+import sema_type
 
 # AGAST #2329: what a `*[N]T`, `@[N]T` or `@&[N]T` base that isn't a local was
 # declared as: a field `h.r`, a global `g` or a call `h(p)`.  Each records the type
@@ -68,7 +65,7 @@ pub fn base_ptr_array(s: *EmitterState, e: *Expr) -> *Param
 
 # AGAST #4122: the shape of the `*[N][M]..T` that `*e` reads, `e` a `**[N][M]..T`
 # field `s.q`, global `gq` or call `f()`; null for anything else, a local included.
-fn base_plane_ptr_ptr(s: *EmitterState, e: *Expr) -> *ArrayShape
+pub fn base_plane_ptr_ptr(s: *EmitterState, e: *Expr) -> *ArrayShape
     var pa: *Param = null
     match e.kind
         ExprKind.Member =>
@@ -109,30 +106,6 @@ pub fn base_array_view(s: *EmitterState, root: *Expr) -> *LocalVar
     if pa == null
         return null
     return unscoped_array_view(s, root, pa.param_pointee_array_elem_type, StrView { ptr: (pa.param_type_name), len: (pa.param_type_name_len) as i64 }, pa.param_pointee_array_elem_pointee)
-
-var g_base_spills: i32 = 0
-
-# "#" + up to 20 digits of an i64 + NUL (AGAST #1820: no magic alloc sizes).
-const BASE_SPILL_NAME_BUF: i64 = 24
-
-
-# AGAST #2329: `view`, bound, at an emitting site.  A base_array_view's base is
-# evaluated once, into a `*T` local named `#k`, so `x[i]` is `*(#k + i)` the way a
-# local's is `*(p# + i)`; anything else is `view` itself.
-pub fn through_spill(s: *EmitterState, view: *LocalVar) -> *LocalVar
-    if view == null or lv_array_base(view) == null
-        return view
-    let val: i32 = emit_expr(s, lv_array_base(view))
-    let slot: i32 = entry_alloca(s, c"i64", null)
-    emit_store_typed(s, IR_TY_I64, val, slot)
-    g_base_spills = g_base_spills + 1
-    let name: *u8 = malloc(BASE_SPILL_NAME_BUF)
-    *name = 35   # '#': no identifier has one
-    let len: i32 = 1 + fmt_i64_into(Span<u8> { ptr: name + 1, len: BASE_SPILL_NAME_BUF - 1 }, g_base_spills as i64).len as i32
-    add_local_full(s, StrView { ptr: (name), len: (len) as i64 }, slot, TypeKind.Ptr, StrView { ptr: (lv_type_name(view)), len: (lv_type_name_len(view)) as i64 }, lv_pointee_type(view), 0, TypeKind.Void)
-    let bound: *LocalVar = local_at(s, s.local_count - 1)
-    lv_mark_array_view(bound)
-    bound
 
 # The FnDef a call expression names: `func_name` plus its generic suffix
 # (`vec_new` + `$u8`).  Replaces nine copies of a loop that built the name in
@@ -908,37 +881,6 @@ pub fn plane_ptr_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
     if pa == null or pa.param_type != TypeKind.Ptr
         return null
     pa.param_pointee_array_shape
-
-# AGAST #2098 / #3635: the `ptr` a plane_ptr_shape base `e` is, in a register:
-# a local's slot loaded (twice for `*r`, r a `**`), else `e` (or the X of a
-# `*X`) evaluated.
-pub fn emit_plane_ptr(s: *EmitterState, e: *Expr) -> i32
-    var x: *Expr = e
-    if e.kind == ExprKind.Unary and e.op == OpKind.Deref and e.operand != null
-        x = e.operand
-    if x.kind == ExprKind.Ident
-        let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
-        if lv != null
-            var r: i32 = next_reg(s)
-            emit_load_into(s, IR_TY_PTR, r, lv.reg)
-            if local_holds_plane_ptr(lv) == 1   # AGAST #4122: a ref too
-                let r2: i32 = next_reg(s)
-                emit_load_into(s, IR_TY_PTR, r2, r)
-                r = r2
-            return r
-    let v: i32 = emit_expr(s, x)
-    let ptr: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, ptr)
-    emit_str(s, IR_INTTOPTR)
-    emit_reg(s, v)
-    emit_str(s, c" to ptr\n")
-    # AGAST #4122: `*s.q` / `*gq` / `*f()` loads the `*[N][M]T` the `**` holds.
-    if x != e and base_plane_ptr_ptr(s, x) != null
-        let held: i32 = next_reg(s)
-        emit_load_into(s, IR_TY_PTR, held, ptr)
-        return held
-    ptr
 
 # AGAST #2570: the plane `e`, an index chain two or more short of its N-D
 # array's rank, names: the dims after the chain, and the leaf.  `@x[i]` with
@@ -2683,3 +2625,882 @@ fn synth_slot_ty_unary(s: *EmitterState, e: *Expr, out: *TypeKind) -> i32
     *out = synth_slot_ty(s, e.operand)
     return 1
 
+
+
+# =============================================================================
+# Indexing through a borrow or pointer (AGAST #2440): was index_through.ritz,
+# merged here by AGAST #1818 so the two stop importing each other.
+# =============================================================================
+# ritz1/src/index_through.ritz - `[]` through a pointer or reference
+#
+# AGAST #2440, LARB R9.  `p[i]` means `(*p)[i]` when `p` is a `*T`, `@T` or `@&T` and
+# T is a Vec, Span or String, and it's a place in every position: read, store, `+=`,
+# `@`, `@&`, `.f`.  Each of those lowers `*(p.data + i)` already, at stride T, so a
+# site asks index_through and takes the deref index_through_fill builds, as
+# elem_index_as_deref does for `a[i][j]` (#2332).  ritz0's twin is
+# Emitter._index_through.
+#
+# A `*T` over anything else is a raw buffer, and stays on the pointer paths.  A
+# reference to anything else is one T: Sema refuses indexing it (index_refuse.ritz,
+# AGAST #3893), before any site here runs.
+#
+# AGAST #2442: the value itself is the same place.  `v[i]` on a Vec, Span or String
+# local is `*(v.data + i)`, and so is an element that is one: `v[i][j]` and `p[i][j]`
+# are `*(v[i].data + j)`.
+#
+# AGAST #2330: an array behind a pointer is the same place.  `p[i]` and `(*p)[i]` on a
+# `*[N]T`, `@[N]T` or `@&[N]T` local are `*(p# + i)`, element i at stride T, where
+# `p#` is the `*T` view add_array_view bound with `p`.
+#
+# AGAST #2329: so are other bases, `h.r[i]`, `g[i]` and `h(p)[i]`.  Their view is in
+# no scope (base_array_view): an emitting site binds it with through_spill, which
+# evaluates the base once into a `#k` local, and `x[i]` is `*(#k + i)`.  So is
+# `(*r)[i]` with `r: **[N]T` (#2553, deref_array_view): the base is `*r`.  And
+# (#2331) `(*q)[i]` with `q: **Vec<T>`, `@*Vec<T>` or `@&*Vec<T>`: `q.data` sees through.
+# The Exprs `*(p.data + i)` is made of, for `index_through_fill` to fill.  A String
+# reaches its bytes through a Vec, so `*(p.data.data + i)`.
+
+struct ThroughIndex
+    field: Expr
+    bytes: Expr
+    sum: Expr
+    deref: Expr
+
+fn name_starts(name_sv: StrView, prefix_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    var prefix: *u8 = prefix_sv.ptr
+    var prefix_len: i32 = prefix_sv.len as i32
+    if len <= prefix_len
+        return 0
+    (memcmp(name, prefix, prefix_len as i64) == 0) as i32
+
+fn through_is_string(name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if len != 6
+        return 0
+    (memcmp(name, c"String", 6) == 0) as i32
+
+# `p` of `p[i]` and of `(*p)[i]`.
+fn through_root(base: *Expr) -> *Expr
+    if base != null and base.kind == ExprKind.Unary and base.op == OpKind.Deref
+        return base.operand
+    base
+
+# 1 when `loc` is a Vec, Span or String itself (#2442).
+fn indexes_itself(loc: *LocalVar) -> i32
+    if lv_var_type(loc) != TypeKind.Struct
+        return 0
+    name_is_indexable(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+
+# 1 when `loc` is a pointer or reference, at one level, to a struct of an indexable name.
+fn sees_through(loc: *LocalVar) -> i32
+    if lv_var_type(loc) != TypeKind.Ptr and lv_var_type(loc) != TypeKind.Ref and lv_var_type(loc) != TypeKind.MutRef
+        return 0
+    if lv_pointee_type(loc) != TypeKind.Struct
+        return 0
+    name_is_indexable(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+
+# AGAST #2331: 1 when `loc` is a `**T`, `@*T` or `@&*T` with T a Vec, Span or
+# String, one level further out than sees_through: `(*q)[i]` is `*((*q).data + i)`.
+# index_through_fill's `q.data` sees through both levels.  It read and stored the wrong bytes.
+fn sees_through_deref(loc: *LocalVar) -> i32
+    if ptr_to_struct_ptr(loc) == 0
+        return 0
+    name_is_indexable(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+
+# What an element that is itself a Vec, Span or String is, for `v[i][j]`: only its
+# type_name and var_type are read, and every caller has done with it before it emits.
+var g_through_elem: LocalVar
+
+# The local `e` indexes through, or null.  `p[lo..hi]` is monomorph's
+# `p.slice(lo, hi)` or through_slice_refused's error, and a slice of the value itself
+# keeps its own lowering.
+pub fn index_through(s: *EmitterState, e: *Expr) -> *LocalVar
+    if e == null or e.kind != ExprKind.Index or e.right == null or e.right.kind == ExprKind.Range
+        return null
+    # AGAST #2570: a plane pointer `q` is indexed as its `[M][N]..T`, by the N-D
+    # path (nd_index_shape), not as the flat `*[M*N..]T` view: `q[i]` is a row.
+    var chain_base: *Expr = e.left
+    while chain_base != null and chain_base.kind == ExprKind.Index
+        chain_base = chain_base.left
+    if plane_ptr_shape(s, chain_base) != null
+        return null
+    if e.left != null and e.left.kind == ExprKind.Index
+        return index_through_element(s, e.left)
+    let root: *Expr = through_root(e.left)
+    if root == null
+        return null
+    if root.kind != ExprKind.Ident
+        let ev: *LocalVar = element_array_view(s, root)   # `(*pg[i])[j]` (#2995)
+        if ev != null
+            return ev
+        let fv: *LocalVar = vec_field_through(s, e.left)   # `x.vf[i]` (#2564)
+        if fv != null
+            return fv
+        if root == e.left
+            let cv: *LocalVar = call_result_view(s, root)   # `v[1..3][i]` (#2726)
+            if cv != null
+                return cv
+        return base_array_view(s, root)   # `h.r[i]`, `h(p)[i]` (#2329)
+    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (root.ident_ptr), len: (root.ident_len) as i64 })
+    if loc == null
+        return base_array_view(s, root)   # `g[i]` (#2329)
+    # `v[i]` on the value itself, but not `(*v)[i]`.
+    if root == e.left and indexes_itself(loc) == 1
+        return loc
+    if root != e.left   # `(*r)[i]` with `r: **[N]T` (#2553)
+        let dv: *LocalVar = deref_array_view(s, e.left, loc)
+        if dv != null
+            return dv
+        if sees_through_deref(loc) == 1   # `(*q)[i]` with `q: **Vec<T>` (#2331)
+            return loc
+    if lv_pointee_type(loc) == TypeKind.Array
+        return array_view_of(s, root)
+    if sees_through(loc) == 0
+        return null
+    loc
+
+# AGAST #2564: `base`, a field `x.vf` that is a Vec, Span or String by value, as the
+# local `v[i]` takes on a Vec name (#2442): index_through_fill makes `x.vf[i]` the
+# place `*(x.vf.data + i)`, and an element that is a struct S names S.  The member
+# path found no S through `x.vf[i]`, so `x.vf[i].f`, `x.vf[i].m()` and
+# `x.vf[i] = ...` were "unhandled EXPR_MEMBER", unlocated.  The fill names `base`
+# again at each use, so a base holding a call (`h().vf[i]`) isn't taken: it would
+# run twice under `+=`.  None reaches here today (member_field_def types no `*T`
+# call's field, #2517), so that guard is for when one does.  It's in no scope:
+# only type_name and var_type are read.
+fn vec_field_through(s: *EmitterState, base: *Expr) -> *LocalVar
+    if base == null or base.kind != ExprKind.Member or place_without_call(base) == 0
+        return null
+    let f: *StructField = member_field_def(s, base)
+    if f == null
+        return null
+    # AGAST #3816: and a field that is a `*T`, `@T` or `@&T` to one, `w.p[i]`:
+    # `w.p.data` sees through it, as through a local `p` (sees_through).
+    let by_ptr: bool = f.field_type == TypeKind.Ptr and f.ptr_pointee == TypeKind.Struct
+    if f.field_type != TypeKind.Struct and not by_ptr
+        return null
+    if name_is_indexable(StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == 0
+        return null
+    let v: *LocalVar = malloc(sizeof(LocalVar)) as *LocalVar
+    lv_loc_init(v, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Struct, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, TypeKind.I64, 0, TypeKind.Void)
+    v
+
+# AGAST #2726: `base`, a call that returns a Vec or Span by value, as the view of
+# its buffer.  #2451 makes `v[lo..hi]` the call `v.slice(lo, hi)`, so `v[1..3][i]`
+# indexes a call's result: emit_expr_index took the aggregate for a pointer
+# (`inttoptr i64 %"Span$i32"`, which clang refuses).  The view's base is the field
+# `base.ptr` / `base.data`, which through_spill evaluates once (the call runs once),
+# so `x[i]` is `*(#k + i)` at stride T, as for `h(p)[i]` (#2329).  A String's
+# buffer is a Vec, one more level, and isn't taken; nor is an element that's a
+# pointer (its pointee isn't recorded).  It's in no scope.
+#
+# AGAST #3816: and a call that returns a `*T`, `@T` or `@&T` to one, `h.get()[i]`
+# on a `-> @Vec<P>`: `base.data` sees through the pointer, and through_spill
+# still runs the call once.  It was "unhandled EXPR_MEMBER" (ritz0 took the
+# element for the Vec itself).  A String's bytes are `base.data.data`.
+fn call_result_view(s: *EmitterState, base: *Expr) -> *LocalVar
+    if base.kind != ExprKind.Call and base.kind != ExprKind.Method
+        return null
+    var name: *u8 = null
+    var name_len: i32 = 0
+    call_result_struct_name(s, base, @name, @name_len)
+    if name == null
+        let ps: *StructDef = call_result_ptr_struct(s, base)
+        if ps != null and name_is_indexable(StrView { ptr: (ps.name), len: (ps.name_len) as i64 }) == 1
+            return call_ref_view(s, base, StrView { ptr: (ps.name), len: (ps.name_len) as i64 })
+        return null
+    if name_is_indexable(StrView { ptr: (name), len: (name_len) as i64 }) == 0 or through_is_string(StrView { ptr: (name), len: (name_len) as i64 }) == 1
+        return null
+    call_ref_view(s, base, StrView { ptr: (name), len: (name_len) as i64 })
+
+# The view of the buffer of `base`'s result, a `name` (a Vec, Span or String) or
+# a pointer or reference to one: `base.data` (`.ptr`, or a String's
+# `.data.data`) at stride T, evaluated once by through_spill.
+fn call_ref_view(s: *EmitterState, base: *Expr, name_sv: StrView) -> *LocalVar
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    var probe: LocalVar
+    lv_loc_init(@probe, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Struct, StrView { ptr: (name), len: (name_len) as i64 }, TypeKind.I64, 0, TypeKind.Void)
+    let buf: *Expr = malloc(sizeof(Expr)) as *Expr
+    memset(buf as *u8, 0, sizeof(Expr))
+    if name_starts(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"Span$"), len: (5) as i64 }) == 1
+        through_member(buf, base, base, StrView { ptr: (c"ptr"), len: (3) as i64 })
+    else
+        through_member(buf, base, base, StrView { ptr: (c"data"), len: (4) as i64 })
+    if through_is_string(StrView { ptr: (name), len: (name_len) as i64 }) == 1
+        return unscoped_array_view(s, string_bytes(base, buf), TypeKind.U8, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Void)
+    let f: *StructField = through_buffer(s, @probe)
+    if f == null or f.field_type != TypeKind.Ptr
+        return null
+    unscoped_array_view(s, buf, ptr_field_elem_kind(f), StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, TypeKind.Void)
+
+# `vec.data`, the bytes of a String whose Vec is `vec`.
+fn string_bytes(base: *Expr, vec: *Expr) -> *Expr
+    let bytes: *Expr = malloc(sizeof(Expr)) as *Expr
+    memset(bytes as *u8, 0, sizeof(Expr))
+    through_member(bytes, base, vec, StrView { ptr: (c"data"), len: (4) as i64 })
+    bytes
+
+# 1 when `e` names a place with no call in it: names, fields, indexes, derefs, and
+# arithmetic on those in an index (`a[i - 1].vf`).
+fn place_without_call(e: *Expr) -> i32
+    if e == null
+        return 0
+    match e.kind
+        ExprKind.Ident | ExprKind.IntLit =>
+            return 1
+        ExprKind.Member =>
+            return place_without_call(e.left)
+        ExprKind.Index | ExprKind.Binary =>
+            return (place_without_call(e.left) == 1 and place_without_call(e.right) == 1) as i32
+        ExprKind.Unary =>
+            return place_without_call(e.operand)
+        _ => pass
+    0
+
+# AGAST #2330: the `p#` view of `root`, a `*[N]T`, `@[N]T` or `@&[N]T` local, or null:
+# rows and `*[N]**U` have none (#2522).  It's the local just before `p`, over the
+# same slot.
+fn array_view_of(s: *EmitterState, root: *Expr) -> *LocalVar
+    array_view_named(s, StrView { ptr: (root.ident_ptr), len: (root.ident_len) as i64 })
+
+fn array_view_named(s: *EmitterState, name_sv: StrView) -> *LocalVar
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if array_ptr_named(s, StrView { ptr: (name), len: (len) as i64 }) == null
+        return null
+    let idx: i32 = find_local_idx(s, StrView { ptr: (name), len: (len) as i64 })
+    if idx < 1
+        return null
+    let loc: *LocalVar = local_at(s, idx)
+    let view: *LocalVar = local_at(s, idx - 1)
+    if lv_is_array_view(view) == 0 or view.reg != loc.reg
+        return null
+    if view_lacks_pointee(view) == 1
+        return null
+    view
+
+# `inner` of `inner[j]` as a local, when `inner` is an index through and its element
+# is a Vec, Span or String, or a pointer to one: `[]` sees through that (#2442).
+# emit_through_member_ptr loads the pointer for `inner.data`.  An element that's a
+# `*S` over any other struct is the view of a raw buffer (#2887).
+fn index_through_element(s: *EmitterState, inner: *Expr) -> *LocalVar
+    let ev: *LocalVar = element_array_view(s, inner)   # `pg[i][j]` (#2995)
+    if ev != null
+        return ev
+    let outer: *LocalVar = index_through(s, inner)
+    if outer == null
+        return null
+    var name: *u8 = null
+    var name_len: i32 = 0
+    let held: TypeKind = through_elem_struct(s, outer, @name, @name_len)
+    if name == null
+        return null
+    if name_is_indexable(StrView { ptr: (name), len: (name_len) as i64 }) == 0
+        # AGAST #2887: a `*S` element over a struct that doesn't index is a raw
+        # buffer (R9): `pv[i][j]` is `*(pv[i] + j)` at stride S.  The view's base
+        # `pv[i]` is evaluated once by through_spill.
+        if held == TypeKind.PtrPtr
+            return unscoped_array_view(s, inner, TypeKind.Struct, StrView { ptr: (name), len: (name_len) as i64 }, TypeKind.Void)
+        return null
+    lv_loc_init(@g_through_elem, StrView { ptr: (null), len: (0) as i64 }, TypeKind.Struct, StrView { ptr: (name), len: (name_len) as i64 }, TypeKind.I64, 0, TypeKind.Void)
+    @g_through_elem
+
+# AGAST #2995: `b` = `pg[i]`, an element of a `var pg: [N]*[M]T` local, as the view
+# of the array it points at, or null.  Under R9 the element is a pointer to one
+# array, so `pg[i][j]` and `(*pg[i])[j]` are element j at stride T, as `p[j]` is on
+# a `*[M]T` local (#2330).  They took the raw-buffer path, `*(pg[i] + j)` at stride
+# u8, and read the wrong bytes, SILENT.  through_spill evaluates `pg[i]` once.
+fn element_array_view(s: *EmitterState, b: *Expr) -> *LocalVar
+    if b == null or b.kind != ExprKind.Index or b.left == null or b.left.kind != ExprKind.Ident
+        return null
+    if b.right == null or b.right.kind == ExprKind.Range
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (b.left.ident_ptr), len: (b.left.ident_len) as i64 })
+    if loc == null or lv_var_type(loc) != TypeKind.Array or lv_array_rec(loc) == null
+        return null
+    let pa: *ArrayElem = lv_array_rec(loc).ptr_array
+    if pa == null or lv_array_rec(loc).ptr_array_size <= 0
+        return null
+    unscoped_array_view(s, b, pa.elem, StrView { ptr: (pa.name), len: (pa.name_len) as i64 }, pa.pointee)
+
+fn through_member(m: *Expr, e: *Expr, base: *Expr, name_sv: StrView)
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    m.kind = ExprKind.Member
+    m.span = e.span
+    m.left = base
+    m.ident_ptr = name
+    m.ident_len = len
+    m.next = null
+
+# `m` names `view`, the `p#` of `root` (#2330).
+fn through_view(m: *Expr, root: *Expr, view: *LocalVar)
+    m.kind = ExprKind.Ident
+    m.span = root.span
+    m.ident_ptr = view.name
+    m.ident_len = view.name_len
+    m.next = null
+
+# Fill `t` with `*(p.data + i)` for `e`, which index_through took as `loc`.
+pub fn index_through_fill(s: *EmitterState, e: *Expr, loc: *LocalVar, t: *ThroughIndex)
+    memset(t as *u8, 0, sizeof(ThroughIndex))
+    let root: *Expr = through_root(e.left)
+    var buffer: *Expr = @t.field
+    if lv_is_array_view(loc) == 1
+        through_view(@t.field, root, loc)   # `*(p# + i)` (#2330)
+    else if name_starts(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, StrView { ptr: (c"Span$"), len: (5) as i64 }) == 1
+        through_member(@t.field, e, root, StrView { ptr: (c"ptr"), len: (3) as i64 })
+    else
+        through_member(@t.field, e, root, StrView { ptr: (c"data"), len: (4) as i64 })
+    if through_is_string(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
+        through_member(@t.bytes, e, @t.field, StrView { ptr: (c"data"), len: (4) as i64 })
+        buffer = @t.bytes
+    t.sum.kind = ExprKind.Binary
+    t.sum.slot_type = TypeKind.Void      # AGAST #3225: no wider slot yet
+    t.sum.span = e.span
+    t.sum.op = OpKind.Add
+    t.sum.left = buffer
+    t.sum.right = e.right
+    t.deref.kind = ExprKind.Unary
+    t.deref.span = e.span
+    t.deref.op = OpKind.Deref
+    t.deref.operand = @t.sum
+    # AGAST #4410: these nodes never meet Sema's walk, so note the slots the
+    # emitter reads here, at construction: the element for the load, a pointer
+    # for the `+` and the buffer, and a Vec for a String's `.data`.
+    expr_note_sema_ty(@t.sum, TypeKind.Ptr)
+    expr_note_sema_ty(@t.deref, through_elem_kind(s, loc))
+    if through_is_string(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
+        expr_note_sema_ty(@t.field, TypeKind.Struct)
+        expr_note_sema_ty(@t.bytes, TypeKind.Ptr)
+    else
+        expr_note_sema_ty(@t.field, TypeKind.Ptr)
+
+# The field of a Vec or Span that points at its elements, or null: a String's is
+# a Vec, so it has none here.
+fn through_buffer(s: *EmitterState, loc: *LocalVar) -> *StructField
+    let st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+    if st == null or through_is_string(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
+        return null
+    var idx: i32 = find_field_index(st, StrView { ptr: (c"data"), len: (4) as i64 })
+    if idx < 0
+        idx = find_field_index(st, StrView { ptr: (c"ptr"), len: (3) as i64 })
+    if idx < 0
+        return null
+    get_field_type(st, idx)
+
+# The kind of an element of `loc`, which sees through, for the slot checks.
+pub fn through_elem_kind(s: *EmitterState, loc: *LocalVar) -> TypeKind
+    if lv_is_array_view(loc) == 1
+        return lv_pointee_type(loc)
+    if through_is_string(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
+        return TypeKind.U8
+    let f: *StructField = through_buffer(s, loc)
+    if f == null
+        return TypeKind.Unknown
+    ptr_field_elem_kind(f)
+
+# The element kind of `name[i]`, if `name` sees through, or TypeKind.Void.
+pub fn through_named_elem(s: *EmitterState, name_sv: StrView) -> TypeKind
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let idx: i32 = find_local_idx(s, StrView { ptr: (name), len: (len) as i64 })
+    if idx < 0
+        return TypeKind.Void
+    let loc: *LocalVar = local_at(s, idx)
+    # AGAST #2330: through a pointer to an array, the slot is the element.
+    let view: *LocalVar = array_view_named(s, StrView { ptr: (name), len: (len) as i64 })
+    if view != null
+        return through_elem_kind(s, view)
+    if sees_through(loc) == 0 and indexes_itself(loc) == 0
+        return TypeKind.Void
+    through_elem_kind(s, loc)
+
+# The struct an element of `loc`'s buffer is or points at, and the field's type
+# (TypeKind.Ptr for `*S` elements, TypeKind.PtrPtr for `*S` held in the buffer), or
+# TypeKind.Void for scalars.
+pub fn through_elem_struct(s: *EmitterState, loc: *LocalVar, out_name: **u8, out_len: *i32) -> TypeKind
+    *out_name = null
+    *out_len = 0
+    if lv_is_array_view(loc) == 1
+        # A struct T, named by the view's type_name, is held in the array.
+        if lv_pointee_type(loc) != TypeKind.Struct
+            return TypeKind.Void
+        *out_name = lv_type_name(loc)
+        *out_len = lv_type_name_len(loc)
+        return TypeKind.Ptr
+    let f: *StructField = through_buffer(s, loc)
+    if f == null or f.field_type_name_len <= 0 or find_struct(s, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == null
+        return TypeKind.Void
+    *out_name = f.field_type_name
+    *out_len = f.field_type_name_len
+    f.field_type
+
+# The struct `p[i].f` takes a field of, for the type-only paths.  Returns 1 if `e`
+# is an index through.
+pub fn index_through_struct(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    let loc: *LocalVar = index_through(s, e)
+    if loc == null
+        return 0
+    through_elem_struct(s, loc, out_name, out_len)
+    1
+
+# AGAST #2444: the struct an element of `e`, an index through, is by value, for the
+# move check.  1 and its name; 0 if `e` isn't an index through, or its element is a
+# scalar or a pointer.  ref_ty_of gives `p[i]` the Vec's own name and `(*p)[i]` none.
+pub fn index_through_value_struct(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    let loc: *LocalVar = index_through(s, e)
+    if loc == null
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if through_elem_struct(s, loc, @name, @len) != TypeKind.Ptr or name == null
+        return 0
+    *out_name = name
+    *out_len = len
+    1
+
+# 1 after reporting `e`, a slice through a pointer or reference that monomorph
+# didn't rewrite into `p.slice(lo, hi)` (#2448): a Vec into a Span slot whose
+# low bound has a call inside it (#2501), a call in a Span<u8>'s low bound with
+# no ritzlib.span.  The range block in
+# emit_expr_index reads the struct at the local's own slot, which here holds a
+# pointer to it, so a Span sliced garbage.  A limit of this lowering, not a rule
+# of the language, so it stays here; the rules index_refused said with it (a
+# reference indexed as a buffer, an element or `*p` with nothing to index, `*v`
+# of a value, a whole array into `p[i]`) are Sema's, index_refuse.ritz (#3893).
+pub fn through_slice_refused(s: *EmitterState, e: *Expr) -> i32
+    if e == null or e.kind != ExprKind.Index or e.left == null
+        return 0
+    if e.right == null or e.right.kind != ExprKind.Range
+        return 0
+    let root: *Expr = through_root(e.left)
+    if root == null or root.kind != ExprKind.Ident
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (root.ident_ptr), len: (root.ident_len) as i64 })
+    if loc == null or sees_through(loc) == 0
+        return 0
+    emit_nd_error(s, e.span.line, e.span.col, c"this slice of a Vec, Span or String isn't lowered by ritz1 (`let t = p[lo..hi]` is)")
+    1
+
+
+# =============================================================================
+# Moved down from emitter_expr_arith / emitter_expr_call by AGAST #1818: pure
+# lookups the inference above needs (deref pointee names, method callees).
+# =============================================================================
+pub fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    var base: *Expr = op
+    while base != null and base.kind == ExprKind.Binary and (base.op == OpKind.Add or base.op == OpKind.Sub)
+        base = base.left
+    if base == null
+        return
+    var cand: *u8 = null
+    var cand_len: i32 = 0
+    # The pre-#1505 path: a bare `*p` on a local with a recorded struct
+    # pointee loaded `%<type_name>` unverified.  Keep trusting it — its names
+    # include tagged enums and other aggregates find_struct does not list.
+    var trusted: i32 = 0
+    match base.kind
+        ExprKind.Ident =>
+            let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            if lv != null
+                # Only a recorded TypeKind.Struct pointee is trusted: the parser can
+                # leave a stale type_name on a primitive pointer param
+                # (`lex: *Lexer, out: *i64` gives `out` the name "Lexer").
+                let is_ptr: bool = lv_var_type(lv) == TypeKind.Ptr or lv_var_type(lv) == TypeKind.Ref or lv_var_type(lv) == TypeKind.MutRef
+                if base == op and lv_pointee_type(lv) == TypeKind.Struct
+                    cand = lv_type_name(lv)
+                    cand_len = lv_type_name_len(lv)
+                    trusted = 1
+                else if is_ptr and lv_pointee_type(lv) == TypeKind.Struct
+                    cand = lv_type_name(lv)
+                    cand_len = lv_type_name_len(lv)
+            else
+                let glob: *GlobalVarDef = find_global(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                # AGAST #2359: a `var G: *S` keeps S in pointee_type_name;
+                # type_name is set only for a by-value `var g: S`.  Reading
+                # type_name gave null here, so `G + i` strode 1 byte.  #1554:
+                # and an `@S` / `@&S` global, whose `*g` loaded i64.
+                cand = global_pointee_struct(glob, @cand_len)
+        ExprKind.Index =>
+            # AGAST #2332: `*a[i]` / `*(a[i] + k)` with `a: [N]*S`.
+            array_elem_pointee(s, base, @cand, @cand_len)
+            trusted = 1   # the array's own record, and an enum isn't a StructDef
+        _ =>
+            if base.kind == ExprKind.Unary and base.op == OpKind.Deref
+                # AGAST #1924: `*(*(pp + i) + k)` / `**pp` with `pp: **S` (local,
+                # param, global or field) loads an S.
+                deref_ptr_ptr_struct_name(s, base, @cand, @cand_len)
+            else if base.kind == ExprKind.Unary and (base.op == OpKind.Addr or base.op == OpKind.AddrMut)
+                # AGAST #1746: `*@x` is x's own struct type.  It loaded i64, which a
+                # by-value or struct store of the result rejects.
+                let lent: *LocalVar = lent_struct_local(s, base.operand)
+                if lent != null
+                    cand = lv_type_name(lent)   # AGAST #2286: `c` itself reads as the pointer
+                    cand_len = lv_type_name_len(lent)
+                else
+                    resolve_expr_struct_name(s, base.operand, @cand, @cand_len)
+                # AGAST #2544: `*@g` / `*((@g) + k)` with a by-value struct global
+                # `var g: S` (or `G<T>`, recorded as its instance `G$T`).
+                # resolve_expr_struct_name types locals only, so this loaded i64.
+                if cand == null
+                    addr_global_struct_name(s, base.operand, @cand, @cand_len)
+            else
+                match base.kind
+                    ExprKind.Member =>
+                        let f: *StructField = member_field_def(s, base)
+                        if f != null and f.field_type == TypeKind.Ptr
+                            # make_ptr_prim_field records primitive pointees here.
+                            let pe: TypeKind = f.array_elem_type
+                            let prim: bool = ty_is_int(pe) == 1
+                            if not prim
+                                cand = f.field_type_name
+                                cand_len = f.field_type_name_len
+                    ExprKind.Call =>
+                        # AGAST #2526: `*f()` / `*(f() + i)` with `f() -> *S` (or `-> @S`)
+                        # loads an S.  capture_fn_return_type names a primitive pointee
+                        # ("i32") rather than leaving a stale struct name, and find_struct
+                        # below rejects it, so `-> *i32` keeps its width-specific load.
+                        let fd: *FnDef = find_call_fn(s, base)
+                        if fd != null and (fd.return_type == TypeKind.Ptr or fd.return_type == TypeKind.Ref or fd.return_type == TypeKind.MutRef)
+                            cand = fd.return_type_name
+                            cand_len = fd.return_type_name_len
+                    ExprKind.Method =>
+                        # AGAST #1635: `*m.index(k)`, a struct's `m[k]`, with `index -> @S`
+                        # (or `index_mut -> @&S`) loads an S.
+                        let mfd: *FnDef = method_call_def(s, base)
+                        if mfd != null and (mfd.return_type == TypeKind.Ptr or mfd.return_type == TypeKind.Ref or mfd.return_type == TypeKind.MutRef)
+                            cand = mfd.return_type_name
+                            cand_len = mfd.return_type_name_len
+                    _ =>
+                        if base.kind == ExprKind.Cast and (base.type_kind == TypeKind.Ptr or base.type_kind == TypeKind.Ref or base.type_kind == TypeKind.MutRef) and base.cast_ptr_kind == (TypeKind.Struct as i32)
+                            # AGAST #2526: `*(x as *S)` / `*((x as *S) + i)`.  apply_cast_tail
+                            # records a struct pointee's name on the node (AGAST #1453).
+                            # AGAST #3443: and `(x as @&S).f` / `(x as @S).f`.
+                            cand = base.ident_ptr
+                            cand_len = base.ident_len
+                        else if base.kind == ExprKind.If and base == op
+                            # AGAST #2544: `*(if c then p else q)` loads what every arm points
+                            # at.  Each arm's value is named as a deref operand of its own; an
+                            # arm this can't name, or two arms naming different types, leave the
+                            # deref unnamed.  (`(if ..) + k` steps its i64 value one byte:
+                            # ptr_arith_elem_size has no arm for an if, so it isn't named here.)
+                            if_arms_pointee_name(s, base, out_name, out_len)
+                            return
+    if cand == null or cand_len <= 0
+        return
+    # `Option$T` / `Result$T,E` are tagged-enum aggregates, not StructDefs.
+    # AGAST #2539: so is a plain enum: `**r` with `r: **Color` loads a %Color.
+    if trusted == 0 and is_tagged_enum_type(StrView { ptr: (cand), len: (cand_len) as i64 }) == 0 and is_enum_type(s.mono.pctx, StrView { ptr: (cand), len: (cand_len) as i64 }) == 0
+        let st: *StructDef = find_struct(s, StrView { ptr: (cand), len: (cand_len) as i64 })
+        if st == null
+            return
+    *out_name = cand
+    *out_len = cand_len
+
+# AGAST #2544: the struct type of `x` when it names a by-value struct global
+# no local shadows; null otherwise.
+fn addr_global_struct_name(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32)
+    if x == null or x.kind != ExprKind.Ident
+        return
+    if find_local_struct_name(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) != null
+        return
+    let g: *GlobalVarDef = find_global(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+    if g == null or g.var_type != TypeKind.Struct or g.type_name_len <= 0
+        return
+    *out_name = g.type_name
+    *out_len = g.type_name_len
+
+# AGAST #2544: the aggregate every arm of the if-expression `e` points at, as
+# deref_pointee_struct_name names each arm's value; nothing unless all agree.
+fn if_arms_pointee_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    var arm: *MatchArm = e.args as *MatchArm
+    var name: *u8 = null
+    var len: i32 = 0
+    while arm != null
+        var an: *u8 = null
+        var al: i32 = 0
+        deref_pointee_struct_name(s, arm.body, @an, @al)
+        if al <= 0
+            return
+        if len > 0 and (al != len or memcmp(an, name, len as i64) != 0)
+            return
+        name = an
+        len = al
+        arm = arm.next
+    *out_name = name
+    *out_len = len
+
+# 1 if `c` is a struct table written as a fill `[v; N]`, which
+# emit_const_array_entry declares as `[N x %S]`: a `[N]StrView` string fill
+# (AGAST #3978), or a refused fill's placeholder (AGAST #3946).  Its readers
+# treat it as they do a literal table.
+pub fn const_struct_fill_global(c: *ConstEntry) -> i32
+    if c == null or c.const_type != TypeKind.Array or c.array_elem_type != TypeKind.Struct
+        return 0
+    if c.value_expr == null or c.value_expr.kind != ExprKind.ArrayFill
+        return 0
+    1
+
+# The impl method `type_name.method` defined in this module, or null.
+pub fn find_impl_method(s: *EmitterState, type_name_sv: StrView, method_sv: StrView) -> *FnDef
+    var type_name: *u8 = type_name_sv.ptr
+    var type_name_len: i32 = type_name_sv.len as i32
+    var method: *u8 = method_sv.ptr
+    var method_len: i32 = method_sv.len as i32
+    let exact: *FnDef = find_impl_method_exact(s, StrView { ptr: (type_name), len: (type_name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 })
+    if exact != null
+        return exact
+    # AGAST #4294 (R36's revisit): a concrete built-in target —
+    # `impl Display for Span<u8>` — is one impl block for every instantiation
+    # (R65), so its target is the base name and the receiver is `Span$u8`.
+    # Match the base only for a non-generic impl: a generic impl's methods are
+    # monomorphized into the module's functions (find_spec_impl_method).
+    var base_len: i32 = 0
+    while base_len < type_name_len and *(type_name + base_len) != '$'
+        base_len = base_len + 1
+    if base_len == type_name_len
+        return null
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        if ib.type_params == null and name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (type_name), len: (base_len) as i64 }) == 1
+            var mm: *FnDef = ib.methods
+            while mm != null
+                if name_eq(StrView { ptr: (mm.name), len: (mm.name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 }) == 1
+                    return mm
+                mm = mm.next
+        ib = ib.next
+    return null
+
+fn find_impl_method_exact(s: *EmitterState, type_name_sv: StrView, method_sv: StrView) -> *FnDef
+    var type_name: *u8 = type_name_sv.ptr
+    var type_name_len: i32 = type_name_sv.len as i32
+    var method: *u8 = method_sv.ptr
+    var method_len: i32 = method_sv.len as i32
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        if name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (type_name), len: (type_name_len) as i64 }) == 1
+            var mm: *FnDef = ib.methods
+            while mm != null
+                if name_eq(StrView { ptr: (mm.name), len: (mm.name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 }) == 1
+                    return mm
+                mm = mm.next
+        ib = ib.next
+    return null
+
+# The function a method call `type_name.method(..)` dispatches to, in
+# emit_expr_method's order: a method of a non-generic impl, else a
+# specialized generic impl method `Type$T_method` (monomorph adds those to the
+# module's functions, not to its impls).  Null when unknown.  No free fn: the
+# UFCS table went with LARB R66 (#3497).  let_check.ritz reads its params
+# (AGAST #2032).
+pub fn method_callee_def(s: *EmitterState, type_name_sv: StrView, method_sv: StrView) -> *FnDef
+    var type_name: *u8 = type_name_sv.ptr
+    var type_name_len: i32 = type_name_sv.len as i32
+    var method: *u8 = method_sv.ptr
+    var method_len: i32 = method_sv.len as i32
+    let m: *FnDef = find_impl_method(s, StrView { ptr: (type_name), len: (type_name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 })
+    if m != null
+        return m
+    return find_spec_impl_method(s, StrView { ptr: (type_name), len: (type_name_len) as i64 }, StrView { ptr: (method), len: (method_len) as i64 })
+
+# The specialized generic impl method `Type$T_method` (`W$i32_dup`), or null.
+# monomorph's specialize_impl_method adds these to the module's functions as
+# free fns, not to an impl block, so an impl-table walk never finds them.
+pub fn find_spec_impl_method(s: *EmitterState, type_name_sv: StrView, method_sv: StrView) -> *FnDef
+    var type_name: *u8 = type_name_sv.ptr
+    var type_name_len: i32 = type_name_sv.len as i32
+    var method: *u8 = method_sv.ptr
+    var method_len: i32 = method_sv.len as i32
+    let n: i32 = type_name_len + 1 + method_len
+    let buf: *u8 = malloc(n as i64 + 1)
+    for i in 0..type_name_len
+        *(buf + i) = *(type_name + i)
+    *(buf + type_name_len) = '_'
+    for i in 0..method_len
+        *(buf + type_name_len + 1 + i) = *(method + i)
+    *(buf + n) = 0
+    let fd: *FnDef = find_fn(s, StrView { ptr: (buf), len: (n) as i64 })
+    free(buf)
+    return fd
+
+fn method_recv_type(s: *EmitterState, recv: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if recv == null
+        return null
+    match recv.kind
+        ExprKind.Ident =>
+            let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
+            if loc != null
+                *out_len = lv_type_name_len(loc)
+                return lv_type_name(loc)
+            let g: *GlobalVarDef = find_global(s, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
+            if g != null
+                *out_len = g.type_name_len
+                return g.type_name
+            # `S.make(..)`: a static method's receiver is the type.
+            *out_len = recv.ident_len
+            return recv.ident_ptr as *u8
+        ExprKind.Member =>
+            let f: *StructField = member_field_def(s, recv)
+            if f == null
+                return null
+            *out_len = f.field_type_name_len
+            return f.field_type_name
+        # AGAST #4180: `(*p).me()` / `(p as @C).me()`, so their callee is known.
+        ExprKind.Unary | ExprKind.Cast =>
+            return deref_cast_recv_struct(s, recv, out_len)
+        _ => pass
+    # AGAST #3360: `PS[i].m()`, so let_check sees a `self:&` lend of the
+    # const's read-only element.
+    let ce: *ConstEntry = const_struct_array_elem(s, recv)
+    if ce != null
+        *out_len = ce.array_elem_type_name_len
+        return ce.array_elem_type_name
+    return null
+
+# The function a method call dispatches to (UFCS helper, impl method or
+# specialized generic impl method), or null.
+pub fn method_call_def(s: *EmitterState, e: *Expr) -> *FnDef
+    var tlen: i32 = 0
+    let tname: *u8 = method_recv_type(s, e.left, @tlen)
+    if tname == null or tlen <= 0
+        return null
+    return method_callee_def(s, StrView { ptr: (tname), len: (tlen) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+
+# =============================================================================
+# Moved down by AGAST #1818 so the Sema-side checks (bool_kind, let_check,
+# ref_check, ownership) import no emitter module above this one.
+# =============================================================================
+pub fn local_struct_levels(loc: *LocalVar) -> i32
+    match lv_var_type(loc)
+        TypeKind.PtrPtr =>
+            return ptr_ptr_ident_levels(lv_inner_pointee_type(loc))
+        TypeKind.Ref | TypeKind.MutRef =>
+            match lv_pointee_type(loc)
+                TypeKind.Ptr =>
+                    return 2
+                TypeKind.PtrPtr =>
+                    return 1 + ptr_ptr_ident_levels(lv_inner_pointee_type(loc))
+                _ => pass
+            return 1
+        TypeKind.Ptr =>
+            return 1
+        _ => pass
+    0
+
+# The integer element of monomorphised `Vec$T` (`v[i]` is the index sugar), or
+# TypeKind.Unknown for any other name.
+pub fn vec_name_elem_type(name_sv: StrView) -> TypeKind
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if name == null or len < 6 or *name != 'V' or *(name + 1) != 'e' or *(name + 2) != 'c' or *(name + 3) != '$'
+        return TypeKind.Unknown
+    let en: *u8 = name + 4
+    let el: i32 = len - 4
+    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"u8"), len: (2) as i64 }) == 1
+        return TypeKind.U8
+    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"i8"), len: (2) as i64 }) == 1
+        return TypeKind.I8
+    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"u16"), len: (3) as i64 }) == 1
+        return TypeKind.U16
+    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"i16"), len: (3) as i64 }) == 1
+        return TypeKind.I16
+    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"u32"), len: (3) as i64 }) == 1
+        return TypeKind.U32
+    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"i32"), len: (3) as i64 }) == 1
+        return TypeKind.I32
+    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"u64"), len: (3) as i64 }) == 1
+        return TypeKind.U64
+    TypeKind.Unknown
+
+pub fn enum_declares_variant(ctx: *ParseCtx, ei: i32, name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    for vi in 0..enum_variant_count(ctx, ei)
+        var vlen: i32 = 0
+        let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
+        if name_eq(StrView { ptr: (vname), len: (vlen) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+            return 1
+    0
+
+# 1 when a user enum declares `name`, whichever one or how many.
+pub fn user_enum_declares(ctx: *ParseCtx, name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    for ei in 0..enum_count(ctx)
+        if enum_declares_variant(ctx, ei, StrView { ptr: (name), len: (len) as i64 }) == 1
+            return 1
+    0
+
+# 1 when emit_expr lowers `e` as Some/Ok/Err(x), or `e` is the Option's None: one
+# no name shadows and no user enum declares.  A user's None is its enum's bare unit
+# variant (match_scrutinee_is_ctor, #2434), never an Option's tag.
+pub fn is_tagged_ctor(s: *EmitterState, e: *Expr) -> i32
+    if e.kind == ExprKind.Call
+        return (is_variant_carrier(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1 or is_variant_null(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1) as i32
+    if e.kind != ExprKind.Ident or is_ident_none(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0
+        return 0
+    if is_const(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1 or find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
+        return 0
+    if user_enum_declares(s.mono.pctx, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+        return 0
+    (find_local(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0) as i32
+
+# 1 when `e` builds its enum where it stands, payload and all: nothing but the
+# match can own that value (own_scrutinee_moved).
+pub fn match_scrutinee_builds(s: *EmitterState, e: *Expr) -> i32
+    if is_tagged_ctor(s, e) == 1
+        return 1
+    var gvi: i32 = 0
+    if e.kind == ExprKind.Call and generic_ctor_enum(s, e, @gvi) >= 0   # AGAST #2437
+        return 1
+    var name: *u8 = null
+    var len: i32 = 0
+    match e.kind
+        ExprKind.Call =>
+            user_variant_ctor_enum(s.mono.pctx, e, @name, @len)
+        ExprKind.Method =>
+            qualified_variant_enum(s, e, @name, @len)
+        _ => pass
+    (name != null) as i32
+
+# The generic enum the bare constructor `e` builds (*out_vi its variant), or -1:
+# not a constructor, a name a local / const / global / fn takes, or a variant
+# another enum declares too.  Option and Result are the tagged constructors'.
+pub fn generic_ctor_enum(s: *EmitterState, e: *Expr, out_vi: *i32) -> i32
+    *out_vi = 0 - 1
+    var name: *u8 = null
+    var len: i32 = 0
+    if e.kind == ExprKind.Call and e.call_type_suffix_len == 0
+        name = e.func_name
+        len = e.func_name_len
+    else if e.kind == ExprKind.Ident
+        name = e.ident_ptr
+        len = e.ident_len
+        if find_local(s, StrView { ptr: (name), len: (len) as i64 }) >= 0 or is_const(s, StrView { ptr: (name), len: (len) as i64 }) == 1 or find_global(s, StrView { ptr: (name), len: (len) as i64 }) != null
+            return 0 - 1
+    if name == null or find_fn(s, StrView { ptr: (name), len: (len) as i64 }) != null
+        return 0 - 1
+    let ei: i32 = generic_enum_of_variant(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }, out_vi)
+    if ei < 0
+        return 0 - 1
+    var en_len: i32 = 0
+    let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
+    if en_len == 6 and (memcmp(en, c"Option", 6) == 0 or memcmp(en, c"Result", 6) == 0)
+        return 0 - 1
+    ei
+
+pub fn is_ident_none(name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    if len == 4
+        if *name == 'N' and *(name + 1) == 'o' and *(name + 2) == 'n' and *(name + 3) == 'e'
+            return 1
+    return 0

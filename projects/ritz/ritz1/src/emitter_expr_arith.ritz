@@ -11,7 +11,6 @@ import emitter_abi   # AGAST #1818: sret / byval moved out of emitter_core
 import emitter_types   # AGAST #1818: type inference moved out of emitter_core
 import emitter_ir
 import diag           # diag_error_at (AGAST #3445)
-import index_through
 import emitter_expr
 import emitter_expr_access   # emit_whole_array_error (AGAST #2287)
 import emitter_stmt          # array_ptr_local (AGAST #2287)
@@ -843,31 +842,6 @@ fn indexed_elem_type(s: *EmitterState, base: *Expr) -> TypeKind
         _ => pass
     TypeKind.Unknown
 
-# The integer element of monomorphised `Vec$T` (`v[i]` is the index sugar), or
-# TypeKind.Unknown for any other name.
-pub fn vec_name_elem_type(name_sv: StrView) -> TypeKind
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len < 6 or *name != 'V' or *(name + 1) != 'e' or *(name + 2) != 'c' or *(name + 3) != '$'
-        return TypeKind.Unknown
-    let en: *u8 = name + 4
-    let el: i32 = len - 4
-    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"u8"), len: (2) as i64 }) == 1
-        return TypeKind.U8
-    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"i8"), len: (2) as i64 }) == 1
-        return TypeKind.I8
-    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"u16"), len: (3) as i64 }) == 1
-        return TypeKind.U16
-    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"i16"), len: (3) as i64 }) == 1
-        return TypeKind.I16
-    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"u32"), len: (3) as i64 }) == 1
-        return TypeKind.U32
-    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"i32"), len: (3) as i64 }) == 1
-        return TypeKind.I32
-    if name_eq(StrView { ptr: (en), len: (el) as i64 }, StrView { ptr: (c"u64"), len: (3) as i64 }) == 1
-        return TypeKind.U64
-    TypeKind.Unknown
-
 # AGAST #3225: the slot `/` or `%` node `e` lands in directly, when it's wider
 # than `e`'s own integer type (literal_slot.ritz, lit_slot_arith); else
 # TypeKind.Void.  ritz0's _wider_slot.  LARB R63 (AGAST #3489): `+ - *` and
@@ -1174,131 +1148,6 @@ fn scalar_llvm_name(t: TypeKind) -> *u8
         _ => pass
     null
 
-pub fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
-    var base: *Expr = op
-    while base != null and base.kind == ExprKind.Binary and (base.op == OpKind.Add or base.op == OpKind.Sub)
-        base = base.left
-    if base == null
-        return
-    var cand: *u8 = null
-    var cand_len: i32 = 0
-    # The pre-#1505 path: a bare `*p` on a local with a recorded struct
-    # pointee loaded `%<type_name>` unverified.  Keep trusting it — its names
-    # include tagged enums and other aggregates find_struct does not list.
-    var trusted: i32 = 0
-    match base.kind
-        ExprKind.Ident =>
-            let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-            if lv != null
-                # Only a recorded TypeKind.Struct pointee is trusted: the parser can
-                # leave a stale type_name on a primitive pointer param
-                # (`lex: *Lexer, out: *i64` gives `out` the name "Lexer").
-                let is_ptr: bool = lv_var_type(lv) == TypeKind.Ptr or lv_var_type(lv) == TypeKind.Ref or lv_var_type(lv) == TypeKind.MutRef
-                if base == op and lv_pointee_type(lv) == TypeKind.Struct
-                    cand = lv_type_name(lv)
-                    cand_len = lv_type_name_len(lv)
-                    trusted = 1
-                else if is_ptr and lv_pointee_type(lv) == TypeKind.Struct
-                    cand = lv_type_name(lv)
-                    cand_len = lv_type_name_len(lv)
-            else
-                let glob: *GlobalVarDef = find_global(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-                # AGAST #2359: a `var G: *S` keeps S in pointee_type_name;
-                # type_name is set only for a by-value `var g: S`.  Reading
-                # type_name gave null here, so `G + i` strode 1 byte.  #1554:
-                # and an `@S` / `@&S` global, whose `*g` loaded i64.
-                cand = global_pointee_struct(glob, @cand_len)
-        ExprKind.Index =>
-            # AGAST #2332: `*a[i]` / `*(a[i] + k)` with `a: [N]*S`.
-            array_elem_pointee(s, base, @cand, @cand_len)
-            trusted = 1   # the array's own record, and an enum isn't a StructDef
-        _ =>
-            if base.kind == ExprKind.Unary and base.op == OpKind.Deref
-                # AGAST #1924: `*(*(pp + i) + k)` / `**pp` with `pp: **S` (local,
-                # param, global or field) loads an S.
-                deref_ptr_ptr_struct_name(s, base, @cand, @cand_len)
-            else if base.kind == ExprKind.Unary and (base.op == OpKind.Addr or base.op == OpKind.AddrMut)
-                # AGAST #1746: `*@x` is x's own struct type.  It loaded i64, which a
-                # by-value or struct store of the result rejects.
-                let lent: *LocalVar = lent_struct_local(s, base.operand)
-                if lent != null
-                    cand = lv_type_name(lent)   # AGAST #2286: `c` itself reads as the pointer
-                    cand_len = lv_type_name_len(lent)
-                else
-                    resolve_expr_struct_name(s, base.operand, @cand, @cand_len)
-                # AGAST #2544: `*@g` / `*((@g) + k)` with a by-value struct global
-                # `var g: S` (or `G<T>`, recorded as its instance `G$T`).
-                # resolve_expr_struct_name types locals only, so this loaded i64.
-                if cand == null
-                    addr_global_struct_name(s, base.operand, @cand, @cand_len)
-            else
-                match base.kind
-                    ExprKind.Member =>
-                        let f: *StructField = member_field_def(s, base)
-                        if f != null and f.field_type == TypeKind.Ptr
-                            # make_ptr_prim_field records primitive pointees here.
-                            let pe: TypeKind = f.array_elem_type
-                            let prim: bool = ty_is_int(pe) == 1
-                            if not prim
-                                cand = f.field_type_name
-                                cand_len = f.field_type_name_len
-                    ExprKind.Call =>
-                        # AGAST #2526: `*f()` / `*(f() + i)` with `f() -> *S` (or `-> @S`)
-                        # loads an S.  capture_fn_return_type names a primitive pointee
-                        # ("i32") rather than leaving a stale struct name, and find_struct
-                        # below rejects it, so `-> *i32` keeps its width-specific load.
-                        let fd: *FnDef = find_call_fn(s, base)
-                        if fd != null and (fd.return_type == TypeKind.Ptr or fd.return_type == TypeKind.Ref or fd.return_type == TypeKind.MutRef)
-                            cand = fd.return_type_name
-                            cand_len = fd.return_type_name_len
-                    ExprKind.Method =>
-                        # AGAST #1635: `*m.index(k)`, a struct's `m[k]`, with `index -> @S`
-                        # (or `index_mut -> @&S`) loads an S.
-                        let mfd: *FnDef = method_call_def(s, base)
-                        if mfd != null and (mfd.return_type == TypeKind.Ptr or mfd.return_type == TypeKind.Ref or mfd.return_type == TypeKind.MutRef)
-                            cand = mfd.return_type_name
-                            cand_len = mfd.return_type_name_len
-                    _ =>
-                        if base.kind == ExprKind.Cast and (base.type_kind == TypeKind.Ptr or base.type_kind == TypeKind.Ref or base.type_kind == TypeKind.MutRef) and base.cast_ptr_kind == (TypeKind.Struct as i32)
-                            # AGAST #2526: `*(x as *S)` / `*((x as *S) + i)`.  apply_cast_tail
-                            # records a struct pointee's name on the node (AGAST #1453).
-                            # AGAST #3443: and `(x as @&S).f` / `(x as @S).f`.
-                            cand = base.ident_ptr
-                            cand_len = base.ident_len
-                        else if base.kind == ExprKind.If and base == op
-                            # AGAST #2544: `*(if c then p else q)` loads what every arm points
-                            # at.  Each arm's value is named as a deref operand of its own; an
-                            # arm this can't name, or two arms naming different types, leave the
-                            # deref unnamed.  (`(if ..) + k` steps its i64 value one byte:
-                            # ptr_arith_elem_size has no arm for an if, so it isn't named here.)
-                            if_arms_pointee_name(s, base, out_name, out_len)
-                            return
-    if cand == null or cand_len <= 0
-        return
-    # `Option$T` / `Result$T,E` are tagged-enum aggregates, not StructDefs.
-    # AGAST #2539: so is a plain enum: `**r` with `r: **Color` loads a %Color.
-    if trusted == 0 and is_tagged_enum_type(StrView { ptr: (cand), len: (cand_len) as i64 }) == 0 and is_enum_type(s.mono.pctx, StrView { ptr: (cand), len: (cand_len) as i64 }) == 0
-        let st: *StructDef = find_struct(s, StrView { ptr: (cand), len: (cand_len) as i64 })
-        if st == null
-            return
-    *out_name = cand
-    *out_len = cand_len
-
-# AGAST #2544: the struct type of `x` when it names a by-value struct global
-# no local shadows; null otherwise.
-fn addr_global_struct_name(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32)
-    if x == null or x.kind != ExprKind.Ident
-        return
-    if find_local_struct_name(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) != null
-        return
-    let g: *GlobalVarDef = find_global(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
-    if g == null or g.var_type != TypeKind.Struct or g.type_name_len <= 0
-        return
-    *out_name = g.type_name
-    *out_len = g.type_name_len
-
 # AGAST #2544: 1 when `op` is an if-expression some arm of which points at an
 # aggregate, so a deref of it the arms don't agree on is #1505's located error,
 # not a `load i64` clang rejects.
@@ -1314,26 +1163,6 @@ fn if_arm_names_pointee(s: *EmitterState, op: *Expr) -> i32
             return 1
         arm = arm.next
     0
-
-# AGAST #2544: the aggregate every arm of the if-expression `e` points at, as
-# deref_pointee_struct_name names each arm's value; nothing unless all agree.
-fn if_arms_pointee_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
-    var arm: *MatchArm = e.args as *MatchArm
-    var name: *u8 = null
-    var len: i32 = 0
-    while arm != null
-        var an: *u8 = null
-        var al: i32 = 0
-        deref_pointee_struct_name(s, arm.body, @an, @al)
-        if al <= 0
-            return
-        if len > 0 and (al != len or memcmp(an, name, len as i64) != 0)
-            return
-        name = an
-        len = al
-        arm = arm.next
-    *out_name = name
-    *out_len = len
 
 # AGAST #1488: the address of an lvalue, as a `ptr` register, or -1 when
 # `op` is not an lvalue this emitter can address.  Shared by `@` (OpKind.Addr,
@@ -1600,17 +1429,6 @@ fn const_array_global(ce: *ConstEntry) -> i32
     if ce == null or ce.const_type != TypeKind.Array or ce.value_expr == null
         return 0
     if ce.value_expr.kind != ExprKind.ArrayLit and ce.value_expr.kind != ExprKind.ArrayFill
-        return 0
-    1
-
-# 1 if `c` is a struct table written as a fill `[v; N]`, which
-# emit_const_array_entry declares as `[N x %S]`: a `[N]StrView` string fill
-# (AGAST #3978), or a refused fill's placeholder (AGAST #3946).  Its readers
-# treat it as they do a literal table.
-pub fn const_struct_fill_global(c: *ConstEntry) -> i32
-    if c == null or c.const_type != TypeKind.Array or c.array_elem_type != TypeKind.Struct
-        return 0
-    if c.value_expr == null or c.value_expr.kind != ExprKind.ArrayFill
         return 0
     1
 
