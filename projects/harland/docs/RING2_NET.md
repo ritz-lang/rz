@@ -292,7 +292,7 @@ The kernel drops every TCP segment. The arrows above are the later milestone. Th
 
 ## Ring-3 app exchange
 
-An app does not map the frame rings and does not hold a device grant. It attaches to the service. The attachment is two SPSC rings plus an arena, with the same publication rule as the frame rings: fill the slot, release-store the index, then the wake. The slot is not `FrameDesc` and not a Zeus HTTP slot. This draft names the operations and does not freeze the struct.
+An app does not map the frame rings and does not hold a device grant. It attaches to the service. The attachment is two SPSC rings plus an arena, with the same publication rule as the frame rings: fill the slot, release-store the index, then the wake. The slot is `AppDesc`, not `FrameDesc` and not a Zeus HTTP slot. The bytes below are the layout a ring-3 caller encodes and decodes.
 
 App to service, on the first cutover named in the overview: `net_bind`, `net_send_to`, `net_recv_from`, `net_ping`, and `net_close`. The TCP milestone adds `net_connect`, `net_read`, `net_write`, and `net_close` on a stream. Service to app: data, peer-closed, and error. A ping from an app is `net_ping`, an exchange request that the ICMP path answers with one event. It is not syscall 61. The address record is not carried as a field of these messages. The app reads the kernel snapshot with `NetAddr`. Connect and byte-stream events belong to the TCP milestone. The service reads an app request the way the frame consumer reads a descriptor: one private copy, then validation of that copy.
 
@@ -320,7 +320,70 @@ flowchart LR
   sock --> ev --> call
 ```
 
-One pair of rings per attached app. A second bind of a live port fails inside the service. `MAX_PROCS` is 8. Init, the ring-1 driver, and this service each hold a slot, so at most five apps attach. `NetAttach` (228) creates the `ShmObject` and returns the app's handle. `ShmMap` (227) maps it. `CapRevoke` (41) drops the caller's handle and unmaps only that caller. The object's pages stay allocated while the other mapping is live. The wake word is the `u32` from the frame-ring layout. The bytes inside a request or an event are not frozen.
+One pair of rings per attached app. A second bind of a live port fails inside the service with `Errno.Exist` (-17) and does not allocate a handle. `MAX_PROCS` is 8. Init, the ring-1 driver, and this service each hold a slot, so at most five apps attach. `NetAttach` (228) creates the `ShmObject` and returns the app's exchange handle. `ShmMap` (227) maps it. `CapRevoke` (41) drops the caller's handle and unmaps only that caller. The object's pages stay allocated while the other mapping is live. The wake word is the `u32` from the frame-ring layout.
+
+The region is `0x23000` bytes. Indexes are monotonic `u64`. Depth is `APP_DEPTH = 32`. The slot is `seq & 31`. `APP_SLOT = 2048`, which is `FRAME_MAX`, so one datagram fits in one slot and the published MTU still caps the packet. Each side keeps a private copy of the index it owns.
+
+| Offset | Size | Contents |
+|---|---|---|
+| `0x0000` | `0x100` | Request `SpscCtrl`. The app stores `write_idx`. The service stores `read_idx`. `wake` is at `0x80`. |
+| `0x0100` | `0x100` | Event `SpscCtrl`. The service stores `write_idx`. The app stores `read_idx`. `wake` is at `0x180`. |
+| `0x0200` | to `0x1000` | Unused. |
+| `0x1000` | 4096 | Request `AppDesc[32]`. Bytes past the 32 live slots are unused. |
+| `0x2000` | 4096 | Event `AppDesc[32]`. |
+| `0x3000` | 65536 | Request arena. |
+| `0x13000` | 65536 | Event arena. The region ends at `0x23000`. |
+
+`AppDesc` is 32 bytes, little-endian, the endianness of this kernel. A reader copies it once into private memory and validates that copy. The payload copy uses only that copy's `length` and `arena_off`.
+
+| Offset | Type | Field |
+|---|---|---|
+| 0 | `u16` | `kind` |
+| 2 | `u16` | `flags`. `APP_F_NONE = 0`. Any other value is `Bad`. |
+| 4 | `u32` | `id`. The library chooses it, starting at 1. The service echoes it. `0` is not a request id. |
+| 8 | `u32` | `handle`. `0` in a request that creates an endpoint. Otherwise the endpoint the service assigned. `0` is never a live endpoint. |
+| 12 | `u16` | `port`. Local port for bind, remote port for send, peer port for a datagram event. |
+| 14 | `i16` | `status`. `0` in a request. `0` or a negative `Errno` in an event. |
+| 16 | `[4]u8` | `addr`. IPv4 in wire order. Four zero bytes when the call has no address. |
+| 20 | `u32` | `length`. Payload bytes, `0..=2048`. |
+| 24 | `u32` | `arena_off`. Must equal `(seq & 31) * 2048`. |
+| 28 | `u32` | `_pad`. Must be `0`. |
+
+Request `kind` values, written by the app:
+
+| Kind | Value | Call |
+|---|---|---|
+| `APP_BIND` | 1 | `net_bind` |
+| `APP_SEND_TO` | 2 | `net_send_to` |
+| `APP_PING` | 4 | `net_ping` |
+| `APP_CLOSE` | 5 | `net_close` |
+| `APP_CONNECT` | 6 | reserved for `net_connect` |
+| `APP_WRITE` | 7 | reserved for `net_write` |
+
+Event `kind` values, written by the service:
+
+| Kind | Value | Call that decodes it |
+|---|---|---|
+| `EV_DATAGRAM` | 16 | `net_recv_from` |
+| `EV_PING_REPLY` | 17 | `net_ping` |
+| `EV_BOUND` | 18 | `net_bind` |
+| `EV_CLOSED` | 19 | `net_close` |
+| `EV_ERROR` | 20 | any of the calls above |
+| `EV_STREAM` | 21 | reserved for `net_read` |
+
+`APP_CONNECT`, `APP_WRITE`, and `EV_STREAM` are names for the TCP milestone. The first cutover does not encode them in the tools below. A request of kind 6 or 7 is answered with `EV_ERROR` and `Errno.NoSys` (-38). It does not open a stream, and this draft still does not pick a retransmission interval or a congestion number.
+
+`net_bind(port)` publishes `APP_BIND` with `handle` 0, `length` 0, and `addr` zero. Port 0 asks the service to assign a port in `49152..=65535` that is not already bound. Any other port is the requested local port. The library waits for the event whose `id` matches. `EV_BOUND` carries `status` 0, the new `handle`, and the bound `port`. `EV_ERROR` carries no handle. A second bind of a live port is `Errno.Exist`.
+
+`net_send_to(handle, bytes, address, port)` publishes `APP_SEND_TO` with that handle, the remote port, the remote address, and the bytes at `arena_off`. `length` above 2048 is rejected in the library and is not published. The service checks the private copy, copies `length` bytes from that offset, and wraps them in UDP, IPv4, and Ethernet. The call returns when the request is on the ring. It does not wait for an event. A full request ring waits for `SPACE`, the same way a full frame ring waits.
+
+`net_recv_from(handle)` publishes nothing. It waits on the event ring and decodes the next `EV_DATAGRAM` for that handle. The returned bytes are the payload, the address, and the port from that private copy. `EV_ERROR` for the handle, or `PEER_CLOSE` on the exchange, ends the wait.
+
+`net_ping(address)` publishes one `APP_PING` with `handle` 0, port 0, and the echo bytes in the arena. It waits for one event with that `id`. `EV_PING_REPLY` returns those echoed bytes and the peer address. `EV_ERROR` returns the status. There is no count and no interval.
+
+`net_close(handle)` publishes `APP_CLOSE` with `length` 0 and waits for `EV_CLOSED` with that `id`. The process may then `CapRevoke` the exchange. Process exit detaches even if this call did not run.
+
+A `Bad` slot, a length above 2048, a non-zero `flags` or `_pad`, or an `arena_off` that is not the slot offset, is not dispatched. The consumer advances its private index past it. An occupancy above 32 closes that attachment and does not kill the caller.
 
 ## Address publication
 
@@ -388,15 +451,15 @@ The 21 per-CPU and syscall-stack checks exercise the current kernel. The service
 
 ## Userspace interface
 
-The calls below are what a ring-3 application uses. They are library calls on the app exchange. They are not new socket syscalls, and `net_ping` here is not syscall 61. The host example in `stack_example/` invokes these same names.
+The calls below are what a ring-3 application uses. They are library calls on the app exchange, and they encode and decode the `AppDesc` bytes in the ring-3 app exchange section. They are not new socket syscalls, and `net_ping` here is not syscall 61. The host example in `stack_example/` invokes these same names.
 
 Datagram, the first cutover:
 
-- `net_bind(port)` returns a handle for a local UDP port.
-- `net_recv_from(handle)` returns the datagram bytes and the peer address.
-- `net_send_to(handle, bytes, address, port)` queues those bytes.
-- `net_ping(address)` sends one echo request and returns the reply bytes.
-- `net_close(handle)` detaches.
+- `net_bind(port)` publishes `APP_BIND` and returns the handle from `EV_BOUND`. The handle is not the port.
+- `net_recv_from(handle)` decodes the next `EV_DATAGRAM` for that handle and returns the payload, the peer address, and the peer port.
+- `net_send_to(handle, bytes, address, port)` publishes `APP_SEND_TO` and returns when that request is on the ring.
+- `net_ping(address)` publishes one `APP_PING` and returns the payload of the matching `EV_PING_REPLY`.
+- `net_close(handle)` publishes `APP_CLOSE` and returns after `EV_CLOSED`.
 
 Stream, the TCP milestone, named now so the path is one stack:
 
@@ -439,10 +502,21 @@ sequenceDiagram
   Drv->>Dev: virtio header plus Ethernet, app bytes inside
 ```
 
+## Ring-3 tools
+
+The first cutover runs three ring-3 programs. Each program calls `NetAttach` (228), `ShmMap` (227), and `NetAddr` (225), then the library calls above. `NetAttach` or `NetAddr` returning `Errno.NoDev` (-19) ends the program before it publishes a request. The programs do not add a socket syscall. They stop at one datagram or one echo. HTTP, TLS, and DNS stay above this cutover, and DNS remains an application on `net_send_to` and `net_recv_from`.
+
+`udp-send` binds local port 0, so the service assigns a port in `49152..=65535`. It publishes one `APP_SEND_TO` for the address, port, and payload it was given, waits until that request is on the ring, then `net_close`.
+
+`udp-recv` binds the local port it was given. It waits for one `EV_DATAGRAM` on that handle, prints the payload and the peer address and port from that descriptor, then `net_close`.
+
+`ping` publishes one `APP_PING` and prints the payload of the matching `EV_PING_REPLY`. One echo. No count and no interval.
+
+A second bind of a port that is already live fails inside the service with `Errno.Exist` (-17). The program exits non-zero and holds no new handle.
+
 ## Open questions
 
-1. The bytes inside an app-exchange request or event. The wake word is a `u32`, the publication rule matches the frame rings, and at most five apps attach. The field layout is not frozen.
-2. One service for every NIC that later grows a frame-ring pair, or one service per device. ENA is not on the rings yet.
+One service for every NIC that later grows a frame-ring pair, or one service per device. ENA is not on the rings yet.
 
 ARP lifetime, the pending-send cap, DHCP retransmission, and the lease timers are decided above. TCP retransmission and congestion numbers are not open on this cutover. They belong to the TCP milestone, which is not part of it.
 

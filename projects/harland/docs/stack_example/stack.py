@@ -24,6 +24,42 @@ USER_EVENT_BITS = DATA | SPACE
 CAP_RIGHT_PUBLISH = 4096
 INBOX_DEPTH = 8
 U64_MAX = (1 << 64) - 1
+APP_DEPTH = 32
+APP_SLOT = 2048
+APP_REGION = 0x23000
+APP_DESC_SIZE = 32
+REQ_DESC = 0x1000
+EV_DESC = 0x2000
+REQ_ARENA = 0x3000
+EV_ARENA = 0x13000
+REQ_WRITE_AT = 0x00
+REQ_READ_AT = 0x40
+REQ_WAKE_AT = 0x80
+EV_WRITE_AT = 0x100
+EV_READ_AT = 0x140
+EV_WAKE_AT = 0x180
+APP_BIND = 1
+APP_SEND_TO = 2
+APP_PING = 4
+APP_CLOSE = 5
+APP_CONNECT = 6
+APP_WRITE = 7
+EV_DATAGRAM = 16
+EV_PING_REPLY = 17
+EV_BOUND = 18
+EV_CLOSED = 19
+EV_ERROR = 20
+EV_STREAM = 21
+REQUEST_KINDS = {APP_BIND, APP_SEND_TO, APP_PING, APP_CLOSE, APP_CONNECT, APP_WRITE}
+EVENT_KINDS = {EV_DATAGRAM, EV_PING_REPLY, EV_BOUND, EV_CLOSED, EV_ERROR, EV_STREAM}
+ERRNO_AGAIN = -11
+ERRNO_EXIST = -17
+ERRNO_NODEV = -19
+ERRNO_INVAL = -22
+ERRNO_NOSYS = -38
+EPHEMERAL_MIN = 49152
+EPHEMERAL_MAX = 65535
+APP_DESC_FMT = "<HHIIHh4sIII"
 
 
 class BackwardsIndex(Exception):
@@ -591,6 +627,179 @@ def replacement_generation():
     }
 
 
+def encode_app_desc(kind, req_id, handle, port, status, addr, length, arena_off):
+    """One AppDesc. flags and _pad are zero. addr is four IPv4 bytes."""
+    if addr is None:
+        addr = b"\x00\x00\x00\x00"
+    return struct.pack(
+        APP_DESC_FMT,
+        kind,
+        0,
+        req_id,
+        handle,
+        port,
+        status,
+        bytes(addr),
+        length,
+        arena_off,
+        0,
+    )
+
+
+def decode_app_desc(raw, seq):
+    """Private copy of one slot. A bad flags, pad, length, offset, or kind is None."""
+    if len(raw) != APP_DESC_SIZE:
+        return None
+    kind, flags, req_id, handle, port, status, addr, length, arena_off, pad = struct.unpack(
+        APP_DESC_FMT, raw
+    )
+    expected = (seq & (APP_DEPTH - 1)) * APP_SLOT
+    if flags != 0 or pad != 0 or arena_off != expected or length > APP_SLOT:
+        return None
+    if kind not in REQUEST_KINDS and kind not in EVENT_KINDS:
+        return None
+    return {
+        "kind": kind,
+        "flags": flags,
+        "id": req_id,
+        "handle": handle,
+        "port": port,
+        "status": status,
+        "addr": addr,
+        "length": length,
+        "arena_off": arena_off,
+    }
+
+
+def build_icmp_echo(payload):
+    header = bytearray(8)
+    header[0] = 8
+    body = bytes(header) + payload
+    folded = inet_checksum(body)
+    header[2] = (folded >> 8) & 0xFF
+    header[3] = folded & 0xFF
+    return bytes(header) + payload
+
+
+class AppExchange:
+    """The 0x23000 app region. Each side keeps the index it owns in private fields."""
+
+    def __init__(self):
+        self.region = bytearray(APP_REGION)
+        self.req_write = 0
+        self.req_read = 0
+        self.ev_write = 0
+        self.ev_read = 0
+        self.next_id = 1
+        self.closed = False
+
+    def _store_u64(self, offset, value):
+        self.region[offset:offset + 8] = struct.pack("<Q", value)
+
+    def _store_u32(self, offset, value):
+        self.region[offset:offset + 4] = struct.pack("<I", value & 0xFFFFFFFF)
+
+    def publish_request(self, kind, handle, port, addr, payload):
+        if self.closed:
+            return None
+        if payload is None:
+            payload = b""
+        if len(payload) > APP_SLOT:
+            return None
+        distance = self.req_write - self.req_read
+        if distance > APP_DEPTH:
+            self.closed = True
+            return None
+        if distance == APP_DEPTH:
+            return "full"
+        seq = self.req_write
+        slot = seq & (APP_DEPTH - 1)
+        arena_off = slot * APP_SLOT
+        start = REQ_ARENA + arena_off
+        self.region[start:start + APP_SLOT] = b"\xff" * APP_SLOT
+        if payload:
+            self.region[start:start + len(payload)] = payload
+        req_id = self.next_id
+        self.next_id += 1
+        desc = encode_app_desc(kind, req_id, handle, port, 0, addr, len(payload), arena_off)
+        at = REQ_DESC + slot * APP_DESC_SIZE
+        self.region[at:at + APP_DESC_SIZE] = desc
+        self.req_write += 1
+        self._store_u64(REQ_WRITE_AT, self.req_write)
+        self._store_u32(REQ_WAKE_AT, self.req_write)
+        return req_id
+
+    def take_request(self):
+        if self.req_read == self.req_write:
+            return None
+        seq = self.req_read
+        raw = self.request_desc_bytes(seq)
+        self.req_read += 1
+        self._store_u64(REQ_READ_AT, self.req_read)
+        desc = decode_app_desc(raw, seq)
+        if desc is None:
+            return ("bad", None, b"")
+        return ("ok", desc, self.request_payload(desc))
+
+    def publish_event(self, kind, req_id, handle, port, addr, status, payload):
+        if self.closed:
+            return None
+        if payload is None:
+            payload = b""
+        if len(payload) > APP_SLOT:
+            return None
+        distance = self.ev_write - self.ev_read
+        if distance > APP_DEPTH:
+            self.closed = True
+            return None
+        if distance == APP_DEPTH:
+            return "full"
+        seq = self.ev_write
+        slot = seq & (APP_DEPTH - 1)
+        arena_off = slot * APP_SLOT
+        start = EV_ARENA + arena_off
+        self.region[start:start + APP_SLOT] = b"\xff" * APP_SLOT
+        if payload:
+            self.region[start:start + len(payload)] = payload
+        desc = encode_app_desc(kind, req_id, handle, port, status, addr, len(payload), arena_off)
+        at = EV_DESC + slot * APP_DESC_SIZE
+        self.region[at:at + APP_DESC_SIZE] = desc
+        self.ev_write += 1
+        self._store_u64(EV_WRITE_AT, self.ev_write)
+        self._store_u32(EV_WAKE_AT, self.ev_write)
+        return req_id
+
+    def take_event(self):
+        if self.ev_read == self.ev_write:
+            return None
+        seq = self.ev_read
+        raw = self.event_desc_bytes(seq)
+        self.ev_read += 1
+        self._store_u64(EV_READ_AT, self.ev_read)
+        desc = decode_app_desc(raw, seq)
+        if desc is None:
+            return ("bad", None, b"")
+        return ("ok", desc, self.event_payload(desc))
+
+    def request_desc_bytes(self, seq):
+        slot = seq & (APP_DEPTH - 1)
+        at = REQ_DESC + slot * APP_DESC_SIZE
+        return bytes(self.region[at:at + APP_DESC_SIZE])
+
+    def event_desc_bytes(self, seq):
+        slot = seq & (APP_DEPTH - 1)
+        at = EV_DESC + slot * APP_DESC_SIZE
+        return bytes(self.region[at:at + APP_DESC_SIZE])
+
+    def request_payload(self, desc):
+        start = REQ_ARENA + desc["arena_off"]
+        return bytes(self.region[start:start + desc["length"]])
+
+    def event_payload(self, desc):
+        start = EV_ARENA + desc["arena_off"]
+        return bytes(self.region[start:start + desc["length"]])
+
+
 class Stack:
     """One NIC, one service, one app. Frames are Ethernet after the virtio header."""
 
@@ -599,7 +808,6 @@ class Stack:
         self.tx = FrameRing()
         self.pending_tx = []
         self.device_tx = []
-        self.datagrams = {}
         self.stream_inbox = []
         self.stream_expected = 1000
         self.stream_send_seq = 1000
@@ -609,6 +817,17 @@ class Stack:
         self.our_ip = bytes((10, 0, 2, 15))
         self.rx_notifies = 0
         self.space_notifies = 0
+        self.exchange = AppExchange()
+        self.port_handles = {}
+        self.handle_ports = {}
+        self.next_handle = 1
+        self.ephemeral_next = EPHEMERAL_MIN
+        self.attached = False
+        self.mapped = False
+        self.address_published = True
+        self.service_present = True
+        self.attach_handle = 0
+        self.tx_result = None
 
     def deliver_device_frame(self, frame):
         """Ring 1 strips the virtio header and publishes. Ring 2 demuxes."""
@@ -635,9 +854,11 @@ class Stack:
                 if udp is None:
                     continue
                 source_port, destination_port, payload = udp
-                queue = self.datagrams.get(destination_port)
-                if queue is not None:
-                    queue.append((payload, source, source_port))
+                handle = self.port_handles.get(destination_port)
+                if handle is not None:
+                    self.exchange.publish_event(
+                        EV_DATAGRAM, 0, handle, source_port, source, 0, payload
+                    )
             elif protocol == 6 and self.established:
                 tcp = parse_tcp(body, self.stream_expected)
                 if tcp is None:
@@ -647,24 +868,214 @@ class Stack:
                     self.stream_inbox.append(payload)
                     self.stream_expected += len(payload)
 
+    def net_attach(self):
+        """Syscall 228. NoDev when the service is not there. One app in this host."""
+        if not self.service_present:
+            return ERRNO_NODEV
+        self.attached = True
+        self.attach_handle = 1
+        return self.attach_handle
+
+    def shm_map(self, handle):
+        """Syscall 227. Maps this app's exchange and nothing else."""
+        if not self.attached or handle != self.attach_handle:
+            return ERRNO_NODEV
+        self.mapped = True
+        return self.exchange.region
+
+    def net_addr(self):
+        """Syscall 225. NoDev while the address generation is unpublished."""
+        if not self.address_published or not self.service_present:
+            return ERRNO_NODEV
+        return {"address": self.our_ip, "configured": 1}
+
     def net_bind(self, port):
-        self.datagrams[port] = []
-        return port
+        req_id = self.exchange.publish_request(APP_BIND, 0, port, b"\x00\x00\x00\x00", b"")
+        if req_id is None or req_id == "full":
+            return ERRNO_AGAIN if req_id == "full" else ERRNO_INVAL
+        self._drain_requests()
+        event = self._take_id(req_id)
+        if event is None or event["kind"] != EV_BOUND or event["status"] != 0:
+            if event is not None and event["status"] != 0:
+                return event["status"]
+            return ERRNO_INVAL
+        return event["handle"]
 
     def net_recv_from(self, handle):
-        queue = self.datagrams[handle]
-        if not queue:
-            return None
-        return queue.pop(0)
+        while True:
+            item = self.exchange.take_event()
+            if item is None:
+                return None
+            if item[0] != "ok":
+                continue
+            desc, payload = item[1], item[2]
+            if desc["handle"] != handle:
+                continue
+            if desc["kind"] == EV_DATAGRAM and desc["status"] == 0:
+                return (payload, desc["addr"], desc["port"])
+            if desc["kind"] == EV_ERROR:
+                return None
 
     def net_send_to(self, handle, payload, address, port):
-        _ = handle
-        ethernet = build_ethernet(
-            self.peer_mac,
-            self.our_mac,
-            build_ipv4(17, self.our_ip, address, build_udp(handle, port, payload)),
+        if len(payload) > APP_SLOT:
+            return None
+        req_id = self.exchange.publish_request(APP_SEND_TO, handle, port, address, payload)
+        if req_id is None:
+            return None
+        if req_id == "full":
+            return "full"
+        self.tx_result = None
+        self._drain_requests()
+        if self.tx_result is None:
+            return ERRNO_INVAL
+        return self.tx_result
+
+    def net_ping(self, address, payload):
+        req_id = self.exchange.publish_request(APP_PING, 0, 0, address, payload)
+        if not isinstance(req_id, int):
+            return ERRNO_INVAL
+        self._drain_requests()
+        event = self._take_id(req_id)
+        if event is None:
+            return ERRNO_INVAL
+        if event["kind"] == EV_PING_REPLY and event["status"] == 0:
+            return event["payload"]
+        return event["status"]
+
+    def net_close(self, handle):
+        req_id = self.exchange.publish_request(APP_CLOSE, handle, 0, b"\x00\x00\x00\x00", b"")
+        if not isinstance(req_id, int):
+            return ERRNO_INVAL
+        self._drain_requests()
+        event = self._take_id(req_id)
+        if event is None or event["kind"] != EV_CLOSED or event["status"] != 0:
+            if event is not None and event["status"] != 0:
+                return event["status"]
+            return ERRNO_INVAL
+        return 0
+
+    def submit_kind(self, kind):
+        """Publish one request kind and return the status the service posts."""
+        req_id = self.exchange.publish_request(kind, 0, 0, b"\x00\x00\x00\x00", b"")
+        if not isinstance(req_id, int):
+            return ERRNO_INVAL
+        self._drain_requests()
+        event = self._take_id(req_id)
+        if event is None:
+            return ERRNO_INVAL
+        return event["status"]
+
+    def _take_id(self, req_id):
+        item = self.exchange.take_event()
+        if item is None or item[0] != "ok":
+            return None
+        desc, payload = item[1], item[2]
+        if desc["id"] != req_id:
+            return None
+        desc["payload"] = payload
+        return desc
+
+    def _drain_requests(self):
+        while True:
+            item = self.exchange.take_request()
+            if item is None:
+                return
+            if item[0] != "ok":
+                continue
+            self._dispatch(item[1], item[2])
+
+    def _error(self, desc, status):
+        handle = 0 if desc["kind"] == APP_BIND else desc["handle"]
+        self.exchange.publish_event(
+            EV_ERROR, desc["id"], handle, desc["port"], desc["addr"], status, b""
         )
-        return self._transmit(ethernet)
+
+    def _assign_port(self, requested):
+        if requested != 0:
+            if requested in self.port_handles:
+                return None
+            return requested
+        port = self.ephemeral_next
+        while port <= EPHEMERAL_MAX:
+            if port not in self.port_handles:
+                self.ephemeral_next = port + 1
+                return port
+            port += 1
+        return None
+
+    def _dispatch(self, desc, payload):
+        if desc["id"] == 0 or desc["status"] != 0:
+            return
+        kind = desc["kind"]
+        if kind in (APP_CONNECT, APP_WRITE):
+            self._error(desc, ERRNO_NOSYS)
+            return
+        if kind == APP_BIND:
+            port = self._assign_port(desc["port"])
+            if port is None:
+                status = ERRNO_AGAIN if desc["port"] == 0 else ERRNO_EXIST
+                self._error(desc, status)
+                return
+            handle = self.next_handle
+            self.next_handle += 1
+            self.port_handles[port] = handle
+            self.handle_ports[handle] = port
+            self.exchange.publish_event(
+                EV_BOUND, desc["id"], handle, port, b"\x00\x00\x00\x00", 0, b""
+            )
+            return
+        if kind == APP_SEND_TO:
+            source_port = self.handle_ports.get(desc["handle"])
+            if source_port is None or desc["handle"] == 0:
+                self._error(desc, ERRNO_INVAL)
+                return
+            ethernet = build_ethernet(
+                self.peer_mac,
+                self.our_mac,
+                build_ipv4(
+                    17,
+                    self.our_ip,
+                    desc["addr"],
+                    build_udp(source_port, desc["port"], payload),
+                ),
+            )
+            self.tx_result = self._transmit(ethernet)
+            return
+        if kind == APP_PING:
+            if not icmp_echo_answered(desc["addr"], self.peer_mac, True):
+                self._error(desc, ERRNO_INVAL)
+                return
+            echo = build_icmp_echo(payload)
+            ethernet = build_ethernet(
+                self.peer_mac,
+                self.our_mac,
+                build_ipv4(1, self.our_ip, desc["addr"], echo),
+            )
+            self._transmit(ethernet)
+            self.exchange.publish_event(
+                EV_PING_REPLY, desc["id"], 0, 0, desc["addr"], 0, payload
+            )
+            return
+        if kind == APP_CLOSE:
+            port = self.handle_ports.pop(desc["handle"], None)
+            if port is None or desc["handle"] == 0:
+                self._error(desc, ERRNO_INVAL)
+                return
+            self.port_handles.pop(port, None)
+            self.exchange.publish_event(
+                EV_CLOSED, desc["id"], desc["handle"], port, b"\x00\x00\x00\x00", 0, b""
+            )
+
+    def _tool_ready(self):
+        attached = self.net_attach()
+        if attached == ERRNO_NODEV:
+            return ERRNO_NODEV
+        mapped = self.shm_map(attached)
+        if mapped == ERRNO_NODEV:
+            return ERRNO_NODEV
+        if self.net_addr() == ERRNO_NODEV:
+            return ERRNO_NODEV
+        return None
 
     def net_connect(self, address, port):
         self.established = True
@@ -728,3 +1139,42 @@ class Stack:
             moved = True
         self._driver_consume_tx()
         return moved
+
+
+def tool_udp_send(host, payload, address, port):
+    """udp-send: attach, map, read the address, bind port 0, send once, close."""
+    ready = host._tool_ready()
+    if ready is not None:
+        return ready
+    handle = host.net_bind(0)
+    if not isinstance(handle, int) or handle <= 0:
+        return handle
+    result = host.net_send_to(handle, payload, address, port)
+    closed = host.net_close(handle)
+    if closed != 0:
+        return closed
+    return result
+
+
+def tool_udp_recv_once(host, local_port, frame):
+    """udp-recv: bind the given port, take one datagram, close."""
+    ready = host._tool_ready()
+    if ready is not None:
+        return ready
+    handle = host.net_bind(local_port)
+    if not isinstance(handle, int) or handle <= 0:
+        return handle
+    host.deliver_device_frame(frame)
+    got = host.net_recv_from(handle)
+    closed = host.net_close(handle)
+    if closed != 0:
+        return closed
+    return got
+
+
+def tool_ping(host, address, payload):
+    """ping: one echo. The reply bytes are the EV_PING_REPLY payload."""
+    ready = host._tool_ready()
+    if ready is not None:
+        return ready
+    return host.net_ping(address, payload)

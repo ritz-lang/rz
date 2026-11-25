@@ -5,6 +5,7 @@ The log names each behavior and prints the datagram and stream bytes at the
 userspace calls and inside the device frame on send.
 """
 
+import struct
 import sys
 from pathlib import Path
 
@@ -40,11 +41,28 @@ def require(condition, message):
         raise SystemExit(message)
 
 
+def udp_payload_of(frame):
+    """Parse a device frame with the shipped IPv4 and UDP readers."""
+    ethernet = frame[stack.VIRTIO_HDR:]
+    parsed = stack.parse_ipv4(ethernet)
+    if parsed is None:
+        return None
+    protocol, source, destination, body = parsed
+    if protocol != 17:
+        return None
+    return stack.parse_udp(body, source, destination)
+
+
 def run():
     host = stack.Stack()
-    host.net_bind(9999)
+    bound = host.net_bind(9999)
+    require(isinstance(bound, int) and bound > 0, "net_bind did not return a handle")
+    require(host.handle_ports[bound] == 9999, "bind did not record the requested port")
+    again = host.net_bind(9999)
+    require(again == stack.ERRNO_EXIST, "second bind of a live port returned %s" % again)
+    require(host.next_handle == 2, "the refused bind allocated a handle")
     host.deliver_device_frame(udp_device_frame(DATAGRAM, 9999))
-    received = host.net_recv_from(9999)
+    received = host.net_recv_from(bound)
     require(received is not None, "net_recv_from returned nothing")
     payload, source, source_port = received
     require(payload == DATAGRAM, "datagram bytes changed in the stack")
@@ -58,10 +76,29 @@ def run():
     require(stream_bytes == STREAM, "stream bytes changed in the stack")
     print("net_read stream bytes: %s" % stream_bytes.decode())
 
-    host.net_send_to(9999, DATAGRAM, PEER_IP, 44000)
+    writes_before_oversize = host.exchange.req_write
+    require(host.net_send_to(bound, b"x" * (stack.APP_SLOT + 1), PEER_IP, 44000) is None, "an oversize send was published")
+    require(host.exchange.req_write == writes_before_oversize, "an oversize send advanced the request index")
+    host.net_send_to(bound, DATAGRAM, PEER_IP, 44000)
     require(host.device_tx, "datagram send produced no device frame")
     datagram_frame = host.device_tx[-1]
-    require(DATAGRAM in datagram_frame, "device frame does not carry the datagram bytes")
+    send_seq = host.exchange.req_write - 1
+    raw = host.exchange.request_desc_bytes(send_seq)
+    require(struct.unpack("<H", raw[0:2])[0] == stack.APP_SEND_TO, "send kind is not at byte 0")
+    require(struct.unpack("<H", raw[12:14])[0] == 44000, "remote port is not at byte 12")
+    require(raw[16:20] == PEER_IP, "address is not at byte 16")
+    require(struct.unpack("<I", raw[20:24])[0] == len(DATAGRAM), "length is not at byte 20")
+    desc = stack.decode_app_desc(raw, send_seq)
+    require(desc is not None, "published send did not decode")
+    require(host.exchange.request_payload(desc) == DATAGRAM, "request arena payload ignored length")
+    poison_at = stack.REQ_ARENA + desc["arena_off"] + desc["length"]
+    require(host.exchange.region[poison_at] == 0xFF, "bytes past length were not left unread")
+    mutated = bytearray(raw)
+    mutated[24:28] = struct.pack("<I", desc["arena_off"] + 1)
+    require(stack.decode_app_desc(bytes(mutated), send_seq) is None, "a bad arena_off decoded")
+    udp = udp_payload_of(datagram_frame)
+    require(udp is not None and udp[2] == DATAGRAM, "device frame UDP payload is not the datagram")
+    require(udp[0] == 9999, "device frame source port is not the bound port")
     print("net_send_to device frame contains datagram bytes: %s" % DATAGRAM.decode())
 
     host.net_write(("stream", PEER_IP, 80), STREAM)
@@ -87,9 +124,14 @@ def run():
     print("behavior: generic exchange handle cannot publish")
 
     space = stack.Stack()
+    space_handle = space.net_bind(9999)
+    require(isinstance(space_handle, int) and space_handle > 0, "pending send had no binding")
     filled = space.fill_tx()
     require(filled == stack.DEPTH, "TX ring did not fill")
-    require(space.net_send_to(9999, PENDING, PEER_IP, 44000) == "queued", "full ring did not queue the send")
+    require(
+        space.net_send_to(space_handle, PENDING, PEER_IP, 44000) == "queued",
+        "full ring did not queue the send",
+    )
     before = len(space.device_tx)
     rx_before = space.rx_notifies
     moved = space.release_tx_space()
@@ -198,9 +240,9 @@ def run():
     require(good != 0, "the checksum fixture folded to zero")
     bad = 1 if good != 1 else 2
     host.deliver_device_frame(udp_frame_with_checksum(b"udp-csum-bad", 9999, bad))
-    require(host.net_recv_from(9999) is None, "a mismatched UDP checksum was delivered")
+    require(host.net_recv_from(bound) is None, "a mismatched UDP checksum was delivered")
     host.deliver_device_frame(udp_frame_with_checksum(b"udp-csum-7f3a", 9999, good))
-    checked = host.net_recv_from(9999)
+    checked = host.net_recv_from(bound)
     require(checked is not None and checked[0] == b"udp-csum-7f3a", "a valid UDP checksum was dropped")
     print("behavior: a non-zero UDP checksum is checked, and zero stayed legal on the first datagram")
 
@@ -247,7 +289,7 @@ def run():
     ip = stack.build_ipv4(17, PEER_IP, OUR_IP, udp)
     padded = stack.build_ethernet(OUR_MAC, PEER_MAC, ip) + b"OUTSIDE!"
     host.deliver_device_frame(stack.device_frame(padded))
-    bounded = host.net_recv_from(9999)
+    bounded = host.net_recv_from(bound)
     require(bounded is not None and bounded[0] == inside, "IPv4 padding was delivered as payload")
     overclaim = bytearray(stack.device_frame(padded))
     length_at = stack.VIRTIO_HDR + 14 + 20 + 4
@@ -255,8 +297,55 @@ def run():
     overclaim[length_at] = (claim >> 8) & 0xFF
     overclaim[length_at + 1] = claim & 0xFF
     host.deliver_device_frame(bytes(overclaim))
-    require(host.net_recv_from(9999) is None, "UDP consumed bytes past the IPv4 total length")
+    require(host.net_recv_from(bound) is None, "UDP consumed bytes past the IPv4 total length")
     print("behavior: IPv4 total length bounds the UDP parse, including padding past that length")
+
+    echo = b"ping-body-3c91"
+    reply = host.net_ping(PEER_IP, echo)
+    ping_seq = host.exchange.ev_write - 1
+    ping_raw = host.exchange.event_desc_bytes(ping_seq)
+    ping_desc = stack.decode_app_desc(ping_raw, ping_seq)
+    require(ping_desc is not None and ping_desc["kind"] == stack.EV_PING_REPLY, "ping reply did not decode")
+    arena_echo = host.exchange.event_payload(ping_desc)
+    require(arena_echo == echo, "ping event payload is not the request bytes")
+    require(reply == arena_echo, "net_ping did not return the event payload")
+    print("net_ping reply bytes: %s" % reply.decode())
+
+    require(host.submit_kind(stack.APP_CONNECT) == stack.ERRNO_NOSYS, "APP_CONNECT opened a stream")
+    require(host.submit_kind(stack.APP_WRITE) == stack.ERRNO_NOSYS, "APP_WRITE queued stream bytes")
+    print("behavior: reserved stream requests return NoSys and publish no retransmission")
+
+    sender = stack.Stack()
+    require(stack.tool_udp_send(sender, DATAGRAM, PEER_IP, 44000) == "sent", "udp-send did not send")
+    sent_udp = udp_payload_of(sender.device_tx[-1])
+    require(sent_udp is not None and sent_udp[2] == DATAGRAM, "udp-send payload changed")
+    require(stack.EPHEMERAL_MIN <= sent_udp[0] <= stack.EPHEMERAL_MAX, "udp-send did not bind an ephemeral port")
+    print("udp-send datagram bytes: %s" % sent_udp[2].decode())
+
+    quiet = stack.Stack()
+    quiet.address_published = False
+    require(stack.tool_udp_send(quiet, DATAGRAM, PEER_IP, 44000) == stack.ERRNO_NODEV, "unpublished NetAddr sent")
+    require(quiet.exchange.req_write == 0 and quiet.device_tx == [], "NoDev still published a request")
+    absent = stack.Stack()
+    absent.service_present = False
+    require(stack.tool_ping(absent, PEER_IP, echo) == stack.ERRNO_NODEV, "a missing service answered ping")
+    require(absent.exchange.req_write == 0, "NoDev from NetAttach published a ping")
+
+    receiver = stack.Stack()
+    got = stack.tool_udp_recv_once(receiver, 9999, udp_device_frame(DATAGRAM, 9999))
+    require(got is not None and got[0] == DATAGRAM and got[1] == PEER_IP and got[2] == 44000, "udp-recv changed the datagram")
+    print("udp-recv datagram bytes: %s" % got[0].decode())
+
+    pinger = stack.Stack()
+    tool_reply = stack.tool_ping(pinger, PEER_IP, echo)
+    require(tool_reply == echo, "ping tool reply was not the request payload")
+    frames_after_echo = len(pinger.device_tx)
+    require(
+        stack.tool_ping(pinger, bytes((255, 255, 255, 255)), echo) == stack.ERRNO_INVAL,
+        "ping tool answered a broadcast",
+    )
+    require(len(pinger.device_tx) == frames_after_echo, "broadcast ping transmitted an echo")
+    print("ping tool reply bytes: %s" % tool_reply.decode())
 
 
 def udp_frame_with_checksum(payload, destination_port, checksum):
