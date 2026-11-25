@@ -17,6 +17,7 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.option
+import ritzlib.box
 import ritzlib.span
 
 import lib.m7m_types
@@ -27,6 +28,10 @@ import lib.btree
 # ============================================================================
 # Test Helpers
 # ============================================================================
+
+# The first n bytes of buffer `b`: a key or value to hand the tree.
+fn head(b: [u8], n: i64) -> [u8]
+    return b[0..n]
 
 # Create a test key from an integer
 fn make_key(n: i32, buf: *u8) -> i32
@@ -64,11 +69,11 @@ fn make_value(n: i32, buf: *u8) -> i32
 
 # Create an in-memory buffer pool for testing (no file I/O)
 # Returns null if pool creation fails
-fn create_test_pool() -> *BufferPool
-    let pool_opt = buffer_pool_new(64)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return null
-    return option_unwrap_or<*BufferPool>(@pool_opt, null)
+fn create_test_pool() -> Box<BufferPool>
+    # Empty if out of memory
+    match buffer_pool_new(64)
+        Some(p) => return box_new<BufferPool>(p)
+        None => return box_empty<BufferPool>()
 
 # ============================================================================
 # Node Creation Tests (Happy Path)
@@ -76,15 +81,17 @@ fn create_test_pool() -> *BufferPool
 
 [[test]]
 fn test_btree_create_empty() -> i32
-    var pool: *BufferPool = create_test_pool()
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
     if pool == null
         return 1
 
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 2
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 2
+    let tree: *BTree = @tree_v
 
     # Empty tree should have zero entries
     if btree_count(tree) != 0
@@ -98,12 +105,14 @@ fn test_btree_create_empty() -> i32
 
 [[test]]
 fn test_btree_root_is_leaf() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 1
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 1
+    let tree: *BTree = @tree_v
 
     # Empty tree's root should be a leaf
     if btree_root_is_leaf(tree) != 1
@@ -121,19 +130,21 @@ fn test_btree_root_is_leaf() -> i32
 
 [[test]]
 fn test_btree_put_single() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 1
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 1
+    let tree: *BTree = @tree_v
 
     var key: [16]u8
     var val: [16]u8
     let key_len: i32 = make_key(42, @key[0])
     let val_len: i32 = make_value(42, @val[0])
 
-    let err: i32 = btree_put(tree, @key[0], key_len, @val[0], val_len)
+    let err: i32 = btree_put(tree, head(@key, key_len), head(@val, val_len))
     if err != ERR_OK
         btree_destroy(tree)
         buffer_pool_destroy(pool)
@@ -151,24 +162,26 @@ fn test_btree_put_single() -> i32
 
 [[test]]
 fn test_btree_get_single() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     var key: [16]u8
     var val: [16]u8
     let key_len: i32 = make_key(100, @key[0])
     let val_len: i32 = make_value(100, @val[0])
 
-    btree_put(tree, @key[0], key_len, @val[0], val_len)
+    btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Get the value back
     var result: [16]u8
     var result_len: i32 = 0
-    let err: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+    let err: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
 
     if err != ERR_OK
         btree_destroy(tree)
@@ -181,7 +194,7 @@ fn test_btree_get_single() -> i32
         return 2
 
     # Verify value matches
-    if memcmp(@result[0], @val[0], val_len as i64) != 0
+    if not head(@result, val_len as i64).eq(@head(@val, val_len as i64))
         btree_destroy(tree)
         buffer_pool_destroy(pool)
         return 3
@@ -192,12 +205,14 @@ fn test_btree_get_single() -> i32
 
 [[test]]
 fn test_btree_put_overwrite() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     var key: [16]u8
     var val1: [16]u8
@@ -207,10 +222,10 @@ fn test_btree_put_overwrite() -> i32
     let val2_len: i32 = make_value(999, @val2[0])
 
     # Insert first value
-    btree_put(tree, @key[0], key_len, @val1[0], val1_len)
+    btree_put(tree, head(@key, key_len), head(@val1, val1_len))
 
     # Overwrite with second value
-    btree_put(tree, @key[0], key_len, @val2[0], val2_len)
+    btree_put(tree, head(@key, key_len), head(@val2, val2_len))
 
     # Count should still be 1
     if btree_count(tree) != 1
@@ -221,9 +236,9 @@ fn test_btree_put_overwrite() -> i32
     # Get should return second value
     var result: [16]u8
     var result_len: i32 = 0
-    btree_get(tree, @key[0], key_len, @result[0], @result_len)
+    btree_get(tree, head(@key, key_len), @result, @result_len)
 
-    if memcmp(@result[0], @val2[0], val2_len as i64) != 0
+    if not head(@result, val2_len as i64).eq(@head(@val2, val2_len as i64))
         btree_destroy(tree)
         buffer_pool_destroy(pool)
         return 2
@@ -234,22 +249,24 @@ fn test_btree_put_overwrite() -> i32
 
 [[test]]
 fn test_btree_delete_single() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     var key: [16]u8
     var val: [16]u8
     let key_len: i32 = make_key(75, @key[0])
     let val_len: i32 = make_value(75, @val[0])
 
-    btree_put(tree, @key[0], key_len, @val[0], val_len)
+    btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Delete the key
-    let err: i32 = btree_delete(tree, @key[0], key_len)
+    let err: i32 = btree_delete(tree, head(@key, key_len))
     if err != ERR_OK
         btree_destroy(tree)
         buffer_pool_destroy(pool)
@@ -271,12 +288,14 @@ fn test_btree_delete_single() -> i32
 
 [[test]]
 fn test_btree_put_multiple_ascending() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert 10 keys in ascending order
     for i in 0..10 as i32
@@ -285,7 +304,7 @@ fn test_btree_put_multiple_ascending() -> i32
         let key_len: i32 = make_key(i, @key[0])
         let val_len: i32 = make_value(i, @val[0])
 
-        let err: i32 = btree_put(tree, @key[0], key_len, @val[0], val_len)
+        let err: i32 = btree_put(tree, head(@key, key_len), head(@val, val_len))
         if err != ERR_OK
             btree_destroy(tree)
             buffer_pool_destroy(pool)
@@ -302,12 +321,14 @@ fn test_btree_put_multiple_ascending() -> i32
 
 [[test]]
 fn test_btree_put_multiple_descending() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert 10 keys in descending order
     for i in 0..10
@@ -317,7 +338,7 @@ fn test_btree_put_multiple_descending() -> i32
         let key_len: i32 = make_key(n, @key[0])
         let val_len: i32 = make_value(n, @val[0])
 
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     if btree_count(tree) != 10
         btree_destroy(tree)
@@ -330,12 +351,14 @@ fn test_btree_put_multiple_descending() -> i32
 
 [[test]]
 fn test_btree_put_multiple_random() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert keys in pseudo-random order
     var order: [10]i32
@@ -356,7 +379,7 @@ fn test_btree_put_multiple_random() -> i32
         let key_len: i32 = make_key(order[i], @key[0])
         let val_len: i32 = make_value(order[i], @val[0])
 
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     if btree_count(tree) != 10
         btree_destroy(tree)
@@ -370,7 +393,7 @@ fn test_btree_put_multiple_random() -> i32
         var result_len: i32 = 0
         let key_len: i32 = make_key(i, @key[0])
 
-        let err: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+        let err: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
         if err != ERR_OK
             btree_destroy(tree)
             buffer_pool_destroy(pool)
@@ -382,12 +405,14 @@ fn test_btree_put_multiple_random() -> i32
 
 [[test]]
 fn test_btree_get_all_multiple() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert 20 keys
     for i in 0..20 as i32
@@ -395,7 +420,7 @@ fn test_btree_get_all_multiple() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(i, @key[0])
         let val_len: i32 = make_value(i * 10, @val[0])
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Verify each key returns the correct value
     for i in 0..20 as i32
@@ -407,13 +432,13 @@ fn test_btree_get_all_multiple() -> i32
         let key_len: i32 = make_key(i, @key[0])
         make_value(i * 10, @expected[0])
 
-        let err: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+        let err: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
         if err != ERR_OK
             btree_destroy(tree)
             buffer_pool_destroy(pool)
             return 1
 
-        if memcmp(@result[0], @expected[0], result_len as i64) != 0
+        if not head(@result, result_len as i64).eq(@head(@expected, result_len as i64))
             btree_destroy(tree)
             buffer_pool_destroy(pool)
             return 2
@@ -428,12 +453,14 @@ fn test_btree_get_all_multiple() -> i32
 
 [[test]]
 fn test_btree_split_leaf() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert enough keys to cause a leaf split
     # With 4KB pages and ~24 byte entries, we need ~100+ entries
@@ -442,7 +469,7 @@ fn test_btree_split_leaf() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(i, @key[0])
         let val_len: i32 = make_value(i, @val[0])
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Tree should have multiple levels now
     if btree_height(tree) < 2
@@ -457,7 +484,7 @@ fn test_btree_split_leaf() -> i32
         var result_len: i32 = 0
         let key_len: i32 = make_key(i, @key[0])
 
-        let err: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+        let err: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
         if err != ERR_OK
             btree_destroy(tree)
             buffer_pool_destroy(pool)
@@ -471,16 +498,17 @@ fn test_btree_split_leaf() -> i32
 fn test_btree_split_internal() -> i32
     # With 4KB pages, ~125 entries/leaf, and ~180 children/internal node,
     # we need ~22,500 entries for height 3. Use 25,000 to ensure internal splits.
-    var pool_opt = buffer_pool_new(512)  # More pages needed
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 10
-    var pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var pool_v: BufferPool = match buffer_pool_new(512)  # More pages needed
+        Some(v) => v
+        None => return 10
+    let pool: *BufferPool = @pool_v
 
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 11
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 11
+    let tree: *BTree = @tree_v
 
     # Insert many keys to cause internal node splits
     for i in 0..25000 as i32
@@ -488,7 +516,7 @@ fn test_btree_split_internal() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(i, @key[0])
         let val_len: i32 = make_value(i, @val[0])
-        let err: i32 = btree_put(tree, @key[0], key_len, @val[0], val_len)
+        let err: i32 = btree_put(tree, head(@key, key_len), head(@val, val_len))
         if err != ERR_OK
             btree_destroy(tree)
             buffer_pool_destroy(pool)
@@ -512,7 +540,7 @@ fn test_btree_split_internal() -> i32
         var result_len: i32 = 0
         let idx: i32 = i as i32 * 250  # Sample across range (i < 100)
         let key_len: i32 = make_key(idx, @key[0])
-        let err: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+        let err: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
         if err != ERR_OK
             btree_destroy(tree)
             buffer_pool_destroy(pool)
@@ -528,12 +556,14 @@ fn test_btree_split_internal() -> i32
 
 [[test]]
 fn test_btree_delete_multiple() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert 50 keys
     for i in 0..50 as i32
@@ -541,13 +571,13 @@ fn test_btree_delete_multiple() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(i, @key[0])
         let val_len: i32 = make_value(i, @val[0])
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Delete every other key
     for i in 0..25 as i32
         var key: [16]u8
         let key_len: i32 = make_key(i * 2, @key[0])
-        btree_delete(tree, @key[0], key_len)
+        btree_delete(tree, head(@key, key_len))
 
     # Count should be 25
     if btree_count(tree) != 25
@@ -562,7 +592,7 @@ fn test_btree_delete_multiple() -> i32
         var result_len: i32 = 0
         let key_len: i32 = make_key(i * 2 + 1, @key[0])
 
-        let err: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+        let err: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
         if err != ERR_OK
             btree_destroy(tree)
             buffer_pool_destroy(pool)
@@ -574,12 +604,14 @@ fn test_btree_delete_multiple() -> i32
 
 [[test]]
 fn test_btree_delete_all() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert 100 keys
     for i in 0..100 as i32
@@ -587,13 +619,13 @@ fn test_btree_delete_all() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(i, @key[0])
         let val_len: i32 = make_value(i, @val[0])
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Delete all keys
     for i in 0..100 as i32
         var key: [16]u8
         let key_len: i32 = make_key(i, @key[0])
-        btree_delete(tree, @key[0], key_len)
+        btree_delete(tree, head(@key, key_len))
 
     # Tree should be empty
     if btree_count(tree) != 0
@@ -611,12 +643,14 @@ fn test_btree_delete_all() -> i32
 
 [[test]]
 fn test_btree_get_nonexistent() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Try to get a key that doesn't exist
     var key: [16]u8
@@ -624,7 +658,7 @@ fn test_btree_get_nonexistent() -> i32
     var result_len: i32 = 0
     let key_len: i32 = make_key(999, @key[0])
 
-    let err: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+    let err: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
     if err != ERR_NOT_FOUND
         btree_destroy(tree)
         buffer_pool_destroy(pool)
@@ -636,12 +670,14 @@ fn test_btree_get_nonexistent() -> i32
 
 [[test]]
 fn test_btree_get_nonexistent_after_inserts() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert some keys
     for i in 0..10 as i32
@@ -649,7 +685,7 @@ fn test_btree_get_nonexistent_after_inserts() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(i * 2, @key[0])  # Even keys only
         let val_len: i32 = make_value(i, @val[0])
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Try to get odd keys (don't exist)
     for i in 0..10 as i32
@@ -658,7 +694,7 @@ fn test_btree_get_nonexistent_after_inserts() -> i32
         var result_len: i32 = 0
         let key_len: i32 = make_key(i * 2 + 1, @key[0])
 
-        let err: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+        let err: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
         if err != ERR_NOT_FOUND
             btree_destroy(tree)
             buffer_pool_destroy(pool)
@@ -670,18 +706,20 @@ fn test_btree_get_nonexistent_after_inserts() -> i32
 
 [[test]]
 fn test_btree_delete_nonexistent() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Try to delete a key that doesn't exist
     var key: [16]u8
     let key_len: i32 = make_key(999, @key[0])
 
-    let err: i32 = btree_delete(tree, @key[0], key_len)
+    let err: i32 = btree_delete(tree, head(@key, key_len))
     if err != ERR_NOT_FOUND
         btree_destroy(tree)
         buffer_pool_destroy(pool)
@@ -693,25 +731,27 @@ fn test_btree_delete_nonexistent() -> i32
 
 [[test]]
 fn test_btree_get_after_delete() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     var key: [16]u8
     var val: [16]u8
     let key_len: i32 = make_key(42, @key[0])
     let val_len: i32 = make_value(42, @val[0])
 
-    btree_put(tree, @key[0], key_len, @val[0], val_len)
-    btree_delete(tree, @key[0], key_len)
+    btree_put(tree, head(@key, key_len), head(@val, val_len))
+    btree_delete(tree, head(@key, key_len))
 
     # Get should now return NOT_FOUND
     var result: [16]u8
     var result_len: i32 = 0
-    let err: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+    let err: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
     if err != ERR_NOT_FOUND
         btree_destroy(tree)
         buffer_pool_destroy(pool)
@@ -728,7 +768,7 @@ fn test_btree_get_after_delete() -> i32
 [[test]]
 fn test_btree_create_null_pool() -> i32
     var tree_opt = btree_create(null)
-    if not option_is_none<*BTree>(@tree_opt)
+    if not option_is_none<BTree>(@tree_opt)
         return 1
     0
 
@@ -736,22 +776,24 @@ fn test_btree_create_null_pool() -> i32
 fn test_btree_put_null_tree() -> i32
     var key: [16]u8
     var val: [16]u8
-    let err: i32 = btree_put(null, @key[0], 12, @val[0], 12)
+    let err: i32 = btree_put(null, head(@key, 12), head(@val, 12))
     if err != ERR_INVALID
         return 1
     0
 
 [[test]]
 fn test_btree_put_null_key() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     var val: [16]u8
-    let err: i32 = btree_put(tree, null, 12, @val[0], 12)
+    let err: i32 = btree_put(tree, "", head(@val, 12))
 
     if err != ERR_INVALID
         btree_destroy(tree)
@@ -764,16 +806,18 @@ fn test_btree_put_null_key() -> i32
 
 [[test]]
 fn test_btree_put_zero_key_len() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     var key: [16]u8
     var val: [16]u8
-    let err: i32 = btree_put(tree, @key[0], 0, @val[0], 12)
+    let err: i32 = btree_put(tree, head(@key, 0), head(@val, 12))
 
     if err != ERR_INVALID
         btree_destroy(tree)
@@ -786,16 +830,18 @@ fn test_btree_put_zero_key_len() -> i32
 
 [[test]]
 fn test_btree_put_negative_key_len() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     var key: [16]u8
     var val: [16]u8
-    let err: i32 = btree_put(tree, @key[0], -1, @val[0], 12)
+    let err: i32 = btree_put(tree, head(@key, -1), head(@val, 12))
 
     if err != ERR_INVALID
         btree_destroy(tree)
@@ -811,7 +857,7 @@ fn test_btree_get_null_tree() -> i32
     var key: [16]u8
     var result: [16]u8
     var result_len: i32 = 0
-    let err: i32 = btree_get(null, @key[0], 12, @result[0], @result_len)
+    let err: i32 = btree_get(null, head(@key, 12), @result, @result_len)
     if err != ERR_INVALID
         return 1
     0
@@ -819,7 +865,7 @@ fn test_btree_get_null_tree() -> i32
 [[test]]
 fn test_btree_delete_null_tree() -> i32
     var key: [16]u8
-    let err: i32 = btree_delete(null, @key[0], 12)
+    let err: i32 = btree_delete(null, head(@key, 12))
     if err != ERR_INVALID
         return 1
     0
@@ -830,18 +876,20 @@ fn test_btree_delete_null_tree() -> i32
 
 [[test]]
 fn test_btree_put_key_too_large() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Key larger than max allowed (1024 bytes)
     var key: [2048]u8
     var val: [16]u8
 
-    let err: i32 = btree_put(tree, @key[0], 2048, @val[0], 12)
+    let err: i32 = btree_put(tree, head(@key, 2048), head(@val, 12))
 
     if err != ERR_INVALID
         btree_destroy(tree)
@@ -854,19 +902,21 @@ fn test_btree_put_key_too_large() -> i32
 
 [[test]]
 fn test_btree_put_value_too_large() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Value larger than max allowed (2048 bytes)
     var key: [16]u8
     var val: [4096]u8
     let key_len: i32 = make_key(1, @key[0])
 
-    let err: i32 = btree_put(tree, @key[0], key_len, @val[0], 4096)
+    let err: i32 = btree_put(tree, head(@key, key_len), head(@val, 4096))
 
     if err != ERR_INVALID
         btree_destroy(tree)
@@ -883,18 +933,20 @@ fn test_btree_put_value_too_large() -> i32
 
 [[test]]
 fn test_btree_empty_value() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     var key: [16]u8
     let key_len: i32 = make_key(1, @key[0])
 
     # Insert with empty value
-    let err: i32 = btree_put(tree, @key[0], key_len, null, 0)
+    let err: i32 = btree_put(tree, head(@key, key_len), "")
     if err != ERR_OK
         btree_destroy(tree)
         buffer_pool_destroy(pool)
@@ -903,7 +955,7 @@ fn test_btree_empty_value() -> i32
     # Get should succeed with zero length
     var result: [16]u8
     var result_len: i32 = 99
-    let err2: i32 = btree_get(tree, @key[0], key_len, @result[0], @result_len)
+    let err2: i32 = btree_get(tree, head(@key, key_len), @result, @result_len)
     if err2 != ERR_OK
         btree_destroy(tree)
         buffer_pool_destroy(pool)
@@ -920,12 +972,14 @@ fn test_btree_empty_value() -> i32
 
 [[test]]
 fn test_btree_duplicate_inserts() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     var key: [16]u8
     var val: [16]u8
@@ -934,7 +988,7 @@ fn test_btree_duplicate_inserts() -> i32
 
     # Insert same key 100 times
     for i in 0..100
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Count should still be 1
     if btree_count(tree) != 1
@@ -948,18 +1002,20 @@ fn test_btree_duplicate_inserts() -> i32
 
 [[test]]
 fn test_btree_single_byte_key() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
-    var key: u8 = 65  # 'A'
+    var key: [1]u8 = [65]  # "A"
     var val: [16]u8
     let val_len: i32 = make_value(1, @val[0])
 
-    let err: i32 = btree_put(tree, @key, 1, @val[0], val_len)
+    let err: i32 = btree_put(tree, @key, head(@val, val_len))
     if err != ERR_OK
         btree_destroy(tree)
         buffer_pool_destroy(pool)
@@ -967,7 +1023,7 @@ fn test_btree_single_byte_key() -> i32
 
     var result: [16]u8
     var result_len: i32 = 0
-    let err2: i32 = btree_get(tree, @key, 1, @result[0], @result_len)
+    let err2: i32 = btree_get(tree, head(@key, 1), @result, @result_len)
     if err2 != ERR_OK
         btree_destroy(tree)
         buffer_pool_destroy(pool)
@@ -983,40 +1039,42 @@ fn test_btree_single_byte_key() -> i32
 
 [[test]]
 fn test_btree_scan_empty() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
-    var iter_opt = btree_scan(tree, null, 0, null, 0)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        btree_destroy(tree)
-        buffer_pool_destroy(pool)
-        return 1
-    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    var iter_v: BTreeIter = match btree_scan(tree, "", "")
+        Some(v) => v
+        None =>
+            btree_destroy(tree)
+            buffer_pool_destroy(pool)
+            return 1
+    let iter: *BTreeIter = @iter_v
 
     # Should be no entries
     if btree_iter_valid(iter) != 0
-        btree_iter_destroy(iter)
         btree_destroy(tree)
         buffer_pool_destroy(pool)
         return 2
-
-    btree_iter_destroy(iter)
     btree_destroy(tree)
     buffer_pool_destroy(pool)
     0
 
 [[test]]
 fn test_btree_scan_all() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert 20 keys
     for i in 0..20 as i32
@@ -1024,15 +1082,16 @@ fn test_btree_scan_all() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(i, @key[0])
         let val_len: i32 = make_value(i, @val[0])
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Scan all
-    var iter_opt = btree_scan(tree, null, 0, null, 0)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        btree_destroy(tree)
-        buffer_pool_destroy(pool)
-        return 1
-    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    var iter_v: BTreeIter = match btree_scan(tree, "", "")
+        Some(v) => v
+        None =>
+            btree_destroy(tree)
+            buffer_pool_destroy(pool)
+            return 1
+    let iter: *BTreeIter = @iter_v
 
     # Count entries
     var count: i32 = 0
@@ -1041,24 +1100,23 @@ fn test_btree_scan_all() -> i32
         btree_iter_next(iter)
 
     if count != 20
-        btree_iter_destroy(iter)
         btree_destroy(tree)
         buffer_pool_destroy(pool)
         return 2
-
-    btree_iter_destroy(iter)
     btree_destroy(tree)
     buffer_pool_destroy(pool)
     0
 
 [[test]]
 fn test_btree_scan_range() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert keys 0-99
     for i in 0..100 as i32
@@ -1066,7 +1124,7 @@ fn test_btree_scan_range() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(i, @key[0])
         let val_len: i32 = make_value(i, @val[0])
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Scan range [key_25, key_75)
     var start_key: [16]u8
@@ -1074,12 +1132,13 @@ fn test_btree_scan_range() -> i32
     let start_len: i32 = make_key(25, @start_key[0])
     let end_len: i32 = make_key(75, @end_key[0])
 
-    var iter_opt = btree_scan(tree, @start_key[0], start_len, @end_key[0], end_len)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        btree_destroy(tree)
-        buffer_pool_destroy(pool)
-        return 1
-    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    var iter_v: BTreeIter = match btree_scan(tree, head(@start_key, start_len), head(@end_key, end_len))
+        Some(v) => v
+        None =>
+            btree_destroy(tree)
+            buffer_pool_destroy(pool)
+            return 1
+    let iter: *BTreeIter = @iter_v
 
     # Should get keys 25-74 (50 entries)
     var count: i32 = 0
@@ -1088,24 +1147,23 @@ fn test_btree_scan_range() -> i32
         btree_iter_next(iter)
 
     if count != 50
-        btree_iter_destroy(iter)
         btree_destroy(tree)
         buffer_pool_destroy(pool)
         return 2
-
-    btree_iter_destroy(iter)
     btree_destroy(tree)
     buffer_pool_destroy(pool)
     0
 
 [[test]]
 fn test_btree_scan_ordered() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Insert keys in random order
     var order: [10]i32
@@ -1125,21 +1183,22 @@ fn test_btree_scan_ordered() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(order[i], @key[0])
         let val_len: i32 = make_value(order[i], @val[0])
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Scan should return keys in sorted order
-    var iter_opt = btree_scan(tree, null, 0, null, 0)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        btree_destroy(tree)
-        buffer_pool_destroy(pool)
-        return 11
-    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    var iter_v: BTreeIter = match btree_scan(tree, "", "")
+        Some(v) => v
+        None =>
+            btree_destroy(tree)
+            buffer_pool_destroy(pool)
+            return 11
+    let iter: *BTreeIter = @iter_v
 
     var prev: i32 = -1
     while btree_iter_valid(iter) != 0
         var key: [16]u8
         var key_len: i32 = 0
-        btree_iter_key(iter, @key[0], @key_len)
+        btree_iter_key(iter, @key, @key_len)
 
         # Extract number from key (bytes 4-11)
         var n: i32 = 0
@@ -1148,15 +1207,12 @@ fn test_btree_scan_ordered() -> i32
 
         # Should be greater than previous
         if n <= prev
-            btree_iter_destroy(iter)
             btree_destroy(tree)
             buffer_pool_destroy(pool)
             return 1
 
         prev = n
         btree_iter_next(iter)
-
-    btree_iter_destroy(iter)
     btree_destroy(tree)
     buffer_pool_destroy(pool)
     0
@@ -1167,12 +1223,14 @@ fn test_btree_scan_ordered() -> i32
 
 [[test]]
 fn test_btree_height_empty() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Empty tree has height 1 (just root leaf)
     if btree_height(tree) != 1
@@ -1186,12 +1244,14 @@ fn test_btree_height_empty() -> i32
 
 [[test]]
 fn test_btree_node_count() -> i32
-    var pool: *BufferPool = create_test_pool()
-    var tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        buffer_pool_destroy(pool)
-        return 10
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    var pool_owner: Box<BufferPool> = create_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = match btree_create(pool)
+        Some(v) => v
+        None =>
+            buffer_pool_destroy(pool)
+            return 10
+    let tree: *BTree = @tree_v
 
     # Empty tree has 1 node (root)
     if btree_node_count(tree) != 1
@@ -1205,7 +1265,7 @@ fn test_btree_node_count() -> i32
         var val: [16]u8
         let key_len: i32 = make_key(i, @key[0])
         let val_len: i32 = make_value(i, @val[0])
-        btree_put(tree, @key[0], key_len, @val[0], val_len)
+        btree_put(tree, head(@key, key_len), head(@val, val_len))
 
     # Should have multiple nodes now
     if btree_node_count(tree) <= 1
@@ -1231,18 +1291,20 @@ fn scrambled_key(i: i32, buf: *u8) -> i32
     make_key((i * 7919) % 100003, buf)
 
 # Room for every leaf these tests make: the pool has no file to evict to.
-fn big_test_pool() -> *BufferPool
-    let pool_opt = buffer_pool_new(512)
-    return option_unwrap_or<*BufferPool>(@pool_opt, null)
+fn big_test_pool() -> Box<BufferPool>
+    # Empty if out of memory
+    match buffer_pool_new(512)
+        Some(p) => return box_new<BufferPool>(p)
+        None => return box_empty<BufferPool>()
 
-fn fill_value(buf: *u8, len: i32, fill: i32)
-    memset(buf, fill as u8, len as i64)
+fn fill_value(buf: [u8], fill: i32)
+    buf.fill(fill as u8)
 
 # 0 if `key` holds `len` bytes of `fill`.
-fn value_is(tree: *BTree, key: *u8, key_len: i32, len: i32, fill: i32) -> i32
+fn value_is(tree: *BTree, key: [u8], len: i32, fill: i32) -> i32
     var got: [4096]u8
     var got_len: i32 = 0
-    if btree_get(tree, key, key_len, @got[0], @got_len) != ERR_OK
+    if btree_get(tree, key, @got, @got_len) != ERR_OK
         return 1
     if got_len != len
         return 2
@@ -1269,23 +1331,24 @@ fn test_btree_max_value_len_is_half_a_leaf() -> i32
 
 [[test]]
 fn test_btree_put_refuses_an_entry_over_half_a_leaf() -> i32
-    var pool: *BufferPool = big_test_pool()
-    var tree_opt = btree_create(pool)
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = btree_create(pool).unwrap_or(btree_closed())
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     var key: [1024]u8
     var val: [4096]u8
     let key_len: i32 = make_key(1, @key[0])
     let max: i32 = btree_max_value_len(key_len)
-    if btree_put(tree, @key[0], key_len, @val[0], max + 1) != ERR_INVALID
+    if btree_put(tree, head(@key, key_len), head(@val, max + 1)) != ERR_INVALID
         return 1
-    if btree_put(tree, @key[0], key_len, @val[0], max) != ERR_OK
+    if btree_put(tree, head(@key, key_len), head(@val, max)) != ERR_OK
         return 2
     # The same value under the longest key is over the limit.
     let whole_key: Span<u8> = @key
     whole_key.fill(120)
-    if btree_put(tree, @key[0], 1024, @val[0], max) != ERR_INVALID
+    if btree_put(tree, head(@key, 1024), head(@val, max)) != ERR_INVALID
         return 3
     if btree_count(tree) != 1
         return 4
@@ -1295,24 +1358,25 @@ fn test_btree_put_refuses_an_entry_over_half_a_leaf() -> i32
 
 [[test]]
 fn test_btree_max_size_values_survive_splits() -> i32
-    var pool: *BufferPool = big_test_pool()
-    var tree_opt = btree_create(pool)
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = btree_create(pool).unwrap_or(btree_closed())
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     var key: [16]u8
     var val: [4096]u8
     let max: i32 = btree_max_value_len(12)
     for i in 0..60 as i32
         let kl: i32 = scrambled_key(i, @key[0])
-        fill_value(@val[0], max, 65 + i % 26)
-        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
+        fill_value(head(@val, max), 65 + i % 26)
+        if btree_put(tree, head(@key, kl), head(@val, max)) != ERR_OK
             return 1
     if btree_count(tree) != 60
         return 2
     for i in 0..60 as i32
         let kl: i32 = scrambled_key(i, @key[0])
-        if value_is(tree, @key[0], kl, max, 65 + i % 26) != 0
+        if value_is(tree, head(@key, kl), max, 65 + i % 26) != 0
             return 100 + i
     btree_destroy(tree)
     buffer_pool_destroy(pool)
@@ -1321,10 +1385,11 @@ fn test_btree_max_size_values_survive_splits() -> i32
 # Overwriting a key must reuse its space, not leak a page's worth per update.
 [[test]]
 fn test_btree_repeated_updates_of_large_values() -> i32
-    var pool: *BufferPool = big_test_pool()
-    var tree_opt = btree_create(pool)
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = btree_create(pool).unwrap_or(btree_closed())
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     var key: [16]u8
     var val: [4096]u8
@@ -1332,8 +1397,8 @@ fn test_btree_repeated_updates_of_large_values() -> i32
     # A few small neighbours share the leaf.
     for i in 0..5 as i32
         let kl: i32 = make_key(i, @key[0])
-        fill_value(@val[0], 20, 48 + i)
-        btree_put(tree, @key[0], kl, @val[0], 20)
+        fill_value(head(@val, 20), 48 + i)
+        btree_put(tree, head(@key, kl), head(@val, 20))
     # Alternate two keys, so the entry replaced is not always the newest
     # (lowest) one, whose space would come back without a compaction.
     for round in 0..200
@@ -1341,17 +1406,17 @@ fn test_btree_repeated_updates_of_large_values() -> i32
         let which: i32 = 1 + 2 * (r % 2)
         let kw: i32 = make_key(which, @key[0])
         let len: i32 = max - (r % 3) * 300
-        fill_value(@val[0], len, 97 + r % 26)
-        if btree_put(tree, @key[0], kw, @val[0], len) != ERR_OK
+        fill_value(head(@val, len), 97 + r % 26)
+        if btree_put(tree, head(@key, kw), head(@val, len)) != ERR_OK
             return 1
-        if value_is(tree, @key[0], kw, len, 97 + r % 26) != 0
+        if value_is(tree, head(@key, kw), len, 97 + r % 26) != 0
             return 2
     if btree_count(tree) != 5
         return 3
     for i in 0..5 as i32
         if i != 1 and i != 3
             let nk: i32 = make_key(i, @key[0])
-            if value_is(tree, @key[0], nk, 20, 48 + i) != 0
+            if value_is(tree, head(@key, nk), 20, 48 + i) != 0
                 return 20 + i
     btree_destroy(tree)
     buffer_pool_destroy(pool)
@@ -1361,33 +1426,34 @@ fn test_btree_repeated_updates_of_large_values() -> i32
 # a split by count would leave the large entry's half over-full.
 [[test]]
 fn test_btree_large_values_among_many_small_ones() -> i32
-    var pool: *BufferPool = big_test_pool()
-    var tree_opt = btree_create(pool)
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = btree_create(pool).unwrap_or(btree_closed())
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     var key: [16]u8
     var val: [4096]u8
     let max: i32 = btree_max_value_len(12)
     for i in 0..300 as i32
         let kl: i32 = make_key(i * 10, @key[0])
-        fill_value(@val[0], 8, 48 + i % 10)  # a fill byte per i, not decimal formatting (#1957)
-        if btree_put(tree, @key[0], kl, @val[0], 8) != ERR_OK
+        fill_value(head(@val, 8), 48 + i % 10)  # a fill byte per i, not decimal formatting (#1957)
+        if btree_put(tree, head(@key, kl), head(@val, 8)) != ERR_OK
             return 1
     for i in 0..30 as i32
         let kl: i32 = make_key(i * 100 + 5, @key[0])
-        fill_value(@val[0], max, 65 + i % 26)
-        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
+        fill_value(head(@val, max), 65 + i % 26)
+        if btree_put(tree, head(@key, kl), head(@val, max)) != ERR_OK
             return 2
     if btree_count(tree) != 330
         return 3
     for i in 0..300 as i32
         let kl: i32 = make_key(i * 10, @key[0])
-        if value_is(tree, @key[0], kl, 8, 48 + i % 10) != 0  # the same fill byte
+        if value_is(tree, head(@key, kl), 8, 48 + i % 10) != 0  # the same fill byte
             return 4
     for i in 0..30 as i32
         let kl: i32 = make_key(i * 100 + 5, @key[0])
-        if value_is(tree, @key[0], kl, max, 65 + i % 26) != 0
+        if value_is(tree, head(@key, kl), max, 65 + i % 26) != 0
             return 5
     btree_destroy(tree)
     buffer_pool_destroy(pool)
@@ -1404,10 +1470,11 @@ fn test_btree_large_values_among_many_small_ones() -> i32
 
 # Key `n` (make_key's 12 bytes, so keys order by n), padded with 'x' to
 # `len` bytes.
-fn long_key(n: i32, len: i32, buf: *u8) -> i32
-    make_key(n, buf)
+fn long_key(n: i32, len: i32, buf: [u8]) -> i32
+    make_key(n, buf.as_ptr())
     if len > 12
-        memset(buf + 12, 120, (len - 12) as i64)
+        let pad: [u8] = buf[12..len]
+        pad.fill(120)
     return len
 
 # The n make_key wrote into the first 12 bytes of `key`.
@@ -1419,24 +1486,23 @@ fn key_number(key: *u8) -> i32
 
 # 0 if a full scan visits exactly `expect` keys in strictly increasing order.
 fn scan_is_ordered(tree: *BTree, expect: i64) -> i32
-    var iter_opt = btree_scan(tree, null, 0, null, 0)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        return 1
-    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    var iter_v: BTreeIter = match btree_scan(tree, "", "")
+        Some(v) => v
+        None => return 1
+    let iter: *BTreeIter = @iter_v
     var seen: i64 = 0
     var prev: i32 = -1
     var rc: i32 = 0
     while btree_iter_valid(iter) != 0 and rc == 0
         var key: [1024]u8
         var key_len: i32 = 0
-        btree_iter_key(iter, @key[0], @key_len)
+        btree_iter_key(iter, @key, @key_len)
         let n: i32 = key_number(@key[0])
         if key_len < 12 or n <= prev
             rc = 2
         prev = n
         seen += 1
         btree_iter_next(iter)
-    btree_iter_destroy(iter)
     if rc != 0
         return rc
     if seen != expect
@@ -1447,19 +1513,20 @@ fn scan_is_ordered(tree: *BTree, expect: i64) -> i32
 # separators to split internal nodes several times over.
 [[test]]
 fn test_btree_long_keys_split_internal_nodes() -> i32
-    var pool: *BufferPool = big_test_pool()
-    var tree_opt = btree_create(pool)
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = btree_create(pool).unwrap_or(btree_closed())
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     var key: [1024]u8
     var val: [16]u8
     for ii in 0..400
         let i: i32 = ii as i32
         let n: i32 = (i * 7919) % 100003
-        let kl: i32 = long_key(n, 1024 - (i % 4) * 300, @key[0])
-        fill_value(@val[0], 8, 65 + i % 26)
-        if btree_put(tree, @key[0], kl, @val[0], 8) != ERR_OK
+        let kl: i32 = long_key(n, 1024 - (i % 4) * 300, @key)
+        fill_value(head(@val, 8), 65 + i % 26)
+        if btree_put(tree, head(@key, kl), head(@val, 8)) != ERR_OK
             return 1
     if btree_count(tree) != 400
         return 2
@@ -1469,8 +1536,8 @@ fn test_btree_long_keys_split_internal_nodes() -> i32
     for ii in 0..400
         let i: i32 = ii as i32
         let n: i32 = (i * 7919) % 100003
-        let kl: i32 = long_key(n, 1024 - (i % 4) * 300, @key[0])
-        if value_is(tree, @key[0], kl, 8, 65 + i % 26) != 0
+        let kl: i32 = long_key(n, 1024 - (i % 4) * 300, @key)
+        if value_is(tree, head(@key, kl), 8, 65 + i % 26) != 0
             return 100 + i
     let s: i32 = scan_is_ordered(tree, 400)
     if s != 0
@@ -1484,10 +1551,11 @@ fn test_btree_long_keys_split_internal_nodes() -> i32
 # near full must take one more 1034-byte entry.
 [[test]]
 fn test_btree_max_size_keys_into_full_internal_nodes() -> i32
-    var pool: *BufferPool = big_test_pool()
-    var tree_opt = btree_create(pool)
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = btree_create(pool).unwrap_or(btree_closed())
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     var key: [1024]u8
     var val: [4096]u8
@@ -1495,26 +1563,26 @@ fn test_btree_max_size_keys_into_full_internal_nodes() -> i32
     for ii in 0..300
         let i: i32 = ii as i32
         let kl: i32 = make_key(((i * 7919) % 300) * 10, @key[0])
-        fill_value(@val[0], max, 48 + i % 10)  # a fill byte per i, not decimal formatting (#1957)
-        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
+        fill_value(head(@val, max), 48 + i % 10)  # a fill byte per i, not decimal formatting (#1957)
+        if btree_put(tree, head(@key, kl), head(@val, max)) != ERR_OK
             return 1
     for ii in 0..60
         let i: i32 = ii as i32
-        let kl: i32 = long_key(((i * 37) % 60) * 50 + 5, 1024, @key[0])
-        fill_value(@val[0], 8, 65 + i % 26)
-        if btree_put(tree, @key[0], kl, @val[0], 8) != ERR_OK
+        let kl: i32 = long_key(((i * 37) % 60) * 50 + 5, 1024, @key)
+        fill_value(head(@val, 8), 65 + i % 26)
+        if btree_put(tree, head(@key, kl), head(@val, 8)) != ERR_OK
             return 2
     if btree_count(tree) != 360
         return 3
     for ii in 0..300
         let i: i32 = ii as i32
         let kl: i32 = make_key(((i * 7919) % 300) * 10, @key[0])
-        if value_is(tree, @key[0], kl, max, 48 + i % 10) != 0  # the same fill byte
+        if value_is(tree, head(@key, kl), max, 48 + i % 10) != 0  # the same fill byte
             return 4
     for ii in 0..60
         let i: i32 = ii as i32
-        let kl: i32 = long_key(((i * 37) % 60) * 50 + 5, 1024, @key[0])
-        if value_is(tree, @key[0], kl, 8, 65 + i % 26) != 0
+        let kl: i32 = long_key(((i * 37) % 60) * 50 + 5, 1024, @key)
+        if value_is(tree, head(@key, kl), 8, 65 + i % 26) != 0
             return 5
     let s: i32 = scan_is_ordered(tree, 360)
     if s != 0
@@ -1539,39 +1607,40 @@ fn test_btree_max_size_keys_into_full_internal_nodes() -> i32
 const EMPTY_LEAF_KEYS: i32 = 20
 
 # A tree of keys 0..n-1 with max-size values, then keys [del_lo, del_hi)
-# deleted. Null if any step fails.
-fn tree_with_hole(pool: *BufferPool, n: i32, del_lo: i32, del_hi: i32) -> *BTree
-    var tree_opt = btree_create(pool)
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if tree == null
-        return null
+# deleted. Not open if any step fails.
+fn tree_with_hole(pool: *BufferPool, n: i32, del_lo: i32, del_hi: i32) -> BTree
+    var tree_v: BTree = btree_create(pool).unwrap_or(btree_closed())
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
+        return btree_closed()
     var key: [16]u8
     var val: [4096]u8
     let max: i32 = btree_max_value_len(12)
     for i in 0..n
         let kl: i32 = make_key(i, @key[0])
-        fill_value(@val[0], max, 65 + i % 26)
-        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
-            return null
+        fill_value(head(@val, max), 65 + i % 26)
+        if btree_put(tree, head(@key, kl), head(@val, max)) != ERR_OK
+            return btree_closed()
     var d: i32 = del_lo
     while d < del_hi
         let kl: i32 = make_key(d, @key[0])
-        if btree_delete(tree, @key[0], kl) != ERR_OK
-            return null
+        if btree_delete(tree, head(@key, kl)) != ERR_OK
+            return btree_closed()
         d += 1
-    return tree
+    return tree_v
 
 # 0 if a scan from key `start` (-1: from the beginning) visits exactly the
 # keys of 0..n-1 that are >= start and outside [del_lo, del_hi), in order.
 fn scan_skips_hole(tree: *BTree, start: i32, n: i32, del_lo: i32, del_hi: i32) -> i32
     var skey: [16]u8
-    var iter_opt = btree_scan(tree, null, 0, null, 0)
+    var iter_opt = btree_scan(tree, "", "")
     if start >= 0
         let sl: i32 = make_key(start, @skey[0])
-        iter_opt = btree_scan(tree, @skey[0], sl, null, 0)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        return 1
-    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+        iter_opt = btree_scan(tree, head(@skey, sl), "")
+    var iter_v: BTreeIter = match iter_opt
+        Some(v) => v
+        None => return 1
+    let iter: *BTreeIter = @iter_v
     # The next key the scan should produce.
     var want: i32 = 0
     if start > 0
@@ -1589,20 +1658,21 @@ fn scan_skips_hole(tree: *BTree, start: i32, n: i32, del_lo: i32, del_hi: i32) -
             break
         var key: [16]u8
         var key_len: i32 = 0
-        btree_iter_key(iter, @key[0], @key_len)
+        btree_iter_key(iter, @key, @key_len)
         if key_len != 12 or key_number(@key[0]) != want
             rc = 4
             break
         want += 1
         btree_iter_next(iter)
-    btree_iter_destroy(iter)
     rc
 
 [[test]]
 fn test_btree_scan_skips_an_empty_leaf_in_the_middle() -> i32
-    var pool: *BufferPool = big_test_pool()
-    let tree: *BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 8, 12)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 8, 12)
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     let rc: i32 = scan_skips_hole(tree, -1, EMPTY_LEAF_KEYS, 8, 12)
     btree_destroy(tree)
@@ -1611,9 +1681,11 @@ fn test_btree_scan_skips_an_empty_leaf_in_the_middle() -> i32
 
 [[test]]
 fn test_btree_scan_skips_an_empty_first_leaf() -> i32
-    var pool: *BufferPool = big_test_pool()
-    let tree: *BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 0, 2)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 0, 2)
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     let rc: i32 = scan_skips_hole(tree, -1, EMPTY_LEAF_KEYS, 0, 2)
     btree_destroy(tree)
@@ -1623,10 +1695,12 @@ fn test_btree_scan_skips_an_empty_first_leaf() -> i32
 # Deleting the last keys must still end the scan cleanly, with nothing extra.
 [[test]]
 fn test_btree_scan_ends_at_an_empty_last_leaf() -> i32
-    var pool: *BufferPool = big_test_pool()
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
     let n: i32 = EMPTY_LEAF_KEYS
-    let tree: *BTree = tree_with_hole(pool, n, n - 2, n)
-    if tree == null
+    var tree_v: BTree = tree_with_hole(pool, n, n - 2, n)
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     let rc: i32 = scan_skips_hole(tree, -1, n, n - 2, n)
     btree_destroy(tree)
@@ -1635,9 +1709,11 @@ fn test_btree_scan_ends_at_an_empty_last_leaf() -> i32
 
 [[test]]
 fn test_btree_scan_skips_two_empty_leaves_in_a_row() -> i32
-    var pool: *BufferPool = big_test_pool()
-    let tree: *BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 6, 12)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 6, 12)
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     let rc: i32 = scan_skips_hole(tree, -1, EMPTY_LEAF_KEYS, 6, 12)
     btree_destroy(tree)
@@ -1648,9 +1724,11 @@ fn test_btree_scan_skips_two_empty_leaves_in_a_row() -> i32
 # begins on the first remaining key at or after it.
 [[test]]
 fn test_btree_scan_from_a_key_in_an_emptied_leaf() -> i32
-    var pool: *BufferPool = big_test_pool()
-    let tree: *BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 6, 12)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 6, 12)
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     var rc: i32 = 0
     for s in (4 as i32)..(13 as i32)
@@ -1666,10 +1744,11 @@ fn test_btree_scan_from_a_key_in_an_emptied_leaf() -> i32
 # leaf, must begin the scan in the next leaf.
 [[test]]
 fn test_btree_scan_from_an_absent_key_past_its_leaf() -> i32
-    var pool: *BufferPool = big_test_pool()
-    var tree_opt = btree_create(pool)
-    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if tree == null
+    var pool_owner: Box<BufferPool> = big_test_pool()
+    var pool: *BufferPool = pool_owner.as_ptr()
+    var tree_v: BTree = btree_create(pool).unwrap_or(btree_closed())
+    let tree: *BTree = @tree_v
+    if not btree_is_open(tree)
         return 10
     var key: [16]u8
     var val: [4096]u8
@@ -1677,23 +1756,22 @@ fn test_btree_scan_from_an_absent_key_past_its_leaf() -> i32
     # Even keys 0, 2, .., 38.
     for i in 0..EMPTY_LEAF_KEYS
         let kl: i32 = make_key(2 * i, @key[0])
-        fill_value(@val[0], max, 65)
-        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
+        fill_value(head(@val, max), 65)
+        if btree_put(tree, head(@key, kl), head(@val, max)) != ERR_OK
             return 11
     var rc: i32 = 0
     for j in 0..EMPTY_LEAF_KEYS
         if rc == 0
             # Scan from odd key 2j+1: expect even keys 2j+2 .. 38.
             let sl: i32 = make_key(2 * j + 1, @key[0])
-            var iter_opt = btree_scan(tree, @key[0], sl, null, 0)
-            var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
-            if iter == null
-                return 12
+            var iter_v: BTreeIter = match btree_scan(tree, head(@key, sl), "")
+                Some(v) => v
+                None => return 12
+            let iter: *BTreeIter = @iter_v
             var seen: i32 = 0
             while btree_iter_valid(iter) != 0
                 seen += 1
                 btree_iter_next(iter)
-            btree_iter_destroy(iter)
             if seen != EMPTY_LEAF_KEYS - 1 - j
                 rc = 100 + j
     btree_destroy(tree)

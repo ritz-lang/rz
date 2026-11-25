@@ -26,6 +26,7 @@ import ritzlib.time { sleep_ms }
 import ritzlib.span
 import ritzlib.result
 import ritzlib.option
+import ritzlib.box
 import ritzlib.strview
 import ritzlib.fs { access }
 import ritzlib.str
@@ -39,6 +40,10 @@ import lib.client
 import lib.document
 import lib.collection
 
+# The first n bytes of buffer `b`.
+fn head(b: [u8], n: i64) -> [u8]
+    return b[0..n]
+
 const PORT_BASE: i32 = 20000
 const PORT_SPAN: i32 = 30000
 const PORT_ATTEMPTS: i32 = 5
@@ -48,8 +53,8 @@ const PR_SET_PDEATHSIG: i64 = 1
 const SIG_KILL: i32 = 9
 const WAIT_NOHANG: i32 = 1
 
-fn server_bin() -> *u8
-    return c"./build/debug/mausoleum"
+fn server_bin() -> StrView
+    return "./build/debug/mausoleum"
 
 struct TestServer
     pid: i32
@@ -76,8 +81,8 @@ fn connect_mode(client: *Client, mode: i32, port: i32) -> i32
 # ============================================================================
 
 # Whether the built server binary is there and executable.
-fn access_ok(bin: *u8) -> bool
-    match access(strview_from_cstr(bin), X_OK)
+fn access_ok(bin: StrView) -> bool
+    match access(bin, X_OK)
         Ok(_) => true
         Err(_) => false
 
@@ -120,7 +125,8 @@ fn spawn_server(port: i32, mode: i32) -> i32
             if devnull.raw() > 2
                 devnull.close()
         Err(_) => pass
-    exec(strview_from_cstr(server_bin()), span_from_ptr<StrView>(@args[0], nargs))
+    let argv: [StrView] = @args
+    exec(server_bin(), argv[0..nargs])
     sys_exit(127)
     return -1
 
@@ -147,7 +153,8 @@ fn wait_ready(srv: *TestServer) -> i32
         if server_exited(srv.pid) == 1
             srv.pid = 0
             return 1
-        let probe: *Client = client_new()
+        var probe_owner: Box<Client> = client_new()
+        let probe: *Client = probe_owner.as_ptr()
         if probe != null
             let rc: i32 = connect_mode(probe, srv.mode, srv.port)
             if rc == 0
@@ -195,31 +202,34 @@ fn server_stop(srv: *TestServer)
     srv.pid = 0
 
 # Connect a fresh client with bounded request timeouts; null on failure.
-fn connect_client(srv: *TestServer) -> *Client
-    let client: *Client = client_new()
+# A client connected to `srv`; empty if it could not connect.
+fn connect_client(srv: *TestServer) -> Box<Client>
+    var owner: Box<Client> = client_new()
+    let client: *Client = owner.as_ptr()
     if client == null
-        return null
+        return owner
     if connect_mode(client, srv.mode, srv.port) < 0
         client_free(client)
-        return null
+        return box_empty<Client>()
     client.sock.set_io_timeout(OP_TIMEOUT_MS)
-    return client
+    return owner
 
 # Serialize a one-int-field document into buf. Returns size or < 0.
-fn make_int_doc(name: StrView, value: i64, buf: *u8, cap: i64) -> i64
+fn make_int_doc(name: StrView, value: i64, buf: [u8]) -> i64
     var doc: Document
     var tmp_id: DocumentId = doc_id_invalid()
     doc_init(@doc, @tmp_id)
     var val: Field = field_int(value)
     doc_set_field(@doc, name, @val)
-    return doc_serialize(@doc, buf, cap)
+    return doc_serialize(@doc, buf)
 
 # ============================================================================
 # Checks (run against a live server; the caller owns the server)
 # ============================================================================
 
 fn check_connect_disconnect(srv: *TestServer) -> i32
-    let client: *Client = client_new()
+    var client_owner: Box<Client> = client_new()
+    let client: *Client = client_owner.as_ptr()
     if client == null
         return 1
     # A failed attempt leaves its errno (#3881); the next connect clears it.
@@ -248,7 +258,8 @@ fn check_connect_disconnect(srv: *TestServer) -> i32
     return 0
 
 fn check_ping(srv: *TestServer) -> i32
-    let client: *Client = connect_client(srv)
+    var client_owner: Box<Client> = connect_client(srv)
+    let client: *Client = client_owner.as_ptr()
     if client == null
         return 1
     if client_ping(client) < 0
@@ -263,32 +274,32 @@ fn check_ping(srv: *TestServer) -> i32
     return 0
 
 fn check_insert_get(srv: *TestServer) -> i32
-    let client: *Client = connect_client(srv)
+    var client_owner: Box<Client> = connect_client(srv)
+    let client: *Client = client_owner.as_ptr()
     if client == null
         return 1
 
     var doc_buf: [2048]u8
-    let doc_size: i64 = make_int_doc("value", 42, @doc_buf[0], 2048)
+    let doc_size: i64 = make_int_doc("value", 42, @doc_buf)
     if doc_size < 0
         client_free(client)
         return 2
 
-    let doc_id: i64 = client_insert(client, @doc_buf[0], doc_size as i32)
+    let doc_id: i64 = client_insert(client, head(@doc_buf, doc_size))
     if doc_id < 0
         client_free(client)
         return 3
 
-    var out_data: *u8 = null
-    var out_len: i32 = 0
-    if client_get(client, doc_id, @out_data, @out_len) != 1
+    var out_data: [u8] = span_empty<u8>()
+    if client_get(client, doc_id, @out_data) != 1
         client_free(client)
         return 4
-    if out_data == null or out_len == 0
+    if out_data.len == 0
         client_free(client)
         return 5
 
     var retrieved: Document
-    if doc_deserialize(out_data, out_len as i64, @retrieved) != ERR_OK
+    if doc_deserialize(out_data, @retrieved) != ERR_OK
         client_free(client)
         return 6
 
@@ -305,25 +316,25 @@ fn check_insert_get(srv: *TestServer) -> i32
     return 0
 
 fn check_delete(srv: *TestServer) -> i32
-    let client: *Client = connect_client(srv)
+    var client_owner: Box<Client> = connect_client(srv)
+    let client: *Client = client_owner.as_ptr()
     if client == null
         return 1
 
     var doc_buf: [2048]u8
-    let doc_size: i64 = make_int_doc("delete_me", 123, @doc_buf[0], 2048)
+    let doc_size: i64 = make_int_doc("delete_me", 123, @doc_buf)
     if doc_size < 0
         client_free(client)
         return 2
 
-    let doc_id: i64 = client_insert(client, @doc_buf[0], doc_size as i32)
+    let doc_id: i64 = client_insert(client, head(@doc_buf, doc_size))
     if doc_id < 0
         client_free(client)
         return 3
 
     # Present before the delete...
-    var out_data: *u8 = null
-    var out_len: i32 = 0
-    if client_get(client, doc_id, @out_data, @out_len) != 1
+    var out_data: [u8] = span_empty<u8>()
+    if client_get(client, doc_id, @out_data) != 1
         client_free(client)
         return 4
 
@@ -332,9 +343,7 @@ fn check_delete(srv: *TestServer) -> i32
         return 5
 
     # ...and "not found" (0) after it.
-    out_data = null
-    out_len = 0
-    if client_get(client, doc_id, @out_data, @out_len) != 0
+    if client_get(client, doc_id, @out_data) != 0
         client_free(client)
         return 6
 
@@ -392,7 +401,7 @@ fn test_delete() -> i32
 
 # Serialize a document with one string field "c" whose serialization is
 # exactly `size` bytes (69 bytes of header and field framing + payload).
-fn make_sized_doc(size: i64, payload: *u8, buf: *u8, cap: i64) -> i64
+fn make_sized_doc(size: i64, payload: [u8], buf: [u8]) -> i64
     let len: i64 = size - 69
     # A run that repeats every 23 bytes: a chunk out of place shows.
     var i: i64 = 0
@@ -402,32 +411,33 @@ fn make_sized_doc(size: i64, payload: *u8, buf: *u8, cap: i64) -> i64
     var doc: Document
     var tmp_id: DocumentId = doc_id_invalid()
     doc_init(@doc, @tmp_id)
-    var f: Field = field_string(payload, len)
+    var f: Field = field_string(head(payload, len).as_strview())
     doc_set_field(@doc, "c", @f)
-    return doc_serialize(@doc, buf, cap)
+    return doc_serialize(@doc, buf)
 
 struct ScanSeen
     docs: i32
     max_len: i32
-    expect: *u8         # Documents should be these bytes (null: any)
-    expect_len: i64
+    expect: [u8]        # Documents should be these bytes (empty: any)
     matched: i32        # Documents that were
 
-fn scan_seen_init(seen: *ScanSeen, expect: *u8, expect_len: i64)
+fn scan_seen_init(seen: *ScanSeen, expect: [u8])
     seen.docs = 0
     seen.max_len = 0
     seen.expect = expect
-    seen.expect_len = expect_len
     seen.matched = 0
 
-fn scan_seen_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+fn scan_seen_step(doc_id: i64, data: [u8], user_data: *u8) -> i32
     let seen: *ScanSeen = user_data as *ScanSeen
     seen.docs += 1
+    let len: i32 = data.len as i32
     if len > seen.max_len
         seen.max_len = len
     # Skip the serial version (4) and the id (8), which the server assigns.
-    if seen.expect != null and len as i64 == seen.expect_len
-        if memcmp(data + 12, seen.expect + 12, seen.expect_len - 12) == 0
+    if seen.expect.len > 12 and data.len == seen.expect.len
+        let got_tail: [u8] = data[12..data.len]
+        let want_tail: [u8] = seen.expect[12..data.len]
+        if got_tail.eq(@want_tail)
             seen.matched += 1
     return 0
 
@@ -435,36 +445,38 @@ fn scan_seen_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
 # (only the id the server assigns differs) and all come back by SCAN, as does
 # a zero-document batch for the still-empty collection first (AGAST #4201).
 fn check_max_size_docs(srv: *TestServer) -> i32
-    let client: *Client = connect_client(srv)
+    var client_owner: Box<Client> = connect_client(srv)
+    let client: *Client = client_owner.as_ptr()
     if client == null
         return 1
     var seen: ScanSeen
-    scan_seen_init(@seen, null, 0)
+    scan_seen_init(@seen, span_empty<u8>())
     if client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0 or seen.docs != 0
         return 9
-    var payload_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let payload: *u8 = payload_vec.as_ptr()
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let buf: *u8 = buf_vec.as_ptr()
-    let size: i64 = make_sized_doc(MAX_DOC_SIZE, payload, buf, MAX_DOC_SIZE)
+    var payload_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    let payload: [u8] = payload_vec[0..payload_vec.len()]
+    var buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    let buf: [u8] = buf_vec[0..buf_vec.len()]
+    let size: i64 = make_sized_doc(MAX_DOC_SIZE, payload, buf)
     if size != MAX_DOC_SIZE
         return 2
     var ids: [6]i64
     for i in 0..6
-        ids[i] = client_insert(client, buf, size as i32)
+        ids[i] = client_insert(client, head(buf, size))
         if ids[i] < 0
             return 3
     for i in 0..6
-        var out: *u8 = null
-        var out_len: i32 = 0
-        if client_get(client, ids[i], @out, @out_len) != 1
+        var out: [u8] = span_empty<u8>()
+        if client_get(client, ids[i], @out) != 1
             return 4
-        if out_len as i64 != size
+        if out.len != size
             return 5
         # Skip the serial version (4) and the id (8).
-        if memcmp(out + 12, buf + 12, size - 12) != 0
+        let got_tail: [u8] = out[12..size]
+        let sent_tail: [u8] = buf[12..size]
+        if not got_tail.eq(@sent_tail)
             return 6
-    scan_seen_init(@seen, buf, size)
+    scan_seen_init(@seen, head(buf, size))
     if client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0
         return 7
     if seen.docs != 6 or seen.matched != 6
@@ -476,16 +488,17 @@ fn check_max_size_docs(srv: *TestServer) -> i32
 # One byte over is refused as DOCUMENT_TOO_LARGE before it is sent, and the
 # session carries on; so is a document bigger than the client's buffers.
 fn check_oversize_doc(srv: *TestServer, size: i64) -> i32
-    let client: *Client = connect_client(srv)
+    var client_owner: Box<Client> = connect_client(srv)
+    let client: *Client = client_owner.as_ptr()
     if client == null
         return 1
-    var payload_vec: Vec<u8> = vec_with_cap<u8>(size + 64)
-    let payload: *u8 = payload_vec.as_ptr()
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(size + 64)
-    let buf: *u8 = buf_vec.as_ptr()
-    if make_sized_doc(size, payload, buf, size + 64) != size
+    var payload_vec: Vec<u8> = m7m_scratch(size + 64)
+    let payload: [u8] = payload_vec[0..payload_vec.len()]
+    var buf_vec: Vec<u8> = m7m_scratch(size + 64)
+    let buf: [u8] = buf_vec[0..buf_vec.len()]
+    if make_sized_doc(size, payload, buf) != size
         return 2
-    if client_insert(client, buf, size as i32) != -4
+    if client_insert(client, head(buf, size)) != -4
         return 3
     if client_last_error(client) != PROTO_ERR_DOCUMENT_TOO_LARGE
         return 4
@@ -494,7 +507,7 @@ fn check_oversize_doc(srv: *TestServer, size: i64) -> i32
     if client_ping(client) < 0
         return 6
     var seen: ScanSeen
-    scan_seen_init(@seen, null, 0)
+    scan_seen_init(@seen, span_empty<u8>())
     if client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0
         return 7
     if seen.docs != 0
@@ -559,59 +572,60 @@ fn test_doc_over_the_client_buffer_is_refused() -> i32
 # every INSERT and DELETE: all copies of a value come back, in id order, and
 # a value held by no document is 0 — never the "no index" refusal.
 
-fn make_string_doc(field: StrView, value: StrView, buf: *u8, cap: i64) -> i64
+fn make_string_doc(field: StrView, value: StrView, buf: [u8]) -> i64
     var doc: Document
     var tmp_id: DocumentId = doc_id_invalid()
     doc_init(@doc, @tmp_id)
-    var f: Field = field_string(value.ptr, value.len)
+    var f: Field = field_string(value)
     doc_set_field(@doc, field, @f)
-    return doc_serialize(@doc, buf, cap)
+    return doc_serialize(@doc, buf)
 
 fn check_field_index(srv: *TestServer) -> i32
-    let client: *Client = connect_client(srv)
+    var client_owner: Box<Client> = connect_client(srv)
+    let client: *Client = client_owner.as_ptr()
     if client == null
         return 1
 
-    if client_index_create(client, c"slug", 4) != 0
+    if client_index_create(client, "slug") != 0
         client_free(client)
         return 2
 
     var buf: [1024]u8
-    let d1: i64 = make_string_doc("slug", "twice", @buf[0], 1024)
+    let d1: i64 = make_string_doc("slug", "twice", @buf)
     if d1 <= 0
         client_free(client)
         return 3
-    let id1: i64 = client_insert(client, @buf[0], d1 as i32)
+    let id1: i64 = client_insert(client, head(@buf, d1))
     if id1 < 0
         client_free(client)
         return 4
-    let d2: i64 = make_string_doc("slug", "twice", @buf[0], 1024)
-    let id2: i64 = client_insert(client, @buf[0], d2 as i32)
+    let d2: i64 = make_string_doc("slug", "twice", @buf)
+    let id2: i64 = client_insert(client, head(@buf, d2))
     if id2 < 0
         client_free(client)
         return 5
-    let d3: i64 = make_string_doc("slug", "only", @buf[0], 1024)
-    let id3: i64 = client_insert(client, @buf[0], d3 as i32)
+    let d3: i64 = make_string_doc("slug", "only", @buf)
+    let id3: i64 = client_insert(client, head(@buf, d3))
     if id3 < 0
         client_free(client)
         return 6
 
     var ids: [8]i64
-    let n: i32 = client_find(client, c"slug", 4, c"twice", 5, @ids[0], 8)
+    let n: i32 = client_find(client, "slug", "twice", @ids[0], 8)
     if n != 2
         client_free(client)
         return 7
     if ids[0] != id1 or ids[1] != id2
         client_free(client)
         return 8
-    if client_find(client, c"slug", 4, c"only", 4, @ids[0], 8) != 1
+    if client_find(client, "slug", "only", @ids[0], 8) != 1
         client_free(client)
         return 9
-    if client_find(client, c"slug", 4, c"absent", 6, @ids[0], 8) != 0
+    if client_find(client, "slug", "absent", @ids[0], 8) != 0
         client_free(client)
         return 10
     # No index on another field: the client is told to scan instead.
-    if client_find(client, c"title", 5, c"x", 1, @ids[0], 8) >= 0
+    if client_find(client, "title", "x", @ids[0], 8) >= 0
         client_free(client)
         return 11
     if client_last_error(client) != PROTO_ERR_NO_INDEX
@@ -622,7 +636,7 @@ fn check_field_index(srv: *TestServer) -> i32
     if client_delete(client, id1) != 1
         client_free(client)
         return 13
-    if client_find(client, c"slug", 4, c"twice", 5, @ids[0], 8) != 1
+    if client_find(client, "slug", "twice", @ids[0], 8) != 1
         client_free(client)
         return 14
     if ids[0] != id2
@@ -631,7 +645,7 @@ fn check_field_index(srv: *TestServer) -> i32
     if client_delete(client, id2) != 1
         client_free(client)
         return 16
-    if client_find(client, c"slug", 4, c"twice", 5, @ids[0], 8) != 0
+    if client_find(client, "slug", "twice", @ids[0], 8) != 0
         client_free(client)
         return 17
 

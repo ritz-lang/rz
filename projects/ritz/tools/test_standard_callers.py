@@ -54,7 +54,9 @@ PINS = {
     "indium": 120,
     "larb": 0,
     "lexis": 10,
-    "mausoleum": 141,
+    # exec (2): test_integration / test_multi_collection fork+exec the built
+    # server binary; ritzlib.process.exec is that process boundary.
+    "mausoleum": 2,
     "nexus": 29,
     "prism": 3,
     "ritz": 1391,
@@ -120,7 +122,7 @@ C_LITERAL_PINS = {
     "indium": 157,
     "iris": 1,
     "larb": 0,
-    "mausoleum": 86,
+    "mausoleum": 33,
     "nexus": 48,
     "prism": 1,
     "ritz": 3888,

@@ -5,7 +5,7 @@
 
 import ritzlib.sys
 import ritzlib.str
-import ritzlib.memory
+import ritzlib.box
 import ritzlib.net
 import ritzlib.gvec
 import ritzlib.strview
@@ -14,7 +14,7 @@ import ritzlib.span
 import mausoleum.protocol
 import mausoleum.collection { MAX_DOC_SIZE }
 import mausoleum.encrypted_channel { EncryptedChannel }
-import mausoleum.encrypted_channel { channel_init_client, channel_handshake_client }
+import mausoleum.encrypted_channel { channel_new, channel_init_client, channel_handshake_client }
 import mausoleum.encrypted_channel { channel_send, channel_recv, channel_free }
 
 # ============================================================================
@@ -34,7 +34,7 @@ struct Client
     connected: i32            # Connection state (1 = connected)
     session_id: i64           # Server-assigned session ID
     next_request_id: i32      # Next request ID
-    send_buf: *MessageBuffer  # Send buffer
+    send_buf: MessageBuffer   # Send buffer
     recv_buf: Vec<u8>         # Receive buffer; .len = bytes held (plaintext path only)
     recv_used: i32            # Bytes at its front that are the message last
                               # returned (dropped by the next recv_message)
@@ -60,28 +60,28 @@ struct Client
 # Client API
 # ============================================================================
 
-# Create a new client
-pub fn client_new() -> *Client
-    # The buffers first, the client last: a failure frees only what it made.
+# Create a new client. It is boxed: its encrypted channel stays where it was
+# set up. Empty (valid() false) if out of memory; dropping the Box frees it.
+pub fn client_new() -> Box<Client>
     var recv_buf: Vec<u8> = vec_with_cap<u8>(CLIENT_BUFFER_SIZE as i64)
     if recv_buf.cap() < CLIENT_BUFFER_SIZE as i64
-        return null
-    let send_buf: *MessageBuffer = msgbuf_new(CLIENT_BUFFER_SIZE)
-    if send_buf == null
-        return null
-    var client: *Client = malloc(sizeof(Client)) as *Client
+        return box_empty<Client>()
+    var send_buf: MessageBuffer = msgbuf_new(CLIENT_BUFFER_SIZE)
+    if msgbuf_capacity(@send_buf) < CLIENT_BUFFER_SIZE
+        return box_empty<Client>()
+    var c: Client
+    c.send_buf = send_buf
+    c.recv_buf = recv_buf
+    c.sock = socket_from_raw(-1)
+    c.channel = channel_new()
+    var owner: Box<Client> = box_new<Client>(c)
+    let client: *Client = owner.as_ptr()
     if client == null
-        msgbuf_free(send_buf)
-        return null
+        return owner
 
-    client.sock.fd = -1
-    client.sock.family = AF_INET
-    client.sock.socktype = SOCK_STREAM
     client.connected = 0
     client.session_id = 0
     client.next_request_id = 1
-    client.send_buf = send_buf
-    client.recv_buf = recv_buf
     client.recv_used = 0
     client.last_error = PROTO_OK
     client.last_errno = 0
@@ -93,9 +93,9 @@ pub fn client_new() -> *Client
     # populates every field on entry, so the previous bytes don't matter.
     client.encrypted = 0
 
-    return client
+    return owner
 
-# Free client resources.  client_disconnect already tears down the
+# Release client resources (the Box that owns the client frees it).  client_disconnect already tears down the
 # encrypted channel + socket on its way out (so a connected client gets
 # clean shutdown).  This function additionally handles two edge cases:
 # (1) caller created a client but never connected — channel is still
@@ -117,11 +117,8 @@ pub fn client_free(client: *Client)
         channel_free(@client.channel)
         client.encrypted = 0
 
-    if client.send_buf != null
-        msgbuf_free(client.send_buf)
+    msgbuf_free(@client.send_buf)
     client.recv_buf.deinit()
-
-    free(client as *u8)
 
 # ============================================================================
 # Connection management
@@ -176,7 +173,7 @@ pub fn client_connect(client: *Client, host: StrView, port: i32, collection: Str
     # Send CONNECT message
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_connect(client.send_buf, req_id, collection.ptr, collection.len as i32)
+    build_connect(@client.send_buf, req_id, collection.as_bytes())
 
     let send_result: i32 = send_message(client)
     if send_result < 0
@@ -289,7 +286,7 @@ pub fn client_connect_encrypted(client: *Client, host: StrView, port: i32, colle
     # Send protocol-level CONNECT (encrypted via channel_send)
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_connect(client.send_buf, req_id, collection.ptr, collection.len as i32)
+    build_connect(@client.send_buf, req_id, collection.as_bytes())
 
     if send_message(client) < 0
         client.encrypted = 0
@@ -346,8 +343,8 @@ pub fn client_disconnect(client: *Client) -> i32
     # like garbage and trigger a protocol-error close.
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    msgbuf_start(client.send_buf, MSG_DISCONNECT, req_id)
-    msgbuf_finish(client.send_buf)
+    msgbuf_start(@client.send_buf, MSG_DISCONNECT, req_id)
+    msgbuf_finish(@client.send_buf)
     send_message(client)
 
     # Tear down channel + socket.  In encrypted mode, channel_free zeroes
@@ -417,8 +414,8 @@ fn recv_some(client: *Client) -> i64
 # Send the message in send_buf.  Routes through the encrypted channel
 # when client.encrypted == 1; otherwise socket_send_all.
 fn send_message(client: *Client) -> i32
-    let len: i32 = msgbuf_len(client.send_buf)
-    var data: *u8 = msgbuf_data(client.send_buf)
+    let len: i32 = msgbuf_len(@client.send_buf)
+    let data: *u8 = msgbuf_data(@client.send_buf)
 
     if client.encrypted != 0
         # channel_send handles framing ([4 BE len][12 nonce][ct][16 tag])
@@ -429,7 +426,7 @@ fn send_message(client: *Client) -> i32
             return -1
         return 0
 
-    match client.sock.send_all(span_from_ptr<u8>(data, len as i64))
+    match client.sock.send_all(msgbuf_bytes(@client.send_buf))
         Ok(_) => 0
         Err(_) => -1
 
@@ -463,12 +460,14 @@ fn recv_message(client: *Client, reader: *MessageReader) -> i32
         if msg_len != n
             return -3
 
-        let result: i32 = msgreader_init(reader, client.recv_buf.data, n)
+        # The frame is the message: view it, then hold nothing (encrypted
+        # frames leave no leftover bytes; the next one lands at the front).
+        client.recv_buf.len = n as i64
+        let frame: [u8] = client.recv_buf[0..n]
+        let result: i32 = msgreader_init(reader, frame)
+        client.recv_buf.len = 0
         if result != PROTO_OK
             return -4
-
-        # Encrypted frames do not produce leftover bytes; no buffer shift.
-        client.recv_buf.len = 0
         return 0
 
     # Drop the message returned last time: its caller is done with it.
@@ -503,7 +502,8 @@ fn recv_message(client: *Client, reader: *MessageReader) -> i32
             return -3
 
     # Parse message
-    let result: i32 = msgreader_init(reader, client.recv_buf.data, msg_len)
+    let message: [u8] = client.recv_buf[0..msg_len]
+    let result: i32 = msgreader_init(reader, message)
     if result != PROTO_OK
         return -4
 
@@ -523,7 +523,7 @@ pub fn client_ping(client: *Client) -> i32
 
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_ping(client.send_buf, req_id)
+    build_ping(@client.send_buf, req_id)
 
     if send_message(client) < 0
         client.connected = 0
@@ -547,9 +547,10 @@ pub fn client_ping(client: *Client) -> i32
 # Insert a document (returns document ID, or < 0 on error). -4 is a refusal
 # with the session intact: client_last_error says why (DOCUMENT_TOO_LARGE for
 # a document over MAX_DOC_SIZE, which is never sent).
-pub fn client_insert(client: *Client, doc_data: *u8, doc_len: i32) -> i64
+pub fn client_insert(client: *Client, doc_data: [u8]) -> i64
     if client == null or client.connected == 0
         return -1
+    let doc_len: i32 = doc_data.len as i32
 
     # The server would refuse it; don't send it (AGAST #2208). This also
     # keeps the document within the client's own buffers.
@@ -559,7 +560,7 @@ pub fn client_insert(client: *Client, doc_data: *u8, doc_len: i32) -> i64
 
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    if build_insert(client.send_buf, req_id, doc_data, doc_len) < 0
+    if build_insert(@client.send_buf, req_id, doc_data) < 0
         client.last_error = PROTO_ERR_MESSAGE_TOO_LARGE
         return -4
 
@@ -588,13 +589,13 @@ pub fn client_insert(client: *Client, doc_data: *u8, doc_len: i32) -> i64
 
 # Get a document by ID (returns 1 if found, 0 if not found, < 0 on error)
 # doc_data and doc_len are output parameters
-pub fn client_get(client: *Client, doc_id: i64, doc_data: **u8, doc_len: *i32) -> i32
+pub fn client_get(client: *Client, doc_id: i64, doc_out: *Span<u8>) -> i32
     if client == null or client.connected == 0
         return -1
 
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_get(client.send_buf, req_id, doc_id)
+    build_get(@client.send_buf, req_id, doc_id)
 
     if send_message(client) < 0
         client.connected = 0
@@ -620,10 +621,7 @@ pub fn client_get(client: *Client, doc_id: i64, doc_data: **u8, doc_len: *i32) -
         return -5
 
     # Read document data
-    var len: i32 = 0
-    var data: *u8 = msgreader_read_bytes(@reader, @len)
-    *doc_data = data
-    *doc_len = len
+    *doc_out = msgreader_read_bytes(@reader).unwrap_or(span_empty<u8>())
 
     client.last_error = PROTO_OK
     return 1
@@ -635,7 +633,7 @@ pub fn client_delete(client: *Client, doc_id: i64) -> i32
 
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_delete(client.send_buf, req_id, doc_id)
+    build_delete(@client.send_buf, req_id, doc_id)
 
     if send_message(client) < 0
         client.connected = 0
@@ -678,7 +676,7 @@ pub fn client_begin_txn(client: *Client) -> i64
 
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_txn_begin(client.send_buf, req_id)
+    build_txn_begin(@client.send_buf, req_id)
 
     if send_message(client) < 0
         client.connected = 0
@@ -715,7 +713,7 @@ pub fn client_commit_txn(client: *Client) -> i32
 
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_txn_commit(client.send_buf, req_id)
+    build_txn_commit(@client.send_buf, req_id)
 
     if send_message(client) < 0
         client.connected = 0
@@ -752,7 +750,7 @@ pub fn client_abort_txn(client: *Client) -> i32
 
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_txn_abort(client.send_buf, req_id)
+    build_txn_abort(@client.send_buf, req_id)
 
     if send_message(client) < 0
         client.connected = 0
@@ -800,7 +798,7 @@ pub fn client_scan(client: *Client, callback: *u8, user_data: *u8) -> i32
     client.next_request_id = client.next_request_id + 1
 
     # Build scan request (0 = no limit)
-    build_scan(client.send_buf, req_id, 0)
+    build_scan(@client.send_buf, req_id, 0)
 
     if send_message(client) < 0
         client.connected = 0
@@ -841,8 +839,7 @@ pub fn client_scan(client: *Client, callback: *u8, user_data: *u8) -> i32
             var user_stopped: i32 = 0
             for i in 0..doc_count
                 let doc_id: i64 = msgreader_read_i64(@reader)
-                var data_len: i32 = 0
-                let data: *u8 = msgreader_read_bytes(@reader, @data_len)
+                let doc: [u8] = msgreader_read_bytes(@reader).unwrap_or(span_empty<u8>())
 
                 # Call user callback.  IMPORTANT: cast to `fn(...)` (the
                 # function-value type), NOT `*fn(...)` (pointer-to-fn).
@@ -853,8 +850,8 @@ pub fn client_scan(client: *Client, callback: *u8, user_data: *u8) -> i32
                 # didn't crash on call (the test for phase 4 was nexus-driven
                 # and happened to land in a survivable spot), but with longer
                 # batches the loaded address is consistently bad and segfaults.
-                let cb: fn(i64, *u8, i32, *u8) -> i32 = callback as fn(i64, *u8, i32, *u8) -> i32
-                let result: i32 = cb(doc_id, data, data_len, user_data)
+                let cb: fn(i64, [u8], *u8) -> i32 = callback as fn(i64, [u8], *u8) -> i32
+                let result: i32 = cb(doc_id, doc, user_data)
                 count = count + 1
 
                 if result != 0
@@ -882,15 +879,15 @@ pub fn client_scan(client: *Client, callback: *u8, user_data: *u8) -> i32
 # Ensure a secondary index on `field`.  Idempotent: the server confirms an
 # existing index without rebuilding.  0 on success, -4 if the server refused
 # (client_last_error says why), other < 0 on a transport failure.
-pub fn client_index_create(client: *Client, field: *u8, field_len: i32) -> i32
+pub fn client_index_create(client: *Client, field: [u8]) -> i32
     if client == null or client.connected == 0
         return -1
-    if field == null or field_len <= 0
+    if field.len <= 0
         return -4
 
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    if build_index_create(client.send_buf, req_id, field, field_len, 0) < 0
+    if build_index_create(@client.send_buf, req_id, field, 0) < 0
         client.last_error = PROTO_ERR_MESSAGE_TOO_LARGE
         return -5
 
@@ -918,15 +915,15 @@ pub fn client_index_create(client: *Client, field: *u8, field_len: i32) -> i32
 # Document ids holding string `value` in `field`, up to `max`, in ascending
 # id order.  Returns the count, or < 0: -4 means the server has no index on
 # the field (client_last_error is PROTO_ERR_NO_INDEX), so the caller scans.
-pub fn client_find(client: *Client, field: *u8, field_len: i32, value: *u8, value_len: i32, out: *i64, max: i32) -> i32
+pub fn client_find(client: *Client, field: [u8], value: [u8], out: *i64, max: i32) -> i32
     if client == null or client.connected == 0
         return -1
-    if field == null or field_len <= 0 or max < 0 or value_len < 0
+    if field.len <= 0 or max < 0
         return -4
 
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    if build_find(client.send_buf, req_id, field, field_len, value, value_len) < 0
+    if build_find(@client.send_buf, req_id, field, value) < 0
         client.last_error = PROTO_ERR_MESSAGE_TOO_LARGE
         return -5
 

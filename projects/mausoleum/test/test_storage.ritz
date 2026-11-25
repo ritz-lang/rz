@@ -12,6 +12,7 @@ import ritzlib.strview
 import ritzlib.string
 import ritzlib.span
 import ritzlib.option
+import ritzlib.box
 
 import lib.m7m_types
 import lib.page
@@ -23,35 +24,27 @@ import lib.wal
 # Test Helpers
 # ============================================================================
 
-var g_db_path: [96]u8
 
-# This process's "/tmp/mausoleum_<pid>_test_db" (NUL-terminated in
-# g_db_path). The pid keeps concurrent test runs (gate slots, compiler
+# This process's "/tmp/mausoleum_<pid>_test_db". The pid keeps concurrent test runs (gate slots, compiler
 # variants) off each other's databases (AGAST #4084).
-fn test_db_path() -> StrView
+fn test_db_path() -> String
     let pid: i32 = process_id()
     var name: String = string_new()
     format_into(@&name, "/tmp/mausoleum_{pid}_test_db")
-    let n: i64 = m7m_path_join(@g_db_path, name.as_view(), "")
-    return StrView { ptr: @g_db_path[0], len: n }
+    return name
 
 fn cleanup_test_db()
     # Remove test database directory
-    let path: StrView = test_db_path()
-    var data_path: [256]u8
-    var wal_path: [256]u8
-    var meta_path: [256]u8
-
-    # Build paths
-    m7m_path_join(@data_path, path, "/data.m7m")
-    m7m_path_join(@wal_path, path, "/wal.wal.000000")
-    m7m_path_join(@meta_path, path, "/meta.m7m")
+    let path: String = test_db_path()
 
     # Delete files (ignore errors)
-    unlink(strview_from_cstr(@data_path[0]))
-    unlink(strview_from_cstr(@wal_path[0]))
-    unlink(strview_from_cstr(@meta_path[0]))
-    rmdir(path)
+    let data_path: String = m7m_path_join(path.as_view(), "/data.m7m")
+    let wal_path: String = m7m_path_join(path.as_view(), "/wal.wal.000000")
+    let meta_path: String = m7m_path_join(path.as_view(), "/meta.m7m")
+    unlink(data_path.as_view())
+    unlink(wal_path.as_view())
+    unlink(meta_path.as_view())
+    rmdir(path.as_view())
 
 # ============================================================================
 # Storage Creation Tests
@@ -61,12 +54,13 @@ fn cleanup_test_db()
 fn test_storage_open_new() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None =>
+            return 1
 
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let storage: *Storage = storage_owner.as_ptr()
     if storage_is_open(storage) != 1
         storage_destroy(storage)
         return 2
@@ -79,20 +73,20 @@ fn test_storage_open_new() -> i32
 fn test_storage_open_existing() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
+    let path: String = test_db_path()
 
     # Open and close
-    let storage1_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage1_opt)
-        return 1
-    let storage1: *Storage = option_unwrap_or<*Storage>(@storage1_opt, null)
+    var storage1_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage1: *Storage = storage1_owner.as_ptr()
     storage_destroy(storage1)
 
     # Reopen
-    let storage2_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage2_opt)
-        return 2
-    let storage2: *Storage = option_unwrap_or<*Storage>(@storage2_opt, null)
+    var storage2_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 2
+    let storage2: *Storage = storage2_owner.as_ptr()
 
     if storage_is_open(storage2) != 1
         storage_destroy(storage2)
@@ -104,8 +98,8 @@ fn test_storage_open_existing() -> i32
 
 [[test]]
 fn test_storage_null_path() -> i32
-    let storage_opt: Option<*Storage> = storage_open(null)
-    if not option_is_none<*Storage>(@storage_opt)
+    # An empty path opens nothing
+    if storage_open("").is_some()
         return 1
     0
 
@@ -117,11 +111,11 @@ fn test_storage_null_path() -> i32
 fn test_storage_alloc_page() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
 
     # Start transaction
     let txn: i64 = storage_begin_txn(storage)
@@ -155,11 +149,11 @@ fn test_storage_alloc_page() -> i32
 fn test_storage_multiple_pages() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
 
     let txn: i64 = storage_begin_txn(storage)
 
@@ -193,11 +187,11 @@ fn test_storage_multiple_pages() -> i32
 fn test_storage_begin_commit() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
 
     # Begin transaction
     let txn: i64 = storage_begin_txn(storage)
@@ -224,11 +218,11 @@ fn test_storage_begin_commit() -> i32
 fn test_storage_begin_abort() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
 
     let txn: i64 = storage_begin_txn(storage)
     if txn < 0
@@ -248,11 +242,11 @@ fn test_storage_begin_abort() -> i32
 fn test_storage_nested_txn_fails() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
 
     let txn1: i64 = storage_begin_txn(storage)
     if txn1 < 0
@@ -278,14 +272,14 @@ fn test_storage_nested_txn_fails() -> i32
 fn test_storage_persist_page_data() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
+    let path: String = test_db_path()
     var page_id_stored: i64 = -1
 
     # Phase 1: Create and write data
-    let s1_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@s1_opt)
-        return 1
-    let s1: *Storage = option_unwrap_or<*Storage>(@s1_opt, null)
+    var s1_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let s1: *Storage = s1_owner.as_ptr()
 
     let txn: i64 = storage_begin_txn(s1)
 
@@ -313,10 +307,10 @@ fn test_storage_persist_page_data() -> i32
     storage_destroy(s1)
 
     # Phase 2: Reopen and verify data
-    let s2_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@s2_opt)
-        return 3
-    let s2: *Storage = option_unwrap_or<*Storage>(@s2_opt, null)
+    var s2_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 3
+    let s2: *Storage = s2_owner.as_ptr()
 
     let fetch_opt: Option<*Page> = storage_fetch_page(s2, page_id_stored)
     if option_is_none<*Page>(@fetch_opt)
@@ -341,11 +335,11 @@ fn test_storage_persist_page_data() -> i32
 fn test_storage_checkpoint() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
 
     let txn: i64 = storage_begin_txn(storage)
     let page_opt: Option<*Page> = storage_alloc_page(storage, PAGE_MAGIC_HEAP)
@@ -377,11 +371,11 @@ fn test_storage_checkpoint() -> i32
 fn test_storage_flush() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
 
     let txn: i64 = storage_begin_txn(storage)
 
@@ -416,11 +410,11 @@ fn test_storage_flush() -> i32
 fn test_storage_pool_access() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
 
     let pool: *BufferPool = storage_pool(storage)
     if pool == null
@@ -435,11 +429,11 @@ fn test_storage_pool_access() -> i32
 fn test_storage_wal_access() -> i32
     cleanup_test_db()
 
-    let path: StrView = test_db_path()
-    let storage_opt: Option<*Storage> = storage_open(path.ptr)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    let path: String = test_db_path()
+    var storage_owner: Box<Storage> = match storage_open(path.as_view())
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
 
     let wal: *WalWriter = storage_wal(storage)
     if wal == null

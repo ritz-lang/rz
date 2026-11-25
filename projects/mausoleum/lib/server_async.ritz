@@ -51,8 +51,7 @@ import mausoleum.btree {
     BTreeIter,
     btree_iter_valid,
     btree_iter_next,
-    btree_iter_key,
-    btree_iter_destroy
+    btree_iter_key
 }
 
 # Phase 6: encrypted async path uses the same crypto primitives as the
@@ -64,7 +63,7 @@ import cryptosec.crypto_error
 import mausoleum.session_kdf
 import cryptosec.random
 import cryptosec.mem
-import ritzlib.memory { malloc, free }
+import ritzlib.box
 import ritzlib.gvec
 import ritzlib.span
 
@@ -162,8 +161,9 @@ struct M7SPSession
     # are heap buffers of ASYNC_MAX_FRAME bytes, allocated the first time
     # the session needs one and freed by m7sp_session_destroy.  recv_big:
     # the message being received is collected in big_recv, not read_buf.
-    big_recv: i64              # *u8, 0 = none yet
-    big_send: i64              # *u8, 0 = none yet
+    big_recv: i64              # *u8 into heap.big_recv, 0 = none yet
+    big_send: i64              # *u8 into heap.big_send, 0 = none yet
+    slot_heap: *SessionHeap    # what this slot owns (null: no serve loop)
     recv_big: i32
     # The reply in flight: send_ptr[0..send_len), send_pos bytes sent so
     # far (a send may complete short; the rest is sent again).
@@ -187,6 +187,47 @@ struct M7SPSession
 
 var g_sessions: [256]M7SPSession
 
+# What a session slot owns (AGAST #3638, #4692): the frame buffers for a
+# message over TASK_BUFFER_SIZE, and the SCAN iterator in flight.  The
+# session's big_recv / big_send / scan_iter point into it.
+struct SessionHeap
+    big_recv: Vec<u8>           # ASYNC_MAX_FRAME bytes once used
+    big_send: Vec<u8>
+    scan_iter: Box<BTreeIter>   # empty: no scan
+
+# The serve loop's state: serve_async* owns it on its frame and g_state
+# points at it while the loop runs (a global can't own: it never drops).
+struct AsyncState
+    # Every collection a CONNECT has named, the default one first (AGAST #3637).
+    registry: CollectionRegistry
+    heaps: Vec<SessionHeap>     # one per session slot
+
+var g_state: *AsyncState = null
+
+fn async_state_new(pool: *BufferPool, storage: *Storage, collection: *Collection) -> AsyncState
+    var heaps: Vec<SessionHeap> = vec_with_cap<SessionHeap>(SESSION_MAX as i64)
+    for i in 0..SESSION_MAX
+        heaps.push(SessionHeap { big_recv: vec_new<u8>(), big_send: vec_new<u8>(), scan_iter: box_empty<BTreeIter>() })
+    return AsyncState { registry: registry_new(pool, storage, collection), heaps: heaps }
+
+# The running loop's registry, or null outside one.
+fn async_registry() -> *CollectionRegistry
+    if g_state == null
+        return null
+    return @g_state.registry
+
+# Slot idx's heap, or null outside a serve loop.
+fn session_heap(idx: i32) -> *SessionHeap
+    if g_state == null or idx < 0 or idx as i64 >= g_state.heaps.len()
+        return null
+    return g_state.heaps.get_ptr(idx as i64)
+
+# Drop the session's SCAN iterator, if it has one.
+fn m7sp_scan_release(session: *M7SPSession)
+    if session.slot_heap != null
+        session.slot_heap.scan_iter.drop()
+    session.scan_iter = 0
+
 
 # Session slot by index (tests reach sessions through this, not the global).
 pub fn m7sp_session_at(idx: i32) -> *M7SPSession
@@ -199,7 +240,8 @@ fn m7sp_session_init(idx: i32)
     g_sessions[idx].msg_len = 0
     g_sessions[idx].have = 0
     g_sessions[idx].active_txn = -1
-    g_sessions[idx].collection = registry_default(@g_registry) as i64
+    g_sessions[idx].collection = registry_default(async_registry()) as i64
+    g_sessions[idx].slot_heap = session_heap(idx)
     g_sessions[idx].next_doc_id = 1
     g_sessions[idx].scan_active = 0
     g_sessions[idx].scan_iter = 0
@@ -215,26 +257,27 @@ fn m7sp_session_init(idx: i32)
 pub fn m7sp_session_destroy(idx: i32)
     # Free any in-flight scan iterator (the connection may have died
     # mid-scan; without this we'd leak the BTreeIter and pinned pages).
-    if g_sessions[idx].scan_iter != 0
-        btree_iter_destroy(g_sessions[idx].scan_iter as *BTreeIter)
-        g_sessions[idx].scan_iter = 0
+    m7sp_scan_release(@g_sessions[idx])
     g_sessions[idx].scan_active = 0
 
     # Zero key material before clearing the slot so it can never leak
     # into a subsequent session reusing the same index.
-    span_from_ptr<u8>(@g_sessions[idx].cipher_private_key[0], 32).secure_zero()
-    span_from_ptr<u8>(@g_sessions[idx].cipher_send_key[0], 32).secure_zero()
-    span_from_ptr<u8>(@g_sessions[idx].cipher_recv_key[0], 32).secure_zero()
+    let private_key: [u8] = @g_sessions[idx].cipher_private_key
+    let send_key: [u8] = @g_sessions[idx].cipher_send_key
+    let recv_key: [u8] = @g_sessions[idx].cipher_recv_key
+    private_key.secure_zero()
+    send_key.secure_zero()
+    recv_key.secure_zero()
     g_sessions[idx].cipher_send_nonce = 0
     g_sessions[idx].cipher_recv_nonce = 0
 
     g_sessions[idx].in_use = 0
-    if g_sessions[idx].big_recv != 0
-        free(g_sessions[idx].big_recv as *u8)
-        g_sessions[idx].big_recv = 0
-    if g_sessions[idx].big_send != 0
-        free(g_sessions[idx].big_send as *u8)
-        g_sessions[idx].big_send = 0
+    let slot: *SessionHeap = g_sessions[idx].slot_heap
+    if slot != null
+        slot.big_recv.deinit()
+        slot.big_send.deinit()
+    g_sessions[idx].big_recv = 0
+    g_sessions[idx].big_send = 0
     g_sessions[idx].recv_big = 0
 
     # Draining: this may have been the last busy session, and nothing else
@@ -253,7 +296,8 @@ pub fn m7sp_session_init_encrypted(idx: i32)
     g_sessions[idx].msg_len = 0
     g_sessions[idx].have = 0
     g_sessions[idx].active_txn = -1
-    g_sessions[idx].collection = registry_default(@g_registry) as i64
+    g_sessions[idx].collection = registry_default(async_registry()) as i64
+    g_sessions[idx].slot_heap = session_heap(idx)
     g_sessions[idx].next_doc_id = 1
     g_sessions[idx].scan_iter = 0
     g_sessions[idx].scan_request_id = 0
@@ -289,7 +333,8 @@ fn cipher_derive_session_keys(session: *M7SPSession) -> i32
     # nothing and fails the handshake (#2763).
     var okm: [64]u8
     let rc: i32 = session_kdf_derive(@shared[0], @okm[0], SESSION_KDF_OKM_LEN)
-    span_from_ptr<u8>(@shared[0], 32).secure_zero()
+    let shared_s: [u8] = @shared
+    shared_s.secure_zero()
     if rc != 0
         return -1
 
@@ -298,7 +343,8 @@ fn cipher_derive_session_keys(session: *M7SPSession) -> i32
     mem_copy(@session.cipher_send_key[0], @okm[0], 32)
     mem_copy(@session.cipher_recv_key[0], @okm[32], 32)
 
-    span_from_ptr<u8>(@okm[0], 64).secure_zero()
+    let okm_s: [u8] = @okm
+    okm_s.secure_zero()
     return 0
 
 
@@ -432,8 +478,6 @@ fn task_to_session_idx(task: *Task) -> i32
 var g_pool: i64 = 0          # *BufferPool — for collection access
 var g_storage: i64 = 0       # *Storage — for txn + flush
 var g_collection: i64 = 0    # *Collection — the default collection
-# Every collection a CONNECT has named, the default one first (AGAST #3637).
-var g_registry: CollectionRegistry
 
 
 fn get_collection() -> *Collection
@@ -474,19 +518,40 @@ fn m7sp_submit_recv_at(task: *Task, offset: i32) -> i32
 # Messages over TASK_BUFFER_SIZE (AGAST #3638)
 # ============================================================================
 
-# The session's heap buffer in *slot (big_recv or big_send), allocated on
-# first use; null if malloc fails.
-fn m7sp_session_buf(slot: *i64) -> *u8
+# A frame buffer of the session's (heap.big_recv or heap.big_send, with
+# *slot its cached pointer), ASYNC_MAX_FRAME bytes once first used; null
+# outside a serve loop or out of memory.
+fn m7sp_session_buf(buf: *Vec<u8>, slot: *i64) -> *u8
     if *slot == 0
-        *slot = malloc(ASYNC_MAX_FRAME as i64) as i64
+        if buf == null
+            return null
+        if buf.len() < ASYNC_MAX_FRAME as i64
+            # The old one is empty (never used, or released by destroy)
+            *buf = m7m_scratch(ASYNC_MAX_FRAME as i64)
+            if buf.len() < ASYNC_MAX_FRAME as i64
+                return null
+        *slot = buf.as_ptr() as i64
     return *slot as *u8
 
+fn m7sp_session_recv_buf(session: *M7SPSession) -> *u8
+    if session.slot_heap == null
+        return null
+    return m7sp_session_buf(@session.slot_heap.big_recv, @session.big_recv)
 
-# The bytes of the message being received: big_recv or task.read_buf.
-fn m7sp_msg_bytes(task: *Task, session: *M7SPSession) -> *u8
+fn m7sp_session_send_buf(session: *M7SPSession) -> *u8
+    if session.slot_heap == null
+        return null
+    return m7sp_session_buf(@session.slot_heap.big_send, @session.big_send)
+
+
+# The message being received (session.msg_len bytes): in big_recv or
+# task.read_buf.
+fn m7sp_msg_bytes(task: *Task, session: *M7SPSession) -> [u8]
     if session.recv_big != 0
-        return session.big_recv as *u8
-    return @task.read_buf[0]
+        let big: [u8] = session.slot_heap.big_recv[0..session.msg_len]
+        return big
+    let read_buf: [u8] = @task.read_buf
+    return read_buf[0..session.msg_len]
 
 
 # The message's header says it is session.msg_len bytes.  Past
@@ -497,7 +562,7 @@ fn m7sp_recv_msg_len_set(task: *Task, session: *M7SPSession, max_len: i32) -> i3
         return -1
     if session.msg_len <= TASK_BUFFER_SIZE
         return 0
-    let big: *u8 = m7sp_session_buf(@session.big_recv)
+    let big: *u8 = m7sp_session_recv_buf(session)
     if big == null
         return -1
     mem_copy(big, @task.read_buf[0], session.have as i64)
@@ -532,7 +597,7 @@ fn m7sp_submit_out(task: *Task, session: *M7SPSession, out: *u8, len: i32) -> i3
 fn m7sp_send(task: *Task, session: *M7SPSession, data: *u8, len: i32) -> i32
     var out: *u8 = @task.write_buf[0]
     if len > TASK_BUFFER_SIZE
-        out = m7sp_session_buf(@session.big_send)
+        out = m7sp_session_send_buf(session)
         if out == null
             return -1
     mem_copy(out, data, len as i64)
@@ -545,7 +610,7 @@ fn m7sp_send_encrypted(task: *Task, session: *M7SPSession, plaintext: *u8, len: 
     var out: *u8 = @task.write_buf[0]
     var cap: i32 = TASK_BUFFER_SIZE
     if len + ENC_LEN_PREFIX_SIZE + ENC_NONCE_SIZE + ENC_TAG_SIZE > TASK_BUFFER_SIZE
-        out = m7sp_session_buf(@session.big_send)
+        out = m7sp_session_send_buf(session)
         if out == null
             return -1
         cap = ASYNC_MAX_FRAME
@@ -587,9 +652,9 @@ fn async_flush_after_write(storage: *Storage, collection: *Collection)
 # Identical contract to handle_insert in src/main.ritz; kept inline so
 # the async loop doesn't depend on private symbols there.
 pub fn async_handle_insert(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
-    var doc_len: i32 = 0
-    let doc_data: *u8 = msgreader_read_bytes(reader, @doc_len)
-    if doc_data == null or doc_len <= 0
+    let doc_data: [u8] = msgreader_read_bytes(reader).unwrap_or(span_empty<u8>())
+    let doc_len: i32 = doc_data.len as i32
+    if doc_len <= 0
         build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Missing document data")
         return
     if doc_len as i64 > MAX_DOC_SIZE
@@ -597,7 +662,7 @@ pub fn async_handle_insert(reader: *MessageReader, resp: *MessageBuffer, request
         return
 
     var doc: Document
-    let deser_result: i32 = doc_deserialize(doc_data, doc_len as i64, @doc)
+    let deser_result: i32 = doc_deserialize(doc_data, @doc)
     if deser_result != ERR_OK
         build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Failed to deserialize document")
         return
@@ -628,13 +693,13 @@ pub fn async_handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id
     var doc_id: DocumentId
     doc_id.value = doc_id_val
 
-    var doc_buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let doc_buf: *u8 = doc_buf_vec.as_ptr()
-    if doc_buf == null
+    var doc_buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    if doc_buf_vec.len() < MAX_DOC_SIZE
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
         return
+    let doc_buf: [u8] = doc_buf_vec[0..MAX_DOC_SIZE]
     var doc_size: i64 = 0
-    let get_result: i32 = collection_get_raw(collection, @doc_id, doc_buf, MAX_DOC_SIZE, @doc_size)
+    let get_result: i32 = collection_get_raw(collection, @doc_id, doc_buf, @doc_size)
     if get_result == ERR_NOT_FOUND
         build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
     else if get_result != ERR_OK
@@ -645,14 +710,14 @@ pub fn async_handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id
         prints(" size=")
         print_i64(doc_size)
         prints("\n")
-        build_get_ok(resp, request_id, doc_buf, doc_size as i32)
+        build_get_ok(resp, request_id, doc_buf[0..doc_size])
 
 
 # UPDATE — payload: [doc_data_len: i32][doc_data: bytes]
 pub fn async_handle_update(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
-    var doc_len: i32 = 0
-    let doc_data: *u8 = msgreader_read_bytes(reader, @doc_len)
-    if doc_data == null or doc_len <= 0
+    let doc_data: [u8] = msgreader_read_bytes(reader).unwrap_or(span_empty<u8>())
+    let doc_len: i32 = doc_data.len as i32
+    if doc_len <= 0
         build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Missing document data")
         return
     if doc_len as i64 > MAX_DOC_SIZE
@@ -660,7 +725,7 @@ pub fn async_handle_update(reader: *MessageReader, resp: *MessageBuffer, request
         return
 
     var doc: Document
-    let deser_result: i32 = doc_deserialize(doc_data, doc_len as i64, @doc)
+    let deser_result: i32 = doc_deserialize(doc_data, @doc)
     if deser_result != ERR_OK
         build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Failed to deserialize document")
         return
@@ -775,13 +840,13 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
     var batch_count: i32 = 0
     var done: i32 = 0
     var key_buf: [16]u8
-    var val_buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let val_buf: *u8 = val_buf_vec.as_ptr()
+    var val_buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    let val_buf: [u8] = val_buf_vec[0..val_buf_vec.len()]
 
     let batch_target: i32 = 16          # safety cap on per-batch doc count
     let batch_byte_budget: i32 = 7000   # ~1.2 KiB headroom in 8 KiB write_buf
 
-    if iter == null or val_buf == null or btree_iter_valid(iter) == 0
+    if iter == null or val_buf.len < MAX_DOC_SIZE or btree_iter_valid(iter) == 0
         # Empty / unopenable iter — emit a single zero-doc batch.
         done = 1
     else
@@ -795,11 +860,11 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
                 break
 
             var key_len: i32 = 0
-            btree_iter_key(iter, @key_buf[0], @key_len)
+            btree_iter_key(iter, @key_buf, @key_len)
 
             # The whole document: a large one's overflow chain, not its stub.
             var full_len: i64 = 0
-            if collection_iter_value(collection, iter, val_buf, MAX_DOC_SIZE, @full_len) != ERR_OK
+            if collection_iter_value(collection, iter, val_buf, @full_len) != ERR_OK
                 # Unreadable (a broken chain, or no frame to read it
                 # into): skip it rather than end the scan.
                 btree_iter_next(iter)
@@ -819,7 +884,7 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
             let doc_id: i64 = *id_ptr
 
             msgbuf_write_i64(resp, doc_id)
-            msgbuf_write_bytes(resp, val_buf, val_len)
+            msgbuf_write_bytes(resp, val_buf[0..val_len])
 
             batch_count += 1
             session.scan_total_emitted += 1
@@ -831,7 +896,7 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
         has_more = 0
 
     # The message written so far, as a span: both slots lie inside it.
-    let written: [u8] = span_from_ptr<u8>(msgbuf_data(resp), msgbuf_len(resp) as i64)
+    let written: [u8] = msgbuf_bytes(resp)
     endian_write_u32_be(written, count_offset as i64, batch_count as u32)
     endian_write_u32_be(written, more_offset as i64, has_more as u32)
 
@@ -896,12 +961,13 @@ fn m7sp_dispatch_session(reader: *MessageReader, resp: *MessageBuffer, session: 
 # Bind the session to the collection it names (AGAST #3637); an unknown
 # name is created (see lib/registry.ritz).
 fn m7sp_dispatch_connect(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSession, request_id: i32)
-    var name_len: i32 = 0
-    let name: *u8 = msgreader_read_bytes(reader, @name_len)
-    if name == null and name_len != 0
-        build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed collection name")
-        return
-    let bound: *Collection = registry_bind(@g_registry, name, name_len)
+    var name: [u8] = ""
+    match msgreader_read_bytes(reader)
+        Some(n) => name = n
+        None =>
+            build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed collection name")
+            return
+    let bound: *Collection = registry_bind(async_registry(), name.as_ptr(), name.len as i32)
     if bound == null
         build_error(resp, request_id, PROTO_ERR_COLLECTION_REFUSED, "Collection name too long, or too many collections")
         return
@@ -1011,16 +1077,17 @@ fn m7sp_dispatch_scan(reader: *MessageReader, resp: *MessageBuffer, session: *M7
     print("  [async] SCAN max_results={max_results}\n")
 
     # If a previous scan somehow leaked, free its iter before starting.
-    if session.scan_iter != 0
-        btree_iter_destroy(session.scan_iter as *BTreeIter)
-        session.scan_iter = 0
+    m7sp_scan_release(session)
 
-    let iter_opt = collection_scan(collection)
-    var iter: *BTreeIter = null
-    if not option_is_none<*BTreeIter>(@iter_opt)
-        iter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    # The iterator lives in the session's heap (outside a serve loop there
+    # is none: the scan is empty).
+    match collection_scan(collection)
+        Some(it) =>
+            if session.slot_heap != null
+                session.slot_heap.scan_iter = box_new<BTreeIter>(it)
+                session.scan_iter = session.slot_heap.scan_iter.as_ptr() as i64
+        None => pass
 
-    session.scan_iter = iter as i64
     session.scan_request_id = request_id
     session.scan_max_results = max_results
     session.scan_total_emitted = 0
@@ -1040,13 +1107,12 @@ fn m7sp_dispatch_scan(reader: *MessageReader, resp: *MessageBuffer, session: *M7
 # after every dial; a new index is built from the documents already in
 # the collection (AGAST #3644).
 fn m7sp_dispatch_index_create(reader: *MessageReader, resp: *MessageBuffer, collection: *Collection, request_id: i32)
-    var field_len: i32 = 0
-    let field: *u8 = msgreader_read_bytes(reader, @field_len)
+    let field: [u8] = msgreader_read_bytes(reader).unwrap_or(span_empty<u8>())
     msgreader_read_i32(reader)      # reserved `unique` field
-    if field == null or field_len <= 0
+    if field.len <= 0
         build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed index field")
         return
-    let rc: i32 = collection_index_create(collection, field, field_len)
+    let rc: i32 = collection_index_create(collection, field.as_strview())
     if rc == ERR_OK
         build_index_created(resp, request_id)
     else if rc == ERR_INVALID
@@ -1062,19 +1128,18 @@ fn m7sp_dispatch_index_create(reader: *MessageReader, resp: *MessageBuffer, coll
 # A field with no index is PROTO_ERR_NO_INDEX, which tells the client to
 # fall back to a scan rather than treat the value as absent.
 fn m7sp_dispatch_find(reader: *MessageReader, resp: *MessageBuffer, collection: *Collection, request_id: i32)
-    var field_len: i32 = 0
-    let field: *u8 = msgreader_read_bytes(reader, @field_len)
-    var value_len: i32 = 0
-    let value: *u8 = msgreader_read_bytes(reader, @value_len)
-    if field == null or field_len <= 0 or value_len < 0
+    let field: [u8] = msgreader_read_bytes(reader).unwrap_or(span_empty<u8>())
+    let value_opt: Option<[u8]> = msgreader_read_bytes(reader)
+    if field.len <= 0 or value_opt.is_none()
         build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed find")
         return
+    let value: [u8] = value_opt.unwrap_or(span_empty<u8>())
     var ids_vec: Vec<i64> = vec_with_cap<i64>(FIND_MAX_IDS as i64)
     let ids: *i64 = ids_vec.as_ptr()
     if ids == null
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
         return
-    let rc: i32 = collection_index_find_string(collection, field, field_len, value, value_len, ids, FIND_MAX_IDS)
+    let rc: i32 = collection_index_find_string(collection, field.as_strview(), value.as_strview(), ids, FIND_MAX_IDS)
     if rc == ERR_NOT_FOUND
         build_error(resp, request_id, PROTO_ERR_NO_INDEX, "No index on field")
     else if rc < 0
@@ -1287,8 +1352,8 @@ fn handle_task_event(task: *Task) -> i32
             # the iter, transition to scan_active=2 so the *next* CQE
             # emits SCAN_END.
             var out1: [36864]u8
-            var resp1: MessageBuffer
-            msgbuf_init(@resp1, @out1[0], ASYNC_MAX_MSG)
+            var resp1: MessageBuffer = msgbuf_empty()
+            msgbuf_init(@resp1, @out1)
             let last: i32 = m7sp_scan_build_batch(@resp1, session)
             if last != 0
                 session.scan_active = 2
@@ -1301,8 +1366,8 @@ fn handle_task_event(task: *Task) -> i32
         if session.scan_active == 2
             # Final SCAN_RESULT (has_more=0) has been delivered; emit
             # the trailing SCAN_END terminator.
-            var resp2: MessageBuffer
-            msgbuf_init(@resp2, @task.write_buf[0], TASK_BUFFER_SIZE)
+            var resp2: MessageBuffer = msgbuf_empty()
+            msgbuf_init(@resp2, @task.write_buf)
             build_scan_end(@resp2, session.scan_request_id)
             session.scan_active = 3
             let send_ret2: i32 = m7sp_submit_out(task, session, @task.write_buf[0], msgbuf_len(@resp2))
@@ -1315,9 +1380,7 @@ fn handle_task_event(task: *Task) -> i32
             # SCAN_END acknowledged — tear down the iter and reset the
             # session for the next request on this keep-alive connection.
             print("  [async] SCAN done - emitted {session.scan_total_emitted} doc(s)\n")
-            if session.scan_iter != 0
-                btree_iter_destroy(session.scan_iter as *BTreeIter)
-                session.scan_iter = 0
+            m7sp_scan_release(session)
             session.scan_active = 0
             session.scan_request_id = 0
             session.scan_max_results = 0
@@ -1389,7 +1452,7 @@ fn handle_task_event(task: *Task) -> i32
     # ─── DISPATCHING: parse + build response + submit_send ───
     if session.parse_state == PARSE_DISPATCHING
         var reader: MessageReader
-        let parse_rc: i32 = msgreader_init(@reader, m7sp_msg_bytes(task, session), session.msg_len)
+        let parse_rc: i32 = msgreader_init(@reader, m7sp_msg_bytes(task, session))
         if parse_rc != PROTO_OK
             m7sp_session_destroy(idx)
             return 1
@@ -1400,8 +1463,8 @@ fn handle_task_event(task: *Task) -> i32
         # Built on the stack (up to ASYNC_MAX_MSG), then sent from
         # write_buf or big_send by m7sp_send.
         var out: [36864]u8
-        var resp: MessageBuffer
-        msgbuf_init(@resp, @out[0], ASYNC_MAX_MSG)
+        var resp: MessageBuffer = msgbuf_empty()
+        msgbuf_init(@resp, @out)
 
         m7sp_dispatch(@reader, @resp, session, msg_type, request_id)
 
@@ -1471,8 +1534,8 @@ fn enc_scan_continue(task: *Task, idx: i32, session: *M7SPSession) -> i32
         # batch drained the iter, transition to scan_active=2 so the
         # *next* CQE emits SCAN_END.
         var pt1: [36864]u8
-        var resp1: MessageBuffer
-        msgbuf_init(@resp1, @pt1[0], ASYNC_MAX_MSG)
+        var resp1: MessageBuffer = msgbuf_empty()
+        msgbuf_init(@resp1, @pt1)
         let last1: i32 = m7sp_scan_build_batch(@resp1, session)
         if last1 != 0
             session.scan_active = 2
@@ -1486,8 +1549,8 @@ fn enc_scan_continue(task: *Task, idx: i32, session: *M7SPSession) -> i32
         # Final SCAN_RESULT (has_more=0) has been delivered; emit the
         # trailing SCAN_END terminator.  Tiny message — header only.
         var pt2: [256]u8
-        var resp2: MessageBuffer
-        msgbuf_init(@resp2, @pt2[0], 256)
+        var resp2: MessageBuffer = msgbuf_empty()
+        msgbuf_init(@resp2, @pt2)
         build_scan_end(@resp2, session.scan_request_id)
         session.scan_active = 3
         let send_ret2: i32 = m7sp_send_encrypted(task, session, @pt2[0], msgbuf_len(@resp2))
@@ -1500,9 +1563,7 @@ fn enc_scan_continue(task: *Task, idx: i32, session: *M7SPSession) -> i32
         # SCAN_END acknowledged — tear down the iter and reset for the
         # next request on this keep-alive connection.
         print("  [async/enc] SCAN done - emitted {session.scan_total_emitted} doc(s)\n")
-        if session.scan_iter != 0
-            btree_iter_destroy(session.scan_iter as *BTreeIter)
-            session.scan_iter = 0
+        m7sp_scan_release(session)
         session.scan_active = 0
         session.scan_request_id = 0
         session.scan_max_results = 0
@@ -1611,14 +1672,15 @@ fn enc_dispatch(task: *Task, idx: i32, session: *M7SPSession) -> i32
     # ASYNC_MAX_MSG, the most any accepted frame holds.  Stack frame
     # is ~72 KiB (in + out); well within the 8 MiB process default.
     var plaintext_in: [36864]u8
-    let plaintext_len: i32 = cipher_decrypt_msg(session, m7sp_msg_bytes(task, session), session.msg_len, @plaintext_in[0], ASYNC_MAX_MSG)
+    let plaintext_len: i32 = cipher_decrypt_msg(session, m7sp_msg_bytes(task, session).as_ptr(), session.msg_len, @plaintext_in[0], ASYNC_MAX_MSG)
     if plaintext_len < 0
         print("  [async/enc] decrypt failed code={plaintext_len}\n")
         m7sp_session_destroy(idx)
         return 1
 
     var reader: MessageReader
-    let parse_rc: i32 = msgreader_init(@reader, @plaintext_in[0], plaintext_len)
+    let plaintext: [u8] = @plaintext_in
+    let parse_rc: i32 = msgreader_init(@reader, plaintext[0..plaintext_len])
     if parse_rc != PROTO_OK
         m7sp_session_destroy(idx)
         return 1
@@ -1629,8 +1691,8 @@ fn enc_dispatch(task: *Task, idx: i32, session: *M7SPSession) -> i32
     # Build the plaintext response (up to ASYNC_MAX_MSG); its frame
     # goes out from write_buf or big_send (m7sp_send_encrypted).
     var plaintext_out: [36864]u8
-    var resp: MessageBuffer
-    msgbuf_init(@resp, @plaintext_out[0], ASYNC_MAX_MSG)
+    var resp: MessageBuffer = msgbuf_empty()
+    msgbuf_init(@resp, @plaintext_out)
 
     m7sp_dispatch(@reader, @resp, session, msg_type, request_id)
 
@@ -1714,7 +1776,8 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
     g_pool = pool as i64
     g_storage = storage as i64
     g_collection = collection as i64
-    registry_init(@g_registry, pool, storage, collection)
+    var state: AsyncState = async_state_new(pool, storage, collection)
+    g_state = @state
 
     # Initialize session table — every slot starts free.
     for i in 0..SESSION_MAX
@@ -1728,7 +1791,8 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
         Some(s) => srv = s
         None =>
             prints("serve_async: task_server_create failed\n")
-            registry_destroy(@g_registry)
+            registry_destroy(@state.registry)
+            g_state = null
             return 1
 
     srv.pool.ring = @srv.ring
@@ -1743,7 +1807,8 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
     prints("Mausoleum (async): shutting down\n")
     shutdown_uninstall()
     srv.free()
-    registry_destroy(@g_registry)
+    registry_destroy(@state.registry)
+    g_state = null
     return ret
 
 
@@ -1758,7 +1823,8 @@ pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storag
     g_pool = pool as i64
     g_storage = storage as i64
     g_collection = collection as i64
-    registry_init(@g_registry, pool, storage, collection)
+    var state: AsyncState = async_state_new(pool, storage, collection)
+    g_state = @state
 
     for i in 0..SESSION_MAX
         g_sessions[i].in_use = 0
@@ -1770,7 +1836,8 @@ pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storag
         Some(s) => srv = s
         None =>
             prints("serve_async_encrypted: task_server_create failed\n")
-            registry_destroy(@g_registry)
+            registry_destroy(@state.registry)
+            g_state = null
             return 1
 
     srv.pool.ring = @srv.ring
@@ -1784,5 +1851,6 @@ pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storag
     prints("Mausoleum (async, encrypted): shutting down\n")
     shutdown_uninstall()
     srv.free()
-    registry_destroy(@g_registry)
+    registry_destroy(@state.registry)
+    g_state = null
     return ret

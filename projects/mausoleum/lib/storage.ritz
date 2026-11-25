@@ -30,7 +30,7 @@ import ritzlib.str
 import ritzlib.strview
 import ritzlib.string
 import ritzlib.span
-import ritzlib.memory
+import ritzlib.box
 import ritzlib.gvec
 import ritzlib.option
 
@@ -87,9 +87,9 @@ struct StorageMeta
 # ============================================================================
 
 struct Storage
-    pool: *BufferPool
-    wal_writer: *WalWriter
-    recovery_mgr: *RecoveryManager
+    pool: BufferPool
+    wal_writer: Box<WalWriter>              # empty if the WAL couldn't be made
+    recovery_mgr: Box<RecoveryManager>      # empty if none was made
 
     base_path: String
     base_path_len: i32
@@ -200,7 +200,7 @@ fn storage_meta_write(storage: *Storage) -> i32
 # Every collection's meta is now on disk: nothing is dirty.
 fn storage_meta_clean(storage: *Storage)
     storage.meta_dirty = 0
-    memset(storage.coll_dirty.as_ptr(), 0, MAX_COLLECTIONS as i64)
+    span_from_vec<u8>(@storage.coll_dirty).zero()
 
 # The table entry of collection `id`, or null.
 fn storage_entry(storage: *Storage, id: i32) -> *NamedCollectionMeta
@@ -234,71 +234,60 @@ fn storage_apply_recovered(storage: *Storage, rec: *NamedCollectionMeta) -> i32
     storage.meta.coll_count += 1
     return ERR_OK
 
-# Free what storage_open allocated, after a failure part-way through it.
-fn storage_open_fail(storage: *Storage)
-    # Raw memory doesn't drop its fields: release them before the block
-    storage.colls.deinit()
-    storage.coll_dirty.deinit()
-    storage.base_path.deinit()
-    free(storage as *u8)
-
 # ============================================================================
 # Storage Creation/Opening
 # ============================================================================
 
-# Open or create a storage directory
-pub fn storage_open(path: *u8) -> Option<*Storage>
-    if path == null
-        return None
-
-    let base: StrView = strview_from_cstr(path)
+# Open or create a storage directory. The Storage is boxed: its parts point
+# at each other (the recovery manager at the pool), so it must not move.
+pub fn storage_open(base: StrView) -> Option<Box<Storage>>
     let path_len: i64 = base.len
     if path_len <= 0 or path_len > 200
         return None
 
-    # Copy base path
-    let base_copy: String = string_from(base)
-    if base_copy.len() != path_len
+    # The collection table (AGAST #3637): MAX_COLLECTIONS entries, and a
+    # dirty flag for each.
+    var colls: Vec<NamedCollectionMeta> = vec_with_cap<NamedCollectionMeta>(MAX_COLLECTIONS as i64)
+    var coll_dirty: Vec<u8> = vec_with_cap<u8>(MAX_COLLECTIONS as i64)
+    if colls.cap() < MAX_COLLECTIONS as i64 or coll_dirty.cap() < MAX_COLLECTIONS as i64
         return None
+    for i in 0..MAX_COLLECTIONS
+        coll_dirty.push(0)
 
-    # Allocate storage structure
-    let storage: *Storage = malloc(sizeof(Storage)) as *Storage
-    if storage == null
+    var pool: BufferPool = match buffer_pool_new(DEFAULT_BUFFER_SIZE)
+        Some(p) => p
+        None => return None
+
+    # Every part with drop glue is set here; meta is read or made below.
+    var st: Storage
+    st.pool = pool
+    st.wal_writer = box_empty<WalWriter>()
+    st.recovery_mgr = box_empty<RecoveryManager>()
+    st.base_path = string_from(base)
+    st.base_path_len = path_len as i32
+    st.meta_fd = fd_adopt(-1)
+    st.colls = colls
+    st.coll_dirty = coll_dirty
+    st.current_txn = 0
+    st.meta_dirty = 0
+    st.current_lsn = 0
+    st.is_open = 0
+    var owner: Box<Storage> = box_new<Storage>(st)
+    if not owner.valid()
         return None
-    storage.base_path = base_copy
-    storage.base_path_len = path_len as i32
-
-    # The collection table (AGAST #3637).
-    storage.colls = vec_with_cap<NamedCollectionMeta>(MAX_COLLECTIONS as i64)
-    storage.coll_dirty = vec_with_cap<u8>(MAX_COLLECTIONS as i64)
-    if storage.colls.cap() < MAX_COLLECTIONS as i64 or storage.coll_dirty.cap() < MAX_COLLECTIONS as i64
-        storage_open_fail(storage)
-        return None
-
-    storage.pool = null
-    storage.wal_writer = null
-    storage.recovery_mgr = null
-    storage.meta_fd = fd_adopt(-1)
-    storage.current_txn = 0
-    storage.current_lsn = 0
-    storage_meta_clean(storage)
-    storage.is_open = 0
+    let storage: *Storage = owner.as_ptr()
 
     # Create the directory; it may already exist (Err(Exist) is fine).
     mkdir(base, 493)  # 0755
 
-    # Build paths (base is at most 200 bytes)
-    var data_path: [256]u8
-    var wal_path: [256]u8
-    var meta_path: [256]u8
-
-    m7m_path_join(@data_path, base, DATA_FILE_NAME)
-    m7m_path_join(@wal_path, base, WAL_FILE_NAME)
-    m7m_path_join(@meta_path, base, META_FILE_NAME)
+    # Build paths
+    let data_path: String = m7m_path_join(base, DATA_FILE_NAME)
+    let wal_path: String = m7m_path_join(base, WAL_FILE_NAME)
+    let meta_path: String = m7m_path_join(base, META_FILE_NAME)
 
     # Open or create meta file
     var is_new: i32 = 0
-    let meta_view: StrView = strview_from_cstr(@meta_path[0])
+    let meta_view: StrView = meta_path.as_view()
     var meta_fd: Fd = fd_adopt(-1)
     match fd_open(meta_view, O_RDWR, 0)
         Ok(f) => meta_fd = f
@@ -306,9 +295,7 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
             # Create new meta file
             match fd_open(meta_view, O_RDWR | O_CREAT, 420)
                 Ok(f) => meta_fd = f
-                Err(_) =>
-                    storage_open_fail(storage)
-                    return None
+                Err(_) => return None
             is_new = 1
 
     storage.meta_fd = meta_fd
@@ -317,58 +304,44 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
     if is_new != 0
         meta_init(@storage.meta, storage.colls.as_ptr())
         if storage_meta_write(storage) != ERR_OK
-            meta_fd.close()
-            storage_open_fail(storage)
             return None
     else
-        if meta_read(@meta_fd, @storage.meta, storage.colls.as_ptr()) != ERR_OK
-            meta_fd.close()
-            storage_open_fail(storage)
+        if meta_read(@storage.meta_fd, @storage.meta, storage.colls.as_ptr()) != ERR_OK
             return None
 
-    # Create buffer pool
-    let pool_opt: Option<*BufferPool> = buffer_pool_new(DEFAULT_BUFFER_SIZE)
-    if option_is_none<*BufferPool>(@pool_opt)
-        meta_fd.close()
-        storage_open_fail(storage)
-        return None
-    storage.pool = option_unwrap_or<*BufferPool>(@pool_opt, null)
     # The WAL is redo-only: no page may reach data.m7m before the WAL
     # commit that holds it (AGAST #4205).
-    buffer_pool_set_no_steal(storage.pool, 1)
+    buffer_pool_set_no_steal(@storage.pool, 1)
 
     # Open data file
-    let open_result: i32 = buffer_pool_open(storage.pool, @data_path[0])
-    if open_result != ERR_OK
-        buffer_pool_destroy(storage.pool)
-        meta_fd.close()
-        storage_open_fail(storage)
+    if buffer_pool_open(@storage.pool, data_path.as_view()) != ERR_OK
         return None
 
     # Recovery first: redo every committed WAL transaction onto its pages
     # and take each collection's meta from the last one that logged it.  A
     # WAL that cannot be read is not discarded: refuse to open instead.
-    storage.recovery_mgr = recovery_mgr_new(storage.pool, @wal_path[0])
-    if is_new == 0 and storage.recovery_mgr != null
-        var rc: i32 = recovery_recover(storage.recovery_mgr)
-        let n: i32 = recovery_collection_meta_count(storage.recovery_mgr)
+    match recovery_mgr_new(@storage.pool, wal_path.as_view())
+        Some(m) => storage.recovery_mgr = box_new<RecoveryManager>(m)
+        None => pass
+    let rmgr: *RecoveryManager = storage.recovery_mgr.as_ptr()
+    if is_new == 0 and rmgr != null
+        var rc: i32 = recovery_recover(rmgr)
+        let n: i32 = recovery_collection_meta_count(rmgr)
         var i: i32 = 0
         while rc == ERR_OK and i < n
             var recovered: NamedCollectionMeta
-            recovery_collection_meta_at(storage.recovery_mgr, i, @recovered)
+            recovery_collection_meta_at(rmgr, i, @recovered)
             rc = storage_apply_recovered(storage, @recovered)
             i += 1
         if rc != ERR_OK
-            recovery_mgr_destroy(storage.recovery_mgr)
-            buffer_pool_destroy(storage.pool)
-            meta_fd.close()
-            storage_open_fail(storage)
             return None
 
     # Create WAL writer
-    storage.wal_writer = wal_writer_new(@wal_path[0])
-    if storage.wal_writer != null
-        wal_writer_open(storage.wal_writer)
+    match wal_writer_new(wal_path.as_view())
+        Some(w) => storage.wal_writer = box_new<WalWriter>(w)
+        None => pass
+    if storage.wal_writer.valid()
+        wal_writer_open(storage.wal_writer.as_ptr())
 
     # Update last open time
     let now: M7mTimestamp = m7m_timestamp_now()
@@ -380,8 +353,8 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
 
     # The free pages (AGAST #3638) are the PAGE_MAGIC_FREE ones, now that
     # data.m7m holds every committed page: list them for reuse.
-    buffer_pool_reclaim_free_pages(storage.pool)
-    return Some(storage)
+    buffer_pool_reclaim_free_pages(@storage.pool)
+    return Some(owner)
 
 # Close storage
 pub fn storage_close(storage: *Storage) -> i32
@@ -398,19 +371,17 @@ pub fn storage_close(storage: *Storage) -> i32
     storage_checkpoint(storage)
 
     # Close WAL
-    if storage.wal_writer != null
-        wal_writer_destroy(storage.wal_writer)
-        storage.wal_writer = null
+    if storage.wal_writer.valid()
+        wal_writer_destroy(storage.wal_writer.as_ptr())
+        storage.wal_writer.drop()
 
     # Close buffer pool
-    if storage.pool != null
-        buffer_pool_destroy(storage.pool)
-        storage.pool = null
+    buffer_pool_destroy(@storage.pool)
 
     # Close recovery manager
-    if storage.recovery_mgr != null
-        recovery_mgr_destroy(storage.recovery_mgr)
-        storage.recovery_mgr = null
+    if storage.recovery_mgr.valid()
+        recovery_mgr_destroy(storage.recovery_mgr.as_ptr())
+        storage.recovery_mgr.drop()
 
     # Write final metadata
     if storage.meta_fd.valid()
@@ -423,7 +394,8 @@ pub fn storage_close(storage: *Storage) -> i32
     storage.is_open = 0
     return ERR_OK
 
-# Destroy storage (calls close if needed)
+# Close storage if it is open and release its tables. Its owner still drops
+# the (now empty) Box.
 pub fn storage_destroy(storage: *Storage)
     if storage == null
         return
@@ -431,10 +403,8 @@ pub fn storage_destroy(storage: *Storage)
     if storage.is_open != 0
         storage_close(storage)
 
-    # Raw memory doesn't drop its fields: release them before the block
     storage.colls.deinit()
     storage.coll_dirty.deinit()
-    free(storage as *u8)
 
 # ============================================================================
 # Buffer Pool Access
@@ -443,12 +413,12 @@ pub fn storage_destroy(storage: *Storage)
 pub fn storage_pool(storage: *Storage) -> *BufferPool
     if storage == null
         return null
-    return storage.pool
+    return @storage.pool
 
 pub fn storage_wal(storage: *Storage) -> *WalWriter
     if storage == null
         return null
-    return storage.wal_writer
+    return storage.wal_writer.as_ptr()
 
 # ============================================================================
 # Transaction Operations
@@ -467,8 +437,8 @@ pub fn storage_begin_txn(storage: *Storage) -> i64
     storage.current_txn = txn_id
 
     # Write BEGIN to WAL
-    if storage.wal_writer != null
-        storage.current_lsn = wal_write_begin(storage.wal_writer, txn_id)
+    if storage.wal_writer.valid()
+        storage.current_lsn = wal_write_begin(storage.wal_writer.as_ptr(), txn_id)
 
     return txn_id
 
@@ -481,8 +451,8 @@ pub fn storage_commit_txn(storage: *Storage) -> i32
         return ERR_INVALID  # No active transaction
 
     # Write COMMIT to WAL
-    if storage.wal_writer != null
-        wal_write_commit(storage.wal_writer, storage.current_txn, storage.current_lsn)
+    if storage.wal_writer.valid()
+        wal_write_commit(storage.wal_writer.as_ptr(), storage.current_txn, storage.current_lsn)
 
     storage.current_txn = 0
     storage.current_lsn = 0
@@ -497,8 +467,8 @@ pub fn storage_abort_txn(storage: *Storage) -> i32
         return ERR_INVALID  # No active transaction
 
     # Write ABORT to WAL
-    if storage.wal_writer != null
-        wal_write_abort(storage.wal_writer, storage.current_txn, storage.current_lsn)
+    if storage.wal_writer.valid()
+        wal_write_abort(storage.wal_writer.as_ptr(), storage.current_txn, storage.current_lsn)
 
     storage.current_txn = 0
     storage.current_lsn = 0
@@ -513,19 +483,19 @@ pub fn storage_alloc_page(storage: *Storage, page_type: i32) -> Option<*Page>
     if storage == null or storage.is_open == 0
         return None
 
-    let page_opt: Option<*Page> = buffer_pool_alloc(storage.pool, page_type)
+    let page_opt: Option<*Page> = buffer_pool_alloc(@storage.pool, page_type)
     if option_is_none<*Page>(@page_opt)
         return None
 
     let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
     # Log full page image to WAL for new pages
-    if storage.wal_writer != null and storage.current_txn != 0
-        let page_id: i64 = buffer_pool_page_id(storage.pool, page)
-        storage.current_lsn = wal_write_page(storage.wal_writer, storage.current_txn, storage.current_lsn, page_id, page)
+    if storage.wal_writer.valid() and storage.current_txn != 0
+        let page_id: i64 = buffer_pool_page_id(@storage.pool, page)
+        storage.current_lsn = wal_write_page(storage.wal_writer.as_ptr(), storage.current_txn, storage.current_lsn, page_id, page)
 
     # Update next_page_id in metadata
-    let page_id: i64 = buffer_pool_page_id(storage.pool, page)
+    let page_id: i64 = buffer_pool_page_id(@storage.pool, page)
     if page_id >= storage.meta.next_page_id
         storage.meta.next_page_id = page_id + 1
 
@@ -536,25 +506,25 @@ pub fn storage_fetch_page(storage: *Storage, page_id: i64) -> Option<*Page>
     if storage == null or storage.is_open == 0
         return None
 
-    return buffer_pool_fetch(storage.pool, page_id)
+    return buffer_pool_fetch(@storage.pool, page_id)
 
 # Mark a page as modified and log to WAL
 pub fn storage_mark_dirty(storage: *Storage, page: *Page)
     if storage == null or page == null or storage.is_open == 0
         return
 
-    let page_id: i64 = buffer_pool_page_id(storage.pool, page)
+    let page_id: i64 = buffer_pool_page_id(@storage.pool, page)
 
     # Log page modification to WAL
-    if storage.wal_writer != null and storage.current_txn != 0
-        storage.current_lsn = wal_write_page(storage.wal_writer, storage.current_txn, storage.current_lsn, page_id, page)
+    if storage.wal_writer.valid() and storage.current_txn != 0
+        storage.current_lsn = wal_write_page(storage.wal_writer.as_ptr(), storage.current_txn, storage.current_lsn, page_id, page)
 
 # Unpin a page
 pub fn storage_unpin_page(storage: *Storage, page_id: i64, dirty: i32)
     if storage == null or storage.is_open == 0
         return
 
-    buffer_pool_unpin(storage.pool, page_id, dirty)
+    buffer_pool_unpin(@storage.pool, page_id, dirty)
 
 # ============================================================================
 # Durability Operations
@@ -567,10 +537,10 @@ pub fn storage_unpin_page(storage: *Storage, page_id: i64, dirty: i32)
 pub fn storage_wal_commit(storage: *Storage) -> i32
     if storage == null or storage.is_open == 0
         return ERR_INVALID
-    let w: *WalWriter = storage.wal_writer
+    let w: *WalWriter = storage.wal_writer.as_ptr()
     if w == null
         return ERR_OK
-    if buffer_pool_dirty_count(storage.pool) == 0 and storage.meta_dirty == 0
+    if buffer_pool_dirty_count(@storage.pool) == 0 and storage.meta_dirty == 0
         return wal_writer_flush(w)
 
     let txn_id: i64 = storage.meta.next_txn_id
@@ -579,11 +549,11 @@ pub fn storage_wal_commit(storage: *Storage) -> i32
     var lsn: i64 = wal_write_begin(w, txn_id)
     if lsn < 0
         return ERR_IO
-    let frames: i32 = buffer_pool_num_frames(storage.pool)
+    let frames: i32 = buffer_pool_num_frames(@storage.pool)
     var i: i32 = 0
     while i < frames
         var page_id: i64 = INVALID_PAGE_ID
-        let page: *Page = buffer_pool_dirty_page(storage.pool, i, @page_id)
+        let page: *Page = buffer_pool_dirty_page(@storage.pool, i, @page_id)
         if page != null
             lsn = wal_write_page(w, txn_id, lsn, page_id, page)
             if lsn < 0
@@ -601,7 +571,7 @@ pub fn storage_wal_commit(storage: *Storage) -> i32
     if wal_write_commit(w, txn_id, lsn) < 0
         return ERR_IO
     # Committed: the dirty pages may be written back from now on.
-    buffer_pool_mark_logged(storage.pool)
+    buffer_pool_mark_logged(@storage.pool)
     return ERR_OK
 
 # Commit everything written so far: WAL first (write-ahead), then the dirty
@@ -615,7 +585,7 @@ pub fn storage_flush(storage: *Storage) -> i32
     if wal_result != ERR_OK
         return wal_result
 
-    let pool_result: i32 = buffer_pool_flush_all(storage.pool)
+    let pool_result: i32 = buffer_pool_flush_all(@storage.pool)
     if pool_result != ERR_OK
         return pool_result
 
@@ -625,7 +595,7 @@ pub fn storage_flush(storage: *Storage) -> i32
     storage_meta_clean(storage)
 
     # Everything logged so far is now in data.m7m; keep the WAL bounded.
-    if storage.wal_writer != null and wal_writer_size(storage.wal_writer) > WAL_CHECKPOINT_BYTES
+    if storage.wal_writer.valid() and wal_writer_size(storage.wal_writer.as_ptr()) > WAL_CHECKPOINT_BYTES
         return storage_checkpoint(storage)
     return ERR_OK
 
@@ -636,7 +606,7 @@ pub fn storage_checkpoint(storage: *Storage) -> i32
 
     # Write all dirty pages and the meta file directly: a checkpoint makes
     # the WAL redundant, so there is no point logging them first.
-    let flush_result: i32 = buffer_pool_flush_all(storage.pool)
+    let flush_result: i32 = buffer_pool_flush_all(@storage.pool)
     if flush_result != ERR_OK
         return flush_result
     let meta_result: i32 = storage_meta_write(storage)
@@ -645,9 +615,9 @@ pub fn storage_checkpoint(storage: *Storage) -> i32
     storage_meta_clean(storage)
 
     # Data and meta are on disk: drop the redo records, mark the checkpoint.
-    if storage.wal_writer != null
-        wal_writer_truncate(storage.wal_writer)
-        let lsn: i64 = wal_write_checkpoint(storage.wal_writer)
+    if storage.wal_writer.valid()
+        wal_writer_truncate(storage.wal_writer.as_ptr())
+        let lsn: i64 = wal_write_checkpoint(storage.wal_writer.as_ptr())
         if lsn > 0
             storage.meta.checkpoint_lsn = lsn
 
@@ -677,7 +647,7 @@ pub fn storage_is_open(storage: *Storage) -> i32
 pub fn storage_wal_size(storage: *Storage) -> i64
     if storage == null
         return 0
-    return wal_writer_size(storage.wal_writer)
+    return wal_writer_size(storage.wal_writer.as_ptr())
 
 # ============================================================================
 # Collection Metadata Persistence

@@ -16,7 +16,6 @@
 
 import ritzlib.sys
 import ritzlib.str
-import ritzlib.memory
 import ritzlib.gvec
 import ritzlib.strview
 import ritzlib.option
@@ -63,7 +62,7 @@ struct Index
     fields: [4]IndexField       # Fields in this index (MAX_INDEX_FIELDS)
     field_count: i32            # Number of fields
     flags: i32                  # INDEX_FLAG_*
-    tree: *BTree                # B-tree storing index entries
+    tree: BTree                 # B-tree storing index entries
     entry_count: i64            # Number of entries in index
 
 # ============================================================================
@@ -116,7 +115,7 @@ fn serialize_field_key(f: *Field, buf: Span<u8>) -> i32
 
     if f.ftype == FIELD_STRING or f.ftype == FIELD_BYTES
         # Length (2 bytes big-endian) + data
-        var len: i32 = f.len_val as i32
+        var len: i32 = f.bytes.len as i32
         if len > 1024
             len = 1024  # Cap at 1024 bytes for index keys
 
@@ -172,36 +171,35 @@ fn build_index_key(idx: *Index, doc: *Document, buf: Span<u8>) -> i32
 # IndexManager Creation
 # ============================================================================
 
-pub fn index_manager_new(pool: *BufferPool, col: *Collection) -> *IndexManager
-    if pool == null or col == null
-        return null
-
-    var mgr: *IndexManager = malloc(sizeof(IndexManager)) as *IndexManager
-    if mgr == null
-        return null
+# Set up the manager `mgr` (the caller's, e.g. a `var mgr: IndexManager`)
+# for collection `col`. ERR_INVALID for a null pool or collection.
+pub fn index_manager_init(mgr: *IndexManager, pool: *BufferPool, col: *Collection) -> i32
+    if mgr == null or pool == null or col == null
+        return ERR_INVALID
 
     mgr.pool = pool
     mgr.collection = col
     mgr.index_count = 0
     mgr.next_index_id = 1
-
-    # Zero out indexes array
-    memset(@mgr.indexes[0] as *u8, 0, (MAX_INDEXES * sizeof(Index)) as i64)
-
-    return mgr
+    for i in 0..MAX_INDEXES
+        let idx: *Index = @mgr.indexes[i]
+        idx.id = 0
+        idx.field_count = 0
+        idx.flags = 0
+        idx.tree = btree_closed()
+        idx.entry_count = 0
+    return ERR_OK
 
 pub fn index_manager_destroy(mgr: *IndexManager)
     if mgr == null
         return
 
-    # Destroy all index B-trees
+    # Close all index B-trees
     var i: i32 = 0
     while i < mgr.index_count
-        if mgr.indexes[i].tree != null
-            btree_destroy(mgr.indexes[i].tree)
+        btree_destroy(@mgr.indexes[i].tree)
         i = i + 1
-
-    free(mgr as *u8)
+    mgr.index_count = 0
 
 # ============================================================================
 # Index Creation
@@ -237,10 +235,9 @@ pub fn index_create(mgr: *IndexManager, name: StrView, field: StrView, unique: i
         idx.flags = idx.flags | INDEX_FLAG_UNIQUE
 
     # Create B-tree for index
-    let tree_opt = btree_create(mgr.pool)
-    idx.tree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if idx.tree == null
-        return ERR_NO_MEMORY
+    match btree_create(mgr.pool)
+        Some(t) => idx.tree = t
+        None => return ERR_NO_MEMORY
 
     idx.entry_count = 0
     mgr.index_count = mgr.index_count + 1
@@ -249,8 +246,7 @@ pub fn index_create(mgr: *IndexManager, name: StrView, field: StrView, unique: i
     var build_err: i32 = index_build(mgr, idx)
     if build_err != ERR_OK
         # Rollback
-        btree_destroy(idx.tree)
-        idx.tree = null
+        btree_destroy(@idx.tree)
         mgr.index_count = mgr.index_count - 1
         return build_err
 
@@ -296,10 +292,9 @@ pub fn index_create_composite(mgr: *IndexManager, name: StrView, fields: Span<St
         idx.flags = idx.flags | INDEX_FLAG_UNIQUE
 
     # Create B-tree for index
-    let tree_opt = btree_create(mgr.pool)
-    idx.tree = option_unwrap_or<*BTree>(@tree_opt, null)
-    if idx.tree == null
-        return ERR_NO_MEMORY
+    match btree_create(mgr.pool)
+        Some(t) => idx.tree = t
+        None => return ERR_NO_MEMORY
 
     idx.entry_count = 0
     mgr.index_count = mgr.index_count + 1
@@ -307,8 +302,7 @@ pub fn index_create_composite(mgr: *IndexManager, name: StrView, fields: Span<St
     # Build index from existing documents
     var build_err: i32 = index_build(mgr, idx)
     if build_err != ERR_OK
-        btree_destroy(idx.tree)
-        idx.tree = null
+        btree_destroy(@idx.tree)
         mgr.index_count = mgr.index_count - 1
         return build_err
 
@@ -317,25 +311,24 @@ pub fn index_create_composite(mgr: *IndexManager, name: StrView, fields: Span<St
 # Build index entries for all existing documents
 fn index_build(mgr: *IndexManager, idx: *Index) -> i32
     # Scan all documents in the collection
-    let iter_opt = btree_scan(mgr.collection.tree, null, 0, null, 0)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        return ERR_OK  # Empty collection is fine
-    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    var iter_v: BTreeIter = match collection_scan(mgr.collection)
+        Some(it) => it
+        None => return ERR_OK  # Empty collection is fine
+    let iter: *BTreeIter = @iter_v
 
     # One buffer for every document: any one may be up to MAX_DOC_SIZE.
-    var val_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let val: *u8 = val_vec.as_ptr()
-    if val == null
-        btree_iter_destroy(iter)
+    var val_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    if val_vec.len() < MAX_DOC_SIZE
         return ERR_NO_MEMORY
+    let val: [u8] = val_vec[0..MAX_DOC_SIZE]
 
     while btree_iter_valid(iter) != 0
         # Get document (resolving an overflow stub)
         var val_len: i64 = 0
         var doc: Document
-        var err: i32 = collection_iter_value(mgr.collection, iter, val, MAX_DOC_SIZE, @val_len)
+        var err: i32 = collection_iter_value(mgr.collection, iter, val, @val_len)
         if err == ERR_OK
-            err = doc_deserialize(val, val_len, @doc)
+            err = doc_deserialize(val[0..val_len], @doc)
         if err == ERR_OK
             # Build index key
             var key: [256]u8
@@ -345,9 +338,9 @@ fn index_build(mgr: *IndexManager, idx: *Index) -> i32
                 if (idx.flags & INDEX_FLAG_UNIQUE) != 0
                     var existing_val: [8]u8
                     var existing_len: i32 = 0
-                    var lookup: i32 = btree_get(idx.tree, @key[0], key_len, @existing_val[0], @existing_len)
+                    let k: [u8] = @key
+                    var lookup: i32 = btree_get(@idx.tree, k[0..key_len], @existing_val, @existing_len)
                     if lookup == ERR_OK
-                        btree_iter_destroy(iter)
                         return ERR_EXISTS  # Duplicate value
 
                 # Insert into index: key -> doc_id
@@ -355,13 +348,13 @@ fn index_build(mgr: *IndexManager, idx: *Index) -> i32
                 var doc_id_ptr: *i64 = @doc_id_bytes[0] as *i64
                 *doc_id_ptr = doc.id.value
 
-                err = btree_put(idx.tree, @key[0], key_len, @doc_id_bytes[0], 8)
+                let k: [u8] = @key
+                err = btree_put(@idx.tree, k[0..key_len], @doc_id_bytes)
                 if err == ERR_OK
                     idx.entry_count = idx.entry_count + 1
 
         btree_iter_next(iter)
 
-    btree_iter_destroy(iter)
     return ERR_OK
 
 # ============================================================================
@@ -385,8 +378,7 @@ pub fn index_drop(mgr: *IndexManager, name: StrView) -> i32
         return ERR_NOT_FOUND
 
     # Destroy B-tree
-    if mgr.indexes[idx_pos].tree != null
-        btree_destroy(mgr.indexes[idx_pos].tree)
+    btree_destroy(@mgr.indexes[idx_pos].tree)
 
     # Shift remaining indexes down
     i = idx_pos
@@ -439,8 +431,9 @@ pub fn index_insert_doc(mgr: *IndexManager, doc: *Document) -> i32
     if mgr == null or doc == null
         return ERR_INVALID
 
-    var i: i32 = 0
-    while i < mgr.index_count
+    # A `for`: the `continue` below must still move on (a `while` that
+    # bumped `i` at the bottom spun forever on a key it couldn't build).
+    for i in 0..mgr.index_count
         var idx: *Index = @mgr.indexes[i]
 
         # Build index key
@@ -448,12 +441,13 @@ pub fn index_insert_doc(mgr: *IndexManager, doc: *Document) -> i32
         var key_len: i32 = build_index_key(idx, doc, @key)
         if key_len <= 0
             continue
+        let k: [u8] = @key
 
         # Check uniqueness if required
         if (idx.flags & INDEX_FLAG_UNIQUE) != 0
             var existing_val: [8]u8
             var existing_len: i32 = 0
-            var lookup: i32 = btree_get(idx.tree, @key[0], key_len, @existing_val[0], @existing_len)
+            var lookup: i32 = btree_get(@idx.tree, k[0..key_len], @existing_val, @existing_len)
             if lookup == ERR_OK
                 return ERR_EXISTS
 
@@ -462,11 +456,9 @@ pub fn index_insert_doc(mgr: *IndexManager, doc: *Document) -> i32
         var doc_id_ptr: *i64 = @doc_id_bytes[0] as *i64
         *doc_id_ptr = doc.id.value
 
-        var err: i32 = btree_put(idx.tree, @key[0], key_len, @doc_id_bytes[0], 8)
+        var err: i32 = btree_put(@idx.tree, k[0..key_len], @doc_id_bytes)
         if err == ERR_OK
             idx.entry_count = idx.entry_count + 1
-
-        i = i + 1
 
     return ERR_OK
 
@@ -475,8 +467,7 @@ pub fn index_delete_doc(mgr: *IndexManager, doc: *Document) -> i32
     if mgr == null or doc == null
         return ERR_INVALID
 
-    var i: i32 = 0
-    while i < mgr.index_count
+    for i in 0..mgr.index_count
         var idx: *Index = @mgr.indexes[i]
 
         # Build index key
@@ -486,11 +477,10 @@ pub fn index_delete_doc(mgr: *IndexManager, doc: *Document) -> i32
             continue
 
         # Delete from index
-        var err: i32 = btree_delete(idx.tree, @key[0], key_len)
+        let k: [u8] = @key
+        var err: i32 = btree_delete(@idx.tree, k[0..key_len])
         if err == ERR_OK
             idx.entry_count = idx.entry_count - 1
-
-        i = i + 1
 
     return ERR_OK
 
@@ -537,7 +527,7 @@ pub fn index_field_count(idx: *Index) -> i32
 
 # Scan an index for a specific value
 # Returns iterator positioned at first matching entry
-pub fn index_scan_eq(idx: *Index, value: *Field) -> Option<*BTreeIter>
+pub fn index_scan_eq(idx: *Index, value: *Field) -> Option<BTreeIter>
     if idx == null or value == null
         return None
 
@@ -547,10 +537,11 @@ pub fn index_scan_eq(idx: *Index, value: *Field) -> Option<*BTreeIter>
     if key_len <= 0
         return None
 
-    return btree_scan(idx.tree, @key[0], key_len, null, 0)
+    let k: [u8] = @key
+    return btree_scan(@idx.tree, k[0..key_len], "")
 
 # Scan an index for a range of values
-pub fn index_scan_range(idx: *Index, start: *Field, end: *Field) -> Option<*BTreeIter>
+pub fn index_scan_range(idx: *Index, start: *Field, end: *Field) -> Option<BTreeIter>
     if idx == null
         return None
 
@@ -569,14 +560,9 @@ pub fn index_scan_range(idx: *Index, start: *Field, end: *Field) -> Option<*BTre
         if end_len < 0
             end_len = 0
 
-    var start_ptr: *u8 = null
-    var end_ptr: *u8 = null
-    if start_len > 0
-        start_ptr = @start_key[0]
-    if end_len > 0
-        end_ptr = @end_key[0]
-
-    return btree_scan(idx.tree, start_ptr, start_len, end_ptr, end_len)
+    let start_s: [u8] = @start_key
+    let end_s: [u8] = @end_key
+    return btree_scan(@idx.tree, start_s[0..start_len], end_s[0..end_len])
 
 # Get document ID from current iterator position
 pub fn index_iter_doc_id(iter: *BTreeIter) -> DocumentId
@@ -588,7 +574,7 @@ pub fn index_iter_doc_id(iter: *BTreeIter) -> DocumentId
 
     var val: [8]u8
     var val_len: i32 = 0
-    btree_iter_value(iter, @val[0], @val_len)
+    btree_iter_value(iter, @val, @val_len)
 
     if val_len == 8
         var id_ptr: *i64 = @val[0] as *i64

@@ -12,7 +12,7 @@
 # Usage:
 #
 #   # Initialize database connection
-#   var db: Db
+#   var db: Db = db_empty()
 #   db_init(@db, "127.0.0.1", 7777, "my_collection")
 #
 #   # Insert a document
@@ -34,6 +34,8 @@ import ritzlib.str
 import ritzlib.memory
 import ritzlib.io
 import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.span
+import ritzlib.box
 
 import mausoleum.client { Client, client_new, client_free }
 import mausoleum.client { client_connect, client_connect_encrypted, client_disconnect, client_is_connected }
@@ -54,7 +56,7 @@ import mausoleum.collection { doc_serialize, doc_deserialize }
 # ============================================================================
 
 pub struct Db
-    client: *Client
+    client: Box<Client>   # empty while not connected
     connected: i32
     host: [64]u8
     host_len: i32
@@ -67,9 +69,21 @@ pub struct Db
                           # use db_set_encryption(@db, 0) to override for a
                           # mausoleum running with --no-encryption.
 
+# A Db with no connection settings yet: what `var db: Db` starts as, before
+# db_init.
+pub fn db_empty() -> Db
+    var db: Db
+    db.client = box_empty<Client>()
+    db.connected = 0
+    db.host_len = 0
+    db.port = 0
+    db.collection_len = 0
+    db.encrypted = 1
+    return db
+
 # Initialize a database connection
 pub fn db_init(db: *Db, host: *u8, host_len: i32, port: i32, collection: *u8, collection_len: i32) -> i32
-    db.client = null
+    db.client.drop()
     db.connected = 0
     db.port = port
     # Default to encrypted — matches mausoleum's default serve mode.
@@ -111,18 +125,18 @@ pub fn db_connect(db: *Db) -> i32
         return 0  # Already connected
 
     db.client = client_new()
-    if db.client == null
+    if not db.client.valid()
         return -1
 
     var result: i32 = 0
     if db.encrypted != 0
-        result = client_connect_encrypted(db.client, strview_from_ptr(@db.host[0], db.host_len as i64), db.port, strview_from_ptr(@db.collection[0], db.collection_len as i64))
+        result = client_connect_encrypted(db.client.as_ptr(), strview_from_ptr(@db.host[0], db.host_len as i64), db.port, strview_from_ptr(@db.collection[0], db.collection_len as i64))
     else
-        result = client_connect(db.client, strview_from_ptr(@db.host[0], db.host_len as i64), db.port, strview_from_ptr(@db.collection[0], db.collection_len as i64))
+        result = client_connect(db.client.as_ptr(), strview_from_ptr(@db.host[0], db.host_len as i64), db.port, strview_from_ptr(@db.collection[0], db.collection_len as i64))
 
     if result < 0
-        client_free(db.client)
-        db.client = null
+        client_free(db.client.as_ptr())
+        db.client.drop()
         return result
 
     db.connected = 1
@@ -130,11 +144,11 @@ pub fn db_connect(db: *Db) -> i32
 
 # Close the database connection
 pub fn db_close(db: *Db)
-    if db.client != null
+    if db.client.valid()
         if db.connected != 0
-            client_disconnect(db.client)
-        client_free(db.client)
-        db.client = null
+            client_disconnect(db.client.as_ptr())
+        client_free(db.client.as_ptr())
+        db.client.drop()
     db.connected = 0
 
 # Check if connected
@@ -149,21 +163,26 @@ pub fn db_is_connected(db: *Db) -> i32
 pub fn db_insert(db: *Db, data: *u8, data_len: i32) -> i64
     if db.connected == 0
         return -1
-    return client_insert(db.client, data, data_len)
+    # spire's API is still a raw pair (its own port, AGAST #4692)
+    return client_insert(db.client.as_ptr(), Span<u8> { ptr: data, len: data_len as i64 })
 
 # Get raw document data by ID
 # Returns 1 if found, 0 if not found, < 0 on error
 pub fn db_get(db: *Db, doc_id: i64, data_out: **u8, len_out: *i32) -> i32
     if db.connected == 0
         return -1
-    return client_get(db.client, doc_id, data_out, len_out)
+    var doc: [u8] = span_empty<u8>()
+    let rc: i32 = client_get(db.client.as_ptr(), doc_id, @doc)
+    *data_out = doc.as_ptr()
+    *len_out = doc.len as i32
+    return rc
 
 # Delete a document by ID
 # Returns 1 if deleted, 0 if not found, < 0 on error
 pub fn db_delete(db: *Db, doc_id: i64) -> i32
     if db.connected == 0
         return -1
-    return client_delete(db.client, doc_id)
+    return client_delete(db.client.as_ptr(), doc_id)
 
 # Scan all documents with a callback
 # callback: fn(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
@@ -172,7 +191,19 @@ pub fn db_delete(db: *Db, doc_id: i64) -> i32
 pub fn db_scan(db: *Db, callback: *u8, user_data: *u8) -> i32
     if db.connected == 0
         return -1
-    return client_scan(db.client, callback, user_data)
+    var fwd: ScanForward = ScanForward { callback: callback, user_data: user_data }
+    return client_scan(db.client.as_ptr(), scan_forward as *u8, @fwd as *u8)
+
+# db_scan's callback and its user_data, behind client_scan's: client_scan
+# hands each document over as a [u8], db_scan's callers take (ptr, len).
+struct ScanForward
+    callback: *u8
+    user_data: *u8
+
+fn scan_forward(doc_id: i64, doc: [u8], user: *u8) -> i32
+    let fwd: *ScanForward = user as *ScanForward
+    let cb: fn(i64, *u8, i32, *u8) -> i32 = fwd.callback as fn(i64, *u8, i32, *u8) -> i32
+    return cb(doc_id, doc.as_ptr(), doc.len as i32, fwd.user_data)
 
 # ============================================================================
 # Secondary indexes
@@ -190,11 +221,11 @@ pub const DB_REFUSED: i32 = -1001
 pub fn db_index_create(db: *Db, field: *u8, field_len: i32) -> i32
     if db.connected == 0
         return -1
-    let rc: i32 = client_index_create(db.client, field, field_len)
+    let rc: i32 = client_index_create(db.client.as_ptr(), Span<u8> { ptr: field, len: field_len as i64 })
     if rc == -4
         # The server answered with an error.  An old server does not know
         # MSG_INDEX_CREATE and says so; that is permanent, not transient.
-        if client_last_error(db.client) == PROTO_ERR_INVALID_MSG_TYPE
+        if client_last_error(db.client.as_ptr()) == PROTO_ERR_INVALID_MSG_TYPE
             return DB_REFUSED
     return rc
 
@@ -204,9 +235,11 @@ pub fn db_index_create(db: *Db, field: *u8, field_len: i32) -> i32
 pub fn db_find_ids(db: *Db, field: *u8, field_len: i32, value: *u8, value_len: i32, out: *i64, max: i32) -> i32
     if db.connected == 0
         return -1
-    let rc: i32 = client_find(db.client, field, field_len, value, value_len, out, max)
+    if value_len < 0
+        return -4
+    let rc: i32 = client_find(db.client.as_ptr(), Span<u8> { ptr: field, len: field_len as i64 }, Span<u8> { ptr: value, len: value_len as i64 }, out, max)
     if rc == -4
-        let err: i32 = client_last_error(db.client)
+        let err: i32 = client_last_error(db.client.as_ptr())
         if err == PROTO_ERR_NO_INDEX or err == PROTO_ERR_INVALID_MSG_TYPE
             return DB_REFUSED
     return rc
@@ -225,12 +258,12 @@ pub fn db_serialize_doc(buf: *u8, buf_len: i64, fields: *DbField, field_count: i
 
     for i in 0..field_count
         let f: *DbField = fields + i
-        var field: Field = field_string(f.value, f.value_len as i64)
+        var field: Field = field_string(StrView { ptr: f.value, len: f.value_len as i64 })
         # Create StrView for key
         let key_sv: StrView = strview_from_ptr(f.key, f.key_len as i64)
         doc_set_field(@doc, key_sv, @field)
 
-    return doc_serialize(@doc, buf, buf_len)
+    return doc_serialize(@doc, Span<u8> { ptr: buf, len: buf_len })
 
 # Field descriptor for serialization
 pub struct DbField
@@ -252,7 +285,7 @@ pub fn db_field(key: *u8, key_len: i32, value: *u8, value_len: i32) -> DbField
 # Returns field length, or < 0 if not found
 pub fn db_extract_field(data: *u8, data_len: i32, field_name: *u8, field_name_len: i32, out_value: *u8, max_len: i32) -> i32
     var doc: Document
-    let result: i32 = doc_deserialize(data, data_len as i64, @doc)
+    let result: i32 = doc_deserialize(Span<u8> { ptr: data, len: data_len as i64 }, @doc)
     if result != ERR_OK
         return -1
 
@@ -266,9 +299,9 @@ pub fn db_extract_field(data: *u8, data_len: i32, field_name: *u8, field_name_le
     if field.ftype != FIELD_STRING
         return -3
 
-    var len: i32 = field.len_val as i32
+    var len: i32 = field.bytes.len as i32
     if len > max_len
         len = max_len
 
-    memcpy(out_value, field.ptr_val, len as i64)
+    memcpy(out_value, field.bytes.as_ptr(), len as i64)
     return len

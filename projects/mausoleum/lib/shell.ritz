@@ -97,7 +97,9 @@ fn line_take(r: *LineReader, stop: i32, next: i32, max: i64) -> StrView
         len -= 1
     if len > max
         len = max
-    let line: StrView = strview_from_ptr(@r.buf[r.start], len)
+    let bytes: [u8] = @r.buf
+    let line_bytes: [u8] = bytes[r.start as i64..r.start as i64 + len]
+    let line: StrView = line_bytes.as_strview()
     r.start = next
     return line
 
@@ -176,11 +178,11 @@ pub fn shell_build_doc(line: StrView, pos: i32, doc: *Document) -> i32
         var iv: i64 = 0
         if val.len >= 2 and val.get(0) == 34 and val.get(val.len - 1) == 34
             let inner: StrView = val.slice(1, val.len - 1)
-            field = field_string(inner.ptr, inner.len)
+            field = field_string(inner)
         else if parse_int_value(val, @iv) == 1
             field = field_int(iv)
         else
-            field = field_string(val.ptr, val.len)
+            field = field_string(val)
 
         let rc: i32 = doc_set_field(doc, tok.take(eq), @field)
         if rc == ERR_FULL
@@ -241,12 +243,12 @@ fn print_field_value(f: *Field, one_line: i32)
 
 # Print a serialized document: "<id> key=value ..." on one line, or the id
 # then "  key = value" per line.
-pub fn shell_print_doc(id: i64, data: *u8, len: i32, one_line: i32)
+pub fn shell_print_doc(id: i64, data: [u8], one_line: i32)
     var doc: Document
     print_i64(id)
-    if doc_deserialize(data, len as i64, @doc) != ERR_OK
+    if doc_deserialize(data, @doc) != ERR_OK
         prints("  <undecodable document, ")
-        print_i64(len as i64)
+        print_i64(data.len)
         prints(" bytes>\n")
         return
     if one_line == 0
@@ -266,8 +268,8 @@ pub fn shell_print_doc(id: i64, data: *u8, len: i32, one_line: i32)
     if one_line != 0
         prints("\n")
 
-fn shell_list_cb(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
-    shell_print_doc(doc_id, data, len, 1)
+fn shell_list_cb(doc_id: i64, data: [u8], user: *u8) -> i32
+    shell_print_doc(doc_id, data, 1)
     return 0
 
 # ============================================================================
@@ -361,12 +363,13 @@ pub fn shell_run(client: *Client, input: Fd) -> i32
                 failures += 1
             else
                 var buf: [8192]u8
-                let size: i64 = doc_serialize(@doc, @buf[0], SHELL_DOC_BUF)
+                let size: i64 = doc_serialize(@doc, @buf)
                 if size < 0
                     prints("Error: document too large\n")
                     failures += 1
                 else
-                    let id: i64 = client_insert(client, @buf[0], size as i32)
+                    let serialized: [u8] = @buf
+                    let id: i64 = client_insert(client, serialized[0..size])
                     if id < 0
                         report_error("put failed", client)
                         failures += 1
@@ -380,11 +383,10 @@ pub fn shell_run(client: *Client, input: Fd) -> i32
             if id_arg(lp, @pos, "get", @id) == 0
                 failures += 1
             else
-                var data: *u8 = null
-                var dlen: i32 = 0
-                let rc: i32 = client_get(client, id, @data, @dlen)
+                var data: [u8] = span_empty<u8>()
+                let rc: i32 = client_get(client, id, @data)
                 if rc == 1
-                    shell_print_doc(id, data, dlen, 0)
+                    shell_print_doc(id, data, 0)
                 else if rc == 0
                     prints("not found: ")
                     print_i64(id)

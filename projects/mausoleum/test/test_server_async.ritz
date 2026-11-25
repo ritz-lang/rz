@@ -7,10 +7,10 @@
 import ritzlib.sys
 import ritzlib.result
 import ritzlib.fd
-import ritzlib.span { span_from_ptr }
+import ritzlib.span
+import ritzlib.box
 
 import lib.server_async
-import ritzlib.memory
 import ritzlib.gvec
 import ritzlib.option
 import lib.m7m_types
@@ -23,6 +23,10 @@ import cryptosec.random
 import ritzlib.str
 import ritzlib.uring
 import ritzlib.async.tasks
+
+# The first n bytes of buffer `b`.
+fn head(b: [u8], n: i64) -> [u8]
+    return b[0..n]
 
 fn sa_all_zero(p: *u8, n: i32) -> i32
     var i: i32 = 0
@@ -77,44 +81,51 @@ fn test_async_handshake_accepts_valid_client_key() -> i32
 # than an internal error, on INSERT and UPDATE alike.
 
 
-fn sa_collection(col: *Collection) -> i32
-    let pool_opt = buffer_pool_new(128)
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+# The pool the test's collection lives in (empty if out of memory).
+fn sa_pool() -> Box<BufferPool>
+    match buffer_pool_new(128)
+        Some(p) => return box_new<BufferPool>(p)
+        None => return box_empty<BufferPool>()
+
+fn sa_collection(col: *Collection, pool: *BufferPool) -> i32
     if pool == null
         return -1
     return collection_init(col, pool, 1)
 
 # Serialize a one-string-field document of exactly `size` bytes into buf;
 # `id` (an existing document's, for UPDATE) or the invalid id.
-fn sa_sized_doc(size: i64, id: i64, payload: *u8, buf: *u8, cap: i64) -> i64
-    memset(payload, 122, size - 69)
+fn sa_sized_doc(size: i64, id: i64, payload: [u8], buf: [u8]) -> i64
+    let text: [u8] = payload[0..size - 69]
+    text.fill(122)
     var doc: Document
     var doc_id: DocumentId = doc_id_invalid()
     doc_id.value = id
     doc_init(@doc, @doc_id)
-    var f: Field = field_string(payload, size - 69)
+    var f: Field = field_string(text.as_strview())
     doc_set_field(@doc, "c", @f)
-    return doc_serialize(@doc, buf, cap)
+    return doc_serialize(@doc, buf)
 
 # Run one INSERT (update == 0) or UPDATE carrying `doc` through the handler;
 # returns the response type, with the error code in *code for MSG_ERROR.
-fn sa_write(col: *Collection, update: i32, doc: *u8, doc_len: i32, code: *i32) -> i32
-    let req: *MessageBuffer = msgbuf_new(ASYNC_MAX_MSG)
-    let resp: *MessageBuffer = msgbuf_new(ASYNC_MAX_MSG)
+fn sa_write(col: *Collection, update: i32, doc: [u8], code: *i32) -> i32
+    var req_v: MessageBuffer = msgbuf_new(ASYNC_MAX_MSG)
+    var resp_v: MessageBuffer = msgbuf_new(ASYNC_MAX_MSG)
+    let req: *MessageBuffer = @req_v
+    let resp: *MessageBuffer = @resp_v
     var msg_type: i32 = MSG_INSERT
     if update != 0
         msg_type = MSG_UPDATE
     msgbuf_start(req, msg_type, 1)
-    msgbuf_write_bytes(req, doc, doc_len)
+    msgbuf_write_bytes(req, doc)
     msgbuf_finish(req)
     var reader: MessageReader
-    msgreader_init(@reader, msgbuf_data(req), msgbuf_len(req))
+    msgreader_init(@reader, msgbuf_bytes(req))
     if update != 0
         async_handle_update(@reader, resp, 1, col)
     else
         async_handle_insert(@reader, resp, 1, col)
     var out: MessageReader
-    msgreader_init(@out, msgbuf_data(resp), msgbuf_len(resp))
+    msgreader_init(@out, msgbuf_bytes(resp))
     let t: i32 = msgreader_msg_type(@out)
     *code = 0
     if t == MSG_ERROR
@@ -125,56 +136,59 @@ fn sa_write(col: *Collection, update: i32, doc: *u8, doc_len: i32, code: *i32) -
 
 [[test]]
 fn test_async_insert_takes_a_max_size_doc() -> i32
-    var col: Collection
-    assert sa_collection(@col) == ERR_OK
-    var payload_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE + 1)
-    let payload: *u8 = payload_vec.as_ptr()
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE + 1)
-    let buf: *u8 = buf_vec.as_ptr()
-    let n: i64 = sa_sized_doc(MAX_DOC_SIZE, -1, payload, buf, MAX_DOC_SIZE + 1)
+    var pool_owner: Box<BufferPool> = sa_pool()
+    var col: Collection = collection_empty()
+    assert sa_collection(@col, pool_owner.as_ptr()) == ERR_OK
+    var payload_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE + 1)
+    let payload: [u8] = payload_vec[0..payload_vec.len()]
+    var buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE + 1)
+    let buf: [u8] = buf_vec[0..buf_vec.len()]
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE, -1, payload, buf)
     assert n == MAX_DOC_SIZE
     var code: i32 = 0
-    assert sa_write(@col, 0, buf, n as i32, @code) == MSG_INSERT_OK
+    assert sa_write(@col, 0, head(buf, n), @code) == MSG_INSERT_OK
     assert collection_count(@col) == 1
     0
 
 [[test]]
 fn test_async_insert_refuses_an_oversize_doc_as_too_large() -> i32
-    var col: Collection
-    assert sa_collection(@col) == ERR_OK
-    var payload_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE + 1)
-    let payload: *u8 = payload_vec.as_ptr()
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE + 1)
-    let buf: *u8 = buf_vec.as_ptr()
-    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, -1, payload, buf, MAX_DOC_SIZE + 1)
+    var pool_owner: Box<BufferPool> = sa_pool()
+    var col: Collection = collection_empty()
+    assert sa_collection(@col, pool_owner.as_ptr()) == ERR_OK
+    var payload_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE + 1)
+    let payload: [u8] = payload_vec[0..payload_vec.len()]
+    var buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE + 1)
+    let buf: [u8] = buf_vec[0..buf_vec.len()]
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, -1, payload, buf)
     var code: i32 = 0
-    assert sa_write(@col, 0, buf, n as i32, @code) == MSG_ERROR
+    assert sa_write(@col, 0, head(buf, n), @code) == MSG_ERROR
     assert code == PROTO_ERR_DOCUMENT_TOO_LARGE
     assert collection_count(@col) == 0
     0
 
 [[test]]
 fn test_async_update_refuses_an_oversize_doc_as_too_large() -> i32
-    var col: Collection
-    assert sa_collection(@col) == ERR_OK
-    var payload_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE + 1)
-    let payload: *u8 = payload_vec.as_ptr()
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE + 1)
-    let buf: *u8 = buf_vec.as_ptr()
-    var small: i64 = sa_sized_doc(100, -1, payload, buf, MAX_DOC_SIZE + 1)
+    var pool_owner: Box<BufferPool> = sa_pool()
+    var col: Collection = collection_empty()
+    assert sa_collection(@col, pool_owner.as_ptr()) == ERR_OK
+    var payload_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE + 1)
+    let payload: [u8] = payload_vec[0..payload_vec.len()]
+    var buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE + 1)
+    let buf: [u8] = buf_vec[0..buf_vec.len()]
+    var small: i64 = sa_sized_doc(100, -1, payload, buf)
     var id: DocumentId
     var doc: Document
-    assert doc_deserialize(buf, small, @doc) == ERR_OK
+    assert doc_deserialize(head(buf, small), @doc) == ERR_OK
     assert collection_insert(@col, @doc, @id) == ERR_OK
 
-    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, id.value, payload, buf, MAX_DOC_SIZE + 1)
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, id.value, payload, buf)
     var code: i32 = 0
-    assert sa_write(@col, 1, buf, n as i32, @code) == MSG_ERROR
+    assert sa_write(@col, 1, head(buf, n), @code) == MSG_ERROR
     assert code == PROTO_ERR_DOCUMENT_TOO_LARGE
 
     # Control: an update at the limit is fine.
-    let ok: i64 = sa_sized_doc(MAX_DOC_SIZE, id.value, payload, buf, MAX_DOC_SIZE + 1)
-    assert sa_write(@col, 1, buf, ok as i32, @code) == MSG_UPDATE_OK
+    let ok: i64 = sa_sized_doc(MAX_DOC_SIZE, id.value, payload, buf)
+    assert sa_write(@col, 1, head(buf, ok), @code) == MSG_UPDATE_OK
     0
 
 
@@ -193,34 +207,38 @@ fn test_async_max_msg_holds_a_max_size_doc() -> i32
 # A GET of a document over the 8 KiB task buffer answers with all of it.
 [[test]]
 fn test_async_get_returns_a_max_size_doc() -> i32
-    var col: Collection
-    assert sa_collection(@col) == ERR_OK
-    var payload_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let payload: *u8 = payload_vec.as_ptr()
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let buf: *u8 = buf_vec.as_ptr()
-    let n: i64 = sa_sized_doc(MAX_DOC_SIZE, -1, payload, buf, MAX_DOC_SIZE)
+    var pool_owner: Box<BufferPool> = sa_pool()
+    var col: Collection = collection_empty()
+    assert sa_collection(@col, pool_owner.as_ptr()) == ERR_OK
+    var payload_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    let payload: [u8] = payload_vec[0..payload_vec.len()]
+    var buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    let buf: [u8] = buf_vec[0..buf_vec.len()]
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE, -1, payload, buf)
     var doc: Document
-    assert doc_deserialize(buf, n, @doc) == ERR_OK
+    assert doc_deserialize(head(buf, n), @doc) == ERR_OK
     var id: DocumentId
     assert collection_insert(@col, @doc, @id) == ERR_OK
 
-    let req: *MessageBuffer = msgbuf_new(64)
-    let resp: *MessageBuffer = msgbuf_new(ASYNC_MAX_MSG)
+    var req_v: MessageBuffer = msgbuf_new(64)
+    var resp_v: MessageBuffer = msgbuf_new(ASYNC_MAX_MSG)
+    let req: *MessageBuffer = @req_v
+    let resp: *MessageBuffer = @resp_v
     msgbuf_start(req, MSG_GET, 1)
     msgbuf_write_i64(req, id.value)
     msgbuf_finish(req)
     var reader: MessageReader
-    msgreader_init(@reader, msgbuf_data(req), msgbuf_len(req))
+    msgreader_init(@reader, msgbuf_bytes(req))
     async_handle_get(@reader, resp, 1, @col)
     var out: MessageReader
-    msgreader_init(@out, msgbuf_data(resp), msgbuf_len(resp))
+    msgreader_init(@out, msgbuf_bytes(resp))
     assert msgreader_msg_type(@out) == MSG_GET_OK
-    var len: i32 = 0
-    let data: *u8 = msgreader_read_bytes(@out, @len)
-    assert len as i64 == MAX_DOC_SIZE
+    let data: [u8] = msgreader_read_bytes(@out).unwrap_or(span_empty<u8>())
+    assert data.len == MAX_DOC_SIZE
     # The id was assigned on insert; everything after it is as sent.
-    assert memcmp(data + 12, buf + 12, MAX_DOC_SIZE - 12) == 0
+    let got_tail: [u8] = data[12..MAX_DOC_SIZE]
+    let sent_tail: [u8] = buf[12..MAX_DOC_SIZE]
+    assert got_tail.eq(@sent_tail)
     0
 
 # ============================================================================
@@ -241,11 +259,11 @@ const SA_SHORT: i32 = 5000
 fn sa_read_all(fd: i32, out: *u8, want: i32) -> i32
     var got: i32 = 0
     while got < want
-        var pfd: PollFd
-        pfd.fd = fd
-        pfd.events = POLLIN
-        pfd.revents = 0
-        match poll(span_from_ptr<PollFd>(@pfd, 1), 2000)
+        var pfd: [1]PollFd
+        pfd[0].fd = fd
+        pfd[0].events = POLLIN
+        pfd[0].revents = 0
+        match poll(@pfd, 2000)
             Ok(n) =>
                 if n <= 0
                     return got
@@ -273,14 +291,14 @@ fn test_async_short_send_resubmits_the_rest() -> i32
     task.fd = sv[0]
     task.user_data = pool as *u8
 
-    var reply_vec: Vec<u8> = vec_with_cap<u8>(SA_REPLY_LEN as i64)
-    let reply: *u8 = reply_vec.as_ptr()
+    var reply_vec: Vec<u8> = m7m_scratch(SA_REPLY_LEN as i64)
+    let reply: [u8] = reply_vec[0..reply_vec.len()]
     var i: i32 = 0
     while i < SA_REPLY_LEN
         reply[i] = ((i * 7 + i / 251) & 255) as u8
         i += 1
     let s: *M7SPSession = m7sp_session_at(9)
-    s.send_ptr = reply as i64
+    s.send_ptr = reply.as_ptr() as i64
     s.send_len = SA_REPLY_LEN
     s.send_pos = 0
 
@@ -296,10 +314,12 @@ fn test_async_short_send_resubmits_the_rest() -> i32
             assert false
 
     let rest: i32 = SA_REPLY_LEN - SA_SHORT
-    var got_vec: Vec<u8> = vec_with_cap<u8>(SA_REPLY_LEN as i64)
-    let got: *u8 = got_vec.as_ptr()
-    assert sa_read_all(sv[1], got, rest) == rest
-    assert memcmp(got, reply + SA_SHORT as i64, rest as i64) == 0
+    var got_vec: Vec<u8> = m7m_scratch(SA_REPLY_LEN as i64)
+    let got: [u8] = got_vec[0..got_vec.len()]
+    assert sa_read_all(sv[1], got.as_ptr(), rest) == rest
+    let got_rest: [u8] = got[0..rest]
+    let sent_rest: [u8] = reply[SA_SHORT..SA_REPLY_LEN]
+    assert got_rest.eq(@sent_rest)
 
     let cqe: @IoUringCqe = match ring.wait_cqe()
         Some(c) => c
@@ -316,11 +336,11 @@ fn test_async_short_send_resubmits_the_rest() -> i32
             assert n == 0
         Err(_) =>
             assert false
-    var pfd: PollFd
-    pfd.fd = sv[1]
-    pfd.events = POLLIN
-    pfd.revents = 0
-    match poll(span_from_ptr<PollFd>(@pfd, 1), 100)
+    var pfd: [1]PollFd
+    pfd[0].fd = sv[1]
+    pfd[0].events = POLLIN
+    pfd[0].revents = 0
+    match poll(@pfd, 100)
         Ok(n) =>
             assert n == 0
         Err(_) =>

@@ -40,7 +40,6 @@ PINS = {
     "goliath": 25,
     "indium": 16,
     "lexis": 6,
-    "mausoleum": 40,
     "nexus": 6,
     "prism": 3,
     "ritz-lsp": 13,

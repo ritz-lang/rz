@@ -23,9 +23,10 @@ import ritzlib.process { fork, try_wait_pid, wait_pid, kill, process_id }
 import ritzlib.time { sleep_ms }
 
 import mausoleum.buffer_pool
-import mausoleum.collection { Collection, collection_init, collection_open_storage }
+import mausoleum.collection { Collection, collection_empty, collection_init, collection_open_storage }
 import mausoleum.storage { Storage, storage_open, storage_pool }
-import mausoleum.m7m_types { DEFAULT_COLLECTION_ID }
+import mausoleum.m7m_types { DEFAULT_COLLECTION_ID, m7m_name_view }
+import ritzlib.box
 import mausoleum.client { Client, client_new, client_free, client_connect, client_disconnect }
 import mausoleum.server_async { serve_async }
 
@@ -75,12 +76,13 @@ fn serve_forever(port: i32)
     syscall2(SYS_PRCTL, PR_SET_PDEATHSIG, SIG_KILL as i64)
     quiet_stdio()
 
-    let pool_opt = buffer_pool_new(POOL_FRAMES)
-    if option_is_none<*BufferPool>(@pool_opt)
-        sys_exit(2)
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var pool_owner: Box<BufferPool> = box_empty<BufferPool>()
+    match buffer_pool_new(POOL_FRAMES)
+        Some(p) => pool_owner = box_new<BufferPool>(p)
+        None => sys_exit(2)
+    let pool: *BufferPool = pool_owner.as_ptr()
 
-    var collection: Collection
+    var collection: Collection = collection_empty()
     if collection_init(@collection, pool, 1) < 0
         sys_exit(3)
 
@@ -99,17 +101,18 @@ fn serve_forever(port: i32)
 
 
 # The child: serve the data directory `dir` until killed.
-fn serve_store_forever(port: i32, dir: *u8)
+fn serve_store_forever(port: i32, dir: StrView)
     syscall2(SYS_PRCTL, PR_SET_PDEATHSIG, SIG_KILL as i64)
     quiet_stdio()
 
-    let storage_opt = storage_open(dir)
-    if option_is_none<*Storage>(@storage_opt)
-        sys_exit(2)
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+    var storage_owner: Box<Storage> = box_empty<Storage>()
+    match storage_open(dir)
+        Some(s) => storage_owner = s
+        None => sys_exit(2)
+    let storage: *Storage = storage_owner.as_ptr()
     let pool: *BufferPool = storage_pool(storage)
 
-    var collection: Collection
+    var collection: Collection = collection_empty()
     if collection_open_storage(@collection, storage, DEFAULT_COLLECTION_ID) < 0
         sys_exit(3)
 
@@ -129,7 +132,7 @@ fn serve_store_forever(port: i32, dir: *u8)
 
 fn serve_child(db: *LiveDb, port: i32)
     if db.has_dir
-        serve_store_forever(port, @db.dir[0])
+        serve_store_forever(port, m7m_name_view(@db.dir))
     else
         serve_forever(port)
 
@@ -152,7 +155,8 @@ fn wait_ready(db: *LiveDb) -> i32
         if exited(db.pid) == 1
             db.pid = 0
             return 1
-        let probe: *Client = client_new()
+        var probe_owner: Box<Client> = client_new()
+        let probe: *Client = probe_owner.as_ptr()
         if probe != null
             if client_connect(probe, "127.0.0.1", db.port, "probe") == 0
                 client_disconnect(probe)

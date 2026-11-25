@@ -26,6 +26,10 @@ import lib.wal
 # The pid separates concurrent test processes; the sequence separates two
 # calls inside one process.  A fixed path let two runs share one WAL
 # (AGAST #4466).
+# The first n bytes of buffer `b`.
+fn head(b: [u8], n: i64) -> [u8]
+    return b[0..n]
+
 var g_test_path_seq: i64 = 0
 
 fn get_test_path(suffix: i32) -> String
@@ -36,29 +40,24 @@ fn get_test_path(suffix: i32) -> String
     format_into(@&path, "/tmp/m7m_test_wal_{pid}_{seq}_{suffix}")
     return path
 
-# "<path>.wal.000000" into buf (NUL-terminated).  Never a fixed offset: the
+# "<path>.wal.000000".  Never a fixed offset: the
 # base path length varies with pid and sequence (AGAST #4466).
-fn build_wal_path(buf: Span<u8>, path: *u8)
-    m7m_path_join(buf, strview_from_cstr(path), ".wal.000000")
+fn build_wal_path(path: StrView) -> String
+    return m7m_path_join(path, ".wal.000000")
 
 # Remove every "<path>.wal.<segment>", not just segment 0: WAL segments left
 # behind by a crashed run must not poison the next one (AGAST #4466).
-fn cleanup_test_wal(path: *u8)
-    var wal_path: [128]u8
-    let base: StrView = strview_from_cstr(path)
-    m7m_path_join(@wal_path, base, ".wal.")
-    let n: i64 = base.len
+fn cleanup_test_wal(path: StrView)
     var seg: i32 = 0
     while seg < 64
+        var seg_path: String = m7m_path_join(path, ".wal.")
         var div: i32 = 100000
-        var i: i64 = 0
         while div > 0
-            wal_path[n + 5 + i] = (48 + ((seg / div) % 10)) as u8
+            seg_path.push((48 + ((seg / div) % 10)) as u8)
             div = div / 10
-            i += 1
-        wal_path[n + 11] = 0
-        unlink(strview_from_cstr(@wal_path[0]))
+        unlink(seg_path.as_view())
         seg += 1
+
 
 # ============================================================================
 # WAL Writer Creation Tests
@@ -67,8 +66,11 @@ fn cleanup_test_wal(path: *u8)
 [[test]]
 fn test_wal_writer_new() -> i32
     var path_str: String = get_test_path(0)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     if writer == null
         return 1
 
@@ -77,16 +79,19 @@ fn test_wal_writer_new() -> i32
 
 [[test]]
 fn test_wal_writer_new_null_path() -> i32
-    var writer: *WalWriter = wal_writer_new(null)
-    if writer != null
+    # An empty base path makes no writer
+    if wal_writer_new("").is_some()
         return 1
     0
 
 [[test]]
 fn test_wal_writer_open() -> i32
     var path_str: String = get_test_path(1)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     if writer == null
         return 1
 
@@ -108,8 +113,11 @@ fn test_wal_writer_open() -> i32
 [[test]]
 fn test_wal_write_begin() -> i32
     var path_str: String = get_test_path(2)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     if writer == null
         return 1
 
@@ -137,8 +145,11 @@ fn test_wal_write_begin() -> i32
 [[test]]
 fn test_wal_write_commit() -> i32
     var path_str: String = get_test_path(3)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     if writer == null
         return 1
 
@@ -160,8 +171,11 @@ fn test_wal_write_commit() -> i32
 [[test]]
 fn test_wal_write_abort() -> i32
     var path_str: String = get_test_path(4)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     var begin_lsn: i64 = wal_write_begin(writer, 300)
@@ -180,8 +194,11 @@ fn test_wal_write_abort() -> i32
 [[test]]
 fn test_wal_write_insert() -> i32
     var path_str: String = get_test_path(5)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     var begin_lsn: i64 = wal_write_begin(writer, 400)
@@ -192,7 +209,7 @@ fn test_wal_write_insert() -> i32
     data[2] = 3
     data[3] = 4
 
-    var insert_lsn: i64 = wal_write_insert(writer, 400, begin_lsn, 0, 100, @data[0], 4)
+    var insert_lsn: i64 = wal_write_insert(writer, 400, begin_lsn, 0, 100, head(@data, 4))
     if insert_lsn != 2
         wal_writer_destroy(writer)
         return 1
@@ -206,8 +223,11 @@ fn test_wal_write_insert() -> i32
 [[test]]
 fn test_wal_write_page() -> i32
     var path_str: String = get_test_path(6)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     var begin_lsn: i64 = wal_write_begin(writer, 500)
@@ -230,8 +250,11 @@ fn test_wal_write_page() -> i32
 [[test]]
 fn test_wal_write_checkpoint() -> i32
     var path_str: String = get_test_path(7)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     var cp_lsn: i64 = wal_write_checkpoint(writer)
@@ -251,7 +274,8 @@ fn test_wal_write_checkpoint() -> i32
 
 [[test]]
 fn test_wal_reader_new() -> i32
-    var reader: *WalReader = wal_reader_new()
+    var reader_v: WalReader = wal_reader_new()
+    let reader: *WalReader = @reader_v
     if reader == null
         return 1
 
@@ -262,8 +286,11 @@ fn test_wal_reader_new() -> i32
 fn test_wal_write_then_read() -> i32
     # Write some records
     var path_str: String = get_test_path(8)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     wal_write_begin(writer, 600)
@@ -274,13 +301,13 @@ fn test_wal_write_then_read() -> i32
     wal_writer_destroy(writer)
 
     # Build WAL file path
-    var wal_path: [64]u8
-    build_wal_path(@wal_path, path)
-    defer unlink(strview_from_cstr(@wal_path[0]))
+    let wal_path: String = build_wal_path(path)
+    defer unlink(wal_path.as_view())
 
     # Read them back
-    var reader: *WalReader = wal_reader_new()
-    var err: i32 = wal_reader_open(reader, @wal_path[0])
+    var reader_v: WalReader = wal_reader_new()
+    let reader: *WalReader = @reader_v
+    var err: i32 = wal_reader_open(reader, wal_path.as_view())
     if err != ERR_OK
         wal_reader_destroy(reader)
         return 1
@@ -337,8 +364,11 @@ fn test_wal_write_then_read() -> i32
 [[test]]
 fn test_wal_writer_lsn() -> i32
     var path_str: String = get_test_path(9)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     # Initial LSN should be 1
@@ -366,8 +396,11 @@ fn test_wal_writer_lsn() -> i32
 [[test]]
 fn test_wal_full_transaction() -> i32
     var path_str: String = get_test_path(10)
-    let path: *u8 = path_str.as_ptr()
-    var writer: *WalWriter = wal_writer_new(path)
+    let path: StrView = path_str.as_view()
+    var writer_v: WalWriter = match wal_writer_new(path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     # Simulate a complete transaction
@@ -382,7 +415,7 @@ fn test_wal_full_transaction() -> i32
     # Multiple inserts
     var data: [32]u8
     for i in 0..5
-        var lsn: i64 = wal_write_insert(writer, txn_id, begin_lsn, i as i64, i as i32, @data[0], 8)
+        var lsn: i64 = wal_write_insert(writer, txn_id, begin_lsn, i as i64, i as i32, head(@data, 8))
         if lsn < 0
             wal_writer_destroy(writer)
             return 2

@@ -9,7 +9,7 @@
 
 import ritzlib.sys
 import ritzlib.str
-import ritzlib.memory
+
 import ritzlib.gvec
 import ritzlib.strview
 import ritzlib.option
@@ -475,26 +475,20 @@ fn query_matches(q: *Query, doc: *Document) -> i32
 # Query Result Management
 # ============================================================================
 
-pub fn query_result_new(capacity: i32) -> *QueryResult
+# A result is a value its owner holds and lends as `@result`.
+pub fn query_result_new(capacity: i32) -> Option<QueryResult>
     var ids: Vec<i64> = vec_with_cap<i64>(capacity as i64)
     if ids.cap() < capacity as i64
-        return null
-    var result: *QueryResult = malloc(sizeof(QueryResult)) as *QueryResult
-    if result == null
-        return null
+        return None
+    return Some(QueryResult { doc_ids: ids, count: 0, capacity: capacity })
 
-    result.doc_ids = ids
-
-    result.count = 0
-    result.capacity = capacity
-    return result
-
+# Release the ids now (the owner still drops the emptied result).
 pub fn query_result_destroy(result: *QueryResult)
     if result == null
         return
-    # Raw memory doesn't drop its fields: release the ids before the block
     result.doc_ids.deinit()
-    free(result as *u8)
+    result.count = 0
+    result.capacity = 0
 
 pub fn query_result_count(result: *QueryResult) -> i32
     if result == null
@@ -562,26 +556,26 @@ fn sort_results(q: *Query, col: *Collection, result: *QueryResult)
 
     # key_doc and j_doc are compared while both are alive, so each keeps
     # its strings in its own buffer (each up to MAX_DOC_SIZE).
-    var key_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    var j_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let key_buf: *u8 = key_vec.as_ptr()
-    let j_buf: *u8 = j_vec.as_ptr()
-    if key_buf == null or j_buf == null
+    var key_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    var j_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    if key_vec.len() < MAX_DOC_SIZE or j_vec.len() < MAX_DOC_SIZE
         return
+    let key_buf: [u8] = key_vec[0..MAX_DOC_SIZE]
+    let j_buf: [u8] = j_vec[0..MAX_DOC_SIZE]
     var i: i32 = 1
     while i < result.count
         var key_id: i64 = result.doc_ids.get(i as i64)
         var key_doc: Document
         var key_doc_id: DocumentId
         key_doc_id.value = key_id
-        collection_get(col, @key_doc_id, @key_doc, key_buf, MAX_DOC_SIZE)
+        collection_get(col, @key_doc_id, @key_doc, key_buf)
 
         var j: i32 = i - 1
         while j >= 0
             var j_doc_id: DocumentId
             j_doc_id.value = result.doc_ids.get(j as i64)
             var j_doc: Document
-            collection_get(col, @j_doc_id, @j_doc, j_buf, MAX_DOC_SIZE)
+            collection_get(col, @j_doc_id, @j_doc, j_buf)
 
             if compare_docs_for_sort(q, @j_doc, @key_doc) <= 0
                 break
@@ -597,38 +591,36 @@ fn sort_results(q: *Query, col: *Collection, result: *QueryResult)
 # ============================================================================
 
 # Execute query against a collection
-pub fn query_exec(q: *Query, col: *Collection) -> *QueryResult
+pub fn query_exec(q: *Query, col: *Collection) -> Option<QueryResult>
     if q == null or col == null
-        return null
+        return None
 
     # Allocate result buffer (we'll collect all matches first, then paginate)
-    var result: *QueryResult = query_result_new(MAX_RESULTS)
-    if result == null
-        return null
+    var result_v: QueryResult = match query_result_new(MAX_RESULTS)
+        Some(r) => r
+        None => return None
+    let result: *QueryResult = @result_v
 
     # Scan all documents in the collection using B-tree iterator
-    let iter_opt = btree_scan(col.tree, null, 0, null, 0)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        query_result_destroy(result)
-        return null
-    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    var iter_v: BTreeIter = match collection_scan(col)
+        Some(it) => it
+        None => return None
+    let iter: *BTreeIter = @iter_v
 
     # One buffer for every document: any one may be up to MAX_DOC_SIZE.
-    var val_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let val: *u8 = val_vec.as_ptr()
-    if val == null
-        btree_iter_destroy(iter)
-        query_result_destroy(result)
-        return null
+    var val_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    if val_vec.len() < MAX_DOC_SIZE
+        return None
+    let val: [u8] = val_vec[0..MAX_DOC_SIZE]
 
     # Iterate through all documents
     while btree_iter_valid(iter) != 0
         # Get the document (resolving an overflow stub) and deserialize it
         var val_len: i64 = 0
         var doc: Document
-        var err: i32 = collection_iter_value(col, iter, val, MAX_DOC_SIZE, @val_len)
+        var err: i32 = collection_iter_value(col, iter, val, @val_len)
         if err == ERR_OK
-            err = doc_deserialize(val, val_len, @doc)
+            err = doc_deserialize(val[0..val_len], @doc)
         if err == ERR_OK
             # Check if it matches all filters
             if query_matches(q, @doc) != 0
@@ -637,8 +629,6 @@ pub fn query_exec(q: *Query, col: *Collection) -> *QueryResult
                     query_result_add(result, @doc.id)
 
         btree_iter_next(iter)
-
-    btree_iter_destroy(iter)
 
     # Sort results if ordering is specified
     sort_results(q, col, result)
@@ -660,7 +650,7 @@ pub fn query_exec(q: *Query, col: *Collection) -> *QueryResult
 
         result.count = final_count
 
-    return result
+    return Some(result_v)
 
 # ============================================================================
 # Convenience: Execute and get first result
@@ -668,26 +658,21 @@ pub fn query_exec(q: *Query, col: *Collection) -> *QueryResult
 
 # The first match, deserialized into `out` with its strings in the
 # caller's `buf` (see collection_get): `out` is valid while `buf` is.
-pub fn query_first(q: *Query, col: *Collection, out: *Document, buf: *u8, cap: i64) -> i32
+pub fn query_first(q: *Query, col: *Collection, out: *Document, buf: [u8]) -> i32
     # Temporarily set limit to 1
     var saved_limit: i32 = q.limit_val
     q.limit_val = 1
 
-    var result: *QueryResult = query_exec(q, col)
+    let found: Option<QueryResult> = query_exec(q, col)
     q.limit_val = saved_limit
 
-    if result == null
-        return ERR_NO_MEMORY
-
-    if result.count == 0
-        query_result_destroy(result)
-        return ERR_NOT_FOUND
-
-    var id: DocumentId = query_result_get(result, 0)
-    var err: i32 = collection_get(col, @id, out, buf, cap)
-
-    query_result_destroy(result)
-    return err
+    match found
+        Some(result) =>
+            if result.count == 0
+                return ERR_NOT_FOUND
+            var id: DocumentId = query_result_get(@result, 0)
+            return collection_get(col, @id, out, buf)
+        None => return ERR_NO_MEMORY
 
 # ============================================================================
 # Convenience: Count matching documents
@@ -700,17 +685,14 @@ pub fn query_count(q: *Query, col: *Collection) -> i64
     q.limit_val = MAX_RESULTS
     q.offset_val = 0
 
-    var result: *QueryResult = query_exec(q, col)
+    let found: Option<QueryResult> = query_exec(q, col)
 
     q.limit_val = saved_limit
     q.offset_val = saved_offset
 
-    if result == null
-        return 0
-
-    var count: i64 = result.count as i64
-    query_result_destroy(result)
-    return count
+    match found
+        Some(result) => return result.count as i64
+        None => return 0
 
 # ============================================================================
 # Index-Aware Query Execution

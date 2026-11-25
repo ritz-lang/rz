@@ -22,6 +22,7 @@ import ritzlib.time { sleep_ms }
 import ritzlib.span
 import ritzlib.result
 import ritzlib.option
+import ritzlib.box
 import ritzlib.fs { remove_dir_all, access }
 import ritzlib.str
 import ritzlib.memory
@@ -35,6 +36,10 @@ import lib.client
 import lib.document
 import lib.collection
 
+# The first n bytes of buffer `b`.
+fn head(b: [u8], n: i64) -> [u8]
+    return b[0..n]
+
 const PORT_BASE: i32 = 20000
 const PORT_SPAN: i32 = 30000
 const PORT_ATTEMPTS: i32 = 5
@@ -44,13 +49,13 @@ const PR_SET_PDEATHSIG: i64 = 1
 const SIG_KILL: i32 = 9
 const WAIT_NOHANG: i32 = 1
 
-fn server_bin() -> *u8
-    return c"./build/debug/mausoleum"
+fn server_bin() -> StrView
+    return "./build/debug/mausoleum"
 
 struct TestServer
     pid: i32
     port: i32
-    dir: *u8
+    dir: StrView
     serial: i32     # 1: the --serial loop instead of the async one
 
 # ============================================================================
@@ -58,18 +63,18 @@ struct TestServer
 # ============================================================================
 
 # Remove the directory and everything in it (ritzlib.fs remove_dir_all).
-fn rm_dir_flat(dir: *u8)
-    remove_dir_all(strview_from_cstr(dir))
+fn rm_dir_flat(dir: StrView)
+    remove_dir_all(dir)
 
 # Whether the built server binary is there and executable.
-fn access_ok(bin: *u8) -> bool
-    match access(strview_from_cstr(bin), X_OK)
+fn access_ok(bin: StrView) -> bool
+    match access(bin, X_OK)
         Ok(_) => true
         Err(_) => false
 
 # fork+exec `mausoleum serve --no-encryption --port P --data-dir DIR
 # [--serial]`.
-fn spawn_server(port: i32, dir: *u8, serial: i32) -> i32
+fn spawn_server(port: i32, dir: StrView, serial: i32) -> i32
     var port_buf: [20]u8
     let port_str: StrView = fmt_i64_into(@port_buf, port as i64)
 
@@ -80,7 +85,7 @@ fn spawn_server(port: i32, dir: *u8, serial: i32) -> i32
     args[2] = "--port"
     args[3] = port_str
     args[4] = "--data-dir"
-    args[5] = strview_from_cstr(dir)
+    args[5] = dir
     var nargs: i64 = 6
     if serial != 0
         args[6] = "--serial"
@@ -102,7 +107,8 @@ fn spawn_server(port: i32, dir: *u8, serial: i32) -> i32
             if devnull.raw() > 2
                 devnull.close()
         Err(_) => pass
-    exec(strview_from_cstr(server_bin()), span_from_ptr<StrView>(@args[0], nargs))
+    let argv: [StrView] = @args
+    exec(server_bin(), argv[0..nargs])
     sys_exit(127)
     return -1
 
@@ -127,7 +133,8 @@ fn wait_ready(srv: *TestServer) -> i32
         if server_exited(srv.pid) == 1
             srv.pid = 0
             return 1
-        let probe: *Client = client_new()
+        var probe_owner: Box<Client> = client_new()
+        let probe: *Client = probe_owner.as_ptr()
         if probe != null
             if client_connect(probe, "127.0.0.1", srv.port, "") == 0
                 client_disconnect(probe)
@@ -169,15 +176,17 @@ fn server_stop(srv: *TestServer)
     server_kill(srv.pid)
     srv.pid = 0
 
-fn connect_to(srv: *TestServer, name: StrView) -> *Client
-    let client: *Client = client_new()
+# A client connected to `srv` as `name`; empty if it could not connect.
+fn connect_to(srv: *TestServer, name: StrView) -> Box<Client>
+    var owner: Box<Client> = client_new()
+    let client: *Client = owner.as_ptr()
     if client == null
-        return null
+        return owner
     if client_connect(client, "127.0.0.1", srv.port, name) < 0
         client_free(client)
-        return null
+        return box_empty<Client>()
     client.sock.set_io_timeout(OP_TIMEOUT_MS)
-    return client
+    return owner
 
 fn close_client(client: *Client)
     if client == null
@@ -195,10 +204,10 @@ fn insert_tagged(client: *Client, count: i32, tag: i64) -> i32
         doc_init(@doc, @tmp)
         var f: Field = field_int(tag)
         doc_set_field(@doc, "tag", @f)
-        let size: i64 = doc_serialize(@doc, @buf[0], 256)
+        let size: i64 = doc_serialize(@doc, head(@buf, 256))
         if size < 0
             return 1
-        if client_insert(client, @buf[0], size as i32) < 0
+        if client_insert(client, head(@buf, size)) < 0
             return 2
         i += 1
     return 0
@@ -209,23 +218,23 @@ fn insert_slugged(client: *Client, value: StrView) -> i64
     var doc: Document
     var tmp: DocumentId = doc_id_invalid()
     doc_init(@doc, @tmp)
-    var f: Field = field_string(value.ptr, value.len)
+    var f: Field = field_string(value)
     doc_set_field(@doc, "slug", @f)
-    let size: i64 = doc_serialize(@doc, @buf[0], 256)
+    let size: i64 = doc_serialize(@doc, head(@buf, 256))
     if size < 0
         return -1
-    return client_insert(client, @buf[0], size as i32)
+    return client_insert(client, head(@buf, size))
 
 struct ScanTally
     tag: i64
     docs: i32
     foreign: i32
 
-fn scan_tally_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+fn scan_tally_step(doc_id: i64, data: [u8], user_data: *u8) -> i32
     let t: *ScanTally = user_data as *ScanTally
     t.docs += 1
     var doc: Document
-    if doc_deserialize(data, len as i64, @doc) != ERR_OK
+    if doc_deserialize(data, @doc) != ERR_OK
         t.foreign += 1
         return 0
     var f: Field
@@ -246,12 +255,12 @@ fn scan_own(client: *Client, tag: i64) -> i32
         return -1
     return t.docs
 
-fn make_dir_path(buf: [u8], tag: StrView)
+fn make_dir_path(tag: StrView) -> String
     let pid: i32 = process_id()
     var name: String = string_new()
     format_into(@&name, "/tmp/m7m_multicoll_{pid}_")
     name.push_str(tag)
-    m7m_path_join(buf, name.as_view(), "")
+    return name
 
 # ============================================================================
 # Checks
@@ -259,8 +268,10 @@ fn make_dir_path(buf: [u8], tag: StrView)
 
 # Two clients, "a" and "b", both connected at once.
 fn check_two_collections(srv: *TestServer) -> i32
-    let a: *Client = connect_to(srv, "a")
-    let b: *Client = connect_to(srv, "b")
+    var a_owner: Box<Client> = connect_to(srv, "a")
+    let a: *Client = a_owner.as_ptr()
+    var b_owner: Box<Client> = connect_to(srv, "b")
+    let b: *Client = b_owner.as_ptr()
     if a == null or b == null
         close_client(a)
         close_client(b)
@@ -279,14 +290,16 @@ fn check_two_collections(srv: *TestServer) -> i32
     if rc != 0
         return rc
     # A later client on "a" is in the same collection as the first.
-    let a2: *Client = connect_to(srv, "a")
+    var a2_owner: Box<Client> = connect_to(srv, "a")
+    let a2: *Client = a2_owner.as_ptr()
     if a2 == null
         return 6
     if scan_own(a2, 100) != 2
         rc = 7
     close_client(a2)
     # The default collection got none of them.
-    let d: *Client = connect_to(srv, "")
+    var d_owner: Box<Client> = connect_to(srv, "")
+    let d: *Client = d_owner.as_ptr()
     if d == null
         return 8
     if rc == 0 and scan_own(d, 0) != 0
@@ -295,8 +308,10 @@ fn check_two_collections(srv: *TestServer) -> i32
     return rc
 
 fn check_after_restart(srv: *TestServer) -> i32
-    let a: *Client = connect_to(srv, "a")
-    let b: *Client = connect_to(srv, "b")
+    var a_owner: Box<Client> = connect_to(srv, "a")
+    let a: *Client = a_owner.as_ptr()
+    var b_owner: Box<Client> = connect_to(srv, "b")
+    let b: *Client = b_owner.as_ptr()
     if a == null or b == null
         close_client(a)
         close_client(b)
@@ -323,11 +338,12 @@ fn check_after_restart(srv: *TestServer) -> i32
 # default one.
 
 fn check_serial_field_index(srv: *TestServer) -> i32
-    let a: *Client = connect_to(srv, "a")
+    var a_owner: Box<Client> = connect_to(srv, "a")
+    let a: *Client = a_owner.as_ptr()
     if a == null
         return 1
     var rc: i32 = 0
-    if client_index_create(a, c"slug", 4) != 0
+    if client_index_create(a, "slug") != 0
         rc = 2
     var id1: i64 = -1
     var id2: i64 = -1
@@ -347,25 +363,26 @@ fn check_serial_field_index(srv: *TestServer) -> i32
 
     # A second client on "a", after the first closed: it must find the
     # documents under an index the first one created.
-    let b: *Client = connect_to(srv, "a")
+    var b_owner: Box<Client> = connect_to(srv, "a")
+    let b: *Client = b_owner.as_ptr()
     if b == null
         return 6
     # Idempotent ensure, the shape a reconnecting client uses.
-    if client_index_create(b, c"slug", 4) != 0
+    if client_index_create(b, "slug") != 0
         rc = 7
     var ids: [8]i64
     if rc == 0
-        let n: i32 = client_find(b, c"slug", 4, c"twice", 5, @ids[0], 8)
+        let n: i32 = client_find(b, "slug", "twice", @ids[0], 8)
         if n != 2
             rc = 8
         else if ids[0] != id1 or ids[1] != id2
             rc = 9
-    if rc == 0 and client_find(b, c"slug", 4, c"only", 4, @ids[0], 8) != 1
+    if rc == 0 and client_find(b, "slug", "only", @ids[0], 8) != 1
         rc = 10
-    if rc == 0 and client_find(b, c"slug", 4, c"absent", 6, @ids[0], 8) != 0
+    if rc == 0 and client_find(b, "slug", "absent", @ids[0], 8) != 0
         rc = 11
     # No index on another field: the client is told to scan instead.
-    if rc == 0 and client_find(b, c"title", 5, c"x", 1, @ids[0], 8) >= 0
+    if rc == 0 and client_find(b, "title", "x", @ids[0], 8) >= 0
         rc = 12
     if rc == 0 and client_last_error(b) != PROTO_ERR_NO_INDEX
         rc = 13
@@ -373,7 +390,7 @@ fn check_serial_field_index(srv: *TestServer) -> i32
     if rc == 0
         if client_delete(b, id1) != 1
             rc = 14
-        else if client_find(b, c"slug", 4, c"twice", 5, @ids[0], 8) != 1
+        else if client_find(b, "slug", "twice", @ids[0], 8) != 1
             rc = 15
         else if ids[0] != id2
             rc = 16
@@ -383,10 +400,11 @@ fn check_serial_field_index(srv: *TestServer) -> i32
 
     # The index landed on "a" — the collection CONNECT selected — so the
     # default collection has none and says so.
-    let d: *Client = connect_to(srv, "")
+    var d_owner: Box<Client> = connect_to(srv, "")
+    let d: *Client = d_owner.as_ptr()
     if d == null
         return 17
-    if client_find(d, c"slug", 4, c"twice", 5, @ids[0], 8) >= 0
+    if client_find(d, "slug", "twice", @ids[0], 8) >= 0
         rc = 18
     else if client_last_error(d) != PROTO_ERR_NO_INDEX
         rc = 19
@@ -395,21 +413,20 @@ fn check_serial_field_index(srv: *TestServer) -> i32
 
 [[test]]
 fn test_serial_loop_secondary_index() -> i32
-    var dir: [96]u8
-    make_dir_path(@dir, "serial_index")
-    rm_dir_flat(@dir[0])
+    let dir: String = make_dir_path("serial_index")
+    rm_dir_flat(dir.as_view())
     var srv: TestServer
     srv.pid = 0
     srv.port = 0
-    srv.dir = @dir[0]
+    srv.dir = dir.as_view()
     srv.serial = 1
     let started: i32 = server_start(@srv, 0)
     if started != 0
-        rm_dir_flat(@dir[0])
+        rm_dir_flat(dir.as_view())
         return started
     let rc: i32 = check_serial_field_index(@srv)
     server_stop(@srv)
-    rm_dir_flat(@dir[0])
+    rm_dir_flat(dir.as_view())
     return rc
 
 # ============================================================================
@@ -418,36 +435,34 @@ fn test_serial_loop_secondary_index() -> i32
 
 [[test]]
 fn test_connect_binds_each_client_to_its_collection() -> i32
-    var dir: [96]u8
-    make_dir_path(@dir, "sep")
-    rm_dir_flat(@dir[0])
+    let dir: String = make_dir_path("sep")
+    rm_dir_flat(dir.as_view())
     var srv: TestServer
     srv.pid = 0
     srv.port = 0
-    srv.dir = @dir[0]
+    srv.dir = dir.as_view()
     srv.serial = 0
     let started: i32 = server_start(@srv, 0)
     if started != 0
-        rm_dir_flat(@dir[0])
+        rm_dir_flat(dir.as_view())
         return started
     let rc: i32 = check_two_collections(@srv)
     server_stop(@srv)
-    rm_dir_flat(@dir[0])
+    rm_dir_flat(dir.as_view())
     return rc
 
 [[test]]
 fn test_restart_keeps_both_collections() -> i32
-    var dir: [96]u8
-    make_dir_path(@dir, "restart")
-    rm_dir_flat(@dir[0])
+    let dir: String = make_dir_path("restart")
+    rm_dir_flat(dir.as_view())
     var srv: TestServer
     srv.pid = 0
     srv.port = 0
-    srv.dir = @dir[0]
+    srv.dir = dir.as_view()
     srv.serial = 0
     var started: i32 = server_start(@srv, 0)
     if started != 0
-        rm_dir_flat(@dir[0])
+        rm_dir_flat(dir.as_view())
         return started
     var rc: i32 = check_two_collections(@srv)
     server_stop(@srv)   # kill -9
@@ -458,13 +473,14 @@ fn test_restart_keeps_both_collections() -> i32
         else
             rc = check_after_restart(@srv)
             server_stop(@srv)
-    rm_dir_flat(@dir[0])
+    rm_dir_flat(dir.as_view())
     return rc
 
 # The --serial loop serves one connection at a time, so its clients take
 # turns; each still lands in its own collection.
 fn check_two_collections_in_turn(srv: *TestServer) -> i32
-    let a: *Client = connect_to(srv, "a")
+    var a_owner: Box<Client> = connect_to(srv, "a")
+    let a: *Client = a_owner.as_ptr()
     if a == null
         return 1
     var rc: i32 = 0
@@ -473,7 +489,8 @@ fn check_two_collections_in_turn(srv: *TestServer) -> i32
     close_client(a)
     if rc != 0
         return rc
-    let b: *Client = connect_to(srv, "b")
+    var b_owner: Box<Client> = connect_to(srv, "b")
+    let b: *Client = b_owner.as_ptr()
     if b == null
         return 3
     if insert_tagged(b, 3, 200) != 0
@@ -483,7 +500,8 @@ fn check_two_collections_in_turn(srv: *TestServer) -> i32
     close_client(b)
     if rc != 0
         return rc
-    let a2: *Client = connect_to(srv, "a")
+    var a2_owner: Box<Client> = connect_to(srv, "a")
+    let a2: *Client = a2_owner.as_ptr()
     if a2 == null
         return 6
     if scan_own(a2, 100) != 2
@@ -493,19 +511,18 @@ fn check_two_collections_in_turn(srv: *TestServer) -> i32
 
 [[test]]
 fn test_serial_loop_binds_each_client_to_its_collection() -> i32
-    var dir: [96]u8
-    make_dir_path(@dir, "serial")
-    rm_dir_flat(@dir[0])
+    let dir: String = make_dir_path("serial")
+    rm_dir_flat(dir.as_view())
     var srv: TestServer
     srv.pid = 0
     srv.port = 0
-    srv.dir = @dir[0]
+    srv.dir = dir.as_view()
     srv.serial = 1
     let started: i32 = server_start(@srv, 0)
     if started != 0
-        rm_dir_flat(@dir[0])
+        rm_dir_flat(dir.as_view())
         return started
     let rc: i32 = check_two_collections_in_turn(@srv)
     server_stop(@srv)
-    rm_dir_flat(@dir[0])
+    rm_dir_flat(dir.as_view())
     return rc

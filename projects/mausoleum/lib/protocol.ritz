@@ -44,9 +44,14 @@
 #   0xC2: TXN_ABORTED
 #   0xFF: ERROR      - Error response
 
-import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.endian
 import ritzlib.str
 import ritzlib.strview
+import ritzlib.option
+
+import mausoleum.m7m_types { m7m_scratch }
 
 # ============================================================================
 # Protocol constants
@@ -174,40 +179,38 @@ pub fn request_to_response(msg_type: i32) -> i32
 # ============================================================================
 
 struct MessageBuffer
-    data: *u8         # Buffer data
-    capacity: i32     # Buffer capacity
+    store: Vec<u8>    # The bytes when the buffer owns them (msgbuf_new); else empty
+    data: [u8]        # Where the message is built: store's bytes, or the caller's
     length: i32       # Current data length
     header: MessageHeader  # Cached header
 
-# Initialize a stack-allocated message buffer with external storage
-pub fn msgbuf_init(buf: *MessageBuffer, data: *u8, capacity: i32)
+# A buffer with no room yet: give it some with msgbuf_init.
+pub fn msgbuf_empty() -> MessageBuffer
+    return MessageBuffer { store: vec_new<u8>(), data: "", length: 0, header: header_zero() }
+
+# Build messages in the caller's bytes `data` (they must outlive the buffer).
+pub fn msgbuf_init(buf: *MessageBuffer, data: [u8])
     buf.data = data
-    buf.capacity = capacity
     buf.length = 0
     buf.header = header_zero()
 
-# Create a new message buffer
-pub fn msgbuf_new(capacity: i32) -> *MessageBuffer
-    var buf: *MessageBuffer = malloc(sizeof(MessageBuffer)) as *MessageBuffer
-    if buf == null
-        return null
-
-    buf.data = malloc(capacity as i64) as *u8
-    if buf.data == null
-        free(buf as *u8)
-        return null
-
-    buf.capacity = capacity
-    buf.length = 0
-    buf.header = header_zero()
+# A buffer that owns `capacity` bytes; its Drop frees them. No room (a zero
+# capacity) if out of memory.
+pub fn msgbuf_new(capacity: i32) -> MessageBuffer
+    var buf: MessageBuffer = msgbuf_empty()
+    buf.store = m7m_scratch(capacity as i64)
+    buf.data = span_from_vec<u8>(@buf.store)
     return buf
 
-# Free a message buffer
+# Release the bytes a msgbuf_new buffer owns now, leaving it with no room.
 pub fn msgbuf_free(buf: *MessageBuffer)
-    if buf != null
-        if buf.data != null
-            free(buf.data)
-        free(buf as *u8)
+    buf.data = ""
+    buf.length = 0
+    buf.store.deinit()
+
+# Bytes the buffer can hold
+pub fn msgbuf_capacity(buf: *MessageBuffer) -> i32
+    return buf.data.len as i32
 
 # Reset buffer for reuse
 pub fn msgbuf_reset(buf: *MessageBuffer)
@@ -223,66 +226,54 @@ pub fn msgbuf_start(buf: *MessageBuffer, msg_type: i32, request_id: i32)
 
 # Write i8 to buffer
 pub fn msgbuf_write_i8(buf: *MessageBuffer, value: i32) -> i32
-    if buf.length + 1 > buf.capacity
+    if buf.length + 1 > msgbuf_capacity(buf)
         return -1
-    *(buf.data + buf.length) = value as u8
+    buf.data[buf.length] = value as u8
     buf.length += 1
     return 0
 
 # Write i32 to buffer (big-endian)
 pub fn msgbuf_write_i32(buf: *MessageBuffer, value: i32) -> i32
-    if buf.length + 4 > buf.capacity
+    if buf.length + 4 > msgbuf_capacity(buf)
         return -1
-    var ptr: *u8 = buf.data + buf.length
-    *(ptr + 0) = ((value >> 24) & 0xFF) as u8
-    *(ptr + 1) = ((value >> 16) & 0xFF) as u8
-    *(ptr + 2) = ((value >> 8) & 0xFF) as u8
-    *(ptr + 3) = (value & 0xFF) as u8
+    endian_write_u32_be(buf.data, buf.length as i64, value as u32)
     buf.length += 4
     return 0
 
 # Write i64 to buffer (big-endian)
 pub fn msgbuf_write_i64(buf: *MessageBuffer, value: i64) -> i32
-    if buf.length + 8 > buf.capacity
+    if buf.length + 8 > msgbuf_capacity(buf)
         return -1
-    var ptr: *u8 = buf.data + buf.length
-    *(ptr + 0) = ((value >> 56) & 0xFF) as u8
-    *(ptr + 1) = ((value >> 48) & 0xFF) as u8
-    *(ptr + 2) = ((value >> 40) & 0xFF) as u8
-    *(ptr + 3) = ((value >> 32) & 0xFF) as u8
-    *(ptr + 4) = ((value >> 24) & 0xFF) as u8
-    *(ptr + 5) = ((value >> 16) & 0xFF) as u8
-    *(ptr + 6) = ((value >> 8) & 0xFF) as u8
-    *(ptr + 7) = (value & 0xFF) as u8
+    endian_write_u64_be(buf.data, buf.length as i64, value as u64)
     buf.length += 8
     return 0
 
 # Write bytes to buffer (length-prefixed)
-pub fn msgbuf_write_bytes(buf: *MessageBuffer, data: *u8, len: i32) -> i32
-    if buf.length + 4 + len > buf.capacity
+pub fn msgbuf_write_bytes(buf: *MessageBuffer, data: [u8]) -> i32
+    let len: i32 = data.len as i32
+    if buf.length + 4 + len > msgbuf_capacity(buf)
         return -1
     # Write length prefix
     msgbuf_write_i32(buf, len)
-    # Write data
-    if len > 0
-        memcpy(buf.data + buf.length, data, len as i64)
-        buf.length += len
-    return 0
+    return msgbuf_write_raw(buf, data)
 
 # Write raw bytes (no length prefix)
-pub fn msgbuf_write_raw(buf: *MessageBuffer, data: *u8, len: i32) -> i32
-    if buf.length + len > buf.capacity
+pub fn msgbuf_write_raw(buf: *MessageBuffer, data: [u8]) -> i32
+    let len: i32 = data.len as i32
+    if buf.length + len > msgbuf_capacity(buf)
         return -1
-    if len > 0
-        memcpy(buf.data + buf.length, data, len as i64)
-        buf.length += len
+    let dst: [u8] = buf.data[buf.length..buf.length + len]
+    dst.copy_from(data)
+    buf.length += len
     return 0
 
 # Finalize message (write header to beginning)
 pub fn msgbuf_finish(buf: *MessageBuffer) -> i32
     buf.header.length = buf.length
+    if msgbuf_capacity(buf) < PROTO_HEADER_SIZE
+        return -1
     # Write header to start of buffer
-    var ptr: *u8 = buf.data
+    var ptr: *u8 = buf.data.as_ptr()
     # Magic (big-endian)
     *(ptr + 0) = ((buf.header.magic >> 24) & 0xFF) as u8
     *(ptr + 1) = ((buf.header.magic >> 16) & 0xFF) as u8
@@ -309,7 +300,11 @@ pub fn msgbuf_finish(buf: *MessageBuffer) -> i32
 
 # Get message data pointer
 pub fn msgbuf_data(buf: *MessageBuffer) -> *u8
-    return buf.data
+    return buf.data.as_ptr()
+
+# The message built so far
+pub fn msgbuf_bytes(buf: *MessageBuffer) -> [u8]
+    return buf.data[0..buf.length]
 
 # Get message length
 pub fn msgbuf_len(buf: *MessageBuffer) -> i32
@@ -320,42 +315,27 @@ pub fn msgbuf_len(buf: *MessageBuffer) -> i32
 # ============================================================================
 
 struct MessageReader
-    data: *u8         # Message data
+    data: [u8]        # Message data
     length: i32       # Total message length
     pos: i32          # Current read position
     header: MessageHeader  # Parsed header
 
-# Initialize reader from raw data
-pub fn msgreader_init(reader: *MessageReader, data: *u8, length: i32) -> i32
-    if length < PROTO_HEADER_SIZE
+# Initialize reader over a whole message
+pub fn msgreader_init(reader: *MessageReader, data: [u8]) -> i32
+    if data.len < PROTO_HEADER_SIZE
         return PROTO_ERR_PROTOCOL
 
     reader.data = data
-    reader.length = length
+    reader.length = data.len as i32
     reader.pos = PROTO_HEADER_SIZE  # Start after header
 
-    # Parse header
-    var ptr: *u8 = data
-    reader.header.magic = (*(ptr + 0) as i32) << 24
-    reader.header.magic = reader.header.magic | ((*(ptr + 1) as i32) << 16)
-    reader.header.magic = reader.header.magic | ((*(ptr + 2) as i32) << 8)
-    reader.header.magic = reader.header.magic | (*(ptr + 3) as i32)
-
-    reader.header.length = (*(ptr + 4) as i32) << 24
-    reader.header.length = reader.header.length | ((*(ptr + 5) as i32) << 16)
-    reader.header.length = reader.header.length | ((*(ptr + 6) as i32) << 8)
-    reader.header.length = reader.header.length | (*(ptr + 7) as i32)
-
-    reader.header.version = *(ptr + 8) as i32
-    reader.header.msg_type = *(ptr + 9) as i32
-
-    reader.header.flags = (*(ptr + 10) as i32) << 8
-    reader.header.flags = reader.header.flags | (*(ptr + 11) as i32)
-
-    reader.header.request_id = (*(ptr + 12) as i32) << 24
-    reader.header.request_id = reader.header.request_id | ((*(ptr + 13) as i32) << 16)
-    reader.header.request_id = reader.header.request_id | ((*(ptr + 14) as i32) << 8)
-    reader.header.request_id = reader.header.request_id | (*(ptr + 15) as i32)
+    # Parse header (big-endian)
+    reader.header.magic = endian_read_u32_be(data, 0) as i32
+    reader.header.length = endian_read_u32_be(data, 4) as i32
+    reader.header.version = data[8] as i32
+    reader.header.msg_type = data[9] as i32
+    reader.header.flags = endian_read_u16_be(data, 10) as i32
+    reader.header.request_id = endian_read_u32_be(data, 12) as i32
 
     return header_validate(@reader.header)
 
@@ -363,7 +343,7 @@ pub fn msgreader_init(reader: *MessageReader, data: *u8, length: i32) -> i32
 pub fn msgreader_read_i8(reader: *MessageReader) -> i32
     if reader.pos + 1 > reader.length
         return -1
-    let value: i32 = *(reader.data + reader.pos) as i32
+    let value: i32 = reader.data[reader.pos] as i32
     reader.pos += 1
     return value
 
@@ -371,11 +351,7 @@ pub fn msgreader_read_i8(reader: *MessageReader) -> i32
 pub fn msgreader_read_i32(reader: *MessageReader) -> i32
     if reader.pos + 4 > reader.length
         return -1
-    var ptr: *u8 = reader.data + reader.pos
-    var value: i32 = (*(ptr + 0) as i32) << 24
-    value = value | ((*(ptr + 1) as i32) << 16)
-    value = value | ((*(ptr + 2) as i32) << 8)
-    value = value | (*(ptr + 3) as i32)
+    let value: i32 = endian_read_u32_be(reader.data, reader.pos as i64) as i32
     reader.pos += 4
     return value
 
@@ -383,31 +359,19 @@ pub fn msgreader_read_i32(reader: *MessageReader) -> i32
 pub fn msgreader_read_i64(reader: *MessageReader) -> i64
     if reader.pos + 8 > reader.length
         return -1
-    var ptr: *u8 = reader.data + reader.pos
-    var value: i64 = (*(ptr + 0) as i64) << 56
-    value = value | ((*(ptr + 1) as i64) << 48)
-    value = value | ((*(ptr + 2) as i64) << 40)
-    value = value | ((*(ptr + 3) as i64) << 32)
-    value = value | ((*(ptr + 4) as i64) << 24)
-    value = value | ((*(ptr + 5) as i64) << 16)
-    value = value | ((*(ptr + 6) as i64) << 8)
-    value = value | (*(ptr + 7) as i64)
+    let value: i64 = endian_read_u64_be(reader.data, reader.pos as i64) as i64
     reader.pos += 8
     return value
 
-# Read bytes (returns pointer to data in buffer, sets out_len)
-pub fn msgreader_read_bytes(reader: *MessageReader, out_len: *i32) -> *u8
+# Read length-prefixed bytes: a view into the message (empty for an empty
+# field). None when the length is missing or runs past the message's end.
+pub fn msgreader_read_bytes(reader: *MessageReader) -> Option<[u8]>
     let len: i32 = msgreader_read_i32(reader)
-    if len < 0
-        return null
-    *out_len = len
-    if len == 0
-        return null
-    if reader.pos + len > reader.length
-        return null
-    var ptr: *u8 = reader.data + reader.pos
+    if len < 0 or reader.pos + len > reader.length
+        return None
+    let start: i32 = reader.pos
     reader.pos += len
-    return ptr
+    return Some(reader.data[start..start + len])
 
 # Get remaining bytes in reader
 pub fn msgreader_remaining(reader: *MessageReader) -> i32
@@ -440,9 +404,9 @@ pub fn build_pong(buf: *MessageBuffer, request_id: i32) -> i32
     return msgbuf_finish(buf)
 
 # Build CONNECT message
-pub fn build_connect(buf: *MessageBuffer, request_id: i32, collection_name: *u8, name_len: i32) -> i32
+pub fn build_connect(buf: *MessageBuffer, request_id: i32, collection_name: [u8]) -> i32
     msgbuf_start(buf, MSG_CONNECT, request_id)
-    msgbuf_write_bytes(buf, collection_name, name_len)
+    msgbuf_write_bytes(buf, collection_name)
     return msgbuf_finish(buf)
 
 # Build CONNECTED response
@@ -456,14 +420,14 @@ pub fn build_connected(buf: *MessageBuffer, request_id: i32, session_id: i64) ->
 pub fn build_error(buf: *MessageBuffer, request_id: i32, error_code: i32, message: StrView) -> i32
     msgbuf_start(buf, MSG_ERROR, request_id)
     msgbuf_write_i32(buf, error_code)
-    msgbuf_write_bytes(buf, message.ptr, message.len as i32)
+    msgbuf_write_bytes(buf, message.as_bytes())
     return msgbuf_finish(buf)
 
 # Build INSERT message (document data is already serialized).
 # Returns -1, leaving no message to send, if the document doesn't fit `buf`.
-pub fn build_insert(buf: *MessageBuffer, request_id: i32, doc_data: *u8, doc_len: i32) -> i32
+pub fn build_insert(buf: *MessageBuffer, request_id: i32, doc_data: [u8]) -> i32
     msgbuf_start(buf, MSG_INSERT, request_id)
-    if msgbuf_write_bytes(buf, doc_data, doc_len) < 0
+    if msgbuf_write_bytes(buf, doc_data) < 0
         msgbuf_reset(buf)
         return -1
     return msgbuf_finish(buf)
@@ -481,9 +445,9 @@ pub fn build_get(buf: *MessageBuffer, request_id: i32, doc_id: i64) -> i32
     return msgbuf_finish(buf)
 
 # Build GET_OK response
-pub fn build_get_ok(buf: *MessageBuffer, request_id: i32, doc_data: *u8, doc_len: i32) -> i32
+pub fn build_get_ok(buf: *MessageBuffer, request_id: i32, doc_data: [u8]) -> i32
     msgbuf_start(buf, MSG_GET_OK, request_id)
-    msgbuf_write_bytes(buf, doc_data, doc_len)
+    msgbuf_write_bytes(buf, doc_data)
     return msgbuf_finish(buf)
 
 # Build DELETE message
@@ -581,9 +545,9 @@ pub fn build_scan_next(buf: *MessageBuffer, request_id: i32) -> i32
 # Build INDEX_CREATE request (idempotent).
 # Payload: [field_len: i32][field: bytes][unique: i32]
 # `unique` is reserved; this server keeps every (value, document) entry.
-pub fn build_index_create(buf: *MessageBuffer, request_id: i32, field: *u8, field_len: i32, unique: i32) -> i32
+pub fn build_index_create(buf: *MessageBuffer, request_id: i32, field: [u8], unique: i32) -> i32
     msgbuf_start(buf, MSG_INDEX_CREATE, request_id)
-    if msgbuf_write_bytes(buf, field, field_len) < 0
+    if msgbuf_write_bytes(buf, field) < 0
         msgbuf_reset(buf)
         return -1
     msgbuf_write_i32(buf, unique)
@@ -596,12 +560,12 @@ pub fn build_index_created(buf: *MessageBuffer, request_id: i32) -> i32
 
 # Build FIND request.
 # Payload: [field_len: i32][field: bytes][value_len: i32][value: bytes]
-pub fn build_find(buf: *MessageBuffer, request_id: i32, field: *u8, field_len: i32, value: *u8, value_len: i32) -> i32
+pub fn build_find(buf: *MessageBuffer, request_id: i32, field: [u8], value: [u8]) -> i32
     msgbuf_start(buf, MSG_FIND, request_id)
-    if msgbuf_write_bytes(buf, field, field_len) < 0
+    if msgbuf_write_bytes(buf, field) < 0
         msgbuf_reset(buf)
         return -1
-    if msgbuf_write_bytes(buf, value, value_len) < 0
+    if msgbuf_write_bytes(buf, value) < 0
         msgbuf_reset(buf)
         return -1
     return msgbuf_finish(buf)

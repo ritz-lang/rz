@@ -21,6 +21,7 @@ import ritzlib.fs { remove_dir_all, stat }
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.option
+import ritzlib.box
 import ritzlib.memory
 import ritzlib.gvec
 
@@ -31,35 +32,39 @@ import lib.storage
 import lib.document
 import lib.collection
 
+# The first n bytes of buffer `b`.
+fn head(b: [u8], n: i64) -> [u8]
+    return b[0..n]
+
 # ============================================================================
 # Helpers
 # ============================================================================
 
-# "/tmp/m7m_restart_<pid>_<tag>" into buf (NUL-terminated).
-fn make_tmp_path(buf: [u8], tag: StrView)
+# "/tmp/m7m_restart_<pid>_<tag>".
+fn make_tmp_path(tag: StrView) -> String
     let pid: i32 = process_id()
     var name: String = string_new()
     format_into(@&name, "/tmp/m7m_restart_{pid}_")
     name.push_str(tag)
-    m7m_path_join(buf, name.as_view(), "")
+    return name
 
 # Remove the directory and everything in it (ritzlib.fs remove_dir_all).
-fn rm_dir_flat(dir: *u8)
-    remove_dir_all(strview_from_cstr(dir))
+fn rm_dir_flat(dir: StrView)
+    remove_dir_all(dir)
 
 # Size in bytes of <dir>/<name>, or -1 if it cannot be opened.
-fn store_file_size(dir: *u8, name: StrView) -> i64
-    var path: String = string_from(strview_from_cstr(dir))
+fn store_file_size(dir: StrView, name: StrView) -> i64
+    var path: String = string_from(dir)
     path.push_str(name)
     match stat(path.as_view())
         Ok(st) => st.st_size
         Err(_) => -1
 
-fn open_store(path: *u8) -> *Storage
-    let opt: Option<*Storage> = storage_open(path)
-    if option_is_none<*Storage>(@opt)
-        return null
-    return option_unwrap_or<*Storage>(@opt, null)
+fn open_store(path: StrView) -> Box<Storage>
+    # Empty if the store would not open
+    match storage_open(path)
+        Some(s) => return s
+        None => return box_empty<Storage>()
 
 # A ~240-byte document: {"n": i, "body": <filler>}.
 fn insert_numbered(col: *Collection, i: i32, out_id: *DocumentId) -> i32
@@ -69,7 +74,7 @@ fn insert_numbered(col: *Collection, i: i32, out_id: *DocumentId) -> i32
     var nf: Field = field_int(i as i64)
     doc_set_field(@doc, "n", @nf)
     let body: StrView = "Where data is entombed forever. Where data is entombed forever. Where data is entombed forever. Where data is entombed forever. Where data is entombed forever. Where data is entombed forever."
-    var bf: Field = field_string(body.ptr, body.len)
+    var bf: Field = field_string(body)
     doc_set_field(@doc, "body", @bf)
     return collection_insert(col, @doc, out_id)
 
@@ -78,7 +83,7 @@ fn has_numbered(col: *Collection, seq: i32) -> i32
     var id: DocumentId = doc_id_new(1, seq)
     var doc: Document
     var doc_buf: [2048]u8
-    if collection_get(col, @id, @doc, @doc_buf[0], 2048) != ERR_OK
+    if collection_get(col, @id, @doc, head(@doc_buf, 2048)) != ERR_OK
         return 0
     var nf: Field
     if doc_get_field(@doc, "n", @nf) != ERR_OK
@@ -89,32 +94,34 @@ fn has_numbered(col: *Collection, seq: i32) -> i32
 
 # Open DIR, insert `count` documents numbered 1..count, committing after each
 # exactly as the server does.  Returns the open storage (caller decides how
-# it "stops"), or null on failure.
-fn seed(path: *u8, col: *Collection, count: i32) -> *Storage
-    let s: *Storage = open_store(path)
+# it "stops"), or an empty Box on failure.
+fn seed(path: StrView, col: *Collection, count: i32) -> Box<Storage>
+    var s_owner: Box<Storage> = open_store(path)
+    let s: *Storage = s_owner.as_ptr()
     if s == null
-        return null
+        return s_owner
     if collection_open_storage(col, s, 1) != ERR_OK
-        return null
+        return box_empty<Storage>()
     var i: i32 = 1
     while i <= count
         var id: DocumentId
         if insert_numbered(col, i, @id) != ERR_OK
-            return null
+            return box_empty<Storage>()
         if doc_id_sequence(@id) != i
-            return null
+            return box_empty<Storage>()
         if collection_commit(col, s) != ERR_OK
-            return null
+            return box_empty<Storage>()
         i += 1
-    return s
+    return s_owner
 
 # Reopen DIR and check documents 1..count are all there, the count matches
 # and the next insert gets sequence count+1 (no id reuse).  0 = ok.
-fn reopen_and_check(path: *u8, count: i32) -> i32
-    let s: *Storage = open_store(path)
+fn reopen_and_check(path: StrView, count: i32) -> i32
+    var s_owner: Box<Storage> = open_store(path)
+    let s: *Storage = s_owner.as_ptr()
     if s == null
         return 101
-    var col: Collection
+    var col: Collection = collection_empty()
     if collection_open_storage(@col, s, 1) != ERR_OK
         storage_destroy(s)
         return 102
@@ -146,69 +153,70 @@ fn reopen_and_check(path: *u8, count: i32) -> i32
 # SIGTERM path: commit, close, reopen.
 [[test]]
 fn test_restart_after_close_keeps_documents() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "close")
-    rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("close")
+    rm_dir_flat(path.as_view())
 
-    var col: Collection
-    let s: *Storage = seed(@path[0], @col, 5)
+    var col: Collection = collection_empty()
+    var seeded: Box<Storage> = seed(path.as_view(), @col, 5)
+    let s: *Storage = seeded.as_ptr()
     if s == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 1
     collection_destroy(@col)
     storage_destroy(s)
 
-    var rc: i32 = reopen_and_check(@path[0], 5)
+    var rc: i32 = reopen_and_check(path.as_view(), 5)
     # A second restart (with one more document from the first) still holds.
     if rc == 0
-        rc = reopen_and_check(@path[0], 6)
-    rm_dir_flat(@path[0])
+        rc = reopen_and_check(path.as_view(), 6)
+    rm_dir_flat(path.as_view())
     return rc
 
 # kill -9 path: commit, then never close.  The WAL must have been written.
 [[test]]
 fn test_restart_after_abandon_keeps_documents() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "abandon")
-    rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("abandon")
+    rm_dir_flat(path.as_view())
 
-    var col: Collection
-    let s: *Storage = seed(@path[0], @col, 5)
+    var col: Collection = collection_empty()
+    var seeded: Box<Storage> = seed(path.as_view(), @col, 5)
+    let s: *Storage = seeded.as_ptr()
     if s == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 1
     # The ticket's symptom: wal.wal.000000 stayed 0 bytes after writes.
     # Five committed inserts log at least one full page image.
-    if store_file_size(@path[0], "/wal.wal.000000") < 4096
-        rm_dir_flat(@path[0])
+    if store_file_size(path.as_view(), "/wal.wal.000000") < 4096
+        rm_dir_flat(path.as_view())
         return 2
     # No storage_destroy: the process "dies" here.
 
-    let rc: i32 = reopen_and_check(@path[0], 5)
-    rm_dir_flat(@path[0])
+    let rc: i32 = reopen_and_check(path.as_view(), 5)
+    rm_dir_flat(path.as_view())
     return rc
 
 # Crash mid-flush: the WAL holds the committed pages, data.m7m does not.
 [[test]]
 fn test_restart_recovers_from_wal_alone() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "walonly")
-    rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("walonly")
+    rm_dir_flat(path.as_view())
 
-    let s: *Storage = open_store(@path[0])
+    var s_owner: Box<Storage> = open_store(path.as_view())
+
+    let s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
-    var col: Collection
+    var col: Collection = collection_empty()
     if collection_open_storage(@col, s, 1) != ERR_OK
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 2
-    let data_before: i64 = store_file_size(@path[0], "/data.m7m")
+    let data_before: i64 = store_file_size(path.as_view(), "/data.m7m")
 
     var i: i32 = 1
     while i <= 5
         var id: DocumentId
         if insert_numbered(@col, i, @id) != ERR_OK
-            rm_dir_flat(@path[0])
+            rm_dir_flat(path.as_view())
             return 3
         i += 1
     var meta: CollectionMeta
@@ -216,65 +224,67 @@ fn test_restart_recovers_from_wal_alone() -> i32
     storage_set_collection_meta(s, @meta)
     # WAL commit only - the "crash" comes before the data pages are written.
     if storage_wal_commit(s) != ERR_OK
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 4
-    if store_file_size(@path[0], "/data.m7m") != data_before
-        rm_dir_flat(@path[0])
+    if store_file_size(path.as_view(), "/data.m7m") != data_before
+        rm_dir_flat(path.as_view())
         return 5  # pages reached data.m7m, so this would not test redo
 
-    let rc: i32 = reopen_and_check(@path[0], 5)
-    rm_dir_flat(@path[0])
+    let rc: i32 = reopen_and_check(path.as_view(), 5)
+    rm_dir_flat(path.as_view())
     return rc
 
 # Enough documents to split the root: the root page moves and the tree
 # grows a level.  Both must come back, or lookups walk the wrong pages.
 [[test]]
 fn test_restart_after_root_split_keeps_documents() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "split")
-    rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("split")
+    rm_dir_flat(path.as_view())
 
-    var col: Collection
-    let s: *Storage = seed(@path[0], @col, 200)
+    var col: Collection = collection_empty()
+    var seeded: Box<Storage> = seed(path.as_view(), @col, 200)
+    let s: *Storage = seeded.as_ptr()
     if s == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 1
     var meta: CollectionMeta
     collection_meta(@col, @meta)
     if meta.tree_height < 2
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 2  # never split: the test would not cover a moved root
     collection_destroy(@col)
     storage_destroy(s)
 
-    let rc: i32 = reopen_and_check(@path[0], 200)
-    rm_dir_flat(@path[0])
+    let rc: i32 = reopen_and_check(path.as_view(), 200)
+    rm_dir_flat(path.as_view())
     return rc
 
 # Deletes persist too, and the count follows them.
 [[test]]
 fn test_restart_after_delete_keeps_it_deleted() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "delete")
-    rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("delete")
+    rm_dir_flat(path.as_view())
 
-    var col: Collection
-    let s: *Storage = seed(@path[0], @col, 3)
+    var col: Collection = collection_empty()
+    var seeded: Box<Storage> = seed(path.as_view(), @col, 3)
+    let s: *Storage = seeded.as_ptr()
     if s == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 1
     var id: DocumentId = doc_id_new(1, 2)
     if collection_delete(@col, @id) != ERR_OK
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 2
     collection_commit(@col, s)
     # abandoned, like kill -9
 
-    let s2: *Storage = open_store(@path[0])
+    var s2_owner: Box<Storage> = open_store(path.as_view())
+
+    let s2: *Storage = s2_owner.as_ptr()
     if s2 == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 3
-    var col2: Collection
+    var col2: Collection = collection_empty()
     var rc: i32 = 0
     if collection_open_storage(@col2, s2, 1) != ERR_OK
         rc = 4
@@ -285,27 +295,27 @@ fn test_restart_after_delete_keeps_it_deleted() -> i32
     else if collection_count(@col2) != 2
         rc = 7
     storage_destroy(s2)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc
 
 # A clean close checkpoints: the WAL is cut back to (at most) its checkpoint
 # record instead of growing forever across restarts.
 [[test]]
 fn test_close_checkpoints_the_wal() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "ckpt")
-    rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("ckpt")
+    rm_dir_flat(path.as_view())
 
-    var col: Collection
-    let s: *Storage = seed(@path[0], @col, 5)
+    var col: Collection = collection_empty()
+    var seeded: Box<Storage> = seed(path.as_view(), @col, 5)
+    let s: *Storage = seeded.as_ptr()
     if s == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 1
     let wal_open: i64 = storage_wal_size(s)
     collection_destroy(@col)
     storage_destroy(s)
-    let wal_closed: i64 = store_file_size(@path[0], "/wal.wal.000000")
-    rm_dir_flat(@path[0])
+    let wal_closed: i64 = store_file_size(path.as_view(), "/wal.wal.000000")
+    rm_dir_flat(path.as_view())
     if wal_open < 4096
         return 2  # 5 committed writes logged less than one page image
     if wal_closed < 0 or wal_closed > 64
@@ -323,8 +333,8 @@ fn big_byte(seed: i64, i: i64) -> u8
 # Insert (out_id != null) or rewrite (*id) a document whose one field "c" is
 # `len` bytes of big_byte(seed, _).
 fn put_big(col: *Collection, id: *DocumentId, len: i64, seed: i64, insert: bool) -> i32
-    var payload_vec: Vec<u8> = vec_with_cap<u8>(len)
-    let payload: *u8 = payload_vec.as_ptr()
+    var payload_vec: Vec<u8> = m7m_scratch(len)
+    let payload: [u8] = payload_vec[0..payload_vec.len()]
     var i: i64 = 0
     while i < len
         payload[i] = big_byte(seed, i)
@@ -332,7 +342,7 @@ fn put_big(col: *Collection, id: *DocumentId, len: i64, seed: i64, insert: bool)
     var doc: Document
     var tmp: DocumentId = doc_id_invalid()
     doc_init(@doc, @tmp)
-    var f: Field = field_string(payload, len)
+    var f: Field = field_string(payload.as_strview())
     doc_set_field(@doc, "c", @f)
     var rc: i32 = 0
     if insert
@@ -344,11 +354,11 @@ fn put_big(col: *Collection, id: *DocumentId, len: i64, seed: i64, insert: bool)
 
 # 1 if document `id` is there with field "c" of `len` bytes of big_byte(seed, _).
 fn has_big(col: *Collection, id: *DocumentId, len: i64, seed: i64) -> i32
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let buf: *u8 = buf_vec.as_ptr()
+    var buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    let buf: [u8] = buf_vec[0..buf_vec.len()]
     var doc: Document
     var ok: i32 = 0
-    if collection_get(col, id, @doc, buf, MAX_DOC_SIZE) == ERR_OK
+    if collection_get(col, id, @doc, head(buf, MAX_DOC_SIZE)) == ERR_OK
         var f: Field
         if doc_get_field(@doc, "c", @f) == ERR_OK and field_string_len(@f) == len
             ok = 1
@@ -364,14 +374,15 @@ fn has_big(col: *Collection, id: *DocumentId, len: i64, seed: i64) -> i32
 # reached the WAL (crash mid-flush) is redone, its new chain included.
 [[test]]
 fn test_restart_keeps_large_documents() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "large")
-    rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("large")
+    rm_dir_flat(path.as_view())
 
-    var s: *Storage = open_store(@path[0])
+    var s_owner: Box<Storage> = open_store(path.as_view())
+
+    var s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
-    var col: Collection
+    var col: Collection = collection_empty()
     if collection_open_storage(@col, s, 1) != ERR_OK
         return 2
     var a: DocumentId
@@ -382,7 +393,9 @@ fn test_restart_keeps_large_documents() -> i32
         return 4
     storage_destroy(s)
 
-    s = open_store(@path[0])
+    s_owner = open_store(path.as_view())
+
+    s = s_owner.as_ptr()
     if s == null or collection_open_storage(@col, s, 1) != ERR_OK
         return 5
     if has_big(@col, @a, 20000, 1) == 0 or has_big(@col, @b, MAX_DOC_SIZE - 100, 2) == 0
@@ -396,7 +409,9 @@ fn test_restart_keeps_large_documents() -> i32
     if storage_wal_commit(s) != ERR_OK
         return 8
 
-    s = open_store(@path[0])
+    s_owner = open_store(path.as_view())
+
+    s = s_owner.as_ptr()
     if s == null or collection_open_storage(@col, s, 1) != ERR_OK
         return 9
     var rc: i32 = 0
@@ -405,21 +420,22 @@ fn test_restart_keeps_large_documents() -> i32
     else if has_big(@col, @b, MAX_DOC_SIZE - 100, 2) == 0
         rc = 11
     storage_destroy(s)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     rc
 
 # The pages a deleted large document gave back are still free after a
 # restart: inserting another one does not grow data.m7m.
 [[test]]
 fn test_restart_reuses_pages_freed_before_it() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "freed")
-    rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("freed")
+    rm_dir_flat(path.as_view())
 
-    var s: *Storage = open_store(@path[0])
+    var s_owner: Box<Storage> = open_store(path.as_view())
+
+    var s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
-    var col: Collection
+    var col: Collection = collection_empty()
     if collection_open_storage(@col, s, 1) != ERR_OK
         return 2
     var id: DocumentId
@@ -434,7 +450,9 @@ fn test_restart_reuses_pages_freed_before_it() -> i32
     let pages: i64 = buffer_pool_page_count(storage_pool(s))
     storage_destroy(s)
 
-    s = open_store(@path[0])
+    s_owner = open_store(path.as_view())
+
+    s = s_owner.as_ptr()
     if s == null or collection_open_storage(@col, s, 1) != ERR_OK
         return 7
     if put_big(@col, @id, MAX_DOC_SIZE - 100, 2, true) != ERR_OK
@@ -447,9 +465,9 @@ fn test_restart_reuses_pages_freed_before_it() -> i32
     else if has_big(@col, @id, MAX_DOC_SIZE - 100, 2) == 0
         rc = 11
     storage_destroy(s)
-    if rc == 0 and store_file_size(@path[0], "/data.m7m") != pages * PAGE_SIZE
+    if rc == 0 and store_file_size(path.as_view(), "/data.m7m") != pages * PAGE_SIZE
         rc = 12
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     rc
 
 # AGAST #4205: nothing of an uncommitted write reaches data.m7m.  A rewrite
@@ -461,14 +479,15 @@ fn test_restart_reuses_pages_freed_before_it() -> i32
 # both at reopen and after a new large document reuses whatever is free.
 [[test]]
 fn test_crash_before_commit_keeps_evicted_chain() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "nosteal")
-    rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("nosteal")
+    rm_dir_flat(path.as_view())
 
-    var s: *Storage = open_store(@path[0])
+    var s_owner: Box<Storage> = open_store(path.as_view())
+
+    var s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
-    var col: Collection
+    var col: Collection = collection_empty()
     if collection_open_storage(@col, s, 1) != ERR_OK
         return 2
     var a: DocumentId
@@ -478,7 +497,9 @@ fn test_crash_before_commit_keeps_evicted_chain() -> i32
         return 4
     storage_destroy(s)
 
-    s = open_store(@path[0])
+    s_owner = open_store(path.as_view())
+
+    s = s_owner.as_ptr()
     if s == null or collection_open_storage(@col, s, 1) != ERR_OK
         return 5
     let free_before: i64 = buffer_pool_free_page_count(storage_pool(s))
@@ -500,7 +521,9 @@ fn test_crash_before_commit_keeps_evicted_chain() -> i32
         p += 1
     # No commit, no close: the process "dies" here.
 
-    s = open_store(@path[0])
+    s_owner = open_store(path.as_view())
+
+    s = s_owner.as_ptr()
     if s == null or collection_open_storage(@col, s, 1) != ERR_OK
         return 9
     var rc: i32 = 0
@@ -516,5 +539,5 @@ fn test_crash_before_commit_keeps_evicted_chain() -> i32
     if rc == 0 and has_big(@col, @b, MAX_DOC_SIZE - 100, 3) == 0
         rc = 14
     storage_destroy(s)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     rc

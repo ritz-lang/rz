@@ -12,7 +12,7 @@ import ritzlib.io
 import ritzlib.fmt
 import ritzlib.span { Span }
 import ritzlib.strview
-import ritzlib.memory
+import ritzlib.box
 
 import lib.m7m_types
 import lib.protocol
@@ -58,31 +58,32 @@ fn bad_int_arg(flag: StrView, value: StrView) -> i32
 # Wiki Page Document Creation
 # ============================================================================
 
-fn create_wiki_page_doc(slug: StrView, title: StrView, content: StrView, buf: *u8, buf_len: i64) -> i64
+fn create_wiki_page_doc(slug: StrView, title: StrView, content: StrView, buf: [u8]) -> i64
     var doc: Document
     var tmp_id: DocumentId = doc_id_invalid()
     doc_init(@doc, @tmp_id)
 
-    var slug_field: Field = field_string(slug.ptr, slug.len)
+    var slug_field: Field = field_string(slug)
     doc_set_field(@doc, "slug", @slug_field)
 
-    var title_field: Field = field_string(title.ptr, title.len)
+    var title_field: Field = field_string(title)
     doc_set_field(@doc, "title", @title_field)
 
-    var content_field: Field = field_string(content.ptr, content.len)
+    var content_field: Field = field_string(content)
     doc_set_field(@doc, "content", @content_field)
 
     var version_field: Field = field_int(1)
     doc_set_field(@doc, "version", @version_field)
 
-    return doc_serialize(@doc, buf, buf_len)
+    return doc_serialize(@doc, buf)
 
 fn insert_page(client: *Client, slug: StrView, title: StrView, content: StrView) -> i64
     var buf: [8192]u8
-    let doc_size: i64 = create_wiki_page_doc(slug, title, content, @buf[0], 8192)
+    let doc_size: i64 = create_wiki_page_doc(slug, title, content, @buf)
     if doc_size < 0
         return -1
-    return client_insert(client, @buf[0], doc_size as i32)
+    let doc: [u8] = @buf
+    return client_insert(client, doc[0..doc_size])
 
 # ============================================================================
 # Seed Pages
@@ -150,10 +151,10 @@ struct WelcomeHunt
     doc_id: i64
     len: i32
 
-fn welcome_hunt_step(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
+fn welcome_hunt_step(doc_id: i64, data: [u8], user: *u8) -> i32
     let hunt: *WelcomeHunt = user as *WelcomeHunt
     var doc: Document
-    if doc_deserialize(data, len as i64, @doc) != ERR_OK
+    if doc_deserialize(data, @doc) != ERR_OK
         return 0
     var slug: Field
     if doc_get_field(@doc, "slug", @slug) != ERR_OK or slug.ftype != FIELD_STRING
@@ -162,7 +163,7 @@ fn welcome_hunt_step(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
         return 0
     hunt.found = 1
     hunt.doc_id = doc_id
-    hunt.len = len
+    hunt.len = data.len as i32
     return 1   # stop the scan
 
 # The seeded welcome page is in the collection, found by its slug.  (This
@@ -261,7 +262,8 @@ pub fn main(args: Span<StrView>) -> i32
     else
         prints(" (encrypted)...\n")
 
-    var client: *Client = client_new()
+    var client_owner: Box<Client> = client_new()
+    let client: *Client = client_owner.as_ptr()
     if client == null
         print_error("Failed to create client")
         return 1

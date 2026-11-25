@@ -13,6 +13,7 @@ import ritzlib.fs { remove_dir_all, path_exists }
 import ritzlib.str
 import ritzlib.string
 import ritzlib.option
+import ritzlib.box
 
 import lib.m7m_types
 import lib.page
@@ -23,17 +24,16 @@ import lib.storage
 # Helpers
 # ============================================================================
 
-# Write "/tmp/mausoleum_persist_<pid>" (NUL-terminated) into buf.
-fn make_tmp_path(buf: [u8])
+# "/tmp/mausoleum_persist_<pid>".
+fn make_tmp_path() -> String
     let pid: i32 = process_id()
     var name: String = string_new()
     format_into(@&name, "/tmp/mausoleum_persist_{pid}")
-    m7m_path_join(buf, name.as_view(), "")
+    return name
 
 # Remove the directory and everything in it (ritzlib.fs remove_dir_all).
 # Returns 0 if the directory is gone afterwards (or never existed).
-fn rm_dir_flat(dir: *u8) -> i32
-    let path: StrView = strview_from_cstr(dir)
+fn rm_dir_flat(path: StrView) -> i32
     remove_dir_all(path)
     if path_exists(path)
         return 1
@@ -41,11 +41,11 @@ fn rm_dir_flat(dir: *u8) -> i32
 
 # The actual round trip. Every early return destroys whatever storage it
 # opened; the caller removes the directory.
-fn run_open_commit_reopen(path: *u8) -> i32
-    let storage_opt: Option<*Storage> = storage_open(path)
-    if option_is_none<*Storage>(@storage_opt)
-        return 1
-    let storage: *Storage = option_unwrap_or<*Storage>(@storage_opt, null)
+fn run_open_commit_reopen(path: StrView) -> i32
+    var storage_owner: Box<Storage> = match storage_open(path)
+        Some(v) => v
+        None => return 1
+    let storage: *Storage = storage_owner.as_ptr()
     if storage_is_open(storage) != 1
         storage_destroy(storage)
         return 2
@@ -78,10 +78,10 @@ fn run_open_commit_reopen(path: *u8) -> i32
     storage_destroy(storage)
 
     # Reopen from disk: the committed page must still be there.
-    let storage2_opt: Option<*Storage> = storage_open(path)
-    if option_is_none<*Storage>(@storage2_opt)
-        return 8
-    let storage2: *Storage = option_unwrap_or<*Storage>(@storage2_opt, null)
+    var storage2_owner: Box<Storage> = match storage_open(path)
+        Some(v) => v
+        None => return 8
+    let storage2: *Storage = storage2_owner.as_ptr()
     if storage_is_open(storage2) != 1
         storage_destroy(storage2)
         return 9
@@ -100,14 +100,13 @@ fn run_open_commit_reopen(path: *u8) -> i32
 
 [[test]]
 fn test_storage_open_commit_reopen() -> i32
-    var path: [64]u8
-    make_tmp_path(@path)
-    if rm_dir_flat(@path[0]) != 0
+    let path: String = make_tmp_path()
+    if rm_dir_flat(path.as_view()) != 0
         return 20  # stale directory we cannot remove
 
-    let rc: i32 = run_open_commit_reopen(@path[0])
+    let rc: i32 = run_open_commit_reopen(path.as_view())
 
-    let cleaned: i32 = rm_dir_flat(@path[0])
+    let cleaned: i32 = rm_dir_flat(path.as_view())
     if rc != 0
         return rc
     if cleaned != 0

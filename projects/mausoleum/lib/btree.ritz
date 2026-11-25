@@ -43,7 +43,7 @@
 
 import ritzlib.sys
 import ritzlib.str
-import ritzlib.memory
+import ritzlib.cmp
 import ritzlib.gvec
 import ritzlib.span
 import ritzlib.option
@@ -102,7 +102,6 @@ struct BTreeIter
     page_id: i64
     slot_idx: i32
     end_key: Vec<u8>           # copy of the scan's end key (empty: none)
-    end_key_len: i32
     exhausted: i32
 
 # ============================================================================
@@ -144,13 +143,21 @@ fn read_key_len(entry: *u8) -> i32
 fn read_val_len(entry: *u8) -> i32
     return (entry[2] as i32) | ((entry[3] as i32) << 8)
 
-# Get key pointer from entry
-fn get_entry_key(entry: *u8) -> *u8
-    return entry + 4
+# A node's bytes: its page's data area (or a copy of one).
+fn node_bytes(page: *Page) -> [u8]
+    let bytes: [u8] = @page.data
+    return bytes
 
-# Get value pointer from entry (leaf nodes)
-fn get_entry_value(entry: *u8, key_len: i32) -> *u8
-    return entry + 4 + key_len
+# The key of the leaf entry at `offset` in node bytes `node`.
+fn leaf_key(node: [u8], offset: i32) -> [u8]
+    let at: i64 = offset as i64 + 4
+    return node[at..at + read_key_len(@node[offset]) as i64]
+
+# The value of the leaf entry at `offset` in node bytes `node`.
+fn leaf_value(node: [u8], offset: i32) -> [u8]
+    let entry: *u8 = @node[offset]
+    let at: i64 = offset as i64 + 4 + read_key_len(entry) as i64
+    return node[at..at + read_val_len(entry) as i64]
 
 # Read child page ID from internal node entry
 # Internal entry format: key_len(2) + child_page(8) + key
@@ -167,25 +174,11 @@ fn write_entry_child(entry: *u8, child: i64)
     for i in 0..8
         ptr[i] = ((child >> (i * 8)) & 0xFF) as u8
 
-# Get key from internal node entry (after child pointer)
-fn get_internal_entry_key(entry: *u8) -> *u8
-    return entry + 10  # key_len(2) + child(8)
-
-# Compare two keys
-fn key_compare(k1: *u8, len1: i32, k2: *u8, len2: i32) -> i32
-    var min_len: i32 = len1
-    if len2 < min_len
-        min_len = len2
-
-    let cmp: i32 = memcmp(k1, k2, min_len as i64)
-    if cmp != 0
-        return cmp
-
-    if len1 < len2
-        return -1
-    if len1 > len2
-        return 1
-    return 0
+# The key of the internal entry at `offset` in node bytes `node` (after
+# key_len(2) and the child(8)).
+fn internal_key(node: [u8], offset: i32) -> [u8]
+    let at: i64 = offset as i64 + 10
+    return node[at..at + read_key_len(@node[offset]) as i64]
 
 # Calculate space needed for a leaf entry
 fn leaf_entry_size(key_len: i32, val_len: i32) -> i32
@@ -212,7 +205,7 @@ fn node_free_space(page: *Page) -> i32
     return data_start - slots_end
 
 # Binary search for key position in leaf node
-fn find_key_position(page: *Page, key: *u8, key_len: i32, found: *i32) -> i32
+fn find_key_position(page: *Page, key: [u8], found: *i32) -> i32
     let header: *BTreeNodeHeader = get_node_header(page)
     *found = 0
 
@@ -228,15 +221,11 @@ fn find_key_position(page: *Page, key: *u8, key_len: i32, found: *i32) -> i32
         var length: i32 = 0
         read_slot(page, mid, @offset, @length)
 
-        let entry: *u8 = get_entry_ptr(page, offset)
-        let entry_key_len: i32 = read_key_len(entry)
-        let entry_key: *u8 = get_entry_key(entry)
+        let cmp: Ordering = key.cmp(@leaf_key(node_bytes(page), offset))
 
-        let cmp: i32 = key_compare(key, key_len, entry_key, entry_key_len)
-
-        if cmp < 0
+        if cmp.is_lt()
             hi = mid
-        else if cmp > 0
+        else if cmp.is_gt()
             lo = mid + 1
         else
             *found = 1
@@ -245,7 +234,7 @@ fn find_key_position(page: *Page, key: *u8, key_len: i32, found: *i32) -> i32
     return lo
 
 # Binary search in internal node - returns child index
-fn find_child_position(page: *Page, key: *u8, key_len: i32) -> i32
+fn find_child_position(page: *Page, key: [u8]) -> i32
     let header: *BTreeNodeHeader = get_node_header(page)
 
     if header.num_keys == 0
@@ -260,15 +249,11 @@ fn find_child_position(page: *Page, key: *u8, key_len: i32) -> i32
         var length: i32 = 0
         read_slot(page, mid, @offset, @length)
 
-        let entry: *u8 = get_entry_ptr(page, offset)
-        let entry_key_len: i32 = read_key_len(entry)
-        let entry_key: *u8 = get_internal_entry_key(entry)
+        let cmp: Ordering = key.cmp(@internal_key(node_bytes(page), offset))
 
-        let cmp: i32 = key_compare(key, key_len, entry_key, entry_key_len)
-
-        if cmp < 0
+        if cmp.is_lt()
             hi = mid
-        else if cmp > 0
+        else if cmp.is_gt()
             lo = mid + 1
         else
             return mid + 1  # Go right for equal keys
@@ -298,19 +283,15 @@ fn is_leaf(page: *Page) -> i32
 # B-tree Creation/Destruction
 # ============================================================================
 
-pub fn btree_create(pool: *BufferPool) -> Option<*BTree>
+# A BTree is a plain value (its pages belong to the pool): the owner holds it
+# and passes `@tree`.
+pub fn btree_create(pool: *BufferPool) -> Option<BTree>
     if pool == null
-        return None
-
-    # Allocate tree structure
-    let tree: *BTree = malloc(sizeof(BTree)) as *BTree
-    if tree == null
         return None
 
     # Allocate root page (leaf node)
     let root_opt = buffer_pool_alloc(pool, PAGE_MAGIC_BTREE)
     if option_is_none<*Page>(@root_opt)
-        free(tree as *u8)
         return None
     let root: *Page = option_unwrap_or<*Page>(@root_opt, null)
 
@@ -325,19 +306,12 @@ pub fn btree_create(pool: *BufferPool) -> Option<*BTree>
 
     buffer_pool_unpin(pool, root_id, 1)
 
-    # Initialize tree
-    tree.pool = pool
-    tree.root_page_id = root_id
-    tree.height = 1
-    tree.count = 0
-    tree.node_count = 1
-
-    return Some(tree)
+    return Some(BTree { pool: pool, root_page_id: root_id, height: 1, count: 0, node_count: 1 })
 
 # Reattach to an existing B-tree whose root is page `root_page_id` (as
 # recorded by a previous run; see CollectionMeta).  The root must be a
 # B-tree page: None otherwise, so a stale or wrong root is not walked.
-pub fn btree_open(pool: *BufferPool, root_page_id: i64, height: i32, count: i64, node_count: i64) -> Option<*BTree>
+pub fn btree_open(pool: *BufferPool, root_page_id: i64, height: i32, count: i64, node_count: i64) -> Option<BTree>
     if pool == null or root_page_id < 0 or height < 1
         return None
 
@@ -350,21 +324,21 @@ pub fn btree_open(pool: *BufferPool, root_page_id: i64, height: i32, count: i64,
     if not is_btree
         return None
 
-    let tree: *BTree = malloc(sizeof(BTree)) as *BTree
-    if tree == null
-        return None
-    tree.pool = pool
-    tree.root_page_id = root_page_id
-    tree.height = height
-    tree.count = count
-    tree.node_count = node_count
-    return Some(tree)
+    return Some(BTree { pool: pool, root_page_id: root_page_id, height: height, count: count, node_count: node_count })
 
+# A tree that is not open: what a BTree field holds before btree_create and
+# after btree_destroy.
+pub fn btree_closed() -> BTree
+    return BTree { pool: null, root_page_id: INVALID_PAGE_ID, height: 0, count: 0, node_count: 0 }
+
+pub fn btree_is_open(tree: *BTree) -> bool
+    return tree != null and tree.pool != null
+
+# Close the tree: it no longer reaches its pages (they stay in the pool).
 pub fn btree_destroy(tree: *BTree)
     if tree == null
         return
-    # Pages will be cleaned up by buffer pool
-    free(tree as *u8)
+    *tree = btree_closed()
 
 # ============================================================================
 # B-tree Statistics
@@ -396,8 +370,10 @@ pub fn btree_root_is_leaf(tree: *BTree) -> i32
 # B-tree Lookup (GET)
 # ============================================================================
 
-pub fn btree_get(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: *i32) -> i32
-    if tree == null or key == null or key_len <= 0
+# Look `key` up: ERR_OK with its value's length in *value_len and as much of
+# the value as fits copied to the front of `value` (an empty span: none).
+pub fn btree_get(tree: *BTree, key: [u8], value: [u8], value_len: *i32) -> i32
+    if tree == null or key.len <= 0
         return ERR_INVALID
 
     # Navigate to leaf
@@ -410,7 +386,7 @@ pub fn btree_get(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: *i
             return ERR_IO
         let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
-        let pos: i32 = find_child_position(page, key, key_len)
+        let pos: i32 = find_child_position(page, key)
         let child_id: i64 = get_child_at(page, pos)
 
         buffer_pool_unpin(tree.pool, page_id, 0)
@@ -424,7 +400,7 @@ pub fn btree_get(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: *i
     let leaf: *Page = option_unwrap_or<*Page>(@leaf_opt, null)
 
     var found: i32 = 0
-    let pos: i32 = find_key_position(leaf, key, key_len, @found)
+    let pos: i32 = find_key_position(leaf, key, @found)
 
     if found == 0
         buffer_pool_unpin(tree.pool, page_id, 0)
@@ -435,14 +411,9 @@ pub fn btree_get(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: *i
     var length: i32 = 0
     read_slot(leaf, pos, @offset, @length)
 
-    let entry: *u8 = get_entry_ptr(leaf, offset)
-    let entry_key_len: i32 = read_key_len(entry)
-    let entry_val_len: i32 = read_val_len(entry)
-
-    *value_len = entry_val_len
-    if entry_val_len > 0 and value != null
-        let entry_val: *u8 = get_entry_value(entry, entry_key_len)
-        memcpy(value, entry_val, entry_val_len as i64)
+    let entry_val: [u8] = leaf_value(node_bytes(leaf), offset)
+    *value_len = entry_val.len as i32
+    value.copy_from(entry_val)
 
     buffer_pool_unpin(tree.pool, page_id, 0)
     return ERR_OK
@@ -471,22 +442,27 @@ fn leaf_remove_slot(page: *Page, pos: i32)
 fn node_compact(page: *Page)
     let header: *BTreeNodeHeader = get_node_header(page)
     var copy: [4032]u8
-    memcpy(@copy[0], page_data(page), PAGE_DATA_SIZE)
+    let old: [u8] = @copy
+    let node: [u8] = node_bytes(page)
+    old.copy_from(node)
     var top: i32 = PAGE_DATA_SIZE as i32
     for i in 0..header.num_keys
         var offset: i32 = 0
         var length: i32 = 0
         read_slot(page, i, @offset, @length)
         top = top - length
-        memcpy(get_entry_ptr(page, top), @copy[offset], length as i64)
+        let dst: [u8] = node[top..top + length]
+        dst.copy_from(old[offset..offset + length])
         write_slot(page, i, top, length)
 
 # Insert entry directly into leaf. The caller makes room first; with none
 # this returns -1 and writes nothing.
-fn leaf_insert_entry(page: *Page, key: *u8, key_len: i32, val: *u8, val_len: i32) -> i32
+fn leaf_insert_entry(page: *Page, key: [u8], val: [u8]) -> i32
     let header: *BTreeNodeHeader = get_node_header(page)
+    let key_len: i32 = key.len as i32
+    let val_len: i32 = val.len as i32
     var found: i32 = 0
-    let pos: i32 = find_key_position(page, key, key_len, @found)
+    let pos: i32 = find_key_position(page, key, @found)
     let entry_size: i32 = leaf_entry_size(key_len, val_len)
 
     # Handle update case
@@ -523,9 +499,12 @@ fn leaf_insert_entry(page: *Page, key: *u8, key_len: i32, val: *u8, val_len: i32
     entry[1] = ((key_len >> 8) & 0xFF) as u8
     entry[2] = (val_len & 0xFF) as u8
     entry[3] = ((val_len >> 8) & 0xFF) as u8
-    memcpy(entry + 4, key, key_len as i64)
-    if val_len > 0 and val != null
-        memcpy(entry + 4 + key_len, val, val_len as i64)
+    let at: i32 = new_offset + 4
+    let node: [u8] = node_bytes(page)
+    let key_dst: [u8] = node[at..at + key_len]
+    let val_dst: [u8] = node[at + key_len..at + key_len + val_len]
+    key_dst.copy_from(key)
+    val_dst.copy_from(val)
 
     # Shift slots
     let shift_count: i32 = header.num_keys - pos
@@ -547,9 +526,10 @@ fn leaf_insert_entry(page: *Page, key: *u8, key_len: i32, val: *u8, val_len: i32
 
 # Insert into internal node. The caller makes room first; with none this
 # returns -1 and writes nothing (AGAST #3640), else 0.
-fn internal_insert_entry(page: *Page, key: *u8, key_len: i32, child_id: i64) -> i32
+fn internal_insert_entry(page: *Page, key: [u8], child_id: i64) -> i32
     let header: *BTreeNodeHeader = get_node_header(page)
-    let pos: i32 = find_child_position(page, key, key_len)
+    let key_len: i32 = key.len as i32
+    let pos: i32 = find_child_position(page, key)
     let entry_size: i32 = internal_entry_size(key_len)
 
     # Find data insertion point
@@ -572,7 +552,10 @@ fn internal_insert_entry(page: *Page, key: *u8, key_len: i32, child_id: i64) -> 
     entry[0] = (key_len & 0xFF) as u8
     entry[1] = ((key_len >> 8) & 0xFF) as u8
     write_entry_child(entry, child_id)
-    memcpy(entry + 10, key, key_len as i64)
+    let at: i32 = new_offset + 10
+    let node: [u8] = node_bytes(page)
+    let key_dst: [u8] = node[at..at + key_len]
+    key_dst.copy_from(key)
 
     # Shift slots
     let shift_count: i32 = header.num_keys - pos
@@ -597,11 +580,11 @@ fn internal_insert_entry(page: *Page, key: *u8, key_len: i32, child_id: i64) -> 
 #
 # Returns ERR_OK, 1 (split: *new_child_id is the new right leaf and
 # sep_key its first key), or < 0. On error the leaf is unchanged.
-fn leaf_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32, val: *u8, val_len: i32, sep_key: *u8, sep_key_len: *i32, new_child_id: *i64, did_insert: *i32) -> i32
+fn leaf_put(tree: *BTree, page: *Page, page_id: i64, key: [u8], val: [u8], sep_key: [u8], sep_key_len: *i32, new_child_id: *i64, did_insert: *i32) -> i32
     let header: *BTreeNodeHeader = get_node_header(page)
     var found: i32 = 0
-    let pos: i32 = find_key_position(page, key, key_len, @found)
-    let entry_size: i32 = leaf_entry_size(key_len, val_len)
+    let pos: i32 = find_key_position(page, key, @found)
+    let entry_size: i32 = leaf_entry_size(key.len as i32, val.len as i32)
     *new_child_id = INVALID_PAGE_ID
 
     # Bytes the leaf would hold after this put.
@@ -618,14 +601,15 @@ fn leaf_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32, val
             leaf_remove_slot(page, pos)
         if node_free_space(page) < entry_size + BTREE_SLOT_SIZE
             node_compact(page)
-        leaf_insert_entry(page, key, key_len, val, val_len)
+        leaf_insert_entry(page, key, val)
         *did_insert = 1 - found
         buffer_pool_unpin(tree.pool, page_id, 1)
         return ERR_OK
 
     # Split. Lay out the entries first, so a failure changes nothing.
     var copy: [4032]u8
-    memcpy(@copy[0], page_data(page), PAGE_DATA_SIZE)
+    let old: [u8] = @copy
+    old.copy_from(node_bytes(page))
     # A leaf holds at most 446 entries (4-byte header, 1-byte key and a slot
     # each in 4016 bytes), plus the new one.
     var offs: [512]i32      # offset of each entry in `copy`; -1 = the new one
@@ -689,19 +673,15 @@ fn leaf_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32, val
         if v >= cut
             target = new_page
         if offs[v] < 0
-            leaf_insert_entry(target, key, key_len, val, val_len)
+            leaf_insert_entry(target, key, val)
         else
-            let entry: *u8 = @copy[offs[v]]
-            let ek_len: i32 = read_key_len(entry)
-            leaf_insert_entry(target, get_entry_key(entry), ek_len, get_entry_value(entry, ek_len), read_val_len(entry))
+            leaf_insert_entry(target, leaf_key(old, offs[v]), leaf_value(old, offs[v]))
 
     # Separator: the right leaf's first key.
     var sep_offset: i32 = 0
     var sep_length: i32 = 0
     read_slot(new_page, 0, @sep_offset, @sep_length)
-    let sep_entry: *u8 = get_entry_ptr(new_page, sep_offset)
-    *sep_key_len = read_key_len(sep_entry)
-    memcpy(sep_key, get_entry_key(sep_entry), *sep_key_len as i64)
+    *sep_key_len = sep_key.copy_from(leaf_key(node_bytes(new_page), sep_offset)) as i32
 
     *did_insert = 1 - found
     *new_child_id = new_page_id
@@ -720,10 +700,10 @@ fn leaf_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32, val
 #
 # Returns ERR_OK, 1 (split: *new_child_id is the new right node and sep_key
 # the promoted key), or < 0. On error the node is unchanged.
-fn internal_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32, child_id: i64, sep_key: *u8, sep_key_len: *i32, new_child_id: *i64) -> i32
+fn internal_put(tree: *BTree, page: *Page, page_id: i64, key: [u8], child_id: i64, sep_key: [u8], sep_key_len: *i32, new_child_id: *i64) -> i32
     let header: *BTreeNodeHeader = get_node_header(page)
-    let pos: i32 = find_child_position(page, key, key_len)
-    let entry_size: i32 = internal_entry_size(key_len)
+    let pos: i32 = find_child_position(page, key)
+    let entry_size: i32 = internal_entry_size(key.len as i32)
     *new_child_id = INVALID_PAGE_ID
 
     # Bytes the node would hold after this put.
@@ -737,13 +717,14 @@ fn internal_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32,
     if used <= BTREE_NODE_CAPACITY
         if node_free_space(page) < entry_size + BTREE_SLOT_SIZE
             node_compact(page)
-        internal_insert_entry(page, key, key_len, child_id)
+        internal_insert_entry(page, key, child_id)
         buffer_pool_unpin(tree.pool, page_id, 1)
         return ERR_OK
 
     # Split. Lay out the entries first, so a failure changes nothing.
     var copy: [4032]u8
-    memcpy(@copy[0], page_data(page), PAGE_DATA_SIZE)
+    let old: [u8] = @copy
+    old.copy_from(node_bytes(page))
     # A node holds at most 267 entries (10-byte entry header, 1-byte key and a
     # slot each in 4016 bytes), plus the new one.
     var offs: [512]i32      # offset of each entry in `copy`; -1 = the new one
@@ -800,14 +781,11 @@ fn internal_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32,
     new_header.num_keys = 0
     new_header.reserved = 0
     if offs[up] < 0
-        *sep_key_len = key_len
-        memcpy(sep_key, key, key_len as i64)
+        *sep_key_len = sep_key.copy_from(key) as i32
         new_header.next_leaf = child_id
     else
-        let up_entry: *u8 = @copy[offs[up]]
-        *sep_key_len = read_key_len(up_entry)
-        memcpy(sep_key, get_internal_entry_key(up_entry), *sep_key_len as i64)
-        new_header.next_leaf = read_entry_child(up_entry)
+        *sep_key_len = sep_key.copy_from(internal_key(old, offs[up])) as i32
+        new_header.next_leaf = read_entry_child(@copy[offs[up]])
 
     # Rebuild both halves from the copy; the old node keeps its first child.
     header.num_keys = 0
@@ -818,10 +796,9 @@ fn internal_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32,
             if w > up
                 target = new_page
             if offs[w] < 0
-                internal_insert_entry(target, key, key_len, child_id)
+                internal_insert_entry(target, key, child_id)
             else
-                let entry: *u8 = @copy[offs[w]]
-                internal_insert_entry(target, get_internal_entry_key(entry), read_key_len(entry), read_entry_child(entry))
+                internal_insert_entry(target, internal_key(old, offs[w]), read_entry_child(@copy[offs[w]]))
 
     *new_child_id = new_page_id
     buffer_pool_unpin(tree.pool, new_page_id, 1)
@@ -835,7 +812,7 @@ fn internal_put(tree: *BTree, page: *Page, page_id: i64, key: *u8, key_len: i32,
 # Insert into subtree rooted at page_id
 # Returns: 0 = success, >0 = split occurred (need to insert separator into parent)
 # On split: sep_key and new_child_id are set
-fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: *u8, key_len: i32, val: *u8, val_len: i32, sep_key: *u8, sep_key_len: *i32, new_child_id: *i64, did_insert: *i32) -> i32
+fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: [u8], val: [u8], sep_key: [u8], sep_key_len: *i32, new_child_id: *i64, did_insert: *i32) -> i32
 
     let page_opt = buffer_pool_fetch(tree.pool, page_id)
     if option_is_none<*Page>(@page_opt)
@@ -843,11 +820,11 @@ fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: *u8, key_
     let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
     if level == 1
-        return leaf_put(tree, page, page_id, key, key_len, val, val_len, sep_key, sep_key_len, new_child_id, did_insert)
+        return leaf_put(tree, page, page_id, key, val, sep_key, sep_key_len, new_child_id, did_insert)
 
     else
         # Internal node - find child and recurse
-        let pos: i32 = find_child_position(page, key, key_len)
+        let pos: i32 = find_child_position(page, key)
         let child_id: i64 = get_child_at(page, pos)
 
         buffer_pool_unpin(tree.pool, page_id, 0)
@@ -856,7 +833,7 @@ fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: *u8, key_
         var child_sep_len: i32 = 0
         var child_new_id: i64 = INVALID_PAGE_ID
 
-        let err: i32 = btree_insert_recursive(tree, child_id, level - 1, key, key_len, val, val_len, @child_sep_key[0], @child_sep_len, @child_new_id, did_insert)
+        let err: i32 = btree_insert_recursive(tree, child_id, level - 1, key, val, @child_sep_key, @child_sep_len, @child_new_id, did_insert)
 
         if err != 0 and err != 1
             return err
@@ -871,16 +848,19 @@ fn btree_insert_recursive(tree: *BTree, page_id: i64, level: i32, key: *u8, key_
             return ERR_IO
         let page2: *Page = option_unwrap_or<*Page>(@page2_opt, null)
 
-        return internal_put(tree, page2, page_id, @child_sep_key[0], child_sep_len, child_new_id, sep_key, sep_key_len, new_child_id)
+        let child_sep: [u8] = @child_sep_key
+        return internal_put(tree, page2, page_id, child_sep[0..child_sep_len], child_new_id, sep_key, sep_key_len, new_child_id)
 
 # The longest value btree_put accepts under a key of `key_len` bytes.
 pub fn btree_max_value_len(key_len: i32) -> i32
     return BTREE_MAX_LEAF_ENTRY - BTREE_SLOT_SIZE - leaf_entry_size(key_len, 0)
 
-pub fn btree_put(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: i32) -> i32
+pub fn btree_put(tree: *BTree, key: [u8], value: [u8]) -> i32
+    let key_len: i32 = key.len as i32
+    let value_len: i32 = value.len as i32
     if tree == null
         return ERR_INVALID
-    if key == null or key_len <= 0
+    if key_len <= 0
         return ERR_INVALID
     if key_len > BTREE_MAX_KEY_SIZE
         return ERR_INVALID
@@ -894,7 +874,7 @@ pub fn btree_put(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: i3
     var new_child_id: i64 = INVALID_PAGE_ID
     var did_insert: i32 = 0
 
-    let err: i32 = btree_insert_recursive(tree, tree.root_page_id, tree.height, key, key_len, value, value_len, @sep_key[0], @sep_key_len, @new_child_id, @did_insert)
+    let err: i32 = btree_insert_recursive(tree, tree.root_page_id, tree.height, key, value, @sep_key, @sep_key_len, @new_child_id, @did_insert)
 
     if err != 0 and err != 1
         return err
@@ -920,7 +900,8 @@ pub fn btree_put(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: i3
 
         # Insert separator pointing to new child (always fits: the root is
         # empty)
-        internal_insert_entry(new_root, @sep_key[0], sep_key_len, new_child_id)
+        let sep: [u8] = @sep_key
+        internal_insert_entry(new_root, sep[0..sep_key_len], new_child_id)
 
         # Clear ROOT flag from old root
         let old_root_opt = buffer_pool_fetch(tree.pool, tree.root_page_id)
@@ -941,10 +922,10 @@ pub fn btree_put(tree: *BTree, key: *u8, key_len: i32, value: *u8, value_len: i3
 # B-tree Delete
 # ============================================================================
 
-pub fn btree_delete(tree: *BTree, key: *u8, key_len: i32) -> i32
+pub fn btree_delete(tree: *BTree, key: [u8]) -> i32
     if tree == null
         return ERR_INVALID
-    if key == null or key_len <= 0
+    if key.len <= 0
         return ERR_INVALID
 
     # Navigate to leaf
@@ -957,7 +938,7 @@ pub fn btree_delete(tree: *BTree, key: *u8, key_len: i32) -> i32
             return ERR_IO
         let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
-        let pos: i32 = find_child_position(page, key, key_len)
+        let pos: i32 = find_child_position(page, key)
         let child_id: i64 = get_child_at(page, pos)
 
         buffer_pool_unpin(tree.pool, page_id, 0)
@@ -973,7 +954,7 @@ pub fn btree_delete(tree: *BTree, key: *u8, key_len: i32) -> i32
     let header: *BTreeNodeHeader = get_node_header(page)
 
     var found: i32 = 0
-    let pos: i32 = find_key_position(page, key, key_len, @found)
+    let pos: i32 = find_key_position(page, key, @found)
 
     if found == 0
         buffer_pool_unpin(tree.pool, page_id, 0)
@@ -999,7 +980,9 @@ pub fn btree_delete(tree: *BTree, key: *u8, key_len: i32) -> i32
 # B-tree Iterator (Range Scan)
 # ============================================================================
 
-pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, end_len: i32) -> Option<*BTreeIter>
+# An iterator over the keys from `start_key` (empty: the first) up to but not
+# including `end_key` (empty: no end).
+pub fn btree_scan(tree: *BTree, start_key: [u8], end_key: [u8]) -> Option<BTreeIter>
     if tree == null
         return None
 
@@ -1014,8 +997,8 @@ pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, en
         let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
         var pos: i32 = 0
-        if start_key != null and start_len > 0
-            pos = find_child_position(page, start_key, start_len)
+        if start_key.len > 0
+            pos = find_child_position(page, start_key)
 
         let child_id: i64 = get_child_at(page, pos)
 
@@ -1031,32 +1014,21 @@ pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, en
 
     var found: i32 = 0
     var slot_idx: i32 = 0
-    if start_key != null and start_len > 0
-        slot_idx = find_key_position(leaf, start_key, start_len, @found)
+    if start_key.len > 0
+        slot_idx = find_key_position(leaf, start_key, @found)
 
     buffer_pool_unpin(tree.pool, page_id, 0)
 
-    # Copy end key if provided
+    # A copy of the end key: the caller's buffer need not outlive the scan
     var end_copy: Vec<u8> = vec_new<u8>()
-    var end_copy_len: i32 = 0
-    if end_key != null and end_len > 0
-        if end_copy.push_span(span_from_ptr<u8>(end_key, end_len as i64))
-            end_copy_len = end_len
-
-    # The iterator itself, last: a failure above frees only what drops
-    let iter: *BTreeIter = malloc(sizeof(BTreeIter)) as *BTreeIter
-    if iter == null
+    if not end_copy.push_span(end_key)
         return None
-    iter.tree = tree
-    iter.exhausted = 0
-    iter.end_key = end_copy
-    iter.end_key_len = end_copy_len
-    iter.page_id = page_id
-    iter.slot_idx = slot_idx
+
+    var iter: BTreeIter = BTreeIter { tree: tree, page_id: page_id, slot_idx: slot_idx, end_key: end_copy, exhausted: 0 }
 
     # The start key may sort after every key left in its leaf, or the leaf
     # may be empty: the scan begins in the next leaf with a key.
-    btree_iter_settle(iter)
+    btree_iter_settle(@iter)
 
     return Some(iter)
 
@@ -1101,16 +1073,12 @@ pub fn btree_iter_valid(iter: *BTreeIter) -> i32
         return 0
 
     # Check end key
-    if iter.end_key_len > 0
+    if iter.end_key.len() > 0
         var offset: i32 = 0
         var length: i32 = 0
         read_slot(page, iter.slot_idx, @offset, @length)
-        let entry: *u8 = get_entry_ptr(page, offset)
-        let key_len: i32 = read_key_len(entry)
-        let key: *u8 = get_entry_key(entry)
-
-        let cmp: i32 = key_compare(key, key_len, iter.end_key.as_ptr(), iter.end_key_len)
-        if cmp >= 0
+        let end: [u8] = iter.end_key[0..iter.end_key.len()]
+        if leaf_key(node_bytes(page), offset).cmp(@end).is_ge()
             buffer_pool_unpin(iter.tree.pool, iter.page_id, 0)
             return 0
 
@@ -1124,7 +1092,9 @@ pub fn btree_iter_next(iter: *BTreeIter)
     iter.slot_idx += 1
     btree_iter_settle(iter)
 
-pub fn btree_iter_key(iter: *BTreeIter, key: *u8, key_len: *i32)
+# The current key's length in *key_len and as much of it as fits copied to
+# the front of `key`.
+pub fn btree_iter_key(iter: *BTreeIter, key: [u8], key_len: *i32)
     if iter == null or iter.exhausted != 0
         *key_len = 0
         return
@@ -1139,17 +1109,15 @@ pub fn btree_iter_key(iter: *BTreeIter, key: *u8, key_len: *i32)
     var length: i32 = 0
     read_slot(page, iter.slot_idx, @offset, @length)
 
-    let entry: *u8 = get_entry_ptr(page, offset)
-    let klen: i32 = read_key_len(entry)
-    let k: *u8 = get_entry_key(entry)
-
-    *key_len = klen
-    if key != null
-        memcpy(key, k, klen as i64)
+    let k: [u8] = leaf_key(node_bytes(page), offset)
+    *key_len = k.len as i32
+    key.copy_from(k)
 
     buffer_pool_unpin(iter.tree.pool, iter.page_id, 0)
 
-pub fn btree_iter_value(iter: *BTreeIter, value: *u8, value_len: *i32)
+# The current value's length in *value_len and as much of it as fits copied
+# to the front of `value`.
+pub fn btree_iter_value(iter: *BTreeIter, value: [u8], value_len: *i32)
     if iter == null or iter.exhausted != 0
         *value_len = 0
         return
@@ -1164,24 +1132,11 @@ pub fn btree_iter_value(iter: *BTreeIter, value: *u8, value_len: *i32)
     var length: i32 = 0
     read_slot(page, iter.slot_idx, @offset, @length)
 
-    let entry: *u8 = get_entry_ptr(page, offset)
-    let klen: i32 = read_key_len(entry)
-    let vlen: i32 = read_val_len(entry)
-    let v: *u8 = get_entry_value(entry, klen)
-
-    *value_len = vlen
-    if value != null and vlen > 0
-        memcpy(value, v, vlen as i64)
+    let v: [u8] = leaf_value(node_bytes(page), offset)
+    *value_len = v.len as i32
+    value.copy_from(v)
 
     buffer_pool_unpin(iter.tree.pool, iter.page_id, 0)
-
-pub fn btree_iter_destroy(iter: *BTreeIter)
-    if iter == null
-        return
-
-    # Raw memory doesn't drop its fields: release the key copy before the block
-    iter.end_key.deinit()
-    free(iter as *u8)
 
 # Get the root page ID of the B-tree
 pub fn btree_root_page_id(tree: *BTree) -> i64

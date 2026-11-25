@@ -30,6 +30,10 @@ import lib.recovery
 # and another room's `rz test mausoleum`, AGAST #4466); the sequence separates
 # two calls inside one process.  Never a fixed path: one run's checkpoint
 # truncates the WAL another run is still reading.
+# The first n bytes of buffer `b`.
+fn head(b: [u8], n: i64) -> [u8]
+    return b[0..n]
+
 var g_test_path_seq: i64 = 0
 
 fn make_test_path(suffix: StrView) -> String
@@ -45,22 +49,17 @@ fn make_test_path(suffix: StrView) -> String
 # Remove every "<base>.wal.<segment>", not just segment 0: WAL segments left
 # behind by a crashed run must not poison the next one (AGAST #4466).  Each
 # segment is 16MB (WAL_FILE_SIZE), so 64 covers 1GB of scrap.
-fn cleanup_test_files(base_path: *u8)
-    var path_buf: [256]u8
-    let base: StrView = strview_from_cstr(base_path)
-    m7m_path_join(@path_buf, base, ".wal.")
-    let base_len: i64 = base.len
+fn cleanup_test_files(base_path: StrView)
     var seg: i32 = 0
     while seg < 64
+        var path: String = m7m_path_join(base_path, ".wal.")
         var div: i32 = 100000
-        var i: i64 = 0
         while div > 0
-            path_buf[base_len + 5 + i] = (48 + ((seg / div) % 10)) as u8
+            path.push((48 + ((seg / div) % 10)) as u8)
             div = div / 10
-            i += 1
-        path_buf[base_len + 11] = 0
-        unlink(strview_from_cstr(@path_buf[0]))
+        unlink(path.as_view())
         seg += 1
+
 
 # ============================================================================
 # Recovery Manager Creation Tests
@@ -69,13 +68,19 @@ fn cleanup_test_files(base_path: *u8)
 [[test]]
 fn test_recovery_mgr_new() -> i32
     var base_path_str: String = make_test_path("new")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let mgr: *RecoveryManager = @mgr_v
     if mgr == null
         return 1
 
@@ -87,23 +92,19 @@ fn test_recovery_mgr_new() -> i32
 [[test]]
 fn test_recovery_mgr_new_null_pool() -> i32
     var base_path_str: String = make_test_path("null_pool")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let mgr: *RecoveryManager = recovery_mgr_new(null, base_path)
-    if mgr != null
-        recovery_mgr_destroy(mgr)
+    let base_path: StrView = base_path_str.as_view()
+    if recovery_mgr_new(null, base_path).is_some()
         return 1
     return 0
 
 [[test]]
 fn test_recovery_mgr_new_null_path() -> i32
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, null)
-    if mgr != null
-        recovery_mgr_destroy(mgr)
+    if recovery_mgr_new(pool, "").is_some()
         buffer_pool_destroy(pool)
         return 1
 
@@ -117,12 +118,15 @@ fn test_recovery_mgr_new_null_path() -> i32
 [[test]]
 fn test_recovery_empty_wal() -> i32
     var base_path_str: String = make_test_path("empty")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+        Some(v) => v
+        None => return 99
+    let mgr: *RecoveryManager = @mgr_v
 
     # Recover from empty WAL (no file exists)
     let result: i32 = recovery_recover(mgr)
@@ -142,14 +146,17 @@ fn test_recovery_empty_wal() -> i32
 [[test]]
 fn test_recovery_single_committed_txn() -> i32
     var base_path_str: String = make_test_path("committed")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
     # Phase 1: Write a committed transaction to WAL
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     let txn_id: i64 = 1
@@ -161,13 +168,16 @@ fn test_recovery_single_committed_txn() -> i32
     var test_data: [16]u8
     test_data[0] = 0x42
     test_data[1] = 0x43
-    let lsn2: i64 = wal_write_insert(writer, txn_id, lsn1, page_id, 0, @test_data[0], 16)
+    let lsn2: i64 = wal_write_insert(writer, txn_id, lsn1, page_id, 0, head(@test_data, 16))
 
     let lsn3: i64 = wal_write_commit(writer, txn_id, lsn2)
     wal_writer_destroy(writer)
 
     # Phase 2: Recover - committed txn should be replayed
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+        Some(v) => v
+        None => return 99
+    let mgr: *RecoveryManager = @mgr_v
     let result: i32 = recovery_recover(mgr)
     if result != ERR_OK
         recovery_mgr_destroy(mgr)
@@ -200,14 +210,17 @@ fn test_recovery_single_committed_txn() -> i32
 [[test]]
 fn test_recovery_single_aborted_txn() -> i32
     var base_path_str: String = make_test_path("aborted")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
     # Phase 1: Write an aborted transaction to WAL
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     let txn_id: i64 = 1
@@ -217,14 +230,17 @@ fn test_recovery_single_aborted_txn() -> i32
     let page_id: i64 = page_id_tmp.value
     var test_data: [16]u8
     test_data[0] = 0x99
-    let lsn2: i64 = wal_write_insert(writer, txn_id, lsn1, page_id, 0, @test_data[0], 16)
+    let lsn2: i64 = wal_write_insert(writer, txn_id, lsn1, page_id, 0, head(@test_data, 16))
 
     # Explicitly abort
     let lsn3: i64 = wal_write_abort(writer, txn_id, lsn2)
     wal_writer_destroy(writer)
 
     # Phase 2: Recover - aborted txn should NOT be replayed
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+        Some(v) => v
+        None => return 99
+    let mgr: *RecoveryManager = @mgr_v
     let result: i32 = recovery_recover(mgr)
     if result != ERR_OK
         recovery_mgr_destroy(mgr)
@@ -256,14 +272,17 @@ fn test_recovery_single_aborted_txn() -> i32
 [[test]]
 fn test_recovery_uncommitted_txn() -> i32
     var base_path_str: String = make_test_path("uncommitted")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
     # Phase 1: Write a transaction WITHOUT commit (simulates crash)
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     let txn_id: i64 = 1
@@ -273,14 +292,17 @@ fn test_recovery_uncommitted_txn() -> i32
     let page_id: i64 = page_id_tmp.value
     var test_data: [16]u8
     test_data[0] = 0xAA
-    let lsn2: i64 = wal_write_insert(writer, txn_id, lsn1, page_id, 0, @test_data[0], 16)
+    let lsn2: i64 = wal_write_insert(writer, txn_id, lsn1, page_id, 0, head(@test_data, 16))
 
     # NO COMMIT - simulates crash
     wal_writer_flush(writer)
     wal_writer_destroy(writer)
 
     # Phase 2: Recover - uncommitted txn should be rolled back
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+        Some(v) => v
+        None => return 99
+    let mgr: *RecoveryManager = @mgr_v
     let result: i32 = recovery_recover(mgr)
     if result != ERR_OK
         recovery_mgr_destroy(mgr)
@@ -312,12 +334,15 @@ fn test_recovery_uncommitted_txn() -> i32
 [[test]]
 fn test_recovery_checkpoint_basic() -> i32
     var base_path_str: String = make_test_path("checkpoint")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+        Some(v) => v
+        None => return 99
+    let mgr: *RecoveryManager = @mgr_v
 
     # Take a checkpoint
     let result: i32 = recovery_checkpoint(mgr)
@@ -335,14 +360,17 @@ fn test_recovery_checkpoint_basic() -> i32
 [[test]]
 fn test_recovery_after_checkpoint() -> i32
     var base_path_str: String = make_test_path("after_ckpt")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
     # Phase 1: Write some transactions, then checkpoint
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     # Committed txn before checkpoint
@@ -360,13 +388,16 @@ fn test_recovery_after_checkpoint() -> i32
     let page_id: i64 = page_id_tmp.value
     var data: [8]u8
     data[0] = 0xBB
-    lsn = wal_write_insert(writer, txn2, lsn, page_id, 0, @data[0], 8)
+    lsn = wal_write_insert(writer, txn2, lsn, page_id, 0, head(@data, 8))
     lsn = wal_write_commit(writer, txn2, lsn)
 
     wal_writer_destroy(writer)
 
     # Phase 2: Recover
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+        Some(v) => v
+        None => return 99
+    let mgr: *RecoveryManager = @mgr_v
     let result: i32 = recovery_recover(mgr)
     if result != ERR_OK
         recovery_mgr_destroy(mgr)
@@ -394,13 +425,19 @@ fn test_recovery_after_checkpoint() -> i32
 [[test]]
 fn test_recovery_multiple_committed() -> i32
     var base_path_str: String = make_test_path("multi_commit")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     # Write 5 committed transactions
@@ -413,7 +450,13 @@ fn test_recovery_multiple_committed() -> i32
 
     wal_writer_destroy(writer)
 
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let mgr: *RecoveryManager = @mgr_v
     let result: i32 = recovery_recover(mgr)
     if result != ERR_OK
         recovery_mgr_destroy(mgr)
@@ -436,13 +479,19 @@ fn test_recovery_multiple_committed() -> i32
 [[test]]
 fn test_recovery_mixed_txns() -> i32
     var base_path_str: String = make_test_path("mixed")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     # Txn 1: committed
@@ -463,7 +512,13 @@ fn test_recovery_mixed_txns() -> i32
     wal_writer_flush(writer)
     wal_writer_destroy(writer)
 
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let mgr: *RecoveryManager = @mgr_v
     let result: i32 = recovery_recover(mgr)
     if result != ERR_OK
         recovery_mgr_destroy(mgr)
@@ -495,11 +550,11 @@ fn test_recovery_mixed_txns() -> i32
 [[test]]
 fn test_recovery_page_write_replay() -> i32
     var base_path_str: String = make_test_path("page_write")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
     # Create a page with known content
     var test_page: Page
@@ -512,7 +567,10 @@ fn test_recovery_page_write_replay() -> i32
     data[3] = 0xEF
 
     # Write full page image to WAL in committed transaction
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+        Some(v) => v
+        None => return 99
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
 
     let txn_id: i64 = 1
@@ -523,7 +581,10 @@ fn test_recovery_page_write_replay() -> i32
     wal_writer_destroy(writer)
 
     # Recover
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+        Some(v) => v
+        None => return 99
+    let mgr: *RecoveryManager = @mgr_v
     let result: i32 = recovery_recover(mgr)
     if result != ERR_OK
         recovery_mgr_destroy(mgr)
@@ -549,11 +610,11 @@ fn test_recovery_page_write_replay() -> i32
 [[test]]
 fn test_recovery_page_write_replays_onto_its_own_page() -> i32
     var base_path_str: String = make_test_path("own_page")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
     var img: Page
     page_init_heap(@img, 3)
@@ -561,14 +622,26 @@ fn test_recovery_page_write_replays_onto_its_own_page() -> i32
     data[0] = 0xCA
     data[1] = 0xFE
 
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
     var lsn: i64 = wal_write_begin(writer, 7)
     lsn = wal_write_page(writer, 7, lsn, 3, @img)
     lsn = wal_write_commit(writer, 7, lsn)
     wal_writer_destroy(writer)
 
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let mgr: *RecoveryManager = @mgr_v
     var rc: i32 = 0
     if recovery_recover(mgr) != ERR_OK
         rc = 1
@@ -604,18 +677,24 @@ fn test_recovery_page_write_replays_onto_its_own_page() -> i32
 [[test]]
 fn test_recovery_torn_tail_keeps_committed_prefix() -> i32
     var base_path_str: String = make_test_path("torn_tail")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
     var img: Page
     page_init_heap(@img, 2)
     let data: *u8 = page_data(@img)
     data[0] = 0x42
 
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
     var lsn: i64 = wal_write_begin(writer, 1)
     lsn = wal_write_page(writer, 1, lsn, 2, @img)
@@ -623,17 +702,22 @@ fn test_recovery_torn_tail_keeps_committed_prefix() -> i32
     wal_writer_destroy(writer)
 
     # Append half a record header.
-    var path_buf: [256]u8
-    m7m_path_join(@path_buf, strview_from_cstr(base_path), ".wal.000000")
+    let path_buf: String = m7m_path_join(base_path, ".wal.000000")
     var junk: [16]u8 = [0x5A; 16]
-    match fd_open(strview_from_cstr(@path_buf[0]), O_WRONLY | O_APPEND, 420)
+    match fd_open(path_buf.as_view(), O_WRONLY | O_APPEND, 420)
         Ok(f) =>
             var wal: Fd = f
             wal.write_all(Span<u8> { ptr: @junk[0], len: 16 })
             wal.close()
         Err(_) => return 90
 
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let mgr: *RecoveryManager = @mgr_v
     var rc: i32 = 0
     if recovery_recover(mgr) != ERR_OK
         rc = 1
@@ -669,13 +753,19 @@ fn malloc_usable_bytes(p: *u8) -> i64
 [[test]]
 fn test_recovery_txn_table_holds_max_active_txns() -> i32
     var base_path_str: String = make_test_path("max_txns")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
-    let writer: *WalWriter = wal_writer_new(base_path)
+    var writer_v: WalWriter = match wal_writer_new(base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let writer: *WalWriter = @writer_v
     wal_writer_open(writer)
     var i: i64 = 0
     while i < MAX_ACTIVE_TXNS
@@ -685,7 +775,13 @@ fn test_recovery_txn_table_holds_max_active_txns() -> i32
         i += 1
     wal_writer_destroy(writer)
 
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+
+        Some(v) => v
+
+        None => return 99
+
+    let mgr: *RecoveryManager = @mgr_v
     var rc: i32 = 0
     if mgr == null
         rc = 1
@@ -715,21 +811,20 @@ fn test_recovery_txn_table_holds_max_active_txns() -> i32
 [[test]]
 fn test_recovery_corrupted_wal() -> i32
     var base_path_str: String = make_test_path("corrupt")
-    let base_path: *u8 = base_path_str.as_ptr()
-    let pool_opt = buffer_pool_new(16)
-    if option_is_none<*BufferPool>(@pool_opt)
-        return 99
-    let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    let base_path: StrView = base_path_str.as_view()
+    var pool_v: BufferPool = match buffer_pool_new(16)
+        Some(v) => v
+        None => return 99
+    let pool: *BufferPool = @pool_v
 
     # Write garbage to WAL file
-    var path_buf: [256]u8
-    m7m_path_join(@path_buf, strview_from_cstr(base_path), ".wal.000000")
+    let path_buf: String = m7m_path_join(base_path, ".wal.000000")
 
     var garbage: [64]u8
     garbage[0] = 0xFF
     garbage[1] = 0xFE
     garbage[2] = 0xFD
-    match fd_open(strview_from_cstr(@path_buf[0]), O_RDWR | O_CREAT | O_TRUNC, 420)
+    match fd_open(path_buf.as_view(), O_RDWR | O_CREAT | O_TRUNC, 420)
         Ok(f) =>
             var wal: Fd = f
             wal.write_all(Span<u8> { ptr: @garbage[0], len: 64 })
@@ -737,7 +832,10 @@ fn test_recovery_corrupted_wal() -> i32
         Err(_) => return 90
 
     # Recovery should handle corruption gracefully
-    let mgr: *RecoveryManager = recovery_mgr_new(pool, base_path)
+    var mgr_v: RecoveryManager = match recovery_mgr_new(pool, base_path)
+        Some(v) => v
+        None => return 99
+    let mgr: *RecoveryManager = @mgr_v
     let result: i32 = recovery_recover(mgr)
     # Should return error for corrupted WAL
     if result == ERR_OK
@@ -775,8 +873,8 @@ fn test_recovery_test_paths_are_unique() -> i32
     var a: String = make_test_path("unique")
     var b: String = make_test_path("unique")
     let same: bool = a.eq_string(@b)
-    cleanup_test_files(a.as_ptr())
-    cleanup_test_files(b.as_ptr())
+    cleanup_test_files(a.as_view())
+    cleanup_test_files(b.as_view())
     if same
         return 1
     return 0

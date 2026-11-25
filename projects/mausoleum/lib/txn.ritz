@@ -18,7 +18,7 @@
 
 import ritzlib.sys
 import ritzlib.str
-import ritzlib.memory
+import ritzlib.strview
 import ritzlib.option
 import ritzlib.string
 import ritzlib.gvec
@@ -59,7 +59,7 @@ struct Txn
 
 struct TxnManager
     pool: *BufferPool               # Buffer pool for page access
-    wal_writer: *WalWriter          # WAL for durability
+    wal_writer: WalWriter           # WAL for durability
     wal_path: String                  # Base path for WAL files
 
     next_txn_id: i64                # Next transaction ID to assign
@@ -77,51 +77,39 @@ struct TxnManager
 # Transaction Manager Creation/Destruction
 # ============================================================================
 
-pub fn txn_mgr_new(pool: *BufferPool, wal_path: *u8) -> *TxnManager
-    if pool == null or wal_path == null
-        return null
+# A manager is a value its owner holds and lends as `@mgr`; its transactions
+# point back at it, so it stays where it is while they are in use.
+pub fn txn_mgr_new(pool: *BufferPool, wal_path: StrView) -> Option<TxnManager>
+    if pool == null or wal_path.len == 0
+        return None
 
-    # Copy WAL path
-    var path_copy: String = match m7m_path_copy(wal_path)
-        Some(s) => s
-        None => return null
-
-    # Active transaction slots, all TXN_INVALID (zero)
+    # Active transaction slots, all TXN_INVALID
     var active_txns: Vec<Txn> = vec_with_cap<Txn>(MAX_ACTIVE_TXNS)
     # Committed transaction tracking
     var committed_txns: Vec<i64> = vec_with_cap<i64>(MAX_COMMITTED_TXNS)
     if active_txns.cap() < MAX_ACTIVE_TXNS or committed_txns.cap() < MAX_COMMITTED_TXNS
-        return null
-    memset(active_txns.as_ptr() as *u8, 0, MAX_ACTIVE_TXNS * sizeof(Txn))
+        return None
+    for i in 0..MAX_ACTIVE_TXNS
+        active_txns.push(Txn { id: 0, state: TXN_INVALID, snapshot_ts: 0, start_lsn: 0, last_lsn: 0, mgr: null })
 
     # Create WAL writer
-    let wal_writer: *WalWriter = wal_writer_new(wal_path)
-    if wal_writer == null
-        return null
+    var wal_writer: WalWriter = match wal_writer_new(wal_path)
+        Some(w) => w
+        None => return None
+    if wal_writer_open(@wal_writer) != ERR_OK
+        return None
 
-    let open_result: i32 = wal_writer_open(wal_writer)
-    if open_result != ERR_OK
-        wal_writer_destroy(wal_writer)
-        return null
-
-    # The manager itself, last: every failure above has nothing to free
-    # but what drops on return.
-    let mgr: *TxnManager = malloc(sizeof(TxnManager)) as *TxnManager
-    if mgr == null
-        wal_writer_destroy(wal_writer)
-        return null
-
-    # Initialize
-    mgr.pool = pool
-    mgr.wal_writer = wal_writer
-    mgr.wal_path = path_copy
-    mgr.next_txn_id = 1
-    mgr.commit_ts = 1
-    mgr.active_txns = active_txns
-    mgr.active_count = 0
-    mgr.committed_txns = committed_txns
-
-    return mgr
+    let mgr: TxnManager = TxnManager {
+        pool: pool,
+        wal_writer: wal_writer,
+        wal_path: string_from(wal_path),
+        next_txn_id: 1,
+        commit_ts: 1,
+        active_txns: active_txns,
+        active_count: 0,
+        committed_txns: committed_txns
+    }
+    return Some(mgr)
 
 pub fn txn_mgr_destroy(mgr: *TxnManager)
     if mgr == null
@@ -129,21 +117,16 @@ pub fn txn_mgr_destroy(mgr: *TxnManager)
 
     # Abort any active transactions
     var i: i64 = 0
-    while i < MAX_ACTIVE_TXNS
+    while i < mgr.active_txns.len()
         let txn: *Txn = mgr.active_txns.get_ptr(i)
         if txn.state == TXN_ACTIVE
             txn.state = TXN_ABORTED
         i += 1
 
-    if mgr.wal_writer != null
-        wal_writer_destroy(mgr.wal_writer)
-
-    # Raw memory doesn't drop its fields: release them before the block
+    wal_writer_destroy(@mgr.wal_writer)
     mgr.committed_txns.deinit()
     mgr.active_txns.deinit()
     mgr.wal_path.deinit()
-
-    free(mgr as *u8)
 
 # ============================================================================
 # Transaction Lifecycle
@@ -174,7 +157,7 @@ pub fn txn_begin(mgr: *TxnManager) -> *Txn
     let snapshot_ts: i64 = mgr.commit_ts
 
     # Write BEGIN to WAL
-    let begin_lsn: i64 = wal_write_begin(mgr.wal_writer, txn_id)
+    let begin_lsn: i64 = wal_write_begin(@mgr.wal_writer, txn_id)
     if begin_lsn < 0
         return null
 
@@ -202,7 +185,7 @@ pub fn txn_commit(txn: *Txn) -> i32
         return ERR_INVALID
 
     # Write COMMIT to WAL
-    let commit_lsn: i64 = wal_write_commit(mgr.wal_writer, txn.id, txn.last_lsn)
+    let commit_lsn: i64 = wal_write_commit(@mgr.wal_writer, txn.id, txn.last_lsn)
     if commit_lsn < 0
         return ERR_IO
 
@@ -232,7 +215,7 @@ pub fn txn_abort(txn: *Txn) -> i32
         return ERR_INVALID
 
     # Write ABORT to WAL
-    let abort_lsn: i64 = wal_write_abort(mgr.wal_writer, txn.id, txn.last_lsn)
+    let abort_lsn: i64 = wal_write_abort(@mgr.wal_writer, txn.id, txn.last_lsn)
     if abort_lsn < 0
         # Even if WAL write fails, mark as aborted
         txn.state = TXN_ABORTED

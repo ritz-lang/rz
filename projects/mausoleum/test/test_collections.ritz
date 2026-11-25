@@ -22,6 +22,7 @@ import ritzlib.fs { remove_dir_all, copy_file, mkdir }
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.option
+import ritzlib.box
 
 import lib.m7m_types
 import lib.page
@@ -32,37 +33,41 @@ import lib.collection
 import lib.btree
 import lib.registry
 
+# The first n bytes of buffer `b`.
+fn head(b: [u8], n: i64) -> [u8]
+    return b[0..n]
+
 # ============================================================================
 # Helpers
 # ============================================================================
 
-# "/tmp/m7m_colls_<pid>_<tag>" into buf (NUL-terminated).
-fn make_tmp_path(buf: [u8], tag: StrView)
+# "/tmp/m7m_colls_<pid>_<tag>".
+fn make_tmp_path(tag: StrView) -> String
     let pid: i32 = process_id()
     var name: String = string_new()
     format_into(@&name, "/tmp/m7m_colls_{pid}_")
     name.push_str(tag)
-    m7m_path_join(buf, name.as_view(), "")
+    return name
 
 # Remove the directory and everything in it (ritzlib.fs remove_dir_all).
-fn rm_dir_flat(dir: *u8)
-    remove_dir_all(strview_from_cstr(dir))
+fn rm_dir_flat(dir: StrView)
+    remove_dir_all(dir)
 
 # Copy <src_dir><name> to <dst_dir><name>.  0 = ok.
-fn copy_named(src_dir: *u8, dst_dir: *u8, name: StrView) -> i32
-    var src: String = string_from(strview_from_cstr(src_dir))
+fn copy_named(src_dir: StrView, dst_dir: StrView, name: StrView) -> i32
+    var src: String = string_from(src_dir)
     src.push_str(name)
-    var dst: String = string_from(strview_from_cstr(dst_dir))
+    var dst: String = string_from(dst_dir)
     dst.push_str(name)
     match copy_file(src.as_view(), dst.as_view(), 420)
         Ok(_) => 0
         Err(_) => 1
 
-# A fresh copy of fixture `fixture` (e.g. c"test/fixtures/store_v1_clean")
+# A fresh copy of fixture `fixture` (e.g. "test/fixtures/store_v1_clean")
 # at `dst`.  0 = ok.
-fn copy_fixture(fixture: *u8, dst: *u8) -> i32
+fn copy_fixture(fixture: StrView, dst: StrView) -> i32
     rm_dir_flat(dst)
-    match mkdir(strview_from_cstr(dst), 493)
+    match mkdir(dst, 493)
         Ok(_) => pass
         Err(_) => return 1
     if copy_named(fixture, dst, "/meta.m7m") != 0
@@ -73,11 +78,11 @@ fn copy_fixture(fixture: *u8, dst: *u8) -> i32
         return 4
     return 0
 
-fn open_store(path: *u8) -> *Storage
-    let opt: Option<*Storage> = storage_open(path)
-    if option_is_none<*Storage>(@opt)
-        return null
-    return option_unwrap_or<*Storage>(@opt, null)
+fn open_store(path: StrView) -> Box<Storage>
+    # Empty if the store would not open
+    match storage_open(path)
+        Some(s) => return s
+        None => return box_empty<Storage>()
 
 # Insert {"n": n, "tag": tag}.
 fn insert_tagged(col: *Collection, n: i32, tag: i64) -> i32
@@ -107,18 +112,18 @@ fn fill(col: *Collection, s: *Storage, count: i32, tag: i64) -> i32
 # Scan `col`: the number of documents, or -1 if one is not tagged `tag`
 # (tag < 0: don't check tags) or not stamped with the collection's id.
 fn scan_count(col: *Collection, tag: i64) -> i32
-    let iter_opt = collection_scan(col)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        return -2
-    let iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    var iter_v: BTreeIter = match collection_scan(col)
+        Some(v) => v
+        None => return -2
+    let iter: *BTreeIter = @iter_v
     var count: i32 = 0
     var bad: i32 = 0
     while btree_iter_valid(iter) == 1
         var val_len: i32 = 0
         var val: [2048]u8
-        btree_iter_value(iter, @val[0], @val_len)
+        btree_iter_value(iter, @val, @val_len)
         var doc: Document
-        if doc_deserialize(@val[0], val_len as i64, @doc) != ERR_OK
+        if doc_deserialize(head(@val, val_len as i64), @doc) != ERR_OK
             bad = 1
         else
             if doc_id_collection(@doc.id) != col.collection_id
@@ -131,7 +136,6 @@ fn scan_count(col: *Collection, tag: i64) -> i32
                     bad = 1
         count += 1
         btree_iter_next(iter)
-    btree_iter_destroy(iter)
     if bad != 0
         return -1
     return count
@@ -141,7 +145,7 @@ fn has_numbered(col: *Collection, cid: i32, seq: i32) -> i32
     var id: DocumentId = doc_id_new(cid, seq)
     var doc: Document
     var doc_buf: [2048]u8
-    if collection_get(col, @id, @doc, @doc_buf[0], 2048) != ERR_OK
+    if collection_get(col, @id, @doc, head(@doc_buf, 2048)) != ERR_OK
         return 0
     var nf: Field
     if doc_get_field(@doc, "n", @nf) != ERR_OK
@@ -158,14 +162,14 @@ fn has_numbered(col: *Collection, cid: i32, seq: i32) -> i32
 # document ids carry each collection's own id.
 [[test]]
 fn test_named_collections_scan_only_their_own() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "sep")
-    rm_dir_flat(@path[0])
-    let s: *Storage = open_store(@path[0])
+    let path: String = make_tmp_path("sep")
+    rm_dir_flat(path.as_view())
+    var s_owner: Box<Storage> = open_store(path.as_view())
+    let s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
-    var a: Collection
-    var b: Collection
+    var a: Collection = collection_empty()
+    var b: Collection = collection_empty()
     var rc: i32 = 0
     if collection_open_named(@a, s, c"a", 1) != ERR_OK
         rc = 2
@@ -182,16 +186,16 @@ fn test_named_collections_scan_only_their_own() -> i32
     else if scan_count(@b, 200) != 3
         rc = 8
     storage_destroy(s)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc
 
 # The same name finds the same collection; an unknown one is created.
 [[test]]
 fn test_storage_collection_lookup() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "lookup")
-    rm_dir_flat(@path[0])
-    let s: *Storage = open_store(@path[0])
+    let path: String = make_tmp_path("lookup")
+    rm_dir_flat(path.as_view())
+    var s_owner: Box<Storage> = open_store(path.as_view())
+    let s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
     var rc: i32 = 0
@@ -214,17 +218,17 @@ fn test_storage_collection_lookup() -> i32
         else if storage_collection_count(s) != 2
             rc = 9
     storage_destroy(s)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc
 
 # Names longer than MAX_COLLECTION_NAME are refused, and so is the
 # MAX_COLLECTIONS + 1st collection.
 [[test]]
 fn test_storage_collection_limits() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "limits")
-    rm_dir_flat(@path[0])
-    let s: *Storage = open_store(@path[0])
+    let path: String = make_tmp_path("limits")
+    rm_dir_flat(path.as_view())
+    var s_owner: Box<Storage> = open_store(path.as_view())
+    let s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
     var rc: i32 = 0
@@ -252,25 +256,25 @@ fn test_storage_collection_limits() -> i32
     if rc == 0 and storage_collection_create(s, c"one-too-many", 12) >= 0
         rc = 6
     storage_destroy(s)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc
 
 # A clean restart keeps both collections, their documents and counters.
 [[test]]
 fn test_named_collections_survive_restart() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "restart")
-    rm_dir_flat(@path[0])
-    let s: *Storage = open_store(@path[0])
+    let path: String = make_tmp_path("restart")
+    rm_dir_flat(path.as_view())
+    var s_owner: Box<Storage> = open_store(path.as_view())
+    let s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
-    var a: Collection
-    var b: Collection
+    var a: Collection = collection_empty()
+    var b: Collection = collection_empty()
     if collection_open_named(@a, s, c"a", 1) != ERR_OK or collection_open_named(@b, s, c"b", 1) != ERR_OK
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 2
     if fill(@a, s, 2, 100) != 0 or fill(@b, s, 3, 200) != 0
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 3
     let a_id: i32 = a.collection_id
     let b_id: i32 = b.collection_id
@@ -278,13 +282,15 @@ fn test_named_collections_survive_restart() -> i32
     collection_destroy(@b)
     storage_destroy(s)
 
-    let s2: *Storage = open_store(@path[0])
+    var s2_owner: Box<Storage> = open_store(path.as_view())
+
+    let s2: *Storage = s2_owner.as_ptr()
     if s2 == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 4
     var rc: i32 = 0
-    var a2: Collection
-    var b2: Collection
+    var a2: Collection = collection_empty()
+    var b2: Collection = collection_empty()
     if collection_open_named(@a2, s2, c"a", 1) != ERR_OK or collection_open_named(@b2, s2, c"b", 1) != ERR_OK
         rc = 5
     else if a2.collection_id != a_id or b2.collection_id != b_id
@@ -304,7 +310,7 @@ fn test_named_collections_survive_restart() -> i32
         if collection_insert(@a2, @doc, @id) != ERR_OK or doc_id_sequence(@id) != 3
             rc = 10
     storage_destroy(s2)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc
 
 # kill -9 right after the WAL commit of a brand-new collection, before
@@ -312,37 +318,39 @@ fn test_named_collections_survive_restart() -> i32
 # collection, its name and its documents.
 [[test]]
 fn test_new_collection_recovers_from_wal_alone() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "walonly")
-    rm_dir_flat(@path[0])
-    let s: *Storage = open_store(@path[0])
+    let path: String = make_tmp_path("walonly")
+    rm_dir_flat(path.as_view())
+    var s_owner: Box<Storage> = open_store(path.as_view())
+    let s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
     let id: i32 = storage_collection_create(s, c"pages", 5)
     if id <= 0
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 2
-    var col: Collection
+    var col: Collection = collection_empty()
     if collection_init(@col, storage_pool(s), id) != ERR_OK
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 3
     if fill(@col, null, 4, 300) != 0
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 4
     var meta: CollectionMeta
     collection_meta(@col, @meta)
     storage_set_collection_meta_of(s, id, @meta)
     if storage_wal_commit(s) != ERR_OK
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 5
     # No storage_destroy: the process "dies" here.
 
-    let s2: *Storage = open_store(@path[0])
+    var s2_owner: Box<Storage> = open_store(path.as_view())
+
+    let s2: *Storage = s2_owner.as_ptr()
     if s2 == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 6
     var rc: i32 = 0
-    var col2: Collection
+    var col2: Collection = collection_empty()
     if storage_collection_find(s2, c"pages", 5) != id
         rc = 7
     else if collection_open_storage(@col2, s2, id) != ERR_OK
@@ -350,24 +358,24 @@ fn test_new_collection_recovers_from_wal_alone() -> i32
     else if scan_count(@col2, 300) != 4
         rc = 9
     storage_destroy(s2)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc
 
 # Opening a collection id that was never created is refused.
 [[test]]
 fn test_open_unknown_collection_id_is_refused() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "unknownid")
-    rm_dir_flat(@path[0])
-    let s: *Storage = open_store(@path[0])
+    let path: String = make_tmp_path("unknownid")
+    rm_dir_flat(path.as_view())
+    var s_owner: Box<Storage> = open_store(path.as_view())
+    let s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
-    var col: Collection
+    var col: Collection = collection_empty()
     var rc: i32 = 0
     if collection_open_storage(@col, s, 7) == ERR_OK
         rc = 2
     storage_destroy(s)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc
 
 # ============================================================================
@@ -376,19 +384,19 @@ fn test_open_unknown_collection_id_is_refused() -> i32
 
 # Open fixture `fixture` (copied) and check its three documents are the
 # default collection's, reachable by id and by the name "default".
-fn check_legacy_fixture(fixture: *u8, tag: StrView) -> i32
-    var path: [96]u8
-    make_tmp_path(@path, tag)
-    if copy_fixture(fixture, @path[0]) != 0
-        rm_dir_flat(@path[0])
+fn check_legacy_fixture(fixture: StrView, tag: StrView) -> i32
+    let path: String = make_tmp_path(tag)
+    if copy_fixture(fixture, path.as_view()) != 0
+        rm_dir_flat(path.as_view())
         return 1
-    let s: *Storage = open_store(@path[0])
+    var s_owner: Box<Storage> = open_store(path.as_view())
+    let s: *Storage = s_owner.as_ptr()
     if s == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 2
     var rc: i32 = 0
-    var col: Collection
-    var named: Collection
+    var col: Collection = collection_empty()
+    var named: Collection = collection_empty()
     if storage_collection_count(s) != 1
         rc = 3
     else if collection_open_storage(@col, s, DEFAULT_COLLECTION_ID) != ERR_OK
@@ -402,47 +410,49 @@ fn check_legacy_fixture(fixture: *u8, tag: StrView) -> i32
     else if named.collection_id != DEFAULT_COLLECTION_ID or collection_count(@named) != 3
         rc = 8
     storage_destroy(s)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc
 
 [[test]]
 fn test_legacy_store_opens_in_default_collection() -> i32
-    return check_legacy_fixture(c"test/fixtures/store_v1_clean", "legacy")
+    return check_legacy_fixture("test/fixtures/store_v1_clean", "legacy")
 
 # The abandoned fixture also replays the old 48-byte WAL META records.
 [[test]]
 fn test_legacy_store_with_wal_opens_in_default_collection() -> i32
-    return check_legacy_fixture(c"test/fixtures/store_v1_wal", "legacywal")
+    return check_legacy_fixture("test/fixtures/store_v1_wal", "legacywal")
 
 # A legacy store takes a new named collection and keeps both over a restart.
 [[test]]
 fn test_legacy_store_upgrade_keeps_default_and_adds_named() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "upgrade")
-    if copy_fixture(c"test/fixtures/store_v1_clean", @path[0]) != 0
-        rm_dir_flat(@path[0])
+    let path: String = make_tmp_path("upgrade")
+    if copy_fixture("test/fixtures/store_v1_clean", path.as_view()) != 0
+        rm_dir_flat(path.as_view())
         return 1
-    let s: *Storage = open_store(@path[0])
+    var s_owner: Box<Storage> = open_store(path.as_view())
+    let s: *Storage = s_owner.as_ptr()
     if s == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 2
-    var a: Collection
+    var a: Collection = collection_empty()
     if collection_open_named(@a, s, c"a", 1) != ERR_OK
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 3
     if fill(@a, s, 2, 100) != 0
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 4
     collection_destroy(@a)
     storage_destroy(s)
 
-    let s2: *Storage = open_store(@path[0])
+    var s2_owner: Box<Storage> = open_store(path.as_view())
+
+    let s2: *Storage = s2_owner.as_ptr()
     if s2 == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 5
     var rc: i32 = 0
-    var d: Collection
-    var a2: Collection
+    var d: Collection = collection_empty()
+    var a2: Collection = collection_empty()
     if collection_open_storage(@d, s2, DEFAULT_COLLECTION_ID) != ERR_OK
         rc = 6
     else if scan_count(@d, -1) != 3
@@ -452,31 +462,30 @@ fn test_legacy_store_upgrade_keeps_default_and_adds_named() -> i32
     else if scan_count(@a2, 100) != 2
         rc = 9
     storage_destroy(s2)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc
 
 # ============================================================================
 # The server's registry (what CONNECT binds a session to)
 # ============================================================================
 
-fn new_pool() -> *BufferPool
-    let opt = buffer_pool_new(256)
-    if option_is_none<*BufferPool>(@opt)
-        return null
-    return option_unwrap_or<*BufferPool>(@opt, null)
+fn new_pool() -> Box<BufferPool>
+    # Empty if out of memory
+    match buffer_pool_new(256)
+        Some(p) => return box_new<BufferPool>(p)
+        None => return box_empty<BufferPool>()
 
 # In memory: one collection per name, "" and "default" are the default one.
 [[test]]
 fn test_registry_binds_one_collection_per_name() -> i32
-    let pool: *BufferPool = new_pool()
+    var pool_owner: Box<BufferPool> = new_pool()
+    let pool: *BufferPool = pool_owner.as_ptr()
     if pool == null
         return 1
-    var def: Collection
+    var def: Collection = collection_empty()
     if collection_init(@def, pool, DEFAULT_COLLECTION_ID) != ERR_OK
         return 2
-    var reg: CollectionRegistry
-    if registry_init(@reg, pool, null, @def) != ERR_OK
-        return 3
+    var reg: CollectionRegistry = registry_new(pool, null, @def)
     var rc: i32 = 0
     let a: *Collection = registry_bind(@reg, c"a", 1)
     let b: *Collection = registry_bind(@reg, c"b", 1)
@@ -505,14 +514,14 @@ fn test_registry_binds_one_collection_per_name() -> i32
 # Too long a name, or one past the table, is refused (null), not truncated.
 [[test]]
 fn test_registry_refuses_bad_names_and_overflow() -> i32
-    let pool: *BufferPool = new_pool()
+    var pool_owner: Box<BufferPool> = new_pool()
+    let pool: *BufferPool = pool_owner.as_ptr()
     if pool == null
         return 1
-    var def: Collection
+    var def: Collection = collection_empty()
     if collection_init(@def, pool, DEFAULT_COLLECTION_ID) != ERR_OK
         return 2
-    var reg: CollectionRegistry
-    registry_init(@reg, pool, null, @def)
+    var reg: CollectionRegistry = registry_new(pool, null, @def)
     var rc: i32 = 0
     var name: [128]u8
     var i: i32 = 0
@@ -541,18 +550,17 @@ fn test_registry_refuses_bad_names_and_overflow() -> i32
 # On storage, binding an unknown name creates it there, so a restart finds it.
 [[test]]
 fn test_registry_creates_unknown_names_on_storage() -> i32
-    var path: [96]u8
-    make_tmp_path(@path, "regstore")
-    rm_dir_flat(@path[0])
-    let s: *Storage = open_store(@path[0])
+    let path: String = make_tmp_path("regstore")
+    rm_dir_flat(path.as_view())
+    var s_owner: Box<Storage> = open_store(path.as_view())
+    let s: *Storage = s_owner.as_ptr()
     if s == null
         return 1
-    var def: Collection
+    var def: Collection = collection_empty()
     if collection_open_storage(@def, s, DEFAULT_COLLECTION_ID) != ERR_OK
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 2
-    var reg: CollectionRegistry
-    registry_init(@reg, storage_pool(s), s, @def)
+    var reg: CollectionRegistry = registry_new(storage_pool(s), s, @def)
     let w: *Collection = registry_bind(@reg, c"wiki", 4)
     var rc: i32 = 0
     if w == null
@@ -563,18 +571,20 @@ fn test_registry_creates_unknown_names_on_storage() -> i32
     collection_destroy(@def)
     storage_destroy(s)
     if rc != 0
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return rc
 
-    let s2: *Storage = open_store(@path[0])
+    var s2_owner: Box<Storage> = open_store(path.as_view())
+
+    let s2: *Storage = s2_owner.as_ptr()
     if s2 == null
-        rm_dir_flat(@path[0])
+        rm_dir_flat(path.as_view())
         return 5
-    var w2: Collection
+    var w2: Collection = collection_empty()
     if collection_open_named(@w2, s2, c"wiki", 4) != ERR_OK
         rc = 6
     else if scan_count(@w2, 7) != 2
         rc = 7
     storage_destroy(s2)
-    rm_dir_flat(@path[0])
+    rm_dir_flat(path.as_view())
     return rc

@@ -23,7 +23,8 @@ import ritzlib.process { signalfd_create_for_shutdown, signalfd_read }
 import ritzlib.result
 import ritzlib.fmt
 import ritzlib.strview
-import ritzlib.span { span_from_ptr }
+import ritzlib.span
+import ritzlib.box
 import ritzlib.memory
 import ritzlib.gvec
 import ritzlib.option
@@ -39,8 +40,7 @@ import mausoleum.btree {
     btree_iter_valid,
     btree_iter_next,
     btree_iter_key,
-    btree_iter_value,
-    btree_iter_destroy
+    btree_iter_value
 }
 import mausoleum.document
 import mausoleum.server_async
@@ -78,7 +78,7 @@ struct Args
     port: i32
     host: StrView       # Host as StrView (idiomatic Ritz)
     collection: StrView # shell: collection to CONNECT to (--collection)
-    data_dir: *u8       # Data directory for persistence (null = in-memory)
+    data_dir: StrView   # Data directory for persistence (empty = in-memory)
     no_encryption: i32  # 1 = disable encryption (for development)
     serial_mode: i32    # 1 = use legacy serial serve loop (--serial, phase 7
                         #     bisect escape hatch; default = io_uring async)
@@ -99,7 +99,7 @@ fn parse_args(args: Span<StrView>, out: *Args)
     out.port = DEFAULT_PORT
     out.host = default_host()
     out.collection = default_collection()
-    out.data_dir = null
+    out.data_dir = ""
     out.no_encryption = 0
     out.serial_mode = 0
     out.explicit_encrypted = 0
@@ -132,7 +132,7 @@ fn parse_args(args: Span<StrView>, out: *Args)
                     i += 1
             else if arg.eq("--data-dir") or arg.eq("-d")
                 if i + 1 < args.len
-                    out.data_dir = args[i + 1].as_ptr()
+                    out.data_dir = args[i + 1]
                     i += 2
                 else
                     i += 1
@@ -276,12 +276,13 @@ fn commit_write(storage: *Storage, col: *Collection)
 # CONNECT on the serial loops: answer it, and return the collection it names
 # (AGAST #3637; see lib/registry.ritz), or `current` if it was refused.
 fn serial_connect(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, reg: *CollectionRegistry, current: *Collection) -> *Collection
-    var name_len: i32 = 0
-    let name: *u8 = msgreader_read_bytes(reader, @name_len)
-    if name == null and name_len != 0
-        build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed collection name")
-        return current
-    let bound: *Collection = registry_bind(reg, name, name_len)
+    var name: [u8] = ""
+    match msgreader_read_bytes(reader)
+        Some(n) => name = n
+        None =>
+            build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed collection name")
+            return current
+    let bound: *Collection = registry_bind(reg, name.as_ptr(), name.len as i32)
     if bound == null
         build_error(resp, request_id, PROTO_ERR_COLLECTION_REFUSED, "Collection name too long, or too many collections")
         return current
@@ -292,10 +293,10 @@ fn serial_connect(reader: *MessageReader, resp: *MessageBuffer, request_id: i32,
 # Serve Command - Encrypted Database Server
 # ============================================================================
 
-fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> i32
+fn cmd_serve(port: i32, data_dir: StrView, no_encryption: i32, serial_mode: i32) -> i32
     print("Starting Mausoleum server...\n")
     print("  Port: {port}\n")
-    if data_dir != null
+    if data_dir.len > 0
         print("  Data: {data_dir}\n")
     else
         print("  Data: in-memory (no persistence)\n")
@@ -315,29 +316,34 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
             print("  Loop: io_uring async, encrypted (default since phase 7)\n")
     print("\n")
 
-    # Create buffer pool - either persistent or in-memory
+    # Create buffer pool - either persistent or in-memory. The owners drop
+    # (free) them when this returns; pool and storage borrow from them.
+    var storage_owner: Box<Storage> = box_empty<Storage>()
+    var pool_owner: Box<BufferPool> = box_empty<BufferPool>()
     var pool: *BufferPool = null
     var storage: *Storage = null
 
-    if data_dir != null
+    if data_dir.len > 0
         # Persistent mode - use storage engine
-        let storage_opt = storage_open(data_dir)
-        if option_is_none<*Storage>(@storage_opt)
-            print("Error: Failed to open storage at {data_dir}\n")
-            return 1
-        storage = option_unwrap_or<*Storage>(@storage_opt, null)
+        match storage_open(data_dir)
+            Some(s) => storage_owner = s
+            None =>
+                print("Error: Failed to open storage at {data_dir}\n")
+                return 1
+        storage = storage_owner.as_ptr()
         pool = storage_pool(storage)
         print("Opened persistent storage.\n")
     else
         # In-memory mode
-        let pool_opt = buffer_pool_new(BUFFER_POOL_FRAMES)
-        if option_is_none<*BufferPool>(@pool_opt)
-            print("Error: Failed to allocate buffer pool\n")
-            return 1
-        pool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+        match buffer_pool_new(BUFFER_POOL_FRAMES)
+            Some(p) => pool_owner = box_new<BufferPool>(p)
+            None =>
+                print("Error: Failed to allocate buffer pool\n")
+                return 1
+        pool = pool_owner.as_ptr()
 
     # Create or load collection
-    var collection: Collection
+    var collection: Collection = collection_empty()
     var col_result: i32 = ERR_OK
 
     if storage != null
@@ -423,8 +429,7 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
     else if serial_mode == 0
         serve_async_encrypted(sock.fd, pool, storage, @collection)
     else
-        var reg: CollectionRegistry
-        registry_init(@reg, pool, storage, @collection)
+        var reg: CollectionRegistry = registry_new(pool, storage, @collection)
         if no_encryption != 0
             serve_loop_plain(sock.fd, pool, storage, @reg)
         else
@@ -467,7 +472,7 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
 
     loop
         # Poll with 1 second timeout
-        let poll_result: i32 = match poll(span_from_ptr<PollFd>(@poll_fds[0], 2), 1000)
+        let poll_result: i32 = match poll(@poll_fds, 1000)
             Ok(n) => n
             Err(_) => continue
 
@@ -540,10 +545,12 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
 fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
     # A request and its reply: each up to ASYNC_MAX_MSG, the async loops'
     # limit, which holds a MAX_DOC_SIZE document (AGAST #3638).
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(2 * ASYNC_MAX_MSG as i64)
-    let buf: *u8 = buf_vec.as_ptr()
-    if buf == null
+    var buf_vec: Vec<u8> = m7m_scratch(2 * ASYNC_MAX_MSG as i64)
+    if buf_vec.len() < 2 * ASYNC_MAX_MSG as i64
         return
+    let request_buf: [u8] = buf_vec[0..ASYNC_MAX_MSG]
+    let reply_buf: [u8] = buf_vec[ASYNC_MAX_MSG..2 * ASYNC_MAX_MSG]
+    let buf: *u8 = request_buf.as_ptr()
     var active_txn: i64 = -1  # Track active transaction (-1 = none)
     var collection: *Collection = registry_default(reg)
 
@@ -555,7 +562,7 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *
 
         # Parse and handle M7SP message
         var reader: MessageReader
-        let result: i32 = msgreader_init(@reader, buf, n)
+        let result: i32 = msgreader_init(@reader, request_buf[0..n])
         if result != PROTO_OK
             continue
 
@@ -563,8 +570,8 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *
         let request_id: i32 = msgreader_request_id(@reader)
 
         # Handle message
-        var resp: MessageBuffer
-        msgbuf_init(@resp, buf + ASYNC_MAX_MSG, ASYNC_MAX_MSG)
+        var resp: MessageBuffer = msgbuf_empty()
+        msgbuf_init(@resp, reply_buf)
 
         if msg_type == MSG_CONNECT
             collection = serial_connect(@reader, @resp, request_id, reg, collection)
@@ -653,9 +660,9 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *
 # Payload: [doc_data_len: i32][doc_data: bytes]
 fn handle_insert(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
     # Read document data
-    var doc_len: i32 = 0
-    let doc_data: *u8 = msgreader_read_bytes(reader, @doc_len)
-    if doc_data == null or doc_len <= 0
+    let doc_data: [u8] = msgreader_read_bytes(reader).unwrap_or(span_empty<u8>())
+    let doc_len: i32 = doc_data.len as i32
+    if doc_len <= 0
         build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Missing document data")
         return
     if doc_len as i64 > MAX_DOC_SIZE
@@ -664,7 +671,7 @@ fn handle_insert(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, 
 
     # Deserialize document (doc_deserialize populates all fields)
     var doc: Document
-    let deser_result: i32 = doc_deserialize(doc_data, doc_len as i64, @doc)
+    let deser_result: i32 = doc_deserialize(doc_data, @doc)
     if deser_result != ERR_OK
         build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Failed to deserialize document")
         return
@@ -696,28 +703,28 @@ fn handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, col
     doc_id.value = doc_id_val
 
     # The stored bytes, sent as they are (see collection_get_raw)
-    var doc_buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let doc_buf: *u8 = doc_buf_vec.as_ptr()
-    if doc_buf == null
+    var doc_buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    if doc_buf_vec.len() < MAX_DOC_SIZE
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
         return
+    let doc_buf: [u8] = doc_buf_vec[0..MAX_DOC_SIZE]
     var doc_size: i64 = 0
-    let get_result: i32 = collection_get_raw(collection, @doc_id, doc_buf, MAX_DOC_SIZE, @doc_size)
+    let get_result: i32 = collection_get_raw(collection, @doc_id, doc_buf, @doc_size)
     if get_result == ERR_NOT_FOUND
         build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
     else if get_result != ERR_OK
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
     else
         print("  GET doc_id={doc_id_val} size={doc_size}\n")
-        build_get_ok(resp, request_id, doc_buf, doc_size as i32)
+        build_get_ok(resp, request_id, doc_buf[0..doc_size])
 
 # Handle UPDATE message
 # Payload: [doc_data_len: i32][doc_data: bytes]
 fn handle_update(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
     # Read document data
-    var doc_len: i32 = 0
-    let doc_data: *u8 = msgreader_read_bytes(reader, @doc_len)
-    if doc_data == null or doc_len <= 0
+    let doc_data: [u8] = msgreader_read_bytes(reader).unwrap_or(span_empty<u8>())
+    let doc_len: i32 = doc_data.len as i32
+    if doc_len <= 0
         build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Missing document data")
         return
     if doc_len as i64 > MAX_DOC_SIZE
@@ -726,7 +733,7 @@ fn handle_update(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, 
 
     # Deserialize document (doc_deserialize populates all fields)
     var doc: Document
-    let deser_result: i32 = doc_deserialize(doc_data, doc_len as i64, @doc)
+    let deser_result: i32 = doc_deserialize(doc_data, @doc)
     if deser_result != ERR_OK
         build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Failed to deserialize document")
         return
@@ -809,29 +816,28 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
 
     # A batch is up to ASYNC_MAX_MSG: room for one MAX_DOC_SIZE document,
     # or several small ones (AGAST #3638).
-    var scan_buf_vec: Vec<u8> = vec_with_cap<u8>(ASYNC_MAX_MSG as i64)
-    let scan_buf: *u8 = scan_buf_vec.as_ptr()
-    var val_buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let val_buf: *u8 = val_buf_vec.as_ptr()
-    var scan_resp: MessageBuffer
+    var scan_buf_vec: Vec<u8> = m7m_scratch(ASYNC_MAX_MSG as i64)
+    let scan_buf: [u8] = scan_buf_vec[0..scan_buf_vec.len()]
+    var val_buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    let val_buf: [u8] = val_buf_vec[0..val_buf_vec.len()]
+    var scan_resp: MessageBuffer = msgbuf_empty()
 
-    let iter_opt = collection_scan(collection)
-    var iter: *BTreeIter = null
-    if not option_is_none<*BTreeIter>(@iter_opt)
-        iter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
-    if iter == null or scan_buf == null or val_buf == null
+    var iter_opt: Option<BTreeIter> = collection_scan(collection)
+    if iter_opt.is_none() or scan_buf.len < ASYNC_MAX_MSG as i64 or val_buf.len < MAX_DOC_SIZE
         # Empty / unopenable: emit one zero-doc SCAN_RESULT then SCAN_END.
         var empty: [64]u8
-        msgbuf_init(@scan_resp, @empty[0], 64)
+        msgbuf_init(@scan_resp, @empty)
         msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
         msgbuf_write_i32(@scan_resp, 0)
         msgbuf_write_i32(@scan_resp, 0)
         msgbuf_finish(@scan_resp)
         scan_send(fd, ch, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp))
         build_scan_end(resp, request_id)
-        if iter != null
-            btree_iter_destroy(iter)
         return
+    var iter_v: BTreeIter = match iter_opt
+        Some(it) => it
+        None => return
+    let iter: *BTreeIter = @iter_v
 
     var total_emitted: i32 = 0
     var done: i32 = 0
@@ -839,7 +845,7 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
     let batch_byte_budget: i32 = 30000  # a lone larger document still goes
 
     while done == 0
-        msgbuf_init(@scan_resp, scan_buf, ASYNC_MAX_MSG)
+        msgbuf_init(@scan_resp, scan_buf)
         msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
 
         # Reserve doc_count and has_more (4 bytes each).  Capture their
@@ -863,11 +869,11 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
                 break
 
             var key_len: i32 = 0
-            btree_iter_key(iter, @key_buf[0], @key_len)
+            btree_iter_key(iter, @key_buf, @key_len)
 
             # The whole document: a large one's overflow chain, not its stub.
             var full_len: i64 = 0
-            if collection_iter_value(collection, iter, val_buf, MAX_DOC_SIZE, @full_len) != ERR_OK
+            if collection_iter_value(collection, iter, val_buf, @full_len) != ERR_OK
                 btree_iter_next(iter)
                 continue
             let val_len: i32 = full_len as i32
@@ -883,7 +889,7 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
             let doc_id: i64 = *id_ptr
 
             msgbuf_write_i64(@scan_resp, doc_id)
-            msgbuf_write_bytes(@scan_resp, val_buf, val_len)
+            msgbuf_write_bytes(@scan_resp, val_buf[0..val_len])
 
             batch_count += 1
             total_emitted += 1
@@ -917,8 +923,6 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
         if batch_count == 0
             done = 1
 
-    btree_iter_destroy(iter)
-
     print("  SCAN emitted {total_emitted} doc(s)\n")
 
     # Trailing SCAN_END goes into the caller's resp buffer; serve loop
@@ -943,13 +947,12 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
 # INDEX_CREATE — [field_len: i32][field][unique: i32]; `unique` reserved.
 # Idempotent; a new index is built from the documents already stored.
 fn handle_index_create(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
-    var field_len: i32 = 0
-    let field: *u8 = msgreader_read_bytes(reader, @field_len)
+    let field: [u8] = msgreader_read_bytes(reader).unwrap_or(span_empty<u8>())
     msgreader_read_i32(reader)      # reserved `unique` field
-    if field == null or field_len <= 0
+    if field.len <= 0
         build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed index field")
         return
-    let rc: i32 = collection_index_create(collection, field, field_len)
+    let rc: i32 = collection_index_create(collection, field.as_strview())
     if rc == ERR_OK
         build_index_created(resp, request_id)
     else if rc == ERR_INVALID
@@ -963,19 +966,18 @@ fn handle_index_create(reader: *MessageReader, resp: *MessageBuffer, request_id:
 # A field with no index answers PROTO_ERR_NO_INDEX, so the client falls
 # back to a scan rather than read the value as absent.
 fn handle_find(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
-    var field_len: i32 = 0
-    let field: *u8 = msgreader_read_bytes(reader, @field_len)
-    var value_len: i32 = 0
-    let value: *u8 = msgreader_read_bytes(reader, @value_len)
-    if field == null or field_len <= 0 or value_len < 0
+    let field: [u8] = msgreader_read_bytes(reader).unwrap_or(span_empty<u8>())
+    let value_opt: Option<[u8]> = msgreader_read_bytes(reader)
+    if field.len <= 0 or value_opt.is_none()
         build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed find")
         return
+    let value: [u8] = value_opt.unwrap_or(span_empty<u8>())
     var ids_vec: Vec<i64> = vec_with_cap<i64>(FIND_MAX_IDS as i64)
     let ids: *i64 = ids_vec.as_ptr()
     if ids == null
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
         return
-    let rc: i32 = collection_index_find_string(collection, field, field_len, value, value_len, ids, FIND_MAX_IDS)
+    let rc: i32 = collection_index_find_string(collection, field.as_strview(), value.as_strview(), ids, FIND_MAX_IDS)
     if rc == ERR_NOT_FOUND
         build_error(resp, request_id, PROTO_ERR_NO_INDEX, "No index on field")
     else if rc < 0
@@ -1010,7 +1012,7 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
 
     loop
         # Poll with 1 second timeout
-        let poll_result: i32 = match poll(span_from_ptr<PollFd>(@poll_fds[0], 2), 1000)
+        let poll_result: i32 = match poll(@poll_fds, 1000)
             Ok(n) => n
             # Error (EINTR or otherwise): poll again
             Err(_) => continue
@@ -1062,10 +1064,12 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
 fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
     # A request and its reply: each up to ASYNC_MAX_MSG, the async loops'
     # limit, which holds a MAX_DOC_SIZE document (AGAST #3638).
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(2 * ASYNC_MAX_MSG as i64)
-    let buf: *u8 = buf_vec.as_ptr()
-    if buf == null
+    var buf_vec: Vec<u8> = m7m_scratch(2 * ASYNC_MAX_MSG as i64)
+    if buf_vec.len() < 2 * ASYNC_MAX_MSG as i64
         return
+    let request_buf: [u8] = buf_vec[0..ASYNC_MAX_MSG]
+    let reply_buf: [u8] = buf_vec[ASYNC_MAX_MSG..2 * ASYNC_MAX_MSG]
+    let buf: *u8 = request_buf.as_ptr()
     var active_txn: i64 = -1  # Track active transaction (-1 = none)
     var collection: *Collection = registry_default(reg)
 
@@ -1077,7 +1081,7 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *Col
 
         # Parse and handle M7SP message
         var reader: MessageReader
-        let result: i32 = msgreader_init(@reader, buf, n)
+        let result: i32 = msgreader_init(@reader, request_buf[0..n])
         if result != PROTO_OK
             continue
 
@@ -1085,8 +1089,8 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *Col
         let request_id: i32 = msgreader_request_id(@reader)
 
         # Handle message
-        var resp: MessageBuffer
-        msgbuf_init(@resp, buf + ASYNC_MAX_MSG, ASYNC_MAX_MSG)
+        var resp: MessageBuffer = msgbuf_empty()
+        msgbuf_init(@resp, reply_buf)
 
         if msg_type == MSG_CONNECT
             print("  CONNECT received\n")
@@ -1206,7 +1210,8 @@ fn cmd_shell(host: StrView, port: i32, collection: StrView, no_encryption: i32) 
     else
         print(" (encrypted)...\n")
 
-    let client: *Client = client_new()
+    var client_owner: Box<Client> = client_new()
+    let client: *Client = client_owner.as_ptr()
     if client == null
         print("Error: Failed to create client\n")
         return 1

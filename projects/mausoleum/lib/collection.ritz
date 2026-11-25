@@ -9,7 +9,7 @@ import ritzlib.option
 import ritzlib.strview
 import ritzlib.span
 
-import ritzlib.memory
+import ritzlib.endian
 import ritzlib.gvec
 
 import mausoleum.m7m_types
@@ -58,7 +58,7 @@ const DOC_SERIAL_VERSION: i32 = 1
 
 struct Collection
     pool: *BufferPool
-    tree: *BTree
+    tree: BTree
     collection_id: i32
     next_sequence: i32
     doc_count: i64
@@ -66,7 +66,12 @@ struct Collection
     # below (AGAST #3644).  Their pages live in a private pool, so they are
     # never written to the data directory: an index is derived state, built
     # from the collection when it is created.
-    indexes: *FieldIndexSet
+    indexes: FieldIndexSet
+
+# A collection with no tree yet: what `var col: Collection` starts as, before
+# collection_init / collection_open fill it in.
+pub fn collection_empty() -> Collection
+    return Collection { pool: null, tree: btree_closed(), collection_id: 0, next_sequence: 1, doc_count: 0, indexes: field_index_new(0) }
 
 pub fn collection_init(col: *Collection, pool: *BufferPool, collection_id: i32) -> i32
     if pool == null
@@ -76,13 +81,10 @@ pub fn collection_init(col: *Collection, pool: *BufferPool, collection_id: i32) 
     col.collection_id = collection_id
     col.next_sequence = 1
     col.doc_count = 0
-    col.indexes = field_index_new(0)
-
     # Initialize the B-tree
-    let tree_opt = btree_create(pool)
-    if option_is_none<*BTree>(@tree_opt)
-        return ERR_NO_MEMORY
-    col.tree = option_unwrap_or<*BTree>(@tree_opt, null)
+    match btree_create(pool)
+        Some(t) => col.tree = t
+        None => return ERR_NO_MEMORY
     return ERR_OK
 
 # Reattach to a collection a previous run wrote (meta from meta.m7m / WAL).
@@ -90,28 +92,27 @@ pub fn collection_open(col: *Collection, pool: *BufferPool, collection_id: i32, 
     if pool == null or meta == null
         return ERR_INVALID
 
-    let tree_opt = btree_open(pool, meta.root_page_id, meta.tree_height as i32, meta.tree_count, meta.tree_node_count)
-    if option_is_none<*BTree>(@tree_opt)
-        return ERR_CORRUPT
-    col.tree = option_unwrap_or<*BTree>(@tree_opt, null)
+    match btree_open(pool, meta.root_page_id, meta.tree_height as i32, meta.tree_count, meta.tree_node_count)
+        Some(t) => col.tree = t
+        None => return ERR_CORRUPT
     col.pool = pool
     col.collection_id = collection_id
     col.next_sequence = meta.next_sequence as i32
     col.doc_count = meta.doc_count
     # Indexes are in-memory state: a reopened collection starts with none
     # and a client re-creates the ones it needs (AGAST #3644).
-    col.indexes = field_index_new(0)
+    field_index_drop_all(@col.indexes)
     return ERR_OK
 
 # Snapshot what collection_open needs into *out.
 pub fn collection_meta(col: *Collection, out: *CollectionMeta)
     collection_meta_clear(out)
-    if col == null or col.tree == null
+    if col == null or not btree_is_open(@col.tree)
         return
-    out.root_page_id = btree_root_page_id(col.tree)
-    out.tree_height = btree_height(col.tree) as i64
-    out.tree_count = btree_count(col.tree)
-    out.tree_node_count = btree_node_count(col.tree)
+    out.root_page_id = btree_root_page_id(@col.tree)
+    out.tree_height = btree_height(@col.tree) as i64
+    out.tree_count = btree_count(@col.tree)
+    out.tree_node_count = btree_node_count(@col.tree)
     out.next_sequence = col.next_sequence as i64
     out.doc_count = col.doc_count
 
@@ -164,11 +165,8 @@ pub fn collection_commit(col: *Collection, storage: *Storage) -> i32
 pub fn collection_destroy(col: *Collection)
     if col == null
         return
-    if col.tree != null
-        btree_destroy(col.tree)
-        col.tree = null
-    field_index_destroy(col.indexes)
-    col.indexes = null
+    btree_destroy(@col.tree)
+    field_index_destroy(@col.indexes)
 
 # ============================================================================
 # Document Serialization
@@ -193,8 +191,9 @@ pub fn collection_destroy(col: *Collection)
 #     label_len: i32
 #     label: [label_len]u8
 #     target: i64
-pub fn doc_serialize(doc: *Document, buf: *u8, buf_len: i64) -> i64
-    let out: Span<u8> = span_from_ptr(buf, buf_len)
+pub fn doc_serialize(doc: *Document, out: [u8]) -> i64
+    let buf: *u8 = out.as_ptr()
+    let buf_len: i64 = out.len
     var pos: i64 = 0
 
     # Version
@@ -288,13 +287,13 @@ pub fn doc_serialize(doc: *Document, buf: *u8, buf_len: i64) -> i64
             if pos + 8 > buf_len
                 return -1
             var len_ptr: *i64 = (buf + pos) as *i64
-            *len_ptr = entry.value.len_val
+            *len_ptr = entry.value.bytes.len
             pos = pos + 8
 
-            if pos + entry.value.len_val > buf_len
+            if pos + entry.value.bytes.len > buf_len
                 return -1
-            out.from(pos).copy_from(field_string_view(@entry.value).as_bytes())
-            pos = pos + entry.value.len_val
+            out.from(pos).copy_from(entry.value.bytes)
+            pos = pos + entry.value.bytes.len
         else if entry.value.ftype == FIELD_DOCREF
             if pos + 8 > buf_len
                 return -1
@@ -343,8 +342,9 @@ pub fn doc_serialize(doc: *Document, buf: *u8, buf_len: i64) -> i64
     return pos
 
 # Deserialize a document from a byte buffer
-pub fn doc_deserialize(buf: *u8, buf_len: i64, doc: *Document) -> i32
-    let input: Span<u8> = span_from_ptr(buf, buf_len)
+pub fn doc_deserialize(input: [u8], doc: *Document) -> i32
+    let buf: *u8 = input.as_ptr()
+    let buf_len: i64 = input.len
     var pos: i64 = 0
 
     # Version check
@@ -418,8 +418,7 @@ pub fn doc_deserialize(buf: *u8, buf_len: i64, doc: *Document) -> i32
         # Field value
         if entry.value.ftype == FIELD_NULL
             entry.value.int_val = 0
-            entry.value.ptr_val = null
-            entry.value.len_val = 0
+            entry.value.bytes = ""
             entry.value.ref_val = 0
         else if entry.value.ftype == FIELD_INT or entry.value.ftype == FIELD_BOOL or entry.value.ftype == FIELD_FLOAT
             if pos + 8 > buf_len
@@ -429,18 +428,14 @@ pub fn doc_deserialize(buf: *u8, buf_len: i64, doc: *Document) -> i32
         else if entry.value.ftype == FIELD_STRING or entry.value.ftype == FIELD_BYTES
             if pos + 8 > buf_len
                 return ERR_CORRUPT
-            entry.value.len_val = *((buf + pos) as *i64)
+            let len: i64 = *((buf + pos) as *i64)
             pos = pos + 8
 
-            # Note: We point into the buffer - caller must ensure buffer lifetime
-            # For full implementation, we'd copy to owned memory
-            if entry.value.len_val > 0
-                if pos + entry.value.len_val > buf_len
-                    return ERR_CORRUPT
-                entry.value.ptr_val = buf + pos
-                pos = pos + entry.value.len_val
-            else
-                entry.value.ptr_val = null
+            # The field views the buffer: the caller keeps it alive
+            if len < 0 or pos + len > buf_len
+                return ERR_CORRUPT
+            entry.value.bytes = input[pos..pos + len]
+            pos = pos + len
         else if entry.value.ftype == FIELD_DOCREF
             if pos + 8 > buf_len
                 return ERR_CORRUPT
@@ -500,19 +495,19 @@ const OVERFLOW_STUB_TAG: i32 = 0x4F564552   # "OVER", as PAGE_MAGIC_OVERFLOW
 const OVERFLOW_STUB_LEN: i64 = 20
 
 # 1 and the chain's length and first page if `raw` is an overflow stub.
-fn overflow_stub_decode(raw: *u8, raw_len: i64, out_total: *i64, out_first: *i64) -> i32
-    if raw_len != OVERFLOW_STUB_LEN
+fn overflow_stub_decode(raw: [u8], out_total: *i64, out_first: *i64) -> i32
+    if raw.len != OVERFLOW_STUB_LEN
         return 0
-    if *(raw as *i32) != OVERFLOW_STUB_TAG
+    if endian_read_u32_le(raw, 0) as i32 != OVERFLOW_STUB_TAG
         return 0
-    *out_total = *((raw + 4) as *i64)
-    *out_first = *((raw + 12) as *i64)
+    *out_total = endian_read_u64_le(raw, 4) as i64
+    *out_first = endian_read_u64_le(raw, 12) as i64
     return 1
 
-fn overflow_stub_encode(stub: *u8, total: i64, first: i64)
-    *(stub as *i32) = OVERFLOW_STUB_TAG
-    *((stub + 4) as *i64) = total
-    *((stub + 12) as *i64) = first
+fn overflow_stub_encode(stub: [u8], total: i64, first: i64)
+    endian_write_u32_le(stub, 0, OVERFLOW_STUB_TAG as u32)
+    endian_write_u64_le(stub, 4, total as u64)
+    endian_write_u64_le(stub, 12, first as u64)
 
 # Give back every page of the chain starting at `first`.  Stops at the
 # first page that is not an overflow page (nothing to free past a break).
@@ -535,7 +530,8 @@ fn overflow_free(pool: *BufferPool, first: i64)
 
 # Write data[0..len) to a new chain; its first page in *out_first.  On
 # failure no page stays allocated.
-fn overflow_write(pool: *BufferPool, data: *u8, len: i64, out_first: *i64) -> i32
+fn overflow_write(pool: *BufferPool, data: [u8], out_first: *i64) -> i32
+    let len: i64 = data.len
     var first: i64 = INVALID_PAGE_ID
     var prev: *Page = null
     var prev_id: i64 = INVALID_PAGE_ID
@@ -553,7 +549,8 @@ fn overflow_write(pool: *BufferPool, data: *u8, len: i64, out_first: *i64) -> i3
         var chunk: i64 = len - pos
         if chunk > PAGE_DATA_SIZE
             chunk = PAGE_DATA_SIZE
-        memcpy(page_data(page), data + pos, chunk)
+        let page_bytes: [u8] = @page.data
+        page_bytes.copy_from(data[pos..pos + chunk])
         page.header.free_start = chunk as i32
         page.header.prev_page = prev_id
         if prev != null
@@ -571,7 +568,7 @@ fn overflow_write(pool: *BufferPool, data: *u8, len: i64, out_first: *i64) -> i3
 
 # Read the `total`-byte chain starting at `first` into buf (cap >= total).
 # ERR_CORRUPT if the chain is not exactly `total` bytes of overflow pages.
-fn overflow_read(pool: *BufferPool, first: i64, total: i64, buf: *u8) -> i32
+fn overflow_read(pool: *BufferPool, first: i64, total: i64, buf: [u8]) -> i32
     var page_id: i64 = first
     var pos: i64 = 0
     while pos < total
@@ -585,7 +582,9 @@ fn overflow_read(pool: *BufferPool, first: i64, total: i64, buf: *u8) -> i32
         if page.header.magic != PAGE_MAGIC_OVERFLOW or chunk <= 0 or chunk > PAGE_DATA_SIZE or pos + chunk > total
             buffer_pool_unpin(pool, page_id, 0)
             return ERR_CORRUPT
-        memcpy(buf + pos, page_data(page), chunk)
+        let page_bytes: [u8] = @page.data
+        let dst: [u8] = buf[pos..pos + chunk]
+        dst.copy_from(page_bytes[0..chunk])
         let next: i64 = page.header.next_page
         buffer_pool_unpin(pool, page_id, 0)
         pos += chunk
@@ -596,75 +595,61 @@ fn overflow_read(pool: *BufferPool, first: i64, total: i64, buf: *u8) -> i32
 
 # The document a B-tree value `raw` stands for, copied into buf: `raw`
 # itself, or the chain its stub points at.  ERR_FULL (with the length it
-# needs in *out_len) if it is longer than `cap`.
-fn value_resolve(col: *Collection, raw: *u8, raw_len: i64, buf: *u8, cap: i64, out_len: *i64) -> i32
+# needs in *out_len) if it is longer than buf.
+fn value_resolve(col: *Collection, raw: [u8], buf: [u8], out_len: *i64) -> i32
     var total: i64 = 0
     var first: i64 = INVALID_PAGE_ID
-    if overflow_stub_decode(raw, raw_len, @total, @first) == 1
+    if overflow_stub_decode(raw, @total, @first) == 1
         *out_len = total
-        if total > cap
+        if total > buf.len
             return ERR_FULL
         return overflow_read(col.pool, first, total, buf)
-    *out_len = raw_len
-    if raw_len > cap
+    *out_len = raw.len
+    if raw.len > buf.len
         return ERR_FULL
-    if raw_len > 0
-        memcpy(buf, raw, raw_len)
-    return ERR_OK
-
-# The B-tree value for document bytes data[0..len): data itself if it fits
-# inline, else a stub (written into `stub`) for a new chain holding them.
-# *out_val / *out_len say which; *out_first is the chain or INVALID_PAGE_ID.
-fn value_store(col: *Collection, data: *u8, len: i64, stub: *u8, out_val: **u8, out_len: *i64, out_first: *i64) -> i32
-    *out_first = INVALID_PAGE_ID
-    if len <= MAX_INLINE_DOC_SIZE
-        *out_val = data
-        *out_len = len
-        return ERR_OK
-    var first: i64 = INVALID_PAGE_ID
-    let rc: i32 = overflow_write(col.pool, data, len, @first)
-    if rc != ERR_OK
-        return rc
-    overflow_stub_encode(stub, len, first)
-    *out_val = stub
-    *out_len = OVERFLOW_STUB_LEN
-    *out_first = first
+    buf.copy_from(raw)
     return ERR_OK
 
 # The overflow chain document `key` points at now, or INVALID_PAGE_ID (no
 # such document, or stored inline).
-fn current_chain(col: *Collection, key: *u8) -> i64
+fn current_chain(col: *Collection, key: [u8]) -> i64
     var raw: [2048]u8
     var raw_len: i32 = 0
-    if btree_get(col.tree, key, 8, @raw[0], @raw_len) != ERR_OK
+    if btree_get(@col.tree, key, @raw, @raw_len) != ERR_OK
         return INVALID_PAGE_ID
     var total: i64 = 0
     var first: i64 = INVALID_PAGE_ID
-    if overflow_stub_decode(@raw[0], raw_len as i64, @total, @first) == 1
+    let raw_s: [u8] = @raw
+    if overflow_stub_decode(raw_s[0..raw_len], @total, @first) == 1
         return first
     return INVALID_PAGE_ID
 
 # Serialize `doc` and store it under `key`: inline, or in a new chain (the
 # old chain, if any, is freed once the new value is in).
-fn store_doc(col: *Collection, key: *u8, doc: *Document) -> i32
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let buf: *u8 = buf_vec.as_ptr()
-    if buf == null
+fn store_doc(col: *Collection, key: [u8], doc: *Document) -> i32
+    var buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    if buf_vec.len() < MAX_DOC_SIZE
         return ERR_NO_MEMORY
-    let size: i64 = doc_serialize(doc, buf, MAX_DOC_SIZE)
+    let buf: [u8] = buf_vec[0..MAX_DOC_SIZE]
+    let size: i64 = doc_serialize(doc, buf)
     if size < 0
         return ERR_FULL
 
     let old_chain: i64 = current_chain(col, key)
+    # The B-tree value: the bytes themselves if they fit inline, else a stub
+    # for a new chain holding them.
     var stub: [20]u8
-    var val: *u8 = null
-    var val_len: i64 = 0
+    var val: [u8] = buf[0..size]
     var chain: i64 = INVALID_PAGE_ID
-    var rc: i32 = value_store(col, buf, size, @stub[0], @val, @val_len, @chain)
-    if rc == ERR_OK
-        rc = btree_put(col.tree, key, 8, val, val_len as i32)
-        if rc != ERR_OK and chain != INVALID_PAGE_ID
-            overflow_free(col.pool, chain)
+    if size > MAX_INLINE_DOC_SIZE
+        let write_rc: i32 = overflow_write(col.pool, val, @chain)
+        if write_rc != ERR_OK
+            return write_rc
+        overflow_stub_encode(@stub, size, chain)
+        val = @stub
+    var rc: i32 = btree_put(@col.tree, key, val)
+    if rc != ERR_OK and chain != INVALID_PAGE_ID
+        overflow_free(col.pool, chain)
     if rc == ERR_OK and old_chain != INVALID_PAGE_ID
         overflow_free(col.pool, old_chain)
     return rc
@@ -686,16 +671,16 @@ pub fn collection_insert(col: *Collection, doc: *Document, out_id: *DocumentId) 
     var key_ptr: *i64 = @key[0] as *i64
     *key_ptr = doc.id.value
 
-    var result: i32 = store_doc(col, @key[0], doc)
+    var result: i32 = store_doc(col, @key, doc)
     if result != ERR_OK
         return result
 
     # Keep every secondary index in step.  If one can't be maintained the
     # index is dropped instead of failing the write: the document is the
     # source of truth, and a lookup with no index falls back to a scan.
-    let index_rc: i32 = field_index_insert_doc(col.indexes, doc)
+    let index_rc: i32 = field_index_insert_doc(@col.indexes, doc)
     if index_rc != ERR_OK
-        field_index_drop_all(col.indexes)
+        field_index_drop_all(@col.indexes)
 
     col.doc_count = col.doc_count + 1
     *out_id = doc.id
@@ -705,45 +690,47 @@ pub fn collection_insert(col: *Collection, doc: *Document, out_id: *DocumentId) 
 # into the caller's `buf` (see collection_get_raw), and `out_doc`'s
 # FIELD_STRING and FIELD_BYTES values point into it: `out_doc` is only
 # valid while `buf` is. Two documents alive at once need two buffers.
-pub fn collection_get(col: *Collection, id: *DocumentId, out_doc: *Document, buf: *u8, cap: i64) -> i32
+pub fn collection_get(col: *Collection, id: *DocumentId, out_doc: *Document, buf: [u8]) -> i32
     if out_doc == null
         return ERR_INVALID
     var val_len: i64 = 0
-    let result: i32 = collection_get_raw(col, id, buf, cap, @val_len)
+    let result: i32 = collection_get_raw(col, id, buf, @val_len)
     if result != ERR_OK
         return result
-    return doc_deserialize(buf, val_len, out_doc)
+    return doc_deserialize(buf[0..val_len], out_doc)
 
 # The stored (serialized) bytes of document `id`, copied into `buf`.
 # The server answers GET with these as they are, with no deserialize and
 # re-serialize round trip.  A buffer of MAX_DOC_SIZE holds any document;
-# for a shorter `cap` that the document does not fit, ERR_FULL with the
+# for a shorter `buf` that the document does not fit, ERR_FULL with the
 # length it needs in *out_len.
-pub fn collection_get_raw(col: *Collection, id: *DocumentId, buf: *u8, cap: i64, out_len: *i64) -> i32
-    if col == null or id == null or buf == null or out_len == null
+pub fn collection_get_raw(col: *Collection, id: *DocumentId, buf: [u8], out_len: *i64) -> i32
+    if col == null or id == null or out_len == null
         return ERR_INVALID
     var key: [8]u8
     var key_ptr: *i64 = @key[0] as *i64
     *key_ptr = id.value
     var raw: [2048]u8
     var raw_len: i32 = 0
-    let result: i32 = btree_get(col.tree, @key[0], 8, @raw[0], @raw_len)
+    let result: i32 = btree_get(@col.tree, @key, @raw, @raw_len)
     if result != ERR_OK
         return result
-    return value_resolve(col, @raw[0], raw_len as i64, buf, cap, out_len)
+    let raw_s: [u8] = @raw
+    return value_resolve(col, raw_s[0..raw_len], buf, out_len)
 
 # The document a scan's iterator is on (see collection_scan), copied into
 # `buf` like collection_get_raw: btree_iter_value gives only its B-tree
 # value, which for a large document is an overflow stub.
-pub fn collection_iter_value(col: *Collection, iter: *BTreeIter, buf: *u8, cap: i64, out_len: *i64) -> i32
-    if col == null or iter == null or buf == null or out_len == null
+pub fn collection_iter_value(col: *Collection, iter: *BTreeIter, buf: [u8], out_len: *i64) -> i32
+    if col == null or iter == null or out_len == null
         return ERR_INVALID
     var raw: [2048]u8
     var raw_len: i32 = 0
-    btree_iter_value(iter, @raw[0], @raw_len)
+    btree_iter_value(iter, @raw, @raw_len)
     if raw_len <= 0
         return ERR_IO   # Unreadable leaf (no stored document is empty).
-    return value_resolve(col, @raw[0], raw_len as i64, buf, cap, out_len)
+    let raw_s: [u8] = @raw
+    return value_resolve(col, raw_s[0..raw_len], buf, out_len)
 
 pub fn collection_update(col: *Collection, doc: *Document) -> i32
     if col == null or doc == null
@@ -756,44 +743,44 @@ pub fn collection_update(col: *Collection, doc: *Document) -> i32
 
     var tmp_buf: [2048]u8
     var tmp_len: i32 = 0
-    var result: i32 = btree_get(col.tree, @key[0], 8, @tmp_buf[0], @tmp_len)
+    var result: i32 = btree_get(@col.tree, @key, @tmp_buf, @tmp_len)
     if result != ERR_OK
         return ERR_NOT_FOUND
 
     # Move the index entries from the old version to the new one (AGAST
     # #3644).  The old document is read first because the store overwrites
     # it; if the store then fails the old entries are put back.
-    var indexed: bool = col.indexes != null and field_index_count(col.indexes) > 0
+    var indexed: bool = field_index_count(@col.indexes) > 0
     var old_doc: Document
     var have_old: bool = false
+    # The old document's bytes: old_doc's strings point into them
     var old_vec: Vec<u8> = vec_new<u8>()
-    var old_buf: *u8 = null
     if indexed
-        old_vec = vec_with_cap<u8>(MAX_DOC_SIZE)
-        old_buf = old_vec.as_ptr()
-        if old_buf != null
+        old_vec = m7m_scratch(MAX_DOC_SIZE)
+        if old_vec.len() == MAX_DOC_SIZE
+            let old_buf: [u8] = old_vec[0..MAX_DOC_SIZE]
             var old_len: i64 = 0
-            if collection_get_raw(col, @doc.id, old_buf, MAX_DOC_SIZE, @old_len) == ERR_OK
-                if doc_deserialize(old_buf, old_len, @old_doc) == ERR_OK
+            if collection_get_raw(col, @doc.id, old_buf, @old_len) == ERR_OK
+                if doc_deserialize(old_buf[0..old_len], @old_doc) == ERR_OK
                     have_old = true
         if have_old
-            if field_index_delete_doc(col.indexes, @old_doc) != ERR_OK
-                field_index_drop_all(col.indexes)
+            if field_index_delete_doc(@col.indexes, @old_doc) != ERR_OK
+                field_index_drop_all(@col.indexes)
                 indexed = false
         else
             # Can't read the old entries; don't leave a half-updated index.
-            field_index_drop_all(col.indexes)
+            field_index_drop_all(@col.indexes)
             indexed = false
 
-    let store_rc: i32 = store_doc(col, @key[0], doc)
+    let store_rc: i32 = store_doc(col, @key, doc)
     if store_rc != ERR_OK
         if indexed and have_old
-            field_index_insert_doc(col.indexes, @old_doc)   # put them back
+            field_index_insert_doc(@col.indexes, @old_doc)   # put them back
         return store_rc
 
     if indexed
-        if field_index_insert_doc(col.indexes, doc) != ERR_OK
-            field_index_drop_all(col.indexes)
+        if field_index_insert_doc(@col.indexes, doc) != ERR_OK
+            field_index_drop_all(@col.indexes)
     return ERR_OK
 
 pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
@@ -808,20 +795,20 @@ pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
     # Remove the document's index entries while it can still be read
     # (AGAST #3644).  If they can't be kept exact, drop the index: a
     # lookup then falls back to a scan.
-    if col.indexes != null and field_index_count(col.indexes) > 0
-        var dbuf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-        let dbuf: *u8 = dbuf_vec.as_ptr()
-        if dbuf != null
+    if field_index_count(@col.indexes) > 0
+        var dbuf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+        if dbuf_vec.len() == MAX_DOC_SIZE
+            let dbuf: [u8] = dbuf_vec[0..MAX_DOC_SIZE]
             var dlen: i64 = 0
-            if collection_get_raw(col, id, dbuf, MAX_DOC_SIZE, @dlen) == ERR_OK
+            if collection_get_raw(col, id, dbuf, @dlen) == ERR_OK
                 var old_doc: Document
-                if doc_deserialize(dbuf, dlen, @old_doc) == ERR_OK
-                    if field_index_delete_doc(col.indexes, @old_doc) != ERR_OK
-                        field_index_drop_all(col.indexes)
+                if doc_deserialize(dbuf[0..dlen], @old_doc) == ERR_OK
+                    if field_index_delete_doc(@col.indexes, @old_doc) != ERR_OK
+                        field_index_drop_all(@col.indexes)
 
     # Delete from B-tree, then give back its overflow chain if it had one.
-    let chain: i64 = current_chain(col, @key[0])
-    var result: i32 = btree_delete(col.tree, @key[0], 8)
+    let chain: i64 = current_chain(col, @key)
+    var result: i32 = btree_delete(@col.tree, @key)
     if result == ERR_OK
         col.doc_count = col.doc_count - 1
         if chain != INVALID_PAGE_ID
@@ -841,43 +828,42 @@ pub fn collection_count(col: *Collection) -> i64
 # already stored.  Idempotent: an existing index is left alone, so a client
 # can ensure it after every connect.  ERR_INVALID for a bad field name,
 # ERR_FULL past the index limit, < 0 on failure.
-pub fn collection_index_create(col: *Collection, field: *u8, field_len: i32) -> i32
+pub fn collection_index_create(col: *Collection, field: StrView) -> i32
     if col == null
         return ERR_INVALID
-    let existed: i32 = field_index_has(col.indexes, field, field_len)
-    let create_rc: i32 = field_index_create(col.indexes, field, field_len)
+    let existed: i32 = field_index_has(@col.indexes, field.ptr, field.len as i32)
+    let create_rc: i32 = field_index_create(@col.indexes, field.ptr, field.len as i32)
     if create_rc != ERR_OK
         return create_rc
     if existed == 1
         return ERR_OK
 
     # A new index starts empty: build it from the documents already here.
-    let iter_opt = collection_scan(col)
-    if option_is_none<*BTreeIter>(@iter_opt)
-        field_index_drop_all(col.indexes)
+    var iter_v: BTreeIter = match collection_scan(col)
+        Some(it) => it
+        None =>
+            field_index_drop_all(@col.indexes)
+            return ERR_NO_MEMORY
+    let iter: *BTreeIter = @iter_v
+    var buf_vec: Vec<u8> = m7m_scratch(MAX_DOC_SIZE)
+    if buf_vec.len() < MAX_DOC_SIZE
+        field_index_drop_all(@col.indexes)
         return ERR_NO_MEMORY
-    let iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
-    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
-    let buf: *u8 = buf_vec.as_ptr()
-    if buf == null
-        btree_iter_destroy(iter)
-        field_index_drop_all(col.indexes)
-        return ERR_NO_MEMORY
+    let buf: [u8] = buf_vec[0..MAX_DOC_SIZE]
 
     var build_rc: i32 = ERR_OK
     while btree_iter_valid(iter) != 0
         var dlen: i64 = 0
-        if collection_iter_value(col, iter, buf, MAX_DOC_SIZE, @dlen) == ERR_OK
+        if collection_iter_value(col, iter, buf, @dlen) == ERR_OK
             var doc: Document
-            if doc_deserialize(buf, dlen, @doc) == ERR_OK
-                build_rc = field_index_insert_doc(col.indexes, @doc)
+            if doc_deserialize(buf[0..dlen], @doc) == ERR_OK
+                build_rc = field_index_insert_doc(@col.indexes, @doc)
                 if build_rc != ERR_OK
                     break
         btree_iter_next(iter)
-    btree_iter_destroy(iter)
 
     if build_rc != ERR_OK
-        field_index_drop_all(col.indexes)
+        field_index_drop_all(@col.indexes)
         return build_rc
     return ERR_OK
 
@@ -887,28 +873,28 @@ pub fn collection_index_create(col: *Collection, field: *u8, field_len: i32) -> 
 pub fn collection_index_drop_all(col: *Collection)
     if col == null
         return
-    field_index_drop_all(col.indexes)
+    field_index_drop_all(@col.indexes)
 
 
 pub fn collection_index_count(col: *Collection) -> i32
     if col == null
         return 0
-    return field_index_count(col.indexes)
+    return field_index_count(@col.indexes)
 
 
 # Every document holding `value` in string field `field`, up to `max`, in
 # ascending document id order.  Count, 0 for none, ERR_NOT_FOUND when the
 # field has no index, or < 0 on failure.
-pub fn collection_index_find_string(col: *Collection, field: *u8, field_len: i32, value: *u8, value_len: i32, out: *i64, max: i32) -> i32
+pub fn collection_index_find_string(col: *Collection, field: StrView, value: StrView, out: *i64, max: i32) -> i32
     if col == null
         return ERR_INVALID
-    return field_index_find_string(col.indexes, field, field_len, value, value_len, out, max)
+    return field_index_find_string(@col.indexes, field, value, out, max)
 
 # Getter for root page ID (from the B-tree)
 pub fn collection_root_page_id(col: *Collection) -> i64
-    if col == null or col.tree == null
+    if col == null or not btree_is_open(@col.tree)
         return INVALID_PAGE_ID
-    return btree_root_page_id(col.tree)
+    return btree_root_page_id(@col.tree)
 
 # Getter for next document sequence number
 pub fn collection_next_sequence(col: *Collection) -> i64
@@ -931,7 +917,7 @@ pub fn collection_doc_count(col: *Collection) -> i64
 # finish with the `btree_iter_*` API exported from `mausoleum.btree`.
 #
 # Returns None on null collection / null tree / OOM.
-pub fn collection_scan(col: *Collection) -> Option<*BTreeIter>
-    if col == null or col.tree == null
+pub fn collection_scan(col: *Collection) -> Option<BTreeIter>
+    if col == null or not btree_is_open(@col.tree)
         return None
-    return btree_scan(col.tree, null, 0, null, 0)
+    return btree_scan(@col.tree, "", "")

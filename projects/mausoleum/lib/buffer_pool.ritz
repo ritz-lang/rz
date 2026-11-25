@@ -23,7 +23,7 @@ import ritzlib.sys
 import ritzlib.fd
 import ritzlib.str
 import ritzlib.strview
-import ritzlib.memory
+import ritzlib.span
 import ritzlib.gvec
 import ritzlib.option
 
@@ -78,7 +78,9 @@ struct BufferPool
 # ============================================================================
 
 # Create a new buffer pool with the given number of frames
-pub fn buffer_pool_new(num_frames: i32) -> Option<*BufferPool>
+# The pool is a value its owner holds and lends as `@pool`; dropping it frees
+# its frames (buffer_pool_destroy flushes them first).
+pub fn buffer_pool_new(num_frames: i32) -> Option<BufferPool>
     if num_frames <= 0
         return None
 
@@ -109,33 +111,29 @@ pub fn buffer_pool_new(num_frames: i32) -> Option<*BufferPool>
         else
             frame.lru_next = -1
 
-    # Allocate pool structure, last: a failure above frees only what drops
-    let pool: *BufferPool = malloc(sizeof(BufferPool)) as *BufferPool
-    if pool == null
-        return None
-
-    # Initialize pool
-    pool.frames = frames
-    pool.num_frames = num_frames
-    pool.hash_table = hash_table
-    pool.lru_head = -1
-    pool.lru_tail = -1
-    pool.free_list = 0  # First frame is head of free list
-    pool.file_fd = fd_adopt(-1)
-    pool.next_page_id = 0
-    pool.stats_hits = 0
-    pool.stats_misses = 0
-    pool.stats_evictions = 0
-    pool.free_ids = vec_new<i64>()
-    pool.no_steal = 0
-
+    let pool: BufferPool = BufferPool {
+        frames: frames,
+        num_frames: num_frames,
+        hash_table: hash_table,
+        lru_head: -1,
+        lru_tail: -1,
+        free_list: 0,  # First frame is head of free list
+        file_fd: fd_adopt(-1),
+        next_page_id: 0,
+        stats_hits: 0,
+        stats_misses: 0,
+        stats_evictions: 0,
+        free_ids: vec_new<i64>(),
+        no_steal: 0
+    }
     return Some(pool)
 
 # Create a buffer pool with default size
-pub fn buffer_pool_default() -> Option<*BufferPool>
+pub fn buffer_pool_default() -> Option<BufferPool>
     return buffer_pool_new(DEFAULT_POOL_SIZE)
 
-# Destroy a buffer pool
+# Flush and close a buffer pool and release its frames. Its owner still
+# drops the (now empty) value.
 pub fn buffer_pool_destroy(pool: *BufferPool)
     if pool == null
         return
@@ -146,11 +144,13 @@ pub fn buffer_pool_destroy(pool: *BufferPool)
     # Close file if open
     pool.file_fd.close()
 
-    # Raw memory doesn't drop its fields: release them before the block
     pool.hash_table.deinit()
     pool.frames.deinit()
     pool.free_ids.deinit()
-    free(pool as *u8)
+    pool.num_frames = 0
+    pool.free_list = -1
+    pool.lru_head = -1
+    pool.lru_tail = -1
 
 # ============================================================================
 # Internal Helpers
@@ -291,12 +291,12 @@ fn get_free_frame(pool: *BufferPool) -> i32
 # ============================================================================
 
 # Open database file
-pub fn buffer_pool_open(pool: *BufferPool, path: *u8) -> i32
+pub fn buffer_pool_open(pool: *BufferPool, path: StrView) -> i32
     if pool == null
         return ERR_INVALID
 
     # Open file (create if not exists)
-    match fd_open(strview_from_cstr(path), O_RDWR | O_CREAT, 420)  # 0644
+    match fd_open(path, O_RDWR | O_CREAT, 420)  # 0644
         Ok(f) => pool.file_fd = f
         Err(_) => return ERR_IO
 
@@ -329,7 +329,7 @@ fn read_page(pool: *BufferPool, frame: *Frame, page_id: i64) -> i32
         Ok(_) => pass
         Err(_) => return ERR_IO
 
-    match pool.file_fd.read_exact(Span<u8> { ptr: @frame.page as *u8, len: PAGE_SIZE })
+    match pool.file_fd.read_exact(page_bytes(@frame.page))
         Ok(_) => pass
         Err(_) =>
             # Past the end of the file: a new page - initialize it
@@ -347,7 +347,7 @@ fn write_page(pool: *BufferPool, frame: *Frame) -> i32
         Ok(_) => pass
         Err(_) => return ERR_IO
 
-    match pool.file_fd.write_all(Span<u8> { ptr: @frame.page as *u8, len: PAGE_SIZE })
+    match pool.file_fd.write_all(page_bytes(@frame.page))
         Ok(_) => pass
         Err(_) => return ERR_IO
 
@@ -584,14 +584,14 @@ pub fn buffer_pool_reserve_page_id(pool: *BufferPool, page_id: i64)
 
 # Install a full page image as page `page_id`, dirty, without reading the
 # old contents from disk (WAL redo: the image replaces them wholesale).
-pub fn buffer_pool_put_page(pool: *BufferPool, page_id: i64, image: *u8) -> i32
-    if pool == null or image == null or page_id < 0
+pub fn buffer_pool_put_page(pool: *BufferPool, page_id: i64, image: [u8]) -> i32
+    if pool == null or image.len != PAGE_SIZE or page_id < 0
         return ERR_INVALID
 
     var frame_idx: i32 = find_frame(pool, page_id)
     if frame_idx >= 0
         let frame: *Frame = get_frame(pool, frame_idx)
-        memcpy(@frame.page as *u8, image, PAGE_SIZE)
+        page_bytes(@frame.page).copy_from(image)
         frame.dirty = 1
         frame.unlogged = 0   # The image came from the WAL.
         buffer_pool_reserve_page_id(pool, page_id)
@@ -601,7 +601,7 @@ pub fn buffer_pool_put_page(pool: *BufferPool, page_id: i64, image: *u8) -> i32
     if frame_idx < 0
         return ERR_NO_MEMORY
     let frame: *Frame = get_frame(pool, frame_idx)
-    memcpy(@frame.page as *u8, image, PAGE_SIZE)
+    page_bytes(@frame.page).copy_from(image)
     frame.page_id = page_id
     frame.pin_count = 0
     frame.dirty = 1
