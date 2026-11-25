@@ -67,6 +67,7 @@
 # test_defer_all_compilers.py and test_ownership_free_count.py.
 
 import ritzlib.cstr
+import ritzlib.strview
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.memory
@@ -385,10 +386,10 @@ fn oc_put_int(n: i32)
 # (an instance of an imported generic has its lines in that module, AGAST
 # #2890).
 fn oc_put_loc(sm: *Sema, line: i32, col: i32)
-    var f: *u8 = sema_file(sm)
-    if f == null
-        f = c"<input>"
-    oc_put_cstr(f)
+    var f: StrView = sema_file(sm)
+    if f.ptr == null
+        f = "<input>"
+    oc_put_bytes(f.ptr, f.len as i32)
     oc_put_char(':')
     oc_put_int(line)
     oc_put_char(':')
@@ -650,7 +651,7 @@ fn oc_local(sm: *Sema, name_sv: StrView) -> *LocalVar
 # The move-only struct a local holds (an `[N]T` / N-D array's element struct,
 # with the element count in *count), as own_register reads its LocalVar; null
 # when it holds none.
-fn oc_local_owns(sm: *Sema, loc: *LocalVar, count: *i32, len: *i32) -> *u8
+fn oc_local_owns(sm: *Sema, loc: *LocalVar, count: *i32) -> StrView
     *count = 0
     var name: *u8 = lv_type_name(loc)
     var n: i32 = lv_type_name_len(loc)
@@ -658,20 +659,19 @@ fn oc_local_owns(sm: *Sema, loc: *LocalVar, count: *i32, len: *i32) -> *u8
         if lv_array_shape(loc) != null
             let leaves: StructElems = own_shape_elems(lv_array_shape(loc))
             if leaves.name.len == 0
-                return null
+                return strview_empty()
             *count = leaves.count
             name = leaves.name.ptr
             n = leaves.name.len as i32
         else if lv_array_elem_type(loc) == TypeKind.Struct and lv_array_size(loc) > 0
             *count = lv_array_size(loc)
         else
-            return null
+            return strview_empty()
     else if lv_var_type(loc) != TypeKind.Struct
-        return null
+        return strview_empty()
     if oc_move_only(sm, StrView { ptr: (name), len: (n) as i64 }) == 0
-        return null
-    *len = n
-    name
+        return strview_empty()
+    StrView { ptr: (name), len: (n) as i64 }
 
 # Record on the fn that `name` (a declaration's name pointer) owns its value.
 fn oc_annotate(sm: *Sema, name: *u8)
@@ -706,20 +706,18 @@ fn oc_register(sm: *Sema, name_sv: StrView) -> i32
     var len: i32 = name_sv.len as i32
     let loc: *LocalVar = oc_local(sm, StrView { ptr: (name), len: (len) as i64 })
     var count: i32 = 0
-    var tlen: i32 = 0
-    var tname: *u8 = null
+    var tname_sv: StrView = strview_empty()
     if loc != null
-        tname = oc_local_owns(sm, loc, @count, @tlen)
-    if tname == null and (loc == null or lv_var_type(loc) != TypeKind.Array)
+        tname_sv = oc_local_owns(sm, loc, @count)
+    if tname_sv.ptr == null and (loc == null or lv_var_type(loc) != TypeKind.Array)
         # A user enum value (`var s = E.V(x)`): Sema's own type of it, where
         # the image of its LocalVar can't say.
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (name), len: (len) as i64 })
         if v != null and v.kind == TypeKind.Struct and user_enum_index(sm.pctx, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) >= 0 and oc_move_only(sm, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }) == 1
-            tname = v.type_name
-            tlen = v.type_name_len
-    if tname == null
+            tname_sv = StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }
+    if tname_sv.ptr == null
         return 0
-    oc_register_as(sm, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (tname), len: (tlen) as i64 }, count)
+    oc_register_as(sm, StrView { ptr: (name), len: (len) as i64 }, tname_sv, count)
 
 # Register the local `name` as holding the move-only `tname` (`count` of
 # them for an array).
@@ -1049,7 +1047,7 @@ fn oc_call_fn(sm: *Sema, e: *Expr) -> *FnDef
 
 # The move-only struct type a call or method call returns by value (its length
 # in *out_len), or null.
-fn oc_call_ret_type(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
+fn oc_call_ret_type(sm: *Sema, e: *Expr) -> StrView
     var f: *FnDef = null
     match e.kind
         ExprKind.Call =>
@@ -1058,28 +1056,26 @@ fn oc_call_ret_type(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
             f = rs_method_def(sm, e)   # AGAST #2262
         _ => pass
     if f == null or f.return_type != TypeKind.Struct or f.return_type_name_len <= 0
-        return null
+        return strview_empty()
     if oc_move_only(sm, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }) == 0
-        return null
-    *out_len = f.return_type_name_len
-    f.return_type_name
+        return strview_empty()
+    StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }
 
 # `call().f` with f a move-only field (ritz0's _is_move_only_field).
 fn oc_temp_field_move_only(sm: *Sema, e: *Expr) -> i32
     let l: *Expr = e.left
     if l == null or l.kind != ExprKind.Call
         return 0
-    var len: i32 = 0
-    let name: *u8 = oc_call_ret_type(sm, l, @len)
-    if name == null
+    let name_sv: StrView = oc_call_ret_type(sm, l)
+    if name_sv.ptr == null
         return 0
-    let st: *StructDef = sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 })
+    let st: *StructDef = sema_find_struct(sm, name_sv)
     if st == null
         return 0
     let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if idx < 0
         return 0
-    oc_field_move_only(sm, oc_struct_field(sm, StrView { ptr: (name), len: (len) as i64 }, idx))
+    oc_field_move_only(sm, oc_struct_field(sm, name_sv, idx))
 
 # `p[i]` through a Vec, Span or String (or a pointer to one), as
 # index_through_value_struct reads it, typed by Sema's element typer
@@ -1326,9 +1322,9 @@ fn oc_recv_def(sm: *Sema, e: *Expr) -> *FnDef
 
 # ptr_levels_of's question on Sema: the struct S when `x` is a `**S` (or
 # deeper) local, global, field, cast or call result; null otherwise.
-fn oc_ptr_ptr_struct(sm: *Sema, x: *Expr, out_len: *i32) -> *u8
+fn oc_ptr_ptr_struct(sm: *Sema, x: *Expr) -> StrView
     if x == null
-        return null
+        return strview_empty()
     var name: *u8 = null
     var len: i32 = 0
     match x.kind
@@ -1336,31 +1332,31 @@ fn oc_ptr_ptr_struct(sm: *Sema, x: *Expr, out_len: *i32) -> *u8
             if sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) != null
                 let loc: *LocalVar = oc_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
                 if loc == null or lv_var_type(loc) != TypeKind.PtrPtr
-                    return null
+                    return strview_empty()
                 name = lv_type_name(loc)
                 len = lv_type_name_len(loc)
             else
                 let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
                 if g == null or g.var_type != TypeKind.PtrPtr
-                    return null
+                    return strview_empty()
                 name = g.pointee_type_name
                 len = g.pointee_type_name_len
         ExprKind.Member =>
             let f: *StructField = rs_field(sm, x)
             if f == null or f.field_type != TypeKind.PtrPtr
-                return null
+                return strview_empty()
             name = f.field_type_name
             len = f.field_type_name_len
         ExprKind.Cast =>
             if x.type_kind != TypeKind.PtrPtr
-                return null
+                return strview_empty()
             name = x.ident_ptr
             len = x.ident_len
         ExprKind.Call =>
             # `f()` with `f() -> **S`, spelled with a `ptr_` per level past two.
             let fd: *FnDef = oc_call_fn(sm, x)
             if fd == null or fd.return_type != TypeKind.PtrPtr or fd.return_type_name == null
-                return null
+                return strview_empty()
             name = fd.return_type_name
             len = fd.return_type_name_len
             while len > 4 and (StrView { ptr: (name), len: (len) as i64 }).starts_with("ptr_")
@@ -1368,9 +1364,8 @@ fn oc_ptr_ptr_struct(sm: *Sema, x: *Expr, out_len: *i32) -> *u8
                 len = len - 4
         _ => pass
     if name == null or len <= 0 or sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 }) == null
-        return null
-    *out_len = len
-    name
+        return strview_empty()
+    StrView { ptr: (name), len: (len) as i64 }
 
 # AGAST #2336: a by-value `self` method on a reference to a move-only value.
 fn oc_check_ref_receiver(sm: *Sema, e: *Expr)
@@ -1397,9 +1392,11 @@ fn oc_check_ref_receiver(sm: *Sema, e: *Expr)
         else
             # `p.m()` with `p: **S` (or deeper): the method is S's and the
             # receiver is behind a pointer (AGAST #2402).
-            name = oc_ptr_ptr_struct(sm, e.left, @len)
-            if name == null
+            let ppname: StrView = oc_ptr_ptr_struct(sm, e.left)
+            if ppname.ptr == null
                 return
+            name = ppname.ptr
+            len = ppname.len as i32
             is_ptr = 1
             m = sema_method_fn(sm, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if m == null or m.params == null or oc_param_moves(m.params) == 0 or m.params.is_borrow == 1
@@ -1463,15 +1460,15 @@ const OC_READ_DEREF: i32 = 3
 
 # The struct (an `a:& [N]T`'s element T) a `:&` param `e` names, when reading
 # `e` as `how` (OC_READ_*) reads the referent; null otherwise.
-fn oc_lent_name(sm: *Sema, e: *Expr, how: i32, out_len: *i32) -> *u8
+fn oc_lent_name(sm: *Sema, e: *Expr, how: i32) -> StrView
     if e == null or e.kind != ExprKind.Ident
-        return null
+        return strview_empty()
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if v == null or v.lent == null
-        return null
+        return strview_empty()
     let loc: *LocalVar = oc_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if loc == null or lv_type_name_len(loc) <= 0
-        return null
+        return strview_empty()
     let p: *Param = v.lent
     let arr: i32 = (lv_is_lent(loc) == 1 and lv_var_type(loc) == TypeKind.Array) as i32   # lent_array_ident
     let referent: i32 = (lv_is_lent(loc) == 1 and lv_var_type(loc) == TypeKind.MutRef and lv_pointee_type(loc) == TypeKind.Struct) as i32
@@ -1489,15 +1486,13 @@ fn oc_lent_name(sm: *Sema, e: *Expr, how: i32, out_len: *i32) -> *u8
     else
         ok = arr
     if ok == 0
-        return null
-    *out_len = lv_type_name_len(loc)
-    lv_type_name(loc)
+        return strview_empty()
+    StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }
 
 # `e`, a `:&` param, read by value.
 fn oc_lent_read(sm: *Sema, e: *Expr, how: i32)
-    var len: i32 = 0
-    let name: *u8 = oc_lent_name(sm, e, how, @len)
-    if name == null or oc_move_only(sm, StrView { ptr: (name), len: (len) as i64 }) == 0
+    let name_sv: StrView = oc_lent_name(sm, e, how)
+    if name_sv.ptr == null or oc_move_only(sm, name_sv) == 0
         return
     oc_error_move_out(sm, e.span.line, e.span.col)
 
@@ -2030,11 +2025,9 @@ fn oc_stmt_end(sm: *Sema, stmt: *Stmt)
         StmtKind.TupleDecl =>
             # AGAST #3033: each name owns the element it was bound to.
             var tup: *StructDef = null
-            var un: *u8 = null
-            var ul: i32 = 0
-            un = oc_sema_struct(sm, stmt.var_init, @ul)
-            if un != null
-                tup = oc_find_struct(sm, StrView { ptr: (un), len: (ul) as i64 })
+            let un_sv: StrView = oc_sema_struct(sm, stmt.var_init)
+            if un_sv.ptr != null
+                tup = oc_find_struct(sm, un_sv)
             var f: *StructField = null
             if tup != null
                 f = tup.fields
@@ -2068,20 +2061,18 @@ fn oc_stmt_end(sm: *Sema, stmt: *Stmt)
 # The struct a value `e` is: ref_check's image of it (oc_value_struct), else
 # sema_expr_ty's (a constructor, a tuple, `c?`); null when neither says, or
 # `e` is null.
-fn oc_sema_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
+fn oc_sema_struct(sm: *Sema, e: *Expr) -> StrView
     if e == null
-        return null
+        return strview_empty()
     var n: *u8 = null
     var l: i32 = 0
     if oc_value_struct(sm, e, @n, @l) == 1
-        *out_len = l
-        return n
+        return StrView { ptr: (n), len: (l) as i64 }
     var t: SemaTy
     sema_expr_ty(sm, e, @t)
     if t.kind == TypeKind.Struct and t.name != null and t.name_len > 0
-        *out_len = t.name_len
-        return t.name
-    null
+        return StrView { ptr: (t.name), len: (t.name_len) as i64 }
+    strview_empty()
 
 # A `let (a, b, ..)` name just bound to the tuple's field `f` (null when
 # unknown): register it, typed as Sema's scope has it, else as `f`.
@@ -2106,30 +2097,28 @@ fn oc_decl(sm: *Sema, stmt: *Stmt)
     # What the image of its LocalVar can't say: `let p = (a, b)` and `let x =
     # p.0` of a nameless tuple, `var s = E.V` / `E.V(x)` / `V(x)` of a user
     # enum, `let t = T.f()?`.
-    var vn: *u8 = null
-    var vl: i32 = 0
+    var vn_sv: StrView = strview_empty()
     var count: i32 = 0
     let init: *Expr = stmt.var_init
     if init.kind == ExprKind.ArrayLit
         # AGAST #2266: `let a = [h.t]`, an array of what its elements are.
         var el: *Expr = init.args
         while el != null
-            if vn == null
-                vn = oc_sema_struct(sm, el, @vl)
+            if vn_sv.ptr == null
+                vn_sv = oc_sema_struct(sm, el)
             count += 1
             el = el.next
     else
-        vn = oc_sema_struct(sm, init, @vl)
-    if vn != null and oc_move_only(sm, StrView { ptr: (vn), len: (vl) as i64 }) == 1
-        oc_register_as(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, StrView { ptr: (vn), len: (vl) as i64 }, count)
+        vn_sv = oc_sema_struct(sm, init)
+    if vn_sv.ptr != null and oc_move_only(sm, vn_sv) == 1
+        oc_register_as(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, vn_sv, count)
 
 fn oc_check_uninit_array(sm: *Sema, stmt: *Stmt)
     let loc: *LocalVar = oc_local(sm, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
     if loc == null or lv_var_type(loc) != TypeKind.Array
         return
     var count: i32 = 0
-    var len: i32 = 0
-    if oc_local_owns(sm, loc, @count, @len) == null
+    if oc_local_owns(sm, loc, @count).ptr == null
         return
     var line: i32 = stmt.name_span.line
     var col: i32 = stmt.name_span.col
@@ -2701,8 +2690,7 @@ fn oc_scrutinee_moved(sm: *Sema, e: *Expr) -> i32
                 return 1
             return 0
         ExprKind.Call =>
-            var len: i32 = 0
-            if oc_call_ret_type(sm, e, @len) != null
+            if oc_call_ret_type(sm, e).ptr != null
                 return 1
             return oc_scrutinee_builds(sm, e)
         ExprKind.Method =>
@@ -2754,19 +2742,17 @@ fn oc_ctor_arg(e: *Expr) -> *Expr
 
 # The enum a match on `scrut` is over, as the emitter resolves it: its type's
 # name; null when Sema can't say.
-fn oc_scrut_enum(sm: *Sema, typed: *Expr, out_len: *i32) -> *u8
+fn oc_scrut_enum(sm: *Sema, typed: *Expr) -> StrView
     var t: SemaTy
     sema_expr_ty(sm, typed, @t)
     if t.kind != TypeKind.Unknown and t.name != null and t.name_len > 0
-        *out_len = t.name_len
-        return t.name
+        return StrView { ptr: (t.name), len: (t.name_len) as i64 }
     # Else what the image of its LocalVar says (ref_check's typing).
     var env: RefEnv
     var r: RefTy
     if ref_ty_in(ref_env_of(@env, null, sm), typed, @r) == 0 or r.kind != TypeKind.Struct or r.name_len <= 0
-        return null
-    *out_len = r.name_len
-    r.name
+        return strview_empty()
+    StrView { ptr: (r.name), len: (r.name_len) as i64 }
 
 # Before a match's arms: the match owns a scrutinee it moved.  The old
 # match_scrut goes on the hook stack for oc_match_end.
@@ -2779,12 +2765,11 @@ fn oc_match_begin(sm: *Sema, scrut: *Expr)
     var typed: *Expr = scrut
     if scrut.kind == ExprKind.Unary and (scrut.op == OpKind.Addr or scrut.op == OpKind.AddrMut) and scrut.operand != null
         typed = scrut.operand
-    var len: i32 = 0
-    var name: *u8 = oc_scrut_enum(sm, typed, @len)
-    if name == null
+    var name_sv: StrView = oc_scrut_enum(sm, typed)
+    if name_sv.ptr == null
         # AGAST #2419: `match Some(make(1))` owns the payload it builds.
-        name = oc_sema_struct(sm, oc_ctor_arg(typed), @len)
-    if name == null or oc_move_only(sm, StrView { ptr: (name), len: (len) as i64 }) == 0
+        name_sv = oc_sema_struct(sm, oc_ctor_arg(typed))
+    if name_sv.ptr == null or oc_move_only(sm, name_sv) == 0
         return
     # `@Some(x)` borrows a value only this match holds (emit_match's owned).
     var owned: *Expr = scrut
@@ -2796,25 +2781,23 @@ fn oc_match_begin(sm: *Sema, scrut: *Expr)
         return
     oc_push_scope()
     let b: *OcBind = oc_new_bind(o)
-    b.type_name = name
-    b.type_name_len = len
+    b.type_name = name_sv.ptr
+    b.type_name_len = name_sv.len as i32
     o.match_scrut = o.live_count - 1
 
 # The struct an arm's payload binding holds, as sema_walk bound it
 # (sema_arm_payload_ty: a variant's payload of the scrutinee's enum, `Some(v)`
 # of `match Some(make(1))` too); null when it holds none.
-fn oc_payload_struct(pv: *SemaVar, out_len: *i32) -> *u8
+fn oc_payload_struct(pv: *SemaVar) -> StrView
     if pv.kind != TypeKind.Struct or pv.type_name == null or pv.type_name_len <= 0
-        return null
-    *out_len = pv.type_name_len
-    pv.type_name
+        return strview_empty()
+    StrView { ptr: (pv.type_name), len: (pv.type_name_len) as i64 }
 
 # oc_payload_struct of a SemaTy (sema_named_payload_ty's answer, AGAST #4590).
-fn oc_payload_struct_ty(pt: *SemaTy, out_len: *i32) -> *u8
+fn oc_payload_struct_ty(pt: *SemaTy) -> StrView
     if pt.kind != TypeKind.Struct or pt.name == null or pt.name_len <= 0
-        return null
-    *out_len = pt.name_len
-    pt.name
+        return strview_empty()
+    StrView { ptr: (pt.name), len: (pt.name_len) as i64 }
 
 # An arm bound `name` to a copy of the payload: when the match owns its
 # scrutinee and the payload is move-only, the binding owns it now; when the
@@ -2828,9 +2811,8 @@ fn oc_match_payload(sm: *Sema, arm: *MatchArm, name_sv: StrView)
     let vi: i32 = oc_var_index(sm, StrView { ptr: (name), len: (len) as i64 })
     if vi < 0
         return
-    var plen: i32 = 0
-    var pname: *u8 = oc_payload_struct(@sm.scope[vi], @plen)
-    if pname == null and o.match_scrut >= 0
+    var pname_sv: StrView = oc_payload_struct(@sm.scope[vi])
+    if pname_sv.ptr == null and o.match_scrut >= 0
         # AGAST #4590: Sema can't type the scrutinee (`x.unwrap()`'s, say),
         # but oc_match_begin owns it by ref_check's typing: its payload is
         # the binding's, or the binding is never registered and the
@@ -2838,15 +2820,15 @@ fn oc_match_payload(sm: *Sema, arm: *MatchArm, name_sv: StrView)
         let sb: *OcBind = oc_live_at(o, o.match_scrut)
         var pt: SemaTy
         sema_named_payload_ty(sm, arm, StrView { ptr: (sb.type_name), len: (sb.type_name_len) as i64 }, @pt)
-        pname = oc_payload_struct_ty(@pt, @plen)
-    if pname == null
+        pname_sv = oc_payload_struct_ty(@pt)
+    if pname_sv.ptr == null
         return
     if o.match_scrut == OC_MATCH_LENT
-        if oc_move_only(sm, StrView { ptr: (pname), len: (plen) as i64 }) == 1
+        if oc_move_only(sm, pname_sv) == 1
             oc_lend(sm, vi)
         return
-    if oc_move_only(sm, StrView { ptr: (pname), len: (plen) as i64 }) == 1
-        oc_register_as(sm, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (pname), len: (plen) as i64 }, 0)
+    if oc_move_only(sm, pname_sv) == 1
+        oc_register_as(sm, StrView { ptr: (name), len: (len) as i64 }, pname_sv, 0)
 
 # A non-owning match lent the binding `vi`, a copy of the owner's value
 # (AGAST #2178): oc_lent_payload refuses moving it.
@@ -2875,20 +2857,18 @@ fn oc_scrut_binding(sm: *Sema, arm: *MatchArm, scrut: *Expr)
         return
     if o.match_scrut < 0 and o.match_scrut != OC_MATCH_LENT
         return
-    var len: i32 = 0
-    var name: *u8 = null
+    var name_sv: StrView = strview_empty()
     if o.match_scrut >= 0
         let sb: *OcBind = oc_live_at(o, o.match_scrut)
-        name = sb.type_name
-        len = sb.type_name_len
+        name_sv = StrView { ptr: (sb.type_name), len: (sb.type_name_len) as i64 }
     else
         var typed: *Expr = scrut
         if scrut.kind == ExprKind.Unary and (scrut.op == OpKind.Addr or scrut.op == OpKind.AddrMut) and scrut.operand != null
             typed = scrut.operand
-        name = oc_scrut_enum(sm, typed, @len)
-    if name == null or oc_move_only(sm, StrView { ptr: (name), len: (len) as i64 }) == 0
+        name_sv = oc_scrut_enum(sm, typed)
+    if name_sv.ptr == null or oc_move_only(sm, name_sv) == 0
         return
-    if arm_binds_enum_value(sm.pctx, arm, StrView { ptr: (name), len: (len) as i64 }) == 0
+    if arm_binds_enum_value(sm.pctx, arm, name_sv) == 0
         return
     let bound: StrView = StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }
     let vi: i32 = oc_var_index(sm, bound)
@@ -2897,7 +2877,7 @@ fn oc_scrut_binding(sm: *Sema, arm: *MatchArm, scrut: *Expr)
     if o.match_scrut == OC_MATCH_LENT
         oc_lend(sm, vi)
     else
-        oc_register_as(sm, bound, StrView { ptr: (name), len: (len) as i64 }, 0)
+        oc_register_as(sm, bound, name_sv, 0)
 
 # After the arms have met: forget the scrutinee where no arm took it, and
 # restore the enclosing match's state.

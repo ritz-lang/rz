@@ -31,6 +31,7 @@
 # that is a `let`'s own storage (let_check_implicit).
 
 import ritzlib.cstr
+import ritzlib.strview
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str      # memcmp, for the payload's mangled prefix (AGAST #4458)
@@ -685,71 +686,62 @@ fn let_recv_is_type(sm: *Sema, recv: *Expr) -> i32
 # The type a method receiver names, as the emitter's method_recv_type: a
 # local's or global's type name, a static call's type, a field's type, an
 # element of a const struct array.
-fn let_method_recv_type(sm: *Sema, recv: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+fn let_method_recv_type(sm: *Sema, recv: *Expr) -> StrView
     if recv == null
-        return null
+        return strview_empty()
     match recv.kind
         ExprKind.Ident =>
             let v: *SemaVar = sema_find_local(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
             if v != null
-                *out_len = v.let_name_len
-                return v.let_name
+                return StrView { ptr: (v.let_name), len: (v.let_name_len) as i64 }
             let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
             if g != null
-                *out_len = g.type_name_len
-                return g.type_name
-            *out_len = recv.ident_len
-            return recv.ident_ptr as *u8
+                return StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 }
+            return StrView { ptr: (recv.ident_ptr as *u8), len: (recv.ident_len) as i64 }
         ExprKind.Member =>
             var f: *StructField = sbk_member_field(sm, recv)
             # AGAST #3399: `xs[i].f.m()`, a field of an array's struct element.
             if f == null and recv.left != null and recv.left.kind == ExprKind.Index
-                var en: i32 = 0
-                let es: *u8 = let_index_struct(sm, recv.left, @en)
-                if es != null
-                    f = sbk_struct_field(sm, StrView { ptr: (es), len: (en) as i64 }, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
+                let es: StrView = let_index_struct(sm, recv.left)
+                if es.ptr != null
+                    f = sbk_struct_field(sm, es, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
             if f == null
-                return null
-            *out_len = f.field_type_name_len
-            return f.field_type_name
+                return strview_empty()
+            return StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }
         _ => pass
     # AGAST #3360: `PS[i].m()` of a const struct array.
     if recv.kind == ExprKind.Index and recv.left != null and recv.left.kind == ExprKind.Ident
         if sema_find_local(sm, StrView { ptr: (recv.left.ident_ptr), len: (recv.left.ident_len) as i64 }) == null and sbk_global(sm, StrView { ptr: (recv.left.ident_ptr), len: (recv.left.ident_len) as i64 }) == null
             let ce: *ConstEntry = sbk_const(sm, StrView { ptr: (recv.left.ident_ptr), len: (recv.left.ident_len) as i64 })
             if ce != null and ce.const_type == TypeKind.Array and ce.array_elem_type == TypeKind.Struct
-                *out_len = ce.array_elem_type_name_len
-                return ce.array_elem_type_name
+                return StrView { ptr: (ce.array_elem_type_name), len: (ce.array_elem_type_name_len) as i64 }
     # AGAST #3399: `xs[i].m()` of a local, global or field array's struct
     # element, and `g[i][j].m()` of an N-D one's.
     if recv.kind == ExprKind.Index
-        return let_index_struct(sm, recv, out_len)
-    null
+        return let_index_struct(sm, recv)
+    strview_empty()
 
-# The struct an element `e` (an ExprKind.Index) of an array is, or null: a 1-D
-# array's as let_value_ty types it, an N-D `[N][M]..S` array's when `e`
-# indexes every dimension.
-fn let_index_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+# The struct an element `e` (an ExprKind.Index) of an array is, or an empty
+# view: a 1-D array's as let_value_ty types it, an N-D `[N][M]..S` array's
+# when `e` indexes every dimension.
+fn let_index_struct(sm: *Sema, e: *Expr) -> StrView
     var kind: TypeKind = TypeKind.Unknown
     var name: *u8 = null
     var name_len: i32 = 0
     if let_value_ty(sm, e, @kind, @name, @name_len, 0) == 1
         if kind != TypeKind.Struct or name_len <= 0
-            return null
-        *out_len = name_len
-        return name
+            return strview_empty()
+        return StrView { ptr: (name), len: (name_len) as i64 }
     # Down the index chain to the N-D array it starts at.
     var depth: i32 = 0
     var at: *Expr = e
     while at != null and at.kind == ExprKind.Index
         if at.right == null or at.right.kind == ExprKind.Range
-            return null
+            return strview_empty()
         depth = depth + 1
         at = at.left
     if at == null
-        return null
+        return strview_empty()
     var sh: *ArrayShape = null
     match at.kind
         ExprKind.Ident =>
@@ -766,17 +758,15 @@ fn let_index_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
                 sh = f.array_shape
         _ => pass
     if sh == null or sh.rank != depth or sh.leaf_type != TypeKind.Struct or sh.leaf_name_len <= 0
-        return null
-    *out_len = sh.leaf_name_len
-    sh.leaf_name
+        return strview_empty()
+    StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }
 
 # The fn method call `e` dispatches to, as the emitter's method_call_def.
 fn let_method_call_def(sm: *Sema, e: *Expr) -> *FnDef
-    var tlen: i32 = 0
-    let tname: *u8 = let_method_recv_type(sm, e.left, @tlen)
-    if tname == null or tlen <= 0
+    let tname: StrView = let_method_recv_type(sm, e.left)
+    if tname.ptr == null or tname.len <= 0
         return null
-    sema_method_fn(sm, StrView { ptr: (tname), len: (tlen) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    sema_method_fn(sm, tname, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
 
 # =============================================================================
 # `let` immutability

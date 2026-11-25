@@ -64,6 +64,7 @@
 # per place: the first check to refuse it speaks.
 
 import ritzlib.cstr
+import ritzlib.strview
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.memory
@@ -152,7 +153,7 @@ fn rv_first_report(line: i32, col: i32) -> i32
 fn rv_report(sm: *Sema, line: i32, col: i32) -> i32
     if rv_first_report(line, col) == 0
         return 0
-    diag_error_at(sema_file(sm), diag_span(line, col))
+    diag_error_at(sema_file(sm).ptr, diag_span(line, col))
     sm.error_count = sm.error_count + 1
     1
 
@@ -302,18 +303,17 @@ fn rv_is_vec_or_string(t: *SemaTy) -> i32
 # String held by value.  monomorph makes the view a Span struct literal in a
 # Span slot; an unrewritten slice is its index.  Null when `e` isn't a view of
 # a Vec or String, or `v` isn't a local root.
-fn rv_span_view_root(sm: *Sema, e: *Expr, len: *i32) -> *u8
+fn rv_span_view_root(sm: *Sema, e: *Expr) -> StrView
     let base: *Expr = span_view_base(e)
     if base == null
-        return null
+        return strview_empty()
     var t: SemaTy
     if sema_expr_ty(sm, base, @t) == TypeKind.Void or rv_is_vec_or_string(@t) == 0
-        return null
+        return strview_empty()
     let root: *SemaVar = rv_local_root(sm, base)
     if root == null
-        return null
-    *len = root.name_len
-    root.name
+        return strview_empty()
+    StrView { ptr: (root.name), len: (root.name_len) as i64 }
 
 # 1 when `stmt`, a declaration, writes a `Span<T>` type (LARB R57).
 fn rv_decl_is_span(stmt: *Stmt) -> i32
@@ -323,24 +323,22 @@ fn rv_decl_is_span(stmt: *Stmt) -> i32
 
 # The name of the local root `e` definitely refers to, with its length in `len`:
 # `@x` of one, or a binding that holds such a reference.  Null if there's none.
-fn rv_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
+fn rv_referent(sm: *Sema, e: *Expr) -> StrView
     if e == null
-        return null
+        return strview_empty()
     if e.kind == ExprKind.Unary and (e.op == OpKind.Addr or e.op == OpKind.AddrMut)
         let root: *SemaVar = rv_local_root(sm, e.operand)
         if root == null
-            return null
-        *len = root.name_len
-        return root.name
+            return strview_empty()
+        return StrView { ptr: (root.name), len: (root.name_len) as i64 }
     if e.kind != ExprKind.Ident
-        return null
+        return strview_empty()
     let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     let n: *RsNote = rs_note(sm, v)
     # A loop can reach a `var`'s later write before this read.
     if n == null or n.root == null or v.is_let == 0 and RV_LOOPS > n.root_loops
-        return null
-    *len = n.root_len
-    n.root
+        return strview_empty()
+    StrView { ptr: (n.root), len: (n.root_len) as i64 }
 
 # What `e`, which rv_referent named a root for, has: a binding keeps it.
 fn rv_referent_ty(sm: *Sema, e: *Expr, out: *RefTy) -> i32
@@ -371,29 +369,28 @@ fn rv_forget(sm: *Sema, e: *Expr)
 
 # The local root `a` refers to, if it has `ret`'s pointee.  A `:&` param or a
 # receiver borrows `a` itself when it's that `U`.
-fn rv_gives_referent(sm: *Sema, a: *Expr, lent: i32, ret: *RefTy, len: *i32) -> *u8
+fn rv_gives_referent(sm: *Sema, a: *Expr, lent: i32, ret: *RefTy) -> StrView
     var t: RefTy
-    let root: *u8 = rv_referent(sm, a, len)
-    if root != null
+    let root: StrView = rv_referent(sm, a)
+    if root.ptr != null
         if rv_referent_ty(sm, a, @t) == 1 and ref_same_referent(@t, ret) == 1
             return root
-        return null
+        return strview_empty()
     if lent == 0
-        return null
+        return strview_empty()
     let place: *SemaVar = rv_local_root(sm, a)
     if place == null or rv_ty(sm, a, @t) == 0
-        return null
+        return strview_empty()
     var held: RefTy
     ref_set(@held, TypeKind.Ptr, t.kind, StrView { ptr: (t.name), len: (t.name_len) as i64 })
     if ref_same_referent(@held, ret) == 0
-        return null
-    *len = place.name_len
-    place.name
+        return strview_empty()
+    StrView { ptr: (place.name), len: (place.name_len) as i64 }
 
 # The local root a call returning `@U` or `@&U` was given a reference to, with
 # pointee `U`: the result may be that reference, so a raw `*U` return, which no
 # reference has to live through, isn't asked.
-fn rv_call_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
+fn rv_call_referent(sm: *Sema, e: *Expr) -> StrView
     var f: *FnDef = null
     if e.kind == ExprKind.Method
         f = rs_method_def(sm, e)
@@ -401,13 +398,13 @@ fn rv_call_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
         f = sema_call_fn(sm, e)
     var ret: RefTy
     if f == null or f.ret_ref == null or ref_of_fn(f, @ret) == 0
-        return null
+        return strview_empty()
     var p: *Param = f.params
     if p != null and name_eq(StrView { ptr: (p.name), len: (p.name_len) as i64 }, "self") == 1
         p = p.next
     if e.kind == ExprKind.Method
-        let by_self: *u8 = rv_gives_referent(sm, e.left, 1, @ret, len)
-        if by_self != null
+        let by_self: StrView = rv_gives_referent(sm, e.left, 1, @ret)
+        if by_self.ptr != null
             return by_self
     var a: *Expr = e.args
     while a != null
@@ -415,27 +412,26 @@ fn rv_call_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
         if p != null
             lent = p.is_borrow
             p = p.next
-        let root: *u8 = rv_gives_referent(sm, a, lent, @ret, len)
-        if root != null
+        let root: StrView = rv_gives_referent(sm, a, lent, @ret)
+        if root.ptr != null
             return root
         a = a.next
-    null
+    strview_empty()
 
 # `e` is a return value or a tail of one.  It runs after the `@&T` slot checks
 # on `e` (rv_into), so a place they refuse is reported once, in their words.
 fn rv_check_return(sm: *Sema, e: *Expr)
-    var len: i32 = 0
-    var root: *u8 = rv_referent(sm, e, @len)
+    var root: StrView = rv_referent(sm, e)
     # LARB R57: a Span return of a view of a local Vec or String, as `@x` in a
     # Span slot already is by rv_referent.
-    if root == null and rv_is_span(@RV_RET) == 1
-        root = rv_span_view_root(sm, e, @len)
-    if root == null and (e.kind == ExprKind.Call or e.kind == ExprKind.Method)
-        root = rv_call_referent(sm, e, @len)
-    if root == null or rv_report(sm, e.span.line, e.span.col) == 0
+    if root.ptr == null and rv_is_span(@RV_RET) == 1
+        root = rv_span_view_root(sm, e)
+    if root.ptr == null and (e.kind == ExprKind.Call or e.kind == ExprKind.Method)
+        root = rv_call_referent(sm, e)
+    if root.ptr == null or rv_report(sm, e.span.line, e.span.col) == 0
         return
     eprints("cannot return a reference to local `")
-    eprint_bytes(StrView { ptr: (root), len: (len) as i64 })
+    eprint_bytes(root)
     eprints("`: it ends with the fn\n")
 
 # LARB R71 (AGAST #3999): a pointer value returned from a `-> *[N]T` fn, whose
@@ -921,7 +917,7 @@ fn rv_literal_length(sm: *Sema, e: *Expr, slot: *RefTy)
         shape = @one
     if array_lit_wrong_length(e, shape, 0) == 0 or rv_first_report(e.span.line, e.span.col) == 0
         return
-    array_lit_length_report(sema_file(sm), e, shape, 0)
+    array_lit_length_report(sema_file(sm).ptr, e, shape, 0)
     sm.error_count = sm.error_count + 1
 
 # `e`'s value lands in `slot`.
@@ -1898,10 +1894,12 @@ fn rv_decl_fn_sig(sm: *Sema, stmt: *Stmt) -> *FnDef
 # to, its type, and whether the emitter types an un-annotated binding as a
 # reference (emitter_stmt's let_ref_view / type_ref_view_let, AGAST #3079).
 fn rv_before_decl(sm: *Sema, stmt: *Stmt)
-    RV_DECL_ROOT = rv_referent(sm, stmt.var_init, @RV_DECL_ROOT_LEN)
+    var decl_root_sv: StrView = rv_referent(sm, stmt.var_init)
     # LARB R57: a Span slot holds a view of the local Vec or String it slices.
-    if RV_DECL_ROOT == null and rv_decl_is_span(stmt) == 1
-        RV_DECL_ROOT = rv_span_view_root(sm, stmt.var_init, @RV_DECL_ROOT_LEN)
+    if decl_root_sv.ptr == null and rv_decl_is_span(stmt) == 1
+        decl_root_sv = rv_span_view_root(sm, stmt.var_init)
+    RV_DECL_ROOT = decl_root_sv.ptr
+    RV_DECL_ROOT_LEN = decl_root_sv.len as i32
     if RV_DECL_ROOT != null and rv_referent_ty(sm, stmt.var_init, @RV_DECL_TY) == 0
         RV_DECL_TY.pointee = TypeKind.Void
     RV_DECL_KIND = TypeKind.Void

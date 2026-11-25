@@ -113,7 +113,7 @@ fn cc_report(sm: *Sema, line: i32, col: i32) -> i32
     g_cc_line = line
     g_cc_col = col
     sm.error_count = sm.error_count + 1
-    diag_error_at(sema_file(sm), diag_span(line, col))
+    diag_error_at(sema_file(sm).ptr, diag_span(line, col))
     1
 
 fn cc_count_params(p: *Param) -> i32
@@ -133,14 +133,14 @@ fn cc_count_args(a: *Expr) -> i32
     n
 
 # The part of `path` after its last '/'.
-fn cc_basename(path: *u8) -> *u8
+fn cc_basename(path: *u8) -> StrView
     var base: *u8 = path
     var q: *u8 = path
     while *q != 0
         if *q == '/'
             base = q + 1
         q = q + 1
-    base
+    StrView { ptr: (base), len: (q - base) as i64 }
 
 # AGAST #3419 (LARB R45a, LANGUAGE_SPEC §15.2): a call to `fd`, declared
 # without `pub` in another file, refused at line:col as ritz0 refuses it
@@ -183,7 +183,7 @@ fn cc_private(sm: *Sema, line: i32, col: i32, owner: *ImplBlock, name_sv: StrVie
             eprint_bytes(StrView { ptr: (name), len: (len) as i64 })
             if round == 0
                 eprints("` is private to ")
-                eprints_cstr(cc_basename(fd.def_file))
+                eprints(cc_basename(fd.def_file))
                 eprints("; mark it `pub` (#3413)\n")
             else
                 eprints("` is declared here\n")
@@ -257,14 +257,12 @@ fn cc_lent_scalar(sm: *Sema, e: *Expr) -> i32
         return 0
     (p.param_pointee_type == TypeKind.Bool or is_borrow_scalar_kind(p.param_pointee_type) == 1) as i32
 
-# The struct a `:&` param `e` borrows, or null: `c:& C` (lent_struct_local).
-fn cc_lent_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+# The struct a `:&` param `e` borrows, or an empty view: `c:& C` (lent_struct_local).
+fn cc_lent_struct(sm: *Sema, e: *Expr) -> StrView
     let p: *Param = cc_lent(sm, e)
     if p == null or p.param_pointee_type != TypeKind.Struct
-        return null
-    *out_len = p.param_type_name_len
-    p.param_type_name
+        return strview_empty()
+    StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }
 
 # 1 if `p` surely points at an integer: a pointer or borrow local to one, a
 # `*i64` field, or either plus an offset (`p + i`).
@@ -318,119 +316,115 @@ fn cc_sure_int(sm: *Sema, a: *Expr) -> i32
                 return cc_int_type(f.array_elem_type)
     0
 
-# The struct argument `a` statically points at, or null (the emitter's
-# arg_pointee_struct, AGAST #1948): `@x` / `@&x` of a struct local, a `:&`
-# struct param or a struct field; `x` a local `*T` / `@T` / `@&T`, T a struct.
-# Anything else is null: it fails open on shapes it cannot type.
-fn cc_pointee_struct(sm: *Sema, a: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+# The struct argument `a` statically points at, or an empty view (the
+# emitter's arg_pointee_struct, AGAST #1948): `@x` / `@&x` of a struct local,
+# a `:&` struct param or a struct field; `x` a local `*T` / `@T` / `@&T`, T a
+# struct.  Anything else is empty: it fails open on shapes it cannot type.
+fn cc_pointee_struct(sm: *Sema, a: *Expr) -> StrView
     var name: *u8 = null
     var len: i32 = 0
     if a.kind == ExprKind.Unary and (a.op == OpKind.Addr or a.op == OpKind.AddrMut)
         let x: *Expr = a.operand
         if x == null
-            return null
+            return strview_empty()
         match x.kind
             ExprKind.Ident =>
                 let v: *SemaVar = sema_find_local(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
                 if v == null
-                    return null
+                    return strview_empty()
                 if v.kind == TypeKind.Struct
                     name = v.type_name
                     len = v.type_name_len
                 else
-                    name = cc_lent_struct(sm, x, @len)
+                    let lent: StrView = cc_lent_struct(sm, x)
+                    name = lent.ptr
+                    len = lent.len as i32
             ExprKind.Member =>
                 let f: *StructField = sbk_member_field(sm, x)
                 if f == null or f.field_type != TypeKind.Struct
-                    return null
+                    return strview_empty()
                 name = f.field_type_name
                 len = f.field_type_name_len
             _ =>
-                return null
+                return strview_empty()
     else if a.kind == ExprKind.Ident
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 })
         if v == null or v.lent != null
-            return null
+            return strview_empty()
         if v.kind != TypeKind.Ptr and v.kind != TypeKind.Ref and v.kind != TypeKind.MutRef
-            return null
+            return strview_empty()
         if v.pointee != TypeKind.Struct
-            return null
+            return strview_empty()
         name = v.type_name
         len = v.type_name_len
     else
-        return null
+        return strview_empty()
     if name == null or len <= 0 or sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 }) == null
-        return null
-    *out_len = len
-    name
+        return strview_empty()
+    StrView { ptr: (name), len: (len) as i64 }
 
-# What `a` is when it can't be the by-value struct `want`, in words; null when
-# it can be, or Sema can't tell.
-fn cc_not_a_struct(sm: *Sema, a: *Expr, want_sv: StrView) -> *u8
+# What `a` is when it can't be the by-value struct `want`, in words; an empty
+# view when it can be, or Sema can't tell.
+fn cc_not_a_struct(sm: *Sema, a: *Expr, want_sv: StrView) -> StrView
     var want: *u8 = want_sv.ptr
     var want_len: i32 = want_sv.len as i32
     match a.kind
         ExprKind.NilLit =>
-            return c"`null`"
+            return "`null`"
         ExprKind.CstringLit =>
-            return c"a `*u8`"
+            return "a `*u8`"
         _ => pass
     let k: i32 = sema_bool_kind(sm, a)
     if k == BK_FLOAT
-        return c"a float"
+        return "a float"
     # Nothing converts to a struct, not even a single-field one (LARB R47,
     # §9.2, #3390).
     if k == BK_INT and cc_sure_int(sm, a) == 1
-        return c"an integer"
+        return "an integer"
     # Nor any other scalar (LARB R47b, #3420): a bool says so whatever its form.
     if k == BK_BOOL
-        return c"a `bool`"
+        return "a `bool`"
     if k != BK_PTR
-        return null
+        return strview_empty()
     # A Span is built from `@a` / `@v` (coerce_array_to_span).
     if want_len > 5 and (StrView { ptr: (want), len: (want_len) as i64 }).starts_with("Span$")
-        return null
+        return strview_empty()
     # A `c:& C` local reads as the C it borrows (#2250): another struct than
     # `want` is let_check's (#3294).
     if cc_lent(sm, a) != null
-        return null
-    var plen: i32 = 0
-    let pointee: *u8 = cc_pointee_struct(sm, a, @plen)
-    if pointee != null
-        if name_eq(StrView { ptr: (pointee), len: (plen) as i64 }, StrView { ptr: (want), len: (want_len) as i64 }) == 1
-            return null   # ref_check's "doesn't fit a by-value slot"
-        return c"a pointer"
+        return strview_empty()
+    let pointee: StrView = cc_pointee_struct(sm, a)
+    if pointee.ptr != null
+        if name_eq(pointee, StrView { ptr: (want), len: (want_len) as i64 }) == 1
+            return strview_empty()   # ref_check's "doesn't fit a by-value slot"
+        return "a pointer"
     # A local `*u8` / `*i32` ...: a pointer to no struct at all.  A `*[N]u8`
     # makes a StrView in ritz0, so a pointer to an array isn't judged.
     if a.kind == ExprKind.Ident
         let v: *SemaVar = sema_find_local(sm, StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 })
         if v != null and v.lent == null and v.kind == TypeKind.Ptr and v.pointee != TypeKind.Struct and v.pointee != TypeKind.Void and v.pointee != TypeKind.Array and v.pointee != TypeKind.Unknown
-            return c"a pointer"
-    null
+            return "a pointer"
+    strview_empty()
 
-# The known struct `a` is a value of, or null.
-fn cc_struct_value(sm: *Sema, a: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+# The known struct `a` is a value of, or an empty view.
+fn cc_struct_value(sm: *Sema, a: *Expr) -> StrView
     var name: *u8 = null
     var len: i32 = 0
     # A `c:& C` param is a TypeKind.MutRef local naming its referent (#2250).
     let lent: *Param = cc_lent(sm, a)
     if lent != null
         if lent.param_pointee_type != TypeKind.Struct
-            return null
+            return strview_empty()
         name = lent.param_type_name
         len = lent.param_type_name_len
     else if a.kind == ExprKind.StringLit
         # A bare literal lowers to a %Span$u8 (AGAST #98), and is named so.
-        name = c"Span$u8"
-        len = 7
+        return "Span$u8"
     else if sema_bool_kind(sm, a) == BK_OTHER
         sbk_receiver(sm, a, @name, @len)
     if name == null or len <= 0 or sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 }) == null
-        return null
-    *out_len = len
-    name
+        return strview_empty()
+    StrView { ptr: (name), len: (len) as i64 }
 
 fn cc_kind_error(sm: *Sema, a: *Expr, fname_sv: StrView, argno: i32, p: *Param) -> i32
     var fname: *u8 = fname_sv.ptr
@@ -479,7 +473,7 @@ fn cc_kind(sm: *Sema, fname_sv: StrView, argno: i32, a: *Expr, p: *Param, num: i
         return
     if fit.slot_class == SKS_STRUCT
         if cc_kind_error(sm, a, StrView { ptr: (fname), len: (flen) as i64 }, argno, p) == 1
-            eprints(strview_from_cstr(cc_not_a_struct(sm, a, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })))
+            eprints(cc_not_a_struct(sm, a, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }))
             eprint_char('\n')
         return
     if fit.value_class == SKV_STRUCT and cc_kind_error(sm, a, StrView { ptr: (fname), len: (flen) as i64 }, argno, p) == 1
@@ -598,16 +592,14 @@ fn skf_value(sm: *Sema, a: *Expr, out: *SlotFit) -> i32
         if pn == null or t.pointee == TypeKind.Void
             return SKV_NONE
         return skf_named(out, SKV_PTR, strview_from_cstr(pn))
-    var len: i32 = 0
-    var sname: *u8 = cc_struct_value(sm, a, @len)
-    if sname == null and a.kind == ExprKind.StructLit and a.ident_len > 0 and sema_find_struct(sm, StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 }) != null
-        sname = a.ident_ptr
-        len = a.ident_len
-    if sname == null
+    var sv: StrView = cc_struct_value(sm, a)
+    if sv.ptr == null and a.kind == ExprKind.StructLit and a.ident_len > 0 and sema_find_struct(sm, StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 }) != null
+        sv = StrView { ptr: (a.ident_ptr), len: (a.ident_len) as i64 }
+    if sv.ptr == null
         return SKV_NONE
     out.value_class = SKV_STRUCT
-    out.name = sname
-    out.name_len = len
+    out.name = sv.ptr
+    out.name_len = sv.len as i32
     SKV_STRUCT
 
 fn skf_is_view(name_sv: StrView) -> i32
@@ -705,7 +697,7 @@ pub fn slot_kind_fit(sm: *Sema, a: *Expr, t: TypeKind, name_sv: StrView, pointee
         # A C-string literal into a StrView / `Span<u8>` is literal_slot's (#3440).
         if a.kind == ExprKind.CstringLit and skf_is_view(name_sv) == 1
             return SKF_FITS
-        if cc_not_a_struct(sm, a, name_sv) != null
+        if cc_not_a_struct(sm, a, name_sv).ptr != null
             skf_value(sm, a, out)
             return SKF_AGG
         if other == 0 or a.kind == ExprKind.Cast or skf_value(sm, a, out) != SKV_STRUCT
@@ -1017,17 +1009,17 @@ fn cc_named_fn(sm: *Sema, e: *Expr) -> *FnDef
     fd
 
 # The full name of `e`'s callee (`vec_new$u8`), as its errors spell it.
-fn cc_full_name(e: *Expr, out_len: *i32) -> *u8
-    *out_len = e.func_name_len + e.call_type_suffix_len
+fn cc_full_name(e: *Expr) -> StrView
+    let n: i32 = e.func_name_len + e.call_type_suffix_len
     if e.call_type_suffix_len <= 0
-        return e.func_name
-    let buf: *u8 = malloc(*out_len as i64 + 1)
+        return StrView { ptr: (e.func_name), len: (n) as i64 }
+    let buf: *u8 = malloc(n as i64 + 1)
     for i in 0..e.func_name_len
         *(buf + i) = *(e.func_name + i)
     for i in 0..e.call_type_suffix_len
         *(buf + e.func_name_len + i) = *(e.call_type_suffix + i)
-    *(buf + *out_len) = 0
-    buf
+    *(buf + n) = 0
+    StrView { ptr: (buf), len: (n) as i64 }
 
 # AGAST #4198: a call to `main` once main took the entry adapter.  `main` is
 # then the adapter, `(argc, argv, envp)`; the user's fn is `__ritz_main`
@@ -1039,7 +1031,7 @@ fn cc_adapted_main(sm: *Sema, e: *Expr) -> i32
     if sema_find_fn(sm, "__ritz_main") == null   # main_abi_rename's name
         return 0
     if cc_report(sm, e.span.line, e.span.col) == 1
-        eprints_cstr(main_abi_call_msg())
+        eprints(main_abi_call_msg())
         eprint_char('\n')
     1
 
@@ -1061,8 +1053,7 @@ pub fn call_check_call(sm: *Sema, e: *Expr)
         cc_print_arg(sm, e)
         cc_interp_names(sm, e)   # AGAST #4665
         return
-    var full_len: i32 = 0
-    let full: *u8 = cc_full_name(e, @full_len)
+    let full: StrView = cc_full_name(e)
     var fd: *FnDef = null
     # A local of the name is the callee (AGAST #2246, #2407): a typed fn
     # value through its signature; an untyped one isn't judged.
@@ -1080,12 +1071,12 @@ pub fn call_check_call(sm: *Sema, e: *Expr)
             return
         if v == null
             tail_note_callee(e, fd)   # AGAST #3511: a procedure in a tail
-    if cc_arity(sm, e.span.line, e.span.col, StrView { ptr: (full), len: (full_len) as i64 }, fd, e.args) == 1
+    if cc_arity(sm, e.span.line, e.span.col, full, fd, e.args) == 1
         return
     # R10's `C_get(c)` of a `self:&` method (AGAST #3260, #3278) lends c:
     # that param is a bare `self:&` or an `@&C`, neither of which cc_kind
     # judges, so it needs no lent view here.
-    cc_kinds(sm, StrView { ptr: (full), len: (full_len) as i64 }, 1, fd.params, e.args, (v == null) as i32)
+    cc_kinds(sm, full, 1, fd.params, e.args, (v == null) as i32)
     # What each argument points at (AGAST #4173), against the params the
     # emitter lowers the call with: `C_get(c)` lends c to a `self:&`.
     var cf: *FnDef = fd
@@ -1332,9 +1323,8 @@ fn cc_is_value_name(sm: *Sema, x: *Expr) -> i32
     (sbk_global(sm, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 }) != null) as i32
 
 # The type an instance method call's receiver dispatches on, as
-# emit_expr_method resolves it, or null.
-fn cc_recv_type(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+# emit_expr_method resolves it, or an empty view.
+fn cc_recv_type(sm: *Sema, e: *Expr) -> StrView
     var recv: *Expr = e.left
     # `(@d).m()` and `(@&d).m()` dispatch on `d` (AGAST #2550).
     while recv.kind == ExprKind.Unary and (recv.op == OpKind.Addr or recv.op == OpKind.AddrMut) and recv.operand != null
@@ -1343,32 +1333,26 @@ fn cc_recv_type(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
         ExprKind.Ident =>
             let v: *SemaVar = sema_find_local(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
             if v != null
-                *out_len = v.type_name_len
-                return v.type_name
+                return StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }
             let g: *GlobalVarDef = sbk_global(sm, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
             if g == null
-                return null
+                return strview_empty()
             if g.var_type == TypeKind.Struct and g.type_name_len > 0
-                *out_len = g.type_name_len
-                return g.type_name
+                return StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 }
             if (g.var_type == TypeKind.Ptr or g.var_type == TypeKind.Ref or g.var_type == TypeKind.MutRef) and g.pointee_type == TypeKind.Struct and g.pointee_type_name_len > 0
-                *out_len = g.pointee_type_name_len
-                return g.pointee_type_name
-            return null
+                return StrView { ptr: (g.pointee_type_name), len: (g.pointee_type_name_len) as i64 }
+            return strview_empty()
         ExprKind.StringLit =>
-            *out_len = 7
-            return c"StrView"
+            return "StrView"
         ExprKind.StructLit =>
-            *out_len = recv.ident_len
-            return recv.ident_ptr
+            return StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 }
         _ => pass
     var name: *u8 = null
     var len: i32 = 0
     sbk_receiver(sm, recv, @name, @len)
     if name == null or len <= 0
-        return null
-    *out_len = len
-    name
+        return strview_empty()
+    StrView { ptr: (name), len: (len) as i64 }
 
 # 1 for a method emit_expr_method lowers inline on `type_name`: an Option /
 # Result's unwrap and predicates, StrView.as_bytes, and the Vec / Span /
@@ -1475,20 +1459,19 @@ pub fn call_check_method(sm: *Sema, e: *Expr)
         if sm_method != null and param_is_self(sm_method.params) == 0
             cc_method(sm, e, sm_method, 0)
         return
-    var tn_len: i32 = 0
-    let tn: *u8 = cc_recv_type(sm, e, @tn_len)
-    if tn == null or tn_len <= 0
+    let tn: StrView = cc_recv_type(sm, e)
+    if tn.ptr == null or tn.len <= 0
         cc_scalar_method(sm, e)   # AGAST #4665
         return
-    if e.args != null and name_eq(StrView { ptr: (tn), len: (tn_len) as i64 }, "StrView") == 1 and name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "as_bytes") == 1
+    if e.args != null and name_eq(tn, "StrView") == 1 and name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "as_bytes") == 1
         if cc_report(sm, e.span.line, e.span.col) == 1   # AGAST #4665
             eprints("as_bytes() takes no arguments\n")
         return
-    if cc_inline_method(StrView { ptr: (tn), len: (tn_len) as i64 }, e) == 1
+    if cc_inline_method(tn, e) == 1
         return
-    var mfn: *FnDef = sema_impl_method(sm, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    var mfn: *FnDef = sema_impl_method(sm, tn, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if mfn == null
-        mfn = sema_spec_impl_method(sm, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        mfn = sema_spec_impl_method(sm, tn, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if mfn == null
         return
     tail_note_callee(e, mfn)   # AGAST #3511
@@ -1559,7 +1542,7 @@ fn ca_report(sm: *Sema, call: *Expr, at: *Expr, fname_sv: StrView, argno: i32) -
     g_ca_call = call
     g_ca_argno = argno
     sm.error_count = sm.error_count + 1
-    diag_error_at(sema_file(sm), at.span)
+    diag_error_at(sema_file(sm).ptr, at.span)
     eprint("argument {argno as i64} of `")
     eprint_bytes(StrView { ptr: (fname), len: (flen) as i64 })
     eprints("` has the wrong type: ")
@@ -1572,67 +1555,63 @@ fn ca_error(sm: *Sema, call: *Expr, at: *Expr, fname_sv: StrView, argno: i32, wh
         eprints_cstr(why)
         eprint_char('\n')
 
-# The struct a pointer param `p: *T` / `@T` / `@&T` points at, or null (the
-# emitter's param_pointee_struct until AGAST #4173): not a `p:& T`, whose
-# argument is a value.
-fn ca_param_struct(sm: *Sema, p: *Param, out_len: *i32) -> *u8
-    *out_len = 0
+# The struct a pointer param `p: *T` / `@T` / `@&T` points at, or an empty
+# view (the emitter's param_pointee_struct until AGAST #4173): not a `p:& T`,
+# whose argument is a value.
+fn ca_param_struct(sm: *Sema, p: *Param) -> StrView
     if p == null or p.is_borrow == 1 or p.param_type_name_len <= 0
-        return null
+        return strview_empty()
     if p.param_type != TypeKind.Ptr and p.param_type != TypeKind.Ref and p.param_type != TypeKind.MutRef
-        return null
+        return strview_empty()
     if p.param_pointee_type != TypeKind.Struct or sema_find_struct(sm, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }) == null
-        return null
-    *out_len = p.param_type_name_len
-    p.param_type_name
+        return strview_empty()
+    StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }
 
-# The struct `arg` surely points at, or null (the emitter's arg_pointee_struct):
-# `@x` / `@&x` of a struct local, a `c:& C` param or a struct field; `x` a
-# local `*T` / `@T` / `@&T`.  Anything else fails open.
-fn ca_arg_struct(sm: *Sema, arg: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+# The struct `arg` surely points at, or an empty view (the emitter's
+# arg_pointee_struct): `@x` / `@&x` of a struct local, a `c:& C` param or a
+# struct field; `x` a local `*T` / `@T` / `@&T`.  Anything else fails open.
+fn ca_arg_struct(sm: *Sema, arg: *Expr) -> StrView
     var name: *u8 = null
     var len: i32 = 0
     if arg.kind == ExprKind.Unary and (arg.op == OpKind.Addr or arg.op == OpKind.AddrMut)
         let x: *Expr = arg.operand
         if x == null
-            return null
+            return strview_empty()
         match x.kind
             ExprKind.Ident =>
                 let loc: *LocalVar = ca_local(sm, x)
                 if loc == null
-                    return null
+                    return strview_empty()
                 let lent: i32 = (lv_holds_lent_ptr(loc) == 1 and lv_pointee_type(loc) == TypeKind.Struct) as i32
                 if lv_var_type(loc) != TypeKind.Struct and lent == 0
-                    return null
+                    return strview_empty()
                 if ca_names_differ(sm, x, loc) == 1
-                    return null
+                    return strview_empty()
                 name = lv_type_name(loc)
                 len = lv_type_name_len(loc)
             ExprKind.Member =>
                 let f: *StructField = rs_field(sm, x)
                 if f == null or f.field_type != TypeKind.Struct
-                    return null
+                    return strview_empty()
                 name = f.field_type_name
                 len = f.field_type_name_len
             _ =>
-                return null
+                return strview_empty()
     else if arg.kind == ExprKind.Ident
         let loc: *LocalVar = ca_local(sm, arg)
         if loc == null
-            return null
+            return strview_empty()
         if lv_var_type(loc) != TypeKind.Ptr and lv_var_type(loc) != TypeKind.Ref and lv_var_type(loc) != TypeKind.MutRef
-            return null
+            return strview_empty()
         if lv_pointee_type(loc) != TypeKind.Struct or ca_names_differ(sm, arg, loc) == 1
-            return null
+            return strview_empty()
         name = lv_type_name(loc)
         len = lv_type_name_len(loc)
     else
-        return null
+        return strview_empty()
     if name == null or len <= 0 or sema_find_struct(sm, StrView { ptr: (name), len: (len) as i64 }) == null
-        return null
-    *out_len = len
-    name
+        return strview_empty()
+    StrView { ptr: (name), len: (len) as i64 }
 
 # 1 when the image of `x` and Sema's own binding name different structs: an
 # inferred `let c = v[i]` through a Vec reads as the container (#2443), where
@@ -1647,22 +1626,20 @@ fn ca_names_differ(sm: *Sema, x: *Expr, loc: *LocalVar) -> i32
 fn ca_struct_ptr(sm: *Sema, call: *Expr, fname_sv: StrView, argno: i32, arg: *Expr, p: *Param)
     var fname: *u8 = fname_sv.ptr
     var flen: i32 = fname_sv.len as i32
-    var want_len: i32 = 0
-    let want: *u8 = ca_param_struct(sm, p, @want_len)
-    if want == null
+    let want: StrView = ca_param_struct(sm, p)
+    if want.ptr == null
         return
-    var got_len: i32 = 0
-    let got: *u8 = ca_arg_struct(sm, arg, @got_len)
-    if got == null or name_eq(StrView { ptr: (want), len: (want_len) as i64 }, StrView { ptr: (got), len: (got_len) as i64 }) == 1
+    let got: StrView = ca_arg_struct(sm, arg)
+    if got.ptr == null or name_eq(want, got) == 1
         return
     # R79: any async fn's `NAME$Future` fits a pointer to the built-in
     # `Future`, by reference.
-    if sema_future_ref_fits(want, want_len, got, got_len) == 1
+    if sema_future_ref_fits(want.ptr, want.len as i32, got.ptr, got.len as i32) == 1
         return
     if ca_report(sm, call, call, StrView { ptr: (fname), len: (flen) as i64 }, argno) == 1
-        eprint_bytes(StrView { ptr: (want), len: (want_len) as i64 })
+        eprint_bytes(want)
         eprints("* != ")
-        eprint_bytes(StrView { ptr: (got), len: (got_len) as i64 })
+        eprint_bytes(got)
         eprints("*\n")
 
 # --- Arrays ---

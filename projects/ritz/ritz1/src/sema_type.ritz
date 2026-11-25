@@ -32,6 +32,7 @@
 # (RITZ1_SEMA_PROBE=1; ritz0/test_ritz1_sema_type.py).
 
 import ritzlib.sys
+import ritzlib.strview
 import ritzlib.str
 import ritzlib.hashmap
 import ritzlib.memory
@@ -519,35 +520,31 @@ pub fn sema_tagged_payload(sm: *Sema, name_sv: StrView, is_err: i32) -> *StructD
 # `Result$T$E` carries in Some / Ok (is_err 0) or Err (1), as a slice of `name`
 # into `out_len`; null if that payload is no (non-generic) user enum.  A
 # Result's split is the first `$` with a user enum on the side wanted.
-fn sema_tagged_enum_payload(ctx: *ParseCtx, name_sv: StrView, is_err: i32, out_len: *i32) -> *u8
+fn sema_tagged_enum_payload(ctx: *ParseCtx, name_sv: StrView, is_err: i32) -> StrView
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    *out_len = 0
     var d: i32 = 0
     while d < len and *(name + d) != '$'
         d += 1
     if d >= len
-        return null
+        return strview_empty()
     let sfx: *u8 = name + d + 1
     let sfx_len: i32 = len - d - 1
     if name_eq(StrView { ptr: (name), len: (d) as i64 }, "Option") == 1
         if is_err == 1 or user_enum_index(ctx, StrView { ptr: (sfx), len: (sfx_len) as i64 }) < 0
-            return null
-        *out_len = sfx_len
-        return sfx
+            return strview_empty()
+        return StrView { ptr: (sfx), len: (sfx_len) as i64 }
     if name_eq(StrView { ptr: (name), len: (d) as i64 }, "Result") == 0
-        return null
+        return strview_empty()
     var cut: i32 = 0
     while cut < sfx_len
         if *(sfx + cut) == '$'
             if is_err == 0 and user_enum_index(ctx, StrView { ptr: (sfx), len: (cut) as i64 }) >= 0
-                *out_len = cut
-                return sfx
+                return StrView { ptr: (sfx), len: (cut) as i64 }
             if is_err == 1 and user_enum_index(ctx, StrView { ptr: (sfx + cut + 1), len: (sfx_len - cut - 1) as i64 }) >= 0
-                *out_len = sfx_len - cut - 1
-                return sfx + cut + 1
+                return StrView { ptr: (sfx + cut + 1), len: (sfx_len - cut - 1) as i64 }
         cut += 1
-    null
+    strview_empty()
 
 # AGAST #4410: the primitive kind `Option<T>` / `Result<T, E>` carries in its
 # Some / Ok (is_err 0) or Err (is_err 1) payload, or TypeKind.Void.  Sema's
@@ -642,10 +639,9 @@ pub fn sema_named_payload_ty(sm: *Sema, arm: *MatchArm, name_sv: StrView, t: *Se
         if st != null
             return sema_struct_ty(st, t)
         # AGAST #4265: a user-enum payload is that enum, as a `let x: E` is.
-        var en_len: i32 = 0
-        let en: *u8 = sema_tagged_enum_payload(sm.pctx, StrView { ptr: (s.name), len: (s.name_len) as i64 }, is_err, @en_len)
-        if en != null
-            return sema_ty_set(t, TypeKind.Struct, StrView { ptr: (en), len: (en_len) as i64 }, TypeKind.Void, null)
+        let en_sv: StrView = sema_tagged_enum_payload(sm.pctx, StrView { ptr: (s.name), len: (s.name_len) as i64 }, is_err)
+        if en_sv.ptr != null
+            return sema_ty_set(t, TypeKind.Struct, en_sv, TypeKind.Void, null)
         # AGAST #4448: a one-level pointer payload (`Option<*u8>`'s
         # `Some(n)`) is that `*T`, as the emitter binds the local.
         let pk_ptr: TypeKind = sema_tagged_pointer_payload(s.name, s.name_len, is_err)
@@ -1474,10 +1470,9 @@ fn sx_member_field(sm: *Sema, e: *Expr) -> *StructField
     # AGAST #4410: `x.forward[i].f` -- an element of a `[N]*S` / `**S` /
     # `[N]S` base.  index_elem_struct_name names the struct there.
     if e.left.kind == ExprKind.Index
-        var iel: i32 = 0
-        let ien: *u8 = sx_index_struct_name(sm, e.left, @iel)
-        if ien != null and iel > 0
-            let ist: *StructDef = sema_find_struct(sm, StrView { ptr: (ien), len: (iel) as i64 })
+        let ien_sv: StrView = sx_index_struct_name(sm, e.left)
+        if ien_sv.ptr != null and ien_sv.len > 0
+            let ist: *StructDef = sema_find_struct(sm, ien_sv)
             if ist != null
                 let iidx: i32 = find_field_index(ist, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
                 if iidx >= 0
@@ -1535,10 +1530,9 @@ fn sx_member_slot_ty(sm: *Sema, e: *Expr) -> TypeKind
 # The struct an element `ie` = `b[i]` names, as emitter_core's
 # index_elem_struct_name: a `[N]*S` / **S field, a `[N]S` array, a `*S`
 # local, or a `[N]S` global; null of any other.
-fn sx_index_struct_name(sm: *Sema, ie: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+fn sx_index_struct_name(sm: *Sema, ie: *Expr) -> StrView
     if ie == null or ie.kind != ExprKind.Index or ie.left == null
-        return null
+        return strview_empty()
     let b: *Expr = ie.left
     # An N-D array field's full-rank element, `T[0].n[0][0]` over `n: [2][1]In`.
     match b.kind
@@ -1557,75 +1551,66 @@ fn sx_index_struct_name(sm: *Sema, ie: *Expr, out_len: *i32) -> *u8
                         if ridx >= 0
                             let rf: *StructField = get_field_type(rst, ridx)
                             if rf.array_shape != null and depth + 1 == rf.array_shape.rank and rf.array_shape.leaf_type == TypeKind.Struct and rf.array_shape.leaf_name_len > 0
-                                *out_len = rf.array_shape.leaf_name_len
-                                return rf.array_shape.leaf_name
-            return null
+                                return StrView { ptr: (rf.array_shape.leaf_name), len: (rf.array_shape.leaf_name_len) as i64 }
+            return strview_empty()
         ExprKind.Member =>
             # The field where `b`'s own receiver names the struct (no recursion
             # through sx_member_field: it calls this fn for an INDEX receiver).
             if b.left == null
-                return null
+                return strview_empty()
             var r: SemaTy
             if sema_expr_ty(sm, b.left, @r) == TypeKind.Unknown
-                return null
+                return strview_empty()
             let mst: *StructDef = sema_recv_struct(sm, @r)
             if mst == null
-                return null
+                return strview_empty()
             let midx: i32 = find_field_index(mst, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
             if midx < 0
-                return null
+                return strview_empty()
             let f: *StructField = get_field_type(mst, midx)
             if f.field_type_name_len <= 0
-                return null
+                return strview_empty()
             match f.field_type
                 TypeKind.PtrPtr =>
-                    *out_len = f.field_type_name_len
-                    return f.field_type_name
+                    return StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }
                 TypeKind.Ptr =>
-                    *out_len = f.field_type_name_len
-                    return f.field_type_name
+                    return StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }
                 _ => pass
             if f.field_type == TypeKind.Array and (f.array_elem_type == TypeKind.Struct or f.array_elem_type == TypeKind.Ptr or f.array_elem_type == TypeKind.PtrPtr)
-                *out_len = f.array_elem_type_name_len
-                return f.array_elem_type_name
+                return StrView { ptr: (f.array_elem_type_name), len: (f.array_elem_type_name_len) as i64 }
             # A Vec / Span / String field (`table.edges[0].y_min`).
             if f.field_type_name != null and f.field_type_name_len > 0
                 var fbt: SemaTy
                 sema_ty_set(@fbt, f.field_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, f.ptr_pointee, null)
                 var fet: SemaTy
                 if sema_buffer_ty(sm, @fbt, @fet) != TypeKind.Unknown and fet.kind == TypeKind.Struct and fet.name_len > 0
-                    *out_len = fet.name_len
-                    return fet.name
-            return null
+                    return StrView { ptr: (fet.name), len: (fet.name_len) as i64 }
+            return strview_empty()
         ExprKind.Ident =>
             let v: *SemaVar = sema_find_local(sm, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
             if v != null
                 if v.kind == TypeKind.Array or v.kind == TypeKind.Ptr or v.kind == TypeKind.PtrPtr
                     if v.type_name_len <= 0
-                        return null
-                    *out_len = v.type_name_len
-                    return v.type_name
+                        return strview_empty()
+                    return StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }
                 # A `& [N]S` borrow param binds as an array local; its type
                 # name is the element struct.
                 if v.kind == TypeKind.Unknown and v.lent != null and v.lent.param_pointee_type == TypeKind.Array and v.lent.param_type_name_len > 0
-                    *out_len = v.lent.param_type_name_len
-                    return v.lent.param_type_name
+                    return StrView { ptr: (v.lent.param_type_name), len: (v.lent.param_type_name_len) as i64 }
                 # A Vec / Span / String element (`points[0].x`, points: Vec<T>).
                 if v.type_name != null and v.type_name_len > 0
                     var bt: SemaTy
                     sema_ty_set(@bt, v.kind, StrView { ptr: (v.type_name), len: (v.type_name_len) as i64 }, v.pointee, null)
                     var et: SemaTy
                     if sema_buffer_ty(sm, @bt, @et) != TypeKind.Unknown and et.kind == TypeKind.Struct and et.name_len > 0
-                        *out_len = et.name_len
-                        return et.name
-                return null
+                        return StrView { ptr: (et.name), len: (et.name_len) as i64 }
+                return strview_empty()
             let g: *GlobalVarDef = sx_find_global(sm, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
             if g != null and g.var_type == TypeKind.Array and g.array_elem_type == TypeKind.Struct and g.array_elem_type_name_len > 0
-                *out_len = g.array_elem_type_name_len
-                return g.array_elem_type_name
-            return null
+                return StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 }
+            return strview_empty()
         _ => pass
-    null
+    strview_empty()
 
 # The pointee of `x[i]`'s element when the array is a `[N]*T` (emitter's
 # array_elem_pointee_kind), else TypeKind.Void.

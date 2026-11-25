@@ -256,10 +256,12 @@ class RitzGenerator:
         }
         self._emit('')
         self._emit('# AGAST #1819: the spelling of a token kind, for diagnostics.')
-        self._emit('pub fn tok_display_name(kind: i32) -> *u8')
+        self._emit('# AGAST #4772: StrView, not a c"" C string -- no non-emitter fn names text')
+        self._emit('# in a NUL-terminated *u8; this one has no emitter*.ritz caller.')
+        self._emit('pub fn tok_display_name(kind: i32) -> StrView')
         for tid, name in [(HAND_WRITTEN_TOKEN_IDS[b], b) for b in builtins]:
             self._emit(f'    if kind == TOK_{name}')
-            self._emit(f'        return c"{FRIENDLY[name]}"')
+            self._emit(f'        return "{FRIENDLY[name]}"')
         for tid, name in all_user_toks:
             tok = next(t for t in self.grammar.tokens if t.name == name)
             if tok.is_skip:
@@ -269,8 +271,8 @@ class RitzGenerator:
             else:
                 text = FRIENDLY.get(name, name.lower().replace('_', ' '))
             self._emit(f'    if kind == TOK_{name}')
-            self._emit(f'        return c"{text}"')
-        self._emit('    return c"token"')
+            self._emit(f'        return "{text}"')
+        self._emit('    return "token"')
 
         # Token struct
         self._emit('# Token structure')

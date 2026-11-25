@@ -242,21 +242,20 @@ pub fn test_fns_reset(ctx: *ParseCtx)
 pub fn gated_decl_count(ctx: *ParseCtx) -> i32
     ctx.gated_count
 
-pub fn gated_decl_at(ctx: *ParseCtx, i: i32, out_len: *i32) -> *u8
-    *out_len = *(ctx.gated_lens + i)
-    *(ctx.gated_names + i)
+pub fn gated_decl_at(ctx: *ParseCtx, i: i32) -> StrView
+    StrView { ptr: (*(ctx.gated_names + i)), len: (*(ctx.gated_lens + i)) as i64 }
 
 pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
     # AGAST #4055: a fn gated out never reaches the module, so main's
     # fn-conflict checks can't see two gated to one other target; note it.
     if p.skip_item != 0 and (p.ctx.attr_bits & ATTR_TARGET_ANY) != 0 and fn_def.body != null
-        fn_variant_note(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, fn_def.line, parse_file_copy_shared(p), attr_target_key(p.ctx))
+        fn_variant_note(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, fn_def.line, parse_file_copy_shared(p).ptr, attr_target_key(p.ctx))
     if p.skip_item != 0
         gated_decl_log(p.ctx, StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
         module_add_fn(p.ctx, p.module, fn_def)
         # AGAST #2148: what main.ritz's fn-conflict checks read.
-        fn_def.def_file = parse_file_copy_shared(p)
+        fn_def.def_file = parse_file_copy_shared(p).ptr
         if (p.ctx.attr_bits & ATTR_TARGET_ANY) != 0
             fn_def.target_gated = 1
         if (p.ctx.attr_bits & ATTR_TEST) != 0
@@ -284,7 +283,7 @@ pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
     var exists: i32 = 1
     if p.skip_item != 0
         exists = 0
-    struct_variant_note(p.tokens, p.pos, StrView { ptr: (st.name), len: (st.name_len) as i64 }, parse_file_copy_shared(p), target, exists)
+    struct_variant_note(p.tokens, p.pos, StrView { ptr: (st.name), len: (st.name_len) as i64 }, parse_file_copy_shared(p).ptr, target, exists)
     if p.skip_item != 0
         gated_decl_log(p.ctx, StrView { ptr: (st.name), len: (st.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
@@ -1183,7 +1182,7 @@ pub fn p_eprint_expected(p: *Parser)
         if fail_bit(p, k) == 1
             if seen > 0
                 eprints(", ")
-            eprints_cstr(tok_display_name(k))
+            eprints(tok_display_name(k))
             seen = seen + 1
         k = k + 1
 
@@ -1458,7 +1457,7 @@ fn impl_block_core(p: *Parser, trait_name_sv: StrView, type_name_sv: StrView, ty
     if trait_name != null
         impl_trait_span(p, trait_name, @ib.trait_span)   # AGAST #3015, #4211
     impl_keyword_span(p, type_name, @ib.impl_span, @ib.type_span)   # AGAST #3162, #3264
-    ib.def_file = parse_file_copy_shared(p)
+    ib.def_file = parse_file_copy_shared(p).ptr
     ib.trait_name = trait_name
     ib.trait_name_len = trait_len
     ib.type_name = type_name
@@ -1474,7 +1473,7 @@ fn impl_block_core(p: *Parser, trait_name_sv: StrView, type_name_sv: StrView, ty
         # (fn_source_file; specialize_impl_method's clone copies it).  Methods
         # never reach main.ritz's fn-conflict checks: those run on
         # m.functions before monomorph appends the specialised methods.
-        mt.def_file = parse_file_copy_shared(p)
+        mt.def_file = parse_file_copy_shared(p).ptr
         if mt.type_params != null
             generic_method_error(p.ctx, tok_span_of(p, mt.name, mt.line), mt, StrView { ptr: (type_name), len: (type_len) as i64 })
         if type_params != null and fn_is_decl(p.ctx, mt) == 1
@@ -1514,9 +1513,8 @@ pub fn impl_block_generic_new(p: *Parser, trait_name_sv: StrView, base_sv: StrVi
     var base_len: i32 = base_sv.len as i32
     if type_params != null or args == null
         return impl_block_new(p, StrView { ptr: (trait_name), len: (trait_len) as i64 }, StrView { ptr: (base), len: (base_len) as i64 }, type_params, args, methods)
-    var name_len: i32 = 0
-    let name: *u8 = mangle_generic_args(p, StrView { ptr: (base), len: (base_len) as i64 }, args, @name_len)
-    let ib: *ImplBlock = impl_block_new(p, StrView { ptr: (trait_name), len: (trait_len) as i64 }, StrView { ptr: (name), len: (name_len) as i64 }, type_params, args, methods)
+    let name_sv: StrView = mangle_generic_args(p, StrView { ptr: (base), len: (base_len) as i64 }, args)
+    let ib: *ImplBlock = impl_block_new(p, StrView { ptr: (trait_name), len: (trait_len) as i64 }, name_sv, type_params, args, methods)
     # `Span$u8` is not in the source; locate the diagnostic at the base token
     # the user wrote (`Span`), as the pointer target does with its `*`.
     if ib.type_span.line == 0
@@ -1526,8 +1524,9 @@ pub fn impl_block_generic_new(p: *Parser, trait_name_sv: StrView, base_sv: StrVi
 fn impl_spell_self(p: *Parser, mt: *FnDef, type_name_sv: StrView, type_params: *TypeParam)
     var type_name: *u8 = type_name_sv.ptr
     var type_len: i32 = type_name_sv.len as i32
-    var self_len: i32 = 0
-    let self_name: *u8 = impl_self_spelling(p, StrView { ptr: (type_name), len: (type_len) as i64 }, type_params, @self_len)
+    let self_sv: StrView = impl_self_spelling(p, StrView { ptr: (type_name), len: (type_len) as i64 }, type_params)
+    let self_name: *u8 = self_sv.ptr
+    let self_len: i32 = self_sv.len as i32
     var prm: *Param = mt.params
     while prm != null
         param_spell_self(prm, StrView { ptr: (self_name), len: (self_len) as i64 })
@@ -1622,12 +1621,11 @@ fn name_is_self_type(name_sv: StrView) -> i32
     ((StrView { ptr: (name), len: (len) as i64 }).eq("Self")) as i32
 
 # `Box` for `impl Box`, `Box$K$V` for `impl<K, V> Box<K, V>`.
-fn impl_self_spelling(p: *Parser, type_name_sv: StrView, type_params: *TypeParam, out_len: *i32) -> *u8
+fn impl_self_spelling(p: *Parser, type_name_sv: StrView, type_params: *TypeParam) -> StrView
     var type_name: *u8 = type_name_sv.ptr
     var type_len: i32 = type_name_sv.len as i32
     if type_params == null
-        *out_len = type_len
-        return type_name
+        return StrView { ptr: (type_name), len: (type_len) as i64 }
     var total: i32 = type_len
     var tp: *TypeParam = type_params
     while tp != null
@@ -1647,8 +1645,7 @@ fn impl_self_spelling(p: *Parser, type_name_sv: StrView, type_params: *TypeParam
             pos = pos + 1
         tp = tp.next
     *(out + pos) = 0
-    *out_len = pos
-    out
+    StrView { ptr: (out), len: (pos) as i64 }
 
 # AGAST #1902: a method's own `<...>` (`impl Box` / `fn conv<T>`) is a
 # located error.  Monomorph never specialises a method's type params, so the
@@ -1740,9 +1737,9 @@ pub fn decl_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam, pa
 # primitive/built-in can be admitted only in the trait's file.
 # State: ParseCtx.trait_files, .trait_count, .trait_cap
 
-fn dup_parse_file_name(path: *u8) -> *u8
+fn dup_parse_file_name(path: *u8) -> StrView
     if path == null
-        return null
+        return strview_empty()
     var n: i64 = 0
     while *(path + n) != 0
         n = n + 1
@@ -1751,7 +1748,7 @@ fn dup_parse_file_name(path: *u8) -> *u8
     while i <= n
         *(buf + i) = *(path + i)
         i = i + 1
-    buf
+    StrView { ptr: (buf), len: (n) as i64 }
 
 pub fn trait_declared_record(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
@@ -1766,7 +1763,7 @@ pub fn trait_declared_record(ctx: *ParseCtx, name_sv: StrView) -> i32
         ctx.trait_cap = cap
     *(ctx.trait_names + ctx.trait_count) = name
     *(ctx.trait_lens + ctx.trait_count) = len
-    *(ctx.trait_files + ctx.trait_count) = dup_parse_file_name(ctx.parse_file)
+    *(ctx.trait_files + ctx.trait_count) = dup_parse_file_name(ctx.parse_file).ptr
     ctx.trait_count = ctx.trait_count + 1
     0
 
@@ -1776,9 +1773,8 @@ pub fn trait_declared_record(ctx: *ParseCtx, name_sv: StrView) -> i32
 pub fn trait_declared_count(ctx: *ParseCtx) -> i32
     ctx.trait_count
 
-pub fn trait_declared_at(ctx: *ParseCtx, i: i32, out_len: *i32) -> *u8
-    *out_len = *(ctx.trait_lens + i)
-    *(ctx.trait_names + i)
+pub fn trait_declared_at(ctx: *ParseCtx, i: i32) -> StrView
+    StrView { ptr: (*(ctx.trait_names + i)), len: (*(ctx.trait_lens + i)) as i64 }
 
 pub fn trait_declared(ctx: *ParseCtx, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
@@ -1912,7 +1908,7 @@ pub fn global_var_new(p: *Parser, name_sv: StrView, tr: *TypeRef, init_expr: *Ex
         g.pointee_type_name = f.type_name
         g.pointee_type_name_len = f.type_name_len
     g.init_expr = init_expr
-    g.src_file = parse_file_copy(p)
+    g.src_file = parse_file_copy(p).ptr
     g.line = line
     g.col = col
     g.next = null
@@ -1956,28 +1952,28 @@ pub fn extern_var_init_refused(p: *Parser, name_sv: StrView, line: i32, col: i32
 # The type a declaration would spell for an untyped global's initializer, as
 # ritz0 names it in "a global needs a type" (#3375), or "T" when the parser
 # can't tell (a call, an ident, `null`: ritz0 may name more of those).
-fn untyped_global_shown(e: *Expr) -> *u8
+fn untyped_global_shown(e: *Expr) -> StrView
     match e.kind
         ExprKind.IntLit =>
             if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
-                return c"bool"
+                return "bool"
             if e.lit_kind == LIT_PLAIN
-                return c"i64"
-            return c"T"
+                return "i64"
+            return "T"
         ExprKind.FloatLit =>
-            return c"f64"
+            return "f64"
         ExprKind.StringLit =>
-            return c"StrView"
+            return "StrView"
         ExprKind.CstringLit =>
-            return c"*u8"
+            return "*u8"
         ExprKind.CharLit =>
-            return c"u8"
+            return "u8"
         _ => pass
     if e.kind == ExprKind.Unary and e.op == OpKind.Neg
         let o: *Expr = e.operand
         if o.kind == ExprKind.FloatLit or (o.kind == ExprKind.IntLit and o.lit_kind == LIT_PLAIN)
             return untyped_global_shown(o)
-    c"T"
+    "T"
 
 # `var g = expr` (LARB R38, #3375): "a global needs a type: write
 # `var g: T = ...`" at the `=`.  Counted like a refused attribute so the
@@ -1994,7 +1990,7 @@ pub fn global_var_untyped_refused(p: *Parser, name_sv: StrView, init_expr: *Expr
             eprint_char(*(name + i))
             i += 1
         eprints(": ")
-        eprints_cstr(untyped_global_shown(init_expr))
+        eprints(untyped_global_shown(init_expr))
         eprints(" = ...`\n")
         p.ctx.attr_errors = p.ctx.attr_errors + 1
     global_var_new(p, StrView { ptr: (name), len: (len) as i64 }, type_prim(p, TypeKind.I64), 0 as *Expr, line, col)
@@ -2238,7 +2234,7 @@ pub fn trait_bound_new(p: *Parser, name_sv: StrView, line: i32, col: i32, rest: 
     b.name = name
     b.name_len = len
     b.span = diag_span(line, col)
-    b.file = parse_file_copy_shared(p)
+    b.file = parse_file_copy_shared(p).ptr
     b.next = rest
     return b
 
@@ -2285,7 +2281,7 @@ pub fn generic_struct_def_new(p: *Parser, name_sv: StrView, type_params: *TypePa
     s.fields = fields
     s.next = null
     s.type_params = type_params  # Generic type parameters (field at end to preserve layout)
-    s.def_file = parse_file_copy_shared(p)   # AGAST #3494 (R65)
+    s.def_file = parse_file_copy_shared(p).ptr   # AGAST #3494 (R65)
     tn_claim(p, type_params, null)   # AGAST #4021
     return s
 
@@ -2321,7 +2317,7 @@ pub fn const_new(p: *Parser, name_sv: StrView, tr: *TypeRef, val: *Expr, line: i
     # ConstEntry for non-integer constants (value_expr, array_size, etc.).
     let c: *ConstEntry = parser_alloc(p, sizeof(ConstEntry)) as *ConstEntry
     c.name = name as *u8
-    c.def_file = parse_file_copy_shared(p)
+    c.def_file = parse_file_copy_shared(p).ptr
     c.target_gated = 0  # item_dispatch_const sets it
     c.name_len = len
     c.const_type = ty
@@ -2342,7 +2338,7 @@ pub fn const_new(p: *Parser, name_sv: StrView, tr: *TypeRef, val: *Expr, line: i
         # is not a constant at all: the emitter decides once every module is
         # merged, and reports a located error if it still does not fold.
         c.fold_state = CONST_FOLD_PENDING
-        c.src_file = parse_file_copy(p)
+        c.src_file = parse_file_copy(p).ptr
     else if val != null and val.kind == ExprKind.IntLit
         # Non-integer declared types (float, struct/alias, ...) keep the
         # legacy literal fast path; their real lowering reads value_expr.
@@ -2883,7 +2879,7 @@ fn enum_new(p: *Parser, name_sv: StrView, generic: i32, repr: TypeKind, line: i3
     e.line = line
     e.variants = null
     e.next = null
-    e.def_file = parse_file_copy_shared(p)   # AGAST #3494 (R65)
+    e.def_file = parse_file_copy_shared(p).ptr   # AGAST #3494 (R65)
     if p.module.enums == null
         p.module.enums = e
     else
@@ -3376,18 +3372,17 @@ pub fn enum_discr_is_index(ctx: *ParseCtx, ei: i32) -> i32
 
 # `E__from`, the fn `E.from(v)` calls (LANGUAGE_SPEC §10.4): the receiver's
 # name + "__from", malloc'd.  *out_len gets its length.
-pub fn enum_from_fn_name(name_sv: StrView, out_len: *i32) -> *u8
+pub fn enum_from_fn_name(name_sv: StrView) -> StrView
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let buf: *u8 = malloc((len + 7) as i64)
     for i in 0..len
         *(buf + i) = *(name + i)
-    let suffix: *u8 = c"__from"
+    let suffix: StrView = "__from"
     for j in 0..6
-        *(buf + len + j) = *(suffix + j)
+        *(buf + len + j) = *(suffix.ptr + j)
     *(buf + len + 6) = 0
-    *out_len = len + 6
-    return buf
+    return StrView { ptr: (buf), len: (len + 6) as i64 }
 
 # Is `e` the method call `E.from(...)` on the bare name of an enum?
 pub fn is_enum_from_call(ctx: *ParseCtx, e: *Expr) -> i32
@@ -3470,7 +3465,7 @@ fn gen_discr(ctx: *ParseCtx, bits: i64, neg: i32)
 # Source of `from` for every enum with a representation type in `m` (the
 # module just parsed), or null if there is none.  *out_len gets its length.
 # The buffer is the caller's to keep.
-pub fn enum_from_source(ctx: *ParseCtx, m: *Module, out_len: *i64) -> *u8
+pub fn enum_from_source(ctx: *ParseCtx, m: *Module) -> StrView
     ctx.gen_buf = null
     ctx.gen_len = 0
     ctx.gen_cap = 0
@@ -3508,8 +3503,7 @@ pub fn enum_from_source(ctx: *ParseCtx, m: *Module, out_len: *i64) -> *u8
             gen_cstr(ctx, c"    return None\n")
             line = line + 1
         e = e.next
-    *out_len = ctx.gen_len
-    return ctx.gen_buf
+    return StrView { ptr: (ctx.gen_buf), len: (ctx.gen_len) }
 
 # 1 when enum `a`'s name sorts before enum `b`'s (bytewise; a proper prefix
 # sorts first), else 0.
@@ -3681,10 +3675,10 @@ pub fn postfix_generic_call_ref(p: *Parser, type_tok: Token, args: *Expr) -> *Po
     op.kind = POSTFIX_CALL
     op.args = args
     # "$ref_" + type_name (an alias spelled as its target, #2037).
-    var len: i32 = 0
     tn_note_tok(p, type_tok)   # AGAST #4171
-    op.call_type_suffix = generic_tok_suffix(p, "ref_", type_tok, @len)
-    op.call_type_suffix_len = len
+    let suf_sv: StrView = generic_tok_suffix(p, "ref_", type_tok)
+    op.call_type_suffix = suf_sv.ptr
+    op.call_type_suffix_len = suf_sv.len as i32
     op.call_targs = generic_tok_arg(p, type_tok)
     op.next = null
     return op

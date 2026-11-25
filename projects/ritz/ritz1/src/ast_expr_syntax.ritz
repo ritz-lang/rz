@@ -46,9 +46,9 @@ pub fn parse_span_at(p: *Parser, pos: i32) -> SrcSpan
 # Copy of the current parse file's path in the parser arena, or null.
 # ctx.parse_file itself is borrowed: for an import it points into a String the
 # driver drops as soon as that import is parsed, long before emission.
-pub fn parse_file_copy(p: *Parser) -> *u8
+pub fn parse_file_copy(p: *Parser) -> StrView
     if p.ctx.parse_file == null
-        return null
+        return strview_empty()
     var n: i64 = 0
     while *(p.ctx.parse_file + n) != 0
         n = n + 1
@@ -57,7 +57,7 @@ pub fn parse_file_copy(p: *Parser) -> *u8
     while i <= n
         *(buf + i) = *(p.ctx.parse_file + i)
         i = i + 1
-    buf
+    StrView { ptr: (buf), len: (n) as i64 }
 
 # parse_file_copy, shared between consecutive callers that see the same path.
 # AGAST #1364 records a path on every narrow-integer let/var, and a fresh copy
@@ -66,14 +66,14 @@ pub fn parse_file_copy(p: *Parser) -> *u8
 # after each import, so a later file can arrive at the same address.
 # State: ParseCtx.shared_file_copy
 
-pub fn parse_file_copy_shared(p: *Parser) -> *u8
+pub fn parse_file_copy_shared(p: *Parser) -> StrView
     if p.ctx.parse_file == null
-        return null
-    if p.ctx.shared_file_copy != null
+        return strview_empty()
+    if p.ctx.shared_file_copy.ptr != null
         var i: i64 = 0
-        while *(p.ctx.parse_file + i) != 0 and *(p.ctx.parse_file + i) == *(p.ctx.shared_file_copy + i)
+        while i < p.ctx.shared_file_copy.len and *(p.ctx.parse_file + i) == *(p.ctx.shared_file_copy.ptr + i)
             i = i + 1
-        if *(p.ctx.parse_file + i) == 0 and *(p.ctx.shared_file_copy + i) == 0
+        if i == p.ctx.shared_file_copy.len and *(p.ctx.parse_file + i) == 0
             return p.ctx.shared_file_copy
     p.ctx.shared_file_copy = parse_file_copy(p)
     p.ctx.shared_file_copy
@@ -167,13 +167,14 @@ pub fn param_of_type(p: *Parser, name_sv: StrView, ty: *TypeRef) -> *Param
     param.param_type = kind
     # Copy the struct type name for a struct, or a pointer / reference whose
     # pointee is a named type.  AGAST #2139: only then.
-    var nm_len: i32 = 0
     if param_type_names_pointee(p, ty) == 1
-        param.param_type_name = tr_name(ty, @nm_len)
-        param.param_type_name_len = nm_len
+        let nm_sv: StrView = tr_name(ty)
+        param.param_type_name = nm_sv.ptr
+        param.param_type_name_len = nm_sv.len as i32
     else if kind == TypeKind.Array
-        param.param_type_name = tr_elem_name(ty, @nm_len)
-        param.param_type_name_len = nm_len
+        let nm_sv: StrView = tr_elem_name(ty)
+        param.param_type_name = nm_sv.ptr
+        param.param_type_name_len = nm_sv.len as i32
     else
         param.param_type_name = null
         param.param_type_name_len = 0
@@ -397,18 +398,18 @@ pub fn const_fold_int(consts: *ConstEntry, e: *Expr, resolve: i32, out: *i64) ->
 # expression is a compile error" (ritz0's ConstEvaluator._wrap_if_requested).
 
 # `+`, `-`, `*`, `/` or `%`, as the source spells it.
-pub fn arith_op_cstr(op: OpKind) -> *u8
+pub fn arith_op_cstr(op: OpKind) -> StrView
     match op
         OpKind.Add =>
-            return c"+"
+            return "+"
         OpKind.Sub =>
-            return c"-"
+            return "-"
         OpKind.Mul =>
-            return c"*"
+            return "*"
         OpKind.Div =>
-            return c"/"
+            return "/"
         _ => pass
-    c"%"
+    "%"
 
 # 1 when `a op b` (`+`, `-` or `*`) leaves the `bits`-wide type, signed or
 # (uns == 1) unsigned.  `a` and `b` are values of that type held in an i64: a
@@ -497,7 +498,7 @@ pub fn const_overflow_site(consts: *ConstEntry, e: *Expr, resolve: i32) -> *Expr
 pub fn const_overflow_report(file: *u8, site: *Expr)
     diag_error_at(file, diag_span(site.span.line, site.span.col))
     eprints("integer overflow in `")
-    eprints_cstr(arith_op_cstr(site.op))
+    eprints(arith_op_cstr(site.op))
     eprints("` in constant expression\n")
 
 # Is constant expression `e` a u64?  The rule of int_operand_shape in
@@ -754,25 +755,23 @@ pub fn tr_elem_pointee(tr: *TypeRef) -> TypeKind
 
 # `last_array_elem_type_name`: the struct an array's element (or the struct
 # it points at / refers to) is named, null otherwise.
-pub fn tr_elem_name(tr: *TypeRef, out_len: *i32) -> *u8
-    *out_len = 0
+pub fn tr_elem_name(tr: *TypeRef) -> StrView
     if tr == null or tr.elem == null
-        return null
+        return strview_empty()
     let e: *TypeRef = tr.elem
     match e.kind
         TypeKind.Struct =>
-            *out_len = e.name_len
-            return e.name
+            return StrView { ptr: (e.name), len: (e.name_len) as i64 }
         TypeKind.Ref | TypeKind.MutRef =>
             if tr_ref_inner(e) == TypeKind.Struct
-                return tr_name(e.pointee, out_len)
-            return null
+                return tr_name(e.pointee)
+            return strview_empty()
         TypeKind.Ptr | TypeKind.PtrPtr =>
             if tr_slot_inner(e) == TypeKind.Struct
-                return tr_name(e, out_len)
-            return null
+                return tr_name(e)
+            return strview_empty()
         _ => pass
-    null
+    strview_empty()
 
 # The `[N]..T` a pointer names via `*[N]T`, `**[N]T` or `@*[N]T`; null for any
 # other pointer.  This is `ptr_names_array`'s subject.
@@ -888,7 +887,9 @@ pub fn type_facts(p: *Parser, tr: *TypeRef) -> *TypeFacts
     let f: *TypeFacts = parser_alloc(p, sizeof(TypeFacts)) as *TypeFacts
     let kind: TypeKind = tr_kind(tr)
     f.kind = kind
-    f.type_name = tr_name(tr, @f.type_name_len)
+    let type_name_sv: StrView = tr_name(tr)
+    f.type_name = type_name_sv.ptr
+    f.type_name_len = type_name_sv.len as i32
     # `last_pointee_type`: the pointer's pointee, or, for a reference, the
     # pointer it wraps one level in (`@*T` recorded T) -- and for a reference
     # to a value, that value's own kind (`@S` recorded S, which is what a
@@ -935,7 +936,9 @@ pub fn type_facts(p: *Parser, tr: *TypeRef) -> *TypeFacts
         f.array_size = tr_count(a) as i32
         f.array_elem_type = tr_elem_kind(a)
         f.array_elem_pointee = tr_elem_pointee(a)
-        f.array_elem_type_name = tr_elem_name(a, @f.array_elem_type_name_len)
+        let array_elem_name_sv: StrView = tr_elem_name(a)
+        f.array_elem_type_name = array_elem_name_sv.ptr
+        f.array_elem_type_name_len = array_elem_name_sv.len as i32
         f.array_shape = tr_shape(a)
     f.ref_inner_type = tr_ref_inner(tr)
     f.inner_ref = tr_inner_ref(tr)
@@ -947,7 +950,7 @@ pub fn note_type_name_written(p: *Parser, name: *u8, line: i32, col: i32)
     at.name = name
     at.line = line
     at.col = col
-    at.file = parse_file_copy_shared(p)
+    at.file = parse_file_copy_shared(p).ptr
     at.reported = 0
     at.next = p.ctx.type_name_at
     p.ctx.type_name_at = at
@@ -1079,7 +1082,9 @@ pub fn array_elem_of_type(p: *Parser, tr: *TypeRef) -> *ArrayElem
     let ae: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
     ae.elem = tr_kind(e)
     ae.pointee = tr_elem_pointee(a)
-    ae.name = tr_elem_name(a, @ae.name_len)
+    let ae_name_sv: StrView = tr_elem_name(a)
+    ae.name = ae_name_sv.ptr
+    ae.name_len = ae_name_sv.len as i32
     ae.shape = tr_shape(a)
     # AGAST #2995: the `[M]T` that the element of `[N]*[M]T` points at.
     ae.ptr_array = null
@@ -1091,7 +1096,9 @@ pub fn array_elem_of_type(p: *Parser, tr: *TypeRef) -> *ArrayElem
                 let inner: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
                 inner.elem = tr_elem_kind(e.pointee)
                 inner.pointee = tr_elem_pointee(e.pointee)
-                inner.name = tr_elem_name(e.pointee, @inner.name_len)
+                let inner_name_sv: StrView = tr_elem_name(e.pointee)
+                inner.name = inner_name_sv.ptr
+                inner.name_len = inner_name_sv.len as i32
                 inner.shape = null
                 inner.ptr_array = null
                 inner.ptr_array_size = 0
@@ -1125,7 +1132,9 @@ fn array_shape_prepend_type(p: *Parser, size: i32, elem: *TypeRef) -> *ArrayShap
         sh.rank = 2
         sh.dims[1] = tr_count(elem) as i32
         sh.leaf_type = tr_elem_kind(elem)
-        sh.leaf_name = tr_elem_name(elem, @sh.leaf_name_len)
+        let leaf_name_sv: StrView = tr_elem_name(elem)
+        sh.leaf_name = leaf_name_sv.ptr
+        sh.leaf_name_len = leaf_name_sv.len as i32
         sh.leaf_pointee = tr_elem_pointee(elem)
         return sh
     if inner.rank >= MAX_ARRAY_RANK
@@ -1288,15 +1297,14 @@ pub fn primitive_arg_spelling(ty: TypeKind, out: **u8) -> i32
 
 # spell_ptr_generic_arg over explicit parts, so an alias table entry (which
 # saved the same fields) spells without replaying itself into p.
-pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, type_name_sv: StrView, out_len: *i32) -> *u8
+pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, type_name_sv: StrView) -> StrView
     var type_name: *u8 = type_name_sv.ptr
     var type_name_len: i32 = type_name_sv.len as i32
     var depth: i32 = 1
     var leaf: TypeKind = ptr_slot_flat(inner)
     if ty == TypeKind.PtrPtr
         if pointee != TypeKind.Ptr
-            *out_len = 0
-            return null
+            return strview_empty()
         # AGAST #3686: `inner` is depth-packed past two levels (`***u8` is
         # u8 + PTR_DEPTH_UNIT).  Read raw, it named no primitive, so the
         # argument spelled "" and `first<***u8>` became `first$`, a
@@ -1311,8 +1319,7 @@ pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, 
     else
         base_len = primitive_arg_spelling(leaf, @base)
     if base_len <= 0
-        *out_len = 0
-        return null
+        return strview_empty()
     let total: i32 = depth * 4 + base_len
     let name: *u8 = parser_alloc(p, (total + 1) as i64)
     var pos: i32 = 0
@@ -1326,8 +1333,7 @@ pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, 
         *(name + pos) = *(base + i)
         pos = pos + 1
     *(name + pos) = 0
-    *out_len = pos
-    return name
+    return StrView { ptr: (name), len: (pos) as i64 }
 
 # AGAST #2037: build a single-token generic call's suffix — "$" + prefix +
 # the type argument's mangled spelling.  The token rules (`f<T>`, `f<*T>`,
@@ -1338,7 +1344,7 @@ pub fn spell_ptr_parts(p: *Parser, ty: TypeKind, pointee: TypeKind, inner: i32, 
 # (the table entry holds the final target, so alias-of-alias is settled).
 # Anything else spells as the token text.  Reads the table without touching
 # parser state.
-pub fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token, out_len: *i32) -> *u8
+pub fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token) -> StrView
     var prefix: *u8 = prefix_sv.ptr
     var prefix_len: i32 = prefix_sv.len as i32
     var spell: *u8 = tok.start
@@ -1357,7 +1363,9 @@ pub fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token, out_len: *
                     spell = e.type_name
                     n = e.type_name_len
                 TypeKind.Ptr | TypeKind.PtrPtr =>
-                    spell = spell_ptr_parts(p, e.kind, e.pointee_type, e.inner_pointee_type, StrView { ptr: (e.type_name), len: (e.type_name_len) as i64 }, @n)
+                    let spelled_sv: StrView = spell_ptr_parts(p, e.kind, e.pointee_type, e.inner_pointee_type, StrView { ptr: (e.type_name), len: (e.type_name_len) as i64 })
+                    spell = spelled_sv.ptr
+                    n = spelled_sv.len as i32
                 _ =>
                     n = primitive_arg_spelling(e.kind, @spell)
             # A target with no spelling (array, fn type, ...) keeps the alias
@@ -1374,8 +1382,7 @@ pub fn generic_tok_suffix(p: *Parser, prefix_sv: StrView, tok: Token, out_len: *
     for i in 0..spell_len
         *(buf + 1 + prefix_len + i) = *(spell + i)
     *(buf + total) = 0
-    *out_len = total
-    return buf
+    return StrView { ptr: (buf), len: (total) as i64 }
 
 # Mangled spelling of one argument: the primitive's name, or the captured
 # struct/generic/pointer name.  The one speller for generic type annotations,
@@ -1395,7 +1402,7 @@ pub fn generic_arg_spelling(ga: *GenericArg, out: **u8) -> i32
 # Mangle `base<a1, a2, ...>` as "base$a1$a2..." (AGAST #1574), from the
 # captured argument list.  Returns an arena-allocated, NUL-terminated name
 # and its length in *out_len.
-pub fn mangle_generic_args(p: *Parser, base_name_sv: StrView, ga: *GenericArg, out_len: *i32) -> *u8
+pub fn mangle_generic_args(p: *Parser, base_name_sv: StrView, ga: *GenericArg) -> StrView
     var base_name: *u8 = base_name_sv.ptr
     var base_len: i32 = base_name_sv.len as i32
     var total: i32 = base_len
@@ -1419,8 +1426,7 @@ pub fn mangle_generic_args(p: *Parser, base_name_sv: StrView, ga: *GenericArg, o
             pos = pos + 1
         cur = cur.next
     *(mangled + pos) = 0
-    *out_len = pos
-    return mangled
+    return StrView { ptr: (mangled), len: (pos) as i64 }
 
 # Mangle a generic type like Result<Vec<u8>, StrView> → Result$Vec$u8$StrView
 # from the arguments captured by capture_first_generic_arg.  Returns
@@ -1454,13 +1460,12 @@ pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericAr
     while cur != null
         tn_note(p, StrView { ptr: (cur.written), len: (cur.written_len) as i64 })   # AGAST #4021
         cur = cur.next
-    var len: i32 = 0
-    let mangled: *u8 = mangle_generic_args(p, StrView { ptr: (base_name), len: (base_len) as i64 }, ga, @len)
+    let mangled_sv: StrView = mangle_generic_args(p, StrView { ptr: (base_name), len: (base_len) as i64 }, ga)
     if p.skip_item == 0
-        generic_use_note_mangled(p.ctx, StrView { ptr: (mangled), len: (len) as i64 }, ga, diag_span(0, 0), parse_file_copy_shared(p))
+        generic_use_note_mangled(p.ctx, mangled_sv, ga, diag_span(0, 0), parse_file_copy_shared(p).ptr)
     let t: *TypeRef = typeref_new(p, TypeKind.Struct)
-    t.name = mangled
-    t.name_len = len
+    t.name = mangled_sv.ptr
+    t.name_len = mangled_sv.len as i32
     t
 
 # =============================================================================
@@ -1889,8 +1894,9 @@ pub fn expr_generic_call(p: *Parser, name_sv: StrView, type_arg: *TypeRef, args:
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let ta: TypeKind = tr_kind(type_arg)
-    var tn_len: i32 = 0
-    let tn: *u8 = tr_name(type_arg, @tn_len)
+    let tn_sv: StrView = tr_name(type_arg)
+    let tn: *u8 = tn_sv.ptr
+    let tn_len: i32 = tn_sv.len as i32
     # Build mangled name: name$type (e.g., vec_new$u8)
     # name + '$' + type suffix + NUL.  A struct type can be as long as its
     # parsed name; primitives add at most 3 chars ("i32").
@@ -2189,10 +2195,10 @@ pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *Postfi
     op.kind = POSTFIX_CALL
     op.args = args
     # Type suffix: "$" + type_name (an alias spelled as its target, #2037).
-    var len: i32 = 0
     tn_note_tok(p, type_tok)   # AGAST #4171
-    op.call_type_suffix = generic_tok_suffix(p, StrView { ptr: (null), len: (0) as i64 }, type_tok, @len)
-    op.call_type_suffix_len = len
+    let suffix_sv: StrView = generic_tok_suffix(p, StrView { ptr: (null), len: (0) as i64 }, type_tok)
+    op.call_type_suffix = suffix_sv.ptr
+    op.call_type_suffix_len = suffix_sv.len as i32
     op.call_targs = generic_tok_arg(p, type_tok)
     op.next = null
     return op
@@ -2209,10 +2215,10 @@ pub fn postfix_generic_call_ptr(p: *Parser, type_tok: Token, args: *Expr) -> *Po
     op.kind = POSTFIX_CALL
     op.args = args
     # Type suffix: "$ptr_" + type_name (an alias spelled as its target, #2037).
-    var len: i32 = 0
     tn_note_tok(p, type_tok)   # AGAST #4171
-    op.call_type_suffix = generic_tok_suffix(p, "ptr_", type_tok, @len)
-    op.call_type_suffix_len = len
+    let suffix_sv: StrView = generic_tok_suffix(p, "ptr_", type_tok)
+    op.call_type_suffix = suffix_sv.ptr
+    op.call_type_suffix_len = suffix_sv.len as i32
     op.call_targs = generic_tok_arg(p, type_tok)
     op.next = null
     return op
@@ -2226,9 +2232,9 @@ pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *Po
     op.args = args
     tn_note_args(p, ga)   # AGAST #4171
     # "" + "$" + arg → "$<arg>", from the same speller as type annotations.
-    var len: i32 = 0
-    op.call_type_suffix = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga, @len)
-    op.call_type_suffix_len = len
+    let suffix_sv: StrView = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga)
+    op.call_type_suffix = suffix_sv.ptr
+    op.call_type_suffix_len = suffix_sv.len as i32
     op.call_targs = ga
     op.next = null
     return op
@@ -2273,9 +2279,9 @@ pub fn postfix_generic_call_list(p: *Parser, ga: *GenericArg, args: *Expr) -> *P
     let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
-    var len: i32 = 0
-    op.call_type_suffix = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga, @len)
-    op.call_type_suffix_len = len
+    let suffix_sv: StrView = mangle_generic_args(p, StrView { ptr: (null), len: (0) as i64 }, ga)
+    op.call_type_suffix = suffix_sv.ptr
+    op.call_type_suffix_len = suffix_sv.len as i32
     op.call_targs = ga
     op.next = null
     return op
@@ -2337,7 +2343,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
                     result.call_type_suffix_len = op.call_type_suffix_len
                     result.args = op.args
                     if op.call_type_suffix != null and p.skip_item == 0
-                        generic_use_note(p.ctx, StrView { ptr: (result.func_name), len: (result.func_name_len) as i64 }, StrView { ptr: (op.call_type_suffix), len: (op.call_type_suffix_len) as i64 }, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p))
+                        generic_use_note(p.ctx, StrView { ptr: (result.func_name), len: (result.func_name_len) as i64 }, StrView { ptr: (op.call_type_suffix), len: (op.call_type_suffix_len) as i64 }, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p).ptr)
                 ExprKind.Member =>
                     # Method call: expr.method(args)
                     # ExprKind.Member has: left = receiver, ident_ptr/len = method name
@@ -2533,7 +2539,7 @@ fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual_sv:
     f.qual_len = qual_len
     f.span.line = head.line
     f.span.col = head.col
-    f.file = parse_file_copy_shared(p)
+    f.file = parse_file_copy_shared(p).ptr
     f.next = p.ctx.named_forms
     p.ctx.named_forms = f
 
@@ -2557,9 +2563,9 @@ pub fn generic_struct_lit_arg(p: *Parser, tok: Token, ga: *GenericArg, lit: *Fie
     e.kind = ExprKind.StructLit
     e.span.line = tok.line
     e.span.col = tok.col
-    var len: i32 = 0
-    e.ident_ptr = mangle_generic_args(p, StrView { ptr: (tok.start), len: (tok.len) as i64 }, ga, @len)
-    e.ident_len = len
+    let ident_sv: StrView = mangle_generic_args(p, StrView { ptr: (tok.start), len: (tok.len) as i64 }, ga)
+    e.ident_ptr = ident_sv.ptr
+    e.ident_len = ident_sv.len as i32
     # Store field inits in args field (reuse)
     e.args = lit as *Expr
     e.next = null
@@ -3145,6 +3151,10 @@ pub fn method_call_expr(p: *Parser, recv: *Expr, name_sv: StrView, args: *Expr) 
 # narrowing of a `-> *T` generic call (AGAST #1980).
 # AGAST #1984: the inverse of primitive_type_from_name.  null / 0 for a
 # non-primitive kind (struct, pointer, array, ...).
+# AGAST #4772 note: stays *u8, not StrView — text_bridge.ritz:47
+# (`llvm_text(primitive_name_from_type(t))`) and emitter_abi.ritz/emitter.ritz/
+# emitter_expr.ritz call it directly as a C string, and both text_bridge.ritz
+# and emitter*.ritz are off-limits for this ticket (another room owns them).
 pub fn primitive_name_from_type(t: TypeKind) -> *u8
     match t
         TypeKind.U8 =>

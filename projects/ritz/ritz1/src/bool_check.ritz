@@ -20,6 +20,7 @@
 # RITZ1_SEMA_PROBE pins the two together on every expression it lowers.
 
 import ritzlib.cstr
+import ritzlib.strview
 import ritzlib.sys
 import ritzlib.io
 
@@ -79,14 +80,14 @@ pub fn bk_arithmetic(l: i32, r: i32) -> i32
         return BK_UNSURE
     BK_INT
 
-fn bk_words(k: i32) -> *u8
+fn bk_words(k: i32) -> StrView
     if k == BK_INT
-        return c"an integer"
+        return "an integer"
     if k == BK_PTR
-        return c"a pointer"
+        return "a pointer"
     if k == BK_FLOAT
-        return c"a float"
-    c"a struct or enum"
+        return "a float"
+    "a struct or enum"
 
 fn bk_write(k: i32)
     if k == BK_INT
@@ -94,32 +95,32 @@ fn bk_write(k: i32)
     else if k == BK_PTR
         eprints(": write `p != null`")
 
-fn bool_op_name(op: OpKind) -> *u8
+fn bool_op_name(op: OpKind) -> StrView
     match op
         OpKind.And =>
-            return c"and"
+            return "and"
         OpKind.Or =>
-            return c"or"
+            return "or"
         OpKind.BitAnd =>
-            return c"&"
+            return "&"
         OpKind.BitOr =>
-            return c"|"
+            return "|"
         OpKind.BitXor =>
-            return c"^"
+            return "^"
         OpKind.Shl =>
-            return c"<<"
+            return "<<"
         OpKind.Shr =>
-            return c">>"
+            return ">>"
         OpKind.Add =>
-            return c"+"
+            return "+"
         OpKind.Sub =>
-            return c"-"
+            return "-"
         OpKind.Mul =>
-            return c"*"
+            return "*"
         OpKind.Div =>
-            return c"/"
+            return "/"
         _ => pass
-    c"%"
+    "%"
 
 fn is_comparison(e: *Expr) -> i32
     if e.kind == ExprKind.Binary and op_is_comparison(e.op)
@@ -392,40 +393,34 @@ fn sbk_payload_of(sm: *Sema, e: *Expr) -> i32
         return BK_UNSURE
     bk_tagged_payload(StrView { ptr: (name), len: (len) as i64 }, 0)
 
-# The type name method call `e` dispatches on, or null.
-pub fn sbk_method_recv(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+# The type name method call `e` dispatches on, or an empty view.
+pub fn sbk_method_recv(sm: *Sema, e: *Expr) -> StrView
     let rcv: *Expr = e.left
     if rcv == null
-        return null
+        return strview_empty()
     var name: *u8 = null
     var len: i32 = 0
     if rcv.kind == ExprKind.Ident
         if sema_find_local(sm, StrView { ptr: (rcv.ident_ptr), len: (rcv.ident_len) as i64 }) == null and sbk_global(sm, StrView { ptr: (rcv.ident_ptr), len: (rcv.ident_len) as i64 }) == null
             # Neither local nor global: a static call names its impl type.
-            *out_len = rcv.ident_len
-            return rcv.ident_ptr
+            return StrView { ptr: (rcv.ident_ptr), len: (rcv.ident_len) as i64 }
     match rcv.kind
         ExprKind.StructLit =>
-            *out_len = rcv.ident_len
-            return rcv.ident_ptr
+            return StrView { ptr: (rcv.ident_ptr), len: (rcv.ident_len) as i64 }
         ExprKind.StringLit =>
-            *out_len = 7
-            return c"StrView"
+            return "StrView"
         _ => pass
     sbk_receiver(sm, rcv, @name, @len)
     if name == null or len <= 0
-        return null
-    *out_len = len
-    name
+        return strview_empty()
+    StrView { ptr: (name), len: (len) as i64 }
 
 # The fn a method call dispatches to, or null.
 pub fn sbk_method_def(sm: *Sema, e: *Expr) -> *FnDef
-    var tn_len: i32 = 0
-    let tn: *u8 = sbk_method_recv(sm, e, @tn_len)
-    if tn == null
+    let tn: StrView = sbk_method_recv(sm, e)
+    if tn.ptr == null
         return null
-    sema_method_fn(sm, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    sema_method_fn(sm, tn, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
 
 # `expect` is none (AGAST #4263): no emitter lowers it.
 fn sbk_is_unwrap(e: *Expr) -> i32
@@ -456,9 +451,8 @@ fn sbk_method(sm: *Sema, e: *Expr) -> i32
         let pk: i32 = sbk_payload_of(sm, e.left)
         if pk != BK_UNSURE
             return pk
-    var tn_len: i32 = 0
-    let tn: *u8 = sbk_method_recv(sm, e, @tn_len)
-    if bk_is_strview_as_bytes(StrView { ptr: (tn), len: (tn_len) as i64 }, e) == 1
+    let tn: StrView = sbk_method_recv(sm, e)
+    if bk_is_strview_as_bytes(tn, e) == 1
         return BK_OTHER
     let fd: *FnDef = sbk_method_def(sm, e)
     if fd != null
@@ -466,7 +460,7 @@ fn sbk_method(sm: *Sema, e: *Expr) -> i32
     # AGAST #4403: a `Span$T` accessor the emitter lowers inline has no
     # FnDef; ask the typer that mirrors those builtins.
     var bt: SemaTy
-    if sema_span_method_ty(StrView { ptr: (tn), len: (tn_len) as i64 }, e, @bt) != TypeKind.Unknown
+    if sema_span_method_ty(tn, e, @bt) != TypeKind.Unknown
         return bk_of_type(bt.kind, StrView { ptr: (bt.name), len: (bt.name_len) as i64 })
     BK_UNSURE
 
@@ -614,11 +608,10 @@ pub fn sbk_receiver(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
                     var clen: i32 = 0
                     sbk_receiver(sm, e.left, @cname, @clen)
                     if cname != null and clen > 0 and is_tagged_enum_type(StrView { ptr: (cname), len: (clen) as i64 }) == 1
-                        var ok_len: i32 = 0
-                        let ok: *u8 = sbk_ok_struct(sm, StrView { ptr: (cname), len: (clen) as i64 }, @ok_len)
-                        if ok != null
-                            *out_name = ok
-                            *out_len = ok_len
+                        let ok: StrView = sbk_ok_struct(sm, StrView { ptr: (cname), len: (clen) as i64 })
+                        if ok.ptr != null
+                            *out_name = ok.ptr
+                            *out_len = ok.len as i32
                 else
                     match e.kind
                         ExprKind.Method =>
@@ -1368,26 +1361,24 @@ pub fn bool_note_arm(sm: *Sema, arm: *MatchArm, scrut: *Expr)
                 v.type_name = uf.field_type_name
                 v.type_name_len = uf.field_type_name_len
 
-# The struct an `Option$S` / `Result$S$E` carries in Some / Ok, or null
-# (tagged_enum_payload_struct): an Option's whole suffix, a Result's shortest
-# `$`-prefix naming a concrete struct (`Result$Vec$E$i32` -> `Vec$E`).
-fn sbk_ok_struct(sm: *Sema, name_sv: StrView, out_len: *i32) -> *u8
+# The struct an `Option$S` / `Result$S$E` carries in Some / Ok, or an empty
+# view (tagged_enum_payload_struct): an Option's whole suffix, a Result's
+# shortest `$`-prefix naming a concrete struct (`Result$Vec$E$i32` -> `Vec$E`).
+fn sbk_ok_struct(sm: *Sema, name_sv: StrView) -> StrView
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    *out_len = 0
     var dollar: i32 = 0
     while dollar < len and *(name + dollar) != '$'
         dollar += 1
     let sfx: *u8 = name + dollar + 1
     let sfx_len: i32 = len - dollar - 1
     if sfx_len <= 0
-        return null
+        return strview_empty()
     if name_eq(StrView { ptr: (name), len: (dollar) as i64 }, "Option") == 1
         let st: *StructDef = sema_find_struct(sm, StrView { ptr: (sfx), len: (sfx_len) as i64 })
         if st == null
-            return null
-        *out_len = sfx_len
-        return sfx
+            return strview_empty()
+        return StrView { ptr: (sfx), len: (sfx_len) as i64 }
     var end: i32 = 0
     while end < sfx_len
         end += 1
@@ -1395,9 +1386,8 @@ fn sbk_ok_struct(sm: *Sema, name_sv: StrView, out_len: *i32) -> *u8
             end += 1
         let pst: *StructDef = sema_find_struct(sm, StrView { ptr: (sfx), len: (end) as i64 })
         if pst != null and pst.type_params == null
-            *out_len = end
-            return sfx
-    null
+            return StrView { ptr: (sfx), len: (end) as i64 }
+    strview_empty()
 
 # The struct a mangled `Option$S` / `Result$S$E` carries, by name, onto `v`.
 fn sbk_payload_struct(sm: *Sema, v: *SemaVar, name_sv: StrView, is_err: i32)
@@ -1419,12 +1409,11 @@ fn sbk_payload_struct(sm: *Sema, v: *SemaVar, name_sv: StrView, is_err: i32)
         v.bk = BK_FLOAT
         return
     if is_err == 0
-        var ok_len: i32 = 0
-        let ok: *u8 = sbk_ok_struct(sm, StrView { ptr: (name), len: (len) as i64 }, @ok_len)
-        if ok != null
+        let ok: StrView = sbk_ok_struct(sm, StrView { ptr: (name), len: (len) as i64 })
+        if ok.ptr != null
             v.bk = BK_OTHER
-            v.type_name = ok
-            v.type_name_len = ok_len
+            v.type_name = ok.ptr
+            v.type_name_len = ok.len as i32
         return
     let st: *StructDef = sema_find_struct(sm, StrView { ptr: (name + i), len: (end - i) as i64 })
     if st != null
@@ -1450,7 +1439,7 @@ fn bool_sema_report_span(sm: *Sema, line: i32, col: i32) -> i32
     sm.bool_err_line = line
     sm.bool_err_col = col
     sm.error_count = sm.error_count + 1
-    diag_error_at(sema_file(sm), diag_span(line, col))
+    diag_error_at(sema_file(sm).ptr, diag_span(line, col))
     1
 
 pub fn bool_sema_report_at(sm: *Sema, e: *Expr) -> i32
@@ -1488,7 +1477,7 @@ fn bool_require(sm: *Sema, e: *Expr, what: *u8, op: *u8)
         eprints(" must be bool, and ritz1 cannot tell that it is\n")
         return
     eprints(" must be bool, got ")
-    eprints_cstr(bk_words(k))
+    eprints(bk_words(k))
     bk_write(k)
     eprints("\n")
 
@@ -1501,13 +1490,12 @@ fn sbk_is_unknown_carrier_method(sm: *Sema, e: *Expr) -> i32
         return 0
     if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "is_ok") == 1 or name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, "is_err") == 1
         return 0
-    var tn_len: i32 = 0
-    let tn: *u8 = sbk_method_recv(sm, e, @tn_len)
-    if tn == null or tn_len < 7
+    let tn: StrView = sbk_method_recv(sm, e)
+    if tn.ptr == null or tn.len < 7
         return 0
-    if name_eq(StrView { ptr: (tn), len: (7) as i64 }, "Option$") == 0 and name_eq(StrView { ptr: (tn), len: (7) as i64 }, "Result$") == 0
+    if name_eq(StrView { ptr: (tn.ptr), len: (7) as i64 }, "Option$") == 0 and name_eq(StrView { ptr: (tn.ptr), len: (7) as i64 }, "Result$") == 0
         return 0
-    if sema_method_fn(sm, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
+    if sema_method_fn(sm, tn, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
         return 0
     1
 
@@ -1538,8 +1526,8 @@ fn bool_reject_operand(sm: *Sema, e: *Expr, op: *u8, wanted: *u8, bitwise: i32)
 # Every binary operator, before its operands.
 pub fn bool_check_binary(sm: *Sema, e: *Expr)
     if e.op == OpKind.And or e.op == OpKind.Or
-        bool_require(sm, e.left, c"operand of `", bool_op_name(e.op))
-        bool_require(sm, e.right, c"operand of `", bool_op_name(e.op))
+        bool_require(sm, e.left, c"operand of `", bool_op_name(e.op).ptr)
+        bool_require(sm, e.right, c"operand of `", bool_op_name(e.op).ptr)
         return
     let l: i32 = sema_bool_kind(sm, e.left)
     let r: i32 = sema_bool_kind(sm, e.right)
@@ -1553,16 +1541,16 @@ pub fn bool_check_binary(sm: *Sema, e: *Expr)
             other = r
         if other != BK_BOOL and other != BK_UNSURE and bool_sema_report_at(sm, e) == 1
             eprints("cannot compare bool with ")
-            eprints_cstr(bk_words(other))
+            eprints(bk_words(other))
             eprints("\n")
         return
     var bad: *Expr = e.right
     if l == BK_BOOL
         bad = e.left
     if op_is_bitwise(e.op)
-        bool_reject_operand(sm, bad, bool_op_name(e.op), c"an integer", 1)
+        bool_reject_operand(sm, bad, bool_op_name(e.op).ptr, c"an integer", 1)
     else
-        bool_reject_operand(sm, bad, bool_op_name(e.op), c"a number", 0)
+        bool_reject_operand(sm, bad, bool_op_name(e.op).ptr, c"a number", 0)
 
 # `not`, `-` and `~`.
 pub fn bool_check_unary(sm: *Sema, e: *Expr)
@@ -1586,12 +1574,12 @@ fn bool_check_kinds(sm: *Sema, v: i32, slot: i32, line: i32, col: i32)
         return
     if v == BK_BOOL
         eprints("cannot use bool as ")
-        eprints_cstr(bk_words(slot))
+        eprints(bk_words(slot))
         if slot == BK_INT
             eprints(": write `b as i32`")
     else
         eprints("cannot use ")
-        eprints_cstr(bk_words(v))
+        eprints(bk_words(v))
         eprints(" as bool")
         bk_write(v)
     eprints("\n")
@@ -1628,7 +1616,7 @@ pub fn bool_check_cast(sm: *Sema, e: *Expr)
     if (target == BK_FLOAT or target == BK_PTR) and sema_bool_kind(sm, e.left) == BK_BOOL
         if bool_sema_report_at(sm, e) == 1
             eprints("cannot cast bool to ")
-            eprints_cstr(bk_words(target))
+            eprints(bk_words(target))
             eprints("\n")
 
 fn bool_check_args(sm: *Sema, params: *Param, args: *Expr)
@@ -1656,11 +1644,10 @@ pub fn bool_check_call(sm: *Sema, e: *Expr)
         bool_check_args(sm, fd.params, e.args)
 
 pub fn bool_check_method(sm: *Sema, e: *Expr)
-    var tn_len: i32 = 0
-    let tn: *u8 = sbk_method_recv(sm, e, @tn_len)
-    if tn == null
+    let tn: StrView = sbk_method_recv(sm, e)
+    if tn.ptr == null
         return
-    let fd: *FnDef = sema_method_fn(sm, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let fd: *FnDef = sema_method_fn(sm, tn, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if fd == null or fd.params == null
         return
     # `self` is the receiver, not the first argument (AGAST #2942).

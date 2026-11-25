@@ -34,6 +34,7 @@
 
 import ast
 import ritzlib.memory   # calloc for the view layout below (AGAST #4545)
+import ritzlib.strview  # StrView, strview_empty (AGAST #4772)
 
 # 1 for the eight integer kinds (not bool).
 pub fn ty_is_int(t: TypeKind) -> i32
@@ -143,6 +144,15 @@ pub fn ty_value_llvm(t: TypeKind) -> *u8
 
 # The Ritz spelling of a primitive kind (`u16`); "i64" for anything else,
 # which is how ritz1 types an unknown integer.
+#
+# AGAST #4772 note: ty_mem_llvm/ty_value_llvm/ty_name stay *u8 (not StrView)
+# because emitter*.ritz calls them directly as a C string (e.g.
+# `let m: *u8 = ty_mem_llvm(t)` in emitter_core.ritz) and this ticket must
+# leave emitter*.ritz untouched (another room is porting it). Converting
+# these three would break that off-limits subsystem; tr_mem_llvm/
+# tr_value_llvm/tr_name (thin wrappers around them) are reverted for the
+# same reason. Everything else in this file that has no emitter caller is
+# converted.
 pub fn ty_name(t: TypeKind) -> *u8
     match t
         TypeKind.I8 =>
@@ -267,20 +277,18 @@ pub fn tr_depth(tr: *TypeRef) -> i32
     0
 
 # The name a struct type carries: its own, or the deepest struct a pointer /
-# reference / array wraps.  null when nothing in the chain is a struct, and
-# `*out_len` is 0 then.
-pub fn tr_name(tr: *TypeRef, out_len: *i32) -> *u8
-    *out_len = 0
+# reference / array wraps.  `strview_empty()` when nothing in the chain is a
+# struct.
+pub fn tr_name(tr: *TypeRef) -> StrView
     if tr == null
-        return null
+        return strview_empty()
     if tr.kind == TypeKind.Struct
-        *out_len = tr.name_len
-        return tr.name
+        return StrView { ptr: (tr.name), len: (tr.name_len) as i64 }
     if tr.pointee != null
-        return tr_name(tr.pointee, out_len)
+        return tr_name(tr.pointee)
     if tr.elem != null
-        return tr_name(tr.elem, out_len)
-    null
+        return tr_name(tr.elem)
+    strview_empty()
 
 # =============================================================================
 # The compiler-supplied `{ ptr, len }` view (AGAST #4545)
@@ -303,11 +311,11 @@ pub const VIEW_PTR_NAME_LEN: i32 = 3
 pub const VIEW_LEN_NAME_LEN: i32 = 3
 
 # The view's field names, in declaration order.
-pub fn view_ptr_name() -> *u8
-    c"ptr"
+pub fn view_ptr_name() -> StrView
+    "ptr"
 
-pub fn view_len_name() -> *u8
-    c"len"
+pub fn view_len_name() -> StrView
+    "len"
 
 # A fresh StructField of the view: named, typed, and every specialization
 # field at its TypeKind.Void / null default (calloc zeroes them).
@@ -329,14 +337,16 @@ fn view_field_new(name: *u8, name_len: i32, ty: TypeKind) -> *StructField
 pub fn view_struct_new(name_sv: StrView, generic: i32) -> *StructDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let ptr_f: *StructField = view_field_new(view_ptr_name(), VIEW_PTR_NAME_LEN, TypeKind.Ptr)
+    let ptr_name: StrView = view_ptr_name()
+    let ptr_f: *StructField = view_field_new(ptr_name.ptr, ptr_name.len as i32, TypeKind.Ptr)
     if generic == 1
         ptr_f.ptr_pointee = TypeKind.Struct
         ptr_f.field_type_name = c"T"
         ptr_f.field_type_name_len = 1
     else
         ptr_f.array_elem_type = TypeKind.U8   # the pointee, for `span.ptr + i` stride
-    ptr_f.next = view_field_new(view_len_name(), VIEW_LEN_NAME_LEN, TypeKind.I64)
+    let len_name: StrView = view_len_name()
+    ptr_f.next = view_field_new(len_name.ptr, len_name.len as i32, TypeKind.I64)
     let st: *StructDef = calloc(1, sizeof(StructDef)) as *StructDef
     st.name = name
     st.name_len = len

@@ -17,6 +17,7 @@
 
 import ast
 import ast_helpers
+import ritzlib.strview
 import types         # view_struct_new / view_*_name: the one view (#4545)
 import struct_index   # AGAST #1635
 import ast_query   # name_eq & co., off emitter_core (AGAST #3513)
@@ -178,20 +179,20 @@ pub fn add_instantiation(mono: *MonoCtx, name_sv: StrView, suffix_sv: StrView) -
 pub fn get_instantiation_count(mono: *MonoCtx) -> i32
     mono.inst_count
 
-pub fn get_instantiation_name(mono: *MonoCtx, idx: i32) -> *u8
+pub fn get_instantiation_name(mono: *MonoCtx, idx: i32) -> StrView
     if idx >= mono.inst_count
-        return null
-    *(mono.inst_names + idx)
+        return strview_empty()
+    strview_from_ptr(*(mono.inst_names + idx), (*(mono.inst_name_lens + idx)) as i64)
 
 pub fn get_instantiation_name_len(mono: *MonoCtx, idx: i32) -> i32
     if idx >= mono.inst_count
         return 0
     *(mono.inst_name_lens + idx)
 
-pub fn get_instantiation_suffix(mono: *MonoCtx, idx: i32) -> *u8
+pub fn get_instantiation_suffix(mono: *MonoCtx, idx: i32) -> StrView
     if idx >= mono.inst_count
-        return null
-    *(mono.inst_suffixes + idx)
+        return strview_empty()
+    strview_from_ptr(*(mono.inst_suffixes + idx), (*(mono.inst_suffix_lens + idx)) as i64)
 
 pub fn get_instantiation_suffix_len(mono: *MonoCtx, idx: i32) -> i32
     if idx >= mono.inst_count
@@ -235,20 +236,20 @@ pub fn add_struct_instantiation(mono: *MonoCtx, name_sv: StrView, suffix_sv: Str
 pub fn get_struct_instantiation_count(mono: *MonoCtx) -> i32
     mono.struct_count
 
-pub fn get_struct_instantiation_name(mono: *MonoCtx, idx: i32) -> *u8
+pub fn get_struct_instantiation_name(mono: *MonoCtx, idx: i32) -> StrView
     if idx >= mono.struct_count
-        return null
-    *(mono.struct_names + idx)
+        return strview_empty()
+    strview_from_ptr(*(mono.struct_names + idx), (*(mono.struct_name_lens + idx)) as i64)
 
 pub fn get_struct_instantiation_name_len(mono: *MonoCtx, idx: i32) -> i32
     if idx >= mono.struct_count
         return 0
     *(mono.struct_name_lens + idx)
 
-pub fn get_struct_instantiation_suffix(mono: *MonoCtx, idx: i32) -> *u8
+pub fn get_struct_instantiation_suffix(mono: *MonoCtx, idx: i32) -> StrView
     if idx >= mono.struct_count
-        return null
-    *(mono.struct_suffixes + idx)
+        return strview_empty()
+    strview_from_ptr(*(mono.struct_suffixes + idx), (*(mono.struct_suffix_lens + idx)) as i64)
 
 pub fn get_struct_instantiation_suffix_len(mono: *MonoCtx, idx: i32) -> i32
     if idx >= mono.struct_count
@@ -291,23 +292,19 @@ fn type_base_len(name_sv: StrView) -> i32
         i = i + 1
     i
 
-fn builtin_type_module(name_sv: StrView, out_len: *i32) -> *u8
+fn builtin_type_module(name_sv: StrView) -> StrView
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let base: i32 = type_base_len(StrView { ptr: (name), len: (len) as i64 })
     if (StrView { ptr: (name), len: (base) as i64 }).eq("Span")
-        *out_len = 12
-        return c"ritzlib.span"
+        return "ritzlib.span"
     if (StrView { ptr: (name), len: (base) as i64 }).eq("StrView")
-        *out_len = 15
-        return c"ritzlib.strview"
+        return "ritzlib.strview"
     if (StrView { ptr: (name), len: (base) as i64 }).eq("Option")
-        *out_len = 14
-        return c"ritzlib.option"
+        return "ritzlib.option"
     if (StrView { ptr: (name), len: (base) as i64 }).eq("Result")
-        *out_len = 14
-        return c"ritzlib.result"
-    null
+        return "ritzlib.result"
+    strview_empty()
 
 pub fn module_declares_type(ctx: *ParseCtx, m: *Module, name_sv: StrView) -> i32
     var name: *u8 = name_sv.ptr
@@ -360,13 +357,12 @@ pub fn refuse_impls_on_builtin_types(ctx: *ParseCtx, m: *Module, path: *u8) -> i
     var errors: i32 = 0
     var ib: *ImplBlock = m.impls
     while ib != null
-        var mod_len: i32 = 0
-        let module: *u8 = builtin_type_module(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, @mod_len)
+        let module_sv: StrView = builtin_type_module(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 })
         # A trait impl on Span/StrView is R36's revisit (#4294); it is this
         # check's to refuse only when inherent, and the placement is
         # impl_target_class's.
         let allowed_trait: i32 = (builtin_impl_target_allowed(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }) == 1 and ib.trait_name != null) as i32
-        if module != null and module_declares_type(ctx, m, StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }) == 0 and allowed_trait == 0
+        if module_sv.ptr != null and module_declares_type(ctx, m, StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }) == 0 and allowed_trait == 0
             if ib.def_file != null
                 eprints_cstr(ib.def_file)
             else
@@ -378,7 +374,7 @@ pub fn refuse_impls_on_builtin_types(ctx: *ParseCtx, m: *Module, path: *u8) -> i
             eprints(": error: `")
             eprint_impl_target(ib)
             eprints("` is a built-in type and can't be extended here: import ")
-            sys_write(2, module, mod_len as i64)
+            sys_write(2, module_sv.ptr, module_sv.len)
             eprints(" or declare your own type\n")
             errors += 1
         ib = ib.next
@@ -458,9 +454,8 @@ fn impl_target_class(ctx: *ParseCtx, m: *Module, ib: *ImplBlock) -> i32
     # `Span<T>` / `StrView` in the trait's file stand even when nothing
     # declares them (the emitter synthesizes them); outside it, the trait
     # impl is misplaced (#4294).
-    var mod_len: i32 = 0
-    let module: *u8 = builtin_type_module(StrView { ptr: (name), len: (len) as i64 }, @mod_len)
-    if module != null and module_declares_type(ctx, m, StrView { ptr: (name), len: (len) as i64 }) == 0
+    let module_sv: StrView = builtin_type_module(StrView { ptr: (name), len: (len) as i64 })
+    if module_sv.ptr != null and module_declares_type(ctx, m, StrView { ptr: (name), len: (len) as i64 }) == 0
         if builtin_impl_target_allowed(StrView { ptr: (name), len: (len) as i64 }) == 1 and ib.trait_name != null
             if impl_in_trait_file(ctx, ib) == 1
                 return IMPL_TARGET_OK
@@ -482,17 +477,16 @@ fn eprint_misplaced_target(ib: *ImplBlock)
 fn eprint_impl_on_alias(ctx: *ParseCtx, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    var tlen: i32 = 0
-    let target: *u8 = type_alias_target_spelling(ctx, StrView { ptr: (name), len: (len) as i64 }, @tlen)
+    let target: StrView = type_alias_target_spelling(ctx, StrView { ptr: (name), len: (len) as i64 })
     eprint_char('`')
     sys_write(2, name, len as i64)
-    if target == null
+    if target.ptr == null
         eprints("` is a type alias: write `impl` on the type it names\n")
         return
     eprints("` is a type alias for `")
-    sys_write(2, target, tlen as i64)
+    sys_write(2, target.ptr, target.len)
     eprints("`: write `impl ")
-    sys_write(2, target, tlen as i64)
+    sys_write(2, target.ptr, target.len)
     eprints("`\n")
 
 # The traits the compiler knows without a declaration, as ritz0's
@@ -755,16 +749,15 @@ pub fn track_array_local(mono: *MonoCtx, name_sv: StrView, elem_sv: StrView)
 
 # The element type name of `[N]S` local `name`, or null.  The latest
 # declaration of the name wins.
-pub fn array_local_elem(mono: *MonoCtx, name_sv: StrView, out_len: *i32) -> *u8
+pub fn array_local_elem(mono: *MonoCtx, name_sv: StrView) -> StrView
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     var i: i32 = mono.al_count - 1
     while i >= 0
         if name_eq(StrView { ptr: (*(mono.al_names + i)), len: (*(mono.al_name_lens + i)) as i64 }, StrView { ptr: (name), len: (name_len) as i64 }) == 1
-            *out_len = *(mono.al_elem_lens + i)
-            return *(mono.al_elems + i)
+            return strview_from_ptr(*(mono.al_elems + i), (*(mono.al_elem_lens + i)) as i64)
         i = i - 1
-    null
+    strview_empty()
 
 pub fn add_local_var(mono: *MonoCtx, name_sv: StrView, prefix_kind: i32, suffix_sv: StrView)
     var name: *u8 = name_sv.ptr
@@ -1233,23 +1226,20 @@ pub fn find_concrete_struct(m: *Module, name_sv: StrView) -> *StructDef
 # AGAST #2573: the mangled type of a match scrutinee, as far as this walk
 # knows it: a tracked local's (`let o = wrap(v)`, a param), or a plain fn
 # call's return type (`match wrap(v)`).  null for anything else.
-pub fn scrutinee_type_name(mono: *MonoCtx, m: *Module, e: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
+pub fn scrutinee_type_name(mono: *MonoCtx, m: *Module, e: *Expr) -> StrView
     if e == null
-        return null
+        return strview_empty()
     if e.kind == ExprKind.Ident
         let idx: i32 = find_local_var_idx(mono, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         if idx < 0 or *(mono.lv_by_value + idx) != 1 or *(mono.lv_prefix_kind + idx) != 0
-            return null
-        *out_len = *(mono.lv_type_name_lens + idx)
-        return *(mono.lv_type_names + idx)
+            return strview_empty()
+        return strview_from_ptr(*(mono.lv_type_names + idx), (*(mono.lv_type_name_lens + idx)) as i64)
     if e.kind == ExprKind.Call and e.call_type_suffix_len == 0
         let f: *FnDef = find_fn_in_module(m, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
         if f == null or f.type_params != null or f.return_type != TypeKind.Struct or f.return_type_name == null
-            return null
-        *out_len = f.return_type_name_len
-        return f.return_type_name
-    return null
+            return strview_empty()
+        return strview_from_ptr(f.return_type_name, f.return_type_name_len as i64)
+    strview_empty()
 
 # Record `Ctor(x)`'s `x` at its payload's type, so `x[lo..hi]` is a slice of
 # a Vec, Span or String (rewrite_value_slice) and `x.push(..)` instantiates.
@@ -1262,75 +1252,65 @@ pub fn bind_arm_payload(mono: *MonoCtx, m: *Module, arm: *MatchArm, tn_sv: StrVi
     let name_len: i32 = arm.pattern_inner_name_len
     if name_len <= 0 or (name_len == 1 and *name == '_')   # `_`
         return
-    var pay_len: i32 = 0
     var k: i32 = arm.pattern_field_sel
     if arm.pattern_binds == null
         k = 0 - 1
-    let pay: *u8 = variant_field_payload_type(mono.pctx, m, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, k, @pay_len)
-    if pay != null and pay_len > 0
-        track_typed_local(mono, StrView { ptr: (name), len: (name_len) as i64 }, TypeKind.Struct, StrView { ptr: (pay), len: (pay_len) as i64 })
+    let pay_sv: StrView = variant_field_payload_type(mono.pctx, m, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, k)
+    if pay_sv.ptr != null and pay_sv.len > 0
+        track_typed_local(mono, StrView { ptr: (name), len: (name_len) as i64 }, TypeKind.Struct, pay_sv)
 
 # The mangled type variant `ctor` of `tn` carries, or null: Option's Some the
 # whole suffix, Result's Ok its T and Err its E, a non-generic user enum's
 # single-field tuple variant that field's struct type.
-pub fn variant_payload_type(ctx: *ParseCtx, m: *Module, tn_sv: StrView, ctor_sv: StrView, out_len: *i32) -> *u8
-    var tn: *u8 = tn_sv.ptr
-    var tn_len: i32 = tn_sv.len as i32
-    var ctor: *u8 = ctor_sv.ptr
-    var ctor_len: i32 = ctor_sv.len as i32
-    return variant_field_payload_type(ctx, m, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (ctor), len: (ctor_len) as i64 }, 0 - 1, out_len)
+pub fn variant_payload_type(ctx: *ParseCtx, m: *Module, tn_sv: StrView, ctor_sv: StrView) -> StrView
+    return variant_field_payload_type(ctx, m, tn_sv, ctor_sv, 0 - 1)
 
 # AGAST #1295: as variant_payload_type, for field `k` of a multi-field user
 # enum variant (`h` of `Rect(w, h)` is field 1).  k = -1 asks for the sole
 # field of a single-field variant (none for a multi-field one); Result /
 # Option have only that one.
-fn variant_field_payload_type(ctx: *ParseCtx, m: *Module, tn_sv: StrView, ctor_sv: StrView, k: i32, out_len: *i32) -> *u8
+fn variant_field_payload_type(ctx: *ParseCtx, m: *Module, tn_sv: StrView, ctor_sv: StrView, k: i32) -> StrView
     var tn: *u8 = tn_sv.ptr
     var tn_len: i32 = tn_sv.len as i32
     var ctor: *u8 = ctor_sv.ptr
     var ctor_len: i32 = ctor_sv.len as i32
-    *out_len = 0
     if k > 0 and enum_find(ctx, StrView { ptr: (tn), len: (tn_len) as i64 }) < 0
-        return null
+        return strview_empty()
     let sole: i32 = (k < 0) as i32
     var want: i32 = k
     if want < 0
         want = 0
     if tn == null or tn_len <= 0
-        return null
+        return strview_empty()
     if tn_len > 7 and (StrView { ptr: (tn), len: (tn_len) as i64 }).starts_with("Option$")
         if name_eq(StrView { ptr: (ctor), len: (ctor_len) as i64 }, "Some") == 0
-            return null
-        *out_len = tn_len - 7
-        return tn + 7
+            return strview_empty()
+        return strview_from_ptr(tn + 7, (tn_len - 7) as i64)
     if tn_len > 7 and (StrView { ptr: (tn), len: (tn_len) as i64 }).starts_with("Result$")
         let sfx: *u8 = tn + 7
         let sfx_len: i32 = tn_len - 7
         let t_len: i32 = mangled_type_extent(m, StrView { ptr: (sfx), len: (sfx_len) as i64 })
         if name_eq(StrView { ptr: (ctor), len: (ctor_len) as i64 }, "Ok") == 1
-            *out_len = t_len
-            return sfx
+            return strview_from_ptr(sfx, t_len as i64)
         if name_eq(StrView { ptr: (ctor), len: (ctor_len) as i64 }, "Err") == 1 and t_len + 1 < sfx_len
-            *out_len = sfx_len - t_len - 1
-            return sfx + t_len + 1
-        return null
+            return strview_from_ptr(sfx + t_len + 1, (sfx_len - t_len - 1) as i64)
+        return strview_empty()
     let ei: i32 = enum_find(ctx, StrView { ptr: (tn), len: (tn_len) as i64 })
     if ei < 0 or enum_is_generic(ctx, ei) == 1
-        return null
+        return strview_empty()
     let vi: i32 = enum_variant_index(ctx, StrView { ptr: (tn), len: (tn_len) as i64 }, StrView { ptr: (ctor), len: (ctor_len) as i64 })
     if vi < 0 or enum_variant_kind(ctx, ei, vi) != ENUM_VARIANT_TUPLE
-        return null
+        return strview_empty()
     var f: *StructField = enum_variant_fields(ctx, ei, vi)
     if sole == 1 and f != null and f.next != null
-        return null   # `V(x)` over a multi-field variant: the arity error's
+        return strview_empty()   # `V(x)` over a multi-field variant: the arity error's
     var i: i32 = 0
     while f != null and i < want
         f = f.next
         i += 1
     if f == null or f.field_type != TypeKind.Struct or f.field_type_name == null
-        return null
-    *out_len = f.field_type_name_len
-    return f.field_type_name
+        return strview_empty()
+    strview_from_ptr(f.field_type_name, f.field_type_name_len as i64)
 
 # Byte length of the first whole type in the `$`-joined mangled list `p`
 # (AGAST #1574): `Vec$i32$i32` -> `Vec$i32`, `Result$Vec$u8$i32$i64` ->
@@ -1396,13 +1376,12 @@ pub fn rewrite_enum_from_call(mono: *MonoCtx, m: *Module, e: *Expr)
         return
     if find_local_var_idx(mono, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) >= 0
         return
-    var len: i32 = 0
-    let name: *u8 = enum_from_fn_name(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, @len)
-    if find_fn_in_module(m, StrView { ptr: (name), len: (len) as i64 }) == null
+    let name_sv: StrView = enum_from_fn_name(StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+    if find_fn_in_module(m, name_sv) == null
         return
     e.kind = ExprKind.Call
-    e.func_name = name
-    e.func_name_len = len
+    e.func_name = name_sv.ptr
+    e.func_name_len = name_sv.len as i32
     e.call_type_suffix = null
     e.call_type_suffix_len = 0
     e.left = null
@@ -1434,9 +1413,8 @@ pub fn si_global(m: *Module, name_sv: StrView) -> *GlobalVarDef
 pub fn si_check_shown(m: *Module, line: i32, col: i32, name_sv: StrView, mask: i32, use: i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    var shown_len: i32 = 0
-    let shown: *u8 = si_shown(m, StrView { ptr: (name), len: (len) as i64 }, @shown_len)
-    si_check(line, col, StrView { ptr: (shown), len: (shown_len) as i64 }, mask, use)
+    let shown: StrView = si_shown(m, StrView { ptr: (name), len: (len) as i64 })
+    si_check(line, col, shown, mask, use)
 
 # `@<call>` (or `@&<call>`) of a by-value call's result, which `index` /
 # `index_mut` would lend and return a reference into: refused as ritz0's
@@ -1532,11 +1510,11 @@ pub fn span_view_in_place(e: *Expr, field_sv: StrView, suf_sv: StrView)
     memcpy(name + 4, suf, suf_len as i64)
     *(name + 4 + suf_len) = 0
     let ptr_field: *FieldInit = calloc(1, sizeof(FieldInit)) as *FieldInit
-    ptr_field.name = view_ptr_name()
+    ptr_field.name = view_ptr_name().ptr
     ptr_field.name_len = VIEW_PTR_NAME_LEN
     ptr_field.value = at
     let len_field: *FieldInit = calloc(1, sizeof(FieldInit)) as *FieldInit
-    len_field.name = view_len_name()
+    len_field.name = view_len_name().ptr
     len_field.name_len = VIEW_LEN_NAME_LEN
     len_field.value = len
     ptr_field.next = len_field
@@ -2066,7 +2044,7 @@ pub fn want_method(mono: *MonoCtx, m: *Module, tn_sv: StrView, meth_sv: StrView)
         mono.wanted_methods = push_wanted(mono.wanted_methods, StrView { ptr: (tn), len: (d) as i64 }, StrView { ptr: (tn + d), len: (tn_len - d) as i64 }, StrView { ptr: (meth), len: (meth_len) as i64 })
 
 # "Vec$i32" / "Span$u8" for a Vec / Span of the tracker's kind and suffix.
-pub fn collection_instance_name(kind: i32, suf_sv: StrView, out_len: *i32) -> *u8
+pub fn collection_instance_name(kind: i32, suf_sv: StrView) -> StrView
     var suf: *u8 = suf_sv.ptr
     var suf_len: i32 = suf_sv.len as i32
     var base: *u8 = c"Vec"
@@ -2078,40 +2056,37 @@ pub fn collection_instance_name(kind: i32, suf_sv: StrView, out_len: *i32) -> *u
     memcpy(tn, base, bl as i64)
     memcpy(tn + bl, suf, suf_len as i64)
     *(tn + bl + suf_len) = 0
-    *out_len = bl + suf_len
-    tn
+    strview_from_ptr(tn, (bl + suf_len) as i64)
 
 # The type a call `f(..)` returns, by name: a plain fn's (or an impl method's
 # by its symbol, `String_from`), or a one-param generic fn's `Base$T` at the
 # call's own suffix (`vec_new<i32>()` -> "Vec$i32").  null when unknown.
-pub fn call_result_type_name(m: *Module, call: *Expr, out_len: *i32) -> *u8
+pub fn call_result_type_name(m: *Module, call: *Expr) -> StrView
     var f: *FnDef = find_fn_in_module(m, StrView { ptr: (call.func_name), len: (call.func_name_len) as i64 })
     if f == null
         f = find_impl_method_by_symbol(m, StrView { ptr: (call.func_name), len: (call.func_name_len) as i64 })
     if f == null or f.return_type_name == null or f.return_type_name_len <= 0
-        return null
+        return strview_empty()
     if f.type_params == null
-        *out_len = f.return_type_name_len
-        return f.return_type_name
+        return strview_from_ptr(f.return_type_name, f.return_type_name_len as i64)
     let tp: *TypeParam = f.type_params
     if tp.next != null or call.call_type_suffix == null or call.call_type_suffix_len <= 0
-        return null
+        return strview_empty()
     let d: i32 = find_dollar_sign(StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
     if d <= 0 or name_eq(StrView { ptr: (f.return_type_name + d + 1), len: (f.return_type_name_len - d - 1) as i64 }, StrView { ptr: (tp.name), len: (tp.name_len) as i64 }) == 0
-        return null
+        return strview_empty()
     let n: i32 = d + call.call_type_suffix_len
     let tn: *u8 = malloc(n as i64 + 1)
     memcpy(tn, f.return_type_name, d as i64)
     memcpy(tn + d, call.call_type_suffix, call.call_type_suffix_len as i64)
     *(tn + n) = 0
-    *out_len = n
-    tn
+    strview_from_ptr(tn, n as i64)
 
 # The type impl method `meth` of instance `tn` ("Vec$i32", or a plain "S")
 # returns, by name: a one-param generic impl's `T` / `Base$T` at tn's suffix,
 # or a concrete name as written.  null when unknown, or when the name still
 # holds a type param this can't substitute.
-pub fn method_result_type_name(m: *Module, tn_sv: StrView, meth_sv: StrView, out_len: *i32) -> *u8
+pub fn method_result_type_name(m: *Module, tn_sv: StrView, meth_sv: StrView) -> StrView
     var tn: *u8 = tn_sv.ptr
     var tn_len: i32 = tn_sv.len as i32
     var meth: *u8 = meth_sv.ptr
@@ -2130,41 +2105,37 @@ pub fn method_result_type_name(m: *Module, tn_sv: StrView, meth_sv: StrView, out
                 var f: *FnDef = ib.methods
                 while f != null
                     if name_eq(StrView { ptr: (f.name), len: (f.name_len) as i64 }, StrView { ptr: (meth), len: (meth_len) as i64 }) == 1
-                        return method_ret_at(ib, f, StrView { ptr: (tn), len: (tn_len) as i64 }, d, out_len)
+                        return method_ret_at(ib, f, StrView { ptr: (tn), len: (tn_len) as i64 }, d)
                     f = f.next
         ib = ib.next
-    null
+    strview_empty()
 
-fn method_ret_at(ib: *ImplBlock, f: *FnDef, tn_sv: StrView, d: i32, out_len: *i32) -> *u8
+fn method_ret_at(ib: *ImplBlock, f: *FnDef, tn_sv: StrView, d: i32) -> StrView
     var tn: *u8 = tn_sv.ptr
     var tn_len: i32 = tn_sv.len as i32
     let rn: *u8 = f.return_type_name
     let rl: i32 = f.return_type_name_len
     if rn == null or rl <= 0
-        return null
+        return strview_empty()
     if ib.type_params == null
-        *out_len = rl
-        return rn
+        return strview_from_ptr(rn, rl as i64)
     let tp: *TypeParam = ib.type_params
     if tp.next != null
-        return null
+        return strview_empty()
     if name_eq(StrView { ptr: (rn), len: (rl) as i64 }, StrView { ptr: (tp.name), len: (tp.name_len) as i64 }) == 1
         # `-> T`: the instance's own argument.
-        *out_len = tn_len - d - 1
-        return tn + d + 1
+        return strview_from_ptr(tn + d + 1, (tn_len - d - 1) as i64)
     let rd: i32 = find_dollar_sign(StrView { ptr: (rn), len: (rl) as i64 })
     if rd < 0
-        *out_len = rl
-        return rn   # a concrete type
+        return strview_from_ptr(rn, rl as i64)   # a concrete type
     if name_eq(StrView { ptr: (rn + rd + 1), len: (rl - rd - 1) as i64 }, StrView { ptr: (tp.name), len: (tp.name_len) as i64 }) == 0
-        return null
+        return strview_empty()
     let n: i32 = rd + tn_len - d
     let out: *u8 = malloc(n as i64 + 1)
     memcpy(out, rn, rd as i64)
     memcpy(out + rd, tn + d, (tn_len - d) as i64)
     *(out + n) = 0
-    *out_len = n
-    out
+    strview_from_ptr(out, n as i64)
 
 # AGAST #2318: an untyped receiver becomes the typed one it means: bare `self`
 # (param_self) is `self: T`, and bare `self:&` (param_self_lent) is `self:& T`,
@@ -2204,8 +2175,8 @@ pub fn refuse_recursive_instance(mono: *MonoCtx, m: *Module, name_sv: StrView)
         eprints_cstr(ib.def_file)
     else if fd != null and fd.def_file != null
         eprints_cstr(fd.def_file)
-    else if struct_index_file() != null
-        eprints_cstr(struct_index_file())
+    else if struct_index_file().ptr != null
+        eprints(struct_index_file())
     else
         eprints("<input>")
     if ib != null

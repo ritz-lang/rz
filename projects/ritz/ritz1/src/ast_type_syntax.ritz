@@ -110,7 +110,7 @@ pub fn struct_def_new(p: *Parser, name_sv: StrView, fields: *StructField, line: 
     s.fields = fields
     s.next = null
     s.type_params = null  # Non-generic struct (field at end to preserve layout)
-    s.def_file = parse_file_copy_shared(p)   # AGAST #3494 (R65)
+    s.def_file = parse_file_copy_shared(p).ptr   # AGAST #3494 (R65)
     return s
 
 # AGAST #2399: the inner pointee slot of the `**S` (or deeper) that a just-parsed
@@ -295,12 +295,16 @@ pub fn ret_name_of_type(p: *Parser, tr: *TypeRef, out: **u8, out_len: *i32)
                     *out = primitive_name_from_type(inner)
                     *out_len = primitive_name_len(inner)
                 else if inner == TypeKind.Struct
-                    *out = tr_name(tr, out_len)
+                    let tn: StrView = tr_name(tr)
+                    *out = tn.ptr
+                    *out_len = tn.len as i32
                 else
                     *out = null
                     *out_len = 0
             TypeKind.Ptr | TypeKind.Ref | TypeKind.MutRef =>
-                *out = tr_name(tr, out_len)
+                let tn2: StrView = tr_name(tr)
+                *out = tn2.ptr
+                *out_len = tn2.len as i32
             _ =>
                 *out = null
                 *out_len = 0
@@ -468,17 +472,15 @@ pub fn array_lit_elements(e: *Expr) -> i64
     n
 
 # `T` as Ritz spells it, for a primitive or struct T; null for anything else.
-fn array_leaf_spell(kind: TypeKind, name_sv: StrView, out_len: *i32) -> *u8
+fn array_leaf_spell(kind: TypeKind, name_sv: StrView) -> StrView
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     let prim: *u8 = primitive_name_from_type(kind)
     if prim != null
-        *out_len = primitive_name_len(kind)
-        return prim
+        return StrView { ptr: (prim), len: (primitive_name_len(kind)) as i64 }
     if kind == TypeKind.Struct and name_len > 0
-        *out_len = name_len
-        return name
-    null
+        return StrView { ptr: (name), len: (name_len) as i64 }
+    strview_empty()
 
 # 1 if `e` is an array literal or fill of another length than the slot
 # `shape` from `at`, which this can spell.  Only `e` itself is judged.
@@ -496,8 +498,7 @@ pub fn array_lit_wrong_length(e: *Expr, shape: *ArrayShape, at: i32) -> i32
     var kind: TypeKind = shape.leaf_type
     if kind == TypeKind.Ptr
         kind = shape.leaf_pointee
-    var len: i32 = 0
-    if array_leaf_spell(kind, StrView { ptr: (shape.leaf_name), len: (shape.leaf_name_len) as i64 }, @len) == null
+    if array_leaf_spell(kind, StrView { ptr: (shape.leaf_name), len: (shape.leaf_name_len) as i64 }).ptr == null
         return 0
     1
 
@@ -521,10 +522,9 @@ pub fn array_lit_length_report(file: *u8, e: *Expr, shape: *ArrayShape, at: i32)
     if kind == TypeKind.Ptr
         eprint_char('*')
         kind = shape.leaf_pointee
-    var len: i32 = 0
-    let leaf: *u8 = array_leaf_spell(kind, StrView { ptr: (shape.leaf_name), len: (shape.leaf_name_len) as i64 }, @len)
-    for j in 0..len
-        eprint_char(*(leaf + j))
+    let leaf: StrView = array_leaf_spell(kind, StrView { ptr: (shape.leaf_name), len: (shape.leaf_name_len) as i64 })
+    for j in 0..leaf.len
+        eprint_char(*(leaf.ptr + j))
     eprintln("`")
 
 # The last place a const or global literal was reported: the grammar can re-run
@@ -783,9 +783,8 @@ pub fn type_decl_log(ctx: *ParseCtx, name_sv: StrView)
 pub fn type_decl_log_count(ctx: *ParseCtx) -> i32
     ctx.tdl_count
 
-pub fn type_decl_log_at(ctx: *ParseCtx, i: i32, out_len: *i32) -> *u8
-    *out_len = *(ctx.tdl_lens + i)
-    *(ctx.tdl_names + i)
+pub fn type_decl_log_at(ctx: *ParseCtx, i: i32) -> StrView
+    StrView { ptr: (*(ctx.tdl_names + i)), len: (*(ctx.tdl_lens + i)) as i64 }
 
 # AGAST #3907: each type alias written, in parse order: type_named replaces
 # it with its target, so sema never sees the name.  `name` points into the
@@ -818,10 +817,9 @@ pub fn alias_use_log(p: *Parser, name_sv: StrView)
 pub fn alias_use_count(ctx: *ParseCtx) -> i32
     ctx.aul_count
 
-pub fn alias_use_at(ctx: *ParseCtx, i: i32, out_len: *i32, out_span: *SrcSpan) -> *u8
-    *out_len = *(ctx.aul_lens + i)
+pub fn alias_use_at(ctx: *ParseCtx, i: i32, out_span: *SrcSpan) -> StrView
     *out_span = *(ctx.aul_spans + i)
-    *(ctx.aul_names + i)
+    StrView { ptr: (*(ctx.aul_names + i)), len: (*(ctx.aul_lens + i)) as i64 }
 
 # AGAST #3264: 1 if a `type` alias of that name was declared (an impl on it
 # is on a known type).
@@ -836,14 +834,13 @@ pub fn type_alias_declared(ctx: *ParseCtx, name_sv: StrView) -> i32
 # Foo`" (LARB R35), with its length in *out_len; null if it wasn't recorded.
 # The alias's own tokens (#3625), since the table keeps a pointer, array or
 # generic instance (`Box$u8`) only in replay form.
-pub fn type_alias_target_spelling(ctx: *ParseCtx, name_sv: StrView, out_len: *i32) -> *u8
+pub fn type_alias_target_spelling(ctx: *ParseCtx, name_sv: StrView) -> StrView
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let e: *AliasEntry = type_alias_find(ctx, StrView { ptr: (name), len: (len) as i64 })
     if e == null
-        return null
-    *out_len = e.spelling_len
-    e.spelling
+        return strview_empty()
+    StrView { ptr: (e.spelling), len: (e.spelling_len) as i64 }
 
 # 1 if `c` is a letter, digit or `_`.
 fn alias_word_char(c: u8) -> i32
@@ -862,12 +859,13 @@ fn alias_tok_arrow(t: *Token) -> i32
 # `[4]u8`, `Box<u8, i32>`, `*mut Foo`, `fn(i32) -> i32`.  A space after `,`,
 # around `->` and between two words; none elsewhere.  The type's tokens run
 # from after the name's `=` to the item's NEWLINE, just before p.pos.
-fn type_alias_spell(p: *Parser, name: *u8, out_len: *i32) -> *u8
+fn type_alias_spell(p: *Parser, name_sv: StrView) -> StrView
+    var name: *u8 = name_sv.ptr
     var i: i32 = p.pos - 1
     while i >= 0 and (*(p.tokens + i)).start != name
         i = i - 1
     if i < 0
-        return null
+        return strview_empty()
     let first: i32 = i + 2   # past the name and `=`
     var last: i32 = p.pos - 1
     while last >= first and (*(p.tokens + last)).kind == TOK_NEWLINE
@@ -896,8 +894,7 @@ fn type_alias_spell(p: *Parser, name: *u8, out_len: *i32) -> *u8
             j = j + 1
         k = k + 1
     *(buf + n) = 0
-    *out_len = n
-    buf
+    StrView { ptr: (buf), len: (n) as i64 }
 
 # Does replaying this kind need the side-channel state?  Primitive kinds
 # carry everything in the kind itself, and type_spec's primitive
@@ -941,7 +938,7 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
         *(p.ctx.alias_table + p.ctx.alias_count) = e as *u8
         p.ctx.alias_count = p.ctx.alias_count + 1
     type_decl_log(p.ctx, StrView { ptr: (name), len: (len) as i64 })   # AGAST #3907: a redeclaration too
-    type_note(p.tokens, p.pos, StrView { ptr: (name), len: (len) as i64 }, parse_file_copy_shared(p), 0, 1, TYPE_NOTE_ALIAS)   # AGAST #4609
+    type_note(p.tokens, p.pos, StrView { ptr: (name), len: (len) as i64 }, parse_file_copy_shared(p).ptr, 0, 1, TYPE_NOTE_ALIAS)   # AGAST #4609
     # The alias table is process-wide (it must outlive this Parser's arena), so
     # it keeps the flat snapshot, and type_alias_resolve rebuilds a *TypeRef
     # from it.  Nothing is latched on the Parser any more (#4035).
@@ -972,9 +969,9 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     e.fn_sig = f.fn_sig
     if e.fn_sig != null and (p.ctx.attr_bits & ATTR_WIN64) != 0
         item_attr_record(p.ctx, e.fn_sig as *u8, ATTR_WIN64)
-    var slen: i32 = 0
-    e.spelling = type_alias_spell(p, name, @slen)
-    e.spelling_len = slen
+    let spell_sv: StrView = type_alias_spell(p, StrView { ptr: (name), len: (len) as i64 })
+    e.spelling = spell_sv.ptr
+    e.spelling_len = spell_sv.len as i32
     return tr
 
 # AGAST #4769: true if the snapshot `f` names a different type than `e` holds,
@@ -1305,25 +1302,25 @@ pub fn capture_first_generic_arg(p: *Parser, tr: *TypeRef) -> *GenericArg
             # AGAST #1519: a pointer's pointee is only in parser state now, so
             # spell it here ("ptr_u8", "ptr_ptr_Foo"); generic_arg_spelling
             # returns the saved name.
-            var n: i32 = 0
-            ga.name = spell_ptr_generic_arg(p, tr, @n)
-            ga.name_len = n
+            let ptr_sv: StrView = spell_ptr_generic_arg(p, tr)
+            ga.name = ptr_sv.ptr
+            ga.name_len = ptr_sv.len as i32
         TypeKind.Array =>
             # AGAST #2832: `[2]i8` is "arr2_i8".  It spelled as nothing, so
             # `Box<[2]i8>` and `Box<[4]i64>` were one `%Box$`.
-            var n: i32 = 0
-            ga.name = spell_last_array(p, tr, @n)
-            ga.name_len = n
+            let arr_sv: StrView = spell_last_array(p, tr)
+            ga.name = arr_sv.ptr
+            ga.name_len = arr_sv.len as i32
         TypeKind.Ref | TypeKind.MutRef =>
             # AGAST #2384: `@C` is "ref_C", `@&C` "refmut_C".  Both spelled as
             # nothing, so `Option<@&A>` and `Option<@&B>` were one `%Option$`
             # with no payload to measure or judge.
-            var n: i32 = 0
-            ga.name = spell_ref_generic_arg(p, tr, @n)
-            ga.name_len = n
+            let ref_sv: StrView = spell_ref_generic_arg(p, tr)
+            ga.name = ref_sv.ptr
+            ga.name_len = ref_sv.len as i32
         TypeKind.Void =>
             # AGAST #2272: `()`.  Only the unit type parses to TypeKind.Void here.
-            ga.name = c"unit"
+            ga.name = "unit".ptr
             ga.name_len = 4
         _ =>
             # A primitive, spelled by generic_arg_spelling from `ty`.  AGAST
@@ -1361,19 +1358,18 @@ pub fn capture_generic_arg_at(p: *Parser, tr: *TypeRef, start: i32) -> *GenericA
 # primitive's name or the struct/generic name in last_type_name.  `*u8` is
 # "ptr_u8", `**Foo` "ptr_ptr_Foo", `***u8` "ptr_ptr_ptr_u8" (the depth past
 # two levels is packed into the inner-pointee slot, AGAST #3686).
-fn spell_ptr_generic_arg(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
+fn spell_ptr_generic_arg(p: *Parser, tr: *TypeRef) -> StrView
     let ty: TypeKind = tr_kind(tr)
     let facts: *TypeFacts = type_facts(p, tr)
     if facts.inner_pointee_type == (TypeKind.Array as i32)
         # AGAST #2832: `*[2]i8` is "ptr_arr2_i8".
-        var n: i32 = 0
-        let arr: *u8 = spell_last_array(p, tr.pointee, @n)
-        return spell_ptr_parts(p, ty, facts.pointee_type, (TypeKind.Struct as i32), StrView { ptr: (arr), len: (n) as i64 }, out_len)
+        let arr: StrView = spell_last_array(p, tr.pointee)
+        return spell_ptr_parts(p, ty, facts.pointee_type, (TypeKind.Struct as i32), arr)
     # AGAST #3686: past two levels the pointee is itself a `**`; pass the
     # depth-packed slot, as a `***u8` local records it.
     if ty == TypeKind.PtrPtr and facts.pointee_type == TypeKind.PtrPtr
-        return spell_ptr_parts(p, ty, TypeKind.Ptr, tr_ptr_ptr_inner_pointee(tr), StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 }, out_len)
-    return spell_ptr_parts(p, ty, facts.pointee_type, facts.inner_pointee_type, StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 }, out_len)
+        return spell_ptr_parts(p, ty, TypeKind.Ptr, tr_ptr_ptr_inner_pointee(tr), StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 })
+    return spell_ptr_parts(p, ty, facts.pointee_type, facts.inner_pointee_type, StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 })
 
 # AGAST #2384: the reference type that just parsed, spelled as ritz0's
 # mangle_type_name spells a RefType: "ref_" (`@T`) or "refmut_" (`@&T`), then
@@ -1382,7 +1378,7 @@ fn spell_ptr_generic_arg(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
 # state in p, so it reads as if the referent alone had just parsed.  A
 # referent that has no spelling (a reference to a reference, whose state the
 # outer one overwrote; a fn type) spells as "" (out_len 0), as before.
-fn spell_ref_generic_arg(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
+fn spell_ref_generic_arg(p: *Parser, tr: *TypeRef) -> StrView
     let ty: TypeKind = tr_kind(tr)
     let facts: *TypeFacts = type_facts(p, tr)
     let inner: TypeKind = facts.ref_inner_type
@@ -1393,27 +1389,29 @@ fn spell_ref_generic_arg(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
             base = facts.type_name
             base_len = facts.type_name_len
         TypeKind.Ptr | TypeKind.PtrPtr =>
-            base = spell_ptr_generic_arg(p, tr.pointee, @base_len)
+            let bsv: StrView = spell_ptr_generic_arg(p, tr.pointee)
+            base = bsv.ptr
+            base_len = bsv.len as i32
         TypeKind.Array =>
-            base = spell_last_array(p, tr.pointee, @base_len)
+            let bsv: StrView = spell_last_array(p, tr.pointee)
+            base = bsv.ptr
+            base_len = bsv.len as i32
         _ =>
             base_len = primitive_arg_spelling(inner, @base)
     if base == null or base_len <= 0
-        *out_len = 0
-        return null
-    var prefix: *u8 = c"ref_"
+        return strview_empty()
+    var prefix: StrView = "ref_"
     var prefix_len: i32 = 4
     if ty == TypeKind.MutRef
-        prefix = c"refmut_"
+        prefix = "refmut_"
         prefix_len = 7
     let name: *u8 = parser_alloc(p, (prefix_len + base_len + 1) as i64)
     for i in 0..prefix_len
-        *(name + i) = *(prefix + i)
+        *(name + i) = *(prefix.ptr + i)
     for i in 0..base_len
         *(name + prefix_len + i) = *(base + i)
     *(name + prefix_len + base_len) = 0
-    *out_len = prefix_len + base_len
-    return name
+    StrView { ptr: (name), len: (prefix_len + base_len) as i64 }
 
 # Length of the pointer-like prefix a mangled argument starts with: 4 for
 # "ptr_" and "ref_" (`@T`), 7 for "refmut_" (`@&T`, AGAST #2384); 0 if none,
@@ -1437,7 +1435,7 @@ pub fn mangled_ref_prefix(name_sv: StrView) -> i32
 # AGAST #3634: a `[N][M]..E` is every dimension's prefix around its leaf, as
 # ritz0 nests it: `[2][3]u8` is "arr2_arr3_u8".  monomorph's array_arg_decode
 # reads the shape back.
-fn spell_last_array(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
+fn spell_last_array(p: *Parser, tr: *TypeRef) -> StrView
     let facts: *TypeFacts = type_facts(p, tr)
     var elem: *u8 = null
     var elem_len: i32 = 0
@@ -1468,8 +1466,7 @@ fn spell_last_array(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
         _ =>
             elem_len = primitive_arg_spelling(et, @elem)
     if elem_len <= 0 or elem == null
-        *out_len = 0
-        return null
+        return strview_empty()
     # ("arr" + up to 10 digits + "_") per dimension + "ptr_" + elem
     let name: *u8 = parser_alloc(p, (elem_len + 14 * dims + 5) as i64)
     var pos: i32 = 0
@@ -1494,8 +1491,7 @@ fn spell_last_array(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
         *(name + pos) = *(elem + i)
         pos = pos + 1
     *(name + pos) = 0
-    *out_len = pos
-    return name
+    return StrView { ptr: (name), len: (pos) as i64 }
 
 # The decimal digits of n >= 0 at buf; returns how many.
 pub fn write_dec_i32(buf: *u8, n: i32) -> i32
@@ -1601,12 +1597,11 @@ pub fn tuple_regs_reset(ctx: *ParseCtx)
 # sign + 10 digits of an i32 + NUL (AGAST #1820: no magic alloc sizes).
 const I32_DEC_BUF: i64 = 12
 
-fn tuple_index_name(p: *Parser, i: i32, out_len: *i32) -> *u8
+fn tuple_index_name(p: *Parser, i: i32) -> StrView
     let buf: *u8 = parser_alloc(p, I32_DEC_BUF)
     let n: i32 = write_dec_i32(buf, i)
     *(buf + n) = 0
-    *out_len = n
-    return buf
+    return StrView { ptr: (buf), len: (n) as i64 }
 
 # The registered tuple spelled (name, len), or null.
 pub fn tuple_reg_lookup(ctx: *ParseCtx, name_sv: StrView) -> *TupleReg
@@ -1675,9 +1670,9 @@ pub fn type_tuple(p: *Parser, elems: *TupleElem) -> *TypeRef
         cur = elems
         while cur != null
             let f: *StructField = cur.field
-            var nlen: i32 = 0
-            f.name = tuple_index_name(p, i, @nlen)
-            f.name_len = nlen
+            let idx_sv: StrView = tuple_index_name(p, i)
+            f.name = idx_sv.ptr
+            f.name_len = idx_sv.len as i32
             f.next = null
             if last == null
                 fields = f
@@ -1710,10 +1705,9 @@ pub fn tuple_lit(p: *Parser, first: *Expr, rest: *Expr, line: i32, col: i32) -> 
     var cur: *Expr = first
     while cur != null
         let nxt: *Expr = cur.next
-        var nlen: i32 = 0
-        let nm: *u8 = tuple_index_name(p, i, @nlen)
+        let nm_sv: StrView = tuple_index_name(p, i)
         cur.next = null
-        let fi: *FieldInit = field_init_new(p, StrView { ptr: (nm), len: (nlen) as i64 }, cur)
+        let fi: *FieldInit = field_init_new(p, nm_sv, cur)
         if last == null
             inits = fi
         else
@@ -2167,7 +2161,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, li
     s.var_declared_type = ty
     s.var_src_file = null
     if ty_int_in(ty, 8, 32) == 1
-        s.var_src_file = parse_file_copy_shared(p)
+        s.var_src_file = parse_file_copy_shared(p).ptr
     # Default to i64 for type inference (when ty == 0 aka TypeKind.Void)
     if ty == TypeKind.Void
         s.var_type = TypeKind.I64
