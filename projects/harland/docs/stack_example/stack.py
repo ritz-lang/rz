@@ -52,11 +52,25 @@ EV_ERROR = 20
 EV_STREAM = 21
 REQUEST_KINDS = {APP_BIND, APP_SEND_TO, APP_PING, APP_CLOSE, APP_CONNECT, APP_WRITE}
 EVENT_KINDS = {EV_DATAGRAM, EV_PING_REPLY, EV_BOUND, EV_CLOSED, EV_ERROR, EV_STREAM}
+REPLY_KINDS = {APP_BIND, APP_PING, APP_CLOSE, APP_CONNECT, APP_WRITE}
+REPLY_RESERVE = 1
+DATAGRAM_QUEUE = APP_DEPTH
+DHCP_SERVER_PORT = 67
+DHCP_CLIENT_PORT = 68
+IPV4_HDR = 20
+UDP_HDR = 8
+LINK_MTU = 1500
+ERRNO_IO = -5
+ERRNO_BADF = -9
 ERRNO_AGAIN = -11
 ERRNO_EXIST = -17
 ERRNO_NODEV = -19
 ERRNO_INVAL = -22
+ERRNO_NFILE = -23
 ERRNO_NOSYS = -38
+MAX_ENDPOINTS = 16
+PING_DEADLINE_MS = 1000
+OUT_CAP_MAX = 8
 EPHEMERAL_MIN = 49152
 EPHEMERAL_MAX = 65535
 APP_DESC_FMT = "<HHIIHh4sIII"
@@ -138,8 +152,9 @@ def net_publish(handle, registered_ids):
 class IrqObject:
     """One device's latched interrupt. A different device does not move it."""
 
-    def __init__(self, name):
+    def __init__(self, name, handle=0):
         self.name = name
+        self.handle = handle
         self.latched = 0
         self.seen = 0
 
@@ -189,6 +204,105 @@ def kernel_post(end, bits):
     end.latch |= bits
 
 
+class HandleLatches:
+    """One latch per (object, process), created when the handle is inserted."""
+
+    def __init__(self):
+        self.latches = {}
+        self.mapped = {}
+        self.retired = set()
+
+    def insert(self, pid, object_id):
+        self.latches.setdefault((pid, object_id), 0)
+
+    def notify(self, sender_pid, object_id, bits):
+        peers = [key for key in self.latches if key[0] != sender_pid and key[1] == object_id]
+        if not peers:
+            return ERRNO_NODEV
+        for key in peers:
+            self.latches[key] |= bits
+        return 0
+
+    def latch(self, pid, object_id):
+        return self.latches.get((pid, object_id), 0)
+
+    def is_mapped(self, pid, object_id):
+        return (pid, object_id) in self.mapped
+
+    def retire(self, object_id):
+        self.retired.add(object_id)
+
+    def shm_map(self, pid, object_id):
+        if object_id in self.retired:
+            return ERRNO_NODEV
+        if (pid, object_id) not in self.latches:
+            return ERRNO_NODEV
+        if (pid, object_id) in self.mapped:
+            return self.mapped[(pid, object_id)]
+        self.mapped[(pid, object_id)] = 0x1000
+        return self.mapped[(pid, object_id)]
+
+
+class ExchangeTable:
+    """One live exchange per app process.
+
+    Dequeue of an already-retired attach drops the service capability. So does
+    ``ShmMap`` of a retired object the service still holds.
+    """
+
+    def __init__(self):
+        self.live = {}
+        self.service_caps = {}
+        self.retired = set()
+        self.pages = set()
+        self.inbox = []
+        self.next_object = 1
+        self.next_handle = 1
+
+    def attach(self, pid):
+        if pid in self.live:
+            return ERRNO_EXIST
+        if len(self.inbox) >= INBOX_DEPTH:
+            return ERRNO_AGAIN
+        object_id = self.next_object
+        self.next_object += 1
+        app_handle = self.next_handle
+        self.next_handle += 1
+        service_handle = self.next_handle
+        self.next_handle += 1
+        self.live[pid] = object_id
+        self.service_caps[object_id] = service_handle
+        self.pages.add(object_id)
+        self.inbox.append((service_handle, ATTACH, object_id))
+        return app_handle
+
+    def exit_process(self, pid):
+        object_id = self.live.pop(pid)
+        self.retired.add(object_id)
+        self.pages.discard(object_id)
+
+    def dequeue(self):
+        """Copy the inbox. A retired object loses its service handle here."""
+        copied = []
+        released = []
+        pending = self.inbox
+        self.inbox = []
+        for handle, bits, object_id in pending:
+            copied.append((handle, bits))
+            if object_id in self.retired and object_id in self.service_caps:
+                self.service_caps.pop(object_id)
+                released.append(object_id)
+        return copied, released
+
+    def shm_map(self, object_id):
+        if object_id not in self.service_caps:
+            return ERRNO_BADF
+        if object_id in self.retired:
+            self.service_caps.pop(object_id)
+            return ERRNO_NODEV
+        return 0x1000
+
+
 class ProcessWait:
     """Listed sources plus an inbox that is scanned even when the list is empty."""
 
@@ -203,18 +317,23 @@ class ProcessWait:
         self.inbox.append((handle, bits))
         return True
 
-    def wait(self, sources, out_cap, deadline_passed):
+    def wait(self, sources, out_cap, deadline_passed, out=None):
         """Return ``(code, events)``. ``sources`` is ``(handle, mask, end)``.
 
         Code 0 includes the IRQ. Code 2 is shm or inbox events and no IRQ.
-        Code 1 is the deadline. ``repark`` means a wake matched nothing and
-        the deadline has not passed. ``reap`` does not park again.
+        Code 1 is the deadline. ``len(events)`` is ``out_count``. ``repark``
+        means a wake matched nothing and the deadline has not passed. ``reap``
+        does not park again. ``out_cap`` of 0 or above 8 is ``Errno.Inval``
+        and consumes nothing. When ``out`` is a list, copied records replace
+        its prefix and the tail is left as the caller filled it.
         """
+        if out_cap < 1 or out_cap > OUT_CAP_MAX:
+            return (ERRNO_INVAL, [])
         events = []
         irq_hit = False
         if self.irq is not None and self.irq.latched != self.irq.seen and len(events) < out_cap:
             self.irq.seen = self.irq.latched
-            events.append((self.irq.name, DATA))
+            events.append((self.irq.handle, DATA))
             irq_hit = True
         for handle, mask, end in sources:
             if len(events) >= out_cap:
@@ -225,6 +344,9 @@ class ProcessWait:
                 events.append((handle, bits))
         while self.inbox and len(events) < out_cap:
             events.append(self.inbox.pop(0))
+        if out is not None:
+            for index, event in enumerate(events):
+                out[index] = event
         if events:
             return (0 if irq_hit else 2, events)
         if self.reap:
@@ -585,6 +707,55 @@ def reap_skips_repark():
     return code == "reap" and events == []
 
 
+def partial_wait_keeps_the_tail():
+    """A short out buffer keeps the unwritten tail and leaves the rest latched.
+
+    The IRQ record is the IRQ handle with DATA, and it takes one of the slots.
+    """
+    irq = IrqObject("virtio-net", handle=7)
+    irq.interrupt()
+    frame = PeerEnd(1)
+    bind_peers(frame, PeerEnd(101))
+    if shm_notify(frame.peer, DATA) != "ok":
+        return False
+    wait = ProcessWait(irq)
+    if not wait.post_inbox(10, ATTACH) or not wait.post_inbox(11, ATTACH):
+        return False
+    out = ["TAIL", "TAIL", "TAIL", "TAIL"]
+    code, events = wait.wait([(1, DATA, frame)], 2, False, out)
+    if code != 0 or events != [(7, DATA), (1, DATA)]:
+        return False
+    if out != [(7, DATA), (1, DATA), "TAIL", "TAIL"]:
+        return False
+    if frame.latch != 0 or irq.seen != irq.latched:
+        return False
+    if wait.inbox != [(10, ATTACH), (11, ATTACH)]:
+        return False
+    code, events = wait.wait([], 8, False)
+    return code == 2 and events == [(10, ATTACH), (11, ATTACH)] and wait.inbox == []
+
+
+def out_cap_zero_consumes_nothing():
+    """out_cap 0 is Inval. The IRQ, the shm latch, and the inbox stay put."""
+    irq = IrqObject("virtio-net", handle=7)
+    irq.interrupt()
+    end = PeerEnd(1)
+    bind_peers(end, PeerEnd(2))
+    if shm_notify(end.peer, DATA) != "ok":
+        return False
+    wait = ProcessWait(irq)
+    if not wait.post_inbox(10, ATTACH):
+        return False
+    code, events = wait.wait([(1, DATA, end)], 0, True)
+    return (
+        code == ERRNO_INVAL
+        and events == []
+        and irq.seen == 0
+        and end.latch == DATA
+        and wait.inbox == [(10, ATTACH)]
+    )
+
+
 def arp_observe(cache, opcode, sender_ip, sender_mac, target_ip, our_ip, pending):
     """Update an existing entry. A request adds only when we are the target.
 
@@ -693,6 +864,10 @@ class AppExchange:
         self.next_id = 1
         self.closed = False
         self.held = []
+        self.datagram_queue = {}
+        self.datagram_drops = {}
+        self.closing = set()
+        self.dead = set()
 
     def _store_u64(self, offset, value):
         self.region[offset:offset + 8] = struct.pack("<Q", value)
@@ -730,17 +905,26 @@ class AppExchange:
         self._store_u32(REQ_WAKE_AT, self.req_write)
         return req_id
 
-    def take_request(self):
+    def event_occupancy(self):
+        return self.ev_write - self.ev_read
+
+    def peek_request(self):
         if self.req_read == self.req_write:
             return None
         seq = self.req_read
         raw = self.request_desc_bytes(seq)
-        self.req_read += 1
-        self._store_u64(REQ_READ_AT, self.req_read)
         desc = decode_app_desc(raw, seq)
         if desc is None:
             return ("bad", None, b"")
         return ("ok", desc, self.request_payload(desc))
+
+    def take_request(self):
+        item = self.peek_request()
+        if item is None:
+            return None
+        self.req_read += 1
+        self._store_u64(REQ_READ_AT, self.req_read)
+        return item
 
     def publish_event(self, kind, req_id, handle, port, addr, status, payload):
         if self.closed:
@@ -775,19 +959,51 @@ class AppExchange:
             return None
         seq = self.ev_read
         raw = self.event_desc_bytes(seq)
-        self.ev_read += 1
-        self._store_u64(EV_READ_AT, self.ev_read)
         desc = decode_app_desc(raw, seq)
         if desc is None:
-            return ("bad", None, b"")
-        return ("ok", desc, self.event_payload(desc))
+            item = ("bad", None, b"")
+        else:
+            item = ("ok", desc, self.event_payload(desc))
+        self.ev_read += 1
+        self._store_u64(EV_READ_AT, self.ev_read)
+        return item
+
+    def _absorb(self, desc, payload):
+        """Datagrams fill a bounded per-handle queue. Replies stay in `held`."""
+        if desc["kind"] == EV_DATAGRAM:
+            if desc["handle"] in self.closing or desc["handle"] in self.dead:
+                return
+            queue = self.datagram_queue.setdefault(desc["handle"], [])
+            if len(queue) >= DATAGRAM_QUEUE:
+                self.datagram_drops[desc["handle"]] = self.datagram_drops.get(desc["handle"], 0) + 1
+                return
+            queue.append((desc, payload))
+            return
+        self.held.append((desc, payload))
+
+    def drop_handle(self, handle):
+        """Close discards this handle's queue and its drop counter."""
+        self.datagram_queue.pop(handle, None)
+        self.datagram_drops.pop(handle, None)
+        self.closing.discard(handle)
+        self.dead.add(handle)
+
+    def drain_events(self):
+        while True:
+            item = self.take_event()
+            if item is None:
+                return
+            if item[0] != "ok":
+                continue
+            self._absorb(item[1], item[2])
 
     def take_matching(self, predicate):
-        """Return the first private event copy the predicate accepts.
+        """Return the first queued reply the predicate accepts.
 
-        Copies that do not match stay queued, ahead of anything still on the
-        ring. A bad slot is not queued.
+        The ring is copied first. A datagram goes to its handle queue, and a
+        reply stays queued until its call takes it.
         """
+        self.drain_events()
         index = 0
         while index < len(self.held):
             desc, payload = self.held[index]
@@ -795,16 +1011,14 @@ class AppExchange:
                 self.held.pop(index)
                 return ("ok", desc, payload)
             index += 1
-        while True:
-            item = self.take_event()
-            if item is None:
-                return None
-            if item[0] != "ok":
-                continue
-            desc, payload = item[1], item[2]
-            if predicate(desc, payload):
-                return ("ok", desc, payload)
-            self.held.append((desc, payload))
+        return None
+
+    def pop_datagram(self, handle):
+        self.drain_events()
+        queue = self.datagram_queue.get(handle, [])
+        if not queue:
+            return None
+        return queue.pop(0)
 
     def request_desc_bytes(self, seq):
         slot = seq & (APP_DEPTH - 1)
@@ -853,6 +1067,12 @@ class Stack:
         self.service_present = True
         self.attach_handle = 0
         self.tx_result = None
+        self.mtu = LINK_MTU
+        self.service_datagram_drops = 0
+        self.send_drops = 0
+        self.peer_quiet = False
+        self.arp_unresolved = False
+        self.ping_wait = None
 
     def deliver_device_frame(self, frame):
         """Ring 1 strips the virtio header and publishes. Ring 2 demuxes."""
@@ -881,9 +1101,7 @@ class Stack:
                 source_port, destination_port, payload = udp
                 handle = self.port_handles.get(destination_port)
                 if handle is not None:
-                    self.exchange.publish_event(
-                        EV_DATAGRAM, 0, handle, source_port, source, 0, payload
-                    )
+                    self._post_datagram(handle, source_port, source, payload)
             elif protocol == 6 and self.established:
                 tcp = parse_tcp(body, self.stream_expected)
                 if tcp is None:
@@ -926,25 +1144,38 @@ class Stack:
             return ERRNO_INVAL
         return event["handle"]
 
-    def net_recv_from(self, handle):
-        def matches(desc, _payload):
-            if desc["handle"] != handle:
-                return False
-            if desc["kind"] == EV_DATAGRAM and desc["status"] == 0:
-                return True
-            return desc["kind"] == EV_ERROR
+    def udp_payload_max(self):
+        return self.mtu - IPV4_HDR - UDP_HDR
 
-        item = self.exchange.take_matching(matches)
-        if item is None:
-            return None
-        desc, payload = item[1], item[2]
-        if desc["kind"] == EV_DATAGRAM and desc["status"] == 0:
+    def _post_datagram(self, handle, source_port, source, payload):
+        if self.exchange.event_occupancy() >= APP_DEPTH - REPLY_RESERVE:
+            self.service_datagram_drops += 1
+            return
+        posted = self.exchange.publish_event(
+            EV_DATAGRAM, 0, handle, source_port, source, 0, payload
+        )
+        if posted is None or posted == "full":
+            self.service_datagram_drops += 1
+
+    def net_recv_from(self, handle):
+        if handle in self.exchange.dead:
+            return ERRNO_BADF
+        item = self.exchange.pop_datagram(handle)
+        if item is not None:
+            desc, payload = item
             return (payload, desc["addr"], desc["port"])
+        error = self.exchange.take_matching(
+            lambda desc, _payload: desc["kind"] == EV_ERROR and desc["handle"] == handle
+        )
+        if error is not None:
+            return None
         return None
 
     def net_send_to(self, handle, payload, address, port):
-        if len(payload) > APP_SLOT:
-            return None
+        if handle in self.exchange.dead:
+            return ERRNO_BADF
+        if len(payload) > APP_SLOT or len(payload) > self.udp_payload_max():
+            return ERRNO_INVAL
         req_id = self.exchange.publish_request(APP_SEND_TO, handle, port, address, payload)
         if req_id is None:
             return None
@@ -961,6 +1192,8 @@ class Stack:
         if not isinstance(req_id, int):
             return ERRNO_INVAL
         self._drain_requests()
+        if self.ping_wait is not None and self.ping_wait["id"] == req_id:
+            self.expire_pings()
         event = self._take_id(req_id)
         if event is None:
             return ERRNO_INVAL
@@ -969,16 +1202,50 @@ class Stack:
         return event["status"]
 
     def net_close(self, handle):
+        if handle in self.exchange.dead:
+            return ERRNO_BADF
+        self.exchange.closing.add(handle)
         req_id = self.exchange.publish_request(APP_CLOSE, handle, 0, b"\x00\x00\x00\x00", b"")
         if not isinstance(req_id, int):
+            self.exchange.closing.discard(handle)
             return ERRNO_INVAL
         self._drain_requests()
         event = self._take_id(req_id)
         if event is None or event["kind"] != EV_CLOSED or event["status"] != 0:
+            self.exchange.closing.discard(handle)
             if event is not None and event["status"] != 0:
                 return event["status"]
             return ERRNO_INVAL
+        self.exchange.drop_handle(handle)
         return 0
+
+    def expire_pings(self):
+        """The ping deadline fires once. A second call posts nothing."""
+        owed = self.ping_wait
+        if owed is None:
+            return 0
+        self.ping_wait = None
+        posted = self.exchange.publish_event(
+            EV_ERROR, owed["id"], 0, 0, owed["addr"], ERRNO_IO, b""
+        )
+        if posted is None or posted == "full":
+            self.ping_wait = owed
+            return 0
+        return 1
+
+    def note_ping_reply(self):
+        """One matching echo reply. A late reply, after the terminal event, is dropped."""
+        owed = self.ping_wait
+        if owed is None:
+            return False
+        self.ping_wait = None
+        posted = self.exchange.publish_event(
+            EV_PING_REPLY, owed["id"], 0, 0, owed["addr"], 0, owed["payload"]
+        )
+        if posted is None or posted == "full":
+            self.ping_wait = owed
+            return False
+        return True
 
     def submit_kind(self, kind):
         """Publish one request kind and return the status the service posts."""
@@ -999,14 +1266,19 @@ class Stack:
         desc["payload"] = payload
         return desc
 
+    def drop_unanswered_sends(self):
+        """ARP retries are exhausted. The app is not waiting, so this is a count."""
+        self.send_drops += 1
+
     def _drain_requests(self):
         while True:
-            item = self.exchange.take_request()
+            item = self.exchange.peek_request()
             if item is None:
                 return
-            if item[0] != "ok":
+            taken = self.exchange.take_request()
+            if taken is None or taken[0] != "ok":
                 continue
-            self._dispatch(item[1], item[2])
+            self._dispatch(taken[1], taken[2])
 
     def _error(self, desc, status):
         handle = 0 if desc["kind"] == APP_BIND else desc["handle"]
@@ -1015,6 +1287,8 @@ class Stack:
         )
 
     def _assign_port(self, requested):
+        if requested in (DHCP_SERVER_PORT, DHCP_CLIENT_PORT):
+            return None
         if requested != 0:
             if requested in self.port_handles:
                 return None
@@ -1040,6 +1314,9 @@ class Stack:
                 status = ERRNO_AGAIN if desc["port"] == 0 else ERRNO_EXIST
                 self._error(desc, status)
                 return
+            if len(self.handle_ports) >= MAX_ENDPOINTS:
+                self._error(desc, ERRNO_NFILE)
+                return
             handle = self.next_handle
             self.next_handle += 1
             self.port_handles[port] = handle
@@ -1051,7 +1328,8 @@ class Stack:
         if kind == APP_SEND_TO:
             source_port = self.handle_ports.get(desc["handle"])
             if source_port is None or desc["handle"] == 0:
-                self._error(desc, ERRNO_INVAL)
+                self.send_drops += 1
+                self.tx_result = ERRNO_INVAL
                 return
             ethernet = build_ethernet(
                 self.peer_mac,
@@ -1069,6 +1347,9 @@ class Stack:
             if not icmp_echo_answered(desc["addr"], self.peer_mac, True):
                 self._error(desc, ERRNO_INVAL)
                 return
+            if self.arp_unresolved:
+                self._error(desc, ERRNO_IO)
+                return
             echo = build_icmp_echo(payload)
             ethernet = build_ethernet(
                 self.peer_mac,
@@ -1076,6 +1357,9 @@ class Stack:
                 build_ipv4(1, self.our_ip, desc["addr"], echo),
             )
             self._transmit(ethernet)
+            if self.peer_quiet:
+                self.ping_wait = {"id": desc["id"], "addr": desc["addr"], "payload": payload}
+                return
             self.exchange.publish_event(
                 EV_PING_REPLY, desc["id"], 0, 0, desc["addr"], 0, payload
             )

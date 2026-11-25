@@ -41,6 +41,13 @@ def require(condition, message):
         raise SystemExit(message)
 
 
+def frame_protocol(frame):
+    parsed = stack.parse_ipv4(frame[stack.VIRTIO_HDR:])
+    if parsed is None:
+        return None
+    return parsed[0]
+
+
 def udp_payload_of(frame):
     """Parse a device frame with the shipped IPv4 and UDP readers."""
     ethernet = frame[stack.VIRTIO_HDR:]
@@ -77,7 +84,10 @@ def run():
     print("net_read stream bytes: %s" % stream_bytes.decode())
 
     writes_before_oversize = host.exchange.req_write
-    require(host.net_send_to(bound, b"x" * (stack.APP_SLOT + 1), PEER_IP, 44000) is None, "an oversize send was published")
+    require(
+        host.net_send_to(bound, b"x" * (stack.APP_SLOT + 1), PEER_IP, 44000) == stack.ERRNO_INVAL,
+        "an oversize send was published",
+    )
     require(host.exchange.req_write == writes_before_oversize, "an oversize send advanced the request index")
     host.net_send_to(bound, DATAGRAM, PEER_IP, 44000)
     require(host.device_tx, "datagram send produced no device frame")
@@ -85,7 +95,8 @@ def run():
     send_seq = host.exchange.req_write - 1
     raw = host.exchange.request_desc_bytes(send_seq)
     require(struct.unpack("<H", raw[0:2])[0] == stack.APP_SEND_TO, "send kind is not at byte 0")
-    require(struct.unpack("<H", raw[12:14])[0] == 44000, "remote port is not at byte 12")
+    require(raw[12:14] == struct.pack("<H", 44000), "port is not host-endian at byte 12")
+    require(raw[12:14] != struct.pack(">H", 44000), "port was stored in wire order")
     require(raw[16:20] == PEER_IP, "address is not at byte 16")
     require(struct.unpack("<I", raw[20:24])[0] == len(DATAGRAM), "length is not at byte 20")
     desc = stack.decode_app_desc(raw, send_seq)
@@ -213,6 +224,12 @@ def run():
 
     require(stack.empty_wake_reparks(), "an empty wake before the deadline returned the deadline")
     print("behavior: an empty wake reparks until the deadline")
+
+    require(stack.partial_wait_keeps_the_tail(), "a short wait overwrote its tail or dropped the IRQ")
+    print("behavior: out_count is the copied prefix, and the IRQ record uses one slot")
+
+    require(stack.out_cap_zero_consumes_nothing(), "out_cap 0 consumed a latch")
+    print("behavior: out_cap 0 is Inval and consumes nothing")
 
     require(stack.reap_skips_repark(), "a reaped process parked again with no event")
     print("behavior: PROC_REAP returns toward exit instead of parking")
@@ -360,6 +377,185 @@ def run():
         "a datagram queued ahead of bind was dropped",
     )
     print("behavior: a datagram stays queued across a later bind, bytes: %s" % kept[0].decode())
+
+    limited = stack.Stack()
+    first_port = limited.net_bind(9999)
+    require(first_port == 1, "limited stack's first handle was %s" % first_port)
+    sent_before = limited.exchange.req_write
+    events_before = limited.exchange.ev_write
+    oversize = b"x" * (limited.mtu - stack.IPV4_HDR - stack.UDP_HDR + 1)
+    for _ in range(33):
+        refused = limited.net_send_to(first_port, oversize, PEER_IP, 44000)
+        require(refused == stack.ERRNO_INVAL, "an oversize send returned %s" % refused)
+    require(limited.exchange.req_write == sent_before, "oversize sends were published")
+    require(limited.exchange.ev_write == events_before, "oversize sends posted an event")
+    rebound = limited.net_bind(9998)
+    require(rebound == 2, "bind after 33 oversize sends returned %s" % rebound)
+    after_bind = limited.exchange.ev_write
+    limited.drop_unanswered_sends()
+    require(limited.send_drops == 1, "an unanswered send was not counted")
+    require(limited.exchange.ev_write == after_bind, "send_drops posted an event")
+    print("behavior: 33 oversize sends publish nothing, and the next bind returns handle 2")
+
+    flooded = stack.Stack()
+    flood_handle = flooded.net_bind(9999)
+    require(flood_handle == 1, "flood handle was %s" % flood_handle)
+    flood_body = b"flood-datagram"
+    for _ in range(33):
+        flooded.deliver_device_frame(udp_device_frame(flood_body, 9999))
+    posted = stack.APP_DEPTH - stack.REPLY_RESERVE
+    require(flooded.service_datagram_drops == 33 - posted, "the reply slot was filled with datagrams")
+    require(flooded.exchange.event_occupancy() == posted, "the event ring did not keep the reply slot")
+    other = flooded.net_bind(9998)
+    require(other == 2, "bind behind a full datagram ring returned %s" % other)
+    require(len(flooded.exchange.datagram_queue[flood_handle]) == posted, "the library queue did not keep the posted datagrams")
+    require(flooded.exchange.datagram_drops.get(flood_handle, 0) == 0, "the library dropped a datagram that fit")
+    flood_got = flooded.net_recv_from(flood_handle)
+    require(flood_got is not None and flood_got[0] == flood_body, "a queued datagram was not returned")
+    require(flooded.exchange.held == [], "a datagram was left in the reply queue")
+    print("behavior: datagrams leave a reply slot, and a later bind still returns handle 2")
+
+    dhcp_ports = stack.Stack()
+    require(dhcp_ports.net_bind(stack.DHCP_CLIENT_PORT) == stack.ERRNO_EXIST, "port 68 was bound")
+    require(dhcp_ports.net_bind(stack.DHCP_SERVER_PORT) == stack.ERRNO_EXIST, "port 67 was bound")
+    require(dhcp_ports.next_handle == 1, "a DHCP port allocated a handle")
+    print("behavior: ports 67 and 68 stay with the DHCP client")
+
+    latches = stack.HandleLatches()
+    latches.insert(1, 9)
+    latches.insert(2, 9)
+    require(latches.notify(2, 9, stack.DATA) == 0, "a notify before ShmMap was refused")
+    require(latches.latch(1, 9) & stack.DATA, "the unmapped peer did not latch DATA")
+    require(not latches.is_mapped(1, 9), "insert mapped the object")
+    latches.retire(9)
+    require(latches.shm_map(1, 9) == stack.ERRNO_NODEV, "a retired object mapped")
+    print("behavior: the latch exists before ShmMap, and a retired object does not map")
+
+    exchanges = stack.ExchangeTable()
+    first = exchanges.attach(4)
+    retired_id = exchanges.live[4]
+    require(isinstance(first, int) and first > 0, "the first attach on a slot failed")
+    exchanges.exit_process(4)
+    require(retired_id not in exchanges.pages, "exit left the retired object's pages")
+    _copied, released = exchanges.dequeue()
+    require(released == [retired_id], "dequeue did not drop the retired service capability")
+    require(retired_id not in exchanges.service_caps, "the retired service handle survived dequeue")
+    require(exchanges.shm_map(retired_id) == stack.ERRNO_BADF, "a dropped handle mapped")
+    second = exchanges.attach(4)
+    require(isinstance(second, int) and second > 0, "the reused slot could not attach")
+    require(exchanges.live[4] != retired_id, "the reused slot resumed the retired object")
+    living = stack.ExchangeTable()
+    live_handle = living.attach(5)
+    require(isinstance(live_handle, int) and live_handle > 0, "a living app could not attach")
+    require(living.attach(5) == stack.ERRNO_EXIST, "a second attach from one process created an exchange")
+    require(len(living.inbox) == 1, "the refused attach enqueued a record")
+    live_id = living.live[5]
+    _copied, released = living.dequeue()
+    require(released == [], "a live dequeue dropped the service capability")
+    living.exit_process(5)
+    require(living.shm_map(live_id) == stack.ERRNO_NODEV, "ShmMap of an unmapped retired exchange did not return NoDev")
+    require(live_id not in living.service_caps, "NoDev left the service capability")
+    require(living.shm_map(live_id) == stack.ERRNO_BADF, "a second map detached an object the service never mapped")
+    print("behavior: one exchange per process, and a retired attach drops the service capability")
+
+    capped = stack.Stack()
+    live_handles = []
+    for _ in range(stack.MAX_ENDPOINTS):
+        got = capped.net_bind(0)
+        require(isinstance(got, int) and got > 0, "a bind inside the endpoint cap failed")
+        live_handles.append(got)
+    handle_after_cap = capped.next_handle
+    require(capped.net_bind(0) == stack.ERRNO_NFILE, "bind past the endpoint cap allocated a handle")
+    require(capped.next_handle == handle_after_cap, "the refused bind advanced the handle")
+    require(capped.net_close(live_handles[0]) == 0, "closing one endpoint failed")
+    rebound = capped.net_bind(0)
+    require(rebound == handle_after_cap, "a bind after close did not take the next handle")
+    print("behavior: one exchange keeps at most 16 live endpoints")
+
+    stale = stack.Stack()
+    stale_handle = stale.net_bind(9999)
+    other_handle = stale.net_bind(9998)
+    stale.deliver_device_frame(udp_device_frame(b"stale-after-close", 9999))
+    stale.deliver_device_frame(udp_device_frame(b"kept-for-other", 9998))
+    stale.exchange.drain_events()
+    stale.exchange.datagram_drops[stale_handle] = 3
+    require(stale.exchange.datagram_queue[stale_handle], "the closing handle had no queued datagram")
+    require(stale.net_close(stale_handle) == 0, "net_close failed")
+    require(stale_handle not in stale.exchange.datagram_queue, "close kept the datagram queue")
+    require(stale_handle not in stale.exchange.datagram_drops, "close kept the drop counter")
+    require(stale.net_recv_from(stale_handle) == stack.ERRNO_BADF, "a closed handle still received")
+    require(
+        stale.net_send_to(stale_handle, b"x", PEER_IP, 1) == stack.ERRNO_BADF,
+        "a closed handle still sent",
+    )
+    kept = stale.net_recv_from(other_handle)
+    require(kept is not None and kept[0] == b"kept-for-other", "close discarded another handle's datagram")
+    rebound_same_port = stale.net_bind(9999)
+    require(rebound_same_port == stale_handle + 2, "rebind reused a closed handle number")
+    require(stale.net_recv_from(rebound_same_port) is None, "rebind delivered a discarded datagram")
+    print("behavior: net_close discards that handle's datagrams and its drop counter")
+
+    lost = stack.Stack()
+    lost.arp_unresolved = True
+    frames_before_lost = len(lost.device_tx)
+    require(lost.net_ping(PEER_IP, b"no-arp") == stack.ERRNO_IO, "unresolved ARP did not end the ping")
+    require(len(lost.device_tx) == frames_before_lost, "unresolved ARP transmitted an echo")
+    require(lost.ping_wait is None, "the failed ping stayed in flight")
+    require(isinstance(lost.net_bind(9999), int), "a bind after ARP failure did not proceed")
+    print("behavior: ARP giving up is one EV_ERROR and no echo")
+
+    quiet_call = stack.Stack()
+    quiet_call.peer_quiet = True
+    frames_before_quiet = len(quiet_call.device_tx)
+    require(quiet_call.net_ping(PEER_IP, b"quiet-body") == stack.ERRNO_IO, "a quiet peer did not time out")
+    quiet_echoes = [frame for frame in quiet_call.device_tx if frame_protocol(frame) == 1]
+    require(len(quiet_echoes) == frames_before_quiet + 1, "the quiet ping did not send one echo")
+    require(quiet_call.ping_wait is None, "the timed-out ping stayed owed")
+    require(quiet_call.expire_pings() == 0, "the ping deadline posted a second event")
+    require(quiet_call.exchange.ev_write == 1, "the quiet ping posted more than one event")
+    print("behavior: a quiet peer is one echo and one Errno.Io")
+
+    quiet = stack.Stack()
+    quiet.peer_quiet = True
+    quiet_handle = quiet.net_bind(9999)
+    ping_id = quiet.exchange.publish_request(stack.APP_PING, 0, 0, PEER_IP, b"quiet-body")
+    quiet._drain_requests()
+    require(quiet.exchange.req_read == quiet.exchange.req_write, "the ping stayed at the request head")
+    require(quiet.ping_wait is not None and quiet.ping_wait["id"] == ping_id, "the echo was not in flight")
+    during = quiet.net_send_to(quiet_handle, b"during-ping", PEER_IP, 44000)
+    require(during == "sent", "a send behind a ping did not reach the TX ring")
+    require(quiet.ping_wait is not None, "the send completed the ping")
+    sent_udp = udp_payload_of(quiet.device_tx[-1])
+    require(sent_udp is not None and sent_udp[2] == b"during-ping", "the TX frame was not the send behind the ping")
+    require(quiet.expire_pings() == 1, "the deadline did not post the terminal event")
+    require(quiet.expire_pings() == 0, "the deadline posted twice")
+    events_after = quiet.exchange.ev_write
+    require(quiet.note_ping_reply() is False, "a late echo reply was accepted")
+    require(quiet.exchange.ev_write == events_after, "a late reply posted a second event")
+    timed_out = quiet._take_id(ping_id)
+    require(
+        timed_out is not None
+        and timed_out["kind"] == stack.EV_ERROR
+        and timed_out["status"] == stack.ERRNO_IO,
+        "the quiet ping's terminal event was not EV_ERROR / Errno.Io",
+    )
+    require(isinstance(quiet.net_bind(9998), int), "the next control request did not proceed")
+    print("behavior: a send behind a ping reaches TX before the ping deadline")
+
+    answered = stack.Stack()
+    answered.peer_quiet = True
+    answer_id = answered.exchange.publish_request(stack.APP_PING, 0, 0, PEER_IP, b"quiet-body")
+    answered._drain_requests()
+    require(answered.note_ping_reply() is True, "the in-flight echo was not matched")
+    require(answered.note_ping_reply() is False, "a second reply was matched")
+    require(answered.expire_pings() == 0, "a matched ping also timed out")
+    answer = answered._take_id(answer_id)
+    require(
+        answer is not None and answer["kind"] == stack.EV_PING_REPLY and answer["payload"] == b"quiet-body",
+        "the matched echo was not the one terminal reply",
+    )
+    require(answered.exchange.ev_write == 1, "success posted more than one event")
+    print("behavior: one echo reply is the only terminal event")
 
 
 def udp_frame_with_checksum(payload, destination_port, checksum):

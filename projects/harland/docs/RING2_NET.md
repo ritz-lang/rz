@@ -77,7 +77,7 @@ Each protocol section below draws the service's receive path and send path. The 
 
 ## Service wait
 
-The service parks with one `ShmWait`. The call lists the frame object and every live app exchange, at most five, each with its own mask. `proc_wake(reason)` in `proc/table.ritz` marks every `PROC_BLOCKED` process with that reason runnable, so the service does not use a shared reason. Each mapping has its own latch. A notify posts to the other mapping, and the bits stay there whether or not the peer is inside `ShmWait`. The process inbox is scanned on every wait, including a wait that lists no exchanges. The kernel does not read the service's private pending-TX queue. The service builds the pairs. One return copies every matching source that fits in `out_cap`, not only the first.
+The service parks with one `ShmWait`. The call lists the frame object and every live app exchange, at most five, one per app process, each with its own mask. `proc_wake(reason)` in `proc/table.ritz` marks every `PROC_BLOCKED` process with that reason runnable, so the service does not use a shared reason. Each holding process has one latch per object, created when the kernel inserts its handle. A notify posts to the peer's latch, including before the peer maps the object or waits on it. The process inbox is scanned on every wait, including a wait that lists no exchanges. The kernel does not read the service's private pending-TX queue. The service builds the pairs. One return copies every matching source that fits in `out_cap` and writes that number to `out_count`.
 
 The call parks only when every listed source is idle and the inbox is empty:
 
@@ -120,7 +120,7 @@ flowchart TB
 
 The cache is private to the service. An ARP packet updates the sender's MAC when that IP is already cached. A request adds an entry only when the target protocol address is ours. A reply adds an entry only when a request for that sender IP is outstanding. An unsolicited reply does not create an entry, including one whose target is our address. RFC 826 would add that sender. This cutover does not, because an unsolicited reply is the cache-poisoning path. A packet that names some other target does not create an entry either. This is not what `arp_cache_add` does today. A request whose target is our address, and whose address record is configured, is answered with a reply to the sender's MAC. A reply that matches an outstanding request wakes the sends waiting on that next hop. Today the waiter is `icmp_ping`, which returns -1 and expects its caller to retry. The service keeps the pending send and finishes it when the reply arrives.
 
-Pending sends are capped at 16 per next hop. The seventeenth fails to its caller and is not queued. One request is in flight for that hop. The service retries it three times, one second apart. After the third retry with no reply, every pending send for that hop fails and is dropped. A cache entry expires after 60 seconds without use. The next send starts resolution again. Today the cache has no timeout.
+Pending sends are capped at 16 per next hop. The seventeenth is not queued. One request is in flight for that hop. The service retries it three times, one second apart. After the third retry with no reply, every pending send for that hop is dropped. An app datagram already accepted onto the request ring is included in that drop: the service increments `send_drops` and does not post `EV_ERROR` for `APP_SEND_TO`. A cache entry expires after 60 seconds without use. The next send starts resolution again. Today the cache has no timeout.
 
 On send, a request is a broadcast Ethernet frame. A reply is unicast to the requester. The service sends a request when a next hop is missing. It does not invent a MAC.
 
@@ -204,6 +204,8 @@ flowchart TB
 ```
 
 A ring-3 ping is an app request that becomes this echo request. The reply returns on the app exchange. That exchange is drawn in its own section. The ICMP diagram stops at the frame rings.
+
+`APP_PING` is one in-flight echo for that request. The service consumes the request when it has validated the private copy, stores the request `read_idx`, and keeps the owed reply in private per-attachment state. It does not leave the request at the head of the ring. `PING_DEADLINE_MS` is 1000. The deadline starts once, when that echo frame is published to the driver, and it is not restarted. ARP resolution is not that timer. While the next hop is unresolved the ping is one pending operation on that hop, under the pending cap of 16. When ARP installs the entry, the service publishes one echo and starts the deadline. When the third ARP retry fails, the service posts one `EV_ERROR` with `Errno.Io` (-5) and does not publish an echo. A matching echo reply before the deadline posts one `EV_PING_REPLY`. The deadline with no reply posts one `EV_ERROR` with `Errno.Io`. The attachment produces exactly one of those two events for that request id. A late reply after the error is dropped. This kernel's errno set has no timed-out discriminant, and this cutover does not add one. There is no second echo and no interval. An `APP_SEND_TO` published behind the ping is consumed and can reach the TX ring while the echo is still in flight. The deadline bounds the owed reply, not the request ring.
 
 ## UDP and DHCP
 
@@ -298,11 +300,11 @@ App to service, on the first cutover named in the overview: `net_bind`, `net_sen
 
 Ring 0 grants the pages as `CAP_TYPE_SHM` and delivers the wake. The service holds that capability for the frame rings and for its address page. It does not hold `CAP_TYPE_MMIO` or `CAP_TYPE_IRQ`. An app holds `CAP_TYPE_SHM` only for its own exchange. On Harland the wake is the scheduler, and it names one endpoint. The app blocks when its event ring is empty, with the same recheck the frame-ring consumer uses. The service does not block on one empty request ring. Its park is the multi-source wait above. The service gets no port I/O, no BAR, and no DMA domain of the NIC.
 
-The app writes the request payloads and the request `write_idx`. The service reads them, validates, and then stores the request `read_idx`. The service writes the event payloads and the event `write_idx`. The app reads them, validates, and then stores the event `read_idx`. The page is peer-writable, because those two indexes share a page. Each side validates the other's index and does not write it. A generic exchange handle has no `CAP_RIGHT_PUBLISH` and cannot call `NetPublish` or take the frame seat. `NetAttach` is what returns the handle. `CapGrant` is not how the app learns it.
+The app writes the request payloads and the request `write_idx`. The service reads a request and validates that private copy, then stores the request `read_idx`. A reply-producing request (`APP_BIND`, `APP_PING`, `APP_CLOSE`, and the reserved stream kinds) is consumed at that read. The owed reply stays in private per-attachment state until it is posted. It does not sit at the head of the request ring, so an `APP_SEND_TO` behind it is consumed while the reply is still owed. The service writes the event payloads and the event `write_idx`. The app reads them, validates, and then stores the event `read_idx`. The page is peer-writable, because those two indexes share a page. Each side validates the other's index and does not write it. A generic exchange handle has no `CAP_RIGHT_PUBLISH` and cannot call `NetPublish` or take the frame seat. `NetAttach` is what returns the handle. `CapGrant` is not how the app learns it.
 
 Validation matches the frame ring. The payload offset comes from the slot. A bad length, a mismatched offset, or an occupancy above the depth is rejected and not dispatched. Request ids and socket handles belong to that attachment. An id from another attachment is rejected.
 
-An app that stops consuming events fills its own event ring. The service stops producing events for that attachment. NIC RX, DHCP, and every other app keep running. One stalled app is not a park of the service. When the app exits with requests still pending, the kernel marks the attachment closed and wakes the service. It does not read the request slots. The service drains that attachment and discards the requests. A restart into a reused process slot does not inherit the old rings or the old handles. The kernel creates a new attachment or the attach fails. It does not resume the previous one.
+An app that stops consuming events fills its own event ring with datagrams. The service posts an `EV_DATAGRAM` only while one slot stays free for a reply, so the ring holds at most `APP_DEPTH - 1` datagrams. A datagram that does not fit is dropped, and that attachment's drop count increments. The service does not park on a full event ring. NIC RX, DHCP, and every other app keep running. One stalled app is not a park of the service. When the app exits with requests still pending, the kernel marks the attachment closed and wakes the service. It does not read the request slots. The service drains that attachment and discards the requests. A restart into a reused process slot does not inherit the old rings or the old handles. The kernel creates a new attachment or the attach fails. It does not resume the previous one.
 
 ```mermaid
 flowchart LR
@@ -320,7 +322,7 @@ flowchart LR
   sock --> ev --> call
 ```
 
-One pair of rings per attached app. A second bind of a live port fails inside the service with `Errno.Exist` (-17) and does not allocate a handle. `MAX_PROCS` is 8. Init, the ring-1 driver, and this service each hold a slot, so at most five apps attach. `NetAttach` (228) creates the `ShmObject` and returns the app's exchange handle. `ShmMap` (227) maps it. `CapRevoke` (41) drops the caller's handle and unmaps only that caller. The object's pages stay allocated while the other mapping is live. The wake word is the `u32` from the frame-ring layout.
+One pair of rings per attached app, and one live exchange per app process. A second bind of a live port fails inside the service with `Errno.Exist` (-17) and does not allocate a handle. One exchange has at most `MAX_ENDPOINTS` (16) live endpoints. A bind past that cap returns `Errno.NFile` (-23) and allocates no handle. A closed endpoint does not count. Handle numbers start at 1 and are not reused. `MAX_PROCS` is 8. Init, the ring-1 driver, and this service each hold a slot, so at most five apps attach. `NetAttach` (228) creates the `ShmObject` and returns the app's exchange handle. `ShmMap` (227) maps it. `CapRevoke` (41) drops the caller's handle and unmaps only that caller. The object's pages stay allocated while the other mapping is live. The wake word is the `u32` from the frame-ring layout.
 
 The region is `0x23000` bytes. Indexes are monotonic `u64`. Depth is `APP_DEPTH = 32`. The slot is `seq & 31`. `APP_SLOT = 2048`, which is `FRAME_MAX`, so one datagram fits in one slot and the published MTU still caps the packet. Each side keeps a private copy of the index it owns.
 
@@ -342,7 +344,7 @@ The region is `0x23000` bytes. Indexes are monotonic `u64`. Depth is `APP_DEPTH 
 | 2 | `u16` | `flags`. `APP_F_NONE = 0`. Any other value is `Bad`. |
 | 4 | `u32` | `id`. The library chooses it, starting at 1. The service echoes it. `0` is not a request id. |
 | 8 | `u32` | `handle`. `0` in a request that creates an endpoint. Otherwise the endpoint the service assigned. `0` is never a live endpoint. |
-| 12 | `u16` | `port`. Local port for bind, remote port for send, peer port for a datagram event. |
+| 12 | `u16` | `port`. Host endian, little-endian on this kernel. Local port for bind, remote port for send, peer port for a datagram event. The service swaps it when it builds or checks UDP. `addr` stays wire order. |
 | 14 | `i16` | `status`. `0` in a request. `0` or a negative `Errno` in an event. |
 | 16 | `[4]u8` | `addr`. IPv4 in wire order. Four zero bytes when the call has no address. |
 | 20 | `u32` | `length`. Payload bytes, `0..=2048`. |
@@ -373,15 +375,15 @@ Event `kind` values, written by the service:
 
 `APP_CONNECT`, `APP_WRITE`, and `EV_STREAM` are names for the TCP milestone. The first cutover does not encode them in the tools below. A request of kind 6 or 7 is answered with `EV_ERROR` and `Errno.NoSys` (-38). It does not open a stream, and this draft still does not pick a retransmission interval or a congestion number.
 
-`net_bind(port)` publishes `APP_BIND` with `handle` 0, `length` 0, and `addr` zero. Port 0 asks the service to assign a port in `49152..=65535` that is not already bound. Any other port is the requested local port. The library waits for the event whose `id` matches. An event with a different `id` stays queued for the call that owns it. A datagram already on the ring is still there for `net_recv_from`. `EV_BOUND` carries `status` 0, the new `handle`, and the bound `port`. `EV_ERROR` carries no handle. A second bind of a live port is `Errno.Exist`.
+`net_bind(port)` publishes `APP_BIND` with `handle` 0, `length` 0, and `addr` zero. Port 0 asks the service to assign a port in `49152..=65535` that is not already bound. Any other port is the requested local port. Ports 67 and 68 belong to the DHCP client. `net_bind` of either returns `Errno.Exist` and allocates no handle. The library waits for the event whose `id` matches. While it waits, it copies every event off the ring. A datagram goes to that handle's queue, whose depth is `APP_DEPTH`. The arriving datagram is dropped when the queue is full, and the library counts that drop. The datagrams already queued stay. A reply stays until the call with its `id` takes it, and it is not dropped to make room for a datagram. One attachment has one outstanding reply. The library does not publish a second `APP_BIND`, `APP_PING`, or `APP_CLOSE` while one of those calls is waiting. `EV_BOUND` carries `status` 0, the new `handle`, and the bound `port`. `EV_ERROR` carries no handle. A second bind of a live port is `Errno.Exist`.
 
-`net_send_to(handle, bytes, address, port)` publishes `APP_SEND_TO` with that handle, the remote port, the remote address, and the bytes at `arena_off`. `length` above 2048 is rejected in the library and is not published. The service checks the private copy, copies `length` bytes from that offset, and wraps them in UDP, IPv4, and Ethernet. The call returns when the request is on the ring. It does not wait for an event. A full request ring waits for `SPACE`, the same way a full frame ring waits.
+`net_send_to(handle, bytes, address, port)` publishes `APP_SEND_TO` with that handle, the remote port, the remote address, and the bytes at `arena_off`. `length` above 2048 is rejected in the library and is not published. So is a length above `mtu - 28`, where `mtu` is the `NetInfo` value and 28 is an IPv4 header with no options plus a UDP header. `NetInfo` returning `Errno.NoDev` rejects the send the same way. The service checks the private copy, copies `length` bytes from that offset, and wraps them in UDP, IPv4, and Ethernet. The call returns when the request is on the ring. It does not wait for an event, and the service does not post `EV_ERROR` for it. A send the service cannot finish increments `send_drops`. A full request ring waits for `SPACE`, the same way a full frame ring waits.
 
-`net_recv_from(handle)` publishes nothing. It decodes the next `EV_DATAGRAM` for that handle and leaves every other event queued. The returned bytes are the payload, the address, and the port from that private copy. `EV_ERROR` for the handle, or `PEER_CLOSE` on the exchange, ends the wait.
+`net_recv_from(handle)` publishes nothing. It returns the next datagram from that handle's queue. The returned bytes are the payload, the address, and the port from that private copy. `EV_ERROR` for the handle, or `PEER_CLOSE` on the exchange, ends the wait.
 
-`net_ping(address)` publishes one `APP_PING` with `handle` 0, port 0, and the echo bytes in the arena. It waits for one event with that `id`. `EV_PING_REPLY` returns those echoed bytes and the peer address. `EV_ERROR` returns the status. There is no count and no interval.
+`net_ping(address)` publishes one `APP_PING` with `handle` 0, port 0, and the echo bytes in the arena. It waits for one event with that `id`. `EV_PING_REPLY` returns those echoed bytes and the peer address. `EV_ERROR` returns the status. A quiet peer, after ARP has resolved, is `Errno.Io` once `PING_DEADLINE_MS` has elapsed. That is the one terminal event. There is no count and no interval.
 
-`net_close(handle)` publishes `APP_CLOSE` with `length` 0 and waits for `EV_CLOSED` with that `id`. The process may then `CapRevoke` the exchange. Process exit detaches even if this call did not run.
+`net_close(handle)` publishes `APP_CLOSE` with `length` 0 and waits for `EV_CLOSED` with that `id`. While it waits, an `EV_DATAGRAM` for that handle is discarded and is not queued. Datagrams for any other handle are still queued. When `EV_CLOSED` is taken, the library drops that handle's queue, the bytes in it, and its drop counter. The handle is not live. A later `net_recv_from` or `net_send_to` on it returns `Errno.BadF` (-9) and does not publish. The service consumes `APP_CLOSE` when it reads it, frees the port, discards a datagram it has not yet posted for that handle, and posts no later `EV_DATAGRAM` for it. `EV_CLOSED` is the one terminal event. The process may then `CapRevoke` the exchange. Process exit detaches even if this call did not run.
 
 A `Bad` slot, a length above 2048, a non-zero `flags` or `_pad`, or an `arena_off` that is not the slot offset, is not dispatched. The consumer advances its private index past it. An occupancy above 32 closes that attachment and does not kill the caller.
 
@@ -457,9 +459,9 @@ Datagram, the first cutover:
 
 - `net_bind(port)` publishes `APP_BIND` and returns the handle from `EV_BOUND`. The handle is not the port.
 - `net_recv_from(handle)` decodes the next `EV_DATAGRAM` for that handle and returns the payload, the peer address, and the peer port.
-- `net_send_to(handle, bytes, address, port)` publishes `APP_SEND_TO` and returns when that request is on the ring.
-- `net_ping(address)` publishes one `APP_PING` and returns the payload of the matching `EV_PING_REPLY`.
-- `net_close(handle)` publishes `APP_CLOSE` and returns after `EV_CLOSED`.
+- `net_send_to(handle, bytes, address, port)` publishes `APP_SEND_TO` and returns when that request is on the ring. A length the link cannot carry is rejected before that publish.
+- `net_ping(address)` publishes one `APP_PING` and returns the payload of the matching `EV_PING_REPLY`. No reply within `PING_DEADLINE_MS` returns `Errno.Io`.
+- `net_close(handle)` publishes `APP_CLOSE`, discards that handle's queued datagrams, and returns after `EV_CLOSED`.
 
 Stream, the TCP milestone, named now so the path is one stack:
 
@@ -472,7 +474,7 @@ No HTTP, TLS, or DNS is defined on top of these calls. DNS stays an application 
 
 ### Datagram receive
 
-A device RX buffer holds a virtio-net header and one Ethernet frame. The ring-1 driver strips the virtio header, checks the frame length, and writes the Ethernet bytes into the RX arena. It stores the RX `write_idx`, then `ShmNotify` with `DATA`. The ring-2 service's `ShmWait` returns that frame object among every hot source. The service checks the destination MAC, the ethertype, the IPv4 header and its checksum, the IPv4 total length, the UDP checksum when it is non-zero, and the UDP ports. Bytes past the IPv4 total length are padding and are not part of the UDP datagram. Header checks run on the private copy of the frame. When the destination port matches a `net_bind`, the service copies the UDP payload into that app's event arena, stores the event `write_idx`, and `ShmNotify` with `DATA`. `net_recv_from` returns those payload bytes. The bytes the application reads are the bytes that followed the UDP header in the device buffer.
+A device RX buffer holds a virtio-net header and one Ethernet frame. The ring-1 driver strips the virtio header, checks the frame length, and writes the Ethernet bytes into the RX arena. It stores the RX `write_idx`, then `ShmNotify` with `DATA`. The ring-2 service's `ShmWait` returns that frame object among every hot source. The service checks the destination MAC, the ethertype, the IPv4 header and its checksum, the IPv4 total length, the UDP checksum when it is non-zero, and the UDP ports. Bytes past the IPv4 total length are padding and are not part of the UDP datagram. Header checks run on the private copy of the frame. When the destination port matches a `net_bind` and the event ring still has its reply slot free, the service copies the UDP payload into that app's event arena, stores the event `write_idx`, and `ShmNotify` with `DATA`. A datagram that would take the reply slot is dropped and counted. `net_recv_from` returns those payload bytes. The bytes the application reads are the bytes that followed the UDP header in the device buffer.
 
 ### Datagram send
 
@@ -510,7 +512,7 @@ The first cutover runs three ring-3 programs. Each program calls `NetAttach` (22
 
 `udp-recv` binds the local port it was given. It waits for one `EV_DATAGRAM` on that handle, prints the payload and the peer address and port from that descriptor, then `net_close`.
 
-`ping` publishes one `APP_PING` and prints the payload of the matching `EV_PING_REPLY`. One echo. No count and no interval.
+`ping` publishes one `APP_PING` and prints the payload of the matching `EV_PING_REPLY`. One echo. No count and no interval. A quiet peer ends as `Errno.Io` after `PING_DEADLINE_MS`.
 
 A second bind of a port that is already live fails inside the service with `Errno.Exist` (-17). The program exits non-zero and holds no new handle.
 
@@ -518,7 +520,7 @@ A second bind of a port that is already live fails inside the service with `Errn
 
 One service for every NIC that later grows a frame-ring pair, or one service per device. ENA is not on the rings yet.
 
-ARP lifetime, the pending-send cap, DHCP retransmission, and the lease timers are decided above. TCP retransmission and congestion numbers are not open on this cutover. They belong to the TCP milestone, which is not part of it.
+ARP lifetime, the pending-send cap, the ping deadline, DHCP retransmission, and the lease timers are decided above. TCP retransmission and congestion numbers are not open on this cutover. They belong to the TCP milestone, which is not part of it.
 
 ## References
 
