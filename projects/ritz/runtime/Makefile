@@ -9,7 +9,8 @@
 #   ritz_start.<arch>.o          - calls main(argc, argv, envp), Linux
 #   ritz_start.harland.<arch>.o  - the same for Harland userspace
 # A `main` of any accepted shape links against it; the compiler adapts a
-# Ritz-native `main(args: Span<StrView>, ...)`.
+# Ritz-native `main(args: Span<StrView>, ...)` (C's argc/argv `main` is
+# refused, AGAST #204).
 #
 # The object list is DERIVED from the .ll files on disk rather than
 # hand-maintained. The previous version listed six rules explicitly, so the

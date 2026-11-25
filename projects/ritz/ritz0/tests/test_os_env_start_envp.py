@@ -9,15 +9,14 @@ children got an empty env.  #3725 only fixed ritzunit's children.
 Every `_start` now stores the kernel's envp in one global, `__ritz_envp`, and
 os/env reads that first, with /proc/self/environ as the fallback:
 
-  - ritz0 emits `_start` inline (all three main shapes, and test mode);
+  - ritz0 emits `_start` inline (both main shapes, and test mode);
   - ritz1 emits one in test mode;
   - runtime/*.ll are the shims build.py and ritz1's links use.
 
 The rows, each able to fail on its own:
 
   - build.py packages that drop dumpable, then env_get("PATH"): ritz0,
-    ritz1 and ritz1_selfhosted, and ritz0 with the 2- and 3-arg main shapes
-    (each picks a different runtime shim);
+    ritz1 and ritz1_selfhosted, and ritz0 with a Span main (the adapter);
   - single-file programs that read `__ritz_envp` directly: ritz0's inline
     `_start` per main shape, and ritz1 linked with each Linux shim;
   - every runtime/*.ll, Harland's included (they can't run here), stores it.
@@ -45,10 +44,11 @@ MARKER = "RZ3737=yes"
 
 # --- build.py packages: drop dumpable, then read the environment ------------
 
+# `()` is the C symbol `_start` calls; a Span main goes through the adapter
+# (main_abi.py). C's argc/argv shapes are refused since #204.
 MAINS = {
     0: "pub fn main() -> i32",
-    2: "pub fn main(argc: i32, argv: **u8) -> i32",
-    3: "pub fn main(argc: i32, argv: **u8, envp: **u8) -> i32",
+    2: "pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32",
 }
 
 NONDUMPABLE = """\
@@ -121,7 +121,6 @@ def _build_pkg(compiler: str, tmp_path: Path, name: str, program: str) -> Path:
     [
         ("ritz0", 0),
         ("ritz0", 2),
-        ("ritz0", 3),
         ("ritz1", 0),
         ("ritz1_selfhosted", 0),
     ],
@@ -173,11 +172,12 @@ fn has_marker(envp: **u8) -> i32
 @CHECK_ENVP@    return 0
 """
 
-SAME_AS_ENVP = "    if envp != __ritz_envp\n        return 4\n"
+# main's `env` views the strings `_start` stored.
+SAME_AS_ENVP = "    if env.len == 0 or env[0].ptr != *__ritz_envp\n        return 4\n"
 
 def _reads_global(arity: int) -> str:
     return READS_GLOBAL.replace("@MAIN@", MAINS[arity]).replace(
-        "@CHECK_ENVP@", SAME_AS_ENVP if arity == 3 else ""
+        "@CHECK_ENVP@", SAME_AS_ENVP if arity == 2 else ""
     )
 
 

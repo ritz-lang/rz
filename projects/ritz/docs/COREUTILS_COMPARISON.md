@@ -352,7 +352,7 @@ Examples with option parsing should use `ritzlib.argspec`:
 
 **Pattern to replace:**
 ```ritz
-# OLD: Manual arg parsing
+# OLD: Manual arg parsing (C's argc/argv main, refused since AGAST #204)
 var i: i32 = 1
 while i < argc
     let arg: *u8 = argv[i]
@@ -365,10 +365,10 @@ while i < argc
 # NEW: Declarative parsing
 import ritzlib.argspec
 
-var all = args_from_argv(argc, argv)
+# in `pub fn main(args: Span<StrView>) -> i32`
 var spec = argspec_new("prog", "Description")
-argspec_switch(@&spec, 'v', "verbose", "Enable verbose")
-match argspec_parse(@spec, args_tail(@all))
+spec.switch('v', "verbose", "Enable verbose")
+match spec.parse(args.from(1))
     Ok(p) => run(p)
     Err(e) => fail(@spec, e)
 ```

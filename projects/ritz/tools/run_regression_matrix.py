@@ -175,7 +175,7 @@ CLANG_C = ["clang", "-c", "-O2", "-march=native"]
 
 _MARKER_RE = re.compile(r"^\s*\[\[test\]\]\s*$", re.MULTILINE)
 _FN_RE = re.compile(r"^fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*(?:->\s*(\w+))?\s*$")
-_MAIN_RE = re.compile(r"^fn\s+main\s*\(", re.MULTILINE)
+_MAIN_RE = re.compile(r"^(pub\s+)?fn\s+main\s*\(", re.MULTILINE)
 
 
 def strip_main(src):
@@ -190,7 +190,7 @@ def strip_main(src):
                 skip = False
             else:
                 continue
-        if re.match(r"^fn\s+main\s*\(", line):
+        if re.match(r"^(pub\s+)?fn\s+main\s*\(", line):
             skip = True
             continue
         out.append(line)
@@ -262,7 +262,7 @@ def selector_arg(index):
 
 
 def build_harness(src, fns):
-    """The file without its main, plus a main that runs fns[argv[1]].
+    """The file without its main, plus a main that runs fns[args[1]].
 
     A test fn's i32 result reaches the process exit status, which keeps only
     the low 8 bits — ritz_matrix_rc maps a nonzero multiple of 256 to 255 so
@@ -293,11 +293,10 @@ def build_harness(src, fns):
             "    if lo == 0\n"
             "        return 255\n"
             "    lo as i32\n\n"
-            "fn main(ritz_matrix_argc: i32, ritz_matrix_argv: **u8, ritz_matrix_envp: **u8) -> i32\n"
-            "    if ritz_matrix_argc < 2\n"
+            "pub fn main(ritz_matrix_args: Span<StrView>) -> i32\n"
+            "    if ritz_matrix_args.len < 2\n"
             "        return 125\n"
-            "    let ritz_matrix_sel: *u8 = ritz_matrix_argv[1]\n"
-            "    let ritz_matrix_k: i32 = ritz_matrix_sel[0] as i32\n"
+            "    let ritz_matrix_k: i32 = ritz_matrix_args[1].ptr[0] as i32\n"
             + "\n".join(arms) + "\n"
             "    126\n")
 

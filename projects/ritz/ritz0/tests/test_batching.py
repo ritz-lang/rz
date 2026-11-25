@@ -27,12 +27,12 @@ def _row(body, entry="    f()\n", top=""):
 # ---- merge: pure text ----------------------------------------------------
 
 @pytest.mark.unit
-def test_rows_become_functions_and_main_dispatches_on_argc():
+def test_rows_become_functions_and_main_dispatches_on_args_len():
     m = batching.merge([_row("fn f() -> i32\n    3\n"), _row("fn f() -> i32\n    4\n")])
     assert "fn __row0() -> i32" in m.text and "fn __row1() -> i32" in m.text
-    assert "pub fn main(argc: i32, argv: **u8) -> i32" in m.text
-    assert "    if argc == 1\n        return __row0()\n" in m.text
-    assert "    if argc == 2\n        return __row1()\n" in m.text
+    assert "pub fn main(__rows: Span<StrView>) -> i32" in m.text
+    assert "    if __rows.len == 1\n        return __row0()\n" in m.text
+    assert "    if __rows.len == 2\n        return __row1()\n" in m.text
     assert m.ok == [True, True]
 
 
@@ -99,7 +99,7 @@ def test_imports_are_hoisted_once():
 
 @pytest.mark.unit
 def test_a_row_with_no_plain_main_is_left_out():
-    rows = [_row("fn f() -> i32\n    3\n"), "fn main(argc: i32, argv: **u8) -> i32\n    0\n"]
+    rows = [_row("fn f() -> i32\n    3\n"), "pub fn main(args: Span<StrView>) -> i32\n    0\n"]
     m = batching.merge(rows)
     assert m.ok == [True, False]
     assert "__row1" not in m.text

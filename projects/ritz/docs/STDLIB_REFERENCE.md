@@ -2695,12 +2695,13 @@ come back as `Result<_, ArgError>` rather than being printed by the parser.
 A lookup `name` matches an option's long name, or its short name if it is one
 byte (`"count"` or `"n"`).
 
-**argv**:
+**Arguments**: `pub fn main(args: Span<StrView>)` already has argv as views
+(LANGUAGE_SPEC §5); `args.from(1)` is the arguments after the program name.
+`args_from_argv` and `args_tail`, which built those from C's `argc`/`argv`,
+went with that shape of `main` (AGAST #204).
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `args_from_argv` | `fn(argc: i32, argv: **u8) -> Vec<StrView>` | Every argv entry, argv[0] included |
-| `args_tail` | `fn(all: @Vec<StrView>) -> Span<StrView>` | The arguments after the program name |
 | `args_get` | `fn(args: @Span<StrView>, i: i64) -> Option<StrView>` | Bounds-checked element |
 
 **Spec**:
@@ -2741,6 +2742,7 @@ import ritzlib.io
 import ritzlib.option
 import ritzlib.result
 import ritzlib.strview
+import ritzlib.span
 import ritzlib.gvec
 import ritzlib.argspec
 
@@ -2757,13 +2759,12 @@ fn fail(spec: @ArgSpec, e: ArgError) -> i32
     spec.error_print(@e)
     2
 
-fn main(argc: i32, argv: **u8) -> i32
-    var all = args_from_argv(argc, argv)
+pub fn main(args: Span<StrView>) -> i32
     var spec = argspec_new("myprogram", "Description")
     spec.switch('v', "verbose", "Enable verbose output")
     spec.option('n', "count", "NUM", "Number of items", Some("10"))
     spec.positionals("FILE", "Input file(s)", 0, ARGS_UNLIMITED)
-    let status: i32 = match spec.parse(args_tail(@all))
+    let status: i32 = match spec.parse(args.from(1))
         Ok(p) => run(p)
         Err(e) => fail(@spec, e)
     status

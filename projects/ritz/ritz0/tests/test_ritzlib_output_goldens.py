@@ -91,14 +91,14 @@ def _golden_body(name: str, start: str, prefix: str) -> str:
 
 
 def _printers_program() -> str:
-    """The goldens' case functions, driven by argv[1] instead of fork."""
+    """The goldens' case functions, driven by args[1] instead of fork."""
     return (
         "import ritzlib.sys\nimport ritzlib.io\nimport ritzlib.strview\n"
         "import ritzlib.timer\nimport ritzlib.iovec\n\n"
         + _golden_body("timer", "fn show(", "timer")
         + _golden_body("iovec", "fn case_empty(", "iovec")
-        + """fn main(argc: i32, argv: **u8) -> i32
-    let which: u8 = *(*(argv + 1))
+        + """pub fn main(args: Span<StrView>) -> i32
+    let which: u8 = args[1].ptr[0]
     if which == '1'
         return timer_body(1)
     if which == '2'

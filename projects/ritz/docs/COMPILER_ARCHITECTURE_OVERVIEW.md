@@ -127,18 +127,12 @@ Compiles to: Program exits with code 42
 ```ritz
 extern fn write(fd: i32, buf: *u8, len: i64) -> i64
 
-fn main(argc: i32, argv: **u8) -> i32
-  var i: i32 = 1
-  while i < argc
-    let s = argv[i]
-    var len: i32 = 0
-    while s[len] != 0
-      len = len + 1
-    
+pub fn main(args: Span<StrView>) -> i32
+  var i: i64 = 1
+  while i < args.len
     if i > 1
       write(1, " ", 1)
-    
-    write(1, s, len)
+    write(1, args[i].ptr, args[i].len)
     i = i + 1
   
   write(1, "\n", 1)

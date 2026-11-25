@@ -355,6 +355,10 @@ def test_floor_accepts_a_main_driven_file():
     """A file with no [[test]] fn runs its main whole: that main is compiled."""
     src = "fn main() -> i32\n    0\n"
     assert matrix.floor_violations({"t": src}, {"ritz1": _results(**{"t::main": "pass"})}) == []
+    # #204: a Span main is `pub` (test_level18's shape).
+    src = "pub fn main(args: Span<StrView>) -> i32\n    0\n"
+    assert matrix.floor_violations({"t": src}, {"ritz1": _results(**{"t::main": "pass"})}) == []
+    assert matrix.strip_main("fn f() -> i32\n    1\n\n" + src) == "fn f() -> i32\n    1\n"
 
 
 @pytest.mark.unit

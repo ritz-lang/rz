@@ -5,8 +5,8 @@ compile and link are most of a row's cost (docs/TESTING.md, "What a ritz0
 pytest case costs"), so a batched test file pays them once per CHUNK rows:
 
 * **Run rows.** Each row's program is merged into one: its `main` becomes
-  `fn __row<i>() -> i32`, and the merged `main(argc, argv)` returns row i's
-  answer when started with i extra arguments.  One compile and one link; each
+  `fn __row<i>() -> i32`, and the merged `pub fn main(__rows: Span<StrView>)`
+  returns row i's answer when started with i extra arguments.  One compile and one link; each
   row then runs in its own process, so a crash or a stray global in one row
   is that row's alone.
 * **Refusal rows.** All three compilers report every error in a file, so the
@@ -237,10 +237,10 @@ def merge(programs: list) -> Merged:
             out += [*text.rstrip("\n").split("\n"), ""]
         regions.append((start, len(out) - 1))
         marks.append(None)
-    out.append("pub fn main(argc: i32, argv: **u8) -> i32")
+    out.append("pub fn main(__rows: Span<StrView>) -> i32")
     for i, good in enumerate(ok):
         if good:
-            out += [f"    if argc == {i + 1}", f"        return {_ROW_FN.format(i)}()"]
+            out += [f"    if __rows.len == {i + 1}", f"        return {_ROW_FN.format(i)}()"]
     out += ["    0", ""]
 
     # Each MARK is in its own row's lines: note where, then take it out.

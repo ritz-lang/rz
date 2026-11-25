@@ -226,8 +226,10 @@ RUNS = {
     # so a loan of another element doesn't stand in its way (AGAST #4160).
     "field_store_through_pointer": (NEST, """\
     var x: Inner
+    x.v = 0
     var n: Nest
     n.cells[0].p = @x
+    n.cells[1].c.v = 0   # read below; `var` leaves it uninitialised
     let p: @Outer = @n[1]
     n[0].p.v = 4
     if x.v != 4 or p.c.v != 0

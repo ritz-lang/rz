@@ -2064,7 +2064,8 @@ fn main(args: Span<StrView>) -> i32
     0
 ```
 
-There is one entry path. The runtime's `_start` calls the C symbol
+There is one entry path. The runtime's `_start` (`runtime/ritz_start*.ll`,
+one per OS; ritz0 can emit the same one inline) calls the C symbol
 `main(argc, argv, envp)`. For a `main` that takes spans or returns nothing,
 the compiler names the fn `__ritz_main` and adds that `main` as an adapter
 written in Ritz. It builds the spans once and calls the fn.
@@ -2080,10 +2081,18 @@ pub fn main(args: Span<StrView>) -> i32
     0
 ```
 
-*Transitional:* the C shapes `main(argc: i32, argv: **u8) -> i32` and
-`main(argc: i32, argv: **u8, envp: **u8) -> i32` are still accepted, and so is
-a `main` without `pub` in a C shape, until the workspace migrates (AGAST #203).
-Both are removed in #204.
+C's `main(argc: i32, argv: **u8)` and `main(argc, argv, envp)` are not Ritz
+shapes. They are refused at `main`, with or without `pub` and whatever the
+parameter names, and the message names the replacement (AGAST #204):
+
+```ritz expect-error="`main` takes `Span<StrView>`, not C's `argc`/`argv`: write `pub fn main(args: Span<StrView>)`"
+pub fn main(argc: i32, argv: **u8) -> i32
+    0
+```
+
+`pub` may be left off `main()`; a `main` that takes spans must be `pub`.
+`fn main() -> i32` takes no adapter: it is the symbol `_start` calls, and
+it may call itself.
 
 ---
 

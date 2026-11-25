@@ -1,10 +1,13 @@
 ; Ritz Runtime Entry Point: the one `_start` (docs/V1_ABI_CLEANUP.md, AGAST #200)
 ;
 ; Every program is entered here and calls `main(argc, argv, envp)`.
-; A C-shaped `main()` / `main(argc, argv)` ignores the registers it does not
-; take (SysV); a Ritz-native `pub fn main(args: Span<StrView>, ...)` is reached
-; through the adapter `main` the compiler adds (ritz0/main_abi.py,
-; ritz1/src/main_abi.ritz), which builds the spans in Ritz.
+; A user's `fn main() -> i32` ignores the registers (SysV); every other
+; `main` (`pub fn main(args: Span<StrView>, ...)`, or one returning nothing) is
+; reached through the adapter `main` the compiler adds (ritz0/main_abi.py,
+; ritz1/src/main_abi.ritz), which builds the spans in Ritz. C's argc/argv
+; `main` is refused (AGAST #204). This shim is the one entry stub the runtime
+; needs: the kernel enters at `_start` with argc/argv/envp on the stack, not in
+; registers, and with no return address.
 ;
 ; Stack layout at _start:
 ;   (%rsp)     = argc

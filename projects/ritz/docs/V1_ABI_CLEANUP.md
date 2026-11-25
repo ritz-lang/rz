@@ -2,8 +2,9 @@
 
 **Status:** Phase 1 (runtime + `main` ABI, AGAST #200) landed on main for
 ritz0 and ritz1, 2026-11-18. Phase 2 (Writer, Display, format specs, #201)
-landed 2026-11-20; see "Phase 2 as built". Phases 3-5 (#202-#204) follow,
-one room each, in order. Redone on current main after Aaron's decision of 2026-11-18 (#198:
+landed 2026-11-20; see "Phase 2 as built". Phases 3-4 (#202, #203) landed
+after it, and Phase 5 (#204, 2026-11-25) refused C's `argc`/`argv` mains; see
+"Phase 5 as built". Redone on current main after Aaron's decision of 2026-11-18 (#198:
 "Hell yeah, redo that shit. Ritz-ify it.").
 **Driver:** AGAST `#198` (with phase subtasks).
 
@@ -114,10 +115,9 @@ compiles a single file without `--no-runtime`. It always calls the C symbol
 every `link_runtime` freestanding binary. The `main_args` manifest key and the
 arity-based shim choice are gone.
 
-- A **C-shaped** `main` (`()`, `(argc: i32, argv: **u8)`,
-  `(argc: i32, argv: **u8, envp: **u8)`) returning `i32` *is* that symbol. On
-  SysV x86-64 a callee ignores argument registers it doesn't declare, so one
-  call site serves all three.
+- `fn main() -> i32` *is* that symbol. On SysV x86-64 a callee ignores
+  argument registers it doesn't declare. C's `(argc: i32, argv: **u8)` and
+  `(argc, argv, envp)` were that symbol too until #204, which refuses them.
 - A **Ritz-native** `main` (one taking `Span<StrView>`), or any `main` with no
   return type, is renamed `__ritz_main`. The compiler adds an adapter written
   in Ritz:
@@ -130,7 +130,7 @@ arity-based shim choice are gone.
   (or `__ritz_main(...)` then `0` when the user's main returns nothing). For a
   Span main, three small runtime fns come with it: `__ritz_views`,
   `__ritz_args` and `__ritz_env`. They make one `mmap` for the views, then
-  measure each string. A C-shaped program pays nothing.
+  measure each string. `main()` pays nothing.
 
 *Why an adapter, when the 2026-05 plan said "no synthesized adapter"?* That
 plan wanted the user's `main` emitted directly with the canonical
@@ -185,7 +185,7 @@ kernel exec()                      ← stack: argc, argv[], NULL, envp[], NULL, 
   ↓
 _start (~10 lines asm)             ← runtime/ritz_start.<os>.x86_64.ll — forced by kernel ABI
   ↓                                   stores envp in __ritz_envp
-main(argc, argv, envp) -> i32      ← C-shaped user main, or the compiler's Ritz adapter
+main(argc, argv, envp) -> i32      ← the user's `fn main() -> i32`, or the compiler's Ritz adapter
   ↓  (adapter only)                   __ritz_args / __ritz_env build the Span<StrView>s
 __ritz_main(args, env)             ← the user's Ritz-native main
 ```
@@ -193,8 +193,9 @@ __ritz_main(args, env)             ← the user's Ritz-native main
 ### Compiler enforcement (as built; ritz0 and ritz1 alike)
 
 - The shape is matched by parameter types (names are free): `()`,
-  `(Span<StrView>)`, `(Span<StrView>, Span<StrView>)`, and, until #204, the C
-  shapes. Anything else, or a generic, `extern` or `= extern` main, is an
+  `(Span<StrView>)`, `(Span<StrView>, Span<StrView>)`. C's `(i32, **u8)` and
+  `(i32, **u8, **u8)` give ``error: `main` takes `Span<StrView>`, not C's
+  `argc`/`argv`: write `pub fn main(args: Span<StrView>)` `` (#204). Anything else, or a generic, `extern` or `= extern` main, is an
   error at `main`: ``error: `main` must take `()`, `(args: Span<StrView>)` or
   `(args: Span<StrView>, env: Span<StrView>)` ``.
 - A return type other than `i32` (or `void`/none) gives
@@ -205,11 +206,8 @@ __ritz_main(args, env)             ← the user's Ritz-native main
   (ritz0 used to return the tail).
 - In test mode the file's `main` is dropped (the runner supplies one), so it is
   not checked. An `async fn main` keeps its own synchronous wrapper.
-- **Transitional until #204:** C-shaped mains, and `fn main` without `pub` in a
-  C shape, are still accepted. Rejecting them now would mean migrating 268
-  `.ritz` files and about 700 test sources in the same commit, which is #203's
-  job.
-- Diagnostics inside an adapted main currently name it `__ritz_main` (#4018).
+- `main()` may leave off `pub` (see Phase 5 as built).
+- Diagnostics inside an adapted main name it `main` (#4018).
 - `pub` on main has no linkage effect. Both compilers give `main` external
   linkage by name (ritz0 `emitter_llvmlite._declare_function`, ritz1
   `emitter.fn_linkage`), so the old question of whether a non-pub `main` was
@@ -488,6 +486,36 @@ wins.
    'c' → error in both compilers). The adapter then serves every program.
 2. Remove any dead code paths the legacy main signatures referenced.
 
+### Phase 5 as built (#204, 2026-11-25)
+
+- **C's mains are refused** at `main`, in both compilers, with MSG_C (above),
+  whatever the parameter names and with or without `pub`. `main_abi.shape`
+  still names the shape (`'c'`) so the message can say what to write.
+- **Callers ported:** ritz1's own `main` takes `argv: Span<StrView>` and
+  `parse_cli` reads views (the bootstrap closes on it);
+  `ritz0/test/test_level18.ritz` reads `env: Span<StrView>`; the harness
+  mains that were C-shaped (the regression matrix's, `ritz0/harness/batching`'s,
+  the output goldens', `test_os_env_start_envp`'s) take a `Span<StrView>`.
+- **Dead code:** the adapter's C-argument path (`C_ARGS`, ritz1's
+  non-span branch) and ritzlib.argspec's `args_from_argv` / `args_tail`,
+  which built a `Span<StrView>` out of C's `argc`/`argv`; `args.from(1)` is
+  that now.
+- **Shims:** of the three shims the ticket names, the arity variants
+  `ritz_start_envp.x86_64.ll` and `ritz_start_noargs.x86_64.ll` were already
+  gone (#3913, then #200's one entry path). What stays is one `_start` per OS,
+  `runtime/ritz_start.x86_64.ll` and `runtime/ritz_start.harland.x86_64.ll`.
+  The kernel enters a process at `_start` with argc/argv/envp on the stack,
+  not in registers, and no Ritz fn can be entered with an unaligned stack and
+  no return address, so ~10 lines of asm must exist. The shim also stores
+  `__ritz_envp` for ritzlib.os.env and defines the weak `ritz_platform_*`
+  hooks (#4119). ritz0's inline `_start` is the same code for single-file
+  builds.
+- **Not refused: `fn main()` without `pub`.** Step 1 above also proposed
+  refusing it. It is the no-argument native shape, not a C one: nothing
+  about it is `argc`/`argv`, it needs no adapter, and requiring `pub` would
+  change about 5,600 test sources and the spec's own examples for no
+  difference in behaviour. A Span main must still be `pub`.
+
 ## Backwards compatibility
 
 None is promised; Ritz is pre-v1. Between phases, main stays green and both
@@ -504,7 +532,7 @@ forms work. Phase 5 removes the old ones in one commit.
    below, for the reasons under "One entry path".
 8. **Legacy mains — RESOLVED: accepted until #204.** This replaces "no
    deprecation window" in 4 below. A hard cutover on main would be the whole
-   of Phase 4 inside Phase 1.
+   of Phase 4 inside Phase 1. #204 refused them (2026-11-25).
 
 ## Decision log (resolved 2026-05-06)
 

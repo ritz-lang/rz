@@ -17,10 +17,10 @@ Each RUNS row can fail for its own reason:
               (ritz0 returned the tail; ritz1 emitted `void @main`)
   unit        `pub fn main()`, the zero-ceremony shape, also returns 0
               over an i32 tail (ritz0 returned the tail)
-  c_noret     a C-shaped main with no return type (`-> void` is none) gets
-              argc/argv through the adapter
-Each REFUSED row is one message. The C shapes' own behaviour is every other
-test in the suite.
+  unit_i32    `fn main() -> i32` is the C symbol itself: no adapter, and
+              it may call itself (#4198 refuses only an adapted main's calls)
+Each REFUSED row is one message. #204 removed C's `(argc: i32, argv: **u8)`
+and `(argc, argv, envp)`: they are refused at `main` with MSG_C.
 """
 
 import os
@@ -67,17 +67,16 @@ fn seven() -> i32
 pub fn main()
     seven()
 """, 0),
-    "c_noret": ("""\
-fn main(argc: i32, argv: **u8) -> void
-    let n: i32 = argc
-""", 0),
-    # #4198: a C-shaped main is the C symbol itself, so it may still call
-    # itself; only an adapted main's calls are refused (REFUSED below).
-    "c_recursive": ("""\
-fn main(argc: i32, argv: **u8) -> i32
-    if argc < 5
-        return main(argc + 1, argv)
-    argc
+    # #4198: a main that takes the C symbol directly may call itself; only
+    # an adapted main's calls are refused (REFUSED below).
+    "unit_i32": ("""\
+var n: i32 = 0
+
+fn main() -> i32
+    n = n + 1
+    if n < 5
+        return main()
+    n
 """, 5),
 }
 
@@ -100,6 +99,10 @@ REFUSED = {
     "three_spans": ("^pub fn main(a: Span<StrView>, b: Span<StrView>, c: Span<StrView>) -> i32\n    0\n",
                     main_abi.MSG_SHAPE),
     "ret": ("^pub fn main() -> i64\n    0\n", main_abi.MSG_RET),
+    # #204: C's argc/argv shapes are refused at `main`, `pub` or not,
+    # whatever the names, with or without envp; MSG_C names the replacement.
+    "c_argv": ("^fn main(c: i32, v: **u8) -> i32\n    0\n", main_abi.MSG_C),
+    "c_envp": ("^pub fn main(argc: i32, argv: **u8, envp: **u8) -> i32\n    0\n", main_abi.MSG_C),
     "not_pub": ("^fn main(args: Span<StrView>) -> i32\n    0\n", main_abi.MSG_PUB),
     # #4018: a diagnostic inside an adapted main names it `main`, not
     # `__ritz_main`. One row per message that names the enclosing fn (the
@@ -141,7 +144,7 @@ def test_ritz1_says_and_generates_what_ritz0_does():
     """The messages and the runtime text are one spec in two compilers;
     the run/refuse rows above check behaviour, this checks the bytes."""
     ritz1 = _ritz_strings(RITZ1_MAIN_ABI.read_text())
-    for text in (main_abi.MSG_SHAPE, main_abi.MSG_RET, main_abi.MSG_PUB, main_abi.MSG_CALL,
+    for text in (main_abi.MSG_SHAPE, main_abi.MSG_C, main_abi.MSG_RET, main_abi.MSG_PUB, main_abi.MSG_CALL,
                  main_abi.RUNTIME_SOURCE):
         assert text in ritz1, f"ritz1/src/main_abi.ritz lacks:\n{text}"
 

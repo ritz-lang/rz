@@ -1,31 +1,31 @@
-"""The program entry ABI (docs/V1_ABI_CLEANUP.md, AGAST #200).
+"""The program entry ABI (docs/V1_ABI_CLEANUP.md, AGAST #200, #204).
 
 There is one entry path. The runtime's only `_start`
 (`runtime/ritz_start*.ll`, or the one ritz0 embeds) calls the C symbol
-`main(argc, argv, envp)`. A `main` written in that C shape, `()`,
-`(argc: i32, argv: **u8)` or `(argc, argv, envp)`, returning `i32`, *is* that
-symbol, as before.
-
-The Ritz-native shapes are
+`main(argc, argv, envp)`. A user's `main` takes one of
 
     pub fn main()
     pub fn main(args: Span<StrView>)
     pub fn main(args: Span<StrView>, env: Span<StrView>)
 
 each with or without `-> i32`. Where `-> i32` is left off, main returns 0.
-For these shapes the user's fn becomes `__ritz_main`, and this pass adds
-an adapter `main(argc, argv, envp) -> i32`, written in Ritz (`adapter_source`),
-that builds the spans and calls it. A `main` with no return type takes
-the adapter even with no params, so it returns 0 under both compilers (ritz1
-used to emit `void @main` and exit with whatever was in rax).
+`fn main() -> i32` *is* the C symbol: `_start`'s registers are simply
+unused. Every other shape becomes `__ritz_main`, and this pass adds an
+adapter `main(argc, argv, envp) -> i32`, written in Ritz
+(`adapter_source`), that builds the spans and calls it. A `main` with no
+return type takes the adapter even with no params, so it returns 0 under
+both compilers (ritz1 used to emit `void @main` and exit with whatever was
+in rax).
 
 ritz1 does the same in ritz1/src/main_abi.ritz. Messages and the adapter
 text are identical in both; test_main_abi.py holds them to that.
 
 `main` must not be generic, `extern` or a declaration. Any other parameter
 list or return type is refused (`check_main`). A `Span<StrView>` main must be
-`pub`. A legacy C-shaped main without `pub` is still accepted until the
-workspace migration (#203) and the cleanup (#204).
+`pub`; `()` may leave `pub` off. C's `(argc: i32, argv: **u8)` and
+`(argc, argv, envp)` were accepted until the workspace migrated (#203); #204
+refuses them with MSG_C, which names the replacement. The adapter is the
+only `main` with that signature, and it is generated after this check.
 """
 from typing import List, Optional
 
@@ -42,6 +42,8 @@ def display_name(name: str) -> str:
 
 MSG_SHAPE = ("`main` must take `()`, `(args: Span<StrView>)` or "
              "`(args: Span<StrView>, env: Span<StrView>)`")
+MSG_C = ("`main` takes `Span<StrView>`, not C's `argc`/`argv`: "
+         "write `pub fn main(args: Span<StrView>)`")
 MSG_RET = "`main` must return `i32` or nothing"
 MSG_PUB = "`main` taking `Span<StrView>` must be `pub`: write `pub fn main(...)`"
 # A call to `main` in a program whose main took the adapter would bind to
@@ -50,8 +52,8 @@ MSG_PUB = "`main` taking `Span<StrView>` must be `pub`: write `pub fn main(...)`
 MSG_CALL = "`main` is the program's entry point and cannot be called"
 
 # The runtime half of the entry path, in Ritz: one `mmap` for the views,
-# then a `strlen` per string. Added only for a Span main, so a C-shaped
-# program pays nothing. SYS_mmap is 9, PROT_READ|PROT_WRITE is 3,
+# then a `strlen` per string. Added only for a main with params, so
+# `main()` pays nothing. SYS_mmap is 9, PROT_READ|PROT_WRITE is 3,
 # MAP_PRIVATE|MAP_ANONYMOUS is 0x22. The mmap is Linux's, and serves
 # Harland too: its mmap is also 9, has the same flag values and reads the
 # first four arguments (indium's span_args boots it in init's Tier-1 suite,
@@ -119,11 +121,12 @@ def returns_value(fn: rast.FnDef) -> bool:
 
 
 def shape(fn: rast.FnDef) -> Optional[str]:
-    """'c' for a C-shaped param list, 'span' for a Ritz-native one, None if
-    neither."""
+    """'unit' for `()`, 'span' for a Ritz-native param list, 'c' for C's
+    refused `(argc: i32, argv: **u8[, envp: **u8])`, None for anything
+    else."""
     types = [p.type for p in fn.params]
     if not types:
-        return "c"
+        return "unit"
     if all(_is_span_strview(t) for t in types) and len(types) <= 2:
         return "span"
     if (len(types) in (2, 3) and _is_named(types[0], "i32")
@@ -146,6 +149,8 @@ def check_main(fn: rast.FnDef) -> List[str]:
     kind = shape(fn)
     if kind is None or fn.type_params or fn.is_extern or fn.is_decl:
         return [where + MSG_SHAPE]
+    if kind == "c":
+        return [where + MSG_C]
     if returns_value(fn) and not _is_named(fn.ret_type, "i32"):
         return [where + MSG_RET]
     if kind == "span" and not fn.is_pub:
@@ -158,15 +163,13 @@ def needs_adapter(fn: rast.FnDef) -> bool:
 
 
 SPAN_ARGS = ("__ritz_args(argc, argv)", "__ritz_env(envp)")
-C_ARGS = ("argc", "argv", "envp")
 
 
 def adapter_source(fn: rast.FnDef) -> str:
     """The `main` the C entry calls: it calls `__ritz_main` (the user's
-    main) with what it takes, and returns its i32, or 0 if it returns
+    main) with the spans it takes, and returns its i32, or 0 if it returns
     nothing."""
-    pool = SPAN_ARGS if shape(fn) == "span" else C_ARGS
-    args = pool[:len(fn.params)]
+    args = SPAN_ARGS[:len(fn.params)]
     returns = returns_value(fn)
     call = f"{ADAPTED_NAME}({', '.join(args)})"
     body = f"    return {call}\n" if returns else f"    {call}\n    0\n"
@@ -188,7 +191,7 @@ def lower_main(module: rast.Module, source_path: str) -> List[str]:
         return errors
     from module_interface import parse_source_tokens
     text = adapter_source(fn)
-    if shape(fn) == "span" and fn.params:
+    if fn.params:
         text += "\n" + RUNTIME_SOURCE
     _, generated = parse_source_tokens(text, source_path)
     fn.name = ADAPTED_NAME

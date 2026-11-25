@@ -6171,9 +6171,9 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # We need to emit this as raw IR text since llvmlite doesn't support naked functions
         # This will be appended after the module is stringified
         # One entry path (docs/V1_ABI_CLEANUP.md, AGAST #200): every `main`
-        # is called as `main(argc, argv, envp)`. A C-shaped `main()` or
-        # `main(argc, argv)` ignores the extra registers (SysV), and a
-        # Ritz-native main is reached through the adapter main_abi.py adds.
+        # is called as `main(argc, argv, envp)`. A user's `fn main() -> i32`
+        # ignores the registers (SysV); every other main is reached through
+        # the adapter main_abi.py adds.
 
         # Exit syscall number depends on target OS
         if self.target_os == 'harland':

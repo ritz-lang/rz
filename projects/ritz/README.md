@@ -113,14 +113,13 @@ fn main() -> i32
 ```
 
 ```ritz
-import ritzlib.sys
 import ritzlib.io
 
-fn main(argc: i32, argv: **u8) -> i32
-    let name: *u8 = *(argv + 1)
-    prints("Hello, ")
-    prints(name)
-    prints("!\n")
+pub fn main(args: Span<StrView>) -> i32
+    if args.len < 2
+        return 1
+    let name: StrView = args[1]
+    print("Hello, {name}!\n")
     0
 ```
 
