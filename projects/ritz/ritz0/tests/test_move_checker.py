@@ -1305,6 +1305,31 @@ impl Wrap
                            "        return self.r.burn()\n\n    fn peek(self:& Wrap) -> i32\n"
                            "        return self.r.look()\n" + main, 7)})
 
+    @pytest.mark.integration
+    @pytest.mark.parametrize("compiler", COMPILERS)
+    def test_every_compiler_runs_a_borrowing_receiver_through_a_reference(
+            self, tmp_path, compiler):
+        """Control: `self.r.m(x)` through a lent root is no move when `m`
+        borrows its receiver, whether as `@Res`, `self:& Res` or a bare
+        `self:&` (AGAST #4657 fix-forward: ritz1 refused prism's
+        `self.damage.add_damage(..)` with `add_damage(self:&, ..)`)."""
+        tap = "impl Res\n    fn tap(self:&, x: i32) -> i32\n        return self.h + x\n\n"
+        uses = "self.r.look() + self.r.keep() + self.r.tap(1)"
+        roots = {
+            "self_param": ("fn spend(self:& Wrap) -> i32", uses),
+            "bare_self_param": ("fn spend(self:&) -> i32", uses),
+            "self_mut_ref": ("fn spend(self: @&Wrap) -> i32", uses),
+            # An `@Wrap` lends its fields read-only: `@Res` methods only.
+            "self_ref": ("fn spend(self: @Wrap) -> i32", "self.r.look() * 3 + 1"),
+        }
+        main = ("\nfn via(w:& Wrap) -> i32\n    return w.r.tap(0)\n\n"
+                "fn main() -> i32\n    var w = Wrap { r: Res { h: 2 } }\n"
+                "    return w.spend() + via(w)\n")
+        assert_runs(compiler, tmp_path, {
+            name: (self.DEFS + tap + "impl Wrap\n    " + sig + "\n        return "
+                   + body + "\n" + main, 9)
+            for name, (sig, body) in roots.items()})
+
     # AGAST #2178: a match that owns nothing (`match t` of a `:&` param,
     # `match @s`, a scrutinee read through a pointer) binds a copy of the
     # payload. Its owner still drops the original, so moving the copy out
