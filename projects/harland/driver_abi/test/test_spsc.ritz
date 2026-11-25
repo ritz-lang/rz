@@ -1,0 +1,357 @@
+# Harland SPSC frame ring protocol (AGAST #4726)
+#
+# RING1_DRIVER.md PR 6's host tests of driver_abi.spsc, run on a frame
+# region in a host global: one publish/consume single-stepped, a full ring
+# that waits for read_idx, bad slots and impossible indexes rejected
+# without exiting, Timeout on an empty ring past the deadline, and a
+# validated length that a later write to the shared descriptor does not
+# change. Every "peer" write is a plain or atomic store to the shared
+# region, which is all a hostile peer can do.
+
+import driver_abi.frame_ring { FrameDesc, SpscCtrl, FRAME_RING_CAP, FRAME_MAX, FRAME_REGION_SIZE, FRAME_RX_ARENA_OFF }
+import driver_abi.spsc { SpscRing, SpscProducer, SpscConsumer, SpscClose, Reject, Publish, Poll, Take, FrameBuf, spsc_rx_ring, spsc_tx_ring, frame_desc_validate, frame_slot_off }
+
+# The frame region, u64s so the control words are 8-aligned.
+var g_region: [FRAME_REGION_SIZE / 8]u64
+# The consumer's private frame.
+var g_buf: FrameBuf
+# One byte longer than a slot.
+var g_too_long: [FRAME_MAX + 1]u8
+
+# Zero the controls and descriptors (the first FRAME_RX_ARENA_OFF bytes),
+# as the kernel zeroes a new region, and return its address.
+fn fresh_region() -> u64
+    for i in 0..FRAME_RX_ARENA_OFF / 8
+        g_region[i] = 0
+    @g_region as u64
+
+fn is_done(p: Publish) -> bool
+    match p
+        Publish.Done => true
+        _ => false
+
+fn is_full(p: Publish) -> bool
+    match p
+        Publish.Full => true
+        _ => false
+
+fn is_frame(t: Take, len: u32) -> bool
+    match t
+        Take.Frame(n) => n == len
+        _ => false
+
+fn is_rejected(t: Take, why: Reject) -> bool
+    match t
+        Take.Rejected(w) => w == why
+        _ => false
+
+fn is_close(t: Take, why: SpscClose) -> bool
+    match t
+        Take.Close(w) => w == why
+        _ => false
+
+fn is_empty(p: Poll) -> bool
+    match p
+        Poll.Empty => true
+        _ => false
+
+# Publish a one-byte frame holding `b`.
+fn publish_byte(p: @&SpscProducer, b: u8) -> Publish
+    let f: [1]u8 = [b]
+    p.publish(@f)
+
+# ---------------------------------------------------------------------------
+# 1. One publish and consume, single-stepped
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_publish_consume_single_stepped() -> i32
+    let ring = spsc_rx_ring(fresh_region())
+    var p = SpscProducer.new(ring)
+    var c = SpscConsumer.new(ring)
+    let frame: [5]u8 = [1, 2, 3, 4, 5]
+
+    # Step 1: the bytes and descriptor are written, the index is not.
+    if not is_done(p.stage(@frame))
+        return 1
+    if atomic_load(@ring.ctrl.write_idx) != 0 or p.write != 0
+        return 2
+    # The consumer does not read a slot at or past the index it loaded.
+    if not is_empty(c.poll(0, 10))
+        return 3
+
+    # Step 2: the index store publishes it and bumps the wake word.
+    if not p.commit()
+        return 4
+    if atomic_load(@ring.ctrl.write_idx) != 1 or atomic_load(@ring.ctrl.wake) != 1
+        return 5
+    if p.commit()                    # nothing staged: no second publish
+        return 6
+    if atomic_load(@ring.ctrl.write_idx) != 1
+        return 7
+
+    # The consumer copies the descriptor; poll does not release the slot.
+    let desc = match c.poll(0, 10)
+        Poll.Ready(d) => d
+        _ => return 8
+    if desc.length != 5 or desc.arena_off != 0 or desc.flags != 0
+        return 9
+    if atomic_load(@ring.ctrl.read_idx) != 0
+        return 10
+
+    if not is_frame(c.take(desc, @&g_buf), 5)
+        return 11
+    for i in 0..5
+        if g_buf.bytes[i] != frame[i]
+            return 12
+    if atomic_load(@ring.ctrl.read_idx) != 1 or c.read != 1
+        return 13
+    if not is_empty(c.poll(0, 10))
+        return 14
+    0
+
+# ---------------------------------------------------------------------------
+# 2. A full ring waits for read_idx; it does not drop or overwrite
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_full_ring_waits_for_read_idx() -> i32
+    let ring = spsc_tx_ring(fresh_region())
+    var p = SpscProducer.new(ring)
+    var c = SpscConsumer.new(ring)
+    for i in 0..FRAME_RING_CAP
+        if not is_done(publish_byte(@&p, i as u8))
+            return 1
+    if p.write != FRAME_RING_CAP or atomic_load(@ring.ctrl.write_idx) != FRAME_RING_CAP
+        return 2
+
+    # Slot 0 is unreleased: publish neither advances nor writes it.
+    for i in 0..3
+        if not is_full(publish_byte(@&p, 0xEE))
+            return 3
+    if p.write != FRAME_RING_CAP or atomic_load(@ring.ctrl.write_idx) != FRAME_RING_CAP
+        return 4
+    if atomic_load(@ring.ctrl.wake) != FRAME_RING_CAP as u32
+        return 5
+
+    # The consumer releases slot 0; the next publish lands in it.
+    if not is_frame(c.next(@&g_buf, 0, 1), 1) or g_buf.bytes[0] != 0
+        return 6
+    if not is_done(publish_byte(@&p, 0xAB))
+        return 7
+    if atomic_load(@ring.ctrl.write_idx) != FRAME_RING_CAP + 1
+        return 8
+    if not is_full(publish_byte(@&p, 0xEE))
+        return 9
+
+    # Every frame comes out once, in order; the 257th wrapped to slot 0.
+    for i in 1..FRAME_RING_CAP
+        if not is_frame(c.next(@&g_buf, 0, 1), 1) or g_buf.bytes[0] != i as u8
+            return 10
+    if not is_frame(c.next(@&g_buf, 0, 1), 1) or g_buf.bytes[0] != 0xAB
+        return 11
+    if not is_empty(c.poll(0, 1))
+        return 12
+    0
+
+# ---------------------------------------------------------------------------
+# 3. Bad slots and impossible indexes are rejected without exiting
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_bad_descriptors_rejected_and_skipped() -> i32
+    let ring = spsc_rx_ring(fresh_region())
+    var p = SpscProducer.new(ring)
+    var c = SpscConsumer.new(ring)
+    for i in 0..6
+        if not is_done(publish_byte(@&p, i as u8))
+            return 1
+
+    # The peer rewrites shared descriptors 0..3 after publishing them.
+    (*ring.descs)[0].length = 0
+    (*ring.descs)[1].length = FRAME_MAX as u32 + 1
+    (*ring.descs)[2].flags = 1
+    (*ring.descs)[3].arena_off = frame_slot_off(4) as u32
+
+    if not is_rejected(c.next(@&g_buf, 0, 1), Reject.Length)
+        return 2
+    if not is_rejected(c.next(@&g_buf, 0, 1), Reject.Length)
+        return 3
+    if not is_rejected(c.next(@&g_buf, 0, 1), Reject.Flags)
+        return 4
+    if not is_rejected(c.next(@&g_buf, 0, 1), Reject.Offset)
+        return 5
+    # Each reject stored read_idx past its slot, so the ring is not pinned.
+    if c.read != 4 or atomic_load(@ring.ctrl.read_idx) != 4
+        return 6
+    if not is_frame(c.next(@&g_buf, 0, 1), 1) or g_buf.bytes[0] != 4
+        return 7
+
+    # The edges of the length range are good.
+    (*ring.descs)[5].length = FRAME_MAX as u32
+    if not is_frame(c.next(@&g_buf, 0, 1), FRAME_MAX as u32)
+        return 8
+    0
+
+[[test]]
+fn test_impossible_occupancy_closes() -> i32
+    let ring = spsc_rx_ring(fresh_region())
+    var p = SpscProducer.new(ring)
+    var c = SpscConsumer.new(ring)
+    for i in 0..3
+        if not is_done(publish_byte(@&p, i as u8))
+            return 1
+    if not is_frame(c.next(@&g_buf, 0, 1), 1)
+        return 2
+
+    # Occupancy above FRAME_RING_CAP: the peer's write_idx jumps ahead.
+    atomic_store(@ring.ctrl.write_idx, c.read + FRAME_RING_CAP + 1)
+    if not is_close(c.next(@&g_buf, 0, 1), SpscClose.Overfull)
+        return 3
+    # Exactly FRAME_RING_CAP is a full ring, not a close.
+    atomic_store(@ring.ctrl.write_idx, c.read + FRAME_RING_CAP)
+    match c.poll(0, 1)
+        Poll.Ready(_) => pass
+        _ => return 4
+
+    # A backwards write_idx, behind the private read_idx.
+    atomic_store(@ring.ctrl.write_idx, c.read - 1)
+    if not is_close(c.next(@&g_buf, 0, 1), SpscClose.Backwards)
+        return 5
+    # A close moved nothing: the private and shared read_idx stand.
+    if c.read != 1 or atomic_load(@ring.ctrl.read_idx) != 1
+        return 6
+
+    # The producer closes on a read_idx past its private write_idx.
+    atomic_store(@ring.ctrl.read_idx, p.write + 1)
+    match publish_byte(@&p, 9)
+        Publish.Close(why) =>
+            if why != SpscClose.Backwards
+                return 7
+        _ => return 8
+    if p.write != 3 or atomic_load(@ring.ctrl.write_idx) != c.read - 1
+        return 9
+    0
+
+[[test]]
+fn test_rewound_shared_index_ignored() -> i32
+    let ring = spsc_rx_ring(fresh_region())
+    var p = SpscProducer.new(ring)
+    var c = SpscConsumer.new(ring)
+    for i in 0..4
+        if not is_done(publish_byte(@&p, 10 + i as u8))
+            return 1
+    for i in 0..2
+        if not is_frame(c.next(@&g_buf, 0, 1), 1)
+            return 2
+
+    # The producer rewinds the shared copy of the consumer's read_idx. The
+    # consumer reads slot 2, not slot 0, and its store overwrites the word.
+    atomic_store(@ring.ctrl.read_idx, 0)
+    if not is_frame(c.next(@&g_buf, 0, 1), 1) or g_buf.bytes[0] != 12
+        return 3
+    if atomic_load(@ring.ctrl.read_idx) != 3
+        return 4
+
+    # The consumer rewinds the shared copy of the producer's write_idx. The
+    # producer's next store overwrites it from the private index.
+    atomic_store(@ring.ctrl.write_idx, 0)
+    if not is_close(c.next(@&g_buf, 0, 1), SpscClose.Backwards)
+        return 5
+    if not is_done(publish_byte(@&p, 14))
+        return 6
+    if p.write != 5 or atomic_load(@ring.ctrl.write_idx) != 5
+        return 7
+    if not is_frame(c.next(@&g_buf, 0, 1), 1) or g_buf.bytes[0] != 13
+        return 8
+    0
+
+[[test]]
+fn test_producer_rejects_bad_length() -> i32
+    let ring = spsc_rx_ring(fresh_region())
+    var p = SpscProducer.new(ring)
+    let none: [0]u8 = []
+    match p.publish(@none)
+        Publish.BadLength => pass
+        _ => return 1
+    match p.publish(@g_too_long)
+        Publish.BadLength => pass
+        _ => return 2
+    if p.write != 0 or atomic_load(@ring.ctrl.write_idx) != 0
+        return 3
+    # A failed stage after a good one leaves nothing to commit.
+    let one: [1]u8 = [7]
+    if not is_done(p.stage(@one))
+        return 4
+    match p.stage(@none)
+        Publish.BadLength => pass
+        _ => return 5
+    if p.commit() or atomic_load(@ring.ctrl.write_idx) != 0
+        return 6
+    0
+
+# ---------------------------------------------------------------------------
+# 4. An empty ring at the deadline is Timeout
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_empty_ring_past_deadline_times_out() -> i32
+    let ring = spsc_rx_ring(fresh_region())
+    var c = SpscConsumer.new(ring)
+    if not is_empty(c.poll(9, 10))
+        return 1
+    match c.poll(10, 10)
+        Poll.Timeout => pass
+        _ => return 2
+    match c.next(@&g_buf, 11, 10)
+        Take.Timeout => pass
+        _ => return 3
+    if c.read != 0 or atomic_load(@ring.ctrl.read_idx) != 0
+        return 4
+    0
+
+# ---------------------------------------------------------------------------
+# 5. The validated length is the private copy's
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_shared_length_change_after_copy_ignored() -> i32
+    let ring = spsc_rx_ring(fresh_region())
+    var p = SpscProducer.new(ring)
+    var c = SpscConsumer.new(ring)
+    let frame: [100]u8 = [0x5A; 100]
+    if not is_done(p.publish(@frame))
+        return 1
+    let desc = match c.poll(0, 1)
+        Poll.Ready(d) => d
+        _ => return 2
+
+    # After the copy the peer lengthens the shared descriptor and fills the
+    # bytes past the frame, then makes the descriptor bad outright.
+    (*ring.descs)[0].length = 200
+    for i in 100..200
+        (*ring.arena)[i] = 0x77
+    for i in 0..FRAME_MAX
+        g_buf.bytes[i] = 0
+    match frame_desc_validate((*ring.descs)[0], 0)
+        Ok(n) =>
+            if n != 200                  # the peer's 200 would pass validation
+                return 7
+        Err(_) => return 8
+    (*ring.descs)[0].flags = 1
+    (*ring.descs)[0].arena_off = frame_slot_off(1) as u32
+
+    match frame_desc_validate(desc, 0)
+        Ok(n) =>
+            if n != 100
+                return 3
+        Err(_) => return 4
+    if not is_frame(c.take(desc, @&g_buf), 100)
+        return 5
+    if g_buf.bytes[0] != 0x5A or g_buf.bytes[99] != 0x5A
+        return 6
+    # Exactly the validated 100 bytes were copied, not the shared 200.
+    for i in 100..200
+        if g_buf.bytes[i] != 0
+            return 9
+    0

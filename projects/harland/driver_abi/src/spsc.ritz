@@ -1,0 +1,241 @@
+# Harland SPSC frame ring protocol (AGAST #4726, docs/RING1_DRIVER.md
+# section 6)
+#
+# The producer and consumer halves of one frame ring, over the bytes
+# driver_abi.frame_ring lays out: a SpscCtrl, FRAME_RING_CAP FrameDescs and
+# an arena of FRAME_RING_CAP slots of FRAME_MAX bytes. The kernel, the
+# ring-1 driver and a later Linux port compile this same file, so it imports
+# nothing outside driver_abi and never blocks: waiting (DrvIrqWait, ShmWait,
+# a futex) and the ShmNotify after a publish are the caller's.
+#
+# Each side keeps a private copy of the index it owns, stores only that
+# copy to the shared word and loads only the peer's index. A peer that
+# rewinds or advances the shared copy of our index moves nothing: the next
+# store overwrites it from the private value. Indexes are monotonic u64s
+# and the slot is seq & FRAME_RING_MASK. Ritz traps on a wrapping subtract,
+# so every occupancy check compares before it subtracts.
+#
+# Publication is a seq_cst atomic_store of the index after plain writes of
+# the frame bytes and descriptor; the consumer's seq_cst atomic_load of that
+# index comes before it reads the slot. No fence() is needed (section 6).
+
+import driver_abi.frame_ring { FrameDesc, SpscCtrl, FRAME_RING_CAP, FRAME_RING_MASK, FRAME_MAX, FRAME_F_NONE, FRAME_RX_CTRL_OFF, FRAME_TX_CTRL_OFF, FRAME_RX_DESC_OFF, FRAME_TX_DESC_OFF, FRAME_RX_ARENA_OFF, FRAME_TX_ARENA_OFF }
+
+# The FrameDescs of one ring, one page.
+pub type FrameDescs = [FRAME_RING_CAP]FrameDesc
+# The arena of one ring, FRAME_ARENA_SIZE bytes.
+pub type FrameArena = [FRAME_RING_CAP * FRAME_MAX]u8
+# One frame's private bytes, where the consumer copies a slot. A struct,
+# not a `[FRAME_MAX]u8` alias: ritz1 mis-sizes an array alias whose length
+# is a const from a third module when a caller passes @& to it.
+pub struct FrameBuf
+    bytes: [FRAME_MAX]u8
+
+# The shared words of one ring. Every pointer is into the frame region,
+# which the peer can also write: nothing read through them is trusted
+# until the consumer validates its private copy.
+pub struct SpscRing
+    ctrl: *SpscCtrl
+    descs: *FrameDescs
+    arena: *FrameArena
+
+# The ring is unusable: the peer's shared index is impossible given ours.
+# The caller closes the endpoint (endpoint_fail); it does not exit.
+pub enum SpscClose
+    # The occupancy, write_idx - read_idx, would be negative: the consumer
+    # saw write_idx behind its private read_idx, or the producer saw
+    # read_idx past its private write_idx.
+    Backwards
+    # The occupancy is above FRAME_RING_CAP.
+    Overfull
+
+# Why the consumer skipped a slot. The slot is not copied or dispatched,
+# and read_idx moves past it so one bad descriptor cannot pin the ring.
+pub enum Reject
+    Length                           # outside 1..=FRAME_MAX
+    Flags                            # not FRAME_F_NONE
+    Offset                           # not (seq & FRAME_RING_MASK) * FRAME_MAX
+
+# What stage and publish did.
+pub enum Publish
+    # The frame is written (stage) or written and its index stored
+    # (publish).
+    Done
+    # FRAME_RING_CAP slots are unreleased. Nothing is written and the
+    # private write_idx does not move; retry after read_idx advances. A
+    # full ring does not drop the frame.
+    Full
+    # The frame is empty or longer than FRAME_MAX. Nothing is written.
+    BadLength
+    Close(SpscClose)
+
+# What the consumer's poll saw.
+pub enum Poll
+    # The private copy of the descriptor at the private read_idx. The
+    # shared descriptor is not read again.
+    Ready(FrameDesc)
+    # No frame and the deadline has not passed: the caller waits.
+    Empty
+    # No frame and now >= deadline: a quiet link.
+    Timeout
+    Close(SpscClose)
+
+# What the consumer's take and next did.
+pub enum Take
+    # A frame of this many bytes is in the caller's FrameBuf and
+    # read_idx is past it.
+    Frame(u32)
+    # The slot was bad; read_idx is past it. The caller counts the reject
+    # and takes again.
+    Rejected(Reject)
+    Empty
+    Timeout
+    Close(SpscClose)
+
+# The RX ring of a frame region at `region` (FRAME_REGION_SIZE bytes).
+pub fn spsc_rx_ring(region: u64) -> SpscRing
+    SpscRing {
+        ctrl: (region + FRAME_RX_CTRL_OFF) as *SpscCtrl,
+        descs: (region + FRAME_RX_DESC_OFF) as *FrameDescs,
+        arena: (region + FRAME_RX_ARENA_OFF) as *FrameArena
+    }
+
+# The TX ring of a frame region at `region`.
+pub fn spsc_tx_ring(region: u64) -> SpscRing
+    SpscRing {
+        ctrl: (region + FRAME_TX_CTRL_OFF) as *SpscCtrl,
+        descs: (region + FRAME_TX_DESC_OFF) as *FrameDescs,
+        arena: (region + FRAME_TX_ARENA_OFF) as *FrameArena
+    }
+
+# The arena offset slot `seq` must carry.
+pub fn frame_slot_off(seq: u64) -> u64
+    (seq & FRAME_RING_MASK) * FRAME_MAX
+
+# Validate a private copy of the descriptor for sequence `seq`. Ok is the
+# validated length; the caller copies exactly that many bytes from the
+# arena offset the copy names, and reads nothing from the shared slot.
+pub fn frame_desc_validate(d: FrameDesc, seq: u64) -> Result<u32, Reject>
+    if d.length == 0 or d.length as u64 > FRAME_MAX
+        return Err(Reject.Length)
+    if d.flags != FRAME_F_NONE
+        return Err(Reject.Flags)
+    if d.arena_off as u64 != frame_slot_off(seq)
+        return Err(Reject.Offset)
+    Ok(d.length)
+
+# The occupancy write - read, or why it is impossible. Compares before it
+# subtracts.
+fn spsc_occupancy(write: u64, read: u64) -> Result<u64, SpscClose>
+    if write < read
+        return Err(SpscClose.Backwards)
+    let used = write - read
+    if used > FRAME_RING_CAP
+        return Err(SpscClose.Overfull)
+    Ok(used)
+
+# The producing half. `write` is the private write_idx: the only value
+# ever stored to ctrl.write_idx.
+pub struct SpscProducer
+    ring: SpscRing
+    write: u64
+    staged: bool                     # slot `write` is written, not published
+
+impl SpscProducer
+    # A producer at index 0, the index a zeroed region starts at.
+    pub fn new(ring: SpscRing) -> SpscProducer
+        SpscProducer { ring: ring, write: 0, staged: false }
+
+    # Write `frame` and its descriptor into slot `write` without storing
+    # the index, so the consumer cannot see it yet. Loads only the peer's
+    # read_idx.
+    pub fn stage(self: @&SpscProducer, frame: [u8]) -> Publish
+        self.staged = false              # a failed stage leaves nothing to commit
+        if frame.len == 0 or frame.len as u64 > FRAME_MAX
+            return Publish.BadLength
+        let read = atomic_load(@self.ring.ctrl.read_idx)
+        match spsc_occupancy(self.write, read)
+            Err(why) => return Publish.Close(why)
+            Ok(used) =>
+                if used == FRAME_RING_CAP
+                    return Publish.Full
+        let slot = self.write & FRAME_RING_MASK
+        let off = frame_slot_off(self.write)
+        for i in 0..frame.len
+            (*self.ring.arena)[off + i as u64] = frame[i]
+        (*self.ring.descs)[slot] = FrameDesc {
+            length: frame.len as u32,
+            flags: FRAME_F_NONE,
+            arena_off: off as u32,
+            _pad: 0
+        }
+        self.staged = true
+        Publish.Done
+
+    # Publish the staged slot: the seq_cst store of the private write_idx
+    # after the plain writes, then the wake word the Linux futex and
+    # Win64 recheck read. The caller then posts DATA (ShmNotify).
+    # Returns false, storing nothing, when no slot is staged.
+    pub fn commit(self: @&SpscProducer) -> bool
+        if not self.staged
+            return false
+        self.write += 1
+        self.staged = false
+        atomic_store(@self.ring.ctrl.write_idx, self.write)
+        atomic_fetch_add(@self.ring.ctrl.wake, 1)
+        true
+
+    # stage, then commit when it staged.
+    pub fn publish(self: @&SpscProducer, frame: [u8]) -> Publish
+        let r = self.stage(frame)
+        if self.staged
+            self.commit()
+        r
+
+# The consuming half. `read` is the private read_idx: the only value ever
+# stored to ctrl.read_idx.
+pub struct SpscConsumer
+    ring: SpscRing
+    read: u64
+
+impl SpscConsumer
+    pub fn new(ring: SpscRing) -> SpscConsumer
+        SpscConsumer { ring: ring, read: 0 }
+
+    # Load the producer's write_idx and, when a slot at the private
+    # read_idx is published, copy its descriptor once. Never reads a slot
+    # at or past the index it loaded. Empty means the caller may wait
+    # until `deadline`; at or past it the answer is Timeout.
+    pub fn poll(self: @SpscConsumer, now: u64, deadline: u64) -> Poll
+        let write = atomic_load(@self.ring.ctrl.write_idx)
+        match spsc_occupancy(write, self.read)
+            Err(why) => return Poll.Close(why)
+            Ok(used) =>
+                if used == 0
+                    if now >= deadline
+                        return Poll.Timeout
+                    return Poll.Empty
+        Poll.Ready((*self.ring.descs)[self.read & FRAME_RING_MASK])
+
+    # Validate `desc`, the private copy poll returned for the private
+    # read_idx, and on success copy its validated length from its arena
+    # offset into `dst`. Either way store read_idx past the slot.
+    pub fn take(self: @&SpscConsumer, desc: FrameDesc, dst: @&FrameBuf) -> Take
+        let result = match frame_desc_validate(desc, self.read)
+            Err(why) => Take.Rejected(why)
+            Ok(len) =>
+                let off = desc.arena_off as u64
+                for i in 0..len as u64
+                    dst.bytes[i] = (*self.ring.arena)[off + i]
+                Take.Frame(len)
+        self.read += 1
+        atomic_store(@self.ring.ctrl.read_idx, self.read)
+        result
+
+    # poll, then take when a slot is ready.
+    pub fn next(self: @&SpscConsumer, dst: @&FrameBuf, now: u64, deadline: u64) -> Take
+        match self.poll(now, deadline)
+            Poll.Ready(desc) => self.take(desc, dst)
+            Poll.Empty => Take.Empty
+            Poll.Timeout => Take.Timeout
+            Poll.Close(why) => Take.Close(why)
