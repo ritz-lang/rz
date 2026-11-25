@@ -1,0 +1,329 @@
+# Harland netstack: ARP cache, learn rules, pending sends, retries and
+# expiry (AGAST #4739, docs/RING2_NET.md "ARP")
+#
+# Receive (`observe`): an ARP packet updates the sender's MAC when that IP
+# is already cached and the entry has not expired. Otherwise a request
+# adds the sender only when its target protocol address is ours; a reply
+# adds the sender only when a request for that sender IP is outstanding
+# (`send` started one). An unsolicited reply, and a packet naming some
+# other target, create no entry. Whether a targeted request is *answered*
+# is a separate question (`arp_should_reply`): it also needs the address
+# record configured, which has nothing to do with whether the sender gets
+# learned.
+#
+# Send (`send`/`poll`): one request is in flight per next hop, with up to
+# ARP_PENDING_CAP sends queued behind it. `send` returns `Request` the
+# first time a hop is missing (the caller transmits a broadcast request),
+# `Queued` while that request is still outstanding, and `Refused` past the
+# cap (the 17th send for that hop, or no free hop slot) -- a `Refused` send
+# is never queued and is not what `send_drops` counts. `poll` is the
+# one-second timer: it retransmits up to ARP_RETRY_LIMIT times and, past
+# the limit with still no reply, gives up on the hop, counts every queued
+# send for it in `send_drops`, and reports `GiveUp` so the caller can drop
+# them (an app datagram among them included, with no `EV_ERROR`).
+#
+# A cache entry expires ARP_ENTRY_TTL_MS after its last use (a learn or a
+# `lookup` hit); `lookup` purges a stale hit lazily, so the next `send`
+# starts resolution again. ARP_CACHE_CAP and ARP_HOP_CAP are this fixed
+# table's own sizing (no RING2_NET number), generous for one LAN segment
+# and for the hops a 16-deep-per-hop pending cap can realistically have
+# outstanding at once; a table that is full simply does not learn a new
+# IP (cache) or start a new resolution (hops) until one frees up.
+
+import netstack.bytes { be16_get, be16_put, be32_get, be32_put }
+import netstack.ethernet { MacAddr, EtherType, SendError, ETH_PAYLOAD_OFF, eth_header_write }
+import driver_abi.link { NetInfo }
+
+pub const ARP_PACKET_LEN: i64 = 28
+pub const ARP_HTYPE_ETHERNET: u16 = 1
+pub const ARP_PTYPE_IPV4: u16 = 0x0800
+pub const ARP_HLEN: u8 = 6
+pub const ARP_PLEN: u8 = 4
+pub const ARP_OP_REQUEST: u16 = 1
+pub const ARP_OP_REPLY: u16 = 2
+
+pub fn arp_broadcast_mac() -> MacAddr
+    [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+
+fn arp_no_mac() -> MacAddr
+    [0, 0, 0, 0, 0, 0]
+
+# RING2_NET.md "ARP": 16 pending sends per next hop, 3 retries one second
+# apart, a cache entry expires 60 s without use.
+pub const ARP_PENDING_CAP: i64 = 16
+pub const ARP_RETRY_LIMIT: i64 = 3
+pub const ARP_RETRY_INTERVAL_MS: u64 = 1000
+pub const ARP_ENTRY_TTL_MS: u64 = 60000
+
+# This table's own fixed sizing; see the file header.
+pub const ARP_CACHE_CAP: i64 = 64
+pub const ARP_HOP_CAP: i64 = 16
+
+# ---------------------------------------------------------------------------
+# Wire format
+# ---------------------------------------------------------------------------
+
+pub enum ArpOp
+    Request
+    Reply
+
+# One parsed ARP packet (an Ethernet payload). The target hardware address
+# is never read: no learn or send rule depends on it.
+pub struct ArpRx
+    op: ArpOp
+    sender_ip: u32
+    sender_mac: MacAddr
+    target_ip: u32
+
+pub enum ArpDrop
+    Short                             # under ARP_PACKET_LEN bytes
+    Header                            # not Ethernet/IPv4, or a wrong hw/proto length
+    Op                                # opcode is neither request nor reply
+
+# Copy the 6 bytes at `at` out of `s`.
+fn mac_read(s: [u8], at: i64) -> MacAddr
+    var m: MacAddr = [0, 0, 0, 0, 0, 0]
+    for i in 0..6
+        m[i] = s[at + i]
+    m
+
+fn mac_write(s: [u8], at: i64, m: MacAddr)
+    for i in 0..6
+        s[at + i] = m[i]
+
+pub fn arp_parse(payload: [u8]) -> Result<ArpRx, ArpDrop>
+    if payload.len < ARP_PACKET_LEN
+        return Err(ArpDrop.Short)
+    if be16_get(payload, 0) != ARP_HTYPE_ETHERNET or be16_get(payload, 2) != ARP_PTYPE_IPV4
+        return Err(ArpDrop.Header)
+    if payload[4] != ARP_HLEN or payload[5] != ARP_PLEN
+        return Err(ArpDrop.Header)
+    let opcode = be16_get(payload, 6)
+    var op = ArpOp.Request
+    if opcode == ARP_OP_REPLY
+        op = ArpOp.Reply
+    else if opcode != ARP_OP_REQUEST
+        return Err(ArpDrop.Op)
+    Ok(ArpRx {
+        op: op,
+        sender_ip: be32_get(payload, 14),
+        sender_mac: mac_read(payload, 8),
+        target_ip: be32_get(payload, 24),
+    })
+
+# Write one 28-byte ARP payload (htype/ptype/hlen/plen, opcode, sender,
+# target) and its Ethernet header. `target_mac` is the ARP field, not the
+# Ethernet destination: a request leaves it zero (unknown), a reply sets
+# it to the requester's MAC, which is also the Ethernet destination.
+fn arp_frame_write(frame: [u8], eth_dst: MacAddr, src_mac: MacAddr, op: u16, src_ip: u32, target_mac: MacAddr, target_ip: u32) -> Result<i64, SendError>
+    if frame.len < ETH_PAYLOAD_OFF + ARP_PACKET_LEN
+        return Err(SendError.TooBig)
+    let body = frame[ETH_PAYLOAD_OFF..frame.len]
+    be16_put(body, 0, ARP_HTYPE_ETHERNET)
+    be16_put(body, 2, ARP_PTYPE_IPV4)
+    body[4] = ARP_HLEN
+    body[5] = ARP_PLEN
+    be16_put(body, 6, op)
+    mac_write(body, 8, src_mac)
+    be32_put(body, 14, src_ip)
+    mac_write(body, 18, target_mac)
+    be32_put(body, 24, target_ip)
+    eth_header_write(frame, eth_dst, src_mac, EtherType.Arp)?
+    Ok(ETH_PAYLOAD_OFF + ARP_PACKET_LEN)
+
+# A broadcast request for `target_ip`, from the link snapshot's MAC.
+pub fn arp_request_write(frame: [u8], link: NetInfo, our_ip: u32, target_ip: u32) -> Result<i64, SendError>
+    arp_frame_write(frame, arp_broadcast_mac(), link.mac, ARP_OP_REQUEST, our_ip, arp_no_mac(), target_ip)
+
+# A unicast reply to `dst_mac`/`dst_ip`, the original requester.
+pub fn arp_reply_write(frame: [u8], link: NetInfo, our_ip: u32, dst_mac: MacAddr, dst_ip: u32) -> Result<i64, SendError>
+    arp_frame_write(frame, dst_mac, link.mac, ARP_OP_REPLY, our_ip, dst_mac, dst_ip)
+
+# Whether a received request should be answered: its target is ours, and
+# our address record is configured. Learning the sender (`observe`) does
+# not depend on `configured`; answering does.
+pub fn arp_should_reply(rx: ArpRx, our_ip: u32, configured: bool) -> bool
+    match rx.op
+        ArpOp.Request => rx.target_ip == our_ip and configured
+        ArpOp.Reply => false
+
+# ---------------------------------------------------------------------------
+# Cache and pending-hop state
+# ---------------------------------------------------------------------------
+
+struct ArpEntry
+    ip: u32
+    mac: MacAddr
+    last_used: u64
+    live: bool
+
+struct ArpHop
+    ip: u32
+    pending: i64                     # queued sends not yet resolved or dropped
+    retries: i64                     # ARP requests already sent past the first
+    next_retry: u64                  # ms deadline for the next retry or give-up
+    live: bool
+
+pub enum ArpLearn
+    Updated                          # the sender's entry already existed
+    Added                            # a targeted request added the sender
+    Resolved(i64)                    # a reply resolved a hop; i64 pending sends to flush
+    Ignored                          # no entry was added or updated
+
+pub enum ArpSend
+    Resolved(MacAddr)                 # already cached; send now
+    Request                           # first send for a missing hop: transmit a request
+    Queued                            # a request for this hop is already outstanding
+    Refused                           # the pending cap (or the hop table) is full
+
+pub enum ArpEvent
+    Retry(u32)                        # retransmit a broadcast request to this hop
+    GiveUp(u32, i64)                  # give up on this hop; i64 is the sends dropped
+
+# ARP_CACHE_CAP learned neighbors and ARP_HOP_CAP in-flight resolutions.
+# Every field here is scalar or a fixed array of scalars, so a zeroed
+# `var` (the caller's own storage, on the driver_abi / boot_abi pattern)
+# starts every slot with `live` false; `init` makes that explicit rather
+# than relying on it, the same way NetExchange.init does.
+pub struct ArpTable
+    cache: [ARP_CACHE_CAP]ArpEntry
+    hops: [ARP_HOP_CAP]ArpHop
+    send_drops: u64
+
+impl ArpTable
+    pub fn init(self: @&ArpTable)
+        for i in 0..ARP_CACHE_CAP
+            self.cache[i].live = false
+        for i in 0..ARP_HOP_CAP
+            self.hops[i].live = false
+        self.send_drops = 0
+
+    fn cache_find(self: @&ArpTable, ip: u32) -> Option<i64>
+        for i in 0..ARP_CACHE_CAP
+            if self.cache[i].live and self.cache[i].ip == ip
+                return Some(i)
+        None
+
+    # A live hit that is not yet stale as of `now`. A stale hit is purged
+    # here (so it does not keep matching) and counts as a miss.
+    fn cache_live(self: @&ArpTable, idx: i64, now: u64) -> bool
+        if now - self.cache[idx].last_used > ARP_ENTRY_TTL_MS
+            self.cache[idx].live = false
+            return false
+        true
+
+    # A free slot, or (the table full) the least-recently-used one.
+    fn cache_slot(self: @&ArpTable) -> i64
+        for i in 0..ARP_CACHE_CAP
+            if not self.cache[i].live
+                return i
+        var oldest: i64 = 0
+        for i in 1..ARP_CACHE_CAP
+            if self.cache[i].last_used < self.cache[oldest].last_used
+                oldest = i
+        oldest
+
+    fn cache_store(self: @&ArpTable, ip: u32, mac: MacAddr, now: u64)
+        match self.cache_find(ip)
+            Some(idx) =>
+                self.cache[idx].mac = mac
+                self.cache[idx].last_used = now
+            None =>
+                let idx = self.cache_slot()
+                self.cache[idx] = ArpEntry { ip: ip, mac: mac, last_used: now, live: true }
+
+    # The cached MAC for `ip`, if any and not expired. A hit refreshes
+    # `last_used`: the entry is used, not just held.
+    pub fn lookup(self: @&ArpTable, ip: u32, now: u64) -> Option<MacAddr>
+        match self.cache_find(ip)
+            None => None
+            Some(idx) =>
+                if not self.cache_live(idx, now)
+                    return None
+                self.cache[idx].last_used = now
+                Some(self.cache[idx].mac)
+
+    fn hop_find(self: @&ArpTable, ip: u32) -> Option<i64>
+        for i in 0..ARP_HOP_CAP
+            if self.hops[i].live and self.hops[i].ip == ip
+                return Some(i)
+        None
+
+    fn hop_free_slot(self: @&ArpTable) -> Option<i64>
+        for i in 0..ARP_HOP_CAP
+            if not self.hops[i].live
+                return Some(i)
+        None
+
+    # Resolve `hop_ip` for a send, starting ARP resolution if it is
+    # missing. Never invents a MAC: `Request` is the caller's cue to
+    # transmit a broadcast request now, and `Queued` means one is already
+    # outstanding.
+    pub fn send(self: @&ArpTable, hop_ip: u32, now: u64) -> ArpSend
+        match self.lookup(hop_ip, now)
+            Some(mac) => return ArpSend.Resolved(mac)
+            None => pass
+        match self.hop_find(hop_ip)
+            Some(idx) =>
+                if self.hops[idx].pending >= ARP_PENDING_CAP
+                    return ArpSend.Refused
+                self.hops[idx].pending += 1
+                return ArpSend.Queued
+            None => pass
+        match self.hop_free_slot()
+            Some(idx) =>
+                self.hops[idx] = ArpHop { ip: hop_ip, pending: 1, retries: 0, next_retry: now + ARP_RETRY_INTERVAL_MS, live: true }
+                ArpSend.Request
+            None => ArpSend.Refused
+
+    # Update an existing entry, or add one per the learn rules: a request
+    # only when it targets us, a reply only when `send` left that sender
+    # IP outstanding. Everything else is ignored, including an unsolicited
+    # reply and a packet naming some other target.
+    pub fn observe(self: @&ArpTable, rx: ArpRx, our_ip: u32, now: u64) -> ArpLearn
+        match self.cache_find(rx.sender_ip)
+            Some(idx) =>
+                if self.cache_live(idx, now)
+                    self.cache[idx].mac = rx.sender_mac
+                    self.cache[idx].last_used = now
+                    return ArpLearn.Updated
+            None => pass
+        match rx.op
+            ArpOp.Request =>
+                if rx.target_ip != our_ip
+                    return ArpLearn.Ignored
+                self.cache_store(rx.sender_ip, rx.sender_mac, now)
+                ArpLearn.Added
+            ArpOp.Reply =>
+                match self.hop_find(rx.sender_ip)
+                    None => ArpLearn.Ignored
+                    Some(idx) =>
+                        let pending = self.hops[idx].pending
+                        self.cache_store(rx.sender_ip, rx.sender_mac, now)
+                        self.hops[idx].live = false
+                        ArpLearn.Resolved(pending)
+
+    # The one-second timer: retransmit a still-unresolved hop up to
+    # ARP_RETRY_LIMIT times, then give up and count every queued send for
+    # it in send_drops. Writes at most `out.len` events and returns how
+    # many; a hop whose retry is not yet due is left alone.
+    pub fn poll(self: @&ArpTable, now: u64, out: [ArpEvent]) -> i64
+        var n: i64 = 0
+        for i in 0..ARP_HOP_CAP
+            if not self.hops[i].live or now < self.hops[i].next_retry
+                continue
+            let hop_ip = self.hops[i].ip
+            if self.hops[i].retries >= ARP_RETRY_LIMIT
+                let dropped = self.hops[i].pending
+                self.send_drops += dropped as u64
+                self.hops[i].live = false
+                if n < out.len
+                    out[n] = ArpEvent.GiveUp(hop_ip, dropped)
+                    n += 1
+            else
+                self.hops[i].retries += 1
+                self.hops[i].next_retry = now + ARP_RETRY_INTERVAL_MS
+                if n < out.len
+                    out[n] = ArpEvent.Retry(hop_ip)
+                    n += 1
+        n

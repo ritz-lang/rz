@@ -1,0 +1,365 @@
+# Harland netstack: ARP learn rules, pending sends, retries and expiry
+# (AGAST #4739, docs/RING2_NET.md "ARP")
+#
+# Ported from docs/stack_example/test_stack.py's arp_observe fixture (an
+# unsolicited reply and a request for someone else are ignored, a request
+# targeting us and a reply for an outstanding request are added, an
+# existing entry is updated), then every other rule the host example does
+# not model: the pending cap, the retry schedule and give-up, and the
+# cache expiry.
+
+import netstack.bytes { be16_put, be32_put }
+import netstack.ethernet { MacAddr, ETH_PAYLOAD_OFF, eth_demux, mac_eq, mac_is_broadcast }
+import netstack.arp {
+    ArpOp, ArpRx, ArpDrop, ArpLearn, ArpSend, ArpEvent, ArpTable,
+    ARP_PENDING_CAP, ARP_RETRY_LIMIT, ARP_RETRY_INTERVAL_MS, ARP_ENTRY_TTL_MS, ARP_HOP_CAP,
+    arp_parse, arp_request_write, arp_reply_write, arp_should_reply, arp_broadcast_mac,
+}
+import driver_abi.link { NetInfo }
+
+const OUR_IP: u32 = 0x0A00020F        # 10.0.2.15
+const PEER_IP: u32 = 0x0A000202       # 10.0.2.2
+const OTHER_IP: u32 = 0x0A000263      # 10.0.2.99
+
+var g_table: ArpTable
+var g_frame: [64]u8
+
+fn our_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+
+fn peer_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0xAA, 0xBB, 0xCC]
+
+fn link() -> NetInfo
+    NetInfo { mac: our_mac(), link_up: 1, device_type: 1, mtu: 1500 }
+
+fn reset()
+    g_table.init()
+
+# A hand-built ARP payload (the 28 bytes after the Ethernet header).
+fn arp_payload(op: u16, sender_ip: u32, sender_mac: MacAddr, target_ip: u32) -> [u8]
+    let all: [u8] = @g_frame
+    for i in 0..28
+        all[i] = 0
+    be16_put(all, 0, 1)                # htype Ethernet
+    be16_put(all, 2, 0x0800)            # ptype IPv4
+    all[4] = 6
+    all[5] = 4
+    be16_put(all, 6, op)
+    for i in 0..6
+        all[8 + i] = sender_mac[i]
+    be32_put(all, 14, sender_ip)
+    be32_put(all, 24, target_ip)
+    all[0..28]
+
+fn request(sender_ip: u32, sender_mac: MacAddr, target_ip: u32) -> ArpRx
+    match arp_parse(arp_payload(1, sender_ip, sender_mac, target_ip))
+        Ok(rx) => rx
+        Err(_) => ArpRx { op: ArpOp.Request, sender_ip: 0, sender_mac: [0, 0, 0, 0, 0, 0], target_ip: 0 }
+
+fn reply(sender_ip: u32, sender_mac: MacAddr, target_ip: u32) -> ArpRx
+    match arp_parse(arp_payload(2, sender_ip, sender_mac, target_ip))
+        Ok(rx) => rx
+        Err(_) => ArpRx { op: ArpOp.Reply, sender_ip: 0, sender_mac: [0, 0, 0, 0, 0, 0], target_ip: 0 }
+
+fn is_ignored(l: ArpLearn) -> bool
+    match l
+        ArpLearn.Ignored => true
+        _ => false
+
+fn is_added(l: ArpLearn) -> bool
+    match l
+        ArpLearn.Added => true
+        _ => false
+
+fn is_updated(l: ArpLearn) -> bool
+    match l
+        ArpLearn.Updated => true
+        _ => false
+
+fn resolved_count(l: ArpLearn) -> i64
+    match l
+        ArpLearn.Resolved(n) => n
+        _ => -1
+
+fn is_resolved_mac(s: ArpSend, want: MacAddr) -> bool
+    match s
+        ArpSend.Resolved(mac) => mac_eq(mac, want)
+        _ => false
+
+fn is_request(s: ArpSend) -> bool
+    match s
+        ArpSend.Request => true
+        _ => false
+
+fn is_queued(s: ArpSend) -> bool
+    match s
+        ArpSend.Queued => true
+        _ => false
+
+fn is_refused(s: ArpSend) -> bool
+    match s
+        ArpSend.Refused => true
+        _ => false
+
+# ---------------------------------------------------------------------------
+# Wire format
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_parse_rejects_short_bad_header_and_bad_op() -> i32
+    let good = arp_payload(1, PEER_IP, peer_mac(), OUR_IP)
+    match arp_parse(good[0..27])
+        Err(w) => 
+            if w != ArpDrop.Short
+                return 1
+        Ok(_) => return 2
+    let bad_htype = arp_payload(1, PEER_IP, peer_mac(), OUR_IP)
+    be16_put(bad_htype, 0, 6)
+    match arp_parse(bad_htype)
+        Err(w) => 
+            if w != ArpDrop.Header
+                return 3
+        Ok(_) => return 4
+    let bad_op = arp_payload(1, PEER_IP, peer_mac(), OUR_IP)
+    be16_put(bad_op, 6, 3)
+    match arp_parse(bad_op)
+        Err(w) => 
+            if w != ArpDrop.Op
+                return 5
+        Ok(_) => return 6
+    0
+
+[[test]]
+fn test_request_and_reply_build_round_trip() -> i32
+    let out: [u8] = @g_frame
+    match arp_request_write(out, link(), OUR_IP, PEER_IP)
+        Ok(n) => 
+            if n != ETH_PAYLOAD_OFF + 28
+                return 1
+        Err(_) => return 2
+    # A request is a broadcast frame; the target's MAC is unknown.
+    match eth_demux(out, our_mac())
+        Ok(rx) => 
+            if not mac_is_broadcast(rx.dst) or not mac_eq(rx.src, our_mac())
+                return 3
+        Err(_) => return 4
+    match arp_parse(out[ETH_PAYLOAD_OFF..out.len])
+        Ok(rx) =>
+            if rx.op != ArpOp.Request or rx.sender_ip != OUR_IP or rx.target_ip != PEER_IP
+                return 5
+        Err(_) => return 6
+    let reply_out: [u8] = @g_frame
+    match arp_reply_write(reply_out, link(), OUR_IP, peer_mac(), PEER_IP)
+        Ok(n) => 
+            if n != ETH_PAYLOAD_OFF + 28
+                return 7
+        Err(_) => return 8
+    # A reply is unicast to the requester: the peer's own demux (its MAC
+    # is the destination) keeps it, ours would not.
+    match eth_demux(reply_out, peer_mac())
+        Ok(rx) =>
+            if not mac_eq(rx.dst, peer_mac()) or not mac_eq(rx.src, our_mac())
+                return 9
+        Err(_) => return 10
+    match arp_parse(reply_out[ETH_PAYLOAD_OFF..reply_out.len])
+        Ok(rx) =>
+            if rx.op != ArpOp.Reply or rx.sender_ip != OUR_IP or rx.target_ip != PEER_IP
+                return 11
+        Err(_) => return 12
+    0
+
+[[test]]
+fn test_should_reply_needs_our_target_and_configured() -> i32
+    let to_us = request(PEER_IP, peer_mac(), OUR_IP)
+    if not arp_should_reply(to_us, OUR_IP, true)
+        return 1
+    if arp_should_reply(to_us, OUR_IP, false)
+        return 2                     # unconfigured: never answered
+    let to_other = request(PEER_IP, peer_mac(), OTHER_IP)
+    if arp_should_reply(to_other, OUR_IP, true)
+        return 3
+    let a_reply = reply(PEER_IP, peer_mac(), OUR_IP)
+    if arp_should_reply(a_reply, OUR_IP, true)
+        return 4                     # a reply is never answered
+    0
+
+# ---------------------------------------------------------------------------
+# Learn rules (ported from stack_example's arp_observe fixture)
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_learn_rules_ported_from_stack_example() -> i32
+    reset()
+    # A request for someone else is ignored.
+    if not is_ignored(g_table.observe(request(PEER_IP, peer_mac(), OTHER_IP), OUR_IP, 1000))
+        return 1
+    # An unsolicited reply, even one addressed to us, creates no entry.
+    if not is_ignored(g_table.observe(reply(PEER_IP, peer_mac(), OUR_IP), OUR_IP, 1000))
+        return 2
+    match g_table.lookup(PEER_IP, 1000)
+        None => pass
+        Some(_) => return 3
+    # A request that targets us is learned.
+    if not is_added(g_table.observe(request(PEER_IP, peer_mac(), OUR_IP), OUR_IP, 1000))
+        return 4
+    # A reply for an outstanding request (send() started one) is learned.
+    match g_table.send(OTHER_IP, 1000)
+        ArpSend.Request => pass
+        _ => return 5
+    let other_mac: MacAddr = [0x52, 0x54, 0x00, 0xDD, 0xEE, 0xFF]
+    if resolved_count(g_table.observe(reply(OTHER_IP, other_mac, OUR_IP), OUR_IP, 1000)) != 1
+        return 6
+    # An existing entry is updated by a later packet from that sender.
+    let updated_mac: MacAddr = [0x52, 0x54, 0x00, 0x11, 0x22, 0x33]
+    if not is_updated(g_table.observe(reply(PEER_IP, updated_mac, OTHER_IP), OUR_IP, 1000))
+        return 7
+    match g_table.lookup(PEER_IP, 1000)
+        Some(mac) => 
+            if not mac_eq(mac, updated_mac)
+                return 8
+        None => return 9
+    0
+
+[[test]]
+fn test_reply_target_is_irrelevant_only_sender_matters() -> i32
+    reset()
+    if not is_ignored(g_table.observe(request(PEER_IP, peer_mac(), OTHER_IP), OUR_IP, 0))
+        return 1
+    # A reply's target field plays no part in the learn rule: what matters
+    # is whether its *sender* has an outstanding request.
+    match g_table.send(PEER_IP, 0)
+        ArpSend.Request => pass
+        _ => return 2
+    if resolved_count(g_table.observe(reply(PEER_IP, peer_mac(), OTHER_IP), OUR_IP, 0)) != 1
+        return 3
+    0
+
+# ---------------------------------------------------------------------------
+# Send: resolution, the pending cap, retries and give-up
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_send_starts_resolution_then_queues_then_refuses() -> i32
+    reset()
+    match g_table.send(PEER_IP, 0)
+        ArpSend.Request => pass
+        _ => return 1
+    # The second send for the same still-unresolved hop queues instead of
+    # starting a second request.
+    for i in 0..ARP_PENDING_CAP - 1
+        if not is_queued(g_table.send(PEER_IP, 0))
+            return 2
+    # 16 are now pending (the first Request plus 15 Queued); the 17th is
+    # refused.
+    if not is_refused(g_table.send(PEER_IP, 0))
+        return 3
+    0
+
+[[test]]
+fn test_resolved_hop_is_used_without_a_new_request() -> i32
+    reset()
+    if not is_request(g_table.send(PEER_IP, 0))
+        return 1
+    if resolved_count(g_table.observe(reply(PEER_IP, peer_mac(), OUR_IP), OUR_IP, 0)) != 1
+        return 2
+    match g_table.send(PEER_IP, 10)
+        ArpSend.Resolved(mac) => 
+            if not mac_eq(mac, peer_mac())
+                return 3
+        _ => return 4
+    0
+
+[[test]]
+fn test_retries_then_gives_up_and_counts_send_drops() -> i32
+    reset()
+    if not is_request(g_table.send(PEER_IP, 0))
+        return 1
+    if not is_queued(g_table.send(PEER_IP, 0))
+        return 2                     # two sends now pending for this hop
+    var out: [4]ArpEvent = [ArpEvent.Retry(0), ArpEvent.Retry(0), ArpEvent.Retry(0), ArpEvent.Retry(0)]
+    # Nothing is due yet.
+    if g_table.poll(500, @out) != 0
+        return 3
+    # Three retries, one second apart.
+    for retry in 0..ARP_RETRY_LIMIT
+        let n = g_table.poll(1000 + retry as u64 * ARP_RETRY_INTERVAL_MS, @out)
+        if n != 1
+            return 4
+        match out[0]
+            ArpEvent.Retry(ip) => 
+                if ip != PEER_IP
+                    return 5
+            ArpEvent.GiveUp(_, _) => return 6
+    # The fourth deadline, with still no reply, gives up and drops both
+    # pending sends, counted in send_drops.
+    let n = g_table.poll(1000 + ARP_RETRY_LIMIT as u64 * ARP_RETRY_INTERVAL_MS, @out)
+    if n != 1
+        return 7
+    match out[0]
+        ArpEvent.GiveUp(ip, dropped) => 
+            if ip != PEER_IP or dropped != 2
+                return 8
+        ArpEvent.Retry(_) => return 9
+    if g_table.send_drops != 2
+        return 10
+    # The hop is free again: the next send starts resolution over.
+    if not is_request(g_table.send(PEER_IP, 100000))
+        return 11
+    0
+
+[[test]]
+fn test_pending_cap_is_per_hop() -> i32
+    reset()
+    if not is_request(g_table.send(PEER_IP, 0))
+        return 1
+    if not is_request(g_table.send(OTHER_IP, 0))
+        return 2                     # a different hop gets its own request and its own cap
+    for i in 0..ARP_PENDING_CAP - 1
+        if not is_queued(g_table.send(PEER_IP, 0))
+            return 3
+    if not is_refused(g_table.send(PEER_IP, 0))
+        return 4
+    if not is_queued(g_table.send(OTHER_IP, 0))
+        return 5                     # the other hop is unaffected
+    0
+
+# ---------------------------------------------------------------------------
+# Cache expiry
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_entry_is_still_fresh_exactly_at_the_ttl() -> i32
+    reset()
+    if not is_added(g_table.observe(request(PEER_IP, peer_mac(), OUR_IP), OUR_IP, 0))
+        return 1
+    match g_table.lookup(PEER_IP, ARP_ENTRY_TTL_MS)
+        Some(_) => pass
+        None => return 2             # exactly at the TTL is still fresh
+    0
+
+[[test]]
+fn test_entry_expires_after_60s_without_use() -> i32
+    reset()
+    if not is_added(g_table.observe(request(PEER_IP, peer_mac(), OUR_IP), OUR_IP, 0))
+        return 1
+    # One past the TTL, with no use in between: expired, so a send starts
+    # resolution over instead of finding a cached MAC.
+    if not is_request(g_table.send(PEER_IP, ARP_ENTRY_TTL_MS + 1))
+        return 2
+    0
+
+[[test]]
+fn test_lookup_use_refreshes_the_ttl() -> i32
+    reset()
+    if not is_added(g_table.observe(request(PEER_IP, peer_mac(), OUR_IP), OUR_IP, 0))
+        return 1
+    # A use halfway through the window pushes expiry out another 60 s
+    # from there, so the entry is still live past the original deadline.
+    match g_table.lookup(PEER_IP, ARP_ENTRY_TTL_MS / 2)
+        Some(_) => pass
+        None => return 2
+    match g_table.lookup(PEER_IP, ARP_ENTRY_TTL_MS)
+        Some(_) => pass
+        None => return 3
+    0
