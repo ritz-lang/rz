@@ -71,6 +71,7 @@ pub fn main() -> i32
 | `box.ritz` | `ritzlib.box` | Owned heap allocation |
 | `buf.ritz` | `ritzlib.buf` | Buffer and reader utilities for parsing |
 | `cmp.ritz` | `ritzlib.cmp` | Ordering, the result of a three-way comparison |
+| `cstr.ritz` | `ritzlib.cstr` | C interop only; StrView/String everywhere else |
 | `ct.ritz` | `ritzlib.ct` | Constant-time comparison (AGAST #1863) |
 | `drop.ritz` | `ritzlib.drop` | Drop trait for automatic cleanup |
 | `elf.ritz` | `ritzlib.elf` | ELF Binary Format Parser |
@@ -99,7 +100,7 @@ pub fn main() -> i32
 | `ptr.ritz` | `ritzlib.ptr` | reads through a raw pointer that take ownership |
 | `result.ritz` | `ritzlib.result` | `Result<T, E>`, a success value or an error |
 | `span.ritz` | `ritzlib.span` | Non-owning views into contiguous memory |
-| `str.ritz` | `ritzlib.str` | C-string interop only; new code uses StrView/String |
+| `str.ritz` | `ritzlib.str` | byte predicates and the libc memory symbols |
 | `string.ritz` | `ritzlib.string` | Owned string type |
 | `strview.ritz` | `ritzlib.strview` | Zero-copy string view |
 | `sys.ritz` | `ritzlib.sys` | System call wrappers |

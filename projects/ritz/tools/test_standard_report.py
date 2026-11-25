@@ -627,3 +627,31 @@ def test_every_counting_rule_names_a_rule_in_the_standard():
         assert f"#### {rule_id} " in doc, f"{key}: {rule_id} is not a rule in STANDARD.md"
         assert f"`{key}`" in doc, f"{key} is not named in STANDARD.md"
 
+
+
+LIB_STR = (
+    "impl String\n"
+    "    # standard-exempt: raw-ptr-param: C-string ABI for the test\n"
+    "    pub fn push_cstr(self: @&String, p: *u8) -> bool\n        true\n"
+    "    pub fn push_str(self: @&String, s: StrView) -> bool\n        true\n"
+)
+
+
+def test_callers_count_method_calls_of_exempt_methods(tmp_path):
+    # #4688: `.push_cstr(` was invisible to --callers, so no pin counted it.
+    _tree(tmp_path, {
+        "lib/string.ritz": LIB_STR,
+        "proj/a/m.ritz": (
+            "import ritzlib.string\n"
+            "fn f(s: @&String)\n"
+            "    s.push_cstr(p)\n"
+            "    s.push_str(\"ok\")\n"      # not exempt
+            "    s.push_cstr(q)\n"
+        ),
+        # No import of the defining module: not this API.
+        "proj/b/x.ritz": "import ritzlib.sys\nfn g(s: @&String)\n    s.push_cstr(p)\n",
+    })
+    assert exempt_apis(tmp_path / "lib") == {".push_cstr": {"string"}}
+    sites = count_callers(tmp_path / "lib", [tmp_path / "proj"])
+    got = sorted((s.api, Path(s.path).relative_to(tmp_path).as_posix(), s.line) for s in sites)
+    assert got == [(".push_cstr", "proj/a/m.ritz", 3), (".push_cstr", "proj/a/m.ritz", 5)]

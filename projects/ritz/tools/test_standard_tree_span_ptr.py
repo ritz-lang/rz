@@ -33,8 +33,8 @@ def _summary(module: str) -> dict[str, dict[str, int]]:
     ("module", "exempt"),
     [
         ("span.ritz", 3),     # 3 raw-pair constructor boundaries (#4639 deleted span_from_cstr, span_eq_cstr)
-        ("strview.ritz", 4),  # 4 C-string / raw-pair boundaries (#4639 deleted cmp_cstr)
-        ("string.ritz", 6),   # 2 *Allocator + 4 C-string; push_bytes is a Span (#4555)
+        ("strview.ritz", 1),  # the raw-pair constructor boundary; the C-string API moved to ritzlib.cstr (#4688)
+        ("string.ritz", 2),   # 2 *Allocator; the C-string API moved to ritzlib.cstr (#4688)
     ],
 )
 def test_raw_pointer_parameters_are_converted_or_exempted(module, exempt):

@@ -619,8 +619,6 @@ count elements as usual, and `data` is a non-null dangling pointer that
 | `v.swap(i, j)` | `fn(i: i64, j: i64) -> bool` | Swap elements; false if either index is out of range |
 | `v.push_bytes(data, len)` | `fn(data: *T, len: i64) -> bool` | Push `len` elements (the print-sink protocol, LANGUAGE_SPEC §2.6) |
 | `v.push_span(data)` | `fn(data: Span<T>) -> bool` | Push every element of a span |
-| `v.push_str(s)` | `fn(s: *T) -> bool` | Push a NUL-terminated C string, without the NUL |
-| `v.as_str()` | `fn() -> Option<*T>` | NUL-terminate (not counted in `len`) and return the data pointer; `None` if that can't be allocated |
 
 **Line Utilities** (to read a whole fd into a `Vec<u8>`, use `vec_read_all_fd` in [io](#io)):
 
@@ -678,7 +676,6 @@ Modification:
 |--------|-----------|-------------|
 | `s.push(b)` | `fn(b: u8) -> bool` | Push byte |
 | `s.push_str(sv)` | `fn(sv: StrView) -> bool` | Push StrView (a `"..."` literal) |
-| `s.push_cstr(cstr)` | `fn(cstr: *u8) -> bool` | Push NUL-terminated C string |
 | `s.push_string(other)` | `fn(other: @String) -> bool` | Push String |
 | `s.push_span(bytes)` | `fn(bytes: Span<u8>) -> bool` | Push a byte span |
 | `s.push_bytes(bytes)` | `fn(bytes: Span<u8>) -> bool` | Append a byte span; the print-sink protocol `format_into(@&s, "...")` appends through (AGAST #4555) |
@@ -695,7 +692,6 @@ Comparison:
 | `s.eq(other)` | `fn(other: StrView) -> bool` | Compare to a StrView (a `"..."` literal) |
 | `s.eq_string(b)` | `fn(b: @String) -> bool` | Compare two Strings |
 | `s.eq_strview(sv)` | `fn(sv: StrView) -> bool` | Same as `s.eq` |
-| `s.eq_cstr(cstr)` | `fn(cstr: *u8) -> bool` | Compare to C string |
 | `s.hash()` | `fn() -> u64` | Hash the string |
 
 Search/Slice:
@@ -979,7 +975,6 @@ frees it).
 |----------|-----------|-------------|
 | `strview_empty` | `fn() -> StrView` | Empty view (`ptr` null, `len` 0) |
 | `strview_from_ptr` | `fn(ptr: *u8, len: i64) -> StrView` | View `len` bytes at `ptr` |
-| `strview_from_cstr` | `fn(cstr: *u8) -> StrView` | View a NUL-terminated string, without the NUL |
 
 **Methods** (`impl StrView`; call `s.method(...)`, the view by value):
 
@@ -991,7 +986,6 @@ Access / conversion:
 | `s.is_empty()` | `fn() -> bool` | `len == 0` |
 | `s.get(idx)` | `fn(idx: i64) -> u8` | Byte at `idx` (unchecked) |
 | `s.as_ptr()` | `fn() -> *u8` | Pointer to the first byte |
-| `s.as_cstr_unchecked()` | `fn() -> *u8` | The pointer as a C string. Only sound if the bytes after the view hold a NUL, as they do for a whole literal; a slice usually doesn't |
 | `s.parse_i64()` | `fn() -> Option<i64>` | The whole view as decimal, optional `+`/`-`: `None` for empty, a bare sign, whitespace, junk or overflow. Trim first if needed |
 
 Comparison:
@@ -999,7 +993,6 @@ Comparison:
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `s.eq(t)` | `fn(t: StrView) -> bool` | Same length and bytes |
-| `s.eq_cstr(c)` | `fn(c: *u8) -> bool` | Equal to a C string |
 | `s.cmp(t)` | `fn(t: StrView) -> Ordering` | Bytewise order, bytes unsigned; a prefix sorts first (`ritzlib.cmp`) |
 
 Slicing (no allocation):
@@ -1019,7 +1012,6 @@ Search:
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `s.starts_with(p)` | `fn(p: StrView) -> bool` | Prefix test |
-| `s.starts_with_cstr(p)` | `fn(p: *u8) -> bool` | Prefix test against a C string |
 | `s.ends_with(p)` | `fn(p: StrView) -> bool` | Suffix test |
 | `s.contains(t)` | `fn(t: StrView) -> bool` | Substring test; an empty needle is always found |
 | `s.find(t)` | `fn(t: StrView) -> i64` | First index of `t`, or `len` when absent (0 for an empty needle) |
@@ -1050,7 +1042,7 @@ fn test_strview_example() -> i32
         None => -1
     assert port == 8080
     assert config_int("port = 80x", "port").is_none()
-    let path = strview_from_cstr(c"/usr/lib/libc.so")
+    let path = "/usr/lib/libc.so"
     let base = path.skip(path.rfind("/") + 1)
     assert base.eq("libc.so")
     assert path.starts_with("/usr") and path.ends_with(".so")
@@ -1062,18 +1054,35 @@ fn test_strview_example() -> i32
 
 ---
 
+### cstr
+
+**Module**: `ritzlib.cstr`
+
+C interop only; `StrView`/`String` everywhere else (AGAST #4688). The one module
+that names a NUL-terminated `*u8`, for argv/envp, syscalls and C APIs.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `strlen` | `fn(s: *u8) -> i64` | Bytes before the NUL |
+| `streq` | `fn(a: *u8, b: *u8) -> bool` | Equal C strings |
+| `strneq` | `fn(a: *u8, b: *u8, n: i64) -> bool` | First `n` bytes equal (or both end first) |
+| `strview_from_cstr` | `fn(cstr: *u8) -> StrView` | View a NUL-terminated string, without the NUL |
+| `string_from_cstr` | `fn(cstr: *u8) -> String` | Owned copy of a C string |
+| `cstr_of` | `fn(s: @&String) -> *u8` | The String's own NUL-terminated buffer |
+| `eprints_cstr` | `fn(s: *u8)` | Print a C string to stderr. Prefer `eprints` |
+| `eprintln_cstr` | `fn(s: *u8)` | Print a C string and newline to stderr. Prefer `eprintln` |
+
 ### str
 
 **Module**: `ritzlib.str`
 
-C-string interop only: NUL-terminated `*u8`, for argv, syscalls and C APIs.
-New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
-(`ritzlib.string`, owned); get a view of a C string with `strview_from_cstr`.
+Byte predicates and the libc memory symbols. The C-string API is in
+[cstr](#cstr); `strcmp`, `strcpy`, `strcat`, `strchr`, `strstr` and `atoi` are
+gone (AGAST #4688). New code uses `StrView` (`ritzlib.strview`, borrowed) and
+`String` (`ritzlib.string`, owned).
 
-| `str` | Use instead |
+| Gone from `str` | Use instead |
 |-------|-------------|
-| `strlen` | `s.len()` on a `StrView` or `String` |
-| `streq`, `strneq` | `s.eq(t)` / `s.eq_cstr(c)`; `s.take(n)` then `s.eq(t)` |
 | `strcmp` | `s.cmp(t) -> Ordering` |
 | `strchr` | `s.find_byte(c)` |
 | `strrchr` | `s.rfind(t)` |
@@ -1082,41 +1091,16 @@ New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
 | `bzero`, `explicit_bzero` | `s.zero()`, `s.secure_zero()` on a `Span` |
 | `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `s.take(n)` to bound it |
 | `strcat` | `s.push_str(v)`, `s.push_string(other)` |
-| `atoi` | `s.parse_i64() -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |
+| `atoi` | `s.parse_i64() -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returned 0 or a prefix |
 | `itoa` (deleted, AGAST #4685) | `s.push_i64(n) -> bool` / `string_from_i64` / `{n}`; `fmt_i64_into(@buf, n)` with no allocation |
+| `String.push_cstr`, `Vec.push_str(*T)` | `s.push_str(v)` / `v.push_view(sv)` |
+| `String.eq_cstr`, `StrView.eq_cstr` | `s.eq(t)` / `==` |
+| `StrView.starts_with_cstr` | `s.starts_with("...")` |
+| `StrView.as_cstr_unchecked` | `string_from(sv)` then `cstr_of(@&s)` |
+| `Vec.as_str` | `strview_from_ptr(v.data, v.len)` |
 
-The byte predicates (`isdigit` .. `tolower`) take a `u8`, not a C string, and
-are fine to use. `memset`/`memcpy`/`memcmp`/`bcmp`/`memmove` stay here because
-the compiler emits calls to those symbols.
-
-**Length/Comparison**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `strlen` | `fn(s: *u8) -> i64` | String length |
-| `streq` | `fn(a: *u8, b: *u8) -> i32` | Equality check |
-| `strneq` | `fn(a: *u8, b: *u8, n: i64) -> i32` | First n chars equal |
-| `strcmp` | `fn(a: *u8, b: *u8) -> i32` | Lexicographic compare |
-
-**Search**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `strchr` | `fn(s: *u8, c: u8) -> *u8` | Find first char |
-| `strstr` | `fn(haystack: *u8, needle: *u8) -> *u8` | Find substring |
-
-**Copy/Concatenate**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `strcpy` | `fn(dest: *u8, src: *u8) -> *u8` | Copy string |
-| `strcat` | `fn(dest: *u8, src: *u8) -> *u8` | Concatenate |
-
-**Conversion**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `atoi` | `fn(s: *u8) -> i64` | String to integer |
+`memset`/`memcpy`/`memcmp`/`bcmp`/`memmove` stay here because the compiler
+emits calls to those symbols.
 
 **Character Classification**:
 
@@ -1701,8 +1685,6 @@ High-level console I/O functions. Numbers and Strings print through the
 |----------|-----------|-------------|
 | `eprints` | `fn(s: StrView)` | Print a StrView to stderr |
 | `eprintln` | `fn(s: StrView)` | Print a StrView to stderr with newline |
-| `eprints_cstr` | `fn(s: *u8)` | C interop: print a C string to stderr. Prefer `eprints` |
-| `eprintln_cstr` | `fn(s: *u8)` | C interop: print a C string to stderr with newline. Prefer `eprintln` |
 | `eprint_char` | `fn(c: u8)` | Print char to stderr |
 | `eprint_int` | `fn(n: i64)` | Print int to stderr |
 
@@ -1809,7 +1791,7 @@ High-level filesystem operations.
 
 There is one path API, and every path is a `StrView`. A `"..."` literal is
 already a StrView; a `String` passes `s.as_view()`; a C string passes
-`strview_from_cstr(p)`. Every `Err` is an `Errno` (see [errno](#errno), which
+`strview_from_cstr(p)` (`ritzlib.cstr`). Every `Err` is an `Errno` (see [errno](#errno), which
 fs re-exports): `NoEnt`, `Exist`, ..., or `Other(n)`; no fs function returns
 a `-1` / `null` sentinel. A path of 4096 bytes or more fails with
 `NameTooLong` without making a syscall.

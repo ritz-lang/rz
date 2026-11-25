@@ -371,12 +371,12 @@ fn f(s: StrView) -> Result<i64, ArgError>
     return Ok(3)
 
 pub fn main() -> i32
-    let e = ArgError.Missing(strview_from_cstr(c"x"))
+    let e = ArgError.Missing("x")
     var r: i64 = 0
-    match f(strview_from_cstr(c""))
+    match f("")
         Ok(n) => r = 100
         Err(e2) => prints("err\\n")
-    match f(strview_from_cstr(c"ab"))
+    match f("ab")
         Ok(n) => r = r + n + 39
         Err(e2) => r = 200
     return r as i32

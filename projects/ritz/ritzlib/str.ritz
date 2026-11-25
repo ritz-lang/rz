@@ -1,159 +1,21 @@
-# ritzlib/str.ritz - C-string interop only; new code uses StrView/String
+# ritzlib/str.ritz - byte predicates and the libc memory symbols
 #
-# Every string here is a NUL-terminated *u8: use these at the C boundary
-# (argv, syscalls, C APIs). Elsewhere use StrView (ritzlib.strview, borrowed)
-# or String (ritzlib.string, owned); strview_from_cstr views a C string.
+# The C-string functions (strlen, streq, strneq, strview_from_cstr, ...) live in
+# ritzlib.cstr, the one C-interop module (AGAST #4688). strcmp, strcpy, strcat,
+# strchr, strstr and atoi are gone; use StrView/String:
 #
-#   strlen            -> strview_len / string_len
-#   streq, strneq     -> strview_eq, strview_eq_cstr (strview_take to bound)
-#   strcmp            -> strview_cmp
-#   strchr            -> strview_find_byte
-#   strstr            -> strview_find, strview_contains
-#   strcpy            -> string_from (the String owns its copy)
-#   strcat            -> string_push_str, string_push_string
-#   atoi              -> strview_parse_i64 (None for "", "abc", "12x", overflow)
-#   itoa              -> string_push_i64 / string_from_i64 / `{n}`; it is gone
-#                        (AGAST #4685), and fmt_i64_into(@buf20, n) is the
-#                        no-allocation form
+#   strcmp  -> StrView.cmp          strchr -> StrView.find_byte
+#   strstr  -> StrView.find / contains
+#   strcpy  -> string_from(sv)      strcat -> String.push_str / push_string
+#   atoi    -> StrView.parse_i64 (None for "", "abc", "12x", overflow)
+#   itoa    -> string_push_i64 / string_from_i64 / `{n}`, or fmt_i64_into
 #
-# The byte predicates (isdigit .. tolower) take a u8, not a C string, and are
-# fine to use. memset/memcpy/memcmp/bcmp/memmove live here because the
-# compiler emits calls to those symbols.
+# The byte predicates (isdigit .. tolower) take a u8, not a C string. memset,
+# memcpy, memcmp, bcmp and memmove live here because the compiler emits calls
+# to those symbols.
 #
-# standard-exempt-file: ptr-return: the libc ABI: strchr/strstr/strcpy/memcpy and kin return the C pointer they are specified to
+# standard-exempt-file: ptr-return: the libc ABI: memset/memcpy/memmove return the C pointer they are specified to
 
-
-# ============================================================================
-# Length and comparison
-# ============================================================================
-
-# standard-exempt: raw-ptr-param: C string ABI: strlen(3)
-pub fn strlen(s: *u8) -> i64
-    var len: i64 = 0
-    while *(s + len) != 0
-        len += 1
-    return len
-
-# standard-exempt: raw-ptr-param: C string ABI: strcmp(3) equality, no ordering
-pub fn streq(a: *u8, b: *u8) -> bool
-    var i: i64 = 0
-    while *(a + i) != 0 and *(b + i) != 0
-        if *(a + i) != *(b + i)
-            return false
-        i += 1
-    return *(a + i) == *(b + i)
-
-# standard-exempt: ptr-len-param, raw-ptr-param: C string ABI: strncmp(3) bound, NUL-terminated *u8
-pub fn strneq(a: *u8, b: *u8, n: i64) -> bool
-    var i: i64 = 0
-    while i < n and *(a + i) != 0 and *(b + i) != 0
-        if *(a + i) != *(b + i)
-            return false
-        i += 1
-    if i == n
-        return true
-    return *(a + i) == *(b + i)
-
-# C strcmp: three-way ordering (-1/0/1), not an error (S-RESULT-1).
-# standard-exempt: sentinel-return, raw-ptr-param: C string ABI: strcmp(3) three-way ordering, not an error
-pub fn strcmp(a: *u8, b: *u8) -> i32
-    var i: i64 = 0
-    while *(a + i) != 0 and *(b + i) != 0
-        if *(a + i) < *(b + i)
-            return -1
-        if *(a + i) > *(b + i)
-            return 1
-        i += 1
-    if *(a + i) == 0 and *(b + i) == 0
-        return 0
-    if *(a + i) == 0
-        return -1
-    return 1
-
-# ============================================================================
-# Search
-# ============================================================================
-
-# C strchr: a pointer into `s`, or null when `c` is absent (C string ABI,
-# S-OPTION-1's foreign-ABI null case). New code uses strview_find_byte.
-# standard-exempt: null-return, raw-ptr-param: C string ABI: strchr(3), null is "not found"
-pub fn strchr(s: *u8, c: u8) -> *u8
-    var i: i64 = 0
-    while *(s + i) != 0
-        if *(s + i) == c
-            return s + i
-        i += 1
-    if c == 0
-        return s + i
-    return null
-
-# C strstr: a pointer into `haystack`, or null when `needle` is absent (C
-# string ABI, S-OPTION-1's foreign-ABI null case). New code uses strview_find.
-# standard-exempt: null-return, raw-ptr-param: C string ABI: strstr(3), null is "not found"
-pub fn strstr(haystack: *u8, needle: *u8) -> *u8
-    if *needle == 0
-        return haystack
-    var i: i64 = 0
-    while *(haystack + i) != 0
-        var j: i64 = 0
-        while *(needle + j) != 0 and *(haystack + i + j) == *(needle + j)
-            j += 1
-        if *(needle + j) == 0
-            return haystack + i
-        i += 1
-    return null
-
-# ============================================================================
-# Copy and concatenate
-# ============================================================================
-
-# standard-exempt: raw-ptr-param: C string ABI: strcpy(3)
-pub fn strcpy(dest: *u8, src: *u8) -> *u8
-    var i: i64 = 0
-    while *(src + i) != 0
-        *(dest + i) = *(src + i)
-        i += 1
-    *(dest + i) = 0
-    return dest
-
-# standard-exempt: raw-ptr-param: C string ABI: strcat(3)
-pub fn strcat(dest: *u8, src: *u8) -> *u8
-    var len: i64 = strlen(dest)
-    strcpy(dest + len, src)
-    return dest
-
-# ============================================================================
-# Conversion
-# ============================================================================
-
-# C interop. Reads "abc" as 0 and "12x" as 12, and wraps on overflow; new code
-# uses strview_parse_i64, which returns None for all three.
-# standard-exempt: raw-ptr-param: C string ABI: atoi(3)
-pub fn atoi(s: *u8) -> i64
-    var result: i64 = 0
-    var neg: i32 = 0
-    var i: i64 = 0
-
-    # Skip whitespace
-    while *(s + i) == ' ' or *(s + i) == '\t'
-        i += 1
-
-    # Check sign
-    if *(s + i) == '-'  # '-'
-        neg = 1
-        i += 1
-    else if *(s + i) == '+'  # '+'
-        i += 1
-
-    # Parse digits. C atoi wraps on overflow: spelled `*%`/`+%`/`-%` because
-    # plain operators trap (LARB R63).
-    while *(s + i) >= '0' and *(s + i) <= '9'
-        result = result *% 10 +% (*(s + i) - '0') as i64
-        i += 1
-
-    if neg != 0
-        return 0 -% result
-    return result
 
 # ============================================================================
 # Character classification

@@ -44,7 +44,6 @@ STATICS = {
     "field_of_the_result": ('    var t = String.from("xy")\n    t.data.push(65)\n'
                             "    t.data.len as i32\n", 3),
     "from_i64": ("    let t = String.from_i64(4207)\n    t.len() as i32\n", 4),
-    "from_cstr": ('    let t = String.from_cstr(c"hello")\n    t.len() as i32\n', 5),
     "annotated": ("    var s: String = String.new()\n    s.push('q')\n"
                   "    s.len() as i32\n", 1),
     "as_an_argument": ('    count(String.from("abcd"))\n', 4),

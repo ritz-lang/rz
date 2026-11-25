@@ -33,6 +33,7 @@ from parser import Parser
 RITZ_ROOT = Path(__file__).resolve().parents[2]
 LEGACY_PRINTERS = ("prints_cstr", "println_cstr", "print_int", "print_hex", "print_string")
 IO_RITZ = RITZ_ROOT / "ritzlib" / "io.ritz"
+CSTR_RITZ = RITZ_ROOT / "ritzlib" / "cstr.ritz"  # the C-string fns moved here (#4688)
 
 STRING_PRINTERS = ("eprint_string", "println_string", "eprintln_string")
 # Each _cstr fn -> the StrView function its doc comment must point callers at.
@@ -42,9 +43,9 @@ CSTR_INTEROP = {
 }
 
 
-def _pub_fns():
-    """Parse io.ritz and return {name: FnDef} for every `pub fn`."""
-    module = Parser(tokenize(IO_RITZ.read_text())).parse_module()
+def _pub_fns(path=IO_RITZ):
+    """Parse `path` (io.ritz) and return {name: FnDef} for every `pub fn`."""
+    module = Parser(tokenize(path.read_text())).parse_module()
     return {
         item.name: item
         for item in module.items
@@ -63,9 +64,9 @@ def _mentions_raw_pointer(ty) -> bool:
     return False
 
 
-def _doc_comment(fn_name: str) -> str:
+def _doc_comment(fn_name: str, path=IO_RITZ) -> str:
     """The contiguous `#` comment block directly above `pub fn <fn_name>(`."""
-    lines = IO_RITZ.read_text().splitlines()
+    lines = path.read_text().splitlines()
     idx = next(i for i, l in enumerate(lines) if l.startswith(f"pub fn {fn_name}("))
     block = []
     i = idx - 1
@@ -104,8 +105,9 @@ def test_only_cstr_interop_fns_take_raw_pointers():
 @pytest.mark.parametrize("name", CSTR_INTEROP)
 def test_cstr_fns_are_kept_and_documented_as_c_interop(name):
     fns = _pub_fns()
-    assert name in fns, f"{name} must stay (deletion is out of scope for #1469)"
-    doc = _doc_comment(name)
+    assert name not in fns, f"{name} moved to ritzlib.cstr (#4688)"
+    assert name in _pub_fns(CSTR_RITZ), f"{name} must stay, in cstr.ritz"
+    doc = _doc_comment(name, CSTR_RITZ)
     assert "C interop" in doc, f"{name} doc comment must mark it as C interop:\n{doc}"
     target = CSTR_INTEROP[name]
     assert target in fns, f"{target} (the StrView alternative) missing from io.ritz"

@@ -121,7 +121,7 @@ SOURCES = \
 #   and the `{x}` formatting of main.ritz (AGAST #4690).
 # - errno: io.ritz's vec_read_all_fd returns Err(errno).
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str fmt_digits string strview cmp hash hashmap memory gvec drop option result json span os_env timer errno fmt_display fmt_impls fmt_writer fmt_spec
+RITZLIB_MODULES = sys io str cstr fmt_digits string strview cmp hash hashmap memory gvec drop option result json span os_env timer errno fmt_display fmt_impls fmt_writer fmt_spec
 
 # Build artifacts
 BUILD_DIR = build

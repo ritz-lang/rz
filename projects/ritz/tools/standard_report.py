@@ -515,6 +515,8 @@ def scan_tree(paths: list[Path]) -> list[Site]:
 
 IMPORT_RE = re.compile(r"^import\s+ritzlib\.([\w.]+)\s*(?:\{([^}]*)\}?)?")
 CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\(")
+# A method call: `.name(`.  exempt_apis keys an exempt method as ".name".
+METHOD_RE = re.compile(r"\.(\w+)\s*\(")
 DEF_RE = re.compile(r"^\s*(?:pub\s+)?(?:async\s+)?(?:extern\s+)?fn\s+")
 
 
@@ -528,17 +530,39 @@ class CallSite:
 def exempt_apis(lib: Path) -> dict[str, set[str]]:
     """{name: {defining module, dotted from `lib`}} of every exempt API.
 
-    An exempt API is a ``pub`` module-level fn with at least one exempt site.
+    An exempt API is a ``pub`` module-level fn with at least one exempt site,
+    or a ``pub`` method of an inherent ``impl`` with one (#4688: ``push_cstr``
+    and the other methods were missing from every pin).  A method is keyed
+    ``".name"`` and counted at each ``.name(`` call in a file that imports its
+    module.  The receiver type is not known, so a name that any ``pub`` method
+    defines without an exemption is not counted, and a ``ptr-return`` method
+    (an accessor such as ``as_ptr``) is not a C-string API and is not counted.
     """
     out: dict[str, set[str]] = {}
+    accessors: set[str] = set()       # a method with a ptr-return exemption
+    plain_methods: set[str] = set()   # a pub method of this name with no exemption
     for f in iter_sources([lib]):
         module = ".".join(f.relative_to(lib).with_suffix("").parts)
         text = f.read_text(errors="replace")
-        fns, _, _ = parse_fns(text)
+        fns, _, file_exempts = parse_fns(text)
         public = {fn.name for fn in fns if fn.public and fn.in_impl is None}
+        methods = {fn.name for fn in fns if fn.public and fn.in_impl == "inherent"}
+        plain_methods |= {fn.name for fn in fns if fn.public and fn.in_impl == "inherent"
+                          and not fn.exemptions and not file_exempts}
         for s in scan_source(text, str(f)):
-            if s.exempt is not None and s.fn in public:
+            if s.exempt is None:
+                continue
+            if s.fn in public:
                 out.setdefault(s.fn, set()).add(module)
+            if s.fn in methods and s.key == "ptr-return":
+                accessors.add(s.fn)
+            if s.fn in methods:
+                out.setdefault("." + s.fn, set()).add(module)
+    # A method call names no receiver type, so a name some other type defines
+    # without an exemption (StrView.as_ptr beside String.as_ptr) would count
+    # calls that are not exempt: leave that name out.
+    for name in plain_methods | accessors:
+        out.pop("." + name, None)
     return out
 
 
@@ -591,12 +615,21 @@ def count_callers(lib: Path, roots: list[Path],
             for i, raw in enumerate(lines):
                 if DEF_RE.match(raw):
                     continue
-                for m in CALL_RE.finditer(strip_comment(raw)):
-                    mods = apis.get(m.group(1))
+                code = strip_comment(raw)
+                for m in CALL_RE.finditer(code):
+                    name = m.group(1)
+                    mods = apis.get(name)
                     if mods and any(mod in imports and (imports[mod] is None
-                                                       or m.group(1) in imports[mod])
+                                                       or name in imports[mod])
                                     for mod in mods):
-                        sites.append(CallSite(m.group(1), str(f), i + 1))
+                        sites.append(CallSite(name, str(f), i + 1))
+                for m in METHOD_RE.finditer(code):
+                    name = "." + m.group(1)
+                    mods = apis.get(name)
+                    # A method is reached through its type, not imported by name:
+                    # the module (or any `{...}` import of it) is enough.
+                    if mods and any(mod in imports for mod in mods):
+                        sites.append(CallSite(name, str(f), i + 1))
     return sites
 
 

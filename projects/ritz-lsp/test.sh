@@ -327,7 +327,7 @@ for argv in ([], ["--stdio"]):
 # import of an imported module is private to it (#3891), and so is a fn
 # without `pub`. The tree's path has a space, so the Location's uri must be
 # percent-encoded the way an editor encodes it.
-RITZLIB_STR = REAL_RITZ1.parents[2] / "ritzlib" / "str.ritz"
+RITZLIB_STR = REAL_RITZ1.parents[2] / "ritzlib" / "cstr.ritz"
 tree = scratch / "imp tree"
 files = {
     "app/util.ritz": "pub import reexp\nimport plain\n\npub fn util_fn() -> i32\n    1\n\nfn private_fn() -> i32\n    2\n",
@@ -348,7 +348,7 @@ for rel, text in files.items():
 # tree/deepsib.ritz is an ancestor of lib/ too, but lib/'s own directory is
 # probed first, so lib/deepsib.ritz answers.
 iuri = (tree / "app" / "main.ritz").as_uri()
-isrc = ("import ritzlib.str\n"                                      # 0
+isrc = ("import ritzlib.cstr\n"                                      # 0
         "import util\n"                                             # 1
         "import lib.deep { deep_fn }\n"                             # 2
         "import extpkg.thing\n"                                     # 3
@@ -383,7 +383,7 @@ ireqs = [
     req(17, "textDocument/definition", iuri, 8, at(L8, "decoy_mem")),
 ]
 IENV = {**NO_RITZ1, "RITZ_PATH": str(tree / "ext")}
-rc, out = session([did_open(iuri, isrc), did_open("untitled:Untitled-1", "import ritzlib.str\n    strlen(c\"\")\n"),
+rc, out = session([did_open(iuri, isrc), did_open("untitled:Untitled-1", "import ritzlib.cstr\n    strlen(c\"\")\n"),
                    *ireqs], env=IENV)
 r = by_id(out)
 def res(rid):
@@ -781,7 +781,7 @@ if REAL_RITZ1.is_file():
     check("ritz1: ritzlib imports resolve with no RITZ_PATH set",
           d[1].get("diagnostics") == [], repr(d[1]))
     # ritz1's byte column becomes UTF-16 units after é€😀 (#3885).
-    mb_src = f'import ritzlib.str\n\nfn main() -> i32\n    (strlen(c"{MB}") + nope(1)) as i32\n'
+    mb_src = f'import ritzlib.cstr\n\nfn main() -> i32\n    (strlen(c"{MB}") + nope(1)) as i32\n'
     mb_l3 = mb_src.splitlines()[3]
     mc = u16(mb_l3[:mb_l3.index("nope")])
     rc, out = session([did_open(ruri, mb_src, 1)], env=env, cwd=str(scratch))

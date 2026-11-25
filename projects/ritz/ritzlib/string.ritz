@@ -4,7 +4,7 @@
 # Internally uses Vec<u8> for storage.
 #
 # For low-level C-style string operations on *u8, see ritzlib.str
-# (strlen, strcmp, strcpy, memcpy, etc.)
+# (memcpy, etc.; the C-string calls are in ritzlib.cstr)
 #
 # Usage:
 #   var s: String = string_from("hello")
@@ -13,7 +13,7 @@
 #   # Automatic cleanup when s goes out of scope (Drop trait)
 
 import ritzlib.memory
-import ritzlib.str     # memcpy, strlen
+import ritzlib.str     # memcpy
 import ritzlib.gvec
 import ritzlib.drop
 import ritzlib.hash
@@ -78,20 +78,6 @@ pub fn string_from(sv: StrView) -> String
     # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
     if s.data.ensure_cap(sv.len + 1)
         s.push_span(Span<u8> { ptr: sv.ptr, len: sv.len })
-
-    return s
-
-# Create a string from a C string (null-terminated *u8).
-# DEPRECATED: Use string_from() with StrView instead.
-# For FFI C strings, convert to StrView first: string_from(strview_from_cstr(cstr))
-# standard-exempt: raw-ptr-param: NUL-terminated C-string ABI
-pub fn string_from_cstr(cstr: *u8) -> String
-    var s: String = String { data: vec_new<u8>() }
-
-    # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
-    let len: i64 = strlen(cstr)
-    if s.data.ensure_cap(len + 1)
-        s.push_span(Span<u8> { ptr: cstr, len: len })
 
     return s
 
@@ -163,10 +149,6 @@ impl String
     pub fn from(sv: StrView) -> String
         return string_from(sv)
 
-    # standard-exempt: raw-ptr-param: NUL-terminated C-string ABI
-    pub fn from_cstr(cstr: *u8) -> String
-        return string_from_cstr(cstr)
-
     pub fn from_bytes(bytes: Span<u8>) -> String
         return string_from_bytes(bytes)
 
@@ -202,7 +184,7 @@ impl String
     # If the byte for the NUL can't be allocated, nothing is written: an empty
     # String reads as c"", a non-empty one returns null (AGAST #3551).
     # standard-exempt: null-return: raw pointer to the String's own buffer; null only when the NUL slot allocation fails (allocator boundary)
-    # standard-exempt: ptr-return: the raw accessor for interop: the NUL-terminated buffer for C
+    # standard-exempt: ptr-return: the raw accessor for interop: the buffer plus its trailing zero slot, for C
     pub fn as_ptr(self: @&String) -> *u8
         # Ensure null-terminated
         let len: i64 = self.data.len
@@ -230,15 +212,9 @@ impl String
         return self.data.push(b)
 
     # Push a StrView onto the string. A "..." literal is a StrView, so it passes
-    # straight in. For a NUL-terminated C string use s.push_cstr.
+    # straight in. A C string is viewed first: ritzlib.cstr.strview_from_cstr.
     pub fn push_str(self: @&String, sv: StrView) -> bool
         return self.push_span(Span<u8> { ptr: sv.ptr, len: sv.len })
-
-    # Push a NUL-terminated C string onto the string (FFI / *u8 interop).
-    # The length is measured first, so cstr may be s.as_ptr() itself.
-    # standard-exempt: raw-ptr-param: NUL-terminated C-string ABI
-    pub fn push_cstr(self: @&String, cstr: *u8) -> bool
-        return self.push_span(Span<u8> { ptr: cstr, len: strlen(cstr) })
 
     # Push another String onto this string. `other` may be `s` itself.
     pub fn push_string(self: @&String, other: @String) -> bool
@@ -307,25 +283,6 @@ impl String
         for i in 0..len
             h = fnv1a_byte(h, self.data.get(i))
         return h
-
-    # Compare a String to a C string.
-    # standard-exempt: raw-ptr-param: NUL-terminated C-string ABI
-    pub fn eq_cstr(self: @String, cstr: *u8) -> bool
-        let len: i64 = self.data.len
-
-        var i: i64 = 0
-        while i < len
-            if *(cstr + i) == 0
-                return false  # cstr is shorter
-            if self.data.get(i) != *(cstr + i)
-                return false
-            i += 1
-
-        # Check that cstr ends here
-        if *(cstr + len) != 0
-            return false
-
-        return true
 
     # Clone a string (deep copy).
     pub fn clone(self: @String) -> String

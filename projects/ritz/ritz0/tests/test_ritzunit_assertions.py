@@ -147,10 +147,10 @@ fn cstr_helpers_hold() -> i32
 
 [[test]]
 fn view_helpers_hold() -> i32
-    var a: StrView = strview_from_cstr(c"needle in haystack")
-    var b: StrView = strview_from_cstr(c"needle in haystack")
-    var pre: StrView = strview_from_cstr(c"needle")
-    var mid: StrView = strview_from_cstr(c"in hay")
+    var a: StrView = "needle in haystack"
+    var b: StrView = "needle in haystack"
+    var pre: StrView = "needle"
+    var mid: StrView = "in hay"
     assert_str_eq_sv(a, b)
     assert_starts_with_sv(a, pre)
     assert_contains_sv(a, mid)
@@ -197,8 +197,8 @@ import ritzunit.assertions
 
 [[test]]
 fn fails() -> i32
-    var a: StrView = strview_from_cstr(c"abc")
-    var b: StrView = strview_from_cstr(c"abd")
+    var a: StrView = "abc"
+    var b: StrView = "abd"
     {call}
     0
 """

@@ -35,6 +35,7 @@ RITZLIB = Path(__file__).resolve().parent.parent.parent / "ritzlib"
 # module (path under ritzlib) -> (violations, violations + exempt)
 PINS: dict[str, tuple[int, int]] = {
     "box.ritz": (0, 1),
+    "cstr.ritz": (0, 1),
     "gvec.ritz": (1, 3),     # as_str is #4688's
     "iovec.ritz": (0, 1),
     "memory.ritz": (0, 11),

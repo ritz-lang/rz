@@ -51,12 +51,12 @@ def test_string_eq_family_returns_bool(method):
 # Span<u8>'s are methods of span.ritz's Bytes trait (`impl Bytes for Span<u8>`).
 PREDICATE_METHODS = {
     "string.ritz": [
-        "eq", "eq_string", "eq_strview", "eq_cstr", "is_empty",
+        "eq", "eq_string", "eq_strview", "is_empty",
         "starts_with", "starts_with_string", "ends_with",
         "ends_with_string", "contains", "contains_string",
     ],
     "strview.ritz": [
-        "is_empty", "eq", "eq_cstr", "starts_with", "starts_with_cstr",
+        "is_empty", "eq", "starts_with",
         "ends_with", "contains",
     ],
     "span.ritz": ["is_empty", "eq", "contains", "starts_with", "ends_with"],

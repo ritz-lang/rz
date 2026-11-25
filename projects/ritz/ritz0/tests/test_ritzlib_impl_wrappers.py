@@ -59,13 +59,13 @@ RITZ_ROOT = RITZ0_DIR.parent
 RITZLIB = RITZ_ROOT / "ritzlib"
 
 STRING_STATIC = {
-    "new", "with_cap", "from", "from_cstr", "from_bytes", "from_strview",
+    "new", "with_cap", "from", "from_bytes", "from_strview",
     "from_i64", "from_hex",
 }
 STRING_METHODS = STRING_STATIC | {
     "len", "cap", "is_empty", "as_ptr", "as_view", "get", "push", "push_str",
-    "push_cstr", "push_string", "push_bytes", "push_span", "clear", "pop", "eq",
-    "eq_string", "hash", "eq_cstr", "clone", "starts_with_string",
+    "push_string", "push_bytes", "push_span", "clear", "pop", "eq",
+    "eq_string", "hash", "clone", "starts_with_string",
     "ends_with_string", "contains_string", "find", "slice", "char_at",
     "set_char", "starts_with", "ends_with", "contains", "push_i64",
     "to_lower", "eq_strview", "deinit",
@@ -141,14 +141,14 @@ fn main() -> i32
     var s: String = String.new()
     var u: String = String.with_cap(8)
     let a: String = String.from("ab")
-    let b: String = String.from_cstr(c"cd")
+    let b: String = String.from("cd")
     let c: String = String.from_bytes(Span<u8> { ptr: (c"ef"), len: (2) as i64 })
     let d: String = String.from_strview("gh")
     let e: String = String.from_i64(42)
     let f: String = String.from_hex(255)
     s.push('x')
     s.push_str("yz")
-    s.push_cstr(c"w")
+    s.push_str("w")
     s.push_string(@a)
     s.push_bytes(Span<u8> { ptr: (c"qq"), len: (2) as i64 })
     s.push_i64(7)
@@ -161,7 +161,7 @@ fn main() -> i32
     t = t + (s.get(0) + s.char_at(1) + s.pop()) as i64
     let ptr: *u8 = s.as_ptr()
     let view: StrView = s.as_view()
-    if s.is_empty() or s.eq("x") or s.eq_string(@b) or s.eq_cstr(c"x")
+    if s.is_empty() or s.eq("x") or s.eq_string(@b) or s.eq("x")
         t = t + 1
     if s.starts_with("X") and s.ends_with("q") and s.contains("yz")
         t = t + 1

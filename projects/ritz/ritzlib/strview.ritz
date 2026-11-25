@@ -13,7 +13,7 @@
 # Usage:
 #   let greeting = "hello"           # StrView (default in RERITZ)
 #   let owned = greeting.to_string() # String (explicit heap allocation)
-#   let cstr = greeting.as_cstr_unchecked()  # *u8 (for FFI)
+#   # a C string: ritzlib.cstr (strview_from_cstr, cstr_of); strview is C-free
 #
 # Note: StrView must not outlive the data it references.
 # For owned strings that can be stored/moved, use String.
@@ -21,7 +21,7 @@
 # Heap-free (BARE in tools/ritzlib_layers.py, AGAST #4601): this module imports
 # only ritzlib.option and ritzlib.cmp, so a target with no allocator (harland's
 # UEFI loader and HWINV) imports it. For an owned NUL-terminated copy, use
-# ritzlib.string's string_from(sv) and its as_ptr().
+# ritzlib.string's string_from(sv) and its as_ptr() (ritzlib.cstr.cstr_of).
 
 import ritzlib.option  # parse_i64, split_once -> Option
 import ritzlib.cmp     # cmp -> Ordering
@@ -59,16 +59,6 @@ pub fn strview_from_ptr(ptr: *u8, len: i64) -> StrView
     s.len = len
     return s
 
-# Create a StrView from a null-terminated C string
-# standard-exempt: raw-ptr-param: NUL-terminated C-string ABI
-pub fn strview_from_cstr(cstr: *u8) -> StrView
-    var s: StrView
-    s.ptr = cstr
-    s.len = 0
-    while *(cstr + s.len) != 0
-        s.len += 1
-    return s
-
 # ============================================================================
 # Method syntax support (impl block)
 # ============================================================================
@@ -93,16 +83,6 @@ impl StrView
     pub fn as_ptr(self: StrView) -> *u8
         return self.ptr
 
-    # Get a pointer suitable for C FFI.
-    # If the original data is null-terminated (like string literals),
-    # this returns the pointer directly. Otherwise, behavior is undefined
-    # if passed to C functions expecting null termination.
-    # For guaranteed null-termination, copy into a String
-    # (string_from(sv).as_ptr()).
-    # standard-exempt: ptr-return: the raw accessor for interop: C needs the pointer, and says so (unchecked)
-    pub fn as_cstr_unchecked(self: StrView) -> *u8
-        return self.ptr
-
     # Compare two StrViews for equality
     pub fn eq(self: StrView, b: StrView) -> bool
         if self.len != b.len
@@ -112,21 +92,6 @@ impl StrView
         for i in 0..self.len
             if *(self.ptr + i) != *(b.ptr + i)
                 return false
-        return true
-
-    # Compare a StrView to a null-terminated C string
-    # standard-exempt: raw-ptr-param: NUL-terminated C-string ABI
-    pub fn eq_cstr(self: StrView, cstr: *u8) -> bool
-        var i: i64 = 0
-        while i < self.len
-            if *(cstr + i) == 0
-                return false  # cstr is shorter
-            if *(self.ptr + i) != *(cstr + i)
-                return false
-            i += 1
-        # Check that cstr ends here
-        if *(cstr + i) != 0
-            return false
         return true
 
     # Lexicographic comparison of two StrViews, bytes unsigned; a proper
@@ -198,18 +163,6 @@ impl StrView
         for i in 0..prefix.len
             if *(self.ptr + i) != *(prefix.ptr + i)
                 return false
-        return true
-
-    # Check if view starts with a C string prefix
-    # standard-exempt: raw-ptr-param: NUL-terminated C-string ABI
-    pub fn starts_with_cstr(self: StrView, prefix: *u8) -> bool
-        var i: i64 = 0
-        while *(prefix + i) != 0
-            if i >= self.len
-                return false
-            if *(self.ptr + i) != *(prefix + i)
-                return false
-            i += 1
         return true
 
     # Check if view ends with suffix
@@ -340,7 +293,7 @@ impl StrView
 
     # The whole view as a decimal i64: an optional '-' or '+', then digits only,
     # range-checked. Anything else (empty, a bare sign, whitespace, trailing junk,
-    # overflow) is None. This replaces str.atoi, which reads "abc" as 0.
+    # overflow) is None. (The C atoi, which read "abc" as 0, is gone.)
     pub fn parse_i64(self: StrView) -> Option<i64>
         var i: i64 = 0
         var negative: bool = false
