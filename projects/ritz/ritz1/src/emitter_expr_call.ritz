@@ -3830,26 +3830,86 @@ fn sizeof_call_value(s: *EmitterState, e: *Expr) -> i64
         sizeof_error(s, arg, StrView { ptr: (null), len: (0) as i64 })
     return 0
 
-pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
-    record_assert_site(s, e)   # AGAST #1869: in a [[test]] fn only
-    # Variant constructor: Some(x) / Ok(x) / None / Err(x) -> %Result$.../
-    # Option$... struct.  Handled before the generic call path so
-    # match/return paths get a type-correct aggregate (ritz-task-133).
-    # AGAST #2453: a user enum declaring `Ok` / `Some` (or `Err` / `None`)
-    # builds its own variant unless an Option / Result slot names the builtin.
-    if users_variant_wins(s, e) == 1
-        return try_emit_user_variant_ctor(s, e)
-    if is_variant_carrier(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1
-        # Ok / Some = tag 0
-        return emit_variant_struct(s, 0, e)
-    if is_variant_null(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1
-        # Err = tag 1 (None is the no-arg case, handled in emit_expr_ident)
-        return emit_variant_struct(s, 1, e)
-    # User-enum payload variant `Holds(x)` (AGAST #1797).  Before the
-    # generic call path, as ritz0 checks variant_to_enum before functions.
-    let user_ctor: i32 = try_emit_user_variant_ctor(s, e)
-    if user_ctor != 0
-        return user_ctor
+# A call-position compiler intrinsic, lowered inline and never an extern.
+# SIMD builtins (AGAST #167) become native LLVM vector instructions: the
+# generic call path's `call i64 @simd_loadu(ptr ...)` then `store %v4i32`
+# failed the IR verifier (ritz0's _try_emit_simd_builtin).  The x86 SHA-NI /
+# AES-NI ones take and return vectors and map onto `llvm.x86.*` directly.
+enum CallIntrinsicOp
+    SimdLoad
+    SimdStore
+    SimdXor
+    SimdAdd
+    SimdExtract
+    SimdInsert
+    SimdShuffle
+    SimdRotl
+    SimdSad
+    SimdClmul
+    X86V4i32
+    X86V2i64
+    AesKeygenAssist
+    Xgetbv
+
+# `llvm` names an X86* op's LLVM intrinsic; `arg` is its operand count, or a
+# SimdLoad / SimdStore's unaligned flag.
+struct CallIntrinsic
+    name: StrView
+    op: CallIntrinsicOp
+    llvm: StrView
+    arg: i32
+
+const CALL_INTRINSICS: [22]CallIntrinsic = [
+    CallIntrinsic { name: "simd_loadu", op: CallIntrinsicOp.SimdLoad, llvm: "", arg: 1 },
+    CallIntrinsic { name: "simd_load", op: CallIntrinsicOp.SimdLoad, llvm: "", arg: 0 },
+    CallIntrinsic { name: "simd_storeu", op: CallIntrinsicOp.SimdStore, llvm: "", arg: 1 },
+    CallIntrinsic { name: "simd_store", op: CallIntrinsicOp.SimdStore, llvm: "", arg: 0 },
+    CallIntrinsic { name: "simd_xor", op: CallIntrinsicOp.SimdXor, llvm: "", arg: 0 },
+    CallIntrinsic { name: "simd_add", op: CallIntrinsicOp.SimdAdd, llvm: "", arg: 0 },
+    CallIntrinsic { name: "simd_extract", op: CallIntrinsicOp.SimdExtract, llvm: "", arg: 0 },
+    CallIntrinsic { name: "simd_insert", op: CallIntrinsicOp.SimdInsert, llvm: "", arg: 0 },
+    CallIntrinsic { name: "simd_shuffle", op: CallIntrinsicOp.SimdShuffle, llvm: "", arg: 0 },
+    CallIntrinsic { name: "simd_rotl", op: CallIntrinsicOp.SimdRotl, llvm: "", arg: 0 },
+    CallIntrinsic { name: "simd_sad", op: CallIntrinsicOp.SimdSad, llvm: "", arg: 0 },
+    CallIntrinsic { name: "simd_clmul", op: CallIntrinsicOp.SimdClmul, llvm: "", arg: 0 },
+    CallIntrinsic { name: "sha256rnds2", op: CallIntrinsicOp.X86V4i32, llvm: "llvm.x86.sha256rnds2", arg: 3 },
+    CallIntrinsic { name: "sha256msg1", op: CallIntrinsicOp.X86V4i32, llvm: "llvm.x86.sha256msg1", arg: 2 },
+    CallIntrinsic { name: "sha256msg2", op: CallIntrinsicOp.X86V4i32, llvm: "llvm.x86.sha256msg2", arg: 2 },
+    CallIntrinsic { name: "aesenc", op: CallIntrinsicOp.X86V2i64, llvm: "llvm.x86.aesni.aesenc", arg: 2 },
+    CallIntrinsic { name: "aesenclast", op: CallIntrinsicOp.X86V2i64, llvm: "llvm.x86.aesni.aesenclast", arg: 2 },
+    CallIntrinsic { name: "aesdec", op: CallIntrinsicOp.X86V2i64, llvm: "llvm.x86.aesni.aesdec", arg: 2 },
+    CallIntrinsic { name: "aesdeclast", op: CallIntrinsicOp.X86V2i64, llvm: "llvm.x86.aesni.aesdeclast", arg: 2 },
+    CallIntrinsic { name: "aesimc", op: CallIntrinsicOp.X86V2i64, llvm: "llvm.x86.aesni.aesimc", arg: 1 },
+    CallIntrinsic { name: "aeskeygenassist", op: CallIntrinsicOp.AesKeygenAssist, llvm: "", arg: 0 },
+    CallIntrinsic { name: "xgetbv", op: CallIntrinsicOp.Xgetbv, llvm: "", arg: 0 }
+]
+
+# The intrinsic `name` calls, or null.
+fn call_intrinsic_named(name: StrView) -> *CallIntrinsic
+    for i in 0..22
+        if name_eq(name, CALL_INTRINSICS[i].name) == 1
+            return @CALL_INTRINSICS[i]
+    null
+
+fn emit_call_intrinsic(s: *EmitterState, e: *Expr, ci: *CallIntrinsic) -> i32
+    match ci.op
+        CallIntrinsicOp.SimdLoad => emit_simd_loadu(s, e, ci.arg)
+        CallIntrinsicOp.SimdStore => emit_simd_storeu(s, e, ci.arg)
+        CallIntrinsicOp.SimdXor => emit_simd_binop(s, e, c"xor")
+        CallIntrinsicOp.SimdAdd => emit_simd_binop(s, e, c"add")
+        CallIntrinsicOp.SimdExtract => emit_simd_extract(s, e)
+        CallIntrinsicOp.SimdInsert => emit_simd_insert(s, e)
+        CallIntrinsicOp.SimdShuffle => emit_simd_shuffle(s, e)
+        CallIntrinsicOp.SimdRotl => emit_simd_rotl(s, e)
+        CallIntrinsicOp.SimdSad => emit_simd_sad(s, e)
+        CallIntrinsicOp.SimdClmul => emit_simd_clmul(s, e)
+        CallIntrinsicOp.X86V4i32 => emit_x86_intrinsic_v4i32(s, e, ci.llvm, ci.arg)
+        CallIntrinsicOp.X86V2i64 => emit_x86_intrinsic_v2i64(s, e, ci.llvm, ci.arg, -1)
+        CallIntrinsicOp.AesKeygenAssist => emit_aeskeygenassist(s, e)
+        CallIntrinsicOp.Xgetbv => emit_xgetbv(s, e)
+
+# print / eprint / println / eprintln of a literal: 1 (result in *out) when lowered here.
+fn try_emit_print_call(s: *EmitterState, e: *Expr, out: *i32) -> i32
     # print() / eprint() built-ins: the same lowering to fd 1 / fd 2 (#1641).
     # println / eprintln take it too, but only for an interpolated literal
     # (a plain one stays the ritzlib.io function that adds the newline).
@@ -3871,7 +3931,61 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         if e.args == null or e.args.next != null or interp_lit_has_placeholder(e.args) == 0
             print_fd = 0
             print_newline = 0
+    if print_fd == 0
+        return 0
+    # print(str) -> syscall(1, fd, str_ptr, str_len)
+    # Get the first argument - should be a string literal
+    var arg: *Expr = e.args
+    if arg != null
+        # "..." interpolates `{expr}` placeholders; c"..." is written
+        # verbatim, and rejected if it holds one (AGAST #1521, #1394).
+        # emitter_print.ritz has the lowering.
+        if arg.kind == ExprKind.StringLit or arg.kind == ExprKind.CstringLit
+            *out = emit_print_literal(s, print_fd, arg, print_newline)
+            return 1
+        else
+            # Non-literal: evaluate the expression and call syscall
+            let str_reg: i32 = emit_expr(s, arg)
+            let result: i32 = next_reg(s)
+            emit_str(s, c"  ; print() with non-literal - strlen unknown\n")
+            emit_str(s, IR_INDENT)
+            emit_reg(s, result)
+            emit_str(s, IR_ADD_ZERO)
+            *out = result
+            return 1
+    let zero: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, zero)
+    emit_str(s, IR_ADD_ZERO)
+    *out = zero
+    return 1
 
+# The built-in calls checked before user fns (variant ctors, print, write,
+# format_into, sizeof, __builtin_alloca, intrinsics, memory builtins): 1
+# (result in *out) when `e` is one.
+fn try_emit_call_builtin(s: *EmitterState, e: *Expr, out: *i32) -> i32
+    # Variant constructor: Some(x) / Ok(x) / None / Err(x) -> %Result$.../
+    # Option$... struct.  Handled before the generic call path so
+    # match/return paths get a type-correct aggregate (ritz-task-133).
+    # AGAST #2453: a user enum declaring `Ok` / `Some` (or `Err` / `None`)
+    # builds its own variant unless an Option / Result slot names the builtin.
+    if users_variant_wins(s, e) == 1
+        *out = try_emit_user_variant_ctor(s, e)
+        return 1
+    if is_variant_carrier(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1
+        # Ok / Some = tag 0
+        *out = emit_variant_struct(s, 0, e)
+        return 1
+    if is_variant_null(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1
+        # Err = tag 1 (None is the no-arg case, handled in emit_expr_ident)
+        *out = emit_variant_struct(s, 1, e)
+        return 1
+    # User-enum payload variant `Holds(x)` (AGAST #1797).  Before the
+    # generic call path, as ritz0 checks variant_to_enum before functions.
+    let user_ctor: i32 = try_emit_user_variant_ctor(s, e)
+    if user_ctor != 0
+        *out = user_ctor
+        return 1
     # write(w, "...{x}...") / writeln: Display through the Writer the
     # program named, not an implicit one (AGAST #4381, ritz0's #202). Only
     # an interpolated literal is lowered here; a plain one is the ordinary
@@ -3883,67 +3997,20 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                 var wnl: i32 = 0
                 if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"writeln"), len: (7) as i64 }) == 1
                     wnl = 1
-                return emit_write_literal(s, wlit, e.args, wnl)
+                *out = emit_write_literal(s, wlit, e.args, wnl)
+                return 1
 
     # format_into(sink, "...") -- print's literal, appended to a buffer
     # through sink.push_bytes (AGAST #1824). emitter_print.ritz has it.
     if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"format_into"), len: (11) as i64 }) == 1
-        return emit_format_into(s, e)
+        *out = emit_format_into(s, e)
+        return 1
+    var print_reg: i32 = 0
+    if try_emit_print_call(s, e, @print_reg) == 1
+        *out = print_reg
+        return 1
 
-    if print_fd != 0
-        # print(str) -> syscall(1, fd, str_ptr, str_len)
-        # Get the first argument - should be a string literal
-        var arg: *Expr = e.args
-        if arg != null
-            # "..." interpolates `{expr}` placeholders; c"..." is written
-            # verbatim, and rejected if it holds one (AGAST #1521, #1394).
-            # emitter_print.ritz has the lowering.
-            if arg.kind == ExprKind.StringLit or arg.kind == ExprKind.CstringLit
-                return emit_print_literal(s, print_fd, arg, print_newline)
-            else
-                # Non-literal: evaluate the expression and call syscall
-                let str_reg: i32 = emit_expr(s, arg)
-                let result: i32 = next_reg(s)
-                emit_str(s, c"  ; print() with non-literal - strlen unknown\n")
-                emit_str(s, IR_INDENT)
-                emit_reg(s, result)
-                emit_str(s, IR_ADD_ZERO)
-                return result
-        let zero: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, zero)
-        emit_str(s, IR_ADD_ZERO)
-        return zero
-
-    # Check if this is __builtin_alloca
-    var is_alloca: bool = false
-    if e.func_name_len == 16
-        # Check for "__builtin_alloca"
-        if *(e.func_name + 0) == '_'   # _
-            if *(e.func_name + 1) == '_'   # _
-                if *(e.func_name + 2) == 'b'   # b
-                    if *(e.func_name + 3) == 'u'  # u
-                        if *(e.func_name + 4) == 'i'  # i
-                            if *(e.func_name + 5) == 'l'  # l
-                                if *(e.func_name + 6) == 't'  # t
-                                    if *(e.func_name + 7) == 'i'  # i
-                                        if *(e.func_name + 8) == 'n'  # n
-                                            if *(e.func_name + 9) == '_'   # _
-                                                if *(e.func_name + 10) == 'a'  # a
-                                                    if *(e.func_name + 11) == 'l' # l
-                                                        if *(e.func_name + 12) == 'l' # l
-                                                            if *(e.func_name + 13) == 'o' # o
-                                                                if *(e.func_name + 14) == 'c' # c
-                                                                    if *(e.func_name + 15) == 'a' # a
-                                                                        is_alloca = true
-
-    # Check if this is sizeof
-    var is_sizeof: bool = false
-    if e.func_name_len == 6
-        if memcmp(e.func_name, c"sizeof", 6) == 0
-            is_sizeof = true
-
-    if is_sizeof
+    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "sizeof") == 1
         # sizeof(T) / sizeof(expr) -> compile-time constant; the operand is
         # not evaluated (AGAST #2124, see sizeof_call_value).
         let type_size: i64 = sizeof_call_value(s, e)
@@ -3953,9 +4020,10 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, c" = add i64 0, ")
         emit_int(s, type_size)
         emit_str(s, IR_NL)
-        return result
+        *out = result
+        return 1
 
-    if is_alloca
+    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "__builtin_alloca") == 1
         # __builtin_alloca(size) -> alloca i8, i64 size
         var arg: *Expr = e.args
         if arg != null
@@ -3968,76 +4036,38 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, IR_NL)
             # Convert to i64 for uniform representation
             let ptr_reg: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, alloca_reg)
-            return ptr_reg
+            *out = ptr_reg
+            return 1
         # No argument - allocate 1 byte
         let alloca_reg: i32 = next_reg(s)
         entry_alloca_reg(s, alloca_reg, c"i8", null)
         let ptr_reg: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, alloca_reg)
-        return ptr_reg
+        *out = ptr_reg
+        return 1
 
-    # AGAST #167: SIMD intrinsic dispatch.  Before the regular call path
-    # (which always emits `call i64 @<name>` and registers an extern), look
-    # for `simd_*` builtin names and lower them inline to native LLVM
-    # vector instructions.  Without this, `let v: v4i32 = simd_loadu(...)`
-    # produced `call i64 @simd_loadu(ptr ...)` then `store %v4i32 ...` and
-    # the IR verifier rejected the type mismatch.  Mirrors ritz0's
-    # _try_emit_simd_builtin lowering.
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_loadu"), len: (10) as i64 }) == 1
-        return emit_simd_loadu(s, e, 1)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_load"), len: (9) as i64 }) == 1
-        return emit_simd_loadu(s, e, 0)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_storeu"), len: (11) as i64 }) == 1
-        return emit_simd_storeu(s, e, 1)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_store"), len: (10) as i64 }) == 1
-        return emit_simd_storeu(s, e, 0)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_xor"), len: (8) as i64 }) == 1
-        return emit_simd_binop(s, e, c"xor")
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_add"), len: (8) as i64 }) == 1
-        return emit_simd_binop(s, e, c"add")
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_extract"), len: (12) as i64 }) == 1
-        return emit_simd_extract(s, e)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_insert"), len: (11) as i64 }) == 1
-        return emit_simd_insert(s, e)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_shuffle"), len: (12) as i64 }) == 1
-        return emit_simd_shuffle(s, e)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_rotl"), len: (9) as i64 }) == 1
-        return emit_simd_rotl(s, e)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_sad"), len: (8) as i64 }) == 1
-        return emit_simd_sad(s, e)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"simd_clmul"), len: (10) as i64 }) == 1
-        return emit_simd_clmul(s, e)
-    # AGAST #167: x86 SHA-NI / AES-NI intrinsics that take and return SIMD
-    # vectors.  They map to LLVM intrinsics directly (`llvm.x86.sha256rnds2`,
-    # etc.); without explicit dispatch, ritz1's generic call path emits
-    # `call i64 @sha256rnds2(i64 %vec_arg, ...)` and the verifier rejects
-    # the vector-into-i64 mismatch.  v4i32-returning ones first; the v2i64
-    # AES family below.
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sha256rnds2"), len: (11) as i64 }) == 1
-        return emit_x86_intrinsic_v4i32(s, e, StrView { ptr: (c"llvm.x86.sha256rnds2"), len: (20) as i64 }, 3)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sha256msg1"), len: (10) as i64 }) == 1
-        return emit_x86_intrinsic_v4i32(s, e, StrView { ptr: (c"llvm.x86.sha256msg1"), len: (19) as i64 }, 2)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sha256msg2"), len: (10) as i64 }) == 1
-        return emit_x86_intrinsic_v4i32(s, e, StrView { ptr: (c"llvm.x86.sha256msg2"), len: (19) as i64 }, 2)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"aesenc"), len: (6) as i64 }) == 1
-        return emit_x86_intrinsic_v2i64(s, e, StrView { ptr: (c"llvm.x86.aesni.aesenc"), len: (21) as i64 }, 2, -1)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"aesenclast"), len: (10) as i64 }) == 1
-        return emit_x86_intrinsic_v2i64(s, e, StrView { ptr: (c"llvm.x86.aesni.aesenclast"), len: (25) as i64 }, 2, -1)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"aesdec"), len: (6) as i64 }) == 1
-        return emit_x86_intrinsic_v2i64(s, e, StrView { ptr: (c"llvm.x86.aesni.aesdec"), len: (21) as i64 }, 2, -1)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"aesdeclast"), len: (10) as i64 }) == 1
-        return emit_x86_intrinsic_v2i64(s, e, StrView { ptr: (c"llvm.x86.aesni.aesdeclast"), len: (25) as i64 }, 2, -1)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"aesimc"), len: (6) as i64 }) == 1
-        return emit_x86_intrinsic_v2i64(s, e, StrView { ptr: (c"llvm.x86.aesni.aesimc"), len: (21) as i64 }, 1, -1)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"aeskeygenassist"), len: (15) as i64 }) == 1
-        return emit_aeskeygenassist(s, e)
-    if name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, "xgetbv") == 1
-        return emit_xgetbv(s, e)
+    let intrinsic: *CallIntrinsic = call_intrinsic_named(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    if intrinsic != null
+        *out = emit_call_intrinsic(s, e, intrinsic)
+        return 1
     # AGAST #1879: volatile / atomic memory builtins.  Reserved names, as in
     # ritz0: checked before user fns, so they never become an extern.
     let mem_id: i32 = mem_builtin_id(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
     if mem_id != 0
-        return emit_mem_builtin(s, e, mem_id)
+        *out = emit_mem_builtin(s, e, mem_id)
+        return 1
+    0
 
+# What emit_expr_call learned about a call through a value: the local slot
+# holding the fn pointer (-1: none), its signature, and a nameless callee's
+# evaluated address (-1: none).
+struct CallCallee
+    icall_local: i32
+    icall_sig: *FnDef
+    callee_val: i32
+
+# A call of a fn-pointer local or of a nameless callee: fills `c`; 1 (result in
+# *out) when the untyped `call i64` path lowered it whole.
+fn try_emit_indirect_call(s: *EmitterState, e: *Expr, c: *CallCallee, out: *i32) -> i32
     # Indirect call via local fn-ptr.  When `e.func_name` matches a
     # local variable (e.g. `let h: fn(*Task) -> i32 = task.handler`),
     # the call must load the function pointer from the slot and use
@@ -4054,37 +4084,38 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # is read at the real return width (`call i1 %f(i8 ...)`, then zext).
     # The untyped `call i64 %f(i64 ...)` below remains only for locals
     # whose type is unknown (e.g. inferred `let h = task.handler`).
-    let icall_local: i32 = find_local(s, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
+    c.icall_local = find_local(s, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
     # AGAST #2407: a local named like a fn is the local, so a call of one that
     # holds no fn value is an error, not a call of the fn or a jump to the value.
-    if icall_local >= 0 and e.call_type_suffix_len == 0
+    if c.icall_local >= 0 and e.call_type_suffix_len == 0
         let named: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
         if named != null and lv_fn_sig(named) == null and named.not_fn == 1
             binder_call_refuse(fn_source_file(emitter_current_fn()), e.span.line, e.span.col, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
             emit_str(s, c"  ; ERROR: a call of a local that holds no fn\n")
             s.error_count = s.error_count + 1
-            return 0
+            *out = 0
+            return 1
     # AGAST #2255, #2246: a local of this name is a fn pointer, not the procedure.
-    if icall_local < 0 and e.func_name_len > 0
+    if c.icall_local < 0 and e.func_name_len > 0
         note_callee(s, e, find_call_fn(s, e), StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
-    var icall_sig: *FnDef = null
-    if icall_local >= 0 and e.call_type_suffix_len == 0
+    c.icall_sig = null
+    if c.icall_local >= 0 and e.call_type_suffix_len == 0
         let icall_lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
         if icall_lv != null
-            icall_sig = lv_fn_sig(icall_lv)
-        if fn_is_procedure(icall_sig) == 1   # AGAST #2260: a fn pointer
+            c.icall_sig = lv_fn_sig(icall_lv)
+        if fn_is_procedure(c.icall_sig) == 1   # AGAST #2260: a fn pointer
             reject_procedure_value(s, e, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
     # AGAST #1747: a nameless call (`fs[i](..)`): the callee is an expression
     # in `left`, evaluated first (left to right), to an i64 address.  With a
     # known signature it takes the typed path below, as a typed fn-ptr local
     # does; otherwise it is the untyped `call i64` an untyped local gets.
-    var callee_val: i32 = -1
+    c.callee_val = -1
     if e.func_name_len == 0
-        icall_sig = call_callee_sig(s, e)
-        if fn_is_procedure(icall_sig) == 1   # AGAST #2260
+        c.icall_sig = call_callee_sig(s, e)
+        if fn_is_procedure(c.icall_sig) == 1   # AGAST #2260
             reject_procedure_value(s, e, StrView { ptr: (null), len: (0) as i64 })
-        callee_val = emit_expr(s, e.left)
-        if icall_sig == null
+        c.callee_val = emit_expr(s, e.left)
+        if c.icall_sig == null
             let ut_args: *i32 = call_reg_slots(e.args, 0)
             var ut_argc: i32 = 0
             var ut_arg: *Expr = e.args
@@ -4092,7 +4123,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                 ut_args[ut_argc] = emit_expr(s, ut_arg)
                 ut_argc += 1
                 ut_arg = ut_arg.next
-            let ut_fp: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, callee_val)
+            let ut_fp: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, c.callee_val)
             let ut_result: i32 = next_reg(s)
             emit_str(s, IR_INDENT)
             emit_reg(s, ut_result)
@@ -4105,8 +4136,9 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                 emit_str(s, c"i64 ")
                 emit_reg(s, ut_args[j])
             emit_str(s, IR_CLOSE)
-            return ut_result
-    if icall_local >= 0 and e.call_type_suffix_len == 0 and icall_sig == null
+            *out = ut_result
+            return 1
+    if c.icall_local >= 0 and e.call_type_suffix_len == 0 and c.icall_sig == null
         # Evaluate args first.
         let icall_args: *i32 = call_reg_slots(e.args, 0)
         var icall_argc: i32 = 0
@@ -4117,7 +4149,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             icall_arg = icall_arg.next
         # Load fn pointer from the slot.
         let icall_fp: i32 = next_reg(s)
-        emit_load_into(s, IR_TY_PTR, icall_fp, icall_local)
+        emit_load_into(s, IR_TY_PTR, icall_fp, c.icall_local)
         # Emit indirect call. We don't know the return type precisely,
         # so default to i64 (the unified value model).  Args are passed
         # as i64 — fn-ptr locals are typed as `fn(*T) -> i32` etc., but
@@ -4134,7 +4166,459 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, c"i64 ")
             emit_reg(s, icall_args[j])
         emit_str(s, IR_CLOSE)
-        return icall_result
+        *out = icall_result
+        return 1
+    0
+
+# A typed param's arg, by the param's value type: bool, float or a by-value aggregate.
+fn call_convert_value_arg(s: *EmitterState, e: *Expr, j: i32, param_ptr: *Param, arg_regs: *i32, converted_regs: *i32)
+    match param_ptr.param_type
+        TypeKind.Bool =>
+            # Callee expects i1; every bool value is an i64 register
+            # (AGAST #1646, a bool global's load too since #3001), so
+            # trunc.  `takes(yes())` passed the zext'd i64 as is (#1646).
+            let bool_trunc: i32 = next_reg(s)
+            emit_str(s, IR_INDENT)
+            emit_reg(s, bool_trunc)
+            emit_str(s, IR_TRUNC)
+            emit_reg(s, arg_regs[j])
+            emit_str(s, c" to i1\n")
+            converted_regs[j] = bool_trunc
+        TypeKind.F32 | TypeKind.F64 =>
+            # Callee expects float / double.  Coerce based on actual arg
+            # type: int → sitofp; double-when-target-is-float → fptrunc;
+            # already-matching float passthrough.  The arg expression's
+            # type tells us which path (default lit-int → i64 → sitofp).
+            var f_arg_expr: *Expr = e.args
+            var fk: i32 = 0
+            while fk < j and f_arg_expr != null
+                f_arg_expr = f_arg_expr.next
+                fk = fk + 1
+            var src_ty: TypeKind = TypeKind.I64
+            if f_arg_expr != null
+                src_ty = float_arg_src_type(s, f_arg_expr, param_ptr.param_type)
+            if src_ty == TypeKind.F32 and param_ptr.param_type == TypeKind.F32
+                converted_regs[j] = arg_regs[j]
+            else if src_ty == TypeKind.F64 and param_ptr.param_type == TypeKind.F64
+                converted_regs[j] = arg_regs[j]
+            else if src_ty == TypeKind.F64 and param_ptr.param_type == TypeKind.F32
+                let trunc: i32 = next_reg(s)
+                emit_str(s, IR_INDENT)
+                emit_reg(s, trunc)
+                emit_str(s, c" = fptrunc double ")
+                emit_reg(s, arg_regs[j])
+                emit_str(s, c" to float\n")
+                converted_regs[j] = trunc
+            else if src_ty == TypeKind.F32 and param_ptr.param_type == TypeKind.F64
+                let ext: i32 = next_reg(s)
+                emit_str(s, IR_INDENT)
+                emit_reg(s, ext)
+                emit_str(s, c" = fpext float ")
+                emit_reg(s, arg_regs[j])
+                emit_str(s, c" to double\n")
+                converted_regs[j] = ext
+            else
+                # Integer source: exact only, by its signedness (#2945).
+                converted_regs[j] = emit_int_into_float_slot(s, arg_regs[j], float_slot_unsigned(f_arg_expr), param_ptr.param_type)
+        _ =>
+            if is_span_param(param_ptr) == 1
+                var span_arg_expr: *Expr = e.args
+                var sak: i32 = 0
+                while sak < j and span_arg_expr != null
+                    span_arg_expr = span_arg_expr.next
+                    sak = sak + 1
+                converted_regs[j] = span_param_arg(s, span_arg_expr, param_ptr, arg_regs[j])
+            else if param_ptr.param_type == TypeKind.Struct and param_ptr.param_type_name_len == 7
+                var is_strview: bool = false
+                if name_eq(StrView { ptr: (param_ptr.param_type_name), len: (7) as i64 }, "StrView") == 1
+                    is_strview = true
+                if is_strview
+                    # Get the argument expression to check if it's a string literal
+                    var arg_expr: *Expr = e.args
+                    var k: i32 = 0
+                    while k < j and arg_expr != null
+                        arg_expr = arg_expr.next
+                        k = k + 1
+                    let sv_lit: i32 = emit_strview_from_lit(s, arg_expr, arg_regs[j])
+                    if sv_lit >= 0
+                        converted_regs[j] = sv_lit
+                    else
+                        converted_regs[j] = arg_regs[j]
+                else
+                    converted_regs[j] = arg_regs[j]
+            else
+                # Final fallback for TypeKind.Struct params not matched by any
+                # specialised branch (StrView/Span/primitive).  ptr_value_
+                # coercion regression: `sum_point(@p)` where p: PointI and
+                # the callee takes PointI by value.  emit_expr(@p) emitted
+                # i64 (ptrtoint of the alloca); we need %PointI value.  If
+                # the arg is OpKind.Addr/OpKind.AddrMut and the param is a
+                # struct, inttoptr+load to materialise the value.
+                var fb_arg: *Expr = e.args
+                var fk: i32 = 0
+                while fk < j and fb_arg != null
+                    fb_arg = fb_arg.next
+                    fk = fk + 1
+                var fb_done: bool = false
+                if param_ptr.param_type == TypeKind.Struct and param_ptr.param_type_name_len > 0
+                    if fb_arg != null and fb_arg.kind == ExprKind.Unary
+                        if fb_arg.op == OpKind.Addr or fb_arg.op == OpKind.AddrMut
+                            let fb_pp: i32 = next_reg(s)
+                            emit_str(s, IR_INDENT)
+                            emit_reg(s, fb_pp)
+                            emit_str(s, IR_INTTOPTR)
+                            emit_reg(s, arg_regs[j])
+                            emit_str(s, c" to ptr\n")
+                            let fb_v: i32 = next_reg(s)
+                            emit_str(s, IR_INDENT)
+                            emit_reg(s, fb_v)
+                            emit_str(s, IR_LOAD_NAMED)
+                            emit_name(s, StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 })
+                            emit_str(s, IR_PTR_SEP)
+                            emit_reg(s, fb_pp)
+                            emit_str(s, IR_NL)
+                            converted_regs[j] = fb_v
+                            fb_done = true
+                if not fb_done
+                    converted_regs[j] = arg_regs[j]
+
+# Arg j into the typed param `param_ptr`'s representation, in converted_regs[j].
+fn call_convert_param_arg(s: *EmitterState, e: *Expr, j: i32, param_ptr: *Param, arg_regs: *i32, converted_regs: *i32, param_types: *TypeKind)
+    param_types[j] = param_ptr.param_type
+    # AGAST #176: Span$u8 / StrView -> i64 coercion for legacy *u8
+    # (TypeKind.Ptr / TypeKind.Ref / TypeKind.I64) params.  Bare "..." lowers to
+    # %Span$u8 (#98); without this coercion `eprints_cstr("...")`
+    # emits `call void @eprints_cstr(i64 %.span)` and the IR verifier
+    # rejects the aggregate-into-i64 mismatch.  helper returns the
+    # coerced i64 reg or -1 (fall through to the regular cascade).
+    # Also subsumes the narrower string-literal coercion ritz-task-172
+    # added for cryptosec's hkdf_expand_label("key", …) call site.
+    var s176_arg_iter: *Expr = e.args
+    var s176_ai: i32 = 0
+    while s176_ai < j and s176_arg_iter != null
+        s176_arg_iter = s176_arg_iter.next
+        s176_ai = s176_ai + 1
+    var s176_reg: i32 = 0 - 1
+    if param_uses_byval(s, param_ptr) == 0
+        s176_reg = try_emit_span_to_i64_arg(s, s176_arg_iter, param_ptr.param_type, arg_regs[j])
+    if param_uses_byval(s, param_ptr) == 1
+        # AGAST #1739 — already the byval slot (emit_call_arg).
+        converted_regs[j] = arg_regs[j]
+    else if s176_reg >= 0
+        converted_regs[j] = s176_reg
+    # Truncate i64 values to smaller types if needed
+    else if ty_int_bits(param_ptr.param_type) == 8
+        let trunc: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, trunc)
+        emit_str(s, IR_TRUNC)
+        emit_reg(s, arg_regs[j])
+        emit_str(s, c" to i8\n")
+        converted_regs[j] = trunc
+    else if ty_int_bits(param_ptr.param_type) == 32
+        let trunc: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, trunc)
+        emit_str(s, IR_TRUNC)
+        emit_reg(s, arg_regs[j])
+        emit_str(s, c" to i32\n")
+        converted_regs[j] = trunc
+    else if ty_int_bits(param_ptr.param_type) == 16
+        let trunc: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, trunc)
+        emit_str(s, IR_TRUNC)
+        emit_reg(s, arg_regs[j])
+        emit_str(s, c" to i16\n")
+        converted_regs[j] = trunc
+    else if param_ptr.param_type == TypeKind.Struct and param_ptr.param_type_name_len > 0 and is_primitive_type_name(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }) == 1
+        # Post-monomorph primitive param (vec_push_u16_method parity):
+        # `T` substituted with u16/i32/etc. but left TypeKind.Struct in AST.
+        # emit_llvm_type_struct maps the name back for signatures;
+        # match by truncating i64 arg down to primitive width.
+        if name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"u8"), len: (2) as i64 }) == 1 or name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"i8"), len: (2) as i64 }) == 1
+            let tp8: i32 = next_reg(s)
+            emit_str(s, IR_INDENT)
+            emit_reg(s, tp8)
+            emit_str(s, IR_TRUNC)
+            emit_reg(s, arg_regs[j])
+            emit_str(s, c" to i8\n")
+            converted_regs[j] = tp8
+        else if name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"u16"), len: (3) as i64 }) == 1 or name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"i16"), len: (3) as i64 }) == 1
+            let tp16: i32 = next_reg(s)
+            emit_str(s, IR_INDENT)
+            emit_reg(s, tp16)
+            emit_str(s, IR_TRUNC)
+            emit_reg(s, arg_regs[j])
+            emit_str(s, c" to i16\n")
+            converted_regs[j] = tp16
+        else if name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"u32"), len: (3) as i64 }) == 1 or name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"i32"), len: (3) as i64 }) == 1
+            let tp32: i32 = next_reg(s)
+            emit_str(s, IR_INDENT)
+            emit_reg(s, tp32)
+            emit_str(s, IR_TRUNC)
+            emit_reg(s, arg_regs[j])
+            emit_str(s, c" to i32\n")
+            converted_regs[j] = tp32
+        else
+            # bool/usize/isize/u64/i64/f32/f64: passthrough.
+            converted_regs[j] = arg_regs[j]
+    else if (param_ptr.param_type == TypeKind.Ptr or param_ptr.param_type == TypeKind.PtrPtr) and expr_is_ptr_valued(s, nth_arg(e.args, j)) == 1
+        # AGAST #1644: `*T` params are i64 in ritz1's value model,
+        # but `@&v` and a TypeKind.MutRef ident are `ptr`.
+        let ptr_arg: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, ptr_arg)
+        emit_str(s, c" = ptrtoint ptr ")
+        emit_reg(s, arg_regs[j])
+        emit_str(s, c" to i64  ; #1644 @&T->*T\n")
+        converted_regs[j] = ptr_arg
+    else if param_ptr.param_type == TypeKind.Ref and expr_is_ptr_valued(s, nth_arg(e.args, j)) == 1
+        # AGAST #2416: an `@T` param is i64 too, so `rd(@&c)` (a `ptr`)
+        # needs the same ptrtoint, for a struct of any size or a scalar.
+        converted_regs[j] = ptr_value_to_i64(s, nth_arg(e.args, j), arg_regs[j])
+    else if param_ptr.param_type == TypeKind.MutRef
+        # TypeKind.MutRef params expect ptr.  An `@&T` ident, `@&v` or
+        # `v as @&T` is already `ptr`; anything else -- `@v`, a `*T`
+        # value, and (AGAST #1757) a `-> @&T` call result, which
+        # get_expr_type calls TypeKind.MutRef but is i64 -- is inttoptr'd.
+        converted_regs[j] = i64_value_to_ptr(s, nth_arg(e.args, j), arg_regs[j])
+    else if param_ptr.param_type == TypeKind.Ref and param_ptr.param_type_name_len > 0
+        # AGAST #113 — auto-borrow: @Struct param + Struct-valued ident
+        # actual. Callsite emits `i64` for TypeKind.Ref, but emit_expr of a
+        # struct ident loaded `%Struct`. Take the local slot's address
+        # as i64 instead (the load is left orphaned — harmless).
+        var ref_arg: *Expr = e.args
+        var rk: i32 = 0
+        while rk < j and ref_arg != null
+            ref_arg = ref_arg.next
+            rk = rk + 1
+        var ref_done: bool = false
+        # AGAST #187 — narrow TypeKind.MutRef → TypeKind.Ref coercion.
+        # Caller has `@&T` (lowered as `ptr`); callee expects `@T`
+        # (lowered as `i64`).  arg_regs[j] is a freshly-loaded `ptr`
+        # from the caller's MUT_REF slot; insert a `ptrtoint` so the
+        # call-site i64 signature matches.  Repro: tome.ritz:3327
+        # `pubsub_unsubscribe(ps: @&PubSub)` calling
+        # `pubsub_find_channel(ps: @PubSub, …)`.
+        #
+        # Narrow scoping: only when the actual arg is an ExprKind.Ident
+        # whose local has var_type == TypeKind.MutRef.  An earlier
+        # broader attempt (#184 reverted) regressed
+        # test_issue_strview_as_bytes by hitting StrView struct args.
+        if ref_arg != null and ref_arg.kind == ExprKind.Ident
+            let mr_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (ref_arg.ident_ptr), len: (ref_arg.ident_len) as i64 })
+            if mr_loc != null and lv_var_type(mr_loc) == TypeKind.MutRef
+                let pti_mr: i32 = next_reg(s)
+                emit_str(s, IR_INDENT)
+                emit_reg(s, pti_mr)
+                emit_str(s, c" = ptrtoint ptr ")
+                emit_reg(s, arg_regs[j])
+                emit_str(s, c" to i64  ; #187 @&T->@T\n")
+                converted_regs[j] = pti_mr
+                ref_done = true
+        if not ref_done and ref_arg != null and ref_arg.kind == ExprKind.Ident
+            let ref_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (ref_arg.ident_ptr), len: (ref_arg.ident_len) as i64 })
+            if ref_loc != null and lv_var_type(ref_loc) == TypeKind.Struct
+                let pti_r: i32 = next_reg(s)
+                emit_str(s, IR_INDENT)
+                emit_reg(s, pti_r)
+                emit_str(s, c" = ptrtoint ptr ")
+                emit_reg(s, ref_loc.reg)
+                emit_str(s, IR_TO_I64)
+                converted_regs[j] = pti_r
+                ref_done = true
+        # Rvalue auto-borrow: `f(call_returning_struct())` where
+        # f wants @Struct.  arg_regs[j] holds the %Struct value
+        # returned by the call — spill it to a stack slot and
+        # pass the slot's address as i64.  Without this, the
+        # struct-typed reg gets cast to i64 implicitly (clang
+        # rejects).
+        if not ref_done and ref_arg != null
+            if (ref_arg.kind == ExprKind.Method or ref_arg.kind == ExprKind.Call) and call_returns_address(s, ref_arg) == 0
+                let spill: i32 = next_reg(s)
+                entry_alloca_reg_begin_named(s, spill)
+                emit_name(s, StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 })
+                emit_str(s, c"  ; rvalue auto-borrow\n")
+                entry_alloca_reg_end(s)
+                emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, arg_regs[j], spill)
+                let pti_rv: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, spill)
+                converted_regs[j] = pti_rv
+                ref_done = true
+        if not ref_done
+            converted_regs[j] = arg_regs[j]
+    else
+        call_convert_value_arg(s, e, j, param_ptr, arg_regs, converted_regs)
+
+# Convert each evaluated arg to its param's type before the call (the i64 value
+# model to the callee's ABI); an unknown callee takes i64s.
+fn call_convert_args(s: *EmitterState, e: *Expr, fn_def: *FnDef, arg_regs: *i32, arg_count: i32, converted_regs: *i32, param_types: *TypeKind)
+    var param_ptr: *Param = null
+    if fn_def != null
+        param_ptr = fn_def.params
+    for j in 0..arg_count
+        if param_ptr != null
+            call_convert_param_arg(s, e, j, param_ptr, arg_regs, converted_regs, param_types)
+            param_ptr = param_ptr.next
+        else
+            # fn_def is null - external function, assume i64 for all args
+            # But a `ptr`-valued argument (`@&v`, an `@&T` local) needs a
+            # ptrtoint; a `-> @&T` call result is already i64 (AGAST #1758).
+            param_types[j] = TypeKind.I64
+            var arg_expr: *Expr = e.args
+            var k: i32 = 0
+            while k < j and arg_expr != null
+                arg_expr = arg_expr.next
+                k = k + 1
+            # AGAST #176: Span$u8 / StrView -> i64 coercion (extern path).
+            # When fn_def is missing we assume `i64` per arg; a %Span$u8
+            # aggregate would otherwise flow through unchanged and fail IR
+            # verification at the callsite.  The helper handles the resolve
+            # + extractvalue + ptrtoint and returns -1 on no-match.
+            let s176_ext_reg: i32 = try_emit_span_to_i64_arg(s, arg_expr, TypeKind.I64, arg_regs[j])
+            if s176_ext_reg >= 0
+                converted_regs[j] = s176_ext_reg
+            else
+                converted_regs[j] = ptr_value_to_i64(s, arg_expr, arg_regs[j])
+
+# The `call` keyword and result type after `%r = `, for a first-class result.
+fn emit_call_ret_kw(s: *EmitterState, fn_def: *FnDef, ret_type: TypeKind, ret_sv: StrView, call_cc: *u8)
+    let ret_struct_name: *u8 = ret_sv.ptr
+    let ret_struct_name_len: i32 = ret_sv.len as i32
+    if ret_array_of(fn_def) != null
+        # AGAST #2302: a `[N x T]` value, which emit_array_local_whole_assign
+        # stores; a discarded call drops it.
+        emit_str(s, IR_CALL)
+        emit_str(s, call_cc)
+        emit_fn_ret_llvm_type(s, fn_def)
+        emit_str(s, IR_SP)
+    else if ret_type == TypeKind.Struct and ret_struct_name_len > 0
+        # emit_llvm_type_struct routes tagged-enum Result$/Option$ to i64
+        # (task-99 cluster #3).
+        emit_str(s, IR_CALL)
+        emit_str(s, call_cc)
+        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 })
+        emit_str(s, IR_SP)
+    else
+        match ret_type
+            TypeKind.Bool =>
+                # Bool-returning fns emit `define i1 @f(...)`, so the call must
+                # match: `call i1 @f(...)`.  Without this branch the call site
+                # emits `call i64` and clang rejects the type mismatch.  The
+                # zext-to-i64 happens below in the return-narrow block.
+                emit_str(s, IR_CALL)
+                emit_str(s, call_cc)
+                emit_str(s, c"i1 ")
+            TypeKind.F32 =>
+                emit_str(s, IR_CALL)
+                emit_str(s, call_cc)
+                emit_str(s, c"float ")
+            TypeKind.F64 =>
+                emit_str(s, IR_CALL)
+                emit_str(s, call_cc)
+                emit_str(s, c"double ")
+            _ =>
+                if ty_int_bits(ret_type) == 32
+                    emit_str(s, IR_CALL)
+                    emit_str(s, call_cc)
+                    emit_str(s, c"i32 ")
+                else if ty_int_bits(ret_type) == 16
+                    emit_str(s, IR_CALL)
+                    emit_str(s, call_cc)
+                    emit_str(s, c"i16 ")
+                else if ty_int_bits(ret_type) == 8
+                    emit_str(s, IR_CALL)
+                    emit_str(s, call_cc)
+                    emit_str(s, c"i8 ")
+                else
+                    match ret_type
+                        TypeKind.MutRef =>
+                            emit_str(s, IR_CALL)
+                            emit_str(s, call_cc)
+                            emit_str(s, c"ptr ")
+                        TypeKind.Ptr | TypeKind.Ref =>
+                            # Match definition's return type (emit_llvm_type emits i64 for TypeKind.Ptr/TypeKind.Ref)
+                            emit_str(s, IR_CALL)
+                            emit_str(s, call_cc)
+                            emit_str(s, c"i64 ")
+                        _ =>
+                            emit_str(s, IR_CALL)
+                            emit_str(s, call_cc)
+                            emit_str(s, c"i64 ")
+
+# A call's result in the i64 value model: narrow ints and bools extended.
+fn widen_call_result(s: *EmitterState, ret_type: TypeKind, ret_sv: StrView, call_result: i32) -> i32
+    let ret_struct_name: *u8 = ret_sv.ptr
+    let ret_struct_name_len: i32 = ret_sv.len as i32
+    match ret_type
+        TypeKind.Bool =>
+            let ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, call_result)
+            return ext
+        TypeKind.I32 =>
+            let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, call_result)
+            return ext
+        TypeKind.U32 =>
+            let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, call_result)
+            return ext
+        TypeKind.I16 =>
+            let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, call_result)
+            return ext
+        TypeKind.U16 =>
+            let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, call_result)
+            return ext
+        TypeKind.I8 =>
+            let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, call_result)
+            return ext
+        TypeKind.U8 =>
+            let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, call_result)
+            return ext
+        _ =>
+            if ret_type == TypeKind.Struct and ret_struct_name_len > 0 and is_primitive_type_name(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }) == 1
+                # Post-monomorph primitive return (vec_push_u16_method parity):
+                # generic `T` substituted with u16/i32/etc. leaves TypeKind.Struct in
+                # the AST.  emit_llvm_type_struct emitted the LLVM primitive type
+                # for the `call` opcode; now extend to i64 so the caller's
+                # expression-level representation stays uniform.
+                if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"u8"), len: (2) as i64 }) == 1
+                    let e8: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, call_result)
+                    return e8
+                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"i8"), len: (2) as i64 }) == 1
+                    let e8s: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, call_result)
+                    return e8s
+                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"u16"), len: (3) as i64 }) == 1
+                    let e16: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, call_result)
+                    return e16
+                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"i16"), len: (3) as i64 }) == 1
+                    let e16s: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, call_result)
+                    return e16s
+                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"u32"), len: (3) as i64 }) == 1
+                    let e32: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, call_result)
+                    return e32
+                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"i32"), len: (3) as i64 }) == 1
+                    let e32s: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, call_result)
+                    return e32s
+                # bool/usize/isize/u64/i64/f32/f64: no extension.
+                return call_result
+            else if ret_type == TypeKind.MutRef
+                # TypeKind.MutRef call returns ptr — convert to i64 for consistent value representation
+                let pti: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, call_result)
+                return pti
+    # TypeKind.Ptr/TypeKind.Ref calls now return i64 directly — no conversion needed
+    return call_result
+
+pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
+    record_assert_site(s, e)   # AGAST #1869: in a [[test]] fn only
+    var builtin_reg: i32 = 0
+    if try_emit_call_builtin(s, e, @builtin_reg) == 1
+        return builtin_reg
+
+    var cc: CallCallee = CallCallee { icall_local: 0 - 1, icall_sig: null, callee_val: 0 - 1 }
+    var indirect_reg: i32 = 0
+    if try_emit_indirect_call(s, e, @cc, @indirect_reg) == 1
+        return indirect_reg
+    let icall_local: i32 = cc.icall_local
+    let icall_sig: *FnDef = cc.icall_sig
+    let callee_val: i32 = cc.callee_val
 
     # Regular function call - register as external if not defined in this module
     # Build the full function name with type suffix (e.g., "vec_new$u8" for vec_new<u8>())
@@ -4218,309 +4702,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     # Convert argument values to match parameter types BEFORE emitting call
     let converted_regs: *i32 = call_reg_slots(e.args, 0)
     let param_types: *TypeKind = call_reg_slots(e.args, 0) as *TypeKind
-    var param_ptr: *Param = null
-    if fn_def != null
-        param_ptr = fn_def.params
-    for j in 0..arg_count
-        if param_ptr != null
-            param_types[j] = param_ptr.param_type
-            # AGAST #176: Span$u8 / StrView -> i64 coercion for legacy *u8
-            # (TypeKind.Ptr / TypeKind.Ref / TypeKind.I64) params.  Bare "..." lowers to
-            # %Span$u8 (#98); without this coercion `eprints_cstr("...")`
-            # emits `call void @eprints_cstr(i64 %.span)` and the IR verifier
-            # rejects the aggregate-into-i64 mismatch.  helper returns the
-            # coerced i64 reg or -1 (fall through to the regular cascade).
-            # Also subsumes the narrower string-literal coercion ritz-task-172
-            # added for cryptosec's hkdf_expand_label("key", …) call site.
-            var s176_arg_iter: *Expr = e.args
-            var s176_ai: i32 = 0
-            while s176_ai < j and s176_arg_iter != null
-                s176_arg_iter = s176_arg_iter.next
-                s176_ai = s176_ai + 1
-            var s176_reg: i32 = 0 - 1
-            if param_uses_byval(s, param_ptr) == 0
-                s176_reg = try_emit_span_to_i64_arg(s, s176_arg_iter, param_ptr.param_type, arg_regs[j])
-            if param_uses_byval(s, param_ptr) == 1
-                # AGAST #1739 — already the byval slot (emit_call_arg).
-                converted_regs[j] = arg_regs[j]
-            else if s176_reg >= 0
-                converted_regs[j] = s176_reg
-            # Truncate i64 values to smaller types if needed
-            else if ty_int_bits(param_ptr.param_type) == 8
-                let trunc: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, trunc)
-                emit_str(s, IR_TRUNC)
-                emit_reg(s, arg_regs[j])
-                emit_str(s, c" to i8\n")
-                converted_regs[j] = trunc
-            else if ty_int_bits(param_ptr.param_type) == 32
-                let trunc: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, trunc)
-                emit_str(s, IR_TRUNC)
-                emit_reg(s, arg_regs[j])
-                emit_str(s, c" to i32\n")
-                converted_regs[j] = trunc
-            else if ty_int_bits(param_ptr.param_type) == 16
-                let trunc: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, trunc)
-                emit_str(s, IR_TRUNC)
-                emit_reg(s, arg_regs[j])
-                emit_str(s, c" to i16\n")
-                converted_regs[j] = trunc
-            else if param_ptr.param_type == TypeKind.Struct and param_ptr.param_type_name_len > 0 and is_primitive_type_name(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }) == 1
-                # Post-monomorph primitive param (vec_push_u16_method parity):
-                # `T` substituted with u16/i32/etc. but left TypeKind.Struct in AST.
-                # emit_llvm_type_struct maps the name back for signatures;
-                # match by truncating i64 arg down to primitive width.
-                if name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"u8"), len: (2) as i64 }) == 1 or name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"i8"), len: (2) as i64 }) == 1
-                    let tp8: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, tp8)
-                    emit_str(s, IR_TRUNC)
-                    emit_reg(s, arg_regs[j])
-                    emit_str(s, c" to i8\n")
-                    converted_regs[j] = tp8
-                else if name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"u16"), len: (3) as i64 }) == 1 or name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"i16"), len: (3) as i64 }) == 1
-                    let tp16: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, tp16)
-                    emit_str(s, IR_TRUNC)
-                    emit_reg(s, arg_regs[j])
-                    emit_str(s, c" to i16\n")
-                    converted_regs[j] = tp16
-                else if name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"u32"), len: (3) as i64 }) == 1 or name_eq(StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, StrView { ptr: (c"i32"), len: (3) as i64 }) == 1
-                    let tp32: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, tp32)
-                    emit_str(s, IR_TRUNC)
-                    emit_reg(s, arg_regs[j])
-                    emit_str(s, c" to i32\n")
-                    converted_regs[j] = tp32
-                else
-                    # bool/usize/isize/u64/i64/f32/f64: passthrough.
-                    converted_regs[j] = arg_regs[j]
-            else if (param_ptr.param_type == TypeKind.Ptr or param_ptr.param_type == TypeKind.PtrPtr) and expr_is_ptr_valued(s, nth_arg(e.args, j)) == 1
-                # AGAST #1644: `*T` params are i64 in ritz1's value model,
-                # but `@&v` and a TypeKind.MutRef ident are `ptr`.
-                let ptr_arg: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, ptr_arg)
-                emit_str(s, c" = ptrtoint ptr ")
-                emit_reg(s, arg_regs[j])
-                emit_str(s, c" to i64  ; #1644 @&T->*T\n")
-                converted_regs[j] = ptr_arg
-            else if param_ptr.param_type == TypeKind.Ref and expr_is_ptr_valued(s, nth_arg(e.args, j)) == 1
-                # AGAST #2416: an `@T` param is i64 too, so `rd(@&c)` (a `ptr`)
-                # needs the same ptrtoint, for a struct of any size or a scalar.
-                converted_regs[j] = ptr_value_to_i64(s, nth_arg(e.args, j), arg_regs[j])
-            else if param_ptr.param_type == TypeKind.MutRef
-                # TypeKind.MutRef params expect ptr.  An `@&T` ident, `@&v` or
-                # `v as @&T` is already `ptr`; anything else -- `@v`, a `*T`
-                # value, and (AGAST #1757) a `-> @&T` call result, which
-                # get_expr_type calls TypeKind.MutRef but is i64 -- is inttoptr'd.
-                converted_regs[j] = i64_value_to_ptr(s, nth_arg(e.args, j), arg_regs[j])
-            else if param_ptr.param_type == TypeKind.Ref and param_ptr.param_type_name_len > 0
-                # AGAST #113 — auto-borrow: @Struct param + Struct-valued ident
-                # actual. Callsite emits `i64` for TypeKind.Ref, but emit_expr of a
-                # struct ident loaded `%Struct`. Take the local slot's address
-                # as i64 instead (the load is left orphaned — harmless).
-                var ref_arg: *Expr = e.args
-                var rk: i32 = 0
-                while rk < j and ref_arg != null
-                    ref_arg = ref_arg.next
-                    rk = rk + 1
-                var ref_done: bool = false
-                # AGAST #187 — narrow TypeKind.MutRef → TypeKind.Ref coercion.
-                # Caller has `@&T` (lowered as `ptr`); callee expects `@T`
-                # (lowered as `i64`).  arg_regs[j] is a freshly-loaded `ptr`
-                # from the caller's MUT_REF slot; insert a `ptrtoint` so the
-                # call-site i64 signature matches.  Repro: tome.ritz:3327
-                # `pubsub_unsubscribe(ps: @&PubSub)` calling
-                # `pubsub_find_channel(ps: @PubSub, …)`.
-                #
-                # Narrow scoping: only when the actual arg is an ExprKind.Ident
-                # whose local has var_type == TypeKind.MutRef.  An earlier
-                # broader attempt (#184 reverted) regressed
-                # test_issue_strview_as_bytes by hitting StrView struct args.
-                if ref_arg != null and ref_arg.kind == ExprKind.Ident
-                    let mr_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (ref_arg.ident_ptr), len: (ref_arg.ident_len) as i64 })
-                    if mr_loc != null and lv_var_type(mr_loc) == TypeKind.MutRef
-                        let pti_mr: i32 = next_reg(s)
-                        emit_str(s, IR_INDENT)
-                        emit_reg(s, pti_mr)
-                        emit_str(s, c" = ptrtoint ptr ")
-                        emit_reg(s, arg_regs[j])
-                        emit_str(s, c" to i64  ; #187 @&T->@T\n")
-                        converted_regs[j] = pti_mr
-                        ref_done = true
-                if not ref_done and ref_arg != null and ref_arg.kind == ExprKind.Ident
-                    let ref_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (ref_arg.ident_ptr), len: (ref_arg.ident_len) as i64 })
-                    if ref_loc != null and lv_var_type(ref_loc) == TypeKind.Struct
-                        let pti_r: i32 = next_reg(s)
-                        emit_str(s, IR_INDENT)
-                        emit_reg(s, pti_r)
-                        emit_str(s, c" = ptrtoint ptr ")
-                        emit_reg(s, ref_loc.reg)
-                        emit_str(s, IR_TO_I64)
-                        converted_regs[j] = pti_r
-                        ref_done = true
-                # Rvalue auto-borrow: `f(call_returning_struct())` where
-                # f wants @Struct.  arg_regs[j] holds the %Struct value
-                # returned by the call — spill it to a stack slot and
-                # pass the slot's address as i64.  Without this, the
-                # struct-typed reg gets cast to i64 implicitly (clang
-                # rejects).
-                if not ref_done and ref_arg != null
-                    if (ref_arg.kind == ExprKind.Method or ref_arg.kind == ExprKind.Call) and call_returns_address(s, ref_arg) == 0
-                        let spill: i32 = next_reg(s)
-                        entry_alloca_reg_begin_named(s, spill)
-                        emit_name(s, StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 })
-                        emit_str(s, c"  ; rvalue auto-borrow\n")
-                        entry_alloca_reg_end(s)
-                        emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, arg_regs[j], spill)
-                        let pti_rv: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, spill)
-                        converted_regs[j] = pti_rv
-                        ref_done = true
-                if not ref_done
-                    converted_regs[j] = arg_regs[j]
-            else
-                match param_ptr.param_type
-                    TypeKind.Bool =>
-                        # Callee expects i1; every bool value is an i64 register
-                        # (AGAST #1646, a bool global's load too since #3001), so
-                        # trunc.  `takes(yes())` passed the zext'd i64 as is (#1646).
-                        let bool_trunc: i32 = next_reg(s)
-                        emit_str(s, IR_INDENT)
-                        emit_reg(s, bool_trunc)
-                        emit_str(s, IR_TRUNC)
-                        emit_reg(s, arg_regs[j])
-                        emit_str(s, c" to i1\n")
-                        converted_regs[j] = bool_trunc
-                    TypeKind.F32 | TypeKind.F64 =>
-                        # Callee expects float / double.  Coerce based on actual arg
-                        # type: int → sitofp; double-when-target-is-float → fptrunc;
-                        # already-matching float passthrough.  The arg expression's
-                        # type tells us which path (default lit-int → i64 → sitofp).
-                        var f_arg_expr: *Expr = e.args
-                        var fk: i32 = 0
-                        while fk < j and f_arg_expr != null
-                            f_arg_expr = f_arg_expr.next
-                            fk = fk + 1
-                        var src_ty: TypeKind = TypeKind.I64
-                        if f_arg_expr != null
-                            src_ty = float_arg_src_type(s, f_arg_expr, param_ptr.param_type)
-                        if src_ty == TypeKind.F32 and param_ptr.param_type == TypeKind.F32
-                            converted_regs[j] = arg_regs[j]
-                        else if src_ty == TypeKind.F64 and param_ptr.param_type == TypeKind.F64
-                            converted_regs[j] = arg_regs[j]
-                        else if src_ty == TypeKind.F64 and param_ptr.param_type == TypeKind.F32
-                            let trunc: i32 = next_reg(s)
-                            emit_str(s, IR_INDENT)
-                            emit_reg(s, trunc)
-                            emit_str(s, c" = fptrunc double ")
-                            emit_reg(s, arg_regs[j])
-                            emit_str(s, c" to float\n")
-                            converted_regs[j] = trunc
-                        else if src_ty == TypeKind.F32 and param_ptr.param_type == TypeKind.F64
-                            let ext: i32 = next_reg(s)
-                            emit_str(s, IR_INDENT)
-                            emit_reg(s, ext)
-                            emit_str(s, c" = fpext float ")
-                            emit_reg(s, arg_regs[j])
-                            emit_str(s, c" to double\n")
-                            converted_regs[j] = ext
-                        else
-                            # Integer source: exact only, by its signedness (#2945).
-                            converted_regs[j] = emit_int_into_float_slot(s, arg_regs[j], float_slot_unsigned(f_arg_expr), param_ptr.param_type)
-                    _ =>
-                        if is_span_param(param_ptr) == 1
-                            var span_arg_expr: *Expr = e.args
-                            var sak: i32 = 0
-                            while sak < j and span_arg_expr != null
-                                span_arg_expr = span_arg_expr.next
-                                sak = sak + 1
-                            converted_regs[j] = span_param_arg(s, span_arg_expr, param_ptr, arg_regs[j])
-                        else if param_ptr.param_type == TypeKind.Struct and param_ptr.param_type_name_len == 7
-                            # Check if this is StrView (7 chars)
-                            var is_strview: bool = false
-                            if *(param_ptr.param_type_name + 0) == 'S' and *(param_ptr.param_type_name + 1) == 't'
-                                if *(param_ptr.param_type_name + 2) == 'r' and *(param_ptr.param_type_name + 3) == 'V'
-                                    if *(param_ptr.param_type_name + 4) == 'i' and *(param_ptr.param_type_name + 5) == 'e'
-                                        if *(param_ptr.param_type_name + 6) == 'w'
-                                            is_strview = true
-                            if is_strview
-                                # Get the argument expression to check if it's a string literal
-                                var arg_expr: *Expr = e.args
-                                var k: i32 = 0
-                                while k < j and arg_expr != null
-                                    arg_expr = arg_expr.next
-                                    k = k + 1
-                                let sv_lit: i32 = emit_strview_from_lit(s, arg_expr, arg_regs[j])
-                                if sv_lit >= 0
-                                    converted_regs[j] = sv_lit
-                                else
-                                    converted_regs[j] = arg_regs[j]
-                            else
-                                converted_regs[j] = arg_regs[j]
-                        else
-                            # Final fallback for TypeKind.Struct params not matched by any
-                            # specialised branch (StrView/Span/primitive).  ptr_value_
-                            # coercion regression: `sum_point(@p)` where p: PointI and
-                            # the callee takes PointI by value.  emit_expr(@p) emitted
-                            # i64 (ptrtoint of the alloca); we need %PointI value.  If
-                            # the arg is OpKind.Addr/OpKind.AddrMut and the param is a
-                            # struct, inttoptr+load to materialise the value.
-                            var fb_arg: *Expr = e.args
-                            var fk: i32 = 0
-                            while fk < j and fb_arg != null
-                                fb_arg = fb_arg.next
-                                fk = fk + 1
-                            var fb_done: bool = false
-                            if param_ptr.param_type == TypeKind.Struct and param_ptr.param_type_name_len > 0
-                                if fb_arg != null and fb_arg.kind == ExprKind.Unary
-                                    if fb_arg.op == OpKind.Addr or fb_arg.op == OpKind.AddrMut
-                                        let fb_pp: i32 = next_reg(s)
-                                        emit_str(s, IR_INDENT)
-                                        emit_reg(s, fb_pp)
-                                        emit_str(s, IR_INTTOPTR)
-                                        emit_reg(s, arg_regs[j])
-                                        emit_str(s, c" to ptr\n")
-                                        let fb_v: i32 = next_reg(s)
-                                        emit_str(s, IR_INDENT)
-                                        emit_reg(s, fb_v)
-                                        emit_str(s, IR_LOAD_NAMED)
-                                        emit_name(s, StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 })
-                                        emit_str(s, IR_PTR_SEP)
-                                        emit_reg(s, fb_pp)
-                                        emit_str(s, IR_NL)
-                                        converted_regs[j] = fb_v
-                                        fb_done = true
-                            if not fb_done
-                                converted_regs[j] = arg_regs[j]
-            param_ptr = param_ptr.next
-        else
-            # fn_def is null - external function, assume i64 for all args
-            # But a `ptr`-valued argument (`@&v`, an `@&T` local) needs a
-            # ptrtoint; a `-> @&T` call result is already i64 (AGAST #1758).
-            param_types[j] = TypeKind.I64
-            var arg_expr: *Expr = e.args
-            var k: i32 = 0
-            while k < j and arg_expr != null
-                arg_expr = arg_expr.next
-                k = k + 1
-            # AGAST #176: Span$u8 / StrView -> i64 coercion (extern path).
-            # When fn_def is missing we assume `i64` per arg; a %Span$u8
-            # aggregate would otherwise flow through unchanged and fail IR
-            # verification at the callsite.  The helper handles the resolve
-            # + extractvalue + ptrtoint and returns -1 on no-match.
-            let s176_ext_reg: i32 = try_emit_span_to_i64_arg(s, arg_expr, TypeKind.I64, arg_regs[j])
-            if s176_ext_reg >= 0
-                converted_regs[j] = s176_ext_reg
-            else
-                converted_regs[j] = ptr_value_to_i64(s, arg_expr, arg_regs[j])
+    call_convert_args(s, e, fn_def, arg_regs, arg_count, converted_regs, param_types)
 
     # Now emit the call with converted registers.  A typed indirect call
     # loads the fn pointer from its slot here, after the args.
@@ -4559,66 +4741,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         call_result = next_reg(s)
         emit_str(s, IR_INDENT)
         emit_reg(s, call_result)
-        if ret_array_of(fn_def) != null
-            # AGAST #2302: a `[N x T]` value, which emit_array_local_whole_assign
-            # stores; a discarded call drops it.
-            emit_str(s, IR_CALL)
-            emit_str(s, call_cc)
-            emit_fn_ret_llvm_type(s, fn_def)
-            emit_str(s, IR_SP)
-        else if ret_type == TypeKind.Struct and ret_struct_name_len > 0
-            # emit_llvm_type_struct routes tagged-enum Result$/Option$ to i64
-            # (task-99 cluster #3).
-            emit_str(s, IR_CALL)
-            emit_str(s, call_cc)
-            emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 })
-            emit_str(s, IR_SP)
-        else
-            match ret_type
-                TypeKind.Bool =>
-                    # Bool-returning fns emit `define i1 @f(...)`, so the call must
-                    # match: `call i1 @f(...)`.  Without this branch the call site
-                    # emits `call i64` and clang rejects the type mismatch.  The
-                    # zext-to-i64 happens below in the return-narrow block.
-                    emit_str(s, IR_CALL)
-                    emit_str(s, call_cc)
-                    emit_str(s, c"i1 ")
-                TypeKind.F32 =>
-                    emit_str(s, IR_CALL)
-                    emit_str(s, call_cc)
-                    emit_str(s, c"float ")
-                TypeKind.F64 =>
-                    emit_str(s, IR_CALL)
-                    emit_str(s, call_cc)
-                    emit_str(s, c"double ")
-                _ =>
-                    if ty_int_bits(ret_type) == 32
-                        emit_str(s, IR_CALL)
-                        emit_str(s, call_cc)
-                        emit_str(s, c"i32 ")
-                    else if ty_int_bits(ret_type) == 16
-                        emit_str(s, IR_CALL)
-                        emit_str(s, call_cc)
-                        emit_str(s, c"i16 ")
-                    else if ty_int_bits(ret_type) == 8
-                        emit_str(s, IR_CALL)
-                        emit_str(s, call_cc)
-                        emit_str(s, c"i8 ")
-                    else
-                        match ret_type
-                            TypeKind.MutRef =>
-                                emit_str(s, IR_CALL)
-                                emit_str(s, call_cc)
-                                emit_str(s, c"ptr ")
-                            TypeKind.Ptr | TypeKind.Ref =>
-                                # Match definition's return type (emit_llvm_type emits i64 for TypeKind.Ptr/TypeKind.Ref)
-                                emit_str(s, IR_CALL)
-                                emit_str(s, call_cc)
-                                emit_str(s, c"i64 ")
-                            _ =>
-                                emit_str(s, IR_CALL)
-                                emit_str(s, call_cc)
-                                emit_str(s, c"i64 ")
+        emit_call_ret_kw(s, fn_def, ret_type, StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, call_cc)
     if icall_fp_reg >= 0
         emit_reg(s, icall_fp_reg)
     else
@@ -4652,62 +4775,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     if call_sret > 0
         call_result = emit_call_sret_result(s, fn_def, call_result, call_sret, StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 })
 
-    # Extend smaller return types to i64 for consistent value representation
-    match ret_type
-        TypeKind.Bool =>
-            let ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, call_result)
-            return ext
-        TypeKind.I32 =>
-            let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, call_result)
-            return ext
-        TypeKind.U32 =>
-            let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, call_result)
-            return ext
-        TypeKind.I16 =>
-            let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, call_result)
-            return ext
-        TypeKind.U16 =>
-            let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, call_result)
-            return ext
-        TypeKind.I8 =>
-            let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, call_result)
-            return ext
-        TypeKind.U8 =>
-            let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, call_result)
-            return ext
-        _ =>
-            if ret_type == TypeKind.Struct and ret_struct_name_len > 0 and is_primitive_type_name(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }) == 1
-                # Post-monomorph primitive return (vec_push_u16_method parity):
-                # generic `T` substituted with u16/i32/etc. leaves TypeKind.Struct in
-                # the AST.  emit_llvm_type_struct emitted the LLVM primitive type
-                # for the `call` opcode; now extend to i64 so the caller's
-                # expression-level representation stays uniform.
-                if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"u8"), len: (2) as i64 }) == 1
-                    let e8: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, call_result)
-                    return e8
-                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"i8"), len: (2) as i64 }) == 1
-                    let e8s: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, call_result)
-                    return e8s
-                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"u16"), len: (3) as i64 }) == 1
-                    let e16: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, call_result)
-                    return e16
-                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"i16"), len: (3) as i64 }) == 1
-                    let e16s: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, call_result)
-                    return e16s
-                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"u32"), len: (3) as i64 }) == 1
-                    let e32: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, call_result)
-                    return e32
-                else if name_eq(StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, StrView { ptr: (c"i32"), len: (3) as i64 }) == 1
-                    let e32s: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, call_result)
-                    return e32s
-                # bool/usize/isize/u64/i64/f32/f64: no extension.
-                return call_result
-            else if ret_type == TypeKind.MutRef
-                # TypeKind.MutRef call returns ptr — convert to i64 for consistent value representation
-                let pti: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, call_result)
-                return pti
-    # TypeKind.Ptr/TypeKind.Ref calls now return i64 directly — no conversion needed
-    return call_result
+    return widen_call_result(s, ret_type, StrView { ptr: (ret_struct_name), len: (ret_struct_name_len) as i64 }, call_result)
 
 # AGAST #4603: `br` on the Option / Result tag in `tag_reg` (an i8; Some /
 # Ok is 0): a None / Err goes to a block that calls `llvm.trap` and ends
