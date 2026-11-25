@@ -9,9 +9,11 @@ run on the user's GS_BASE.
 
 Now (Linux's paranoid entry):
 
-  * isr_stubs.s ISR_PARANOID (vectors 2 and 18): rdmsr MSR_GS_BASE; if it is
-    not one of syscall_entry.s's percpu_areas, swapgs and remember (in the
-    callee-saved %ebx) to swap back on the way out. It never looks at CS.
+  * isr_stubs.s PARANOID_BODY (isr_stub_2, the NMI, and ISR_PARANOID 18):
+    rdmsr MSR_GS_BASE; if it is not one of syscall_entry.s's percpu_areas,
+    swapgs and remember (in the callee-saved %ebx) to swap back on the way
+    out. It never looks at CS. (The NMI's nested-NMI entry around it is
+    pinned in test_harland_nested_nmi.py, AGAST #4650.)
   * the "nmi-gs" boot self-test (arch/x86_64/nmi_probe.ritz) sends this CPU
     an NMI while it sits in ring 0 on the user's GS (isr_stubs.s
     nmi_gs_probe) and requires the handler to have run on this CPU's area and
@@ -77,17 +79,20 @@ def _ritz_fn(code, name):
 
 def test_nmi_and_machine_check_use_the_paranoid_entry():
     isr = _code(ISR_S)
-    assert re.search(r"^ISR_PARANOID 2\b", isr, re.M), "NMI must take the paranoid entry"
+    nmi = isr[isr.index("\nisr_stub_2:"):isr.index("\n.Lnmi_end_repeat:")+200]
+    assert re.search(r"^\s+PARANOID_BODY 2$", nmi, re.M), "NMI must take the paranoid entry"
     assert re.search(r"^ISR_PARANOID 18\b", isr, re.M), "#MC must take the paranoid entry"
+    assert "PARANOID_BODY \\num" in _macro(isr, "ISR_PARANOID num")
     assert not re.search(r"^ISR_NOERR\s+(2|18)\b", isr, re.M)
     # Every other stub keeps the CS-based entry: only 2 and 18 are paranoid.
-    assert sorted(re.findall(r"^ISR_PARANOID (\d+)", isr, re.M)) == ["18", "2"]
+    assert re.findall(r"^ISR_PARANOID (\d+)", isr, re.M) == ["18"]
+    assert re.findall(r"^\s+PARANOID_BODY (\S+)", isr, re.M) == ["\\num", "2"]
 
 
 def test_paranoid_entry_decides_by_gs_base_not_cs():
     isr = _code(ISR_S)
     assert re.search(r"^\.set MSR_GS_BASE, 0xC0000101$", isr, re.M)
-    body = _macro(isr, "ISR_PARANOID num")
+    body = _macro(isr, "PARANOID_BODY num")
     # It never asks the frame's CS.
     assert "testq $3" not in body and "SWAPGS_IF_USER" not in body
     entry = body[:body.index("call exception_handler")]
@@ -102,12 +107,13 @@ def test_paranoid_entry_decides_by_gs_base_not_cs():
     assert entry.count("swapgs") == 1
     assert "xorl %ebx, %ebx" in entry
     assert entry.index("xorl %ebx, %ebx") < entry.index("swapgs") < entry.index("movl $1, %ebx")
-    # The exit swaps back the same way, and returns itself (isr_common's exit
-    # would decide by CS again).
+    # The exit swaps back the same way, and its stubs return themselves
+    # (isr_common's exit would decide by CS again).
     assert "testl %ebx, %ebx" in exit_
     assert exit_.count("swapgs") == 1
-    assert exit_.index("testl %ebx, %ebx") < exit_.index("swapgs") < exit_.index("iretq")
+    assert exit_.index("testl %ebx, %ebx") < exit_.index("swapgs") < exit_.index("addq $16, %rsp")
     assert "isr_common" not in body
+    assert _macro(isr, "ISR_PARANOID num").rstrip().endswith("iretq")
 
 
 def test_paranoid_frame_matches_the_interrupt_frame():
@@ -115,8 +121,8 @@ def test_paranoid_frame_matches_the_interrupt_frame():
     InterruptFrame: dummy error, vector, then RAX .. R15."""
     isr = _code(ISR_S)
     pushes = lambda m: re.findall(r"pushq (\S+)", _macro(isr, m))
-    assert pushes("ISR_PARANOID num") == pushes("ISR_NOERR num")
-    pops = re.findall(r"popq (\S+)", _macro(isr, "ISR_PARANOID num"))
+    assert pushes("PARANOID_BODY num") == pushes("ISR_NOERR num")
+    pops = re.findall(r"popq (\S+)", _macro(isr, "PARANOID_BODY num"))
     assert pops == list(reversed(pushes("ISR_NOERR num")[2:]))
 
 
@@ -132,9 +138,10 @@ def test_nmi_gs_probe_sends_the_nmi_on_the_users_gs():
     isr = _code(ISR_S)
     probe = _asm_fn(isr, "nmi_gs_probe")
     first, second = [m.start() for m in re.finditer(r"swapgs", probe)]
-    send = probe.index("wrmsr")                       # x2APIC ICR
-    mmio = probe.index("movl %eax, (%rdi)")           # xAPIC ICR low: sends
-    assert first < send < second and first < mmio < second
+    assert first < probe.index("call nmi_self_send") < second
+    send = _asm_fn(isr, "nmi_self_send")
+    assert "movl $X2APIC_ICR_MSR, %ecx" in send and "wrmsr" in send   # x2APIC ICR
+    assert "movl %eax, (%rdi)" in send                # xAPIC ICR low: sends
     # It waits for the handler (nmi_probe_mark) before swapping back, and
     # reports GS_BASE as the NMI's exit left it.
     assert "cmpl $0, nmi_probe_hit(%rip)" in probe

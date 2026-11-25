@@ -91,9 +91,11 @@ gdt_flush:
 # swap back on exit. Each runs on its own IST stack (idt.ritz, AGAST #4628).
 .set MSR_GS_BASE, 0xC0000101
 
-.macro ISR_PARANOID num
-.global isr_stub_\num
-isr_stub_\num:
+# The paranoid body: InterruptFrame (dummy error, vector, RAX .. R15) under
+# the IRET frame at %rsp, the GS_BASE check, exception_handler, the swap
+# back, and the pops; it leaves %rsp at the IRET frame. Each run decides GS
+# afresh, so an NMI's repeat (below) gets it right whatever GS it repeats on.
+.macro PARANOID_BODY num
     pushq $0
     pushq $\num
     pushq %rax
@@ -148,8 +150,117 @@ isr_stub_\num:
     popq %rbx
     popq %rax
     addq $16, %rsp
+.endm
+
+# #MC: the paranoid body and its IRET.
+.macro ISR_PARANOID num
+.global isr_stub_\num
+isr_stub_\num:
+    PARANOID_BODY \num
     iretq
 .endm
+
+# ============================================================================
+# NMI entry: nested NMIs (AGAST #4650)
+# ============================================================================
+# The CPU blocks NMIs from an NMI's delivery to the next IRETQ, any IRETQ:
+# one returning from a #GP/#PF/#DB taken inside the NMI handler unblocks
+# them while the CPU is still on the NMI's stack. A second NMI then loads
+# RSP from TSS.ist4 again, pushes its IRET frame over the first's and runs
+# the handler over the first's frames; the first returns to garbage. As
+# Linux's asm_exc_nmi does (arch/x86/entry/entry_64.S), a nested NMI runs no
+# handler: it points the first NMI's IRET at .Lnmi_repeat and returns, and
+# the first NMI runs the handler again once it is done. Slots are 8 bytes
+# up from the first NMI's %rsp at .Lnmi_repeat; the top is TSS.ist4:
+#
+#   12-16  the CPU's IRET frame (RIP .. SS); a nested NMI overwrites it
+#   11     saved RDX (scratch for the nested checks)
+#   10     "NMI executing": 1 from .Lnmi_repeat until just before the IRETQ
+#    5-9   the "iret" frame the IRETQ pops: copied from the outermost frame
+#          on each run; a nested NMI rewrites it to return to .Lnmi_repeat
+#    0-4   the "outermost" frame: the CPU's, copied once at the first NMI
+#   below  PARANOID_BODY's InterruptFrame; its RIP .. SS is the outermost
+#
+# An NMI is nested if it came from ring 0 and:
+#   * its RIP is in [.Lnmi_repeat, .Lnmi_end_repeat): the first NMI is
+#     about to run the handler anyway, so just return; or
+#   * "NMI executing" is set; or
+#   * its RSP is on this stack and RFLAGS.DF is set: the first NMI's last
+#     instructions, from its `std` (which no other code on this stack runs:
+#     every entry here clears DF, and SYSCALL clears it through SFMASK) to its
+#     IRETQ, which restores the frame's DF.
+# A nested NMI looks at the first NMI's slots below its own %rsp, so it
+# addresses them off %rdx: tools/check_no_red_zone.py rejects any operand
+# below %rsp, and nothing else can push here while they are live (NMIs nest
+# only as above; #MC and #DF have their own stacks).
+.set KERNEL_CS, 0x08                  # arch/x86_64/gdt.ritz GDT_KERNEL_CODE
+.set KERNEL_DS, 0x10                  # arch/x86_64/gdt.ritz GDT_KERNEL_DATA
+.set NMI_STACK_SIZE, 4096             # percpu.ritz's IST4, gdt.ritz nmi_stack
+.set RFLAGS_DF, 0x400
+
+.global isr_stub_2
+isr_stub_2:
+    cld
+    pushq %rdx                        # slot 11; the CPU's frame at 8(%rsp)
+    testq $3, 16(%rsp)                # CS: an NMI from ring 3 nests nothing
+    jnz .Lnmi_first
+    leaq .Lnmi_repeat(%rip), %rdx
+    cmpq %rdx, 8(%rsp)                # RIP
+    jb 1f
+    leaq .Lnmi_end_repeat(%rip), %rdx
+    cmpq %rdx, 8(%rsp)
+    jb .Lnmi_nested_out
+1:
+    movq %rsp, %rdx
+    cmpq $1, -8(%rdx)                 # slot 10: NMI executing
+    je .Lnmi_nested
+    leaq 48(%rsp), %rdx               # the top of this stack
+    cmpq %rdx, 32(%rsp)               # RSP
+    ja .Lnmi_first
+    subq $NMI_STACK_SIZE, %rdx
+    cmpq %rdx, 32(%rsp)
+    jb .Lnmi_first
+    testq $RFLAGS_DF, 24(%rsp)        # RFLAGS
+    jz .Lnmi_first
+.Lnmi_nested:
+    lock incl nmi_repeats_latched(%rip)
+    subq $8, %rsp                     # slot 10
+    movq %rsp, %rdx
+    subq $80, %rdx                    # slot 0: the first NMI's %rsp at the repeat
+    pushq $KERNEL_DS                  # slots 9 .. 5: the iret frame
+    pushq %rdx
+    pushfq                            # IF=0 and, after the cld, DF=0
+    pushq $KERNEL_CS
+    leaq .Lnmi_repeat(%rip), %rdx
+    pushq %rdx
+    addq $48, %rsp                    # slot 11
+.Lnmi_nested_out:
+    popq %rdx
+    iretq
+
+.Lnmi_first:
+    movq (%rsp), %rdx                 # slot 11 keeps a copy; unused from here
+    pushq $0                          # slot 10: NMI executing
+    subq $40, %rsp                    # slots 5-9: the iret frame
+    .rept 5
+    pushq 88(%rsp)                    # slots 4 .. 0 from 16 .. 12
+    .endr
+.Lnmi_repeat:
+    # The first NMI's IRETQ returns here when a nested NMI rewrote the iret
+    # frame: every GPR is as the NMI interrupted it, so the copy uses no
+    # register. A POP's memory operand off %rsp is taken after the pop.
+    movq $1, 80(%rsp)                 # NMI executing
+    .rept 5
+    popq 32(%rsp)                     # outermost slot k -> iret slot k + 5
+    .endr
+    subq $40, %rsp                    # slot 0
+.Lnmi_end_repeat:
+    PARANOID_BODY 2
+    addq $40, %rsp                    # slot 5: the iret frame
+    std                               # see "RFLAGS.DF" above
+    movq $0, 40(%rsp)                 # slot 10: no longer executing
+    iretq
+
 
 # ============================================================================
 # Common ISR Handler
@@ -328,7 +439,7 @@ irq_stub_\num:
 # Exceptions WITHOUT error code
 ISR_NOERR 0     # Divide Error
 ISR_NOERR 1     # Debug
-ISR_PARANOID 2  # NMI (paranoid: GS by MSR, AGAST #4612)
+# Vector 2, NMI: isr_stub_2 above (paranoid, nested NMIs, AGAST #4612/#4650)
 ISR_NOERR 3     # Breakpoint
 ISR_NOERR 4     # Overflow
 ISR_NOERR 5     # Bound Range Exceeded
@@ -509,6 +620,8 @@ irq_stub_timer:
 
 .section .bss
 .align 4
+nmi_repeats_latched:
+    .long 0
 nmi_probe_hit:
     .long 0
 .section .text
@@ -520,26 +633,36 @@ nmi_probe_mark:
     ret
 .size nmi_probe_mark, . - nmi_probe_mark
 
-.global nmi_gs_probe
-.type nmi_gs_probe, @function
-nmi_gs_probe:
-    pushfq
-    cli
-    movl $0, nmi_probe_hit(%rip)
+# void nmi_self_send(u64 icr_lo, u64 apic_id): send CPU `apic_id` (this one)
+# an NMI through the xAPIC ICR at `icr_lo`, or the x2APIC ICR MSR when it is
+# 0. Touches no per-CPU state, so it runs on any GS, and in an NMI handler
+# ("nmi-nest", arch/x86_64/nmi_probe.ritz).
+.global nmi_self_send
+.type nmi_self_send, @function
+nmi_self_send:
     movq %rsi, %r8                    # destination: this CPU's APIC ID
-    swapgs                            # GS = the user's, in ring 0
     movl $ICR_NMI_ASSERT, %eax
     testq %rdi, %rdi
     jnz 1f
     movl %r8d, %edx                   # x2APIC: destination in ICR[63:32]
     movl $X2APIC_ICR_MSR, %ecx
     wrmsr
-    jmp 2f
+    ret
 1:
     shll $24, %r8d                    # xAPIC: destination in ICR_HI[31:24]
     movl %r8d, 0x10(%rdi)
     movl %eax, (%rdi)                 # writing ICR_LO sends it
-2:
+    ret
+.size nmi_self_send, . - nmi_self_send
+
+.global nmi_gs_probe
+.type nmi_gs_probe, @function
+nmi_gs_probe:
+    pushfq
+    cli
+    movl $0, nmi_probe_hit(%rip)
+    swapgs                            # GS = the user's, in ring 0
+    call nmi_self_send                # same arguments
     movl $NMI_PROBE_SPIN, %ecx
 3:
     cmpl $0, nmi_probe_hit(%rip)
@@ -583,3 +706,12 @@ ist_nest_pf_at:
 ist_nest_pf_resume:
     ret
 .size ist_nest_faults, . - ist_nest_faults
+
+# u64 nmi_repeats(): how many NMIs isr_stub_2 has latched as nested, each
+# turned into a repeat of the NMI it interrupted ("nmi-nest", AGAST #4650).
+.global nmi_repeats
+.type nmi_repeats, @function
+nmi_repeats:
+    movl nmi_repeats_latched(%rip), %eax
+    ret
+.size nmi_repeats, . - nmi_repeats

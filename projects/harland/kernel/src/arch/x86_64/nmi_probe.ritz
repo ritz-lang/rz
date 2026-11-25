@@ -16,6 +16,16 @@
 # restarted at the top of IST1, over the NMI's frame, and the NMI returned
 # to garbage.
 #
+# The "nmi-nest" boot self-test (AGAST #4650) runs "ist-nest" and then, still
+# inside the NMI handler but past the faults' IRETs (which unblock NMIs),
+# sends this CPU a second NMI. It lands at the top of the NMI's IST stack,
+# where the first NMI's IRET frame is: isr_stubs.s isr_stub_2 must see it is
+# nested (nmi_repeats counts that), point the first NMI's IRET at its repeat
+# loop and return at once. The first NMI's handler finishes, its IRET runs the
+# handler a second time (on the right GS: the paranoid check runs again) and
+# only then returns to the probe. Before #4650 the second NMI ran its handler
+# inside the first's, over its frame, and the first returned to garbage.
+#
 # A leaf module so exceptions.ritz can call it: postinit.ritz passes the
 # LAPIC's ICR (apic.ritz lapic_icr_lo_mmio, 0 in x2APIC mode) and APIC ID.
 
@@ -29,12 +39,16 @@ extern fn ist_nest_gp_at()
 extern fn ist_nest_gp_resume()
 extern fn ist_nest_pf_at()
 extern fn ist_nest_pf_resume()
+extern fn nmi_self_send(icr_lo: u64, apic_id: u64)
+extern fn nmi_repeats() -> u64
 
 const GP_VECTOR: u64 = 13
 const PF_VECTOR: u64 = 14
 # The faults' frames must sit within this much below the NMI's frame: on the
 # NMI's own stack, under its live frames.
 const IST_NEST_REACH: u64 = 4096
+# How long the first NMI waits for the second to be latched.
+const NMI_NEST_SPIN: u64 = 50000000
 
 const GS_BASE_MSR: u32 = 0xC0000101
 const KERNEL_GS_BASE_MSR: u32 = 0xC0000102
@@ -57,10 +71,32 @@ var ist_nest_nmi_frame: u64 = 0
 var ist_nest_gp_frame: u64 = 0
 var ist_nest_pf_frame: u64 = 0
 
+# "nmi-nest": the second NMI, sent from inside the first. `second_due` arms
+# the catch for it; `outer_running` is true while the first NMI's handler
+# waits, so a second handler that runs inside it (no repeat) is caught.
+var nmi_nest_armed: bool = false
+var nmi_nest_icr: u64 = 0
+var nmi_nest_apic: u64 = 0
+var nmi_nest_outer_running: bool = false
+var nmi_nest_second_due: bool = false
+var nmi_nest_second_seen: bool = false
+var nmi_nest_second_inside: bool = false
+var nmi_nest_second_gs: u64 = 0
+var nmi_nest_latched: bool = false
+
 # An NMI while the probe is armed: record the GS_BASE its handler runs on and
 # let it return (after the "ist-nest" faults, when those are armed). `frame`
 # is the NMI's InterruptFrame. False, doing nothing, when not armed.
 pub fn nmi_probe_catch(cs: u64, frame: u64) -> bool
+    if nmi_nest_second_due
+        # "nmi-nest"'s second NMI, the repeat of the first (or, without the
+        # nested entry, run inside it).
+        nmi_nest_second_due = false
+        nmi_nest_second_inside = nmi_nest_outer_running
+        nmi_nest_second_gs = rdmsr(GS_BASE_MSR)
+        nmi_nest_second_seen = true
+        memory_barrier()
+        return true
     if not nmi_probe_armed
         return false
     nmi_probe_armed = false
@@ -73,10 +109,29 @@ pub fn nmi_probe_catch(cs: u64, frame: u64) -> bool
         memory_barrier()
         ist_nest_faults(ist_nest_unmapped)
         ist_nest_in_nmi = false
+        if nmi_nest_armed
+            nmi_nest_armed = false
+            nmi_nest_send_second()
     nmi_probe_seen = true
     memory_barrier()
     nmi_probe_mark()
     return true
+
+# Inside the first NMI's handler, after the faults' IRETs: send the second
+# NMI and wait until isr_stub_2 has latched it as a repeat (or, without the
+# nested entry, until its handler has run here, inside this one).
+fn nmi_nest_send_second()
+    let before: u64 = nmi_repeats()
+    nmi_nest_second_due = true
+    nmi_nest_outer_running = true
+    memory_barrier()
+    nmi_self_send(nmi_nest_icr, nmi_nest_apic)
+    var spin: u64 = 0
+    while spin < NMI_NEST_SPIN and nmi_repeats() == before and not nmi_nest_second_seen
+        spin += 1
+    nmi_nest_latched = nmi_repeats() != before
+    nmi_nest_outer_running = false
+    memory_barrier()
 
 # A fault inside the "ist-nest" NMI: the #GP or #PF of ist_nest_faults.
 # Records where its frame landed and returns the RIP to resume at, or 0 for
@@ -182,4 +237,46 @@ pub fn ist_nest_selftest(x2apic: bool, icr: u64, apic_id: u32, unmapped: u64) ->
     klog(" and ")
     klog_hex(ist_nest_pf_frame)
     klog(") and returned; the NMI returned to its probe\n")
+    return true
+
+fn nmi_nest_fail(why: StrView) -> bool
+    klog("[nmi-nest] FAILED: ")
+    klog(why)
+    klog("\n")
+    return false
+
+# A second NMI inside the first, after a fault's IRET (AGAST #4650): the
+# nested entry must latch it and return, the first NMI must run the handler
+# again after its own, on this CPU's GS, and then return to the probe (with
+# the GS state nmi-gs requires). Runs "ist-nest" for the faults.
+pub fn nmi_nest_selftest(x2apic: bool, icr: u64, apic_id: u32, unmapped: u64) -> bool
+    let area: u64 = rdmsr(GS_BASE_MSR)
+    nmi_nest_icr = icr
+    nmi_nest_apic = apic_id as u64
+    nmi_nest_outer_running = false
+    nmi_nest_second_due = false
+    nmi_nest_second_seen = false
+    nmi_nest_second_inside = false
+    nmi_nest_second_gs = 0
+    nmi_nest_latched = false
+    nmi_nest_armed = true
+    let returned: bool = ist_nest_selftest(x2apic, icr, apic_id, unmapped)
+    nmi_nest_armed = false
+    nmi_nest_second_due = false
+    if not returned
+        return nmi_nest_fail("the first NMI did not return to the probe intact")
+    if nmi_nest_second_inside
+        return nmi_nest_fail("the second NMI's handler ran inside the first's")
+    if not nmi_nest_latched
+        return nmi_nest_fail("the second NMI was not latched by the nested entry")
+    if not nmi_nest_second_seen
+        return nmi_nest_fail("the first NMI did not repeat for the second")
+    if nmi_nest_second_gs != area
+        klog("[nmi-nest] repeated handler GS_BASE ")
+        klog_hex(nmi_nest_second_gs)
+        klog("\n")
+        return nmi_nest_fail("the repeated NMI handler ran on the user's GS")
+    klog("[nmi-nest] a second NMI inside the first was latched; the first ran its handler again on GS_BASE ")
+    klog_hex(nmi_nest_second_gs)
+    klog(" and returned to its probe\n")
     return true
