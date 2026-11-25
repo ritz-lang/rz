@@ -20,16 +20,29 @@ Named after Indium, a soft malleable metal - the distribution that wraps around 
 - libharland syscall wrapper library
 - Position-independent executable (PIE) userspace binaries
 - Bootable ISO image builder (GRUB/BIOS mode)
-- UEFI disk image builder (qcow2 format)
+- UEFI boot image builder with a QCOW2 data disk for QEMU
 - QEMU launch targets for both UEFI and BIOS boot
 - GPU framebuffer support with prism_demo
 - EC2-compatible GPT disk image builder (`make ec2-disk`)
 
 ## Try it
 
-`make -C projects/indium shell` boots Harland to an `rzsh> ` prompt on your terminal (serial console, no window; OVMF needed).
-Try `echo hi`, `pwd`, `ls /bin`, `cat /etc/motd`; `exit` returns to init, which powers the VM off; Ctrl-A x quits QEMU at any time.
-The gate scripts this same session: `projects/harland/tools/test_shell_boot.sh`.
+`make -C projects/indium shell` boots Harland under OVMF to an `rzsh> ` prompt on your terminal. `make -C projects/indium shell-image` builds `projects/indium/build/uefi-shell.img` and creates `build/shell-storage.qcow2` if needed, without launching QEMU.
+
+At the prompt, try `ls /bin` and `cat /etc/motd`. To test Goliath persistence, run:
+
+```sh
+writefile /var/shell-note "hello from Harland"
+exit
+```
+
+Run `make -C projects/indium shell` again and read the file with `cat /var/shell-note`. A clean `exit` powers the VM off and flushes pending writes. Keep the same QCOW2 disk between boots. To keep the data outside the build directory, pass the same `SHELL_STORAGE=/absolute/path/to/storage.qcow2` each time.
+
+Pass `QEMU_DISPLAY=` to show the framebuffer in a QEMU window alongside the serial shell. The current `hello_gfx` demo uses an embedded bitmap font. An Angelo demo should load a packaged TrueType font and render its glyph outlines through Prism.
+
+The shell VM attaches a VirtIO NIC. The next networking milestone is to expose the live MAC address and IPv4 configuration in the shell and enable ICMP echo from userspace. Use `10.0.2.2`, the QEMU guest gateway, as the first acceptance target.
+
+The toolchain milestone starts with a stable Ritz 1 baseline that rebuilds the system. Use that compiler to bootstrap a Ritz 1.1 development tree. The native toolchain work should produce a Ritz-written LLVM IR assembler and ELF linker that run on both Harland and Linux. A first acceptance test should build and run the same small Ritz program on both hosts using those tools. A later gate can rebuild the system with the native toolchain.
 
 ## Installation
 
@@ -37,7 +50,7 @@ The gate scripts this same session: `projects/harland/tools/test_shell_boot.sh`.
 # Prerequisites. `lld` is required: indium builds harland, whose UEFI
 # bootloader target links with lld-link. Without it the build fails at
 # exit 1 with "Cannot link UEFI target 'bootx64': lld-link not found".
-sudo apt install qemu-system-x86 grub-efi mtools clang lld
+sudo apt install qemu-system-x86 qemu-utils ovmf grub-efi mtools dosfstools clang lld
 
 cd projects/indium
 
@@ -70,6 +83,7 @@ make ec2-disk     # Create EC2-compatible GPT disk image
 make run          # Boot in QEMU (UEFI)
 make run-iso      # Boot in QEMU (BIOS/GRUB)
 make shell        # Boot to an rzsh prompt on this terminal (serial)
+make shell-image  # Build the UEFI shell image and create its Goliath disk
 make test-uefi-gui # Boot with display (shows graphics)
 make debug        # Boot with GDB server on :1234
 make clean        # Remove build artifacts
@@ -133,7 +147,9 @@ UEFI-bootable AMI with `ena_support`, and an instance booted from it.
 | `wc` | Count words, lines, and bytes |
 | `seq10` | Print numbers 1 through 10 |
 | `cat_motd` | Display the message of the day |
-| `ping` | Network connectivity test |
+| `ping` | Reports that userspace ICMP is unavailable |
+| `writefile` | Write a line to a file and flush Goliath storage |
+| `mkdir` | Create directories using absolute paths or the current working directory |
 | `args_test` | Test argument passing |
 | `mmap_test` | Test mmap syscall |
 | `cwd_test` | Test working-directory syscalls |

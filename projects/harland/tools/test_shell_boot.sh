@@ -1,8 +1,8 @@
 #!/bin/bash
-# Boot the `make shell` image and drive a scripted rzsh session over its
+# Boot an interactive initramfs and drive a scripted rzsh session over its
 # serial console (AGAST #4252): the first interactive Indium prompt.
 #
-# The image is the one `make -C projects/indium shell` boots: every package in
+# This uses the same userspace as `make -C projects/indium shell`: every package in
 # indium/initramfs.pkgs, with init_interactive installed as /bin/init
 # (mkinitramfs.py --init), on a virtio-blk disk; harland's own BOOTX64.EFI
 # under OVMF. tools/shell_session.py connects COM1 to a unix socket and plays:
@@ -10,7 +10,8 @@
 #   wait for `rzsh> `, then type
 #     echo hi          -> hi
 #     pwd              -> /
-#     ls /bin          -> lists rzsh, cat and init
+#     cd /bin; ls      -> lists rzsh, cat and init in columns
+#     ls -1            -> lists /bin one name per line in sorted order
 #     cat /etc/motd    -> Welcome to Harland! (a spawned program)
 #     echo after-cat   -> after-cat (the shell survives a child's exit)
 #     exit             -> Goodbye!, "[init] Shell exited", "[exit] init
@@ -100,8 +101,7 @@ for p in "${OVMF_CODE/CODE/VARS}" /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVM
     fi
 done
 
-# shell_session.py adds the serial port (a unix socket it listens on). The
-# rest matches `make -C projects/indium shell`.
+# shell_session.py adds the serial port (a unix socket it listens on).
 python3 "$SCRIPT_DIR/shell_session.py" "$WORK/shell.log" "$TIMEOUT" -- \
     qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m 2G \
     -display none -no-reboot -monitor none \

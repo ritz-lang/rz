@@ -13,7 +13,7 @@ import ritzlib.sys {
     sys_pipe, sys_dup, sys_dup2, sys_chdir, sys_getcwd,
     O_RDONLY, O_DIRECTORY,
     ECHO, ICANON, ISIG, IEXTEN, ICRNL, IXON,
-    VMIN, VTIME, STDIN,
+    VMIN, VTIME, STDIN, STDOUT,
     # Harland-specific (only used when target_os=harland)
     sys_readdir, sys_spawn_args, sys_wait, sys_yield,
     sys_tty_getattr, sys_tty_setattr, TtyAttrs, TTY_ECHO, TTY_ICANON, TTY_ISIG,
@@ -39,53 +39,93 @@ import ritzlib.strview { StrView }
 
 # Linux implementation uses sys_open + sys_getdents64 + sys_close
 [[target_os = "linux"]]
-pub fn os_readdir(path: StrView, names: @&String) -> bool
+fn os_readdir(path: StrView, names: @&String) -> bool
     var cpath: String = string_from(path)
-    let fd: i32 = sys_open(cpath.as_ptr(), O_RDONLY | O_DIRECTORY)
+    let raw: *u8 = cpath.as_ptr()
+    if not cpath.eq(path) or raw == null
+        return false
+    let fd: i32 = sys_open(raw, O_RDONLY | O_DIRECTORY)
     if fd < 0
         return false
 
+    defer sys_close(fd)
     var temp_buf: [4096]u8
+    let dents: Span<u8> = @temp_buf
 
     while true
-        let n: i64 = sys_getdents64(fd, @temp_buf[0], 4096)
-        if n <= 0
+        let n: i64 = sys_getdents64(fd, dents.ptr, dents.len)
+        if n < 0
+            return false
+        if n == 0
             break
 
-        # Parse dirent64 entries and extract names
+        # Parse dirent64 entries (d_reclen at 16, d_name at 19) and extract names
         var pos: i64 = 0
         while pos < n
-            let entry: *u8 = @temp_buf[0] + pos
-            let reclen_lo: u8 = *(entry + 16)
-            let reclen_hi: u8 = *(entry + 17)
-            let reclen: i64 = (reclen_lo as i64) | ((reclen_hi as i64) << 8)
-            let name: *u8 = entry + 19
-
-            # Skip . and .. (d_name is the kernel's NUL-terminated string)
-            let name_view: StrView = strview_from_cstr(name)
-            if not name_view.eq(".") and not name_view.eq("..")
-                names.push_str(name_view)
-                names.push(0)
+            if n - pos <= 19
+                return false
+            let reclen: i64 = (dents.get(pos + 16) as i64) | ((dents.get(pos + 17) as i64) << 8)
+            if reclen <= 19 or reclen > n - pos
+                return false
+            let field: StrView = dents.slice(pos + 19, pos + reclen).as_strview()
+            let end: i64 = field.find_byte(0)
+            if end < 0
+                return false
+            let name: StrView = field.take(end)
+            if not name.eq(".") and not name.eq("..")
+                if not names.push_str(name) or not names.push(0)
+                    return false
 
             pos = pos + reclen
 
-    sys_close(fd)
     return true
 
 # Harland implementation uses sys_readdir, which fills a buffer with names
 # in the same "a\0b\0" form.
 [[target_os = "harland"]]
-pub fn os_readdir(path: StrView, names: @&String) -> bool
-    var cpath: String = string_from(path)
-    var buf: [4096]u8
-    let n: i64 = sys_readdir(cpath.as_ptr(), @buf[0], 4096)
-    if n < 0
+fn os_readdir(path: StrView, names: @&String) -> bool
+    if path.is_empty()
         return false
-    push_prefix(names, @buf, n)
-    return true
+    var absolute: String = string_new()
+    if path.starts_with("/")
+        if not absolute.push_str(path)
+            return false
+    else
+        var cwd_buffer: [4096]u8
+        match os_getcwd(@cwd_buffer)
+            Some(cwd) =>
+                if not absolute.push_str(cwd)
+                    return false
+                if not path.eq(".")
+                    if not cwd.ends_with("/") and not absolute.push('/')
+                        return false
+                    if not absolute.push_str(path)
+                        return false
+            None => return false
+    let raw: *u8 = absolute.as_ptr()
+    if raw == null
+        return false
+    var bytes: [16384]u8
+    let listing: Span<u8> = @bytes
+    let length: i64 = sys_readdir(raw, listing.ptr, listing.len)
+    if length < 0 or length > listing.len
+        return false
+    return names.push_span(listing.to(length))
 
-fn push_prefix(names: @&String, bytes: Span<u8>, n: i64)
-    names.push_span(bytes.to(n))
+# Directory views borrow the caller's string.
+pub fn os_directory_names(path: StrView, storage: @&String, names: @&Vec<StrView>) -> bool
+    if not os_readdir(path, storage)
+        return false
+    var entries: StrView = storage.as_view()
+    while not entries.is_empty()
+        let end: i64 = entries.find_byte(0)
+        if end < 0
+            return false
+        let name: StrView = entries.take(end)
+        if not name.is_empty() and not name.starts_with(".") and not names.push(name)
+            return false
+        entries = entries.skip(end + 1)
+    return true
 
 # ============================================================================
 # Process spawning
@@ -348,16 +388,16 @@ pub fn os_yield()
     sys_yield()
 
 # ============================================================================
-# Default directory for ls
+# Directory listing layout
 # ============================================================================
 
 [[target_os = "linux"]]
-pub fn os_default_ls_path() -> StrView
-    return "."
+pub fn os_stdout_is_terminal() -> bool
+    return tcgetattr(STDOUT).is_ok()
 
 [[target_os = "harland"]]
-pub fn os_default_ls_path() -> StrView
-    return "/"
+pub fn os_stdout_is_terminal() -> bool
+    return true
 
 # ============================================================================
 # Search paths for external commands

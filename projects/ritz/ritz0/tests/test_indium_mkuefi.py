@@ -122,7 +122,10 @@ def test_indium_disks_carry_the_initramfs_on_the_esp():
     in the ESP; the EC2 disk no longer writes a raw TAR partition."""
     text = INDIUM_MAKEFILE.read_text()
     uefi = _recipe(text, "$(UEFI_DISK)")
-    assert "initramfs.tar" in uefi.split("mkuefi.py", 1)[1]
+    # The recipe is shared with the shell image (`make shell-image`); each
+    # disk names the initramfs it carries in a target-specific BOOT_TAR.
+    assert "$(BOOT_TAR)" in uefi.split("mkuefi.py", 1)[1]
+    assert "$(UEFI_DISK): BOOT_TAR = $(BUILD_DIR)/initramfs.tar" in text.splitlines()
     ec2 = _recipe(text, "$(EC2_DISK)")
     # AGAST #1849: the EC2 disk is built by tools/mkec2disk.py, which writes
     # harland/initramfs.tar into the ESP itself (pinned byte-for-byte by
@@ -206,8 +209,15 @@ def test_usage_error(tmp_path):
 
 
 def _recipe(makefile_text, target):
+    """The recipe of the rule naming `target`, alone or among other targets
+    (`$(UEFI_DISK) $(SHELL_DISK): kernel`); skips its prerequisite-only rules
+    and target-specific variables, which have no recipe."""
     lines = makefile_text.splitlines()
-    start = next(i for i, l in enumerate(lines) if l.startswith(target + ":"))
+    start = next(
+        i for i, l in enumerate(lines[:-1])
+        if ":" in l and target in l.split(":", 1)[0].split()
+        and lines[i + 1].startswith("\t")
+    )
     body = []
     for l in lines[start + 1:]:
         if not l.startswith("\t"):
