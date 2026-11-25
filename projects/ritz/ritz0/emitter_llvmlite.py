@@ -12137,7 +12137,13 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         bad_exit = None
         self.builder.position_at_end(bad_block)
         if expr.method == 'unwrap_or':
-            bad_val = self._emit_expr(expr.args[0])
+            default = expr.args[0]
+            if isinstance(default, rast.StringLit) and llvm_payload_type == self.i8.as_pointer():
+                # `"q"` in a `*u8` slot is its bytes (AGAST #4679), as in a
+                # `let p: *u8 = "q"`; a StrView converted to `ptr` was bad IR.
+                bad_val = self._const_str_ptr(default.value)
+            else:
+                bad_val = self._emit_expr(default)
             bad_val = self._convert_type(bad_val, llvm_payload_type)
             self.builder.branch(merge_block)
             bad_exit = self.builder.block

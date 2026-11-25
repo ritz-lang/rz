@@ -2294,7 +2294,14 @@ fn emit_payload_into_slot(s: *EmitterState, enum_name_sv: StrView, tag: i32, e: 
     if is_tagged_enum_type(StrView { ptr: (pay), len: (pay_len) as i64 }) == 1 or is_enum_instance(s.mono.pctx, StrView { ptr: (pay), len: (pay_len) as i64 }) == 1
         s.ctx_enum_name = pay
         s.ctx_enum_name_len = pay_len
-    let reg: i32 = emit_expr(s, e)
+    # AGAST #4678: a struct payload is a copy into the variant's slot, as a
+    # struct argument is, so a whole struct element (`Some(m.params[i])`,
+    # `Ok(p[i])`) is its value rather than refused (whole_struct_elem_refused).
+    var reg: i32 = 0
+    if find_struct(s, StrView { ptr: (pay), len: (pay_len) as i64 }) != null
+        reg = emit_struct_copy(s, e, TypeKind.Struct)
+    else
+        reg = emit_expr(s, e)
     s.ctx_enum_name = saved_name
     s.ctx_enum_name_len = saved_len
     s.ctx_enum_arg = saved_arg
@@ -4821,7 +4828,10 @@ fn try_emit_enum_unwrap(s: *EmitterState, e: *Expr, type_name_sv: StrView, recei
         emit_str(s, c" = icmp eq i8 ")
         emit_reg(s, tag_reg)
         emit_str(s, c", 0  ; unwrap_or tag check (Ok/Some == 0)\n")
-        let def_agg: i32 = emit_expr(s, e.args)
+        # AGAST #4679: the default is a value of the payload's type, as a
+        # `let` of it is: a `"/"` is rebuilt from its `%Span$u8` into the
+        # `%StrView` the select wants, and a struct element is its copy.
+        let def_agg: i32 = emit_store_into_slot(s, e.args, TypeKind.Struct, StrView { ptr: (pay_name), len: (pay_name_len) as i64 })
         let sel_agg: i32 = next_reg(s)
         emit_str(s, IR_INDENT)
         emit_reg(s, sel_agg)
@@ -4851,6 +4861,13 @@ fn try_emit_enum_unwrap(s: *EmitterState, e: *Expr, type_name_sv: StrView, recei
     emit_reg(s, tag_reg)
     emit_str(s, c", 0  ; unwrap_or tag check (Ok/Some == 0)\n")
 
+    # AGAST #4679: a `"q"` default of a `*u8` payload is its bytes, as in any
+    # `*u8` slot (literal_slot.ritz's lit_into_ptr): Sema never types this
+    # argument, so it stayed a `%Span$u8` in an i64 select.
+    var arg_len: i32 = 0
+    let arg: *u8 = tagged_enum_arg(s, StrView { ptr: (type_name), len: (type_name_len) as i64 }, 0, @arg_len)
+    if e.args.kind == ExprKind.StringLit and arg != null and name_eq(StrView { ptr: (arg), len: (arg_len) as i64 }, StrView { ptr: (c"ptr_u8"), len: (6) as i64 }) == 1
+        e.args.kind = ExprKind.CstringLit
     let default_reg: i32 = emit_expr(s, e.args)
     let result: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
