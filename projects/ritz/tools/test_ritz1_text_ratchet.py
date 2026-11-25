@@ -1,6 +1,7 @@
 """tools/ritz1_text_ratchet.py: ritz1's old emitter text form, pinned down-only (AGAST #4696)."""
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -74,3 +75,41 @@ def test_this_tree_is_within_its_baseline():
 def test_a_ported_file_is_pinned_at_zero_in_every_column(name):
     assert name not in rt.load(rt.DEFAULT_BASELINE)
     assert rt.measure(rt.DEFAULT_SRC)[name] == dict.fromkeys(rt.COLUMNS, 0)
+
+
+# AGAST #4770: outside the emitter, literal text is a plain "..." StrView. A
+# C literal wrapped in a hand-counted view, or compared with memcmp /
+# bytes_eq_cstr, is the C form the port removed: its length is counted by hand.
+_C_VIEW = re.compile(r'ptr: \(c"')
+_C_COMPARE = re.compile(r'\b(?:memcmp|bytes_eq_cstr)\([^)]*c"')
+
+
+def c_text_forms(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if _C_VIEW.search(line) or _C_COMPARE.search(line)]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '    f(StrView { ptr: (c"self"), len: (4) as i64 })',
+        '    if len > 4 and memcmp(name, c"ptr_", 4) == 0',
+        '    if bytes_eq_cstr(name, c"Ok") == 1',
+    ],
+)
+def test_a_c_literal_view_or_compare_is_found(line):
+    assert c_text_forms(line) == [line.strip()]
+
+
+def test_a_plain_literal_and_a_pointer_compare_are_not():
+    text = '    f("self")\n    if name.starts_with("ptr_")\n    memcmp(a, b, n)\n'
+    assert c_text_forms(text) == []
+
+
+def test_no_c_literal_text_outside_the_emitter():
+    found = [
+        f"{p.name}: {line}"
+        for p in sorted(rt.DEFAULT_SRC.glob("*.ritz"))
+        if not p.name.startswith("emitter") and p.stem not in rt.GENERATED_MODULES
+        for line in c_text_forms(p.read_text())
+    ]
+    assert found == []
