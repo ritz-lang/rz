@@ -80,6 +80,26 @@ fn err3(prefix: StrView, path: *u8, extra: *u8) -> i32
 # File I/O Helpers
 # =============================================================================
 
+# The arena the module's IR is written into (AGAST #4696).  Address space, not
+# memory: pages are mapped untouched and only the bytes written are resident.
+# 1 GiB is the most IR a module can write (the buffers never grow); a host that refuses that much address space gets the
+# largest power-of-two share it will give, down to 128 MiB.
+const IR_ARENA_BYTES: i64 = 1073741824
+const IR_ARENA_MIN_BYTES: i64 = 134217728
+# What the arena keeps for the buffers' headers and alignment.
+const IR_ARENA_SLACK_BYTES: i64 = 65536
+
+fn ir_arena_open() -> Arena
+    var size: i64 = IR_ARENA_BYTES
+    var arena: Arena = arena_new(size)
+    while not arena.valid() and size > IR_ARENA_MIN_BYTES
+        size = size / 2
+        arena = arena_new(size)
+    if not arena.valid()
+        eprint("error: ritz1 could not map memory for the module's IR\n")
+        sys_exit(1)
+    arena
+
 fn read_file(path: *u8) -> Vec<u8>
     var buf: Vec<u8> = vec_new<u8>()
     let fd: i32 = sys_open(path, O_RDONLY)
@@ -1866,19 +1886,25 @@ pub fn main(argv: Span<StrView>) -> i32
     if sema_check_module(mono, m, args.input_path) > 0
         return 1
 
-    # Emit IR
-    var ir: Vec<u8> = vec_with_cap<u8>(131072)  # 128KB seed; realloc as needed
+    # Emit IR.  The module's text is a String on the module's Arena (AGAST
+    # #4696); the whole arena goes back at once when this fn returns, after the
+    # .ll is written.
+    var ir_arena: Arena = ir_arena_open()
+    defer ir_arena.destroy()
+    var ir_alloc: Allocator = ir_arena.allocator()
+    # Sized to the room left after the entry-alloca buffer (emit_module's), so it
+    # never grows; see arena_string.
+    let ir: *String = arena_string(@ir_alloc, ir_arena.remaining() - ENTRY_ALLOCA_BYTES - IR_ARENA_SLACK_BYTES)
     emitter_set_source_file(args.input_path)   # AGAST #1813
-    let emit_errors: i32 = emit_module(m, @ir, mono, freestanding)
+    let emit_errors: i32 = emit_module(m, ir, @ir_alloc, mono, freestanding)
     sema_probe_report()
     # AGAST #4609: a renamed twin's methods under the `T_m` its object defines.
     if twin_renames_pending(ctx) == 1
-        var fixed: String = twin_fix_ir_symbols(ctx, m, StrView { ptr: (ir.data), len: (ir.len as i64) })
-        ir.len = 0
-        var fi: i64 = 0
-        while fi < fixed.len()
-            ir.push(fixed.get(fi))
-            fi = fi + 1
+        let fixed: String = twin_fix_ir_symbols(ctx, m, ir.as_view())
+        ir.clear()
+        if not ir.push_string(@fixed)
+            eprint("error: ritz1's IR for this module does not fit its arena\n")
+            return 1
 
     # AGAST #1369.  This return value was previously discarded, and it was a
     # hardcoded 0 anyway: an expression the emitter could not lower was written
@@ -1903,7 +1929,7 @@ pub fn main(argv: Span<StrView>) -> i32
         return 1
 
     # Write output
-    if write_file(args.output_path, StrView { ptr: (ir.data), len: (ir.len as i64) }) < 0
+    if write_file(args.output_path, ir.as_view()) < 0
         return 1
 
     # Write the sig: source hash, compiler identity, import hashes and a
@@ -1922,11 +1948,11 @@ pub fn main(argv: Span<StrView>) -> i32
         # AGAST #1550: and with the target OS, which picks the variants.
         sig_out.compiler_hash = cache_fp
         # Take a heap copy of ir.data — sig_data_free() owns the buffer.
-        let ir_len: i64 = ir.len as i64
+        let ir_len: i64 = ir.len()
         if ir_len > 0
             let ir_copy: *u8 = malloc(ir_len + 1)
             if ir_copy != null
-                memcpy(ir_copy, ir.data, ir_len)
+                memcpy(ir_copy, ir.as_view().ptr, ir_len)
                 *(ir_copy + ir_len) = 0
                 sig_out.module_ir = ir_copy
                 sig_out.module_ir_len = ir_len

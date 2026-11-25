@@ -12,6 +12,7 @@ import ritzlib.str
 import ritzlib.fmt.digits  # fmt_i64_into: the byval refusal's byte count
 import ritzlib.strview    # StrView (the type; #4462 moved the scanners out)
 import ritzlib.gvec
+import ritzlib.string
 import ritzlib.memory
 import diag              # diag_error_at (AGAST #1866)
 
@@ -471,19 +472,10 @@ fn emit_bool_param_spill(s: *EmitterState, param: *Param)
 # each was emitted (ea_marks), and the original marks past `entry:` move up by
 # the buffer's length.  Its diagnostics keep their exact source spans.
 fn splice_entry_allocas(s: *EmitterState, body_start: i64)
-    let n: i64 = s.entry_allocas.len
+    let n: i64 = s.entry_allocas.data.len
     if n <= 0
         return
-    let old_len: i64 = s.out.len
-    let new_len: i64 = old_len + n
-    let base: *u8 = malloc(new_len)
-    memcpy(base, s.out.data, body_start)
-    memcpy(base + body_start, s.entry_allocas.data, n)
-    memcpy(base + body_start + n, s.out.data + body_start, old_len - body_start)
-    free(s.out.data)
-    s.out.data = base
-    s.out.len = new_len
-    s.out.cap = new_len
+    out_insert(s, body_start, s.entry_allocas.as_view())
     # Rebuild the frame-limit marks.  They are sorted by offset; the buffer's
     # lines now start at body_start (in emission order), and every original
     # mark at or after body_start shifted up by n.
@@ -525,7 +517,7 @@ fn splice_entry_allocas(s: *EmitterState, body_start: i64)
     # AGAST #4461: deferred load lines move with the body too.
     defer_loads_shift(s, n)
     # The next fn starts empty (grows are kept for reuse).
-    s.entry_allocas.len = 0
+    s.entry_allocas.data.len = 0
     s.ea_count = 0
 
 # AGAST #4461: the generic line scanners the deferred-load splice uses live in
@@ -557,9 +549,9 @@ fn splice_entry_allocas(s: *EmitterState, body_start: i64)
 fn out_contains(s: *EmitterState, from: i64, pat_sv: StrView) -> i32
     var pat: *u8 = pat_sv.ptr
     var plen: i64 = pat_sv.len
-    let base: *u8 = s.out.data
+    let base: *u8 = s.out.data.data
     var i: i64 = from
-    while i + plen <= s.out.len
+    while i + plen <= s.out.data.len
         if memcmp(base + i, pat, plen) == 0
             return 1
         i += 1
@@ -575,10 +567,10 @@ fn tag_intrinsic_target_features(s: *EmitterState, attr_pos: i64)
     let clmul: i32 = out_contains(s, attr_pos, StrView { ptr: (c"@llvm.x86.pclmulqdq"), len: (19) })
     if sha == 0 and aes == 0 and clmul == 0
         return
-    let n: i64 = s.out.len - attr_pos
+    let n: i64 = s.out.data.len - attr_pos
     let tail: *u8 = malloc(n)
-    memcpy(tail, s.out.data + attr_pos, n)
-    s.out.len = attr_pos
+    memcpy(tail, s.out.data.data + attr_pos, n)
+    s.out.data.len = attr_pos
     emit_str(s, c" \"target-cpu\"=\"x86-64\" \"target-features\"=\"")
     # Sorted, as ritz0 emits them, so the two compilers' IR agrees.
     var sep: i32 = 0
@@ -814,7 +806,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         return
     emit_fn_attrs(s)
     emit_str(s, fn_inline_attr(s.mono.pctx, f))   # [[inline]] / [[always_inline]] / [[noinline]] (#1847)
-    let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
+    let attr_pos: i64 = s.out.data.len    # AGAST #1737: target attrs go here
     # After attr_pos: an attribute inserted there must precede `comdat`.
     if f.is_local == 1 and (poll_odr or fn_is_odr(is_main, own_copy, f.is_pub, f.from_generated))
         emit_str(s, c" comdat")   # AGAST #201: see emit_odr_comdat_start
@@ -822,7 +814,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     emit_str(s, c"entry:\n")
     # AGAST #1685, #4460: static allocas emitted below this point are
     # buffered and spliced back here when the body is complete.
-    let body_start: i64 = s.out.len
+    let body_start: i64 = s.out.data.len
 
     var param3: *Param = f.params
     while param3 != null
@@ -1164,14 +1156,14 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # alignstack(16), "no-builtins" and (--stack-protector) sspstrong: see
     # emit_fn_attrs.
     emit_fn_attrs(s)
-    let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
+    let attr_pos: i64 = s.out.data.len    # AGAST #1737: target attrs go here
     if fn_is_odr(false, im_is_monomorph, im_pub, 0)
         emit_str(s, c" comdat")   # AGAST #201: see emit_odr_comdat_start
     emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
     # AGAST #1685, #4460: static allocas emitted below this point are
     # buffered and spliced back here when the body is complete.
-    let body_start: i64 = s.out.len
+    let body_start: i64 = s.out.data.len
 
     var param2: *Param = method.params
     while param2 != null
@@ -1997,10 +1989,10 @@ fn emit_tagged_enum_types(s: *EmitterState)
 fn emit_late_enum_types(s: *EmitterState, pos: i64)
     if namelist_count(@s.late_enums) == 0 and namelist_count(@s.late_tuples) == 0
         return
-    let n: i64 = s.out.len - pos
+    let n: i64 = s.out.data.len - pos
     let tail: *u8 = malloc(n)
-    memcpy(tail, s.out.data + pos, n)
-    s.out.len = pos
+    memcpy(tail, s.out.data.data + pos, n)
+    s.out.data.len = pos
     for i in 0..namelist_count(@s.late_enums)
         let ln: *u8 = namelist_name(@s.late_enums, i)
         let ll: i32 = namelist_len(@s.late_enums, i)
@@ -2523,13 +2515,13 @@ fn lower_ref_fields(m: *Module)
             f = f.next
         st = st.next
 
-pub fn emit_module(m: *Module, out: *Vec<u8>, mono: *MonoCtx, freestanding: i32) -> i32
+pub fn emit_module(m: *Module, out: *String, alloc: *Allocator, mono: *MonoCtx, freestanding: i32) -> i32
     # Built whole (AGAST #3592): EmitterState is move-only (its HashMapI64
     # maps have Drop).  This was R59's migration site; R59 now allows a
     # splittable struct to be written field by field (AGAST #4328).
     var s: EmitterState = EmitterState {
         out: out,
-        entry_allocas: Vec<u8> { data: null, len: 0, cap: 0 },   # AGAST #4460
+        entry_allocas: arena_string(alloc, ENTRY_ALLOCA_BYTES),   # AGAST #4460
         ea_marks: null,
         ea_count: 0,
         ea_cap: 0,
@@ -2663,7 +2655,7 @@ pub fn emit_module(m: *Module, out: *Vec<u8>, mono: *MonoCtx, freestanding: i32)
     # old i64-pack fast-path with a real `{ i8, [N x i8] }` struct so the
     # IR matches ritz0.
     emit_tagged_enum_types(@s)
-    let late_enum_pos: i64 = s.out.len
+    let late_enum_pos: i64 = s.out.data.len
 
     # Emit fallback `%Name = type { i8 }` decls for any remaining
     # referenced struct-typed name the parser skipped (C-style unit

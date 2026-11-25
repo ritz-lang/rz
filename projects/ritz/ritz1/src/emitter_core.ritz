@@ -9,6 +9,7 @@ import ritzlib.str
 import ritzlib.strview    # strview_eq / strview_starts_with_cstr
 import ritzlib.fmt.digits
 import ritzlib.gvec
+import ritzlib.string   # EmitterState.out: the module's IR, a String on its Arena (AGAST #4696)
 import ritzlib.memory
 import ritzlib.hash
 import ritzlib.hashmap
@@ -23,6 +24,7 @@ import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
 pub import ast_query
 import tokens_gen
 import emitter_ir      # ir_alloca (AGAST #4460)
+import ir_operand      # what a register operand is (AGAST #4696)
 import monomorph       # MonoCtx, EmitterState.mono (AGAST #4454)
 
 # =============================================================================
@@ -145,18 +147,22 @@ struct DeferredLoad
     used: i32         # 1 once emit_reg referenced the register
 
 struct EmitterState
-    out: *Vec<u8>
+    # The IR text.  A String drawn from the module's Arena (main.ritz), written
+    # through format_into(s, "...") (EmitterState.push_bytes) in ported code and
+    # through emit_str (the legacy shim) in the rest.  Points at entry_allocas
+    # while a redirect is in effect (#4460).
+    out: *String
     # AGAST #4460 — this fn's STATIC allocas, in emission order, and the
     # (buffer offset, source span) of each (frame_limit still locates the
     # largest one).  Written by entry_alloca_begin / entry_alloca and spliced
     # after `entry:` by splice_entry_allocas when the body is complete; a
     # DYNAMIC alloca (`alloca i8, i64 %.N`) is still written to s.out.
     # entry_out_saved is s.out while a redirect is in effect.
-    entry_allocas: Vec<u8>
+    entry_allocas: *String   # in the module's arena, like `out`
     ea_marks: *FrameMark
     ea_count: i32
     ea_cap: i32
-    entry_out_saved: *Vec<u8>
+    entry_out_saved: *String
     # AGAST #4461 — the deferred large-struct loads of this fn (see
     # DeferredLoad).  Grown for reuse across fns; reset when the body's loads
     # are spliced at the end of each.
@@ -598,15 +604,42 @@ pub fn emit_no_red_zone_attr(s: *EmitterState)
 
 # Start offset of the line currently being built in s.out.
 fn packed_line_start(s: *EmitterState) -> i64
-    var i: i64 = s.out.len - 1
-    while i >= 0 and *(s.out.data + i) != 10   # '\n'
+    var i: i64 = s.out.data.len - 1
+    while i >= 0 and *(s.out.data.data + i) != 10   # '\n'
         i -= 1
     i + 1
+
+# The module's IR buffers live in its Arena and are sized once, to the room they
+# have, so they never grow: a growth would realloc a block no libc allocator
+# owns (valgrind, which replaces realloc and free, rejects it), and a String
+# that is never dropped never frees one.  So an arena String is a *String whose
+# header is in the arena too, and the arena is unmapped whole.
+pub const ENTRY_ALLOCA_BYTES: i64 = 33554432   # one fn's static allocas, about 100 bytes each
+
+# A String of `cap` bytes, header and bytes both from `a` (see above); null if
+# `a` is out of room.
+pub fn arena_string(a: *Allocator, cap: i64) -> *String
+    let at: *String = a.malloc(sizeof(String)) as *String
+    if at == null
+        emit_out_exhausted()
+    *at = string_with_cap_in(a, cap)
+    at
+
+# `text` inserted into the IR at offset `at`, the bytes after it moving up.
+# The two splices (the entry-block allocas, the deferred struct loads) are the
+# only places the emitter writes anywhere but the end of the IR.
+pub fn out_insert(s: *EmitterState, at: i64, text: StrView)
+    let old_len: i64 = s.out.data.len
+    if not s.out.data.ensure_cap(old_len + text.len)
+        emit_out_exhausted()
+    memmove(s.out.data.data + at + text.len, s.out.data.data + at, old_len - at)
+    memcpy(s.out.data.data + at, text.ptr, text.len)
+    s.out.data.len = old_len + text.len
 
 # The partial line currently being built (no trailing newline yet).
 fn packed_line(s: *EmitterState) -> StrView
     let start: i64 = packed_line_start(s)
-    StrView { ptr: (s.out.data + start), len: (s.out.len - start) }
+    StrView { ptr: (s.out.data.data + start), len: (s.out.data.len - start) }
 
 # Does the partial line end with `, ptr ` -- i.e. is a pointer operand next?
 fn packed_line_at_ptr_sep(s: *EmitterState) -> i32
@@ -666,6 +699,11 @@ pub fn packed_marks_reset(s: *EmitterState)
     if s.packed_marks != null and s.packed_marks_cap > 0
         memzero(s.packed_marks, s.packed_marks_cap as i64)
 
+# The legacy text shim for the files not yet ported (AGAST #4695): NUL-terminated
+# `c"..."` text, one call per fragment.  New and ported code does not call it:
+# it writes whole instructions with `format_into(s, "  %.{r} = add i64 %.{a}, %.{b}\n")`
+# (EmitterState.push_bytes, below), whose text is a StrView and whose values are
+# interpolated.  ritz1/ARCHITECTURE.md "Emitter style" has the pattern.
 pub fn emit_str(s: *EmitterState, text: *u8)
     # AGAST #1625, #3508: every way out of a fn is a `ret`, written from
     # dozens of sites once the return value is computed.  The live owned
@@ -679,7 +717,7 @@ pub fn emit_str(s: *EmitterState, text: *u8)
     var i: i32 = 0
     while *(text + i) != 0
         i += 1
-    s.out.push_span(Span<u8> { ptr: (text), len: (i as i64) as i64 })
+    out_append(s, StrView { ptr: (text), len: (i as i64) })
 
 # AGAST #4666: emit_str for a StrView (`"..."`, no NUL needed), with the
 # same `ret` hook.
@@ -687,7 +725,40 @@ pub fn emit_sv(s: *EmitterState, text: StrView)
     if text.starts_with("  ret ") or text.starts_with("  ret\n")
         let before_ret: fn(*EmitterState) = s.own_before_ret_fn
         before_ret(s)
-    s.out.push_span(Span<u8> { ptr: text.ptr, len: text.len })
+    out_append(s, text)
+
+# `text` appended to the IR.  The IR lives in the module's Arena, which has a
+# fixed size: a module whose text outgrows it stops here, rather than writing a
+# truncated .ll that clang would reject (or worse, accept).
+fn out_append(s: *EmitterState, text: StrView)
+    if not s.out.push_span(Span<u8> { ptr: text.ptr, len: text.len })
+        emit_out_exhausted()
+
+fn emit_out_exhausted()
+    eprint("error: ritz1's IR for this module does not fit its arena\n")
+    sys_exit(1)
+
+# format_into's sink (LANGUAGE_SPEC §2.6): `format_into(s, "  %.{r} = add {ty} ...")`
+# appends to the module's IR, one call per piece of the literal, text or value.
+#
+# This is the one place IR text becomes IR, so the two hooks emit_str and
+# emit_reg used to carry between them live here once:
+#   * a piece that starts a `ret` first drops the live owned bindings
+#     (own_before_ret; AGAST #1625, #3508);
+#   * a register operand, which is the digits right after `%.`, is noted as
+#     used by the deferred struct loads (#4461) and, after a `ptr` operand,
+#     by the packed-align tracking (#4462), exactly as emit_reg notes it.
+impl EmitterState
+    pub fn push_bytes(self: @&EmitterState, data: Span<u8>)
+        let text: StrView = StrView { ptr: data.ptr, len: data.len }
+        let reg: i32 = reg_operand_of(self, text)
+        if reg < 0
+            emit_sv(self, text)
+            return
+        let kind: i32 = reg_operand_kind(self, 2)
+        dload_note_use(self, reg)
+        out_append(self, text)
+        reg_operand_after(self, reg, kind)
 
 # `  ret ...` / `  ret\n`: the start of a `ret` instruction.
 fn emit_str_is_ret(text: *u8) -> i32
@@ -737,6 +808,31 @@ pub fn emit_name(s: *EmitterState, name_sv: StrView)
             s.out.push(95)   # '_'
         else
             s.out.push(c)
+
+# `  %.{dst} = getelementptr %<struct>`: the start of a GEP over a named struct
+# type, left open for the caller's `, ptr %.{base}, i32 0, ...`.  The name goes
+# through emit_name, which marks a GEP over a packed struct (AGAST #4462); a
+# format_into piece would not.
+pub fn gep_struct_open(s: *EmitterState, dst: i32, struct_name: StrView)
+    format_into(s, "  %.{dst} = getelementptr %")
+    emit_name(s, struct_name)
+
+# `name` spelled for the IR as emit_name spells it, as a String to interpolate:
+# `let g = ir_name(n)` then `format_into(s, "@{g.as_view()}")`.  For the sites
+# that are not a struct type behind `getelementptr %` (emit_name's packed
+# check, AGAST #4462, stays with emit_name for those).
+pub fn ir_name(name: StrView) -> String
+    var out: String = string_with_cap(name.len + 1)
+    var seen_dollar: bool = false
+    for i in 0..name.len
+        let c: u8 = name.get(i)
+        if c == '$' and seen_dollar
+            out.push('_')
+        else
+            out.push(c)
+        if c == '$'
+            seen_dollar = true
+    out
 
 # AGAST #3257: how many counted errors were printed WITHOUT a file:line:col,
 # out of s.error_count.  Since #3445 the emit_ir_error family is located, so
@@ -944,29 +1040,42 @@ pub fn emit_reg(s: *EmitterState, reg: i32)
     # AGAST #4461: any use of a deferred load's register means the copy
     # rewrite cannot fire; the load is written back at fn end.
     dload_note_use(s, reg)
-    # AGAST #4462: a register emitted right after `, ptr ` is either a GEP's
-    # base or a load/store's pointer operand.  Both decisions are made here,
-    # before the register's text is appended.
-    let at_ptr: i32 = packed_line_at_ptr_sep(s)
-    var is_gep: bool = false
-    var is_access: bool = false
-    if at_ptr == 1
-        let line: StrView = packed_line(s)
-        if line.contains(strview_from_cstr(c" = getelementptr "))
-            is_gep = true
-        else if line.starts_with("  store ")
-            is_access = true
-        else if line.contains(strview_from_cstr(c" = load "))
-            is_access = true
-    let marked: i32 = packed_marked(s, reg)
+    let kind: i32 = reg_operand_kind(s, 0)
     emit_str(s, c"%.")
     emit_int(s, reg as i64)
-    if at_ptr == 1 and marked == 1
-        if is_gep
-            # `getelementptr ... ptr %.reg`: the result inherits provenance.
-            packed_mark(s, packed_gep_dst(s))
-        else if is_access
-            emit_str(s, c", align 1")
+    reg_operand_after(s, reg, kind)
+
+# What a register operand about to be written means to the packed-align
+# tracking (AGAST #4462): REG_PLAIN, or after a `, ptr ` the base of a
+# getelementptr (REG_GEP_BASE) or the pointer of a load/store (REG_ACCESS_PTR).
+# Decided from the line so far, before the register's text is appended;
+# `written` is how many bytes of that text (`%.`) are already on the line.
+fn reg_operand_kind(s: *EmitterState, written: i64) -> i32
+    let whole: StrView = packed_line(s)
+    reg_operand_kind_of(StrView { ptr: whole.ptr, len: whole.len - written })
+
+# After `%.reg` is written: a packed-derived register keeps its provenance
+# through a GEP and is accessed `align 1`.
+fn reg_operand_after(s: *EmitterState, reg: i32, kind: i32)
+    if kind == REG_PLAIN or packed_marked(s, reg) == 0
+        return
+    if kind == REG_GEP_BASE
+        # `getelementptr ... ptr %.reg`: the result inherits provenance.
+        packed_mark(s, packed_gep_dst(s))
+    else
+        out_append(s, ", align 1")
+
+# The register `text` names when it is the digits of a register operand, i.e.
+# the IR so far ends in `%.`; else -1.
+fn reg_operand_of(s: *EmitterState, text: StrView) -> i32
+    let reg: i32 = register_digits(text)
+    if reg < 0
+        return reg
+    let have: i64 = s.out.data.len
+    if have < 2 or *(s.out.data.data + (have - 2)) != '%' or *(s.out.data.data + (have - 1)) != '.'
+        return 0 - 1
+    reg
+
 
 
 pub fn next_reg(s: *EmitterState) -> i32
@@ -1058,10 +1167,10 @@ fn dload_cannot_write(p_sv: StrView) -> i32
 
 # 1 when every line emitted since offset `from` cannot write memory.
 pub fn dload_region_cannot_write(s: *EmitterState, from: i64) -> i32
-    if from >= s.out.len
+    if from >= s.out.data.len
         return 1
-    var p: *u8 = s.out.data + from
-    let end: *u8 = s.out.data + s.out.len
+    var p: *u8 = s.out.data.data + from
+    let end: *u8 = s.out.data.data + s.out.data.len
     while p < end
         let ll: i64 = scan_line_len(p, end)
         if dload_cannot_write(StrView { ptr: (p), len: (ll) }) == 0
@@ -1087,7 +1196,7 @@ pub fn dload_add(s: *EmitterState, reg: i32, ty_sv: StrView, src_reg: i32, src_n
     var ty_len: i32 = ty_sv.len as i32
     let r: *DeferredLoad = s.dloads + (s.dload_count as i64)
     r.reg = reg
-    r.off = s.out.len
+    r.off = s.out.data.len
     r.src_reg = src_reg
     r.src_name = dload_dup(src_name, src_name_len)
     r.src_name_len = src_name_len
@@ -1129,8 +1238,8 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
         if r.state == DLOAD_KEEP
             # Render through the ordinary emitters into a scratch buffer, so
             # the line is spelled exactly as the load site spells it.
-            var line: Vec<u8> = Vec<u8> { data: null, len: 0, cap: 0 }
-            let saved: *Vec<u8> = s.out
+            var line: String = string_new()
+            let saved: *String = s.out
             s.out = @line
             emit_str(s, c"  ")
             emit_reg(s, r.reg)
@@ -1145,12 +1254,8 @@ pub fn splice_deferred_struct_loads(s: *EmitterState)
             emit_str(s, IR_NL)
             s.out = saved
             let at: i64 = r.off + shift
-            let old_len: i64 = s.out.len
-            s.out.ensure_cap(old_len + line.len)
-            memmove(s.out.data + at + line.len, s.out.data + at, old_len - at)
-            memcpy(s.out.data + at, line.data, line.len)
-            s.out.len = old_len + line.len
-            shift = shift + line.len
+            out_insert(s, at, line.as_view())
+            shift = shift + line.len()
             # `line` drops at the end of this iteration (AGAST #2159): its
             # buffer is freed once, by the compiler.
         i += 1
@@ -1190,7 +1295,7 @@ pub fn entry_alloca_mark(s: *EmitterState)
         s.ea_marks = realloc(s.ea_marks as *u8, (cap as i64) * sizeof(FrameMark)) as *FrameMark
         s.ea_cap = cap
     let m: *FrameMark = s.ea_marks + (s.ea_count as i64)
-    m.off = s.entry_allocas.len
+    m.off = s.entry_allocas.data.len
     m.line = s.fm_line
     m.col = s.fm_col
     s.ea_count = s.ea_count + 1
@@ -1203,7 +1308,7 @@ pub fn entry_alloca_mark(s: *EmitterState)
 pub fn entry_alloca_begin(s: *EmitterState) -> i32
     entry_alloca_mark(s)
     s.entry_out_saved = s.out
-    s.out = @s.entry_allocas
+    s.out = s.entry_allocas
     let r: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, r)
@@ -1218,9 +1323,9 @@ pub fn entry_alloca_end(s: *EmitterState)
 pub fn entry_alloca(s: *EmitterState, ty: *u8, comment: *u8) -> i32
     entry_alloca_mark(s)
     if comment == null
-        ir_alloca(@s.entry_allocas, @s.reg_counter, ty)
+        ir_alloca(s.entry_allocas, @s.reg_counter, ty)
     else
-        ir_alloca_c(@s.entry_allocas, @s.reg_counter, ty, comment)
+        ir_alloca_c(s.entry_allocas, @s.reg_counter, ty, comment)
 
 # The same line for a register the caller already took with next_reg.  The
 # sites that allocate early (one slot for every branch of a type switch, say)
@@ -1228,16 +1333,16 @@ pub fn entry_alloca(s: *EmitterState, ty: *u8, comment: *u8) -> i32
 pub fn entry_alloca_reg(s: *EmitterState, r: i32, ty: *u8, comment: *u8)
     entry_alloca_mark(s)
     if comment == null
-        ir_alloca_at(@s.entry_allocas, r, ty)
+        ir_alloca_at(s.entry_allocas, r, ty)
     else
-        ir_alloca_at_c(@s.entry_allocas, r, ty, comment)
+        ir_alloca_at_c(s.entry_allocas, r, ty, comment)
 
 # entry_alloca_begin for a register already taken: redirect, write the
 # `  %.{r} = alloca ` prefix with no new register, then entry_alloca_reg_end.
 pub fn entry_alloca_reg_begin(s: *EmitterState, r: i32)
     entry_alloca_mark(s)
     s.entry_out_saved = s.out
-    s.out = @s.entry_allocas
+    s.out = s.entry_allocas
     emit_str(s, IR_INDENT)
     emit_reg(s, r)
     emit_str(s, IR_ALLOCA)
@@ -1247,7 +1352,7 @@ pub fn entry_alloca_reg_begin(s: *EmitterState, r: i32)
 pub fn entry_alloca_reg_begin_named(s: *EmitterState, r: i32)
     entry_alloca_mark(s)
     s.entry_out_saved = s.out
-    s.out = @s.entry_allocas
+    s.out = s.entry_allocas
     emit_str(s, IR_INDENT)
     emit_reg(s, r)
     emit_str(s, IR_ALLOCA_NAMED)
@@ -1384,7 +1489,7 @@ pub fn frame_begin_fn(s: *EmitterState, line: i32, col: i32)
 pub fn frame_mark(s: *EmitterState, line: i32, col: i32)
     s.fm_line = line
     s.fm_col = col
-    let off: i64 = s.out.len
+    let off: i64 = s.out.data.len
     if s.fm_count > 0
         let last: *FrameMark = s.fm + ((s.fm_count - 1) as i64)
         if last.off == off
@@ -3789,6 +3894,14 @@ pub fn emit_load_ptr(s: *EmitterState, slot_reg: i32) -> i32
 # Emit `store ptr %val_reg, ptr %slot_reg`.
 fn emit_store_ptr(s: *EmitterState, val_reg: i32, slot_reg: i32)
     emit_store_typed(s, IR_TY_PTR, val_reg, slot_reg)
+
+# `text` as a string-table entry the emitter composed itself: copied into the
+# heap (never freed: one module per process), since the table keeps the pointer
+# for the whole module.
+pub fn intern_string(s: *EmitterState, text: StrView) -> i32
+    let copy: *u8 = malloc(text.len)
+    memcpy(copy, text.ptr, text.len)
+    add_string(s, StrView { ptr: copy, len: text.len })
 
 pub fn add_string(s: *EmitterState, data_sv: StrView) -> i32
     var data: *u8 = data_sv.ptr

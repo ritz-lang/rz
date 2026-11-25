@@ -119,7 +119,7 @@ C_LITERAL_PINS = {
     "mausoleum": 109,
     "nexus": 207,
     "prism": 1,
-    "ritz": 4201,
+    "ritz": 3924,
     "ritz-lsp": 40,
     "ritzunit": 108,
     "rzrz": 34,

@@ -7,6 +7,7 @@ import ast
 import types           # the one primitive type table (AGAST #1889)
 import ast_helpers   # is_enum_type (AGAST #2539)
 import emitter_core
+import text_bridge      # StrView views of the older *u8 text APIs (AGAST #4696)
 import emitter_abi   # AGAST #1818: sret / byval moved out of emitter_core
 import emitter_types   # AGAST #1818: type inference moved out of emitter_core
 import emitter_ir
@@ -22,189 +23,163 @@ import emitter_match
 import float_slot            # fs_literal_only (AGAST #4285)
 import ritzlib.io
 import ritzlib.str
+import ritzlib.string
+import ritzlib.option
+import ritzlib.strview
 import ritzlib.memory      # malloc: a trap's message (AGAST #3489)
 import emitter_call_lower   # AGAST #1818: split out below the emitter cycle
 import emitter_decl   # AGAST #1818: split out below the emitter cycle
 import emitter_stmt_parts   # AGAST #1818: split out below the emitter cycle
 
 
-# The Option / Result `e` is, by its type, or as a constructor naming one; null.
-fn tagged_enum_operand(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+# The Option / Result `e` is, by its type, or as a constructor naming one.
+fn tagged_enum_operand(s: *EmitterState, e: *Expr) -> StrView
     if builtin_tagged_ctor(s, e) == 1
-        ctor_scrutinee_enum(s, e, out_name, out_len)
-        if *out_name == null   # a payload ritz1 can't name: its family will do
-            if ctor_family_is(e, StrView { ptr: (c"Option$"), len: (7) as i64 }) == 1
-                *out_name = c"Option"
-                *out_len = 6
-            else
-                *out_name = c"Result"
-                *out_len = 6
-        return
-    var name: *u8 = null
-    var len: i32 = 0
-    match_scrutinee_type(s, e, @name, @len)
-    if name != null and is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
-        *out_name = name
-        *out_len = len
+        let ctor: StrView = named_by(ctor_scrutinee_enum, s, e)
+        if not unnamed(ctor)
+            return ctor
+        # A payload ritz1 can't name: its family will do.
+        if ctor_family_is(e, "Option$") == 1
+            return "Option"
+        return "Result"
+    let typed: StrView = named_by(match_scrutinee_type, s, e)
+    if not unnamed(typed) and is_tagged_enum_type(typed) == 1
+        return typed
+    no_name()
+
+# `==` or `!=`, as the refusals quote it.
+fn eq_op_quoted(e: *Expr) -> StrView
+    if e.op == OpKind.Ne
+        return "'!='"
+    "'=='"
 
 # AGAST #2454: `o == None`, `r != Ok(5)`, `o == p` over an Option or a Result is
 # ritz0's located refusal: a variant carries a payload, so `==` would compare
 # the tags alone.  ritz1 compiled it: `None` had no enum and was the `add i64
 # 0, 0` fallback, and two Options were an `icmp` clang rejects.  A user's
 # payload enum is refuse_aggregate_eq's (#2510).  1 when refused.
-fn refuse_tagged_enum_eq(s: *EmitterState, e: *Expr) -> i32
-    var name: *u8 = null
-    var len: i32 = 0
-    tagged_enum_operand(s, e.left, @name, @len)
-    if name == null or builtin_tagged_ctor(s, e.left) == 1
+fn refuse_tagged_enum_eq(s: *EmitterState, e: *Expr) -> bool
+    var name: StrView = tagged_enum_operand(s, e.left)
+    if unnamed(name) or builtin_tagged_ctor(s, e.left) == 1
         # A typed side names the enum better than a constructor's guess.
-        var rname: *u8 = null
-        var rlen: i32 = 0
-        tagged_enum_operand(s, e.right, @rname, @rlen)
-        if rname != null and (name == null or builtin_tagged_ctor(s, e.right) == 0)
+        let rname: StrView = tagged_enum_operand(s, e.right)
+        if not unnamed(rname) and (unnamed(name) or builtin_tagged_ctor(s, e.right) == 0)
             name = rname
-            len = rlen
-    if name == null
-        return 0
-    var op: *u8 = c"'=='"
-    if e.op == OpKind.Ne
-        op = c"'!='"
-    var n: i32 = 0
-    let head: *u8 = ctor_join(StrView { ptr: (op), len: (4) as i64 }, StrView { ptr: (c" is not supported for struct type '"), len: (strlen(c" is not supported for struct type '") as i32) as i64 }, StrView { ptr: (name), len: (len) as i64 }, @n)
-    let tail: *u8 = c"' — a variant carries a payload, so `==` would compare tags only; use `match` to test the variant"
-    let msg: *u8 = ctor_join(StrView { ptr: (head), len: (n) as i64 }, StrView { ptr: (tail), len: (strlen(tail) as i32) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, @n)
-    emit_nd_error(s, e.span.line, e.span.col, msg)
-    1
+    if unnamed(name)
+        return false
+    let op: StrView = eq_op_quoted(e)
+    var msg: String = string_new()
+    format_into(@&msg, "{op} is not supported for struct type '{name}' — a variant carries a payload, so `==` would compare tags only; use `match` to test the variant")
+    emit_nd_error_sv(s, e.span.line, e.span.col, msg.as_view())
+    true
 
-# The by-value struct or user enum `e` is, as its LLVM type names it; null when
-# it is a scalar, a pointer, or not statically known.
-fn eq_aggregate_operand(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+# The by-value struct or user enum `e` is, as its LLVM type names it; unnamed
+# when it is a scalar, a pointer, or not statically known.
+fn eq_aggregate_operand(s: *EmitterState, e: *Expr) -> StrView
+    let none: StrView = no_name()
     if e == null
-        return
-    var name: *u8 = null
-    var len: i32 = 0
+        return none
+    var name: StrView = none
     if e.kind == ExprKind.Member
-        qualified_variant_enum(s, e, @name, @len)   # `Shape.Dot`
-        if name == null
+        name = named_by(qualified_variant_enum, s, e)   # `Shape.Dot`
+        if unnamed(name)
             let fld: *StructField = resolve_member_chain_field(s, e)
             if fld != null and fld.field_type == TypeKind.Struct and fld.field_type_name_len > 0
-                name = fld.field_type_name
-                len = fld.field_type_name_len
+                name = StrView { ptr: fld.field_type_name, len: fld.field_type_name_len as i64 }
     else if e.kind == ExprKind.Unary and e.op == OpKind.Deref and e.operand != null
-        deref_pointee_struct_name(s, e.operand, @name, @len)   # AGAST #2525: `*q`
+        name = named_by(deref_pointee_struct_name, s, e.operand)   # AGAST #2525: `*q`
     else
-        resolve_expr_struct_name(s, e, @name, @len)
-    if name == null or len == 0 or is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
-        return
-    let ei: i32 = enum_find(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
+        name = named_by(resolve_expr_struct_name, s, e)
+    if unnamed(name) or name.len == 0 or is_tagged_enum_type(name) == 1
+        return none
+    let ei: i32 = enum_find(s.mono.pctx, name)
     if ei >= 0
         # A fieldless enum compares its tags (#1660); one with a payload can't.
-        var vi: i32 = 0
-        var payload: i32 = 0
-        while vi < enum_variant_count(s.mono.pctx, ei)
-            if enum_variant_kind(s.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
-                payload = 1
-            vi = vi + 1
-        if payload == 0
-            return
-    else if find_struct(s, StrView { ptr: (name), len: (len) as i64 }) == null and name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 0 and name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"String"), len: (6) as i64 }) == 0
-        return
-    *out_name = name
-    *out_len = len
+        if not enum_has_payload(s, ei)
+            return none
+    else if find_struct(s, name) == null and name_eq(name, "StrView") == 0 and name_eq(name, "String") == 0
+        return none
+    name
+
+# Does any variant of enum `ei` carry a payload?
+fn enum_has_payload(s: *EmitterState, ei: i32) -> bool
+    for vi in 0..enum_variant_count(s.mono.pctx, ei)
+        if enum_variant_kind(s.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
+            return true
+    false
+
+# What to do instead of `==` on the aggregate `name`.
+fn aggregate_eq_hint(s: *EmitterState, name: StrView) -> StrView
+    if enum_find(s.mono.pctx, name) >= 0
+        return " — a variant carries a payload, so `==` would compare tags only; use `match` to test the variant"
+    if name_eq(name, "StrView") == 1
+        return " — use a.eq(b) from ritzlib.strview"
+    if name_eq(name, "String") == 1
+        return " — use a.eq_string(@b) from ritzlib.string"
+    ""
 
 # AGAST #2510: `==` / `!=` on a user enum whose variants carry a payload, or on
 # a struct, is ritz0's located refusal (_reject_aggregate_compare).  ritz1
 # compared a payload enum's tags alone (`Circle(1) == Circle(2)` was true) and
 # wrote a struct as an `icmp eq i64` clang rejects.  The left operand names the
 # type, as in ritz0; the right one when the left is no aggregate.  1 when refused.
-fn refuse_aggregate_eq(s: *EmitterState, e: *Expr) -> i32
-    var name: *u8 = null
-    var len: i32 = 0
-    eq_aggregate_operand(s, e.left, @name, @len)
-    if name == null
-        eq_aggregate_operand(s, e.right, @name, @len)
-    if name == null
-        return 0
-    var op: *u8 = c"'=='"
-    if e.op == OpKind.Ne
-        op = c"'!='"
-    var hint: *u8 = c""
-    if enum_find(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) >= 0
-        hint = c" — a variant carries a payload, so `==` would compare tags only; use `match` to test the variant"
-    else if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1
-        hint = c" — use a.eq(b) from ritzlib.strview"
-    else if name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"String"), len: (6) as i64 }) == 1
-        hint = c" — use a.eq_string(@b) from ritzlib.string"
-    var n: i32 = 0
-    let head: *u8 = ctor_join(StrView { ptr: (op), len: (4) as i64 }, StrView { ptr: (c" is not supported for struct type '"), len: (strlen(c" is not supported for struct type '") as i32) as i64 }, StrView { ptr: (name), len: (len) as i64 }, @n)
-    let msg: *u8 = ctor_join(StrView { ptr: (head), len: (n) as i64 }, StrView { ptr: (c"'"), len: (1) as i64 }, StrView { ptr: (hint), len: (strlen(hint) as i32) as i64 }, @n)
-    emit_nd_error(s, e.span.line, e.span.col, msg)
-    1
+fn refuse_aggregate_eq(s: *EmitterState, e: *Expr) -> bool
+    var name: StrView = eq_aggregate_operand(s, e.left)
+    if unnamed(name)
+        name = eq_aggregate_operand(s, e.right)
+    if unnamed(name)
+        return false
+    let op: StrView = eq_op_quoted(e)
+    let hint: StrView = aggregate_eq_hint(s, name)
+    var msg: String = string_new()
+    format_into(@&msg, "{op} is not supported for struct type '{name}'{hint}")
+    emit_nd_error_sv(s, e.span.line, e.span.col, msg.as_view())
+    true
 
 # The source spelling of a binary operator other than `and` / `or`.
-fn binary_op_spelling(op: OpKind) -> *u8
+fn binary_op_spelling(op: OpKind) -> StrView
     match op
-        OpKind.Eq =>
-            return c"=="
-        OpKind.Ne =>
-            return c"!="
-        OpKind.Lt =>
-            return c"<"
-        OpKind.Gt =>
-            return c">"
-        OpKind.Le =>
-            return c"<="
-        OpKind.Ge =>
-            return c">="
-        OpKind.BitAnd =>
-            return c"&"
-        OpKind.BitOr =>
-            return c"|"
-        OpKind.BitXor =>
-            return c"^"
-        OpKind.Shl =>
-            return c"<<"
-        OpKind.Shr =>
-            return c">>"
-        OpKind.Add =>
-            return c"+"
-        OpKind.Sub =>
-            return c"-"
-        OpKind.Mul =>
-            return c"*"
-        OpKind.Div =>
-            return c"/"
-        _ => pass
-    c"%"
+        OpKind.Eq => "=="
+        OpKind.Ne => "!="
+        OpKind.Lt => "<"
+        OpKind.Gt => ">"
+        OpKind.Le => "<="
+        OpKind.Ge => ">="
+        OpKind.BitAnd => "&"
+        OpKind.BitOr => "|"
+        OpKind.BitXor => "^"
+        OpKind.Shl => "<<"
+        OpKind.Shr => ">>"
+        OpKind.Add => "+"
+        OpKind.Sub => "-"
+        OpKind.Mul => "*"
+        OpKind.Div => "/"
+        _ => "%"
 
 # AGAST #2525: `*(q + 1) + 1`, `*q < 5` with `q: *S`: the deref loads a `%S`,
 # which ritz1 wrote where clang wanted an i64, unlocated.  ritz0's refusal
 # (_reject_struct_operand), located at the operand.  A `[N]S` element is
 # whole_struct_elem_refused's; `==` / `!=` on a struct refuse_aggregate_eq's
 # first.  1 when refused.
-fn refuse_struct_deref_operand(s: *EmitterState, e: *Expr) -> i32
+fn refuse_struct_deref_operand(s: *EmitterState, e: *Expr) -> bool
     var side: *Expr = e.left
-    var name: *u8 = null
-    var len: i32 = 0
-    if side != null and side.kind == ExprKind.Unary and side.op == OpKind.Deref
-        struct_value_name(s, side, @name, @len)
-    if name == null
+    var name: StrView = deref_struct_name(s, side)
+    if unnamed(name)
         side = e.right
-        if side != null and side.kind == ExprKind.Unary and side.op == OpKind.Deref
-            struct_value_name(s, side, @name, @len)
-    if name == null
-        return 0
-    let op: *u8 = binary_op_spelling(e.op)
-    var n: i32 = 0
-    let head: *u8 = ctor_join(StrView { ptr: (c"`"), len: (1) as i64 }, StrView { ptr: (op), len: (strlen(op) as i32) as i64 }, StrView { ptr: (c"` on struct `"), len: (13) as i64 }, @n)
-    let tail: *u8 = c"`: a struct is not an integer (read one of its fields)"
-    let msg: *u8 = ctor_join(StrView { ptr: (head), len: (n) as i64 }, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (tail), len: (strlen(tail) as i32) as i64 }, @n)
-    emit_nd_error(s, side.span.line, side.span.col, msg)
-    1
+        name = deref_struct_name(s, side)
+    if unnamed(name)
+        return false
+    let op: StrView = binary_op_spelling(e.op)
+    var msg: String = string_new()
+    format_into(@&msg, "`{op}` on struct `{name}`: a struct is not an integer (read one of its fields)")
+    emit_nd_error_sv(s, side.span.line, side.span.col, msg.as_view())
+    true
+
+# The struct a `*p` operand loads, when `side` is one; unnamed otherwise.
+fn deref_struct_name(s: *EmitterState, side: *Expr) -> StrView
+    if side != null and side.kind == ExprKind.Unary and side.op == OpKind.Deref
+        return named_by(struct_value_name, s, side)
+    no_name()
 
 # AGAST #2514: `p == "lit"` / `p != "lit"` (the literal on either side) with
 # `p` a pointer is ritz0's located refusal (_reject_pointer_strlit_compare).
@@ -213,26 +188,18 @@ fn refuse_struct_deref_operand(s: *EmitterState, e: *Expr) -> i32
 # `*u8` is not necessarily a string.  A `*u8` slot is untouched.  1 when refused.
 # AGAST #3196: a C-string literal (`p == c"lit"`) too — it type-checks as
 # `*u8 == *u8` but compares the pointer with the literal's address, not its text.
-fn is_any_string_lit(e: *Expr) -> i32
-    if e == null
-        return 0
-    if e.kind == ExprKind.StringLit or e.kind == ExprKind.CstringLit
-        return 1
-    0
+fn is_any_string_lit(e: *Expr) -> bool
+    e != null and (e.kind == ExprKind.StringLit or e.kind == ExprKind.CstringLit)
 
-fn refuse_pointer_strlit_eq(s: *EmitterState, e: *Expr) -> i32
-    var hit: bool = false
-    if is_any_string_lit(e.left) == 1 and expr_is_pointer(s, e.right) == 1
-        hit = true
-    if is_any_string_lit(e.right) == 1 and expr_is_pointer(s, e.left) == 1
-        hit = true
+fn refuse_pointer_strlit_eq(s: *EmitterState, e: *Expr) -> bool
+    let hit: bool = (is_any_string_lit(e.left) and expr_is_pointer(s, e.right) == 1) or (is_any_string_lit(e.right) and expr_is_pointer(s, e.left) == 1)
     if not hit
-        return 0
-    var msg: *u8 = c"'==' is not supported between a pointer and a string literal — a *u8 is not necessarily a string; compare it with streq(p, c\"...\") from ritzlib.str"
-    if e.op == OpKind.Ne
-        msg = c"'!=' is not supported between a pointer and a string literal — a *u8 is not necessarily a string; compare it with streq(p, c\"...\") from ritzlib.str"
-    emit_nd_error(s, e.span.line, e.span.col, msg)
-    1
+        return false
+    let op: StrView = eq_op_quoted(e)
+    var msg: String = string_new()
+    format_into(@&msg, "{op} is not supported between a pointer and a string literal — a *u8 is not necessarily a string; compare it with streq(p, c\"...\") from ritzlib.str")
+    emit_nd_error_sv(s, e.span.line, e.span.col, msg.as_view())
+    true
 
 pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # Short-circuit logical AND / OR.  Without this, ritz1 emits
@@ -261,7 +228,7 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # size is never 0, so the sentinel is unambiguous.
     # AGAST #2928 / #2597: `q - p` on two pointers is their distance in
     # elements of the left's pointee: (q - p) / sizeof(T), an i64.
-    if (e.op == OpKind.Add or e.op == OpKind.Sub) and refuse_ref_arith(s, e) == 1
+    if (e.op == OpKind.Add or e.op == OpKind.Sub) and refuse_ref_arith(s, e)
         return 0   # AGAST #3037, LARB R16
     if is_ptr_distance(s, e) == 1
         return emit_ptr_distance(s, e)
@@ -274,13 +241,13 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
             is_ptr_arith = true
             ptr_elem_size = elem
 
-    if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_pointer_strlit_eq(s, e) == 1
+    if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_pointer_strlit_eq(s, e)
         return 0   # AGAST #2514
-    if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_tagged_enum_eq(s, e) == 1
+    if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_tagged_enum_eq(s, e)
         return 0   # AGAST #2454
-    if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_aggregate_eq(s, e) == 1
+    if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_aggregate_eq(s, e)
         return 0   # AGAST #2510
-    if refuse_struct_deref_operand(s, e) == 1
+    if refuse_struct_deref_operand(s, e)
         return 0   # AGAST #2525
 
     var left_reg: i32 = emit_expr(s, e.left)
@@ -289,7 +256,7 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # AGAST #1754: `p == s` with `p: *S` (i64) and `s: @&S` (`ptr`) -- the
     # compares below are all `icmp ... i64`, so bring a `ptr` operand into
     # the i64 value model.  A no-op for every non-`ptr` operand.
-    if e.op == OpKind.Eq or e.op == OpKind.Ne or e.op == OpKind.Lt or e.op == OpKind.Gt or e.op == OpKind.Le or e.op == OpKind.Ge
+    if is_compare(e.op)
         left_reg = ptr_value_to_i64(s, e.left, left_reg)
         right_reg = ptr_value_to_i64(s, e.right, right_reg)
 
@@ -305,13 +272,7 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     var scaled_right: i32 = right_reg
     if is_ptr_arith and ptr_elem_size > 1
         scaled_right = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, scaled_right)
-        emit_str(s, c" = mul i64 ")
-        emit_reg(s, right_reg)
-        emit_str(s, IR_COMMA)
-        emit_int(s, ptr_elem_size)
-        emit_str(s, IR_NL)
+        format_into(s, "  %.{scaled_right} = mul i64 %.{right_reg}, {ptr_elem_size}\n")
 
     # For pointer arithmetic, emit as `getelementptr i8` to preserve LLVM
     # pointer provenance (prevents -O2 mis-optimization of inttoptr-derived
@@ -323,31 +284,17 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
         var left_as_ptr: i32 = left_reg
         if expr_is_ptr_valued(s, e.left) == 0
             left_as_ptr = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, left_as_ptr)
-            emit_str(s, IR_INTTOPTR)
-            emit_reg(s, left_reg)
-            emit_str(s, c" to ptr\n")
+            format_into(s, "  %.{left_as_ptr} = inttoptr i64 %.{left_reg} to ptr\n")
 
         # For SUB, negate the scaled offset
         var offset_reg: i32 = scaled_right
         if e.op == OpKind.Sub
             offset_reg = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, offset_reg)
-            emit_str(s, c" = sub i64 0, ")
-            emit_reg(s, scaled_right)
-            emit_str(s, IR_NL)
+            format_into(s, "  %.{offset_reg} = sub i64 0, %.{scaled_right}\n")
 
         # getelementptr i8, ptr %left, i64 %offset — preserves provenance
         let gep_reg: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, gep_reg)
-        emit_str(s, c" = getelementptr i8, ptr ")
-        emit_reg(s, left_as_ptr)
-        emit_str(s, IR_I64_SEP)
-        emit_reg(s, offset_reg)
-        emit_str(s, IR_NL)
+        format_into(s, "  %.{gep_reg} = getelementptr i8, ptr %.{left_as_ptr}, i64 %.{offset_reg}\n")
 
         # ptrtoint back to i64 (unified value model)
         let ptr_result: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, gep_reg)
@@ -377,7 +324,7 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # `(a ^ z) > 1`, `K[0] / 2` and `s.get() % 10` are a u64's too, and a narrow
     # operand is brought back to its type first: `~s` on a u8 is 248, not -8.
     # AGAST #3063: so is one `==` / `!=` reads: `(a + a) == 144` on a u8 of 200.
-    var uns: i32 = 0
+    var unsigned: bool = false
     if e.op == OpKind.Div or e.op == OpKind.Mod or e.op == OpKind.Lt or e.op == OpKind.Gt or e.op == OpKind.Le or e.op == OpKind.Ge or e.op == OpKind.Eq or e.op == OpKind.Ne
         var lu: i32 = 0
         var ru: i32 = 0
@@ -389,21 +336,21 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
             # on operands that didn't wrap below it: read back at that type.
             let wb: i32 = ty_bits(wider)
             let wu: i32 = ty_is_unsigned(wider)
-            left_reg = emit_narrow_operand(s, e.left, left_reg, wb, wu)
-            scaled_right = emit_narrow_operand(s, e.right, scaled_right, wb, wu)
+            left_reg = emit_narrow_operand(s, e.left, left_reg, wb, wu == 1)
+            scaled_right = emit_narrow_operand(s, e.right, scaled_right, wb, wu == 1)
             if wb == 64 and wu == 1
-                uns = 1
+                unsigned = true
         else
-            left_reg = emit_narrow_operand(s, e.left, left_reg, lb, lu)
-            scaled_right = emit_narrow_operand(s, e.right, scaled_right, rb, ru)
+            left_reg = emit_narrow_operand(s, e.left, left_reg, lb, lu == 1)
+            scaled_right = emit_narrow_operand(s, e.right, scaled_right, rb, ru == 1)
             if (lb == 64 and lu == 1) or (rb == 64 and ru == 1)
-                uns = 1
+                unsigned = true
 
     # AGAST #2356: `>>` follows the left operand alone, never the count.
-    var shr_uns: i32 = 0
+    var shr_u: i32 = 0
     if e.op == OpKind.Shr
-        let shr_bits: i32 = int_operand_shape(s, e.left, @shr_uns)
-        left_reg = emit_narrow_operand(s, e.left, left_reg, shr_bits, shr_uns)
+        let shr_bits: i32 = int_operand_shape(s, e.left, @shr_u)
+        left_reg = emit_narrow_operand(s, e.left, left_reg, shr_bits, shr_u == 1)
 
     # AGAST #1869: a failing `assert a OP b` prints the two operands, as the
     # i64s this compare reads (not a re-evaluation; see emit_assert_stmt).
@@ -420,20 +367,11 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
 
     let result: i32 = next_reg(s)
 
-    emit_str(s, IR_INDENT)
-    emit_reg(s, result)
-    emit_str(s, c" = ")
+    let opcode: StrView = int_binop_opcode(e.op, unsigned, shr_u != 0)
+    format_into(s, "  %.{result} = {opcode}%.{left_reg}, %.{scaled_right}\n")
 
-    emit_int_binop_opcode(s, e, uns, shr_uns)
-
-    emit_reg(s, left_reg)
-    emit_str(s, IR_COMMA)
-    emit_reg(s, scaled_right)
-    emit_str(s, IR_NL)
-
-    if e.op == OpKind.Eq or e.op == OpKind.Ne or e.op == OpKind.Lt or e.op == OpKind.Gt or e.op == OpKind.Le or e.op == OpKind.Ge
-        let ext_result: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result)
-        return ext_result
+    if is_compare(e.op)
+        return ir_zext_i1_i64(s.out, @s.reg_counter, result)
 
     # LARB R63 (AGAST #3486): `+%` / `-%` / `*%` wrap at their operand type.
     # The sum is an i64 like every integer, so a wider slot would otherwise see
@@ -445,92 +383,34 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
         let wbits: i32 = int_operand_shape(s, e, @wuns)
         if wbits < 64
             let wrapped_low: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, wrapped_low)
-            emit_str(s, IR_TRUNC)
-            emit_reg(s, result)
-            emit_str(s, c" to i")
-            emit_int(s, wbits as i64)
-            emit_str(s, IR_NL)
+            format_into(s, "  %.{wrapped_low} = trunc i64 %.{result} to i{wbits}\n")
             let wrapped_wide: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, wrapped_wide)
-            if wuns == 1
-                emit_str(s, c" = zext i")
-            else
-                emit_str(s, c" = sext i")
-            emit_int(s, wbits as i64)
-            emit_str(s, IR_SP)
-            emit_reg(s, wrapped_low)
-            emit_str(s, IR_TO_I64)
+            let extend: StrView = if wuns == 1 then "zext" else "sext"
+            format_into(s, "  %.{wrapped_wide} = {extend} i{wbits} %.{wrapped_low} to i64\n")
             return wrapped_wide
 
     return result
 
-# The integer op's opcode and operand type after `%r = ` (`uns`: unsigned
-# div / rem / compare; `shr_uns`: logical shift right).
-fn emit_int_binop_opcode(s: *EmitterState, e: *Expr, uns: i32, shr_uns: i32)
-    match e.op
-        OpKind.Add =>
-            emit_str(s, c"add i64 ")
-        OpKind.Sub =>
-            emit_str(s, c"sub i64 ")
-        OpKind.Mul =>
-            emit_str(s, c"mul i64 ")
-        OpKind.Div =>
-            if uns == 1
-                emit_str(s, c"udiv i64 ")
-            else
-                emit_str(s, c"sdiv i64 ")
-        OpKind.Mod =>
-            if uns == 1
-                emit_str(s, c"urem i64 ")
-            else
-                emit_str(s, c"srem i64 ")
-        OpKind.Eq =>
-            emit_str(s, c"icmp eq i64 ")
-        OpKind.Ne =>
-            emit_str(s, c"icmp ne i64 ")
-        OpKind.Lt =>
-            if uns == 1
-                emit_str(s, c"icmp ult i64 ")
-            else
-                emit_str(s, c"icmp slt i64 ")
-        OpKind.Gt =>
-            if uns == 1
-                emit_str(s, c"icmp ugt i64 ")
-            else
-                emit_str(s, c"icmp sgt i64 ")
-        OpKind.Le =>
-            if uns == 1
-                emit_str(s, c"icmp ule i64 ")
-            else
-                emit_str(s, c"icmp sle i64 ")
-        OpKind.Ge =>
-            if uns == 1
-                emit_str(s, c"icmp uge i64 ")
-            else
-                emit_str(s, c"icmp sge i64 ")
-        OpKind.And =>
-            emit_str(s, c"and i64 ")
-        OpKind.Or =>
-            emit_str(s, c"or i64 ")
-        OpKind.BitAnd =>
-            emit_str(s, c"and i64 ")
-        OpKind.BitOr =>
-            emit_str(s, c"or i64 ")
-        OpKind.BitXor =>
-            emit_str(s, c"xor i64 ")
-        OpKind.Shl =>
-            emit_str(s, c"shl i64 ")
-        OpKind.Shr =>
-            if shr_uns == 1
-                emit_str(s, c"lshr i64 ")
-            else
-                emit_str(s, c"ashr i64 ")
-        _ =>
-            emit_str(s, c"add i64 ")
-
+# The integer op's opcode and operand type after `%r = ` (`unsigned`: unsigned
+# div / rem / compare; `shr_unsigned`: logical shift right).
+fn int_binop_opcode(op: OpKind, unsigned: bool, shr_unsigned: bool) -> StrView
+    match op
+        OpKind.Sub => "sub i64 "
+        OpKind.Mul => "mul i64 "
+        OpKind.Div => if unsigned then "udiv i64 " else "sdiv i64 "
+        OpKind.Mod => if unsigned then "urem i64 " else "srem i64 "
+        OpKind.Eq => "icmp eq i64 "
+        OpKind.Ne => "icmp ne i64 "
+        OpKind.Lt => if unsigned then "icmp ult i64 " else "icmp slt i64 "
+        OpKind.Gt => if unsigned then "icmp ugt i64 " else "icmp sgt i64 "
+        OpKind.Le => if unsigned then "icmp ule i64 " else "icmp sle i64 "
+        OpKind.Ge => if unsigned then "icmp uge i64 " else "icmp sge i64 "
+        OpKind.And | OpKind.BitAnd => "and i64 "
+        OpKind.Or | OpKind.BitOr => "or i64 "
+        OpKind.BitXor => "xor i64 "
+        OpKind.Shl => "shl i64 "
+        OpKind.Shr => if shr_unsigned then "lshr i64 " else "ashr i64 "
+        _ => "add i64 "
 
 # `a and b`, short-circuit: a phi over the two exits.
 fn emit_logical_and(s: *EmitterState, e: *Expr) -> i32
@@ -540,104 +420,52 @@ fn emit_logical_and(s: *EmitterState, e: *Expr) -> i32
     # on it being a valid number.  LLVM optimizes the trivial branch
     # away.
     let sa_anchor: i32 = next_label(s)
-    emit_str(s, IR_BR)
-    emit_label(s, sa_anchor)
-    emit_str(s, IR_NL)
+    format_into(s, "  br label %L{sa_anchor}\n")
     begin_block(s, sa_anchor)
     let sa_left_val: i32 = emit_expr(s, e.left)
     let sa_left_bool: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, sa_left_bool)
-    emit_str(s, c" = icmp ne i64 ")
-    emit_reg(s, sa_left_val)
-    emit_str(s, IR_COMMA_0)
+    format_into(s, "  %.{sa_left_bool} = icmp ne i64 %.{sa_left_val}, 0\n")
     let sa_entry_label: i32 = s.current_label
     let sa_right_label: i32 = next_label(s)
     let sa_end_label: i32 = next_label(s)
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, sa_left_bool)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, sa_right_label)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, sa_end_label)
-    emit_str(s, IR_NL)
+    format_into(s, "  br i1 %.{sa_left_bool}, label %L{sa_right_label}, label %L{sa_end_label}\n")
     # Right branch — only entered when left was truthy
     begin_block(s, sa_right_label)
     let sa_right_val: i32 = emit_expr(s, e.right)
     let sa_right_bool: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, sa_right_bool)
-    emit_str(s, c" = icmp ne i64 ")
-    emit_reg(s, sa_right_val)
-    emit_str(s, IR_COMMA_0)
+    format_into(s, "  %.{sa_right_bool} = icmp ne i64 %.{sa_right_val}, 0\n")
     let sa_right_ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, sa_right_bool)
     let sa_right_exit: i32 = s.current_label
-    emit_str(s, IR_BR)
-    emit_label(s, sa_end_label)
-    emit_str(s, IR_NL)
+    format_into(s, "  br label %L{sa_end_label}\n")
     # End — phi merges short-circuit (false) and full-eval branches.
     begin_block(s, sa_end_label)
     let sa_phi: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, sa_phi)
-    emit_str(s, c" = phi i64 [ 0, %")
-    emit_label(s, sa_entry_label)
-    emit_str(s, c" ], [ ")
-    emit_reg(s, sa_right_ext)
-    emit_str(s, c", %")
-    emit_label(s, sa_right_exit)
-    emit_str(s, c" ]\n")
+    format_into(s, "  %.{sa_phi} = phi i64 [ 0, %L{sa_entry_label} ], [ %.{sa_right_ext}, %L{sa_right_exit} ]\n")
     return sa_phi
 
 # `a or b`, short-circuit: a phi over the two exits.
 fn emit_logical_or(s: *EmitterState, e: *Expr) -> i32
     let so_anchor: i32 = next_label(s)
-    emit_str(s, IR_BR)
-    emit_label(s, so_anchor)
-    emit_str(s, IR_NL)
+    format_into(s, "  br label %L{so_anchor}\n")
     begin_block(s, so_anchor)
     let so_left_val: i32 = emit_expr(s, e.left)
     let so_left_bool: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, so_left_bool)
-    emit_str(s, c" = icmp ne i64 ")
-    emit_reg(s, so_left_val)
-    emit_str(s, IR_COMMA_0)
+    format_into(s, "  %.{so_left_bool} = icmp ne i64 %.{so_left_val}, 0\n")
     let so_entry_label: i32 = s.current_label
     let so_right_label: i32 = next_label(s)
     let so_end_label: i32 = next_label(s)
     # Inverted: if left truthy, skip right (result already true).
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, so_left_bool)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, so_end_label)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, so_right_label)
-    emit_str(s, IR_NL)
+    format_into(s, "  br i1 %.{so_left_bool}, label %L{so_end_label}, label %L{so_right_label}\n")
     begin_block(s, so_right_label)
     let so_right_val: i32 = emit_expr(s, e.right)
     let so_right_bool: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, so_right_bool)
-    emit_str(s, c" = icmp ne i64 ")
-    emit_reg(s, so_right_val)
-    emit_str(s, IR_COMMA_0)
+    format_into(s, "  %.{so_right_bool} = icmp ne i64 %.{so_right_val}, 0\n")
     let so_right_ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, so_right_bool)
     let so_right_exit: i32 = s.current_label
-    emit_str(s, IR_BR)
-    emit_label(s, so_end_label)
-    emit_str(s, IR_NL)
+    format_into(s, "  br label %L{so_end_label}\n")
     begin_block(s, so_end_label)
     let so_phi: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, so_phi)
-    emit_str(s, c" = phi i64 [ 1, %")
-    emit_label(s, so_entry_label)
-    emit_str(s, c" ], [ ")
-    emit_reg(s, so_right_ext)
-    emit_str(s, c", %")
-    emit_label(s, so_right_exit)
-    emit_str(s, c" ]\n")
+    format_into(s, "  %.{so_phi} = phi i64 [ 1, %L{so_entry_label} ], [ %.{so_right_ext}, %L{so_right_exit} ]\n")
     return so_phi
 
 # A float binary op at width `fty_t`: each operand coerced to it, then the
@@ -660,63 +488,43 @@ fn emit_float_binop(s: *EmitterState, e: *Expr, fty_t: TypeKind, left_in: i32, r
         scaled_right = emit_float_coerce(s, scaled_right, rft, fty_t)
     else if fs_literal_only(e.right) == 1
         scaled_right = emit_float_coerce(s, scaled_right, TypeKind.I64, fty_t)
-    let fty: *u8 = float_llvm_name(fty_t)
+    let fty: StrView = llvm_text(float_llvm_name(fty_t))
     let result_f: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, result_f)
-    emit_str(s, c" = ")
     if e.op == OpKind.Mod
         # AGAST #3817: not `frem`, which lowers to a libm fmod call; Ritz
         # links no libc.  The module defines the helper (emit_fmod_helpers).
-        emit_str(s, c"call ")
-        emit_str(s, fty)
+        var callee: StrView = "@__ritz_fmod(double "
         if fty_t == TypeKind.F32
-            emit_str(s, c" @__ritz_fmodf(float ")
+            callee = "@__ritz_fmodf(float "
             s.fmod_helpers_used = s.fmod_helpers_used | 2
         else
-            emit_str(s, c" @__ritz_fmod(double ")
             s.fmod_helpers_used = s.fmod_helpers_used | 1
-        emit_reg(s, left_reg)
-        emit_str(s, IR_COMMA)
-        emit_str(s, fty)
-        emit_str(s, IR_SP)
-        emit_reg(s, scaled_right)
-        emit_str(s, IR_CLOSE)
+        format_into(s, "  %.{result_f} = call {fty} {callee}%.{left_reg}, {fty} %.{scaled_right})\n")
         return result_f
-    match e.op
-        OpKind.Add =>
-            emit_str(s, c"fadd ")
-        OpKind.Sub =>
-            emit_str(s, c"fsub ")
-        OpKind.Mul =>
-            emit_str(s, c"fmul ")
-        OpKind.Div =>
-            emit_str(s, c"fdiv ")
-        OpKind.Eq =>
-            emit_str(s, c"fcmp oeq ")
-        OpKind.Ne =>
-            emit_str(s, c"fcmp une ")
-        OpKind.Lt =>
-            emit_str(s, c"fcmp olt ")
-        OpKind.Gt =>
-            emit_str(s, c"fcmp ogt ")
-        OpKind.Le =>
-            emit_str(s, c"fcmp ole ")
-        OpKind.Ge =>
-            emit_str(s, c"fcmp oge ")
-        _ =>
-            emit_str(s, c"fadd ")
-    emit_str(s, fty)
-    emit_str(s, IR_SP)
-    emit_reg(s, left_reg)
-    emit_str(s, IR_COMMA)
-    emit_reg(s, scaled_right)
-    emit_str(s, IR_NL)
+    let opcode: StrView = float_binop_opcode(e.op)
+    format_into(s, "  %.{result_f} = {opcode}{fty} %.{left_reg}, %.{scaled_right}\n")
     # Comparison ops produce i1 — zext to i64 for unified value model.
-    if e.op == OpKind.Eq or e.op == OpKind.Ne or e.op == OpKind.Lt or e.op == OpKind.Gt or e.op == OpKind.Le or e.op == OpKind.Ge
-        let ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result_f)
-        return ext
-    return result_f
+    if is_compare(e.op)
+        return ir_zext_i1_i64(s.out, @s.reg_counter, result_f)
+    result_f
+
+# The float op or ordered compare, as the opcode and its trailing space.
+fn float_binop_opcode(op: OpKind) -> StrView
+    match op
+        OpKind.Sub => "fsub "
+        OpKind.Mul => "fmul "
+        OpKind.Div => "fdiv "
+        OpKind.Eq => "fcmp oeq "
+        OpKind.Ne => "fcmp une "
+        OpKind.Lt => "fcmp olt "
+        OpKind.Gt => "fcmp ogt "
+        OpKind.Le => "fcmp ole "
+        OpKind.Ge => "fcmp oge "
+        _ => "fadd "
+
+# `==`, `!=`, `<`, `>`, `<=`, `>=`: the ops whose result is an i1.
+fn is_compare(op: OpKind) -> bool
+    op == OpKind.Eq or op == OpKind.Ne or op == OpKind.Lt or op == OpKind.Gt or op == OpKind.Le or op == OpKind.Ge
 
 
 # AGAST #3225: the slot `/` or `%` node `e` lands in directly, when it's wider
@@ -742,7 +550,7 @@ fn wider_slot_type(s: *EmitterState, e: *Expr) -> TypeKind
 # have.  Bring such a value back to its type.  `/`, `%` and every compare
 # read the whole register too (#2361, #3063).  Only an operator can leave the
 # range: a name, load, call or cast is already extended from its width.
-fn emit_narrow_operand(s: *EmitterState, e: *Expr, reg: i32, bits: i32, uns: i32) -> i32
+fn emit_narrow_operand(s: *EmitterState, e: *Expr, reg: i32, bits: i32, unsigned: bool) -> i32
     if bits >= 64
         return reg
     if e.kind != ExprKind.Binary and e.kind != ExprKind.Unary
@@ -750,60 +558,32 @@ fn emit_narrow_operand(s: *EmitterState, e: *Expr, reg: i32, bits: i32, uns: i32
     if e.kind == ExprKind.Unary and e.op != OpKind.Neg and e.op != OpKind.BitNot
         return reg
     let low: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, low)
-    emit_str(s, IR_TRUNC)
-    emit_reg(s, reg)
-    emit_str(s, c" to i")
-    emit_int(s, bits as i64)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{low} = trunc i64 %.{reg} to i{bits}\n")
     let wide: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, wide)
-    if uns == 1
-        emit_str(s, c" = zext i")
-    else
-        emit_str(s, c" = sext i")
-    emit_int(s, bits as i64)
-    emit_str(s, IR_SP)
-    emit_reg(s, low)
-    emit_str(s, IR_TO_I64)
+    let extend: StrView = if unsigned then "zext" else "sext"
+    format_into(s, "  %.{wide} = {extend} i{bits} %.{low} to i64\n")
     wide
 
 # AGAST #1660 — `reg` (the value of `operand`) as an i64.  A unit-enum
 # operand's `%Kind` aggregate becomes its zero-extended i8 tag; any other
 # operand is already i64 and is returned unchanged.
 fn unit_enum_tag_to_i64(s: *EmitterState, operand: *Expr, reg: i32) -> i32
-    var en_name: *u8 = null
-    var en_len: i32 = 0
     # AGAST #2539: `*q` / `**r` loads the %E deref_pointee_struct_name names;
     # unit_enum_expr_name knows every memory read (AGAST #4450).
-    unit_enum_expr_name(s, operand, @en_name, @en_len)
-    if en_len == 0
+    let en: StrView = named_by(unit_enum_expr_name, s, operand)
+    if en.len == 0
         return reg
     let tag: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, tag)
-    emit_str(s, c" = extractvalue %")
-    emit_name(s, StrView { ptr: (en_name), len: (en_len) as i64 })
-    emit_str(s, IR_SP)
-    emit_reg(s, reg)
-    emit_str(s, IR_COMMA_0)
+    let en_ir: String = ir_name(en)
+    format_into(s, "  %.{tag} = extractvalue %{en_ir.as_view()} %.{reg}, 0\n")
     # AGAST #4574: a repr enum's tag is its repr type; equality only needs
     # both sides widened alike.
-    let en_sv: StrView = StrView { ptr: (en_name), len: (en_len) as i64 }
-    let tag_ty: *u8 = enum_tag_ty_named(s.mono.pctx, en_sv)
-    let uei: i32 = user_enum_index(s.mono.pctx, en_sv)
+    let tag_ty: StrView = llvm_text(enum_tag_ty_named(s.mono.pctx, en))
+    let uei: i32 = user_enum_index(s.mono.pctx, en)
     if uei >= 0 and enum_tag_size(s.mono.pctx, uei) == 8
         return tag
     let wide: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, wide)
-    emit_str(s, c" = zext ")
-    emit_str(s, tag_ty)
-    emit_str(s, IR_SP)
-    emit_reg(s, tag)
-    emit_str(s, IR_TO_I64)
+    format_into(s, "  %.{wide} = zext {tag_ty} %.{tag} to i64\n")
     wide
 
 # AGAST #1505 — static pointee struct of a deref operand.
@@ -833,15 +613,12 @@ fn ptr_operand_stride(s: *EmitterState, x: *Expr) -> i64
     # sizeof(S) — the same resolution the OpKind.Deref arm loads through, so
     # `*(q + i)` steps and loads the same type.  ptr_arith_elem_size
     # alone does not scale a nested `a.b.items` field at all.
-    var ps_name: *u8 = null
-    var ps_len: i32 = 0
-    deref_pointee_struct_name(s, x, @ps_name, @ps_len)
+    let pointee: StrView = named_by(deref_pointee_struct_name, s, x)
     # Only a StructDef or a user enum (user_enum_size, AGAST #4574: an
     # `enum E: i32` steps 4 bytes) has a size here; get_struct_size_by_name
     # says 8 for a tagged enum, so those keep ptr_arith_elem_size's answer.
-    let ps_sv: StrView = StrView { ptr: (ps_name), len: (ps_len) as i64 }
-    if ps_len > 0 and (find_struct(s, ps_sv) != null or user_enum_index(s.mono.pctx, ps_sv) >= 0)
-        return get_struct_size_by_name(s, ps_sv)
+    if pointee.len > 0 and (find_struct(s, pointee) != null or user_enum_index(s.mono.pctx, pointee) >= 0)
+        return get_struct_size_by_name(s, pointee)
     ptr_arith_elem_size(s, x)
 
 # AGAST #3037, LARB R16: `p + i`, `i + p`, `p - i`, `p += i`, `p -= i` and
@@ -849,55 +626,48 @@ fn ptr_operand_stride(s: *EmitterState, x: *Expr) -> i64
 # value, so `p + 1` names one that was never lent; `(p as *T) + 1` is the way
 # out.  The row walk on `@[N]T` / `@&[N]T` stays legal (§7.8, #2554, R18).
 # `+=` / `-=` reach here desugared.  The words are ritz0's array_rules.ref_arith.
-fn refuse_ref_arith(s: *EmitterState, e: *Expr) -> i32
-    var t: *u8 = null
-    var tl: i32 = 0
-    if ref_arith_pointee(s, e.left, @t, @tl) == 0 and ref_arith_pointee(s, e.right, @t, @tl) == 0
-        return 0
-    var op: *u8 = c"+"
-    if e.op == OpKind.Sub
-        op = c"-"
-    var n: i32 = 0
-    let lead: *u8 = c"a reference is one value, not a buffer: `"
-    let a: *u8 = ctor_join(StrView { ptr: (lead), len: (strlen(lead) as i32) as i64 }, StrView { ptr: (op), len: (1) as i64 }, StrView { ptr: (c"` needs a `*T`; write `(p as *"), len: (30) as i64 }, @n)
-    let b: *u8 = ctor_join(StrView { ptr: (a), len: (n) as i64 }, StrView { ptr: (t), len: (tl) as i64 }, StrView { ptr: (c") "), len: (2) as i64 }, @n)
-    let msg: *u8 = ctor_join(StrView { ptr: (b), len: (n) as i64 }, StrView { ptr: (op), len: (1) as i64 }, StrView { ptr: (c" 1`"), len: (3) as i64 }, @n)
-    emit_nd_error(s, e.span.line, e.span.col, msg)
-    1
+fn refuse_ref_arith(s: *EmitterState, e: *Expr) -> bool
+    var pointee: String = ref_arith_pointee(s, e.left)
+    if pointee.is_empty()
+        pointee = ref_arith_pointee(s, e.right)
+    if pointee.is_empty()
+        return false
+    let op: StrView = if e.op == OpKind.Sub then "-" else "+"
+    var msg: String = string_new()
+    format_into(@&msg, "a reference is one value, not a buffer: `{op}` needs a `*T`; write `(p as *{pointee.as_view()}) {op} 1`")
+    emit_nd_error_sv(s, e.span.line, e.span.col, msg.as_view())
+    true
 
-# 1 when `x` names an `@T` / `@&T` local or param whose T isn't an array, with
-# T as Ritz spells it ("i32", "S", "*u8"; "T" when unknown) in out_name/out_len.
-fn ref_arith_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+# The T of an `@T` / `@&T` local or param `x` whose T isn't an array, as Ritz
+# spells it ("i32", "S", "*u8"; "T" when unknown); empty when `x` isn't one.
+fn ref_arith_pointee(s: *EmitterState, x: *Expr) -> String
+    var name: String = string_new()
     if x == null or x.kind != ExprKind.Ident
-        return 0
+        return name
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
     if loc == null or (lv_var_type(loc) != TypeKind.Ref and lv_var_type(loc) != TypeKind.MutRef)
-        return 0
-    if lv_pointee_type(loc) == TypeKind.Array
-        return 0
-    var name: *u8 = primitive_name_from_type(lv_pointee_type(loc))
-    var len: i32 = 0
-    if name != null
-        len = strlen(name) as i32
-    else if lv_pointee_type(loc) == TypeKind.Ptr and primitive_name_from_type(ptr_slot_flat(lv_inner_pointee_type(loc))) != null
-        let inner: *u8 = primitive_name_from_type(ptr_slot_flat(lv_inner_pointee_type(loc)))
-        name = ctor_join(StrView { ptr: (c"*"), len: (1) as i64 }, StrView { ptr: (inner), len: (strlen(inner) as i32) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, @len)
+        return name
+    let pointee: TypeKind = lv_pointee_type(loc)
+    if pointee == TypeKind.Array
+        return name
+    let prim: StrView = primitive_spelling(pointee)
+    let inner: StrView = primitive_spelling(ptr_slot_flat(lv_inner_pointee_type(loc)))
+    if not unnamed(prim)
+        name.push_str(prim)
+    else if pointee == TypeKind.Ptr and not unnamed(inner)
+        format_into(@&name, "*{inner}")
     else if lv_type_name_len(loc) > 0
-        name = lv_type_name(loc)
-        len = lv_type_name_len(loc)
+        name.push_str(StrView { ptr: lv_type_name(loc), len: lv_type_name_len(loc) as i64 })
     else
-        name = c"T"
-        len = 1
-    *out_name = name
-    *out_len = len
-    1
+        name.push_str("T")
+    name
 
 # AGAST #2928: `q - p` on two pointers, as an i64 count of elements.  Both
 # sides come into the i64 value model (an `@&T` operand is a `ptr`, #1754),
 # and the byte distance divides by the left's stride (plain sdiv, as ritz0:
 # `exact` would make an unaligned pair poison).
 fn emit_ptr_distance(s: *EmitterState, e: *Expr) -> i32
-    if refuse_mixed_ptr_distance(s, e) == 1
+    if refuse_mixed_ptr_distance(s, e)
         return 0   # AGAST #2957
     var stride: i64 = ptr_operand_stride(s, e.left)
     if stride <= 0
@@ -905,23 +675,11 @@ fn emit_ptr_distance(s: *EmitterState, e: *Expr) -> i32
     let l: i32 = ptr_value_to_i64(s, e.left, emit_expr(s, e.left))
     let r: i32 = ptr_value_to_i64(s, e.right, emit_expr(s, e.right))
     let bytes: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, bytes)
-    emit_str(s, c" = sub i64 ")
-    emit_reg(s, l)
-    emit_str(s, IR_COMMA)
-    emit_reg(s, r)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{bytes} = sub i64 %.{l}, %.{r}\n")
     if stride == 1
         return bytes
     let count: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, count)
-    emit_str(s, c" = sdiv i64 ")
-    emit_reg(s, bytes)
-    emit_str(s, IR_COMMA)
-    emit_int(s, stride)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{count} = sdiv i64 %.{bytes}, {stride}\n")
     count
 
 # AGAST #2957: LANGUAGE_SPEC §7.1 — only two pointers to the same T have a
@@ -930,99 +688,81 @@ fn emit_ptr_distance(s: *EmitterState, e: *Expr) -> i32
 # which name the pointer types as LLVM spells them (`*u8` is `i8*`, so `*u8`
 # and `*i8` are the same type, as in ritz0).  An operand whose pointee isn't
 # statically known keeps the old behaviour: never refuse on a guess.
-fn refuse_mixed_ptr_distance(s: *EmitterState, e: *Expr) -> i32
-    var ln: *u8 = null
-    var ll: i32 = 0
-    var rn: *u8 = null
-    var rl: i32 = 0
-    if ptr_distance_pointee(s, e.left, @ln, @ll) == 0 or ptr_distance_pointee(s, e.right, @rn, @rl) == 0
-        return 0
-    if name_eq(StrView { ptr: (ln), len: (ll) as i64 }, StrView { ptr: (rn), len: (rl) as i64 }) == 1
-        return 0
-    var n: i32 = 0
-    let lead: *u8 = c"pointer difference needs two pointers to the same type, got `"
-    let head: *u8 = ctor_join(StrView { ptr: (lead), len: (strlen(lead) as i32) as i64 }, StrView { ptr: (ln), len: (ll) as i64 }, StrView { ptr: (c"*` and `"), len: (8) as i64 }, @n)
-    let msg: *u8 = ctor_join(StrView { ptr: (head), len: (n) as i64 }, StrView { ptr: (rn), len: (rl) as i64 }, StrView { ptr: (c"*`"), len: (2) as i64 }, @n)
-    emit_nd_error(s, e.span.line, e.span.col, msg)
-    1
+fn refuse_mixed_ptr_distance(s: *EmitterState, e: *Expr) -> bool
+    let left: String = ptr_distance_pointee(s, e.left)
+    if left.is_empty()
+        return false
+    let right: String = ptr_distance_pointee(s, e.right)
+    if right.is_empty() or left.as_view().eq(right.as_view())
+        return false
+    var msg: String = string_new()
+    format_into(@&msg, "pointer difference needs two pointers to the same type, got `{left.as_view()}*` and `{right.as_view()}*`")
+    emit_nd_error_sv(s, e.span.line, e.span.col, msg.as_view())
+    true
 
 # The pointee of the pointer operand `x` of `q - p`, as LLVM names it ("i32",
-# "%struct.E"), into out_name/out_len; returns 1, or 0 when it isn't
-# statically known.  `p + k` / `p - k` keep p's type, so a chain is read down
-# its left spine.
-fn ptr_distance_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+# "%struct.E"); empty when it isn't statically known.  `p + k` / `p - k` keep
+# p's type, so a chain is read down its left spine.
+fn ptr_distance_pointee(s: *EmitterState, x: *Expr) -> String
+    var pointee: String = string_new()
     var base: *Expr = x
     while base != null and base.kind == ExprKind.Binary and (base.op == OpKind.Add or base.op == OpKind.Sub) and is_ptr_distance(s, base) == 0
         base = base.left
     if base == null
-        return 0
+        return pointee
     var kind: TypeKind = TypeKind.Void
-    var name: *u8 = null
-    var name_len: i32 = 0
+    var name: StrView = no_name()
     if base.kind == ExprKind.Ident
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
         if loc != null
             if lv_var_type(loc) != TypeKind.Ptr and lv_var_type(loc) != TypeKind.Ref and lv_var_type(loc) != TypeKind.MutRef
-                return 0
+                return pointee
             kind = lv_pointee_type(loc)
-            name = lv_type_name(loc)
-            name_len = lv_type_name_len(loc)
+            name = StrView { ptr: lv_type_name(loc), len: lv_type_name_len(loc) as i64 }
         else
             let glob: *GlobalVarDef = find_global(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
             if glob == null or glob.var_type != TypeKind.Ptr
-                return 0
+                return pointee
             kind = glob.pointee_type
-            name = glob.pointee_type_name
-            name_len = glob.pointee_type_name_len
+            name = StrView { ptr: glob.pointee_type_name, len: glob.pointee_type_name_len as i64 }
     else
-        kind = ptr_root_pointee(s, base, @name, @name_len)
-    let prim: *u8 = scalar_llvm_name(kind)
-    if prim != null
-        *out_name = prim
-        *out_len = strlen(prim) as i32
-        return 1
-    if kind != TypeKind.Struct or name_len == 0 or find_struct(s, StrView { ptr: (name), len: (name_len) as i64 }) == null
-        return 0
-    var n: i32 = 0
-    *out_name = ctor_join(StrView { ptr: (c"%struct."), len: (8) as i64 }, StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, @n)
-    *out_len = n
-    1
+        var root: *u8 = null
+        var root_len: i32 = 0
+        kind = ptr_root_pointee(s, base, @root, @root_len)
+        name = StrView { ptr: root, len: root_len as i64 }
+    let scalar: StrView = scalar_llvm_name(kind)
+    if not unnamed(scalar)
+        pointee.push_str(scalar)
+    else if kind == TypeKind.Struct and name.len > 0 and find_struct(s, name) != null
+        format_into(@&pointee, "%struct.{name}")
+    pointee
 
-# A scalar kind's LLVM type, as emit_llvm_type spells it; null for any other.
-fn scalar_llvm_name(t: TypeKind) -> *u8
-    if ty_int_bits(t) == 8
-        return c"i8"
-    if ty_int_bits(t) == 16
-        return c"i16"
-    if ty_int_bits(t) == 32
-        return c"i32"
-    if ty_int_bits(t) == 64
-        return c"i64"
-    match t
-        TypeKind.F32 =>
-            return c"float"
-        TypeKind.F64 =>
-            return c"double"
-        TypeKind.Bool =>
-            return c"i1"
+# A scalar kind's LLVM type, as emit_llvm_type spells it; unnamed for any other.
+fn scalar_llvm_name(t: TypeKind) -> StrView
+    match ty_int_bits(t)
+        8 => return "i8"
+        16 => return "i16"
+        32 => return "i32"
+        64 => return "i64"
         _ => pass
-    null
+    match t
+        TypeKind.F32 => "float"
+        TypeKind.F64 => "double"
+        TypeKind.Bool => "i1"
+        _ => no_name()
 
 # AGAST #2544: 1 when `op` is an if-expression some arm of which points at an
 # aggregate, so a deref of it the arms don't agree on is #1505's located error,
 # not a `load i64` clang rejects.
-fn if_arm_names_pointee(s: *EmitterState, op: *Expr) -> i32
+fn if_arm_names_pointee(s: *EmitterState, op: *Expr) -> bool
     if op == null or op.kind != ExprKind.If
-        return 0
+        return false
     var arm: *MatchArm = op.args as *MatchArm
     while arm != null
-        var an: *u8 = null
-        var al: i32 = 0
-        deref_pointee_struct_name(s, arm.body, @an, @al)
-        if al > 0
-            return 1
+        if named_by(deref_pointee_struct_name, s, arm.body).len > 0
+            return true
         arm = arm.next
-    0
+    false
 
 # AGAST #1488: the address of an lvalue, as a `ptr` register, or -1 when
 # `op` is not an lvalue this emitter can address.  Shared by `@` (OpKind.Addr,
@@ -1034,22 +774,24 @@ fn if_arm_names_pointee(s: *EmitterState, op: *Expr) -> i32
 # The GEP element type of `p[i]` for `p: *T`, given T's kind (pointee_type)
 # and, for a struct, its name.  AGAST #1908: a struct pointee used to fall
 # to the i8 default, so `@tests[1]` over `*RitzTest` pointed one BYTE in.
-fn emit_ptr_elem_gep_type(s: *EmitterState, pointee_type: TypeKind, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
+fn emit_ptr_elem_gep_type(s: *EmitterState, pointee_type: TypeKind, name: StrView)
+    if pointee_type == TypeKind.Struct and name.len > 0
+        emit_llvm_type_struct(s, TypeKind.Struct, name)
+        return
+    format_into(s, "{ptr_elem_gep_scalar(pointee_type)}")
+
+# The GEP element type of a scalar `*T`: i8 by default (covers *u8 / *i8, the
+# most common).
+fn ptr_elem_gep_scalar(pointee_type: TypeKind) -> StrView
     if ty_int_bits(pointee_type) == 32
-        emit_str(s, c"i32")
-    else if ty_int_bits(pointee_type) == 64
-        emit_str(s, c"i64")
-    else if ty_int_bits(pointee_type) == 16
-        emit_str(s, c"i16")
-    else if pointee_type == TypeKind.Ptr or pointee_type == TypeKind.PtrPtr
-        emit_str(s, c"ptr")
-    else if pointee_type == TypeKind.Struct and name_len > 0
-        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (name), len: (name_len) as i64 })
-    else
-        # Default to i8 (covers *u8 / *i8 — most common).
-        emit_str(s, c"i8")
+        return "i32"
+    if ty_int_bits(pointee_type) == 64
+        return "i64"
+    if ty_int_bits(pointee_type) == 16
+        return "i16"
+    if pointee_type == TypeKind.Ptr or pointee_type == TypeKind.PtrPtr
+        return "ptr"
+    "i8"
 
 # =============================================================================
 # Multi-dimensional arrays (AGAST #1509)
@@ -1086,7 +828,7 @@ fn nd_plane_overindex(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
     let sh: *ArrayShape = plane_ptr_shape(s, base)
     if sh == null
         return 0
-    emit_nd_error(s, e.span.line, e.span.col, c"this indexes more dimensions than the plane of the multi-dimensional array it points at has")
+    emit_nd_error_sv(s, e.span.line, e.span.col, "this indexes more dimensions than the plane of the multi-dimensional array it points at has")
     out.reg = 0
     out.depth = sh.rank
     out.shape = sh
@@ -1112,7 +854,7 @@ pub fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
         # Reported, then emitted anyway (over %.0) so callers do not fall
         # through to a 1-D path and report again; the error fails the build.
         if mp.success != 1
-            emit_nd_error(s, e.span.line, e.span.col, c"cannot address the multi-dimensional array field this index chain starts from in ritz1")
+            emit_nd_error_sv(s, e.span.line, e.span.col, "cannot address the multi-dimensional array field this index chain starts from in ritz1")
         base_reg = mp.reg
     # AGAST #2570: a plane pointer `q` is GEP'd from its value, not its slot.
     # Loaded before the indices, as a field base is addressed before them.
@@ -1134,27 +876,24 @@ pub fn emit_nd_index_ptr(s: *EmitterState, e: *Expr, out: *NdIndexPtr) -> i32
         regs[j] = emit_expr(s, node.right)
         j = j + 1
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, c" = getelementptr ")
+    format_into(s, "  %.{r} = getelementptr ")
     emit_array_shape_llvm(s, sh, 0)
-    emit_str(s, IR_PTR_SEP)
+    format_into(s, ", ptr ")
     if plane == 1 or base.kind == ExprKind.Member
-        emit_reg(s, base_reg)
+        format_into(s, "%.{base_reg}")
     else
         let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
         if lv != null
-            emit_reg(s, lv.reg)
+            format_into(s, "%.{lv.reg}")
         else
-            emit_str(s, c"@")
-            emit_name(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-    emit_str(s, c", i64 0")
+            let name_ir1: String = ir_name(StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+            format_into(s, "@{name_ir1.as_view()}")
+    format_into(s, ", i64 0")
     j = 0
     while j < depth
-        emit_str(s, IR_I64_SEP)
-        emit_reg(s, regs[j])
+        format_into(s, ", i64 %.{regs[j]}")
         j = j + 1
-    emit_str(s, IR_NL)
+    format_into(s, "\n")
     out.reg = r
     out.depth = depth
     out.shape = sh
@@ -1181,7 +920,7 @@ pub fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
     if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0
         leaf_st = find_struct(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
     if ndp.depth < sh.rank or (sh.leaf_type == TypeKind.Struct and leaf_st == null)
-        emit_nd_error(s, e.span.line, e.span.col, c"a row or a struct element of a multi-dimensional array is not a value in ritz1 (index every dimension, use .field, or take its address with @)")
+        emit_nd_error_sv(s, e.span.line, e.span.col, "a row or a struct element of a multi-dimensional array is not a value in ritz1 (index every dimension, use .field, or take its address with @)")
         *out_reg = 0
         return 1
     if sh.leaf_type == TypeKind.Struct
@@ -1192,16 +931,10 @@ pub fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
         emit_struct_load_or_defer(s, TypeKind.Struct, sv, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, ndp.reg, null, 0)
         *out_reg = sv
         return 1
-    let ty: *u8 = elem_mem_llvm(sh.leaf_type)
+    let ty: StrView = llvm_text(elem_mem_llvm(sh.leaf_type))
     let v: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, v)
-    emit_str(s, IR_LOAD)
-    emit_str(s, ty)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, ndp.reg)
-    emit_str(s, IR_NL)
-    *out_reg = emit_array_elem_widen(s, v, sh.leaf_type, ty)
+    format_into(s, "  %.{v} = load {ty}, ptr %.{ndp.reg}\n")
+    *out_reg = emit_array_elem_widen(s, v, sh.leaf_type, elem_mem_llvm(sh.leaf_type))
     return 1
 
 # AGAST #3145: `@x[lo..hi]` refused at the index, in ritz0's words (#3088).  A
@@ -1209,38 +942,38 @@ pub fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
 # else isn't sliced, and emit_expr_index says so as it does for `x[lo..hi]`.
 # Both were unlocated: "unknown expression kind" or "cannot take address".
 fn addr_of_slice_refused(s: *EmitterState, op: *Expr)
-    if slice_base_is_sliceable(s, op.left) == 1
-        emit_nd_error(s, op.span.line, op.span.col, c"can't take the address of a slice")
+    if slice_base_is_sliceable(s, op.left)
+        emit_nd_error_sv(s, op.span.line, op.span.col, "can't take the address of a slice")
         return
     emit_expr_index(s, op)
 
-# 1 when `base` (`v`, `*p`, `b.f`) is a String, Vec or Span, or a pointer to
+# True when `base` (`v`, `*p`, `b.f`) is a String, Vec or Span, or a pointer to
 # one, as ritz0's _slice_ritz_type reads it.
-fn slice_base_is_sliceable(s: *EmitterState, base: *Expr) -> i32
+fn slice_base_is_sliceable(s: *EmitterState, base: *Expr) -> bool
     var b: *Expr = base
     if b != null and b.kind == ExprKind.Unary and b.op == OpKind.Deref
         b = b.operand
     if b == null
-        return 0
+        return false
     match b.kind
         ExprKind.Ident =>
             let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (b.ident_ptr), len: (b.ident_len) as i64 })
             if loc == null
-                return 0
+                return false
             let vt: TypeKind = lv_var_type(loc)
             if vt != TypeKind.Struct and vt != TypeKind.Ptr and vt != TypeKind.Ref and vt != TypeKind.MutRef
-                return 0
-            return is_sliceable_name(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+                return false
+            return 1 == is_sliceable_name(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
         ExprKind.Member =>
             let fld: *StructField = resolve_member_chain_field(s, b)
             if fld == null
-                return 0
+                return false
             let ft: TypeKind = fld.field_type
             if ft != TypeKind.Struct and ft != TypeKind.Ptr and ft != TypeKind.Ref and ft != TypeKind.MutRef
-                return 0
-            return is_sliceable_name(StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 })
+                return false
+            return 1 == is_sliceable_name(StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 })
         _ => pass
-    return 0
+    return false
 
 # AGAST #2518 / #3050: `@mk()` / `@&mk()` straight into a call's argument (the
 # only place ref_check lets one be): the struct or array the call returns, spilled to a
@@ -1258,10 +991,8 @@ fn emit_call_temp_ptr(s: *EmitterState, op: *Expr) -> i32
     let ra: *Param = call_ret_array(s, op)
     if ra != null
         return emit_call_array_temp(s, op, ra)
-    var name: *u8 = null
-    var len: i32 = 0
-    call_result_struct_name(s, op, @name, @len)
-    if len <= 0
+    let result_struct: StrView = named_by(call_result_struct_name, s, op)
+    if result_struct.len <= 0
         return 0
     let v: i32 = emit_expr(s, op)
     let held: i32 = own_temp_slot_of(s, v)
@@ -1269,10 +1000,10 @@ fn emit_call_temp_ptr(s: *EmitterState, op: *Expr) -> i32
         return held
     let slot: i32 = next_reg(s)
     entry_alloca_reg_begin(s, slot)
-    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c"  ; #3050 lent temporary\n")
+    emit_llvm_type_struct(s, TypeKind.Struct, result_struct)
+    format_into(s, "  ; #3050 lent temporary\n")
     entry_alloca_reg_end(s)
-    emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (name), len: (len) as i64 }, v, slot)
+    emit_struct_store_or_copy(s, TypeKind.Struct, result_struct, v, slot)
     slot
 
 # AGAST #3978: 1 if `c` is `const D: [N]StrView = ["s"; N]`, the one struct
@@ -1281,7 +1012,7 @@ fn emit_call_temp_ptr(s: *EmitterState, op: *Expr) -> i32
 pub fn const_strview_fill(c: *ConstEntry) -> i32
     if const_struct_fill_global(c) == 0 or c.value_expr.left == null or c.value_expr.left.kind != ExprKind.StringLit
         return 0
-    name_eq(StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 })
+    name_eq(StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 }, "StrView")
 
 # AGAST #3946: 1 if `c` is a struct table written as a fill, which §3.3
 # refuses (emitter.ritz const_struct_fill_error), a `[N]StrView` fill of a
@@ -1303,11 +1034,8 @@ pub fn emit_const_array_ptr(s: *EmitterState, op: *Expr) -> i32
         if const_array_global(ce) == 0
             return -1
         let whole: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, whole)
-        emit_str(s, c" = getelementptr i8, ptr @")
-        emit_name(s, StrView { ptr: (ce.name), len: (ce.name_len) as i64 })
-        emit_str(s, c", i64 0\n")
+        let name_ir2: String = ir_name(StrView { ptr: (ce.name), len: (ce.name_len) as i64 })
+        format_into(s, "  %.{whole} = getelementptr i8, ptr @{name_ir2.as_view()}, i64 0\n")
         return whole
     if op.kind != ExprKind.Index or op.left == null or op.left.kind != ExprKind.Ident
         return -1
@@ -1320,47 +1048,43 @@ pub fn emit_const_array_ptr(s: *EmitterState, op: *Expr) -> i32
         if const_struct_table(carr) == 0
             return -1
         return emit_struct_array_elem_ptr(s, StrView { ptr: (carr.name), len: (carr.name_len) as i64 }, carr.array_size, carr.array_elem_type_name, carr.array_elem_type_name_len, op.right)
-    let cty: *u8 = const_elem_llvm(carr.array_elem_type)
-    if cty == null
+    let cty: StrView = llvm_text(const_elem_llvm(carr.array_elem_type))
+    if unnamed(cty)
         return -1
     let cidx: i32 = emit_expr(s, op.right)
     let cptr: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, cptr)
-    emit_str(s, IR_GEP_ARRAY)
-    emit_int(s, carr.array_size as i64)
-    emit_str(s, IR_X)
-    emit_str(s, cty)
-    emit_str(s, c"], ptr @")
-    emit_name(s, StrView { ptr: (carr.name), len: (carr.name_len) as i64 })
-    emit_str(s, IR_I64_ZERO)
-    emit_reg(s, cidx)
-    emit_str(s, IR_NL)
+    let name_ir3: String = ir_name(StrView { ptr: (carr.name), len: (carr.name_len) as i64 })
+    format_into(s, "  %.{cptr} = getelementptr [{carr.array_size as i64} x {cty}], ptr @{name_ir3.as_view()}, i64 0, i64 %.{cidx}\n")
     cptr
 
 # LARB R48: a const scalar is inlined, so `@N` has no storage to point at.  A
 # located error at the `@`, in ritz0's words; it was an unlocated "cannot take
 # address" (`@&N`: "cannot take mutable address").  1 when `e` (`@op` or
 # `@&op`) was refused.
-fn const_scalar_addr_refused(s: *EmitterState, e: *Expr) -> i32
+fn const_scalar_addr_refused(s: *EmitterState, e: *Expr) -> bool
     let op: *Expr = e.operand
     if op == null or op.kind != ExprKind.Ident
-        return 0
+        return false
     let ce: *ConstEntry = unshadowed_const(s, StrView { ptr: (op.ident_ptr), len: (op.ident_len) as i64 })
     # LARB R48 / R60: a struct or enum const is read-only data, so `@C` is
     # `@S`; only a scalar const has no storage to point at.
     if ce == null or ce.const_type == TypeKind.Array or ce.const_type == TypeKind.Struct
-        return 0
-    emit_str(s, c"  ; ERROR: address of a const scalar\n")
+        return false
+    format_into(s, "  ; ERROR: address of a const scalar\n")
     diag_error_at(emitter_source_file(), e.span)
-    eprints("cannot take the address of const `")
-    var i: i32 = 0
-    while i < op.ident_len
-        eprint_char(*(op.ident_ptr + i))
-        i += 1
-    eprints("`; a const scalar has no storage\n")
+    let name: StrView = StrView { ptr: op.ident_ptr, len: op.ident_len as i64 }
+    eprint("cannot take the address of const `{name}`; a const scalar has no storage\n")
     s.error_count = s.error_count + 1
-    1
+    true
+
+# The address of the place `op` names by its own kind, when it is one this
+# emitter can address.
+fn place_address(s: *EmitterState, op: *Expr) -> Option<i32>
+    match op.kind
+        ExprKind.Ident => lvalue_ptr_of_ident(s, op)
+        ExprKind.Index => lvalue_ptr_of_index(s, op)
+        ExprKind.Member => lvalue_ptr_of_member(s, op)
+        _ => None
 
 pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
     # AGAST #3234: `look(@mka()[1])`, an element of a call's array lent to a
@@ -1379,7 +1103,7 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
     # address is `a[i] + j`.  It was "cannot take address".
     if is_array_elem_index(s, op) == 1
         if op.right != null and op.right.kind == ExprKind.Range
-            emit_nd_error(s, op.span.line, op.span.col, c"an element of an array of pointers can't be sliced (only String, Vec and Span can)")
+            emit_nd_error_sv(s, op.span.line, op.span.col, "an element of an array of pointers can't be sliced (only String, Vec and Span can)")
             return 0
         var ei_sum: Expr
         var ei_deref: Expr
@@ -1398,18 +1122,9 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
     var nd_addr: NdIndexPtr
     if emit_nd_index_ptr(s, op, @nd_addr) == 1
         return nd_addr.reg
-    var lv: i32 = 0
-    match op.kind
-        ExprKind.Ident =>
-            if lvalue_ptr_of_ident(s, op, @lv) == 1
-                return lv
-        ExprKind.Index =>
-            if lvalue_ptr_of_index(s, op, @lv) == 1
-                return lv
-        ExprKind.Member =>
-            if lvalue_ptr_of_member(s, op, @lv) == 1
-                return lv
-        _ => pass
+    match place_address(s, op)
+        Some(addr) => return addr
+        None => pass
     # AGAST #184: generic addr-of-MEMBER fallback. Anything that
     # `emit_member_ptr` knows how to GEP — including the new
     # `parent.fwd[i].field` over **Foo case — gets handled here
@@ -1442,22 +1157,14 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
                 if idx_fb_field.field_type == TypeKind.Array
                     let idx_v: i32 = emit_expr(s, op.right)
                     let elem_ptr_fb: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, elem_ptr_fb)
-                    emit_str(s, IR_GEP_ARRAY)
-                    emit_int(s, idx_fb_field.array_size as i64)
-                    emit_str(s, IR_X)
+                    format_into(s, "  %.{elem_ptr_fb} = getelementptr [{idx_fb_field.array_size as i64} x ")
                     if idx_fb_field.array_elem_type == TypeKind.Struct and idx_fb_field.array_elem_type_name_len > 0
-                        emit_str(s, IR_PCT)
-                        emit_name(s, StrView { ptr: (idx_fb_field.array_elem_type_name), len: (idx_fb_field.array_elem_type_name_len) as i64 })
+                        let name_ir4: String = ir_name(StrView { ptr: (idx_fb_field.array_elem_type_name), len: (idx_fb_field.array_elem_type_name_len) as i64 })
+                        format_into(s, "%{name_ir4.as_view()}")
                     else
                         # AGAST #1814: the field's declared element type.
-                        emit_str(s, elem_mem_llvm(idx_fb_field.array_elem_type))
-                    emit_str(s, IR_RBRACK_PTR)
-                    emit_reg(s, idx_fb.reg)
-                    emit_str(s, IR_I64_ZERO)
-                    emit_reg(s, idx_v)
-                    emit_str(s, IR_NL)
+                        format_into(s, "{llvm_text(elem_mem_llvm(idx_fb_field.array_elem_type))}")
+                    format_into(s, "], ptr %.{idx_fb.reg}, i64 0, i64 %.{idx_v}\n")
                     return elem_ptr_fb
     # AGAST #1599: `@*e` / `@&*e` — the address of `*e` is `e` itself, so
     # emit the pointer operand without loading through it.  Same ptr
@@ -1471,30 +1178,24 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
         return deref_ptr
     return -1
 
-# `x` as a place: 1 (address in *out) when lowered.
-fn lvalue_ptr_of_ident(s: *EmitterState, op: *Expr, out: *i32) -> i32
+# `x` as a place: its address, when lowered.
+fn lvalue_ptr_of_ident(s: *EmitterState, op: *Expr) -> Option<i32>
     # LARB R48 / R60: `@C` of a struct or enum const is `@S`, a pointer
     # into its read-only data (emit_const_struct_entry).
     let dce: *ConstEntry = unshadowed_const(s, StrView { ptr: (op.ident_ptr), len: (op.ident_len) as i64 })
     if dce != null and dce.const_type == TypeKind.Struct and dce.type_name_len > 0 and dce.value_expr != null
         let dres: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, dres)
-        emit_str(s, c" = getelementptr i8, ptr @")
-        emit_name(s, StrView { ptr: (dce.name), len: (dce.name_len) as i64 })
-        emit_str(s, c", i64 0\n")
-        *out = dres
-        return 1
+        let name_ir5: String = ir_name(StrView { ptr: (dce.name), len: (dce.name_len) as i64 })
+        format_into(s, "  %.{dres} = getelementptr i8, ptr @{name_ir5.as_view()}, i64 0\n")
+        return Some(dres)
     let loc: i32 = find_local(s, StrView { ptr: (op.ident_ptr), len: (op.ident_len) as i64 })
     if loc >= 0
         # AGAST #2286: `@c` of `c:& C` is the borrow's pointer.  The slot's
         # own address is a pointer to that pointer.
         if lent_ptr_local(s, op) != null
-            *out = emit_load_ptr(s, loc)
-            return 1
+            return Some(emit_load_ptr(s, loc))
         # Convert ptr (alloca) to i64
-        *out = loc
-        return 1
+        return Some(loc)
     # Fall through: not a local, try a global. `@g_processed` (a
     # `var g_processed: Vec<String>` at module scope) used to silently
     # produce "ERROR: cannot take address" because this branch only
@@ -1505,35 +1206,28 @@ fn lvalue_ptr_of_ident(s: *EmitterState, op: *Expr, out: *i32) -> i32
         # A global's address is the constant `@name`; GEP it by 0 to get
         # it into a register, since callers want a reg for both @ and @&.
         let result: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, result)
-        emit_str(s, c" = getelementptr i8, ptr @")
-        emit_name(s, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
-        emit_str(s, c", i64 0\n")
-        *out = result
-        return 1
-    0
+        let name_ir6: String = ir_name(StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+        format_into(s, "  %.{result} = getelementptr i8, ptr @{name_ir6.as_view()}, i64 0\n")
+        return Some(result)
+    None
 
-# `a[i]` as a place: 1 (address in *out) when lowered.
-fn lvalue_ptr_of_index(s: *EmitterState, op: *Expr, out: *i32) -> i32
+# `a[i]` as a place: its address, when lowered.
+fn lvalue_ptr_of_index(s: *EmitterState, op: *Expr) -> Option<i32>
     # AGAST #2440: `@p[i]` through a reference or pointer: `p.data + i`.
     if through_slice_refused(s, op) == 1
-        *out = 0
-        return 1
+        return Some(0)
     let through: *LocalVar = index_through(s, op)
     if through != null
         var th: ThroughIndex
         index_through_fill(s, op, through_spill(s, through), @th)
         let th_val: i32 = emit_expr(s, @th.sum)
         let th_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, th_val)
-        *out = th_ptr
-        return 1
+        return Some(th_ptr)
     # AGAST #2321: ritz0 lowers this at stride `[N]T`, past the end of the
     # array, against its own read; ritz1 stepped by a byte.  Neither (#2330).
     if array_ptr_index_base(s, op.left) != null
-        emit_nd_error(s, op.span.line, op.span.col, c"the address of an element through a pointer to an array is refused (cast the pointer to `*T` and index that)")
-        *out = 0
-        return 1
+        emit_nd_error_sv(s, op.span.line, op.span.col, "the address of an element through a pointer to an array is refused (cast the pointer to `*T` and index that)")
+        return Some(0)
     # AGAST #2204: `@b.f[i]` with a `f: *T` field, whatever `b` is (a struct
     # value, a `*S`, a member chain), is `b.f + i`: the sum the read
     # `*(b.f + i)` steps by one T.  A struct value's field was "cannot take
@@ -1545,21 +1239,15 @@ fn lvalue_ptr_of_index(s: *EmitterState, op: *Expr, out: *i32) -> i32
         elem_index_as_deref(s, op, @pf_sum, @pf_deref)
         let pf_val: i32 = emit_expr(s, @pf_sum)
         let pf_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, pf_val)
-        *out = pf_ptr
-        return 1
+        return Some(pf_ptr)
     # Handle @arr[i] - address of array element
     match op.left.kind
-        ExprKind.Ident =>
-            if lvalue_ptr_index_of_ident(s, op, out) == 1
-                return 1
-        ExprKind.Member =>
-            if lvalue_ptr_index_of_member(s, op, out) == 1
-                return 1
-        _ => pass
-    0
+        ExprKind.Ident => lvalue_ptr_index_of_ident(s, op)
+        ExprKind.Member => lvalue_ptr_index_of_member(s, op)
+        _ => None
 
-# `a[i]` with `a` named: 1 (address in *out) when lowered.
-fn lvalue_ptr_index_of_ident(s: *EmitterState, op: *Expr, out: *i32) -> i32
+# `a[i]` with `a` named: its address, when lowered.
+fn lvalue_ptr_index_of_ident(s: *EmitterState, op: *Expr) -> Option<i32>
     let local: *LocalVar = find_local_struct_name(s, StrView { ptr: (op.left.ident_ptr), len: (op.left.ident_len) as i64 })
     if local != null
         match lv_var_type(local)
@@ -1567,11 +1255,7 @@ fn lvalue_ptr_index_of_ident(s: *EmitterState, op: *Expr, out: *i32) -> i32
                 # Array local - use GEP [0, index] to get element address
                 let idx: i32 = emit_expr(s, op.right)
                 let elem_ptr: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, elem_ptr)
-                emit_str(s, IR_GEP_ARRAY)
-                emit_int(s, lv_array_size(local) as i64)
-                emit_str(s, IR_X)
+                format_into(s, "  %.{elem_ptr} = getelementptr [{lv_array_size(local) as i64} x ")
                 if lv_array_elem_type(local) == TypeKind.Struct and lv_type_name_len(local) > 0
                     # AGAST #190: `@arr[i]` over `var arr: [N]Struct`
                     # — emit `[N x %T]` so the GEP stride matches the
@@ -1583,15 +1267,10 @@ fn lvalue_ptr_index_of_ident(s: *EmitterState, op: *Expr, out: *i32) -> i32
                 else
                     # AGAST #1564: the alloca's own element type;
                     # u32/u16/i16 used to stride as i64.
-                    emit_str(s, elem_mem_llvm(lv_array_elem_type(local)))
-                emit_str(s, IR_RBRACK_PTR)
-                emit_reg(s, local.reg)
-                emit_str(s, IR_I64_ZERO)
-                emit_reg(s, idx)
-                emit_str(s, IR_NL)
+                    format_into(s, "{llvm_text(elem_mem_llvm(lv_array_elem_type(local)))}")
+                format_into(s, "], ptr %.{local.reg}, i64 0, i64 %.{idx}\n")
                 # Convert to i64
-                *out = elem_ptr
-                return 1
+                return Some(elem_ptr)
             TypeKind.Ptr =>
                 # @ptr_var[i] where ptr_var: *T — load the pointer,
                 # GEP by element, convert to i64. Common in cryptosec
@@ -1602,17 +1281,10 @@ fn lvalue_ptr_index_of_ident(s: *EmitterState, op: *Expr, out: *i32) -> i32
                 let loaded_p: i32 = emit_load_ptr(s, local.reg)
                 let idx_p: i32 = emit_expr(s, op.right)
                 let elem_ptr_p: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, elem_ptr_p)
-                emit_str(s, c" = getelementptr ")
+                format_into(s, "  %.{elem_ptr_p} = getelementptr ")
                 emit_ptr_elem_gep_type(s, lv_pointee_type(local), StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
-                emit_str(s, IR_PTR_SEP)
-                emit_reg(s, loaded_p)
-                emit_str(s, IR_I64_SEP)
-                emit_reg(s, idx_p)
-                emit_str(s, IR_NL)
-                *out = elem_ptr_p
-                return 1
+                format_into(s, ", ptr %.{loaded_p}, i64 %.{idx_p}\n")
+                return Some(elem_ptr_p)
             _ => pass
     # If `op.left` is an ident but no matching local
     # was found, try the global table.  Squeeze's inflate
@@ -1629,19 +1301,11 @@ fn lvalue_ptr_index_of_ident(s: *EmitterState, op: *Expr, out: *i32) -> i32
         if glob_arr.var_type == TypeKind.Array and glob_arr.array_elem_type == TypeKind.Struct and glob_arr.array_elem_type_name_len > 0
             let gas_idx: i32 = emit_expr(s, op.right)
             let gas_elem: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, gas_elem)
-            emit_str(s, IR_GEP_ARRAY)
-            emit_int(s, glob_arr.array_size as i64)
-            emit_str(s, IR_X)
+            format_into(s, "  %.{gas_elem} = getelementptr [{glob_arr.array_size as i64} x ")
             emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (glob_arr.array_elem_type_name), len: (glob_arr.array_elem_type_name_len) as i64 })
-            emit_str(s, c"], ptr @")
-            emit_name(s, StrView { ptr: (glob_arr.name), len: (glob_arr.name_len) as i64 })
-            emit_str(s, IR_I64_ZERO)
-            emit_reg(s, gas_idx)
-            emit_str(s, IR_NL)
-            *out = gas_elem
-            return 1
+            let name_ir7: String = ir_name(StrView { ptr: (glob_arr.name), len: (glob_arr.name_len) as i64 })
+            format_into(s, "], ptr @{name_ir7.as_view()}, i64 0, i64 %.{gas_idx}\n")
+            return Some(gas_elem)
         # AGAST #1908: `@g[i]` with `var g: *T` indexes the pointee,
         # not the global's own storage: load g, then GEP one T.
         if glob_arr.var_type == TypeKind.Ptr
@@ -1649,51 +1313,28 @@ fn lvalue_ptr_index_of_ident(s: *EmitterState, op: *Expr, out: *i32) -> i32
             emit_load_global(s, IR_TY_PTR, gp_base, StrView { ptr: (glob_arr.name), len: (glob_arr.name_len) as i64 })
             let gp_idx: i32 = emit_expr(s, op.right)
             let gp_elem: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, gp_elem)
-            emit_str(s, c" = getelementptr ")
+            format_into(s, "  %.{gp_elem} = getelementptr ")
             emit_ptr_elem_gep_type(s, glob_arr.pointee_type, StrView { ptr: (glob_arr.pointee_type_name), len: (glob_arr.pointee_type_name_len) as i64 })
-            emit_str(s, IR_PTR_SEP)
-            emit_reg(s, gp_base)
-            emit_str(s, IR_I64_SEP)
-            emit_reg(s, gp_idx)
-            emit_str(s, IR_NL)
-            *out = gp_elem
-            return 1
+            format_into(s, ", ptr %.{gp_base}, i64 %.{gp_idx}\n")
+            return Some(gp_elem)
         # AGAST #1984: `@g[i]` over a primitive `var g: [N]T` steps one
         # T, as `g[i]` loads/stores do (#1504).  The byte GEP below made
         # `@g_u64[1]` point one BYTE in.
         if glob_arr.var_type == TypeKind.Array and glob_arr.array_elem_type != TypeKind.Struct
             let gp_aidx: i32 = emit_expr(s, op.right)
             let gp_aelem: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, gp_aelem)
-            emit_str(s, IR_GEP_ARRAY)
-            emit_int(s, glob_arr.array_size as i64)
-            emit_str(s, IR_X)
-            emit_str(s, elem_mem_llvm(glob_arr.array_elem_type))
-            emit_str(s, c"], ptr @")
-            emit_name(s, StrView { ptr: (glob_arr.name), len: (glob_arr.name_len) as i64 })
-            emit_str(s, IR_I64_ZERO)
-            emit_reg(s, gp_aidx)
-            emit_str(s, IR_NL)
-            *out = gp_aelem
-            return 1
+            let name_ir8: String = ir_name(StrView { ptr: (glob_arr.name), len: (glob_arr.name_len) as i64 })
+            format_into(s, "  %.{gp_aelem} = getelementptr [{glob_arr.array_size as i64} x {llvm_text(elem_mem_llvm(glob_arr.array_elem_type))}], ptr @{name_ir8.as_view()}, i64 0, i64 %.{gp_aidx}\n")
+            return Some(gp_aelem)
         let ga_idx: i32 = emit_expr(s, op.right)
         let ga_elem: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, ga_elem)
-        emit_str(s, c" = getelementptr i8, ptr @")
-        emit_name(s, StrView { ptr: (glob_arr.name), len: (glob_arr.name_len) as i64 })
-        emit_str(s, IR_I64_SEP)
-        emit_reg(s, ga_idx)
-        emit_str(s, IR_NL)
-        *out = ga_elem
-        return 1
-    0
+        let name_ir9: String = ir_name(StrView { ptr: (glob_arr.name), len: (glob_arr.name_len) as i64 })
+        format_into(s, "  %.{ga_elem} = getelementptr i8, ptr @{name_ir9.as_view()}, i64 %.{ga_idx}\n")
+        return Some(ga_elem)
+    None
 
 # Handle @global.array_field[i] - address of global struct's array field element
-fn lvalue_ptr_index_of_member(s: *EmitterState, op: *Expr, out: *i32) -> i32
+fn lvalue_ptr_index_of_member(s: *EmitterState, op: *Expr) -> Option<i32>
     match op.left.left.kind
         ExprKind.Ident =>
             # Try to find as global variable
@@ -1711,20 +1352,11 @@ fn lvalue_ptr_index_of_member(s: *EmitterState, op: *Expr, out: *i32) -> i32
                                 # getelementptr %StructType, ptr @global, i32 0, i32 field_idx, i64 index
                                 let idx: i32 = emit_expr(s, op.right)
                                 let elem_ptr: i32 = next_reg(s)
-                                emit_str(s, IR_INDENT)
-                                emit_reg(s, elem_ptr)
-                                emit_str(s, IR_GEP_NAMED)
-                                emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-                                emit_str(s, c", ptr @")
-                                emit_name(s, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
-                                emit_str(s, IR_I32_ZERO)
-                                emit_int(s, field_idx as i64)
-                                emit_str(s, IR_I64_SEP)
-                                emit_reg(s, idx)
-                                emit_str(s, IR_NL)
+                                gep_struct_open(s, elem_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+                                let name_ir10: String = ir_name(StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+                                format_into(s, ", ptr @{name_ir10.as_view()}, i32 0, i32 {field_idx as i64}, i64 %.{idx}\n")
                                 # Convert to i64
-                                *out = elem_ptr
-                                return 1
+                                return Some(elem_ptr)
             # Handle @ptr_to_struct.array_field[i] - address of element in array field via pointer
             let local: *LocalVar = find_local_struct_name(s, StrView { ptr: (op.left.left.ident_ptr), len: (op.left.left.ident_len) as i64 })
             if local != null
@@ -1741,20 +1373,10 @@ fn lvalue_ptr_index_of_member(s: *EmitterState, op: *Expr, out: *i32) -> i32
                                 # GEP to array field, then to element
                                 let idx: i32 = emit_expr(s, op.right)
                                 let elem_ptr: i32 = next_reg(s)
-                                emit_str(s, IR_INDENT)
-                                emit_reg(s, elem_ptr)
-                                emit_str(s, IR_GEP_NAMED)
-                                emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-                                emit_str(s, IR_PTR_SEP)
-                                emit_reg(s, loaded_ptr)
-                                emit_str(s, IR_I32_ZERO)
-                                emit_int(s, field_idx as i64)
-                                emit_str(s, IR_I64_SEP)
-                                emit_reg(s, idx)
-                                emit_str(s, IR_NL)
+                                gep_struct_open(s, elem_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+                                format_into(s, ", ptr %.{loaded_ptr}, i32 0, i32 {field_idx as i64}, i64 %.{idx}\n")
                                 # Convert to i64
-                                *out = elem_ptr
-                                return 1
+                                return Some(elem_ptr)
                             # A `*T` field is the #2204 sum above.
                 # task-170: @local_struct.array_field[i] — local stack-
                 # allocated struct (TypeKind.Struct, not PTR). e.g.
@@ -1772,19 +1394,9 @@ fn lvalue_ptr_index_of_member(s: *EmitterState, op: *Expr, out: *i32) -> i32
                             if field_ls.field_type == TypeKind.Array
                                 let idx_ls: i32 = emit_expr(s, op.right)
                                 let elem_ptr_ls: i32 = next_reg(s)
-                                emit_str(s, IR_INDENT)
-                                emit_reg(s, elem_ptr_ls)
-                                emit_str(s, IR_GEP_NAMED)
-                                emit_name(s, StrView { ptr: (st_ls.name), len: (st_ls.name_len) as i64 })
-                                emit_str(s, IR_PTR_SEP)
-                                emit_reg(s, local.reg)
-                                emit_str(s, IR_I32_ZERO)
-                                emit_int(s, field_idx_ls as i64)
-                                emit_str(s, IR_I64_SEP)
-                                emit_reg(s, idx_ls)
-                                emit_str(s, IR_NL)
-                                *out = elem_ptr_ls
-                                return 1
+                                gep_struct_open(s, elem_ptr_ls, StrView { ptr: (st_ls.name), len: (st_ls.name_len) as i64 })
+                                format_into(s, ", ptr %.{local.reg}, i32 0, i32 {field_idx_ls as i64}, i64 %.{idx_ls}\n")
+                                return Some(elem_ptr_ls)
         # task-170 site-1: chained-member addr-of-index, e.g.
         # `@p.command.args[i]` where `p.command` itself is a member
         # access (RespParser.command yields a RespCommand struct
@@ -1799,30 +1411,21 @@ fn lvalue_ptr_index_of_member(s: *EmitterState, op: *Expr, out: *i32) -> i32
                 if inner_field_cm.field_type == TypeKind.Array
                     let idx_cm: i32 = emit_expr(s, op.right)
                     let elem_ptr_cm: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, elem_ptr_cm)
-                    emit_str(s, IR_GEP_ARRAY)
-                    emit_int(s, inner_field_cm.array_size as i64)
-                    emit_str(s, IR_X)
+                    format_into(s, "  %.{elem_ptr_cm} = getelementptr [{inner_field_cm.array_size as i64} x ")
                     if inner_field_cm.array_elem_type == TypeKind.Struct and inner_field_cm.array_elem_type_name_len > 0
-                        emit_str(s, IR_PCT)
-                        emit_name(s, StrView { ptr: (inner_field_cm.array_elem_type_name), len: (inner_field_cm.array_elem_type_name_len) as i64 })
+                        let name_ir11: String = ir_name(StrView { ptr: (inner_field_cm.array_elem_type_name), len: (inner_field_cm.array_elem_type_name_len) as i64 })
+                        format_into(s, "%{name_ir11.as_view()}")
                     else
                         # AGAST #1814: the field's declared element type.
-                        emit_str(s, elem_mem_llvm(inner_field_cm.array_elem_type))
-                    emit_str(s, IR_RBRACK_PTR)
-                    emit_reg(s, inner_result_cm.reg)
-                    emit_str(s, IR_I64_ZERO)
-                    emit_reg(s, idx_cm)
-                    emit_str(s, IR_NL)
-                    *out = elem_ptr_cm
-                    return 1
+                        format_into(s, "{llvm_text(elem_mem_llvm(inner_field_cm.array_elem_type))}")
+                    format_into(s, "], ptr %.{inner_result_cm.reg}, i64 0, i64 %.{idx_cm}\n")
+                    return Some(elem_ptr_cm)
         _ => pass
-    0
+    None
 
 
-# `e.f` as a place: 1 (address in *out) when lowered.
-fn lvalue_ptr_of_member(s: *EmitterState, op: *Expr, out: *i32) -> i32
+# `e.f` as a place: its address, when lowered.
+fn lvalue_ptr_of_member(s: *EmitterState, op: *Expr) -> Option<i32>
     # Handle @local_struct.field - address of a field in a local struct
     if op.left.kind == ExprKind.Ident
         # Try to find as local struct variable
@@ -1847,85 +1450,53 @@ fn lvalue_ptr_of_member(s: *EmitterState, op: *Expr, out: *i32) -> i32
                         if lv_var_type(local) == TypeKind.Struct
                             # Direct struct - GEP from local.reg directly
                             let field_ptr: i32 = next_reg(s)
-                            emit_str(s, IR_INDENT)
-                            emit_reg(s, field_ptr)
-                            emit_str(s, IR_GEP_NAMED)
-                            emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-                            emit_str(s, IR_PTR_SEP)
-                            emit_reg(s, local.reg)
-                            emit_str(s, IR_I32_ZERO)
-                            emit_int(s, field_idx as i64)
-                            emit_str(s, IR_NL)
+                            gep_struct_open(s, field_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+                            format_into(s, ", ptr %.{local.reg}, i32 0, i32 {field_idx as i64}\n")
                             # Convert pointer to i64
-                            *out = field_ptr
-                            return 1
+                            return Some(field_ptr)
                         else
                             # Ptr/ref - native ptr load (task #73 migration)
                             let loaded_ptr: i32 = emit_load_levels(s, local.reg, local_struct_levels(local))
                             let field_ptr: i32 = next_reg(s)
-                            emit_str(s, IR_INDENT)
-                            emit_reg(s, field_ptr)
-                            emit_str(s, IR_GEP_NAMED)
-                            emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-                            emit_str(s, IR_PTR_SEP)
-                            emit_reg(s, loaded_ptr)
-                            emit_str(s, IR_I32_ZERO)
-                            emit_int(s, field_idx as i64)
-                            emit_str(s, IR_NL)
+                            gep_struct_open(s, field_ptr, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+                            format_into(s, ", ptr %.{loaded_ptr}, i32 0, i32 {field_idx as i64}\n")
                             # Convert pointer to i64
-                            *out = field_ptr
-                            return 1
-    0
+                            return Some(field_ptr)
+    None
 
 
 # AGAST #1959 / #1955 / #1541: the LLVM float type of a negated operand, or
 # null when it is an integer.  A float literal is `double` (get_expr_type
 # says f64), so `-1.5` is a double that the f32 binding / argument sites
 # narrow just as they narrow `1.5`.
-fn neg_float_llvm_type(s: *EmitterState, operand: *Expr) -> *u8
-    let ty: TypeKind = expr_slot_ty(operand)
-    match ty
-        TypeKind.F32 =>
-            return c"float"
-        TypeKind.F64 =>
-            return c"double"
-        _ => pass
-    return null
+fn neg_float_llvm_type(s: *EmitterState, operand: *Expr) -> StrView
+    match expr_slot_ty(operand)
+        TypeKind.F32 => "float"
+        TypeKind.F64 => "double"
+        _ => no_name()
 
 pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
-    var ureg: i32 = 0
     match e.op
         OpKind.Neg =>
-            let fty: *u8 = neg_float_llvm_type(s, e.operand)
+            let fty: StrView = neg_float_llvm_type(s, e.operand)
             let operand: i32 = emit_expr(s, e.operand)
             let result: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, result)
-            if fty != null
+            if not unnamed(fty)
                 # `fneg`, as ritz0 emits: `sub i64 0, %double` is invalid IR.
-                emit_str(s, c" = fneg ")
-                emit_str(s, fty)
-                emit_str(s, IR_SP)
-                emit_reg(s, operand)
-                emit_str(s, IR_NL)
+                format_into(s, "  %.{result} = fneg {fty} %.{operand}\n")
                 return result
-            emit_str(s, c" = sub i64 0, ")
-            emit_reg(s, operand)
-            emit_str(s, IR_NL)
+            format_into(s, "  %.{result} = sub i64 0, %.{operand}\n")
             return result
         OpKind.Not =>
             let operand: i32 = emit_expr(s, e.operand)
             let result: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, result)
-            emit_str(s, c" = icmp eq i64 ")
-            emit_reg(s, operand)
-            emit_str(s, IR_COMMA_0)
+            format_into(s, "  %.{result} = icmp eq i64 %.{operand}, 0\n")
             let ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result)
             return ext
         _ =>
-            if emit_unary_addr_deref(s, e, @ureg) == 1
-                return ureg
+            match emit_unary_addr_deref(s, e)
+                Some(value) => return value
+                None => pass
     return 0
 
 
@@ -1957,12 +1528,11 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
 var g_ovf_used: i32 = 0
 const OVF_TRAP_USED: i32 = 16777216    # 1 << 24, past the 24 intrinsic bits
 
-# `@x`, `@&x`, `*p`, `~x` (every unary op but `-` and `not`): 1 (result in *out) when lowered.
-fn emit_unary_addr_deref(s: *EmitterState, e: *Expr, out: *i32) -> i32
+# `@x`, `@&x`, `*p`, `~x` (every unary op but `-` and `not`): its value, when lowered.
+fn emit_unary_addr_deref(s: *EmitterState, e: *Expr) -> Option<i32>
     if e.op == OpKind.Deref and deref_names_array(s, e.operand) == 1
         emit_whole_array_error(s, e)   # AGAST #2287: `*p` for `p: *[N]T`; #2304: `*w.p`, `*P`, `*(p + 1)`
-        *out = 0
-        return 1
+        return Some(0)
     else
         match e.op
             OpKind.Deref =>
@@ -1971,8 +1541,7 @@ fn emit_unary_addr_deref(s: *EmitterState, e: *Expr, out: *i32) -> i32
                 # caller's T, so it already reads as the referent.  This loaded
                 # through the int's value as an address, and segfaulted.
                 if lent_scalar_ident(s, e.operand) != null
-                    *out = emit_expr(s, e.operand)
-                    return 1
+                    return Some(emit_expr(s, e.operand))
                 let addr: i32 = emit_expr(s, e.operand)
                 # Convert i64 address to ptr.  AGAST #1644: a TypeKind.MutRef local
                 # (`x: @&T`) already loads as `ptr`, so casting it is invalid IR.
@@ -1980,25 +1549,18 @@ fn emit_unary_addr_deref(s: *EmitterState, e: *Expr, out: *i32) -> i32
                 var ptr: i32 = addr
                 if deref_operand_is_ptr(s, e.operand) == 0
                     ptr = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, ptr)
-                    emit_str(s, IR_INTTOPTR)
-                    emit_reg(s, addr)
-                    emit_str(s, c" to ptr\n")
+                    format_into(s, "  %.{ptr} = inttoptr i64 %.{addr} to ptr\n")
                 # AGAST #1505: a pointee statically known to be a struct loads that
                 # struct, whatever get_expr_type guessed (it reports TypeKind.I64 for a
                 # let-local `*S` and TypeKind.U8 for an unrecorded `*S` field pointee).
-                var sname: *u8 = null
-                var sname_len: i32 = 0
-                deref_pointee_struct_name(s, e.operand, @sname, @sname_len)
-                if sname_len > 0
+                let sname: StrView = named_by(deref_pointee_struct_name, s, e.operand)
+                if sname.len > 0
                     let sresult: i32 = next_reg(s)
                     # AGAST #2204: a `*v4i32` pointee is the vector `<4 x i32>`, not a
                     # struct `%v4i32` (clang: "load operand must be a pointer to a
                     # first class type").  emit_llvm_type_struct maps SIMD names.
-                    emit_struct_load_or_defer(s, TypeKind.Struct, sresult, StrView { ptr: (sname), len: (sname_len) as i64 }, ptr, null, 0)
-                    *out = sresult
-                    return 1
+                    emit_struct_load_or_defer(s, TypeKind.Struct, sresult, sname, ptr, null, 0)
+                    return Some(sresult)
                 # Determine load type based on pointee type
                 let deref_type: TypeKind = expr_slot_ty(e)
                 match deref_type
@@ -2008,23 +1570,15 @@ fn emit_unary_addr_deref(s: *EmitterState, e: *Expr, out: *i32) -> i32
                         # fell to the i64 default, so `*p != x` emitted
                         # `fcmp float <i64>`, which clang rejects.
                         let fresult: i32 = next_reg(s)
-                        emit_str(s, IR_INDENT)
-                        emit_reg(s, fresult)
-                        emit_str(s, IR_LOAD)
-                        emit_str(s, elem_mem_llvm(deref_type))
-                        emit_str(s, IR_PTR_SEP)
-                        emit_reg(s, ptr)
-                        emit_str(s, IR_NL)
-                        *out = fresult
-                        return 1
+                        format_into(s, "  %.{fresult} = load {llvm_text(elem_mem_llvm(deref_type))}, ptr %.{ptr}\n")
+                        return Some(fresult)
                     TypeKind.Bool =>
                         # AGAST #2053: a `*bool` pointee is an `i1`; zext it to the i64
                         # bools are carried in.  (The i64 default read 7 bytes past it.)
                         let bval: i32 = next_reg(s)
                         emit_load_into(s, IR_TY_I1, bval, ptr)
                         let bresult: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, bval)
-                        *out = bresult
-                        return 1
+                        return Some(bresult)
                     _ =>
                         if ty_int_bits(deref_type) == 8
                             # Load i8 and sign/zero-extend to i64.  AGAST #2021: `*p` on a
@@ -2032,31 +1586,25 @@ fn emit_unary_addr_deref(s: *EmitterState, e: *Expr, out: *i32) -> i32
                             let byte_val: i32 = next_reg(s)
                             emit_load_into(s, IR_TY_I8, byte_val, ptr)
                             let result: i32 = next_reg(s)
-                            emit_str(s, IR_INDENT)
-                            emit_reg(s, result)
+                            format_into(s, "  %.{result}")
                             if deref_type == TypeKind.I8
-                                emit_str(s, c" = sext i8 ")
+                                format_into(s, " = sext i8 ")
                             else
-                                emit_str(s, c" = zext i8 ")
-                            emit_reg(s, byte_val)
-                            emit_str(s, IR_TO_I64)
-                            *out = result
-                            return 1
+                                format_into(s, " = zext i8 ")
+                            format_into(s, "%.{byte_val} to i64\n")
+                            return Some(result)
                         else if ty_int_bits(deref_type) == 16
                             # Load i16 and sign/zero-extend to i64
                             let val16: i32 = next_reg(s)
                             emit_load_into(s, IR_TY_I16, val16, ptr)
                             let result: i32 = next_reg(s)
-                            emit_str(s, IR_INDENT)
-                            emit_reg(s, result)
+                            format_into(s, "  %.{result}")
                             if deref_type == TypeKind.I16
-                                emit_str(s, c" = sext i16 ")
+                                format_into(s, " = sext i16 ")
                             else
-                                emit_str(s, c" = zext i16 ")
-                            emit_reg(s, val16)
-                            emit_str(s, IR_TO_I64)
-                            *out = result
-                            return 1
+                                format_into(s, " = zext i16 ")
+                            format_into(s, "%.{val16} to i64\n")
+                            return Some(result)
                         else if ty_int_bits(deref_type) == 32
                             # Load i32 and sign/zero-extend to i64 (unified value model)
                             # Critical: reading i64 from a 4-byte slot reads 4 bytes of
@@ -2064,284 +1612,232 @@ fn emit_unary_addr_deref(s: *EmitterState, e: *Expr, out: *i32) -> i32
                             let val32: i32 = next_reg(s)
                             emit_load_into(s, IR_TY_I32, val32, ptr)
                             let result: i32 = next_reg(s)
-                            emit_str(s, IR_INDENT)
-                            emit_reg(s, result)
+                            format_into(s, "  %.{result}")
                             if deref_type == TypeKind.I32
-                                emit_str(s, c" = sext i32 ")
+                                format_into(s, " = sext i32 ")
                             else
-                                emit_str(s, c" = zext i32 ")
-                            emit_reg(s, val32)
-                            emit_str(s, IR_TO_I64)
-                            *out = result
-                            return 1
-                        else if deref_type == TypeKind.Struct or if_arm_names_pointee(s, e.operand) == 1
+                                format_into(s, " = zext i32 ")
+                            format_into(s, "%.{val32} to i64\n")
+                            return Some(result)
+                        else if deref_type == TypeKind.Struct or if_arm_names_pointee(s, e.operand)
                             # AGAST #1505: the pointee is a struct but deref_pointee_struct_name
                             # could not name it.  This used to fall back silently to
                             # `load i64`, which clang rejects as soon as the value meets a
                             # struct slot.  Report it at the deref's source position instead.
-                            emit_ir_error(s, e.span, c"cannot determine the struct type loaded by this '*' deref")
+                            emit_ir_error_sv(s, e.span, "cannot determine the struct type loaded by this '*' deref")
                             let result: i32 = next_reg(s)
                             emit_load_into(s, IR_TY_I64, result, ptr)
-                            *out = result
-                            return 1
+                            return Some(result)
                         else
                             # Default: load i64
                             let result: i32 = next_reg(s)
                             emit_load_into(s, IR_TY_I64, result, ptr)
-                            *out = result
-                            return 1
+                            return Some(result)
             OpKind.Addr =>
-                if const_scalar_addr_refused(s, e) == 1
-                    *out = 0
-                    return 1
+                if const_scalar_addr_refused(s, e)
+                    return Some(0)
                 let lend_from: i32 = own_temp_mark(s)
                 let addr_ptr: i32 = emit_lvalue_ptr(s, e.operand)
                 own_lend_temps(s, e.operand, lend_from)   # AGAST #3050
                 if addr_ptr >= 0
                     # `@expr` is an i64 in ritz1's value model.
                     let result: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, addr_ptr)
-                    *out = result
-                    return 1
-                emit_ir_error(s, e.span, c"cannot take address")
-                *out = 0
-                return 1
+                    return Some(result)
+                emit_ir_error_sv(s, e.span, "cannot take address")
+                return Some(0)
             OpKind.AddrMut =>
                 # @&expr - mutable address-of, returns ptr type (not i64)
-                if const_scalar_addr_refused(s, e) == 1   # LARB R48: `@&N`
-                    *out = 0
-                    return 1
+                if const_scalar_addr_refused(s, e)   # LARB R48: `@&N`
+                    return Some(0)
                 let lend_mut_from: i32 = own_temp_mark(s)
                 let addr_mut_ptr: i32 = emit_lvalue_ptr(s, e.operand)
                 own_lend_temps(s, e.operand, lend_mut_from)   # AGAST #3050
                 if addr_mut_ptr >= 0
-                    *out = addr_mut_ptr
-                    return 1
-                emit_ir_error(s, e.span, c"cannot take mutable address")
-                *out = 0
-                return 1
+                    return Some(addr_mut_ptr)
+                emit_ir_error_sv(s, e.span, "cannot take mutable address")
+                return Some(0)
             OpKind.BitNot =>
                 let operand: i32 = emit_expr(s, e.operand)
                 let result: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, result)
-                emit_str(s, c" = xor i64 ")
-                emit_reg(s, operand)
-                emit_str(s, c", -1\n")
+                format_into(s, "  %.{result} = xor i64 %.{operand}, -1\n")
                 # AGAST #3225: `~m` on a u32 of 0 is 4294967295, not the i64's -1, in
                 # whatever it lands in: a wider slot (`let w: i64 = ~m`) or a sum that
                 # runs there (`~m + 1`) reads it as is, so it's brought back here.
                 var not_uns: i32 = 0
                 let not_bits: i32 = int_operand_shape(s, e.operand, @not_uns)
-                *out = emit_narrow_operand(s, e, result, not_bits, not_uns)
-                return 1
+                return Some(emit_narrow_operand(s, e, result, not_bits, not_uns == 1))
             _ => pass
-    0
+    None
 
 
 fn ovf_width_index(bits: i32) -> i32
-    if bits == 8
-        return 0
-    if bits == 16
-        return 1
-    if bits == 32
-        return 2
-    3
+    match bits
+        8 => 0
+        16 => 1
+        32 => 2
+        _ => 3
 
 fn ovf_op_index(op: OpKind) -> i32
     match op
-        OpKind.Add =>
-            return 0
-        OpKind.Sub =>
-            return 1
-        _ => pass
-    2
+        OpKind.Add => 0
+        OpKind.Sub => 1
+        _ => 2
 
-# The width (8, 16, 32 or 64) and signedness `e` runs at: its wider slot's,
-# else its operands' (int_operand_shape, ritz0's unified operand type).
-fn ovf_op_type(s: *EmitterState, e: *Expr, uns: *i32) -> i32
+# Why a checked operation stops the program, as ritz0 words it.
+enum Trap
+    Safe
+    Overflow
+    DivideByZero
+    ShiftRange
+
+fn trap_text(t: Trap) -> StrView
+    match t
+        Trap.Overflow => "integer overflow in"
+        Trap.DivideByZero => "division by zero in"
+        Trap.ShiftRange => "shift count out of range in"
+        _ => ""
+
+# The type an operation runs at: its width (8, 16, 32 or 64) and signedness.
+struct OperandType
+    bits: i32
+    unsigned: bool
+
+# What `e` runs at: its wider slot's type, else its operands' (int_operand_shape,
+# ritz0's unified operand type).
+fn ovf_op_type(s: *EmitterState, e: *Expr) -> OperandType
     var bits: i32 = 0
+    var uns: i32 = 0
     let wider: TypeKind = wider_slot_type(s, e)
     if wider != TypeKind.Void
-        *uns = ty_is_unsigned(wider)
+        uns = ty_is_unsigned(wider)
         bits = ty_bits(wider)
     else
-        bits = int_operand_shape(s, e, uns)
+        bits = int_operand_shape(s, e, @uns)
     if bits != 8 and bits != 16 and bits != 32
         bits = 64
-    bits
+    OperandType { bits: bits, unsigned: uns == 1 }
 
 # The minimum of the signed `bits`-wide type; `-%` because at 64 bits it is
 # 0 -% i64::MIN, which wraps to itself (LARB R63).
 fn ovf_type_min(bits: i32) -> i64
     0 -% (1 << (bits as i64 - 1))
 
-# `v` (not negative) in decimal at `p`; the number of digits written.
-fn ovf_put_dec(p: *u8, v: i64) -> i32
-    var n: i32 = 1
-    var t: i64 = v
-    while t >= 10
-        t = t / 10
-        n += 1
-    var i: i32 = n
-    t = v
-    while i > 0
-        i -= 1
-        *(p + i) = (48 + t % 10) as u8
-        t = t / 10
-    n
-
-fn ovf_put(p: *u8, text: *u8) -> i32
-    let n: i64 = strlen(text)
-    memcpy(p, text, n)
-    n as i32
-
-# `<file>:<line>:<col>: <what> `<op>`\n` as a string-table entry (its index);
-# its length in *out_len.  The file is the source's base name, as an assert's.
-# Freestanding, the message has no `\n`: ritz_platform_fatal adds it (#4617).
-fn ovf_message(s: *EmitterState, e: *Expr, what: *u8, out_len: *i32) -> i32
-    var file: *u8 = emitter_source_file()
+# The source's base name, as an assert's message gives it.
+fn source_base_name() -> StrView
+    let file: *u8 = emitter_source_file()
     if file == null
-        file = c"?"
+        return "?"
+    let path: StrView = strview_from_cstr(file)
     var start: i64 = 0
-    var k: i64 = 0
-    while *(file + k) != 0
-        if *(file + k) == '/'
+    for k in 0..path.len
+        if path.get(k) == '/'
             start = k + 1
-        k += 1
-    let base: *u8 = file + start
-    let m: *u8 = malloc(strlen(base) + strlen(what) + 64)
-    var n: i32 = ovf_put(m, base)
-    *(m + n) = ':'
-    n += 1
-    n += ovf_put_dec(m + n, e.span.line as i64)
-    *(m + n) = ':'
-    n += 1
-    n += ovf_put_dec(m + n, e.span.col as i64)
-    n += ovf_put(m + n, c": ")
-    n += ovf_put(m + n, what)
-    n += ovf_put(m + n, c" `")
-    n += ovf_put(m + n, binary_op_spelling(e.op))
-    n += ovf_put(m + n, c"`")
-    # ritz_platform_fatal writes its own newline (AGAST #4617).
-    if (s.platform_stop & PSTOP_FREESTANDING) == 0
-        n += ovf_put(m + n, c"\n")
-    *(m + n) = 0
-    *out_len = n
-    add_string(s, StrView { ptr: m, len: n as i64 })
+    StrView { ptr: path.ptr + start, len: path.len - start }
 
-# Stop the program, with `<what>` at `e`, when i1 register `cond` is true;
-# the builder continues in the block where it is false.
-fn ovf_guard(s: *EmitterState, e: *Expr, cond: i32, what: *u8)
-    var mlen: i32 = 0
-    let idx: i32 = ovf_message(s, e, what, @mlen)
+# A trap's message as a string-table entry: `<file>:<line>:<col>: <what> `<op>`\n`.
+# Freestanding, it has no `\n`: ritz_platform_fatal adds it (#4617).
+struct TrapMessage
+    index: i32    # its string-table entry
+    len: i64
+
+fn trap_message(s: *EmitterState, e: *Expr, what: Trap) -> TrapMessage
+    let file: StrView = source_base_name()
+    let op: StrView = binary_op_spelling(e.op)
+    let newline: StrView = if (s.platform_stop & PSTOP_FREESTANDING) == 0 then "\n" else ""
+    var text: String = string_new()
+    format_into(@&text, "{file}:{e.span.line}:{e.span.col}: {trap_text(what)} `{op}`{newline}")
+    TrapMessage { index: intern_string(s, text.as_view()), len: text.len() }
+
+# Stop the program, with `what` at `e`, when i1 register `cond` is true; the
+# builder continues in the block where it is false.
+fn ovf_guard(s: *EmitterState, e: *Expr, cond: i32, what: Trap)
+    let msg: TrapMessage = trap_message(s, e, what)
     let bad: i32 = next_label(s)
     let ok: i32 = next_label(s)
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, cond)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, bad)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, ok)
-    emit_str(s, IR_NL)
+    format_into(s, "  br i1 %.{cond}, label %L{bad}, label %L{ok}\n")
     begin_block(s, bad)
-    emit_str(s, c"  call void @__ritz_overflow_trap(ptr @.str.")
-    emit_int(s, idx as i64)
-    emit_str(s, IR_I64_SEP)
-    emit_int(s, mlen as i64)
-    emit_str(s, c")\n  unreachable\n")
+    format_into(s, "  call void @__ritz_overflow_trap(ptr @.str.{msg.index}, i64 {msg.len})\n  unreachable\n")
     begin_block(s, ok)
     g_ovf_used = g_ovf_used | OVF_TRAP_USED
 
 # The value of a constant operand: a literal, `-literal`, or an integer const
-# no local or global shadows.  1 if `e` is one.
-fn ovf_const_operand(s: *EmitterState, e: *Expr, out: *i64) -> i32
-    if lit_int_value(e, out) == 1
-        return 1
+# no local or global shadows; None for anything else.
+fn ovf_const_operand(s: *EmitterState, e: *Expr) -> Option<i64>
+    var lit: i64 = 0
+    if lit_int_value(e, @lit) == 1
+        return Some(lit)
     if e.kind != ExprKind.Ident
-        return 0
+        return None
     let ce: *ConstEntry = unshadowed_const(s, StrView { ptr: e.ident_ptr, len: e.ident_len as i64 })
     if ce == null or ce.fold_state != CONST_FOLD_DONE or is_int_const_type(ce.const_type) == 0
-        return 0
-    *out = ce.value
-    1
+        return None
+    Some(ce.value)
 
-# Refuse a constant `e` whose operation can only stop the program: 1 if
-# refused.  ritz0's _check_constant_arith, _guard_division and
-# _guard_shift_count on two constants (one, the count, for a shift).
-fn ovf_const_refused(s: *EmitterState, e: *Expr, bits: i32, uns: i32) -> i32
-    var a: i64 = 0
+# What a constant `e` can only do: stop the program (ritz0's
+# _check_constant_arith, _guard_division and _guard_shift_count on two
+# constants, one, the count, for a shift), or nothing.
+fn const_trap(s: *EmitterState, e: *Expr, ty: OperandType) -> Trap
+    let right: Option<i64> = ovf_const_operand(s, e.right)
     var b: i64 = 0
-    if ovf_const_operand(s, e.right, @b) == 0
-        return 0
+    match right
+        Some(v) => b = v
+        None => return Trap.Safe
     if e.op == OpKind.Shl or e.op == OpKind.Shr
-        if b >= 0 and b < bits as i64
-            return 0
-        emit_nd_error_begin(s, e.span.line, e.span.col)
-        eprints("shift count out of range in `")
-    else
-        if ovf_const_operand(s, e.left, @a) == 0
-            return 0
-        if bits < 64 and uns == 1
-            let mask: i64 = (1 << (bits as i64)) - 1
-            a = a & mask
-            b = b & mask
-        if e.op == OpKind.Div or e.op == OpKind.Mod
-            if b == 0
-                emit_nd_error_begin(s, e.span.line, e.span.col)
-                eprints("division by zero in `")
-            else if uns == 0 and b == -1 and a == ovf_type_min(bits)
-                emit_nd_error_begin(s, e.span.line, e.span.col)
-                eprints("integer overflow in `")
-            else
-                return 0
-        else if int_op_overflows(e.op, a, b, bits, uns) == 1
-            emit_nd_error_begin(s, e.span.line, e.span.col)
-            eprints("integer overflow in `")
-        else
-            return 0
-    eprints_cstr(binary_op_spelling(e.op))
-    eprints("`\n")
-    1
+        if b >= 0 and b < ty.bits as i64
+            return Trap.Safe
+        return Trap.ShiftRange
+    var a: i64 = 0
+    match ovf_const_operand(s, e.left)
+        Some(v) => a = v
+        None => return Trap.Safe
+    if ty.bits < 64 and ty.unsigned
+        let mask: i64 = (1 << (ty.bits as i64)) - 1
+        a = a & mask
+        b = b & mask
+    if e.op == OpKind.Div or e.op == OpKind.Mod
+        if b == 0
+            return Trap.DivideByZero
+        if not ty.unsigned and b == -1 and a == ovf_type_min(ty.bits)
+            return Trap.Overflow
+        return Trap.Safe
+    let uns: i32 = if ty.unsigned then 1 else 0
+    if int_op_overflows(e.op, a, b, ty.bits, uns) == 1
+        return Trap.Overflow
+    Trap.Safe
 
-# `{ iN, i1 }`: what a with.overflow intrinsic returns.
-fn ovf_emit_pair_ty(s: *EmitterState, bits: i32)
-    emit_str(s, c"{ i")
-    emit_int(s, bits as i64)
-    emit_str(s, c", i1 }")
+# Refuse a constant `e` whose operation can only stop the program: true if
+# refused.
+fn ovf_const_refused(s: *EmitterState, e: *Expr, ty: OperandType) -> bool
+    let trap: Trap = const_trap(s, e, ty)
+    if trap == Trap.Safe
+        return false
+    emit_nd_error_begin(s, e.span.line, e.span.col)
+    eprint("{trap_text(trap)} `{binary_op_spelling(e.op)}`\n")
+    true
 
-fn ovf_emit_intrinsic(s: *EmitterState, opi: i32, uns: i32, bits: i32)
-    emit_str(s, c"@llvm.")
-    if uns == 1
-        emit_str(s, c"u")
-    else
-        emit_str(s, c"s")
-    if opi == 0
-        emit_str(s, c"add")
-    else if opi == 1
-        emit_str(s, c"sub")
-    else
-        emit_str(s, c"mul")
-    emit_str(s, c".with.overflow.i")
-    emit_int(s, bits as i64)
+# `@llvm.<s|u><add|sub|mul>.with.overflow.i<bits>`: what the intrinsic is called.
+fn ovf_intrinsic(opi: i32, unsigned: bool, bits: i32) -> String
+    let sign: StrView = if unsigned then "u" else "s"
+    let op: StrView = match opi
+        0 => "add"
+        1 => "sub"
+        _ => "mul"
+    var name: String = string_new()
+    format_into(@&name, "@llvm.{sign}{op}.with.overflow.i{bits}")
+    name
 
 # `reg` (an i64) at `bits`, a new register.
 fn ovf_trunc(s: *EmitterState, reg: i32, bits: i32) -> i32
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, IR_TRUNC)
-    emit_reg(s, reg)
-    emit_str(s, c" to i")
-    emit_int(s, bits as i64)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{r} = trunc i64 %.{reg} to i{bits}\n")
     r
 
 # `left op right` (`+`, `-` or `*`) at e's type, stopping on overflow; the
 # result is an i64 register, 0 if the operation was refused.
 fn ovf_checked_arith(s: *EmitterState, e: *Expr, left: i32, right: i32) -> i32
-    var uns: i32 = 0
-    let bits: i32 = ovf_op_type(s, e, @uns)
-    if ovf_const_refused(s, e, bits, uns) == 1
+    let ty: OperandType = ovf_op_type(s, e)
+    let bits: i32 = ty.bits
+    if ovf_const_refused(s, e, ty)
         return 0
     var a: i32 = left
     var b: i32 = right
@@ -2349,100 +1845,58 @@ fn ovf_checked_arith(s: *EmitterState, e: *Expr, left: i32, right: i32) -> i32
         a = ovf_trunc(s, left, bits)
         b = ovf_trunc(s, right, bits)
     let opi: i32 = ovf_op_index(e.op)
+    let uns: i32 = if ty.unsigned then 1 else 0
     g_ovf_used = g_ovf_used | (1 << ((opi * 2 + uns) * 4 + ovf_width_index(bits)))
     let pair: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, pair)
-    emit_str(s, c" = call ")
-    ovf_emit_pair_ty(s, bits)
-    emit_str(s, IR_SP)
-    ovf_emit_intrinsic(s, opi, uns, bits)
-    emit_str(s, c"(i")
-    emit_int(s, bits as i64)
-    emit_str(s, IR_SP)
-    emit_reg(s, a)
-    emit_str(s, c", i")
-    emit_int(s, bits as i64)
-    emit_str(s, IR_SP)
-    emit_reg(s, b)
-    emit_str(s, IR_CLOSE)
+    let callee: String = ovf_intrinsic(opi, ty.unsigned, bits)
+    format_into(s, "  %.{pair} = call {{ i{bits}, i1 }} {callee.as_view()}(i{bits} %.{a}, i{bits} %.{b})\n")
     let val: i32 = ovf_extract(s, pair, bits, 0)
     let flag: i32 = ovf_extract(s, pair, bits, 1)
-    ovf_guard(s, e, flag, c"integer overflow in")
+    ovf_guard(s, e, flag, Trap.Overflow)
     if bits == 64
         return val
     let wide: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, wide)
-    if uns == 1
-        emit_str(s, c" = zext i")
-    else
-        emit_str(s, c" = sext i")
-    emit_int(s, bits as i64)
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, IR_TO_I64)
+    let extend: StrView = if ty.unsigned then "zext" else "sext"
+    format_into(s, "  %.{wide} = {extend} i{bits} %.{val} to i64\n")
     wide
 
 fn ovf_extract(s: *EmitterState, pair: i32, bits: i32, field: i32) -> i32
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, c" = extractvalue ")
-    ovf_emit_pair_ty(s, bits)
-    emit_str(s, IR_SP)
-    emit_reg(s, pair)
-    emit_str(s, IR_COMMA)
-    emit_int(s, field as i64)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{r} = extractvalue {{ i{bits}, i1 }} %.{pair}, {field}\n")
     r
 
 # An i1 register: `reg pred value` on i64s.
-fn ovf_icmp(s: *EmitterState, pred: *u8, reg: i32, value: i64) -> i32
+fn ovf_icmp(s: *EmitterState, pred: StrView, reg: i32, value: i64) -> i32
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, c" = icmp ")
-    emit_str(s, pred)
-    emit_str(s, c" i64 ")
-    emit_reg(s, reg)
-    emit_str(s, IR_COMMA)
-    emit_int(s, value)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{r} = icmp {pred} i64 %.{reg}, {value}\n")
     r
 
 # `/` and `%`: stop on a zero divisor, and on signed MIN / -1 at e's type.
-# The operands are already read back at that type (emit_expr_binary).
-fn ovf_division_guard(s: *EmitterState, e: *Expr, left: i32, right: i32) -> i32
-    var uns: i32 = 0
-    let bits: i32 = ovf_op_type(s, e, @uns)
-    if ovf_const_refused(s, e, bits, uns) == 1
-        return 0
-    ovf_guard(s, e, ovf_icmp(s, c"eq", right, 0), c"division by zero in")
-    if uns == 1
-        return 1
-    let is_min: i32 = ovf_icmp(s, c"eq", left, ovf_type_min(bits))
-    let is_m1: i32 = ovf_icmp(s, c"eq", right, -1)
+# The operands are already read back at that type (emit_expr_binary).  False
+# if the operation was refused.
+fn ovf_division_guard(s: *EmitterState, e: *Expr, left: i32, right: i32) -> bool
+    let ty: OperandType = ovf_op_type(s, e)
+    if ovf_const_refused(s, e, ty)
+        return false
+    ovf_guard(s, e, ovf_icmp(s, "eq", right, 0), Trap.DivideByZero)
+    if ty.unsigned
+        return true
+    let is_min: i32 = ovf_icmp(s, "eq", left, ovf_type_min(ty.bits))
+    let is_m1: i32 = ovf_icmp(s, "eq", right, -1)
     let both: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, both)
-    emit_str(s, c" = and i1 ")
-    emit_reg(s, is_min)
-    emit_str(s, IR_COMMA)
-    emit_reg(s, is_m1)
-    emit_str(s, IR_NL)
-    ovf_guard(s, e, both, c"integer overflow in")
-    1
+    format_into(s, "  %.{both} = and i1 %.{is_min}, %.{is_m1}\n")
+    ovf_guard(s, e, both, Trap.Overflow)
+    true
 
 # `<<` and `>>`: stop unless the count is in 0..width-1.  An unsigned compare
-# catches a negative count too: as a u64 it is far above the width.
-fn ovf_shift_guard(s: *EmitterState, e: *Expr, count: i32) -> i32
-    var uns: i32 = 0
-    let bits: i32 = ovf_op_type(s, e, @uns)
-    if ovf_const_refused(s, e, bits, uns) == 1
-        return 0
-    ovf_guard(s, e, ovf_icmp(s, c"uge", count, bits as i64), c"shift count out of range in")
-    1
+# catches a negative count too: as a u64 it is far above the width.  False if
+# the operation was refused.
+fn ovf_shift_guard(s: *EmitterState, e: *Expr, count: i32) -> bool
+    let ty: OperandType = ovf_op_type(s, e)
+    if ovf_const_refused(s, e, ty)
+        return false
+    ovf_guard(s, e, ovf_icmp(s, "uge", count, ty.bits as i64), Trap.ShiftRange)
+    true
 
 # emit_expr_binary's integer step: the result register of a checked `+ - *`
 # (0 if refused), 0 for a refused `/ % << >>`, else -1: the caller emits the
@@ -2454,10 +1908,10 @@ fn arith_trap_guard(s: *EmitterState, e: *Expr, left: i32, right: i32) -> i32
                 return -1
             return ovf_checked_arith(s, e, left, right)
         OpKind.Div | OpKind.Mod =>
-            if ovf_division_guard(s, e, left, right) == 0
+            if not ovf_division_guard(s, e, left, right)
                 return 0
         OpKind.Shl | OpKind.Shr =>
-            if ovf_shift_guard(s, e, right) == 0
+            if not ovf_shift_guard(s, e, right)
                 return 0
         _ => pass
     -1
@@ -2472,26 +1926,18 @@ pub fn emit_overflow_helpers(s: *EmitterState)
             var bits: i32 = 64
             if bit % 4 < 3
                 bits = 8 << (bit % 4)
-            emit_str(s, c"declare ")
-            ovf_emit_pair_ty(s, bits)
-            emit_str(s, IR_SP)
-            ovf_emit_intrinsic(s, bit / 8, (bit / 4) % 2, bits)
-            emit_str(s, c"(i")
-            emit_int(s, bits as i64)
-            emit_str(s, c", i")
-            emit_int(s, bits as i64)
-            emit_str(s, c")\n")
+            let callee: String = ovf_intrinsic(bit / 8, ((bit / 4) % 2) == 1, bits)
+            format_into(s, "declare {{ i{bits}, i1 }} {callee.as_view()}(i{bits}, i{bits})\n")
         bit += 1
     if (g_ovf_used & OVF_TRAP_USED) != 0
-        emit_str(s, c"define internal void @__ritz_overflow_trap(ptr %msg, i64 %len) cold noinline noreturn nounwind")
+        format_into(s, "define internal void @__ritz_overflow_trap(ptr %msg, i64 %len) cold noinline noreturn nounwind")
         emit_no_red_zone_attr(s)
-        emit_str(s, c" {\nentry:\n")
+        format_into(s, " {{\nentry:\n")
         if (s.platform_stop & PSTOP_FREESTANDING) != 0
             # A kernel stops through its own hook, as ritz0's _emit_trap
             # does: no exit syscall in its IR (AGAST #4607).
             s.platform_stop = s.platform_stop | PSTOP_USED
-            emit_str(s, c"  call void @ritz_platform_fatal(ptr %msg, i64 %len, i32 1)\n  unreachable\n}\n")
+            format_into(s, "  call void @ritz_platform_fatal(ptr %msg, i64 %len, i32 1)\n  unreachable\n}}\n")
         else
-            emit_str(s, c"  %w = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, ptr %msg, i64 %len)\n")
-            emit_str(s, c"  %x = call i64 asm sideeffect \"syscall\", \"=&{rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 60, i64 1)\n  unreachable\n}\n")
+            format_into(s, "  %w = call i64 asm sideeffect \"syscall\", \"=&{{rax}},{{rax}},{{rdi}},{{rsi}},{{rdx}},~{{rcx}},~{{r11}},~{{memory}}\"(i64 1, i64 2, ptr %msg, i64 %len)\n  %x = call i64 asm sideeffect \"syscall\", \"=&{{rax}},{{rax}},{{rdi}},~{{rcx}},~{{r11}},~{{memory}}\"(i64 60, i64 1)\n  unreachable\n}}\n")
     g_ovf_used = 0

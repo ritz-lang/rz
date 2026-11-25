@@ -392,6 +392,8 @@ empty. A note that belongs to a move goes on that check's own entry.
 | `emitter_call_lower` | The call path's parts that never recurse into `emit_expr`: argument and receiver place facts, arg conversions, `sizeof`, enum payload shapes, builtin method pieces, the `CALL_INTRINSICS` table. Below the emitter import cycle (AGAST #1818). |
 | `emitter_decl` | `let` / `var` typing and placement: what a declaration's slot is (the `decl_infer_*` phases, the `infer_*_let` views), tuple bindings. Below the emitter import cycle (AGAST #1818). |
 | `emitter_stmt_parts` | Statement lowering that never recurses into a statement or expression: `for` headers and element slots, if / match arm phi types, array and N-D row copies. Below the emitter import cycle (AGAST #1818). |
+| `ir_operand` | What the text of an IR operand says: the digits of a register after `%.`, and whether it is the base of a GEP or the pointer of a load / store. The decisions behind the `format_into` sink, on StrViews alone so a unit test states them (AGAST #4696). A leaf module. |
+| `text_bridge` | The older `*u8` text APIs read as StrViews: the `(out_name, out_len)` lookups (`named_by`), C-string LLVM type spellings (`llvm_text`). A ported file calls these instead of carrying a `*u8`; each goes when the API it reads is ported (AGAST #4696). |
 | `emitter_ir` | Typed IR builders (casts, load/store, alloca, branches): the spelling of an instruction lives here, not at each site. A leaf module, so it stays out of the emitter import cycle (AGAST #1817). |
 | `emitter_expr` | `emit_expr` dispatch and struct literals. |
 | `emitter_expr_access`, `emitter_expr_arith`, `emitter_expr_call` | Identifiers/index/member; binary/unary; calls and methods. |
@@ -410,6 +412,79 @@ from `grammars/ritz1.grammar` by `tools/ritzgen_py/ritz_generator.py`;
 `ast_helpers` is hand-written: the generator writes only a stub listing the
 constructor names the grammar's actions call, so there is no generated copy
 of it to compare.
+
+## Emitter style
+
+ritz1 is written in Ritz, so its emitter reads as Ritz: `emitter_expr_arith` is the
+reference, and a file ported after it follows what it does (AGAST #4695, #4696).
+The old form was `emit_str(s, c"...")` fragments of NUL-terminated text, with a
+`*u8` for every type name; the counts left of it are pinned down-only per file
+(`tools/ritz1_text_ratchet.py`, run by `make tools-ratchets`).
+
+**Where the IR goes.** One `Arena` per emitted module (`main.ritz` opens it and
+frees it with the module).  `EmitterState.out` is a `String` drawn from it, as is
+the entry-block alloca buffer, each sized once to the room it has (`arena_string`):
+they never grow, so no block is ever realloc'd or freed on its own, which keeps
+the compile valgrind-clean.  An IR that outgrows its buffer stops the compile with
+a message; it is never written truncated.
+
+**How text goes in.** The state is itself the `format_into` sink
+(`EmitterState.push_bytes`): a whole instruction is one call, text is a `StrView`
+literal, and values are interpolated.
+
+```text
+# before: five calls, a `*u8` per fragment
+emit_str(s, IR_INDENT)
+emit_reg(s, left_as_ptr)
+emit_str(s, IR_INTTOPTR)
+emit_reg(s, left_reg)
+emit_str(s, c" to ptr\n")
+
+# after: the instruction, as it is written in the IR
+format_into(s, "  %.{left_as_ptr} = inttoptr i64 %.{left_reg} to ptr\n")
+```
+
+The sink is where IR text becomes IR: a piece that starts a `ret` drops the live
+owned bindings first (what `emit_str` did), and the digits after `%.` are a
+register operand, noted as used by the deferred struct loads and the packed-align
+tracking (what `emit_reg` did).  So `%.{r}` is a register, and nothing else in a
+ported file calls `emit_reg`.  `emit_str` stays only as the shim for the files not
+yet ported, and says so.
+
+**Rules for a ported file.**
+
+1. No `emit_str`, `emit_reg`, `emit_int`, `emit_label`, and no `c"..."`: a `c""`
+   belongs only at a C boundary, which an emitter file has none of.
+2. No `*u8` (or `**u8` out-parameter) in a signature: a name or a type spelling is
+   a `StrView`; a message is a `String` built with `format_into(@&msg, "...")`.  A
+   lookup that still speaks `*u8` is read through `text_bridge`.
+3. An opcode, predicate or type that depends on a kind is a `match` returning a
+   `StrView`, not a ladder of `emit_str` arms:
+
+```text
+# before: twenty arms, each a call
+OpKind.Div =>
+    if uns == 1
+        emit_str(s, c"udiv i64 ")
+    else
+        emit_str(s, c"sdiv i64 ")
+
+# after: the table, then one line that uses it
+OpKind.Div => if unsigned then "udiv i64 " else "sdiv i64 "
+...
+let opcode: StrView = int_binop_opcode(e.op, unsigned, shr_u != 0)
+format_into(s, "  %.{result} = {opcode}%.{left_reg}, %.{scaled_right}\n")
+```
+
+4. Yes/no is a `bool`; a status plus an out-parameter is an `Option` (or a struct);
+   a refusal reason is an `enum` with a text `match` (`Trap` in `emitter_expr_arith`).
+5. A struct type behind `getelementptr %` is opened with `gep_struct_open` (the
+   packed-struct check lives in `emit_name`); any other IR name is `ir_name(n)`.
+6. Behaviour is the contract: `make ritz1-bootstrap` builds the compiler, and
+   `tools/ritz1_ir_identity.py --ref <reference ritz1> --cand build/ritz1` (and the
+   `ritz1_selfhosted` pair) compares the `.ll` of every module of ritz0/test,
+   ritzlib and ritz1/src.  The reference is built from the commit before the port.
+   A port that is not meant to change the IR changes none of it.
 
 ## Build
 

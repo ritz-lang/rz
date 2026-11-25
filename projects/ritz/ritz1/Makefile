@@ -41,6 +41,7 @@ SOURCES = \
 	mono_clone \
 	impl_placement \
 	generic_infer \
+	ir_operand \
 	emitter_core \
 	emitter_types \
 	emitter_call_lower \
@@ -57,6 +58,7 @@ SOURCES = \
 	ref_check \
 	deref_field \
 	ownership \
+	text_bridge \
 	emitter_expr_arith \
 	emitter_expr_access \
 	emitter_expr_call \

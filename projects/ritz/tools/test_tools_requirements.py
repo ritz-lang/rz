@@ -49,6 +49,8 @@ LOCAL_MODULES = {
     "check_liveness",
     "audit_string_literals",
     "check_doc_examples",
+    "ritz1_ir_identity",  # AGAST #4696
+    "ritz1_text_ratchet",
     "check_no_s_strings",
     "check_unused_imports",  # AGAST #3458
     "check_test_tempdirs",
