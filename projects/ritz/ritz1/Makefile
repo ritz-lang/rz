@@ -107,9 +107,11 @@ SOURCES = \
 #   explicit ritzlib_os_env rules below, since the ritzlib_% pattern only
 #   reaches top-level ritzlib/*.ritz.
 # - timer (ritzlib/timer.ritz): RITZ1_PARSE_ONLY's clock (AGAST #4379).
+# - fmt_display/impls/writer/spec: json.ritz's `impl Display for JsonError`
+#   and the `{x}` formatting of main.ritz (AGAST #4690).
 # - errno: io.ritz's vec_read_all_fd returns Err(errno).
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str fmt_digits string strview cmp hash hashmap memory gvec drop option result json span os_env timer errno
+RITZLIB_MODULES = sys io str fmt_digits string strview cmp hash hashmap memory gvec drop option result json span os_env timer errno fmt_display fmt_impls fmt_writer fmt_spec
 
 # Build artifacts
 BUILD_DIR = build
@@ -208,6 +210,26 @@ $(BUILD_DIR)/ritzlib_os_env.o: $(RITZLIB_DIR)/os/env.ritz | $(BUILD_DIR)
 $(BUILD_DIR)/ritzlib_fmt_digits.o: $(RITZLIB_DIR)/fmt/digits.ritz | $(BUILD_DIR)
 	@echo "ritzlib/fmt/digits.ritz → $@ (artifact store)"
 	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_fmt_digits.d.tmp && mv $(BUILD_DIR)/ritzlib_fmt_digits.d.tmp $(BUILD_DIR)/ritzlib_fmt_digits.d
+	$(CAS_OBJ) $< $@
+
+$(BUILD_DIR)/ritzlib_fmt_display.o: $(RITZLIB_DIR)/fmt/display.ritz | $(BUILD_DIR)
+	@echo "ritzlib/fmt/display.ritz → $@ (artifact store)"
+	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_fmt_display.d.tmp && mv $(BUILD_DIR)/ritzlib_fmt_display.d.tmp $(BUILD_DIR)/ritzlib_fmt_display.d
+	$(CAS_OBJ) $< $@
+
+$(BUILD_DIR)/ritzlib_fmt_impls.o: $(RITZLIB_DIR)/fmt/impls.ritz | $(BUILD_DIR)
+	@echo "ritzlib/fmt/impls.ritz → $@ (artifact store)"
+	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_fmt_impls.d.tmp && mv $(BUILD_DIR)/ritzlib_fmt_impls.d.tmp $(BUILD_DIR)/ritzlib_fmt_impls.d
+	$(CAS_OBJ) $< $@
+
+$(BUILD_DIR)/ritzlib_fmt_writer.o: $(RITZLIB_DIR)/fmt/writer.ritz | $(BUILD_DIR)
+	@echo "ritzlib/fmt/writer.ritz → $@ (artifact store)"
+	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_fmt_writer.d.tmp && mv $(BUILD_DIR)/ritzlib_fmt_writer.d.tmp $(BUILD_DIR)/ritzlib_fmt_writer.d
+	$(CAS_OBJ) $< $@
+
+$(BUILD_DIR)/ritzlib_fmt_spec.o: $(RITZLIB_DIR)/fmt/spec.ritz | $(BUILD_DIR)
+	@echo "ritzlib/fmt/spec.ritz → $@ (artifact store)"
+	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_fmt_spec.d.tmp && mv $(BUILD_DIR)/ritzlib_fmt_spec.d.tmp $(BUILD_DIR)/ritzlib_fmt_spec.d
 	$(CAS_OBJ) $< $@
 
 # === Build ritz1 from source using ritz0 ===

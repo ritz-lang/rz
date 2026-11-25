@@ -304,16 +304,12 @@ pub fn u64_to_hex16(h: u64, out: *u8)
         i = i - 1
 
 # Parse a 16-hex-char string back to u64.  Returns 0 on malformed input
-# (only `[0-9a-fA-F]` accepted).  Stops at the first non-hex byte.
-pub fn hex16_to_u64(s: *u8) -> u64
-    if s == null
-        return 0
+# (only `[0-9a-fA-F]` accepted).  Stops at the first non-hex byte or after 16.
+pub fn hex16_to_u64(s: StrView) -> u64
     var v: u64 = 0
-    var i: i32 = 0
-    while i < 16
-        let c: u8 = *(s + i)
-        if c == 0
-            return v
+    var i: i64 = 0
+    while i < 16 and i < s.len
+        let c: u8 = s.get(i)
         var d: u64 = 0
         if c >= '0' and c <= '9'           # '0'-'9'
             d = (c - 48) as u64
@@ -766,89 +762,111 @@ pub fn read_sig_file(sig_path: *u8) -> *SigData
     if buf == null or sz <= 0
         return null
 
-    let root: *JsonValue = sig_parse_root(strview_from_ptr(buf, sz))
+    let parsed: Result<Json, JsonError> = json_parse(strview_from_ptr(buf, sz))
     free(buf)
-    if root == null
-        return null
-    if root.kind != JSON_OBJECT
-        root.free()
-        return null
+    match parsed
+        Ok(root) => return sig_read_root(@root)
+        Err(e) => return null
+
+# The SigData for parsed document `root`, or null if it is not an object.
+fn sig_read_root(root: @Json) -> *SigData
+    match *root
+        Object(_) => pass
+        _ => return null
 
     let sd: *SigData = sig_data_new()
     if sd == null
-        root.free()
         return null
 
-    let sh_node: *JsonValue = sig_field(root, "source_hash")
-    if sh_node != null and sh_node.kind == JSON_STRING and sh_node.str_val != null
-        sd.source_hash = hex16_to_u64(sh_node.str_val)
+    sd.source_hash = sig_hex_field(root, "source_hash")
 
-    # Absent → stays 0, and every reuse check fails closed.
-    let ch_node: *JsonValue = sig_field(root, "compiler_hash")
-    if ch_node != null and ch_node.kind == JSON_STRING and ch_node.str_val != null
-        sd.compiler_hash = hex16_to_u64(ch_node.str_val)
+    # Absent -> stays 0, and every reuse check fails closed.
+    sd.compiler_hash = sig_hex_field(root, "compiler_hash")
 
-    let mir_node: *JsonValue = sig_field(root, "module_ir")
-    if mir_node != null and mir_node.kind == JSON_STRING and mir_node.str_val != null
-        let ml: i64 = mir_node.str_len
-        if ml > 0
-            let mb: *u8 = malloc(ml + 1)
-            if mb != null
-                memcpy(mb, mir_node.str_val, ml + 1)
-                sd.module_ir = mb
-                sd.module_ir_len = ml
+    match sig_str_field(root, "module_ir")
+        Some(ir) =>
+            if ir.len > 0
+                let mb: *u8 = malloc(ir.len + 1)
+                if mb != null
+                    memcpy(mb, ir.ptr, ir.len)
+                    *(mb + ir.len) = 0
+                    sd.module_ir = mb
+                    sd.module_ir_len = ir.len
+        None => pass
 
-    let ih_node: *JsonValue = sig_field(root, "import_hashes")
-    if ih_node != null and ih_node.kind == JSON_OBJECT
-        sig_parse_deps(sd, ih_node)
+    match root.get_field("import_hashes")
+        Some(ih) =>
+            if sig_is_object(ih)
+                sig_parse_deps(sd, ih)
+        None => pass
 
-    let im_node: *JsonValue = sig_field(root, "import_misses")
-    if im_node != null and im_node.kind == JSON_ARRAY
-        sig_parse_misses(sd, im_node)
+    match root.get_field("import_misses")
+        Some(im) =>
+            if sig_is_array(im)
+                sig_parse_misses(sd, im)
+        None => pass
 
-    root.free()
     return sd
 
-# The parsed sig document, or null if `text` is not JSON (cold start).
-fn sig_parse_root(text: StrView) -> *JsonValue
-    match json_parse(text)
-        Ok(v) => v
-        Err(e) => null as *JsonValue
+fn sig_is_object(v: @Json) -> bool
+    match *v
+        Object(_) => return true
+        _ => return false
 
-# Field `key` of `root`, or null if absent: read_sig_file checks each field's
-# kind itself, so a missing one and a wrong-kind one take the same path.
-fn sig_field(root: *JsonValue, key: StrView) -> *JsonValue
+fn sig_is_array(v: @Json) -> bool
+    match *v
+        Array(_) => return true
+        _ => return false
+
+# Field `key` of `root` as a string, or None if absent or not a string:
+# a missing field and a wrong-kind one take the same path.
+fn sig_str_field(root: @Json, key: StrView) -> Option<StrView>
     match root.get_field(key)
-        Some(v) => v
-        None => null as *JsonValue
+        Some(v) =>
+            let j: @Json = v
+            return j.get_string()
+        None => return None
+
+# Field `key` as a hex hash; 0 if absent or not a string.
+fn sig_hex_field(root: @Json, key: StrView) -> u64
+    match sig_str_field(root, key)
+        Some(s) => return hex16_to_u64(s)
+        None => return 0
 
 # Fill `sd`'s missed candidates from the `import_misses` array.  Any entry
 # that is not a non-empty string, or that cannot be stored, leaves the record
 # incomplete (`has_misses == 0`), so the sig is not reused.
-fn sig_parse_misses(sd: *SigData, arr: *JsonValue)
+fn sig_parse_misses(sd: *SigData, arr: @Json)
+    let n: i64 = arr.array_len()
     var i: i64 = 0
-    while i < arr.count
-        let val: *JsonValue = *(arr.items + i)
-        if val == null or val.kind != JSON_STRING or val.str_val == null or val.str_len <= 0
-            return
-        if sig_data_add_miss(sd, StrView { ptr: (val.str_val), len: (val.str_len) }) == 0
-            return
+    while i < n
+        match arr.get_index(i)
+            Some(item) =>
+                let j: @Json = item
+                match j.get_string()
+                    Some(s) =>
+                        if s.len <= 0
+                            return
+                        if sig_data_add_miss(sd, s) == 0
+                            return
+                    None => return
+            None => return
         i = i + 1
     sd.has_misses = 1
 
 # Fill `sd`'s dependencies from the `import_hashes` object.  An entry that is
 # not a string hash is recorded with hash 0, which no real file matches.
-fn sig_parse_deps(sd: *SigData, obj: *JsonValue)
+fn sig_parse_deps(sd: *SigData, obj: @Json)
     sd.has_deps = 1
+    let members: Span<JsonMember> = obj.members()
     var i: i64 = 0
-    while i < obj.count
-        let key: *u8 = *(obj.keys + i)
-        let val: *JsonValue = *(obj.items + i)
+    while i < members.len
+        let m: *JsonMember = members.get_ptr(i)
         var h: u64 = 0
-        if val != null and val.kind == JSON_STRING and val.str_val != null
-            h = hex16_to_u64(val.str_val)
-        if key != null
-            sig_data_add_dep(sd, StrView { ptr: (key), len: (strlen(key)) }, h)
+        match m.value.get_string()
+            Some(s) => h = hex16_to_u64(s)
+            None => pass
+        sig_data_add_dep(sd, m.key.as_view(), h)
         i = i + 1
 
 

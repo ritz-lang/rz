@@ -116,25 +116,25 @@ pub fn config_default(cfg: *ValetConfig)
 # JSON parsing helpers
 # ============================================================================
 
-# Field `key` of `obj`, or null if absent.  The config_get_* / copy helpers
+# Field `key` of `obj`, None if absent.  The config_get_* / copy helpers
 # below check each value's kind themselves and fall back to the default, so a
 # missing field and a wrong-kind one take the same path.
-fn config_field(obj: *JsonValue, key: StrView) -> *JsonValue
-    match obj.get_field(key)
-        Some(v) => v
-        None => null as *JsonValue
+fn config_field(obj: @Json, key: StrView) -> Option<@Json>
+    obj.get_field(key)
 
 
 # Copy a JSON string value into a fixed-size buffer, cut to fit with its
 # NUL.  Returns 1, or 0 (leaving `dst` alone) if the value isn't a string.
-pub fn config_copy_string(dst: Span<u8>, json_val: *JsonValue) -> i32
-    if json_val == null
-        return 0
-    match json_val.get_string()
-        Some(s) =>
-            let n: i64 = dst.to(dst.len - 1).copy_from(s.as_bytes())
-            dst[n] = 0
-            1
+pub fn config_copy_string(dst: Span<u8>, json_val: Option<@Json>) -> i32
+    match json_val
+        Some(v) =>
+            let r: @Json = v
+            match r.get_string()
+                Some(s) =>
+                    let n: i64 = dst.to(dst.len - 1).copy_from(s.as_bytes())
+                    dst[n] = 0
+                    1
+                None => 0
         None => 0
 
 
@@ -147,82 +147,91 @@ pub fn config_str(buf: Span<u8>) -> StrView
 
 
 # Get an integer from a JSON value with a default
-pub fn config_get_int(json_val: *JsonValue, default_val: i32) -> i32
-    if json_val == null
-        return default_val
-    if json_val.kind != JSON_NUMBER
-        return default_val
-    return json_val.num_val as i32
+pub fn config_get_int(json_val: Option<@Json>, default_val: i32) -> i32
+    match json_val
+        Some(v) =>
+            let r: @Json = v
+            match r.get_number()
+                Some(n) => n as i32
+                None => default_val
+        None => default_val
 
 
 # Get a boolean from a JSON value with a default
-pub fn config_get_bool(json_val: *JsonValue, default_val: i32) -> i32
-    if json_val == null
-        return default_val
-    if json_val.kind != JSON_BOOL
-        return default_val
-    return json_val.bool_val
+pub fn config_get_bool(json_val: Option<@Json>, default_val: i32) -> i32
+    match json_val
+        Some(v) =>
+            let r: @Json = v
+            match r.get_bool()
+                Some(b) => b as i32
+                None => default_val
+        None => default_val
 
 
 # ============================================================================
 # Configuration parsing
 # ============================================================================
 
-# Parse server section
-pub fn config_parse_server(cfg: *ValetConfig, server_obj: *JsonValue)
-    if server_obj == null
-        return
-    if server_obj.kind != JSON_OBJECT
-        return
+# The section `sec` if it is an object; None if absent or of another kind.
+fn config_section(sec: Option<@Json>) -> Option<@Json>
+    match sec
+        Some(v) =>
+            if config_is_object(v)
+                Some(v)
+            else
+                None
+        None => None
 
-    cfg.port = config_get_int(config_field(server_obj, "port"), cfg.port)
-    cfg.workers = config_get_int(config_field(server_obj, "workers"), cfg.workers)
-    cfg.multishot = config_get_bool(config_field(server_obj, "multishot"), cfg.multishot)
-    cfg.use_send_zc = config_get_bool(config_field(server_obj, "use_send_zc"), cfg.use_send_zc)
-    cfg.backlog = config_get_int(config_field(server_obj, "backlog"), cfg.backlog)
-    cfg.sndbuf = config_get_int(config_field(server_obj, "sndbuf"), cfg.sndbuf)
+
+fn config_is_object(v: @Json) -> bool
+    match *v
+        Object(_) => true
+        _ => false
+
+
+# Parse server section
+pub fn config_parse_server(cfg: *ValetConfig, server: Option<@Json>)
+    match config_section(server)
+        Some(obj) =>
+            cfg.port = config_get_int(config_field(obj, "port"), cfg.port)
+            cfg.workers = config_get_int(config_field(obj, "workers"), cfg.workers)
+            cfg.multishot = config_get_bool(config_field(obj, "multishot"), cfg.multishot)
+            cfg.use_send_zc = config_get_bool(config_field(obj, "use_send_zc"), cfg.use_send_zc)
+            cfg.backlog = config_get_int(config_field(obj, "backlog"), cfg.backlog)
+            cfg.sndbuf = config_get_int(config_field(obj, "sndbuf"), cfg.sndbuf)
+        None => pass
 
 
 # Parse limits section
-pub fn config_parse_limits(cfg: *ValetConfig, limits_obj: *JsonValue)
-    if limits_obj == null
-        return
-    if limits_obj.kind != JSON_OBJECT
-        return
-
-    cfg.max_connections = config_get_int(config_field(limits_obj, "max_connections"), cfg.max_connections)
-    cfg.max_request_size = config_get_int(config_field(limits_obj, "max_request_size"), cfg.max_request_size)
-    cfg.keepalive_requests = config_get_int(config_field(limits_obj, "keepalive_requests"), cfg.keepalive_requests)
-    cfg.idle_timeout = config_get_int(config_field(limits_obj, "idle_timeout"), cfg.idle_timeout)
+pub fn config_parse_limits(cfg: *ValetConfig, limits: Option<@Json>)
+    match config_section(limits)
+        Some(obj) =>
+            cfg.max_connections = config_get_int(config_field(obj, "max_connections"), cfg.max_connections)
+            cfg.max_request_size = config_get_int(config_field(obj, "max_request_size"), cfg.max_request_size)
+            cfg.keepalive_requests = config_get_int(config_field(obj, "keepalive_requests"), cfg.keepalive_requests)
+            cfg.idle_timeout = config_get_int(config_field(obj, "idle_timeout"), cfg.idle_timeout)
+        None => pass
 
 
 # Parse static section
-pub fn config_parse_static(cfg: *ValetConfig, static_obj: *JsonValue)
-    if static_obj == null
-        return
-    if static_obj.kind != JSON_OBJECT
-        return
-
-    let prefix_val: *JsonValue = config_field(static_obj, "prefix")
-    let root_val: *JsonValue = config_field(static_obj, "root")
-
-    if config_copy_string(@cfg.static_prefix, prefix_val) != 0
-        if config_copy_string(@cfg.static_root, root_val) != 0
-            cfg.static_enabled = 1
+pub fn config_parse_static(cfg: *ValetConfig, static_sec: Option<@Json>)
+    match config_section(static_sec)
+        Some(obj) =>
+            if config_copy_string(@cfg.static_prefix, config_field(obj, "prefix")) != 0
+                if config_copy_string(@cfg.static_root, config_field(obj, "root")) != 0
+                    cfg.static_enabled = 1
+        None => pass
 
 
 # Parse TLS section
-pub fn config_parse_tls(cfg: *ValetConfig, tls_obj: *JsonValue)
-    if tls_obj == null
-        return
-    if tls_obj.kind != JSON_OBJECT
-        return
-
-    cfg.tls_enabled = config_get_bool(config_field(tls_obj, "enabled"), cfg.tls_enabled)
-
-    if cfg.tls_enabled != 0
-        config_copy_string(@cfg.tls_cert, config_field(tls_obj, "cert"))
-        config_copy_string(@cfg.tls_key, config_field(tls_obj, "key"))
+pub fn config_parse_tls(cfg: *ValetConfig, tls: Option<@Json>)
+    match config_section(tls)
+        Some(obj) =>
+            cfg.tls_enabled = config_get_bool(config_field(obj, "enabled"), cfg.tls_enabled)
+            if cfg.tls_enabled != 0
+                config_copy_string(@cfg.tls_cert, config_field(obj, "cert"))
+                config_copy_string(@cfg.tls_key, config_field(obj, "key"))
+        None => pass
 
 
 # ============================================================================
@@ -233,7 +242,7 @@ pub fn config_parse_tls(cfg: *ValetConfig, tls_obj: *JsonValue)
 # Returns 0 on success, negative on error
 pub fn config_parse_json(cfg: *ValetConfig, json: StrView) -> i32
     match json_parse(json)
-        Ok(root) => config_apply_root(cfg, root)
+        Ok(root) => config_apply_root(cfg, @root)
         Err(err) => config_parse_error(err)
 
 
@@ -242,12 +251,11 @@ fn config_parse_error(err: JsonError) -> i32
     return -1
 
 
-# Apply a parsed document to `cfg` and free it.  Returns 0, or -2 if the root
-# is not an object.
-fn config_apply_root(cfg: *ValetConfig, root: *JsonValue) -> i32
-    if root.kind != JSON_OBJECT
+# Apply a parsed document to `cfg`; it frees itself on return.  Returns 0, or
+# -2 if the root is not an object.
+fn config_apply_root(cfg: *ValetConfig, root: @Json) -> i32
+    if not config_is_object(root)
         eprints("config: root must be an object\n")
-        root.free()
         return -2
 
     # Parse each section
@@ -255,8 +263,6 @@ fn config_apply_root(cfg: *ValetConfig, root: *JsonValue) -> i32
     config_parse_limits(cfg, config_field(root, "limits"))
     config_parse_static(cfg, config_field(root, "static"))
     config_parse_tls(cfg, config_field(root, "tls"))
-
-    root.free()
     return 0
 
 

@@ -1,21 +1,30 @@
-# ritzlib/json.ritz - JSON Parser
+# ritzlib/json.ritz - JSON parser and writer: json_parse(StrView) -> Result<Json, JsonError>
 #
-# A simple JSON parser for reading .ritz-meta files.
+# A JSON parser and writer for .ritz-meta files, LSP messages and configs.
 # Supports: objects, arrays, strings, numbers, booleans, null.
 #
-# Usage (AGAST #1482):
-#   match json_parse(input)                     # input: StrView
-#       Ok(root) => use_root(root)              # root.free() when done
-#       Err(err) => report(err.code, err.pos)   # json_error_message(err.code)
+# A document is a `Json`, an enum that owns its parts: a `Str` holds a String,
+# an `Array` a Vec<Json>, an `Object` a Vec<JsonMember> (key String + value).
+# It frees itself when its binding ends; there is nothing to free by hand.
 #
-# Lookups return Option rather than a null/0 sentinel:
-#   obj.get_field("key") -> Option<*JsonValue>   (key: StrView)
-#   arr.get_index(i) -> Option<*JsonValue>
-#   v.get_string() -> Option<StrView>      (borrows from v)
-#   v.get_number() -> Option<i64>
-#   v.get_bool() -> Option<bool>
-# Each is None for a missing field, an out-of-range index, a null `v` or a
-# value of another kind.  The jp_* parser primitives are private.
+# Usage (AGAST #4690):
+#     match json_parse(input)                     # input: StrView
+#         Ok(root) => use_root(root)
+#         Err(err) => report(err)                 # {err} prints err.message()
+#
+# Lookups borrow from the document and return Option, so a missing field, an
+# out-of-range index and a value of another kind are all None:
+#     root.get_field("key") -> Option<@Json>      (key: StrView)
+#     arr.get_index(i)      -> Option<@Json>
+#     v.get_string()        -> Option<StrView>    (borrows from v)
+#     v.get_number()        -> Option<i64>
+#     v.get_bool()          -> Option<bool>
+# or take the parts: `match *v` on Array(xs) / Object(ms), or v.items() and
+# v.members().  The jp_* parser primitives are private.
+#
+# Numbers are i64: the integer part, truncated toward zero and saturated at
+# the i64 bounds; fraction digits are consumed and dropped.  Object keys are
+# Strings with a length, so a key may hold a decoded \u0000.
 
 import ritzlib.sys
 import ritzlib.str
@@ -25,233 +34,120 @@ import ritzlib.result
 import ritzlib.option
 import ritzlib.strview
 import ritzlib.string
-import ritzlib.fmt.digits  # JsonValue.emit's numbers
+import ritzlib.ptr
+import ritzlib.fmt.digits  # Json.emit's numbers
+import ritzlib.fmt.display  # impl Display for JsonError
+import ritzlib.fmt.impls    # fmt_show_strview
+import ritzlib.fmt.writer   # Writer
 
 # =============================================================================
-# JSON Value Types
+# Types
 # =============================================================================
 
-const JSON_NULL: i32 = 0
-const JSON_BOOL: i32 = 1
-const JSON_NUMBER: i32 = 2
-const JSON_STRING: i32 = 3
-const JSON_ARRAY: i32 = 4
-const JSON_OBJECT: i32 = 5
+# One `"key": value` pair of an object, in document order.
+pub struct JsonMember
+    key: String
+    value: Json
 
-struct JsonValue
-    kind: i32           # JSON_* type constant
-    # For primitives:
-    bool_val: i32       # 0 or 1 for booleans
-    num_val: i64        # Integer value for numbers
-    float_val: i64      # Unused for now (would need float support)
-    str_val: *u8        # Heap-allocated string (null-terminated)
-    str_len: i64        # String length
-    # For arrays/objects:
-    items: **JsonValue  # Array of JsonValue pointers
-    count: i64          # Number of items
-    keys: **u8          # For objects: array of key strings
+pub enum Json
+    Null
+    Bool(bool)
+    Number(i64)
+    Str(String)
+    Array(Vec<Json>)
+    Object(Vec<JsonMember>)
 
-# Error codes for JSON parsing
-const JSON_ERR_NONE: i32 = 0
-const JSON_ERR_UNEXPECTED_CHAR: i32 = 1
-const JSON_ERR_UNTERMINATED_STRING: i32 = 2
-const JSON_ERR_EXPECTED_COLON: i32 = 3
-const JSON_ERR_EXPECTED_BRACKET: i32 = 4
-const JSON_ERR_EXPECTED_BRACE: i32 = 5
-const JSON_ERR_OUT_OF_MEMORY: i32 = 6
-const JSON_ERR_INVALID_ESCAPE: i32 = 7   # escape RFC 8259 lacks (\q), bad \uXXXX hex,
-                                         # unpaired surrogate, or \u0000 in a key
-const JSON_ERR_CONTROL_CHAR: i32 = 8     # raw U+0000-U+001F inside a string (RFC 8259
-                                         # §7 requires them escaped); pos = that byte
+pub enum JsonErrorKind
+    UnexpectedChar        # a value was expected here, or the input is empty
+    UnterminatedString    # the input ended inside a string
+    ExpectedColon         # an object key without its ':'
+    ExpectedBracket       # an array without its closing ']'
+    ExpectedBrace         # an object without its closing '}'
+    OutOfMemory
+    InvalidEscape         # an escape RFC 8259 lacks (\q), bad \uXXXX hex, an
+                          # unpaired surrogate; pos = the backslash
+    ControlChar           # raw U+0000-U+001F inside a string (RFC 8259 §7
+                          # requires them escaped); pos = that byte
 
-# Error type for JSON parsing
-struct JsonError
-    code: i32           # JSON_ERR_* error code
-    pos: i64            # Position of error in input
+pub struct JsonError
+    kind: JsonErrorKind
+    pos: i64              # byte offset of the error in the input
+
+impl JsonError
+    pub fn message(self: @JsonError) -> StrView
+        match self.kind
+            UnexpectedChar => "unexpected character"
+            UnterminatedString => "unterminated string"
+            ExpectedColon => "expected ':'"
+            ExpectedBracket => "expected ']'"
+            ExpectedBrace => "expected '}'"
+            OutOfMemory => "out of memory"
+            InvalidEscape => "invalid escape"
+            ControlChar => "control character in string"
+
+impl Display for JsonError
+    fn show(self: @JsonError, w: @&Writer) -> i64
+        fmt_show_strview(self.message(), w)
 
 # =============================================================================
-# JSON Parser State
+# Ownership
+# =============================================================================
+
+# A Vec frees its buffer, not the elements it holds, so a Json frees its
+# children itself: its drop moves each one out of its Vec, and the moved-out
+# value drops where it is bound.  The parser calls the same drains on a
+# half-built Vec when a parse fails.
+fn json_drain_items(xs: @&Vec<Json>)
+    let base: *Json = xs.as_ptr()
+    let n: i64 = xs.len
+    xs.len = 0
+    var i: i64 = 0
+    while i < n
+        let child: Json = ptr_read<Json>(base + i)
+        i += 1
+
+fn json_drain_members(ms: @&Vec<JsonMember>)
+    let base: *JsonMember = ms.as_ptr()
+    let n: i64 = ms.len
+    ms.len = 0
+    var i: i64 = 0
+    while i < n
+        let member: JsonMember = ptr_read<JsonMember>(base + i)
+        i += 1
+
+impl Drop for Json
+    fn drop(self: @&Json)
+        match *self
+            Array(xs) =>
+                json_drain_items(@&xs)
+            Object(ms) =>
+                json_drain_members(@&ms)
+            _ =>
+                pass
+
+# =============================================================================
+# Parser
 # =============================================================================
 
 struct JsonParser
-    src: *u8            # Input buffer
-    len: i64            # Input length
+    src: StrView        # Input
     pos: i64            # Current position
-    err: i32            # JSON_ERR_* for a failure more specific than "unexpected
-                        # character" (set where the parse returns null)
 
-# =============================================================================
-# Helper Functions
-# =============================================================================
+# What `\uXXXX` (or a surrogate pair) decoded to.
+struct JsonEscape
+    cp: i32             # the code point
+    used: i64           # bytes consumed from the 'u' on (5 or 11)
 
-# Raw allocation of a zeroed JsonValue; null when malloc fails.  Private: the
-# public constructor below turns that failure into None.
-fn json_value_alloc_raw() -> *JsonValue
-    let v: *JsonValue = malloc(sizeof(JsonValue)) as *JsonValue
-    if v == null
-        return null
-    # Zero all fields
-    v.kind = JSON_NULL
-    v.bool_val = 0
-    v.num_val = 0
-    v.float_val = 0
-    v.str_val = null
-    v.str_len = 0
-    v.items = null
-    v.count = 0
-    v.keys = null
-    return v
-
-# A zeroed JsonValue, or None when the allocation fails.
-pub fn json_alloc_value() -> Option<*JsonValue>
-    let v: *JsonValue = json_value_alloc_raw()
-    if v == null
-        return None
-    return Some(v)
-
-# Free `v`; the caller's `*JsonValue` from json_parse fits `@&JsonValue`.
-impl JsonValue
-    pub fn free(self: @&JsonValue)
-        json_free_raw(self)
-
-# The tree's own recursion: a private raw entry point, as S-PTR-1 allows for
-# the memory a type owns.  json_free above is the API.
-fn json_free_raw(v: *JsonValue)
-    if v == null
-        return
-
-    # Free string value
-    if v.str_val != null
-        free(v.str_val)
-
-    # Free array/object items recursively
-    if v.items != null
-        for i in 0..v.count
-            json_free_raw(*(v.items + i))
-        free(v.items as *u8)
-
-    # Free object keys
-    if v.keys != null
-        for i in 0..v.count
-            let key: *u8 = *(v.keys + i)
-            if key != null
-                free(key)
-        free(v.keys as *u8)
-
-    free(v as *u8)
-
-# =============================================================================
-# Parser Primitives
-# =============================================================================
-
-fn jp_at_end(p: *JsonParser) -> i32
-    return (p.pos >= p.len) as i32
-
-fn jp_peek(p: *JsonParser) -> i32
-    if p.pos >= p.len
-        return 0
-    return *(p.src + p.pos) as i32
-
-fn jp_advance(p: *JsonParser) -> i32
-    if p.pos >= p.len
-        return 0
-    let ch: i32 = *(p.src + p.pos) as i32
-    p.pos = p.pos + 1
-    return ch
-
-fn jp_skip_ws(p: *JsonParser)
-    while p.pos < p.len
-        let ch: i32 = jp_peek(p)
-        if ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r'
-            jp_advance(p)
-        else
-            return
-
-fn jp_expect(p: *JsonParser, ch: i32) -> i32
-    jp_skip_ws(p)
-    if jp_peek(p) == ch
-        jp_advance(p)
-        return 1
-    return 0
-
-fn jp_match_str(p: *JsonParser, s: *u8) -> i32
-    var len: i64 = strlen(s)
-    if p.pos + len > p.len
-        return 0
-    for i in 0..len
-        if *(p.src + p.pos + i) != *(s + i)
-            return 0
-    p.pos = p.pos + len
-    return 1
-
-# =============================================================================
-# Parse Functions
-# =============================================================================
-# Note: ritz0 pre-registers all function signatures, so these can call each other.
-
-fn jp_parse_value(p: *JsonParser) -> *JsonValue
-    jp_skip_ws(p)
-    let ch: i32 = jp_peek(p)
-
-    # String
-    if ch == '"'  # '"'
-        return jp_parse_string(p, 0)
-
-    # Number (including negative)
-    if ch == '-' or (ch >= '0' and ch <= '9')  # '-' or digit
-        return jp_parse_number(p)
-
-    # Array
-    if ch == '['  # '['
-        return jp_parse_array(p)
-
-    # Object
-    if ch == '{'  # '{'
-        return jp_parse_object(p)
-
-    # true
-    if ch == 't'  # 't'
-        if jp_match_str(p, c"true") != 0
-            let v: *JsonValue = match json_alloc_value()
-                Some(x) => x
-                None => return null
-            v.kind = JSON_BOOL
-            v.bool_val = 1
-            return v
-        return null
-
-    # false
-    if ch == 'f'  # 'f'
-        if jp_match_str(p, c"false") != 0
-            let v: *JsonValue = match json_alloc_value()
-                Some(x) => x
-                None => return null
-            v.kind = JSON_BOOL
-            v.bool_val = 0
-            return v
-        return null
-
-    # null
-    if ch == 'n'  # 'n'
-        if jp_match_str(p, c"null") != 0
-            let v: *JsonValue = match json_alloc_value()
-                Some(x) => x
-                None => return null
-            # kind is already JSON_NULL
-            return v
-        return null
-
-    return null
-
-# Value of the four hex digits at src[pos..pos+4), or -1 if one is not a hex
+# Value of the four hex digits at src[pos..pos+4), or None if one is not a hex
 # digit or `end` comes first.
-fn jp_hex4(src: *u8, pos: i64, end: i64) -> i32
+fn jp_hex4(src: StrView, pos: i64, end: i64) -> Option<i32>
     if pos + 4 > end
-        return 0 - 1
+        return None
     var val: i32 = 0
     var k: i64 = 0
     while k < 4
-        let c: i32 = *(src + pos + k) as i32
+        let b: u8 = src.get(pos + k)
+        let c: i32 = b as i32
         var d: i32 = 0 - 1
         if c >= 48 and c <= 57          # '0'-'9'
             d = c - 48
@@ -260,514 +156,406 @@ fn jp_hex4(src: *u8, pos: i64, end: i64) -> i32
         else if c >= 65 and c <= 70     # 'A'-'F'
             d = c - 55
         if d < 0
-            return 0 - 1
+            return None
         val = val * 16 + d
         k += 1
-    return val
+    Some(val)
 
-# Write code point `cp` (U+0000..U+10FFFF, not a surrogate) to `dst` as UTF-8;
-# returns the byte count, 1-4.
-fn jp_put_utf8(dst: *u8, cp: i32) -> i64
+# Append code point `cp` (U+0000..U+10FFFF, not a surrogate) to `out` as
+# UTF-8; false if the String could not grow.
+fn jp_put_utf8(out: @&String, cp: i32) -> bool
     if cp < 0x80
-        *dst = cp as u8
-        return 1
+        return out.push(cp as u8)
     if cp < 0x800
-        *dst = (0xC0 | (cp >> 6)) as u8
-        *(dst + 1) = (0x80 | (cp & 0x3F)) as u8
-        return 2
+        return out.push((0xC0 | (cp >> 6)) as u8) and out.push((0x80 | (cp & 0x3F)) as u8)
     if cp < 0x10000
-        *dst = (0xE0 | (cp >> 12)) as u8
-        *(dst + 1) = (0x80 | ((cp >> 6) & 0x3F)) as u8
-        *(dst + 2) = (0x80 | (cp & 0x3F)) as u8
-        return 3
-    *dst = (0xF0 | (cp >> 18)) as u8
-    *(dst + 1) = (0x80 | ((cp >> 12) & 0x3F)) as u8
-    *(dst + 2) = (0x80 | ((cp >> 6) & 0x3F)) as u8
-    *(dst + 3) = (0x80 | (cp & 0x3F)) as u8
-    return 4
+        return out.push((0xE0 | (cp >> 12)) as u8) and out.push((0x80 | ((cp >> 6) & 0x3F)) as u8) and out.push((0x80 | (cp & 0x3F)) as u8)
+    out.push((0xF0 | (cp >> 18)) as u8) and out.push((0x80 | ((cp >> 12) & 0x3F)) as u8) and out.push((0x80 | ((cp >> 6) & 0x3F)) as u8) and out.push((0x80 | (cp & 0x3F)) as u8)
 
-# Fail a string parse on an invalid escape: report JSON_ERR_INVALID_ESCAPE at
-# `at`, the offset of the escape's backslash.
-fn jp_bad_escape(p: *JsonParser, str: *u8, at: i64) -> *JsonValue
-    free(str)
-    p.err = JSON_ERR_INVALID_ESCAPE
-    p.pos = at
-    return null
-
-# Code point of the \uXXXX escape whose 'u' is at src[pos], combining a
-# surrogate pair \uD8xx\uDCxx into one; -1 if the hex is bad or a surrogate
-# is unpaired.  *used is set to the bytes consumed from the 'u' on (5 or 11).
-fn jp_decode_u(src: *u8, pos: i64, end: i64, used: *i64) -> i32
-    let hi: i32 = jp_hex4(src, pos + 1, end)
-    if hi < 0 or (hi >= 0xDC00 and hi <= 0xDFFF)
-        return 0 - 1                    # bad hex, or a low surrogate first
-    *used = 5
+# The \uXXXX escape whose 'u' is at src[pos], combining a surrogate pair
+# \uD8xx\uDCxx into one code point; None if the hex is bad or a surrogate is
+# unpaired.
+fn jp_decode_u(src: StrView, pos: i64, end: i64) -> Option<JsonEscape>
+    let hi: i32 = match jp_hex4(src, pos + 1, end)
+        Some(h) => h
+        None => return None
+    if hi >= 0xDC00 and hi <= 0xDFFF
+        return None                     # a low surrogate first
     if hi < 0xD800 or hi > 0xDBFF
-        return hi
+        return Some(JsonEscape { cp: hi, used: 5 })
     # A high surrogate must be followed directly by \u and a low surrogate.
     let lo_at: i64 = pos + 5
     if lo_at + 1 >= end
-        return 0 - 1
-    if *(src + lo_at) as i32 != 92 or *(src + lo_at + 1) as i32 != 117   # '\\' 'u'
-        return 0 - 1
-    let lo: i32 = jp_hex4(src, lo_at + 2, end)
-    if lo < 0xDC00 or lo > 0xDFFF       # also catches lo == -1 (bad hex)
-        return 0 - 1
-    *used = 11
-    return 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+        return None
+    if src.get(lo_at) != 92 or src.get(lo_at + 1) != 117   # '\\' 'u'
+        return None
+    let lo: i32 = match jp_hex4(src, lo_at + 2, end)
+        Some(l) => l
+        None => return None
+    if lo < 0xDC00 or lo > 0xDFFF
+        return None
+    Some(JsonEscape { cp: 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00), used: 11 })
 
-# Parse the string at p.pos.  `is_key` != 0 for an object key, which is kept
-# as a NUL-terminated *u8 with no length (JsonValue.keys), so \u0000 is rejected
-# there: json_get_field would otherwise match {"a\u0000b": 1} on "a".  A string
-# value keeps \u0000: str_len counts it and json_get_string returns all bytes.
-# A raw U+0000-U+001F byte is JSON_ERR_CONTROL_CHAR in keys and values alike
-# (AGAST #3941), so no raw NUL reaches a key either.
-fn jp_parse_string(p: *JsonParser, is_key: i32) -> *JsonValue
-    if jp_peek(p) != 34  # '"'
-        return null
-    jp_advance(p)  # Skip opening quote
+impl JsonParser
+    fn fail(self: @JsonParser, kind: JsonErrorKind) -> JsonError
+        JsonError { kind: kind, pos: self.pos }
 
-    let start: i64 = p.pos
+    # The byte at pos, or -1 at the end.
+    fn peek(self: @JsonParser) -> i32
+        if self.pos >= self.src.len
+            return 0 - 1
+        let b: u8 = self.src.get(self.pos)   # bound first: a method result `as i32` sign-extends
+        b as i32
 
-    # First pass: find the closing quote and bound the decoded length.  It
-    # counts 1 per escape plus 1 per other byte, so \uXXXX counts 5 (decodes
-    # to at most 3 bytes) and a surrogate pair counts 10 (decodes to 4): the
-    # estimate never undercounts, because no escape decodes to more bytes
-    # than it occupies in the input.
-    var escaped_len: i64 = 0
-    while p.pos < p.len
-        let ch: i32 = jp_peek(p)
-        if ch == '"'  # closing quote
-            break
-        if ch < 0x20
-            # RFC 8259 §7: U+0000-U+001F must be escaped.  Copying one raw
-            # would also let a raw NUL truncate a key, as \u0000 did (#3918).
-            # p.pos is already at the byte, which is where the error points.
-            p.err = JSON_ERR_CONTROL_CHAR
-            return null
-        if ch == '\\'  # backslash
-            jp_advance(p)
-            if p.pos < p.len
-                jp_advance(p)
-            escaped_len += 1
-        else
-            jp_advance(p)
-            escaped_len += 1
+    fn skip_ws(self: @&JsonParser)
+        while self.pos < self.src.len
+            let ch: i32 = self.peek()
+            if ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r'
+                self.pos += 1
+            else
+                return
 
-    let raw_len: i64 = p.pos - start
+    # Consume `lit` if the input continues with it.
+    fn match_lit(self: @&JsonParser, lit: StrView) -> bool
+        if self.pos + lit.len > self.src.len
+            return false
+        for i in 0..lit.len
+            if self.src.get(self.pos + i) != lit.get(i)
+                return false
+        self.pos += lit.len
+        true
 
-    if jp_peek(p) != 34
-        return null  # Unterminated string
-    jp_advance(p)  # Skip closing quote
+    fn parse_value(self: @&JsonParser) -> Result<Json, JsonError>
+        self.skip_ws()
+        let ch: i32 = self.peek()
+        if ch == '"'
+            return match self.parse_string()
+                Ok(s) => Ok(Json.Str(s))
+                Err(e) => Err(e)
+        if ch == '-' or (ch >= '0' and ch <= '9')
+            return Ok(self.parse_number())
+        if ch == '['
+            return self.parse_array()
+        if ch == '{'
+            return self.parse_object()
+        if ch == 't' and self.match_lit("true")
+            return Ok(Json.Bool(true))
+        if ch == 'f' and self.match_lit("false")
+            return Ok(Json.Bool(false))
+        if ch == 'n' and self.match_lit("null")
+            return Ok(Json.Null)
+        Err(self.fail(JsonErrorKind.UnexpectedChar))
 
-    # Allocate and copy string, handling escapes
-    let str: *u8 = malloc(escaped_len + 1)
-    if str == null
-        return null
+    # The string at pos, decoded.  The first pass finds the closing quote and
+    # rejects raw control bytes; the second decodes the escapes, so a string
+    # that never closes is UnterminatedString whatever escapes it holds.
+    fn parse_string(self: @&JsonParser) -> Result<String, JsonError>
+        if self.peek() != '"'
+            return Err(self.fail(JsonErrorKind.UnexpectedChar))
+        self.pos += 1  # Skip opening quote
+        let start: i64 = self.pos
 
-    let end: i64 = start + raw_len
-    var src_pos: i64 = start
-    var dst_pos: i64 = 0
-    while src_pos < end
-        let ch: i32 = *(p.src + src_pos) as i32
-        if ch == '\\'  # backslash
-            src_pos += 1
-            if src_pos < end
-                let esc: i32 = *(p.src + src_pos) as i32
-                if esc == 'u'
-                    var used: i64 = 0
-                    let cp: i32 = jp_decode_u(p.src, src_pos, end, @used)
-                    if cp < 0 or (cp == 0 and is_key != 0)
-                        return jp_bad_escape(p, str, src_pos - 1)
-                    dst_pos += jp_put_utf8(str + dst_pos, cp)
-                    src_pos += used
-                else
-                    if esc == 'n'  # 'n'
-                        *(str + dst_pos) = 10  # newline
-                    else if esc == 't'  # 't'
-                        *(str + dst_pos) = 9  # tab
-                    else if esc == 'r'  # 'r'
-                        *(str + dst_pos) = 13  # carriage return
-                    else if esc == 'b'  # 'b'
-                        *(str + dst_pos) = 8  # backspace
-                    else if esc == 'f'  # 'f'
-                        *(str + dst_pos) = 12  # form feed
-                    else if esc == '/'  # '/'
-                        *(str + dst_pos) = 47
-                    else if esc == '"'  # '"'
-                        *(str + dst_pos) = 34
-                    else if esc == '\\'  # '\'
-                        *(str + dst_pos) = 92
+        while self.pos < self.src.len
+            let ch: i32 = self.peek()
+            if ch == '"'
+                break
+            if ch < 0x20
+                # RFC 8259 §7: U+0000-U+001F must be escaped.  pos is at the
+                # byte, which is where the error points.
+                return Err(self.fail(JsonErrorKind.ControlChar))
+            self.pos += 1
+            if ch == '\\' and self.pos < self.src.len
+                self.pos += 1  # the escaped byte, even a quote
+
+        let end: i64 = self.pos
+        if self.peek() != '"'
+            return Err(self.fail(JsonErrorKind.UnterminatedString))
+        self.pos += 1  # Skip closing quote
+
+        # Decoded text is never longer than its escaped form.
+        var out: String = string_with_cap(end - start)
+        var i: i64 = start
+        while i < end
+            let ch: u8 = self.src.get(i)
+            if ch != '\\'
+                if not out.push(ch)
+                    return Err(self.fail(JsonErrorKind.OutOfMemory))
+                i += 1
+                continue
+            let at: i64 = i          # the backslash
+            i += 1
+            if i >= end
+                break
+            let esc: u8 = self.src.get(i)
+            if esc == 'u'
+                let dec: JsonEscape = match jp_decode_u(self.src, i, end)
+                    Some(d) => d
+                    None => return Err(JsonError { kind: JsonErrorKind.InvalidEscape, pos: at })
+                if not jp_put_utf8(@&out, dec.cp)
+                    return Err(self.fail(JsonErrorKind.OutOfMemory))
+                i += dec.used
+                continue
+            var b: u8 = esc
+            if esc == 'n'
+                b = 10
+            else if esc == 't'
+                b = 9
+            else if esc == 'r'
+                b = 13
+            else if esc == 'b'
+                b = 8
+            else if esc == 'f'
+                b = 12
+            else if esc != '/' and esc != '"' and esc != '\\'
+                # RFC 8259 has no other escape: "\q" is an error, not "q".
+                return Err(JsonError { kind: JsonErrorKind.InvalidEscape, pos: at })
+            if not out.push(b)
+                return Err(self.fail(JsonErrorKind.OutOfMemory))
+            i += 1
+        Ok(out)
+
+    # The integer part, truncated toward zero, saturated at the i64 bounds.
+    # Fraction digits are consumed but not accumulated (#4571): a valid
+    # number of any length parses without overflowing.
+    fn parse_number(self: @&JsonParser) -> Json
+        var neg: bool = false
+        if self.peek() == '-'
+            neg = true
+            self.pos += 1
+
+        # Negative numbers accumulate below zero so that i64 MIN is reachable.
+        let i64_max: i64 = 9223372036854775807
+        let i64_min: i64 = 0 - i64_max - 1
+        var val: i64 = 0
+        var has_decimal: bool = false
+
+        while self.pos < self.src.len
+            let ch: i32 = self.peek()
+            if ch >= 48 and ch <= 57  # '0'-'9'
+                if not has_decimal
+                    let d: i64 = (ch - 48) as i64
+                    if neg
+                        if val < (i64_min + d) / 10
+                            val = i64_min
+                        else
+                            val = val * 10 - d
                     else
-                        # RFC 8259 has no other escape: "\q" is an error, not "q".
-                        return jp_bad_escape(p, str, src_pos - 1)
-                    dst_pos += 1
-                    src_pos += 1
-        else
-            *(str + dst_pos) = ch as u8
-            dst_pos += 1
-            src_pos += 1
-    *(str + dst_pos) = 0
-
-    var v: *JsonValue = null
-    match json_alloc_value()
-        Some(x) => v = x
-        None =>
-            free(str)
-            return null
-    v.kind = JSON_STRING
-    v.str_val = str
-    v.str_len = dst_pos
-    return v
-
-# num_val is the integer part, truncated toward zero, saturated at the i64
-# bounds.  Fraction digits are consumed but not accumulated (#4571): a
-# valid number of any length parses without overflowing.
-fn jp_parse_number(p: *JsonParser) -> *JsonValue
-    var neg: i32 = 0
-    if jp_peek(p) == '-'  # '-'
-        neg = 1
-        jp_advance(p)
-
-    # Negative numbers accumulate below zero so that i64 MIN is reachable.
-    let i64_max: i64 = 9223372036854775807
-    let i64_min: i64 = 0 - i64_max - 1
-    var val: i64 = 0
-    var has_decimal: i32 = 0
-
-    while p.pos < p.len
-        let ch: i32 = jp_peek(p)
-        if ch >= 48 and ch <= 57  # '0'-'9'
-            if has_decimal == 0
-                let d: i64 = (ch - 48) as i64
-                if neg != 0
-                    if val < (i64_min + d) / 10
-                        val = i64_min
-                    else
-                        val = val * 10 - d
-                else
-                    if val > (i64_max - d) / 10
-                        val = i64_max
-                    else
-                        val = val * 10 + d
-            jp_advance(p)
-        else if ch == '.' and has_decimal == 0  # '.'
-            has_decimal = 1
-            jp_advance(p)
-        else
-            break
-
-    let v: *JsonValue = match json_alloc_value()
-        Some(x) => x
-        None => return null
-    v.kind = JSON_NUMBER
-    v.num_val = val
-    return v
-
-fn jp_parse_array(p: *JsonParser) -> *JsonValue
-    if jp_peek(p) != 91  # '['
-        return null
-    jp_advance(p)
-    jp_skip_ws(p)
-
-    # Collect items
-    var items: Vec<u8> = vec_with_cap<u8>(64)  # Store pointers (8 bytes each)
-    var count: i64 = 0
-
-    if jp_peek(p) != 93  # Not empty array
-        loop
-            var item: *JsonValue = jp_parse_value(p)
-            if item == null
-                # Error - free what we have
-                return null
-
-            # Store pointer (8 bytes)
-            items.push_span(Span<u8> { ptr: (@item as *u8), len: (8) as i64 })
-            count += 1
-
-            jp_skip_ws(p)
-            if jp_peek(p) == ','  # ','
-                jp_advance(p)
-                jp_skip_ws(p)
+                        if val > (i64_max - d) / 10
+                            val = i64_max
+                        else
+                            val = val * 10 + d
+                self.pos += 1
+            else if ch == '.' and not has_decimal
+                has_decimal = true
+                self.pos += 1
             else
                 break
+        Json.Number(val)
 
-    if jp_peek(p) != 93  # ']'
-        # Free all parsed items
-        for i in 0..count
-            let ptr: *JsonValue = *((items.data + i * 8) as **JsonValue)
-            ptr.free()
-        return null
-    jp_advance(p)
+    fn parse_array(self: @&JsonParser) -> Result<Json, JsonError>
+        self.pos += 1  # '['
+        self.skip_ws()
+        var items: Vec<Json> = vec_new<Json>()
+        match self.fill_array(@&items)
+            Some(err) =>
+                json_drain_items(@&items)
+                return Err(err)
+            None =>
+                pass
+        Ok(Json.Array(items))
 
-    # Create array value
-    var v: *JsonValue = null
-    match json_alloc_value()
-        Some(x) => v = x
-        None =>
-            return null
+    # Parse the items and the closing ']' into `items`; the error, if any.
+    fn fill_array(self: @&JsonParser, items: @&Vec<Json>) -> Option<JsonError>
+        if self.peek() != ']'  # Not an empty array
+            loop
+                match self.parse_value()
+                    Ok(item) =>
+                        if not items.push(item)
+                            return Some(self.fail(JsonErrorKind.OutOfMemory))
+                    Err(e) =>
+                        return Some(e)
+                self.skip_ws()
+                if self.peek() == ','
+                    self.pos += 1
+                    self.skip_ws()
+                else
+                    break
+        if self.peek() != ']'
+            return Some(self.fail(JsonErrorKind.ExpectedBracket))
+        self.pos += 1
+        None
 
-    v.kind = JSON_ARRAY
-    v.count = count
+    fn parse_object(self: @&JsonParser) -> Result<Json, JsonError>
+        self.pos += 1  # '{'
+        self.skip_ws()
+        var members: Vec<JsonMember> = vec_new<JsonMember>()
+        match self.fill_object(@&members)
+            Some(err) =>
+                json_drain_members(@&members)
+                return Err(err)
+            None =>
+                pass
+        Ok(Json.Object(members))
 
-    if count > 0
-        v.items = malloc(count * 8) as **JsonValue
-        if v.items == null
-            v.free()
-            return null
-        memcpy(v.items as *u8, items.data, count * 8)
-
-    return v
-
-fn jp_parse_object(p: *JsonParser) -> *JsonValue
-    if jp_peek(p) != 123  # '{'
-        return null
-    jp_advance(p)
-    jp_skip_ws(p)
-
-    # Collect key-value pairs
-    var keys_vec: Vec<u8> = vec_with_cap<u8>(64)
-    var vals_vec: Vec<u8> = vec_with_cap<u8>(64)
-    var count: i64 = 0
-
-    if jp_peek(p) != 125  # Not empty object
-        loop
-            jp_skip_ws(p)
-
-            # Parse key (must be string)
-            let key_val: *JsonValue = jp_parse_string(p, 1)
-            if key_val == null
-                return null
-
-            # Steal the string from key_val
-            var key: *u8 = key_val.str_val
-            key_val.str_val = null  # Prevent double-free
-            key_val.free()
-
-            jp_skip_ws(p)
-            if jp_peek(p) != 58  # ':'
-                free(key)
-                return null
-            jp_advance(p)
-
-            # Parse value
-            var val: *JsonValue = jp_parse_value(p)
-            if val == null
-                free(key)
-                return null
-
-            # Store pointers
-            keys_vec.push_span(Span<u8> { ptr: (@key as *u8), len: (8) as i64 })
-            vals_vec.push_span(Span<u8> { ptr: (@val as *u8), len: (8) as i64 })
-            count += 1
-
-            jp_skip_ws(p)
-            if jp_peek(p) == ','  # ','
-                jp_advance(p)
-            else
-                break
-
-    jp_skip_ws(p)
-    if jp_peek(p) != 125  # '}'
-        # Free all
-        for i in 0..count
-            let k: *u8 = *((keys_vec.data + i * 8) as **u8)
-            let v: *JsonValue = *((vals_vec.data + i * 8) as **JsonValue)
-            free(k)
-            v.free()
-        return null
-    jp_advance(p)
-
-    # Create object value
-    var obj: *JsonValue = null
-    match json_alloc_value()
-        Some(x) => obj = x
-        None =>
-            return null
-
-    obj.kind = JSON_OBJECT
-    obj.count = count
-
-    if count > 0
-        obj.keys = malloc(count * 8) as **u8
-        obj.items = malloc(count * 8) as **JsonValue
-        if obj.keys == null or obj.items == null
-            obj.free()
-            return null
-        memcpy(obj.keys as *u8, keys_vec.data, count * 8)
-        memcpy(obj.items as *u8, vals_vec.data, count * 8)
-
-    return obj
+    # Parse the members and the closing '}' into `members`; the error, if any.
+    fn fill_object(self: @&JsonParser, members: @&Vec<JsonMember>) -> Option<JsonError>
+        if self.peek() != '}'  # Not an empty object
+            loop
+                self.skip_ws()
+                let key: String = match self.parse_string()
+                    Ok(k) => k
+                    Err(e) => return Some(e)
+                self.skip_ws()
+                if self.peek() != ':'
+                    return Some(self.fail(JsonErrorKind.ExpectedColon))
+                self.pos += 1
+                match self.parse_value()
+                    Ok(value) =>
+                        if not members.push(JsonMember { key: key, value: value })
+                            return Some(self.fail(JsonErrorKind.OutOfMemory))
+                    Err(e) =>
+                        return Some(e)
+                self.skip_ws()
+                if self.peek() == ','
+                    self.pos += 1
+                else
+                    break
+        self.skip_ws()
+        if self.peek() != '}'
+            return Some(self.fail(JsonErrorKind.ExpectedBrace))
+        self.pos += 1
+        None
 
 # =============================================================================
 # Public API
 # =============================================================================
 
 # Parse the first JSON value in `input`; trailing input is ignored.
-pub fn json_parse(input: StrView) -> Result<*JsonValue, JsonError>
-    var p: JsonParser
-    p.src = input.ptr
-    p.len = input.len
-    p.pos = 0
-    p.err = JSON_ERR_NONE
-
-    let v: *JsonValue = jp_parse_value(@p)
-    if v == null
-        var err: JsonError
-        err.code = JSON_ERR_UNEXPECTED_CHAR
-        if p.err != JSON_ERR_NONE
-            err.code = p.err
-        err.pos = p.pos
-        return Err(err)
-
-    return Ok(v)
-
-# Deprecated (AGAST #1482): the (ptr, len) form of json_parse.  Kept as a
-# wrapper for one commit; use json_parse(strview_from_ptr(input, len)).
-pub fn json_parse2(input: Span<u8>) -> Result<*JsonValue, JsonError>
-    return json_parse(strview_from_ptr(input.ptr, input.len))
+pub fn json_parse(input: StrView) -> Result<Json, JsonError>
+    var p: JsonParser = JsonParser { src: input, pos: 0 }
+    p.parse_value()
 
 # =============================================================================
-# Error Helpers
+# Access and output
 # =============================================================================
 
-pub fn json_error_message(code: i32) -> StrView
-    if code == JSON_ERR_UNEXPECTED_CHAR
-        return "unexpected character"
-    if code == JSON_ERR_UNTERMINATED_STRING
-        return "unterminated string"
-    if code == JSON_ERR_EXPECTED_COLON
-        return "expected ':'"
-    if code == JSON_ERR_EXPECTED_BRACKET
-        return "expected ']'"
-    if code == JSON_ERR_EXPECTED_BRACE
-        return "expected '}'"
-    if code == JSON_ERR_OUT_OF_MEMORY
-        return "out of memory"
-    if code == JSON_ERR_INVALID_ESCAPE
-        return "invalid escape"
-    if code == JSON_ERR_CONTROL_CHAR
-        return "control character in string"
-    return "unknown error"
+# Methods (S-IMPL-1): a Json is the subject of every operation on it.
+impl Json
+    # The value of `key` in object `self`; None if `self` is not an object or
+    # has no such key.  Keys compare byte-for-byte, length included.
+    pub fn get_field(self: @Json, key: StrView) -> Option<@Json>
+        match *self
+            Object(ms) =>
+                let base: *JsonMember = ms.as_ptr()
+                for i in 0..ms.len
+                    let m: *JsonMember = base + i
+                    if m.key.eq(key)
+                        return Some(@m.value)
+                None
+            _ =>
+                None
 
-# =============================================================================
-# Object Access Helpers
-# =============================================================================
+    # Element `idx` of array `self`; None if `self` is not an array or `idx`
+    # is out of range.
+    pub fn get_index(self: @Json, idx: i64) -> Option<@Json>
+        match *self
+            Array(xs) =>
+                if idx < 0 or idx >= xs.len
+                    return None
+                let base: *Json = xs.as_ptr()
+                Some(@*(base + idx))
+            _ =>
+                None
 
-# Methods (S-IMPL-1): a JsonValue is the subject of every operation on it.
-impl JsonValue
-    # The value of `key` in object `self`; None if `self` is null, not an object,
-    # or has no such key.  Keys compare byte-for-byte.
-    pub fn get_field(self: @JsonValue, key: StrView) -> Option<*JsonValue>
-        if self == null
-            return None
-        if self.kind != JSON_OBJECT
-            return None
+    # A view of a string value's bytes, borrowed from `self`.
+    pub fn get_string(self: @Json) -> Option<StrView>
+        match *self
+            Str(s) => Some(s.as_view())
+            _ => None
 
-        for i in 0..self.count
-            let k: *u8 = *(self.keys + i)
-            if key.eq_cstr(k)
-                return Some(*(self.items + i))
-        return None
+    pub fn get_number(self: @Json) -> Option<i64>
+        match *self
+            Number(n) => Some(n)
+            _ => None
 
-    # Element `idx` of array `self`; None if `self` is null, not an array, or
-    # `idx` is out of range.
-    pub fn get_index(self: @JsonValue, idx: i64) -> Option<*JsonValue>
-        if self == null
-            return None
-        if self.kind != JSON_ARRAY
-            return None
-        if idx < 0 or idx >= self.count
-            return None
-        return Some(*(self.items + idx))
+    pub fn get_bool(self: @Json) -> Option<bool>
+        match *self
+            Bool(b) => Some(b)
+            _ => None
 
-    # A view of a string value's bytes, borrowed from `self` (valid until free).
-    pub fn get_string(self: @JsonValue) -> Option<StrView>
-        if self == null
-            return None
-        if self.kind != JSON_STRING
-            return None
-        return Some(strview_from_ptr(self.str_val, self.str_len))
+    pub fn is_null(self: @Json) -> bool
+        match *self
+            Null => true
+            _ => false
 
-    pub fn get_number(self: @JsonValue) -> Option<i64>
-        if self == null
-            return None
-        if self.kind != JSON_NUMBER
-            return None
-        return Some(self.num_val)
+    # The elements of an array; empty for any other value.
+    pub fn items(self: @Json) -> Span<Json>
+        match *self
+            Array(xs) => Span<Json> { ptr: xs.as_ptr(), len: xs.len }
+            _ => Span<Json> { ptr: null, len: 0 }
 
-    pub fn get_bool(self: @JsonValue) -> Option<bool>
-        if self == null
-            return None
-        if self.kind != JSON_BOOL
-            return None
-        return Some(self.bool_val != 0)
+    # The members of an object, in document order; empty for any other value.
+    pub fn members(self: @Json) -> Span<JsonMember>
+        match *self
+            Object(ms) => Span<JsonMember> { ptr: ms.as_ptr(), len: ms.len }
+            _ => Span<JsonMember> { ptr: null, len: 0 }
 
-    pub fn is_null(self: @JsonValue) -> bool
-        if self == null
-            return true
-        return self.kind == JSON_NULL
+    pub fn array_len(self: @Json) -> i64
+        self.items().len
 
-    pub fn array_len(self: @JsonValue) -> i64
-        if self == null
-            return 0
-        if self.kind != JSON_ARRAY
-            return 0
-        return self.count
-
-    pub fn object_len(self: @JsonValue) -> i64
-        if self == null
-            return 0
-        if self.kind != JSON_OBJECT
-            return 0
-        return self.count
+    pub fn object_len(self: @Json) -> i64
+        self.members().len
 
     # Append the JSON text of `self` to buf.
-    pub fn emit(self: @JsonValue, buf: @&Vec<u8>)
-        if self == null
-            buf.push_str(c"null")
-            return
-
-        if self.kind == JSON_NULL
-            buf.push_str(c"null")
-        else if self.kind == JSON_BOOL
-            if self.bool_val != 0
-                buf.push_str(c"true")
-            else
-                buf.push_str(c"false")
-        else if self.kind == JSON_NUMBER
-            var num_buf: [20]u8
-            let digits: StrView = fmt_i64_into(@num_buf, self.num_val)
-            buf.push_span(Span<u8> { ptr: digits.ptr, len: digits.len })
-        else if self.kind == JSON_STRING
-            json_emit_bytes(Span<u8> { ptr: self.str_val, len: self.str_len }, buf)
-        else if self.kind == JSON_ARRAY
-            buf.push(91)  # '['
-            for i in 0..self.count
-                if i > 0
-                    buf.push_str(c", ")
-                (*(self.items + i)).emit(buf)
-            buf.push(93)  # ']'
-        else if self.kind == JSON_OBJECT
-            buf.push(123)  # '{'
-            for i in 0..self.count
-                if i > 0
-                    buf.push_str(c", ")
-                let key: *u8 = *(self.keys + i)
-                var key_view: StrView = strview_empty()
-                if key != null
-                    key_view = strview_from_cstr(key)
-                json_emit_string(key_view, buf)
-                buf.push_str(c": ")
-                (*(self.items + i)).emit(buf)
-            buf.push(125)  # '}'
+    pub fn emit(self: @Json, buf: @&Vec<u8>)
+        match *self
+            Null =>
+                json_emit_text("null", buf)
+            Bool(b) =>
+                if b
+                    json_emit_text("true", buf)
+                else
+                    json_emit_text("false", buf)
+            Number(n) =>
+                var num_buf: [20]u8
+                let digits: StrView = fmt_i64_into(@num_buf, n)
+                json_emit_text(digits, buf)
+            Str(s) =>
+                json_emit_string(s.as_view(), buf)
+            Array(xs) =>
+                json_emit_byte(91, buf)  # '['
+                let base: *Json = xs.as_ptr()
+                for i in 0..xs.len
+                    if i > 0
+                        json_emit_text(", ", buf)
+                    let child: @Json = @*(base + i)
+                    child.emit(buf)
+                json_emit_byte(93, buf)  # ']'
+            Object(ms) =>
+                json_emit_byte(123, buf)  # '{'
+                let base: *JsonMember = ms.as_ptr()
+                for i in 0..ms.len
+                    if i > 0
+                        json_emit_text(", ", buf)
+                    let m: *JsonMember = base + i
+                    json_emit_string(m.key.as_view(), buf)
+                    json_emit_text(": ", buf)
+                    m.value.emit(buf)
+                json_emit_byte(125, buf)  # '}'
 
     # The JSON text of `self`; the caller owns the String.
-    pub fn to_string(self: @JsonValue) -> String
+    pub fn to_string(self: @Json) -> String
         var buf: Vec<u8> = vec_with_cap<u8>(256)
         self.emit(@&buf)
-        let out: String = string_from_bytes(Span<u8> { ptr: (buf.data), len: (buf.len) as i64 })
-        return out
+        string_from_bytes(Span<u8> { ptr: (buf.data), len: (buf.len) as i64 })
+
+# Append one byte to buf.
+fn json_emit_byte(b: u8, buf: @&Vec<u8>)
+    buf.push(b)
+
+# Append `s` to buf as it is.
+fn json_emit_text(s: StrView, buf: @&Vec<u8>)
+    buf.push_span(Span<u8> { ptr: s.ptr, len: s.len })
 
 # Emit s[0..len) as a JSON string literal.  Length-driven, so an embedded NUL
 # (a decoded \u0000) is written as \u0000 rather than ending the string.
@@ -803,7 +591,7 @@ pub fn json_emit_bytes(s_sv: Span<u8>, buf: @&Vec<u8>)
                 buf.push(92)
                 buf.push(102)  # 'f'
             else if ch < 32  # other control characters: \u00XX
-                buf.push_str(c"\\u00")
+                json_emit_text("\\u00", buf)
                 buf.push(jp_hex_digit(ch >> 4))
                 buf.push(jp_hex_digit(ch & 15))
             else

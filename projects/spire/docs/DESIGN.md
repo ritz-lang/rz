@@ -825,34 +825,34 @@ We need to encode/decode JSON for API responses and request bodies.
 ```ritz
 # spire/json/mod.ritz
 
-pub enum JsonValue
+pub enum Json
     Null
     Bool(bool)
     Number(f64)
     String(String)
-    Array(Vec<JsonValue>)
+    Array(Vec<Json>)
     Object(Vec<JsonKeyValue>)
 
 pub struct JsonKeyValue
     key: String
-    value: JsonValue
+    value: Json
 
-# Parse JSON string to JsonValue
-pub fn json_parse(input: StrView) -> Result<JsonValue, JsonError>
+# Parse JSON string to Json
+pub fn json_parse(input: StrView) -> Result<Json, JsonError>
     # ... parser implementation
 
-# Encode JsonValue to string
-pub fn json_stringify(value: *JsonValue) -> String
+# Encode Json to string
+pub fn json_stringify(value: *Json) -> String
     # ... encoder implementation
 
 # Builder pattern for creating JSON
 pub struct JsonBuilder
-    value: JsonValue
+    value: Json
 
 pub fn json_object() -> JsonBuilder
     JsonBuilder { value: Object(vec_new<JsonKeyValue>()) }
 
-pub fn json_builder_set(builder:& JsonBuilder, key: StrView, value: JsonValue)
+pub fn json_builder_set(builder:& JsonBuilder, key: StrView, value: Json)
     match builder.value
         Object(pairs) =>
             var kv: JsonKeyValue
@@ -1158,7 +1158,7 @@ lib/
 │   ├── auth.ritz
 │   └── cors.ritz
 ├── json/
-│   ├── mod.ritz          # JsonValue, parse, stringify
+│   ├── mod.ritz          # Json, parse, stringify
 │   ├── parser.ritz
 │   └── encoder.ritz
 ├── form/

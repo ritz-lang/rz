@@ -3002,61 +3002,93 @@ fn wait_until(ready: fn() -> bool, limit: Duration) -> bool
 
 **Module**: `ritzlib.json`
 
-JSON parsing and serialization.
-
-**Value Types**: `JSON_NULL`, `JSON_BOOL`, `JSON_NUMBER`, `JSON_STRING`, `JSON_ARRAY`, `JSON_OBJECT`
+JSON parsing and serialization. A document is a `Json`, an enum that owns its
+parts and frees itself when its binding ends: there is nothing to free by hand.
 
 ```ritz
-struct JsonValue
-    kind: i32
-    bool_val: i32
-    num_val: i64
-    float_val: i64   # reserved; unused until float support lands
-    str_val: *u8
-    str_len: i64
-    items: **JsonValue
-    count: i64
-    keys: **u8
+import ritzlib.json
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
+
+fn port_of(input: StrView) -> i64
+    match json_parse(input)
+        Ok(root) =>
+            match root.get_field("port")
+                Some(v) =>
+                    match v.get_number()
+                        Some(n) => n
+                        None => 0 - 1
+                None => 0 - 1
+        Err(err) => 0 - 2    # err.kind, err.pos, err.message()
+```
+
+```text
+enum Json
+    Null
+    Bool(bool)
+    Number(i64)
+    Str(String)
+    Array(Vec<Json>)
+    Object(Vec<JsonMember>)       # members in document order
+
+struct JsonMember               # one "key": value pair
+    key: String
+    value: Json
+
+enum JsonErrorKind
+    UnexpectedChar, UnterminatedString, ExpectedColon, ExpectedBracket,
+    ExpectedBrace, OutOfMemory, InvalidEscape, ControlChar
 
 struct JsonError
-    code: i32
-    pos: i64
+    kind: JsonErrorKind
+    pos: i64                    # byte offset of the error in the input
 ```
 
 **Parsing**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `json_parse` | `fn(input: StrView) -> Result<*JsonValue, JsonError>` | Parse the first JSON value in `input` |
-| `json_parse2` | `fn(input: *u8, len: i64) -> Result<*JsonValue, JsonError>` | Deprecated wrapper: `json_parse(strview_from_ptr(input, len))` |
+| `json_parse` | `fn(input: StrView) -> Result<Json, JsonError>` | Parse the first JSON value in `input`; trailing input is ignored |
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `v.free()` | `fn()` | Free JSON tree |
+| `err.message()` | `fn() -> StrView` | Text of the error kind; `impl Display for JsonError` prints it |
+
+Error kinds: `UnterminatedString` (input ends inside a string),
+`ExpectedColon` (key without `:`), `ExpectedBracket` / `ExpectedBrace` (array
+or object without its closer), `InvalidEscape` and `ControlChar` (below),
+`UnexpectedChar` for anything else, including empty input. A failed parse
+frees what it had built.
+
+Numbers are `i64`: the integer part, truncated toward zero and saturated at the
+`i64` bounds; fraction digits are consumed and dropped.
 
 Strings are decoded to UTF-8: `\n \t \r \b \f \/ \" \\` and `\uXXXX`, with a
-surrogate pair (`😀`) combined into one 4-byte sequence. Bad hex
-digits, a short `\u`, a surrogate without its other half, or any other
-escape (`\q`, `\x41`) fail with `JSON_ERR_INVALID_ESCAPE` at the escape's
-backslash. `\u0000` is kept in a string value (`str_len` and
-`v.get_string()` count it) but rejected in an object key, which is stored as
-a NUL-terminated `*u8`. A raw control character (U+0000–U+001F) inside a
-string, key or value, fails with `JSON_ERR_CONTROL_CHAR` at that byte: RFC
-8259 requires them escaped. Tabs and newlines between tokens are whitespace
-and stay legal.
+surrogate pair combined into one 4-byte sequence. Bad hex digits, a short
+`\u`, a surrogate without its other half, or any other escape (`\q`, `\x41`)
+fail with `InvalidEscape` at the escape's backslash. `\u0000` is kept, in a
+value and in an object key (keys are length-checked Strings, so `"a\u0000b"`
+is not `"a"`). A raw control character (U+0000-U+001F) inside a string fails
+with `ControlChar` at that byte: RFC 8259 requires them escaped. Tabs and
+newlines between tokens are whitespace and stay legal.
 
-**Value Access**:
+**Value Access** (lookups borrow from the document; a missing field, an
+out-of-range index and a value of another kind are all `None`):
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `v.get_field(key)` | `fn(key: StrView) -> Option<*JsonValue>` | Object field; None if missing or not an object |
-| `v.get_index(idx)` | `fn(idx: i64) -> Option<*JsonValue>` | Array element; None if out of range or not an array |
-| `v.get_string()` | `fn() -> Option<StrView>` | String value, borrowed from `v`; None if not a string |
-| `v.get_number()` | `fn() -> Option<i64>` | Number value; None if not a number |
-| `v.get_bool()` | `fn() -> Option<bool>` | Bool value; None if not a bool |
-| `v.is_null()` | `fn() -> bool` | Check if null |
-| `v.array_len()` | `fn() -> i64` | Get array length |
-| `v.object_len()` | `fn() -> i64` | Get object size |
+| `v.get_field(key)` | `fn(key: StrView) -> Option<@Json>` | Object member; first of any duplicates |
+| `v.get_index(idx)` | `fn(idx: i64) -> Option<@Json>` | Array element |
+| `v.get_string()` | `fn() -> Option<StrView>` | String value, borrowed from `v` |
+| `v.get_number()` | `fn() -> Option<i64>` | Number value |
+| `v.get_bool()` | `fn() -> Option<bool>` | Bool value |
+| `v.is_null()` | `fn() -> bool` | Is `Null` |
+| `v.items()` | `fn() -> Span<Json>` | Array elements; empty for any other value |
+| `v.members()` | `fn() -> Span<JsonMember>` | Object members in order; empty for any other value |
+| `v.array_len()` / `v.object_len()` | `fn() -> i64` | Element / member count; 0 for another kind |
+
+To take a value apart, `match *v` on `Array(xs)` / `Object(ms)`.
 
 **Serialization**:
 
@@ -3069,12 +3101,6 @@ and stay legal.
 |--------|-----------|-------------|
 | `v.emit(buf)` | `fn(buf: @&Vec<u8>)` | Append the JSON text to buffer |
 | `v.to_string()` | `fn() -> String` | JSON text; the caller owns it, and its `Drop` impl frees it at scope end |
-
-**Error Messages**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `json_error_message` | `fn(code: i32) -> StrView` | Get error message |
 
 ---
 

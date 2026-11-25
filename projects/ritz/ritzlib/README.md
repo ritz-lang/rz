@@ -89,7 +89,7 @@ pub fn main() -> i32
 | `hashmap.ritz` | `ritzlib.hashmap` | Hash maps: HashMap<K, V>, and HashMapI64 |
 | `io.ritz` | `ritzlib.io` | High-level I/O functions |
 | `iovec.ritz` | `ritzlib.iovec` | Vectored I/O for scatter/gather writes |
-| `json.ritz` | `ritzlib.json` | JSON Parser |
+| `json.ritz` | `ritzlib.json` | JSON parser and writer: json_parse(StrView) -> Result<Json, JsonError> |
 | `mapping.ritz` | `ritzlib.mapping` | mmap_anon and munmap: anonymous memory as Result<Span<u8>, Errno> |
 | `memory.ritz` | `ritzlib.memory` | Memory allocation infrastructure |
 | `net.ritz` | `ritzlib.net` | Networking primitives for TCP/IP communication |

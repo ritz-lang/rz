@@ -1,6 +1,7 @@
 # Test suite for ritzlib/json.ritz
 #
-# Tests JSON parsing and emitting functionality.
+# Tests JSON parsing and emitting functionality on `enum Json` (AGAST #4690):
+# a parsed document owns its parts and frees itself at the end of its scope.
 # Run with: python3 ritz0/ritz0.py --test ritzlib/tests/test_json.ritz
 
 import ritzlib.sys
@@ -12,34 +13,161 @@ import ritzlib.result
 import ritzlib.option
 import ritzlib.strview
 import ritzlib.string
+import ritzlib.span
+import ritzlib.fs
 
 # =============================================================================
-# Helpers: the Option/Result API flattened to a pointer or sentinel so that
-# tests can assert on one value.  The "Option API" section at the end tests
-# the Options themselves.
+# Helpers: the Option API flattened to a bool or sentinel so that tests can
+# assert on one value.  Lookups borrow from the document (Option<@Json>), so
+# the helpers take the Option itself and never outlive it.
 # =============================================================================
-
-fn parse_or_null(input: StrView) -> *JsonValue
-    match json_parse(input)
-        Ok(v) => v
-        Err(e) => null as *JsonValue
-
-fn field(obj: *JsonValue, key: StrView) -> *JsonValue
-    match obj.get_field(key)
-        Some(v) => v
-        None => null as *JsonValue
-
-fn at(arr: *JsonValue, idx: i64) -> *JsonValue
-    match arr.get_index(idx)
-        Some(v) => v
-        None => null as *JsonValue
 
 const NO_NUMBER: i64 = -999999
 
-fn num(v: *JsonValue) -> i64
+# Error kinds as numbers, so a test compares one i32.
+const K_NONE: i32 = 0 - 1          # the parse succeeded
+const K_UNEXPECTED_CHAR: i32 = 1
+const K_UNTERMINATED_STRING: i32 = 2
+const K_EXPECTED_COLON: i32 = 3
+const K_EXPECTED_BRACKET: i32 = 4
+const K_EXPECTED_BRACE: i32 = 5
+const K_OUT_OF_MEMORY: i32 = 6
+const K_INVALID_ESCAPE: i32 = 7
+const K_CONTROL_CHAR: i32 = 8
+
+fn kind_code(k: JsonErrorKind) -> i32
+    match k
+        UnexpectedChar => K_UNEXPECTED_CHAR
+        UnterminatedString => K_UNTERMINATED_STRING
+        ExpectedColon => K_EXPECTED_COLON
+        ExpectedBracket => K_EXPECTED_BRACKET
+        ExpectedBrace => K_EXPECTED_BRACE
+        OutOfMemory => K_OUT_OF_MEMORY
+        InvalidEscape => K_INVALID_ESCAPE
+        ControlChar => K_CONTROL_CHAR
+
+# The error kind of parsing `input`, or K_NONE if it parses.
+fn err_code(input: StrView) -> i32
+    match json_parse(input)
+        Ok(v) => K_NONE
+        Err(e) => kind_code(e.kind)
+
+# The error offset of parsing `input`, or -1 if it parses.
+fn err_pos(input: StrView) -> i64
+    match json_parse(input)
+        Ok(v) => 0 - 1
+        Err(e) => e.pos
+
+fn parses(input: StrView) -> bool
+    match json_parse(input)
+        Ok(v) => true
+        Err(e) => false
+
+fn is_some(o: Option<@Json>) -> bool
+    match o
+        Some(v) => true
+        None => false
+
+fn num(v: @Json) -> i64
     match v.get_number()
         Some(n) => n
         None => NO_NUMBER
+
+# The number at the Option, or NO_NUMBER for None / a non-number.
+fn num_of(o: Option<@Json>) -> i64
+    match o
+        Some(v) => num(v)
+        None => NO_NUMBER
+
+# Step into object member `key` of an Option (None stays None).
+fn sub(o: Option<@Json>, key: StrView) -> Option<@Json>
+    match o
+        Some(v) =>
+            let r: @Json = v
+            r.get_field(key)
+        None => None
+
+# Step into array element `idx` of an Option.
+fn nth(o: Option<@Json>, idx: i64) -> Option<@Json>
+    match o
+        Some(v) =>
+            let r: @Json = v
+            r.get_index(idx)
+        None => None
+
+fn is_bool(v: @Json) -> bool
+    match *v
+        Bool(b) => true
+        _ => false
+
+fn is_number(v: @Json) -> bool
+    match *v
+        Number(n) => true
+        _ => false
+
+fn is_string(v: @Json) -> bool
+    match *v
+        Str(s) => true
+        _ => false
+
+fn is_array(v: @Json) -> bool
+    match *v
+        Array(xs) => true
+        _ => false
+
+fn is_object(v: @Json) -> bool
+    match *v
+        Object(ms) => true
+        _ => false
+
+fn str_is(o: Option<StrView>, want: StrView) -> bool
+    match o
+        Some(sv) => sv.eq(want)
+        None => false
+
+fn str_none(o: Option<StrView>) -> bool
+    match o
+        Some(sv) => false
+        None => true
+
+# 1 for Some(true), 0 for Some(false), -1 for None.
+fn bool_state(o: Option<bool>) -> i32
+    match o
+        Some(b) => if b then 1 else 0
+        None => 0 - 1
+
+# Parse `input` (one JSON string) and compare its decoded bytes with want[0..n].
+fn decodes_to(input: StrView, want: *u8, n: i64) -> bool
+    match json_parse(input)
+        Ok(root) => str_is(root.get_string(), strview_from_ptr(want, n))
+        Err(e) => false
+
+# The compact text of the document parsed from `input`; "" if it does not parse.
+fn reemit(input: StrView) -> String
+    match json_parse(input)
+        Ok(root) => root.to_string()
+        Err(e) => string_new()
+
+fn str_of(o: Option<@Json>) -> Option<StrView>
+    match o
+        Some(v) =>
+            let r: @Json = v
+            r.get_string()
+        None => None
+
+fn bool_of(o: Option<@Json>) -> Option<bool>
+    match o
+        Some(v) =>
+            let r: @Json = v
+            r.get_bool()
+        None => None
+
+fn null_of(o: Option<@Json>) -> bool
+    match o
+        Some(v) =>
+            let r: @Json = v
+            r.is_null()
+        None => false
 
 # =============================================================================
 # Primitive Parsing Tests
@@ -47,119 +175,115 @@ fn num(v: *JsonValue) -> i64
 
 [[test]]
 fn test_parse_null() -> i32
-    let root: *JsonValue = parse_or_null("null")
-    assert root != null
-    assert root != null
-    assert root.kind == JSON_NULL
-    root.free()
+    let root: Json = match json_parse("null")
+        Ok(j) => j
+        Err(e) => return 1
+    assert root.is_null()
     0
 
 [[test]]
 fn test_parse_true() -> i32
-    let root: *JsonValue = parse_or_null("true")
-    assert root != null
-    assert root.kind == JSON_BOOL
-    assert root.bool_val == 1
-    root.free()
+    let root: Json = match json_parse("true")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_bool(@root)
+    assert bool_state(root.get_bool()) == 1
     0
 
 [[test]]
 fn test_parse_false() -> i32
-    let root: *JsonValue = parse_or_null("false")
-    assert root != null
-    assert root.kind == JSON_BOOL
-    assert root.bool_val == 0
-    root.free()
+    let root: Json = match json_parse("false")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_bool(@root)
+    assert bool_state(root.get_bool()) == 0
     0
 
 [[test]]
 fn test_parse_number_positive() -> i32
-    let root: *JsonValue = parse_or_null("42")
-    assert root != null
-    assert root.kind == JSON_NUMBER
-    assert root.num_val == 42
-    root.free()
+    let root: Json = match json_parse("42")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_number(@root)
+    assert num(@root) == 42
     0
 
 [[test]]
 fn test_parse_number_negative() -> i32
-    let root: *JsonValue = parse_or_null("-123")
-    assert root != null
-    assert root.kind == JSON_NUMBER
-    assert root.num_val == 0 - 123
-    root.free()
+    let root: Json = match json_parse("-123")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_number(@root)
+    assert num(@root) == 0 - 123
     0
 
 [[test]]
 fn test_parse_number_zero() -> i32
-    let root: *JsonValue = parse_or_null("0")
-    assert root != null
-    assert root.kind == JSON_NUMBER
-    assert root.num_val == 0
-    root.free()
+    let root: Json = match json_parse("0")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_number(@root)
+    assert num(@root) == 0
+    0
+
+# #4571: the integer part saturates at i64 and fraction digits are
+# consumed without being accumulated, so long valid numbers never trap.
+[[test]]
+fn test_parse_number_long_fraction_truncates() -> i32
+    let root: Json = match json_parse("3.14159265358979323846")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num(@root) == 3
+    0
+
+[[test]]
+fn test_parse_number_long_integer_saturates_max() -> i32
+    let root: Json = match json_parse("123456789012345678901234567890")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num(@root) == 9223372036854775807
+    0
+
+[[test]]
+fn test_parse_number_long_negative_saturates_min() -> i32
+    let root: Json = match json_parse("-123456789012345678901234567890")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num(@root) == 0 - 9223372036854775807 - 1
+    0
+
+[[test]]
+fn test_parse_number_i64_bounds_exact() -> i32
+    let hi: Json = match json_parse("9223372036854775807")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num(@hi) == 9223372036854775807
+    let lo: Json = match json_parse("-9223372036854775808")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num(@lo) == 0 - 9223372036854775807 - 1
     0
 
 # =============================================================================
 # String Parsing Tests
 # =============================================================================
 
-# #4571: the integer part saturates at i64 and fraction digits are
-# consumed without being accumulated, so long valid numbers never trap.
-[[test]]
-fn test_parse_number_long_fraction_truncates() -> i32
-    let root: *JsonValue = parse_or_null("3.14159265358979323846")
-    assert root != null
-    assert root.kind == JSON_NUMBER
-    assert root.num_val == 3
-    root.free()
-    0
-
-[[test]]
-fn test_parse_number_long_integer_saturates_max() -> i32
-    let root: *JsonValue = parse_or_null("123456789012345678901234567890")
-    assert root != null
-    assert root.kind == JSON_NUMBER
-    assert root.num_val == 9223372036854775807
-    root.free()
-    0
-
-[[test]]
-fn test_parse_number_long_negative_saturates_min() -> i32
-    let root: *JsonValue = parse_or_null("-123456789012345678901234567890")
-    assert root != null
-    assert root.kind == JSON_NUMBER
-    assert root.num_val == 0 - 9223372036854775807 - 1
-    root.free()
-    0
-
-[[test]]
-fn test_parse_number_i64_bounds_exact() -> i32
-    let hi: *JsonValue = parse_or_null("9223372036854775807")
-    assert hi != null
-    assert hi.num_val == 9223372036854775807
-    hi.free()
-    let lo: *JsonValue = parse_or_null("-9223372036854775808")
-    assert lo != null
-    assert lo.num_val == 0 - 9223372036854775807 - 1
-    lo.free()
-    0
-
 [[test]]
 fn test_parse_string_simple() -> i32
-    let root: *JsonValue = parse_or_null("\"hello\"")
-    assert root != null
-    assert root.kind == JSON_STRING
-    assert streq(root.str_val, c"hello")
-    root.free()
+    let root: Json = match json_parse("\"hello\"")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_string(@root)
+    assert str_is(root.get_string(), "hello")
     0
 
 [[test]]
 fn test_parse_string_empty() -> i32
-    let root: *JsonValue = parse_or_null("\"\"")
-    assert root != null
-    assert root.kind == JSON_STRING
-    assert root.str_len == 0
-    root.free()
+    let root: Json = match json_parse("\"\"")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_string(@root)
+    assert str_is(root.get_string(), "")
     0
 
 [[test]]
@@ -177,12 +301,11 @@ fn test_parse_string_escape_quote() -> i32
     input[8] = 34   # "
     input[9] = 0    # null
 
-    let root: *JsonValue = parse_or_null(strview_from_ptr(@input[0], 9))
-    assert root != null
-    assert root.kind == JSON_STRING
+    let root: Json = match json_parse(strview_from_ptr(@input[0], 9))
+        Ok(j) => j
+        Err(e) => return 1
     # Result should be: he"llo
-    assert root.str_len == 6
-    root.free()
+    assert str_is(root.get_string(), "he\"llo")
     0
 
 [[test]]
@@ -205,12 +328,11 @@ fn test_parse_string_escape_newline() -> i32
     input[13] = 34  # "
     input[14] = 0   # null
 
-    let root: *JsonValue = parse_or_null(strview_from_ptr(@input[0], 14))
-    assert root != null
-    assert root.kind == JSON_STRING
-    # Result should contain actual newline character
-    assert root.str_len == 11
-    root.free()
+    let root: Json = match json_parse(strview_from_ptr(@input[0], 14))
+        Ok(j) => j
+        Err(e) => return 1
+    # Result should contain an actual newline character
+    assert str_is(root.get_string(), "line1\nline2")
     0
 
 # =============================================================================
@@ -219,82 +341,58 @@ fn test_parse_string_escape_newline() -> i32
 
 [[test]]
 fn test_parse_array_empty() -> i32
-    let root: *JsonValue = parse_or_null("[]")
-    assert root != null
-    assert root.kind == JSON_ARRAY
-    assert root.count == 0
-    root.free()
+    let root: Json = match json_parse("[]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_array(@root)
+    assert root.array_len() == 0
     0
 
 [[test]]
 fn test_parse_array_single() -> i32
-    let root: *JsonValue = parse_or_null("[42]")
-    assert root != null
-    assert root.kind == JSON_ARRAY
-    assert root.count == 1
-    let item: *JsonValue = at(root, 0)
-    assert item.kind == JSON_NUMBER
-    assert item.num_val == 42
-    root.free()
+    let root: Json = match json_parse("[42]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_array(@root)
+    assert root.array_len() == 1
+    assert num_of(root.get_index(0)) == 42
     0
 
 [[test]]
 fn test_parse_array_multiple() -> i32
-    let root: *JsonValue = parse_or_null("[1, 2, 3]")
-    assert root != null
-    assert root.kind == JSON_ARRAY
-    assert root.count == 3
-    assert num(at(root, 0)) == 1
-    assert num(at(root, 1)) == 2
-    assert num(at(root, 2)) == 3
-    root.free()
+    let root: Json = match json_parse("[1, 2, 3]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_array(@root)
+    assert root.array_len() == 3
+    assert num_of(root.get_index(0)) == 1
+    assert num_of(root.get_index(1)) == 2
+    assert num_of(root.get_index(2)) == 3
     0
 
 [[test]]
 fn test_parse_array_mixed() -> i32
-    let root: *JsonValue = parse_or_null("[1, \"hello\", true, null]")
-    assert root != null
-    assert root.kind == JSON_ARRAY
-    assert root.count == 4
-
-    let n: *JsonValue = at(root, 0)
-    assert n.kind == JSON_NUMBER
-    assert n.num_val == 1
-
-    let s: *JsonValue = at(root, 1)
-    assert s.kind == JSON_STRING
-    assert streq(s.str_val, c"hello")
-
-    let b: *JsonValue = at(root, 2)
-    assert b.kind == JSON_BOOL
-    assert b.bool_val == 1
-
-    let nl: *JsonValue = at(root, 3)
-    assert nl.kind == JSON_NULL
-
-    root.free()
+    let root: Json = match json_parse("[1, \"hello\", true, null]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_array(@root)
+    assert root.array_len() == 4
+    assert num_of(root.get_index(0)) == 1
+    assert str_is(str_of(nth(Some(@root), 1)), "hello")
+    assert bool_state(bool_of(nth(Some(@root), 2))) == 1
+    assert null_of(nth(Some(@root), 3))
     0
 
 [[test]]
 fn test_parse_array_nested() -> i32
-    let root: *JsonValue = parse_or_null("[[1, 2], [3, 4]]")
-    assert root != null
-    assert root.kind == JSON_ARRAY
-    assert root.count == 2
-
-    let arr1: *JsonValue = at(root, 0)
-    assert arr1.kind == JSON_ARRAY
-    assert arr1.count == 2
-    assert num(at(arr1, 0)) == 1
-    assert num(at(arr1, 1)) == 2
-
-    let arr2: *JsonValue = at(root, 1)
-    assert arr2.kind == JSON_ARRAY
-    assert arr2.count == 2
-    assert num(at(arr2, 0)) == 3
-    assert num(at(arr2, 1)) == 4
-
-    root.free()
+    let root: Json = match json_parse("[[1, 2], [3, 4]]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert root.array_len() == 2
+    assert num_of(nth(nth(Some(@root), 0), 0)) == 1
+    assert num_of(nth(nth(Some(@root), 0), 1)) == 2
+    assert num_of(nth(nth(Some(@root), 1), 0)) == 3
+    assert num_of(nth(nth(Some(@root), 1), 1)) == 4
     0
 
 # =============================================================================
@@ -303,58 +401,68 @@ fn test_parse_array_nested() -> i32
 
 [[test]]
 fn test_parse_object_empty() -> i32
-    let root: *JsonValue = parse_or_null("{}")
-    assert root != null
-    assert root.kind == JSON_OBJECT
-    assert root.count == 0
-    root.free()
+    let root: Json = match json_parse("{}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_object(@root)
+    assert root.object_len() == 0
     0
 
 [[test]]
 fn test_parse_object_single() -> i32
-    let root: *JsonValue = parse_or_null("{\"name\": \"test\"}")
-    assert root != null
-    assert root.kind == JSON_OBJECT
-    assert root.count == 1
-
-    let name: *JsonValue = field(root, "name")
-    assert name != null
-    assert name.kind == JSON_STRING
-    assert streq(name.str_val, c"test")
-
-    root.free()
+    let root: Json = match json_parse("{\"name\": \"test\"}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_object(@root)
+    assert root.object_len() == 1
+    assert str_is(str_of(sub(Some(@root), "name")), "test")
     0
 
 [[test]]
 fn test_parse_object_multiple() -> i32
-    let root: *JsonValue = parse_or_null("{\"a\": 1, \"b\": 2, \"c\": 3}")
-    assert root != null
-    assert root.kind == JSON_OBJECT
-    assert root.count == 3
-
-    assert num(field(root, "a")) == 1
-    assert num(field(root, "b")) == 2
-    assert num(field(root, "c")) == 3
-
-    root.free()
+    let root: Json = match json_parse("{\"a\": 1, \"b\": 2, \"c\": 3}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert root.object_len() == 3
+    assert num_of(root.get_field("a")) == 1
+    assert num_of(root.get_field("b")) == 2
+    assert num_of(root.get_field("c")) == 3
     0
 
 [[test]]
 fn test_parse_object_nested() -> i32
-    let root: *JsonValue = parse_or_null("{\"outer\": {\"inner\": 42}}")
-    assert root != null
-    assert root.kind == JSON_OBJECT
+    let root: Json = match json_parse("{\"outer\": {\"inner\": 42}}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert is_object(@root)
+    assert is_some(root.get_field("outer"))
+    assert num_of(sub(root.get_field("outer"), "inner")) == 42
+    0
 
-    let outer: *JsonValue = field(root, "outer")
-    assert outer != null
-    assert outer.kind == JSON_OBJECT
-
-    let inner: *JsonValue = field(outer, "inner")
-    assert inner != null
-    assert inner.kind == JSON_NUMBER
-    assert inner.num_val == 42
-
-    root.free()
+# Three levels of objects and arrays, reached by chained get_field/get_index.
+[[test]]
+fn test_parse_object_deeply_nested_lookups() -> i32
+    let root: Json = match json_parse("{\"a\": {\"b\": {\"c\": {\"d\": 4, \"e\": [10, {\"f\": \"deep\"}]}, \"x\": 3}, \"y\": 2}, \"z\": 1}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num_of(root.get_field("z")) == 1
+    assert num_of(sub(root.get_field("a"), "y")) == 2
+    assert num_of(sub(sub(root.get_field("a"), "b"), "x")) == 3
+    let c: Option<@Json> = sub(sub(root.get_field("a"), "b"), "c")
+    assert num_of(sub(c, "d")) == 4
+    assert num_of(nth(sub(c, "e"), 0)) == 10
+    assert str_is(str_of(sub(nth(sub(c, "e"), 1), "f")), "deep")
+    # A miss anywhere along the chain stays a miss.
+    assert not is_some(sub(sub(sub(root.get_field("a"), "b"), "nope"), "d"))
+    assert not is_some(sub(sub(root.get_field("a"), "x"), "x"))
+    # Each level is an object of the expected size.
+    assert root.object_len() == 2
+    match sub(root.get_field("a"), "b")
+        Some(b) =>
+            let r: @Json = b
+            assert r.object_len() == 2
+        None =>
+            assert false
     0
 
 # =============================================================================
@@ -363,78 +471,161 @@ fn test_parse_object_nested() -> i32
 
 [[test]]
 fn test_json_get_field_missing() -> i32
-    let root: *JsonValue = parse_or_null("{\"a\": 1}")
-    assert root != null
-
-    let missing: *JsonValue = field(root, "nonexistent")
-    assert missing == null
-
-    root.free()
+    let root: Json = match json_parse("{\"a\": 1}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert not is_some(root.get_field("nonexistent"))
     0
 
 [[test]]
 fn test_json_get_index_bounds() -> i32
-    let root: *JsonValue = parse_or_null("[1, 2, 3]")
-    assert root != null
-
+    let root: Json = match json_parse("[1, 2, 3]")
+        Ok(j) => j
+        Err(e) => return 1
     # Valid index
-    let valid: *JsonValue = at(root, 1)
-    assert valid != null
-
+    assert is_some(root.get_index(1))
     # Out of bounds
-    let oob: *JsonValue = at(root, 10)
-    assert oob == null
-
+    assert not is_some(root.get_index(10))
     # Negative index
-    let neg: *JsonValue = at(root, 0 - 1)
-    assert neg == null
-
-    root.free()
+    assert not is_some(root.get_index(0 - 1))
     0
 
 [[test]]
 fn test_json_array_len() -> i32
-    let root: *JsonValue = parse_or_null("[1, 2, 3, 4, 5]")
-    assert root != null
+    let root: Json = match json_parse("[1, 2, 3, 4, 5]")
+        Ok(j) => j
+        Err(e) => return 1
     assert root.array_len() == 5
-    root.free()
+    assert root.items().len == 5
     0
 
 [[test]]
 fn test_json_object_len() -> i32
-    let root: *JsonValue = parse_or_null("{\"a\": 1, \"b\": 2}")
-    assert root != null
+    let root: Json = match json_parse("{\"a\": 1, \"b\": 2}")
+        Ok(j) => j
+        Err(e) => return 1
     assert root.object_len() == 2
-    root.free()
+    0
+
+# A value of another kind has no items and no members.
+[[test]]
+fn test_json_len_of_other_kinds_is_zero() -> i32
+    let n: Json = match json_parse("7")
+        Ok(j) => j
+        Err(e) => return 1
+    assert n.array_len() == 0
+    assert n.object_len() == 0
+    let arr: Json = match json_parse("[1]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert arr.object_len() == 0
+    let obj: Json = match json_parse("{\"a\": 1}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert obj.array_len() == 0
+    0
+
+# members() lists the pairs in document order, duplicates included.
+[[test]]
+fn test_json_members_in_document_order() -> i32
+    let root: Json = match json_parse("{\"z\": 1, \"a\": 2, \"z\": 3}")
+        Ok(j) => j
+        Err(e) => return 1
+    let ms: Span<JsonMember> = root.members()
+    assert ms.len == 3
+    let base: *JsonMember = ms.ptr
+    assert (*(base + 0)).key.eq("z")
+    assert (*(base + 1)).key.eq("a")
+    assert (*(base + 2)).key.eq("z")
+    assert num(@(*(base + 2)).value) == 3
+    # get_field finds the first of the duplicates.
+    assert num_of(root.get_field("z")) == 1
+    0
+
+[[test]]
+fn test_json_items_in_order() -> i32
+    let root: Json = match json_parse("[5, 6, 7]")
+        Ok(j) => j
+        Err(e) => return 1
+    let xs: Span<Json> = root.items()
+    assert xs.len == 3
+    let base: *Json = xs.ptr
+    assert num(@*(base + 0)) == 5
+    assert num(@*(base + 2)) == 7
     0
 
 # =============================================================================
-# Error Handling Tests
+# Error Handling Tests.  The kind says what was wrong, pos where.
 # =============================================================================
 
 [[test]]
 fn test_parse_invalid_empty() -> i32
-    let root: *JsonValue = parse_or_null("")
-    # Empty input should fail to parse
-    assert root == null
+    assert err_code("") == K_UNEXPECTED_CHAR
+    assert err_code("   ") == K_UNEXPECTED_CHAR
     0
 
 [[test]]
 fn test_parse_invalid_unclosed_string() -> i32
-    let root: *JsonValue = parse_or_null("\"unclosed")
-    assert root == null
+    assert err_code("\"unclosed") == K_UNTERMINATED_STRING
+    assert err_pos("\"unclosed") == 9
+    # A trailing backslash does not hide the missing quote.
+    assert err_code("\"ab\\") == K_UNTERMINATED_STRING
+    assert err_code("\"ab\\\"") == K_UNTERMINATED_STRING
     0
 
 [[test]]
 fn test_parse_invalid_unclosed_array() -> i32
-    let root: *JsonValue = parse_or_null("[1, 2")
-    assert root == null
+    assert err_code("[1, 2") == K_EXPECTED_BRACKET
+    # Nothing after the bracket: a value was expected.
+    assert err_code("[") == K_UNEXPECTED_CHAR
+    assert err_code("[1 2]") == K_EXPECTED_BRACKET
+    assert err_pos("[1 2]") == 3
     0
 
 [[test]]
 fn test_parse_invalid_unclosed_object() -> i32
-    let root: *JsonValue = parse_or_null("{\"a\": 1")
-    assert root == null
+    assert err_code("{\"a\": 1") == K_EXPECTED_BRACE
+    assert err_code("{") == K_UNEXPECTED_CHAR
+    assert err_code("{\"a\": 1 \"b\": 2}") == K_EXPECTED_BRACE
+    0
+
+[[test]]
+fn test_parse_invalid_missing_colon() -> i32
+    assert err_code("{\"a\" 1}") == K_EXPECTED_COLON
+    assert err_pos("{\"a\" 1}") == 5
+    assert err_code("{\"a\"}") == K_EXPECTED_COLON
+    0
+
+[[test]]
+fn test_parse_invalid_unexpected_char() -> i32
+    assert err_code("x") == K_UNEXPECTED_CHAR
+    assert err_code("tru") == K_UNEXPECTED_CHAR
+    assert err_code("nul") == K_UNEXPECTED_CHAR
+    assert err_code("[1,]") == K_UNEXPECTED_CHAR
+    assert err_pos("[1,]") == 3
+    assert err_code("[,1]") == K_UNEXPECTED_CHAR
+    # An object key must be a string.
+    assert err_code("{1: 2}") == K_UNEXPECTED_CHAR
+    assert err_code("{\"a\": }") == K_UNEXPECTED_CHAR
+    0
+
+# An error deep inside is the inner error, not the outer container's.
+[[test]]
+fn test_parse_invalid_error_reports_innermost() -> i32
+    assert err_code("[1, [2, {\"a\": \"x\"},") == K_UNEXPECTED_CHAR
+    assert err_code("{\"a\": [1, 2}") == K_EXPECTED_BRACKET
+    assert err_pos("{\"a\": [1, 2}") == 11
+    assert err_code("[{\"a\": 1]") == K_EXPECTED_BRACE
+    assert err_code("[{\"a\" 1}]") == K_EXPECTED_COLON
+    0
+
+# Trailing input after the first value is ignored.
+[[test]]
+fn test_parse_ignores_trailing_input() -> i32
+    let root: Json = match json_parse("[1] garbage")
+        Ok(j) => j
+        Err(e) => return 1
+    assert root.array_len() == 1
     0
 
 # =============================================================================
@@ -443,29 +634,27 @@ fn test_parse_invalid_unclosed_object() -> i32
 
 [[test]]
 fn test_parse_whitespace_around_value() -> i32
-    let root: *JsonValue = parse_or_null("   42   ")
-    assert root != null
-    assert root.kind == JSON_NUMBER
-    assert root.num_val == 42
-    root.free()
+    let root: Json = match json_parse("   42   ")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num(@root) == 42
     0
 
 [[test]]
 fn test_parse_whitespace_in_array() -> i32
-    let root: *JsonValue = parse_or_null("[ 1 , 2 , 3 ]")
-    assert root != null
-    assert root.kind == JSON_ARRAY
-    assert root.count == 3
-    root.free()
+    let root: Json = match json_parse("[ 1 , 2 , 3 ]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert root.array_len() == 3
     0
 
 [[test]]
 fn test_parse_whitespace_in_object() -> i32
-    let root: *JsonValue = parse_or_null("{ \"a\" : 1 , \"b\" : 2 }")
-    assert root != null
-    assert root.kind == JSON_OBJECT
-    assert root.count == 2
-    root.free()
+    let root: Json = match json_parse("{ \"a\" : 1 , \"b\" : 2 }")
+        Ok(j) => j
+        Err(e) => return 1
+    assert root.object_len() == 2
+    assert num_of(root.get_field("b")) == 2
     0
 
 # =============================================================================
@@ -476,8 +665,9 @@ fn test_parse_whitespace_in_object() -> i32
 # (AGAST #4648): two emits into one buffer are the two texts back to back.
 [[test]]
 fn test_emit_appends_to_buffer() -> i32
-    let root: *JsonValue = parse_or_null("[1, true]")
-    assert root != null
+    let root: Json = match json_parse("[1, true]")
+        Ok(j) => j
+        Err(e) => return 1
 
     var buf: Vec<u8> = vec_with_cap<u8>(16)
     root.emit(@&buf)
@@ -487,158 +677,80 @@ fn test_emit_appends_to_buffer() -> i32
     assert buf.len == want.len
     for i in 0..want.len
         assert buf.get(i) == *(want.ptr + i)
-
-    root.free()
     0
 
 [[test]]
 fn test_emit_null() -> i32
-    let root: *JsonValue = parse_or_null("null")
-    assert root != null
-
-    var output: String = root.to_string()
-    assert output.eq("null")
-
-    root.free()
+    assert reemit("null").eq("null")
     0
 
 [[test]]
-fn test_emit_bool_true() -> i32
-    let root: *JsonValue = parse_or_null("true")
-    assert root != null
-
-    var output: String = root.to_string()
-    assert output.eq("true")
-
-    root.free()
+fn test_emit_bool() -> i32
+    assert reemit("true").eq("true")
+    assert reemit("false").eq("false")
     0
 
 [[test]]
 fn test_emit_number() -> i32
-    let root: *JsonValue = parse_or_null("42")
-    assert root != null
-
-    var output: String = root.to_string()
-    assert output.eq("42")
-
-    root.free()
+    assert reemit("42").eq("42")
+    assert reemit("-7").eq("-7")
+    assert reemit("0").eq("0")
+    assert reemit("9223372036854775807").eq("9223372036854775807")
+    assert reemit("-9223372036854775808").eq("-9223372036854775808")
+    # Fractions were dropped at parse time.
+    assert reemit("3.99").eq("3")
     0
 
 [[test]]
 fn test_emit_string() -> i32
-    let root: *JsonValue = parse_or_null("\"hello\"")
-    assert root != null
-
-    var output: String = root.to_string()
-    assert output.eq("\"hello\"")
-
-    root.free()
+    assert reemit("\"hello\"").eq("\"hello\"")
+    assert reemit("\"\"").eq("\"\"")
     0
 
 [[test]]
 fn test_emit_array() -> i32
-    let root: *JsonValue = parse_or_null("[1, 2, 3]")
-    assert root != null
-
-    var output: String = root.to_string()
-    assert output.eq("[1, 2, 3]")
-
-    root.free()
+    assert reemit("[1, 2, 3]").eq("[1, 2, 3]")
+    assert reemit("[]").eq("[]")
+    assert reemit("[ 1,2 ,3 ]").eq("[1, 2, 3]")
     0
 
 [[test]]
 fn test_emit_object() -> i32
-    # Note: Object key order may not be preserved in the same way
-    let root: *JsonValue = parse_or_null("{\"a\": 1}")
-    assert root != null
-
-    var output: String = root.to_string()
-    assert output.eq("{\"a\": 1}")
-
-    root.free()
+    assert reemit("{\"a\": 1}").eq("{\"a\": 1}")
+    assert reemit("{}").eq("{}")
+    # Members keep document order.
+    assert reemit("{\"b\":2,\"a\":1}").eq("{\"b\": 2, \"a\": 1}")
     0
 
 # =============================================================================
-# Deprecated wrapper json_parse2(ptr, len): same Result as json_parse
+# Errors as values: the message for each kind, and Display.
 # =============================================================================
 
-[[test]]
-fn test_parse2_success() -> i32
-    let input = c"{\"key\": 42}"
-    var result: Result<*JsonValue, JsonError> = json_parse2(Span<u8> { ptr: (input), len: (strlen(input)) as i64 })
-    let success: i32 = match result
-        Ok(root) => check_parse2_result(root, 42)
-        Err(err) => 1
-    success
+fn message_of(kind: JsonErrorKind) -> StrView
+    let e: JsonError = JsonError { kind: kind, pos: 0 }
+    e.message()
 
-fn check_parse2_result(root: *JsonValue, expected: i64) -> i32
-    if root.kind != JSON_OBJECT
-        root.free()
-        return 1
-    let val: *JsonValue = field(root, "key")
-    if val == null or val.num_val != expected
-        root.free()
-        return 1
-    root.free()
+[[test]]
+fn test_error_message_table() -> i32
+    assert message_of(JsonErrorKind.UnexpectedChar).eq("unexpected character")
+    assert message_of(JsonErrorKind.UnterminatedString).eq("unterminated string")
+    assert message_of(JsonErrorKind.ExpectedColon).eq("expected ':'")
+    assert message_of(JsonErrorKind.ExpectedBracket).eq("expected ']'")
+    assert message_of(JsonErrorKind.ExpectedBrace).eq("expected '}'")
+    assert message_of(JsonErrorKind.OutOfMemory).eq("out of memory")
+    assert message_of(JsonErrorKind.InvalidEscape).eq("invalid escape")
+    assert message_of(JsonErrorKind.ControlChar).eq("control character in string")
     0
 
+# The message of an error a parse really returned.
 [[test]]
-fn test_parse2_error() -> i32
-    let input = c""
-    var result: Result<*JsonValue, JsonError> = json_parse2(Span<u8> { ptr: (input), len: (0) as i64 })
-    let success: i32 = match result
-        Ok(root) => handle_unexpected_ok(root)
-        Err(err) => check_err_code(err.code, JSON_ERR_UNEXPECTED_CHAR)
-    success
-
-fn handle_unexpected_ok(root: *JsonValue) -> i32
-    root.free()
-    1
-
-fn check_err_code(got: i32, expected: i32) -> i32
-    if got == expected
-        return 0
-    1
-
-[[test]]
-fn test_parse2_null() -> i32
-    let input = c"null"
-    var result: Result<*JsonValue, JsonError> = json_parse2(Span<u8> { ptr: (input), len: (strlen(input)) as i64 })
-    let success: i32 = match result
-        Ok(root) => check_null_result(root)
-        Err(err) => 1
-    success
-
-fn check_null_result(root: *JsonValue) -> i32
-    if root.kind == JSON_NULL
-        root.free()
-        return 0
-    root.free()
-    1
-
-[[test]]
-fn test_parse2_array() -> i32
-    let input = c"[1, 2, 3]"
-    var result: Result<*JsonValue, JsonError> = json_parse2(Span<u8> { ptr: (input), len: (strlen(input)) as i64 })
-    let success: i32 = match result
-        Ok(root) => check_array_result(root, 3)
-        Err(err) => 1
-    success
-
-fn check_array_result(root: *JsonValue, expected_count: i64) -> i32
-    if root.kind == JSON_ARRAY and root.count == expected_count
-        root.free()
-        return 0
-    root.free()
-    1
-
-[[test]]
-fn test_error_message() -> i32
-    let msg: StrView = json_error_message(JSON_ERR_UNEXPECTED_CHAR)
-    assert msg.eq("unexpected character")
-    let msg2: StrView = json_error_message(JSON_ERR_UNTERMINATED_STRING)
-    assert msg2.eq("unterminated string")
-    assert (json_error_message(99)).eq("unknown error")
+fn test_error_message_from_parse() -> i32
+    match json_parse("{\"a\" 1}")
+        Ok(v) =>
+            assert false
+        Err(e) =>
+            assert e.message().eq("expected ':'")
+            assert e.pos == 5
     0
 
 # =============================================================================
@@ -646,173 +758,132 @@ fn test_error_message() -> i32
 # distinct from a present 0 / false / "".
 # =============================================================================
 
-fn is_some(o: Option<*JsonValue>) -> bool
-    match o
-        Some(v) => true
-        None => false
-
-fn str_is(o: Option<StrView>, want: StrView) -> bool
-    match o
-        Some(sv) => sv.eq(want)
-        None => false
-
-fn str_none(o: Option<StrView>) -> bool
-    match o
-        Some(sv) => false
-        None => true
-
-# 1 for Some(true), 0 for Some(false), -1 for None.
-fn bool_state(o: Option<bool>) -> i32
-    match o
-        Some(b) => if b then 1 else 0
-        None => 0 - 1
-
-fn err_pos(r: Result<*JsonValue, JsonError>) -> i64
-    match r
-        Ok(v) => 0 - 1
-        Err(e) => e.pos
-
 [[test]]
 fn test_parse_respects_strview_len() -> i32
     # Only the first two bytes are in view: "12", not 12345.
-    let root: *JsonValue = parse_or_null(strview_from_ptr(c"12345", 2))
-    assert root != null
-    assert num(root) == 12
-    root.free()
+    let whole: StrView = "12345"
+    let root: Json = match json_parse(whole.slice(0, 2))
+        Ok(j) => j
+        Err(e) => return 1
+    assert num(@root) == 12
     0
 
 [[test]]
 fn test_parse_error_pos() -> i32
-    assert err_pos(json_parse("[1, 2")) == 5
-    assert err_pos(json_parse("")) == 0
+    assert err_pos("[1, 2") == 5
+    assert err_pos("") == 0
     0
 
 [[test]]
 fn test_get_field_option() -> i32
-    let root: *JsonValue = parse_or_null("{\"name\": \"x\", \"zero\": 0}")
-    assert root != null
+    let root: Json = match json_parse("{\"name\": \"x\", \"zero\": 0}")
+        Ok(j) => j
+        Err(e) => return 1
     assert is_some(root.get_field("name"))
     assert not is_some(root.get_field("missing"))
     assert not is_some(root.get_field("nam"))
-    assert not is_some((null as *JsonValue).get_field("name"))
-    # A present 0 is Some(0), not the old missing-field default.
-    assert num(field(root, "zero")) == 0
-    assert num(field(root, "missing")) == NO_NUMBER
-    root.free()
+    # A present 0 is Some(0), not a missing-field default.
+    assert num_of(root.get_field("zero")) == 0
+    assert num_of(root.get_field("missing")) == NO_NUMBER
     0
 
 [[test]]
 fn test_get_field_strview_key_not_nul_terminated() -> i32
-    let root: *JsonValue = parse_or_null("{\"name\": 7}")
-    assert root != null
+    let root: Json = match json_parse("{\"name\": 7}")
+        Ok(j) => j
+        Err(e) => return 1
     # "names" sliced to 4 bytes: matches by length, not by a terminator.
-    assert num(field(root, ("names").slice(0, 4))) == 7
+    let names: StrView = "names"
+    assert num_of(root.get_field(names.slice(0, 4))) == 7
     assert not is_some(root.get_field("names"))
-    root.free()
     0
 
 [[test]]
 fn test_get_field_on_non_object() -> i32
-    let root: *JsonValue = parse_or_null("[1]")
-    assert root != null
+    let root: Json = match json_parse("[1]")
+        Ok(j) => j
+        Err(e) => return 1
     assert not is_some(root.get_field("0"))
-    root.free()
     0
 
 [[test]]
 fn test_get_index_option() -> i32
-    let root: *JsonValue = parse_or_null("[0, 1]")
-    assert root != null
+    let root: Json = match json_parse("[0, 1]")
+        Ok(j) => j
+        Err(e) => return 1
     assert is_some(root.get_index(0))
     assert is_some(root.get_index(1))
     assert not is_some(root.get_index(2))
     assert not is_some(root.get_index(0 - 1))
-    assert num(at(root, 0)) == 0
-    let obj: *JsonValue = parse_or_null("{\"a\": 1}")
+    assert num_of(root.get_index(0)) == 0
+    let obj: Json = match json_parse("{\"a\": 1}")
+        Ok(j) => j
+        Err(e) => return 1
     assert not is_some(obj.get_index(0))
-    obj.free()
-    root.free()
     0
 
 [[test]]
 fn test_get_string_option() -> i32
-    let root: *JsonValue = parse_or_null("[\"hello\", \"\", 5]")
-    assert root != null
-    assert str_is(at(root, 0).get_string(), "hello")
-    assert str_is(at(root, 1).get_string(), "")
-    assert str_none(at(root, 2).get_string())
-    assert str_none((null as *JsonValue).get_string())
-    root.free()
+    let root: Json = match json_parse("[\"hello\", \"\", 5]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert str_is(str_of(nth(Some(@root), 0)), "hello")
+    assert str_is(str_of(nth(Some(@root), 1)), "")
+    assert str_none(str_of(nth(Some(@root), 2)))
     0
 
 [[test]]
 fn test_get_string_len_counts_escapes_once() -> i32
-    let root: *JsonValue = parse_or_null("\"a\\tb\"")
-    assert root != null
+    let root: Json = match json_parse("\"a\\tb\"")
+        Ok(j) => j
+        Err(e) => return 1
     # The view spans the decoded bytes: a, TAB, b.
     let want: [3]u8 = [97, 9, 98]
     assert str_is(root.get_string(), strview_from_ptr(@want[0], 3))
-    root.free()
     0
 
 [[test]]
 fn test_get_number_option() -> i32
-    let root: *JsonValue = parse_or_null("[-7, \"7\", null]")
-    assert root != null
-    assert num(at(root, 0)) == 0 - 7
-    assert num(at(root, 1)) == NO_NUMBER
-    assert num(at(root, 2)) == NO_NUMBER
-    assert num(null as *JsonValue) == NO_NUMBER
-    root.free()
+    let root: Json = match json_parse("[-7, \"7\", null]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num_of(root.get_index(0)) == 0 - 7
+    assert num_of(root.get_index(1)) == NO_NUMBER
+    assert num_of(root.get_index(2)) == NO_NUMBER
     0
 
 [[test]]
 fn test_get_bool_option() -> i32
-    let root: *JsonValue = parse_or_null("[true, false, 0, null]")
-    assert root != null
-    assert bool_state(at(root, 0).get_bool()) == 1
-    assert bool_state(at(root, 1).get_bool()) == 0
-    assert bool_state(at(root, 2).get_bool()) == 0 - 1
-    assert bool_state(at(root, 3).get_bool()) == 0 - 1
-    assert bool_state((null as *JsonValue).get_bool()) == 0 - 1
-    root.free()
+    let root: Json = match json_parse("[true, false, 0, null]")
+        Ok(j) => j
+        Err(e) => return 1
+    assert bool_state(bool_of(nth(Some(@root), 0))) == 1
+    assert bool_state(bool_of(nth(Some(@root), 1))) == 0
+    assert bool_state(bool_of(nth(Some(@root), 2))) == 0 - 1
+    assert bool_state(bool_of(nth(Some(@root), 3))) == 0 - 1
     0
 
 [[test]]
 fn test_to_string_roundtrip_is_owned_string() -> i32
-    let root: *JsonValue = parse_or_null("{\"k\": [1, \"a\\\"b\", null, true]}")
-    assert root != null
+    let root: Json = match json_parse("{\"k\": [1, \"a\\\"b\", null, true]}")
+        Ok(j) => j
+        Err(e) => return 1
     var out: String = root.to_string()
     assert out.eq("{\"k\": [1, \"a\\\"b\", null, true]}")
     assert out.len() == 30
     # Re-parse the emitted text: a fixed point.
-    let again: *JsonValue = parse_or_null(out.as_view())
-    assert again != null
+    let again: Json = match json_parse(out.as_view())
+        Ok(j) => j
+        Err(e) => return 1
     var out2: String = again.to_string()
     assert out.eq_string(@out2)
-    again.free()
-    root.free()
     0
 
 # =============================================================================
 # String escapes (AGAST #3914): \b \f \/ and \uXXXX decoded to UTF-8, a
 # surrogate pair combined into one 4-byte sequence.  A malformed \u escape is
-# JSON_ERR_INVALID_ESCAPE at the offset of its backslash.
+# InvalidEscape at the offset of its backslash.
 # =============================================================================
-
-fn err_code(r: Result<*JsonValue, JsonError>) -> i32
-    match r
-        Ok(v) => 0 - 1
-        Err(e) => e.code
-
-# Parse `input` (one JSON string) and compare its decoded bytes with want[0..n].
-fn decodes_to(input: StrView, want: *u8, n: i64) -> bool
-    let root: *JsonValue = parse_or_null(input)
-    if root == null
-        return false
-    let ok: bool = str_is(root.get_string(), strview_from_ptr(want, n))
-    root.free()
-    ok
 
 [[test]]
 fn test_escape_backspace() -> i32
@@ -886,107 +957,78 @@ fn test_escape_u_mixed_document() -> i32
 [[test]]
 fn test_escape_u_lone_high_surrogate() -> i32
     # High surrogate then the closing quote.
-    let r: Result<*JsonValue, JsonError> = json_parse("\"ab\\ud83d\"")
-    assert err_code(r) == JSON_ERR_INVALID_ESCAPE
-    assert err_pos(json_parse("\"ab\\ud83d\"")) == 3
+    assert err_code("\"ab\\ud83d\"") == K_INVALID_ESCAPE
+    assert err_pos("\"ab\\ud83d\"") == 3
     0
 
 [[test]]
 fn test_escape_u_high_surrogate_then_plain_text() -> i32
-    assert err_code(json_parse("\"\\ud83dxxxxxx\"")) == JSON_ERR_INVALID_ESCAPE
+    assert err_code("\"\\ud83dxxxxxx\"") == K_INVALID_ESCAPE
     0
 
 [[test]]
 fn test_escape_u_high_surrogate_then_non_low() -> i32
     # A second \u that is not a low surrogate does not complete the pair.
-    assert err_code(json_parse("\"\\ud83d\\u0041\"")) == JSON_ERR_INVALID_ESCAPE
-    assert err_pos(json_parse("\"\\ud83d\\u0041\"")) == 1
+    assert err_code("\"\\ud83d\\u0041\"") == K_INVALID_ESCAPE
+    assert err_pos("\"\\ud83d\\u0041\"") == 1
     # Two high surrogates in a row.
-    assert err_code(json_parse("\"\\ud83d\\ud83d\"")) == JSON_ERR_INVALID_ESCAPE
+    assert err_code("\"\\ud83d\\ud83d\"") == K_INVALID_ESCAPE
     0
 
 [[test]]
 fn test_escape_u_lone_low_surrogate() -> i32
-    assert err_code(json_parse("\"a\\ude00b\"")) == JSON_ERR_INVALID_ESCAPE
-    assert err_pos(json_parse("\"a\\ude00b\"")) == 2
+    assert err_code("\"a\\ude00b\"") == K_INVALID_ESCAPE
+    assert err_pos("\"a\\ude00b\"") == 2
     0
 
 [[test]]
 fn test_escape_u_bad_hex_digit() -> i32
-    assert err_code(json_parse("\"\\u00g9\"")) == JSON_ERR_INVALID_ESCAPE
-    assert err_pos(json_parse("\"\\u00g9\"")) == 1
+    assert err_code("\"\\u00g9\"") == K_INVALID_ESCAPE
+    assert err_pos("\"\\u00g9\"") == 1
     # Bad hex in the low half of a pair.
-    assert err_code(json_parse("\"\\ud83d\\ude0z\"")) == JSON_ERR_INVALID_ESCAPE
+    assert err_code("\"\\ud83d\\ude0z\"") == K_INVALID_ESCAPE
     0
 
 [[test]]
 fn test_escape_u_truncated() -> i32
     # Fewer than four hex digits before the closing quote.
-    assert err_code(json_parse("\"\\u00e\"")) == JSON_ERR_INVALID_ESCAPE
+    assert err_code("\"\\u00e\"") == K_INVALID_ESCAPE
     0
 
 [[test]]
 fn test_escape_u_error_inside_container() -> i32
-    # The code survives the array/object unwinding.
-    assert err_code(json_parse("[1, {\"k\": \"\\uzzzz\"}]")) == JSON_ERR_INVALID_ESCAPE
-    assert err_code(json_parse("{\"\\ude00\": 1}")) == JSON_ERR_INVALID_ESCAPE
-    0
-
-[[test]]
-fn test_error_message_invalid_escape() -> i32
-    assert (json_error_message(JSON_ERR_INVALID_ESCAPE)).eq("invalid escape")
-    0
-
-# The whole message table, ends included.  JSON_ERR_INVALID_ESCAPE is the last
-# code: the one after it must be "unknown error".  examples/tier5_async/
-# 79_ritzlib_json prints codes 0..8 against a golden, so adding a code moves
-# that golden too -- update both in the same commit (the gate's corpus run,
-# not ritzlib/tests, is what caught it last time).
-[[test]]
-fn test_error_message_table() -> i32
-    assert (json_error_message(JSON_ERR_NONE)).eq("unknown error")
-    assert (json_error_message(JSON_ERR_UNEXPECTED_CHAR)).eq("unexpected character")
-    assert (json_error_message(JSON_ERR_UNTERMINATED_STRING)).eq("unterminated string")
-    assert (json_error_message(JSON_ERR_EXPECTED_COLON)).eq("expected ':'")
-    assert (json_error_message(JSON_ERR_EXPECTED_BRACKET)).eq("expected ']'")
-    assert (json_error_message(JSON_ERR_EXPECTED_BRACE)).eq("expected '}'")
-    assert (json_error_message(JSON_ERR_OUT_OF_MEMORY)).eq("out of memory")
-    assert (json_error_message(JSON_ERR_INVALID_ESCAPE)).eq("invalid escape")
-    assert JSON_ERR_INVALID_ESCAPE == 7
-    assert (json_error_message(JSON_ERR_CONTROL_CHAR)).eq("control character in string")
-    assert JSON_ERR_CONTROL_CHAR == 8
-    assert (json_error_message(JSON_ERR_CONTROL_CHAR + 1)).eq("unknown error")
-    assert (json_error_message(-1)).eq("unknown error")
+    # The kind survives the array/object unwinding.
+    assert err_code("[1, {\"k\": \"\\uzzzz\"}]") == K_INVALID_ESCAPE
+    assert err_code("{\"\\ude00\": 1}") == K_INVALID_ESCAPE
     0
 
 # =============================================================================
 # Unknown escapes and \u0000 (AGAST #3918).  RFC 8259 allows only
-# \" \\ \/ \b \f \n \r \t \uXXXX; any other escape is JSON_ERR_INVALID_ESCAPE
-# at its backslash (it used to decode "\q" to "q").  \u0000 is valid JSON and
-# is kept in a string value -- str_len and json_get_string carry it -- but
-# rejected in an object key, which is a NUL-terminated *u8 with no length:
-# {"a\u0000b": 1} would otherwise be found by json_get_field(obj, "a").
+# \" \\ \/ \b \f \n \r \t \uXXXX; any other escape is InvalidEscape at its
+# backslash.  \u0000 is valid JSON and is kept in a string value and in an
+# object key: both are length-checked Strings, so {"a\u0000b": 1} is not found
+# by get_field("a").
 # =============================================================================
 
 [[test]]
 fn test_escape_unknown_rejected() -> i32
-    assert err_code(json_parse("\"\\q\"")) == JSON_ERR_INVALID_ESCAPE
-    assert err_pos(json_parse("\"\\q\"")) == 1
-    assert err_code(json_parse("\"ab\\xcd\"")) == JSON_ERR_INVALID_ESCAPE
-    assert err_pos(json_parse("\"ab\\xcd\"")) == 3
+    assert err_code("\"\\q\"") == K_INVALID_ESCAPE
+    assert err_pos("\"\\q\"") == 1
+    assert err_code("\"ab\\xcd\"") == K_INVALID_ESCAPE
+    assert err_pos("\"ab\\xcd\"") == 3
     # Escapes other languages have but JSON does not.
-    assert err_code(json_parse("\"\\'\"")) == JSON_ERR_INVALID_ESCAPE
-    assert err_code(json_parse("\"\\0\"")) == JSON_ERR_INVALID_ESCAPE
-    assert err_code(json_parse("\"\\a\"")) == JSON_ERR_INVALID_ESCAPE
-    assert err_code(json_parse("\"\\U0041\"")) == JSON_ERR_INVALID_ESCAPE
+    assert err_code("\"\\'\"") == K_INVALID_ESCAPE
+    assert err_code("\"\\0\"") == K_INVALID_ESCAPE
+    assert err_code("\"\\a\"") == K_INVALID_ESCAPE
+    assert err_code("\"\\U0041\"") == K_INVALID_ESCAPE
     0
 
 [[test]]
 fn test_escape_unknown_in_container_and_key() -> i32
-    assert err_code(json_parse("[1, {\"k\": \"a\\qb\"}]")) == JSON_ERR_INVALID_ESCAPE
-    assert err_pos(json_parse("[1, {\"k\": \"a\\qb\"}]")) == 12
-    assert err_code(json_parse("{\"\\q\": 1}")) == JSON_ERR_INVALID_ESCAPE
-    assert err_pos(json_parse("{\"\\q\": 1}")) == 2
+    assert err_code("[1, {\"k\": \"a\\qb\"}]") == K_INVALID_ESCAPE
+    assert err_pos("[1, {\"k\": \"a\\qb\"}]") == 12
+    assert err_code("{\"\\q\": 1}") == K_INVALID_ESCAPE
+    assert err_pos("{\"\\q\": 1}") == 2
     0
 
 [[test]]
@@ -997,60 +1039,94 @@ fn test_escape_all_rfc_escapes_still_accepted() -> i32
 
 [[test]]
 fn test_escape_u0000_kept_in_value() -> i32
-    # The NUL is in the value and counted by str_len: nothing after it is lost.
+    # The NUL is in the value and counted: nothing after it is lost.
     let want: [3]u8 = [97, 0, 98]
     assert decodes_to("\"a\\u0000b\"", @want[0], 3)
-    let root: *JsonValue = parse_or_null("\"a\\u0000b\"")
-    assert root != null
-    assert root.str_len == 3
-    root.free()
+    let root: Json = match json_parse("\"a\\u0000b\"")
+        Ok(j) => j
+        Err(e) => return 1
+    match root.get_string()
+        Some(sv) =>
+            assert sv.len == 3
+        None =>
+            assert false
     0
 
+# \u0000 in an object key is accepted: the key is a String with a length.
 [[test]]
-fn test_escape_u0000_rejected_in_key() -> i32
-    assert err_code(json_parse("{\"a\\u0000b\": 1}")) == JSON_ERR_INVALID_ESCAPE
-    assert err_pos(json_parse("{\"a\\u0000b\": 1}")) == 3
-    # Nested object key, after a valid member.
-    assert err_code(json_parse("{\"x\": {\"\\u0000\": 1}}")) == JSON_ERR_INVALID_ESCAPE
-    # Other \u escapes in a key are fine.
-    let root: *JsonValue = parse_or_null("{\"\\u0041\": 7}")
-    assert root != null
-    assert num(field(root, "A")) == 7
-    root.free()
+fn test_escape_u0000_accepted_in_key() -> i32
+    assert parses("{\"a\\u0000b\": 1}")
+    assert parses("{\"x\": {\"\\u0000\": 1}}")
+    # Other \u escapes in a key are fine too.
+    let root: Json = match json_parse("{\"\\u0041\": 7}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num_of(root.get_field("A")) == 7
+    0
+
+# {"a\u0000b": 1, "a": 2}: the 3-byte key and the 1-byte key are distinct.
+[[test]]
+fn test_key_with_embedded_nul_is_distinct() -> i32
+    let root: Json = match json_parse("{\"a\\u0000b\": 1, \"a\": 2}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert root.members().len == 2
+    assert num_of(root.get_field("a")) == 2
+    var key: String = string_new()
+    assert key.push(97)
+    assert key.push(0)
+    assert key.push(98)
+    assert key.len() == 3
+    assert num_of(root.get_field(key.as_view())) == 1
+    # Neither prefix of the 3-byte key matches it.
+    let whole_key: StrView = key.as_view()
+    let prefix: StrView = whole_key.slice(0, 2)
+    assert not is_some(root.get_field(prefix))
+    assert not is_some(root.get_field("b"))
+    # The members themselves hold the 3-byte key.
+    let base: *JsonMember = root.members().ptr
+    assert (*base).key.len() == 3
+    assert (*(base + 1)).key.len() == 1
+    # And it is written back as \u0000, then parses to the same thing.
+    var text: String = root.to_string()
+    assert text.eq("{\"a\\u0000b\": 1, \"a\": 2}")
+    let again: Json = match json_parse(text.as_view())
+        Ok(j) => j
+        Err(e) => return 1
+    assert num_of(again.get_field(key.as_view())) == 1
+    assert num_of(again.get_field("a")) == 2
     0
 
 # =============================================================================
 # Raw control characters (AGAST #3941).  RFC 8259 §7: U+0000-U+001F must be
-# escaped inside a string.  A raw one is JSON_ERR_CONTROL_CHAR at that byte;
-# it used to be copied, and a raw 0x00 in a key truncated the key just as
-# \u0000 did before #3918.  Whitespace between tokens (tab, LF, CR) is not
-# inside a string and stays legal.
+# escaped inside a string.  A raw one is ControlChar at that byte.  Whitespace
+# between tokens (tab, LF, CR) is not inside a string and stays legal.
 # =============================================================================
 
 [[test]]
 fn test_control_char_raw_tab_newline_cr_rejected() -> i32
-    assert err_code(json_parse("\"a\tb\"")) == JSON_ERR_CONTROL_CHAR
-    assert err_pos(json_parse("\"a\tb\"")) == 2
-    assert err_code(json_parse("\"a\nb\"")) == JSON_ERR_CONTROL_CHAR
-    assert err_pos(json_parse("\"a\nb\"")) == 2
-    assert err_code(json_parse("\"\rb\"")) == JSON_ERR_CONTROL_CHAR
-    assert err_pos(json_parse("\"\rb\"")) == 1
+    assert err_code("\"a\tb\"") == K_CONTROL_CHAR
+    assert err_pos("\"a\tb\"") == 2
+    assert err_code("\"a\nb\"") == K_CONTROL_CHAR
+    assert err_pos("\"a\nb\"") == 2
+    assert err_code("\"\rb\"") == K_CONTROL_CHAR
+    assert err_pos("\"\rb\"") == 1
     0
 
 [[test]]
 fn test_control_char_raw_nul_rejected_in_value() -> i32
     # "a<00>b" as a value: rejected at the NUL (offset 2).
     let src: [5]u8 = [34, 97, 0, 98, 34]
-    assert err_code(json_parse(strview_from_ptr(@src[0], 5))) == JSON_ERR_CONTROL_CHAR
-    assert err_pos(json_parse(strview_from_ptr(@src[0], 5))) == 2
+    assert err_code(strview_from_ptr(@src[0], 5)) == K_CONTROL_CHAR
+    assert err_pos(strview_from_ptr(@src[0], 5)) == 2
     0
 
 [[test]]
 fn test_control_char_raw_nul_rejected_in_key() -> i32
-    # {"a<00>b": 1} -- json_get_field(obj, "a") would have found it.
+    # {"a<00>b": 1}: a raw NUL is rejected in a key as in a value.
     let src: [10]u8 = [123, 34, 97, 0, 98, 34, 58, 32, 49, 125]
-    assert err_code(json_parse(strview_from_ptr(@src[0], 10))) == JSON_ERR_CONTROL_CHAR
-    assert err_pos(json_parse(strview_from_ptr(@src[0], 10))) == 3
+    assert err_code(strview_from_ptr(@src[0], 10)) == K_CONTROL_CHAR
+    assert err_pos(strview_from_ptr(@src[0], 10)) == 3
     0
 
 [[test]]
@@ -1058,9 +1134,9 @@ fn test_control_char_range_bounds() -> i32
     # 0x01 and 0x1F are the inner edges of the range; 0x20 and 0x7F (DEL,
     # which RFC 8259 does not require escaping) are accepted.
     let lo: [3]u8 = [34, 1, 34]
-    assert err_code(json_parse(strview_from_ptr(@lo[0], 3))) == JSON_ERR_CONTROL_CHAR
+    assert err_code(strview_from_ptr(@lo[0], 3)) == K_CONTROL_CHAR
     let hi: [3]u8 = [34, 31, 34]
-    assert err_code(json_parse(strview_from_ptr(@hi[0], 3))) == JSON_ERR_CONTROL_CHAR
+    assert err_code(strview_from_ptr(@hi[0], 3)) == K_CONTROL_CHAR
     let want_sp: [1]u8 = [32]
     assert decodes_to("\" \"", @want_sp[0], 1)
     let del: [3]u8 = [34, 127, 34]
@@ -1074,25 +1150,25 @@ fn test_control_char_range_bounds() -> i32
 
 [[test]]
 fn test_control_char_in_container_and_key() -> i32
-    assert err_code(json_parse("[1, {\"k\": \"a\tb\"}]")) == JSON_ERR_CONTROL_CHAR
-    assert err_pos(json_parse("[1, {\"k\": \"a\tb\"}]")) == 12
-    assert err_code(json_parse("{\"a\tb\": 1}")) == JSON_ERR_CONTROL_CHAR
-    assert err_pos(json_parse("{\"a\tb\": 1}")) == 3
+    assert err_code("[1, {\"k\": \"a\tb\"}]") == K_CONTROL_CHAR
+    assert err_pos("[1, {\"k\": \"a\tb\"}]") == 12
+    assert err_code("{\"a\tb\": 1}") == K_CONTROL_CHAR
+    assert err_pos("{\"a\tb\": 1}") == 3
     0
 
 [[test]]
 fn test_control_char_unterminated_reports_first_control() -> i32
     # A raw newline in an unclosed string is reported where it is, not at EOF.
-    assert err_code(json_parse("[\"open\n]")) == JSON_ERR_CONTROL_CHAR
-    assert err_pos(json_parse("[\"open\n]")) == 6
+    assert err_code("[\"open\n]") == K_CONTROL_CHAR
+    assert err_pos("[\"open\n]") == 6
     0
 
 [[test]]
 fn test_control_char_whitespace_between_tokens_ok() -> i32
-    let root: *JsonValue = parse_or_null("{\n\t\"a\":\r\n\t[1,\t2]\n}")
-    assert root != null
-    assert num(at(field(root, "a"), 1)) == 2
-    root.free()
+    let root: Json = match json_parse("{\n\t\"a\":\r\n\t[1,\t2]\n}")
+        Ok(j) => j
+        Err(e) => return 1
+    assert num_of(nth(root.get_field("a"), 1)) == 2
     0
 
 [[test]]
@@ -1103,25 +1179,138 @@ fn test_control_char_escaped_forms_still_accepted() -> i32
 
 [[test]]
 fn test_emit_u0000_value_round_trips() -> i32
-    # The emitter writes the value's str_len bytes, not up to the first NUL.
-    let root: *JsonValue = parse_or_null("\"a\\u0000b\"")
-    assert root != null
+    # The emitter writes every byte of the value, not up to the first NUL.
+    let root: Json = match json_parse("\"a\\u0000b\"")
+        Ok(j) => j
+        Err(e) => return 1
     var output: String = root.to_string()
     assert output.eq("\"a\\u0000b\"")
-    let again: *JsonValue = parse_or_null(output.as_view())
-    assert again != null
-    assert again.str_len == 3
-    again.free()
-    root.free()
+    let again: Json = match json_parse(output.as_view())
+        Ok(j) => j
+        Err(e) => return 1
+    match again.get_string()
+        Some(sv) =>
+            assert sv.len == 3
+        None =>
+            assert false
     0
 
 [[test]]
 fn test_emit_control_chars_as_u_escapes() -> i32
     # Raw control characters are not valid inside a JSON string: the emitter
     # writes \b \f by name and the rest of U+0000-U+001F as \u00XX.
-    let root: *JsonValue = parse_or_null("\"\\u0001\\b\\f\\u001f\"")
-    assert root != null
-    var output: String = root.to_string()
-    assert output.eq("\"\\u0001\\b\\f\\u001f\"")
-    root.free()
+    assert reemit("\"\\u0001\\b\\f\\u001f\"").eq("\"\\u0001\\b\\f\\u001f\"")
+    0
+
+# =============================================================================
+# RFC 8259 round trip: parse -> to_string -> parse -> to_string is a fixed
+# point over a document with every value kind, nesting and every escape.
+# =============================================================================
+
+fn rfc_doc() -> StrView
+    "{\"nul\": null, \"t\": true, \"f\": false, \"n\": -42, \"big\": 9223372036854775807, \"s\": \"q\\\" b\\\\ s\\/ \\b\\f\\n\\r\\t \\u00e9 \\u20ac \\ud83d\\ude00 \\u0001 \\u0000\", \"empty\": [], \"eo\": {}, \"arr\": [1, [2, [3, {\"k\": []}]], \"x\"], \"obj\": {\"a\": {\"b\": {\"c\": [null, false]}}}, \"k\\\"ey\\n\": 0}"
+
+[[test]]
+fn test_rfc8259_round_trip() -> i32
+    let first: Json = match json_parse(rfc_doc())
+        Ok(j) => j
+        Err(e) => return 1
+    var text1: String = first.to_string()
+    let second: Json = match json_parse(text1.as_view())
+        Ok(j) => j
+        Err(e) => return 1
+    var text2: String = second.to_string()
+    assert text1.eq_string(@text2)
+    # A third generation, from the second text, for good measure.
+    assert reemit(text2.as_view()).eq_string(@text1)
+    # What survived: kinds, values and the decoded string bytes.
+    assert second.object_len() == 11
+    assert null_of(second.get_field("nul"))
+    assert bool_state(bool_of(second.get_field("f"))) == 0
+    assert num_of(second.get_field("n")) == 0 - 42
+    assert num_of(second.get_field("big")) == 9223372036854775807
+    match str_of(second.get_field("s"))
+        Some(sv) =>
+            assert sv.len == 30
+        None =>
+            assert false
+    assert num_of(nth(nth(nth(second.get_field("arr"), 1), 1), 0)) == 3
+    assert null_of(nth(sub(sub(sub(second.get_field("obj"), "a"), "b"), "c"), 0))
+    assert num_of(second.get_field(("k\"ey\n"))) == 0
+    0
+
+# =============================================================================
+# Ownership: a Json frees what it owns, on success and on a failed parse.
+# The resident set (pages, from /proc/self/statm) must not grow by the size of
+# the documents parsed: each loop would leak tens of MB if the drain broke.
+# =============================================================================
+
+# Resident pages of this process, or -1 if /proc/self/statm is unreadable.
+# statm is "size resident shared ...": the second number.
+fn rss_pages() -> i64
+    match read_file("/proc/self/statm")
+        Ok(s) =>
+            let v: StrView = s.as_view()
+            var i: i64 = 0
+            while i < v.len and v.get(i) != ' '
+                i += 1
+            i += 1
+            var n: i64 = 0
+            while i < v.len and v.get(i) >= '0' and v.get(i) <= '9'
+                n = n * 10 + (v.get(i) - '0') as i64
+                i += 1
+            n
+        Err(e) =>
+            0 - 1
+
+# 4 MiB, in 4 KiB pages.
+const RSS_SLACK_PAGES: i64 = 1024
+const LEAK_ROUNDS: i64 = 20000
+
+fn nested_doc() -> StrView
+    "{\"users\": [{\"name\": \"alice\", \"tags\": [\"a\", \"b\", \"c\"], \"meta\": {\"id\": 1, \"ok\": true, \"x\": null}}, {\"name\": \"bob\", \"tags\": [], \"meta\": {\"id\": 2, \"ok\": false, \"x\": [1, 2, [3, [4, [5]]]]}}], \"title\": \"a fairly long string value so each round allocates a few hundred bytes more\", \"n\": 12345}"
+
+# Parse (and drop) the document once; also emit it, so to_string's buffers are
+# part of the loop.  The Json drops when it leaves the match arm.
+fn parse_and_drop(input: StrView) -> i64
+    match json_parse(input)
+        Ok(root) =>
+            let s: String = root.to_string()
+            s.len()
+        Err(e) =>
+            0 - 1
+
+[[test]]
+fn test_drop_does_not_leak() -> i32
+    # Warm up: the allocator's first pages and the String/Vec growth paths.
+    for w in 0..200
+        assert parse_and_drop(nested_doc()) > 0
+    let before: i64 = rss_pages()
+    assert before > 0
+    for r in 0..LEAK_ROUNDS
+        assert parse_and_drop(nested_doc()) > 0
+    let after: i64 = rss_pages()
+    assert after - before < RSS_SLACK_PAGES
+    0
+
+# A parse that fails midway frees the half-built containers.
+fn parse_fails(input: StrView) -> bool
+    match json_parse(input)
+        Ok(root) => false
+        Err(e) => true
+
+[[test]]
+fn test_failed_parse_does_not_leak() -> i32
+    for w in 0..200
+        assert parse_fails("[1,[2,{\"a\":\"x\"},")
+    let before: i64 = rss_pages()
+    assert before > 0
+    for r in 0..LEAK_ROUNDS
+        # Failure after finished children at several depths and kinds.
+        assert parse_fails("[1,[2,{\"a\":\"x\"},")
+        assert parse_fails("{\"k\": [\"aaaaaaaaaaaaaaaaaaaaaaaaaaaa\", {\"j\": [1, 2, 3]}], \"z\": {\"y\": [true, null, \"s\"]}, \"w\" 1}")
+        assert parse_fails("[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", [[[\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"]]], \"c\\q\"]")
+        assert parse_fails("{\"a\": {\"b\": [{\"c\": \"dddddddddddddddddddddddddddd\"}, {\"e\": 1}")
+    let after: i64 = rss_pages()
+    assert after - before < RSS_SLACK_PAGES
     0

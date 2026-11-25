@@ -18,32 +18,22 @@ import ritzlib.json
 # JSON Value Types (mirrored from ritzlib/json.ritz)
 # =============================================================================
 
-const JSON_NULL: i32 = 0
-const JSON_BOOL: i32 = 1
-const JSON_NUMBER: i32 = 2
-const JSON_STRING: i32 = 3
-const JSON_ARRAY: i32 = 4
-const JSON_OBJECT: i32 = 5
-
-# =============================================================================
-# Message Types
-# =============================================================================
-
 const MSG_REQUEST: i32 = 1      # Has "id" and "method"
 const MSG_RESPONSE: i32 = 2     # Has "id" and "result" or "error"
 const MSG_NOTIFICATION: i32 = 3 # Has "method" but no "id"
 
+# The message owns its parsed `Json` root and frees it when it goes out of
+# scope; `method` and the params()/result() borrows point into that root (a
+# String's buffer does not move when the message does).
 struct LspMessage
     kind: i32               # MSG_* type
     id: i64                 # Request/response ID (-1 if notification)
     id_is_string: i32       # 1 if ID was a string
-    method: StrView         # Method name (borrowed from json_root; "" if none)
+    method: StrView         # Method name (borrowed from root; "" if none)
     has_method: bool        # The message has a string "method" (false for responses)
-    params: *JsonValue      # Parameters (borrowed from parsed JSON)
-    result: *JsonValue      # Result (for responses)
     error_code: i32         # Error code (for error responses)
     error_msg: *u8          # Error message (for error responses)
-    json_root: *JsonValue   # Root JSON (owned, for cleanup)
+    root: Json              # The parsed message (Null if it did not parse)
 
 pub fn lsp_message_new() -> LspMessage
     return LspMessage {
@@ -52,110 +42,106 @@ pub fn lsp_message_new() -> LspMessage
         id_is_string: 0,
         method: "",
         has_method: false,
-        params: null,
-        result: null,
         error_code: 0,
         error_msg: null,
-        json_root: null
+        root: Json.Null
     }
 
-pub fn lsp_message_free(msg: *LspMessage)
-    if msg.json_root != null
-        msg.json_root.free()
+impl LspMessage
+    # The "params" value, if the message has one.
+    pub fn params(self: @LspMessage) -> Option<@Json>
+        self.root.get_field("params")
+
+    # The "result" value (for responses), if the message has one.
+    pub fn result(self: @LspMessage) -> Option<@Json>
+        self.root.get_field("result")
 
 # =============================================================================
 # JSON access adapters
 # =============================================================================
-# ritzlib.json's lookups return Option; the handlers here test each value for
-# null (and check its kind) themselves, so these collapse None to null / 0.
-
-# The parsed message, or null after reporting the parse error.
-fn parse_root(text: StrView) -> *JsonValue
-    match json_parse(text)
-        Ok(v) => v
-        Err(e) => report_parse_error(e)
-
-fn report_parse_error(err: JsonError) -> *JsonValue
-    eprint("[ritz-lsp] JSON parse error at position {err.pos}\n")
-    return null
-
-# Field `key` of `obj`, or null if `obj` is not an object or lacks it.
-pub fn lsp_field(obj: *JsonValue, key: StrView) -> *JsonValue
-    match obj.get_field(key)
-        Some(v) => v
-        None => null as *JsonValue
-
-# Element `idx` of array `arr`, or null.
-pub fn lsp_index(arr: *JsonValue, idx: i64) -> *JsonValue
-    match arr.get_index(idx)
-        Some(v) => v
-        None => null as *JsonValue
 
 # The text of string `v`, or "" if `v` is not a string.  Borrows from `v`.
-pub fn lsp_view(v: *JsonValue) -> StrView
-    match v.get_string()
-        Some(s) => s
+pub fn lsp_view(v: Option<@Json>) -> StrView
+    match v
+        Some(j) =>
+            let r: @Json = j
+            match r.get_string()
+                Some(s) => s
+                None => ""
         None => ""
 
 # The value of number `v`, or 0 if `v` is not a number.
-pub fn lsp_number(v: *JsonValue) -> i64
-    match v.get_number()
-        Some(n) => n
+pub fn lsp_number(v: Option<@Json>) -> i64
+    match v
+        Some(j) =>
+            let r: @Json = j
+            match r.get_number()
+                Some(n) => n
+                None => 0
         None => 0
 
 # =============================================================================
 # Message Parsing
 # =============================================================================
 
-# Parse a JSON-RPC message
+# Parse a JSON-RPC message; on a parse error the message has kind 0.
 pub fn parse_message(json_str: *u8) -> LspMessage
     var msg: LspMessage = lsp_message_new()
 
-    let root: *JsonValue = parse_root(strview_from_cstr(json_str))
-    if root == null
-        return msg
+    match json_parse(strview_from_cstr(json_str))
+        Ok(root) =>
+            fill_message(@&msg, root)
+        Err(err) =>
+            eprint("[ritz-lsp] JSON parse error at position {err.pos}\n")
+    return msg
 
-    msg.json_root = root
-
+# Classify `root` into `msg` and move it in as msg.root.
+fn fill_message(msg: @&LspMessage, root: Json)
     # Check for "jsonrpc": "2.0"
-    let version: *JsonValue = lsp_field(root, "jsonrpc")
-    if version == null
+    if root.get_field("jsonrpc").is_none()
         eprints("[ritz-lsp] Missing jsonrpc field\n")
-        return msg
+        msg.root = root
+        return
 
     # Get ID if present
-    let id_val: *JsonValue = lsp_field(root, "id")
-    if id_val != null
-        if id_val.kind == JSON_NUMBER
-            msg.id = id_val.num_val
-        else if id_val.kind == JSON_STRING
-            msg.id_is_string = 1
-            # For string IDs, store as number (hash or just use 0)
-            msg.id = 0
+    let has_id: bool = root.get_field("id").is_some()
+    match root.get_field("id")
+        Some(idv) =>
+            let r: @Json = idv
+            match *r
+                Number(n) =>
+                    msg.id = n
+                Str(_) =>
+                    # For string IDs, store as number (hash or just use 0)
+                    msg.id_is_string = 1
+                    msg.id = 0
+                _ =>
+                    pass
+        None =>
+            pass
 
     # Get method if present
-    match lsp_field(root, "method").get_string()
-        Some(m) =>
-            msg.method = m
-            msg.has_method = true
-        None => pass
-
-    # Get params if present
-    msg.params = lsp_field(root, "params")
-
-    # Get result if present (for responses)
-    msg.result = lsp_field(root, "result")
+    match root.get_field("method")
+        Some(mv) =>
+            let r: @Json = mv
+            match r.get_string()
+                Some(m) =>
+                    msg.method = m
+                    msg.has_method = true
+                None =>
+                    pass
+        None =>
+            pass
 
     # Determine message type
     if msg.has_method
-        if msg.id >= 0 || id_val != null
+        if msg.id >= 0 || has_id
             msg.kind = MSG_REQUEST
         else
             msg.kind = MSG_NOTIFICATION
-    else if msg.result != null || lsp_field(root, "error") != null
+    else if root.get_field("result").is_some() || root.get_field("error").is_some()
         msg.kind = MSG_RESPONSE
-
-    return msg
+    msg.root = root
 
 # =============================================================================
 # Response Building

@@ -11,7 +11,8 @@ and exempted the genuine raw outputs with a reason: the allocators
 (memory), mmap (sys), libc-shaped str, and the `as_ptr` / `get_ptr` accessors
 and iovec array that exist to hand C a pointer.
 
-Left as violations: json.ritz's five (AGAST #4690) and `Vec.as_str` (#4688).
+json.ritz's five went with AGAST #4690 (enum Json, borrows `Option<@Json>`); left as a
+violation: `Vec.as_str` (#4688).
 
 A module not listed is pinned at zero, so a new `pub fn f() -> Option<*T>`
 anywhere in ritzlib fails here.  The pin is a ceiling of (violations,
@@ -36,7 +37,6 @@ PINS: dict[str, tuple[int, int]] = {
     "box.ritz": (0, 1),
     "gvec.ritz": (1, 3),     # as_str is #4688's
     "iovec.ritz": (0, 1),
-    "json.ritz": (5, 5),     # #4690's
     "memory.ritz": (0, 11),
     "span.ritz": (0, 2),
     "str.ritz": (0, 7),
@@ -47,7 +47,7 @@ PINS: dict[str, tuple[int, int]] = {
 
 # Ported to borrows or views: no raw return may come back in these.
 PORTED = ("hashmap.ritz", "elf.ritz", "uring.ritz", "async/tasks.ritz", "async/runtime.ritz",
-          "async_net.ritz", "mapping.ritz")
+          "async_net.ritz", "mapping.ritz", "json.ritz")
 
 
 def ptr_returns(root: Path) -> dict[str, tuple[int, int]]:

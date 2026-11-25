@@ -1,11 +1,13 @@
 #!/bin/bash
 # Golden stdout for json_walk (examples/tier5_async/79_ritzlib_json):
-# ritzlib.json (AGAST #1459).  Pins json's CURRENT behaviour, quirks included:
-#   - json_parse2 reports every failure as code 1 (JSON_ERR_UNEXPECTED_CHAR),
-#     except an invalid escape (\q, or a malformed \uXXXX): code 7
-#     (JSON_ERR_INVALID_ESCAPE) at its backslash (AGAST #3914, #3918), and
-#     a raw control character inside a string: code 8 (JSON_ERR_CONTROL_CHAR)
-#     at that byte (AGAST #3941);
+# ritzlib.json (AGAST #1459, #4690).  Pins json's CURRENT behaviour, quirks
+# included:
+#   - json_parse reports the precise JsonErrorKind: ExpectedColon,
+#     ExpectedBracket (an array without its `]`), ExpectedBrace,
+#     UnterminatedString (the input ends inside a string), InvalidEscape (\q,
+#     or a malformed \uXXXX) at its backslash (AGAST #3914, #3918),
+#     ControlChar for a raw control character inside a string, at that byte
+#     (AGAST #3941), and UnexpectedChar where a value was expected;
 #     pos is where the parser stopped (end of input for "[1, 2" and "\"open");
 #   - numbers are integers, the fraction truncated and the integer part
 #     saturated at the i64 bounds (AGAST #4571): -1.25 parses as -1,
@@ -96,40 +98,26 @@ meta array_len: 0
 tags object_len: 0
 root[0]: 1
 == errors ==
-missing colon: error: code=1 pos=5 msg=unexpected character
-  legacy: ok=0 pos=5 error=JSON parse error
+missing colon: error: kind=ExpectedColon pos=5 msg=expected ':'
   failed: 1
-unclosed array: error: code=1 pos=5 msg=unexpected character
-  legacy: ok=0 pos=5 error=JSON parse error
+unclosed array: error: kind=ExpectedBracket pos=5 msg=expected ']'
   failed: 1
-unterminated string: error: code=1 pos=5 msg=unexpected character
-  legacy: ok=0 pos=5 error=JSON parse error
+unterminated string: error: kind=UnterminatedString pos=5 msg=unterminated string
   failed: 1
-bad literal: error: code=1 pos=6 msg=unexpected character
-  legacy: ok=0 pos=6 error=JSON parse error
+bad literal: error: kind=UnexpectedChar pos=6 msg=unexpected character
   failed: 1
-empty input: error: code=1 pos=0 msg=unexpected character
-  legacy: ok=0 pos=0 error=JSON parse error
+empty input: error: kind=UnexpectedChar pos=0 msg=unexpected character
   failed: 1
 trailing input (accepted): ok [1]
-  legacy: ok=1
   failed: 0
-bad \u escape: error: code=7 pos=2 msg=invalid escape
-  legacy: ok=0 pos=2 error=JSON parse error
+bad \u escape: error: kind=InvalidEscape pos=2 msg=invalid escape
   failed: 1
-raw tab in string: error: code=8 pos=3 msg=control character in string
-  legacy: ok=0 pos=3 error=JSON parse error
+raw tab in string: error: kind=ControlChar pos=3 msg=control character in string
   failed: 1
-message 0: unknown error
-message 1: unexpected character
-message 2: unterminated string
-message 3: expected ':'
-message 4: expected ']'
-message 5: expected '}'
-message 6: out of memory
-message 7: invalid escape
-message 8: control character in string
-message 9: unknown error
+unclosed object: error: kind=ExpectedBrace pos=7 msg=expected '}'
+  failed: 1
+unterminated escape: error: kind=UnterminatedString pos=4 msg=unterminated string
+  failed: 1
 GOLDEN
 )
 out=$(./json_walk </dev/null); rc=$?
@@ -170,7 +158,7 @@ want=$(cat <<'GOLDEN'
 == doc ==
 source: stdin
 bytes: 7
-error: code=1 pos=5 msg=unexpected character
+error: kind=ExpectedColon pos=5 msg=expected ':'
 GOLDEN
 )
 out=$(printf '{"a" 1}' | ./json_walk); rc=$?

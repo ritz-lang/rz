@@ -7,34 +7,29 @@
 #
 # Three sections:
 #
-# 1. `== doc ==` — stdin (read with io's vec_read_all_fd) parsed with
-#    json_parse(StrView), matched on its Result<*JsonValue, JsonError>.  Empty
+# 1. `== doc ==` -- stdin (read with fd_stdin().read_to_end) parsed with
+#    json_parse(StrView), matched on its Result<Json, JsonError>.  Empty
 #    stdin (the regression suite runs every example with </dev/null) parses a
-#    built-in document instead.  The tree is walked depth-first with the
-#    accessor API only: objects via json_object_len + their keys +
-#    json_get_field, arrays via json_array_len + json_get_index, scalars via
-#    json_get_string / json_get_number / json_get_bool (each an Option) and
-#    json_is_null.  Each node prints as `<path> <kind> <value>`, then a
-#    per-kind tally, then the document re-emitted with json_to_string (a
-#    String), which is re-parsed with json_parse and re-emitted to show the
-#    round trip is a fixed point.
-# 2. `== lookup ==` — typed lookups on the built-in document's keys, plus a
+#    built-in document instead.  The tree is walked depth-first by matching on
+#    the Json enum: `match *v` on Object(_) / Array(_) / Str(_) / Number(_) /
+#    Bool(_) / Null, with v.members() and v.items() for the children.  Each
+#    node prints as `<path> <kind> <value>`, then a per-kind tally, then the
+#    document re-emitted with to_string (a String), which is re-parsed with
+#    json_parse and re-emitted to show the round trip is a fixed point.
+# 2. `== lookup ==` -- typed lookups on the built-in document's keys, plus a
 #    missing field, an out-of-range index and a wrong-kind value, each of
 #    which is None (the same lines run whatever stdin held).  None prints as
-#    the sentinel the pre-#1482 accessors returned — 0, `(null)`, is_null=1 —
-#    so the golden output did not move.
-# 3. `== errors ==` — fixed malformed inputs through json_parse and the
-#    deprecated json_parse2(ptr, len) wrapper (the `legacy:` line), and the
-#    json_error_message table.
+#    0, `(null)`, or is_null=1, as the first Option-returning accessors did.
+# 3. `== errors ==` -- fixed malformed inputs through json_parse, each printing
+#    the JsonErrorKind's name, the byte offset and err.message().
 #
 # Behaviour pinned as it is today, quirks included (test.sh says the same):
-#   - json_parse reports every failure as JSON_ERR_UNEXPECTED_CHAR, except a
-#     invalid escape (one RFC 8259 lacks, like \q; bad \uXXXX hex; unpaired
-#     surrogate), which is JSON_ERR_INVALID_ESCAPE at the backslash (AGAST
-#     #3914, #3918), and a raw control character (U+0000-U+001F) inside a
-#     string, which is JSON_ERR_CONTROL_CHAR at that byte (#3941).  The other
-#     codes
-#     exist only in json_error_message.
+#   - the error kinds are precise: UnterminatedString (the input ends inside a
+#     string), ExpectedColon, ExpectedBracket (an array without its `]`),
+#     ExpectedBrace, InvalidEscape (one RFC 8259 lacks, like \q; bad \uXXXX
+#     hex; unpaired surrogate; at the backslash), ControlChar (a raw U+0000-
+#     U+001F byte inside a string, at that byte), and UnexpectedChar for a
+#     value that does not start with one;
 #   - numbers are integers: "-1.25" parses as -1 (fraction truncated, #4571);
 #   - trailing input after the first value is ignored: "[1] x" parses as [1].
 #
@@ -64,7 +59,7 @@ fn put_byte(c: u8)
 
 const PATH_MAX: i64 = 480
 
-# Per-kind tally, indexed by JSON_* kind (0..5).
+# Per-kind tally, indexed by kind_of (0..5).
 var g_tally: [6]i64
 
 # ============================================================================
@@ -75,20 +70,42 @@ fn show(label: StrView, v: i64) -> i32
     print("{label}{v}\n")
     0
 
-fn kind_name(kind: i32) -> StrView
-    if kind == JSON_NULL
+# The tally slot of a value: 0 null, 1 bool, 2 number, 3 string, 4 array,
+# 5 object.
+fn kind_of(v: @Json) -> i64
+    match *v
+        Null => 0
+        Bool(_) => 1
+        Number(_) => 2
+        Str(_) => 3
+        Array(_) => 4
+        Object(_) => 5
+
+fn kind_name(kind: i64) -> StrView
+    if kind == 0
         return "null"
-    if kind == JSON_BOOL
+    if kind == 1
         return "bool"
-    if kind == JSON_NUMBER
+    if kind == 2
         return "number"
-    if kind == JSON_STRING
+    if kind == 3
         return "string"
-    if kind == JSON_ARRAY
+    if kind == 4
         return "array"
-    if kind == JSON_OBJECT
+    if kind == 5
         return "object"
     return "?"
+
+fn error_kind_name(kind: JsonErrorKind) -> StrView
+    match kind
+        UnexpectedChar => "UnexpectedChar"
+        UnterminatedString => "UnterminatedString"
+        ExpectedColon => "ExpectedColon"
+        ExpectedBracket => "ExpectedBracket"
+        ExpectedBrace => "ExpectedBrace"
+        OutOfMemory => "OutOfMemory"
+        InvalidEscape => "InvalidEscape"
+        ControlChar => "ControlChar"
 
 # Print `s` with control bytes as `<decimal>` (so the golden output stays
 # free of raw tabs).
@@ -131,56 +148,72 @@ fn show_str(label: StrView, o: Option<StrView>) -> i32
         Some(s) => show_view(label, s)
         None => show_view(label, "(null)")
 
-# --- Option<*JsonValue> combinators, so a lookup chain stays one expression.
+# --- Option<@Json> combinators, so a lookup chain stays one expression.
 
-fn field_of(o: Option<*JsonValue>, key: StrView) -> Option<*JsonValue>
+fn field_of(o: Option<@Json>, key: StrView) -> Option<@Json>
     match o
-        Some(v) => v.get_field(key)
+        Some(v) =>
+            let j: @Json = v
+            j.get_field(key)
         None => None
 
-fn index_of(o: Option<*JsonValue>, i: i64) -> Option<*JsonValue>
+fn index_of(o: Option<@Json>, i: i64) -> Option<@Json>
     match o
-        Some(v) => v.get_index(i)
+        Some(v) =>
+            let j: @Json = v
+            j.get_index(i)
         None => None
 
-fn number_of(o: Option<*JsonValue>) -> Option<i64>
+fn number_of(o: Option<@Json>) -> Option<i64>
     match o
-        Some(v) => v.get_number()
+        Some(v) =>
+            let j: @Json = v
+            j.get_number()
         None => None
 
-fn bool_of(o: Option<*JsonValue>) -> Option<bool>
+fn bool_of(o: Option<@Json>) -> Option<bool>
     match o
-        Some(v) => v.get_bool()
+        Some(v) =>
+            let j: @Json = v
+            j.get_bool()
         None => None
 
-fn string_of(o: Option<*JsonValue>) -> Option<StrView>
+fn string_of(o: Option<@Json>) -> Option<StrView>
     match o
-        Some(v) => v.get_string()
+        Some(v) =>
+            let j: @Json = v
+            j.get_string()
         None => None
 
-# A missing value counts as null, as json_is_null(null) does.
-fn is_null_of(o: Option<*JsonValue>) -> i64
+# A missing value counts as null.
+fn is_null_of(o: Option<@Json>) -> i64
     match o
-        Some(v) => v.is_null() as i64
+        Some(v) =>
+            let j: @Json = v
+            j.is_null() as i64
         None => 1
 
-fn is_none(o: Option<*JsonValue>) -> i64
+fn is_none(o: Option<@Json>) -> i64
     match o
         Some(_) => 0
         None => 1
 
-fn array_len_of(o: Option<*JsonValue>) -> i64
+fn array_len_of(o: Option<@Json>) -> i64
     match o
-        Some(v) => v.array_len()
+        Some(v) =>
+            let j: @Json = v
+            j.array_len()
         None => 0
 
-fn object_len_of(o: Option<*JsonValue>) -> i64
+fn object_len_of(o: Option<@Json>) -> i64
     match o
-        Some(v) => v.object_len()
+        Some(v) =>
+            let j: @Json = v
+            j.object_len()
         None => 0
 
-# Print `v` as JSON (json_to_string), dropping the String.
-fn print_json(v: *JsonValue) -> i32
+# Print `v` as JSON (to_string), dropping the String.
+fn print_json(v: @Json) -> i32
     var s: String = v.to_string()
     print("{s.as_view()}")
     0
@@ -202,7 +235,7 @@ fn path_truncate(path: @&String, len: i64)
 # ============================================================================
 
 # Raw value between bars, then its JSON-escaped form.
-fn walk_string(v: *JsonValue, s: StrView) -> i32
+fn walk_string(v: @Json, s: StrView) -> i32
     print("|")
     show_raw(s)
     print("| ")
@@ -210,68 +243,67 @@ fn walk_string(v: *JsonValue, s: StrView) -> i32
     print("\n")
     0
 
-# Print one node and recurse.  Uses only the public accessors to read values;
-# `kind` is the only struct field touched, to choose which accessor applies
-# (and `keys`, which has no accessor, to enumerate an object).  The None arms
-# below cannot fire for a node of the matching kind.
-fn walk(v: *JsonValue, path: @&String) -> i32
+fn walk_object(v: @Json, path: @&String) -> i32
     let plen: i64 = path.len()
-    let kind: i32 = v.kind
-    g_tally[kind as i64] = g_tally[kind as i64] + 1
+    let ms: Span<JsonMember> = v.members()
+    print("\{{ms.len}\}\n")
+    for i in 0..ms.len
+        let m: *JsonMember = ms.get_ptr(i)
+        path_push(path, ".")
+        path_push(path, m.key.as_view())
+        walk(@m.value, path)
+        path_truncate(path, plen)
+    0
 
-    if plen == 0
+fn walk_array(v: @Json, path: @&String) -> i32
+    let plen: i64 = path.len()
+    let xs: Span<Json> = v.items()
+    print("[{xs.len}]\n")
+    for i in 0..xs.len
+        var num: String = string_from_i64(i)
+        path_push(path, "[")
+        path_push(path, num.as_view())
+        path_push(path, "]")
+        walk(@*xs.get_ptr(i), path)
+        path_truncate(path, plen)
+    0
+
+# Print one node and recurse, matching on the enum.
+fn walk(v: @Json, path: @&String) -> i32
+    let kind: i64 = kind_of(v)
+    g_tally[kind] = g_tally[kind] + 1
+
+    if path.len() == 0
         print("$")
     else
         print("{path.as_view()}")
     print(" {kind_name(kind)} ")
 
-    if kind == JSON_OBJECT
-        let n: i64 = v.object_len()
-        print("\{{n}\}\n")
-        for i in 0..n
-            # The keys are NUL-terminated (JsonValue.keys has no accessor).
-            let key: StrView = strview_from_cstr(*(v.keys + i))
-            path_push(path, ".")
-            path_push(path, key)
-            match v.get_field(key)
-                Some(child) => walk(child, path)
-                None => pass
-            path_truncate(path, plen)
-    else if kind == JSON_ARRAY
-        let n: i64 = v.array_len()
-        print("[{n}]\n")
-        for i in 0..n
-            var num: String = string_from_i64(i)
-            path_push(path, "[")
-            path_push(path, num.as_view())
-            path_push(path, "]")
-            match v.get_index(i)
-                Some(child) => walk(child, path)
-                None => pass
-            path_truncate(path, plen)
-    else if kind == JSON_STRING
-        match v.get_string()
-            Some(s) => walk_string(v, s)
-            None => pass
-    else if kind == JSON_NUMBER
-        show_num("", v.get_number())
-    else if kind == JSON_BOOL
-        show_bool("", v.get_bool())
-    else
-        show("is_null=", v.is_null() as i64)
+    match *v
+        Object(_) =>
+            walk_object(v, path)
+        Array(_) =>
+            walk_array(v, path)
+        Str(s) =>
+            walk_string(v, s.as_view())
+        Number(n) =>
+            show("", n)
+        Bool(b) =>
+            show("", bool_i64(b))
+        Null =>
+            show("is_null=", v.is_null() as i64)
     0
 
 fn builtin_doc() -> StrView
     return "{\"name\": \"ritz\", \"version\": 3, \"stable\": false, \"tags\": [\"compiler\", \"self-hosted\"], \"owner\": null, \"meta\": {\"tier\": 5, \"ratio\": -1.25, \"quote\": \"say \\\"hi\\\"\\tnow\", \"empty\": [], \"none\": {}}}"
 
 # Compare the second emission with the first; frees the re-parsed tree.
-fn roundtrip_check(out: @String, again: *JsonValue) -> i32
+fn roundtrip_check(out: @String, again: @Json) -> i32
     var out2: String = again.to_string()
     if out.eq_string(@out2)
         println("roundtrip: identical")
     else
         show_view("roundtrip: DIFFERS: ", out2.as_view())
-    again.free()
     0
 
 fn reparse_failed(err: JsonError) -> i32
@@ -279,7 +311,7 @@ fn reparse_failed(err: JsonError) -> i32
     1
 
 # Walk, tally and re-emit `root`; check the emitted text round-trips.
-fn report(root: *JsonValue) -> i32
+fn report(root: @Json) -> i32
     for k in 0..6
         g_tally[k] = 0
     var path: String = string_new()
@@ -287,10 +319,10 @@ fn report(root: *JsonValue) -> i32
 
     for k in 0..6
         if g_tally[k] != 0
-            print("count {kind_name(k as i32)}: {g_tally[k]}\n")
+            print("count {kind_name(k)}: {g_tally[k]}\n")
 
     # Bounds: index len must be None, not read one slot past the end.
-    if root.kind == JSON_ARRAY
+    if kind_of(root) == 4
         let n: i64 = root.array_len()
         show("index len == null: ", is_none(root.get_index(n)))
         show("index len+100 == null: ", is_none(root.get_index(n + 100)))
@@ -300,24 +332,24 @@ fn report(root: *JsonValue) -> i32
 
     # Re-parse the emitted text and emit it again.
     let rc: i32 = match json_parse(out.as_view())
-        Ok(again) => roundtrip_check(@out, again)
+        Ok(again) => roundtrip_check(@out, @again)
         Err(err) => reparse_failed(err)
     return rc
 
 fn print_parse_error(err: JsonError) -> i32
-    print("error: code={err.code as i64} pos={err.pos} msg={json_error_message(err.code)}\n")
+    print("error: kind={error_kind_name(err.kind)} pos={err.pos} msg={err}\n")
     return 1
 
 # ============================================================================
 # 2. Lookups
 # ============================================================================
 
-fn lookups_in(root: *JsonValue) -> i32
-    let doc: Option<*JsonValue> = Some(root)
-    let name: Option<*JsonValue> = root.get_field("name")
-    let version: Option<*JsonValue> = root.get_field("version")
-    let tags: Option<*JsonValue> = root.get_field("tags")
-    let meta: Option<*JsonValue> = root.get_field("meta")
+fn lookups_in(root: @Json) -> i32
+    let doc: Option<@Json> = Some(root)
+    let name: Option<@Json> = root.get_field("name")
+    let version: Option<@Json> = root.get_field("version")
+    let tags: Option<@Json> = root.get_field("tags")
+    let meta: Option<@Json> = root.get_field("meta")
 
     show_str("name: ", string_of(name))
     show_num("version: ", number_of(version))
@@ -340,7 +372,7 @@ fn lookups_in(root: *JsonValue) -> i32
     show("meta.none object_len: ", object_len_of(field_of(meta, "none")))
 
     # None: missing keys and wrong kinds never crash.
-    let missing: Option<*JsonValue> = root.get_field("missing")
+    let missing: Option<@Json> = root.get_field("missing")
     show("missing == null: ", is_none(missing))
     show("missing is_null: ", is_null_of(missing))
     show_num("missing number: ", number_of(missing))
@@ -354,7 +386,6 @@ fn lookups_in(root: *JsonValue) -> i32
     show("tags object_len: ", object_len_of(tags))
     show("root[0]: ", is_null_of(root.get_index(0)))
 
-    root.free()
     0
 
 fn builtin_failed(err: JsonError) -> i32
@@ -363,43 +394,25 @@ fn builtin_failed(err: JsonError) -> i32
 
 fn lookups()
     match json_parse(builtin_doc())
-        Ok(root) => lookups_in(root)
+        Ok(root) => lookups_in(@root)
         Err(err) => builtin_failed(err)
 
 # ============================================================================
 # 3. Errors
 # ============================================================================
 
-fn ok_case(v: *JsonValue) -> i32
+fn ok_case(v: @Json) -> i32
     print("ok ")
     print_json(v)
     print("\n")
-    v.free()
     return 0
 
-# The `legacy:` line, from the deprecated json_parse2(ptr, len) wrapper.  It
-# keeps the wording of the JsonResult struct it replaced (ok / pos / error).
-fn legacy_ok(v: *JsonValue) -> i32
-    println("  legacy: ok=1")
-    v.free()
-    0
-
-fn legacy_err(err: JsonError) -> i32
-    print("  legacy: ok=0 pos={err.pos}")
-    println(" error=JSON parse error")
-    1
-
-# Parse `src` with json_parse and with json_parse2; print the Result's error
-# or the emitted value.
+# Parse `src` with json_parse; print the Result's error or the emitted value.
 fn try_parse(label: StrView, src: StrView)
     print("{label}: ")
     let failed: i32 = match json_parse(src)
-        Ok(v) => ok_case(v)
+        Ok(v) => ok_case(@v)
         Err(err) => print_parse_error(err)
-
-    match json_parse2(Span<u8> { ptr: (src.ptr), len: (src.len) as i64 })
-        Ok(v) => legacy_ok(v)
-        Err(err) => legacy_err(err)
     show("  failed: ", failed as i64)
 
 fn errors()
@@ -411,18 +424,15 @@ fn errors()
     try_parse("trailing input (accepted)", "[1] x")
     try_parse("bad \\u escape", "[\"\\u00g9\"]")
     try_parse("raw tab in string", "[\"a\tb\"]")
-    # Codes 0-9: every code, then the first past the last (JSON_ERR_CONTROL_CHAR).
-    for code in 0..10
-        print("message {code as i64}: {json_error_message(code as i32)}\n")
+    try_parse("unclosed object", "{\"a\": 1")
+    try_parse("unterminated escape", "\"ab\\")
 
 # ============================================================================
 # main
 # ============================================================================
 
-fn report_and_free(root: *JsonValue) -> i32
-    let rc: i32 = report(root)
-    root.free()
-    return rc
+fn report_root(root: @Json) -> i32
+    return report(root)
 
 pub fn main() -> i32
     println("== doc ==")
@@ -442,7 +452,7 @@ pub fn main() -> i32
     show("bytes: ", src.len)
 
     let rc: i32 = match json_parse(src)
-        Ok(root) => report_and_free(root)
+        Ok(root) => report_root(@root)
         Err(err) => print_parse_error(err)
     if rc != 0
         return rc
