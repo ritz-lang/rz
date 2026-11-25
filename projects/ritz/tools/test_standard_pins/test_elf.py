@@ -25,3 +25,9 @@ def test_elf_module_has_no_raw_pointer_parameters():
     summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "elf.ritz"]))
     assert summary["raw-ptr-param"] == {"violations": 0, "exempt": 0}
     assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
+
+
+def test_elf_symbol_names_are_views_not_raw_pointers():
+    """AGAST #4689: get_symbol_name returns Option<StrView>, so elf.ritz has no ptr-return."""
+    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "elf.ritz"]))
+    assert summary["ptr-return"] == {"violations": 0, "exempt": 0}

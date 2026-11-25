@@ -469,6 +469,40 @@ fn make() -> @Counter
     return @c
 ```
 
+#### S-PTR-7 A return value is a value, a borrow or a view, not a raw `*T`
+
+**Status: CHECKED**
+
+A `-> *T` (or `Option<*T>`, `Result<*T, E>`) hands the caller a pointer with no
+lifetime and no null check, the mirror of S-PTR-1. A lookup returns
+`Option<@&V>` (or `Option<@V>`), a pointer into a buffer returns a `StrView` or
+`Span<T>`, an owned allocation returns a `Box<T>`. The caller matches and uses
+the borrow directly; there is no `(*p).f` (AGAST #4689).
+
+Keep a raw return only where the pointer is the product: an allocator, a
+`mmap`/syscall wrapper, an `as_ptr` / `get_ptr` accessor for interop, the
+`writev` iovec. Mark it `standard-exempt` with that reason.
+
+```ritz
+struct Table
+    n: i64
+
+impl Table
+    pub fn slot(self: @&Table) -> Option<@&i64>
+        Some(@&self.n)
+
+fn main() -> i32
+    var t = Table { n: 41 }
+    match t.slot()
+        Some(v) =>
+            *v = 42
+        None => pass
+    t.n as i32
+```
+
+Report: `ptr-return`. Counts each API fn (a `pub` free fn, or any method of an
+inherent `impl`) whose return type is, or wraps, a raw `*T`.
+
 #### S-TEXT-1 `c"..."` is for C interop only
 
 **Status: ENFORCED**

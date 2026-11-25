@@ -46,17 +46,17 @@ RITZ_ROOT = Path(__file__).resolve().parent.parent
 PROJECTS = RITZ_ROOT.parent
 
 PINS = {
-    "angelo": 3,
-    "cryptosec": 7,
-    "goliath": 28,
+    "angelo": 4,
+    "cryptosec": 10,
+    "goliath": 31,
     "harland": 11,
     "http": 2,
-    "indium": 116,
+    "indium": 120,
     "larb": 0,
     "lexis": 10,
     "mausoleum": 141,
     "nexus": 29,
-    "prism": 2,
+    "prism": 3,
     "ritz": 1360,
     "ritz-lsp": 30,
     "ritzunit": 37,
@@ -67,8 +67,8 @@ PINS = {
     "squeeze": 2,
     "tempest": 0,
     "tome": 139,
-    "valet": 42,
-    "zeus": 43,
+    "valet": 45,
+    "zeus": 51,
 }
 
 

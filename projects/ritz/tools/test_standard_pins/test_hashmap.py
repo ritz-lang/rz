@@ -22,3 +22,9 @@ def test_hashmap_module_has_no_raw_pointer_parameters():
     summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "hashmap.ritz"]))
     assert summary["raw-ptr-param"] == {"violations": 0, "exempt": 4}
     assert summary["exempt-malformed"] == {"violations": 0, "exempt": 0}
+
+
+def test_hashmap_lookups_borrow_not_return_raw_pointers():
+    """AGAST #4689: get_ptr / value_ptr became get_mut -> Option<@&V>: no ptr-return."""
+    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "hashmap.ritz"]))
+    assert summary["ptr-return"] == {"violations": 0, "exempt": 0}

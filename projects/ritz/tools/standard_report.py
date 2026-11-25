@@ -56,6 +56,8 @@ fns are never counted.
                    struct or enum declared in the same file.
   raw-receiver     a ``pub`` method of an inherent impl whose ``self`` is a
                    raw pointer (``self: *T``, ``self: **T``).
+  ptr-return       an API fn whose return type is, or wraps, a raw ``*T``
+                   (``-> *T``, ``Option<*T>``, ``Result<*T, E>``).
   raw-alloc        each call to an ALLOC_FNS function, except in a method,
                    or in a fn whose first parameter or return type is a
                    struct declared in the same file (the owning type's own
@@ -132,6 +134,7 @@ RULES: dict[str, tuple[str, str]] = {
     "ptr-len-param": ("S-PTR-2", "(*T, length) pair instead of Span<T>/StrView"),
     "free-fn-method": ("S-IMPL-1", "free fn on a type this module declares"),
     "raw-receiver": ("S-IMPL-3", "method takes a raw *T self, not @T / @&T"),
+    "ptr-return": ("S-PTR-7", "raw *T returned: a borrow or a view instead"),
     "raw-alloc": ("S-OWN-2", "raw allocation outside the owning type"),
     "lib-exit": ("S-ERR-3", "library code ends the program"),
 }
@@ -151,6 +154,8 @@ LENGTH_NAMES = {"len", "n", "size", "count", "cap", "nbytes", "length"}
 ALLOC_FNS = ("malloc", "free", "realloc", "calloc", "heap_alloc", "heap_free",
              "heap_realloc", "sys_mmap", "sys_munmap", "mmap", "munmap")
 
+# A raw `*T` at the start of a return type or just inside a generic's `<` / `,`.
+RAW_RET_RE = re.compile(r"(?:^|[<,])\s*\*")
 ALLOC_RE = re.compile(r"(?<![\w.])(" + "|".join(ALLOC_FNS) + r")\s*\(")
 EXIT_RE = re.compile(r"(?<![\w.])sys_exit\s*\(")
 NEG_RETURN_RE = re.compile(r"^\s*return\s+-\s*\d")
@@ -438,6 +443,8 @@ def _fn_sites(fn: Fn, types: set[str]) -> list[tuple[str, int, str]]:
                 out.append(("out-param", fn.line, sig))
         if fn.ret[:1] in ("*", "@") and any(NULL_RETURN_RE.match(c) for _, c in fn.body):
             out.append(("null-return", fn.line, f"-> {fn.ret}"))
+        if RAW_RET_RE.search(fn.ret):
+            out.append(("ptr-return", fn.line, f"-> {fn.ret}"))
         for k, (name, ty) in enumerate(fn.params):
             if name == "self" or not ty.startswith("*"):
                 continue
@@ -667,6 +674,7 @@ def summarise(sites: list[Site]) -> dict[str, dict[str, int]]:
 
 # The C shapes #4636 pins down-only, per module (tools/test_standard_pins/).
 # #4682 adds raw-receiver: a `self: *T` method reads as C's `T_m(T *p)`.
+# ptr-return (#4689) is pinned apart, in test_standard_pins/test_cshape_ptr_return.py.
 C_SHAPE_KEYS = ("bool-return", "status-return", "out-param", "raw-receiver")
 
 

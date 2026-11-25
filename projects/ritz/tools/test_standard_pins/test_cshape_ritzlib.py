@@ -28,3 +28,9 @@ PINS = {"out-param": (0, 13), "status-return": (0, 82)}
 def test_ritzlib_c_shapes_only_go_down():
     summary = summarise(scan_tree([RITZ_ROOT / "ritzlib"]))
     assert ratchet_breaches(summary, PINS) == []
+
+
+def test_ritzlib_has_no_raw_alloc_violation():
+    """AGAST #4689: mapping.munmap, the last one, is exempt (ritzlib.mapping IS the mmap owner)."""
+    summary = summarise(scan_tree([RITZ_ROOT / "ritzlib"]))
+    assert summary["raw-alloc"]["violations"] == 0

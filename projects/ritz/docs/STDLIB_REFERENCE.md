@@ -753,7 +753,7 @@ Operations are methods (AGAST #4445):
 |--------|-----------|-------------|
 | `m.insert(key, value)` | `fn(key: K, value: V)` | Insert or overwrite |
 | `m.get(key)` | `fn(key: K) -> Option<V>` | The value, or `None` |
-| `m.get_ptr(key)` | `fn(key: K) -> Option<*V>` | The value, borrowed (for a move-only `V`), or `None` |
+| `m.get_mut(key)` | `fn(key: K) -> Option<@&V>` | The value, borrowed in place (for a move-only `V`), or `None` |
 | `m.contains(key)` | `fn(key: K) -> bool` | Whether the key is present |
 | `m.remove(key)` | `fn(key: K) -> bool` | Remove key (true if it was there) |
 | `m.len()` | `fn() -> i64` | The number of keys |
@@ -836,7 +836,7 @@ struct HashMapI64
 | `m.is_empty()` | `fn() -> bool` | Check if empty |
 | `m.clear()` | `fn()` | Remove every key, keeping the table allocated |
 | `m.free()` | `fn()` | Free the map |
-| `m.value_ptr(key)` | `fn(key: i64) -> Option<*i64>` | The value's slot (None if not found) |
+| `m.get_mut(key)` | `fn(key: i64) -> Option<@&i64>` | The value's slot, borrowed (None if not found) |
 | `hashmap_i64_missing_key` | `fn(key: i64)` | Exit 101: `HashMapI64: key not found: <key>` |
 
 **Indexing** (LANGUAGE_SPEC §7.8): `HashMapI64` implements `Index`, `IndexMut` and
@@ -2333,7 +2333,7 @@ as `rt.block_on` does, when a poll reports Pending without suspending on the rin
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `get_runtime` | `fn() -> *Runtime` | Get global runtime |
+| `get_runtime` | `fn() -> @&Runtime` | Get global runtime |
 | `cleanup_runtime` | `fn()` | Cleanup global runtime |
 
 | Method | Signature | Description |
@@ -2418,8 +2418,8 @@ struct TaskServer
 | `pool.spawn(fd, handler)` | `fn(fd: i32, handler: fn(*Task) -> i32) -> bool` | Spawn task |
 | `pool.complete(task)` | `fn(task: @&Task)` | Complete task |
 | `pool.run()` | `fn() -> i32` | Run all tasks |
-| `pool.alloc()` | `fn() -> Option<*Task>` | A free task slot, or `None` if the pool is full |
-| `pool.find(task_id)` | `fn(task_id: i64) -> Option<*Task>` | A live task by its ID (`user_data`), or `None` |
+| `pool.alloc()` | `fn() -> Option<@&Task>` | A free task slot, or `None` if the pool is full |
+| `pool.find(task_id)` | `fn(task_id: i64) -> Option<@&Task>` | A live task by its ID (`user_data`), or `None` |
 | `pool.submit_recv(task)` | `fn(task: @&Task) -> bool` | Queue a recv into `task.read_buf`; false if no SQE was free |
 | `pool.submit_send(task, len)` | `fn(task: @&Task, len: i32) -> bool` | Queue a send of `len` bytes of `task.write_buf` |
 | `pool.submit_timeout(task, ts)` | `fn(task: @&Task, ts: @&KernelTimespec) -> bool` | Queue a relative timeout that wakes `task` (`io_result` is the kernel's code, e.g. -ETIME) |
@@ -2542,12 +2542,12 @@ struct IoUring
 |--------|-----------|-------------|
 | `ring.init(entries)` | `fn(entries: i32) -> i32` | Initialize ring |
 | `ring.destroy()` | `fn()` | Destroy ring |
-| `ring.get_sqe()` | `fn() -> Option<*IoUringSqe>` | Get SQE (None when the ring is full) |
+| `ring.get_sqe()` | `fn() -> Option<@&IoUringSqe>` | Get SQE (None when the ring is full) |
 | `ring.sqe_submit()` | `fn()` | Advance SQ tail |
 | `ring.submit()` | `fn() -> Result<i32, Errno>` | Submit pending SQEs: `Ok(count)`, `Ok(0)` with none pending (no syscall) |
 | `ring.submit_and_wait(min_complete)` | `fn(min_complete: i32) -> Result<i32, Errno>` | Submit and wait for `min_complete` CQEs |
-| `ring.peek_cqe()` | `fn() -> Option<*IoUringCqe>` | Peek CQE (None when none is ready) |
-| `ring.wait_cqe()` | `fn() -> Option<*IoUringCqe>` | Wait for CQE |
+| `ring.peek_cqe()` | `fn() -> Option<@IoUringCqe>` | Peek CQE (None when none is ready) |
+| `ring.wait_cqe()` | `fn() -> Option<@IoUringCqe>` | Wait for CQE |
 | `ring.cqe_seen(cqe)` | `fn(cqe: @IoUringCqe)` | Mark CQE consumed |
 | `ring.cleanup()` | `fn()` | Alias for `ring.destroy()` |
 
@@ -3146,7 +3146,7 @@ struct ElfReader
 |--------|-----------|-------------|
 | `elf.init(data_sv)` | `fn(data_sv: Span<u8>) -> Result<(), ElfError>` | Initialize |
 | `elf.parse_sections()` | `fn() -> Result<(), ElfError>` | Parse sections |
-| `elf.get_symbol_name(sym_index)` | `fn(sym_index: i64) -> Option<*u8>` | Get symbol name |
+| `elf.get_symbol_name(sym_index)` | `fn(sym_index: i64) -> Option<StrView>` | Get symbol name |
 | `elf.get_symbol_info(sym_index)` | `fn(sym_index: i64) -> u8` | Get symbol info |
 | `elf.symbol_count()` | `fn() -> i64` | Get symbol count |
 | `elf.image()` | `fn() -> Span<u8>` | The whole image, as a span |

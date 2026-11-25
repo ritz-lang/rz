@@ -105,6 +105,7 @@ struct ElfReader
     symtab: *Elf64_Sym    # Pointer to symbol table
     symtab_count: i64     # Number of symbols
     strtab: *u8           # Pointer to string table
+    strtab_size: i64      # Bytes in the string table
 
 # Why an ELF image cannot be read.  The reader is left pointing at whatever
 # was validly set before the failure (nothing, for a rejected header).
@@ -119,8 +120,8 @@ pub enum ElfError
 # Header fields are read with ritzlib.endian's little-endian readers, at an
 # offset into the image's span: a header that points past the end of the
 # image stops the program rather than reading beyond it (AGAST #4644).  A
-# symbol name is a NUL-terminated .strtab string; `strview_from_cstr(name)`
-# and StrView's `starts_with` test its prefix.
+# symbol name is a StrView of the .strtab string (get_symbol_name); StrView's
+# `starts_with` tests its prefix.
 
 # Check if symbol is a function
 pub fn elf_is_function(info: u8) -> bool
@@ -150,6 +151,7 @@ impl ElfReader
         self.symtab = null
         self.symtab_count = 0
         self.strtab = null
+        self.strtab_size = 0
 
         # Check minimum size for ELF header
         if size < 64
@@ -221,6 +223,7 @@ impl ElfReader
                 let strtab_sh: i64 = shoff + (sh_link as i64 * shentsize as i64)
                 let strtab_offset: i64 = endian_read_u64_le(img, strtab_sh + 24) as i64
                 self.strtab = data + strtab_offset
+                self.strtab_size = endian_read_u64_le(img, strtab_sh + 32) as i64  # sh_size
 
         if self.symtab == null
             return Err(ElfError.NoSymtab)
@@ -229,7 +232,9 @@ impl ElfReader
 
     # Get the name of a symbol, or None when the symbol table is absent or the
     # index is out of range.
-    pub fn get_symbol_name(self: @ElfReader, sym_index: i64) -> Option<*u8>
+    # The name is a view of the string table's NUL-terminated entry, bounded
+    # by the table's size; a name that runs off the end is None.
+    pub fn get_symbol_name(self: @ElfReader, sym_index: i64) -> Option<StrView>
         if self.symtab == null or self.strtab == null
             return None
         if sym_index < 0 or sym_index >= self.symtab_count
@@ -239,7 +244,16 @@ impl ElfReader
         let syms: [u8] = span_from_ptr<u8>(self.symtab as *u8, self.symtab_count * 24)
         let st_name: i32 = endian_read_u32_le(syms, sym_index * 24) as i32
 
-        return Some(self.strtab + st_name)
+        if st_name < 0 or st_name as i64 >= self.strtab_size
+            return None
+        let name: *u8 = self.strtab + st_name
+        let room: i64 = self.strtab_size - st_name as i64
+        var n: i64 = 0
+        while n < room and *(name + n) != 0
+            n += 1
+        if n == room
+            return None
+        return Some(strview_from_ptr(name, n))
 
     # Get symbol info byte (type in lower 4 bits, binding in upper 4 bits)
     pub fn get_symbol_info(self: @ElfReader, sym_index: i64) -> u8
@@ -268,8 +282,8 @@ impl ElfReader
             # Only look at global functions
             if elf_is_function(info) and elf_is_global(info)
                 match self.get_symbol_name(i)
-                    Some(p) =>
-                        if strview_from_cstr(p).starts_with("test_")
+                    Some(name) =>
+                        if name.starts_with("test_")
                             count += 1
                     None => pass
 
@@ -287,9 +301,8 @@ impl ElfReader
 
             if elf_is_function(info) and elf_is_global(info)
                 match self.get_symbol_name(i)
-                    Some(p) =>
-                        let name: *u8 = p
-                        if strview_from_cstr(name).starts_with("test_")
+                    Some(name) =>
+                        if name.starts_with("test_")
                             print("  {name}\n")
                     None => pass
 

@@ -180,7 +180,7 @@ CASES = {
     # S-OPTION-1: a pointer or reference return with `return null`.
     "null-return hit": (
         "pub fn lookup(k: i64) -> *u8\n    return null\n",
-        [("null-return", "lookup")],
+        [("null-return", "lookup"), ("ptr-return", "lookup")],
     ),
     "null-return miss: Option": (
         "pub fn lookup(k: i64) -> Option<i64>\n    return None\n",
@@ -286,6 +286,21 @@ CASES = {
         "fn scratch(p: *u8) -> i64\n    my_free(p)\n    0\n",
         [],
     ),
+    # S-PTR-7: a pub fn's return type is or wraps a raw *T.
+    "ptr-return hit: Option<*T>": (
+        "struct Foo\n    n: i64\n\nimpl Foo\n    pub fn get(self: @Foo) -> Option<*i64>\n        None\n",
+        [("ptr-return", "get")],
+    ),
+    "ptr-return hit: *T, Result<*T, E>, free fn": (
+        "pub fn a() -> *u8\n    0 as *u8\n\npub fn b() -> Result<*u8, i32>\n    Err(1)\n",
+        [("ptr-return", "a"), ("ptr-return", "b")],
+    ),
+    "ptr-return miss: borrows, views, a private free fn, and *T in a parameter": (
+        "struct Foo\n    n: i64\n\nimpl Foo\n    pub fn a(self: @&Foo) -> Option<@&i64>\n        None\n"
+        "    pub fn c(self: @Foo, p: *i64) -> i64\n        1\n\n"
+        "fn b() -> *i64\n    0 as *i64\n",
+        [("raw-ptr-param", "c")],
+    ),
     # S-ERR-3: a library ends the program.
     "lib-exit hit": (
         "fn bail()\n    sys_exit(1)\n",
@@ -319,7 +334,7 @@ def test_counting_rule(name):
 
 def test_site_carries_line_and_path():
     text = "\n\npub fn lookup(k: i64) -> *u8\n    return null\n"
-    (site,) = scan_source(text, "lib/x.ritz")
+    site = next(s for s in scan_source(text, "lib/x.ritz") if s.key == "null-return")
     assert (site.path, site.line, site.fn, site.key) == ("lib/x.ritz", 3, "lookup", "null-return")
 
 
