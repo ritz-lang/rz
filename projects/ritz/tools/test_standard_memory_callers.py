@@ -40,7 +40,6 @@ PINS = {
     "indium": 16,
     "lexis": 6,
     "prism": 3,
-    "ritz-lsp": 13,
     "ritz/examples": 30,
     "ritz/ritz0": 18,
     "ritz/ritz1": 511,

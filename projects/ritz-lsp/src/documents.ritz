@@ -2,11 +2,8 @@
 #
 # Tracks open documents and their contents.
 
-import ritzlib.sys
-import ritzlib.io
-import ritzlib.str
-import ritzlib.memory
 import ritzlib.gvec
+import ritzlib.string
 import ritzlib.strview
 
 # =============================================================================
@@ -16,119 +13,68 @@ import ritzlib.strview
 const MAX_DOCUMENTS: i32 = 256
 
 struct Document
-    uri: *u8            # Document URI (owned)
-    uri_len: i64        # URI length
-    content: *u8        # Document content (owned)
-    content_len: i64    # Content length
+    uri: String         # Document URI
+    content: String     # Document content
     version: i64        # Document version
-    dirty: i32          # 1: changed since its diagnostics were last published
+    dirty: bool         # changed since its diagnostics were last published
 
+# The open documents, in the order they were opened.
 struct DocumentStore
-    docs: [256]Document
-    count: i32
+    docs: Vec<Document>
+
+# A Vec frees its buffer, not its elements: each Document's Strings go here,
+# dropped as it is popped.
+impl Drop for DocumentStore
+    fn drop(self: @&DocumentStore)
+        while self.docs.len > 0
+            self.docs.pop()
 
 pub fn document_store_new() -> DocumentStore
-    var store: DocumentStore
-    store.count = 0
-    for i in 0..MAX_DOCUMENTS
-        store.docs[i].uri = null
-        store.docs[i].uri_len = 0
-        store.docs[i].content = null
-        store.docs[i].content_len = 0
-        store.docs[i].version = 0
-        store.docs[i].dirty = 0
-    return store
-
-pub fn document_store_drop(store: *DocumentStore)
-    for i in 0..store.count
-        if store.docs[i].uri != null
-            free(store.docs[i].uri)
-        if store.docs[i].content != null
-            free(store.docs[i].content)
+    DocumentStore { docs: vec_new<Document>() }
 
 # =============================================================================
 # Document Operations
 # =============================================================================
 
-# The URI of `doc` (borrowed from the store).
-pub fn document_uri(doc: *Document) -> StrView
-    strview_from_ptr(doc.uri, doc.uri_len)
-
 # Find document by URI, returns index or -1
 pub fn document_find(store: *DocumentStore, uri: StrView) -> i32
-    for i in 0..store.count
-        if store.docs[i].uri != null
-            if document_uri(@store.docs[i]).eq(uri)
-                return i
+    for i in 0..store.docs.len
+        let d: *Document = store.docs.get_ptr(i)
+        if d.uri.as_view().eq(uri)
+            return i as i32
     return -1
+
+# Replace document `idx`'s text and version, and mark it dirty.
+fn document_set(store: *DocumentStore, idx: i32, content: StrView, version: i64)
+    let d: *Document = store.docs.get_ptr(idx as i64)
+    d.content.clear()
+    d.content.push_str(content)
+    d.version = version
+    d.dirty = true
 
 # Open a document (add to store)
 pub fn document_open(store: *DocumentStore, uri: StrView, content: StrView, version: i64) -> i32
-    # Check if already open
     let existing: i32 = document_find(store, uri)
     if existing >= 0
-        # Update existing
-        if store.docs[existing].content != null
-            free(store.docs[existing].content)
-        let content_len: i64 = content.len()
-        store.docs[existing].content = malloc(content_len + 1)
-        if store.docs[existing].content != null
-            memcpy(store.docs[existing].content, content.as_ptr(), content_len)
-            *(store.docs[existing].content + content_len) = 0
-            store.docs[existing].content_len = content_len
-        store.docs[existing].version = version
-        store.docs[existing].dirty = 1
+        document_set(store, existing, content, version)
         return existing
 
-    # Add new document
-    if store.count >= MAX_DOCUMENTS
+    if store.docs.len >= MAX_DOCUMENTS as i64
         return -1
-
-    let idx: i32 = store.count
-    store.count += 1
-
-    # Copy URI
-    let uri_len: i64 = uri.len()
-    store.docs[idx].uri = malloc(uri_len + 1)
-    if store.docs[idx].uri != null
-        memcpy(store.docs[idx].uri, uri.as_ptr(), uri_len)
-        *(store.docs[idx].uri + uri_len) = 0
-        store.docs[idx].uri_len = uri_len
-
-    # Copy content
-    let content_len: i64 = content.len()
-    store.docs[idx].content = malloc(content_len + 1)
-    if store.docs[idx].content != null
-        memcpy(store.docs[idx].content, content.as_ptr(), content_len)
-        *(store.docs[idx].content + content_len) = 0
-        store.docs[idx].content_len = content_len
-
-    store.docs[idx].version = version
-    store.docs[idx].dirty = 1
-
-    return idx
+    store.docs.push(Document {
+        uri: string_from(uri),
+        content: string_from(content),
+        version: version,
+        dirty: true
+    })
+    (store.docs.len - 1) as i32
 
 # Update document content
 pub fn document_change(store: *DocumentStore, uri: StrView, content: StrView, version: i64) -> i32
     let idx: i32 = document_find(store, uri)
     if idx < 0
         return -1
-
-    # Free old content
-    if store.docs[idx].content != null
-        free(store.docs[idx].content)
-
-    # Copy new content
-    let content_len: i64 = content.len()
-    store.docs[idx].content = malloc(content_len + 1)
-    if store.docs[idx].content != null
-        memcpy(store.docs[idx].content, content.as_ptr(), content_len)
-        *(store.docs[idx].content + content_len) = 0
-        store.docs[idx].content_len = content_len
-
-    store.docs[idx].version = version
-    store.docs[idx].dirty = 1
-
+    document_set(store, idx, content, version)
     return idx
 
 # Close a document (remove from store)
@@ -137,29 +83,14 @@ pub fn document_close(store: *DocumentStore, uri: StrView) -> i32
     if idx < 0
         return -1
 
-    # Free resources
-    if store.docs[idx].uri != null
-        free(store.docs[idx].uri)
-    if store.docs[idx].content != null
-        free(store.docs[idx].content)
-
-    # Shift remaining documents
-    var i: i32 = idx
-    let end: i32 = store.count - 1
-    while i < end
-        store.docs[i] = store.docs[i + 1]
-        i += 1
-
-    store.count -= 1
-
-    # Clear last slot
-    store.docs[store.count].uri = null
-    store.docs[store.count].uri_len = 0
-    store.docs[store.count].content = null
-    store.docs[store.count].content_len = 0
-    store.docs[store.count].version = 0
-    store.docs[store.count].dirty = 0
-
+    # Set aside the documents after it, drop it, and put them back: the
+    # others keep their order.
+    var after: Vec<Document> = vec_new<Document>()
+    while store.docs.len > (idx as i64) + 1
+        after.push(store.docs.pop())
+    store.docs.pop()
+    while after.len > 0
+        store.docs.push(after.pop())
     return 0
 
 # Get document content
@@ -167,15 +98,16 @@ pub fn document_get(store: *DocumentStore, uri: StrView) -> *Document
     let idx: i32 = document_find(store, uri)
     if idx < 0
         return null
-    return @store.docs[idx]
+    store.docs.get_ptr(idx as i64)
 
 # Diagnostics are published once input pauses, not per change (#3902): an
 # open or change marks the document dirty, and the server publishes each
 # dirty document for its latest version. The next dirty document, clearing
 # its mark, or null when none is.
 pub fn document_take_dirty(store: *DocumentStore) -> *Document
-    for i in 0..store.count
-        if store.docs[i].dirty != 0
-            store.docs[i].dirty = 0
-            return @store.docs[i]
+    for i in 0..store.docs.len
+        let d: *Document = store.docs.get_ptr(i)
+        if d.dirty
+            d.dirty = false
+            return d
     return null

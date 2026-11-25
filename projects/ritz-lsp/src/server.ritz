@@ -4,9 +4,9 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
-import ritzlib.memory
 import ritzlib.gvec
+import ritzlib.option
+import ritzlib.string
 import ritzlib.json
 import ritzlib.strview
 import ritzlib.span
@@ -37,8 +37,8 @@ pub fn server_new() -> Server
         result_buf: vec_with_cap<u8>(1024)
     }
 
-pub fn server_drop(s: *Server)
-    document_store_drop(@s.documents)
+# A Server is an owned value: its documents and buffers go at the owner's
+# scope end, so there is no server_drop to call.
 
 # =============================================================================
 # Request Handlers
@@ -164,9 +164,7 @@ fn handle_did_close(s: *Server, msg: *LspMessage)
 # textDocument/publishDiagnostics for open document `doc`, from a ritz1
 # compile of its text (diagnostics.ritz).
 fn publish_diagnostics(s: *Server, doc: *Document)
-    if doc.content == null
-        return
-    diagnostics_json(document_uri(doc), doc.version, doc.content, doc.content_len, @s.result_buf)
+    diagnostics_json(doc.uri.as_view(), doc.version, doc.content.as_view(), @s.result_buf)
     build_notification("textDocument/publishDiagnostics", span_from_vec(@s.result_buf), @s.response_buf)
     write_message_vec(@s.response_buf)
 
@@ -200,10 +198,7 @@ fn request_doc(s: *Server, msg: *LspMessage, line: *i64, col: *i64) -> *Document
         None => return null
     *line = lsp_number(pos.get_field("line"))
     *col = lsp_number(pos.get_field("character"))
-    let doc: *Document = document_get(@s.documents, uri)
-    if doc == null or doc.content == null
-        return null
-    doc
+    document_get(@s.documents, uri)
 
 # textDocument/hover: the signature of the function named at the position.
 fn handle_hover(s: *Server, msg: *LspMessage)
@@ -214,7 +209,7 @@ fn handle_hover(s: *Server, msg: *LspMessage)
     if doc == null
         let _: bool = s.result_buf.push_view("null")
     else
-        hover_json(document_uri(doc), doc.content, doc.content_len, line, col, @s.result_buf)
+        hover_json(doc.uri.as_view(), doc.content.as_view(), line, col, @s.result_buf)
     build_response(msg.id, span_from_vec(@s.result_buf), @s.response_buf)
     write_message_vec(@s.response_buf)
 
@@ -228,7 +223,7 @@ fn handle_definition(s: *Server, msg: *LspMessage)
     if doc == null
         let _: bool = s.result_buf.push_view("null")
     else
-        definition_json(document_uri(doc), doc.content, doc.content_len, line, col, @s.result_buf)
+        definition_json(doc.uri.as_view(), doc.content.as_view(), line, col, @s.result_buf)
     build_response(msg.id, span_from_vec(@s.result_buf), @s.response_buf)
     write_message_vec(@s.response_buf)
 
@@ -281,20 +276,13 @@ pub fn server_run(s: *Server) -> i32
         # queued would replace the text before anyone saw its diagnostics.
         if not input_pending()
             publish_pending(s)
-        let json_str: *u8 = read_message()
-        if json_str == null
-            eprints("[ritz-lsp] Connection closed\n")
-            break
-
-        var msg: LspMessage = parse_message(json_str)
-
-        let exit_code: i32 = dispatch_message(s, @msg)
-        # msg.method borrows from msg.root, which is still alive here.
-        let is_exit: bool = msg.method.eq("exit")
-
-        free(json_str)
-
-        if s.shutdown_requested != 0 && is_exit
-            return exit_code
-
-    return 0
+        match read_message()
+            Some(json) =>
+                var msg: LspMessage = parse_message(json.as_view())
+                let exit_code: i32 = dispatch_message(s, @msg)
+                # msg.method borrows from msg.root, which is still alive here.
+                if s.shutdown_requested != 0 and msg.method.eq("exit")
+                    return exit_code
+            None =>
+                eprints("[ritz-lsp] Connection closed\n")
+                return 0

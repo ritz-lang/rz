@@ -1,0 +1,146 @@
+# test_documents.ritz - the open-document store (src/documents.ritz).
+#
+# The store is a Vec of Documents that own their uri and text as Strings
+# (AGAST #4692): open adds or replaces, change replaces, close removes and
+# keeps the others in order, a closed slot is reused, and the store holds at
+# most MAX_DOCUMENTS.
+
+import ritzlib.fmt
+import ritzlib.string
+import ritzlib.strview
+import src.documents
+
+fn fail(name: StrView) -> i32
+    print("FAIL: {name}\n")
+    1
+
+# Whether the open document `uri` holds `text` at `version`.
+fn holds(store: *DocumentStore, uri: StrView, text: StrView, version: i64) -> bool
+    let d: *Document = document_get(store, uri)
+    d != null and d.uri.as_view().eq(uri) and d.content.as_view().eq(text) and d.version == version
+
+[[test]]
+fn test_open_find_get() -> i32
+    var store: DocumentStore = document_store_new()
+    if document_open(@store, "file:///a.ritz", "fn a()", 1) != 0
+        return fail("first open is index 0")
+    if document_open(@store, "file:///b.ritz", "fn b()", 2) != 1
+        return fail("second open is index 1")
+    if document_find(@store, "file:///b.ritz") != 1
+        return fail("find b")
+    if document_find(@store, "file:///c.ritz") != -1
+        return fail("find a uri never opened")
+    if not holds(@store, "file:///a.ritz", "fn a()", 1) or not holds(@store, "file:///b.ritz", "fn b()", 2)
+        return fail("get a and b")
+    if document_get(@store, "file:///c.ritz") != null
+        return fail("get a uri never opened")
+    0
+
+[[test]]
+fn test_reopen_replaces() -> i32
+    var store: DocumentStore = document_store_new()
+    document_open(@store, "file:///a.ritz", "old text", 1)
+    if document_open(@store, "file:///a.ritz", "new, longer text", 5) != 0
+        return fail("reopen keeps the index")
+    if store.docs.len != 1
+        return fail("reopen adds no document")
+    if not holds(@store, "file:///a.ritz", "new, longer text", 5)
+        return fail("reopen replaces text and version")
+    0
+
+[[test]]
+fn test_change() -> i32
+    var store: DocumentStore = document_store_new()
+    document_open(@store, "file:///a.ritz", "short", 1)
+    if document_change(@store, "file:///a.ritz", "a good deal longer than before", 2) != 0
+        return fail("change an open document")
+    if not holds(@store, "file:///a.ritz", "a good deal longer than before", 2)
+        return fail("change to longer text")
+    document_change(@store, "file:///a.ritz", "", 3)
+    if not holds(@store, "file:///a.ritz", "", 3)
+        return fail("change to empty text")
+    if document_change(@store, "file:///b.ritz", "x", 1) != -1
+        return fail("change a document that is not open")
+    if store.docs.len != 1
+        return fail("change adds no document")
+    0
+
+[[test]]
+fn test_close_keeps_order_and_reuses() -> i32
+    var store: DocumentStore = document_store_new()
+    document_open(@store, "file:///a.ritz", "A", 1)
+    document_open(@store, "file:///b.ritz", "B", 1)
+    document_open(@store, "file:///c.ritz", "C", 1)
+    if document_close(@store, "file:///b.ritz") != 0
+        return fail("close b")
+    if document_close(@store, "file:///b.ritz") != -1
+        return fail("close b twice")
+    if store.docs.len != 2
+        return fail("close removes one document")
+    if document_find(@store, "file:///a.ritz") != 0 or document_find(@store, "file:///c.ritz") != 1
+        return fail("the others keep their order")
+    if document_get(@store, "file:///b.ritz") != null
+        return fail("a closed document is gone")
+    if not holds(@store, "file:///c.ritz", "C", 1)
+        return fail("a moved document keeps its text")
+    if document_open(@store, "file:///d.ritz", "D", 1) != 2
+        return fail("open after close takes the freed slot")
+    document_close(@store, "file:///d.ritz")
+    document_close(@store, "file:///a.ritz")
+    document_close(@store, "file:///c.ritz")
+    if store.docs.len != 0
+        return fail("close every document")
+    if document_open(@store, "file:///a.ritz", "again", 2) != 0
+        return fail("reopen into an empty store")
+    if not holds(@store, "file:///a.ritz", "again", 2)
+        return fail("a reopened document holds its new text")
+    0
+
+[[test]]
+fn test_take_dirty() -> i32
+    var store: DocumentStore = document_store_new()
+    document_open(@store, "file:///a.ritz", "A", 1)
+    document_open(@store, "file:///b.ritz", "B", 1)
+    let first: *Document = document_take_dirty(@store)
+    if first == null or not first.uri.as_view().eq("file:///a.ritz")
+        return fail("first dirty is a")
+    let second: *Document = document_take_dirty(@store)
+    if second == null or not second.uri.as_view().eq("file:///b.ritz")
+        return fail("second dirty is b")
+    if document_take_dirty(@store) != null
+        return fail("nothing left dirty")
+    document_change(@store, "file:///b.ritz", "B2", 2)
+    let changed: *Document = document_take_dirty(@store)
+    if changed == null or not changed.content.as_view().eq("B2")
+        return fail("a change marks the document dirty")
+    document_change(@store, "file:///a.ritz", "A2", 2)
+    document_close(@store, "file:///a.ritz")
+    if document_take_dirty(@store) != null
+        return fail("a closed document is not published")
+    0
+
+# file:///<n>.ritz
+fn numbered_uri(n: i64) -> String
+    var s: String = string_from("file:///")
+    s.push_i64(n)
+    s.push_str(".ritz")
+    s
+
+[[test]]
+fn test_capacity() -> i32
+    var store: DocumentStore = document_store_new()
+    for i in 0..MAX_DOCUMENTS
+        var uri: String = numbered_uri(i as i64)
+        if document_open(@store, uri.as_view(), uri.as_view(), 1) != i
+            return fail("open up to MAX_DOCUMENTS")
+    var extra: String = numbered_uri(MAX_DOCUMENTS as i64)
+    if document_open(@store, extra.as_view(), "x", 1) != -1
+        return fail("open past MAX_DOCUMENTS")
+    var last: String = numbered_uri((MAX_DOCUMENTS - 1) as i64)
+    if not holds(@store, last.as_view(), last.as_view(), 1)
+        return fail("the last document holds its text")
+    var gone: String = numbered_uri(7)
+    document_close(@store, gone.as_view())
+    if document_open(@store, extra.as_view(), "x", 1) != MAX_DOCUMENTS - 1
+        return fail("a full store takes a document once one closes")
+    0

@@ -7,12 +7,13 @@
 
 import ritzlib.io
 import ritzlib.fmt
-import ritzlib.str
-import ritzlib.memory
 import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result
+import ritzlib.string
 import ritzlib.strview
 import ritzlib.fd { fd_stdin, fd_stdout, poll, PollFd, POLLIN }
-import ritzlib.span { Span, span_from_ptr }
+import ritzlib.span
 
 # =============================================================================
 # Transport State
@@ -38,7 +39,8 @@ pub fn transport_new() -> Transport
 # Read a single byte from stdin, returns -1 on EOF
 fn read_byte() -> i32
     var buf: [1]u8
-    match fd_stdin().read(Span<u8> { ptr: @buf[0], len: 1 })
+    let one: [u8] = @buf
+    match fd_stdin().read(one)
         Ok(n) =>
             if n <= 0
                 return -1
@@ -47,8 +49,8 @@ fn read_byte() -> i32
 
 # A Content-Length header value as a byte count, or -1. Whitespace around it
 # is allowed; the rest must be digits only (no sign) within i64 (#1958).
-# i64::MAX parses, and read_message's allocation of it fails, closing the
-# connection like any other bad length.
+# i64::MAX parses, and read_message reaches EOF before that many bytes,
+# closing the connection like any other bad length.
 fn content_length_value(value: StrView) -> i64
     let v: StrView = value.trim()
     if v.len == 0 or v.get(0) < '0' or v.get(0) > '9'
@@ -86,71 +88,64 @@ pub fn read_headers() -> i64
             break
 
         # Check for Content-Length header; its value runs from after the colon.
-        let line: StrView = strview_from_ptr(line_buf.data, line_buf.len)
+        let bytes: [u8] = line_buf[0..line_buf.len]
+        let line: StrView = bytes.as_strview()
         if line.starts_with("Content-Length:")
             content_length = content_length_value(line.skip(15))
 
     return content_length
 
-# Read exactly n bytes from stdin into buffer
-pub fn read_exact(buf: *u8, n: i64) -> i32
-    match fd_stdin().read_exact(Span<u8> { ptr: buf, len: n })
-        Ok(_) => 0
-        Err(_) => -1
-
 # Whether a message (or part of one) is waiting on stdin. Reads are
-# unbuffered (read_byte, read_exact), so what poll reports is everything not
+# unbuffered (read_byte, read_message), so what poll reports is everything not
 # yet consumed. EOF alone is not input.
 pub fn input_pending() -> bool
     var fds: [1]PollFd
     fds[0].fd = fd_stdin().raw()
     fds[0].events = POLLIN
     fds[0].revents = 0
-    match poll(span_from_ptr<PollFd>(@fds[0], 1), 0)
+    let polled: [PollFd] = @fds
+    match poll(polled, 0)
         Ok(n) =>
             if n <= 0
                 return false
         Err(_) => return false
     (fds[0].revents & POLLIN) != 0
 
-# Read a complete LSP message
-# Returns the JSON payload as a null-terminated string (caller must free)
-pub fn read_message() -> *u8
+# Read a complete LSP message: its JSON payload, or None once the connection
+# is closed or the header is bad.  The payload is read a chunk at a time, so
+# a Content-Length larger than what follows (up to i64::MAX) ends at EOF
+# instead of asking for that much memory up front.
+pub fn read_message() -> Option<String>
     let content_length: i64 = read_headers()
     if content_length <= 0
-        return null
+        return None
 
-    # One byte for the NUL.  i64::MAX parses as a length, but i64::MAX + 1
-    # overflows i64, and no allocation that large can succeed: treat it as
-    # a length we cannot buffer, like any other that malloc refuses.
-    if content_length == 9223372036854775807
-        return null
-
-    # Allocate buffer for content + null terminator
-    let buf: *u8 = malloc(content_length + 1)
-    if buf == null
-        return null
-
-    if read_exact(buf, content_length) != 0
-        free(buf)
-        return null
-
-    # Null-terminate
-    *(buf + content_length) = 0
-    return buf
+    var payload: String = string_new()
+    var chunk: [4096]u8
+    let scratch: [u8] = @chunk
+    var left: i64 = content_length
+    while left > 0
+        var n: i64 = left
+        if n > scratch.len
+            n = scratch.len
+        let part: [u8] = scratch[0..n]
+        match fd_stdin().read_exact(part)
+            Ok(_) => pass
+            Err(_) => return None
+        payload.push_span(part)
+        left -= n
+    Some(payload)
 
 # =============================================================================
 # Writing Messages
 # =============================================================================
 
 # Write a complete LSP message
-pub fn write_message(json: *u8, len: i64)
-    # Write headers
-    print("Content-Length: {len}\r\n\r\n")
-
-    # Write content
-    fd_stdout().write_all(Span<u8> { ptr: json, len: len })
+pub fn write_message(json: Span<u8>)
+    print("Content-Length: {json.len}\r\n\r\n")
+    fd_stdout().write_all(json)
 
 # Write message from Vec<u8> buffer
 pub fn write_message_vec(buf: *Vec<u8>)
-    write_message(buf.data, buf.len)
+    let json: [u8] = buf[0..buf.len]
+    write_message(json)

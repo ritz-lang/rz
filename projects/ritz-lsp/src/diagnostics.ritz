@@ -41,8 +41,6 @@
 
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str
-import ritzlib.memory
 import ritzlib.gvec
 import ritzlib.string
 import ritzlib.strview
@@ -123,7 +121,7 @@ struct DiagList
     json: Vec<u8>       # `{...},{...}` -- the array's elements
     count: i32
 
-fn add_diag(dl: *DiagList, line: i64, col: i64, end_col: i64, sev: i64, msg: *u8, msg_len: i64)
+fn add_diag(dl: *DiagList, line: i64, col: i64, end_col: i64, sev: i64, msg: StrView)
     if dl.count > 0
         dl.json.push(',')
     dl.json.push_view("{\"range\":")
@@ -131,90 +129,104 @@ fn add_diag(dl: *DiagList, line: i64, col: i64, end_col: i64, sev: i64, msg: *u8
     dl.json.push_view(",\"severity\":")
     push_i64(@dl.json, sev)
     dl.json.push_view(",\"source\":\"ritz1\",\"message\":")
-    json_emit_string(strview_from_ptr(msg, msg_len), @&dl.json)
+    json_emit_string(msg, @&dl.json)
     dl.json.push('}')
     dl.count += 1
 
 # One at the start of the document, carrying a whole line of output.
-fn add_unlocated(dl: *DiagList, sev: i64, msg: *u8, msg_len: i64)
-    add_diag(dl, 0, 0, 0, sev, msg, msg_len)
+fn add_unlocated(dl: *DiagList, sev: i64, msg: StrView)
+    add_diag(dl, 0, 0, 0, sev, msg)
 
-fn add_cstr(dl: *DiagList, sev: i64, msg: @&String)
-    add_unlocated(dl, sev, msg.as_ptr(), msg.len())
+fn add_message(dl: *DiagList, sev: i64, msg: @&String)
+    add_unlocated(dl, sev, msg.as_view())
 
-# Parse decimal digits at s[i..]; the value, and `*next` past them (or -1
-# if there are none, or they overflow i64: read by strview_parse_i64, #4040).
-fn parse_num(s: *u8, i: i64, len: i64, next: *i64) -> i64
+# A run of decimal digits in a line: its value and the offset after it.
+struct Num
+    value: i64
+    end: i64
+
+# The decimal digits at s[i..], or None if there are none or they overflow
+# i64 (read by StrView.parse_i64, #4040).
+fn parse_num(s: StrView, i: i64) -> Option<Num>
     var j: i64 = i
-    while j < len and *(s + j) >= '0' and *(s + j) <= '9'
+    while j < s.len and s.get(j) >= '0' and s.get(j) <= '9'
         j += 1
-    *next = -1
     if j == i
-        return 0
-    match (strview_from_ptr(s + i, j - i)).parse_i64()
-        Some(v) => parse_num_at(next, j, v)
-        None => 0
+        return None
+    match s.slice(i, j).parse_i64()
+        Some(v) => Some(Num { value: v, end: j })
+        None => None
 
-fn parse_num_at(next: *i64, j: i64, v: i64) -> i64
-    *next = j
-    v
-
-fn starts_with_at(s: *u8, i: i64, len: i64, lit: StrView) -> bool
-    i <= len and strview_from_ptr(s + i, len - i).starts_with(lit)
-
-fn contains_error(s: *u8, len: i64) -> bool
+fn contains_error(s: StrView) -> bool
     var i: i64 = 0
-    while i + 5 <= len
-        let c: u8 = *(s + i)
-        if (c == 'e' or c == 'E') and memcmp(s + i + 1, c"rror", 4) == 0
+    while i + 5 <= s.len
+        let c: u8 = s.get(i)
+        if (c == 'e' or c == 'E') and s.slice(i + 1, i + 5).eq("rror")
             return true
         i += 1
     false
 
-# One line of ritz1's stderr.  `input` is the path ritz1 was given.
-fn add_line(dl: *DiagList, text: *u8, text_len: i64, input: StrView, s: *u8, len: i64)
-    if len == 0 or starts_with_at(s, 0, len, "note:")
-        return
+# A line `<input>:<line>:<col>: error|warning: <message>` as a diagnostic
+# at that position in `text`; false if `s` is not one.
+fn add_located(dl: *DiagList, text: StrView, input: StrView, s: StrView) -> bool
     let in_len: i64 = input.len()
-    if starts_with_at(s, 0, len, input) and in_len < len and *(s + in_len) == ':'
-        var after_line: i64 = -1
-        let line: i64 = parse_num(s, in_len + 1, len, @after_line)
-        if after_line > 0 and after_line < len and *(s + after_line) == ':'
-            var after_col: i64 = -1
-            let col: i64 = parse_num(s, after_line + 1, len, @after_col)
-            if after_col > 0 and line > 0 and col > 0
-                var sev: i64 = 0
-                var msg: i64 = 0
-                if starts_with_at(s, after_col, len, ": error: ")
-                    sev = SEV_ERROR
-                    msg = after_col + 9
-                else if starts_with_at(s, after_col, len, ": warning: ")
-                    sev = SEV_WARNING
-                    msg = after_col + 11
-                if sev != 0
-                    # ritz1's column counts bytes; LSP's counts UTF-16 units.
-                    let off: i64 = byte_offset(text, text_len, line - 1, col - 1)
-                    let w: Word = word_at_offset(text, text_len, line - 1, off)
-                    var end_byte: i64 = col
-                    if w.start >= 0
-                        end_byte = col - 1 + w.end - off
-                    let c0: i64 = lsp_char(text, text_len, line - 1, col - 1)
-                    let c1: i64 = lsp_char(text, text_len, line - 1, end_byte)
-                    add_diag(dl, line - 1, c0, c1, sev, s + msg, len - msg)
-                    return
-    if contains_error(s, len)
-        add_unlocated(dl, SEV_ERROR, s, len)
+    if not s.starts_with(input) or in_len >= s.len or s.get(in_len) != ':'
+        return false
+    let ln: Num = match parse_num(s, in_len + 1)
+        Some(n) => n
+        None => return false
+    if ln.end >= s.len or s.get(ln.end) != ':'
+        return false
+    let cn: Num = match parse_num(s, ln.end + 1)
+        Some(n) => n
+        None => return false
+    let line: i64 = ln.value
+    let col: i64 = cn.value
+    if line <= 0 or col <= 0
+        return false
+    let rest: StrView = s.skip(cn.end)
+    var sev: i64 = 0
+    var msg: StrView = ""
+    if rest.starts_with(": error: ")
+        sev = SEV_ERROR
+        msg = rest.skip(9)
+    else if rest.starts_with(": warning: ")
+        sev = SEV_WARNING
+        msg = rest.skip(11)
+    else
+        return false
+    # ritz1's column counts bytes; LSP's counts UTF-16 units.
+    let off: i64 = byte_offset(text, line - 1, col - 1)
+    let w: Word = word_at_offset(text, line - 1, off)
+    var end_byte: i64 = col
+    if w.start >= 0
+        end_byte = col - 1 + w.end - off
+    let c0: i64 = lsp_char(text, line - 1, col - 1)
+    let c1: i64 = lsp_char(text, line - 1, end_byte)
+    add_diag(dl, line - 1, c0, c1, sev, msg)
+    true
+
+# One line of ritz1's stderr.  `input` is the path ritz1 was given.
+fn add_line(dl: *DiagList, text: StrView, input: StrView, s: StrView)
+    if s.len == 0 or s.starts_with("note:")
+        return
+    if add_located(dl, text, input, s)
+        return
+    if contains_error(s)
+        add_unlocated(dl, SEV_ERROR, s)
 
 # Every line of `err` (ritz1's stderr) into `dl`.
-fn add_output(dl: *DiagList, text: *u8, text_len: i64, input: StrView, err: @Vec<u8>)
+fn add_output(dl: *DiagList, text: StrView, input: StrView, err: @Vec<u8>)
+    let bytes: [u8] = err[0..err.len]
+    let e: StrView = bytes.as_strview()
     var start: i64 = 0
     var i: i64 = 0
-    while i <= err.len
-        if i == err.len or *(err.data + i) == '\n'
+    while i <= e.len
+        if i == e.len or e.get(i) == '\n'
             var end: i64 = i
-            if end > start and *(err.data + end - 1) == '\r'
+            if end > start and e.get(end - 1) == '\r'
                 end -= 1
-            add_line(dl, text, text_len, input, err.data + start, end - start)
+            add_line(dl, text, input, e.slice(start, end))
             start = i + 1
         i += 1
 
@@ -223,16 +235,15 @@ fn add_output(dl: *DiagList, text: *u8, text_len: i64, input: StrView, err: @Vec
 # =============================================================================
 
 # Compile `text` as the document `uri` with ritz1; its diagnostics into `dl`.
-fn compile(dl: *DiagList, uri: StrView, text: *u8, text_len: i64)
+fn compile(dl: *DiagList, uri: StrView, text: StrView)
     var ritz1: String = find_ritz1()
     if ritz1.len() == 0
         var m: String = string_from("ritz-lsp: no ritz1 to run (set RITZ1, put ritz1 on PATH, or build it: make -C projects/ritz ritz1); no compiler diagnostics")
-        add_cstr(dl, SEV_WARNING, @&m)
+        add_message(dl, SEV_WARNING, @&m)
         return
 
     var doc_path: String = uri_path(uri)
-    let dp: *u8 = doc_path.as_ptr()
-    let slash: i64 = last_slash(dp, doc_path.len())
+    let slash: i64 = last_slash(doc_path.as_view())
     var base: String = string_from(doc_path.as_view().skip(slash + 1))
     if base.len() == 0
         base.push_str("buffer.ritz")
@@ -248,8 +259,8 @@ fn compile(dl: *DiagList, uri: StrView, text: *u8, text_len: i64)
     output.push_str("/ritz-lsp-out.ll")
     var ipath: String = import_path(@&doc_path)
 
-    match write_file(input.as_view(), strview_from_ptr(text, text_len))
-        Ok(n) => run_ritz1(dl, @&ritz1, @&input, @&output, @&ipath, text, text_len)
+    match write_file(input.as_view(), text)
+        Ok(n) => run_ritz1(dl, @&ritz1, @&input, @&output, @&ipath, text)
         Err(e) => write_failed(dl, @&input, e.code())
 
     unlink(input.as_view())
@@ -262,9 +273,9 @@ fn write_failed(dl: *DiagList, input: @&String, errno: i32)
     m.push_str(" (errno ")
     m.push_i64(errno as i64)
     m.push_str("); no compiler diagnostics")
-    add_cstr(dl, SEV_WARNING, @&m)
+    add_message(dl, SEV_WARNING, @&m)
 
-fn run_ritz1(dl: *DiagList, ritz1: @&String, input: @&String, output: @&String, ipath: @&String, text: *u8, text_len: i64)
+fn run_ritz1(dl: *DiagList, ritz1: @&String, input: @&String, output: @&String, ipath: @&String, text: StrView)
     var args: [5]StrView
     args[0] = input.as_view()
     args[1] = "-o"
@@ -274,8 +285,9 @@ fn run_ritz1(dl: *DiagList, ritz1: @&String, input: @&String, output: @&String, 
     var nargs: i64 = 5
     if ipath.len() == 0
         nargs = 3
-    match spawn(ritz1.as_view(), span_from_ptr<StrView>(@args[0], nargs))
-        Ok(p) => collect(dl, p, input, text, text_len)
+    let all: [StrView] = @args
+    match spawn(ritz1.as_view(), all[0..nargs])
+        Ok(p) => collect(dl, p, input, text)
         Err(e) => spawn_failed(dl, ritz1, e.code())
 
 fn spawn_failed(dl: *DiagList, ritz1: @&String, errno: i32)
@@ -284,9 +296,9 @@ fn spawn_failed(dl: *DiagList, ritz1: @&String, errno: i32)
     m.push_str(" (errno ")
     m.push_i64(errno as i64)
     m.push_str("); no compiler diagnostics")
-    add_cstr(dl, SEV_WARNING, @&m)
+    add_message(dl, SEV_WARNING, @&m)
 
-fn collect(dl: *DiagList, p: Process, input: @&String, text: *u8, text_len: i64)
+fn collect(dl: *DiagList, p: Process, input: @&String, text: StrView)
     var q: Process = p
     q.close_stdin()
     var err: Vec<u8> = vec_new<u8>()
@@ -295,19 +307,19 @@ fn collect(dl: *DiagList, p: Process, input: @&String, text: *u8, text_len: i64)
     drain(@&q, @&err, @&out, deadline)
     match wait_until(@&q, deadline)
         Some(r) =>
-            add_output(dl, text, text_len, input.as_view(), @err)
+            add_output(dl, text, input.as_view(), @err)
             if dl.count == 0 and not r.success()
                 var m: String = string_from("ritz1 failed with no error message (exit ")
                 m.push_i64(r.exit_code as i64)
                 m.push_str(")")
-                add_cstr(dl, SEV_ERROR, @&m)
+                add_message(dl, SEV_ERROR, @&m)
         None =>
             q.kill()
             q.wait()   # Err only if already reaped: nothing to do
             var m: String = string_from("ritz-lsp: the ritz1 check timed out after ")
             m.push_i64(COMPILE_DEADLINE_SECS)
             m.push_str("s and was stopped; no compiler diagnostics")
-            add_cstr(dl, SEV_WARNING, @&m)
+            add_message(dl, SEV_WARNING, @&m)
     q.close_pipes()
 
 # Milliseconds left before `deadline` (now_millis() time), at least 0.
@@ -321,45 +333,49 @@ fn ms_left(deadline: i64) -> i32
 # `deadline` passes.  An fd at EOF is closed and set to -1.
 fn drain(q: @&Process, err: @&Vec<u8>, out: @&Vec<u8>, deadline: i64)
     var fds: [2]PollFd
+    let polled: [PollFd] = @fds
     var buf: [4096]u8
+    let scratch: [u8] = @buf
     while q.stderr_fd >= 0 or q.stdout_fd >= 0
         let left: i32 = ms_left(deadline)
         if left == 0
             return
-        fds[0].fd = q.stderr_fd
-        fds[0].events = POLLIN
-        fds[0].revents = 0
-        fds[1].fd = q.stdout_fd
-        fds[1].events = POLLIN
-        fds[1].revents = 0
+        polled[0].fd = q.stderr_fd
+        polled[0].events = POLLIN
+        polled[0].revents = 0
+        polled[1].fd = q.stdout_fd
+        polled[1].events = POLLIN
+        polled[1].revents = 0
         # poll skips an entry whose fd is negative.
         var rc: i32 = 0
-        match poll(span_from_ptr<PollFd>(@fds[0], 2), left)
+        match poll(polled, left)
             Ok(n) => rc = n
             Err(e) =>
                 match e
                     Intr => pass   # a signal: poll again
                     _ => return
         if rc > 0
-            if fds[0].revents != 0
-                let n: i64 = read_some(q.stderr_fd, @buf[0])
+            if polled[0].revents != 0
+                let n: i64 = read_some(q.stderr_fd, scratch)
                 if n > 0
-                    err.push_span(Span<u8> { ptr: (@buf[0]), len: (n) as i64 })
+                    let got: [u8] = scratch[0..n]
+                    err.push_span(got)
                 else
                     close_pipe(q.stderr_fd)
                     q.stderr_fd = -1
-            if fds[1].revents != 0
-                let n: i64 = read_some(q.stdout_fd, @buf[0])
+            if polled[1].revents != 0
+                let n: i64 = read_some(q.stdout_fd, scratch)
                 if n > 0
-                    out.push_span(Span<u8> { ptr: (@buf[0]), len: (n) as i64 })
+                    let got: [u8] = scratch[0..n]
+                    out.push_span(got)
                 else
                     close_pipe(q.stdout_fd)
                     q.stdout_fd = -1
 
-# One read of up to 4096 bytes from the Process's pipe `fd` (it stays the
+# One read of up to buf.len bytes from the Process's pipe `fd` (it stays the
 # Process's): the count, 0 at EOF, -1 on error.
-fn read_some(fd: i32, buf: *u8) -> i64
-    match fd_borrow(fd).read(Span<u8> { ptr: buf, len: 4096 })
+fn read_some(fd: i32, buf: Span<u8>) -> i64
+    match fd_borrow(fd).read(buf)
         Ok(n) => n
         Err(_) => -1
 
@@ -380,14 +396,15 @@ fn wait_until(q: @&Process, deadline: i64) -> Option<ProcessResult>
 
 # The textDocument/publishDiagnostics params for `uri` at `version` into
 # `out`, from a ritz1 compile of `text`.
-pub fn diagnostics_json(uri: StrView, version: i64, text: *u8, text_len: i64, out: *Vec<u8>)
+pub fn diagnostics_json(uri: StrView, version: i64, text: StrView, out: *Vec<u8>)
     var dl: DiagList = DiagList { json: vec_with_cap<u8>(256), count: 0 }
-    compile(@dl, uri, text, text_len)
+    compile(@dl, uri, text)
     out.clear()
     out.push_view("{\"uri\":")
     json_emit_string(uri, out)
     out.push_view(",\"version\":")
     push_i64(out, version)
     out.push_view(",\"diagnostics\":[")
-    out.push_span(Span<u8> { ptr: (dl.json.data), len: (dl.json.len) as i64 })
+    let elements: [u8] = dl.json[0..dl.json.len]
+    out.push_span(elements)
     out.push_view("]}")
