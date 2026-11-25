@@ -48,27 +48,27 @@ PROJECTS = RITZ_ROOT.parent
 PINS = {
     "angelo": 3,
     "cryptosec": 7,
-    "goliath": 34,
+    "goliath": 28,
     "harland": 11,
     "http": 2,
     "indium": 116,
     "larb": 0,
     "lexis": 10,
-    "mausoleum": 159,
-    "nexus": 31,
+    "mausoleum": 141,
+    "nexus": 29,
     "prism": 2,
-    "ritz": 1369,
-    "ritz-lsp": 33,
-    "ritzunit": 40,
+    "ritz": 1360,
+    "ritz-lsp": 30,
+    "ritzunit": 37,
     "rzrz": 3,
-    "rzsh": 17,
+    "rzsh": 12,
     "sage": 13,
     "spire": 28,
     "squeeze": 2,
-    "tempest": 1,
-    "tome": 142,
-    "valet": 48,
-    "zeus": 56,
+    "tempest": 0,
+    "tome": 139,
+    "valet": 42,
+    "zeus": 43,
 }
 
 
@@ -84,7 +84,30 @@ def test_raw_api_callers_only_go_down(by_project):
     assert over == {}, f"project: (calls, pin) over the pin: {over}"
 
 
-# `c"..."` literals per project, re-measured by #4686 on af511e6fba25.  Down only.
+# AGAST #4691: the syscalls ritzlib now wraps (ritzlib.process ids, SigSet,
+# signalfd; ritzlib.fd poll and Fd.sendfile; ritzlib.fs unlink / rename) have
+# no raw callers left in hosted code.  The compilers (ritz0, ritz1) and the
+# freestanding indium / harland are out of scope, and so is rzsh's
+# src/rawio.ritz: rzsh's src/ also builds a freestanding Harland bin, where
+# ritzlib.fd and ritzlib.process don't build, so its pid and stdio stay raw
+# in that one shim.
+WRAPPED_SYSCALLS = {
+    "sys_getpid", "sys_getppid", "sys_getuid", "sys_poll", "sys_rt_sigprocmask",
+    "sys_signalfd4", "sys_sendfile", "sys_unlink", "sys_rename",
+}
+RAW_OK = ("ritz/ritz0/", "ritz/ritz1/", "indium/", "harland/", "rzsh/src/rawio.ritz")
+
+
+def test_wrapped_syscalls_have_no_hosted_callers():
+    sites = count_callers(RITZ_ROOT / "ritzlib", [PROJECTS])
+    raw = [f"{Path(s.path).relative_to(PROJECTS)}:{s.line} {s.api}" for s in sites
+           if s.api in WRAPPED_SYSCALLS
+           and not str(Path(s.path).relative_to(PROJECTS)).startswith(RAW_OK)]
+    assert raw == [], f"raw calls with a typed ritzlib wrapper: {raw}"
+
+
+# `c"..."` literals per project, re-measured by #4686 on af511e6fba25 (rzsh by
+# #4691).  Down only.
 C_LITERAL_PINS = {
     "cryptosec": 295,
     "goliath": 45,
@@ -100,7 +123,7 @@ C_LITERAL_PINS = {
     "ritz-lsp": 40,
     "ritzunit": 108,
     "rzrz": 34,
-    "rzsh": 6,
+    "rzsh": 2,
     "sage": 1,
     "spire": 25,
     "tome": 9,

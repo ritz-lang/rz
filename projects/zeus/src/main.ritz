@@ -19,11 +19,11 @@
 
 import ritzlib.sys
 import ritzlib.fmt.digits { fmt_i64_into }
-import ritzlib.span { Span }
+import ritzlib.span { Span, span_from_ptr }
 import ritzlib.strview { StrView, strview_from_cstr }
-import ritzlib.fd { Fd, fd_adopt, fd_stdout }
+import ritzlib.fd { Fd, fd_adopt, fd_stdout, poll, PollFd, POLLIN }
 import ritzlib.fs { unlink }
-import ritzlib.process { ProcessResult, kill, wait_pid, try_wait_pid }
+import ritzlib.process { ProcessResult, kill, wait_pid, try_wait_pid, signalfd_read }
 import ritzlib.time { sleep_ms }
 import ritzlib.option
 import ritzlib.result
@@ -83,7 +83,7 @@ var g_signal_pipe_read: i32 = -1
 var g_signal_pipe_write: i32 = -1
 
 # signalfd for SIGTERM/SIGINT/SIGHUP (blocked; read in the event loop)
-var g_signal_fd: i32 = -1
+var g_signal_fd: Fd = Fd { fd: -1 }
 
 # Daemon context (global for signal handler access)
 var g_daemon: DaemonContext
@@ -105,21 +105,19 @@ fn run_event_loop(ctx: *DaemonContext, opts: *ZeusOptions) -> i32
     # Poll fds: signal pipe + listen socket
     var poll_fds: [2]PollFd
 
-    poll_fds[0].fd = g_signal_fd
-    poll_fds[0].events = 1  # POLLIN
+    poll_fds[0].fd = g_signal_fd.raw()
+    poll_fds[0].events = POLLIN
     poll_fds[0].revents = 0
 
     poll_fds[1].fd = ctx.listen_fd.raw()
-    poll_fds[1].events = 1  # POLLIN
+    poll_fds[1].events = POLLIN
     poll_fds[1].revents = 0
 
     while g_running != 0
         # Poll with 1 second timeout
-        let nready: i32 = sys_poll(@poll_fds[0], 2, 1000)
-
-        if nready < 0
-            # Error (might be EINTR from signal)
-            continue
+        let nready: i32 = match poll(span_from_ptr<PollFd>(@poll_fds[0], 2), 1000)
+            Ok(n) => n
+            Err(_) => continue  # Err(Intr) from a signal, or another error
 
         if nready == 0
             # Timeout - check worker health
@@ -127,11 +125,11 @@ fn run_event_loop(ctx: *DaemonContext, opts: *ZeusOptions) -> i32
             continue
 
         # Handle signal pipe
-        if (poll_fds[0].revents & 1) != 0
+        if (poll_fds[0].revents & POLLIN) != 0
             handle_signals(ctx)
 
         # Handle new connections
-        if (poll_fds[1].revents & 1) != 0
+        if (poll_fds[1].revents & POLLIN) != 0
             handle_accept(ctx)
 
         # Check workers periodically
@@ -143,9 +141,12 @@ fn run_event_loop(ctx: *DaemonContext, opts: *ZeusOptions) -> i32
 # Handle every signal queued on the signalfd
 fn handle_signals(ctx: *DaemonContext)
     loop
-        let sig: i32 = zeus_read_signal(g_signal_fd)
-        if sig <= 0
-            return
+        let pending: Option<i32> = match signalfd_read(@g_signal_fd)
+            Ok(p) => p
+            Err(_) => return
+        let sig: i32 = match pending
+            Some(s) => s
+            None => return
         if sig == SIGTERM || sig == SIGINT
             print_str(c"zeus: received shutdown signal\n")
             g_running = 0
@@ -538,7 +539,7 @@ fn print_usage()
 # Poll structures
 # ============================================================================
 
-# Note: sys_poll and PollFd are imported from ritzlib.sys
+# Note: poll and PollFd are imported from ritzlib.fd
 
 # ============================================================================
 # Entry Point
@@ -598,11 +599,12 @@ pub fn main(args: Span<StrView>) -> i32
     # Take SIGTERM/SIGINT/SIGHUP through a signalfd before any worker
     # exists: their default action would kill zeus and leave the workers
     # running (AGAST #2465).
-    g_signal_fd = zeus_open_signalfd()
-    if g_signal_fd < 0
-        print_str(c"zeus: failed to create signalfd\n")
-        daemon_destroy(@g_daemon)
-        return 1
+    match zeus_open_signalfd()
+        Ok(sfd) => g_signal_fd = sfd
+        Err(_) =>
+            print_str(c"zeus: failed to create signalfd\n")
+            daemon_destroy(@g_daemon)
+            return 1
 
     # Start daemon
     daemon_start(@g_daemon)

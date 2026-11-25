@@ -40,7 +40,7 @@ import ritzlib.str
 import ritzlib.strview
 import ritzlib.os.env
 import ritzlib.fd { Fd, fd_adopt, SEEK_SET, SEEK_END }
-import ritzlib.process { fork, kill, wait_pid }
+import ritzlib.process { fork, kill, wait_pid, SigSet, sigset_empty, sigset_of }
 import ritzlib.time { now, now_unix_ms }
 import ritzunit.wait_status
 
@@ -259,9 +259,6 @@ struct Outcome
     elapsed: i64
     output: StrView      # captured output, only for a test that did not pass
 
-fn sigchld_mask() -> i64
-    return (1 as i64) << ((SIGCHLD - 1) as i64)
-
 fn outcome_fail_to_start(out: *Outcome)
     out.done = 1
     out.result.status = TEST_RESULT_FAIL
@@ -272,7 +269,7 @@ fn outcome_fail_to_start(out: *Outcome)
 
 # Fork the test at run-list position `pos` into `slot`. A failed fork records
 # the test as failed at once.
-fn pool_launch(opts: @RunOptions, slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_mask: *i64) -> i32
+fn pool_launch(opts: @RunOptions, slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_mask: @SigSet) -> i32
     capture_reset(@slot.capture_fd)
     # A child without a capture file writes to our stdout: the report so far
     # must be there first. With one, the report stays buffered.
@@ -284,7 +281,9 @@ fn pool_launch(opts: @RunOptions, slot: *PoolSlot, test: *RitzTest, pos: i64, ou
             match side
                 Child =>
                     # === Child: the test sees the signal mask the runner started with ===
-                    sys_rt_sigprocmask(SIG_SETMASK, old_mask, null, 8)
+                    match old_mask.set_mask()
+                        Ok(_) => pass
+                        Err(_) => pass
                     # The report buffered so far is the runner's to write, not the test's.
                     out_discard()
                     child_disable_core(opts)
@@ -338,7 +337,7 @@ fn pool_reap(slots: *PoolSlot, nslots: i64, outcomes: *Outcome) -> i32
 # killed (and reaped once they are gone); the wait ends no later than the
 # earliest deadline still pending.
 fn pool_wait(slots: *PoolSlot, nslots: i64, outcomes: *Outcome)
-    let mask: i64 = sigchld_mask()
+    let mask: SigSet = sigset_of(SIGCHLD)
     loop
         if pool_reap(slots, nslots, outcomes) > 0
             return
@@ -355,13 +354,13 @@ fn pool_wait(slots: *PoolSlot, nslots: i64, outcomes: *Outcome)
         # SIGCHLD is blocked, so a child that exited since pool_reap is a
         # pending signal and this returns at once.
         if earliest < 0
-            syscall4(SYS_RT_SIGTIMEDWAIT, @mask as i64, 0, 0, 8)
+            syscall4(SYS_RT_SIGTIMEDWAIT, @mask.bits as i64, 0, 0, 8)
         else
             var ts: [2]i64
             let wait_ms: i64 = earliest - now
             ts[0] = wait_ms / 1000
             ts[1] = (wait_ms % 1000) * 1000000
-            syscall4(SYS_RT_SIGTIMEDWAIT, @mask as i64, 0, @ts[0] as i64, 8)
+            syscall4(SYS_RT_SIGTIMEDWAIT, @mask.bits as i64, 0, @ts[0] as i64, 8)
 
 # Kill and reap every live child (--fail-fast stopped the run).
 fn pool_abandon(slots: *PoolSlot, nslots: i64)
@@ -473,9 +472,12 @@ fn run_pool(opts: @RunOptions, tests: *RitzTest, run: *i64, nrun: i64, outcomes:
         slots[i].pid = 0
         slots[i].capture_fd = capture_open()
 
-    var mask: i64 = sigchld_mask()
-    var old_mask: i64 = 0
-    sys_rt_sigprocmask(SIG_BLOCK, @mask, @old_mask, 8)
+    # On Err nothing was blocked: restoring the empty set is what the raw
+    # call's zeroed old mask did.
+    let chld: SigSet = sigset_of(SIGCHLD)
+    let old_mask: SigSet = match chld.block()
+        Ok(prev) => prev
+        Err(_) => sigset_empty()
 
     var next: i64 = 0       # next position to launch
     var reported: i64 = 0   # next position to report
@@ -505,7 +507,9 @@ fn run_pool(opts: @RunOptions, tests: *RitzTest, run: *i64, nrun: i64, outcomes:
                 if slots[i].pid != 0
                     live += 1
 
-    sys_rt_sigprocmask(SIG_SETMASK, @old_mask, null, 8)
+    match old_mask.set_mask()
+        Ok(_) => pass
+        Err(_) => pass
     for i in 0..nslots
         slots[i].capture_fd.close()
 

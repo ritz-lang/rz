@@ -54,7 +54,7 @@ import ritzlib.os.env
 import ritzlib.fs
 import ritzlib.timer
 import ritzlib.json
-import ritzlib.fd { Fd, fd_borrow, fd_adopt }
+import ritzlib.fd { Fd, fd_borrow, fd_adopt, poll, PollFd, POLLIN }
 import ritzlib.time { sleep_ms }
 
 import symbols
@@ -111,7 +111,7 @@ fn scratch_root() -> String
     if out.len() == 0
         out.push_str(env_get_or("TMPDIR", "/tmp"))
         out.push_str("/ritz-lsp-")
-        out.push_i64(sys_getuid() as i64)
+        out.push_i64(user_id() as i64)
     mkdir(out.as_view(), 448)
     out
 
@@ -333,9 +333,13 @@ fn drain(q: @&Process, err: @&Vec<u8>, out: @&Vec<u8>, deadline: i64)
         fds[1].events = POLLIN
         fds[1].revents = 0
         # poll skips an entry whose fd is negative.
-        let rc: i32 = sys_poll(@fds[0], 2, left)
-        if rc < 0 and rc != 0 - EINTR
-            return
+        var rc: i32 = 0
+        match poll(span_from_ptr<PollFd>(@fds[0], 2), left)
+            Ok(n) => rc = n
+            Err(e) =>
+                match e
+                    Intr => pass   # a signal: poll again
+                    _ => return
         if rc > 0
             if fds[0].revents != 0
                 let n: i64 = read_some(q.stderr_fd, @buf[0])

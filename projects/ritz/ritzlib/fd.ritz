@@ -21,15 +21,22 @@
 # automatically once Drop lands (AGAST #1854). fd_stdin/fd_stdout/fd_stderr
 # borrow the process's standard streams: never close those.
 #
-# raw() is for the remaining kernel-ABI hand-offs (poll, io_uring, execve
-# redirection by number): it does not transfer ownership.
+# raw() is for the remaining kernel-ABI hand-offs (a PollFd's number,
+# io_uring, execve redirection by number): it does not transfer ownership.
+#
+#     var fds: [1]PollFd
+#     fds[0] = PollFd { fd: sock.raw(), events: POLLIN, revents: 0 }
+#     match poll(span_from_ptr<PollFd>(@fds[0], 1), 1000)  # Result<i32, Errno>
+#         Ok(n) => ...                          # 0: timed out
+#
+#     file.sendfile(@sock, off, len)            # Result<i64, Errno>: bytes sent
 #
 # A read or write interrupted by a signal (EINTR) is retried, so Err(Intr)
 # never escapes these methods.
 
 import ritzlib.sys
-# What a caller of fd_open / stat / lock needs, so `import ritzlib.fd` is enough.
-pub import ritzlib.sys { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK, O_CLOEXEC, O_DIRECTORY, LOCK_SH, LOCK_EX, LOCK_NB, LOCK_UN, Stat }
+# What a caller of fd_open / stat / lock / poll needs, so `import ritzlib.fd` is enough.
+pub import ritzlib.sys { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND, O_NONBLOCK, O_CLOEXEC, O_DIRECTORY, LOCK_SH, LOCK_EX, LOCK_NB, LOCK_UN, Stat, PollFd, POLLIN, POLLOUT, POLLERR, POLLHUP, POLLNVAL }
 import ritzlib.string
 import ritzlib.strview
 import ritzlib.span
@@ -117,6 +124,20 @@ pub fn pipe() -> Result<Pipe, Errno>
     if rc < 0
         return Err(errno_from_raw(rc))
     Ok(Pipe { read: Fd { fd: ends[0] }, write: Fd { fd: ends[1] } })
+
+# Wait up to `timeout_ms` (-1: forever, 0: don't wait) for an event on any of
+# `fds` (poll(2)): Ok(how many have a non-zero revents), Ok(0) on a timeout.
+# A number that names no open file is POLLNVAL in its revents, not an Err;
+# a negative fd is skipped. A signal arriving first is Err(Intr): the caller
+# owns the deadline, so it decides whether to poll again.
+#
+# standard-exempt: free-fn-method: `PollFd` is `[[target_os = "linux"]]`, and impl blocks take no attributes (AGAST #4445)
+[[target_os = "linux"]]
+pub fn poll(fds: Span<PollFd>, timeout_ms: i32) -> Result<i32, Errno>
+    let rc: i32 = sys_poll(fds.ptr, fds.len, timeout_ms)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(rc)
 
 # ============================================================================
 # Fd methods
@@ -266,6 +287,20 @@ impl Fd
         if self.fd < 0
             return Err(errno_from_raw(FD_EBADF))
         fd_unit(sys_fchmod(self.fd, mode))
+
+    # Copy up to `count` bytes of this file, starting `offset` bytes in, to
+    # `out` inside the kernel (sendfile(2)): Ok(bytes copied), 0 at end of
+    # file. This Fd's own file offset does not move, so a loop sending a
+    # range advances its offset by each Ok.
+    pub fn sendfile(self: @Fd, out: @Fd, offset: i64, count: i64) -> Result<i64, Errno>
+        if self.fd < 0 or out.fd < 0
+            return Err(errno_from_raw(FD_EBADF))
+        # The kernel advances its copy of the offset; ours stays the caller's.
+        var at: i64 = offset
+        var n: i64 = sys_sendfile(out.fd, self.fd, @at, count)
+        while n == -(FD_EINTR as i64)
+            n = sys_sendfile(out.fd, self.fd, @at, count)
+        fd_count(n)
 
     # Advisory whole-file lock (flock(2)): LOCK_SH, LOCK_EX, LOCK_UN, with
     # LOCK_NB added to fail with Again instead of blocking.

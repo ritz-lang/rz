@@ -15,8 +15,10 @@
 # `<path>.lock` sidecar: the store itself can't carry it, since each save
 # renames a new inode over it. Plain readers need no lock.
 
-import ritzlib.sys { sys_getpid, sys_rename, sys_unlink, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
+import ritzlib.sys { sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
 import ritzlib.fd { Fd, fd_open, fd_adopt, fd_borrow, SEEK_SET, SEEK_END, O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_CLOEXEC, LOCK_EX }
+import ritzlib.process { process_id }
+import ritzlib.fs { unlink, rename }
 import ritzlib.span { Span }
 import ritzlib.strview { StrView, strview_from_ptr, strview_empty }
 import goliath.blob_store { MemoryBlobStore }
@@ -34,9 +36,7 @@ const FS_ENOENT: i32 = 2
 
 # `path` + `suffix` + NUL into `buf` (FS_PATH_BUF bytes), as a view of `buf`
 # (without the NUL). An empty view if `path` is empty, holds a NUL, or the
-# pair doesn't fit. The NUL is for rename(2)/unlink(2), which stay raw here:
-# ritzlib.fs can't be imported (its DirEntry and path_basename collide with
-# goliath's).
+# pair doesn't fit.
 fn fs_path_join(path: StrView, suffix: StrView, buf: *u8) -> StrView
     if path.len == 0 or path.len + suffix.len >= FS_PATH_BUF
         return strview_empty()
@@ -64,7 +64,7 @@ fn fs_tmp_path(path: StrView, buf: *u8) -> StrView
         n = n + 1
     var digits: [16]u8
     var d: i64 = 0
-    var pid: i64 = sys_getpid() as i64
+    var pid: i64 = process_id() as i64
     if pid <= 0
         return strview_empty()
     while pid > 0
@@ -176,12 +176,20 @@ pub fn file_store_save(path: StrView, ns: *Namespace) -> ErrorCode
         Ok(_) => pass
         Err(_) => closed = false
     if not closed or not ok
-        sys_unlink(tmp.ptr)
+        discard_tmp(tmp)
         return ErrorCode.IoError
-    if sys_rename(tmp.ptr, full.ptr) != 0
-        sys_unlink(tmp.ptr)
-        return ErrorCode.IoError
-    ErrorCode.Ok
+    match rename(tmp, full)
+        Ok(_) => ErrorCode.Ok
+        Err(_) =>
+            discard_tmp(tmp)
+            ErrorCode.IoError
+
+# Remove a half-written temp file. Best effort: the save has already failed,
+# and that failure is what the caller hears about.
+fn discard_tmp(tmp: StrView)
+    match unlink(tmp)
+        Ok(_) => pass
+        Err(_) => pass
 
 # ============================================================================
 # Lock

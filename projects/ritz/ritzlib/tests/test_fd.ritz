@@ -17,6 +17,8 @@
 #   Fd.stat() -> Result<Stat, Errno>, Fd.truncate(len) -> Result<(), Errno>
 #   Fd.chmod(mode) / lock(op) -> Result<(), Errno>
 #   Fd.raw() -> i32, Fd.valid() -> bool
+#   Fd.sendfile(out: @Fd, offset: i64, count: i64) -> Result<i64, Errno>
+#   poll(fds: Span<PollFd>, timeout_ms: i32) -> Result<i32, Errno>
 #
 # Every test owns its fixture under /tmp, named by pid so concurrent runs
 # (gate slots, compiler variants) stay apart.
@@ -412,4 +414,118 @@ fn test_borrow_reads_through_a_number_it_does_not_own() -> i32
 [[test]]
 fn test_stdout_write_str() -> i32
     assert unit_err(fd_stdout().write_str("")) == 0
+    0
+
+# ============================================================================
+# poll (AGAST #4691)
+# ============================================================================
+
+# One POLLIN entry for `f`, nothing returned yet.
+fn poll_in(f: @Fd) -> PollFd
+    PollFd { fd: f.raw(), events: POLLIN, revents: 0 }
+
+fn poll_count(r: Result<i32, Errno>) -> i32
+    match r
+        Ok(n) => n
+        Err(e) => -1000 - e.code()
+
+[[test]]
+fn test_poll_empty_pipe_times_out() -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            var fds: [1]PollFd
+            fds[0] = poll_in(@p.read)
+            assert poll_count(poll(span_from_ptr<PollFd>(@fds[0], 1), 0)) == 0
+            assert fds[0].revents == 0
+            p.close()
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_poll_pipe_with_data_is_readable() -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            p.write.write_str("x")
+            # The empty write end's POLLIN never fires: only the read end counts.
+            var fds: [2]PollFd
+            fds[0] = poll_in(@p.write)
+            fds[1] = poll_in(@p.read)
+            assert poll_count(poll(span_from_ptr<PollFd>(@fds[0], 2), 1000)) == 1
+            assert (fds[1].revents & POLLIN) != 0
+            assert fds[0].revents == 0
+            p.close()
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_poll_closed_number_reports_pollnval() -> i32
+    # A number that names no open file is POLLNVAL in revents, not an Err.
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            let gone: i32 = p.read.raw()
+            p.close()
+            var fds: [1]PollFd
+            fds[0] = PollFd { fd: gone, events: POLLIN, revents: 0 }
+            assert poll_count(poll(span_from_ptr<PollFd>(@fds[0], 1), 0)) == 1
+            assert (fds[0].revents & POLLNVAL) != 0
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_poll_no_fds_is_a_timeout() -> i32
+    assert poll_count(poll(span_empty<PollFd>(), 0)) == 0
+    0
+
+# ============================================================================
+# sendfile (AGAST #4691)
+# ============================================================================
+
+[[test]]
+fn test_sendfile_copies_from_the_offset() -> i32
+    let path: String = tmp_path("sendfile")
+    var src: Fd = fresh(@path)
+    src.write_str("hello world")
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            assert count_of(src.sendfile(@p.write, 6, 5)) == 5
+            # The file's own offset is untouched: sendfile used `offset`.
+            assert count_of(src.seek(0, SEEK_CUR)) == 11
+            var buf: [5]u8
+            assert unit_err(p.read.read_exact(Span<u8> { ptr: @buf[0], len: 5 })) == 0
+            assert strview_from_ptr(@buf[0], 5).eq("world")
+            p.close()
+        Err(_) =>
+            assert false
+    src.close()
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_sendfile_at_end_of_file_is_zero() -> i32
+    let path: String = tmp_path("sendfile_eof")
+    var src: Fd = fresh(@path)
+    src.write_str("abc")
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            assert count_of(src.sendfile(@p.write, 3, 10)) == 0
+            p.close()
+        Err(_) =>
+            assert false
+    src.close()
+    unlink(path.as_view())
+    0
+
+[[test]]
+fn test_sendfile_from_a_closed_fd_is_badf() -> i32
+    let closed: Fd = fd_adopt(-1)
+    let out: Fd = fd_stdout()
+    assert count_of(closed.sendfile(@out, 0, 1)) == -1000 - E_BADF as i64
     0

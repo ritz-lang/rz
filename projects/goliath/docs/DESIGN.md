@@ -33,7 +33,7 @@ pub struct Namespace
     root: BlobID        # Points to root directory blob
     cap: Cap            # Capability to access this namespace
 
-pub struct DirEntry
+pub struct NsEntry
     name: String        # Up to 255 bytes UTF-8
     kind: EntryKind
     metadata: Metadata
@@ -46,7 +46,7 @@ pub enum EntryKind
 ```
 
 **Properties**:
-- Directories are also blobs (just serialized DirEntry lists)
+- Directories are also blobs (just serialized NsEntry lists)
 - Modifying a directory creates a new directory blob
 - Old versions remain until garbage collected
 
@@ -164,7 +164,7 @@ The index itself is stored as a blob! (Bootstrap: superblock points to it)
 
 2. Update namespace:
    - Load parent directory blob
-   - Create new DirEntry pointing to new BlobID
+   - Create new NsEntry pointing to new BlobID
    - Store new directory as blob
    - Recursively update parent directories to root
    - Update namespace root pointer

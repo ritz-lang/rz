@@ -29,3 +29,14 @@ PINS = {"out-param": (0, 9), "status-return": (0, 71)}
 def test_sys_c_shapes_only_go_down():
     summary = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "sys.ritz"]))
     assert ratchet_breaches(summary, PINS) == []
+
+
+# sentinel-return isn't a C_SHAPE_KEYS rule, so it's pinned here (AGAST #4691):
+# signalfd_read's "0 = none pending, negative = errno" went to ritzlib.process
+# as Result<Option<i32>, Errno>.  What's left is at_fdcwd (AT_FDCWD, -100, not
+# an error) in sys.ritz, and 4 in all of ritzlib.  Down only.
+def test_sentinel_returns_only_go_down():
+    sys_ritz = summarise(scan_tree([RITZ_ROOT / "ritzlib" / "sys.ritz"]))["sentinel-return"]
+    ritzlib = summarise(scan_tree([RITZ_ROOT / "ritzlib"]))["sentinel-return"]
+    assert sys_ritz["violations"] == 0 and sys_ritz["exempt"] <= 1
+    assert ritzlib["violations"] == 0 and ritzlib["exempt"] <= 4

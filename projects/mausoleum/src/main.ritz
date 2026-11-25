@@ -19,10 +19,11 @@
 
 import ritzlib.sys
 import ritzlib.fd
-import ritzlib.process { signalfd_create_for_shutdown }
+import ritzlib.process { signalfd_create_for_shutdown, signalfd_read }
 import ritzlib.result
 import ritzlib.fmt
 import ritzlib.strview
+import ritzlib.span { span_from_ptr }
 import ritzlib.memory
 import ritzlib.gvec
 import ritzlib.option
@@ -446,11 +447,12 @@ fn cmd_serve(port: i32, data_dir: *u8, no_encryption: i32, serial_mode: i32) -> 
 # Server main loop - handles encrypted connections
 fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
     # Create signalfd for SIGTERM/SIGINT
-    let signal_fd: i32 = match signalfd_create_for_shutdown()
+    # The signalfd; a closed Fd (raw -1, skipped by poll) if it failed.
+    var signal_fd: Fd = match signalfd_create_for_shutdown()
         Ok(fd) => fd
         Err(_) =>
             print("Warning: Failed to create signalfd, shutdown may not be graceful\n")
-            -1
+            fd_adopt(-1)
 
     # Set up poll fds: [0] = listen socket, [1] = signal fd
     var poll_fds: [2]PollFd
@@ -459,20 +461,15 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
     poll_fds[0].events = POLLIN
     poll_fds[0].revents = 0
 
-    poll_fds[1].fd = signal_fd
+    poll_fds[1].fd = signal_fd.raw()
     poll_fds[1].events = POLLIN
     poll_fds[1].revents = 0
 
-    let num_fds: i64 = 2
-    if signal_fd < 0
-        poll_fds[1].fd = -1
-
     loop
         # Poll with 1 second timeout
-        let poll_result: i32 = sys_poll(@poll_fds[0], num_fds, 1000)
-
-        if poll_result < 0
-            continue
+        let poll_result: i32 = match poll(span_from_ptr<PollFd>(@poll_fds[0], 2), 1000)
+            Ok(n) => n
+            Err(_) => continue
 
         if poll_result == 0
             if shutdown_requested() != 0
@@ -481,8 +478,11 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
             continue
 
         # Check for signal
-        if signal_fd >= 0 and (poll_fds[1].revents & POLLIN) != 0
-            let sig: i32 = signalfd_read(signal_fd)
+        if signal_fd.valid() and (poll_fds[1].revents & POLLIN) != 0
+            # Ok(None) (nothing pending) or a failed read: no signal.
+            let sig: i32 = match signalfd_read(@signal_fd)
+                Ok(pending) => option_unwrap_or<i32>(@pending, 0)
+                Err(_) => 0
             if sig == SIGTERM or sig == SIGINT
                 print("Received shutdown signal, stopping server...\n")
                 break
@@ -533,9 +533,8 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
         poll_fds[0].revents = 0
         poll_fds[1].revents = 0
 
-    # Cleanup signalfd (raw: poll(2) takes its number)
-    var sig: Fd = fd_adopt(signal_fd)
-    sig.close()
+    # Cleanup signalfd
+    signal_fd.close()
 
 # Handle a single encrypted session
 fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
@@ -991,11 +990,12 @@ fn handle_find(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
 # Server main loop - handles plain TCP connections (no encryption)
 fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
     # Create signalfd for SIGTERM/SIGINT for graceful shutdown
-    let signal_fd: i32 = match signalfd_create_for_shutdown()
+    # The signalfd; a closed Fd (raw -1, skipped by poll) if it failed.
+    var signal_fd: Fd = match signalfd_create_for_shutdown()
         Ok(fd) => fd
         Err(_) =>
             print("Warning: Failed to create signalfd, shutdown may not be graceful\n")
-            -1
+            fd_adopt(-1)
 
     # Set up poll fds: [0] = listen socket, [1] = signal fd
     var poll_fds: [2]PollFd
@@ -1004,22 +1004,16 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
     poll_fds[0].events = POLLIN
     poll_fds[0].revents = 0
 
-    poll_fds[1].fd = signal_fd
+    poll_fds[1].fd = signal_fd.raw()
     poll_fds[1].events = POLLIN
     poll_fds[1].revents = 0
 
-    let num_fds: i64 = 2
-    if signal_fd < 0
-        # Skip signalfd if it failed to create
-        poll_fds[1].fd = -1
-
     loop
         # Poll with 1 second timeout
-        let poll_result: i32 = sys_poll(@poll_fds[0], num_fds, 1000)
-
-        if poll_result < 0
-            # Error - check if it's EINTR
-            continue
+        let poll_result: i32 = match poll(span_from_ptr<PollFd>(@poll_fds[0], 2), 1000)
+            Ok(n) => n
+            # Error (EINTR or otherwise): poll again
+            Err(_) => continue
 
         if poll_result == 0
             # Timeout - check shutdown flag
@@ -1029,8 +1023,11 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
             continue
 
         # Check for signal
-        if signal_fd >= 0 and (poll_fds[1].revents & POLLIN) != 0
-            let sig: i32 = signalfd_read(signal_fd)
+        if signal_fd.valid() and (poll_fds[1].revents & POLLIN) != 0
+            # Ok(None) (nothing pending) or a failed read: no signal.
+            let sig: i32 = match signalfd_read(@signal_fd)
+                Ok(pending) => option_unwrap_or<i32>(@pending, 0)
+                Err(_) => 0
             if sig == SIGTERM or sig == SIGINT
                 print("Received shutdown signal, stopping server...\n")
                 break
@@ -1058,9 +1055,8 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
         poll_fds[0].revents = 0
         poll_fds[1].revents = 0
 
-    # Cleanup signalfd (raw: poll(2) takes its number)
-    var sig: Fd = fd_adopt(signal_fd)
-    sig.close()
+    # Cleanup signalfd
+    signal_fd.close()
 
 # Handle a single plain (unencrypted) session
 fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)

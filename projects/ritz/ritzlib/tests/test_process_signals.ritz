@@ -1,0 +1,231 @@
+# ritzlib.process: process ids, the signal mask and signalfd (AGAST #4691).
+#
+#   process_id() -> i32, parent_process_id() -> i32, user_id() -> u32
+#   SigSet: sigset_empty(), sigset_of(sig), .add(sig), .contains(sig)
+#   SigSet.block() -> Result<SigSet, Errno>      adds the set; Ok(previous mask)
+#   SigSet.set_mask() -> Result<SigSet, Errno>   replaces the mask; Ok(previous)
+#   SigSet.signalfd(flags) -> Result<Fd, Errno>
+#   signalfd_read(fd: @Fd) -> Result<Option<i32>, Errno>   Ok(None): none pending
+#
+# The mask is per process, so every test that changes it runs in a forked
+# child and reports by exit code: 0 passed, anything else names the step
+# that failed.
+
+import ritzlib.sys
+import ritzlib.process
+import ritzlib.fd
+import ritzlib.errno
+import ritzlib.option
+import ritzlib.result
+
+const E_BADF: i32 = 9
+const E_INVAL: i32 = 22
+
+# The exit code of an Ok wait, -1000 - errno for an Err.
+fn exit_of(r: Result<ProcessResult, Errno>) -> i32
+    match r
+        Ok(pr) => pr.exit_code
+        Err(e) => -1000 - e.code()
+
+# Run `body` in a forked child; its exit code (0 = passed).
+fn in_child(body: fn() -> i32) -> i32
+    match fork()
+        Ok(fr) =>
+            match fr
+                Child =>
+                    sys_exit(body())
+                    0
+                Parent(pid) => exit_of(wait_pid(pid))
+        Err(e) => -1000 - e.code()
+
+# The mask of an Ok, a set holding every signal for an Err (so a test that
+# expects a signal absent fails).
+fn mask_of(r: Result<SigSet, Errno>) -> SigSet
+    match r
+        Ok(s) => s
+        Err(_) => SigSet { bits: 0xffffffffffffffff }
+
+fn fd_of(r: Result<Fd, Errno>) -> Fd
+    match r
+        Ok(f) => f
+        Err(_) => fd_adopt(-1)
+
+fn fd_err(r: Result<Fd, Errno>) -> i32
+    match r
+        Ok(f) =>
+            var g: Fd = f
+            g.close()
+            0
+        Err(e) => e.code()
+
+# The signal number read, 0 for Ok(None), -1000 - errno for an Err.
+fn sig_of(r: Result<Option<i32>, Errno>) -> i32
+    match r
+        Ok(o) =>
+            match o
+                Some(n) => n
+                None => 0
+        Err(e) => -1000 - e.code()
+
+# ============================================================================
+# process ids
+# ============================================================================
+
+[[test]]
+fn test_process_id_is_this_process() -> i32
+    assert process_id() > 0
+    assert process_id() == sys_getpid()
+    0
+
+var g_parent_pid: i32 = 0
+
+fn child_sees_its_parent() -> i32
+    if parent_process_id() != g_parent_pid
+        return 1
+    if process_id() == g_parent_pid
+        return 2
+    0
+
+[[test]]
+fn test_parent_process_id_of_a_child_is_the_forker() -> i32
+    g_parent_pid = process_id()
+    assert in_child(child_sees_its_parent) == 0
+    0
+
+[[test]]
+fn test_user_id_is_the_real_uid() -> i32
+    assert user_id() == sys_getuid() as u32
+    0
+
+# ============================================================================
+# SigSet
+# ============================================================================
+
+[[test]]
+fn test_sigset_empty_holds_nothing() -> i32
+    let s: SigSet = sigset_empty()
+    assert not s.contains(SIGTERM)
+    assert not s.contains(SIGINT)
+    0
+
+[[test]]
+fn test_sigset_add_holds_just_that_signal() -> i32
+    var s: SigSet = sigset_of(SIGTERM)
+    assert s.contains(SIGTERM)
+    assert not s.contains(SIGINT)
+    s.add(SIGINT)
+    assert s.contains(SIGINT)
+    assert s.contains(SIGTERM)
+    # Signal n is bit n - 1 of the kernel's mask.
+    assert s.bits == ((1 << 14) | (1 << 1))
+    0
+
+[[test]]
+fn test_sigset_out_of_range_is_ignored() -> i32
+    var s: SigSet = sigset_empty()
+    s.add(0)
+    s.add(65)
+    assert s.bits == 0
+    assert not s.contains(0)
+    assert not s.contains(65)
+    0
+
+# ============================================================================
+# SigSet.block / SigSet.set_mask
+# ============================================================================
+
+fn child_block_then_restore() -> i32
+    let before: SigSet = mask_of(sigset_empty().set_mask())
+    if mask_of(sigset_of(SIGTERM).block()).contains(SIGTERM)
+        return 1
+    # Blocking adds to the mask: TERM stays when INT joins it.
+    let after_term: SigSet = mask_of(sigset_of(SIGINT).block())
+    if not after_term.contains(SIGTERM)
+        return 2
+    if after_term.contains(SIGINT)
+        return 3
+    let both: SigSet = mask_of(before.set_mask())
+    if not both.contains(SIGTERM) or not both.contains(SIGINT)
+        return 4
+    # set_mask replaces: after an empty mask, nothing is blocked.
+    let empty: SigSet = sigset_empty()
+    mask_of(empty.set_mask())
+    if mask_of(empty.block()).contains(SIGTERM)
+        return 5
+    0
+
+[[test]]
+fn test_signals_block_adds_and_set_restores() -> i32
+    assert in_child(child_block_then_restore) == 0
+    0
+
+# ============================================================================
+# SigSet.signalfd / signalfd_read
+# ============================================================================
+
+fn child_signalfd_none_pending() -> i32
+    let set: SigSet = sigset_of(SIGTERM)
+    if mask_of(set.block()).bits == 0xffffffffffffffff
+        return 1
+    let fd: Fd = fd_of(set.signalfd(SIGNALFD_NONBLOCK | SIGNALFD_CLOEXEC))
+    if not fd.valid()
+        return 2
+    if sig_of(signalfd_read(@fd)) != 0
+        return 3
+    0
+
+[[test]]
+fn test_signalfd_read_with_nothing_pending_is_none() -> i32
+    assert in_child(child_signalfd_none_pending) == 0
+    0
+
+fn child_signalfd_reads_sigterm() -> i32
+    var set: SigSet = sigset_of(SIGTERM)
+    set.add(SIGINT)
+    if mask_of(set.block()).bits == 0xffffffffffffffff
+        return 1
+    let fd: Fd = fd_of(set.signalfd(SIGNALFD_NONBLOCK))
+    if not fd.valid()
+        return 2
+    match kill(process_id(), SIGTERM)
+        Ok(_) => pass
+        Err(_) => return 3
+    if sig_of(signalfd_read(@fd)) != SIGTERM
+        return 4
+    # Read once: nothing left.
+    if sig_of(signalfd_read(@fd)) != 0
+        return 5
+    0
+
+[[test]]
+fn test_signalfd_read_returns_the_blocked_signal() -> i32
+    assert in_child(child_signalfd_reads_sigterm) == 0
+    0
+
+[[test]]
+fn test_signalfd_new_bad_flags_is_einval() -> i32
+    # Flag bit 0 is not SFD_*: the kernel says EINVAL, and nothing is blocked.
+    assert fd_err(sigset_of(SIGTERM).signalfd(1)) == E_INVAL
+    0
+
+[[test]]
+fn test_signalfd_read_of_a_closed_fd_is_badf() -> i32
+    let closed: Fd = fd_adopt(-1)
+    assert sig_of(signalfd_read(@closed)) == -1000 - E_BADF
+    0
+
+fn child_shutdown_fd_reads_sigint() -> i32
+    let fd: Fd = fd_of(signalfd_create_for_shutdown())
+    if not fd.valid()
+        return 1
+    match kill(process_id(), SIGINT)
+        Ok(_) => pass
+        Err(_) => return 2
+    if sig_of(signalfd_read(@fd)) != SIGINT
+        return 3
+    0
+
+[[test]]
+fn test_signalfd_for_shutdown_is_an_fd_that_reads_sigint() -> i32
+    assert in_child(child_shutdown_fd_reads_sigint) == 0
+    0

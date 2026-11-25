@@ -26,7 +26,7 @@ import ritzlib.memory { Allocator }
 import goliath.alloc { allocator_alloc, allocator_free }
 import goliath.blob_id { BlobId, blob_id_zero, blob_id_is_zero, blob_id_copy }
 import goliath.blob_store { MemoryBlobStore, memory_store_get, memory_store_get_size, memory_store_get_span, memory_store_put, memory_store_refs, memory_store_retain, memory_store_release, memory_store_allocator, memory_store_mark_begin, memory_store_mark, memory_store_sweep, memory_store_hold_children, memory_store_holds_children }
-import goliath.dir_entry { DirEntry, dir_entry_file, dir_entry_dir, dir_entry_is_dir, dir_entry_name_eq, dir_entry_serialize, dir_entry_deserialize, dir_serialized_size, dir_entry_at, dir_entry_disk_size, DIR_HEADER_SIZE }
+import goliath.dir_entry { NsEntry, dir_entry_file, dir_entry_dir, dir_entry_is_dir, dir_entry_name_eq, dir_entry_serialize, dir_entry_deserialize, dir_serialized_size, dir_entry_at, dir_entry_disk_size, DIR_HEADER_SIZE }
 import goliath.path { path_is_absolute, path_is_root, path_validate, PathIter, path_iter_new, path_iter_next }
 import goliath.error { ErrorCode }
 
@@ -89,7 +89,7 @@ fn mark_tree(ns: *Namespace, id: *BlobId, is_dir: bool) -> i32
     var missing: i32 = 0
     var i: i32 = 0
     while i < count
-        var entry: DirEntry = read_dir_entry(ns, id, i)
+        var entry: NsEntry = read_dir_entry(ns, id, i)
         missing = missing + mark_tree(ns, @entry.blob_id, dir_entry_is_dir(@entry))
         i = i + 1
     missing
@@ -121,7 +121,7 @@ fn read_dir_count(ns: *Namespace, dir_id: *BlobId) -> i32
     count as i32
 
 # Entry `index` (< read_dir_count) of a directory blob
-fn read_dir_entry(ns: *Namespace, dir_id: *BlobId, index: i32) -> DirEntry
+fn read_dir_entry(ns: *Namespace, dir_id: *BlobId, index: i32) -> NsEntry
     let data: *u8 = memory_store_get((*ns).store, dir_id)
     dir_entry_deserialize(dir_entry_at(data, index))
 
@@ -130,7 +130,7 @@ fn find_entry_in_dir(ns: *Namespace, dir_id: *BlobId, name: StrView) -> i32
     let count: i32 = read_dir_count(ns, dir_id)
     var i: i32 = 0
     while i < count
-        var entry: DirEntry = read_dir_entry(ns, dir_id, i)
+        var entry: NsEntry = read_dir_entry(ns, dir_id, i)
         if dir_entry_name_eq(@entry, name)
             return i
         i = i + 1
@@ -146,7 +146,7 @@ fn put_dir(ns: *Namespace, data: *u8, size: u64) -> BlobId
         let count: i32 = read_dir_count(ns, @id)
         var i: i32 = 0
         while i < count
-            var entry: DirEntry = read_dir_entry(ns, @id, i)
+            var entry: NsEntry = read_dir_entry(ns, @id, i)
             memory_store_retain((*ns).store, @entry.blob_id)
             i = i + 1
     id
@@ -166,7 +166,7 @@ fn release(ns: *Namespace, id: *BlobId)
         let count: i32 = read_dir_count(ns, id)
         var i: i32 = 0
         while i < count
-            var entry: DirEntry = read_dir_entry(ns, id, i)
+            var entry: NsEntry = read_dir_entry(ns, id, i)
             release(ns, @entry.blob_id)
             i = i + 1
     memory_store_release((*ns).store, id)
@@ -242,7 +242,7 @@ fn dir_with(ns: *Namespace, dir: *BlobId, name: StrView, child: *BlobId, child_i
     id
 
 fn write_entry(buf: *u8, index: i32, name: StrView, child: *BlobId, is_dir: bool, size: u64)
-    var entry: DirEntry
+    var entry: NsEntry
     if is_dir
         entry = dir_entry_dir(name, child)
     else
@@ -280,7 +280,7 @@ fn rewrite(ns: *Namespace, dir: *BlobId, iter: *PathIter, change: *Change, err: 
         if idx < 0
             *err = ErrorCode.NotFound
             return blob_id_zero()
-        var entry: DirEntry = read_dir_entry(ns, dir, idx)
+        var entry: NsEntry = read_dir_entry(ns, dir, idx)
         if not dir_entry_is_dir(@entry)
             *err = ErrorCode.NotADirectory
             return blob_id_zero()
@@ -295,14 +295,14 @@ fn rewrite(ns: *Namespace, dir: *BlobId, iter: *PathIter, change: *Change, err: 
         if idx < 0
             *err = ErrorCode.NotFound
             return blob_id_zero()
-        var target: DirEntry = read_dir_entry(ns, dir, idx)
+        var target: NsEntry = read_dir_entry(ns, dir, idx)
         if dir_entry_is_dir(@target) and read_dir_count(ns, @target.blob_id) != 0
             *err = ErrorCode.DirectoryNotEmpty
             return blob_id_zero()
         return dir_with(ns, dir, name, null, false, 0, err)
 
     if idx >= 0
-        var existing: DirEntry = read_dir_entry(ns, dir, idx)
+        var existing: NsEntry = read_dir_entry(ns, dir, idx)
         if (*change).op == OP_MKDIR
             *err = ErrorCode.AlreadyExists
             return blob_id_zero()
@@ -352,7 +352,7 @@ fn resolve_kind(ns: *Namespace, path: StrView, is_dir_out: *bool) -> BlobId
         let idx: i32 = find_entry_in_dir(ns, @current, name)
         if idx < 0
             return blob_id_zero()
-        var entry: DirEntry = read_dir_entry(ns, @current, idx)
+        var entry: NsEntry = read_dir_entry(ns, @current, idx)
         current = blob_id_copy(@entry.blob_id)
         current_is_dir = dir_entry_is_dir(@entry)
     *is_dir_out = current_is_dir
@@ -422,7 +422,7 @@ pub fn namespace_delete(ns: *Namespace, path: StrView) -> ErrorCode
 
 # List directory contents: copies up to `max_entries` entries, returns the
 # directory's entry count (-1 if `path` isn't a directory).
-pub fn namespace_list(ns: *Namespace, path: StrView, entries: *DirEntry, max_entries: i32) -> i32
+pub fn namespace_list(ns: *Namespace, path: StrView, entries: *NsEntry, max_entries: i32) -> i32
     var is_dir: bool = false
     var dir_id: BlobId = resolve_kind(ns, path, @is_dir)
     if blob_id_is_zero(@dir_id) or not is_dir

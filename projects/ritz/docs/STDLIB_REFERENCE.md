@@ -2032,6 +2032,7 @@ interrupted by a signal is retried, so `Err(Intr)` never escapes.
 | `fd_stdin` / `fd_stdout` / `fd_stderr` | `fn() -> Fd` | The standard streams, borrowed |
 | `fd_adopt` | `fn(raw: i32) -> Fd` | Own a raw descriptor (a socket, an inherited fd); `-1` gives a closed Fd |
 | `fd_borrow` | `fn(raw: i32) -> Fd` | Use a raw descriptor someone else owns and closes (a `Socket`'s fd, a caller's number): never close it |
+| `poll` | `fn(fds: Span<PollFd>, timeout_ms: i32) -> Result<i32, Errno>` | poll(2) on `PollFd { fd, events: POLLIN, revents: 0 }` entries: `Ok` = how many have events, `Ok(0)` on timeout (`-1` waits forever); a dead number is `POLLNVAL` in its revents; `Err(Intr)` on a signal. Linux |
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -2049,6 +2050,7 @@ interrupted by a signal is retried, so `Err(Intr)` never escapes.
 | `f.truncate(len)` | `fn(len: i64) -> Result<(), Errno>` | ftruncate(2) |
 | `f.chmod(mode)` | `fn(mode: i32) -> Result<(), Errno>` | fchmod(2) |
 | `f.lock(op)` | `fn(op: i32) -> Result<(), Errno>` | flock(2): `LOCK_SH`, `LOCK_EX`, `LOCK_UN`, `+ LOCK_NB` |
+| `f.sendfile(out, offset, count)` | `fn(out: @Fd, offset: i64, count: i64) -> Result<i64, Errno>` | sendfile(2): up to `count` bytes of `f` from `offset` to `out`, in the kernel; `Ok` = bytes sent, `Ok(0)` at EOF; `f`'s own offset doesn't move |
 | `f.raw()` | `fn() -> i32` | The number, for a kernel-ABI hand-off (poll, io_uring); ownership stays |
 | `f.valid()` | `fn() -> bool` | Open? |
 | `p.close()` (Pipe) | `fn() -> Result<(), Errno>` | Close both ends |
@@ -2677,7 +2679,18 @@ cover). To run a program and read its output, use `spawn`.
 | `try_wait_pid` | `fn(pid: i32) -> Result<Option<ProcessResult>, Errno>` | `wait_pid` without blocking: `Ok(None)` while it runs |
 | `kill` | `fn(pid: i32, sig: i32) -> Result<(), Errno>` | Send `sig` (0 checks the pid exists); `Err(Other(3))` (ESRCH) if there's no such process |
 | `signal_ignore` | `fn(signum: i32) -> Result<(), Errno>` | Ignore `signum` (SIG_IGN), e.g. SIGPIPE in a server; `Err(Inval)` for SIGKILL / SIGSTOP. Linux |
-| `signalfd_create_for_shutdown` | `fn() -> Result<i32, Errno>` | Block SIGTERM and SIGINT and return a nonblocking signalfd that reads them, for a poll loop's graceful shutdown; the caller owns the fd. Linux |
+| `signalfd_create_for_shutdown` | `fn() -> Result<Fd, Errno>` | Block SIGTERM and SIGINT and return a nonblocking signalfd that reads them, for a poll loop's graceful shutdown; the caller owns the Fd. Linux |
+| `signalfd_read` | `fn(fd: @Fd) -> Result<Option<i32>, Errno>` | The next signal from a signalfd: `Ok(Some(signo))`, `Ok(None)` when a nonblocking one has none pending. Linux |
+| `process_id` | `fn() -> i32` | getpid(2) |
+| `parent_process_id` | `fn() -> i32` | getppid(2). Linux |
+| `user_id` | `fn() -> u32` | getuid(2), the real uid. Linux |
+
+**SigSet** (AGAST #4691): signals 1..64 as the kernel's mask. `sigset_empty()`,
+`sigset_of(sig)`; `s.add(sig)` (outside 1..64 is ignored), `s.contains(sig)`.
+`s.block() -> Result<SigSet, Errno>` adds `s` to the blocked mask and
+`s.set_mask()` replaces it, each `Ok` with the mask before;
+`s.signalfd(flags) -> Result<Fd, Errno>` (`SIGNALFD_NONBLOCK`,
+`SIGNALFD_CLOEXEC`) reads the blocked signals as an Fd. Linux.
 
 ```ritz
 import ritzlib.process

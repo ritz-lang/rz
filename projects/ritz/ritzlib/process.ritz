@@ -48,6 +48,8 @@ import ritzlib.strview
 import ritzlib.span
 import ritzlib.option
 import ritzlib.result
+# signalfd_new and signalfd_create_for_shutdown return an owned Fd.
+import ritzlib.fd
 # Errno is part of this API (every Err), so importers of process get it too.
 pub import ritzlib.errno
 import ritzlib.os.env
@@ -731,19 +733,130 @@ pub fn signal_ignore(signum: i32) -> Result<(), Errno>
         return Err(errno_from_raw(rc))
     Ok(())
 
+# ============================================================================
+# Process ids (AGAST #4691): infallible, so plain values
+# ============================================================================
+
+# This process's id (getpid(2)).
+pub fn process_id() -> i32
+    sys_getpid()
+
+# The id of the process that forked this one (getppid(2)); 1, or a
+# subreaper's id, once that parent has exited.
+[[target_os = "linux"]]
+pub fn parent_process_id() -> i32
+    sys_getppid()
+
+# This process's real user id (getuid(2)).
+[[target_os = "linux"]]
+pub fn user_id() -> u32
+    sys_getuid() as u32
+
+# ============================================================================
+# Signal mask and signalfd (AGAST #4691)
+# ============================================================================
+#
+#     var set: SigSet = sigset_of(SIGTERM)
+#     set.add(SIGINT)
+#     set.block()                               # Result<SigSet, Errno>: the mask before
+#     set.signalfd(SIGNALFD_NONBLOCK | SIGNALFD_CLOEXEC)   # Result<Fd, Errno>
+#     match signalfd_read(@sfd)                 # Result<Option<i32>, Errno>
+#         Ok(pending) => match pending
+#             Some(sig) => ...                  # SIGTERM or SIGINT
+#             None => ...                       # nothing pending
+#         Err(e) => ...
+
+# SigSet.signalfd flags (SFD_NONBLOCK, SFD_CLOEXEC).
+pub const SIGNALFD_NONBLOCK: i32 = 2048
+pub const SIGNALFD_CLOEXEC: i32 = 524288
+
+const PROC_SIG_BLOCK: i32 = 0
+const PROC_SIG_SETMASK: i32 = 2
+const PROC_SIGSET_BYTES: i64 = 8
+const PROC_SIGINFO_BYTES: i64 = 128
+const PROC_EIO: i32 = 5
+
+# A set of signals 1..64, as the kernel's 64-bit mask: signal n is bit n - 1.
+pub struct SigSet
+    bits: u64
+
+# The set with no signals in it.
+pub fn sigset_empty() -> SigSet
+    SigSet { bits: 0 }
+
+# The set holding just `sig`.
+pub fn sigset_of(sig: i32) -> SigSet
+    var s: SigSet = sigset_empty()
+    s.add(sig)
+    s
+
+# rt_sigprocmask(2) with `how` and `set`: Ok(the mask before).
+[[target_os = "linux"]]
+fn sigmask_change(how: i32, bits: u64) -> Result<SigSet, Errno>
+    var next: i64 = bits as i64
+    var prev: i64 = 0
+    let rc: i32 = sys_rt_sigprocmask(how, @next, @prev, PROC_SIGSET_BYTES)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(SigSet { bits: prev as u64 })
+
+# Methods (S-IMPL-1): a SigSet is the subject of every operation on it.
+impl SigSet
+    # Put `sig` in the set; a number outside 1..64 names no signal and is ignored.
+    pub fn add(self: @&SigSet, sig: i32)
+        if sig >= 1 and sig <= 64
+            self.bits = self.bits | ((1 as u64) << ((sig - 1) as u64))
+
+    # Is `sig` in the set? Never for a number outside 1..64.
+    pub fn contains(self: @SigSet, sig: i32) -> bool
+        if sig < 1 or sig > 64
+            return false
+        (self.bits & ((1 as u64) << ((sig - 1) as u64))) != 0
+
+    # Block these signals, added to those already blocked (rt_sigprocmask(2)
+    # SIG_BLOCK): Ok(the mask before), which `old.set_mask()` puts back.
+    pub fn block(self: @SigSet) -> Result<SigSet, Errno>
+        sigmask_change(PROC_SIG_BLOCK, self.bits)
+
+    # Make this set the whole signal mask (SIG_SETMASK; sigset_empty()
+    # unblocks everything): Ok(the mask before).
+    pub fn set_mask(self: @SigSet) -> Result<SigSet, Errno>
+        sigmask_change(PROC_SIG_SETMASK, self.bits)
+
+    # A new signalfd(2) that reads these signals (block() them first, or they
+    # are delivered as usual instead), owned by the caller. `flags`:
+    # SIGNALFD_NONBLOCK, SIGNALFD_CLOEXEC; anything else is Err(Inval).
+    pub fn signalfd(self: @SigSet, flags: i32) -> Result<Fd, Errno>
+        var mask: i64 = self.bits as i64
+        let rc: i32 = sys_signalfd4(-1, @mask, flags)
+        if rc < 0
+            return Err(errno_from_raw(rc))
+        Ok(fd_adopt(rc))
+
+# The next pending signal from signalfd `fd`: Ok(Some(signal number)),
+# Ok(None) if a nonblocking fd has none pending. A short read is Err(Io).
+[[target_os = "linux"]]
+pub fn signalfd_read(fd: @Fd) -> Result<Option<i32>, Errno>
+    # struct signalfd_siginfo is 128 bytes; ssi_signo is the u32 at offset 0.
+    var info: [128]u8
+    match fd.read(Span<u8> { ptr: @info[0], len: PROC_SIGINFO_BYTES })
+        Ok(n) =>
+            if n != PROC_SIGINFO_BYTES
+                return Err(errno_from_raw(PROC_EIO))
+        Err(e) =>
+            match e
+                Again => return Ok(None)
+                _ => return Err(e)
+    let signo: i32 = (info[0] as i32) | ((info[1] as i32) << 8) | ((info[2] as i32) << 16) | ((info[3] as i32) << 24)
+    Ok(Some(signo))
+
 # Block SIGTERM and SIGINT and return a signalfd(2) that reads them instead
 # (nonblocking, close-on-exec), for a server's graceful shutdown in its poll
-# loop.  The caller owns the fd.
+# loop: read it with signalfd_read. The caller owns the Fd.
 [[target_os = "linux"]]
-pub fn signalfd_create_for_shutdown() -> Result<i32, Errno>
-    let sig_block: i32 = 0          # SIG_BLOCK
-    let sfd_flags: i32 = 524288 | 2048   # SFD_CLOEXEC | SFD_NONBLOCK
-    # Signal n is bit n - 1: SIGTERM (15) and SIGINT (2).
-    var mask: i64 = (1 << 14) | (1 << 1)
-    let blocked: i32 = sys_rt_sigprocmask(sig_block, @mask, null, 8)
-    if blocked < 0
-        return Err(errno_from_raw(blocked))
-    let fd: i32 = sys_signalfd4(-1, @mask, sfd_flags)
-    if fd < 0
-        return Err(errno_from_raw(fd))
-    Ok(fd)
+pub fn signalfd_create_for_shutdown() -> Result<Fd, Errno>
+    var set: SigSet = sigset_of(SIGTERM)
+    set.add(SIGINT)
+    match set.block()
+        Ok(_) => set.signalfd(SIGNALFD_NONBLOCK | SIGNALFD_CLOEXEC)
+        Err(e) => Err(e)
