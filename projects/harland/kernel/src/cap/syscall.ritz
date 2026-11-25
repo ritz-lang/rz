@@ -4,8 +4,8 @@
 
 import klog { klog, klog_dec }
 import syscall.errno { Errno }
-import cap.types { CapHandle, CapInfo }
-import cap.table { CapTable, cap_table_get, cap_table_remove, cap_table_derive, cap_grant, cap_table_info, cap_has_rights }
+import cap.types { CapHandle, CapEntry, CapInfo, cap_handle_init, cap_type_is_device }
+import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_revoke, cap_table_derive, cap_grant, cap_table_info, cap_has_rights }
 
 # ============================================================================
 # Syscall Numbers - imported from single source of truth
@@ -25,17 +25,24 @@ import cap.table { CapTable, cap_table_get, cap_table_remove, cap_table_derive, 
 #   rights: Rights to grant (must be subset of current rights)
 # Returns:
 #   Handle in target process (packed) on success
+#   Errno.Perm for a CAP_TYPE_MMIO or CAP_TYPE_IRQ handle: only the kernel
+#   grants those (AGAST #4716, docs/RING1_DRIVER.md "Grants")
 #   Negative error code on failure
 
 pub fn sys_cap_grant(caller_pid: u32, handle_packed: u64, target_pid: u32, rights: u32) -> i64
     # Unpack handle
-    var handle: CapHandle
-    handle.index = (handle_packed & 0xFFFFFFFF) as u32
-    handle.generation = ((handle_packed >> 32) & 0xFFFFFFFF) as u32
+    let index: u32 = (handle_packed & 0xFFFFFFFF) as u32
+    let generation: u32 = ((handle_packed >> 32) & 0xFFFFFFFF) as u32
 
     let from_table: *CapTable = cap_table_get(caller_pid)
     if from_table == 0 as *CapTable
         return Errno.Perm as i64
+
+    # A device capability cannot be transferred, whatever its rights
+    let held: *CapEntry = cap_table_lookup(from_table, cap_handle_init(index, generation))
+    if held != 0 as *CapEntry and cap_type_is_device((*held).cap_type)
+        return Errno.Perm as i64
+    let handle: CapHandle = cap_handle_init(index, generation)
 
     let to_table: *CapTable = cap_table_get(target_pid)
     if to_table == 0 as *CapTable
@@ -56,7 +63,10 @@ pub fn sys_cap_grant(caller_pid: u32, handle_packed: u64, target_pid: u32, right
 # SYS_CAP_REVOKE
 # ============================================================================
 #
-# Revoke (delete) a capability from caller's table.
+# Revoke (delete) a capability from caller's table. Only the caller's copy
+# goes: another process's handle for the same object stays. When the caller
+# holds no other handle for a shm, MMIO or IRQ object, cap_revoke's hook
+# releases that process's hold on it (AGAST #4716).
 # Args:
 #   handle: Capability handle to revoke (packed)
 # Returns:
@@ -71,7 +81,7 @@ pub fn sys_cap_revoke(caller_pid: u32, handle_packed: u64) -> i64
     if table == 0 as *CapTable
         return Errno.Perm as i64  # no capability table
 
-    if cap_table_remove(table, handle) != 0
+    if not cap_revoke(table, handle)
         return Errno.BadF as i64  # no such capability
     return 0
 

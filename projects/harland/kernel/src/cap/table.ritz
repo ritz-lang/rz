@@ -4,7 +4,7 @@
 # kernel objects with associated rights.
 
 import klog { klog, klog_dec }
-import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid }
+import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_IRQ, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid, cap_type_is_device, cap_type_is_kernel_granted }
 
 # ============================================================================
 # Constants
@@ -96,6 +96,7 @@ pub fn cap_table_free(table: *CapTable) -> i32
     if not (*table).in_use
         return -1
 
+    irq_owner_release_pid((*table).pid)
     (*table).in_use = false
     (*table).pid = 0
     (*table).active_count = 0
@@ -210,6 +211,11 @@ pub fn cap_grant(from_table: *CapTable, handle: CapHandle, to_table: *CapTable, 
 
     let entry: *CapEntry = cap_table_lookup(from_table, handle)
     if entry == 0 as *CapEntry
+        return cap_handle_invalid()
+
+    # Device capabilities are the kernel's to grant (cap_kernel_grant), never
+    # a holder's, whatever its rights (AGAST #4716)
+    if cap_type_is_device((*entry).cap_type)
         return cap_handle_invalid()
 
     # Check if caller has GRANT right
@@ -364,3 +370,142 @@ pub fn cap_inherit_ambient(parent_pid: u32, child_pid: u32) -> i32
     if channel != 0
         return channel
     return cap_inherit_type(from, to, CAP_TYPE_NAMESPACE)
+
+# ============================================================================
+# Device capabilities (AGAST #4716, docs/RING1_DRIVER.md "Grants")
+# ============================================================================
+#
+# Only the kernel grants CAP_TYPE_IRQ and CAP_TYPE_MMIO, to the process it
+# spawned for the device; cap_grant refuses both. CAP_TYPE_SHM handles are
+# kernel-granted too (NetAttach and the spawn of the driver and service),
+# though a holder with GRANT may still pass one on.
+#
+# The IRQ-cap owner is the process the kernel granted a device's IRQ to. It
+# is recorded per object id so the kernel can quiesce the device when that
+# owner exits or revokes its last IRQ handle for it (later ring-1 tasks).
+
+const MAX_IRQ_CAP_OWNERS: i32 = 16
+
+struct IrqCapOwner
+    object_id: u64
+    pid: u32
+    in_use: bool
+    _padding: [3]u8
+
+var irq_cap_owners: [16]IrqCapOwner
+
+# Slot recording `object_id`'s owner, or -1.
+fn irq_owner_slot(object_id: u64) -> i32
+    var i: i32 = 0
+    while i < MAX_IRQ_CAP_OWNERS
+        if irq_cap_owners[i].in_use and irq_cap_owners[i].object_id == object_id
+            return i
+        i = i + 1
+    return -1
+
+# Record `pid` as `object_id`'s IRQ owner. False when another process owns
+# it or the registry is full; true (and no change) when `pid` already does.
+fn irq_owner_claim(object_id: u64, pid: u32) -> bool
+    let slot: i32 = irq_owner_slot(object_id)
+    if slot >= 0
+        return irq_cap_owners[slot].pid == pid
+    var i: i32 = 0
+    while i < MAX_IRQ_CAP_OWNERS
+        if not irq_cap_owners[i].in_use
+            irq_cap_owners[i].object_id = object_id
+            irq_cap_owners[i].pid = pid
+            irq_cap_owners[i].in_use = true
+            return true
+        i = i + 1
+    return false
+
+# Forget `object_id`'s owner if it is `pid`.
+fn irq_owner_release(object_id: u64, pid: u32)
+    let slot: i32 = irq_owner_slot(object_id)
+    if slot >= 0 and irq_cap_owners[slot].pid == pid
+        irq_cap_owners[slot].in_use = false
+        irq_cap_owners[slot].pid = 0
+        irq_cap_owners[slot].object_id = 0
+
+# Forget every IRQ `pid` owns (its table is being freed: exit or spawn undo).
+fn irq_owner_release_pid(pid: u32)
+    var i: i32 = 0
+    while i < MAX_IRQ_CAP_OWNERS
+        if irq_cap_owners[i].in_use and irq_cap_owners[i].pid == pid
+            irq_cap_owners[i].in_use = false
+            irq_cap_owners[i].pid = 0
+            irq_cap_owners[i].object_id = 0
+        i = i + 1
+
+# The pid that owns the IRQ capability for `object_id`, or 0 for none.
+pub fn cap_irq_owner(object_id: u64) -> u32
+    let slot: i32 = irq_owner_slot(object_id)
+    if slot < 0
+        return 0
+    return irq_cap_owners[slot].pid
+
+# Kernel-internal grant of an IRQ, MMIO or SHM capability for `object_id`
+# into `pid`'s table. Never reached from a syscall argument: the kernel calls
+# it for the process it spawned for a device, or for the two ends of a shared
+# object. An IRQ grant records `pid` as the device's IRQ owner and is refused
+# when another process owns that IRQ. Invalid handle on refusal, for a pid
+# with no table, or when the table is full.
+pub fn cap_kernel_grant(pid: u32, cap_type: u8, rights: u32, object_id: u64) -> CapHandle
+    if not cap_type_is_kernel_granted(cap_type)
+        return cap_handle_invalid()
+    let table: *CapTable = cap_table_get(pid)
+    if table == 0 as *CapTable
+        return cap_handle_invalid()
+    if cap_type == CAP_TYPE_IRQ
+        if irq_owner_slot(object_id) < 0
+            # A new owner: claim only once the handle is in, so a full
+            # table leaves no owner behind
+            let h: CapHandle = cap_table_insert(table, cap_type, rights, object_id)
+            let idx: u32 = h.index
+            let gen: u32 = h.generation
+            if idx == 0xFFFFFFFF
+                return cap_handle_invalid()
+            if not irq_owner_claim(object_id, pid)
+                cap_table_remove(table, cap_handle_init(idx, gen))
+                return cap_handle_invalid()
+            return cap_handle_init(idx, gen)
+        if cap_irq_owner(object_id) != pid
+            return cap_handle_invalid()
+    return cap_table_insert(table, cap_type, rights, object_id)
+
+# True if `table` still holds a handle of `cap_type` for `object_id`.
+fn cap_table_holds_object(table: *CapTable, cap_type: u8, object_id: u64) -> bool
+    var i: i32 = 0
+    while i < 64
+        let entry: *CapEntry = @(*table).entries[i]
+        if (*entry).cap_type == cap_type and (*entry).object_id == object_id
+            return true
+        i = i + 1
+    return false
+
+# The CapRevoke hook: `table`'s process dropped its last handle of
+# `cap_type` for `object_id`. An IRQ owner stops owning the device's IRQ.
+# MMIO and SHM leaves are unmapped here once a later ring-1 task maps them
+# (docs/RING1_DRIVER.md, Grants); today nothing maps them, so there is
+# nothing to unmap. Other types have no per-process mapping. Another
+# process's handles and mappings are never touched.
+fn cap_last_handle_dropped(table: *CapTable, cap_type: u8, object_id: u64)
+    if cap_type == CAP_TYPE_IRQ
+        irq_owner_release(object_id, (*table).pid)
+
+# CapRevoke: remove `handle` from `table` (only the caller's copy) and, when
+# the caller holds no other handle for the same object, run the hook. False
+# for a handle the caller does not hold.
+pub fn cap_revoke(table: *CapTable, handle: CapHandle) -> bool
+    let idx: u32 = handle.index
+    let gen: u32 = handle.generation
+    let entry: *CapEntry = cap_table_lookup(table, cap_handle_init(idx, gen))
+    if entry == 0 as *CapEntry
+        return false
+    let cap_type: u8 = (*entry).cap_type
+    let object_id: u64 = (*entry).object_id
+    if cap_table_remove(table, cap_handle_init(idx, gen)) != 0
+        return false
+    if cap_type_is_kernel_granted(cap_type) and not cap_table_holds_object(table, cap_type, object_id)
+        cap_last_handle_dropped(table, cap_type, object_id)
+    return true

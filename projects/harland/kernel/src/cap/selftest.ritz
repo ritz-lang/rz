@@ -1,0 +1,100 @@
+# Harland Capability System - "cap-device" boot self-test (AGAST #4716)
+#
+# docs/RING1_DRIVER.md, Grants: the kernel grants a device's IRQ and MMIO
+# capabilities by object id into the process it spawned for the device; a
+# ring-3 holder cannot CapGrant either onward (Errno.Perm); CapRevoke drops
+# only the caller's copy. This drives the same syscall handlers ring 3
+# reaches (sys_cap_grant, sys_cap_revoke) on two throwaway tables, then
+# frees them. It logs nothing, so test/test_cap_device.ritz runs it hosted.
+
+import syscall.errno { Errno }
+import cap.types { CapHandle, CapEntry, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_ALL }
+import cap.table { CapTable, cap_table_alloc, cap_table_get, cap_table_free_pid, cap_kernel_grant, cap_irq_owner }
+import cap.syscall { sys_cap_grant, sys_cap_revoke }
+
+# Pids no process gets: the test runs before /bin/init and frees both.
+const DRIVER_PID: u32 = 0xFFFFFF00
+const OTHER_PID: u32 = 0xFFFFFF01
+const TEST_IRQ: u64 = 0xFFFF0001
+const TEST_BAR: u64 = 0xFFFF0002
+const TEST_SHM: u64 = 0xFFFF0003
+
+fn pack(h: CapHandle) -> u64
+    return (h.index as u64) | ((h.generation as u64) << 32)
+
+fn holds(pid: u32, cap_type: u8, object_id: u64) -> bool
+    let table: *CapTable = cap_table_get(pid)
+    if table == 0 as *CapTable
+        return false
+    var i: i32 = 0
+    while i < 64
+        let entry: *CapEntry = @(*table).entries[i]
+        if (*entry).cap_type == cap_type and (*entry).object_id == object_id
+            return true
+        i = i + 1
+    return false
+
+fn cap_device_steps() -> i32
+    # The granted IRQ handle is found in the driver's table, owned by it
+    let irq: CapHandle = cap_kernel_grant(DRIVER_PID, CAP_TYPE_IRQ, CAP_RIGHT_ALL, TEST_IRQ)
+    let irq_idx: u32 = irq.index
+    let irq_gen: u32 = irq.generation
+    if irq_idx == 0xFFFFFFFF
+        return 3
+    if not holds(DRIVER_PID, CAP_TYPE_IRQ, TEST_IRQ)
+        return 4
+    if cap_irq_owner(TEST_IRQ) != DRIVER_PID
+        return 5
+    # Nobody else can be granted that device's IRQ
+    if cap_kernel_grant(OTHER_PID, CAP_TYPE_IRQ, CAP_RIGHT_ALL, TEST_IRQ).index != 0xFFFFFFFF
+        return 6
+
+    # The ring-3-held MMIO handle (with GRANT) can't be granted onward
+    let bar: CapHandle = cap_kernel_grant(DRIVER_PID, CAP_TYPE_MMIO, CAP_RIGHT_ALL, TEST_BAR)
+    let bar_packed: u64 = pack(bar)
+    if (bar_packed & 0xFFFFFFFF) == 0xFFFFFFFF
+        return 7
+    if sys_cap_grant(DRIVER_PID, bar_packed, OTHER_PID, CAP_RIGHT_ALL) != Errno.Perm as i64
+        return 8
+    if holds(OTHER_PID, CAP_TYPE_MMIO, TEST_BAR)
+        return 9
+    let irq_packed: u64 = (irq_idx as u64) | ((irq_gen as u64) << 32)
+    if sys_cap_grant(DRIVER_PID, irq_packed, OTHER_PID, CAP_RIGHT_ALL) != Errno.Perm as i64
+        return 10
+
+    # Revoke drops only the caller's copy of a shared object
+    let mine: CapHandle = cap_kernel_grant(DRIVER_PID, CAP_TYPE_SHM, CAP_RIGHT_READ | CAP_RIGHT_WRITE, TEST_SHM)
+    let mine_packed: u64 = pack(mine)
+    if (mine_packed & 0xFFFFFFFF) == 0xFFFFFFFF
+        return 11
+    if cap_kernel_grant(OTHER_PID, CAP_TYPE_SHM, CAP_RIGHT_READ | CAP_RIGHT_WRITE, TEST_SHM).index == 0xFFFFFFFF
+        return 12
+    if sys_cap_revoke(DRIVER_PID, mine_packed) != 0
+        return 13
+    if holds(DRIVER_PID, CAP_TYPE_SHM, TEST_SHM)
+        return 14
+    if not holds(OTHER_PID, CAP_TYPE_SHM, TEST_SHM)
+        return 15
+
+    # Revoking the last IRQ handle ends the ownership
+    if sys_cap_revoke(DRIVER_PID, irq_packed) != 0
+        return 16
+    if cap_irq_owner(TEST_IRQ) != 0
+        return 17
+    return 0
+
+# 0 on pass, else the number of the step that failed. An i32, not a bool:
+# the boot log names the failing step, and the freestanding kernel has no
+# Result to carry it (REVIEW.md A5).
+pub fn cap_device_selftest() -> i32
+    if cap_table_alloc(DRIVER_PID) == 0 as *CapTable
+        return 1
+    if cap_table_alloc(OTHER_PID) == 0 as *CapTable
+        cap_table_free_pid(DRIVER_PID)
+        return 2
+    let step: i32 = cap_device_steps()
+    cap_table_free_pid(DRIVER_PID)
+    cap_table_free_pid(OTHER_PID)
+    if step == 0 and cap_irq_owner(TEST_IRQ) != 0
+        return 18
+    return step
