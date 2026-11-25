@@ -235,8 +235,9 @@ fn log_user_fault(frame: *InterruptFrame, user_rip: u64, bad_iret: bool)
 # ============================================================================
 #
 # Called from isr_stubs.s when a CPU exception occurs (vectors 0-31).
-# A fault taken in ring 3 kills only the running process (#2755): it exits
-# with status 128 + vector and its parent resumes (init's exit powers off).
+# A fault taken at any non-zero CPL (a ring-3 program or a ring-1 driver)
+# kills only the running process (#2755, #4711): it exits with status
+# 128 + vector and its parent resumes (init's exit powers off).
 # A kernel-mode exception prints diagnostic information and halts.
 
 pub fn exception_handler(frame: *InterruptFrame)
@@ -259,8 +260,9 @@ pub fn exception_handler(frame: *InterruptFrame)
         process_kill_current(128 + ((*frame).vector as i32))
         return
 
-    # CPL of the interrupted code: ring 3 is user mode.
-    if ((*frame).cs & 3) == 3
+    # CPL of the interrupted code: any non-zero CPL is a process (ring 3, or
+    # ring 1 for a driver: RING1_DRIVER.md section 3).
+    if ((*frame).cs & 3) != 0
         log_user_fault(frame, (*frame).rip, false)
         process_kill_current(128 + ((*frame).vector as i32))
         # Never reached: the parent resumed, or the machine powered off.
@@ -377,19 +379,20 @@ pub fn irq_handler(frame: *InterruptFrame)
     # Handle specific IRQs
     if irq_num == 0
         # The periodic LAPIC tick (or the NVMe watchdog's one-shot). EOI
-        # first: if this tick preempts the process it interrupted in ring 3,
-        # the switch returns here only when that process runs again (#3629).
+        # first: if this tick preempts the process it interrupted (any
+        # non-zero CPL), the switch returns here only when that process runs
+        # again (#3629, #4711).
         lapic_eoi()
-        sched_tick(((*frame).cs & 3) == 3)
+        sched_tick(((*frame).cs & 3) != 0)
         return
 
     if irq_num == 4
         # COM1 serial port interrupt: received bytes go through the console's
         # line discipline (#4254), then any pending output is sent.
-        let kill: bool = tty_console_irq(((*frame).cs & 3) == 3)
+        let kill: bool = tty_console_irq(((*frame).cs & 3) != 0)
         serial_drain_output()
         if kill
-            # Ctrl-C while a program ran in ring 3: it exits (130) and its
+            # Ctrl-C while a process ran (non-zero CPL): it exits (130) and its
             # parent resumes; this handler never returns, so EOI first.
             lapic_eoi()
             tty_console_irq_kill()

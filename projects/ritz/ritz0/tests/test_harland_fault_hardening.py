@@ -138,8 +138,10 @@ def test_fb_map_marks_device_frames_and_maps_every_time():
 
 def test_user_mode_exception_kills_only_the_process():
     body = _fn(EXCEPTIONS, "exception_handler")
-    m = re.search(r"if \(\(\*frame\)\.cs & 3\) == 3\n((?:\s{8}.*\n)+)", body)
-    assert m, "exception_handler does not test for a ring-3 fault"
+    # Any non-zero CPL is a process (RING1_DRIVER.md section 3, AGAST #4711):
+    # a ring-1 driver's fault kills it like a ring-3 program's.
+    m = re.search(r"if \(\(\*frame\)\.cs & 3\) != 0\n((?:\s{8}.*\n)+)", body)
+    assert m, "exception_handler does not test for a non-zero-CPL fault"
     user = m.group(1)
     # Before any panic output, and it exits with 128 + vector.
     assert body.index(m.group(0)) < body.index("!!! EXCEPTION !!!")
@@ -147,6 +149,17 @@ def test_user_mode_exception_kills_only_the_process():
     assert "EXCEPTION" not in user and "PANIC" not in user and "halt_loop" not in user, user
     src = EXCEPTIONS.read_text()
     assert re.search(r"^import syscall\.runtime\.process \{ [^}]*process_kill_current", src, re.M)
+
+
+def test_every_process_predicate_is_any_nonzero_cpl():
+    """exception_handler, the tick's sched_tick argument and the console
+    IRQ's tty_console_irq argument treat CPL 1 as a process, like CPL 3
+    (RING1_DRIVER.md section 3, AGAST #4711): none tests for ring 3 alone."""
+    code = "\n".join(line.split("#", 1)[0].rstrip() for line in EXCEPTIONS.read_text().splitlines())
+    assert not re.search(r"cs & 3\) == 3", code), "a CPL test still means ring 3 only"
+    irq = _fn(EXCEPTIONS, "irq_handler")
+    assert "sched_tick(((*frame).cs & 3) != 0)" in irq, irq
+    assert "tty_console_irq(((*frame).cs & 3) != 0)" in irq, irq
 
 
 def test_process_kill_current_is_exit():

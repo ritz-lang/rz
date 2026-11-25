@@ -207,10 +207,10 @@ def test_timer_stub_never_addresses_below_rsp():
         assert f"movq {off}(%rsp), %rbx" in stub, off
 
 
-def test_tick_preempts_only_ring_3_after_its_eoi():
+def test_tick_preempts_only_a_process_after_its_eoi():
     irq = _body(_code(EXCEPTIONS), "irq_handler")
     timer = irq[irq.index("if irq_num == 0"):irq.index("if irq_num == 4")]
-    assert timer.index("lapic_eoi()") < timer.index("sched_tick(((*frame).cs & 3) == 3)")
+    assert timer.index("lapic_eoi()") < timer.index("sched_tick(((*frame).cs & 3) != 0)")
     tick = _body(_code(SCHED), "sched_tick")
     assert "if not from_user or not sched_running" in tick and "sched_switch_to(next)" in tick
 

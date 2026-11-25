@@ -171,12 +171,12 @@ def test_a_fault_on_the_syscall_iretq_is_the_users():
     exc = _code(EXCEPTIONS)
     handler = _ritz_fn(exc, "exception_handler")
     assert "syscall_exit_iret as u64" in exc
-    # Its own check, ahead of (and apart from) the ring-3 test that
+    # Its own check, ahead of (and apart from) the non-zero-CPL test that
     # test_harland_fault_hardening pins: it kills the process, reading the
     # user's RIP from the IRETQ frame.
     bad = handler.index("if fault_on_syscall_iret(frame)")
-    assert bad < handler.index("if ((*frame).cs & 3) == 3")
-    case = handler[bad:handler.index("if ((*frame).cs & 3) == 3")]
+    assert bad < handler.index("if ((*frame).cs & 3) != 0")
+    case = handler[bad:handler.index("if ((*frame).cs & 3) != 0")]
     assert "log_user_fault(frame, *((*frame).rsp as *u64), true)" in case
     assert "process_kill_current(128 + ((*frame).vector as i32))" in case
     # The self-test's catch runs before either kill.
