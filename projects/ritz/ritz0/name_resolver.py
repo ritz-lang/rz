@@ -53,8 +53,20 @@ INTRINSICS = frozenset({
 # (AGAST #3397) and `write`, `read`, `open`, `close` and `nanosleep` (AGAST
 # #3243) are ordinary identifiers: ritzlib.sys defines `syscallN`, `sys_write`
 # and friends.
-BUILTIN_VARIANTS = frozenset({'Some', 'None', 'Ok', 'Err'})
-BUILTIN_GENERICS = frozenset({'Option', 'Result', 'Span'})
+#
+# The built-in enums are ritzlib's, exactly (AGAST #4693, LANGUAGE_SPEC
+# §14.1): the emitter synthesizes an instance no declaration produced from
+# this table, each variant `(name, index of the type parameter it carries, or
+# None)` in declaration order, so its tags and layout are those of ritzlib's
+# `enum Result<T, E>` / `enum Option<T>`.  tests/test_builtin_result_is_ritzlibs.py
+# pins it to the two declarations.  A file need not declare or import one to
+# qualify an arm's variant with it (`Result.Err(e) =>`, `Option.None =>`).
+BUILTIN_ENUM_VARIANTS = {
+    'Result': (('Ok', 0), ('Err', 1)),
+    'Option': (('Some', 0), ('None', None)),
+}
+BUILTIN_VARIANTS = frozenset(v for vs in BUILTIN_ENUM_VARIANTS.values() for v, _ in vs)
+BUILTIN_GENERICS = frozenset({*BUILTIN_ENUM_VARIANTS, 'Span'})
 
 
 def generic_fn_value(name: str) -> str:
@@ -361,6 +373,7 @@ class NameResolver:
                                           pattern.name, pattern.span, scope)):
                 pass
             elif (pattern.qualifier and pattern.qualifier not in self.enums
+                    and pattern.qualifier not in BUILTIN_ENUM_VARIANTS
                     and pattern.qualifier not in self.module_names):
                 self.errors.append(NameError(
                     f"Unknown enum: {pattern.qualifier}",

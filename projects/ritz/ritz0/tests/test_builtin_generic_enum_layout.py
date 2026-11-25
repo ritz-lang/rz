@@ -161,7 +161,7 @@ def test_synthesized_option_string_body_uses_shared_layout(tmp_path):
     assert result.returncode == 0, result.stderr
     ll = (tmp_path / "unit.ll").read_text()
     body = next((line for line in ll.splitlines()
-                 if '"Option$StrLike" = type' in line), None)
+                 if 'Option$StrLike" = type' in line), None)  # `enum.<module>.` (#4693)
     assert body is not None, "synthesized Option$StrLike type not found in module"
     assert "{i8, [7 x i8], [24 x i8]}" in body, (
         f"synthesized Option$String body drifted from shared layout: {body}"

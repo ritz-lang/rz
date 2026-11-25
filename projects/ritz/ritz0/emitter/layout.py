@@ -18,6 +18,7 @@ import deref_rules
 import ritz_ast as rast
 from monomorph import resolve_alias_in
 from monomorph_core import note_instance_display
+from name_resolver import BUILTIN_ENUM_VARIANTS
 from emitter.common import EmitError, InternalError, SourceError
 
 
@@ -640,21 +641,19 @@ class LayoutEmitter:
         specialized_name = self._get_specialized_type_name(ty)
         if specialized_name in self.enum_types:
             return specialized_name
-        if ty.name == 'Result' and len(ty.args) == 2:
-            variants = [
-                rast.Variant(ty.span, 'Ok', [ty.args[0]]),
-                rast.Variant(ty.span, 'Err', [ty.args[1]]),
-            ]
-        elif ty.name == 'Option' and len(ty.args) == 1:
-            variants = [
-                rast.Variant(ty.span, 'Some', [ty.args[0]]),
-                rast.Variant(ty.span, 'None', []),
-            ]
-        else:
+        # ritzlib's declaration, exactly (AGAST #4693): its variants in its
+        # order, each carrying its type argument, under the name
+        # `_declare_enum` gives the instance of an imported `enum Result<T, E>`.
+        declared = BUILTIN_ENUM_VARIANTS.get(ty.name)
+        params = {p for _, p in declared or () if p is not None}
+        if declared is None or len(ty.args) != len(params):
             return None
+        variants = [rast.Variant(ty.span, name, [] if p is None else [ty.args[p]])
+                    for name, p in declared]
         note_instance_display(specialized_name, ty.name, ty.args)  # AGAST #4266
 
-        enum_type = self.module.context.get_identified_type(specialized_name)
+        enum_type = self.module.context.get_identified_type(
+            f"enum.{self.module.name}.{specialized_name}")
         self.enum_types[specialized_name] = (enum_type, variants)
         for variant in variants:
             self.variant_to_enum[variant.name] = specialized_name

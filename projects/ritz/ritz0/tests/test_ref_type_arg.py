@@ -71,5 +71,5 @@ def test_each_reference_argument_is_its_own_pointer_sized_type(tmp_path, compile
     assert comp.returncode == 0, comp.stdout + comp.stderr
     ir = ll.read_text()
     for name in ("Option$refmut_A", "Option$refmut_B", "Option$ref_A"):
-        found = re.search(r'%"?' + re.escape(name) + r'"? = type \{\s*i8, \[7 x i8\], \[8 x i8\]\s*\}', ir)
+        found = re.search(r'%"?(?:enum\.[\w.]+?\.)?' + re.escape(name) + r'"? = type \{\s*i8, \[7 x i8\], \[8 x i8\]\s*\}', ir)
         assert found, f"{compiler}: no 8-byte-payload %{name}"

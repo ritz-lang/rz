@@ -18,6 +18,7 @@ from tail_value import arm_diverges, value_tails
 import bool_rules
 import match_coverage
 import binder_names
+from name_resolver import BUILTIN_ENUM_VARIANTS
 from emitter.common import (EmitError, NoValue, _PASS_ARM, has_no_value)
 
 
@@ -67,8 +68,14 @@ class PatternEmitter:
         # where `Some(x)` binds nothing and the arm dies with `Unknown
         # identifier: x` (AGAST #1321). Compare the type itself: a user enum's
         # struct is named `enum.<module>.Opt`, not its enum_types key (#2101).
+        # A borrowed instance (`o: @Result<i32, E>`, a param) is the enum its
+        # pointer addresses, as `match @place` is above: its declared type
+        # names a generic enum, never the instance's key (AGAST #4693).
+        scrut_ty = match_val.type
+        if isinstance(scrut_ty, ir.PointerType):
+            scrut_ty = scrut_ty.pointee
         for enum_name, (enum_ty, _) in self.enum_types.items():
-            if match_val.type == enum_ty:
+            if scrut_ty == enum_ty:
                 return self._emit_enum_match(expr, match_val, enum_name)
 
         # Check if matching on an integer type
@@ -83,8 +90,8 @@ class PatternEmitter:
 
     # The builtin constructors: (generic enum, which type argument the payload
     # gives, or None for a unit variant).
-    _BUILTIN_CTORS = {'Some': ('Option', 0), 'None': ('Option', None),
-                      'Ok': ('Result', 0), 'Err': ('Result', 1)}
+    _BUILTIN_CTORS = {v: (enum, p) for enum, vs in BUILTIN_ENUM_VARIANTS.items()
+                      for v, p in vs}
 
     def _bare_ctor_type(self, expr: rast.Expr) -> Optional[rast.NamedType]:
         """The enum the bare constructor `expr` builds, from it alone, or None.

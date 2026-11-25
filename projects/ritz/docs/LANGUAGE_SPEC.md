@@ -4536,6 +4536,11 @@ significant: reordering fields changes the layout, just as it does in a
 
 `Option<T>` and `Result<T, E>` are defined in `ritzlib.option` and
 `ritzlib.result` respectively; import them rather than redeclaring them.
+The compiler knows both without the import (§14.1), and that built-in is
+the imported type, not a twin: an `Option<i32>` built in a file that never
+imports `ritzlib.option` has its layout and LLVM type, and is passed to and
+matched in a file that does with no conversion. A qualified arm (`Option.None
+=>`, `Option.Some(v) =>`) names it without the import, as a bare one does.
 
 **Layout of a fieldless enum.** How a fieldless enum (no variant carries
 data) is stored depends on whether it names a representation type (§10.4):
@@ -6711,6 +6716,23 @@ fn parse_port(s: StrView) -> Result<i64, PortError>
 `Result` is declared in `ritzlib.result`, with its methods (`is_ok`, `is_err`,
 `unwrap_or`, `ok`, `err`). The compiler also knows it without the import, so
 naming, constructing and matching one, and `?`, work in any file (§15.4).
+The built-in and the imported `Result` are the same type: the same layout
+and LLVM type, so a value built where `ritzlib.result` isn't imported is
+passed to, returned from and matched in a file that imports it, whose
+methods then apply to it (AGAST #4693). A qualified arm (`Result.Err(e) =>`)
+names it without the import too; a value is built bare, `Err(e)`, imported
+or not (§11.3):
+
+```ritz
+fn code(r: @Result<i32, i64>) -> i32
+    match r
+        Result.Ok(v) => v
+        Result.Err(e) => e as i32
+
+fn main() -> i32
+    let r: Result<i32, i64> = Err(0)
+    code(@r)
+```
 ritzlib's syscall wrappers return `Result<T, Errno>` (`ritzlib.errno`): the
 kernel's negative return is converted at the wrapper, and nothing above it
 sees a raw code.

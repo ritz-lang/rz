@@ -422,7 +422,7 @@ def test_a_row_that_leans_on_another_rows_type_gets_no_answer(tmp_path):
         if "Some(4)" in src.read_text():
             ll = work / "main.ll"
             ll.write_text("".join(ln for ln in ll.read_text().splitlines(keepends=True)
-                                  if not ln.startswith('%"Option$i32" = type')))
+                                  if 'Option$i32" = type' not in ln))  # `enum.<module>.` (#4693)
         return code, out
     rows = [_row(_opt(n)) for n in (3, 4)]
     assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=compile) == [3, None]

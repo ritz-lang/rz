@@ -2679,6 +2679,14 @@ fn match_scrutinee_is_addr(scr: *Expr) -> i32
     0
 
 # The `%E` value in a place-scrutinee's slot, for arms that use the register.
+# AGAST #4693: is `e` a local (a param among them) of type `@E`, E a struct
+# or enum (a match's caller has already resolved it to an enum)?
+fn borrowed_enum_local(s: *EmitterState, e: *Expr) -> bool
+    if e.kind != ExprKind.Ident
+        return false
+    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    loc != null and lv_var_type(loc) == TypeKind.Ref and lv_pointee_type(loc) == TypeKind.Struct
+
 fn emit_match_place_load(s: *EmitterState, slot: i32, enum_name_sv: StrView) -> i32
     var enum_name: *u8 = enum_name_sv.ptr
     var enum_name_len: i32 = enum_name_sv.len as i32
@@ -2798,6 +2806,12 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     var lent: bool = false
     if is_enum == 1 and is_ctor == 0 and lent_referent_local(s, typed) != null
         lent = true
+    # AGAST #4693: so is an `o: @E` param or local, `o: @Result<T, E>` among
+    # them: the borrow lowers to an i64, which spilled as a `%E` was IR clang
+    # refused.  Its pointer is the slot, as `match @place`'s is.
+    var borrowed: bool = false
+    if is_enum == 1 and is_ctor == 0 and not lent and borrowed_enum_local(s, typed)
+        borrowed = true
 
     # Evaluate scrutinee.  For `@place` the place's own address (a `ptr`;
     # `@expr` as a value is a ptrtoint'd i64) is the slot.
@@ -2806,6 +2820,10 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     if lent
         from_place = 1
         scrut_slot = emit_expr(s, typed)
+        scrut_reg = emit_match_place_load(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
+    else if borrowed
+        from_place = 1
+        scrut_slot = ir_inttoptr_ptr(s.out, @s.reg_counter, emit_expr(s, typed))
         scrut_reg = emit_match_place_load(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
     else if is_enum == 1 and from_place == 1
         scrut_slot = emit_lvalue_ptr(s, typed)

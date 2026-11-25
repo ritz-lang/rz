@@ -163,7 +163,7 @@ fn main() -> i32
 def test_fn_type_option_at_two_spans_one_enum(tmp_path):
     ll = _compile(tmp_path, TWO_FN_OPTIONS)
     assert "span=" not in ll, "a mangled name still embeds a source span"
-    assert '"Option$fn1_i32_ret_i32"' in ll
+    assert 'Option$fn1_i32_ret_i32"' in ll  # `"enum.<module>.Option$...` (#4693)
 
 
 # `Span<*mut u8>` is named by the emitter; it must spell it as the
