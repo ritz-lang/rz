@@ -8,7 +8,7 @@
 import klog { klog, klog_hex, klog_dec }
 import serial { StrView }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_fail_allocs_after, pmm_fail_allocs_off }
-import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_nx_flag, phys_to_virt }
+import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, DRV_RING_BASE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_nx_flag, phys_to_virt }
 import fs.syscall { fs_process_pid, fs_process_mmap_next, fs_process_set_mmap_next }
 import syscall.errno { Errno }
 
@@ -148,13 +148,29 @@ pub fn alloc_user_stack() -> u64
 fn free_user_stack()
     unmap_user_pages(USER_STACK_BASE, USER_STACK_PAGES)
 
+# True when num_pages pages at the page-aligned addr overlap the ring-1
+# driver windows [DRV_RING_BASE, USER_STACK_BASE) (#4715): the kernel maps a
+# driver's ring, DMA and MMIO pages there, so neither sys_mmap_impl nor
+# sys_munmap_impl may reach them, whether the range starts in the windows or
+# below them and runs in. Divides rather than adding num_pages * PAGE_SIZE to
+# addr, which a huge length would wrap.
+fn drv_window_overlaps(addr: u64, num_pages: u64) -> bool
+    if addr >= USER_STACK_BASE
+        return false
+    if addr >= DRV_RING_BASE
+        return true
+    return num_pages > (DRV_RING_BASE - addr) / PAGE_SIZE
+
 # True when a hint range is unusable because some page of it is already
 # mapped: the hint is then ignored, as on Linux, rather than mapped over
 # (#4114). A range outside the mmap region is left to sys_mmap_impl's
-# bounds check (NoMem), as before. The PMM never hands out page 0, so a
-# 0 from vmm_virt_to_phys means unmapped.
+# bounds check (NoMem), as before, and one overlapping the driver windows
+# to its window check (Inval): a hint there is refused, not moved. The PMM
+# never hands out page 0, so a 0 from vmm_virt_to_phys means unmapped.
 fn mmap_hint_taken(addr: u64, num_pages: u64) -> bool
     if addr < USER_MMAP_START or addr >= USER_MMAP_END
+        return false
+    if drv_window_overlaps(addr, num_pages)
         return false
     if num_pages > (USER_MMAP_END - addr) / PAGE_SIZE
         return false
@@ -189,7 +205,8 @@ fn unmap_user_pages(addr: u64, count: u64)
 #   flags: Mapping flags (MAP_ANONYMOUS | MAP_PRIVATE)
 #
 # Returns:
-#   Address of mapped region, or Errno.Inval / Errno.NoMem
+#   Address of mapped region, or Errno.Inval / Errno.NoMem. A range that
+#   overlaps the driver windows is Errno.Inval, MAP_FIXED or not (#4715).
 #
 # Note: We only support anonymous private mappings for now.
 fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
@@ -224,6 +241,12 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
             return Errno.Srch as i64
         map_addr = mmap_cursor(num_pages)
         kernel_chose = true
+
+    # Before the region check: a range that starts below the windows and
+    # runs past USER_MMAP_END overlaps them too, and is Inval, not NoMem.
+    if drv_window_overlaps(map_addr, num_pages)
+        klog("[mmap] ERROR: range overlaps the driver windows\n")
+        return Errno.Inval as i64
 
     # Validate address is in user mmap region
     if map_addr < USER_MMAP_START or map_addr >= USER_MMAP_END
@@ -292,7 +315,8 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
 #   length: Number of bytes to unmap (will be rounded up to page size)
 #
 # Returns:
-#   0 on success, Errno.Inval for a bad address
+#   0 on success, Errno.Inval for a bad address or a range that overlaps
+#   the driver windows (#4715), which unmaps nothing
 fn sys_munmap_impl(addr: u64, length: u64) -> i64
     # Validate address alignment
     if (addr & 0xFFF) != 0
@@ -309,6 +333,12 @@ fn sys_munmap_impl(addr: u64, length: u64) -> i64
 
     # Round length up to page size
     let num_pages: u64 = (length + PAGE_SIZE - 1) / PAGE_SIZE
+
+    # The windows sit inside the mmap region, and this loop frees whatever
+    # phys it unmaps: refuse the whole call before unmapping any page.
+    if drv_window_overlaps(addr, num_pages)
+        klog("[munmap] ERROR: range overlaps the driver windows\n")
+        return Errno.Inval as i64
 
     # Unmap each page
     var i: u64 = 0
@@ -611,6 +641,119 @@ pub fn mmap_cursor_self_test() -> bool
     if not ok
         return false
     klog("  mmap cursor test PASSED!\n")
+    return true
+
+# ============================================================================
+# Boot self-test: mmap and munmap refuse the driver windows (#4715)
+# ============================================================================
+#
+# [DRV_RING_BASE, USER_STACK_BASE) holds the ring-1 driver windows
+# (RING1_DRIVER.md, DMA domain): the shared ring, DMA and MMIO pages the
+# kernel maps for a driver. A user mmap there would land on them and a
+# munmap would free frames the process does not own, so both refuse any
+# range that overlaps the windows, with Inval, before touching a page.
+#
+# Runs after mmap_cursor_self_test, on the same terms: kernel PML4, no
+# process, interrupts off. Nothing maps in the windows yet, so the test maps
+# one page at DRV_RING_BASE itself, as the kernel will map a driver's ring:
+# every case must leave that page mapped to the same frame. A hint over it
+# must be refused, not treated as taken and moved to the cursor (which, with
+# no process, is Srch). The test's one user mapping is MMAP_WINDOW_BELOW
+# pages ending exactly at DRV_RING_BASE: it must succeed (the boundary is
+# exclusive), and a munmap that runs from it into the window must leave it
+# mapped.
+const MMAP_WINDOW_BELOW: u64 = 2
+
+# One mmap case: true when sys_mmap_impl(addr, pages, flags) returns Inval
+# and takes no page.
+fn mmap_window_case(name: StrView, addr: u64, pages: u64, flags: u64) -> bool
+    let before: u64 = pmm_get_free_pages()
+    let result: i64 = sys_mmap_impl(addr, pages * PAGE_SIZE, PROT_READ | PROT_WRITE, flags)
+    if result == Errno.Inval as i64 and pmm_get_free_pages() == before
+        return true
+    klog("  mmap driver-window test FAILED: mmap ")
+    klog(name)
+    klog(": result=0x")
+    klog_hex(result as u64)
+    klog("\n")
+    # It may have mapped the range: give it back so later tests start clean.
+    if result == addr as i64
+        unmap_user_pages(addr, pages)
+    return false
+
+# One munmap case: true when sys_munmap_impl(addr, pages) returns Inval and
+# frees no page.
+fn munmap_window_case(name: StrView, addr: u64, pages: u64) -> bool
+    let before: u64 = pmm_get_free_pages()
+    let result: i64 = sys_munmap_impl(addr, pages * PAGE_SIZE)
+    if result == Errno.Inval as i64 and pmm_get_free_pages() == before
+        return true
+    klog("  mmap driver-window test FAILED: munmap ")
+    klog(name)
+    klog(": result=0x")
+    klog_hex(result as u64)
+    klog("\n")
+    return false
+
+# Returns true when every overlap is refused and the boundary is not, false
+# (after saying why) if not.
+pub fn mmap_driver_window_self_test() -> bool
+    klog("\nTesting mmap/munmap refuse the driver windows...\n")
+    let fixed: u64 = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
+    let hint: u64 = MAP_ANONYMOUS | MAP_PRIVATE
+    let below: u64 = DRV_RING_BASE - MMAP_WINDOW_BELOW * PAGE_SIZE
+    let last: u64 = USER_STACK_BASE - PAGE_SIZE
+
+    # The kernel's own page in the ring window.
+    let ring_phys: u64 = pmm_alloc_page()
+    if ring_phys == 0
+        klog("  mmap driver-window test FAILED: no page for the ring\n")
+        return false
+    if vmm_map_page(DRV_RING_BASE, ring_phys, PTE_WRITABLE | PTE_USER | vmm_nx_flag()) != 0
+        pmm_free_page(ring_phys)
+        klog("  mmap driver-window test FAILED: mapping the ring page failed\n")
+        return false
+
+    var ok: bool = mmap_window_case("MAP_FIXED at the ring window", DRV_RING_BASE, 1, fixed)
+    if ok
+        ok = mmap_window_case("MAP_FIXED at the DMA window", DRV_DMA_BASE, 1, fixed)
+    if ok
+        ok = mmap_window_case("MAP_FIXED at the MMIO window", DRV_MMIO_BASE, 1, fixed)
+    if ok
+        ok = mmap_window_case("MAP_FIXED on the last page", last, 1, fixed)
+    if ok
+        ok = mmap_window_case("MAP_FIXED from below", below, MMAP_WINDOW_BELOW + 1, fixed)
+    if ok
+        ok = mmap_window_case("hint at the ring window", DRV_RING_BASE, 1, hint)
+    if ok
+        ok = mmap_window_case("hint from below", below, MMAP_WINDOW_BELOW + 1, hint)
+    if ok
+        ok = munmap_window_case("at the ring window", DRV_RING_BASE, 1)
+    if ok
+        ok = munmap_window_case("at the MMIO window", DRV_MMIO_BASE, 1)
+    if ok
+        ok = munmap_window_case("on the last page", last, 1)
+
+    # The boundary: a range ending at DRV_RING_BASE maps, and a munmap that
+    # runs from it into the window is refused whole, leaving it mapped.
+    if ok and sys_mmap_impl(below, MMAP_WINDOW_BELOW * PAGE_SIZE, PROT_READ | PROT_WRITE, fixed) != below as i64
+        klog("  mmap driver-window test FAILED: a range ending at the window was refused\n")
+        ok = false
+    if ok
+        let below_phys: u64 = vmm_virt_to_phys(below)
+        ok = munmap_window_case("from below", below, MMAP_WINDOW_BELOW + 1)
+        if ok and vmm_virt_to_phys(below) != below_phys
+            klog("  mmap driver-window test FAILED: refused munmap unmapped the pages below\n")
+            ok = false
+        unmap_user_pages(below, MMAP_WINDOW_BELOW)
+
+    if ok and vmm_virt_to_phys(DRV_RING_BASE) != ring_phys
+        klog("  mmap driver-window test FAILED: the ring page was remapped or unmapped\n")
+        ok = false
+    unmap_user_pages(DRV_RING_BASE, 1)
+    if not ok
+        return false
+    klog("  mmap driver-window test PASSED!\n")
     return true
 
 # ============================================================================
