@@ -78,12 +78,18 @@ FORMS = {
 }
 
 
+# Every form x scalar, as one table per compiler (test_table_rows.py), not a
+# 297-case parametrised matrix: each row still compiles and runs, and a
+# failure names its `<form>_<ty>` row.
+WALKS = {f"{form}_{ty}": (FORMS[form](ty, SCALARS[ty]), 0)
+         for form in sorted(FORMS) for ty in sorted(SCALARS)}
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-@pytest.mark.parametrize("form", sorted(FORMS))
-def test_address_of_an_iterable_walks_it(run_with, compiler, form, ty):
-    assert run_with(compiler, f"{form}_{ty}", FORMS[form](ty, SCALARS[ty])) == 0
+def test_address_of_an_iterable_walks_it(tmp_path, compiler):
+    from test_table_rows import assert_runs  # #3566: it imports for_header
+    assert_runs(compiler, tmp_path, WALKS)
 
 
 # Struct elements, with the borrow's array in between canaries: 1 + 2 + 4.

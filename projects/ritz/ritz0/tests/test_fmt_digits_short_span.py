@@ -35,9 +35,9 @@ def _program(body: str) -> str:
     )
 
 
-def _build_and_run(ritz1_bin, compiler, tmp_path, src):
-    work = tmp_path / compiler
-    work.mkdir()
+def _build_and_run(ritz1_bin, compiler, tmp_path, src, row="main"):
+    work = tmp_path / compiler / row
+    work.mkdir(parents=True)
     (work / "main.ritz").write_text(src)
     ok, output, exe = ritzlib_build(ritz1_bin)(compiler, work / "main.ritz", work)
     assert ok, f"{compiler} failed to build:\n{output[-3000:]}"
@@ -82,13 +82,18 @@ SHORT = {
 }
 
 
+# One test per compiler iterating SHORT's rows, not a parametrised matrix (the
+# ritz0 suite's case cap, tools/test_budget.toml).  A trap ends its binary, so
+# every row is still its own build and run; a failure names each row it hits.
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("case", sorted(SHORT))
-def test_short_span_traps(ritz1_bin, tmp_path, compiler, case):
-    body, message = SHORT[case]
-    run = _build_and_run(ritz1_bin, compiler, tmp_path, _program(body))
-    assert run.returncode == 101, (run.returncode, run.stderr)
-    assert message in run.stderr
+def test_short_span_traps(ritz1_bin, tmp_path, compiler):
+    wrong = []
+    for case in sorted(SHORT):
+        body, message = SHORT[case]
+        run = _build_and_run(ritz1_bin, compiler, tmp_path, _program(body), case)
+        if run.returncode != 101 or message not in run.stderr:
+            wrong.append(f"{case}: exit {run.returncode}, stderr {run.stderr!r}, wanted 101 and {message!r}")
+    assert not wrong, "\n".join(wrong)
 
 
 # The exact sizes are enough, at each routine's widest value.
