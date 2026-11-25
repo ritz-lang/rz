@@ -830,10 +830,14 @@ fn emit_struct_ptr_index(s: *EmitterState, e: *Expr, name_sv: StrView) -> i32
     emit_struct_load_or_defer(s, TypeKind.Struct, val, StrView { ptr: (name), len: (len) as i64 }, ptr, null, 0)
     return val
 
-pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
+# The index forms that need no base type (through a borrow, a range, N-D,
+# array-pointer, element-pointer, call-result and cast bases): 1 (result
+# in *out) when `e` is one.
+fn try_emit_index_early(s: *EmitterState, e: *Expr, out: *i32) -> i32
     # AGAST #2440: `p[i]` through a reference or pointer.
     if through_slice_refused(s, e) == 1
-        return 0
+        *out = 0
+        return 1
     # `f()[i]` of a `-> [N]T` call is read from a spill in emit_expr (AGAST
     # #3234); emit_call_array_index puts a local in its place before here.
     let through: *LocalVar = index_through(s, e)
@@ -843,10 +847,12 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         # don't either.  This was #2321's located refusal, and `*(q + i)` failed
         # at clang for `p[i] + 1`, `p[i] as i64` and `return p[i]`.
         if lv_is_array_view(through) == 1 and lv_pointee_type(through) == TypeKind.Struct and whole_struct_elem_refused(s, e) == 1
-            return 0
+            *out = 0
+            return 1
         var th: ThroughIndex
         index_through_fill(s, e, through_spill(s, through), @th)
-        return emit_expr(s, @th.deref)
+        *out = emit_expr(s, @th.deref)
+        return 1
     # AGAST #3403: a range on an N-D array (`a[1][0..2]`, `h.m[1][0..2]`, a
     # plane pointer's `q[1][0..2]`) is #2521's refusal, in ritz0's words.
     # emit_nd_index_value below lowered the range as an index value, and
@@ -855,36 +861,43 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         var nd_depth: i32 = 0
         if nd_index_shape(s, e, @nd_depth) != null
             emit_nd_error(s, e.span.line, e.span.col, unsliceable_message(TypeKind.Array))
-            return 0
+            *out = 0
+            return 1
     # AGAST #1509: `g[i][j]` over a multi-dimensional array (one GEP chain).
     var nd_val: i32 = 0
     if emit_nd_index_value(s, e, @nd_val) == 1
-        return nd_val
+        *out = nd_val
+        return 1
     var ap_val: i32 = 0
     if emit_array_ptr_index(s, e, @ap_val) == 1
-        return ap_val
+        *out = ap_val
+        return 1
     # AGAST #2332: `a[i][j]` with `a: [N]*T`.  It took the byte path.
     if is_array_elem_index(s, e) == 1
         if e.right != null and e.right.kind == ExprKind.Range
             emit_nd_error(s, e.span.line, e.span.col, c"an element of an array of pointers can't be sliced (only String, Vec and Span can)")
-            return 0
+            *out = 0
+            return 1
         # AGAST #3188: a struct pointee is a copy only, as a `[N]S` element is.
         var ei_name: *u8 = null
         var ei_len: i32 = 0
         deref_pointee_struct_name(s, e.left, @ei_name, @ei_len)
         if ei_len > 0 and find_struct(s, StrView { ptr: (ei_name), len: (ei_len) as i64 }) != null and whole_struct_elem_refused(s, e) == 1
-            return 0
+            *out = 0
+            return 1
         var ei_sum: Expr
         var ei_deref: Expr
         elem_index_as_deref(s, e, @ei_sum, @ei_deref)
-        return emit_expr(s, @ei_deref)
+        *out = emit_expr(s, @ei_deref)
+        return 1
     # AGAST #3058: `b[i][j]` with `b: [N]**T` is `*(b[i] + j)`, a `*T` loaded at a
     # pointer's stride.  It took the byte path: one i8 at `b[i] + j`.
     if is_ptr_ptr_elem_index(s, e) == 1
         var pp_sum: Expr
         var pp_deref: Expr
         elem_index_as_deref(s, e, @pp_sum, @pp_deref)
-        return emit_expr(s, @pp_deref)
+        *out = emit_expr(s, @pp_deref)
+        return 1
     # AGAST #3052: `p[i]` with `p: *S` is `*(p + i)`, the `%S` at a stride of
     # sizeof(S).  It took the byte path: one i8 at `p + i`, an i64 where a
     # `%S` goes, so `let c: S = p[0]` failed at clang.
@@ -895,11 +908,13 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         # AGAST #3188: a copy only.  `let n: i32 = p[0]`, `p[0] + 1` and
         # `return p[0]` put the `%S` where an integer goes, and clang refused it.
         if find_struct(s, StrView { ptr: (ps_name), len: (ps_len) as i64 }) != null and whole_struct_elem_refused(s, e) == 1
-            return 0
+            *out = 0
+            return 1
         var ps_sum: Expr
         var ps_deref: Expr
         elem_index_as_deref(s, e, @ps_sum, @ps_deref)
-        return emit_expr(s, @ps_deref)
+        *out = emit_expr(s, @ps_deref)
+        return 1
     # AGAST #4450: `g[i]`, `h.ks[i]`, `f()[i]` through any `*E` (E a user
     # enum) is `*(g + i)`, the `%E` at E's stride -- the value
     # unit_enum_expr_name reads the tag of.  A global's or a field's took the
@@ -911,7 +926,8 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         var pe_sum: Expr
         var pe_deref: Expr
         elem_index_as_deref(s, e, @pe_sum, @pe_deref)
-        return emit_expr(s, @pe_deref)
+        *out = emit_expr(s, @pe_deref)
+        return 1
     # AGAST #3147: `(*r)[i]` with `*r` a `*C` (`r: **C`, `@*C`, `@&*C`) is
     # `*(*r + i)`, the `%C` at a stride of sizeof(C), as #3122 stores one.  It
     # took the byte path below: one i8, an i64 where a `%C` goes.  A copy only,
@@ -922,11 +938,13 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         deref_ptr_ptr_struct_name(s, e.left, @dp_name, @dp_len)
         if dp_len > 0 and find_struct(s, StrView { ptr: (dp_name), len: (dp_len) as i64 }) != null
             if whole_struct_elem_refused(s, e) == 1
-                return 0
+                *out = 0
+                return 1
             var dp_sum: Expr
             var dp_deref: Expr
             elem_index_as_deref(s, e, @dp_sum, @dp_deref)
-            return emit_expr(s, @dp_deref)
+            *out = emit_expr(s, @dp_deref)
+            return 1
     # AGAST #3527: `f()[i]` with `f` returning a `*T` or `**T` is `*(f() + i)`,
     # at the pointee's stride and width (ptr_root_pointee, as #3442 stores
     # one): a scalar T, a `%S` (a copy only, as `p[i]` above) or a `ptr`.  It
@@ -948,11 +966,13 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             cb_ok = true
         if cb_ok
             if cb_kind == TypeKind.Struct and whole_struct_elem_refused(s, e) == 1
-                return 0
+                *out = 0
+                return 1
             var cb_sum: Expr
             var cb_deref: Expr
             elem_index_as_deref(s, e, @cb_sum, @cb_deref)
-            return emit_expr(s, @cb_deref)
+            *out = emit_expr(s, @cb_deref)
+            return 1
     # AGAST #3756, #3833: `(e as *T)[i]`, `(e as **T)[i]` and `(q + k)[i]` read
     # element i at the pointee's stride and width, as emit_ptr_base_index_store
     # (#3565) stores one: a scalar T, a `%S` (a copy only, as `p[i]` above) or,
@@ -965,36 +985,17 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         let tb_kind: TypeKind = index_store_base_pointee(s, e.left, @tb_name, @tb_len, @tb_pp)
         if tb_kind == TypeKind.Struct and tb_pp == 0
             if whole_struct_elem_refused(s, e) == 1
-                return 0
-            return emit_struct_ptr_index(s, e, StrView { ptr: (tb_name), len: (tb_len) as i64 })
+                *out = 0
+                return 1
+            *out = emit_struct_ptr_index(s, e, StrView { ptr: (tb_name), len: (tb_len) as i64 })
+            return 1
         if tb_kind != TypeKind.Void
-            return emit_deref_index(s, e, tb_kind)
-    # Check if base is an array, pointer-to-pointer (e.g., argv: **u8), or pointer
-    #
-    # AGAST #1328: resolve the base through locals THEN globals, and carry the
-    # pointee kind so the fallback pointer path below can load the element at
-    # its real width.  Previously (a) a global base hit find_local_type's
-    # TypeKind.I64 miss value and fell into the byte path (`g[i]` on a global
-    # *i32 read one byte of a 4-byte slot), and (b) even for locals there was
-    # no pointee-typed path at all — `p[i]` on a local *i32 also byte-loaded.
-    var base_type: TypeKind = TypeKind.Ptr
-    var elem_pointee: TypeKind = TypeKind.Unknown
-    var local: *LocalVar = null
-    if e.left.kind == ExprKind.Ident
-        base_type = find_local_type(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-        local = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-        if base_type == TypeKind.Unknown
-            let glob: *GlobalVarDef = find_global(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-            if glob != null
-                base_type = glob.var_type
-                elem_pointee = glob.pointee_type
-            else
-                # Neither local nor global: preserve the historical byte-path
-                # default rather than letting TypeKind.Unknown leak downstream.
-                base_type = TypeKind.Ptr
-        else if local != null
-            elem_pointee = lv_pointee_type(local)
+            *out = emit_deref_index(s, e, tb_kind)
+            return 1
+    0
 
+# `x[i]` on a named local, global or const (and `x[a..b]` on one), by `base_type`.
+fn try_emit_index_named(s: *EmitterState, e: *Expr, base_type: TypeKind, local: *LocalVar, out: *i32) -> i32
     # A range index `a[lo..hi]` slices a Vec, Span or String only, and monomorph
     # rewrites one into `v.slice(lo, hi)` (AGAST #2451).  What reaches here is
     # refused, located (#2521).
@@ -1002,7 +1003,8 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         # AGAST #2290: ritz0 slices no array, so a borrowed one isn't either.
         if local != null and base_type == TypeKind.Array and lv_is_lent(local) == 1
             emit_nd_error(s, e.span.line, e.span.col, c"an `a:& [N]T` param can't be sliced (only String, Vec and Span can)")
-            return 0
+            *out = 0
+            return 1
         # AGAST #2451: a Vec, Span or String local was sliced here into a bare
         # address, so `t[1]` read bytes and `t.len` had no struct.  What
         # monomorph didn't rewrite is refused rather than read as an address.
@@ -1011,7 +1013,8 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 emit_nd_error(s, e.span.line, e.span.col, c"this slice of a Vec, Span or String isn't lowered by ritz1 (`let t = v[lo..hi]` is)")
             else
                 emit_nd_error(s, e.span.line, e.span.col, c"a struct can't be sliced (only String, Vec and Span can)")
-            return 0
+            *out = 0
+            return 1
         # AGAST #2521: nothing else slices (LANGUAGE_SPEC §3.4, R9 rules 5 and
         # 6).  An array, a raw `*T` and a `**Vec` were lowered here to a bare
         # address in an i64 (#110, #1974), read as 20 for the first two and as
@@ -1021,7 +1024,8 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         if e.left.kind != ExprKind.Ident
             named = expr_slot_ty(e.left)
         emit_nd_error(s, e.span.line, e.span.col, unsliceable_message(named))
-        return 0
+        *out = 0
+        return 1
 
     if base_type == TypeKind.Array and local != null and lv_array_elem_type(local) == TypeKind.Struct and lv_type_name_len(local) > 0
         # AGAST #2592: a whole struct element of a `[N]P` local is a `%P`
@@ -1029,7 +1033,8 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         # read as a `[N x i64]` slot, so `let p: P = ps[1]` stored an i64 into
         # a %P slot and clang refused the IR.  AGAST #2996: a copy only.
         if whole_struct_elem_refused(s, e) == 1
-            return 0
+            *out = 0
+            return 1
         let sidx: i32 = emit_expr(s, e.right)
         let sptr: i32 = next_reg(s)
         emit_str(s, IR_INDENT)
@@ -1045,7 +1050,8 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, IR_NL)
         let sval: i32 = next_reg(s)
         emit_struct_load_or_defer(s, TypeKind.Struct, sval, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, sptr, null, 0)
-        return sval
+        *out = sval
+        return 1
 
     if base_type == TypeKind.Array and local != null
         # Array local - use GEP [0, index] to get element, then load.
@@ -1074,7 +1080,8 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         emit_str(s, IR_PTR_SEP)
         emit_reg(s, elem_ptr)
         emit_str(s, IR_NL)
-        return emit_array_elem_widen(s, result, lv_array_elem_type(local), elem_ty)
+        *out = emit_array_elem_widen(s, result, lv_array_elem_type(local), elem_ty)
+        return 1
 
     # AGAST #1504: a GLOBAL `[N]T` array. The branch above covers only an
     # array local, so a global array fell through to the pointer fallback
@@ -1089,10 +1096,13 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             # a struct-valued deref or call yields, so a %P slot can take it.
             # AGAST #2996: a copy only.
             if whole_struct_elem_refused(s, e) == 1
-                return 0
-            return emit_struct_array_elem_load(s, StrView { ptr: (garr.name), len: (garr.name_len) as i64 }, garr.array_size, garr.array_elem_type_name, garr.array_elem_type_name_len, e.right)
+                *out = 0
+                return 1
+            *out = emit_struct_array_elem_load(s, StrView { ptr: (garr.name), len: (garr.name_len) as i64 }, garr.array_size, garr.array_elem_type_name, garr.array_elem_type_name_len, e.right)
+            return 1
         if garr != null and garr.array_elem_type != TypeKind.Struct
-            return emit_global_array_index(s, StrView { ptr: (garr.name), len: (garr.name_len) as i64 }, garr.array_size, garr.array_elem_type, elem_mem_llvm(garr.array_elem_type), e.right)
+            *out = emit_global_array_index(s, StrView { ptr: (garr.name), len: (garr.name_len) as i64 }, garr.array_size, garr.array_elem_type, elem_mem_llvm(garr.array_elem_type), e.right)
+            return 1
 
     # AGAST #1534: a module `const T: [N]X = [...]`. emit_const_array_entry
     # emits it as `@T = internal constant [N x X]`, but T is neither a local
@@ -1110,11 +1120,14 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             # AGAST #3946: a refused struct fill reads its placeholder global.
             if carr.array_elem_type == TypeKind.Struct and carr.array_elem_type_name_len > 0 and (carr.value_expr.kind == ExprKind.ArrayLit or const_struct_fill_global(carr) == 1)
                 if whole_struct_elem_refused(s, e) == 1
-                    return 0
-                return emit_struct_array_elem_load(s, StrView { ptr: (carr.name), len: (carr.name_len) as i64 }, carr.array_size, carr.array_elem_type_name, carr.array_elem_type_name_len, e.right)
+                    *out = 0
+                    return 1
+                *out = emit_struct_array_elem_load(s, StrView { ptr: (carr.name), len: (carr.name_len) as i64 }, carr.array_size, carr.array_elem_type_name, carr.array_elem_type_name_len, e.right)
+                return 1
             let cty: *u8 = const_elem_llvm(carr.array_elem_type)
             if cty != null
-                return emit_global_array_index(s, StrView { ptr: (carr.name), len: (carr.name_len) as i64 }, carr.array_size, carr.array_elem_type, cty, e.right)
+                *out = emit_global_array_index(s, StrView { ptr: (carr.name), len: (carr.name_len) as i64 }, carr.array_size, carr.array_elem_type, cty, e.right)
+                return 1
 
     # task-101: Span$T indexing on a struct local — `let b = s.as_bytes(); b[0]`
     # or `let b = "ABC"; b[0]`. Without this, emit_expr(e.left) loads the whole
@@ -1131,8 +1144,13 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # which clang rejects (struct → ptr not allowed).
     if e.left.kind == ExprKind.Ident and local != null and lv_var_type(local) == TypeKind.Struct and lv_type_name_len(local) > 4
         if *(lv_type_name(local) + 0) == 'V' and *(lv_type_name(local) + 1) == 'e' and *(lv_type_name(local) + 2) == 'c' and *(lv_type_name(local) + 3) == '$'
-            return emit_vec_ptr_index(s, local.reg, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, e.right)
+            *out = emit_vec_ptr_index(s, local.reg, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, e.right)
+            return 1
 
+    0
+
+# `v[i]` on a Vec / Span / String local.
+fn try_emit_index_struct_local(s: *EmitterState, e: *Expr, local: *LocalVar, out: *i32) -> i32
     if e.left.kind == ExprKind.Ident and local != null and lv_var_type(local) == TypeKind.Struct and lv_type_name_len(local) >= 5
         if *(lv_type_name(local) + 0) == 'S' and *(lv_type_name(local) + 1) == 'p' and *(lv_type_name(local) + 2) == 'a' and *(lv_type_name(local) + 3) == 'n' and *(lv_type_name(local) + 4) == '$'
             let idx_s: i32 = emit_expr(s, e.right)
@@ -1193,25 +1211,107 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             match elem_kind_s
                 TypeKind.U8 =>
                     let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, val_s)
-                    return ext
+                    *out = ext
+                    return 1
                 TypeKind.I8 =>
                     let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, val_s)
-                    return ext
+                    *out = ext
+                    return 1
                 TypeKind.I32 =>
                     let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, val_s)
-                    return ext
+                    *out = ext
+                    return 1
                 TypeKind.U32 =>
                     let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, val_s)
-                    return ext
+                    *out = ext
+                    return 1
                 TypeKind.I16 =>
                     let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, val_s)
-                    return ext
+                    *out = ext
+                    return 1
                 TypeKind.U16 =>
                     let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, val_s)
-                    return ext
+                    *out = ext
+                    return 1
                 _ => pass
-            return val_s
+            *out = val_s
+            return 1
 
+    0
+
+# `s.f[i]` with `f: [N]T` inline in s: the element at `mr`'s field address, 1
+# (result in *out) when lowered.
+fn try_emit_index_field_array(s: *EmitterState, e: *Expr, mr: *MemberPtrResult, field: *StructField, out: *i32) -> i32
+    let et: TypeKind = field.array_elem_type
+    # AGAST #2996: a whole struct element is a copy only.
+    if et == TypeKind.Struct and field.array_elem_type_name_len > 0 and whole_struct_elem_refused(s, e) == 1
+        *out = 0
+        return 1
+    # Array field in struct - GEP directly into it
+    let idx: i32 = emit_expr(s, e.right)
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, elem_ptr)
+    emit_str(s, IR_GEP_ARRAY)
+    emit_int(s, field.array_size as i64)
+    emit_str(s, IR_X)
+    if et == TypeKind.Struct and field.array_elem_type_name_len > 0
+        # AGAST #188: struct-array RHS — `[N x %T]` so the GEP
+        # element stride matches the actual struct layout.  Without
+        # this, `doc.fields[i + 1]` (RHS-read) used `[64 x i64]`
+        # GEP and `load i64`, but the LHS expects `%FieldEntry`,
+        # tripping clang's IR-verifier on `store %FieldEntry %i64val`
+        # in mausoleum doc_remove_field's compaction loop.
+        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })
+    else
+        # AGAST #1814: the field's declared element type.
+        emit_str(s, elem_mem_llvm(et))
+    emit_str(s, IR_RBRACK_PTR)
+    emit_reg(s, mr.reg)
+    emit_str(s, IR_I64_ZERO)
+    emit_reg(s, idx)
+    emit_str(s, IR_NL)
+    # Load element. Integer/pointer elements load at their own
+    # width (array_elem_llvm) and widen to i64. Bool loads its i1
+    # and zero-extends. AGAST #1954: f32 / f64 elements load the
+    # field's own `float` / `double` (field_array_elem_llvm) and
+    # are returned as-is, as #1966's `loc[i]` and #1973's `p[i]`
+    # are; get_expr_type reports F32 / F64 for them. They used to
+    # fail closed (f32) or bit-load an i64 (f64).
+    var load_ty: *u8 = elem_mem_llvm(et)
+    if et == TypeKind.Bool or et == TypeKind.F32 or et == TypeKind.F64
+        load_ty = elem_mem_llvm(et)
+    let result: i32 = next_reg(s)
+    if et == TypeKind.Struct and field.array_elem_type_name_len > 0
+        # AGAST #188: load the struct value as `%T`, not as i64.
+        emit_struct_load_or_defer(s, TypeKind.Struct, result, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }, elem_ptr, null, 0)
+    else
+        emit_str(s, IR_INDENT)
+        emit_reg(s, result)
+        emit_str(s, IR_LOAD)
+        emit_str(s, load_ty)
+        emit_str(s, IR_PTR_SEP)
+        emit_reg(s, elem_ptr)
+        emit_str(s, IR_NL)
+    if et == TypeKind.Struct and field.array_elem_type_name_len > 0
+        *out = result
+        return 1
+    match et
+        TypeKind.F32 | TypeKind.F64 =>
+            *out = result
+            return 1
+        TypeKind.Bool =>
+            let bext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result)
+            *out = bext
+            return 1
+        _ => pass
+    # Extend to i64 if needed (zext unsigned, sext signed,
+    # ptrtoint pointers; i64 as-is).
+    *out = emit_array_elem_widen(s, result, et, load_ty)
+    return 1
+
+# `s.field[i]`: an array, Vec, Span or pointer field.
+fn try_emit_index_member(s: *EmitterState, e: *Expr, out: *i32) -> i32
     # Check for struct member array access: s.field[idx] where field is an array
     if e.left.kind == ExprKind.Member
         var member_result: MemberPtrResult
@@ -1219,68 +1319,7 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         if member_result.success == 1
             let field: *StructField = member_result.field
             if field.field_type == TypeKind.Array
-                let et: TypeKind = field.array_elem_type
-                # AGAST #2996: a whole struct element is a copy only.
-                if et == TypeKind.Struct and field.array_elem_type_name_len > 0 and whole_struct_elem_refused(s, e) == 1
-                    return 0
-                # Array field in struct - GEP directly into it
-                let idx: i32 = emit_expr(s, e.right)
-                let elem_ptr: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, elem_ptr)
-                emit_str(s, IR_GEP_ARRAY)
-                emit_int(s, field.array_size as i64)
-                emit_str(s, IR_X)
-                if et == TypeKind.Struct and field.array_elem_type_name_len > 0
-                    # AGAST #188: struct-array RHS — `[N x %T]` so the GEP
-                    # element stride matches the actual struct layout.  Without
-                    # this, `doc.fields[i + 1]` (RHS-read) used `[64 x i64]`
-                    # GEP and `load i64`, but the LHS expects `%FieldEntry`,
-                    # tripping clang's IR-verifier on `store %FieldEntry %i64val`
-                    # in mausoleum doc_remove_field's compaction loop.
-                    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })
-                else
-                    # AGAST #1814: the field's declared element type.
-                    emit_str(s, elem_mem_llvm(et))
-                emit_str(s, IR_RBRACK_PTR)
-                emit_reg(s, member_result.reg)
-                emit_str(s, IR_I64_ZERO)
-                emit_reg(s, idx)
-                emit_str(s, IR_NL)
-                # Load element. Integer/pointer elements load at their own
-                # width (array_elem_llvm) and widen to i64. Bool loads its i1
-                # and zero-extends. AGAST #1954: f32 / f64 elements load the
-                # field's own `float` / `double` (field_array_elem_llvm) and
-                # are returned as-is, as #1966's `loc[i]` and #1973's `p[i]`
-                # are; get_expr_type reports F32 / F64 for them. They used to
-                # fail closed (f32) or bit-load an i64 (f64).
-                var load_ty: *u8 = elem_mem_llvm(et)
-                if et == TypeKind.Bool or et == TypeKind.F32 or et == TypeKind.F64
-                    load_ty = elem_mem_llvm(et)
-                let result: i32 = next_reg(s)
-                if et == TypeKind.Struct and field.array_elem_type_name_len > 0
-                    # AGAST #188: load the struct value as `%T`, not as i64.
-                    emit_struct_load_or_defer(s, TypeKind.Struct, result, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }, elem_ptr, null, 0)
-                else
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, result)
-                    emit_str(s, IR_LOAD)
-                    emit_str(s, load_ty)
-                    emit_str(s, IR_PTR_SEP)
-                    emit_reg(s, elem_ptr)
-                    emit_str(s, IR_NL)
-                if et == TypeKind.Struct and field.array_elem_type_name_len > 0
-                    return result
-                match et
-                    TypeKind.F32 | TypeKind.F64 =>
-                        return result
-                    TypeKind.Bool =>
-                        let bext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result)
-                        return bext
-                    _ => pass
-                # Extend to i64 if needed (zext unsigned, sext signed,
-                # ptrtoint pointers; i64 as-is).
-                return emit_array_elem_widen(s, result, et, load_ty)
+                return try_emit_index_field_array(s, e, @member_result, field, out)
             # AGAST #184: `obj.fwd[i]` value-read where `fwd: **Foo` is a
             # pointer to an array of *Foo (skip-list / hash-bucket pattern).
             # Pre-fix this fell through to "; ERROR: unhandled EXPR_MEMBER"
@@ -1305,7 +1344,8 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 let val_pp: i32 = next_reg(s)
                 emit_load_into(s, IR_TY_PTR, val_pp, slot_pp)
                 let pti_pp: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, val_pp)
-                return pti_pp
+                *out = pti_pp
+                return 1
             # AGAST #1596: `x.f[i]` value-read with `f: *T` (primitive int
             # pointee) or `**T`: load the pointer from the field, GEP by the
             # pointee width, load and widen. Without this arm the read fell
@@ -1327,7 +1367,8 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 emit_str(s, IR_PTR_SEP)
                 emit_reg(s, pf_ptr)
                 emit_str(s, IR_NL)
-                return emit_array_elem_widen(s, pf_val, pf_kind, pf_ty)
+                *out = emit_array_elem_widen(s, pf_val, pf_kind, pf_ty)
+                return 1
             # AGAST #3972: `x.f[i]` with `f: *S`, the whole S by value, as
             # `p[i]` on a `*S` local is (#3052).  It took the byte path below:
             # one `load i8`, stored as the %S (lexis's
@@ -1335,12 +1376,14 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             # clang refused.  A Vec, Span or String pointee indexes through.
             else if ptr_field_struct_elem(s, field) == 1
                 if whole_struct_elem_refused(s, e) == 1
-                    return 0
+                    *out = 0
+                    return 1
                 let ps_idx: i32 = emit_expr(s, e.right)
                 let ps_ptr: i32 = emit_ptr_field_elem_addr(s, member_result.reg, field, TypeKind.Struct, ps_idx)
                 let ps_val: i32 = next_reg(s)
                 emit_struct_load_or_defer(s, TypeKind.Struct, ps_val, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }, ps_ptr, null, 0)
-                return ps_val
+                *out = ps_val
+                return 1
             # Port of ritz0 bedc85b: Vec<T> field indexing — s.vec_field[i]
             # The field is a Vec$T struct: { *T data, i64 len, i64 cap }.
             # We already have a ptr to the Vec struct in member_result.reg; load
@@ -1414,25 +1457,36 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                     match elem_kind
                         TypeKind.I32 =>
                             let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, val_reg)
-                            return ext
+                            *out = ext
+                            return 1
                         TypeKind.U32 =>
                             let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, val_reg)
-                            return ext
+                            *out = ext
+                            return 1
                         TypeKind.I16 =>
                             let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, val_reg)
-                            return ext
+                            *out = ext
+                            return 1
                         TypeKind.U16 =>
                             let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, val_reg)
-                            return ext
+                            *out = ext
+                            return 1
                         TypeKind.I8 =>
                             let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, val_reg)
-                            return ext
+                            *out = ext
+                            return 1
                         TypeKind.U8 =>
                             let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, val_reg)
-                            return ext
+                            *out = ext
+                            return 1
                         _ => pass
-                    return val_reg
+                    *out = val_reg
+                    return 1
 
+    0
+
+# `mk()[i]` on a call's Vec / Span / pointer result.
+fn try_emit_index_call(s: *EmitterState, e: *Expr, out: *i32) -> i32
     # Port of ritz0 bedc85b: Vec<T> indexing on call receiver — mk()[i].
     # When the index base is a call returning Vec<T>, spill the returned
     # struct to a stack slot, then GEP to the data pointer + index.
@@ -1515,25 +1569,36 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 match elem_kind2
                     TypeKind.I32 =>
                         let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, val2)
-                        return ext
+                        *out = ext
+                        return 1
                     TypeKind.U32 =>
                         let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, val2)
-                        return ext
+                        *out = ext
+                        return 1
                     TypeKind.I16 =>
                         let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, val2)
-                        return ext
+                        *out = ext
+                        return 1
                     TypeKind.U16 =>
                         let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, val2)
-                        return ext
+                        *out = ext
+                        return 1
                     TypeKind.I8 =>
                         let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, val2)
-                        return ext
+                        *out = ext
+                        return 1
                     TypeKind.U8 =>
                         let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, val2)
-                        return ext
+                        *out = ext
+                        return 1
                     _ => pass
-                return val2
+                *out = val2
+                return 1
 
+    0
+
+# The fallback: `p[i]` through a pointer by its pointee, or a byte.
+fn emit_index_through_ptr(s: *EmitterState, e: *Expr, base_type: TypeKind, elem_pointee: TypeKind) -> i32
     # AGAST #2537: `(*r)[i]` with `r: **T` GEPs and loads T (get_expr_type's
     # deref_index_elem), widened as an array element is.  It took the byte
     # path below: wrong values on an integer, invalid IR on a float.
@@ -1625,6 +1690,48 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
 
         let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, result)
         return ext
+
+pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
+    var idx_reg: i32 = 0
+    if try_emit_index_early(s, e, @idx_reg) == 1
+        return idx_reg
+
+    # Check if base is an array, pointer-to-pointer (e.g., argv: **u8), or pointer
+    #
+    # AGAST #1328: resolve the base through locals THEN globals, and carry the
+    # pointee kind so the fallback pointer path below can load the element at
+    # its real width.  Previously (a) a global base hit find_local_type's
+    # TypeKind.I64 miss value and fell into the byte path (`g[i]` on a global
+    # *i32 read one byte of a 4-byte slot), and (b) even for locals there was
+    # no pointee-typed path at all — `p[i]` on a local *i32 also byte-loaded.
+    var base_type: TypeKind = TypeKind.Ptr
+    var elem_pointee: TypeKind = TypeKind.Unknown
+    var local: *LocalVar = null
+    if e.left.kind == ExprKind.Ident
+        base_type = find_local_type(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+        local = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+        if base_type == TypeKind.Unknown
+            let glob: *GlobalVarDef = find_global(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+            if glob != null
+                base_type = glob.var_type
+                elem_pointee = glob.pointee_type
+            else
+                # Neither local nor global: preserve the historical byte-path
+                # default rather than letting TypeKind.Unknown leak downstream.
+                base_type = TypeKind.Ptr
+        else if local != null
+            elem_pointee = lv_pointee_type(local)
+
+    if try_emit_index_named(s, e, base_type, local, @idx_reg) == 1
+        return idx_reg
+    if try_emit_index_struct_local(s, e, local, @idx_reg) == 1
+        return idx_reg
+    if try_emit_index_member(s, e, @idx_reg) == 1
+        return idx_reg
+    if try_emit_index_call(s, e, @idx_reg) == 1
+        return idx_reg
+    emit_index_through_ptr(s, e, base_type, elem_pointee)
+
 
 # Build a `%Enum` value whose tag is `tag` (alloca + zero + store i8 + load),
 # for a unit variant: the qualified `Shade.Light` (emit_expr_member) and,
