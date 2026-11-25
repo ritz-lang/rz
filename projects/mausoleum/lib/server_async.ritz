@@ -62,7 +62,8 @@ import cryptosec.crypto_error
 import mausoleum.session_kdf
 import cryptosec.random
 import cryptosec.mem
-import ritzlib.memory { secure_zero, malloc, free }
+import ritzlib.memory { malloc, free }
+import ritzlib.gvec
 import ritzlib.span
 
 
@@ -219,9 +220,9 @@ pub fn m7sp_session_destroy(idx: i32)
 
     # Zero key material before clearing the slot so it can never leak
     # into a subsequent session reusing the same index.
-    secure_zero(@g_sessions[idx].cipher_private_key[0], 32)
-    secure_zero(@g_sessions[idx].cipher_send_key[0], 32)
-    secure_zero(@g_sessions[idx].cipher_recv_key[0], 32)
+    span_from_ptr<u8>(@g_sessions[idx].cipher_private_key[0], 32).secure_zero()
+    span_from_ptr<u8>(@g_sessions[idx].cipher_send_key[0], 32).secure_zero()
+    span_from_ptr<u8>(@g_sessions[idx].cipher_recv_key[0], 32).secure_zero()
     g_sessions[idx].cipher_send_nonce = 0
     g_sessions[idx].cipher_recv_nonce = 0
 
@@ -286,7 +287,7 @@ fn cipher_derive_session_keys(session: *M7SPSession) -> i32
     # nothing and fails the handshake (#2763).
     var okm: [64]u8
     let rc: i32 = session_kdf_derive(@shared[0], @okm[0], SESSION_KDF_OKM_LEN)
-    secure_zero(@shared[0], 32)
+    span_from_ptr<u8>(@shared[0], 32).secure_zero()
     if rc != 0
         return -1
 
@@ -295,7 +296,7 @@ fn cipher_derive_session_keys(session: *M7SPSession) -> i32
     mem_copy(@session.cipher_send_key[0], @okm[0], 32)
     mem_copy(@session.cipher_recv_key[0], @okm[32], 32)
 
-    secure_zero(@okm[0], 64)
+    span_from_ptr<u8>(@okm[0], 64).secure_zero()
     return 0
 
 
@@ -625,7 +626,8 @@ pub fn async_handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id
     var doc_id: DocumentId
     doc_id.value = doc_id_val
 
-    let doc_buf: *u8 = malloc(MAX_DOC_SIZE)
+    var doc_buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
+    let doc_buf: *u8 = doc_buf_vec.as_ptr()
     if doc_buf == null
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
         return
@@ -642,7 +644,6 @@ pub fn async_handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id
         print_i64(doc_size)
         prints("\n")
         build_get_ok(resp, request_id, doc_buf, doc_size as i32)
-    free(doc_buf)
 
 
 # UPDATE — payload: [doc_data_len: i32][doc_data: bytes]
@@ -772,7 +773,8 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
     var batch_count: i32 = 0
     var done: i32 = 0
     var key_buf: [16]u8
-    let val_buf: *u8 = malloc(MAX_DOC_SIZE)
+    var val_buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
+    let val_buf: *u8 = val_buf_vec.as_ptr()
 
     let batch_target: i32 = 16          # safety cap on per-batch doc count
     let batch_byte_budget: i32 = 7000   # ~1.2 KiB headroom in 8 KiB write_buf
@@ -821,9 +823,6 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
             session.scan_total_emitted += 1
 
             btree_iter_next(iter)
-
-    if val_buf != null
-        free(val_buf)
 
     var has_more: i32 = 1
     if done != 0
@@ -1068,7 +1067,8 @@ fn m7sp_dispatch_find(reader: *MessageReader, resp: *MessageBuffer, collection: 
     if field == null or field_len <= 0 or value_len < 0
         build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed find")
         return
-    let ids: *i64 = malloc(FIND_MAX_IDS as i64 * 8) as *i64
+    var ids_vec: Vec<i64> = vec_with_cap<i64>(FIND_MAX_IDS as i64)
+    let ids: *i64 = ids_vec.as_ptr()
     if ids == null
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
         return
@@ -1079,7 +1079,6 @@ fn m7sp_dispatch_find(reader: *MessageReader, resp: *MessageBuffer, collection: 
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
     else
         build_find_result(resp, request_id, ids, rc)
-    free(ids as *u8)
 
 
 # ============================================================================

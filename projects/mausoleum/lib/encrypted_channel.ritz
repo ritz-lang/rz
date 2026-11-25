@@ -183,9 +183,9 @@ pub fn channel_init_server(ch: *EncryptedChannel, sock: Socket) -> i32
 # Free channel resources
 pub fn channel_free(ch: *EncryptedChannel)
     # Zero sensitive key material
-    secure_zero(@ch.private_key[0], 32)
-    secure_zero(@ch.send_key[0], 32)
-    secure_zero(@ch.recv_key[0], 32)
+    span_from_ptr<u8>(@ch.private_key[0], 32).secure_zero()
+    span_from_ptr<u8>(@ch.send_key[0], 32).secure_zero()
+    span_from_ptr<u8>(@ch.recv_key[0], 32).secure_zero()
 
     ch.recv_buf.deinit()
 
@@ -222,7 +222,7 @@ fn derive_keys(ch: *EncryptedChannel, shared_secret: *u8) -> i32
         mem_copy(@ch.send_key[0], @okm[32], 32)
 
     # Zero intermediate values
-    secure_zero(@okm[0], 64)
+    span_from_ptr<u8>(@okm[0], 64).secure_zero()
     return 0
 
 # ============================================================================
@@ -262,7 +262,7 @@ pub fn channel_handshake_client(ch: *EncryptedChannel) -> i32
 
     # Derive keys; a refused KDF fails the handshake (#2763)
     let dk: i32 = derive_keys(ch, @shared[0])
-    secure_zero(@shared[0], 32)
+    span_from_ptr<u8>(@shared[0], 32).secure_zero()
     if dk != 0
         ch.state = CHANNEL_STATE_ERROR
         ch.last_error = CHANNEL_ERR_HANDSHAKE
@@ -304,7 +304,7 @@ pub fn channel_handshake_server(ch: *EncryptedChannel) -> i32
 
     # Derive keys; a refused KDF fails the handshake (#2763)
     let dk: i32 = derive_keys(ch, @shared[0])
-    secure_zero(@shared[0], 32)
+    span_from_ptr<u8>(@shared[0], 32).secure_zero()
     if dk != 0
         ch.state = CHANNEL_STATE_ERROR
         ch.last_error = CHANNEL_ERR_HANDSHAKE
@@ -344,7 +344,8 @@ pub fn channel_send(ch: *EncryptedChannel, data: *u8, len: i32) -> i32
     # Prepare message buffer:
     # [length: 4 BE][nonce: 12][ciphertext: len][tag: 16]
     var msg_len: i32 = 4 + CHANNEL_NONCE_SIZE + len + CHANNEL_TAG_SIZE
-    var msg: *u8 = malloc(msg_len as i64) as *u8
+    var msg_vec: Vec<u8> = vec_with_cap<u8>(msg_len as i64)
+    let msg: *u8 = msg_vec.as_ptr()
     if msg == null
         ch.last_error = CHANNEL_ERR_BUFFER
         return -3
@@ -371,17 +372,14 @@ pub fn channel_send(ch: *EncryptedChannel, data: *u8, len: i32) -> i32
         Ok(_) => pass
         Err(_) =>
             # Nothing was written; the nonce is burned, never reused.
-            free(msg)
             ch.last_error = CHANNEL_ERR_ENCRYPT
             return -5
 
     # Send message
     if not send_bytes(@&ch.sock, msg, msg_len as i64)
-        free(msg)
         ch.last_error = CHANNEL_ERR_IO
         return -4
 
-    free(msg)
     return len
 
 # Receive encrypted message

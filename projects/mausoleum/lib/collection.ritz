@@ -10,6 +10,7 @@ import ritzlib.strview
 import ritzlib.span
 
 import ritzlib.memory
+import ritzlib.gvec
 
 import mausoleum.m7m_types
 import mausoleum.page
@@ -646,12 +647,12 @@ fn current_chain(col: *Collection, key: *u8) -> i64
 # Serialize `doc` and store it under `key`: inline, or in a new chain (the
 # old chain, if any, is freed once the new value is in).
 fn store_doc(col: *Collection, key: *u8, doc: *Document) -> i32
-    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
+    let buf: *u8 = buf_vec.as_ptr()
     if buf == null
         return ERR_NO_MEMORY
     let size: i64 = doc_serialize(doc, buf, MAX_DOC_SIZE)
     if size < 0
-        free(buf)
         return ERR_FULL
 
     let old_chain: i64 = current_chain(col, key)
@@ -664,7 +665,6 @@ fn store_doc(col: *Collection, key: *u8, doc: *Document) -> i32
         rc = btree_put(col.tree, key, 8, val, val_len as i32)
         if rc != ERR_OK and chain != INVALID_PAGE_ID
             overflow_free(col.pool, chain)
-    free(buf)
     if rc == ERR_OK and old_chain != INVALID_PAGE_ID
         overflow_free(col.pool, old_chain)
     return rc
@@ -766,9 +766,11 @@ pub fn collection_update(col: *Collection, doc: *Document) -> i32
     var indexed: bool = col.indexes != null and field_index_count(col.indexes) > 0
     var old_doc: Document
     var have_old: bool = false
+    var old_vec: Vec<u8> = vec_new<u8>()
     var old_buf: *u8 = null
     if indexed
-        old_buf = malloc(MAX_DOC_SIZE)
+        old_vec = vec_with_cap<u8>(MAX_DOC_SIZE)
+        old_buf = old_vec.as_ptr()
         if old_buf != null
             var old_len: i64 = 0
             if collection_get_raw(col, @doc.id, old_buf, MAX_DOC_SIZE, @old_len) == ERR_OK
@@ -787,15 +789,11 @@ pub fn collection_update(col: *Collection, doc: *Document) -> i32
     if store_rc != ERR_OK
         if indexed and have_old
             field_index_insert_doc(col.indexes, @old_doc)   # put them back
-        if old_buf != null
-            free(old_buf)
         return store_rc
 
     if indexed
         if field_index_insert_doc(col.indexes, doc) != ERR_OK
             field_index_drop_all(col.indexes)
-    if old_buf != null
-        free(old_buf)
     return ERR_OK
 
 pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
@@ -811,7 +809,8 @@ pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
     # (AGAST #3644).  If they can't be kept exact, drop the index: a
     # lookup then falls back to a scan.
     if col.indexes != null and field_index_count(col.indexes) > 0
-        var dbuf: *u8 = malloc(MAX_DOC_SIZE)
+        var dbuf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
+        let dbuf: *u8 = dbuf_vec.as_ptr()
         if dbuf != null
             var dlen: i64 = 0
             if collection_get_raw(col, id, dbuf, MAX_DOC_SIZE, @dlen) == ERR_OK
@@ -819,7 +818,6 @@ pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
                 if doc_deserialize(dbuf, dlen, @old_doc) == ERR_OK
                     if field_index_delete_doc(col.indexes, @old_doc) != ERR_OK
                         field_index_drop_all(col.indexes)
-            free(dbuf)
 
     # Delete from B-tree, then give back its overflow chain if it had one.
     let chain: i64 = current_chain(col, @key[0])
@@ -859,7 +857,8 @@ pub fn collection_index_create(col: *Collection, field: *u8, field_len: i32) -> 
         field_index_drop_all(col.indexes)
         return ERR_NO_MEMORY
     let iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
-    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    var buf_vec: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE)
+    let buf: *u8 = buf_vec.as_ptr()
     if buf == null
         btree_iter_destroy(iter)
         field_index_drop_all(col.indexes)
@@ -876,7 +875,6 @@ pub fn collection_index_create(col: *Collection, field: *u8, field_len: i32) -> 
                     break
         btree_iter_next(iter)
     btree_iter_destroy(iter)
-    free(buf)
 
     if build_rc != ERR_OK
         field_index_drop_all(col.indexes)

@@ -21,6 +21,7 @@ import ritzlib.str
 import ritzlib.memory
 import ritzlib.option
 import ritzlib.string
+import ritzlib.gvec
 
 import mausoleum.m7m_types
 import mausoleum.page
@@ -32,6 +33,7 @@ import mausoleum.wal
 # ============================================================================
 
 const MAX_ACTIVE_TXNS: i64 = 256    # Max concurrent transactions
+const MAX_COMMITTED_TXNS: i64 = 1024 # Committed txn IDs tracked for visibility
 
 # Transaction states
 const TXN_INVALID: i32 = 0          # Invalid/uninitialized
@@ -64,13 +66,12 @@ struct TxnManager
     commit_ts: i64                  # Global commit timestamp counter
 
     # Active transaction tracking
-    active_txns: *Txn               # Array of active transaction slots
+    active_txns: Vec<Txn>           # MAX_ACTIVE_TXNS transaction slots
     active_count: i64               # Number of active transactions
 
-    # Committed transaction tracking (for visibility)
-    committed_txns: *i64            # Array of committed txn IDs
-    committed_count: i64            # Number of committed txns tracked
-    committed_capacity: i64         # Capacity of committed array
+    # Committed transaction tracking (for visibility): up to
+    # MAX_COMMITTED_TXNS ids, oldest first
+    committed_txns: Vec<i64>
 
 # ============================================================================
 # Transaction Manager Creation/Destruction
@@ -80,47 +81,34 @@ pub fn txn_mgr_new(pool: *BufferPool, wal_path: *u8) -> *TxnManager
     if pool == null or wal_path == null
         return null
 
-    let mgr: *TxnManager = malloc(sizeof(TxnManager)) as *TxnManager
-    if mgr == null
-        return null
-
     # Copy WAL path
     var path_copy: String = match m7m_path_copy(wal_path)
         Some(s) => s
-        None =>
-            free(mgr as *u8)
-            return null
+        None => return null
 
-    # Allocate active transaction slots
-    let active_size: i64 = MAX_ACTIVE_TXNS * sizeof(Txn)
-    let active_txns: *Txn = malloc(active_size) as *Txn
-    if active_txns == null
-        free(mgr as *u8)
+    # Active transaction slots, all TXN_INVALID (zero)
+    var active_txns: Vec<Txn> = vec_with_cap<Txn>(MAX_ACTIVE_TXNS)
+    # Committed transaction tracking
+    var committed_txns: Vec<i64> = vec_with_cap<i64>(MAX_COMMITTED_TXNS)
+    if active_txns.cap() < MAX_ACTIVE_TXNS or committed_txns.cap() < MAX_COMMITTED_TXNS
         return null
-    memset(active_txns as *u8, 0, active_size)
-
-    # Allocate committed transaction tracking
-    let committed_capacity: i64 = 1024
-    let committed_txns: *i64 = malloc(committed_capacity * 8) as *i64
-    if committed_txns == null
-        free(active_txns as *u8)
-        free(mgr as *u8)
-        return null
+    memset(active_txns.as_ptr() as *u8, 0, MAX_ACTIVE_TXNS * sizeof(Txn))
 
     # Create WAL writer
     let wal_writer: *WalWriter = wal_writer_new(wal_path)
     if wal_writer == null
-        free(committed_txns as *u8)
-        free(active_txns as *u8)
-        free(mgr as *u8)
         return null
 
     let open_result: i32 = wal_writer_open(wal_writer)
     if open_result != ERR_OK
         wal_writer_destroy(wal_writer)
-        free(committed_txns as *u8)
-        free(active_txns as *u8)
-        free(mgr as *u8)
+        return null
+
+    # The manager itself, last: every failure above has nothing to free
+    # but what drops on return.
+    let mgr: *TxnManager = malloc(sizeof(TxnManager)) as *TxnManager
+    if mgr == null
+        wal_writer_destroy(wal_writer)
         return null
 
     # Initialize
@@ -132,8 +120,6 @@ pub fn txn_mgr_new(pool: *BufferPool, wal_path: *u8) -> *TxnManager
     mgr.active_txns = active_txns
     mgr.active_count = 0
     mgr.committed_txns = committed_txns
-    mgr.committed_count = 0
-    mgr.committed_capacity = committed_capacity
 
     return mgr
 
@@ -144,7 +130,7 @@ pub fn txn_mgr_destroy(mgr: *TxnManager)
     # Abort any active transactions
     var i: i64 = 0
     while i < MAX_ACTIVE_TXNS
-        let txn: *Txn = mgr.active_txns + i
+        let txn: *Txn = mgr.active_txns.get_ptr(i)
         if txn.state == TXN_ACTIVE
             txn.state = TXN_ABORTED
         i += 1
@@ -152,12 +138,9 @@ pub fn txn_mgr_destroy(mgr: *TxnManager)
     if mgr.wal_writer != null
         wal_writer_destroy(mgr.wal_writer)
 
-    if mgr.committed_txns != null
-        free(mgr.committed_txns as *u8)
-
-    if mgr.active_txns != null
-        free(mgr.active_txns as *u8)
-
+    # Raw memory doesn't drop its fields: release them before the block
+    mgr.committed_txns.deinit()
+    mgr.active_txns.deinit()
     mgr.wal_path.deinit()
 
     free(mgr as *u8)
@@ -174,7 +157,7 @@ pub fn txn_begin(mgr: *TxnManager) -> *Txn
     var slot: *Txn = null
     var i: i64 = 0
     while i < MAX_ACTIVE_TXNS
-        let candidate: *Txn = mgr.active_txns + i
+        let candidate: *Txn = mgr.active_txns.get_ptr(i)
         if candidate.state == TXN_INVALID or candidate.state == TXN_COMMITTED or candidate.state == TXN_ABORTED
             slot = candidate
             i = MAX_ACTIVE_TXNS  # Break
@@ -232,9 +215,8 @@ pub fn txn_commit(txn: *Txn) -> i32
     mgr.commit_ts += 1
 
     # Track as committed for visibility
-    if mgr.committed_count < mgr.committed_capacity
-        mgr.committed_txns[mgr.committed_count] = txn.id
-        mgr.committed_count += 1
+    if mgr.committed_txns.len() < MAX_COMMITTED_TXNS
+        mgr.committed_txns.push(txn.id)
 
     return ERR_OK
 
@@ -336,15 +318,15 @@ fn is_committed_before(txn: *Txn, check_tid: i64) -> i32
 
     # Check if it's in the committed list
     var i: i64 = 0
-    while i < mgr.committed_count
-        if mgr.committed_txns[i] == check_tid
+    while i < mgr.committed_txns.len()
+        if mgr.committed_txns.get(i) == check_tid
             return 1
         i += 1
 
     # Also check active transactions - if it's active, it's not committed
     i = 0
     while i < MAX_ACTIVE_TXNS
-        let active: *Txn = mgr.active_txns + i
+        let active: *Txn = mgr.active_txns.get_ptr(i)
         if active.id == check_tid and active.state == TXN_ACTIVE
             return 0
         i += 1

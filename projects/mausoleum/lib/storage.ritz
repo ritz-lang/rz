@@ -30,6 +30,7 @@ import ritzlib.strview
 import ritzlib.string
 import ritzlib.span
 import ritzlib.memory
+import ritzlib.gvec
 import ritzlib.option
 
 import mausoleum.m7m_types
@@ -97,8 +98,8 @@ struct Storage
 
     # The collection table: meta.coll_count entries of MAX_COLLECTIONS, and
     # per entry 1 if it changed since the last commit (AGAST #3637).
-    colls: *NamedCollectionMeta
-    coll_dirty: *u8
+    colls: Vec<NamedCollectionMeta>   # MAX_COLLECTIONS slots
+    coll_dirty: Vec<u8>               # MAX_COLLECTIONS flags
 
     current_txn: i64        # Current active transaction ID (0 = none)
     meta_dirty: i32         # Some collection's meta changed since the last commit
@@ -193,18 +194,18 @@ fn meta_write(fd: @Fd, meta: *StorageMeta, colls: *NamedCollectionMeta) -> i32
     return ERR_OK
 
 fn storage_meta_write(storage: *Storage) -> i32
-    return meta_write(@storage.meta_fd, @storage.meta, storage.colls)
+    return meta_write(@storage.meta_fd, @storage.meta, storage.colls.as_ptr())
 
 # Every collection's meta is now on disk: nothing is dirty.
 fn storage_meta_clean(storage: *Storage)
     storage.meta_dirty = 0
-    memset(storage.coll_dirty, 0, MAX_COLLECTIONS as i64)
+    memset(storage.coll_dirty.as_ptr(), 0, MAX_COLLECTIONS as i64)
 
 # The table entry of collection `id`, or null.
 fn storage_entry(storage: *Storage, id: i32) -> *NamedCollectionMeta
     var i: i64 = 0
     while i < storage.meta.coll_count
-        let e: *NamedCollectionMeta = storage.colls + i
+        let e: *NamedCollectionMeta = storage.colls.as_ptr() + i
         if e.id == id as i64
             return e
         i += 1
@@ -213,7 +214,7 @@ fn storage_entry(storage: *Storage, id: i32) -> *NamedCollectionMeta
 fn storage_entry_index(storage: *Storage, id: i32) -> i64
     var i: i64 = 0
     while i < storage.meta.coll_count
-        let e: *NamedCollectionMeta = storage.colls + i
+        let e: *NamedCollectionMeta = storage.colls.as_ptr() + i
         if e.id == id as i64
             return i
         i += 1
@@ -228,16 +229,15 @@ fn storage_apply_recovered(storage: *Storage, rec: *NamedCollectionMeta) -> i32
         return ERR_OK
     if storage.meta.coll_count >= MAX_COLLECTIONS as i64
         return ERR_FULL
-    *(storage.colls + storage.meta.coll_count) = *rec
+    *(storage.colls.as_ptr() + storage.meta.coll_count) = *rec
     storage.meta.coll_count += 1
     return ERR_OK
 
 # Free what storage_open allocated, after a failure part-way through it.
 fn storage_open_fail(storage: *Storage)
-    if storage.colls != null
-        free(storage.colls as *u8)
-    if storage.coll_dirty != null
-        free(storage.coll_dirty)
+    # Raw memory doesn't drop its fields: release them before the block
+    storage.colls.deinit()
+    storage.coll_dirty.deinit()
     storage.base_path.deinit()
     free(storage as *u8)
 
@@ -266,13 +266,11 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
         return None
     storage.base_path = base_copy
     storage.base_path_len = path_len as i32
-    storage.colls = null
-    storage.coll_dirty = null
 
     # The collection table (AGAST #3637).
-    storage.colls = malloc(MAX_COLLECTIONS as i64 * sizeof(NamedCollectionMeta)) as *NamedCollectionMeta
-    storage.coll_dirty = malloc(MAX_COLLECTIONS as i64)
-    if storage.colls == null or storage.coll_dirty == null
+    storage.colls = vec_with_cap<NamedCollectionMeta>(MAX_COLLECTIONS as i64)
+    storage.coll_dirty = vec_with_cap<u8>(MAX_COLLECTIONS as i64)
+    if storage.colls.cap() < MAX_COLLECTIONS as i64 or storage.coll_dirty.cap() < MAX_COLLECTIONS as i64
         storage_open_fail(storage)
         return None
 
@@ -316,13 +314,13 @@ pub fn storage_open(path: *u8) -> Option<*Storage>
 
     # Read or initialize metadata
     if is_new != 0
-        meta_init(@storage.meta, storage.colls)
+        meta_init(@storage.meta, storage.colls.as_ptr())
         if storage_meta_write(storage) != ERR_OK
             meta_fd.close()
             storage_open_fail(storage)
             return None
     else
-        if meta_read(@meta_fd, @storage.meta, storage.colls) != ERR_OK
+        if meta_read(@meta_fd, @storage.meta, storage.colls.as_ptr()) != ERR_OK
             meta_fd.close()
             storage_open_fail(storage)
             return None
@@ -432,12 +430,9 @@ pub fn storage_destroy(storage: *Storage)
     if storage.is_open != 0
         storage_close(storage)
 
-    if storage.colls != null
-        free(storage.colls as *u8)
-        storage.colls = null
-    if storage.coll_dirty != null
-        free(storage.coll_dirty)
-        storage.coll_dirty = null
+    # Raw memory doesn't drop its fields: release them before the block
+    storage.colls.deinit()
+    storage.coll_dirty.deinit()
     free(storage as *u8)
 
 # ============================================================================
@@ -596,8 +591,8 @@ pub fn storage_wal_commit(storage: *Storage) -> i32
     # One META record per collection that changed (AGAST #3637).
     var c: i64 = 0
     while c < storage.meta.coll_count
-        if *(storage.coll_dirty + c) != 0
-            lsn = wal_write_named_meta(w, txn_id, lsn, storage.colls + c)
+        if *(storage.coll_dirty.as_ptr() + c) != 0
+            lsn = wal_write_named_meta(w, txn_id, lsn, storage.colls.as_ptr() + c)
             if lsn < 0
                 return ERR_IO
         c += 1
@@ -696,7 +691,7 @@ pub fn storage_collection_find(storage: *Storage, name: *u8, len: i32) -> i32
         return 0
     var i: i64 = 0
     while i < storage.meta.coll_count
-        let e: *NamedCollectionMeta = storage.colls + i
+        let e: *NamedCollectionMeta = storage.colls.as_ptr() + i
         if named_collection_meta_is(e, name, len) == 1
             return e.id as i32
         i += 1
@@ -717,14 +712,14 @@ pub fn storage_collection_create(storage: *Storage, name: *u8, len: i32) -> i32
     var max_id: i64 = 0
     var i: i64 = 0
     while i < count
-        let e: *NamedCollectionMeta = storage.colls + i
+        let e: *NamedCollectionMeta = storage.colls.as_ptr() + i
         if e.id > max_id
             max_id = e.id
         i += 1
     let id: i32 = (max_id + 1) as i32
-    named_collection_meta_init(storage.colls + count, id, name, len)
+    named_collection_meta_init(storage.colls.as_ptr() + count, id, name, len)
     storage.meta.coll_count = count + 1
-    *(storage.coll_dirty + count) = 1
+    *(storage.coll_dirty.as_ptr() + count) = 1
     storage.meta_dirty = 1
     return id
 
@@ -742,10 +737,10 @@ pub fn storage_set_collection_meta_of(storage: *Storage, id: i32, meta: *Collect
     let idx: i64 = storage_entry_index(storage, id)
     if idx < 0
         return ERR_NOT_FOUND
-    let e: *NamedCollectionMeta = storage.colls + idx
+    let e: *NamedCollectionMeta = storage.colls.as_ptr() + idx
     if not collection_meta_eq(@e.meta, meta)
         e.meta = *meta
-        *(storage.coll_dirty + idx) = 1
+        *(storage.coll_dirty.as_ptr() + idx) = 1
         storage.meta_dirty = 1
     return ERR_OK
 

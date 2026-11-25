@@ -44,6 +44,8 @@
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.span
 import ritzlib.option
 
 import mausoleum.m7m_types
@@ -99,7 +101,7 @@ struct BTreeIter
     tree: *BTree
     page_id: i64
     slot_idx: i32
-    end_key: *u8
+    end_key: Vec<u8>           # copy of the scan's end key (empty: none)
     end_key_len: i32
     exhausted: i32
 
@@ -1001,26 +1003,6 @@ pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, en
     if tree == null
         return None
 
-    let iter: *BTreeIter = malloc(sizeof(BTreeIter)) as *BTreeIter
-    if iter == null
-        return None
-
-    iter.tree = tree
-    iter.exhausted = 0
-
-    # Copy end key if provided
-    if end_key != null and end_len > 0
-        iter.end_key = malloc(end_len as i64)
-        if iter.end_key != null
-            memcpy(iter.end_key, end_key, end_len as i64)
-            iter.end_key_len = end_len
-        else
-            iter.end_key = null
-            iter.end_key_len = 0
-    else
-        iter.end_key = null
-        iter.end_key_len = 0
-
     # Navigate to starting leaf
     var page_id: i64 = tree.root_page_id
     var level: i32 = tree.height
@@ -1028,7 +1010,6 @@ pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, en
     while level > 1
         let page_opt = buffer_pool_fetch(tree.pool, page_id)
         if option_is_none<*Page>(@page_opt)
-            free(iter as *u8)
             return None
         let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
 
@@ -1042,24 +1023,36 @@ pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, en
         page_id = child_id
         level -= 1
 
-    iter.page_id = page_id
-
     # Find starting position in leaf
     let leaf_opt = buffer_pool_fetch(tree.pool, page_id)
     if option_is_none<*Page>(@leaf_opt)
-        if iter.end_key != null
-            free(iter.end_key)
-        free(iter as *u8)
         return None
     let leaf: *Page = option_unwrap_or<*Page>(@leaf_opt, null)
 
     var found: i32 = 0
+    var slot_idx: i32 = 0
     if start_key != null and start_len > 0
-        iter.slot_idx = find_key_position(leaf, start_key, start_len, @found)
-    else
-        iter.slot_idx = 0
+        slot_idx = find_key_position(leaf, start_key, start_len, @found)
 
     buffer_pool_unpin(tree.pool, page_id, 0)
+
+    # Copy end key if provided
+    var end_copy: Vec<u8> = vec_new<u8>()
+    var end_copy_len: i32 = 0
+    if end_key != null and end_len > 0
+        if end_copy.push_span(span_from_ptr<u8>(end_key, end_len as i64))
+            end_copy_len = end_len
+
+    # The iterator itself, last: a failure above frees only what drops
+    let iter: *BTreeIter = malloc(sizeof(BTreeIter)) as *BTreeIter
+    if iter == null
+        return None
+    iter.tree = tree
+    iter.exhausted = 0
+    iter.end_key = end_copy
+    iter.end_key_len = end_copy_len
+    iter.page_id = page_id
+    iter.slot_idx = slot_idx
 
     # The start key may sort after every key left in its leaf, or the leaf
     # may be empty: the scan begins in the next leaf with a key.
@@ -1108,7 +1101,7 @@ pub fn btree_iter_valid(iter: *BTreeIter) -> i32
         return 0
 
     # Check end key
-    if iter.end_key != null and iter.end_key_len > 0
+    if iter.end_key_len > 0
         var offset: i32 = 0
         var length: i32 = 0
         read_slot(page, iter.slot_idx, @offset, @length)
@@ -1116,7 +1109,7 @@ pub fn btree_iter_valid(iter: *BTreeIter) -> i32
         let key_len: i32 = read_key_len(entry)
         let key: *u8 = get_entry_key(entry)
 
-        let cmp: i32 = key_compare(key, key_len, iter.end_key, iter.end_key_len)
+        let cmp: i32 = key_compare(key, key_len, iter.end_key.as_ptr(), iter.end_key_len)
         if cmp >= 0
             buffer_pool_unpin(iter.tree.pool, iter.page_id, 0)
             return 0
@@ -1186,9 +1179,8 @@ pub fn btree_iter_destroy(iter: *BTreeIter)
     if iter == null
         return
 
-    if iter.end_key != null
-        free(iter.end_key)
-
+    # Raw memory doesn't drop its fields: release the key copy before the block
+    iter.end_key.deinit()
     free(iter as *u8)
 
 # Get the root page ID of the B-tree

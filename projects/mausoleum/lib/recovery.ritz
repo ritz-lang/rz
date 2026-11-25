@@ -16,6 +16,7 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.memory
+import ritzlib.gvec
 import ritzlib.string
 import ritzlib.option
 
@@ -67,7 +68,7 @@ struct RecoveryManager
     wal_path: String              # Base path for WAL files
 
     # Active transaction table
-    txn_table: *TxnEntry        # Array of active transactions
+    txn_table: Vec<TxnEntry>    # MAX_ACTIVE_TXNS slots; txn_count in use
     txn_count: i64              # Number of entries in txn_table
 
     # Recovery stats
@@ -75,7 +76,7 @@ struct RecoveryManager
 
     # The last committed WAL_REC_META of each collection seen by redo:
     # meta_count entries of a MAX_COLLECTIONS table (AGAST #3637).
-    metas: *NamedCollectionMeta
+    metas: Vec<NamedCollectionMeta>   # MAX_COLLECTIONS slots; meta_count in use
     meta_count: i32
 
 # ============================================================================
@@ -86,28 +87,21 @@ pub fn recovery_mgr_new(pool: *BufferPool, wal_path: *u8) -> *RecoveryManager
     if pool == null or wal_path == null
         return null
 
-    let mgr: *RecoveryManager = malloc(sizeof(RecoveryManager)) as *RecoveryManager
-    if mgr == null
-        return null
-
     # Copy WAL path
     var path_copy: String = match m7m_path_copy(wal_path)
         Some(s) => s
-        None =>
-            free(mgr as *u8)
-            return null
+        None => return null
 
     # Allocate transaction table. Size by sizeof: a literal 24 undersized the
     # 32-byte TxnEntry and overflowed past 192 transactions (AGAST #3683).
-    let txn_table: *TxnEntry = malloc(MAX_ACTIVE_TXNS * sizeof(TxnEntry)) as *TxnEntry
-    if txn_table == null
-        free(mgr as *u8)
+    var txn_table: Vec<TxnEntry> = vec_with_cap<TxnEntry>(MAX_ACTIVE_TXNS)
+    var metas: Vec<NamedCollectionMeta> = vec_with_cap<NamedCollectionMeta>(MAX_COLLECTIONS as i64)
+    if txn_table.cap() < MAX_ACTIVE_TXNS or metas.cap() < MAX_COLLECTIONS as i64
         return null
 
-    let metas: *NamedCollectionMeta = malloc(MAX_COLLECTIONS as i64 * sizeof(NamedCollectionMeta)) as *NamedCollectionMeta
-    if metas == null
-        free(txn_table as *u8)
-        free(mgr as *u8)
+    # The manager itself, last: a failure above frees only what drops on return
+    let mgr: *RecoveryManager = malloc(sizeof(RecoveryManager)) as *RecoveryManager
+    if mgr == null
         return null
 
     # Initialize
@@ -136,12 +130,9 @@ pub fn recovery_mgr_destroy(mgr: *RecoveryManager)
     if mgr.wal_writer != null
         wal_writer_destroy(mgr.wal_writer)
 
-    if mgr.txn_table != null
-        free(mgr.txn_table as *u8)
-
-    if mgr.metas != null
-        free(mgr.metas as *u8)
-
+    # Raw memory doesn't drop its fields: release them before the block
+    mgr.txn_table.deinit()
+    mgr.metas.deinit()
     mgr.wal_path.deinit()
 
     free(mgr as *u8)
@@ -154,7 +145,7 @@ pub fn recovery_mgr_destroy(mgr: *RecoveryManager)
 fn find_txn(mgr: *RecoveryManager, txn_id: i64) -> *TxnEntry
     var i: i64 = 0
     while i < mgr.txn_count
-        let entry: *TxnEntry = mgr.txn_table + i
+        let entry: *TxnEntry = mgr.txn_table.get_ptr(i)
         if entry.txn_id == txn_id
             return entry
         i += 1
@@ -173,7 +164,7 @@ fn upsert_txn(mgr: *RecoveryManager, txn_id: i64, state: u8, lsn: i64) -> *TxnEn
     if mgr.txn_count >= MAX_ACTIVE_TXNS
         return null  # Table full
 
-    let entry: *TxnEntry = mgr.txn_table + mgr.txn_count
+    let entry: *TxnEntry = mgr.txn_table.get_ptr(mgr.txn_count)
     entry.txn_id = txn_id
     entry.state = state
     entry.first_lsn = lsn
@@ -232,7 +223,7 @@ pub fn recovery_recover(mgr: *RecoveryManager) -> i32
     # Phase 3: Mark uncommitted transactions as aborted
     var i: i64 = 0
     while i < mgr.txn_count
-        let entry: *TxnEntry = mgr.txn_table + i
+        let entry: *TxnEntry = mgr.txn_table.get_ptr(i)
         if entry.state == TXN_STATE_ACTIVE
             entry.state = TXN_STATE_ABORTED
             mgr.stats.txns_aborted += 1
@@ -445,14 +436,14 @@ pub fn recovery_checkpoint(mgr: *RecoveryManager) -> i32
 fn recovery_put_meta(mgr: *RecoveryManager, entry: *NamedCollectionMeta) -> i32
     var i: i32 = 0
     while i < mgr.meta_count
-        let cur: *NamedCollectionMeta = mgr.metas + i
+        let cur: *NamedCollectionMeta = mgr.metas.get_ptr(i as i64)
         if cur.id == entry.id
             *cur = *entry
             return ERR_OK
         i += 1
     if mgr.meta_count >= MAX_COLLECTIONS
         return ERR_FULL
-    *(mgr.metas + mgr.meta_count) = *entry
+    *mgr.metas.get_ptr(mgr.meta_count as i64) = *entry
     mgr.meta_count += 1
     return ERR_OK
 
@@ -467,7 +458,7 @@ pub fn recovery_collection_meta_count(mgr: *RecoveryManager) -> i32
 pub fn recovery_collection_meta_at(mgr: *RecoveryManager, i: i32, out: *NamedCollectionMeta) -> i32
     if mgr == null or out == null or i < 0 or i >= mgr.meta_count
         return 0
-    *out = *(mgr.metas + i)
+    *out = *mgr.metas.get_ptr(i as i64)
     return 1
 
 pub fn recovery_stats(mgr: *RecoveryManager) -> *RecoveryStats

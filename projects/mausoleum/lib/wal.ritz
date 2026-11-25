@@ -26,6 +26,7 @@ import ritzlib.strview
 import ritzlib.string
 import ritzlib.option
 import ritzlib.memory
+import ritzlib.gvec
 
 import mausoleum.m7m_types
 import mausoleum.page
@@ -121,7 +122,7 @@ struct WalPageWritePayload
 
 struct WalWriter
     fd: Fd                      # The segment file (closed: raw -1)
-    buffer: *u8                 # Write buffer
+    buffer: Vec<u8>             # Write buffer, WAL_BUFFER_SIZE bytes
     buffer_pos: i64             # Current position in buffer
     current_lsn: i64            # Current LSN counter
     segment_num: i32            # Current segment number
@@ -137,24 +138,20 @@ pub fn wal_writer_new(base_path: *u8) -> *WalWriter
     if base_path == null
         return null
 
-    # Allocate writer
-    let writer: *WalWriter = malloc(sizeof(WalWriter)) as *WalWriter
-    if writer == null
-        return null
-
     # Allocate write buffer
-    let buffer: *u8 = malloc(WAL_BUFFER_SIZE)
-    if buffer == null
-        free(writer as *u8)
+    var buffer: Vec<u8> = vec_with_cap<u8>(WAL_BUFFER_SIZE)
+    if buffer.cap() < WAL_BUFFER_SIZE
         return null
 
     # Copy base path
     var path_copy: String = match m7m_path_copy(base_path)
         Some(s) => s
-        None =>
-            free(buffer)
-            free(writer as *u8)
-            return null
+        None => return null
+
+    # Allocate writer, last: a failure above frees only what drops on return
+    let writer: *WalWriter = malloc(sizeof(WalWriter)) as *WalWriter
+    if writer == null
+        return null
 
     # Initialize
     writer.fd = fd_adopt(-1)
@@ -206,8 +203,8 @@ pub fn wal_writer_destroy(writer: *WalWriter)
 
     wal_writer_close(writer)
 
-    if writer.buffer != null
-        free(writer.buffer)
+    # Raw memory doesn't drop its fields: release them before the block
+    writer.buffer.deinit()
     writer.base_path.deinit()
 
     free(writer as *u8)
@@ -238,7 +235,7 @@ pub fn wal_writer_flush(writer: *WalWriter) -> i32
     if writer.buffer_pos == 0
         return ERR_OK
 
-    match writer.fd.write_all(Span<u8> { ptr: writer.buffer, len: writer.buffer_pos })
+    match writer.fd.write_all(Span<u8> { ptr: writer.buffer.as_ptr(), len: writer.buffer_pos })
         Ok(_) => pass
         Err(_) => return ERR_IO
 
@@ -258,7 +255,7 @@ fn write_bytes(writer: *WalWriter, data: *u8, len: i64) -> i32
     if err != ERR_OK
         return err
 
-    memcpy(writer.buffer + writer.buffer_pos, data, len)
+    memcpy(writer.buffer.as_ptr() + writer.buffer_pos, data, len)
     writer.buffer_pos += len
     return ERR_OK
 
@@ -545,20 +542,19 @@ pub fn wal_write_checkpoint(writer: *WalWriter) -> i64
 
 struct WalReader
     fd: Fd
-    buffer: *u8
+    buffer: Vec<u8>
     buffer_size: i64
     buffer_pos: i64
     buffer_len: i64
     current_lsn: i64
 
 pub fn wal_reader_new() -> *WalReader
-    let reader: *WalReader = malloc(sizeof(WalReader)) as *WalReader
-    if reader == null
+    var buffer: Vec<u8> = vec_with_cap<u8>(WAL_BUFFER_SIZE)
+    if buffer.cap() < WAL_BUFFER_SIZE
         return null
 
-    let buffer: *u8 = malloc(WAL_BUFFER_SIZE)
-    if buffer == null
-        free(reader as *u8)
+    let reader: *WalReader = malloc(sizeof(WalReader)) as *WalReader
+    if reader == null
         return null
 
     reader.fd = fd_adopt(-1)
@@ -596,8 +592,8 @@ pub fn wal_reader_destroy(reader: *WalReader)
 
     wal_reader_close(reader)
 
-    if reader.buffer != null
-        free(reader.buffer)
+    # Raw memory doesn't drop its fields: release the buffer before the block
+    reader.buffer.deinit()
 
     free(reader as *u8)
 
