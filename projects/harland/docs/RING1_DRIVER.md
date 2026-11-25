@@ -127,7 +127,7 @@ flowchart LR
 
 The diagram is this slice. The IPv4 box moves to CPL 2 with the network service. The rings between that service and the driver stay as drawn.
 
-CPL 0 is the only mode that walks kernel-half page tables (`U/S = 0`). CPL 1 and CPL 3 both fault on those pages. `vmm_create_user_pml4` copies PML4 entries 256–511 with `PTE_USER` cleared. User image, mmap, stack, framebuffer, and the new driver windows sit below PML4[256] with `PTE_USER` set. `boot.s` and `ap_trampoline.s` set CR4.PAE only (bit 5). Nothing in the kernel sets CR4.SMEP (bit 20) or CR4.SMAP (bit 21). There is no second page-privilege lever hiding behind ring 1.
+Only CPL 3 is a user-mode access. Intel SDM Vol 3 §4.6: every access at CPL < 3 is a supervisor-mode access, so CPL 1 and CPL 2 do **not** fault on `U/S = 0` pages. Only CPL 3 does. `vmm_create_user_pml4` copies PML4 entries 256–511 with `PTE_USER` cleared, so every process CR3 maps the whole kernel half, physmap included. A CPL-1 or CPL-2 process can therefore read and write every supervisor page, which is all of RAM through the physmap. User image, mmap, stack, framebuffer, and the new driver windows sit below PML4[256] with `PTE_USER` set. `boot.s` and `ap_trampoline.s` set CR4.PAE only (bit 5). Nothing in the kernel sets CR4.SMEP (bit 20) or CR4.SMAP (bit 21), so CPL 1/2 can also use its own `PTE_USER` pages, and nothing there changes. **With today's shared kernel half, CPL 1/2 is not isolated from the kernel.** How it is kept out of kernel memory is open decision D8 (see Open questions). The GDT entries (§1) and the iret path (§2) are blocked on D8. The IOMMU/DMA rule is independent of D8 and stays as written.
 
 ### 1. GDT
 
@@ -340,7 +340,7 @@ The shared ring is not allocated through `DrvDmaAlloc` and is not entered in the
 
 `USER_MMAP_END` is `0x7FFFFFF00000`, above these windows, and `mmap_cursor_pick` will occupy a present page only by skipping it. `sys_mmap_impl` and `sys_munmap_impl` both reject any range that overlaps `[DRV_RING_BASE, USER_STACK_BASE)`, including a request that starts below the window and runs into it. A `MAP_FIXED` request there returns `Errno.Inval`. `sys_munmap_impl` today frees any page-aligned address inside `[USER_MMAP_START, USER_MMAP_END)`, and these windows sit in that span, so the overlap check is the change. The framebuffer address stays where it is.
 
-Ring 3 cannot map a BAR. The kernel mapping of the BAR is `U/S = 0` and remains unreachable from both CPL 1 and CPL 3.
+Ring 3 cannot map a BAR. The kernel mapping of the BAR is `U/S = 0`: unreachable from CPL 3, but reachable from CPL 1 while the kernel half is shared (open decision D8).
 
 ### 6. Portable SPSC ring
 
@@ -741,7 +741,7 @@ The shared `NetInfo` is not `ip_our_addr`. The kernel snapshot is a separate cop
 
 CPL and authorization are separate. This design keeps CPL 1 for the driver and CPL 2 for the service. It authorizes with capabilities.
 
-Page tables do not get simpler either way: `PTE_USER` is already the bit CPL 1 and CPL 3 both need, and kernel pages are already `U/S = 0`. SMEP and SMAP are off, so ring 1 gains no execution or access right that a capability-checked ring-3 process lacks. The iret frame's RPL is written by the CPU. `ARCHITECTURE.md` assigns drivers to ring 1 and the stack to ring 2, and a later call gate into the driver uses `TSS.rsp1`, which exists only for a target CPL of 1. The cost of CPL 1 is the GDT entries, the iret selectors, and the three `== 3` predicates. That cost is the whole of PRs 2 and 3.
+Page tables are not the same either way. `PTE_USER` is the bit CPL 3 needs, but `U/S = 0` does not stop CPL 1: every CPL < 3 access is a supervisor access (Intel SDM Vol 3 §4.6). With the kernel half copied into every process CR3, ring 1 gains read/write access to every supervisor page, which a ring-3 process does not have. Keeping CPL 1 out of kernel memory is open decision D8, and option (b) there is this alternative. The iret frame's RPL is written by the CPU. `ARCHITECTURE.md` assigns drivers to ring 1 and the stack to ring 2, and a later call gate into the driver uses `TSS.rsp1`, which exists only for a target CPL of 1. The cost of CPL 1 is the GDT entries, the iret selectors, and the three `== 3` predicates. That cost is the whole of PRs 2 and 3.
 
 ### A process-wide driver bit
 
@@ -776,7 +776,7 @@ Rejected. Writing `link_up = 0` into the shared record would make the kernel a s
 Threats that matter here:
 
 - A ring-3 process maps a BAR or a DMA window. Mitigated by `CAP_TYPE_MMIO` and `CAP_TYPE_IRQ`, granted only to the process the kernel spawned for that device. The failure is `Errno.Perm`. The spawn syscall does not grow a flag that selects the mark.
-- The driver maps arbitrary physical memory. Mitigated by the probe window list. Kernel half stays `U/S = 0` in this CR3 and is never given `PTE_USER`.
+- The driver maps arbitrary physical memory. The probe window list bounds what `DrvMmioMap` installs, but it is **not** a mitigation on its own: the kernel half stays mapped `U/S = 0` in this CR3, and `U/S = 0` does not stop a CPL-1 access (SDM Vol 3 §4.6). Through the physmap the driver can reach all of RAM. Unmitigated until open decision D8 is made.
 - The driver steers MSI-X at another CPU. Mitigated by not mapping the MSI-X table. The process can write a virtio queue-vector index; it cannot write the APIC ID. Indexes outside the three the kernel published are a device bug in a kernel-spawned binary, not a ring-3 attack. v1 does not add a second check in the device.
 - The driver executes `in` / `out` or a privileged MSR. IOPL is 0, there is no IOPB, and MSR access is CPL 0. `#GP` kills the process (vector 13, status 141) and quiesces the device.
 - A fault in the driver panics the machine. Mitigated only if every non-zero-CPL test is updated. The asm paths already qualify. The Ritz paths are the ones this design changes. A missed site is the panic.
@@ -827,6 +827,7 @@ TDD order. Each test is named as the file it extends or the boot log it adds. No
 |---|---|---|
 | Iret exit left at `$USER_SS` / `$USER_CS`, CS and SS swapped (the pre-#4610 order), a zero `PC_USER_CS` on the SMP return, or an RPL-1 return taking `sysretq` | High. The driver would run its ring-1 maps at CPL 3, the SMP phase-1 return would `#GP` on CS 0, or a later ring-3 syscall would iret to `0x429`. | `PC_USER_CS` / `PC_USER_SS` are qwords at offsets 64 and 72. `percpu_area_init` stores CS `0x23` / SS `0x1B`. `sched_use_kstack` writes the incoming Proc's selectors on every switch, including the switch back to ring 3. Any `PC_USER_CS` whose RPL is not 3 takes the iret exit before the `sysretq` path. `test_harland_sysret.py` pins the ring-3 values. The enter/exit test runs `Getpid` from the driver frame, and the SMP phase-1 return still completes. |
 | One `cs & 3 == 3` site left in place | High. A ring-1 fault panics the kernel, or the driver is never preempted. | The three sites are listed. The asm `testq $3` paths stay as they are. The fault test expects `[fault]` and forbids `KERNEL PANIC`. |
+| CPL 1/2 reads or writes the shared kernel half (`U/S = 0` is no barrier below CPL 3, SDM Vol 3 §4.6) | Critical. The driver or netd can read and write all of RAM through the physmap. | None yet. Open decision D8. The CPL-1 PRs (2 and 3) are blocked on it. |
 | MMIO mapped `U/S=1` into the kernel PML4 or another process | High | Map only `vmm_pml4_phys` of the driver slot, only below PML4[256], only inside recorded BARs. |
 | DMA mapped uncached, or a cacheable map used on a non-coherent device later | Medium for virtio-pci, which is coherent and already uses the write-back physmap. High if a later device assumes UC. | This design states WB on purpose. A non-coherent device is a new mapping flag, not a silent change. |
 | Driver death leaves `DRIVER_OK`, frees a page the device can still DMA, or `dma_free_pages` runs after `vmm_free_pml4` | High. The device DMAs into a recycled frame, or the PMM is handed the same page twice. | `driver_quiesce` runs in `sys_exit_impl` after the kernel PML4 switch and before `vmm_free_pml4`: mask MSI-X, virtio status 0 with a 0 readback, IOTLB invalidation, invalidate the link snapshot, `ShmNotify` `DRIVER_GONE` on the retired object id. Pages whose readback or invalidation does not finish go to `dma_quarantine` until reboot. `vmm_free_user_pt` frees a finished DMA run once. Shared-object pages stay allocated while another mapping is still live. A peer that has not detached is unmapped after `SHM_DETACH_TIMEOUT_MS`. No `dma_free_pages` of those leaves. Fault, `exit`, and Ctrl-C all enter `sys_exit_impl`. |
@@ -845,7 +846,7 @@ TDD order. Each test is named as the file it extends or the boot log it adds. No
 
 ## Key decisions
 
-1. **CPL 1 with selectors `0x429` and `0x431` appended at GDT indexes 133 and 134.** CPU 0's TSS stays `0x28`. `GDT_ENTRIES` is 135. Ring 3 was the alternative and loses because the iret RPL, the architecture doc, and a future `rsp1` call gate are the point of the ring. Page rights do not distinguish the two. Capabilities authorize the process. They do not choose its CPL.
+1. **CPL 1 with selectors `0x429` and `0x431` appended at GDT indexes 133 and 134.** CPU 0's TSS stays `0x28`. `GDT_ENTRIES` is 135. Ring 3 was the alternative and loses because the iret RPL, the architecture doc, and a future `rsp1` call gate are the point of the ring. Page rights do distinguish the two: CPL 1 is a supervisor access, so this decision is blocked on open decision D8. Capabilities authorize the process. They do not choose its CPL.
 2. **Ring 3 keeps `sysretq` (#4610). Any `PC_USER_CS` whose RPL is not 3 always takes the iret exit, and the whole iret frame is built on the kernel stack.** The iret exit pushes `%gs:PC_USER_SS` and `%gs:PC_USER_CS`. `iretq` loads the saved user RSP. On the iret path a non-canonical or kernel-half saved RSP kills the process before `iretq`. An unmapped canonical stack faults after `iretq`, as that process. The same iret exit serves CPL 1 and a ring-3 non-canonical RIP. Per-process CS/SS are qwords at per-CPU offsets 64 and 72. The area is 128 bytes, indexed by `shlq $7`. `percpu_area_init` stores CS `0x23` / SS `0x1B` so the SMP phase-1 return, which never calls `sched_use_kstack`, still returns to ring 3 by `sysretq`. `sched_use_kstack` writes the incoming Proc's selectors on every switch. Offset 56 is not reused: `pushq` of a GS slot is 8 bytes, and the iret exit has no scratch. SYSRET cannot represent CPL 1 on Intel. The DPL-1 descriptors stay at 133 and 134, `0x429` and `0x431`.
 3. **`rsp1` stays 0.** Kernel entry uses `rsp0` or an IST. The ring-1 stack is the user stack in the iret frame.
 4. **Non-zero CPL is a process** in `exception_handler`, `sched_tick`, and `tty_console_irq`. The asm stubs already use that predicate.
@@ -860,7 +861,20 @@ TDD order. Each test is named as the file it extends or the boot log it adds. No
 
 ## Open questions
 
-None. The trade-offs above are decided. A weaker-than-`seq_cst` order is a later measurement, not a blocker: the language has one order, and it is correct for the ports.
+### Open decision D8: how CPL 1/2 is kept out of kernel memory
+
+**Undecided; Aaron decides.** Intel SDM Vol 3 §4.6: every access at CPL < 3 is a supervisor-mode access, so `U/S = 0` does not stop CPL 1 or CPL 2. `vmm_create_user_pml4` copies PML4[256–511] into every process CR3, so a CPL-1/2 process can read and write the whole kernel half, physmap included, which is all of RAM. With SMEP/SMAP off it can also use its own `PTE_USER` pages, so nothing changes there. Options, none chosen:
+
+- **(a) A separate reduced PML4 for each CPL-1/2 process (KPTI-style).** Its kernel half maps only the entry trampoline, the GDT/IDT/TSS, and the per-CPU stacks. CR3 switches on every entry and every exit whose RPL is neither 3 nor 0.
+- **(b) Run the driver and netd at CPL 3, with capabilities providing all authority.** This makes D1 and D2 (the DPL-1/DPL-2 descriptors and the RPL-selected iret exit) unnecessary.
+- **(c) Supervisor protection keys (PKS).** Recent Intel only. The PKRS MSR is switched on each transition.
+- **(d) Accept CPL 1/2 as crash containment only, not a security boundary.**
+
+The CPL-1 steps of M2.6 (PR 2's GDT entries and PR 3's iret path) are blocked on D8. The IOMMU/DMA rule is independent of D8 and stays as written: no ring-1 DMA without a translated DMA domain.
+
+### Other questions
+
+None. A weaker-than-`seq_cst` order is a later measurement, not a blocker: the language has one order, and it is correct for the ports.
 
 ## PR plan
 
@@ -880,6 +894,8 @@ None. The trade-offs above are decided. A weaker-than-`seq_cst` order is a later
 
 **Files:** `kernel/src/arch/x86_64/gdt.ritz`, `projects/ritz/ritz0/test_harland_percpu.py`.
 
+**Blocked on:** open decision D8 (option (b) removes this PR).
+
 **Depends on:** PR 1 for the numbers in comments only. The code does not depend on the doc landing first, but the selector values should match it.
 
 **Description:** Append indexes 133 and 134. Tests for the selectors, access bytes, and the unchanged TSS formula. No process loads the selectors.
@@ -889,6 +905,8 @@ None. The trade-offs above are decided. A weaker-than-`seq_cst` order is a later
 **Title:** harland: Enter a driver-class process at CPL 1
 
 **Files:** `gdt.ritz` (selectors already present), `proc/table.ritz`, `proc/sched.ritz`, `syscall_entry.s`, `exceptions.ritz`, `proc_switch.s` comments if they still say the frame is ring 3 only, a boot-test stub, `projects/ritz/ritz0/test_harland_percpu.py`, `projects/ritz/ritz0/test_harland_sysret.py`, `projects/ritz/ritz0/tests/test_harland_syscall_stack.py`, `test_harland_process_model.py` if a field initializer needs a touch.
+
+**Blocked on:** open decision D8 (option (a) adds a CR3 switch to this exit; option (b) removes the RPL-selected iret exit).
 
 **Depends on:** PR 2.
 
