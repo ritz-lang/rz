@@ -13,7 +13,7 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
-import ritzlib.string { String, string_from, string_from_cstr }
+import ritzlib.string { String, string_from }
 import ritzlib.os.env { env_iter, env_get_or }
 import ritzlib.strview
 import ritzlib.span { Span, span_from_ptr }
@@ -343,22 +343,21 @@ fn test_pid_file_path() -> i32
 # ============================================================================
 
 # A scratch dir for a test that execs a script from it: `<base>/<tag><pid>`,
-# NUL-terminated. An empty `base` means /tmp. (AGAST #3710)
-fn scratch_dir_in(base: StrView, tag: *u8) -> String
+# An empty `base` means /tmp. (AGAST #3710)
+fn scratch_dir_in(base: StrView, tag: StrView) -> String
     var b: StrView = base
     if b.len == 0
         b = "/tmp"
     var dir: String = string_from(b)
     dir.push('/')
-    dir.push_cstr(tag)
+    dir.push_str(tag)
     dir.push_i64(sys_getpid() as i64)
-    dir.push(0)
     dir
 
 
 # scratch_dir_in under $TMPDIR, not a literal /tmp: a host may mount /tmp
 # noexec (a CIS policy does), and then execve of the script fails with EACCES.
-fn scratch_dir(tag: *u8) -> String
+fn scratch_dir(tag: StrView) -> String
     scratch_dir_in(env_get_or("TMPDIR", ""), tag)
 
 
@@ -383,13 +382,13 @@ fn dev_null_raw() -> i32
 
 
 # Exec a script that writes its arguments to `out`, wait, read them back.
-fn spawn_and_capture(dir: *u8, worker_count: i32, out: *u8, out_cap: i64) -> i64
+fn spawn_and_capture(dir: StrView, worker_count: i32, out: *u8, out_cap: i64) -> i64
     var script: [256]u8
     var record: [256]u8
-    let d: i64 = strlen(dir)
-    memcpy(@script[0], dir, d)
+    let d: i64 = dir.len()
+    memcpy(@script[0], dir.as_ptr(), d)
     memcpy(@script[d], c"/w.sh", 6)
-    memcpy(@record[0], dir, d)
+    memcpy(@record[0], dir.as_ptr(), d)
     memcpy(@record[d], c"/argv", 6)
 
     # #!/bin/sh + `echo "$@" > <dir>/argv`
@@ -424,32 +423,29 @@ fn spawn_and_capture(dir: *u8, worker_count: i32, out: *u8, out_cap: i64) -> i64
 # built from $TMPDIR, falling back to /tmp only when it is unset or empty.
 # ============================================================================
 
-# `<base>/<tag><pid>` as a C string, for comparing against a scratch dir.
-fn expected_scratch(base: *u8, tag: *u8) -> String
-    var want: String = string_from_cstr(base)
-    want.push_cstr(c"/")
-    want.push_cstr(tag)
+# `<base>/<tag><pid>`, for comparing against a scratch dir.
+fn expected_scratch(base: StrView, tag: StrView) -> String
+    var want: String = string_from(base)
+    want.push('/')
+    want.push_str(tag)
     want.push_i64(sys_getpid() as i64)
-    want.push(0)
     want
 
 
 [[test]]
 fn test_scratch_dir_in_puts_the_dir_under_the_base() -> i32
-    var dir: String = scratch_dir_in("/srv/scratch", c"zeus-argv-")
-    var want: String = expected_scratch(c"/srv/scratch", c"zeus-argv-")
-    let ok: i32 = streq(dir.as_ptr(), want.as_ptr()) as i32
-    if ok == 0
+    var dir: String = scratch_dir_in("/srv/scratch", "zeus-argv-")
+    var want: String = expected_scratch("/srv/scratch", "zeus-argv-")
+    if not dir.eq(want.as_view())
         return 1
     0
 
 
 [[test]]
 fn test_scratch_dir_in_falls_back_to_tmp_for_an_empty_base() -> i32
-    var dir: String = scratch_dir_in("", c"zeus-env-")
-    var want: String = expected_scratch(c"/tmp", c"zeus-env-")
-    let ok: i32 = streq(dir.as_ptr(), want.as_ptr()) as i32
-    if ok == 0
+    var dir: String = scratch_dir_in("", "zeus-env-")
+    var want: String = expected_scratch("/tmp", "zeus-env-")
+    if not dir.eq(want.as_view())
         return 1
     0
 
@@ -460,16 +456,15 @@ fn test_scratch_dir_in_falls_back_to_tmp_for_an_empty_base() -> i32
 [[test]]
 fn test_scratch_dir_follows_tmpdir() -> i32
     var base: StrView = env_get_or("TMPDIR", "")
-    var dir: String = scratch_dir(c"zeus-tmpdir-")
-    var want: String = scratch_dir_in(base, c"zeus-tmpdir-")
-    let ok: i32 = streq(dir.as_ptr(), want.as_ptr()) as i32
-    if ok == 0
+    var dir: String = scratch_dir("zeus-tmpdir-")
+    var want: String = scratch_dir_in(base, "zeus-tmpdir-")
+    if not dir.eq(want.as_view())
         return 1
-    let d: *u8 = dir.as_ptr()
-    mkdir(strview_from_cstr(d), 448)
+    let d: StrView = dir.as_view()
+    mkdir(d, 448)
     var out: [64]u8
     let n: i64 = spawn_and_capture(d, 2, @out[0], 64)
-    rmdir(strview_from_cstr(d))
+    rmdir(d)
     if n <= 0
         return 2
     0
@@ -477,20 +472,17 @@ fn test_scratch_dir_follows_tmpdir() -> i32
 
 [[test]]
 fn test_spawn_worker_passes_worker_count() -> i32
-    var dir: String = scratch_dir(c"zeus-argv-")
-    mkdir(strview_from_cstr(dir.as_ptr()), 448)
+    var dir: String = scratch_dir("zeus-argv-")
+    let d: StrView = dir.as_view()
+    mkdir(d, 448)
     var out: [64]u8
-    let n: i64 = spawn_and_capture(dir.as_ptr(), 3, @out[0], 64)
-    rmdir(strview_from_cstr(dir.as_ptr()))
+    let n: i64 = spawn_and_capture(d, 3, @out[0], 64)
+    rmdir(d)
     if n < 0
         return 1
     # "<shm_size> <worker_id> <worker_count>\n"
-    let want: *u8 = c"4096 7 3\n"
-    if n != strlen(want)
+    if not strview_from_ptr(@out[0], n).eq("4096 7 3\n")
         return 2
-    for i in 0..n
-        if out[i] != *(want + i)
-            return 3
     0
 
 
@@ -519,15 +511,15 @@ fn test_spawn_worker_passes_the_environment() -> i32
     let want: StrView = probe_entry()
     if want.len == 0
         return 100     # no usable variable to look for
-    var dir: String = scratch_dir(c"zeus-env-")
-    let d: *u8 = dir.as_ptr()
-    mkdir(strview_from_cstr(d), 448)
-    let dl: i64 = strlen(d)
+    var dir: String = scratch_dir("zeus-env-")
+    let d: StrView = dir.as_view()
+    mkdir(d, 448)
+    let dl: i64 = d.len()
     var script: [256]u8
     var record: [256]u8
-    memcpy(@script[0], d, dl)
+    memcpy(@script[0], d.as_ptr(), dl)
     memcpy(@script[dl], c"/w.sh", 6)
-    memcpy(@record[0], d, dl)
+    memcpy(@record[0], d.as_ptr(), dl)
     memcpy(@record[dl], c"/env", 5)
 
     # #!/bin/sh + `env > <dir>/env`
@@ -558,12 +550,11 @@ fn test_spawn_worker_passes_the_environment() -> i32
                 n += r
             rf.close()
         Err(_) => pass
-    *(out + n) = 0
     unlink(strview_from_cstr(@record[0]))
     unlink(strview_from_cstr(@script[0]))
-    rmdir(strview_from_cstr(d))
+    rmdir(d)
     if !opened
         return 3
-    let found: bool = (strview_from_cstr(out)).contains(want)
+    let found: bool = strview_from_ptr(out, n).contains(want)
     free(out)
     if found then 0 else 4

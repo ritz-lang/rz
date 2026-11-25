@@ -713,3 +713,37 @@ pub fn kill(pid: i32, sig: i32) -> Result<(), Errno>
     if rc < 0
         return Err(errno_from_raw(rc))
     Ok(())
+
+# Ignore signal `signum` (rt_sigaction(2) with SIG_IGN), e.g. SIGPIPE in a
+# server so a write to a closed peer is Err(Pipe) instead of a kill.
+[[target_os = "linux"]]
+pub fn signal_ignore(signum: i32) -> Result<(), Errno>
+    # struct kernel_sigaction { sa_handler @0, sa_flags @8, sa_restorer @16,
+    # sa_mask @24 }: all zero but sa_handler = SIG_IGN (1).
+    var act: [32]u8
+    var i: i64 = 0
+    while i < 32
+        act[i] = 0
+        i += 1
+    act[0] = 1
+    let rc: i32 = sys_rt_sigaction(signum, @act[0], null, 8)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(())
+
+# Block SIGTERM and SIGINT and return a signalfd(2) that reads them instead
+# (nonblocking, close-on-exec), for a server's graceful shutdown in its poll
+# loop.  The caller owns the fd.
+[[target_os = "linux"]]
+pub fn signalfd_create_for_shutdown() -> Result<i32, Errno>
+    let sig_block: i32 = 0          # SIG_BLOCK
+    let sfd_flags: i32 = 524288 | 2048   # SFD_CLOEXEC | SFD_NONBLOCK
+    # Signal n is bit n - 1: SIGTERM (15) and SIGINT (2).
+    var mask: i64 = (1 << 14) | (1 << 1)
+    let blocked: i32 = sys_rt_sigprocmask(sig_block, @mask, null, 8)
+    if blocked < 0
+        return Err(errno_from_raw(blocked))
+    let fd: i32 = sys_signalfd4(-1, @mask, sfd_flags)
+    if fd < 0
+        return Err(errno_from_raw(fd))
+    Ok(fd)

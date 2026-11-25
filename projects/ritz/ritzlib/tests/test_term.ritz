@@ -1,0 +1,113 @@
+# ritzlib.term: termios and window size as Results (AGAST #4686).
+#
+#   tcgetattr(fd) -> Result<Termios, Errno>
+#   tcsetattr(fd, @t, when: TcsetWhen) -> Result<(), Errno>
+#   get_winsize(fd) -> Result<Winsize, Errno>
+#
+# A pty master (/dev/ptmx) is a terminal without needing one on stdin, so
+# the Ok paths run under any harness; a pipe is the not-a-tty case (ENOTTY).
+
+import ritzlib.sys
+import ritzlib.term
+import ritzlib.fd
+import ritzlib.result
+
+const E_NOTTY: i32 = 25
+
+fn unit_err(r: Result<(), Errno>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => e.code()
+
+# A pty master: a fresh terminal this test owns. A closed Fd if the system
+# has no /dev/ptmx, so the caller skips.
+fn open_pty() -> Fd
+    match fd_open("/dev/ptmx", O_RDWR | O_CLOEXEC, 0)
+        Ok(f) => f
+        Err(_) => fd_adopt(-1)
+
+[[test]]
+fn test_tcgetattr_not_a_tty_is_enotty() -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            match tcgetattr(p.read.raw())
+                Ok(_) =>
+                    assert false
+                Err(e) =>
+                    assert e.code() == E_NOTTY
+            p.read.close()
+            p.write.close()
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_get_winsize_not_a_tty_is_enotty() -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            match get_winsize(p.write.raw())
+                Ok(_) =>
+                    assert false
+                Err(e) =>
+                    assert e.code() == E_NOTTY
+            p.read.close()
+            p.write.close()
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_tcsetattr_not_a_tty_is_enotty() -> i32
+    match pipe()
+        Ok(pp) =>
+            var p: Pipe = pp
+            var t: Termios
+            assert unit_err(tcsetattr(p.read.raw(), @t, TcsetWhen.Now)) == E_NOTTY
+            p.read.close()
+            p.write.close()
+        Err(_) =>
+            assert false
+    0
+
+# Clear ECHO with each TcsetWhen, read it back, then restore it.
+[[test]]
+fn test_tcsetattr_roundtrip_on_a_pty() -> i32
+    var m: Fd = open_pty()
+    if not m.valid()
+        return 0  # no ptys here: nothing to test against
+    match tcgetattr(m.raw())
+        Ok(orig) =>
+            var raw: Termios = orig
+            raw.c_lflag = raw.c_lflag & (0xFFFFFFFF ^ ECHO)
+            assert unit_err(tcsetattr(m.raw(), @raw, TcsetWhen.Now)) == 0
+            match tcgetattr(m.raw())
+                Ok(now) =>
+                    assert (now.c_lflag & ECHO) == 0
+                Err(_) =>
+                    assert false
+            assert unit_err(tcsetattr(m.raw(), @orig, TcsetWhen.Drain)) == 0
+            assert unit_err(tcsetattr(m.raw(), @orig, TcsetWhen.Flush)) == 0
+            match tcgetattr(m.raw())
+                Ok(back) =>
+                    assert back.c_lflag == orig.c_lflag
+                Err(_) =>
+                    assert false
+        Err(_) =>
+            assert false
+    m.close()
+    0
+
+[[test]]
+fn test_get_winsize_on_a_pty() -> i32
+    var m: Fd = open_pty()
+    if not m.valid()
+        return 0
+    # A fresh pty is 0x0: that the ioctl succeeds is the point.
+    let ok: bool = match get_winsize(m.raw())
+        Ok(_) => true
+        Err(_) => false
+    assert ok
+    m.close()
+    0

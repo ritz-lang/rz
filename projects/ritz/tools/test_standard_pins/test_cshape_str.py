@@ -21,7 +21,7 @@ pytestmark = pytest.mark.unit
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent.parent
 
-PINS = {"bool-return": (6, 6)}
+PINS = {}  # bool-return reached 0 (re-measured by #4686)
 
 
 def test_str_c_shapes_only_go_down():

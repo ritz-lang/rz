@@ -37,7 +37,8 @@ struct LspMessage
     kind: i32               # MSG_* type
     id: i64                 # Request/response ID (-1 if notification)
     id_is_string: i32       # 1 if ID was a string
-    method: *u8             # Method name (owned, null for responses)
+    method: StrView         # Method name (borrowed from json_root; "" if none)
+    has_method: bool        # The message has a string "method" (false for responses)
     params: *JsonValue      # Parameters (borrowed from parsed JSON)
     result: *JsonValue      # Result (for responses)
     error_code: i32         # Error code (for error responses)
@@ -49,7 +50,8 @@ pub fn lsp_message_new() -> LspMessage
         kind: 0,
         id: -1,
         id_is_string: 0,
-        method: null,
+        method: "",
+        has_method: false,
         params: null,
         result: null,
         error_code: 0,
@@ -58,8 +60,6 @@ pub fn lsp_message_new() -> LspMessage
     }
 
 pub fn lsp_message_free(msg: *LspMessage)
-    if msg.method != null
-        free(msg.method)
     if msg.json_root != null
         msg.json_root.free()
 
@@ -96,12 +96,6 @@ pub fn lsp_view(v: *JsonValue) -> StrView
     match v.get_string()
         Some(s) => s
         None => ""
-
-# The NUL-terminated bytes of string value `v`, or null if `v` is not a string.
-pub fn lsp_string(v: *JsonValue) -> *u8
-    match v.get_string()
-        Some(s) => s.ptr
-        None => null as *u8
 
 # The value of number `v`, or 0 if `v` is not a number.
 pub fn lsp_number(v: *JsonValue) -> i64
@@ -140,13 +134,11 @@ pub fn parse_message(json_str: *u8) -> LspMessage
             msg.id = 0
 
     # Get method if present
-    let method_val: *JsonValue = lsp_field(root, "method")
-    if method_val != null && method_val.kind == JSON_STRING
-        # Copy method string
-        let method_len: i64 = method_val.str_len
-        msg.method = malloc(method_len + 1)
-        if msg.method != null
-            memcpy(msg.method, method_val.str_val, method_len + 1)
+    match lsp_field(root, "method").get_string()
+        Some(m) =>
+            msg.method = m
+            msg.has_method = true
+        None => pass
 
     # Get params if present
     msg.params = lsp_field(root, "params")
@@ -155,7 +147,7 @@ pub fn parse_message(json_str: *u8) -> LspMessage
     msg.result = lsp_field(root, "result")
 
     # Determine message type
-    if msg.method != null
+    if msg.has_method
         if msg.id >= 0 || id_val != null
             msg.kind = MSG_REQUEST
         else

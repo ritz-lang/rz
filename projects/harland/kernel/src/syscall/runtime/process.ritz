@@ -19,7 +19,7 @@
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
-import klog { klog, klog_cstr, klog_dec, klog_hex }
+import klog { klog, klog_dec, klog_hex }
 import io { halt_loop, disable_interrupts, enable_interrupts }
 import serial { StrView }
 import mm.pmm { PAGE_SIZE }
@@ -29,7 +29,6 @@ import fs.kfs { kfs_ns_for, kfs_local, kfs_read, kfs_save, kfs_save_pending }
 import fs.vfs { O_CREAT }
 import goliath.namespace { Namespace }
 import ritzlib.strview { strview_from_ptr }
-import ritzlib.str { strlen }
 import fs.syscall { sys_open, fs_process_end, fs_process_start, fs_process_select }
 import syscall.stack { syscall_stack_check, syscall_stack_used }
 import drivers.acpi.tables { acpi_poweroff }
@@ -153,11 +152,9 @@ fn spawn_push_argv(argc: i32, total_string_bytes: i64, child_argv: *u64) -> u64
 #
 # ISOLATION: each child gets its own page table (CR3); it cannot read or
 # write the parent's user memory.
-fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
+fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64) -> i64
     # Read file from namespace (using kernel's page table). A path under
     # /var comes from the persistent subtree (fs/kfs.ritz, #4321).
-    let path_len: i64 = strlen(path)
-    let path_view: StrView = strview_from_ptr(path, path_len)
     let ns: *Namespace = kfs_ns_for(path_view)
     if ns == 0 as *Namespace
         klog("[spawn_args] No namespace\n")
@@ -168,7 +165,7 @@ fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     if elf_data == 0 as *u8
         if argc > 0
             klog("[spawn_args] File not found: ")
-            klog_cstr(path)
+            klog(path_view)
             klog("\n")
         return Errno.NoEnt as i64
 
@@ -275,7 +272,7 @@ fn wait_for_child(pid: u64, code: *i64) -> i32
 # spawn, blocking: start the child and sleep until it exits. Its pid, for
 # sys_wait to collect the status; a negative exit code fails the spawn with
 # -1 instead, and the child is reaped here since no wait will come.
-fn spawn_and_block(path: *u8, argc: i32, argv_bytes: i64) -> i64
+fn spawn_and_block(path: StrView, argc: i32, argv_bytes: i64) -> i64
     let pid: i64 = spawn_process(path, argc, argv_bytes)
     if pid <= 0
         return pid
@@ -287,15 +284,15 @@ fn spawn_and_block(path: *u8, argc: i32, argv_bytes: i64) -> i64
     return pid
 
 # sys_spawn: run a binary from the filesystem and wait for it to exit.
-fn sys_spawn_impl(path: *u8) -> i64
+fn sys_spawn_impl(path: StrView) -> i64
     return spawn_and_block(path, 0, 0)
 
 # sys_spawn_args: run a binary with arguments and wait for it to exit. The
 # child's _start passes (argc, argv) to main; a `pub fn main(args:
 # Span<StrView>)` gets them as views through the entry adapter (#200).
-fn sys_spawn_args_impl(path: *u8, argc: i32, argv_bytes: i64) -> i64
+fn sys_spawn_args_impl(path: StrView, argc: i32, argv_bytes: i64) -> i64
     klog("[spawn_args] spawn_args(")
-    klog_cstr(path)
+    klog(path)
     klog(", argc=")
     klog_dec(argc as i64)
     klog(")\n")
@@ -421,7 +418,7 @@ pub fn sys_spawn_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
         return Errno.Fault as i64
-    return sys_spawn_impl(rdi as *u8)
+    return sys_spawn_impl(strview_from_ptr(rdi as *u8, path_result))
 
 # spawn_args(path, argv, argc)
 pub fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
@@ -437,7 +434,7 @@ pub fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         argv_bytes = spawn_capture_argv(rsi as **u8, argc)
         if argv_bytes < 0
             return argv_bytes
-    return sys_spawn_args_impl(rdi as *u8, argc, argv_bytes)
+    return sys_spawn_args_impl(strview_from_ptr(rdi as *u8, path_result), argc, argv_bytes)
 
 # spawn_bg(path, argv, argc): like spawn_args, but the caller doesn't wait:
 # the child's pid comes back at once, both run (#3629), and wait(pid)
@@ -455,7 +452,7 @@ pub fn sys_spawn_bg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         argv_bytes = spawn_capture_argv(rsi as **u8, argc)
         if argv_bytes < 0
             return argv_bytes
-    return spawn_process(rdi as *u8, argc, argv_bytes)
+    return spawn_process(strview_from_ptr(rdi as *u8, path_result), argc, argv_bytes)
 
 # wait(pid)
 pub fn sys_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

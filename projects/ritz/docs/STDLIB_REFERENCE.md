@@ -103,6 +103,7 @@ modules links without sys. A freestanding program defines all three itself.
    - [uring](#uring) - io_uring bindings
 9. [Process Management](#process-management)
    - [process](#process) - Subprocess spawning
+   - [term](#term) - Terminal attributes and size
    - [argspec](#argspec) - Argument parsing
    - [os.env](#osenv) - Environment variables
 10. [Utilities](#utilities)
@@ -1873,7 +1874,7 @@ fn size_or_minus_one(path: StrView) -> i64
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `d.next()` | `fn() -> bool` | Advance; true if an entry is available, false at the end |
-| `d.close()` | `fn()` | Close the iterator |
+| `d.close()` | `fn()` | Close the fd and free the buffer early; a second close is a no-op. The buffer is a `Vec<u8>`, so a dropped `DirIter` frees it anyway (AGAST #4686) |
 | `d.entry()` | `fn() -> DirEntry` | Current entry after `d.next()` returns true |
 | `d.next_entry()` | `fn() -> Option<DirEntry>` | Advance and return the next entry, `None` at the end |
 | `d.entry_type()` | `fn() -> Option<u8>` | Type of the current entry (`DT_REG`, `DT_DIR`, ...), `None` if there is none |
@@ -2675,6 +2676,8 @@ cover). To run a program and read its output, use `spawn`.
 | `wait_pid` | `fn(pid: i32) -> Result<ProcessResult, Errno>` | Block until child `pid` exits; `Err(Child)` if it isn't ours or was already reaped |
 | `try_wait_pid` | `fn(pid: i32) -> Result<Option<ProcessResult>, Errno>` | `wait_pid` without blocking: `Ok(None)` while it runs |
 | `kill` | `fn(pid: i32, sig: i32) -> Result<(), Errno>` | Send `sig` (0 checks the pid exists); `Err(Other(3))` (ESRCH) if there's no such process |
+| `signal_ignore` | `fn(signum: i32) -> Result<(), Errno>` | Ignore `signum` (SIG_IGN), e.g. SIGPIPE in a server; `Err(Inval)` for SIGKILL / SIGSTOP. Linux |
+| `signalfd_create_for_shutdown` | `fn() -> Result<i32, Errno>` | Block SIGTERM and SIGINT and return a nonblocking signalfd that reads them, for a poll loop's graceful shutdown; the caller owns the fd. Linux |
 
 ```ritz
 import ritzlib.process
@@ -2698,6 +2701,42 @@ fn run_true_into(out: @Fd) -> i32
                         Ok(r) => r.exit_code
                         Err(e) => -e.code()
         Err(e) => -e.code()
+```
+
+---
+
+### term
+
+**Module**: `ritzlib.term` (Linux)
+
+Terminal attributes (termios) and window size, each one ioctl(2) on a raw fd,
+as Results (AGAST #4686). A fd that isn't a terminal is `Err(Other(25))`
+(ENOTTY), the usual answer under a test harness or a pipe. `Termios`,
+`Winsize` and `Errno` come with the import. Harland's console has its own
+three-flag form (`sys_tty_getattr` / `sys_tty_setattr` in `ritzlib.sys`).
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `tcgetattr` | `fn(fd: i32) -> Result<Termios, Errno>` | The terminal attributes of `fd` (TCGETS) |
+| `tcsetattr` | `fn(fd: i32, t: @Termios, when: TcsetWhen) -> Result<(), Errno>` | Set them: `TcsetWhen.Now` (TCSETS), `.Drain` after pending output (TCSETSW), `.Flush` after a drain, discarding unread input (TCSETSF) |
+| `get_winsize` | `fn(fd: i32) -> Result<Winsize, Errno>` | Rows and columns of the terminal on `fd` (TIOCGWINSZ) |
+
+```ritz
+import ritzlib.term
+import ritzlib.sys { STDIN, ECHO, ICANON }
+import ritzlib.result
+
+# Turn off echo and line editing on stdin; the old attributes to restore, or
+# Err if stdin isn't a terminal.
+fn enter_raw() -> Result<Termios, Errno>
+    match tcgetattr(STDIN)
+        Ok(orig) =>
+            var raw: Termios = orig
+            raw.c_lflag = raw.c_lflag & (0xFFFFFFFF ^ (ECHO | ICANON))
+            match tcsetattr(STDIN, @raw, TcsetWhen.Now)
+                Ok(_) => Ok(orig)
+                Err(e) => Err(e)
+        Err(e) => Err(e)
 ```
 
 ---

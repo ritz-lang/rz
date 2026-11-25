@@ -12,7 +12,7 @@
 # would reach the wrong store, and the wrong transport fails every handshake
 # or sends pages in the clear. Moved here from src/store.ritz (AGAST #2209).
 
-import ritzlib.strview { StrView }
+import ritzlib.strview { StrView, strview_empty, strview_from_ptr }
 import ritzlib.string { String }
 import ritzlib.os.env { env_get_or }
 
@@ -25,7 +25,7 @@ const CONNECT_NO_REPLY: i32 = -6         # handshake / CONNECT reply never came
 
 
 pub struct StoreConfig
-    host: [64]u8             # NUL-terminated
+    host: [64]u8             # host_len bytes; store_config_host views them
     host_len: i32
     port: i32
     encrypted: bool
@@ -35,33 +35,32 @@ pub struct StoreConfig
 # 127.0.0.1:7777, encrypted.
 pub fn store_config_default() -> StoreConfig
     var cfg: StoreConfig
-    store_config_set_host(@cfg, c"127.0.0.1", 9)
+    store_config_set_host(@cfg, "127.0.0.1")
     cfg.port = 7777
     cfg.encrypted = true
     cfg.error = false
     cfg
 
 
-fn store_config_set_host(cfg: *StoreConfig, host: *u8, host_len: i32)
-    var n: i32 = host_len
-    if n > 63
-        n = 63
+fn store_config_set_host(cfg: *StoreConfig, host: StrView)
+    var n: i64 = host.len()
+    if n > 64
+        n = 64
     for i in 0..n
-        cfg.host[i] = *(host + i)
-    cfg.host[n] = 0
-    cfg.host_len = n
+        cfg.host[i] = host.get(i)
+    cfg.host_len = n as i32
 
 
-# The host, NUL-terminated.
-pub fn store_config_host(cfg: *StoreConfig) -> *u8
-    @cfg.host[0]
+# The host, a view of the config's own bytes.
+pub fn store_config_host(cfg: *StoreConfig) -> StrView
+    strview_from_ptr(@cfg.host[0], cfg.host_len as i64)
 
 
-fn store_config_reject(cfg: *StoreConfig, why: *u8) -> i32
+fn store_config_reject(cfg: *StoreConfig, why: StrView) -> i32
     cfg.error = true
     var line: String = log_begin()
     line.push_cstr(c"[STORE] ")
-    line.push_cstr(why)
+    line.push_str(why)
     line.push_cstr(c"; REFUSING to serve pages until it is fixed")
     log_end(@&line)
     -1
@@ -71,7 +70,7 @@ fn store_config_reject(cfg: *StoreConfig, why: *u8) -> i32
 # -1 (and cfg.error) if the port isn't 1..65535 or the host is over 63 bytes.
 pub fn store_config_set_address(cfg: *StoreConfig, host: StrView, port: StrView) -> i32
     if host.len > 63
-        return store_config_reject(cfg, c"MAUSOLEUM_HOST is longer than 63 bytes")
+        return store_config_reject(cfg, "MAUSOLEUM_HOST is longer than 63 bytes")
     var p: i64 = cfg.port as i64
     if port.len > 0
         p = 0
@@ -82,9 +81,9 @@ pub fn store_config_set_address(cfg: *StoreConfig, host: StrView, port: StrView)
                 break
             p = p * 10 + (c - 48) as i64
         if p < 1 or p > 65535
-            return store_config_reject(cfg, c"MAUSOLEUM_PORT is not a port number (1..65535)")
+            return store_config_reject(cfg, "MAUSOLEUM_PORT is not a port number (1..65535)")
     if host.len > 0
-        store_config_set_host(cfg, host.ptr, host.len as i32)
+        store_config_set_host(cfg, host)
     cfg.port = p as i32
     0
 
@@ -100,7 +99,7 @@ pub fn store_config_set_plaintext(cfg: *StoreConfig, v: StrView) -> i32
     if v.len == 1 and *v.ptr == '0'
         cfg.encrypted = true
         return 0
-    store_config_reject(cfg, c"MAUSOLEUM_PLAINTEXT is not 1 (plaintext) or 0 (encrypted)")
+    store_config_reject(cfg, "MAUSOLEUM_PLAINTEXT is not 1 (plaintext) or 0 (encrypted)")
 
 
 # The defaults, overridden by this process's MAUSOLEUM_* variables.
@@ -111,12 +110,12 @@ pub fn store_config_from_env() -> StoreConfig
     cfg
 
 
-# Why a connect failed, for the log; null if there is nothing to add.
-pub fn store_connect_hint(err: i32, encrypted: bool) -> *u8
+# Why a connect failed, for the log; empty if there is nothing to add.
+pub fn store_connect_hint(err: i32, encrypted: bool) -> StrView
     if err == CONNECT_NO_REPLY
         if encrypted
-            return c"it accepted the connection but never completed the encrypted handshake: is it running with --no-encryption? nexus speaks the encrypted protocol"
-        return c"it accepted the connection but never answered the plaintext CONNECT: is it running encrypted (mausoleum's default)?"
+            return "it accepted the connection but never completed the encrypted handshake: is it running with --no-encryption? nexus speaks the encrypted protocol"
+        return "it accepted the connection but never answered the plaintext CONNECT: is it running encrypted (mausoleum's default)?"
     if err == CONNECT_REFUSED
-        return c"nothing accepted the connection: is mausoleum running there?"
-    return null
+        return "nothing accepted the connection: is mausoleum running there?"
+    return strview_empty()

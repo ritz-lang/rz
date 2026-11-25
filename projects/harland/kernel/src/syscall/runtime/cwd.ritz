@@ -6,7 +6,6 @@ import fs.kfs { kfs_ns_for, kfs_local, kfs_list }
 import goliath.namespace { Namespace }
 import goliath.dir_entry { DirEntry }
 import ritzlib.strview { strview_from_ptr }
-import ritzlib.str { strlen }
 import mm.uptr { uptr_validate_string, uptr_check_write }
 import serial { StrView }
 import syscall.errno { Errno }
@@ -43,20 +42,16 @@ fn sys_getcwd_impl(buf: *u8, size: u64) -> i64
     return cwd.len
 
 # sys_chdir_impl: Change current working directory
-# Args: path = path to new directory (null-terminated)
+# Args: path_view = path to new directory (the handler's validated view)
 # Returns: 0 on success, Errno.NoEnt / NameTooLong / NoDev on error
-fn sys_chdir_impl(path: *u8) -> i64
-    # The handler validated the string (NUL within 4096 bytes).
-    let path_len: i64 = strlen(path)
-
-    if path_len == 0
+fn sys_chdir_impl(path_view: StrView) -> i64
+    if path_view.len == 0
         return Errno.NoEnt as i64
-    if path_len >= 255
+    if path_view.len >= 255
         return Errno.NameTooLong as i64
 
     # Verify the path exists in the namespace. /var and below are checked in
     # the persistent subtree, where they are "/" and "/x" (fs/kfs.ritz, #4321).
-    let path_view: StrView = strview_from_ptr(path, path_len)
     let ns: *Namespace = kfs_ns_for(path_view)
     if ns == 0 as *Namespace
         return Errno.NoDev as i64
@@ -83,8 +78,9 @@ pub fn sys_getcwd_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
 # chdir(path) -> 0 or -errno
 pub fn sys_chdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
-    # SECURITY: Validate path string
+    # SECURITY: Validate path string; its length (NUL within 4096 bytes)
+    # makes the one view the impl uses.
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
         return Errno.Fault as i64
-    return sys_chdir_impl(rdi as *u8)
+    return sys_chdir_impl(strview_from_ptr(rdi as *u8, path_result))

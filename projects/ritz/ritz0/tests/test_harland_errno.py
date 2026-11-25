@@ -49,7 +49,8 @@ RITZLIB_NAME = {
 
 # The modules a host program needs to link the kernel's log path: klog (the
 # one log API, #1885) over serial, with digits from ritzlib.fmt.digits (#1957)
-# and klog_cstr's strlen from ritzlib.str.
+# and ritzlib.str (klog itself has needed none since #4686 deleted klog_cstr;
+# a listed module nothing imports links nothing).
 SERIAL = ["klog", "serial", "io", "boot_abi.serial", "boot_abi.portio", "ritzlib.fmt.digits", "ritzlib.str"]
 
 # serial.ritz and mm/vmm.ritz hold `asm x86_64:` blocks, which ritz1 can't

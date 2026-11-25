@@ -103,6 +103,7 @@ pub fn main() -> i32
 | `string.ritz` | `ritzlib.string` | Owned string type |
 | `strview.ritz` | `ritzlib.strview` | Zero-copy string view |
 | `sys.ritz` | `ritzlib.sys` | System call wrappers |
+| `term.ritz` | `ritzlib.term` | Terminal attributes and size (Linux termios) -> Result |
 | `testlib.ritz` | `ritzlib.testlib` | Helpers for `[[test]]` integration tests |
 | `time.ritz` | `ritzlib.time` | Duration, sleep(Duration) and the wall clock |
 | `timer.ritz` | `ritzlib.timer` | High-performance timing utilities |

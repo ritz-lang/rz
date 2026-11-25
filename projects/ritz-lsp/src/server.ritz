@@ -96,11 +96,11 @@ fn handle_did_open(s: *Server, msg: *LspMessage)
     if uri_val == null || text_val == null
         return
 
-    let uri: *u8 = lsp_string(uri_val)
-    let text: *u8 = lsp_string(text_val)
+    let uri: StrView = lsp_view(uri_val)
+    let text: StrView = lsp_view(text_val)
     let version: i64 = lsp_number(version_val)
 
-    eprint("[ritz-lsp] Document opened: {lsp_view(uri_val)}\n")
+    eprint("[ritz-lsp] Document opened: {uri}\n")
 
     # Marks it dirty; published once input pauses (publish_pending).
     document_open(@s.documents, uri, text, version)
@@ -130,11 +130,11 @@ fn handle_did_change(s: *Server, msg: *LspMessage)
     if text_val == null
         return
 
-    let uri: *u8 = lsp_string(uri_val)
-    let text: *u8 = lsp_string(text_val)
+    let uri: StrView = lsp_view(uri_val)
+    let text: StrView = lsp_view(text_val)
     let version: i64 = lsp_number(version_val)
 
-    eprint("[ritz-lsp] Document changed: {lsp_view(uri_val)}\n")
+    eprint("[ritz-lsp] Document changed: {uri}\n")
 
     # Marks it dirty; a burst of changes compiles once, for the last.
     document_change(@s.documents, uri, text, version)
@@ -152,9 +152,9 @@ fn handle_did_close(s: *Server, msg: *LspMessage)
     if uri_val == null
         return
 
-    let uri: *u8 = lsp_string(uri_val)
+    let uri: StrView = lsp_view(uri_val)
 
-    eprint("[ritz-lsp] Document closed: {lsp_view(uri_val)}\n")
+    eprint("[ritz-lsp] Document closed: {uri}\n")
 
     document_close(@s.documents, uri)
 
@@ -162,7 +162,7 @@ fn handle_did_close(s: *Server, msg: *LspMessage)
     # published list until told otherwise).
     s.result_buf.clear()
     s.result_buf.push_str(c"{\"uri\":")
-    json_emit_string(strview_from_cstr(uri), @&s.result_buf)
+    json_emit_string(uri, @&s.result_buf)
     s.result_buf.push_str(c",\"diagnostics\":[]}")
     s.result_buf.push(0)
     build_notification(c"textDocument/publishDiagnostics", s.result_buf.data, @s.response_buf)
@@ -173,7 +173,7 @@ fn handle_did_close(s: *Server, msg: *LspMessage)
 fn publish_diagnostics(s: *Server, doc: *Document)
     if doc.content == null
         return
-    diagnostics_json(doc.uri, doc.version, doc.content, doc.content_len, @s.result_buf)
+    diagnostics_json(document_uri(doc), doc.version, doc.content, doc.content_len, @s.result_buf)
     s.result_buf.push(0)
     build_notification(c"textDocument/publishDiagnostics", s.result_buf.data, @s.response_buf)
     write_message_vec(@s.response_buf)
@@ -197,9 +197,10 @@ fn request_doc(s: *Server, msg: *LspMessage, line: *i64, col: *i64) -> *Document
     let pos: *JsonValue = lsp_field(msg.params, "position")
     if text_doc == null or pos == null
         return null
-    let uri: *u8 = lsp_string(lsp_field(text_doc, "uri"))
-    if uri == null
+    let uri_val: *JsonValue = lsp_field(text_doc, "uri")
+    if uri_val == null or uri_val.kind != JSON_STRING
         return null
+    let uri: StrView = lsp_view(uri_val)
     *line = lsp_number(lsp_field(pos, "line"))
     *col = lsp_number(lsp_field(pos, "character"))
     let doc: *Document = document_get(@s.documents, uri)
@@ -216,7 +217,7 @@ fn handle_hover(s: *Server, msg: *LspMessage)
     if doc == null
         let _: bool = s.result_buf.push_str(c"null")
     else
-        hover_json(doc.uri, doc.content, doc.content_len, line, col, @s.result_buf)
+        hover_json(document_uri(doc), doc.content, doc.content_len, line, col, @s.result_buf)
     s.result_buf.push(0)
     build_response(msg.id, s.result_buf.data, @s.response_buf)
     write_message_vec(@s.response_buf)
@@ -231,7 +232,7 @@ fn handle_definition(s: *Server, msg: *LspMessage)
     if doc == null
         let _: bool = s.result_buf.push_str(c"null")
     else
-        definition_json(doc.uri, doc.content, doc.content_len, line, col, @s.result_buf)
+        definition_json(document_uri(doc), doc.content, doc.content_len, line, col, @s.result_buf)
     s.result_buf.push(0)
     build_response(msg.id, s.result_buf.data, @s.response_buf)
     write_message_vec(@s.response_buf)
@@ -241,30 +242,30 @@ fn handle_definition(s: *Server, msg: *LspMessage)
 # =============================================================================
 
 pub fn dispatch_message(s: *Server, msg: *LspMessage) -> i32
-    if msg.method == null
+    if not msg.has_method
         return 0
 
     # Check method and dispatch
-    if streq(msg.method, c"initialize")
+    if msg.method.eq("initialize")
         handle_initialize(s, msg)
-    else if streq(msg.method, c"initialized")
+    else if msg.method.eq("initialized")
         handle_initialized(s, msg)
-    else if streq(msg.method, c"shutdown")
+    else if msg.method.eq("shutdown")
         handle_shutdown(s, msg)
-    else if streq(msg.method, c"exit")
+    else if msg.method.eq("exit")
         return handle_exit(s, msg)
-    else if streq(msg.method, c"textDocument/didOpen")
+    else if msg.method.eq("textDocument/didOpen")
         handle_did_open(s, msg)
-    else if streq(msg.method, c"textDocument/didChange")
+    else if msg.method.eq("textDocument/didChange")
         handle_did_change(s, msg)
-    else if streq(msg.method, c"textDocument/didClose")
+    else if msg.method.eq("textDocument/didClose")
         handle_did_close(s, msg)
-    else if streq(msg.method, c"textDocument/hover")
+    else if msg.method.eq("textDocument/hover")
         handle_hover(s, msg)
-    else if streq(msg.method, c"textDocument/definition")
+    else if msg.method.eq("textDocument/definition")
         handle_definition(s, msg)
     else
-        eprint("[ritz-lsp] Unknown method: {strview_from_cstr(msg.method)}\n")
+        eprint("[ritz-lsp] Unknown method: {msg.method}\n")
 
         # Return method not found for requests
         if msg.kind == MSG_REQUEST
@@ -293,11 +294,13 @@ pub fn server_run(s: *Server) -> i32
         var msg: LspMessage = parse_message(json_str)
 
         let exit_code: i32 = dispatch_message(s, @msg)
+        # msg.method borrows from the parsed JSON lsp_message_free releases.
+        let is_exit: bool = msg.method.eq("exit")
 
         lsp_message_free(@msg)
         free(json_str)
 
-        if s.shutdown_requested != 0 && streq(msg.method, c"exit")
+        if s.shutdown_requested != 0 && is_exit
             return exit_code
 
     return 0

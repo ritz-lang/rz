@@ -1,7 +1,8 @@
 """AGAST #4636: sys.ritz's C-shaped API fns, pinned down-only.
 
-The sys_* kernel ABI is exempt by `standard-exempt-file(sys_*)`; the 8
-violations (signal_ignore, tcgetattr, get_winsize, ...) sit above it.
+The sys_* kernel ABI is exempt by `standard-exempt-file(sys_*)`; the last
+non-exempt fns (signal_ignore, tcgetattr, get_winsize, ...) moved to
+ritzlib.process and ritzlib.term as Results (AGAST #4686).
 
 The pin is a ceiling of (violations, violations + exempt) per counting rule
 (standard_report.ratchet_breaches): a migration that lowers a count passes,
@@ -22,7 +23,7 @@ pytestmark = pytest.mark.unit
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent.parent
 
-PINS = {"out-param": (0, 9), "status-return": (8, 78)}
+PINS = {"out-param": (0, 9), "status-return": (0, 71)}
 
 
 def test_sys_c_shapes_only_go_down():

@@ -45,7 +45,7 @@ RUNTIME = KERNEL_SRC / "syscall" / "runtime"
 METRICS = RITZ0_DIR.parents[1] / "larb" / "tools" / "ritz-metrics" / "ritz_metrics.py"
 
 # area module -> the fns it now defines. (process.ritz's private prints_str
-# is gone: it logs paths with klog.ritz's klog_cstr, AGAST #1885.)
+# is gone: it logs paths with klog.ritz's klog, AGAST #1885 / #4686.)
 AREAS = {
     "entry": ["syscall_init", "syscall_table_init", "syscall_handler"],
     "process": [
@@ -152,11 +152,12 @@ def test_area_module_defines_its_code(area):
     assert not set(CONSTS.get(area, [])) - _consts(code), sorted(set(CONSTS.get(area, [])) - _consts(code))
 
 
-def test_process_logs_paths_through_klog_cstr():
+def test_process_logs_paths_through_klog():
     """prints_str (serial only, so missing from the crash ring) became klog.ritz's
-    klog_cstr (AGAST #1885); process.ritz must not grow a private copy back."""
+    klog_cstr (AGAST #1885), then klog of the path's StrView when klog_cstr
+    went (#4686); process.ritz must not grow a private copy back."""
     code = _code(_area("process"))
-    assert "klog_cstr" in (_imports_from(code, "klog") or set())
+    assert "klog" in (_imports_from(code, "klog") or set())
     assert "prints_str" not in _fns(code)
 
 

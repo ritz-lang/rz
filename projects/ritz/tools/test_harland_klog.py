@@ -80,7 +80,7 @@ def test_every_kernel_message_reaches_the_ring():
     hits = serial_only_calls(KERNEL)
     assert not hits, (
         f"{len(hits)} kernel output call(s) skip the crash ring; log through "
-        "klog.ritz (klog, klog_cstr, klog_dec, klog_udec, klog_hex, "
+        "klog.ritz (klog, klog_dec, klog_udec, klog_hex, "
         "klog_hex_width, klog_hex_prefix):\n" + "\n".join(hits[:40])
     )
 

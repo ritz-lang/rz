@@ -1,0 +1,65 @@
+# ritzlib/term.ritz - Terminal attributes and size (Linux termios) -> Result
+#
+#   tcgetattr(fd) -> Result<Termios, Errno>
+#   tcsetattr(fd, @t, when: TcsetWhen) -> Result<(), Errno>
+#   get_winsize(fd) -> Result<Winsize, Errno>
+#
+# Each is one ioctl(2) on `fd` (TCGETS / TCSETS* / TIOCGWINSZ).  A fd that
+# is not a terminal is Err(Other(25)) (ENOTTY), which is the usual answer
+# under a test harness or a pipe.
+#
+#   match tcgetattr(STDIN)
+#       Ok(orig) =>
+#           var raw: Termios = orig
+#           raw.c_lflag = raw.c_lflag & (0xFFFFFFFF ^ (ECHO | ICANON))
+#           tcsetattr(STDIN, @raw, TcsetWhen.Now)
+#       Err(e) => ...    # not a tty
+#
+# Harland's console has its own three-flag form (sys_tty_getattr /
+# sys_tty_setattr, TtyAttrs in ritzlib.sys).
+#
+# AGAST #4686: these replaced sys.ritz's out-param `-> i32` forms.
+
+import ritzlib.sys
+import ritzlib.result
+# Termios / Winsize are this API's values, so importers of term get them too.
+pub import ritzlib.sys { Termios, Winsize }
+# Errno is part of this API (every Err), so importers of term get it too.
+pub import ritzlib.errno
+
+# When tcsetattr applies the new attributes (TCSETS / TCSETSW / TCSETSF).
+pub enum TcsetWhen
+    Now      # at once (TCSANOW)
+    Drain    # once pending output has been written (TCSADRAIN)
+    Flush    # after a drain, discarding unread input (TCSAFLUSH)
+
+# The terminal attributes of `fd`.
+[[target_os = "linux"]]
+pub fn tcgetattr(fd: i32) -> Result<Termios, Errno>
+    var t: Termios
+    let rc: i32 = sys_ioctl(fd, TCGETS, @t as *u8)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(t)
+
+# Set the terminal attributes of `fd` to `t`, at the point `when` names.
+[[target_os = "linux"]]
+pub fn tcsetattr(fd: i32, t: @Termios, when: TcsetWhen) -> Result<(), Errno>
+    let request: u64 = match when
+        TcsetWhen.Now => TCSETS
+        TcsetWhen.Drain => TCSETSW
+        TcsetWhen.Flush => TCSETSF
+    var copy: Termios = *t
+    let rc: i32 = sys_ioctl(fd, request, @copy as *u8)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(())
+
+# The window size (rows, columns) of the terminal on `fd`.
+[[target_os = "linux"]]
+pub fn get_winsize(fd: i32) -> Result<Winsize, Errno>
+    var ws: Winsize
+    let rc: i32 = sys_ioctl(fd, TIOCGWINSZ, @ws as *u8)
+    if rc < 0
+        return Err(errno_from_raw(rc))
+    Ok(ws)

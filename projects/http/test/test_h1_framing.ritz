@@ -6,22 +6,22 @@
 # decide message length: Content-Length as an i64, chunked
 # Transfer-Encoding, and the smuggling cases RFC 9112 6.3 says to reject.
 
-import ritzlib.str
+import ritzlib.strview
 import lib.h1_framing
 
-fn frame(s: *u8, max_body: i64, f: *H1Frame) -> i64
-    return h1_frame_request(s, strlen(s), max_body, f)
+fn frame(s: StrView, max_body: i64, f: *H1Frame) -> i64
+    return h1_frame_request(s.as_ptr(), s.len(), max_body, f)
 
-fn frame_of(s: *u8) -> i64
+fn frame_of(s: StrView) -> i64
     var f: H1Frame
     return frame(s, 0, @f)
 
-# 1 when buf[0..n) equals the C string `want`.
-fn bytes_eq(buf: *u8, n: i64, want: *u8) -> i32
-    if n != strlen(want)
+# 1 when buf[0..n) equals `want`.
+fn bytes_eq(buf: *u8, n: i64, want: StrView) -> i32
+    if n != want.len()
         return 0
     for i in 0..n
-        if *(buf + i) != *(want + i)
+        if *(buf + i) != want.get(i)
             return 0
     return 1
 
@@ -33,24 +33,24 @@ fn bytes_eq(buf: *u8, n: i64, want: *u8) -> i32
 [[test]]
 fn test_no_body() -> i32
     var f: H1Frame
-    let r = c"GET / HTTP/1.1\r\nHost: x\r\n\r\n"
-    if frame(r, 0, @f) != strlen(r)
+    let r = "GET / HTTP/1.1\r\nHost: x\r\n\r\n"
+    if frame(r, 0, @f) != r.len()
         return 1
     if f.body_kind != H1F_BODY_NONE or f.body_len != 0
         return 2
-    if f.headers_end != strlen(r)
+    if f.headers_end != r.len()
         return 3
     return 0
 
 [[test]]
 fn test_content_length_body() -> i32
     var f: H1Frame
-    let r = c"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"
-    if frame(r, 0, @f) != strlen(r)
+    let r = "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"
+    if frame(r, 0, @f) != r.len()
         return 1
     if f.body_kind != H1F_BODY_LENGTH or f.body_len != 5
         return 2
-    if f.headers_end != strlen(r) - 5
+    if f.headers_end != r.len() - 5
         return 3
     return 0
 
@@ -58,25 +58,25 @@ fn test_content_length_body() -> i32
 fn test_content_length_is_i64() -> i32
     # 5000000000 does not fit an i32; it is a valid length, still on the wire.
     var f: H1Frame
-    let r = c"POST / HTTP/1.1\r\nContent-Length: 5000000000\r\n\r\n"
+    let r = "POST / HTTP/1.1\r\nContent-Length: 5000000000\r\n\r\n"
     if frame(r, 0, @f) != H1F_INCOMPLETE
         return 1
     if f.body_len != 5000000000
         return 2
-    if f.total != strlen(r) + 5000000000
+    if f.total != r.len() + 5000000000
         return 3
     return 0
 
 [[test]]
 fn test_content_length_over_max_is_too_large() -> i32
     var f: H1Frame
-    if frame(c"POST / HTTP/1.1\r\nContent-Length: 1001\r\n\r\n", 1000, @f) != H1F_TOO_LARGE
+    if frame("POST / HTTP/1.1\r\nContent-Length: 1001\r\n\r\n", 1000, @f) != H1F_TOO_LARGE
         return 1
     return 0
 
 [[test]]
 fn test_content_length_overflowing_i64_is_bad() -> i32
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n") != H1F_BAD_REQUEST
         return 1
     return 0
 
@@ -86,19 +86,19 @@ fn test_content_length_overflowing_i64_is_bad() -> i32
 [[test]]
 fn test_content_length_extremes() -> i32
     var f: H1Frame
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n") != 38
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\n") != 38
         return 1
-    if frame(c"POST / HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n", 0, @f) != H1F_TOO_LARGE
+    if frame("POST / HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n", 0, @f) != H1F_TOO_LARGE
         return 2
-    if frame(c"POST / HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n", 1000, @f) != H1F_TOO_LARGE
+    if frame("POST / HTTP/1.1\r\nContent-Length: 9223372036854775807\r\n\r\n", 1000, @f) != H1F_TOO_LARGE
         return 3
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: 9223372036854775808\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: 9223372036854775808\r\n\r\n") != H1F_BAD_REQUEST
         return 4
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: -9223372036854775808\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: -9223372036854775808\r\n\r\n") != H1F_BAD_REQUEST
         return 5
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: +0\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: +0\r\n\r\n") != H1F_BAD_REQUEST
         return 6
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: x\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: x\r\n\r\n") != H1F_BAD_REQUEST
         return 7
     return 0
 
@@ -106,57 +106,57 @@ fn test_content_length_extremes() -> i32
 fn test_content_length_overflowing_total_is_too_large() -> i32
     # Fits an i64, but the header bytes plus it do not.
     var f: H1Frame
-    if frame(c"POST / HTTP/1.1\r\nContent-Length: 9223372036854775790\r\n\r\n", 0, @f) != H1F_TOO_LARGE
+    if frame("POST / HTTP/1.1\r\nContent-Length: 9223372036854775790\r\n\r\n", 0, @f) != H1F_TOO_LARGE
         return 1
     return 0
 
 [[test]]
 fn test_content_length_ows_is_trimmed() -> i32
     var f: H1Frame
-    let r = c"POST / HTTP/1.1\r\nContent-Length: \t3 \r\n\r\nabc"
-    if frame(r, 0, @f) != strlen(r)
+    let r = "POST / HTTP/1.1\r\nContent-Length: \t3 \r\n\r\nabc"
+    if frame(r, 0, @f) != r.len()
         return 1
     return 0
 
 [[test]]
 fn test_invalid_content_length_is_bad() -> i32
     # Was "no body": the bytes after the headers then parsed as a request.
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n") != H1F_BAD_REQUEST
         return 1
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: 12abc\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: 12abc\r\n\r\n") != H1F_BAD_REQUEST
         return 2
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n") != H1F_BAD_REQUEST
         return 3
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length:\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length:\r\n\r\n") != H1F_BAD_REQUEST
         return 4
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\nhello") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: 5, 5\r\n\r\nhello") != H1F_BAD_REQUEST
         return 5
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\nhello") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\nhello") != H1F_BAD_REQUEST
         return 6
     return 0
 
 [[test]]
 fn test_duplicate_content_length_is_bad() -> i32
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!") != H1F_BAD_REQUEST
         return 1
     # Even when they agree: one length, one header.
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: 5\r\ncontent-length: 5\r\n\r\nhello") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: 5\r\ncontent-length: 5\r\n\r\nhello") != H1F_BAD_REQUEST
         return 2
     return 0
 
 [[test]]
 fn test_header_name_case_insensitive() -> i32
     var f: H1Frame
-    let r = c"POST / HTTP/1.1\r\ncOnTeNt-LeNgTh: 2\r\n\r\nhi"
-    if frame(r, 0, @f) != strlen(r)
+    let r = "POST / HTTP/1.1\r\ncOnTeNt-LeNgTh: 2\r\n\r\nhi"
+    if frame(r, 0, @f) != r.len()
         return 1
     return 0
 
 [[test]]
 fn test_similar_header_names_are_not_framing() -> i32
     var f: H1Frame
-    let r = c"GET / HTTP/1.1\r\nX-Content-Length: 5\r\nContent-Lengthy: 7\r\nTransfer-Encodings: gzip\r\n\r\n"
-    if frame(r, 0, @f) != strlen(r)
+    let r = "GET / HTTP/1.1\r\nX-Content-Length: 5\r\nContent-Lengthy: 7\r\nTransfer-Encodings: gzip\r\n\r\n"
+    if frame(r, 0, @f) != r.len()
         return 1
     if f.body_kind != H1F_BODY_NONE
         return 2
@@ -166,21 +166,21 @@ fn test_similar_header_names_are_not_framing() -> i32
 fn test_space_before_colon_is_bad() -> i32
     # RFC 9112 5.1: a server MUST reject whitespace between name and colon,
     # or "Content-Length : 5" frames differently here and in a proxy.
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length : 5\r\n\r\nhello") != H1F_BAD_REQUEST
         return 1
     return 0
 
 [[test]]
 fn test_obs_fold_is_bad() -> i32
-    if frame_of(c"POST / HTTP/1.1\r\nX-A: 1\r\n Content-Length: 5\r\n\r\nhello") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nX-A: 1\r\n Content-Length: 5\r\n\r\nhello") != H1F_BAD_REQUEST
         return 1
     return 0
 
 [[test]]
 fn test_bare_lf_is_bad() -> i32
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: 5\nX: y\r\n\r\nhello") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: 5\nX: y\r\n\r\nhello") != H1F_BAD_REQUEST
         return 1
-    if frame_of(c"GET / HTTP/1.1\n\n") != H1F_BAD_REQUEST
+    if frame_of("GET / HTTP/1.1\n\n") != H1F_BAD_REQUEST
         return 2
     return 0
 
@@ -191,29 +191,29 @@ fn test_bare_lf_is_bad() -> i32
 
 [[test]]
 fn test_cl_and_te_is_bad() -> i32
-    if frame_of(c"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n") != H1F_BAD_REQUEST
         return 1
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n") != H1F_BAD_REQUEST
         return 2
     return 0
 
 [[test]]
 fn test_unsupported_te_is_not_implemented() -> i32
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n") != H1F_NOT_IMPLEMENTED
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n") != H1F_NOT_IMPLEMENTED
         return 1
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n") != H1F_NOT_IMPLEMENTED
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n") != H1F_NOT_IMPLEMENTED
         return 2
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n") != H1F_NOT_IMPLEMENTED
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n") != H1F_NOT_IMPLEMENTED
         return 3
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked, identity\r\n\r\n") != H1F_NOT_IMPLEMENTED
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked, identity\r\n\r\n") != H1F_NOT_IMPLEMENTED
         return 4
     return 0
 
 [[test]]
 fn test_chunked_body() -> i32
     var f: H1Frame
-    let r = c"POST / HTTP/1.1\r\nTransfer-Encoding: Chunked \r\n\r\n5\r\nhello\r\n7;ext=1\r\n, world\r\n0\r\nX-Trailer: t\r\n\r\n"
-    if frame(r, 0, @f) != strlen(r)
+    let r = "POST / HTTP/1.1\r\nTransfer-Encoding: Chunked \r\n\r\n5\r\nhello\r\n7;ext=1\r\n, world\r\n0\r\nX-Trailer: t\r\n\r\n"
+    if frame(r, 0, @f) != r.len()
         return 1
     if f.body_kind != H1F_BODY_CHUNKED or f.body_len != 12
         return 2
@@ -222,20 +222,20 @@ fn test_chunked_body() -> i32
 [[test]]
 fn test_chunked_dechunk_in_place() -> i32
     var buf: [128]u8
-    let r = c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nA\r\n, world!!!\r\n0\r\n\r\nGET /next"
-    let n: i64 = strlen(r)
+    let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nA\r\n, world!!!\r\n0\r\n\r\nGET /next"
+    let n: i64 = r.len()
     for i in 0..n
-        buf[i] = *(r + i)
+        buf[i] = r.get(i)
     var f: H1Frame
     let total: i64 = h1_frame_request(@buf[0], n, 0, @f)
     if total != n - 9
         return 1
     if h1_frame_dechunk(@buf[0], @f) != 15
         return 2
-    if bytes_eq(@buf[f.headers_end], 15, c"hello, world!!!") == 0
+    if bytes_eq(@buf[f.headers_end], 15, "hello, world!!!") == 0
         return 3
     # The pipelined bytes behind it are untouched.
-    if bytes_eq(@buf[total], 9, c"GET /next") == 0
+    if bytes_eq(@buf[total], 9, "GET /next") == 0
         return 4
     return 0
 
@@ -243,13 +243,13 @@ fn test_chunked_dechunk_in_place() -> i32
 fn test_chunked_incomplete_at_every_split() -> i32
     # Every proper prefix of a chunked request is incomplete, never an error:
     # a body split across recv() calls must keep being read.
-    let r = c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4;a=b\r\nWiki\r\n10\r\n0123456789abcdef\r\n0\r\nT: 1\r\n\r\n"
-    let n: i64 = strlen(r)
+    let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4;a=b\r\nWiki\r\n10\r\n0123456789abcdef\r\n0\r\nT: 1\r\n\r\n"
+    let n: i64 = r.len()
     var f: H1Frame
     for cut in 0..n
-        if h1_frame_request(r, cut, 0, @f) != H1F_INCOMPLETE
+        if h1_frame_request(r.as_ptr(), cut, 0, @f) != H1F_INCOMPLETE
             return (cut + 1) as i32
-    if h1_frame_request(r, n, 0, @f) != n
+    if h1_frame_request(r.as_ptr(), n, 0, @f) != n
         return 1000
     if f.body_len != 20
         return 1001
@@ -257,36 +257,36 @@ fn test_chunked_incomplete_at_every_split() -> i32
 
 [[test]]
 fn test_content_length_incomplete_at_every_split() -> i32
-    let r = c"POST /p HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world"
-    let n: i64 = strlen(r)
+    let r = "POST /p HTTP/1.1\r\nContent-Length: 11\r\n\r\nhello world"
+    let n: i64 = r.len()
     var f: H1Frame
     for cut in 0..n
-        if h1_frame_request(r, cut, 0, @f) != H1F_INCOMPLETE
+        if h1_frame_request(r.as_ptr(), cut, 0, @f) != H1F_INCOMPLETE
             return (cut + 1) as i32
-    if h1_frame_request(r, n, 0, @f) != n
+    if h1_frame_request(r.as_ptr(), n, 0, @f) != n
         return 1000
     return 0
 
 [[test]]
 fn test_chunked_bad_size_line() -> i32
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n") != H1F_BAD_REQUEST
         return 1
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n\r\n") != H1F_BAD_REQUEST
         return 2
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n-5\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n-5\r\n") != H1F_BAD_REQUEST
         return 3
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n") != H1F_BAD_REQUEST
         return 4
     # 17 hex digits overflow an i64's 15-digit budget.
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000000\r\n") != H1F_BAD_REQUEST
         return 5
     return 0
 
 [[test]]
 fn test_chunked_leading_zeros_are_fine() -> i32
     var f: H1Frame
-    let r = c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n00000000000000000002\r\nhi\r\n000\r\n\r\n"
-    if frame(r, 0, @f) != strlen(r)
+    let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n00000000000000000002\r\nhi\r\n000\r\n\r\n"
+    if frame(r, 0, @f) != r.len()
         return 1
     if f.body_len != 2
         return 2
@@ -294,18 +294,18 @@ fn test_chunked_leading_zeros_are_fine() -> i32
 
 [[test]]
 fn test_chunked_data_without_crlf_is_bad() -> i32
-    if frame_of(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n0\r\n\r\n") != H1F_BAD_REQUEST
+    if frame_of("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n0\r\n\r\n") != H1F_BAD_REQUEST
         return 1
     return 0
 
 [[test]]
 fn test_chunked_over_max_is_too_large() -> i32
     var f: H1Frame
-    let r = c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello!\r\n6\r\nhello!\r\n0\r\n\r\n"
+    let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello!\r\n6\r\nhello!\r\n0\r\n\r\n"
     if frame(r, 10, @f) != H1F_TOO_LARGE
         return 1
     # A declared chunk over the limit fails before its data arrives.
-    if frame(c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFF\r\n", 10, @f) != H1F_TOO_LARGE
+    if frame("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFF\r\n", 10, @f) != H1F_TOO_LARGE
         return 2
     return 0
 
@@ -316,16 +316,16 @@ fn test_chunked_over_max_is_too_large() -> i32
 
 [[test]]
 fn test_pipelined_requests_frame_one_at_a_time() -> i32
-    let r = c"POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\nPOST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\n\r\n"
-    let n: i64 = strlen(r)
+    let r = "POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\nPOST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nz\r\n0\r\n\r\n"
+    let n: i64 = r.len()
     var f: H1Frame
-    let a: i64 = h1_frame_request(r, n, 0, @f)
+    let a: i64 = h1_frame_request(r.as_ptr(), n, 0, @f)
     if a != 42
         return 1
-    let b: i64 = h1_frame_request(r + a, n - a, 0, @f)
+    let b: i64 = h1_frame_request(r.as_ptr() + a, n - a, 0, @f)
     if b != 19
         return 2
-    let c: i64 = h1_frame_request(r + a + b, n - a - b, 0, @f)
+    let c: i64 = h1_frame_request(r.as_ptr() + a + b, n - a - b, 0, @f)
     if c != n - a - b
         return 3
     if f.body_kind != H1F_BODY_CHUNKED or f.body_len != 1
@@ -355,14 +355,14 @@ fn test_status_for_errors() -> i32
 
 [[test]]
 fn test_continue_matches_fresh_at_every_length() -> i32
-    let r = c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4;a=b\r\nWiki\r\n10\r\n0123456789abcdef\r\n1\r\nz\r\n0\r\nT: 1\r\n\r\nGET"
-    let n: i64 = strlen(r)
+    let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n4;a=b\r\nWiki\r\n10\r\n0123456789abcdef\r\n1\r\nz\r\n0\r\nT: 1\r\n\r\nGET"
+    let n: i64 = r.len()
     var f: H1Frame
     h1_frame_init(@f)
     var fresh: H1Frame
     for cut in 0..n + 1
-        let a: i64 = h1_frame_continue(r, cut, 0, @f)
-        let b: i64 = h1_frame_request(r, cut, 0, @fresh)
+        let a: i64 = h1_frame_continue(r.as_ptr(), cut, 0, @f)
+        let b: i64 = h1_frame_request(r.as_ptr(), cut, 0, @fresh)
         if a != b
             return (cut + 1) as i32
     if f.body_len != 21 or f.total != n - 3
@@ -372,10 +372,10 @@ fn test_continue_matches_fresh_at_every_length() -> i32
 [[test]]
 fn test_continue_resumes_after_the_last_whole_chunk() -> i32
     var buf: [128]u8
-    let r = c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n"
-    let n: i64 = strlen(r)
+    let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n"
+    let n: i64 = r.len()
     for i in 0..n
-        buf[i] = *(r + i)
+        buf[i] = r.get(i)
     var f: H1Frame
     h1_frame_init(@f)
     if h1_frame_continue(@buf[0], n, 0, @f) != H1F_INCOMPLETE
@@ -384,9 +384,9 @@ fn test_continue_resumes_after_the_last_whole_chunk() -> i32
         return 2
     # The chunks already walked are not looked at again: garble one.
     buf[f.headers_end] = 'z'
-    let tail = c"0\r\n\r\n"
+    let tail = "0\r\n\r\n"
     for i in 0..5
-        buf[n + i] = *(tail + i)
+        buf[n + i] = tail.get(i)
     if h1_frame_continue(@buf[0], n + 5, 0, @f) != n + 5
         return 3
     if f.body_len != 6
@@ -397,20 +397,20 @@ fn test_continue_resumes_after_the_last_whole_chunk() -> i32
 fn test_continue_content_length_waits_without_rescanning() -> i32
     var f: H1Frame
     h1_frame_init(@f)
-    let r = c"POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nab"
-    if h1_frame_continue(r, strlen(r), 0, @f) != H1F_INCOMPLETE
+    let r = "POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nab"
+    if h1_frame_continue(r.as_ptr(), r.len(), 0, @f) != H1F_INCOMPLETE
         return 1
-    if h1_frame_continue(c"garbage, never rescanned......................", strlen(r) + 2, 0, @f) != strlen(r) + 2
+    if h1_frame_continue("garbage, never rescanned......................".as_ptr(), r.len() + 2, 0, @f) != r.len() + 2
         return 2
     return 0
 
 [[test]]
 fn test_continue_limit_applies_across_calls() -> i32
-    let r = c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello!\r\n6\r\nhello!\r\n0\r\n\r\n"
+    let r = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello!\r\n6\r\nhello!\r\n0\r\n\r\n"
     var f: H1Frame
     h1_frame_init(@f)
-    if h1_frame_continue(r, 60, 10, @f) != H1F_INCOMPLETE
+    if h1_frame_continue(r.as_ptr(), 60, 10, @f) != H1F_INCOMPLETE
         return 1
-    if h1_frame_continue(r, strlen(r), 10, @f) != H1F_TOO_LARGE
+    if h1_frame_continue(r.as_ptr(), r.len(), 10, @f) != H1F_TOO_LARGE
         return 2
     return 0

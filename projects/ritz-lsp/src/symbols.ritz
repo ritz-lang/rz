@@ -186,11 +186,11 @@ pub fn word_at_offset(text: *u8, len: i64, line: i64, off: i64) -> Word
 
 # If bytes [i, end) start with keyword `kw` followed by a blank, the offset
 # after the keyword and its blanks; else -1.
-fn skip_keyword(text: *u8, i: i64, end: i64, kw: *u8) -> i64
-    let n: i64 = strlen(kw)
+fn skip_keyword(text: *u8, i: i64, end: i64, kw: StrView) -> i64
+    let n: i64 = kw.len()
     if i + n >= end
         return -1
-    if memcmp(text + i, kw, n) != 0 or not is_blank(*(text + i + n))
+    if not strview_from_ptr(text + i, n).eq(kw) or not is_blank(*(text + i + n))
         return -1
     var j: i64 = i + n
     while j < end and is_blank(*(text + j))
@@ -206,17 +206,17 @@ fn decl_name(text: *u8, start: i64, end: i64, exported: *bool) -> Word
     while i < end and is_blank(*(text + i))
         i += 1
     loop
-        var j: i64 = skip_keyword(text, i, end, c"pub")
+        var j: i64 = skip_keyword(text, i, end, "pub")
         if j < 0
-            j = skip_keyword(text, i, end, c"extern")
+            j = skip_keyword(text, i, end, "extern")
         if j >= 0
             *exported = true
         else
-            j = skip_keyword(text, i, end, c"async")
+            j = skip_keyword(text, i, end, "async")
         if j < 0
             break
         i = j
-    i = skip_keyword(text, i, end, c"fn")
+    i = skip_keyword(text, i, end, "fn")
     if i < 0 or not is_ident_start(*(text + i))
         return no_word()
     var e: i64 = i
@@ -267,11 +267,11 @@ struct ImportLine
 fn import_decl(text: *u8, start: i64, end: i64) -> ImportLine
     var i: i64 = start
     var is_pub: bool = false
-    let j: i64 = skip_keyword(text, i, end, c"pub")
+    let j: i64 = skip_keyword(text, i, end, "pub")
     if j >= 0
         is_pub = true
         i = j
-    i = skip_keyword(text, i, end, c"import")
+    i = skip_keyword(text, i, end, "import")
     if i < 0 or not is_ident_start(*(text + i))
         return ImportLine { start: -1, end: -1, is_pub: false }
     var e: i64 = i
@@ -282,7 +282,7 @@ fn import_decl(text: *u8, start: i64, end: i64) -> ImportLine
 # A new String holding dir[0, dir_len) + "/" + the module path with each '.'
 # turned into '/', + ".ritz".  If `sub` is non-empty it goes after the first
 # segment (<pkg>/<sub>/<rest>.ritz), and a single-segment module gives "".
-fn module_file(dir: *u8, dir_len: i64, text: *u8, imp: ImportLine, sub: *u8) -> String
+fn module_file(dir: *u8, dir_len: i64, text: *u8, imp: ImportLine, sub: StrView) -> String
     var out: String = string_from_bytes(Span<u8> { ptr: (dir), len: (dir_len) as i64 })
     if dir_len > 0 and *(dir + dir_len - 1) != '/'
         out.push('/')
@@ -292,21 +292,21 @@ fn module_file(dir: *u8, dir_len: i64, text: *u8, imp: ImportLine, sub: *u8) -> 
         let c: u8 = *(text + i)
         if c == '.'
             out.push('/')
-            if first and *sub != 0
-                out.push_cstr(sub)
+            if first and sub.len() > 0
+                out.push_str(sub)
                 out.push('/')
             first = false
         else
             out.push(c)
         i += 1
-    if first and *sub != 0
+    if first and sub.len() > 0
         return string_new()
     out.push_str(".ritz")
     out
 
 # Whether module_file(dir, dir_len, text, imp, sub) exists.  If it does, it is
 # appended to `found`.
-fn try_file(found: @&String, dir: *u8, dir_len: i64, text: *u8, imp: ImportLine, sub: *u8) -> bool
+fn try_file(found: @&String, dir: *u8, dir_len: i64, text: *u8, imp: ImportLine, sub: StrView) -> bool
     var c: String = module_file(dir, dir_len, text, imp, sub)
     var hit: bool = false
     if c.len() > 0 and exists(@&c, 0)
@@ -328,7 +328,7 @@ fn resolve_module(text: *u8, imp: ImportLine, from_dir: @&String, roots: @&Strin
         var end: i64 = from_dir.len()
         var levels: i32 = 0
         while end > 0 and levels < 8
-            if try_file(@&found, d, end, text, imp, c"")
+            if try_file(@&found, d, end, text, imp, "")
                 return found
             end = last_slash(d, end)
             levels += 1
@@ -340,11 +340,11 @@ fn resolve_module(text: *u8, imp: ImportLine, from_dir: @&String, roots: @&Strin
         while e < rn and *(r + e) != ':'
             e += 1
         if e > s
-            if try_file(@&found, r + s, e - s, text, imp, c"")
+            if try_file(@&found, r + s, e - s, text, imp, "")
                 return found
-            if try_file(@&found, r + s, e - s, text, imp, c"lib")
+            if try_file(@&found, r + s, e - s, text, imp, "lib")
                 return found
-            if try_file(@&found, r + s, e - s, text, imp, c"src")
+            if try_file(@&found, r + s, e - s, text, imp, "src")
                 return found
         s = e + 1
     found
@@ -414,7 +414,7 @@ fn search_imports(f: *Found, text: *u8, len: i64, dir: @&String, roots: @&String
 # The declaration of the function named text[w.start, w.end) that the
 # document `uri` can call goes in `f`.  The document's own declaration comes
 # first, then one its imports export.  If neither exists, f.w.start < 0.
-fn lookup(f: *Found, uri: *u8, text: *u8, len: i64, w: Word)
+fn lookup(f: *Found, uri: StrView, text: *u8, len: i64, w: Word)
     f.w = find_fn_decl(text, len, w)
     if f.w.start >= 0
         return
@@ -462,9 +462,9 @@ fn push_word_range(buf: *Vec<u8>, text: *u8, w: Word)
     push_range(buf, line, utf16_col(text, start, w.start), line, utf16_col(text, start, w.end))
 
 # `{"uri":...,"range":...}`: the Location of word `w` in `text`, the file `uri`.
-fn push_location(buf: *Vec<u8>, uri: *u8, text: *u8, w: Word)
+fn push_location(buf: *Vec<u8>, uri: StrView, text: *u8, w: Word)
     buf.push_str(c"{\"uri\":")
-    json_emit_string(strview_from_cstr(uri), buf)
+    json_emit_string(uri, buf)
     buf.push_str(c",\"range\":")
     push_word_range(buf, text, w)
     buf.push('}')
@@ -483,7 +483,7 @@ fn found_len(f: *Found, len: i64) -> i64
 # Hover: the result JSON for (line, col) in the document `uri` into `out`.  It
 # is "null" if the word there names no function that the document declares or
 # imports.
-pub fn hover_json(uri: *u8, text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
+pub fn hover_json(uri: StrView, text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
     out.clear()
     let w: Word = word_at(text, len, line, col)
     var f: Found = found_new()
@@ -506,9 +506,8 @@ pub fn hover_json(uri: *u8, text: *u8, len: i64, line: i64, col: i64, out: *Vec<
     md.push_str(c"```ritz\n")
     md.push_span(Span<u8> { ptr: (dt + s), len: (e - s) as i64 })
     md.push_str(c"\n```")
-    md.push(0)
     out.push_str(c"{\"contents\":{\"kind\":\"markdown\",\"value\":")
-    json_emit_string(strview_from_cstr(md.data), out)
+    json_emit_string(strview_from_ptr(md.data, md.len), out)
     out.push_str(c"},\"range\":")
     push_word_range(out, text, w)
     out.push('}')
@@ -516,7 +515,7 @@ pub fn hover_json(uri: *u8, text: *u8, len: i64, line: i64, col: i64, out: *Vec<
 # Definition: the Location JSON for (line, col) in the document `uri` into
 # `out`.  It is "null" if the word there names no function that the document
 # declares or imports.
-pub fn definition_json(uri: *u8, text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
+pub fn definition_json(uri: StrView, text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
     out.clear()
     let w: Word = word_at(text, len, line, col)
     var f: Found = found_new()
@@ -528,4 +527,4 @@ pub fn definition_json(uri: *u8, text: *u8, len: i64, line: i64, col: i64, out: 
         push_location(out, uri, text, f.w)
     else
         var furi: String = uri_from_path(@&f.path)
-        push_location(out, furi.as_ptr(), (f.text).as_ptr(), f.w)
+        push_location(out, furi.as_view(), (f.text).as_ptr(), f.w)

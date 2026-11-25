@@ -14,6 +14,9 @@ klog_cstr and the klog_dec/udec/hex family replace klog(*u8), klogs,
 klog_hex(prefix, v, suffix) and serial's prints/serial_print_*, so the
 moved lines below now read `klog("...")`.
 
+#4686 deleted klog_cstr: its last callers (the syscall paths) pass the
+StrView uptr_validate_string's length gives them to klog.
+
 It ports main's code, not the #1844 branch's (83af7f1d): main has since edited
 kernel_main (#2118/#2130/#2143), and the branch's ring_write_byte grew a
 defensive clamp that would change behaviour. #1887 will gate the self-tests
@@ -58,7 +61,7 @@ METRICS = RITZ0_DIR.parents[1] / "larb" / "tools" / "ritz-metrics" / "ritz_metri
 KLOG_FNS = {
     "ring_write_byte": False, "ring_clear": True, "ring_len": False, "ring_at": False,
     "ring_copy": True, "ring_dump": True, "klog_serial": True, "klog_bytes": False,
-    "klog": True, "klog_cstr": True, "klog_dec": True, "klog_udec": True,
+    "klog": True, "klog_dec": True, "klog_udec": True,
     "klog_hex": True, "klog_hex_width": True, "klog_hex_prefix": True,
 }
 KLOG_VARS = {"ring_buffer", "ring_head", "ring_wrapped"}

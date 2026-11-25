@@ -4,18 +4,23 @@
 # These tests run on Linux only since that's where we develop/test.
 
 import ritzlib.sys {
-    sys_write, sys_ioctl, tcgetattr, tcsetattr, get_winsize,
-    Termios, Winsize,
-    TCGETS, TCSETS, TIOCGWINSZ,
+    sys_write,
     ECHO, ICANON, ISIG, IEXTEN, ICRNL, IXON,
     VMIN, VTIME,
     STDIN, STDOUT
 }
+import ritzlib.term { tcgetattr, tcsetattr, get_winsize, TcsetWhen, Termios, Winsize, Errno }
+import ritzlib.result
 import ritzlib.fmt
 import ritzlib.strview { StrView }
 
 fn puts(s: StrView) -> i64
     return sys_write(STDOUT, s.ptr, s.len)
+
+fn failed(r: Result<(), Errno>) -> bool
+    match r
+        Ok(_) => false
+        Err(_) => true
 
 fn print_u32(n: u32)
     let v: i64 = n as i64
@@ -29,18 +34,16 @@ fn print_u32(n: u32)
 fn test_termios_get() -> i32
     print("Testing tcgetattr...\n")
 
-    var termios: Termios
-
     # Get current terminal attributes
-    let result: i32 = tcgetattr(STDIN, @termios)
-
-    print("  tcgetattr returned: {result}\n")
-
-    if result != 0
-        # ENOTTY (-25) is expected when running without a terminal
-        # (e.g., in CI, piped, or under test harness)
-        print("  SKIP: stdin is not a tty (expected in CI)\n")
-        return 0  # Skip, not fail
+    let termios: Termios = match tcgetattr(STDIN)
+        Ok(t) => t
+        Err(e) =>
+            # ENOTTY (25) is expected when running without a terminal
+            # (e.g., in CI, piped, or under test harness)
+            let code: i32 = e.code()
+            print("  tcgetattr: errno {code}\n")
+            print("  SKIP: stdin is not a tty (expected in CI)\n")
+            return 0  # Skip, not fail
 
     # Print some values to verify structure is being read correctly
     puts("  c_lflag: ")
@@ -84,17 +87,13 @@ fn test_termios_get() -> i32
 fn test_winsize() -> i32
     print("Testing get_winsize...\n")
 
-    var ws: Winsize
-
-    let result: i32 = get_winsize(STDOUT, @ws)
-
-    print("  get_winsize returned: {result}\n")
-
     # Note: This may fail if stdout is not a tty (e.g., piped output)
-    if result != 0
-        print("  INFO: get_winsize failed (stdout may not be a tty)\n")
-        # Don't fail the test - this is expected when running under a test harness
-        return 0
+    let ws: Winsize = match get_winsize(STDOUT)
+        Ok(w) => w
+        Err(_) =>
+            print("  INFO: get_winsize failed (stdout may not be a tty)\n")
+            # Don't fail the test - this is expected when running under a test harness
+            return 0
 
     print("  Rows: {ws.ws_row}\n")
     print("  Cols: {ws.ws_col}\n")
@@ -111,12 +110,12 @@ fn test_raw_mode_roundtrip() -> i32
     print("Testing raw mode roundtrip...\n")
 
     # Get original termios
-    var orig: Termios
-    let r1: i32 = tcgetattr(STDIN, @orig)
-    if r1 != 0
-        # ENOTTY (-25) is expected when running without a terminal
-        print("  SKIP: stdin is not a tty (expected in CI)\n")
-        return 0  # Skip, not fail
+    var orig: Termios = match tcgetattr(STDIN)
+        Ok(t) => t
+        Err(_) =>
+            # ENOTTY (25) is expected when running without a terminal
+            print("  SKIP: stdin is not a tty (expected in CI)\n")
+            return 0  # Skip, not fail
 
     let orig_lflag: u32 = orig.c_lflag
     puts("  Original c_lflag: ")
@@ -141,8 +140,7 @@ fn test_raw_mode_roundtrip() -> i32
     print("\n")
 
     # Apply raw mode
-    let r2: i32 = tcsetattr(STDIN, @orig)
-    if r2 != 0
+    if failed(tcsetattr(STDIN, @orig, TcsetWhen.Now))
         print("  FAIL: tcsetattr (raw) failed\n")
         return 1
 
@@ -150,29 +148,28 @@ fn test_raw_mode_roundtrip() -> i32
 
     # Get fresh copy of terminal state and restore original lflag
     # (We can't easily copy structs, so we modify in place)
-    var restore: Termios
-    let r2b: i32 = tcgetattr(STDIN, @restore)
-    if r2b != 0
-        print("  FAIL: tcgetattr for restore failed\n")
-        return 1
+    var restore: Termios = match tcgetattr(STDIN)
+        Ok(t) => t
+        Err(_) =>
+            print("  FAIL: tcgetattr for restore failed\n")
+            return 1
 
     # Restore original flags
     restore.c_lflag = orig_lflag
     restore.c_iflag = restore.c_iflag | ICRNL | IXON
 
-    let r3: i32 = tcsetattr(STDIN, @restore)
-    if r3 != 0
+    if failed(tcsetattr(STDIN, @restore, TcsetWhen.Now))
         print("  FAIL: tcsetattr (restore) failed\n")
         return 1
 
     print("  Original mode restored\n")
 
     # Verify restoration
-    var verify: Termios
-    let r4: i32 = tcgetattr(STDIN, @verify)
-    if r4 != 0
-        print("  FAIL: Verification tcgetattr failed\n")
-        return 1
+    let verify: Termios = match tcgetattr(STDIN)
+        Ok(t) => t
+        Err(_) =>
+            print("  FAIL: Verification tcgetattr failed\n")
+            return 1
 
     if verify.c_lflag != orig_lflag
         puts("  FAIL: c_lflag not restored. Expected: ")
