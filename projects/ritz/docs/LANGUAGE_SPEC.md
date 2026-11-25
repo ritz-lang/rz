@@ -3815,12 +3815,13 @@ fn main() -> i32
 Every `match`, statement or value, must cover its scrutinee, or it is a compile
 error naming what is missing. A `match` covers its scrutinee when it has:
 
-- an unguarded `_` or binding arm; or
+- a `_` or binding arm; or
 - for an enum, generic enums included, an arm for every variant; or
 - for a `bool`, both `true` and `false`.
 
-An integer or `StrView` scrutinee needs a catch-all. A guarded arm never counts
-towards coverage, though no guard parses yet.
+An integer or `StrView` scrutinee needs a catch-all. There are no match-arm
+guards: `n if n > 0 =>` is a parse error, so test the condition in the arm
+body (AGAST #1939).
 
 ```ritz expect-error="non-exhaustive match: missing a catch-all"
 fn f(n: i64) -> i64
@@ -3877,16 +3878,15 @@ also be reachable: an arm that no value can reach is a compile error at that
 arm, naming the line of the arm that covers it. An arm is unreachable when it
 comes after:
 
-- an unguarded catch-all, `_` or a binding;
+- a catch-all, `_` or a binding;
 - an arm with the same literal or the same `const` value (`K =>` then `5 =>`,
   where `K` is 5);
 - an arm for the same variant, whatever its payload binds; or
 - arms that already cover the scrutinee, so a `_` after every variant, or after
   `true` and `false`, is an error too.
 
-A guarded arm covers nothing, as for coverage, but it can itself be
-unreachable. Since no arm hides behind another, reordering the arms of a match
-that compiles never changes which arm a value takes.
+Since no arm hides behind another, reordering the arms of a match that
+compiles never changes which arm a value takes.
 
 ```ritz expect-error="unreachable match arm: the arm at line 3 covers it"
 fn f(n: i64) -> i64
@@ -3965,8 +3965,8 @@ A character literal is `u8` (§2.6), so a character literal pattern is an
 integer literal pattern typed `u8` (LARB R72): it tests a `u8` scrutinee
 exactly as the integer its byte denotes would, under the same catch-all and
 repeated-arm rules. `'(' => …` and `40 => …` are the same test, so one after
-the other is an unreachable arm. A character pattern on any other scrutinee —
-an `i32`, `i64`, `bool`, `StrView` or enum — is a compile error at the pattern.
+the other is an unreachable arm. A character pattern on any other scrutinee
+(an `i32`, `i64`, `bool`, `StrView` or enum) is a compile error at the pattern.
 
 ```ritz
 fn kind(c: u8) -> i32
@@ -4013,14 +4013,16 @@ fn main() -> i32
         _ => 1
 ```
 
-Only a `StrView` takes a string pattern. A `*u8` or a `String` scrutinee is
-a compile error at the pattern: convert it first, with `strview_from_cstr(p)`
-or `s.as_view()`. A `StrView` takes no integer, `bool` or variant
-pattern.
+Only a `StrView` takes a string pattern. A `String` or a `*u8` scrutinee is a
+compile error at the pattern: match `s.as_view()` for a `String`. A `*u8`
+comes only from a C boundary, and the wrapper there turns it into a `StrView`
+(§3.5). A `StrView` takes no integer, `bool` or variant pattern.
 
 ```ritz expect-error="a string pattern needs a StrView scrutinee"
-fn f(p: *u8) -> i32
-    match p
+import ritzlib.string
+
+fn f(s: String) -> i32
+    match s
         "html" => 1
         _ => 0
 
@@ -4095,9 +4097,10 @@ fn main() -> i32
 A variant declared with named fields (§10.1) may instead be matched by name:
 `SetViewport { height, width }` binds each field to a local of its own name.
 Every field is named exactly once, in any order (AGAST #4187); there is no
-`..` rest pattern yet. A named pattern on a variant declared without field
-names, a field the variant doesn't declare, one named twice and one left out
-are each a compile error at the pattern. The named literal
+`..` rest pattern and no `field: name` form. To skip a field, match the
+variant positionally, `SetViewport(w, _)` (§10.3). A named pattern on a
+variant declared without field names, a field the variant doesn't declare, one
+named twice and one left out are each a compile error at the pattern. The named literal
 `SetViewport { width: 640, height: 480 }` builds the variant under the same
 rule (§10.3).
 
@@ -4171,10 +4174,10 @@ fn main() -> i32
 ```
 
 A const resolves wherever it is declared in the module, before or after the
-`match`. Qualified by its module (`instructions.POP =>` after `import
-hinting.instructions`), an integer const compares the same way, as
-`instructions.POP` reads in an expression; it is not a variant pattern. Constant patterns compare integers only: against an enum
-scrutinee, a bare name is a variant (§10.2).
+`match`. An imported const is written bare, `POP =>` after `import
+hinting.instructions`, as in an expression: there is no `module.item` access
+(§15.3), so `instructions.POP =>` is an error. Constant patterns compare
+integers only: against an enum scrutinee, a bare name is a variant (§10.2).
 
 ```ritz expect-error="a local can't take the name of a const: 'NAME' — rename the local"
 const NAME: StrView = "ritz"
@@ -4334,7 +4337,7 @@ fn main() -> i32
 A literal is the only way to make a struct value. Nothing converts to a struct,
 even one with a single field: `f(1)` for `fn f(s: S)` with `struct S { x: i32 }`
 is "argument 1 of `f` has the wrong type", and you write `f(S { x: 1 })` (LARB
-R47, AGAST #3336; ritz0 wraps the integer today).
+R47, AGAST #3336).
 
 A field the literal leaves out is zero, and so is every element and field
 inside it: `S { count: 3 }` for `struct S { a: [64]i64, count: i32 }` has
@@ -4403,9 +4406,7 @@ fn main() -> i32
 ```
 
 Unlike a bare constructor, an untyped `let` doesn't look at the fn's return
-type: it has no slot, so its literal takes the field values' types. ritz0
-(#3407) and ritz1 (#3408) implement this; before them, each refused an
-args-less literal (#3311).
+type: it has no slot, so its literal takes the field values' types.
 
 ### 9.3 Field Access
 
@@ -4422,22 +4423,27 @@ fn main() -> i32
 
 ### 9.4 Methods
 
-Constructors are ordinary free functions; there is no `Type::new` path syntax.
+A constructor is a method without `self`, called on the type as
+`Point.new(3, 4)` (§5.4), or a free function such as `point_origin`. Either way
+it returns the value. There is no `Type::new` path syntax (§10.2).
 
 ```ritz
 struct Point
     x: i32
     y: i32
 
-fn point_new(x: i32, y: i32) -> Point
-    Point { x: x, y: y }
-
 impl Point
+    fn new(x: i32, y: i32) -> Point
+        Point { x: x, y: y }
+
     fn distance_squared(self) -> i32
         self.x * self.x + self.y * self.y
 
+fn point_origin() -> Point
+    Point { x: 0, y: 0 }
+
 fn main() -> i32
-    point_new(3, 4).distance_squared()
+    Point.new(3, 4).distance_squared() + point_origin().x
 ```
 
 A method has no type parameters of its own: `fn conv<T>(self: *Point, x: T)`
@@ -4488,7 +4494,7 @@ compiler tracks which one.
 
 ### 10.1 Definition
 
-The simplest enums are C-style — variants with no payload:
+The simplest enums are fieldless, with no variant carrying a payload:
 
 ```ritz
 enum Color
@@ -4525,7 +4531,7 @@ pub enum Msg
 
 Named fields are **sugar**: `SetViewport` above has exactly the same tag and
 memory layout as `SetViewport(u32, u32)` would. Field order is therefore
-significant — reordering fields changes the layout, just as it does in a
+significant: reordering fields changes the layout, just as it does in a
 `struct`.
 
 `Option<T>` and `Result<T, E>` are defined in `ritzlib.option` and
@@ -4588,8 +4594,8 @@ An enum without a representation type stores its variant index, which names
 no variant only if the memory was corrupted; a `match` on one has no such
 check, and reaching it is undefined behaviour.
 
-A `match` on an enum must cover every variant (§8.1). For the full treatment —
-memory layout and the design rationale — see
+A `match` on an enum must cover every variant (§8.1). For the memory layout
+and the design rationale, see
 [`docs/ENUM_VARIANTS.md`](ENUM_VARIANTS.md).
 
 ### 10.2 Usage
@@ -4616,8 +4622,8 @@ fn main() -> i32
 let c = Color::Red
 ```
 
-Use free functions instead: `string_from(sv)`, `strview_from_cstr(p)`,
-`vec_new<T>()`.
+Use `.` for a variant (`Color.Red`) or a method without `self` (§5.4), and a
+free function where there is one: `string_from(sv)`, `vec_new<T>()`.
 
 **Bare variants.** A variant may be written without its enum (`Red`, `Red()`,
 `Circle(1.0)`) only when **exactly one** enum in scope (declared or imported,
@@ -4664,8 +4670,8 @@ against an `S` is `S.B`. An enum reached twice through an import cycle is
 still one enum.
 
 A local or parameter can't be named like a variant (§4.3), so a bare `B` is
-never a local. Until AGAST #2407 the local won; a name with two meanings is
-now an error at the binding:
+never a local: a name with two meanings is an error at the binding (AGAST
+#2407):
 
 ```ritz expect-error="a local can't take the name of a variant: 'B' — rename the local"
 enum S
@@ -4928,9 +4934,10 @@ fn main() -> i32
     identity<i32>(x)
 ```
 
-Type arguments are explicit at the call site (`identity<i32>(x)`), including
-pointer arguments (`option_is_none<*Page>(@p)`). A function with several type
-parameters takes one argument per parameter, in order:
+A call usually takes its type arguments from its arguments (§4.4). It can
+also spell them out, `identity<i32>(x)`, and must when no argument binds a
+parameter, as in `vec_new<*Node>()`. An explicit list has one type per
+parameter, in order:
 
 ```ritz
 fn second<T, U>(a: T, b: U) -> U
@@ -4945,7 +4952,8 @@ list of two or more type arguments as a call only if none of them is a bare
 lowercase identifier: by naming convention (`docs/STANDARD.md` S-NAME-1, S-NAME-2: types are
 PascalCase, variables snake_case) such a name is a value, so
 the example above stays two comparison arguments. ritz0 does not make this
-distinction yet; it always reads `<...>(` as type arguments.
+distinction: it always reads `<...>(` as type arguments, so under ritz0 the
+first line is a call to `a<b, c>` and fails with "unknown type `b`".
 
 ```
 f(a < b, c > (d))          # ritz1: f((a < b), (c > (d)))
@@ -5063,10 +5071,6 @@ RITZ_PATH=$PWD python3 ritz0/ritz0.py prog.ritz -o prog.ll --no-runtime
 grep -o 'Result\$[A-Za-z0-9_]*' prog.ll | sort -u
 ```
 
-This document claimed until 2026-09-12 that only the first type argument
-mangled — which would have made `Result<i32, StrView>` and `Result<i32, i64>`
-collide. They do not.
-
 A method of a generic inherent impl (`impl<T> Cell<T>`) is specialised, and
 type- and move-checked, only at the instances a call names it at, as a
 generic fn is: `x.m()` on that instance, `T.m()` filling a slot of it, or a
@@ -5181,8 +5185,8 @@ fn main() -> i32
     0
 ```
 
-Traits are structural in ritz0: an `impl Trait for Type` block is checked for
-shape and its methods are emitted, but there is no dynamic dispatch and no `dyn
+Traits are static: an `impl Trait for Type` block is checked for shape and
+its methods are emitted, but there is no dynamic dispatch and no `dyn
 Trait`. Methods are resolved statically from the receiver's concrete type. A
 generic parameter's trait bound is a check at instantiation (§11.5).
 
@@ -5194,10 +5198,12 @@ R36's revisit (Aaron, 2026-11-20, AGAST #4294) admits a *trait* impl on a
 primitive or on a closed built-in, but only in the file that declares the
 trait:
 
-- `impl Display for i64` and `impl Display for bool` — primitives;
-- `impl Display for *u8` — the pointer type;
-- `impl Display for StrView` — a built-in;
-- `impl Display for Span<u8>` — one concrete instantiation.
+- `impl Display for i64` and `impl Display for bool`: primitives;
+- `impl Display for StrView`: a built-in;
+- `impl Display for Span<u8>`: one concrete instantiation;
+- `impl Display for *u8`: a pointer type. ritzlib's prints a NUL-terminated
+  C string, for text that arrives from a C-interop boundary; Ritz text is a
+  `StrView` (§3.5, S-TEXT-1).
 
 An inherent impl is still refused, and a trait impl outside the trait's file
 is "`i64` is a built-in type: a trait impl for it must be in the trait's file
@@ -5231,7 +5237,7 @@ impl G<u8>
 A generic impl declares its parameters (LARB R81, AGAST #1390). In
 `impl Box<T>`, written without `<T>`, `T` is an ordinary type name; if no type
 `T` exists, it is an error at the `T`: "unknown type `T`: a generic impl
-declares it, `impl<T> Box<T>`" (ritz0; ritz1's half is #4002).
+declares it, `impl<T> Box<T>`", from ritz0, ritz1 and ritz1_selfhosted.
 
 `dyn` stays a reserved keyword (§2.4). Every use of it, in any type position
 or after `as`, is an error located at the `dyn` token, from ritz0, ritz1 and
@@ -6423,8 +6429,8 @@ fn main() -> i32
 
 A tuple element moves the same way, by its index: `p.0` moves out of `p`, `p.1`
 stays usable, `p` is partly moved and `p`'s drop skips the element. So does an
-element on a longer path, like `v.pair.0`. `(p.0).1` is an element of an
-element (`p.0.1` doesn't parse yet, AGAST #2284).
+element on a longer path, like `v.pair.0`, or an element of an element, like
+`p.0.1`.
 
 ```ritz expect-error="use of moved value: `p.0`"
 struct Resource
@@ -6547,14 +6553,14 @@ fn main() -> i32
     r.handle                        # r is dropped after this is evaluated
 ```
 
-ritz0 follows these rules (AGAST #2157, #2161, #2232, #2244), except that
-`let (a, b) = p` isn't move-checked yet (AGAST #2282) and a tuple element can't
-be assigned to yet (AGAST #2283). ritz1 follows them (AGAST
-#2158) except for enum payloads, arrays, temporaries and moves inside loops
-(AGAST #2165), and it has no tuple literals yet (AGAST #1526). Like ritz0, ritz1
-tracks every movable path of a binding, however many it has (AGAST #2319).
-`ritz0/test_ownership_free_count.py` counts the drops for each rule on all
-three compilers, with today's gaps marked as expected failures.
+ritz0, ritz1 and ritz1_selfhosted follow these rules (AGAST #2157, #2158,
+#2161, #2165, #2244), and track every movable path of a binding, however many
+it has (AGAST #2319). ritz1 has two gaps: it miscounts the drops of a tuple
+with a reference or array element (AGAST #3024), and it doesn't refuse a second
+move out of an element of an element (`p.0.1`), though it drops one correctly.
+`ritz0/tests/test_ownership_free_count.py` counts the drops for each rule on all
+three compilers. A row a compiler still misses is a strict expected failure
+naming its ticket, so closing the gap fails the test until the row is flipped.
 
 ### 13.7 Defer
 
@@ -6562,25 +6568,23 @@ three compilers, with today's gaps marked as expected failures.
 ritz1_selfhosted (AGAST #1625).*
 
 `defer` schedules a statement to run when the enclosing block exits. It's for cleanup
-that has no `Drop` type of its own, such as a raw fd, a lock or a buffer from `alloc`.
+that has no `Drop` type of its own, such as closing a `ritzlib.fd` `Fd`, releasing
+a lock or destroying an `Arena`.
 
 ```ritz
-import ritzlib.sys
-import ritzlib.memory
-import ritzlib.str
+import ritzlib.fd
 
-fn read_header(path: *u8, out: *u8) -> i64
-    let fd: i32 = sys_open(path, O_RDONLY)
-    if fd < 0
-        return -1
-    defer sys_close(fd)
-    let buf: *u8 = malloc(4096)
-    defer free(buf)                 # runs before sys_close: LIFO
-    let n: i64 = sys_read(fd, buf, 4096)
-    if n < 16
-        return -1                   # free(buf), then sys_close(fd)
-    memcpy(out, buf, 16)
-    16                              # 16 is evaluated, then free, then sys_close
+fn header_sum(path: StrView) -> Result<i64, Errno>
+    var file: Fd = fd_open(path, O_RDONLY, 0)?
+    defer file.close()
+    file.lock(LOCK_SH)?
+    defer file.lock(LOCK_UN)        # runs before file.close(): LIFO
+    var buf: [16]u8
+    file.read_exact(@buf)?          # on Err: unlock, then close
+    var sum: i64 = 0
+    for b in buf
+        sum += b as i64
+    Ok(sum)                         # Ok(sum) is evaluated, then unlock, then close
 ```
 
 - **Form.** `defer` is followed by one statement on the same line, or by an indented
@@ -6655,19 +6659,24 @@ defer
 ```
 
 A `defer` inside a deferred block belongs to that block, and runs when that block
-finishes.
+finishes. Here both are in a loop body, so they run once per pass, `continue`
+included:
 
 ```ritz
-import ritzlib.sys
+var LOG: i32 = 0
 
-fn drain(fds: [4]i32) -> i32
-    var closed: i32 = 0
-    for fd in fds
-        defer closed += 1               # once per pass, `continue` included
-        if fd < 0
-            continue
-        sys_close(fd)
-    closed                              # 4
+fn note(d: i32)
+    LOG = LOG * 10 + d
+
+fn main() -> i32
+    for i in 0..2
+        defer
+            defer note(3)               # runs when this deferred block finishes
+            note(2)
+        if i == 0
+            continue                    # the deferred block runs here too
+        note(1)
+    LOG - 23123                         # pass 0: 2, 3; pass 1: 1, 2, 3
 ```
 
 ---
@@ -6676,108 +6685,194 @@ fn drain(fds: [4]i32) -> i32
 
 ### 14.1 Result Type
 
-`Result<T, E>` comes from `ritzlib.result`:
+A function that can fail in a way its caller must act on returns
+`Result<T, E>`: `Ok(value)` on success, `Err(error)` on failure. `E` is an enum
+with one variant per failure the caller might handle differently, not an `i32`
+status code, and a failure is never a sentinel such as `-1` in `T`
+(S-RESULT-1, S-RESULT-2). A variant is qualified with `.`: `PortError.Empty`.
 
 ```ritz
 import ritzlib.result
+import ritzlib.strview
 
-fn go(x: i32) -> Result<i32, i32>
-    if x > 0
-        return Ok(x)
-    return Err(1)
+enum PortError
+    Empty
+    NotANumber
+    TooBig
+
+fn parse_port(s: StrView) -> Result<i64, PortError>
+    if s.len() == 0
+        return Err(PortError.Empty)
+    match s.parse_i64()
+        Some(n) => if n > 65535 then Err(PortError.TooBig) else Ok(n)
+        None => Err(PortError.NotANumber)
 ```
 
-`Ok` and `Err` are resolved against the enclosing function's declared return
-type, so a `Result`-returning signature is required to construct one.
+`Result` is declared in `ritzlib.result`, with its methods (`is_ok`, `is_err`,
+`unwrap_or`, `ok`, `err`). The compiler also knows it without the import, so
+naming, constructing and matching one, and `?`, work in any file (§15.4).
+ritzlib's syscall wrappers return `Result<T, Errno>` (`ritzlib.errno`): the
+kernel's negative return is converted at the wrapper, and nothing above it
+sees a raw code.
+
+`Ok` and `Err` take their type from where they stand: a `return` or tail of a
+fn declared to return a `Result`, or a `let` with a `Result` type
+(`let r: Result<i64, PortError> = Ok(80)`). Where nothing gives the type, the
+constructor is an error.
+
+A failure that has nothing to report beyond "not there" is an `Option<T>`
+(§10, S-OPTION-1), as `parse_i64` above is.
 
 ### 14.2 Try Operator (?)
 
 `?` propagates a failure or absence to the caller. On a `Result`, it unwraps an
-`Ok` and returns early on `Err`:
+`Ok` and returns early on `Err`, passing the error on unchanged:
 
 ```ritz
 import ritzlib.result
+import ritzlib.strview
 
-fn parse(x: i32) -> Result<i32, i32>
-    if x > 0
-        return Ok(x)
-    return Err(1)
+enum PortError
+    Empty
+    TooBig
 
-fn double(x: i32) -> Result<i32, i32>
-    let v = parse(x)?
-    Ok(v + v)
+fn parse_port(s: StrView) -> Result<i64, PortError>
+    match s.parse_i64()
+        Some(n) => if n > 65535 then Err(PortError.TooBig) else Ok(n)
+        None => Err(PortError.Empty)
+
+fn next_port(s: StrView) -> Result<i64, PortError>
+    let p = parse_port(s)?
+    Ok(p + 1)
 ```
 
 On an `Option`, it unwraps a `Some` and returns early on `None`:
 
 ```ritz
 import ritzlib.option
+import ritzlib.strview
 
-fn find(x: i32) -> Option<i32>
-    if x > 0
-        return Some(x)
-    None
+fn first_comma(s: StrView) -> Option<i64>
+    let i = s.find_byte(',')
+    if i < 0 then None else Some(i)
 
-fn twice(x: i32) -> Option<i32>
-    let v = find(x)?
-    Some(v + v)
+fn after_comma(s: StrView) -> Option<i64>
+    let i = first_comma(s)?
+    Some(i + 1)
 ```
 
-The operand must be a call returning `Result<T, E>` or `Option<T>`, and the
-enclosing function must return the same carrier: a `Result` with the same `E`
-for a `Result` operand, an `Option` for an `Option` operand. Applying `?` to
-another type fails — `Try operator requires a Result type` for a plain value,
-or `Try operator requires a Result or Option type, got: <carrier>` for another
-enum. Applying `?` to an `Option` from a function that does not return an
-`Option` fails with `Try operator on an Option used in a function that does not
-return an Option`:
+The operand is a `Result<T, E>` or `Option<T>` value, a call or a local, and
+the enclosing function must return the same carrier: a `Result` with the same
+`E` for a `Result` operand, an `Option` for an `Option` operand. On any other
+value `?` is an error, "Try operator requires a Result or an Option" (ritz0
+names another enum: "Try operator requires a Result or Option type, got:
+<enum>"). A `Result` operand in a function that returns no `Result` fails with
+"Try operator used in function not returning Result type (got <type>)", and an
+`Option` operand in a function that returns no `Option` fails with `Try
+operator on an Option used in a function that does not return an Option`:
 
 ```ritz expect-error="Try operator on an Option used in a function that does not return an Option"
 import ritzlib.option
+import ritzlib.strview
 
-fn find(x: i32) -> Option<i32>
-    if x > 0
-        return Some(x)
-    None
+fn first_comma(s: StrView) -> Option<i64>
+    let i = s.find_byte(',')
+    if i < 0 then None else Some(i)
 
-fn twice(x: i32) -> i32
-    let v = find(x)?
-    v + v
+fn after_comma(s: StrView) -> i64
+    let i = first_comma(s)?
+    i + 1
 ```
 
 "The same `E`" is type-name identity after alias resolution: a signature
-spelling `u8` matches one spelling `type Code = u8`, and two distinct names
-whose layouts happen to agree are different `E`s. A `Result` operand in a
-function returning a `Result` with a different `E` fails, as does one in a
-function that returns some other enum:
+spelling `PortError` matches one spelling `type PortErr = PortError`, and two
+distinct enums are different `E`s even when their variants agree. `?` doesn't
+convert one error into another:
 
 ```ritz expect-error="Try operator on a Result used in a function returning a Result with a different error type"
 import ritzlib.result
+import ritzlib.strview
 
-fn parse(x: i32) -> Result<i32, i32>
-    if x > 0
-        return Ok(x)
-    return Err(1)
+enum PortError
+    Empty
+    TooBig
 
-fn double(x: i32) -> Result<i32, u8>
-    let v = parse(x)?
-    Ok((v + v) as u8)
+enum ConfigError
+    BadPort(PortError)
+    Missing
+
+fn parse_port(s: StrView) -> Result<i64, PortError>
+    match s.parse_i64()
+        Some(n) => if n > 65535 then Err(PortError.TooBig) else Ok(n)
+        None => Err(PortError.Empty)
+
+fn load_port(s: StrView) -> Result<i64, ConfigError>
+    let p = parse_port(s)?
+    Ok(p)
+```
+
+Convert it with a `match`, wrapping the inner error in a variant of the outer
+one so the caller still sees which failure it was:
+
+```ritz
+import ritzlib.result
+import ritzlib.strview
+
+enum PortError
+    Empty
+    TooBig
+
+enum ConfigError
+    BadPort(PortError)
+    Missing
+
+fn parse_port(s: StrView) -> Result<i64, PortError>
+    match s.parse_i64()
+        Some(n) => if n > 65535 then Err(PortError.TooBig) else Ok(n)
+        None => Err(PortError.Empty)
+
+fn load_port(s: StrView) -> Result<i64, ConfigError>
+    match parse_port(s)
+        Ok(p) => Ok(p)
+        Err(e) => Err(ConfigError.BadPort(e))
 ```
 
 ### 14.3 Pattern Matching
 
-```ritz
-import ritzlib.result
+A `match` on a `Result` must cover both `Ok` and `Err` (§8.1). A variant's
+payload pattern is a name or `_` (§8.2), so `Err(PortError.Empty)` is not a
+pattern: bind the error and match it in its own `match`, which must cover
+every variant.
 
-fn go(x: i32) -> Result<i32, i32>
-    if x > 0
-        return Ok(x)
-    return Err(1)
+```ritz
+import ritzlib.io
+import ritzlib.result
+import ritzlib.strview
+
+enum PortError
+    Empty
+    NotANumber
+    TooBig
+
+fn parse_port(s: StrView) -> Result<i64, PortError>
+    if s.len() == 0
+        return Err(PortError.Empty)
+    match s.parse_i64()
+        Some(n) => if n > 65535 then Err(PortError.TooBig) else Ok(n)
+        None => Err(PortError.NotANumber)
+
+fn describe(e: PortError) -> StrView
+    match e
+        PortError.Empty => "no port given\n"
+        PortError.NotANumber => "port is not a number\n"
+        PortError.TooBig => "port is above 65535\n"
 
 fn main() -> i32
-    match go(5)
-        Ok(value) => value
-        Err(e) => e
+    match parse_port("8080")
+        Ok(port) => if port == 8080 then 0 else 1
+        Err(e) =>
+            eprints(describe(e))
+            1
 ```
 
 ---
@@ -6851,8 +6946,8 @@ private (non-`pub`) name is visible only in its own module (§15.2): it does not
 land in the importer's namespace, and two modules may each define a private
 `fn be16` [AGAST #1858].
 
-```ritz body expect-error="`sys::write`: `::` was removed in RERITZ"
-let n = sys::write(1, c"hi\n", 3)
+```ritz body expect-error="`io::prints`: `::` was removed in RERITZ"
+io::prints("hi\n")
 ```
 
 The `.` form is refused the same way, as a type at the type and as a value,
@@ -7219,8 +7314,9 @@ fn main() -> i32
 
 A value `if` with an `else` may await as an operand, too (AGAST #4190): only
 the taken arm's awaits run, and its value is kept in the future, of the type
-of the first arm whose value isn't a bare literal.  One that tells no type,
-such as a struct field, is refused at the `if`; cast an arm (`p.n as i32`):
+of the first arm whose value isn't a bare literal and tells a type.  An `if`
+none of whose arms tells one (each a struct field, say, or an operator over
+one) is refused at the `if`; cast an arm (`p.n as i32`):
 
 ```ritz
 async fn dbl(x: i32) -> i32
@@ -7271,8 +7367,8 @@ The built-in `future_poll(f: @&Future) -> bool` drives a future one step: it
 returns `false` while the future is Pending and `true` once it has finished.
 The result is read with `await`, not through the poll (LARB R78).
 
-A hand-written poll source — an `Option<T>`-returning call awaited directly
-in an async fn — says Pending with `None` and Ready with `Some(v)`, whatever
+A hand-written poll source, an `Option<T>`-returning call awaited directly
+in an async fn, says Pending with `None` and Ready with `Some(v)`, whatever
 `v` is (§16.1, AGAST #4558).  Only an async fn can await one: it may be
 Pending, and nothing else can suspend.  Outside an async fn such an `await` is
 refused: "`await` of a poll source outside an async fn: a poll source can only
@@ -7286,8 +7382,9 @@ fn main() -> i32
     await ready()
 ```
 
-ritzlib's runtime drives one future on one io_uring, waiting on the ring
-whenever a poll answers Pending (`ritzlib/async/runtime.ritz`):
+ritzlib's runtime (`ritzlib/async/runtime.ritz`) drives futures on one
+io_uring, waiting on the ring whenever a poll answers Pending.  `rt.block_on`
+drives one future:
 
 ```ritz
 import ritzlib.async.runtime
@@ -7307,9 +7404,13 @@ fn main() -> i32
 ```
 
 `rt.block_on(f: @&Future)` returns nothing: it polls `f` until it is ready,
-then the caller reads the result with `await p` (above).  A poll that answers
-`false` must have suspended on an operation it will be woken by; otherwise the
-future can never finish, so `block_on` fails loudly rather than spin.
+then the caller reads the result with `await p` (above).  `rt.spawn(f)` queues
+a held future instead, and `rt.run_spawned()` polls every queued future until
+all have finished; the caller keeps each future alive until then.  A poll that
+answers `false` must have suspended on an operation it will be woken by;
+otherwise the future can never finish, so `block_on` and `run_spawned` fail
+loudly rather than spin.  `rt.init()` still reports failure as a negative
+`i32` from io_uring setup, hence the `< 0` test above.
 
 **Not covered.**  A future stored by value in a struct field or an array needs
 a nameable type, which `Future` isn't; keep the future in a local and store an
@@ -7724,9 +7825,9 @@ fn both(a: i32, b: i32) -> i32
 ritzunit's `assert_*` fns used to be `[[must_use]]`: each returned 0 or 1 for
 the test to return, and a bare `assert_eq_i32(a, b)` statement made a test that
 could not fail. Its integer helpers are now plain `assert`, and the string
-checks it keeps (`assert_str_eq`, `assert_contains`, ...) are void
-`[[test_helper]]` fns that `assert` ([§17.1](#171-test-attribute)), so a bare
-call is the intended use.
+checks it keeps (`assert_str_eq_sv`, `assert_contains_sv`, ..., which take
+`StrView`s) are void `[[test_helper]]` fns that `assert`
+([§17.1](#171-test-attribute)), so a bare call is the intended use.
 
 ---
 
@@ -7743,9 +7844,23 @@ buffer[0] = 0
 
 ### 18.2 Heap Allocation
 
-Heap allocation goes through `mmap`/`munmap` directly (no `malloc`/`free`),
-either raw via `ritzlib.sys` or through the size-binned allocator in
-`ritzlib.memory`:
+Heap memory comes from `mmap`/`munmap` (there is no `malloc`/`free`). App
+code allocates through `ritzlib.memory`, a size-binned allocator and arenas
+built on it, or through an owning type (`String`, `Vec`, `Box`) that frees
+itself:
+
+```ritz
+import ritzlib.memory
+
+fn main() -> i32
+    let p = heap_alloc(64)
+    heap_free(p, 64)
+    0
+```
+
+The raw `sys_mmap` / `sys_munmap` calls in `ritzlib.sys` are what the
+allocator is built on on Linux, for code that manages pages itself, such
+as another allocator:
 
 ```ritz
 import ritzlib.sys
@@ -7754,15 +7869,6 @@ fn main() -> i32
     let size: i64 = 4096
     let p = sys_mmap(0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
     sys_munmap(p, size)
-    0
-```
-
-```ritz
-import ritzlib.memory
-
-fn main() -> i32
-    let p = heap_alloc(64)
-    heap_free(p, 64)
     0
 ```
 
@@ -7825,13 +7931,13 @@ every secret wipe. Use plain `memzero` for zeroing that only initialises.
 ```ritz
 import ritzlib.memory
 
-fn derive(seed: u8, out: *u8) -> i32
+fn derive(seed: u8) -> u8
     var key: [32]u8
     for i in 0..32
         key[i] = seed + i as u8
-    out[0] = key[0] ^ key[31]
+    let tag: u8 = key[0] ^ key[31]
     secure_zero(@key[0], 32)     # stays at -O2: key is dead, the wipe is not
-    0
+    tag
 ```
 
 *Why a library function, not an intrinsic:* `volatile_store` already says
@@ -7919,7 +8025,9 @@ fn inb(port: u16) -> u8
         movb %al, {result}
     return result
 
-fn write1(fd: i64, buf: *u8, n: i64) -> i64
+fn write1(fd: i64, data: Span<u8>) -> i64
+    let buf: *u8 = data.ptr
+    let n: i64 = data.len
     var ret: i64 = 1                     # syscall number in, result out
     asm x86_64 (inout ret: rax, in fd: rdi, in buf: rsi, in n: rdx, clobber rcx, clobber r11):
         syscall
@@ -7930,8 +8038,9 @@ Both compilers accept every form here (ritz1: AGAST #3395, ritz0: #3396). The
 compiler barrier cryptosec uses to keep a zeroing loop from being removed:
 
 ```ritz
-fn wipe(ptr: *u8, len: i64)
-    for i in 0..len
+fn wipe(buf: Span<u8>)
+    let ptr: *u8 = buf.ptr
+    for i in 0..buf.len
         *(ptr + i) = 0
     asm x86_64:
         nopl ({ptr})
@@ -8015,22 +8124,63 @@ a general register; `rsp`/`rbp` pinned or clobbered; a named label; a clause or
 
 ### 19.1 Core Modules (ritzlib)
 
+ritzlib's text APIs take a `StrView` (a `"..."` literal,
+[§3.5](#35-string-types)) or a `String`, and its fallible ones return a
+`Result` or an `Option`. They are the normal path for app code. The raw
+`sys_*` calls and the C-string (`*_cstr`, `str`) helpers sit beneath them,
+for the C boundary only.
+
 | Module | Purpose |
 |--------|---------|
-| `sys` | System calls |
-| `io` | I/O helpers |
-| `memory` | Arena and size-binned heap allocation |
-| `str` / `strview` / `string` | String utilities |
+| `io` | Printing: `prints` / `eprints` / `println` / `eprintln` (`StrView`), `print_int`, `print_char`, `newline` |
+| `fmt` | One import for formatted output: `Writer`s, `write` / `writeln`, `Display` |
+| `strview` / `string` | Borrowed text (`StrView`) and owned text (`String`) |
 | `span` | `Span<T>` slices |
+| `memory` | Arena and size-binned heap allocation |
 | `gvec` | Generic `Vec<T>` |
-| `hashmap` | Hash table |
-| `option` / `result` | `Option<T>`, `Result<T, E>` |
-| `fs` | Filesystem |
-| `args` / `env` | Argument and environment access |
+| `hashmap` | `HashMap<K, V>` |
+| `option` / `result` / `errno` | `Option<T>`, `Result<T, E>`, and `Errno`, the error of the syscall wrappers |
+| `fs` | Paths and files: `read_file`, `write_file`, `stat`, `path_exists`, `dir_open`, ... |
+| `fd` | `Fd`, an owned file descriptor: `fd_open`, `read`, `write_all`, `write_str`, ... |
+| `process` | `spawn`, `exec`, `wait_pid`, `find_command` |
+| `time` | `Duration`, `sleep`, `now` |
+| `argspec` / `os.env` | Command-line parsing into `StrView`s; `env_get(name) -> Option<StrView>` |
 | `json` | JSON parsing |
-| `process` | Process spawning |
+| `net` | Sockets |
 | `uring` | io_uring bindings |
 | `async.runtime` / `async.tasks` | Async runtime |
+| `sys` | Raw system calls (`sys_*`): what the wrappers above are built on |
+| `str` | NUL-terminated `*u8` helpers, for C interop only ([§2.6](#string-literals)) |
+
+A program reaches the OS through these wrappers, never a `sys_*` call with a
+`c"..."` path:
+
+```ritz
+import ritzlib.io
+import ritzlib.fs
+import ritzlib.process
+import ritzlib.span
+import ritzlib.string
+
+fn show_config(path: StrView) -> bool
+    match read_file(path)                         # Result<String, Errno>
+        Ok(text) =>
+            prints(text.as_view())
+            true
+        Err(e) =>
+            eprints("cannot read config\n")
+            false
+
+fn list_long(dir: StrView) -> bool
+    var args: [2]StrView = ["-l", dir]
+    match spawn("ls", @args)                     # argv[1..], a Span<StrView>
+        Ok(p) =>
+            var proc = p
+            match proc.wait()
+                Ok(r) => r.success()
+                Err(e) => false
+        Err(e) => false
+```
 
 See `docs/STDLIB_REFERENCE.md` for the function-level reference.
 
@@ -8049,7 +8199,7 @@ See `docs/STDLIB_REFERENCE.md` for the function-level reference.
 
 `assert` is legal **only inside a `[[test]]` or `[[test_helper]]` function**
 ([§17.1](#171-test-attribute)), and the compiler enforces it rather than leaving
-it to convention — an `assert` in ordinary code is a compile error, located at
+it to convention: an `assert` in ordinary code is a compile error, located at
 the assert, naming the offending function:
 
 ```ritz expect-error="assert is only allowed in [[test]] and [[test_helper]] functions, not in 'main'"
@@ -8113,7 +8263,8 @@ fn main() -> i32
     return 0
 ```
 
-`print` and `eprint` are the only builtins that take a string, and they require a literal:
+`print`, `eprint` and `format_into` are the only builtins that take a string,
+and they require a literal:
 
 ```ritz body expect-error="print() requires a single string literal argument"
 let s = "hi"
@@ -8223,7 +8374,7 @@ path = "src/main.ritz"
 entry = "main::main"
 ```
 
-Note that `entry` uses a `module::function` string — that is a build-system
+`entry` is a `module::function` string. That is a build-system
 key, not Ritz syntax, and is unaffected by the removal of `::` from the
 language.
 
