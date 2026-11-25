@@ -1,0 +1,816 @@
+# Harland netstack: DHCP client (AGAST #4741, docs/RING2_NET.md "UDP and
+# DHCP"; RFC 2131)
+#
+# One test per transition on a fake clock (`now` in ms), starting from
+# docs/stack_example's DhcpClient cases: SELECTING takes the first server,
+# the initial ACK commits the lease, and a rebind ACK from a second server
+# is accepted and refreshes the lease and the timers. `rand` 1000 is zero
+# jitter; 0 and 2000 are the -1 s and +1 s ends.
+
+import netstack.bytes { be16_get, be32_get, be32_put }
+import netstack.ethernet { MacAddr, SendError }
+import netstack.ipv4 { IPV4_BROADCAST }
+import netstack.udp { udp_frame_write, udp_parse }
+import netstack.dhcp { DhcpClient, DhcpState, DhcpDrop, DhcpKind, DhcpMsg, DhcpSend, DhcpRecord, DhcpStep, DHCP_MAGIC, DHCP_OPTIONS_OFF, DHCP_NEVER, dhcp_parse }
+import driver_abi.link { NetInfo }
+
+const XID: u32 = 0x3903F326
+const SERVER_A: u32 = 0x0A000202     # 10.0.2.2
+const SERVER_B: u32 = 0x0A000203     # 10.0.2.3
+const OUR_IP: u32 = 0x0A00020F       # 10.0.2.15
+const NETMASK: u32 = 0xFFFFFF00
+const ROUTER: u32 = 0x0A000201
+const NO_JITTER: u32 = 1000
+
+const MSG_OFFER: u8 = 2
+const MSG_ACK: u8 = 5
+const MSG_NAK: u8 = 6
+
+var g_msg: [576]u8
+var g_out: [576]u8
+var g_frame: [2048]u8
+
+fn our_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+
+fn link() -> NetInfo
+    NetInfo { mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56], link_up: 1, device_type: 1, mtu: 1500 }
+
+# ---------------------------------------------------------------------------
+# A server reply in g_msg: reply_begin, then options, then reply_end.
+
+var g_at: i64 = 0
+
+fn reply_begin(kind: u8, xid: u32, yiaddr: u32)
+    let m: [u8] = @g_msg
+    for i in 0..m.len
+        m[i] = 0
+    m[0] = 2                         # BOOTREPLY
+    m[1] = 1
+    m[2] = 6
+    be32_put(m, 4, xid)
+    be32_put(m, 16, yiaddr)
+    let mac = our_mac()
+    for i in 0..6
+        m[28 + i] = mac[i]
+    be32_put(m, 236, DHCP_MAGIC)
+    m[240] = 53
+    m[241] = 1
+    m[242] = kind
+    g_at = 243
+
+fn opt4(code: u8, v: u32)
+    let m: [u8] = @g_msg
+    m[g_at] = code
+    m[g_at + 1] = 4
+    be32_put(m, g_at + 2, v)
+    g_at += 6
+
+fn reply_end() -> [u8]
+    let m: [u8] = @g_msg
+    m[g_at] = 255
+    let r = m[0..g_at + 1]
+    r
+
+fn offer(server: u32, xid: u32) -> [u8]
+    reply_begin(MSG_OFFER, xid, OUR_IP)
+    opt4(54, server)
+    opt4(51, 3600)
+    reply_end()
+
+# An ACK with only the address, the server and the lease: no router, no
+# netmask.
+fn ack(server: u32, xid: u32, lease: u32) -> [u8]
+    reply_begin(MSG_ACK, xid, OUR_IP)
+    opt4(54, server)
+    opt4(51, lease)
+    reply_end()
+
+fn nak(server: u32, xid: u32) -> [u8]
+    reply_begin(MSG_NAK, xid, 0)
+    opt4(54, server)
+    reply_end()
+
+# ---------------------------------------------------------------------------
+# Step and result checks.
+
+fn sends(s: DhcpStep, rec: DhcpRecord, want: DhcpSend) -> bool
+    if s.record != rec
+        return false
+    match s.send
+        Some(k) => k == want
+        None => false
+
+fn quiet(s: DhcpStep, rec: DhcpRecord) -> bool
+    if s.record != rec
+        return false
+    match s.send
+        Some(_) => false
+        None => true
+
+fn took(r: Result<DhcpStep, DhcpDrop>, rec: DhcpRecord) -> bool
+    match r
+        Ok(s) => quiet(s, rec)
+        Err(_) => false
+
+fn took_send(r: Result<DhcpStep, DhcpDrop>, rec: DhcpRecord, want: DhcpSend) -> bool
+    match r
+        Ok(s) => sends(s, rec, want)
+        Err(_) => false
+
+fn dropped(r: Result<DhcpStep, DhcpDrop>, why: DhcpDrop) -> bool
+    match r
+        Err(w) => w == why
+        Ok(_) => false
+
+fn parse_dropped(r: Result<DhcpMsg, DhcpDrop>, why: DhcpDrop) -> bool
+    match r
+        Err(w) => w == why
+        Ok(_) => false
+
+fn deadline_is(c: DhcpClient, at: u64) -> bool
+    match c.deadline
+        Some(d) => d == at
+        None => false
+
+fn server_is(c: DhcpClient, s: u32) -> bool
+    match c.server
+        Some(v) => v == s
+        None => false
+
+# A client through discover, offer and ACK from SERVER_A at t=0: Bound,
+# lease 3600 s counted from the request sent at t=0.
+fn bound_client(lease: u32) -> DhcpClient
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    c.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    c.receive(ack(SERVER_A, XID, lease), 0, NO_JITTER)
+    c
+
+# ---------------------------------------------------------------------------
+# INIT -> SELECTING -> REQUESTING -> BOUND
+
+[[test]]
+fn test_start_sends_a_broadcast_discover() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    if c.state != DhcpState.Idle
+        return 1
+    if not sends(c.start(100, NO_JITTER), DhcpRecord.Keep, DhcpSend.Discover)
+        return 2
+    if c.state != DhcpState.Selecting or not deadline_is(c, 4100)
+        return 3
+    # A second start while running sends nothing.
+    if not quiet(c.start(200, NO_JITTER), DhcpRecord.Keep)
+        return 4
+    let out: [u8] = @g_out
+    let tx = match c.payload_write(out, DhcpSend.Discover)
+        Ok(t) => t
+        Err(_) => return 5
+    if tx.src != 0 or tx.dst != IPV4_BROADCAST or tx.len != DHCP_OPTIONS_OFF + 10
+        return 6
+    if out[0] != 1 or out[1] != 1 or out[2] != 6 or be32_get(out, 4) != XID or be16_get(out, 10) != 0x8000
+        return 7
+    if be32_get(out, 12) != 0 or out[28] != 0x52 or out[33] != 0x56 or be32_get(out, 236) != DHCP_MAGIC
+        return 8
+    # 53 = DISCOVER, 55 = [1, 3, 6, 51], end.
+    if out[240] != 53 or out[241] != 1 or out[242] != 1 or out[243] != 55 or out[244] != 4 or out[249] != 255
+        return 9
+    # It goes out 68 -> 67 as UDP, broadcast, and parses back.
+    let payload = out[0..tx.len]
+    let frame: [u8] = @g_frame
+    let n = match udp_frame_write(frame, link(), [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], tx.src, tx.dst, 68, 67, payload)
+        Ok(len) => len
+        Err(_) => return 10
+    let seg = frame[34..n]
+    match udp_parse(seg, tx.src, tx.dst)
+        Ok(u) =>
+            if u.src_port != 68 or u.dst_port != 67 or u.payload.len != tx.len
+                return 11
+        Err(_) => return 12
+    0
+
+[[test]]
+fn test_selecting_takes_an_offer_and_pins_its_server() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    if not took_send(c.receive(offer(SERVER_A, XID), 500, NO_JITTER), DhcpRecord.Keep, DhcpSend.Request)
+        return 1
+    if c.state != DhcpState.Requesting or not server_is(c, SERVER_A) or c.offered != OUR_IP
+        return 2
+    # The request schedule restarts at 4 s.
+    if not deadline_is(c, 4500)
+        return 3
+    let out: [u8] = @g_out
+    let tx = match c.payload_write(out, DhcpSend.Request)
+        Ok(t) => t
+        Err(_) => return 4
+    if tx.src != 0 or tx.dst != IPV4_BROADCAST or tx.len != DHCP_OPTIONS_OFF + 22
+        return 5
+    # 53 = REQUEST, 50 = the offered address, 54 = the selected server.
+    if out[242] != 3 or out[243] != 50 or be32_get(out, 245) != OUR_IP or out[249] != 54 or be32_get(out, 251) != SERVER_A
+        return 6
+    if be32_get(out, 12) != 0 or out[255] != 55 or out[261] != 255
+        return 7
+    # A second offer, even from another server, is not taken now.
+    if not dropped(c.receive(offer(SERVER_B, XID), 600, NO_JITTER), DhcpDrop.State)
+        return 8
+    if not server_is(c, SERVER_A)
+        return 9
+    0
+
+[[test]]
+fn test_selecting_drops_ack_nak_and_offers_without_server_or_address() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    if not dropped(c.receive(ack(SERVER_A, XID, 3600), 0, NO_JITTER), DhcpDrop.State)
+        return 1
+    if not dropped(c.receive(nak(SERVER_A, XID), 0, NO_JITTER), DhcpDrop.State)
+        return 2
+    reply_begin(MSG_OFFER, XID, OUR_IP)
+    opt4(51, 3600)
+    if not dropped(c.receive(reply_end(), 0, NO_JITTER), DhcpDrop.Server)
+        return 3
+    reply_begin(MSG_OFFER, XID, 0)
+    opt4(54, SERVER_A)
+    if not dropped(c.receive(reply_end(), 0, NO_JITTER), DhcpDrop.Lease)
+        return 4
+    if c.state != DhcpState.Selecting
+        return 5
+    0
+
+[[test]]
+fn test_requesting_pins_the_server_and_ack_binds() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    c.receive(offer(SERVER_A, XID), 1000, NO_JITTER)
+    if not dropped(c.receive(ack(SERVER_B, XID, 3600), 1100, NO_JITTER), DhcpDrop.Server)
+        return 1
+    if not dropped(c.receive(nak(SERVER_B, XID), 1100, NO_JITTER), DhcpDrop.Server)
+        return 2
+    if not dropped(c.receive(offer(SERVER_A, XID), 1100, NO_JITTER), DhcpDrop.State)
+        return 3
+    # An ACK without a lease time is not a lease.
+    reply_begin(MSG_ACK, XID, OUR_IP)
+    opt4(54, SERVER_A)
+    if not dropped(c.receive(reply_end(), 1100, NO_JITTER), DhcpDrop.Lease)
+        return 4
+    if c.state != DhcpState.Requesting
+        return 5
+    if not took(c.receive(ack(SERVER_A, XID, 3600), 1200, NO_JITTER), DhcpRecord.Write)
+        return 6
+    if c.state != DhcpState.Bound or not server_is(c, SERVER_A)
+        return 7
+    match c.lease
+        Some(l) =>
+            if l.addr != OUR_IP or l.server != SERVER_A or l.lease_secs != 3600
+                return 8
+        None => return 9
+    # Counted from the request sent at t=1000: T1 1800 s, T2 3150 s.
+    if c.t1_at != 1000 + 1800000 or c.t2_at != 1000 + 3150000 or c.expires_at != 1000 + 3600000
+        return 10
+    # Bound takes nothing more.
+    if not dropped(c.receive(ack(SERVER_A, XID, 3600), 1300, NO_JITTER), DhcpDrop.State)
+        return 11
+    0
+
+[[test]]
+fn test_ack_without_router_or_netmask_invents_neither() -> i32
+    var c = bound_client(3600)
+    let cfg = c.config()
+    match cfg.addr
+        Some(a) =>
+            if a != OUR_IP
+                return 1
+        None => return 2
+    match cfg.gateway
+        Some(_) => return 3
+        None => pass
+    match cfg.netmask
+        Some(_) => return 4
+        None => pass
+    # With the options present, they are what the record holds.
+    var d = DhcpClient.new(our_mac(), XID)
+    d.start(0, NO_JITTER)
+    d.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    reply_begin(MSG_ACK, XID, OUR_IP)
+    opt4(54, SERVER_A)
+    opt4(51, 3600)
+    opt4(1, NETMASK)
+    opt4(3, ROUTER)
+    opt4(6, 0x08080808)
+    if not took(d.receive(reply_end(), 0, NO_JITTER), DhcpRecord.Write)
+        return 5
+    let dc = d.config()
+    match dc.gateway
+        Some(g) =>
+            if g != ROUTER
+                return 6
+        None => return 7
+    match dc.netmask
+        Some(m) =>
+            if m != NETMASK
+                return 8
+        None => return 9
+    match d.lease
+        Some(l) =>
+            match l.dns
+                Some(s) =>
+                    if s != 0x08080808
+                        return 10
+                None => return 11
+        None => return 12
+    0
+
+# ---------------------------------------------------------------------------
+# NAK, link down
+
+[[test]]
+fn test_nak_in_requesting_returns_to_idle_and_restarts() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    c.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    if not took(c.receive(nak(SERVER_A, XID), 2000, NO_JITTER), DhcpRecord.Clear)
+        return 1
+    if c.state != DhcpState.Idle or c.offered != 0
+        return 2
+    match c.server
+        Some(_) => return 3
+        None => pass
+    match c.lease
+        Some(_) => return 4
+        None => pass
+    # A new discover after one randomized interval, on the next xid.
+    if not quiet(c.tick(5999, NO_JITTER), DhcpRecord.Keep)
+        return 5
+    if not sends(c.tick(6000, NO_JITTER), DhcpRecord.Keep, DhcpSend.Discover)
+        return 6
+    if c.state != DhcpState.Selecting or c.xid != XID + 1
+        return 7
+    # A late reply to the abandoned cycle is dropped.
+    if not dropped(c.receive(offer(SERVER_A, XID), 6100, NO_JITTER), DhcpDrop.Xid)
+        return 8
+    0
+
+[[test]]
+fn test_nak_while_renewing_clears_the_record() -> i32
+    var c = bound_client(3600)
+    c.tick(1800000, NO_JITTER)
+    if c.state != DhcpState.Renewing
+        return 1
+    if not dropped(c.receive(nak(SERVER_B, XID), 1800001, NO_JITTER), DhcpDrop.Server)
+        return 2
+    if not took(c.receive(nak(SERVER_A, XID), 1800001, NO_JITTER), DhcpRecord.Clear)
+        return 3
+    if c.state != DhcpState.Idle
+        return 4
+    match c.config().addr
+        Some(_) => return 5
+        None => pass
+    0
+
+[[test]]
+fn test_link_down_clears_and_waits_for_start() -> i32
+    var c = bound_client(3600)
+    if not quiet(c.link_down(), DhcpRecord.Clear)
+        return 1
+    if c.state != DhcpState.Idle
+        return 2
+    match c.lease
+        Some(_) => return 3
+        None => pass
+    match c.deadline
+        Some(_) => return 4
+        None => pass
+    # No timer runs: not the old T1, not a restart.
+    if not quiet(c.tick(1800000, NO_JITTER), DhcpRecord.Keep)
+        return 5
+    if not sends(c.start(1800001, NO_JITTER), DhcpRecord.Keep, DhcpSend.Discover)
+        return 6
+    # Link down mid-selection too.
+    c.link_down()
+    if c.state != DhcpState.Idle or not quiet(c.tick(DHCP_NEVER - 1, NO_JITTER), DhcpRecord.Keep)
+        return 7
+    0
+
+# ---------------------------------------------------------------------------
+# Retransmission
+
+[[test]]
+fn test_discover_retransmits_doubling_to_the_cap() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    # 4, 8, 16, 32, 64, then 64 again: the RFC 2131 client schedule.
+    var at: u64 = 0
+    let waits: [6]u64 = [4000, 8000, 16000, 32000, 64000, 64000]
+    for i in 0..6
+        at += waits[i]
+        if not quiet(c.tick(at - 1, NO_JITTER), DhcpRecord.Keep)
+            return 1 + i as i32 * 10
+        if not sends(c.tick(at, NO_JITTER), DhcpRecord.Keep, DhcpSend.Discover)
+            return 2 + i as i32 * 10
+    if c.rto_ms != 64000 or c.state != DhcpState.Selecting or c.xid != XID
+        return 70
+    0
+
+[[test]]
+fn test_retransmit_jitter_is_one_second_either_way() -> i32
+    var lo = DhcpClient.new(our_mac(), XID)
+    lo.start(0, 0)
+    if not deadline_is(lo, 3000)
+        return 1
+    var hi = DhcpClient.new(our_mac(), XID)
+    hi.start(0, 2000)
+    if not deadline_is(hi, 5000)
+        return 2
+    # rand wraps into the window: 2001 is -1 s again.
+    var wrap = DhcpClient.new(our_mac(), XID)
+    wrap.start(0, 2001)
+    if not deadline_is(wrap, 3000)
+        return 3
+    var max = DhcpClient.new(our_mac(), XID)
+    max.start(0, 0xFFFFFFFF)
+    match max.deadline
+        Some(d) =>
+            if d < 3000 or d > 5000
+                return 4
+        None => return 5
+    0
+
+[[test]]
+fn test_request_retransmits_then_falls_back_to_discover() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    c.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    var at: u64 = 0
+    let waits: [4]u64 = [4000, 8000, 16000, 32000]
+    for i in 0..4
+        at += waits[i]
+        if not sends(c.tick(at, NO_JITTER), DhcpRecord.Keep, DhcpSend.Request)
+            return 1 + i as i32
+    # The ACK counts from the last request sent.
+    if c.sent_at != at or c.rto_ms != 64000
+        return 10
+    at += 64000
+    if not sends(c.tick(at, NO_JITTER), DhcpRecord.Keep, DhcpSend.Discover)
+        return 11
+    if c.state != DhcpState.Selecting or c.xid != XID + 1 or c.rto_ms != 4000
+        return 12
+    match c.server
+        Some(_) => return 13
+        None => pass
+    0
+
+# ---------------------------------------------------------------------------
+# T1, T2, expiry
+
+[[test]]
+fn test_t1_unicasts_a_renew_to_the_pinned_server() -> i32
+    var c = bound_client(3600)
+    if not quiet(c.tick(1799999, NO_JITTER), DhcpRecord.Keep)
+        return 1
+    if not sends(c.tick(1800000, NO_JITTER), DhcpRecord.Keep, DhcpSend.Renew)
+        return 2
+    if c.state != DhcpState.Renewing
+        return 3
+    let out: [u8] = @g_out
+    let tx = match c.payload_write(out, DhcpSend.Renew)
+        Ok(t) => t
+        Err(_) => return 4
+    # Unicast from our address, ciaddr ours, no 50 or 54, no broadcast flag.
+    if tx.src != OUR_IP or tx.dst != SERVER_A or tx.len != DHCP_OPTIONS_OFF + 10
+        return 5
+    if be32_get(out, 12) != OUR_IP or be16_get(out, 10) != 0 or out[242] != 3 or out[243] != 55
+        return 6
+    # Renewing pins the server.
+    if not dropped(c.receive(ack(SERVER_B, XID, 7200), 1800100, NO_JITTER), DhcpDrop.Server)
+        return 7
+    # The pinned server's ACK refreshes the lease and the timers, from
+    # the renew sent at T1, and keeps the server.
+    if not took(c.receive(ack(SERVER_A, XID, 7200), 1800100, NO_JITTER), DhcpRecord.Write)
+        return 8
+    if c.state != DhcpState.Bound or not server_is(c, SERVER_A)
+        return 9
+    if c.t1_at != 1800000 + 3600000 or c.t2_at != 1800000 + 6300000 or c.expires_at != 1800000 + 7200000
+        return 10
+    0
+
+[[test]]
+fn test_renew_retransmits_at_half_the_time_to_t2() -> i32
+    var c = bound_client(3600)
+    c.tick(1800000, NO_JITTER)
+    # T2 is 1350 s away: the next renew is 675 s on.
+    if not deadline_is(c, 1800000 + 675000)
+        return 1
+    if not sends(c.tick(2475000, NO_JITTER), DhcpRecord.Keep, DhcpSend.Renew)
+        return 2
+    # Close to T2 the wait floors at 60 s, but never past T2.
+    c.tick(3100000, NO_JITTER)
+    if not deadline_is(c, 3150000)
+        return 3
+    if not sends(c.tick(3150000, NO_JITTER), DhcpRecord.Keep, DhcpSend.Rebind)
+        return 4
+    if c.state != DhcpState.Rebinding
+        return 5
+    0
+
+[[test]]
+fn test_rebind_ack_from_a_second_server_refreshes_the_lease() -> i32
+    # stack_example: "rebind ACK from a second server refreshed the lease"
+    var c = bound_client(3600)
+    c.tick(1800000, NO_JITTER)
+    if not sends(c.tick(3150000, NO_JITTER), DhcpRecord.Keep, DhcpSend.Rebind)
+        return 1
+    let out: [u8] = @g_out
+    let tx = match c.payload_write(out, DhcpSend.Rebind)
+        Ok(t) => t
+        Err(_) => return 2
+    if tx.src != OUR_IP or tx.dst != IPV4_BROADCAST or be32_get(out, 12) != OUR_IP or out[243] != 55
+        return 3
+    # Half of the 450 s to expiry.
+    if not deadline_is(c, 3150000 + 225000)
+        return 4
+    # An offer is still not taken.
+    if not dropped(c.receive(offer(SERVER_B, XID), 3150100, NO_JITTER), DhcpDrop.State)
+        return 5
+    reply_begin(MSG_ACK, XID, OUR_IP)
+    opt4(54, SERVER_B)
+    opt4(51, 7200)
+    opt4(58, 3600)
+    opt4(59, 6300)
+    if not took(c.receive(reply_end(), 3150100, NO_JITTER), DhcpRecord.Write)
+        return 6
+    if c.state != DhcpState.Bound or not server_is(c, SERVER_B)
+        return 7
+    match c.lease
+        Some(l) =>
+            if l.server != SERVER_B or l.lease_secs != 7200
+                return 8
+        None => return 9
+    if c.t1_at != 3150000 + 3600000 or c.t2_at != 3150000 + 6300000 or c.expires_at != 3150000 + 7200000
+        return 10
+    0
+
+[[test]]
+fn test_expiry_clears_and_discovers_again() -> i32
+    var c = bound_client(3600)
+    c.tick(1800000, NO_JITTER)
+    c.tick(3150000, NO_JITTER)
+    # The overdue rebind retransmit (due at 3375 s) goes first.
+    if not sends(c.tick(3599999, NO_JITTER), DhcpRecord.Keep, DhcpSend.Rebind) or c.state != DhcpState.Rebinding
+        return 1
+    if not sends(c.tick(3600000, NO_JITTER), DhcpRecord.Clear, DhcpSend.Discover)
+        return 2
+    if c.state != DhcpState.Selecting or c.xid != XID + 1
+        return 3
+    match c.lease
+        Some(_) => return 4
+        None => pass
+    # A clock jump past expiry from Bound clears too.
+    var d = bound_client(60)
+    if not sends(d.tick(1000000, NO_JITTER), DhcpRecord.Clear, DhcpSend.Discover)
+        return 5
+    0
+
+[[test]]
+fn test_server_t1_t2_used_only_when_ordered() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    c.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    reply_begin(MSG_ACK, XID, OUR_IP)
+    opt4(54, SERVER_A)
+    opt4(51, 1000)
+    opt4(58, 100)
+    opt4(59, 200)
+    c.receive(reply_end(), 0, NO_JITTER)
+    if c.t1_at != 100000 or c.t2_at != 200000
+        return 1
+    # T1 after T2: both defaults.
+    var d = DhcpClient.new(our_mac(), XID)
+    d.start(0, NO_JITTER)
+    d.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    reply_begin(MSG_ACK, XID, OUR_IP)
+    opt4(54, SERVER_A)
+    opt4(51, 1000)
+    opt4(58, 900)
+    opt4(59, 800)
+    d.receive(reply_end(), 0, NO_JITTER)
+    if d.t1_at != 500000 or d.t2_at != 875000
+        return 2
+    # T2 past the lease: both defaults.
+    var e = DhcpClient.new(our_mac(), XID)
+    e.start(0, NO_JITTER)
+    e.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    reply_begin(MSG_ACK, XID, OUR_IP)
+    opt4(54, SERVER_A)
+    opt4(51, 1000)
+    opt4(59, 1001)
+    e.receive(reply_end(), 0, NO_JITTER)
+    if e.t1_at != 500000 or e.t2_at != 875000
+        return 3
+    0
+
+[[test]]
+fn test_infinite_lease_never_renews() -> i32
+    var c = bound_client(0xFFFFFFFF)
+    if c.expires_at != DHCP_NEVER or c.t1_at != DHCP_NEVER
+        return 1
+    if not quiet(c.tick(DHCP_NEVER - 1, NO_JITTER), DhcpRecord.Keep) or c.state != DhcpState.Bound
+        return 2
+    0
+
+# ---------------------------------------------------------------------------
+# Identity, layout and option bounds, in every receiving state
+
+# Each identity failure, offered to `c`, is dropped and leaves it as it was.
+fn identity_checked(c: @&DhcpClient) -> i32
+    let st = c.state
+    let m: [u8] = @g_msg
+    var r = ack(SERVER_A, XID + 7, 3600)
+    if not dropped(c.receive(r, 1, NO_JITTER), DhcpDrop.Xid)
+        return 1
+    r = ack(SERVER_A, c.xid, 3600)
+    m[33] = m[33] ^ 1
+    if not dropped(c.receive(r, 1, NO_JITTER), DhcpDrop.Chaddr)
+        return 2
+    r = ack(SERVER_A, c.xid, 3600)
+    m[0] = 1                         # a BOOTREQUEST
+    if not dropped(c.receive(r, 1, NO_JITTER), DhcpDrop.Layout)
+        return 3
+    r = ack(SERVER_A, c.xid, 3600)
+    m[2] = 16                        # hlen not Ethernet
+    if not dropped(c.receive(r, 1, NO_JITTER), DhcpDrop.Layout)
+        return 4
+    r = ack(SERVER_A, c.xid, 3600)
+    m[239] = 0                       # no magic cookie
+    if not dropped(c.receive(r, 1, NO_JITTER), DhcpDrop.Layout)
+        return 5
+    r = ack(SERVER_A, c.xid, 3600)
+    let short = m[0..239]
+    if not dropped(c.receive(short, 1, NO_JITTER), DhcpDrop.Short)
+        return 6
+    if c.state != st
+        return 7
+    0
+
+[[test]]
+fn test_identity_is_checked_in_every_state() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    c.start(0, NO_JITTER)
+    var r = identity_checked(@&c)
+    if r != 0
+        return r                     # Selecting
+    c.receive(offer(SERVER_A, XID), 0, NO_JITTER)
+    r = identity_checked(@&c)
+    if r != 0
+        return 10 + r                # Requesting
+    var b = bound_client(3600)
+    b.tick(1800000, NO_JITTER)
+    r = identity_checked(@&b)
+    if r != 0
+        return 20 + r                # Renewing
+    b.tick(3150000, NO_JITTER)
+    r = identity_checked(@&b)
+    if r != 0
+        return 30 + r                # Rebinding
+    0
+
+[[test]]
+fn test_options_must_fit_the_payload() -> i32
+    let mac = our_mac()
+    # A length byte that runs past the end.
+    reply_begin(MSG_ACK, XID, OUR_IP)
+    opt4(54, SERVER_A)
+    let m: [u8] = @g_msg
+    m[g_at] = 51
+    m[g_at + 1] = 4
+    be32_put(m, g_at + 2, 3600)
+    let cut = m[0..g_at + 5]
+    if not parse_dropped(dhcp_parse(cut, XID, mac), DhcpDrop.Option)
+        return 1
+    # An option code with no room for its length byte.
+    let lone = m[0..g_at + 1]
+    if not parse_dropped(dhcp_parse(lone, XID, mac), DhcpDrop.Option)
+        return 2
+    # A length of 255 near the end.
+    m[g_at + 1] = 255
+    let big = m[0..g_at + 6]
+    if not parse_dropped(dhcp_parse(big, XID, mac), DhcpDrop.Option)
+        return 3
+    # Exactly fitting, with no end option, is fine.
+    m[g_at + 1] = 4
+    let exact = m[0..g_at + 6]
+    match dhcp_parse(exact, XID, mac)
+        Ok(msg) =>
+            if msg.kind != DhcpKind.Ack
+                return 4
+            match msg.lease_secs
+                Some(s) =>
+                    if s != 3600
+                        return 5
+                None => return 6
+        Err(_) => return 7
+    0
+
+[[test]]
+fn test_known_options_of_the_wrong_length_drop() -> i32
+    let mac = our_mac()
+    let m: [u8] = @g_msg
+    # Server id of 2 bytes.
+    reply_begin(MSG_OFFER, XID, OUR_IP)
+    m[g_at] = 54
+    m[g_at + 1] = 2
+    g_at += 4
+    if not parse_dropped(dhcp_parse(reply_end(), XID, mac), DhcpDrop.Option)
+        return 1
+    # Router list not a multiple of 4.
+    reply_begin(MSG_OFFER, XID, OUR_IP)
+    m[g_at] = 3
+    m[g_at + 1] = 6
+    g_at += 8
+    if not parse_dropped(dhcp_parse(reply_end(), XID, mac), DhcpDrop.Option)
+        return 2
+    # Message type of 2 bytes.
+    reply_begin(MSG_OFFER, XID, OUR_IP)
+    m[241] = 2
+    m[243] = 0
+    g_at = 244
+    if not parse_dropped(dhcp_parse(reply_end(), XID, mac), DhcpDrop.Option)
+        return 3
+    # Two routers: the first is the one kept; unknown options are skipped.
+    reply_begin(MSG_OFFER, XID, OUR_IP)
+    m[g_at] = 3
+    m[g_at + 1] = 8
+    be32_put(m, g_at + 2, ROUTER)
+    be32_put(m, g_at + 6, SERVER_B)
+    g_at += 10
+    m[g_at] = 12                     # host name, not read
+    m[g_at + 1] = 3
+    g_at += 5
+    opt4(54, SERVER_A)
+    match dhcp_parse(reply_end(), XID, mac)
+        Ok(msg) =>
+            match msg.router
+                Some(r) =>
+                    if r != ROUTER
+                        return 4
+                None => return 5
+            match msg.server
+                Some(s) =>
+                    if s != SERVER_A
+                        return 6
+                None => return 7
+        Err(_) => return 8
+    0
+
+[[test]]
+fn test_message_type_must_be_offer_ack_or_nak() -> i32
+    let mac = our_mac()
+    reply_begin(3, XID, OUR_IP)      # a REQUEST echoed back
+    opt4(54, SERVER_A)
+    if not parse_dropped(dhcp_parse(reply_end(), XID, mac), DhcpDrop.Kind)
+        return 1
+    # No option 53 at all.
+    reply_begin(MSG_ACK, XID, OUR_IP)
+    let m: [u8] = @g_msg
+    m[240] = 0
+    m[241] = 0
+    m[242] = 0
+    opt4(54, SERVER_A)
+    if not parse_dropped(dhcp_parse(reply_end(), XID, mac), DhcpDrop.Kind)
+        return 2
+    0
+
+[[test]]
+fn test_payload_write_bounds_and_needs() -> i32
+    var c = DhcpClient.new(our_mac(), XID)
+    let out: [u8] = @g_out
+    for i in 0..out.len
+        out[i] = 0xEE
+    let small = out[0..249]
+    match c.payload_write(small, DhcpSend.Discover)
+        Err(e) =>
+            if e != SendError.TooBig
+                return 1
+        Ok(_) => return 2
+    # Nothing was written.
+    for i in 0..small.len
+        if small[i] != 0xEE
+            return 3
+    let exact = out[0..250]
+    match c.payload_write(exact, DhcpSend.Discover)
+        Ok(t) =>
+            if t.len != 250
+                return 4
+        Err(_) => return 5
+    # A request needs a selected server, a renew a lease.
+    match c.payload_write(out, DhcpSend.Request)
+        Err(e) =>
+            if e != SendError.Unroutable
+                return 6
+        Ok(_) => return 7
+    match c.payload_write(out, DhcpSend.Renew)
+        Err(e) =>
+            if e != SendError.Unroutable
+                return 8
+        Ok(_) => return 9
+    0
