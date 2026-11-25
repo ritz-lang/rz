@@ -67,7 +67,7 @@ fn emit_ctor_stmt(s: *EmitterState, e: *Expr) -> i32
     let ctx: StrView = resolve_enum_ctx(s)
     if not unnamed(ctx) and ctor_family_is(e, ctx) == 1
         return emit_expr(s, e)
-    let name: StrView = named_by(ctor_scrutinee_enum, s, e)
+    let name: StrView = ctor_scrutinee_enum(s, e)
     if unnamed(name)
         return emit_expr(s, e)   # the located error
     emit_ctor_scrutinee(s, e, name)
@@ -92,7 +92,7 @@ fn emit_tuple_decl(s: *EmitterState, stmt: *Stmt)
         if s.last_match_agg_name != null
             sname = StrView { ptr: s.last_match_agg_name, len: s.last_match_agg_name_len as i64 }
     else
-        sname = named_by(tuple_decl_struct_name, s, init)
+        sname = tuple_decl_struct_name(s, init)
         # A copy of the struct it destructures: `let (a, b) = ps[1]` (#2996).
         init_reg = emit_struct_copy(s, init, TypeKind.Struct)
     var st: *StructDef = null
@@ -272,17 +272,15 @@ fn decl_pre_emit_arms(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: T
             s.last_match_float_ty = TypeKind.Void
             # AGAST #2454: arms ending in Some / None / Ok / Err build the
             # enum they name, not the no-enum zero.
-            var arms_enum: *u8 = null
-            var arms_enum_len: i32 = 0
             let ptr_phi: StrView = ptr_phi_let_struct(s, stmt.var_init)   # AGAST #2960
-            let arms: i32 = infer_ctor_arms(s, stmt, @arms_enum, @arms_enum_len)
+            let arms: CtorArms = infer_ctor_arms(s, stmt)
             # AGAST #2296: an `i64` or untyped let is a slot with no struct
             # type, so no `Span.empty()` arm takes the fn's T.
             var pre_slot: SlotCtx
             enter_slot_ctx(s, @pre_slot, TypeKind.Void, StrView { ptr: (null), len: (0) as i64 })
-            if arms == 1
-                *pre_init_reg = emit_ctor_scrutinee(s, stmt.var_init, StrView { ptr: (arms_enum), len: (arms_enum_len) as i64 })
-            else if arms == 0
+            if arms.kind == ArmsCtor.Named
+                *pre_init_reg = emit_ctor_scrutinee(s, stmt.var_init, arms.name)
+            else if arms.kind == ArmsCtor.Plain
                 *pre_init_reg = emit_expr(s, stmt.var_init)
             else
                 *pre_init_reg = emit_zero_i64(s)   # refused: its arms are not emitted
@@ -298,7 +296,7 @@ fn decl_pre_emit_arms(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type_in: T
                 # `Some(x) => x` over Option<f64>: a `double` slot.
                 var_type = s.last_match_float_ty
                 dt.var_type = var_type
-            else if not unnamed(ptr_phi) and arms == 0
+            else if not unnamed(ptr_phi) and arms.kind == ArmsCtor.Plain
                 # AGAST #2960: a `ptr` phi of `@&C` arms is an `@&C` slot.
                 var_type = TypeKind.MutRef
                 dt.var_type = TypeKind.MutRef
@@ -316,7 +314,9 @@ fn decl_emit_struct_lit_init(s: *EmitterState, stmt: *Stmt, alloca_reg: i32)
     let e: *Expr = stmt.var_init
     var lit_name: *u8 = null
     var lit_name_len: i32 = 0
-    tuple_lit_name(s, e, StrView { ptr: (null), len: (0) as i64 }, @lit_name, @lit_name_len)
+    let lit_name_sv: StrView = tuple_lit_name(s, e, StrView { ptr: (null), len: (0) as i64 }).unwrap_or(no_name())
+    lit_name = lit_name_sv.ptr
+    lit_name_len = lit_name_sv.len as i32
     var st: *StructDef = null
     if lit_name != null
         st = find_struct(s, StrView { ptr: (lit_name), len: (lit_name_len) as i64 })
@@ -620,7 +620,9 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 var stored_reg: i32 = val
                 var src_name: *u8 = null
                 var src_len: i32 = 0
-                resolve_expr_struct_name(s, stmt.assign_value, @src_name, @src_len)
+                let src_name_sv: StrView = resolve_expr_struct_name(s, stmt.assign_value)
+                src_name = src_name_sv.ptr
+                src_len = src_name_sv.len as i32
                 if is_layout_equiv_pair(StrView { ptr: (src_name), len: (src_len) as i64 }, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }) == 1
                     stored_reg = rebuild_layout_equiv(s, val, StrView { ptr: (src_name), len: (src_len) as i64 }, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
                 # AGAST #167: emit_llvm_type_struct routes `v4i32`/`v16i8`
@@ -693,7 +695,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 TypeKind.Struct =>
                     # AGAST #2454: `g = Some(5)` builds the global's enum.
                     let val: i32 = emit_expr_into_slot(s, stmt.assign_value, TypeKind.Struct, StrView { ptr: (glob.type_name), len: (glob.type_name_len) as i64 })
-                    emit_struct_store_or_copy_named(s, TypeKind.Struct, StrView { ptr: (glob.type_name), len: (glob.type_name_len) as i64 }, val, glob.name, glob.name_len)
+                    emit_struct_store_or_copy_named(s, TypeKind.Struct, StrView { ptr: (glob.type_name), len: (glob.type_name_len) as i64 }, val, StrView { ptr: glob.name, len: glob.name_len as i64 })
                     return
                 _ => pass
             set_match_float_hint(s, stmt.assign_value, glob.var_type, StrView { ptr: (null), len: (0) as i64 })   # AGAST #4028
@@ -941,7 +943,7 @@ fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, ori
         # AGAST #1505: resolve it exactly as the `*p` load does, so
         # `*(h.items + j) = *other` stores the %S the RHS deref loaded
         # (pointer arithmetic, let-local `*S`, struct-pointer fields).
-        let dst_sname: StrView = named_by(deref_pointee_struct_name, s, target_expr.operand)
+        let dst_sname: StrView = deref_pointee_struct_name(s, target_expr.operand)
         if dst_sname.len > 0
             value_type = TypeKind.Struct
             struct_name = dst_sname
@@ -1115,7 +1117,7 @@ fn emit_assign_to_expr(s: *EmitterState, stmt: *Stmt)
     let dix: TypeKind = deref_index_elem(s, target_expr)
     var dst_name: StrView = no_name()
     if dix == TypeKind.Void and target_expr.kind == ExprKind.Index
-        dst_name = named_by(deref_ptr_ptr_struct_name, s, target_expr.left)
+        dst_name = deref_ptr_ptr_struct_name(s, target_expr.left)
     if dix != TypeKind.Void or dst_name.len > 0
         let dbase: i32 = emit_expr(s, target_expr.left)
         let dptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, dbase)
@@ -1274,7 +1276,7 @@ fn emit_struct_return(s: *EmitterState, stmt: *Stmt)
 # Load the returned struct from `ptr`, then return it.
 fn ret_struct_loaded(s: *EmitterState, ret_name: StrView, ptr: i32)
     let result: i32 = next_reg(s)
-    emit_struct_load_or_defer(s, TypeKind.Struct, result, ret_name, ptr, null, 0)
+    emit_struct_load_or_defer(s, TypeKind.Struct, result, ret_name, ptr, no_name())
     ret_struct_value(s, ret_name, result)
 
 # `  ret <S> %.{reg}`, the type spelled by emit_llvm_type_struct.
@@ -1479,7 +1481,7 @@ fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **S
         ExprKind.Call | ExprKind.Method =>
             name = for_call_struct_name(s, iter)
         ExprKind.StringLit =>
-            name = named_by(resolve_expr_struct_name, s, iter)
+            name = resolve_expr_struct_name(s, iter)
         _ => pass
     let vst: *StructDef = for_header_struct(s, name)
     if vst == null
@@ -1491,7 +1493,10 @@ fn emit_for_header(s: *EmitterState, iter: *Expr, mr: *MemberPtrResult, out: **S
 # into the entry-block buffer, out of any enclosing loop; its element type,
 # count and struct go to `src`.  0 for a literal ritz1 can't type.
 fn emit_for_literal(s: *EmitterState, e: *Expr, src: *ForIterSrc) -> i32
-    let t: TypeKind = array_init_elem(s, e, @src.elem_name, @src.elem_name_len)
+    let elem_kind: NamedKind = array_init_elem(s, e)
+    let t: TypeKind = elem_kind.kind
+    src.elem_name = elem_kind.name.ptr
+    src.elem_name_len = elem_kind.name.len as i32
     if t == TypeKind.Void
         return 0
     let name: StrView = StrView { ptr: src.elem_name, len: src.elem_name_len as i64 }

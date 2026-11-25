@@ -6,13 +6,15 @@
 # first-class value.  Split from emitter_core by AGAST #1818 (no hand-written
 # file over 3,000 SLOC): nothing left in emitter_core calls these, so this
 # sits above it and below the emitter modules.
+#
+# The IR is written in ritz1/ARCHITECTURE.md's "Emitter style": a whole
+# instruction per `format_into(s, "...")`, text as StrViews.
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
-import ritzlib.cstr
-import ritzlib.strview    # strview_eq / strview_starts_with_cstr
-import ritzlib.fmt.digits
+import ritzlib.strview
+import ritzlib.string    # refuse_huge_fn_type_byval's message
 import ritzlib.gvec
 import ritzlib.memory
 import ritzlib.hash
@@ -26,158 +28,151 @@ import tokens_gen
 import emitter_ir      # ir_alloca (AGAST #4460)
 import monomorph       # MonoCtx, EmitterState.mono (AGAST #4454)
 import emitter_core
+import text_bridge     # no_name, llvm_text, primitive_spelling (AGAST #4696)
+
+# The type name a param was declared with (its elements' struct, for an array).
+fn abi_param_type_name(p: *Param) -> StrView
+    StrView { ptr: p.param_type_name, len: p.param_type_name_len as i64 }
+
+# The struct type the fn being emitted returns.
+fn abi_ret_type_name(s: *EmitterState) -> StrView
+    StrView { ptr: s.ret_type_name, len: s.ret_type_name_len as i64 }
+
+# A `ptr` operand: the register `reg`, or the global `@<name>` when reg < 0.
+fn emit_ptr_operand(s: *EmitterState, reg: i32, name: StrView)
+    if reg >= 0
+        format_into(s, "%.{reg}")
+        return
+    let g: String = ir_name(name)
+    format_into(s, "@{g.as_view()}")
+
+# Hold the load `  %.reg = load %T, ptr <src>` when `ty` is an sret-sized
+# struct; false when the caller must emit it as usual.  `src_name` names the
+# source when src_reg < 0.
+fn defer_load(s: *EmitterState, t: TypeKind, reg: i32, ty: StrView, src_reg: i32, src_name: StrView) -> bool
+    if struct_ret_uses_sret(s, t, ty) == 0
+        return false
+    dload_add(s, reg, ty, src_reg, src_name.ptr, src_name.len as i32)
+    true
 
 # 1 (and the load line is held) when `t`/`ty_sv` is an sret-sized struct;
 # 0 when the caller must emit the load as usual.  `src_reg` is the pointer
 # register the line would say `, ptr %.N` for.
 pub fn defer_large_struct_load(s: *EmitterState, t: TypeKind, reg: i32, ty_sv: StrView, src_reg: i32) -> i32
-    if struct_ret_uses_sret(s, t, ty_sv) == 0
-        return 0
-    dload_add(s, reg, ty_sv, src_reg, null, 0)
-    1
+    if defer_load(s, t, reg, ty_sv, src_reg, no_name()) then 1 else 0
 
 # As defer_large_struct_load, for `, ptr @<name>` (a global or const struct).
-pub fn defer_large_struct_load_named(s: *EmitterState, t: TypeKind, reg: i32, ty_sv: StrView, name: *u8, name_len: i32) -> i32
-    if struct_ret_uses_sret(s, t, ty_sv) == 0
-        return 0
-    dload_add(s, reg, ty_sv, 0 - 1, name, name_len)
-    1
+pub fn defer_large_struct_load_named(s: *EmitterState, t: TypeKind, reg: i32, ty_sv: StrView, name: StrView) -> i32
+    if defer_load(s, t, reg, ty_sv, 0 - 1, name) then 1 else 0
 
 # 1 when the store `store %T %.val, ptr %.dst` is the copy of a deferred load
 # and was emitted as the helper call.  0 means "emit the store as usual".
 pub fn defer_try_struct_copy_store(s: *EmitterState, t: TypeKind, ty_sv: StrView, val: i32, dst: i32) -> i32
-    return defer_try_struct_copy_store_at(s, t, ty_sv, val, dst, null, 0)
+    if defer_copy_store(s, t, ty_sv, val, dst, no_name()) then 1 else 0
 
 # As defer_try_struct_copy_store, for `, ptr @<name>` (a global destination).
-pub fn defer_try_struct_copy_store_named(s: *EmitterState, t: TypeKind, ty_sv: StrView, val: i32, name: *u8, name_len: i32) -> i32
-    return defer_try_struct_copy_store_at(s, t, ty_sv, val, 0 - 1, name, name_len)
+pub fn defer_try_struct_copy_store_named(s: *EmitterState, t: TypeKind, ty_sv: StrView, val: i32, name: StrView) -> i32
+    if defer_copy_store(s, t, ty_sv, val, 0 - 1, name) then 1 else 0
 
-fn defer_try_struct_copy_store_at(s: *EmitterState, t: TypeKind, ty_sv: StrView, val: i32, dst: i32, dst_name: *u8, dst_name_len: i32) -> i32
-    if s.dload_count <= 0
-        return 0
-    if struct_ret_uses_sret(s, t, ty_sv) == 0
-        return 0
-    var ty: *u8 = ty_sv.ptr
-    var ty_len: i32 = ty_sv.len as i32
-    var i: i32 = 0
-    while i < s.dload_count
+# The held load of %.val as type `ty`, when the region since it cannot have
+# written its source; null when there is none.
+fn pending_load_of(s: *EmitterState, ty: StrView, val: i32) -> *DeferredLoad
+    for i in 0..s.dload_count
         let r: *DeferredLoad = s.dloads + (i as i64)
         if r.state == DLOAD_PENDING and r.reg == val and dload_region_cannot_write(s, r.off) == 1
-            if name_eq(StrView { ptr: (r.ty), len: (r.ty_len) as i64 }, StrView { ptr: (ty), len: (ty_len) as i64 }) == 1
-                emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
-                if dst >= 0
-                    emit_reg(s, dst)
-                else
-                    emit_str(s, c"@")
-                    emit_name(s, StrView { ptr: (dst_name), len: (dst_name_len) as i64 })
-                emit_str(s, IR_PTR_SEP)
-                if r.src_reg >= 0
-                    emit_reg(s, r.src_reg)
-                else
-                    emit_str(s, c"@")
-                    emit_name(s, StrView { ptr: (r.src_name), len: (r.src_name_len) as i64 })
-                emit_str(s, IR_COMMA)
-                emit_sret_size(s, ty_sv)
-                emit_str(s, IR_CLOSE)
-                s.sret_helpers_used = 1
-                if r.used == 0
-                    r.state = DLOAD_DROPPED
-                else
-                    # Also read elsewhere: keep the load, copy anyway, as the
-                    # #1732 pass did when its dead-load count saw a reader.
-                    r.state = DLOAD_KEEP
-                return 1
-        i += 1
-    0
+            let held: StrView = StrView { ptr: r.ty, len: r.ty_len as i64 }
+            if held.eq(ty)
+                return r
+    null
+
+# The store of %.val to <dst> (the register `dst`, or `@dst_name` when dst < 0)
+# as the `@__ritz_sret_copy` call, when %.val is a held load; false otherwise.
+fn defer_copy_store(s: *EmitterState, t: TypeKind, ty: StrView, val: i32, dst: i32, dst_name: StrView) -> bool
+    if s.dload_count <= 0 or struct_ret_uses_sret(s, t, ty) == 0
+        return false
+    let r: *DeferredLoad = pending_load_of(s, ty, val)
+    if r == null
+        return false
+    format_into(s, "  call void @__ritz_sret_copy(ptr ")
+    emit_ptr_operand(s, dst, dst_name)
+    format_into(s, ", ptr ")
+    emit_ptr_operand(s, r.src_reg, StrView { ptr: r.src_name, len: r.src_name_len as i64 })
+    format_into(s, ", ")
+    emit_sret_size(s, ty)
+    format_into(s, ")\n")
+    s.sret_helpers_used = 1
+    if r.used == 0
+        r.state = DLOAD_DROPPED
+    else
+        # Also read elsewhere: keep the load, copy anyway, as the
+        # #1732 pass did when its dead-load count saw a reader.
+        r.state = DLOAD_KEEP
+    true
 
 # `  %.reg = <tytext>, ptr <src>` where <tytext> is what the load sites
 # spell for the type kind `t`.  Emits the load line, or holds it when `ty_sv`
 # is an sret-sized struct (AGAST #4461).  `src_reg` < 0 means the source is
 # the named global `src_name`.  Returns 1 when the line was held.
-pub fn emit_struct_load_or_defer(s: *EmitterState, t: TypeKind, reg: i32, ty_sv: StrView, src_reg: i32, src_name: *u8, src_name_len: i32) -> i32
-    if src_reg < 0
-        if defer_large_struct_load_named(s, t, reg, ty_sv, src_name, src_name_len) == 1
-            return 1
-    else
-        if defer_large_struct_load(s, t, reg, ty_sv, src_reg) == 1
-            return 1
-    emit_str(s, IR_INDENT)
-    emit_reg(s, reg)
-    emit_str(s, IR_LOAD)
+pub fn emit_struct_load_or_defer(s: *EmitterState, t: TypeKind, reg: i32, ty_sv: StrView, src_reg: i32, src_name: StrView) -> i32
+    let held_name: StrView = if src_reg < 0 then src_name else no_name()
+    if defer_load(s, t, reg, ty_sv, src_reg, held_name)
+        return 1
+    format_into(s, "  %.{reg} = load ")
     emit_llvm_type_struct(s, t, ty_sv)
-    emit_str(s, IR_PTR_SEP)
-    if src_reg < 0
-        emit_str(s, c"@")
-        emit_name(s, StrView { ptr: (src_name), len: (src_name_len) as i64 })
-    else
-        emit_reg(s, src_reg)
-    emit_str(s, IR_NL)
+    format_into(s, ", ptr ")
+    emit_ptr_operand(s, src_reg, src_name)
+    format_into(s, "\n")
     0
+
+# `  store %<ty> %.val, ptr <dst>` (`@dst_name` when dst < 0), or the
+# `@__ritz_sret_copy` call when it copies a held sret-sized struct load
+# (AGAST #4461).  True when the copy call was emitted.
+fn struct_store_or_copy(s: *EmitterState, t: TypeKind, ty: StrView, val: i32, dst: i32, dst_name: StrView) -> bool
+    if defer_copy_store(s, t, ty, val, dst, dst_name)
+        return true
+    format_into(s, "  store ")
+    emit_llvm_type_struct(s, t, ty)
+    format_into(s, " %.{val}, ptr ")
+    emit_ptr_operand(s, dst, dst_name)
+    format_into(s, "\n")
+    false
 
 # `  store %<ty> %.val, ptr %.dst`.  When it copies a held sret-sized struct
 # load, this is the `@__ritz_sret_copy` call instead (AGAST #4461).
 # Returns 1 when the copy call was emitted.
 pub fn emit_struct_store_or_copy(s: *EmitterState, t: TypeKind, ty_sv: StrView, val: i32, dst: i32) -> i32
-    if defer_try_struct_copy_store(s, t, ty_sv, val, dst) == 1
-        return 1
-    emit_str(s, IR_STORE_IND)
-    emit_llvm_type_struct(s, t, ty_sv)
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, dst)
-    emit_str(s, IR_NL)
-    0
+    if struct_store_or_copy(s, t, ty_sv, val, dst, no_name()) then 1 else 0
 
 # As emit_struct_store_or_copy, for a `, ptr @<name>` global destination.
-pub fn emit_struct_store_or_copy_named(s: *EmitterState, t: TypeKind, ty_sv: StrView, val: i32, name: *u8, name_len: i32) -> i32
-    if defer_try_struct_copy_store_named(s, t, ty_sv, val, name, name_len) == 1
-        return 1
-    emit_str(s, IR_STORE_IND)
-    emit_llvm_type_struct(s, t, ty_sv)
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, c", ptr @")
-    emit_name(s, StrView { ptr: (name), len: (name_len) as i64 })
-    emit_str(s, IR_NL)
-    0
+pub fn emit_struct_store_or_copy_named(s: *EmitterState, t: TypeKind, ty_sv: StrView, val: i32, name: StrView) -> i32
+    if struct_store_or_copy(s, t, ty_sv, val, 0 - 1, name) then 1 else 0
 
 pub fn struct_ret_uses_sret(s: *EmitterState, t: TypeKind, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if t != TypeKind.Struct or name == null or len <= 0
-        return 0
-    if is_primitive_type_name(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if t != TypeKind.Struct or name_sv.ptr == null or name_sv.len <= 0
         return 0
     # Tagged enums (Result$/Option$) are not StructDefs and keep their ABI.
-    if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if is_primitive_type_name(name_sv) == 1 or is_tagged_enum_type(name_sv) == 1
         return 0
-    if find_struct(s, StrView { ptr: (name), len: (len) as i64 }) == null
+    if find_struct(s, name_sv) == null
         return 0
     # get_struct_size_by_name is the padded LLVM alloc size.  It must be
     # exact, and ritz0's _sret_struct_type must measure the same way: for a
     # PARAM this predicate is the ABI (byval vs first-class), so a struct
     # that only padding lifts to 256 B is byval in both (AGAST #1744,
     # test_byval_exact_size.py).
-    if get_struct_size_by_name(s, StrView { ptr: (name), len: (len) as i64 }) < SRET_MIN_BYTES
+    if get_struct_size_by_name(s, name_sv) < SRET_MIN_BYTES
         return 0
     1
 
 # The exact LLVM alloc size of %T as a constant expression, prefixed `i64 `.
 pub fn emit_sret_size(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    emit_str(s, c"i64 ptrtoint (ptr getelementptr (%")
-    emit_name(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c", ptr null, i32 1) to i64)")
+    let n: String = ir_name(name_sv)
+    format_into(s, "i64 ptrtoint (ptr getelementptr (%{n.as_view()}, ptr null, i32 1) to i64)")
 
 # `ptr sret(%T) ` — the attribute both the definition and every call carry.
 pub fn emit_sret_attr(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    emit_str(s, c"ptr sret(%")
-    emit_name(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c") ")
+    let n: String = ir_name(name_sv)
+    format_into(s, "ptr sret(%{n.as_view()}) ")
 
 # AGAST #1739 — large by-value struct PARAMS are `ptr byval(%T) align 8`.
 #
@@ -196,38 +191,29 @@ pub fn emit_sret_attr(s: *EmitterState, name_sv: StrView)
 pub fn param_uses_byval(s: *EmitterState, p: *Param) -> i32
     if p == null
         return 0
-    struct_ret_uses_sret(s, p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+    struct_ret_uses_sret(s, p.param_type, abi_param_type_name(p))
 
 # `ptr byval(%T) align A` — what the definition, declare and every call
 # carry.  A is 8, or %T's own alignment when that is more: a struct of
 # `v4i64` is 32-aligned, and clang gives an over-aligned C struct its type's
 # alignment (AGAST #3656).  ritz0's _byval_align writes the same A.
-fn emit_byval_attr(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    emit_str(s, c"ptr byval(%")
-    emit_name(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c") align ")
-    var a: i64 = get_struct_align_by_name(s, StrView { ptr: (name), len: (len) as i64 })
+fn emit_byval_attr(s: *EmitterState, name: StrView)
+    var a: i64 = get_struct_align_by_name(s, name)
     if a < 8
         a = 8
-    emit_int(s, a)
+    let n: String = ir_name(name)
+    format_into(s, "ptr byval(%{n.as_view()}) align {a}")
 
 # Emit the LLVM type `[N x T]` of a 1-D local array (element struct `name`).
 # The spelling matches emit_var_decl's alloca, so a copy loads and stores
 # exactly the local's bytes.
 pub fn emit_local_array_llvm_type(s: *EmitterState, size: i32, et: TypeKind, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    emit_str(s, c"[")
-    emit_int(s, size as i64)
-    emit_str(s, IR_X)
-    if et == TypeKind.Struct and name_len > 0
-        emit_str(s, IR_PCT)
-        emit_name(s, StrView { ptr: (name), len: (name_len) as i64 })
-    else
-        emit_str(s, elem_mem_llvm(et))
-    emit_str(s, c"]")
+    if et == TypeKind.Struct and name_sv.len > 0
+        let n: String = ir_name(name_sv)
+        format_into(s, "[{size} x %{n.as_view()}]")
+        return
+    let elem: StrView = llvm_text(elem_mem_llvm(et))
+    format_into(s, "[{size} x {elem}]")
 
 # AGAST #2306 / #3181 — large by-value ARRAYS are `ptr byval` / `ptr sret`.
 #
@@ -244,22 +230,27 @@ pub fn emit_local_array_llvm_type(s: *EmitterState, size: i32, et: TypeKind, nam
 # The `[N]T` is described by a Param: the param itself, or ret_array_of(f)
 # for a return.  Below the threshold nothing changes.
 
-# The byte size of the `[N]T` that `p` holds, with its alignment in *align.
-fn array_param_size_align(s: *EmitterState, p: *Param, align: *i64) -> i64
-    *align = 8
+# The byte size of an `[N]T` and the alignment of its element.
+struct ArrayBytes
+    size: i64
+    align: i64
+
+# The `[N]T` that `p` holds; size 0 (align 8) when `p` is not an array.
+fn array_param_bytes(s: *EmitterState, p: *Param) -> ArrayBytes
+    var align: i64 = 8
     if p == null or p.param_type != TypeKind.Array
-        return 0
+        return ArrayBytes { size: 0, align: align }
     let sh: *ArrayShape = p.param_array_shape
     if sh != null
         # AGAST #3634: `[N][M]..T` is every leaf, at the leaf's alignment.
-        return elem_size_align(s, sh.leaf_type, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, align) * (shape_leaf_count(sh) as i64)
-    let es: i64 = elem_size_align(s, p.param_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, align)
-    es * (p.param_array_size as i64)
+        let leaf: i64 = elem_size_align(s, sh.leaf_type, StrView { ptr: sh.leaf_name, len: sh.leaf_name_len as i64 }, @align)
+        return ArrayBytes { size: leaf * (shape_leaf_count(sh) as i64), align: align }
+    let es: i64 = elem_size_align(s, p.param_array_elem_type, abi_param_type_name(p), @align)
+    ArrayBytes { size: es * (p.param_array_size as i64), align: align }
 
 # 1 when the `[N]T` `p` holds is passed byval / returned sret (AGAST #2306).
 pub fn array_param_uses_byval(s: *EmitterState, p: *Param) -> i32
-    var align: i64 = 8
-    if array_param_size_align(s, p, @align) < SRET_MIN_BYTES
+    if array_param_bytes(s, p).size < SRET_MIN_BYTES
         return 0
     1
 
@@ -268,47 +259,34 @@ pub fn array_param_uses_byval(s: *EmitterState, p: *Param) -> i32
 # other param.  i64 throughout: a byval past 4 GiB is what this measures.
 pub fn param_byval_bytes(s: *EmitterState, p: *Param) -> i64
     if param_uses_byval(s, p) == 1
-        return get_struct_size_by_name(s, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-    if p == null or p.param_type != TypeKind.Array or array_param_uses_byval(s, p) == 0
+        return get_struct_size_by_name(s, abi_param_type_name(p))
+    let bytes: i64 = array_param_bytes(s, p).size
+    if bytes < SRET_MIN_BYTES
         return 0
-    var align: i64 = 8
-    array_param_size_align(s, p, @align)
-
-# Append `n` bytes of `src` to `buf` at `*at`.
-pub fn hb_put(buf: *u8, at: *i64, src: *u8, n: i64)
-    memcpy(buf + *at, src, n)
-    *at = *at + n
-
-pub fn hb_puts(buf: *u8, at: *i64, src: *u8)
-    hb_put(buf, at, src, strlen(src))
+    bytes
 
 # A Ritz leaf type `T` of kind `t`, a struct named `name`.  "?" when unknown.
-pub fn hb_put_leaf(buf: *u8, at: *i64, t: TypeKind, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var name_len: i32 = name_sv.len as i32
-    let prim: *u8 = primitive_name_from_type(t)
-    if prim != null
-        hb_puts(buf, at, prim)
-    else if name != null and name_len > 0
-        hb_put(buf, at, name, name_len as i64)
+fn put_leaf_type(out: *String, t: TypeKind, name: StrView)
+    let prim: StrView = primitive_spelling(t)
+    if not unnamed(prim)
+        format_into(out, "{prim}")
+    else if name.ptr != null and name.len > 0
+        format_into(out, "{name}")
     else
-        hb_puts(buf, at, c"?")
+        format_into(out, "?")
 
 # The param's type as written: `H`, or `[1073741825]i32` for an array.
-pub fn hb_put_param_type(buf: *u8, at: *i64, p: *Param)
+pub fn put_param_type(out: *String, p: *Param)
+    let name: StrView = abi_param_type_name(p)
     if p.param_type != TypeKind.Array
-        hb_put(buf, at, p.param_type_name, p.param_type_name_len as i64)
+        format_into(out, "{name}")
         return
-    var num: [20]u8
-    let digits: StrView = fmt_i64_into(@num, p.param_array_size as i64)
-    hb_puts(buf, at, c"[")
-    hb_put(buf, at, digits.ptr, digits.len)
-    hb_puts(buf, at, c"]")
+    format_into(out, "[{p.param_array_size}]")
     if p.param_array_elem_type == TypeKind.Ptr
-        hb_puts(buf, at, c"*")
-        hb_put_leaf(buf, at, p.param_array_elem_pointee, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+        format_into(out, "*")
+        put_leaf_type(out, p.param_array_elem_pointee, name)
         return
-    hb_put_leaf(buf, at, p.param_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+    put_leaf_type(out, p.param_array_elem_type, name)
 
 # AGAST #3690: a call through a fn type whose by-value param `p` (the
 # `n`th, 1-based) is past LLVM's byval limit is refused at the type's `fn`
@@ -316,32 +294,21 @@ pub fn hb_put_param_type(buf: *u8, at: *i64, p: *Param)
 # ritz0's words.  An uncalled fn type is a plain `ptr`: nothing to refuse.
 # Returns 1 when it refused.
 pub fn refuse_huge_fn_type_byval(s: *EmitterState, sig: *FnDef) -> i32
-    var refused: i32 = 0
+    var refused: bool = false
     var n: i32 = 1
     var p: *Param = sig.params
     while p != null
         let bytes: i64 = param_byval_bytes(s, p)
-        if bytes >= BYVAL_MAX_BYTES and refused == 0
-            let buf: *u8 = malloc(BYVAL_MSG_BASE + 2 * (p.param_type_name_len as i64))
-            var at: i64 = 0
-            var num: [20]u8
-            let index: StrView = fmt_i64_into(@num, n as i64)
-            hb_puts(buf, @at, c"parameter #")
-            hb_put(buf, @at, index.ptr, index.len)
-            hb_puts(buf, @at, c" of this fn type is ")
-            let size: StrView = fmt_i64_into(@num, bytes)
-            hb_put(buf, @at, size.ptr, size.len)
-            hb_puts(buf, @at, c" bytes, too large to pass by value (LLVM's byval limit is 4 GiB); take it by reference: `@")
-            hb_put_param_type(buf, @at, p)
-            hb_puts(buf, @at, c"` or `@&")
-            hb_put_param_type(buf, @at, p)
-            hb_puts(buf, @at, c"`")
-            *(buf + at) = 0
-            emit_nd_error(s, sig.line, sig.col, buf)
-            refused = 1
+        if bytes >= BYVAL_MAX_BYTES and not refused
+            var ty: String = string_new()
+            put_param_type(@&ty, p)
+            var msg: String = string_new()
+            format_into(@&msg, "parameter #{n} of this fn type is {bytes} bytes, too large to pass by value (LLVM's byval limit is 4 GiB); take it by reference: `@{ty.as_view()}` or `@&{ty.as_view()}`")
+            emit_nd_error_sv(s, sig.line, sig.col, msg.as_view())
+            refused = true
         n += 1
         p = p.next
-    refused
+    if refused then 1 else 0
 
 # The `[N x T]` value type of the array `p` holds (its allocas and loads).
 # AGAST #3634: a `[N][M]..T` is the nested `[N x [M x T]]`, as ritz0 spells it.
@@ -349,28 +316,19 @@ pub fn emit_array_value_llvm_type(s: *EmitterState, p: *Param)
     if p.param_array_shape != null
         emit_array_shape_llvm(s, p.param_array_shape, 0)
         return
-    emit_local_array_llvm_type(s, p.param_array_size, p.param_array_elem_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-
-# `ptr byval([N x T]) align A`, A the element's alignment (AGAST #2306).
-fn emit_byval_array_attr(s: *EmitterState, p: *Param)
-    var align: i64 = 8
-    array_param_size_align(s, p, @align)
-    emit_str(s, c"ptr byval(")
-    emit_array_value_llvm_type(s, p)
-    emit_str(s, c") align ")
-    emit_int(s, align)
+    emit_local_array_llvm_type(s, p.param_array_size, p.param_array_elem_type, abi_param_type_name(p))
 
 # `i64 sizeof([N x T])` as a constant expression, as emit_sret_size spells it.
 pub fn emit_array_sret_size(s: *EmitterState, p: *Param)
-    emit_str(s, c"i64 ptrtoint (ptr getelementptr (")
+    format_into(s, "i64 ptrtoint (ptr getelementptr (")
     emit_array_value_llvm_type(s, p)
-    emit_str(s, c", ptr null, i32 1) to i64)")
+    format_into(s, ", ptr null, i32 1) to i64)")
 
 # `ptr sret([N x T]) ` (AGAST #3181).
 pub fn emit_sret_array_attr(s: *EmitterState, ra: *Param)
-    emit_str(s, c"ptr sret(")
+    format_into(s, "ptr sret(")
     emit_array_value_llvm_type(s, ra)
-    emit_str(s, c") ")
+    format_into(s, ") ")
 
 # The `-> [N]T` of `f` when it is returned through sret, or null (AGAST #3181).
 pub fn fn_sret_array(s: *EmitterState, f: *FnDef) -> *Param
@@ -379,58 +337,58 @@ pub fn fn_sret_array(s: *EmitterState, f: *FnDef) -> *Param
         return null
     ra
 
-# Caller side of a `-> [N]T` sret call: the fresh `[N x T]` slot it writes,
-# which is also the call's value (a `ptr`; emit_call_array_store copies it).
-fn emit_sret_array_call_slot(s: *EmitterState, ra: *Param) -> i32
-    let slot: i32 = next_reg(s)
-    entry_alloca_reg_begin(s, slot)
-    emit_array_value_llvm_type(s, ra)
-    emit_str(s, c"  ; #3181 sret array\n")
-    entry_alloca_reg_end(s)
-    slot
-
-# A call's sret slot, when callee `f` returns `[N]T` through one (AGAST #3181);
-# `slot` (a struct's, or 0) otherwise.  Each call site keeps its struct path.
+# A call's sret slot, when callee `f` returns `[N]T` through one (AGAST #3181):
+# the fresh `[N x T]` slot it writes, which is also the call's value (a `ptr`;
+# emit_call_array_store copies it).  `slot` (a struct's, or 0) otherwise.
+# Each call site keeps its struct path.
 pub fn emit_call_sret_array_slot(s: *EmitterState, f: *FnDef, slot: i32) -> i32
     let ra: *Param = fn_sret_array(s, f)
     if ra == null
         return slot
-    emit_sret_array_call_slot(s, ra)
+    let array_slot: i32 = next_reg(s)
+    entry_alloca_reg_begin(s, array_slot)
+    emit_array_value_llvm_type(s, ra)
+    format_into(s, "  ; #3181 sret array\n")
+    entry_alloca_reg_end(s)
+    array_slot
 
 # The `ptr sret(...)` an sret call passes: `[N x T]` or the struct `name`.
 pub fn emit_call_sret_attr(s: *EmitterState, f: *FnDef, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let ra: *Param = fn_sret_array(s, f)
     if ra != null
         emit_sret_array_attr(s, ra)
         return
-    emit_sret_attr(s, StrView { ptr: (name), len: (len) as i64 })
+    emit_sret_attr(s, name_sv)
 
-# After an sret call: a struct is loaded into `result` (emit_sret_call_result);
-# an array's value is its slot, which emit_call_array_store copies from.
+# After an sret call: a struct is loaded into `result` as the first-class
+# value every consumer expects, and the slot remembered (emit_sret_ret_value
+# copies it for `return f()`); an array's value is its slot, which
+# emit_call_array_store copies from.
 pub fn emit_call_sret_result(s: *EmitterState, f: *FnDef, result: i32, slot: i32, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     if fn_sret_array(s, f) != null
         return slot
-    emit_sret_call_result(s, result, slot, StrView { ptr: (name), len: (len) as i64 })
+    emit_struct_load_or_defer(s, TypeKind.Struct, result, name_sv, slot, no_name())
+    s.sret_last_val = result
+    s.sret_last_slot = slot
     result
 
 # The LLVM type of param `p` in a signature or call argument list.  AGAST #2287:
 # a by-value `[N]T` is a first-class `[N x T]`, as ritz0 emits it; a large one
-# is `ptr byval` (AGAST #2306).
+# is `ptr byval` (AGAST #2306), aligned as its element.
 pub fn emit_param_llvm_type(s: *EmitterState, p: *Param)
     if param_uses_byval(s, p) == 1
-        emit_byval_attr(s, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+        emit_byval_attr(s, abi_param_type_name(p))
         return
-    if p.param_type == TypeKind.Array
-        if array_param_uses_byval(s, p) == 1
-            emit_byval_array_attr(s, p)
-            return
+    if p.param_type != TypeKind.Array
+        emit_llvm_type_struct(s, p.param_type, abi_param_type_name(p))
+        return
+    let ab: ArrayBytes = array_param_bytes(s, p)
+    if ab.size < SRET_MIN_BYTES
         emit_array_value_llvm_type(s, p)
         return
-    emit_llvm_type_struct(s, p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
+    format_into(s, "ptr byval(")
+    emit_array_value_llvm_type(s, p)
+    format_into(s, ") align {ab.align}")
 
 # AGAST #2302: the `-> [N]T` of `f` as a by-value param would hold it, or null.
 pub fn ret_array_of(f: *FnDef) -> *Param
@@ -443,132 +401,142 @@ pub fn ret_array_of(f: *FnDef) -> *Param
 # large: it then comes back through `ptr sret([N x T])` (AGAST #3181).
 pub fn emit_fn_ret_llvm_type(s: *EmitterState, f: *FnDef)
     let ra: *Param = ret_array_of(f)
-    if ra != null and array_param_uses_byval(s, ra) == 1
-        emit_str(s, c"void")
+    if ra == null
+        emit_llvm_type_struct(s, f.return_type, StrView { ptr: f.return_type_name, len: f.return_type_name_len as i64 })
         return
-    if ra != null
-        emit_array_value_llvm_type(s, ra)   # AGAST #3634: `[N][M]T` too
+    if array_param_uses_byval(s, ra) == 1
+        format_into(s, "void")
         return
-    emit_llvm_type_struct(s, f.return_type, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 })
+    emit_array_value_llvm_type(s, ra)   # AGAST #3634: `[N][M]T` too
 
 # Return from an sret fn by copying the %T at register `src_ptr` (a `ptr`).
+# The `ret` is its own piece: the sink drops the live owned bindings before it.
 pub fn emit_sret_ret_from_ptr(s: *EmitterState, src_ptr: i32)
-    emit_str(s, c"  call void @__ritz_sret_copy(ptr %ret.sret, ptr ")
-    emit_reg(s, src_ptr)
-    emit_str(s, IR_COMMA)
-    emit_sret_size(s, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
-    emit_str(s, IR_CLOSE)
-    emit_str(s, c"  ret void\n")
+    format_into(s, "  call void @__ritz_sret_copy(ptr %ret.sret, ptr %.{src_ptr}, ")
+    emit_sret_size(s, abi_ret_type_name(s))
+    format_into(s, ")\n")
+    format_into(s, "  ret void\n")
     s.sret_helpers_used = 1
 
 # Module-internal byte copy / zero used by every sret return.  Defined once
 # per module, only when used.  "no-builtins" keeps clang from rewriting the
 # loops into libc memcpy/memset calls (see build.py FREESTANDING_FLAGS).
+# These are module-level text, emitted after every fn: each `  ret void\n` is
+# its own piece, so the sink runs its before-`ret` drops, but no owned binding
+# is live here and they emit nothing.
 pub fn emit_sret_helpers(s: *EmitterState)
     if s.sret_helpers_used == 0
         return
-    emit_str(s, c"define internal void @__ritz_sret_copy(ptr %d, ptr %s, i64 %n) \"no-builtins\"")
+    format_into(s, "define internal void @__ritz_sret_copy(ptr %d, ptr %s, i64 %n) \"no-builtins\"")
     emit_no_red_zone_attr(s)
-    emit_str(s, c" {\n")
-    emit_str(s, c"entry:\n")
-    emit_str(s, c"  %z = icmp eq i64 %n, 0\n")
-    emit_str(s, c"  br i1 %z, label %done, label %loop\n")
-    emit_str(s, c"loop:\n")
-    emit_str(s, c"  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]\n")
-    emit_str(s, c"  %sp = getelementptr i8, ptr %s, i64 %i\n")
-    emit_str(s, c"  %c = load i8, ptr %sp\n")
-    emit_str(s, c"  %dp = getelementptr i8, ptr %d, i64 %i\n")
-    emit_str(s, c"  store i8 %c, ptr %dp\n")
-    emit_str(s, c"  %i1 = add i64 %i, 1\n")
-    emit_str(s, c"  %more = icmp ult i64 %i1, %n\n")
-    emit_str(s, c"  br i1 %more, label %loop, label %done\n")
-    emit_str(s, c"done:\n")
-    emit_str(s, c"  ret void\n")
-    emit_str(s, c"}\n\n")
-    emit_str(s, c"define internal void @__ritz_sret_zero(ptr %d, i64 %n) \"no-builtins\"")
+    format_into(s, " {{\n")
+    format_into(s, "entry:\n")
+    format_into(s, "  %z = icmp eq i64 %n, 0\n")
+    format_into(s, "  br i1 %z, label %done, label %loop\n")
+    format_into(s, "loop:\n")
+    format_into(s, "  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]\n")
+    format_into(s, "  %sp = getelementptr i8, ptr %s, i64 %i\n")
+    format_into(s, "  %c = load i8, ptr %sp\n")
+    format_into(s, "  %dp = getelementptr i8, ptr %d, i64 %i\n")
+    format_into(s, "  store i8 %c, ptr %dp\n")
+    format_into(s, "  %i1 = add i64 %i, 1\n")
+    format_into(s, "  %more = icmp ult i64 %i1, %n\n")
+    format_into(s, "  br i1 %more, label %loop, label %done\n")
+    format_into(s, "done:\n")
+    format_into(s, "  ret void\n")
+    format_into(s, "}}\n\n")
+    format_into(s, "define internal void @__ritz_sret_zero(ptr %d, i64 %n) \"no-builtins\"")
     emit_no_red_zone_attr(s)
-    emit_str(s, c" {\n")
-    emit_str(s, c"entry:\n")
-    emit_str(s, c"  %z = icmp eq i64 %n, 0\n")
-    emit_str(s, c"  br i1 %z, label %done, label %loop\n")
-    emit_str(s, c"loop:\n")
-    emit_str(s, c"  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]\n")
-    emit_str(s, c"  %dp = getelementptr i8, ptr %d, i64 %i\n")
-    emit_str(s, c"  store i8 0, ptr %dp\n")
-    emit_str(s, c"  %i1 = add i64 %i, 1\n")
-    emit_str(s, c"  %more = icmp ult i64 %i1, %n\n")
-    emit_str(s, c"  br i1 %more, label %loop, label %done\n")
-    emit_str(s, c"done:\n")
-    emit_str(s, c"  ret void\n")
-    emit_str(s, c"}\n\n")
+    format_into(s, " {{\n")
+    format_into(s, "entry:\n")
+    format_into(s, "  %z = icmp eq i64 %n, 0\n")
+    format_into(s, "  br i1 %z, label %done, label %loop\n")
+    format_into(s, "loop:\n")
+    format_into(s, "  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]\n")
+    format_into(s, "  %dp = getelementptr i8, ptr %d, i64 %i\n")
+    format_into(s, "  store i8 0, ptr %dp\n")
+    format_into(s, "  %i1 = add i64 %i, 1\n")
+    format_into(s, "  %more = icmp ult i64 %i1, %n\n")
+    format_into(s, "  br i1 %more, label %loop, label %done\n")
+    format_into(s, "done:\n")
+    format_into(s, "  ret void\n")
+    format_into(s, "}}\n\n")
 
-# Emit `line` with each `#` replaced by `ty`, for emit_fmod_fn's template.
-fn emit_typed_line(s: *EmitterState, line: *u8, ty: *u8)
-    var i: i32 = 0
-    var start: i32 = 0
-    while *(line + i) != 0
-        if *(line + i) == '#'
-            s.out.push_span(Span<u8> { ptr: (line + start), len: ((i - start) as i64) as i64 })
-            emit_str(s, ty)
-            start = i + 1
-        i += 1
-    s.out.push_span(Span<u8> { ptr: (line + start), len: ((i - start) as i64) as i64 })
-    emit_str(s, IR_NL)
+# The float widths float `%` has a helper for (EmitterState.fmod_helpers_used).
+enum FmodWidth
+    F64
+    F32
 
-# @__ritz_fmod / @__ritz_fmodf: C's fmod, exactly, at float type `ty`.  Float
+# The fmod_helpers_used bit that says the helper at width `w` is called.
+fn fmod_used_bit(w: FmodWidth) -> i32
+    match w
+        FmodWidth.F64 => 1
+        FmodWidth.F32 => 2
+
+fn fmod_symbol(w: FmodWidth) -> StrView
+    match w
+        FmodWidth.F64 => "__ritz_fmod"
+        FmodWidth.F32 => "__ritz_fmodf"
+
+fn fmod_llvm_type(w: FmodWidth) -> StrView
+    match w
+        FmodWidth.F64 => "double"
+        FmodWidth.F32 => "float"
+
+# @__ritz_fmod / @__ritz_fmodf: C's fmod, exactly, at float width `w`.  Float
 # `%` can't be `frem`: x86-64 lowers it to a libm fmod call and Ritz links no
 # libc (AGAST #3817).  Binary long division: double |y| up to just past |x|,
 # then halve back down to |y|, subtracting where it fits (|x| < |y| subtracts
 # nothing).  Each subtraction is
 # exact (Sterbenz: d <= r < 2d) and so is each halving (it retraces a
-# doubling).  Mirrors ritz0's _fmod_helper.
-fn emit_fmod_fn(s: *EmitterState, name: *u8, ty: *u8)
-    emit_str(s, c"define internal ")
-    emit_str(s, ty)
-    emit_str(s, c" @")
-    emit_str(s, name)
-    emit_typed_line(s, c"(# %x, # %y) {", ty)
-    emit_typed_line(s, c"entry:", ty)
-    emit_typed_line(s, c"  %xn = fcmp olt # %x, 0.0", ty)
-    emit_typed_line(s, c"  %xf = fneg # %x", ty)
-    emit_typed_line(s, c"  %ax = select i1 %xn, # %xf, # %x", ty)
-    emit_typed_line(s, c"  %yn = fcmp olt # %y, 0.0", ty)
-    emit_typed_line(s, c"  %yf = fneg # %y", ty)
-    emit_typed_line(s, c"  %ay = select i1 %yn, # %yf, # %y", ty)
+# doubling).  Mirrors ritz0's _fmod_helper.  Module-level text, as
+# emit_sret_helpers; here each `ret` shares a piece with the text before it,
+# so no piece starts a `ret`.
+fn emit_fmod_fn(s: *EmitterState, w: FmodWidth)
+    let name: StrView = fmod_symbol(w)
+    let ty: StrView = fmod_llvm_type(w)
+    format_into(s, "define internal {ty} @{name}({ty} %x, {ty} %y) {{\n")
+    format_into(s, "entry:\n")
+    format_into(s, "  %xn = fcmp olt {ty} %x, 0.0\n")
+    format_into(s, "  %xf = fneg {ty} %x\n")
+    format_into(s, "  %ax = select i1 %xn, {ty} %xf, {ty} %x\n")
+    format_into(s, "  %yn = fcmp olt {ty} %y, 0.0\n")
+    format_into(s, "  %yf = fneg {ty} %y\n")
+    format_into(s, "  %ay = select i1 %yn, {ty} %yf, {ty} %y\n")
     # y == 0, x infinite, or either NaN: NaN (unordered compares are true).
-    emit_typed_line(s, c"  %yz = fcmp ueq # %ay, 0.0", ty)
-    emit_typed_line(s, c"  %xi = fcmp ueq # %ax, 0x7FF0000000000000", ty)
-    emit_typed_line(s, c"  %bad = or i1 %yz, %xi", ty)
-    emit_typed_line(s, c"  br i1 %bad, label %nan, label %up", ty)
-    emit_typed_line(s, c"nan:", ty)
-    emit_typed_line(s, c"  ret # 0x7FF8000000000000", ty)
-    emit_typed_line(s, c"up:", ty)
-    emit_typed_line(s, c"  %t = phi # [ %ay, %entry ], [ %t2, %up ]", ty)
-    emit_typed_line(s, c"  %t2 = fmul # %t, 2.0", ty)
-    emit_typed_line(s, c"  %more = fcmp ole # %t2, %ax", ty)
-    emit_typed_line(s, c"  br i1 %more, label %up, label %down", ty)
-    emit_typed_line(s, c"down:", ty)
-    emit_typed_line(s, c"  %r = phi # [ %ax, %up ], [ %r2, %down ]", ty)
-    emit_typed_line(s, c"  %d = phi # [ %t, %up ], [ %d2, %down ]", ty)
-    emit_typed_line(s, c"  %ge = fcmp oge # %r, %d", ty)
-    emit_typed_line(s, c"  %rs = fsub # %r, %d", ty)
-    emit_typed_line(s, c"  %r2 = select i1 %ge, # %rs, # %r", ty)
-    emit_typed_line(s, c"  %d2 = fmul # %d, 0.5", ty)
-    emit_typed_line(s, c"  %again = fcmp ogt # %d, %ay", ty)
-    emit_typed_line(s, c"  br i1 %again, label %down, label %done", ty)
-    emit_typed_line(s, c"done:", ty)
-    emit_typed_line(s, c"  %rn = fneg # %r2", ty)
-    emit_typed_line(s, c"  %res = select i1 %xn, # %rn, # %r2", ty)
-    emit_typed_line(s, c"  ret # %res", ty)
-    emit_str(s, c"}\n\n")
+    format_into(s, "  %yz = fcmp ueq {ty} %ay, 0.0\n")
+    format_into(s, "  %xi = fcmp ueq {ty} %ax, 0x7FF0000000000000\n")
+    format_into(s, "  %bad = or i1 %yz, %xi\n")
+    format_into(s, "  br i1 %bad, label %nan, label %up\n")
+    format_into(s, "nan:\n  ret {ty} 0x7FF8000000000000\n")
+    format_into(s, "up:\n")
+    format_into(s, "  %t = phi {ty} [ %ay, %entry ], [ %t2, %up ]\n")
+    format_into(s, "  %t2 = fmul {ty} %t, 2.0\n")
+    format_into(s, "  %more = fcmp ole {ty} %t2, %ax\n")
+    format_into(s, "  br i1 %more, label %up, label %down\n")
+    format_into(s, "down:\n")
+    format_into(s, "  %r = phi {ty} [ %ax, %up ], [ %r2, %down ]\n")
+    format_into(s, "  %d = phi {ty} [ %t, %up ], [ %d2, %down ]\n")
+    format_into(s, "  %ge = fcmp oge {ty} %r, %d\n")
+    format_into(s, "  %rs = fsub {ty} %r, %d\n")
+    format_into(s, "  %r2 = select i1 %ge, {ty} %rs, {ty} %r\n")
+    format_into(s, "  %d2 = fmul {ty} %d, 0.5\n")
+    format_into(s, "  %again = fcmp ogt {ty} %d, %ay\n")
+    format_into(s, "  br i1 %again, label %down, label %done\n")
+    format_into(s, "done:\n")
+    format_into(s, "  %rn = fneg {ty} %r2\n")
+    format_into(s, "  %res = select i1 %xn, {ty} %rn, {ty} %r2\n  ret {ty} %res\n")
+    format_into(s, "}}\n\n")
 
-# The fmod helpers float `%` called in this module (fmod_helpers_used: 1 for
-# f64, 2 for f32), defined once each.
+# The fmod helper at width `w`, when float `%` called it in this module.
+fn emit_fmod_if_used(s: *EmitterState, w: FmodWidth)
+    if (s.fmod_helpers_used & fmod_used_bit(w)) != 0
+        emit_fmod_fn(s, w)
+
+# The fmod helpers float `%` called in this module, defined once each.
 pub fn emit_fmod_helpers(s: *EmitterState)
-    if (s.fmod_helpers_used & 1) != 0
-        emit_fmod_fn(s, c"__ritz_fmod", c"double")
-    if (s.fmod_helpers_used & 2) != 0
-        emit_fmod_fn(s, c"__ritz_fmodf", c"float")
+    emit_fmod_if_used(s, FmodWidth.F64)
+    emit_fmod_if_used(s, FmodWidth.F32)
 
 # Return from an sret fn given a first-class %T value register.  When `val`
 # is the load of an sret call's slot (`return f()`), copy the slot itself;
@@ -577,34 +545,20 @@ pub fn emit_sret_ret_value(s: *EmitterState, val: i32)
     if val == s.sret_last_val and s.sret_last_slot > 0
         emit_sret_ret_from_ptr(s, s.sret_last_slot)
         return
-    let tmp: i32 = next_reg(s)
-    entry_alloca_reg_begin_named(s, tmp)
-    emit_name(s, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
-    emit_str(s, c"\n")
-    entry_alloca_reg_end(s)
-    emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }, val, tmp)
+    let ty: StrView = abi_ret_type_name(s)
+    let tmp: i32 = emit_sret_call_slot(s, ty)
+    emit_struct_store_or_copy(s, TypeKind.Struct, ty, val, tmp)
     emit_sret_ret_from_ptr(s, tmp)
 
 # Caller side: allocate the result slot for a call to an sret fn.  Emit it
-# BEFORE the `call` line; pass it with emit_sret_attr + emit_reg.
+# BEFORE the `call` line; pass it with emit_sret_attr and `%.{slot}`.
 pub fn emit_sret_call_slot(s: *EmitterState, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
     let slot: i32 = next_reg(s)
     entry_alloca_reg_begin_named(s, slot)
-    emit_name(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, IR_NL)
+    let n: String = ir_name(name_sv)
+    format_into(s, "{n.as_view()}\n")
     entry_alloca_reg_end(s)
     slot
-
-# Caller side, after the call: load the result into `result` as the
-# first-class value every consumer expects, and remember the slot.
-fn emit_sret_call_result(s: *EmitterState, result: i32, slot: i32, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    emit_struct_load_or_defer(s, TypeKind.Struct, result, StrView { ptr: (name), len: (len) as i64 }, slot, null, 0)
-    s.sret_last_val = result
-    s.sret_last_slot = slot
 
 # AGAST #1600: the user enum a bare identifier `B` denotes as a VALUE — a
 # unit variant of exactly one non-generic enum, the name not shadowed by a
@@ -618,18 +572,13 @@ pub fn bare_unit_variant_enum(s: *EmitterState, e: *Expr, out_vi: *i32, out_othe
     *out_other = 0 - 1
     if e == null or e.kind != ExprKind.Ident
         return 0 - 1
-    if is_const(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
+    let name: StrView = StrView { ptr: e.ident_ptr, len: e.ident_len as i64 }
+    if is_const(s, name) == 1 or find_local(s, name) >= 0 or find_global(s, name) != null or find_fn(s, name) != null
         return 0 - 1
-    if find_local(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
-        return 0 - 1
-    if find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
-        return 0 - 1
-    if find_fn(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
-        return 0 - 1
-    let ei: i32 = enum_of_variant_unique(s.mono.pctx, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, out_vi, out_other)
+    let ei: i32 = enum_of_variant_unique(s.mono.pctx, name, out_vi, out_other)
     if ei < 0
         return ei
     if enum_variant_kind(s.mono.pctx, ei, *out_vi) != ENUM_VARIANT_UNIT
         *out_vi = 0 - 1
         return 0 - 1
-    return ei
+    ei

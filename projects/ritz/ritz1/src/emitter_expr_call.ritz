@@ -151,7 +151,9 @@ fn emit_call_arg(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     if p != null and p.param_type == TypeKind.Struct
         var arg_name: *u8 = null
         var arg_name_len: i32 = 0
-        tuple_lit_name(s, arg, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, @arg_name, @arg_name_len)
+        let arg_name_sv: StrView = tuple_lit_name(s, arg, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }).unwrap_or(no_name())
+        arg_name = arg_name_sv.ptr
+        arg_name_len = arg_name_sv.len as i32
     if p != null and param_self_is_ptr(p) == 0
         if p.param_type == TypeKind.Array
             return emit_array_arg_value(s, arg, p)   # AGAST #2287
@@ -409,7 +411,7 @@ pub fn emit_lent_referent(s: *EmitterState, e: *Expr, name: StrView) -> i32
         format_into(s, "  %.{addr} = inttoptr i64 %.{src} to ptr  ; #2278 lent self\n")
         src = addr
     let val: i32 = next_reg(s)
-    emit_struct_load_or_defer(s, TypeKind.Struct, val, name, src, null, 0)
+    emit_struct_load_or_defer(s, TypeKind.Struct, val, name, src, no_name())
     return val
 
 # AGAST #2279: `return c` or a tail `c` with `c:& C` in a fn returning `C`: the
@@ -2616,7 +2618,7 @@ fn method_recv_chain(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
     # AGAST #2594: when the inner method returns a struct
     # (`c.me().tp(3)`), call_result_struct_name names it; the result is a
     # `%S` value, spilled at that type and dispatched like a call's.
-    r.type_name = named_by(call_result_struct_name, s, recv)
+    r.type_name = call_result_struct_name(s, recv)
     # AGAST #2883: a `*S` return (`s.me().me()`) names S too, and the
     # returned pointer itself is the receiver -- not a spill of it.
     var chain_ptr_st: *StructDef = null
@@ -2805,9 +2807,12 @@ fn method_recv_resolve(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
 fn method_recv_index(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
     # The element's struct, as index_through_struct, emit_through_elem_ptr and
     # array_elem_pointee name it (AGAST #2332, #2443).
-    var elem_name: *u8 = null
-    var elem_len: i32 = 0
-    if index_through_struct(s, recv, @elem_name, @elem_len) == 1 and elem_name != null
+    let through: Option<StrView> = index_through_struct(s, recv)
+    let through_name: StrView = through.unwrap_or(no_name())
+    var elem_name: *u8 = through_name.ptr
+    var elem_len: i32 = through_name.len as i32
+    let ptr_elem: NamedKind = array_elem_pointee(s, recv)   # `[N]*S`'s S, AGAST #2332
+    if through.is_some() and elem_name != null
         # AGAST #2443: `p[i].m()` through a `*`, `@` or `@&` Vec, Span or String
         # (R9), and `v[i].m()` on one: the element's address is the receiver, so
         # a mutating method writes the element in place.
@@ -2827,8 +2832,10 @@ fn method_recv_index(s: *EmitterState, e: *Expr, recv: *Expr, r: *MethodRecv)
         r.type_name = StrView { ptr: (nd_st.name), len: (nd_st.name_len) as i64 }
         r.recv_is_ptr_of_ptr = false
         r.recv_levels = 0
-    else if array_elem_pointee(s, recv, @elem_name, @elem_len) == TypeKind.Struct
+    else if ptr_elem.kind == TypeKind.Struct
         # AGAST #2332: `a[i].m()` with `a: [N]*S`: the element IS the receiver.
+        elem_name = ptr_elem.name.ptr
+        elem_len = ptr_elem.name.len as i32
         var elem_ptr: i32 = 0
         if recv_elem_is_local_array(s, recv)
             # AGAST #3071: a local array's element is a place, so a `self: **S`

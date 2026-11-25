@@ -36,14 +36,14 @@ import emitter_stmt_parts   # AGAST #1818: split out below the emitter cycle
 # The Option / Result `e` is, by its type, or as a constructor naming one.
 fn tagged_enum_operand(s: *EmitterState, e: *Expr) -> StrView
     if builtin_tagged_ctor(s, e) == 1
-        let ctor: StrView = named_by(ctor_scrutinee_enum, s, e)
+        let ctor: StrView = ctor_scrutinee_enum(s, e)
         if not unnamed(ctor)
             return ctor
         # A payload ritz1 can't name: its family will do.
         if ctor_family_is(e, "Option$") == 1
             return "Option"
         return "Result"
-    let typed: StrView = named_by(match_scrutinee_type, s, e)
+    let typed: StrView = match_scrutinee_type(s, e)
     if not unnamed(typed) and is_tagged_enum_type(typed) == 1
         return typed
     no_name()
@@ -88,9 +88,9 @@ fn eq_aggregate_operand(s: *EmitterState, e: *Expr) -> StrView
             if fld != null and fld.field_type == TypeKind.Struct and fld.field_type_name_len > 0
                 name = StrView { ptr: fld.field_type_name, len: fld.field_type_name_len as i64 }
     else if e.kind == ExprKind.Unary and e.op == OpKind.Deref and e.operand != null
-        name = named_by(deref_pointee_struct_name, s, e.operand)   # AGAST #2525: `*q`
+        name = deref_pointee_struct_name(s, e.operand)   # AGAST #2525: `*q`
     else
-        name = named_by(resolve_expr_struct_name, s, e)
+        name = resolve_expr_struct_name(s, e)
     if unnamed(name) or name.len == 0 or is_tagged_enum_type(name) == 1
         return none
     let ei: i32 = enum_find(s.mono.pctx, name)
@@ -191,7 +191,7 @@ fn refuse_struct_deref_operand(s: *EmitterState, e: *Expr) -> bool
 # The struct a `*p` operand loads, when `side` is one; unnamed otherwise.
 fn deref_struct_name(s: *EmitterState, side: *Expr) -> StrView
     if side != null and side.kind == ExprKind.Unary and side.op == OpKind.Deref
-        return named_by(struct_value_name, s, side)
+        return struct_value_name(s, side)
     no_name()
 
 # AGAST #2514: `p == "lit"` / `p != "lit"` (the literal on either side) with
@@ -594,7 +594,7 @@ fn emit_narrow_operand(s: *EmitterState, e: *Expr, reg: i32, bits: i32, unsigned
 fn unit_enum_tag_to_i64(s: *EmitterState, operand: *Expr, reg: i32) -> i32
     # AGAST #2539: `*q` / `**r` loads the %E deref_pointee_struct_name names;
     # unit_enum_expr_name knows every memory read (AGAST #4450).
-    let en: StrView = named_by(unit_enum_expr_name, s, operand)
+    let en: StrView = unit_enum_expr_name(s, operand)
     if en.len == 0
         return reg
     let tag: i32 = next_reg(s)
@@ -637,7 +637,7 @@ fn ptr_operand_stride(s: *EmitterState, x: *Expr) -> i64
     # sizeof(S) — the same resolution the OpKind.Deref arm loads through, so
     # `*(q + i)` steps and loads the same type.  ptr_arith_elem_size
     # alone does not scale a nested `a.b.items` field at all.
-    let pointee: StrView = named_by(deref_pointee_struct_name, s, x)
+    let pointee: StrView = deref_pointee_struct_name(s, x)
     # Only a StructDef or a user enum (user_enum_size, AGAST #4574: an
     # `enum E: i32` steps 4 bytes) has a size here; get_struct_size_by_name
     # says 8 for a tagged enum, so those keep ptr_arith_elem_size's answer.
@@ -750,10 +750,9 @@ fn ptr_distance_pointee(s: *EmitterState, x: *Expr) -> String
             kind = glob.pointee_type
             name = StrView { ptr: glob.pointee_type_name, len: glob.pointee_type_name_len as i64 }
     else
-        var root: *u8 = null
-        var root_len: i32 = 0
-        kind = ptr_root_pointee(s, base, @root, @root_len)
-        name = StrView { ptr: root, len: root_len as i64 }
+        let root: NamedKind = ptr_root_pointee(s, base)
+        kind = root.kind
+        name = root.name
     let scalar: StrView = scalar_llvm_name(kind)
     if not unnamed(scalar)
         pointee.push_str(scalar)
@@ -783,7 +782,7 @@ fn if_arm_names_pointee(s: *EmitterState, op: *Expr) -> bool
         return false
     var arm: *MatchArm = op.args as *MatchArm
     while arm != null
-        if named_by(deref_pointee_struct_name, s, arm.body).len > 0
+        if deref_pointee_struct_name(s, arm.body).len > 0
             return true
         arm = arm.next
     false
@@ -952,7 +951,7 @@ pub fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
         if whole_struct_elem_refused(s, e)
             return 1
         let sv: i32 = next_reg(s)
-        emit_struct_load_or_defer(s, TypeKind.Struct, sv, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, ndp.reg, null, 0)
+        emit_struct_load_or_defer(s, TypeKind.Struct, sv, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, ndp.reg, no_name())
         *out_reg = sv
         return 1
     let ty: StrView = llvm_text(elem_mem_llvm(sh.leaf_type))
@@ -1015,7 +1014,7 @@ fn emit_call_temp_ptr(s: *EmitterState, op: *Expr) -> i32
     let ra: *Param = call_ret_array(s, op)
     if ra != null
         return emit_call_array_temp(s, op, ra)
-    let result_struct: StrView = named_by(call_result_struct_name, s, op)
+    let result_struct: StrView = call_result_struct_name(s, op)
     if result_struct.len <= 0
         return 0
     let v: i32 = emit_expr(s, op)
@@ -1547,13 +1546,13 @@ fn emit_unary_deref(s: *EmitterState, e: *Expr) -> i32
     # AGAST #1505: a pointee statically known to be a struct loads that
     # struct, whatever get_expr_type guessed (it reports TypeKind.I64 for a
     # let-local `*S` and TypeKind.U8 for an unrecorded `*S` field pointee).
-    let sname: StrView = named_by(deref_pointee_struct_name, s, e.operand)
+    let sname: StrView = deref_pointee_struct_name(s, e.operand)
     if sname.len > 0
         let sresult: i32 = next_reg(s)
         # AGAST #2204: a `*v4i32` pointee is the vector `<4 x i32>`, not a
         # struct `%v4i32` (clang: "load operand must be a pointer to a
         # first class type").  emit_llvm_type_struct maps SIMD names.
-        emit_struct_load_or_defer(s, TypeKind.Struct, sresult, sname, ptr, null, 0)
+        emit_struct_load_or_defer(s, TypeKind.Struct, sresult, sname, ptr, no_name())
         return sresult
     # Determine load type based on pointee type
     let deref_type: TypeKind = expr_slot_ty(e)

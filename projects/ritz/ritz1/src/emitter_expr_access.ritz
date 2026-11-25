@@ -25,6 +25,7 @@ import ritzlib.option
 import ritzlib.strview
 import emitter_call_lower   # AGAST #1818: split out below the emitter cycle
 import emitter_decl   # AGAST #1818: split out below the emitter cycle
+import text_bridge   # no_name / unnamed (AGAST #4696)
 
 
 # =============================================================================
@@ -102,7 +103,7 @@ fn emit_struct_elem_addr(s: *EmitterState, size: i32, elem: StrView, base: i32, 
 # The struct `%name` at `ptr`, as a value (a deferred load when it is large).
 fn emit_struct_load(s: *EmitterState, name: StrView, ptr: i32) -> i32
     let v: i32 = next_reg(s)
-    emit_struct_load_or_defer(s, TypeKind.Struct, v, name, ptr, null, 0)
+    emit_struct_load_or_defer(s, TypeKind.Struct, v, name, ptr, no_name())
     v
 
 # =============================================================================
@@ -175,7 +176,7 @@ fn emit_const_value(s: *EmitterState, e: *Expr, name: StrView) -> i32
         # `add i64 0, 0`.
         if ce.const_type == TypeKind.Struct and ce.type_name_len > 0 and ce.value_expr != null
             let result: i32 = next_reg(s)
-            emit_struct_load_or_defer(s, TypeKind.Struct, result, StrView { ptr: ce.type_name, len: ce.type_name_len as i64 }, 0 - 1, ce.name, ce.name_len)
+            emit_struct_load_or_defer(s, TypeKind.Struct, result, StrView { ptr: ce.type_name, len: ce.type_name_len as i64 }, 0 - 1, StrView { ptr: ce.name, len: ce.name_len as i64 })
             return result
         # AGAST #2341: a string `*u8` const is its literal.  Its folded value
         # is 0, which is what `*P` used to read.
@@ -224,7 +225,7 @@ fn emit_local_value(s: *EmitterState, e: *Expr, index: i32, lv: *LocalVar) -> i3
         emit_whole_array_error(s, e)
         return 0
     let result: i32 = next_reg(s)
-    emit_struct_load_or_defer(s, var_type, result, local_type_text(lv), index, null, 0)
+    emit_struct_load_or_defer(s, var_type, result, local_type_text(lv), index, no_name())
     widen_slot_value(s, var_type, result)
 
 # A global's value.  AGAST #2427: a struct is loaded whole at its own type, as
@@ -235,7 +236,7 @@ fn emit_global_value(s: *EmitterState, e: *Expr, glob: *GlobalVarDef) -> i32
         return 0
     let result: i32 = next_reg(s)
     if glob.var_type == TypeKind.Struct and glob.type_name_len > 0
-        emit_struct_load_or_defer(s, TypeKind.Struct, result, StrView { ptr: glob.type_name, len: glob.type_name_len as i64 }, 0 - 1, glob.name, glob.name_len)
+        emit_struct_load_or_defer(s, TypeKind.Struct, result, StrView { ptr: glob.type_name, len: glob.type_name_len as i64 }, 0 - 1, StrView { ptr: glob.name, len: glob.name_len as i64 })
     else
         let ty: StrView = llvm_text(ty_value_llvm(glob.var_type))
         let g: String = ir_name(StrView { ptr: glob.name, len: glob.name_len as i64 })
@@ -461,9 +462,9 @@ fn emit_deref_index(s: *EmitterState, e: *Expr, elem: TypeKind) -> i32
 # struct: its `%E` is the value every consumer reads the tag of, as a local's
 # (unit_enum_expr_name), so it is never refused here.
 pub fn whole_struct_elem_refused(s: *EmitterState, e: *Expr) -> bool
-    if named_by(unit_enum_expr_name, s, e).len > 0
+    if unit_enum_expr_name(s, e).len > 0
         return false
-    struct_value_refused(s, e, strview_from_cstr(whole_struct_value_message()))
+    struct_value_refused(s, e, whole_struct_value_message())
 
 # A struct element of type `name` (a known struct) where a copy can't take it:
 # whole_struct_elem_refused, for the element kinds that name their struct.
@@ -483,7 +484,7 @@ fn struct_value_refused(s: *EmitterState, e: *Expr, msg: StrView) -> bool
 pub fn struct_cast_to_int_refused(s: *EmitterState, e: *Expr) -> i32
     if ty_int_bits(e.type_kind) == 0
         return 0
-    let name: StrView = named_by(struct_value_name, s, e.left)
+    let name: StrView = struct_value_name(s, e.left)
     if unnamed(name)
         return 0
     var msg: String = string_new()
@@ -495,7 +496,7 @@ pub fn struct_cast_to_int_refused(s: *EmitterState, e: *Expr) -> i32
 pub fn struct_return_as_int_refused(s: *EmitterState, value: *Expr, ret_type: TypeKind) -> bool
     if ty_int_bits(ret_type) == 0
         return false
-    let name: StrView = named_by(struct_value_name, s, value)
+    let name: StrView = struct_value_name(s, value)
     if unnamed(name)
         return false
     var msg: String = string_new()
@@ -563,10 +564,8 @@ fn index_store_root_pointee(s: *EmitterState, x: *Expr) -> StorePointee
             return no_pointee()
     if pp
         return pointer_pointee()
-    var name: *u8 = null
-    var len: i32 = 0
-    let t: TypeKind = ptr_root_pointee(s, x, @name, @len)
-    StorePointee { kind: t, name: StrView { ptr: name, len: len as i64 }, pp: false }
+    let root: NamedKind = ptr_root_pointee(s, x)
+    StorePointee { kind: root.kind, name: root.name, pp: false }
 
 # The pointee of global `glob` as an index store's root (null: not a global).
 fn global_store_pointee(s: *EmitterState, glob: *GlobalVarDef) -> StorePointee
@@ -588,12 +587,8 @@ fn global_store_pointee(s: *EmitterState, glob: *GlobalVarDef) -> StorePointee
 fn addr_elem_root_pointee(s: *EmitterState, x: *Expr) -> StorePointee
     if x.op != OpKind.Addr or x.operand == null or x.operand.kind != ExprKind.Index
         return no_pointee()
-    var elem: TypeKind = TypeKind.Void
-    var pointee_slot: i32 = 0
-    var name: *u8 = null
-    var len: i32 = 0
-    array_elem_record(s, x.operand, @elem, @pointee_slot, @name, @len)
-    scalar_or_struct_pointee(s, elem, StrView { ptr: name, len: len as i64 })
+    let rec: ElemRecord = array_elem_record(s, x.operand)
+    scalar_or_struct_pointee(s, rec.elem, rec.name)
 
 # AGAST #3757: the base `e` of an expression-target index as a `ptr` register:
 # emit_expr's i64 converted, or the `ptr` an `as @&T` cast already is (#1754).
@@ -693,7 +688,7 @@ fn try_emit_elem_ptr_index(s: *EmitterState, e: *Expr, ranged: bool) -> Option<i
             emit_nd_error_sv(s, e.span.line, e.span.col, "an element of an array of pointers can't be sliced (only String, Vec and Span can)")
             return Some(0)
         # AGAST #3188: a struct pointee is a copy only, as a `[N]S` element is.
-        if struct_elem_refused(s, e, named_by(deref_pointee_struct_name, s, e.left))
+        if struct_elem_refused(s, e, deref_pointee_struct_name(s, e.left))
             return Some(0)
         return Some(emit_index_as_deref(s, e))
     # AGAST #3058: `b[i][j]` with `b: [N]**T` is `*(b[i] + j)`, a `*T` loaded at a
@@ -703,7 +698,7 @@ fn try_emit_elem_ptr_index(s: *EmitterState, e: *Expr, ranged: bool) -> Option<i
     # AGAST #3052: `p[i]` with `p: *S` is `*(p + i)`, the `%S` at a stride of
     # sizeof(S).  It took the byte path: one i8 at `p + i`, an i64 where a
     # `%S` goes, so `let c: S = p[0]` failed at clang.
-    let ps_name: StrView = named_by(ptr_local_struct_index, s, e)
+    let ps_name: StrView = ptr_local_struct_index(s, e)
     if ps_name.len > 0
         # AGAST #3188: a copy only.  `let n: i32 = p[0]`, `p[0] + 1` and
         # `return p[0]` put the `%S` where an integer goes, and clang refused it.
@@ -714,7 +709,7 @@ fn try_emit_elem_ptr_index(s: *EmitterState, e: *Expr, ranged: bool) -> Option<i
     # enum) is `*(g + i)`, the `%E` at E's stride -- the value
     # unit_enum_expr_name reads the tag of.  A global's or a field's took the
     # byte path: one i8 widened to i64, where a `%E` goes.
-    if named_by(ptr_index_user_enum, s, e).len > 0
+    if ptr_index_user_enum(s, e).len > 0
         return Some(emit_index_as_deref(s, e))
     None
 
@@ -725,7 +720,7 @@ fn try_emit_ptr_root_index(s: *EmitterState, e: *Expr) -> Option<i32>
     # `*(*r + i)`, the `%C` at a stride of sizeof(C), as #3122 stores one.  It
     # took the byte path: one i8, an i64 where a `%C` goes.  A copy only, as
     # `p[i]` is.
-    let dp_name: StrView = named_by(deref_ptr_ptr_struct_name, s, e.left)
+    let dp_name: StrView = deref_ptr_ptr_struct_name(s, e.left)
     if dp_name.len > 0 and find_struct(s, dp_name) != null
         if whole_struct_elem_refused(s, e)
             return Some(0)

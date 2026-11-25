@@ -73,6 +73,7 @@ import emitter_expr_arith
 import emitter_call_lower   # AGAST #1818: split out below the emitter cycle
 import emitter_decl   # AGAST #1818: split out below the emitter cycle
 import emitter_stmt_parts   # AGAST #1818: split out below the emitter cycle
+import text_bridge   # no_name / unnamed (AGAST #4696)
 
 # Phi result tracking during emit_match.
 # We need to collect (value_reg, exit_label) pairs across all non-pass arms
@@ -334,7 +335,7 @@ fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enu
         sel = 0   # Result / Option: the payload is at offset 0
     let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, enum_name, sel)
     let val: i32 = next_reg(s)
-    emit_struct_load_or_defer(s, TypeKind.Struct, val, st_name, pay_ptr, null, 0)
+    emit_struct_load_or_defer(s, TypeKind.Struct, val, st_name, pay_ptr, no_name())
     let alloca_reg: i32 = next_reg(s)
     entry_alloca_reg_begin_named(s, alloca_reg)
     emit_name(s, st_name)
@@ -581,7 +582,7 @@ fn match_merge_slot(s: *EmitterState, result: *MatchResult) -> i32
         return 0
     let reg: i32 = next_reg(s)
     if result.agg_name != null and result.agg_name_len > 0
-        emit_struct_load_or_defer(s, TypeKind.Struct, reg, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }, result.slot, null, 0)
+        emit_struct_load_or_defer(s, TypeKind.Struct, reg, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }, result.slot, no_name())
     else
         format_into(s, "  %.{reg} = load ")
         emit_match_phi_type(s, result)
@@ -844,7 +845,9 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # AGAST #3005: a nameless tuple arm takes the type an earlier arm
         # fixed, or its own elements', with this arm's bindings in scope.
         let agg_sv: StrView = StrView { ptr: result.agg_name, len: result.agg_name_len as i64 }
-        tuple_lit_name(s, arm.body, agg_sv, @arm_lit_name, @arm_lit_name_len)
+        let arm_lit_name_sv: StrView = tuple_lit_name(s, arm.body, agg_sv).unwrap_or(no_name())
+        arm_lit_name = arm_lit_name_sv.ptr
+        arm_lit_name_len = arm_lit_name_sv.len as i32
         if lent_arm != null and discarded
             body_reg = MATCH_ZERO_VALUE   # AGAST #3028: nothing reads it
         else if lent_arm != null
@@ -900,7 +903,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         if unnamed(arm_ty)
             arm_ty = qualified_unit_variant_arm_type(s.mono.pctx, arm.body)   # AGAST #3205
         if unnamed(arm_ty)
-            arm_ty = named_by(resolve_expr_struct_name, s, arm.body)
+            arm_ty = resolve_expr_struct_name(s, arm.body)
         # #4408: resolve reads a struct literal's own `ident_ptr`; a tuple
         # literal no longer carries the name, so use the one it returned.
         # Only a literal has a type name here: for any other arm tuple_lit_name
@@ -912,11 +915,11 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # AGAST #2559: a static or global-receiver method call (`B.new(..)`)
         # returning a struct, which resolve_expr_struct_name leaves untyped.
         if unnamed(arm_ty)
-            arm_ty = named_by(call_result_struct_name, s, arm.body)
+            arm_ty = call_result_struct_name(s, arm.body)
         # AGAST #2950: `*r` with `r: @C` / `@&C` / `*C` loads the %C
         # deref_pointee_struct_name names; the phi was i64 over it.
         if unnamed(arm_ty) and arm.body.kind == ExprKind.Unary and arm.body.op == OpKind.Deref
-            arm_ty = named_by(deref_pointee_struct_name, s, arm.body.operand)
+            arm_ty = deref_pointee_struct_name(s, arm.body.operand)
         # The first struct-valued arm fixes the phi type.  A `"..."` arm is a
         # StrView in the language; its `%Span$u8` lowering (#98) is an
         # artefact, so a leading literal arm types the phi as StrView, the
@@ -1271,7 +1274,7 @@ pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out: *StrView) -> i3
     # AGAST #4450: any other read of a unit enum from memory -- a global, an
     # `[N]E` element, `p[i]` / `*(p + i)` through a `*E` -- loads the `%E`
     # exactly as a local does, so `g as i32` and `match a[i]` read its tag.
-    *out = named_by(unit_enum_expr_name, s, scr)
+    *out = unit_enum_expr_name(s, scr)
     if (*out).len > 0
         return 1
     *out = no_name()
@@ -1315,7 +1318,7 @@ fn match_scrutinee_is_scalar(s: *EmitterState, scr: *Expr) -> i32
 fn match_scrutinee_is_strview(s: *EmitterState, scr: *Expr) -> i32
     if scr.kind == ExprKind.StringLit
         return 1
-    let name: StrView = named_by(match_scrutinee_type, s, scr)
+    let name: StrView = match_scrutinee_type(s, scr)
     (not unnamed(name) and name.eq("StrView")) as i32
 
 # The first arm that names a user enum's variant, for a scrutinee no rule above
@@ -1418,11 +1421,9 @@ var g_gctor_refused: *Expr = null   # the scrutinee generic_ctor_scrutinee_enum 
 
 # "can't infer `T` for `Gone`: give the binding a type", at the constructor.
 fn generic_ctor_error(s: *EmitterState, e: *Expr, tp: *TypeParam, name: StrView)
-    var n: i32 = 0
-    let head: *u8 = ctor_join("can't infer `", StrView { ptr: (tp.name), len: (tp.name_len) as i64 }, "` for `", @n)
-    var m: i32 = 0
-    let msg: *u8 = ctor_join(StrView { ptr: (head), len: (n) as i64 }, name, "`: give the binding a type", @m)
-    emit_nd_error(s, e.span.line, e.span.col, msg)
+    let head: StrView = ctor_join("can't infer `", StrView { ptr: (tp.name), len: (tp.name_len) as i64 }, "` for `")
+    let msg: StrView = ctor_join(head, name, "`: give the binding a type")
+    emit_nd_error(s, e.span.line, e.span.col, msg.ptr)
     g_gctor_refused = e
 
 # The instance `scr` builds, recorded and queued for its type decl; `no_name()`
@@ -1455,8 +1456,9 @@ fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr) -> StrView
         if f.field_type == TypeKind.Struct and f.field_type_name != null
             let ti: i32 = type_param_index(tps, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
             if ti >= 0 and *(lens + ti) >= 0
-                var sp: *u8 = null
-                let sp_len: i32 = ctor_payload_spelling(s, arg, @sp)
+                let sp_sv: StrView = ctor_payload_spelling(s, arg)
+                let sp: *u8 = sp_sv.ptr
+                let sp_len: i32 = sp_sv.len as i32
                 if sp_len > 0 and *(names + ti) == null
                     *(names + ti) = sp
                     *(lens + ti) = sp_len
@@ -1465,18 +1467,16 @@ fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr) -> StrView
         f = f.next
         arg = arg.next
     let en: StrView = enum_name_view(s.mono.pctx, ei)
-    var out_len: i32 = 0
-    var full: *u8 = ctor_join(en, "", "", @out_len)
+    var full_sv: StrView = ctor_join(en, "", "")
     var tp: *TypeParam = tps
     var i: i32 = 0
     while tp != null
         if *(lens + i) <= 0
             generic_ctor_error(s, scr, tp, ctor_name)
             return no_name()
-        full = ctor_join(StrView { ptr: (full), len: (out_len) as i64 }, "$", StrView { ptr: (*(names + i)), len: (*(lens + i)) as i64 }, @out_len)
+        full_sv = ctor_join(full_sv, "$", StrView { ptr: (*(names + i)), len: (*(lens + i)) as i64 })
         tp = tp.next
         i = i + 1
-    let full_sv: StrView = StrView { ptr: full, len: out_len as i64 }
     add_enum_instance(s.mono, s.module, full_sv, en.len as i32)
     if user_enum_index(s.mono.pctx, full_sv) < 0
         return no_name()   # not an instance monomorph could record: no enum to build
@@ -1504,13 +1504,13 @@ pub fn emit_ctor_scrutinee(s: *EmitterState, scr: *Expr, name: StrView) -> i32
 fn resolve_match_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm, out: *StrView) -> i32
     if resolve_scrutinee_enum(s, scr, out) == 1
         return 1
-    *out = named_by(ctor_scrutinee_enum, s, scr)   # AGAST #2419
+    *out = ctor_scrutinee_enum(s, scr)   # AGAST #2419
     if not unnamed(*out)
         return 1
     *out = generic_ctor_scrutinee_enum(s, scr)   # AGAST #2437
     if not unnamed(*out)
         return 1
-    let name: StrView = named_by(match_scrutinee_type, s, scr)
+    let name: StrView = match_scrutinee_type(s, scr)
     if not unnamed(name) and (is_tagged_enum_type(name) == 1 or is_enum_type(s.mono.pctx, name) == 1)
         *out = name
         return 1
@@ -1967,7 +1967,7 @@ fn match_check_reachable(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i3
 fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enum_name: StrView, from_arms: i32, line: i32, col: i32)
     var name: StrView = enum_name
     if unnamed(name)
-        name = named_by(match_scrutinee_type, s, scrutinee)
+        name = match_scrutinee_type(s, scrutinee)
     var ei: i32 = 0 - 1
     if not unnamed(name)
         ei = match_enum_index(s.mono.pctx, name)

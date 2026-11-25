@@ -184,11 +184,12 @@ def test_the_emitter_names_tuples_without_writing_the_node():
     assert writes == [], (
         "emitter_expr.ritz / emitter_decl.ritz still write a field of an existing Expr node "
         f"({len(writes)} sites): tuple naming must return the name, not store it")
-    for fn in ("tuple_lit_infer", "tuple_lit_name"):
+    # Both return it (AGAST #4765).
+    for fn, gives in (("tuple_lit_infer", "-> Option<StrView>"), ("tuple_lit_name", "-> Option<StrView>")):
         m = re.search(rf"^(?:pub )?fn {fn}\(.*$", expr, re.MULTILINE)
         assert m is not None, f"{fn} is gone or renamed"
-        assert "out_name: **u8" in m.group(0), \
-            f"{fn} must return the name through out-params (#1816)"
+        assert gives in m.group(0), \
+            f"{fn} must return the name, not store it on the node (#1816)"
 
 
 @pytest.mark.unit

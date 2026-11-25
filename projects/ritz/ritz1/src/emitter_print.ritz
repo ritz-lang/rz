@@ -175,25 +175,17 @@ fn fmt_index_struct(s: *EmitterState, e: *Expr) -> StrView
 fn element_type_name(s: *EmitterState, e: *Expr) -> StrView
     if index_through(s, e) != null
         # A Vec / Span / pointer-to-array buffer: a struct or pointer held there.
-        var held: *u8 = null
-        var held_len: i32 = 0
-        if index_through_value_struct(s, e, @held, @held_len) == 0
-            return no_name()
-        return StrView { ptr: held, len: held_len as i64 }
+        return index_through_value_struct(s, e)
     # `[N]*S` elements (a local, field, global or const) and `**S` fields name
     # S too, for `.field` through them.
-    var elem: TypeKind = TypeKind.Void
-    var pslot: i32 = 0
-    var rec: *u8 = null
-    var rec_len: i32 = 0
-    array_elem_record(s, e, @elem, @pslot, @rec, @rec_len)
+    let elem: TypeKind = array_elem_record(s, e).elem
     if elem != TypeKind.Void and elem != TypeKind.Struct
         return no_name()
     if e.left.kind == ExprKind.Member
         let f: *StructField = resolve_member_chain_field(s, e.left)
         if f == null or f.field_type == TypeKind.PtrPtr
             return no_name()
-    named_by(index_elem_struct_name, s, e)
+    index_elem_struct_name(s, e)
 
 # AGAST #4576: the view type (StrView, Span$u8) an element `e` POINTS AT, when
 # it is one of a `[N]*V` (a local, field, global or const), a `**V` field or a
@@ -202,11 +194,10 @@ fn element_type_name(s: *EmitterState, e: *Expr) -> StrView
 fn fmt_index_view_ptr(s: *EmitterState, e: *Expr) -> StrView
     if not is_element(e)
         return no_name()
-    var pointee: *u8 = null
-    var pointee_len: i32 = 0
     var n: StrView = no_name()
-    if array_elem_pointee(s, e, @pointee, @pointee_len) == TypeKind.Struct
-        n = StrView { ptr: pointee, len: pointee_len as i64 }
+    let pointee: NamedKind = array_elem_pointee(s, e)
+    if pointee.kind == TypeKind.Struct
+        n = pointee.name
     else
         n = ptrptr_type_name(s, e.left)
     if not named(n) or not interp_is_view_name(n)
@@ -232,10 +223,10 @@ fn ptrptr_type_name(s: *EmitterState, b: *Expr) -> StrView
 # arm only sees `s.module.impls`, and String's impl lives in an imported
 # module), else an element `a[i]` / `p[i]` / `args[i]` (AGAST #4576).
 fn value_struct_name(s: *EmitterState, e: *Expr) -> StrView
-    let resolved: StrView = named_by(resolve_expr_struct_name, s, e)
+    let resolved: StrView = resolve_expr_struct_name(s, e)
     if named(resolved)
         return resolved
-    let returned: StrView = named_by(call_result_struct_name, s, e)
+    let returned: StrView = call_result_struct_name(s, e)
     if named(returned)
         return returned
     fmt_index_struct(s, e)
@@ -425,13 +416,9 @@ fn fmt_type_of(s: *EmitterState, e: *Expr) -> FmtType
     # AGAST #4576: an element of a `[N]*T` (a local, field, global or const)
     # is a pointer, whose i64 slot printed its address as a number.
     if e.kind == ExprKind.Index and ty_int_bits(t) > 0
-        var elem: TypeKind = TypeKind.Void
-        var pslot: i32 = 0
-        var rec: *u8 = null
-        var rec_len: i32 = 0
-        array_elem_record(s, e, @elem, @pslot, @rec, @rec_len)
-        if elem == TypeKind.Ptr
-            return ptr_fmt_type(TypeKind.Ptr, ptr_slot_flat(pslot))
+        let rec: ElemRecord = array_elem_record(s, e)
+        if rec.elem == TypeKind.Ptr
+            return ptr_fmt_type(TypeKind.Ptr, ptr_slot_flat(rec.pointee))
     var ft: FmtType = fmt_type(t)
     match t
         TypeKind.Ref | TypeKind.MutRef =>
@@ -1803,7 +1790,7 @@ fn fmt_sink_is_value(s: *EmitterState, e: *Expr) -> bool
         let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: e.ident_ptr, len: e.ident_len as i64 })
         if loc != null and lv_var_type(loc) == TypeKind.Struct
             return true
-    not unnamed(named_by(resolve_expr_struct_name, s, e))
+    not unnamed(resolve_expr_struct_name(s, e))
 
 # The `ret` type push_bytes is called with: a struct by its name, a bool or
 # a narrow integer by its width, anything else as i64.

@@ -220,12 +220,9 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
     # AGAST #2376: `b[i]` with `b: [N]**S`, or `@a[i]` with `a: [N]*S`: a `**S`,
     # so `(**b[i]).f` reaches S.
     if elem_rooted(x) == 1
-        var pl_inner: TypeKind = TypeKind.Void
-        var pl_name: *u8 = null
-        var pl_len: i32 = 0
-        let pl: i32 = ptr_levels_of(s, x, @pl_inner, @pl_name, @pl_len)
-        if pl >= 2 and pl_inner == TypeKind.Struct and pl_len > 0
-            let pl_st: *StructDef = find_struct(s, StrView { ptr: (pl_name), len: (pl_len) as i64 })
+        let pl: PtrLevels = ptr_levels_of(s, x)
+        if pl.levels >= 2 and pl.inner == TypeKind.Struct and pl.name.len > 0
+            let pl_st: *StructDef = find_struct(s, pl.name)
             if pl_st == null
                 return 0
             var pl_ptr: i32 = emit_expr(s, x)
@@ -234,7 +231,7 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
                 pl_ptr = next_reg(s)
                 format_into(s, "  %.{pl_ptr} = inttoptr i64 %.{pl_val} to ptr\n")
             *out_st = pl_st
-            *out_levels = pl
+            *out_levels = pl.levels
             return pl_ptr
     # AGAST #2805: `y + k` / `y - k` where y is a `**S` (`qq + 1`, or a call
     # returning one, `vec_as_ptr<*S>(@w) + 1`), or such a call bare: emit_expr
@@ -257,7 +254,7 @@ pub fn emit_deref_operand_ptr(s: *EmitterState, x: *Expr, out_st: **StructDef, o
     # AGAST #2332: and `a[i]` / `a[i] + k` with `a: [N]*S`.
     # AGAST #2526: and a call `f()` (`-> *S`) or a cast `x as *S`.
     if x.kind == ExprKind.Index or x.kind == ExprKind.Call or x.kind == ExprKind.Cast or (x.kind == ExprKind.Binary and (x.op == OpKind.Add or x.op == OpKind.Sub))
-        let b_name: StrView = named_by(deref_pointee_struct_name, s, x)
+        let b_name: StrView = deref_pointee_struct_name(s, x)
         if b_name.len <= 0
             return 0
         let b_st: *StructDef = find_struct(s, b_name)
@@ -301,13 +298,11 @@ fn ptr_ptr_struct_operand(s: *EmitterState, x: *Expr, out_st: **StructDef) -> i3
             name = name.skip(4)
             levels = levels + 1
     else
-        var inner: TypeKind = TypeKind.Void
-        var pl_name: *u8 = null
-        var pl_len: i32 = 0
-        levels = ptr_levels_of(s, x, @inner, @pl_name, @pl_len)
-        if inner != TypeKind.Struct
+        let pl: PtrLevels = ptr_levels_of(s, x)
+        if pl.inner != TypeKind.Struct
             return 0
-        name = StrView { ptr: (pl_name), len: (pl_len) as i64 }
+        levels = pl.levels
+        name = pl.name
     if levels < 2 or unnamed(name) or name.len <= 0
         return 0
     let st: *StructDef = find_struct(s, name)
@@ -405,13 +400,10 @@ fn emit_struct_const_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrRe
 fn unwrap_pointer_payload_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     if e.left == null
         return
-    var uw_kind: TypeKind = TypeKind.Void
-    var uw_name: *u8 = null
-    var uw_len: i32 = 0
-    var uw_pointee: TypeKind = TypeKind.Void
-    if unwrap_payload_pointer_type(s, e.left, @uw_kind, @uw_name, @uw_len, @uw_pointee) == 0 or uw_len == 0
+    let uw: PayloadPtr = unwrap_payload_pointer_type(s, e.left)
+    if uw.kind == TypeKind.Void or uw.name.len == 0
         return
-    let uw_st: *StructDef = find_struct(s, StrView { ptr: (uw_name), len: (uw_len) as i64 })
+    let uw_st: *StructDef = find_struct(s, uw.name)
     if uw_st == null
         return
     let uw_idx: i32 = find_field_index(uw_st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
@@ -423,9 +415,9 @@ fn unwrap_pointer_payload_member_ptr(s: *EmitterState, e: *Expr, result: *Member
     # The payload register already holds the pointer the let-declaration
     # path stores in its slot, so one level fewer than local_struct_levels.
     var uw_levels: i32 = 1
-    if uw_kind == TypeKind.PtrPtr
+    if uw.kind == TypeKind.PtrPtr
         uw_levels = 2
-    else if (uw_kind == TypeKind.Ref or uw_kind == TypeKind.MutRef) and uw_pointee == TypeKind.Ptr
+    else if (uw.kind == TypeKind.Ref or uw.kind == TypeKind.MutRef) and uw.pointee == TypeKind.Ptr
         uw_levels = 2
     let uw_base: i32 = emit_load_levels(s, uw_ptr, uw_levels - 1)
     emit_member_gep_from_ptr(s, result, uw_base, uw_st, uw_idx, get_field_type(uw_st, uw_idx))
@@ -565,12 +557,10 @@ fn member_ptr_of_member(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
 # as emit_struct_lit_value does, and GEP the field out of that.  It fell
 # to "unhandled EXPR_MEMBER"; ritz0 compiled it.
 fn member_ptr_of_struct_lit(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
-    var sl_name: *u8 = null
-    var sl_len: i32 = 0
-    tuple_lit_name(s, e.left, no_name(), @sl_name, @sl_len)
-    if sl_name == null
+    let sl_name: StrView = tuple_lit_name(s, e.left, no_name()).unwrap_or(no_name())
+    if unnamed(sl_name)
         return
-    let sl_st: *StructDef = find_struct(s, StrView { ptr: (sl_name), len: (sl_len) as i64 })
+    let sl_st: *StructDef = find_struct(s, sl_name)
     if sl_st == null
         return
     let sl_idx: i32 = find_field_index(sl_st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
@@ -590,7 +580,7 @@ fn member_ptr_of_struct_lit(s: *EmitterState, e: *Expr, result: *MemberPtrResult
 # alloca of the callee's return struct, then GEP the field out of it.
 # Before this the base fell through to "unhandled EXPR_MEMBER".
 fn member_ptr_of_call(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
-    let cr_name: StrView = named_by(call_result_struct_name, s, e.left)
+    let cr_name: StrView = call_result_struct_name(s, e.left)
     if cr_name.len > 0
         let cr_st: *StructDef = find_struct(s, cr_name)
         if cr_st != null
@@ -828,7 +818,7 @@ fn member_ptr_of_index(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
         # stays with the by-value arm above).  The call is emitted once, as
         # the pointer emit_ptr_elem_member_ptr strides.
         ExprKind.Call | ExprKind.Method =>
-            let pc_name: StrView = named_by(call_result_pointee_struct, s, arr)
+            let pc_name: StrView = call_result_pointee_struct(s, arr)
             if pc_name.len > 0
                 emit_ptr_elem_member_ptr(s, e, result, pc_name)
         _ => pass
@@ -918,7 +908,7 @@ fn member_ptr_index_of_member(s: *EmitterState, e: *Expr, result: *MemberPtrResu
 fn member_ptr_index_of_ident(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     let arr_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.left.ident_ptr), len: (e.left.left.ident_len) as i64 })
     if arr_loc != null
-        let pp_name: StrView = local_ptr_ptr_struct(s, e.left.left)
+        let pp_name: StrView = ptr_ptr_local_struct(s, e.left.left)
         if lv_var_type(arr_loc) == TypeKind.Array and lv_array_elem_type(arr_loc) == TypeKind.Struct and lv_type_name_len(arr_loc) > 0
             let elem_st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(arr_loc)), len: (lv_type_name_len(arr_loc)) as i64 })
             if elem_st != null
@@ -999,15 +989,17 @@ fn member_ptr_index_of_ident(s: *EmitterState, e: *Expr, result: *MemberPtrResul
 # AGAST #2332: address of `a[i].field` and `a[i][j].field` for `a: [N]*S`.
 # Returns 1 when it took `e`.
 fn emit_array_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult) -> i32
-    var name: *u8 = null
-    var name_len: i32 = 0
-    if array_elem_pointee(s, e.left.left, @name, @name_len) == TypeKind.Struct
-        return emit_ptr_elem_member_ptr(s, e, result, StrView { ptr: (name), len: (name_len) as i64 })
+    let outer: NamedKind = array_elem_pointee(s, e.left.left)
+    if outer.kind == TypeKind.Struct
+        return emit_ptr_elem_member_ptr(s, e, result, outer.name)
     # AGAST #2369: and `a[i].f` with `a: [N]@S` or `[N]@&S`, whose element
     # refers to an S as a `*S` one points at it.
-    if array_elem_pointee(s, e.left, @name, @name_len) != TypeKind.Struct and array_elem_referent(s, e.left, @name, @name_len) != TypeKind.Struct
-        return 0
-    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (name_len) as i64 })
+    var elem: NamedKind = array_elem_pointee(s, e.left)
+    if elem.kind != TypeKind.Struct
+        elem = array_elem_referent(s, e.left)
+        if elem.kind != TypeKind.Struct
+            return 0
+    let st: *StructDef = find_struct(s, elem.name)
     if st == null
         return 0
     let field_idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
@@ -1056,21 +1048,12 @@ pub fn emit_ptr_elem_addr(s: *EmitterState, ie: *Expr, st: *StructDef) -> i32
     format_into(s, ", ptr %.{base_ptr}, i64 %.{idx_reg}\n")
     elem_ptr
 
-# ptr_ptr_local_struct's St (a `**St` local) as a StrView; `no_name()` when `e`
-# is not one.
-fn local_ptr_ptr_struct(s: *EmitterState, e: *Expr) -> StrView
-    var len: i32 = 0
-    let name: *u8 = ptr_ptr_local_struct(s, e, @len)
-    if name == null
-        return no_name()
-    StrView { ptr: (name), len: (len) as i64 }
-
 # AGAST #3148: St when `*e` is a `*St`: ptr_ptr_local_struct's `**St`, or an
 # `@*St` / `@&*St` local or param, which records St as its inner pointee as a
 # `**St` does (#3108, #3131).  Only `(*r)[i].f` asks: `r[i]` on a reference
 # isn't the `**St` stride ptr_ptr_local_struct's other callers take.
 fn deref_ptr_local_struct(s: *EmitterState, e: *Expr) -> StrView
-    let pp: StrView = local_ptr_ptr_struct(s, e)
+    let pp: StrView = ptr_ptr_local_struct(s, e)
     if not unnamed(pp) or e == null or e.kind != ExprKind.Ident
         return pp
     let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
@@ -1308,12 +1291,11 @@ fn try_carrier_name(s: *EmitterState, inner: *Expr) -> StrView
     var inner_sv: StrView = StrView { ptr: null, len: 0 }
     if resolve_scrutinee_enum(s, inner, @inner_sv) != 0
         return inner_sv
-    var name: *u8 = null
-    var len: i32 = 0
     # AGAST #3238: a method's Result is its FnDef's, not the fn's: `r.rd()?`
     # in a `-> Result<P, E>` fn spilled a `%Result$u32$E` as `%Result$P$E`.
-    if try_method_carrier(s, inner, @name, @len) != 0
-        return StrView { ptr: name, len: len as i64 }
+    let carrier: StrView = try_method_carrier(s, inner)
+    if carrier.len > 0
+        return carrier
     try_fn_ret_sv(s)
 
 # Lower `expr?`:
@@ -1727,7 +1709,7 @@ fn emit_cast_expr(s: *EmitterState, e: *Expr) -> i32
         if ref_cast_reads_referent(s, e) == 1
             let ref_addr: i32 = i64_value_to_ptr(s, e.left, emit_expr(s, e.left))
             let ref_val: i32 = next_reg(s)
-            emit_struct_load_or_defer(s, TypeKind.Struct, ref_val, target_sv, ref_addr, null, 0)
+            emit_struct_load_or_defer(s, TypeKind.Struct, ref_val, target_sv, ref_addr, no_name())
             return ref_val
     # AGAST #1652: `s as *S` with `s: @&S` (a `ptr`) must yield the i64
     # address the rest of the value model expects; only `as @&T` keeps it.
@@ -2183,9 +2165,7 @@ pub fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: 
     # AGAST #3005: a tuple field (`Box<(u32, u32)> { v: (1, 2) }`, a nested
     # tuple) names a nameless tuple literal.
     if field.field_type == TypeKind.Struct
-        var lname: *u8 = null
-        var lname_len: i32 = 0
-        tuple_lit_name(s, value, field_ty_sv, @lname, @lname_len)
+        tuple_lit_name(s, value, field_ty_sv)
     # A nested literal (`E { name: V { .. } }`) has no value register:
     # emit_expr rejects a bare ExprKind.StructLit. Write it in place into the
     # field instead, recursively. (AGAST #1655)
@@ -2264,12 +2244,10 @@ pub fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: 
 # Emit a struct literal into an existing alloca and return the alloca register
 # Used for returning struct literals from functions
 pub fn emit_struct_lit_to_alloca(s: *EmitterState, e: *Expr, alloca_reg: i32) -> i32
-    var lname: *u8 = null
-    var lname_len: i32 = 0
-    tuple_lit_name(s, e, no_name(), @lname, @lname_len)   # AGAST #3005
+    let lname: StrView = tuple_lit_name(s, e, no_name()).unwrap_or(no_name())   # AGAST #3005
     var st: *StructDef = null
-    if lname != null
-        st = find_struct(s, StrView { ptr: (lname), len: (lname_len) as i64 })
+    if not unnamed(lname)
+        st = find_struct(s, lname)
     if st == null
         emit_ir_error_sv(s, e.span, "struct not found for literal")
         return alloca_reg
@@ -2327,12 +2305,10 @@ pub fn emit_struct_lit_zero_omitted(s: *EmitterState, st: *StructDef, e: *Expr, 
 # Unknown struct names are a located error (from emit_struct_lit_to_alloca's
 # lookup), never a silently wrong value. (AGAST #1362)
 fn emit_struct_lit_value(s: *EmitterState, e: *Expr) -> i32
-    var lname: *u8 = null
-    var lname_len: i32 = 0
-    tuple_lit_name(s, e, no_name(), @lname, @lname_len)   # AGAST #3005
+    let lname: StrView = tuple_lit_name(s, e, no_name()).unwrap_or(no_name())   # AGAST #3005
     var st: *StructDef = null
-    if lname != null
-        st = find_struct(s, StrView { ptr: (lname), len: (lname_len) as i64 })
+    if not unnamed(lname)
+        st = find_struct(s, lname)
     if st == null
         emit_ir_error_sv(s, e.span, "struct not found for literal")
         let zero: i32 = next_reg(s)
@@ -2416,30 +2392,27 @@ pub fn emit_through_elem_ptr(s: *EmitterState, e: *Expr, out_name: *StrView) -> 
     let loc: *LocalVar = index_through(s, e)
     if loc == null
         return 0
-    var name: *u8 = null
-    var name_len: i32 = 0
-    let held: TypeKind = through_elem_struct(s, loc, @name, @name_len)
-    if name == null
+    let held: NamedKind = through_elem_struct(s, loc)
+    if unnamed(held.name)
         return 0
     var t: ThroughIndex
     index_through_fill(s, e, through_spill(s, loc), @t)
     var val: i32 = 0
-    if held == TypeKind.PtrPtr
+    if held.kind == TypeKind.PtrPtr
         val = emit_expr(s, @t.deref)
     else
         val = emit_expr(s, @t.sum)
     let elem_ptr: i32 = next_reg(s)
     format_into(s, "  %.{elem_ptr} = inttoptr i64 %.{val} to ptr\n")
-    *out_name = StrView { ptr: (name), len: (name_len) as i64 }
+    *out_name = held.name
     elem_ptr
 
 # `p[i].f`'s address, for `e` = the ExprKind.Member.  Returns 1 when it took `e`.
 pub fn emit_through_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult) -> i32
-    var name: *u8 = null
-    var name_len: i32 = 0
-    if index_through_struct(s, e.left, @name, @name_len) == 0 or name == null
+    let name: StrView = index_through_struct(s, e.left).unwrap_or(no_name())
+    if unnamed(name)
         return 0
-    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (name_len) as i64 })
+    let st: *StructDef = find_struct(s, name)
     let field_idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     if field_idx < 0
         return 0
