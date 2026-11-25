@@ -4170,6 +4170,65 @@ struct ForIterSrc
     row_size: i32
     plane: *ArrayShape
 
+# `for x in a` / `in @a` with `a` named: a local, const or global array (or a
+# Vec / Span local) into `src`.  Returns the iterable's N-D shape, or `nd_in`.
+fn for_iter_ident(s: *EmitterState, src: *ForIterSrc, iter: *Expr, arr_ident: *Expr, via_addr: i32, nd_in: *ArrayShape) -> *ArrayShape
+    var nd_shape: *ArrayShape = nd_in
+    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
+    if loc != null
+        if lv_var_type(loc) == TypeKind.Array and lv_array_shape(loc) != null
+            # AGAST #1509: a multi-dimensional array yields rows.  It
+            # used to GEP the alloca as `[N x i64]` and load garbage.
+            nd_shape = lv_array_shape(loc)
+            src.iter_kind = 1
+            src.data_reg = loc.reg
+        else if lv_var_type(loc) == TypeKind.Array
+            src.iter_kind = 1
+            src.elem_type = lv_array_elem_type(loc)
+            src.arr_size = lv_array_size(loc)
+            src.data_reg = loc.reg
+            src.elem_name = lv_type_name(loc)
+            src.elem_name_len = lv_type_name_len(loc)
+            src.bind_pointee = elem_recorded_pointee(s, src.elem_type, lv_array_elem_pointee(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, @src.bind_name, @src.bind_name_len)
+        else if via_addr == 0 and array_ptr_named(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 }) != null
+            # AGAST #2410: `a: *[N]T` / `@[N]T` / `@&[N]T` walks the array
+            # it points at.
+            src.data_reg = for_array_ptr(s, loc, @src.elem_type, @src.arr_size, @src.elem_name, @src.elem_name_len, @src.bind_pointee, @src.bind_name, @src.bind_name_len)
+            src.iter_kind = 1
+    else
+        # Iter is not a local — try a module const array
+        # (`const VALUES: [3]i32 = [2,3,5]`).  emit_const_array_entry
+        # emits `@VALUES = internal constant [3 x i32] [...]`; we GEP
+        # off the global symbol below.
+        let centry: *ConstEntry = find_const_entry(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
+        if centry != null and centry.const_type == TypeKind.Array and (via_addr == 0 or iter.op == OpKind.Addr)
+            src.iter_kind = 3
+            src.elem_type = centry.array_elem_type
+            src.arr_size = centry.array_size
+            src.const_name = centry.name as *u8
+            src.const_name_len = centry.name_len
+            src.elem_name = centry.array_elem_type_name
+            src.elem_name_len = centry.array_elem_type_name_len
+            # AGAST #1866: `for p in T` over a `[N]*u8` table binds a `*u8`.
+            src.bind_pointee = elem_recorded_pointee(s, src.elem_type, centry.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
+        else
+            let glob: *GlobalVarDef = find_global(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
+            if glob != null and glob.var_type == TypeKind.Array and glob.array_shape != null
+                nd_shape = glob.array_shape
+                src.iter_kind = 3
+                src.const_name = glob.name
+                src.const_name_len = glob.name_len
+            else if glob != null and glob.var_type == TypeKind.Array
+                src.iter_kind = 3
+                src.elem_type = glob.array_elem_type
+                src.arr_size = glob.array_size
+                src.const_name = glob.name
+                src.const_name_len = glob.name_len
+                src.elem_name = glob.array_elem_type_name
+                src.elem_name_len = glob.array_elem_type_name_len
+                src.bind_pointee = elem_recorded_pointee(s, src.elem_type, glob.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
+    nd_shape
+
 # Resolve `stmt`'s iterable into `src`: 0 (an error reported) when it is not
 # one ritz1 lowers.
 fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
@@ -4217,59 +4276,7 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
     if iter != null
         match arr_ident.kind
             ExprKind.Ident =>
-                let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
-                if loc != null
-                    if lv_var_type(loc) == TypeKind.Array and lv_array_shape(loc) != null
-                        # AGAST #1509: a multi-dimensional array yields rows.  It
-                        # used to GEP the alloca as `[N x i64]` and load garbage.
-                        nd_shape = lv_array_shape(loc)
-                        src.iter_kind = 1
-                        src.data_reg = loc.reg
-                    else if lv_var_type(loc) == TypeKind.Array
-                        src.iter_kind = 1
-                        src.elem_type = lv_array_elem_type(loc)
-                        src.arr_size = lv_array_size(loc)
-                        src.data_reg = loc.reg
-                        src.elem_name = lv_type_name(loc)
-                        src.elem_name_len = lv_type_name_len(loc)
-                        src.bind_pointee = elem_recorded_pointee(s, src.elem_type, lv_array_elem_pointee(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, @src.bind_name, @src.bind_name_len)
-                    else if via_addr == 0 and array_ptr_named(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 }) != null
-                        # AGAST #2410: `a: *[N]T` / `@[N]T` / `@&[N]T` walks the array
-                        # it points at.
-                        src.data_reg = for_array_ptr(s, loc, @src.elem_type, @src.arr_size, @src.elem_name, @src.elem_name_len, @src.bind_pointee, @src.bind_name, @src.bind_name_len)
-                        src.iter_kind = 1
-                else
-                    # Iter is not a local — try a module const array
-                    # (`const VALUES: [3]i32 = [2,3,5]`).  emit_const_array_entry
-                    # emits `@VALUES = internal constant [3 x i32] [...]`; we GEP
-                    # off the global symbol below.
-                    let centry: *ConstEntry = find_const_entry(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
-                    if centry != null and centry.const_type == TypeKind.Array and (via_addr == 0 or iter.op == OpKind.Addr)
-                        src.iter_kind = 3
-                        src.elem_type = centry.array_elem_type
-                        src.arr_size = centry.array_size
-                        src.const_name = centry.name as *u8
-                        src.const_name_len = centry.name_len
-                        src.elem_name = centry.array_elem_type_name
-                        src.elem_name_len = centry.array_elem_type_name_len
-                        # AGAST #1866: `for p in T` over a `[N]*u8` table binds a `*u8`.
-                        src.bind_pointee = elem_recorded_pointee(s, src.elem_type, centry.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
-                    else
-                        let glob: *GlobalVarDef = find_global(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
-                        if glob != null and glob.var_type == TypeKind.Array and glob.array_shape != null
-                            nd_shape = glob.array_shape
-                            src.iter_kind = 3
-                            src.const_name = glob.name
-                            src.const_name_len = glob.name_len
-                        else if glob != null and glob.var_type == TypeKind.Array
-                            src.iter_kind = 3
-                            src.elem_type = glob.array_elem_type
-                            src.arr_size = glob.array_size
-                            src.const_name = glob.name
-                            src.const_name_len = glob.name_len
-                            src.elem_name = glob.array_elem_type_name
-                            src.elem_name_len = glob.array_elem_type_name_len
-                            src.bind_pointee = elem_recorded_pointee(s, src.elem_type, glob.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
+                nd_shape = for_iter_ident(s, src, iter, arr_ident, via_addr, nd_shape)
             ExprKind.Member =>
                 # `@mk().a` has no address: ritz0 says "Cannot get address of: Call".
                 # Refused before the member is reached, which would run the call.
@@ -4376,6 +4383,52 @@ fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
         emit_nd_error(s, iter.span.line, iter.span.col, c"this `for` iterable is not supported in ritz1 (it takes an array, an array field, a Vec, a Span or a StrView)")
         return 0
     1
+
+# GEP `elem_ptr` to element `idx` of what `src` walks: through a Vec / Span /
+# StrView header's data pointer, or into the array (in a reg or at a symbol).
+fn emit_for_elem_ptr(s: *EmitterState, src: *ForIterSrc, elem_ptr: i32, idx_val2: i32)
+    if src.iter_kind == 2
+        # `data` is field 0 and `len` field 1, as for_header_struct checked.
+        let data_ptr_ptr: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, data_ptr_ptr)
+        emit_str(s, IR_GEP_NAMED)
+        emit_name(s, StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 })
+        emit_str(s, IR_PTR_SEP)
+        emit_reg(s, src.data_reg)
+        emit_str(s, c", i32 0, i32 0\n")
+        let data_ptr: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, data_ptr)
+        emit_str(s, IR_LOAD_PTR)
+        emit_reg(s, data_ptr_ptr)
+        emit_str(s, c"\n  ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, c" = getelementptr ")
+        emit_for_elem_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 })
+        emit_str(s, IR_PTR_SEP)
+        emit_reg(s, data_ptr)
+        emit_str(s, IR_I64_SEP)
+        emit_reg(s, idx_val2)
+        emit_str(s, IR_NL)
+    else
+        emit_str(s, IR_INDENT)
+        emit_reg(s, elem_ptr)
+        emit_str(s, IR_GEP_ARRAY)
+        emit_int(s, src.arr_size as i64)
+        emit_str(s, IR_X)
+        emit_for_slot_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, src.row_size, src.plane)
+        emit_str(s, IR_RBRACK_PTR)
+        # A local array or a field is an SSA reg; a const or global
+        # array is its symbol.
+        if src.iter_kind == 3
+            emit_str(s, c"@")
+            emit_name(s, StrView { ptr: (src.const_name), len: (src.const_name_len) as i64 })
+        else
+            emit_reg(s, src.data_reg)
+        emit_str(s, IR_I64_ZERO)
+        emit_reg(s, idx_val2)
+        emit_str(s, IR_NL)
 
 # Lower `for x in iter { body }` (no `..`) — the iterable form.
 # Supports the shapes ritz1 can express today:
@@ -4504,48 +4557,8 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     emit_load_into(s, IR_TY_I64, idx_val2, idx_reg)
 
     let elem_ptr: i32 = next_reg(s)
-    if src.iter_kind == 2
-        # `data` is field 0 and `len` field 1, as for_header_struct checked.
-        let data_ptr_ptr: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, data_ptr_ptr)
-        emit_str(s, IR_GEP_NAMED)
-        emit_name(s, StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 })
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, src.data_reg)
-        emit_str(s, c", i32 0, i32 0\n")
-        let data_ptr: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, data_ptr)
-        emit_str(s, IR_LOAD_PTR)
-        emit_reg(s, data_ptr_ptr)
-        emit_str(s, c"\n  ")
-        emit_reg(s, elem_ptr)
-        emit_str(s, c" = getelementptr ")
-        emit_for_elem_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 })
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, data_ptr)
-        emit_str(s, IR_I64_SEP)
-        emit_reg(s, idx_val2)
-        emit_str(s, IR_NL)
-    else
-        emit_str(s, IR_INDENT)
-        emit_reg(s, elem_ptr)
-        emit_str(s, IR_GEP_ARRAY)
-        emit_int(s, src.arr_size as i64)
-        emit_str(s, IR_X)
-        emit_for_slot_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, src.row_size, src.plane)
-        emit_str(s, IR_RBRACK_PTR)
-        # A local array or a field is an SSA reg; a const or global
-        # array is its symbol.
-        if src.iter_kind == 3
-            emit_str(s, c"@")
-            emit_name(s, StrView { ptr: (src.const_name), len: (src.const_name_len) as i64 })
-        else
-            emit_reg(s, src.data_reg)
-        emit_str(s, IR_I64_ZERO)
-        emit_reg(s, idx_val2)
-        emit_str(s, IR_NL)
+    emit_for_elem_ptr(s, @src, elem_ptr, idx_val2)
+
     let elem_val: i32 = next_reg(s)
     emit_str(s, IR_INDENT)
     emit_reg(s, elem_val)

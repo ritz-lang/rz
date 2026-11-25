@@ -1811,6 +1811,7 @@ fn emit_expr_body(s: *EmitterState, e: *Expr) -> i32
     let ca_root: *Expr = call_array_index_root(s, e)
     if ca_root != null
         return emit_call_array_index(s, e, ca_root)
+    var kreg: i32 = 0
     match e.kind
         ExprKind.IntLit =>
             let result: i32 = next_reg(s)
@@ -1872,139 +1873,8 @@ fn emit_expr_body(s: *EmitterState, e: *Expr) -> i32
         ExprKind.Index =>
             return emit_expr_index(s, e)
         ExprKind.Cast =>
-            # `expr as <type>` — `e.op` holds the target type kind.
-            # Float ↔ int needs explicit instructions (sitofp / fptosi /
-            # fptrunc / fpext); same-class casts pass through as i64 wraps
-            # (the unified value model already keeps narrow ints in i64).
-            let target_ty: TypeKind = e.type_kind
-            own_raw_written(s, e)   # AGAST #4033: `@x as *U` writes x
-            if struct_cast_to_int_refused(s, e) == 1   # AGAST #3008
-                return 0
-            if int_as_enum_refused(s, e) == 1          # AGAST #3040
-                return 0
-            # AGAST #2288: `c as C` with `c:& C` is the referent, as in ritz0.
-            # It read as the pointer and ptrtoint'd it.
-            if target_ty == TypeKind.Struct and e.ident_len > 0 and lent_referent_local(s, e.left) != null
-                let referent: i32 = emit_lent_referent(s, e.left, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-                if referent != 0
-                    return referent
-            # AGAST #3004: `r as C` with `r: @C`, `@&C` or `*C` is a copy of the
-            # referent, as in ritz0.  It emitted `r`'s address as the `%C`.
-            if target_ty == TypeKind.Struct and ref_cast_reads_referent(s, e) == 1
-                let ref_addr: i32 = i64_value_to_ptr(s, e.left, emit_expr(s, e.left))
-                let ref_val: i32 = next_reg(s)
-                emit_struct_load_or_defer(s, TypeKind.Struct, ref_val, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, ref_addr, null, 0)
-                return ref_val
-            # AGAST #1652: `s as *S` with `s: @&S` (a `ptr`) must yield the i64
-            # address the rest of the value model expects; only `as @&T` keeps it.
-            # AGAST #1754: and `p as @&S` (`p: *S`, i64) must inttoptr into the
-            # `ptr` an `@&T` is lowered as.
-            let cast_raw: i32 = emit_expr(s, e.left)
-            var cast_src: i32 = cast_raw
-            if target_ty != TypeKind.MutRef
-                cast_src = ptr_value_to_i64(s, e.left, cast_raw)
-            else
-                cast_src = i64_value_to_ptr(s, e.left, cast_raw)
-            var src_name: *u8 = null
-            var src_name_len: i32 = 0
-            if e.left.kind == ExprKind.Ident
-                let lv2: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-                if lv2 != null
-                    src_name = lv_type_name(lv2)
-                    src_name_len = lv_type_name_len(lv2)
-            var src_ty: TypeKind = expr_slot_ty(e.left)
-            # An enum's discriminant (LANGUAGE_SPEC §10.4), at its representation
-            # type: the int → int path below wraps it to the target.
-            if enum_identity_cast(s, e) == 1
-                return cast_raw
-            var enum_src_ty: TypeKind = TypeKind.Void
-            let enum_disc: i32 = emit_enum_to_int(s, e, cast_raw, @enum_src_ty)
-            if enum_disc != 0 - 1
-                cast_src = enum_disc
-                src_ty = enum_src_ty
-                src_name = null
-                src_name_len = 0
-            let src_is_float: i32 = is_float_type(src_ty, StrView { ptr: (src_name), len: (src_name_len) as i64 })
-            let dst_is_float: i32 = is_float_type(target_ty, StrView { ptr: (null), len: (0) as i64 })
-            if src_is_float == 1 and dst_is_float == 0
-                # Float → int: saturating, by the target's signedness (§7.5,
-                # AGAST #2192).  A bare fptosi to i8/i16 also left an iN where the
-                # unified model wants an i64, and the IR didn't link.
-                var ft: TypeKind = TypeKind.F64
-                if src_ty == TypeKind.F32
-                    ft = TypeKind.F32
-                return emit_float_to_int_sat(s, ft, cast_src, target_ty)
-            if src_is_float == 0 and dst_is_float == 1
-                # Int → float.  Source is i64 in the unified model, where a narrow
-                # unsigned value is zero-extended and so non-negative; a u64 with
-                # its top bit set is not, and sitofp made it negative (#2192).
-                var src_uns: i32 = 0
-                if enum_disc == 0 - 1
-                    int_operand_shape(s, e.left, @src_uns)
-                let r: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, r)
-                if src_uns == 1
-                    emit_str(s, c" = uitofp i64 ")
-                else
-                    emit_str(s, c" = sitofp i64 ")
-                emit_reg(s, cast_src)
-                emit_str(s, IR_TO_SP)
-                emit_str(s, ty_value_llvm(target_ty))
-                emit_str(s, IR_NL)
-                return r
-            if src_is_float == 1 and dst_is_float == 1
-                # f32 ↔ f64
-                if src_ty == TypeKind.F64 and target_ty == TypeKind.F32
-                    let r: i32 = ir_fptrunc_f64_f32(s.out, @s.reg_counter, cast_src)
-                    return r
-                if src_ty == TypeKind.F32 and target_ty == TypeKind.F64
-                    let r: i32 = ir_fpext_f32_f64(s.out, @s.reg_counter, cast_src)
-                    return r
-                return cast_src
-            # int → int (AGAST #1602).  Values live in i64 registers, held
-            # sign/zero-extended per their own type, so the cast must wrap to
-            # an effective width and re-extend.  ritz0's rule: narrowing (or
-            # same width) truncates to the target and the result is read with
-            # the TARGET's signedness; widening extends from the SOURCE width,
-            # zext if either side is unsigned, sext only if both are signed.
-            # A non-int-primitive side (bool, pointer, enum, unknown) counts as
-            # signed 64-bit; a non-int target (bool, ptr, ...) passes through.
-            let dst_bits: i32 = ty_int_bits(target_ty)
-            if dst_bits == 0
-                return cast_src
-            var src_bits: i32 = ty_int_bits(src_ty)
-            var src_signed: i32 = ty_is_signed(src_ty)
-            if src_bits == 0
-                src_bits = 64
-                src_signed = 1
-            var w: i32 = dst_bits
-            var signed: i32 = ty_is_signed(target_ty)
-            if src_bits < dst_bits
-                w = src_bits
-                signed = src_signed * ty_is_signed(target_ty)
-            if w == 64
-                return cast_src
-            let narrow: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, narrow)
-            emit_str(s, IR_TRUNC)
-            emit_reg(s, cast_src)
-            emit_str(s, c" to i")
-            emit_int(s, w as i64)
-            emit_str(s, IR_NL)
-            let wide: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, wide)
-            if signed == 1
-                emit_str(s, c" = sext i")
-            else
-                emit_str(s, c" = zext i")
-            emit_int(s, w as i64)
-            emit_str(s, IR_SP)
-            emit_reg(s, narrow)
-            emit_str(s, IR_TO_I64)
-            return wide
+            if emit_cast_expr(s, e, @kreg) == 1
+                return kreg
 
         ExprKind.NilLit =>
             # nil literal - emit as null pointer (0)
@@ -2030,42 +1900,8 @@ fn emit_expr_body(s: *EmitterState, e: *Expr) -> i32
             return ptr_reg
 
         ExprKind.StringLit =>
-            # Bare "..." lowers to a %Span$u8 aggregate { ptr: *u8, len: i64 } —
-            # the StrView-shaped view (AGAST #98). Zero allocation: the payload
-            # is an @.str global and length is known at compile time. %Span$u8 is
-            # supplied by ensure_string_literal_struct when the source does not
-            # define it, so no import is required.
-            # StrView (ritzlib.strview) has identical layout, so call-site
-            # coercion rebuilds the aggregate under the StrView name.
-            let str_idx: i32 = add_string(s, StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 })
-            let gep_reg: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, gep_reg)
-            emit_str(s, IR_GEP_ARRAY)
-            emit_int(s, (e.string_len + 1) as i64)
-            emit_str(s, c" x i8], ptr @.str.")
-            emit_int(s, str_idx as i64)
-            emit_str(s, c", i64 0, i64 0\n")
-            # Build %Span$u8 via insertvalue: { ptr, len }
-            let sv1: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, sv1)
-            emit_sv(s, " = insertvalue %")
-            emit_name(s, strlit_struct(s))   # AGAST #4666
-            emit_sv(s, " undef, ptr ")
-            emit_reg(s, gep_reg)
-            emit_str(s, IR_COMMA_0)
-            let sv2: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, sv2)
-            emit_sv(s, " = insertvalue %")
-            emit_name(s, strlit_struct(s))
-            emit_str(s, IR_SP)
-            emit_reg(s, sv1)
-            emit_str(s, IR_I64_SEP)
-            emit_int(s, e.string_len as i64)
-            emit_str(s, IR_COMMA_1)
-            return sv2
+            if emit_string_lit_expr(s, e, @kreg) == 1
+                return kreg
 
         ExprKind.StructLit =>
             # Struct literal as an rvalue: TypeName { field: value, ... }
@@ -2158,6 +1994,196 @@ fn emit_expr_body(s: *EmitterState, e: *Expr) -> i32
     emit_reg(s, zero)
     emit_str(s, IR_ADD_ZERO)
     zero
+
+# `x as T`: 1 (result in *out) when lowered.
+fn emit_cast_expr(s: *EmitterState, e: *Expr, out: *i32) -> i32
+    # `expr as <type>` — `e.op` holds the target type kind.
+    # Float ↔ int needs explicit instructions (sitofp / fptosi /
+    # fptrunc / fpext); same-class casts pass through as i64 wraps
+    # (the unified value model already keeps narrow ints in i64).
+    let target_ty: TypeKind = e.type_kind
+    own_raw_written(s, e)   # AGAST #4033: `@x as *U` writes x
+    if struct_cast_to_int_refused(s, e) == 1   # AGAST #3008
+        *out = 0
+        return 1
+    if int_as_enum_refused(s, e) == 1          # AGAST #3040
+        *out = 0
+        return 1
+    # AGAST #2288: `c as C` with `c:& C` is the referent, as in ritz0.
+    # It read as the pointer and ptrtoint'd it.
+    if target_ty == TypeKind.Struct and e.ident_len > 0 and lent_referent_local(s, e.left) != null
+        let referent: i32 = emit_lent_referent(s, e.left, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        if referent != 0
+            *out = referent
+            return 1
+    # AGAST #3004: `r as C` with `r: @C`, `@&C` or `*C` is a copy of the
+    # referent, as in ritz0.  It emitted `r`'s address as the `%C`.
+    if target_ty == TypeKind.Struct and ref_cast_reads_referent(s, e) == 1
+        let ref_addr: i32 = i64_value_to_ptr(s, e.left, emit_expr(s, e.left))
+        let ref_val: i32 = next_reg(s)
+        emit_struct_load_or_defer(s, TypeKind.Struct, ref_val, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, ref_addr, null, 0)
+        *out = ref_val
+        return 1
+    # AGAST #1652: `s as *S` with `s: @&S` (a `ptr`) must yield the i64
+    # address the rest of the value model expects; only `as @&T` keeps it.
+    # AGAST #1754: and `p as @&S` (`p: *S`, i64) must inttoptr into the
+    # `ptr` an `@&T` is lowered as.
+    let cast_raw: i32 = emit_expr(s, e.left)
+    var cast_src: i32 = cast_raw
+    if target_ty != TypeKind.MutRef
+        cast_src = ptr_value_to_i64(s, e.left, cast_raw)
+    else
+        cast_src = i64_value_to_ptr(s, e.left, cast_raw)
+    var src_name: *u8 = null
+    var src_name_len: i32 = 0
+    if e.left.kind == ExprKind.Ident
+        let lv2: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+        if lv2 != null
+            src_name = lv_type_name(lv2)
+            src_name_len = lv_type_name_len(lv2)
+    var src_ty: TypeKind = expr_slot_ty(e.left)
+    # An enum's discriminant (LANGUAGE_SPEC §10.4), at its representation
+    # type: the int → int path below wraps it to the target.
+    if enum_identity_cast(s, e) == 1
+        *out = cast_raw
+        return 1
+    var enum_src_ty: TypeKind = TypeKind.Void
+    let enum_disc: i32 = emit_enum_to_int(s, e, cast_raw, @enum_src_ty)
+    if enum_disc != 0 - 1
+        cast_src = enum_disc
+        src_ty = enum_src_ty
+        src_name = null
+        src_name_len = 0
+    let src_is_float: i32 = is_float_type(src_ty, StrView { ptr: (src_name), len: (src_name_len) as i64 })
+    let dst_is_float: i32 = is_float_type(target_ty, StrView { ptr: (null), len: (0) as i64 })
+    if src_is_float == 1 and dst_is_float == 0
+        # Float → int: saturating, by the target's signedness (§7.5,
+        # AGAST #2192).  A bare fptosi to i8/i16 also left an iN where the
+        # unified model wants an i64, and the IR didn't link.
+        var ft: TypeKind = TypeKind.F64
+        if src_ty == TypeKind.F32
+            ft = TypeKind.F32
+        *out = emit_float_to_int_sat(s, ft, cast_src, target_ty)
+        return 1
+    if src_is_float == 0 and dst_is_float == 1
+        # Int → float.  Source is i64 in the unified model, where a narrow
+        # unsigned value is zero-extended and so non-negative; a u64 with
+        # its top bit set is not, and sitofp made it negative (#2192).
+        var src_uns: i32 = 0
+        if enum_disc == 0 - 1
+            int_operand_shape(s, e.left, @src_uns)
+        let r: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, r)
+        if src_uns == 1
+            emit_str(s, c" = uitofp i64 ")
+        else
+            emit_str(s, c" = sitofp i64 ")
+        emit_reg(s, cast_src)
+        emit_str(s, IR_TO_SP)
+        emit_str(s, ty_value_llvm(target_ty))
+        emit_str(s, IR_NL)
+        *out = r
+        return 1
+    if src_is_float == 1 and dst_is_float == 1
+        # f32 ↔ f64
+        if src_ty == TypeKind.F64 and target_ty == TypeKind.F32
+            let r: i32 = ir_fptrunc_f64_f32(s.out, @s.reg_counter, cast_src)
+            *out = r
+            return 1
+        if src_ty == TypeKind.F32 and target_ty == TypeKind.F64
+            let r: i32 = ir_fpext_f32_f64(s.out, @s.reg_counter, cast_src)
+            *out = r
+            return 1
+        *out = cast_src
+        return 1
+    # int → int (AGAST #1602).  Values live in i64 registers, held
+    # sign/zero-extended per their own type, so the cast must wrap to
+    # an effective width and re-extend.  ritz0's rule: narrowing (or
+    # same width) truncates to the target and the result is read with
+    # the TARGET's signedness; widening extends from the SOURCE width,
+    # zext if either side is unsigned, sext only if both are signed.
+    # A non-int-primitive side (bool, pointer, enum, unknown) counts as
+    # signed 64-bit; a non-int target (bool, ptr, ...) passes through.
+    let dst_bits: i32 = ty_int_bits(target_ty)
+    if dst_bits == 0
+        *out = cast_src
+        return 1
+    var src_bits: i32 = ty_int_bits(src_ty)
+    var src_signed: i32 = ty_is_signed(src_ty)
+    if src_bits == 0
+        src_bits = 64
+        src_signed = 1
+    var w: i32 = dst_bits
+    var signed: i32 = ty_is_signed(target_ty)
+    if src_bits < dst_bits
+        w = src_bits
+        signed = src_signed * ty_is_signed(target_ty)
+    if w == 64
+        *out = cast_src
+        return 1
+    let narrow: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, narrow)
+    emit_str(s, IR_TRUNC)
+    emit_reg(s, cast_src)
+    emit_str(s, c" to i")
+    emit_int(s, w as i64)
+    emit_str(s, IR_NL)
+    let wide: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, wide)
+    if signed == 1
+        emit_str(s, c" = sext i")
+    else
+        emit_str(s, c" = zext i")
+    emit_int(s, w as i64)
+    emit_str(s, IR_SP)
+    emit_reg(s, narrow)
+    emit_str(s, IR_TO_I64)
+    *out = wide
+    return 1
+
+# A `"..."` literal (a %Span$u8 / %StrView value): 1 (result in *out) when lowered.
+fn emit_string_lit_expr(s: *EmitterState, e: *Expr, out: *i32) -> i32
+    # Bare "..." lowers to a %Span$u8 aggregate { ptr: *u8, len: i64 } —
+    # the StrView-shaped view (AGAST #98). Zero allocation: the payload
+    # is an @.str global and length is known at compile time. %Span$u8 is
+    # supplied by ensure_string_literal_struct when the source does not
+    # define it, so no import is required.
+    # StrView (ritzlib.strview) has identical layout, so call-site
+    # coercion rebuilds the aggregate under the StrView name.
+    let str_idx: i32 = add_string(s, StrView { ptr: (e.string_ptr), len: (e.string_len) as i64 })
+    let gep_reg: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, gep_reg)
+    emit_str(s, IR_GEP_ARRAY)
+    emit_int(s, (e.string_len + 1) as i64)
+    emit_str(s, c" x i8], ptr @.str.")
+    emit_int(s, str_idx as i64)
+    emit_str(s, c", i64 0, i64 0\n")
+    # Build %Span$u8 via insertvalue: { ptr, len }
+    let sv1: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, sv1)
+    emit_sv(s, " = insertvalue %")
+    emit_name(s, strlit_struct(s))   # AGAST #4666
+    emit_sv(s, " undef, ptr ")
+    emit_reg(s, gep_reg)
+    emit_str(s, IR_COMMA_0)
+    let sv2: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, sv2)
+    emit_sv(s, " = insertvalue %")
+    emit_name(s, strlit_struct(s))
+    emit_str(s, IR_SP)
+    emit_reg(s, sv1)
+    emit_str(s, IR_I64_SEP)
+    emit_int(s, e.string_len as i64)
+    emit_str(s, IR_COMMA_1)
+    *out = sv2
+    return 1
+
 
 # AGAST #3014: an array literal or fill of scalars that reached emit_expr has no
 # `[N]T` slot, and emit_expr has no type to build one at.  ritz1 used to build

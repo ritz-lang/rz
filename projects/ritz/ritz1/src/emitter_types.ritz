@@ -2324,6 +2324,7 @@ pub fn synth_slot_ty(s: *EmitterState, e: *Expr) -> TypeKind
     # itself, so Sema annotates it (sema_walk -> sema_note_expr_ty) and the
     # emitter reads the annotation (expr_slot_ty) instead of keeping its own
     # copy of the rule.
+    var kty: TypeKind = TypeKind.Void
     match e.kind
         ExprKind.IntLit | ExprKind.FloatLit | ExprKind.CharLit | ExprKind.StringLit | ExprKind.CstringLit | ExprKind.NilLit =>
             return expr_slot_ty(e)
@@ -2356,222 +2357,11 @@ pub fn synth_slot_ty(s: *EmitterState, e: *Expr) -> TypeKind
                 return lft
             return TypeKind.I64
         ExprKind.Index =>
-            # AGAST #2332: `a[i][j]` with `a: [N]*T` is a T.
-            if is_array_elem_index(s, e) == 1
-                return array_elem_pointee_kind(s, e.left)
-            # AGAST #2440: what `*(p.data + i)` is.
-            let through: *LocalVar = index_through(s, e)
-            if through != null and lv_array_base(through) != null
-                return lv_pointee_type(through)   # the element of `h.r[i]`, `g[i]`, `h(p)[i]` (#2329)
-            if through != null
-                var th: ThroughIndex
-                index_through_fill(s, e, through, @th)
-                return synth_slot_ty(s, @th.deref)
-            # AGAST #2537: `(*r)[i]` with `r: **T` is a T, as `*(*r + i)` is.
-            let dix: TypeKind = deref_index_elem(s, e)
-            if dix != TypeKind.Void
-                return dix
-            # AGAST #4450: `p[i]` through a `*E` (a local, param, global, field
-            # or call), E a user enum, loads the `%E` (emit_expr_index lowers it
-            # `*(p + i)`), as Sema types it.  The `*T` arm below called it the
-            # byte path's u8.
-            var pe_name: *u8 = null
-            var pe_len: i32 = 0
-            ptr_index_user_enum(s, e, @pe_name, @pe_len)
-            if pe_len > 0
-                return TypeKind.Struct
-            # AGAST #2767: a full-rank `x[i][j]` over an N-D `[N][M]f32` / `f64`
-            # (local, global or field) loads a `float` / `double`, as the 1-D
-            # arms below say for `[N]f32`.  It fell to the i64 default, so a
-            # literal beside it stayed a double (`fcmp double` on a `float`) and
-            # `x[i][j] + 1.0` was stored as an i64.
-            var nd_depth: i32 = 0
-            let nd_sh: *ArrayShape = nd_index_shape(s, e, @nd_depth)
-            if nd_sh != null and nd_depth == nd_sh.rank and (e.right == null or e.right.kind != ExprKind.Range)
-                match nd_sh.leaf_type
-                    TypeKind.F32 | TypeKind.F64 =>
-                        return nd_sh.leaf_type
-                    # AGAST #4428: a full-rank index over an N-D array of pointers is
-                    # that pointer (Sema's array view types it so).
-                    TypeKind.Ptr | TypeKind.PtrPtr =>
-                        return nd_sh.leaf_type
-                    _ => pass
-            # Indexing: result type depends on base type.
-            # AGAST #1328: resolve the base through locals THEN globals — the old
-            # code only saw locals, and find_local_type's TypeKind.I64 miss value made
-            # a global pointer base look like an i64, so `g[i]` on `var g: *i32`
-            # skipped both pointer branches and fell to the i64 default.
-            match e.left.kind
-                ExprKind.Ident =>
-                    # AGAST #2321: as `a[i]` below.
-                    let ap: *LocalVar = array_ptr_index_base(s, e.left)
-                    if ap != null
-                        let ap_elem: TypeKind = lv_pointee_array_elem_type(ap)
-                        if ap_elem == TypeKind.F32 or ap_elem == TypeKind.F64
-                            return ap_elem
-                        return TypeKind.I64
-                    var base_type: TypeKind = find_local_type(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-                    var pointee: TypeKind = TypeKind.Unknown
-                    if base_type == TypeKind.Unknown
-                        let glob: *GlobalVarDef = find_global(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-                        if glob != null
-                            base_type = glob.var_type
-                            pointee = glob.pointee_type
-                    else
-                        pointee = find_local_pointee_type(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-                    match base_type
-                        TypeKind.PtrPtr =>
-                            return TypeKind.Ptr  # **u8 indexed gives *u8
-                        TypeKind.Ptr =>
-                            # Element type of *T indexing is the pointee when recorded.
-                            # AGAST #1973: `p[i]` through a *f32 / *f64 loads a `float` /
-                            # `double`.
-                            if ty_is_int(pointee) == 1 or ty_is_float(pointee) == 1
-                                return pointee
-                            return TypeKind.U8   # *u8 (or unrecorded pointee) indexed gives u8
-                        TypeKind.Array =>
-                            # AGAST #1966: `loc[i]` over a local `[N]f32` / `[N]f64` loads
-                            # a `float` / `double` (local_array_elem_llvm); say so, or a
-                            # binop / compare over it picks the other operand's width.
-                            # AGAST #1970: likewise a global `[N]f32` / `[N]f64`
-                            # (global_array_elem_llvm).  (No range case: an array can't be
-                            # sliced, #2521.)
-                            let arr_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-                            var arr_elem: TypeKind = TypeKind.Unknown
-                            if arr_loc != null
-                                arr_elem = lv_array_elem_type(arr_loc)
-                            else
-                                let arr_glob: *GlobalVarDef = find_global(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
-                                if arr_glob != null
-                                    arr_elem = arr_glob.array_elem_type
-                            if arr_elem == TypeKind.F32 or arr_elem == TypeKind.F64
-                                return arr_elem
-                        _ => pass
-                ExprKind.Member =>
-                    # AGAST #1954: `x.f[i]` over a `[N]f32` / `[N]f64` field (any
-                    # receiver depth, struct pointers included) loads a `float` /
-                    # `double` (field_array_elem_llvm) — the element's own type.
-                    let af: *StructField = member_field_def(s, e.left)
-                    if af != null and af.field_type == TypeKind.Array and (af.array_elem_type == TypeKind.F32 or af.array_elem_type == TypeKind.F64)
-                        return af.array_elem_type
-                    # AGAST #2053: `x.p[i]` through a `*f32` / `*f64` field loads a
-                    # `float` / `double` (ptr_field_elem_llvm) and is not widened.
-                    if af != null and af.field_type == TypeKind.Ptr
-                        let pk: TypeKind = ptr_field_elem_kind(af)
-                        if pk == TypeKind.F32 or pk == TypeKind.F64
-                            return pk
-                _ => pass
-            return TypeKind.I64  # Default
+            if synth_slot_ty_index(s, e, @kty) == 1
+                return kty
         ExprKind.Unary =>
-            # AGAST #4404: these four are node-local; Sema annotates them.
-            match e.op
-                OpKind.Addr | OpKind.AddrMut | OpKind.Not | OpKind.BitNot =>
-                    return expr_slot_ty(e)
-                OpKind.Deref =>
-                    # AGAST #2119: `*(@s as *i8)` / `*@g` load the stated pointee.
-                    let inl_pt: TypeKind = inline_deref_scalar_pointee(s, e.operand)
-                    if inl_pt != TypeKind.Void
-                        return inl_pt
-                    # AGAST #4249: `*(@a[0] + i)` / `*(@x - k)` load the base's
-                    # inline pointee too.  The ptr+offset arm below knows only an
-                    # ident / member / `*pp` base, so this loaded i64: 21_ls's
-                    # newline count over a `[N]u8` saw one line of six.
-                    if e.operand.kind == ExprKind.Binary and (e.operand.op == OpKind.Add or e.operand.op == OpKind.Sub)
-                        let off_pt: TypeKind = inline_deref_scalar_pointee(s, find_base_expr(e.operand))
-                        if off_pt != TypeKind.Void
-                            return off_pt
-                    # AGAST #2332: `*a[i]` / `*(a[i] + k)` with `a: [N]*T`.
-                    let el_pt: TypeKind = array_elem_pointee_kind(s, e.operand)
-                    if el_pt != TypeKind.Void
-                        return el_pt
-                    # AGAST #3186: `*X[i]` with `X` a `**T` loads a T, as
-                    # get_deref_store_type stores one.  It loaded i64.
-                    if e.operand.kind == ExprKind.Index and e.operand.right != null and e.operand.right.kind != ExprKind.Range
-                        let ix_pt: TypeKind = ptr_ptr_index_scalar(s, e.operand.left)
-                        if ix_pt != TypeKind.Void
-                            return ix_pt
-                    # AGAST #1924: `*(ppp + i)` with `ppp: ***T` is itself a `**T`.
-                    # The arm below calls every deref of a `**` a `*T`, so the next
-                    # deref out lost the pointee and `*(*(*(ppp + i) + j) + k)`
-                    # loaded i64.
-                    var dl_inner: TypeKind = TypeKind.Void
-                    var dl_name: *u8 = null
-                    var dl_len: i32 = 0
-                    let dl_levels: i32 = ptr_levels_of(s, e, @dl_inner, @dl_name, @dl_len)
-                    if dl_levels >= 2
-                        return TypeKind.PtrPtr
-                    # AGAST #2376: `*a[i]` with `a: [N]**T` (or `*@a[i]` with `a: [N]*T`)
-                    # is a `*T`, so `**a[i]` reads its T below.  The element itself isn't
-                    # typed as a `**`.
-                    if dl_levels == 1 and elem_rooted(e.operand) == 1
-                        return TypeKind.Ptr
-                    let inner_type: TypeKind = synth_slot_ty(s, e.operand)
-                    match inner_type
-                        TypeKind.PtrPtr =>
-                            return TypeKind.Ptr  # Deref **T gives *T
-                        TypeKind.Ptr =>
-                            # Deref *T gives T - look up what T is
-                            # If operand is an identifier, look up its pointee type
-                            match e.operand.kind
-                                ExprKind.Ident =>
-                                    let local_pt: TypeKind = find_local_pointee_type(s, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
-                                    if local_pt != TypeKind.I64
-                                        return local_pt
-                                    # Fall back to global pointee — without this, *(g_ptr)
-                                    # for a global *i32 reads as i64 (selfhost monomorph
-                                    # bug).
-                                    let glob: *GlobalVarDef = find_global(s, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
-                                    if glob != null
-                                        return glob.pointee_type
-                                    return local_pt
-                                # If operand is ptr+offset, find base expression and get its pointee type
-                                ExprKind.Binary =>
-                                    let base: *Expr = find_base_expr(e.operand)
-                                    match base.kind
-                                        ExprKind.Ident =>
-                                            let lpt: TypeKind = find_local_pointee_type(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-                                            if lpt != TypeKind.I64
-                                                return lpt
-                                            let glob: *GlobalVarDef = find_global(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-                                            if glob != null
-                                                return glob.pointee_type
-                                            return lpt
-                                        ExprKind.Member =>
-                                            # Member+offset dereference (e.g., *(span.ptr + i))
-                                            return get_member_pointee_type(s, base)
-                                        _ => pass
-                                    # AGAST #1815: `*(*(pp + i) + k)` for `pp: **T`.
-                                    let bdpt: TypeKind = deref_ptr_ptr_elem_type(s, base)
-                                    if bdpt != TypeKind.Void
-                                        return bdpt
-                                # AGAST #1815: `**pp` / `*(*(pp + i))` for `pp: **T`.
-                                ExprKind.Unary =>
-                                    let udpt: TypeKind = deref_ptr_ptr_elem_type(s, e.operand)
-                                    if udpt != TypeKind.Void
-                                        return udpt
-                                # Bare member deref: `*param.name` where param.name is *u8
-                                # (selfhost-only bug — emit_impl_method's `is_self` check
-                                # `*param.name == 115` was loading i64 instead of i8 because
-                                # this branch defaulted to TypeKind.I64).  Reuse the helper
-                                # already used for the member+offset path.
-                                ExprKind.Member =>
-                                    return get_member_pointee_type(s, e.operand)
-                                _ => pass
-                            return TypeKind.I64  # Default for unknown pointer dereference
-                        _ =>
-                            if (inner_type == TypeKind.MutRef or inner_type == TypeKind.Ref) and e.operand.kind == ExprKind.Ident
-                                # AGAST #1644: `*x` with `x: @&i32` loads the pointee's
-                                # width, as `*q` with `q: *i32` does.  Struct pointees are
-                                # resolved by name in the OpKind.Deref arm before this is asked.
-                                # AGAST #2308: so does `x: @i32`, which loaded 8 bytes.
-                                let mr_pt: TypeKind = find_local_pointee_type(s, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
-                                if mr_pt != TypeKind.Struct
-                                    return mr_pt
-                                return TypeKind.I64
-                            else
-                                return TypeKind.I64  # Deref *T gives value
-                _ => pass
-            return synth_slot_ty(s, e.operand)
+            if synth_slot_ty_unary(s, e, @kty) == 1
+                return kty
         ExprKind.Binary =>
             # AGAST #1965: float arithmetic is computed at binop_float_width
             # (`y * 2.0` is f32, `y * x` with `x: f64` is f64), not the left type.
@@ -2631,3 +2421,264 @@ pub fn synth_slot_ty(s: *EmitterState, e: *Expr) -> TypeKind
                 return umt
         _ => pass
     TypeKind.I64  # Default fallback
+
+# synth_slot_ty of `a[i]`: 1 (type in *out) when it names one.
+fn synth_slot_ty_index(s: *EmitterState, e: *Expr, out: *TypeKind) -> i32
+    # AGAST #2332: `a[i][j]` with `a: [N]*T` is a T.
+    if is_array_elem_index(s, e) == 1
+        *out = array_elem_pointee_kind(s, e.left)
+        return 1
+    # AGAST #2440: what `*(p.data + i)` is.
+    let through: *LocalVar = index_through(s, e)
+    if through != null and lv_array_base(through) != null
+        *out = lv_pointee_type(through)  # the element of `h.r[i]`, `g[i]`, `h(p)[i]` (#2329)
+        return 1
+    if through != null
+        var th: ThroughIndex
+        index_through_fill(s, e, through, @th)
+        *out = synth_slot_ty(s, @th.deref)
+        return 1
+    # AGAST #2537: `(*r)[i]` with `r: **T` is a T, as `*(*r + i)` is.
+    let dix: TypeKind = deref_index_elem(s, e)
+    if dix != TypeKind.Void
+        *out = dix
+        return 1
+    # AGAST #4450: `p[i]` through a `*E` (a local, param, global, field
+    # or call), E a user enum, loads the `%E` (emit_expr_index lowers it
+    # `*(p + i)`), as Sema types it.  The `*T` arm below called it the
+    # byte path's u8.
+    var pe_name: *u8 = null
+    var pe_len: i32 = 0
+    ptr_index_user_enum(s, e, @pe_name, @pe_len)
+    if pe_len > 0
+        *out = TypeKind.Struct
+        return 1
+    # AGAST #2767: a full-rank `x[i][j]` over an N-D `[N][M]f32` / `f64`
+    # (local, global or field) loads a `float` / `double`, as the 1-D
+    # arms below say for `[N]f32`.  It fell to the i64 default, so a
+    # literal beside it stayed a double (`fcmp double` on a `float`) and
+    # `x[i][j] + 1.0` was stored as an i64.
+    var nd_depth: i32 = 0
+    let nd_sh: *ArrayShape = nd_index_shape(s, e, @nd_depth)
+    if nd_sh != null and nd_depth == nd_sh.rank and (e.right == null or e.right.kind != ExprKind.Range)
+        match nd_sh.leaf_type
+            TypeKind.F32 | TypeKind.F64 =>
+                *out = nd_sh.leaf_type
+                return 1
+            # AGAST #4428: a full-rank index over an N-D array of pointers is
+            # that pointer (Sema's array view types it so).
+            TypeKind.Ptr | TypeKind.PtrPtr =>
+                *out = nd_sh.leaf_type
+                return 1
+            _ => pass
+    # Indexing: result type depends on base type.
+    # AGAST #1328: resolve the base through locals THEN globals — the old
+    # code only saw locals, and find_local_type's TypeKind.I64 miss value made
+    # a global pointer base look like an i64, so `g[i]` on `var g: *i32`
+    # skipped both pointer branches and fell to the i64 default.
+    match e.left.kind
+        ExprKind.Ident =>
+            # AGAST #2321: as `a[i]` below.
+            let ap: *LocalVar = array_ptr_index_base(s, e.left)
+            if ap != null
+                let ap_elem: TypeKind = lv_pointee_array_elem_type(ap)
+                if ap_elem == TypeKind.F32 or ap_elem == TypeKind.F64
+                    *out = ap_elem
+                    return 1
+                *out = TypeKind.I64
+                return 1
+            var base_type: TypeKind = find_local_type(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+            var pointee: TypeKind = TypeKind.Unknown
+            if base_type == TypeKind.Unknown
+                let glob: *GlobalVarDef = find_global(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+                if glob != null
+                    base_type = glob.var_type
+                    pointee = glob.pointee_type
+            else
+                pointee = find_local_pointee_type(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+            match base_type
+                TypeKind.PtrPtr =>
+                    *out = TypeKind.Ptr  # **u8 indexed gives *u8
+                    return 1
+                TypeKind.Ptr =>
+                    # Element type of *T indexing is the pointee when recorded.
+                    # AGAST #1973: `p[i]` through a *f32 / *f64 loads a `float` /
+                    # `double`.
+                    if ty_is_int(pointee) == 1 or ty_is_float(pointee) == 1
+                        *out = pointee
+                        return 1
+                    *out = TypeKind.U8  # *u8 (or unrecorded pointee) indexed gives u8
+                    return 1
+                TypeKind.Array =>
+                    # AGAST #1966: `loc[i]` over a local `[N]f32` / `[N]f64` loads
+                    # a `float` / `double` (local_array_elem_llvm); say so, or a
+                    # binop / compare over it picks the other operand's width.
+                    # AGAST #1970: likewise a global `[N]f32` / `[N]f64`
+                    # (global_array_elem_llvm).  (No range case: an array can't be
+                    # sliced, #2521.)
+                    let arr_loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+                    var arr_elem: TypeKind = TypeKind.Unknown
+                    if arr_loc != null
+                        arr_elem = lv_array_elem_type(arr_loc)
+                    else
+                        let arr_glob: *GlobalVarDef = find_global(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+                        if arr_glob != null
+                            arr_elem = arr_glob.array_elem_type
+                    if arr_elem == TypeKind.F32 or arr_elem == TypeKind.F64
+                        *out = arr_elem
+                        return 1
+                _ => pass
+        ExprKind.Member =>
+            # AGAST #1954: `x.f[i]` over a `[N]f32` / `[N]f64` field (any
+            # receiver depth, struct pointers included) loads a `float` /
+            # `double` (field_array_elem_llvm) — the element's own type.
+            let af: *StructField = member_field_def(s, e.left)
+            if af != null and af.field_type == TypeKind.Array and (af.array_elem_type == TypeKind.F32 or af.array_elem_type == TypeKind.F64)
+                *out = af.array_elem_type
+                return 1
+            # AGAST #2053: `x.p[i]` through a `*f32` / `*f64` field loads a
+            # `float` / `double` (ptr_field_elem_llvm) and is not widened.
+            if af != null and af.field_type == TypeKind.Ptr
+                let pk: TypeKind = ptr_field_elem_kind(af)
+                if pk == TypeKind.F32 or pk == TypeKind.F64
+                    *out = pk
+                    return 1
+        _ => pass
+    *out = TypeKind.I64  # Default
+    return 1
+
+# synth_slot_ty of `*p`, `-x`, `@x`: 1 (type in *out) when it names one.
+fn synth_slot_ty_unary(s: *EmitterState, e: *Expr, out: *TypeKind) -> i32
+    # AGAST #4404: these four are node-local; Sema annotates them.
+    match e.op
+        OpKind.Addr | OpKind.AddrMut | OpKind.Not | OpKind.BitNot =>
+            *out = expr_slot_ty(e)
+            return 1
+        OpKind.Deref =>
+            # AGAST #2119: `*(@s as *i8)` / `*@g` load the stated pointee.
+            let inl_pt: TypeKind = inline_deref_scalar_pointee(s, e.operand)
+            if inl_pt != TypeKind.Void
+                *out = inl_pt
+                return 1
+            # AGAST #4249: `*(@a[0] + i)` / `*(@x - k)` load the base's
+            # inline pointee too.  The ptr+offset arm below knows only an
+            # ident / member / `*pp` base, so this loaded i64: 21_ls's
+            # newline count over a `[N]u8` saw one line of six.
+            if e.operand.kind == ExprKind.Binary and (e.operand.op == OpKind.Add or e.operand.op == OpKind.Sub)
+                let off_pt: TypeKind = inline_deref_scalar_pointee(s, find_base_expr(e.operand))
+                if off_pt != TypeKind.Void
+                    *out = off_pt
+                    return 1
+            # AGAST #2332: `*a[i]` / `*(a[i] + k)` with `a: [N]*T`.
+            let el_pt: TypeKind = array_elem_pointee_kind(s, e.operand)
+            if el_pt != TypeKind.Void
+                *out = el_pt
+                return 1
+            # AGAST #3186: `*X[i]` with `X` a `**T` loads a T, as
+            # get_deref_store_type stores one.  It loaded i64.
+            if e.operand.kind == ExprKind.Index and e.operand.right != null and e.operand.right.kind != ExprKind.Range
+                let ix_pt: TypeKind = ptr_ptr_index_scalar(s, e.operand.left)
+                if ix_pt != TypeKind.Void
+                    *out = ix_pt
+                    return 1
+            # AGAST #1924: `*(ppp + i)` with `ppp: ***T` is itself a `**T`.
+            # The arm below calls every deref of a `**` a `*T`, so the next
+            # deref out lost the pointee and `*(*(*(ppp + i) + j) + k)`
+            # loaded i64.
+            var dl_inner: TypeKind = TypeKind.Void
+            var dl_name: *u8 = null
+            var dl_len: i32 = 0
+            let dl_levels: i32 = ptr_levels_of(s, e, @dl_inner, @dl_name, @dl_len)
+            if dl_levels >= 2
+                *out = TypeKind.PtrPtr
+                return 1
+            # AGAST #2376: `*a[i]` with `a: [N]**T` (or `*@a[i]` with `a: [N]*T`)
+            # is a `*T`, so `**a[i]` reads its T below.  The element itself isn't
+            # typed as a `**`.
+            if dl_levels == 1 and elem_rooted(e.operand) == 1
+                *out = TypeKind.Ptr
+                return 1
+            let inner_type: TypeKind = synth_slot_ty(s, e.operand)
+            match inner_type
+                TypeKind.PtrPtr =>
+                    *out = TypeKind.Ptr  # Deref **T gives *T
+                    return 1
+                TypeKind.Ptr =>
+                    # Deref *T gives T - look up what T is
+                    # If operand is an identifier, look up its pointee type
+                    match e.operand.kind
+                        ExprKind.Ident =>
+                            let local_pt: TypeKind = find_local_pointee_type(s, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
+                            if local_pt != TypeKind.I64
+                                *out = local_pt
+                                return 1
+                            # Fall back to global pointee — without this, *(g_ptr)
+                            # for a global *i32 reads as i64 (selfhost monomorph
+                            # bug).
+                            let glob: *GlobalVarDef = find_global(s, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
+                            if glob != null
+                                *out = glob.pointee_type
+                                return 1
+                            *out = local_pt
+                            return 1
+                        # If operand is ptr+offset, find base expression and get its pointee type
+                        ExprKind.Binary =>
+                            let base: *Expr = find_base_expr(e.operand)
+                            match base.kind
+                                ExprKind.Ident =>
+                                    let lpt: TypeKind = find_local_pointee_type(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                                    if lpt != TypeKind.I64
+                                        *out = lpt
+                                        return 1
+                                    let glob: *GlobalVarDef = find_global(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
+                                    if glob != null
+                                        *out = glob.pointee_type
+                                        return 1
+                                    *out = lpt
+                                    return 1
+                                ExprKind.Member =>
+                                    # Member+offset dereference (e.g., *(span.ptr + i))
+                                    *out = get_member_pointee_type(s, base)
+                                    return 1
+                                _ => pass
+                            # AGAST #1815: `*(*(pp + i) + k)` for `pp: **T`.
+                            let bdpt: TypeKind = deref_ptr_ptr_elem_type(s, base)
+                            if bdpt != TypeKind.Void
+                                *out = bdpt
+                                return 1
+                        # AGAST #1815: `**pp` / `*(*(pp + i))` for `pp: **T`.
+                        ExprKind.Unary =>
+                            let udpt: TypeKind = deref_ptr_ptr_elem_type(s, e.operand)
+                            if udpt != TypeKind.Void
+                                *out = udpt
+                                return 1
+                        # Bare member deref: `*param.name` where param.name is *u8
+                        # (selfhost-only bug — emit_impl_method's `is_self` check
+                        # `*param.name == 115` was loading i64 instead of i8 because
+                        # this branch defaulted to TypeKind.I64).  Reuse the helper
+                        # already used for the member+offset path.
+                        ExprKind.Member =>
+                            *out = get_member_pointee_type(s, e.operand)
+                            return 1
+                        _ => pass
+                    *out = TypeKind.I64  # Default for unknown pointer dereference
+                    return 1
+                _ =>
+                    if (inner_type == TypeKind.MutRef or inner_type == TypeKind.Ref) and e.operand.kind == ExprKind.Ident
+                        # AGAST #1644: `*x` with `x: @&i32` loads the pointee's
+                        # width, as `*q` with `q: *i32` does.  Struct pointees are
+                        # resolved by name in the OpKind.Deref arm before this is asked.
+                        # AGAST #2308: so does `x: @i32`, which loaded 8 bytes.
+                        let mr_pt: TypeKind = find_local_pointee_type(s, StrView { ptr: (e.operand.ident_ptr), len: (e.operand.ident_len) as i64 })
+                        if mr_pt != TypeKind.Struct
+                            *out = mr_pt
+                            return 1
+                        *out = TypeKind.I64
+                        return 1
+                    else
+                        *out = TypeKind.I64  # Deref *T gives value
+                        return 1
+        _ => pass
+    *out = synth_slot_ty(s, e.operand)
+    return 1
+
