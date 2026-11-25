@@ -22,13 +22,14 @@
 import klog { klog, klog_dec }
 import io { halt_loop, disable_interrupts, enable_interrupts }
 import serial { StrView }
-import mm.pmm { PAGE_SIZE }
-import mm.vmm { vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_free_pml4 }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
+import mm.vmm { PTE_USER, phys_to_virt, vmm_map_page, vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_free_pml4 }
 import mm.uptr { uptr_validate_string, uptr_check_read }
 import fs.kfs { kfs_ns_for, kfs_local, kfs_read, kfs_save, kfs_save_pending }
 import fs.vfs { O_CREAT }
 import goliath.namespace { Namespace }
 import ritzlib.strview { strview_from_ptr }
+import ritzlib.span { Span, span_from_ptr }
 import fs.syscall { sys_open, fs_process_end, fs_process_start, fs_process_select }
 import syscall.stack { syscall_stack_check, syscall_stack_used }
 import drivers.acpi.tables { acpi_poweroff }
@@ -167,6 +168,51 @@ fn spawn_push_argv(argc: i32, total_string_bytes: i64, child_argv: *u64) -> u64
     *child_argv = argv_addr
     return stack_ptr & 0xFFFFFFFFFFFFFFF0
 
+# The first half of every spawn, in the parent's address space: a child
+# slot of the running process `parent_pid`, its capability table (the
+# parent's ambient capabilities when `inherit_caps`), its own fd table, and
+# an isolated page table (kernel mappings, empty user space) in its Proc.
+# The parent's fd table is current again on return. The child's slot, or a
+# negative errno with nothing left behind.
+fn spawn_child_begin(parent_pid: u64, inherit_caps: bool) -> i64
+    let slot: i32 = proc_new_child()
+    if slot < 0
+        klog("[spawn_args] No child process slot\n")
+        return slot as i64
+    let child: *Proc = proc_at(slot)
+    let child_pid: u64 = child.pid
+
+    # The child's capability table. A sys_spawn child inherits the ambient
+    # capabilities of its parent (display, channel, namespace); POWER is
+    # init's alone (AGAST #1888, extended by #4472). A kernel spawn inherits
+    # nothing: the kernel grants what it holds (RING1_DRIVER.md section 2).
+    if cap_table_alloc(child_pid as u32) == 0 as *CapTable
+        proc_abort_child(slot)
+        return Errno.NoMem as i64
+    if inherit_caps
+        cap_inherit_ambient(parent_pid as u32, child_pid as u32)
+
+    # The child's own fd table (#2753); its exit releases it. Made here, in
+    # the parent's address space: kalloc may grow the heap, and vmm_map_page
+    # walks the page tables through the identity map, which a child's page
+    # table lacks. fs_process_start makes it current: the parent's again
+    # straight after.
+    let fs_result: i32 = fs_process_start(child_pid)
+    fs_process_select(parent_pid)
+    if fs_result != 0
+        klog("[spawn_args] No fd table for the child\n")
+        cap_table_free_pid(child_pid as u32)
+        proc_abort_child(slot)
+        return fs_result as i64
+
+    # An isolated address space: kernel mappings, empty user space.
+    let child_pml4: u64 = vmm_create_user_pml4()
+    if child_pml4 == 0
+        spawn_undo(slot, parent_pid)
+        return Errno.NoMem as i64
+    (*child).pml4 = child_pml4
+    slot as i64
+
 # Start `path` as a child of the running process, with argc/argv (argc 0:
 # none) in main's RDI/RSI. The child is runnable when this returns: its pid,
 # or a negative errno with nothing changed.
@@ -198,40 +244,12 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64) -> i64
     let parent_pid: u64 = parent.pid
     let parent_pml4: u64 = vmm_get_current_pml4()
     (*parent).pml4 = parent_pml4
-    let slot: i32 = proc_new_child()
-    if slot < 0
-        klog("[spawn_args] No child process slot\n")
-        return slot as i64
-    let child: *Proc = proc_at(slot)
-    let child_pid: u64 = child.pid
-
-    # The child's capability table: the ambient capabilities it inherits
-    # from its parent (display, channel, namespace). POWER is init's alone
-    # (AGAST #1888, extended by #4472).
-    if cap_table_alloc(child_pid as u32) == 0 as *CapTable
-        proc_abort_child(slot)
-        return Errno.NoMem as i64
-    cap_inherit_ambient(parent_pid as u32, child_pid as u32)
-
-    # The child's own fd table (#2753); its exit releases it. Made here, in
-    # the parent's address space: kalloc may grow the heap, and vmm_map_page
-    # walks the page tables through the identity map, which a child's page
-    # table lacks. fs_process_start makes it current: the parent's again
-    # straight after.
-    let fs_result: i32 = fs_process_start(child_pid)
-    fs_process_select(parent_pid)
-    if fs_result != 0
-        klog("[spawn_args] No fd table for the child\n")
-        cap_table_free_pid(child_pid as u32)
-        proc_abort_child(slot)
-        return fs_result as i64
-
-    # An isolated address space: kernel mappings, empty user space.
-    let child_pml4: u64 = vmm_create_user_pml4()
-    if child_pml4 == 0
-        spawn_undo(slot, parent_pid)
-        return Errno.NoMem as i64
-    (*child).pml4 = child_pml4
+    let begun: i64 = spawn_child_begin(parent_pid, true)
+    if begun < 0
+        return begun
+    let slot: i32 = begun as i32
+    let child_pid: u64 = proc_at(slot).pid
+    let child_pml4: u64 = proc_at(slot).pml4
 
     # Load in the child's address space, so elf_load maps its pages there.
     vmm_switch_pml4(child_pml4)
@@ -261,6 +279,58 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64) -> i64
     if argc > 0
         arg0 = argc as u64
     sched_prepare_user(slot, load_result.entry_point, user_rsp, arg0, child_argv)
+    proc_start(slot)
+    return child_pid as i64
+
+# Start a program the kernel chose as a child of the running process
+# (RING1_DRIVER.md section 2, AGAST #4713): `image`, position-independent
+# code of at most one page, copied into a user page at USER_IMAGE_BASE of
+# its own page table and entered there at CPL 3, through the ordinary
+# sched_prepare_user frame (CS 0x23, SS 0x1B), on a fresh user stack, with
+# the kernel's arg0/arg1 in RDI/RSI. It inherits no capabilities: what it
+# holds, the kernel grants. The child is runnable when this returns: its
+# pid, or a negative errno with nothing changed.
+pub fn process_spawn_image(image: Span<u8>, arg0: u64, arg1: u64) -> i64
+    if image.is_empty() or image.len() as u64 > PAGE_SIZE
+        return Errno.Inval as i64
+    let parent: *Proc = proc_current()
+    if parent == 0 as *Proc
+        return Errno.Srch as i64
+    let parent_pid: u64 = parent.pid
+    let parent_pml4: u64 = vmm_get_current_pml4()
+    (*parent).pml4 = parent_pml4
+
+    # The code page, filled through the physmap before it is mapped (as
+    # alloc_user_stack does, #4332): read-only and executable for the child.
+    let code_phys: u64 = pmm_alloc_page()
+    if code_phys == 0
+        return Errno.NoMem as i64
+    let code: Span<u8> = span_from_ptr<u8>(phys_to_virt(code_phys) as *u8, PAGE_SIZE as i64)
+    code.zero()
+    code.copy_from(image)
+
+    let begun: i64 = spawn_child_begin(parent_pid, false)
+    if begun < 0
+        pmm_free_page(code_phys)
+        return begun
+    let slot: i32 = begun as i32
+    let child_pid: u64 = proc_at(slot).pid
+
+    # Map in the child's address space; from here its exit, or spawn_undo,
+    # frees the page with the page table.
+    vmm_switch_pml4(proc_at(slot).pml4)
+    if vmm_map_page(USER_IMAGE_BASE, code_phys, PTE_USER) != 0
+        vmm_switch_pml4(parent_pml4)
+        pmm_free_page(code_phys)
+        spawn_undo(slot, parent_pid)
+        return Errno.NoMem as i64
+    let user_rsp: u64 = alloc_user_stack()
+    vmm_switch_pml4(parent_pml4)
+    if user_rsp == 0
+        spawn_undo(slot, parent_pid)
+        return Errno.NoMem as i64
+
+    sched_prepare_user(slot, USER_IMAGE_BASE, user_rsp, arg0, arg1)
     proc_start(slot)
     return child_pid as i64
 
@@ -376,6 +446,12 @@ fn sys_exit_impl(code: i32) -> i64
 # console for Ctrl-C (#4254). Never returns.
 pub fn process_kill_current(status: i32) -> i64
     return sys_exit_impl(status)
+
+# Reap the running process's child `pid`, sleeping until it exits: its exit
+# code, or Errno.Child. The kernel's own wait, for a child it spawned with
+# process_spawn_image (#4713); the same path as the wait syscall.
+pub fn process_wait(pid: i32) -> i64
+    return sys_wait_impl(pid)
 
 # sys_wait: reap the caller's child `pid`, sleeping until it exits: its exit
 # code, or Errno.Child if pid is no unreaped child of the caller.

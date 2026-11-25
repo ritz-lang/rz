@@ -73,3 +73,22 @@ proc_first_entry:
     swapgs
     iretq
 .size proc_first_entry, . - proc_first_entry
+
+# void kstack_call(void (*body)(void), u64 top): run body() on the stack
+# whose top is `top`, then return on the caller's stack. Pid 1 before
+# run_init runs on the boot stack, which is identity-mapped and absent from
+# every user PML4 (vmm_create_user_pml4 copies only the kernel half), so
+# code that switches pid 1 to a child must first move onto pid 1's own
+# kernel stack (AGAST #4713, RING1_DRIVER.md section 9 step 1). `top` is
+# 16-byte aligned (kstack_top); RBP keeps the caller's RSP across the call.
+.global kstack_call
+.type kstack_call, @function
+kstack_call:
+    pushq %rbp
+    movq %rsp, %rbp
+    movq %rsi, %rsp
+    callq *%rdi
+    movq %rbp, %rsp
+    popq %rbp
+    ret
+.size kstack_call, . - kstack_call

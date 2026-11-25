@@ -53,6 +53,7 @@ AREAS = {
         "elf_status_errno", "sys_spawn_impl", "sys_spawn_args_impl", "sys_exit_impl", "sys_wait_impl",
         "sys_exit_handler", "sys_open_handler", "sys_spawn_handler", "sys_spawn_args_handler",
         "sys_spawn_bg_handler", "spawn_process", "wait_for_child",
+        "spawn_child_begin", "process_spawn_image", "process_wait",
         "sys_wait_handler", "sys_getpid_handler", "sys_yield_handler", "sys_acpi_poweroff_handler",
     ],
     "file": [

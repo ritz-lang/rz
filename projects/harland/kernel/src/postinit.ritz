@@ -22,7 +22,7 @@ import drivers.msix { msix_print_all }
 import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
 import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
 import io { enable_interrupts, disable_interrupts, halt_loop }
-import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
+import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed, tsc_hz }
 import arch.x86_64.apcall { ap_run_nvme_probe }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test, virtio_blk_read, virtio_blk_msix_vector, virtio_blk_irq_count, virtio_blk_irq_wait_count, virtio_blk_irq_halt_count }
 import net.stack { net_stack_init, net_poll, net_wait_rx, net_configure_dhcp, net_is_configured, net_device_type }
@@ -38,10 +38,12 @@ import cap.selftest { cap_device_selftest }
 import cap.shm_selftest { shm_map_selftest }
 import arch.x86_64.percpu { CPU_KSTACK, cpu_index, cpu_stack_guard }
 import arch.x86_64.apic { x2apic_mode, lapic_id, lapic_icr_lo_mmio }
-import proc.table { Proc, proc_at, proc_current, proc_current_pid, proc_current_slot, proc_is_init, proc_live_count }
-import proc.sched { sched_is_running, sched_stop }
+import proc.table { Proc, PROC_CHILD_LIVE, proc_child_status, proc_at, proc_current, proc_current_pid, proc_current_slot, proc_is_init, proc_live_count }
+import proc.sched { sched_is_running, sched_start, sched_stop, sched_yield, sched_preemption_count }
 import fs.syscall { fs_process_pid }
-import syscall.runtime.process { process_create_init, process_destroy_init }
+import syscall.stack { kstack_top }
+import syscall.runtime.process { process_create_init, process_destroy_init, process_spawn_image, process_wait }
+import ritzlib.span { Span, span_from_ptr }
 
 # ============================================================================
 # Boot-test mode self-tests (AGAST #1887)
@@ -379,6 +381,105 @@ fn proc_create_init_self_test() -> bool
     klog("\n")
     return created and kept and not running and gone
 
+# A kernel-spawned CPL-3 process (#4713, RING1_DRIVER.md section 2-3, Tests
+# 1-3): pid 1 (made with process_create_init, scheduler stopped) spawns the
+# asm stub kernel/driver_stub.s with process_spawn_image and entry arguments
+# it chose. The stub packs what it measured at CPL 3 into its exit status:
+# (arg1 & 0x7FFF) << 16 | cpl << 8 | (pid & 0xFF).
+extern fn driver_stub_start()
+extern fn driver_stub_end()
+extern fn kstack_call(body: u64, top: u64)
+
+const DRIVER_STUB_ENTER: u64 = 0
+const DRIVER_STUB_FAULT: u64 = 1
+const DRIVER_STUB_SPIN: u64 = 2
+const DRIVER_STUB_COOKIE: u64 = 0x4713
+# SCHED_HZ is 100: a 50 ms spin spans five ticks.
+const DRIVER_SPIN_MS: u64 = 50
+# A #PF at CPL 3 kills the process with 128 + 14 (exceptions.ritz).
+const DRIVER_FAULT_STATUS: i64 = 142
+
+fn driver_stub() -> Span<u8>
+    let start: u64 = driver_stub_start as u64
+    span_from_ptr<u8>(start as *u8, (driver_stub_end as u64 - start) as i64)
+
+# What the stub reported in its exit status.
+struct DriverReport
+    pid: u64
+    cpl: u64
+    arg1: u64
+
+fn driver_report(status: i64) -> DriverReport
+    DriverReport { pid: (status & 0xFF) as u64, cpl: ((status >> 8) & 0xFF) as u64, arg1: ((status >> 16) & 0x7FFF) as u64 }
+
+# Log "[driver] pid N cpl C arg1 K" for the stub `pid` that exited with
+# `status`; true when it ran at CPL 3 as that pid with `arg1`.
+fn driver_check(pid: i64, status: i64, arg1: u64) -> bool
+    let r: DriverReport = driver_report(status)
+    klog("[driver] pid ")
+    klog_dec(r.pid as i64)
+    klog(" cpl ")
+    klog_dec(r.cpl as i64)
+    klog(" arg1 ")
+    klog_dec(r.arg1 as i64)
+    klog("\n")
+    r.pid == (pid as u64 & 0xFF) and r.cpl == 3 and r.arg1 == (arg1 & 0x7FFF)
+
+# driver-enter: the stub sees the kernel's arguments, Getpid returns its pid,
+# CS says CPL 3, and Exit (by sysretq's return path) reports them.
+fn driver_enter_self_test() -> bool
+    klog("\nTesting a kernel-spawned CPL-3 process...\n")
+    let pid: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_ENTER, DRIVER_STUB_COOKIE)
+    if pid <= 0
+        klog("  spawn failed\n")
+        return false
+    return driver_check(pid, process_wait(pid as i32), DRIVER_STUB_COOKIE)
+
+# driver-fault: a null read at CPL 3 kills only the stub, with status 142;
+# the kernel does not panic and pid 1 runs on.
+fn driver_fault_self_test() -> bool
+    klog("\nTesting a fault in a kernel-spawned process...\n")
+    let pid: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_FAULT, 0)
+    if pid <= 0
+        klog("  spawn failed\n")
+        return false
+    let status: i64 = process_wait(pid as i32)
+    klog("  status ")
+    klog_dec(status)
+    klog("\n")
+    return status == DRIVER_FAULT_STATUS
+
+# driver-preempt: with the tick running and pid 1 runnable (it yields until
+# the stub exits), the stub's 50 ms spin at CPL 3 is preempted.
+fn driver_preempt_self_test() -> bool
+    klog("\nTesting preemption of a kernel-spawned process...\n")
+    let cycles: u64 = tsc_hz() / 1000 * DRIVER_SPIN_MS
+    if cycles == 0
+        klog("  no TSC frequency\n")
+        return false
+    let before: u64 = sched_preemption_count()
+    sched_start(proc_current_slot())
+    let pid: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_SPIN, cycles)
+    var ok: bool = pid > 0
+    if ok
+        var code: i64 = 0
+        while proc_child_status(pid as u64, @code) == PROC_CHILD_LIVE
+            sched_yield()
+        ok = driver_check(pid, process_wait(pid as i32), cycles)
+    sched_stop()
+    let preempted: u64 = sched_preemption_count() - before
+    klog("  preemptions ")
+    klog_dec(preempted as i64)
+    klog("\n")
+    return ok and preempted > 0
+
+# The driver-* tests, as pid 1 with its scheduler stopped (on pid 1's kernel
+# stack: boot_process_tests).
+fn driver_process_tests()
+    boot_test_result("driver-enter", driver_enter_self_test())
+    boot_test_result("driver-fault", driver_fault_self_test())
+    boot_test_result("driver-preempt", driver_preempt_self_test())
+
 # The boot-test mode tests that need SYSCALL set up (syscall_init) and run
 # with no process yet, after boot_self_tests: kernel_main calls them before
 # postinit_diagnostics. They leave what run_init expects (no Proc, the
@@ -387,6 +488,12 @@ fn proc_create_init_self_test() -> bool
 pub fn boot_process_tests()
     klog("\n=== Boot-test mode: process tests ===\n")
     boot_test_result("proc-create-init", proc_create_init_self_test())
+    # The driver-* tests run as pid 1, on its own kernel stack: the boot
+    # stack is not mapped in a child's page table. Pid 1 is gone again
+    # afterwards, as run_init expects.
+    process_create_init()
+    kstack_call(driver_process_tests as u64, kstack_top(proc_current_slot()))
+    process_destroy_init()
     klog("[boot-test] ")
     klog_dec(boot_tests_passed as i64)
     klog(" passed, ")

@@ -663,9 +663,12 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
     body = _fn(PROCESS, "spawn_process")
     # made before the switch into the child's page table (kalloc may map
     # heap pages through the identity map, which the child's lacks), and the
-    # parent's table is current again straight after
-    start = body.index("fs_process_start(child_pid)")
-    assert start < body.index("fs_process_select(parent_pid)") < body.index("vmm_switch_pml4(child_pml4)")
+    # parent's table is current again straight after: spawn_child_begin,
+    # shared with the kernel's own spawn (#4713), does both
+    begin = _fn(PROCESS, "spawn_child_begin")
+    start = begin.index("fs_process_start(child_pid)")
+    assert start < begin.index("fs_process_select(parent_pid)") < begin.index("vmm_create_user_pml4()")
+    assert body.index("spawn_child_begin(parent_pid, true)") < body.index("vmm_switch_pml4(child_pml4)")
     # every later failure path gives it back: spawn_undo ends the child's table
     fails = re.findall(r"vmm_switch_pml4\(parent_pml4\)\n(\s+)(\S.*)\n", body)
     fail_lines = [line for _, line in fails]
@@ -673,6 +676,14 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
     undo = _fn(PROCESS, "spawn_undo")
     assert undo.index("fs_process_select(c.pid)") < undo.index("fs_process_end()") \
         < undo.index("fs_process_select(parent_pid)")
+    # the kernel's spawn (#4713) shares the first half and inherits no
+    # ambient capabilities: the kernel grants what it holds
+    image = _fn(PROCESS, "process_spawn_image")
+    assert "spawn_child_begin(parent_pid, false)" in image
+    assert begin.index("if inherit_caps") < begin.index("cap_inherit_ambient(")
+    # every failure after the child exists gives its slot back
+    assert image.count("spawn_undo(slot, parent_pid)") == 2, image
+    assert image.index("proc_start(slot)") > image.index("sched_prepare_user(slot, USER_IMAGE_BASE, user_rsp, arg0, arg1)")
     # both spawn syscalls, and spawn_bg, go through it
     for spawn in ("spawn_and_block", "sys_spawn_bg_handler"):
         assert "spawn_process(" in _fn(PROCESS, spawn), spawn

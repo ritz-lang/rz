@@ -72,7 +72,8 @@ POSTINIT_ENTRIES = {
     "boot_self_tests": ["vmm_self_test", "higher_half_self_test", "heap_self_test", "ipc_self_test",
                         "channel_close_self_test", "channel_debug_print", "test_elf_loader",
                         "virtio_blk_test"],
-    "boot_process_tests": ["proc_create_init_self_test"],
+    "boot_process_tests": ["proc_create_init_self_test", "process_create_init", "kstack_call",
+                           "process_destroy_init"],
     "postinit_diagnostics": ["pci_print_all_devices", "network_dhcp_ping", "virtio_blk_check"],
 }
 POSTINIT_FNS = {"vmm_self_test", "higher_half_self_test", "heap_self_test", "ipc_self_test",
@@ -167,6 +168,11 @@ def test_postinit_module_defines_the_self_tests():
     assert "boot_tests_failed != 0" not in body
     body = _body(code, "boot_process_tests")
     assert '"proc-create-init", proc_create_init_self_test()' in body
+    # #4713: the driver-* tests run as pid 1 on its own kernel stack, since
+    # the identity-mapped boot stack is absent from a child's page table.
+    assert "kstack_call(driver_process_tests as u64, kstack_top(proc_current_slot()))" in body
+    _calls_in_order(_body(code, "driver_process_tests"),
+                    ["driver_enter_self_test", "driver_fault_self_test", "driver_preempt_self_test"])
     assert body.index('" passed, "') < body.index("if boot_tests_failed != 0") < body.index("halt_loop()")
 
 
