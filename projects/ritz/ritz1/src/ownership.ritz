@@ -22,7 +22,7 @@
 #     may still read it); and on assignment to a field, for the field's old
 #     value (AGAST #2173, see own_field_drop_cond);
 #   - before every `ret` of the fn, for the bindings and temporaries live
-#     there, newest first (own_before_ret, which emit_str calls as a `ret`
+#     there, newest first (own_before_ret, which the IR sink calls as a `ret`
 #     starts, because ritz1 emits `ret` from dozens of sites; AGAST #3508).
 #     Which locals own a value is Sema's annotation (FnDef.own_binds), so
 #     the drops are known where the `ret` is emitted: nothing rescans the
@@ -60,6 +60,9 @@
 # A fn without move-only bindings, in a module without `impl Drop`, emits
 # nothing extra.
 #
+# The IR is written in ritz1/ARCHITECTURE.md's "Emitter style": a whole
+# instruction per `format_into(s, "...")`, text as StrViews.
+#
 # Tests: ritz0/test_ownership_free_count.py (shared with ritz0) and
 # ritz0/test_ritz1_ownership.py.
 
@@ -68,6 +71,8 @@ import ritzlib.io
 import ritzlib.gvec
 import ritzlib.hashmap   # HashMapI64 (own_move_only_in)
 import ritzlib.memory
+import ritzlib.string    # own_set_const's text
+import ritzlib.strview
 
 import ast
 import ast_helpers
@@ -75,6 +80,7 @@ import emitter_core
 import emitter_abi   # AGAST #1818: sret / byval moved out of emitter_core
 import emitter_types   # AGAST #1818: type inference moved out of emitter_core
 import ref_check           # ref_ty_of, ref_through, ref_method_def, ref_temp_call
+import text_bridge         # no_name, named_by, tagged_payload (AGAST #4696)
 import ritzlib.str
 
 const OWN_INIT_CAP: i32 = 16
@@ -82,6 +88,15 @@ const OWN_INIT_CAP: i32 = 16
 const OWN_MAX_DEPTH: i32 = 32
 # Bits 0..30 of an i32, the paths a set held inline can have.
 const OWN_ALL_PATHS: i32 = 0x7FFFFFFF
+
+# `count` values of the struct `name` side by side (an `[N]T` of it, or a
+# lone value when count is 0).  `name` is empty when there is none.
+pub struct StructElems
+    name: StrView
+    count: i32
+
+fn no_elems() -> StructElems
+    StructElems { name: no_name(), count: 0 }
 
 # =============================================================================
 # Path sets (AGAST #2319)
@@ -98,9 +113,10 @@ const OWN_ALL_PATHS: i32 = 0x7FFFFFFF
 # paths reaches the pool, so other code pays nothing for it.  Sets are never
 # freed: a fn's sets are few, and the pool is shared by all of them.
 
-const OS_OR: i32 = 0
-const OS_AND: i32 = 1
-const OS_MINUS: i32 = 2
+enum SetOp
+    Or
+    And
+    Minus
 
 var g_os_words: *i32 = null    # the entries' words, back to back
 var g_os_wlen: i32 = 0
@@ -166,20 +182,20 @@ fn os_hash(w: *i32, n: i32) -> i32
         i += 1
     h as i32
 
-# 1 when entry k holds the words w[0..n).
-fn os_same(k: i32, w: *i32, n: i32) -> i32
+# True when entry k holds the words w[0..n).
+fn os_same(k: i32, w: *i32, n: i32) -> bool
     let lens: *i32 = g_os_len
     if lens[k] != n
-        return 0
+        return false
     let offs: *i32 = g_os_off
     let words: *i32 = g_os_words
     let base: i32 = offs[k]
     var i: i32 = 0
     while i < n
         if words[base + i] != w[i]
-            return 0
+            return false
         i += 1
-    1
+    true
 
 # Put entry k in the hash table.
 fn os_slot_in(k: i32)
@@ -229,7 +245,7 @@ fn os_make(buf: *i32, n: i32) -> i32
     var at: i32 = os_hash(buf, len) & mask
     while tab[at] != 0
         let k: i32 = tab[at] - 1
-        if os_same(k, buf, len) == 1
+        if os_same(k, buf, len)
             return 0 - k - 1
         at = (at + 1) & mask
     if g_os_count >= g_os_cap
@@ -262,43 +278,40 @@ fn os_make(buf: *i32, n: i32) -> i32
     tab[at] = k + 1
     0 - k - 1
 
-# `a | b`, `a & b` or `a & ~b` (op OS_OR, OS_AND, OS_MINUS).
-fn os_op(a: i32, b: i32, op: i32) -> i32
+# One word of `a op b`.
+fn os_word_op(wa: i32, wb: i32, op: SetOp) -> i32
+    match op
+        SetOp.Or => wa | wb
+        SetOp.And => wa & wb
+        SetOp.Minus => wa & (wb ^ (0 - 1))
+
+# `a | b`, `a & b` or `a & ~b`.
+fn os_op(a: i32, b: i32, op: SetOp) -> i32
     if a >= 0 and b >= 0
-        if op == OS_OR
-            return a | b
-        if op == OS_AND
-            return a & b
-        return a & (OWN_ALL_PATHS ^ b)
+        # Both inline: `a` has no bit 31, so neither has `a & ~b`.
+        return os_word_op(a, b, op)
     var n: i32 = os_len(a)
     let nb: i32 = os_len(b)
-    if op == OS_OR and nb > n
+    if op == SetOp.Or and nb > n
         n = nb
-    if op == OS_AND and nb < n
+    if op == SetOp.And and nb < n
         n = nb
     let buf: *i32 = os_scratch(n)
     var i: i32 = 0
     while i < n
-        let wa: i32 = os_word(a, i)
-        let wb: i32 = os_word(b, i)
-        if op == OS_OR
-            buf[i] = wa | wb
-        else if op == OS_AND
-            buf[i] = wa & wb
-        else
-            buf[i] = wa & (wb ^ (0 - 1))
+        buf[i] = os_word_op(os_word(a, i), os_word(b, i), op)
         i += 1
     os_make(buf, n)
 
 pub fn own_set_or(a: i32, b: i32) -> i32
-    os_op(a, b, OS_OR)
+    os_op(a, b, SetOp.Or)
 
 pub fn own_set_and(a: i32, b: i32) -> i32
-    os_op(a, b, OS_AND)
+    os_op(a, b, SetOp.And)
 
 # The paths of `a` that aren't in `b`.
 pub fn own_set_minus(a: i32, b: i32) -> i32
-    os_op(a, b, OS_MINUS)
+    os_op(a, b, SetOp.Minus)
 
 # {path}.
 pub fn own_set_bit(path: i32) -> i32
@@ -324,7 +337,8 @@ pub fn own_set_range(n: i32) -> i32
         buf[n / 32] = (1 << (n % 32)) - 1
     os_make(buf, words)
 
-# 1 when `path` is in `a`.
+# 1 when `path` is in `a`.  An i32, as the rest of the set API is: own_check
+# tests it with the sets it keeps.
 pub fn own_set_has(a: i32, path: i32) -> i32
     if (os_word(a, path / 32) & (1 << (path % 32))) != 0
         return 1
@@ -386,68 +400,74 @@ fn own_temp_at(o: *OwnState, i: i32) -> *OwnBinding
     let base: *OwnBinding = o.temps
     return @base[i]
 
+# The struct type a binding holds (its elements' type, for an array).
+fn own_binding_type(b: *OwnBinding) -> StrView
+    StrView { ptr: b.type_name, len: b.type_name_len as i64 }
+
+# A struct field's type name.
+fn own_field_type(f: *StructField) -> StrView
+    StrView { ptr: f.field_type_name, len: f.field_type_name_len as i64 }
+
+# An expression's identifier (a name, a member's field, a method's name).
+fn own_ident(e: *Expr) -> StrView
+    StrView { ptr: e.ident_ptr, len: e.ident_len as i64 }
+
 # =============================================================================
 # Move-only types
 # =============================================================================
+#
+# The predicates here that end in `_in` (and own_base_len) are Sema's too:
+# own_check.ritz and ref_value.ritz ask them with Sema's struct map (AGAST
+# #4011), and test their i32 results with i32 predicates of their own.  The
+# emitter's wrappers read them as bools.
 
 # Length of `name` up to its first `$` (a monomorph's base name).
-pub fn own_base_len(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var i: i32 = 0
-    while i < len
-        if *(name + i) == '$'   # '$'
-            return i
-        i += 1
-    len
+pub fn own_base_len(name: StrView) -> i32
+    name.find_byte('$') as i32
 
-# 1 when the type itself has an `impl Drop`.
-fn own_has_drop_impl(s: *EmitterState, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    own_has_drop_impl_in(s.module, StrView { ptr: (name), len: (len) as i64 })
+# True for an `impl Drop for ..` block.
+fn own_impl_is_drop(ib: *ImplBlock) -> bool
+    if ib.trait_name == null
+        return false
+    let tr: StrView = StrView { ptr: ib.trait_name, len: ib.trait_name_len as i64 }
+    tr.eq("Drop")
 
-pub fn own_has_drop_impl_in(m: *Module, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let base_len: i32 = own_base_len(StrView { ptr: (name), len: (len) as i64 })
+# True when the type itself has an `impl Drop`.
+fn own_has_drop_impl(s: *EmitterState, name: StrView) -> bool
+    own_has_drop_impl_in(s.module, name) == 1
+
+pub fn own_has_drop_impl_in(m: *Module, name: StrView) -> i32
+    let base: StrView = name.take(own_base_len(name) as i64)
     var ib: *ImplBlock = m.impls
     while ib != null
-        if ib.trait_name != null and name_eq(StrView { ptr: (ib.trait_name), len: (ib.trait_name_len) as i64 }, StrView { ptr: (c"Drop"), len: (4) as i64 }) == 1
-            if name_eq(StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }, StrView { ptr: (name), len: (base_len) as i64 }) == 1
-                return 1
+        let ty: StrView = StrView { ptr: ib.type_name, len: ib.type_name_len as i64 }
+        if own_impl_is_drop(ib) and ty.eq(base)
+            return 1
         ib = ib.next
     0
 
-fn own_move_only_depth(s: *EmitterState, name_sv: StrView, depth: i32) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    own_move_only_in(s.mono.pctx, s.module, @s.struct_map, StrView { ptr: (name), len: (len) as i64 }, depth)
+fn own_move_only_depth(s: *EmitterState, name: StrView, depth: i32) -> bool
+    own_move_only_in(s.mono.pctx, s.module, @s.struct_map, name, depth) == 1
 
 # own_move_only_depth over `m` and a struct map of its (struct_map_find): the
 # emitter's, or Sema's (AGAST #4011).
-fn own_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, name_sv: StrView, depth: i32) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if name == null or len <= 0 or depth > OWN_MAX_DEPTH
+fn own_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, name: StrView, depth: i32) -> i32
+    if name.ptr == null or name.len <= 0 or depth > OWN_MAX_DEPTH
         return 0
-    if own_has_drop_impl_in(m, StrView { ptr: (name), len: (len) as i64 }) == 1
+    if own_has_drop_impl_in(m, name) == 1
         return 1
     # Generic arguments: `Vec$Tracked`, `Pair$i32$Tracked`.
-    let base_len: i32 = own_base_len(StrView { ptr: (name), len: (len) as i64 })
-    var i: i32 = base_len
-    while i < len
-        let start: i32 = i + 1
-        var j: i32 = start
-        while j < len and *(name + j) != '$'
-            j += 1
-        if j > start and own_move_only_in(ctx, m, map, StrView { ptr: (name + start), len: (j - start) as i64 }, depth + 1) == 1
+    var i: i64 = own_base_len(name) as i64
+    while i < name.len
+        let rest: StrView = name.skip(i + 1)
+        let arg: StrView = rest.take(rest.find_byte('$'))
+        if arg.len > 0 and own_move_only_in(ctx, m, map, arg, depth + 1) == 1
             return 1
-        i = j
-    let st: *StructDef = struct_map_find(map, m, StrView { ptr: (name), len: (len) as i64 })
+        i = i + 1 + arg.len
+    let st: *StructDef = struct_map_find(map, m, name)
     if st == null
         # A user enum is move-only when a variant's payload is (AGAST #2165).
-        let ei: i32 = user_enum_index(ctx, StrView { ptr: (name), len: (len) as i64 })
+        let ei: i32 = user_enum_index(ctx, name)
         if ei < 0
             return 0
         var vi: i32 = 0
@@ -458,51 +478,43 @@ fn own_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, name_sv: StrVi
         return 0
     own_fields_move_only_in(ctx, m, map, st.fields, depth + 1)
 
-# The leaf elements of an N-D array shape, when they are structs: 1, with
-# their total count and type.
-pub fn own_shape_elems(sh: *ArrayShape, out_n: *i32, out_name: **u8, out_len: *i32) -> i32
+# The leaf elements of an N-D array shape, when they are structs: their
+# type and total count.
+pub fn own_shape_elems(sh: *ArrayShape) -> StructElems
     if sh.leaf_type != TypeKind.Struct or sh.leaf_name_len <= 0
-        return 0
+        return no_elems()
     var n: i32 = 1
     var d: i32 = 0
     while d < sh.rank
         n = n * sh.dims[d]
         d += 1
-    *out_n = n
-    *out_name = sh.leaf_name
-    *out_len = sh.leaf_name_len
-    1
+    StructElems { name: StrView { ptr: sh.leaf_name, len: sh.leaf_name_len as i64 }, count: n }
 
-# An array field of struct elements: 1, with the element count (every
-# leaf of an N-D array) and the element type.
-fn own_field_array(f: *StructField, out_n: *i32, out_name: **u8, out_len: *i32) -> i32
+# An array field of struct elements: the element type and count (every leaf
+# of an N-D array).
+fn own_field_array(f: *StructField) -> StructElems
     if f.field_type != TypeKind.Array
-        return 0
+        return no_elems()
     if f.array_shape != null
-        return own_shape_elems(f.array_shape, out_n, out_name, out_len)
+        return own_shape_elems(f.array_shape)
     if f.array_elem_type != TypeKind.Struct or f.array_size <= 0
-        return 0
-    *out_n = f.array_size
-    *out_name = f.array_elem_type_name
-    *out_len = f.array_elem_type_name_len
-    1
+        return no_elems()
+    let elem: StrView = StrView { ptr: f.array_elem_type_name, len: f.array_elem_type_name_len as i64 }
+    StructElems { name: elem, count: f.array_size }
 
-# 1 when field `f` (of a struct or an enum payload) holds a move-only value.
-fn own_field_move_only(s: *EmitterState, f: *StructField, depth: i32) -> i32
-    own_field_move_only_in(s.mono.pctx, s.module, @s.struct_map, f, depth)
+# True when field `f` (of a struct or an enum payload) holds a move-only value.
+fn own_field_move_only(s: *EmitterState, f: *StructField, depth: i32) -> bool
+    own_field_move_only_in(s.mono.pctx, s.module, @s.struct_map, f, depth) == 1
 
 pub fn own_field_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, f: *StructField, depth: i32) -> i32
     if f.field_type == TypeKind.Struct
-        return own_move_only_in(ctx, m, map, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, depth)
-    var n: i32 = 0
-    var en: *u8 = null
-    var el: i32 = 0
-    if own_field_array(f, @n, @en, @el) == 1
-        return own_move_only_in(ctx, m, map, StrView { ptr: (en), len: (el) as i64 }, depth)
-    0
+        return own_move_only_in(ctx, m, map, own_field_type(f), depth)
+    # Not an array of structs: an empty name, which is no move-only type.
+    let arr: StructElems = own_field_array(f)
+    own_move_only_in(ctx, m, map, arr.name, depth)
 
-fn own_fields_move_only(s: *EmitterState, fields: *StructField, depth: i32) -> i32
-    own_fields_move_only_in(s.mono.pctx, s.module, @s.struct_map, fields, depth)
+fn own_fields_move_only(s: *EmitterState, fields: *StructField, depth: i32) -> bool
+    own_fields_move_only_in(s.mono.pctx, s.module, @s.struct_map, fields, depth) == 1
 
 pub fn own_fields_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, fields: *StructField, depth: i32) -> i32
     var f: *StructField = fields
@@ -512,36 +524,29 @@ pub fn own_fields_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, fie
         f = f.next
     0
 
-# 1 when the module has an `impl Drop` at all; without one nothing is
-# move-only, and the hooks skip their work.
-fn own_any_drop(s: *EmitterState) -> i32
+# True when the module has an `impl Drop` at all; without one nothing is
+# move-only, and the hooks skip their work.  OwnState.has_drop caches it
+# (-1 until known).
+fn own_any_drop(s: *EmitterState) -> bool
     let o: *OwnState = s.own
-    if o.has_drop >= 0
-        return o.has_drop
-    o.has_drop = 0
-    var ib: *ImplBlock = s.module.impls
-    while ib != null
-        if ib.trait_name != null and name_eq(StrView { ptr: (ib.trait_name), len: (ib.trait_name_len) as i64 }, StrView { ptr: (c"Drop"), len: (4) as i64 }) == 1
-            o.has_drop = 1
-            return 1
-        ib = ib.next
-    0
+    if o.has_drop < 0
+        o.has_drop = 0
+        var ib: *ImplBlock = s.module.impls
+        while ib != null and o.has_drop == 0
+            if own_impl_is_drop(ib)
+                o.has_drop = 1
+            ib = ib.next
+    o.has_drop == 1
 
-pub fn own_type_is_move_only(s: *EmitterState, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if own_any_drop(s) == 0
-        return 0
-    own_move_only_depth(s, StrView { ptr: (name), len: (len) as i64 }, 0)
+pub fn own_type_is_move_only(s: *EmitterState, name: StrView) -> bool
+    own_any_drop(s) and own_move_only_depth(s, name, 0)
 
 # own_type_is_move_only over `m` and a struct map of its: Sema's (AGAST #4011).
-pub fn own_type_is_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn own_type_is_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, name: StrView) -> i32
     var ib: *ImplBlock = m.impls
     while ib != null
-        if ib.trait_name != null and name_eq(StrView { ptr: (ib.trait_name), len: (ib.trait_name_len) as i64 }, StrView { ptr: (c"Drop"), len: (4) as i64 }) == 1
-            return own_move_only_in(ctx, m, map, StrView { ptr: (name), len: (len) as i64 }, 0)
+        if own_impl_is_drop(ib)
+            return own_move_only_in(ctx, m, map, name, 0)
         ib = ib.next
     0
 
@@ -549,67 +554,63 @@ pub fn own_type_is_move_only_in(ctx: *ParseCtx, m: *Module, map: *HashMapI64, na
 # Drop glue
 # =============================================================================
 
-# Emit `call void @<T's drop>(ptr %ptr)` if T has its own drop.
-fn own_emit_own_drop(s: *EmitterState, ptr: i32, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if own_has_drop_impl(s, StrView { ptr: (name), len: (len) as i64 }) == 0
+# `call void @<T's drop>(ptr %ptr)` if T has its own drop.
+fn own_emit_own_drop(s: *EmitterState, ptr: i32, name: StrView)
+    if not own_has_drop_impl(s, name)
         return
-    let base_len: i32 = own_base_len(StrView { ptr: (name), len: (len) as i64 })
-    if base_len < len
+    if own_base_len(name) < name.len as i32
         # A generic impl: monomorph specialised its methods as `Box$i32_drop`.
-        let fd: *FnDef = find_spec_impl_method(s, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"drop"), len: (4) as i64 })
+        let fd: *FnDef = find_spec_impl_method(s, name, "drop")
         if fd == null
             return
-        emit_str(s, c"  call void @")
-        emit_name(s, StrView { ptr: (fd.name), len: (fd.name_len) as i64 })
-        emit_str(s, c"(ptr ")
-        emit_reg(s, ptr)
-        emit_str(s, c")\n")
-        add_extern(s, StrView { ptr: (fd.name), len: (fd.name_len) as i64 })
+        let callee: StrView = StrView { ptr: fd.name, len: fd.name_len as i64 }
+        let callee_ir: String = ir_name(callee)
+        format_into(s, "  call void @{callee_ir.as_view()}(ptr %.{ptr})\n")
+        add_extern(s, callee)
         return
-    emit_str(s, c"  call void @")
-    emit_name(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c"_drop(ptr ")
-    emit_reg(s, ptr)
-    emit_str(s, c")\n")
-    add_method_extern(s, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"drop"), len: (4) as i64 })
+    let ty_ir: String = ir_name(name)
+    format_into(s, "  call void @{ty_ir.as_view()}_drop(ptr %.{ptr})\n")
+    add_method_extern(s, name, "drop")
 
 # A pointer to field `idx` of the struct `st` at `ptr`.
 fn own_field_gep(s: *EmitterState, ptr: i32, st: *StructDef, idx: i32) -> i32
     let r: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, r)
-    emit_str(s, c" = getelementptr %")
-    emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-    emit_str(s, c", ptr ")
-    emit_reg(s, ptr)
-    emit_str(s, c", i32 0, i32 ")
-    emit_int(s, idx as i64)
-    emit_str(s, c"\n")
+    gep_struct_open(s, r, StrView { ptr: st.name, len: st.name_len as i64 })
+    format_into(s, ", ptr %.{ptr}, i32 0, i32 {idx}\n")
     r
+
+# `br i1 %cond` to a new block, which is opened; returns the label own_if_close
+# closes it with, the one the false edge goes to.
+fn own_if_open(s: *EmitterState, cond: i32) -> i32
+    let do_label: i32 = next_label(s)
+    let next: i32 = next_label(s)
+    format_into(s, "  br i1 %.{cond}, label %L{do_label}, label %L{next}\n")
+    begin_block(s, do_label)
+    next
+
+fn own_if_close(s: *EmitterState, next: i32)
+    format_into(s, "  br label %L{next}\n")
+    begin_block(s, next)
 
 # Drop the value of type `name` at `ptr`: its own drop, then its move-only
 # struct fields in declaration order, or an enum's payload.
-fn own_emit_glue(s: *EmitterState, ptr: i32, name_sv: StrView, depth: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn own_emit_glue(s: *EmitterState, ptr: i32, name: StrView, depth: i32)
     if depth > OWN_MAX_DEPTH
         return
-    own_emit_own_drop(s, ptr, StrView { ptr: (name), len: (len) as i64 })
-    if is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
-        own_emit_tagged_glue(s, ptr, StrView { ptr: (name), len: (len) as i64 }, depth)
+    own_emit_own_drop(s, ptr, name)
+    if is_tagged_enum_type(name) == 1
+        own_emit_tagged_glue(s, ptr, name, depth)
         return
-    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
+    let st: *StructDef = find_struct(s, name)
     if st == null
-        let ei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
+        let ei: i32 = user_enum_index(s.mono.pctx, name)
         if ei >= 0
-            own_emit_enum_glue(s, ptr, StrView { ptr: (name), len: (len) as i64 }, ei, depth)
+            own_emit_enum_glue(s, ptr, name, ei, depth)
         return
     var idx: i32 = 0
     var f: *StructField = st.fields
     while f != null
-        if own_field_move_only(s, f, 0) == 1
+        if own_field_move_only(s, f, 0)
             own_emit_field_glue(s, own_field_gep(s, ptr, st, idx), f, depth + 1)
         idx += 1
         f = f.next
@@ -617,71 +618,38 @@ fn own_emit_glue(s: *EmitterState, ptr: i32, name_sv: StrView, depth: i32)
 # Drop the move-only field `f` stored at `ptr`.
 fn own_emit_field_glue(s: *EmitterState, ptr: i32, f: *StructField, depth: i32)
     if f.field_type == TypeKind.Struct
-        own_emit_glue(s, ptr, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, depth)
+        own_emit_glue(s, ptr, own_field_type(f), depth)
         return
-    var n: i32 = 0
-    var en: *u8 = null
-    var el: i32 = 0
-    if own_field_array(f, @n, @en, @el) == 1
-        own_emit_array_glue(s, ptr, n, StrView { ptr: (en), len: (el) as i64 }, depth)
+    let arr: StructElems = own_field_array(f)
+    if not arr.name.is_empty()
+        own_emit_array_glue(s, ptr, arr.count, arr.name, depth)
 
 # AGAST #2168, #2242: drop the binding's value at `ptr`, or with `path` >= 0
 # that path's value (no drop of its own either way), except the paths whose
-# bit is set in the i32 register `mask`: each move-only field in declaration
+# bit is set in the mask register `mask`: each move-only field in declaration
 # order if it isn't moved out, a field with parts of its own part by part.
 fn own_emit_masked_glue(s: *EmitterState, ptr: i32, b: *OwnBinding, path: i32, mask: i32)
-    var name: *u8 = b.type_name
-    var len: i32 = b.type_name_len
+    var name: StrView = own_binding_type(b)
     if path >= 0
-        let pp: *OwnPath = own_path_at(b, path)
-        let pf: *StructField = pp.fld
-        name = pf.field_type_name
-        len = pf.field_type_name_len
-    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
+        name = own_field_type(own_path_at(b, path).fld)
+    let st: *StructDef = find_struct(s, name)
     if st == null
         return
     var idx: i32 = 0
     var f: *StructField = st.fields
     while f != null
-        if own_field_move_only(s, f, 0) == 1
+        if own_field_move_only(s, f, 0)
             let part: i32 = own_child_path(b, path, idx)
             var next: i32 = 0 - 1
             if part >= 0
-                let t: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, t)
-                emit_str(s, c" = and ")
-                own_emit_mask_type(s, b)
-                emit_str(s, c" ")
-                emit_reg(s, mask)
-                emit_str(s, c", ")
-                own_emit_set_const(s, b, own_set_bit(part), 0)
-                emit_str(s, c"\n")
-                let c: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, c)
-                emit_str(s, c" = icmp eq ")
-                own_emit_mask_type(s, b)
-                emit_str(s, c" ")
-                emit_reg(s, t)
-                emit_str(s, c", 0\n")
-                let do_label: i32 = next_label(s)
-                next = next_label(s)
-                emit_str(s, c"  br i1 ")
-                emit_reg(s, c)
-                emit_str(s, c", label %")
-                emit_label(s, do_label)
-                emit_str(s, c", label %")
-                emit_label(s, next)
-                emit_str(s, c"\n")
-                begin_block(s, do_label)
+                next = own_if_open(s, own_bits_clear(s, b, mask, own_set_bit(part)))
             let fp: i32 = own_field_gep(s, ptr, st, idx)
-            if part >= 0 and own_has_parts(b, part) == 1
+            if part >= 0 and own_has_parts(b, part)
                 own_emit_masked_glue(s, fp, b, part, mask)
             else
                 own_emit_field_glue(s, fp, f, 1)
             if next >= 0
-                own_case_end(s, next)
+                own_if_close(s, next)
         idx += 1
         f = f.next
 
@@ -691,255 +659,164 @@ fn own_emit_binding_glue(s: *EmitterState, b: *OwnBinding, ptr: i32, mask: i32)
     if mask != 0
         own_emit_masked_glue(s, ptr, b, 0 - 1, mask)
     else
-        own_emit_value_glue(s, ptr, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 }, b.count)
+        own_emit_value_glue(s, ptr, own_binding_type(b), b.count)
 
 # AGAST #2319: the run-time mask is an integer of whole 32-bit words, one
-# bit per path (an i32 up to 32 paths, an i64 up to 64, ...).
+# bit per path (an i32 up to 32 paths, an i64 up to 64, ...): its width.
 fn own_mask_width(b: *OwnBinding) -> i32
     var words: i32 = (b.path_count + 31) / 32
     if words < 1
         words = 1
     words * 32
 
-fn own_emit_mask_type(s: *EmitterState, b: *OwnBinding)
-    emit_str(s, c"i")
-    emit_int(s, own_mask_width(b) as i64)
-
 # The path set `a` as a constant of the binding's mask type, or with `inv`
-# 1 its complement: in decimal for an i32, else in hex (`u0x` + every word,
+# its complement: in decimal for an i32, else in hex (`u0x` + every word,
 # the top one first), which LLVM reads at any width.
-fn own_emit_set_const(s: *EmitterState, b: *OwnBinding, a: i32, inv: i32)
+fn own_set_const(b: *OwnBinding, a: i32, inv: bool) -> String
     let words: i32 = own_mask_width(b) / 32
+    var out: String = string_new()
     if words == 1
         var w: i32 = os_word(a, 0)
-        if inv == 1
+        if inv
             w = w ^ (0 - 1)
-        emit_int(s, w as i64)
-        return
-    emit_str(s, c"u0x")
+        format_into(@&out, "{w}")
+        return out
+    let digits: StrView = "0123456789abcdef"
+    out.push_str("u0x")
     var i: i32 = words - 1
     while i >= 0
         var w: i32 = os_word(a, i)
-        if inv == 1
+        if inv
             w = w ^ (0 - 1)
         var k: i32 = 7
         while k >= 0
-            let nib: i32 = (w >> (k * 4)) & 15
-            if nib < 10
-                s.out.push((nib + 48) as u8)    # '0'
-            else
-                s.out.push((nib + 87) as u8)    # 'a' - 10
+            out.push(digits.get(((w >> (k * 4)) & 15) as i64))
             k -= 1
         i -= 1
+    out
+
+# The i1 "none of the path set `bits` is set in the mask register `mask`".
+fn own_bits_clear(s: *EmitterState, b: *OwnBinding, mask: i32, bits: i32) -> i32
+    let width: i32 = own_mask_width(b)
+    let t: i32 = next_reg(s)
+    let bits_ir: String = own_set_const(b, bits, false)
+    format_into(s, "  %.{t} = and i{width} %.{mask}, {bits_ir.as_view()}\n")
+    let c: i32 = next_reg(s)
+    format_into(s, "  %.{c} = icmp eq i{width} %.{t}, 0\n")
+    c
 
 # Load the binding's moved-path mask (0 when it has none).
 fn own_load_mask(s: *EmitterState, b: *OwnBinding) -> i32
     if b.fmask == 0
         return 0
     let m: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, m)
-    emit_str(s, c" = load ")
-    own_emit_mask_type(s, b)
-    emit_str(s, c", ptr ")
-    emit_reg(s, b.fmask)
-    emit_str(s, c"\n")
+    format_into(s, "  %.{m} = load i{own_mask_width(b)}, ptr %.{b.fmask}\n")
     m
 
-# Set (`set` 1) or clear the run-time moved bits of the path set `bits`.
-fn own_emit_mask_bits(s: *EmitterState, b: *OwnBinding, bits: i32, set: i32)
+# Set (`set`) or clear the run-time moved bits of the path set `bits`.
+fn own_emit_mask_bits(s: *EmitterState, b: *OwnBinding, bits: i32, set: bool)
     if b.fmask == 0 or bits == 0
         return
     let m: i32 = own_load_mask(s, b)
     let r: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, r)
-    if set == 1
-        emit_str(s, c" = or ")
-    else
-        emit_str(s, c" = and ")
-    own_emit_mask_type(s, b)
-    emit_str(s, c" ")
-    emit_reg(s, m)
-    emit_str(s, c", ")
-    own_emit_set_const(s, b, bits, 1 - set)
-    emit_str(s, c"\n  store ")
-    own_emit_mask_type(s, b)
-    emit_str(s, c" ")
-    emit_reg(s, r)
-    emit_str(s, c", ptr ")
-    emit_reg(s, b.fmask)
-    emit_str(s, c"\n")
+    let width: i32 = own_mask_width(b)
+    let op: StrView = if set then "or" else "and"
+    let bits_ir: String = own_set_const(b, bits, not set)
+    format_into(s, "  %.{r} = {op} i{width} %.{m}, {bits_ir.as_view()}\n")
+    format_into(s, "  store i{width} %.{r}, ptr %.{b.fmask}\n")
 
 # Mark no path moved out.
 fn own_clear_mask(s: *EmitterState, b: *OwnBinding)
     if b.fmask == 0
         return
-    emit_str(s, c"  store ")
-    own_emit_mask_type(s, b)
-    emit_str(s, c" 0, ptr ")
-    emit_reg(s, b.fmask)
-    emit_str(s, c"\n")
+    format_into(s, "  store i{own_mask_width(b)} 0, ptr %.{b.fmask}\n")
 
 # A value (count 0) or an array of `count` elements, at `ptr`.
-fn own_emit_value_glue(s: *EmitterState, ptr: i32, name_sv: StrView, count: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn own_emit_value_glue(s: *EmitterState, ptr: i32, name: StrView, count: i32)
     if count > 0
-        own_emit_array_glue(s, ptr, count, StrView { ptr: (name), len: (len) as i64 }, 0)
+        own_emit_array_glue(s, ptr, count, name, 0)
     else
-        own_emit_glue(s, ptr, StrView { ptr: (name), len: (len) as i64 }, 0)
+        own_emit_glue(s, ptr, name, 0)
+
+# A static `alloca` of `ty` in the fn's entry block, with the `  ; <what>`
+# comment its line carries.
+fn own_entry_alloca(s: *EmitterState, ty: StrView, what: StrView) -> i32
+    let r: i32 = entry_alloca_begin(s)
+    format_into(s, "{ty}  ; {what}\n")
+    entry_alloca_end(s)
+    r
 
 # Drop `n` elements of type `name` from `ptr` on, in index order, with a
 # loop (its counter alloca is written into the entry-block buffer).
-fn own_emit_array_glue(s: *EmitterState, ptr: i32, n: i32, name_sv: StrView, depth: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn own_emit_array_glue(s: *EmitterState, ptr: i32, n: i32, name: StrView, depth: i32)
     if n <= 0 or depth > OWN_MAX_DEPTH
         return
-    let ctr: i32 = entry_alloca(s, c"i64", c"array drop index")
-    emit_str(s, c"  store i64 0, ptr ")
-    emit_reg(s, ctr)
-    emit_str(s, c"\n")
+    let ctr: i32 = own_entry_alloca(s, "i64", "array drop index")
+    format_into(s, "  store i64 0, ptr %.{ctr}\n")
     let head: i32 = next_label(s)
     let body: i32 = next_label(s)
     let done: i32 = next_label(s)
-    emit_str(s, c"  br label %")
-    emit_label(s, head)
-    emit_str(s, c"\n")
+    format_into(s, "  br label %L{head}\n")
     begin_block(s, head)
     let i: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, i)
-    emit_str(s, c" = load i64, ptr ")
-    emit_reg(s, ctr)
-    emit_str(s, c"\n")
+    format_into(s, "  %.{i} = load i64, ptr %.{ctr}\n")
     let more: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, more)
-    emit_str(s, c" = icmp slt i64 ")
-    emit_reg(s, i)
-    emit_str(s, c", ")
-    emit_int(s, n as i64)
-    emit_str(s, c"\n  br i1 ")
-    emit_reg(s, more)
-    emit_str(s, c", label %")
-    emit_label(s, body)
-    emit_str(s, c", label %")
-    emit_label(s, done)
-    emit_str(s, c"\n")
+    format_into(s, "  %.{more} = icmp slt i64 %.{i}, {n}\n")
+    format_into(s, "  br i1 %.{more}, label %L{body}, label %L{done}\n")
     begin_block(s, body)
     let ep: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, ep)
-    emit_str(s, c" = getelementptr ")
-    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c", ptr ")
-    emit_reg(s, ptr)
-    emit_str(s, c", i64 ")
-    emit_reg(s, i)
-    emit_str(s, c"\n")
-    own_emit_glue(s, ep, StrView { ptr: (name), len: (len) as i64 }, depth + 1)
+    gep_struct_open(s, ep, name)
+    format_into(s, ", ptr %.{ptr}, i64 %.{i}\n")
+    own_emit_glue(s, ep, name, depth + 1)
     let nx: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, nx)
-    emit_str(s, c" = add i64 ")
-    emit_reg(s, i)
-    emit_str(s, c", 1\n  store i64 ")
-    emit_reg(s, nx)
-    emit_str(s, c", ptr ")
-    emit_reg(s, ctr)
-    emit_str(s, c"\n  br label %")
-    emit_label(s, head)
-    emit_str(s, c"\n")
+    format_into(s, "  %.{nx} = add i64 %.{i}, 1\n")
+    format_into(s, "  store i64 %.{nx}, ptr %.{ctr}\n")
+    format_into(s, "  br label %L{head}\n")
     begin_block(s, done)
 
-# `if tag == <tag> {`: branch on the tag of the enum `ename` at `ptr` and
-# open the block that drops the payload.  Returns the payload's address
-# (field 2 of every payload-carrying enum layout); *out_next gets the label
-# own_case_end closes the block with.
-fn own_case_begin(s: *EmitterState, ptr: i32, ename_sv: StrView, tag: i32, out_next: *i32) -> i32
-    var ename: *u8 = ename_sv.ptr
-    var elen: i32 = ename_sv.len as i32
-    let tp: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, tp)
-    emit_str(s, c" = getelementptr %")
-    emit_name(s, StrView { ptr: (ename), len: (elen) as i64 })
-    emit_str(s, c", ptr ")
-    emit_reg(s, ptr)
-    emit_str(s, c", i32 0, i32 0\n")
-    let t: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, t)
-    emit_str(s, c" = load i8, ptr ")
-    emit_reg(s, tp)
-    emit_str(s, c"\n")
-    let c: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, c)
-    emit_str(s, c" = icmp eq i8 ")
-    emit_reg(s, t)
-    emit_str(s, c", ")
-    emit_int(s, tag as i64)
-    emit_str(s, c"\n")
-    let do_label: i32 = next_label(s)
-    let next: i32 = next_label(s)
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, c)
-    emit_str(s, c", label %")
-    emit_label(s, do_label)
-    emit_str(s, c", label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, do_label)
-    let pp: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, pp)
-    emit_str(s, c" = getelementptr %")
-    emit_name(s, StrView { ptr: (ename), len: (elen) as i64 })
-    emit_str(s, c", ptr ")
-    emit_reg(s, ptr)
-    emit_str(s, c", i32 0, i32 2\n")
-    *out_next = next
-    pp
+# A block that drops one variant's payload (own_case_begin).
+struct OwnCase
+    payload: i32   # the payload's address
+    next: i32      # the label own_if_close closes the block with
 
-fn own_case_end(s: *EmitterState, next: i32)
-    emit_str(s, c"  br label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, next)
+# `if tag == <tag> {`: branch on the tag of the enum `ename` at `ptr` and
+# open the block that drops the payload, which is field 2 of every
+# payload-carrying enum layout.
+fn own_case_begin(s: *EmitterState, ptr: i32, ename: StrView, tag: i32) -> OwnCase
+    let tp: i32 = next_reg(s)
+    gep_struct_open(s, tp, ename)
+    format_into(s, ", ptr %.{ptr}, i32 0, i32 0\n")
+    let t: i32 = next_reg(s)
+    format_into(s, "  %.{t} = load i8, ptr %.{tp}\n")
+    let c: i32 = next_reg(s)
+    format_into(s, "  %.{c} = icmp eq i8 %.{t}, {tag}\n")
+    let next: i32 = own_if_open(s, c)
+    let pp: i32 = next_reg(s)
+    gep_struct_open(s, pp, ename)
+    format_into(s, ", ptr %.{ptr}, i32 0, i32 2\n")
+    OwnCase { payload: pp, next: next }
 
 # Option$T / Result$T$E: tag 0 holds the Some / Ok payload, tag 1 Result's
 # Err payload.
-fn own_emit_tagged_glue(s: *EmitterState, ptr: i32, name_sv: StrView, depth: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var variants: i32 = 1
-    if len > 7 and name_eq(StrView { ptr: (name), len: (7) as i64 }, StrView { ptr: (c"Result$"), len: (7) as i64 }) == 1
-        variants = 2
+fn own_emit_tagged_glue(s: *EmitterState, ptr: i32, name: StrView, depth: i32)
+    let variants: i32 = if name.len > 7 and name.starts_with("Result$") then 2 else 1
     var v: i32 = 0
     while v < variants
-        var al: i32 = 0
-        let a: *u8 = tagged_enum_arg(s, StrView { ptr: (name), len: (len) as i64 }, v, @al)
-        if a != null and own_move_only_depth(s, StrView { ptr: (a), len: (al) as i64 }, depth + 1) == 1
-            var next: i32 = 0
-            let pp: i32 = own_case_begin(s, ptr, StrView { ptr: (name), len: (len) as i64 }, v, @next)
-            own_emit_glue(s, pp, StrView { ptr: (a), len: (al) as i64 }, depth + 1)
-            own_case_end(s, next)
+        let a: StrView = tagged_payload(s, name, v)
+        if not a.is_empty() and own_move_only_depth(s, a, depth + 1)
+            let case: OwnCase = own_case_begin(s, ptr, name, v)
+            own_emit_glue(s, case.payload, a, depth + 1)
+            own_if_close(s, case.next)
         v += 1
 
 # A user enum: its tag is the variant's index; the payload's fields sit in
 # the payload bytes as variant_payload_size_align lays them out.
-fn own_emit_enum_glue(s: *EmitterState, ptr: i32, name_sv: StrView, ei: i32, depth: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn own_emit_enum_glue(s: *EmitterState, ptr: i32, name: StrView, ei: i32, depth: i32)
     var vi: i32 = 0
     while vi < enum_variant_count(s.mono.pctx, ei)
         let fields: *StructField = enum_variant_fields(s.mono.pctx, ei, vi)
-        if own_fields_move_only(s, fields, depth + 1) == 1
-            var next: i32 = 0
-            let pp: i32 = own_case_begin(s, ptr, StrView { ptr: (name), len: (len) as i64 }, vi, @next)
+        if own_fields_move_only(s, fields, depth + 1)
+            let case: OwnCase = own_case_begin(s, ptr, name, vi)
             var offset: i64 = 0
             var f: *StructField = fields
             while f != null
@@ -948,66 +825,43 @@ fn own_emit_enum_glue(s: *EmitterState, ptr: i32, name_sv: StrView, ei: i32, dep
                 if f.field_type == TypeKind.Array
                     fsize = field_array_size_align(s, f, @falign)
                 else
-                    fsize = elem_size_align(s, f.field_type, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, @falign)
+                    fsize = elem_size_align(s, f.field_type, own_field_type(f), @falign)
                 if falign < 1
                     falign = 1
                 let rem: i64 = offset % falign
                 if rem != 0
                     offset = offset + (falign - rem)
-                if own_field_move_only(s, f, depth + 1) == 1
-                    var fp: i32 = pp
+                if own_field_move_only(s, f, depth + 1)
+                    var fp: i32 = case.payload
                     if offset > 0
                         fp = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, fp)
-                        emit_str(s, c" = getelementptr i8, ptr ")
-                        emit_reg(s, pp)
-                        emit_str(s, c", i64 ")
-                        emit_int(s, offset)
-                        emit_str(s, c"\n")
+                        format_into(s, "  %.{fp} = getelementptr i8, ptr %.{case.payload}, i64 {offset}\n")
                     own_emit_field_glue(s, fp, f, depth + 1)
                 offset = offset + fsize
                 f = f.next
-            own_case_end(s, next)
+            own_if_close(s, case.next)
         vi += 1
+
+# The binding's drop flag, loaded.
+fn own_load_flag(s: *EmitterState, b: *OwnBinding) -> i32
+    let f: i32 = next_reg(s)
+    format_into(s, "  %.{f} = load i1, ptr %.{b.flag}\n")
+    f
 
 # `if flag { flag = 0; glue(slot) }`, as basic blocks of the current fn.
 fn own_emit_drop(s: *EmitterState, b: *OwnBinding)
     let saved: i32 = last_expr_here(s)
-    let f: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, f)
-    emit_str(s, c" = load i1, ptr ")
-    emit_reg(s, b.flag)
-    emit_str(s, c"\n")
-    let do_label: i32 = next_label(s)
-    let next: i32 = next_label(s)
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, f)
-    emit_str(s, c", label %")
-    emit_label(s, do_label)
-    emit_str(s, c", label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, do_label)
-    emit_str(s, c"  store i1 0, ptr ")
-    emit_reg(s, b.flag)
-    emit_str(s, c"\n")
+    let next: i32 = own_if_open(s, own_load_flag(s, b))
+    format_into(s, "  store i1 0, ptr %.{b.flag}\n")
     own_emit_binding_glue(s, b, b.slot, own_load_mask(s, b))
-    emit_str(s, c"  br label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, next)
+    own_if_close(s, next)
     # The block's value (an `if` arm's) still dominates the new block.
     if saved != 0
         set_last_expr(s, saved)
 
-fn own_store_flag(s: *EmitterState, b: *OwnBinding, v: i32)
-    emit_str(s, c"  store i1 ")
-    emit_int(s, v as i64)
-    emit_str(s, c", ptr ")
-    emit_reg(s, b.flag)
-    emit_str(s, c"\n")
+fn own_store_flag(s: *EmitterState, b: *OwnBinding, owned: bool)
+    let bit: StrView = if owned then "1" else "0"
+    format_into(s, "  store i1 {bit}, ptr %.{b.flag}\n")
 
 # =============================================================================
 # Bindings and scopes
@@ -1026,6 +880,25 @@ fn own_next_seq(o: *OwnState) -> i32
     o.seq_next = q + 1
     q
 
+# `b` as a new nameless binding of `count` values of `ty` (0: one) at `slot`,
+# with the drop flag `flag`, owning its whole value; a named one sets its
+# name, and the paths it can move out, after.
+fn own_init_binding(o: *OwnState, b: *OwnBinding, slot: i32, flag: i32, ty: StrView, count: i32)
+    b.name = null
+    b.name_len = 0
+    b.local_idx = 0 - 1
+    b.slot = slot
+    b.flag = flag
+    b.type_name = ty.ptr
+    b.type_name_len = ty.len as i32
+    b.moved = 0
+    b.count = count
+    b.paths = null
+    b.path_count = 0
+    b.fmask = 0
+    b.aux = 0
+    b.seq = own_next_seq(o)
+
 pub fn own_push_scope(s: *EmitterState)
     let o: *OwnState = s.own
     if o.scope_count >= o.scope_cap
@@ -1042,11 +915,13 @@ pub fn own_push_scope(s: *EmitterState)
     dstarts[o.scope_count] = o.defer_count
     o.scope_count = o.scope_count + 1
 
-fn own_scope_is_dead(o: *OwnState) -> i32
+# True once a `return` (or a loop's `break` / `continue`) ended the innermost
+# block: what follows in it is unreachable.
+fn own_scope_is_dead(o: *OwnState) -> bool
     if o.scope_count <= 0
-        return 0
+        return false
     let deads: *i32 = o.scope_dead
-    deads[o.scope_count - 1]
+    deads[o.scope_count - 1] != 0
 
 fn own_mark_dead(o: *OwnState)
     if o.scope_count <= 0
@@ -1063,23 +938,20 @@ fn own_drop_from(s: *EmitterState, from: i32)
         i -= 1
 
 # Close the innermost block: drop what it declared (unless the block ended
-# in a `return`, after which nothing is reachable) and forget it.  Returns 1
-# when the block returned (for the `if` merge in the move check).
-pub fn own_pop_scope(s: *EmitterState) -> i32
+# in a `return`, after which nothing is reachable) and forget it.
+pub fn own_pop_scope(s: *EmitterState)
     let o: *OwnState = s.own
     if o.scope_count <= 0
-        return 0
+        return
     let starts: *i32 = o.scope_start
     let start: i32 = starts[o.scope_count - 1]
     let dstarts: *i32 = o.scope_dstart
     let dstart: i32 = dstarts[o.scope_count - 1]
-    let dead: i32 = own_scope_is_dead(o)
-    if dead == 0
+    if not own_scope_is_dead(o)
         own_unwind(s, start, dstart)   # drops and deferred statements (#1625)
     o.defer_count = dstart
     o.live_count = start
     o.scope_count = o.scope_count - 1
-    dead
 
 # Enter / leave a loop body.  `break` and `continue` drop live[loop_base..].
 pub fn own_loop_enter(s: *EmitterState) -> i32
@@ -1109,14 +981,12 @@ pub fn own_loop_exit(s: *EmitterState, old: i32)
     o.loop_depth = o.loop_depth - 1
     o.loop_base = old
 
-# Before a `break` (is_continue 0) / `continue` (1) branches out of the
-# loop body: drop the body's bindings and pending temporaries, running its
-# deferred statements, innermost first (AGAST #2158, #4387).
-pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
+# Before a `break` / `continue` branches out of the loop body: drop the
+# body's bindings and pending temporaries, running its deferred statements,
+# innermost first (AGAST #2158, #4387).  Both leave the body alike.
+pub fn own_loop_jump(s: *EmitterState)
     let o: *OwnState = s.own
-    if o.loop_base < 0
-        return
-    if own_scope_is_dead(o) == 1
+    if o.loop_base < 0 or own_scope_is_dead(o)
         return
     # AGAST #1625: the body's deferred statements run first.
     let ld: *i32 = o.loop_dstart
@@ -1138,53 +1008,41 @@ pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
 # marked it a temporary, spill it with a set drop flag and queue its drop.
 pub fn own_note_temp(s: *EmitterState, e: *Expr, reg: i32)
     let o: *OwnState = s.own
-    if reg == 0 or own_take_temp_mark(o, e) == 0
+    if reg == 0 or not own_take_temp_mark(o, e)
         return
-    var len: i32 = 0
-    var count: i32 = 0
-    let name: *u8 = own_temp_type(s, e, @len, @count)
-    if name == null
+    let t: StructElems = own_temp_type(s, e)
+    if t.name.is_empty()
         return
-    if count > 0
-        own_note_array_call_temp(s, e, reg, StrView { ptr: (name), len: (len) as i64 }, count)
+    if t.count > 0
+        own_note_array_call_temp(s, e, reg, t)
         return
     let slot: i32 = entry_alloca_begin(s)
-    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c"  ; temporary\n")
+    emit_llvm_type_struct(s, TypeKind.Struct, t.name)
+    format_into(s, "  ; temporary\n")
     entry_alloca_end(s)
-    emit_str(s, c"  store ")
-    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c" ")
-    emit_reg(s, reg)
-    emit_str(s, c", ptr ")
-    emit_reg(s, slot)
-    emit_str(s, c"\n")
-    own_push_temp(s, slot, StrView { ptr: (name), len: (len) as i64 }, 0)
+    format_into(s, "  store ")
+    emit_llvm_type_struct(s, TypeKind.Struct, t.name)
+    format_into(s, " %.{reg}, ptr %.{slot}\n")
+    own_push_temp(s, slot, t)
     o.temp_last_reg = reg
     o.temp_last_slot = slot
 
 # AGAST #3258: own_note_temp of a `-> [N]T` call's result `reg`, T needing a
 # drop: a `[N x T]` value spilled to a slot, or the sret slot `reg` already is
 # (#3181), queued to drop per element as a `[N]T` binding is.
-fn own_note_array_call_temp(s: *EmitterState, e: *Expr, reg: i32, name_sv: StrView, count: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn own_note_array_call_temp(s: *EmitterState, e: *Expr, reg: i32, t: StructElems)
     let o: *OwnState = s.own
     let ra: *Param = call_ret_array(s, e)
     var slot: i32 = reg
     if array_param_uses_byval(s, ra) == 0
         slot = entry_alloca_begin(s)
         emit_array_value_llvm_type(s, ra)
-        emit_str(s, c"  ; temporary\n")
+        format_into(s, "  ; temporary\n")
         entry_alloca_end(s)
-        emit_str(s, c"  store ")
+        format_into(s, "  store ")
         emit_array_value_llvm_type(s, ra)
-        emit_str(s, c" ")
-        emit_reg(s, reg)
-        emit_str(s, c", ptr ")
-        emit_reg(s, slot)
-        emit_str(s, c"\n")
-    own_push_temp(s, slot, StrView { ptr: (name), len: (len) as i64 }, count)
+        format_into(s, " %.{reg}, ptr %.{slot}\n")
+    own_push_temp(s, slot, t)
     o.temp_last_reg = reg
     o.temp_last_slot = slot
 
@@ -1196,81 +1054,62 @@ pub fn own_temp_slot_of(s: *EmitterState, reg: i32) -> i32
         return 0
     o.temp_last_slot
 
-# AGAST #3258: 1 when the move check marked `e` a temporary, which emitting it
-# will spill (own_note_temp); keeps the mark.
-pub fn own_temp_marked(s: *EmitterState, e: *Expr) -> i32
+# AGAST #3258: true when the move check marked `e` a temporary, which emitting
+# it will spill (own_note_temp); keeps the mark.
+pub fn own_temp_marked(s: *EmitterState, e: *Expr) -> bool
     let o: *OwnState = s.own
     let te: **Expr = o.temp_exprs
     var i: i32 = 0
     while i < o.temp_expr_count
         if te[i] == e
-            return 1
+            return true
         i += 1
-    0
+    false
 
-# 1 when the move check marked `e` a temporary; forgets the mark.
-fn own_take_temp_mark(o: *OwnState, e: *Expr) -> i32
-    if o.temp_expr_count == 0
-        return 0
+# True when the move check marked `e` a temporary; forgets the mark.
+fn own_take_temp_mark(o: *OwnState, e: *Expr) -> bool
     let te: **Expr = o.temp_exprs
     var i: i32 = 0
     while i < o.temp_expr_count and te[i] != e
         i += 1
     if i >= o.temp_expr_count
-        return 0
+        return false
     o.temp_expr_count = o.temp_expr_count - 1
     te[i] = te[o.temp_expr_count]
-    1
+    true
 
 # AGAST #2266: after emit_expr wrote array literal `e` (`[N]T` of struct T)
 # into the alloca `slot`: if the move check marked it a temporary (nobody
 # takes it), queue the drop of its elements, as a `[N]T` binding's.
 pub fn own_note_array_temp(s: *EmitterState, e: *Expr, slot: i32)
     let o: *OwnState = s.own
-    if own_take_temp_mark(o, e) == 0
+    if not own_take_temp_mark(o, e)
         return
-    var len: i32 = 0
-    var count: i32 = 0
-    let name: *u8 = own_temp_type(s, e, @len, @count)
-    if name == null
+    let t: StructElems = own_temp_type(s, e)
+    if t.name.is_empty()
         return
-    own_push_temp(s, slot, StrView { ptr: (name), len: (len) as i64 }, count)
+    own_push_temp(s, slot, t)
 
 # Queue the drop of the temporary at `slot` (a `T`, or `[count]T` when count
 # > 0), with a set drop flag.
-fn own_push_temp(s: *EmitterState, slot: i32, name_sv: StrView, count: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn own_push_temp(s: *EmitterState, slot: i32, t: StructElems)
     let o: *OwnState = s.own
-    let flag: i32 = entry_alloca(s, c"i1", c"drop flag")
+    let flag: i32 = own_entry_alloca(s, "i1", "drop flag")
     if o.temp_count >= o.temp_cap
         let cap: i32 = o.temp_cap * 2
         o.temps = realloc(o.temps as *u8, (cap as i64) * sizeof(OwnBinding)) as *OwnBinding
         o.temp_cap = cap
     let b: *OwnBinding = own_temp_at(o, o.temp_count)
-    b.name = null
-    b.name_len = 0
-    b.local_idx = 0 - 1
-    b.slot = slot
-    b.flag = flag
-    b.type_name = name
-    b.type_name_len = len
-    b.moved = 0
-    b.count = count
-    b.paths = null
-    b.path_count = 0
-    b.fmask = 0
-    b.aux = 0
-    b.seq = own_next_seq(o)
+    own_init_binding(o, b, slot, flag, t.name, t.count)
     o.temp_count = o.temp_count + 1
-    own_store_flag(s, b, 1)
+    own_store_flag(s, b, true)
 
 # Drop temps[from..] (newest first) and forget them.
 fn own_drop_temps_from(s: *EmitterState, from: i32)
     let o: *OwnState = s.own
     if o.temp_count <= from
         return
-    if own_scope_is_dead(o) == 0
+    if not own_scope_is_dead(o)
         var i: i32 = o.temp_count - 1
         while i >= from
             own_emit_drop(s, own_temp_at(o, i))
@@ -1328,7 +1167,7 @@ pub fn own_drop_lent(s: *EmitterState, from: i32)
         while i >= o.stmt_mark and own_lent_slot_at(o, i) != slot
             i -= 1
         if i >= o.stmt_mark
-            if own_scope_is_dead(o) == 0
+            if not own_scope_is_dead(o)
                 own_emit_drop(s, own_temp_at(o, i))
             var j: i32 = i + 1
             while j < o.temp_count
@@ -1355,17 +1194,13 @@ pub fn own_cond_end(s: *EmitterState)
     let o: *OwnState = s.own
     own_drop_temps_from(s, o.stmt_mark)
 
-# AGAST #2168: 1 when a value of struct type `name` can have fields moved
+# AGAST #2168: true when a value of struct type `name` can have fields moved
 # out: it has no drop of its own and a move-only field.
-fn own_partly_movable(s: *EmitterState, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if own_has_drop_impl(s, StrView { ptr: (name), len: (len) as i64 }) == 1
-        return 0
-    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
-    if st == null
-        return 0
-    own_fields_move_only(s, st.fields, 0)
+fn own_partly_movable(s: *EmitterState, name: StrView) -> bool
+    if own_has_drop_impl(s, name)
+        return false
+    let st: *StructDef = find_struct(s, name)
+    st != null and own_fields_move_only(s, st.fields, 0)
 
 # AGAST #2242: path `i` of the binding.
 fn own_path_at(b: *OwnBinding, i: i32) -> *OwnPath
@@ -1375,17 +1210,15 @@ fn own_path_at(b: *OwnBinding, i: i32) -> *OwnPath
 # Add a path for each move-only field of the struct `name`, the parts of
 # path `parent`, to the array *pp (room for *cap, grown as it fills).
 # Returns the new path count.
-fn own_add_paths(s: *EmitterState, pp: **OwnPath, cap: *i32, count: i32, parent: i32, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
+fn own_add_paths(s: *EmitterState, pp: **OwnPath, cap: *i32, count: i32, parent: i32, name: StrView) -> i32
+    let st: *StructDef = find_struct(s, name)
     if st == null
         return count
     var n: i32 = count
     var idx: i32 = 0
     var f: *StructField = st.fields
     while f != null
-        if own_field_move_only(s, f, 0) == 1
+        if own_field_move_only(s, f, 0)
             if n >= *cap
                 let nc: i32 = *cap * 2
                 *pp = realloc(*pp as *u8, (nc as i64) * sizeof(OwnPath)) as *OwnPath
@@ -1423,18 +1256,16 @@ fn own_path_depth(paths: *OwnPath, i: i32) -> i32
 # holds inline.  A field stops the walk where it can't be partly moved
 # itself: a type with its own drop, an enum, an array.  Every path is
 # tracked (AGAST #2319); only OWN_MAX_DEPTH bounds a malformed recursive type.
-fn own_build_paths(s: *EmitterState, name_sv: StrView, out_n: *i32) -> *OwnPath
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn own_build_paths(s: *EmitterState, name: StrView, out_n: *i32) -> *OwnPath
     var cap: i32 = 32
     var paths: *OwnPath = malloc((cap as i64) * sizeof(OwnPath)) as *OwnPath
-    var n: i32 = own_add_paths(s, @paths, @cap, 0, 0 - 1, StrView { ptr: (name), len: (len) as i64 })
+    var n: i32 = own_add_paths(s, @paths, @cap, 0, 0 - 1, name)
     var i: i32 = 0
     while i < n
         let p: *OwnPath = @paths[i]
         let f: *StructField = p.fld
-        if f.field_type == TypeKind.Struct and own_path_depth(paths, i) < OWN_MAX_DEPTH and own_partly_movable(s, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }) == 1
-            n = own_add_paths(s, @paths, @cap, n, i, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
+        if f.field_type == TypeKind.Struct and own_path_depth(paths, i) < OWN_MAX_DEPTH and own_partly_movable(s, own_field_type(f))
+            n = own_add_paths(s, @paths, @cap, n, i, own_field_type(f))
         i += 1
     *out_n = n
     paths
@@ -1450,59 +1281,57 @@ fn own_child_path(b: *OwnBinding, parent: i32, idx: i32) -> i32
     0 - 1
 
 # The path for the field `name` of path `parent`, or -1.
-fn own_named_path(b: *OwnBinding, parent: i32, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn own_named_path(b: *OwnBinding, parent: i32, name: StrView) -> i32
     var i: i32 = 0
     while i < b.path_count
         let p: *OwnPath = own_path_at(b, i)
-        if p.parent == parent and name_eq(StrView { ptr: (p.fld.name), len: (p.fld.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        let fname: StrView = StrView { ptr: p.fld.name, len: p.fld.name_len as i64 }
+        if p.parent == parent and fname.eq(name)
             return i
         i += 1
     0 - 1
 
-fn own_has_parts(b: *OwnBinding, path: i32) -> i32
-    let p: *OwnPath = own_path_at(b, path)
-    if p.down != own_set_bit(path)
-        return 1
-    0
+fn own_has_parts(b: *OwnBinding, path: i32) -> bool
+    own_path_at(b, path).down != own_set_bit(path)
 
-# AGAST #3507: 1 when Sema's move check found the binding declared as `name`
-# (its declaration's name pointer) owning a move-only value in the fn being
+# AGAST #3507: true when Sema's move check found the local `loc` (by its
+# declaration's name pointer) owning a move-only value in the fn being
 # emitted (FnDef.own_binds, own_check.ritz).
-fn own_annotated(name: *u8) -> i32
+fn own_annotated(loc: *LocalVar) -> bool
     let f: *FnDef = emitter_current_fn()
-    if f == null or f.own_binds == null or name == null
-        return 0
+    if f == null or f.own_binds == null or loc.name == null
+        return false
     let ob: *OwnedBinds = f.own_binds
     let names: **u8 = ob.names
     var i: i32 = 0
     while i < ob.count
-        if names[i] == name
-            return 1
+        if names[i] == loc.name
+            return true
         i += 1
-    0
+    false
 
 # Register the local at `idx` if it is a move-only value: one Sema's move
-# check found owning one (own_annotated).  `owned` is 1 when
-# it starts out holding a value (an initialised declaration, a parameter).
-fn own_register(s: *EmitterState, idx: i32, owned: i32)
+# check found owning one (own_annotated).  `owned` when it starts out
+# holding a value (an initialised declaration, a parameter).
+fn own_register(s: *EmitterState, idx: i32, owned: bool)
     let loc: *LocalVar = local_at(s, idx)
-    var name: *u8 = lv_type_name(loc)
-    var len: i32 = lv_type_name_len(loc)
+    var name: StrView = StrView { ptr: lv_type_name(loc), len: lv_type_name_len(loc) as i64 }
     var count: i32 = 0
     if lv_var_type(loc) == TypeKind.Array
         # `[N]T` / `[N][M]..T` of move-only T (AGAST #2165).
         if lv_array_shape(loc) != null
-            if own_shape_elems(lv_array_shape(loc), @count, @name, @len) == 0
+            let leaves: StructElems = own_shape_elems(lv_array_shape(loc))
+            if leaves.name.is_empty()
                 return
+            name = leaves.name
+            count = leaves.count
         else if lv_array_elem_type(loc) == TypeKind.Struct and lv_array_size(loc) > 0
             count = lv_array_size(loc)
         else
             return
     else if lv_var_type(loc) != TypeKind.Struct
         return
-    if own_annotated(loc.name) == 0
+    if not own_annotated(loc)
         return
     let o: *OwnState = s.own
     # A redeclaration that reuses its storage is the same binding.
@@ -1516,35 +1345,27 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
             own_clear_mask(s, lb)
             return
         i += 1
-    let flag: i32 = entry_alloca(s, c"i1", c"drop flag")
+    let flag: i32 = own_entry_alloca(s, "i1", "drop flag")
     # AGAST #2168: a struct with no drop of its own can be partly moved.
     var fmask: i32 = 0
     var paths: *OwnPath = null
     var path_count: i32 = 0
-    if count == 0 and own_partly_movable(s, StrView { ptr: (name), len: (len) as i64 }) == 1
-        paths = own_build_paths(s, StrView { ptr: (name), len: (len) as i64 }, @path_count)
+    if count == 0 and own_partly_movable(s, name)
+        paths = own_build_paths(s, name, @path_count)
         # One bit per path, in whole 32-bit words (own_mask_width).
+        let bits: i32 = (path_count + 31) / 32 * 32
         fmask = entry_alloca_begin(s)
-        emit_str(s, c"i")
-        emit_int(s, ((path_count + 31) / 32 * 32) as i64)
-        emit_str(s, c"  ; moved fields\n")
+        format_into(s, "i{bits}  ; moved fields\n")
         entry_alloca_end(s)
     own_grow_live(o)
     let b: *OwnBinding = own_live_at(o, o.live_count)
+    own_init_binding(o, b, loc.reg, flag, name, count)
     b.name = loc.name
     b.name_len = loc.name_len
     b.local_idx = idx
-    b.slot = loc.reg
-    b.flag = flag
-    b.type_name = name
-    b.type_name_len = len
-    b.moved = 0
-    b.count = count
     b.paths = paths
     b.path_count = path_count
     b.fmask = fmask
-    b.aux = 0
-    b.seq = own_next_seq(o)
     o.live_count = o.live_count + 1
     own_store_flag(s, b, owned)
     own_clear_mask(s, b)
@@ -1570,22 +1391,20 @@ pub fn own_begin_fn(s: *EmitterState, params: *Param)
     var p: *Param = params
     while p != null
         if p.param_type == TypeKind.Struct or p.param_type == TypeKind.Array
-            let idx: i32 = find_local_idx(s, StrView { ptr: (p.name), len: (p.name_len) as i64 })
+            let idx: i32 = find_local_idx(s, StrView { ptr: p.name, len: p.name_len as i64 })
             if idx >= 0
-                own_register(s, idx, 1)
+                own_register(s, idx, true)
         p = p.next
 
 # After a `let` / `var`: register the binding it declared.  `before` is
 # s.local_count before the declaration (see mark_let_local).
 pub fn own_decl(s: *EmitterState, stmt: *Stmt, before: i32)
-    let idx: i32 = find_local_idx(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
+    let idx: i32 = find_local_idx(s, StrView { ptr: stmt.var_name, len: stmt.var_name_len as i64 })
     if idx < before or idx < 0
         return
-    var owned: i32 = 0
-    if stmt.var_init != null
-        owned = 1
+    let owned: bool = stmt.var_init != null
     own_register(s, idx, owned)
-    if owned == 0
+    if not owned
         own_start_unwritten(s, stmt)
 
 # `var x: T` with no initialiser, T with drop glue (§13.6, AGAST #4033,
@@ -1596,17 +1415,17 @@ pub fn own_decl(s: *EmitterState, stmt: *Stmt, before: i32)
 # stack held.  A T with no paths leaves x owning nothing (its flag clear)
 # until it is assigned.
 fn own_start_unwritten(s: *EmitterState, stmt: *Stmt)
-    let b: *OwnBinding = own_lookup(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
+    let b: *OwnBinding = own_lookup(s, StrView { ptr: stmt.var_name, len: stmt.var_name_len as i64 })
     if b == null or b.count > 0 or b.path_count == 0
         return
     var leaves: i32 = 0
     var i: i32 = 0
     while i < b.path_count
-        if own_has_parts(b, i) == 0
+        if not own_has_parts(b, i)
             leaves = own_set_or(leaves, own_set_bit(i))
         i += 1
-    own_store_flag(s, b, 1)
-    own_emit_mask_bits(s, b, leaves, 1)
+    own_store_flag(s, b, true)
+    own_emit_mask_bits(s, b, leaves, true)
 
 # `@x as *U` that own_check marked (Expr.own_raw, its oc_raw_written): raw
 # code writes x's unwritten parts from here, so x owns them: its flag is set
@@ -1614,46 +1433,42 @@ fn own_start_unwritten(s: *EmitterState, stmt: *Stmt)
 pub fn own_raw_written(s: *EmitterState, e: *Expr)
     if e.own_raw == 0 or e.left == null or e.left.operand == null
         return
-    let x: *Expr = e.left.operand
-    let b: *OwnBinding = own_lookup(s, StrView { ptr: (x.ident_ptr), len: (x.ident_len) as i64 })
+    let b: *OwnBinding = own_lookup(s, own_ident(e.left.operand))
     if b == null
         return
-    own_store_flag(s, b, 1)
-    own_emit_mask_bits(s, b, e.own_raw_bits, 0)
+    own_store_flag(s, b, true)
+    own_emit_mask_bits(s, b, e.own_raw_bits, false)
 
 # After a `let (a, b, ..) = v` (emit_tuple_decl): each name owns the element
 # it was bound to, and drops it at scope end unless moved (AGAST #3033).  The
 # source was moved into the destructure by own_stmt_moves.
 pub fn own_tuple_decl(s: *EmitterState, stmt: *Stmt, before: i32)
-    own_tuple_name(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 }, before)
-    own_tuple_name(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, before)
+    own_tuple_name(s, StrView { ptr: stmt.var_name, len: stmt.var_name_len as i64 }, before)
+    own_tuple_name(s, StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }, before)
     var tn: *TupleName = stmt.tuple_more
     while tn != null
-        own_tuple_name(s, StrView { ptr: (tn.name), len: (tn.len) as i64 }, before)
+        own_tuple_name(s, StrView { ptr: tn.name, len: tn.len as i64 }, before)
         tn = tn.next
 
-fn own_tuple_name(s: *EmitterState, name_sv: StrView, before: i32)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let idx: i32 = find_local_idx(s, StrView { ptr: (name), len: (len) as i64 })
+fn own_tuple_name(s: *EmitterState, name: StrView, before: i32)
+    let idx: i32 = find_local_idx(s, name)
     if idx < before or idx < 0
         return
-    own_register(s, idx, 1)
+    own_register(s, idx, true)
 
 # The registered binding `name` currently resolves to, or null.
-fn own_lookup(s: *EmitterState, name_sv: StrView) -> *OwnBinding
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn own_lookup(s: *EmitterState, name: StrView) -> *OwnBinding
     let o: *OwnState = s.own
     if o.live_count == 0
         return null
-    let idx: i32 = find_local_idx(s, StrView { ptr: (name), len: (len) as i64 })
+    let idx: i32 = find_local_idx(s, name)
     if idx < 0
         return null
     var i: i32 = o.live_count - 1
     while i >= 0
         let b: *OwnBinding = own_live_at(o, i)
-        if b.local_idx == idx and name_eq(StrView { ptr: (b.name), len: (b.name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        let bname: StrView = StrView { ptr: b.name, len: b.name_len as i64 }
+        if b.local_idx == idx and bname.eq(name)
             return b
         i -= 1
     null
@@ -1663,10 +1478,8 @@ fn own_lookup(s: *EmitterState, name_sv: StrView) -> *OwnBinding
 # =============================================================================
 
 # Field `idx` of the struct `name`, or null.
-fn own_struct_field(s: *EmitterState, name_sv: StrView, idx: i32) -> *StructField
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
+fn own_struct_field(s: *EmitterState, name: StrView, idx: i32) -> *StructField
+    let st: *StructDef = find_struct(s, name)
     if st == null
         return null
     var f: *StructField = st.fields
@@ -1677,221 +1490,193 @@ fn own_struct_field(s: *EmitterState, name_sv: StrView, idx: i32) -> *StructFiel
     f
 
 # AGAST #2242: the paths a use of `path` overlaps: it and its parents, and
-# with `exact` 0 no more, as that names a field of `path` no path covers, so
-# what moved out of `path` is its sibling.  With `exact` 1 its parts too.
-fn own_overlap(b: *OwnBinding, path: i32, exact: i32) -> i32
+# not `exact`, no more, as that names a field of `path` no path covers, so
+# what moved out of `path` is its sibling.  When `exact`, its parts too.
+fn own_overlap(b: *OwnBinding, path: i32, exact: bool) -> i32
     if path < 0
         return 0
     let p: *OwnPath = own_path_at(b, path)
-    if exact == 1
+    if exact
         return own_set_or(p.up, p.down)
     p.up
 
-# The leftmost operand of a member path `x.f.g` (x).
-fn own_member_root(e: *Expr) -> *Expr
-    var r: *Expr = e
-    while r.kind == ExprKind.Member and r.left != null
-        r = r.left
-    r
+# A member path `x.f1...fn` rooted at a registered single-value binding x.
+struct OwnMember
+    fld: *StructField    # fn, or null when `e` is no such path
+    b: *OwnBinding       # x
+    drop: StrView        # the first struct along the path with its own drop, or no_name()
 
-# A member path `x.f1...fn` rooted at a registered single-value binding x:
-# fn's field, with x (*out_b) and the first struct along the path that has
-# its own drop (*out_drop, null if none); else null.
-fn own_member_path(s: *EmitterState, e: *Expr, out_b: **OwnBinding, out_drop: **u8, out_drop_len: *i32) -> *StructField
+fn no_member() -> OwnMember
+    OwnMember { fld: null, b: null, drop: no_name() }
+
+fn own_member_path(s: *EmitterState, e: *Expr) -> OwnMember
     if e.kind != ExprKind.Member or e.left == null
-        return null
+        return no_member()
     let l: *Expr = e.left
-    var tname: *u8 = null
-    var tlen: i32 = 0
+    var mp: OwnMember = no_member()
+    var tname: StrView = no_name()
     if l.kind == ExprKind.Ident
-        let b: *OwnBinding = own_lookup(s, StrView { ptr: (l.ident_ptr), len: (l.ident_len) as i64 })
+        let b: *OwnBinding = own_lookup(s, own_ident(l))
         if b == null or b.count > 0
-            return null
-        tname = b.type_name
-        tlen = b.type_name_len
-        *out_b = b
+            return no_member()
+        mp.b = b
+        tname = own_binding_type(b)
     else
-        let pf: *StructField = own_member_path(s, l, out_b, out_drop, out_drop_len)
-        if pf == null or pf.field_type != TypeKind.Struct
-            return null
-        tname = pf.field_type_name
-        tlen = pf.field_type_name_len
-    let st: *StructDef = find_struct(s, StrView { ptr: (tname), len: (tlen) as i64 })
+        mp = own_member_path(s, l)
+        if mp.fld == null or mp.fld.field_type != TypeKind.Struct
+            return no_member()
+        tname = own_field_type(mp.fld)
+    let st: *StructDef = find_struct(s, tname)
     if st == null
-        return null
-    let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return no_member()
+    let idx: i32 = find_field_index(st, own_ident(e))
     if idx < 0
-        return null
-    if l.kind == ExprKind.Ident
-        *out_drop = null
-        *out_drop_len = 0
-    if *out_drop == null and own_has_drop_impl(s, StrView { ptr: (tname), len: (tlen) as i64 }) == 1
-        *out_drop = tname
-        *out_drop_len = tlen
-    own_struct_field(s, StrView { ptr: (tname), len: (tlen) as i64 }, idx)
+        return no_member()
+    if unnamed(mp.drop) and own_has_drop_impl(s, tname)
+        mp.drop = tname
+    mp.fld = own_struct_field(s, tname, idx)
+    mp
 
-# AGAST #2242: the deepest path of `b` along the member path `e`, rooted at
-# b (-1 for b itself); *out_exact is 1 when `e` ends on it, 0 when `e` goes on
-# into a field no path covers.
-fn own_path_of(b: *OwnBinding, e: *Expr, out_exact: *i32) -> i32
+# The deepest path of a binding along a member path (own_path_of).
+struct PathHit
+    path: i32     # -1 for the binding itself
+    exact: bool   # the member path ends on it, not in a field no path covers
+
+# AGAST #2242: the deepest path of `b` along the member path `e`, rooted at b.
+fn own_path_of(b: *OwnBinding, e: *Expr) -> PathHit
     if e.kind != ExprKind.Member or e.left == null
-        *out_exact = 1
-        return 0 - 1
-    var exact: i32 = 0
-    let parent: i32 = own_path_of(b, e.left, @exact)
-    if exact == 0
-        *out_exact = 0
+        return PathHit { path: 0 - 1, exact: true }
+    let parent: PathHit = own_path_of(b, e.left)
+    if not parent.exact
         return parent
-    let path: i32 = own_named_path(b, parent, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let path: i32 = own_named_path(b, parent.path, own_ident(e))
     if path < 0
-        *out_exact = 0
-        return parent
-    *out_exact = 1
-    path
+        return PathHit { path: parent.path, exact: false }
+    PathHit { path: path, exact: true }
 
 # `call().f` with f a move-only field (ritz0's _is_move_only_field).
-fn own_temp_field_move_only(s: *EmitterState, e: *Expr) -> i32
+fn own_temp_field_move_only(s: *EmitterState, e: *Expr) -> bool
     let l: *Expr = e.left
     if l == null or l.kind != ExprKind.Call
-        return 0
-    var len: i32 = 0
-    let name: *u8 = own_call_ret_type(s, l, @len)
-    if name == null
-        return 0
-    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (len) as i64 })
+        return false
+    let name: StrView = own_call_ret_type(s, l)
+    if name.is_empty()
+        return false
+    let st: *StructDef = find_struct(s, name)
     if st == null
-        return 0
-    let idx: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        return false
+    let idx: i32 = find_field_index(st, own_ident(e))
     if idx < 0
-        return 0
-    own_field_move_only(s, own_struct_field(s, StrView { ptr: (name), len: (len) as i64 }, idx), 0)
+        return false
+    own_field_move_only(s, own_struct_field(s, name, idx), 0)
 
-# `x.f...` (AGAST #2168, #2242): a use of that path, or with `mv` 1 a move of
+# `x.f...` (AGAST #2168, #2242): a use of that path, or when `mv` a move of
 # it when the path's value is move-only.
-fn own_walk_member(s: *EmitterState, e: *Expr, mv: i32)
-    var b: *OwnBinding = null
-    var dn: *u8 = null
-    var dl: i32 = 0
-    let f: *StructField = own_member_path(s, e, @b, @dn, @dl)
-    if f == null
+fn own_walk_member(s: *EmitterState, e: *Expr, mv: bool)
+    let mp: OwnMember = own_member_path(s, e)
+    if mp.fld == null
         # Moving a move-only field out of a temporary: the rest of the
         # temporary isn't dropped either (ritz0: no partial drops).
-        var lmv: i32 = 0
-        if mv == 1 and own_temp_field_move_only(s, e) == 1
-            lmv = 1
-        own_walk(s, e.left, lmv)
+        own_walk(s, e.left, mv and own_temp_field_move_only(s, e))
         return
-    if mv == 0 or own_field_move_only(s, f, 0) == 0 or dn != null
+    if not mv or not own_field_move_only(s, mp.fld, 0) or not unnamed(mp.drop)
         return
-    var exact: i32 = 0
-    let path: i32 = own_path_of(b, e, @exact)
-    if path < 0
+    let b: *OwnBinding = mp.b
+    let hit: PathHit = own_path_of(b, e)
+    if hit.path < 0
         # Can't be tracked per path: the whole binding moves.
         b.moved = 1
-        own_store_flag(s, b, 0)
+        own_store_flag(s, b, false)
         return
-    own_emit_mask_bits(s, b, own_set_bit(path), 1)
+    own_emit_mask_bits(s, b, own_set_bit(hit.path), true)
 
-# The move-only struct type a call or method call returns by value (its length in
-# *out_len), or null.
-fn own_call_ret_type(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
+# The move-only struct type a call or method call returns by value, or
+# no_name().
+fn own_call_ret_type(s: *EmitterState, e: *Expr) -> StrView
     var f: *FnDef = null
     match e.kind
         ExprKind.Call =>
             f = find_call_fn(s, e)
         ExprKind.Method =>
             f = ref_method_def(s, e)   # AGAST #2262
-        _ => pass
+        _ => pass   # no call: no result
     if f == null or f.return_type != TypeKind.Struct or f.return_type_name_len <= 0
-        return null
-    if own_type_is_move_only(s, StrView { ptr: (f.return_type_name), len: (f.return_type_name_len) as i64 }) == 0
-        return null
-    *out_len = f.return_type_name_len
-    f.return_type_name
+        return no_name()
+    let name: StrView = StrView { ptr: f.return_type_name, len: f.return_type_name_len as i64 }
+    if not own_type_is_move_only(s, name)
+        return no_name()
+    name
 
 # AGAST #2266: the struct T an array literal `[a, b, ..]` holds, as `[N]T`:
-# returns N and writes T's name, or returns 0 (name null) when no element
-# names a struct.  The first element whose type ritz1 can name decides; a
-# string literal names none (its `%Span$u8` isn't the slot's `%StrView`).
-pub fn array_lit_struct_elem(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
-    *out_name = null
-    *out_len = 0
+# T and N, or no_elems() when no element names a struct.  The first element
+# whose type ritz1 can name decides; a string literal names none (its
+# `%Span$u8` isn't the slot's `%StrView`).
+pub fn array_lit_struct_elem(s: *EmitterState, e: *Expr) -> StructElems
     if e == null or e.kind != ExprKind.ArrayLit
-        return 0
+        return no_elems()
+    var name: StrView = no_name()
     var n: i32 = 0
     var it: *Expr = e.args
     while it != null
-        if *out_len == 0
-            elem_struct_name(s, it, out_name, out_len)
+        if name.is_empty()
+            name = elem_struct_name(s, it)
         n += 1
         it = it.next
-    if *out_len == 0
-        return 0
-    n
+    if name.is_empty()
+        return no_elems()
+    StructElems { name: name, count: n }
 
-# The struct an array element `it` names, written to out_name / out_len (left
-# as they are when it names none): a struct literal's type, or a value whose
-# type ritz1 can name.  A string literal names none.
-fn elem_struct_name(s: *EmitterState, it: *Expr, out_name: **u8, out_len: *i32)
+# The struct an array element `it` names, or no_name(): a struct literal's
+# type, or a value whose type ritz1 can name.  A string literal names none.
+fn elem_struct_name(s: *EmitterState, it: *Expr) -> StrView
     if it.kind == ExprKind.StructLit and it.ident_len > 0
-        *out_name = it.ident_ptr as *u8
-        *out_len = it.ident_len
-    else if it.kind != ExprKind.StringLit
+        return own_ident(it)
+    if it.kind != ExprKind.StringLit
         var t: RefTy
         if ref_ty_of(s, it, @t) == 1 and t.kind == TypeKind.Struct and t.name_len > 0
-            *out_name = t.name
-            *out_len = t.name_len
+            return StrView { ptr: t.name, len: t.name_len as i64 }
+    no_name()
 
-# AGAST #2976: array_lit_struct_elem for a fill `[v; N]`: returns N and writes
-# the struct v names, or returns 0 (name null) when v names none.
-pub fn array_fill_struct_elem(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
-    *out_name = null
-    *out_len = 0
+# AGAST #2976: array_lit_struct_elem for a fill `[v; N]`: the struct v names
+# and N, or no_elems() when v names none.
+pub fn array_fill_struct_elem(s: *EmitterState, e: *Expr) -> StructElems
     if e == null or e.kind != ExprKind.ArrayFill or e.left == null
-        return 0
-    elem_struct_name(s, e.left, out_name, out_len)
-    if *out_len == 0
-        return 0
-    e.int_val as i32
+        return no_elems()
+    let name: StrView = elem_struct_name(s, e.left)
+    if name.is_empty()
+        return no_elems()
+    StructElems { name: name, count: e.int_val as i32 }
 
-# AGAST #3258: the move-only struct T of a call's `-> [N]T` result: returns T's
-# name (its length in *out_len, N in *out_count), or null.
-fn own_call_ret_array_type(s: *EmitterState, e: *Expr, out_len: *i32, out_count: *i32) -> *u8
+# AGAST #3258: the move-only struct T of a call's `-> [N]T` result, and N; or
+# no_elems().
+fn own_call_ret_array_type(s: *EmitterState, e: *Expr) -> StructElems
     let ra: *Param = call_ret_array(s, e)
     if ra == null or ra.param_array_elem_type != TypeKind.Struct or ra.param_type_name_len <= 0 or ra.param_array_size <= 0
-        return null
-    if own_type_is_move_only(s, StrView { ptr: (ra.param_type_name), len: (ra.param_type_name_len) as i64 }) == 0
-        return null
-    *out_len = ra.param_type_name_len
-    *out_count = ra.param_array_size
-    ra.param_type_name
+        return no_elems()
+    let name: StrView = StrView { ptr: ra.param_type_name, len: ra.param_type_name_len as i64 }
+    if not own_type_is_move_only(s, name)
+        return no_elems()
+    StructElems { name: name, count: ra.param_array_size }
 
-# The move-only type a temporary `e` holds, or null: a call's result (count
-# 0), its `[N]T` result's elements (count N, AGAST #3258), or an array
+# The move-only type a temporary `e` holds, or no_elems(): a call's result
+# (count 0), its `[N]T` result's elements (count N, AGAST #3258), or an array
 # literal's elements (count N, AGAST #2266).
-fn own_temp_type(s: *EmitterState, e: *Expr, out_len: *i32, out_count: *i32) -> *u8
-    *out_count = 0
+fn own_temp_type(s: *EmitterState, e: *Expr) -> StructElems
     if e.kind == ExprKind.Call or e.kind == ExprKind.Method
-        let rn: *u8 = own_call_ret_array_type(s, e, out_len, out_count)
-        if rn != null
-            return rn
+        let arr: StructElems = own_call_ret_array_type(s, e)
+        if not arr.name.is_empty()
+            return arr
     if e.kind != ExprKind.ArrayLit
-        return own_call_ret_type(s, e, out_len)
-    var name: *u8 = null
-    var len: i32 = 0
-    let n: i32 = array_lit_struct_elem(s, e, @name, @len)
-    if n == 0 or own_type_is_move_only(s, StrView { ptr: (name), len: (len) as i64 }) == 0
-        return null
-    *out_len = len
-    *out_count = n
-    name
+        return StructElems { name: own_call_ret_type(s, e), count: 0 }
+    let lit: StructElems = array_lit_struct_elem(s, e)
+    if lit.count == 0 or not own_type_is_move_only(s, lit.name)
+        return no_elems()
+    lit
 
 # `e`, a call or array literal whose move-only value nobody takes, yields a
 # temporary: remember it for own_note_temp / own_note_array_temp.
 fn own_mark_temp(s: *EmitterState, e: *Expr)
-    var len: i32 = 0
-    var count: i32 = 0
-    if own_temp_type(s, e, @len, @count) == null
+    if own_temp_type(s, e).name.is_empty()
         return
     let o: *OwnState = s.own
     if o.temp_expr_count >= o.temp_expr_cap
@@ -1902,14 +1687,11 @@ fn own_mark_temp(s: *EmitterState, e: *Expr)
     te[o.temp_expr_count] = e
     o.temp_expr_count = o.temp_expr_count + 1
 
-# 1 when an argument bound to `p` is passed by value (a move).  A reference
-# param borrows its argument; an unknown callee is taken as by-value.
-fn own_param_moves(p: *Param) -> i32
-    if p == null
-        return 1
-    if p.param_type == TypeKind.Ref or p.param_type == TypeKind.MutRef or p.param_type == TypeKind.Ptr or p.param_type == TypeKind.PtrPtr
-        return 0
-    1
+# True when an argument bound to `p` is passed by value (a move).  A
+# reference or pointer param reaches its argument through it, and borrows
+# it; an unknown callee is taken as by-value.
+fn own_param_moves(p: *Param) -> bool
+    p == null or own_kind_reach(p.param_type) == OwnReach.Owned
 
 fn own_walk_args(s: *EmitterState, a0: *Expr, p0: *Param)
     var a: *Expr = a0
@@ -1925,10 +1707,11 @@ fn own_recv_def(s: *EmitterState, e: *Expr) -> *FnDef
     let recv: *Expr = e.left
     if recv == null or recv.kind != ExprKind.Ident
         return null
-    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (recv.ident_ptr), len: (recv.ident_len) as i64 })
+    let loc: *LocalVar = find_local_struct_name(s, own_ident(recv))
     if loc == null or lv_type_name_len(loc) <= 0
         return null
-    return method_callee_def(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+    let ty: StrView = StrView { ptr: lv_type_name(loc), len: lv_type_name_len(loc) as i64 }
+    return method_callee_def(s, ty, own_ident(e))
 
 # The `a[i]` that the place `e` (`a[i]`, `a[i].f.g`) is, or is a field of, when
 # `a` is an array held by value: a local, a by-value param, a field of one or a
@@ -1955,57 +1738,46 @@ pub fn own_start_of(e: *Expr) -> *Expr
 
 # A scrutinee moves into its match, unless a reference holds it, or it is an
 # array's element (#2268): that's a read.
-fn own_scrutinee_mv(s: *EmitterState, e: *Expr) -> i32
-    if ref_through(s, e) == 1 or own_element_root(s, e) != null
-        return 0
-    1
+fn own_scrutinee_mv(s: *EmitterState, e: *Expr) -> bool
+    ref_through(s, e) == 0 and own_element_root(s, e) == null
 
-# `.unwrap()` of a move-only Some/Ok payload consumes the carrier, so its
-# drop flag clears (AGAST #4490).  own_check refuses a borrowed receiver;
-# a program that reaches here passed that check.  A copy payload is left
-# to the caller's rmv.
-fn own_note_unwrap(s: *EmitterState, e: *Expr, rmv: *i32)
-    if e.ident_len != 6 or e.args != null
-        return
-    if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap"), len: (6) as i64 }) == 0
-        return
+# True for `.unwrap()` of a move-only Some/Ok payload, which consumes the
+# carrier, so its drop flag clears (AGAST #4490).  own_check refuses a
+# borrowed receiver; a program that reaches here passed that check.  A copy
+# payload is left to the caller's receiver rule.
+fn own_unwrap_consumes(s: *EmitterState, e: *Expr) -> bool
+    if e.args != null or not own_ident(e).eq("unwrap")
+        return false
     if e.left == null or ref_through(s, e.left) == 1
-        return
+        return false
     var t: RefTy
     if ref_ty_of(s, e.left, @t) == 0 or ref_is_pointer(t.kind) == 1
-        return
-    var pay: *u8 = null
-    var plen: i32 = 0
-    unwrap_payload_struct_name(s, e, @pay, @plen)
-    if pay == null or plen <= 0
-        return
-    if own_type_is_move_only(s, StrView { ptr: (pay), len: (plen) as i64 }) == 0
-        return
-    *rmv = 1
+        return false
+    let pay: StrView = named_by(unwrap_payload_struct_name, s, e)
+    not pay.is_empty() and own_type_is_move_only(s, pay)
 
 # One expression's moves, in evaluation order: each clears the moved
 # binding's drop flag (or sets its moved field's bit) and marks the
-# temporaries nobody owns.  `mv` is 1 when its value is used by value.  The
+# temporaries nobody owns.  `mv` when its value is used by value.  The
 # rules (and their errors) are own_check.ritz's oc_walk, on Sema (AGAST
 # #3507); a program that reaches here passed them.  Match / if-expression
 # arms are walked as their bodies are emitted (own_arm_moves).
-pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
+pub fn own_walk(s: *EmitterState, e: *Expr, mv: bool)
     if e == null
         return
-    let k: ExprKind = e.kind
-    match k
+    match e.kind
         ExprKind.Ident =>
-            let b: *OwnBinding = own_lookup(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-            if b != null and mv == 1
+            let b: *OwnBinding = own_lookup(s, own_ident(e))
+            if b != null and mv
                 b.moved = 1
-                own_store_flag(s, b, 0)
+                own_store_flag(s, b, false)
         ExprKind.Unary =>
             if (e.op == OpKind.Addr or e.op == OpKind.AddrMut) and e.operand != null and e.operand.kind == ExprKind.Ident
                 return
-            own_walk(s, e.operand, 0)
+            own_walk(s, e.operand, false)
         ExprKind.Binary | ExprKind.Index | ExprKind.Range =>
-            own_walk(s, e.left, 0)
-            own_walk(s, e.right, 0)
+            own_walk(s, e.left, false)
+            own_walk(s, e.right, false)
         ExprKind.Member =>
             own_walk_member(s, e, mv)
         ExprKind.Cast =>
@@ -2014,10 +1786,11 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
             own_walk(s, e.left, mv)
         ExprKind.Try =>
             # `e?` consumes `e` either way (AGAST #2159), as own_check says.
-            own_walk(s, e.left, 1)
+            own_walk(s, e.left, true)
         ExprKind.Call =>
             # sizeof's operand is never evaluated (ritz0 #2124).
-            if e.func_name_len == 6 and name_eq(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, StrView { ptr: (c"sizeof"), len: (6) as i64 }) == 1
+            let callee: StrView = StrView { ptr: e.func_name, len: e.func_name_len as i64 }
+            if callee.eq("sizeof")
                 return
             var p: *Param = null
             let f: *FnDef = find_call_fn(s, e)
@@ -2025,7 +1798,7 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
                 p = f.params
             own_walk_args(s, e.args, p)
             # A result nobody takes is a temporary (AGAST #2165).
-            if mv == 0 and f != null
+            if not mv and f != null
                 own_mark_temp(s, e)
         ExprKind.Method =>
             # A by-value `self` takes the receiver, as a by-value param takes its
@@ -2035,28 +1808,27 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
             # stays a move: a leak, where a by-value `self` dropped as a
             # temporary too would be dropped twice.
             let m: *FnDef = own_recv_def(s, e)
-            var rmv: i32 = 0
             let taken: *FnDef = ref_method_def(s, e)
-            if taken == null and e.left != null and (e.left.kind == ExprKind.Call or e.left.kind == ExprKind.Method)
-                rmv = 1
-            if taken != null and param_self_is_value(taken.params) == 1
-                rmv = 1
+            var rmv: bool = false
+            if taken == null
+                rmv = e.left != null and (e.left.kind == ExprKind.Call or e.left.kind == ExprKind.Method)
+            else
+                rmv = param_self_is_value(taken.params) == 1
             # `.unwrap()` of a move-only Option/Result consumes the carrier (#4490).
-            own_note_unwrap(s, e, @rmv)
+            if own_unwrap_consumes(s, e)
+                rmv = true
             own_walk(s, e.left, rmv)
             var mp: *Param = null
-            if m != null
-                mp = m.params
-                if mp != null
-                    mp = mp.next
+            if m != null and m.params != null
+                mp = m.params.next
             own_walk_args(s, e.args, mp)
             # A result nobody takes is a temporary, as a call's (AGAST #2262).
-            if mv == 0 and taken != null
+            if not mv and taken != null
                 own_mark_temp(s, e)
         ExprKind.StructLit =>
             var fi: *FieldInit = e.args as *FieldInit
             while fi != null
-                own_walk(s, fi.value, 1)
+                own_walk(s, fi.value, true)
                 fi = fi.next
         ExprKind.ArrayLit =>
             # A literal owns its elements (ritz0 #2238, AGAST #2266): each moves
@@ -2064,46 +1836,43 @@ pub fn own_walk(s: *EmitterState, e: *Expr, mv: i32)
             # is a temporary that drops them.
             var el: *Expr = e.args
             while el != null
-                own_walk(s, el, 1)
+                own_walk(s, el, true)
                 el = el.next
-            if mv == 0
+            if not mv
                 own_mark_temp(s, e)
         ExprKind.ArrayFill =>
             # `[v; N]` moves `v` into its element, as `[v]` does (AGAST #2976).
-            own_walk(s, e.left, 1)
+            own_walk(s, e.left, true)
         ExprKind.Match =>
             own_walk(s, e.left, own_scrutinee_mv(s, e.left))
         ExprKind.If =>
-            own_walk(s, e.left, 0)
-        _ => pass
+            own_walk(s, e.left, false)
+        ExprKind.Unset | ExprKind.IntLit | ExprKind.StringLit | ExprKind.NilLit | ExprKind.CharLit | ExprKind.CstringLit | ExprKind.FloatLit | ExprKind.TypeOperand | ExprKind.Await =>
+            pass
 
-# 1 when the move check should look at code at this point.
-fn own_checking(s: *EmitterState) -> i32
+# True when the move check should look at code at this point.
+fn own_checking(s: *EmitterState) -> bool
     let o: *OwnState = s.own
-    if o.live_count == 0 and own_any_drop(s) == 0
-        return 0
-    if own_scope_is_dead(o) == 1
-        return 0
-    1
+    if o.live_count == 0 and not own_any_drop(s)
+        return false
+    not own_scope_is_dead(o)
 
 # The index of field `name` in the binding's struct, or -1.
-fn own_field_idx(s: *EmitterState, b: *OwnBinding, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let st: *StructDef = find_struct(s, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 })
+fn own_field_idx(s: *EmitterState, b: *OwnBinding, name: StrView) -> i32
+    let st: *StructDef = find_struct(s, own_binding_type(b))
     if st == null
         return 0 - 1
-    find_field_index(st, StrView { ptr: (name), len: (len) as i64 })
+    find_field_index(st, name)
 
 # The binding a whole-binding assignment `x = v` writes, or null.
 fn own_assign_target(s: *EmitterState, stmt: *Stmt) -> *OwnBinding
     if stmt.kind != StmtKind.Assign
         return null
     if stmt.assign_target_len > 0
-        return own_lookup(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+        return own_lookup(s, StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 })
     let t: *Expr = stmt.if_cond as *Expr
     if t != null and t.kind == ExprKind.Ident
-        return own_lookup(s, StrView { ptr: (t.ident_ptr), len: (t.ident_len) as i64 })
+        return own_lookup(s, own_ident(t))
     null
 
 # Field stores (AGAST #2173).  `x.f = v` drops the old x.f, as `x = v`
@@ -2125,41 +1894,12 @@ fn own_assign_target(s: *EmitterState, stmt: *Stmt) -> *OwnBinding
 fn own_field_drop_cond(s: *EmitterState, b: *OwnBinding, bits: i32) -> i32
     if b.count > 0
         return 0
-    let f: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, f)
-    emit_str(s, c" = load i1, ptr ")
-    emit_reg(s, b.flag)
-    emit_str(s, c"\n")
+    let f: i32 = own_load_flag(s, b)
     if b.fmask == 0 or bits == 0
         return f
-    let m: i32 = own_load_mask(s, b)
-    let t: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, t)
-    emit_str(s, c" = and ")
-    own_emit_mask_type(s, b)
-    emit_str(s, c" ")
-    emit_reg(s, m)
-    emit_str(s, c", ")
-    own_emit_set_const(s, b, bits, 0)
-    emit_str(s, c"\n")
-    let c: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, c)
-    emit_str(s, c" = icmp eq ")
-    own_emit_mask_type(s, b)
-    emit_str(s, c" ")
-    emit_reg(s, t)
-    emit_str(s, c", 0\n")
+    let c: i32 = own_bits_clear(s, b, own_load_mask(s, b), bits)
     let r: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, r)
-    emit_str(s, c" = and i1 ")
-    emit_reg(s, f)
-    emit_str(s, c", ")
-    emit_reg(s, c)
-    emit_str(s, c"\n")
+    format_into(s, "  %.{r} = and i1 %.{f}, %.{c}\n")
     r
 
 # =============================================================================
@@ -2174,111 +1914,108 @@ fn own_field_drop_cond(s: *EmitterState, b: *OwnBinding, bits: i32) -> i32
 
 # How a place is reached: through a reference, through a raw pointer, or to a
 # binding's own storage.
-const OWN_REACH_OWNED: i32 = 0
-const OWN_REACH_REF: i32 = 1
-const OWN_REACH_RAW: i32 = 2
+pub enum OwnReach
+    Owned
+    Ref
+    Raw
+
+# How a value of kind `t` reaches what it refers to.  Every other kind is a
+# value held in place.  That arm is `_`: spelling out the scalar kinds is
+# types.ritz's alone (tests/test_ritz1_type_layout_table.py).
+fn own_kind_reach(t: TypeKind) -> OwnReach
+    match t
+        TypeKind.Ref | TypeKind.MutRef => OwnReach.Ref
+        TypeKind.Ptr | TypeKind.PtrPtr => OwnReach.Raw
+        _ => OwnReach.Owned
 
 # How the binding `loc` is reached: a `:&` / lent param, or an `@T` / `@&T`
 # local, is a reference; a `*T` is raw; anything else is owned.
-pub fn own_local_reach(loc: *LocalVar) -> i32
+pub fn own_local_reach(loc: *LocalVar) -> OwnReach
     if loc == null
-        return OWN_REACH_OWNED
+        return OwnReach.Owned
     # A `:&` param (incl. a `self:&` impl receiver) holds the caller's
     # pointer (AGAST #2286).
     if lv_is_lent(loc) == 1 or lv_holds_lent_ptr(loc) == 1
-        return OWN_REACH_REF
-    match lv_var_type(loc)
-        TypeKind.Ref | TypeKind.MutRef =>
-            return OWN_REACH_REF
-        TypeKind.Ptr | TypeKind.PtrPtr =>
-            return OWN_REACH_RAW
-        _ => pass
-    OWN_REACH_OWNED
+        return OwnReach.Ref
+    own_kind_reach(lv_var_type(loc))
 
 # How the place base `e` is reached: a borrow is a reference, a `*T` is raw,
 # anything else is owned.
-pub fn own_place_reach(s: *EmitterState, e: *Expr) -> i32
+fn own_place_reach(s: *EmitterState, e: *Expr) -> OwnReach
     if e == null
-        return OWN_REACH_OWNED
+        return OwnReach.Owned
     if e.kind == ExprKind.Ident
-        return own_local_reach(find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }))
+        return own_local_reach(find_local_struct_name(s, own_ident(e)))
     var t: RefTy
-    if ref_ty_of(s, e, @t) == 1
-        match t.kind
-            TypeKind.Ref | TypeKind.MutRef =>
-                return OWN_REACH_REF
-            TypeKind.Ptr | TypeKind.PtrPtr =>
-                return OWN_REACH_RAW
-            _ => pass
-    OWN_REACH_OWNED
+    if ref_ty_of(s, e, @t) == 0
+        return OwnReach.Owned
+    own_kind_reach(t.kind)
+
+# The place a member, an index or a deref is a step into, or null.
+fn own_place_base(place: *Expr) -> *Expr
+    if place.kind == ExprKind.Member or place.kind == ExprKind.Index
+        return place.left
+    if place.kind == ExprKind.Unary and place.op == OpKind.Deref
+        return place.operand
+    null
 
 # How the store target `target` is reached (LARB R58, §13.6): walk up its
 # place -- a member's struct, an index's array, a deref's pointer -- and the
 # first base that is a reference or pointer says how.  A root binding is
 # owned unless it is a borrow.  A step the types can't name is owned, so the
 # binding's drop flag decides, as it did before.
-pub fn own_store_reach(s: *EmitterState, target: *Expr) -> i32
+pub fn own_store_reach(s: *EmitterState, target: *Expr) -> OwnReach
     var place: *Expr = target
     while place != null
         if place.kind == ExprKind.Ident
             return own_place_reach(s, place)
-        var base: *Expr = null
-        if place.kind == ExprKind.Member or place.kind == ExprKind.Index
-            base = place.left
-        else if place.kind == ExprKind.Unary and place.op == OpKind.Deref
-            base = place.operand
-        else
-            return OWN_REACH_OWNED
+        let base: *Expr = own_place_base(place)
         if base == null
-            return OWN_REACH_OWNED
-        let r: i32 = own_place_reach(s, base)
-        if r != OWN_REACH_OWNED
+            return OwnReach.Owned
+        let r: OwnReach = own_place_reach(s, base)
+        if r != OwnReach.Owned
             return r
         place = base
-    OWN_REACH_OWNED
+    OwnReach.Owned
 
 # Drop the old field `f`'s value at `ptr` for a store through a reference:
 # its own Drop, then its move-only parts.  Nothing when it isn't move-only.
 pub fn own_drop_old_ref_field(s: *EmitterState, ptr: i32, f: *StructField)
-    if own_field_move_only(s, f, 0) == 1
+    if own_field_move_only(s, f, 0)
         own_emit_field_glue(s, ptr, f, 0)
 
 # Drop the old whole value `name` at `ptr` for a store through a reference.
-pub fn own_drop_old_ref_value(s: *EmitterState, ptr: i32, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if own_type_is_move_only(s, StrView { ptr: (name), len: (len) as i64 }) == 1
-        own_emit_glue(s, ptr, StrView { ptr: (name), len: (len) as i64 }, 0)
+pub fn own_drop_old_ref_value(s: *EmitterState, ptr: i32, name: StrView)
+    if own_type_is_move_only(s, name)
+        own_emit_glue(s, ptr, name, 0)
 
 # A store to the move-only value at `path` of `b`: the drop condition of its
-# old value into o.fa_cond, and when `path` is the value stored to, the mask
-# saying which of its parts that old value has left.
-fn own_store_cond(s: *EmitterState, b: *OwnBinding, path: i32, exact: i32)
+# old value into o.fa_cond, and when `path` is the value stored to (`exact`),
+# the mask saying which of its parts that old value has left.
+fn own_store_cond(s: *EmitterState, b: *OwnBinding, path: i32, exact: bool)
     let o: *OwnState = s.own
-    o.fa_cond = own_field_drop_cond(s, b, own_overlap(b, path, 0))
-    if exact == 1
+    o.fa_cond = own_field_drop_cond(s, b, own_overlap(b, path, false))
+    if exact
         o.fa_path = path
         o.fa_mask = own_load_mask(s, b)
 
 # `t = v` with t a member path `x.f...` rooted at the binding `b`, whose last
 # field is `f`.
-fn own_field_store_cond(s: *EmitterState, b: *OwnBinding, f: *StructField, path: i32, exact: i32)
-    if own_field_move_only(s, f, 0) == 1
+fn own_field_store_cond(s: *EmitterState, b: *OwnBinding, f: *StructField, path: i32, exact: bool)
+    if own_field_move_only(s, f, 0)
         own_store_cond(s, b, path, exact)
 
 # `x.f = v` (StmtKind.LocalFieldAssign) with x the binding `b`: as
-# own_field_store_cond; returns f's path, with *out_exact.
-fn own_local_field_path(s: *EmitterState, b: *OwnBinding, stmt: *Stmt, out_exact: *i32) -> i32
-    let path: i32 = own_named_path(b, 0 - 1, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-    *out_exact = 0
-    if path >= 0
-        *out_exact = 1
-    let idx: i32 = own_field_idx(s, b, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-    if idx >= 0
-        let f: *StructField = own_struct_field(s, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 }, idx)
-        if f != null
-            own_field_store_cond(s, b, f, path, *out_exact)
-    path
+# own_field_store_cond.
+fn own_local_field_store(s: *EmitterState, b: *OwnBinding, stmt: *Stmt)
+    let fname: StrView = StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }
+    let path: i32 = own_named_path(b, 0 - 1, fname)
+    let idx: i32 = own_field_idx(s, b, fname)
+    if idx < 0
+        return
+    let f: *StructField = own_struct_field(s, own_binding_type(b), idx)
+    if f != null
+        own_field_store_cond(s, b, f, path, path >= 0)
 
 # Element stores (LARB R39, AGAST #3377; ritz0's _drop_old_element, #3376).
 # `a[i] = v`, `g[i][j] = v`, `h.a[i] = v`, once v and the index are evaluated
@@ -2289,63 +2026,45 @@ fn own_local_field_path(s: *EmitterState, b: *OwnBinding, stmt: *Stmt, out_exact
 # (LARB R58); through a `*T` or into a global, nothing does.  Every element
 # of an owned Drop array holds a value: such an array must be initialised
 # (§3.3).
-pub fn own_drop_old_elem(s: *EmitterState, arr: *Expr, elem_ptr: i32, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if arr == null or name == null or len <= 0
+pub fn own_drop_old_elem(s: *EmitterState, arr: *Expr, elem_ptr: i32, name: StrView)
+    if arr == null or name.ptr == null or name.len <= 0
         return
-    if own_type_is_move_only(s, StrView { ptr: (name), len: (len) as i64 }) == 0
+    if not own_type_is_move_only(s, name)
         return
-    # Through a reference it always drops (LARB R58); through a `*T` never.
-    let reach: i32 = own_store_reach(s, arr)
-    if reach == OWN_REACH_REF
-        own_emit_glue(s, elem_ptr, StrView { ptr: (name), len: (len) as i64 }, 0)
-        return
-    if reach == OWN_REACH_RAW
-        return
-    var cond: i32 = 0
-    match arr.kind
-        ExprKind.Ident =>
-            let b: *OwnBinding = own_lookup(s, StrView { ptr: (arr.ident_ptr), len: (arr.ident_len) as i64 })
-            if b == null or b.count == 0
-                return
-            cond = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, cond)
-            emit_str(s, c" = load i1, ptr ")
-            emit_reg(s, b.flag)
-            emit_str(s, c"\n")
-        ExprKind.Member =>
-            var b: *OwnBinding = null
-            var dn: *u8 = null
-            var dl: i32 = 0
-            let f: *StructField = own_member_path(s, arr, @b, @dn, @dl)
-            if f == null or b == null or f.field_type != TypeKind.Array
-                return
-            var exact: i32 = 0
-            let path: i32 = own_path_of(b, arr, @exact)
-            cond = own_field_drop_cond(s, b, own_overlap(b, path, 0))
-        _ => pass
+    match own_store_reach(s, arr)
+        OwnReach.Ref =>
+            # Through a reference it always drops (LARB R58).
+            own_emit_glue(s, elem_ptr, name, 0)
+            return
+        OwnReach.Raw =>
+            return
+        OwnReach.Owned =>
+            pass
+    let cond: i32 = own_elem_drop_cond(s, arr)
     if cond == 0
         return
     let saved: i32 = last_expr_here(s)
-    let do_label: i32 = next_label(s)
-    let next: i32 = next_label(s)
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, cond)
-    emit_str(s, c", label %")
-    emit_label(s, do_label)
-    emit_str(s, c", label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, do_label)
-    own_emit_glue(s, elem_ptr, StrView { ptr: (name), len: (len) as i64 }, 0)
-    emit_str(s, c"  br label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, next)
+    let next: i32 = own_if_open(s, cond)
+    own_emit_glue(s, elem_ptr, name, 0)
+    own_if_close(s, next)
     if saved != 0
         set_last_expr(s, saved)
+
+# The i1 "a binding owns the array `arr`" for own_drop_old_elem, or 0 when
+# none does: an array local's flag, or a field path's drop condition.
+fn own_elem_drop_cond(s: *EmitterState, arr: *Expr) -> i32
+    if arr.kind == ExprKind.Ident
+        let b: *OwnBinding = own_lookup(s, own_ident(arr))
+        if b == null or b.count == 0
+            return 0
+        return own_load_flag(s, b)
+    if arr.kind != ExprKind.Member
+        return 0
+    let mp: OwnMember = own_member_path(s, arr)
+    if mp.fld == null or mp.b == null or mp.fld.field_type != TypeKind.Array
+        return 0
+    let hit: PathHit = own_path_of(mp.b, arr)
+    own_field_drop_cond(s, mp.b, own_overlap(mp.b, hit.path, false))
 
 # AGAST #4590: the statement-`if` arm's trailing StmtKind.Expr whose value
 # the `if` hands on (it has an `else` and is not discarded), or null; set by
@@ -2369,64 +2088,59 @@ pub fn own_stmt_moves(s: *EmitterState, stmt: *Stmt)
     o.fa_cond = 0
     o.fa_path = 0 - 1
     o.fa_mask = 0
-    if own_checking(s) == 0
+    if not own_checking(s)
         return
-    let k: StmtKind = stmt.kind
-    match k
+    match stmt.kind
         StmtKind.VarDecl | StmtKind.TupleDecl =>
-            own_walk(s, stmt.var_init, 1)
+            own_walk(s, stmt.var_init, true)
         StmtKind.Assign =>
             let t: *Expr = stmt.if_cond as *Expr
             # `x.f... = v` (AGAST #2168, #2242): v first, since it can move what
             # is stored to; then the old value's drop condition.
-            var pb: *OwnBinding = null
-            var pf: *StructField = null
-            if stmt.assign_target_len == 0 and t != null and t.kind == ExprKind.Member
-                var dn: *u8 = null
-                var dl: i32 = 0
-                pf = own_member_path(s, t, @pb, @dn, @dl)
-            if pf == null and stmt.assign_target_len == 0 and t != null and t.kind != ExprKind.Ident
-                own_walk(s, t, 0)
-            own_walk(s, stmt.assign_value, 1)
-            if pf != null
-                var exact: i32 = 0
-                let path: i32 = own_path_of(pb, t, @exact)
-                own_field_store_cond(s, pb, pf, path, exact)
-        StmtKind.IndexAssign | StmtKind.LocalFieldAssign | StmtKind.LocalFieldIndexAssign =>
-            # `x[i] = v`, `x.f = v`, `x.f[i] = v`: x is used, not moved.
-            if k == StmtKind.LocalFieldAssign
-                let base: *OwnBinding = own_lookup(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
-                if base != null and base.count == 0
-                    # `x.f = v`, as the path store above.
-                    own_walk(s, stmt.assign_value, 1)
-                    var exact: i32 = 0
-                    own_local_field_path(s, base, stmt, @exact)
-                    return
-            if k != StmtKind.LocalFieldAssign
-                own_walk(s, stmt.while_cond, 0)
-            own_walk(s, stmt.assign_value, 1)
+            var mp: OwnMember = no_member()
+            if stmt.assign_target_len == 0 and t != null
+                if t.kind == ExprKind.Member
+                    mp = own_member_path(s, t)
+                if mp.fld == null and t.kind != ExprKind.Ident
+                    own_walk(s, t, false)
+            own_walk(s, stmt.assign_value, true)
+            if mp.fld != null
+                let hit: PathHit = own_path_of(mp.b, t)
+                own_field_store_cond(s, mp.b, mp.fld, hit.path, hit.exact)
+        StmtKind.LocalFieldAssign =>
+            # `x.f = v`: x is used, not moved; a single-value x drops the old
+            # x.f, as the path store above.
+            let base: *OwnBinding = own_lookup(s, StrView { ptr: stmt.var_name, len: stmt.var_name_len as i64 })
+            own_walk(s, stmt.assign_value, true)
+            if base != null and base.count == 0
+                own_local_field_store(s, base, stmt)
+        StmtKind.IndexAssign | StmtKind.LocalFieldIndexAssign =>
+            # `x[i] = v`, `x.f[i] = v`: x is used, not moved.
+            own_walk(s, stmt.while_cond, false)
+            own_walk(s, stmt.assign_value, true)
         StmtKind.MemberAssign | StmtKind.MemberIndexAssign =>
-            own_walk(s, stmt.assign_value, 1)
+            own_walk(s, stmt.assign_value, true)
         StmtKind.Return =>
-            own_walk(s, stmt.return_value, 1)
+            own_walk(s, stmt.return_value, true)
         StmtKind.Expr =>
             # AGAST #4590: a value-giving statement `if`'s arm value moves out.
-            var mv: i32 = 0
-            if stmt == OWN_IF_ARM_MOVES
-                mv = 1
-            own_walk(s, stmt.expr, mv)
+            own_walk(s, stmt.expr, stmt == OWN_IF_ARM_MOVES)
         StmtKind.Match =>
             # AGAST #2174: the scrutinee moves into the match, as in the
             # expression form (own_match_begin takes ownership).
-            own_walk(s, stmt.if_cond as *Expr, own_scrutinee_mv(s, stmt.if_cond as *Expr))
+            let scrut: *Expr = stmt.if_cond as *Expr
+            own_walk(s, scrut, own_scrutinee_mv(s, scrut))
         StmtKind.If | StmtKind.Assert =>
-            own_walk(s, stmt.if_cond, 0)
+            own_walk(s, stmt.if_cond, false)
         StmtKind.While =>
-            own_walk(s, stmt.while_cond, 0)
+            own_walk(s, stmt.while_cond, false)
         StmtKind.For =>
-            own_walk(s, stmt.for_start, 0)
-            own_walk(s, stmt.for_end, 0)
-        _ => pass
+            own_walk(s, stmt.for_start, false)
+            own_walk(s, stmt.for_end, false)
+        StmtKind.Unset | StmtKind.Break | StmtKind.Continue | StmtKind.Loop | StmtKind.Stripped | StmtKind.Defer | StmtKind.Unsafe | StmtKind.Asm =>
+            # No value of their own: a body's statements are walked as they
+            # are emitted.
+            pass
 
 # After a statement is emitted: a `return` ends its block for the check,
 # and so does a `break` / `continue` in a loop (their moves reach the loop
@@ -2435,22 +2149,19 @@ pub fn own_after_stmt(s: *EmitterState, stmt: *Stmt)
     let o: *OwnState = s.own
     if o.scope_count <= 0
         return
-    if stmt.kind == StmtKind.Return
-        own_mark_dead(o)
-    else if (stmt.kind == StmtKind.Break or stmt.kind == StmtKind.Continue) and o.loop_depth > 0
+    let jumps: bool = stmt.kind == StmtKind.Break or stmt.kind == StmtKind.Continue
+    if stmt.kind == StmtKind.Return or (jumps and o.loop_depth > 0)
         own_mark_dead(o)
 
 # A fn's tail expression is its return value: a move.
 pub fn own_tail_moves(s: *EmitterState, e: *Expr)
-    if own_checking(s) == 0
-        return
-    own_walk(s, e, 1)
+    if own_checking(s)
+        own_walk(s, e, true)
 
 # A match / if-expression arm's value expression.
 pub fn own_arm_moves(s: *EmitterState, e: *Expr)
-    if own_checking(s) == 0
-        return
-    own_walk(s, e, 1)
+    if own_checking(s)
+        own_walk(s, e, true)
 
 # =============================================================================
 # Reassignment
@@ -2460,13 +2171,11 @@ pub fn own_arm_moves(s: *EmitterState, e: *Expr)
 # array's leaves are contiguous, so a flat array of them is its layout).
 fn own_emit_binding_type(s: *EmitterState, b: *OwnBinding)
     if b.count > 0
-        emit_str(s, c"[")
-        emit_int(s, b.count as i64)
-        emit_str(s, c" x ")
-        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 })
-        emit_str(s, c"]")
+        format_into(s, "[{b.count} x ")
+        emit_llvm_type_struct(s, TypeKind.Struct, own_binding_type(b))
+        format_into(s, "]")
         return
-    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 })
+    emit_llvm_type_struct(s, TypeKind.Struct, own_binding_type(b))
 
 # Before `x = v` is emitted: copy x's old value aside with its flag (and
 # its moved-field mask), so it can be dropped once v (which may still read
@@ -2485,37 +2194,24 @@ pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: 
     let b: *OwnBinding = own_assign_target(s, stmt)
     if b == null
         return null
-    let f: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, f)
-    emit_str(s, c" = load i1, ptr ")
-    emit_reg(s, b.flag)
-    emit_str(s, c"\n")
+    let f: i32 = own_load_flag(s, b)
     let m: i32 = own_load_mask(s, b)
     let tmp: i32 = entry_alloca_begin(s)
     own_emit_binding_type(s, b)
-    emit_str(s, c"\n")
+    format_into(s, "\n")
     entry_alloca_end(s)
     let v: i32 = next_reg(s)
     if b.count > 0
         # An array of the binding's struct: not a `%T` value, so not a copy.
-        emit_str(s, c"  ")
-        emit_reg(s, v)
-        emit_str(s, c" = load ")
+        format_into(s, "  %.{v} = load ")
         own_emit_binding_type(s, b)
-        emit_str(s, c", ptr ")
-        emit_reg(s, b.slot)
-        emit_str(s, c"\n")
-        emit_str(s, c"  store ")
+        format_into(s, ", ptr %.{b.slot}\n")
+        format_into(s, "  store ")
         own_emit_binding_type(s, b)
-        emit_str(s, c" ")
-        emit_reg(s, v)
-        emit_str(s, c", ptr ")
-        emit_reg(s, tmp)
-        emit_str(s, c"\n")
+        format_into(s, " %.{v}, ptr %.{tmp}\n")
     else
-        emit_struct_load_or_defer(s, TypeKind.Struct, v, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 }, b.slot, null, 0)
-        emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 }, v, tmp)
+        emit_struct_load_or_defer(s, TypeKind.Struct, v, own_binding_type(b), b.slot, null, 0)
+        emit_struct_store_or_copy(s, TypeKind.Struct, own_binding_type(b), v, tmp)
     *out_old = tmp
     *out_flag = f
     let h: *OwnBinding = malloc(sizeof(OwnBinding)) as *OwnBinding
@@ -2526,15 +2222,11 @@ pub fn own_assign_begin(s: *EmitterState, stmt: *Stmt, out_old: *i32, out_flag: 
 
 # The field `fname` of the struct `tname` at `base`: a pointer to it (and
 # the field in *out_f), or 0.
-fn own_field_ptr(s: *EmitterState, base: i32, tname_sv: StrView, fname_sv: StrView, out_f: **StructField) -> i32
-    var tname: *u8 = tname_sv.ptr
-    var tlen: i32 = tname_sv.len as i32
-    var fname: *u8 = fname_sv.ptr
-    var flen: i32 = fname_sv.len as i32
-    let st: *StructDef = find_struct(s, StrView { ptr: (tname), len: (tlen) as i64 })
+fn own_field_ptr(s: *EmitterState, base: i32, tname: StrView, fname: StrView, out_f: **StructField) -> i32
+    let st: *StructDef = find_struct(s, tname)
     if st == null
         return 0
-    let idx: i32 = find_field_index(st, StrView { ptr: (fname), len: (flen) as i64 })
+    let idx: i32 = find_field_index(st, fname)
     if idx < 0
         return 0
     let f: *StructField = get_field_type(st, idx)
@@ -2549,16 +2241,16 @@ fn own_place_ptr(s: *EmitterState, e: *Expr, out_f: **StructField, out_b: **OwnB
         return 0
     let l: *Expr = e.left
     if l.kind == ExprKind.Ident
-        let b: *OwnBinding = own_lookup(s, StrView { ptr: (l.ident_ptr), len: (l.ident_len) as i64 })
+        let b: *OwnBinding = own_lookup(s, own_ident(l))
         if b == null or b.count > 0
             return 0
         *out_b = b
-        return own_field_ptr(s, b.slot, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, out_f)
+        return own_field_ptr(s, b.slot, own_binding_type(b), own_ident(e), out_f)
     var pf: *StructField = null
     let base: i32 = own_place_ptr(s, l, @pf, out_b)
     if base == 0 or pf.field_type != TypeKind.Struct
         return 0
-    own_field_ptr(s, base, StrView { ptr: (pf.field_type_name), len: (pf.field_type_name_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, out_f)
+    own_field_ptr(s, base, own_field_type(pf), own_ident(e), out_f)
 
 # AGAST #2173: before the field store `x.f... = v` (own_stmt_moves found
 # x owns its old value on the i1 `cond`): copy the old value aside.  The
@@ -2569,37 +2261,31 @@ fn own_field_store_begin(s: *EmitterState, stmt: *Stmt, cond: i32, out_old: *i32
     var ptr: i32 = 0
     match stmt.kind
         StmtKind.LocalFieldAssign =>
-            b = own_lookup(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
+            b = own_lookup(s, StrView { ptr: stmt.var_name, len: stmt.var_name_len as i64 })
             if b == null or b.count > 0
                 return null
-            ptr = own_field_ptr(s, b.slot, StrView { ptr: (b.type_name), len: (b.type_name_len) as i64 }, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }, @f)
+            let fname: StrView = StrView { ptr: stmt.assign_target, len: stmt.assign_target_len as i64 }
+            ptr = own_field_ptr(s, b.slot, own_binding_type(b), fname, @f)
         StmtKind.Assign =>
             ptr = own_place_ptr(s, stmt.if_cond as *Expr, @f, @b)
-        _ => pass
+        _ => pass   # own_stmt_moves sets fa_cond for these two only
     if ptr == 0 or f == null or b == null
         return null
     let tmp: i32 = entry_alloca_begin(s)
     emit_field_llvm_type(s, f)
-    emit_str(s, c"\n")
+    format_into(s, "\n")
     entry_alloca_end(s)
     let v: i32 = next_reg(s)
     if f.field_type != TypeKind.Struct
-        emit_str(s, c"  ")
-        emit_reg(s, v)
-        emit_str(s, c" = load ")
+        format_into(s, "  %.{v} = load ")
         emit_field_llvm_type(s, f)
-        emit_str(s, c", ptr ")
-        emit_reg(s, ptr)
-        emit_str(s, c"\n  store ")
+        format_into(s, ", ptr %.{ptr}\n")
+        format_into(s, "  store ")
         emit_field_llvm_type(s, f)
-        emit_str(s, c" ")
-        emit_reg(s, v)
-        emit_str(s, c", ptr ")
-        emit_reg(s, tmp)
-        emit_str(s, c"\n")
+        format_into(s, " %.{v}, ptr %.{tmp}\n")
     else
-        emit_struct_load_or_defer(s, TypeKind.Struct, v, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, ptr, null, 0)
-        emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 }, v, tmp)
+        emit_struct_load_or_defer(s, TypeKind.Struct, v, own_field_type(f), ptr, null, 0)
+        emit_struct_store_or_copy(s, TypeKind.Struct, own_field_type(f), v, tmp)
     *out_old = tmp
     *out_flag = cond
     let h: *OwnBinding = malloc(sizeof(OwnBinding)) as *OwnBinding
@@ -2616,27 +2302,14 @@ fn own_field_store_begin(s: *EmitterState, stmt: *Stmt, cond: i32, out_old: *i32
 # can reach this store round a loop.
 fn own_field_store_end(s: *EmitterState, h: *OwnBinding, old: i32, cond: i32)
     let saved: i32 = last_expr_here(s)
-    let do_label: i32 = next_label(s)
-    let next: i32 = next_label(s)
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, cond)
-    emit_str(s, c", label %")
-    emit_label(s, do_label)
-    emit_str(s, c", label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, do_label)
-    if h.old_path >= 0 and h.aux != 0 and own_has_parts(h, h.old_path) == 1
+    let next: i32 = own_if_open(s, cond)
+    if h.old_path >= 0 and h.aux != 0 and own_has_parts(h, h.old_path)
         own_emit_masked_glue(s, old, h, h.old_path, h.aux)
     else
         own_emit_field_glue(s, old, h.old_field, 1)
-    emit_str(s, c"  br label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, next)
+    own_if_close(s, next)
     if h.old_path >= 0
-        let p: *OwnPath = own_path_at(h, h.old_path)
-        own_emit_mask_bits(s, h, p.down, 0)
+        own_emit_mask_bits(s, h, own_path_at(h, h.old_path).down, false)
     if saved != 0
         set_last_expr(s, saved)
     free(h as *u8)
@@ -2660,24 +2333,12 @@ pub fn own_assign_end(s: *EmitterState, h: *OwnBinding, old: i32, old_flag: i32)
             break
         i -= 1
     b.moved = 0
-    own_store_flag(s, b, 1)
+    own_store_flag(s, b, true)
     own_clear_mask(s, b)
     let saved: i32 = last_expr_here(s)
-    let do_label: i32 = next_label(s)
-    let next: i32 = next_label(s)
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, old_flag)
-    emit_str(s, c", label %")
-    emit_label(s, do_label)
-    emit_str(s, c", label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, do_label)
+    let next: i32 = own_if_open(s, old_flag)
     own_emit_binding_glue(s, h, old, h.aux)
-    emit_str(s, c"  br label %")
-    emit_label(s, next)
-    emit_str(s, c"\n")
-    begin_block(s, next)
+    own_if_close(s, next)
     if saved != 0
         set_last_expr(s, saved)
     free(h as *u8)
@@ -2694,88 +2355,59 @@ pub fn own_assign_end(s: *EmitterState, h: *OwnBinding, old: i32, old_flag: i32)
 # move-only payload bindings are lent and can't move (AGAST #2178, checked
 # by own_check.ritz on Sema).
 
-# 1 when the move check just moved `e`, a match scrutinee, by value.
-fn own_scrutinee_moved(s: *EmitterState, e: *Expr) -> i32
-    if own_checking(s) == 0
-        return 0
-    let k: ExprKind = e.kind
-    match k
+# True when the move check just moved `e`, a match scrutinee, by value.
+fn own_scrutinee_moved(s: *EmitterState, e: *Expr) -> bool
+    if not own_checking(s)
+        return false
+    match e.kind
         ExprKind.Ident =>
-            let b: *OwnBinding = own_lookup(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-            if b != null and b.count == 0 and b.moved == 1
-                return 1
-            return 0
+            let b: *OwnBinding = own_lookup(s, own_ident(e))
+            b != null and b.count == 0 and b.moved == 1
         ExprKind.Call =>
-            var len: i32 = 0
-            if own_call_ret_type(s, e, @len) != null
-                return 1
-            return match_scrutinee_builds(s, e)   # AGAST #2419
+            not own_call_ret_type(s, e).is_empty() or match_scrutinee_builds(s, e) == 1   # AGAST #2419
         ExprKind.Method =>
-            return match_scrutinee_builds(s, e)
-        _ => pass
-    if k == ExprKind.Member
-        var b: *OwnBinding = null
-        var dn: *u8 = null
-        var dl: i32 = 0
-        let f: *StructField = own_member_path(s, e, @b, @dn, @dl)
-        if f != null and dn == null and own_field_move_only(s, f, 0) == 1
-            return 1
-    0
+            match_scrutinee_builds(s, e) == 1
+        ExprKind.Member =>
+            let mp: OwnMember = own_member_path(s, e)
+            mp.fld != null and unnamed(mp.drop) and own_field_move_only(s, mp.fld, 0)
+        ExprKind.Unset | ExprKind.IntLit | ExprKind.StringLit | ExprKind.NilLit | ExprKind.Binary | ExprKind.Unary | ExprKind.Cast | ExprKind.Index | ExprKind.StructLit | ExprKind.CharLit | ExprKind.Range | ExprKind.ArrayLit | ExprKind.CstringLit | ExprKind.Match | ExprKind.Try | ExprKind.FloatLit | ExprKind.ArrayFill | ExprKind.If | ExprKind.TypeOperand | ExprKind.Await =>
+            false
 
 # Before a match's arms: `slot` holds the spilled scrutinee `e` of enum
 # type `name`.  Returns the state for own_match_end.
-pub fn own_match_begin(s: *EmitterState, e: *Expr, slot: i32, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn own_match_begin(s: *EmitterState, e: *Expr, slot: i32, name: StrView) -> i32
     let o: *OwnState = s.own
     let old: i32 = o.match_scrut
     o.match_scrut = 0 - 1
-    if e == null or slot == 0 or name == null or len <= 0
+    if e == null or slot == 0 or name.ptr == null or name.len <= 0
         return old
-    if own_type_is_move_only(s, StrView { ptr: (name), len: (len) as i64 }) == 0
-        return old
-    if own_scrutinee_moved(s, e) == 0
+    if not own_type_is_move_only(s, name) or not own_scrutinee_moved(s, e)
         return old
     own_push_scope(s)
-    let flag: i32 = entry_alloca(s, c"i1", c"drop flag (match scrutinee)")
+    let flag: i32 = own_entry_alloca(s, "i1", "drop flag (match scrutinee)")
     own_grow_live(o)
     let b: *OwnBinding = own_live_at(o, o.live_count)
-    b.name = null
-    b.name_len = 0
-    b.local_idx = 0 - 1
-    b.slot = slot
-    b.flag = flag
-    b.type_name = name
-    b.type_name_len = len
-    b.moved = 0
-    b.count = 0
-    b.paths = null
-    b.path_count = 0
-    b.fmask = 0
-    b.aux = 0
-    b.seq = own_next_seq(o)
+    own_init_binding(o, b, slot, flag, name, 0)
     o.match_scrut = o.live_count
     o.live_count = o.live_count + 1
-    own_store_flag(s, b, 1)
+    own_store_flag(s, b, true)
     old
 
 # An arm bound the local `name` to a copy of the payload: when the match
 # owns its scrutinee and the payload is move-only, the binding owns it now.
 # When the match owns nothing, the binding is lent and owns nothing (AGAST
 # #2178, Rust's E0507).
-pub fn own_match_payload(s: *EmitterState, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn own_match_payload(s: *EmitterState, name: StrView)
     let o: *OwnState = s.own
     if o.match_scrut < 0
         return
-    let idx: i32 = find_local_idx(s, StrView { ptr: (name), len: (len) as i64 })
+    let idx: i32 = find_local_idx(s, name)
     if idx < 0
         return
     let n: i32 = o.live_count
-    own_register(s, idx, 1)
+    own_register(s, idx, true)
     if o.live_count > n
-        own_store_flag(s, own_live_at(o, o.match_scrut), 0)
+        own_store_flag(s, own_live_at(o, o.match_scrut), false)
 
 # After the arms have met (and the result phi is emitted): drop the
 # scrutinee where no arm took it, and restore the enclosing match's state.
@@ -2789,7 +2421,7 @@ pub fn own_match_end(s: *EmitterState, old: i32)
 # Before every `ret`: drop what is live (AGAST #3508)
 # =============================================================================
 #
-# emit_str calls own_before_ret as a `ret` starts.  Every binding and
+# The IR sink calls own_before_ret as a `ret` starts.  Every binding and
 # temporary still live there drops, newest first by OwnBinding.seq; a
 # binding whose block already ended was dropped there (or moved), and one
 # declared later isn't reached, so neither is in `live`.  These are the
@@ -2806,29 +2438,13 @@ fn own_emit_ret_drop(s: *EmitterState, b: *OwnBinding)
     let o: *OwnState = s.own
     let seq: i32 = o.ret_seq
     o.ret_seq = o.ret_seq + 1
-    let f: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, f)
-    emit_str(s, c" = load i1, ptr ")
-    emit_reg(s, b.flag)
-    emit_str(s, c"\n  br i1 ")
-    emit_reg(s, f)
-    emit_str(s, c", label %own.d")
-    emit_int(s, seq as i64)
-    emit_str(s, c", label %own.n")
-    emit_int(s, seq as i64)
-    emit_str(s, c"\nown.d")
-    emit_int(s, seq as i64)
-    emit_str(s, c":\n")
-    emit_str(s, c"  store i1 0, ptr ")
-    emit_reg(s, b.flag)
-    emit_str(s, c"\n")
+    let f: i32 = own_load_flag(s, b)
+    format_into(s, "  br i1 %.{f}, label %own.d{seq}, label %own.n{seq}\n")
+    format_into(s, "own.d{seq}:\n")
+    format_into(s, "  store i1 0, ptr %.{b.flag}\n")
     own_emit_binding_glue(s, b, b.slot, own_load_mask(s, b))
-    emit_str(s, c"  br label %own.n")
-    emit_int(s, seq as i64)
-    emit_str(s, c"\nown.n")
-    emit_int(s, seq as i64)
-    emit_str(s, c":\n")
+    format_into(s, "  br label %own.n{seq}\n")
+    format_into(s, "own.n{seq}:\n")
 
 # The live bindings and temporaries, newest first.
 fn own_emit_ret_drops(s: *EmitterState)
@@ -2836,15 +2452,8 @@ fn own_emit_ret_drops(s: *EmitterState)
     var i: i32 = o.live_count - 1
     var t: i32 = o.temp_count - 1
     while i >= 0 or t >= 0
-        var take_temp: i32 = 0
-        if i < 0
-            take_temp = 1
-        else if t >= 0
-            let lb: *OwnBinding = own_live_at(o, i)
-            let tb: *OwnBinding = own_temp_at(o, t)
-            if tb.seq > lb.seq
-                take_temp = 1
-        if take_temp == 1
+        let take_temp: bool = i < 0 or (t >= 0 and own_temp_at(o, t).seq > own_live_at(o, i).seq)
+        if take_temp
             own_emit_ret_drop(s, own_temp_at(o, t))
             t -= 1
         else
@@ -2852,7 +2461,7 @@ fn own_emit_ret_drops(s: *EmitterState)
             i -= 1
 
 # The module's functions are done: forget the last fn, so the module-level
-# helper emitters can write their own `ret` (AGAST #4529).  emit_str runs
+# helper emitters can write their own `ret` (AGAST #4529).  The IR sink runs
 # own_before_ret at every `ret`, but the sret copy/zero, print/format, test
 # table and platform-hook helpers are emitted outside any fn body: without
 # this reset the previous fn's live bindings would drop inside a helper and
@@ -2884,7 +2493,7 @@ pub fn own_reset(s: *EmitterState)
 #   - falling off the end: own_pop_scope (after the arm's value);
 #   - `break` / `continue`: own_loop_jump, for the blocks inside the loop;
 #   - `return`, `?` and a fn's tail: own_before_ret, before every `ret`
-#     (emit_str spots it, once the value is computed), for every block.
+#     (the IR sink spots it, once the value is computed), for every block.
 # A `defer` that isn't reached registers nothing, since the emitter only
 # reaches it on the paths that do.  A deferred statement may move a binding:
 # its flag clears, so the drop that follows it is skipped at run time.
@@ -2935,15 +2544,9 @@ fn own_unwind(s: *EmitterState, from: i32, dfrom: i32)
     var i: i32 = o.live_count - 1
     var j: i32 = o.defer_count - 1
     while i >= from or j >= dfrom
-        var run: i32 = 0
-        if j >= dfrom
-            if i < from
-                run = 1
-            else
-                let pos: *i32 = o.defer_pos
-                if pos[j] > i
-                    run = 1
-        if run == 1
+        # Read each time: a deferred statement's own `defer` may grow it.
+        let pos: *i32 = o.defer_pos
+        if j >= dfrom and (i < from or pos[j] > i)
             own_run_defer(s, j)
             j -= 1
         else
@@ -2962,16 +2565,15 @@ fn own_unwind_loop(s: *EmitterState, from: i32, dfrom: i32, tfrom: i32)
     var t: i32 = o.temp_count - 1
     var j: i32 = o.defer_count - 1
     while i >= from or t >= tfrom or j >= dfrom
-        var run: i32 = 0
+        # Deferred statement j runs first when it was registered after both
+        # the binding and the temporary still to drop.  Read each time: a
+        # deferred statement's own `defer` may grow them.
+        var run: bool = false
         if j >= dfrom
-            run = 1
             let pos: *i32 = o.defer_pos
-            if i >= from and pos[j] <= i
-                run = 0
             let tpos: *i32 = o.defer_tpos
-            if t >= tfrom and tpos[j] <= t
-                run = 0
-        if run == 1
+            run = (i < from or pos[j] > i) and (t < tfrom or tpos[j] > t)
+        if run
             own_run_defer(s, j)
             j -= 1
             # The deferred statements may have consumed (lent) a temporary.
@@ -2984,8 +2586,8 @@ fn own_unwind_loop(s: *EmitterState, from: i32, dfrom: i32, tfrom: i32)
             own_emit_drop(s, own_live_at(o, i))
             i -= 1
 
-# Called by emit_str as a `ret` starts: every block is being left.  With a
-# `defer` registered, run them all, innermost first, with the drops they
+# Called by the IR sink as a `ret` starts: every block is being left.  With
+# a `defer` registered, run them all, innermost first, with the drops they
 # interleave with; the live temporaries (the `return` / `?` / tail
 # expression's) drop first, as ritz0 drops the statement's temp frames
 # before its defers (AGAST #2810, §13.6 then §13.7).  Otherwise drop what is
@@ -2993,11 +2595,11 @@ fn own_unwind_loop(s: *EmitterState, from: i32, dfrom: i32, tfrom: i32)
 # `ret` is unreachable from it, so the moves don't stay.
 pub fn own_before_ret(s: *EmitterState)
     let o: *OwnState = s.own
-    if o.in_ret == 1
+    if o.in_ret != 0
         return
     if o.live_count == 0 and o.temp_count == 0 and o.defer_count == 0
         return
-    if own_scope_is_dead(o) == 1
+    if own_scope_is_dead(o)
         return
     o.in_ret = 1
     if o.defer_count == 0
@@ -3013,7 +2615,7 @@ pub fn own_before_ret(s: *EmitterState)
 # A StmtKind.Defer is reached: register it with the innermost block.
 pub fn own_defer(s: *EmitterState, d: *Stmt, ret_type: TypeKind)
     let o: *OwnState = s.own
-    if own_scope_is_dead(o) == 1
+    if own_scope_is_dead(o)
         return
     own_grow_defers(o)
     let ds: **Stmt = o.defer_stmts

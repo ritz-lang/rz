@@ -444,7 +444,7 @@ fn decl_emit_init(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, var_type: TypeKind
 fn emit_nd_sub_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
     let sh: *ArrayShape = dst.shape
     let v: *Expr = stmt.assign_value
-    if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0 and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }) == 1
+    if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0 and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
         emit_nd_error_sv(s, stmt.span.line, stmt.span.col, "assigning a row of a multi-dimensional array of a move-only type is not supported in ritz1 (assign each element)")
         return
     if sh.rank - dst.depth >= 2
@@ -763,7 +763,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_ir_error_end(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
 
 # `e.f = v`: a store to a field place: 1 when lowered here.
-fn assign_to_member(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, orig_target: *Expr, orig_reach: i32) -> i32
+fn assign_to_member(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, orig_target: *Expr, orig_reach: OwnReach) -> i32
     # Check if target is a member expression (struct field assignment)
     if target_expr.kind == ExprKind.Member
         var member_result: MemberPtrResult
@@ -780,7 +780,7 @@ fn assign_to_member(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, orig_targ
             let val: i32 = emit_expr_into_field(s, stmt.assign_value, field)
             # LARB R58 (§13.6): through a reference, `p.t = v` drops the
             # field's old value after v, before the store.
-            if orig_reach == OWN_REACH_REF and orig_target.kind == ExprKind.Member
+            if orig_reach == OwnReach.Ref and orig_target.kind == ExprKind.Member
                 own_drop_old_ref_field(s, member_result.reg, field)
             # AGAST #2048: f32 / f64 fields store float / double.
             if emit_float_field_store(s, member_result.reg, field.field_type, val, stmt.assign_value) == 1
@@ -919,7 +919,7 @@ fn assign_to_deref(s: *EmitterState, stmt: *Stmt, target_expr: *Expr) -> i32
     0
 
 # The generic store: evaluate the place's address and the value, store at its type.
-fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, orig_target: *Expr, orig_reach: i32)
+fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, orig_target: *Expr, orig_reach: OwnReach)
     # Determine the store type. For `*ptr = value` we want the POINTEE
     # type of `ptr` (the destination slot's type), not the value's type.
     # Otherwise storing an i64 RHS into an i32 slot writes 4 extra bytes.
@@ -1069,7 +1069,7 @@ fn assign_to_expr_generic(s: *EmitterState, stmt: *Stmt, target_expr: *Expr, ori
     # old value after v, before the store.  Only a literal `*p` target --
     # not an index the rewrites restated as a deref -- and never through
     # a `*T`, whose pointee may be uninitialised.
-    if orig_reach == OWN_REACH_REF and orig_target.kind == ExprKind.Unary and orig_target.op == OpKind.Deref
+    if orig_reach == OwnReach.Ref and orig_target.kind == ExprKind.Unary and orig_target.op == OpKind.Deref
         if value_type == TypeKind.Struct and struct_name_len > 0
             own_drop_old_ref_value(s, ptr, StrView { ptr: (struct_name), len: (struct_name_len) as i64 })
     # Store based on value type
@@ -1131,7 +1131,7 @@ fn emit_assign_to_expr(s: *EmitterState, stmt: *Stmt)
     # the place as written; the rewrites below may restate it (e.g. an
     # index as a deref), and the reach must be read from the original.
     let orig_target: *Expr = target_expr
-    let orig_reach: i32 = own_store_reach(s, orig_target)
+    let orig_reach: OwnReach = own_store_reach(s, orig_target)
 
     # AGAST #2332: `a[i][j] = v` with `a: [N]*T` is `*(a[i] + j) = v`.  The
     # generic path below stored through the VALUE of `a[i][j]`.
@@ -2206,7 +2206,7 @@ fn emit_call_array_store(s: *EmitterState, value: *Expr, ra: *Param, dst_ptr: i3
 # (T needing a drop) is already in the slot own_note_temp queued its drop on,
 # and that slot is the one read, as a struct temporary's (own_temp_slot_of).
 pub fn emit_call_array_temp(s: *EmitterState, value: *Expr, ra: *Param) -> i32
-    if own_temp_marked(s, value) == 1
+    if own_temp_marked(s, value)
         # 0 only when the call itself failed to emit, already an error.
         return own_temp_slot_of(s, emit_expr(s, value))
     let tmp: i32 = next_reg(s)
@@ -2373,7 +2373,7 @@ fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, valu
 # nothing, when `v` is no N-D value; a move-only leaf isn't copied either
 # (the old elements would never drop, and `v`'s would drop twice).
 fn emit_nd_whole_assign(s: *EmitterState, stmt: *Stmt, sh: *ArrayShape) -> i32
-    if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0 and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }) == 1
+    if sh.leaf_type == TypeKind.Struct and sh.leaf_name_len > 0 and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
         return 0
     let v: *Expr = stmt.assign_value
     let cra: *Param = call_ret_array(s, v)
@@ -2465,7 +2465,7 @@ fn emit_nd_array_init_into(s: *EmitterState, sh: *ArrayShape, d: i32, ptr: i32, 
             idx = idx + 1
             it = it.next
         return 1
-    if count > 1 and sh.leaf_type == TypeKind.Struct and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }) == 1
+    if count > 1 and sh.leaf_type == TypeKind.Struct and own_type_is_move_only(s, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
         emit_nd_error(s, e.span.line, e.span.col, c"`[v; n]` copies `v` into every element: a move-only value fills one, `[v; 1]`")
         return 0
     let row0: i32 = emit_nd_row_gep(s, sh, d, ptr, 0)
@@ -3530,7 +3530,7 @@ fn emit_local_field_assign_stmt(s: *EmitterState, stmt: *Stmt)
                 # LARB R58 (§13.6): through a reference (`r.t = v` on a
                 # local `@&T`, `h.t = v` on a `:& T` param) the field's
                 # old value drops after v, before the store.
-                if own_local_reach(loc) == OWN_REACH_REF
+                if own_local_reach(loc) == OwnReach.Ref
                     own_drop_old_ref_field(s, field_ptr, field)
                 # Store the value based on field type.
                 #

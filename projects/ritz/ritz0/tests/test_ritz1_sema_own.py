@@ -258,7 +258,7 @@ def test_the_emitter_tracks_no_moves():
     for word in ("use of moved value", "cannot move out", "may be moved before",
                  "fmoved", "fshadow", "own_snapshot", "OWN_EV_", "own_check_"):
         assert word not in own, f"ownership.ritz still has {word!r}: the move check is own_check.ritz's"
-    assert "own_annotated(loc.name)" in own, "own_register gives a drop flag only to what Sema annotated"
+    assert "own_annotated(loc)" in own, "own_register gives a drop flag only to what Sema annotated"
     walk = (SRC / "sema_walk.ritz").read_text()
     assert "own_check_stmt(sm, st," in walk, "sema_walk runs the move check"
     ast = (SRC / "ast.ritz").read_text()
