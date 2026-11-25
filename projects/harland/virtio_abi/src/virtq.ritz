@@ -1,0 +1,289 @@
+# Harland split virtqueue (AGAST #4732, docs/RING1_DRIVER.md section 6)
+#
+# The transport-independent half of a virtio 1.x split virtqueue (virtio
+# 1.1 section 2.6): the descriptor table, the available and used rings, the
+# driver's free list of descriptors and its used-ring cursor. The in-kernel
+# blk, input and net drivers and the ring-1 virtio-net driver all compile
+# this file, so it imports nothing.
+#
+# Allocation and register access are the caller's. virtq_init lays a queue
+# over ring memory the caller allocated, zeroed and can name both ways (the
+# CPU's address and the device's); the caller tells the device where the
+# rings are (virtq_*_phys) and writes the notify register. Virtqueue keeps
+# the transport's notify cookie (transport, notify_addr) for it and never
+# reads it here.
+#
+# The avail idx and the driver's last_used_idx are free-running u16s that
+# wrap by spec (section 2.7: only idx % num picks the slot), hence `+%`.
+
+# ============================================================================
+# Descriptor flags
+# ============================================================================
+
+pub const VRING_DESC_F_NEXT: u16 = 1       # Buffer continues via next field
+pub const VRING_DESC_F_WRITE: u16 = 2      # Buffer is device-writable (vs read-only)
+pub const VRING_DESC_F_INDIRECT: u16 = 4   # Buffer contains indirect descriptor table
+
+# ============================================================================
+# Ring layout
+# ============================================================================
+
+# The most entries a virtqueue may have: VringAvail/VringUsed are sized for
+# it. A modern device may offer more (its queue_size is R/W, so the
+# transport writes the cap); a legacy device's size is fixed, so the
+# transport refuses one offering more.
+pub const VIRTQ_MAX_SIZE: u16 = 256
+
+# The used ring starts on this boundary from the descriptor table: the
+# legacy transport's only layout (one PFN for all three parts), kept on the
+# modern transport too.
+pub const VIRTQ_ALIGN: u64 = 4096
+
+pub const VRING_DESC_SIZE: u64 = 16        # sizeof(VringDesc)
+pub const VRING_USED_ELEM_SIZE: u64 = 8    # sizeof(VringUsedElem)
+
+# Virtqueue descriptor entry (16 bytes)
+pub struct VringDesc
+    addr: u64           # Device address of the buffer
+    len: u32            # Length of buffer
+    flags: u16          # VRING_DESC_F_* flags
+    next: u16           # Index of next descriptor if F_NEXT is set
+
+# Available ring header + ring entries
+pub struct VringAvail
+    flags: u16          # Suppress interrupts flag
+    idx: u16            # Next index to use
+    ring: [256]u16      # Ring of descriptor chain heads (max size)
+    # used_event: u16   # Only if VIRTIO_F_EVENT_IDX
+
+# Used ring element (8 bytes)
+pub struct VringUsedElem
+    id: u32             # Index of start of descriptor chain
+    len: u32            # Total bytes written
+
+# Used ring header + ring entries
+pub struct VringUsed
+    flags: u16          # Suppress notifications flag
+    idx: u16            # Next index device will write
+    ring: [256]VringUsedElem   # Ring of used descriptors (max size)
+    # avail_event: u16  # Only if VIRTIO_F_EVENT_IDX
+
+fn virtq_align_up(n: u64) -> u64
+    (n + VIRTQ_ALIGN - 1) & (0xFFFFFFFFFFFFFFFF ^ (VIRTQ_ALIGN - 1))
+
+# Byte offset of the available ring: it follows `num` descriptors.
+pub fn virtq_avail_offset(num: u16) -> u64
+    (num as u64) * VRING_DESC_SIZE
+
+# Byte offset of the used ring: past the avail header and `num` entries,
+# rounded up to VIRTQ_ALIGN.
+pub fn virtq_used_offset(num: u16) -> u64
+    virtq_align_up(virtq_avail_offset(num) + 4 + (num as u64) * 2)
+
+# Bytes a queue of `num` entries needs, used_event and avail_event
+# included: what the caller allocates and zeroes for virtq_init.
+pub fn virtq_ring_bytes(num: u16) -> u64
+    let avail_size: u64 = 4 + (num as u64) * 2 + 2       # flags + idx + ring + used_event
+    let used_size: u64 = 4 + (num as u64) * VRING_USED_ELEM_SIZE + 2
+    virtq_align_up(virtq_avail_offset(num) + avail_size) + used_size
+
+# ============================================================================
+# Virtqueue
+# ============================================================================
+
+pub struct Virtqueue
+    # Queue configuration
+    num: u16                # Number of descriptors
+    queue_index: u16        # Index in device's queue array
+
+    # Ring pointers (the CPU's addresses)
+    desc: *VringDesc        # Descriptor table
+    avail: *VringAvail      # Available ring
+    used: *VringUsed        # Used ring
+
+    # The device's address of the descriptor table
+    phys_addr: u64
+
+    # Free descriptor management
+    free_head: u16          # First free descriptor
+    free_count: u16         # Number of free descriptors
+
+    # Tracking for processing completions
+    last_used_idx: u16      # Last used index we processed
+
+    # The transport's: which register kind the notify write goes to and
+    # its address (an I/O port, or the CPU's address of an MMIO word).
+    # Set and read by the transport only.
+    transport: u8
+    notify_addr: u64
+
+# Lay queue `queue_index` of `num` entries (1..=VIRTQ_MAX_SIZE) over
+# virtq_ring_bytes(num) bytes of zeroed ring memory the CPU reaches at
+# `ring_virt` and the device at `ring_phys`, every descriptor on the free
+# list. The transport fields are left for the caller.
+pub fn virtq_init(vq: *Virtqueue, queue_index: u16, num: u16, ring_virt: u64, ring_phys: u64)
+    vq.num = num
+    vq.queue_index = queue_index
+    vq.phys_addr = ring_phys
+    vq.desc = ring_virt as *VringDesc
+    vq.avail = (ring_virt + virtq_avail_offset(num)) as *VringAvail
+    vq.used = (ring_virt + virtq_used_offset(num)) as *VringUsed
+    vq.last_used_idx = 0
+    vq.free_head = 0
+    vq.free_count = num
+    # Chain every descriptor: j's next is j + 1. The last one's next (num)
+    # is never followed: free_count reaches 0 first.
+    for j in 0..num
+        vq_get_desc(vq, j).next = j + 1
+
+# The device's addresses of the three parts, for the transport to program.
+pub fn virtq_desc_phys(vq: *Virtqueue) -> u64
+    vq.phys_addr
+
+pub fn virtq_avail_phys(vq: *Virtqueue) -> u64
+    vq.phys_addr + virtq_avail_offset(vq.num)
+
+pub fn virtq_used_phys(vq: *Virtqueue) -> u64
+    vq.phys_addr + virtq_used_offset(vq.num)
+
+# ============================================================================
+# Descriptor Chain Management
+# ============================================================================
+
+# Allocate a descriptor from the free list
+pub fn vq_alloc_desc(vq: *Virtqueue) -> i32
+    if (*vq).free_count == 0
+        return -1
+
+    let idx: u16 = (*vq).free_head
+    let desc: *VringDesc = ((*vq).desc as u64 + ((idx as u64) * VRING_DESC_SIZE)) as *VringDesc
+    (*vq).free_head = (*desc).next
+    (*vq).free_count = (*vq).free_count - 1
+
+    return idx as i32
+
+# Free a descriptor back to the free list
+pub fn vq_free_desc(vq: *Virtqueue, idx: u16)
+    let desc: *VringDesc = ((*vq).desc as u64 + ((idx as u64) * VRING_DESC_SIZE)) as *VringDesc
+    (*desc).next = (*vq).free_head
+    (*vq).free_head = idx
+    (*vq).free_count = (*vq).free_count + 1
+
+# Get a descriptor by index
+pub fn vq_get_desc(vq: *Virtqueue, idx: u16) -> *VringDesc
+    return ((*vq).desc as u64 + ((idx as u64) * VRING_DESC_SIZE)) as *VringDesc
+
+# ============================================================================
+# Queue Operations
+# ============================================================================
+
+# Make a descriptor chain available to the device. The caller notifies
+# the device through its transport.
+pub fn vq_submit(vq: *Virtqueue, head_idx: u16)
+    let avail: *VringAvail = (*vq).avail
+    let idx: u16 = (*avail).idx
+
+    # Add to available ring
+    let ring_entry: *u16 = ((avail as u64) + 4 + ((idx % (*vq).num) as u64) * 2) as *u16
+    *ring_entry = head_idx
+
+    # The device may read the ring entry as soon as it sees the new index,
+    # so the entry must be visible first (LANGUAGE_SPEC §18.5).
+    fence()
+
+    # Increment available index: a free-running u16 that wraps by spec
+    # (virtio 1.x §2.7; only idx % num picks the slot), hence `+%` (R63).
+    (*avail).idx = idx +% 1
+
+# Check if there are used buffers to process
+pub fn vq_has_used(vq: *Virtqueue) -> bool
+    let used: *VringUsed = (*vq).used
+    return (*used).idx != (*vq).last_used_idx
+
+# Get next used buffer (returns head index, or -1 if none)
+pub fn vq_get_used(vq: *Virtqueue) -> i32
+    let used: *VringUsed = (*vq).used
+
+    if (*used).idx == (*vq).last_used_idx
+        return -1
+
+    let ring_idx: u16 = (*vq).last_used_idx % (*vq).num
+    let elem: *VringUsedElem = ((used as u64) + 4 + ((ring_idx as u64) * VRING_USED_ELEM_SIZE)) as *VringUsedElem
+    let id: u32 = (*elem).id
+
+    # Free-running u16, wrapping like the device's used idx (`+%`, R63).
+    (*vq).last_used_idx = (*vq).last_used_idx +% 1
+
+    return id as i32
+
+# Get length of used buffer
+pub fn vq_get_used_len(vq: *Virtqueue) -> u32
+    let used: *VringUsed = (*vq).used
+    let ring_idx: u16 = ((*vq).last_used_idx -% 1) % (*vq).num
+    let elem: *VringUsedElem = ((used as u64) + 4 + ((ring_idx as u64) * VRING_USED_ELEM_SIZE)) as *VringUsedElem
+    return (*elem).len
+
+# ============================================================================
+# TX buffer ownership (AGAST #4073)
+# ============================================================================
+#
+# A TX buffer is busy from the send that posts it until the device returns
+# its descriptor through the used ring; a free descriptor is not enough.
+# Sends take buffers in rotation from `next`, so the device never reads a
+# buffer being rewritten, and reclaiming frees the descriptor and the
+# buffer together. Without the reclaim the ring runs dry after queue-size
+# sends.
+
+pub const TX_SLOTS_MAX: u32 = 256
+
+# The TX buffers of one queue: slot b is buffer b of the caller's pool.
+pub struct TxSlots
+    count: u32                      # Slots in use, 1..=TX_SLOTS_MAX
+    next: u32                       # Where the next take starts looking
+    busy: [256]bool                 # Slot b's buffer is the device's
+    desc: [256]u16                  # The descriptor slot b was posted on
+
+# `count` slots, none busy.
+pub fn tx_slots_init(s: *TxSlots, count: u32)
+    s.count = count
+    s.next = 0
+    for b in 0..count
+        s.busy[b] = false
+
+# The next slot the device isn't reading, from `next` on, or None when all
+# `count` are in flight. The slot stays free until tx_slots_post.
+pub fn tx_slots_take(s: *TxSlots) -> Option<u32>
+    for k in 0..s.count
+        let b: u32 = (s.next + k) % s.count
+        if not s.busy[b]
+            s.next = (b + 1) % s.count
+            return Some(b)
+    None
+
+# Slot `b`'s buffer went to the device on descriptor `desc`.
+pub fn tx_slots_post(s: *TxSlots, b: u32, desc: u16)
+    s.busy[b] = true
+    s.desc[b] = desc
+
+# The device returned descriptor `desc`: free the busy slot posted on it.
+# False if no busy slot names it.
+pub fn tx_slots_release(s: *TxSlots, desc: u16) -> bool
+    for b in 0..s.count
+        if s.busy[b] and s.desc[b] == desc
+            s.busy[b] = false
+            return true
+    false
+
+# Return every TX descriptor the device has finished with to the free list
+# and release its buffer. Returns how many it reclaimed. The caller orders
+# its used-ring read after the device's write (a read barrier) first.
+pub fn vq_reclaim_tx(vq: *Virtqueue, s: *TxSlots) -> u32
+    var n: u32 = 0
+    while vq_has_used(vq)
+        let desc: i32 = vq_get_used(vq)
+        if desc < 0
+            return n
+        tx_slots_release(s, desc as u16)
+        vq_free_desc(vq, desc as u16)
+        n = n + 1
+    n

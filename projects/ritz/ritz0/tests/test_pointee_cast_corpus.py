@@ -42,6 +42,8 @@ GROUPS = {
         "kernel/src/drivers/virtio/common.ritz",
         "kernel/src/drivers/virtio/input.ritz",
         "kernel/src/mm/dma.ritz",
+        # The virtqueue moved here from virtio/common.ritz (AGAST #4732).
+        "virtio_abi/src/virtq.ritz",
     ]),
     "ritz1_struct_lit": (RITZ1, ["src", ".."], "x86_64-unknown-linux-gnu", [
         "src/parser_gen.ritz",

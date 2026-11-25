@@ -1,7 +1,11 @@
 # VirtIO Common Layer
 #
-# Implements the VirtIO 1.0+ specification for device initialization and
-# virtqueue management. This is the foundation for all VirtIO device drivers.
+# The kernel's virtio PCI transport (legacy port I/O and modern MMIO):
+# device status, feature words, queue setup and notification, and config
+# space. The virtqueue itself and the feature negotiation are the
+# transport-independent virtio_abi package (AGAST #4732), which the ring-1
+# driver shares; this file allocates the rings and does the register
+# access virtio_abi leaves to its caller.
 #
 # Reference: https://docs.oasis-open.org/virtio/virtio/v1.1/virtio-v1.1.html
 
@@ -11,6 +15,10 @@ import mm.pmm { pmm_alloc_page, PAGE_SIZE }
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_map_mmio, phys_to_virt }
 import drivers.pci { PciDevice, pci_enable_bus_master, pci_enable_memory, pci_enable_io, pci_find_capability_nth, pci_dev_read_config8, pci_dev_read_config32, PCI_CAP_VENDOR }
+# The transport-independent virtqueue and feature negotiation (AGAST #4732):
+# this file is the transport, the allocation and the register access.
+import virtio_abi.virtq { Virtqueue, VIRTQ_MAX_SIZE, virtq_ring_bytes, virtq_init, virtq_desc_phys, virtq_avail_phys, virtq_used_phys }
+import virtio_abi.features { VIRTIO_F_VERSION_1, virtio_driver_features, virtio_features_lo, virtio_features_hi, virtio_features_join }
 
 # ============================================================================
 # VirtIO Device Status Bits
@@ -86,87 +94,6 @@ const VIRTIO_MMIO_QUEUE_USED_HI: u32 = 0x34        # W: Used ring addr (high)
 const VIRTIO_MMIO_DEVICE_STATUS: u32 = 0x14        # R/W: Device status (8-bit)
 const VIRTIO_MMIO_MSIX_CONFIG: u32 = 0x10          # R/W: Config change MSI-X vector
 
-# VIRTIO_F_VERSION_1 is feature bit 32: bit 0 of feature word 1.
-const VIRTIO_F_VERSION_1_HI: u32 = 1
-
-# ============================================================================
-# Virtqueue Descriptor Flags
-# ============================================================================
-
-pub const VRING_DESC_F_NEXT: u16 = 1       # Buffer continues via next field
-pub const VRING_DESC_F_WRITE: u16 = 2      # Buffer is device-writable (vs read-only)
-pub const VRING_DESC_F_INDIRECT: u16 = 4   # Buffer contains indirect descriptor table
-
-# ============================================================================
-# Virtqueue Structures
-# ============================================================================
-
-# Virtqueue descriptor entry (16 bytes)
-pub struct VringDesc
-    addr: u64           # Physical address of buffer
-    len: u32            # Length of buffer
-    flags: u16          # VRING_DESC_F_* flags
-    next: u16           # Index of next descriptor if F_NEXT is set
-
-# The most entries a virtqueue may have: VringAvail/VringUsed and the ring
-# allocation in vio_setup_queue are sized for it. A modern device may offer
-# more (queue_size is R/W there, so vio_setup_queue writes the cap); a legacy
-# device's size is fixed, so one offering more is refused.
-pub const VIRTQ_MAX_SIZE: u16 = 256
-
-# Available ring header + ring entries
-pub struct VringAvail
-    flags: u16          # Suppress interrupts flag
-    idx: u16            # Next index to use
-    ring: [256]u16      # Ring of descriptor chain heads (max size)
-    # used_event: u16   # Only if VIRTIO_F_EVENT_IDX
-
-# Used ring element (8 bytes)
-pub struct VringUsedElem
-    id: u32             # Index of start of descriptor chain
-    len: u32            # Total bytes written
-
-# Used ring header + ring entries
-pub struct VringUsed
-    flags: u16          # Suppress notifications flag
-    idx: u16            # Next index device will write
-    ring: [256]VringUsedElem   # Ring of used descriptors (max size)
-    # avail_event: u16  # Only if VIRTIO_F_EVENT_IDX
-
-# ============================================================================
-# Virtqueue Management Structure
-# ============================================================================
-
-pub struct Virtqueue
-    # Queue configuration
-    num: u16                # Number of descriptors
-    queue_index: u16        # Index in device's queue array
-
-    # Ring pointers (virtual addresses)
-    desc: *VringDesc        # Descriptor table
-    avail: *VringAvail      # Available ring
-    used: *VringUsed        # Used ring
-
-    # Physical address for device
-    phys_addr: u64          # Physical address of descriptor table
-
-    # Free descriptor management
-    free_head: u16          # First free descriptor
-    free_count: u16         # Number of free descriptors
-
-    # Tracking for processing completions
-    last_used_idx: u16      # Last used index we processed
-
-    # I/O base for this device (legacy)
-    io_base: u16
-
-    # MMIO transport info
-    transport: u8           # VIO_TRANSPORT_LEGACY or VIO_TRANSPORT_MMIO
-    _padding: u8
-    mmio_notify: u64        # Notification MMIO base
-    notify_multiplier: u32  # Notify offset multiplier
-    notify_offset: u16      # Queue-specific notify offset
-
 # ============================================================================
 # VirtIO Transport Type
 # ============================================================================
@@ -194,34 +121,8 @@ pub struct VirtioDevice
     mmio_device: u64        # Device-specific MMIO base
     notify_multiplier: u32  # Notify offset multiplier
 
-# ============================================================================
-# Size Constants
-# ============================================================================
-
-const VIRTQUEUE_SIZE: u64 = 128           # sizeof(Virtqueue)
-const VRING_DESC_SIZE: u64 = 16           # sizeof(VringDesc)
-const VRING_AVAIL_SIZE: u64 = 520         # 4 + 256*2 + padding
-const VRING_USED_ELEM_SIZE: u64 = 8       # sizeof(VringUsedElem)
-const VRING_USED_SIZE: u64 = 2060         # 4 + 256*8 + padding
+# kalloc sizes
 const VIRTIO_DEVICE_SIZE: u64 = 200       # sizeof(VirtioDevice)
-
-# ============================================================================
-# Ring Size Calculation
-# ============================================================================
-
-# Calculate total size needed for a virtqueue with given number of descriptors
-fn vring_size(num: u16) -> u64
-    # Align to page boundary for used ring
-    let desc_size: u64 = (num as u64) * VRING_DESC_SIZE
-    let avail_size: u64 = 4 + (num as u64) * 2 + 2  # flags + idx + ring + used_event
-    let used_size: u64 = 4 + (num as u64) * VRING_USED_ELEM_SIZE + 2
-
-    # Descriptor table + available ring (page aligned)
-    let first_part: u64 = desc_size + avail_size
-    let first_aligned: u64 = (first_part + PAGE_SIZE - 1) & (0xFFFFFFFFFFFFFFFF ^ (PAGE_SIZE - 1))
-
-    # Plus used ring
-    return first_aligned + used_size
 
 # ============================================================================
 # Device I/O Helpers (Legacy port I/O)
@@ -303,21 +204,30 @@ pub fn vio_get_features(dev: *VirtioDevice) -> u32
     else
         return vio_read32(dev, VIRTIO_PCI_HOST_FEATURES)
 
-# Accept `features` (feature bits 0-31). On the modern transport also accept
-# VIRTIO_F_VERSION_1 (bit 32): a modern device must be driven as virtio 1.x
-# and may refuse FEATURES_OK (or behave as legacy) without it (§6.1).
-pub fn vio_set_features(dev: *VirtioDevice, features: u32)
+# Accept the `wanted` features the device offers, as virtio_abi decides
+# (virtio_driver_features): that includes VIRTIO_F_VERSION_1 (bit 32)
+# whenever a modern device offers it, since a modern device must be driven
+# as virtio 1.x and may refuse FEATURES_OK (or behave as legacy) without it
+# (§6.1). The legacy transport has feature word 0 only.
+pub fn vio_set_features(dev: *VirtioDevice, wanted: u64)
     if (*dev).transport == VIO_TRANSPORT_MMIO
         let common: u64 = (*dev).mmio_common
+        mmio_write32(common + VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64, 0)
+        let dev_lo: u32 = mmio_read32(common + VIRTIO_MMIO_DEVICE_FEATURES as u64)
         mmio_write32(common + VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64, 1)
         let dev_hi: u32 = mmio_read32(common + VIRTIO_MMIO_DEVICE_FEATURES as u64)
+        let accepted: u64 = virtio_driver_features(virtio_features_join(dev_lo, dev_hi), wanted)
         mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64, 0)
-        mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES as u64, features)
+        mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES as u64, virtio_features_lo(accepted))
         mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64, 1)
-        mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES as u64, dev_hi & VIRTIO_F_VERSION_1_HI)
-        (*dev).version_1 = (dev_hi & VIRTIO_F_VERSION_1_HI) as u8
+        mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES as u64, virtio_features_hi(accepted))
+        if (accepted & VIRTIO_F_VERSION_1) != 0
+            (*dev).version_1 = 1
+        else
+            (*dev).version_1 = 0
     else
-        vio_write32(dev, VIRTIO_PCI_GUEST_FEATURES, features)
+        let offered: u64 = vio_read32(dev, VIRTIO_PCI_HOST_FEATURES) as u64
+        vio_write32(dev, VIRTIO_PCI_GUEST_FEATURES, virtio_features_lo(virtio_driver_features(offered, wanted)))
 
 # Complete feature negotiation (call after vio_set_features for modern transport)
 # Returns 0 on success, -1 on failure
@@ -399,24 +309,13 @@ pub fn vio_setup_queue_vec(dev: *VirtioDevice, queue_idx: u16, msix_vector: u16)
             return 0 as *Virtqueue
 
     # Allocate virtqueue structure
-    let vq: *Virtqueue = kalloc(VIRTQUEUE_SIZE) as *Virtqueue
+    let vq: *Virtqueue = kalloc(sizeof(Virtqueue) as u64) as *Virtqueue
     if vq == 0 as *Virtqueue
         klog("[virtio] Failed to allocate virtqueue\n")
         return 0 as *Virtqueue
 
-    (*vq).num = num
-    (*vq).queue_index = queue_idx
-    (*vq).io_base = (*dev).io_base
-    (*vq).free_count = num
-    (*vq).last_used_idx = 0
-    (*vq).transport = (*dev).transport
-    (*vq).mmio_notify = (*dev).mmio_notify
-    (*vq).notify_multiplier = (*dev).notify_multiplier
-    (*vq).notify_offset = 0  # Will be set below for MMIO
-
     # Calculate memory needed and allocate
-    let ring_size: u64 = vring_size(num)
-    let pages_needed: u64 = (ring_size + PAGE_SIZE - 1) / PAGE_SIZE
+    let pages_needed: u64 = (virtq_ring_bytes(num) + PAGE_SIZE - 1) / PAGE_SIZE
 
     # Allocate contiguous pages for the ring
     # PMM allocates pages in ascending order, so consecutive calls give contiguous pages
@@ -448,37 +347,20 @@ pub fn vio_setup_queue_vec(dev: *VirtioDevice, queue_idx: u16, msix_vector: u16)
         *((ring_virt + i) as *u8) = 0
         i = i + 1
 
-    (*vq).phys_addr = ring_phys
-
-    # Set up pointers to ring structures
-    (*vq).desc = ring_virt as *VringDesc
-
-    let avail_offset: u64 = (num as u64) * VRING_DESC_SIZE
-    (*vq).avail = (ring_virt + avail_offset) as *VringAvail
-
-    # Used ring starts at page-aligned offset
-    let used_offset: u64 = (avail_offset + 4 + (num as u64) * 2 + PAGE_SIZE - 1) & (0xFFFFFFFFFFFFFFFF ^ (PAGE_SIZE - 1))
-    (*vq).used = (ring_virt + used_offset) as *VringUsed
-
-    # Initialize free list - chain all descriptors
-    (*vq).free_head = 0
-    var j: u16 = 0
-    while j < num
-        let desc: *VringDesc = (ring_virt + ((j as u64) * VRING_DESC_SIZE)) as *VringDesc
-        (*desc).next = j + 1
-        j = j + 1
+    # Rings, free list and cursors (virtio_abi); the notify target is ours
+    virtq_init(vq, queue_idx, num, ring_virt, ring_phys)
+    (*vq).transport = (*dev).transport
 
     # Tell device where the queue is
     if (*dev).transport == VIO_TRANSPORT_MMIO
-        # Read queue-specific notify offset
+        # The queue's notify word: mmio_notify + notify_off * notify_multiplier
         let notify_off: u16 = mmio_read16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_NOTIFY_OFF as u64)
-        (*vq).notify_offset = notify_off
+        (*vq).notify_addr = (*dev).mmio_notify + ((notify_off as u32) * (*dev).notify_multiplier) as u64
 
         # Modern: set descriptor, avail, used addresses separately
-        let desc_phys: u64 = ring_phys
-        let avail_phys: u64 = ring_phys + (num as u64) * VRING_DESC_SIZE
-        let mmio_used_offset: u64 = ((num as u64) * VRING_DESC_SIZE + 4 + (num as u64) * 2 + PAGE_SIZE - 1) & (0xFFFFFFFFFFFFFFFF ^ (PAGE_SIZE - 1))
-        let used_phys: u64 = ring_phys + mmio_used_offset
+        let desc_phys: u64 = virtq_desc_phys(vq)
+        let avail_phys: u64 = virtq_avail_phys(vq)
+        let used_phys: u64 = virtq_used_phys(vq)
 
         mmio_write32((*dev).mmio_common + VIRTIO_MMIO_QUEUE_DESC_LO as u64, (desc_phys & 0xFFFFFFFF) as u32)
         mmio_write32((*dev).mmio_common + VIRTIO_MMIO_QUEUE_DESC_HI as u64, (desc_phys >> 32) as u32)
@@ -490,6 +372,8 @@ pub fn vio_setup_queue_vec(dev: *VirtioDevice, queue_idx: u16, msix_vector: u16)
         # Enable the queue
         mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_ENABLE as u64, 1)
     else
+        # The queue's notify port
+        (*vq).notify_addr = ((*dev).io_base + VIRTIO_PCI_QUEUE_NOTIFY) as u64
         # Legacy: set PFN (page frame number)
         let pfn: u32 = (ring_phys / PAGE_SIZE) as u32
         vio_write32(dev, VIRTIO_PCI_QUEUE_PFN, pfn)
@@ -497,91 +381,16 @@ pub fn vio_setup_queue_vec(dev: *VirtioDevice, queue_idx: u16, msix_vector: u16)
     return vq
 
 # ============================================================================
-# Descriptor Chain Management
+# Queue Notification
 # ============================================================================
 
-# Allocate a descriptor from the free list
-pub fn vq_alloc_desc(vq: *Virtqueue) -> i32
-    if (*vq).free_count == 0
-        return -1
-
-    let idx: u16 = (*vq).free_head
-    let desc: *VringDesc = ((*vq).desc as u64 + ((idx as u64) * VRING_DESC_SIZE)) as *VringDesc
-    (*vq).free_head = (*desc).next
-    (*vq).free_count = (*vq).free_count - 1
-
-    return idx as i32
-
-# Free a descriptor back to the free list
-pub fn vq_free_desc(vq: *Virtqueue, idx: u16)
-    let desc: *VringDesc = ((*vq).desc as u64 + ((idx as u64) * VRING_DESC_SIZE)) as *VringDesc
-    (*desc).next = (*vq).free_head
-    (*vq).free_head = idx
-    (*vq).free_count = (*vq).free_count + 1
-
-# Get a descriptor by index
-pub fn vq_get_desc(vq: *Virtqueue, idx: u16) -> *VringDesc
-    return ((*vq).desc as u64 + ((idx as u64) * VRING_DESC_SIZE)) as *VringDesc
-
-# ============================================================================
-# Queue Operations
-# ============================================================================
-
-# Make a descriptor chain available to the device
-pub fn vq_submit(vq: *Virtqueue, head_idx: u16)
-    let avail: *VringAvail = (*vq).avail
-    let idx: u16 = (*avail).idx
-
-    # Add to available ring
-    let ring_entry: *u16 = ((avail as u64) + 4 + ((idx % (*vq).num) as u64) * 2) as *u16
-    *ring_entry = head_idx
-
-    # The device may read the ring entry as soon as it sees the new index,
-    # so the entry must be visible first (LANGUAGE_SPEC §18.5).
-    fence()
-
-    # Increment available index: a free-running u16 that wraps by spec
-    # (virtio 1.x §2.7; only idx % num picks the slot), hence `+%` (R63).
-    (*avail).idx = idx +% 1
-
-# Notify device that there are buffers available
+# Notify device that there are buffers available on `vq` (after vq_submit):
+# write the queue index to the notify target vio_setup_queue_vec set.
 pub fn vq_notify(vq: *Virtqueue)
     if (*vq).transport == VIO_TRANSPORT_MMIO
-        # Modern: write queue index to notify address
-        # notify_addr = mmio_notify + notify_offset * notify_multiplier
-        let notify_addr: u64 = (*vq).mmio_notify + (((*vq).notify_offset as u32) * (*vq).notify_multiplier) as u64
-        mmio_write16(notify_addr, (*vq).queue_index)
+        mmio_write16((*vq).notify_addr, (*vq).queue_index)
     else
-        # Legacy: write to I/O port
-        outw((*vq).io_base + VIRTIO_PCI_QUEUE_NOTIFY, (*vq).queue_index)
-
-# Check if there are used buffers to process
-pub fn vq_has_used(vq: *Virtqueue) -> bool
-    let used: *VringUsed = (*vq).used
-    return (*used).idx != (*vq).last_used_idx
-
-# Get next used buffer (returns head index, or -1 if none)
-pub fn vq_get_used(vq: *Virtqueue) -> i32
-    let used: *VringUsed = (*vq).used
-
-    if (*used).idx == (*vq).last_used_idx
-        return -1
-
-    let ring_idx: u16 = (*vq).last_used_idx % (*vq).num
-    let elem: *VringUsedElem = ((used as u64) + 4 + ((ring_idx as u64) * VRING_USED_ELEM_SIZE)) as *VringUsedElem
-    let id: u32 = (*elem).id
-
-    # Free-running u16, wrapping like the device's used idx (`+%`, R63).
-    (*vq).last_used_idx = (*vq).last_used_idx +% 1
-
-    return id as i32
-
-# Get length of used buffer
-pub fn vq_get_used_len(vq: *Virtqueue) -> u32
-    let used: *VringUsed = (*vq).used
-    let ring_idx: u16 = ((*vq).last_used_idx -% 1) % (*vq).num
-    let elem: *VringUsedElem = ((used as u64) + 4 + ((ring_idx as u64) * VRING_USED_ELEM_SIZE)) as *VringUsedElem
-    return (*elem).len
+        outw((*vq).notify_addr as u16, (*vq).queue_index)
 
 # ============================================================================
 # Device Initialization

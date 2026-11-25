@@ -528,6 +528,11 @@ STUBS = {
 }
 REAL = ["drivers/virtio/blk.ritz", "drivers/virtio/common.ritz",
         "drivers/virtio/vmsix.ritz", "drivers/irq_wait.ritz"]
+# The virtqueue and feature negotiation the drivers call (AGAST #4732): the
+# real virtio_abi package, at virtio_abi/<module>.ritz in the tree.
+VIRTIO_ABI_SRC = KERNEL_SRC.parents[1] / "virtio_abi" / "src"
+VIRTIO_ABI = {f"virtio_abi/{name}.ritz": VIRTIO_ABI_SRC / f"{name}.ritz"
+              for name in ("virtq", "features")}
 
 # Exit code -> the claim that failed.
 CHECKS = {
@@ -555,7 +560,7 @@ CHECKS = {
 PROGRAM = """\
 import ritzlib.option
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_read, virtio_blk_write }
-import drivers.virtio.common { Virtqueue }
+import virtio_abi.virtq { Virtqueue }
 import io { fake_dev_service, fake_dev_pending, fake_dev_hold, fake_dev_writes, fake_dev_write_sector, fake_dev_write_byte }
 
 var g_buf: [512]u8
@@ -647,6 +652,8 @@ def _run(tmp_path, src, real=REAL):
     sources = dict(STUBS)
     for rel in real:
         sources[rel] = (KERNEL_SRC / rel).read_text()
+    for rel, path in VIRTIO_ABI.items():
+        sources[rel] = path.read_text()
     for rel, text in sources.items():
         (tree / rel).parent.mkdir(parents=True, exist_ok=True)
         (tree / rel).write_text(text)

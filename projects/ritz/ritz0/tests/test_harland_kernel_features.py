@@ -98,6 +98,12 @@ def virtio_ir(tmp_path_factory):
 
 
 @pytest.fixture(scope="module")
+def virtq_ir(tmp_path_factory):
+    # The virtqueue moved to the virtio_abi leaf package (AGAST #4732).
+    return _compile(tmp_path_factory, str(HARLAND / "virtio_abi" / "src" / "virtq.ritz"))
+
+
+@pytest.fixture(scope="module")
 def boot_ir(tmp_path_factory):
     return _compile(tmp_path_factory, "main.ritz", boot=True)
 
@@ -121,11 +127,12 @@ def test_linker_symbols_are_extern_vars(request, module, sym):
         f"{sym} is still declared as a function"
 
 
-# --- drivers/virtio/common.ritz: ring publish and MMIO ---------------------
+# --- virtio_abi/src/virtq.ritz and drivers/virtio/common.ritz: ring publish
+# and MMIO -------------------------------------------------------------------
 
 @pytest.mark.integration
-def test_vq_submit_fences_before_idx_publish(virtio_ir):
-    body = _body(virtio_ir, "vq_submit")
+def test_vq_submit_fences_before_idx_publish(virtq_ir):
+    body = _body(virtq_ir, "vq_submit")
     stores = [m.start() for m in re.finditer(r"^\s+store ", body, re.M)]
     fence = body.find("fence seq_cst")
     assert fence != -1, f"vq_submit has no fence:\n{body}"

@@ -15,7 +15,8 @@ import drivers.irq_wait { irq_wait_vector }
 import drivers.pci { PciDevice, pci_find_virtio, VIRTIO_DEVICE_NET }
 import mm.vmm { vmm_virt_to_phys, phys_to_virt }
 import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count }
-import drivers.virtio.common { VirtioDevice, Virtqueue, VringDesc, VIO_TRANSPORT_MMIO, VIRTIO_MSI_NO_VECTOR, VIRTIO_STATUS_FAILED, vio_init_device, vio_add_status, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_get_queue_size, vio_setup_queue_vec, vio_read_isr, vio_note_msix_on, vio_set_config_msix_vector, vio_read_config8, vio_read_config16, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE }
+import drivers.virtio.common { VirtioDevice, VIO_TRANSPORT_MMIO, VIRTIO_MSI_NO_VECTOR, VIRTIO_STATUS_FAILED, vio_init_device, vio_add_status, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_get_queue_size, vio_setup_queue_vec, vio_read_isr, vio_note_msix_on, vio_set_config_msix_vector, vio_read_config8, vio_read_config16, vq_notify }
+import virtio_abi.virtq { Virtqueue, VringDesc, TxSlots, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE, tx_slots_init, tx_slots_take, tx_slots_post, vq_reclaim_tx }
 
 # MSI-X table entries this driver uses: config changes, RX queue, TX queue
 const VIRTIO_NET_MSIX_ENTRIES: u16 = 3
@@ -100,13 +101,10 @@ var virtio_net: VirtioNetDevice
 var virtio_rx_buffers: [65536]u8  # 32 * 2048 = 64KB
 var virtio_tx_buffers: [65536]u8  # 32 * 2048 = 64KB
 
-# TX buffer ownership (AGAST #4073). A TX buffer is busy from the send that
-# posts it until the device returns its descriptor through the used ring;
-# virtio_tx_buf_desc names that descriptor. Sends rotate from
-# virtio_tx_next, so the device never reads a buffer being rewritten.
-var virtio_tx_busy: [32]u8
-var virtio_tx_buf_desc: [32]u16
-var virtio_tx_next: u32 = 0
+# TX buffer ownership (AGAST #4073): slot b is buffer b of
+# virtio_tx_buffers, busy from the send that posts it until the device
+# returns its descriptor through the used ring (virtio_abi.virtq TxSlots).
+var virtio_tx_slots: TxSlots
 
 # MSI-X state (AGAST #1852). Entry 0 signals config changes, entry 1 the RX
 # queue and entry 2 the TX queue, each on its own IDT vector. Without MSI-X
@@ -296,7 +294,7 @@ pub fn virtio_net_init() -> i32
     if (device_features & VIRTIO_NET_F_STATUS) != 0
         accepted_features = accepted_features | VIRTIO_NET_F_STATUS
 
-    vio_set_features(vdev, accepted_features)
+    vio_set_features(vdev, accepted_features as u64)
     virtio_net.features = accepted_features
     if vio_features_ok(vdev) != 0
         vio_add_status(vdev, VIRTIO_STATUS_FAILED)
@@ -336,11 +334,7 @@ pub fn virtio_net_init() -> i32
         vio_add_status(vdev, VIRTIO_STATUS_FAILED)
         return -1
 
-    var t: u32 = 0
-    while t < VIRTIO_NET_TX_BUFFER_COUNT
-        virtio_tx_busy[t] = 0
-        t = t + 1
-    virtio_tx_next = 0
+    tx_slots_init(@virtio_tx_slots, VIRTIO_NET_TX_BUFFER_COUNT)
 
     # Populate RX buffers
     klog("[virtio-net] Populating RX buffers...\n")
@@ -386,31 +380,8 @@ pub fn virtio_net_init() -> i32
 # and release its buffer. Without this the ring runs dry after queue-size
 # sends (AGAST #4073).
 fn virtio_net_reclaim_tx()
-    let txq: *Virtqueue = virtio_net.tx_queue
     read_barrier()
-    while vq_has_used(txq)
-        let desc: i32 = vq_get_used(txq)
-        if desc < 0
-            return
-        var b: u32 = 0
-        while b < VIRTIO_NET_TX_BUFFER_COUNT
-            if virtio_tx_busy[b] != 0 and virtio_tx_buf_desc[b] == desc as u16
-                virtio_tx_busy[b] = 0
-                break
-            b = b + 1
-        vq_free_desc(txq, desc as u16)
-
-# Next TX buffer the device isn't reading, from virtio_tx_next on; -1 if
-# all VIRTIO_NET_TX_BUFFER_COUNT are in flight.
-fn virtio_net_take_tx_buf() -> i32
-    var k: u32 = 0
-    while k < VIRTIO_NET_TX_BUFFER_COUNT
-        let b: u32 = (virtio_tx_next + k) % VIRTIO_NET_TX_BUFFER_COUNT
-        if virtio_tx_busy[b] == 0
-            virtio_tx_next = (b + 1) % VIRTIO_NET_TX_BUFFER_COUNT
-            return b as i32
-        k = k + 1
-    return -1
+    vq_reclaim_tx(virtio_net.tx_queue, @virtio_tx_slots)
 
 pub fn virtio_net_send(data: *u8, len: u32) -> i32
     if virtio_net.initialized == 0
@@ -420,10 +391,12 @@ pub fn virtio_net_send(data: *u8, len: u32) -> i32
         return -1
 
     virtio_net_reclaim_tx()
-    let taken: i32 = virtio_net_take_tx_buf()
-    if taken < 0
-        return -1
-    let tx_buf_idx: u32 = taken as u32
+    # The next buffer the device isn't reading; none while all
+    # VIRTIO_NET_TX_BUFFER_COUNT are in flight.
+    var tx_buf_idx: u32 = 0
+    match tx_slots_take(@virtio_tx_slots)
+        Some(b) => tx_buf_idx = b
+        None => return -1
 
     let buf_addr: u64 = (@virtio_tx_buffers[0] as u64) + (tx_buf_idx as u64 * VIRTIO_NET_TX_BUFFER_SIZE as u64)
     let hdr_size: u32 = virtio_net.hdr_size
@@ -448,8 +421,7 @@ pub fn virtio_net_send(data: *u8, len: u32) -> i32
     let result: i32 = virtq_add_buf(virtio_net.tx_queue, buf_addr, total_len, 0)
     if result < 0
         return -1
-    virtio_tx_busy[tx_buf_idx] = 1
-    virtio_tx_buf_desc[tx_buf_idx] = result as u16
+    tx_slots_post(@virtio_tx_slots, tx_buf_idx, result as u16)
 
     virtq_kick(virtio_net.tx_queue)
     return 0

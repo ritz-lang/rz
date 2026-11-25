@@ -1,0 +1,300 @@
+# Harland virtio_abi host tests (AGAST #4732)
+#
+# The ring layout, the queue index math and the free list of
+# virtio_abi.virtq on ring memory in a host global; the AGAST #4073 TX rule
+# against a "device" that is plain stores to the used ring; and the
+# feature negotiation, VERSION_1 (bit 32) and ACCESS_PLATFORM (bit 33)
+# included. Nothing here touches a device: virtio_abi never does.
+
+import virtio_abi.virtq { Virtqueue, VringDesc, VringAvail, VringUsed, VringUsedElem, TxSlots, VIRTQ_MAX_SIZE, VIRTQ_ALIGN, VRING_DESC_SIZE, VRING_USED_ELEM_SIZE, TX_SLOTS_MAX, virtq_avail_offset, virtq_used_offset, virtq_ring_bytes, virtq_init, virtq_desc_phys, virtq_avail_phys, virtq_used_phys, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_has_used, vq_get_used, vq_get_used_len, tx_slots_init, tx_slots_take, tx_slots_post, tx_slots_release, vq_reclaim_tx }
+import virtio_abi.features { VIRTIO_F_VERSION_1, VIRTIO_F_ACCESS_PLATFORM, virtio_driver_features, virtio_features_lo, virtio_features_hi, virtio_features_join }
+
+# Ring memory for a VIRTQ_MAX_SIZE queue (three pages), u64s so it is
+# 8-aligned. The "device" address is an arbitrary page-aligned number.
+var g_ring: [3 * 4096 / 8]u64
+const RING_PHYS: u64 = 0x40000000
+var g_slots: TxSlots
+
+fn fresh_queue(vq: *Virtqueue, num: u16) -> u64
+    for i in 0..3 * 4096 / 8
+        g_ring[i] = 0
+    let virt: u64 = @g_ring as u64
+    virtq_init(vq, 1, num, virt, RING_PHYS)
+    virt
+
+# The device returns descriptor `id` with `len` bytes written, in the next
+# used slot.
+fn device_return(vq: *Virtqueue, id: u16, len: u32)
+    let used: *VringUsed = vq.used
+    let slot: u16 = used.idx % vq.num
+    used.ring[slot].id = id as u32
+    used.ring[slot].len = len
+    used.idx = used.idx +% 1
+
+fn is_slot(t: Option<u32>, want: u32) -> bool
+    match t
+        Some(b) => b == want
+        None => false
+
+fn is_none(t: Option<u32>) -> bool
+    match t
+        Some(_) => false
+        None => true
+
+# ---------------------------------------------------------------------------
+# Layout
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_struct_sizes() -> i32
+    assert sizeof(VringDesc) as u64 == VRING_DESC_SIZE
+    assert sizeof(VringUsedElem) as u64 == VRING_USED_ELEM_SIZE
+    # Header (flags, idx) then the entries, at their natural alignment.
+    assert sizeof(VringAvail) == (4 + 256 * 2)
+    assert sizeof(VringUsed) == 4 + 256 * 8
+    0
+
+[[test]]
+fn test_ring_offsets_max_queue() -> i32
+    # 256 descriptors are one page; the avail ring (4 + 512 + 2) follows,
+    # and the used ring starts on the next VIRTQ_ALIGN boundary.
+    assert virtq_avail_offset(VIRTQ_MAX_SIZE) == 4096
+    assert virtq_used_offset(VIRTQ_MAX_SIZE) == 2 * VIRTQ_ALIGN
+    assert virtq_ring_bytes(VIRTQ_MAX_SIZE) == 8192 + 4 + 256 * 8 + 2
+    0
+
+[[test]]
+fn test_ring_offsets_small_queues() -> i32
+    assert virtq_avail_offset(8) == 128
+    assert virtq_used_offset(8) == VIRTQ_ALIGN
+    assert virtq_ring_bytes(8) == 4096 + 4 + 8 * 8 + 2
+    assert virtq_avail_offset(1) == 16
+    assert virtq_used_offset(1) == VIRTQ_ALIGN
+    # 227 descriptors and their avail ring (3632 + 4 + 454) still fit one
+    # page; 228 (3648 + 4 + 456) does not.
+    assert virtq_used_offset(227) == VIRTQ_ALIGN
+    assert virtq_used_offset(228) == 2 * VIRTQ_ALIGN
+    0
+
+[[test]]
+fn test_init_lays_out_the_rings() -> i32
+    var vq: Virtqueue
+    let virt: u64 = fresh_queue(@vq, 256)
+    assert vq.num == 256 and vq.queue_index == 1
+    assert vq.desc as u64 == virt
+    assert vq.avail as u64 == virt + 4096
+    assert vq.used as u64 == virt + 8192
+    assert virtq_desc_phys(@vq) == RING_PHYS
+    assert virtq_avail_phys(@vq) == RING_PHYS + 4096
+    assert virtq_used_phys(@vq) == RING_PHYS + 8192
+    assert vq.free_count == 256 and vq.free_head == 0 and vq.last_used_idx == 0
+    0
+
+# ---------------------------------------------------------------------------
+# Free list
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_free_list_hands_out_every_descriptor_once() -> i32
+    var vq: Virtqueue
+    fresh_queue(@vq, 8)
+    for i in 0..8
+        assert vq_alloc_desc(@vq) == i as i32
+    assert vq.free_count == 0
+    assert vq_alloc_desc(@vq) == -1
+    0
+
+[[test]]
+fn test_freed_descriptor_is_reused_first() -> i32
+    var vq: Virtqueue
+    fresh_queue(@vq, 8)
+    let a: i32 = vq_alloc_desc(@vq)
+    let b: i32 = vq_alloc_desc(@vq)
+    vq_free_desc(@vq, a as u16)
+    assert vq.free_count == 7
+    assert vq_alloc_desc(@vq) == a
+    assert vq_alloc_desc(@vq) == b + 1
+    assert vq_get_desc(@vq, 3) as u64 == vq.desc as u64 + 3 * VRING_DESC_SIZE
+    0
+
+# ---------------------------------------------------------------------------
+# Index math
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_submit_publishes_head_at_idx_mod_num() -> i32
+    var vq: Virtqueue
+    fresh_queue(@vq, 8)
+    for i in 0..10
+        vq_submit(@vq, (i + 100) as u16)
+    let avail: *VringAvail = vq.avail
+    assert avail.idx == 10
+    assert avail.ring[0] == 108 and avail.ring[1] == 109 and avail.ring[2] == 102
+    0
+
+[[test]]
+fn test_avail_idx_wraps() -> i32
+    var vq: Virtqueue
+    fresh_queue(@vq, 8)
+    let avail: *VringAvail = vq.avail
+    avail.idx = 0xFFFF
+    vq_submit(@vq, 3)
+    assert avail.idx == 0
+    assert avail.ring[7] == 3      # 0xFFFF % 8
+    0
+
+[[test]]
+fn test_used_ring_empty_and_in_order() -> i32
+    var vq: Virtqueue
+    fresh_queue(@vq, 8)
+    assert not vq_has_used(@vq)
+    assert vq_get_used(@vq) == -1
+    device_return(@vq, 5, 60)
+    device_return(@vq, 2, 70)
+    assert vq_has_used(@vq)
+    assert vq_get_used(@vq) == 5
+    assert vq_get_used_len(@vq) == 60
+    assert vq_get_used(@vq) == 2
+    assert vq_get_used_len(@vq) == 70
+    assert not vq_has_used(@vq)
+    0
+
+[[test]]
+fn test_last_used_idx_wraps() -> i32
+    var vq: Virtqueue
+    fresh_queue(@vq, 8)
+    let used: *VringUsed = vq.used
+    vq.last_used_idx = 0xFFFF
+    used.idx = 0
+    used.ring[7].id = 5
+    used.ring[7].len = 99
+    assert vq_get_used(@vq) == 5
+    assert vq.last_used_idx == 0
+    # The previous slot is 0xFFFF % 8, reached across the wrap.
+    assert vq_get_used_len(@vq) == 99
+    0
+
+# ---------------------------------------------------------------------------
+# TX rule (AGAST #4073)
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_tx_slots_rotate_and_fill() -> i32
+    tx_slots_init(@g_slots, 3)
+    assert is_slot(tx_slots_take(@g_slots), 0)
+    tx_slots_post(@g_slots, 0, 4)
+    # A taken slot that was never posted is still free.
+    assert is_slot(tx_slots_take(@g_slots), 1)
+    assert is_slot(tx_slots_take(@g_slots), 2)
+    tx_slots_post(@g_slots, 2, 6)
+    assert is_slot(tx_slots_take(@g_slots), 1)
+    tx_slots_post(@g_slots, 1, 5)
+    assert is_none(tx_slots_take(@g_slots))
+    0
+
+[[test]]
+fn test_tx_slot_busy_until_its_descriptor_returns() -> i32
+    tx_slots_init(@g_slots, 2)
+    tx_slots_post(@g_slots, 0, 7)
+    tx_slots_post(@g_slots, 1, 3)
+    assert not tx_slots_release(@g_slots, 9)        # names no busy slot
+    assert is_none(tx_slots_take(@g_slots))
+    assert tx_slots_release(@g_slots, 3)
+    assert is_slot(tx_slots_take(@g_slots), 1)
+    assert not tx_slots_release(@g_slots, 3)        # already released
+    0
+
+[[test]]
+fn test_reclaim_frees_descriptors_and_buffers_in_used_order() -> i32
+    var vq: Virtqueue
+    fresh_queue(@vq, 4)
+    tx_slots_init(@g_slots, 4)
+    # Four sends fill the queue and every buffer.
+    for i in 0..4
+        let d: i32 = vq_alloc_desc(@vq)
+        assert d >= 0
+        assert is_slot(tx_slots_take(@g_slots), i as u32)
+        tx_slots_post(@g_slots, i as u32, d as u16)
+        vq_submit(@vq, d as u16)
+    assert vq_alloc_desc(@vq) == -1
+    assert vq_reclaim_tx(@vq, @g_slots) == 0
+    assert is_none(tx_slots_take(@g_slots))
+    # The device finishes 2 and 0, out of order: those two slots and
+    # descriptors come back, the others stay the device's.
+    device_return(@vq, 2, 0)
+    device_return(@vq, 0, 0)
+    assert vq_reclaim_tx(@vq, @g_slots) == 2
+    assert vq.free_count == 2
+    assert not vq_has_used(@vq)
+    assert is_slot(tx_slots_take(@g_slots), 0)
+    assert is_slot(tx_slots_take(@g_slots), 2)
+    assert is_slot(tx_slots_take(@g_slots), 0)      # 1 and 3 still busy
+    0
+
+[[test]]
+fn test_reclaim_outlasts_the_queue_size() -> i32
+    # More sends than descriptors (the boot burst sends 300 on 256): each
+    # send reclaims first, so the ring never runs dry.
+    var vq: Virtqueue
+    fresh_queue(@vq, 8)
+    tx_slots_init(@g_slots, 4)
+    for i in 0..300
+        vq_reclaim_tx(@vq, @g_slots)
+        var b: u32 = 0
+        match tx_slots_take(@g_slots)
+            Some(x) => b = x
+            None => return 1
+        let d: i32 = vq_alloc_desc(@vq)
+        assert d >= 0
+        tx_slots_post(@g_slots, b, d as u16)
+        vq_submit(@vq, d as u16)
+        device_return(@vq, d as u16, 0)
+    assert vq_reclaim_tx(@vq, @g_slots) == 1
+    assert vq.free_count == 8
+    assert TX_SLOTS_MAX == 256
+    0
+
+# ---------------------------------------------------------------------------
+# Feature negotiation
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_features_accept_only_what_was_offered_and_wanted() -> i32
+    let offered: u64 = 0x30021 | VIRTIO_F_VERSION_1
+    assert virtio_driver_features(offered, 0x20) == (0x20 | VIRTIO_F_VERSION_1)
+    # Wanted but not offered: not accepted.
+    assert virtio_driver_features(offered, 0x8000) == VIRTIO_F_VERSION_1
+    assert virtio_driver_features(0x21, 0x20 | 0x40) == 0x20
+    0
+
+[[test]]
+fn test_version_1_is_accepted_whenever_offered() -> i32
+    assert virtio_driver_features(VIRTIO_F_VERSION_1, 0) == VIRTIO_F_VERSION_1
+    # A legacy device has no word 1: nothing above bit 31 is accepted.
+    assert virtio_driver_features(0xFFFFFFFF, VIRTIO_F_VERSION_1) == 0
+    0
+
+[[test]]
+fn test_access_platform_is_bit_33_and_only_on_request() -> i32
+    assert VIRTIO_F_VERSION_1 == 1 << 32
+    assert VIRTIO_F_ACCESS_PLATFORM == 1 << 33
+    let offered: u64 = VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM | 0x20
+    # Offered, not wanted (an untranslated boot): left off.
+    let plain: u64 = virtio_driver_features(offered, 0x20)
+    assert plain == (VIRTIO_F_VERSION_1 | 0x20)
+    assert virtio_features_hi(plain) == 1
+    # Offered and wanted (the translating boot): word 1 carries bits 32 and 33.
+    let translated: u64 = virtio_driver_features(offered, 0x20 | VIRTIO_F_ACCESS_PLATFORM)
+    assert virtio_features_hi(translated) == 3
+    assert virtio_features_lo(translated) == 0x20
+    # Wanted, not offered: not accepted.
+    assert virtio_driver_features(VIRTIO_F_VERSION_1, VIRTIO_F_ACCESS_PLATFORM) == VIRTIO_F_VERSION_1
+    0
+
+[[test]]
+fn test_feature_words_round_trip() -> i32
+    let f: u64 = virtio_features_join(0x89ABCDEF, 3)
+    assert f == 0x389ABCDEF
+    assert virtio_features_lo(f) == 0x89ABCDEF
+    assert virtio_features_hi(f) == 3
+    0
