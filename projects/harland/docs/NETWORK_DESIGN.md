@@ -470,8 +470,18 @@ pub fn sys_net_addr(addr_ptr: *u8) -> i64
 > ring-1 design. It grants MMIO (`DrvMmioMap` 221), DMA (`DrvDmaAlloc` 222)
 > and IRQ wait (`DrvIrqWait` 220) by capability, and frames move over SPSC
 > rings in `CAP_TYPE_SHM` regions (`ShmMap` 227), not an IPC channel.
-> `IOPORT` / port-I/O grants are rejected. The ring-2 `netd` split is still
-> future work.
+> `IOPORT` / port-I/O grants are rejected. The ring-2 `netd` split is designed
+> in [`RING2_NET.md`](RING2_NET.md).
+>
+> **Rings 1 and 2 are tiers, not privilege levels** (D8 in `RING1_DRIVER.md`).
+> The driver and `netd` both run at CPL 3, each in its own address space with
+> the kernel half `U/S = 0`; their capabilities, granted by the kernel at spawn,
+> are what make one a ring-1 driver and the other a ring-2 service. Every access
+> at CPL < 3 is a supervisor-mode access (Intel SDM Vol 3 §4.6) and long mode
+> has no segment limits, so a lower CPL would not isolate either from the
+> kernel. seL4, QNX, MINIX 3 and Fuchsia run drivers and network stacks the same
+> way. Items 1, 2 and 3 of "Required kernel changes" below are therefore not
+> needed: no ring 1/2 privilege levels, no `TSS.rsp1`/`rsp2`, no I/O port grants.
 
 Once the stack is properly organized, we can split it:
 
@@ -486,10 +496,10 @@ Once the stack is properly organized, we can split it:
 - Exposes socket API to Ring 3
 
 ### Required kernel changes:
-1. Process privilege levels (Ring 1, 2, 3)
-2. TSS stack setup for Ring 1/2
-3. Capability grants for I/O port access
-4. IRQ delegation to Ring 1
+1. ~~Process privilege levels (Ring 1, 2, 3)~~ Not needed: every process is CPL 3.
+2. ~~TSS stack setup for Ring 1/2~~ Not needed: `rsp1`/`rsp2` stay 0.
+3. ~~Capability grants for I/O port access~~ Rejected: virtio is MMIO-only.
+4. IRQ delegation to the ring-1 driver (`DrvIrqWait` 220, a capability)
 
 This is **future work** - first we get the code organized properly in the kernel, then we can move it out.
 

@@ -11,7 +11,7 @@ Ring 0 should do the absolute minimum:
 - Ring transitions
 - IPC primitives
 
-Everything else runs in lower privilege rings.
+Everything else runs outside ring 0, in user-mode processes at CPL 3.
 
 ## Ring Model
 
@@ -45,6 +45,20 @@ Everything else runs in lower privilege rings.
 │   └─ Full isolation, capability-based access                │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+> **Rings 1 and 2 are tiers, not CPU privilege levels** (decision D8 in
+> [`RING1_DRIVER.md`](RING1_DRIVER.md)). Every non-kernel process, drivers and
+> system services included, runs at CPL 3 in its own address space, with the
+> kernel half mapped `U/S = 0`. What separates the tiers is the capabilities the
+> kernel grants at spawn: a ring-1 driver gets its device's MMIO, IRQ and DMA
+> capabilities, with device DMA fenced by an IOMMU domain; a ring-2 service gets
+> the shared rings it serves. The reason is the hardware: every access at
+> CPL < 3 is a supervisor-mode access (Intel SDM Vol 3 §4.6), and long mode has
+> no segment limits, so a process below CPL 3 that shares the kernel half is
+> not isolated from the kernel, and fencing it costs more than CPL 3 for the same
+> result. seL4, QNX, MINIX 3 and Fuchsia run drivers and services the same way:
+> user-mode processes with explicit grants. Harland adds no DPL-1/DPL-2
+> descriptors; every process returns with `sysretq`.
 
 ## IPC: Ring Buffers (Zeus/Valet Style)
 
@@ -145,7 +159,8 @@ Each connection/channel uses a **shared ring buffer**:
 ### Phase 3: IPC & Ring Buffers
 1. **Ring buffer primitive**
 2. **Capability tokens**
-3. **Ring 1/2/3 transitions**
+3. **Ring 1/2/3 transitions** (superseded: every process is CPL 3, and the tiers
+   are capabilities; see the ring model note)
 4. **Shared memory regions**
 5. **Async notification (signal/wait)**
 

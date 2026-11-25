@@ -3,13 +3,13 @@
 | | |
 |---|---|
 | Status | Draft |
-| Date | 2026-11-25 (placement, selectors, respawn, and boot switch decided) |
+| Date | 2026-11-25 (placement, respawn, and boot switch decided; D8 = (b): netd runs at CPL 3) |
 | Audience | Harland kernel |
-| Seat | Ring 2. This pass draws the service. It does not build it. |
+| Seat | Ring 2, a tier name: a CPL-3 process with service capabilities. This pass draws the service. It does not build it. |
 
 ## Overview
 
-The network service is one ring-2 process. It owns Ethernet demux, ARP, IPv4, ICMP, UDP, and DHCP. TCP is a later milestone in the same service, not part of the first cutover. The first cutover is DHCP, ARP, ping, and a ring-3 UDP bind, datagram send, and datagram receive. The service consumes and produces the SPSC frame rings from `RING1_DRIVER.md`. Ring 3 apps talk to it on a separate exchange. The service publishes its own address record. `NetInfo` (224) stays the ring-1 driver's link record and carries no lease. `NetAddr` (225) copies the address snapshot. Numbers 60 and 61 stay free.
+The network service is one ring-2-tier process. Ring 2 is a tier, not a CPU privilege level: `/bin/netd` runs at CPL 3 in its own address space, like every non-kernel process, and what makes it a system service is the capabilities the kernel grants at spawn (D8 in `RING1_DRIVER.md`). It owns Ethernet demux, ARP, IPv4, ICMP, UDP, and DHCP. TCP is a later milestone in the same service, not part of the first cutover. The first cutover is DHCP, ARP, ping, and a ring-3 UDP bind, datagram send, and datagram receive. The service consumes and produces the SPSC frame rings from `RING1_DRIVER.md`. Ring 3 apps talk to it on a separate exchange. The service publishes its own address record. `NetInfo` (224) stays the ring-1 driver's link record and carries no lease. `NetAddr` (225) copies the address snapshot. Numbers 60 and 61 stay free.
 
 Until that process exists, the in-kernel stack in `kernel/src/net/` sits in the consumer seat. Taking the seat later does not change `FrameDesc`. The virtio device ring stays inside the ring-1 driver. `ipc/channel.ritz` stays a copied control queue. Neither is the dataplane. The service gets no port I/O.
 
@@ -33,7 +33,7 @@ ENA stays an in-kernel `NetDevice` until its own driver moves. On that path the 
 
 ## Placement
 
-Ring 0 grants shared pages through `CAP_TYPE_SHM` (`CapGrant` 40, `ShmMap` 227, `CapRevoke` 41). Each process has one wait set. Spawn of the driver and of this service is the kernel exercising that path. An app that attaches later uses it again. There is no second sharing mechanism. Ring 0 does not parse a frame and does not parse an app request slot. Ring 1 is the only CPL that programs the NIC. Ring 2 is the only CPL that answers ARP or runs DHCP. It is also where TCP will live, once that milestone exists. Ring 3 sees datagrams and the address snapshot. The userspace calls for a byte stream are named below and wait for the TCP milestone. The first cutover is the one named in the overview.
+Ring 0 grants shared pages through `CAP_TYPE_SHM` (`CapGrant` 40, `ShmMap` 227, `CapRevoke` 41). Each process has one wait set. Spawn of the driver and of this service is the kernel exercising that path. An app that attaches later uses it again. There is no second sharing mechanism. Ring 0 does not parse a frame and does not parse an app request slot. The ring-1-tier driver is the only process that programs the NIC. The ring-2-tier service is the only process that answers ARP or runs DHCP. Both run at CPL 3; their capabilities, not their CPL, keep them apart. It is also where TCP will live, once that milestone exists. Ring 3 sees datagrams and the address snapshot. The userspace calls for a byte stream are named below and wait for the TCP milestone. The first cutover is the one named in the overview.
 
 ```mermaid
 flowchart TB
@@ -69,26 +69,17 @@ flowchart TB
 
 The frame path is the pair of SPSC rings. The address path is the service's record, copied out by `NetAddr` (225), beside `NetInfo` (224), so the lease does not travel with the link. `NetInfo` is a separate object mapped only into the driver. Apps do not map the service's address page. The driver never writes the address record. The service never maps `NetInfo`. TCP is not in the box because the first cutover does not expose streams. Its home is still this service. The TCP section draws that later path.
 
-### CPL-2 selectors
+### Privilege level
 
-The service runs at CPL 2 on two descriptors appended after the ring-1 pair that `RING1_DRIVER.md` puts at indexes 133 and 134 (`0x429`, `0x431`). The ring-2 pair uses the same base, limit, flags, and `make_gdt_entry` helper as the user and driver segments.
-
-| Index | Selector | Access | Flags |
-|---|---|---|---|
-| 135 | `GDT_SERVICE_CODE` = `0x43A` | `0xDA` = present `0x80`, DPL 2 `0x40`, code `0x1A` | `0xA0` = L and G, same as user code |
-| 136 | `GDT_SERVICE_DATA` = `0x442` | `0xD2` = present, DPL 2, data `0x12` | `0x80` = G, same as user data |
-
-`GDT_ENTRIES` becomes 137, which is `GDT_TSS_FIRST + 2 * MAX_CPUS + 4`. `GDT_TSS_FIRST` stays 5 and CPU 0's TSS selector stays `0x28`. The GDT source test that `RING1_DRIVER.md` extends for 133 and 134 asserts 135 and 136 and their access bytes in the same change.
-
-There is one spawn-frame function, not a ring-2 copy of the ring-1 one. `sched_prepare_driver` takes the CS/SS pair as arguments, and the kernel chooses that pair at spawn: `0x429` / `0x431` for the ring-1 driver, `0x43A` / `0x442` for the service. There is no `sched_prepare_service`. User code never chooses its selectors. The Proc stores the pair, and `sched_use_kstack` installs it in `PC_USER_CS` / `PC_USER_SS` on every switch, as it does for the driver. RPL 2 is not 3, so the syscall exit takes the iret tail and pushes those per-CPU slots. Only RPL 3 returns with `sysretq`.
+`netd` is a kernel-spawned CPL-3 process, on the same spawn path as the ring-1-tier driver (`RING1_DRIVER.md` §2). It runs on `GDT_USER_CODE` / `GDT_USER_DATA` (`0x23` / `0x1B`), in its own PML4 with the kernel half `U/S = 0`, and returns with `sysretq` like every process. No descriptor is appended to the GDT, and no selector pair is chosen. User code never chooses its CPL. Its authority is the `CAP_TYPE_SHM` handles the kernel grants. It holds no `CAP_TYPE_MMIO` and no `CAP_TYPE_IRQ`.
 
 ### Service binary and respawn
 
-The service binary is `/bin/netd`. Its source is `projects/harland/system/src/netd.ritz`, the `[[bin]] netd` target of the Harland system package below. The kernel spawns it with `proc_new_child`, `sched_prepare_driver` with the ring-2 pair, and `proc_start`, and grants it the frame object and its address page as `CAP_TYPE_SHM`.
+The service binary is `/bin/netd`. Its source is `projects/harland/system/src/netd.ritz`, the `[[bin]] netd` target of the Harland system package below. The kernel spawns it on the same path as the driver: `proc_new_child`, `sched_prepare_user` with the ordinary CPL-3 frame (CS `0x23`, SS `0x1B`) and entry arguments the kernel chose, and `proc_start`. It grants the frame object and the address page as `CAP_TYPE_SHM`, and passes those initial handles in the entry arguments.
 
 The kernel restarts `netd` when it exits or faults. Each death first runs the exit-or-fault path in the frame-seat section. That path invalidates the snapshot, closes every attachment, and retires the frame object. The kernel allows three restarts per boot, one after each of the first three deaths, with a doubling backoff before each restart: 250 ms after the first death, 500 ms after the second, and 1 s after the third. Each restart gets a new frame object, a new address page, and an empty attachment list, the same as a first spawn. The fourth death starts no process. The kernel logs that the restart budget is spent, `NetAddr` keeps returning `Errno.NoDev`, and networking stays down until reboot. The count is per boot and does not reset after a long healthy run. A boot that is still within its budget is down only for the backoff and the new process's start.
 
-Restart policy lives in the kernel for this cutover. A supervisor process, init, owning restart policy is a later option. It needs a privileged "spawn a ring-2 process" call that this cutover does not add.
+Restart policy lives in the kernel for this cutover. A supervisor process, init, owning restart policy is a later option. It needs a privileged spawn-a-service call that this cutover does not add.
 
 ### Where the code lives
 
@@ -106,7 +97,7 @@ The `SYS_*` numbers for these calls (`NetInfo` 224, `NetAddr` 225, `ShmMap` 227,
 
 ### Boot switch
 
-Ring-1 and ring-2 networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` is unchanged.
+Ring-1-tier and ring-2-tier networking is on by default. Every boot that has a virtio-net device and a translated DMA domain (an IOMMU) spawns `/bin/virtio-net` and `/bin/netd`. No marker file chooses that. A boot without translation keeps the in-kernel `virtio_net_init` and the in-kernel stack, because `RING1_DRIVER.md`'s DMA rule allows no ring-1 DMA without an IOMMU. `\harland\net-selftest` still runs the DHCP and ping self-test, on whichever owner the boot picked. It does not choose the owner. `NET_RESPONDER` is unchanged. Before this becomes the default, the performance gate in `RING1_DRIVER.md` Rollout runs: ICMP echo and UDP round-trip through the CPL-3 driver and netd against the in-kernel stack. If the gap matters, merging the driver and netd into one process is the first lever, then batching, PCID, and polling.
 
 ## What the kernel does today
 
@@ -486,11 +477,9 @@ The service is not given port I/O. IOPL stays 0. There is no I/O bitmap. Queue r
 
 ## What this draft leaves in place
 
-Per-device DMA domains, `munmap` of the driver windows, page-granular MMIO, the kernel-stack iret frame, the unpublished `link_seq`, and the self-test deadline are specified in `RING1_DRIVER.md`. They are prerequisites of the first virtio cutover. This draft does not retune that self-test. Whichever consumer owns the rings runs the DHCP window, and that wait already has a deadline.
+Per-device DMA domains, `munmap` of the driver windows, page-granular MMIO, the unpublished `link_seq`, and the self-test deadline are specified in `RING1_DRIVER.md`. They are prerequisites of the first virtio cutover. This draft does not retune that self-test. Whichever consumer owns the rings runs the DHCP window, and that wait already has a deadline.
 
-The CPL-2 service uses the stack in its `iretq` frame. Ordinary syscall and interrupt entry targets CPL 0 and uses `TSS.rsp0` or an IST. `TSS.rsp2` is what the CPU loads for a gate whose target is CPL 2. This draft adds no such gate, so `tss_fill` does not write `rsp2`. The selectors are decided: `0x43A` / `0x442` at GDT indexes 135 and 136, loaded through the shared `sched_prepare_driver` frame (Placement, "CPL-2 selectors").
-
-The kernel owns restart policy for `netd`: three restarts per boot with the 250 ms, 500 ms, 1 s backoff (Placement, "Service binary and respawn"). Moving that policy into a supervisor such as init is a later option. It needs a privileged "spawn a ring-2 process" call, and this cutover does not add one.
+The kernel owns restart policy for `netd`: three restarts per boot with the 250 ms, 500 ms, 1 s backoff (Placement, "Service binary and respawn"). Moving that policy into a supervisor such as init is a later option. It needs a privileged spawn-a-service call, and this cutover does not add one.
 
 The kernel does not restart a dead ring-1 driver in this cutover. The frame-seat section covers that case.
 
@@ -579,8 +568,7 @@ ARP lifetime, the pending-send cap, the ping deadline, DHCP retransmission, and 
 - `projects/harland/docs/stack_example/` — host traversal of `net_recv_from`, `net_send_to`, `net_read`, and `net_write`. The same run checks the peer-latch notify, the inbox, every hot source, the IPv4 total length, the ARP reply rule, and a broadcast echo request.
 - `projects/harland/system/src/netd.ritz` (`/bin/netd`) and `projects/harland/system/src/virtio_net.ritz` (`/bin/virtio-net`) — the programs the kernel spawns
 - `projects/harland/netstack/`, `projects/harland/net_abi/`, `projects/harland/libnet/` — the protocol leaf, the app-exchange records, and the ring-3 library
-- `projects/harland/kernel/src/arch/x86_64/gdt.ritz` — `GDT_ENTRIES` and the descriptors that indexes 133–136 extend
-- `projects/harland/docs/ARCHITECTURE.md` — phase 5, the ring-2 stack
+- `projects/harland/docs/ARCHITECTURE.md` — phase 5, the ring-2 stack; rings 1 and 2 as capability tiers at CPL 3
 - `projects/harland/docs/NETWORK_DESIGN.md` — ring-2 section; syscall 40/41 and the IOPORT line are stale
 - `projects/harland/kernel/src/net/stack.ritz` — `net_poll`, `handle_ipv4_packet`, `handle_udp_packet`
 - `projects/harland/kernel/src/net/{eth,arp,ip,icmp,udp,dhcp}.ritz` — today's send and receive helpers

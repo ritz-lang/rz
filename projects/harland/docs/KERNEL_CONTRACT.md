@@ -19,6 +19,14 @@ Goliath runs as a system service and communicates with:
 2. **Block drivers** (Ring 1) - via IPC channels
 3. **Kernel** (Ring 0) - via syscalls
 
+Rings 1 and 2 are tiers, not CPU privilege levels. Goliath, the block drivers
+and every application run at CPL 3, each in its own address space; what makes
+a process a ring-1 driver or a ring-2 service is the capabilities the kernel
+grants it at spawn. Every access at CPL < 3 is a supervisor-mode access (Intel
+SDM Vol 3 §4.6) and long mode has no segment limits, so a lower CPL would not
+isolate a driver from the kernel. This is decision D8 in
+[`RING1_DRIVER.md`](RING1_DRIVER.md); seL4, QNX, MINIX 3 and Fuchsia do the same.
+
 This contract specifies the syscall interface Goliath depends on.
 
 ---
@@ -269,7 +277,8 @@ revoked with `SYS_CAP_GRANT` (40) and `SYS_CAP_REVOKE` (41) and mapped with
 
 ### Device Syscalls (Ring 1 Drivers Only)
 
-Drivers run in ring 1. Device authority is a capability, not a privilege bit;
+Drivers are the ring-1 tier and run at CPL 3, like every process. Device
+authority is a capability, not a privilege level or a privilege bit;
 a missing capability is `Errno.Perm`. The numbers below are reserved by
 [`RING1_DRIVER.md`](RING1_DRIVER.md), which defines their arguments and
 returns; they are not yet in `syscall/numbers.ritz`.
