@@ -43,6 +43,9 @@ SOURCES = \
 	generic_infer \
 	emitter_core \
 	emitter_types \
+	emitter_call_lower \
+	emitter_decl \
+	emitter_stmt_parts \
 	emitter_abi \
 	emitter_ir \
 	frame_limit \

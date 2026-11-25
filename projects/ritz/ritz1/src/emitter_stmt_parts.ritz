@@ -1,0 +1,1011 @@
+# ritz1/src/emitter_stmt_parts.ritz - statement lowering that never recurses into a statement or expression: for-loop headers and element slots, if / match arm phi types, array and N-D row copies
+#
+# Split out by AGAST #1818: these never reach emit_expr / emit_stmt, so they
+# sit below the emitter import cycle and the cycle's modules import them.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.memory
+import ast
+import types           # the one primitive type table (AGAST #1889)
+import ast_helpers
+import tokens_gen
+import emitter_core
+import emitter_abi   # AGAST #1818: sret / byval moved out of emitter_core
+import emitter_types   # AGAST #1818: type inference moved out of emitter_core
+import emitter_ir
+import narrowing           # narrow_note_decl (AGAST #1364, #3505)
+import ownership          # move check + drops (AGAST #2158)
+import ref_check          # ref_view (AGAST #2338)
+import bool_check   # AGAST #2342
+import bool_kind
+import sema_type    # name_is_indexable (AGAST #3510)
+import emitter_asm   # emit_asm_block (AGAST #3395)
+import tail_value   # tail_stmts_diverge (AGAST #3323)
+import emitter_call_lower   # AGAST #1818: split out below the emitter cycle
+import emitter_decl   # AGAST #1818: split out below the emitter cycle
+import diag                 # diag_error_at (AGAST #3621)
+import float_slot   # float_slot_unsigned (AGAST #3313, #4376)
+import monomorph     # ArrayArg (AGAST #3029)
+import mono_clone   # AGAST #1818: cloning moved out of monomorph
+import binder_check
+
+fn ptr_arm_struct(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if e == null
+        return null
+    match e.kind
+        ExprKind.If | ExprKind.Match =>
+            return ptr_arms_struct(s, e.args as *MatchArm, out_len)
+        ExprKind.Ident =>
+            let rl: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+            if rl == null or lv_var_type(rl) != TypeKind.MutRef or lv_pointee_type(rl) != TypeKind.Struct or lv_type_name_len(rl) == 0
+                return null
+            *out_len = lv_type_name_len(rl)
+            return lv_type_name(rl)
+        _ => pass
+    if e.kind != ExprKind.Unary or e.op != OpKind.AddrMut or e.operand == null
+        return null
+    let o: *Expr = e.operand
+    match o.kind
+        ExprKind.Ident =>
+            let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (o.ident_ptr), len: (o.ident_len) as i64 })
+            if loc == null or lv_type_name_len(loc) == 0
+                return null
+            if lv_var_type(loc) != TypeKind.Struct and lent_struct_local(s, o) == null
+                return null
+            *out_len = lv_type_name_len(loc)
+            return lv_type_name(loc)
+        ExprKind.Member =>
+            let f: *StructField = resolve_member_chain_field(s, o)
+            if f == null or f.field_type != TypeKind.Struct or f.field_type_name_len == 0
+                return null
+            *out_len = f.field_type_name_len
+            return f.field_type_name
+        _ => pass
+    null
+
+# AGAST #2960: the one struct every value arm of `arms` points at, or null.
+fn ptr_arms_struct(s: *EmitterState, arms: *MatchArm, out_len: *i32) -> *u8
+    var name: *u8 = null
+    var len: i32 = 0
+    var a: *MatchArm = arms
+    while a != null
+        if a.is_pass == 0 and a.body != null
+            var alen: i32 = 0
+            let an: *u8 = ptr_arm_struct(s, a.body, @alen)
+            if an == null or (name != null and name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (an), len: (alen) as i64 }) == 0)
+                *out_len = 0
+                return null
+            name = an
+            len = alen
+        a = a.next
+    *out_len = len
+    name
+
+# AGAST #2960: an un-annotated `let p = if … @&c else @&c` (or match) holds
+# what `let p: @&C = …` does: an `@&C` slot, the `ptr` phi stored as is, so
+# `p.x` reaches C.  Asked before the arms are emitted, in the let's scope, as
+# arms_ptr_valued is.  It stayed an i64 with no name: `p.x = 3` was
+# "unhandled EXPR_MEMBER".  Returns the struct's name, or null.
+pub fn ptr_phi_let_struct(s: *EmitterState, init: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if arms_ptr_valued(s, init.args as *MatchArm) == 0
+        return null
+    ptr_arms_struct(s, init.args as *MatchArm, out_len)
+
+# An i64 zero: a value for an init that was refused, so the let still binds.
+pub fn emit_zero_i64(s: *EmitterState) -> i32
+    let z: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, z)
+    emit_str(s, IR_ADD_ZERO)
+    z
+
+# AGAST #2097: the ArrayShape of `var.field` for a StmtKind.LocalFieldIndexAssign
+# `var.field[i] = v`, null when the field is not multi-dimensional.
+pub fn local_field_nd_shape(s: *EmitterState, stmt: *Stmt) -> *ArrayShape
+    var base: Expr
+    base.kind = ExprKind.Ident
+    base.ident_ptr = stmt.var_name
+    base.ident_len = stmt.var_name_len
+    var mem: Expr
+    mem.kind = ExprKind.Member
+    mem.left = @base
+    mem.ident_ptr = stmt.assign_target
+    mem.ident_len = stmt.assign_target_len
+    return nd_array_member_shape(s, @mem)
+
+# AGAST #1946: when `e` is a match / if expression bound or returned at float
+# type (`ty`, or a TypeKind.Struct named "f32" / "f64"), tell it to merge at that
+# type so its phi, every arm and the slot / `ret` agree.  emit_match and
+# emit_if_expr consume the hint on entry.
+pub fn set_match_float_hint(s: *EmitterState, e: *Expr, ty: TypeKind, ty_name_sv: StrView)
+    var ty_name: *u8 = ty_name_sv.ptr
+    var ty_name_len: i32 = ty_name_sv.len as i32
+    s.match_float_hint = TypeKind.Void
+    if e == null
+        return
+    if e.kind != ExprKind.Match and e.kind != ExprKind.If
+        return
+    s.match_float_hint = slot_float_type(ty, StrView { ptr: (ty_name), len: (ty_name_len) as i64 })
+
+# TypeKind.F32 / TypeKind.F64 when a slot of type (ty, ty_name) is a float, else 0.
+pub fn slot_float_type(ty: TypeKind, ty_name_sv: StrView) -> TypeKind
+    var ty_name: *u8 = ty_name_sv.ptr
+    var ty_name_len: i32 = ty_name_sv.len as i32
+    if ty == TypeKind.F32 or ty == TypeKind.F64
+        return ty
+    if ty_name != null and ty_name_len == 3 and is_float_type(ty, StrView { ptr: (ty_name), len: (ty_name_len) as i64 }) == 1
+        if *(ty_name + 1) == '3'   # "f32"
+            return TypeKind.F32
+        return TypeKind.F64
+    TypeKind.Void
+
+# AGAST #3205: the fn's tail statement is a match and the fn returns a struct
+# or enum (`ret_type`, named s.ret_type_name): if no arm yields a value (every
+# arm `return`s), the match's phi is typed as that, which the implicit `ret`
+# names, not i64.  emit_match_arms consumes the hint.
+pub fn set_match_agg_hint(s: *EmitterState, ret_type: TypeKind)
+    if ret_type != TypeKind.Struct
+        return
+    s.match_agg_hint = s.ret_type_name
+    s.match_agg_hint_len = s.ret_type_name_len
+
+# AGAST #2388: 1 for a struct the iterable form walks through its header: a
+# Vec<T>, a Span<T> or a StrView.  ritz0 takes any struct opening with a pointer
+# and an integer; these are the ones that mean it.
+fn is_for_header_name(name_sv: StrView) -> i32
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    if name == null
+        return 0
+    if name_len > 4 and memcmp(name, c"Vec$", 4) == 0
+        return 1
+    if name_len > 5 and memcmp(name, c"Span$", 5) == 0
+        return 1
+    name_eq(StrView { ptr: (name), len: (name_len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 })
+
+# find_struct, for a name that's a header.  Null for anything else, and for a
+# header whose `data` and `len` aren't where the loop reads them.
+pub fn for_header_struct(s: *EmitterState, name_sv: StrView) -> *StructDef
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    if is_for_header_name(StrView { ptr: (name), len: (name_len) as i64 }) == 0
+        return null
+    let st: *StructDef = find_struct(s, StrView { ptr: (name), len: (name_len) as i64 })
+    if st == null or st.fields == null or st.fields.next == null
+        return null
+    let data: *StructField = st.fields
+    if data.field_type != TypeKind.Ptr and data.field_type != TypeKind.PtrPtr
+        return null
+    if data.next.field_type != TypeKind.I64
+        return null
+    st
+
+# What a header's elements are, read off its `data` field as the monomorph left
+# it: a struct T by name, a primitive T in array_elem_type, and `*T` as a `**`
+# field.  1 if that names the element; a type this can't name is refused rather
+# than walked at a guessed stride, which `Vec<S>` was at 8 bytes.
+pub fn for_header_elem(s: *EmitterState, st: *StructDef, out: *ForElem) -> i32
+    let data: *StructField = st.fields
+    if data.field_type == TypeKind.Ptr
+        if data.field_type_name_len > 0
+            # AGAST #2411: a non-generic user enum is a `%C` the loop walks at
+            # its layout (#1797), bound as a struct element is.  AGAST #3647:
+            # and an Option / Result instance (`%Option$i64`), at the layout
+            # tagged_enum_layout gives it, as ptr_pointee_size strides it (#1578).
+            if find_struct(s, StrView { ptr: (data.field_type_name), len: (data.field_type_name_len) as i64 }) == null and user_enum_index(s.mono.pctx, StrView { ptr: (data.field_type_name), len: (data.field_type_name_len) as i64 }) < 0 and is_tagged_enum_type(StrView { ptr: (data.field_type_name), len: (data.field_type_name_len) as i64 }) == 0
+                return 0
+            out.elem = TypeKind.Struct
+            out.name = data.field_type_name
+            out.name_len = data.field_type_name_len
+            return 1
+        if primitive_name_len(data.array_elem_type) == 0
+            return 0
+        out.elem = data.array_elem_type
+        return 1
+    # `Vec$ptr_Node` names Node, and `Vec$ptr_u8` nothing: its pointee is only
+    # in the suffix.  `Vec$ptr_ptr_u8` names no struct there is, and is refused.
+    out.elem = TypeKind.Ptr
+    if data.field_type_name_len > 0
+        if find_struct(s, StrView { ptr: (data.field_type_name), len: (data.field_type_name_len) as i64 }) == null
+            return 0
+        out.pointee = TypeKind.Struct
+        out.pointee_name = data.field_type_name
+        out.pointee_name_len = data.field_type_name_len
+        return 1
+    var after: i32 = 0
+    while after < st.name_len and *(st.name + after) != '$'   # '$'
+        after = after + 1
+    after = after + 5   # `$ptr_`
+    out.pointee = primitive_type_from_name(StrView { ptr: (st.name + after), len: (st.name_len - after) as i64 })
+    1
+
+# The LLVM type of one element of a `for` iterable: `%S` for a struct element.
+# emit_llvm_type spells that i64, which is neither its size nor its stride.
+pub fn emit_for_elem_llvm(s: *EmitterState, elem: TypeKind, name_sv: StrView)
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    if elem == TypeKind.Struct and name_len > 0
+        emit_str(s, IR_PCT)
+        emit_name(s, StrView { ptr: (name), len: (name_len) as i64 })
+    else
+        emit_str(s, ty_value_llvm(elem))
+
+# AGAST #2388: a slot for the header value `val`, which has no place of its own:
+# a call's result, a literal or a const.  Nothing else can write to it.  The alloca
+# is static, so it is written into the fn's entry-block buffer, out of any enclosing loop.
+pub fn emit_for_header_spill(s: *EmitterState, st: *StructDef, val: i32) -> i32
+    let slot: i32 = next_reg(s)
+    entry_alloca_reg_begin_named(s, slot)
+    emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+    emit_str(s, c"\n")
+    entry_alloca_reg_end(s)
+    emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (st.name), len: (st.name_len) as i64 }, val, slot)
+    slot
+
+# The struct a call in iterable position returns by value.  `as_bytes` is only
+# the builtin on a StrView: a user's method of that name is whatever it says.
+pub fn for_call_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    call_result_struct_name(s, e, out_name, out_len)
+    if *out_len > 0 or e.kind != ExprKind.Method or e.left == null or e.left.kind != ExprKind.Ident
+        return
+    if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"as_bytes"), len: (8) as i64 }) == 0
+        return
+    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+    if loc != null and name_eq(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1
+        *out_name = c"Span$u8"
+        *out_len = 7
+
+# AGAST #2410: the LLVM type of what the loop binds: an element, or a `[M x T]` row
+# when `row` is M.  AGAST #3379: or the plane `[M x [N x ..T]]` when `plane`
+# is non-null, spelled as the `[M][N]..T` local's alloca is.
+pub fn emit_for_slot_llvm(s: *EmitterState, elem: TypeKind, name_sv: StrView, row: i32, plane: *ArrayShape)
+    var name: *u8 = name_sv.ptr
+    var name_len: i32 = name_sv.len as i32
+    if plane != null
+        emit_array_shape_llvm(s, plane, 0)
+    else if row > 0
+        emit_str(s, c"[")
+        emit_int(s, row as i64)
+        emit_str(s, IR_X)
+        emit_for_elem_llvm(s, elem, StrView { ptr: (name), len: (name_len) as i64 })
+        emit_str(s, c"]")
+    else
+        emit_for_elem_llvm(s, elem, StrView { ptr: (name), len: (name_len) as i64 })
+
+# AGAST #2410: the array a `*[N]T` / `@[N]T` / `@&[N]T` local points at, read once,
+# with its N and T in the outs.  (`*[N][M]T` doesn't parse on ritz1.)
+pub fn for_array_ptr(s: *EmitterState, loc: *LocalVar, elem: *TypeKind, size: *i32, name: **u8, name_len: *i32, pointee: *TypeKind, p_name: **u8, p_name_len: *i32) -> i32
+    *elem = lv_pointee_array_elem_type(loc)
+    *size = lv_pointee_array_size(loc)
+    var en_len: i32 = 0
+    let en: *u8 = array_ptr_elem_name(loc, @en_len)
+    *name = en
+    *name_len = en_len
+    *pointee = elem_recorded_pointee(s, *elem, lv_pointee_array_elem_pointee(loc), StrView { ptr: (en), len: (en_len) as i64 }, p_name, p_name_len)
+    emit_load_ptr(s, loc.reg)
+
+# AGAST #2533: whether the field `e` names is in a call's temporary, as `mk().a`
+# and `mk().h.a` are with `h` by value.  ritz0 takes no address of one (#2518).
+# AGAST #3207: a link through a pointer leaves the temporary, so `mk().p.a`
+# with `p: *H` is the place `p` points at, as `mkp().a` is with `mkp() -> *H`.
+# `mkp()[0].a` is a place too: an index stops the search.
+pub fn member_in_call_temp(s: *EmitterState, e: *Expr) -> i32
+    var m: *Expr = e
+    while m != null and m.kind == ExprKind.Member and m.left != null
+        let l: *Expr = m.left
+        if l.kind == ExprKind.Call or l.kind == ExprKind.Method
+            # By value only: a `*S` call's field is where the call points.
+            if call_result_ptr_struct(s, l) != null
+                return 0
+            return 1
+        if l.kind != ExprKind.Member
+            return 0
+        # `m` reaches into the field `l` names.  A by-value struct is part of
+        # whatever holds `l`: look further.  A pointer leads elsewhere.  A link
+        # that won't resolve stays refused, as every call's field was.
+        let lf: *StructField = resolve_member_chain_field(s, l)
+        if lf == null
+            return 1
+        if lf.field_type == TypeKind.Ptr or lf.field_type == TypeKind.Ref or lf.field_type == TypeKind.MutRef
+            return 0
+        m = l
+    0
+
+# What a `for x in <iterable>` walks, as for_iter_resolve found it: the
+# iterable's kind and storage, the element's type, and the binding's.
+struct ForIterSrc
+    iter_kind: i32
+    elem_type: TypeKind
+    arr_size: i32
+    data_reg: i32
+    type_name: *u8
+    type_name_len: i32
+    const_name: *u8
+    const_name_len: i32
+    bind_pointee: TypeKind
+    bind_name: *u8
+    bind_name_len: i32
+    elem_name: *u8
+    elem_name_len: i32
+    row_size: i32
+    plane: *ArrayShape
+
+# `for x in a` / `in @a` with `a` named: a local, const or global array (or a
+# Vec / Span local) into `src`.  Returns the iterable's N-D shape, or `nd_in`.
+pub fn for_iter_ident(s: *EmitterState, src: *ForIterSrc, iter: *Expr, arr_ident: *Expr, via_addr: i32, nd_in: *ArrayShape) -> *ArrayShape
+    var nd_shape: *ArrayShape = nd_in
+    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
+    if loc != null
+        if lv_var_type(loc) == TypeKind.Array and lv_array_shape(loc) != null
+            # AGAST #1509: a multi-dimensional array yields rows.  It
+            # used to GEP the alloca as `[N x i64]` and load garbage.
+            nd_shape = lv_array_shape(loc)
+            src.iter_kind = 1
+            src.data_reg = loc.reg
+        else if lv_var_type(loc) == TypeKind.Array
+            src.iter_kind = 1
+            src.elem_type = lv_array_elem_type(loc)
+            src.arr_size = lv_array_size(loc)
+            src.data_reg = loc.reg
+            src.elem_name = lv_type_name(loc)
+            src.elem_name_len = lv_type_name_len(loc)
+            src.bind_pointee = elem_recorded_pointee(s, src.elem_type, lv_array_elem_pointee(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, @src.bind_name, @src.bind_name_len)
+        else if via_addr == 0 and array_ptr_named(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 }) != null
+            # AGAST #2410: `a: *[N]T` / `@[N]T` / `@&[N]T` walks the array
+            # it points at.
+            src.data_reg = for_array_ptr(s, loc, @src.elem_type, @src.arr_size, @src.elem_name, @src.elem_name_len, @src.bind_pointee, @src.bind_name, @src.bind_name_len)
+            src.iter_kind = 1
+    else
+        # Iter is not a local — try a module const array
+        # (`const VALUES: [3]i32 = [2,3,5]`).  emit_const_array_entry
+        # emits `@VALUES = internal constant [3 x i32] [...]`; we GEP
+        # off the global symbol below.
+        let centry: *ConstEntry = find_const_entry(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
+        if centry != null and centry.const_type == TypeKind.Array and (via_addr == 0 or iter.op == OpKind.Addr)
+            src.iter_kind = 3
+            src.elem_type = centry.array_elem_type
+            src.arr_size = centry.array_size
+            src.const_name = centry.name as *u8
+            src.const_name_len = centry.name_len
+            src.elem_name = centry.array_elem_type_name
+            src.elem_name_len = centry.array_elem_type_name_len
+            # AGAST #1866: `for p in T` over a `[N]*u8` table binds a `*u8`.
+            src.bind_pointee = elem_recorded_pointee(s, src.elem_type, centry.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
+        else
+            let glob: *GlobalVarDef = find_global(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
+            if glob != null and glob.var_type == TypeKind.Array and glob.array_shape != null
+                nd_shape = glob.array_shape
+                src.iter_kind = 3
+                src.const_name = glob.name
+                src.const_name_len = glob.name_len
+            else if glob != null and glob.var_type == TypeKind.Array
+                src.iter_kind = 3
+                src.elem_type = glob.array_elem_type
+                src.arr_size = glob.array_size
+                src.const_name = glob.name
+                src.const_name_len = glob.name_len
+                src.elem_name = glob.array_elem_type_name
+                src.elem_name_len = glob.array_elem_type_name_len
+                src.bind_pointee = elem_recorded_pointee(s, src.elem_type, glob.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
+    nd_shape
+
+# GEP `elem_ptr` to element `idx` of what `src` walks: through a Vec / Span /
+# StrView header's data pointer, or into the array (in a reg or at a symbol).
+pub fn emit_for_elem_ptr(s: *EmitterState, src: *ForIterSrc, elem_ptr: i32, idx_val2: i32)
+    if src.iter_kind == 2
+        # `data` is field 0 and `len` field 1, as for_header_struct checked.
+        let data_ptr_ptr: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, data_ptr_ptr)
+        emit_str(s, IR_GEP_NAMED)
+        emit_name(s, StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 })
+        emit_str(s, IR_PTR_SEP)
+        emit_reg(s, src.data_reg)
+        emit_str(s, c", i32 0, i32 0\n")
+        let data_ptr: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, data_ptr)
+        emit_str(s, IR_LOAD_PTR)
+        emit_reg(s, data_ptr_ptr)
+        emit_str(s, c"\n  ")
+        emit_reg(s, elem_ptr)
+        emit_str(s, c" = getelementptr ")
+        emit_for_elem_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 })
+        emit_str(s, IR_PTR_SEP)
+        emit_reg(s, data_ptr)
+        emit_str(s, IR_I64_SEP)
+        emit_reg(s, idx_val2)
+        emit_str(s, IR_NL)
+    else
+        emit_str(s, IR_INDENT)
+        emit_reg(s, elem_ptr)
+        emit_str(s, IR_GEP_ARRAY)
+        emit_int(s, src.arr_size as i64)
+        emit_str(s, IR_X)
+        emit_for_slot_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, src.row_size, src.plane)
+        emit_str(s, IR_RBRACK_PTR)
+        # A local array or a field is an SSA reg; a const or global
+        # array is its symbol.
+        if src.iter_kind == 3
+            emit_str(s, c"@")
+            emit_name(s, StrView { ptr: (src.const_name), len: (src.const_name_len) as i64 })
+        else
+            emit_reg(s, src.data_reg)
+        emit_str(s, IR_I64_ZERO)
+        emit_reg(s, idx_val2)
+        emit_str(s, IR_NL)
+
+# Emit the LLVM type `[N x T]` of inline array field `field`.
+pub fn emit_array_field_llvm_type(s: *EmitterState, field: *StructField)
+    emit_str(s, c"[")
+    emit_int(s, field.array_size as i64)
+    emit_str(s, IR_X)
+    if field.array_elem_type == TypeKind.Struct and field.array_elem_type_name_len > 0
+        emit_str(s, IR_PCT)
+        emit_name(s, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })
+    else
+        emit_str(s, elem_mem_llvm(field.array_elem_type))
+    emit_str(s, c"]")
+
+# Copy `[N x T]` (spelled for `field`) from `src_ptr` over `dst_ptr` as one
+# aggregate load + store: every element is read before any is written.
+# AGAST #1748: an array of SRET_MIN_BYTES or more is copied pointer-to-
+# pointer, as emit_local_array_copy does (#2306): clang -O2 splits a large
+# first-class `[N x T]` load/store into one scalar per element. The two
+# arrays are distinct or the same, never partially overlapping.
+pub fn emit_array_field_copy(s: *EmitterState, field: *StructField, src_ptr: i32, dst_ptr: i32)
+    var align: i64 = 8
+    if elem_size_align(s, field.array_elem_type, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }, @align) * (field.array_size as i64) >= SRET_MIN_BYTES
+        emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
+        emit_reg(s, dst_ptr)
+        emit_str(s, IR_PTR_SEP)
+        emit_reg(s, src_ptr)
+        emit_str(s, c", i64 ptrtoint (ptr getelementptr (")
+        emit_array_field_llvm_type(s, field)
+        emit_str(s, c", ptr null, i32 1) to i64))\n")
+        s.sret_helpers_used = 1
+        return
+    let agg: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, agg)
+    emit_str(s, IR_LOAD)
+    emit_array_field_llvm_type(s, field)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, src_ptr)
+    emit_str(s, c"\n  store ")
+    emit_array_field_llvm_type(s, field)
+    emit_str(s, IR_SP)
+    emit_reg(s, agg)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, dst_ptr)
+    emit_str(s, IR_NL)
+
+# The address of the array behind array_ptr_local's `loc`.
+pub fn emit_array_ptr_base(s: *EmitterState, loc: *LocalVar) -> i32
+    if lv_var_type(loc) == TypeKind.Array
+        return loc.reg
+    return emit_load_ptr(s, loc.reg)
+
+# 1 when `*e` is a whole `[N]T` (array_ptr_shape), which isn't a value on its own.
+pub fn deref_names_array(s: *EmitterState, e: *Expr) -> i32
+    var sh: ArraySrc
+    array_ptr_shape(s, e, @sh)
+
+# AGAST #2517: fill `out` when `value` is a 1-D row of an N-D array (nd_row_shape:
+# `g[i]` of `[N][M]T`, `c[i][j]` of `[N][M][K]T`).  The base is any
+# nd_index_shape knows: a local, a global, a field, or a field of a call's
+# result, by value or through `*S`.  Emits nothing; emit_nd_index_ptr finds it.
+pub fn nd_row_src(s: *EmitterState, value: *Expr, out: *ArraySrc) -> i32
+    if value.kind != ExprKind.Index or value.right == null or value.right.kind == ExprKind.Range
+        return 0
+    let sh: *ArrayShape = nd_row_shape(s, value)
+    if sh == null
+        return 0
+    array_src_set(out, sh.dims[sh.rank - 1], sh.leaf_type, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 })
+
+# The address of global array `g`, in a register.
+pub fn emit_global_array_ptr(s: *EmitterState, g: *GlobalVarDef) -> i32
+    let ptr: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, ptr)
+    emit_str(s, c" = getelementptr i8, ptr @")
+    emit_name(s, StrView { ptr: (g.name), len: (g.name_len) as i64 })
+    emit_str(s, c", i64 0\n")
+    return ptr
+
+# 1 when two N-D shapes are the same type: rank, every dim and the leaf.
+pub fn array_shapes_match(a: *ArrayShape, b: *ArrayShape) -> i32
+    if a.rank != b.rank or a.leaf_pointee != b.leaf_pointee
+        return 0
+    var d: i32 = 0
+    while d < a.rank
+        if a.dims[d] != b.dims[d]
+            return 0
+        d = d + 1
+    array_elem_types_match(a.leaf_type, StrView { ptr: (a.leaf_name), len: (a.leaf_name_len) as i64 }, b.leaf_type, StrView { ptr: (b.leaf_name), len: (b.leaf_name_len) as i64 })
+
+# Copy the dimension-`from` plane of `sh` (the whole array at 0) from
+# `src_ptr` over `dst_ptr`: one aggregate load + store, or pointer-to-pointer
+# when large (as emit_local_array_copy).
+pub fn emit_nd_plane_copy(s: *EmitterState, sh: *ArrayShape, from: i32, dst_ptr: i32, src_ptr: i32)
+    var leaves: i64 = 1
+    var d: i32 = from
+    while d < sh.rank
+        leaves = leaves * (sh.dims[d] as i64)
+        d = d + 1
+    var align: i64 = 8
+    if elem_size_align(s, sh.leaf_type, StrView { ptr: (sh.leaf_name), len: (sh.leaf_name_len) as i64 }, @align) * leaves >= SRET_MIN_BYTES
+        emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
+        emit_reg(s, dst_ptr)
+        emit_str(s, IR_PTR_SEP)
+        emit_reg(s, src_ptr)
+        emit_str(s, c", i64 ptrtoint (ptr getelementptr (")
+        emit_array_shape_llvm(s, sh, from)
+        emit_str(s, c", ptr null, i32 1) to i64))\n")
+        s.sret_helpers_used = 1
+        return
+    let agg: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, agg)
+    emit_str(s, IR_LOAD)
+    emit_array_shape_llvm(s, sh, from)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, src_ptr)
+    emit_str(s, c"\n  store ")
+    emit_array_shape_llvm(s, sh, from)
+    emit_str(s, IR_SP)
+    emit_reg(s, agg)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, dst_ptr)
+    emit_str(s, IR_NL)
+
+# The address of row `idx` of the dimension-`d` plane of `sh` at `ptr`.
+pub fn emit_nd_row_gep(s: *EmitterState, sh: *ArrayShape, d: i32, ptr: i32, idx: i32) -> i32
+    let r: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, r)
+    emit_str(s, c" = getelementptr ")
+    emit_array_shape_llvm(s, sh, d)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, ptr)
+    emit_str(s, IR_I64_ZERO)
+    emit_int(s, idx as i64)
+    emit_str(s, IR_NL)
+    r
+
+# The number of elements an array literal `[a, b, ..]` lists.
+pub fn array_lit_count(e: *Expr) -> i32
+    var n: i32 = 0
+    var it: *Expr = e.args
+    while it != null
+        n = n + 1
+        it = it.next
+    n
+
+# AGAST #2048: `x.f = v` / `pp.f = v` / `o.p.f = v` where `f` is an f32 /
+# f64 field at `field_ptr` and `val_reg` is emit_expr(value).  Stores
+# `float` / `double` (an f64 value into an f32 field is fptrunc'd by
+# emit_field_elem_narrow, as struct-literal init does) and returns 1; returns
+# 0 for any other field type.  Both field-assign paths fell to `store i64`
+# here, which clang rejects.
+pub fn emit_float_field_store(s: *EmitterState, field_ptr: i32, field_ty: TypeKind, val_reg: i32, value: *Expr) -> i32
+    if field_ty != TypeKind.F32 and field_ty != TypeKind.F64
+        return 0
+    let fval: i32 = emit_field_elem_narrow(s, val_reg, field_ty, value)
+    if field_ty == TypeKind.F32
+        emit_str(s, c"  store float ")
+    else
+        emit_str(s, c"  store double ")
+    emit_reg(s, fval)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, field_ptr)
+    emit_str(s, IR_NL)
+    1
+
+# AGAST #1814: `x.f[i] = v` where `f` is an inline `[N]T` array field at
+# `field_ptr`. GEP the element at the field's DECLARED element type
+# (field_array_elem_llvm, ritz0's layout) and store `val` at that width.
+# Shared by both member-index store paths, which used to carry their own
+# i8/i32/i64/ptr ladders and stored u16/u32/bool elements as 8-byte i64.
+# `place` is the array field stored into (`h.a` of `h.a[i] = v`), whose old
+# element is dropped when a binding owns it (own_drop_old_elem, AGAST #3377).
+pub fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructField, idx: i32, val: i32, val_expr: *Expr, place: *Expr)
+    let et: TypeKind = field.array_elem_type
+    var is_struct: bool = false
+    if et == TypeKind.Struct and field.array_elem_type_name_len > 0
+        is_struct = true
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, elem_ptr)
+    emit_str(s, IR_GEP_ARRAY)
+    emit_int(s, field.array_size as i64)
+    emit_str(s, IR_X)
+    if is_struct
+        # AGAST #188: struct-array LHS — `[N x %T]` so the GEP and the store
+        # agree with the struct value being stored.
+        emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })
+    else
+        emit_str(s, elem_mem_llvm(et))
+    emit_str(s, IR_RBRACK_PTR)
+    emit_reg(s, field_ptr)
+    emit_str(s, IR_I64_ZERO)
+    emit_reg(s, idx)
+    emit_str(s, IR_NL)
+    var sty: *u8 = c"i64"
+    var sval: i32 = val
+    if is_struct
+        own_drop_old_elem(s, place, elem_ptr, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })
+        # AGAST #188: `store %T %val` matches the `load %T` of the RHS.
+        # AGAST #4461: an sret-sized struct copied from a held load becomes a
+        # `@__ritz_sret_copy` call instead of a first-class store.
+        emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 }, val, elem_ptr)
+        return
+    match et
+        TypeKind.F32 | TypeKind.F64 =>
+            # AGAST #1954: `float` / `double` (field_array_elem_llvm), an f64
+            # value into an f32 slot fptrunc'd, as #1973's `p[i] = v` does.
+            # f32 failed closed; f64 stored `i64`, which only type-checked while
+            # the `x.f[i]` read also bit-loaded an i64.
+            sty = elem_mem_llvm(et)
+            sval = emit_field_elem_narrow(s, val, et, val_expr)
+        TypeKind.Bool =>
+            # A bool value is an i64 register (AGAST #1646): truncate it.
+            sty = c"i1"
+            sval = next_reg(s)
+            emit_str(s, IR_INDENT)
+            emit_reg(s, sval)
+            emit_str(s, IR_TRUNC)
+            emit_reg(s, val)
+            emit_str(s, c" to i1\n")
+        _ =>
+            # Integers / pointers at their own width (trunc / inttoptr); i64
+            # elements store all 8 bytes.
+            sty = elem_mem_llvm(et)
+            if (et == TypeKind.Ptr or et == TypeKind.PtrPtr) and expr_is_ptr_valued(s, val_expr) == 1
+                sval = val   # AGAST #3170: `h.a[i] = @&x` into a `[N]*T` field: a `ptr` already
+            else
+                sval = emit_array_elem_narrow(s, val, et, sty)
+    emit_str(s, IR_STORE_IND)
+    emit_str(s, sty)
+    emit_str(s, IR_SP)
+    emit_reg(s, sval)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, elem_ptr)
+    emit_str(s, IR_NL)
+
+# AGAST #2559: the struct type of a statement-`if` arm's value, or null/0.
+# The arm's last statement is its value: a trailing expression (a static
+# call `B.new(..)` is typed by its callee), a `match` (emit_match published
+# its phi type, #1666), or a nested statement `if` (an `else if` chain),
+# which published its own.  Called right after the arm is emitted, so its
+# `let`s are still in scope.
+pub fn if_stmt_arm_agg(s: *EmitterState, list: *Stmt, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    var last: *Stmt = list
+    if last == null
+        return
+    while last.next != null
+        last = last.next
+    match last.kind
+        StmtKind.If =>
+            *out_name = s.last_if_stmt_agg_name
+            *out_len = s.last_if_stmt_agg_name_len
+            return
+        StmtKind.Match =>
+            *out_name = s.last_match_agg_name
+            *out_len = s.last_match_agg_name_len
+            return
+        _ => pass
+    if last.kind != StmtKind.Expr or last.expr == null
+        return
+    let e: *Expr = last.expr
+    let lent: *LocalVar = lent_referent_local(s, e)
+    if lent != null   # AGAST #2288: emit_if_stmt_arm read the referent
+        *out_name = lv_type_name(lent)
+        *out_len = lv_type_name_len(lent)
+        return
+    resolve_expr_struct_name(s, e, out_name, out_len)
+    if *out_name == null
+        call_result_struct_name(s, e, out_name, out_len)
+    if *out_name == null
+        span_assoc_arm_type(s, e, out_name, out_len)   # AGAST #4194
+    # AGAST #2950: `*r` with `r: @C` / `@&C` / `*C` loads the %C.
+    if *out_name == null and e.kind == ExprKind.Unary and e.op == OpKind.Deref
+        deref_pointee_struct_name(s, e.operand, out_name, out_len)
+
+# AGAST #2950: a statement-`if` arm's `@&x` value `reg` (a `ptr`) as the i64
+# its phi holds, asked while the arm's `let`s are in scope.  The phi was i64
+# over `ptr`s; a tail one in a `-> @&C` fn is converted back at the `ret`
+# (emit_implicit_return_tail).
+pub fn if_stmt_arm_ptr_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: *u8) -> i32
+    if reg <= 0 or agg != null
+        return reg
+    var last: *Stmt = list
+    while last.next != null
+        last = last.next
+    if last.kind != StmtKind.Expr or arm_value_is_ptr(s, last.expr) == 0
+        return reg
+    ptr_value_to_i64(s, last.expr, reg)
+
+# 1 if `st` is an `if` / `match`, as a statement or an expression statement.
+pub fn stmt_is_if_or_match(st: *Stmt) -> i32
+    if st.kind == StmtKind.If or st.kind == StmtKind.Match
+        return 1
+    if st.kind == StmtKind.Expr and st.expr != null and (st.expr.kind == ExprKind.If or st.expr.kind == ExprKind.Match)
+        return 1
+    0
+
+# AGAST #3421: settle a statement-`if` arm's scalar value `reg` against the
+# merge's float type `fr` in the arm's own block, before its `br`, as a match
+# arm's is (LARB R43, §7.5: an integer arm converts in a float slot and is
+# refused next to a float arm without one).  The arm's value is its last
+# statement: an expression, or a nested `if` / `match` statement, whose phi
+# type it published (last_match_float_ty).  Its phi was `i64` over doubles.
+pub fn if_stmt_arm_float_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: *u8, fr: *MatchResult) -> i32
+    if reg <= 0 or agg != null
+        return reg
+    var last: *Stmt = list
+    while last.next != null
+        last = last.next
+    if last.kind == StmtKind.Expr and last.expr != null
+        return match_arm_float_settle(s, last.expr, reg, fr)
+    if last.kind == StmtKind.If or last.kind == StmtKind.Match
+        return float_arm_settle(s, s.last_match_float_ty, null, last.span, reg, fr)
+    reg
+
+# 1 if the statement `if` `stmt` has no value to give: a statement follows
+# it, or its list's value is unread (s.if_stmt_discarded).  Consumes the mark.
+pub fn if_stmt_is_discarded(s: *EmitterState, stmt: *Stmt) -> i32
+    let marked: *Stmt = s.if_stmt_discarded
+    s.if_stmt_discarded = null
+    if stmt.next != null or stmt == marked
+        return 1
+    0
+
+# AGAST #3323: an arm's phi incoming.  An arm that never reaches the merge (a
+# `return`, a `while true` with no `break`) has no value, but the phi still
+# names its block, so it gets IF_ARM_DIVERGES and the zero constant of the
+# phi's type: `if c / return a / else / b` as a fn tail.  Its merge was
+# `unreachable` with no phi, dropping the else value (a SIGSEGV).
+const IF_ARM_DIVERGES: i32 = -1
+
+pub fn if_stmt_arm_incoming(result: i32, list: *Stmt) -> i32
+    if result > 0
+        return result
+    if tail_stmts_diverge(list) == 1
+        return IF_ARM_DIVERGES
+    0
+
+pub fn emit_if_phi_incoming(s: *EmitterState, reg: i32, agg: *u8, float_ty: TypeKind)
+    if reg != IF_ARM_DIVERGES
+        emit_reg(s, reg)
+    else if agg != null
+        emit_str(s, c"zeroinitializer")
+    else if float_ty != TypeKind.Void
+        emit_str(s, c"0.0")   # AGAST #3421
+    else
+        emit_str(s, c"0")
+
+# AGAST #2563: the phi type a statement-`if` arm of struct type `agg` asks
+# for.  The Span$u8 / StrView pair (layout-equal, #168) takes the fn's return
+# type when that is one of the two, since a tail `if` feeds the implicit
+# `ret`: a `"..."` arm is a %Span$u8 (#98) but a `-> StrView` fn returns
+# %StrView.  Any other type is `agg` itself.
+pub fn if_stmt_phi_type(s: *EmitterState, agg_sv: StrView, ret_type: TypeKind, out_name: **u8, out_len: *i32)
+    var agg: *u8 = agg_sv.ptr
+    var agg_len: i32 = agg_sv.len as i32
+    *out_name = agg
+    *out_len = agg_len
+    if agg == null or agg_len <= 0 or ret_type != TypeKind.Struct or s.ret_type_name_len <= 0
+        return
+    if is_layout_equiv_pair(StrView { ptr: (agg), len: (agg_len) as i64 }, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }) == 1
+        *out_name = s.ret_type_name
+        *out_len = s.ret_type_name_len
+
+# AGAST #2563: rebuild a statement-`if` arm's value `reg` of type `agg` as
+# the phi's type when they are the Span$u8 / StrView pair, in the arm's own
+# block before its `br` (as emit_match_arm_body does, #1662).
+pub fn if_stmt_arm_settle(s: *EmitterState, reg: i32, agg_sv: StrView, phi_sv: StrView) -> i32
+    var agg: *u8 = agg_sv.ptr
+    var agg_len: i32 = agg_sv.len as i32
+    var phi: *u8 = phi_sv.ptr
+    var phi_len: i32 = phi_sv.len as i32
+    if reg > 0 and is_layout_equiv_pair(StrView { ptr: (agg), len: (agg_len) as i64 }, StrView { ptr: (phi), len: (phi_len) as i64 }) == 1
+        return rebuild_layout_equiv(s, reg, StrView { ptr: (agg), len: (agg_len) as i64 }, StrView { ptr: (phi), len: (phi_len) as i64 })
+    reg
+
+# 1 if range `for j in a..b` is unsigned: a bound is a u64, by binary `<`'s
+# rule (emit_expr_binary, #2361), so `for j in 0..big` with `big: u64 = 1 << 63`
+# runs (#1636) and `-3..2` stays signed.  This one answer picks both the
+# compare and j's type in the body (#3328).  ritz0's _for_range_unsigned.
+pub fn for_range_unsigned(s: *EmitterState, stmt: *Stmt) -> i32
+    var start_uns: i32 = 0
+    var end_uns: i32 = 0
+    let start_bits: i32 = int_operand_shape(s, stmt.for_start, @start_uns)
+    let end_bits: i32 = int_operand_shape(s, stmt.for_end, @end_uns)
+    if (start_bits == 64 and start_uns == 1) or (end_bits == 64 and end_uns == 1)
+        return 1
+    0
+
+# AGAST #4080: the type for_range_type gives `for x in a..b`'s x, from the
+# bounds as int_operand_shape reads them (a literal is told apart first).
+pub fn for_range_var_type(s: *EmitterState, stmt: *Stmt) -> TypeKind
+    var sv: i64 = 0
+    var ev: i64 = 0
+    let lit_s: i32 = lit_int_value(stmt.for_start, @sv)
+    let lit_e: i32 = lit_int_value(stmt.for_end, @ev)
+    var su: i32 = 0
+    var eu: i32 = 0
+    let sb: i32 = int_operand_shape(s, stmt.for_start, @su)
+    let eb: i32 = int_operand_shape(s, stmt.for_end, @eu)
+    for_range_type(int_kind_of(sb, su), lit_s, sv, int_kind_of(eb, eu), lit_e, ev)
+
+# A range bound's i64 register at the loop variable's type `t`: truncated when
+# `t` is narrower (ritz1 holds every integer in an i64), else as it is.
+pub fn for_bound_at(s: *EmitterState, reg: i32, t: TypeKind) -> i32
+    let bits: i32 = ty_int_bits(t)
+    if bits == 0 or bits >= 64
+        return reg
+    let r: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, r)
+    emit_str(s, IR_TRUNC)
+    emit_reg(s, reg)
+    emit_str(s, IR_TO_SP)
+    emit_str(s, ty_mem_llvm(t))
+    emit_str(s, IR_NL)
+    r
+
+# `break`, running the defers of the scopes it leaves.
+pub fn emit_break_stmt(s: *EmitterState, stmt: *Stmt)
+    if s.break_label >= 0
+        own_loop_jump(s, 0)   # AGAST #2158: drop the loop body's bindings
+        emit_str(s, IR_BR)
+        emit_label(s, s.break_label)
+        emit_str(s, IR_NL)
+        let dead_label: i32 = next_label(s)
+        # `begin_block` makes the dead block the active insertion
+        # point, so the enclosing IF/loop captures the right
+        # `current_label` when building PHI predecessor labels.
+        # Without this, then/else_exit labels point at the pre-break
+        # block which isn't actually a CFG predecessor of the merge —
+        # LLVM's "Remove unreachable blocks" pass then crashes when it
+        # tries to remove the real (dead) predecessor from the PHI.
+        # (ritz-task-195)
+        begin_block(s, dead_label)
+        clear_last_expr(s)
+
+
+# `continue`, running the defers of the scopes it leaves.
+pub fn emit_continue_stmt(s: *EmitterState, stmt: *Stmt)
+    if s.continue_label >= 0
+        own_loop_jump(s, 1)   # AGAST #2158
+        emit_str(s, IR_BR)
+        emit_label(s, s.continue_label)
+        emit_str(s, IR_NL)
+        let dead_label: i32 = next_label(s)
+        # Same rationale as StmtKind.Break above. (ritz-task-195)
+        begin_block(s, dead_label)
+        clear_last_expr(s)
+
+
+
+# =============================================================================
+# From emitter_match.ritz (AGAST #1818): pure helpers the above needs.
+# =============================================================================
+struct MatchResult
+    values: *i32   # register numbers holding each arm's result
+    labels: *i32   # exit label numbers for each arm's result
+    count: i32
+    # AGAST #1645: LLVM struct type the arms yield (`%StrView`, `%Point`),
+    # or null when they yield the usual i64 scalar.  The merge phi is emitted
+    # at this type.
+    agg_name: *u8
+    agg_name_len: i32
+    # AGAST #1946: TypeKind.F32 / TypeKind.F64 when the arms yield a float, else 0.
+    # Fixed by the enclosing let / return's hint (match_float_hint) or by
+    # the first float-valued arm; later arms are coerced to it.
+    float_ty: TypeKind
+    # AGAST #2092: the enclosing let / return's float hint itself (0 if
+    # none), handed on to a match / if that is an arm's value tail so the
+    # annotation reaches every nested tail, as in ritz0.  Unlike float_ty it
+    # is never set by an arm: an unannotated match passes nothing down.
+    hint_ty: TypeKind
+    # Arms recorded as i64 values before float_ty was fixed: they cannot be
+    # coerced after the fact (their `br` is already emitted).
+    int_arms: i32
+    # AGAST #1654: arms whose body expression produced no value (a call to a
+    # void fn: emit_expr returns register 0, which is never defined).  Any
+    # such arm makes the match valueless: emit_match emits no phi.
+    void_arms: i32
+    # AGAST #2046: where the first valueless arm is (its innermost void
+    # call), for the error when the match's value is wanted.
+    void_line: i32
+    void_col: i32
+    # AGAST #2950: 1 when every value arm yields a `ptr` (`@&x`), so the phi
+    # is a `ptr` (arms_ptr_valued, asked before the arms are emitted).
+    ptr_ty: i32
+    # AGAST #3276: the whole `[N]T` each arm stores its value into, or null
+    # (the arms meet in a phi).  See emit_match_into.
+    into: *ArrayInto
+    # AGAST #3696: the `alloca %T` register every arm of a large struct %T
+    # (at the sret threshold) stores its value into, or 0.  The merge loads
+    # it instead of a `phi %T`.  slot_misses counts value arms recorded
+    # before the slot existed; any forces the phi back (match_merge_slot).
+    slot: i32
+    slot_misses: i32
+    # AGAST #3028: 1 when nothing reads the match's value (a match statement
+    # before the block's last, or an expression arm of such a match).  An
+    # expression arm's `t` with `t:& T` then reads nothing, as in ritz0.
+    discarded: i32
+
+# AGAST #3276: where a `match` of whole arrays stores each arm's array: the
+# `[N x T]` at `ptr`, held to N (`size`) and T (`et`; a struct's `name`).
+struct ArrayInto
+    ptr: i32
+    size: i32
+    et: TypeKind
+    name: *u8
+    name_len: i32
+
+# AGAST #1946: the float type (TypeKind.F32 / TypeKind.F64) arm value `e` was just
+# emitted at, or 0.  A nested match / if publishes its phi type as it
+# completes, which is immediately before this is asked.
+pub fn match_arm_float_ty(s: *EmitterState, e: *Expr) -> TypeKind
+    if e.kind == ExprKind.Match or e.kind == ExprKind.If
+        return s.last_match_float_ty
+    binop_operand_float_ty(s, e)
+
+# AGAST #1946: settle a scalar arm's value against the phi's float type.  A
+# float slot (result.hint_ty) fixes it up front; otherwise the first float arm
+# does, and an integer arm on either side of it is an error (LARB R43).  Once
+# fixed, a float of the other width, or in a slot an integer, is converted in
+# the arm's own block before its `br`.  Called while
+# the arm's pattern binding is in scope.  Returns the register to record.
+pub fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, result: *MatchResult) -> i32
+    float_arm_settle(s, match_arm_float_ty(s, arm_body), arm_body, arm_body.span, body_reg, result)
+
+# AGAST #3421: match_arm_float_settle for an arm whose value is of float type
+# `aft` (0 if none).  A statement `if`'s arms come here too, and one whose
+# value is a nested statement `if` / `match` has no expression (`arm_body`
+# null): its phi's type is `aft`, and if that is an integer in a float merge,
+# it is the R43 mix (the nested one had the slot too, so it would be float).
+# `at` is the arm's value, where an R43 mix is reported (AGAST #3621).
+pub fn float_arm_settle(s: *EmitterState, aft: TypeKind, arm_body: *Expr, at: SrcSpan, body_reg: i32, result: *MatchResult) -> i32
+    if result.float_ty == TypeKind.Void
+        if aft == TypeKind.Void
+            result.int_arms = result.int_arms + 1
+            return body_reg
+        if result.int_arms > 0
+            emit_ir_error(s, at, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+        result.float_ty = aft
+        return body_reg
+    if aft == result.float_ty
+        return body_reg
+    if aft != TypeKind.Void
+        return emit_float_coerce(s, body_reg, aft, result.float_ty)
+    if arm_body == null
+        emit_ir_error(s, at, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+        return body_reg
+    let is_int: bool = is_int_const_type(expr_slot_ty(arm_body)) == 1
+    # LARB R43 (#3385): with no float slot (hint_ty 0) the float type came
+    # from an earlier arm, and an integer arm next to it is refused, as one
+    # BEFORE the first float arm is above: the rule doesn't depend on order.
+    # The slot is known before any arm is emitted, so no pre-pass is needed.
+    if is_int and result.hint_ty == TypeKind.Void
+        emit_ir_error(s, at, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+        return body_reg
+    # AGAST #3313, LARB R43a: an integer arm lands in the float slot as
+    # `let a: f64 = x` does (§7.5): a literal or an exact type (i32 into
+    # f64) converts, a lossy one (i64) is refused (ritz0 does the same).
+    if is_int
+        return emit_int_into_float_slot(s, body_reg, float_slot_unsigned(arm_body), result.float_ty)
+    # A pointer arm was refused on Sema, in ritz0's words (AGAST #3626, #3892).
+    emit_ir_error(s, arm_body.span, c"match arm yields a non-numeric value where the other arms yield a float")
+    body_reg

@@ -15,6 +15,8 @@ import emitter_expr_call
 import emitter_match
 import ritzlib.io
 import ritzlib.str
+import emitter_call_lower   # AGAST #1818: split out below the emitter cycle
+import emitter_decl   # AGAST #1818: split out below the emitter cycle
 
 
 # Check if ident name is "None" (4 chars: N o n e).
@@ -42,11 +44,6 @@ pub fn users_none_wins(s: *EmitterState, e: *Expr) -> i32
     if resolve_enum_ctx(s, @bn, @bn_len) == 1
         return 0
     1
-
-# AGAST #3054: an array Sema refused in a pointer slot's own words never gets
-# here (ref_value.ritz): any Sema error stops the compile before emission.
-pub fn emit_whole_array_error(s: *EmitterState, e: *Expr)
-    emit_nd_error(s, e.span.line, e.span.col, c"a whole array is not a value here (index it, copy it into an array of the same type, or take its address with @)")
 
 pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
     # AGAST #1509: a multi-dimensional array as a whole value (`h = g`,
@@ -616,11 +613,6 @@ pub fn whole_struct_elem_refused(s: *EmitterState, e: *Expr) -> i32
         return 0
     return struct_value_refused(s, e, whole_struct_value_message())
 
-# A whole struct element or deref (`a[i]`, `*q`) in an integer slot: one message
-# for both (AGAST #2525).
-pub fn whole_struct_value_message() -> *u8
-    return c"a whole struct is not a value here in ritz1 (copy it into a `let s: S`, or read its fields)"
-
 # The shared refusal: a struct value `e` where a number goes, located at `e`
 # with `msg`.  1 when refused; 0 when `e` is the copy being emitted.
 fn struct_value_refused(s: *EmitterState, e: *Expr, msg: *u8) -> i32
@@ -628,30 +620,6 @@ fn struct_value_refused(s: *EmitterState, e: *Expr, msg: *u8) -> i32
         return 0
     emit_nd_error(s, e.span.line, e.span.col, msg)
     return 1
-
-# AGAST #3008: the plain struct `e` is by value, when it is a local, a param or
-# a call result (`s`, `mk()`, `q.make()`); null/0 otherwise.  An enum, which
-# resolve_expr_struct_name names too, is no struct to find_struct: it is an
-# integer to `as` (§10.4) with its own refusals.  A `[N]S` element is
-# whole_struct_elem_refused's.
-pub fn struct_value_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
-    if e == null
-        return
-    var name: *u8 = null
-    var len: i32 = 0
-    if e.kind == ExprKind.Unary and e.op == OpKind.Deref and e.operand != null
-        # AGAST #2525: `*q`, `*(q + i)` with `q: *S`, which loads the `%S`.
-        deref_pointee_struct_name(s, e.operand, @name, @len)
-    else if e.kind == ExprKind.Ident or e.kind == ExprKind.Call or e.kind == ExprKind.Method
-        resolve_expr_struct_name(s, e, @name, @len)
-    else
-        return
-    if name == null or len == 0 or find_struct(s, StrView { ptr: (name), len: (len) as i64 }) == null
-        return
-    *out_name = name
-    *out_len = len
 
 # AGAST #3008: `s as i32`, `mk() as i32` on a struct `S`: ritz0's refusal (#2999).
 # ritz1 emitted the `%S` as the integer and clang refused the IR.  1 when refused.

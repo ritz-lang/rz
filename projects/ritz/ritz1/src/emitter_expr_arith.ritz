@@ -23,6 +23,9 @@ import float_slot            # fs_literal_only (AGAST #4285)
 import ritzlib.io
 import ritzlib.str
 import ritzlib.memory      # malloc: a trap's message (AGAST #3489)
+import emitter_call_lower   # AGAST #1818: split out below the emitter cycle
+import emitter_decl   # AGAST #1818: split out below the emitter cycle
+import emitter_stmt_parts   # AGAST #1818: split out below the emitter cycle
 
 
 # The Option / Result `e` is, by its type, or as a constructor naming one; null.
@@ -716,132 +719,6 @@ fn emit_float_binop(s: *EmitterState, e: *Expr, fty_t: TypeKind, left_in: i32, r
     return result_f
 
 
-# AGAST #2356: the width in bits of integer expression `e`, with *uns set if it
-# is unsigned.  get_expr_type says a binary has its left operand's type, which
-# would make `(1 + a) >> 1` signed for `a: u64`.  Here the wider operand wins, at
-# equal width the unsigned one does (as #1604 has it for `/` and `<`), and a
-# shift keeps its left operand's signedness.  A literal operand is the other
-# operand's type (LARB R21, AGAST #3112), except on the left of a shift: with
-# `m: u32`, `m + 1` is a u32.  A lone literal, or two, is an i64, unless only a
-# u64 can hold it, in which case the lexer has wrapped it negative: `-8` is a
-# negated literal.  This is ritz0's _int_shape.
-pub fn int_operand_shape(s: *EmitterState, e: *Expr, uns: *i32) -> i32
-    *uns = 0
-    if e.kind == ExprKind.IntLit
-        if e.int_val < 0
-            *uns = 1
-        return 64
-    if e.kind == ExprKind.Unary and (e.op == OpKind.Neg or e.op == OpKind.BitNot)
-        return int_operand_shape(s, e.operand, uns)
-    if e.kind == ExprKind.Binary and is_int_arith_op(e.op) == 1
-        let lit_l: i32 = is_untyped_int_lit(e.left)
-        let lit_r: i32 = is_untyped_int_lit(e.right)
-        if lit_r == 1 and lit_l == 0
-            return int_operand_shape(s, e.left, uns)
-        if lit_l == 1 and lit_r == 0 and e.op != OpKind.Shl and e.op != OpKind.Shr
-            return int_operand_shape(s, e.right, uns)
-        var lu: i32 = 0
-        var ru: i32 = 0
-        let lb: i32 = int_operand_shape(s, e.left, @lu)
-        let rb: i32 = int_operand_shape(s, e.right, @ru)
-        if e.op == OpKind.Shl or e.op == OpKind.Shr
-            *uns = lu
-            if rb > lb
-                return rb
-            return lb
-        if lb > rb
-            *uns = lu
-            return lb
-        if rb > lb
-            *uns = ru
-            return rb
-        *uns = lu | ru
-        return lb
-    # A compare or `and` is a bool in an i64, whatever its operands are.
-    if e.kind == ExprKind.Binary
-        return 64
-    let t: TypeKind = int_leaf_type(s, e)
-    if t == TypeKind.U64
-        *uns = 1
-        return 64
-    var signed: i32 = 1
-    let bits: i32 = type_code_scalar_bits(t, @signed)
-    *uns = 1 - signed
-    bits
-
-# The declared type of a non-operator expression.  get_expr_type answers what its
-# callers need, whether a value is a float or a pointer, so a u64 array element,
-# const or method result is the i64 it is held in.  Every one of those is a u64
-# that an `ashr` would sign-fill, so the forms it can't type are resolved here.
-fn int_leaf_type(s: *EmitterState, e: *Expr) -> TypeKind
-    if e.kind == ExprKind.Ident
-        if find_local_idx(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0 and find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == null
-            let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-            if ce != null
-                return ce.const_type
-    else if e.kind == ExprKind.Index and (e.right == null or e.right.kind != ExprKind.Range)
-        let et: TypeKind = indexed_elem_type(s, e.left)
-        if et != TypeKind.Unknown
-            return et
-    else if e.kind == ExprKind.Member and e.left != null
-        # `x[i].f` and `(*p).f`: a field of the element's or pointee's struct.
-        var sn: *u8 = null
-        var sl: i32 = 0
-        if e.left.kind == ExprKind.Index
-            index_elem_struct_name(s, e.left, @sn, @sl)
-        else if e.left.kind == ExprKind.Unary and e.left.op == OpKind.Deref
-            deref_member_base_struct_name(s, e.left.operand, @sn, @sl)
-        if sl > 0
-            let st: *StructDef = find_struct(s, StrView { ptr: (sn), len: (sl) as i64 })
-            if st != null
-                let fi: i32 = find_field_index(st, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-                if fi >= 0
-                    let ef: *StructField = get_field_type(st, fi)
-                    return ef.field_type
-    else
-        match e.kind
-            ExprKind.Method =>
-                let mt: TypeKind = user_method_ret_type(s, e)
-                if mt != TypeKind.Unknown
-                    return mt
-            ExprKind.Call =>
-                # A call through a `fn(...) -> T` local.
-                let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 })
-                if lv != null and lv_fn_sig(lv) != null
-                    return lv_fn_sig(lv).return_type
-            _ => pass
-    expr_slot_ty(e)
-
-# The element type of array or pointer `base`, for what get_expr_type leaves at
-# i64: a `[N]T` local, global or const, and an array or `*T` field.
-fn indexed_elem_type(s: *EmitterState, base: *Expr) -> TypeKind
-    match base.kind
-        ExprKind.Ident =>
-            let lv: *LocalVar = find_local_struct_name(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-            if lv != null
-                if lv_var_type(lv) == TypeKind.Array
-                    return lv_array_elem_type(lv)
-                return vec_name_elem_type(StrView { ptr: (lv_type_name(lv)), len: (lv_type_name_len(lv)) as i64 })
-            let g: *GlobalVarDef = find_global(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-            if g != null
-                if g.var_type == TypeKind.Array
-                    return g.array_elem_type
-                return TypeKind.Unknown
-            let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (base.ident_ptr), len: (base.ident_len) as i64 })
-            if ce != null and ce.const_type == TypeKind.Array
-                return ce.array_elem_type
-        ExprKind.Member =>
-            let f: *StructField = member_field_def(s, base)
-            if f != null
-                if f.field_type == TypeKind.Array
-                    return f.array_elem_type
-                let vt: TypeKind = vec_name_elem_type(StrView { ptr: (f.field_type_name), len: (f.field_type_name_len) as i64 })
-                if vt != TypeKind.Unknown
-                    return vt
-                return ptr_field_elem_kind(f)
-        _ => pass
-    TypeKind.Unknown
-
 # AGAST #3225: the slot `/` or `%` node `e` lands in directly, when it's wider
 # than `e`'s own integer type (literal_slot.ritz, lit_slot_arith); else
 # TypeKind.Void.  ritz0's _wider_slot.  LARB R63 (AGAST #3489): `+ - *` and
@@ -859,23 +736,6 @@ fn wider_slot_type(s: *EmitterState, e: *Expr) -> TypeKind
     if bits <= int_operand_shape(s, e, @uns)
         return TypeKind.Void
     t
-
-fn is_int_arith_op(op: OpKind) -> i32
-    match op
-        OpKind.Add | OpKind.Sub | OpKind.Mul | OpKind.Div | OpKind.Mod =>
-            return 1
-        OpKind.BitAnd | OpKind.BitOr | OpKind.BitXor | OpKind.Shl | OpKind.Shr =>
-            return 1
-        _ => pass
-    0
-
-# 1 when `e` is an untyped integer literal, `-` and all: ritz0's
-# _untyped_int_literal.  `true`, `pass` and `()` are literals of another kind.
-fn is_untyped_int_lit(e: *Expr) -> i32
-    if e == null
-        return 0
-    var v: i64 = 0
-    lit_int_value(e, @v)
 
 # AGAST #2356: a register holds an i64, so `a + a` or `~a` on a u8 can sit outside
 # the u8's range, and the bits a `>>` brings down would be ones the type does not
@@ -1415,23 +1275,6 @@ fn emit_call_temp_ptr(s: *EmitterState, op: *Expr) -> i32
     emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (name), len: (len) as i64 }, v, slot)
     slot
 
-# LARB R48 (AGAST #3392): `name` is a module const that no local or global of
-# the name shadows: its ConstEntry, else null.
-fn unshadowed_const(s: *EmitterState, name_sv: StrView) -> *ConstEntry
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if find_local_idx(s, StrView { ptr: (name), len: (len) as i64 }) >= 0 or find_global(s, StrView { ptr: (name), len: (len) as i64 }) != null
-        return null
-    find_const_entry(s, StrView { ptr: (name), len: (len) as i64 })
-
-# A const array emit_const_array_entry lowers to `@A = internal constant`.
-fn const_array_global(ce: *ConstEntry) -> i32
-    if ce == null or ce.const_type != TypeKind.Array or ce.value_expr == null
-        return 0
-    if ce.value_expr.kind != ExprKind.ArrayLit and ce.value_expr.kind != ExprKind.ArrayFill
-        return 0
-    1
-
 # AGAST #3978: 1 if `c` is `const D: [N]StrView = ["s"; N]`, the one struct
 # fill §3.3 allows (ritz0's is_strview_array fill).  emit_const_array_entry
 # lowers it as a `[N x %StrView]` of N views over one backing string.
@@ -1447,27 +1290,6 @@ pub fn const_struct_fill_refused(c: *ConstEntry) -> i32
     if const_struct_fill_global(c) == 0 or const_strview_fill(c) == 1
         return 0
     1
-
-# 1 if `c` is a struct table emit_const_array_entry declares as `[N x %S]`,
-# so `@T[i]` is a `*S` into it: a literal, or a struct fill
-# (const_struct_fill_global).
-fn const_struct_table(c: *ConstEntry) -> i32
-    if const_array_global(c) == 0 or c.array_elem_type != TypeKind.Struct or c.array_elem_type_name_len <= 0
-        return 0
-    if c.value_expr.kind != ExprKind.ArrayLit and const_struct_fill_global(c) == 0
-        return 0
-    1
-
-# AGAST #3976: the const struct table `@op[i]` borrows an element of, which
-# emit_const_array_ptr GEPs as a `*S`; null when `op` names none.  A `let` of
-# it takes S from here, as #3129 does `@ga[i]` of a global.
-pub fn const_struct_table_named(s: *EmitterState, op: *Expr) -> *ConstEntry
-    if op == null or op.kind != ExprKind.Ident
-        return null
-    let c: *ConstEntry = unshadowed_const(s, StrView { ptr: (op.ident_ptr), len: (op.ident_len) as i64 })
-    if const_struct_table(c) == 0
-        return null
-    c
 
 # LARB R48 (AGAST #3392): `@A` and `@A[i]` of a const array are shared
 # references into its read-only global, `@[N]T` and `@T` (ritz0 #3391).  `@A`

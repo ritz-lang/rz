@@ -176,11 +176,13 @@ def test_struct_change_rebuilds_every_importer(tree: Path) -> None:
 
 @pytest.mark.integration
 def test_transitive_import_change_rebuilds(tree: Path) -> None:
-    # main does not import emitter_stmt directly, only via emitter.  (Not
-    # emitter_core: main uses its names, so imports it, AGAST #3891.)
+    # main does not import emitter_decl directly, only via emitter ->
+    # emitter_stmt.  (Not emitter_core: main uses its names, so imports it,
+    # AGAST #3891.  Not emitter_stmt: it declares no struct since #1818 moved
+    # DeclTy to emitter_decl.)
     main_imports = IMPORT_RE.findall((tree / "ritz1/src/main.ritz").read_text())
-    assert "emitter_stmt" not in main_imports and "emitter" in main_imports
-    _edit_struct(tree / "ritz1" / "src" / "emitter_stmt.ritz")
+    assert "emitter_decl" not in main_imports and "emitter" in main_imports
+    _edit_struct(tree / "ritz1" / "src" / "emitter_decl.ritz")
     assert "main.ritz" in set(_make(tree))
 
 

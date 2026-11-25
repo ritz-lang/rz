@@ -178,10 +178,11 @@ def test_the_emitter_names_tuples_without_writing_the_node():
     # node is left as the parse built it.  `sub_e` and `id` below are nodes the
     # emitter builds, so they are not write-backs (emitter_print.ritz's fmt_*
     # constructors are new nodes too).
-    expr = (SRC / "emitter_expr.ritz").read_text()
+    # The tuple naming moved to emitter_decl.ritz with the let inference (AGAST #1818).
+    expr = (SRC / "emitter_expr.ritz").read_text() + "\n" + (SRC / "emitter_decl.ritz").read_text()
     writes = re.findall(r"^\s+e\.(?:ident_ptr|ident_len)\s*=", expr, re.MULTILINE)
     assert writes == [], (
-        "emitter_expr.ritz still writes a field of an existing Expr node "
+        "emitter_expr.ritz / emitter_decl.ritz still write a field of an existing Expr node "
         f"({len(writes)} sites): tuple naming must return the name, not store it")
     for fn in ("tuple_lit_infer", "tuple_lit_name"):
         m = re.search(rf"^(?:pub )?fn {fn}\(.*$", expr, re.MULTILINE)

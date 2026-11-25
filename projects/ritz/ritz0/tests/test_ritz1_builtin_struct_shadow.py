@@ -470,7 +470,7 @@ _STRUCTDEF_BUILDERS = {
     ("types.ritz", "view_struct_new"): 1,
     # Tuple structs: nameless literals the source cannot spell.
     ("sema.ritz", "sema_tuple_new"): 1,
-    ("emitter_expr.ritz", "tuple_struct_new"): 1,
+    ("emitter_decl.ritz", "tuple_struct_new"): 1,
     ("mono_clone.ritz", "tuple_subst"): 1,
     # A generic specialisation clones its fields from the source template.
     ("mono_clone.ritz", "clone_and_specialize_struct"): 2,

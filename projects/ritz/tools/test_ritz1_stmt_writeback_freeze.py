@@ -7,7 +7,7 @@ An unannotated `let` / `var` is typed during lowering, arm by arm: `let p =
 checks and the emitter's tagged-enum scans read the same fields, so the
 parser's facts and the emitter's inference shared one mutable channel.
 
-From #4407 the inference lives in a lowering-local `DeclTy` (emitter_stmt.ritz)
+From #4407 the inference lives in a lowering-local `DeclTy` (emitter_decl.ritz)
 for the length of one declaration; the Stmt keeps only what the parser and
 pre-Sema passes put there.  This test freezes that: in the emitter modules, a
 function whose parameter is a `*Stmt` must not assign one of the inferred-type
@@ -27,6 +27,7 @@ import pytest
 TOOLS = Path(__file__).resolve().parent
 SRC = TOOLS.parent / "ritz1" / "src"
 EMITTER_STMT = SRC / "emitter_stmt.ritz"
+EMITTER_DECL = SRC / "emitter_decl.ritz"   # DeclTy and the let inference (AGAST #1818)
 
 # The type an inferred binding takes, as emit_var_decl_at / infer_* work it
 # out.  The parser also writes them for an annotated declaration; that is the
@@ -102,11 +103,11 @@ def emitter_writes(src: Path = SRC) -> list[str]:
     return found
 
 
-def decl_ty_fields(path: Path = EMITTER_STMT) -> set[str]:
+def decl_ty_fields(path: Path = EMITTER_DECL) -> set[str]:
     """The field names `struct DeclTy` declares."""
     text = path.read_text()
     m = re.search(r"^struct DeclTy\n(.*?)(?=^\S)", text, re.M | re.S)
-    assert m, "struct DeclTy is missing from emitter_stmt.ritz"
+    assert m, "struct DeclTy is missing from emitter_decl.ritz"
     return set(re.findall(r"^    (\w+):", m.group(1), re.M))
 
 

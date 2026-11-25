@@ -65,67 +65,15 @@ import mono_clone   # AGAST #1818: cloning moved out of monomorph
 import narrowing    # narrow_note_binding (AGAST #3345)
 import binder_check
 import emitter_expr_arith
+import emitter_call_lower   # AGAST #1818: split out below the emitter cycle
+import emitter_decl   # AGAST #1818: split out below the emitter cycle
+import emitter_stmt_parts   # AGAST #1818: split out below the emitter cycle
 
 # Phi result tracking during emit_match.
 # We need to collect (value_reg, exit_label) pairs across all non-pass arms
 # so we can emit a terminating phi at the match.end label.
 # Sized to the arm count by match_result_init (AGAST #1813): fixed [64]
 # arrays silently dropped the phi incoming edges of arms past the 64th.
-struct MatchResult
-    values: *i32   # register numbers holding each arm's result
-    labels: *i32   # exit label numbers for each arm's result
-    count: i32
-    # AGAST #1645: LLVM struct type the arms yield (`%StrView`, `%Point`),
-    # or null when they yield the usual i64 scalar.  The merge phi is emitted
-    # at this type.
-    agg_name: *u8
-    agg_name_len: i32
-    # AGAST #1946: TypeKind.F32 / TypeKind.F64 when the arms yield a float, else 0.
-    # Fixed by the enclosing let / return's hint (match_float_hint) or by
-    # the first float-valued arm; later arms are coerced to it.
-    float_ty: TypeKind
-    # AGAST #2092: the enclosing let / return's float hint itself (0 if
-    # none), handed on to a match / if that is an arm's value tail so the
-    # annotation reaches every nested tail, as in ritz0.  Unlike float_ty it
-    # is never set by an arm: an unannotated match passes nothing down.
-    hint_ty: TypeKind
-    # Arms recorded as i64 values before float_ty was fixed: they cannot be
-    # coerced after the fact (their `br` is already emitted).
-    int_arms: i32
-    # AGAST #1654: arms whose body expression produced no value (a call to a
-    # void fn: emit_expr returns register 0, which is never defined).  Any
-    # such arm makes the match valueless: emit_match emits no phi.
-    void_arms: i32
-    # AGAST #2046: where the first valueless arm is (its innermost void
-    # call), for the error when the match's value is wanted.
-    void_line: i32
-    void_col: i32
-    # AGAST #2950: 1 when every value arm yields a `ptr` (`@&x`), so the phi
-    # is a `ptr` (arms_ptr_valued, asked before the arms are emitted).
-    ptr_ty: i32
-    # AGAST #3276: the whole `[N]T` each arm stores its value into, or null
-    # (the arms meet in a phi).  See emit_match_into.
-    into: *ArrayInto
-    # AGAST #3696: the `alloca %T` register every arm of a large struct %T
-    # (at the sret threshold) stores its value into, or 0.  The merge loads
-    # it instead of a `phi %T`.  slot_misses counts value arms recorded
-    # before the slot existed; any forces the phi back (match_merge_slot).
-    slot: i32
-    slot_misses: i32
-    # AGAST #3028: 1 when nothing reads the match's value (a match statement
-    # before the block's last, or an expression arm of such a match).  An
-    # expression arm's `t` with `t:& T` then reads nothing, as in ritz0.
-    discarded: i32
-
-# AGAST #3276: where a `match` of whole arrays stores each arm's array: the
-# `[N x T]` at `ptr`, held to N (`size`) and T (`et`; a struct's `name`).
-struct ArrayInto
-    ptr: i32
-    size: i32
-    et: TypeKind
-    name: *u8
-    name_len: i32
-
 # AGAST #1946: a `values[]` entry for an arm with no value (`pass`, or a body
 # with no trailing expression): the phi gets the zero constant of its type
 # instead of an `add i64 0, 0` register, which mismatched a float or struct
@@ -639,68 +587,12 @@ fn match_void_arms_settle(s: *EmitterState, result: *MatchResult, wants_value: i
     emit_str(s, c"  ; ERROR: valueless match / if arm used as a value\n")
     s.error_count = s.error_count + 1
 
-# AGAST #1946: the float type (TypeKind.F32 / TypeKind.F64) arm value `e` was just
-# emitted at, or 0.  A nested match / if publishes its phi type as it
-# completes, which is immediately before this is asked.
-pub fn match_arm_float_ty(s: *EmitterState, e: *Expr) -> TypeKind
-    if e.kind == ExprKind.Match or e.kind == ExprKind.If
-        return s.last_match_float_ty
-    binop_operand_float_ty(s, e)
-
 # AGAST #1946: take the float type an enclosing let / return expects of this
 # match (0 if none) and clear it so no nested match sees it.
 pub fn take_match_float_hint(s: *EmitterState) -> TypeKind
     let h: TypeKind = s.match_float_hint
     s.match_float_hint = TypeKind.Void
     h
-
-# AGAST #1946: settle a scalar arm's value against the phi's float type.  A
-# float slot (result.hint_ty) fixes it up front; otherwise the first float arm
-# does, and an integer arm on either side of it is an error (LARB R43).  Once
-# fixed, a float of the other width, or in a slot an integer, is converted in
-# the arm's own block before its `br`.  Called while
-# the arm's pattern binding is in scope.  Returns the register to record.
-pub fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, result: *MatchResult) -> i32
-    float_arm_settle(s, match_arm_float_ty(s, arm_body), arm_body, arm_body.span, body_reg, result)
-
-# AGAST #3421: match_arm_float_settle for an arm whose value is of float type
-# `aft` (0 if none).  A statement `if`'s arms come here too, and one whose
-# value is a nested statement `if` / `match` has no expression (`arm_body`
-# null): its phi's type is `aft`, and if that is an integer in a float merge,
-# it is the R43 mix (the nested one had the slot too, so it would be float).
-# `at` is the arm's value, where an R43 mix is reported (AGAST #3621).
-pub fn float_arm_settle(s: *EmitterState, aft: TypeKind, arm_body: *Expr, at: SrcSpan, body_reg: i32, result: *MatchResult) -> i32
-    if result.float_ty == TypeKind.Void
-        if aft == TypeKind.Void
-            result.int_arms = result.int_arms + 1
-            return body_reg
-        if result.int_arms > 0
-            emit_ir_error(s, at, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
-        result.float_ty = aft
-        return body_reg
-    if aft == result.float_ty
-        return body_reg
-    if aft != TypeKind.Void
-        return emit_float_coerce(s, body_reg, aft, result.float_ty)
-    if arm_body == null
-        emit_ir_error(s, at, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
-        return body_reg
-    let is_int: bool = is_int_const_type(expr_slot_ty(arm_body)) == 1
-    # LARB R43 (#3385): with no float slot (hint_ty 0) the float type came
-    # from an earlier arm, and an integer arm next to it is refused, as one
-    # BEFORE the first float arm is above: the rule doesn't depend on order.
-    # The slot is known before any arm is emitted, so no pre-pass is needed.
-    if is_int and result.hint_ty == TypeKind.Void
-        emit_ir_error(s, at, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
-        return body_reg
-    # AGAST #3313, LARB R43a: an integer arm lands in the float slot as
-    # `let a: f64 = x` does (§7.5): a literal or an exact type (i32 into
-    # f64) converts, a lossy one (i64) is refused (ritz0 does the same).
-    if is_int
-        return emit_int_into_float_slot(s, body_reg, float_slot_unsigned(arm_body), result.float_ty)
-    # A pointer arm was refused on Sema, in ritz0's words (AGAST #3626, #3892).
-    emit_ir_error(s, arm_body.span, c"match arm yields a non-numeric value where the other arms yield a float")
-    body_reg
 
 # AGAST #3696: an arm of a large struct %T writes its value into the
 # match's slot, in its own block, while its value is fresh: before its
@@ -1592,56 +1484,6 @@ pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_
     *out_len = 0
     return 0
 
-# AGAST #2344: the struct `scr` yields, for the shapes resolve_scrutinee_enum
-# leaves out.  It stays strict for its other callers, but a match cannot: `R` in
-# `match a[1]` is a variant or a binding by this type alone, and read as a
-# binding it took the first arm and looked covered.
-pub fn match_scrutinee_type(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
-    match scr.kind
-        ExprKind.Ident =>
-            let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (scr.ident_ptr), len: (scr.ident_len) as i64 })
-            if loc != null
-                if lv_var_type(loc) == TypeKind.Struct
-                    *out_name = lv_type_name(loc)
-                    *out_len = lv_type_name_len(loc)
-                return
-            let g: *GlobalVarDef = find_global(s, StrView { ptr: (scr.ident_ptr), len: (scr.ident_len) as i64 })
-            if g != null and g.var_type == TypeKind.Struct
-                *out_name = g.type_name
-                *out_len = g.type_name_len
-            # LARB R60 (#3480): a const is a whole value, so `match MODE` reads
-            # the type its declaration wrote, as `match g` does.  Untyped, the
-            # arms were judged against a scalar and every variant arm refused.
-            if g == null
-                let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (scr.ident_ptr), len: (scr.ident_len) as i64 })
-                if ce != null and ce.const_type == TypeKind.Struct and ce.type_name_len > 0
-                    *out_name = ce.type_name
-                    *out_len = ce.type_name_len
-        ExprKind.Method | ExprKind.Call =>
-            call_result_struct_name(s, scr, out_name, out_len)
-        ExprKind.Index =>
-            index_elem_struct_name(s, scr, out_name, out_len)
-        ExprKind.Member =>
-            let fld: *StructField = resolve_member_chain_field(s, scr)
-            if fld != null and fld.field_type == TypeKind.Struct
-                *out_name = fld.field_type_name
-                *out_len = fld.field_type_name_len
-        _ =>
-            if scr.kind == ExprKind.Cast and scr.type_kind == TypeKind.Struct and scr.ident_len > 0
-                # AGAST #2503: `x as B` is a B.  Untyped, the arms guessed the enum,
-                # and an `A` declaring the first arm's `V` too judged B's arms as A's.
-                *out_name = scr.ident_ptr
-                *out_len = scr.ident_len
-            else if (scr.kind == ExprKind.If or scr.kind == ExprKind.Match) and scr.value_ty_name != null
-                # AGAST #3042: `match (if c then b else d)` is what its branches are,
-                # as Sema typed them (sema_note_arm_value).  Untyped, the arms guessed
-                # the enum: refused when two enums declare the arm's name (#2503),
-                # and a generic `G<i32>` was matched as an i64, IR clang rejects.
-                *out_name = scr.value_ty_name
-                *out_len = scr.value_ty_name_len
-
 # 1 when `scr` is certainly no enum, so a bare name in an arm is a binding or a
 # const.  Anything this cannot prove stays open: see match_arms_enum.
 fn match_scrutinee_is_scalar(s: *EmitterState, scr: *Expr) -> i32
@@ -1780,120 +1622,6 @@ fn match_scrutinee_is_ctor(s: *EmitterState, e: *Expr) -> i32
     if generic_ctor_enum(s, e, @vi) >= 0   # AGAST #2437
         return 1
     (bare_unit_variant_enum(s, e, @vi, @other) >= 0) as i32
-
-# `a`, `b` and `c` as one NUL-terminated name, its length in *out_len.
-pub fn ctor_join(a_sv: StrView, b_sv: StrView, c_sv: StrView, out_len: *i32) -> *u8
-    var a: *u8 = a_sv.ptr
-    var a_len: i32 = a_sv.len as i32
-    var b: *u8 = b_sv.ptr
-    var b_len: i32 = b_sv.len as i32
-    var c: *u8 = c_sv.ptr
-    var c_len: i32 = c_sv.len as i32
-    let n: i32 = a_len + b_len + c_len
-    let name: *u8 = malloc((n + 1) as i64)
-    memcpy(name, a, a_len as i64)
-    memcpy(name + a_len, b, b_len as i64)
-    memcpy(name + a_len + b_len, c, c_len as i64)
-    *(name + n) = 0
-    *out_len = n
-    name
-
-# A pointer's spelling, `ptr_T`, for the shapes that record T; else 0.
-fn ctor_pointer_spelling(s: *EmitterState, e: *Expr, out: **u8) -> i32
-    if e.kind == ExprKind.CstringLit
-        *out = c"ptr_u8"
-        return 6
-    if e.kind != ExprKind.Ident
-        return 0
-    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
-    if loc == null
-        return 0
-    var base: *u8 = lv_type_name(loc)
-    var base_len: i32 = lv_type_name_len(loc)
-    if lv_pointee_type(loc) != TypeKind.Struct
-        base_len = primitive_arg_spelling(lv_pointee_type(loc), @base)
-    if base_len <= 0
-        return 0
-    var n: i32 = 0
-    *out = ctor_join(StrView { ptr: (c"ptr_"), len: (4) as i64 }, StrView { ptr: (base), len: (base_len) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, @n)
-    n
-
-# The type argument payload `e` gives its enum, spelled as a mangled name; its
-# length, or 0 when ritz1 can't name it.  A nested constructor is its own enum's,
-# named by its payload the same way (AGAST #2435): `Some(5)` in `Some(Some(5))`
-# is `Option$i64`.
-pub fn ctor_payload_spelling(s: *EmitterState, e: *Expr, out: **u8) -> i32
-    if is_tagged_ctor(s, e) == 1
-        var len: i32 = 0
-        let name: *u8 = tagged_ctor_enum_name(s, e, @len)
-        if name == null
-            return 0
-        *out = name
-        return len
-    if e.kind == ExprKind.StringLit
-        *out = c"StrView"   # layout-equal to the %Span$u8 it lowers to
-        return 7
-    if bool_kind(s, e) == BK_BOOL   # `true` is an ExprKind.IntLit to get_expr_type
-        *out = c"bool"
-        return 4
-    var name: *u8 = null
-    var len: i32 = 0
-    variant_payload_aggregate(s, e, @name, @len)
-    if name != null
-        *out = name
-        return len
-    # A struct emit_variant_build would store as a scalar, which get_expr_type
-    # can call an i64: `Some(t.m())`, `Some(a[1])`.
-    match_scrutinee_type(s, e, @name, @len)
-    if name != null
-        return 0
-    let ty: TypeKind = expr_slot_ty(e)
-    if ty == TypeKind.Ptr
-        return ctor_pointer_spelling(s, e, out)
-    primitive_arg_spelling(ty, out)
-
-# The enum tagged constructor `scr` builds, named by its payload alone: i64 for a
-# type argument nothing gives.  null when its payload can't be named.
-fn tagged_ctor_enum_name(s: *EmitterState, scr: *Expr, out_len: *i32) -> *u8
-    *out_len = 0
-    var arg: *u8 = c"i64"
-    var arg_len: i32 = 3
-    let is_none: i32 = (scr.kind == ExprKind.Ident or is_ident_none(StrView { ptr: (scr.func_name), len: (scr.func_name_len) as i64 }) == 1) as i32
-    if is_none == 0 and scr.args != null
-        arg_len = ctor_payload_spelling(s, scr.args, @arg)
-        if arg_len <= 0
-            return null
-    if is_none == 1 or name_eq(StrView { ptr: (scr.func_name), len: (scr.func_name_len) as i64 }, StrView { ptr: (c"Some"), len: (4) as i64 }) == 1
-        return ctor_join(StrView { ptr: (c"Option$"), len: (7) as i64 }, StrView { ptr: (arg), len: (arg_len) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, out_len)
-    if name_eq(StrView { ptr: (scr.func_name), len: (scr.func_name_len) as i64 }, StrView { ptr: (c"Ok"), len: (2) as i64 }) == 1
-        return ctor_join(StrView { ptr: (c"Result$"), len: (7) as i64 }, StrView { ptr: (arg), len: (arg_len) as i64 }, StrView { ptr: (c"$i64"), len: (4) as i64 }, out_len)
-    ctor_join(StrView { ptr: (c"Result$i64$"), len: (11) as i64 }, StrView { ptr: (arg), len: (arg_len) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, out_len)
-
-# The enum a constructor scrutinee builds, queued for its type decl.  null/0 when
-# `scr` is none, or its payload can't be named.
-pub fn ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
-    if is_tagged_ctor(s, scr) == 0
-        return
-    var len: i32 = 0
-    let name: *u8 = tagged_ctor_enum_name(s, scr, @len)
-    if name == null
-        return
-    if namelist_find(@s.late_enums, StrView { ptr: (name), len: (len) as i64 }) < 0
-        namelist_push(@s.late_enums, StrView { ptr: (name), len: (len) as i64 })
-    *out_name = name
-    *out_len = len
-
-# --- A generic user enum's bare constructor as the scrutinee (AGAST #2437) ----
-#
-# `match Hold(5)` for `enum W<T>`: the template has no struct, so the constructor
-# lowered to a call to an undefined `@Hold`, and `match Gone` was an unknown
-# identifier.  A scrutinee has no slot (§11.3; nor is it the fn's value, #2419),
-# so the payload binds T as it does for an untyped let: `Hold(5)` is a `W$i64`.
-# A T the payload leaves unbound, every one of a unit variant's, is the located
-# error ritz0's Monomorphizer._infer_variant_scrutinee gives.  Here, not in
-# generic_infer: a generic fn's `match Hold(x)` is emitted specialised, x typed.
 
 var g_gctor_refused: *Expr = null   # the scrutinee generic_ctor_scrutinee_enum refused
 
