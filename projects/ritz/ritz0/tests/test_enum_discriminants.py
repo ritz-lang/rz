@@ -177,6 +177,7 @@ enum Sys: u64
     Write
     Mmap = 9
     Exit = 60
+    Top = 0x8000000000000009   # above i64's max: `from` compares it in hex
 
 enum Errno: i32
     Fault = -14
@@ -189,6 +190,7 @@ fn which(n: u64) -> i32
             Write => 2
             Mmap => 3
             Exit => 4
+            Top => 5
         None => 0
 
 fn round_trip(n: u64) -> u64
@@ -225,6 +227,10 @@ fn main() -> i32
         return 10
     if errno_ok(14) != 0
         return 11
+    if which(0x8000000000000009) != 5
+        return 12
+    if which(0x8000000000000008) != 0
+        return 13
     42
 """
 

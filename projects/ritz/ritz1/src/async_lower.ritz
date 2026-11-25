@@ -1775,11 +1775,9 @@ fn al_refuse(a: *AlFn, m: @&String, span: SrcSpan)
         diag_error_buf(a.file, span, m)
     a.errs += 1
 
-fn al_unplaced(a: *AlFn, what: *u8, span: SrcSpan)
+fn al_unplaced(a: *AlFn, what: StrView, span: SrcSpan)
     var m: String = string_new()
-    m.push_str("`await` inside ")
-    m.push_span(Span<u8> { ptr: (what), len: (al_clen(what) as i64) as i64 })
-    m.push_str(" in an async fn is not supported yet (AGAST #4013)")
+    format_into(@&m, "`await` inside {what} in an async fn is not supported yet (AGAST #4013)")
     al_refuse(a, @&m, span)
 
 # Where a refused statement is: its first await, else its jump, else itself.
@@ -1897,17 +1895,17 @@ fn al_store_ready(a: *AlFn, v: *Expr, span: SrcSpan)
 fn al_hoist(a: *AlFn, e: *Expr) -> *Expr
     if e == null
         return null
-    al_hoist_walk(a, e, null)
+    al_hoist_walk(a, e, "")
     al_rw_expr(a, e)
 
 fn al_hoist_list(a: *AlFn, e: *Expr) -> *Expr
     var cur: *Expr = e
     while cur != null
-        al_hoist_walk(a, cur, null)
+        al_hoist_walk(a, cur, "")
         cur = cur.next
     al_rw_list(a, e)
 
-fn al_hoist_arms(a: *AlFn, arm: *MatchArm, under: *u8)
+fn al_hoist_arms(a: *AlFn, arm: *MatchArm, under: StrView)
     var cur: *MatchArm = arm
     while cur != null
         let s: *Expr = al_await_in_stmts(cur.body_stmts)
@@ -1917,13 +1915,13 @@ fn al_hoist_arms(a: *AlFn, arm: *MatchArm, under: *u8)
         cur = cur.next
 
 # `under`: what the await would be inside, which has no state edge for it
-# (null: nothing).
-fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
+# (empty: nothing).
+fn al_hoist_walk(a: *AlFn, e: *Expr, under: StrView)
     if e == null
         return
     let k: ExprKind = e.kind
     if k == ExprKind.Await
-        if under != null
+        if under.len > 0
             al_unplaced(a, under, e.span)
             return
         let tmp: StrView = al_numbered("__await_result_", a.nawaits)
@@ -1959,18 +1957,18 @@ fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
         d.len = tmp.len as i32
         al_lower_await(a, e, @d)
         al_add_point(a, e, tmp)
-    else if k == ExprKind.If and under == null and (e.args as *MatchArm).next != null and al_await_in(e) != null
+    else if k == ExprKind.If and under.len == 0 and (e.args as *MatchArm).next != null and al_await_in(e) != null
         al_if_value(a, e)
     else if k == ExprKind.If or k == ExprKind.Match
         al_hoist_walk(a, e.left, under)
-        var u: *u8 = under
-        if u == null
+        var u: StrView = under
+        if u.len == 0
             if k == ExprKind.If
-                u = c"an `if` inside an expression"
+                u = "an `if` inside an expression"
             else
-                u = c"a `match` inside an expression"
+                u = "a `match` inside an expression"
         al_hoist_arms(a, e.args as *MatchArm, u)
-    else if k == ExprKind.Binary and (e.op == OpKind.And or e.op == OpKind.Or) and under == null and al_await_in(e.right) != null
+    else if k == ExprKind.Binary and (e.op == OpKind.And or e.op == OpKind.Or) and under.len == 0 and al_await_in(e.right) != null
         al_short_circuit(a, e)
     else
         match k
@@ -2008,7 +2006,7 @@ fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
 #   R: __short_K = r                         # r's awaits in states
 #   J: ... the expression reads __short_K
 fn al_short_circuit(a: *AlFn, e: *Expr)
-    al_hoist_walk(a, e.left, null)
+    al_hoist_walk(a, e.left, "")
     let tmp: StrView = al_numbered("__short_", a.nshorts)
     a.nshorts += 1
     al_set_scalar(al_extra(a, tmp), TypeKind.Bool)
@@ -2093,7 +2091,7 @@ fn al_if_value(a: *AlFn, e: *Expr)
         m.push_str("`'s future holds across an `await`: cast an arm (`x as i32`)")
         al_refuse(a, @&m, e.span)
         return
-    al_hoist_walk(a, e.left, null)
+    al_hoist_walk(a, e.left, "")
     let tmp: StrView = al_numbered("__if_", a.nifs)
     a.nifs += 1
     al_if_type(a, e, al_extra(a, tmp))
@@ -2325,7 +2323,7 @@ fn al_for_type(a: *AlFn, s: *Stmt, l: *AlLocal) -> i32
 fn al_lower_for(a: *AlFn, s: *Stmt)
     let span: SrcSpan = s.span
     if s.for_end == null
-        al_unplaced(a, c"a `for` over an iterable", al_culprit(s))
+        al_unplaced(a, "a `for` over an iterable", al_culprit(s))
         return
     var t: AlLocal
     if al_for_type(a, s, @t) == 0
@@ -2684,7 +2682,7 @@ fn al_lower_stmt(a: *AlFn, s: *Stmt, lp: *AlLoop)
                     StmtKind.For =>
                         al_lower_for(a, s)
                     _ =>
-                        al_unplaced(a, c"this statement", al_culprit(s))
+                        al_unplaced(a, "this statement", al_culprit(s))
 
 # The poll's body: `while true` over `if self.__state == N` for each state.
 fn al_dispatch(a: *AlFn, span: SrcSpan) -> *Stmt
@@ -2897,7 +2895,7 @@ fn al_analyse(a: *AlFn) -> i32
     let f: *FnDef = a.f
     var res: AlLocal
     if f.return_type != TypeKind.Void and al_set_ret(@res, f) == 0
-        diag_error_name(a.file, diag_span(f.line, f.col), c"ritz1 can't yet hold `", StrView { ptr: (f.name), len: (f.name_len) as i64 }, c"`'s result type in a future: an array, reference or fn type")
+        diag_error_name(a.file, diag_span(f.line, f.col), "ritz1 can't yet hold `", StrView { ptr: (f.name), len: (f.name_len) as i64 }, "`'s result type in a future: an array, reference or fn type")
         return 1
     var p: *Param = f.params
     while p != null
@@ -2917,7 +2915,7 @@ fn al_analyse(a: *AlFn) -> i32
         var l: *AlLocal = a.locals
         while l != null
             if l.is_param == 1 and l.unsupported == 1
-                diag_error_name(a.file, l.span, c"ritz1 can't yet hold `", StrView { ptr: (l.name), len: (l.len) as i64 }, c"`'s type in a future: an array, reference or fn type")
+                diag_error_name(a.file, l.span, "ritz1 can't yet hold `", StrView { ptr: (l.name), len: (l.len) as i64 }, "`'s type in a future: an array, reference or fn type")
                 errs += 1
             l = l.next
         return errs
@@ -2941,7 +2939,7 @@ fn al_analyse(a: *AlFn) -> i32
     var l: *AlLocal = a.locals
     while l != null
         if l.unsupported == 1
-            diag_error_name(a.file, l.span, c"ritz1 can't yet hold `", StrView { ptr: (l.name), len: (l.len) as i64 }, c"`'s type in a future: an array, reference or fn type")
+            diag_error_name(a.file, l.span, "ritz1 can't yet hold `", StrView { ptr: (l.name), len: (l.len) as i64 }, "`'s type in a future: an array, reference or fn type")
             errs += 1
         l = l.next
     errs
@@ -2953,7 +2951,7 @@ fn al_lower_fn(m: *Module, prev: *FnDef, f: *FnDef) -> i32
     var a: AlFn
     al_fn_init(@a, f, 0)
     if f.type_params != null
-        diag_error_name(a.file, diag_span(f.line, f.col), c"async fn '", StrView { ptr: (f.name), len: (f.name_len) as i64 }, c"' is generic, which ritz1 can't lower to a state machine")
+        diag_error_name(a.file, diag_span(f.line, f.col), "async fn '", StrView { ptr: (f.name), len: (f.name_len) as i64 }, "' is generic, which ritz1 can't lower to a state machine")
         return 1
     let errs: i32 = al_analyse(@a)
     if errs > 0

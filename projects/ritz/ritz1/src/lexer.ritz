@@ -101,9 +101,9 @@ struct Lexer
   string_buf: *i8          # heap scratch; null until the first literal
   string_cap: i32          # bytes allocated in string_buf
   string_pos: i32          # write cursor within the literal being cooked
-  # AGAST #1813: the message for the TOK_ERROR just returned, or null for an
+  # AGAST #1813: the message for the TOK_ERROR just returned, or empty for an
   # unrecognised character.  Set by lexer_fail, which also stops the lexer.
-  error_msg: *u8
+  error_msg: StrView
   # asm body mode (LANGUAGE_SPEC §18.6, AGAST #3394).  An `asm` block's body is
   # text, not Ritz: `movq $3, %rcx` and `nopl (%rax)` must reach the parser
   # whole.  A line that starts with `asm` (outside brackets) and ends in `:`
@@ -136,7 +136,7 @@ pub fn lexer_reset(lex: *Lexer, src_sv: StrView) -> i32
   lexer_asm_reset(lex)
   # Reset string buffer
   lex.string_pos = 0
-  lex.error_msg = null
+  lex.error_msg = ""
   0
 
 # No pending `if`, no continuation, no token seen.
@@ -180,7 +180,7 @@ fn lexer_asm_line_start(lex: *Lexer, out_tok: *Token) -> i32
   if lex.asm_body == 1
     return 0
   if lex.indent_depth >= MAX_INDENT_DEPTH
-    return lexer_fail(lex, out_tok, c"blocks nested more than 64 levels deep")
+    return lexer_fail(lex, out_tok, "blocks nested more than 64 levels deep")
   lex.asm_body = 1
   lex.indent_stack[lex.indent_depth] = indent
   lex.indent_depth = lex.indent_depth + 1
@@ -244,11 +244,11 @@ fn lexer_fail_block(lex: *Lexer, start: *u8, line: i32, col: i32) -> Token
   var bracket: u8 = 40
   if lex.bracket_depth >= 1 and lex.bracket_depth <= MAX_BRACKET_DEPTH
     bracket = lex.bracket_kinds[lex.bracket_depth - 1]
-  lex.error_msg = c"a block can't open inside `(`: bind the `if`/`match` to a `let` first"
+  lex.error_msg = "a block can't open inside `(`: bind the `if`/`match` to a `let` first"
   if bracket == 91
-    lex.error_msg = c"a block can't open inside `[`: bind the `if`/`match` to a `let` first"
+    lex.error_msg = "a block can't open inside `[`: bind the `if`/`match` to a `let` first"
   if bracket == 123
-    lex.error_msg = c"a block can't open inside `{`: bind the `if`/`match` to a `let` first"
+    lex.error_msg = "a block can't open inside `{`: bind the `if`/`match` to a `let` first"
   lex.pos = lex.len
   lex.pending_dedents = 0
   lex.cont_line = 0
@@ -257,7 +257,7 @@ fn lexer_fail_block(lex: *Lexer, start: *u8, line: i32, col: i32) -> Token
 # Return a located, fatal TOK_ERROR at the current position and stop lexing:
 # the next lexer_next returns EOF.  The tab case used to return TOK_ERROR
 # without advancing, so tokenize looped forever printing the same error.
-fn lexer_fail(lex: *Lexer, out_tok: *Token, msg: *u8) -> i32
+fn lexer_fail(lex: *Lexer, out_tok: *Token, msg: StrView) -> i32
   *out_tok = token_new(TOK_ERROR, StrView { ptr: (lex.src + lex.pos), len: (1) as i64 }, lex.line, lex.col)
   lex.error_msg = msg
   lex.pos = lex.len
@@ -335,15 +335,11 @@ pub fn lexer_escape_width(esc: i32) -> i32
     return 3
   1
 
-# Append the NUL-terminated `text` to `buf` at `n`; returns the new length.
-fn lexer_msg_append(buf: *u8, n: i64, text: *u8) -> i64
-  var k: i64 = n
-  var i: i64 = 0
-  while *(text + i) != 0
-    *(buf + k) = *(text + i)
-    k = k + 1
-    i = i + 1
-  k
+# Append `text` to `buf` at `n`; returns the new length.
+fn lexer_msg_append(buf: *u8, n: i64, text: StrView) -> i64
+  for i in 0..text.len
+    *(buf + n + i) = *(text.ptr + i)
+  n + text.len
 
 # Longest escape message is under 120 bytes; round up (AGAST #1820).
 const LEXER_ESCAPE_MSG_BUF: i64 = 160
@@ -360,19 +356,18 @@ fn lexer_fail_escape(lex: *Lexer, pos: i64, line: i32, col: i32, p: *u8, code: i
   let msg: *u8 = malloc(LEXER_ESCAPE_MSG_BUF)
   var n: i64 = 0
   if code == ESCAPE_HEX_DIGITS
-    n = lexer_msg_append(msg, n, c"Hex escape '\\x' needs exactly two hex digits")
+    n = lexer_msg_append(msg, n, "Hex escape '\\x' needs exactly two hex digits")
   else if code == ESCAPE_HEX_RANGE
-    n = lexer_msg_append(msg, n, c"Hex escape '\\x")
+    n = lexer_msg_append(msg, n, "Hex escape '\\x")
     *(msg + n) = *(p + 1)
     *(msg + n + 1) = *(p + 2)
-    n = lexer_msg_append(msg, n + 2, c"' is above '\\x7F': a literal is UTF-8 text, so write a non-ASCII character as itself")
+    n = lexer_msg_append(msg, n + 2, "' is above '\\x7F': a literal is UTF-8 text, so write a non-ASCII character as itself")
   else
-    n = lexer_msg_append(msg, n, c"Unknown escape sequence '\\")
+    n = lexer_msg_append(msg, n, "Unknown escape sequence '\\")
     *(msg + n) = *p
     *(msg + n + 1) = 39
     n = n + 2
-  *(msg + n) = 0
-  lex.error_msg = msg
+  lex.error_msg = StrView { ptr: msg, len: n }
   lex.pos = lex.len
   lex.pending_dedents = 0
   token_new(TOK_ERROR, StrView { ptr: (lex.src + pos), len: (1) as i64 }, line, col)
@@ -462,7 +457,7 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
   if lexer_peek_at(lex, indent) == 9  # tab
     lex.pos = lex.pos + indent
     lex.col = lex.col + indent
-    return lexer_fail(lex, out_tok, c"Tabs not allowed for indentation; use spaces")
+    return lexer_fail(lex, out_tok, "Tabs not allowed for indentation; use spaces")
 
   # Skip blank lines (just newline after spaces)
   if lexer_peek_at(lex, indent) == 10  # newline
@@ -498,13 +493,13 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
     lex.at_line_start = 0
     if indent < current
       lex.col = 1
-      return lexer_fail(lex, out_tok, c"continuation line is indented less than the statement it continues; indent it at least as far as the statement's first line")
+      return lexer_fail(lex, out_tok, "continuation line is indented less than the statement it continues; indent it at least as far as the statement's first line")
     return 0
 
   if indent > current
     # Deeper indentation - push and emit INDENT
     if lex.indent_depth >= MAX_INDENT_DEPTH
-      return lexer_fail(lex, out_tok, c"blocks nested more than 64 levels deep")
+      return lexer_fail(lex, out_tok, "blocks nested more than 64 levels deep")
     lex.indent_stack[lex.indent_depth] = indent
     lex.indent_depth = lex.indent_depth + 1
     *out_tok = token_new(TOK_INDENT, StrView { ptr: (lex.src + lex.pos), len: (0) as i64 }, lex.line, lex.col)
@@ -779,9 +774,9 @@ fn lexer_scan_string(lex: *Lexer, kind: i32, prefix: i32) -> Token
     lex.col = tok.col            # scanned up to the bad escape
     return tok
   if status == 0
-    var msg: *u8 = c"Unterminated string literal"
+    var msg: StrView = "Unterminated string literal"
     if kind == TOK_CSTRING
-      msg = c"Unterminated C-string literal"
+      msg = "Unterminated C-string literal"
     lexer_fail(lex, @tok, msg)   # at lex.pos, still the literal's start
     return tok
   lex.pos = at + 1
@@ -868,7 +863,7 @@ fn lexer_check_separators(lex: *Lexer, len: i32, err: *Token) -> i32
       if lexer_in_class(lexer_at(lex, at + i - 1), class) == 0 or lexer_in_class(lexer_at(lex, at + i + 1), class) == 0
         lex.pos = at + i
         lex.col = lex.col + i as i32
-        lexer_fail(lex, err, c"`_` must stand between two digits of a numeric literal")
+        lexer_fail(lex, err, "`_` must stand between two digits of a numeric literal")
         return 1
     i = i + 1
   0
@@ -903,7 +898,7 @@ fn lexer_track_bracket(lex: *Lexer, kind: i32, start: i64, line: i32, col: i32, 
   if kind == TOK_LPAREN or kind == TOK_LBRACKET or kind == TOK_LBRACE
     if lex.bracket_depth >= MAX_BRACKET_DEPTH
       *err = token_new(TOK_ERROR, StrView { ptr: (lex.src + start), len: (1) as i64 }, line, col)
-      lex.error_msg = c"brackets nested more than 64 levels deep"
+      lex.error_msg = "brackets nested more than 64 levels deep"
       lex.pos = lex.len
       lex.pending_dedents = 0
       return 1
@@ -928,7 +923,7 @@ fn lexer_check_char(lex: *Lexer, start: i64, len: i32, line: i32, col: i32, err:
     return 1
   if (lexer_escape_width(((*esc_p) as i32) & 255) as i64) != avail
     *err = lexer_token(lex, TOK_ERROR, start, 1, line, col)
-    lex.error_msg = c"Character literal must contain exactly one character"
+    lex.error_msg = "Character literal must contain exactly one character"
     lex.pos = lex.len
     lex.pending_dedents = 0
     return 1
@@ -965,7 +960,7 @@ fn lexer_scan_token(lex: *Lexer) -> Token
   # can't be written (spec §2.5, LARB R37, AGAST #3373).  An asm body's
   # lines never get here.  ritz0's words (ref_rules.DOLLAR_OUTSIDE_ASM).
   if ch == '$'
-    lexer_fail(lex, @tok, c"`$` isn't part of a name: it's written only in an `asm` body")
+    lexer_fail(lex, @tok, "`$` isn't part of a name: it's written only in an `asm` body")
     return tok
   # "..." and c"..." end on their line (lexer_scan_string).
   if ch == '"'
@@ -978,7 +973,7 @@ fn lexer_scan_token(lex: *Lexer) -> Token
     # ritz0's error, at the byte where the exponent's digit should be.
     lex.pos = lex.pos + len as i64
     lex.col = lex.col + len
-    lexer_fail(lex, @tok, c"Expected digit after exponent")
+    lexer_fail(lex, @tok, "Expected digit after exponent")
     return tok
   if kind < 0
     return lexer_bad_byte(lex)
