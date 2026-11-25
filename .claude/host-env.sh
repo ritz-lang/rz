@@ -28,6 +28,15 @@
 #                              speculative train gate on, in order (AGAST
 #                              #4409).  A space-separated host list; no skronk*
 #                              by default, as those boxes are ephemeral.
+#   RZ_ROOM_ACCOUNTS=default /a/config/dir
+#                              the Claude accounts this host's rooms take turns
+#                              on: room <id> gets account <id> % N (AGAST
+#                              #4699).  Each is `default` (~/.claude), a config
+#                              dir, or a host-local env file of
+#                              CLAUDE_CODE_OAUTH_TOKEN=/CLAUDE_CONFIG_DIR=
+#                              lines; absolute paths.  Unset: adele.env decides
+#                              for every room.  .claude/room-account.sh applies
+#                              it.  The one key that may be "double-quoted".
 #
 # Every key is optional; a missing key (or no file at all) keeps the script's
 # default, which is sized for omegalisk's 15.6 GiB VM (7G / 8G / 1).  Only
@@ -63,6 +72,11 @@ rz_host_env_load() {
         fi
         key="${BASH_REMATCH[1]}"
         val="${BASH_REMATCH[2]}"
+        # A list key as the ticket writes it, RZ_ROOM_ACCOUNTS="a b": drop
+        # one pair of surrounding double quotes.  Nothing else is unquoted.
+        if [[ "$key" == RZ_ROOM_ACCOUNTS && "$val" =~ ^\"(.*)\"$ ]]; then
+            val="${BASH_REMATCH[1]}"
+        fi
         case "$key" in
             RZ_ROOMS_MEMORY_HIGH | RZ_ROOMS_MEMORY_MAX)
                 [[ "$val" =~ ^[1-9][0-9]*[KMG]?$ ]] || {
@@ -100,11 +114,18 @@ rz_host_env_load() {
                     return 1
                 }
                 ;;
+            RZ_ROOM_ACCOUNTS)
+                [[ "$val" =~ ^(default|/[^[:space:]\"\']*)([[:space:]]+(default|/[^[:space:]\"\']*))*$ ]] || {
+                    echo "error: $RZ_HOST_ENV_FILE:$n: $key must be a space-separated list of" \
+                        "\`default\` and absolute paths: '$val'" >&2
+                    return 1
+                }
+                ;;
             *)
                 echo "error: $RZ_HOST_ENV_FILE:$n: unknown key $key" \
                     "(known: RZ_ROOMS_MEMORY_HIGH RZ_ROOMS_MEMORY_MAX RZ_GATE_SLOTS" \
                     "RZ_TRAIN_SLOTS RZ_TEST_BUDGET_SCALE RZ_CPU_FACTOR" \
-                    "RZ_TRAIN_DEPTH RZ_TRAIN_HOSTS)" >&2
+                    "RZ_TRAIN_DEPTH RZ_TRAIN_HOSTS RZ_ROOM_ACCOUNTS)" >&2
                 return 1
                 ;;
         esac

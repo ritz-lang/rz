@@ -150,7 +150,7 @@ room until the current one is merged, pushed, and verified.
    # Safe to run after the directory is gone — that is the expected ordering.
    # Left behind, these accumulate one dead absolute path per reap and quietly
    # grant trust to whatever later occupies that path.
-   .claude/provision-room.sh --remove ~/dev/ritz-lang/rz-task-<id>
+   .claude/provision-room.sh --remove --room ritz-task-<id> ~/dev/ritz-lang/rz-task-<id>
 
    # Drop the room's machine-budget drop-in (AGAST #1811). The shared slices stay.
    .claude/host-budget.sh --remove ritz-task-<id>

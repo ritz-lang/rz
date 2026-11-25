@@ -78,12 +78,19 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
 
 4. **Provision room permissions — MANDATORY, and it is not optional plumbing:**
    ```bash
-   .claude/provision-room.sh ~/dev/ritz-lang/rz-task-<id>
+   .claude/provision-room.sh --room ritz-task-<id> ~/dev/ritz-lang/rz-task-<id>
    ```
 
    The script exits non-zero unless both facts hold afterwards. **If it fails,
    stop — do not start the agent.** A room that cannot write is worse than no
    room: it looks healthy, burns budget, and produces nothing.
+
+   `--room` also puts the room on its account: the host's `host.env`
+   `RZ_ROOM_ACCOUNTS`, by ticket parity (`.claude/room-account.sh`, AGAST
+   #4699). It installs the account's unit drop-in before the unit starts,
+   writes trust into that account's `.claude.json`, and refuses an account
+   that `claude auth status` reports logged out. `.claude/room-account.sh
+   --describe ritz-task-<id>` says which account a room would get.
 
    **Why this step exists.** A brand-new worktree is a path Claude Code has
    never seen, so it is an **untrusted workspace**, and Claude Code *silently
@@ -156,7 +163,7 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
 9. **Verify** the room is running **and can write**:
    ```bash
    adele status
-   .claude/provision-room.sh --verify ~/dev/ritz-lang/rz-task-<id>
+   .claude/provision-room.sh --verify --room ritz-task-<id> ~/dev/ritz-lang/rz-task-<id>
    .claude/host-budget.sh --verify ritz-task-<id>
    systemctl --user show -p Slice adele-agent@ritz-task-<id>   # Slice=ritz-rooms.slice
    ```
@@ -215,8 +222,8 @@ git worktree add ~/dev/ritz-lang/rz-task-70 -b ritz-task-70
 
 # 2b. Provision EVERY worktree — a batch spawn is where this is easiest to
 #     forget, and a room that cannot write still reports `active`.
-.claude/provision-room.sh ~/dev/ritz-lang/rz-task-69
-.claude/provision-room.sh ~/dev/ritz-lang/rz-task-70
+.claude/provision-room.sh --room ritz-task-69 ~/dev/ritz-lang/rz-task-69
+.claude/provision-room.sh --room ritz-task-70 ~/dev/ritz-lang/rz-task-70
 
 # 2c. Machine budget for EVERY room, before it starts.
 .claude/host-budget.sh ritz-task-69

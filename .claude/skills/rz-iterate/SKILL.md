@@ -460,7 +460,7 @@ brief, verify the agent woke), with these ritz values:
 | Room / branch / unit name | `ritz-task-<agast-id>` |
 | Worktree | `~/dev/ritz-lang/rz-task-<agast-id>` (host makes it off `origin/main`; if a train queue exists, the room then resets it to the deepest tail: step 3 above) |
 | Install from | `~/dev/nevelis/adele`, `--workspace` pointing at the worktree |
-| Model | default harness/model; the host's `adele.env` decides `CLAUDE_CONFIG_DIR` (see "Fleet model" below) |
+| Model | default harness/model; the host's `host.env` `RZ_ROOM_ACCOUNTS` picks the account by ticket parity (see "Fleet model" below) |
 | Callback room | `rz` |
 
 **Pass `--worktree ~/dev/ritz-lang/rz-task-<agast-id>` explicitly.** `adele
@@ -472,10 +472,19 @@ reap, or teardown step expects (2026-11-20).
 **default harness and model**. Do **not** pass `--harness` / `--model` to
 `adele install`, do **not** install any harness drop-in (`90-adele-deepseek.conf`,
 `95-adele-harness.conf`), and don't put `model=` on a host `SPAWN`.
-**Each host's `~/.config/adele/adele.env` decides `CLAUDE_CONFIG_DIR`**
-(since 2026-11-24 23:09Z): on huburght it is unset, so rooms run on
-`~/.claude`; omegalisk rooms get `CLAUDE_CONFIG_DIR=/home/aaron/.claude-bettercomp`
-in their `room.env`. Don't add it to a room on any other host.
+**Each host's `~/.config/rz/host.env` `RZ_ROOM_ACCOUNTS` decides the
+room's Claude account, by ticket parity** (AGAST #4699): room `<id>` gets
+account `<id> % N` of the list, so with two accounts even tickets run on
+the first and odd tickets on the second. An account is `default`
+(`~/.claude`), a config dir, or a host-local mode-600 env file holding a
+`CLAUDE_CODE_OAUTH_TOKEN=` setup token. Account names live in host.env
+only, never in this repo (a test keeps them out). `.claude/provision-room.sh
+--room ritz-task-<id>` applies it: it installs the room's
+`55-rz-room-account.conf` drop-in, which beats `adele.env`'s token (an env
+token overrides any config dir's stored login), and writes trust into that
+account's `.claude.json`. It refuses an account `claude auth status`
+reports logged out. Don't hand-edit `CLAUDE_CONFIG_DIR` into a `room.env`.
+No key: `adele.env` decides for every room.
 Stale DeepSeek pins live in three places, and any one of them keeps a room
 on DeepSeek or crashes it with `[claude-code:unrecognized_model]
 {"model":"deepseek-flash"}`: `ADELE_HARNESS`/`ADELE_MODEL` lines in
@@ -508,17 +517,20 @@ room keeps the description current from then on (ROOM.md step 0).
 about 20-30 characters, 60 at most (Aaron, 2026-10-25). For example "Lower
 build priority for rooms" or "Re-gating after rebase".
 
-**Provision every worktree** with `.claude/provision-room.sh <worktree>` after
-`git worktree add` and before starting the agent. It must print "room
+**Provision every worktree** with `.claude/provision-room.sh --room
+ritz-task-<id> <worktree>` after `git worktree add` and before starting the
+agent. It must print "room
 permissions OK". A plain SSH/login shell is fine: when PATH's own `python3`
 cannot gate, the host check probes the room venv (`~/dev/.venv`, or
 `~/dev/nevelis/.venv` on omegalisk) and says which interpreter it judged
 (#4432). Trust is not per-worktree: for a worktree the CLI checks the
 **main checkout's** key (`~/dev/ritz-lang/rz`) in
-`${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json`, so the script trusts that key as
+the room account's `.claude.json` (`--room`; else
+`${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json`), so the script trusts that key as
 well as the worktree's own (#2746). Without it the room's allow list is ignored,
 and every `Write`, `rm` or `git push` waits on an approval nobody gives (#1378).
-On cleanup, run `.claude/provision-room.sh --remove <worktree>` after
+On cleanup, run `.claude/provision-room.sh --remove --room ritz-task-<id>
+<worktree>` after
 `git worktree remove`. That drops only the worktree's key. The main key stays,
 because the parent room and every live room share it.
 

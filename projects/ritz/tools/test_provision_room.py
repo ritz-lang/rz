@@ -430,8 +430,9 @@ def test_briefing_says_spawn_does_not_create_tmpdir_dropin():
 def test_briefing_says_fleet_runs_default_harness_host_decides_config():
     """Aaron, 2026-11-23 (AGAST #4569, replacing #4476's DeepSeek pin):
     rooms run the default harness and model, with no harness drop-in.
-    Since 2026-11-24 23:09Z each host's adele.env decides CLAUDE_CONFIG_DIR
-    (AGAST #4698), so there is no fleet-wide bettercomp rule. The three
+    Each host's host.env RZ_ROOM_ACCOUNTS picks a room's account by ticket
+    parity (AGAST #4699, replacing #4698's per-host adele.env rule), and no
+    account is named in the repo. The three
     places a stale DeepSeek pin hides are named so a room stuck on
     `unrecognized_model` can be cleared."""
     para = _briefing_paragraph("**Fleet model")
@@ -443,10 +444,15 @@ def test_briefing_says_fleet_runs_default_harness_host_decides_config():
     assert "90-adele-deepseek.conf" in flat
     assert "95-adele-harness.conf" in flat
     assert "model=" in flat
-    # The host decides the config dir: huburght unset, omegalisk bettercomp.
-    assert "each host's `~/.config/adele/adele.env` decides `claude_config_dir`" in flat
-    assert "huburght it is unset" in flat
-    assert "omegalisk rooms get `claude_config_dir=/home/aaron/.claude-bettercomp`" in flat
+    # host.env decides the account, by ticket parity, applied by provision.
+    assert "each host's `~/.config/rz/host.env` `rz_room_accounts` decides" in flat
+    assert "by ticket parity" in flat
+    assert "<id> % n" in flat
+    assert "provision-room.sh --room ritz-task-<id>" in flat
+    assert "logged out" in flat
+    # No per-host account dir in the text (test_room_account.py keeps the
+    # whole repo clean of their names).
+    assert "/home/aaron/.claude-" not in flat
     # The retired fleet-wide rule must not creep back.
     assert "**must** have" not in flat
     # The three hiding places of a stale DeepSeek pin.

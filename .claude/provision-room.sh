@@ -7,7 +7,15 @@
 #   .claude/provision-room.sh --verify <worktree-path>   # check only, no writes
 #   .claude/provision-room.sh --remove <worktree-path>   # drop worktree trust entry (reap)
 #
-# Config file: ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json.  Trust is set under the
+#   --room ritz-task-<id>, before the path, with any mode: the room's Claude
+#   account (AGAST #4699, .claude/room-account.sh) decides the config file,
+#   so trust and the allow list land in the .claude.json the room reads.
+#   Apply installs the room's account drop-in first and refuses a logged-out
+#   account; --verify checks the drop-in; --remove drops it.  Without
+#   --room, the caller's environment decides, as before.
+#
+# Config file: ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json, or the room's
+# account's with --room.  Trust is set under the
 # MAIN checkout's path (the key the CLI checks for a worktree, AGAST #2746; for
 # a worktree of a BARE repo, the repo dir itself, #4256) and under the
 # worktree's own path.  See TRUST_KEY below.
@@ -79,6 +87,7 @@ set -euo pipefail
 _d="${BASH_SOURCE[0]%/*}"; [[ "$_d" != "${BASH_SOURCE[0]}" ]] || _d=.
 # shellcheck source=host-env.sh
 source "$_d/host-env.sh"
+ROOM_ACCOUNT="$_d/room-account.sh"
 unset _d
 if [[ -z "${PATH:-}" || "$(declare -p PATH)" != "declare -x"* ]]; then
     PATH="$(rz_venv_path /usr/local/bin:/usr/bin:/bin)"
@@ -86,16 +95,21 @@ fi
 export HOME PATH
 
 MODE=apply
-case "${1:-}" in
-    --verify) MODE=verify; shift ;;
-    --remove) MODE=remove; shift ;;
-    # The host checks below and nothing else: "could this host gate a room?"
-    # Any dir on the build filesystem will do, e.g. ~/dev/ritz-lang.
-    --check-host) MODE=check; shift ;;
-esac
+ROOM=""
+while [[ $# -gt 1 ]]; do
+    case "$1" in
+        --verify) MODE=verify; shift ;;
+        --remove) MODE=remove; shift ;;
+        # The host checks below and nothing else: "could this host gate a room?"
+        # Any dir on the build filesystem will do, e.g. ~/dev/ritz-lang.
+        --check-host) MODE=check; shift ;;
+        --room) ROOM="$2"; shift 2 ;;
+        *) break ;;
+    esac
+done
 
 if [[ $# -ne 1 ]]; then
-    echo "usage: $0 [--verify|--remove|--check-host] <worktree-path>" >&2
+    echo "usage: $0 [--verify|--remove|--check-host] [--room ritz-task-<id>] <worktree-path>" >&2
     exit 2
 fi
 
@@ -121,6 +135,20 @@ SETTINGS="$WT/.claude/settings.json"
 # The global config the CLI reads: $CLAUDE_CONFIG_DIR/.claude.json when that is
 # set, else ~/.claude.json.  The CLI's own warning names the file it consults.
 CLAUDE_JSON="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+
+# room_claude_json: with --room, the .claude.json of the config dir the room
+# runs under (room-account.sh --config-dir: the installed drop-in's record,
+# else host.env's choice).  `inherit` (no RZ_ROOM_ACCOUNTS) keeps the above.
+room_claude_json() {
+    [[ -n "$ROOM" ]] || return 0
+    local d
+    d="$("$ROOM_ACCOUNT" --config-dir "$ROOM")" || return 1
+    case "$d" in
+        inherit) ;;
+        default) CLAUDE_JSON="$HOME/.claude.json" ;;
+        *) CLAUDE_JSON="$d/.claude.json" ;;
+    esac
+}
 
 # The key the CLI checks trust under.  For a git WORKTREE, Claude Code (at
 # least 2.1.316 .. 2.1.322) does NOT look up the worktree's own path: it looks
@@ -207,6 +235,9 @@ PY
 }
 
 if [[ $MODE == remove ]]; then
+    # A teardown is never blocked: a host.env broken since the spawn falls
+    # back to the caller's config file, and says so.
+    room_claude_json || echo "  warning: no account for $ROOM; using $CLAUDE_JSON" >&2
     # Drops the WORKTREE's own entry only.  The main checkout's entry is shared
     # by the parent room and every live worktree; never remove it here.
     python3 - "$WT" "$CLAUDE_JSON" <<'PY'
@@ -218,11 +249,22 @@ gone = d.get('projects', {}).pop(wt, None)
 p.write_text(json.dumps(d, indent=2))
 print(f"  {'dropped' if gone is not None else 'no'} trust entry for {wt}")
 PY
+    if [[ -n "$ROOM" ]]; then
+        "$ROOM_ACCOUNT" --remove "$ROOM" | sed 's/^/  /'
+    fi
     exit 0
 fi
 
 if [[ $MODE == verify ]]; then
     rc=0
+    room_claude_json || exit 1
+    if [[ -n "$ROOM" ]]; then
+        if out="$("$ROOM_ACCOUNT" --verify "$ROOM")"; then
+            echo "  ✓ $out"
+        else
+            rc=1
+        fi
+    fi
     if trusted "$TRUST_KEY"; then
         echo "  ✓ trusted in $CLAUDE_JSON under the key the CLI checks: $TRUST_KEY"
     else
@@ -429,6 +471,15 @@ fi
 
 # --- apply ------------------------------------------------------------------
 
+# The room's account first: a logged-out one refuses here, before any trust
+# is written, and the drop-in it installs records the config dir the rest of
+# this script (and --verify, --remove) then writes to.
+if [[ -n "$ROOM" ]]; then
+    "$ROOM_ACCOUNT" --install "$ROOM" | sed 's/^/  /'
+    [[ ${PIPESTATUS[0]} -eq 0 ]] || exit 1
+    room_claude_json || exit 1
+fi
+
 # Trust the workspace.  Read-modify-write via python so we never mangle the
 # rest of ~/.claude.json (it holds auth and per-project history).
 # Both keys: the main checkout is what the CLI checks today; the worktree's
@@ -466,4 +517,4 @@ if [[ -n "$EXCLUDE" ]]; then
 fi
 
 # Prove it rather than announce it.
-exec "$0" --verify "$WT"
+exec "$0" --verify ${ROOM:+--room "$ROOM"} "$WT"

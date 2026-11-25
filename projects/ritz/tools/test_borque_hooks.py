@@ -38,7 +38,7 @@ pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
-HOOKS = ("provision-room.sh", "host-budget.sh", "host-env.sh")
+HOOKS = ("provision-room.sh", "host-budget.sh", "host-env.sh", "room-account.sh")
 ROOM = "ritz-task-4242"
 # What the hooks run besides the tools under test: a PATH of just these keeps
 # the host's own qemu and lld-link out of the refusal tests.
