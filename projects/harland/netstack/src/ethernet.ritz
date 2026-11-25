@@ -1,0 +1,96 @@
+# Harland netstack: Ethernet demux and header build (AGAST #4738,
+# docs/RING2_NET.md "Ethernet demux")
+#
+# One RX ring slot is one Ethernet frame with the virtio header already
+# stripped. Receive keeps a frame addressed to our MAC or to the broadcast
+# MAC and hands ARP and IPv4 on; every other destination and every other
+# ethertype, IPv6 included, is dropped. Send writes the 14-byte header in
+# front of a payload already in place, with the source MAC from the link
+# snapshot.
+
+import netstack.bytes { be16_get, be16_put }
+import driver_abi.link { ETH_HEADER_LEN }
+
+pub type MacAddr = [6]u8
+
+# Where the payload starts: driver_abi's ETH_HEADER_LEN as a span index.
+pub const ETH_PAYLOAD_OFF: i64 = ETH_HEADER_LEN as i64
+pub const ETHERTYPE_IPV4: u16 = 0x0800
+pub const ETHERTYPE_ARP: u16 = 0x0806
+
+# The two ethertypes the service handles.
+pub enum EtherType
+    Arp
+    Ipv4
+
+# Why a received frame was dropped.
+pub enum EthDrop
+    Short                            # under ETH_PAYLOAD_OFF bytes
+    ForeignMac                       # neither our MAC nor broadcast
+    Ethertype                        # not ARP or IPv4
+
+# A frame the service keeps. `payload` is a view of the frame's bytes past
+# the header, to the end of the frame: IPv4 bounds itself by its total
+# length, so Ethernet padding is the next layer's to ignore.
+pub struct EthRx
+    dst: MacAddr
+    src: MacAddr
+    ethertype: EtherType
+    payload: [u8]
+
+# Why a send could not be built.
+pub enum SendError
+    # The packet does not fit the link MTU, or the caller's buffer.
+    TooBig
+    # No on-link prefix and no gateway reach the destination.
+    Unroutable
+
+pub fn mac_eq(a: MacAddr, b: MacAddr) -> bool
+    for i in 0..6
+        if a[i] != b[i]
+            return false
+    true
+
+# ff:ff:ff:ff:ff:ff.
+pub fn mac_is_broadcast(m: MacAddr) -> bool
+    for i in 0..6
+        if m[i] != 0xFF
+            return false
+    true
+
+# Copy the 6 bytes at `at` out of `s`.
+fn mac_at(s: [u8], at: i64) -> MacAddr
+    var m: MacAddr = [0, 0, 0, 0, 0, 0]
+    for i in 0..6
+        m[i] = s[at + i]
+    m
+
+# Demux one received frame against our MAC.
+pub fn eth_demux(frame: [u8], ours: MacAddr) -> Result<EthRx, EthDrop>
+    if frame.len < ETH_PAYLOAD_OFF
+        return Err(EthDrop.Short)
+    let dst = mac_at(frame, 0)
+    if not mac_eq(dst, ours) and not mac_is_broadcast(dst)
+        return Err(EthDrop.ForeignMac)
+    let raw = be16_get(frame, 12)
+    var ethertype = EtherType.Ipv4
+    if raw == ETHERTYPE_ARP
+        ethertype = EtherType.Arp
+    else if raw != ETHERTYPE_IPV4
+        return Err(EthDrop.Ethertype)
+    let payload = frame[ETH_PAYLOAD_OFF..frame.len]
+    Ok(EthRx { dst: dst, src: mac_at(frame, 6), ethertype: ethertype, payload: payload })
+
+# Write the Ethernet header into the first ETH_PAYLOAD_OFF bytes of `frame`.
+# The payload is the caller's, already at frame[ETH_PAYLOAD_OFF..].
+pub fn eth_header_write(frame: [u8], dst: MacAddr, src: MacAddr, ethertype: EtherType) -> Result<i64, SendError>
+    if frame.len < ETH_PAYLOAD_OFF
+        return Err(SendError.TooBig)
+    for i in 0..6
+        frame[i] = dst[i]
+        frame[6 + i] = src[i]
+    let value = match ethertype
+        EtherType.Arp => ETHERTYPE_ARP
+        EtherType.Ipv4 => ETHERTYPE_IPV4
+    be16_put(frame, 12, value)
+    Ok(ETH_PAYLOAD_OFF)

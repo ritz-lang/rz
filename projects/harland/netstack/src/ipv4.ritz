@@ -1,0 +1,179 @@
+# Harland netstack: IPv4 receive checks, next hop and header build
+# (AGAST #4738, docs/RING2_NET.md "IPv4")
+#
+# Receive, in the order the RING2_NET diagram draws: version 4, header
+# length 20..=total length, total length within the frame (it, not the
+# Ethernet length, ends the packet, so padding is ignored), header
+# checksum, fragments dropped (no reassembly), destination, then protocol
+# 1 (ICMP) or 17 (UDP) only. Send picks the next hop from the prefix or
+# the gateway and refuses a packet the link MTU does not fit: there is no
+# fragmentation.
+#
+# Addresses are u32 values of the dotted quad, a.b.c.d = a << 24 | ... | d,
+# so a mask is a plain `&`. The wire is big-endian; bytes.ritz converts.
+
+import netstack.bytes { be16_get, be16_put, be32_get, be32_put }
+import netstack.checksum { inet_checksum }
+import netstack.ethernet { MacAddr, EtherType, SendError, ETH_PAYLOAD_OFF, eth_header_write }
+import driver_abi.link { NetInfo }
+
+pub const IPV4_HEADER_MIN: i64 = 20
+pub const IPV4_TOTAL_MAX: i64 = 65535
+pub const IPV4_TTL: u8 = 64
+pub const IPV4_BROADCAST: u32 = 0xFFFFFFFF
+pub const IPPROTO_ICMP: u8 = 1
+pub const IPPROTO_UDP: u8 = 17
+
+# The DHCP bootstrap the destination check admits while unconfigured: UDP
+# from the server port to the client port.
+pub const DHCP_SERVER_PORT: u16 = 67
+pub const DHCP_CLIENT_PORT: u16 = 68
+
+# Flags and fragment offset, the 16 bits at offset 6.
+const IPV4_FLAG_DF: u16 = 0x4000
+const IPV4_FLAG_MF: u16 = 0x2000
+const IPV4_FRAG_OFFSET_MASK: u16 = 0x1FFF
+
+# The service's address record, as receive and send read it.
+pub struct Ipv4Config
+    # Our address; None until a DHCP ACK configures it, and then only the
+    # DHCP bootstrap is admitted.
+    addr: Option<u32>
+    # The on-link prefix; None installs none, so only `addr` is on-link.
+    netmask: Option<u32>
+    # The default router; None leaves off-link destinations unroutable.
+    gateway: Option<u32>
+
+# The two protocols the service handles.
+pub enum IpProto
+    Icmp
+    Udp
+
+# Why a received packet was dropped.
+pub enum Ipv4Drop
+    Short                            # under IPV4_HEADER_MIN bytes
+    Version                          # not 4
+    HeaderLength                     # under 20 or past the total length
+    TotalLength                      # past the end of the frame
+    Checksum                         # header checksum mismatch
+    Fragment                         # MF set or a non-zero offset
+    Destination                      # not ours, broadcast or the bootstrap
+    Protocol                         # not ICMP or UDP (TCP included)
+
+# A packet the service keeps. `body` runs from the end of the header to
+# the total length, never into padding.
+pub struct Ipv4Rx
+    protocol: IpProto
+    src: u32
+    dst: u32
+    body: [u8]
+
+pub fn ipv4_unconfigured() -> Ipv4Config
+    Ipv4Config { addr: None, netmask: None, gateway: None }
+
+# Check one received packet (an Ethernet payload) against `cfg`.
+pub fn ipv4_parse(packet: [u8], cfg: Ipv4Config) -> Result<Ipv4Rx, Ipv4Drop>
+    if packet.len < IPV4_HEADER_MIN
+        return Err(Ipv4Drop.Short)
+    if packet[0] >> 4 != 4
+        return Err(Ipv4Drop.Version)
+    let header_len = (packet[0] & 0x0F) as i64 * 4
+    let total = be16_get(packet, 2) as i64
+    if header_len < IPV4_HEADER_MIN or header_len > total
+        return Err(Ipv4Drop.HeaderLength)
+    if total > packet.len
+        return Err(Ipv4Drop.TotalLength)
+    # A valid header, its checksum field included, sums to all ones.
+    let header = packet[0..header_len]
+    if inet_checksum(header) != 0
+        return Err(Ipv4Drop.Checksum)
+    let frag = be16_get(packet, 6)
+    if (frag & IPV4_FLAG_MF) != 0 or (frag & IPV4_FRAG_OFFSET_MASK) != 0
+        return Err(Ipv4Drop.Fragment)
+    let protocol = packet[9]
+    let dst = be32_get(packet, 16)
+    let body = packet[header_len..total]
+    let admitted = match cfg.addr
+        Some(ours) => ipv4_is_ours(cfg, ours, dst)
+        None => ipv4_is_dhcp_bootstrap(protocol, body)
+    if not admitted
+        return Err(Ipv4Drop.Destination)
+    var proto = IpProto.Udp
+    if protocol == IPPROTO_ICMP
+        proto = IpProto.Icmp
+    else if protocol != IPPROTO_UDP
+        return Err(Ipv4Drop.Protocol)
+    Ok(Ipv4Rx { protocol: proto, src: be32_get(packet, 12), dst: dst, body: body })
+
+# Our address, the limited broadcast, or our prefix's directed broadcast.
+fn ipv4_is_ours(cfg: Ipv4Config, ours: u32, dst: u32) -> bool
+    if dst == ours or dst == IPV4_BROADCAST
+        return true
+    match cfg.netmask
+        Some(mask) => mask != IPV4_BROADCAST and dst == (ours | (mask ^ IPV4_BROADCAST))
+        None => false
+
+# UDP from port 67 to port 68: the only IPv4 an unconfigured service
+# admits, whatever its destination. The transaction id is the DHCP
+# client's to match; a short or bad UDP header is udp_parse's to drop.
+fn ipv4_is_dhcp_bootstrap(protocol: u8, body: [u8]) -> bool
+    if protocol != IPPROTO_UDP or body.len < 4
+        return false
+    be16_get(body, 0) == DHCP_SERVER_PORT and be16_get(body, 2) == DHCP_CLIENT_PORT
+
+# The next hop for `dst`, the address ARP resolves: the destination itself
+# when it is on-link (our address, or inside our prefix), else the gateway.
+# The limited broadcast is its own next hop (the broadcast MAC, no ARP),
+# configured or not, so DHCP can send before a lease.
+pub fn ipv4_next_hop(cfg: Ipv4Config, dst: u32) -> Result<u32, SendError>
+    if dst == IPV4_BROADCAST
+        return Ok(dst)
+    let ours = match cfg.addr
+        Some(a) => a
+        None => return Err(SendError.Unroutable)
+    if dst == ours
+        return Ok(dst)
+    let on_link = match cfg.netmask
+        Some(mask) => (dst & mask) == (ours & mask)
+        None => false
+    if on_link
+        return Ok(dst)
+    match cfg.gateway
+        Some(gw) => Ok(gw)
+        None => Err(SendError.Unroutable)
+
+# Write a 20-byte IPv4 header, checksum included, in front of `body_len`
+# bytes the caller already wrote at packet[IPV4_HEADER_MIN..]. Ok is the
+# total length. A packet over `mtu` is not sent: DF is set and nothing
+# fragments.
+pub fn ipv4_header_write(packet: [u8], protocol: IpProto, src: u32, dst: u32, body_len: i64, mtu: u32) -> Result<i64, SendError>
+    let total = IPV4_HEADER_MIN + body_len
+    if body_len < 0 or total > mtu as i64 or total > packet.len or total > IPV4_TOTAL_MAX
+        return Err(SendError.TooBig)
+    packet[0] = 0x45                 # version 4, 5 words
+    packet[1] = 0
+    be16_put(packet, 2, total as u16)
+    be16_put(packet, 4, 0)           # id: unused without fragmentation
+    be16_put(packet, 6, IPV4_FLAG_DF)
+    packet[8] = IPV4_TTL
+    packet[9] = match protocol
+        IpProto.Icmp => IPPROTO_ICMP
+        IpProto.Udp => IPPROTO_UDP
+    be16_put(packet, 10, 0)
+    be32_put(packet, 12, src)
+    be32_put(packet, 16, dst)
+    let header = packet[0..IPV4_HEADER_MIN]
+    be16_put(packet, 10, inet_checksum(header))
+    Ok(total)
+
+# Write the IPv4 and Ethernet headers of one frame whose `body_len` bytes
+# of IPv4 body are already at frame[ETH_PAYLOAD_OFF + IPV4_HEADER_MIN..].
+# The source MAC and the MTU come from the link snapshot; `dst_mac` is the
+# next hop's, from ARP. Ok is the frame length.
+pub fn ipv4_frame_write(frame: [u8], link: NetInfo, dst_mac: MacAddr, protocol: IpProto, src: u32, dst: u32, body_len: i64) -> Result<i64, SendError>
+    if frame.len < ETH_PAYLOAD_OFF + IPV4_HEADER_MIN
+        return Err(SendError.TooBig)
+    let packet = frame[ETH_PAYLOAD_OFF..frame.len]
+    let total = ipv4_header_write(packet, protocol, src, dst, body_len, link.mtu)?
+    eth_header_write(frame, dst_mac, link.mac, EtherType.Ipv4)?
+    Ok(ETH_PAYLOAD_OFF + total)

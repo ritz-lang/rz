@@ -1,0 +1,86 @@
+# Harland netstack: UDP length and checksum checks and datagram build
+# (AGAST #4738, docs/RING2_NET.md "UDP and DHCP")
+#
+# Receive: the UDP length is 8..=the remaining IPv4 body and the parse
+# stops there. A non-zero checksum is verified over the pseudo-header and
+# the datagram, and a mismatch drops it; zero is RFC 768's "no checksum"
+# and is accepted. Send always fills the checksum, writing a computed 0 as
+# 0xFFFF so it is never read as "none".
+
+import netstack.bytes { be16_get, be16_put }
+import netstack.checksum { inet_sum, inet_sum_word, inet_fold }
+import netstack.ethernet { MacAddr, SendError, ETH_PAYLOAD_OFF }
+import netstack.ipv4 { IpProto, IPV4_HEADER_MIN, IPPROTO_UDP, ipv4_frame_write }
+import driver_abi.link { NetInfo }
+
+pub const UDP_HEADER_LEN: i64 = 8
+
+# Why a received datagram was dropped.
+pub enum UdpDrop
+    Short                            # under UDP_HEADER_LEN bytes
+    Length                           # UDP length under 8 or past the body
+    Checksum                         # non-zero checksum mismatch
+
+pub struct UdpRx
+    src_port: u16
+    dst_port: u16
+    payload: [u8]
+
+# The one's-complement sum of the pseudo-header and `datagram`, its
+# checksum field as it stands, before the final fold.
+fn udp_sum(src: u32, dst: u32, datagram: [u8]) -> u32
+    var sum = inet_sum_word(0, (src >> 16) as u16)
+    sum = inet_sum_word(sum, (src & 0xFFFF) as u16)
+    sum = inet_sum_word(sum, (dst >> 16) as u16)
+    sum = inet_sum_word(sum, (dst & 0xFFFF) as u16)
+    sum = inet_sum_word(sum, IPPROTO_UDP as u16)
+    sum = inet_sum_word(sum, datagram.len as u16)
+    inet_sum(sum, datagram)
+
+# Check one IPv4 body from `src` to `dst` as a UDP datagram.
+pub fn udp_parse(body: [u8], src: u32, dst: u32) -> Result<UdpRx, UdpDrop>
+    if body.len < UDP_HEADER_LEN
+        return Err(UdpDrop.Short)
+    let length = be16_get(body, 4) as i64
+    if length < UDP_HEADER_LEN or length > body.len
+        return Err(UdpDrop.Length)
+    let datagram: [u8] = body[0..length]
+    # A correct non-zero field makes the whole sum fold to 0.
+    if be16_get(datagram, 6) != 0 and inet_fold(udp_sum(src, dst, datagram)) != 0
+        return Err(UdpDrop.Checksum)
+    let payload = datagram[UDP_HEADER_LEN..length]
+    Ok(UdpRx { src_port: be16_get(datagram, 0), dst_port: be16_get(datagram, 2), payload: payload })
+
+# Write the UDP header, checksum included, in front of `payload_len` bytes
+# the caller already wrote at segment[UDP_HEADER_LEN..]. Ok is the UDP
+# length.
+pub fn udp_header_write(segment: [u8], src: u32, dst: u32, src_port: u16, dst_port: u16, payload_len: i64) -> Result<i64, SendError>
+    let length = UDP_HEADER_LEN + payload_len
+    if payload_len < 0 or length > segment.len or length > 0xFFFF
+        return Err(SendError.TooBig)
+    be16_put(segment, 0, src_port)
+    be16_put(segment, 2, dst_port)
+    be16_put(segment, 4, length as u16)
+    be16_put(segment, 6, 0)
+    let datagram = segment[0..length]
+    var sum = inet_fold(udp_sum(src, dst, datagram))
+    if sum == 0
+        sum = 0xFFFF
+    be16_put(segment, 6, sum)
+    Ok(length)
+
+# Build one Ethernet frame carrying `payload` from src:src_port to
+# dst:dst_port, sent to `dst_mac` (the next hop's, from ARP). The size
+# limit is the link snapshot's MTU and the frame buffer; nothing is
+# written when the datagram does not fit. Ok is the frame length.
+pub fn udp_frame_write(frame: [u8], link: NetInfo, dst_mac: MacAddr, src: u32, dst: u32, src_port: u16, dst_port: u16, payload: [u8]) -> Result<i64, SendError>
+    let udp_at = ETH_PAYLOAD_OFF + IPV4_HEADER_MIN
+    let at = udp_at + UDP_HEADER_LEN
+    let udp_len = UDP_HEADER_LEN + payload.len
+    if IPV4_HEADER_MIN + udp_len > link.mtu as i64 or at + payload.len > frame.len
+        return Err(SendError.TooBig)
+    for i in 0..payload.len
+        frame[at + i] = payload[i]
+    let segment = frame[udp_at..frame.len]
+    udp_header_write(segment, src, dst, src_port, dst_port, payload.len)?
+    ipv4_frame_write(frame, link, dst_mac, IpProto.Udp, src, dst, udp_len)

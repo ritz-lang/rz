@@ -1,0 +1,115 @@
+# Harland netstack: Ethernet demux (AGAST #4738, docs/RING2_NET.md
+# "Ethernet demux")
+#
+# Ported from docs/stack_example: a frame for a foreign MAC is dropped
+# (Stack._service_rx); ours and broadcast are kept. Only ARP and IPv4 pass
+# the ethertype switch.
+
+import netstack.ethernet { MacAddr, EtherType, EthDrop, EthRx, SendError, ETH_PAYLOAD_OFF, eth_demux, eth_header_write, mac_eq, mac_is_broadcast }
+
+var g_frame: [64]u8
+
+fn our_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+
+fn peer_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0xAA, 0xBB, 0xCC]
+
+# A 20-byte frame to `dst` from the peer with `ethertype` and payload 1..6.
+fn frame_to(dst: MacAddr, ethertype: u16) -> [u8]
+    for i in 0..6
+        g_frame[i] = dst[i]
+        g_frame[6 + i] = peer_mac()[i]
+    g_frame[12] = (ethertype >> 8) as u8
+    g_frame[13] = (ethertype & 0xFF) as u8
+    for i in 0..6
+        g_frame[14 + i] = (i + 1) as u8
+    let all: [u8] = @g_frame
+    let f = all[0..20]
+    f
+
+fn dropped(r: Result<EthRx, EthDrop>, why: EthDrop) -> bool
+    match r
+        Err(w) => w == why
+        Ok(_) => false
+
+[[test]]
+fn test_our_mac_is_kept() -> i32
+    match eth_demux(frame_to(our_mac(), 0x0800), our_mac())
+        Ok(rx) =>
+            if rx.ethertype != EtherType.Ipv4
+                return 1
+            if not mac_eq(rx.src, peer_mac()) or not mac_eq(rx.dst, our_mac())
+                return 2
+            if rx.payload.len != 6 or rx.payload[0] != 1 or rx.payload[5] != 6
+                return 3
+        Err(_) => return 4
+    0
+
+[[test]]
+fn test_broadcast_is_kept() -> i32
+    let bcast: MacAddr = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+    match eth_demux(frame_to(bcast, 0x0806), our_mac())
+        Ok(rx) =>
+            if rx.ethertype != EtherType.Arp or not mac_is_broadcast(rx.dst)
+                return 1
+        Err(_) => return 2
+    0
+
+[[test]]
+fn test_foreign_mac_is_dropped() -> i32
+    let foreign: MacAddr = [0x52, 0x54, 0x00, 0x12, 0x34, 0x57]
+    if not dropped(eth_demux(frame_to(foreign, 0x0800), our_mac()), EthDrop.ForeignMac)
+        return 1
+    # A multicast group we never joined is foreign too.
+    let mcast: MacAddr = [0x01, 0x00, 0x5E, 0x00, 0x00, 0x01]
+    if not dropped(eth_demux(frame_to(mcast, 0x0800), our_mac()), EthDrop.ForeignMac)
+        return 2
+    0
+
+[[test]]
+fn test_only_arp_and_ipv4_ethertypes() -> i32
+    if not dropped(eth_demux(frame_to(our_mac(), 0x86DD), our_mac()), EthDrop.Ethertype)
+        return 1                     # IPv6
+    if not dropped(eth_demux(frame_to(our_mac(), 0x8100), our_mac()), EthDrop.Ethertype)
+        return 2                     # 802.1Q
+    if not dropped(eth_demux(frame_to(our_mac(), 0x0000), our_mac()), EthDrop.Ethertype)
+        return 3
+    0
+
+[[test]]
+fn test_short_frame_is_dropped() -> i32
+    let f = frame_to(our_mac(), 0x0800)
+    let short = f[0..13]
+    if not dropped(eth_demux(short, our_mac()), EthDrop.Short)
+        return 1
+    let bare = f[0..14]
+    match eth_demux(bare, our_mac())
+        Ok(rx) =>
+            if rx.payload.len != 0
+                return 2
+        Err(_) => return 3
+    0
+
+[[test]]
+fn test_header_write_round_trips() -> i32
+    let out: [u8] = @g_frame
+    match eth_header_write(out, peer_mac(), our_mac(), EtherType.Arp)
+        Ok(n) =>
+            if n != ETH_PAYLOAD_OFF
+                return 1
+        Err(_) => return 2
+    if out[12] != 0x08 or out[13] != 0x06
+        return 3
+    match eth_demux(out, peer_mac())
+        Ok(rx) =>
+            if not mac_eq(rx.src, our_mac()) or rx.ethertype != EtherType.Arp
+                return 4
+        Err(_) => return 5
+    let small = out[0..13]
+    match eth_header_write(small, peer_mac(), our_mac(), EtherType.Ipv4)
+        Err(e) =>
+            if e != SendError.TooBig
+                return 6
+        Ok(_) => return 7
+    0

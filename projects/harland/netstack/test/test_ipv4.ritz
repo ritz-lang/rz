@@ -1,0 +1,392 @@
+# Harland netstack: IPv4 receive checks, next hop and send (AGAST #4738,
+# docs/RING2_NET.md "IPv4")
+#
+# Ported from docs/stack_example/test_stack.py: the parse_ipv4 total-length
+# / padding fixture ("IPv4 total length bounds the UDP parse, including
+# padding past that length"), a bad header checksum, and a fragment. Then
+# every other receive rule of the RING2_NET diagram, the next hop, and the
+# MTU limit on send.
+
+import netstack.bytes { be16_get, be16_put, be32_put }
+import netstack.checksum { inet_checksum }
+import netstack.ethernet { MacAddr, SendError, ETH_PAYLOAD_OFF, eth_demux }
+import netstack.ipv4 { Ipv4Config, Ipv4Drop, Ipv4Rx, IpProto, IPV4_BROADCAST, ipv4_parse, ipv4_next_hop, ipv4_header_write, ipv4_frame_write, ipv4_unconfigured }
+import netstack.udp { UdpDrop, udp_parse, udp_frame_write }
+import driver_abi.link { NetInfo }
+
+const OUR_IP: u32 = 0x0A00020F       # 10.0.2.15
+const PEER_IP: u32 = 0x0A000202      # 10.0.2.2
+const OTHER_IP: u32 = 0x0A000263     # 10.0.2.99
+const FAR_IP: u32 = 0x08080808       # 8.8.8.8
+const MASK_24: u32 = 0xFFFFFF00
+
+var g_frame: [2048]u8
+
+fn our_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+
+fn peer_link() -> NetInfo
+    NetInfo { mac: [0x52, 0x54, 0x00, 0xAA, 0xBB, 0xCC], link_up: 1, device_type: 1, mtu: 1500 }
+
+fn configured() -> Ipv4Config
+    Ipv4Config { addr: Some(OUR_IP), netmask: Some(MASK_24), gateway: Some(PEER_IP) }
+
+# A UDP frame from the peer, sport -> dport, src -> dst, carrying
+# `payload`; the whole frame, and nothing after it.
+fn udp_frame(src: u32, dst: u32, sport: u16, dport: u16, payload: [u8]) -> [u8]
+    let out: [u8] = @g_frame
+    let n = match udp_frame_write(out, peer_link(), our_mac(), src, dst, sport, dport, payload)
+        Ok(len) => len
+        Err(_) => 0
+    let frame = out[0..n]
+    frame
+
+# The IPv4 packet of a frame udp_frame built.
+fn ip_of(frame: [u8]) -> [u8]
+    let ip = frame[ETH_PAYLOAD_OFF..frame.len]
+    ip
+
+# Recompute the header checksum after a test edits a header field, so the
+# edit, not the checksum, is what the parse sees.
+fn reseal(packet: [u8])
+    let header_len = (packet[0] & 0x0F) as i64 * 4
+    be16_put(packet, 10, 0)
+    let header = packet[0..header_len]
+    be16_put(packet, 10, inet_checksum(header))
+
+fn dropped(r: Result<Ipv4Rx, Ipv4Drop>, why: Ipv4Drop) -> bool
+    match r
+        Err(w) => w == why
+        Ok(_) => false
+
+fn kept(r: Result<Ipv4Rx, Ipv4Drop>) -> bool
+    match r
+        Ok(_) => true
+        Err(_) => false
+
+# ---------------------------------------------------------------------------
+# Ported fixtures
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_total_length_bounds_the_packet_and_padding_is_ignored() -> i32
+    let inside: [u8] = "inside-ip"
+    let outside: [u8] = "OUTSIDE!"
+    let base = udp_frame(PEER_IP, OUR_IP, 44000, 9999, inside)
+    if base.len == 0
+        return 1
+    # Ethernet padding past the IPv4 total length.
+    let all: [u8] = @g_frame
+    for i in 0..outside.len
+        all[base.len + i] = outside[i]
+    let padded = all[0..base.len + outside.len]
+    let eth = match eth_demux(padded, our_mac())
+        Ok(rx) => rx
+        Err(_) => return 2
+    let ip = match ipv4_parse(eth.payload, configured())
+        Ok(rx) => rx
+        Err(_) => return 3
+    if ip.body.len != 8 + inside.len or ip.protocol != IpProto.Udp
+        return 4
+    match udp_parse(ip.body, ip.src, ip.dst)
+        Ok(u) =>
+            if u.payload.len != inside.len or u.payload[0] != 'i' or u.payload[8] != 'p'
+                return 5
+        Err(_) => return 6
+    # A UDP length that claims the padding reaches past the IPv4 body.
+    let udp_len_at = ETH_PAYLOAD_OFF + 20 + 4
+    be16_put(padded, udp_len_at, (8 + inside.len + outside.len) as u16)
+    let again = match ipv4_parse(ip_of(padded), configured())
+        Ok(rx) => rx
+        Err(_) => return 7
+    match udp_parse(again.body, again.src, again.dst)
+        Err(w) =>
+            if w != UdpDrop.Length
+                return 8
+        Ok(_) => return 9
+    0
+
+[[test]]
+fn test_bad_header_checksum_is_dropped() -> i32
+    let frame = udp_frame(PEER_IP, OUR_IP, 44000, 9999, "csum")
+    let ip = ip_of(frame)
+    if not kept(ipv4_parse(ip, configured()))
+        return 1
+    ip[8] = ip[8] - 1                # a router's TTL decrement, no re-checksum
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.Checksum)
+        return 2
+    ip[8] = ip[8] + 1
+    ip[11] = ip[11] ^ 0x01           # the field itself
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.Checksum)
+        return 3
+    0
+
+[[test]]
+fn test_fragments_are_dropped() -> i32
+    let ip = ip_of(udp_frame(PEER_IP, OUR_IP, 44000, 9999, "frag"))
+    # More-fragments.
+    be16_put(ip, 6, 0x2000)
+    reseal(ip)
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.Fragment)
+        return 1
+    # The last fragment: offset non-zero, MF clear.
+    be16_put(ip, 6, 0x0001)
+    reseal(ip)
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.Fragment)
+        return 2
+    # DF alone is a whole packet.
+    be16_put(ip, 6, 0x4000)
+    reseal(ip)
+    if not kept(ipv4_parse(ip, configured()))
+        return 3
+    be16_put(ip, 6, 0x0000)
+    reseal(ip)
+    if not kept(ipv4_parse(ip, configured()))
+        return 4
+    0
+
+[[test]]
+fn test_foreign_mac_frame_never_reaches_ipv4() -> i32
+    let frame = udp_frame(PEER_IP, OUR_IP, 44000, 9999, "foreign")
+    let foreign: MacAddr = [0x52, 0x54, 0x00, 0x12, 0x34, 0x57]
+    match eth_demux(frame, foreign)
+        Ok(_) => 1
+        Err(_) => 0
+
+# ---------------------------------------------------------------------------
+# Header shape
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_textbook_header_parses() -> i32
+    # 192.168.0.1 -> 192.168.0.199, UDP, total 0x73, checksum 0xb861.
+    var pkt: [115]u8
+    let hdr: [20]u8 = [0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0xB8, 0x61, 0xC0, 0xA8, 0x00, 0x01, 0xC0, 0xA8, 0x00, 0xC7]
+    for i in 0..20
+        pkt[i] = hdr[i]
+    let cfg = Ipv4Config { addr: Some(0xC0A800C7), netmask: None, gateway: None }
+    match ipv4_parse(@pkt, cfg)
+        Ok(rx) =>
+            if rx.src != 0xC0A80001 or rx.dst != 0xC0A800C7 or rx.body.len != 95
+                return 1
+        Err(_) => return 2
+    0
+
+[[test]]
+fn test_version_and_lengths() -> i32
+    let ip = ip_of(udp_frame(PEER_IP, OUR_IP, 44000, 9999, "lengths"))
+    let total = ip.len
+    let short = ip[0..19]
+    if not dropped(ipv4_parse(short, configured()), Ipv4Drop.Short)
+        return 1
+    ip[0] = 0x65                     # version 6
+    reseal(ip)
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.Version)
+        return 2
+    ip[0] = 0x44                     # IHL 16 bytes
+    be16_put(ip, 10, 0)
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.HeaderLength)
+        return 3
+    ip[0] = 0x45
+    reseal(ip)
+    # Total length under the header length.
+    be16_put(ip, 2, 19)
+    reseal(ip)
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.HeaderLength)
+        return 4
+    # Total length past the frame.
+    be16_put(ip, 2, (total + 1) as u16)
+    reseal(ip)
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.TotalLength)
+        return 5
+    be16_put(ip, 2, total as u16)
+    reseal(ip)
+    if not kept(ipv4_parse(ip, configured()))
+        return 6
+    0
+
+[[test]]
+fn test_options_are_inside_the_header() -> i32
+    # A 24-byte header (IHL 6, four NOPs) in front of a 4-byte body.
+    var pkt: [28]u8
+    for i in 0..28
+        pkt[i] = 0
+    pkt[0] = 0x46
+    be16_put(@pkt, 2, 28)
+    pkt[8] = 64
+    pkt[9] = 1
+    be32_put(@pkt, 12, PEER_IP)
+    be32_put(@pkt, 16, OUR_IP)
+    for i in 20..24
+        pkt[i] = 1
+    for i in 24..28
+        pkt[i] = (0xA0 + i) as u8
+    reseal(@pkt)
+    match ipv4_parse(@pkt, configured())
+        Ok(rx) =>
+            if rx.protocol != IpProto.Icmp or rx.body.len != 4 or rx.body[0] != 0xB8
+                return 1
+        Err(_) => return 2
+    # IHL 15 (60 bytes) is past the 28-byte total.
+    pkt[0] = 0x4F
+    if not dropped(ipv4_parse(@pkt, configured()), Ipv4Drop.HeaderLength)
+        return 3
+    0
+
+# ---------------------------------------------------------------------------
+# Destination and protocol
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_configured_destination() -> i32
+    let to_us = ip_of(udp_frame(PEER_IP, OUR_IP, 44000, 9999, "d"))
+    if not kept(ipv4_parse(to_us, configured()))
+        return 1
+    let to_other = ip_of(udp_frame(PEER_IP, OTHER_IP, 44000, 9999, "d"))
+    if not dropped(ipv4_parse(to_other, configured()), Ipv4Drop.Destination)
+        return 2
+    let to_all = ip_of(udp_frame(PEER_IP, IPV4_BROADCAST, 44000, 9999, "d"))
+    if not kept(ipv4_parse(to_all, configured()))
+        return 3
+    # 10.0.2.255 is our /24's broadcast; without a prefix it is foreign.
+    let directed = ip_of(udp_frame(PEER_IP, 0x0A0002FF, 44000, 9999, "d"))
+    if not kept(ipv4_parse(directed, configured()))
+        return 4
+    let no_prefix = Ipv4Config { addr: Some(OUR_IP), netmask: None, gateway: None }
+    if not dropped(ipv4_parse(directed, no_prefix), Ipv4Drop.Destination)
+        return 5
+    0
+
+[[test]]
+fn test_unconfigured_admits_only_the_dhcp_bootstrap() -> i32
+    let none = ipv4_unconfigured()
+    # Server to client, broadcast or to the offered address.
+    if not kept(ipv4_parse(ip_of(udp_frame(PEER_IP, IPV4_BROADCAST, 67, 68, "offer")), none))
+        return 1
+    if not kept(ipv4_parse(ip_of(udp_frame(PEER_IP, OUR_IP, 67, 68, "offer")), none))
+        return 2
+    # Any other UDP, the reverse direction included, is dropped.
+    if not dropped(ipv4_parse(ip_of(udp_frame(PEER_IP, IPV4_BROADCAST, 68, 67, "d")), none), Ipv4Drop.Destination)
+        return 3
+    if not dropped(ipv4_parse(ip_of(udp_frame(PEER_IP, OUR_IP, 44000, 9999, "d")), none), Ipv4Drop.Destination)
+        return 4
+    # ICMP with the same first four body bytes is not the bootstrap.
+    let icmp = ip_of(udp_frame(PEER_IP, IPV4_BROADCAST, 67, 68, "offer"))
+    icmp[9] = 1
+    reseal(icmp)
+    if not dropped(ipv4_parse(icmp, none), Ipv4Drop.Destination)
+        return 5
+    0
+
+[[test]]
+fn test_only_icmp_and_udp() -> i32
+    let ip = ip_of(udp_frame(PEER_IP, OUR_IP, 44000, 9999, "proto"))
+    ip[9] = 1
+    reseal(ip)
+    match ipv4_parse(ip, configured())
+        Ok(rx) =>
+            if rx.protocol != IpProto.Icmp
+                return 1
+        Err(_) => return 2
+    ip[9] = 6                        # TCP: a later milestone
+    reseal(ip)
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.Protocol)
+        return 3
+    ip[9] = 2                        # IGMP
+    reseal(ip)
+    if not dropped(ipv4_parse(ip, configured()), Ipv4Drop.Protocol)
+        return 4
+    0
+
+# ---------------------------------------------------------------------------
+# Send
+# ---------------------------------------------------------------------------
+
+fn hop_is(r: Result<u32, SendError>, want: u32) -> bool
+    match r
+        Ok(h) => h == want
+        Err(_) => false
+
+fn unroutable(r: Result<u32, SendError>) -> bool
+    match r
+        Err(e) => e == SendError.Unroutable
+        Ok(_) => false
+
+[[test]]
+fn test_next_hop() -> i32
+    let cfg = configured()
+    if not hop_is(ipv4_next_hop(cfg, OTHER_IP), OTHER_IP)
+        return 1                     # on-link
+    if not hop_is(ipv4_next_hop(cfg, FAR_IP), PEER_IP)
+        return 2                     # via the gateway
+    if not hop_is(ipv4_next_hop(cfg, IPV4_BROADCAST), IPV4_BROADCAST)
+        return 3
+    let no_gw = Ipv4Config { addr: Some(OUR_IP), netmask: Some(MASK_24), gateway: None }
+    if not unroutable(ipv4_next_hop(no_gw, FAR_IP))
+        return 4
+    if not hop_is(ipv4_next_hop(no_gw, OTHER_IP), OTHER_IP)
+        return 5
+    # No prefix: only our own address is on-link.
+    let no_mask = Ipv4Config { addr: Some(OUR_IP), netmask: None, gateway: Some(PEER_IP) }
+    if not hop_is(ipv4_next_hop(no_mask, OTHER_IP), PEER_IP)
+        return 6
+    if not hop_is(ipv4_next_hop(no_mask, OUR_IP), OUR_IP)
+        return 7
+    let bare = Ipv4Config { addr: Some(OUR_IP), netmask: None, gateway: None }
+    if not unroutable(ipv4_next_hop(bare, OTHER_IP))
+        return 8
+    # Unconfigured: the limited broadcast only, for DHCP.
+    if not hop_is(ipv4_next_hop(ipv4_unconfigured(), IPV4_BROADCAST), IPV4_BROADCAST)
+        return 9
+    if not unroutable(ipv4_next_hop(ipv4_unconfigured(), PEER_IP))
+        return 10
+    0
+
+fn too_big(r: Result<i64, SendError>) -> bool
+    match r
+        Err(e) => e == SendError.TooBig
+        Ok(_) => false
+
+[[test]]
+fn test_header_write_fields() -> i32
+    let frame = udp_frame(OUR_IP, PEER_IP, 68, 67, "hdr")
+    let ip = ip_of(frame)
+    if ip[0] != 0x45 or be16_get(ip, 2) != 31 or ip[8] != 64 or ip[9] != 17
+        return 1
+    if be16_get(ip, 6) != 0x4000     # DF: nothing fragments
+        return 2
+    let header = ip[0..20]
+    if inet_checksum(header) != 0
+        return 3
+    # The source MAC is the link snapshot's.
+    for i in 0..6
+        if frame[6 + i] != peer_link().mac[i] or frame[i] != our_mac()[i]
+            return 4
+    0
+
+[[test]]
+fn test_send_is_bounded_by_the_link_mtu() -> i32
+    var link = peer_link()
+    link.mtu = 576
+    let out: [u8] = @g_frame
+    # Exactly the MTU: 20 + 556 bytes of body.
+    match ipv4_frame_write(out, link, our_mac(), IpProto.Icmp, OUR_IP, PEER_IP, 556)
+        Ok(n) =>
+            if n != 14 + 576
+                return 1
+        Err(_) => return 2
+    # One byte over is not sent, and nothing is written.
+    out[0] = 0xEE
+    out[14] = 0xEE
+    if not too_big(ipv4_frame_write(out, link, our_mac(), IpProto.Icmp, OUR_IP, PEER_IP, 557))
+        return 3
+    if out[0] != 0xEE or out[14] != 0xEE
+        return 4
+    # The frame buffer bounds it too, whatever the MTU.
+    link.mtu = 2034
+    let small = out[0..100]
+    if not too_big(ipv4_frame_write(small, link, our_mac(), IpProto.Icmp, OUR_IP, PEER_IP, 67))
+        return 5
+    if not too_big(ipv4_header_write(out, IpProto.Udp, OUR_IP, PEER_IP, -1, 1500))
+        return 6
+    0

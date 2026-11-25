@@ -1,0 +1,197 @@
+# Harland netstack: UDP length and checksum (AGAST #4738,
+# docs/RING2_NET.md "IPv4" and "UDP and DHCP")
+#
+# Ported from docs/stack_example/test_stack.py: "a non-zero UDP checksum is
+# checked, and zero stayed legal". The pinned checksums are stack.py's
+# udp_checksum of the same datagrams, not values this package computed.
+
+import netstack.bytes { be16_get, be16_put }
+import netstack.ethernet { MacAddr, SendError, ETH_PAYLOAD_OFF }
+import netstack.udp { UdpDrop, UdpRx, UDP_HEADER_LEN, udp_parse, udp_header_write, udp_frame_write }
+import driver_abi.link { NetInfo }
+
+const OUR_IP: u32 = 0x0A00020F       # 10.0.2.15
+const PEER_IP: u32 = 0x0A000202      # 10.0.2.2
+const UDP_AT: i64 = 34               # Ethernet 14 + IPv4 20
+
+var g_frame: [2048]u8
+var g_seg: [64]u8
+
+fn our_mac() -> MacAddr
+    [0x52, 0x54, 0x00, 0x12, 0x34, 0x56]
+
+fn peer_link() -> NetInfo
+    NetInfo { mac: [0x52, 0x54, 0x00, 0xAA, 0xBB, 0xCC], link_up: 1, device_type: 1, mtu: 1500 }
+
+# The UDP datagram of a frame from the peer to us, 44000 -> 9999.
+fn datagram(payload: [u8]) -> [u8]
+    let out: [u8] = @g_frame
+    let n = match udp_frame_write(out, peer_link(), our_mac(), PEER_IP, OUR_IP, 44000, 9999, payload)
+        Ok(len) => len
+        Err(_) => UDP_AT
+    let d = out[UDP_AT..n]
+    d
+
+fn dropped(r: Result<UdpRx, UdpDrop>, why: UdpDrop) -> bool
+    match r
+        Err(w) => w == why
+        Ok(_) => false
+
+fn payload_is(r: Result<UdpRx, UdpDrop>, want: [u8]) -> bool
+    match r
+        Ok(u) =>
+            if u.src_port != 44000 or u.dst_port != 9999 or u.payload.len != want.len
+                return false
+            for i in 0..want.len
+                if u.payload[i] != want[i]
+                    return false
+            true
+        Err(_) => false
+
+[[test]]
+fn test_checksum_matches_the_reference() -> i32
+    let body: [u8] = "udp-csum-7f3a"
+    let d = datagram(body)
+    if d.len != 8 + body.len or be16_get(d, 4) != (8 + body.len) as u16
+        return 1
+    if be16_get(d, 6) != 0x61E6      # stack.udp_checksum(PEER_IP, OUR_IP, ...)
+        return 2
+    if not payload_is(udp_parse(d, PEER_IP, OUR_IP), body)
+        return 3
+    0
+
+[[test]]
+fn test_odd_length_checksum_matches_the_reference() -> i32
+    let seg: [u8] = @g_seg
+    seg[8] = 'o'
+    seg[9] = 'd'
+    seg[10] = 'd'
+    match udp_header_write(seg, OUR_IP, 0xFFFFFFFF, 68, 67, 3)
+        Ok(n) =>
+            if n != 11
+                return 1
+        Err(_) => return 2
+    if be16_get(seg, 6) != 0x1FDE    # stack.udp_checksum(OUR_IP, 255.255.255.255, ...)
+        return 3
+    let d = seg[0..11]
+    match udp_parse(d, OUR_IP, 0xFFFFFFFF)
+        Ok(u) =>
+            if u.src_port != 68 or u.dst_port != 67 or u.payload.len != 3
+                return 4
+        Err(_) => return 5
+    0
+
+[[test]]
+fn test_nonzero_mismatch_is_dropped() -> i32
+    let body: [u8] = "udp-csum-bad"
+    let d = datagram(body)
+    let good = be16_get(d, 6)
+    be16_put(d, 6, good ^ 0x0100)
+    if not dropped(udp_parse(d, PEER_IP, OUR_IP), UdpDrop.Checksum)
+        return 1
+    be16_put(d, 6, good)
+    # The pseudo-header counts: the same bytes from another source fail.
+    if not dropped(udp_parse(d, 0x0A000203, OUR_IP), UdpDrop.Checksum)
+        return 2
+    # A payload byte flipped after the checksum was written.
+    d[8] = d[8] ^ 0x20
+    if not dropped(udp_parse(d, PEER_IP, OUR_IP), UdpDrop.Checksum)
+        return 3
+    0
+
+[[test]]
+fn test_zero_checksum_is_accepted() -> i32
+    let body: [u8] = "no-checksum"
+    let d = datagram(body)
+    be16_put(d, 6, 0)
+    if not payload_is(udp_parse(d, PEER_IP, OUR_IP), body)
+        return 1
+    # Zero means "none": even a corrupt payload is not checked.
+    d[8] = d[8] ^ 0x20
+    match udp_parse(d, PEER_IP, OUR_IP)
+        Ok(_) => 0
+        Err(_) => 2
+
+[[test]]
+fn test_computed_zero_is_sent_as_ffff() -> i32
+    # A two-byte payload equal to the checksum of the same datagram with a
+    # zero payload makes the one's-complement sum 0xFFFF, which folds to 0.
+    let seg: [u8] = @g_seg
+    seg[8] = 0
+    seg[9] = 0
+    if udp_header_write(seg, PEER_IP, OUR_IP, 1, 2, 2).is_err()
+        return 1
+    let c = be16_get(seg, 6)
+    be16_put(seg, 8, c)
+    if udp_header_write(seg, PEER_IP, OUR_IP, 1, 2, 2).is_err()
+        return 2
+    if be16_get(seg, 6) != 0xFFFF
+        return 3
+    # 0xFFFF is the same one's-complement value, so it verifies.
+    let d = seg[0..10]
+    match udp_parse(d, PEER_IP, OUR_IP)
+        Ok(_) => 0
+        Err(_) => 4
+
+[[test]]
+fn test_length_is_8_to_the_remaining_body() -> i32
+    let body: [u8] = "length"
+    let d = datagram(body)
+    let short = d[0..7]
+    if not dropped(udp_parse(short, PEER_IP, OUR_IP), UdpDrop.Short)
+        return 1
+    be16_put(d, 4, 7)
+    if not dropped(udp_parse(d, PEER_IP, OUR_IP), UdpDrop.Length)
+        return 2
+    be16_put(d, 4, (d.len + 1) as u16)
+    if not dropped(udp_parse(d, PEER_IP, OUR_IP), UdpDrop.Length)
+        return 3
+    # Exactly 8: an empty datagram, checksum off.
+    be16_put(d, 4, 8)
+    be16_put(d, 6, 0)
+    match udp_parse(d, PEER_IP, OUR_IP)
+        Ok(u) =>
+            if u.payload.len != 0
+                return 4
+        Err(_) => return 5
+    0
+
+[[test]]
+fn test_parse_stops_at_the_udp_length() -> i32
+    # Bytes past the UDP length inside the IPv4 body are not payload.
+    let body: [u8] = "abc"
+    let d = datagram(body)
+    let all: [u8] = @g_frame
+    all[UDP_AT + d.len] = 'X'
+    let longer = all[UDP_AT..UDP_AT + d.len + 1]
+    if not payload_is(udp_parse(longer, PEER_IP, OUR_IP), body)
+        return 1
+    0
+
+fn too_big(r: Result<i64, SendError>) -> bool
+    match r
+        Err(e) => e == SendError.TooBig
+        Ok(_) => false
+
+[[test]]
+fn test_send_fits_the_link_mtu() -> i32
+    var link = peer_link()
+    link.mtu = 40                    # 20 IPv4 + 8 UDP + 12 payload
+    let out: [u8] = @g_frame
+    let twelve: [u8] = "twelve-bytes"
+    match udp_frame_write(out, link, our_mac(), OUR_IP, PEER_IP, 1, 2, twelve)
+        Ok(n) =>
+            if n != 14 + 40
+                return 1
+        Err(_) => return 2
+    out[UDP_AT + UDP_HEADER_LEN] = 0xEE
+    let thirteen: [u8] = "thirteen-byte"
+    if not too_big(udp_frame_write(out, link, our_mac(), OUR_IP, PEER_IP, 1, 2, thirteen))
+        return 3
+    if out[UDP_AT + UDP_HEADER_LEN] != 0xEE
+        return 4                     # nothing copied
+    link.mtu = 1500
+    let small = out[0..ETH_PAYLOAD_OFF + 20 + 8 + 11]
+    if not too_big(udp_frame_write(small, link, our_mac(), OUR_IP, PEER_IP, 1, 2, twelve))
+        return 5                     # the buffer bounds it too
+    0
