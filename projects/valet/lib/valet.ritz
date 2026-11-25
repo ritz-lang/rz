@@ -13,11 +13,9 @@
 #   valet_static(@app, "/static/*", "./static")
 #   valet_run(@app)
 
-import ritzlib.cstr
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.fmt
-import ritzlib.str { memcpy }
 import ritzlib.option
 import ritzlib.span
 import ritzlib.strview { StrView, strview_empty }
@@ -120,8 +118,7 @@ struct HandlerContext
     res: *Response                  # Response builder
     route_result: *RouteMatch       # Route match with params
     path: StrView                   # Request path
-    raw_buf: *u8                    # Raw request buffer (for header access)
-    raw_len: i32                    # Length of raw request data
+    raw: Span<u8>                   # The raw request (for header and body access)
     task: *Task                     # Owning task (cooperative-yield proxy uses this
                                     # to arm yield SQEs and key the side-table)
 
@@ -202,18 +199,17 @@ pub fn valet_tls(app: *Valet, cert_pem: *u8, cert_pem_len: i64, key_pem: *u8, ke
 
 # Load TLS certificate and key from file paths
 # Returns 0 on success, negative error code on failure
-pub fn valet_tls_files(app: *Valet, cert_path: *u8, key_path: *u8) -> i32
+pub fn valet_tls_files(app: *Valet, cert_path: StrView, key_path: StrView) -> i32
     # Read certificate file
     var cert_buf: [8192]u8
-    var cert_file: Fd = match fd_open(strview_from_cstr(cert_path), O_RDONLY, 0)
+    var cert_file: Fd = match fd_open(cert_path, O_RDONLY, 0)
         Ok(f) => f
         Err(_) =>
-            let cert_shown: StrView = strview_from_cstr(cert_path)
-            print("Error: Failed to open certificate file: {cert_shown}\n")
+            print("Error: Failed to open certificate file: {cert_path}\n")
             return -1
 
     var cert_len: i64 = -1
-    match cert_file.read(Span<u8> { ptr: @cert_buf[0], len: 8192 })
+    match cert_file.read(@cert_buf)
         Ok(n) => cert_len = n
         Err(_) => pass
     cert_file.close()
@@ -223,15 +219,14 @@ pub fn valet_tls_files(app: *Valet, cert_path: *u8, key_path: *u8) -> i32
 
     # Read key file
     var key_buf: [4096]u8
-    var key_file: Fd = match fd_open(strview_from_cstr(key_path), O_RDONLY, 0)
+    var key_file: Fd = match fd_open(key_path, O_RDONLY, 0)
         Ok(f) => f
         Err(_) =>
-            let key_shown: StrView = strview_from_cstr(key_path)
-            print("Error: Failed to open key file: {key_shown}\n")
+            print("Error: Failed to open key file: {key_path}\n")
             return -3
 
     var key_len: i64 = -1
-    match key_file.read(Span<u8> { ptr: @key_buf[0], len: 4096 })
+    match key_file.read(@key_buf)
         Ok(n) => key_len = n
         Err(_) => pass
     key_file.close()
@@ -380,13 +375,12 @@ pub fn ctx_body_bytes() -> Span<u8>
         return span_empty<u8>()
 
     # Don't read past end of raw buffer
-    if body_start + body_len > c.raw_len as i64
-        body_len = c.raw_len as i64 - body_start
+    if body_start + body_len > c.raw.len
+        body_len = c.raw.len - body_start
         if body_len < 0
             return span_empty<u8>()
 
-    # Explicit <u8>: ritz1 can't infer T from a pointer-arithmetic argument.
-    return span_from_ptr<u8>(c.raw_buf + body_start, body_len)
+    return c.raw[body_start..body_start + body_len]
 
 
 # Get request body (for POST/PUT requests)
@@ -499,7 +493,7 @@ pub fn ctx_get_header(name: StrView) -> Option<StrView>
     let c: *HandlerContext = get_g_ctx()
     if c == null
         return None
-    return request_find_header(c.raw_buf, c.raw_len, name)
+    return request_find_header(c.raw, name)
 
 
 # Get Accept-Encoding header and return encoding flags
@@ -579,22 +573,19 @@ pub fn ctx_body_large_compressed(status: i32, body: Span<u8>, content_type: StrV
         return -1
 
     # Try compression
-    let accepted: i32 = ctx_accept_encoding()
-    var result: CompressResult
-    let compressed: i32 = compress_large(body, accepted, content_type, @result)
-
-    if compressed == 1
-        # Send compressed response
-        response_status(c.res, status)
-        response_header(c.res, "Content-Type", content_type)
-        ctx_encoding_header(c, result.encoding)
-        response_content_length(c.res, result.len)
-        response_header(c.res, "Connection", ctx_connection_value(c))
-        response_header(c.res, "Vary", "Accept-Encoding")
-        response_end_headers(c.res)
-        response_append_bytes(c.res, result.data, result.len as i32)
-        compress_result_free(@result)
-        return 0
+    match compress_large(body, ctx_accept_encoding(), content_type)
+        Some(z) =>
+            # Send compressed response
+            response_status(c.res, status)
+            response_header(c.res, "Content-Type", content_type)
+            ctx_encoding_header(c, z.encoding)
+            response_content_length(c.res, z.len)
+            response_header(c.res, "Connection", ctx_connection_value(c))
+            response_header(c.res, "Vary", "Accept-Encoding")
+            response_end_headers(c.res)
+            response_append_span(c.res, z.bytes())
+            return 0
+        None => pass
 
     # Send uncompressed
     return ctx_send(c, status, content_type, body)
@@ -612,11 +603,11 @@ pub fn ctx_body_streaming_compressed(status: i32, body: Span<u8>, content_type: 
         return -1
 
     # Initialize streaming compressor
-    let accepted: i32 = ctx_accept_encoding()
-    var sc: StreamCompressor
-    if stream_compressor_init(@sc, accepted) != 0
-        # Allocation failed - fall back to uncompressed chunked
-        return ctx_body_chunked_uncompressed(status, body, content_type)
+    var sc: StreamCompressor = match stream_compressor_new(ctx_accept_encoding())
+        Some(made) => made
+        None =>
+            # Allocation failed - fall back to uncompressed chunked
+            return ctx_body_chunked_uncompressed(status, body, content_type)
 
     # Send headers for chunked transfer
     response_status(c.res, status)
@@ -648,11 +639,9 @@ pub fn ctx_body_streaming_compressed(status: i32, body: Span<u8>, content_type: 
             chunk_len = COMPRESS_CHUNK_SIZE
 
         # Compress chunk
-        let compressed_len: i64 = stream_compress_chunk(@sc, body.slice(offset, offset + chunk_len))
+        let compressed_len: i64 = sc.compress_chunk(body.slice(offset, offset + chunk_len))
         if compressed_len < 0
-            # Compression failed - send uncompressed
-            stream_compressor_free(@sc)
-            return -2
+            return -2  # Compression failed
 
         # Format chunk header: hex length + CRLF
         let header_len: i32 = format_chunk_header(@chunk_header[0], 32, compressed_len)
@@ -664,7 +653,7 @@ pub fn ctx_body_streaming_compressed(status: i32, body: Span<u8>, content_type: 
 
         # Send chunk data
         response_init(c.res, c.res.buf, c.res.cap)
-        response_append_bytes(c.res, sc.compress_buf, compressed_len as i32)
+        response_append_span(c.res, sc.output().to(compressed_len))
         response_append(c.res, "\r\n")
         response_body(c.res, span_empty<u8>())
 
@@ -674,8 +663,6 @@ pub fn ctx_body_streaming_compressed(status: i32, body: Span<u8>, content_type: 
     response_init(c.res, c.res.buf, c.res.cap)
     response_append(c.res, "0\r\n\r\n")
     response_body(c.res, span_empty<u8>())
-
-    stream_compressor_free(@sc)
     return 0
 
 
@@ -951,8 +938,7 @@ const BIGBUF_SEND: i32 = 3     # sending `len` bytes, `pos` already sent
 pub const VALET_MAX_BUFFERED: i64 = 16777216
 
 pub struct BigBuf
-    ptr: *u8
-    cap: i64
+    mem: Span<u8>       # the mapping (mmap_anon), empty when none; len is its capacity
     len: i64
     pos: i64
     need: i64
@@ -984,10 +970,9 @@ fn sendbuf_for(task: *Task) -> *BigBuf
 fn bigbuf_release(b: *BigBuf)
     if b.mode != BIGBUF_NONE
         g_bigbuf_active = g_bigbuf_active - 1
-    if b.ptr != null and b.cap > 0
-        munmap(span_from_ptr<u8>(b.ptr, b.cap))
-    b.ptr = null
-    b.cap = 0
+    if b.mem.len > 0
+        munmap(b.mem)
+    b.mem = span_empty<u8>()
     b.len = 0
     b.pos = 0
     b.need = 0
@@ -1017,9 +1002,8 @@ fn bigbuf_acquire(b: *BigBuf, size: i64, mode: i32) -> *BigBuf
     bigbuf_release(b)
     let cap: i64 = ((size + 4095) / 4096) * 4096
     match mmap_anon(cap)
-        Ok(m) => b.ptr = m.ptr
+        Ok(m) => b.mem = m
         Err(_) => return null
-    b.cap = cap
     b.len = 0
     b.pos = 0
     b.need = size
@@ -1028,32 +1012,35 @@ fn bigbuf_acquire(b: *BigBuf, size: i64, mode: i32) -> *BigBuf
     return b
 
 
-# Get a buffer to build a `len`-byte response in: task.write_buf when it
-# fits, a heap buffer otherwise.  Returns null if `len` can't be buffered.
-# Pass the result to valet_task_send_response.
-pub fn valet_response_buffer(task: *Task, len: i64) -> *u8
+# Get a buffer of `len` bytes to build a response in: the front of
+# task.write_buf when it fits, a heap buffer otherwise.  Empty if `len`
+# can't be buffered.  Pass what you built, a front slice of it, to
+# valet_task_send_response.
+pub fn valet_response_buffer(task: *Task, len: i64) -> Span<u8>
     if len <= 8192
-        return @task.write_buf[0]
+        let wb: Span<u8> = @task.write_buf
+        return wb.to(len)
     let b: *BigBuf = bigbuf_acquire(sendbuf_for(task), len, BIGBUF_SEND)
     if b == null
-        return null
-    return b.ptr
+        return span_empty<u8>()
+    return b.mem.to(len)
 
 
-# Send `len` bytes built in a buffer from valet_response_buffer and move the
-# connection to CONN_STATE_SEND.  Large sends are resumed across short
-# writes in the SEND state.  Returns the handler convention (-1 pending,
-# 1 close).
-pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
+# Send `out`, a response built at the front of a valet_response_buffer, and
+# move the connection to CONN_STATE_SEND.  Large sends are resumed across
+# short writes in the SEND state.  Returns the handler convention (-1
+# pending, 1 close).
+pub fn valet_task_send_response(task: *Task, out: Span<u8>) -> i32
     task.handler_state = CONN_STATE_SEND
-    if buf == @task.write_buf[0]
+    let len: i64 = out.len
+    if out.ptr == @task.write_buf[0]
         task.write_len = len as i32
         task.write_pos = 0
         if valet_task_send(task, len as i32) < 0
             return 1
         return -1
     let b: *BigBuf = sendbuf_for(task)
-    if b == null or b.mode != BIGBUF_SEND or b.ptr != buf
+    if b == null or b.mode != BIGBUF_SEND or b.mem.ptr != out.ptr or len > b.mem.len
         return 1
     b.len = len
     b.pos = 0
@@ -1061,7 +1048,7 @@ pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
     # a reused task's stale write_pos/write_len (AGAST #3678).
     task.write_len = 0
     task.write_pos = 0
-    if not task.send_buf(Span<u8> { ptr: (b.ptr), len: (len as i32) as i64 })
+    if not task.send_buf(b.mem.to(len))
         bigbuf_release_task(task)
         return 1
     return -1
@@ -1071,13 +1058,14 @@ pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
 # Returns 1 if static file was handled (caller should transition to keep-alive or close)
 # Returns 0 if not a static path (caller should try routing)
 pub fn valet_try_static(app: *Valet, task: *Task, path: StrView) -> i32
-    return valet_try_static_raw(app, task, path, @task.read_buf[0], task.read_len)
+    let read_buf: Span<u8> = @task.read_buf
+    return valet_try_static_raw(app, task, path, read_buf.to(task.read_len as i64))
 
 
-# valet_try_static for a request in raw[0..raw_len): its headers (Range,
+# valet_try_static for the request in `raw`: its headers (Range,
 # If-None-Match) are read there, not from task.read_buf, which can hold the
 # next pipelined request instead (AGAST #1865).
-pub fn valet_try_static_raw(app: *Valet, task: *Task, path: StrView, raw: *u8, raw_len: i32) -> i32
+pub fn valet_try_static_raw(app: *Valet, task: *Task, path: StrView, raw: Span<u8>) -> i32
     # Check if static serving is enabled
     let root: StrView = match app.static_root
         Some(r) => r
@@ -1122,8 +1110,8 @@ pub fn valet_try_static_raw(app: *Valet, task: *Task, path: StrView, raw: *u8, r
 
     # Serve the file with the request's Range and If-None-Match (ETag
     # validation) headers, if it has them
-    let range_hdr: Option<StrView> = request_find_header(raw, raw_len, "Range")
-    let if_none_match: Option<StrView> = request_find_header(raw, raw_len, "If-None-Match")
+    let range_hdr: Option<StrView> = request_find_header(raw, "Range")
+    let if_none_match: Option<StrView> = request_find_header(raw, "If-None-Match")
     let sent: i64 = static_serve_file_full(task.fd, file, range_hdr, if_none_match, keep_alive)
 
     if sent < 0
@@ -1248,17 +1236,28 @@ fn valet_next_request(task: *Task) -> i32
     return -12
 
 
+# task.read_buf behind the task.read_len bytes already in it.
+fn valet_read_room(task: *Task) -> Span<u8>
+    let read_buf: Span<u8> = @task.read_buf
+    return read_buf.slice(task.read_len as i64, VALET_READ_BUF as i64)
+
+
+# What is left to send of the response in task.write_buf.
+fn valet_write_rest(task: *Task) -> Span<u8>
+    let write_buf: Span<u8> = @task.write_buf
+    return write_buf.slice(task.write_pos as i64, task.write_len as i64)
+
+
 # The request isn't whole yet: receive more of it.  `big` is the heap buffer
 # it is being read into, or null for task.read_buf; `f` is what
 # request_frame knew.  Returns the handler convention.
 fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
     if big != null
-        let room: i64 = big.cap - big.len
-        if room <= 0
+        if big.len >= big.mem.len
             log_warn("Request too large, closing connection")
             bigbuf_release(big)
             return valet_send_413(task)
-        if not task.recv_buf(Span<u8> { ptr: (big.ptr + big.len), len: (room as i32) as i64 })
+        if not task.recv_buf(big.mem.from(big.len))
             bigbuf_release(big)
             return 1
         return -1
@@ -1271,7 +1270,7 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
         if task.read_len >= VALET_READ_BUF
             log_warn("Request headers exceed the read buffer")
             return valet_send_413(task)
-        if not task.recv_buf(Span<u8> { ptr: (@task.read_buf[task.read_len]), len: (VALET_READ_BUF - task.read_len) as i64 })
+        if not task.recv_buf(valet_read_room(task))
             return 1
         return -1
 
@@ -1286,16 +1285,16 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
         log_warn("Request too large, closing connection")
         return valet_send_413(task)
     if (f.total >= 0 and want <= VALET_READ_BUF as i64) or (f.total < 0 and task.read_len < VALET_READ_BUF)
-        if not task.recv_buf(Span<u8> { ptr: (@task.read_buf[task.read_len]), len: (VALET_READ_BUF - task.read_len) as i64 })
+        if not task.recv_buf(valet_read_room(task))
             return 1
         return -1
     let nb: *BigBuf = bigbuf_acquire(bigbuf_for(task), want, BIGBUF_RECV)
     if nb == null
         return valet_send_413(task)
-    memcpy(nb.ptr, @task.read_buf[0], task.read_len as i64)
-    nb.len = task.read_len as i64
+    let read_buf: Span<u8> = @task.read_buf
+    nb.len = nb.mem.copy_from(read_buf.to(task.read_len as i64))
     task.read_len = 0
-    if not task.recv_buf(Span<u8> { ptr: (nb.ptr + nb.len), len: ((nb.cap - nb.len) as i32) as i64 })
+    if not task.recv_buf(nb.mem.from(nb.len))
         bigbuf_release(nb)
         return 1
     return -1
@@ -1304,8 +1303,7 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
 # The request valet_handle_connection is handling: task.read_buf, or a heap
 # buffer when the request outgrew it (AGAST #2104).
 struct ValetReqView
-    buf: *u8
-    len: i32
+    raw: Span<u8>
     body_len: i64
     close_after: i32
 
@@ -1352,13 +1350,12 @@ fn valet_res_500_close(res: *Response, body: StrView)
 
 
 # Point the handler context at this request and make it current.
-fn valet_ctx_enter(ctx: *HandlerContext, req: *Request, res: *Response, raw: *u8, raw_len: i32, task: *Task)
+fn valet_ctx_enter(ctx: *HandlerContext, req: *Request, res: *Response, raw: Span<u8>, task: *Task)
     ctx.req = req
     ctx.res = res
     ctx.route_result = null
     ctx.path = req.path
-    ctx.raw_buf = raw
-    ctx.raw_len = raw_len
+    ctx.raw = raw
     ctx.task = task
     set_g_ctx(ctx)
 
@@ -1410,11 +1407,11 @@ fn valet_conn_keep_rest(task: *Task, big: *BigBuf, total: i64, v: *ValetReqView)
             v.close_after = 1
             task.read_len = 0
         else
-            memcpy(@task.read_buf[0], big.ptr + total, rest)
-            task.read_len = rest as i32
+            let read_buf: Span<u8> = @task.read_buf
+            task.read_len = read_buf.copy_from(big.mem[total..big.len]) as i32
         valet_set_consumed(task, 0)
     else
-        valet_set_consumed(task, v.len)
+        valet_set_consumed(task, v.raw.len as i32)
 
 
 # State: RECV - read until a whole request is buffered.  `added` bytes came
@@ -1428,15 +1425,13 @@ fn valet_conn_frame(task: *Task, v: *ValetReqView, added: i32) -> i32
     # task_reset_for_recv), or what is already buffered of this one:
     # headers not all here yet (AGAST #2201), or a pipelined request
     # (AGAST #1865).
-    var in_buf: *u8 = @task.read_buf[0]
-    var in_len: i64 = 0
+    var in_buf: Span<u8> = @task.read_buf
     if big != null
         big.len = big.len + added as i64
-        in_buf = big.ptr
-        in_len = big.len
+        in_buf = big.mem.to(big.len)
     else
         task.read_len = task.read_len + added
-        in_len = task.read_len as i64
+        in_buf = in_buf.to(task.read_len as i64)
 
     # Where does the request end?  http's lib/h1_framing.ritz decides,
     # for this server and projects/http alike (AGAST #1865).  Reading
@@ -1448,9 +1443,9 @@ fn valet_conn_frame(task: *Task, v: *ValetReqView, added: i32) -> i32
         h1_frame_init(f)
     var total: i64 = 0
     if big != null
-        total = h1_frame_continue(in_buf, in_len, valet_body_limit(app), f)
+        total = h1_frame_continue(in_buf.ptr, in_buf.len, valet_body_limit(app), f)
     else
-        total = request_frame(in_buf, in_len as i32, valet_body_limit(app), f)
+        total = request_frame(in_buf, valet_body_limit(app), f)
     if total == H1F_INCOMPLETE
         return valet_recv_more(task, app, big, f)
     if total < 0
@@ -1468,9 +1463,8 @@ fn valet_conn_frame(task: *Task, v: *ValetReqView, added: i32) -> i32
 
     # A chunked body is decoded in place, behind the headers, so a
     # handler reads it like a Content-Length one.
-    v.body_len = h1_frame_dechunk(in_buf, f)
-    v.buf = in_buf
-    v.len = total as i32
+    v.body_len = h1_frame_dechunk(in_buf.ptr, f)
+    v.raw = in_buf.to(total)
     valet_conn_keep_rest(task, big, total, v)
 
     task.handler_state = CONN_STATE_PARSE
@@ -1541,7 +1535,7 @@ fn valet_conn_serve(task: *Task, v: *ValetReqView) -> i32
     var req: Request
     request_init(@req)
 
-    let parsed = request_parse(@req, v.buf, v.len)
+    let parsed = request_parse(@req, v.raw)
     if parsed < 0
         bigbuf_release_task(task)
         return 0
@@ -1552,7 +1546,7 @@ fn valet_conn_serve(task: *Task, v: *ValetReqView) -> i32
 
     # Check for static file request first (only for GET requests)
     if request_is_get(@req) != 0
-        if valet_try_static_raw(app, task, req.path, v.buf, v.len) != 0
+        if valet_try_static_raw(app, task, req.path, v.raw) != 0
             # Static file was served - check keep-alive
             return valet_conn_next_or_close(task, app)
 
@@ -1561,7 +1555,7 @@ fn valet_conn_serve(task: *Task, v: *ValetReqView) -> i32
 
     # Set up handler context early for middleware access
     var handler_ctx: HandlerContext
-    valet_ctx_enter(@handler_ctx, @req, @res, v.buf, v.len, task)
+    valet_ctx_enter(@handler_ctx, @req, @res, v.raw, task)
 
     # Run middleware pipeline
     let mw_result: i32 = router_run_middleware(@app.router, req.path.ptr, req.path.len as i32)
@@ -1623,7 +1617,7 @@ fn valet_conn_sent_big(task: *Task) -> i32
         b.pos = b.pos + task.io_result as i64
         if b.pos < b.len
             # Short send: resume from where the kernel stopped.
-            if not task.send_buf(Span<u8> { ptr: (b.ptr + b.pos), len: ((b.len - b.pos) as i32) as i64 })
+            if not task.send_buf(b.mem[b.pos..b.len])
                 bigbuf_release_task(task)
                 return 1
             return -1
@@ -1655,7 +1649,7 @@ fn valet_conn_sent(task: *Task) -> i32
             return 1
         task.write_pos = task.write_pos + task.io_result
         if task.write_pos < task.write_len
-            if not task.send_buf(Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+            if not task.send_buf(valet_write_rest(task))
                 return 1
             return -1
 
@@ -1665,8 +1659,7 @@ fn valet_conn_sent(task: *Task) -> i32
 
 pub fn valet_handle_connection(task: *Task) -> i32
     var view: ValetReqView
-    view.buf = @task.read_buf[0]
-    view.len = 0
+    view.raw = span_empty<u8>()
     view.body_len = 0
     view.close_after = 0
 
@@ -1729,6 +1722,7 @@ const TLS_REQ_CAP: i64 = 8192
 const TLS_RX_CAP: i64 = 16645  # 5-byte header + 2^14 + 256: a maximal TLSCiphertext
 
 struct TlsTaskData
+    map: Span<u8>               # The mapping this lives in (tls_task_data_alloc)
     pool: *TaskPool             # Pointer to task pool (for I/O)
     req_len: i64                # Plaintext bytes in `req`
     rx_len: i64                 # Ciphertext bytes in `rx`
@@ -1740,16 +1734,23 @@ struct TlsTaskData
 fn tls_task_data_size() -> i64
     return ((sizeof(TlsTaskData) as i64 + 4095) / 4096) * 4096
 
-# Allocate TLS task data (zeroed: anonymous mmap)
+# Allocate TLS task data (zeroed: anonymous mmap).  It goes to the task as
+# task.user_data, a raw pointer, so it is a mapping that records itself
+# (`map`) rather than an owned value.
 pub fn tls_task_data_alloc() -> *TlsTaskData
+    var data: *TlsTaskData = null
     match mmap_anon(tls_task_data_size())
-        Ok(m) => return m.ptr as *TlsTaskData
-        Err(_) => return null
+        Ok(m) =>
+            data = m.ptr as *TlsTaskData
+            data.map = m
+        Err(_) => pass
+    return data
 
 pub fn tls_task_data_free(data: *TlsTaskData)
     if data != null
         tls_server_free(@data.tls)
-        munmap(span_from_ptr<u8>(data as *u8, tls_task_data_size()))
+        let m: Span<u8> = data.map  # read before the unmap takes `data` away
+        munmap(m)
 
 # TLS-specific I/O helpers that use the pool from TlsTaskData
 pub fn tls_task_recv(task: *Task, tls_data: *TlsTaskData) -> i32
@@ -1764,8 +1765,8 @@ pub fn tls_task_send(task: *Task, tls_data: *TlsTaskData, len: i32) -> i32
 
 # Receive application data in behind the ciphertext already buffered.
 fn tls_task_recv_app(task: *Task, tls_data: *TlsTaskData) -> i32
-    let room: i64 = TLS_RX_CAP - tls_data.rx_len
-    if tls_data.pool.submit_recv_buf(task, Span<u8> { ptr: (@tls_data.rx[tls_data.rx_len]), len: (room as i32) as i64 })
+    let rx: Span<u8> = @tls_data.rx  # TLS_RX_CAP bytes
+    if tls_data.pool.submit_recv_buf(task, rx.from(tls_data.rx_len))
         return 0
     return -12
 
@@ -1844,7 +1845,8 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
     # Where does the request end?  http's lib/h1_framing.ritz decides, as
     # for plain HTTP (AGAST #1865).  Incomplete: wait for more records.
     var f: H1Frame
-    let total: i64 = request_frame(@tls_data.req[0], req_len as i32, TLS_REQ_CAP, @f)
+    let req_bytes: Span<u8> = @tls_data.req
+    let total: i64 = request_frame(req_bytes.to(req_len), TLS_REQ_CAP, @f)
     if total == H1F_TOO_LARGE or f.total > TLS_REQ_CAP
         return valet_tls_send_413(task, tls_data)
     if total < 0 and total != H1F_INCOMPLETE
@@ -1870,7 +1872,7 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
     var req: Request
     request_init(@req)
 
-    let parsed = request_parse(@req, @tls_data.req[0], total as i32)
+    let parsed = request_parse(@req, req_bytes.to(total))
     if parsed < 0
         log_warn("TLS: malformed HTTP request, closing connection")
         tls_task_data_free(tls_data)
@@ -1892,7 +1894,7 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
 
     # Set up handler context
     var handler_ctx: HandlerContext
-    valet_ctx_enter(@handler_ctx, @req, @res, @tls_data.req[0], total as i32, task)
+    valet_ctx_enter(@handler_ctx, @req, @res, req_bytes.to(total), task)
 
     # Run middleware
     let mw_result: i32 = router_run_middleware(@app.router, req.path.ptr, req.path.len as i32)
@@ -1979,7 +1981,7 @@ fn valet_tls_send_or_drop(task: *Task, tls_data: *TlsTaskData, len: i32) -> i32
 fn valet_tls_resume_send(task: *Task, tls_data: *TlsTaskData) -> i32
     task.write_pos = task.write_pos + task.io_result
     if task.write_pos < task.write_len
-        if not tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+        if not tls_data.pool.submit_send_buf(task, valet_write_rest(task))
             return valet_tls_drop(task, tls_data, 1)
         return -1
     return VALET_CONN_NEXT
@@ -2169,7 +2171,7 @@ fn valet_tls_close_sent(task: *Task, tls_data: *TlsTaskData) -> i32
     if task.io_result > 0
         task.write_pos = task.write_pos + task.io_result
         if task.write_pos < task.write_len
-            if tls_data.pool.submit_send_buf(task, Span<u8> { ptr: (@task.write_buf[task.write_pos]), len: (task.write_len - task.write_pos) as i64 })
+            if tls_data.pool.submit_send_buf(task, valet_write_rest(task))
                 return -1
     var s: Socket = socket_from_raw(task.fd)
     s.shutdown(SHUT_WR)

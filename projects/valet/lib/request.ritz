@@ -5,6 +5,7 @@
 
 import ritzlib.io
 import ritzlib.option
+import ritzlib.span
 import ritzlib.strview
 import http.h1_framing
 
@@ -54,31 +55,27 @@ pub fn request_init(req: *Request)
     req.keep_alive = 0
 
 
-# Parse HTTP request from buffer
+# Parse the HTTP request at the front of `buf`.
 # Returns bytes consumed on success, REQ_ERR_* on failure.
 #
-# SAFETY: This function performs raw pointer arithmetic on `buf`.
-# - Caller must ensure `buf` points to a valid buffer of at least `len` bytes
-# - Caller must ensure `len` accurately reflects the buffer size
-# - The returned Request contains pointers into `buf` - caller must keep `buf`
-#   alive and unmodified while using the Request
-# - All pointer accesses are bounds-checked against `len` before dereferencing
-pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
+# The returned Request's views (method, path, version) point into `buf`:
+# keep `buf` alive and unmodified while using the Request.
+pub fn request_parse(req: *Request, buf: Span<u8>) -> i32
+    let len: i32 = buf.len as i32
     if len < 14  # Minimum: "GET / HTTP/1.0\r\n\r\n"
         return REQ_ERR_INCOMPLETE
 
     var pos: i32 = 0
 
     # Parse method
-    # SAFETY: pos is bounds-checked against len in the while condition
     while pos < len
-        if *(buf + pos) == ' '
-            req.method = strview_from_ptr(buf, pos as i64)
+        if buf[pos] == ' '
+            req.method = buf.slice(0, pos).as_strview()
             pos += 1
             break
         # A line break before the space: a junk line, not the start of a
         # request, so don't let a caller wait for more of it (AGAST #2201).
-        if *(buf + pos) == '\r' || *(buf + pos) == '\n'
+        if buf[pos] == '\r' || buf[pos] == '\n'
             return REQ_ERR_MALFORMED
         pos += 1
 
@@ -88,11 +85,11 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
     # Parse path
     let path_start: i32 = pos
     while pos < len
-        if *(buf + pos) == ' '
-            req.path = strview_from_ptr(buf + path_start, (pos - path_start) as i64)
+        if buf[pos] == ' '
+            req.path = buf.slice(path_start, pos).as_strview()
             pos += 1
             break
-        if *(buf + pos) == '\r' || *(buf + pos) == '\n'
+        if buf[pos] == '\r' || buf[pos] == '\n'
             return REQ_ERR_MALFORMED
         pos += 1
 
@@ -102,8 +99,8 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
     # Parse version
     let version_start: i32 = pos
     while pos < len
-        if *(buf + pos) == '\r'
-            req.version = strview_from_ptr(buf + version_start, (pos - version_start) as i64)
+        if buf[pos] == '\r'
+            req.version = buf.slice(version_start, pos).as_strview()
             break
         pos += 1
 
@@ -113,7 +110,7 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
     # Skip CRLF
     if pos + 1 >= len
         return -1
-    if *(buf + pos) != '\r' || *(buf + pos + 1) != '\n'
+    if buf[pos] != '\r' || buf[pos + 1] != '\n'
         return -2  # Malformed
     pos += 2
 
@@ -130,8 +127,8 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
 
     while pos < len
         # Check for end of headers (empty line)
-        if *(buf + pos) == '\r'
-            if pos + 1 < len && *(buf + pos + 1) == '\n'
+        if buf[pos] == '\r'
+            if pos + 1 < len && buf[pos + 1] == '\n'
                 req.headers_end = pos + 2
                 if conn_close == 1
                     req.keep_alive = 0
@@ -140,8 +137,8 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
                 return req.headers_end
 
         # Connection header: scan its comma-separated tokens.
-        if header_name_is(buf, pos, len, "connection") == 1
-            let tok: i32 = connection_tokens(buf, pos + 11, len)
+        if header_name_is(buf, pos, "connection") == 1
+            let tok: i32 = connection_tokens(buf, pos + 11)
             if (tok & CONN_TOKEN_CLOSE) != 0
                 conn_close = 1
             if (tok & CONN_TOKEN_KEEP_ALIVE) != 0
@@ -149,8 +146,8 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
 
         # Skip to next line
         while pos < len
-            if *(buf + pos) == '\r'
-                if pos + 1 < len && *(buf + pos + 1) == '\n'
+            if buf[pos] == '\r'
+                if pos + 1 < len && buf[pos + 1] == '\n'
                     pos += 2
                     break
             pos += 1
@@ -167,14 +164,14 @@ fn ascii_lower(ch: u8) -> u8
 # 1 when the header line at `pos` is `name` (lowercase) followed directly
 # by ':' — case-insensitive, so "Connection-Foo:" and "X-Connection:" do
 # not match "connection".
-fn header_name_is(buf: *u8, pos: i32, len: i32, name: StrView) -> i32
+fn header_name_is(buf: Span<u8>, pos: i32, name: StrView) -> i32
     let name_len: i32 = name.len as i32
-    if pos + name_len >= len
+    if (pos + name_len) as i64 >= buf.len
         return 0
     for i in 0..name_len
-        if ascii_lower(*(buf + pos + i)) != name.get(i as i64)
+        if ascii_lower(buf[pos + i]) != name.get(i as i64)
             return 0
-    if *(buf + pos + name_len) != ':'
+    if buf[pos + name_len] != ':'
         return 0
     return 1
 
@@ -184,26 +181,27 @@ const CONN_TOKEN_KEEP_ALIVE: i32 = 2
 
 
 # 1 when bytes [start, end) equal `word` (lowercase) case-insensitively.
-fn token_eq(buf: *u8, start: i32, end: i32, word: StrView) -> i32
+fn token_eq(buf: Span<u8>, start: i32, end: i32, word: StrView) -> i32
     if (end - start) as i64 != word.len
         return 0
     for i in 0..(end - start)
-        if ascii_lower(*(buf + start + i)) != word.get(i as i64)
+        if ascii_lower(buf[start + i]) != word.get(i as i64)
             return 0
     return 1
 
 
 # Scan a Connection header value starting at `pos` up to CRLF; return a
 # bitmask of CONN_TOKEN_* for the "close" / "keep-alive" tokens present.
-fn connection_tokens(buf: *u8, pos: i32, len: i32) -> i32
+fn connection_tokens(buf: Span<u8>, pos: i32) -> i32
+    let len: i32 = buf.len as i32
     var mask: i32 = 0
     var p: i32 = pos
-    while p < len and *(buf + p) != '\r'
+    while p < len and buf[p] != '\r'
         # Skip separators / optional whitespace
-        while p < len and (*(buf + p) == ' ' or *(buf + p) == '\t' or *(buf + p) == ',')
+        while p < len and (buf[p] == ' ' or buf[p] == '\t' or buf[p] == ',')
             p += 1
         let start: i32 = p
-        while p < len and *(buf + p) != ',' and *(buf + p) != '\r' and *(buf + p) != ' ' and *(buf + p) != '\t'
+        while p < len and buf[p] != ',' and buf[p] != '\r' and buf[p] != ' ' and buf[p] != '\t'
             p += 1
         if token_eq(buf, start, p, "close") == 1
             mask = mask | CONN_TOKEN_CLOSE
@@ -225,16 +223,16 @@ fn connection_tokens(buf: *u8, pos: i32, len: i32) -> i32
 #   H1F_NOT_IMPLEMENTED  answer 501 (Transfer-Encoding other than chunked)
 #   H1F_TOO_LARGE        answer 413 (body over max_body; <= 0: no limit)
 # Bytes behind the request belong to the next one.
-pub fn request_frame(buf: *u8, len: i32, max_body: i64, f: *H1Frame) -> i64
+pub fn request_frame(buf: Span<u8>, max_body: i64, f: *H1Frame) -> i64
     h1_frame_init(f)
     var req: Request
     request_init(@req)
-    let parsed: i32 = request_parse(@req, buf, len)
+    let parsed: i32 = request_parse(@req, buf)
     if parsed == REQ_ERR_INCOMPLETE
         return H1F_INCOMPLETE
     if parsed < 0
         return H1F_BAD_REQUEST
-    return h1_frame_request(buf, len as i64, max_body, f)
+    return h1_frame_request(buf.ptr, buf.len, max_body, f)
 
 
 # Check if method matches
@@ -265,17 +263,17 @@ pub fn request_check_size(len: i32, max_size: i32) -> i32
 
 # Find a header in the raw request buffer (case-insensitive)
 # buf: raw HTTP request buffer
-# buf_len: buffer length
 # name: header name to search for (e.g., "Range")
 # Returns the value (after ": ", without the CRLF) as a view into `buf`, or
 # None when the header isn't there.
-pub fn request_find_header(buf: *u8, buf_len: i32, name: StrView) -> Option<StrView>
+pub fn request_find_header(buf: Span<u8>, name: StrView) -> Option<StrView>
+    let buf_len: i32 = buf.len as i32
     let name_len: i32 = name.len as i32
 
     # Find end of request line (first CRLF)
     var pos: i32 = 0
     while pos < buf_len - 1
-        if *(buf + pos) == '\r' && *(buf + pos + 1) == '\n'
+        if buf[pos] == '\r' && buf[pos + 1] == '\n'
             pos += 2
             break
         pos += 1
@@ -283,36 +281,36 @@ pub fn request_find_header(buf: *u8, buf_len: i32, name: StrView) -> Option<StrV
     # Search headers
     while pos < buf_len - 1
         # Check for end of headers
-        if *(buf + pos) == '\r' && *(buf + pos + 1) == '\n'
+        if buf[pos] == '\r' && buf[pos + 1] == '\n'
             return None  # Not found
 
         # Check if this header matches (case-insensitive)
         var is_match: i32 = 1
         if pos + name_len + 1 < buf_len
             for i in 0..name_len
-                if ascii_lower(*(buf + pos + i)) != ascii_lower(name.get(i as i64))
+                if ascii_lower(buf[pos + i]) != ascii_lower(name.get(i as i64))
                     is_match = 0
                     break
 
             # Check for ": " after header name
-            if is_match == 1 && *(buf + pos + name_len) == ':'
+            if is_match == 1 && buf[pos + name_len] == ':'
                 # Found header - skip ": " (colon and optional space)
                 let value_start: i32 = pos + name_len + 1
                 var vpos: i32 = value_start
                 # Skip leading whitespace
-                while vpos < buf_len && *(buf + vpos) == ' '
+                while vpos < buf_len && buf[vpos] == ' '
                     vpos += 1
 
                 # Find end of header value (CRLF)
                 let actual_start: i32 = vpos
                 while vpos < buf_len - 1
-                    if *(buf + vpos) == '\r' && *(buf + vpos + 1) == '\n'
-                        return Some(strview_from_ptr(buf + actual_start, (vpos - actual_start) as i64))
+                    if buf[vpos] == '\r' && buf[vpos + 1] == '\n'
+                        return Some(buf.slice(actual_start, vpos).as_strview())
                     vpos += 1
 
         # Skip to next line
         while pos < buf_len - 1
-            if *(buf + pos) == '\r' && *(buf + pos + 1) == '\n'
+            if buf[pos] == '\r' && buf[pos + 1] == '\n'
                 pos += 2
                 break
             pos += 1

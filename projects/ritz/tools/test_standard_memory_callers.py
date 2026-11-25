@@ -51,7 +51,6 @@ PINS = {
     "rzsh": 4,
     "spire": 1,
     "tome": 110,
-    "valet": 21,
     "zeus": 20,
 }
 

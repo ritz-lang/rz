@@ -16,7 +16,6 @@
 
 import ritzlib.sys
 import ritzlib.fmt
-import ritzlib.str { memcpy }
 import ritzlib.option
 import ritzlib.result
 import ritzlib.strview
@@ -86,7 +85,8 @@ import zeus.arena {
     DataArena,
     data_arena_alloc,
     data_arena_ptr_to_offset,
-    data_arena_offset_to_ptr
+    data_arena_offset_to_ptr,
+    data_arena_bytes
 }
 
 
@@ -97,12 +97,12 @@ import zeus.arena {
 # Logging middleware - logs every request
 fn logging_middleware(path: *u8, path_len: i32) -> i32
     log_info("Request: ")
-    # Print path (at most 255 bytes of it)
-    var shown_len: i32 = path_len
-    if shown_len > 255
-        shown_len = 255
-    let shown: StrView = strview_from_ptr(path, shown_len as i64)
-    print("{shown}\n")
+    # Print the request's path (at most 255 bytes of it), as the handler
+    # context has it: the same bytes as path[0..path_len)
+    let c: *HandlerContext = ctx()
+    if c != null
+        let shown: StrView = c.path.take(255)
+        print("{shown}\n")
     return MW_CONTINUE  # Continue to next middleware/handler
 
 
@@ -193,9 +193,8 @@ fn handle_echo_body(path: *u8, path_len: i32) -> i32
 # the continuation sizes a valet_response_buffer BEFORE copying the body
 # into it.  A >8 KB request sits in a heap buffer that a >8 KB response
 # buffer must not unmap (AGAST #3900, test/test_large_echo.sh).  The body
-# pointer, per task slot, is the request's own bytes, still in place.
-var g_mirror_body: [256]i64
-var g_mirror_len: [256]i64
+# view, per task slot, is the request's own bytes, still in place.
+var g_mirror_body: [256]Span<u8>
 
 fn handle_mirror(path: *u8, path_len: i32) -> i32
     let c: *HandlerContext = ctx()
@@ -204,8 +203,7 @@ fn handle_mirror(path: *u8, path_len: i32) -> i32
     let idx: i32 = valet_task_slot_idx(c.task)
     if idx < 0
         return ctx_text(503, "mirror: no task slot\n")
-    g_mirror_body[idx] = (c.raw_buf + c.req.headers_end as i64) as i64
-    g_mirror_len[idx] = c.req.content_length
+    g_mirror_body[idx] = ctx_body_bytes()
     if valet_proxy_arm_yield(c.task, 0) < 0
         return ctx_text(503, "mirror: failed to arm yield\n")
     return STATUS_PROXY_PENDING
@@ -215,8 +213,8 @@ fn handle_mirror_continuation(task: *Task) -> i32
     let idx: i32 = valet_task_slot_idx(task)
     if idx < 0
         return 1
-    let body: *u8 = g_mirror_body[idx] as *u8
-    let body_len: i64 = g_mirror_len[idx]
+    let body: Span<u8> = g_mirror_body[idx]
+    let body_len: i64 = body.len
     var hdr: [256]u8
     var hres: Response
     response_init(@hres, @hdr[0], 256)
@@ -229,13 +227,13 @@ fn handle_mirror_continuation(task: *Task) -> i32
     let hdr_len: i64 = hres.len as i64
 
     # Size the reply first, as the zeus proxy does, then read the body.
-    let out: *u8 = valet_response_buffer(task, hdr_len + body_len)
-    if out == null
+    let out: Span<u8> = valet_response_buffer(task, hdr_len + body_len)
+    if out.len == 0
         return 1
-    memcpy(out, @hdr[0], hdr_len)
-    if body_len > 0
-        memcpy(out + hdr_len, body, body_len)
-    return valet_task_send_response(task, out, hdr_len + body_len)
+    let hdr_bytes: Span<u8> = @hdr
+    out.copy_from(hdr_bytes.to(hdr_len))
+    out.from(hdr_len).copy_from(body)
+    return valet_task_send_response(task, out)
 
 
 # GET /bytes/:n - n bytes of body (at most BYTES_MAX), a repeating
@@ -385,9 +383,8 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     if path_dst == null
         g_proxy_arena_oversize = g_proxy_arena_oversize + 1
         return ctx_text(503, "zeus arena: out of space for path\n")
-    for i in 0..path_len
-        *(path_dst + i) = *(path + i)
     let path_offset: i64 = data_arena_ptr_to_offset(@arena, path_dst)
+    data_arena_bytes(@arena, path_offset, path_len as i64).copy_from(c.path.as_bytes())
 
     # Copy the body (if any) straight from the request buffer into the
     # slot arena.  The framework has already read the whole body, however
@@ -397,14 +394,15 @@ fn handle_zeus_proxy(path: *u8, path_len: i32) -> i32
     var body_len: i32 = 0
     let want: i32 = c.req.content_length as i32
     if want > 0
-        if c.req.headers_end < 0 or c.req.headers_end + want > c.raw_len
+        if c.req.headers_end < 0 or (c.req.headers_end + want) as i64 > c.raw.len
             return ctx_text(400, "incomplete request body\n")
         let body_dst: *u8 = data_arena_alloc(@arena, want as i64)
         if body_dst == null
             g_proxy_arena_oversize = g_proxy_arena_oversize + 1
             return ctx_text(413, "request body too large for zeus slot\n")
-        memcpy(body_dst, c.raw_buf + c.req.headers_end, want as i64)
         body_offset = data_arena_ptr_to_offset(@arena, body_dst)
+        let body_src: i64 = c.req.headers_end as i64
+        data_arena_bytes(@arena, body_offset, want as i64).copy_from(c.raw[body_src..body_src + want as i64])
         body_len = want
 
     # Build + submit RequestSlot
@@ -467,7 +465,8 @@ fn proxy_send_error(task: *Task, status: i32, msg: StrView) -> i32
     response_content_length(@res, msg.len)
     response_end_headers(@res)
     response_body(@res, msg.as_bytes())
-    return valet_task_send_response(task, @task.write_buf[0], res.len as i64)
+    let wb: Span<u8> = @task.write_buf
+    return valet_task_send_response(task, wb.to(res.len as i64))
 
 
 # Cooperative-yield deadline: how long to keep re-arming yields before
@@ -601,19 +600,19 @@ fn handle_zeus_proxy_continuation(task: *Task) -> i32
         # The worker's Connection header is replaced by valet's: only valet
         # knows whether it keeps this connection (AGAST #2459).
         let cap: i64 = hdr_len + PROXY_CONNECTION_EXTRA + body_len
-        let out: *u8 = valet_response_buffer(task, cap)
-        if out == null
+        let out: Span<u8> = valet_response_buffer(task, cap)
+        if out.len == 0
             g_proxy_bad_response = g_proxy_bad_response + 1
             return proxy_send_error(task, 502, "zeus worker response too large\n")
-        let out_hdr_len: i64 = proxy_copy_headers(out, hdr_len + PROXY_CONNECTION_EXTRA, hdr_ptr, hdr_len, valet_task_closing(task))
+        let out_hdr_len: i64 = proxy_copy_headers(out.ptr, hdr_len + PROXY_CONNECTION_EXTRA, hdr_ptr, hdr_len, valet_task_closing(task))
         if out_hdr_len < 0
             g_proxy_bad_response = g_proxy_bad_response + 1
             return proxy_send_error(task, 502, "zeus worker response headers malformed\n")
         if body_len > 0
-            memcpy(out + out_hdr_len, data_arena_offset_to_ptr(@arena, resp.body_offset as i64), body_len)
+            out.from(out_hdr_len).copy_from(data_arena_bytes(@arena, resp.body_offset as i64, body_len))
         let out_len: i64 = out_hdr_len + body_len
 
-        let ret: i32 = valet_task_send_response(task, out, out_len)
+        let ret: i32 = valet_task_send_response(task, out.to(out_len))
         if ret > 0
             g_proxy_send_fail_continuation = g_proxy_send_fail_continuation + 1
             return 1
@@ -721,14 +720,14 @@ pub fn main(args: Span<StrView>) -> i32
     # Try to load config file
     let config_path: StrView = cli_path(@parsed, "config")
     if config_path.len > 0
-        let ret: i32 = config_load(@cfg, config_path.ptr)
+        let ret: i32 = config_load(@cfg, config_path)
         if ret < 0
             eprint("valet: failed to load config file\n")
             return 1
         print("Loaded config from: {config_path}\n")
     else
         # Try default config file
-        if config_load(@cfg, c"valet.json") == 0
+        if config_load(@cfg, "valet.json") == 0
             print("Loaded config from: valet.json\n")
 
     # Command-line overrides
@@ -777,7 +776,7 @@ pub fn main(args: Span<StrView>) -> i32
 
     # Configure TLS if enabled
     if cfg.tls_enabled != 0
-        let tls_ret: i32 = valet_tls_files(@app, @cfg.tls_cert[0], @cfg.tls_key[0])
+        let tls_ret: i32 = valet_tls_files(@app, config_str(@cfg.tls_cert), config_str(@cfg.tls_key))
         if tls_ret < 0
             eprint("valet: failed to load TLS certificates\n")
             return 1

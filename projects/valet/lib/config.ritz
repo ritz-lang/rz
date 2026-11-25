@@ -33,11 +33,9 @@
 #   }
 # }
 
-import ritzlib.cstr
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.fmt
-import ritzlib.memory
 import ritzlib.option
 import ritzlib.result
 import ritzlib.process { signal_ignore }
@@ -144,7 +142,7 @@ pub fn config_str(buf: Span<u8>) -> StrView
     var n: i64 = 0
     while n < buf.len and buf[n] != 0
         n += 1
-    return strview_from_ptr(buf.ptr, n)
+    return buf.slice(0, n).as_strview()
 
 
 # Get an integer from a JSON value with a default
@@ -269,15 +267,13 @@ fn config_apply_root(cfg: *ValetConfig, root: @Json) -> i32
 
 # Load config from a file
 # Returns 0 on success, negative on error
-pub fn config_load(cfg: *ValetConfig, path: *u8) -> i32
-    let shown: StrView = strview_from_cstr(path)
-
+pub fn config_load(cfg: *ValetConfig, path: StrView) -> i32
     # Open file
     var f: Fd = fd_adopt(-1)
-    match fd_open(shown, O_RDONLY, 0)
+    match fd_open(path, O_RDONLY, 0)
         Ok(opened) => f = opened
         Err(_) =>
-            eprint("config: cannot open {shown}\n")
+            eprint("config: cannot open {path}\n")
             return -1
 
     # Get file size
@@ -286,7 +282,7 @@ pub fn config_load(cfg: *ValetConfig, path: *u8) -> i32
         Ok(st) => size = st.st_size
         Err(_) =>
             f.close()
-            eprint("config: cannot stat {shown}\n")
+            eprint("config: cannot stat {path}\n")
             return -2
 
     if size > 65536
@@ -295,16 +291,16 @@ pub fn config_load(cfg: *ValetConfig, path: *u8) -> i32
         return -3
 
     # Scratch buffer, freed when `text` leaves scope
-    var text: Vec<u8> = vec_with_cap<u8>(size + 1)
-    let buf: *u8 = text.as_ptr()
-    if buf == null
+    var text: Vec<u8> = vec_zeroed<u8>(size)
+    if text.len() != size
         f.close()
         eprints("config: out of memory\n")
         return -4
+    let bytes: Span<u8> = text[0..size]
 
     # Read file contents
     var read_ok: bool = true
-    match f.read_exact(Span<u8> { ptr: buf, len: size })
+    match f.read_exact(bytes)
         Ok(_) => pass
         Err(_) => read_ok = false
     f.close()
@@ -314,13 +310,13 @@ pub fn config_load(cfg: *ValetConfig, path: *u8) -> i32
         return -5
 
     # Store config path for reload
-    if shown.len < 256
+    if path.len < 256
         let stored: Span<u8> = @cfg.config_path
-        stored.copy_from(shown.as_bytes())
-        stored[shown.len] = 0
+        stored.copy_from(path.as_bytes())
+        stored[path.len] = 0
 
     # Parse JSON
-    return config_parse_json(cfg, strview_from_ptr(buf, size))
+    return config_parse_json(cfg, bytes.as_strview())
 
 
 # Reload configuration from stored path
@@ -334,7 +330,7 @@ pub fn config_reload(cfg: *ValetConfig) -> i32
     var new_cfg: ValetConfig
     config_default(@new_cfg)
 
-    let ret: i32 = config_load(@new_cfg, @cfg.config_path[0])
+    let ret: i32 = config_load(@new_cfg, config_str(@cfg.config_path))
     if ret < 0
         eprints("config: reload failed, keeping current config\n")
         return ret

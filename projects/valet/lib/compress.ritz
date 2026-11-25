@@ -14,8 +14,8 @@
 #
 import ritzlib.sys
 import ritzlib.io
-import ritzlib.str { memcpy }
-import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.box
 import ritzlib.option
 import ritzlib.span
 import ritzlib.strview
@@ -142,30 +142,20 @@ pub fn encoding_matches(a: StrView, b: StrView) -> i32
 
 
 # ============================================================================
-# Compression Result
+# Compressed body
 # ============================================================================
 
-struct CompressResult
-    data: *u8           # Compressed data (caller must free if allocated)
-    len: i64            # Length of compressed data
-    encoding: i32       # Encoding used (ENCODING_GZIP, etc.)
-    allocated: i32      # 1 if data was allocated (must be freed), 0 if original
+# A compressed body: the first `len` bytes of `data`, in `encoding`
+# (ENCODING_GZIP or ENCODING_DEFLATE).  It owns `data`: dropping it frees it.
+pub struct Compressed
+    data: Vec<u8>
+    len: i64
+    encoding: i32
 
-
-# Initialize a compress result (no compression)
-pub fn compress_result_init(result: *CompressResult, data: *u8, len: i64)
-    result.data = data
-    result.len = len
-    result.encoding = ENCODING_IDENTITY
-    result.allocated = 0
-
-
-# Free compressed data if it was allocated
-pub fn compress_result_free(result: *CompressResult)
-    if result.allocated != 0 && result.data != null
-        free(result.data)
-        result.data = null
-        result.allocated = 0
+impl Compressed
+    # The compressed bytes.
+    pub fn bytes(self: @Compressed) -> Span<u8>
+        return self.data[0..self.len]
 
 
 # ============================================================================
@@ -231,129 +221,45 @@ pub fn compress_deflate(input: Span<u8>, output: Span<u8>) -> i64
     return deflate(input.ptr, input.len, output.ptr, output.len, 6)
 
 
-# Compress data if beneficial.
-# - Tries gzip first (preferred), then deflate if gzip not accepted
-# - Only compresses compressible MIME types
-# - Only compresses if size is in beneficial range
-# - Returns original data if compression not beneficial
-#
-# Caller must check result.allocated and free if needed.
-pub fn compress_if_beneficial(data: Span<u8>, accepted_encodings: i32, mime_type: StrView, result: *CompressResult) -> i32
-    let data_len: i64 = data.len
-
-    # Initialize result with original data
-    compress_result_init(result, data.ptr, data_len)
-
-    # Select encoding (gzip preferred, then deflate)
+# `data` compressed in the encoding picked from `accepted_encodings` into a
+# buffer `slack` bytes bigger than it, when it is a compressible `mime_type`
+# of COMPRESS_MIN_SIZE..max_input bytes and the result is under
+# keep_percent% of it.  None means send `data` as it is: not accepted, not
+# worth it, out of memory or a compression failure alike.
+fn compress_owned(data: Span<u8>, accepted_encodings: i32, mime_type: StrView, max_input: i64, slack: i64, keep_percent: i64) -> Option<Compressed>
     let selected: i32 = encoding_select(accepted_encodings)
     if selected == ENCODING_IDENTITY
-        return 0  # No compression - client doesn't accept any
-
-    # Check if MIME type should be compressed
+        return None  # client doesn't accept any
     if should_compress_mime(mime_type) == 0
-        return 0  # No compression - not a compressible type
+        return None  # not a compressible type
+    if data.len < COMPRESS_MIN_SIZE or data.len > max_input
+        return None  # too small to benefit, or too big for one shot
 
-    # Check size thresholds
-    if data_len < COMPRESS_MIN_SIZE
-        return 0  # Too small to benefit from compression
-
-    if data_len > COMPRESS_MAX_INPUT
-        return 0  # Too large for single-shot compression (needs streaming)
-
-    # Allocate output buffer
-    let output_cap: i64 = data_len + 100  # Gzip adds ~18 bytes overhead + margin
-    let output: *u8 = malloc(output_cap as u64) as *u8
-    if output == null
-        return -1  # Allocation failed
-
-    # Compress using selected encoding
-    var compressed_len: i64 = 0
+    var out: Vec<u8> = vec_zeroed<u8>(data.len + slack)
+    if out.len() == 0
+        return None  # out of memory
+    var n: i64 = 0
     if selected == ENCODING_GZIP
-        compressed_len = gzip_compress(data.ptr, data_len, output, output_cap)
-    else if selected == ENCODING_DEFLATE
-        compressed_len = deflate(data.ptr, data_len, output, output_cap, 6)
+        n = compress_gzip(data, out[0..out.len()])
     else
-        free(output)
-        return 0  # Unknown encoding
-
-    if compressed_len < 0
-        # Compression failed
-        free(output)
-        return -2
-
-    # Check if compression was beneficial (at least 10% smaller)
-    if compressed_len >= (data_len * 9) / 10
-        # Not worth it - less than 10% reduction
-        free(output)
-        return 0
-
-    # Use compressed data
-    result.data = output
-    result.len = compressed_len
-    result.encoding = selected
-    result.allocated = 1
-
-    return 1  # Compression successful
+        n = compress_deflate(data, out[0..out.len()])
+    if n < 0 or n >= (data.len * keep_percent) / 100
+        return None
+    return Some(Compressed { data: out, len: n, encoding: selected })
 
 
-# Compress large data (up to 1MB) using heap allocation.
-# For data >64KB, this allocates a heap buffer for compression.
-# Caller must check result.allocated and free if needed.
-#
-# Returns: 1 if compressed, 0 if not (original data in result), -1 on error
-pub fn compress_large(data: Span<u8>, accepted_encodings: i32, mime_type: StrView, result: *CompressResult) -> i32
-    let data_len: i64 = data.len
+# Compress `data` (up to COMPRESS_MAX_INPUT bytes) if beneficial: gzip if
+# accepted, else deflate; a compressible MIME type; at least 10% smaller.
+# None: send `data` uncompressed.
+pub fn compress_if_beneficial(data: Span<u8>, accepted_encodings: i32, mime_type: StrView) -> Option<Compressed>
+    # Gzip adds ~18 bytes of overhead; 100 is the margin.
+    return compress_owned(data, accepted_encodings, mime_type, COMPRESS_MAX_INPUT, 100, 90)
 
-    # Initialize result with original data
-    compress_result_init(result, data.ptr, data_len)
 
-    # Select encoding
-    let selected: i32 = encoding_select(accepted_encodings)
-    if selected == ENCODING_IDENTITY
-        return 0
-
-    # Check MIME type
-    if should_compress_mime(mime_type) == 0
-        return 0
-
-    # Check size thresholds
-    if data_len < COMPRESS_MIN_SIZE
-        return 0
-
-    if data_len > COMPRESS_MAX_HEAP_INPUT
-        return 0  # Too large even for heap compression
-
-    # Allocate output buffer (compressed data rarely exceeds input size)
-    let output_cap: i64 = data_len + 1024
-    let output: *u8 = malloc(output_cap as u64) as *u8
-    if output == null
-        return -1
-
-    # Compress
-    var compressed_len: i64 = 0
-    if selected == ENCODING_GZIP
-        compressed_len = gzip_compress(data.ptr, data_len, output, output_cap)
-    else if selected == ENCODING_DEFLATE
-        compressed_len = deflate(data.ptr, data_len, output, output_cap, 6)
-    else
-        free(output)
-        return 0
-
-    if compressed_len < 0
-        free(output)
-        return -2
-
-    # Check if compression was beneficial (at least 5% for large files)
-    if compressed_len >= (data_len * 95) / 100
-        free(output)
-        return 0
-
-    result.data = output
-    result.len = compressed_len
-    result.encoding = selected
-    result.allocated = 1
-
-    return 1
+# compress_if_beneficial for large data, up to COMPRESS_MAX_HEAP_INPUT
+# (1MB), worth it at 5% smaller.
+pub fn compress_large(data: Span<u8>, accepted_encodings: i32, mime_type: StrView) -> Option<Compressed>
+    return compress_owned(data, accepted_encodings, mime_type, COMPRESS_MAX_HEAP_INPUT, 1024, 95)
 
 
 # ============================================================================
@@ -368,166 +274,95 @@ pub fn compress_large(data: Span<u8>, accepted_encodings: i32, mime_type: StrVie
 # - 32KB sliding window for back-references across chunks
 # - Hash chains for match finding
 # - Incremental CRC32/Adler-32 checksum
+#
+# It owns its writer and output buffer: dropping it frees them.
 pub struct StreamCompressor
     encoding: i32              # Selected encoding (GZIP, DEFLATE, or IDENTITY)
-    gzip_writer: *GzipWriter   # Pointer to allocated GzipWriter (if gzip)
-    zlib_writer: *ZlibWriter   # Pointer to allocated ZlibWriter (if deflate/zlib)
-    compress_buf: *u8          # Output buffer for compressed data
-    compress_cap: i64          # Output buffer capacity
-    initialized: i32           # 1 if writer has been initialized
+    gzip: Box<GzipWriter>      # The writer when encoding is gzip, else empty
+    zlib: Box<ZlibWriter>      # The writer when encoding is deflate, else empty
+    out: Vec<u8>               # Output buffer for compressed data
 
 
-# Initialize a streaming compressor with the specified encoding.
-# Allocates the underlying GzipWriter or ZlibWriter struct.
-# Returns 0 on success, -1 on allocation failure.
-pub fn stream_compressor_init(sc: *StreamCompressor, accepted_encodings: i32) -> i32
-    sc.encoding = encoding_select(accepted_encodings)
-    sc.gzip_writer = null
-    sc.zlib_writer = null
-    sc.initialized = 0
-
-    # Allocate output buffer (reasonable size for chunk + overhead)
-    sc.compress_cap = COMPRESS_CHUNK_SIZE + 4096
-    sc.compress_buf = malloc(sc.compress_cap as u64) as *u8
-    if sc.compress_buf == null
-        return -1
-
-    # Allocate the appropriate writer struct
-    if sc.encoding == ENCODING_GZIP
-        # GzipWriter is ~295KB: a 32KB window plus two 32K-entry i32 hash arrays
-        sc.gzip_writer = malloc(sizeof(GzipWriter)) as *GzipWriter
-        if sc.gzip_writer == null
-            free(sc.compress_buf)
-            sc.compress_buf = null
-            return -1
-        let result: i32 = gzip_writer_init(sc.gzip_writer, 6)
-        if result != 0
-            free(sc.gzip_writer as *u8)
-            free(sc.compress_buf)
-            sc.gzip_writer = null
-            sc.compress_buf = null
-            return -1
-        sc.initialized = 1
-    else if sc.encoding == ENCODING_DEFLATE
-        # ZlibWriter has the same layout as GzipWriter (~295KB)
-        sc.zlib_writer = malloc(sizeof(ZlibWriter)) as *ZlibWriter
-        if sc.zlib_writer == null
-            free(sc.compress_buf)
-            sc.compress_buf = null
-            return -1
-        let result: i32 = zlib_writer_init(sc.zlib_writer, 6)
-        if result != 0
-            free(sc.zlib_writer as *u8)
-            free(sc.compress_buf)
-            sc.zlib_writer = null
-            sc.compress_buf = null
-            return -1
-        sc.initialized = 1
-
-    return 0
-
-
-# Free streaming compressor resources
-pub fn stream_compressor_free(sc: *StreamCompressor)
-    if sc.gzip_writer != null
-        gzip_writer_free(sc.gzip_writer)
-        free(sc.gzip_writer as *u8)
-        sc.gzip_writer = null
-    if sc.zlib_writer != null
-        zlib_writer_free(sc.zlib_writer)
-        free(sc.zlib_writer as *u8)
-        sc.zlib_writer = null
-    if sc.compress_buf != null
-        free(sc.compress_buf)
-        sc.compress_buf = null
-    sc.initialized = 0
-
-
-# Write data to the streaming compressor.
-# May or may not produce output depending on internal buffering.
-# Returns bytes written to output buffer, or negative on error.
-# Output is written to sc.compress_buf.
-pub fn stream_compressor_write(sc: *StreamCompressor, data: Span<u8>) -> i64
-    if sc.compress_buf == null
-        return -1
+# A streaming compressor for the encoding picked from `accepted_encodings`,
+# or None if its buffers can't be allocated.  A GzipWriter or ZlibWriter is
+# ~295KB (a 32KB window plus two 32K-entry i32 hash arrays), so it is built
+# on the heap in place.
+pub fn stream_compressor_new(accepted_encodings: i32) -> Option<StreamCompressor>
+    var sc: StreamCompressor = StreamCompressor {
+        encoding: encoding_select(accepted_encodings),
+        gzip: box_empty<GzipWriter>(),
+        zlib: box_empty<ZlibWriter>(),
+        out: vec_zeroed<u8>(COMPRESS_CHUNK_SIZE + 4096)  # a chunk + overhead
+    }
+    if sc.out.len() == 0
+        return None
 
     if sc.encoding == ENCODING_GZIP
-        if sc.gzip_writer == null
-            return -1
-        return gzip_writer_write(sc.gzip_writer, data.ptr, data.len, sc.compress_buf, sc.compress_cap)
+        sc.gzip = box_zeroed<GzipWriter>()
+        if not sc.gzip.valid() or gzip_writer_init(sc.gzip.as_ptr(), 6) != 0
+            return None
     else if sc.encoding == ENCODING_DEFLATE
-        if sc.zlib_writer == null
+        sc.zlib = box_zeroed<ZlibWriter>()
+        if not sc.zlib.valid() or zlib_writer_init(sc.zlib.as_ptr(), 6) != 0
+            return None
+    return Some(sc)
+
+
+impl StreamCompressor
+    # The output buffer each call below writes its bytes to the front of.
+    pub fn output(self: @StreamCompressor) -> Span<u8>
+        return self.out[0..self.out.len()]
+
+    # Write data to the streaming compressor.
+    # May or may not produce output depending on internal buffering.
+    # Returns bytes written to output(), or negative on error.
+    pub fn write(self: @&StreamCompressor, data: Span<u8>) -> i64
+        let out: Span<u8> = self.output()
+        if self.encoding == ENCODING_GZIP
+            return gzip_writer_write(self.gzip.as_ptr(), data.ptr, data.len, out.ptr, out.len)
+        if self.encoding == ENCODING_DEFLATE
+            return zlib_writer_write(self.zlib.as_ptr(), data.ptr, data.len, out.ptr, out.len)
+        return self.copy_identity(data)
+
+    # Identity "compression": copy `data` to the output buffer.  Returns its
+    # length, or -1 if it doesn't fit.
+    fn copy_identity(self: @StreamCompressor, data: Span<u8>) -> i64
+        let out: Span<u8> = self.output()
+        if data.len > out.len
             return -1
-        return zlib_writer_write(sc.zlib_writer, data.ptr, data.len, sc.compress_buf, sc.compress_cap)
-    else
-        return stream_copy_identity(sc, data)
+        return out.copy_from(data)
 
-
-# Identity "compression": copy `data` to the output buffer.  Returns its
-# length, or -1 if it doesn't fit.
-fn stream_copy_identity(sc: *StreamCompressor, data: Span<u8>) -> i64
-    if data.len > sc.compress_cap
-        return -1
-    memcpy(sc.compress_buf, data.ptr, data.len)
-    return data.len
-
-
-# Flush pending data from the compressor.
-# Forces output of any buffered data (useful for chunked transfer encoding).
-# Returns bytes written to output buffer.
-pub fn stream_compressor_flush(sc: *StreamCompressor) -> i64
-    if sc.compress_buf == null
-        return -1
-
-    if sc.encoding == ENCODING_GZIP
-        if sc.gzip_writer == null
-            return -1
-        return gzip_writer_flush(sc.gzip_writer, sc.compress_buf, sc.compress_cap)
-    else if sc.encoding == ENCODING_DEFLATE
-        if sc.zlib_writer == null
-            return -1
-        return zlib_writer_flush(sc.zlib_writer, sc.compress_buf, sc.compress_cap)
-    else
+    # Flush pending data from the compressor.
+    # Forces output of any buffered data (useful for chunked transfer encoding).
+    # Returns bytes written to output().
+    pub fn flush(self: @&StreamCompressor) -> i64
+        let out: Span<u8> = self.output()
+        if self.encoding == ENCODING_GZIP
+            return gzip_writer_flush(self.gzip.as_ptr(), out.ptr, out.len)
+        if self.encoding == ENCODING_DEFLATE
+            return zlib_writer_flush(self.zlib.as_ptr(), out.ptr, out.len)
         return 0  # Identity has no buffering
 
-
-# Finish compression and write trailer (checksum, size).
-# Must be called after all data has been written.
-# Returns bytes written to output buffer, or negative on error.
-pub fn stream_compressor_finish(sc: *StreamCompressor) -> i64
-    if sc.compress_buf == null
-        return -1
-
-    if sc.encoding == ENCODING_GZIP
-        if sc.gzip_writer == null
-            return -1
-        return gzip_writer_finish(sc.gzip_writer, sc.compress_buf, sc.compress_cap)
-    else if sc.encoding == ENCODING_DEFLATE
-        if sc.zlib_writer == null
-            return -1
-        return zlib_writer_finish(sc.zlib_writer, sc.compress_buf, sc.compress_cap)
-    else
+    # Finish compression and write trailer (checksum, size).
+    # Must be called after all data has been written.
+    # Returns bytes written to output(), or negative on error.
+    pub fn finish(self: @&StreamCompressor) -> i64
+        let out: Span<u8> = self.output()
+        if self.encoding == ENCODING_GZIP
+            return gzip_writer_finish(self.gzip.as_ptr(), out.ptr, out.len)
+        if self.encoding == ENCODING_DEFLATE
+            return zlib_writer_finish(self.zlib.as_ptr(), out.ptr, out.len)
         return 0  # Identity has no trailer
 
-
-# Get the output buffer pointer
-pub fn stream_compressor_output(sc: *StreamCompressor) -> *u8
-    return sc.compress_buf
-
-
-# Legacy API: Compress a single chunk independently (deprecated).
-# For true streaming with cross-chunk compression, use:
-#   stream_compressor_write() + stream_compressor_flush() + stream_compressor_finish()
-pub fn stream_compress_chunk(sc: *StreamCompressor, data: Span<u8>) -> i64
-    if sc.compress_buf == null
-        return -1
-
-    if sc.encoding == ENCODING_GZIP
-        return gzip_compress(data.ptr, data.len, sc.compress_buf, sc.compress_cap)
-    else if sc.encoding == ENCODING_DEFLATE
-        return deflate(data.ptr, data.len, sc.compress_buf, sc.compress_cap, 6)
-    else
-        return stream_copy_identity(sc, data)
+    # Legacy API: Compress a single chunk independently (deprecated).
+    # For true streaming with cross-chunk compression, use write + flush +
+    # finish.  Returns bytes written to output(), or negative on error.
+    pub fn compress_chunk(self: @StreamCompressor, data: Span<u8>) -> i64
+        if self.encoding == ENCODING_GZIP
+            return compress_gzip(data, self.output())
+        if self.encoding == ENCODING_DEFLATE
+            return compress_deflate(data, self.output())
+        return self.copy_identity(data)
 
 
 # Check if response needs streaming compression

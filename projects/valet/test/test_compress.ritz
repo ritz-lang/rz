@@ -7,6 +7,7 @@ import ritzlib.io
 import ritzlib.option
 import ritzlib.span
 import ritzlib.strview
+import ritzlib.box
 
 import lib.compress
 import squeeze.gzip_stream
@@ -231,16 +232,8 @@ fn test_compress_if_beneficial_too_small() -> i32
     # Data smaller than COMPRESS_MIN_SIZE should not be compressed
     let input: StrView = "tiny"
 
-    var result: CompressResult
-    let ret: i32 = compress_if_beneficial(input.as_bytes(), ENCODING_GZIP, "text/plain", @result)
-
-    if ret != 0
+    if compress_if_beneficial(input.as_bytes(), ENCODING_GZIP, "text/plain").is_some()
         return 1  # FAIL: should not compress small data
-    if result.allocated != 0
-        return 2  # FAIL: should not allocate for uncompressed
-    if result.data != input.ptr
-        return 3  # FAIL: should return original data
-
     return 0
 
 [[test]]
@@ -250,10 +243,7 @@ fn test_compress_if_beneficial_not_accepted() -> i32
     for i in 0..512
         input[i] = 'a'
 
-    var result: CompressResult
-    let ret: i32 = compress_if_beneficial(@input, ENCODING_IDENTITY, "text/plain", @result)
-
-    if ret != 0
+    if compress_if_beneficial(@input, ENCODING_IDENTITY, "text/plain").is_some()
         return 1  # FAIL: should not compress when gzip not accepted
 
     return 0
@@ -265,10 +255,7 @@ fn test_compress_if_beneficial_non_compressible_mime() -> i32
     for i in 0..512
         input[i] = 'a'
 
-    var result: CompressResult
-    let ret: i32 = compress_if_beneficial(@input, ENCODING_GZIP, "image/jpeg", @result)
-
-    if ret != 0
+    if compress_if_beneficial(@input, ENCODING_GZIP, "image/jpeg").is_some()
         return 1  # FAIL: should not compress non-compressible MIME types
 
     return 0
@@ -281,24 +268,16 @@ fn test_compress_if_beneficial_success() -> i32
     for i in 0..1024
         input[i] = ('a' as u8) + ((i % 26) as u8)
 
-    var result: CompressResult
-    let ret: i32 = compress_if_beneficial(@input, ENCODING_GZIP, "text/plain", @result)
-
-    if ret != 1
-        return 1  # FAIL: should compress
-
-    if result.allocated != 1
-        return 2  # FAIL: should be allocated
-
-    if result.encoding != ENCODING_GZIP
-        return 3  # FAIL: should be gzip encoding
-
-    if result.len >= 1024
-        return 4  # FAIL: compressed should be smaller
-
-    # Clean up
-    compress_result_free(@result)
-
+    match compress_if_beneficial(@input, ENCODING_GZIP, "text/plain")
+        Some(z) =>
+            if z.encoding != ENCODING_GZIP
+                return 3  # FAIL: should be gzip encoding
+            if z.len >= 1024 or z.bytes().len != z.len
+                return 4  # FAIL: compressed should be smaller
+            let b: Span<u8> = z.bytes()
+            if b[0] != 0x1f or b[1] != 0x8b
+                return 5  # FAIL: not gzip
+        None => return 1  # FAIL: should compress
     return 0
 
 
@@ -388,20 +367,11 @@ fn test_compress_if_beneficial_deflate_only() -> i32
     for i in 0..1024
         input[i] = ('a' as u8) + ((i % 26) as u8)
 
-    var result: CompressResult
-    let ret: i32 = compress_if_beneficial(@input, ENCODING_DEFLATE, "text/plain", @result)
-
-    if ret != 1
-        return 1  # FAIL: should compress
-
-    if result.encoding != ENCODING_DEFLATE
-        compress_result_free(@result)
-        return 2  # FAIL: should use deflate encoding
-
-    if result.allocated != 1
-        return 3  # FAIL: should allocate
-
-    compress_result_free(@result)
+    match compress_if_beneficial(@input, ENCODING_DEFLATE, "text/plain")
+        Some(z) =>
+            if z.encoding != ENCODING_DEFLATE
+                return 2  # FAIL: should use deflate encoding
+        None => return 1  # FAIL: should compress
     return 0
 
 
@@ -437,20 +407,11 @@ fn test_compress_large_over_64kb() -> i32
     for i in 0..size
         input[i] = ('a' as u8) + ((i % 26) as u8)
 
-    var result: CompressResult
-    let ret: i32 = compress_large(@input, ENCODING_GZIP, "text/plain", @result)
-
-    if ret != 1
-        return 2  # FAIL: should compress
-
-    if result.allocated != 1
-        return 3  # FAIL: should be allocated
-
-    if result.len >= size
-        compress_result_free(@result)
-        return 4  # FAIL: compressed should be smaller
-
-    compress_result_free(@result)
+    match compress_large(@input, ENCODING_GZIP, "text/plain")
+        Some(z) =>
+            if z.len >= size
+                return 4  # FAIL: compressed should be smaller
+        None => return 2  # FAIL: should compress
     return 0
 
 
@@ -467,58 +428,38 @@ fn test_compress_large_respects_max_size() -> i32
 # ============================================================================
 
 [[test]]
-fn test_stream_compressor_init_gzip() -> i32
-    # Test initializing a streaming gzip compressor
-    var sc: StreamCompressor
-    let ret: i32 = stream_compressor_init(@sc, ENCODING_GZIP)
-
-    if ret != 0
-        return 1  # FAIL: init failed
-
+fn test_stream_compressor_new_gzip() -> i32
+    # A gzip compressor holds a gzip writer, no zlib one, and a buffer
+    var sc: StreamCompressor = match stream_compressor_new(ENCODING_GZIP)
+        Some(made) => made
+        None => return 1  # FAIL: allocation failed
     if sc.encoding != ENCODING_GZIP
-        stream_compressor_free(@sc)
         return 2  # FAIL: wrong encoding
-
-    if sc.gzip_writer == null
-        stream_compressor_free(@sc)
-        return 3  # FAIL: gzip_writer not allocated
-
-    if sc.compress_buf == null
-        stream_compressor_free(@sc)
-        return 4  # FAIL: compress_buf not allocated
-
-    stream_compressor_free(@sc)
+    if not sc.gzip.valid() or sc.zlib.valid()
+        return 3  # FAIL: wrong writer allocated
+    if sc.output().len != COMPRESS_CHUNK_SIZE + 4096
+        return 4  # FAIL: output buffer not allocated
     return 0
 
 
 [[test]]
-fn test_stream_compressor_init_deflate() -> i32
-    # Test initializing a streaming zlib/deflate compressor
-    var sc: StreamCompressor
-    let ret: i32 = stream_compressor_init(@sc, ENCODING_DEFLATE)
-
-    if ret != 0
-        return 1  # FAIL: init failed
-
+fn test_stream_compressor_new_deflate() -> i32
+    var sc: StreamCompressor = match stream_compressor_new(ENCODING_DEFLATE)
+        Some(made) => made
+        None => return 1  # FAIL: allocation failed
     if sc.encoding != ENCODING_DEFLATE
-        stream_compressor_free(@sc)
         return 2  # FAIL: wrong encoding
-
-    if sc.zlib_writer == null
-        stream_compressor_free(@sc)
-        return 3  # FAIL: zlib_writer not allocated
-
-    stream_compressor_free(@sc)
+    if not sc.zlib.valid() or sc.gzip.valid()
+        return 3  # FAIL: wrong writer allocated
     return 0
 
 
 [[test]]
 fn test_stream_compressor_write_finish_gzip() -> i32
     # Test full streaming compression cycle with gzip
-    var sc: StreamCompressor
-    let ret: i32 = stream_compressor_init(@sc, ENCODING_GZIP)
-    if ret != 0
-        return 1  # FAIL: init failed
+    var sc: StreamCompressor = match stream_compressor_new(ENCODING_GZIP)
+        Some(made) => made
+        None => return 1  # FAIL: allocation failed
 
     # Write some data in chunks
     let chunk1: StrView = "Hello, this is the first chunk of data. "
@@ -527,128 +468,106 @@ fn test_stream_compressor_write_finish_gzip() -> i32
 
     var total_compressed: i64 = 0
 
-    # Write chunk 1 (output written to internal sc.compress_buf)
-    let out1: i64 = stream_compressor_write(@sc, chunk1.as_bytes())
+    # Write chunk 1 (output written to sc.output())
+    let out1: i64 = sc.write(chunk1.as_bytes())
     if out1 < 0
-        stream_compressor_free(@sc)
         return 2  # FAIL: write 1 failed
     total_compressed = total_compressed + out1
 
-    # Write chunk 2
-    let out2: i64 = stream_compressor_write(@sc, chunk2.as_bytes())
+    let out2: i64 = sc.write(chunk2.as_bytes())
     if out2 < 0
-        stream_compressor_free(@sc)
         return 3  # FAIL: write 2 failed
     total_compressed = total_compressed + out2
 
-    # Write chunk 3
-    let out3: i64 = stream_compressor_write(@sc, chunk3.as_bytes())
+    let out3: i64 = sc.write(chunk3.as_bytes())
     if out3 < 0
-        stream_compressor_free(@sc)
         return 4  # FAIL: write 3 failed
     total_compressed = total_compressed + out3
 
-    # Finish compression
-    let out_finish: i64 = stream_compressor_finish(@sc)
+    let out_finish: i64 = sc.finish()
     if out_finish < 0
-        stream_compressor_free(@sc)
         return 5  # FAIL: finish failed
     total_compressed = total_compressed + out_finish
 
-    # Should have produced some compressed output
     if total_compressed == 0
-        stream_compressor_free(@sc)
         return 6  # FAIL: no output produced
-
-    stream_compressor_free(@sc)
     return 0
 
 
 [[test]]
 fn test_stream_compressor_produces_valid_gzip() -> i32
     # Test that streaming compression produces valid gzip header
-    var sc: StreamCompressor
-    let ret: i32 = stream_compressor_init(@sc, ENCODING_GZIP)
-    if ret != 0
-        return 1
+    var sc: StreamCompressor = match stream_compressor_new(ENCODING_GZIP)
+        Some(made) => made
+        None => return 1
 
-    # Write data (output goes to internal buffer)
+    # Write data (output goes to sc.output())
     let data: StrView = "Test data for gzip header verification in streaming mode!"
-    let out_len: i64 = stream_compressor_write(@sc, data.as_bytes())
+    let out_len: i64 = sc.write(data.as_bytes())
 
-    # Even if write buffered, there should be at least the gzip header
-    # Actually, the header is written on first write
+    # The header is written on the first write, unless it was buffered
+    # until finish
     if out_len < 10
-        # That's ok - output might be buffered until finish
-        let finish_len: i64 = stream_compressor_finish(@sc)
-        if finish_len < 0
-            stream_compressor_free(@sc)
+        if sc.finish() < 0
             return 2
-
-        # Check magic in compress_buf after finish
-        let buf: *u8 = stream_compressor_output(@sc)
-        if buf[0] != 0x1f || buf[1] != 0x8b
-            stream_compressor_free(@sc)
-            return 3  # FAIL: invalid gzip magic
-    else
-        # Check magic in initial output
-        let buf: *u8 = stream_compressor_output(@sc)
-        if buf[0] != 0x1f || buf[1] != 0x8b
-            stream_compressor_free(@sc)
-            return 4  # FAIL: invalid gzip magic
-
-        stream_compressor_finish(@sc)
-
-    stream_compressor_free(@sc)
+    let buf: Span<u8> = sc.output()
+    if buf[0] != 0x1f || buf[1] != 0x8b
+        return 3  # FAIL: invalid gzip magic
     return 0
 
 
 [[test]]
 fn test_stream_compressor_flush() -> i32
     # Test that flush forces output
-    var sc: StreamCompressor
-    let ret: i32 = stream_compressor_init(@sc, ENCODING_GZIP)
-    if ret != 0
-        return 1
+    var sc: StreamCompressor = match stream_compressor_new(ENCODING_GZIP)
+        Some(made) => made
+        None => return 1
 
-    # Write some data
     let data: StrView = "Data that should be flushed immediately for chunked encoding!"
-    stream_compressor_write(@sc, data.as_bytes())
+    sc.write(data.as_bytes())
 
-    # Flush
-    let flush_len: i64 = stream_compressor_flush(@sc)
     # Flush may or may not produce output depending on buffered state
-    if flush_len < 0
-        stream_compressor_free(@sc)
+    if sc.flush() < 0
         return 2  # FAIL: flush returned error
-
-    # Finish
-    stream_compressor_finish(@sc)
-    stream_compressor_free(@sc)
+    sc.finish()
     return 0
 
 
 [[test]]
 fn test_stream_compressor_identity() -> i32
     # Test identity encoding (no compression)
-    var sc: StreamCompressor
-    let ret: i32 = stream_compressor_init(@sc, ENCODING_IDENTITY)
-    if ret != 0
-        return 1
-
+    var sc: StreamCompressor = match stream_compressor_new(ENCODING_IDENTITY)
+        Some(made) => made
+        None => return 1
     if sc.encoding != ENCODING_IDENTITY
-        stream_compressor_free(@sc)
         return 2
+    if sc.gzip.valid() or sc.zlib.valid()
+        return 4  # FAIL: identity needs no writer
 
     # For identity, we should just copy data through
     let data: StrView = "Identity test data"
-    let out_len: i64 = stream_compressor_write(@sc, data.as_bytes())
-
-    if out_len != 18
-        stream_compressor_free(@sc)
+    if sc.write(data.as_bytes()) != 18
         return 3  # FAIL: identity should copy exactly
+    if not sc.output().to(18).as_strview().eq(data)
+        return 5  # FAIL: copied bytes differ
+    return 0
 
-    stream_compressor_free(@sc)
+
+[[test]]
+fn test_stream_compressor_compress_chunk() -> i32
+    # Each chunk compressed on its own is a whole gzip member
+    var sc: StreamCompressor = match stream_compressor_new(ENCODING_GZIP)
+        Some(made) => made
+        None => return 1
+    var input: [2048]u8
+    for i in 0..2048
+        input[i] = ('a' as u8) + ((i % 26) as u8)
+    let n: i64 = sc.compress_chunk(@input)
+    if n <= 0 or n >= 2048
+        return 2
+    let out: Span<u8> = sc.output()
+    if out[0] != 0x1f or out[1] != 0x8b
+        return 3
     return 0
 
 

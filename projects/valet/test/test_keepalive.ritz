@@ -10,6 +10,8 @@
 # persists only with "Connection: keep-alive".
 
 import ritzlib.sys
+import ritzlib.option
+import ritzlib.span
 import ritzlib.strview
 import ritzlib.async.tasks
 
@@ -20,7 +22,7 @@ import lib.valet
 fn parse_ka(raw: StrView) -> i32
     var req: Request
     request_init(@req)
-    if request_parse(@req, raw.ptr, raw.len as i32) < 0
+    if request_parse(@req, raw.as_bytes()) < 0
         return -1
     req.keep_alive
 
@@ -94,6 +96,39 @@ fn test_valet_keep_alive_decision() -> i32
     0
 
 # ----------------------------------------------------------------------------
+# request_parse / request_find_header: views into the request's bytes
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_parse_views_into_buffer() -> i32
+    let raw: StrView = "POST /a/b HTTP/1.1\r\nHost: x\r\n\r\n"
+    var req: Request
+    request_init(@req)
+    if request_parse(@req, raw.as_bytes()) != raw.len as i32
+        return 1
+    if not req.method.eq("POST") or not req.path.eq("/a/b") or not req.version.eq("HTTP/1.1")
+        return 2
+    if req.path.ptr != raw.ptr + 5
+        return 3  # a view, not a copy
+    0
+
+[[test]]
+fn test_find_header_value_and_absence() -> i32
+    let raw: StrView = "GET / HTTP/1.1\r\nHost: x\r\nRange:  bytes=0-9\r\n\r\n"
+    match request_find_header(raw.as_bytes(), "range")
+        Some(v) =>
+            if not v.eq("bytes=0-9")
+                return 1
+        None => return 2
+    if request_find_header(raw.as_bytes(), "If-None-Match").is_some()
+        return 3
+    # A header past the end of the headers is not one
+    let cut: StrView = raw.take(20)
+    if request_find_header(cut.as_bytes(), "Range").is_some()
+        return 4
+    0
+
+# ----------------------------------------------------------------------------
 # ctx_* helpers advertise the decision in the Connection header
 # ----------------------------------------------------------------------------
 
@@ -119,8 +154,7 @@ fn ctx_ok_with(keep_alive: i32, out: *u8, cap: i32) -> i32
     hc.res = @res
     hc.route_result = null
     hc.path = strview_empty()
-    hc.raw_buf = null
-    hc.raw_len = 0
+    hc.raw = span_empty<u8>()
     hc.task = null
     set_g_ctx(@hc)
     ctx_ok("hi")
