@@ -94,6 +94,7 @@ SOURCES = \
 	iface_text \
 	fn_cache \
 	sha256 \
+	type_twins \
 	main_abi \
 	main
 

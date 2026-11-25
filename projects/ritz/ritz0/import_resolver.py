@@ -37,6 +37,7 @@ _RITZ_DIR = str(Path(__file__).resolve().parent.parent)
 if _RITZ_DIR not in sys.path:
     sys.path.append(_RITZ_DIR)
 from resolve import package_sources  # noqa: E402
+from parser import enum_from_name  # noqa: E402
 
 
 _CACHED_SPAN = rast.Span("<cached>", 0, 0, 0)
@@ -52,6 +53,93 @@ def target_key(item) -> tuple:
     if not hasattr(item, 'get_attr_value'):
         return (None, None)
     return (item.get_attr_value('target_os'), item.get_attr_value('target_arch'))
+
+
+def file_digest(path: str) -> str:
+    """The 8 hex digits a twin type's internal name carries (AGAST #4609):
+    sha256 of symbol_file_key, as a private fn's symbol (AGAST #1858).  Only
+    unique within one compile; ritz1 spells its own (type_twins.ritz)."""
+    import hashlib
+    from emitter_llvmlite import symbol_file_key
+    return hashlib.sha256(symbol_file_key(path).encode()).hexdigest()[:8]
+
+
+def _rename_uses(node, name: str, new: str, seen: Set[int]) -> None:
+    """Every use of the type `name` under `node` names `new` (AGAST #4609):
+    a NamedType, a struct literal's or pattern's name, a variant pattern's
+    qualifier, and an `Ident` (the `T` of `T.V`, `T.m()`, `T.from(v)`).  A
+    local can't be named like a type in a file that uses the type."""
+    if id(node) in seen:
+        return
+    seen.add(id(node))
+    if isinstance(node, (list, tuple)):
+        for child in node:
+            _rename_uses(child, name, new, seen)
+        return
+    if isinstance(node, dict):
+        for child in node.values():
+            _rename_uses(child, name, new, seen)
+        return
+    if not hasattr(node, '__dataclass_fields__'):
+        return
+    if isinstance(node, (rast.NamedType, rast.Ident, rast.StructLit, rast.StructPattern)):
+        if node.name == name:
+            node.name = new
+    if isinstance(node, (rast.StructLit, rast.VariantPattern)) and node.qualifier == name:
+        node.qualifier = new
+    for attr in node.__dataclass_fields__:
+        if attr == 'span':
+            continue
+        child = getattr(node, attr, None)
+        if child is None or isinstance(child, (str, int, float, bool)):
+            continue
+        _rename_uses(child, name, new, seen)
+
+
+def _qualified(node, owner: Dict[str, str]):
+    """`node` written qualified, if it is a bare variant `owner` names an
+    enum for: `V` -> `E.V`, `V(x)` -> `E.V(x)`; else None."""
+    if isinstance(node, rast.Ident) and node.name in owner:
+        return rast.Field(node.span, rast.Ident(node.span, owner[node.name]),
+                          node.name, name_span=node.span)
+    if (isinstance(node, rast.Call) and isinstance(node.func, rast.Ident)
+            and node.func.name in owner and not node.type_args):
+        return rast.MethodCall(node.span, rast.Ident(node.span, owner[node.func.name]),
+                               node.func.name, node.args, name_span=node.func.span)
+    return None
+
+
+def _qualify_variants(node, owner: Dict[str, str], seen: Set[int]) -> None:
+    """Write every bare variant under `node` that `owner` names an enum for
+    qualified (import_resolver._qualify_seen_variants).  Patterns are not
+    entered: a bare arm resolves against its scrutinee."""
+    if id(node) in seen or isinstance(node, rast.Pattern):
+        return
+    seen.add(id(node))
+    if isinstance(node, list):
+        for i, child in enumerate(node):
+            new = _qualified(child, owner)
+            if new is not None:
+                node[i] = child = new
+            _qualify_variants(child, owner, seen)
+        return
+    if isinstance(node, tuple):
+        for child in node:
+            _qualify_variants(child, owner, seen)
+        return
+    if not hasattr(node, '__dataclass_fields__'):
+        return
+    for attr in node.__dataclass_fields__:
+        if attr == 'span':
+            continue
+        child = getattr(node, attr, None)
+        if child is None or isinstance(child, (str, int, float, bool)):
+            continue
+        new = _qualified(child, owner)
+        if new is not None:
+            setattr(node, attr, new)
+            child = new
+        _qualify_variants(child, owner, seen)
 
 
 def _calls(node, name: str) -> bool:
@@ -299,6 +387,14 @@ class ImportResolver:
         self.variables: Dict[str, rast.VarDef] = {}
         self.type_aliases: Dict[str, rast.TypeAlias] = {}
         self.traits: Dict[str, rast.TraitDef] = {}
+        # AGAST #4609 (LANGUAGE_SPEC §15.3): a struct, enum or type alias of
+        # a name already registered, differing, from another file.  Types
+        # follow the fn rule, so the two conflict only in a file that sees
+        # both; _settle_type_twins decides once the closure is known.
+        # `_type_copies` is every file an identical repeat came from: a file
+        # that sees one of those sees the definition kept.
+        self._type_twins: Dict[str, List[rast.Item]] = {}
+        self._type_copies: Dict[str, Set[str]] = {}
         # Impl blocks indexed by (trait_name or None, type_name)
         self.impls: List[rast.ImplBlock] = []
         # Static assertions (not exported, but kept for const eval)
@@ -653,6 +749,8 @@ class ImportResolver:
         # Collect items from this module
         for item in non_imports:
             self._register_item(item, source_path)
+        self._settle_type_twins(source_path)
+        self._qualify_seen_variants()
         self._keep_one_fn(source_path)
 
         # Build merged module
@@ -1243,6 +1341,225 @@ class ImportResolver:
                     return fn_name
         return None
 
+    def _twin_of(self, item: rast.Item, existing: List[rast.Item],
+                 source_file: str) -> bool:
+        """Hold `item` aside, and say so, when it is a twin (AGAST #4609): a
+        type differing from a registered one of its name (`existing`, the
+        same kind) that another file declares, or a twin enum's generated
+        `E.from`.  Whether the two conflict is the closure's question
+        (_settle_type_twins), not registration order's."""
+        held = self._type_twins.get(item.name, [])
+        if isinstance(item, rast.FnDef):
+            for enums in self._type_twins.values():
+                for twin in enums:
+                    if (isinstance(twin, rast.EnumDef) and twin.source_file == source_file
+                            and enum_from_name(twin.name) == item.name):
+                        twin.from_fn = item
+                        return True
+            return False
+        if any(h.source_file == source_file for h in held):
+            self._type_twins[item.name].append(item)  # another variant of it
+            return True
+        for other in existing:
+            if other.source_file == source_file:
+                continue
+            if isinstance(item, rast.StructDef):
+                if target_key(other) != target_key(item) or self._structs_equal(other, item):
+                    continue
+            self._type_twins.setdefault(item.name, []).append(item)
+            return True
+        return False
+
+    def _type_sees(self, path: str, name: str, files: Set[str]) -> bool:
+        """Does the module at `path` see the type `name` that `files`
+        declare (one definition, or identical repeats of it): declares it,
+        or imports a module that defines it (§15.1), directly or by
+        `pub import`?"""
+        from selective_import import _Definitions
+        if path in files:
+            return True
+        if self._definitions is None:
+            self._definitions = _Definitions(self)
+        for imp in self._imports_of(path):
+            target = self._resolve_import_path(imp.path, path)
+            if target is None:
+                continue
+            entry = self._definitions.defined(target).get(name)
+            if entry is not None and entry[1] in files:
+                return True
+        return False
+
+    def _settle_type_twins(self, source_path: str) -> None:
+        """Types follow the fn rule (AGAST #4609, LANGUAGE_SPEC §15.3): two
+        definitions of one type name conflict only in a file that sees both.
+
+        Every file of the closure is asked, as each is compiled on its own
+        and an import's code is emitted here too (a generic's body).  Where
+        none sees two, the definition this file sees keeps its name; every
+        other is renamed `Name__<file hash>` (_symbol_name's hash) in the
+        items of the files that see it, so one merged module holds both.
+        Its methods keep their `Name_m` symbols (`symbol_type`), which
+        its own object defines."""
+        for name, held in list(self._type_twins.items()):
+            # Each definition, as the files declaring it.
+            kept = self.structs.get(name) or [self.enums.get(name) or self.type_aliases.get(name)]
+            kept = [k for k in kept if k is not None]
+            groups: Dict[str, List[rast.Item]] = {}
+            for item in kept + held:
+                groups.setdefault(item.source_file, []).append(item)
+            copies = self._type_copies.get(name, set())
+            first_file = kept[0].source_file
+            files_of = {f: ({f} | copies if f == first_file else {f}) for f in groups}
+            for path in sorted(self.processed_files):
+                seen = [f for f in groups if self._type_sees(path, name, files_of[f])]
+                if len(seen) >= 2:
+                    kind = {rast.StructDef: 'struct', rast.EnumDef: 'enum',
+                            rast.TypeAlias: 'type alias'}[type(groups[seen[0]][0])]
+                    where = '' if path in seen else f"; {path} sees both"
+                    raise ImportError(
+                        f"Conflicting {kind} definition for '{name}': "
+                        f"defined in both {seen[0]} and {seen[1]}{where}")
+            self._refuse_shared_methods(name, files_of)
+            own = next((f for f in groups if self._type_sees(source_path, name, files_of[f])), None)
+            for f, items in groups.items():
+                if f != own:
+                    seers = {p for p in self.processed_files
+                             if self._type_sees(p, name, files_of[f])}
+                    self._rename_type(name, f"{name}__{file_digest(f)}", seers)
+            self.structs.pop(name, None)
+            self.enums.pop(name, None)
+            self.type_aliases.pop(name, None)
+            del self._type_twins[name]
+            for items in groups.values():
+                for item in items:
+                    self._file_type(item)
+
+    def _all_items(self) -> List[rast.Item]:
+        """Every item registered so far, twins held aside included."""
+        items: List[rast.Item] = []
+        for group in (self.structs.values(), self.functions.values(),
+                      self.constants.values()):
+            for lst in group:
+                items.extend(lst)
+        items.extend(self.enums.values())
+        items.extend(self.type_aliases.values())
+        items.extend(self.traits.values())
+        items.extend(self.variables.values())
+        items.extend(self.extern_fns.values())
+        items.extend(self.impls)
+        items.extend(self.static_asserts)
+        for held in self._type_twins.values():
+            items.extend(held)
+            items.extend(h.from_fn for h in held if getattr(h, 'from_fn', None) is not None)
+        return items
+
+    def _seen_enums(self, path: str) -> Set[str]:
+        """The enums in the namespace of the module at `path`, by the names
+        they have here: its own, and those its imports define (§15.1)."""
+        from selective_import import _Definitions
+        if self._definitions is None:
+            self._definitions = _Definitions(self)
+        names = {e.name for e in self.enums.values() if e.source_file == path}
+        for imp in self._imports_of(path):
+            target = self._resolve_import_path(imp.path, path)
+            if target is None:
+                continue
+            for item, _ in self._definitions.defined(target).values():
+                if isinstance(item, rast.EnumDef):
+                    names.add(item.name)
+        return names
+
+    def _qualify_seen_variants(self) -> None:
+        """Bare-variant ambiguity is judged over the enums a file sees
+        (AGAST #4609, LANGUAGE_SPEC §15.3).  The merged module holds every
+        enum of the closure, and later passes judge a bare variant over all
+        of them, so where some enum the file doesn't see also declares it,
+        and exactly one it sees does, its bare uses in that file's items are
+        written qualified: `V` is `E.V`, `V(x)` is `E.V(x)`.  A match arm's
+        bare pattern resolves against the scrutinee, so it is left alone."""
+        declarers: Dict[str, Set[str]] = {}
+        for enum in self.enums.values():
+            if enum.type_params:
+                continue
+            for variant in enum.variants:
+                declarers.setdefault(variant.name, set()).add(enum.name)
+        shared = {v: ds for v, ds in declarers.items() if len(ds) >= 2}
+        if not shared:
+            return
+        by_file: Dict[str, List[rast.Item]] = {}
+        for item in self._all_items():
+            by_file.setdefault(getattr(item, 'source_file', None), []).append(item)
+        for path in sorted(self.processed_files):
+            seen = self._seen_enums(path)
+            owner = {}
+            for v, ds in shared.items():
+                mine = ds & seen
+                if len(mine) == 1:
+                    owner[v] = next(iter(mine))
+            if owner:
+                _qualify_variants(by_file.get(path, []), owner, set())
+
+    def _refuse_shared_methods(self, name: str, files_of: Dict[str, Set[str]]) -> None:
+        """A method is the symbol `T_m` (§9.4), so two twins `T` may not
+        both have a method `m`: that is two definitions of one symbol, as
+        two `pub fn`s of one name are (§15.3).  Each twin's methods are the
+        impls of `T` its own file sees."""
+        owner: Dict[str, str] = {}
+        for f, files in files_of.items():
+            for impl in self.impls:
+                if impl.type_name != name or impl.type_params:
+                    continue
+                if not self._type_sees(impl.source_file, name, files):
+                    continue
+                for method in impl.methods:
+                    other = owner.setdefault(method.name, f)
+                    if other != f:
+                        raise ImportError(
+                            f"Conflicting method symbol '{name}_{method.name}': "
+                            f"'{name}' of {other} and '{name}' of {f} both "
+                            f"define '{method.name}'")
+
+    def _file_type(self, item: rast.Item) -> None:
+        """Register a settled twin under the name it now has."""
+        if isinstance(item, rast.StructDef):
+            self.structs.setdefault(item.name, []).append(item)
+        elif isinstance(item, rast.EnumDef):
+            self.enums[item.name] = item
+            from_fn = getattr(item, 'from_fn', None)
+            if from_fn is not None:
+                self.functions.setdefault(from_fn.name, []).append(from_fn)
+        else:
+            self.type_aliases[item.name] = item
+
+    def _rename_type(self, name: str, new: str, files: Set[str]) -> None:
+        """`name` is `new` in every item declared by one of `files`: the
+        definition itself, its generated `E.from`, its impls, and every use
+        (AGAST #4609).  A use is a type (`NamedType`), a struct literal or
+        pattern, an impl's type, a `T.V` / `T.m()` qualifier or a pattern's.
+        A pub method keeps `name_m` as its symbol (`symbol_type`)."""
+        from_old, from_new = enum_from_name(name), enum_from_name(new)
+        items = self._all_items()
+        seen: Set[int] = set()
+        for item in items:
+            if getattr(item, 'source_file', None) not in files:
+                continue
+            if isinstance(item, (rast.StructDef, rast.EnumDef, rast.TypeAlias)) and item.name == name:
+                item.name = new
+            if isinstance(item, rast.ImplBlock) and item.type_name == name:
+                item.type_name = new
+                for method in item.methods:
+                    method.symbol_type = name
+            if (isinstance(item, rast.FnDef) and getattr(item, 'generated', False)
+                    and item.name == from_old):
+                item.name = from_new
+                fns = self.functions.get(from_old, [])
+                if item in fns:
+                    fns.remove(item)
+                    if not fns:
+                        del self.functions[from_old]
+                    self.functions.setdefault(from_new, []).append(item)
+            _rename_uses(item, name, new, seen)
+
     def _register_item(self, item: rast.Item, source_file: str):
         """Register an item, checking for duplicates."""
         # Track which file this item came from (for separate compilation)
@@ -1258,6 +1575,8 @@ class ImportResolver:
             # resolve_struct_variants decides that after target filtering.
             item_target = target_key(item)
             variants = self.structs.setdefault(item.name, [])
+            if self._twin_of(item, variants, source_file):
+                return
             for existing in variants:
                 if target_key(existing) != item_target:
                     continue
@@ -1266,6 +1585,7 @@ class ImportResolver:
                         f"Conflicting struct definition for '{item.name}': "
                         f"defined in both {existing.source_file} and {source_file}"
                     )
+                self._type_copies.setdefault(item.name, set()).add(source_file)
                 return
             variants.append(item)
 
@@ -1304,6 +1624,8 @@ class ImportResolver:
                 # are not compared: an import is seen through its interface.
                 # Two generated `E__from` fns come from enums _enums_equal has
                 # already found identical, so the first is kept.
+                if getattr(item, 'generated', False) and self._twin_of(item, [], source_file):
+                    return
                 for existing in self.functions[item.name]:
                     if target_key(existing) != (None, None):
                         continue
@@ -1373,7 +1695,9 @@ class ImportResolver:
             if item.name in self.enums:
                 existing = self.enums[item.name]
                 # Allow duplicate if identical definition
-                if not self._enums_equal(existing, item):
+                if self._enums_equal(existing, item):
+                    self._type_copies.setdefault(item.name, set()).add(source_file)
+                elif not self._twin_of(item, [existing], source_file):
                     raise ImportError(
                         f"Conflicting enum definition for '{item.name}': "
                         f"defined in both {source_file} and previous import"
@@ -1385,7 +1709,9 @@ class ImportResolver:
             if item.name in self.type_aliases:
                 existing = self.type_aliases[item.name]
                 # Allow duplicate if identical definition
-                if not self._type_aliases_equal(existing, item):
+                if self._type_aliases_equal(existing, item):
+                    self._type_copies.setdefault(item.name, set()).add(source_file)
+                elif not self._twin_of(item, [existing], source_file):
                     raise ImportError(
                         f"Conflicting type alias definition for '{item.name}': "
                         f"defined in both {source_file} and previous import"

@@ -39,6 +39,7 @@ struct VisName
     name: *u8
     len: i32
     fd: *FnDef        # the fn this name declares, else null (R54's private fn)
+    owner: *VisMod    # the module that declares it (AGAST #4609); null for a trait
     next: *VisName
 
 struct VisEdge
@@ -137,6 +138,7 @@ fn vis_new_name(name_sv: StrView, fd: *FnDef, rest: *VisName) -> *VisName
     n.name = name
     n.len = len
     n.fd = fd
+    n.owner = null
     n.next = rest
     n
 
@@ -144,12 +146,14 @@ fn vis_add_name(vm: *VisMod, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     vm.names = vis_new_name(StrView { ptr: (name), len: (len) as i64 }, null, vm.names)
+    vm.names.owner = vm
 
 # What `m` declares itself: call before its imports are merged into it.
 pub fn vis_names(vm: *VisMod, m: *Module)
     var f: *FnDef = m.functions
     while f != null
         vm.names = vis_new_name(StrView { ptr: (f.name), len: (f.name_len) as i64 }, f, vm.names)
+        vm.names.owner = vm
         f = f.next
     var s: *StructDef = m.structs
     while s != null
@@ -468,6 +472,36 @@ pub fn vis_sees(key: *u8, fd: *FnDef) -> i32
                 return 1
         e = e.next
     0
+
+# AGAST #4609 (LANGUAGE_SPEC §15.3): types follow the fn rule.  Is the type
+# `name` that the module `owner` declares in the namespace of the module
+# `vm`: declared there, or defined by one of its imports (declared, or `pub
+# import`ed, by the import's module)?
+pub fn vis_sees_def(vm: *VisMod, name_sv: StrView, owner: *VisMod) -> i32
+    if vm == owner
+        return 1
+    var e: *VisEdge = vm.edges
+    while e != null
+        let n: *VisName = vis_defined(e.target, StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+        if n != null and n.owner == owner
+            return 1
+        e = e.next
+    0
+
+# Is any declaration of `name` in the namespace of the module `vm`?
+pub fn vis_sees_name(vm: *VisMod, name_sv: StrView) -> i32
+    if vis_in_list(vm.names, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }) != null
+        return 1
+    var e: *VisEdge = vm.edges
+    while e != null
+        if vis_defined(e.target, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }) != null
+            return 1
+        e = e.next
+    0
+
+# Every module recorded, in no order: the closure's (AGAST #4609).
+pub fn vis_mods_head() -> *VisMod
+    g_vis_mods
 
 fn vis_eprint(p_sv: StrView)
     var p: *u8 = p_sv.ptr

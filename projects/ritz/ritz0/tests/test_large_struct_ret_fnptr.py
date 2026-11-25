@@ -205,7 +205,7 @@ pub fn main() -> i32
 def test_indexed_callee_survives_generic_clone(ritz1_bin, tmp_path):
     ll = _ll("ritz1", tmp_path, "generic_indexed", GENERIC_INDEXED)
     text = ll.read_text()
-    body = text.split("define linkonce_odr i32 @apply_indexed$i64(", 1)[1]
+    body = text.split("define internal i32 @apply_indexed$i64(", 1)[1]   # AGAST #4609
     body = body.split("\n}", 1)[0]
     assert re.search(r"call i32 %[\w.]+\(i32 ", body), body
     exe = tmp_path / "generic_indexed_ritz1"

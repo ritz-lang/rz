@@ -40,6 +40,7 @@ import impl_placement   # refuse_misplaced_impls (LARB R65, AGAST #3494)
 import generic_infer   # infer_generic_calls (AGAST #1982)
 import struct_index   # struct_index_errors (AGAST #1635)
 import struct_variants   # same-named struct conflicts (AGAST #4111)
+import type_twins     # types follow the fn rule (AGAST #4609)
 import binder_check   # binder_check_module (AGAST #2407)
 import type_name_check   # refuse_unknown_type_names (AGAST #3932)
 import named_variants   # named struct-variant forms (AGAST #4187)
@@ -242,6 +243,9 @@ fn add_enum_from_fns(ctx: *ParseCtx, m: *Module, path: *u8) -> i32
     var gf: *FnDef = gm.functions
     while gf != null
         gf.from_generated = 1
+        # AGAST #4609: every object that uses it defines its own copy (an
+        # import's too, its body kept by strip_to_interface), internal.
+        gf.is_local = 1
         gf = gf.next
     merge_module_into(m, gm)
     0
@@ -1154,6 +1158,10 @@ fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
     if text.len == 0 and iface_text_build(StrView { ptr: (src.data), len: (src.len - 1) }, tokens.data, tokens.len, @&made) == 0
         made_ok = true
 
+    # AGAST #4609: the twins this file sees, renamed for the second pass;
+    # after the interface text is made, which keeps the source's names.
+    twin_rename_tokens(ctx, path_ptr, tokens.data, tokens.len)
+
     # Name the file in parse diagnostics (AGAST #1301).
     parser_set_source_file(ctx, path_ptr)
     let mod: *Module = parse_tokens(ctx, @tokens)
@@ -1194,7 +1202,7 @@ fn load_and_parse(ctx: *ParseCtx, path: @&String) -> *Module
 # fns are is_local == 0 and emit as `declare`.  But monomorph's instantiation
 # collector and the emitter's enum-type scans walk EVERY body in the merged
 # module, so a body-only edit to an import used to change the importer's IR
-# (e.g. an extra linkonce_odr instantiation only the import itself needs).
+# (e.g. an extra internal instantiation only the import itself needs).
 #
 # So each import is cut down to its interface as it is loaded, with ritz0's
 # rule (ritz0/module_interface.py body_needed): every fn body is dropped
@@ -1223,7 +1231,9 @@ fn strip_to_interface(ctx: *ParseCtx, m: *Module)
         # A pub [[inline]] fn keeps its body too, as in the interface text:
         # an eligible one the importer defines available_externally, so -O2
         # can inline it (fn_inline_kept, fn_inline_import; AGAST #3585).
-        if f.type_params == null and f.body != null and f.is_async == 0 and fn_inline_kept(ctx, f) == 0
+        # A generated `E.from` keeps its body too: each object defines its own
+        # (AGAST #4609), as ritz0's body_needed keeps it.
+        if f.type_params == null and f.body != null and f.is_async == 0 and fn_inline_kept(ctx, f) == 0 and f.from_generated != 1
             f.body = body
         f = f.next
     var ib: *ImplBlock = m.impls
@@ -1603,7 +1613,7 @@ fn parse_program(ctx: *ParseCtx, tokens: *Vec<Token>, input_path: *u8, source_di
     # is_local=0). emit_fn uses the flag to decide define-vs-declare —
     # only local fns get a body, imports become extern declarations.
     # This is the core of modular emit: each .ll contains only the
-    # current file's bodies + linkonce_odr monomorph instantiations.
+    # current file's bodies + its own (internal) monomorph instantiations.
     # A declaration-only `fn ... = extern` (#1900) is defined in another
     # object: it stays is_local=0 and is declared as an import is.
     var local_fn: *FnDef = m.functions
@@ -1634,6 +1644,11 @@ fn parse_program(ctx: *ParseCtx, tokens: *Vec<Token>, input_path: *u8, source_di
         eprintln("Error: Import resolution failed")
         return null
     keep_one_fn(m)   # AGAST #1858: one of each name the input sees
+    # AGAST #4609: two definitions of one type name conflict only where a
+    # file sees both; a twin the input doesn't see is renamed by the second
+    # pass (main), so this pass's other checks see both under one name.
+    if type_twins_settle(ctx, m, input_path) < 0
+        return null
     # AGAST #4111: every struct of the closure is noted now, gated out or not.
     if struct_variants_check() < 0
         return null
@@ -1740,7 +1755,8 @@ pub fn main(argv: Span<StrView>) -> i32
     # AGAST #2167: likewise an array length naming a const the first pass
     # hadn't parsed yet (imported, or declared later): the second pass folds
     # it against every const the first one merged.
-    if type_alias_count(ctx) > 0 or array_len_pending(ctx) > 0
+    # AGAST #4609: likewise a twin type to rename (type_twins.ritz).
+    if type_alias_count(ctx) > 0 or array_len_pending(ctx) > 0 or twin_renames_pending(ctx) == 1
         array_len_seed(ctx, m.constants)
         processed_vec().clear()
         dep_record_reset()
@@ -1758,6 +1774,7 @@ pub fn main(argv: Span<StrView>) -> i32
         if m == null
             return 1
     let parse_end: i64 = if parse_only == 1 then now_nanos() else 0
+    twin_variant_views(ctx, m)   # AGAST #4609
 
     # RITZ1_PARSE_ONLY (AGAST #4379): the parse phase, alias second pass
     # included, is done; every phase after this point reads the AST.  Report
@@ -1853,6 +1870,14 @@ pub fn main(argv: Span<StrView>) -> i32
     emitter_set_source_file(args.input_path)   # AGAST #1813
     let emit_errors: i32 = emit_module(m, @ir, mono, freestanding)
     sema_probe_report()
+    # AGAST #4609: a renamed twin's methods under the `T_m` its object defines.
+    if twin_renames_pending(ctx) == 1
+        var fixed: String = twin_fix_ir_symbols(ctx, m, StrView { ptr: (ir.data), len: (ir.len as i64) })
+        ir.len = 0
+        var fi: i64 = 0
+        while fi < fixed.len()
+            ir.push(fixed.get(fi))
+            fi = fi + 1
 
     # AGAST #1369.  This return value was previously discarded, and it was a
     # hardcoded 0 anyway: an expression the emitter could not lower was written

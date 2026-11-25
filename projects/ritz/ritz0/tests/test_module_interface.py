@@ -534,7 +534,8 @@ class TestRitz1Compiler:
         """Kept bodies: generic fns and methods of generic impls."""
         _ritz1(proj / "main.ritz", tmp_path / "main.ll")
         ir = (tmp_path / "main.ll").read_text()
-        m = re.search(r"^define linkonce_odr i64 @%s\(.*?^}" % re.escape(sym),
+        # Each object's own copy (AGAST #4609).
+        m = re.search(r"^define internal i64 @%s\(.*?^}" % re.escape(sym),
                       ir, re.M | re.S)
         assert m, sym
         # The real body: returns a loaded value, not a placeholder.

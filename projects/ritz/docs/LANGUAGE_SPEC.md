@@ -6985,6 +6985,47 @@ fn main() -> i32
     area()
 ```
 
+Types follow the fn rule (AGAST #4609). A struct, enum or type alias conflicts
+with another of its name only in the namespace of a file that sees both: one
+that declares one and imports the other, or imports both, directly or by `pub
+import`. A type that a module reaches only through its own plain `import` is
+not in its importers' namespaces (§15.4), so it conflicts with nothing there.
+The two are two types, and each file's code means the one it sees. An identical
+repeat is one definition, not two. Here `ritzlib.box` imports `ritzlib.memory`,
+whose `Heap` this file never sees, so its own `Heap` builds:
+
+```ritz
+import ritzlib.box
+
+struct Heap
+    used: i64
+
+fn main() -> i32
+    let h = Heap { used: 0 }
+    h.used as i32
+```
+
+A file that imports `ritzlib.memory` sees both `Heap`s:
+
+```ritz expect-error="Conflicting struct definition for 'Heap'"
+import ritzlib.memory
+
+struct Heap
+    used: i64
+
+fn main() -> i32
+    0
+```
+
+A bare variant is judged over the enums its file sees. `Comment` is ambiguous
+only where two enums that the file sees both declare it, not because an enum
+some import uses privately declares one too. A method is the symbol `T_m`, so
+two types of one name in one program may not both have a method of one name,
+just as two `pub` fns of one name may not ("Conflicting method symbol
+'Box_get'"). A generic's instance is its own object's copy, and a generated
+`E.from` carries its enum's file in its symbol, so neither is shared between
+the two types.
+
 ### 15.4 Re-exports
 
 ```ritz

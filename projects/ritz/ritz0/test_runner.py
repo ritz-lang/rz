@@ -792,7 +792,8 @@ def build_runner_objects(tmpdir: str, ll_cache: dict, test_modules=(),
     none of them can clash with the program.
 
     Weak definitions stay global because they are COMDAT groups
-    (`linkonce_odr`), and two objects may hold the same group: the runner's
+    (`weak_odr`: a generated `E.from`; a generic's instance was
+    `linkonce_odr` until AGAST #4609 made it internal), and two objects may hold the same group: the runner's
     copy and the shared dependency's. The final link keeps one and discards
     the other, but a reference from the runner's merged `.text` can only
     reach the survivor if the name is global. Localized, the reference points
@@ -852,7 +853,7 @@ def _keep_global_symbols(obj: str) -> Tuple[List[str], Optional[str]]:
     """`main` plus every weak symbol `obj` defines: the names objcopy keeps
     global in the merged runner (see build_runner_objects).
 
-    A `linkonce_odr` instantiation is WEAK in its object; one that LLVM
+    An ODR (`weak_odr`) definition is WEAK in its object; one that LLVM
     inlines away leaves no symbol at all. Reading the list from the merged
     object rather than naming the generic functions keeps this independent
     of which ones the optimiser decided to keep.

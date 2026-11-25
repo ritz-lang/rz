@@ -357,11 +357,12 @@ def test_identical_enum_from_in_two_modules_runs(compiler, tmp_path):
 
 
 @pytest.mark.integration
-def test_ritz0_generated_from_weak_user_fn_strong(tmp_path):
-    """ritz0 (#2160): only the generated fn is weak_odr; user fns stay strong.
+def test_ritz0_generated_from_internal_user_fn_strong(tmp_path):
+    """ritz0: the generated fn is the object's own; user fns stay strong.
 
-    weak_odr, not linkonce_odr: an importer may only declare `E__from`, so
-    the definition must survive even where its own module does not call it.
+    It was weak_odr (#2160), one body kept for every enum of its name; since
+    AGAST #4609 every object that uses `E__from` defines its own, internal,
+    as an instance is: two files' enums `Color` each have one.
     """
     _write(tmp_path, {"ma": ENUM + "pub fn fa() -> i32\n    Color.Red as i32\n"})
     proc, ll = _compile("ritz0", tmp_path, "ma")
@@ -373,7 +374,7 @@ def test_ritz0_generated_from_weak_user_fn_strong(tmp_path):
         assert len(hits) == 1, (name, defs)
         return hits[0]
 
-    assert define("Color__from").startswith("define weak_odr "), defs
+    assert define("Color__from").startswith("define internal "), defs
     fa = define("fa")
     assert not any(w in fa for w in ("weak", "linkonce", "internal")), fa
 

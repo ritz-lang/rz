@@ -5,7 +5,7 @@ closure. An imported module only contributes *declarations* to the
 importer's IR, though: `emitter_llvmlite._should_emit_body` emits bodies for
 the current file only. The exceptions are bodies the importer instantiates
 itself -- generic fns and methods of generic impls (monomorphised locally,
-`linkonce_odr`) and async fns (state-machine transform runs on the merged
+each object's own `internal` copy, AGAST #4609) and async fns (state-machine transform runs on the merged
 module).
 
 So an imported module is loaded as its *interface*: the parsed module with
@@ -162,6 +162,10 @@ def parse_source_tokens(source: str, path: str) -> Tuple[list, rast.Module]:
 def body_needed(fn: rast.FnDef, impl: Optional[rast.ImplBlock] = None) -> bool:
     """Does an importer need this fn's body? See the module docstring."""
     if fn.type_params or getattr(fn, "is_async", False):
+        return True
+    # A generated `E.from` (§10.4): each object that uses it defines its own
+    # internal copy (AGAST #4609), so the importer needs its body.
+    if getattr(fn, "generated", False):
         return True
     if impl is None and inline_kept(fn):
         return True

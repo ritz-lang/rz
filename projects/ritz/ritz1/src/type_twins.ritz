@@ -1,0 +1,460 @@
+# type_twins.ritz - types follow the fn rule (AGAST #4609)
+#
+# LANGUAGE_SPEC §15.3: two structs, enums or type aliases of one name
+# conflict only in the namespace of a file that sees both -- one that
+# declares one and imports the other, or imports both, directly or by `pub
+# import`.  A type reached only through another module's plain import is not
+# in the importer's namespace, so it conflicts with nothing there.  ritz0's
+# rule is import_resolver.py `_settle_type_twins`; this is the same, in
+# ritz1's terms:
+#
+#   - The parser notes every type it parses (struct_variants.ritz
+#     type_note), with its file and a hash of its tokens; identical repeats
+#     are one definition.  Once the closure is resolved, type_twins_settle
+#     asks every module of it (import_vis.ritz) which definitions it sees.
+#     One that sees two is an error, in ritz0's words.
+#   - Otherwise the definition the input sees keeps its name, and every
+#     other is renamed `Name__<file hash>` in the files that see it: the
+#     driver parses everything again (main.ritz, as for #1475's aliases),
+#     and load_and_parse renames the tokens (twin_rename_tokens).  One
+#     merged module then holds both, as ritz0's does.
+#   - A method is the symbol `T_m`, so twins may not both have a method of
+#     one name (as two `pub fn`s of one name may not).  A renamed twin's
+#     methods keep the `T_m` its own object defines (twin_fix_ir_symbols).
+#   - Bare-variant ambiguity is judged over the enums a file sees
+#     (twin_variant_views; ast_helpers enum_of_variant_unique).
+#
+# The renames and views live on the ParseCtx (ast.ritz TwinRename,
+# VariantView).  A module is its import_vis VisMod: one per canonical path,
+# so two modules are the same when their VisMods are.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.string
+import ritzlib.gvec
+import ritzlib.hash
+
+import ast
+import ast_helpers       # variant_view_add / variant_views_reset
+import diag              # diag_fn_source_file
+import tokens_gen
+import struct_variants   # type_note_count / type_note_at
+import import_vis        # vis_module, vis_sees_def, vis_sees_name
+import fn_cache          # push_canonical_path
+
+const TT_MAX_GROUPS: i32 = 16
+
+# 1 once the first pass found twins to rename: the driver parses again.
+pub fn twin_renames_pending(ctx: *ParseCtx) -> i32
+    if ctx.twin_renames.len > 0
+        return 1
+    0
+
+# The canonical path of `path`, as main.ritz import_key and every VisMod key.
+fn tt_key(path: *u8) -> String
+    var key: String = string_new()
+    if push_canonical_path(@key, path) == 0
+        key.push_cstr(path)
+    key
+
+# The module of the file at `path`.
+fn tt_mod(path: *u8) -> *VisMod
+    var key: String = tt_key(path)
+    vis_module(key.as_ptr())
+
+# A view of `s`'s bytes that outlives it: the compiler runs once per process,
+# and a renamed token points at it.
+fn tt_keep(s: @&String) -> StrView
+    let v: StrView = s.as_view()
+    s.data.data = null
+    s.data.len = 0
+    s.data.cap = 0
+    v
+
+fn tt_name(n: *StructVariant) -> StrView
+    StrView { ptr: (n.name), len: (n.name_len) as i64 }
+
+fn tt_same_name(a: *StructVariant, b: *StructVariant) -> i32
+    if a.kind == b.kind and tt_name(a).eq(tt_name(b))
+        return 1
+    0
+
+fn tt_kind_word(kind: i32) -> StrView
+    if kind == TYPE_NOTE_ENUM
+        return "enum"
+    if kind == TYPE_NOTE_ALIAS
+        return "type alias"
+    "struct"
+
+# The notes of one type name, grouped by definition: a note from the module
+# mods[k] is in group grp[k]; group g's first note is first[g].
+struct TwinSet
+    grp: Vec<i32>
+    mods: Vec<*VisMod>
+    groups: i32
+    first: [16]i64
+
+# 1 if the module `vm` sees group `g` of `ts`.
+fn tt_sees(ts: *TwinSet, vm: *VisMod, name_sv: StrView, g: i32) -> i32
+    var k: i64 = 0
+    while k < ts.grp.len
+        if ts.grp.get(k) == g and vis_sees_def(vm, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, ts.mods.get(k)) == 1
+            return 1
+        k = k + 1
+    0
+
+# The first group the module `vm` sees, or -1.
+fn tt_seen_group(ts: *TwinSet, vm: *VisMod, name_sv: StrView) -> i32
+    var g: i32 = 0
+    while g < ts.groups
+        if tt_sees(ts, vm, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, g) == 1
+            return g
+        g = g + 1
+    0 - 1
+
+fn tt_group_file(ts: *TwinSet, g: i32) -> *u8
+    type_note_at(ts.first[g]).file
+
+fn tt_report(kind: i32, name_sv: StrView, a: *u8, b: *u8, seer: *VisMod)
+    var msg: String = string_from("Error: Conflicting ")
+    msg.push_str(tt_kind_word(kind))
+    msg.push_str(" definition for '")
+    msg.push_str(StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+    msg.push_str("': defined in both ")
+    msg.push_cstr(a)
+    msg.push_str(" and ")
+    msg.push_cstr(b)
+    if seer != null
+        msg.push_str("; ")
+        msg.push_cstr(seer.key)
+        msg.push_str(" sees both")
+    eprintln_string(@msg)
+
+fn tt_impl_of(ib: *ImplBlock, name_sv: StrView) -> bool
+    ib.type_params == null and StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }.eq(StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+
+# The group an impl of `name` belongs to: the one its file sees, or -1.
+fn tt_impl_group(ts: *TwinSet, ib: *ImplBlock, name_sv: StrView, main_path: *u8) -> i32
+    var file: *u8 = ib.def_file
+    if file == null
+        file = main_path
+    tt_seen_group(ts, tt_mod(file), StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+
+# Another group than `g` whose impls of `name` define a method named as
+# `meth`, or -1.
+fn tt_method_owner(ts: *TwinSet, m: *Module, name_sv: StrView, meth: *FnDef, g: i32, main_path: *u8) -> i32
+    let mname: StrView = StrView { ptr: (meth.name), len: (meth.name_len) as i64 }
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if tt_impl_of(ib, StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+            let h: i32 = tt_impl_group(ts, ib, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, main_path)
+            if h >= 0 and h != g
+                var other: *FnDef = ib.methods
+                while other != null
+                    if StrView { ptr: (other.name), len: (other.name_len) as i64 }.eq(StrView { ptr: (mname.ptr), len: (mname.len) })
+                        return h
+                    other = other.next
+        ib = ib.next
+    0 - 1
+
+# A method of `name` that two groups' impls both define: ritz0's
+# `_refuse_shared_methods`.  -1 once reported.
+fn tt_refuse_shared_methods(ts: *TwinSet, m: *Module, name_sv: StrView, main_path: *u8) -> i32
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if tt_impl_of(ib, StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+            let g: i32 = tt_impl_group(ts, ib, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, main_path)
+            if g >= 0
+                var meth: *FnDef = ib.methods
+                while meth != null
+                    let h: i32 = tt_method_owner(ts, m, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, meth, g, main_path)
+                    if h >= 0
+                        let mname: StrView = StrView { ptr: (meth.name), len: (meth.name_len) as i64 }
+                        var msg: String = string_from("Error: Conflicting method symbol '")
+                        msg.push_str(StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+                        msg.push('_')
+                        msg.push_str(StrView { ptr: (mname.ptr), len: (mname.len) })
+                        msg.push_str("': '")
+                        msg.push_str(StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+                        msg.push_str("' of ")
+                        msg.push_cstr(tt_group_file(ts, h))
+                        msg.push_str(" and '")
+                        msg.push_str(StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+                        msg.push_str("' of ")
+                        msg.push_cstr(tt_group_file(ts, g))
+                        msg.push_str(" both define '")
+                        msg.push_str(StrView { ptr: (mname.ptr), len: (mname.len) })
+                        msg.push_str("'")
+                        eprintln_string(@msg)
+                        return 0 - 1
+                    meth = meth.next
+        ib = ib.next
+    0
+
+# `name` renamed for group `g`: `Name__<hash of its file's canonical path>`.
+fn tt_new_name(ts: *TwinSet, name_sv: StrView, g: i32) -> StrView
+    var key: String = tt_key(tt_group_file(ts, g))
+    let h: u64 = fnv1a_str(Span<u8> { ptr: (key.as_ptr()), len: (key.len()) })
+    var out: String = string_new()
+    out.push_str(StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+    out.push_str("__")
+    var hex: String = String.from_hex(h)
+    out.push_string(@hex)
+    tt_keep(@&out)
+
+# Settle the definitions of the name noted at `i`.  -1 once reported.
+fn tt_settle_name(ctx: *ParseCtx, m: *Module, i: i64, main_path: *u8) -> i32
+    let a: *StructVariant = type_note_at(i)
+    let name_sv: StrView = tt_name(a)
+    let n: i64 = type_note_count()
+    var ts: TwinSet
+    ts.grp = vec_new<i32>()
+    ts.mods = vec_new<*VisMod>()
+    ts.groups = 0
+    var j: i64 = i
+    while j < n
+        let b: *StructVariant = type_note_at(j)
+        if b.exists == 1 and tt_same_name(a, b) == 1 and b.file != null
+            var g: i32 = 0
+            while g < ts.groups and type_note_at(ts.first[g]).body != b.body
+                g = g + 1
+            if g == ts.groups
+                if ts.groups == TT_MAX_GROUPS
+                    eprintln("Error: ritz1: too many definitions of one type name (AGAST #4609)")
+                    return 0 - 1
+                ts.first[g] = j
+                ts.groups = ts.groups + 1
+            ts.grp.push(g)
+            ts.mods.push(tt_mod(b.file))
+        j = j + 1
+    if ts.groups < 2
+        return 0
+    # Two definitions in one file are that file's error, not twins.
+    var files: i32 = 0
+    var k: i64 = 1
+    while k < ts.mods.len
+        if ts.mods.get(k) != ts.mods.get(0)
+            files = 1
+        k = k + 1
+    if files == 0
+        return 0
+    # Every module of the closure sees at most one.
+    var vm: *VisMod = vis_mods_head()
+    while vm != null
+        var seen_a: i32 = 0 - 1
+        var g2: i32 = 0
+        while g2 < ts.groups
+            if tt_sees(@ts, vm, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, g2) == 1
+                if seen_a >= 0
+                    let fa: *u8 = tt_group_file(@ts, seen_a)
+                    let fb: *u8 = tt_group_file(@ts, g2)
+                    var seer: *VisMod = vm
+                    if tt_mod(fa) == vm or tt_mod(fb) == vm
+                        seer = null
+                    tt_report(a.kind, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, fa, fb, seer)
+                    return 0 - 1
+                seen_a = g2
+            g2 = g2 + 1
+        vm = vm.next
+    if a.kind == TYPE_NOTE_STRUCT or a.kind == TYPE_NOTE_ENUM
+        if tt_refuse_shared_methods(@ts, m, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, main_path) < 0
+            return 0 - 1
+    # The input's keeps its name; each other is renamed where it is seen.
+    let own: i32 = tt_seen_group(@ts, tt_mod(main_path), StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+    var g3: i32 = 0
+    while g3 < ts.groups
+        if g3 != own
+            let new_name: StrView = tt_new_name(@ts, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, g3)
+            var vm2: *VisMod = vis_mods_head()
+            while vm2 != null
+                if tt_sees(@ts, vm2, StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, g3) == 1
+                    ctx.twin_renames.push(TwinRename { name: StrView { ptr: (name_sv.ptr), len: (name_sv.len) }, new_name: StrView { ptr: (new_name.ptr), len: (new_name.len) }, seer: vm2.key })
+                vm2 = vm2.next
+        g3 = g3 + 1
+    0
+
+# After the closure of `main_path` is resolved (parse_program).  Nothing on
+# the second pass: its names are the renamed ones.  -1 once reported.
+pub fn type_twins_settle(ctx: *ParseCtx, m: *Module, main_path: *u8) -> i32
+    if ctx.twin_renames.len > 0
+        return 0
+    let n: i64 = type_note_count()
+    var i: i64 = 0
+    while i < n
+        let a: *StructVariant = type_note_at(i)
+        var first: i32 = a.exists
+        var j: i64 = 0
+        while first == 1 and j < i
+            let b: *StructVariant = type_note_at(j)
+            if b.exists == 1 and tt_same_name(a, b) == 1
+                first = 0
+            j = j + 1
+        if first == 1
+            if tt_settle_name(ctx, m, i, main_path) < 0
+                return 0 - 1
+        i = i + 1
+    0
+
+# The rename of token `t` in the module whose key is `seer`, or null.
+fn tt_rename_of(ctx: *ParseCtx, seer: *u8, t: *Token) -> *TwinRename
+    var i: i64 = 0
+    while i < ctx.twin_renames.len
+        let r: *TwinRename = ctx.twin_renames.get_ptr(i)
+        if r.seer == seer and StrView { ptr: (r.name.ptr), len: (r.name.len) }.eq(StrView { ptr: (t.start), len: (t.len) as i64 })
+            return r
+        i = i + 1
+    null
+
+# Rename the twins the file at `path` sees in its tokens, before it is parsed
+# (load_and_parse).  A name is a type's wherever it is written except after
+# a `.` (a field, a method, a variant), as a variant's name in an enum's
+# body, and in an import's list (R54 reads that as written).
+pub fn twin_rename_tokens(ctx: *ParseCtx, path: *u8, toks: *Token, count: i64)
+    if ctx.twin_renames.len == 0
+        return
+    let seer: *u8 = tt_mod(path).key
+    var enum_depth: i32 = 0
+    var enum_pending: i32 = 0
+    var in_import: i32 = 0
+    var prev: i32 = TOK_NEWLINE
+    var i: i64 = 0
+    while i < count
+        let t: *Token = toks + i
+        let kind: i32 = t.kind
+        if kind == TOK_ENUM and enum_depth == 0
+            enum_pending = 1
+        else if kind == TOK_INDENT
+            if enum_pending == 1
+                enum_depth = 1
+                enum_pending = 0
+            else if enum_depth > 0
+                enum_depth = enum_depth + 1
+        else if kind == TOK_DEDENT and enum_depth > 0
+            enum_depth = enum_depth - 1
+        else if kind == TOK_IMPORT
+            in_import = 1
+        else if kind == TOK_NEWLINE
+            in_import = 0
+        else if kind == TOK_IDENT and in_import == 0 and prev != TOK_DOT
+            let variant_decl: bool = enum_depth == 1 and (prev == TOK_NEWLINE or prev == TOK_INDENT or prev == TOK_DEDENT)
+            if variant_decl == false
+                let r: *TwinRename = tt_rename_of(ctx, seer, t)
+                if r != null
+                    t.start = r.new_name.ptr
+                    t.len = r.new_name.len as i32
+        prev = kind
+        i = i + 1
+
+# 1 if `ir[at..]` is the whole name of a method of an impl of the renamed
+# type `r` names (not a generated `E.from`, `Tag__<hash>__from`).
+fn tt_method_at(m: *Module, r: *TwinRename, ir: StrView, at: i64) -> i32
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if StrView { ptr: (ib.type_name), len: (ib.type_name_len) as i64 }.eq(StrView { ptr: (r.new_name.ptr), len: (r.new_name.len) })
+            var meth: *FnDef = ib.methods
+            while meth != null
+                let end: i64 = at + (meth.name_len as i64)
+                if end <= ir.len and ir.slice(at, end).eq(StrView { ptr: (meth.name), len: (meth.name_len) as i64 })
+                    if end == ir.len or ir.get(end) == '(' or ir.get(end) == '"' or ir.get(end) == ' '
+                        return 1
+                meth = meth.next
+        ib = ib.next
+    0
+
+# The IR with a renamed twin's methods under the `T_m` symbols its own
+# object defines (`@Box__<hash>_get` -> `@Box_get`, quoted or not), as
+# ritz0's `symbol_type`.  Its methods are never defined here: they are its
+# own file's, where it keeps its name.
+pub fn twin_fix_ir_symbols(ctx: *ParseCtx, m: *Module, ir: StrView) -> String
+    var out: String = string_new()
+    var i: i64 = 0
+    while i < ir.len
+        var done: i32 = 0
+        if ir.get(i) == '@'
+            var q: i64 = 1
+            if i + 1 < ir.len and ir.get(i + 1) == '"'
+                q = 2
+            var k: i64 = 0
+            while k < ctx.twin_renames.len and done == 0
+                let r: *TwinRename = ctx.twin_renames.get_ptr(k)
+                let after: i64 = i + q + r.new_name.len
+                if after < ir.len and ir.slice(i + q, after).eq(StrView { ptr: (r.new_name.ptr), len: (r.new_name.len) }) and ir.get(after) == '_' and tt_method_at(m, r, StrView { ptr: (ir.ptr), len: (ir.len) }, after + 1) == 1
+                    out.push_str(ir.slice(i, i + q))
+                    out.push_str(StrView { ptr: (r.name.ptr), len: (r.name.len) })
+                    i = after
+                    done = 1
+                k = k + 1
+        if done == 0
+            out.push(ir.get(i))
+            i = i + 1
+    out
+
+# 1 if `o` declares a variant named as `v`.
+fn tt_declares(o: *EnumDef, v: *EnumVariant) -> i32
+    var w: *EnumVariant = o.variants
+    while w != null
+        if StrView { ptr: (w.name), len: (w.name_len) as i64 }.eq(StrView { ptr: (v.name), len: (v.name_len) as i64 })
+            return 1
+        w = w.next
+    0
+
+# 1 if another non-generic enum than `e` declares one of `e`'s variants.
+fn tt_shares_variant(m: *Module, e: *EnumDef) -> i32
+    var v: *EnumVariant = e.variants
+    while v != null
+        var o: *EnumDef = m.enums
+        while o != null
+            if o.generic == 0 and StrView { ptr: (o.name), len: (o.name_len) as i64 }.eq(StrView { ptr: (e.name), len: (e.name_len) as i64 }) == false
+                if tt_declares(o, v) == 1
+                    return 1
+            o = o.next
+        v = v.next
+    0
+
+fn tt_view_site(ctx: *ParseCtx, m: *Module, site: *u8)
+    let vm: *VisMod = tt_mod(site)
+    var e: *EnumDef = m.enums
+    while e != null
+        if e.generic == 0 and tt_shares_variant(m, e) == 1
+            variant_view_add(ctx, site, e, vis_sees_name(vm, StrView { ptr: (e.name), len: (e.name_len) as i64 }))
+        e = e.next
+
+# tt_view_site, once per file (`done`: the sites already viewed).
+fn tt_site_once(ctx: *ParseCtx, m: *Module, done: @&Vec<*u8>, site: *u8)
+    var i: i64 = 0
+    while i < done.len
+        if done.get(i) == site
+            return
+        i = i + 1
+    done.push(site)
+    tt_view_site(ctx, m, site)
+
+# Bare-variant ambiguity is judged over the enums a file sees (AGAST #4609):
+# for every file whose fns this compile checks or emits, which of the enums
+# sharing a variant name it sees (ast_helpers enum_of_variant_unique).  A
+# site is a fn's diag_fn_source_file, as the emitter and Sema set it.
+pub fn twin_variant_views(ctx: *ParseCtx, m: *Module)
+    variant_views_reset(ctx)
+    var shared: i32 = 0
+    var e: *EnumDef = m.enums
+    while e != null and shared == 0
+        if e.generic == 0
+            shared = tt_shares_variant(m, e)
+        e = e.next
+    if shared == 0
+        return
+    var done: Vec<*u8> = vec_new<*u8>()
+    var f: *FnDef = m.functions
+    while f != null
+        tt_site_once(ctx, m, @&done, diag_fn_source_file(f))
+        f = f.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var meth: *FnDef = ib.methods
+        while meth != null
+            tt_site_once(ctx, m, @&done, diag_fn_source_file(meth))
+            meth = meth.next
+        ib = ib.next

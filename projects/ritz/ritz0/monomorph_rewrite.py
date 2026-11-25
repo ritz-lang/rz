@@ -143,6 +143,10 @@ class MonoRewriteMixin:
         # the emitter gives it weak_odr linkage by this mark (#2160).
         if getattr(fn, 'generated', False):
             new_fn.generated = True
+        # A twin type's symbols (AGAST #4609, import_resolver._rename_type).
+        for attr in ('symbol_type',):
+            if hasattr(fn, attr):
+                setattr(new_fn, attr, getattr(fn, attr))
         return new_fn
 
     def _rewrite_type(self, ty: rast.Type) -> rast.Type:

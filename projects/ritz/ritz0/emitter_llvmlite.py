@@ -609,6 +609,11 @@ def defines_body(item: rast.Item, source_file: Optional[str],
     # declared exactly as an imported definition is.
     if getattr(item, 'is_decl', False):
         return False
+    # A generated `E.from` (§10.4) is every object's own, as an instance is
+    # (AGAST #4609): two files' enums `E` each generate one, and one symbol
+    # for both handed one file's discriminants to the other.
+    if getattr(item, 'generated', False) and source_file is not None:
+        return getattr(item, 'name', None) not in cached_fn_names
     # If no source file tracking, emit all bodies (legacy behavior)
     if source_file is None:
         return True
@@ -5589,7 +5594,8 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         # that module's object (AGAST #3906).  Moving the symbol keeps the
         # call resolvable.  Methods are not mangled: a trait impl's method is
         # called from other objects without `pub` (Drop's drop at another
-        # file's scope end), and `T_m` cannot clash.
+        # file's scope end), and `T_m` cannot clash: two types of one name
+        # may not both define `m` (AGAST #4609, _refuse_shared_methods).
         is_pub = fn_def.is_pub or getattr(
             getattr(fn_def, 'declared_method', None), 'is_pub', False)
         #
@@ -5605,6 +5611,12 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
             fn.linkage = 'internal'
         elif self._private_free(fn_def, is_pub):
             fn.name = self._symbol_name(fn_def)
+        # AGAST #4609: a twin type renamed in this module (`Box__<hash>`,
+        # import_resolver._settle_type_twins) keeps its methods' `Box_m`
+        # symbols, which its own object defines.
+        symbol_type = getattr(getattr(fn_def, 'declared_method', None), 'symbol_type', None)
+        if symbol_type is not None:
+            fn.name = f"{symbol_type}_{fn_def.declared_method.name}"
 
         # Create DISubprogram for debug info (only for functions we'll define, not declarations)
         if self.emit_debug and self.di_file and self._should_emit_body(fn_def):
@@ -5729,18 +5741,19 @@ class LLVMEmitter(calls.CallEmitter, stmts.StmtEmitter, exprs.ExprEmitter,
         fn, _ = self.functions[fn_def.name]
         ret_type = self._ritz_type_to_llvm(fn_def.ret_type) if fn_def.ret_type else self.i32
 
-        # Set linkage for monomorphized functions to avoid duplicate symbol errors
-        # linkonce_odr means: keep one copy, merge duplicates (One Definition Rule)
+        # A generic's instance is emitted in every object that uses it, so
+        # each object's copy is its own: internal (AGAST #4609).  It was
+        # linkonce_odr, one copy kept for the program, but its name says
+        # only which type *name* it is for: two types `Box` of two files
+        # (§15.3) each have a `pick$Box`, and the linker kept one for both.
         if getattr(fn_def, 'is_monomorphized', False):
-            fn.linkage = 'linkonce_odr'
+            fn.linkage = 'internal'
         # A compiler-generated fn (`E.from`, LANGUAGE_SPEC §10.4) is defined
-        # in every module that declares or imports E, so two objects may each
-        # carry an identical copy (#2160).  weak_odr (as ritz1 emits) merges
-        # them; unlike linkonce_odr it is never dropped as unused, since an
-        # object that only declares `E__from` may rely on this definition.
-        # An internal (non-pub, runtime-linked) copy has no symbol to clash.
-        elif getattr(fn_def, 'generated', False) and fn.linkage in ('', 'external'):
-            fn.linkage = 'weak_odr'
+        # in every module that declares or imports E (defines_body): each
+        # object's own copy, internal, as an instance's (AGAST #4609).  It
+        # was weak_odr (#2160), one body kept for every enum of its name.
+        elif getattr(fn_def, 'generated', False):
+            fn.linkage = 'internal'
 
         self.current_fn = fn
 

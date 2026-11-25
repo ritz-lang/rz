@@ -356,6 +356,7 @@ empty. A note that belongs to a move goes on that check's own entry.
   hash of its tokens; after imports resolve, two differing definitions that
   always coexist (no gate, or one target), or a gated one beside an ungated
   one on its own target, are "Conflicting struct definition" as in ritz0.
+  Two files' are twins, `type_twins`'s; enums and aliases are noted for it.
 
 - `tail_value` — a `-> T` fn must not reach its end without a value. Its
   divergence walk (`tail_stmts_diverge`) is also read by `reachability` and
@@ -370,6 +371,13 @@ empty. A note that belongs to a move goes on that check's own entry.
 - `type_name_check` — a written type name must name a type: "unknown type
   `Nope`" at the name (#3932). Run by main over the whole module before
   monomorphisation; `type_named` records where each name was written.
+
+- `type_twins` — types follow the fn rule (§15.3, #4609): two definitions of
+  one struct, enum or alias name conflict only in a module that sees both
+  (`import_vis`), in ritz0's words; otherwise the one the input doesn't see
+  is renamed `Name__<hash>` by the second parse pass in the files that see
+  it, its methods keep their `T_m` symbols, and a bare variant is judged over
+  the enums its file sees.
 
 - `wrapping` — `+%` / `-%` / `*%` wrap an integer: a float or a pointer
   operand is refused where the source wrote the operation (LARB R63, §7.1,

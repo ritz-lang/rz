@@ -4864,6 +4864,7 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
         *(p.ctx.alias_table + p.ctx.alias_count) = e as *u8
         p.ctx.alias_count = p.ctx.alias_count + 1
     type_decl_log(p.ctx, StrView { ptr: (name), len: (len) as i64 })   # AGAST #3907: a redeclaration too
+    type_note(p.tokens, p.pos, StrView { ptr: (name), len: (len) as i64 }, parse_file_copy_shared(p), 0, 1, TYPE_NOTE_ALIAS)   # AGAST #4609
     # The alias table is process-wide (it must outlive this Parser's arena), so
     # it keeps the flat snapshot, and type_alias_resolve rebuilds a *TypeRef
     # from it.  Nothing is latched on the Parser any more (#4035).
@@ -9374,6 +9375,9 @@ pub fn enum_def_end(p: *Parser, is_pub: i32) -> i32
     let e: *EnumDef = enum_cur(p)
     if e != null
         e.is_pub = is_pub
+        # AGAST #4609: noted for type_twins.ritz, as structs are.
+        if p.skip_item == 0
+            type_note(p.tokens, p.pos, StrView { ptr: (e.name), len: (e.name_len) as i64 }, parse_file_copy_shared(p), 0, 1, TYPE_NOTE_ENUM)
     return 0
 
 # ============================================================================
@@ -10167,6 +10171,56 @@ fn enum_variant_slot_node(e: *EnumDef, name_sv: StrView) -> i32
 # names the same two; declaration order differs between the compilers across
 # imports).  -1 when no enum declares the name.  Otherwise the enum index,
 # with *out_vi the variant's tag.
+# AGAST #4609 (LANGUAGE_SPEC §15.3): bare-variant ambiguity is judged over
+# the enums the use's file sees.  The merged program holds every enum of the
+# closure, so where a variant two enums declare is used, the file of the fn
+# being checked or emitted (variant_site_set) is asked which it sees: one
+# seen alone is the variant's enum, as ritz0's `_qualify_seen_variants`
+# writes it qualified.  type_twins.ritz fills the table, only for the enums
+# that share a variant name; with none, nothing is filtered.
+pub fn variant_view_add(ctx: *ParseCtx, site: *u8, e: *EnumDef, seen: i32)
+    ctx.variant_views.push(VariantView { site: site, e: e, seen: seen })
+
+pub fn variant_views_reset(ctx: *ParseCtx)
+    ctx.variant_views.len = 0
+
+pub fn variant_site_set(ctx: *ParseCtx, site: *u8)
+    ctx.variant_site = site
+
+fn variant_seen_at_site(ctx: *ParseCtx, e: *EnumDef) -> i32
+    if ctx.variant_site == null
+        return 1
+    var i: i64 = 0
+    while i < ctx.variant_views.len
+        let v: *VariantView = ctx.variant_views.get_ptr(i)
+        if v.e == e and v.site == ctx.variant_site
+            return v.seen
+        i = i + 1
+    1
+
+# The one enum the use's file sees of those declaring `name`: its index, the
+# variant's in *out_vi; -1 if it sees none or several.
+fn enum_of_variant_seen(ctx: *ParseCtx, name_sv: StrView, out_vi: *i32) -> i32
+    var found: *EnumDef = null
+    var found_i: i32 = 0 - 1
+    var found_vi: i32 = 0 - 1
+    var e: *EnumDef = ctx.program_enums
+    var ei: i32 = 0
+    while e != null
+        if e.generic == 0 and variant_seen_at_site(ctx, e) == 1
+            let vi: i32 = enum_variant_slot_node(e, StrView { ptr: (name_sv.ptr), len: (name_sv.len) })
+            if vi >= 0
+                if found != null and enum_name_eq(found, StrView { ptr: (e.name), len: (e.name_len) as i64 }) == 0
+                    return 0 - 1
+                if found == null
+                    found = e
+                    found_i = ei
+                    found_vi = vi
+        e = e.next
+        ei = ei + 1
+    *out_vi = found_vi
+    found_i
+
 pub fn enum_of_variant_unique(ctx: *ParseCtx, name_sv: StrView, out_vi: *i32, out_other: *i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
@@ -10208,6 +10262,12 @@ pub fn enum_of_variant_unique(ctx: *ParseCtx, name_sv: StrView, out_vi: *i32, ou
                         hi_i = ei
         e = e.next
         ei = ei + 1
+    if hi != null and ctx.variant_views.len > 0
+        var seen_vi: i32 = 0 - 1
+        let seen_i: i32 = enum_of_variant_seen(ctx, StrView { ptr: (name), len: (len) as i64 }, @seen_vi)
+        if seen_i >= 0
+            *out_vi = seen_vi
+            return seen_i
     if hi != null
         *out_vi = lo_i
         *out_other = hi_i

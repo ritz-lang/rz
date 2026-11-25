@@ -7,7 +7,9 @@ silently called the other's body.
 
 The rule: a private *free* fn is an external `define` whose symbol carries its
 defining file's hash (`priv_fn__1a2b3c4d`, #1858/#4356), a `pub fn` an external
-`define`, `main` external, a monomorph (`$` in its name) `linkonce_odr`. An
+`define`, `main` external, a monomorph (`$` in its name) `internal` (each
+object's own copy, AGAST #4609: two types `Box` of two files each have a
+`pick$Box`, and a `linkonce_odr` copy served both). An
 inherent impl method stays `internal` (it can only be called through its
 type's module); a trait impl's methods are external. Only the module that
 declares the impl defines them.
@@ -134,7 +136,7 @@ ROWS = {
     "private_fn": ("priv_fn", "define i32 "),
     "pub_fn": ("pub_fn", "define i32 "),
     "main": ("main", "define i32 "),
-    "monomorph": ("ident$i32", "define linkonce_odr "),
+    "monomorph": ("ident$i32", "define internal "),   # AGAST #4609
     "private_method": ("P_priv_m", "define internal "),
     "pub_method": ("P_pub_m", "define i32 "),
     # A trait impl's method is reached through the trait, wherever the

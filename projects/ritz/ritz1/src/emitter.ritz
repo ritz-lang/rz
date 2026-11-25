@@ -593,12 +593,31 @@ fn tag_intrinsic_target_features(s: *EmitterState, attr_pos: i64)
     s.out.push_span(Span<u8> { ptr: (tail), len: (n) as i64 })
     free(tail)
 
+# 1 for an async fn's poll fn: its name ends in `$poll` (async_lower).
+fn fn_name_ends_poll(f: *FnDef) -> i32
+    if StrView { ptr: (f.name), len: (f.name_len) as i64 }.ends_with("$poll")
+        return 1
+    0
+
+# AGAST #4609: 1 for a generated `E.from` (§10.4): every object that uses it
+# defines its own internal copy, as an instance's (two files' enums `E` each
+# generate one).  Not async_lower's injected `future_poll` (each unit's own
+# copy, merged weak_odr), nor a monomorph instance ('$'), whose
+# `from_generated` its clone leaves unset.
+fn fn_is_enum_from(f: *FnDef) -> i32
+    if f == null or f.from_generated != 1
+        return 0
+    let name: StrView = StrView { ptr: (f.name), len: (f.name_len) as i64 }
+    if name.ends_with("__from") and name.find_byte('$') == name.len
+        return 1
+    0
+
 # 1 when fn_linkage gives the fn an ODR linkage (linkonce_odr / weak_odr).
 fn fn_is_odr(is_main: bool, is_monomorph: bool, is_pub: i32, from_generated: i32) -> bool
     if is_main
         return false
     if is_monomorph
-        return true
+        return false   # internal since AGAST #4609 (fn_linkage)
     if is_pub == 1 and from_generated == 1
         return true
     false
@@ -634,8 +653,11 @@ fn emit_odr_comdat_start(s: *EmitterState, name_sv: StrView, suffix_sv: StrView)
 
 # AGAST #3386 (LARB R45): a defined fn's linkage follows its visibility.
 #   - `main`: external (the runtime's _start calls it).
-#   - a monomorph ('$' in its name): linkonce_odr. Every module using it
-#     emits a copy and the linker keeps one, as ritz0's is_monomorphized.
+#   - a monomorph ('$' in its name): internal.  Every module using it emits
+#     its own copy, as ritz0's is_monomorphized (AGAST #4609).  It was
+#     linkonce_odr, one copy kept for the program, but its name says only
+#     which type *name* it is for: two types `Box` of two files (§15.3) each
+#     have a `pick$Box`, and the linker kept one for both.
 #   - a generated `pub` `E__from` (§10.4): weak_odr. Two files declaring the
 #     same enum each generate one (AGAST #2148), as ritz0 links them (#2160).
 #   - a `pub fn`: external.
@@ -644,15 +666,14 @@ fn emit_odr_comdat_start(s: *EmitterState, name_sv: StrView, suffix_sv: StrView)
 #     emit_fn does not use this for a private *free* fn: since #4356 that is
 #     external with its file in the symbol (fn_symbol), like ritz0, so a
 #     generic's instance in another object can call it.  A private impl
-#     method still lands here: `T_m` cannot clash.
+#     method still lands here: two types of one name may not both define
+#     `m` (type_twins.ritz), so `T_m` cannot clash.
 fn fn_linkage(is_main: bool, is_monomorph: bool, is_pub: i32, from_generated: i32) -> *u8
     if is_main
         return c"define "
     if fn_is_odr(is_main, is_monomorph, is_pub, from_generated)
-        if is_monomorph
-            return c"define linkonce_odr "
         return c"define weak_odr "
-    if is_pub == 1
+    if is_pub == 1 and is_monomorph == false
         return c"define "
     c"define internal "
 
@@ -680,6 +701,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         return
 
     emitter_set_current_fn(f)   # AGAST #1813: locates emit_fatal_limit
+    variant_site_set(s.mono.pctx, diag_fn_source_file(f))   # AGAST #4609: its bare variants
     frame_begin_fn(s, f.line, f.col)   # AGAST #3739
     s.fn_assert_kind = assert_fn_kind(s.mono.pctx, f)   # AGAST #1869
     s.reg_counter = 1
@@ -717,6 +739,13 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             name_i = f.name_len
         else
             name_i = name_i + 1
+    # AGAST #4609: a generated `E.from` is each object's own copy, as an
+    # instance is (fn_linkage): two files' enums `E` each have one.
+    let own_copy: bool = is_monomorph or fn_is_enum_from(f) == 1
+    # An async fn's poll fn (`go$poll`, async_lower) is no instance: the
+    # importer calls the one its definer's object has, `linkonce_odr` as
+    # before #4609.  Its name is the async fn's, which is one per program.
+    let poll_odr: bool = is_monomorph and fn_name_ends_poll(f) == 1
     if f.is_local == 0
         # AGAST #3585: an imported [[inline]] fn, a body for -O2 to inline;
         # the defining module's object has the symbol.
@@ -726,10 +755,13 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             # AGAST #4356: a private free fn is external but mangled (below),
             # so a generic's instance emitted in another object can call it.
             emit_str(s, c"define ")
+        else if poll_odr
+            emit_odr_comdat_start(s, StrView { ptr: (f.name), len: (f.name_len) as i64 }, StrView { ptr: (null), len: (0) as i64 })
+            emit_str(s, c"define linkonce_odr ")
         else
-            if fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated)
+            if fn_is_odr(is_main, own_copy, f.is_pub, f.from_generated)
                 emit_odr_comdat_start(s, StrView { ptr: (f.name), len: (f.name_len) as i64 }, StrView { ptr: (null), len: (0) as i64 })
-            emit_str(s, fn_linkage(is_main, is_monomorph, f.is_pub, f.from_generated))
+            emit_str(s, fn_linkage(is_main, own_copy, f.is_pub, f.from_generated))
     emit_str(s, fn_callconv_kw(s.mono.pctx, f))   # [[callconv = "win64"]] (AGAST #1879)
     if s.ret_sret == 1
         emit_str(s, c"void")
@@ -779,7 +811,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     emit_str(s, fn_inline_attr(s.mono.pctx, f))   # [[inline]] / [[always_inline]] / [[noinline]] (#1847)
     let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
     # After attr_pos: an attribute inserted there must precede `comdat`.
-    if f.is_local == 1 and fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated)
+    if f.is_local == 1 and (poll_odr or fn_is_odr(is_main, own_copy, f.is_pub, f.from_generated))
         emit_str(s, c" comdat")   # AGAST #201: see emit_odr_comdat_start
     emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
@@ -1022,6 +1054,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     # AGAST #2516: diagnostics name this method's file, not the last fn's.
     emitter_set_current_fn(method)
+    variant_site_set(s.mono.pctx, diag_fn_source_file(method))   # AGAST #4609
     refuse_huge_byval_params(s, method)   # AGAST #3668
     frame_begin_fn(s, method.line, method.col)   # AGAST #3739
     s.fn_assert_kind = ASSERT_FN_PLAIN   # AGAST #1869: methods take no attributes
@@ -1688,7 +1721,7 @@ fn emit_extern_declarations(s: *EmitterState)
                         is_method = 1
                 # AGAST #4356: a private free fn is declared under the mangled
                 # symbol its defining object defines (fn_symbol); a method is
-                # not (its `T_m` cannot clash).
+                # not (twins may not share `T_m`, type_twins.ritz).
                 var sym_name: *u8 = ex_name
                 var sym_len: i32 = ex_len
                 if is_method == 0 and fn_private_free(fn_def) == 1

@@ -39,6 +39,14 @@ struct StructVariant
     target: u64          # hash of the [[target_os]]/[[target_arch]] gate; 0 if ungated
     exists: i32          # 1 if the struct exists on the target compiled for
     body: u64            # hash of the definition's tokens
+    kind: i32            # TYPE_NOTE_STRUCT / _ENUM / _ALIAS (AGAST #4609)
+
+# AGAST #4609: enums and type aliases are noted too, for type_twins.ritz
+# (types follow the fn rule, LANGUAGE_SPEC §15.3); struct_variants_check
+# reads only structs.
+pub const TYPE_NOTE_STRUCT: i32 = 0
+pub const TYPE_NOTE_ENUM: i32 = 1
+pub const TYPE_NOTE_ALIAS: i32 = 2
 
 var g_sv: *StructVariant = null
 var g_sv_count: i64 = 0
@@ -114,6 +122,10 @@ fn sv_body_hash(tokens: *Token, from: i32, to: i32) -> u64
 # (the parser's position just after it).  `target` is 0 for an ungated
 # struct; `exists` is 0 if [[target_os]] filtered it out.
 pub fn struct_variant_note(tokens: *Token, end: i32, name_sv: StrView, file: *u8, target: u64, exists: i32)
+    type_note(tokens, end, name_sv, file, target, exists, TYPE_NOTE_STRUCT)
+
+# Note any type declaration: a struct, an enum or a type alias (`kind`).
+pub fn type_note(tokens: *Token, end: i32, name_sv: StrView, file: *u8, target: u64, exists: i32, kind: i32)
     var name: *u8 = name_sv.ptr
     var name_len: i32 = name_sv.len as i32
     # The name token: the last one before `end` that starts at `name`.
@@ -140,7 +152,15 @@ pub fn struct_variant_note(tokens: *Token, end: i32, name_sv: StrView, file: *u8
     v.target = target
     v.exists = exists
     v.body = sv_body_hash(tokens, from, end)
+    v.kind = kind
     g_sv_count = g_sv_count + 1
+
+# Every type noted since the last reset, in parse order (AGAST #4609).
+pub fn type_note_count() -> i64
+    g_sv_count
+
+pub fn type_note_at(i: i64) -> *StructVariant
+    g_sv + i
 
 fn sv_same_name(a: *StructVariant, b: *StructVariant) -> i32
     if a.name_len != b.name_len
@@ -161,6 +181,17 @@ fn sv_coexist(a: *StructVariant, b: *StructVariant) -> i32
     if b.target == 0 and a.exists == 1
         return 1
     0
+
+# AGAST #4609: two always-coexisting definitions from two files are twins,
+# conflicting only in a file that sees both: type_twins.ritz judges them.
+fn sv_twins(a: *StructVariant, b: *StructVariant) -> i32
+    if a.target != b.target or a.file == null or b.file == null
+        return 0
+    # One file's notes share its parse's copy of its path (ast_helpers
+    # parse_file_copy_shared).
+    if a.file == b.file
+        return 0
+    1
 
 # "Error: <later>:<line>: Conflicting struct definition for 'P': defined in
 # both <earlier> and <later>", ritz0's words.
@@ -191,7 +222,7 @@ pub fn struct_variants_check() -> i32
         var j: i64 = 0
         while j < i
             let a: *StructVariant = g_sv + j
-            if a.body != b.body and sv_same_name(a, b) == 1 and sv_coexist(a, b) == 1
+            if a.kind == TYPE_NOTE_STRUCT and b.kind == TYPE_NOTE_STRUCT and a.body != b.body and sv_same_name(a, b) == 1 and sv_coexist(a, b) == 1 and sv_twins(a, b) == 0
                 sv_report(a, b)
                 bad = 1
                 j = i

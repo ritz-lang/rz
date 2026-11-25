@@ -1,8 +1,10 @@
 """AGAST #201: an ODR definition (`linkonce_odr` / `weak_odr`) is in a comdat.
 
-A monomorph is defined `linkonce_odr` in every object that instantiates it
-(ritz0 is_monomorphized, ritz1 fn_linkage), and the linker is meant to keep
-one copy.  On ELF it does: a linkonce definition is a weak symbol.  On COFF
+A monomorph was defined `linkonce_odr` in every object that instantiates it
+(ritz0 is_monomorphized, ritz1 fn_linkage), and the linker was meant to keep
+one copy.  Since AGAST #4609 each object's copy is `internal`: two types of
+one name in one program (LANGUAGE_SPEC §15.3) each have a `pick$Box`, and one
+kept copy served both.  The UEFI link below still holds both objects' copies.  On ELF it does: a linkonce definition is a weak symbol.  On COFF
 (a `*-uefi` [[bin]] compiles for x86_64-windows-gnu) a definition without a
 comdat lowers to a plain weak external, and lld-link refuses two of them:
 
@@ -118,7 +120,9 @@ _ODR_GLOBAL = re.compile(r'^@("[^"]+"|[-\w.$]+) = (?:linkonce_odr|weak_odr) ([^\
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_every_odr_definition_has_its_comdat(tmp_path, compiler):
-    """ritzlib.string instantiates Vec<u8>: its object carries ODR copies.
+    """ritzlib.string instantiates Vec<u8>: its object carries its own,
+    internal copies (AGAST #4609); any ODR function left (a generated
+    `E.from`) is in its comdat.
 
     Functions only.  A comdat group is matched by name across objects, and
     globals of unrelated modules share names (`g_out`, every test file's
@@ -129,7 +133,8 @@ def test_every_odr_definition_has_its_comdat(tmp_path, compiler):
     ir = _emit_ir(compiler, RITZ_ROOT / "ritzlib" / "string.ritz", tmp_path / "string.ll")
     comdats = set(re.findall(r'^\$("[^"]+"|[-\w.$]+) = comdat any$', ir, re.MULTILINE))
     defines = _ODR_DEFINE.findall(ir)
-    assert defines, "expected linkonce_odr instances in ritzlib.string"
+    assert re.search(r'^define internal [^\n]*@"?Vec\$u8_push"?\(', ir, re.MULTILINE), \
+        "expected ritzlib.string's own internal Vec$u8_push"
     for name, rest in defines:
         assert re.search(r'\bcomdat\b', rest), f"@{name} has no comdat: {rest[:200]}"
         assert name in comdats, f"no `${name} = comdat any` for @{name}"
