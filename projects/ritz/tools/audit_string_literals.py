@@ -19,7 +19,8 @@ chosen by a cheap heuristic that looks at:
                           `let x: String = "..."` => string)
   * Function call sites with well-known stdlib signatures
     (`prints("..")` => s,
-     `panic("..")` / `eprintln_cstr("..")` / `eprints_cstr("..")` => c,
+     `eprints("..")` / `eprintln("..")` => s,
+     `panic("..")` => c,
      `assert ... , "..."` => c, etc.)
   * Fallback: `c` (matches the dominant current-code shape -- almost all
     bare strings today are flowing into `*u8` arguments).
@@ -60,7 +61,8 @@ REPO_ROOT = RITZ_ROOT.parent.parent                       # workspace root
 # --------------------------------------------------------------------------
 
 CALL_SIG: dict[str, dict[int, str]] = {
-    # io.ritz -- C-string sinks expect *u8
+    # io.ritz -- C-string sinks expect *u8.  Only a `*u8` that is already
+    # data belongs here; a literal goes to eprints/eprintln (AGAST #4683).
     "eprints_cstr":  {0: "c"},
     "eprintln_cstr": {0: "c"},
     "print_cstr":    {0: "c"},

@@ -2,10 +2,11 @@
 
 ritz1 had ~60 bespoke error printers: 42 hand-rolled
 
-    eprints_cstr(c"error: ")
+    eprints("error: ")
 
-prefixes, each followed by its own `if file != null ... "<input>"` fallback,
-and per-module helpers (si_error_at, enum_error_at, own_eprint_loc, ...).
+prefixes (then spelled with eprints_cstr and a c-literal; AGAST #4683
+moved ritz1's literal prints to `eprints("..")`), each followed by its own
+`if file != null ... "<input>"` fallback, and per-module helpers (si_error_at, enum_error_at, own_eprint_loc, ...).
 Half printed `error: <file>:<line>:<col>: `, the other half
 `<file>:<line>:<col>: error: `.  ritz1/src/diag.ritz is now the one place
 that prints the location prefix, always as `<file>:<line>:<col>: error: `.
@@ -13,7 +14,7 @@ that prints the location prefix, always as `<file>:<line>:<col>: error: `.
 These tests keep it that way:
 
 - no file under ritz1/src but diag.ritz writes a bare `error: ` prefix,
-  `eprints_cstr(c"error: ")`, to put a location after -- go through
+  `eprints("error: ")`, to put a location after -- go through
   diag_error* instead.  (A location-less fatal such as `c"error: ritz1
   parser arena exhausted ..."` has no file:line:col to give and is not
   covered.)
@@ -42,7 +43,7 @@ DIAG = "diag.ritz"
 ALLOWED: frozenset[str] = frozenset()
 
 # The ticket's pattern: a bare `error: ` prefix (git grep -E).
-PATTERN = r'eprints_cstr\(c"error: "\)'
+PATTERN = r'eprints\("error: "\)'
 
 
 def grep(pattern: str, src: Path = SRC) -> list[str]:
@@ -73,8 +74,18 @@ def offenders(lines: list[str]) -> list[str]:
 def test_pattern_catches_the_old_prefix():
     # The pattern itself must still match the shapes it bans.
     rx = re.compile(PATTERN)
-    assert rx.search('    eprints_cstr(c"error: ")')
-    assert not rx.search('    eprints_cstr(c": error: ")')
+    assert rx.search('    eprints("error: ")')
+    assert not rx.search('    eprints(": error: ")')
+
+
+@pytest.mark.unit
+def test_pattern_catches_a_planted_prefix(tmp_path):
+    # A planted `eprints("error: ")` outside diag.ritz is an offender;
+    # the same line in diag.ritz is not.
+    (tmp_path / "planted.ritz").write_text('fn f()\n    eprints("error: ")\n')
+    (tmp_path / DIAG).write_text('fn g()\n    eprints("error: ")\n')
+    bad = offenders(grep(PATTERN, tmp_path))
+    assert bad == ['planted.ritz:2:    eprints("error: ")']
 
 
 @pytest.mark.unit
@@ -96,7 +107,7 @@ def test_allowlist_only_names_files_that_still_need_it():
 def test_diag_module_prints_the_prefix():
     text = (SRC / DIAG).read_text()
     assert "pub fn diag_error(file: *u8, span: SrcSpan, msg: *u8)" in text
-    assert 'c": error: "' in text
+    assert 'eprints(": error: ")' in text
 
 
 
