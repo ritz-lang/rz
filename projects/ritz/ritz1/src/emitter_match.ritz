@@ -42,12 +42,16 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.gvec
 import ritzlib.memory
+import ritzlib.strview
+import ritzlib.string
+import ritzlib.option
 
 import ast
 import types
 import ast_helpers
 import tokens_gen
 import emitter_core
+import text_bridge      # StrView views of the older *u8 text APIs (AGAST #4696)
 import emitter_abi   # AGAST #1818: sret / byval moved out of emitter_core
 import emitter_types   # AGAST #1818: type inference moved out of emitter_core
 import emitter_ir
@@ -81,184 +85,134 @@ import emitter_stmt_parts   # AGAST #1818: split out below the emitter cycle
 # phi.
 const MATCH_ZERO_VALUE: i32 = -1
 
-# Check if a variant name denotes the "Some/Ok" (tagged) side of its enum.
-# Returns 1 if tag should be 1, 0 otherwise.
-# Heuristic: names "Some", "Ok" are the carrier variants; "None", "Err"
-# are the null variants. Any other variant currently defaults to tag 0
-# (which makes arbitrary enum matching equivalent to "match anything").
-fn variant_is_tag_one(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if len == 4
-        # "Some"
-        if *name == 'S' and *(name + 1) == 'o' and *(name + 2) == 'm' and *(name + 3) == 'e'
-            return 1
-    if len == 2
-        # "Ok"
-        if *name == 'O' and *(name + 1) == 'k'
-            return 1
-    return 0
+# Does `name` denote the "Some/Ok" (carrier) side of its enum?  Any other
+# variant (including None / Err) is the null side (which makes arbitrary
+# enum matching equivalent to "match anything").
+fn variant_is_tag_one(name: StrView) -> bool
+    name.eq("Some") or name.eq("Ok")
+
+# `arm`'s pattern name, as a StrView.
+fn arm_name(arm: *MatchArm) -> StrView
+    StrView { ptr: arm.pattern_name, len: arm.pattern_name_len as i64 }
+
+# `arm`'s inner (payload binding) name, as a StrView.
+fn arm_inner_name(arm: *MatchArm) -> StrView
+    StrView { ptr: arm.pattern_inner_name, len: arm.pattern_inner_name_len as i64 }
+
+# The payload selector (variant_sel) `arm`'s variant occupies: 0 for the
+# carrier side (Ok / Some), 1 for the null side (Err / None).
+fn arm_payload_sel(arm: *MatchArm) -> i32
+    if variant_is_tag_one(arm_name(arm)) then 0 else 1
 
 # Emit a check for the scrutinee being of a given variant against the
 # struct layout `{ i8 tag, [N x i8] payload }` (ritz-task-133 parity with
 # ritz0).  `slot_reg` is a pointer to the scrutinee struct (the match
-# prelude spills the scrutinee value into an alloca once).  `enum_name`
-# is the `%Result$.../Option$...` type name used to GEP.  `tag_one == 1`
-# checks for the carrier variant (Ok / Some); 0 checks for the null
-# variant (Err / None).  ritz0 tag convention: Ok=0 Err=1 Some=0 None=1,
-# so carrier <=> tag==0.
+# prelude spills the scrutinee value into an alloca once).  `enum_name` is
+# the `%Result$.../Option$...` type name used to GEP.  `tag_one` checks for
+# the carrier variant (Ok / Some); false checks for the null variant (Err /
+# None).  ritz0 tag convention: Ok=0 Err=1 Some=0 None=1, so carrier <=>
+# tag==0.
 # User-enum variant check: load the tag byte and compare against an
 # arbitrary i8 tag value (instead of the tagged-enum 0/1 binary check).
 # Used when the scrutinee's enum is a parser-tracked user enum (Shade,
 # etc.) and the match arm names a specific variant by index.
-fn emit_variant_tag_check_eq(s: *EmitterState, slot_reg: i32, enum_name_sv: StrView, tag_value: i32) -> i32
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
+fn emit_variant_tag_check_eq(s: *EmitterState, slot_reg: i32, enum_name: StrView, tag_value: i32) -> i32
     let tag_ptr: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, tag_ptr)
-    emit_str(s, IR_GEP_NAMED)
-    emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, slot_reg)
-    emit_str(s, c", i32 0, i32 0\n")
+    gep_struct_open(s, tag_ptr, enum_name)
+    format_into(s, ", ptr %.{slot_reg}, i32 0, i32 0\n")
     # AGAST #4574: a repr enum holds its discriminant in the repr type.
-    let tag_ty: *u8 = enum_tag_ty_named(s.mono.pctx, enum_name_sv)
+    let tag_ty: StrView = llvm_text(enum_tag_ty_named(s.mono.pctx, enum_name))
     let tag_reg: i32 = next_reg(s)
-    emit_load_into(s, tag_ty, tag_reg, tag_ptr)
+    format_into(s, "  %.{tag_reg} = load {tag_ty}, ptr %.{tag_ptr}\n")
     let cmp_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, cmp_reg)
-    emit_str(s, c" = icmp eq ")
-    emit_str(s, tag_ty)
-    emit_str(s, IR_SP)
-    emit_reg(s, tag_reg)
-    emit_str(s, IR_COMMA)
-    emit_int(s, enum_tag_value_named(s.mono.pctx, enum_name_sv, tag_value))
-    emit_str(s, IR_NL)
-    return cmp_reg
+    let want: i64 = enum_tag_value_named(s.mono.pctx, enum_name, tag_value)
+    format_into(s, "  %.{cmp_reg} = icmp eq {tag_ty} %.{tag_reg}, {want}\n")
+    cmp_reg
 
-fn emit_variant_tag_check(s: *EmitterState, slot_reg: i32, enum_name_sv: StrView, tag_one: i32) -> i32
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
+fn emit_variant_tag_check(s: *EmitterState, slot_reg: i32, enum_name: StrView, tag_one: bool) -> i32
     let tag_ptr: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, tag_ptr)
-    emit_str(s, IR_GEP_NAMED)
-    emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, slot_reg)
-    emit_str(s, c", i32 0, i32 0\n")
+    gep_struct_open(s, tag_ptr, enum_name)
+    format_into(s, ", ptr %.{slot_reg}, i32 0, i32 0\n")
     let tag_reg: i32 = next_reg(s)
     emit_load_into(s, IR_TY_I8, tag_reg, tag_ptr)
     let cmp_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, cmp_reg)
-    if tag_one == 1
-        # carrier (Ok/Some) → tag == 0
-        emit_str(s, c" = icmp eq i8 ")
-    else
-        # null (Err/None) → tag != 0
-        emit_str(s, c" = icmp ne i8 ")
-    emit_reg(s, tag_reg)
-    emit_str(s, IR_COMMA_0)
-    return cmp_reg
+    # carrier (Ok/Some) -> tag == 0; null (Err/None) -> tag != 0
+    let pred: StrView = if tag_one then "eq" else "ne"
+    format_into(s, "  %.{cmp_reg} = icmp {pred} i8 %.{tag_reg}, 0\n")
+    cmp_reg
 
 # Extract the variant payload as an i64 (the common scalar case).  Payload
 # sits at field 2 (the `[N x i8]` buffer after the alignment pad, AGAST
 # #1898), stored at its own width; it is widened to i64 because ritz1's
 # downstream arithmetic / call paths operate on i64 registers.  `variant` is
-# 0 for Ok / Some, 1 for Err.
-fn emit_variant_payload(s: *EmitterState, slot_reg: i32, enum_name_sv: StrView, variant: i32) -> i32
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    # `variant` is a selector (variant_sel): field k sits at its offset.
-    let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, variant)
-    return emit_tagged_payload_load(s, pay_ptr, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, variant)
+# a selector (variant_sel): field k sits at its offset; 0 for Ok / Some, 1
+# for Err.
+fn emit_variant_payload(s: *EmitterState, slot_reg: i32, enum_name: StrView, variant: i32) -> i32
+    let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, enum_name, variant)
+    emit_tagged_payload_load(s, pay_ptr, enum_name, variant)
 
 # The LLVM integer type of narrow integer type code `t` (AGAST #3116).
-fn narrow_int_llvm(t: TypeKind) -> *u8
-    if ty_int_bits(t) == 8
-        return c"i8"
-    if ty_int_bits(t) == 16
-        return c"i16"
-    c"i32"
+fn narrow_int_llvm(t: TypeKind) -> StrView
+    match ty_int_bits(t)
+        8 => "i8"
+        16 => "i16"
+        _ => "i32"
 
 # Scalar-scrutinee fallback (non-enum `match x on int`).
-fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: i32) -> i32
+fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: bool) -> i32
     # Legacy packed-i64 path retained only for non-enum match.  In practice
     # ritz1 code only uses `match` on Result/Option + integers; this branch
     # covers the latter.  Returns a conservative always-false for "variant"
     # patterns against a scalar scrutinee.
     let r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    emit_str(s, c" = icmp eq i64 ")
-    emit_reg(s, scrut_reg)
-    emit_str(s, IR_COMMA_0)
-    if tag_one == 1
+    format_into(s, "  %.{r} = icmp eq i64 %.{scrut_reg}, 0\n")
+    if tag_one
         return r
     let inv: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, inv)
-    emit_str(s, c" = xor i1 ")
-    emit_reg(s, r)
-    emit_str(s, c", true\n")
-    return inv
+    format_into(s, "  %.{inv} = xor i1 %.{r}, true\n")
+    inv
 
 # AGAST #1797: the tag of the variant `arm` names in user enum `enum_name`,
 # or -1 (not a user enum, or no such variant).
 # AGAST #1295: as the payload selector (variant_sel) of the binding the arm
 # has selected (arm_select_bind): field pattern_field_sel of that variant.
-fn user_arm_variant(ctx: *ParseCtx, enum_name_sv: StrView, arm: *MatchArm) -> i32
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    if user_enum_index(ctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) < 0
+fn user_arm_variant(ctx: *ParseCtx, enum_name: StrView, arm: *MatchArm) -> i32
+    if user_enum_index(ctx, enum_name) < 0
         return 0 - 1
-    let vi: i32 = enum_variant_index(ctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+    let vi: i32 = enum_variant_index(ctx, enum_name, arm_name(arm))
     if vi < 0
         return vi
-    return variant_sel(vi, arm.pattern_field_sel)
+    variant_sel(vi, arm.pattern_field_sel)
 
 # AGAST #1515: the struct type carried by a tagged enum's carrier variant
 # (Ok/Some): see tagged_enum_payload_struct.  AGAST #1667 adds Result's Err
 # side (tagged_enum_err_payload_struct), and #2100 a non-generic user enum
-# payload.  When it names a known struct or enum, fills (out_name, out_len);
-# otherwise leaves them null/0 and the caller keeps the scalar i64 binding
-# (primitives, pointers, None).
-fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrView, out_name: **u8, out_len: *i32)
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    *out_name = null
-    *out_len = 0
-    if enum_name == null or enum_name_len <= 0
-        return
-    if is_tagged_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 0
+# payload.  The struct or enum it names; `no_name()` when the caller keeps
+# the scalar i64 binding (primitives, pointers, None).
+fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name: StrView) -> StrView
+    if unnamed(enum_name)
+        return no_name()
+    if is_tagged_enum_type(enum_name) == 0
         # AGAST #1797: a user enum's tuple variant declares its payload.
-        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
-        if uf != null
-            if uf.field_type == TypeKind.Struct and uf.field_type_name_len > 0
-                *out_name = uf.field_type_name
-                *out_len = uf.field_type_name_len
-        return
+        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, enum_name, user_arm_variant(s.mono.pctx, enum_name, arm))
+        if uf != null and uf.field_type == TypeKind.Struct and uf.field_type_name_len > 0
+            return StrView { ptr: uf.field_type_name, len: uf.field_type_name_len as i64 }
+        return no_name()
     # AGAST #2987: a payload declared as a tagged enum (`Some(x)` over
     # `Option<Option<i32>>`, `Ok(x)` / `Err(x)` over a Result carrying one)
     # binds at that aggregate, as emit_variant_build stores it.  It was
     # loaded as an i64.
-    var decl_len: i32 = 0
-    let decl: *u8 = tagged_enum_arg(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }), @decl_len)
-    if decl != null and decl_len > 0 and is_tagged_enum_type(StrView { ptr: (decl), len: (decl_len) as i64 }) == 1
-        *out_name = decl
-        *out_len = decl_len
-        return
-    if variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 0
-        # AGAST #1667: `Err(e)` over Result<T, E> with a struct E binds at %E.
-        if arm.pattern_name_len == 3 and *arm.pattern_name == 'E' and *(arm.pattern_name + 1) == 'r' and *(arm.pattern_name + 2) == 'r'   # "Err"
-            *out_name = tagged_enum_err_payload_named(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, out_len, 1)
-        return
-    # AGAST #2100: a user-enum payload (`Some(x)` over Option<Opt>) binds at
-    # %Opt too; it was loaded as an i64.
-    *out_name = tagged_enum_payload_named(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, out_len, 1)
+    let decl: StrView = tagged_payload(s, enum_name, arm_payload_sel(arm))
+    if not unnamed(decl) and is_tagged_enum_type(decl) == 1
+        return decl
+    if variant_is_tag_one(arm_name(arm))
+        # AGAST #2100: a user-enum payload (`Some(x)` over Option<Opt>) binds
+        # at %Opt too; it was loaded as an i64.
+        return tagged_carrier_payload_named(s, enum_name, 1)
+    # AGAST #1667: `Err(e)` over Result<T, E> with a struct E binds at %E.
+    if arm_name(arm).eq("Err")
+        return tagged_err_payload_named(s, enum_name, 1)
+    no_name()
 
 # AGAST #2436: when `arm`'s payload is a pointer to a struct (`Some(v)` over
 # `Option<*Pair>` / `Result<*Pair, E>`, `E.P(v)` over a `P(*Pair)`, `P(@Pair)`
@@ -270,71 +224,65 @@ fn carrier_payload_struct(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrVie
 # `(*v).a` were "unhandled EXPR_MEMBER".  AGAST #3047: a `**T` payload
 # (`Option<**Pair>`, a user enum's `P(**Pair)`) returns TypeKind.PtrPtr, still
 # naming the struct.
-fn carrier_payload_ptr_struct(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrView, out_name: **u8, out_len: *i32) -> TypeKind
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    *out_name = null
-    *out_len = 0
-    if enum_name == null or enum_name_len <= 0
+fn carrier_payload_ptr_struct(s: *EmitterState, arm: *MatchArm, enum_name: StrView, out_name: *StrView) -> TypeKind
+    *out_name = no_name()
+    if unnamed(enum_name)
         return TypeKind.Void
-    if is_tagged_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 0
-        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
+    if is_tagged_enum_type(enum_name) == 0
+        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, enum_name, user_arm_variant(s.mono.pctx, enum_name, arm))
         if uf == null or uf.array_size != 0 or uf.field_type_name_len <= 0
             return TypeKind.Void
         if uf.field_type != TypeKind.Ptr and uf.field_type != TypeKind.PtrPtr and uf.field_type != TypeKind.Ref and uf.field_type != TypeKind.MutRef
             return TypeKind.Void
-        if is_concrete_payload_type(s, StrView { ptr: (uf.field_type_name), len: (uf.field_type_name_len) as i64 }, 0) == 0
+        let uf_name: StrView = StrView { ptr: uf.field_type_name, len: uf.field_type_name_len as i64 }
+        if is_concrete_payload_type(s, uf_name, 0) == 0
             return TypeKind.Void
-        *out_name = uf.field_type_name
-        *out_len = uf.field_type_name_len
+        *out_name = uf_name
         return uf.field_type
     # Option / Result: the mangled argument spells `*Pair` as "ptr_Pair",
     # `@Pair` "ref_Pair" and `@&Pair` "refmut_Pair" (AGAST #2384).
-    var decl_len: i32 = 0
-    let decl: *u8 = tagged_enum_arg(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }), @decl_len)
-    if decl == null
+    let decl: StrView = tagged_payload(s, enum_name, arm_payload_sel(arm))
+    if unnamed(decl)
         return TypeKind.Void
-    let k: i32 = mangled_ref_prefix(StrView { ptr: (decl), len: (decl_len) as i64 })
+    let k: i32 = mangled_ref_prefix(decl)
     if k == 0
         return TypeKind.Void
     # AGAST #3047: `**Pair` spells "ptr_ptr_Pair" (`@*Pair`, "ref_ptr_Pair",
     # stays unbound).
-    if decl_len > 8 and memcmp(decl, c"ptr_ptr_", 8) == 0
-        if is_concrete_payload_type(s, StrView { ptr: (decl + 8), len: (decl_len - 8) as i64 }, 0) == 0
+    if decl.len > 8 and decl.starts_with("ptr_ptr_")
+        let inner: StrView = decl.skip(8)
+        if is_concrete_payload_type(s, inner, 0) == 0
             return TypeKind.Void
-        *out_name = decl + 8
-        *out_len = decl_len - 8
+        *out_name = inner
         return TypeKind.PtrPtr
-    if is_concrete_payload_type(s, StrView { ptr: (decl + k), len: (decl_len - k) as i64 }, 0) == 0
+    let rest: StrView = decl.skip(k as i64)
+    if is_concrete_payload_type(s, rest, 0) == 0
         return TypeKind.Void
-    *out_name = decl + k
-    *out_len = decl_len - k
+    *out_name = rest
     if k == 7
         return TypeKind.MutRef
-    if *(decl + 1) == 'e'   # 'e': "ref_"
+    if decl.get(1) == 'e'   # 'e': "ref_"
         return TypeKind.Ref
     TypeKind.Ptr
 
 # AGAST #2436: bind a pointer-to-struct payload as a pointer local, as `let
 # v: *Pair = ...` registers one, so the member chain finds the struct.  The
 # payload loads as an i64 (emit_variant_payload); the local holds a `ptr`.
-fn emit_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name_sv: StrView, variant: i32, var_type: TypeKind, st_name_sv: StrView)
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    var st_name: *u8 = st_name_sv.ptr
-    var st_name_len: i32 = st_name_sv.len as i32
-    let raw: i32 = emit_variant_payload(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, variant)
+fn emit_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: StrView, variant: i32, var_type: TypeKind, st_name: StrView)
+    let raw: i32 = emit_variant_payload(s, slot_reg, enum_name, variant)
     let ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, raw)
     let alloca_reg: i32 = next_reg(s)
-    entry_alloca_reg(s, alloca_reg, c"ptr", c"match pointer payload bind")
+    entry_alloca_reg_begin(s, alloca_reg)
+    format_into(s, "ptr  ; match pointer payload bind\n")
+    entry_alloca_reg_end(s)
     emit_store_typed(s, IR_TY_PTR, ptr, alloca_reg)
     if var_type == TypeKind.PtrPtr
         # AGAST #3047: as `let pp: **Pair` registers (emitter_stmt.ritz,
         # #1933): pointee `*`, then the struct one level further in.
-        add_local_full(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, var_type, StrView { ptr: (st_name), len: (st_name_len) as i64 }, TypeKind.Ptr, 0, TypeKind.Void)
-        set_local_inner_pointee(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, (TypeKind.Struct as i32))
+        add_local_full(s, arm_inner_name(arm), alloca_reg, var_type, st_name, TypeKind.Ptr, 0, TypeKind.Void)
+        set_local_inner_pointee(s, arm_inner_name(arm), (TypeKind.Struct as i32))
         return
-    add_local_full(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, var_type, StrView { ptr: (st_name), len: (st_name_len) as i64 }, TypeKind.Struct, 0, TypeKind.Void)
+    add_local_full(s, arm_inner_name(arm), alloca_reg, var_type, st_name, TypeKind.Struct, 0, TypeKind.Void)
 
 # AGAST #4448: the primitive `T` a one-level pointer payload points at
 # (`Some(n)` over `Option<*u8>`, `Ok(p)` over `Result<*u8, E>`, `P(p)` over a
@@ -342,11 +290,11 @@ fn emit_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_n
 # struct is carrier_payload_ptr_struct's, and a `**T` / `@T` stays as it was.
 # `n` used to be bound as an i64, so print's Display dispatch printed the
 # address and `*n` had no pointee.
-fn carrier_payload_ptr_primitive(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32) -> TypeKind
-    if enum_name == null or enum_name_len <= 0
+fn carrier_payload_ptr_primitive(s: *EmitterState, arm: *MatchArm, enum_name: StrView) -> TypeKind
+    if unnamed(enum_name)
         return TypeKind.Void
-    if is_tagged_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 0
-        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
+    if is_tagged_enum_type(enum_name) == 0
+        let uf: *StructField = user_enum_tuple_field(s.mono.pctx, enum_name, user_arm_variant(s.mono.pctx, enum_name, arm))
         if uf == null or uf.field_type != TypeKind.Ptr
             return TypeKind.Void
         let p: TypeKind = uf.ptr_pointee
@@ -354,89 +302,77 @@ fn carrier_payload_ptr_primitive(s: *EmitterState, arm: *MatchArm, enum_name: *u
         if not type_is_scalar_leaf(p)
             return TypeKind.Void
         return p
-    var decl_len: i32 = 0
-    let decl: *u8 = tagged_enum_arg(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }), @decl_len)
-    if decl == null or decl_len <= 4 or memcmp(decl, c"ptr_", 4) != 0
+    let decl: StrView = tagged_payload(s, enum_name, arm_payload_sel(arm))
+    if unnamed(decl) or decl.len <= 4 or not decl.starts_with("ptr_")
         return TypeKind.Void
-    primitive_type_from_name(StrView { ptr: (decl + 4), len: (decl_len - 4) as i64 })
+    primitive_type_from_name(decl.skip(4))
 
 # AGAST #4448: bind a pointer-to-primitive payload as the pointer local a
 # `let n: *T` registers (emitter_stmt.ritz), so Display and the arithmetic /
 # deref paths see the pointer, not an i64.
-fn emit_primitive_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: *u8, enum_name_len: i32, pointee: TypeKind)
-    var sel: i32 = 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-    let uvi: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
+fn emit_primitive_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: StrView, pointee: TypeKind)
+    var sel: i32 = arm_payload_sel(arm)
+    let uvi: i32 = user_arm_variant(s.mono.pctx, enum_name, arm)
     if uvi >= 0
         sel = uvi
-    let raw: i32 = emit_variant_payload(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, sel)
+    let raw: i32 = emit_variant_payload(s, slot_reg, enum_name, sel)
     let ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, raw)
     let alloca_reg: i32 = next_reg(s)
-    entry_alloca_reg(s, alloca_reg, c"ptr", c"match pointer payload bind")
+    entry_alloca_reg_begin(s, alloca_reg)
+    format_into(s, "ptr  ; match pointer payload bind\n")
+    entry_alloca_reg_end(s)
     emit_store_typed(s, IR_TY_PTR, ptr, alloca_reg)
-    add_local_ptr(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, TypeKind.Ptr, pointee)
+    add_local_ptr(s, arm_inner_name(arm), alloca_reg, TypeKind.Ptr, pointee)
 
 # AGAST #1515: bind `Some(p)` / `Ok(s)` to a copy of a struct payload.  The
 # payload sits at field 2 of the spilled scrutinee (#1898); copy it into its own
 # `alloca %Name` and register a struct local, so `p.x` and by-value passing
 # see `%Name` rather than an i64.
-fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name_sv: StrView, st_name_sv: StrView)
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    var st_name: *u8 = st_name_sv.ptr
-    var st_name_len: i32 = st_name_sv.len as i32
-    var sel: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
+fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: StrView, st_name: StrView)
+    var sel: i32 = user_arm_variant(s.mono.pctx, enum_name, arm)
     if sel < 0
         sel = 0   # Result / Option: the payload is at offset 0
-    let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, sel)
+    let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, enum_name, sel)
     let val: i32 = next_reg(s)
-    emit_struct_load_or_defer(s, TypeKind.Struct, val, StrView { ptr: (st_name), len: (st_name_len) as i64 }, pay_ptr, null, 0)
+    emit_struct_load_or_defer(s, TypeKind.Struct, val, st_name, pay_ptr, null, 0)
     let alloca_reg: i32 = next_reg(s)
     entry_alloca_reg_begin_named(s, alloca_reg)
-    emit_name(s, StrView { ptr: (st_name), len: (st_name_len) as i64 })
-    emit_str(s, c"  ; match struct payload bind\n")
+    emit_name(s, st_name)
+    format_into(s, "  ; match struct payload bind\n")
     entry_alloca_reg_end(s)
-    emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (st_name), len: (st_name_len) as i64 }, val, alloca_reg)
-    add_local_struct(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, TypeKind.Struct, StrView { ptr: (st_name), len: (st_name_len) as i64 })
+    emit_struct_store_or_copy(s, TypeKind.Struct, st_name, val, alloca_reg)
+    add_local_struct(s, arm_inner_name(arm), alloca_reg, TypeKind.Struct, st_name)
 
 # AGAST #3029: bind `V(a)` / `Some(a)` to a copy of an array payload, at the
 # `[N]T` the variant declares (variant_array_type), as a `let a: [N]T` is
 # registered.  It was loaded as an i64 and indexed as a pointer: `a[1]` read
 # through the array's bytes.  0, emitting nothing, for any other payload.
-fn emit_array_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name_sv: StrView) -> i32
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    var tag: i32 = 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-    let uvi: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
+fn emit_array_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: StrView) -> i32
+    var tag: i32 = arm_payload_sel(arm)
+    let uvi: i32 = user_arm_variant(s.mono.pctx, enum_name, arm)
     if uvi >= 0
         tag = uvi
     var arr: ArrayArg
-    if variant_array_type(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, tag, @arr) == 0
+    if variant_array_type(s, enum_name, tag, @arr) == 0
         return 0
-    let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, tag)
+    let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, enum_name, tag)
+    let arr_name: StrView = StrView { ptr: arr.name, len: arr.name_len as i64 }
     let val: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, val)
-    emit_str(s, IR_LOAD)
-    emit_local_array_llvm_type(s, arr.size, arr.elem, StrView { ptr: (arr.name), len: (arr.name_len) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, pay_ptr)
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{val} = load ")
+    emit_local_array_llvm_type(s, arr.size, arr.elem, arr_name)
+    format_into(s, ", ptr %.{pay_ptr}\n")
     let alloca_reg: i32 = next_reg(s)
     entry_alloca_reg_begin(s, alloca_reg)
-    emit_local_array_llvm_type(s, arr.size, arr.elem, StrView { ptr: (arr.name), len: (arr.name_len) as i64 })
-    emit_str(s, c"  ; match array payload bind\n")
+    emit_local_array_llvm_type(s, arr.size, arr.elem, arr_name)
+    format_into(s, "  ; match array payload bind\n")
     entry_alloca_reg_end(s)
-    emit_str(s, IR_STORE_IND)
-    emit_local_array_llvm_type(s, arr.size, arr.elem, StrView { ptr: (arr.name), len: (arr.name_len) as i64 })
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, alloca_reg)
-    emit_str(s, IR_NL)
+    format_into(s, "  store ")
+    emit_local_array_llvm_type(s, arr.size, arr.elem, arr_name)
+    format_into(s, " %.{val}, ptr %.{alloca_reg}\n")
     if arr.name_len > 0 and (arr.elem == TypeKind.Struct or arr.elem == TypeKind.Ptr)
-        add_local_full(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, TypeKind.Array, StrView { ptr: (arr.name), len: (arr.name_len) as i64 }, TypeKind.I64, arr.size, arr.elem)
+        add_local_full(s, arm_inner_name(arm), alloca_reg, TypeKind.Array, arr_name, TypeKind.I64, arr.size, arr.elem)
     else
-        add_local_array(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, arr.size, arr.elem)
+        add_local_array(s, arm_inner_name(arm), alloca_reg, arr.size, arr.elem)
     let loc: *LocalVar = local_at(s, s.local_count - 1)
     lv_set_array_elem_pointee(loc, arr.pointee)
     1
@@ -446,70 +382,70 @@ fn emit_array_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum
 # same lookup emit_variant_struct made while emitting the arm), so the merge
 # phi must have that type rather than i64.  `arg_parse_i64`'s
 # `Some(n) => Ok(n)` / `None => Err(..)` emitted `phi i64 [%Result$..]`.
-fn variant_ctor_arm_type(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+fn func_name_sv(e: *Expr) -> StrView
+    StrView { ptr: e.func_name, len: e.func_name_len as i64 }
+
+fn ident_sv(e: *Expr) -> StrView
+    StrView { ptr: e.ident_ptr, len: e.ident_len as i64 }
+
+fn variant_ctor_arm_type(s: *EmitterState, e: *Expr) -> StrView
     if e == null
-        return
-    var is_ctor: i32 = 0
+        return no_name()
+    var is_ctor: bool = false
     match e.kind
         ExprKind.Call =>
-            if is_variant_carrier(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1 or is_variant_null(StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }) == 1
-                is_ctor = 1
+            is_ctor = is_variant_carrier(func_name_sv(e)) == 1 or is_variant_null(func_name_sv(e)) == 1
         ExprKind.Ident =>
             # Unshadowed `None`, mirroring emit_expr_ident: not a user's (#2434),
             # which is typed as any of its enum's unit variants.
-            if is_ident_none(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1 and not users_none_wins(s, e)
-                if is_const(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 0 and find_local(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0
-                    if find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == null
-                        is_ctor = 1
+            is_ctor = is_ident_none(ident_sv(e)) == 1 and not users_none_wins(s, e) and is_const(s, ident_sv(e)) == 0 and find_local(s, ident_sv(e)) < 0 and find_global(s, ident_sv(e)) == null
         _ => pass
-    if is_ctor == 1
-        let ctx: StrView = resolve_enum_ctx(s)
-        *out_name = ctx.ptr
-        *out_len = ctx.len as i32
+    if is_ctor
+        return resolve_enum_ctx(s)
+    no_name()
 
 # AGAST #3117: an arm yielding a bare `Full(..)` / `Empty` of a generic enum
 # builds the instance its slot names (slot_instance_variant, which
 # try_emit_user_variant_ctor and emit_expr_ident asked while emitting the
 # arm), so the merge phi has that type, not i64.  A unit variant counts only
 # where emit_expr_ident reaches it: no const, local, global or fn of its name.
-fn instance_ctor_arm_type(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+fn instance_ctor_arm_type(s: *EmitterState, e: *Expr) -> StrView
     var vi: i32 = 0
     var ei: i32 = 0 - 1
     match e.kind
         ExprKind.Call =>
-            ei = slot_instance_variant(s, StrView { ptr: (e.func_name), len: (e.func_name_len) as i64 }, @vi)
+            ei = slot_instance_variant(s, func_name_sv(e), @vi)
             if ei >= 0
                 let kind: i32 = enum_variant_kind(s.mono.pctx, ei, vi)
                 if not ((kind == ENUM_VARIANT_UNIT and e.args == null) or (kind == ENUM_VARIANT_TUPLE and e.args != null and e.args.next == null))
-                    return
+                    return no_name()
         ExprKind.Ident =>
-            if is_const(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1 or find_local(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) >= 0
-                return
-            if find_global(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null or find_fn(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) != null
-                return
-            ei = slot_instance_variant(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, @vi)
+            if is_const(s, ident_sv(e)) == 1 or find_local(s, ident_sv(e)) >= 0
+                return no_name()
+            if find_global(s, ident_sv(e)) != null or find_fn(s, ident_sv(e)) != null
+                return no_name()
+            ei = slot_instance_variant(s, ident_sv(e), @vi)
             if ei >= 0 and enum_variant_kind(s.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
-                return
+                return no_name()
         _ => pass
     if ei >= 0
-        *out_name = enum_name_at(s.mono.pctx, ei, out_len)
+        return enum_name_view(s.mono.pctx, ei)
+    no_name()
 
 # AGAST #3205: an arm yielding a qualified unit variant (`0 => A.V`) is the
 # `%A` emit_expr_member builds, under the same test, so the merge phi has
 # that type.  The phi was i64 over `%A`s, which clang rejected.
-fn qualified_unit_variant_arm_type(ctx: *ParseCtx, e: *Expr, out_name: **u8, out_len: *i32)
+fn qualified_unit_variant_arm_type(ctx: *ParseCtx, e: *Expr) -> StrView
     if e.kind != ExprKind.Member or e.left == null or e.left.kind != ExprKind.Ident
-        return
-    if is_enum_type(ctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }) == 0
-        return
-    if enum_variant_index(ctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 }, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) < 0
-        return
-    if enum_is_generic(ctx, enum_find(ctx, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })) == 1
-        return   # emit_expr_member refuses it (#1466)
-    *out_name = e.left.ident_ptr
-    *out_len = e.left.ident_len
+        return no_name()
+    let left: StrView = ident_sv(e.left)
+    if is_enum_type(ctx, left) == 0
+        return no_name()
+    if enum_variant_index(ctx, left, ident_sv(e)) < 0
+        return no_name()
+    if enum_is_generic(ctx, enum_find(ctx, left)) == 1
+        return no_name()   # emit_expr_member refuses it (#1466)
+    left
 
 # Emit a block arm's statements (AGAST #1454).  `return` leaves the block
 # terminated by `ret`, but the arm still records a phi incoming and emits its
@@ -587,7 +523,7 @@ fn match_void_arms_settle(s: *EmitterState, result: *MatchResult, wants_value: i
     eprint_char(':')
     eprint_i64(result.void_col as i64)
     eprints(": error: this arm calls a fn that returns nothing, so it has no value; the `match`/`if` it belongs to is used as a value here\n")
-    emit_str(s, c"  ; ERROR: valueless match / if arm used as a value\n")
+    format_into(s, "  ; ERROR: valueless match / if arm used as a value\n")
     s.error_count = s.error_count + 1
 
 # AGAST #1946: take the float type an enclosing let / return expects of this
@@ -615,7 +551,7 @@ pub fn take_match_float_hint(s: *EmitterState) -> TypeKind
 fn match_arm_into_slot(s: *EmitterState, arm: *MatchArm, result: *MatchResult, body_reg: i32)
     if result.into != null
         return
-    if body_reg == MATCH_ZERO_VALUE and if_arm_diverges(arm) == 1
+    if body_reg == MATCH_ZERO_VALUE and if_arm_diverges(arm)
         return
     if result.agg_name == null or struct_ret_uses_sret(s, TypeKind.Struct, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }) == 0
         result.slot_misses = result.slot_misses + 1
@@ -627,18 +563,16 @@ fn match_arm_into_slot(s: *EmitterState, arm: *MatchArm, result: *MatchResult, b
         result.slot = next_reg(s)
         entry_alloca_reg_begin(s, result.slot)
         emit_match_phi_type(s, result)
-        emit_str(s, IR_NL)
+        format_into(s, "\n")
         entry_alloca_reg_end(s)
     if result.agg_name != null and result.agg_name_len > 0 and body_reg != MATCH_ZERO_VALUE
         emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }, body_reg, result.slot)
     else
-        emit_str(s, IR_STORE_IND)
+        format_into(s, "  store ")
         emit_match_phi_type(s, result)
-        emit_str(s, IR_SP)
+        format_into(s, " ")
         emit_match_phi_value(s, result, body_reg)
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, result.slot)
-        emit_str(s, IR_NL)
+        format_into(s, ", ptr %.{result.slot}\n")
 
 # AGAST #3696: at the merge, the arms' value read back from their slot (see
 # match_arm_into_slot), or 0 when they meet in a phi instead.
@@ -649,13 +583,9 @@ fn match_merge_slot(s: *EmitterState, result: *MatchResult) -> i32
     if result.agg_name != null and result.agg_name_len > 0
         emit_struct_load_or_defer(s, TypeKind.Struct, reg, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }, result.slot, null, 0)
     else
-        emit_str(s, IR_INDENT)
-        emit_reg(s, reg)
-        emit_str(s, IR_LOAD)
+        format_into(s, "  %.{reg} = load ")
         emit_match_phi_type(s, result)
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, result.slot)
-        emit_str(s, IR_NL)
+        format_into(s, ", ptr %.{result.slot}\n")
     reg
 
 # AGAST #1946: the merge phi's type: the arms' struct, their float, or i64.
@@ -663,25 +593,25 @@ fn emit_match_phi_type(s: *EmitterState, result: *MatchResult)
     if result.agg_name != null and result.agg_name_len > 0
         emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 })
     else if result.ptr_ty == 1
-        emit_str(s, c"ptr")
+        format_into(s, "ptr")
     else if result.float_ty != TypeKind.Void
-        emit_str(s, float_llvm_name(result.float_ty))
+        format_into(s, "{llvm_text(float_llvm_name(result.float_ty))}")
     else
-        emit_str(s, c"i64")
+        format_into(s, "i64")
 
 # AGAST #1946: one phi incoming value: the arm's register, or for
 # MATCH_ZERO_VALUE the zero constant of the phi's type.
 fn emit_match_phi_value(s: *EmitterState, result: *MatchResult, reg: i32)
     if reg != MATCH_ZERO_VALUE
-        emit_reg(s, reg)
+        format_into(s, "%.{reg}")
     else if result.agg_name != null and result.agg_name_len > 0
-        emit_str(s, c"zeroinitializer")
+        format_into(s, "zeroinitializer")
     else if result.ptr_ty == 1
-        emit_str(s, c"null")
+        format_into(s, "null")
     else if result.float_ty != TypeKind.Void
-        emit_str(s, c"0.0")
+        format_into(s, "0.0")
     else
-        emit_str(s, c"0")
+        format_into(s, "0")
 
 # AGAST #1946: publish the phi's type for an untyped `let v = match` / `if`
 # (#1666).  Called after every arm, so the outermost construct's type wins.
@@ -696,14 +626,12 @@ fn publish_match_type(s: *EmitterState, result: *MatchResult)
         s.last_match_float_ty = result.float_ty
 
 # AGAST #2342: what `Constructor(v)` binds, as bool_kind would say.
-fn payload_bool_kind(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrView) -> i32
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    if enum_name == null or enum_name_len <= 0
+fn payload_bool_kind(s: *EmitterState, arm: *MatchArm, enum_name: StrView) -> i32
+    if unnamed(enum_name)
         return BK_UNSURE
-    if is_tagged_enum_type(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
-        return bk_tagged_binding(StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }))   # AGAST #4280: `ptr_T` too
-    let uf: *StructField = user_enum_tuple_field(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm))
+    if is_tagged_enum_type(enum_name) == 1
+        return bk_tagged_binding(enum_name, arm_payload_sel(arm))   # AGAST #4280: `ptr_T` too
+    let uf: *StructField = user_enum_tuple_field(s.mono.pctx, enum_name, user_arm_variant(s.mono.pctx, enum_name, arm))
     if uf == null
         return BK_UNSURE
     bk_of_type(uf.field_type, StrView { ptr: (uf.field_type_name), len: (uf.field_type_name_len) as i64 })
@@ -712,19 +640,17 @@ fn payload_bool_kind(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrView) ->
 # enum's variant with fields takes exactly one binding per field.  Otherwise
 # the located error, and 0: nothing is bound.  Result / Option, unknown
 # variants and unit variants are left to the checks that already cover them.
-fn user_arm_arity_ok(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrView) -> i32
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    let ei: i32 = user_enum_index(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
+fn user_arm_arity_ok(s: *EmitterState, arm: *MatchArm, enum_name: StrView) -> bool
+    let ei: i32 = user_enum_index(s.mono.pctx, enum_name)
     if ei < 0
-        return 1
-    let vi: i32 = enum_variant_index(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+        return true
+    let vi: i32 = enum_variant_index(s.mono.pctx, enum_name, arm_name(arm))
     if vi < 0
-        return 1
+        return true
     let nf: i32 = enum_variant_field_count(s.mono.pctx, ei, vi)
     let nb: i32 = arm_bind_count(arm)
     if nf == 0 or nf == nb
-        return 1
+        return true
     var line: i32 = arm.head_span.line
     var col: i32 = arm.head_span.col
     if line <= 0
@@ -732,118 +658,99 @@ fn user_arm_arity_ok(s: *EmitterState, arm: *MatchArm, enum_name_sv: StrView) ->
         col = arm.pattern_inner_span.col
     emit_nd_error_begin(s, line, col)
     eprints("pattern `")
-    eprint_bytes(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+    eprint_bytes(arm_name(arm))
     eprint("` binds {nb as i64} field(s), but the variant has {nf as i64}\n")
-    0
+    false
 
 # Bind the payload binding `arm` has selected (arm_select_bind), as a local
 # of the field's type for the rest of the arm.
-fn emit_arm_payload_bind(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name_sv: StrView)
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    if arm.pattern_inner_kind == PAT_IDENT
-        if arm.pattern_inner_name_len > 0
-            var is_wildcard: i32 = 0
-            if arm.pattern_inner_name_len == 1
-                if *arm.pattern_inner_name == '_'   # '_'
-                    is_wildcard = 1
-            var pay_struct: *u8 = null
-            var pay_struct_len: i32 = 0
-            var ptr_struct: *u8 = null
-            var ptr_struct_len: i32 = 0
-            var ptr_kind: TypeKind = TypeKind.Void
-            var ptr_prim: TypeKind = TypeKind.Void
-            if is_wildcard == 0 and scrut_slot != 0
-                carrier_payload_struct(s, arm, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, @pay_struct, @pay_struct_len)
-                ptr_kind = carrier_payload_ptr_struct(s, arm, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, @ptr_struct, @ptr_struct_len)
-                if ptr_kind == TypeKind.Void and pay_struct == null
-                    ptr_prim = carrier_payload_ptr_primitive(s, arm, enum_name, enum_name_len)   # AGAST #4448
-            if is_wildcard == 0 and pay_struct == null and ptr_kind == TypeKind.Void and scrut_slot != 0 and emit_array_payload_bind(s, arm, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
-                is_wildcard = 1   # AGAST #3029: bound, as the `[N]T` it is
-            if is_wildcard == 0 and ptr_kind != TypeKind.Void
-                # AGAST #2436: `Some(v)` over `Option<*Pair>`: v is a `*Pair`.
-                var ptr_variant: i32 = 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-                let puvi: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
-                if puvi >= 0
-                    ptr_variant = puvi
-                emit_ptr_payload_bind(s, arm, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, ptr_variant, ptr_kind, StrView { ptr: (ptr_struct), len: (ptr_struct_len) as i64 })
-                bool_note_binding(s, payload_bool_kind(s, arm, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }))   # AGAST #2342
-            else if is_wildcard == 0 and ptr_prim != TypeKind.Void
-                # AGAST #4448: `Some(n)` over `Option<*u8>`: n is a `*u8`.
-                emit_primitive_ptr_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, ptr_prim)
-                bool_note_binding(s, payload_bool_kind(s, arm, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }))
-            else if is_wildcard == 0 and pay_struct != null
-                emit_struct_payload_bind(s, arm, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (pay_struct), len: (pay_struct_len) as i64 })
-                # AGAST #2174: it owns the payload of a scrutinee the
-                # match owns.
-                own_match_payload(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 })
-            else if is_wildcard == 0
-                var payload_reg: i32 = 0
-                # AGAST #1945: a float payload binds as an f32 / f64 local.
-                var bind_ft: TypeKind = TypeKind.Void
-                # AGAST #3116: a narrow integer payload binds as its own
-                # type (an `i<bits>` local), as a typed `let` does.
-                var bind_nt: TypeKind = TypeKind.Void
-                # AGAST #3345: its integer type, i64 / u64 too, for
-                # the lossy-conversion check (narrow_note_binding).
-                var bind_it: TypeKind = TypeKind.Void
-                if scrut_slot != 0 and enum_name != null and enum_name_len > 0
-                    # Result/Option: 0 Ok-Some, 1 Err; a user enum: the
-                    # variant's own tag (AGAST #1797), for its width.
-                    var pay_variant: i32 = 1 - variant_is_tag_one(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-                    let uvi: i32 = user_arm_variant(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, arm)
-                    if uvi >= 0
-                        pay_variant = uvi
-                    payload_reg = emit_variant_payload(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, pay_variant)
-                    bind_ft = tagged_enum_float_type(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, pay_variant)
-                    bind_nt = tagged_enum_narrow_int_type(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, pay_variant)
-                    bind_it = tagged_enum_int_type(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, pay_variant)
-                else
-                    # Non-enum scrutinee (shouldn't reach here in practice).
-                    payload_reg = scrut_reg
-                var bind_llvm: *u8 = c"i64"
-                var bind_type: TypeKind = TypeKind.I64
-                if bind_ft != TypeKind.Void
-                    bind_llvm = float_llvm_name(bind_ft)
-                    bind_type = bind_ft
-                else if bind_nt != TypeKind.Void
-                    bind_type = bind_nt
-                    bind_llvm = narrow_int_llvm(bind_nt)
-                    # The payload was widened to an i64 register; the
-                    # local holds it at its width, truncated back.
-                    let narrow_reg: i32 = next_reg(s)
-                    emit_str(s, IR_INDENT)
-                    emit_reg(s, narrow_reg)
-                    emit_str(s, IR_TRUNC)
-                    emit_reg(s, payload_reg)
-                    emit_str(s, IR_TO_SP)
-                    emit_str(s, bind_llvm)
-                    emit_str(s, IR_NL)
-                    payload_reg = narrow_reg
-                let alloca_reg: i32 = next_reg(s)
-                entry_alloca_reg_begin(s, alloca_reg)
-                emit_str(s, bind_llvm)
-                emit_str(s, c"  ; match payload bind\n")
-                entry_alloca_reg_end(s)
-                emit_str(s, IR_STORE_IND)
-                emit_str(s, bind_llvm)
-                emit_str(s, IR_SP)
-                emit_reg(s, payload_reg)
-                emit_str(s, IR_PTR_SEP)
-                emit_reg(s, alloca_reg)
-                emit_str(s, IR_NL)
-                add_local(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, bind_type)
-                narrow_note_binding(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, bind_it)   # AGAST #3345
-                if bind_ft == TypeKind.Void
-                    bool_note_binding(s, payload_bool_kind(s, arm, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }))   # AGAST #2342
+fn emit_arm_payload_bind(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: StrView)
+    if arm.pattern_inner_kind != PAT_IDENT or arm.pattern_inner_name_len <= 0
+        return
+    let is_wildcard_name: bool = arm.pattern_inner_name_len == 1 and *arm.pattern_inner_name == '_'
+    if is_wildcard_name
+        return
+    var pay_struct: StrView = no_name()
+    var ptr_struct: StrView = no_name()
+    var ptr_kind: TypeKind = TypeKind.Void
+    var ptr_prim: TypeKind = TypeKind.Void
+    if scrut_slot != 0
+        pay_struct = carrier_payload_struct(s, arm, enum_name)
+        ptr_kind = carrier_payload_ptr_struct(s, arm, enum_name, @ptr_struct)
+        if ptr_kind == TypeKind.Void and unnamed(pay_struct)
+            ptr_prim = carrier_payload_ptr_primitive(s, arm, enum_name)   # AGAST #4448
+    if unnamed(pay_struct) and ptr_kind == TypeKind.Void and scrut_slot != 0 and emit_array_payload_bind(s, arm, scrut_slot, enum_name) == 1
+        return   # AGAST #3029: bound, as the `[N]T` it is
+    if ptr_kind != TypeKind.Void
+        # AGAST #2436: `Some(v)` over `Option<*Pair>`: v is a `*Pair`.
+        var ptr_variant: i32 = arm_payload_sel(arm)
+        let puvi: i32 = user_arm_variant(s.mono.pctx, enum_name, arm)
+        if puvi >= 0
+            ptr_variant = puvi
+        emit_ptr_payload_bind(s, arm, scrut_slot, enum_name, ptr_variant, ptr_kind, ptr_struct)
+        bool_note_binding(s, payload_bool_kind(s, arm, enum_name))   # AGAST #2342
+        return
+    if ptr_prim != TypeKind.Void
+        # AGAST #4448: `Some(n)` over `Option<*u8>`: n is a `*u8`.
+        emit_primitive_ptr_payload_bind(s, arm, scrut_slot, enum_name, ptr_prim)
+        bool_note_binding(s, payload_bool_kind(s, arm, enum_name))
+        return
+    if not unnamed(pay_struct)
+        emit_struct_payload_bind(s, arm, scrut_slot, enum_name, pay_struct)
+        # AGAST #2174: it owns the payload of a scrutinee the match owns.
+        own_match_payload(s, arm_inner_name(arm))
+        return
+    var payload_reg: i32 = 0
+    # AGAST #1945: a float payload binds as an f32 / f64 local.
+    var bind_ft: TypeKind = TypeKind.Void
+    # AGAST #3116: a narrow integer payload binds as its own type (an
+    # `i<bits>` local), as a typed `let` does.
+    var bind_nt: TypeKind = TypeKind.Void
+    # AGAST #3345: its integer type, i64 / u64 too, for the
+    # lossy-conversion check (narrow_note_binding).
+    var bind_it: TypeKind = TypeKind.Void
+    if scrut_slot != 0 and not unnamed(enum_name)
+        # Result/Option: 0 Ok-Some, 1 Err; a user enum: the variant's own
+        # tag (AGAST #1797), for its width.
+        var pay_variant: i32 = arm_payload_sel(arm)
+        let uvi: i32 = user_arm_variant(s.mono.pctx, enum_name, arm)
+        if uvi >= 0
+            pay_variant = uvi
+        payload_reg = emit_variant_payload(s, scrut_slot, enum_name, pay_variant)
+        bind_ft = tagged_enum_float_type(s, enum_name, pay_variant)
+        bind_nt = tagged_enum_narrow_int_type(s, enum_name, pay_variant)
+        bind_it = tagged_enum_int_type(s, enum_name, pay_variant)
+    else
+        # Non-enum scrutinee (shouldn't reach here in practice).
+        payload_reg = scrut_reg
+    var bind_llvm: StrView = "i64"
+    var bind_type: TypeKind = TypeKind.I64
+    if bind_ft != TypeKind.Void
+        bind_llvm = llvm_text(float_llvm_name(bind_ft))
+        bind_type = bind_ft
+    else if bind_nt != TypeKind.Void
+        bind_type = bind_nt
+        bind_llvm = narrow_int_llvm(bind_nt)
+        # The payload was widened to an i64 register; the local holds it
+        # at its width, truncated back.
+        let narrow_reg: i32 = next_reg(s)
+        format_into(s, "  %.{narrow_reg} = trunc i64 %.{payload_reg} to {bind_llvm}\n")
+        payload_reg = narrow_reg
+    let alloca_reg: i32 = next_reg(s)
+    entry_alloca_reg_begin(s, alloca_reg)
+    format_into(s, "{bind_llvm}  ; match payload bind\n")
+    entry_alloca_reg_end(s)
+    format_into(s, "  store {bind_llvm} %.{payload_reg}, ptr %.{alloca_reg}\n")
+    add_local(s, arm_inner_name(arm), alloca_reg, bind_type)
+    narrow_note_binding(s, arm_inner_name(arm), bind_it)   # AGAST #3345
+    if bind_ft == TypeKind.Void
+        bool_note_binding(s, payload_bool_kind(s, arm, enum_name))   # AGAST #2342
 
 # Emit match body, returning (result_reg, exit_label) via MatchResult slot.
 # For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v`), the inner
 # name is bound to the extracted payload for the duration of the arm body,
 # then popped via local_count rollback. (task-99 #105)
-fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name_sv: StrView, result: *MatchResult, arm_index: i32, end_label: i32)
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
+fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: StrView, result: *MatchResult, arm_index: i32, end_label: i32)
     # Save local_count so arm-scoped bindings get popped after the body.
     let saved_local_count: i32 = s.local_count
     # AGAST #3345: the arm's bindings (and lets) leave the narrowing table too.
@@ -853,51 +760,51 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     # Bind variant payload to inner pattern name on `Constructor(binding)`;
     # AGAST #1295: every binding of `V(a, b, ..)`, each field at its offset.
     if arm.pattern_kind == PAT_VARIANT
-        if user_arm_arity_ok(s, arm, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
+        if user_arm_arity_ok(s, arm, enum_name)
             let nb: i32 = arm_bind_count(arm)
             for k in 0..nb
                 arm_select_bind(arm, k)
-                emit_arm_payload_bind(s, arm, scrut_reg, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
+                emit_arm_payload_bind(s, arm, scrut_reg, scrut_slot, enum_name)
             arm_select_bind(arm, 0)
 
     # A catch-all name over a scalar (`other => other + 1`) binds the
     # scrutinee, as in ritz0 (LANGUAGE_SPEC §8.2).  Not a const (that arm
     # compares) and not `None` (the tagged-enum null test above).
-    if arm.pattern_kind == PAT_IDENT and (enum_name == null or enum_name_len == 0)
+    if arm.pattern_kind == PAT_IDENT and unnamed(enum_name)
         if s.match_scrut_str == 1
             # AGAST #1876: a name over a StrView binds the StrView.
             let str_reg: i32 = next_reg(s)
-            entry_alloca_reg(s, str_reg, c"%StrView", c"match binding")
-            emit_str(s, c"  store %StrView ")
-            emit_reg(s, scrut_reg)
-            emit_str(s, IR_PTR_SEP)
-            emit_reg(s, str_reg)
-            emit_str(s, IR_NL)
-            add_local_struct(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, str_reg, TypeKind.Struct, StrView { ptr: (c"StrView"), len: (7) as i64 })
-        else if find_const_entry(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == null and is_ident_none_name(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 0
+            entry_alloca_reg_begin(s, str_reg)
+            format_into(s, "%StrView  ; match binding\n")
+            entry_alloca_reg_end(s)
+            format_into(s, "  store %StrView %.{scrut_reg}, ptr %.{str_reg}\n")
+            add_local_struct(s, arm_name(arm), str_reg, TypeKind.Struct, "StrView")
+        else if find_const_entry(s, arm_name(arm)) == null and not is_ident_none_name(arm_name(arm))
             let bind_reg: i32 = next_reg(s)
-            entry_alloca_reg(s, bind_reg, c"i64", c"match binding")
+            entry_alloca_reg_begin(s, bind_reg)
+            format_into(s, "i64  ; match binding\n")
+            entry_alloca_reg_end(s)
             emit_store_typed(s, IR_TY_I64, scrut_reg, bind_reg)
-            add_local(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, bind_reg, TypeKind.I64)
+            add_local(s, arm_name(arm), bind_reg, TypeKind.I64)
             bool_note_binding(s, s.match_scrut_kind)   # AGAST #2342
-            narrow_note_binding(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, s.match_scrut_int)   # AGAST #3358
+            narrow_note_binding(s, arm_name(arm), s.match_scrut_int)   # AGAST #3358
 
     # AGAST #4596: over an enum, a name that isn't one of its variants binds
     # the scrutinee too (§8.2): a copy of the `%E` value, so a repr enum's
     # `other as i32` sees a discriminant naming no variant.  ritz0's twin is
     # `binds_scrutinee` in _emit_enum_match.
-    if arm.pattern_kind == PAT_IDENT and enum_name != null and enum_name_len > 0
-        if arm_binds_enum_value(s.mono.pctx, arm, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
+    if arm.pattern_kind == PAT_IDENT and not unnamed(enum_name)
+        if arm_binds_enum_value(s.mono.pctx, arm, enum_name) == 1
             let enum_bind: i32 = next_reg(s)
             entry_alloca_reg_begin_named(s, enum_bind)
-            emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-            emit_str(s, c"  ; match binding\n")
+            emit_name(s, enum_name)
+            format_into(s, "  ; match binding\n")
             entry_alloca_reg_end(s)
-            emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, scrut_reg, enum_bind)
-            add_local_struct(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, enum_bind, TypeKind.Struct, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
+            emit_struct_store_or_copy(s, TypeKind.Struct, enum_name, scrut_reg, enum_bind)
+            add_local_struct(s, arm_name(arm), enum_bind, TypeKind.Struct, enum_name)
             # AGAST #4602: of a move-only scrutinee the match owns, the
             # binding takes it (the scrutinee's flag clears): it drops once.
-            own_match_payload(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+            own_match_payload(s, arm_name(arm))
 
     # Block-bodied / statement arm (AGAST #1454, #1617): run the leading
     # statements in the arm's own scope (they are popped with the payload
@@ -910,8 +817,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     var body_reg: i32 = MATCH_ZERO_VALUE
     var lent_arm: *LocalVar = null
     # AGAST #4168: the aggregate type a nested match / if arm published.
-    var nested_ty: *u8 = null
-    var nested_ty_len: i32 = 0
+    var nested_ty: StrView = no_name()
     # AGAST #4408: the tuple name tuple_lit_name decided for the arm, which
     # used to be written onto the literal for the phi-typing step to read.
     var arm_lit_name: *u8 = null
@@ -937,7 +843,8 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         lent_arm = lent_referent_local(s, arm.body)
         # AGAST #3005: a nameless tuple arm takes the type an earlier arm
         # fixed, or its own elements', with this arm's bindings in scope.
-        tuple_lit_name(s, arm.body, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }, @arm_lit_name, @arm_lit_name_len)
+        let agg_sv: StrView = StrView { ptr: result.agg_name, len: result.agg_name_len as i64 }
+        tuple_lit_name(s, arm.body, agg_sv, @arm_lit_name, @arm_lit_name_len)
         if lent_arm != null and discarded
             body_reg = MATCH_ZERO_VALUE   # AGAST #3028: nothing reads it
         else if lent_arm != null
@@ -950,8 +857,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
                 s.match_float_hint = result.hint_ty
             body_reg = emit_expr(s, arm.body)
             if nested   # it published (or cleared) its own phi type
-                nested_ty = s.last_match_agg_name
-                nested_ty_len = s.last_match_agg_name_len
+                nested_ty = StrView { ptr: s.last_match_agg_name, len: s.last_match_agg_name_len as i64 }
     if result.into != null
         body_reg = MATCH_ZERO_VALUE   # stored; no phi reads it
     else if arm.is_pass == 0 and arm.body != null and body_reg == 0
@@ -972,73 +878,67 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     else if arm.is_pass == 0 and arm.body != null
         # AGAST #1645: resolve the arm's struct type while its pattern
         # binding (`Some(v) => v`) is still in scope; it is popped below.
-        var arm_ty: *u8 = null
-        var arm_ty_len: i32 = 0
+        var arm_ty: StrView = no_name()
         if lent_arm != null
-            arm_ty = lv_type_name(lent_arm)
-            arm_ty_len = lv_type_name_len(lent_arm)
+            arm_ty = StrView { ptr: (lv_type_name(lent_arm)), len: (lv_type_name_len(lent_arm)) as i64 }
         # AGAST #4168: a nested match / if arm is of the type its own phi
         # published; the outer phi stayed i64 over its %S value.
-        if arm_ty == null and nested_ty != null and nested_ty_len > 0
+        if unnamed(arm_ty) and not unnamed(nested_ty)
             arm_ty = nested_ty
-            arm_ty_len = nested_ty_len
         # AGAST #2512: a `Some(v)` the slot built as the builtin (#2453) is
         # the slot's enum, not the user enum that also declares `Some`: that
         # typed the phi %E over the arm's %Option$i32.  A `None` the slot
         # built as the builtin is the same (#2434): variant_ctor_arm_type
         # leaves a user's to resolve_expr_struct_name.
-        let call_arm: i32 = (arm.body.kind == ExprKind.Call and not users_variant_wins(s, arm.body)) as i32
-        if arm_ty == null and (call_arm == 1 or arm.body.kind == ExprKind.Ident)
-            variant_ctor_arm_type(s, arm.body, @arm_ty, @arm_ty_len)
-        if arm_ty == null
-            instance_ctor_arm_type(s, arm.body, @arm_ty, @arm_ty_len)   # AGAST #3117
-        if arm_ty == null
-            let span_ty: StrView = span_assoc_arm_type(s, arm.body)   # AGAST #4194
-            if span_ty.ptr != null
-                arm_ty = span_ty.ptr
-                arm_ty_len = span_ty.len as i32
-        if arm_ty == null
-            qualified_unit_variant_arm_type(s.mono.pctx, arm.body, @arm_ty, @arm_ty_len)   # AGAST #3205
-        if arm_ty == null
-            resolve_expr_struct_name(s, arm.body, @arm_ty, @arm_ty_len)
+        let call_arm: bool = arm.body.kind == ExprKind.Call and not users_variant_wins(s, arm.body)
+        if unnamed(arm_ty) and (call_arm or arm.body.kind == ExprKind.Ident)
+            arm_ty = variant_ctor_arm_type(s, arm.body)
+        if unnamed(arm_ty)
+            arm_ty = instance_ctor_arm_type(s, arm.body)   # AGAST #3117
+        if unnamed(arm_ty)
+            arm_ty = span_assoc_arm_type(s, arm.body)   # AGAST #4194
+        if unnamed(arm_ty)
+            arm_ty = qualified_unit_variant_arm_type(s.mono.pctx, arm.body)   # AGAST #3205
+        if unnamed(arm_ty)
+            arm_ty = named_by(resolve_expr_struct_name, s, arm.body)
         # #4408: resolve reads a struct literal's own `ident_ptr`; a tuple
         # literal no longer carries the name, so use the one it returned.
         # Only a literal has a type name here: for any other arm tuple_lit_name
         # returns the expression's own ident_ptr, which is not a type.
-        if arm_ty == null and arm.body.kind == ExprKind.StructLit and arm_lit_name != null and arm_lit_name_len > 0
-            arm_ty = arm_lit_name
-            arm_ty_len = arm_lit_name_len
-        if arm_ty == null
-            variant_ctor_arm_type(s, arm.body, @arm_ty, @arm_ty_len)
+        if unnamed(arm_ty) and arm.body.kind == ExprKind.StructLit and arm_lit_name != null and arm_lit_name_len > 0
+            arm_ty = StrView { ptr: arm_lit_name, len: arm_lit_name_len as i64 }
+        if unnamed(arm_ty)
+            arm_ty = variant_ctor_arm_type(s, arm.body)
         # AGAST #2559: a static or global-receiver method call (`B.new(..)`)
         # returning a struct, which resolve_expr_struct_name leaves untyped.
-        if arm_ty == null
-            call_result_struct_name(s, arm.body, @arm_ty, @arm_ty_len)
+        if unnamed(arm_ty)
+            arm_ty = named_by(call_result_struct_name, s, arm.body)
         # AGAST #2950: `*r` with `r: @C` / `@&C` / `*C` loads the %C
         # deref_pointee_struct_name names; the phi was i64 over it.
-        if arm_ty == null and arm.body.kind == ExprKind.Unary and arm.body.op == OpKind.Deref
-            deref_pointee_struct_name(s, arm.body.operand, @arm_ty, @arm_ty_len)
+        if unnamed(arm_ty) and arm.body.kind == ExprKind.Unary and arm.body.op == OpKind.Deref
+            arm_ty = named_by(deref_pointee_struct_name, s, arm.body.operand)
         # The first struct-valued arm fixes the phi type.  A `"..."` arm is a
         # StrView in the language; its `%Span$u8` lowering (#98) is an
         # artefact, so a leading literal arm types the phi as StrView, the
         # same type a later `Some(s) => s` over Option<StrView> yields.
-        if result.agg_name == null and arm_ty != null and arm_ty_len > 0
+        if result.agg_name == null and not unnamed(arm_ty)
             if arm.body.kind == ExprKind.StringLit
-                result.agg_name = c"StrView"
+                result.agg_name = "StrView".as_ptr()
                 result.agg_name_len = 7
             else
-                result.agg_name = arm_ty
-                result.agg_name_len = arm_ty_len
+                result.agg_name = arm_ty.ptr
+                result.agg_name_len = arm_ty.len as i32
+        let agg_name: StrView = StrView { ptr: result.agg_name, len: result.agg_name_len as i64 }
         # AGAST #1662: rebuild a layout-equivalent arm value (Span$u8 <->
         # StrView, #168) as the phi's type here, in the arm's own block before
         # its `br`, so every phi incoming value has the phi's type.
-        if is_layout_equiv_pair(StrView { ptr: (arm_ty), len: (arm_ty_len) as i64 }, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }) == 1
-            body_reg = rebuild_layout_equiv(s, body_reg, StrView { ptr: (arm_ty), len: (arm_ty_len) as i64 }, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 })
+        if is_layout_equiv_pair(arm_ty, agg_name) == 1
+            body_reg = rebuild_layout_equiv(s, body_reg, arm_ty, agg_name)
         # AGAST #2950: an `@&x` arm is a `ptr`, any other scalar an i64.  In
         # an i64 phi (another arm is a `*C`, or the pre-scan couldn't see the
         # arm's own `let`) it is converted.  The reverse can't happen: no arm
         # name shadows the one the pre-scan read.
-        if result.agg_name == null and arm_ty == null and result.ptr_ty == 0
+        if result.agg_name == null and unnamed(arm_ty) and result.ptr_ty == 0
             if arm_value_is_ptr(s, arm.body) == 1
                 body_reg = ptr_value_to_i64(s, arm.body, body_reg)
         # AGAST #1946: a float-valued scalar arm types the phi as float.
@@ -1062,9 +962,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     if arm_index + 1 > result.count
         result.count = arm_index + 1
 
-    emit_str(s, IR_BR)
-    emit_label(s, end_label)
-    emit_str(s, IR_NL)
+    format_into(s, "  br label %L{end_label}\n")
 
 # AGAST #3276: an arm of a `match` of whole arrays stores its value at `into`,
 # with its pattern binding in scope, as emit_array_arm_into does an `if` arm's
@@ -1073,7 +971,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
 # would leave the array unwritten, and is refused.
 fn match_arm_array_into(s: *EmitterState, arm: *MatchArm, into: *ArrayInto)
     if arm.is_pass == 1
-        emit_ir_error(s, arm.pass_span, c"a `match` arm stored into a whole array has no value (`pass`); give it an `[N]T`")
+        emit_ir_error_sv(s, arm.pass_span, "a `match` arm stored into a whole array has no value (`pass`); give it an `[N]T`")
         return
     if arm.body == null
         return
@@ -1088,88 +986,44 @@ fn match_arm_array_into(s: *EmitterState, arm: *MatchArm, into: *ArrayInto)
 # emit_match_arm's branch.  ritz0's twin is _emit_strview_match.
 fn emit_str_pattern_test(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, miss: i32) -> i32
     let len_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, len_reg)
-    emit_str(s, c" = extractvalue %StrView ")
-    emit_reg(s, scrut_reg)
-    emit_str(s, IR_COMMA_1)
+    format_into(s, "  %.{len_reg} = extractvalue %StrView %.{scrut_reg}, 1\n")
     let same_len: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, same_len)
-    emit_str(s, c" = icmp eq i64 ")
-    emit_reg(s, len_reg)
-    emit_str(s, IR_COMMA)
-    emit_int(s, arm.pattern_name_len as i64)
-    emit_str(s, IR_NL)
+    let want_len: i64 = arm.pattern_name_len as i64
+    format_into(s, "  %.{same_len} = icmp eq i64 %.{len_reg}, {want_len}\n")
     if arm.pattern_name_len == 0
         return same_len
     let bytes_label: i32 = next_label(s)
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, same_len)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, bytes_label)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, miss)
-    emit_str(s, IR_NL)
+    format_into(s, "  br i1 %.{same_len}, label %L{bytes_label}, label %L{miss}\n")
     begin_block(s, bytes_label)
     let ptr_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, ptr_reg)
-    emit_str(s, c" = extractvalue %StrView ")
-    emit_reg(s, scrut_reg)
-    emit_str(s, IR_COMMA_0)
+    format_into(s, "  %.{ptr_reg} = extractvalue %StrView %.{scrut_reg}, 0\n")
     var acc: i32 = 0
     for k in 0..arm.pattern_name_len
         let at_reg: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, at_reg)
-        emit_str(s, c" = getelementptr i8, ptr ")
-        emit_reg(s, ptr_reg)
-        emit_str(s, IR_I64_SEP)
-        emit_int(s, k as i64)
-        emit_str(s, IR_NL)
+        format_into(s, "  %.{at_reg} = getelementptr i8, ptr %.{ptr_reg}, i64 {k as i64}\n")
         let byte_reg: i32 = next_reg(s)
         emit_load_into(s, IR_TY_I8, byte_reg, at_reg)
         let hit: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, hit)
-        emit_str(s, c" = icmp eq i8 ")
-        emit_reg(s, byte_reg)
-        emit_str(s, IR_COMMA)
-        emit_int(s, *(arm.pattern_name + k) as i64)
-        emit_str(s, IR_NL)
+        let want_byte: i64 = *(arm.pattern_name + k) as i64
+        format_into(s, "  %.{hit} = icmp eq i8 %.{byte_reg}, {want_byte}\n")
         if acc == 0
             acc = hit
         else
             let both: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, both)
-            emit_str(s, c" = and i1 ")
-            emit_reg(s, acc)
-            emit_str(s, IR_COMMA)
-            emit_reg(s, hit)
-            emit_str(s, IR_NL)
+            format_into(s, "  %.{both} = and i1 %.{acc}, %.{hit}\n")
             acc = both
     acc
 
 # One pattern's test (`pat` is an arm, or an alternative of its or-pattern):
 # the i1 register that says it matches, or 0 with *always set when it takes
 # every value.  A string test branches to `miss` on a length mismatch.
-fn emit_pattern_test(s: *EmitterState, pat: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name_sv: StrView, miss: i32, always: *i32) -> i32
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
+fn emit_pattern_test(s: *EmitterState, pat: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: StrView, miss: i32, always: *i32) -> i32
     var cond_reg: i32 = 0
-    let is_enum_match: i32 = (enum_name != null and enum_name_len > 0) as i32
+    let is_enum_match: bool = not unnamed(enum_name)
 
     if pat.pattern_kind == PAT_INT_LIT or pat.pattern_kind == PAT_CHAR or pat.pattern_kind == PAT_BOOL
         cond_reg = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, cond_reg)
-        emit_str(s, c" = icmp eq i64 ")
-        emit_reg(s, scrut_reg)
-        emit_str(s, IR_COMMA)
-        emit_int(s, pat.pattern_int)
-        emit_str(s, IR_NL)
+        format_into(s, "  %.{cond_reg} = icmp eq i64 %.{scrut_reg}, {pat.pattern_int}\n")
     else if pat.pattern_kind == PAT_STR
         cond_reg = emit_str_pattern_test(s, pat, scrut_reg, miss)
     else if pat.pattern_kind == PAT_WILDCARD
@@ -1179,47 +1033,39 @@ fn emit_pattern_test(s: *EmitterState, pat: *MatchArm, scrut_reg: i32, scrut_slo
         # First try the user-enum tracker so user-declared variants resolve
         # to their proper tag index; fall back to None/Err special-casing
         # for tagged enums; otherwise treat as a binding (*always).
-        if is_enum_match == 1 and is_enum_type(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
-            let user_idx: i32 = enum_variant_index(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 })
+        if is_enum_match and is_enum_type(s.mono.pctx, enum_name) == 1
+            let user_idx: i32 = enum_variant_index(s.mono.pctx, enum_name, arm_name(pat))
             if user_idx >= 0
-                cond_reg = emit_variant_tag_check_eq(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_idx)
-        if cond_reg == 0 and pat.pattern_name_len == 4
-            if *pat.pattern_name == 'N' and *(pat.pattern_name + 1) == 'o'
-                if *(pat.pattern_name + 2) == 'n' and *(pat.pattern_name + 3) == 'e'
-                    # "None": null variant → tag != 0
-                    if is_enum_match == 1
-                        cond_reg = emit_variant_tag_check(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, 0)
-                    else
-                        cond_reg = emit_variant_tag_check_i64(s, scrut_reg, 0)
+                cond_reg = emit_variant_tag_check_eq(s, scrut_slot, enum_name, user_idx)
+        if cond_reg == 0 and arm_name(pat).eq("None")
+            # "None": null variant → tag != 0
+            if is_enum_match
+                cond_reg = emit_variant_tag_check(s, scrut_slot, enum_name, false)
+            else
+                cond_reg = emit_variant_tag_check_i64(s, scrut_reg, false)
         # A constant pattern (LANGUAGE_SPEC §8.2, AGAST #1880): a name that
         # is an integer const compares, as ritz0 does; any other binds.
-        if cond_reg == 0 and is_enum_match == 0
-            let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 })
+        if cond_reg == 0 and not is_enum_match
+            let ce: *ConstEntry = find_const_entry(s, arm_name(pat))
             if ce != null and is_int_const_type(ce.const_type) == 1
                 cond_reg = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, cond_reg)
-                emit_str(s, c" = icmp eq i64 ")
-                emit_reg(s, scrut_reg)
-                emit_str(s, IR_COMMA)
-                emit_int(s, ce.value)
-                emit_str(s, IR_NL)
+                format_into(s, "  %.{cond_reg} = icmp eq i64 %.{scrut_reg}, {ce.value}\n")
         if cond_reg == 0
             *always = 1
     else if pat.pattern_kind == PAT_VARIANT
         # User-declared enum: look up the variant's tag index from the
         # parser's enum tracker (Shade.Light=0, Shade.Dark=1).  Falls back
         # to the binary Some/Ok-vs-None/Err mapping for tagged enums.
-        if is_enum_match == 1 and is_enum_type(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }) == 1
-            let user_idx: i32 = enum_variant_index(s.mono.pctx, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 })
+        if is_enum_match and is_enum_type(s.mono.pctx, enum_name) == 1
+            let user_idx: i32 = enum_variant_index(s.mono.pctx, enum_name, arm_name(pat))
             if user_idx >= 0
-                cond_reg = emit_variant_tag_check_eq(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, user_idx)
+                cond_reg = emit_variant_tag_check_eq(s, scrut_slot, enum_name, user_idx)
             else
                 *always = 1
         else
-            let tag_one: i32 = variant_is_tag_one(StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 })
-            if is_enum_match == 1
-                cond_reg = emit_variant_tag_check(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, tag_one)
+            let tag_one: bool = variant_is_tag_one(arm_name(pat))
+            if is_enum_match
+                cond_reg = emit_variant_tag_check(s, scrut_slot, enum_name, tag_one)
             else
                 cond_reg = emit_variant_tag_check_i64(s, scrut_reg, tag_one)
     else
@@ -1227,9 +1073,7 @@ fn emit_pattern_test(s: *EmitterState, pat: *MatchArm, scrut_reg: i32, scrut_slo
 
     cond_reg
 
-fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name_sv: StrView, result: *MatchResult, arm_index: i32, end_label: i32)
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
+fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: StrView, result: *MatchResult, arm_index: i32, end_label: i32)
     let body_label: i32 = next_label(s)
     let next_label_id: i32 = next_label(s)
 
@@ -1242,34 +1086,22 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
         if pat.or_next != null
             miss = next_label(s)
         var always_true: i32 = 0
-        let cond_reg: i32 = emit_pattern_test(s, pat, scrut_reg, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, miss, @always_true)
+        let cond_reg: i32 = emit_pattern_test(s, pat, scrut_reg, scrut_slot, enum_name, miss, @always_true)
         if always_true == 1
-            emit_str(s, IR_BR)
-            emit_label(s, body_label)
-            emit_str(s, IR_NL)
+            format_into(s, "  br label %L{body_label}\n")
         else
-            emit_str(s, c"  br i1 ")
-            emit_reg(s, cond_reg)
-            emit_str(s, IR_LABEL_SEP)
-            emit_label(s, body_label)
-            emit_str(s, IR_LABEL_SEP)
-            emit_label(s, miss)
-            emit_str(s, IR_NL)
+            format_into(s, "  br i1 %.{cond_reg}, label %L{body_label}, label %L{miss}\n")
         if pat.or_next != null
             begin_block(s, miss)
         pat = pat.or_next
 
     begin_block(s, body_label)
-    emit_match_arm_body(s, arm, scrut_reg, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, result, arm_index, end_label)
+    emit_match_arm_body(s, arm, scrut_reg, scrut_slot, enum_name, result, arm_index, end_label)
 
     begin_block(s, next_label_id)
 
-fn is_ident_none_name(name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    if len == 4 and memcmp(name, c"None", 4) == 0
-        return 1
-    return 0
+fn is_ident_none_name(name: StrView) -> bool
+    name.eq("None")
 
 # AGAST #3041: 1 when `cast` is `x as E` with `x` already a (non-generic)
 # user enum `E`: the cast is `x` itself, as in ritz0, for a fieldless enum and
@@ -1278,11 +1110,10 @@ fn is_ident_none_name(name_sv: StrView) -> i32
 pub fn enum_identity_cast(s: *EmitterState, cast: *Expr) -> i32
     if cast.type_kind != TypeKind.Struct or cast.ident_len <= 0
         return 0
-    var en: *u8 = null
-    var en_len: i32 = 0
-    if user_enum_value_of(s, cast.left, @en, @en_len) < 0
+    let ei: i32 = user_enum_value_of(s, cast.left)
+    if ei < 0
         return 0
-    name_eq(StrView { ptr: (en), len: (en_len) as i64 }, StrView { ptr: (cast.ident_ptr), len: (cast.ident_len) as i64 })
+    name_eq(enum_name_view(s.mono.pctx, ei), ident_sv(cast))
 
 # `x as U` for a fieldless user enum value `x` (LANGUAGE_SPEC §10.4): the
 # discriminant of `x`'s variant, as an i64 register held per the enum's
@@ -1292,103 +1123,71 @@ pub fn enum_identity_cast(s: *EmitterState, cast: *Expr) -> i32
 # discriminant itself when no `= N` moved one.  An enum with a payload
 # variant is the located error ritz0 gives.  -1 when `x` is no user enum.
 pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty: *TypeKind) -> i32
-    var en: *u8 = null
-    var en_len: i32 = 0
-    let ei: i32 = user_enum_value_of(s, cast.left, @en, @en_len)
+    let ei: i32 = user_enum_value_of(s, cast.left)
     if ei < 0
         return 0 - 1
+    let en: StrView = enum_name_view(s.mono.pctx, ei)
     let n: i32 = enum_variant_count(s.mono.pctx, ei)
     for vi in 0..n
         if enum_variant_kind(s.mono.pctx, ei, vi) != ENUM_VARIANT_UNIT
             var vf: *StructField = enum_variant_fields(s.mono.pctx, ei, vi)
             diag_error_at(emitter_source_file(), cast.span)
             eprints("cannot convert enum '")
-            eprint_bytes(StrView { ptr: (en), len: (en_len) as i64 })
+            eprint_bytes(en)
             eprints("' to an integer: variant '")
             eprint_bytes(StrView { ptr: (vf.name), len: (vf.name_len) as i64 })
             eprints("' carries data\n")
             s.error_count = s.error_count + 1
             *out_src_ty = TypeKind.I64
             let z: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, z)
-            emit_str(s, IR_ADD_ZERO)
+            format_into(s, "  %.{z} = add i64 0, 0\n")
             return z
     *out_src_ty = enum_repr(s.mono.pctx, ei)
     if *out_src_ty == TypeKind.Void
         *out_src_ty = TypeKind.I64
-    let tag_ty: *u8 = enum_tag_llvm(s.mono.pctx, ei)
+    let tag_ty: StrView = llvm_text(enum_tag_llvm(s.mono.pctx, ei))
     let tag: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, tag)
-    emit_str(s, c" = extractvalue %")
-    emit_name(s, StrView { ptr: (en), len: (en_len) as i64 })
-    emit_str(s, IR_SP)
-    emit_reg(s, raw_reg)
-    emit_str(s, IR_COMMA_0)
+    format_into(s, "  %.{tag} = extractvalue %")
+    emit_name(s, en)
+    format_into(s, " %.{raw_reg}, 0\n")
     # AGAST #4574: a repr enum's tag IS its discriminant; widen it as its
     # repr type would be (an i64 / u64 repr is already i64).
     if ty_int_bits(enum_repr(s.mono.pctx, ei)) == 64
         return tag
     var r: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, r)
-    if enum_tag_signed(s.mono.pctx, ei) == 1
-        emit_str(s, c" = sext ")
-    else
-        emit_str(s, c" = zext ")
-    emit_str(s, tag_ty)
-    emit_str(s, IR_SP)
-    emit_reg(s, tag)
-    emit_str(s, IR_TO_I64)
+    let extend: StrView = if enum_tag_signed(s.mono.pctx, ei) == 1 then "sext" else "zext"
+    format_into(s, "  %.{r} = {extend} {tag_ty} %.{tag} to i64\n")
     if enum_discr_is_index(s.mono.pctx, ei) == 1 or ty_int_bits(enum_repr(s.mono.pctx, ei)) > 0
         return r
+    let d0: i64 = enum_variant_discr(s.mono.pctx, ei, 0)
     let first: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, first)
-    emit_str(s, c" = add i64 0, ")
-    emit_int(s, enum_variant_discr(s.mono.pctx, ei, 0))
-    emit_str(s, IR_NL)
+    format_into(s, "  %.{first} = add i64 0, {d0}\n")
     r = first
     for vi in 1..n
         let is_vi: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, is_vi)
-        emit_str(s, c" = icmp eq i8 ")
-        emit_reg(s, tag)
-        emit_str(s, IR_COMMA)
-        emit_int(s, vi as i64)
-        emit_str(s, IR_NL)
+        format_into(s, "  %.{is_vi} = icmp eq i8 %.{tag}, {vi as i64}\n")
         let sel: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, sel)
-        emit_str(s, c" = select i1 ")
-        emit_reg(s, is_vi)
-        emit_str(s, IR_I64_SEP)
-        emit_int(s, enum_variant_discr(s.mono.pctx, ei, vi as i32))
-        emit_str(s, IR_I64_SEP)
-        emit_reg(s, r)
-        emit_str(s, IR_NL)
+        let d: i64 = enum_variant_discr(s.mono.pctx, ei, vi as i32)
+        format_into(s, "  %.{sel} = select i1 %.{is_vi}, i64 {d}, i64 %.{r}\n")
         r = sel
-    return r
+    r
 
-# The non-generic user enum value `e` evaluates to: its index, with its name
-# in out_name/out_len; -1 if `e` is none.  resolve_scrutinee_enum knows enum
-# locals and `Lv.Lo`; a bare unit variant `Lo` is bare_unit_variant_enum's
-# (#3340, #3351: `Lo as u64` passed the `%Lv` aggregate as the int).  A
-# name two enums declare is -1 here: the bare-variant emitter reports it.
-pub fn user_enum_value_of(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+# The non-generic user enum value `e` evaluates to: its index; -1 if `e` is
+# none.  resolve_scrutinee_enum knows enum locals and `Lv.Lo`; a bare unit
+# variant `Lo` is bare_unit_variant_enum's (#3340, #3351: `Lo as u64` passed
+# the `%Lv` aggregate as the int).  A name two enums declare is -1 here: the
+# bare-variant emitter reports it.
+pub fn user_enum_value_of(s: *EmitterState, e: *Expr) -> i32
     if e == null
         return 0 - 1
     var ei: i32 = 0 - 1
-    if resolve_scrutinee_enum(s, e, out_name, out_len) == 1
-        ei = enum_find(s.mono.pctx, StrView { ptr: (*out_name), len: (*out_len) as i64 })
+    var name: StrView = no_name()
+    if resolve_scrutinee_enum(s, e, @name) == 1
+        ei = enum_find(s.mono.pctx, name)
     else
         var vi: i32 = 0
         var other: i32 = 0
         ei = bare_unit_variant_enum(s, e, @vi, @other)
-        if ei >= 0
-            *out_name = enum_name_at(s.mono.pctx, ei, out_len)
     if ei < 0 or enum_is_generic(s.mono.pctx, ei) == 1
         return 0 - 1
     ei
@@ -1397,98 +1196,86 @@ pub fn user_enum_value_of(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *
 #   * ExprKind.Ident   -> local's recorded struct type
 #   * ExprKind.Call    -> callee's return struct type (by name)
 #   * ExprKind.Unary*  -> unwrap deref (match *res) and recurse
-# Returns 1 with (out_name, out_len) filled, 0 otherwise.
-# AGAST #2135: 1 when the local holds a pointer (`*T`, `**T`), not a value.
-fn resolve_local_is_ptr(loc: *LocalVar) -> i32
-    if lv_var_type(loc) == TypeKind.Ptr or lv_var_type(loc) == TypeKind.PtrPtr
-        return 1
-    0
+# Returns 1 with *out filled, 0 otherwise.
+# AGAST #2135: true when the local holds a pointer (`*T`, `**T`), not a value.
+fn resolve_local_is_ptr(loc: *LocalVar) -> bool
+    lv_var_type(loc) == TypeKind.Ptr or lv_var_type(loc) == TypeKind.PtrPtr
 
-pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i32) -> i32
+pub fn resolve_scrutinee_enum(s: *EmitterState, scr: *Expr, out: *StrView) -> i32
+    *out = no_name()
     match scr.kind
         ExprKind.Ident =>
-            let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (scr.ident_ptr), len: (scr.ident_len) as i64 })
+            let loc: *LocalVar = find_local_struct_name(s, ident_sv(scr))
             # AGAST #2135: a pointer local is no enum value, whatever its
             # type_name says.  A `*u8` param's type_name is the parser's
             # last-seen type name (an enum field's type, say), so trusting it
             # lowered `d as *H` as enum -> int.  `*p` of a `*E` is the deref arm.
-            if loc != null and resolve_local_is_ptr(loc) == 0
-                if lv_type_name_len(loc) > 0
-                    if is_tagged_enum_type(StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
-                        *out_name = lv_type_name(loc)
-                        *out_len = lv_type_name_len(loc)
-                        return 1
-                    # Also recognize user-declared enums (Shade, etc.) via the
-                    # parser's per-enum tracker.  The tag is field 0 and the
-                    # payload field 2, as for Result/Option (AGAST #1797).
-                    if is_enum_type(s.mono.pctx, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }) == 1
-                        *out_name = lv_type_name(loc)
-                        *out_len = lv_type_name_len(loc)
-                        return 1
+            if loc != null and not resolve_local_is_ptr(loc) and lv_type_name_len(loc) > 0
+                let lt: StrView = StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }
+                # Also recognize user-declared enums (Shade, etc.) via the
+                # parser's per-enum tracker.  The tag is field 0 and the
+                # payload field 2, as for Result/Option (AGAST #1797).
+                if is_tagged_enum_type(lt) == 1 or is_enum_type(s.mono.pctx, lt) == 1
+                    *out = lt
+                    return 1
         ExprKind.Method =>
             # AGAST #1466: `match Opt.Holds(40)`, a qualified variant ctor.
-            qualified_variant_enum(s, scr, out_name, out_len)
-            if *out_name != null
+            *out = named_by(qualified_variant_enum, s, scr)
+            if not unnamed(*out)
                 return 1
         ExprKind.Call =>
             # AGAST #1466: `match Holds(40)`, an unqualified user-enum ctor.
-            user_variant_ctor_enum(s.mono.pctx, scr, out_name, out_len)
-            if *out_name != null
+            var un: *u8 = null
+            var un_len: i32 = 0
+            user_variant_ctor_enum(s.mono.pctx, scr, @un, @un_len)
+            if un != null
+                *out = StrView { ptr: un, len: un_len as i64 }
                 return 1
             let fd: *FnDef = find_call_fn(s, scr)
-            if fd != null
-                if fd.return_type == TypeKind.Struct
-                    if fd.return_type_name_len > 0
-                        if is_tagged_enum_type(StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) == 1
-                            *out_name = fd.return_type_name
-                            *out_len = fd.return_type_name_len
-                            return 1
-                        if is_enum_type(s.mono.pctx, StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }) == 1
-                            *out_name = fd.return_type_name
-                            *out_len = fd.return_type_name_len
-                            return 1
+            if fd != null and fd.return_type == TypeKind.Struct and fd.return_type_name_len > 0
+                let rt: StrView = StrView { ptr: (fd.return_type_name), len: (fd.return_type_name_len) as i64 }
+                if is_tagged_enum_type(rt) == 1 or is_enum_type(s.mono.pctx, rt) == 1
+                    *out = rt
+                    return 1
         ExprKind.Unary =>
             if scr.op == OpKind.Deref
                 let opnd: *Expr = scr.operand
                 if opnd != null and opnd.kind == ExprKind.Ident
                     # `*p` of a `p: *E` local: E, from the pointee's name.  Only
                     # a `*T` names its pointee: a `**T`'s deref is a pointer.
-                    let ploc: *LocalVar = find_local_struct_name(s, StrView { ptr: (opnd.ident_ptr), len: (opnd.ident_len) as i64 })
+                    let ploc: *LocalVar = find_local_struct_name(s, ident_sv(opnd))
                     if ploc != null and lv_var_type(ploc) == TypeKind.Ptr and lv_pointee_type(ploc) == TypeKind.Struct
                         if lv_type_name_len(ploc) > 0
-                            if is_tagged_enum_type(StrView { ptr: (lv_type_name(ploc)), len: (lv_type_name_len(ploc)) as i64 }) == 1 or is_enum_type(s.mono.pctx, StrView { ptr: (lv_type_name(ploc)), len: (lv_type_name_len(ploc)) as i64 }) == 1
-                                *out_name = lv_type_name(ploc)
-                                *out_len = lv_type_name_len(ploc)
+                            let lt: StrView = StrView { ptr: (lv_type_name(ploc)), len: (lv_type_name_len(ploc)) as i64 }
+                            if is_tagged_enum_type(lt) == 1 or is_enum_type(s.mono.pctx, lt) == 1
+                                *out = lt
                                 return 1
-                        *out_name = null
-                        *out_len = 0
                         return 0
-                if resolve_scrutinee_enum(s, scr.operand, out_name, out_len) == 1
+                if resolve_scrutinee_enum(s, scr.operand, out) == 1
                     return 1
         ExprKind.Member =>
             # AGAST #1466: `match Opt.Vacant`, a qualified unit variant.
-            qualified_variant_enum(s, scr, out_name, out_len)
-            if *out_name != null
+            *out = named_by(qualified_variant_enum, s, scr)
+            if not unnamed(*out)
                 return 1
             # AGAST #1797: an enum-typed struct field, `match h.d`.  It loads
             # the `%Enum` aggregate; matched as a scalar, every arm compared
             # the aggregate register as an i64 and fell through.
             let fld: *StructField = resolve_member_chain_field(s, scr)
             if fld != null and fld.field_type == TypeKind.Struct and fld.field_type_name_len > 0
-                if is_tagged_enum_type(StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 }) == 1 or is_enum_type(s.mono.pctx, StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 }) == 1
-                    *out_name = fld.field_type_name
-                    *out_len = fld.field_type_name_len
+                let ft: StrView = StrView { ptr: (fld.field_type_name), len: (fld.field_type_name_len) as i64 }
+                if is_tagged_enum_type(ft) == 1 or is_enum_type(s.mono.pctx, ft) == 1
+                    *out = ft
                     return 1
         _ => pass
     # AGAST #4450: any other read of a unit enum from memory -- a global, an
     # `[N]E` element, `p[i]` / `*(p + i)` through a `*E` -- loads the `%E`
     # exactly as a local does, so `g as i32` and `match a[i]` read its tag.
-    unit_enum_expr_name(s, scr, out_name, out_len)
-    if *out_len > 0
+    *out = named_by(unit_enum_expr_name, s, scr)
+    if (*out).len > 0
         return 1
-    *out_name = null
-    *out_len = 0
-    return 0
+    *out = no_name()
+    0
 
 # 1 when `scr` is certainly no enum, so a bare name in an arm is a binding or a
 # const.  Anything this cannot prove stays open: see match_arms_enum.
@@ -1528,10 +1315,8 @@ fn match_scrutinee_is_scalar(s: *EmitterState, scr: *Expr) -> i32
 fn match_scrutinee_is_strview(s: *EmitterState, scr: *Expr) -> i32
     if scr.kind == ExprKind.StringLit
         return 1
-    var name: *u8 = null
-    var len: i32 = 0
-    match_scrutinee_type(s, scr, @name, @len)
-    (name != null and name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"StrView"), len: (7) as i64 }) == 1) as i32
+    let name: StrView = named_by(match_scrutinee_type, s, scr)
+    (not unnamed(name) and name.eq("StrView")) as i32
 
 # The first arm that names a user enum's variant, for a scrutinee no rule above
 # could type, or null.  A scalar scrutinee keeps its bindings.
@@ -1606,7 +1391,7 @@ fn match_refuse_ambiguous_arms(s: *EmitterState, scr: *Expr, arms: *MatchArm) ->
             eprint_bytes(StrView { ptr: (ename), len: (nlen) as i64 })
             seen = seen + 1
     eprints(" declare it, and ritz1 can't type the scrutinee; bind it to a typed local first\n")
-    emit_str(s, c"  ; ERROR: a match's enum is ambiguous\n")
+    format_into(s, "  ; ERROR: a match's enum is ambiguous\n")
     s.error_count = s.error_count + 1
     1
 
@@ -1632,36 +1417,30 @@ fn match_scrutinee_is_ctor(s: *EmitterState, e: *Expr) -> i32
 var g_gctor_refused: *Expr = null   # the scrutinee generic_ctor_scrutinee_enum refused
 
 # "can't infer `T` for `Gone`: give the binding a type", at the constructor.
-fn generic_ctor_error(s: *EmitterState, e: *Expr, tp: *TypeParam, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn generic_ctor_error(s: *EmitterState, e: *Expr, tp: *TypeParam, name: StrView)
     var n: i32 = 0
-    let head: *u8 = ctor_join(StrView { ptr: (c"can't infer `"), len: (13) as i64 }, StrView { ptr: (tp.name), len: (tp.name_len) as i64 }, StrView { ptr: (c"` for `"), len: (7) as i64 }, @n)
+    let head: *u8 = ctor_join("can't infer `", StrView { ptr: (tp.name), len: (tp.name_len) as i64 }, "` for `", @n)
     var m: i32 = 0
-    let msg: *u8 = ctor_join(StrView { ptr: (head), len: (n) as i64 }, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"`: give the binding a type"), len: (26) as i64 }, @m)
+    let msg: *u8 = ctor_join(StrView { ptr: (head), len: (n) as i64 }, name, "`: give the binding a type", @m)
     emit_nd_error(s, e.span.line, e.span.col, msg)
     g_gctor_refused = e
 
-# The instance `scr` builds, recorded and queued for its type decl, in *out_name;
-# null when `scr` is no such constructor, or it was refused (g_gctor_refused).
-fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
+# The instance `scr` builds, recorded and queued for its type decl; `no_name()`
+# when `scr` is no such constructor, or it was refused (g_gctor_refused).
+fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr) -> StrView
     var vi: i32 = 0
     let ei: i32 = generic_ctor_enum(s, scr, @vi)
     if ei < 0
-        return
-    var name: *u8 = scr.ident_ptr
-    var len: i32 = scr.ident_len
+        return no_name()
+    var ctor_name: StrView = ident_sv(scr)
     var args: *Expr = null
     if scr.kind == ExprKind.Call
-        name = scr.func_name
-        len = scr.func_name_len
+        ctor_name = func_name_sv(scr)
         args = scr.args
     let tps: *TypeParam = generic_enum_params(s.mono.pctx, ei)
     let n: i32 = count_type_params(tps)
     if n == 0
-        return
+        return no_name()
     let names: **u8 = malloc((n as i64) * 8) as **u8
     let lens: *i32 = malloc((n as i64) * 4) as *i32
     for i in 0..n
@@ -1685,37 +1464,33 @@ fn generic_ctor_scrutinee_enum(s: *EmitterState, scr: *Expr, out_name: **u8, out
                     *(lens + ti) = 0 - 1
         f = f.next
         arg = arg.next
-    var en_len: i32 = 0
-    let en: *u8 = enum_name_at(s.mono.pctx, ei, @en_len)
-    var full: *u8 = ctor_join(StrView { ptr: (en), len: (en_len) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, StrView { ptr: (c""), len: (0) as i64 }, out_len)
+    let en: StrView = enum_name_view(s.mono.pctx, ei)
+    var out_len: i32 = 0
+    var full: *u8 = ctor_join(en, "", "", @out_len)
     var tp: *TypeParam = tps
     var i: i32 = 0
     while tp != null
         if *(lens + i) <= 0
-            generic_ctor_error(s, scr, tp, StrView { ptr: (name), len: (len) as i64 })
-            *out_name = null
-            *out_len = 0
-            return
-        full = ctor_join(StrView { ptr: (full), len: (*out_len) as i64 }, StrView { ptr: (c"$"), len: (1) as i64 }, StrView { ptr: (*(names + i)), len: (*(lens + i)) as i64 }, out_len)
+            generic_ctor_error(s, scr, tp, ctor_name)
+            return no_name()
+        full = ctor_join(StrView { ptr: (full), len: (out_len) as i64 }, "$", StrView { ptr: (*(names + i)), len: (*(lens + i)) as i64 }, @out_len)
         tp = tp.next
         i = i + 1
-    add_enum_instance(s.mono, s.module, StrView { ptr: (full), len: (*out_len) as i64 }, en_len)
-    if user_enum_index(s.mono.pctx, StrView { ptr: (full), len: (*out_len) as i64 }) < 0
-        *out_len = 0
-        return   # not an instance monomorph could record: no enum to build
-    if namelist_find(@s.late_enums, StrView { ptr: (full), len: (*out_len) as i64 }) < 0
-        namelist_push(@s.late_enums, StrView { ptr: (full), len: (*out_len) as i64 })
-    *out_name = full
+    let full_sv: StrView = StrView { ptr: full, len: out_len as i64 }
+    add_enum_instance(s.mono, s.module, full_sv, en.len as i32)
+    if user_enum_index(s.mono.pctx, full_sv) < 0
+        return no_name()   # not an instance monomorph could record: no enum to build
+    if namelist_find(@s.late_enums, full_sv) < 0
+        namelist_push(@s.late_enums, full_sv)
+    full_sv
 
 # `scr` under the enum the match named.  What the slot around the match wants (a
 # typed let, the fn's return type) is that match's value, not its scrutinee's.
-pub fn emit_ctor_scrutinee(s: *EmitterState, scr: *Expr, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+pub fn emit_ctor_scrutinee(s: *EmitterState, scr: *Expr, name: StrView) -> i32
     let saved_name: *u8 = s.ctx_enum_name
     let saved_len: i32 = s.ctx_enum_name_len
-    s.ctx_enum_name = name
-    s.ctx_enum_name_len = len
+    s.ctx_enum_name = name.ptr
+    s.ctx_enum_name_len = name.len as i32
     let reg: i32 = emit_expr(s, scr)
     s.ctx_enum_name = saved_name
     s.ctx_enum_name_len = saved_len
@@ -1726,28 +1501,24 @@ pub fn emit_ctor_scrutinee(s: *EmitterState, scr: *Expr, name_sv: StrView) -> i3
 # it.  An instance the scrutinee's type names (`Slot$i32`) is a recorded enum
 # with ritz0's layout (AGAST #2422), but no arm names one: an arm's `Full` is the
 # template's.
-fn resolve_match_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm, out_name: **u8, out_len: *i32) -> i32
-    if resolve_scrutinee_enum(s, scr, out_name, out_len) == 1
+fn resolve_match_enum(s: *EmitterState, scr: *Expr, arms: *MatchArm, out: *StrView) -> i32
+    if resolve_scrutinee_enum(s, scr, out) == 1
         return 1
-    ctor_scrutinee_enum(s, scr, out_name, out_len)   # AGAST #2419
-    if *out_name != null
+    *out = named_by(ctor_scrutinee_enum, s, scr)   # AGAST #2419
+    if not unnamed(*out)
         return 1
-    generic_ctor_scrutinee_enum(s, scr, out_name, out_len)   # AGAST #2437
-    if *out_name != null
+    *out = generic_ctor_scrutinee_enum(s, scr)   # AGAST #2437
+    if not unnamed(*out)
         return 1
-    var name: *u8 = null
-    var len: i32 = 0
-    match_scrutinee_type(s, scr, @name, @len)
-    if name != null and (is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1 or is_enum_type(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 }) == 1)
-        *out_name = name
-        *out_len = len
+    let name: StrView = named_by(match_scrutinee_type, s, scr)
+    if not unnamed(name) and (is_tagged_enum_type(name) == 1 or is_enum_type(s.mono.pctx, name) == 1)
+        *out = name
         return 1
-    *out_name = null
-    *out_len = 0
-    if name == null
+    *out = no_name()
+    if unnamed(name)
         let ei: i32 = match_arms_enum(s, scr, arms)
         if ei >= 0 and enum_is_generic(s.mono.pctx, ei) == 0
-            *out_name = enum_name_at(s.mono.pctx, ei, out_len)
+            *out = enum_name_view(s.mono.pctx, ei)
             return MATCH_ENUM_FROM_ARMS
     0
 
@@ -1760,53 +1531,54 @@ const MATCH_ENUM_FROM_ARMS: i32 = 2
 # ritz0's twin is ritz0/match_coverage.py, and test_match_exhaustive.py holds the
 # two to one table.  The parser refuses guards, so no arm here has one.
 
+# `file:line:col: error: ` (AGAST #1876's bespoke callers: dynamic content
+# follows on the same line, so emit_nd_error_begin's IR comment is added by
+# the caller once it knows which).
+fn match_err_prefix(line: i32, col: i32)
+    eprints_cstr(fn_source_file(emitter_current_fn()))
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints(": error: ")
+
 # The first name opens the error; `count` says how many went before.
-fn match_gap_name(line: i32, col: i32, count: *i32, name_sv: StrView)
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn match_gap_name(line: i32, col: i32, count: *i32, name: StrView)
     if *count == 0
-        eprints_cstr(fn_source_file(emitter_current_fn()))
-        eprint_char(':')
-        eprint_i64(line as i64)
-        eprint_char(':')
-        eprint_i64(col as i64)
-        eprints(": error: non-exhaustive match: missing ")
+        match_err_prefix(line, col)
+        eprints("non-exhaustive match: missing ")
     else
         eprints(", ")
-    eprint_bytes(StrView { ptr: (name), len: (len) as i64 })
+    eprint_bytes(name)
     *count = *count + 1
 
 fn match_gap_end(s: *EmitterState, count: i32)
     if count > 0
         eprints("\n")
-        emit_str(s, c"  ; ERROR: non-exhaustive match\n")
+        format_into(s, "  ; ERROR: non-exhaustive match\n")
         s.error_count = s.error_count + 1
 
 # A name that is an integer const compares (§8.2, as emit_match_arm reads it).
-fn match_arm_is_catch_all(s: *EmitterState, arm: *MatchArm) -> i32
+fn match_arm_is_catch_all(s: *EmitterState, arm: *MatchArm) -> bool
     if arm.pattern_kind == PAT_WILDCARD
-        return 1
+        return true
     if arm.pattern_kind != PAT_IDENT
-        return 0
+        return false
     if s.match_scrut_str == 1   # an integer const tests only an integer (#1876)
-        return 1
-    let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-    if ce != null and is_int_const_type(ce.const_type) == 1
-        return 0
-    1
+        return true
+    let ce: *ConstEntry = find_const_entry(s, arm_name(arm))
+    not (ce != null and is_int_const_type(ce.const_type) == 1)
 
 # Every alternative of an or-pattern counts (AGAST #4450).
-fn match_arms_name(arms: *MatchArm, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn match_arms_name(arms: *MatchArm, name: StrView) -> bool
     var arm: *MatchArm = arms
     var pat: *MatchArm = arms
     while pat != null
         if pat.pattern_kind == PAT_IDENT or pat.pattern_kind == PAT_VARIANT
-            if name_eq(StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
-                return 1
+            if arm_name(pat).eq(name)
+                return true
         pat = arm_pattern_next(@arm, pat)
-    0
+    false
 
 # Every variant of enum `ei`, in declaration order.  A name that is no variant
 # here is a binding, and so a catch-all.
@@ -1815,15 +1587,16 @@ fn match_check_enum(s: *EmitterState, arms: *MatchArm, ei: i32, line: i32, col: 
     while arm != null
         if arm.pattern_kind == PAT_WILDCARD
             return
-        if arm.pattern_kind == PAT_IDENT and enum_declares_variant(s.mono.pctx, ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 0
+        if arm.pattern_kind == PAT_IDENT and enum_declares_variant(s.mono.pctx, ei, arm_name(arm)) == 0
             return
         arm = arm.next
     var count: i32 = 0
     for vi in 0..enum_variant_count(s.mono.pctx, ei)
         var vlen: i32 = 0
         let vname: *u8 = enum_variant_name(s.mono.pctx, ei, vi, @vlen)
-        if match_arms_name(arms, StrView { ptr: (vname), len: (vlen) as i64 }) == 0
-            match_gap_name(line, col, @count, StrView { ptr: (vname), len: (vlen) as i64 })
+        let vname_sv: StrView = StrView { ptr: vname, len: vlen as i64 }
+        if not match_arms_name(arms, vname_sv)
+            match_gap_name(line, col, @count, vname_sv)
     match_gap_end(s, count)
 
 fn match_check_bool(s: *EmitterState, arms: *MatchArm, line: i32, col: i32)
@@ -1832,7 +1605,7 @@ fn match_check_bool(s: *EmitterState, arms: *MatchArm, line: i32, col: i32)
     var arm: *MatchArm = arms
     var pat: *MatchArm = arms   # every alternative counts (AGAST #4450)
     while pat != null
-        if match_arm_is_catch_all(s, pat) == 1
+        if match_arm_is_catch_all(s, pat)
             return
         if pat.pattern_kind == PAT_BOOL
             if pat.pattern_int == 1
@@ -1842,19 +1615,19 @@ fn match_check_bool(s: *EmitterState, arms: *MatchArm, line: i32, col: i32)
         pat = arm_pattern_next(@arm, pat)
     var count: i32 = 0
     if not has_true
-        match_gap_name(line, col, @count, StrView { ptr: (c"true"), len: (4) as i64 })
+        match_gap_name(line, col, @count, "true")
     if not has_false
-        match_gap_name(line, col, @count, StrView { ptr: (c"false"), len: (5) as i64 })
+        match_gap_name(line, col, @count, "false")
     match_gap_end(s, count)
 
 fn match_check_scalar(s: *EmitterState, arms: *MatchArm, line: i32, col: i32)
     var arm: *MatchArm = arms
     while arm != null
-        if match_arm_is_catch_all(s, arm) == 1
+        if match_arm_is_catch_all(s, arm)
             return
         arm = arm.next
     var count: i32 = 0
-    match_gap_name(line, col, @count, StrView { ptr: (c"a catch-all"), len: (11) as i64 })
+    match_gap_name(line, col, @count, "a catch-all")
     match_gap_end(s, count)
 
 # Option and Result need no import, so the enum tracker may never have seen them.
@@ -1866,42 +1639,36 @@ fn match_arms_builtin(arms: *MatchArm) -> i32
     var arm: *MatchArm = arms
     while arm != null
         if arm.pattern_kind == PAT_VARIANT or arm.pattern_kind == PAT_IDENT
-            if name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Some"), len: (4) as i64 }) == 1 or name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"None"), len: (4) as i64 }) == 1
+            if arm_name(arm).eq("Some") or arm_name(arm).eq("None")
                 return MATCH_OPTION
-            if name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Ok"), len: (2) as i64 }) == 1 or name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Err"), len: (3) as i64 }) == 1
+            if arm_name(arm).eq("Ok") or arm_name(arm).eq("Err")
                 return MATCH_RESULT
         arm = arm.next
     0
 
 # Both variants of `a`/`b`, for Option or Result with no tracked declaration.
-fn match_check_pair(s: *EmitterState, arms: *MatchArm, a_sv: StrView, b_sv: StrView, line: i32, col: i32)
-    var a: *u8 = a_sv.ptr
-    var a_len: i32 = a_sv.len as i32
-    var b: *u8 = b_sv.ptr
-    var b_len: i32 = b_sv.len as i32
+fn match_check_pair(s: *EmitterState, arms: *MatchArm, a: StrView, b: StrView, line: i32, col: i32)
     var arm: *MatchArm = arms
     while arm != null
         if arm.pattern_kind == PAT_WILDCARD
             return
         if arm.pattern_kind == PAT_IDENT
-            if name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (a), len: (a_len) as i64 }) == 0 and name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (b), len: (b_len) as i64 }) == 0
+            if not arm_name(arm).eq(a) and not arm_name(arm).eq(b)
                 return
         arm = arm.next
     var count: i32 = 0
-    if match_arms_name(arms, StrView { ptr: (a), len: (a_len) as i64 }) == 0
-        match_gap_name(line, col, @count, StrView { ptr: (a), len: (a_len) as i64 })
-    if match_arms_name(arms, StrView { ptr: (b), len: (b_len) as i64 }) == 0
-        match_gap_name(line, col, @count, StrView { ptr: (b), len: (b_len) as i64 })
+    if not match_arms_name(arms, a)
+        match_gap_name(line, col, @count, a)
+    if not match_arms_name(arms, b)
+        match_gap_name(line, col, @count, b)
     match_gap_end(s, count)
 
 # The enum a `Name$args` instantiation, or a plain name, was declared as.
-fn match_enum_index(ctx: *ParseCtx, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var base: i32 = 0
-    while base < len and *(name + base) != '$'
+fn match_enum_index(ctx: *ParseCtx, name: StrView) -> i32
+    var base: i64 = 0
+    while base < name.len and name.get(base) != '$'
         base = base + 1
-    enum_find(ctx, StrView { ptr: (name), len: (base) as i64 })
+    enum_find(ctx, name.take(base))
 
 # --- A bare arm name that binds (AGAST #2407; LANGUAGE_SPEC §4.3, §8.2) -------
 #
@@ -1910,21 +1677,21 @@ fn match_enum_index(ctx: *ParseCtx, name_sv: StrView) -> i32
 # lowers any other name as a binding).  Anywhere else it binds, and a binding
 # can't take a const's, global's or variant's name: binder_check.ritz judges
 # every other binder, and ritz0's twin is _refuse_arm_names.
-fn match_arm_name_tests(s: *EmitterState, arm: *MatchArm, ei: i32, builtin: i32) -> i32
+fn match_arm_name_tests(s: *EmitterState, arm: *MatchArm, ei: i32, builtin: i32) -> bool
     if ei >= 0
-        return enum_declares_variant(s.mono.pctx, ei, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+        return enum_declares_variant(s.mono.pctx, ei, arm_name(arm)) == 1
     if builtin == MATCH_OPTION
-        return (name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Some"), len: (4) as i64 }) == 1 or name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"None"), len: (4) as i64 }) == 1) as i32
+        return arm_name(arm).eq("Some") or arm_name(arm).eq("None")
     if builtin == MATCH_RESULT
-        return (name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Ok"), len: (2) as i64 }) == 1 or name_eq(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, StrView { ptr: (c"Err"), len: (3) as i64 }) == 1) as i32
+        return arm_name(arm).eq("Ok") or arm_name(arm).eq("Err")
     # On a StrView no name tests (AGAST #1876): an integer const compares only
     # an integer, so there it binds, and binder_report refuses it.
     if s.match_scrut_str == 1
-        return 0
+        return false
     # An integer const, which is_int_const_type takes a bool for: ritz0 compares
     # neither a bool const nor a float one.
-    let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
-    (ce != null and ce.const_type != TypeKind.Bool and is_int_const_type(ce.const_type) == 1) as i32
+    let ce: *ConstEntry = find_const_entry(s, arm_name(arm))
+    ce != null and ce.const_type != TypeKind.Bool and is_int_const_type(ce.const_type) == 1
 
 # How many arms were refused, each said at its name.
 fn match_refuse_arm_names(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i32) -> i32
@@ -1932,11 +1699,11 @@ fn match_refuse_arm_names(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i
     var arm: *MatchArm = arms
     while arm != null
         # A qualified `E.V` has no span: it is always a variant.
-        if arm.pattern_kind == PAT_IDENT and arm.pattern_span.line > 0 and match_arm_name_tests(s, arm, ei, builtin) == 0
-            let kind: i32 = binder_module_value_kind(s.mono.pctx, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+        if arm.pattern_kind == PAT_IDENT and arm.pattern_span.line > 0 and not match_arm_name_tests(s, arm, ei, builtin)
+            let kind: i32 = binder_module_value_kind(s.mono.pctx, arm_name(arm))
             if kind != BINDER_NONE
-                binder_report(fn_source_file(emitter_current_fn()), arm.pattern_span.line, arm.pattern_span.col, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, kind)
-                emit_str(s, c"  ; ERROR: a match arm binds a module value's name\n")
+                binder_report(fn_source_file(emitter_current_fn()), arm.pattern_span.line, arm.pattern_span.col, arm_name(arm), kind)
+                format_into(s, "  ; ERROR: a match arm binds a module value's name\n")
                 s.error_count = s.error_count + 1
                 refused = refused + 1
         arm = arm.next
@@ -1950,25 +1717,23 @@ fn match_refuse_arm_names(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i
 # ritz0's twin is _require_enum_variant; both name the enum as it was declared,
 # since the two mangle `Result<i32, i32>` apart.
 
-# 1 when `arm` names a variant: a payload pattern, or a qualified unit one.
-fn match_arm_names_a_variant(arm: *MatchArm) -> i32
+# True when `arm` names a variant: a payload pattern, or a qualified unit one.
+fn match_arm_names_a_variant(arm: *MatchArm) -> bool
     if arm.pattern_kind == PAT_VARIANT
-        return 1
-    (arm.pattern_kind == PAT_IDENT and arm.pattern_span.line == 0 and arm.head_span.line > 0) as i32
+        return true
+    arm.pattern_kind == PAT_IDENT and arm.pattern_span.line == 0 and arm.head_span.line > 0
 
 # How many arms named a variant enum `name` doesn't declare, each said at its
 # pattern.  `name` is the scrutinee's own, maybe an instantiation (`Option$i64`).
-fn match_refuse_foreign_arms(s: *EmitterState, arms: *MatchArm, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    var base: i32 = 0
-    while base < len and *(name + base) != '$'
+fn match_refuse_foreign_arms(s: *EmitterState, arms: *MatchArm, name: StrView) -> i32
+    var base: i64 = 0
+    while base < name.len and name.get(base) != '$'
         base = base + 1
-    let ei: i32 = match_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
+    let ei: i32 = match_enum_index(s.mono.pctx, name)
     var builtin: i32 = 0
-    if ei < 0 and is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
+    if ei < 0 and is_tagged_enum_type(name) == 1
         builtin = MATCH_RESULT
-        if *name == 'O'
+        if name.get(0) == 'O'
             builtin = MATCH_OPTION
     if ei < 0 and builtin == 0
         return 0
@@ -1976,18 +1741,18 @@ fn match_refuse_foreign_arms(s: *EmitterState, arms: *MatchArm, name_sv: StrView
     var arm: *MatchArm = arms
     var pat: *MatchArm = arms   # each alternative of an or-pattern too (AGAST #4450)
     while pat != null
-        if match_arm_names_a_variant(pat) == 1 and match_arm_name_tests(s, pat, ei, builtin) == 0
+        if match_arm_names_a_variant(pat) and not match_arm_name_tests(s, pat, ei, builtin)
             eprints_cstr(fn_source_file(emitter_current_fn()))
             eprint_char(':')
             eprint_i64(pat.head_span.line as i64)
             eprint_char(':')
             eprint_i64(pat.head_span.col as i64)
             eprints(": error: Unknown variant ")
-            eprint_bytes(StrView { ptr: (pat.pattern_name), len: (pat.pattern_name_len) as i64 })
+            eprint_bytes(arm_name(pat))
             eprints(" in enum ")
-            eprint_bytes(StrView { ptr: (name), len: (base) as i64 })
+            eprint_bytes(name.take(base))
             eprints("\n")
-            emit_str(s, c"  ; ERROR: a match arm names another enum's variant\n")
+            format_into(s, "  ; ERROR: a match arm names another enum's variant\n")
             s.error_count = s.error_count + 1
             refused = refused + 1
         pat = arm_pattern_next(@arm, pat)
@@ -2012,13 +1777,13 @@ fn match_refuse_or_alternatives(s: *EmitterState, arms: *MatchArm, ei: i32, buil
             alt = null
         while alt != null
             if alt.pattern_kind == PAT_WILDCARD
-                match_report_at(s, alt.head_span, c"`_` can't be an alternative of an or-pattern: it matches everything; give it an arm of its own\n", c"  ; ERROR: `_` in an or-pattern\n")
+                match_report_at(s, alt.head_span, "`_` can't be an alternative of an or-pattern: it matches everything; give it an arm of its own\n", "  ; ERROR: `_` in an or-pattern\n")
                 refused = refused + 1
             else if alt.pattern_kind == PAT_VARIANT
-                match_report_at(s, alt.head_span, c"an or-pattern alternative can't have a payload list: give that variant an arm of its own\n", c"  ; ERROR: a payload list in an or-pattern\n")
+                match_report_at(s, alt.head_span, "an or-pattern alternative can't have a payload list: give that variant an arm of its own\n", "  ; ERROR: a payload list in an or-pattern\n")
                 refused = refused + 1
-            else if alt.pattern_kind == PAT_IDENT and alt.pattern_span.line > 0 and match_arm_name_tests(s, alt, ei, builtin) == 0
-                match_report_at(s, alt.head_span, c"an or-pattern can't bind a name: each alternative is a literal, a const or a variant\n", c"  ; ERROR: a binding in an or-pattern\n")
+            else if alt.pattern_kind == PAT_IDENT and alt.pattern_span.line > 0 and not match_arm_name_tests(s, alt, ei, builtin)
+                match_report_at(s, alt.head_span, "an or-pattern can't bind a name: each alternative is a literal, a const or a variant\n", "  ; ERROR: a binding in an or-pattern\n")
                 refused = refused + 1
             alt = alt.or_next
         arm = arm.next
@@ -2033,17 +1798,15 @@ fn match_refuse_or_alternatives(s: *EmitterState, arms: *MatchArm, ei: i32, buil
 
 # How many fields variant `name` of the scrutinee has, or -1 if it has none so
 # called: that is match_refuse_foreign_arms' error, after coverage.
-fn match_variant_field_count(ctx: *ParseCtx, ei: i32, builtin: i32, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
+fn match_variant_field_count(ctx: *ParseCtx, ei: i32, builtin: i32, name: StrView) -> i32
     if ei < 0
-        if builtin == MATCH_OPTION and name_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"None"), len: (4) as i64 }) == 1
+        if builtin == MATCH_OPTION and name.eq("None")
             return 0
         return 1
     for vi in 0..enum_variant_count(ctx, ei)
         var vlen: i32 = 0
         let vname: *u8 = enum_variant_name(ctx, ei, vi, @vlen)
-        if name_eq(StrView { ptr: (vname), len: (vlen) as i64 }, StrView { ptr: (name), len: (len) as i64 }) == 1
+        if name.eq(StrView { ptr: vname, len: vlen as i64 })
             let kind: i32 = enum_variant_kind(ctx, ei, vi)
             if kind == ENUM_VARIANT_UNIT
                 return 0
@@ -2065,7 +1828,7 @@ fn match_refuse_field_counts(s: *EmitterState, arms: *MatchArm, ei: i32, builtin
     var arm: *MatchArm = arms
     while arm != null
         if arm.pattern_kind == PAT_VARIANT
-            let has: i32 = match_variant_field_count(s.mono.pctx, ei, builtin, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+            let has: i32 = match_variant_field_count(s.mono.pctx, ei, builtin, arm_name(arm))
             let lists: i32 = arm_bind_count(arm)   # AGAST #1295
             if has >= 0 and has != lists
                 eprints_cstr(fn_source_file(emitter_current_fn()))
@@ -2074,7 +1837,7 @@ fn match_refuse_field_counts(s: *EmitterState, arms: *MatchArm, ei: i32, builtin
                 eprint_char(':')
                 eprint_i64(arm.head_span.col as i64)
                 eprints(": error: variant '")
-                eprint_bytes(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
+                eprint_bytes(arm_name(arm))
                 eprints("' has ")
                 eprint_i64(has as i64)
                 if has == 1
@@ -2083,7 +1846,7 @@ fn match_refuse_field_counts(s: *EmitterState, arms: *MatchArm, ei: i32, builtin
                     eprints(" fields, but this pattern lists ")
                 eprint_i64(lists as i64)
                 eprints("\n")
-                emit_str(s, c"  ; ERROR: a variant pattern lists a field count its variant doesn't have\n")
+                format_into(s, "  ; ERROR: a variant pattern lists a field count its variant doesn't have\n")
                 s.error_count = s.error_count + 1
                 refused = refused + 1
         arm = arm.next
@@ -2097,28 +1860,28 @@ fn match_refuse_field_counts(s: *EmitterState, arms: *MatchArm, ei: i32, builtin
 # arms so far leave no gap under R6, the arm that closed it.  ritz0's twin is
 # unreachable_arm in ritz0/match_coverage.py.  No arm has a guard (#1939).
 
-# 1 when `a` and `b` test the same thing.  `ei`/`builtin` say the scrutinee is
+# True when `a` and `b` test the same thing.  `ei`/`builtin` say the scrutinee is
 # an enum; otherwise a literal and an integer const compare by value (§8.2).
-fn match_arms_test_same(s: *EmitterState, a: *MatchArm, b: *MatchArm, ei: i32, builtin: i32) -> i32
+fn match_arms_test_same(s: *EmitterState, a: *MatchArm, b: *MatchArm, ei: i32, builtin: i32) -> bool
     if ei >= 0 or builtin != 0
         if match_arm_is_variant(s, a, ei, builtin) == 0 or match_arm_is_variant(s, b, ei, builtin) == 0
-            return 0
-        return name_eq(StrView { ptr: (a.pattern_name), len: (a.pattern_name_len) as i64 }, StrView { ptr: (b.pattern_name), len: (b.pattern_name_len) as i64 })
+            return false
+        return arm_name(a).eq(arm_name(b))
     if a.pattern_kind == PAT_BOOL or b.pattern_kind == PAT_BOOL
-        return (a.pattern_kind == b.pattern_kind and a.pattern_int == b.pattern_int) as i32
+        return a.pattern_kind == b.pattern_kind and a.pattern_int == b.pattern_int
     if a.pattern_kind == PAT_STR or b.pattern_kind == PAT_STR   # AGAST #1876
-        return (a.pattern_kind == b.pattern_kind and name_eq(StrView { ptr: (a.pattern_name), len: (a.pattern_name_len) as i64 }, StrView { ptr: (b.pattern_name), len: (b.pattern_name_len) as i64 }) == 1) as i32
+        return a.pattern_kind == b.pattern_kind and arm_name(a).eq(arm_name(b))
     var va: i64 = 0
     var vb: i64 = 0
     if match_arm_int_value(s, a, @va) == 0 or match_arm_int_value(s, b, @vb) == 0
-        return 0
-    (va == vb) as i32
+        return false
+    va == vb
 
 # 1 when `arm` names a variant of the scrutinee's enum, whatever it binds.
 fn match_arm_is_variant(s: *EmitterState, arm: *MatchArm, ei: i32, builtin: i32) -> i32
     if arm.pattern_kind != PAT_IDENT and arm.pattern_kind != PAT_VARIANT
         return 0
-    match_arm_name_tests(s, arm, ei, builtin)
+    match_arm_name_tests(s, arm, ei, builtin) as i32
 
 # The integer a literal or an integer-const arm tests, into `out`; 0 for any other.
 fn match_arm_int_value(s: *EmitterState, arm: *MatchArm, out: *i64) -> i32
@@ -2127,38 +1890,29 @@ fn match_arm_int_value(s: *EmitterState, arm: *MatchArm, out: *i64) -> i32
     if arm.pattern_kind == PAT_INT_LIT or arm.pattern_kind == PAT_CHAR
         *out = arm.pattern_int
         return 1
-    if arm.pattern_kind == PAT_IDENT and match_arm_is_catch_all(s, arm) == 0
+    if arm.pattern_kind == PAT_IDENT and not match_arm_is_catch_all(s, arm)
         let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
         *out = ce.value
         return 1
     0
 
 # `file:line:col: error: <what>` at `at`, one error counted (AGAST #1876).
-fn match_report_at(s: *EmitterState, at: SrcSpan, what: *u8, ir_note: *u8)
-    eprints_cstr(fn_source_file(emitter_current_fn()))
-    eprint_char(':')
-    eprint_i64(at.line as i64)
-    eprint_char(':')
-    eprint_i64(at.col as i64)
-    eprints(": error: ")
-    eprints_cstr(what)
-    emit_str(s, ir_note)
+fn match_report_at(s: *EmitterState, at: SrcSpan, what: StrView, ir_note: StrView)
+    match_err_prefix(at.line, at.col)
+    eprints(what)
+    format_into(s, "{ir_note}")
     s.error_count = s.error_count + 1
 
 fn match_report_unreachable(s: *EmitterState, arm: *MatchArm, cover: *MatchArm)
-    eprints_cstr(fn_source_file(emitter_current_fn()))
-    eprint_char(':')
-    eprint_i64(arm.head_span.line as i64)
-    eprint_char(':')
-    eprint_i64(arm.head_span.col as i64)
-    eprints(": error: unreachable match arm: the arm at line ")
+    match_err_prefix(arm.head_span.line, arm.head_span.col)
+    eprints("unreachable match arm: the arm at line ")
     eprint_i64(cover.head_span.line as i64)
     eprints(" covers it\n")
-    emit_str(s, c"  ; ERROR: unreachable match arm\n")
+    format_into(s, "  ; ERROR: unreachable match arm\n")
     s.error_count = s.error_count + 1
 
-# 1 when an arm was refused.  Asked once the arms cover the scrutinee (R6).
-fn match_check_reachable(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i32, is_bool: i32) -> i32
+# True when an arm was refused.  Asked once the arms cover the scrutinee (R6).
+fn match_check_reachable(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i32, is_bool: i32) -> bool
     # How many distinct values or variants close the match without a catch-all:
     # an integer never closes.
     var total: i32 = 0
@@ -2168,7 +1922,7 @@ fn match_check_reachable(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i3
         total = 2
     else if is_bool == 1
         total = 2
-    let is_enum: i32 = (ei >= 0 or builtin != 0) as i32
+    let is_enum: bool = ei >= 0 or builtin != 0
     var seen: i32 = 0
     var closer: *MatchArm = null
     var arm: *MatchArm = arms
@@ -2182,57 +1936,54 @@ fn match_check_reachable(s: *EmitterState, arms: *MatchArm, ei: i32, builtin: i3
             var prev_arm: *MatchArm = arms
             var prev: *MatchArm = arms
             while prev != alt
-                if match_arms_test_same(s, prev, alt, ei, builtin) == 1
+                if match_arms_test_same(s, prev, alt, ei, builtin)
                     match_report_unreachable(s, alt, prev_arm)
-                    return 1
+                    return true
                 prev = arm_pattern_next(@prev_arm, prev)
             alt = alt.or_next
         if closer != null
             match_report_unreachable(s, arm, closer)
-            return 1
-        var catch_all: i32 = 0
+            return true
+        var catch_all: bool = false
         var counts: i32 = 0
-        if is_enum == 1
-            catch_all = (arm.pattern_kind == PAT_WILDCARD or (arm.pattern_kind == PAT_IDENT and match_arm_is_variant(s, arm, ei, builtin) == 0)) as i32
+        if is_enum
+            catch_all = arm.pattern_kind == PAT_WILDCARD or (arm.pattern_kind == PAT_IDENT and match_arm_is_variant(s, arm, ei, builtin) == 0)
         else
             catch_all = match_arm_is_catch_all(s, arm)
         # Every alternative counts once: a repeat was refused above.
         alt = arm
         while alt != null
-            if is_enum == 1
+            if is_enum
                 counts = counts + match_arm_is_variant(s, alt, ei, builtin)
             else
                 counts = counts + (is_bool == 1 and alt.pattern_kind == PAT_BOOL) as i32
             alt = alt.or_next
         seen = seen + counts
-        if catch_all == 1 or (total > 0 and seen == total)
+        if catch_all or (total > 0 and seen == total)
             closer = arm
         arm = arm.next
-    0
+    false
 
-fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enum_name_sv: StrView, from_arms: i32, line: i32, col: i32)
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
-    var name: *u8 = enum_name
-    var len: i32 = enum_name_len
-    if name == null
-        match_scrutinee_type(s, scrutinee, @name, @len)
+fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enum_name: StrView, from_arms: i32, line: i32, col: i32)
+    var name: StrView = enum_name
+    if unnamed(name)
+        name = named_by(match_scrutinee_type, s, scrutinee)
     var ei: i32 = 0 - 1
-    if name != null
-        ei = match_enum_index(s.mono.pctx, StrView { ptr: (name), len: (len) as i64 })
+    if not unnamed(name)
+        ei = match_enum_index(s.mono.pctx, name)
     # AGAST #2512: an Option / Result scrutinee is judged as one.  Asked which
     # enum its arms name, `Ok(v)` beside a user `enum E { Ok(i32), Bad }` said
     # E, and the match was "non-exhaustive: missing Bad".
-    let named_builtin: bool = name != null and is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
+    let named_builtin: bool = not unnamed(name) and is_tagged_enum_type(name) == 1
     # AGAST #1876: a StrView is no enum, whatever its arms name.
     let is_str: bool = s.match_scrut_str == 1
     if ei < 0 and not named_builtin and not is_str
         ei = match_arms_enum(s, scrutinee, arms)
     var builtin: i32 = 0
     if ei < 0 and not is_str
-        if name != null and is_tagged_enum_type(StrView { ptr: (name), len: (len) as i64 }) == 1
+        if not unnamed(name) and is_tagged_enum_type(name) == 1
             builtin = MATCH_RESULT
-            if *name == 'O'
+            if name.get(0) == 'O'
                 builtin = MATCH_OPTION
         else if match_scrutinee_is_scalar(s, scrutinee) == 0
             builtin = match_arms_builtin(arms)
@@ -2266,13 +2017,9 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
                 emit_module_item_error(s, pat.qualifier, pat.qualifier_len, pat.pattern_name, pat.pattern_name_len, pat.head_span.line, pat.head_span.col)
                 return
         if scalar and (pat.pattern_kind == PAT_VARIANT or qualified)
-            eprints_cstr(fn_source_file(emitter_current_fn()))
-            eprint_char(':')
-            eprint_i64(pat.head_span.line as i64)
-            eprint_char(':')
-            eprint_i64(pat.head_span.col as i64)
-            eprints(": error: a variant pattern needs an enum scrutinee\n")
-            emit_str(s, c"  ; ERROR: variant pattern on a non-enum scrutinee\n")
+            match_err_prefix(pat.head_span.line, pat.head_span.col)
+            eprints("a variant pattern needs an enum scrutinee\n")
+            format_into(s, "  ; ERROR: variant pattern on a non-enum scrutinee\n")
             s.error_count = s.error_count + 1
             return
         # LARB R72 (#4196): a char literal is u8 (§2.6), so only a u8
@@ -2280,35 +2027,27 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
         # enum is an error at the pattern.  `s.match_scrut_int` is the
         # scrutinee's integer kind, or not TypeKind.U8 for every other type.
         if pat.pattern_kind == PAT_CHAR and s.match_scrut_int != TypeKind.U8
-            match_report_at(s, pat.head_span, c"a character pattern needs a u8 scrutinee\n", c"  ; ERROR: character pattern on a non-u8 scrutinee\n")
+            match_report_at(s, pat.head_span, "a character pattern needs a u8 scrutinee\n", "  ; ERROR: character pattern on a non-u8 scrutinee\n")
             return
         # AGAST #3002: a literal compares an integer, so on an enum (`5 =>` on a
         # `C` or an Option) it compared the `%C` aggregate to an i64.
         # AGAST #1876: a string arm compares a StrView, and a StrView only that.
         if pat.pattern_kind == PAT_STR and not is_str
-            match_report_at(s, pat.head_span, c"a string pattern needs a StrView scrutinee\n", c"  ; ERROR: string pattern on a non-StrView scrutinee\n")
+            match_report_at(s, pat.head_span, "a string pattern needs a StrView scrutinee\n", "  ; ERROR: string pattern on a non-StrView scrutinee\n")
             return
         if pat.pattern_kind == PAT_INT_LIT and is_str
-            match_report_at(s, pat.head_span, c"a literal pattern needs an integer scrutinee\n", c"  ; ERROR: literal pattern on a StrView scrutinee\n")
+            match_report_at(s, pat.head_span, "a literal pattern needs an integer scrutinee\n", "  ; ERROR: literal pattern on a StrView scrutinee\n")
             return
         if pat.pattern_kind == PAT_INT_LIT and ei >= 0
-            eprints_cstr(fn_source_file(emitter_current_fn()))
-            eprint_char(':')
-            eprint_i64(pat.head_span.line as i64)
-            eprint_char(':')
-            eprint_i64(pat.head_span.col as i64)
-            eprints(": error: a literal pattern needs an integer scrutinee\n")
-            emit_str(s, c"  ; ERROR: literal pattern on an enum scrutinee\n")
+            match_err_prefix(pat.head_span.line, pat.head_span.col)
+            eprints("a literal pattern needs an integer scrutinee\n")
+            format_into(s, "  ; ERROR: literal pattern on an enum scrutinee\n")
             s.error_count = s.error_count + 1
             return
         if pat.pattern_kind == PAT_BOOL and is_bool == 0
-            eprints_cstr(fn_source_file(emitter_current_fn()))
-            eprint_char(':')
-            eprint_i64(pat.bool_span.line as i64)
-            eprint_char(':')
-            eprint_i64(pat.bool_span.col as i64)
-            eprints(": error: a `true` or `false` pattern needs a bool scrutinee\n")
-            emit_str(s, c"  ; ERROR: bool pattern on a non-bool scrutinee\n")
+            match_err_prefix(pat.bool_span.line, pat.bool_span.col)
+            eprints("a `true` or `false` pattern needs a bool scrutinee\n")
+            format_into(s, "  ; ERROR: bool pattern on a non-bool scrutinee\n")
             s.error_count = s.error_count + 1
             return
         pat = arm_pattern_next(@arm, pat)
@@ -2316,17 +2055,17 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
     if ei >= 0
         match_check_enum(s, arms, ei, line, col)
     else if builtin == MATCH_OPTION
-        match_check_pair(s, arms, StrView { ptr: (c"Some"), len: (4) as i64 }, StrView { ptr: (c"None"), len: (4) as i64 }, line, col)
+        match_check_pair(s, arms, "Some", "None", line, col)
     else if builtin == MATCH_RESULT
-        match_check_pair(s, arms, StrView { ptr: (c"Ok"), len: (2) as i64 }, StrView { ptr: (c"Err"), len: (3) as i64 }, line, col)
+        match_check_pair(s, arms, "Ok", "Err", line, col)
     else if is_bool == 1
         match_check_bool(s, arms, line, col)
     else
         match_check_scalar(s, arms, line, col)
     # AGAST #2431: after coverage, as on ritz0, and only against the enum the
     # scrutinee has: one an arm named is no judge of the arms.
-    if from_arms == 0 and name != null
-        match_refuse_foreign_arms(s, arms, StrView { ptr: (name), len: (len) as i64 })
+    if from_arms == 0 and not unnamed(name)
+        match_refuse_foreign_arms(s, arms, name)
     # AGAST #2349: then every arm must be reachable, as on ritz0.  A foreign
     # arm is that error, not an unreachable one, so this comes after it.
     if s.error_count == errors_before
@@ -2347,17 +2086,11 @@ fn borrowed_enum_local(s: *EmitterState, e: *Expr) -> bool
     let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     loc != null and lv_var_type(loc) == TypeKind.Ref and lv_pointee_type(loc) == TypeKind.Struct
 
-fn emit_match_place_load(s: *EmitterState, slot: i32, enum_name_sv: StrView) -> i32
-    var enum_name: *u8 = enum_name_sv.ptr
-    var enum_name_len: i32 = enum_name_sv.len as i32
+fn emit_match_place_load(s: *EmitterState, slot: i32, enum_name: StrView) -> i32
     let reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, reg)
-    emit_str(s, IR_LOAD_NAMED)
-    emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, slot)
-    emit_str(s, c"  ; match @place\n")
+    format_into(s, "  %.{reg} = load %")
+    emit_name(s, enum_name)
+    format_into(s, ", ptr %.{slot}  ; match @place\n")
     reg
 
 # AGAST #4586: end the block no arm took.  A match on a repr enum
@@ -2365,25 +2098,25 @@ fn emit_match_place_load(s: *EmitterState, slot: i32, enum_name_sv: StrView) -> 
 # when the stored value names no variant: that traps.  Anything else is
 # `unreachable`: coverage rules a miss out, and an untyped enum's index tag
 # names no variant only through memory corruption.
-fn emit_match_no_arm(s: *EmitterState, arms: *MatchArm, enum_name_sv: StrView, is_enum: i32, scrut_slot: i32, span: SrcSpan)
-    if is_enum == 1 and scrut_slot != 0 and match_traps_no_variant(s, arms, enum_name_sv) == 1
-        emit_match_no_variant_trap(s, enum_name_sv, scrut_slot, span.line, span.col)
-    emit_str(s, c"  unreachable\n")
+fn emit_match_no_arm(s: *EmitterState, arms: *MatchArm, enum_name: StrView, is_enum: i32, scrut_slot: i32, span: SrcSpan)
+    if is_enum == 1 and scrut_slot != 0 and match_traps_no_variant(s, arms, enum_name)
+        emit_match_no_variant_trap(s, enum_name, scrut_slot, span.line, span.col)
+    format_into(s, "  unreachable\n")
 
-fn match_traps_no_variant(s: *EmitterState, arms: *MatchArm, enum_name_sv: StrView) -> i32
-    if enum_name_sv.ptr == null
-        return 0
-    let ei: i32 = user_enum_index(s.mono.pctx, enum_name_sv)
+fn match_traps_no_variant(s: *EmitterState, arms: *MatchArm, enum_name: StrView) -> bool
+    if unnamed(enum_name)
+        return false
+    let ei: i32 = user_enum_index(s.mono.pctx, enum_name)
     if ei < 0 or ty_int_bits(enum_repr(s.mono.pctx, ei)) == 0
-        return 0
+        return false
     var arm: *MatchArm = arms
     while arm != null
         if arm.pattern_kind == PAT_WILDCARD
-            return 0
+            return false
         if arm.pattern_kind == PAT_IDENT and match_arm_is_variant(s, arm, ei, 0) == 0
-            return 0
+            return false
         arm = arm.next
-    1
+    true
 
 # Main entry: emit a match construct. Returns the phi register holding
 # the match's result value (or 0 if no arms contribute).
@@ -2425,8 +2158,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     s.match_agg_hint_len = 0
     # Detect whether the scrutinee is a tagged-enum struct; if so, spill
     # it into an alloca once so every arm can GEP the same pointer.
-    var enum_name: *u8 = null
-    var enum_name_len: i32 = 0
+    var enum_name: StrView = no_name()
     # AGAST #2140: `match @place` (angelo's `match @self.cmap`) matches the
     # enum the pointer addresses.  resolve_scrutinee_enum stays strict about
     # `@` (emit_enum_to_int shares it, and `(@e) as T` is a pointer cast), so
@@ -2434,43 +2166,42 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     # value is loaded from it for arms that use the scrutinee register.
     # Without this `@o` was a scalar: `Some(x)` compared the ADDRESS to 0.
     let is_addr: i32 = match_scrutinee_is_addr(scrutinee)
-    var is_enum: i32 = 0
     var typed: *Expr = scrutinee
     if is_addr == 1
         typed = scrutinee.operand
-    let resolved: i32 = resolve_match_enum(s, typed, arms, @enum_name, @enum_name_len)
-    is_enum = (resolved != 0) as i32
+    let resolved: i32 = resolve_match_enum(s, typed, arms, @enum_name)
+    let is_enum: bool = resolved != 0
     # AGAST #2419: never the zero a constructor with no enum lowers to.
-    if is_enum == 0 and is_tagged_ctor(s, typed) == 1
+    if not is_enum and is_tagged_ctor(s, typed) == 1
         emit_ctor_type_error(s, typed)
         return 0
-    if is_enum == 0 and typed == g_gctor_refused   # AGAST #2437, reported
+    if not is_enum and typed == g_gctor_refused   # AGAST #2437, reported
         return 0
     # AGAST #2503: no guess between two enums that declare an arm's name.
-    if is_enum == 0 and match_refuse_ambiguous_arms(s, typed, arms) == 1
+    if not is_enum and match_refuse_ambiguous_arms(s, typed, arms) == 1
         return 0
-    match_check_coverage(s, typed, arms, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, (resolved == MATCH_ENUM_FROM_ARMS) as i32, span.line, span.col)
+    match_check_coverage(s, typed, arms, enum_name, (resolved == MATCH_ENUM_FROM_ARMS) as i32, span.line, span.col)
     # AGAST #2344: an enum element or global is a place too.  emit_expr reads
     # `a[1]` and `g` as scalars, whatever their type.
-    var from_place: i32 = is_addr
-    var is_ctor: i32 = 0
-    if is_enum == 1
-        is_ctor = match_scrutinee_is_ctor(s, typed)   # AGAST #2419
-        if is_ctor == 1
-            from_place = 0
-        else if typed.kind == ExprKind.Index or (typed.kind == ExprKind.Ident and find_local_struct_name(s, StrView { ptr: (typed.ident_ptr), len: (typed.ident_len) as i64 }) == null)
-            from_place = 1
+    var from_place: bool = is_addr == 1
+    var is_ctor: bool = false
+    if is_enum
+        is_ctor = match_scrutinee_is_ctor(s, typed) == 1   # AGAST #2419
+        if is_ctor
+            from_place = false
+        else if typed.kind == ExprKind.Index or (typed.kind == ExprKind.Ident and find_local_struct_name(s, ident_sv(typed)) == null)
+            from_place = true
     # AGAST #2289: an `e:& E` param reads as the borrow's pointer, so it is a
     # place as `@place` is: that pointer is the slot.  Spilled as a `%E` it
     # was a `ptr` clang refused.
     var lent: bool = false
-    if is_enum == 1 and is_ctor == 0 and lent_referent_local(s, typed) != null
+    if is_enum and not is_ctor and lent_referent_local(s, typed) != null
         lent = true
     # AGAST #4693: so is an `o: @E` param or local, `o: @Result<T, E>` among
     # them: the borrow lowers to an i64, which spilled as a `%E` was IR clang
     # refused.  Its pointer is the slot, as `match @place`'s is.
     var borrowed: bool = false
-    if is_enum == 1 and is_ctor == 0 and not lent and borrowed_enum_local(s, typed)
+    if is_enum and not is_ctor and not lent and borrowed_enum_local(s, typed)
         borrowed = true
 
     # Evaluate scrutinee.  For `@place` the place's own address (a `ptr`;
@@ -2478,37 +2209,37 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     var scrut_reg: i32 = 0
     var scrut_slot: i32 = 0
     if lent
-        from_place = 1
+        from_place = true
         scrut_slot = emit_expr(s, typed)
-        scrut_reg = emit_match_place_load(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
+        scrut_reg = emit_match_place_load(s, scrut_slot, enum_name)
     else if borrowed
-        from_place = 1
+        from_place = true
         scrut_slot = ir_inttoptr_ptr(s.out, @s.reg_counter, emit_expr(s, typed))
-        scrut_reg = emit_match_place_load(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    else if is_enum == 1 and from_place == 1
+        scrut_reg = emit_match_place_load(s, scrut_slot, enum_name)
+    else if is_enum and from_place
         scrut_slot = emit_lvalue_ptr(s, typed)
         if scrut_slot < 0
-            emit_ir_error(s, scrutinee.span, c"cannot take address of match scrutinee")
+            emit_ir_error_sv(s, scrutinee.span, "cannot take address of match scrutinee")
             return 0
-        scrut_reg = emit_match_place_load(s, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    else if is_ctor == 1
-        scrut_reg = emit_ctor_scrutinee(s, typed, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
+        scrut_reg = emit_match_place_load(s, scrut_slot, enum_name)
+    else if is_ctor
+        scrut_reg = emit_ctor_scrutinee(s, typed, enum_name)
     else
         scrut_reg = emit_expr(s, scrutinee)
-    if is_enum == 1 and from_place == 0
+    if is_enum and not from_place
         scrut_slot = next_reg(s)
         entry_alloca_reg_begin_named(s, scrut_slot)
-        emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-        emit_str(s, c"  ; match scrut spill\n")
+        emit_name(s, enum_name)
+        format_into(s, "  ; match scrut spill\n")
         entry_alloca_reg_end(s)
-        emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, scrut_reg, scrut_slot)
+        emit_struct_store_or_copy(s, TypeKind.Struct, enum_name, scrut_reg, scrut_slot)
 
     # AGAST #2174: the match owns a scrutinee it moved (ownership.ritz);
     # `match @place` moves nothing.
     var owned: *Expr = scrutinee
-    if is_ctor == 1
+    if is_ctor
         owned = typed   # `@Some(x)` borrows a value only this match holds
-    let own_old: i32 = own_match_begin(s, owned, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
+    let own_old: i32 = own_match_begin(s, owned, scrut_slot, enum_name)
 
     let end_label: i32 = next_label(s)
     var n_arms: i32 = 0
@@ -2527,17 +2258,18 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     var arm: *MatchArm = arms
     var idx: i32 = 0
     while arm != null
-        emit_match_arm(s, arm, scrut_reg, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, @result, idx, end_label)
+        emit_match_arm(s, arm, scrut_reg, scrut_slot, enum_name, @result, idx, end_label)
         arm = arm.next
         idx = idx + 1
 
+    let is_enum_i32: i32 = is_enum as i32
     if into != null
         # AGAST #3276: every arm stored its array; nothing to merge.  No arm
         # type leaks to an enclosing untyped `let` (it is the `[N]T` local).
         s.last_match_agg_name = null
         s.last_match_agg_name_len = 0
         s.last_match_float_ty = TypeKind.Void
-        emit_match_no_arm(s, arms, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, is_enum, scrut_slot, span)
+        emit_match_no_arm(s, arms, enum_name, is_enum_i32, scrut_slot, span)
         begin_block(s, end_label)
         own_match_end(s, own_old)
         return 0
@@ -2565,11 +2297,11 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         s.last_match_agg_name_len = 0
         s.last_match_float_ty = TypeKind.Void
         match_void_arms_settle(s, @result, wants_value)   # AGAST #2046
-        emit_match_no_arm(s, arms, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, is_enum, scrut_slot, span)
+        emit_match_no_arm(s, arms, enum_name, is_enum_i32, scrut_slot, span)
         begin_block(s, end_label)
         own_match_end(s, own_old)
         return 0
-    emit_match_no_arm(s, arms, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, is_enum, scrut_slot, span)
+    emit_match_no_arm(s, arms, enum_name, is_enum_i32, scrut_slot, span)
 
     # End block with phi over all arm results: ( arm_result, arm_exit_label ).
     begin_block(s, end_label)
@@ -2577,9 +2309,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     if result.count == 0
         # No arm phi: the match's value is this register itself.
         let no_arm_reg: i32 = next_reg(s)
-        emit_str(s, IR_INDENT)
-        emit_reg(s, no_arm_reg)
-        emit_str(s, c" = add i64 0, 0  ; match: no arm yields a value\n")
+        format_into(s, "  %.{no_arm_reg} = add i64 0, 0  ; match: no arm yields a value\n")
         own_match_end(s, own_old)
         return no_arm_reg
 
@@ -2588,22 +2318,18 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         own_match_end(s, own_old)
         return slot_reg
     let phi_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, phi_reg)
-    emit_str(s, c" = phi ")
+    format_into(s, "  %.{phi_reg} = phi ")
     emit_match_phi_type(s, @result)
-    emit_str(s, IR_SP)
+    format_into(s, " ")
     var i: i32 = 0
     while i < result.count
         if i > 0
-            emit_str(s, IR_COMMA)
-        emit_str(s, c"[ ")
+            format_into(s, ", ")
+        format_into(s, "[ ")
         emit_match_phi_value(s, @result, result.values[i])
-        emit_str(s, c", %")
-        emit_label(s, result.labels[i])
-        emit_str(s, c" ]")
+        format_into(s, ", %L{result.labels[i]} ]")
         i = i + 1
-    emit_str(s, IR_NL)
+    format_into(s, "\n")
     own_match_end(s, own_old)
     return phi_reg
 
@@ -2611,15 +2337,13 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
 # `break`, `continue`)?  Such an arm reaches the merge only through the
 # unreachable block emit_match_arm_stmts opens after it, so its lack of a
 # value is harmless; Sema refuses any other valueless arm (if_arm_value.ritz).
-fn if_arm_diverges(arm: *MatchArm) -> i32
+fn if_arm_diverges(arm: *MatchArm) -> bool
     var last: *Stmt = arm.body_stmts
     if last == null
-        return 0
+        return false
     while last.next != null
         last = last.next
-    if last.kind == StmtKind.Return or last.kind == StmtKind.Break or last.kind == StmtKind.Continue
-        return 1
-    0
+    last.kind == StmtKind.Return or last.kind == StmtKind.Break or last.kind == StmtKind.Continue
 
 # Emit an if/else expression (AGAST #1613): `left` is the condition, `args`
 # the then-arm and its `next` the else-arm (see expr_if).  Lowered like a
@@ -2639,22 +2363,12 @@ pub fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
     # Narrowed to i1 for the `br`, as StmtKind.If does (AGAST #1367, #1646).
     let cond: i32 = emit_expr(s, e.left)
     let cond_i1: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, cond_i1)
-    emit_str(s, c" = icmp ne i64 ")
-    emit_reg(s, cond)
-    emit_str(s, IR_COMMA_0)
+    format_into(s, "  %.{cond_i1} = icmp ne i64 %.{cond}, 0\n")
 
     let then_label: i32 = next_label(s)
     let else_label: i32 = next_label(s)
     let end_label: i32 = next_label(s)
-    emit_str(s, c"  br i1 ")
-    emit_reg(s, cond_i1)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, then_label)
-    emit_str(s, IR_LABEL_SEP)
-    emit_label(s, else_label)
-    emit_str(s, IR_NL)
+    format_into(s, "  br i1 %.{cond_i1}, label %L{then_label}, label %L{else_label}\n")
 
     var result: MatchResult
     match_result_init(@result, 2)
@@ -2662,9 +2376,9 @@ pub fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
     result.hint_ty = float_hint   # AGAST #2092
     result.ptr_ty = arms_ptr_valued(s, then_arm)   # AGAST #2950
     begin_block(s, then_label)
-    emit_match_arm_body(s, then_arm, 0, 0, StrView { ptr: (null), len: (0) as i64 }, @result, 0, end_label)
+    emit_match_arm_body(s, then_arm, 0, 0, no_name(), @result, 0, end_label)
     begin_block(s, else_label)
-    emit_match_arm_body(s, else_arm, 0, 0, StrView { ptr: (null), len: (0) as i64 }, @result, 1, end_label)
+    emit_match_arm_body(s, else_arm, 0, 0, no_name(), @result, 1, end_label)
     begin_block(s, end_label)
 
     if result.void_arms > 0
@@ -2685,19 +2399,15 @@ pub fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
         return slot_reg
 
     let phi_reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, phi_reg)
-    emit_str(s, c" = phi ")
+    format_into(s, "  %.{phi_reg} = phi ")
     emit_match_phi_type(s, @result)
     var i: i32 = 0
     while i < 2
         if i > 0
-            emit_str(s, c",")
-        emit_str(s, c" [ ")
+            format_into(s, ",")
+        format_into(s, " [ ")
         emit_match_phi_value(s, @result, result.values[i])
-        emit_str(s, c", %")
-        emit_label(s, result.labels[i])
-        emit_str(s, c" ]")
+        format_into(s, ", %L{result.labels[i]} ]")
         i = i + 1
-    emit_str(s, IR_NL)
+    format_into(s, "\n")
     return phi_reg
