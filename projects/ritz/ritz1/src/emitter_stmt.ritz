@@ -6184,6 +6184,7 @@ pub fn binder_mark_decl(s: *EmitterState, stmt: *Stmt, before: i32)
     let loc: *LocalVar = local_at(s, idx)
     loc.not_fn = not_fn
 
+# One statement: dispatch on its kind (AGAST #1818: one handler per kind).
 fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     match stmt.kind
         StmtKind.VarDecl =>
@@ -6207,1013 +6208,1072 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
         StmtKind.Assign =>
             emit_assign(s, stmt)
         StmtKind.Return =>
-            # AGAST #2207: a `return` leaves the let initialiser it sits in, so the
-            # let's enum context does not apply to it. With none set,
-            # resolve_enum_ctx falls back to the fn's return type.
-            let ret_ctx_name: *u8 = s.ctx_enum_name
-            let ret_ctx_len: i32 = s.ctx_enum_name_len
-            s.ctx_enum_name = null
-            s.ctx_enum_name_len = 0
-            # So does the slot's: a `return` lands in the fn's return type.
-            let ret_slot_set: i32 = s.ctx_slot_set
-            s.ctx_slot_set = 0
-            emit_return(s, stmt, ret_type)
-            s.ctx_enum_name = ret_ctx_name
-            s.ctx_enum_name_len = ret_ctx_len
-            s.ctx_slot_set = ret_slot_set
+            emit_return_stmt(s, stmt, ret_type)
         StmtKind.Assert =>
             # AGAST #1869: placement check, operand report, helper call site.
             emit_assert_stmt(s, stmt)
         StmtKind.If =>
-            let discarded: i32 = if_stmt_is_discarded(s, stmt)   # AGAST #3749
-            # AGAST #4590: a value-giving `if` moves its arms' values out.
-            var arm_moves: i32 = 0
-            if discarded == 0 and stmt.if_else != null
-                arm_moves = 1
-            # AGAST #3421: the float slot the value lands in (a `-> f64` fn's
-            # tail), taken before the condition so a match there can't see it.
-            # The arms settle against it (if_stmt_arm_float_settle).
-            var fr: MatchResult
-            match_result_init(@fr, 1)
-            fr.float_ty = take_match_float_hint(s)
-            fr.hint_ty = fr.float_ty
-            let cond: i32 = emit_expr(s, stmt.if_cond)
-            # Every condition value, a bool included, is an i64 register
-            # (AGAST #1646; a bool global's load too since #3001), so coerce
-            # it to i1 via `icmp ne ..., 0` for the `br`.  Skipping that for a
-            # TypeKind.Bool condition wired an i64 into `br i1` (`if f()`, #1367).
-            let cond_i1: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, cond_i1)
-            emit_str(s, c" = icmp ne i64 ")
-            emit_reg(s, cond)
-            emit_str(s, IR_COMMA_0)
-
-            let then_label: i32 = next_label(s)
-            let else_label: i32 = next_label(s)
-            let end_label: i32 = next_label(s)
-
-            own_cond_end(s)   # AGAST #2165: the condition's temporaries
-            emit_str(s, c"  br i1 ")
-            emit_reg(s, cond_i1)
-            emit_str(s, IR_LABEL_SEP)
-            emit_label(s, then_label)
-            emit_str(s, IR_LABEL_SEP)
-            if stmt.if_else != null
-                emit_label(s, else_label)
-            else
-                emit_label(s, end_label)
-            emit_str(s, IR_NL)
-
-            # Save current last_expr_reg before entering branches.  The defining
-            # label rides along so the restore path below puts back a coherent
-            # (value, block) pair rather than re-dating the value to the merge
-            # block. (ritz-task-1309)
-            let saved_last: i32 = s.last_expr_reg
-            let saved_last_label: i32 = s.last_expr_label
-            let saved_last_model: i32 = s.last_expr_model
-
-            begin_block(s, then_label)
-            clear_last_expr(s)  # Reset before then branch
-            # AGAST #2158: each arm is a block for drops.
-            own_push_scope(s)
-            emit_if_stmt_arm(s, stmt.if_then, ret_type, discarded, fr.hint_ty, arm_moves)
-            # AGAST #2559: the arm value's struct type, while its bindings resolve.
-            var then_agg: *u8 = null
-            var then_agg_len: i32 = 0
-            if_stmt_arm_agg(s, stmt.if_then, @then_agg, @then_agg_len)
-            own_pop_scope(s)
-            # ritz-task-1309 — `last_expr_here` (not `s.last_expr_reg`) so a value
-            # produced in a block nested inside the then-arm, which the insertion
-            # point has since left, is reported as "no value" instead of being
-            # falsely attributed to `then_exit_label` below.
-            var then_result: i32 = last_expr_here(s)  # Capture then branch result
-            # AGAST #2563: a Span$u8 / StrView arm takes the phi's type here.
-            var then_phi: *u8 = null
-            var then_phi_len: i32 = 0
-            if_stmt_phi_type(s, StrView { ptr: (then_agg), len: (then_agg_len) as i64 }, ret_type, @then_phi, @then_phi_len)
-            if stmt.if_else != null
-                then_result = if_stmt_arm_settle(s, then_result, StrView { ptr: (then_agg), len: (then_agg_len) as i64 }, StrView { ptr: (then_phi), len: (then_phi_len) as i64 })
-                then_result = if_stmt_arm_ptr_settle(s, stmt.if_then, then_result, then_agg)
-                if discarded == 0
-                    then_result = if_stmt_arm_float_settle(s, stmt.if_then, then_result, then_phi, @fr)
-            let then_exit_label: i32 = s.current_label  # Capture actual exit block
-            emit_str(s, IR_BR)
-            emit_label(s, end_label)
-            emit_str(s, IR_NL)
-
-            var else_result: i32 = 0
-            var else_exit_label: i32 = else_label
-            var else_agg: *u8 = null
-            var else_agg_len: i32 = 0
-            if stmt.if_else != null
-                begin_block(s, else_label)
-                clear_last_expr(s)  # Reset before else branch
-                own_push_scope(s)
-                emit_if_stmt_arm(s, stmt.if_else, ret_type, discarded, fr.hint_ty, arm_moves)
-                if_stmt_arm_agg(s, stmt.if_else, @else_agg, @else_agg_len)
-                own_pop_scope(s)
-                else_result = last_expr_here(s)  # Capture else branch result
-                # AGAST #2563: the phi's type is the then-arm's when it has one.
-                var else_phi: *u8 = null
-                var else_phi_len: i32 = 0
-                if_stmt_phi_type(s, StrView { ptr: (else_agg), len: (else_agg_len) as i64 }, ret_type, @else_phi, @else_phi_len)
-                if then_phi != null and then_phi_len > 0
-                    else_phi = then_phi
-                    else_phi_len = then_phi_len
-                else_result = if_stmt_arm_settle(s, else_result, StrView { ptr: (else_agg), len: (else_agg_len) as i64 }, StrView { ptr: (else_phi), len: (else_phi_len) as i64 })
-                else_result = if_stmt_arm_ptr_settle(s, stmt.if_else, else_result, else_agg)
-                if discarded == 0
-                    else_result = if_stmt_arm_float_settle(s, stmt.if_else, else_result, else_phi, @fr)
-                else_agg = else_phi
-                else_agg_len = else_phi_len
-                else_exit_label = s.current_label  # Capture actual exit block
-                emit_str(s, IR_BR)
-                emit_label(s, end_label)
-                emit_str(s, IR_NL)
-
-            begin_block(s, end_label)
-
-            # If both branches produce values, emit a phi node.  When the
-            # enclosing fn returns a tagged-enum struct, both branches hand us
-            # `%Result$.../Option$...` struct values — the phi must match that
-            # type or LLVM rejects the IR. (ritz-task-133)  Otherwise a struct
-            # value in either arm types it (AGAST #2559): `if c / a / else / b`
-            # over `%B` locals, params, literals and calls.
-            var phi_agg: *u8 = null
-            var phi_agg_len: i32 = 0
-            # AGAST #3323: one arm may diverge; the other is the if's value.
-            if stmt.if_else != null
-                then_result = if_stmt_arm_incoming(then_result, stmt.if_then)
-                else_result = if_stmt_arm_incoming(else_result, stmt.if_else)
-                if then_result == IF_ARM_DIVERGES and else_result == IF_ARM_DIVERGES
-                    then_result = 0   # both leave: no value reaches the merge
-                    else_result = 0
-                if discarded == 1   # AGAST #3749: nobody reads the value
-                    then_result = 0
-                    else_result = 0
-            if stmt.if_else != null and then_result != 0 and else_result != 0
-                if ret_type == TypeKind.Struct and s.ret_type_name_len > 0 and is_tagged_enum_type(StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }) == 1
-                    phi_agg = s.ret_type_name
-                    phi_agg_len = s.ret_type_name_len
-                else if then_phi != null and then_phi_len > 0
-                    phi_agg = then_phi
-                    phi_agg_len = then_phi_len
-                else if else_agg != null and else_agg_len > 0
-                    phi_agg = else_agg
-                    phi_agg_len = else_agg_len
-            # AGAST #2559: publish it for an enclosing `if` ending in this one.
-            s.last_if_stmt_agg_name = phi_agg
-            s.last_if_stmt_agg_name_len = phi_agg_len
-            if stmt.if_else != null and then_result != 0 and else_result != 0
-                let phi_reg: i32 = next_reg(s)
-                emit_str(s, IR_INDENT)
-                emit_reg(s, phi_reg)
-                emit_str(s, c" = phi ")
-                # AGAST #3421: a scalar phi is the arms' float when they have one.
-                var phi_float: TypeKind = TypeKind.Void
-                if phi_agg == null
-                    phi_float = fr.float_ty
-                if phi_agg != null
-                    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (phi_agg), len: (phi_agg_len) as i64 })
-                else if phi_float != TypeKind.Void
-                    emit_str(s, float_llvm_name(phi_float))
-                else
-                    emit_str(s, c"i64")
-                emit_str(s, c" [ ")
-                emit_if_phi_incoming(s, then_result, phi_agg, phi_float)
-                emit_str(s, c", %")
-                emit_label(s, then_exit_label)
-                emit_str(s, c" ], [ ")
-                emit_if_phi_incoming(s, else_result, phi_agg, phi_float)
-                emit_str(s, c", %")
-                emit_label(s, else_exit_label)
-                emit_str(s, c" ]\n")
-                set_last_expr(s, phi_reg)
-                # Published for an enclosing `if` / `match` this one ends.
-                s.last_match_float_ty = phi_float
-                if phi_agg == null and phi_float == TypeKind.Void
-                    set_last_expr_phi(s, phi_reg, 0)   # AGAST #2950: an i64
-            else
-                # ritz-task-1309 — no phi, so this `if` contributes no value that
-                # is live in the merge block.
-                #
-                # There used to be a `then_result > 0` case here that propagated
-                # the then-arm's value out of the merge block.  That was one of
-                # the two confirmed leak paths: `then_result` is defined in the
-                # then-arm's exit block, which is NOT the merge block and does not
-                # dominate it (the else edge bypasses it).  An enclosing `if` then
-                # picked it up as a phi incoming and named the merge block as its
-                # predecessor — the exact `phi i64 [ %x, %L20 ]` shape this task
-                # exists to kill.  An if-without-else genuinely has no value on
-                # all paths, so there is nothing correct to propagate.
-                #
-                # Restore the pre-`if` value with its original defining label, so
-                # the pair stays coherent: still usable by an implicit return that
-                # it dominates, still correctly rejected as a phi incoming here.
-                s.last_expr_reg = saved_last  # Restore if no result
-                s.last_expr_label = saved_last_label
-                s.last_expr_model = saved_last_model
-
+            emit_if_stmt(s, stmt, ret_type)
         StmtKind.While =>
-            let cond_label: i32 = next_label(s)
-            let body_label: i32 = next_label(s)
-            let end_label: i32 = next_label(s)
-
-            let old_break: i32 = s.break_label
-            let old_continue: i32 = s.continue_label
-            s.break_label = end_label
-            s.continue_label = cond_label
-
-            emit_str(s, IR_BR)
-            emit_label(s, cond_label)
-            emit_str(s, IR_NL)
-
-            begin_block(s, cond_label)
-            let cond: i32 = emit_expr(s, stmt.while_cond)
-            # Narrowed to i1 for the `br`, as StmtKind.If does (AGAST #1367).
-            let cond_i1: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, cond_i1)
-            emit_str(s, c" = icmp ne i64 ")
-            emit_reg(s, cond)
-            emit_str(s, IR_COMMA_0)
-            own_cond_end(s)   # AGAST #2165: dropped on every evaluation
-            emit_str(s, c"  br i1 ")
-            emit_reg(s, cond_i1)
-            emit_str(s, IR_LABEL_SEP)
-            emit_label(s, body_label)
-            emit_str(s, IR_LABEL_SEP)
-            emit_label(s, end_label)
-            emit_str(s, IR_NL)
-
-            begin_block(s, body_label)
-            let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
-            own_push_scope(s)
-            emit_void_body(s, stmt.while_body, ret_type)
-            own_pop_scope(s)
-            own_loop_exit(s, own_loop)
-            emit_str(s, IR_BR)
-            emit_label(s, cond_label)
-            emit_str(s, IR_NL)
-
-            begin_block(s, end_label)
-            # AGAST #1329 — a loop contributes no value; clear the tracked
-            # expression so it cannot leak into the exit block (see StmtKind.While
-            # note; symmetric across while/loop/for).
-            clear_last_expr(s)
-
-            s.break_label = old_break
-            s.continue_label = old_continue
-
+            emit_while_stmt(s, stmt, ret_type)
         StmtKind.Loop =>
-            # Infinite loop: loop { body }
-            # Generates:
-            #   br label %loop.body
-            # loop.body:
-            #   ... body ...
-            #   br label %loop.body
-            # loop.end:
-            let body_label: i32 = next_label(s)
-            let end_label: i32 = next_label(s)
-
-            let old_break: i32 = s.break_label
-            let old_continue: i32 = s.continue_label
-            s.break_label = end_label
-            s.continue_label = body_label
-
-            emit_str(s, IR_BR)
-            emit_label(s, body_label)
-            emit_str(s, IR_NL)
-
-            begin_block(s, body_label)
-            let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
-            own_push_scope(s)
-            emit_void_body(s, stmt.while_body, ret_type)
-            own_pop_scope(s)
-            own_loop_exit(s, own_loop)
-            emit_str(s, IR_BR)
-            emit_label(s, body_label)
-            emit_str(s, IR_NL)
-
-            begin_block(s, end_label)
-            # AGAST #1329 — a loop contributes no value; clear the tracked
-            # expression so it cannot leak into the exit block (see StmtKind.While
-            # note; symmetric across while/loop/for).
-            clear_last_expr(s)
-
-            s.break_label = old_break
-            s.continue_label = old_continue
-
+            emit_loop_stmt(s, stmt, ret_type)
         StmtKind.For =>
-            # For-loop. Two shapes:
-            #   for i in start..end   — range; for_end != null
-            #   for x in iterable     — array/Vec-ref; for_end == null
-            if stmt.for_end == null
-                emit_for_iterable(s, stmt, ret_type)
-                return
-
-            # For-loop (range): for i in start..end { body }
-            # Desugar to:
-            #   %i = alloca i64
-            #   store i64 %start, ptr %i
-            #   br label %for.cond
-            # for.cond:
-            #   %i.val = load i64, ptr %i
-            #   %cmp = icmp slt i64 %i.val, %end
-            #   br i1 %cmp, label %for.body, label %for.end
-            # for.body:
-            #   ... body ...
-            #   %i.next = add i64 %i.val, 1
-            #   store i64 %i.next, ptr %i
-            #   br label %for.cond
-            # for.end:
-
-            let cond_label: i32 = next_label(s)
-            let body_label: i32 = next_label(s)
-            let incr_label: i32 = next_label(s)
-            let end_label: i32 = next_label(s)
-
-            let old_break: i32 = s.break_label
-            let old_continue: i32 = s.continue_label
-            s.break_label = end_label
-            s.continue_label = incr_label
-
-            # AGAST #1636 / #3328: the range compares unsigned when a bound is a
-            # u64, and the loop variable is then a u64 in the body, so `j / 2`
-            # with `j = 1 << 63` is a udiv.  Decided once, from the bounds as they
-            # read before `j` is bound, so the compare and the type can't disagree.
-            var range_uns: i32 = for_range_unsigned(s, stmt)
-            var var_type: TypeKind = TypeKind.I64
-            if range_uns == 1
-                var_type = TypeKind.U64
-            # AGAST #4080: a narrower range binds its own type (for_range_type),
-            # in a slot of that width: `for i in 1..n` with `n: i32` is an i32, as
-            # on ritz0.  The start is truncated into it, and the compare and the
-            # increment are at that width, as ritz0's are.
-            let narrow_ty: TypeKind = for_range_var_type(s, stmt)
-            if ty_int_bits(narrow_ty) > 0 and ty_int_bits(narrow_ty) < 64
-                var_type = narrow_ty
-                range_uns = ty_is_unsigned(narrow_ty)
-            let var_llvm: *u8 = ty_mem_llvm(var_type)
-
-            # Allocate loop variable
-            let var_reg: i32 = next_reg(s)
-            entry_alloca_reg_begin(s, var_reg)
-            emit_str(s, var_llvm)
-            emit_str(s, IR_NL)
-            entry_alloca_reg_end(s)
-
-            # Register the loop variable
-            add_local(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, var_type)
-
-            # Emit start expression and store it
-            let start_reg: i32 = for_bound_at(s, emit_expr(s, stmt.for_start), var_type)
-            emit_str(s, IR_STORE_IND)
-            emit_str(s, var_llvm)
-            emit_str(s, IR_SP)
-            emit_reg(s, start_reg)
-            emit_str(s, IR_PTR_SEP)
-            emit_reg(s, var_reg)
-            emit_str(s, IR_NL)
-
-            # Branch to condition check
-            emit_str(s, IR_BR)
-            emit_label(s, cond_label)
-            emit_str(s, IR_NL)
-
-            # Condition block
-            begin_block(s, cond_label)
-            let load_reg: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, load_reg)
-            emit_str(s, IR_LOAD)
-            emit_str(s, var_llvm)
-            emit_str(s, IR_PTR_SEP)
-            emit_reg(s, var_reg)
-            emit_str(s, IR_NL)
-
-            let end_reg: i32 = for_bound_at(s, emit_expr(s, stmt.for_end), var_type)
-            let cmp_reg: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, cmp_reg)
-            # `start..=end` (AGAST #1530) keeps iterating while i <= end; signed
-            # or not by range_uns.
-            if stmt.for_inclusive != 0
-                if range_uns == 1
-                    emit_str(s, c" = icmp ule ")
-                else
-                    emit_str(s, c" = icmp sle ")
-            else
-                if range_uns == 1
-                    emit_str(s, c" = icmp ult ")
-                else
-                    emit_str(s, c" = icmp slt ")
-            emit_str(s, var_llvm)
-            emit_str(s, IR_SP)
-            emit_reg(s, load_reg)
-            emit_str(s, IR_COMMA)
-            emit_reg(s, end_reg)
-            emit_str(s, IR_NL)
-            emit_str(s, c"  br i1 ")
-            emit_reg(s, cmp_reg)
-            emit_str(s, IR_LABEL_SEP)
-            emit_label(s, body_label)
-            emit_str(s, IR_LABEL_SEP)
-            emit_label(s, end_label)
-            emit_str(s, IR_NL)
-
-            # Body block
-            begin_block(s, body_label)
-            let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
-            own_push_scope(s)
-            emit_void_body(s, stmt.for_body, ret_type)
-            own_pop_scope(s)
-            own_loop_exit(s, own_loop)
-            emit_str(s, IR_BR)
-            emit_label(s, incr_label)
-            emit_str(s, IR_NL)
-
-            # Increment block
-            begin_block(s, incr_label)
-            let load2_reg: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, load2_reg)
-            emit_str(s, IR_LOAD)
-            emit_str(s, var_llvm)
-            emit_str(s, IR_PTR_SEP)
-            emit_reg(s, var_reg)
-            emit_str(s, IR_NL)
-            let incr_reg: i32 = next_reg(s)
-            emit_str(s, IR_INDENT)
-            emit_reg(s, incr_reg)
-            emit_str(s, c" = add ")
-            emit_str(s, var_llvm)
-            emit_str(s, IR_SP)
-            emit_reg(s, load2_reg)
-            emit_str(s, IR_COMMA_1)
-            emit_str(s, IR_STORE_IND)
-            emit_str(s, var_llvm)
-            emit_str(s, IR_SP)
-            emit_reg(s, incr_reg)
-            emit_str(s, IR_PTR_SEP)
-            emit_reg(s, var_reg)
-            emit_str(s, IR_NL)
-            emit_str(s, IR_BR)
-            emit_label(s, cond_label)
-            emit_str(s, IR_NL)
-
-            # End block
-            begin_block(s, end_label)
-            # AGAST #1329 — a loop contributes no value; clear the tracked
-            # expression so it cannot leak into the exit block (see StmtKind.While
-            # note; symmetric across while/loop/for).
-            clear_last_expr(s)
-
-            s.break_label = old_break
-            s.continue_label = old_continue
-
+            emit_for_stmt(s, stmt, ret_type)
         StmtKind.Break =>
-            if s.break_label >= 0
-                own_loop_jump(s, 0)   # AGAST #2158: drop the loop body's bindings
-                emit_str(s, IR_BR)
-                emit_label(s, s.break_label)
-                emit_str(s, IR_NL)
-                let dead_label: i32 = next_label(s)
-                # `begin_block` makes the dead block the active insertion
-                # point, so the enclosing IF/loop captures the right
-                # `current_label` when building PHI predecessor labels.
-                # Without this, then/else_exit labels point at the pre-break
-                # block which isn't actually a CFG predecessor of the merge —
-                # LLVM's "Remove unreachable blocks" pass then crashes when it
-                # tries to remove the real (dead) predecessor from the PHI.
-                # (ritz-task-195)
-                begin_block(s, dead_label)
-                clear_last_expr(s)
-
+            emit_break_stmt(s, stmt)
         StmtKind.Continue =>
-            if s.continue_label >= 0
-                own_loop_jump(s, 1)   # AGAST #2158
-                emit_str(s, IR_BR)
-                emit_label(s, s.continue_label)
-                emit_str(s, IR_NL)
-                let dead_label: i32 = next_label(s)
-                # Same rationale as StmtKind.Break above. (ritz-task-195)
-                begin_block(s, dead_label)
-                clear_last_expr(s)
-
+            emit_continue_stmt(s, stmt)
         StmtKind.Expr =>
-            # Note: Implicit return only at function body level, not in nested blocks
-            # The implicit_return flag would be passed from emit_fn for top-level statements
-            # For now, we just emit the expression without implicit return in nested contexts
-            if stmt.expr == null
-                eprints("ERROR: STMT_EXPR with null expr field!\n")
-            else
-                # AGAST #2046: a match / if expression statement's value is
-                # discarded, so a void-call arm is legal there.
-                if stmt.expr.kind == ExprKind.Match or stmt.expr.kind == ExprKind.If
-                    s.match_no_value = 1
-                # (must_use_check and discarded_array_check run on Sema,
-                # sema_walk.ritz, AGAST #3462 / #3512.)
-                var expr_reg: i32 = 0
-                let lent: *LocalVar = lent_referent_local(s, stmt.expr)
-                if stmt == s.if_arm_value and lent != null
-                    # AGAST #2288: an if arm's value (emit_if_stmt_arm).
-                    expr_reg = emit_lent_referent(s, stmt.expr, StrView { ptr: (lv_type_name(lent)), len: (lv_type_name_len(lent)) as i64 })
-                else if builtin_tagged_ctor(s, stmt.expr) == 1
-                    expr_reg = emit_ctor_stmt(s, stmt.expr)   # AGAST #2454
-                else
-                    expr_reg = emit_expr(s, stmt.expr)
-                set_last_expr(s, expr_reg)  # Track for if/else phi nodes
+            emit_expr_stmt(s, stmt)
         StmtKind.Match =>
-            # Statement-form match: `match scrut \n pattern => body ...`
-            # The statement's result is tracked in last_expr_reg so an implicit
-            # return picks up the phi value. See emitter_match.ritz.
-            let arms: *MatchArm = stmt.if_then as *MatchArm
-            s.match_no_value = 1   # AGAST #2046: void-call arms are legal here
-            # AGAST #3028: a block's last statement may be its value; any other
-            # match statement's value is read by nothing.
-            if stmt.next != null
-                match_discard_next()
-            let match_reg: i32 = emit_match(s, stmt.if_cond, arms, stmt.span)
-            set_last_expr(s, match_reg)
-            # AGAST #2950: its phi is a `ptr` or an i64 (emit_match_phi_type).
-            if match_reg > 0 and s.last_match_agg_name == null and s.last_match_float_ty == TypeKind.Void
-                set_last_expr_phi(s, match_reg, arms_ptr_valued(s, arms))
+            emit_match_stmt(s, stmt)
         StmtKind.LocalFieldAssign =>
-            # local_var.field = value
-            # stmt.var_name = variable name
-            # stmt.assign_target = field name
-            # stmt.assign_value = value expression
-            var lfa_done: bool = false
-            let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
-            if loc != null
-                let st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
-                if st != null
-                    let field_idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-                    if field_idx >= 0
-                        let field: *StructField = get_field_type(st, field_idx)
-                        lfa_done = true
-                        # Get the base pointer - differs for TypeKind.Ptr/TypeKind.Ref/TypeKind.MutRef vs TypeKind.Struct
-                        var base_ptr_reg: i32 = loc.reg
-                        let lfa_levels: i32 = local_struct_levels(loc)
-                        if lfa_levels > 0
-                            # Load the pointer value, then convert to ptr
-                            let loaded: i32 = next_reg(s)
-                            emit_load_into(s, IR_TY_I64, loaded, loc.reg)
-                            base_ptr_reg = next_reg(s)
-                            emit_str(s, IR_INDENT)
-                            emit_reg(s, base_ptr_reg)
-                            emit_str(s, IR_INTTOPTR)
-                            emit_reg(s, loaded)
-                            emit_str(s, c" to ptr\n")
-                            base_ptr_reg = emit_load_levels(s, base_ptr_reg, lfa_levels - 1)   # AGAST #2372
-                        # Get pointer to the field using GEP
-                        let field_ptr: i32 = next_reg(s)
-                        emit_str(s, IR_INDENT)
-                        emit_reg(s, field_ptr)
-                        emit_str(s, IR_GEP_NAMED)
-                        emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-                        emit_str(s, IR_PTR_SEP)
-                        emit_reg(s, base_ptr_reg)
-                        emit_str(s, IR_I32_ZERO)
-                        emit_int(s, field_idx as i64)
-                        emit_str(s, IR_NL)
-                        # AGAST #1934: `x.f = [..]` / `p.f = [v; N]` on an inline
-                        # array field.  The generic store below would write the
-                        # ADDRESS of emit_expr's shadow alloca into the field.
-                        if field.field_type == TypeKind.Array
-                            emit_array_field_whole_assign(s, field_ptr, field, stmt.assign_value)
-                            return
-                        # Emit the value.  AGAST #2142: `f.cmap = None` builds
-                        # the field's enum.
-                        let val_reg: i32 = emit_expr_into_field(s, stmt.assign_value, field)
-                        # LARB R58 (§13.6): through a reference (`r.t = v` on a
-                        # local `@&T`, `h.t = v` on a `:& T` param) the field's
-                        # old value drops after v, before the store.
-                        if own_local_reach(loc) == OWN_REACH_REF
-                            own_drop_old_ref_field(s, field_ptr, field)
-                        # Store the value based on field type.
-                        #
-                        # AGAST #1303: narrow fields (u8/i8/u16/i16) used to fall
-                        # through to the `store i64` default below.  Values are i64
-                        # in the unified value model, so an 8-byte store into a
-                        # 1- or 2-byte field silently clobbered every adjacent
-                        # field.  `30_find`'s `opts.type_filter = 'f'` (u8) wiped
-                        # the following `maxdepth: i32` from -1 to 0, so find
-                        # printed the root and never descended — well-typed,
-                        # compiled clean, exit 0, wrong behaviour.  Truncate to the
-                        # field width before storing, as the other member-assign
-                        # paths already do.
-                        #
-                        # AGAST #2048: f32 / f64 fields store float / double.
-                        if emit_float_field_store(s, field_ptr, field.field_type, val_reg, stmt.assign_value) == 1
-                            lfa_done = true
-                        else if ty_int_bits(field.field_type) == 32
-                            let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, val_reg)
-                            emit_store_typed(s, IR_TY_I32, trunc, field_ptr)
-                        else if ty_int_bits(field.field_type) == 16
-                            let trunc16: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, val_reg)
-                            emit_store_typed(s, IR_TY_I16, trunc16, field_ptr)
-                        else if ty_int_bits(field.field_type) == 8
-                            let trunc8: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, val_reg)
-                            emit_store_typed(s, IR_TY_I8, trunc8, field_ptr)
-                        else
-                            match field.field_type
-                                TypeKind.Bool =>
-                                    let trunc1: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, val_reg)
-                                    emit_store_typed(s, IR_TY_I1, trunc1, field_ptr)
-                                TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
-                                    # AGAST #1652: `h.p = s` with `s: @&S` is already a `ptr`,
-                                    # and so is `h.r = @&a` into an `@&[N]T` (#2329).
-                                    let ival: i32 = ptr_value_to_i64(s, stmt.assign_value, val_reg)
-                                    let ptr_val: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, ival)
-                                    emit_store_typed(s, IR_TY_PTR, ptr_val, field_ptr)
-                                _ =>
-                                    if field.field_type == TypeKind.Struct and field.field_type_name_len > 0
-                                        # Struct field - store as struct type.  A bare "..."
-                                        # is a %Span$u8: a StrView field needs it rebuilt as
-                                        # %StrView first, as a struct literal does (#2412).
-                                        let agg: i32 = coerce_struct_ret_value(s, stmt.assign_value, val_reg, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
-                                        emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }, agg, field_ptr)
-                                    else
-                                        emit_store_typed(s, IR_TY_I64, val_reg, field_ptr)
-            # AGAST #1439: unresolved here -> shared member-store path.
-            if not lfa_done
-                emit_local_field_store_fallback(s, stmt, 0)
+            emit_local_field_assign_stmt(s, stmt)
+        StmtKind.LocalFieldIndexAssign =>
+            emit_local_field_index_assign_stmt(s, stmt)
+        StmtKind.IndexAssign =>
+            emit_index_assign_stmt(s, stmt)
+        StmtKind.MemberAssign =>
+            emit_member_assign_stmt(s, stmt)
+        StmtKind.MemberIndexAssign =>
+            emit_member_index_assign_stmt(s, stmt)
+        StmtKind.Asm =>
+            emit_asm_block(s, stmt)   # LANGUAGE_SPEC §18.6 (AGAST #3395)
+        StmtKind.Stripped =>
+            # G9b: only an imported, non-generic fn has this body, and those are
+            # declared, never defined.  Reaching here means a body the importer
+            # instantiates (generic) was stripped: refuse, don't emit `ret 0`.
+            emit_ir_error(s, stmt.span, c"body stripped from an imported module interface (G9b)")
         _ =>
-            if stmt.kind == StmtKind.LocalFieldIndexAssign and local_field_nd_shape(s, stmt) != null
-                # AGAST #2097: `s.m[i] = v` with m an N-D field assigns a whole row
-                # (`s.m[i][j] = v` is an expression assignment, see emit_assign).
-                # AGAST #4666: copied over it (emit_nd_sub_store).
-                var rf_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident_ptr: stmt.var_name, ident_len: stmt.var_name_len }
-                var rf_field: Expr = Expr { kind: ExprKind.Member, span: stmt.span, left: @rf_var, ident_ptr: stmt.assign_target, ident_len: stmt.assign_target_len }
-                var rf_place: Expr = Expr { kind: ExprKind.Index, span: stmt.span, left: @rf_field, right: stmt.while_cond }
-                emit_nd_stmt_row_store(s, stmt, @rf_place)
-            else if stmt.kind == StmtKind.LocalFieldIndexAssign
-                # local_var.field[index] = value
-                # stmt.var_name = variable name
-                # stmt.assign_target = field name
-                # stmt.while_cond = index expression (reused)
-                # stmt.assign_value = value expression
-                var lfia_done: i32 = 0
-                let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
-                if loc != null
-                    let st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
-                    if st != null
-                        let field_idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-                        # AGAST #1596: a pointer field is not an inline array — the
-                        # arm below GEP'd the field slot itself and wrote INTO the
-                        # struct. Leave lfia_done = 0 so the fallback lowers it via
-                        # emit_assign, which loads the pointer and indexes through it.
-                        var lfia_field_is_ptr: i32 = 0
-                        if field_idx >= 0
-                            let pf: *StructField = get_field_type(st, field_idx)
-                            if pf.field_type == TypeKind.Ptr or pf.field_type == TypeKind.PtrPtr
-                                lfia_field_is_ptr = 1
-                            # AGAST #2329: nor is an `@[N]T` / `@&[N]T` one, which
-                            # lower_ref_fields leaves a reference.  `h.r[1] = 7` wrote
-                            # into h.
-                            if pf.ptr_array != null
-                                lfia_field_is_ptr = 1
-                            # AGAST #2564: nor is a Vec, Span or String held by value:
-                            # emit_assign stores `t.v[i] = x` through its buffer, as
-                            # index_through takes it.  `t.v[1] = 7` through a `t: @&T`
-                            # wrote 7 into the Vec's len, SILENT, and a struct element
-                            # was a `store i64` of a `%E` (invalid IR).
-                            if pf.field_type == TypeKind.Struct and name_is_indexable(StrView { ptr: (pf.field_type_name), len: (pf.field_type_name_len) as i64 }) == 1
-                                lfia_field_is_ptr = 1
-                        if field_idx >= 0 and lfia_field_is_ptr == 0
-                            let field: *StructField = get_field_type(st, field_idx)
-                            lfia_done = 1
-                            # Get the base pointer - differs for TypeKind.Ptr/TypeKind.Ref/TypeKind.MutRef vs TypeKind.Struct
-                            var base_ptr_reg: i32 = loc.reg
-                            let lfia_levels: i32 = local_struct_levels(loc)
-                            if lfia_levels > 0
-                                # Load the pointer value, then convert to ptr
-                                let loaded: i32 = next_reg(s)
-                                emit_load_into(s, IR_TY_I64, loaded, loc.reg)
-                                base_ptr_reg = next_reg(s)
-                                emit_str(s, IR_INDENT)
-                                emit_reg(s, base_ptr_reg)
-                                emit_str(s, IR_INTTOPTR)
-                                emit_reg(s, loaded)
-                                emit_str(s, c" to ptr\n")
-                                base_ptr_reg = emit_load_levels(s, base_ptr_reg, lfia_levels - 1)   # AGAST #2372
-                            # First GEP to get the field (array within struct)
-                            let field_ptr: i32 = next_reg(s)
-                            emit_str(s, IR_INDENT)
-                            emit_reg(s, field_ptr)
-                            emit_str(s, IR_GEP_NAMED)
-                            emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-                            emit_str(s, IR_PTR_SEP)
-                            emit_reg(s, base_ptr_reg)
-                            emit_str(s, IR_I32_ZERO)
-                            emit_int(s, field_idx as i64)
-                            emit_str(s, IR_NL)
-                            # Emit index expression
-                            let idx_reg: i32 = emit_expr(s, stmt.while_cond)
-                            # Emit value expression
-                            let val_reg: i32 = emit_store_into_slot(s, stmt.assign_value, field.array_elem_type, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })   # AGAST #2454, #2390
-                            var lfia_base: Expr
-                            memset(@lfia_base as *u8, 0, sizeof(Expr))
-                            lfia_base.kind = ExprKind.Ident
-                            lfia_base.span = stmt.span
-                            lfia_base.ident_ptr = stmt.var_name
-                            lfia_base.ident_len = stmt.var_name_len
-                            var lfia_place: Expr
-                            memset(@lfia_place as *u8, 0, sizeof(Expr))
-                            lfia_place.kind = ExprKind.Member
-                            lfia_place.span = stmt.span
-                            lfia_place.left = @lfia_base
-                            lfia_place.ident_ptr = stmt.assign_target
-                            lfia_place.ident_len = stmt.assign_target_len
-                            emit_field_array_elem_store(s, field_ptr, field, idx_reg, val_reg, stmt.assign_value, @lfia_place)
-                # AGAST #1439: unresolved here -> shared member-store path.
-                if lfia_done == 0
-                    emit_local_field_store_fallback(s, stmt, 1)
-            else if stmt.kind == StmtKind.IndexAssign and emit_through_index_assign(s, stmt) == 1
-                # AGAST #2440: `p[i] = v` through a reference or pointer.
-                return
-            else if stmt.kind == StmtKind.IndexAssign and nd_array_name_shape(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }) != null
-                # AGAST #1509: `g[i] = v` with g multi-dimensional assigns a whole
-                # row (`g[i][j] = v` is an expression assignment, see emit_assign).
-                # AGAST #4666: copied over it (emit_nd_sub_store).
-                var rg_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident_ptr: stmt.assign_target, ident_len: stmt.assign_target_len }
-                var rg_place: Expr = Expr { kind: ExprKind.Index, span: stmt.span, left: @rg_var, right: stmt.while_cond }
-                emit_nd_stmt_row_store(s, stmt, @rg_place)
-            else if stmt.kind == StmtKind.IndexAssign and array_ptr_named(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }) != null
-                # AGAST #2321: refused, as ritz0 refuses a scalar here.  It stored an i64
-                # at stride 8: past the element, and past the array at the top end.
-                # ritz0 takes a whole `[N]T` at stride `[N]T`, against its own read, so
-                # that isn't lowered either (#2330).
-                emit_nd_error(s, stmt.span.line, stmt.span.col, c"`p[i] = v` through a pointer to an array is refused (`*p = a` stores the whole array)")
-            else
-                match stmt.kind
-                    StmtKind.IndexAssign =>
-                        # name[index] = value (array or pointer index assignment)
-                        # stmt.assign_target = base variable name (as *u8)
-                        # stmt.assign_target_len = name length
-                        # stmt.while_cond = index expression (reused field)
-                        # stmt.assign_value = value expression
-                        let base_reg: i32 = find_local(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-                        let base_type: TypeKind = find_local_type(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-                        let local: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-                        if base_reg >= 0
-                            if base_type == TypeKind.Array and local != null
-                                # Array local - use GEP [0, index] to get element
-                                let idx_reg: i32 = emit_expr(s, stmt.while_cond)
-                                let val_reg: i32 = emit_store_into_slot(s, stmt.assign_value, lv_array_elem_type(local), StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })   # AGAST #2454, #2390
-                                let elem_ptr: i32 = next_reg(s)
-                                emit_str(s, IR_INDENT)
-                                emit_reg(s, elem_ptr)
-                                emit_str(s, IR_GEP_ARRAY)
-                                emit_int(s, lv_array_size(local) as i64)
-                                emit_str(s, IR_X)
-                                # AGAST #1564: every non-struct element uses the alloca's own
-                                # spelling (array_elem_llvm); u32/u16/i16 used to fall to i64.
-                                let elem_ty: *u8 = elem_mem_llvm(lv_array_elem_type(local))
-                                if lv_array_elem_type(local) == TypeKind.Struct and lv_type_name_len(local) > 0
-                                    # AGAST #190: struct-array LHS — emit `[N x %T]` so the
-                                    # GEP and the store agree with the actual element layout.
-                                    # Mirrors #188's StmtKind.LocalFieldIndexAssign fix but on
-                                    # the simpler "local IS the array" path (no enclosing
-                                    # struct member).  Surfaces in nexus encode_page where
-                                    # `var fields: [2]DbField; fields[i] = db_field(...)`
-                                    # was emitting `[2 x i64]` GEP / `store i64 %DbField`.
-                                    emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
-                                else
-                                    emit_str(s, elem_ty)
-                                emit_str(s, IR_RBRACK_PTR)
-                                emit_reg(s, base_reg)
-                                emit_str(s, IR_I64_ZERO)
-                                emit_reg(s, idx_reg)
-                                emit_str(s, IR_NL)
-                                if lv_array_elem_type(local) == TypeKind.Struct and lv_type_name_len(local) > 0
-                                    # AGAST #3377 (LARB R39): the old element drops first.
-                                    var ia_place: Expr
-                                    memset(@ia_place as *u8, 0, sizeof(Expr))
-                                    ia_place.kind = ExprKind.Ident
-                                    ia_place.span = stmt.span
-                                    ia_place.ident_ptr = stmt.assign_target
-                                    ia_place.ident_len = stmt.assign_target_len
-                                    own_drop_old_elem(s, @ia_place, elem_ptr, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
-                                    # AGAST #190: struct-array element store — `store %T %val`
-                                    # matches the value loaded/returned as the element struct
-                                    # type (e.g. `%DbField` from `call %DbField @db_field(..)`).
-                                    emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, val_reg, elem_ptr)
-                                else
-                                    # Store at the element width: narrow ints truncate, pointers
-                                    # convert back to ptr, i64 stores as-is; an f64 value into
-                                    # an f32 element is fptrunc'd (#1966).
-                                    var store_val: i32 = val_reg
-                                    if array_elem_typed_scalar(lv_array_elem_type(local)) == 1
-                                        store_val = emit_field_elem_narrow(s, val_reg, lv_array_elem_type(local), stmt.assign_value)
-                                    else if lv_array_elem_type(local) == TypeKind.Ref or lv_array_elem_type(local) == TypeKind.MutRef
-                                        store_val = ptr_value_to_i64(s, stmt.assign_value, val_reg)   # AGAST #2369: `a[i] = @&x`
-                                    else if (lv_array_elem_type(local) == TypeKind.Ptr or lv_array_elem_type(local) == TypeKind.PtrPtr) and expr_is_ptr_valued(s, stmt.assign_value) == 1
-                                        store_val = val_reg   # AGAST #3036: `a[i] = @&x` into `[N]*T`: a `ptr` already
-                                    else
-                                        store_val = emit_array_elem_narrow(s, val_reg, lv_array_elem_type(local), elem_ty)
-                                    emit_str(s, IR_STORE_IND)
-                                    emit_str(s, elem_ty)
-                                    emit_str(s, IR_SP)
-                                    emit_reg(s, store_val)
-                                    emit_str(s, IR_PTR_SEP)
-                                    emit_reg(s, elem_ptr)
-                                    emit_str(s, IR_NL)
+            # AGAST #1813: this was an IR comment and exit 0,
+            # so the statement silently vanished (the #1369 class).
+            emit_ir_error_kind(s, stmt.span, c"unhandled statement kind ", (stmt.kind as i32))
+
+# `return`, outside any let initialiser's enum and slot context.
+fn emit_return_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
+    # AGAST #2207: a `return` leaves the let initialiser it sits in, so the
+    # let's enum context does not apply to it. With none set,
+    # resolve_enum_ctx falls back to the fn's return type.
+    let ret_ctx_name: *u8 = s.ctx_enum_name
+    let ret_ctx_len: i32 = s.ctx_enum_name_len
+    s.ctx_enum_name = null
+    s.ctx_enum_name_len = 0
+    # So does the slot's: a `return` lands in the fn's return type.
+    let ret_slot_set: i32 = s.ctx_slot_set
+    s.ctx_slot_set = 0
+    emit_return(s, stmt, ret_type)
+    s.ctx_enum_name = ret_ctx_name
+    s.ctx_enum_name_len = ret_ctx_len
+    s.ctx_slot_set = ret_slot_set
+
+# An `if` statement (or the value-giving `if` a fn tail is).
+fn emit_if_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
+    let discarded: i32 = if_stmt_is_discarded(s, stmt)   # AGAST #3749
+    # AGAST #4590: a value-giving `if` moves its arms' values out.
+    var arm_moves: i32 = 0
+    if discarded == 0 and stmt.if_else != null
+        arm_moves = 1
+    # AGAST #3421: the float slot the value lands in (a `-> f64` fn's
+    # tail), taken before the condition so a match there can't see it.
+    # The arms settle against it (if_stmt_arm_float_settle).
+    var fr: MatchResult
+    match_result_init(@fr, 1)
+    fr.float_ty = take_match_float_hint(s)
+    fr.hint_ty = fr.float_ty
+    let cond: i32 = emit_expr(s, stmt.if_cond)
+    # Every condition value, a bool included, is an i64 register
+    # (AGAST #1646; a bool global's load too since #3001), so coerce
+    # it to i1 via `icmp ne ..., 0` for the `br`.  Skipping that for a
+    # TypeKind.Bool condition wired an i64 into `br i1` (`if f()`, #1367).
+    let cond_i1: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, cond_i1)
+    emit_str(s, c" = icmp ne i64 ")
+    emit_reg(s, cond)
+    emit_str(s, IR_COMMA_0)
+
+    let then_label: i32 = next_label(s)
+    let else_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+
+    own_cond_end(s)   # AGAST #2165: the condition's temporaries
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cond_i1)
+    emit_str(s, IR_LABEL_SEP)
+    emit_label(s, then_label)
+    emit_str(s, IR_LABEL_SEP)
+    if stmt.if_else != null
+        emit_label(s, else_label)
+    else
+        emit_label(s, end_label)
+    emit_str(s, IR_NL)
+
+    # Save current last_expr_reg before entering branches.  The defining
+    # label rides along so the restore path below puts back a coherent
+    # (value, block) pair rather than re-dating the value to the merge
+    # block. (ritz-task-1309)
+    let saved_last: i32 = s.last_expr_reg
+    let saved_last_label: i32 = s.last_expr_label
+    let saved_last_model: i32 = s.last_expr_model
+
+    begin_block(s, then_label)
+    clear_last_expr(s)  # Reset before then branch
+    # AGAST #2158: each arm is a block for drops.
+    own_push_scope(s)
+    emit_if_stmt_arm(s, stmt.if_then, ret_type, discarded, fr.hint_ty, arm_moves)
+    # AGAST #2559: the arm value's struct type, while its bindings resolve.
+    var then_agg: *u8 = null
+    var then_agg_len: i32 = 0
+    if_stmt_arm_agg(s, stmt.if_then, @then_agg, @then_agg_len)
+    own_pop_scope(s)
+    # ritz-task-1309 — `last_expr_here` (not `s.last_expr_reg`) so a value
+    # produced in a block nested inside the then-arm, which the insertion
+    # point has since left, is reported as "no value" instead of being
+    # falsely attributed to `then_exit_label` below.
+    var then_result: i32 = last_expr_here(s)  # Capture then branch result
+    # AGAST #2563: a Span$u8 / StrView arm takes the phi's type here.
+    var then_phi: *u8 = null
+    var then_phi_len: i32 = 0
+    if_stmt_phi_type(s, StrView { ptr: (then_agg), len: (then_agg_len) as i64 }, ret_type, @then_phi, @then_phi_len)
+    if stmt.if_else != null
+        then_result = if_stmt_arm_settle(s, then_result, StrView { ptr: (then_agg), len: (then_agg_len) as i64 }, StrView { ptr: (then_phi), len: (then_phi_len) as i64 })
+        then_result = if_stmt_arm_ptr_settle(s, stmt.if_then, then_result, then_agg)
+        if discarded == 0
+            then_result = if_stmt_arm_float_settle(s, stmt.if_then, then_result, then_phi, @fr)
+    let then_exit_label: i32 = s.current_label  # Capture actual exit block
+    emit_str(s, IR_BR)
+    emit_label(s, end_label)
+    emit_str(s, IR_NL)
+
+    var else_result: i32 = 0
+    var else_exit_label: i32 = else_label
+    var else_agg: *u8 = null
+    var else_agg_len: i32 = 0
+    if stmt.if_else != null
+        begin_block(s, else_label)
+        clear_last_expr(s)  # Reset before else branch
+        own_push_scope(s)
+        emit_if_stmt_arm(s, stmt.if_else, ret_type, discarded, fr.hint_ty, arm_moves)
+        if_stmt_arm_agg(s, stmt.if_else, @else_agg, @else_agg_len)
+        own_pop_scope(s)
+        else_result = last_expr_here(s)  # Capture else branch result
+        # AGAST #2563: the phi's type is the then-arm's when it has one.
+        var else_phi: *u8 = null
+        var else_phi_len: i32 = 0
+        if_stmt_phi_type(s, StrView { ptr: (else_agg), len: (else_agg_len) as i64 }, ret_type, @else_phi, @else_phi_len)
+        if then_phi != null and then_phi_len > 0
+            else_phi = then_phi
+            else_phi_len = then_phi_len
+        else_result = if_stmt_arm_settle(s, else_result, StrView { ptr: (else_agg), len: (else_agg_len) as i64 }, StrView { ptr: (else_phi), len: (else_phi_len) as i64 })
+        else_result = if_stmt_arm_ptr_settle(s, stmt.if_else, else_result, else_agg)
+        if discarded == 0
+            else_result = if_stmt_arm_float_settle(s, stmt.if_else, else_result, else_phi, @fr)
+        else_agg = else_phi
+        else_agg_len = else_phi_len
+        else_exit_label = s.current_label  # Capture actual exit block
+        emit_str(s, IR_BR)
+        emit_label(s, end_label)
+        emit_str(s, IR_NL)
+
+    begin_block(s, end_label)
+
+    # If both branches produce values, emit a phi node.  When the
+    # enclosing fn returns a tagged-enum struct, both branches hand us
+    # `%Result$.../Option$...` struct values — the phi must match that
+    # type or LLVM rejects the IR. (ritz-task-133)  Otherwise a struct
+    # value in either arm types it (AGAST #2559): `if c / a / else / b`
+    # over `%B` locals, params, literals and calls.
+    var phi_agg: *u8 = null
+    var phi_agg_len: i32 = 0
+    # AGAST #3323: one arm may diverge; the other is the if's value.
+    if stmt.if_else != null
+        then_result = if_stmt_arm_incoming(then_result, stmt.if_then)
+        else_result = if_stmt_arm_incoming(else_result, stmt.if_else)
+        if then_result == IF_ARM_DIVERGES and else_result == IF_ARM_DIVERGES
+            then_result = 0   # both leave: no value reaches the merge
+            else_result = 0
+        if discarded == 1   # AGAST #3749: nobody reads the value
+            then_result = 0
+            else_result = 0
+    if stmt.if_else != null and then_result != 0 and else_result != 0
+        if ret_type == TypeKind.Struct and s.ret_type_name_len > 0 and is_tagged_enum_type(StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }) == 1
+            phi_agg = s.ret_type_name
+            phi_agg_len = s.ret_type_name_len
+        else if then_phi != null and then_phi_len > 0
+            phi_agg = then_phi
+            phi_agg_len = then_phi_len
+        else if else_agg != null and else_agg_len > 0
+            phi_agg = else_agg
+            phi_agg_len = else_agg_len
+    # AGAST #2559: publish it for an enclosing `if` ending in this one.
+    s.last_if_stmt_agg_name = phi_agg
+    s.last_if_stmt_agg_name_len = phi_agg_len
+    if stmt.if_else != null and then_result != 0 and else_result != 0
+        let phi_reg: i32 = next_reg(s)
+        emit_str(s, IR_INDENT)
+        emit_reg(s, phi_reg)
+        emit_str(s, c" = phi ")
+        # AGAST #3421: a scalar phi is the arms' float when they have one.
+        var phi_float: TypeKind = TypeKind.Void
+        if phi_agg == null
+            phi_float = fr.float_ty
+        if phi_agg != null
+            emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (phi_agg), len: (phi_agg_len) as i64 })
+        else if phi_float != TypeKind.Void
+            emit_str(s, float_llvm_name(phi_float))
+        else
+            emit_str(s, c"i64")
+        emit_str(s, c" [ ")
+        emit_if_phi_incoming(s, then_result, phi_agg, phi_float)
+        emit_str(s, c", %")
+        emit_label(s, then_exit_label)
+        emit_str(s, c" ], [ ")
+        emit_if_phi_incoming(s, else_result, phi_agg, phi_float)
+        emit_str(s, c", %")
+        emit_label(s, else_exit_label)
+        emit_str(s, c" ]\n")
+        set_last_expr(s, phi_reg)
+        # Published for an enclosing `if` / `match` this one ends.
+        s.last_match_float_ty = phi_float
+        if phi_agg == null and phi_float == TypeKind.Void
+            set_last_expr_phi(s, phi_reg, 0)   # AGAST #2950: an i64
+    else
+        # ritz-task-1309 — no phi, so this `if` contributes no value that
+        # is live in the merge block.
+        #
+        # There used to be a `then_result > 0` case here that propagated
+        # the then-arm's value out of the merge block.  That was one of
+        # the two confirmed leak paths: `then_result` is defined in the
+        # then-arm's exit block, which is NOT the merge block and does not
+        # dominate it (the else edge bypasses it).  An enclosing `if` then
+        # picked it up as a phi incoming and named the merge block as its
+        # predecessor — the exact `phi i64 [ %x, %L20 ]` shape this task
+        # exists to kill.  An if-without-else genuinely has no value on
+        # all paths, so there is nothing correct to propagate.
+        #
+        # Restore the pre-`if` value with its original defining label, so
+        # the pair stays coherent: still usable by an implicit return that
+        # it dominates, still correctly rejected as a phi incoming here.
+        s.last_expr_reg = saved_last  # Restore if no result
+        s.last_expr_label = saved_last_label
+        s.last_expr_model = saved_last_model
+
+
+# A `while` loop.
+fn emit_while_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
+    let cond_label: i32 = next_label(s)
+    let body_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+
+    let old_break: i32 = s.break_label
+    let old_continue: i32 = s.continue_label
+    s.break_label = end_label
+    s.continue_label = cond_label
+
+    emit_str(s, IR_BR)
+    emit_label(s, cond_label)
+    emit_str(s, IR_NL)
+
+    begin_block(s, cond_label)
+    let cond: i32 = emit_expr(s, stmt.while_cond)
+    # Narrowed to i1 for the `br`, as StmtKind.If does (AGAST #1367).
+    let cond_i1: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, cond_i1)
+    emit_str(s, c" = icmp ne i64 ")
+    emit_reg(s, cond)
+    emit_str(s, IR_COMMA_0)
+    own_cond_end(s)   # AGAST #2165: dropped on every evaluation
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cond_i1)
+    emit_str(s, IR_LABEL_SEP)
+    emit_label(s, body_label)
+    emit_str(s, IR_LABEL_SEP)
+    emit_label(s, end_label)
+    emit_str(s, IR_NL)
+
+    begin_block(s, body_label)
+    let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
+    own_push_scope(s)
+    emit_void_body(s, stmt.while_body, ret_type)
+    own_pop_scope(s)
+    own_loop_exit(s, own_loop)
+    emit_str(s, IR_BR)
+    emit_label(s, cond_label)
+    emit_str(s, IR_NL)
+
+    begin_block(s, end_label)
+    # AGAST #1329 — a loop contributes no value; clear the tracked
+    # expression so it cannot leak into the exit block (see StmtKind.While
+    # note; symmetric across while/loop/for).
+    clear_last_expr(s)
+
+    s.break_label = old_break
+    s.continue_label = old_continue
+
+
+# A `loop`.
+fn emit_loop_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
+    # Infinite loop: loop { body }
+    # Generates:
+    #   br label %loop.body
+    # loop.body:
+    #   ... body ...
+    #   br label %loop.body
+    # loop.end:
+    let body_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+
+    let old_break: i32 = s.break_label
+    let old_continue: i32 = s.continue_label
+    s.break_label = end_label
+    s.continue_label = body_label
+
+    emit_str(s, IR_BR)
+    emit_label(s, body_label)
+    emit_str(s, IR_NL)
+
+    begin_block(s, body_label)
+    let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
+    own_push_scope(s)
+    emit_void_body(s, stmt.while_body, ret_type)
+    own_pop_scope(s)
+    own_loop_exit(s, own_loop)
+    emit_str(s, IR_BR)
+    emit_label(s, body_label)
+    emit_str(s, IR_NL)
+
+    begin_block(s, end_label)
+    # AGAST #1329 — a loop contributes no value; clear the tracked
+    # expression so it cannot leak into the exit block (see StmtKind.While
+    # note; symmetric across while/loop/for).
+    clear_last_expr(s)
+
+    s.break_label = old_break
+    s.continue_label = old_continue
+
+
+# A `for` loop, over a range or an iterable.
+fn emit_for_stmt(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
+    # For-loop. Two shapes:
+    #   for i in start..end   — range; for_end != null
+    #   for x in iterable     — array/Vec-ref; for_end == null
+    if stmt.for_end == null
+        emit_for_iterable(s, stmt, ret_type)
+        return
+
+    # For-loop (range): for i in start..end { body }
+    # Desugar to:
+    #   %i = alloca i64
+    #   store i64 %start, ptr %i
+    #   br label %for.cond
+    # for.cond:
+    #   %i.val = load i64, ptr %i
+    #   %cmp = icmp slt i64 %i.val, %end
+    #   br i1 %cmp, label %for.body, label %for.end
+    # for.body:
+    #   ... body ...
+    #   %i.next = add i64 %i.val, 1
+    #   store i64 %i.next, ptr %i
+    #   br label %for.cond
+    # for.end:
+
+    let cond_label: i32 = next_label(s)
+    let body_label: i32 = next_label(s)
+    let incr_label: i32 = next_label(s)
+    let end_label: i32 = next_label(s)
+
+    let old_break: i32 = s.break_label
+    let old_continue: i32 = s.continue_label
+    s.break_label = end_label
+    s.continue_label = incr_label
+
+    # AGAST #1636 / #3328: the range compares unsigned when a bound is a
+    # u64, and the loop variable is then a u64 in the body, so `j / 2`
+    # with `j = 1 << 63` is a udiv.  Decided once, from the bounds as they
+    # read before `j` is bound, so the compare and the type can't disagree.
+    var range_uns: i32 = for_range_unsigned(s, stmt)
+    var var_type: TypeKind = TypeKind.I64
+    if range_uns == 1
+        var_type = TypeKind.U64
+    # AGAST #4080: a narrower range binds its own type (for_range_type),
+    # in a slot of that width: `for i in 1..n` with `n: i32` is an i32, as
+    # on ritz0.  The start is truncated into it, and the compare and the
+    # increment are at that width, as ritz0's are.
+    let narrow_ty: TypeKind = for_range_var_type(s, stmt)
+    if ty_int_bits(narrow_ty) > 0 and ty_int_bits(narrow_ty) < 64
+        var_type = narrow_ty
+        range_uns = ty_is_unsigned(narrow_ty)
+    let var_llvm: *u8 = ty_mem_llvm(var_type)
+
+    # Allocate loop variable
+    let var_reg: i32 = next_reg(s)
+    entry_alloca_reg_begin(s, var_reg)
+    emit_str(s, var_llvm)
+    emit_str(s, IR_NL)
+    entry_alloca_reg_end(s)
+
+    # Register the loop variable
+    add_local(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, var_type)
+
+    # Emit start expression and store it
+    let start_reg: i32 = for_bound_at(s, emit_expr(s, stmt.for_start), var_type)
+    emit_str(s, IR_STORE_IND)
+    emit_str(s, var_llvm)
+    emit_str(s, IR_SP)
+    emit_reg(s, start_reg)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, var_reg)
+    emit_str(s, IR_NL)
+
+    # Branch to condition check
+    emit_str(s, IR_BR)
+    emit_label(s, cond_label)
+    emit_str(s, IR_NL)
+
+    # Condition block
+    begin_block(s, cond_label)
+    let load_reg: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, load_reg)
+    emit_str(s, IR_LOAD)
+    emit_str(s, var_llvm)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, var_reg)
+    emit_str(s, IR_NL)
+
+    let end_reg: i32 = for_bound_at(s, emit_expr(s, stmt.for_end), var_type)
+    let cmp_reg: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, cmp_reg)
+    # `start..=end` (AGAST #1530) keeps iterating while i <= end; signed
+    # or not by range_uns.
+    if stmt.for_inclusive != 0
+        if range_uns == 1
+            emit_str(s, c" = icmp ule ")
+        else
+            emit_str(s, c" = icmp sle ")
+    else
+        if range_uns == 1
+            emit_str(s, c" = icmp ult ")
+        else
+            emit_str(s, c" = icmp slt ")
+    emit_str(s, var_llvm)
+    emit_str(s, IR_SP)
+    emit_reg(s, load_reg)
+    emit_str(s, IR_COMMA)
+    emit_reg(s, end_reg)
+    emit_str(s, IR_NL)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, cmp_reg)
+    emit_str(s, IR_LABEL_SEP)
+    emit_label(s, body_label)
+    emit_str(s, IR_LABEL_SEP)
+    emit_label(s, end_label)
+    emit_str(s, IR_NL)
+
+    # Body block
+    begin_block(s, body_label)
+    let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
+    own_push_scope(s)
+    emit_void_body(s, stmt.for_body, ret_type)
+    own_pop_scope(s)
+    own_loop_exit(s, own_loop)
+    emit_str(s, IR_BR)
+    emit_label(s, incr_label)
+    emit_str(s, IR_NL)
+
+    # Increment block
+    begin_block(s, incr_label)
+    let load2_reg: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, load2_reg)
+    emit_str(s, IR_LOAD)
+    emit_str(s, var_llvm)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, var_reg)
+    emit_str(s, IR_NL)
+    let incr_reg: i32 = next_reg(s)
+    emit_str(s, IR_INDENT)
+    emit_reg(s, incr_reg)
+    emit_str(s, c" = add ")
+    emit_str(s, var_llvm)
+    emit_str(s, IR_SP)
+    emit_reg(s, load2_reg)
+    emit_str(s, IR_COMMA_1)
+    emit_str(s, IR_STORE_IND)
+    emit_str(s, var_llvm)
+    emit_str(s, IR_SP)
+    emit_reg(s, incr_reg)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, var_reg)
+    emit_str(s, IR_NL)
+    emit_str(s, IR_BR)
+    emit_label(s, cond_label)
+    emit_str(s, IR_NL)
+
+    # End block
+    begin_block(s, end_label)
+    # AGAST #1329 — a loop contributes no value; clear the tracked
+    # expression so it cannot leak into the exit block (see StmtKind.While
+    # note; symmetric across while/loop/for).
+    clear_last_expr(s)
+
+    s.break_label = old_break
+    s.continue_label = old_continue
+
+
+# `break`, running the defers of the scopes it leaves.
+fn emit_break_stmt(s: *EmitterState, stmt: *Stmt)
+    if s.break_label >= 0
+        own_loop_jump(s, 0)   # AGAST #2158: drop the loop body's bindings
+        emit_str(s, IR_BR)
+        emit_label(s, s.break_label)
+        emit_str(s, IR_NL)
+        let dead_label: i32 = next_label(s)
+        # `begin_block` makes the dead block the active insertion
+        # point, so the enclosing IF/loop captures the right
+        # `current_label` when building PHI predecessor labels.
+        # Without this, then/else_exit labels point at the pre-break
+        # block which isn't actually a CFG predecessor of the merge —
+        # LLVM's "Remove unreachable blocks" pass then crashes when it
+        # tries to remove the real (dead) predecessor from the PHI.
+        # (ritz-task-195)
+        begin_block(s, dead_label)
+        clear_last_expr(s)
+
+
+# `continue`, running the defers of the scopes it leaves.
+fn emit_continue_stmt(s: *EmitterState, stmt: *Stmt)
+    if s.continue_label >= 0
+        own_loop_jump(s, 1)   # AGAST #2158
+        emit_str(s, IR_BR)
+        emit_label(s, s.continue_label)
+        emit_str(s, IR_NL)
+        let dead_label: i32 = next_label(s)
+        # Same rationale as StmtKind.Break above. (ritz-task-195)
+        begin_block(s, dead_label)
+        clear_last_expr(s)
+
+
+# An expression statement.
+fn emit_expr_stmt(s: *EmitterState, stmt: *Stmt)
+    # Note: Implicit return only at function body level, not in nested blocks
+    # The implicit_return flag would be passed from emit_fn for top-level statements
+    # For now, we just emit the expression without implicit return in nested contexts
+    if stmt.expr == null
+        eprints("ERROR: STMT_EXPR with null expr field!\n")
+    else
+        # AGAST #2046: a match / if expression statement's value is
+        # discarded, so a void-call arm is legal there.
+        if stmt.expr.kind == ExprKind.Match or stmt.expr.kind == ExprKind.If
+            s.match_no_value = 1
+        # (must_use_check and discarded_array_check run on Sema,
+        # sema_walk.ritz, AGAST #3462 / #3512.)
+        var expr_reg: i32 = 0
+        let lent: *LocalVar = lent_referent_local(s, stmt.expr)
+        if stmt == s.if_arm_value and lent != null
+            # AGAST #2288: an if arm's value (emit_if_stmt_arm).
+            expr_reg = emit_lent_referent(s, stmt.expr, StrView { ptr: (lv_type_name(lent)), len: (lv_type_name_len(lent)) as i64 })
+        else if builtin_tagged_ctor(s, stmt.expr) == 1
+            expr_reg = emit_ctor_stmt(s, stmt.expr)   # AGAST #2454
+        else
+            expr_reg = emit_expr(s, stmt.expr)
+        set_last_expr(s, expr_reg)  # Track for if/else phi nodes
+
+# A `match` statement.
+fn emit_match_stmt(s: *EmitterState, stmt: *Stmt)
+    # Statement-form match: `match scrut \n pattern => body ...`
+    # The statement's result is tracked in last_expr_reg so an implicit
+    # return picks up the phi value. See emitter_match.ritz.
+    let arms: *MatchArm = stmt.if_then as *MatchArm
+    s.match_no_value = 1   # AGAST #2046: void-call arms are legal here
+    # AGAST #3028: a block's last statement may be its value; any other
+    # match statement's value is read by nothing.
+    if stmt.next != null
+        match_discard_next()
+    let match_reg: i32 = emit_match(s, stmt.if_cond, arms, stmt.span)
+    set_last_expr(s, match_reg)
+    # AGAST #2950: its phi is a `ptr` or an i64 (emit_match_phi_type).
+    if match_reg > 0 and s.last_match_agg_name == null and s.last_match_float_ty == TypeKind.Void
+        set_last_expr_phi(s, match_reg, arms_ptr_valued(s, arms))
+
+# `x.f = v` on a local.
+fn emit_local_field_assign_stmt(s: *EmitterState, stmt: *Stmt)
+    # local_var.field = value
+    # stmt.var_name = variable name
+    # stmt.assign_target = field name
+    # stmt.assign_value = value expression
+    var lfa_done: bool = false
+    let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
+    if loc != null
+        let st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+        if st != null
+            let field_idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+            if field_idx >= 0
+                let field: *StructField = get_field_type(st, field_idx)
+                lfa_done = true
+                # Get the base pointer - differs for TypeKind.Ptr/TypeKind.Ref/TypeKind.MutRef vs TypeKind.Struct
+                var base_ptr_reg: i32 = loc.reg
+                let lfa_levels: i32 = local_struct_levels(loc)
+                if lfa_levels > 0
+                    # Load the pointer value, then convert to ptr
+                    let loaded: i32 = next_reg(s)
+                    emit_load_into(s, IR_TY_I64, loaded, loc.reg)
+                    base_ptr_reg = next_reg(s)
+                    emit_str(s, IR_INDENT)
+                    emit_reg(s, base_ptr_reg)
+                    emit_str(s, IR_INTTOPTR)
+                    emit_reg(s, loaded)
+                    emit_str(s, c" to ptr\n")
+                    base_ptr_reg = emit_load_levels(s, base_ptr_reg, lfa_levels - 1)   # AGAST #2372
+                # Get pointer to the field using GEP
+                let field_ptr: i32 = next_reg(s)
+                emit_str(s, IR_INDENT)
+                emit_reg(s, field_ptr)
+                emit_str(s, IR_GEP_NAMED)
+                emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+                emit_str(s, IR_PTR_SEP)
+                emit_reg(s, base_ptr_reg)
+                emit_str(s, IR_I32_ZERO)
+                emit_int(s, field_idx as i64)
+                emit_str(s, IR_NL)
+                # AGAST #1934: `x.f = [..]` / `p.f = [v; N]` on an inline
+                # array field.  The generic store below would write the
+                # ADDRESS of emit_expr's shadow alloca into the field.
+                if field.field_type == TypeKind.Array
+                    emit_array_field_whole_assign(s, field_ptr, field, stmt.assign_value)
+                    return
+                # Emit the value.  AGAST #2142: `f.cmap = None` builds
+                # the field's enum.
+                let val_reg: i32 = emit_expr_into_field(s, stmt.assign_value, field)
+                # LARB R58 (§13.6): through a reference (`r.t = v` on a
+                # local `@&T`, `h.t = v` on a `:& T` param) the field's
+                # old value drops after v, before the store.
+                if own_local_reach(loc) == OWN_REACH_REF
+                    own_drop_old_ref_field(s, field_ptr, field)
+                # Store the value based on field type.
+                #
+                # AGAST #1303: narrow fields (u8/i8/u16/i16) used to fall
+                # through to the `store i64` default below.  Values are i64
+                # in the unified value model, so an 8-byte store into a
+                # 1- or 2-byte field silently clobbered every adjacent
+                # field.  `30_find`'s `opts.type_filter = 'f'` (u8) wiped
+                # the following `maxdepth: i32` from -1 to 0, so find
+                # printed the root and never descended — well-typed,
+                # compiled clean, exit 0, wrong behaviour.  Truncate to the
+                # field width before storing, as the other member-assign
+                # paths already do.
+                #
+                # AGAST #2048: f32 / f64 fields store float / double.
+                if emit_float_field_store(s, field_ptr, field.field_type, val_reg, stmt.assign_value) == 1
+                    lfa_done = true
+                else if ty_int_bits(field.field_type) == 32
+                    let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, val_reg)
+                    emit_store_typed(s, IR_TY_I32, trunc, field_ptr)
+                else if ty_int_bits(field.field_type) == 16
+                    let trunc16: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, val_reg)
+                    emit_store_typed(s, IR_TY_I16, trunc16, field_ptr)
+                else if ty_int_bits(field.field_type) == 8
+                    let trunc8: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, val_reg)
+                    emit_store_typed(s, IR_TY_I8, trunc8, field_ptr)
+                else
+                    match field.field_type
+                        TypeKind.Bool =>
+                            let trunc1: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, val_reg)
+                            emit_store_typed(s, IR_TY_I1, trunc1, field_ptr)
+                        TypeKind.Ptr | TypeKind.PtrPtr | TypeKind.Ref | TypeKind.MutRef =>
+                            # AGAST #1652: `h.p = s` with `s: @&S` is already a `ptr`,
+                            # and so is `h.r = @&a` into an `@&[N]T` (#2329).
+                            let ival: i32 = ptr_value_to_i64(s, stmt.assign_value, val_reg)
+                            let ptr_val: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, ival)
+                            emit_store_typed(s, IR_TY_PTR, ptr_val, field_ptr)
+                        _ =>
+                            if field.field_type == TypeKind.Struct and field.field_type_name_len > 0
+                                # Struct field - store as struct type.  A bare "..."
+                                # is a %Span$u8: a StrView field needs it rebuilt as
+                                # %StrView first, as a struct literal does (#2412).
+                                let agg: i32 = coerce_struct_ret_value(s, stmt.assign_value, val_reg, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
+                                emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 }, agg, field_ptr)
                             else
-                                # Pointer local — load the i64 slot, convert to ptr, then
-                                # GEP + store at the POINTEE's width (AGAST #1332; this was
-                                # hardcoded `getelementptr i64` + `store i64` for every
-                                # non-** pointer, byte-smearing *i32/*u8 stores).
-                                let loaded_i64: i32 = next_reg(s)
-                                emit_load_into(s, IR_TY_I64, loaded_i64, base_reg)
-                                let base_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, loaded_i64)
-                                var pointee: TypeKind = TypeKind.Unknown
-                                var pst_name: *u8 = null
-                                var pst_len: i32 = 0
-                                if local != null
-                                    pointee = lv_pointee_type(local)
-                                    pst_name = lv_type_name(local)
-                                    pst_len = lv_type_name_len(local)
-                                emit_index_assign_ptr_store(s, stmt, base_ptr, base_type, pointee, StrView { ptr: (pst_name), len: (pst_len) as i64 })
-                        else
-                            # AGAST #1332: GLOBAL pointer base.  Previously `base_reg >= 0`
-                            # had no else, so `g[i] = v` through a global *T / **T emitted
-                            # NO store at all — a silent drop that read back as malloc
-                            # garbage (7/8–8/8 mismatches in 92_subscript_store).
-                            let glob: *GlobalVarDef = find_global(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
-                            if glob != null and glob.var_type == TypeKind.Array and glob.array_elem_type == TypeKind.Struct and glob.array_elem_type_name_len > 0
-                                # AGAST #1553/#1555: a whole struct element (`g[i] = q`,
-                                # `g_slot[2] = *v`, `g[i] = g[j]`). The value is a %T struct
-                                # value, so GEP the `[N x %T]` global and `store %T` — the
-                                # global form of the local-array struct arm (#190) above.
-                                # Previously this fell to the pointer arm below: `load i64
-                                # @g` as a base address and `store i64 %T-value` (bad IR).
-                                let sidx: i32 = emit_expr(s, stmt.while_cond)
-                                let sval: i32 = emit_store_into_slot(s, stmt.assign_value, TypeKind.Struct, StrView { ptr: (glob.array_elem_type_name), len: (glob.array_elem_type_name_len) as i64 })   # AGAST #2454, #2390
-                                let sptr: i32 = next_reg(s)
-                                emit_str(s, IR_INDENT)
-                                emit_reg(s, sptr)
-                                emit_str(s, IR_GEP_ARRAY)
-                                emit_int(s, glob.array_size as i64)
-                                emit_str(s, IR_X)
-                                emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (glob.array_elem_type_name), len: (glob.array_elem_type_name_len) as i64 })
-                                emit_str(s, c"], ptr @")
-                                emit_name(s, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
-                                emit_str(s, IR_I64_ZERO)
-                                emit_reg(s, sidx)
-                                emit_str(s, IR_NL)
-                                emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (glob.array_elem_type_name), len: (glob.array_elem_type_name_len) as i64 }, sval, sptr)
-                            else if glob != null and glob.var_type == TypeKind.Array and glob.array_elem_type != TypeKind.Struct
-                                # AGAST #1504: a global `[N]T` array is the storage itself,
-                                # not a pointer slot. The pointer arm below loaded g[0] as a
-                                # base address and stored through it (segfault). GEP @g
-                                # directly, at the width the global is declared with.
-                                let gidx: i32 = emit_expr(s, stmt.while_cond)
-                                set_match_float_hint(s, stmt.assign_value, glob.array_elem_type, StrView { ptr: (null), len: (0) as i64 })   # AGAST #4028
-                                let gval: i32 = emit_expr(s, stmt.assign_value)
-                                let gty: *u8 = elem_mem_llvm(glob.array_elem_type)
-                                let gptr: i32 = next_reg(s)
-                                emit_str(s, IR_INDENT)
-                                emit_reg(s, gptr)
-                                emit_str(s, IR_GEP_ARRAY)
-                                emit_int(s, glob.array_size as i64)
-                                emit_str(s, IR_X)
-                                emit_str(s, gty)
-                                emit_str(s, c"], ptr @")
-                                emit_name(s, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
-                                emit_str(s, IR_I64_ZERO)
-                                emit_reg(s, gidx)
-                                emit_str(s, IR_NL)
-                                # Values are carried as i64: narrow ints truncate, pointers
-                                # convert back to ptr, i64 stores as-is.
-                                let get: TypeKind = glob.array_elem_type
-                                var gstore: i32 = gval
-                                if (get == TypeKind.Ptr or get == TypeKind.PtrPtr) and expr_is_ptr_valued(s, stmt.assign_value) == 1
-                                    gstore = gval   # AGAST #3036: `g[i] = @&x` into `[N]*T`: a `ptr` already
-                                else if get == TypeKind.Ptr or get == TypeKind.PtrPtr
-                                    gstore = next_reg(s)
-                                    emit_str(s, IR_INDENT)
-                                    emit_reg(s, gstore)
-                                    emit_str(s, IR_INTTOPTR)
-                                    emit_reg(s, gval)
-                                    emit_str(s, c" to ptr\n")
-                                else if ty_int_in(get, 8, 32) == 1
-                                    gstore = next_reg(s)
-                                    emit_str(s, IR_INDENT)
-                                    emit_reg(s, gstore)
-                                    emit_str(s, IR_TRUNC)
-                                    emit_reg(s, gval)
-                                    emit_str(s, IR_TO_SP)
-                                    emit_str(s, gty)
-                                    emit_str(s, IR_NL)
-                                else if array_elem_typed_scalar(get) == 1
-                                    # AGAST #1970: a float / double slot; an f64 value into
-                                    # an f32 element is fptrunc'd, as for a local array.  A
-                                    # bool element is an `i1` (#2063).
-                                    gstore = emit_field_elem_narrow(s, gval, get, stmt.assign_value)
-                                emit_str(s, IR_STORE_IND)
-                                emit_str(s, gty)
-                                emit_str(s, IR_SP)
-                                emit_reg(s, gstore)
-                                emit_str(s, IR_PTR_SEP)
-                                emit_reg(s, gptr)
-                                emit_str(s, IR_NL)
-                            else if glob != null
-                                # Globals of pointer type are stored as i64 (emit_llvm_type):
-                                # load the slot, convert to ptr, then share the pointee-width
-                                # store path with the local arm.
-                                let gloaded: i32 = next_reg(s)
-                                emit_load_global(s, IR_TY_I64, gloaded, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
-                                let gbase_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, gloaded)
-                                emit_index_assign_ptr_store(s, stmt, gbase_ptr, glob.var_type, glob.pointee_type, StrView { ptr: (glob.pointee_type_name), len: (glob.pointee_type_name_len) as i64 })
-                    StmtKind.MemberAssign =>
-                        # `(*X).field = value` (and the desugared `(*X).field op= value`):
-                        # stmt.if_cond = X, stmt.assign_target = field name,
-                        # stmt.assign_value = value expression.
-                        #
-                        # AGAST #1510: lower as an expression assignment to the member
-                        # `(*X).field`, so emit_assign resolves it through emit_member_ptr
-                        # like every other field store.  The old inline lowering only knew a
-                        # bare-identifier X; for `(**pp).n = v` or `(*(*b).ops).n = v` it
-                        # evaluated X and then emitted NO store and no error -- the write was
-                        # silently dropped.  An unresolvable X now fails loudly in
-                        # emit_assign ("unhandled EXPR_MEMBER in assignment").
-                        var mdr: Expr
-                        mdr.kind = ExprKind.Unary
-                        mdr.span = stmt.span
-                        mdr.op = OpKind.Deref
-                        mdr.operand = stmt.if_cond
-                        mdr.next = null
-                        var mmem: Expr
-                        mmem.kind = ExprKind.Member
-                        mmem.span = stmt.span
-                        mmem.left = @mdr
-                        mmem.ident_ptr = stmt.assign_target
-                        mmem.ident_len = stmt.assign_target_len
-                        mmem.next = null
-                        var mst: Stmt
-                        mst.kind = StmtKind.Assign
-                        mst.span = stmt.span
-                        mst.if_cond = @mmem
-                        mst.assign_target = null
-                        mst.assign_target_len = 0
-                        mst.assign_value = stmt.assign_value
-                        mst.next = null
-                        emit_assign(s, @mst)
-                    StmtKind.MemberIndexAssign =>
-                        # `(*X).field[i] = value` (and the desugared `op=` form):
-                        # stmt.if_cond = X, stmt.assign_target = field name,
-                        # stmt.while_cond = index, stmt.assign_value = value.
-                        #
-                        # AGAST #1927: this kind had no arm, so it failed with "unhandled
-                        # statement kind 8" even outside a generic fn.  Lower it like
-                        # StmtKind.MemberAssign above, as an expression assignment to
-                        # `(*X).field[i]`; emit_assign resolves the element through
-                        # emit_member_ptr (inline array fields at their declared width,
-                        # pointer fields through the loaded pointer).
-                        var xdr: Expr
-                        xdr.kind = ExprKind.Unary
-                        xdr.span = stmt.span
-                        xdr.op = OpKind.Deref
-                        xdr.operand = stmt.if_cond
-                        xdr.next = null
-                        var xmem: Expr
-                        xmem.kind = ExprKind.Member
-                        xmem.span = stmt.span
-                        xmem.left = @xdr
-                        xmem.ident_ptr = stmt.assign_target
-                        xmem.ident_len = stmt.assign_target_len
-                        xmem.next = null
-                        var xidx: Expr
-                        xidx.kind = ExprKind.Index
-                        xidx.bracket.line = 0
-                        xidx.span = stmt.span
-                        xidx.left = @xmem
-                        xidx.right = stmt.while_cond
-                        xidx.next = null
-                        var xst: Stmt
-                        xst.kind = StmtKind.Assign
-                        xst.span = stmt.span
-                        xst.if_cond = @xidx
-                        xst.assign_target = null
-                        xst.assign_target_len = 0
-                        xst.assign_value = stmt.assign_value
-                        xst.next = null
-                        emit_assign(s, @xst)
-                    StmtKind.Asm =>
-                        emit_asm_block(s, stmt)   # LANGUAGE_SPEC §18.6 (AGAST #3395)
-                    StmtKind.Stripped =>
-                        # G9b: only an imported, non-generic fn has this body, and those are
-                        # declared, never defined.  Reaching here means a body the importer
-                        # instantiates (generic) was stripped: refuse, don't emit `ret 0`.
-                        emit_ir_error(s, stmt.span, c"body stripped from an imported module interface (G9b)")
-                    _ =>
-                        # AGAST #1813: this was an IR comment and exit 0,
-                        # so the statement silently vanished (the #1369 class).
-                        emit_ir_error_kind(s, stmt.span, c"unhandled statement kind ", (stmt.kind as i32))
+                                emit_store_typed(s, IR_TY_I64, val_reg, field_ptr)
+    # AGAST #1439: unresolved here -> shared member-store path.
+    if not lfa_done
+        emit_local_field_store_fallback(s, stmt, 0)
+
+# `x.f[i] = v` on a local.
+fn emit_local_field_index_assign_stmt(s: *EmitterState, stmt: *Stmt)
+    if local_field_nd_shape(s, stmt) != null
+        # AGAST #2097: `s.m[i] = v` with m an N-D field assigns a whole row
+        # (`s.m[i][j] = v` is an expression assignment, see emit_assign).
+        # AGAST #4666: copied over it (emit_nd_sub_store).
+        var rf_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident_ptr: stmt.var_name, ident_len: stmt.var_name_len }
+        var rf_field: Expr = Expr { kind: ExprKind.Member, span: stmt.span, left: @rf_var, ident_ptr: stmt.assign_target, ident_len: stmt.assign_target_len }
+        var rf_place: Expr = Expr { kind: ExprKind.Index, span: stmt.span, left: @rf_field, right: stmt.while_cond }
+        emit_nd_stmt_row_store(s, stmt, @rf_place)
+    else
+        # local_var.field[index] = value
+        # stmt.var_name = variable name
+        # stmt.assign_target = field name
+        # stmt.while_cond = index expression (reused)
+        # stmt.assign_value = value expression
+        var lfia_done: i32 = 0
+        let loc: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.var_name), len: (stmt.var_name_len) as i64 })
+        if loc != null
+            let st: *StructDef = find_struct(s, StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 })
+            if st != null
+                let field_idx: i32 = find_field_index(st, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+                # AGAST #1596: a pointer field is not an inline array — the
+                # arm below GEP'd the field slot itself and wrote INTO the
+                # struct. Leave lfia_done = 0 so the fallback lowers it via
+                # emit_assign, which loads the pointer and indexes through it.
+                var lfia_field_is_ptr: i32 = 0
+                if field_idx >= 0
+                    let pf: *StructField = get_field_type(st, field_idx)
+                    if pf.field_type == TypeKind.Ptr or pf.field_type == TypeKind.PtrPtr
+                        lfia_field_is_ptr = 1
+                    # AGAST #2329: nor is an `@[N]T` / `@&[N]T` one, which
+                    # lower_ref_fields leaves a reference.  `h.r[1] = 7` wrote
+                    # into h.
+                    if pf.ptr_array != null
+                        lfia_field_is_ptr = 1
+                    # AGAST #2564: nor is a Vec, Span or String held by value:
+                    # emit_assign stores `t.v[i] = x` through its buffer, as
+                    # index_through takes it.  `t.v[1] = 7` through a `t: @&T`
+                    # wrote 7 into the Vec's len, SILENT, and a struct element
+                    # was a `store i64` of a `%E` (invalid IR).
+                    if pf.field_type == TypeKind.Struct and name_is_indexable(StrView { ptr: (pf.field_type_name), len: (pf.field_type_name_len) as i64 }) == 1
+                        lfia_field_is_ptr = 1
+                if field_idx >= 0 and lfia_field_is_ptr == 0
+                    let field: *StructField = get_field_type(st, field_idx)
+                    lfia_done = 1
+                    # Get the base pointer - differs for TypeKind.Ptr/TypeKind.Ref/TypeKind.MutRef vs TypeKind.Struct
+                    var base_ptr_reg: i32 = loc.reg
+                    let lfia_levels: i32 = local_struct_levels(loc)
+                    if lfia_levels > 0
+                        # Load the pointer value, then convert to ptr
+                        let loaded: i32 = next_reg(s)
+                        emit_load_into(s, IR_TY_I64, loaded, loc.reg)
+                        base_ptr_reg = next_reg(s)
+                        emit_str(s, IR_INDENT)
+                        emit_reg(s, base_ptr_reg)
+                        emit_str(s, IR_INTTOPTR)
+                        emit_reg(s, loaded)
+                        emit_str(s, c" to ptr\n")
+                        base_ptr_reg = emit_load_levels(s, base_ptr_reg, lfia_levels - 1)   # AGAST #2372
+                    # First GEP to get the field (array within struct)
+                    let field_ptr: i32 = next_reg(s)
+                    emit_str(s, IR_INDENT)
+                    emit_reg(s, field_ptr)
+                    emit_str(s, IR_GEP_NAMED)
+                    emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
+                    emit_str(s, IR_PTR_SEP)
+                    emit_reg(s, base_ptr_reg)
+                    emit_str(s, IR_I32_ZERO)
+                    emit_int(s, field_idx as i64)
+                    emit_str(s, IR_NL)
+                    # Emit index expression
+                    let idx_reg: i32 = emit_expr(s, stmt.while_cond)
+                    # Emit value expression
+                    let val_reg: i32 = emit_store_into_slot(s, stmt.assign_value, field.array_elem_type, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })   # AGAST #2454, #2390
+                    var lfia_base: Expr
+                    memset(@lfia_base as *u8, 0, sizeof(Expr))
+                    lfia_base.kind = ExprKind.Ident
+                    lfia_base.span = stmt.span
+                    lfia_base.ident_ptr = stmt.var_name
+                    lfia_base.ident_len = stmt.var_name_len
+                    var lfia_place: Expr
+                    memset(@lfia_place as *u8, 0, sizeof(Expr))
+                    lfia_place.kind = ExprKind.Member
+                    lfia_place.span = stmt.span
+                    lfia_place.left = @lfia_base
+                    lfia_place.ident_ptr = stmt.assign_target
+                    lfia_place.ident_len = stmt.assign_target_len
+                    emit_field_array_elem_store(s, field_ptr, field, idx_reg, val_reg, stmt.assign_value, @lfia_place)
+        # AGAST #1439: unresolved here -> shared member-store path.
+        if lfia_done == 0
+            emit_local_field_store_fallback(s, stmt, 1)
+
+# `a[i] = v` on a local, global or pointer that no special case above took.
+fn emit_index_assign_plain(s: *EmitterState, stmt: *Stmt)
+    # name[index] = value (array or pointer index assignment)
+    # stmt.assign_target = base variable name (as *u8)
+    # stmt.assign_target_len = name length
+    # stmt.while_cond = index expression (reused field)
+    # stmt.assign_value = value expression
+    let base_reg: i32 = find_local(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+    let base_type: TypeKind = find_local_type(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+    let local: *LocalVar = find_local_struct_name(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+    if base_reg >= 0
+        if base_type == TypeKind.Array and local != null
+            # Array local - use GEP [0, index] to get element
+            let idx_reg: i32 = emit_expr(s, stmt.while_cond)
+            let val_reg: i32 = emit_store_into_slot(s, stmt.assign_value, lv_array_elem_type(local), StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })   # AGAST #2454, #2390
+            let elem_ptr: i32 = next_reg(s)
+            emit_str(s, IR_INDENT)
+            emit_reg(s, elem_ptr)
+            emit_str(s, IR_GEP_ARRAY)
+            emit_int(s, lv_array_size(local) as i64)
+            emit_str(s, IR_X)
+            # AGAST #1564: every non-struct element uses the alloca's own
+            # spelling (array_elem_llvm); u32/u16/i16 used to fall to i64.
+            let elem_ty: *u8 = elem_mem_llvm(lv_array_elem_type(local))
+            if lv_array_elem_type(local) == TypeKind.Struct and lv_type_name_len(local) > 0
+                # AGAST #190: struct-array LHS — emit `[N x %T]` so the
+                # GEP and the store agree with the actual element layout.
+                # Mirrors #188's StmtKind.LocalFieldIndexAssign fix but on
+                # the simpler "local IS the array" path (no enclosing
+                # struct member).  Surfaces in nexus encode_page where
+                # `var fields: [2]DbField; fields[i] = db_field(...)`
+                # was emitting `[2 x i64]` GEP / `store i64 %DbField`.
+                emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
+            else
+                emit_str(s, elem_ty)
+            emit_str(s, IR_RBRACK_PTR)
+            emit_reg(s, base_reg)
+            emit_str(s, IR_I64_ZERO)
+            emit_reg(s, idx_reg)
+            emit_str(s, IR_NL)
+            if lv_array_elem_type(local) == TypeKind.Struct and lv_type_name_len(local) > 0
+                # AGAST #3377 (LARB R39): the old element drops first.
+                var ia_place: Expr
+                memset(@ia_place as *u8, 0, sizeof(Expr))
+                ia_place.kind = ExprKind.Ident
+                ia_place.span = stmt.span
+                ia_place.ident_ptr = stmt.assign_target
+                ia_place.ident_len = stmt.assign_target_len
+                own_drop_old_elem(s, @ia_place, elem_ptr, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 })
+                # AGAST #190: struct-array element store — `store %T %val`
+                # matches the value loaded/returned as the element struct
+                # type (e.g. `%DbField` from `call %DbField @db_field(..)`).
+                emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (lv_type_name(local)), len: (lv_type_name_len(local)) as i64 }, val_reg, elem_ptr)
+            else
+                # Store at the element width: narrow ints truncate, pointers
+                # convert back to ptr, i64 stores as-is; an f64 value into
+                # an f32 element is fptrunc'd (#1966).
+                var store_val: i32 = val_reg
+                if array_elem_typed_scalar(lv_array_elem_type(local)) == 1
+                    store_val = emit_field_elem_narrow(s, val_reg, lv_array_elem_type(local), stmt.assign_value)
+                else if lv_array_elem_type(local) == TypeKind.Ref or lv_array_elem_type(local) == TypeKind.MutRef
+                    store_val = ptr_value_to_i64(s, stmt.assign_value, val_reg)   # AGAST #2369: `a[i] = @&x`
+                else if (lv_array_elem_type(local) == TypeKind.Ptr or lv_array_elem_type(local) == TypeKind.PtrPtr) and expr_is_ptr_valued(s, stmt.assign_value) == 1
+                    store_val = val_reg   # AGAST #3036: `a[i] = @&x` into `[N]*T`: a `ptr` already
+                else
+                    store_val = emit_array_elem_narrow(s, val_reg, lv_array_elem_type(local), elem_ty)
+                emit_str(s, IR_STORE_IND)
+                emit_str(s, elem_ty)
+                emit_str(s, IR_SP)
+                emit_reg(s, store_val)
+                emit_str(s, IR_PTR_SEP)
+                emit_reg(s, elem_ptr)
+                emit_str(s, IR_NL)
+        else
+            # Pointer local — load the i64 slot, convert to ptr, then
+            # GEP + store at the POINTEE's width (AGAST #1332; this was
+            # hardcoded `getelementptr i64` + `store i64` for every
+            # non-** pointer, byte-smearing *i32/*u8 stores).
+            let loaded_i64: i32 = next_reg(s)
+            emit_load_into(s, IR_TY_I64, loaded_i64, base_reg)
+            let base_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, loaded_i64)
+            var pointee: TypeKind = TypeKind.Unknown
+            var pst_name: *u8 = null
+            var pst_len: i32 = 0
+            if local != null
+                pointee = lv_pointee_type(local)
+                pst_name = lv_type_name(local)
+                pst_len = lv_type_name_len(local)
+            emit_index_assign_ptr_store(s, stmt, base_ptr, base_type, pointee, StrView { ptr: (pst_name), len: (pst_len) as i64 })
+    else
+        # AGAST #1332: GLOBAL pointer base.  Previously `base_reg >= 0`
+        # had no else, so `g[i] = v` through a global *T / **T emitted
+        # NO store at all — a silent drop that read back as malloc
+        # garbage (7/8–8/8 mismatches in 92_subscript_store).
+        let glob: *GlobalVarDef = find_global(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 })
+        if glob != null and glob.var_type == TypeKind.Array and glob.array_elem_type == TypeKind.Struct and glob.array_elem_type_name_len > 0
+            # AGAST #1553/#1555: a whole struct element (`g[i] = q`,
+            # `g_slot[2] = *v`, `g[i] = g[j]`). The value is a %T struct
+            # value, so GEP the `[N x %T]` global and `store %T` — the
+            # global form of the local-array struct arm (#190) above.
+            # Previously this fell to the pointer arm below: `load i64
+            # @g` as a base address and `store i64 %T-value` (bad IR).
+            let sidx: i32 = emit_expr(s, stmt.while_cond)
+            let sval: i32 = emit_store_into_slot(s, stmt.assign_value, TypeKind.Struct, StrView { ptr: (glob.array_elem_type_name), len: (glob.array_elem_type_name_len) as i64 })   # AGAST #2454, #2390
+            let sptr: i32 = next_reg(s)
+            emit_str(s, IR_INDENT)
+            emit_reg(s, sptr)
+            emit_str(s, IR_GEP_ARRAY)
+            emit_int(s, glob.array_size as i64)
+            emit_str(s, IR_X)
+            emit_llvm_type_struct(s, TypeKind.Struct, StrView { ptr: (glob.array_elem_type_name), len: (glob.array_elem_type_name_len) as i64 })
+            emit_str(s, c"], ptr @")
+            emit_name(s, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+            emit_str(s, IR_I64_ZERO)
+            emit_reg(s, sidx)
+            emit_str(s, IR_NL)
+            emit_struct_store_or_copy(s, TypeKind.Struct, StrView { ptr: (glob.array_elem_type_name), len: (glob.array_elem_type_name_len) as i64 }, sval, sptr)
+        else if glob != null and glob.var_type == TypeKind.Array and glob.array_elem_type != TypeKind.Struct
+            # AGAST #1504: a global `[N]T` array is the storage itself,
+            # not a pointer slot. The pointer arm below loaded g[0] as a
+            # base address and stored through it (segfault). GEP @g
+            # directly, at the width the global is declared with.
+            let gidx: i32 = emit_expr(s, stmt.while_cond)
+            set_match_float_hint(s, stmt.assign_value, glob.array_elem_type, StrView { ptr: (null), len: (0) as i64 })   # AGAST #4028
+            let gval: i32 = emit_expr(s, stmt.assign_value)
+            let gty: *u8 = elem_mem_llvm(glob.array_elem_type)
+            let gptr: i32 = next_reg(s)
+            emit_str(s, IR_INDENT)
+            emit_reg(s, gptr)
+            emit_str(s, IR_GEP_ARRAY)
+            emit_int(s, glob.array_size as i64)
+            emit_str(s, IR_X)
+            emit_str(s, gty)
+            emit_str(s, c"], ptr @")
+            emit_name(s, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+            emit_str(s, IR_I64_ZERO)
+            emit_reg(s, gidx)
+            emit_str(s, IR_NL)
+            # Values are carried as i64: narrow ints truncate, pointers
+            # convert back to ptr, i64 stores as-is.
+            let get: TypeKind = glob.array_elem_type
+            var gstore: i32 = gval
+            if (get == TypeKind.Ptr or get == TypeKind.PtrPtr) and expr_is_ptr_valued(s, stmt.assign_value) == 1
+                gstore = gval   # AGAST #3036: `g[i] = @&x` into `[N]*T`: a `ptr` already
+            else if get == TypeKind.Ptr or get == TypeKind.PtrPtr
+                gstore = next_reg(s)
+                emit_str(s, IR_INDENT)
+                emit_reg(s, gstore)
+                emit_str(s, IR_INTTOPTR)
+                emit_reg(s, gval)
+                emit_str(s, c" to ptr\n")
+            else if ty_int_in(get, 8, 32) == 1
+                gstore = next_reg(s)
+                emit_str(s, IR_INDENT)
+                emit_reg(s, gstore)
+                emit_str(s, IR_TRUNC)
+                emit_reg(s, gval)
+                emit_str(s, IR_TO_SP)
+                emit_str(s, gty)
+                emit_str(s, IR_NL)
+            else if array_elem_typed_scalar(get) == 1
+                # AGAST #1970: a float / double slot; an f64 value into
+                # an f32 element is fptrunc'd, as for a local array.  A
+                # bool element is an `i1` (#2063).
+                gstore = emit_field_elem_narrow(s, gval, get, stmt.assign_value)
+            emit_str(s, IR_STORE_IND)
+            emit_str(s, gty)
+            emit_str(s, IR_SP)
+            emit_reg(s, gstore)
+            emit_str(s, IR_PTR_SEP)
+            emit_reg(s, gptr)
+            emit_str(s, IR_NL)
+        else if glob != null
+            # Globals of pointer type are stored as i64 (emit_llvm_type):
+            # load the slot, convert to ptr, then share the pointee-width
+            # store path with the local arm.
+            let gloaded: i32 = next_reg(s)
+            emit_load_global(s, IR_TY_I64, gloaded, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
+            let gbase_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, gloaded)
+            emit_index_assign_ptr_store(s, stmt, gbase_ptr, glob.var_type, glob.pointee_type, StrView { ptr: (glob.pointee_type_name), len: (glob.pointee_type_name_len) as i64 })
+
+# `a[i] = v`.
+fn emit_index_assign_stmt(s: *EmitterState, stmt: *Stmt)
+    if emit_through_index_assign(s, stmt) == 1
+        # AGAST #2440: `p[i] = v` through a reference or pointer.
+        return
+    else if nd_array_name_shape(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }) != null
+        # AGAST #1509: `g[i] = v` with g multi-dimensional assigns a whole
+        # row (`g[i][j] = v` is an expression assignment, see emit_assign).
+        # AGAST #4666: copied over it (emit_nd_sub_store).
+        var rg_var: Expr = Expr { kind: ExprKind.Ident, span: stmt.span, ident_ptr: stmt.assign_target, ident_len: stmt.assign_target_len }
+        var rg_place: Expr = Expr { kind: ExprKind.Index, span: stmt.span, left: @rg_var, right: stmt.while_cond }
+        emit_nd_stmt_row_store(s, stmt, @rg_place)
+    else if array_ptr_named(s, StrView { ptr: (stmt.assign_target), len: (stmt.assign_target_len) as i64 }) != null
+        # AGAST #2321: refused, as ritz0 refuses a scalar here.  It stored an i64
+        # at stride 8: past the element, and past the array at the top end.
+        # ritz0 takes a whole `[N]T` at stride `[N]T`, against its own read, so
+        # that isn't lowered either (#2330).
+        emit_nd_error(s, stmt.span.line, stmt.span.col, c"`p[i] = v` through a pointer to an array is refused (`*p = a` stores the whole array)")
+    else
+        emit_index_assign_plain(s, stmt)
+
+# `e.f = v` lowered as an expression assignment.
+fn emit_member_assign_stmt(s: *EmitterState, stmt: *Stmt)
+    # `(*X).field = value` (and the desugared `(*X).field op= value`):
+    # stmt.if_cond = X, stmt.assign_target = field name,
+    # stmt.assign_value = value expression.
+    #
+    # AGAST #1510: lower as an expression assignment to the member
+    # `(*X).field`, so emit_assign resolves it through emit_member_ptr
+    # like every other field store.  The old inline lowering only knew a
+    # bare-identifier X; for `(**pp).n = v` or `(*(*b).ops).n = v` it
+    # evaluated X and then emitted NO store and no error -- the write was
+    # silently dropped.  An unresolvable X now fails loudly in
+    # emit_assign ("unhandled EXPR_MEMBER in assignment").
+    var mdr: Expr
+    mdr.kind = ExprKind.Unary
+    mdr.span = stmt.span
+    mdr.op = OpKind.Deref
+    mdr.operand = stmt.if_cond
+    mdr.next = null
+    var mmem: Expr
+    mmem.kind = ExprKind.Member
+    mmem.span = stmt.span
+    mmem.left = @mdr
+    mmem.ident_ptr = stmt.assign_target
+    mmem.ident_len = stmt.assign_target_len
+    mmem.next = null
+    var mst: Stmt
+    mst.kind = StmtKind.Assign
+    mst.span = stmt.span
+    mst.if_cond = @mmem
+    mst.assign_target = null
+    mst.assign_target_len = 0
+    mst.assign_value = stmt.assign_value
+    mst.next = null
+    emit_assign(s, @mst)
+
+# `e.f[i] = v` lowered as an expression assignment.
+fn emit_member_index_assign_stmt(s: *EmitterState, stmt: *Stmt)
+    # `(*X).field[i] = value` (and the desugared `op=` form):
+    # stmt.if_cond = X, stmt.assign_target = field name,
+    # stmt.while_cond = index, stmt.assign_value = value.
+    #
+    # AGAST #1927: this kind had no arm, so it failed with "unhandled
+    # statement kind 8" even outside a generic fn.  Lower it like
+    # StmtKind.MemberAssign above, as an expression assignment to
+    # `(*X).field[i]`; emit_assign resolves the element through
+    # emit_member_ptr (inline array fields at their declared width,
+    # pointer fields through the loaded pointer).
+    var xdr: Expr
+    xdr.kind = ExprKind.Unary
+    xdr.span = stmt.span
+    xdr.op = OpKind.Deref
+    xdr.operand = stmt.if_cond
+    xdr.next = null
+    var xmem: Expr
+    xmem.kind = ExprKind.Member
+    xmem.span = stmt.span
+    xmem.left = @xdr
+    xmem.ident_ptr = stmt.assign_target
+    xmem.ident_len = stmt.assign_target_len
+    xmem.next = null
+    var xidx: Expr
+    xidx.kind = ExprKind.Index
+    xidx.bracket.line = 0
+    xidx.span = stmt.span
+    xidx.left = @xmem
+    xidx.right = stmt.while_cond
+    xidx.next = null
+    var xst: Stmt
+    xst.kind = StmtKind.Assign
+    xst.span = stmt.span
+    xst.if_cond = @xidx
+    xst.assign_target = null
+    xst.assign_target_len = 0
+    xst.assign_value = stmt.assign_value
+    xst.next = null
+    emit_assign(s, @xst)
 
 # =============================================================================
 # Function Emission
