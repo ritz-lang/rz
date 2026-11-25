@@ -4150,48 +4150,53 @@ fn emit_for_deref_array(s: *EmitterState, x: *Expr, elem: *TypeKind, size: *i32,
     let r: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, val)
     r
 
-# Lower `for x in iter { body }` (no `..`) — the iterable form.
-# Supports the shapes ritz1 can express today:
-#   • a local `[N]T` (TypeKind.Array), walked in place
-#   • a module const or global `[N]T`, walked in place at its symbol
-#   • an array field, walked in place at its address (AGAST #2387)
-#   • what a `*[N]T` / `@[N]T` / `@&[N]T` local points at, as `p` or `*p`, and a
-#     row `m[i]` of a `[N][M]T`, walked in place (AGAST #2410)
-#   • `*x` for a call, field or global `x` of type `*[N]T`, a row `mkp().m[i]` of
-#     what a `*S` call returns, a field `b.f` read through a Box, and a header
-#     `vv[i]` in a Vec's buffer: places, walked in place (AGAST #2426)
-#   • a literal, or an `-> [N]T` call or method (AGAST #2997), walked in a
-#     slot of its own: nothing else can reach it
-#   • a `[N][M]T`, whose binding is each row, a copy as an element is
-#   • a Vec, a Span or a StrView, through its header (emit_for_header)
-# Anything else is a located error, as is an array of rank 3 or more.  AGAST
-# #2375: it used to be a loop that never ran, with no diagnostic.
-fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
-    var iter_kind: i32 = 0         # 0=unsupported, 1=array in a reg, 2=header in a reg, 3=array at a symbol
-    var elem_type: TypeKind = TypeKind.I64
-    var arr_size: i32 = 0
-    var data_reg: i32 = 0
-    var type_name: *u8 = null
-    var type_name_len: i32 = 0
+# What a `for x in <iterable>` walks, as for_iter_resolve found it: the
+# iterable's kind and storage, the element's type, and the binding's.
+struct ForIterSrc
+    iter_kind: i32
+    elem_type: TypeKind
+    arr_size: i32
+    data_reg: i32
+    type_name: *u8
+    type_name_len: i32
+    const_name: *u8
+    const_name_len: i32
+    bind_pointee: TypeKind
+    bind_name: *u8
+    bind_name_len: i32
+    elem_name: *u8
+    elem_name_len: i32
+    row_size: i32
+    plane: *ArrayShape
+
+# Resolve `stmt`'s iterable into `src`: 0 (an error reported) when it is not
+# one ritz1 lowers.
+fn for_iter_resolve(s: *EmitterState, stmt: *Stmt, src: *ForIterSrc) -> i32
+    src.iter_kind = 0         # 0=unsupported, 1=array in a reg, 2=header in a reg, 3=array at a symbol
+    src.elem_type = TypeKind.I64
+    src.arr_size = 0
+    src.data_reg = 0
+    src.type_name = null
+    src.type_name_len = 0
     # Const-array iter (kind=3): use global symbol `@<const_name>` as the
     # base pointer instead of an SSA reg.
-    var const_name: *u8 = null
-    var const_name_len: i32 = 0
+    src.const_name = null
+    src.const_name_len = 0
     # AGAST #2332: what the binding points at, for an element of `[N]*T`.
-    var bind_pointee: TypeKind = TypeKind.Void
-    var bind_name: *u8 = null
-    var bind_name_len: i32 = 0
+    src.bind_pointee = TypeKind.Void
+    src.bind_name = null
+    src.bind_name_len = 0
     # AGAST #2375: the element's struct, for an element of `[N]S`.
-    var elem_name: *u8 = null
-    var elem_name_len: i32 = 0
+    src.elem_name = null
+    src.elem_name_len = 0
     # AGAST #2410: what an N-D iterable is, and how many of its indices are
     # applied.  for_nd_rows turns it into the walk.
     var nd_shape: *ArrayShape = null
     var nd_depth: i32 = 0
     # M when the element is itself a `[M]T` row, which the binding holds.
-    var row_size: i32 = 0
+    src.row_size = 0
     # AGAST #3379: the `[M][N]..T` when the element is itself N-D, a plane.
-    var plane: *ArrayShape = null
+    src.plane = null
 
     var mr: MemberPtrResult
     mr.reg = 0
@@ -4217,21 +4222,21 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
                         # AGAST #1509: a multi-dimensional array yields rows.  It
                         # used to GEP the alloca as `[N x i64]` and load garbage.
                         nd_shape = lv_array_shape(loc)
-                        iter_kind = 1
-                        data_reg = loc.reg
+                        src.iter_kind = 1
+                        src.data_reg = loc.reg
                     else if lv_var_type(loc) == TypeKind.Array
-                        iter_kind = 1
-                        elem_type = lv_array_elem_type(loc)
-                        arr_size = lv_array_size(loc)
-                        data_reg = loc.reg
-                        elem_name = lv_type_name(loc)
-                        elem_name_len = lv_type_name_len(loc)
-                        bind_pointee = elem_recorded_pointee(s, elem_type, lv_array_elem_pointee(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, @bind_name, @bind_name_len)
+                        src.iter_kind = 1
+                        src.elem_type = lv_array_elem_type(loc)
+                        src.arr_size = lv_array_size(loc)
+                        src.data_reg = loc.reg
+                        src.elem_name = lv_type_name(loc)
+                        src.elem_name_len = lv_type_name_len(loc)
+                        src.bind_pointee = elem_recorded_pointee(s, src.elem_type, lv_array_elem_pointee(loc), StrView { ptr: (lv_type_name(loc)), len: (lv_type_name_len(loc)) as i64 }, @src.bind_name, @src.bind_name_len)
                     else if via_addr == 0 and array_ptr_named(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 }) != null
                         # AGAST #2410: `a: *[N]T` / `@[N]T` / `@&[N]T` walks the array
                         # it points at.
-                        data_reg = for_array_ptr(s, loc, @elem_type, @arr_size, @elem_name, @elem_name_len, @bind_pointee, @bind_name, @bind_name_len)
-                        iter_kind = 1
+                        src.data_reg = for_array_ptr(s, loc, @src.elem_type, @src.arr_size, @src.elem_name, @src.elem_name_len, @src.bind_pointee, @src.bind_name, @src.bind_name_len)
+                        src.iter_kind = 1
                 else
                     # Iter is not a local — try a module const array
                     # (`const VALUES: [3]i32 = [2,3,5]`).  emit_const_array_entry
@@ -4239,31 +4244,31 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
                     # off the global symbol below.
                     let centry: *ConstEntry = find_const_entry(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
                     if centry != null and centry.const_type == TypeKind.Array and (via_addr == 0 or iter.op == OpKind.Addr)
-                        iter_kind = 3
-                        elem_type = centry.array_elem_type
-                        arr_size = centry.array_size
-                        const_name = centry.name as *u8
-                        const_name_len = centry.name_len
-                        elem_name = centry.array_elem_type_name
-                        elem_name_len = centry.array_elem_type_name_len
+                        src.iter_kind = 3
+                        src.elem_type = centry.array_elem_type
+                        src.arr_size = centry.array_size
+                        src.const_name = centry.name as *u8
+                        src.const_name_len = centry.name_len
+                        src.elem_name = centry.array_elem_type_name
+                        src.elem_name_len = centry.array_elem_type_name_len
                         # AGAST #1866: `for p in T` over a `[N]*u8` table binds a `*u8`.
-                        bind_pointee = elem_recorded_pointee(s, elem_type, centry.array_elem_pointee, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, @bind_name, @bind_name_len)
+                        src.bind_pointee = elem_recorded_pointee(s, src.elem_type, centry.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
                     else
                         let glob: *GlobalVarDef = find_global(s, StrView { ptr: (arr_ident.ident_ptr), len: (arr_ident.ident_len) as i64 })
                         if glob != null and glob.var_type == TypeKind.Array and glob.array_shape != null
                             nd_shape = glob.array_shape
-                            iter_kind = 3
-                            const_name = glob.name
-                            const_name_len = glob.name_len
+                            src.iter_kind = 3
+                            src.const_name = glob.name
+                            src.const_name_len = glob.name_len
                         else if glob != null and glob.var_type == TypeKind.Array
-                            iter_kind = 3
-                            elem_type = glob.array_elem_type
-                            arr_size = glob.array_size
-                            const_name = glob.name
-                            const_name_len = glob.name_len
-                            elem_name = glob.array_elem_type_name
-                            elem_name_len = glob.array_elem_type_name_len
-                            bind_pointee = elem_recorded_pointee(s, elem_type, glob.array_elem_pointee, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, @bind_name, @bind_name_len)
+                            src.iter_kind = 3
+                            src.elem_type = glob.array_elem_type
+                            src.arr_size = glob.array_size
+                            src.const_name = glob.name
+                            src.const_name_len = glob.name_len
+                            src.elem_name = glob.array_elem_type_name
+                            src.elem_name_len = glob.array_elem_type_name_len
+                            src.bind_pointee = elem_recorded_pointee(s, src.elem_type, glob.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
             ExprKind.Member =>
                 # `@mk().a` has no address: ritz0 says "Cannot get address of: Call".
                 # Refused before the member is reached, which would run the call.
@@ -4273,16 +4278,16 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
                     emit_member_ptr(s, arr_ident, @mr)
                 if mr.success == 1 and mr.field.field_type == TypeKind.Array
                     let fld: *StructField = mr.field
-                    iter_kind = 1
-                    data_reg = mr.reg
+                    src.iter_kind = 1
+                    src.data_reg = mr.reg
                     if fld.array_shape != null
                         nd_shape = fld.array_shape
-                    elem_type = fld.array_elem_type
-                    arr_size = fld.array_size
-                    data_reg = mr.reg
-                    elem_name = fld.array_elem_type_name
-                    elem_name_len = fld.array_elem_type_name_len
-                    bind_pointee = elem_recorded_pointee(s, elem_type, fld.array_elem_pointee, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, @bind_name, @bind_name_len)
+                    src.elem_type = fld.array_elem_type
+                    src.arr_size = fld.array_size
+                    src.data_reg = mr.reg
+                    src.elem_name = fld.array_elem_type_name
+                    src.elem_name_len = fld.array_elem_type_name_len
+                    src.bind_pointee = elem_recorded_pointee(s, src.elem_type, fld.array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
             _ =>
                 if iter.kind == ExprKind.Unary and iter.op == OpKind.Deref and iter.operand != null
                     # AGAST #2410: `*p` is the array `p` points at, not a copy of it.
@@ -4290,13 +4295,13 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
                     if iter.operand.kind == ExprKind.Ident
                         ap = array_ptr_named(s, StrView { ptr: (iter.operand.ident_ptr), len: (iter.operand.ident_len) as i64 })
                     if ap != null
-                        data_reg = for_array_ptr(s, ap, @elem_type, @arr_size, @elem_name, @elem_name_len, @bind_pointee, @bind_name, @bind_name_len)
-                        iter_kind = 1
+                        src.data_reg = for_array_ptr(s, ap, @src.elem_type, @src.arr_size, @src.elem_name, @src.elem_name_len, @src.bind_pointee, @src.bind_name, @src.bind_name_len)
+                        src.iter_kind = 1
                     else
                         # AGAST #2426: and `*mkp()`, `*h.p`, `*gp`, where they point.
-                        data_reg = emit_for_deref_array(s, iter.operand, @elem_type, @arr_size, @elem_name, @elem_name_len, @bind_pointee, @bind_name, @bind_name_len)
-                        if data_reg != 0
-                            iter_kind = 1
+                        src.data_reg = emit_for_deref_array(s, iter.operand, @src.elem_type, @src.arr_size, @src.elem_name, @src.elem_name_len, @src.bind_pointee, @src.bind_name, @src.bind_name_len)
+                        if src.data_reg != 0
+                            src.iter_kind = 1
                 else
                     match iter.kind
                         ExprKind.Index =>
@@ -4307,44 +4312,44 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
                                 var ndp: NdIndexPtr
                                 if emit_nd_index_ptr(s, iter, @ndp) == 1
                                     nd_shape = sh
-                                    iter_kind = 1
-                                    data_reg = ndp.reg
+                                    src.iter_kind = 1
+                                    src.data_reg = ndp.reg
                         ExprKind.ArrayLit =>
                             # AGAST #2410: a literal is an rvalue: a slot of its own.
-                            data_reg = emit_for_literal(s, iter, @elem_type, @arr_size, @elem_name, @elem_name_len)
-                            if data_reg != 0
-                                iter_kind = 1
+                            src.data_reg = emit_for_literal(s, iter, @src.elem_type, @src.arr_size, @src.elem_name, @src.elem_name_len)
+                            if src.data_reg != 0
+                                src.iter_kind = 1
                         _ =>
                             if call_ret_array(s, iter) != null
                                 # AGAST #2997: an `-> [N]T` call or method is an rvalue too: its
                                 # `[N x T]`, made once, in a slot of its own that nothing else sees.
                                 let cra: *Param = call_ret_array(s, iter)
-                                data_reg = emit_call_array_temp(s, iter, cra)
-                                iter_kind = 1
-                                elem_type = cra.param_array_elem_type
-                                arr_size = cra.param_array_size
-                                elem_name = cra.param_type_name
-                                elem_name_len = cra.param_type_name_len
-                                bind_pointee = elem_recorded_pointee(s, elem_type, cra.param_array_elem_pointee, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, @bind_name, @bind_name_len)
+                                src.data_reg = emit_call_array_temp(s, iter, cra)
+                                src.iter_kind = 1
+                                src.elem_type = cra.param_array_elem_type
+                                src.arr_size = cra.param_array_size
+                                src.elem_name = cra.param_type_name
+                                src.elem_name_len = cra.param_type_name_len
+                                src.bind_pointee = elem_recorded_pointee(s, src.elem_type, cra.param_array_elem_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
 
     if nd_shape != null
         # Rows of a `[N][M]T`, or the elements of a row.  AGAST #3379 (LARB
         # R40): rank 3 and up binds planes, each the `[M][N]..T` local that
         # `let p: [M][N]T = g[i]` declares (#3350), walked in turn.
         let left: i32 = nd_shape.rank - nd_depth
-        arr_size = nd_shape.dims[nd_depth]
+        src.arr_size = nd_shape.dims[nd_depth]
         if left == 2
-            row_size = nd_shape.dims[nd_depth + 1]
+            src.row_size = nd_shape.dims[nd_depth + 1]
         else if left > 2
-            plane = nd_shape_from(nd_shape, nd_depth + 1)
-        elem_type = nd_shape.leaf_type
-        elem_name = nd_shape.leaf_name
-        elem_name_len = nd_shape.leaf_name_len
-        bind_pointee = elem_recorded_pointee(s, elem_type, nd_shape.leaf_pointee, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, @bind_name, @bind_name_len)
+            src.plane = nd_shape_from(nd_shape, nd_depth + 1)
+        src.elem_type = nd_shape.leaf_type
+        src.elem_name = nd_shape.leaf_name
+        src.elem_name_len = nd_shape.leaf_name_len
+        src.bind_pointee = elem_recorded_pointee(s, src.elem_type, nd_shape.leaf_pointee, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, @src.bind_name, @src.bind_name_len)
 
-    if iter_kind == 0 and iter != null
+    if src.iter_kind == 0 and iter != null
         var hdr: *StructDef = null
-        data_reg = emit_for_header(s, iter, @mr, @hdr)
+        src.data_reg = emit_for_header(s, iter, @mr, @hdr)
         if hdr != null
             var fe: ForElem
             fe.elem = TypeKind.Void
@@ -4355,19 +4360,41 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
             fe.pointee_name_len = 0
             if for_header_elem(s, hdr, @fe) == 0
                 emit_nd_error(s, iter.span.line, iter.span.col, c"this `for` element type is not supported in ritz1 (index the Vec, or use a struct element)")
-                return
-            iter_kind = 2
-            type_name = hdr.name
-            type_name_len = hdr.name_len
-            elem_type = fe.elem
-            elem_name = fe.name
-            elem_name_len = fe.name_len
-            bind_pointee = fe.pointee
-            bind_name = fe.pointee_name
-            bind_name_len = fe.pointee_name_len
+                return 0
+            src.iter_kind = 2
+            src.type_name = hdr.name
+            src.type_name_len = hdr.name_len
+            src.elem_type = fe.elem
+            src.elem_name = fe.name
+            src.elem_name_len = fe.name_len
+            src.bind_pointee = fe.pointee
+            src.bind_name = fe.pointee_name
+            src.bind_name_len = fe.pointee_name_len
 
-    if iter_kind == 0
+    if src.iter_kind == 0
         emit_nd_error(s, iter.span.line, iter.span.col, c"this `for` iterable is not supported in ritz1 (it takes an array, an array field, a Vec, a Span or a StrView)")
+        return 0
+    1
+
+# Lower `for x in iter { body }` (no `..`) — the iterable form.
+# Supports the shapes ritz1 can express today:
+#   • a local `[N]T` (TypeKind.Array), walked in place
+#   • a module const or global `[N]T`, walked in place at its symbol
+#   • an array field, walked in place at its address (AGAST #2387)
+#   • what a `*[N]T` / `@[N]T` / `@&[N]T` local points at, as `p` or `*p`, and a
+#     row `m[i]` of a `[N][M]T`, walked in place (AGAST #2410)
+#   • `*x` for a call, field or global `x` of type `*[N]T`, a row `mkp().m[i]` of
+#     what a `*S` call returns, a field `b.f` read through a Box, and a header
+#     `vv[i]` in a Vec's buffer: places, walked in place (AGAST #2426)
+#   • a literal, or an `-> [N]T` call or method (AGAST #2997), walked in a
+#     slot of its own: nothing else can reach it
+#   • a `[N][M]T`, whose binding is each row, a copy as an element is
+#   • a Vec, a Span or a StrView, through its header (emit_for_header)
+# Anything else is a located error, as is an array of rank 3 or more.  AGAST
+# #2375: it used to be a loop that never ran, with no diagnostic.
+fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
+    var src: ForIterSrc
+    if for_iter_resolve(s, stmt, @src) == 0
         return
 
     # Index storage (i64 counter).
@@ -4381,34 +4408,34 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     # A bool local is an i64 slot, as emit_var_decl has it, and `elem_type` an
     # `i1` in the array.  The body reads the binding as any other bool local.
     # A bool row or plane (AGAST #3379) stays `i1`s, as a bool array local is.
-    let bool_slot: i32 = (elem_type == TypeKind.Bool and row_size == 0 and plane == null) as i32
+    let bool_slot: i32 = (src.elem_type == TypeKind.Bool and src.row_size == 0 and src.plane == null) as i32
     if bool_slot == 1
         emit_str(s, c"i64")
     else
-        emit_for_slot_llvm(s, elem_type, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, row_size, plane)
+        emit_for_slot_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, src.row_size, src.plane)
     emit_str(s, IR_NL)
     entry_alloca_reg_end(s)
 
-    if plane != null
+    if src.plane != null
         # AGAST #3379: a plane is a `[M][N]..T` local, as emit_var_decl has it.
-        add_local_array(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, plane.dims[0], TypeKind.Array)
+        add_local_array(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, src.plane.dims[0], TypeKind.Array)
         let plane_loc: *LocalVar = local_at(s, s.local_count - 1)
-        lv_set_array_shape(plane_loc, plane)
-    else if row_size > 0
+        lv_set_array_shape(plane_loc, src.plane)
+    else if src.row_size > 0
         # AGAST #2410: a row is a `[M]T` local.
-        add_local_full(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, TypeKind.Array, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, TypeKind.I64, row_size, elem_type)
+        add_local_full(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, TypeKind.Array, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, TypeKind.I64, src.row_size, src.elem_type)
         let row_loc: *LocalVar = local_at(s, s.local_count - 1)
-        lv_set_array_elem_pointee(row_loc, bind_pointee)
-    else if bind_pointee != TypeKind.Void
-        add_local_full(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, elem_type, StrView { ptr: (bind_name), len: (bind_name_len) as i64 }, bind_pointee, 0, TypeKind.Void)
-    else if elem_type == TypeKind.Struct and elem_name_len > 0
-        add_local_struct(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, elem_type, StrView { ptr: (elem_name), len: (elem_name_len) as i64 })
-    else if elem_type == TypeKind.Bool
+        lv_set_array_elem_pointee(row_loc, src.bind_pointee)
+    else if src.bind_pointee != TypeKind.Void
+        add_local_full(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, src.elem_type, StrView { ptr: (src.bind_name), len: (src.bind_name_len) as i64 }, src.bind_pointee, 0, TypeKind.Void)
+    else if src.elem_type == TypeKind.Struct and src.elem_name_len > 0
+        add_local_struct(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 })
+    else if src.elem_type == TypeKind.Bool
         add_local(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, TypeKind.I64)
         let bool_loc: *LocalVar = local_at(s, s.local_count - 1)
         bool_loc.is_bool = 1
     else
-        add_local(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, elem_type)
+        add_local(s, StrView { ptr: (stmt.for_var), len: (stmt.for_var_len) as i64 }, var_reg, src.elem_type)
     # ritz0 binds every element a `let` (#1755, AGAST #2389): a write would only
     # reach this copy of the element.  A range variable (emit_for) stays a `var`.
     let elem_loc: *LocalVar = local_at(s, s.local_count - 1)
@@ -4434,21 +4461,21 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     emit_load_into(s, IR_TY_I64, idx_val, idx_reg)
 
     var len_val: i32 = 0
-    if iter_kind == 1 or iter_kind == 3
+    if src.iter_kind == 1 or src.iter_kind == 3
         len_val = next_reg(s)
         emit_str(s, IR_INDENT)
         emit_reg(s, len_val)
         emit_str(s, c" = add i64 0, ")
-        emit_int(s, arr_size as i64)
+        emit_int(s, src.arr_size as i64)
         emit_str(s, IR_NL)
-    else if iter_kind == 2
+    else if src.iter_kind == 2
         let len_ptr: i32 = next_reg(s)
         emit_str(s, IR_INDENT)
         emit_reg(s, len_ptr)
         emit_str(s, IR_GEP_NAMED)
-        emit_name(s, StrView { ptr: (type_name), len: (type_name_len) as i64 })
+        emit_name(s, StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 })
         emit_str(s, IR_PTR_SEP)
-        emit_reg(s, data_reg)
+        emit_reg(s, src.data_reg)
         emit_str(s, c", i32 0, i32 1\n")
         len_val = next_reg(s)
         emit_load_into(s, IR_TY_I64, len_val, len_ptr)
@@ -4476,15 +4503,15 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     emit_load_into(s, IR_TY_I64, idx_val2, idx_reg)
 
     let elem_ptr: i32 = next_reg(s)
-    if iter_kind == 2
+    if src.iter_kind == 2
         # `data` is field 0 and `len` field 1, as for_header_struct checked.
         let data_ptr_ptr: i32 = next_reg(s)
         emit_str(s, IR_INDENT)
         emit_reg(s, data_ptr_ptr)
         emit_str(s, IR_GEP_NAMED)
-        emit_name(s, StrView { ptr: (type_name), len: (type_name_len) as i64 })
+        emit_name(s, StrView { ptr: (src.type_name), len: (src.type_name_len) as i64 })
         emit_str(s, IR_PTR_SEP)
-        emit_reg(s, data_reg)
+        emit_reg(s, src.data_reg)
         emit_str(s, c", i32 0, i32 0\n")
         let data_ptr: i32 = next_reg(s)
         emit_str(s, IR_INDENT)
@@ -4494,7 +4521,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
         emit_str(s, c"\n  ")
         emit_reg(s, elem_ptr)
         emit_str(s, c" = getelementptr ")
-        emit_for_elem_llvm(s, elem_type, StrView { ptr: (elem_name), len: (elem_name_len) as i64 })
+        emit_for_elem_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 })
         emit_str(s, IR_PTR_SEP)
         emit_reg(s, data_ptr)
         emit_str(s, IR_I64_SEP)
@@ -4504,17 +4531,17 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
         emit_str(s, IR_INDENT)
         emit_reg(s, elem_ptr)
         emit_str(s, IR_GEP_ARRAY)
-        emit_int(s, arr_size as i64)
+        emit_int(s, src.arr_size as i64)
         emit_str(s, IR_X)
-        emit_for_slot_llvm(s, elem_type, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, row_size, plane)
+        emit_for_slot_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, src.row_size, src.plane)
         emit_str(s, IR_RBRACK_PTR)
         # A local array or a field is an SSA reg; a const or global
         # array is its symbol.
-        if iter_kind == 3
+        if src.iter_kind == 3
             emit_str(s, c"@")
-            emit_name(s, StrView { ptr: (const_name), len: (const_name_len) as i64 })
+            emit_name(s, StrView { ptr: (src.const_name), len: (src.const_name_len) as i64 })
         else
-            emit_reg(s, data_reg)
+            emit_reg(s, src.data_reg)
         emit_str(s, IR_I64_ZERO)
         emit_reg(s, idx_val2)
         emit_str(s, IR_NL)
@@ -4522,7 +4549,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
     emit_str(s, IR_INDENT)
     emit_reg(s, elem_val)
     emit_str(s, IR_LOAD)
-    emit_for_slot_llvm(s, elem_type, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, row_size, plane)
+    emit_for_slot_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, src.row_size, src.plane)
     emit_str(s, IR_PTR_SEP)
     emit_reg(s, elem_ptr)
     emit_str(s, IR_NL)
@@ -4536,7 +4563,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: TypeKind)
         emit_reg(s, wide)
     else
         emit_str(s, IR_STORE_IND)
-        emit_for_slot_llvm(s, elem_type, StrView { ptr: (elem_name), len: (elem_name_len) as i64 }, row_size, plane)
+        emit_for_slot_llvm(s, src.elem_type, StrView { ptr: (src.elem_name), len: (src.elem_name_len) as i64 }, src.row_size, src.plane)
         emit_str(s, IR_SP)
         emit_reg(s, elem_val)
     emit_str(s, IR_PTR_SEP)
