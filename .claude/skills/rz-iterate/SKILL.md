@@ -62,7 +62,7 @@ sections below give the mechanics; this is the policy they serve:
 7. **Finish work; don't breed follow-ons** (Aaron, 2026-11-24: "We are now
    at 2250 total cards, we were barely at 1000 before the big push started
    ... we are walking in circles instead of walking towards the
-   objective"). Every ticket and every room must move one of the five goals
+   objective"). Every ticket and every room must move one of the six goals
    at the bottom of this file. In practice:
    - **A room finishes its ticket's objective in its own commit**,
      including the small adjacent fixes the change needs: a caller to
@@ -71,7 +71,7 @@ sections below give the mechanics; this is the policy they serve:
      (style, docs drift, metrics, cleanups, "consider ...") go in the REAP
      line's one-liner or nowhere. A room files **at most one** new ticket,
      and only for a gap that blocks a goal and can't fit in its commit.
-     The ticket names the goal (briefing step 4).
+     The ticket names the goal (ROOM.md step 4).
    - **`rz` files tickets only** for a new failure on `main` or in a train
      that no running room owns, or when Aaron asks. Spawn and host hiccups
      go in the turn report, not into AGAST. Fold related tickets into one
@@ -312,7 +312,7 @@ delivery until the host replies `SPAWNED`/`TORNDOWN`.
     the briefing. The host answers `SPAWNED ritz-task-<id> on <host>` or
     `SPAWN-FAILED ritz-task-<id> on <host>: <reason>`.
     `SPAWN` creates the worktree off `origin/main`; the room gates with
-    its own worktree's `run-gate.sh` (briefing step 6), not the host's
+    its own worktree's `run-gate.sh` (ROOM.md step 6), not the host's
     `~/dev/ritz-lang/rz` checkout (Aaron, 2026-11-16 20:35).
   - `RESTART ritz-task-<id>`: restarts a room that isn't working.
     **Exec-capable TMPDIR (bangerang, 2026-11-17):** bangerang's `/tmp` is
@@ -431,7 +431,7 @@ done. `rz` holds both ends; the room only works in between.
 | Claim | `rz`, **before** anything is created | `claim_task` as `ritz-task-<id>` (omegalisk) or `ritz-task-<id>@<host>`. Check the reply says `executing` with that name; a claim conflict aborts the spawn. Spawn with `--no-claim`, and say in the briefing (and the `SPAWN`) which name holds it |
 | Work | room | Reads the ticket and files new tickets for anything out of scope. **Never** claims, releases or completes its own ticket when it has a commit to REAP. The evidence goes in the REAP line |
 | Close (merged) | `rz`, after `git push origin main` | `complete_task` with `Merged to main as <sha8>. <the REAP line>` |
-| Close (already fixed) | room | REAP `none`: the room may `complete_task` with the evidence (briefing step 1). That's final: it makes no commit after it. If a test is still worth landing, `rz` files a new ticket for it |
+| Close (already fixed) | room | REAP `none`: the room may `complete_task` with the evidence (ROOM.md step 1). That's final: it makes no commit after it. If a test is still worth landing, `rz` files a new ticket for it |
 | Abandon | `rz` | Torn down or `SPAWN-FAILED` without a merge: `release_task`, so the ticket is `ready` again |
 | Wait on another | `rz` | `add_dependency`. The waiting room keeps its claim (e.g. #2582 holding for #2689) |
 
@@ -460,7 +460,7 @@ brief, verify the agent woke), with these ritz values:
 | Room / branch / unit name | `ritz-task-<agast-id>` |
 | Worktree | `~/dev/ritz-lang/rz-task-<agast-id>` (host makes it off `origin/main`; if a train queue exists, the room then resets it to the deepest tail: step 3 above) |
 | Install from | `~/dev/nevelis/adele`, `--workspace` pointing at the worktree |
-| Model | default harness/model, `CLAUDE_CONFIG_DIR=/home/aaron/.claude-bettercomp` in `room.env` (see "Fleet model" below) |
+| Model | default harness/model; the host's `adele.env` decides `CLAUDE_CONFIG_DIR` (see "Fleet model" below) |
 | Callback room | `rz` |
 
 **Pass `--worktree ~/dev/ritz-lang/rz-task-<agast-id>` explicitly.** `adele
@@ -471,14 +471,11 @@ reap, or teardown step expects (2026-11-20).
 **Fleet model (Aaron, 2026-11-23: back on Claude).** Rooms use the
 **default harness and model**. Do **not** pass `--harness` / `--model` to
 `adele install`, do **not** install any harness drop-in (`90-adele-deepseek.conf`,
-`95-adele-harness.conf`), and don't put `model=` on a host `SPAWN`. Every
-room's `~/.config/adele/rooms/<room>/room.env` **must** have
-`CLAUDE_CONFIG_DIR=/home/aaron/.claude-bettercomp` (check it after spawn).
-`adele room spawn` writes a `room.env` without it and starts the unit at
-once, so the first turn would run on `~/.claude`. On huburght the shared
-`~/.config/adele/adele.env` also carries it, so every room starts on the right config;
-on omegalisk (whose `adele.env` serves non-ritz rooms too) append it to
-`room.env` and restart the unit before the briefing (#4548, 2026-11-23).
+`95-adele-harness.conf`), and don't put `model=` on a host `SPAWN`.
+**Each host's `~/.config/adele/adele.env` decides `CLAUDE_CONFIG_DIR`**
+(since 2026-11-24 23:09Z): on huburght it is unset, so rooms run on
+`~/.claude`; omegalisk rooms get `CLAUDE_CONFIG_DIR=/home/aaron/.claude-bettercomp`
+in their `room.env`. Don't add it to a room on any other host.
 Stale DeepSeek pins live in three places, and any one of them keeps a room
 on DeepSeek or crashes it with `[claude-code:unrecognized_model]
 {"model":"deepseek-flash"}`: `ADELE_HARNESS`/`ADELE_MODEL` lines in
@@ -488,8 +485,7 @@ default)` and then the stored value). Clear all three (#203, 2026-11-23).
 Hosts in use for rooms (2026-11-24): omegalisk, huburght, starbux, toffee
 and chungus. Train gates run on huburght or bangerang, not omegalisk
 (Aaron, 2026-11-24: omegalisk's WSL on Windows 10 has no KVM, and the
-harland boot tests need it). huburght got its `~/.claude-bettercomp` copied
-from omegalisk on 2026-11-23.
+harland boot tests need it).
 
 **"START poke sent" doesn't mean the room started.** Within ~2 minutes of
 `adele room spawn`, check the room has posted a `claude_response` or tool use
@@ -506,7 +502,7 @@ crash-loops on HTTP 400. Use `send_room_message` ("Room initialized for AGAST
 #<id>."); `update_room_description` does NOT create a room, it returns "not
 found". Once the room exists, give it a description from the ticket:
 `update_room_description(room_id="ritz-task-<id>", description="...")`. The
-room keeps the description current from then on (briefing step 0).
+room keeps the description current from then on (ROOM.md step 0).
 
 **Room descriptions** are one concise sentence saying what the room is doing:
 about 20-30 characters, 60 at most (Aaron, 2026-10-25). For example "Lower
@@ -539,8 +535,8 @@ The cap is per room, not per command, so a room can't bypass it by running
 **Before spawning, check the ticket isn't already fixed on `main`.** Many
 `ready` tickets were fixed in-session and never closed (#1369 and #1372 were
 found that way). A quick grep for the fix the ticket describes is enough; if
-it's there, `complete_task` with the evidence instead of spawning. Also add a
-"step 0: is it already fixed?" to each briefing.
+it's there, `complete_task` with the evidence instead of spawning. The room
+checks again first (ROOM.md step 1).
 
 ### Spawning on a remote host
 
@@ -561,14 +557,13 @@ You can't run `git worktree`, `systemctl`, `provision-room.sh` or
    AGAST tools (2026-11-10): they read the ticket and file new ones, but
    close it only for REAP `none` (see "Who owns the ticket").
 3. **Send `SPAWN`** to `adele-<host>`: the verb line, then the briefing below
-   with the remote additions filled in. The host creates
+   with its `Host` line. The host creates
    `~/dev/ritz-lang/rz-task-<id>` off `origin/main`, provisions it, puts it
    on the budget, installs, starts it and sends it the briefing.
    **Base the room on the deepest train tail when a queue exists** (AGAST
    #4409, Aaron 2026-11-20): `train.sh show` prints every train's `TIP=`,
    the last one deepest; give the room that tail's first 12 as `<tail12>`
-   and tell it to run `git fetch origin rz-train/<tail12> && git reset
-   --hard FETCH_HEAD` after the worktree exists. Its commit then boards as
+   in the briefing's `Base:` line. Its commit then boards as
    `KEPT` on the next `build --next`, instead of being cherry-picked onto
    the tail. No queue: nothing to do; the room branches from main.
 4. **Wait for `SPAWNED`** (it wakes this room). Then check the agent woke
@@ -576,247 +571,41 @@ You can't run `git worktree`, `systemctl`, `provision-room.sh` or
    reading a journal. No answer in 10 minutes: send `STATUS`.
 
 Paths in the briefing (`~/dev/ritz-lang/...`) are the same on every host.
-Each room runs `run-gate.sh` from its own worktree (briefing step 6), so a
+Each room runs `run-gate.sh` from its own worktree (ROOM.md step 6), so a
 gate fix on `main` reaches a room only when it rebases. Nothing reads the
 host's `~/dev/ritz-lang/rz` checkout for the gate.
 
 ### The briefing (send verbatim, with the placeholders filled)
 
-````markdown
-## Task Briefing — AGAST #<id>
+The standing rules a room follows (steps 0-9, the `.claude/` writes, the
+401 self-restart, the never-do list, remote and spot hosts) are in
+[`ROOM.md`](ROOM.md) beside this file, which every room has in its
+worktree. The briefing carries only what changes per ticket and stays at
+**150 words or fewer** (`test_provision_room.py` pins it). A host `SPAWN`
+carries the same briefing after its verb line.
 
-**<title>**
-
-<2-3 sentence summary. The AGAST ticket is the full spec; read it.>
-
-Room and branch `ritz-task-<id>`, worktree `~/dev/ritz-lang/rz-task-<id>`,
-callback room `rz`.
-
-**Your base is the train tail `<tail12>`, not `origin/main`.** Before
-any edit, run `git fetch origin rz-train/<tail12> && git reset --hard
-FETCH_HEAD`: the host created your worktree off `origin/main`. Make and
-check your commit on that base: it boards the train as KEPT. Do not
-rebase onto `origin/main` before you REAP (step 5) unless `rz` tells you to:
-that would replay the train's cars and stop you boarding as KEPT.
-(`rz` deletes this paragraph when no train is built; then you branch from
-`origin/main`. Rooms used to skip it as "If your SPAWN named a train
-tail", because a room never sees its SPAWN line: #4651.)
-
-### You own this: your REAP vouches for your commit
-
-`rz` boards the SHA you REAP onto a merge train, and the train's full gate
-runs before anything reaches `main`. Your REAP vouches that the subsystems
-you changed pass **in full** on that exact commit (step 6).
-
-0. **Keep your room description current.** Whenever your focus changes, call
-   `update_room_description(room_id="ritz-task-<id>", description="...")`: one
-   concise sentence, about 20-30 characters, 60 at most ("Fix ritz1 slice
-   bounds checks", "Smoke-checking subsystems").
-1. **Already fixed on `origin/main`?** `complete_task` with the evidence and
-   REAP `none`. That's final: commit nothing after it. This is the only time
-   you touch your ticket's status. `rz` claimed it as `<claim name>` and
-   closes it when your commit merges. Never claim, release or complete it
-   yourself, even though your general instructions say to mark tasks done.
-2. **Test first.** Write tests that fail for the reason they name, then fix.
-   Mutation-check: break each part of the fix and confirm only its own tests
-   go red. A pytest matrix is paid by every gate: size it to the rule, not
-   the cross product, and read "What a ritz0 pytest case costs" in
-   `projects/ritz/docs/TESTING.md` before adding hundreds of cases.
-2a. **Write Ritz, not C.** `c"strings"` are only for C interop, where the
-   callee can't take a length and needs NUL termination; null termination
-   is unsafe and heavily discouraged wherever a safer API exists. Add
-   no new `c""` outside an interop boundary (a syscall path or argv, an
-   `extern fn`), and new text-taking APIs take `StrView`: if the only API
-   takes NUL-terminated `*u8`, add the `StrView` one to ritzlib. Read
-   `projects/ritz/docs/RITZ_NOT_C.md` before writing code, and run
-   `docs/REVIEW.md` (`/ritz-review`) on your diff. Your REAP line says how
-   many `c""` you added and removed.
-3. **Subagents (Agent tool) for parallel work.** No rooms of your own.
-4. **Finish the job; don't file follow-ons.** Aaron, 2026-11-24: the
-   board went from ~1,000 to 2,250 cards in one push, and follow-on
-   tickets are overhead that walks in circles. Do the whole of your
-   ticket's objective in your commit, including the small adjacent fixes
-   it needs: a caller to port, a stale comment or test row you touched, a
-   pin to update. "Out of scope" is not a reason to file a ticket. Anything
-   that blocks none of the five self-hosting goals (the end of
-   `.claude/skills/rz-iterate/SKILL.md`), such as style, docs drift,
-   metrics, cleanups or "consider ...", goes in your REAP line's one-liner,
-   or nowhere. File **at most one** ticket, and only for a gap that blocks
-   a goal and can't fit in your commit. Its first line names the goal; file
-   it with `project_id=1` and `parent_task_id=<milestone>` (the parent of
-   your own ticket), and say it in your REAP. Never split your ticket into
-   more tickets.
-5. **Finish on your base:** don't rebase, onto `origin/main` or a newer
-   tail (step 9). `rz` cherry-picks your commit onto the current tail when
-   it boards. Squash to one commit: `ritz-task-<id>: 🤖 <terse
-   description>`.
-6. **Smoke-check your subsystems, in full** (Aaron, 2026-11-23, AGAST
-   #4580): no full room gate is needed before REAP. The train's full gate
-   runs on the whole train before it lands. Run, in the foreground:
-   ```bash
-   bash .claude/skills/rz-iterate/smoke-plan.sh plan   # what it will run
-   bash .claude/skills/rz-iterate/smoke-plan.sh run    # last line: your quote
-   ```
-   `run` maps the files your commit (`HEAD^..HEAD`) changed to their
-   subsystems' test targets. Every diff gets `make smoke` and
-   `tools-ratchets`: the guards and ratchets (the tools/ tests that read
-   compiler sources, the pins such as test_standard_callers.py, and
-   ritz0's in-process tests; ~15 s; #4587, #4653 and #4654 went red on
-   ones their smoke skipped; AGAST #4672). A compiler change (`ritz0`,
-   `ritz1`, `grammars`, `runtime`) also gets the whole `make unit`,
-   `ritz1-bootstrap` and the matrix. A package gets `./rz build` and
-   `./rz test`, a skill gets its `test-*.sh`, and anything under
-   `.claude/` also gets `tools-unit`, whose tests read SKILL.md (the
-   mapping is in the script's header). It runs each target **in full**, never a fail-fast
-   subset: #4450 ran 59 of ~24k ritz0 tests and cost two red trains. The
-   last line is your REAP quote: `smoke <sha12> [<targets>] EXIT=0`. It
-   refuses a dirty tree, and EXIT=99 means HEAD moved under it. Only
-   `EXIT=0` passes: otherwise fix, re-squash and re-run. A long run (the full
-   `unit` is ~24k tests) outlasts one 10-minute tool call: start it with
-   the Bash tool's `run_in_background`, its output to a log, and wait on it
-   in the foreground in slices under 10 minutes until it exits (never end a
-   turn with it pending). The quote is the log's last line. If you touched packages outside `projects/ritz`, compare
-   their failures against `origin/main` before calling them pre-existing.
-
-   **A full room gate is still allowed, and is the stronger quote**: for
-   example when your commit is alone on the deepest tail, where its gate
-   lands the trains below it (SKILL.md "A room gate on a train's tail"). Run
-   it detached, with your own worktree's gate script:
-   ```bash
-   W=~/dev/ritz-lang/rz-task-<id>
-   LOG=$(bash "$W/.claude/skills/rz-iterate/run-gate.sh" "$W" <id>)
-   timeout 540 bash "$W/.claude/skills/rz-iterate/run-gate.sh" --wait "$LOG"
-   ```
-   Repeat the wait on exit 124 (the slice ran out). Only exit 0 passes,
-   with one exception: if the only failing step is `[bootstrap] ritz0 unit
-   tests`, the log prints a `test budget: … breach(es)` line, and pytest
-   reports `0 failed`, the budget-only verdict is terminal. Quote it as
-   `EXIT=2 budget-only: <raw> / factor <f> = <norm> vs cap` and do not
-   re-gate. A `test budget: no calibration` or `SETUP ERROR` line is a host
-   setup error: fix the machine and re-gate (a stale venv's line names the
-   pins it misses; `python3 -m pip install -r projects/ritz/requirements.lock`
-   fixes it, #4583). 98 = no verdict, 99 = HEAD
-   moved. One gate slot is shared machine-wide.
-
-   Your room runs at CPUWeight=20 under a 5G memory cap (#1811), and your
-   permissions deny `systemd-run`. A test that needs a real unit runs it
-   through `bash .claude/room-unit.sh [--pipe] [--unit=NAME] -- <cmd>` (1G,
-   15-minute cap, shares your /tmp; #3568). Builds never go through it.
-   Never start `ci_local.py` or `make ci-local` in the background yourself:
-   the full suite runs only through `run-gate.sh`. Never `pkill -f`,
-   `kill -- -PGID` or any pattern that can match another room's
-   `ci_local.py` or `pytest`. Kill only the exact PIDs you spawned; if you
-   can't identify them, tell `rz` instead of widening the kill.
-7. **Don't chase `main`.** REAP the commit you checked. `rz` usually lands
-   it by cherry-picking it onto `main` in a batch with other rooms' commits
-   and gating the batch, so it may reach `main` under a different SHA. You
-   only rebase if `rz` tells you to.
-8. **Push and REAP:** `git push --force-with-lease origin ritz-task-<id>`
-   (remote rooms: `git push --force-with-lease origin
-   HEAD:refs/heads/ritz-task-<id>`). Never `-f`/`--force`: the lease refuses
-   to overwrite a branch someone else moved. If it's rejected as stale,
-   `git fetch origin`, check `origin/ritz-task-<id>` is your own earlier
-   push, and retry; if it isn't yours, stop and tell `rz`. Then exactly one,
-   quoting step 6's last line before the dash (every room, local or
-   remote):
-   ```
-   mcp__adele-context__send_room_message(
-       room_id="rz",
-       message="REAP ritz-task-<id> <full-sha> smoke <sha12> [<targets>] EXIT=0 — <one line: what changed>",
-       sender_name="ritz-task-<id>",
-       ask_claude=True)
-   ```
-   With a full gate instead, quote it: `REAP ritz-task-<id> <full-sha> gate
-   <log name> SHA=<first 12> EXIT=0 — <one line>`.
-   Don't `complete_task`: the REAP line is your evidence, and `rz` closes the
-   ticket once your commit is on `main`.
-9. **Stay on your base. Don't chase the train.** Trains will stack, land
-   and be rebuilt above you while you work. That's `rz`'s to catch up:
-   it cherry-picks your REAPed commit onto the tail at boarding time. Don't
-   rebase because `main` or a tail moved, even if you notice it.
-   `rz` asks you to rebase only when your car can't board: **"rebase onto
-   <sha12>"** because your commit conflicted with a car in the train, or a
-   train gate failed and names your commit. The message says which, with
-   the conflicting files or the failing lines. Then rebase onto exactly that
-   commit, resolve or fix, re-run step 6, push and REAP again.
-
-**Never end a turn with work pending:** nothing wakes you when a gate,
-mutation run or subagent finishes (#1533). Wait in the foreground, in slices
-under 10 minutes, for anything long. The harness ends a turn after 600s of
-silence on a background wait, and a `Monitor` or wakeup can be lost with it
-(#2333). The gate is detached, so `timeout` only ends the wait. Polling a gate
-in the foreground is a legitimate wait, not a wedged room (AGAST #4423).
-
-**Writing under `.claude/` asks a human** for the `Write` tool and any `rm`,
-whatever your permissions say (#3568). Nobody answers a room, so you stall.
-To create a file there, `Write` it to /tmp and `cp` it in. Change files
-with `Edit` or `sed -i`. To delete one, `mv` it to /tmp. A command that
-writes under `.claude/` and contains the word `rm` anywhere (heredoc bodies
-included) still asks. /tmp scratch (mktemp, cp, rm) needs no approval, with
-one exception (#4215): a single call that runs `rm -rf`, starts jobs with `&`
-in a loop and `kill`s them asks even under /tmp. For load repros, write
-the commands to a script and run `bash /tmp/<name>.sh`, or put the `rm -rf`
-in its own call.
-
-**An MCP call rejected (401, expired or invalid token)? Restart yourself.**
-Don't retry, and don't work around it. Your token is read once, at startup
-(#2546). Save the message you were sending, schedule your own restart, and
-end your turn:
-```bash
-P=$(git rev-parse --git-dir)/pending-mcp   # outside the tree, never committed
-printf '%s\n' "REAP ritz-task-<id> <full-sha> — <one line>" > "$P"
-bash .claude/room-unit.sh restart-self   # restarts your own unit in 15s
+```markdown
+## #<id> <title>
+AGAST #<id> is the spec. Room+branch ritz-task-<id>, worktree ~/dev/ritz-lang/rz-task-<id>, claim <claim name>, callback rz.
+Base: `git fetch origin rz-train/<tail12> && git reset --hard FETCH_HEAD`; stay on it.
+Rules: read .claude/skills/rz-iterate/ROOM.md first and follow it.
+<optional: at most 3 lines of task notes>
+Host <host>, spot, deadline <HH:MM>Z
 ```
-On every rejoin, check for that file first. If it's there, send its line
-exactly as in step 8, then delete it.
 
-**Never** check out or push `main`, merge anything, remove your worktree,
-stop or disable your unit (the scheduled restart above is the one
-exception), or delete your branch. `rz` does that after merging.
-````
+- **No train built:** the base line is `Base: origin/main.`
+- **The `Host` line** is only for a remote room; `, spot, deadline
+  <HH:MM>Z` only for a spot host (ROOM.md "Spot host").
+- **Task notes** say only what the ticket doesn't: a fold-in ("also do
+  #<b> in this commit"), a file to start from. Never restate ROOM.md.
 
-**Remote additions to the briefing** (only for a room on a remote host;
-add them after the room line):
+### Messages
 
-````markdown
-You're on **<host>**, not omegalisk. `rz` can't read your files or journal,
-so:
-
-- **Your REAP must quote your check's verdict** (step 8): the `smoke
-  <sha12> [<targets>] EXIT=0` line, or `gate <log name> SHA=<first 12>
-  EXIT=0` for a full gate. `rz` checks it against the SHA you REAP with
-  `smoke-plan.sh check`.
-- **AGAST:** read your ticket. File a new one only under step 4's rule (at
-  most one, for a gap that blocks a goal). The ticket is claimed as
-  `ritz-task-<id>@<host>`; leave its status alone (step 1). The ticket
-  text is also pasted below. If an AGAST call fails, say so in your REAP,
-  name that one blocking gap there if you have one (title, file:line, the
-  goal it blocks), and for step 1 REAP `none` with the evidence.
-- **Self-restart** (`room-unit.sh restart-self` under "An MCP call
-  rejected", below) works the same on this host.
-
-<full AGAST ticket text>
-````
-
-**Ephemeral (spot) hosts add this too** (skronk*, Aaron 2026-11-18: "commit &
-push more often"). Spot boxes were terminated three times on 2026-11-18, the
-c5.12xlarge pair within 30 minutes, which lost 64 rooms. Only pushed branches
-and room history survived.
-
-````markdown
-- **<host> is an EC2 spot box. It can vanish at any minute, and it powers
-  off at <deadline>Z in any case.** All that survives is what you've pushed
-  and what's in this room's history.
-  - **Push WIP at least every 15 minutes**, and before anything that runs
-    longer than about 5 minutes (a gate, a corpus sweep, a full pytest):
-    `git add -A && git commit -qm "wip: <what>" && git push -q --force-with-lease origin HEAD:refs/heads/ritz-task-<id>`.
-    Squash to one commit before you gate for the REAP (step 5).
-  - **Write measurements down when you get them.** Post sweep counts,
-    bisect results and decisions in a short STATUS to `rz`, or commit them
-    in a scratch file on the branch, so a replacement agent can pick up
-    from them.
-  - REAP (or report state to `rz`) by **<deadline − 20 min>Z** at the latest.
-````
+Every agent-to-agent message (`rz`→room, room→`rz`, `rz`→host, host→`rz`)
+is one line where possible. Don't restate what the recipient's files say
+(ROOM.md, this skill, the ticket), and send no tables or prose recaps. The
+REAP line and the host verbs keep their formats. A message that needs more
+than a line names the file or ticket that holds the detail.
 
 **Re-spawning after a spot loss:** keep the room ID (the evacuate refs and
 the hand-off message are keyed by it), and post this resume briefing in the
@@ -825,7 +614,7 @@ room (`<old host>` is the lost box):
 ````markdown
 ## Resume — ritz-task-<id> (re-spawned on <new host>; <old host> was lost)
 
-Your original `## Task Briefing` is in this room's history: it still holds.
+Your original briefing is in this room's history and ROOM.md: both still hold.
 Before anything else, in this order:
 1. `git fetch origin ritz-task-<id> && git reset --hard FETCH_HEAD` if the
    branch exists (else stay on `origin/main`).
@@ -1014,7 +803,7 @@ This is also how Borque's conductor works.
 - **A car conflicts** (e.g. ABCD is in the train, E arrives, and E conflicts
   with C): bounce E to its room with the exact commit to rebase onto, the
   tail (D's train SHA), not `main`. The room resolves the conflict on D,
-  re-runs its smoke check (briefing step 6) and REAPs again, and E joins
+  re-runs its smoke check (ROOM.md step 6) and REAPs again, and E joins
   the back of the train.
 - **A train fails:** find the culprit by reasoning first, bisection second
   (step 6).
@@ -1025,7 +814,7 @@ we've changed. The whole gate gets run on the whole train before merging,
 to keep the main branch stable. But we will increase velocity."** A room
 no longer runs a full gate before it REAPs. It runs `smoke-plan.sh run`:
 smoke plus every changed subsystem's test targets, each **in full**
-(briefing step 6). It quotes `smoke <sha12> [<targets>] EXIT=0`. One full
+(ROOM.md step 6). It quotes `smoke <sha12> [<targets>] EXIT=0`. One full
 train gate then covers every car. **Main never moves without a full gate on
 the landed SHA.** That is the train's gate, or a room's own full gate on
 exactly the train's tip (the KEPT case under "A room gate on a train's
@@ -1081,7 +870,7 @@ one to train 1.
    Run it in your main checkout once `git fetch` has the REAP SHA.
    (`train.sh build` checks the rest: the branch tip is the REAP SHA, and
    it's one commit.) One accepted exception (AGAST #4580):
-   - **The branch moved after the REAP by a clean rebase** (briefing step
+   - **The branch moved after the REAP by a clean rebase** (ROOM.md step
      9): its tip is a commit with the REAP SHA's patch on another base, and
      the room sent no new REAP. Board the **original** REAP line, quote and
      all (check the quote against the REAP SHA, not the new tip). `build` matches it by `git patch-id --verbatim`, picks the
@@ -1600,7 +1389,7 @@ line's counts, not into AGAST. If it commits nothing, its REAP line is
 
 ## Goal: a working self-hosted ritz compiler
 
-Done when all five hold on `main`:
+Done when all six hold on `main`:
 
 1. **ritz1's known-failure list is empty**: **done.**
    `known-failures/` has no `regression` ritz1 entries
@@ -1620,6 +1409,10 @@ Done when all five hold on `main`:
 5. **ritzlib is proper Ritz, not "C in Ritz's clothing"**: public APIs take
    slices, `String`, `Option`/`Result` and structs, not raw `*u8`/`**u8` and
    out-pointers.
+6. **ritz1 is idiomatic Ritz** (M1.5 #4695): no `emit_str` / `*u8` text API
+   in ritz1's emitter, `c""` only at interop, arena-backed output, and the
+   down-only ratchet at its floor. Pattern slice #4696, structure #4697,
+   then #73.
 
 ### Where to start: ritzlib basics
 

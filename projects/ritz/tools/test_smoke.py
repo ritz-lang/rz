@@ -438,10 +438,10 @@ def test_run_gate_runs_smoke_before_ci_local():
 def test_rz_iterate_briefing_asks_for_smoke_before_gate():
     """AGAST #4580: a room runs smoke-plan.sh (smoke first, then its
     subsystems' targets) before REAP; a full room gate is optional and comes
-    after it in the briefing."""
-    text = (REPO_ROOT / ".claude" / "skills" / "rz-iterate" / "SKILL.md").read_text()
-    brief_at = text.index("### The briefing (send verbatim")
-    check_at = text.index("**Smoke-check your subsystems, in full**", brief_at)
+    after it in ROOM.md."""
+    # The room's rules moved from the briefing to ROOM.md (AGAST #4698).
+    text = (REPO_ROOT / ".claude" / "skills" / "rz-iterate" / "ROOM.md").read_text()
+    check_at = text.index("**Smoke-check your subsystems, in full**")
     run_at = text.index("smoke-plan.sh run", check_at)
     gate_at = text.index("run-gate.sh", check_at)
     assert run_at < gate_at

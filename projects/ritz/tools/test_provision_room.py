@@ -385,10 +385,13 @@ def test_room_unit_restart_self(tmp_path: Path):
 # asking.  So the fix is the briefing; this pins it.
 
 SKILL = REPO / ".claude" / "skills" / "rz-iterate" / "SKILL.md"
+# AGAST #4698: the standing room rules left the briefing for ROOM.md, which
+# every room has in its worktree; the briefing itself is a short template.
+ROOM = SKILL.parent / "ROOM.md"
 
 
-def _briefing_paragraph(head: str) -> str:
-    text = SKILL.read_text()
+def _briefing_paragraph(head: str, path: Path = SKILL) -> str:
+    text = path.read_text()
     at = text.index(head)
     end = text.find("\n\n", at)
     return text[at : end if end >= 0 else len(text)]
@@ -396,7 +399,7 @@ def _briefing_paragraph(head: str) -> str:
 
 @pytest.mark.unit
 def test_briefing_tells_rooms_to_script_rm_plus_background_kill():
-    para = _briefing_paragraph("**Writing under `.claude/` asks a human**")
+    para = _briefing_paragraph("**Writing under `.claude/` asks a human**", ROOM)
     assert "#4215" in para
     # The trigger, named so a room recognises it ...
     assert "rm -rf" in para and "kill" in para and "&" in para
@@ -424,12 +427,13 @@ def test_briefing_says_spawn_does_not_create_tmpdir_dropin():
 
 
 @pytest.mark.unit
-def test_briefing_says_fleet_runs_default_harness_with_bettercomp_config():
+def test_briefing_says_fleet_runs_default_harness_host_decides_config():
     """Aaron, 2026-11-23 (AGAST #4569, replacing #4476's DeepSeek pin):
-    rooms run the default harness and model, with no harness drop-in, and
-    every room's room.env carries CLAUDE_CONFIG_DIR for the bettercomp
-    config. The three places a stale DeepSeek pin hides are named so a
-    room stuck on `unrecognized_model` can be cleared."""
+    rooms run the default harness and model, with no harness drop-in.
+    Since 2026-11-24 23:09Z each host's adele.env decides CLAUDE_CONFIG_DIR
+    (AGAST #4698), so there is no fleet-wide bettercomp rule. The three
+    places a stale DeepSeek pin hides are named so a room stuck on
+    `unrecognized_model` can be cleared."""
     para = _briefing_paragraph("**Fleet model")
     flat = " ".join(para.split()).lower()
     # Default harness/model: no flags, no drop-in, no model= on a SPAWN.
@@ -439,9 +443,12 @@ def test_briefing_says_fleet_runs_default_harness_with_bettercomp_config():
     assert "90-adele-deepseek.conf" in flat
     assert "95-adele-harness.conf" in flat
     assert "model=" in flat
-    # The config dir every room must carry, and where it goes.
-    assert "claude_config_dir=/home/aaron/.claude-bettercomp" in flat
-    assert "room.env" in flat
+    # The host decides the config dir: huburght unset, omegalisk bettercomp.
+    assert "each host's `~/.config/adele/adele.env` decides `claude_config_dir`" in flat
+    assert "huburght it is unset" in flat
+    assert "omegalisk rooms get `claude_config_dir=/home/aaron/.claude-bettercomp`" in flat
+    # The retired fleet-wide rule must not creep back.
+    assert "**must** have" not in flat
     # The three hiding places of a stale DeepSeek pin.
     assert "room.env" in flat and "drop-in" in flat and "rooms.json" in flat
     assert "clear all three" in flat
@@ -451,12 +458,9 @@ def test_briefing_says_fleet_runs_default_harness_with_bettercomp_config():
 def test_briefing_says_budget_only_gate_verdict_is_terminal():
     """AGAST #4423: a budget-only verdict is final, not a reason to re-queue."""
     text = SKILL.read_text()
-    # The briefing template (fenced block through the remote additions).
-    brief_at = text.index("### The briefing (send verbatim")
-    brief_end = text.index("**Remote additions to the briefing**", brief_at)
-    briefing = text[brief_at:brief_end]
+    # The room's rules (ROOM.md, AGAST #4698).
     # Normalise the prose: it is hard-wrapped, so phrases straddle lines.
-    flat = " ".join(briefing.split())
+    flat = " ".join(ROOM.read_text().split())
     # The terminal case, stated next to the exit-124 rule it is confused with.
     assert "budget-only" in flat
     assert "terminal" in flat
@@ -474,11 +478,9 @@ def test_briefing_bans_machine_wide_kills_and_direct_ci_local():
     """AGAST #4468: the full suite runs only through run-gate.sh, and a room
     may stop only the PIDs it spawned -- never pkill -f or a negative PGID."""
     text = SKILL.read_text()
-    # 1. The briefing template, step 6, where the gate is explained.
-    brief_at = text.index("### The briefing (send verbatim")
-    brief_end = text.index("**Remote additions to the briefing**", brief_at)
-    # Normalise the hard-wrapped prose so phrases can straddle lines.
-    flat = " ".join(text[brief_at:brief_end].split())
+    # 1. The room's rules (ROOM.md, AGAST #4698), step 6, where the gate is
+    # explained.  Normalise the hard-wrapped prose so phrases can straddle lines.
+    flat = " ".join(ROOM.read_text().split())
     # Gate-slot-only builds: no hand-started ci_local.py/make ci-local.
     assert "only through `run-gate.sh`" in flat
     assert "ci_local.py" in flat
@@ -536,9 +538,7 @@ def test_briefing_says_write_ritz_not_c():
     so the 40-odd "step N" references to the later steps stay true.
     """
     text = SKILL.read_text()
-    brief_at = text.index("### The briefing (send verbatim")
-    brief_end = text.index("**Remote additions to the briefing**", brief_at)
-    briefing = text[brief_at:brief_end]
+    briefing = ROOM.read_text()  # the room's rules (AGAST #4698)
     step2 = briefing.index("2. **Test first.**")
     step3 = briefing.index("3. **Subagents (Agent tool)")
     at = briefing.index("2a. **Write Ritz, not C.**")
@@ -556,3 +556,32 @@ def test_briefing_says_write_ritz_not_c():
     assert 'added `c"`' in reap
     assert "interop boundary" in reap
     assert "Bounce any added literal outside an interop boundary" in reap
+
+
+@pytest.mark.unit
+def test_briefing_template_is_at_most_150_words_and_points_at_room_md():
+    """AGAST #4698: the briefing sent to every room (and inside every host
+    SPAWN) carries only what changes per ticket; the standing rules are in
+    ROOM.md, which the room reads from its own worktree."""
+    text = SKILL.read_text()
+    at = text.index("### The briefing (send verbatim")
+    start = text.index("```markdown\n", at) + len("```markdown\n")
+    end = text.index("\n```\n", start)
+    template = text[start:end]
+    assert template.startswith("## #<id> <title>")
+    words = len(template.split())
+    assert words <= 150, words
+    assert ".claude/skills/rz-iterate/ROOM.md" in template
+    assert "claim <claim name>" in template and "callback rz" in template
+    assert "rz-train/<tail12>" in template
+    # ROOM.md carries the rules the briefing used to: steps 0-9 (with 2a),
+    # the self-restart, the never-do list, remote and spot hosts.
+    room = ROOM.read_text()
+    for step in ["0.", "1.", "2.", "2a.", "3.", "4.", "5.", "6.", "7.", "8.", "9."]:
+        assert f"\n{step} **" in room, step
+    for head in ["**Never end a turn with work pending:**",
+                 "restart-self", "**Never** check out or push `main`",
+                 "## Remote host", "## Spot host"]:
+        assert head in room, head
+    # A "Messages" rule for agent-to-agent traffic stays in the skill.
+    assert "### Messages" in text

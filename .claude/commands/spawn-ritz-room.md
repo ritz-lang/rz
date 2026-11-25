@@ -137,69 +137,11 @@ Also: `git fetch origin && git rebase origin/main` to ensure we're on latest.
 
 7. **The AGAST task is already claimed** (step 1). Don't claim it again.
 
-8. **Send the briefing** with verification commands and merge rules:
-
-   ````markdown
-   ## Task Briefing
-
-   **{task_title}**
-
-   {task_description}
-
-   | Parameter | Value |
-   |-----------|-------|
-   | AGAST Task | `#{task_id}` |
-   | Branch | `ritz-task-{id}` |
-   | Worktree | `~/dev/ritz-lang/rz-task-{id}` |
-   | Monorepo | `~/dev/ritz-lang/rz` (DO NOT modify) |
-   | Compiler | `projects/ritz/ritz0/` |
-   | Model | `{model}` |
-
-   ---
-
-   ### Verification
-
-   Before signaling completion, run these commands and confirm all pass:
-
-   ```bash
-   cd ~/dev/ritz-lang/rz-task-{id}/projects/ritz/ritz0
-   python -m pytest -x -q
-   ```
-
-   Do NOT send the completion callback until every command exits 0.
-
-   ---
-
-   ### DO NOT self-merge
-
-   **You must NOT merge into main, push to main, or clean up your own worktree.**
-   Your job ends when you commit on YOUR branch and send the callback below.
-   The parent room (`rz`) orchestrates all merges, rebases, and cleanup.
-
-   Do NOT:
-   - `git checkout main` or `git merge` into main
-   - `git push origin main`
-   - `git worktree remove`
-   - `systemctl --user stop/disable` your own unit
-   - `git branch -D`
-
-   ### On Completion
-
-   When all work is done and tests pass, send a callback:
-
-   ```
-   mcp__adele-context__send_room_message(
-       room_id="rz",
-       message="REAP ritz-task-{id} — worktree ~/dev/ritz-lang/rz-task-{id} ready.",
-       sender_name="ritz-task-{id}",
-       ask_claude=True
-   )
-   ```
-
-   Do NOT complete the AGAST task: `rz` closes it once your commit is on
-   `main`. The only exception is REAP `none` (already fixed on `main`), where
-   you `complete_task` with the evidence and commit nothing more.
-   ````
+8. **Send the briefing**: the short template in
+   `.claude/skills/rz-iterate/SKILL.md` ("### The briefing"), at most 150
+   words. The standing rules (verification, REAP line, never self-merge)
+   are in `.claude/skills/rz-iterate/ROOM.md`, which the room reads from
+   its own worktree; don't paste them.
 
    Send with `ask_claude=True`:
    ```
