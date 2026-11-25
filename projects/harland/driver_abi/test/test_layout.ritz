@@ -1,0 +1,269 @@
+# Harland driver ABI layout (AGAST #4718)
+#
+# The ring-1 driver, the kernel and a later Linux port share these bytes
+# (docs/RING1_DRIVER.md sections 5, 6, "Wait and notify" and 7). Each test
+# pins sizeof and every field offset against the doc's tables, so a field
+# added, dropped, resized or re-padded fails here rather than on a boot.
+# The pads are hand-written until [[align(64)]] exists (decision D5); when
+# it lands and the pads come out, these tests pass unchanged.
+#
+# Offsets are taken from a live global: &field - &struct.
+
+import driver_abi.frame_ring { FrameDesc, SpscCtrl, FRAME_RING_CAP, FRAME_RING_MASK, FRAME_MAX, FRAME_F_NONE, FRAME_ARENA_SIZE, FRAME_REGION_SIZE, FRAME_RX_CTRL_OFF, FRAME_TX_CTRL_OFF, FRAME_UNUSED_OFF, FRAME_ADVISORY_OFF, FRAME_RX_DESC_OFF, FRAME_TX_DESC_OFF, FRAME_RX_ARENA_OFF, FRAME_TX_ARENA_OFF, CACHE_LINE }
+import driver_abi.wait { WaitSource, WaitEvent, WaitRequest, EVENT_DATA, EVENT_SPACE, EVENT_PEER_CLOSE, EVENT_DRIVER_GONE, EVENT_LINK, EVENT_RESERVED_32, EVENT_ATTACH, EVENT_USER_MASK, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS, SHM_DETACH_TIMEOUT_MS }
+import driver_abi.dma { DmaAlloc, DMA_ALLOC_MAX }
+import driver_abi.link { NetInfo, LINK_INFO_OFF, LINK_SEQ_OFF, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, NETINFO_MTU_MAX, NETDEV_TYPE_VIRTIO, ETH_HEADER_LEN }
+
+var g_desc: FrameDesc
+var g_ctrl: SpscCtrl
+var g_src: WaitSource
+var g_ev: WaitEvent
+var g_req: WaitRequest
+var g_dma: DmaAlloc
+var g_net: NetInfo
+
+fn off(field: u64, base: u64) -> u64
+    return field - base
+
+# ---------------------------------------------------------------------------
+# Section 6: frame ring
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_frame_desc_layout() -> i32
+    # 16 bytes, so 256 descriptors are exactly one page.
+    if sizeof(FrameDesc) != 16
+        return 1
+    let b: u64 = @g_desc as u64
+    if off(@g_desc.length as u64, b) != 0
+        return 2
+    if off(@g_desc.flags as u64, b) != 4
+        return 3
+    if off(@g_desc.arena_off as u64, b) != 8
+        return 4
+    if off(@g_desc._pad as u64, b) != 12
+        return 5
+    return 0
+
+[[test]]
+fn test_spsc_ctrl_layout() -> i32
+    # Three 64-byte lines: write_idx, read_idx, then the u32 wake word.
+    if CACHE_LINE != 64
+        return 1
+    if sizeof(SpscCtrl) != 0xC0
+        return 2
+    let b: u64 = @g_ctrl as u64
+    if off(@g_ctrl.write_idx as u64, b) != 0
+        return 3
+    if off(@g_ctrl._pad_w as u64, b) != 8
+        return 4
+    if off(@g_ctrl.read_idx as u64, b) != 0x40
+        return 5
+    if off(@g_ctrl._pad_r as u64, b) != 0x48
+        return 6
+    if off(@g_ctrl.wake as u64, b) != 0x80
+        return 7
+    if off(@g_ctrl._pad_k as u64, b) != 0x84
+        return 8
+    # wake is the Linux futex word: a u32, not a u64.
+    if (sizeof(u32) as u64) != off(@g_ctrl._pad_k as u64, @g_ctrl.wake as u64)
+        return 9
+    return 0
+
+[[test]]
+fn test_frame_constants() -> i32
+    if FRAME_RING_CAP != 256 or FRAME_RING_MASK != 255
+        return 1
+    # A power of two, so the slot is seq & mask.
+    if (FRAME_RING_CAP & FRAME_RING_MASK) != 0
+        return 2
+    if FRAME_MAX != 2048
+        return 3
+    if FRAME_F_NONE != 0
+        return 4
+    if FRAME_ARENA_SIZE != 524288 or FRAME_ARENA_SIZE != FRAME_RING_CAP * FRAME_MAX
+        return 5
+    return 0
+
+[[test]]
+fn test_frame_region_table() -> i32
+    # The section 6 region table, offset by offset.
+    if FRAME_RX_CTRL_OFF != 0x0000
+        return 1
+    if FRAME_TX_CTRL_OFF != 0x0100
+        return 2
+    if FRAME_UNUSED_OFF != 0x0200
+        return 3
+    if FRAME_ADVISORY_OFF != 0x0300
+        return 4
+    if FRAME_RX_DESC_OFF != 0x1000
+        return 5
+    if FRAME_TX_DESC_OFF != 0x2000
+        return 6
+    if FRAME_RX_ARENA_OFF != 0x3000
+        return 7
+    if FRAME_TX_ARENA_OFF != 0x83000
+        return 8
+    if FRAME_REGION_SIZE != 0x103000
+        return 9
+    return 0
+
+[[test]]
+fn test_frame_region_fits_sizeof() -> i32
+    # Each block holds what sizeof says it holds, so a struct that grows
+    # overlaps its neighbour here instead of in a shared page (AGAST #2464).
+    let ctrl: u64 = sizeof(SpscCtrl) as u64
+    if FRAME_RX_CTRL_OFF + ctrl > FRAME_TX_CTRL_OFF
+        return 1
+    if FRAME_TX_CTRL_OFF + ctrl > FRAME_UNUSED_OFF
+        return 2
+    let ring: u64 = FRAME_RING_CAP * (sizeof(FrameDesc) as u64)
+    if ring != 4096
+        return 3
+    if FRAME_RX_DESC_OFF + ring != FRAME_TX_DESC_OFF
+        return 4
+    if FRAME_TX_DESC_OFF + ring != FRAME_RX_ARENA_OFF
+        return 5
+    if FRAME_RX_ARENA_OFF + FRAME_ARENA_SIZE != FRAME_TX_ARENA_OFF
+        return 6
+    if FRAME_TX_ARENA_OFF + FRAME_ARENA_SIZE != FRAME_REGION_SIZE
+        return 7
+    return 0
+
+# ---------------------------------------------------------------------------
+# Wait and notify
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_wait_source_layout() -> i32
+    if sizeof(WaitSource) != 16
+        return 1
+    let b: u64 = @g_src as u64
+    if off(@g_src.handle as u64, b) != 0
+        return 2
+    if off(@g_src.mask as u64, b) != 8
+        return 3
+    if off(@g_src._pad as u64, b) != 12
+        return 4
+    return 0
+
+[[test]]
+fn test_wait_event_layout() -> i32
+    if sizeof(WaitEvent) != 16
+        return 1
+    let b: u64 = @g_ev as u64
+    if off(@g_ev.handle as u64, b) != 0
+        return 2
+    if off(@g_ev.bits as u64, b) != 8
+        return 3
+    if off(@g_ev._pad as u64, b) != 12
+        return 4
+    return 0
+
+[[test]]
+fn test_wait_request_layout() -> i32
+    if sizeof(WaitRequest) != 40
+        return 1
+    let b: u64 = @g_req as u64
+    if off(@g_req.sources as u64, b) != 0
+        return 2
+    if off(@g_req.source_count as u64, b) != 8
+        return 3
+    if off(@g_req.out_cap as u64, b) != 12
+        return 4
+    if off(@g_req.out as u64, b) != 16
+        return 5
+    if off(@g_req.deadline as u64, b) != 24
+        return 6
+    if off(@g_req.out_count as u64, b) != 32
+        return 7
+    if off(@g_req._pad as u64, b) != 36
+        return 8
+    return 0
+
+[[test]]
+fn test_event_bits() -> i32
+    if EVENT_DATA != 1 or EVENT_SPACE != 2 or EVENT_PEER_CLOSE != 4
+        return 1
+    if EVENT_DRIVER_GONE != 8 or EVENT_LINK != 16 or EVENT_ATTACH != 64
+        return 2
+    # 32 is reserved, not an ack, and is no defined event.
+    if EVENT_RESERVED_32 != 32
+        return 3
+    let defined: u32 = EVENT_DATA | EVENT_SPACE | EVENT_PEER_CLOSE | EVENT_DRIVER_GONE | EVENT_LINK | EVENT_ATTACH
+    if (defined & EVENT_RESERVED_32) != 0
+        return 4
+    # Userspace ShmNotify may post DATA and SPACE only.
+    if EVENT_USER_MASK != (EVENT_DATA | EVENT_SPACE)
+        return 5
+    return 0
+
+[[test]]
+fn test_wait_constants() -> i32
+    if WAIT_SOURCE_CAP != 8 or WAIT_OUT_CAP != 8
+        return 1
+    if DEVICE_WAIT_MS != 100
+        return 2
+    if SHM_DETACH_TIMEOUT_MS != 1000
+        return 3
+    return 0
+
+# ---------------------------------------------------------------------------
+# Section 5: DmaAlloc
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_dma_alloc_layout() -> i32
+    if sizeof(DmaAlloc) != 16
+        return 1
+    let b: u64 = @g_dma as u64
+    if off(@g_dma.iova as u64, b) != 0
+        return 2
+    if off(@g_dma.size as u64, b) != 8
+        return 3
+    # size is a u64: a u32 would keep offset 8 behind the tail padding.
+    let wide: u64 = 1 << 40
+    g_dma.size = wide
+    if g_dma.size != wide
+        return 5
+    # DrvDmaAlloc rejects any size above 4 MiB.
+    if DMA_ALLOC_MAX != 4 * 1024 * 1024
+        return 4
+    return 0
+
+# ---------------------------------------------------------------------------
+# Section 7: link snapshot
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_net_info_layout() -> i32
+    if sizeof(NetInfo) != 12
+        return 1
+    let b: u64 = @g_net as u64
+    if off(@g_net.mac as u64, b) != 0
+        return 2
+    if off(@g_net.link_up as u64, b) != 6
+        return 3
+    if off(@g_net.device_type as u64, b) != 7
+        return 4
+    if off(@g_net.mtu as u64, b) != 8
+        return 5
+    return 0
+
+[[test]]
+fn test_link_page() -> i32
+    # NetInfo at offset 0 of the link object, link_seq at 0x20.
+    if LINK_INFO_OFF != 0 or LINK_SEQ_OFF != 0x20
+        return 1
+    if LINK_INFO_OFF + (sizeof(NetInfo) as u64) > LINK_SEQ_OFF
+        return 2
+    # 0 is unpublished, not a generation; the first stable one is 2.
+    if LINK_SEQ_UNPUBLISHED != 0 or LINK_SEQ_FIRST_STABLE != 2
+        return 3
+    if ETH_HEADER_LEN != 14 or NETINFO_MTU_MAX != 2034
+        return 4
+    if (NETINFO_MTU_MAX as u64) != FRAME_MAX - (ETH_HEADER_LEN as u64)
+        return 5
+    if NETDEV_TYPE_VIRTIO != 1
+        return 6
+    return 0

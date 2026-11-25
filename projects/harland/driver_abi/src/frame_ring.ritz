@@ -1,0 +1,66 @@
+# Harland frame ring ABI (AGAST #4718, docs/RING1_DRIVER.md section 6)
+#
+# The portable SPSC ring between the ring-1 network driver and its consumer
+# (the kernel stack during this slice, the ring-2 service later). Two rings,
+# RX and TX, share one region of FRAME_REGION_SIZE bytes laid out by the
+# FRAME_*_OFF table below. Harland maps it as a ShmObject; Linux as a memfd;
+# Win64 as a pagefile-backed section. The bytes are the contract, so this
+# module imports nothing.
+#
+# These structs are not [[packed]]: packing would delete the cache-line gaps.
+# The pad arrays write out the natural layout so a reader sees the gaps and
+# the Linux and Win64 sides, which do not read a Ritz attribute, get the
+# same bytes. They come out when [[align(64)]] exists (decision D5), and
+# test/test_layout.ritz must then pass unchanged.
+
+# The line x86 and Windows-on-ARM use, and the one Zeus documents.
+pub const CACHE_LINE: u64 = 64
+
+# Ring depth: the virtqueue cap, a power of two. The slot is seq & mask.
+pub const FRAME_RING_CAP: u64 = 256
+pub const FRAME_RING_MASK: u64 = FRAME_RING_CAP - 1
+
+# One frame slot: VIRTIO_NET_RX_BUFFER_SIZE. Covers MTU 1500, the Ethernet
+# header and the virtio-net header the driver strips before publish.
+pub const FRAME_MAX: u64 = 2048
+
+# FrameDesc.flags. A lease-handoff flag is not defined; any other value is a
+# bad slot.
+pub const FRAME_F_NONE: u32 = 0
+
+# Each arena is FRAME_RING_CAP slots of FRAME_MAX bytes.
+pub const FRAME_ARENA_SIZE: u64 = FRAME_RING_CAP * FRAME_MAX
+
+# The frame region. Both controls share page 0; the link record is a
+# separate object (driver_abi.link) and is not in this region.
+pub const FRAME_RX_CTRL_OFF: u64 = 0x0000    # RX SpscCtrl; 0xC0..0xFF unused
+pub const FRAME_TX_CTRL_OFF: u64 = 0x0100    # TX SpscCtrl
+pub const FRAME_UNUSED_OFF: u64 = 0x0200     # unused: not NetInfo, not link_seq
+pub const FRAME_ADVISORY_OFF: u64 = 0x0300   # advisory window/MSI-X list, to 0x1000
+pub const FRAME_RX_DESC_OFF: u64 = 0x1000    # RX FrameDesc[FRAME_RING_CAP]
+pub const FRAME_TX_DESC_OFF: u64 = 0x2000    # TX FrameDesc[FRAME_RING_CAP]
+pub const FRAME_RX_ARENA_OFF: u64 = 0x3000   # RX arena, FRAME_ARENA_SIZE bytes
+pub const FRAME_TX_ARENA_OFF: u64 = 0x83000  # TX arena, FRAME_ARENA_SIZE bytes
+pub const FRAME_REGION_SIZE: u64 = 0x103000  # 1 MiB of arenas plus three pages
+
+# One published frame. The consumer copies this into private memory,
+# validates the copy (arena_off == (seq & FRAME_RING_MASK) * FRAME_MAX,
+# length in 1..=FRAME_MAX, flags == FRAME_F_NONE) and reads the shared
+# descriptor only once.
+pub struct FrameDesc
+    length: u32
+    flags: u32                       # FRAME_F_*
+    arena_off: u32                   # byte offset of the slot in its arena
+    _pad: u32
+
+# One ring's control block. write_idx and read_idx are monotonic u64s on
+# separate lines; each side stores only its own (from a private copy) and
+# loads only the peer's. wake is on a third line and is a u32 because a
+# Linux futex waits on a 32-bit word.
+pub struct SpscCtrl
+    write_idx: u64
+    _pad_w: [56]u8                   # write_idx owns bytes 0..63
+    read_idx: u64
+    _pad_r: [56]u8                   # read_idx owns the next line
+    wake: u32                        # futex word; Harland bumps it too
+    _pad_k: [60]u8                   # the rest of that line
