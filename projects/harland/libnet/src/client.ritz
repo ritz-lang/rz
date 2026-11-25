@@ -1,0 +1,420 @@
+# Harland ring-3 net library (AGAST #4750, docs/RING2_NET.md "Ring-3 app
+# exchange" and "Userspace interface")
+#
+# net_bind, net_send_to, net_recv_from, net_ping and net_close, the five
+# calls the first cutover's ring-3 tools use. Each call is non-blocking:
+# a reply-producing call (net_bind, net_ping, net_close) returns Pending
+# until the matching event has arrived, and the caller is the one who
+# waits (a future ShmWait) and calls again. NetAttach, ShmMap and the
+# actual wait are not this module's concern: it starts from an
+# already-mapped request/event ring pair (ring.app_req_ring,
+# ring.app_ev_ring), which is also what makes it host-testable against a
+# fake service ring with no kernel at all.
+#
+# Errno numbers below are the ones RING2_NET.md names, not ritzlib's
+# userspace Errno (which does not yet carry NoDev, NFile or NoSys): the
+# same small negative constants docs/stack_example/stack.py uses.
+#
+# A handle's queued datagrams: per-handle metadata (QueueMeta: address,
+# port, length) stays a small struct, but the payload bytes live in one
+# flat `[u8]` arena indexed by row (handle slot * APP_DEPTH + queue
+# slot), the way net_abi's own arenas are byte-indexed rather than
+# struct-indexed. Reading one field of a *dynamically indexed array of
+# structs* that embed a 2048-byte array loads the whole struct in ritz0's
+# current codegen (a `load`, then `extractvalue`), and 32 KiB-class
+# aggregates there once crashed clang's instruction selection outright;
+# that is a ritz0/clang limit, not a language rule, so the payload bytes
+# are kept out of any struct that lives in a dynamically indexed array.
+
+import net_abi.app { AppDesc, APP_DEPTH, APP_DEPTH_MASK, APP_SLOT, APP_BIND, APP_SEND_TO, APP_PING, APP_CLOSE, EV_DATAGRAM, EV_PING_REPLY, EV_BOUND, EV_CLOSED, EV_ERROR, MAX_ENDPOINTS, PING_DEADLINE_MS }
+import libnet.ring { AppRing, AppProducer, AppConsumer, AppPublish, AppPoll, AppTake, AppBytes }
+import ritzlib.option
+
+pub const ERRNO_IO: i32 = -5
+pub const ERRNO_BADF: i32 = -9
+pub const ERRNO_EXIST: i32 = -17
+pub const ERRNO_NODEV: i32 = -19
+pub const ERRNO_INVAL: i32 = -22
+pub const ERRNO_NFILE: i32 = -23
+pub const ERRNO_NOSYS: i32 = -38
+
+# MAX_ENDPOINTS (16) * APP_DEPTH (32) rows of queue metadata, one per
+# (handle slot, queue slot) pair. A named const, not MAX_ENDPOINTS *
+# APP_DEPTH written inline, only because the two are different integer
+# types (u32 and u64) and a mixed-type const expression is more trouble
+# than writing the product out; net_abi/test/test_layout.ritz pins both
+# factors against docs/RING2_NET.md, so a drift there fails loudly.
+pub const QUEUE_ROWS: u64 = 512
+# One row's payload slot, so the datagram arena below is QUEUE_ROWS *
+# APP_SLOT bytes: 512 * 2048 = 1 MiB.
+pub const DATAGRAM_ARENA_SIZE: u64 = 1048576
+
+# One queued datagram's header: the peer address, port and payload
+# length. `bytes[0..length]` of the row it belongs to is the payload;
+# see the datagram arena on NetExchange.
+pub struct QueueMeta
+    addr: [4]u8
+    port: u16
+    length: u32
+
+# One queued datagram or one net_ping echo, returned to the caller. The
+# payload itself is copied into the caller's own `@&AppBytes` out
+# parameter, not carried here (see this file's header comment).
+pub struct Datagram
+    addr: [4]u8
+    port: u16
+    length: u32
+
+# One handle's bookkeeping. `handle == 0` means the slot is free: 0 is
+# never a live endpoint (net_abi), so a free-slot scan and a by-handle
+# lookup are the same `find_handle` call. The queued datagrams
+# themselves live in NetExchange.meta/arena, at rows
+# `handle_slot * APP_DEPTH .. + APP_DEPTH`.
+struct HandleQueue
+    handle: u32
+    head: u32                        # next queue slot net_recv_from takes
+    count: u32                       # live entries, 0..=APP_DEPTH
+    drops: u64                       # datagrams dropped for a full queue
+    closing: bool                    # net_close is waiting on this handle
+
+# A decoded reply-producing event (EV_BOUND, EV_PING_REPLY, EV_CLOSED or
+# EV_ERROR), copied out of the event ring once drain() matches it to the
+# outstanding call's id. One instance, not array-indexed, so carrying its
+# payload bytes here is fine.
+struct ReplyEvent
+    kind: u16
+    handle: u32
+    status: i16
+    addr: [4]u8
+    port: u16
+    length: u32
+    bytes: AppBytes
+
+pub enum BindResult
+    Bound(u32)
+    Err(i32)
+    Pending
+
+pub enum SendResult
+    Sent
+    Err(i32)
+    Pending                          # the request ring is full; wait for SPACE and retry
+    BadF
+
+pub enum RecvResult
+    Datagram(Datagram)
+    Empty
+    Err(i32)
+    BadF
+
+pub enum PingResult
+    Reply(Datagram)
+    Err(i32)
+    Pending
+
+pub enum CloseResult
+    Closed
+    Err(i32)
+    Pending
+    BadF
+
+# One app's attachment: the two rings plus every bit of state the five
+# calls share. One outstanding reply-producing call at a time (net_abi:
+# "One attachment has one outstanding reply"); `outstanding_id` is 0 when
+# none is in flight. `pending_reply` is the event drain() found for it,
+# held here until the call that is waiting on it consumes it, so a
+# net_recv_from that drains the ring in between does not lose it.
+pub struct NetExchange
+    req: AppProducer
+    ev: AppConsumer
+    next_id: u32
+    outstanding_id: u32
+    ping_deadline: u64
+    peer_closed: bool
+    pending_reply: Option<ReplyEvent>
+    handles: [MAX_ENDPOINTS]HandleQueue
+    meta: [QUEUE_ROWS]QueueMeta
+    arena: [DATAGRAM_ARENA_SIZE]u8
+
+impl NetExchange
+    # Reset an attachment onto an already-mapped region's request and
+    # event rings. Every handle slot starts free; nothing here is
+    # resized or reallocated by any later call (AGAST #4750: "bind /
+    # receive / close repeatedly doesn't grow state"). `self` is a `var`
+    # the caller already owns (a global, on the boot_abi / driver_abi
+    # pattern of a zero-initialized static): NetExchange is too big to
+    # construct as a literal, since a fill literal for `arena` would be
+    # over a million individual byte stores, not a memset. Only the
+    # scalar bookkeeping fields are set; `meta` and `arena` content is
+    # never read while a handle's `count` is 0, so both are left exactly
+    # as the caller's storage already had them.
+    pub fn init(self: @&NetExchange, req_ring: AppRing, ev_ring: AppRing)
+        self.req = AppProducer.new(req_ring)
+        self.ev = AppConsumer.new(ev_ring)
+        self.next_id = 1
+        self.outstanding_id = 0
+        self.ping_deadline = 0
+        self.peer_closed = false
+        self.pending_reply = None
+        for i in 0..MAX_ENDPOINTS as u64
+            self.handles[i].handle = 0
+            self.handles[i].head = 0
+            self.handles[i].count = 0
+            self.handles[i].drops = 0
+            self.handles[i].closing = false
+
+    # The slot holding `handle`, or (passing 0) the first free slot: 0 is
+    # never a live handle, so both lookups are this one scan.
+    fn find_handle(self: @NetExchange, handle: u32) -> Option<u32>
+        for i in 0..MAX_ENDPOINTS as u64
+            if self.handles[i].handle == handle
+                return Some(i as u32)
+        None
+
+    # The number of drops recorded for `handle`'s datagram queue, or 0
+    # for a handle this attachment does not hold. Exposed for tests and
+    # for an app that wants to report loss.
+    pub fn drops(self: @NetExchange, handle: u32) -> u64
+        match self.find_handle(handle)
+            Some(idx) => self.handles[idx as u64].drops
+            None => 0
+
+    # A fresh, non-zero request id. 0 stays "not a request id" (net_abi).
+    fn alloc_id(self: @&NetExchange) -> u32
+        let id = self.next_id
+        self.next_id += 1
+        if self.next_id == 0
+            self.next_id = 1
+        id
+
+    # Route one decoded EV_DATAGRAM to its handle's queue, dropping and
+    # counting it when that queue is full or the handle does not exist
+    # (a stale datagram for a handle this attachment has since closed or
+    # never held). `len` is the validated payload length already copied
+    # into `bytes`.
+    fn route_datagram(self: @&NetExchange, d: AppDesc, bytes: @AppBytes, len: u32)
+        match self.find_handle(d.handle)
+            None => pass
+            Some(idx) =>
+                let hidx = idx as u64
+                if self.handles[hidx].closing
+                    pass          # net_abi: discarded while net_close waits, not queued
+                else if self.handles[hidx].count == APP_DEPTH as u32
+                    self.handles[hidx].drops += 1
+                else
+                    let slot = ((self.handles[hidx].head + self.handles[hidx].count) as u64) & APP_DEPTH_MASK
+                    let row = hidx * APP_DEPTH + slot
+                    self.meta[row].addr = d.addr
+                    self.meta[row].port = d.port
+                    self.meta[row].length = len
+                    let base = row * APP_SLOT
+                    for i in 0..len as u64
+                        self.arena[base + i] = bytes[i]
+                    self.handles[hidx].count += 1
+
+    # Copy every event off the ring that is available right now. A
+    # datagram is routed to its handle's queue; a reply-producing event
+    # that matches the outstanding id is cached in `pending_reply` and
+    # stops the drain (there is at most one to find); anything else (no
+    # outstanding call, or a stray id) is dropped. Returns true once
+    # `pending_reply` holds the awaited reply, whether this call found it
+    # or an earlier one did.
+    fn drain(self: @&NetExchange) -> bool
+        if self.pending_reply.is_some()
+            return true
+        var dst: AppBytes = [0; 2048]       # APP_SLOT written out; see init()'s note
+        loop
+            match self.ev.poll()
+                AppPoll.Empty => return false
+                AppPoll.Close(_) =>
+                    self.peer_closed = true
+                    return false
+                AppPoll.Ready(desc) =>
+                    match self.ev.take(desc, @&dst)
+                        AppTake.Rejected(_) => continue
+                        AppTake.Close(_) =>
+                            self.peer_closed = true
+                            return false
+                        AppTake.Desc(d, len) =>
+                            if d.kind == EV_DATAGRAM
+                                self.route_datagram(d, @dst, len)
+                            else if self.outstanding_id != 0 and d.id == self.outstanding_id
+                                self.pending_reply = Some(ReplyEvent {
+                                    kind: d.kind, handle: d.handle, status: d.status,
+                                    addr: d.addr, port: d.port, length: len, bytes: dst
+                                })
+                                return true
+
+    # `net_bind(port)`: publish APP_BIND once, then drain until EV_BOUND
+    # or EV_ERROR for it arrives. Port 0 asks the service to assign one;
+    # 67 and 68 (DHCP) answer Errno.Exist. Returns Pending while the
+    # request ring is full or no answer has arrived yet; the caller
+    # waits and calls again with the same arguments.
+    pub fn net_bind(self: @&NetExchange, port: u16) -> BindResult
+        if self.peer_closed
+            return BindResult.Err(ERRNO_IO)
+        if self.outstanding_id == 0
+            let id = self.alloc_id()
+            let addr: [4]u8 = [0, 0, 0, 0]
+            let empty: [0]u8 = []
+            match self.req.publish(APP_BIND, id, 0, port, 0, addr, @empty)
+                AppPublish.Done => pass
+                AppPublish.Full => return BindResult.Pending
+                AppPublish.BadLength => return BindResult.Err(ERRNO_INVAL)
+                AppPublish.Close(_) =>
+                    self.peer_closed = true
+                    return BindResult.Err(ERRNO_IO)
+            self.outstanding_id = id
+        if not self.drain()
+            return BindResult.Pending
+        let ev = match self.pending_reply
+            Some(e) => e
+            None => return BindResult.Pending
+        self.pending_reply = None
+        self.outstanding_id = 0
+        if ev.kind == EV_BOUND
+            match self.find_handle(0)
+                None => BindResult.Err(ERRNO_NFILE)
+                Some(idx) =>
+                    self.handles[idx as u64].handle = ev.handle
+                    self.handles[idx as u64].head = 0
+                    self.handles[idx as u64].count = 0
+                    self.handles[idx as u64].drops = 0
+                    self.handles[idx as u64].closing = false
+                    BindResult.Bound(ev.handle)
+        else if ev.kind == EV_ERROR
+            BindResult.Err(ev.status as i32)
+        else
+            BindResult.Err(ERRNO_IO)
+
+    # `net_send_to(handle, bytes, address, port)`: reject what the
+    # service would, then publish APP_SEND_TO. Returns once the request
+    # is on the ring; it does not wait for an event. `link_mtu` is the
+    # caller's current `NetInfo` MTU, or None for NetInfo's NoDev.
+    pub fn net_send_to(self: @&NetExchange, handle: u32, bytes: [u8], addr: [4]u8, port: u16, link_mtu: Option<u32>) -> SendResult
+        if self.peer_closed
+            return SendResult.Err(ERRNO_IO)
+        match self.find_handle(handle)
+            None => return SendResult.BadF
+            Some(_) => pass
+        let mtu = match link_mtu
+            None => return SendResult.Err(ERRNO_NODEV)
+            Some(m) => m
+        if bytes.len as u64 > APP_SLOT
+            return SendResult.Err(ERRNO_INVAL)
+        if mtu < 28 or bytes.len as u64 > (mtu as u64 - 28)
+            return SendResult.Err(ERRNO_INVAL)
+        let id = self.alloc_id()
+        match self.req.publish(APP_SEND_TO, id, handle, port, 0, addr, bytes)
+            AppPublish.Done => SendResult.Sent
+            AppPublish.Full => SendResult.Pending
+            AppPublish.BadLength => SendResult.Err(ERRNO_INVAL)
+            AppPublish.Close(_) =>
+                self.peer_closed = true
+                SendResult.Err(ERRNO_IO)
+
+    # `net_recv_from(handle)`: publishes nothing. Drains whatever the
+    # event ring holds right now (so a datagram that arrived with no
+    # reply call in flight still reaches its handle's queue), then pops
+    # that handle's oldest queued datagram into `dst`.
+    pub fn net_recv_from(self: @&NetExchange, handle: u32, dst: @&AppBytes) -> RecvResult
+        let idx = match self.find_handle(handle)
+            None => return RecvResult.BadF
+            Some(i) => i
+        self.drain()
+        if self.peer_closed
+            return RecvResult.Err(ERRNO_IO)
+        let hidx = idx as u64
+        if self.handles[hidx].count == 0
+            return RecvResult.Empty
+        let slot = self.handles[hidx].head as u64
+        let row = hidx * APP_DEPTH + slot
+        let m = self.meta[row]
+        let base = row * APP_SLOT
+        for i in 0..m.length as u64
+            dst[i] = self.arena[base + i]
+        self.handles[hidx].head = (self.handles[hidx].head + 1) & (APP_DEPTH_MASK as u32)
+        self.handles[hidx].count -= 1
+        RecvResult.Datagram(Datagram { addr: m.addr, port: m.port, length: m.length })
+
+    # `net_ping(address, payload)`: publish APP_PING once, then drain
+    # until EV_PING_REPLY, EV_ERROR, or `PING_DEADLINE_MS` has elapsed
+    # (`now` is the caller's clock each call, so this stays host- and
+    # kernel-testable alike). The echoed bytes land in `dst`.
+    pub fn net_ping(self: @&NetExchange, addr: [4]u8, payload: [u8], now: u64, dst: @&AppBytes) -> PingResult
+        if self.peer_closed
+            return PingResult.Err(ERRNO_IO)
+        if self.outstanding_id == 0
+            let id = self.alloc_id()
+            match self.req.publish(APP_PING, id, 0, 0, 0, addr, payload)
+                AppPublish.Done => pass
+                AppPublish.Full => return PingResult.Pending
+                AppPublish.BadLength => return PingResult.Err(ERRNO_INVAL)
+                AppPublish.Close(_) =>
+                    self.peer_closed = true
+                    return PingResult.Err(ERRNO_IO)
+            self.outstanding_id = id
+            self.ping_deadline = now + PING_DEADLINE_MS
+        if self.drain()
+            let ev = match self.pending_reply
+                Some(e) => e
+                None => return PingResult.Pending
+            self.pending_reply = None
+            self.outstanding_id = 0
+            if ev.kind == EV_PING_REPLY
+                for i in 0..ev.length as u64
+                    dst[i] = ev.bytes[i]
+                return PingResult.Reply(Datagram { addr: ev.addr, port: ev.port, length: ev.length })
+            else if ev.kind == EV_ERROR
+                return PingResult.Err(ev.status as i32)
+            else
+                return PingResult.Err(ERRNO_IO)
+        if now >= self.ping_deadline
+            self.outstanding_id = 0
+            return PingResult.Err(ERRNO_IO)
+        PingResult.Pending
+
+    # `net_close(handle)`: publish APP_CLOSE once, then drain until
+    # EV_CLOSED for it arrives. On EV_CLOSED the handle's queue and drop
+    # counter are discarded and the slot frees for reuse; a later call on
+    # this handle is Errno.BadF either way (the slot stays freed, not
+    # reused mid-wait).
+    pub fn net_close(self: @&NetExchange, handle: u32) -> CloseResult
+        if self.peer_closed
+            return CloseResult.Err(ERRNO_IO)
+        let idx = match self.find_handle(handle)
+            None => return CloseResult.BadF
+            Some(i) => i
+        let hidx = idx as u64
+        if self.outstanding_id == 0 and not self.handles[hidx].closing
+            let id = self.alloc_id()
+            let addr: [4]u8 = [0, 0, 0, 0]
+            let empty: [0]u8 = []
+            match self.req.publish(APP_CLOSE, id, handle, 0, 0, addr, @empty)
+                AppPublish.Done => pass
+                AppPublish.Full => return CloseResult.Pending
+                AppPublish.BadLength => return CloseResult.Err(ERRNO_INVAL)
+                AppPublish.Close(_) =>
+                    self.peer_closed = true
+                    return CloseResult.Err(ERRNO_IO)
+            self.outstanding_id = id
+            self.handles[hidx].closing = true
+        if not self.drain()
+            return CloseResult.Pending
+        let ev = match self.pending_reply
+            Some(e) => e
+            None => return CloseResult.Pending
+        self.pending_reply = None
+        self.outstanding_id = 0
+        if ev.kind == EV_CLOSED
+            self.handles[hidx].handle = 0
+            self.handles[hidx].head = 0
+            self.handles[hidx].count = 0
+            self.handles[hidx].drops = 0
+            self.handles[hidx].closing = false
+            CloseResult.Closed
+        else if ev.kind == EV_ERROR
+            self.handles[hidx].closing = false
+            CloseResult.Err(ev.status as i32)
+        else
+            CloseResult.Err(ERRNO_IO)

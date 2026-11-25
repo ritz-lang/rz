@@ -1,0 +1,225 @@
+# Harland app-exchange SPSC protocol (AGAST #4750, docs/RING2_NET.md
+# "Ring-3 app exchange")
+#
+# The producer and consumer halves of one app-exchange ring, over the bytes
+# net_abi.app lays out: a SpscCtrl, APP_DEPTH AppDescs and an arena of
+# APP_DEPTH slots of APP_SLOT bytes. This is driver_abi.spsc's shape one
+# layer up: an AppDesc carries a request or event's header fields (kind,
+# id, handle, port, status, addr) as well as the payload length and arena
+# offset, so stage/take move the header and the payload together. The two
+# control blocks are driver_abi's SpscCtrl bytes (net_abi/src/app.ritz's
+# comment), so this module reuses that type instead of a second copy of
+# it; it does not reuse SpscProducer/SpscConsumer themselves, since those
+# are written for FrameDesc, not AppDesc, and Ritz structs are not generic
+# over a field layout.
+#
+# Each side keeps a private copy of the index it owns, stores only that
+# copy to the shared word and loads only the peer's index, exactly as
+# driver_abi.spsc does; see that module's header for why. This layer never
+# blocks: the caller (libnet.client) decides when to retry a Full publish
+# or an Empty poll, so the actual wait (a future ShmWait) is not this
+# module's concern.
+
+import net_abi.app { AppDesc, APP_DEPTH, APP_DEPTH_MASK, APP_SLOT, APP_F_NONE, APP_REQ_CTRL_OFF, APP_REQ_DESC_OFF, APP_REQ_ARENA_OFF, APP_EV_CTRL_OFF, APP_EV_DESC_OFF, APP_EV_ARENA_OFF }
+import driver_abi.frame_ring { SpscCtrl }
+
+# The AppDescs of one ring, one page (APP_DEPTH * sizeof(AppDesc) == 1024
+# of the 4096 bytes net_abi reserves; the rest stays unused).
+pub type AppDescs = [APP_DEPTH]AppDesc
+# The arena of one ring, APP_ARENA_SIZE bytes.
+pub type AppArena = [APP_DEPTH * APP_SLOT]u8
+# One request or event's private payload bytes.
+pub type AppBytes = [APP_SLOT]u8
+
+# The shared words of one app-exchange ring. Both the request and the
+# event ring use this shape; which side stores write_idx and which stores
+# read_idx is net_abi's "Ring-3 app exchange" table, not this struct's.
+pub struct AppRing
+    ctrl: *SpscCtrl
+    descs: *AppDescs
+    arena: *AppArena
+
+# Why the ring is unusable: the peer's shared index is impossible given
+# ours. The caller treats its attachment as closed; it does not exit.
+pub enum AppClose
+    Backwards                        # occupancy would be negative
+    Overfull                         # occupancy is above APP_DEPTH
+
+# Why the consumer skipped a slot. read_idx still moves past it, so one
+# bad descriptor cannot pin the ring.
+pub enum AppReject
+    Length                           # above APP_SLOT
+    Flags                            # not APP_F_NONE
+    Pad                              # _pad not 0
+    Offset                           # not (seq & APP_DEPTH_MASK) * APP_SLOT
+
+# What stage and publish did.
+pub enum AppPublish
+    Done
+    # APP_DEPTH slots are unreleased; nothing is written. The caller
+    # waits for SPACE and retries; a full ring does not drop the request.
+    Full
+    BadLength                        # payload longer than APP_SLOT
+    Close(AppClose)
+
+# What the consumer's poll saw.
+pub enum AppPoll
+    # The private copy of the descriptor at the private read_idx.
+    Ready(AppDesc)
+    Empty                            # nothing published past our read_idx
+    Close(AppClose)
+
+# What the consumer's take and next did.
+pub enum AppTake
+    # The validated descriptor and the payload length copied into the
+    # caller's AppBytes. read_idx is past this slot.
+    Desc(AppDesc, u32)
+    Rejected(AppReject)               # the slot was bad; read_idx is past it
+    Close(AppClose)
+
+# The arena offset slot `seq` must carry.
+pub fn app_slot_off(seq: u64) -> u64
+    (seq & APP_DEPTH_MASK) * APP_SLOT
+
+# The request ring of an app-exchange region at `region`.
+pub fn app_req_ring(region: u64) -> AppRing
+    AppRing {
+        ctrl: (region + APP_REQ_CTRL_OFF) as *SpscCtrl,
+        descs: (region + APP_REQ_DESC_OFF) as *AppDescs,
+        arena: (region + APP_REQ_ARENA_OFF) as *AppArena
+    }
+
+# The event ring of an app-exchange region at `region`.
+pub fn app_ev_ring(region: u64) -> AppRing
+    AppRing {
+        ctrl: (region + APP_EV_CTRL_OFF) as *SpscCtrl,
+        descs: (region + APP_EV_DESC_OFF) as *AppDescs,
+        arena: (region + APP_EV_ARENA_OFF) as *AppArena
+    }
+
+# Validate a private copy of the descriptor for sequence `seq`. Ok is the
+# validated length; the caller copies exactly that many bytes from the
+# arena offset the copy names, and reads nothing from the shared slot
+# again (net_abi: "A reader copies it once into private memory").
+pub fn app_desc_validate(d: AppDesc, seq: u64) -> Result<u32, AppReject>
+    if d.flags != APP_F_NONE
+        return Err(AppReject.Flags)
+    if d.length as u64 > APP_SLOT
+        return Err(AppReject.Length)
+    if d._pad != 0
+        return Err(AppReject.Pad)
+    if d.arena_off as u64 != app_slot_off(seq)
+        return Err(AppReject.Offset)
+    Ok(d.length)
+
+# The occupancy write - read, or why it is impossible. Compares before it
+# subtracts (Ritz traps on a wrapping subtract).
+fn app_occupancy(write: u64, read: u64) -> Result<u64, AppClose>
+    if write < read
+        return Err(AppClose.Backwards)
+    let used = write - read
+    if used > APP_DEPTH
+        return Err(AppClose.Overfull)
+    Ok(used)
+
+# The producing half. `write` is the private write_idx: the only value
+# ever stored to ctrl.write_idx.
+pub struct AppProducer
+    ring: AppRing
+    write: u64
+    staged: bool                     # slot `write` is written, not published
+
+impl AppProducer
+    # A producer at index 0, the index a zeroed region starts at.
+    pub fn new(ring: AppRing) -> AppProducer
+        AppProducer { ring: ring, write: 0, staged: false }
+
+    # Write one AppDesc and its payload into slot `write` without storing
+    # the index, so the peer cannot see it yet. Loads only the peer's
+    # read_idx. `payload.len` above APP_SLOT fails without touching the
+    # slot or the private write index.
+    pub fn stage(self: @&AppProducer, kind: u16, id: u32, handle: u32, port: u16, status: i16, addr: [4]u8, payload: [u8]) -> AppPublish
+        self.staged = false              # a failed stage leaves nothing to commit
+        if payload.len as u64 > APP_SLOT
+            return AppPublish.BadLength
+        let read = atomic_load(@self.ring.ctrl.read_idx)
+        match app_occupancy(self.write, read)
+            Err(why) => return AppPublish.Close(why)
+            Ok(used) =>
+                if used == APP_DEPTH
+                    return AppPublish.Full
+        let slot = self.write & APP_DEPTH_MASK
+        let off = app_slot_off(self.write)
+        for i in 0..payload.len
+            (*self.ring.arena)[off + i as u64] = payload[i]
+        (*self.ring.descs)[slot] = AppDesc {
+            kind: kind,
+            flags: APP_F_NONE,
+            id: id,
+            handle: handle,
+            port: port,
+            status: status,
+            addr: addr,
+            length: payload.len as u32,
+            arena_off: off as u32,
+            _pad: 0
+        }
+        self.staged = true
+        AppPublish.Done
+
+    # Publish the staged slot: the seq_cst store of the private write_idx
+    # after the plain writes, then the wake word. Returns false, storing
+    # nothing, when no slot is staged.
+    pub fn commit(self: @&AppProducer) -> bool
+        if not self.staged
+            return false
+        self.write += 1
+        self.staged = false
+        atomic_store(@self.ring.ctrl.write_idx, self.write)
+        atomic_fetch_add(@self.ring.ctrl.wake, 1)
+        true
+
+    # stage, then commit when it staged.
+    pub fn publish(self: @&AppProducer, kind: u16, id: u32, handle: u32, port: u16, status: i16, addr: [4]u8, payload: [u8]) -> AppPublish
+        let r = self.stage(kind, id, handle, port, status, addr, payload)
+        if self.staged
+            self.commit()
+        r
+
+# The consuming half. `read` is the private read_idx: the only value ever
+# stored to ctrl.read_idx.
+pub struct AppConsumer
+    ring: AppRing
+    read: u64
+
+impl AppConsumer
+    pub fn new(ring: AppRing) -> AppConsumer
+        AppConsumer { ring: ring, read: 0 }
+
+    # Load the peer's write_idx and, when a slot at the private read_idx
+    # is published, copy its descriptor once. Never reads a slot at or
+    # past the index it loaded. Non-blocking: Empty means nothing is
+    # published right now, not that the caller should wait here.
+    pub fn poll(self: @AppConsumer) -> AppPoll
+        let write = atomic_load(@self.ring.ctrl.write_idx)
+        match app_occupancy(write, self.read)
+            Err(why) => return AppPoll.Close(why)
+            Ok(used) =>
+                if used == 0
+                    return AppPoll.Empty
+        AppPoll.Ready((*self.ring.descs)[self.read & APP_DEPTH_MASK])
+
+    # Validate `desc`, the private copy poll returned for the private
+    # read_idx, and on success copy its validated length from its arena
+    # offset into `dst`. Either way store read_idx past the slot.
+    pub fn take(self: @&AppConsumer, desc: AppDesc, dst: @&AppBytes) -> AppTake
+        let result = match app_desc_validate(desc, self.read)
+            Err(why) => AppTake.Rejected(why)
+            Ok(len) =>
+                let off = desc.arena_off as u64
+                for i in 0..len as u64
+                    dst[i] = (*self.ring.arena)[off + i]
+                AppTake.Desc(desc, len)
+        self.read += 1
+        atomic_store(@self.ring.ctrl.read_idx, self.read)
+        result

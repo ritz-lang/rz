@@ -1,0 +1,213 @@
+# Harland app-exchange SPSC protocol host tests (AGAST #4750)
+#
+# The same shape driver_abi/test/test_spsc.ritz checks for the frame ring,
+# one layer up: a single-stepped publish/take, a full ring that waits for
+# read_idx, and bad descriptors rejected without pinning the ring. The
+# client-level proof (net_bind/net_recv_from/net_close) is
+# test/test_client.ritz; this file is only the AppProducer/AppConsumer
+# plumbing underneath it.
+
+import net_abi.app { AppDesc, APP_DEPTH, APP_SLOT, APP_BIND, APP_SEND_TO }
+import libnet.ring { AppRing, AppProducer, AppConsumer, AppClose, AppReject, AppPublish, AppPoll, AppTake, AppBytes, app_req_ring, app_slot_off }
+
+# One app-exchange region, u64s so the control words are 8-aligned. Big
+# enough for either ring (request and event are the same shape).
+var g_region: [0x23000 / 8]u64
+var g_buf: AppBytes
+
+fn fresh_region() -> u64
+    for i in 0..(0x3000 / 8)          # zero the controls and descriptors only
+        g_region[i] = 0
+    @g_region as u64
+
+fn is_done(p: AppPublish) -> bool
+    match p
+        AppPublish.Done => true
+        _ => false
+
+fn is_full(p: AppPublish) -> bool
+    match p
+        AppPublish.Full => true
+        _ => false
+
+fn is_desc(t: AppTake, len: u32) -> bool
+    match t
+        AppTake.Desc(_, n) => n == len
+        _ => false
+
+fn is_rejected(t: AppTake, why: AppReject) -> bool
+    match t
+        AppTake.Rejected(w) => w == why
+        _ => false
+
+fn is_empty(p: AppPoll) -> bool
+    match p
+        AppPoll.Empty => true
+        _ => false
+
+fn no_addr() -> [4]u8
+    [0, 0, 0, 0]
+
+# ---------------------------------------------------------------------------
+# 1. One publish and take, single-stepped
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_publish_take_single_stepped() -> i32
+    let ring = app_req_ring(fresh_region())
+    var p = AppProducer.new(ring)
+    var c = AppConsumer.new(ring)
+    let payload: [3]u8 = [9, 8, 7]
+
+    if not is_done(p.stage(APP_BIND, 1, 0, 80, 0, no_addr(), @payload))
+        return 1
+    if atomic_load(@ring.ctrl.write_idx) != 0
+        return 2
+    if not is_empty(c.poll())
+        return 3
+
+    if not p.commit()
+        return 4
+    if atomic_load(@ring.ctrl.write_idx) != 1 or atomic_load(@ring.ctrl.wake) != 1
+        return 5
+    if p.commit()
+        return 6
+
+    let desc = match c.poll()
+        AppPoll.Ready(d) => d
+        _ => return 7
+    if desc.kind != APP_BIND or desc.id != 1 or desc.port != 80 or desc.length != 3
+        return 8
+    if atomic_load(@ring.ctrl.read_idx) != 0
+        return 9
+
+    if not is_desc(c.take(desc, @&g_buf), 3)
+        return 10
+    for i in 0..3
+        if g_buf[i] != payload[i]
+            return 11
+    if atomic_load(@ring.ctrl.read_idx) != 1 or c.read != 1
+        return 12
+    if not is_empty(c.poll())
+        return 13
+    0
+
+# ---------------------------------------------------------------------------
+# 2. A full ring waits for read_idx; it does not drop or overwrite
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_full_ring_waits_for_read_idx() -> i32
+    let ring = app_req_ring(fresh_region())
+    var p = AppProducer.new(ring)
+    var c = AppConsumer.new(ring)
+    let empty: [0]u8 = []
+    for i in 0..APP_DEPTH
+        if not is_done(p.publish(APP_SEND_TO, i as u32 + 1, 1, 0, 0, no_addr(), @empty))
+            return 1
+    if p.write != APP_DEPTH or atomic_load(@ring.ctrl.write_idx) != APP_DEPTH
+        return 2
+
+    if not is_full(p.publish(APP_SEND_TO, 99, 1, 0, 0, no_addr(), @empty))
+        return 3
+    if atomic_load(@ring.ctrl.write_idx) != APP_DEPTH
+        return 4
+
+    let d0 = match c.poll()
+        AppPoll.Ready(d) => d
+        _ => return 5
+    if not is_desc(c.take(d0, @&g_buf), 0)
+        return 6
+
+    if not is_done(p.publish(APP_SEND_TO, 100, 1, 0, 0, no_addr(), @empty))
+        return 7
+    if atomic_load(@ring.ctrl.write_idx) != APP_DEPTH + 1
+        return 8
+    0
+
+# ---------------------------------------------------------------------------
+# 3. Bad slots are rejected and skipped without pinning the ring
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_bad_descriptors_rejected_and_skipped() -> i32
+    let ring = app_req_ring(fresh_region())
+    var p = AppProducer.new(ring)
+    var c = AppConsumer.new(ring)
+    let empty: [0]u8 = []
+    for i in 0..4
+        if not is_done(p.publish(APP_BIND, i as u32 + 1, 0, 0, 0, no_addr(), @empty))
+            return 1
+
+    (*ring.descs)[0].length = APP_SLOT as u32 + 1
+    (*ring.descs)[1].flags = 1
+    (*ring.descs)[2]._pad = 7
+    (*ring.descs)[3].arena_off = app_slot_off(9) as u32
+
+    let d0 = match c.poll()
+        AppPoll.Ready(d) => d
+        _ => return 2
+    if not is_rejected(c.take(d0, @&g_buf), AppReject.Length)
+        return 3
+
+    let d1 = match c.poll()
+        AppPoll.Ready(d) => d
+        _ => return 4
+    if not is_rejected(c.take(d1, @&g_buf), AppReject.Flags)
+        return 5
+
+    let d2 = match c.poll()
+        AppPoll.Ready(d) => d
+        _ => return 6
+    if not is_rejected(c.take(d2, @&g_buf), AppReject.Pad)
+        return 7
+
+    let d3 = match c.poll()
+        AppPoll.Ready(d) => d
+        _ => return 8
+    if not is_rejected(c.take(d3, @&g_buf), AppReject.Offset)
+        return 9
+
+    if c.read != 4 or atomic_load(@ring.ctrl.read_idx) != 4
+        return 10
+    0
+
+# ---------------------------------------------------------------------------
+# 4. An impossible occupancy closes without exiting
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_impossible_occupancy_closes() -> i32
+    let ring = app_req_ring(fresh_region())
+    var p = AppProducer.new(ring)
+    var c = AppConsumer.new(ring)
+    let empty: [0]u8 = []
+    if not is_done(p.publish(APP_BIND, 1, 0, 0, 0, no_addr(), @empty))
+        return 1
+    let d0 = match c.poll()
+        AppPoll.Ready(d) => d
+        _ => return 2
+    if not is_desc(c.take(d0, @&g_buf), 0)
+        return 3
+    if c.read != 1
+        return 4
+
+    # Occupancy above APP_DEPTH: the peer's write_idx jumps ahead.
+    atomic_store(@ring.ctrl.write_idx, c.read + APP_DEPTH + 1)
+    match c.poll()
+        AppPoll.Close(why) =>
+            if why != AppClose.Overfull
+                return 5
+        _ => return 6
+
+    # A backwards write_idx, behind the private read_idx.
+    atomic_store(@ring.ctrl.write_idx, c.read - 1)
+    match c.poll()
+        AppPoll.Close(why) =>
+            if why != AppClose.Backwards
+                return 7
+        _ => return 8
+    # A close moved nothing: the private and shared read_idx stand.
+    if c.read != 1 or atomic_load(@ring.ctrl.read_idx) != 1
+        return 9
+    0

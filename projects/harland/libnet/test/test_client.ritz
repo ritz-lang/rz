@@ -1,0 +1,325 @@
+# Harland ring-3 net library host tests (AGAST #4750)
+#
+# A fake service ring: this file plays both sides. It drives libnet.client
+# the way an app would (net_bind, net_send_to, net_recv_from, net_ping,
+# net_close) and, as the "service", publishes directly onto the same
+# event ring with a second AppProducer, the only thing a real netd would
+# do differently. No NetAttach, no ShmMap, no kernel: both rings live in
+# one process-local region, exactly as net_abi/test/test_layout.ritz and
+# driver_abi/test/test_spsc.ritz host their layers.
+#
+# g_exchange is a global, not a per-test value: NetExchange is too big
+# (MAX_ENDPOINTS * APP_DEPTH slots of APP_SLOT bytes each) to construct
+# as a literal or return by value without multiplying out to an enormous
+# IR initializer (see client.ritz's init() comment), so every test resets
+# it in place with reset(), the way test_spsc.ritz reuses g_region.
+#
+# The three proof points AGAST #4750 names:
+#   - 33 oversize datagrams for a bound handle, then a second net_bind
+#     still sees its EV_BOUND (test_oversize_datagrams_do_not_stall_bind).
+#   - bind/receive/close repeated well past MAX_ENDPOINTS does not grow
+#     state (test_repeated_bind_receive_close_bounded_state).
+#   - a closed handle answers BadF to every later call
+#     (test_badf_after_close).
+
+import net_abi.app { APP_DEPTH, APP_SLOT, MAX_ENDPOINTS, PING_DEADLINE_MS, APP_REGION_SIZE, EV_DATAGRAM, EV_PING_REPLY, EV_BOUND, EV_CLOSED, EV_ERROR }
+import libnet.ring { AppProducer, AppConsumer, AppPublish, AppPoll, AppTake, AppBytes, app_req_ring, app_ev_ring }
+import libnet.client { NetExchange, BindResult, SendResult, RecvResult, PingResult, CloseResult }
+import ritzlib.option
+
+# One app-exchange region, u64s so the control words are 8-aligned.
+var g_region: [APP_REGION_SIZE / 8]u64
+var g_exchange: NetExchange
+# The out parameter net_recv_from and net_ping copy their payload into.
+var g_buf: AppBytes
+
+# Zero the region and reset the exchange onto it; returns the region's
+# address, for the fake service's own AppProducer.
+fn reset() -> u64
+    for i in 0..(APP_REGION_SIZE / 8)
+        g_region[i] = 0
+    let region = @g_region as u64
+    g_exchange.init(app_req_ring(region), app_ev_ring(region))
+    region
+
+# The fake service's half: an AppProducer over the same region's event
+# ring, publishing EV_* the way netd would.
+fn fake_service(region: u64) -> AppProducer
+    AppProducer.new(app_ev_ring(region))
+
+fn no_addr() -> [4]u8
+    [0, 0, 0, 0]
+
+fn svc_publish(svc: @&AppProducer, kind: u16, id: u32, handle: u32, port: u16, status: i16, addr: [4]u8, payload: [u8]) -> bool
+    match svc.publish(kind, id, handle, port, status, addr, payload)
+        AppPublish.Done => true
+        _ => false
+
+# The service's other half: drain whatever the app has published on the
+# request ring, discarding it (this suite does not assert on request
+# content, only on the client's own state). A real netd would act on
+# each request; a test that never reads this ring at all — the first
+# draft of this file didn't — fills it after APP_DEPTH requests and
+# every net_bind/net_close past that wedges on AppPublish.Full forever,
+# exactly the way a stalled real service would.
+fn svc_drain_requests(con: @&AppConsumer)
+    var tmp: AppBytes = [0; 2048]
+    loop
+        match con.poll()
+            AppPoll.Ready(desc) =>
+                con.take(desc, @&tmp)
+            _ => return
+
+fn is_bound(r: BindResult, handle: u32) -> bool
+    match r
+        BindResult.Bound(h) => h == handle
+        _ => false
+
+fn is_bind_pending(r: BindResult) -> bool
+    match r
+        BindResult.Pending => true
+        _ => false
+
+fn is_closed(r: CloseResult) -> bool
+    match r
+        CloseResult.Closed => true
+        _ => false
+
+fn is_close_pending(r: CloseResult) -> bool
+    match r
+        CloseResult.Pending => true
+        _ => false
+
+fn is_badf_close(r: CloseResult) -> bool
+    match r
+        CloseResult.BadF => true
+        _ => false
+
+fn is_badf_send(r: SendResult) -> bool
+    match r
+        SendResult.BadF => true
+        _ => false
+
+fn is_badf_recv(r: RecvResult) -> bool
+    match r
+        RecvResult.BadF => true
+        _ => false
+
+fn is_datagram(r: RecvResult, len: u32) -> bool
+    match r
+        RecvResult.Datagram(e) => e.length == len
+        _ => false
+
+fn is_recv_empty(r: RecvResult) -> bool
+    match r
+        RecvResult.Empty => true
+        _ => false
+
+fn is_send_sent(r: SendResult) -> bool
+    match r
+        SendResult.Sent => true
+        _ => false
+
+fn send_err(r: SendResult) -> i32
+    match r
+        SendResult.Err(e) => e
+        _ => 1                       # not an errno: callers only check this on an Err
+
+fn ping_err(r: PingResult) -> i32
+    match r
+        PingResult.Err(e) => e
+        _ => 1
+
+fn is_ping_pending(r: PingResult) -> bool
+    match r
+        PingResult.Pending => true
+        _ => false
+
+# ---------------------------------------------------------------------------
+# 1. 33 oversize datagrams for a bound handle, then a second net_bind
+#    still sees its EV_BOUND.
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_oversize_datagrams_do_not_stall_bind() -> i32
+    let region = reset()
+    var svc = fake_service(region)
+    let empty: [0]u8 = []
+
+    # Bind handle 10 on port 100: id 1, the first request this exchange
+    # ever issues.
+    if not is_bind_pending(g_exchange.net_bind(100))
+        return 1
+    if not svc_publish(@&svc, EV_BOUND, 1, 10, 100, 0, no_addr(), @empty)
+        return 2
+    if not is_bound(g_exchange.net_bind(100), 10)
+        return 3
+
+    # Start a second bind, on port 200: id 2. It stays Pending while the
+    # service floods handle 10 with oversize datagrams.
+    if not is_bind_pending(g_exchange.net_bind(200))
+        return 4
+
+    let oversize: [2000]u8 = [0x5A; 2000]
+    let peer: [4]u8 = [10, 0, 0, 1]
+    for i in 0..33
+        if not svc_publish(@&svc, EV_DATAGRAM, 0, 10, 53, 0, peer, @oversize)
+            return 5
+        if not is_bind_pending(g_exchange.net_bind(200))
+            return 6
+
+    # The 33rd datagram overflowed handle 10's 32-deep queue.
+    if g_exchange.drops(10) != 1
+        return 7
+
+    # EV_BOUND for id 2 is still found, undisturbed by the flood.
+    if not svc_publish(@&svc, EV_BOUND, 2, 20, 200, 0, no_addr(), @empty)
+        return 8
+    if not is_bound(g_exchange.net_bind(200), 20)
+        return 9
+
+    # All 32 delivered datagrams come back from handle 10's queue, in
+    # order, full length; the 33rd is not there.
+    for i in 0..32
+        if not is_datagram(g_exchange.net_recv_from(10, @&g_buf), 2000)
+            return 10
+    if not is_recv_empty(g_exchange.net_recv_from(10, @&g_buf))
+        return 11
+    0
+
+# ---------------------------------------------------------------------------
+# 2. bind/receive/close repeated past MAX_ENDPOINTS does not grow state.
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_repeated_bind_receive_close_bounded_state() -> i32
+    let region = reset()
+    var svc = fake_service(region)
+    var req_con = AppConsumer.new(app_req_ring(region))
+    let payload: [16]u8 = [0xAB; 16]
+    let peer: [4]u8 = [1, 2, 3, 4]
+    let empty: [0]u8 = []
+
+    # Three times MAX_ENDPOINTS worth of cycles: a client that reuses a
+    # fixed-size table survives this; one that grew an entry per handle
+    # would run out of room well before round 48. The fake service also
+    # has to drain the request ring as it goes (svc_drain_requests), the
+    # same way a real netd reading each request would: APP_DEPTH (32)
+    # requests fill it, and round 16's net_bind (request 33, two per
+    # round) would wait on AppPublish.Full forever otherwise.
+    for round in 0..(3 * MAX_ENDPOINTS)
+        let bind_id: u32 = round * 2 + 1      # net_bind's request id this round
+        let close_id: u32 = round * 2 + 2     # net_close's; net_recv_from allocs none
+        let handle: u32 = round + 1000        # server-assigned, never reused
+
+        if not is_bind_pending(g_exchange.net_bind(7000))
+            return 1
+        svc_drain_requests(@&req_con)
+        if not svc_publish(@&svc, EV_BOUND, bind_id, handle, 7000, 0, no_addr(), @empty)
+            return 2
+        if not is_bound(g_exchange.net_bind(7000), handle)
+            return 3
+
+        if not svc_publish(@&svc, EV_DATAGRAM, 0, handle, 53, 0, peer, @payload)
+            return 4
+        if not is_datagram(g_exchange.net_recv_from(handle, @&g_buf), 16)
+            return 5
+        if not is_recv_empty(g_exchange.net_recv_from(handle, @&g_buf))
+            return 6
+
+        if not is_close_pending(g_exchange.net_close(handle))
+            return 7
+        svc_drain_requests(@&req_con)
+        if not svc_publish(@&svc, EV_CLOSED, close_id, handle, 0, 0, no_addr(), @empty)
+            return 8
+        if not is_closed(g_exchange.net_close(handle))
+            return 9
+
+        # Closed: every later call on this handle is BadF, every round.
+        if not is_badf_recv(g_exchange.net_recv_from(handle, @&g_buf))
+            return 10
+        if not is_badf_close(g_exchange.net_close(handle))
+            return 11
+    0
+
+# ---------------------------------------------------------------------------
+# 3. BadF after close, on every call that takes a handle.
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_badf_after_close() -> i32
+    let region = reset()
+    var svc = fake_service(region)
+    let empty: [0]u8 = []
+
+    if not is_bind_pending(g_exchange.net_bind(55))
+        return 1
+    if not svc_publish(@&svc, EV_BOUND, 1, 7, 55, 0, no_addr(), @empty)
+        return 2
+    if not is_bound(g_exchange.net_bind(55), 7)
+        return 3
+
+    if not is_close_pending(g_exchange.net_close(7))
+        return 4
+    if not svc_publish(@&svc, EV_CLOSED, 2, 7, 0, 0, no_addr(), @empty)
+        return 5
+    if not is_closed(g_exchange.net_close(7))
+        return 6
+
+    if not is_badf_recv(g_exchange.net_recv_from(7, @&g_buf))
+        return 7
+    if not is_badf_send(g_exchange.net_send_to(7, @empty, no_addr(), 0, Some(1500)))
+        return 8
+    if not is_badf_close(g_exchange.net_close(7))
+        return 9
+    0
+
+# ---------------------------------------------------------------------------
+# 4. net_send_to rejects what the service would, before publishing.
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_send_to_validates_before_publish() -> i32
+    let region = reset()
+    var svc = fake_service(region)
+    let empty: [0]u8 = []
+
+    if not is_bind_pending(g_exchange.net_bind(9))
+        return 1
+    if not svc_publish(@&svc, EV_BOUND, 1, 3, 9, 0, no_addr(), @empty)
+        return 2
+    if not is_bound(g_exchange.net_bind(9), 3)
+        return 3
+
+    let too_big: [2049]u8 = [1; 2049]
+    if send_err(g_exchange.net_send_to(3, @too_big, no_addr(), 0, Some(1500))) != -22
+        return 4
+
+    let fits_slot_not_mtu: [1480]u8 = [1; 1480]    # <= 2048 but > mtu(1500) - 28
+    if send_err(g_exchange.net_send_to(3, @fits_slot_not_mtu, no_addr(), 0, Some(1500))) != -22
+        return 5
+    if send_err(g_exchange.net_send_to(3, @fits_slot_not_mtu, no_addr(), 0, None)) != -19
+        return 6
+
+    let small: [10]u8 = [1; 10]
+    if not is_send_sent(g_exchange.net_send_to(3, @small, no_addr(), 0, Some(1500)))
+        return 7
+    0
+
+# ---------------------------------------------------------------------------
+# 5. A quiet peer times out net_ping after PING_DEADLINE_MS.
+# ---------------------------------------------------------------------------
+
+[[test]]
+fn test_ping_times_out_after_deadline() -> i32
+    reset()
+    let payload: [4]u8 = [1, 2, 3, 4]
+    let peer: [4]u8 = [10, 0, 0, 1]
+
+    if not is_ping_pending(g_exchange.net_ping(peer, @payload, 0, @&g_buf))
+        return 1
+    if not is_ping_pending(g_exchange.net_ping(peer, @payload, PING_DEADLINE_MS - 1, @&g_buf))
+        return 2
+    if ping_err(g_exchange.net_ping(peer, @payload, PING_DEADLINE_MS, @&g_buf)) != -5
+        return 3
+    0
