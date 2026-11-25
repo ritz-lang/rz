@@ -692,6 +692,7 @@ class AppExchange:
         self.ev_read = 0
         self.next_id = 1
         self.closed = False
+        self.held = []
 
     def _store_u64(self, offset, value):
         self.region[offset:offset + 8] = struct.pack("<Q", value)
@@ -780,6 +781,30 @@ class AppExchange:
         if desc is None:
             return ("bad", None, b"")
         return ("ok", desc, self.event_payload(desc))
+
+    def take_matching(self, predicate):
+        """Return the first private event copy the predicate accepts.
+
+        Copies that do not match stay queued, ahead of anything still on the
+        ring. A bad slot is not queued.
+        """
+        index = 0
+        while index < len(self.held):
+            desc, payload = self.held[index]
+            if predicate(desc, payload):
+                self.held.pop(index)
+                return ("ok", desc, payload)
+            index += 1
+        while True:
+            item = self.take_event()
+            if item is None:
+                return None
+            if item[0] != "ok":
+                continue
+            desc, payload = item[1], item[2]
+            if predicate(desc, payload):
+                return ("ok", desc, payload)
+            self.held.append((desc, payload))
 
     def request_desc_bytes(self, seq):
         slot = seq & (APP_DEPTH - 1)
@@ -902,19 +927,20 @@ class Stack:
         return event["handle"]
 
     def net_recv_from(self, handle):
-        while True:
-            item = self.exchange.take_event()
-            if item is None:
-                return None
-            if item[0] != "ok":
-                continue
-            desc, payload = item[1], item[2]
+        def matches(desc, _payload):
             if desc["handle"] != handle:
-                continue
+                return False
             if desc["kind"] == EV_DATAGRAM and desc["status"] == 0:
-                return (payload, desc["addr"], desc["port"])
-            if desc["kind"] == EV_ERROR:
-                return None
+                return True
+            return desc["kind"] == EV_ERROR
+
+        item = self.exchange.take_matching(matches)
+        if item is None:
+            return None
+        desc, payload = item[1], item[2]
+        if desc["kind"] == EV_DATAGRAM and desc["status"] == 0:
+            return (payload, desc["addr"], desc["port"])
+        return None
 
     def net_send_to(self, handle, payload, address, port):
         if len(payload) > APP_SLOT:
@@ -966,12 +992,10 @@ class Stack:
         return event["status"]
 
     def _take_id(self, req_id):
-        item = self.exchange.take_event()
-        if item is None or item[0] != "ok":
+        item = self.exchange.take_matching(lambda desc, _payload: desc["id"] == req_id)
+        if item is None:
             return None
         desc, payload = item[1], item[2]
-        if desc["id"] != req_id:
-            return None
         desc["payload"] = payload
         return desc
 

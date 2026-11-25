@@ -373,11 +373,11 @@ Event `kind` values, written by the service:
 
 `APP_CONNECT`, `APP_WRITE`, and `EV_STREAM` are names for the TCP milestone. The first cutover does not encode them in the tools below. A request of kind 6 or 7 is answered with `EV_ERROR` and `Errno.NoSys` (-38). It does not open a stream, and this draft still does not pick a retransmission interval or a congestion number.
 
-`net_bind(port)` publishes `APP_BIND` with `handle` 0, `length` 0, and `addr` zero. Port 0 asks the service to assign a port in `49152..=65535` that is not already bound. Any other port is the requested local port. The library waits for the event whose `id` matches. `EV_BOUND` carries `status` 0, the new `handle`, and the bound `port`. `EV_ERROR` carries no handle. A second bind of a live port is `Errno.Exist`.
+`net_bind(port)` publishes `APP_BIND` with `handle` 0, `length` 0, and `addr` zero. Port 0 asks the service to assign a port in `49152..=65535` that is not already bound. Any other port is the requested local port. The library waits for the event whose `id` matches. An event with a different `id` stays queued for the call that owns it. A datagram already on the ring is still there for `net_recv_from`. `EV_BOUND` carries `status` 0, the new `handle`, and the bound `port`. `EV_ERROR` carries no handle. A second bind of a live port is `Errno.Exist`.
 
 `net_send_to(handle, bytes, address, port)` publishes `APP_SEND_TO` with that handle, the remote port, the remote address, and the bytes at `arena_off`. `length` above 2048 is rejected in the library and is not published. The service checks the private copy, copies `length` bytes from that offset, and wraps them in UDP, IPv4, and Ethernet. The call returns when the request is on the ring. It does not wait for an event. A full request ring waits for `SPACE`, the same way a full frame ring waits.
 
-`net_recv_from(handle)` publishes nothing. It waits on the event ring and decodes the next `EV_DATAGRAM` for that handle. The returned bytes are the payload, the address, and the port from that private copy. `EV_ERROR` for the handle, or `PEER_CLOSE` on the exchange, ends the wait.
+`net_recv_from(handle)` publishes nothing. It decodes the next `EV_DATAGRAM` for that handle and leaves every other event queued. The returned bytes are the payload, the address, and the port from that private copy. `EV_ERROR` for the handle, or `PEER_CLOSE` on the exchange, ends the wait.
 
 `net_ping(address)` publishes one `APP_PING` with `handle` 0, port 0, and the echo bytes in the arena. It waits for one event with that `id`. `EV_PING_REPLY` returns those echoed bytes and the peer address. `EV_ERROR` returns the status. There is no count and no interval.
 

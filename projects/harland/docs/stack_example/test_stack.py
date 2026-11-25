@@ -347,6 +347,20 @@ def run():
     require(len(pinger.device_tx) == frames_after_echo, "broadcast ping transmitted an echo")
     print("ping tool reply bytes: %s" % tool_reply.decode())
 
+    queued = stack.Stack()
+    first = queued.net_bind(9999)
+    require(first == 1, "first bind handle was %s" % first)
+    queued.deliver_device_frame(udp_device_frame(DATAGRAM, 9999))
+    second = queued.net_bind(9998)
+    require(second == 2, "bind behind a datagram returned %s" % second)
+    require(queued.handle_ports.get(second) == 9998, "the returned handle is not port 9998")
+    kept = queued.net_recv_from(first)
+    require(
+        kept is not None and kept[0] == DATAGRAM and kept[1] == PEER_IP and kept[2] == 44000,
+        "a datagram queued ahead of bind was dropped",
+    )
+    print("behavior: a datagram stays queued across a later bind, bytes: %s" % kept[0].decode())
+
 
 def udp_frame_with_checksum(payload, destination_port, checksum):
     udp = bytearray(stack.build_udp(44000, destination_port, payload))
