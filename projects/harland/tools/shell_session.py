@@ -52,7 +52,9 @@ def _lines(out: bytes) -> list[str]:
 
 
 def _listing(lines: list[str]) -> list[str]:
-    return [line for line in lines if line and not line.startswith("[mmap] ")]
+    # Non-empty lines only. No kernel line is filtered: a command's output
+    # must be its own (the kernel's mmap success log was dropped for this).
+    return [line for line in lines if line]
 
 
 # (command, description, check(lines) -> bool). Each command's output is
