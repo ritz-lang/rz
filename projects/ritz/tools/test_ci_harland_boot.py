@@ -215,6 +215,7 @@ BOOT_TESTS = (
     "munmap", "mmap-failure", "pmm-above-4g", "mmap-overlap", "mmap-cursor",
     "mmap-driver-window",
     "elf-loader", "sysret", "nmi-gs", "ist-nest", "nmi-nest", "cap-device", "virtio-blk-read",
+    "proc-create-init",
 )
 BOOT_TEST_OK = "".join(f"[boot-test] PASS {t}\n" for t in BOOT_TESTS) + (
     f"[boot-test] {len(BOOT_TESTS)} passed, 0 failed\n"

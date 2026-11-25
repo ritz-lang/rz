@@ -72,6 +72,7 @@ POSTINIT_ENTRIES = {
     "boot_self_tests": ["vmm_self_test", "higher_half_self_test", "heap_self_test", "ipc_self_test",
                         "channel_close_self_test", "channel_debug_print", "test_elf_loader",
                         "virtio_blk_test"],
+    "boot_process_tests": ["proc_create_init_self_test"],
     "postinit_diagnostics": ["pci_print_all_devices", "network_dhcp_ping", "virtio_blk_check"],
 }
 POSTINIT_FNS = {"vmm_self_test", "higher_half_self_test", "heap_self_test", "ipc_self_test",
@@ -161,7 +162,12 @@ def test_postinit_module_defines_the_self_tests():
     assert '"channel-close", channel_close_self_test(pair)' in body
     # channel_debug_print returns nothing (#4600): it passes by returning.
     assert body.index("channel_debug_print()") < body.index('"channel-debug-print", true')
-    assert body.index("if boot_tests_failed != 0") < body.index("halt_loop()")
+    # The summary and the fail-halt end the last phase, boot_process_tests
+    # (#4712): the gate reads one summary for both phases.
+    assert "boot_tests_failed != 0" not in body
+    body = _body(code, "boot_process_tests")
+    assert '"proc-create-init", proc_create_init_self_test()' in body
+    assert body.index('" passed, "') < body.index("if boot_tests_failed != 0") < body.index("halt_loop()")
 
 
 def test_no_self_test_call_is_skipped():
@@ -221,20 +227,24 @@ def test_main_defines_none_of_it():
 def test_main_imports_what_it_calls():
     code = _code(MAIN)
     assert _imports_from(code, "klog") == {"ring_clear", "ring_dump", "klog", "klog_dec", "klog_hex"}
-    assert _imports_from(code, "postinit") == {"boot_self_tests", "postinit_diagnostics"}
+    assert _imports_from(code, "postinit") == {"boot_self_tests", "boot_process_tests",
+                                                  "postinit_diagnostics"}
 
 
 def test_kernel_main_keeps_the_boot_order():
     """Self-tests (boot-test mode only, #1887), the success banner, SYSCALL
-    setup, diagnostics, the opt-in ring dump (#1885), then init: the same
+    setup, the process tests (boot-test mode only, #4712), diagnostics, the opt-in ring dump (#1885), then init: the same
     serial order as before the move."""
     body = _body(_code(MAIN), "kernel_main")
     assert re.search(r"^    if boot_test\n        boot_self_tests\(\)$", body, re.M), body
+    assert re.search(r"^    if boot_test\n        boot_process_tests\(\)$", body, re.M), body
     # \b: fs_syscall_init() runs earlier and must not match syscall_init().
     steps = [
         r"\bboot_self_tests\(\)",
         re.escape(r'klog("\nKernel initialized successfully.\n")'),
         r"\bsyscall_init\(\)",
+        # #4712: the boot-test process phase needs SYSCALL set up.
+        r"\bboot_process_tests\(\)",
         r"\bpostinit_diagnostics\(run_net_selftests, run_net_responder\)",
         # #1885: the opt-in ring dump shows the whole boot log before init runs.
         r"\bring_dump\(\)",

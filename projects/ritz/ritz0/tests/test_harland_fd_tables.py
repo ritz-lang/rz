@@ -682,9 +682,14 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
 
 def test_init_gets_a_table_before_it_runs():
     # run_init makes the running process init through process_enter_init
-    # (syscall/runtime/process.ritz, #2751), before it jumps to /bin/init.
+    # (syscall/runtime/process.ritz, #2751), before it jumps to /bin/init:
+    # process_create_init gives pid 1 its table (#4712), then the scheduler
+    # starts.
+    create = _fn(PROCESS, "process_create_init")
+    assert "fs_process_start(1)" in create
+    assert "sched_start(" not in create
     enter = _fn(PROCESS, "process_enter_init")
-    assert "fs_process_start(1)" in enter
+    assert enter.index("process_create_init()") < enter.index("sched_start(")
     body = _fn(KERNEL_SRC / "main.ritz", "run_init")
     assert body.index("process_enter_init()") < body.index("jump_to_userspace(")
 

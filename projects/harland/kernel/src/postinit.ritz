@@ -1,8 +1,9 @@
 # Harland Kernel Boot-Test Self-Tests and Diagnostics
 #
 # Moved out of kernel_main (AGAST #2752). boot_self_tests runs only in
-# boot-test mode (AGAST #1887), before SYSCALL is set up; the boot gate
-# asserts its "[boot-test]" lines. postinit_diagnostics runs on every boot
+# boot-test mode (AGAST #1887), before SYSCALL is set up, and
+# boot_process_tests after it (#4712); the boot gate asserts their
+# "[boot-test]" lines. postinit_diagnostics runs on every boot
 # after SYSCALL setup, before /bin/init: the PCI listing and the MSI-X
 # checks the interrupt boot tests read. The network diagnostics are opt-in
 # since #4335: a misbehaving NIC made a real-hardware boot panic before
@@ -36,6 +37,10 @@ import arch.x86_64.nmi_probe { ist_nest_selftest, nmi_gs_selftest, nmi_nest_self
 import cap.selftest { cap_device_selftest }
 import arch.x86_64.percpu { CPU_KSTACK, cpu_index, cpu_stack_guard }
 import arch.x86_64.apic { x2apic_mode, lapic_id, lapic_icr_lo_mmio }
+import proc.table { Proc, proc_at, proc_current, proc_current_pid, proc_current_slot, proc_is_init, proc_live_count }
+import proc.sched { sched_is_running, sched_stop }
+import fs.syscall { fs_process_pid }
+import syscall.runtime.process { process_create_init, process_destroy_init }
 
 # ============================================================================
 # Boot-test mode self-tests (AGAST #1887)
@@ -43,7 +48,8 @@ import arch.x86_64.apic { x2apic_mode, lapic_id, lapic_icr_lo_mmio }
 #
 # Run only when the boot asked for boot-test mode (\harland\boot-test, or
 # `boot-test` on the multiboot2 cmdline). Each test logs its own detail, then
-# boot_self_tests logs one "[boot-test] PASS|FAIL <name>" line for it and a
+# boot_self_tests and boot_process_tests log one "[boot-test] PASS|FAIL
+# <name>" line for it; boot_process_tests, the last phase, logs the
 # "[boot-test] N passed, M failed" summary, which tools/test_tier1_boot.sh
 # asserts. A failure is a KERNEL PANIC: every boot gate fails on one.
 
@@ -325,6 +331,53 @@ pub fn boot_self_tests()
     let blk_dev: *VirtioBlkDevice = virtio_blk_get_device()
     if blk_dev != 0 as *VirtioBlkDevice
         boot_test_result("virtio-blk-read", virtio_blk_test(blk_dev) == 0)
+
+# process_create_init makes pid 1 without starting the scheduler (#4712,
+# RING1_DRIVER.md §9 step 1): pid 1 is current and init, has its fd table,
+# and sched_running stays 0; a second call keeps the same pid 1. Then
+# process_destroy_init tears it down and the stopped scheduler's state is
+# what run_init expects: no process, no fd table, not running.
+const PROC_TEST_MARKER: i64 = 0x4712
+
+fn proc_create_init_self_test() -> bool
+    klog("\nTesting process_create_init...\n")
+    if proc_current() != 0 as *Proc or sched_is_running()
+        klog("  a process or the scheduler already exists\n")
+        return false
+    process_create_init()
+    let p: *Proc = proc_current()
+    let created: bool = p != 0 as *Proc and proc_is_init(p) and fs_process_pid() == 1
+    let slot: i32 = proc_current_slot()
+    # A marker on pid 1: a second call that reset the table would clear it
+    if created
+        (*p).exit_code = PROC_TEST_MARKER
+    process_create_init()
+    let kept: bool = proc_current_slot() == slot and proc_live_count() == 1 and proc_at(slot).exit_code == PROC_TEST_MARKER
+    let running: bool = sched_is_running()
+    klog("  pid ")
+    klog_dec(proc_current_pid() as i64)
+    klog(", slot ")
+    klog_dec(slot as i64)
+    klog(", procs ")
+    klog_dec(proc_live_count() as i64)
+    if running
+        klog(", scheduler running")
+    process_destroy_init()
+    sched_stop()
+    let gone: bool = proc_current() == 0 as *Proc and proc_live_count() == 0 and fs_process_pid() == 0 and not sched_is_running()
+    if not gone
+        klog(", teardown left a process or the scheduler")
+    klog("\n")
+    return created and kept and not running and gone
+
+# The boot-test mode tests that need SYSCALL set up (syscall_init) and run
+# with no process yet, after boot_self_tests: kernel_main calls them before
+# postinit_diagnostics. They leave what run_init expects (no Proc, the
+# scheduler not running). Logs the "[boot-test] N passed, M failed" summary
+# for both phases, and halts on a failure.
+pub fn boot_process_tests()
+    klog("\n=== Boot-test mode: process tests ===\n")
+    boot_test_result("proc-create-init", proc_create_init_self_test())
     klog("[boot-test] ")
     klog_dec(boot_tests_passed as i64)
     klog(" passed, ")

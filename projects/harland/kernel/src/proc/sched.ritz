@@ -34,7 +34,7 @@ import io { sti_hlt, disable_interrupts, enable_interrupts, interrupts_enabled }
 import mm.vmm { vmm_switch_pml4, vmm_get_current_pml4 }
 import arch.x86_64.gdt { gdt_set_kernel_stack_cpu }
 import arch.x86_64.percpu { cpu_index }
-import arch.x86_64.apic { lapic_timer_start, lapic_tick_advance, lapic_watchdog_expired }
+import arch.x86_64.apic { lapic_timer_start, lapic_timer_stop,lapic_tick_advance, lapic_watchdog_expired }
 import fs.syscall { fs_process_select }
 import syscall.stack { kstack_top }
 import proc.table { Proc, PROC_RUNNING, BLOCK_IRQ, proc_at, proc_current_slot, proc_pick_next, proc_set_current, proc_wake }
@@ -96,11 +96,29 @@ fn sched_switch_to(next: i32)
     sched_switch(@(*from).ksp, p.ksp)
 
 # init (the running process, slot `slot`) is about to enter ring 3: it runs
-# on its own kernel stack, and the periodic tick starts.
+# on its own kernel stack, and the periodic tick starts. Idempotent: once
+# the scheduler runs, a second call changes nothing (RING1_DRIVER.md §9:
+# pid 1 may start it before run_init does).
 pub fn sched_start(slot: i32)
+    if sched_running
+        return
     sched_use_kstack(slot)
     lapic_timer_start(SCHED_HZ)
     sched_running = true
+
+# The periodic tick drives preemption: sched_start ran and sched_stop has
+# not undone it.
+pub fn sched_is_running() -> bool
+    sched_running
+
+# Undo sched_start: the periodic tick stops and sched_tick preempts nothing
+# until sched_start runs again. The kernel stack stays the one sched_start
+# chose. A no-op when the scheduler is not running.
+pub fn sched_stop()
+    if not sched_running
+        return
+    lapic_timer_stop()
+    sched_running = false
 
 # Give the CPU to the next runnable process, if there is another; the
 # caller stays runnable and continues when its turn comes round.

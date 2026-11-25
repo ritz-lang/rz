@@ -61,17 +61,38 @@ var g_kernel_pml4: u64 = 0
 pub fn current_pid() -> u32
     return proc_current_pid() as u32
 
-# Make the running process init (PID 1, no parent, cwd "/") with its own fd
-# table (#2753) and kernel stack, and start the scheduler's tick (#3629):
-# run_init, before it jumps to /bin/init.
-pub fn process_enter_init()
+# Make the running boot thread init (PID 1, no parent, cwd "/", the
+# kernel's page table) with its own fd table (#2753), without starting the
+# scheduler: pid 1 stays on the boot stack at CPL 0 and nothing preempts it
+# (RING1_DRIVER.md §9 step 1, #4712). Only when no process exists yet: a
+# second call leaves the table, and pid 1, alone.
+pub fn process_create_init()
+    if proc_current() != 0 as *Proc
+        return
     proc_table_reset()
     g_kernel_pml4 = vmm_get_current_pml4()
     if proc_enter_init(g_kernel_pml4) != 0
         klog("[init] No process table slot for init\n")
     if fs_process_start(1) != 0
         klog("[init] No fd table: init cannot open files\n")
+
+# process_create_init, then start the scheduler's tick (#3629) on init's
+# kernel stack: run_init, before it jumps to /bin/init.
+pub fn process_enter_init()
+    process_create_init()
     sched_start(proc_current_slot())
+
+# Undo process_create_init (boot-test mode only, postinit.ritz
+# boot_process_tests): free init's fd table and empty the process table,
+# so run_init finds no process, as on a boot without the test. Only before
+# the scheduler starts; a no-op when no process exists.
+pub fn process_destroy_init()
+    if proc_current() == 0 as *Proc
+        return
+    if fs_process_select(1) == 0
+        fs_process_end()
+    proc_table_reset()
+    g_kernel_pml4 = 0
 
 # The errno a failed spawn returns for a failed ELF load: out of memory, or
 # a file that isn't a loadable x86-64 executable.
