@@ -74,7 +74,15 @@ PINS = {
     # per-task state reached through task.user_data are mmap_anon mappings;
     # munmap(span) is their release, the ritzlib.mapping pair of mmap_anon.
     "valet": 2,
-    "zeus": 51,
+    # zeus: ritzlib.mapping's mmap_shared x4 + munmap x4: the memfd rings
+    # are mmap_shared mappings (lib/shm.ritz region x2, lib/zeus_client.ritz
+    # attached worker, test_zeus_client's received fd) and lib/arena.ritz's
+    # private test arena an mmap_anon one; munmap(span) is their release.
+    # mmap_shared is exempt from #4692 on (mapping.ritz is the mmap owner, as
+    # for munmap), so its calls count from that commit. ritzlib.time's sleep
+    # x1, lib/worker.ritz: the 50us back-off while the response ring is full;
+    # sleep(Duration) is time's API, exempt only for being a free fn.
+    "zeus": 9,
 }
 
 
@@ -134,7 +142,7 @@ C_LITERAL_PINS = {
     "spire": 25,
     "tome": 0,
     "valet": 0,
-    "zeus": 133,
+    "zeus": 1,
 }
 
 

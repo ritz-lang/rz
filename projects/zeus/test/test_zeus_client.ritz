@@ -14,6 +14,8 @@ import ritzlib.io
 import ritzlib.fd { Fd, fd_adopt }
 import ritzlib.result
 import ritzlib.errno
+import ritzlib.span
+import ritzlib.mapping
 
 # Import our library
 import zeus.zeus_client
@@ -56,7 +58,7 @@ fn test_zeus_client_init_destroy() -> i32
     var cfg: ZeusClientConfig
     zeus_client_config_default(@cfg)
 
-    var client: ZeusClient
+    var client = ZeusClient {}
     let result: i32 = zeus_client_init(@client, @cfg)
     if result != 0
         print("FAIL: zeus_client_init failed with code {result}\n")
@@ -81,7 +83,7 @@ fn test_worker_handle_init() -> i32
 
     assert handle.slot_idx == -1
     assert handle.shm_fd.raw() == -1
-    assert handle.shm_base == null
+    assert handle.shm.len == 0
 
     return 0
 
@@ -131,7 +133,7 @@ fn test_client_can_use_attached_shm() -> i32
 
     # Simulate client attaching (normally via received fd)
     var client_region: ShmRegion
-    let attach_result: i32 = shm_attach(@client_region, region.fd, region.size)
+    let attach_result: i32 = shm_attach(@client_region, region.fd, region.mem.len)
     if attach_result != 0
         prints("FAIL: shm_attach failed\n")
         shm_destroy(@region)
@@ -173,7 +175,7 @@ fn test_client_select_worker_none_available() -> i32
     var cfg: ZeusClientConfig
     zeus_client_config_default(@cfg)
 
-    var client: ZeusClient
+    var client = ZeusClient {}
     zeus_client_init(@client, @cfg)
 
     # No workers registered, should return -1
@@ -192,7 +194,7 @@ fn test_client_request_id_generation() -> i32
     var cfg: ZeusClientConfig
     zeus_client_config_default(@cfg)
 
-    var client: ZeusClient
+    var client = ZeusClient {}
     zeus_client_init(@client, @cfg)
 
     let id1: u64 = zeus_client_next_request_id(@client)
@@ -252,8 +254,7 @@ fn test_scm_rights_send_recv_fd() -> i32
         return 1
 
     # Write magic byte to the shm region
-    let test_data: *u8 = region.base
-    *test_data = 0x42  # Magic byte
+    region.mem[0] = 0x42  # Magic byte
 
     # Send the fd via SCM_RIGHTS
     let send_result: i32 = scm_rights_send_fd(end0.raw(), region.fd)
@@ -284,18 +285,21 @@ fn test_scm_rights_send_recv_fd() -> i32
     var received: Fd = fd_adopt(received_fd)
 
     # Map the received fd and check the magic byte
-    let recv_data: *u8 = sys_mmap(0, region.size, PROT_READ, MAP_SHARED, received_fd, 0)
-    if recv_data == (-1 as *u8)
-        prints("FAIL: mmap of received fd failed\n")
-        received.close()
-        shm_destroy(@region)
-        end0.close()
-        end1.close()
-        return 1
+    var recv_data: Span<u8> = span_empty<u8>()
+    match mmap_shared(@received, region.mem.len)
+        Ok(m) => recv_data = m
+        Err(_) =>
+            prints("FAIL: mmap of received fd failed\n")
+            received.close()
+            shm_destroy(@region)
+            end0.close()
+            end1.close()
+            return 1
 
-    if *recv_data != 0x42
+    let magic: u8 = recv_data[0]
+    munmap(recv_data)
+    if magic != 0x42
         prints("FAIL: magic byte mismatch\n")
-        sys_munmap(recv_data, region.size)
         received.close()
         shm_destroy(@region)
         end0.close()
@@ -303,7 +307,6 @@ fn test_scm_rights_send_recv_fd() -> i32
         return 1
 
     # Cleanup
-    sys_munmap(recv_data, region.size)
     received.close()
     shm_destroy(@region)
     end0.close()
@@ -319,7 +322,7 @@ fn test_client_state_transitions() -> i32
     var cfg: ZeusClientConfig
     zeus_client_config_default(@cfg)
 
-    var client: ZeusClient
+    var client = ZeusClient {}
     zeus_client_init(@client, @cfg)
 
     # Initial state

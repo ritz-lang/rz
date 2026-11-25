@@ -10,7 +10,9 @@
 # The fd can be passed to worker processes via fork() or unix socket.
 
 import ritzlib.sys
-import ritzlib.fd { Fd, fd_adopt }
+import ritzlib.fd { Fd, fd_adopt, fd_borrow }
+import ritzlib.span
+import ritzlib.mapping
 import ritzlib.result
 import ritzlib.errno
 import zeus.control
@@ -82,8 +84,7 @@ pub fn shm_calculate_size(cfg: *ShmConfig) -> i64
 # ============================================================================
 
 pub struct ShmRegion
-    base: *u8             # Base pointer of mmap'd region
-    size: i64             # Total size of region
+    mem: Span<u8>         # The mapped region (owned: shm_destroy/detach unmap it)
     fd: i32               # File descriptor (memfd)
     config: ShmConfig     # Configuration used to create this region
 
@@ -122,14 +123,13 @@ pub fn shm_create(region: *ShmRegion, cfg: *ShmConfig) -> i32
             return -e.code()
 
     # Map the memory
-    let base: *u8 = sys_mmap(0, total_size, PROT_READ + PROT_WRITE, MAP_SHARED, fd, 0)
-    if base == (-1) as *u8
-        memfd.close()
-        return -1
+    match mmap_shared(@memfd, total_size)
+        Ok(m) => region.mem = m
+        Err(_) =>
+            memfd.close()
+            return -1
 
     # Store region info
-    region.base = base
-    region.size = total_size
     region.fd = fd
     region.config.ring_capacity = cfg.ring_capacity
     region.config.arena_size = cfg.arena_size
@@ -140,16 +140,14 @@ pub fn shm_create(region: *ShmRegion, cfg: *ShmConfig) -> i32
     region.arena_offset = cb_size + req_ring_size + resp_ring_size
 
     # Initialize control block
-    let cb: *ControlBlock = region.base as *ControlBlock
+    let cb: *ControlBlock = shm_get_control_block(region)
     control_block_init(cb)
     cb.ring_capacity = cfg.ring_capacity
     cb.ring_mask = cfg.ring_capacity - 1
 
     # Zero out ring buffers
-    var i: i64 = 0
-    while i < req_ring_size + resp_ring_size
-        *(region.base + region.req_ring_offset + i) = 0
-        i = i + 1
+    var rings: Span<u8> = region.mem[region.req_ring_offset..region.arena_offset]
+    rings.zero()
 
     return 0
 
@@ -157,15 +155,14 @@ pub fn shm_create(region: *ShmRegion, cfg: *ShmConfig) -> i32
 # Takes fd received from Valet
 pub fn shm_attach(region: *ShmRegion, fd: i32, size: i64) -> i32
     # Map the shared memory
-    let base: *u8 = sys_mmap(0, size, PROT_READ + PROT_WRITE, MAP_SHARED, fd, 0)
-    if base == (-1) as *u8
-        return -1
+    let memfd: Fd = fd_borrow(fd)
+    match mmap_shared(@memfd, size)
+        Ok(m) => region.mem = m
+        Err(_) => return -1
 
     # Read config from control block
-    let cb: *ControlBlock = base as *ControlBlock
+    let cb: *ControlBlock = shm_get_control_block(region)
 
-    region.base = base
-    region.size = size
     region.fd = fd
     region.config.ring_capacity = cb.ring_capacity
     region.config.arena_size = 0  # Will calculate from offsets
@@ -180,27 +177,31 @@ pub fn shm_attach(region: *ShmRegion, fd: i32, size: i64) -> i32
     region.resp_ring_offset = cb_size + req_ring_size
     region.arena_offset = cb_size + req_ring_size + resp_ring_size
     region.config.arena_size = size - region.arena_offset
+    if region.config.arena_size < 0
+        # Too small for the layout the control block describes
+        shm_detach(region)
+        return -1
 
     return 0
 
 # Destroy a shared memory region (Valet side - owns the fd)
 pub fn shm_destroy(region: *ShmRegion)
-    if region.base != null && region.size > 0
-        sys_munmap(region.base, region.size)
+    shm_unmap(region)
     # region.fd stays an i32: shm_attach stores a number it does not own
     var memfd: Fd = fd_adopt(region.fd)
     memfd.close()
-    region.base = null
-    region.size = 0
     region.fd = -1
 
 # Detach from a shared memory region (Worker side - doesn't own fd)
 pub fn shm_detach(region: *ShmRegion)
-    if region.base != null && region.size > 0
-        sys_munmap(region.base, region.size)
-    region.base = null
-    region.size = 0
+    shm_unmap(region)
     # Don't close fd - we don't own it
+
+# Unmap the region's mapping (once: it is left empty)
+fn shm_unmap(region: *ShmRegion)
+    if region.mem.len > 0
+        munmap(region.mem)
+    region.mem = span_empty<u8>()
 
 # ============================================================================
 # Accessors
@@ -208,21 +209,23 @@ pub fn shm_detach(region: *ShmRegion)
 
 # Get pointer to control block
 pub fn shm_get_control_block(region: *ShmRegion) -> *ControlBlock
-    return region.base as *ControlBlock
+    return region.mem.as_ptr() as *ControlBlock
 
 # Get pointer to request ring (array of RequestSlot)
 pub fn shm_get_request_ring(region: *ShmRegion) -> *RequestSlot
-    return (region.base + region.req_ring_offset) as *RequestSlot
+    return region.mem.get_ptr(region.req_ring_offset) as *RequestSlot
 
 # Get pointer to response ring (array of ResponseSlot)
 pub fn shm_get_response_ring(region: *ShmRegion) -> *ResponseSlot
-    return (region.base + region.resp_ring_offset) as *ResponseSlot
+    return region.mem.get_ptr(region.resp_ring_offset) as *ResponseSlot
 
 # Initialize a DataArena pointing to the arena region
 pub fn shm_get_arena(region: *ShmRegion, arena: *DataArena)
-    arena.base = region.base + region.arena_offset
-    arena.size = region.config.arena_size
-    arena.offset = 0
+    data_arena_attach(arena, shm_arena_bytes(region))
+
+# The whole data arena region of the mapping
+pub fn shm_arena_bytes(region: *ShmRegion) -> Span<u8>
+    region.mem.slice(region.arena_offset, region.arena_offset + region.config.arena_size)
 
 # Compute the per-slot arena partition size.
 #
@@ -243,4 +246,4 @@ pub fn shm_slot_arena_size(region: *ShmRegion) -> i64
 pub fn shm_get_slot_arena(region: *ShmRegion, slot_idx: i64, arena: *DataArena)
     let slot_size: i64 = shm_slot_arena_size(region)
     let slot_offset: i64 = slot_idx * slot_size
-    data_arena_attach_slot(arena, region.base + region.arena_offset, slot_offset, slot_size)
+    data_arena_attach_slot(arena, shm_arena_bytes(region), slot_offset, slot_size)

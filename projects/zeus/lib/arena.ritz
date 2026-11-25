@@ -9,45 +9,47 @@
 #   - Reset all allocations at once
 #   - 8-byte aligned for performance
 
-import ritzlib.sys
 import ritzlib.span
+import ritzlib.mapping
 
 # ============================================================================
 # Data Arena Structure
 # ============================================================================
 
+# `mem` is the arena's bytes: from the arena's base (where offset 0 is) up to
+# the end of what this view may allocate. Allocations bump `offset` within it.
 pub struct DataArena
-    base: *u8      # Base pointer of mmap'd region
-    size: i64      # Total size of arena
+    mem: Span<u8>  # The arena's bytes (a mapping, usually another process's shm)
     offset: i64    # Current allocation offset (next free byte)
 
 # ============================================================================
 # Public API
 # ============================================================================
 
-# Initialize a data arena with the given size
-# Uses mmap for allocation (MAP_PRIVATE for testing, MAP_SHARED for real use)
+# Initialize a data arena of `size` fresh private bytes (a test arena; the
+# real ones are views into shm, data_arena_attach / shm_get_arena).
 # Returns 0 on success, -1 on failure
 pub fn data_arena_init(arena: *DataArena, size: i64) -> i32
-    let base: *u8 = sys_mmap(0, size, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
-    if base == (-1) as *u8
-        arena.base = null
-        arena.size = 0
-        arena.offset = 0
-        return -1
-
-    arena.base = base
-    arena.size = size
     arena.offset = 0
-    return 0
+    match mmap_anon(size)
+        Ok(m) =>
+            arena.mem = m
+            0
+        Err(_) =>
+            arena.mem = span_empty<u8>()
+            -1
 
-# Destroy a data arena (munmap the memory)
+# Destroy a data arena made by data_arena_init (unmap its memory)
 pub fn data_arena_destroy(arena: *DataArena)
-    if arena.base != null && arena.size > 0
-        sys_munmap(arena.base, arena.size)
-    arena.base = null
-    arena.size = 0
+    if arena.mem.len > 0
+        munmap(arena.mem)
+    arena.mem = span_empty<u8>()
     arena.offset = 0
+
+# Whether the arena has memory to allocate from (false for one a failed
+# init or a detached worker handle left empty)
+pub fn data_arena_valid(arena: *DataArena) -> bool
+    arena.mem.len > 0
 
 # Allocate bytes from the arena
 # Returns pointer to allocated memory, or null if exhausted
@@ -59,11 +61,11 @@ pub fn data_arena_alloc(arena: *DataArena, size: i64) -> *u8
     let aligned_size: i64 = (size + 7) & (0 - 8)
 
     # Check for space
-    if arena.offset + aligned_size > arena.size
+    if arena.offset + aligned_size > arena.mem.len
         return null
 
     # Allocate
-    let ptr: *u8 = arena.base + arena.offset
+    let ptr: *u8 = arena.mem.get_ptr(arena.offset)
     arena.offset = arena.offset + aligned_size
     return ptr
 
@@ -81,11 +83,11 @@ pub fn data_arena_reset(arena: *DataArena)
 # the slot's region.  No two in-flight requests can overlap.
 #
 # Conventions:
-#   * `base` is the GLOBAL arena base (start of the arena region in
-#     shm), the same value used for unpartitioned init — NOT the slot's
-#     start.  This keeps `data_arena_ptr_to_offset` returning a global
-#     offset that the consumer can use directly without needing to know
-#     the slot index.
+#   * `whole` is the GLOBAL arena (all of the arena region in shm), the
+#     same span used for unpartitioned attach — NOT the slot's bytes.
+#     This keeps `data_arena_ptr_to_offset` returning a global offset
+#     that the consumer can use directly without needing to know the
+#     slot index.
 #   * `slot_offset` is the byte offset of this slot's start within the
 #     arena (= slot_idx * slot_size).
 #   * `slot_size` is the byte capacity of this slot's region.
@@ -97,14 +99,13 @@ pub fn data_arena_reset(arena: *DataArena)
 #   * `data_arena_ptr_to_offset(arena, ptr)` returns a GLOBAL offset
 #     (relative to the arena base).
 #   * `data_arena_offset_to_ptr(arena, off)` accepts a GLOBAL offset.
-pub fn data_arena_attach_slot(arena: *DataArena, base: *u8, slot_offset: i64, slot_size: i64)
-    arena.base = base
-    arena.size = slot_offset + slot_size
+pub fn data_arena_attach_slot(arena: *DataArena, whole: Span<u8>, slot_offset: i64, slot_size: i64)
+    arena.mem = whole.to(slot_offset + slot_size)
     arena.offset = slot_offset
 
 # Get remaining capacity
 pub fn data_arena_remaining(arena: *DataArena) -> i64
-    return arena.size - arena.offset
+    return arena.mem.len - arena.offset
 
 # Get current usage
 pub fn data_arena_used(arena: *DataArena) -> i64
@@ -112,35 +113,30 @@ pub fn data_arena_used(arena: *DataArena) -> i64
 
 # Convert a pointer to an offset (for storing in ring slots)
 pub fn data_arena_ptr_to_offset(arena: *DataArena, ptr: *u8) -> i64
-    return (ptr as i64) - (arena.base as i64)
+    return (ptr as i64) - (arena.mem.as_ptr() as i64)
 
 # Convert an offset to a pointer (for accessing data from ring slots)
 pub fn data_arena_offset_to_ptr(arena: *DataArena, offset: i64) -> *u8
-    return arena.base + offset
+    return arena.mem.get_ptr(offset)
 
 # The `len` bytes at `offset` (a global offset, as data_arena_ptr_to_offset
 # gives) as a span, or an empty one when they aren't all inside the arena.
-# The arena's memory is a raw mapping (often another process's shm), so
-# this is where its bytes become a Span for the code that reads and fills
-# them.
 pub fn data_arena_bytes(arena: *DataArena, offset: i64, len: i64) -> Span<u8>
-    if arena.base == null or offset < 0 or len <= 0 or offset > arena.size - len
+    if offset < 0 or len <= 0 or offset > arena.mem.len - len
         return span_empty<u8>()
-    return span_from_ptr<u8>(arena.base + offset, len)
+    return arena.mem[offset..offset + len]
 
 # ============================================================================
 # Shared Memory Arena (for real IPC)
 # ============================================================================
 
-# Initialize arena from existing shared memory region
+# Initialize arena over existing shared memory
 # Used by worker to attach to Valet's shared memory
-pub fn data_arena_attach(arena: *DataArena, base: *u8, size: i64)
-    arena.base = base
-    arena.size = size
+pub fn data_arena_attach(arena: *DataArena, mem: Span<u8>)
+    arena.mem = mem
     arena.offset = 0
 
 # Detach from arena (don't munmap - we don't own it)
 pub fn data_arena_detach(arena: *DataArena)
-    arena.base = null
-    arena.size = 0
+    arena.mem = span_empty<u8>()
     arena.offset = 0

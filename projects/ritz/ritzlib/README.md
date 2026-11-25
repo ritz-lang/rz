@@ -91,7 +91,7 @@ pub fn main() -> i32
 | `io.ritz` | `ritzlib.io` | High-level I/O functions |
 | `iovec.ritz` | `ritzlib.iovec` | Vectored I/O for scatter/gather writes |
 | `json.ritz` | `ritzlib.json` | JSON parser and writer: json_parse(StrView) -> Result<Json, JsonError> |
-| `mapping.ritz` | `ritzlib.mapping` | mmap_anon and munmap: anonymous memory as Result<Span<u8>, Errno> |
+| `mapping.ritz` | `ritzlib.mapping` | mmap_anon, mmap_shared and munmap: mappings as Result<Span<u8>, Errno> |
 | `memory.ritz` | `ritzlib.memory` | Memory allocation infrastructure |
 | `net.ritz` | `ritzlib.net` | Networking primitives for TCP/IP communication |
 | `option.ritz` | `ritzlib.option` | `Option<T>`, a value that may be absent |

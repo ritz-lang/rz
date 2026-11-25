@@ -8,28 +8,29 @@
 
 import ritzlib.sys
 import ritzlib.io
+import ritzlib.span
+import ritzlib.strview
 
 import zeus.shm
 import zeus.control
 import zeus.ring
 import zeus.arena
 import zeus.worker
-import zeus.echo_handler { echo_serve_request, echo_parse_args }
+import zeus.echo_handler { EchoArgs, echo_serve_request, echo_parse_args }
+import ritzlib.option
 
-# Put a request for `path` (NUL-terminated) in the next request slot,
-# with the path in that slot's arena partition, as valet does.
-fn submit_request(region: *ShmRegion, id: u64, path: *u8)
+# Put a request for `path` in the next request slot, with the path in
+# that slot's arena partition, as valet does.
+fn submit_request(region: *ShmRegion, id: u64, path: StrView)
     let cb: *ControlBlock = shm_get_control_block(region)
     let slot_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
     var arena: DataArena
     shm_get_slot_arena(region, slot_idx, @arena)
 
-    var len: i32 = 0
-    while *(path + len) != 0
-        len += 1
-    let dst: *u8 = data_arena_alloc(@arena, len as i64)
-    for i in 0..len
-        *(dst + i) = *(path + i)
+    let len: i64 = path.len
+    let dst: *u8 = data_arena_alloc(@arena, len)
+    var bytes: [u8] = data_arena_bytes(@arena, data_arena_ptr_to_offset(@arena, dst), len)
+    bytes.copy_from(path.as_bytes())
 
     let slot: *RequestSlot = shm_get_request_ring(region) + slot_idx
     request_slot_init(slot)
@@ -45,19 +46,15 @@ fn next_response(region: *ShmRegion) -> *ResponseSlot
     let idx: i64 = control_block_slot_index(cb, cb.resp_read_idx)
     return shm_get_response_ring(region) + idx
 
-# 1 if the response body is exactly the NUL-terminated `want`
-fn body_is(region: *ShmRegion, resp: *ResponseSlot, want: *u8) -> i32
-    var len: i32 = 0
-    while *(want + len) != 0
-        len += 1
-    if resp.body_len as i32 != len
+# 1 if the response body is exactly `want`
+fn body_is(region: *ShmRegion, resp: *ResponseSlot, want: StrView) -> i32
+    if resp.body_len as i64 != want.len
         return 0
     var arena: DataArena
     shm_get_arena(region, @arena)
-    let got: *u8 = data_arena_offset_to_ptr(@arena, resp.body_offset as i64)
-    for i in 0..len
-        if *(got + i) != *(want + i)
-            return 0
+    let got: [u8] = data_arena_bytes(@arena, resp.body_offset as i64, want.len)
+    if not got.as_strview().eq(want)
+        return 0
     return 1
 
 [[test]]
@@ -68,9 +65,9 @@ fn test_echo_answers_then_acks() -> i32
     shm_create(@region, @cfg)
     let cb: *ControlBlock = shm_get_control_block(@region)
     var ctx: WorkerContext
-    worker_init(@ctx, region.fd, region.size)
+    worker_init(@ctx, region.fd, region.mem.len)
 
-    submit_request(@region, 41, c"/hello")
+    submit_request(@region, 41, "/hello")
     let req: *RequestSlot = worker_poll_request(@ctx)
     assert req != null
     assert echo_serve_request(@ctx, req, 5) == 1
@@ -80,7 +77,7 @@ fn test_echo_answers_then_acks() -> i32
     let resp: *ResponseSlot = next_response(@region)
     assert resp.id == 41
     assert resp.status == 200
-    assert body_is(@region, resp, c"Echo: /hello") == 1
+    assert body_is(@region, resp, "Echo: /hello") == 1
 
     worker_destroy(@ctx)
     shm_destroy(@region)
@@ -97,17 +94,17 @@ fn test_echo_body_in_request_arena_slot() -> i32
     shm_create(@region, @cfg)
     let cb: *ControlBlock = shm_get_control_block(@region)
     var ctx: WorkerContext
-    worker_init(@ctx, region.fd, region.size)
+    worker_init(@ctx, region.fd, region.mem.len)
     let slot_size: i64 = shm_slot_arena_size(@region)
 
-    submit_request(@region, 1, c"/one")
-    submit_request(@region, 2, c"/two")
+    submit_request(@region, 1, "/one")
+    submit_request(@region, 2, "/two")
 
     let req1: *RequestSlot = worker_poll_request(@ctx)
     assert echo_serve_request(@ctx, req1, 5) == 1
     let resp1: *ResponseSlot = next_response(@region)
     assert resp1.body_offset as i64 < slot_size
-    assert body_is(@region, resp1, c"Echo: /one") == 1
+    assert body_is(@region, resp1, "Echo: /one") == 1
     control_block_resp_read_inc(cb)
 
     let req2: *RequestSlot = worker_poll_request(@ctx)
@@ -117,7 +114,7 @@ fn test_echo_body_in_request_arena_slot() -> i32
     assert resp2.id == 2
     assert resp2.body_offset as i64 >= slot_size
     assert resp2.body_offset as i64 < 2 * slot_size
-    assert body_is(@region, resp2, c"Echo: /two") == 1
+    assert body_is(@region, resp2, "Echo: /two") == 1
 
     worker_destroy(@ctx)
     shm_destroy(@region)
@@ -133,9 +130,9 @@ fn test_echo_full_ring_leaves_request_unacked() -> i32
     shm_create(@region, @cfg)
     let cb: *ControlBlock = shm_get_control_block(@region)
     var ctx: WorkerContext
-    worker_init(@ctx, region.fd, region.size)
+    worker_init(@ctx, region.fd, region.mem.len)
 
-    submit_request(@region, 77, c"/full")
+    submit_request(@region, 77, "/full")
     cb.resp_write_idx = cb.resp_read_idx + cb.ring_capacity
     let write_before: i64 = cb.resp_write_idx
 
@@ -163,7 +160,7 @@ fn test_echo_full_ring_leaves_request_unacked() -> i32
     assert resp.id == 77
     assert resp.status == 200
     assert read_before == cb.resp_read_idx
-    assert body_is(@region, resp, c"Echo: /full") == 1
+    assert body_is(@region, resp, "Echo: /full") == 1
 
     worker_destroy(@ctx)
     shm_destroy(@region)
@@ -174,41 +171,39 @@ fn test_echo_full_ring_leaves_request_unacked() -> i32
 # ============================================================================
 # The old inline digit loops wrapped on overflow and read any byte as a
 # digit.  echo_parse_args takes shm_size in 1..i64::MAX and worker_id in
-# 0..i32::MAX, and leaves both outputs alone on failure.
+# 0..i32::MAX, and is None otherwise.
 
-fn echo_reads(size_s: *u8, id_s: *u8, want_size: i64, want_id: i32) -> bool
-    var size: i64 = 77
-    var id: i32 = 77
-    return echo_parse_args(size_s, id_s, @size, @id) == 1 and size == want_size and id == want_id
+fn echo_reads(size_s: StrView, id_s: StrView, want_size: i64, want_id: i32) -> bool
+    match echo_parse_args(size_s, id_s)
+        Some(a) => a.shm_size == want_size and a.worker_id == want_id
+        None => false
 
-fn echo_rejects(size_s: *u8, id_s: *u8) -> bool
-    var size: i64 = 77
-    var id: i32 = 77
-    return echo_parse_args(size_s, id_s, @size, @id) == 0 and size == 77 and id == 77
+fn echo_rejects(size_s: StrView, id_s: StrView) -> bool
+    echo_parse_args(size_s, id_s).is_none()
 
 [[test]]
 fn test_echo_parse_args_reads() -> i32
-    assert echo_reads(c"2097152", c"3", 2097152, 3)
-    assert echo_reads(c"9223372036854775807", c"0", 9223372036854775807, 0)
-    assert echo_reads(c"1", c"2147483647", 1, 2147483647)
+    assert echo_reads("2097152", "3", 2097152, 3)
+    assert echo_reads("9223372036854775807", "0", 9223372036854775807, 0)
+    assert echo_reads("1", "2147483647", 1, 2147483647)
     return 0
 
 [[test]]
 fn test_echo_parse_args_bad_shm_size() -> i32
     # Old loop: i64::MAX + 1 wrapped to i64::MIN; '-' and 'k' read as digits
-    assert echo_rejects(c"9223372036854775808", c"0")
-    assert echo_rejects(c"-9223372036854775808", c"0")
-    assert echo_rejects(c"0", c"0")
-    assert echo_rejects(c"64k", c"0")
-    assert echo_rejects(c"", c"0")
+    assert echo_rejects("9223372036854775808", "0")
+    assert echo_rejects("-9223372036854775808", "0")
+    assert echo_rejects("0", "0")
+    assert echo_rejects("64k", "0")
+    assert echo_rejects("", "0")
     return 0
 
 [[test]]
 fn test_echo_parse_args_bad_worker_id() -> i32
     # Old loop: 2147483648 wrapped to i32::MIN
-    assert echo_rejects(c"4096", c"2147483648")
-    assert echo_rejects(c"4096", c"9223372036854775808")
-    assert echo_rejects(c"4096", c"-1")
-    assert echo_rejects(c"4096", c"-9223372036854775808")
-    assert echo_rejects(c"4096", c"x")
+    assert echo_rejects("4096", "2147483648")
+    assert echo_rejects("4096", "9223372036854775808")
+    assert echo_rejects("4096", "-1")
+    assert echo_rejects("4096", "-9223372036854775808")
+    assert echo_rejects("4096", "x")
     return 0

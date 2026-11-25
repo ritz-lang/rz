@@ -10,6 +10,7 @@
 
 import ritzlib.sys
 import ritzlib.io
+import ritzlib.span
 
 # Import our library
 import zeus.shm
@@ -92,8 +93,8 @@ fn test_shm_create() -> i32
         return 1
 
     # Check region is valid
-    assert region.base != null
-    assert region.size >= 0
+    assert region.mem.len > 0
+    assert region.mem.len >= 0
 
     # Check fd is valid (>= 0)
     if region.fd < 0
@@ -159,8 +160,8 @@ fn test_shm_arena_access() -> i32
     var arena: DataArena
     shm_get_arena(@region, @arena)
 
-    assert arena.base != null
-    assert arena.size == cfg.arena_size
+    assert arena.mem.len > 0
+    assert arena.mem.len == cfg.arena_size
 
     shm_destroy(@region)
     return 0
@@ -243,7 +244,7 @@ fn test_shm_attach_detach() -> i32
 
     # Attach to same region (simulates Worker, but in same process for testing)
     var worker_region: ShmRegion
-    let result: i32 = shm_attach(@worker_region, region.fd, region.size)
+    let result: i32 = shm_attach(@worker_region, region.fd, region.mem.len)
     if result != 0
         print("FAIL: shm_attach failed with code {result}\n")
         shm_destroy(@region)
@@ -260,5 +261,39 @@ fn test_shm_attach_detach() -> i32
     assert cb2.worker_pid == 12345
 
     shm_detach(@worker_region)
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_shm_attach_bad_fd_fails() -> i32
+    var region: ShmRegion
+    assert shm_attach(@region, -1, 4096) == -1
+    return 0
+
+[[test]]
+fn test_shm_attach_too_small_for_its_rings_fails() -> i32
+    # A size that ends inside the rings the control block describes has no
+    # arena: refused, and unmapped again.
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+    var region: ShmRegion
+    assert shm_create(@region, @cfg) == 0
+    var worker_region: ShmRegion
+    assert shm_attach(@worker_region, region.fd, 8192) == -1
+    assert worker_region.mem.len == 0
+    shm_destroy(@region)
+    return 0
+
+[[test]]
+fn test_shm_arena_bytes_is_the_arena_region() -> i32
+    var cfg: ShmConfig
+    shm_config_init(@cfg, 16, 65536)
+    var region: ShmRegion
+    assert shm_create(@region, @cfg) == 0
+    let a: Span<u8> = shm_arena_bytes(@region)
+    assert a.len == 65536
+    assert a.as_ptr() == region.mem.get_ptr(region.arena_offset)
+    # The rings shm_create zeroed sit before it
+    assert region.mem.get(region.req_ring_offset) == 0
     shm_destroy(@region)
     return 0

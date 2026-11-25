@@ -11,17 +11,19 @@
 #   - Zero-downtime restarts via SIGHUP
 #   - Minimal overhead in steady state
 
-import ritzlib.cstr
 import ritzlib.sys
 import ritzlib.fd { Fd, Pipe, fd_adopt, pipe }
 import ritzlib.fs { unlink }
-import ritzlib.span { Span }
+import ritzlib.span
+import ritzlib.strview
+import ritzlib.gvec
 import ritzlib.result
 import ritzlib.errno
 import zeus.shm
 import zeus.control
 import zeus.ring
 import zeus.arena
+import zeus.sockaddr
 
 # ============================================================================
 # Constants
@@ -66,14 +68,14 @@ pub struct DaemonConfig
     worker_count: i32           # 0: Number of workers to spawn
     shm_size: i64               # 8: Size of each worker's shm region
     ring_capacity: i64          # 16: Ring buffer capacity
-    socket_path: *u8            # 24: Unix socket path for Valet
+    socket_path: StrView        # Unix socket path for Valet
 
 # Initialize with defaults
 pub fn daemon_config_init(cfg: *DaemonConfig)
     cfg.worker_count = DEFAULT_WORKER_COUNT
     cfg.shm_size = DEFAULT_SHM_SIZE
     cfg.ring_capacity = DEFAULT_RING_CAPACITY
-    cfg.socket_path = null
+    cfg.socket_path = ""
 
 # ============================================================================
 # Worker Slot
@@ -105,7 +107,7 @@ pub struct DaemonContext
     _pad1: i32                  # 36: Padding
 
     # Workers
-    workers: *WorkerSlot        # 40: Worker slot array (mmap'd)
+    workers: Vec<WorkerSlot>    # MAX_WORKERS slots, never grown
     worker_count: i32           # 48: Current number of allocated workers
     max_workers: i32            # 52: Maximum workers
 
@@ -134,20 +136,14 @@ pub fn daemon_init(ctx: *DaemonContext, cfg: *DaemonConfig) -> i32
     ctx.max_workers = cfg.worker_count
     ctx.listen_fd = fd_adopt(-1)
 
-    # Allocate worker slots
-    let slot_size: i64 = (MAX_WORKERS as i64) * 72  # sizeof(WorkerSlot) ~ 72
-    let mmap_flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
-    let mmap_prot: i32 = PROT_READ + PROT_WRITE
-    let workers: *WorkerSlot = sys_mmap(0, slot_size, mmap_prot, mmap_flags, -1, 0) as *WorkerSlot
-    if workers == (-1 as *WorkerSlot)
+    # Allocate worker slots (zeroed, then each initialized)
+    ctx.workers = vec_zeroed<WorkerSlot>(MAX_WORKERS as i64)
+    if ctx.workers.len() != MAX_WORKERS as i64
         return -1
 
-    ctx.workers = workers
-
-    # Initialize all slots
     var i: i32 = 0
     while i < MAX_WORKERS
-        worker_slot_init(ctx.workers + i)
+        worker_slot_init(ctx.workers.get_ptr(i as i64))
         i = i + 1
 
     # Create signal pipe
@@ -156,7 +152,7 @@ pub fn daemon_init(ctx: *DaemonContext, cfg: *DaemonConfig) -> i32
             ctx.signal_read_fd = p.read
             ctx.signal_write_fd = p.write
         Err(_) =>
-            sys_munmap(ctx.workers as *u8, slot_size)
+            ctx.workers.deinit()
             return -1
 
     # Set pipe to non-blocking
@@ -174,8 +170,8 @@ fn set_nonblocking(fd: i32)
 pub fn daemon_destroy(ctx: *DaemonContext)
     # Stop all workers
     var i: i32 = 0
-    while i < MAX_WORKERS
-        let slot: *WorkerSlot = ctx.workers + i
+    while i < ctx.workers.len() as i32
+        let slot: *WorkerSlot = ctx.workers.get_ptr(i as i64)
         if slot.state != WORKER_SLOT_FREE
             if slot.shm.fd >= 0
                 shm_destroy(@slot.shm)
@@ -183,10 +179,7 @@ pub fn daemon_destroy(ctx: *DaemonContext)
         i = i + 1
 
     # Free worker slots
-    if ctx.workers != null
-        let slot_size: i64 = (MAX_WORKERS as i64) * 72
-        sys_munmap(ctx.workers as *u8, slot_size)
-        ctx.workers = null
+    ctx.workers.deinit()
 
     # Close socket
     ctx.listen_fd.close()
@@ -225,7 +218,7 @@ pub fn daemon_alloc_worker_slot(ctx: *DaemonContext) -> i32
     # Find free slot
     var i: i32 = 0
     while i < MAX_WORKERS
-        let slot: *WorkerSlot = ctx.workers + i
+        let slot: *WorkerSlot = ctx.workers.get_ptr(i as i64)
         if slot.state == WORKER_SLOT_FREE
             # Create shm for this worker
             var shm_cfg: ShmConfig
@@ -250,7 +243,7 @@ pub fn daemon_free_worker_slot(ctx: *DaemonContext, slot_idx: i32)
     if slot_idx < 0 || slot_idx >= MAX_WORKERS
         return
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     if slot.state == WORKER_SLOT_FREE
         return
 
@@ -266,7 +259,7 @@ pub fn daemon_free_worker_slot(ctx: *DaemonContext, slot_idx: i32)
 pub fn daemon_get_worker_slot(ctx: *DaemonContext, slot_idx: i32) -> *WorkerSlot
     if slot_idx < 0 || slot_idx >= MAX_WORKERS
         return null
-    return ctx.workers + slot_idx
+    return ctx.workers.get_ptr(slot_idx as i64)
 
 # ============================================================================
 # Worker Lifecycle
@@ -281,7 +274,7 @@ pub fn daemon_prepare_worker(ctx: *DaemonContext, slot_idx: i32) -> i32
     if slot_idx < 0 || slot_idx >= MAX_WORKERS
         return -1
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     let reaped: bool = slot.state == WORKER_SLOT_DEAD && slot.pid == 0
     if slot.state != WORKER_SLOT_ALLOCATED && !reaped
         return -1
@@ -301,7 +294,7 @@ pub fn daemon_mark_worker_running(ctx: *DaemonContext, slot_idx: i32, pid: i32)
     if slot_idx < 0 || slot_idx >= MAX_WORKERS
         return
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     slot.state = WORKER_SLOT_RUNNING
     slot.pid = pid
     slot.start_time = get_time_ns_daemon()
@@ -311,7 +304,7 @@ pub fn daemon_request_worker_stop(ctx: *DaemonContext, slot_idx: i32)
     if slot_idx < 0 || slot_idx >= MAX_WORKERS
         return
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     if slot.state != WORKER_SLOT_RUNNING
         return
 
@@ -328,7 +321,7 @@ pub fn daemon_mark_worker_reaped(ctx: *DaemonContext, slot_idx: i32)
     if slot_idx < 0 || slot_idx >= MAX_WORKERS
         return
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     if slot.state == WORKER_SLOT_FREE
         return
     slot.state = WORKER_SLOT_DEAD
@@ -339,7 +332,7 @@ pub fn daemon_get_running_worker_count(ctx: *DaemonContext) -> i32
     var count: i32 = 0
     var i: i32 = 0
     while i < MAX_WORKERS
-        let slot: *WorkerSlot = ctx.workers + i
+        let slot: *WorkerSlot = ctx.workers.get_ptr(i as i64)
         if slot.state == WORKER_SLOT_RUNNING
             count = count + 1
         i = i + 1
@@ -355,49 +348,36 @@ fn get_time_ns_daemon() -> i64
 # Socket Management
 # ============================================================================
 
-# Create unix socket for Valet connections
-pub fn daemon_create_socket(ctx: *DaemonContext, path: *u8) -> i32
+# Create the unix socket Valet connects to, listening at `path` (an old
+# socket file there is removed first)
+pub fn daemon_create_socket(ctx: *DaemonContext, path: StrView) -> Result<(), Errno>
     # Create socket: socket(AF_UNIX=1, SOCK_STREAM=1, 0)
     let fd: i32 = syscall3(SYS_SOCKET, 1, 1, 0) as i32
     if fd < 0
-        return fd
+        return Err(errno_from_raw(fd))
     var sock: Fd = fd_adopt(fd)
 
     # Unlink existing socket file
-    unlink(strview_from_cstr(path))
+    unlink(path)
 
     # Bind to path
     var addr: [110]u8  # sockaddr_un size
-    # Zero the struct
-    var j: i32 = 0
-    while j < 110
-        addr[j] = 0
-        j = j + 1
-
-    # Set family = AF_UNIX (1)
-    addr[0] = 1
-    addr[1] = 0
-
-    # Copy path (starting at offset 2)
-    var i: i32 = 0
-    while *(path + i) != 0 && i < 107
-        addr[2 + i] = *(path + i)
-        i = i + 1
+    let addrlen: i64 = sockaddr_un_fill(@addr, path)
 
     # bind(fd, addr, addrlen)
-    let bind_result: i32 = syscall3(SYS_BIND, fd as i64, @addr[0] as i64, (2 + i) as i64) as i32
+    let bind_result: i32 = syscall3(SYS_BIND, fd as i64, @addr[0] as i64, addrlen) as i32
     if bind_result < 0
         sock.close()
-        return bind_result
+        return Err(errno_from_raw(bind_result))
 
     # listen(fd, backlog)
     let listen_result: i32 = syscall2(SYS_LISTEN, fd as i64, 16) as i32
     if listen_result < 0
         sock.close()
-        return listen_result
+        return Err(errno_from_raw(listen_result))
 
     ctx.listen_fd = sock
-    return 0
+    Ok(())
 
 # ============================================================================
 # Signal Handling
@@ -407,7 +387,8 @@ pub fn daemon_create_socket(ctx: *DaemonContext, path: *u8) -> i32
 pub fn daemon_notify_signal(ctx: *DaemonContext, signum: i32)
     var buf: [1]u8
     buf[0] = signum as u8
-    ctx.signal_write_fd.write(Span<u8> { ptr: @buf[0], len: 1 })
+    let b: [u8] = @buf
+    ctx.signal_write_fd.write(b)
 
 # ============================================================================
 # Worker Info for Valet
@@ -418,7 +399,7 @@ pub fn daemon_get_worker_shm_fd(ctx: *DaemonContext, slot_idx: i32) -> i32
     if slot_idx < 0 || slot_idx >= MAX_WORKERS
         return -1
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     return slot.shm.fd
 
 # Get worker's shm size (for Valet to attach)
@@ -426,5 +407,5 @@ pub fn daemon_get_worker_shm_size(ctx: *DaemonContext, slot_idx: i32) -> i64
     if slot_idx < 0 || slot_idx >= MAX_WORKERS
         return -1
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
-    return slot.shm.size
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
+    return slot.shm.mem.len

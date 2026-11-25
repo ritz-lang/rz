@@ -9,15 +9,13 @@
 # Note: We can't easily test fork/exec or signal handlers in unit tests,
 # so we focus on the helper functions and argument parsing.
 
-import ritzlib.cstr
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
-import ritzlib.memory
-import ritzlib.string { String, string_from }
+import ritzlib.string { String, string_from, string_new }
 import ritzlib.os.env { env_iter, env_get_or }
 import ritzlib.strview
-import ritzlib.span { Span, span_from_ptr }
+import ritzlib.span { Span }
 import ritzlib.fd { Fd, fd_open }
 import ritzlib.fs { mkdir, rmdir, unlink }
 import ritzlib.process { ProcessResult, wait_pid, process_id }
@@ -39,7 +37,7 @@ fn test_parse_args_defaults() -> i32
         prints("FAIL: default worker_count should be 4\n")
         return 1
 
-    if opts.socket_path == null
+    if not opts.socket_path.eq("/run/zeus/zeus.sock")
         prints("FAIL: socket_path should have default\n")
         return 1
 
@@ -56,7 +54,7 @@ fn test_parse_args_worker_count() -> i32
     argv[1] = "-w"
     argv[2] = "8"
 
-    let result: i32 = zeus_parse_args(@opts, span_from_ptr(@argv[0], 3))
+    let result: i32 = zeus_parse_args(@opts, @argv)
     if result < 0
         prints("FAIL: parse_args failed\n")
         return 1
@@ -78,13 +76,13 @@ fn test_parse_args_socket_path() -> i32
     argv[1] = "-s"
     argv[2] = "/run/zeus.sock"
 
-    let result: i32 = zeus_parse_args(@opts, span_from_ptr(@argv[0], 3))
+    let result: i32 = zeus_parse_args(@opts, @argv)
     if result < 0
         prints("FAIL: parse_args failed\n")
         return 1
 
-    # Check socket path was set (compare first char)
-    if opts.socket_path == null
+    # Check socket path was set
+    if not opts.socket_path.eq("/run/zeus.sock")
         prints("FAIL: socket_path should be set\n")
         return 1
 
@@ -101,7 +99,7 @@ fn test_parse_args_shm_size() -> i32
     argv[1] = "-m"
     argv[2] = "4194304"
 
-    let result: i32 = zeus_parse_args(@opts, span_from_ptr(@argv[0], 3))
+    let result: i32 = zeus_parse_args(@opts, @argv)
     if result < 0
         prints("FAIL: parse_args failed\n")
         return 1
@@ -127,7 +125,7 @@ fn test_parse_args_multiple() -> i32
     argv[5] = "-s"
     argv[6] = "/run/z.sock"
 
-    let result: i32 = zeus_parse_args(@opts, span_from_ptr(@argv[0], 7))
+    let result: i32 = zeus_parse_args(@opts, @argv)
     if result < 0
         prints("FAIL: parse_args failed\n")
         return 1
@@ -152,7 +150,7 @@ fn test_parse_args_invalid() -> i32
     argv[0] = "zeus"
     argv[1] = "-x"
 
-    let result: i32 = zeus_parse_args(@opts, span_from_ptr(@argv[0], 2))
+    let result: i32 = zeus_parse_args(@opts, @argv)
     if result >= 0
         prints("FAIL: should fail on unknown flag\n")
         return 1
@@ -168,84 +166,84 @@ fn test_parse_args_invalid() -> i32
 # wrapped on overflow and stopped at the first non-digit, reporting success.
 
 # true if `s` parses to exactly `want`
-fn i32_reads(s: *u8, want: i32) -> bool
-    var out: i32 = 77
-    return str_to_i32(s, @out) == 1 and out == want
+fn i32_reads(s: StrView, want: i32) -> bool
+    match str_to_i32(s)
+        Some(n) => n == want
+        None => false
 
-# true if `s` is rejected and *out is left alone
-fn i32_rejects(s: *u8) -> bool
-    var out: i32 = 77
-    return str_to_i32(s, @out) == 0 and out == 77
+# true if `s` is rejected
+fn i32_rejects(s: StrView) -> bool
+    str_to_i32(s).is_none()
 
-fn i64_reads(s: *u8, want: i64) -> bool
-    var out: i64 = 77
-    return str_to_i64(s, @out) == 1 and out == want
+fn i64_reads(s: StrView, want: i64) -> bool
+    match str_to_i64(s)
+        Some(n) => n == want
+        None => false
 
-fn i64_rejects(s: *u8) -> bool
-    var out: i64 = 77
-    return str_to_i64(s, @out) == 0 and out == 77
+fn i64_rejects(s: StrView) -> bool
+    str_to_i64(s).is_none()
 
 [[test]]
 fn test_str_to_i32() -> i32
-    assert i32_reads(c"123", 123)
-    assert i32_reads(c"0", 0)
-    assert i32_reads(c"65536", 65536)
-    assert i32_reads(c"-42", -42)
+    assert i32_reads("123", 123)
+    assert i32_reads("0", 0)
+    assert i32_reads("65536", 65536)
+    assert i32_reads("-42", -42)
     return 0
 
 [[test]]
 fn test_str_to_i32_extremes() -> i32
-    assert i32_reads(c"2147483647", 2147483647)
-    assert i32_reads(c"-2147483648", -2147483647 - 1)
+    assert i32_reads("2147483647", 2147483647)
+    assert i32_reads("-2147483648", -2147483647 - 1)
     return 0
 
 [[test]]
 fn test_str_to_i32_out_of_range() -> i32
     # Old loop: 2147483648 wrapped to i32::MIN, 4294967297 to 1
-    assert i32_rejects(c"2147483648")
-    assert i32_rejects(c"-2147483649")
-    assert i32_rejects(c"4294967297")
-    assert i32_rejects(c"9223372036854775807")
-    assert i32_rejects(c"-9223372036854775808")
-    assert i32_rejects(c"9223372036854775808")
+    assert i32_rejects("2147483648")
+    assert i32_rejects("-2147483649")
+    assert i32_rejects("4294967297")
+    assert i32_rejects("9223372036854775807")
+    assert i32_rejects("-9223372036854775808")
+    assert i32_rejects("9223372036854775808")
     return 0
 
 [[test]]
 fn test_str_to_i32_non_digit() -> i32
-    # Old loop: "12a" read as 12, "abc" and "" as 0
-    assert i32_rejects(c"12a")
-    assert i32_rejects(c"abc")
-    assert i32_rejects(c"")
-    assert i32_rejects(c"-")
+    # Old loop: "12a" read as 12, "ab" and "" as 0
+    assert i32_rejects("12a")
+    assert i32_rejects("ab")
+    assert i32_rejects("")
+    assert i32_rejects("-")
     return 0
 
 [[test]]
 fn test_str_to_i64() -> i32
-    assert i64_reads(c"1048576", 1048576)
-    assert i64_reads(c"4294967296", 4294967296)
-    assert i64_reads(c"0", 0)
+    assert i64_reads("1048576", 1048576)
+    assert i64_reads("4294967296", 4294967296)
+    assert i64_reads("0", 0)
     return 0
 
 [[test]]
 fn test_str_to_i64_extremes() -> i32
-    assert i64_reads(c"9223372036854775807", 9223372036854775807)
-    assert i64_reads(c"-9223372036854775808", -9223372036854775807 - 1)
+    assert i64_reads("9223372036854775807", 9223372036854775807)
+    assert i64_reads("-9223372036854775808", -9223372036854775807 - 1)
     return 0
 
 [[test]]
 fn test_str_to_i64_out_of_range() -> i32
     # Old loop: i64::MAX + 1 wrapped to i64::MIN
-    assert i64_rejects(c"9223372036854775808")
-    assert i64_rejects(c"-9223372036854775809")
-    assert i64_rejects(c"18446744073709551617")
+    assert i64_rejects("9223372036854775808")
+    assert i64_rejects("-9223372036854775809")
+    assert i64_rejects("18446744073709551617")
     return 0
 
 [[test]]
 fn test_str_to_i64_non_digit() -> i32
-    assert i64_rejects(c"4M")
-    assert i64_rejects(c"abc")
-    assert i64_rejects(c"")
-    assert i64_rejects(c"-")
+    assert i64_rejects("4M")
+    assert i64_rejects("ab")
+    assert i64_rejects("")
+    assert i64_rejects("-")
     return 0
 
 # zeus_parse_args fails on a number its option can't hold
@@ -256,7 +254,7 @@ fn parse_flag(flag: StrView, value: StrView) -> i32
     argv[0] = "zeus"
     argv[1] = flag
     argv[2] = value
-    return zeus_parse_args(@opts, span_from_ptr(@argv[0], 3))
+    return zeus_parse_args(@opts, @argv)
 
 [[test]]
 fn test_parse_args_rejects_bad_worker_count() -> i32
@@ -274,26 +272,6 @@ fn test_parse_args_rejects_bad_shm_size() -> i32
 fn test_parse_args_rejects_bad_ring_capacity() -> i32
     assert parse_flag("-r", "9223372036854775808") == -1
     assert parse_flag("-r", "") == -1
-    return 0
-
-# ============================================================================
-# Test: String Comparison
-# ============================================================================
-
-[[test]]
-fn test_str_eq_cstr() -> i32
-    if str_eq_cstr(c"-w", c"-w") != 1
-        prints("FAIL: -w should equal -w\n")
-        return 1
-
-    if str_eq_cstr(c"-w", c"-s") != 0
-        prints("FAIL: -w should not equal -s\n")
-        return 1
-
-    if str_eq_cstr(c"hello", c"hello") != 1
-        prints("FAIL: hello should equal hello\n")
-        return 1
-
     return 0
 
 # ============================================================================
@@ -328,7 +306,7 @@ fn test_pid_file_path() -> i32
     zeus_options_init(@opts)
 
     # Default pid file should be set
-    if opts.pid_file == null
+    if not opts.pid_file.eq("/run/zeus/zeus.pid")
         prints("FAIL: pid_file should have default\n")
         return 1
 
@@ -362,13 +340,19 @@ fn scratch_dir(tag: StrView) -> String
     scratch_dir_in(env_get_or("TMPDIR", ""), tag)
 
 
+# `<dir><name>`
+fn path_in(dir: StrView, name: StrView) -> String
+    var p: String = string_from(dir)
+    p.push_str(name)
+    p
+
 # Write `<head><record>\n` to `script` as an executable (0755) file.
-fn write_script(script: *u8, head: StrView, record: *u8) -> bool
-    match fd_open(strview_from_cstr(script), O_WRONLY | O_CREAT | O_TRUNC, 493)
+fn write_script(script: StrView, head: StrView, record: StrView) -> bool
+    match fd_open(script, O_WRONLY | O_CREAT | O_TRUNC, 493)
         Ok(f) =>
             var file: Fd = f
             file.write_str(head)
-            file.write_str(strview_from_cstr(record))
+            file.write_str(record)
             file.write_str("\n")
             file.close()
             true
@@ -383,36 +367,31 @@ fn dev_null_raw() -> i32
 
 
 # Exec a script that writes its arguments to `out`, wait, read them back.
-fn spawn_and_capture(dir: StrView, worker_count: i32, out: *u8, out_cap: i64) -> i64
-    var script: [256]u8
-    var record: [256]u8
-    let d: i64 = dir.len()
-    memcpy(@script[0], dir.as_ptr(), d)
-    memcpy(@script[d], c"/w.sh", 6)
-    memcpy(@record[0], dir.as_ptr(), d)
-    memcpy(@record[d], c"/argv", 6)
+fn spawn_and_capture(dir: StrView, worker_count: i32, out: [u8]) -> i64
+    let script: String = path_in(dir, "/w.sh")
+    let record: String = path_in(dir, "/argv")
 
     # #!/bin/sh + `echo "$@" > <dir>/argv`
-    if !write_script(@script[0], "#!/bin/sh\necho \"$@\" > ", @record[0])
+    if !write_script(script.as_view(), "#!/bin/sh\necho \"$@\" > ", record.as_view())
         return -1
 
     let shm: i32 = dev_null_raw()
-    let pid: i32 = spawn_worker(shm, 4096, 7, worker_count, @script[0])
-    if pid <= 0
-        return -2
+    let pid: i32 = match spawn_worker(shm, 4096, 7, worker_count, script.as_view())
+        Some(p) => p
+        None => return -2
     wait_pid(pid)
 
     var got: i64 = 0
-    match fd_open(strview_from_cstr(@record[0]), O_RDONLY, 0)
+    match fd_open(record.as_view(), O_RDONLY, 0)
         Ok(f) =>
             var rf: Fd = f
-            match rf.read(Span<u8> { ptr: out, len: out_cap })
+            match rf.read(out)
                 Ok(k) => got = k
                 Err(e) => got = -(e.code() as i64)
             rf.close()
         Err(_) => return -3
-    unlink(strview_from_cstr(@record[0]))
-    unlink(strview_from_cstr(@script[0]))
+    unlink(record.as_view())
+    unlink(script.as_view())
     got
 
 
@@ -464,7 +443,7 @@ fn test_scratch_dir_follows_tmpdir() -> i32
     let d: StrView = dir.as_view()
     mkdir(d, 448)
     var out: [64]u8
-    let n: i64 = spawn_and_capture(d, 2, @out[0], 64)
+    let n: i64 = spawn_and_capture(d, 2, @out)
     rmdir(d)
     if n <= 0
         return 2
@@ -477,12 +456,14 @@ fn test_spawn_worker_passes_worker_count() -> i32
     let d: StrView = dir.as_view()
     mkdir(d, 448)
     var out: [64]u8
-    let n: i64 = spawn_and_capture(d, 3, @out[0], 64)
+    let n: i64 = spawn_and_capture(d, 3, @out)
     rmdir(d)
     if n < 0
         return 1
     # "<shm_size> <worker_id> <worker_count>\n"
-    if not strview_from_ptr(@out[0], n).eq("4096 7 3\n")
+    let all: [u8] = @out
+    let got: [u8] = all[0..n]
+    if not got.as_strview().eq("4096 7 3\n")
         return 2
     0
 
@@ -515,47 +496,31 @@ fn test_spawn_worker_passes_the_environment() -> i32
     var dir: String = scratch_dir("zeus-env-")
     let d: StrView = dir.as_view()
     mkdir(d, 448)
-    let dl: i64 = d.len()
-    var script: [256]u8
-    var record: [256]u8
-    memcpy(@script[0], d.as_ptr(), dl)
-    memcpy(@script[dl], c"/w.sh", 6)
-    memcpy(@record[0], d.as_ptr(), dl)
-    memcpy(@record[dl], c"/env", 5)
+    let script: String = path_in(d, "/w.sh")
+    let record: String = path_in(d, "/env")
 
     # #!/bin/sh + `env > <dir>/env`
-    if !write_script(@script[0], "#!/bin/sh\nenv > ", @record[0])
+    if !write_script(script.as_view(), "#!/bin/sh\nenv > ", record.as_view())
         return 1
 
     let shm: i32 = dev_null_raw()
-    let pid: i32 = spawn_worker(shm, 4096, 0, 1, @script[0])
-    if pid <= 0
-        return 2
+    let pid: i32 = match spawn_worker(shm, 4096, 0, 1, script.as_view())
+        Some(p) => p
+        None => return 2
     wait_pid(pid)
 
-    let cap: i64 = 262144
-    let out: *u8 = malloc(cap + 1)
-    var n: i64 = 0
+    var out: String = string_new()
     var opened: bool = false
-    match fd_open(strview_from_cstr(@record[0]), O_RDONLY, 0)
+    match fd_open(record.as_view(), O_RDONLY, 0)
         Ok(f) =>
             opened = true
             var rf: Fd = f
-            loop
-                var r: i64 = 0
-                match rf.read(Span<u8> { ptr: out + n, len: cap - n })
-                    Ok(k) => r = k
-                    Err(_) => r = -1
-                if r <= 0
-                    break
-                n += r
+            rf.read_to_end(@&out)
             rf.close()
         Err(_) => pass
-    unlink(strview_from_cstr(@record[0]))
-    unlink(strview_from_cstr(@script[0]))
+    unlink(record.as_view())
+    unlink(script.as_view())
     rmdir(d)
     if !opened
         return 3
-    let found: bool = strview_from_ptr(out, n).contains(want)
-    free(out)
-    if found then 0 else 4
+    if out.as_view().contains(want) then 0 else 4

@@ -22,6 +22,7 @@ import ritzlib.sys
 import ritzlib.process { kill }
 import ritzlib.result
 import ritzlib.errno
+import ritzlib.gvec
 import zeus.control
 import zeus.ring
 import zeus.shm
@@ -104,7 +105,7 @@ pub fn valet_config_init(cfg: *ValetConfig, max_workers: i32, ring_capacity: i64
 # ============================================================================
 
 pub struct ValetContext
-    workers: *WorkerSlot     # Array of worker slots (heap allocated)
+    workers: Vec<WorkerSlot> # max_workers slots, never grown
     max_workers: i32         # Maximum slots
     worker_count: i32        # Currently allocated slots
     next_dispatch_idx: i32   # Next worker for round-robin
@@ -128,18 +129,13 @@ pub fn valet_init(ctx: *ValetContext, cfg: *ValetConfig) -> i32
         config.ring_capacity = cfg.ring_capacity
         config.arena_size = cfg.arena_size
 
-    # Allocate worker slots array
-    let slot_size: i64 = 64  # sizeof(WorkerSlot) - approximate
-    let alloc_size: i64 = (config.max_workers as i64) * slot_size
-
-    let prot: i32 = PROT_READ + PROT_WRITE
-    let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
-    let workers: *WorkerSlot = sys_mmap(0, alloc_size, prot, flags, -1, 0) as *WorkerSlot
-    if workers == (-1) as *WorkerSlot
+    # Allocate worker slots array (zeroed: every slot starts EMPTY)
+    ctx.workers = vec_zeroed<WorkerSlot>(config.max_workers as i64)
+    if config.max_workers <= 0 or ctx.workers.len() != config.max_workers as i64
+        ctx.max_workers = 0
         return -1
 
     # Initialize context
-    ctx.workers = workers
     ctx.max_workers = config.max_workers
     ctx.worker_count = 0
     ctx.next_dispatch_idx = 0
@@ -152,7 +148,7 @@ pub fn valet_init(ctx: *ValetContext, cfg: *ValetConfig) -> i32
     # Initialize all slots as empty
     var i: i32 = 0
     while i < config.max_workers
-        let slot: *WorkerSlot = ctx.workers + i
+        let slot: *WorkerSlot = ctx.workers.get_ptr(i as i64)
         slot.state = WORKER_SLOT_EMPTY
         slot.worker_pid = 0
         slot.last_activity_ts = 0
@@ -165,23 +161,19 @@ pub fn valet_init(ctx: *ValetContext, cfg: *ValetConfig) -> i32
 
 # Destroy Valet context
 pub fn valet_destroy(ctx: *ValetContext)
-    if ctx.workers == null
+    if ctx.workers.len() == 0
         return
 
     # Destroy all worker slots
     var i: i32 = 0
     while i < ctx.max_workers
-        let slot: *WorkerSlot = ctx.workers + i
+        let slot: *WorkerSlot = ctx.workers.get_ptr(i as i64)
         if slot.state != WORKER_SLOT_EMPTY
             shm_destroy(@slot.region)
         i = i + 1
 
     # Free worker array
-    let slot_size: i64 = 64
-    let alloc_size: i64 = (ctx.max_workers as i64) * slot_size
-    sys_munmap(ctx.workers as *u8, alloc_size)
-
-    ctx.workers = null
+    ctx.workers.deinit()
     ctx.worker_count = 0
 
 # ============================================================================
@@ -197,7 +189,7 @@ pub fn valet_add_worker_slot(ctx: *ValetContext) -> i32
     # Find first empty slot
     var i: i32 = 0
     while i < ctx.max_workers
-        let slot: *WorkerSlot = ctx.workers + i
+        let slot: *WorkerSlot = ctx.workers.get_ptr(i as i64)
         if slot.state == WORKER_SLOT_EMPTY
             # Create shared memory region
             let result: i32 = shm_create(@slot.region, @ctx.shm_config)
@@ -223,7 +215,7 @@ pub fn valet_remove_worker_slot(ctx: *ValetContext, slot_idx: i32)
     if slot_idx < 0 || slot_idx >= ctx.max_workers
         return
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     if slot.state == WORKER_SLOT_EMPTY
         return
 
@@ -240,14 +232,14 @@ pub fn valet_remove_worker_slot(ctx: *ValetContext, slot_idx: i32)
 pub fn valet_get_worker_slot(ctx: *ValetContext, slot_idx: i32) -> *WorkerSlot
     if slot_idx < 0 || slot_idx >= ctx.max_workers
         return null
-    return ctx.workers + slot_idx
+    return ctx.workers.get_ptr(slot_idx as i64)
 
 # Mark a worker slot as running (worker has attached)
 pub fn valet_mark_worker_running(ctx: *ValetContext, slot_idx: i32)
     if slot_idx < 0 || slot_idx >= ctx.max_workers
         return
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     slot.state = WORKER_SLOT_RUNNING
     slot.last_activity_ts = get_time_ns()
 
@@ -267,7 +259,7 @@ pub fn valet_select_worker(ctx: *ValetContext) -> i32
         let idx: i32 = ctx.next_dispatch_idx
         ctx.next_dispatch_idx = (ctx.next_dispatch_idx + 1) % ctx.max_workers
 
-        let slot: *WorkerSlot = ctx.workers + idx
+        let slot: *WorkerSlot = ctx.workers.get_ptr(idx as i64)
         if slot.state == WORKER_SLOT_RUNNING
             return idx
 
@@ -289,7 +281,7 @@ pub fn valet_submit_request(ctx: *ValetContext, slot_idx: i32, req: *RequestSlot
     if slot_idx < 0 || slot_idx >= ctx.max_workers
         return -1
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     if slot.state != WORKER_SLOT_RUNNING
         return -2  # Worker not running
 
@@ -349,7 +341,7 @@ pub fn valet_poll_response(ctx: *ValetContext, resp: *ResponseSlot, worker_idx: 
     # Check each running worker for responses
     var i: i32 = 0
     while i < ctx.max_workers
-        let slot: *WorkerSlot = ctx.workers + i
+        let slot: *WorkerSlot = ctx.workers.get_ptr(i as i64)
         if slot.state == WORKER_SLOT_RUNNING
             let cb: *ControlBlock = shm_get_control_block(@slot.region)
 
@@ -395,7 +387,7 @@ pub fn valet_check_worker_health_timeout(ctx: *ValetContext, slot_idx: i32, stuc
     if slot_idx < 0 || slot_idx >= ctx.max_workers
         return WORKER_HEALTH_UNKNOWN
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     if slot.state == WORKER_SLOT_EMPTY
         return WORKER_HEALTH_UNKNOWN
 
@@ -430,7 +422,7 @@ pub fn valet_restart_worker(ctx: *ValetContext, slot_idx: i32) -> i32
     if slot_idx < 0 || slot_idx >= ctx.max_workers
         return -1
 
-    let slot: *WorkerSlot = ctx.workers + slot_idx
+    let slot: *WorkerSlot = ctx.workers.get_ptr(slot_idx as i64)
     if slot.state == WORKER_SLOT_EMPTY
         return -1
 
@@ -452,7 +444,7 @@ pub fn valet_get_active_worker_count(ctx: *ValetContext) -> i32
     var count: i32 = 0
     var i: i32 = 0
     while i < ctx.max_workers
-        let slot: *WorkerSlot = ctx.workers + i
+        let slot: *WorkerSlot = ctx.workers.get_ptr(i as i64)
         if slot.state == WORKER_SLOT_RUNNING
             count = count + 1
         i = i + 1

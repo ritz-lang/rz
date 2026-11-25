@@ -5,6 +5,10 @@ import ritzlib.mapping
 import ritzlib.span
 import ritzlib.errno
 import ritzlib.result
+import ritzlib.fd
+import ritzlib.fs { unlink }
+import ritzlib.string
+import ritzlib.process { process_id }
 
 [[test]]
 fn test_mmap_anon_is_zeroed_and_writable() -> i32
@@ -68,4 +72,69 @@ fn test_mmap_anon_kernel_error_is_decoded() -> i32
             return 1
         Err(e) =>
             assert e.code() == 12
+    0
+
+# A fresh file of `len` zero bytes, open read-write and already unlinked.
+fn scratch_file(len: i64) -> Result<Fd, Errno>
+    var path: String = string_from("/tmp/ritzlib-test-mapping-")
+    path.push_i64(process_id() as i64)
+    let file: Fd = fd_open(path.as_view(), O_RDWR | O_CREAT | O_TRUNC, 384)?
+    unlink(path.as_view())
+    file.truncate(len)?
+    Ok(file)
+
+[[test]]
+fn test_mmap_shared_stores_reach_the_file() -> i32
+    var file: Fd = match scratch_file(8192)
+        Ok(f) => f
+        Err(e) => return 1
+    match mmap_shared(@file, 8192)
+        Ok(m) =>
+            var s: Span<u8> = m
+            assert s.len == 8192
+            assert s.get(0) == 0
+            var mid: Span<u8> = s[4096..4100]
+            mid.fill(0x5A)
+            assert munmap(s).is_ok()
+        Err(e) =>
+            file.close()
+            return 2
+    # The bytes are the file's: read them back through the fd.
+    var buf: [8]u8
+    let b: [u8] = @buf
+    assert file.seek(4094, 0).is_ok()
+    match file.read(b)
+        Ok(n) =>
+            assert n == 8
+        Err(e) =>
+            return 3
+    assert b.get(1) == 0
+    assert b.get(2) == 0x5A
+    assert b.get(5) == 0x5A
+    assert b.get(6) == 0
+    file.close()
+    0
+
+[[test]]
+fn test_mmap_shared_bad_fd_is_err() -> i32
+    let closed: Fd = fd_borrow(-1)
+    match mmap_shared(@closed, 4096)
+        Ok(m) =>
+            return 1
+        Err(e) =>
+            assert e.code() == 9      # EBADF
+    0
+
+[[test]]
+fn test_mmap_shared_zero_length_is_inval() -> i32
+    var file: Fd = match scratch_file(4096)
+        Ok(f) => f
+        Err(e) => return 1
+    match mmap_shared(@file, 0)
+        Ok(m) =>
+            file.close()
+            return 2
+        Err(e) =>
+            assert e.code() == 22
+    file.close()
     0

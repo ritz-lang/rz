@@ -7,20 +7,19 @@
 import zeus.worker { WorkerContext }
 import zeus.worker { worker_set_running, worker_set_busy, worker_ack_request }
 import zeus.worker { worker_begin_response, worker_commit_response, worker_wait_response_slot }
-import zeus.worker { worker_get_request_path }
-import zeus.worker { worker_alloc_response_data, worker_ptr_to_offset }
+import zeus.worker { worker_request_path_bytes }
+import zeus.worker { worker_alloc_response_bytes, worker_ptr_to_offset }
 import zeus.ring { RequestSlot, ResponseSlot }
 import zeus.ring { response_slot_set_status, response_slot_set_flags }
 import zeus.ring { response_slot_set_body }
 import zeus.ring { RESP_FLAG_COMPLETE }
 import zeus.main_helpers { str_to_i32, str_to_i64 }
+import ritzlib.span
+import ritzlib.strview
+import ritzlib.option
 
 pub const ECHO_PREFIX_LEN: i32 = 6     # "Echo: "
 pub const ECHO_MAX_BODY: i32 = 1024
-
-fn copy_bytes(dst: *u8, src: *u8, len: i32)
-    for i in 0..len
-        *(dst + i) = *(src + i)
 
 # Answer `req` (the request worker_poll_request just returned) with
 # "Echo: <path>", then ack it.
@@ -41,14 +40,14 @@ pub fn echo_serve_request(ctx: *WorkerContext, req: *RequestSlot, wait_ms: i64) 
 
     worker_set_busy(ctx)
 
-    var body: [1024]u8
-    let path: *u8 = worker_get_request_path(ctx, req)
-    var path_len: i32 = req.path_len as i32
-    if path_len > ECHO_MAX_BODY - ECHO_PREFIX_LEN
-        path_len = ECHO_MAX_BODY - ECHO_PREFIX_LEN
-    copy_bytes(@body[0], c"Echo: ", ECHO_PREFIX_LEN)
-    copy_bytes(@body[ECHO_PREFIX_LEN], path, path_len)
-    let body_len: i32 = ECHO_PREFIX_LEN + path_len
+    var body_buf: [1024]u8
+    var body: [u8] = @body_buf
+    let prefix: StrView = "Echo: "
+    body.copy_from(prefix.as_bytes())
+    var rest: [u8] = body.from(ECHO_PREFIX_LEN as i64)
+    # copy_from stops at the end of `rest`: a long path is cut there
+    let path_len: i64 = rest.copy_from(worker_request_path_bytes(ctx, req))
+    let body_len: i32 = ECHO_PREFIX_LEN + path_len as i32
 
     let resp: *ResponseSlot = worker_begin_response(ctx, req.id)
     if resp == null
@@ -57,11 +56,11 @@ pub fn echo_serve_request(ctx: *WorkerContext, req: *RequestSlot, wait_ms: i64) 
         worker_set_running(ctx)
         return 0
 
-    let body_ptr: *u8 = worker_alloc_response_data(ctx, body_len as i64)
-    if body_ptr != null
-        copy_bytes(body_ptr, @body[0], body_len)
+    var out: [u8] = worker_alloc_response_bytes(ctx, body_len as i64)
+    if out.len > 0
+        out.copy_from(body.to(body_len as i64))
         response_slot_set_status(resp, 200)
-        let body_offset: i64 = worker_ptr_to_offset(ctx, body_ptr)
+        let body_offset: i64 = worker_ptr_to_offset(ctx, out.as_ptr())
         response_slot_set_body(resp, body_offset as u32, body_len as u32)
     else
         # Arena slot too small: still answer, so the pairing holds
@@ -75,20 +74,15 @@ pub fn echo_serve_request(ctx: *WorkerContext, req: *RequestSlot, wait_ms: i64) 
 
 # echo_worker's arguments, <shm_size> <worker_id>, read by str_to_i64 /
 # str_to_i32 (ritzlib's strview_parse_i64, range-checked; AGAST #4038):
-# shm_size in 1..i64::MAX, worker_id in 0..i32::MAX.  Returns 1 and sets
-# both outputs, or 0 and sets neither.  The inline loops this replaces
-# wrapped on overflow and took any byte as a digit.
-pub fn echo_parse_args(shm_size_str: *u8, worker_id_str: *u8, shm_size: *i64, worker_id: *i32) -> i32
-    var size: i64 = 0
-    if str_to_i64(shm_size_str, @size) == 0
-        return 0
-    if size < 1
-        return 0
-    var id: i32 = 0
-    if str_to_i32(worker_id_str, @id) == 0
-        return 0
-    if id < 0
-        return 0
-    *shm_size = size
-    *worker_id = id
-    return 1
+# shm_size in 1..i64::MAX, worker_id in 0..i32::MAX, or None.  The inline
+# loops this replaces wrapped on overflow and took any byte as a digit.
+pub struct EchoArgs
+    shm_size: i64
+    worker_id: i32
+
+pub fn echo_parse_args(shm_size_str: StrView, worker_id_str: StrView) -> Option<EchoArgs>
+    let size: i64 = str_to_i64(shm_size_str).unwrap_or(0)
+    let id: i32 = str_to_i32(worker_id_str).unwrap_or(-1)
+    if size < 1 or id < 0
+        return None
+    Some(EchoArgs { shm_size: size, worker_id: id })

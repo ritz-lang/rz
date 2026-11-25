@@ -85,7 +85,9 @@ def test_a_new_raw_return_turns_the_pin_red(tmp_path):
     assert ptr_returns(tmp_path) == {"foo.ritz": (1, 2)}
 
 
-def test_munmap_is_the_one_raw_alloc_site_made_exempt():
-    """The raw-alloc count is 0 violations in ritzlib: mapping.munmap is exempt, not open."""
+def test_mapping_raw_alloc_sites_are_exempt():
+    """The raw-alloc count is 0 violations in ritzlib: mapping.munmap and
+    mapping.mmap_shared (sys_mmap of a file, AGAST #4692) are exempt, not open;
+    mmap_anon goes through sys_mmap_anon, which raw-alloc doesn't count."""
     mapping = [s for s in scan_tree([RITZLIB / "mapping.ritz"]) if s.key == "raw-alloc"]
-    assert [(s.fn, s.exempt is not None) for s in mapping] == [("munmap", True)]
+    assert [(s.fn, s.exempt is not None) for s in mapping] == [("mmap_shared", True), ("munmap", True)]

@@ -12,7 +12,6 @@
 #   - Zero-downtime restarts via SIGHUP
 #   - Minimal syscalls in hot path
 
-import ritzlib.cstr
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.string { String, string_new }
@@ -24,6 +23,7 @@ import ritzlib.strview { StrView }
 import ritzlib.result
 import ritzlib.errno
 import zeus.daemon
+import zeus.sockaddr
 import zeus.shm
 import zeus.control
 
@@ -31,16 +31,13 @@ import zeus.control
 # Test: Daemon Configuration
 # ============================================================================
 
-# "/tmp/zeus_<pid>_<name>" into dst (>= 96 bytes), NUL-terminated; returns
-# dst's pointer. The pid keeps concurrent test runs (gate slots, compiler
-# variants) off each other's sockets (AGAST #4084).
-fn pid_tmp_path(dst: [u8], name: StrView) -> *u8
+# "/tmp/zeus_<pid>_<name>". The pid keeps concurrent test runs (gate
+# slots, compiler variants) off each other's sockets (AGAST #4084).
+fn pid_tmp_path(name: StrView) -> String
     let pid: i32 = process_id()
     var path: String = string_new()
     format_into(@&path, "/tmp/zeus_{pid}_{name}")
-    let n: i64 = dst.copy_from(path.as_view().as_bytes())
-    dst[n] = 0
-    dst.ptr
+    path
 
 [[test]]
 fn test_daemon_config_defaults() -> i32
@@ -86,7 +83,7 @@ fn test_daemon_context_init() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 2
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     let result: i32 = daemon_init(@ctx, @cfg)
     if result < 0
         prints("FAIL: daemon_init failed\n")
@@ -103,7 +100,7 @@ fn test_daemon_context_destroy() -> i32
     var cfg: DaemonConfig
     daemon_config_init(@cfg)
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     daemon_destroy(@ctx)
@@ -125,7 +122,7 @@ fn test_daemon_alloc_worker_slot() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 4
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     # Allocate a worker slot
@@ -162,7 +159,7 @@ fn test_daemon_worker_slot_arena_has_floor() -> i32
     cfg.shm_size = 1048576
     cfg.ring_capacity = 256
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -181,7 +178,7 @@ fn test_daemon_alloc_max_workers() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 2
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     # Allocate all slots
@@ -209,7 +206,7 @@ fn test_daemon_free_worker_slot() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 2
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -235,7 +232,7 @@ fn test_daemon_prepare_worker() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 2
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -265,7 +262,7 @@ fn test_daemon_prepare_keeps_ring_capacity() -> i32
     cfg.worker_count = 1
     cfg.ring_capacity = 512
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -291,7 +288,7 @@ fn test_daemon_prepare_reaped_worker_reinits_control_block() -> i32
     cfg.worker_count = 1
     cfg.ring_capacity = 512
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -355,7 +352,7 @@ fn test_daemon_prepare_refuses_live_worker() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 1
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -399,7 +396,7 @@ fn test_daemon_mark_worker_running() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 2
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -432,7 +429,7 @@ fn test_daemon_request_worker_stop() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 2
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -464,7 +461,7 @@ fn test_daemon_get_running_worker_count() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 4
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     # Initially 0
@@ -499,7 +496,7 @@ fn test_daemon_state_transitions() -> i32
     var cfg: DaemonConfig
     daemon_config_init(@cfg)
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     # IDLE -> STARTING
@@ -535,14 +532,13 @@ fn test_daemon_create_socket() -> i32
     var cfg: DaemonConfig
     daemon_config_init(@cfg)
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     # Create unix socket
-    var sockbuf: [96]u8
-    let sock: *u8 = pid_tmp_path(@sockbuf, "test.sock")
-    let result: i32 = daemon_create_socket(@ctx, sock)
-    if result < 0
+    let sock_path: String = pid_tmp_path("test.sock")
+    let sock: StrView = sock_path.as_view()
+    if daemon_create_socket(@ctx, sock).is_err()
         prints("FAIL: create_socket failed\n")
         daemon_destroy(@ctx)
         return 1
@@ -553,7 +549,7 @@ fn test_daemon_create_socket() -> i32
         return 1
 
     # Clean up socket file
-    unlink(strview_from_cstr(sock))
+    unlink(sock)
     daemon_destroy(@ctx)
     return 0
 
@@ -562,12 +558,12 @@ fn test_daemon_socket_cleanup() -> i32
     var cfg: DaemonConfig
     daemon_config_init(@cfg)
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
-    var sockbuf: [96]u8
-    let sock: *u8 = pid_tmp_path(@sockbuf, "test2.sock")
-    daemon_create_socket(@ctx, sock)
+    let sock_path: String = pid_tmp_path("test2.sock")
+    let sock: StrView = sock_path.as_view()
+    assert daemon_create_socket(@ctx, sock).is_ok()
 
     # Destroy should close socket
     let fd: i32 = ctx.listen_fd.raw()
@@ -578,7 +574,7 @@ fn test_daemon_socket_cleanup() -> i32
         return 1
 
     # Clean up socket file
-    unlink(strview_from_cstr(sock))
+    unlink(sock)
     return 0
 
 # ============================================================================
@@ -590,7 +586,7 @@ fn test_daemon_signal_pipe() -> i32
     var cfg: DaemonConfig
     daemon_config_init(@cfg)
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     # Signal pipe should be created
@@ -612,7 +608,7 @@ fn test_daemon_notify_signal() -> i32
     var cfg: DaemonConfig
     daemon_config_init(@cfg)
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     # Write to signal pipe (simulates signal handler)
@@ -621,7 +617,8 @@ fn test_daemon_notify_signal() -> i32
     # Read it back
     var buf: [1]u8
     var n: i64 = -1
-    match ctx.signal_read_fd.read(Span<u8> { ptr: @buf[0], len: 1 })
+    let b: [u8] = @buf
+    match ctx.signal_read_fd.read(b)
         Ok(got) => n = got
         Err(_) => pass
     if n != 1
@@ -647,7 +644,7 @@ fn test_daemon_get_worker_shm_fd() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 2
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -670,7 +667,7 @@ fn test_daemon_get_worker_shm_size() -> i32
     daemon_config_init(@cfg)
     cfg.worker_count = 2
 
-    var ctx: DaemonContext
+    var ctx = DaemonContext {}
     daemon_init(@ctx, @cfg)
 
     let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
@@ -684,4 +681,59 @@ fn test_daemon_get_worker_shm_size() -> i32
         return 1
 
     daemon_destroy(@ctx)
+    return 0
+
+# ============================================================================
+# Test: sockaddr_un
+# ============================================================================
+
+[[test]]
+fn test_sockaddr_un_fill_family_path_and_zeros() -> i32
+    var addr: [110]u8
+    let a: [u8] = @addr
+    a.fill(0xEE)
+    let n: i64 = sockaddr_un_fill(a, "/run/z.sock")
+    assert n == 2 + 11
+    assert a[0] == 1
+    assert a[1] == 0
+    let name: [u8] = a[2..13]
+    assert name.as_strview().eq("/run/z.sock")
+    for i in 13..110
+        assert a[i] == 0
+    return 0
+
+[[test]]
+fn test_sockaddr_un_fill_cuts_a_long_path() -> i32
+    # sun_path is 108 bytes: at most 107 of the path, then a zero
+    var long: String = string_new()
+    for i in 0..200
+        long.push('x')
+    var addr: [110]u8
+    let a: [u8] = @addr
+    let n: i64 = sockaddr_un_fill(a, long.as_view())
+    assert n == 2 + 107
+    assert a[108] == 0x78
+    assert a[109] == 0
+    return 0
+
+# ============================================================================
+# Test: every worker slot is addressable (the slots are a Vec of MAX_WORKERS)
+# ============================================================================
+
+[[test]]
+fn test_daemon_all_slots_addressable() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    var ctx = DaemonContext {}
+    assert daemon_init(@ctx, @cfg) == 0
+    for i in 0..MAX_WORKERS
+        let slot: *WorkerSlot = daemon_get_worker_slot(@ctx, i)
+        assert slot != null
+        assert slot.state == WORKER_SLOT_FREE
+        slot.request_count = i as i64
+    let last: *WorkerSlot = daemon_get_worker_slot(@ctx, MAX_WORKERS - 1)
+    assert last.request_count == (MAX_WORKERS - 1) as i64
+    assert daemon_get_worker_slot(@ctx, MAX_WORKERS) == null
+    daemon_destroy(@ctx)
+    assert ctx.workers.len() == 0
     return 0

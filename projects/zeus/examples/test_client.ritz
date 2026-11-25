@@ -56,18 +56,14 @@ import zeus.arena {
     DataArena,
     data_arena_alloc,
     data_arena_ptr_to_offset,
-    data_arena_offset_to_ptr
+    data_arena_bytes,
+    data_arena_valid
 }
 
 
 # ============================================================================
 # Helpers
 # ============================================================================
-
-# Print an arena slice safely (bounded by `len`, no NUL assumption).
-fn print_bytes(buf: *u8, len: i32)
-    fd_stdout().write_all(Span<u8> { ptr: buf, len: len as i64 })
-
 
 # ============================================================================
 # Main
@@ -90,7 +86,6 @@ pub fn main(args: Span<StrView>) -> i32
     let socket_path: StrView = args[1]
     let req_path: StrView = args[2]
     let req_path_len: i32 = req_path.len as i32
-    let req_path_ptr: *u8 = req_path.as_ptr()
 
     # ------------------------------------------------------------------
     # 1. Initialize client
@@ -98,7 +93,7 @@ pub fn main(args: Span<StrView>) -> i32
     var cfg: ZeusClientConfig
     zeus_client_config_default(@cfg)
 
-    var client: ZeusClient
+    var client = ZeusClient {}
     let init_rc: i32 = zeus_client_init(@client, @cfg)
     if init_rc != 0
         let rc: i64 = init_rc as i64
@@ -108,12 +103,13 @@ pub fn main(args: Span<StrView>) -> i32
     # ------------------------------------------------------------------
     # 2. Connect + handshake
     # ------------------------------------------------------------------
-    let connect_rc: i32 = zeus_client_connect(@client, socket_path.as_ptr())
-    if connect_rc != 0
-        let rc: i64 = connect_rc as i64
-        print("FAIL: zeus_client_connect returned {rc}\n  socket: {socket_path}\n")
-        zeus_client_destroy(@client)
-        return 1
+    match zeus_client_connect(@client, socket_path)
+        Ok(_) => pass
+        Err(e) =>
+            let rc: i64 = e.code() as i64
+            print("FAIL: zeus_client_connect failed, errno {rc}\n  socket: {socket_path}\n")
+            zeus_client_destroy(@client)
+            return 1
 
     let hs_rc: i32 = zeus_client_handshake(@client)
     if hs_rc < 0
@@ -158,8 +154,8 @@ pub fn main(args: Span<StrView>) -> i32
 
     var arena: DataArena
     worker_handle_get_arena(handle, @arena)
-    if arena.base == null
-        print("FAIL: worker arena base is null\n")
+    if not data_arena_valid(@arena)
+        print("FAIL: worker arena is empty\n")
         zeus_client_destroy(@client)
         return 1
 
@@ -169,10 +165,9 @@ pub fn main(args: Span<StrView>) -> i32
         print("FAIL: arena alloc for path returned null\n")
         zeus_client_destroy(@client)
         return 1
-    for i in 0..req_path_len
-        *(path_dst + i) = *(req_path_ptr + i)
-
     let path_offset: i64 = data_arena_ptr_to_offset(@arena, path_dst)
+    var path_bytes: [u8] = data_arena_bytes(@arena, path_offset, req_path_len as i64)
+    path_bytes.copy_from(req_path.as_bytes())
 
     # ------------------------------------------------------------------
     # 5. Build + submit the request
@@ -234,9 +229,9 @@ pub fn main(args: Span<StrView>) -> i32
         # Re-derive arena (offset reset is intentional — base is what we want).
         var arena2: DataArena
         worker_handle_get_arena(handle, @arena2)
-        let body_ptr: *u8 = data_arena_offset_to_ptr(@arena2, resp.body_offset as i64)
+        let body: [u8] = data_arena_bytes(@arena2, resp.body_offset as i64, resp.body_len as i64)
         print("--- body ---\n")
-        print_bytes(body_ptr, resp.body_len as i32)
+        fd_stdout().write_all(body)
         print("\n--- end ---\n")
 
     # ------------------------------------------------------------------
