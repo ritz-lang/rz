@@ -476,6 +476,37 @@ let opcode: StrView = int_binop_opcode(e.op, unsigned, shr_u != 0)
 format_into(s, "  %.{result} = {opcode}%.{left_reg}, %.{scaled_right}\n")
 ```
 
+   A port simplifies the logic as well as the text. Each case is decided once, in one
+   place (`docs/STANDARD.md` S-MATCH-3, `docs/REVIEW.md` A11). The rule has three parts:
+   - **No dead arms.** A case handled by an earlier `return` has no arm in a later
+     table. `emit_expr_binary` returns early for `And`/`Or`, so `int_binop_opcode`
+     lists them with the operators that can't reach it.
+   - **No repeated guards.** Test a shared condition once and nest the checks.
+   - **No catch-all output.** A table from an enum to IR text lists every variant.
+     The variants with no output return `no_name()`, and the caller reports a
+     located error. A `_` is fine only when it means "none of these" (`false`,
+     `None`, `pass`).
+
+```text
+# before: `And` can't get here, and an operator the table forgets is an add
+OpKind.And | OpKind.BitAnd => "and i64 "
+...
+_ => "add i64 "
+if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_pointer_strlit_eq(s, e)
+    return 0
+if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_tagged_enum_eq(s, e)
+    return 0
+
+# after: each case once; an unexpected operator is an error
+OpKind.Add => "add i64 "
+OpKind.BitAnd => "and i64 "
+...
+OpKind.Unset | OpKind.And | OpKind.Or | OpKind.Neg | ... => no_name()
+if e.op == OpKind.Eq or e.op == OpKind.Ne
+    if refuse_pointer_strlit_eq(s, e) or refuse_tagged_enum_eq(s, e) or ...
+        return 0
+```
+
 4. Yes/no is a `bool`; a status plus an out-parameter is an `Option` (or a struct);
    a refusal reason is an `enum` with a text `match` (`Trap` in `emitter_expr_arith`).
 5. A struct type behind `getelementptr %` is opened with `gep_struct_open` (the

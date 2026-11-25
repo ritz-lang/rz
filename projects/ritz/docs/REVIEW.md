@@ -35,6 +35,7 @@ finding.
 | A8 | `null` returned or tested for "nothing here" | `Option<T>` | JUDGE; counted by `standard_report.py` (`null-return`) (S-OPTION-1) |
 | A9 | `malloc`/`free` outside an owning type; cleanup repeated before each `return` | an owning type with `Drop`; `defer` | JUDGE; counted (`raw-alloc`) (S-OWN-2, S-OWN-4) |
 | A10 | a raw `sys_*` call in app code | the ritzlib wrapper (`fs`, `fd`, `process`, `time`) | ENFORCED where the `sys_*` fn is `standard-exempt`: the callers pin. JUDGE otherwise (S-RESULT-2) |
+| A11 | a `switch`-style table. Three shapes: a `match` arm for a case an earlier `return` already handled (a dead arm); one condition re-tested in several checks in a row (`(op == Eq or op == Ne) and ...` three times); `_ =>` giving a real output in a table from an enum to output (`_ => "add i64 "`) | each case is handled in one place; test the shared condition once and nest the checks under it; list every variant, with the ones that have no output giving an error. A `_` that means "none of these" (`false`, `None`, `pass`) is fine | JUDGE (S-MATCH-3) |
 
 ## Part B: the change as a whole
 

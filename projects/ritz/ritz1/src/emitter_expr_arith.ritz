@@ -137,9 +137,21 @@ fn refuse_aggregate_eq(s: *EmitterState, e: *Expr) -> bool
     emit_nd_error_sv(s, e.span.line, e.span.col, msg.as_view())
     true
 
-# The source spelling of a binary operator other than `and` / `or`.
+# The source spelling of an operator; unnamed for OpKind.Unset.
 fn binary_op_spelling(op: OpKind) -> StrView
     match op
+        OpKind.Unset => no_name()
+        OpKind.And => "and"
+        OpKind.Or => "or"
+        OpKind.Neg => "-"
+        OpKind.Not => "not"
+        OpKind.Deref => "*"
+        OpKind.Addr => "@"
+        OpKind.AddrMut => "@&"
+        OpKind.BitNot => "~"
+        OpKind.AddWrap => "+%"
+        OpKind.SubWrap => "-%"
+        OpKind.MulWrap => "*%"
         OpKind.Eq => "=="
         OpKind.Ne => "!="
         OpKind.Lt => "<"
@@ -155,7 +167,7 @@ fn binary_op_spelling(op: OpKind) -> StrView
         OpKind.Sub => "-"
         OpKind.Mul => "*"
         OpKind.Div => "/"
-        _ => "%"
+        OpKind.Mod => "%"
 
 # AGAST #2525: `*(q + 1) + 1`, `*q < 5` with `q: *S`: the deref loads a `%S`,
 # which ritz1 wrote where clang wanted an i64, unlocated.  ritz0's refusal
@@ -229,25 +241,24 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     # size is never 0, so the sentinel is unambiguous.
     # AGAST #2928 / #2597: `q - p` on two pointers is their distance in
     # elements of the left's pointee: (q - p) / sizeof(T), an i64.
-    if (e.op == OpKind.Add or e.op == OpKind.Sub) and refuse_ref_arith(s, e)
-        return 0   # AGAST #3037, LARB R16
-    if is_ptr_distance(s, e) == 1
-        return emit_ptr_distance(s, e)
-
+    # is_ptr_distance is a `-` only, so it lives under the one `+`/`-` test.
     var is_ptr_arith: bool = false
     var ptr_elem_size: i64 = 1
     if e.op == OpKind.Add or e.op == OpKind.Sub
+        if refuse_ref_arith(s, e)
+            return 0   # AGAST #3037, LARB R16
+        if is_ptr_distance(s, e) == 1
+            return emit_ptr_distance(s, e)
         let elem: i64 = ptr_operand_stride(s, e.left)
         if elem != 0
             is_ptr_arith = true
             ptr_elem_size = elem
 
-    if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_pointer_strlit_eq(s, e)
-        return 0   # AGAST #2514
-    if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_tagged_enum_eq(s, e)
-        return 0   # AGAST #2454
-    if (e.op == OpKind.Eq or e.op == OpKind.Ne) and refuse_aggregate_eq(s, e)
-        return 0   # AGAST #2510
+    # The first refusal that applies reports; `or` stops there.
+    # AGAST #2514, #2454, #2510.
+    if e.op == OpKind.Eq or e.op == OpKind.Ne
+        if refuse_pointer_strlit_eq(s, e) or refuse_tagged_enum_eq(s, e) or refuse_aggregate_eq(s, e)
+            return 0
     if refuse_struct_deref_operand(s, e)
         return 0   # AGAST #2525
 
@@ -366,9 +377,11 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     if checked >= 0
         return checked
 
-    let result: i32 = next_reg(s)
-
     let opcode: StrView = int_binop_opcode(e.op, unsigned, shr_u != 0)
+    if unnamed(opcode)
+        emit_ir_error_sv(s, e.span, "no integer opcode for this binary operator")
+        return 0
+    let result: i32 = next_reg(s)
     format_into(s, "  %.{result} = {opcode}%.{left_reg}, %.{scaled_right}\n")
 
     if is_compare(e.op)
@@ -393,9 +406,12 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
     return result
 
 # The integer op's opcode and operand type after `%r = ` (`unsigned`: unsigned
-# div / rem / compare; `shr_unsigned`: logical shift right).
+# div / rem / compare; `shr_unsigned`: logical shift right).  Unnamed for an
+# operator that never gets here: `and` / `or` short-circuit before it, and the
+# rest are unary, unset, or parser-only.
 fn int_binop_opcode(op: OpKind, unsigned: bool, shr_unsigned: bool) -> StrView
     match op
+        OpKind.Add => "add i64 "
         OpKind.Sub => "sub i64 "
         OpKind.Mul => "mul i64 "
         OpKind.Div => if unsigned then "udiv i64 " else "sdiv i64 "
@@ -406,12 +422,12 @@ fn int_binop_opcode(op: OpKind, unsigned: bool, shr_unsigned: bool) -> StrView
         OpKind.Gt => if unsigned then "icmp ugt i64 " else "icmp sgt i64 "
         OpKind.Le => if unsigned then "icmp ule i64 " else "icmp sle i64 "
         OpKind.Ge => if unsigned then "icmp uge i64 " else "icmp sge i64 "
-        OpKind.And | OpKind.BitAnd => "and i64 "
-        OpKind.Or | OpKind.BitOr => "or i64 "
+        OpKind.BitAnd => "and i64 "
+        OpKind.BitOr => "or i64 "
         OpKind.BitXor => "xor i64 "
         OpKind.Shl => "shl i64 "
         OpKind.Shr => if shr_unsigned then "lshr i64 " else "ashr i64 "
-        _ => "add i64 "
+        OpKind.Unset | OpKind.And | OpKind.Or | OpKind.Neg | OpKind.Not | OpKind.Deref | OpKind.Addr | OpKind.BitNot | OpKind.AddrMut | OpKind.AddWrap | OpKind.SubWrap | OpKind.MulWrap => no_name()
 
 # `a and b`, short-circuit: a phi over the two exits.
 fn emit_logical_and(s: *EmitterState, e: *Expr) -> i32
@@ -490,7 +506,6 @@ fn emit_float_binop(s: *EmitterState, e: *Expr, fty_t: TypeKind, left_in: i32, r
     else if fs_literal_only(e.right) == 1
         scaled_right = emit_float_coerce(s, scaled_right, TypeKind.I64, fty_t)
     let fty: StrView = llvm_text(float_llvm_name(fty_t))
-    let result_f: i32 = next_reg(s)
     if e.op == OpKind.Mod
         # AGAST #3817: not `frem`, which lowers to a libm fmod call; Ritz
         # links no libc.  The module defines the helper (emit_fmod_helpers).
@@ -500,9 +515,14 @@ fn emit_float_binop(s: *EmitterState, e: *Expr, fty_t: TypeKind, left_in: i32, r
             s.fmod_helpers_used = s.fmod_helpers_used | 2
         else
             s.fmod_helpers_used = s.fmod_helpers_used | 1
-        format_into(s, "  %.{result_f} = call {fty} {callee}%.{left_reg}, {fty} %.{scaled_right})\n")
-        return result_f
+        let fmod_r: i32 = next_reg(s)
+        format_into(s, "  %.{fmod_r} = call {fty} {callee}%.{left_reg}, {fty} %.{scaled_right})\n")
+        return fmod_r
     let opcode: StrView = float_binop_opcode(e.op)
+    if unnamed(opcode)
+        emit_ir_error_sv(s, e.span, "this operator does not take a float operand")
+        return 0
+    let result_f: i32 = next_reg(s)
     format_into(s, "  %.{result_f} = {opcode}{fty} %.{left_reg}, %.{scaled_right}\n")
     # Comparison ops produce i1 — zext to i64 for unified value model.
     if is_compare(e.op)
@@ -510,8 +530,11 @@ fn emit_float_binop(s: *EmitterState, e: *Expr, fty_t: TypeKind, left_in: i32, r
     result_f
 
 # The float op or ordered compare, as the opcode and its trailing space.
+# Unnamed for an operator with none: `%` is emit_float_binop's fmod call, and
+# the bitwise ops, shifts, `and` / `or` and the unary ops take no float.
 fn float_binop_opcode(op: OpKind) -> StrView
     match op
+        OpKind.Add => "fadd "
         OpKind.Sub => "fsub "
         OpKind.Mul => "fmul "
         OpKind.Div => "fdiv "
@@ -521,7 +544,7 @@ fn float_binop_opcode(op: OpKind) -> StrView
         OpKind.Gt => "fcmp ogt "
         OpKind.Le => "fcmp ole "
         OpKind.Ge => "fcmp oge "
-        _ => "fadd "
+        OpKind.Unset | OpKind.Mod | OpKind.And | OpKind.Or | OpKind.BitAnd | OpKind.BitOr | OpKind.BitXor | OpKind.Shl | OpKind.Shr | OpKind.Neg | OpKind.Not | OpKind.Deref | OpKind.Addr | OpKind.BitNot | OpKind.AddrMut | OpKind.AddWrap | OpKind.SubWrap | OpKind.MulWrap => no_name()
 
 # `==`, `!=`, `<`, `>`, `<=`, `>=`: the ops whose result is an i1.
 fn is_compare(op: OpKind) -> bool
@@ -1494,11 +1517,155 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             format_into(s, "  %.{result} = icmp eq i64 %.{operand}, 0\n")
             let ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result)
             return ext
+        OpKind.Deref => emit_unary_deref(s, e)
+        OpKind.Addr => emit_unary_addr(s, e)
+        OpKind.AddrMut => emit_unary_addr_mut(s, e)
+        OpKind.BitNot => emit_unary_bitnot(s, e)
+        OpKind.Unset | OpKind.Add | OpKind.Sub | OpKind.Mul | OpKind.Div | OpKind.Mod | OpKind.Eq | OpKind.Ne | OpKind.Lt | OpKind.Gt | OpKind.Le | OpKind.Ge | OpKind.And | OpKind.Or | OpKind.BitAnd | OpKind.BitOr | OpKind.BitXor | OpKind.Shl | OpKind.Shr | OpKind.AddWrap | OpKind.SubWrap | OpKind.MulWrap =>
+            emit_ir_error_sv(s, e.span, "not a unary operator")
+            0
+
+# `*p`: the value it points at, loaded at its pointee type.
+fn emit_unary_deref(s: *EmitterState, e: *Expr) -> i32
+    if deref_names_array(s, e.operand) == 1
+        emit_whole_array_error(s, e)   # AGAST #2287: `*p` for `p: *[N]T`; #2304: `*w.p`, `*P`, `*(p + 1)`
+        return 0
+    # AGAST #2971: `*h` of an integer or `bool` borrow `h:& T` is `h`, as
+    # ritz0 reads it (#2045): bind_scalar_borrow_param binds `h` as the
+    # caller's T, so it already reads as the referent.  This loaded
+    # through the int's value as an address, and segfaulted.
+    if lent_scalar_ident(s, e.operand) != null
+        return emit_expr(s, e.operand)
+    let addr: i32 = emit_expr(s, e.operand)
+    # Convert i64 address to ptr.  AGAST #1644: a TypeKind.MutRef local
+    # (`x: @&T`) already loads as `ptr`, so casting it is invalid IR.
+    # Mirrors the `*x = v` store path (AGAST #173).
+    var ptr: i32 = addr
+    if deref_operand_is_ptr(s, e.operand) == 0
+        ptr = next_reg(s)
+        format_into(s, "  %.{ptr} = inttoptr i64 %.{addr} to ptr\n")
+    # AGAST #1505: a pointee statically known to be a struct loads that
+    # struct, whatever get_expr_type guessed (it reports TypeKind.I64 for a
+    # let-local `*S` and TypeKind.U8 for an unrecorded `*S` field pointee).
+    let sname: StrView = named_by(deref_pointee_struct_name, s, e.operand)
+    if sname.len > 0
+        let sresult: i32 = next_reg(s)
+        # AGAST #2204: a `*v4i32` pointee is the vector `<4 x i32>`, not a
+        # struct `%v4i32` (clang: "load operand must be a pointer to a
+        # first class type").  emit_llvm_type_struct maps SIMD names.
+        emit_struct_load_or_defer(s, TypeKind.Struct, sresult, sname, ptr, null, 0)
+        return sresult
+    # Determine load type based on pointee type
+    let deref_type: TypeKind = expr_slot_ty(e)
+    match deref_type
+        TypeKind.F32 | TypeKind.F64 =>
+            # AGAST #2022: a *f32 / *f64 pointee loads `float` / `double`
+            # and is returned as-is (no widen), as `p[i]` does (#1973).  It
+            # fell to the i64 default, so `*p != x` emitted
+            # `fcmp float <i64>`, which clang rejects.
+            let fresult: i32 = next_reg(s)
+            format_into(s, "  %.{fresult} = load {llvm_text(elem_mem_llvm(deref_type))}, ptr %.{ptr}\n")
+            return fresult
+        TypeKind.Bool =>
+            # AGAST #2053: a `*bool` pointee is an `i1`; zext it to the i64
+            # bools are carried in.  (The i64 default read 7 bytes past it.)
+            let bval: i32 = next_reg(s)
+            emit_load_into(s, IR_TY_I1, bval, ptr)
+            let bresult: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, bval)
+            return bresult
         _ =>
-            match emit_unary_addr_deref(s, e)
-                Some(value) => return value
-                None => pass
+            if ty_int_bits(deref_type) == 8
+                # Load i8 and sign/zero-extend to i64.  AGAST #2021: `*p` on a
+                # *i8 sexts, as p[i] does; zext made a negative pointee 0xFD.
+                let byte_val: i32 = next_reg(s)
+                emit_load_into(s, IR_TY_I8, byte_val, ptr)
+                let result: i32 = next_reg(s)
+                format_into(s, "  %.{result}")
+                if deref_type == TypeKind.I8
+                    format_into(s, " = sext i8 ")
+                else
+                    format_into(s, " = zext i8 ")
+                format_into(s, "%.{byte_val} to i64\n")
+                return result
+            else if ty_int_bits(deref_type) == 16
+                # Load i16 and sign/zero-extend to i64
+                let val16: i32 = next_reg(s)
+                emit_load_into(s, IR_TY_I16, val16, ptr)
+                let result: i32 = next_reg(s)
+                format_into(s, "  %.{result}")
+                if deref_type == TypeKind.I16
+                    format_into(s, " = sext i16 ")
+                else
+                    format_into(s, " = zext i16 ")
+                format_into(s, "%.{val16} to i64\n")
+                return result
+            else if ty_int_bits(deref_type) == 32
+                # Load i32 and sign/zero-extend to i64 (unified value model)
+                # Critical: reading i64 from a 4-byte slot reads 4 bytes of
+                # adjacent stack/heap = garbage upper half.
+                let val32: i32 = next_reg(s)
+                emit_load_into(s, IR_TY_I32, val32, ptr)
+                let result: i32 = next_reg(s)
+                format_into(s, "  %.{result}")
+                if deref_type == TypeKind.I32
+                    format_into(s, " = sext i32 ")
+                else
+                    format_into(s, " = zext i32 ")
+                format_into(s, "%.{val32} to i64\n")
+                return result
+            else if deref_type == TypeKind.Struct or if_arm_names_pointee(s, e.operand)
+                # AGAST #1505: the pointee is a struct but deref_pointee_struct_name
+                # could not name it.  This used to fall back silently to
+                # `load i64`, which clang rejects as soon as the value meets a
+                # struct slot.  Report it at the deref's source position instead.
+                emit_ir_error_sv(s, e.span, "cannot determine the struct type loaded by this '*' deref")
+                let result: i32 = next_reg(s)
+                emit_load_into(s, IR_TY_I64, result, ptr)
+                return result
+            else
+                # Default: load i64
+                let result: i32 = next_reg(s)
+                emit_load_into(s, IR_TY_I64, result, ptr)
+                return result
+
+# `@x`: its address, in the i64 value model.
+fn emit_unary_addr(s: *EmitterState, e: *Expr) -> i32
+    if const_scalar_addr_refused(s, e)
+        return 0
+    let lend_from: i32 = own_temp_mark(s)
+    let addr_ptr: i32 = emit_lvalue_ptr(s, e.operand)
+    own_lend_temps(s, e.operand, lend_from)   # AGAST #3050
+    if addr_ptr >= 0
+        # `@expr` is an i64 in ritz1's value model.
+        let result: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, addr_ptr)
+        return result
+    emit_ir_error_sv(s, e.span, "cannot take address")
     return 0
+
+# `@&x`: its address, as a `ptr`.
+fn emit_unary_addr_mut(s: *EmitterState, e: *Expr) -> i32
+    # @&expr - mutable address-of, returns ptr type (not i64)
+    if const_scalar_addr_refused(s, e)   # LARB R48: `@&N`
+        return 0
+    let lend_mut_from: i32 = own_temp_mark(s)
+    let addr_mut_ptr: i32 = emit_lvalue_ptr(s, e.operand)
+    own_lend_temps(s, e.operand, lend_mut_from)   # AGAST #3050
+    if addr_mut_ptr >= 0
+        return addr_mut_ptr
+    emit_ir_error_sv(s, e.span, "cannot take mutable address")
+    return 0
+
+# `~x`, read back at x's type.
+fn emit_unary_bitnot(s: *EmitterState, e: *Expr) -> i32
+    let operand: i32 = emit_expr(s, e.operand)
+    let result: i32 = next_reg(s)
+    format_into(s, "  %.{result} = xor i64 %.{operand}, -1\n")
+    # AGAST #3225: `~m` on a u32 of 0 is 4294967295, not the i64's -1, in
+    # whatever it lands in: a wider slot (`let w: i64 = ~m`) or a sum that
+    # runs there (`~m + 1`) reads it as is, so it's brought back here.
+    var not_uns: i32 = 0
+    let not_bits: i32 = int_operand_shape(s, e.operand, @not_uns)
+    return emit_narrow_operand(s, e, result, not_bits, not_uns == 1)
 
 
 # =============================================================================
@@ -1529,147 +1696,6 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
 var g_ovf_used: i32 = 0
 const OVF_TRAP_USED: i32 = 16777216    # 1 << 24, past the 24 intrinsic bits
 
-# `@x`, `@&x`, `*p`, `~x` (every unary op but `-` and `not`): its value, when lowered.
-fn emit_unary_addr_deref(s: *EmitterState, e: *Expr) -> Option<i32>
-    if e.op == OpKind.Deref and deref_names_array(s, e.operand) == 1
-        emit_whole_array_error(s, e)   # AGAST #2287: `*p` for `p: *[N]T`; #2304: `*w.p`, `*P`, `*(p + 1)`
-        return Some(0)
-    else
-        match e.op
-            OpKind.Deref =>
-                # AGAST #2971: `*h` of an integer or `bool` borrow `h:& T` is `h`, as
-                # ritz0 reads it (#2045): bind_scalar_borrow_param binds `h` as the
-                # caller's T, so it already reads as the referent.  This loaded
-                # through the int's value as an address, and segfaulted.
-                if lent_scalar_ident(s, e.operand) != null
-                    return Some(emit_expr(s, e.operand))
-                let addr: i32 = emit_expr(s, e.operand)
-                # Convert i64 address to ptr.  AGAST #1644: a TypeKind.MutRef local
-                # (`x: @&T`) already loads as `ptr`, so casting it is invalid IR.
-                # Mirrors the `*x = v` store path (AGAST #173).
-                var ptr: i32 = addr
-                if deref_operand_is_ptr(s, e.operand) == 0
-                    ptr = next_reg(s)
-                    format_into(s, "  %.{ptr} = inttoptr i64 %.{addr} to ptr\n")
-                # AGAST #1505: a pointee statically known to be a struct loads that
-                # struct, whatever get_expr_type guessed (it reports TypeKind.I64 for a
-                # let-local `*S` and TypeKind.U8 for an unrecorded `*S` field pointee).
-                let sname: StrView = named_by(deref_pointee_struct_name, s, e.operand)
-                if sname.len > 0
-                    let sresult: i32 = next_reg(s)
-                    # AGAST #2204: a `*v4i32` pointee is the vector `<4 x i32>`, not a
-                    # struct `%v4i32` (clang: "load operand must be a pointer to a
-                    # first class type").  emit_llvm_type_struct maps SIMD names.
-                    emit_struct_load_or_defer(s, TypeKind.Struct, sresult, sname, ptr, null, 0)
-                    return Some(sresult)
-                # Determine load type based on pointee type
-                let deref_type: TypeKind = expr_slot_ty(e)
-                match deref_type
-                    TypeKind.F32 | TypeKind.F64 =>
-                        # AGAST #2022: a *f32 / *f64 pointee loads `float` / `double`
-                        # and is returned as-is (no widen), as `p[i]` does (#1973).  It
-                        # fell to the i64 default, so `*p != x` emitted
-                        # `fcmp float <i64>`, which clang rejects.
-                        let fresult: i32 = next_reg(s)
-                        format_into(s, "  %.{fresult} = load {llvm_text(elem_mem_llvm(deref_type))}, ptr %.{ptr}\n")
-                        return Some(fresult)
-                    TypeKind.Bool =>
-                        # AGAST #2053: a `*bool` pointee is an `i1`; zext it to the i64
-                        # bools are carried in.  (The i64 default read 7 bytes past it.)
-                        let bval: i32 = next_reg(s)
-                        emit_load_into(s, IR_TY_I1, bval, ptr)
-                        let bresult: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, bval)
-                        return Some(bresult)
-                    _ =>
-                        if ty_int_bits(deref_type) == 8
-                            # Load i8 and sign/zero-extend to i64.  AGAST #2021: `*p` on a
-                            # *i8 sexts, as p[i] does; zext made a negative pointee 0xFD.
-                            let byte_val: i32 = next_reg(s)
-                            emit_load_into(s, IR_TY_I8, byte_val, ptr)
-                            let result: i32 = next_reg(s)
-                            format_into(s, "  %.{result}")
-                            if deref_type == TypeKind.I8
-                                format_into(s, " = sext i8 ")
-                            else
-                                format_into(s, " = zext i8 ")
-                            format_into(s, "%.{byte_val} to i64\n")
-                            return Some(result)
-                        else if ty_int_bits(deref_type) == 16
-                            # Load i16 and sign/zero-extend to i64
-                            let val16: i32 = next_reg(s)
-                            emit_load_into(s, IR_TY_I16, val16, ptr)
-                            let result: i32 = next_reg(s)
-                            format_into(s, "  %.{result}")
-                            if deref_type == TypeKind.I16
-                                format_into(s, " = sext i16 ")
-                            else
-                                format_into(s, " = zext i16 ")
-                            format_into(s, "%.{val16} to i64\n")
-                            return Some(result)
-                        else if ty_int_bits(deref_type) == 32
-                            # Load i32 and sign/zero-extend to i64 (unified value model)
-                            # Critical: reading i64 from a 4-byte slot reads 4 bytes of
-                            # adjacent stack/heap = garbage upper half.
-                            let val32: i32 = next_reg(s)
-                            emit_load_into(s, IR_TY_I32, val32, ptr)
-                            let result: i32 = next_reg(s)
-                            format_into(s, "  %.{result}")
-                            if deref_type == TypeKind.I32
-                                format_into(s, " = sext i32 ")
-                            else
-                                format_into(s, " = zext i32 ")
-                            format_into(s, "%.{val32} to i64\n")
-                            return Some(result)
-                        else if deref_type == TypeKind.Struct or if_arm_names_pointee(s, e.operand)
-                            # AGAST #1505: the pointee is a struct but deref_pointee_struct_name
-                            # could not name it.  This used to fall back silently to
-                            # `load i64`, which clang rejects as soon as the value meets a
-                            # struct slot.  Report it at the deref's source position instead.
-                            emit_ir_error_sv(s, e.span, "cannot determine the struct type loaded by this '*' deref")
-                            let result: i32 = next_reg(s)
-                            emit_load_into(s, IR_TY_I64, result, ptr)
-                            return Some(result)
-                        else
-                            # Default: load i64
-                            let result: i32 = next_reg(s)
-                            emit_load_into(s, IR_TY_I64, result, ptr)
-                            return Some(result)
-            OpKind.Addr =>
-                if const_scalar_addr_refused(s, e)
-                    return Some(0)
-                let lend_from: i32 = own_temp_mark(s)
-                let addr_ptr: i32 = emit_lvalue_ptr(s, e.operand)
-                own_lend_temps(s, e.operand, lend_from)   # AGAST #3050
-                if addr_ptr >= 0
-                    # `@expr` is an i64 in ritz1's value model.
-                    let result: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, addr_ptr)
-                    return Some(result)
-                emit_ir_error_sv(s, e.span, "cannot take address")
-                return Some(0)
-            OpKind.AddrMut =>
-                # @&expr - mutable address-of, returns ptr type (not i64)
-                if const_scalar_addr_refused(s, e)   # LARB R48: `@&N`
-                    return Some(0)
-                let lend_mut_from: i32 = own_temp_mark(s)
-                let addr_mut_ptr: i32 = emit_lvalue_ptr(s, e.operand)
-                own_lend_temps(s, e.operand, lend_mut_from)   # AGAST #3050
-                if addr_mut_ptr >= 0
-                    return Some(addr_mut_ptr)
-                emit_ir_error_sv(s, e.span, "cannot take mutable address")
-                return Some(0)
-            OpKind.BitNot =>
-                let operand: i32 = emit_expr(s, e.operand)
-                let result: i32 = next_reg(s)
-                format_into(s, "  %.{result} = xor i64 %.{operand}, -1\n")
-                # AGAST #3225: `~m` on a u32 of 0 is 4294967295, not the i64's -1, in
-                # whatever it lands in: a wider slot (`let w: i64 = ~m`) or a sum that
-                # runs there (`~m + 1`) reads it as is, so it's brought back here.
-                var not_uns: i32 = 0
-                let not_bits: i32 = int_operand_shape(s, e.operand, @not_uns)
-                return Some(emit_narrow_operand(s, e, result, not_bits, not_uns == 1))
-            _ => pass
-    None
-
 
 fn ovf_width_index(bits: i32) -> i32
     match bits
@@ -1678,11 +1704,14 @@ fn ovf_width_index(bits: i32) -> i32
         32 => 2
         _ => 3
 
-fn ovf_op_index(op: OpKind) -> i32
+# The `.with.overflow` intrinsic `op` is checked through (ovf_intrinsic's
+# index), or None for an operator with none.
+fn ovf_op_index(op: OpKind) -> Option<i32>
     match op
-        OpKind.Add => 0
-        OpKind.Sub => 1
-        _ => 2
+        OpKind.Add => Some(0)
+        OpKind.Sub => Some(1)
+        OpKind.Mul => Some(2)
+        _ => None
 
 # Why a checked operation stops the program, as ritz0 words it.
 enum Trap
@@ -1696,7 +1725,7 @@ fn trap_text(t: Trap) -> StrView
         Trap.Overflow => "integer overflow in"
         Trap.DivideByZero => "division by zero in"
         Trap.ShiftRange => "shift count out of range in"
-        _ => ""
+        Trap.Safe => ""   # nothing stops: never printed
 
 # The type an operation runs at: its width (8, 16, 32 or 64) and signedness.
 struct OperandType
@@ -1836,6 +1865,12 @@ fn ovf_trunc(s: *EmitterState, reg: i32, bits: i32) -> i32
 # `left op right` (`+`, `-` or `*`) at e's type, stopping on overflow; the
 # result is an i64 register, 0 if the operation was refused.
 fn ovf_checked_arith(s: *EmitterState, e: *Expr, left: i32, right: i32) -> i32
+    var opi: i32 = 0
+    match ovf_op_index(e.op)
+        Some(i) => opi = i
+        None =>
+            emit_ir_error_sv(s, e.span, "no overflow check for this operator")
+            return 0
     let ty: OperandType = ovf_op_type(s, e)
     let bits: i32 = ty.bits
     if ovf_const_refused(s, e, ty)
@@ -1845,7 +1880,6 @@ fn ovf_checked_arith(s: *EmitterState, e: *Expr, left: i32, right: i32) -> i32
     if bits < 64
         a = ovf_trunc(s, left, bits)
         b = ovf_trunc(s, right, bits)
-    let opi: i32 = ovf_op_index(e.op)
     let uns: i32 = if ty.unsigned then 1 else 0
     g_ovf_used = g_ovf_used | (1 << ((opi * 2 + uns) * 4 + ovf_width_index(bits)))
     let pair: i32 = next_reg(s)

@@ -796,6 +796,52 @@ fn weight(k: TokenKind) -> i32
         Eof => 0
 ```
 
+#### S-MATCH-3 Each case is decided once, in one place
+
+**Status: ADVISORY**
+
+S-MATCH-1 catches a missing variant and an arm after a catch-all. It can't
+catch the three shapes below, which a review rejects (AGAST #4754):
+
+- **No dead arms.** A case that an earlier `return` already handled does not
+  appear again in a later table. If `f` returns early for `And`, a table it
+  calls afterwards has no `And` arm and lists `And` with the cases that can't
+  reach it, as an error.
+- **No repeated guards.** A condition that several checks share is tested
+  once, and the checks are nested under it, not each re-tested with
+  `(op == Eq or op == Ne) and ...`.
+- **No catch-all output.** A `match` that maps an enum to output (an opcode,
+  a spelling, a size, a message) lists every variant. `_ => "add"` makes any
+  variant the table forgets come out as an add, with no error. Variants with
+  no output are listed together and give an error the caller reports.
+  A `_` is fine when it means "none of these": `false`, `None`, an empty name,
+  or `pass` in a dispatch whose other variants need nothing.
+
+```ritz
+enum Op
+    Add
+    Sub
+    And
+    Neg
+
+# A real opcode, or an empty name: the caller reports an error.
+fn int_opcode(op: Op) -> StrView
+    match op
+        Add => "add"
+        Sub => "sub"
+        And | Neg => ""   # And short-circuits before this; Neg is unary
+
+fn is_additive(op: Op) -> bool
+    match op
+        Add | Sub => true
+        _ => false
+
+fn main() -> i32
+    if int_opcode(Op.Neg).len != 0 or not is_additive(Op.Sub)
+        return 1
+    0
+```
+
 ---
 
 # Part II: Conventions
