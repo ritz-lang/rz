@@ -207,6 +207,31 @@ def test_test_mode_ir_passes_clang(ritz1_bin, tmp_path):
     _clang_ok(tmp_path, _ir(tmp_path, SOURCE + "\nfn main() -> i32\n    42\n"))
 
 
+# Vec.set is generic, so its body (and the `extern fn ritz_platform_fatal`
+# it calls for a bad index) is emitted into this test binary's module.
+HOOK_CALLER = """\
+import ritzlib.gvec
+
+[[test]]
+fn test_set() -> i32
+    var v: Vec<i64> = vec_new<i64>()
+    v.push(1)
+    v.set(0, 2)
+    0
+"""
+
+
+def test_called_extern_platform_hook_is_defined_once(ritz1_bin, tmp_path):
+    """AGAST #4648: a called `extern fn` hook (gvec's ritz_platform_fatal)
+    was declared by the extern pass and then defined weak by the test
+    binary's hooks: `invalid redefinition of function`.  One line: the
+    weak definition."""
+    ir = _ir(tmp_path, HOOK_CALLER)
+    lines = re.findall(r"^(?:declare|define)\b.*@ritz_platform_fatal\(", ir, re.M)
+    assert len(lines) == 1 and lines[0].startswith("define weak"), lines
+    _clang_ok(tmp_path, ir)
+
+
 def test_test_mode_neither_reads_nor_writes_the_sig_cache(ritz1_bin, tmp_path):
     """Normal, test, normal, test: each output is its own mode's IR.
 
