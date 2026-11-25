@@ -16,7 +16,7 @@ of a reference param, `[@t]` / `(@t, 1)`, and `[(t, 1)]`.
 import pytest
 
 from test_ref_into_value import COMPILERS
-from test_table_rows import assert_refusals, assert_runs
+from test_table_rows import Prefix, assert_refusals, assert_runs
 
 pytestmark = pytest.mark.integration
 
@@ -49,6 +49,12 @@ REFUSED = {
     "struct_then_int": (_main("    let a = [t, ^1]\n"), MESSAGE),
     "declared_struct": (_main("    let a: [2]Res = [t, ^1]\n"), MESSAGE),
     "declared_int": (_main("    let a: [2]i64 = [1, ^t]\n"), MESSAGE),
+    # ritz0 judges the elements in its emitter, after the move checker: a use
+    # of `t` after it moved into the literal is the refusal, at the use (the
+    # refusal-parity replay of test_move_checker's array_not_first row).
+    "moved_then_used": (DEFS + (
+        "fn main() -> i32\n    var t = make()\n    let a = [1, t]\n"
+        "    return ^t.h\n"), Prefix("use of moved value: `t`")),
 }
 
 
