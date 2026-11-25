@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Status | Draft |
-| Date | 2026-11-23 |
+| Date | 2026-11-24 |
 | Audience | Harland kernel |
 | Seat | Ring 2. This pass draws the service. It does not build it. |
 
@@ -33,7 +33,7 @@ ENA stays an in-kernel `NetDevice` until its own driver moves. On that path the 
 
 ## Placement
 
-Ring 0 grants shared pages through `CAP_TYPE_SHM` (`CapGrant` 40, `ShmMap` 227, `CapRevoke` 41) and wakes one endpoint at a time. Spawn of the driver and of this service is the kernel exercising that path. An app that attaches later uses it again. There is no second sharing mechanism. Ring 0 does not parse a frame and does not parse an app request slot. Ring 1 is the only CPL that programs the NIC. Ring 2 is the only CPL that answers ARP or runs DHCP. It is also where TCP will live, once that milestone exists. Ring 3 sees datagrams and the address snapshot. The userspace calls for a byte stream are named below and wait for the TCP milestone. The first cutover is DHCP, ARP, ping, and a ring-3 UDP bind, datagram send, and datagram receive.
+Ring 0 grants shared pages through `CAP_TYPE_SHM` (`CapGrant` 40, `ShmMap` 227, `CapRevoke` 41). Each process has one wait set. Spawn of the driver and of this service is the kernel exercising that path. An app that attaches later uses it again. There is no second sharing mechanism. Ring 0 does not parse a frame and does not parse an app request slot. Ring 1 is the only CPL that programs the NIC. Ring 2 is the only CPL that answers ARP or runs DHCP. It is also where TCP will live, once that milestone exists. Ring 3 sees datagrams and the address snapshot. The userspace calls for a byte stream are named below and wait for the TCP milestone. The first cutover is the one named in the overview.
 
 ```mermaid
 flowchart TB
@@ -67,7 +67,7 @@ flowchart TB
   nic -->|queues| dev
 ```
 
-The frame path is the pair of SPSC rings. The address path is the service's record, copied out by `NetAddr` (225), beside `NetInfo` (224), so the lease does not travel with the link. Apps do not map the service's address page. The driver never writes the address record. The service never writes `NetInfo`. TCP is not in the box because the first cutover does not expose streams. Its home is still this service. The TCP section draws that later path. The first cutover is DHCP, ARP, ping, and a ring-3 UDP bind, datagram send, and datagram receive.
+The frame path is the pair of SPSC rings. The address path is the service's record, copied out by `NetAddr` (225), beside `NetInfo` (224), so the lease does not travel with the link. `NetInfo` is a separate object mapped only into the driver. Apps do not map the service's address page. The driver never writes the address record. The service never maps `NetInfo`. TCP is not in the box because the first cutover does not expose streams. Its home is still this service. The TCP section draws that later path.
 
 ## What the kernel does today
 
@@ -77,26 +77,27 @@ Each protocol section below draws the service's receive path and send path. The 
 
 ## Service wait
 
-The service parks with `ShmWait` on the frame object and on each app-exchange object. `proc_wake(reason)` in `proc/table.ritz` marks every `PROC_BLOCKED` process with that reason runnable, so a shared reason would also wake every app. Each object has its own waiter. The kernel does not read the service's private pending-TX queue. The service builds the mask.
+The service parks with one `ShmWait`. The call lists the frame object and every live app exchange, at most five, each with its own mask. `proc_wake(reason)` in `proc/table.ritz` marks every `PROC_BLOCKED` process with that reason runnable, so the service does not use a shared reason. Each mapping has its own latch. A notify posts to the other mapping, and the bits stay there whether or not the peer is inside `ShmWait`. The process inbox is scanned on every wait, including a wait that lists no exchanges. The kernel does not read the service's private pending-TX queue. The service builds the pairs. One return copies every matching source that fits in `out_cap`, not only the first.
 
-`ShmWait(handle, mask, deadline)` parks only when every masked source is idle:
+The call parks only when every listed source is idle and the inbox is empty:
 
-- `DATA` is clear on the frame object, which is an empty RX ring
-- `SPACE` is clear, or the service left `SPACE` out of the mask because the pending-TX queue is empty
-- `DATA` is clear on every app attachment the service included
+- `DATA` is clear on the frame object's latch, which is an empty RX ring
+- `SPACE` is clear, or the service left `SPACE` out of the frame object's mask because the pending-TX queue is empty
+- `DATA` is clear on every app attachment in the list
 - `LINK` is clear, and `PEER_CLOSE` is clear
-- `DRIVER_GONE` is clear on this object id
+- `DRIVER_GONE` is clear on the frame object's id
+- the inbox has no `ATTACH` record
 - the deadline is still in the future
 
-The service includes `SPACE` only when the pending queue is non-empty and the TX ring has no free slot. A pending send that still fits is not a park: the service does not wait, it publishes. A free TX slot with an empty pending queue is idle, and `SPACE` stays out of the mask. The driver, after it stores the TX `read_idx`, calls `ShmNotify` with `SPACE`. That wake carries no new frame and is how the pending send leaves. The service stores a TX index before `ShmNotify` with `DATA`, which is the driver's wake. An app does the same on its exchange: a request is `DATA` for the service, an event is `DATA` for the app.
+The check runs under `cli` before the park. A notify that arrived while the service was still running is already on its latch, and the call returns every such handle instead of parking. A wake that matches nothing parks again until the deadline. The service includes `SPACE` only when the pending queue is non-empty and the TX ring has no free slot. A pending send that still fits is not a park: the service does not wait, it publishes. A free TX slot with an empty pending queue is idle, and `SPACE` stays out of the mask. The driver, after it stores its private TX `read_idx`, calls `ShmNotify` with `SPACE`. That wake carries no new frame and is how the pending send leaves. The service stores its private TX index before `ShmNotify` with `DATA`. That posts `DATA` to the driver's mapping, which is the driver's wake, including when the driver has not parked yet. An app does the same on its exchange: a request is `DATA` for the service, an event is `DATA` for the app. An app that posts `PEER_CLOSE` or `DRIVER_GONE` gets `Errno.Inval`, and the service stays attached.
 
-`DRIVER_GONE` is latched on the retired frame-object id. A replacement object publishing generation 2 has a new id. A wait on the old handle is not completed by that publish. Closing a peer latches `PEER_CLOSE` on that attachment only.
+`DRIVER_GONE` is latched on the service's mapping of the retired frame-object id. This cutover does not replace a dead driver. The service detaches and exits, and networking stays down until reboot. A wait that still names the old handle is not completed by some later object. Closing a peer latches `PEER_CLOSE` on that attachment only. The service detaches when it observes either bit. It does not ack a slot boundary first. `ATTACH` on the inbox is how a service with no exchanges yet learns a new app handle, and how a surviving driver learns a replacement frame object after this service exits.
 
 ## Ethernet demux
 
 The RX ring delivers one Ethernet frame. The service checks the destination MAC against the link record: our MAC, or the broadcast MAC. A frame that matches neither is dropped. Today `net_poll` does not look at the destination MAC. The service then switches on ethertype. ARP and IPv4 are the only types it handles. IPv6 and every other type are dropped in this draft.
 
-On send, ARP and IPv4 hand the service a payload, a destination MAC, and an ethertype. The service writes the source MAC from the link record, publishes one TX slot, and kicks the driver. A full TX ring does not drop a frame that was already accepted, and it does not stop RX. The service keeps a pending-TX queue of depth 32, one virtio posted pool. While that queue has room, a send that finds the TX ring full is queued and the service returns to RX, timers, and app rings. When the queue is full, the new send fails to its caller and RX continues. The driver, when the RX ring toward the service is full, keeps draining TX. That is the ring-1 rule. Scheduling both sides is not enough on its own: if the driver waited only for RX space while the service waited only for TX space, both would stay blocked. The required test fills both rings at once and still fires a protocol timer on an otherwise idle link.
+On send, ARP and IPv4 hand the service a payload, a destination MAC, and an ethertype. The service writes the source MAC from the link snapshot, publishes one TX slot, and `ShmNotify`s `DATA` onto the driver's mapping. A full TX ring does not drop a frame that was already accepted, and it does not stop RX. The service keeps a pending-TX queue of depth 32, one virtio posted pool. While that queue has room, a send that finds the TX ring full is queued and the service returns to RX, timers, and app rings. When the queue is full, the new send fails to its caller and RX continues. The driver, when the RX ring toward the service is full, keeps draining TX. That is the ring-1 rule. Scheduling both sides is not enough on its own: if the driver waited only for RX space while the service waited only for TX space, both would stay blocked. The required test fills both rings at once and still fires a protocol timer on an otherwise idle link.
 
 ```mermaid
 flowchart TB
@@ -111,13 +112,13 @@ flowchart TB
   subgraph tx [Send]
     body[Payload from ARP or IPv4] --> hdr[Source MAC from the link record]
     hdr --> txOut[TX frame ring]
-    txOut --> kick[Kick the driver]
+    txOut --> kick[ShmNotify DATA]
   end
 ```
 
 ## ARP
 
-The cache is private to the service. Every ARP packet teaches the sender's IP and MAC, which is what `arp_cache_add` does today. A request whose target is our address, and whose address record is configured, is answered with a reply to the sender's MAC. A reply is cache fill plus a wake of the sends waiting on that next hop. Today the waiter is `icmp_ping`, which returns -1 and expects its caller to retry. The service keeps the pending send and finishes it when the reply arrives.
+The cache is private to the service. An ARP packet updates the sender's MAC when that IP is already cached. A request adds an entry only when the target protocol address is ours. A reply adds an entry only when a request for that sender IP is outstanding. An unsolicited reply does not create an entry, including one whose target is our address. RFC 826 would add that sender. This cutover does not, because an unsolicited reply is the cache-poisoning path. A packet that names some other target does not create an entry either. This is not what `arp_cache_add` does today. A request whose target is our address, and whose address record is configured, is answered with a reply to the sender's MAC. A reply that matches an outstanding request wakes the sends waiting on that next hop. Today the waiter is `icmp_ping`, which returns -1 and expects its caller to retry. The service keeps the pending send and finishes it when the reply arrives.
 
 Pending sends are capped at 16 per next hop. The seventeenth fails to its caller and is not queued. One request is in flight for that hop. The service retries it three times, one second apart. After the third retry with no reply, every pending send for that hop fails and is dropped. A cache entry expires after 60 seconds without use. The next send starts resolution again. Today the cache has no timeout.
 
@@ -126,11 +127,11 @@ On send, a request is a broadcast Ethernet frame. A reply is unicast to the requ
 ```mermaid
 flowchart TB
   subgraph rx [Receive]
-    rxIn[ARP payload] --> learn[Cache the sender]
+    rxIn[ARP payload] --> learn[Update an existing entry]
     learn --> op{Operation}
-    op -->|request for our address| reply[Build a reply]
-    op -->|reply| wake[Wake the pending send]
-    op -->|request for someone else| done[Cache only]
+    op -->|request for our address| reply[Add the sender and build a reply]
+    op -->|reply for an outstanding request| wake[Add the sender and wake the pending send]
+    op -->|other request or unsolicited reply| done[No new entry]
     reply --> txReply[Send the reply]
   end
   subgraph tx [Send]
@@ -148,11 +149,11 @@ A fragment, the more-fragments bit set or a non-zero fragment offset, is dropped
 
 While the address record is unconfigured, the only admitted packet is the DHCP bootstrap in the UDP section: UDP from port 67 to port 68 whose transaction matches. Once configured, the destination is our address or a broadcast. Other destinations are dropped. Today every well-formed IPv4 packet is demuxed, with no destination check.
 
-Protocol 1 is ICMP and 17 is UDP. Protocol 6 is dropped on the first cutover. The TCP section is the later milestone. Anything else is dropped.
+Protocol 1 is ICMP and 17 is UDP. Protocol 6 is dropped on the first cutover named in the overview. The TCP section is the later milestone. Anything else is dropped.
 
-UDP length must be at least 8 and no greater than the remaining IPv4 payload, and the parser stops there. A DHCP option length must fit the remaining DHCP payload. An option that does not fit drops the message. `dhcp_parse_options` today reads the length byte and the following data without that check.
+UDP length must be at least 8 and no greater than the remaining IPv4 payload, and the parser stops there. A non-zero UDP checksum is checked, and a mismatch drops the datagram. A checksum of zero is accepted, which is the RFC 768 "no checksum" encoding. ICMP does not have that exception. A DHCP option length must fit the remaining DHCP payload. An option that does not fit drops the message. `dhcp_parse_options` today reads the length byte and the following data without that check.
 
-Send chooses the next hop with `ip_get_next_hop`: the destination itself when it is on the local network, otherwise the gateway. No prefix, or no gateway, leaves an off-link destination unroutable. The next hop goes to ARP. The header checksum is computed in the service. The outgoing size is the link MTU from the link snapshot. The 2048-byte ring slot is the storage for one frame, not the packet size. A packet that does not fit the MTU is not sent. There is no IP fragmentation in this draft. TCP, in its own milestone, also caps a segment at the peer MSS.
+Send chooses the next hop with `ip_get_next_hop`: the destination itself when it is on the local network, otherwise the gateway. No prefix, or no gateway, leaves an off-link destination unroutable. The next hop goes to ARP. The header checksum is computed in the service. The outgoing size is the MTU from the link snapshot, already clamped by the driver to `FRAME_MAX - 14`. The 2048-byte ring slot is the storage for one frame, not the packet size. A packet that does not fit that MTU is not sent. There is no IP fragmentation in this draft. TCP, in its own milestone, also caps a segment at the peer MSS.
 
 ```mermaid
 flowchart TB
@@ -182,7 +183,7 @@ flowchart TB
 
 ## ICMP
 
-Receive handles two types. An echo request is answered with an echo reply, which is the peer-ping path in `icmp_handle_packet`. An echo reply is matched to an outstanding request and recorded, which is `icmp_note_reply`. Every other ICMP type is dropped. Today those two types are the whole handler.
+Receive handles two types, and only after the ICMP checksum matches. A bad checksum is dropped. An echo request is answered with an echo reply, which is the peer-ping path in `icmp_handle_packet`, unless the IPv4 destination is a broadcast address or the Ethernet destination is the broadcast MAC. Those requests are not answered. An echo reply is matched to an outstanding request and recorded, which is `icmp_note_reply`. Every other ICMP type is dropped. Today those two types are the whole handler, and the handler does not reject a broadcast request.
 
 Send of an echo request builds the ICMP message, asks IPv4 for the next hop, and publishes the frame. Send of an echo reply uses `ip_get_next_hop` on the requester's IPv4 address, the same lookup a request uses. A remote requester is reached through the gateway. The reply does not use the request's Ethernet source MAC. `icmp_send_reply` does that today, and the service does not. The service does not send redirects, and it does not generate destination-unreachable in this draft.
 
@@ -210,7 +211,7 @@ DHCP is a client inside the service, because the ACK is what writes the address 
 
 The states are the ones `dhcp.ritz` already uses, named here with the RFC 2131 states they correspond to: idle (INIT), discover sent (SELECTING), request sent (REQUESTING), configured (BOUND), renewing at T1 (RENEWING), and rebinding at T2 (REBINDING). Discover and request are broadcast UDP from port 68 to port 67, except the T1 renewal, which is unicast to the selected server. Every state checks the transaction id, the client hardware address, and the packet layout. A message that fails those checks is dropped.
 
-Decided. SELECTING and REBINDING may accept a new server, REQUESTING and RENEWING pin the selected server, and a valid rebind ACK from a second server refreshes the lease and the timers.
+SELECTING and REBINDING may accept a new server, REQUESTING and RENEWING pin the selected server, and a valid rebind ACK from a second server refreshes the lease and the timers.
 
 In SELECTING there is no selected server yet. A valid OFFER may be chosen, and option 54 of that offer becomes the selected server. The client then sends the REQUEST. In REQUESTING, an ACK or a NAK must name that server. A matching ACK writes the address record and enters BOUND. A NAK returns the client to idle and clears the address record. In RENEWING, only the selected server is accepted, and a valid ACK refreshes the lease, T1, T2, and the expiry without changing the server. In REBINDING, a valid ACK from a different server is accepted. Option 54 of that ACK becomes the selected server, and the lease and the timers refresh. Any other DHCP message is dropped. A NAK, which today is ignored, returns the client to idle and clears the address record.
 
@@ -245,7 +246,7 @@ The service stores only the options the ACK contains. A missing router leaves th
 
 ## TCP
 
-TCP is not part of the first ring-2 cutover. The first cutover is DHCP, ARP, ping, and a ring-3 UDP bind, datagram send, and datagram receive. The kernel's TCP arm returns 0 today, and it keeps returning 0 until the work below is its own change.
+TCP is not part of the first cutover named in the overview. The kernel's TCP arm returns 0 today, and it keeps returning 0 until the work below is its own change.
 
 Before a stream is exposed to an app, all of the following are in place. This draft does not pick a retransmission interval or a congestion number. Those are part of that milestone, not of this cutover.
 
@@ -287,13 +288,13 @@ flowchart TB
   end
 ```
 
-The kernel drops every TCP segment. The arrows above are the later milestone, not the first cutover. The first cutover is DHCP, ARP, ping, and a ring-3 UDP bind, datagram send, and datagram receive.
+The kernel drops every TCP segment. The arrows above are the later milestone. The first cutover does not run them.
 
 ## Ring-3 app exchange
 
 An app does not map the frame rings and does not hold a device grant. It attaches to the service. The attachment is two SPSC rings plus an arena, with the same publication rule as the frame rings: fill the slot, release-store the index, then the wake. The slot is not `FrameDesc` and not a Zeus HTTP slot. This draft names the operations and does not freeze the struct.
 
-App to service, on the first cutover: `net_bind`, `net_send_to`, `net_recv_from`, `net_ping`, and `net_close`. The TCP milestone adds `net_connect`, `net_read`, `net_write`, and `net_close` on a stream. Service to app: data, peer-closed, and error. A ping from an app is `net_ping`, an exchange request that the ICMP path answers with one event. It is not syscall 61. The address record is not carried as a field of these messages. The app reads the kernel snapshot with `NetAddr`. Connect and byte-stream events belong to the TCP milestone. The first cutover is DHCP, ARP, ping, and a ring-3 UDP bind, datagram send, and datagram receive.
+App to service, on the first cutover named in the overview: `net_bind`, `net_send_to`, `net_recv_from`, `net_ping`, and `net_close`. The TCP milestone adds `net_connect`, `net_read`, `net_write`, and `net_close` on a stream. Service to app: data, peer-closed, and error. A ping from an app is `net_ping`, an exchange request that the ICMP path answers with one event. It is not syscall 61. The address record is not carried as a field of these messages. The app reads the kernel snapshot with `NetAddr`. Connect and byte-stream events belong to the TCP milestone. The service reads an app request the way the frame consumer reads a descriptor: one private copy, then validation of that copy.
 
 Ring 0 grants the pages as `CAP_TYPE_SHM` and delivers the wake. The service holds that capability for the frame rings and for its address page. It does not hold `CAP_TYPE_MMIO` or `CAP_TYPE_IRQ`. An app holds `CAP_TYPE_SHM` only for its own exchange. On Harland the wake is the scheduler, and it names one endpoint. The app blocks when its event ring is empty, with the same recheck the frame-ring consumer uses. The service does not block on one empty request ring. Its park is the multi-source wait above. The service gets no port I/O, no BAR, and no DMA domain of the NIC.
 
@@ -337,7 +338,7 @@ The kernel's sample inside `NetPublish` loads the generation, copies the bytes, 
 
 `NetAddr` (225) copies that snapshot to the caller. It returns `Errno.NoDev` while the generation is unpublished and after the service's exit or fault path invalidates the snapshot. It does not return a zeroed record, and it does not read the shared page. After invalidation readers see configured 0. They do not keep the old gateway.
 
-`NetInfo` (224) copies the link snapshot: MAC, link up, MTU, device type. The address fields in `NetInfo` stay zero. An app that wants the lease calls `NetAddr`. An app that wants the MAC calls `NetInfo`. The two reads are different paths, which is why the placement diagram draws both.
+`NetInfo` (224) copies the link snapshot: MAC, link up, MTU, and device type. The struct has no address fields. An app that wants the lease calls `NetAddr`. An app that wants the MAC calls `NetInfo`. The two reads are different paths, which is why the placement diagram draws both. The service does not map the link object.
 
 While the kernel still occupies the frame seat, `ip_set_config` and `ip_set_dns` remain the in-kernel copy of this record. At handoff the kernel clears them. It does not copy them into the service's page, and it does not start writing `NetInfo`. The frame-seat section is that handoff.
 
@@ -359,11 +360,11 @@ A fault invalidates `snap` without a write from the service. The shared page may
 
 One RX consumer and one TX producer. Ready is a state of the service, not a configured address. The service reaches it after it has mapped the frame rings and installed its wait, and before it starts DHCP. It publishes that state with `NetPublish` on the address page: generation 2, `configured` still 0. The kernel still holds the seat when that call runs. Later publishes of the same page update the lease and do not hand the seat over again.
 
-`NetPublish` of that ready generation commits the snapshot and returns. It does not send DHCPRELEASE and it does not switch the seat. Decided. DHCPRELEASE at handoff is one best-effort attempt that may fail, and the frame-seat switch runs after `NetPublish` returns so a failed release does not stall the snapshot call.
+`NetPublish` of that ready generation commits the snapshot and returns. It does not send DHCPRELEASE and it does not switch the seat. DHCPRELEASE at handoff is one best-effort attempt that may fail, and the frame-seat switch runs after `NetPublish` returns so a failed release does not stall the snapshot call.
 
 After the syscall has returned, and while the kernel still owns TX, the kernel tries once to send DHCPRELEASE. The attempt does not wait for ARP and does not wait for a second chance at a free TX slot. If it cannot be sent, the old lease is left to expire. The kernel then stops calling `net_poll`, clears `ip_set_config`, and registers the service as the only RX consumer and TX producer. That switch runs whether or not the release was sent. The kernel does not copy its lease into the service's address page. That page has one writer. The service starts DHCP from idle and writes the page itself. The in-kernel self-test runs DHCP while the kernel still holds the seat, before this handoff.
 
-On service exit or fault the kernel invalidates the address snapshot, marks each app attachment closed, and wakes that app's endpoint. It retires the frame object instead of resetting its indexes, and it waits for the driver's slot-boundary ack before a replacement object is created. It does not read app request slots. A driver preempted between a copy and its index store may commit that slot and then must ack. It must not publish from the retired object after the ack. Apps see `PEER_CLOSE` and a cleared lease. Bytes left in an app ring are abandoned with the attachment. The backing pages stay allocated until both mappings and the in-flight slot have released them.
+On service exit or fault the kernel invalidates the address snapshot, marks each app attachment closed, and wakes that app's endpoint. It retires the frame object instead of resetting its indexes. A replacement service is a new object and is created without waiting for the driver. The kernel maps it into the new service before that process runs, and enqueues the driver's new handle as `ATTACH` on the driver's inbox. Both indexes start at 0. The driver publishes on the new object only after that wait returns the handle. The new service publishes only on the handle from its entry arguments. The driver detaches from the old object when it observes `PEER_CLOSE`. If it has not detached within `SHM_DETACH_TIMEOUT_MS`, the kernel unmaps it. A later load or store of that virtual address is a user fault and kills the driver. The fault is not restarted on the new object. The kernel does not read app request slots. A driver that still holds the old mapping may finish a copy it has already made into private memory. It must not publish on the retired object. Apps see `PEER_CLOSE` and a cleared lease. Bytes left in an app ring are abandoned with the attachment. The backing pages stay allocated until every mapping has detached or the timeout has unmapped it. Driver death is not this path. The service exits on `DRIVER_GONE`, and this cutover does not start another driver.
 
 In-flight device buffers stay the driver's. The frame rings are CPU memory. Resetting an index does not free a DMA page.
 
@@ -408,7 +409,7 @@ No HTTP, TLS, or DNS is defined on top of these calls. DNS stays an application 
 
 ### Datagram receive
 
-A device RX buffer holds a virtio-net header and one Ethernet frame. The ring-1 driver strips the virtio header, checks the frame length, and writes the Ethernet bytes into the RX arena. It stores the RX `write_idx`, then `ShmNotify` with `DATA`. The ring-2 service's `ShmWait` returns. The service checks the destination MAC, the ethertype, the IPv4 header, and the UDP ports. When the destination port matches a `net_bind`, the service copies the UDP payload into that app's event arena, stores the event `write_idx`, and `ShmNotify` with `DATA`. `net_recv_from` returns those payload bytes. The bytes the application reads are the bytes that followed the UDP header in the device buffer.
+A device RX buffer holds a virtio-net header and one Ethernet frame. The ring-1 driver strips the virtio header, checks the frame length, and writes the Ethernet bytes into the RX arena. It stores the RX `write_idx`, then `ShmNotify` with `DATA`. The ring-2 service's `ShmWait` returns that frame object among every hot source. The service checks the destination MAC, the ethertype, the IPv4 header and its checksum, the IPv4 total length, the UDP checksum when it is non-zero, and the UDP ports. Bytes past the IPv4 total length are padding and are not part of the UDP datagram. Header checks run on the private copy of the frame. When the destination port matches a `net_bind`, the service copies the UDP payload into that app's event arena, stores the event `write_idx`, and `ShmNotify` with `DATA`. `net_recv_from` returns those payload bytes. The bytes the application reads are the bytes that followed the UDP header in the device buffer.
 
 ### Datagram send
 
@@ -452,7 +453,9 @@ ARP lifetime, the pending-send cap, DHCP retransmission, and the lease timers ar
 - `projects/harland/docs/RING2_NET_FEEDBACK.md` — the earlier ring-2 review, absorbed here. The feedback file stays the review record.
 - `projects/harland/docs/RING1_RING2_REVIEW.md` — the earlier review of both drafts. The review file stays the review record.
 - `projects/harland/docs/RING1_RING2_REREVIEW.md` — the re-review this text absorbs. The review file stays the review record.
-- `projects/harland/docs/stack_example/` — host traversal of `net_recv_from`, `net_send_to`, `net_read`, and `net_write`
+- `projects/harland/docs/RING_DESIGN_ROUND_2.md` — the round-2 review this text absorbs. The review file stays the review record.
+- `projects/harland/docs/RING_DESIGN_ROUND_3.md` — the round-3 review this text absorbs. The review file stays the review record.
+- `projects/harland/docs/stack_example/` — host traversal of `net_recv_from`, `net_send_to`, `net_read`, and `net_write`. The same run checks the peer-latch notify, the inbox, every hot source, the IPv4 total length, the ARP reply rule, and a broadcast echo request.
 - `projects/harland/docs/ARCHITECTURE.md` — phase 5, the ring-2 stack
 - `projects/harland/docs/NETWORK_DESIGN.md` — ring-2 section; syscall 40/41 and the IOPORT line are stale
 - `projects/harland/kernel/src/net/stack.ritz` — `net_poll`, `handle_ipv4_packet`, `handle_udp_packet`

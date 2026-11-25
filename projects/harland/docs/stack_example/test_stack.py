@@ -1,4 +1,5 @@
-"""Drive the host stack traversal and the eight re-review behaviors.
+"""Drive the host stack traversal, the eight re-review behaviors, and the
+round-2 interleavings.
 
 The log names each behavior and prints the datagram and stream bytes at the
 userspace calls and inside the device frame on send.
@@ -142,6 +143,129 @@ def run():
     nic.interrupt()
     require(nic.drv_irq_wait() == "ready", "the NIC's own interrupt did not complete its wait")
     print("behavior: unrelated interrupt did not satisfy the device wait")
+
+    parked = stack.IrqObject("virtio-net")
+    require(parked.return_from_park() == "deadline", "an empty latch returned an interrupt")
+    parked.interrupt()
+    require(parked.return_from_park() == "irq", "a parked return did not consume the latch")
+    require(parked.return_from_park() == "deadline", "the same latch completed a second wait")
+    print("behavior: a park return consumes the interrupt, and the next call is the deadline")
+
+    require(stack.tx_publish_races_park(), "TX publish before the park was treated as a deadline")
+    print("behavior: TX data latched on the driver mapping is a shm event, not the deadline")
+
+    require(
+        stack.service_wait_returns_every_hot_source(),
+        "one wait returned only the first hot source",
+    )
+    print("behavior: one service wait returns the frame object and a later exchange")
+
+    require(stack.idle_service_attaches(), "an idle service missed a pending attach")
+    print("behavior: a service with no exchanges receives every pending attach")
+
+    require(stack.replacement_handle_for_driver(), "the surviving driver did not receive the new handle")
+    print("behavior: the driver inbox delivers the replacement frame handle")
+
+    require(stack.user_lifecycle_bit_refused(), "an app PEER_CLOSE detached the service")
+    print("behavior: userspace cannot post PEER_CLOSE")
+
+    require(stack.empty_wake_reparks(), "an empty wake before the deadline returned the deadline")
+    print("behavior: an empty wake reparks until the deadline")
+
+    require(stack.reap_skips_repark(), "a reaped process parked again with no event")
+    print("behavior: PROC_REAP returns toward exit instead of parking")
+
+    shared = {"length": 64}
+    require(stack.copy_desc_once(shared) == 64, "the private descriptor copy was not the original length")
+    require(shared["length"] == 2098, "the shared descriptor was not changed after the copy")
+    require(stack.copy_desc_once({"length": 3000}) is None, "a length above FRAME_MAX was accepted")
+    print("behavior: the consumer validates one private descriptor copy")
+
+    side = stack.IndexSide()
+    side.peer_rewrites_our_index(100)
+    require(side.shared_read == 100 and side.private_read == 4, "the private index moved with the shared word")
+    require(side.distance() == 2, "occupancy followed the rewritten shared index")
+    print("behavior: occupancy uses the private index after the peer rewrites the shared word")
+
+    hung = stack.hung_peer_timeout()
+    require(hung["held_until_unmap"], "pages were freed while the hung peer was still mapped")
+    require(hung["reclaimed"], "unmap of the hung peer did not reclaim the object")
+    require(hung["replacement_id"] == 2, "the replacement did not exist before the hung peer detached")
+    print("behavior: a replacement exists before the hung peer is unmapped")
+
+    raw = stack.build_udp(44000, 9999, b"udp-csum-7f3a")
+    good = stack.udp_checksum(PEER_IP, OUR_IP, raw)
+    require(good != 0, "the checksum fixture folded to zero")
+    bad = 1 if good != 1 else 2
+    host.deliver_device_frame(udp_frame_with_checksum(b"udp-csum-bad", 9999, bad))
+    require(host.net_recv_from(9999) is None, "a mismatched UDP checksum was delivered")
+    host.deliver_device_frame(udp_frame_with_checksum(b"udp-csum-7f3a", 9999, good))
+    checked = host.net_recv_from(9999)
+    require(checked is not None and checked[0] == b"udp-csum-7f3a", "a valid UDP checksum was dropped")
+    print("behavior: a non-zero UDP checksum is checked, and zero stayed legal on the first datagram")
+
+    cache = {}
+    pending = set()
+    other = bytes((10, 0, 2, 99))
+    require(
+        stack.arp_observe(cache, "request", PEER_IP, PEER_MAC, other, OUR_IP, pending) == "ignored",
+        "ARP learned a request for someone else",
+    )
+    require(
+        stack.arp_observe(cache, "reply", PEER_IP, PEER_MAC, OUR_IP, OUR_IP, pending) == "ignored",
+        "an unsolicited ARP reply created an entry",
+    )
+    require(PEER_IP not in cache, "an ignored ARP packet created a cache entry")
+    require(
+        stack.arp_observe(cache, "request", PEER_IP, PEER_MAC, OUR_IP, OUR_IP, pending) == "added",
+        "ARP did not learn a request that targets us",
+    )
+    pending.add(other)
+    reply_mac = bytes.fromhex("525400ddeeff")
+    require(
+        stack.arp_observe(cache, "reply", other, reply_mac, OUR_IP, OUR_IP, pending) == "added",
+        "a reply for an outstanding request was ignored",
+    )
+    updated_mac = bytes.fromhex("525400112233")
+    require(
+        stack.arp_observe(cache, "reply", PEER_IP, updated_mac, other, OUR_IP, pending) == "updated",
+        "an existing ARP entry was not updated",
+    )
+    require(cache[PEER_IP] == updated_mac, "the ARP update did not store the new MAC")
+    print("behavior: ARP updates an existing entry, adds a request that targets us, and ignores an unsolicited reply")
+
+    broadcast_ip = bytes((255, 255, 255, 255))
+    broadcast_mac = b"\xff" * 6
+    require(not stack.icmp_echo_answered(broadcast_ip, OUR_MAC, True), "a broadcast IPv4 echo was answered")
+    require(not stack.icmp_echo_answered(OUR_IP, broadcast_mac, True), "a broadcast Ethernet echo was answered")
+    require(not stack.icmp_echo_answered(OUR_IP, OUR_MAC, False), "a bad ICMP checksum was answered")
+    require(stack.icmp_echo_answered(OUR_IP, OUR_MAC, True), "a unicast echo with a good checksum was dropped")
+    print("behavior: broadcast echo requests and a bad ICMP checksum are not answered")
+
+    inside = b"inside-ip"
+    udp = stack.build_udp(44000, 9999, inside)
+    ip = stack.build_ipv4(17, PEER_IP, OUR_IP, udp)
+    padded = stack.build_ethernet(OUR_MAC, PEER_MAC, ip) + b"OUTSIDE!"
+    host.deliver_device_frame(stack.device_frame(padded))
+    bounded = host.net_recv_from(9999)
+    require(bounded is not None and bounded[0] == inside, "IPv4 padding was delivered as payload")
+    overclaim = bytearray(stack.device_frame(padded))
+    length_at = stack.VIRTIO_HDR + 14 + 20 + 4
+    claim = len(udp) + len(b"OUTSIDE!")
+    overclaim[length_at] = (claim >> 8) & 0xFF
+    overclaim[length_at + 1] = claim & 0xFF
+    host.deliver_device_frame(bytes(overclaim))
+    require(host.net_recv_from(9999) is None, "UDP consumed bytes past the IPv4 total length")
+    print("behavior: IPv4 total length bounds the UDP parse, including padding past that length")
+
+
+def udp_frame_with_checksum(payload, destination_port, checksum):
+    udp = bytearray(stack.build_udp(44000, destination_port, payload))
+    udp[6] = (checksum >> 8) & 0xFF
+    udp[7] = checksum & 0xFF
+    ip = stack.build_ipv4(17, PEER_IP, OUR_IP, bytes(udp))
+    ethernet = stack.build_ethernet(OUR_MAC, PEER_MAC, ip)
+    return stack.device_frame(ethernet)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,9 @@ ring-2 service, and comes out of ``net_recv_from`` or ``net_read``. An
 application send takes the reverse path and leaves as a device frame.
 
 This module does not boot the kernel. It follows the rules in
-``RING1_DRIVER.md`` and ``RING2_NET.md``.
+``RING1_DRIVER.md`` and ``RING2_NET.md``. The wait-set, private-index, and
+one-copy descriptor helpers are explicit interleavings of those rules. This
+process has one thread, so the ordering is written out rather than raced.
 """
 
 import struct
@@ -14,8 +16,13 @@ VIRTIO_HDR = 12
 DEPTH = 256
 DATA = 1
 SPACE = 2
+PEER_CLOSE = 4
 DRIVER_GONE = 8
+LINK = 16
+ATTACH = 64
+USER_EVENT_BITS = DATA | SPACE
 CAP_RIGHT_PUBLISH = 4096
+INBOX_DEPTH = 8
 U64_MAX = (1 << 64) - 1
 
 
@@ -49,7 +56,6 @@ class ShmObject:
         self.pages = list(pages)
         self.mappings = {}
         self.retired = False
-        self.inflight = 0
         self.reclaimed = False
         self.events = 0
         self.generation = 0
@@ -67,13 +73,8 @@ class ShmObject:
         self.events |= DRIVER_GONE
         self._try_reclaim()
 
-    def ack_slot(self):
-        if self.inflight > 0:
-            self.inflight -= 1
-        self._try_reclaim()
-
     def _try_reclaim(self):
-        if self.retired and not self.mappings and self.inflight == 0:
+        if self.retired and not self.mappings:
             self.reclaimed = True
 
     @property
@@ -114,6 +115,87 @@ class IrqObject:
             self.seen = self.latched
             return "ready"
         return "parked"
+
+    def return_from_park(self):
+        """The park return consumes the latch. The next call is not the same interrupt."""
+        if self.latched != self.seen:
+            self.seen = self.latched
+            return "irq"
+        return "deadline"
+
+
+class PeerEnd:
+    """One mapping's latch. A notify posts to the other mapping, not to a wait call."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.latch = 0
+        self.peer = None
+        self.attached = True
+
+
+def bind_peers(left, right):
+    left.peer = right
+    right.peer = left
+
+
+def shm_notify(end, bits):
+    """Userspace may post DATA and SPACE onto the peer mapping. Kernel bits are refused."""
+    if bits == 0 or (bits & ~USER_EVENT_BITS) != 0:
+        return "inval"
+    if end.peer is None or not end.peer.attached:
+        return "nodev"
+    end.peer.latch |= bits
+    return "ok"
+
+
+def kernel_post(end, bits):
+    end.latch |= bits
+
+
+class ProcessWait:
+    """Listed sources plus an inbox that is scanned even when the list is empty."""
+
+    def __init__(self, irq=None):
+        self.irq = irq
+        self.inbox = []
+        self.reap = False
+
+    def post_inbox(self, handle, bits):
+        if len(self.inbox) >= INBOX_DEPTH:
+            return False
+        self.inbox.append((handle, bits))
+        return True
+
+    def wait(self, sources, out_cap, deadline_passed):
+        """Return ``(code, events)``. ``sources`` is ``(handle, mask, end)``.
+
+        Code 0 includes the IRQ. Code 2 is shm or inbox events and no IRQ.
+        Code 1 is the deadline. ``repark`` means a wake matched nothing and
+        the deadline has not passed. ``reap`` does not park again.
+        """
+        events = []
+        irq_hit = False
+        if self.irq is not None and self.irq.latched != self.irq.seen and len(events) < out_cap:
+            self.irq.seen = self.irq.latched
+            events.append((self.irq.name, DATA))
+            irq_hit = True
+        for handle, mask, end in sources:
+            if len(events) >= out_cap:
+                break
+            bits = end.latch & mask
+            if bits:
+                end.latch &= ~bits
+                events.append((handle, bits))
+        while self.inbox and len(events) < out_cap:
+            events.append(self.inbox.pop(0))
+        if events:
+            return (0 if irq_hit else 2, events)
+        if self.reap:
+            return ("reap", [])
+        if deadline_passed:
+            return (1, [])
+        return ("repark", [])
 
 
 class FrameRing:
@@ -211,23 +293,51 @@ def parse_ipv4(ethernet):
         return None
     ip_header = ethernet[14:]
     header_len = (ip_header[0] & 0x0F) * 4
-    if header_len < 20 or len(ip_header) < header_len:
+    total = (ip_header[2] << 8) | ip_header[3]
+    if header_len < 20 or total < header_len or len(ip_header) < total:
         return None
     if ip_checksum(ip_header[:header_len]) != ip_header[10:12]:
         return None
     protocol = ip_header[9]
     source = ip_header[12:16]
-    body = ip_header[header_len:]
-    return protocol, source, body
+    destination = ip_header[16:20]
+    body = ip_header[header_len:total]
+    return protocol, source, destination, body
 
 
-def parse_udp(body):
+def inet_checksum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for index in range(0, len(data), 2):
+        total += (data[index] << 8) + data[index + 1]
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def udp_checksum(source, destination, udp):
+    """Checksum of one UDP datagram. A zero field means the sender sent none."""
+    header = bytearray(udp)
+    header[6] = 0
+    header[7] = 0
+    pseudo = source + destination + bytes((0, 17)) + struct.pack("!H", len(udp))
+    return inet_checksum(pseudo + bytes(header))
+
+
+def parse_udp(body, source=None, destination=None):
     if len(body) < 8:
         return None
-    source_port, destination_port, length, _checksum = struct.unpack("!HHHH", body[:8])
+    source_port, destination_port, length, checksum = struct.unpack("!HHHH", body[:8])
     if length < 8 or len(body) < length:
         return None
-    return source_port, destination_port, body[8:length]
+    datagram = body[:length]
+    if checksum != 0:
+        if source is None or destination is None:
+            return None
+        if udp_checksum(source, destination, datagram) != checksum:
+            return None
+    return source_port, destination_port, datagram[8:]
 
 
 def parse_tcp(body, expected_sequence):
@@ -295,31 +405,174 @@ def handoff(try_release):
 
 
 def death_order(which):
-    """Observe page ownership through one death order, including a peer mid-slot."""
+    """Pages stay while the other mapping is live. A replacement does not wait for an ack."""
     obj = ShmObject(1, ["frame-pages"])
     obj.map("driver", 0x1000)
     obj.map("service", 0x2000)
-    obj.inflight = 1
     observed = []
     if which == "driver-first":
-        obj.detach("driver")
-        obj.retire()
-        observed.append(obj.pages_allocated)
-        obj.ack_slot()
-        observed.append(obj.pages_allocated)
-        obj.detach("service")
-        observed.append(obj.pages_allocated)
+        dying, survivor = "driver", "service"
     elif which == "service-first":
-        obj.detach("service")
-        obj.retire()
-        observed.append(obj.pages_allocated)
-        obj.ack_slot()
-        observed.append(obj.pages_allocated)
-        obj.detach("driver")
-        observed.append(obj.pages_allocated)
+        dying, survivor = "service", "driver"
     else:
         raise ValueError(which)
+    obj.detach(dying)
+    obj.retire()
+    observed.append(obj.pages_allocated)
+    replacement = ShmObject(obj.object_id + 1, ["replacement"])
+    observed.append(obj.pages_allocated and replacement.object_id != obj.object_id)
+    obj.detach(survivor)
+    observed.append(obj.pages_allocated)
     return observed
+
+
+def hung_peer_timeout():
+    """A peer that never detaches is unmapped, and the replacement already exists."""
+    old = ShmObject(1, ["old-pages"])
+    old.map("driver", 0x1000)
+    old.map("service", 0x2000)
+    old.detach("service")
+    old.retire()
+    replacement = ShmObject(2, ["new-pages"])
+    still_held = old.pages_allocated
+    old.detach("driver")
+    return {
+        "held_until_unmap": still_held,
+        "reclaimed": not old.pages_allocated,
+        "replacement_id": replacement.object_id,
+    }
+
+
+class IndexSide:
+    """The consumer's own index is private. The shared copy is what the peer can rewrite."""
+
+    def __init__(self):
+        self.private_read = 4
+        self.shared_read = 4
+        self.peer_write = 6
+
+    def peer_rewrites_our_index(self, value):
+        self.shared_read = value
+
+    def distance(self):
+        return occupancy(self.peer_write, self.private_read)
+
+
+def copy_desc_once(shared):
+    """Validate the private copy. A later store to the shared descriptor does not change it."""
+    copied_length = shared["length"]
+    shared["length"] = 2048 + 50
+    if copied_length < 1 or copied_length > 2048:
+        return None
+    return copied_length
+
+
+def tx_publish_races_park():
+    """The notify lands on the driver's mapping before the park, so the wait does not use the deadline."""
+    ring = FrameRing()
+    if ring.take() is not None:
+        raise RuntimeError("a new ring was not empty")
+    driver = PeerEnd(1)
+    service = PeerEnd(1)
+    bind_peers(driver, service)
+    wait = ProcessWait()
+    if not ring.publish(b"tx-race"):
+        return False
+    if shm_notify(service, DATA) != "ok" or driver.latch != DATA:
+        return False
+    code, events = wait.wait([(1, DATA, driver)], 8, False)
+    return code == 2 and events == [(1, DATA)] and driver.latch == 0 and ring.take() == b"tx-race"
+
+
+def service_wait_returns_every_hot_source():
+    """One call copies the frame object and a later exchange. It does not stop at the first."""
+    frame = PeerEnd(1)
+    quiet = PeerEnd(10)
+    hot = PeerEnd(11)
+    bind_peers(frame, PeerEnd(101))
+    bind_peers(quiet, PeerEnd(110))
+    bind_peers(hot, PeerEnd(111))
+    if shm_notify(frame.peer, DATA) != "ok" or shm_notify(hot.peer, DATA) != "ok":
+        return False
+    wait = ProcessWait()
+    code, events = wait.wait([(1, DATA, frame), (10, DATA, quiet), (11, DATA, hot)], 8, False)
+    return code == 2 and events == [(1, DATA), (11, DATA)]
+
+
+def idle_service_attaches():
+    """A service with no exchanges still receives every pending attach."""
+    wait = ProcessWait()
+    if not wait.post_inbox(10, ATTACH) or not wait.post_inbox(11, ATTACH):
+        return False
+    code, events = wait.wait([], 8, False)
+    return code == 2 and events == [(10, ATTACH), (11, ATTACH)]
+
+
+def replacement_handle_for_driver():
+    """After PEER_CLOSE, the next wait delivers the new frame handle from the inbox."""
+    old = PeerEnd(1)
+    kernel_post(old, PEER_CLOSE)
+    wait = ProcessWait()
+    code, events = wait.wait([(1, PEER_CLOSE, old)], 8, False)
+    if code != 2 or events != [(1, PEER_CLOSE)]:
+        return False
+    if not wait.post_inbox(2, ATTACH):
+        return False
+    code, events = wait.wait([], 8, False)
+    return code == 2 and events == [(2, ATTACH)]
+
+
+def user_lifecycle_bit_refused():
+    """An app cannot post PEER_CLOSE. The service stays attached."""
+    service = PeerEnd(8)
+    app = PeerEnd(8)
+    bind_peers(service, app)
+    if shm_notify(app, PEER_CLOSE) != "inval":
+        return False
+    return service.latch == 0 and service.attached
+
+
+def empty_wake_reparks():
+    """A wake that matches nothing is not the deadline while the deadline is still ahead."""
+    end = PeerEnd(1)
+    wait = ProcessWait()
+    early, early_events = wait.wait([(1, DATA, end)], 8, False)
+    late, late_events = wait.wait([(1, DATA, end)], 8, True)
+    return early == "repark" and early_events == [] and late == 1 and late_events == []
+
+
+def reap_skips_repark():
+    """PROC_REAP returns toward the iret tail instead of parking with no event."""
+    wait = ProcessWait()
+    wait.reap = True
+    code, events = wait.wait([], 8, False)
+    return code == "reap" and events == []
+
+
+def arp_observe(cache, opcode, sender_ip, sender_mac, target_ip, our_ip, pending):
+    """Update an existing entry. A request adds only when we are the target.
+
+    A reply adds only when a request for that sender is outstanding. An
+    unsolicited reply does not create an entry.
+    """
+    if sender_ip in cache:
+        cache[sender_ip] = sender_mac
+        return "updated"
+    if opcode == "request" and target_ip == our_ip:
+        cache[sender_ip] = sender_mac
+        return "added"
+    if opcode == "reply" and sender_ip in pending:
+        cache[sender_ip] = sender_mac
+        return "added"
+    return "ignored"
+
+
+def icmp_echo_answered(dest_ip, dest_mac, checksum_ok):
+    if not checksum_ok:
+        return False
+    if dest_ip == bytes((255, 255, 255, 255)) or dest_mac == (b"\xff" * 6):
+        return False
+    return True
 
 
 def replacement_generation():
@@ -376,9 +629,9 @@ class Stack:
             parsed = parse_ipv4(ethernet)
             if parsed is None:
                 continue
-            protocol, source, body = parsed
+            protocol, source, destination_ip, body = parsed
             if protocol == 17:
-                udp = parse_udp(body)
+                udp = parse_udp(body, source, destination_ip)
                 if udp is None:
                     continue
                 source_port, destination_port, payload = udp
