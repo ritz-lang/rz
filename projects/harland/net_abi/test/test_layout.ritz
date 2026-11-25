@@ -1,0 +1,170 @@
+# Harland net ABI layout (AGAST #4747)
+#
+# netd, libnet and a later Linux port share these bytes
+# (docs/RING2_NET.md "Ring-3 app exchange"). Each test pins sizeof, every
+# field offset or every constant against the doc's tables, so a field
+# added, dropped, resized or re-ordered fails here rather than on a boot.
+#
+# Offsets are taken from a live global: &field - &struct.
+
+import net_abi.app { AppDesc, APP_DEPTH, APP_DEPTH_MASK, APP_SLOT, APP_ARENA_SIZE, APP_REQ_CTRL_OFF, APP_EV_CTRL_OFF, APP_UNUSED_OFF, APP_REQ_DESC_OFF, APP_EV_DESC_OFF, APP_REQ_ARENA_OFF, APP_EV_ARENA_OFF, APP_REGION_SIZE, APP_REQ_WAKE_OFF, APP_EV_WAKE_OFF, APP_F_NONE, APP_BIND, APP_SEND_TO, APP_PING, APP_CLOSE, APP_CONNECT, APP_WRITE, EV_DATAGRAM, EV_PING_REPLY, EV_BOUND, EV_CLOSED, EV_ERROR, EV_STREAM, MAX_ENDPOINTS, PING_DEADLINE_MS }
+
+var g_desc: AppDesc
+
+# driver_abi.frame_ring: sizeof(SpscCtrl) and the wake word's offset in it.
+# Not imported (net_abi is a leaf); driver_abi's own test pins both.
+const SPSC_CTRL_SIZE: u64 = 0xC0
+const SPSC_WAKE_OFF: u64 = 0x80
+
+fn off(field: u64, base: u64) -> u64
+    return field - base
+
+[[test]]
+fn test_app_desc_layout() -> i32
+    # 32 bytes, so APP_DEPTH descriptors fit in one page.
+    if sizeof(AppDesc) != 32
+        return 1
+    let b: u64 = @g_desc as u64
+    if off(@g_desc.kind as u64, b) != 0
+        return 2
+    if off(@g_desc.flags as u64, b) != 2
+        return 3
+    if off(@g_desc.id as u64, b) != 4
+        return 4
+    if off(@g_desc.handle as u64, b) != 8
+        return 5
+    if off(@g_desc.port as u64, b) != 12
+        return 6
+    if off(@g_desc.status as u64, b) != 14
+        return 7
+    if off(@g_desc.addr as u64, b) != 16
+        return 8
+    if off(@g_desc.length as u64, b) != 20
+        return 9
+    if off(@g_desc.arena_off as u64, b) != 24
+        return 10
+    if off(@g_desc._pad as u64, b) != 28
+        return 11
+    return 0
+
+[[test]]
+fn test_app_desc_field_widths() -> i32
+    # status is signed: a negative Errno reads back negative.
+    g_desc.status = -38
+    if g_desc.status != -38
+        return 1
+    # port is a full u16, not a u8 behind padding.
+    g_desc.port = 65535
+    if g_desc.port != 65535
+        return 2
+    # addr is four wire-order bytes.
+    g_desc.addr[0] = 10
+    g_desc.addr[3] = 2
+    let p: *u8 = @g_desc.addr[0]
+    if *p != 10 or off(@g_desc.addr[3] as u64, @g_desc.addr[0] as u64) != 3
+        return 3
+    # The u32 fields are full u32s: a u16 id would keep handle at offset 8
+    # behind alignment padding, so only a write-back catches it.
+    let wide: u32 = 0x10001
+    g_desc.id = wide
+    g_desc.handle = wide
+    g_desc.length = wide
+    g_desc.arena_off = wide
+    g_desc._pad = wide
+    if g_desc.id != wide or g_desc.handle != wide or g_desc.length != wide
+        return 4
+    if g_desc.arena_off != wide or g_desc._pad != wide
+        return 5
+    return 0
+
+[[test]]
+fn test_app_constants() -> i32
+    if APP_DEPTH != 32 or APP_DEPTH_MASK != 31
+        return 1
+    # A power of two, so the slot is seq & mask.
+    if (APP_DEPTH & APP_DEPTH_MASK) != 0
+        return 2
+    # APP_SLOT is FRAME_MAX.
+    if APP_SLOT != 2048
+        return 3
+    if APP_ARENA_SIZE != 65536 or APP_ARENA_SIZE != APP_DEPTH * APP_SLOT
+        return 4
+    if APP_F_NONE != 0
+        return 5
+    if MAX_ENDPOINTS != 16
+        return 6
+    if PING_DEADLINE_MS != 1000
+        return 7
+    return 0
+
+[[test]]
+fn test_request_kinds() -> i32
+    if APP_BIND != 1 or APP_SEND_TO != 2
+        return 1
+    if APP_PING != 4 or APP_CLOSE != 5
+        return 2
+    if APP_CONNECT != 6 or APP_WRITE != 7
+        return 3
+    return 0
+
+[[test]]
+fn test_event_kinds() -> i32
+    if EV_DATAGRAM != 16 or EV_PING_REPLY != 17 or EV_BOUND != 18
+        return 1
+    if EV_CLOSED != 19 or EV_ERROR != 20 or EV_STREAM != 21
+        return 2
+    # Every event kind is above every request kind.
+    if EV_DATAGRAM <= APP_WRITE
+        return 3
+    return 0
+
+[[test]]
+fn test_app_region_table() -> i32
+    # The region table, offset by offset.
+    if APP_REQ_CTRL_OFF != 0x0000
+        return 1
+    if APP_EV_CTRL_OFF != 0x0100
+        return 2
+    if APP_UNUSED_OFF != 0x0200
+        return 3
+    if APP_REQ_DESC_OFF != 0x1000
+        return 4
+    if APP_EV_DESC_OFF != 0x2000
+        return 5
+    if APP_REQ_ARENA_OFF != 0x3000
+        return 6
+    if APP_EV_ARENA_OFF != 0x13000
+        return 7
+    if APP_REGION_SIZE != 0x23000
+        return 8
+    # wake is at 0x80 and 0x180.
+    if APP_REQ_WAKE_OFF != 0x80 or APP_REQ_WAKE_OFF != APP_REQ_CTRL_OFF + SPSC_WAKE_OFF
+        return 9
+    if APP_EV_WAKE_OFF != 0x180 or APP_EV_WAKE_OFF != APP_EV_CTRL_OFF + SPSC_WAKE_OFF
+        return 10
+    return 0
+
+[[test]]
+fn test_app_region_fits_sizeof() -> i32
+    # Each block holds what sizeof says it holds, so a struct that grows
+    # overlaps its neighbour here instead of in a shared page.
+    if APP_REQ_CTRL_OFF + SPSC_CTRL_SIZE > APP_EV_CTRL_OFF
+        return 1
+    if APP_EV_CTRL_OFF + SPSC_CTRL_SIZE > APP_UNUSED_OFF
+        return 2
+    let ring: u64 = APP_DEPTH * (sizeof(AppDesc) as u64)
+    if ring != 1024
+        return 3
+    # 32 live slots in a page; bytes past them are unused.
+    if APP_REQ_DESC_OFF + ring > APP_EV_DESC_OFF
+        return 4
+    if APP_EV_DESC_OFF + ring > APP_REQ_ARENA_OFF
+        return 5
+    if APP_REQ_ARENA_OFF + APP_ARENA_SIZE != APP_EV_ARENA_OFF
+        return 6
+    if APP_EV_ARENA_OFF + APP_ARENA_SIZE != APP_REGION_SIZE
+        return 7
+    # The last slot's payload ends at the arena's end.
+    if APP_DEPTH_MASK * APP_SLOT + APP_SLOT != APP_ARENA_SIZE
+        return 8
+    return 0

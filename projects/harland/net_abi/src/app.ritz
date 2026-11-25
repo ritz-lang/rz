@@ -1,0 +1,81 @@
+# Harland app-exchange ABI (AGAST #4747, docs/RING2_NET.md "Ring-3 app exchange")
+#
+# One attachment between a ring-3 app and the ring-2 network service: two
+# SPSC rings, requests (app -> service) and events (service -> app), plus
+# an arena for each, in one region of APP_REGION_SIZE bytes laid out by the
+# APP_*_OFF table below. NetAttach (228) creates it as a ShmObject and
+# ShmMap (227) maps it. The publication rule is the frame ring's: fill the
+# slot, release-store the index, then the wake.
+#
+# The two control blocks are driver_abi's SpscCtrl bytes (write_idx at 0,
+# read_idx at 0x40, the u32 wake word at 0x80, 0xC0 bytes in a 0x100
+# block). This package stays a leaf and does not import driver_abi; the
+# region table and test/test_layout.ritz carry the same numbers. The bytes
+# are the contract, so this module imports nothing.
+
+# Ring depth: a power of two, so the slot is seq & APP_DEPTH_MASK.
+pub const APP_DEPTH: u64 = 32
+pub const APP_DEPTH_MASK: u64 = APP_DEPTH - 1
+
+# One payload slot: FRAME_MAX, so one datagram fits in one slot and the
+# published MTU still caps the packet.
+pub const APP_SLOT: u64 = 2048
+
+# Each arena is a fixed 64 KiB block; APP_DEPTH slots use all of it.
+pub const APP_ARENA_SIZE: u64 = 0x10000
+
+# The region. Both controls share page 0.
+pub const APP_REQ_CTRL_OFF: u64 = 0x0000     # request SpscCtrl; app stores write_idx
+pub const APP_EV_CTRL_OFF: u64 = 0x0100      # event SpscCtrl; service stores write_idx
+pub const APP_UNUSED_OFF: u64 = 0x0200       # unused, to 0x1000
+pub const APP_REQ_DESC_OFF: u64 = 0x1000     # request AppDesc[APP_DEPTH], page 1
+pub const APP_EV_DESC_OFF: u64 = 0x2000      # event AppDesc[APP_DEPTH], page 2
+pub const APP_REQ_ARENA_OFF: u64 = 0x3000    # request arena, APP_ARENA_SIZE bytes
+pub const APP_EV_ARENA_OFF: u64 = 0x13000    # event arena, APP_ARENA_SIZE bytes
+pub const APP_REGION_SIZE: u64 = 0x23000
+
+# The wake words: SpscCtrl.wake (0x80) inside each control block.
+pub const APP_REQ_WAKE_OFF: u64 = 0x0080
+pub const APP_EV_WAKE_OFF: u64 = 0x0180
+
+# AppDesc.flags. Any other value is Bad.
+pub const APP_F_NONE: u16 = 0
+
+# Request kinds, written by the app. 3 is not a kind.
+pub const APP_BIND: u16 = 1
+pub const APP_SEND_TO: u16 = 2
+pub const APP_PING: u16 = 4
+pub const APP_CLOSE: u16 = 5
+pub const APP_CONNECT: u16 = 6              # reserved: answered EV_ERROR NoSys
+pub const APP_WRITE: u16 = 7                # reserved: answered EV_ERROR NoSys
+
+# Event kinds, written by the service.
+pub const EV_DATAGRAM: u16 = 16
+pub const EV_PING_REPLY: u16 = 17
+pub const EV_BOUND: u16 = 18
+pub const EV_CLOSED: u16 = 19
+pub const EV_ERROR: u16 = 20
+pub const EV_STREAM: u16 = 21               # reserved for net_read
+
+# Live endpoints per exchange; a bind past this is Errno.NFile.
+pub const MAX_ENDPOINTS: u32 = 16
+
+# One APP_PING's owed reply: the deadline starts when the echo is published
+# to the driver and is not restarted.
+pub const PING_DEADLINE_MS: u64 = 1000
+
+# One request or event slot. A reader copies it once into private memory,
+# validates the copy (flags == APP_F_NONE, _pad == 0, length <= APP_SLOT,
+# arena_off == (seq & APP_DEPTH_MASK) * APP_SLOT) and copies the payload
+# using only that copy's length and arena_off. Little-endian.
+pub struct AppDesc
+    kind: u16                        # APP_* in a request, EV_* in an event
+    flags: u16                       # APP_F_*
+    id: u32                          # library-chosen from 1, echoed; 0 is no id
+    handle: u32                      # endpoint; 0 creates one, never live
+    port: u16                        # host order; the service swaps for UDP
+    status: i16                      # 0 in a request; 0 or -Errno in an event
+    addr: [4]u8                      # IPv4, wire order; zero when unused
+    length: u32                      # payload bytes, 0..=APP_SLOT
+    arena_off: u32                   # byte offset of the slot in its arena
+    _pad: u32                        # must be 0
