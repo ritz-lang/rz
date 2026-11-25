@@ -233,3 +233,144 @@ def test_ritz1_rejects_length_unfoldable_after_merge(request, tmp_path, compiler
     assert not ll.exists(), f"{compiler} wrote IR for {name!r}"
     hits = re.findall(rf"main\.ritz:{line}:{col}: error: array length ", out)
     assert len(hits) == 1, out[-2000:]
+
+
+# AGAST #4769: an alias whose length is a const from another module, used from
+# a third.  The second pass parses main before a/t.ritz, so main replayed the
+# first pass's alias snapshot (length still pending, 0): `@g` became
+# `[0 x i8]`, `fill(@&g)` was refused, and an index ran past a 0-byte global.
+# Each file of a row is (path, text); main.ritz exits 3 when every length is
+# right.
+THIRD_MODULE = {
+    "alias_global_ref": {
+        "a/c.ritz": "pub const N: u64 = 16\n",
+        "a/t.ritz": """\
+import a.c { N }
+pub type Buf = [N]u8
+
+pub fn fill(b:& Buf) -> u64
+    b[N - 1] = 7
+    sizeof(Buf)
+""",
+        "main.ritz": """\
+import a.t { Buf, fill }
+
+var g: Buf
+
+struct Holder
+    buf: Buf
+    tail: u8
+
+pub fn main() -> i32
+    if fill(@&g) != 16
+        return 10
+    if g[15] != 7
+        return 11
+    if sizeof(g) != 16
+        return 12
+    var h: Holder
+    h.tail = 1
+    if sizeof(Holder) != 17
+        return 13
+    var l: Buf
+    l[15] = 2
+    return (g[15] as i32) - (l[15] as i32) - (h.tail as i32) - 1
+""",
+    },
+    # Aliases of aliases, each in its own module: one link settles a pass,
+    # so this takes five.
+    "alias_chain": {
+        "a/c.ritz": "pub const N: i32 = 5\n",
+        "a/t.ritz": "import a.c { N }\npub type Row = [N]i32\n",
+        "a/u.ritz": "import a.t { Row }\npub type Line = Row\n",
+        "a/v.ritz": "import a.u { Line }\npub type Lane = Line\n",
+        "a/w.ritz": "import a.v { Lane }\npub type Path = Lane\n",
+        "main.ritz": """\
+import a.w { Path }
+
+var g: Path
+
+pub fn main() -> i32
+    g[4] = 3
+    if sizeof(g) != 20
+        return 10
+    return g[4]
+""",
+    },
+}
+
+
+def _write_tree(root, files):
+    for rel, text in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+
+def _compile_tree(compiler, root):
+    env = dict(os.environ, RITZ_PATH=f"{root}:{RITZ_ROOT}")
+    src, ll = root / "main.ritz", root / "main.ll"
+    if compiler == "ritz0":
+        return run_ritz0([str(src), "-o", str(ll)], cwd=root, env=env, timeout=300)
+    binary = RITZ1_BUILD / compiler
+    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+    return subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=root, env=env,
+                          capture_output=True, text=True, timeout=300, check=False)
+
+
+def _compile_module(compiler, root, rel):
+    env = dict(os.environ, RITZ_PATH=f"{root}:{RITZ_ROOT}")
+    ll = root / (rel.replace("/", "_") + ".ll")
+    if compiler == "ritz0":
+        comp = run_ritz0([str(root / rel), "--no-runtime", "-o", str(ll)],
+                         cwd=root, env=env, timeout=300)
+    else:
+        comp = subprocess.run([str(RITZ1_BUILD / compiler), str(root / rel), "-o", str(ll)],
+                              cwd=root, env=env, capture_output=True, text=True, timeout=300, check=False)
+    assert comp.returncode == 0, f"{compiler} {rel}:\n{comp.stdout[-1000:]}\n{comp.stderr[-2000:]}"
+    return ll
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(THIRD_MODULE))
+def test_alias_length_from_third_module(request, tmp_path, compiler, name):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    _write_tree(tmp_path, THIRD_MODULE[name])
+    comp = _compile_tree(compiler, tmp_path)
+    ll = tmp_path / "main.ll"
+    assert comp.returncode == 0 and ll.exists(), (
+        f"{compiler} failed to compile:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
+    )
+    assert "[0 x" not in ll.read_text(), f"{compiler} emitted a zero-length array"
+    # Each module is its own object: main.ll only declares `fill`.
+    objs = [str(ll)]
+    for rel in sorted(THIRD_MODULE[name]):
+        if rel != "main.ritz":
+            objs.append(str(_compile_module(compiler, tmp_path, rel)))
+    exe = tmp_path / "main"
+    link_cmd = ["clang", *objs, "-o", str(exe), "-nostdlib"]
+    if compiler != "ritz0":
+        link_cmd.insert(1, str(RITZ_START))
+    link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
+    assert link.returncode == 0, f"{compiler}: link failed:\n{link.stderr[-2000:]}"
+    assert subprocess.run([str(exe)], capture_output=True, timeout=60, check=False).returncode == 3
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+def test_ritz1_rejects_unfoldable_alias_length_from_third_module(request, tmp_path, compiler):
+    """An imported alias whose length never folds is refused at its `[`, never
+    emitted as `[0 x T]` (AGAST #4769)."""
+    request.getfixturevalue("ritz1_bin")
+    _write_tree(tmp_path, {
+        "a/c.ritz": "pub const N: u64 = 16\n",
+        "a/t.ritz": "import a.c { N }\npub type Buf = [NOPE]u8\n",
+        "main.ritz": "import a.t { Buf }\n\nvar g: Buf\n\npub fn main() -> i32\n    0\n",
+    })
+    comp = _compile_tree(compiler, tmp_path)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-1000:]}"
+    assert not (tmp_path / "main.ll").exists(), f"{compiler} wrote IR"
+    assert re.search(r"t\.ritz:2:16: error: array length ", out), out[-2000:]

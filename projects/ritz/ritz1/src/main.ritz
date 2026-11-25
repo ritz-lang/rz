@@ -1778,7 +1778,18 @@ pub fn main(argv: Span<StrView>) -> i32
     # hadn't parsed yet (imported, or declared later): the second pass folds
     # it against every const the first one merged.
     # AGAST #4609: likewise a twin type to rename (type_twins.ritz).
-    if type_alias_count(ctx) > 0 or array_len_pending(ctx) > 0 or twin_renames_pending(ctx) == 1
+    # AGAST #4769: the second pass parses an importer before its imports, so
+    # it can replay an alias's first-pass snapshot (`[N]u8` with an imported
+    # N, not folded yet) before the alias's own file records the folded one.
+    # alias_stale() says a use did; parse once more, against settled aliases.
+    # Each such pass settles at least one more alias (an alias of an alias,
+    # each in its own module, settles one link per pass), so the alias count
+    # plus two passes always suffice; past that the table is cycling.
+    var passes: i32 = 1
+    var again: bool = type_alias_count(ctx) > 0 or array_len_pending(ctx) > 0 or twin_renames_pending(ctx) == 1
+    while again
+        again = false
+        alias_stale_clear(ctx)
         array_len_seed(ctx, m.constants)
         processed_vec().clear()
         dep_record_reset()
@@ -1795,6 +1806,12 @@ pub fn main(argv: Span<StrView>) -> i32
         m = parse_program(ctx, @tokens, args.input_path, source_dir2, ritz_path2)
         if m == null
             return 1
+        passes = passes + 1
+        again = alias_stale(ctx) and passes < type_alias_count(ctx) + 2
+    if alias_stale(ctx)
+        # Never emit what a stale snapshot built (a `[0 x T]` global).
+        eprintln("error: type aliases did not settle: a use keeps replaying a changed alias")
+        return 1
     let parse_end: i64 = if parse_only == 1 then now_nanos() else 0
     twin_variant_views(ctx, m)   # AGAST #4609
 

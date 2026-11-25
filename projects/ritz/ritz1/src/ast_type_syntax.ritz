@@ -927,6 +927,7 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     tn_note_last(p, 2)
     tn_claim(p, null, null)
     var e: *AliasEntry = type_alias_find(p.ctx, StrView { ptr: (name), len: (len) as i64 })
+    let existed: bool = e != null
     if e == null
         if p.ctx.alias_table == null
             p.ctx.alias_table = malloc((MAX_TYPE_ALIASES as i64) * 8) as **u8
@@ -945,6 +946,12 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     # it keeps the flat snapshot, and type_alias_resolve rebuilds a *TypeRef
     # from it.  Nothing is latched on the Parser any more (#4035).
     let f: *TypeFacts = type_facts(p, tr)
+    # AGAST #4769: a use already replayed the old snapshot (an importer
+    # parsed before this file, whose length the last pass couldn't fold):
+    # what it built is stale, so the driver parses everything once more.
+    if existed and e.replayed and alias_snapshot_changed(e, f)
+        p.ctx.alias_stale = true
+    e.replayed = false
     e.name = name
     e.name_len = len
     e.kind = f.kind
@@ -969,6 +976,36 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     e.spelling = type_alias_spell(p, name, @slen)
     e.spelling_len = slen
     return tr
+
+# AGAST #4769: true if the snapshot `f` names a different type than `e` holds,
+# as far as a replay builds it: the kind, the leaf's name, the pointer depth
+# and pointee, and every array dimension.
+fn alias_snapshot_changed(e: *AliasEntry, f: *TypeFacts) -> bool
+    if e.kind != f.kind or e.array_size != f.array_size or e.ptr_depth != f.ptr_depth
+        return true
+    if e.pointee_type != f.pointee_type or e.array_elem_type != f.array_elem_type
+        return true
+    let old_name = StrView { ptr: e.type_name, len: e.type_name_len as i64 }
+    if not old_name.eq(StrView { ptr: f.type_name, len: f.type_name_len as i64 })
+        return true
+    let a: *ArrayShape = e.array_shape
+    let b: *ArrayShape = f.array_shape
+    if a == null or b == null
+        return a != b
+    if a.rank != b.rank
+        return true
+    for i in 0..a.rank
+        if a.dims[i] != b.dims[i]
+            return true
+    false
+
+# True when a use replayed an alias whose snapshot then changed: the parse
+# built from it is stale (AGAST #4769).
+pub fn alias_stale(ctx: *ParseCtx) -> bool
+    ctx.alias_stale
+
+pub fn alias_stale_clear(ctx: *ParseCtx)
+    ctx.alias_stale = false
 
 # Grammar action around an alias's type.  #4035: the *TypeRef is already the
 # whole snapshot, so there is nothing left to latch.
@@ -1122,6 +1159,7 @@ pub fn type_alias_resolve(p: *Parser, name_sv: StrView) -> *TypeRef
     let e: *AliasEntry = type_alias_find(p.ctx, StrView { ptr: (name), len: (len) as i64 })
     if e == null
         return null
+    e.replayed = true   # AGAST #4769
     var t: *TypeRef = null
     match e.kind
         TypeKind.Struct =>
