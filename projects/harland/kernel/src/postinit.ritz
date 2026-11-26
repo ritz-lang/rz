@@ -814,11 +814,14 @@ fn shm_wait_self_test() -> bool
 # registers it; the stub cannot run before pid 1 yields. Eight stand-in
 # apps (tables with no process, as cap/shm_selftest.ritz uses) each attach
 # once: eight ATTACH records on the inbox, a second attach from one of them
-# is Exist and a ninth app's is Again, creating nothing. Those eight
-# objects are retired (the apps "exited" before the service mapped them),
-# so the service's first wait, with an empty source list, copies out all
-# eight and loses each handle before it returns: the stub's ShmMap of each
-# is Perm. Then two real apps (mode 8), one after the other in the same
+# is Exist and a ninth app's is Again, creating nothing. With the service
+# unregistered, as its exit leaves it, the app holding an exchange still
+# gets Exist and the ninth gets NoDev (#4848: the last real app's second
+# attach can run after the service has collected its record and exited).
+# Those eight objects are retired (the apps "exited" before the service
+# mapped them), so the service's first wait, with an empty source list,
+# copies out all eight and loses each handle before it returns: the stub's
+# ShmMap of each is Perm. Then two real apps (mode 8), one after the other in the same
 # process slot, attach (a second attach of each, still holding its handle,
 # is Exist) and exit, and the exit retires each exchange (#4729); the
 # service maps each it reaches before that exit, refuses the others, and
@@ -846,6 +849,7 @@ fn net_attach_self_test() -> bool
     var queued: bool = false
     var exist: bool = false
     var again: bool = false
+    var gone: bool = false
     var dropped: bool = false
     var apps_ok: bool = false
     var status: i64 = -1
@@ -865,6 +869,9 @@ fn net_attach_self_test() -> bool
         exist = net_attach_for(ATTACH_FAKE_PID) == Errno.Exist as i64
         let ninth: u32 = ATTACH_FAKE_PID + ATTACH_RETIRED
         again = net_attach_for(ninth) == Errno.Again as i64 and cap_table_get(ninth).active_count == 0 and waitset_inbox_len(service) == ATTACH_RETIRED
+        net_service_register(0)
+        gone = net_attach_for(ATTACH_FAKE_PID) == Errno.Exist as i64 and net_attach_for(ninth) == Errno.NoDev as i64
+        net_service_register(service as u32)
         i = 0
         while i < ATTACH_RETIRED
             shm_retire(objects[i as i32], (ATTACH_FAKE_PID + i) as u64, EVENT_PEER_CLOSE)
@@ -875,7 +882,7 @@ fn net_attach_self_test() -> bool
             cap_table_free_pid(ATTACH_FAKE_PID + f)
             f = f + 1
         let parks: u64 = drv_irq_wait_park_count()
-        if queued and exist and again and await_park(service, parks, DRV_TEST_PARK_US)
+        if queued and exist and again and gone and await_park(service, parks, DRV_TEST_PARK_US)
             dropped = waitset_inbox_len(service) == 0
             i = 0
             while i < ATTACH_RETIRED
@@ -886,7 +893,15 @@ fn net_attach_self_test() -> bool
             var a: u64 = 0
             while a < ATTACH_APPS
                 let app: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_APP, a)
-                if app <= 0 or process_wait(app as i32) != 0
+                var code: i64 = app
+                if app > 0
+                    code = process_wait(app as i32)
+                if code != 0
+                    klog("  app ")
+                    klog_dec(a as i64)
+                    klog(" exited ")
+                    klog_dec(code)
+                    klog(" (1: its attach failed, 2: its second attach was not Exist)\n")
                     apps_ok = false
                 a = a + 1
         else
@@ -911,6 +926,8 @@ fn net_attach_self_test() -> bool
         klog(", a second attach was not Exist")
     if not again
         klog(", a ninth record was not Again, or it made something")
+    if not gone
+        klog(", with no service a held exchange was not Exist or a new one not NoDev")
     if not dropped
         klog(", the retired records' handles outlived the wait")
     if not apps_ok
@@ -918,7 +935,7 @@ fn net_attach_self_test() -> bool
     if not freed
         klog(", an exchange outlived the test")
     klog("\n")
-    return attach_status_ok(status) and nodev and queued and exist and again and dropped and apps_ok and freed
+    return attach_status_ok(status) and nodev and queued and exist and again and gone and dropped and apps_ok and freed
 
 # The service stub's status: ten records, the eight retired ones refused.
 # Each real app's exit retires its exchange (#4729): the service maps it if

@@ -34,9 +34,10 @@
 # app and in the service, and {service_handle, EVENT_ATTACH} on the
 # service's inbox, which every wait of the service scans. Returns the app's
 # packed handle, or (each creating nothing):
-#   Errno.NoDev  no service is registered (every boot today)
 #   Errno.Exist  the caller still holds the handle of an exchange it
-#                attached: one live exchange per app process
+#                attached: one live exchange per app process, checked
+#                first, so it holds after the service has gone (#4848)
+#   Errno.NoDev  no service is registered (every boot today)
 #   Errno.Again  the service's inbox holds INBOX_CAP records not yet copied
 #                out; the app retries
 #   Errno.Inval  the caller is the service
@@ -337,8 +338,13 @@ fn attach_undo(app_pid: u32, app: CapHandle, object_id: u64)
 
 # NetAttach for app process `app_pid` (above). IF=1 on entry and on return;
 # the checks and the inbox post run under cli, so a wait of the service
-# cannot drain or fill the inbox between them.
+# cannot drain or fill the inbox between them. A process that still holds
+# its exchange is Exist before anything else is asked (RING1_DRIVER.md
+# "Grants"), whether or not the service is still there: the service can
+# take the record and exit between an app's two attaches (#4848).
 pub fn net_attach_for(app_pid: u32) -> i64
+    if exchange_held_by(app_pid)
+        return Errno.Exist as i64
     let service: u32 = net_service
     if service == 0 or cap_table_get(service) == 0 as *CapTable
         return Errno.NoDev as i64
@@ -346,8 +352,6 @@ pub fn net_attach_for(app_pid: u32) -> i64
         return Errno.Inval as i64
     if cap_table_get(app_pid) == 0 as *CapTable
         return Errno.Perm as i64
-    if exchange_held_by(app_pid)
-        return Errno.Exist as i64
     disable_interrupts()
     let result: i64 = attach_locked(app_pid, service)
     enable_interrupts()
