@@ -9,7 +9,9 @@
 #   Errno.Fault  the NetInfo is not the caller's writable memory
 #
 # NetPublish (226): net_publish(handle) samples a registered seqlocked
-# record (through the physmap) into its kernel snapshot. For the link
+# record (through the physmap) into its kernel snapshot. The armed
+# service's ready publish is then held until the frame-seat handoff ends
+# (#4744, below). For the link
 # object, the ring-1 driver's NetInfo (driver_abi.link link_sample), and it
 # ORs EVENT_LINK into the consumer's latch on the registered frame object;
 # for the address object, the ring-2 service's NetAddr (addr_sample). 0, or:
@@ -59,6 +61,7 @@ import mm.shm { shm_create, shm_destroy, shm_page, shm_map, shm_exists }
 import cap.types { CapHandle, CapEntry, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_PUBLISH, cap_handle_init }
 import cap.table { CapTable, cap_table_get, cap_table_lookup, cap_kernel_grant, cap_revoke, cap_holds_object }
 import proc.table { MAX_PROCS, proc_at, proc_current_pid }
+import proc.sched { sched_yield }
 import proc.waitset { INBOX_CAP, waitset_inbox_len, waitset_inbox_post, shm_latch_post }
 import driver_abi.wait { EVENT_ATTACH, EVENT_LINK, APP_EXCHANGE_SIZE }
 import driver_abi.link { NetInfo, LinkSample, LINK_SEQ_UNPUBLISHED, LINK_SEQ_FIRST_STABLE, link_sample }
@@ -99,6 +102,35 @@ pub fn net_addr_register(object_id: u64)
 pub fn net_frame_register(object_id: u64, consumer: u64)
     net_frame_object = object_id
     net_frame_consumer = consumer
+
+# ============================================================================
+# The frame-seat handoff gate (AGAST #4744, RING2_NET.md "Frame seat")
+# ============================================================================
+#
+# The ready NetPublish of the service net_handoff_arm names commits its
+# snapshot like any other (handoff_ready), then the call holds the service
+# in the kernel, yielding, until pid 1 has tried its DHCPRELEASE and moved
+# the seat (net_handoff_done): the kernel owns TX until then, and the
+# service's next instruction may be a TX publish. Only that service, and
+# only until the handoff ends either way; every other publish returns at
+# once.
+
+# The service whose ready publish the handoff waits on, or 0.
+var handoff_service: u32 = 0
+var handoff_ready: bool = false
+
+# Pid 1, before service `pid` first runs.
+pub fn net_handoff_arm(pid: u32)
+    handoff_ready = false
+    handoff_service = pid
+
+# The armed service's NetPublish has committed a snapshot.
+pub fn net_handoff_ready() -> bool
+    handoff_ready
+
+# The handoff is over (done, or given up): a held NetPublish returns.
+pub fn net_handoff_done()
+    handoff_service = 0
 
 # ============================================================================
 # The link snapshot: NetInfo (224) and NetPublish (226), #4730
@@ -179,7 +211,10 @@ pub fn net_publish_for(pid: u32, handle: u64) -> i64
         return Errno.Perm as i64
     let page: u64 = phys_to_virt(frame)
     if object_id == net_addr_object
-        return addr_publish_page(page)
+        let r: i64 = addr_publish_page(page)
+        if r == 0 and pid != 0 and pid == handoff_service
+            handoff_ready = true
+        return r
     link_publish_page(page)
 
 # NetPublish of the link page at kernel address `page`.
@@ -271,7 +306,12 @@ pub fn sys_net_addr_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
 # net_publish(handle) -> 0 or -errno
 pub fn sys_net_publish_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
-    net_publish_for(proc_current_pid() as u32, rdi)
+    let pid: u32 = proc_current_pid() as u32
+    let r: i64 = net_publish_for(pid, rdi)
+    # The armed service's ready publish: held until the seat is its own.
+    while r == 0 and pid == handoff_service and handoff_ready
+        sched_yield()
+    r
 
 # ============================================================================
 # The app exchange: NetAttach (228), #4728

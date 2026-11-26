@@ -253,12 +253,51 @@ pub fn eth_build_frame(buf: *u8, dst_mac: *u8, ethertype: u16, payload: *u8, pay
     return payload_len
 """
 
+# The ARP cache dhcp_release_frame reads (AGAST #4744): a hit for the server
+# only when the test says so, and the address it was asked for.
+NET_ARP_STUB = """\
+pub var g_arp_hit: bool = false
+pub var g_arp_asked: [4]u8
+
+pub fn arp_cache_lookup(ip: *u8, mac_out: *u8) -> i32
+    var i: i64 = 0
+    while i < 4
+        g_arp_asked[i] = *(ip + i)
+        i = i + 1
+    if not g_arp_hit
+        return -1
+    i = 0
+    while i < 6
+        *(mac_out + i) = 0xAA
+        i = i + 1
+    return 0
+"""
+
 # Drive DISCOVER -> OFFER -> REQUEST -> ACK. A reply carries the client's xid
 # (read back from the DISCOVER it sent) and options: message type, mask,
 # router, DNS, server id. Exit codes name the failed claim.
 DHCP_MAIN = """\
-import net.dhcp { dhcp_discover, dhcp_handle_packet, dhcp_get_state, dhcp_is_configured }
+import net.dhcp { dhcp_discover, dhcp_handle_packet, dhcp_get_state, dhcp_is_configured, dhcp_release_frame, Release }
 import net.ip { g_ip, g_gw, g_mask, g_dns, g_config_calls, g_dns_calls }
+import net.arp { g_arp_hit, g_arp_asked }
+
+var g_frame: [576]u8
+
+fn release_len() -> u32
+    match dhcp_release_frame(@g_frame)
+        Release.Frame(n) => n
+        Release.NoLease => 1
+        Release.NoServerMac => 2
+        Release.TooSmall => 3
+
+# DISCOVER, OFFER, ACK again: a fresh lease for the next release case.
+fn lease_again() -> bool
+    dhcp_discover()
+    var len: u32 = build_reply(2)
+    dhcp_handle_packet(@g_pkt[0], len)
+    len = build_reply(5)
+    dhcp_handle_packet(@g_pkt[0], len)
+    dhcp_is_configured()
 
 var g_sent: [600]u8
 var g_sends: i32 = 0
@@ -316,6 +355,9 @@ fn same4(p: *u8, a: u8, b: u8, c: u8, d: u8) -> bool
     return *p == a and *(p + 1) == b and *(p + 2) == c and *(p + 3) == d
 
 fn main() -> i32
+    # No lease yet: nothing to release
+    if release_len() != 1
+        return 11
     dhcp_discover()
     if g_sends != 1 or g_sent[242] != 1 or dhcp_get_state() != 1
         return 1
@@ -360,6 +402,34 @@ fn main() -> i32
         return 9
     if g_dns_calls != 1 or not same4(@g_dns[0], 10, 0, 2, 3)
         return 10
+
+    # DHCPRELEASE (AGAST #4744). The stub builders write no IPv4 or UDP
+    # header and eth_build_frame copies the datagram as is, so the message
+    # sits 28 bytes in. The server's MAC is not cached: no frame, no ARP
+    # request (the stub has none to call), and the lease is dropped anyway.
+    let sends: i32 = g_sends
+    if release_len() != 2 or not same4(@g_arp_asked[0], 10, 0, 2, 4)
+        return 12
+    if dhcp_is_configured() or g_sends != sends
+        return 13
+    # Cached: one RELEASE for the leased address to the server, and no send
+    # of its own (the caller sends it once).
+    if not lease_again()
+        return 14
+    g_arp_hit = true
+    let sends2: i32 = g_sends
+    if release_len() != 28 + 250 or g_sends != sends2 or dhcp_is_configured()
+        return 14
+    let m: *u8 = @g_frame[28]
+    if *m != 1 or not same4(m + 12, 10, 0, 2, 15) or *(m + 28) != 0x52
+        return 15
+    if not same4(m + 236, 0x63, 0x82, 0x53, 0x63) or *(m + 240) != 53 or *(m + 242) != 7
+        return 15
+    if *(m + 243) != 54 or not same4(m + 245, 10, 0, 2, 4) or *(m + 249) != 255
+        return 15
+    # Released: a second call has no lease
+    if release_len() != 1
+        return 11
     return 0
 """
 
@@ -374,6 +444,11 @@ DHCP_CLAIMS = {
     8: "ACK configured the wrong IP or router",
     9: "ACK configured the wrong netmask",
     10: "ACK set the wrong DNS",
+    11: "DHCPRELEASE built with no lease bound",
+    12: "DHCPRELEASE did not look the server up in the ARP cache, or built a frame without its MAC",
+    13: "an unsent DHCPRELEASE left the lease bound, or sent something",
+    14: "DHCPRELEASE was not built once for a cached server, or sent itself",
+    15: "DHCPRELEASE: wrong op, ciaddr, chaddr, cookie, message type or server id",
 }
 
 
@@ -386,6 +461,7 @@ def test_dhcp_discover_offer_request_ack(tmp_path):
         "net/ip.ritz": NET_IP_STUB,
         "net/udp.ritz": NET_UDP_STUB,
         "net/eth.ritz": NET_ETH_STUB,
+        "net/arp.ritz": NET_ARP_STUB,
         "net/dhcp.ritz": (KERNEL_SRC / "net" / "dhcp.ritz").read_text(),
         # dhcp.ritz imports ritzlib.endian (AGAST #1858), and endian imports
         # ritzlib.span for its Span<u8> parameters (#4644); a real build

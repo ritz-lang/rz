@@ -355,3 +355,57 @@ fn test_shared_length_change_after_copy_ignored() -> i32
         if g_buf[i] != 0
             return 9
     0
+
+# ---------------------------------------------------------------------------
+# 6. A new owner resumes the seat at the old one's indexes (AGAST #4744)
+# ---------------------------------------------------------------------------
+
+# The kernel seat consumed RX and produced TX for a while; netd takes both
+# halves over at the kernel's private indexes. A half made with new() at 0
+# instead sees the ring as overfull and closes it.
+[[test]]
+fn test_resumed_halves_continue_at_the_old_indexes() -> i32
+    let ring = spsc_rx_ring(fresh_region())
+    var drv = SpscProducer.new(ring)
+    var old = SpscConsumer.new(ring)
+    # 300 frames through the old consumer: both indexes are past the cap.
+    for i in 0..300
+        if not is_done(publish_byte(@&drv, i as u8))
+            return 1
+        if not is_frame(old.next(@&g_buf, 0, 1), 1)
+            return 2
+    # One more is published while the seat changes hands.
+    if not is_done(publish_byte(@&drv, 0xC1))
+        return 3
+    # At 0 the consumer would see 301 used: impossible, the ring closes.
+    var fresh = SpscConsumer.new(ring)
+    if not is_close(fresh.next(@&g_buf, 0, 1), SpscClose.Overfull)
+        return 4
+    var c = SpscConsumer.resume(ring, old.read)
+    if c.read != 300
+        return 5
+    if not is_frame(c.next(@&g_buf, 0, 1), 1) or g_buf[0] != 0xC1
+        return 6
+    if atomic_load(@ring.ctrl.read_idx) != 301 or not is_empty(c.poll(0, 1))
+        return 7
+
+    # TX: the old producer published 300 the peer consumed; the resumed
+    # producer's first frame is sequence 300, in slot 300 % 256.
+    let tx = spsc_tx_ring(fresh_region())
+    var p_old = SpscProducer.new(tx)
+    var peer = SpscConsumer.new(tx)
+    for i in 0..300
+        if not is_done(publish_byte(@&p_old, 0))
+            return 8
+        if not is_frame(peer.next(@&g_buf, 0, 1), 1)
+            return 9
+    var p = SpscProducer.resume(tx, p_old.write)
+    if p.write != 300 or p.staged
+        return 10
+    if not is_done(publish_byte(@&p, 0xD2))
+        return 11
+    if atomic_load(@tx.ctrl.write_idx) != 301
+        return 12
+    if not is_frame(peer.next(@&g_buf, 0, 1), 1) or g_buf[0] != 0xD2
+        return 13
+    0

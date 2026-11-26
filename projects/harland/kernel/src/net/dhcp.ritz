@@ -4,10 +4,11 @@
 # Supports DISCOVER/OFFER/REQUEST/ACK flow.
 
 import klog { klog, klog_dec }
-import net.types { DHCP_SERVER_PORT, DHCP_CLIENT_PORT, DHCP_OP_REQUEST, DHCP_DISCOVER, DHCP_OFFER, DHCP_REQUEST, DHCP_ACK, DHCP_MAGIC, DHCP_HEADER_SIZE, IP_PROTO_UDP, ETHERTYPE_IPV4 }
+import net.types { DHCP_SERVER_PORT, DHCP_CLIENT_PORT, DHCP_OP_REQUEST, DHCP_DISCOVER, DHCP_OFFER, DHCP_REQUEST, DHCP_ACK, DHCP_RELEASE, DHCP_MAGIC, DHCP_HEADER_SIZE, IP_PROTO_UDP, ETHERTYPE_IPV4, ETH_HEADER_SIZE, IP_HEADER_SIZE, UDP_HEADER_SIZE }
 import net.ip { ip_build_header, ip_set_config, ip_set_dns }
 import net.udp { udp_build_header }
 import net.eth { eth_build_frame, eth_get_broadcast_mac }
+import net.arp { arp_cache_lookup }
 import ritzlib.span { span_from_ptr }
 import ritzlib.endian
 
@@ -343,6 +344,80 @@ pub fn dhcp_handle_packet(dhcp_data: *u8, dhcp_len: u32)
         dhcp_on_offer(dhcp_data + 16)
     else if msg_type == DHCP_ACK and dhcp_state == 2
         dhcp_on_ack()
+
+# ============================================================================
+# DHCP Release (AGAST #4744, harland docs/RING2_NET.md "Frame seat")
+# ============================================================================
+
+# What dhcp_release_frame built.
+pub enum Release
+    Frame(u32)              # a DHCPRELEASE of this many bytes is in the buffer
+    NoLease                 # no lease is bound: nothing to release
+    NoServerMac             # the server's MAC is not in the ARP cache
+    TooSmall                # the buffer cannot hold the frame
+
+# The DHCPRELEASE message's length: the fixed header, the cookie, option 53
+# (3 bytes), option 54 (6 bytes) and the end option.
+const RELEASE_LEN: i64 = 240 + 3 + 6 + 1
+# The UDP datagram behind the IPv4 header (no options), and the frame.
+const RELEASE_UDP_LEN: i64 = UDP_HEADER_SIZE as i64 + RELEASE_LEN
+const RELEASE_IP_LEN: i64 = IP_HEADER_SIZE as i64 + RELEASE_UDP_LEN
+const RELEASE_FRAME_LEN: i64 = ETH_HEADER_SIZE as i64 + RELEASE_IP_LEN
+
+# Build the DHCPRELEASE for the bound lease into `frame` (RFC 2131 4.4.6:
+# ciaddr is the leased address, unicast to the server, option 54 names it).
+# Best effort, for the frame-seat handoff: the server's MAC comes from the
+# ARP cache or not at all, with no ARP request and no wait for one, and
+# the caller sends it once. The client state goes back to idle whatever
+# this returns; the IP layer's configuration is the caller's to clear.
+pub fn dhcp_release_frame(frame: [u8]) -> Release
+    if dhcp_state != 3
+        return Release.NoLease
+    dhcp_state = 0
+    var server_mac: [6]u8
+    if arp_cache_lookup(@dhcp_offered_server[0], @server_mac[0]) < 0
+        return Release.NoServerMac
+    if frame.len < RELEASE_FRAME_LEN
+        return Release.TooSmall
+
+    var msg: [250]u8                 # RELEASE_LEN
+    let m: [u8] = @msg
+    for i in 0..m.len
+        m[i] = 0
+    m[0] = DHCP_OP_REQUEST
+    m[1] = 1                         # htype: Ethernet
+    m[2] = 6                         # hlen
+    dhcp_xid = dhcp_xid + 1
+    endian_write_u32_be(m, 4, dhcp_xid)
+    for i in 0..4
+        m[12 + i] = dhcp_offered_ip[i]           # ciaddr
+    net_get_mac(@m[28])                          # chaddr
+    endian_write_u32_be(m, 236, DHCP_MAGIC)
+    m[240] = 53
+    m[241] = 1
+    m[242] = DHCP_RELEASE
+    m[243] = 54
+    m[244] = 4
+    for i in 0..4
+        m[245 + i] = dhcp_offered_server[i]
+    m[249] = 255
+
+    # UDP 68 -> 67 behind an IPv4 header from the leased address, in one
+    # buffer: the fixed-size headers in front of the message.
+    var ip: [278]u8                  # RELEASE_IP_LEN
+    let datagram: [u8] = @ip
+    let udp_at: i64 = IP_HEADER_SIZE as i64
+    let msg_at: i64 = udp_at + UDP_HEADER_SIZE as i64
+    udp_build_header(@datagram[udp_at], DHCP_CLIENT_PORT, DHCP_SERVER_PORT, RELEASE_LEN as u32)
+    for i in 0..RELEASE_LEN
+        datagram[msg_at + i] = m[i]
+    ip_build_header(@datagram[0], @dhcp_offered_server[0], IP_PROTO_UDP, RELEASE_UDP_LEN as u32)
+    let len: u32 = eth_build_frame(@frame[0], @server_mac[0], ETHERTYPE_IPV4, @datagram[0], RELEASE_IP_LEN as u32)
+    Release.Frame(len)
+
+# The leased address, for the release's log line.
+pub fn dhcp_print_lease()
+    dhcp_print_ip(@dhcp_offered_ip[0])
 
 # ============================================================================
 # State Query

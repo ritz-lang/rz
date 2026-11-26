@@ -32,8 +32,13 @@
 # object is reclaimed once the driver's mapping is gone too.
 #
 # net/stack.ritz dispatches net_get_mac, net_send, net_poll and
-# net_wait_rx here when net_via_ring is set. Only the frame-ring boot test
-# sets it (RING1_DRIVER.md section 9's cutover is a later change).
+# net_wait_rx here when net_via_ring is set: on the cutover boot (#4735)
+# and in the frame-ring boot test.
+#
+# The seat ends at the frame-seat handoff (#4744, net/ring1.ritz
+# net_seat_handoff): ring_send_once sends the DHCPRELEASE, then
+# ring_seat_handoff closes the seat and registers /bin/netd as the
+# consumer; netd resumes the rings at the indexes it returns.
 #
 # Every ring access runs as pid 1, whose page table holds the seat's
 # mapping: the seat functions refuse any other caller.
@@ -268,6 +273,7 @@ pub enum Send
     Sent                    # the private write_idx was stored
     NoDriver                # no registered driver, or the endpoint closed
     BadLength               # empty, or longer than FRAME_MAX: nothing written
+    Full                    # ring_send_once only: no free TX slot, nothing written
 
 # Publish `frame` on the TX ring. While the ring is full and the driver is
 # registered, DATA goes on the driver's latch (the wake: a proc_wake of a
@@ -300,6 +306,54 @@ pub fn ring_send(frame: [u8]) -> Send
     if was
         enable_interrupts()
     result
+
+# One TX publish with no second try (the frame-seat handoff's DHCPRELEASE,
+# RING2_NET.md "Frame seat"): a full ring is Full, with nothing written and
+# no yield to let the driver drain. Returns with the caller's IF.
+pub fn ring_send_once(frame: [u8]) -> Send
+    if proc_current_pid() != SEAT_PID
+        return Send.NoDriver
+    let was: bool = interrupts_enabled()
+    disable_interrupts()
+    var result: Send = Send.NoDriver
+    if seat_live()
+        result = match seat_tx.publish(frame)
+            Publish.Done =>
+                shm_latch_post_peers(seat_object, SEAT_PID, EVENT_DATA)
+                Send.Sent
+            Publish.Full => Send.Full
+            Publish.BadLength => Send.BadLength
+            Publish.Close(why) =>
+                endpoint_fail(why)
+                Send.NoDriver
+    if was
+        enable_interrupts()
+    result
+
+# ============================================================================
+# The frame-seat handoff (AGAST #4744, RING2_NET.md "Frame seat")
+# ============================================================================
+
+# The seat's private indexes when it was handed over: the new consumer's
+# read_idx and producer's write_idx start here.
+pub struct SeatIndexes
+    rx_read: u64
+    tx_write: u64
+
+# Hand the open seat to the ring-2 service `service_pid`, which already
+# holds a read-write handle for the frame object (so its latch gets the
+# driver's DATA): pid 1 drops its handle, which unmaps it and posts nothing
+# to the driver, and the service is registered as the frame object's
+# consumer, the latch NetPublish posts LINK to. The kernel is no longer a
+# consumer or producer. None when no seat is open or its driver is gone.
+pub fn ring_seat_handoff(service_pid: u64) -> Option<SeatIndexes>
+    if proc_current_pid() != SEAT_PID or not seat_live()
+        return None
+    let object_id: u64 = seat_object
+    let at = SeatIndexes { rx_read: seat_rx.read, tx_write: seat_tx.write }
+    seat_close()
+    net_frame_register(object_id, service_pid)
+    Some(at)
 
 # ============================================================================
 # State the boot test reads

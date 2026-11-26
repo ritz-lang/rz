@@ -1284,3 +1284,68 @@ fn test_owed_ping_reply_is_the_only_terminal_event() -> i32
     if replies != 1 or errors != 0
         return 2
     0
+
+# ---------------------------------------------------------------------------
+# The frame-seat handoff (AGAST #4744, RING2_NET.md "Frame seat")
+# ---------------------------------------------------------------------------
+
+# The kernel seat ran the self-test on this region first: RX consumed to
+# 300 and TX produced to 300, then one frame each way while netd waited in
+# its ready NetPublish (the kernel's DHCPRELEASE, an RX frame). take_seat
+# moves netd's halves to the kernel's private indexes; at 0 the next pass
+# would find 301 frames in a 256-slot ring and close it.
+[[test]]
+fn test_take_seat_resumes_at_the_kernels_indexes() -> i32
+    let svc = fresh()
+    let region: u64 = @g_region as u64
+    var k_rx = SpscConsumer.new(spsc_rx_ring(region))
+    var k_tx = SpscProducer.new(spsc_tx_ring(region))
+    let filler: [1]u8 = [0]
+    for i in 0..300
+        drv_publish(@filler)
+        match k_rx.next(@&g_got, 0, 1)
+            Take.Frame(_) => pass
+            _ => return 1
+        match k_tx.publish(@filler)
+            Publish.Done => pass
+            _ => return 2
+        if drv_take() != 1
+            return 3
+    svc.ready(link_info(1))
+    match k_tx.publish(@filler)
+        Publish.Done => pass
+        _ => return 4
+    drv_take()
+    drv_publish(@filler)
+    svc.take_seat(k_rx.read, k_tx.write)
+    # The RX frame at 300 is netd's (a one-byte frame: a reject, counted).
+    if svc.service(0).is_err()
+        return 5
+    if svc.counters.rx_frames + svc.counters.rx_rejects != 1
+        return 6
+    # DHCP's discover is TX sequence 301, and the driver takes it.
+    svc.set_link(link_info(1), 0)
+    if svc.take_published() != 1
+        return 7
+    if drv_take() == 0 or not got_is_dhcp(1)
+        return 8
+    0
+
+# netd logs "configured <address>" from this once a lease is bound.
+[[test]]
+fn test_address_is_the_bound_lease_only() -> i32
+    let svc = started(0)
+    match svc.address()
+        Some(_) => return 1
+        None => pass
+    let b = bound(0)
+    match b.address()
+        Some(a) =>
+            if a != OUR_IP
+                return 2
+        None => return 3
+    b.set_link(link_info(0), 50)
+    match b.address()
+        Some(_) => return 4
+        None => pass
+    0

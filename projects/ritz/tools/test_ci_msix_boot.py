@@ -183,6 +183,13 @@ NIC_DMA = r"[virtio-net] device DMA: 602 bytes received into granted IOVA 687195
 NIC_DMA_OK = NIC_DOMAIN + NIC_FAULT_RECORD + NIC_FAULT + NIC_ALLOWED + DMA_RUN_RING + DMA_RUN_POOL + NIC_DMA
 RING1_PARKED = r"[net-ring1] /bin/virtio-net pid 2 parked: generation 2 published\n"
 DRIVER_UP = r"[virtio-net] up: MAC published, 32 RX buffers posted\n"
+# The frame-seat handoff (AGAST #4744): after the self-test window the
+# kernel spawns /bin/netd, tries one DHCPRELEASE, and hands it the seat;
+# netd then runs DHCP itself and logs its own lease.
+SEAT_RELEASE = r"[net] DHCPRELEASE sent for 10.0.2.15\n"
+SEAT_NETD = r"[net] seat -> netd pid 3\n"
+NETD_CONFIGURED = r"[netd] configured 10.0.2.15\n"
+SEAT_OK = SEAT_RELEASE + SEAT_NETD + NETD_CONFIGURED
 
 
 def driver_parks(p: int) -> str:
@@ -198,7 +205,7 @@ KERNEL_NIC_UP = r"[virtio-net] Initialization complete!\n"
 # place of the in-kernel RX waits.
 VTD_OK = (NVME_TABLE.replace(PCI_PORT_IO, "") + IR_ON + TE_ON + NET_MODERN + NIC_DMA_OK + NIC_ON
           + RING1_PARKED + NET_PLATFORM + RX_CAPPED + DRIVER_UP + DHCP_OK + TX_BURST_OK + interrupts(8)
-          + driver_parks(41) + NVME_OK + BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + SUITE_PASSED)
+          + driver_parks(41) + NVME_OK + BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + SEAT_OK + SUITE_PASSED)
 
 
 # --------------------------------------------------------------------------
@@ -738,6 +745,49 @@ def test_ring1_checks_are_the_translating_boots_alone(tree):
     assert r.returncode == 0, r.stdout + r.stderr
     pc = r.stdout.split("===== msix boot (vtd) =====")[0]
     assert "PASS: the ring-1 driver" not in pc and "ring-1 driver park" not in pc
+
+
+@pytest.mark.integration
+def test_seat_handoff_passes_on_the_translating_boot(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    vtd = r.stdout.split("===== msix boot (vtd) =====")[1]
+    assert "PASS: the kernel handed the frame seat to /bin/netd (pid 3)" in vtd
+    assert "PASS: netd configured 10.0.2.15 itself, after the handoff" in vtd
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "vtd, want",
+    [
+        (VTD_OK.replace(SEAT_NETD, ""), "the kernel did not hand the frame seat to /bin/netd"),
+        (VTD_OK.replace(NETD_CONFIGURED, ""), "netd logged no lease of its own"),
+        # netd's lease must come after the seat moved: before it, the kernel
+        # still owned TX
+        (VTD_OK.replace(SEAT_OK, NETD_CONFIGURED + SEAT_RELEASE + SEAT_NETD), "netd logged no lease of its own"),
+    ],
+    ids=["no-handoff", "no-netd-lease", "lease-before-handoff"],
+)
+def test_seat_handoff_check_fails(tree, vtd, want):
+    r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": vtd})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout
+
+
+@pytest.mark.integration
+def test_the_release_is_best_effort(tree):
+    """DHCPRELEASE is one try (RING2_NET.md "Frame seat"): a release that
+    could not be sent still hands the seat over and passes."""
+    vtd = VTD_OK.replace(SEAT_RELEASE, r"[net] DHCPRELEASE not sent: the TX ring is full\n")
+    r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": vtd})
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+@pytest.mark.integration
+def test_an_untranslated_boot_spawns_no_netd(tree):
+    r = _run(tree, PASSED + SEAT_NETD)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: the pc machine handed the frame seat to netd: an untranslated boot spawns none" in r.stdout
 
 
 @pytest.mark.unit

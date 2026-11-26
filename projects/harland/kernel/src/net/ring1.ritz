@@ -31,28 +31,56 @@
 # with \harland\net-selftest: net_stack_init finds the published snapshot
 # and the stack's I/O is the frame ring.
 #
+# Step 6 is the frame-seat handoff (AGAST #4744, ring plan T38,
+# docs/RING2_NET.md "Frame seat"), net_seat_handoff, after the self-test
+# window (or in its place) and before run_init:
+#
+#   a. /bin/netd is spawned at CPL 3 (D8 = b, #4767: this spawn path, its
+#      own address space) with two handles and no others: the frame object
+#      (read-write) and a fresh address page (read-write, publish), mapped
+#      into it at DRV_RING_BASE with the ServiceBoot record written there.
+#      The page is registered as the address object and netd as the
+#      service, and the NetPublish gate is armed for it.
+#   b. Pid 1 yields until netd's ready NetPublish has committed; that call
+#      then holds netd in the kernel.
+#   c. Still the seat, pid 1 tries one DHCPRELEASE for the self-test's
+#      lease: the server's MAC from the ARP cache or not at all, one TX
+#      publish with no second try. Unsent, the lease is left to expire.
+#   d. Whether or not it went out: the kernel's stack stops (net_poll,
+#      ip_set_config, ip_set_dns), the seat closes, and netd is the frame
+#      object's only consumer and producer. The kernel's indexes go into
+#      the record and the held NetPublish returns; netd resumes the rings
+#      there and runs DHCP from idle. The kernel copies no lease into the
+#      page: netd is its one writer.
+#
 # A refused NIC, a missing ELF or a driver that exits before it parks
-# leaves the boot with no NIC owner: logged, and the boot goes on.
+# leaves the boot with no NIC owner: logged, and the boot goes on. A netd
+# that is not spawned or does not publish ready leaves the seat with the
+# kernel, logged.
 
 import klog { klog, klog_dec }
 import serial { StrView }
 import ritzlib.option
 import ritzlib.result { Result }
-import mm.shm { shm_create, shm_page }
+import mm.shm { shm_create, shm_destroy, shm_map, shm_page }
 import mm.vmm { phys_to_virt }
 import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_PUBLISH }
-import cap.table { cap_kernel_grant }
+import cap.table { CapTable, cap_kernel_grant, cap_table_get }
 import proc.table { Proc, MAX_PROCS, PROC_BLOCKED, BLOCK_WAIT, proc_at, proc_current, proc_current_slot }
 import proc.sched { sched_is_running, sched_start, sched_yield }
 import proc.waitset { irq_object_register, irq_object_bind_domain }
-import net.ring { SeatOpen, ring_seat_open, ring_seat_object }
-import syscall.runtime.net { net_link_register, ring_driver_published }
+import net.ring { SeatOpen, Send, SeatIndexes, ring_seat_open, ring_seat_object, ring_send_once, ring_seat_handoff }
+import net.dhcp { Release, dhcp_release_frame, dhcp_print_lease }
+import net.stack { net_stack_release }
+import arch.x86_64.tsc { tsc_hz, deadline_after_us, deadline_passed }
+import syscall.runtime.net { net_link_register, ring_driver_published, net_addr_register, net_service_register, net_handoff_arm, net_handoff_ready, net_handoff_done, pml4_of }
 import syscall.runtime.driver { drv_device_bind }
 import syscall.runtime.process { process_create_init, process_spawn_program, process_mark_exit }
 import drivers.virtio.net { NicGrant, virtio_net_ring1_probe }
 import drivers.virtio.window { VioWindow, vio_window_find }
 import syscall.stack { kstack_top }
 import driver_abi.boot { DriverBoot, DriverWindow, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, driver_boot_at }
+import driver_abi.boot { ServiceBoot, DRV_RING_BASE, SERVICE_BOOT_MAGIC, service_boot_at }
 
 # The driver's MSI-X table indexes: config changes, the RX and TX queues
 # (virtio_net_ring1_probe aims all three at the grant's vector).
@@ -227,3 +255,132 @@ pub fn net_ring1_spawn()
         klog("[net-ring1] /bin/virtio-net pid ")
         klog_dec(pid as i64)
         klog(" did not park with its link published: the NIC has no owner on this boot\n")
+
+# ============================================================================
+# Step 6: the frame-seat handoff to /bin/netd (AGAST #4744)
+# ============================================================================
+
+# How long pid 1 waits for netd's ready NetPublish. netd makes a handful of
+# syscalls before it, with no network wait (the link is already published).
+const NETD_READY_US: u64 = 2000000
+
+fn seat_kept(why: StrView)
+    klog("[net] seat stays with the kernel: ")
+    klog(why)
+    klog("\n")
+
+# Step a's grants to netd `pid`, a child that has not run: the frame
+# object's handle, then the address page, mapped as its first shared
+# mapping (DRV_RING_BASE) with the ServiceBoot record in it. The address
+# object's id, or None with nothing left registered.
+fn netd_grant_to(pid: u64, frame_obj: u64) -> Option<u64>
+    let rw: u32 = CAP_RIGHT_READ | CAP_RIGHT_WRITE
+    let frame: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rw, frame_obj)
+    if not granted(frame)
+        return None
+    let addr_obj: u64 = match shm_create(1)
+        Some(id) => id
+        None => return None
+    let addr: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rw | CAP_RIGHT_PUBLISH, addr_obj)
+    if not granted(addr) or shm_map(pid as u32, pml4_of(pid as u32), addr_obj, true) != DRV_RING_BASE as i64
+        # netd's exit (the caller marks it) drops its handles and mapping;
+        # the page goes once nothing holds it.
+        if not granted(addr)
+            shm_destroy(addr_obj)
+        return None
+    var boot: ServiceBoot
+    boot.magic = SERVICE_BOOT_MAGIC
+    boot._pad = 0
+    boot.frame = packed(frame)
+    boot.addr = packed(addr)
+    boot.tsc_hz = tsc_hz()
+    boot.seat_rx_read = 0
+    boot.seat_tx_write = 0
+    *service_boot_at(phys_to_virt(shm_page(addr_obj, 0))) = boot
+    Some(addr_obj)
+
+# netd `pid` still has its capability table: it has not exited.
+fn netd_alive(pid: u64) -> bool
+    cap_table_get(pid as u32) != 0 as *CapTable
+
+# Step c: one DHCPRELEASE for the kernel's lease, if it has one. Logs
+# "[net] DHCPRELEASE sent for A" or "... not sent: why"; nothing when
+# there was no lease (no self-test window ran DHCP).
+fn seat_release()
+    var frame: [576]u8
+    let len: u32 = match dhcp_release_frame(@frame)
+        Release.Frame(n) => n
+        Release.NoLease => return
+        Release.NoServerMac =>
+            klog("[net] DHCPRELEASE not sent: the server's MAC is not in the ARP cache\n")
+            return
+        Release.TooSmall =>
+            klog("[net] DHCPRELEASE not sent: no room for the frame\n")
+            return
+    let f: [u8] = @frame
+    match ring_send_once(f[0..len as i64])
+        Send.Sent =>
+            klog("[net] DHCPRELEASE sent for ")
+            dhcp_print_lease()
+            klog("\n")
+        Send.Full => klog("[net] DHCPRELEASE not sent: the TX ring is full\n")
+        Send.NoDriver => klog("[net] DHCPRELEASE not sent: the driver is gone\n")
+        Send.BadLength => klog("[net] DHCPRELEASE not sent: a bad frame length\n")
+
+# Step 6, as pid 1 after the diagnostics: a no-op unless this boot's NIC
+# went to the ring-1 driver and its link is published (D7: an untranslated
+# boot spawns no netd). Logs "[net] seat -> netd pid P" once netd owns the
+# seat.
+pub fn net_seat_handoff()
+    if ring1_pid == 0 or not ring_driver_published()
+        return
+    let frame_obj: u64 = match ring_seat_object()
+        Some(id) => id
+        None =>
+            seat_kept("no frame seat is open")
+            return
+    let pid: u64 = match process_spawn_program("/bin/netd")
+        Result.Ok(p) => p
+        Result.Err(e) =>
+            klog("[net] /bin/netd was not spawned (errno ")
+            klog_dec(e as i64)
+            klog("): the seat stays with the kernel\n")
+            return
+    let addr_obj: u64 = match netd_grant_to(pid, frame_obj)
+        Some(id) => id
+        None =>
+            process_mark_exit(pid)
+            sched_yield()
+            seat_kept("netd's handles or address page were not made")
+            return
+    net_addr_register(addr_obj)
+    net_service_register(pid as u32)
+    net_handoff_arm(pid as u32)
+    # Step b: netd runs to its ready NetPublish, which holds it there.
+    let deadline: u64 = deadline_after_us(NETD_READY_US)
+    while not net_handoff_ready() and netd_alive(pid) and not deadline_passed(deadline)
+        sched_yield()
+    if not net_handoff_ready()
+        net_handoff_done()
+        if netd_alive(pid)
+            process_mark_exit(pid)
+            sched_yield()
+        seat_kept("netd did not publish ready")
+        return
+    # Steps c and d: the release, then the switch, whatever the release did.
+    seat_release()
+    net_stack_release()
+    let at: SeatIndexes = match ring_seat_handoff(pid)
+        Some(i) => i
+        None =>
+            # The driver went meanwhile: netd's wait returns DRIVER_GONE.
+            net_handoff_done()
+            seat_kept("the driver is gone")
+            return
+    let boot: *ServiceBoot = service_boot_at(phys_to_virt(shm_page(addr_obj, 0)))
+    boot.seat_rx_read = at.rx_read
+    boot.seat_tx_write = at.tx_write
+    klog("[net] seat -> netd pid ")
+    klog_dec(pid as i64)
+    klog("\n")
+    net_handoff_done()

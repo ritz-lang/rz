@@ -2,7 +2,8 @@
 # docs/RING2_NET.md "Service wait", "Frame seat", "Address publication")
 #
 # A CPL-3 process the kernel spawns on a translating boot, after the ring-1
-# driver (the frame-seat handoff, AGAST #4744: nothing spawns it yet). It
+# driver and the in-kernel self-test window (the frame-seat handoff,
+# AGAST #4744, kernel/src/net/ring1.ritz net_seat_handoff). It
 # holds two CAP_TYPE_SHM handles, the frame object and its address page,
 # and no MMIO, IRQ or port I/O:
 #
@@ -13,7 +14,10 @@
 #   3. Take the link snapshot (NetInfo, 224) the driver published, waiting
 #      for LINK if it has not yet.
 #   4. Ready: publish the cleared record (generation 2, configured 0) and
-#      NetPublish it, then start DHCP if the link is up.
+#      NetPublish it. The kernel hands the frame seat over before that call
+#      returns (AGAST #4744); netd resumes the rings at the kernel's
+#      indexes from the boot record, then starts DHCP if the link is up,
+#      and logs "[netd] configured <address>" for each lease it publishes.
 #   5. Loop: one service pass (src/netsvc.ritz), DATA to the driver when
 #      TX slots were published, DATA/SPACE to each app exchange that got
 #      events or had requests consumed, CapRevoke of each exchange the pass
@@ -225,8 +229,30 @@ fn bring_up() -> Result<(), InitError>
     match net_publish(g_boot.addr)
         Ok(_) => pass
         Err(e) => return Err(InitError.Publish(e))
+    # The kernel held the seat until this NetPublish returned (its
+    # DHCPRELEASE went out meanwhile): resume the rings at its indexes,
+    # which it wrote into the record before letting the call return.
+    let seat: *ServiceBoot = service_boot_at(DRV_RING_BASE)
+    g_svc.take_seat(seat.seat_rx_read, seat.seat_tx_write)
     g_svc.set_link(link, now_ms())
     Ok(())
+
+# "[netd] configured a.b.c.d" when the bound address changes, once each.
+# 0 for none: 0.0.0.0 is never a lease's address.
+var g_logged: u32 = 0
+
+fn log_address()
+    let now: u32 = g_svc.address().unwrap_or(0)
+    if now == g_logged
+        return
+    g_logged = now
+    if now == 0
+        return
+    let b0 = (now >> 24) & 0xFF
+    let b1 = (now >> 16) & 0xFF
+    let b2 = (now >> 8) & 0xFF
+    let b3 = now & 0xFF
+    print("[netd] configured {b0}.{b1}.{b2}.{b3}\n")
 
 pub fn main(args: Span<StrView>) -> i32
     match bring_up()
@@ -255,7 +281,7 @@ pub fn main(args: Span<StrView>) -> i32
                 None => break
         if g_svc.take_publish_due()
             match net_publish(g_boot.addr)
-                Ok(_) => pass
+                Ok(_) => log_address()
                 Err(_) => g_svc.publish_failed()
         match wait_once(g_svc.wait_mask(), g_svc.deadline(now))
             Ok(w) =>

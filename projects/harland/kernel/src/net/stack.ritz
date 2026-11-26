@@ -11,6 +11,7 @@
 # RING1_DRIVER.md section 8, #4731). net_stack_init sets it when no
 # NetDevice was found and the ring-1 driver has published its link
 # (the cutover, #4735); the frame-ring boot test sets it by hand.
+# net_stack_release ends it at the frame-seat handoff (#4744).
 
 import klog { klog }
 import net.types { ETHERTYPE_ARP, ETHERTYPE_IPV4, IP_PROTO_ICMP, IP_PROTO_UDP, IP_PROTO_TCP, IP_HEADER_SIZE, ETH_HEADER_SIZE, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, UDP_HEADER_SIZE }
@@ -19,7 +20,7 @@ import net.arp { arp_init, arp_handle_packet }
 import net.ip { ip_init, ip_is_configured, ip_print_config, ip_get_header_len, ip_get_protocol }
 import net.icmp { icmp_handle_packet }
 import net.udp { udp_get_src_port, udp_get_dst_port }
-import net.dhcp { dhcp_discover, dhcp_handle_packet, dhcp_is_configured }
+import net.dhcp { dhcp_discover, dhcp_handle_packet, dhcp_is_configured, dhcp_reset }
 import net.ring { RxWait, Send, take_rx, ring_poll, ring_send }
 import driver_abi.spsc { FrameBytes }
 import syscall.runtime.net { net_info_snapshot, ring_driver_published }
@@ -82,6 +83,18 @@ pub fn net_stack_init() -> i32
 
     klog("[net] No network devices found!\n")
     return -1
+
+# The frame-seat handoff (AGAST #4744): the kernel's stack stops for good.
+# net_poll and net_wait_rx find it uninitialized, and the IP layer, its
+# ARP cache and DHCP forget the self-test's lease (ip_set_config and
+# ip_set_dns are cleared, not copied anywhere): /bin/netd is the stack now.
+pub fn net_stack_release()
+    net_initialized = false
+    net_via_ring = false
+    net_device = 0 as *NetDevice
+    ip_init()
+    arp_init()
+    dhcp_reset()
 
 # The stack's I/O is the frame-ring seat (net_stack_init's ring branch).
 pub fn net_on_ring() -> bool
@@ -267,6 +280,7 @@ pub fn net_send(data: *u8, len: u32) -> i32
             Send.Sent => 0
             Send.NoDriver => Errno.NoDev as i32
             Send.BadLength => Errno.Inval as i32
+            Send.Full => Errno.Again as i32
     if net_device == 0 as *NetDevice
         return -1
     netdev_send(net_device, data, len)

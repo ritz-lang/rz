@@ -108,6 +108,10 @@
 #     private domain ("[nic-dma] DrvDmaAlloc: pid P, N page(s) at IOVA
 #     0xI in domain D", and the driver's "[virtio-net] device DMA: B bytes
 #     received into granted IOVA I" inside one of them).
+# Then the frame-seat handoff (AGAST #4744): after the self-test window
+# the kernel spawns /bin/netd, tries one DHCPRELEASE and hands it the
+# seat ("[net] seat -> netd pid P"); netd runs DHCP itself and logs
+# "[netd] configured A" after that line. The pc run spawns no netd.
 # The pc run keeps the in-kernel driver and every check it had.
 #
 # The NIC uses QEMU's user-mode network (slirp): its built-in DHCP server
@@ -363,6 +367,33 @@ ring1_checks() {
     fi
 }
 
+# seat_checks SERIAL: the frame-seat handoff on the translating boot (AGAST
+# #4744, docs/RING2_NET.md "Frame seat"): after the self-test window the
+# kernel spawned /bin/netd and handed it the seat ("[net] seat -> netd pid
+# P"), and netd then ran DHCP itself and logged its own lease ("[netd]
+# configured A") after that line. The kernel's DHCPRELEASE is best effort
+# and not checked. Sets rc=1 on any failure.
+seat_checks() {
+    local SERIAL="$1" seat_line seat_pid addr
+    seat_line=$(grep -anE "\[net\] seat -> netd pid [0-9]+" "$SERIAL" | head -1)
+    if [ -z "$seat_line" ]; then
+        grep -a "\[net\] seat\|\[net\] /bin/netd\|\[netd\]" "$SERIAL" | head -3
+        echo "FAIL: the kernel did not hand the frame seat to /bin/netd ([net] seat -> netd pid P)"
+        rc=1
+        return
+    fi
+    seat_pid=$(echo "$seat_line" | sed -nE 's/.*netd pid ([0-9]+).*/\1/p')
+    echo "PASS: the kernel handed the frame seat to /bin/netd (pid $seat_pid)"
+    addr=$(tail -n +"${seat_line%%:*}" "$SERIAL" | grep -aoE "\[netd\] configured [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" | head -1 | sed -nE 's/.*configured //p')
+    if [ -n "$addr" ]; then
+        echo "PASS: netd configured $addr itself, after the handoff"
+    else
+        grep -a "\[netd\]" "$SERIAL" | head -3
+        echo "FAIL: netd logged no lease of its own after the handoff ([netd] configured A)"
+        rc=1
+    fi
+}
+
 # check NAME SERIAL: the verdicts for one boot; sets rc=1 on any failure.
 check() {
     local name="$1" SERIAL="$2"
@@ -549,6 +580,11 @@ check() {
             echo "FAIL: no \"[pci] no MCFG: segment 0 only, port I/O\" on the pc machine"
             rc=1
         fi
+        # The in-kernel owner keeps its stack: no netd (D7, AGAST #4744)
+        if grep -aqE "\[net\] seat -> netd" "$SERIAL"; then
+            echo "FAIL: the pc machine handed the frame seat to netd: an untranslated boot spawns none"
+            rc=1
+        fi
         # No IOMMU on pc: nothing may claim DMA is translated
         if grep -aqF "[vtd] translation on" "$SERIAL"; then
             echo "FAIL: \"[vtd] translation on\" on the pc machine, which has no IOMMU"
@@ -591,6 +627,7 @@ check() {
         fi
         nic_dma_checks "$SERIAL"
         ring1_checks "$SERIAL"
+        seat_checks "$SERIAL"
     fi
     if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
         echo "PASS: init Tier-1 suite: ALL TESTS PASSED"
