@@ -25,6 +25,7 @@ import rawio { out_str, err_str, in_read }
 import ritzlib.result
 import ritzlib.gvec
 import ritzlib.option
+import ritzlib.path { path_absolute }
 import ritzlib.span { Span }
 import ritzlib.string
 import ritzlib.strview { StrView }
@@ -81,27 +82,13 @@ fn os_readdir(path: StrView, names: @&String) -> bool
     return true
 
 # Harland implementation uses sys_readdir, which fills a buffer with names
-# in the same "a\0b\0" form.
+# in the same "a\0b\0" form. Harland's kernel takes absolute paths only
+# (AGAST #4776), so `ls etc` and `ls ..` resolve against the cwd first.
 [[target_os = "harland"]]
 fn os_readdir(path: StrView, names: @&String) -> bool
-    if path.is_empty()
-        return false
-    var absolute: String = string_new()
-    if path.starts_with("/")
-        if not absolute.push_str(path)
-            return false
-    else
-        var cwd_buffer: [4096]u8
-        match os_getcwd(@cwd_buffer)
-            Some(cwd) =>
-                if not absolute.push_str(cwd)
-                    return false
-                if not path.eq(".")
-                    if not cwd.ends_with("/") and not absolute.push('/')
-                        return false
-                    if not absolute.push_str(path)
-                        return false
-            None => return false
+    var absolute: String = match path_absolute(path)
+        Ok(resolved) => resolved
+        Err(_) => return false
     let raw: *u8 = absolute.as_ptr()
     if raw == null
         return false
@@ -212,6 +199,18 @@ pub fn os_spawn_search(args: Span<StrView>, search: StrView, envp: **u8) -> i32
 
     return os_wait(pid)
 
+# Harland: spawn `path` (`./prog`, `bin/cat` or a PATH candidate) once it
+# is resolved against the cwd; the kernel takes absolute paths only.
+[[target_os = "harland"]]
+fn spawn_resolved(path: StrView, argv: @CArgv, argc: i32) -> i64
+    var absolute: String = match path_absolute(path)
+        Ok(resolved) => resolved
+        Err(_) => return -1
+    let raw: *u8 = absolute.as_ptr()
+    if raw == null
+        return -1
+    return sys_spawn_args(raw, argv.ptrs.data, argc)
+
 # Harland: try sys_spawn_args on each candidate until one starts. No
 # environment is passed (harland has none).
 [[target_os = "harland"]]
@@ -224,13 +223,13 @@ pub fn os_spawn_search(args: Span<StrView>, search: StrView, envp: **u8) -> i32
     var pid: i64 = -1
     if has_slash(cmd)
         path.push_str(cmd)
-        pid = sys_spawn_args(path.as_ptr(), argv.ptrs.data, argc)
+        pid = spawn_resolved(path.as_view(), @argv, argc)
     else
         var pos: i64 = 0
         while pos >= 0 and pid < 0
             pos = next_candidate(search, pos, cmd, @&path)
             if pos >= 0
-                pid = sys_spawn_args(path.as_ptr(), argv.ptrs.data, argc)
+                pid = spawn_resolved(path.as_view(), @argv, argc)
 
     if pid < 0
         not_found(cmd)
@@ -332,9 +331,22 @@ pub fn os_open_read(path: StrView) -> i32
 # Working directory
 # ============================================================================
 
+[[target_os = "linux"]]
 pub fn os_chdir(path: StrView) -> i32
     var cpath: String = string_from(path)
     return sys_chdir(cpath.as_ptr())
+
+# Harland's kernel takes absolute paths only (AGAST #4776): `cd etc`,
+# `cd ..` and `cd ../etc` are resolved against the cwd first.
+[[target_os = "harland"]]
+pub fn os_chdir(path: StrView) -> i32
+    var absolute: String = match path_absolute(path)
+        Ok(resolved) => resolved
+        Err(_) => return -1
+    let raw: *u8 = absolute.as_ptr()
+    if raw == null
+        return -1
+    return sys_chdir(raw)
 
 # The cwd, read into `buf`; None on error.
 pub fn os_getcwd(buf: Span<u8>) -> Option<StrView>

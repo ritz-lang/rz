@@ -57,6 +57,54 @@ def _listing(lines: list[str]) -> list[str]:
     return [line for line in lines if line]
 
 
+def _no_error(prefix: str):
+    """A check that the command printed no `<prefix>...` error line."""
+    return lambda ls: not any(prefix in line for line in ls)
+
+
+def _only(want: str):
+    """A check that the command printed exactly the one line `want`."""
+    return lambda ls: _listing(ls) == [want]
+
+
+# Relative paths, `.` and `..` (AGAST #4776). The kernel takes absolute paths
+# only; ritzlib.path resolves them in userspace, in rzsh (cd, ls, a command
+# run by path) and in the programs it spawns (cat, mkdir). The first lines
+# are Aaron's session from the ticket, which failed at `cat etc/hostname`.
+# Runs from / and ends there.
+PATH_SESSION = [
+    ("ls etc", "lists a directory named relative to /",
+     lambda ls: all(name in " ".join(_listing(ls)).split() for name in ("hostname", "motd"))),
+    ("cat etc/hostname", "cat opens a path relative to /", _only("harland")),
+    ("cd etc", "cd enters a directory relative to /", _no_error("cd:")),
+    ("pwd", "the cwd is /etc", _only("/etc")),
+    ("cat hostname", "cat opens a name relative to /etc", _only("harland")),
+    ("cat ./motd", "`./` names the cwd", lambda ls: "Welcome to Harland!" in ls),
+    ("cd ..", "`..` is the parent", _no_error("cd:")),
+    ("pwd", "`cd ..` from /etc is /", _only("/")),
+    ("cd ..", "`..` at the root stays at the root", _no_error("cd:")),
+    ("pwd", "the cwd is still /", _only("/")),
+    ("cd bin/", "a trailing / is the same directory", _no_error("cd:")),
+    ("pwd", "the cwd is /bin, without the trailing /", _only("/bin")),
+    ("cat ../etc/hostname", "cat opens a path through `..` from /bin", _only("harland")),
+    ("./cat ./../etc//hostname", "rzsh runs ./cat, which opens a path with `.`, `..` and `//`",
+     _only("harland")),
+    ("ls ..", "lists the parent directory",
+     lambda ls: all(name in " ".join(_listing(ls)).split() for name in ("bin", "etc"))),
+    ("cd ../etc", "cd follows `..` then a name", _no_error("cd:")),
+    ("pwd", "the cwd is /etc", _only("/etc")),
+    ("cd nowhere", "cd to a missing relative directory fails",
+     lambda ls: any("cannot change directory" in line for line in ls)),
+    ("pwd", "a failed cd leaves the cwd alone", _only("/etc")),
+    ("cd /", "returns to the root directory", _no_error("cd:")),
+    ("mkdir x", "mkdir creates a directory relative to /", _no_error("mkdir:")),
+    ("cd x", "cd enters it", _no_error("cd:")),
+    ("pwd", "the cwd is /x", _only("/x")),
+    ("cd ./../x/./", "`.` and `..` fold away in cd", _no_error("cd:")),
+    ("pwd", "the cwd is still /x", _only("/x")),
+    ("cd /", "returns to the root directory", _no_error("cd:")),
+]
+
 # (command, description, check(lines) -> bool). Each command's output is
 # what the guest sent between the typed line and the next prompt.
 SESSION = [
@@ -92,6 +140,7 @@ SESSION = [
      lambda ls: "child" in ls),
     ("cd /", "returns to the root directory",
      lambda ls: not any(line.startswith("cd:") for line in ls)),
+] + PATH_SESSION + [
     ("echo after-cat", "the shell runs a second command after cat exits",
      lambda ls: "after-cat" in ls),
 ]

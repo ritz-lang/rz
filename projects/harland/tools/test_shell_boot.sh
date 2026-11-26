@@ -13,6 +13,11 @@
 #     cd /bin; ls      -> lists rzsh, cat and init in columns
 #     ls -1            -> lists /bin one name per line in sorted order
 #     cat /etc/motd    -> Welcome to Harland! (a spawned program)
+#     relative paths   -> `cat etc/hostname`, `cd etc`, `cd ..`, `cat ./motd`,
+#                         `cat ../etc/hostname` from /bin, `mkdir x; cd x;
+#                         pwd` and more: shell_session.py's PATH_SESSION
+#                         (AGAST #4776; userspace resolves, the kernel takes
+#                         absolute paths only)
 #     echo after-cat   -> after-cat (the shell survives a child's exit)
 #     exit             -> Goodbye!, "[init] Shell exited", "[exit] init
 #                         exited with code 0, powering off", in that order,

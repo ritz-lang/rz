@@ -20,7 +20,6 @@ import syscall.runtime.process { current_pid }
 import cap.table { cap_process_has, cap_process_has_any }
 import cap.types { CAP_TYPE_NAMESPACE, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_CREATE, CAP_RIGHT_LIST }
 import mm.heap { kalloc, kfree }
-import proc.table { proc_cwd }
 
 # Most entries one readdir returns.
 const READDIR_MAX: i32 = 64
@@ -123,28 +122,12 @@ pub fn sys_mkdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
     if path_result != 0
         return Errno.Fault as i64
+    # The kernel takes absolute paths only: userspace resolves a relative
+    # one, `.` and `..` against its cwd first (ritzlib.path, AGAST #4776).
     let path: *u8 = rdi as *u8
-    if *path == PATH_SEP
-        return sys_mkdir(path, rsi)
-
-    let cwd: StrView = proc_cwd()
-    var prefix_len: i64 = cwd.len
-    if not cwd.ends_with("/")
-        prefix_len = prefix_len + 1
-    let total: i64 = prefix_len + rsi as i64
-    if total > GOLIATH_PATH_MAX
-        return Errno.NameTooLong as i64
-    let absolute: *u8 = kalloc(total as u64) as *u8
-    if absolute == 0 as *u8
-        return Errno.NoMem as i64
-    for i in 0..cwd.len
-        *(absolute + i) = cwd.get(i)
-    *(absolute + prefix_len - 1) = PATH_SEP
-    for i in 0..rsi as i64
-        *(absolute + prefix_len + i) = *(path + i)
-    let result: i64 = sys_mkdir(absolute, total as u64)
-    kfree(absolute)
-    result
+    if *path != PATH_SEP
+        return Errno.Inval as i64
+    sys_mkdir(path, rsi)
 
 # write(fd, buf, count), also debug_print: Linux/POSIX write convention.
 pub fn sys_write_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

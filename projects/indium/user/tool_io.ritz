@@ -4,21 +4,30 @@ import ritzlib.string { String }
 import ritzlib.strview { StrView }
 import ritzlib.sys { SYS_MKDIR, syscall2, sys_open, sys_read, sys_write }
 import ritzlib.errno { Errno }
+import ritzlib.path { path_absolute }
 
-pub fn open_path(path: StrView, flags: i32) -> i32
-    # ritz1 cannot call a method on a qualified variant literal
-    # (`Errno.NoMem.code()`), so the variant is bound to a local first.
-    let no_mem: Errno = Errno.NoMem
-    var filename: String = String.new()
-    if not filename.push_str(path)
-        return -no_mem.code()
+# The kernel takes absolute paths only (AGAST #4776): each path is resolved
+# against the cwd here, `.` and `..` included, before the syscall.
+
+# open(2) on the resolved path `filename`; -errno on failure.
+fn open_resolved(filename: @&String, flags: i32) -> i32
     let raw: *u8 = filename.as_ptr()
     if raw == null
+        # ritz1 cannot call a method on a qualified variant literal
+        # (`Errno.NoMem.code()`), so the variant is bound to a local first.
+        let no_mem: Errno = Errno.NoMem
         return -no_mem.code()
     sys_open(raw, flags)
 
+pub fn open_path(path: StrView, flags: i32) -> i32
+    match path_absolute(path)
+        Ok(filename) => open_resolved(@&filename, flags)
+        Err(e) => -e.code()
+
 pub fn make_directory(path: StrView) -> i64
-    syscall2(SYS_MKDIR, path.ptr as i64, path.len)
+    match path_absolute(path)
+        Ok(absolute) => syscall2(SYS_MKDIR, absolute.as_view().ptr as i64, absolute.len())
+        Err(e) => -(e.code() as i64)
 
 pub fn read_bytes(fd: i32, buffer: Span<u8>) -> i64
     sys_read(fd, buffer.ptr, buffer.len)

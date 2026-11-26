@@ -1,0 +1,85 @@
+# ritzlib/path.ritz - lexical path resolution (AGAST #4776)
+#
+#   path_resolve(cwd, path) -> Result<String, Errno>   pure, no syscall
+#   path_absolute(path)     -> Result<String, Errno>   path_resolve against getcwd
+#
+# Harland's kernel takes absolute paths only: a relative path, or a `.` or
+# `..` in one, is resolved here, in userspace, before the syscall. The
+# programs that hand the kernel a path (rzsh's `cd`, `ls` and spawn, and
+# indium's tool_io for cat and mkdir) call path_absolute first.
+#
+# Resolution is lexical: `..` drops the previous name and never reads the
+# filesystem, so `a/..` is `.` even if `a` is missing (harland has no
+# symlinks for it to differ from the physical walk). The result is always
+# absolute and normal: one `/` between names, no `.` or `..`, no trailing
+# `/` except for the root itself.
+
+import ritzlib.errno
+import ritzlib.result
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.sys { sys_getcwd }
+
+# The longest path a syscall takes, counting its NUL (PATH_MAX). A resolved
+# path of PATH_MAX bytes or more fails with NameTooLong.
+pub const PATH_MAX: i64 = 4096
+
+# Drop the last name of the normal absolute path `out` ("/a/b" -> "/a",
+# "/a" -> "/"); the root stays the root.
+fn path_pop_name(out: @&String)
+    while out.len() > 1 and out.get(out.len() - 1) != '/'
+        out.pop()
+    if out.len() > 1
+        out.pop()
+
+# Apply each name of `path` to the normal absolute path `out`: `.` and empty
+# names (from `//` or a trailing `/`) change nothing, `..` drops a name
+# (clamped at the root), anything else is appended.
+fn path_apply(out: @&String, path: StrView) -> Result<(), Errno>
+    var rest: StrView = path
+    while not rest.is_empty()
+        let end: i64 = rest.find_byte('/')
+        let name: StrView = rest.take(end)
+        if name.eq("..")
+            path_pop_name(out)
+        else if not name.is_empty() and not name.eq(".")
+            if out.len() > 1 and not out.push('/')
+                return Err(Errno.NoMem)
+            if not out.push_str(name)
+                return Err(Errno.NoMem)
+        if end >= rest.len
+            break
+        rest = rest.skip(end + 1)
+    Ok(())
+
+# The normal absolute form of `path`, taken relative to `cwd` unless it
+# starts with `/`. `cwd` must be absolute when it is used (Inval
+# otherwise); it is normalised as well. An empty `path` is NoEnt, as for
+# open(2); a result of PATH_MAX bytes or more is NameTooLong.
+pub fn path_resolve(cwd: StrView, path: StrView) -> Result<String, Errno>
+    if path.is_empty()
+        return Err(Errno.NoEnt)
+    var out: String = string_new()
+    if not out.push('/')
+        return Err(Errno.NoMem)
+    if not path.starts_with("/")
+        if not cwd.starts_with("/")
+            return Err(Errno.Inval)
+        path_apply(@&out, cwd)?
+    path_apply(@&out, path)?
+    if out.len() >= PATH_MAX
+        return Err(Errno.NameTooLong)
+    Ok(out)
+
+# The normal absolute form of `path` against this process's working
+# directory. An absolute `path` needs no getcwd.
+pub fn path_absolute(path: StrView) -> Result<String, Errno>
+    if path.starts_with("/")
+        return path_resolve("/", path)
+    var buf: [4096]u8
+    let len: i64 = sys_getcwd(@buf[0], PATH_MAX)
+    if len < 0
+        return Err(errno_from_raw(len as i32))
+    # Linux's getcwd counts the NUL it writes; harland's does not.
+    let raw: StrView = strview_from_ptr(@buf[0], len)
+    path_resolve(raw.take(raw.find_byte(0)), path)
