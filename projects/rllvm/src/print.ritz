@@ -1,0 +1,514 @@
+# print: a Module back to LLVM IR text, one canonical spelling per construct.
+# Typed pointers print as ptr; metadata, which the parser skips, is gone.
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new }
+import rllvm.ir
+
+# String's push and push_str report allocation as a bool; the printer's
+# match arms need statements of one type.
+fn put(out: @&String, s: StrView)
+    out.push_str(s)
+
+fn putc(out: @&String, c: u8)
+    out.push(c)
+
+fn push_int(out: @&String, n: i64)
+    if n < 0
+        putc(out, '-')
+        if n == -9223372036854775807 - 1
+            put(out, "9223372036854775808")
+            return
+        push_int(out, 0 - n)
+        return
+    if n >= 10
+        push_int(out, n / 10)
+    putc(out, ('0' as i64 + n % 10) as u8)
+
+pub fn print_type(m: @Module, out: @&String, ty: i64)
+    let t: Type = m.types.get(ty)
+    match t.kind
+        TypeKind.Void => put(out, "void")
+        TypeKind.Int =>
+            putc(out, 'i')
+            push_int(out, t.width)
+        TypeKind.Float => put(out, "float")
+        TypeKind.Double => put(out, "double")
+        TypeKind.Ptr => put(out, "ptr")
+        TypeKind.Label => put(out, "label")
+        TypeKind.Named => put(out, t.name)
+        TypeKind.Array =>
+            putc(out, '[')
+            push_int(out, t.width)
+            put(out, " x ")
+            print_type(m, out, t.elem)
+            putc(out, ']')
+        TypeKind.Vector =>
+            putc(out, '<')
+            push_int(out, t.width)
+            put(out, " x ")
+            print_type(m, out, t.elem)
+            putc(out, '>')
+        TypeKind.Struct =>
+            if t.packed
+                putc(out, '<')
+            putc(out, '{')
+            for i in 0..t.count
+                if i > 0
+                    putc(out, ',')
+                putc(out, ' ')
+                print_type(m, out, m.type_lists.get(t.first + i))
+            if t.count > 0
+                putc(out, ' ')
+            putc(out, '}')
+            if t.packed
+                putc(out, '>')
+        TypeKind.Func =>
+            print_type(m, out, t.elem)
+            put(out, " (")
+            for i in 0..t.count
+                if i > 0
+                    put(out, ", ")
+                print_type(m, out, m.type_lists.get(t.first + i))
+            if t.packed
+                if t.count > 0
+                    put(out, ", ")
+                put(out, "...")
+            putc(out, ')')
+
+# Is `ty` a packed struct, through a name?
+fn is_packed(m: @Module, ty: i64) -> bool
+    if ty < 0
+        return false
+    let r: i64 = m.resolve(ty)
+    if r < 0
+        return false
+    let t: Type = m.types.get(r)
+    t.kind == TypeKind.Struct and t.packed
+
+fn print_elems(m: @Module, out: @&String, v: @Value)
+    for i in 0..v.count
+        if i > 0
+            put(out, ", ")
+        print_typed(m, out, m.value_lists.get(v.first + i))
+
+pub fn print_value(m: @Module, out: @&String, id: i64)
+    let v: Value = m.values.get(id)
+    match v.kind
+        ValueKind.Local => put(out, v.text)
+        ValueKind.Global => put(out, v.text)
+        ValueKind.Int => put(out, v.text)
+        ValueKind.Float => put(out, v.text)
+        ValueKind.Bytes => put(out, v.text)
+        ValueKind.Null => put(out, "null")
+        ValueKind.Undef => put(out, "undef")
+        ValueKind.Zero => put(out, "zeroinitializer")
+        ValueKind.Struct =>
+            let packed: bool = is_packed(m, v.ty)
+            if packed
+                putc(out, '<')
+            put(out, "{ ")
+            print_elems(m, out, @v)
+            put(out, " }")
+            if packed
+                putc(out, '>')
+        ValueKind.Array =>
+            putc(out, '[')
+            print_elems(m, out, @v)
+            putc(out, ']')
+        ValueKind.Vector =>
+            putc(out, '<')
+            print_elems(m, out, @v)
+            putc(out, '>')
+        ValueKind.Gep =>
+            put(out, "getelementptr (")
+            print_type(m, out, v.src_ty)
+            for i in 0..v.count
+                put(out, ", ")
+                print_typed(m, out, m.value_lists.get(v.first + i))
+            putc(out, ')')
+        ValueKind.PtrToInt =>
+            put(out, "ptrtoint (")
+            print_typed(m, out, m.value_lists.get(v.first))
+            put(out, " to ")
+            print_type(m, out, v.src_ty)
+            putc(out, ')')
+        ValueKind.Asm =>
+            put(out, "asm sideeffect ")
+            put(out, v.text)
+            put(out, ", ")
+            put(out, v.text2)
+
+# `T v`, with a call argument's sret/byval between them.
+pub fn print_typed(m: @Module, out: @&String, id: i64)
+    let v: Value = m.values.get(id)
+    print_type(m, out, v.ty)
+    print_param_attr(m, out, v.attr, v.attr_ty, v.attr_align)
+    putc(out, ' ')
+    print_value(m, out, id)
+
+# ` sret(T)` or ` byval(T) align N`; nothing for a plain parameter.
+fn print_param_attr(m: @Module, out: @&String, attr: ParamAttr, ty: i64, align: i64)
+    match attr
+        ParamAttr.Plain => return
+        ParamAttr.Sret => put(out, " sret(")
+        ParamAttr.Byval => put(out, " byval(")
+    print_type(m, out, ty)
+    putc(out, ')')
+    if align > 0
+        put(out, " align ")
+        push_int(out, align)
+
+fn linkage_text(l: Linkage) -> StrView
+    match l
+        Linkage.External => ""
+        Linkage.Internal => "internal "
+        Linkage.Private => "private "
+        Linkage.Weak => "weak "
+        Linkage.WeakOdr => "weak_odr "
+        Linkage.LinkonceOdr => "linkonce_odr "
+        Linkage.AvailableExternally => "available_externally "
+
+pub fn opcode_text(op: Opcode) -> StrView
+    match op
+        Opcode.Ret => "ret"
+        Opcode.Br => "br"
+        Opcode.Unreachable => "unreachable"
+        Opcode.Alloca => "alloca"
+        Opcode.Load => "load"
+        Opcode.Store => "store"
+        Opcode.Gep => "getelementptr"
+        Opcode.Cmpxchg => "cmpxchg"
+        Opcode.AtomicRmw => "atomicrmw"
+        Opcode.Fence => "fence"
+        Opcode.Add => "add"
+        Opcode.Sub => "sub"
+        Opcode.Mul => "mul"
+        Opcode.UDiv => "udiv"
+        Opcode.SDiv => "sdiv"
+        Opcode.URem => "urem"
+        Opcode.SRem => "srem"
+        Opcode.Shl => "shl"
+        Opcode.LShr => "lshr"
+        Opcode.AShr => "ashr"
+        Opcode.And => "and"
+        Opcode.Or => "or"
+        Opcode.Xor => "xor"
+        Opcode.FNeg => "fneg"
+        Opcode.FAdd => "fadd"
+        Opcode.FSub => "fsub"
+        Opcode.FMul => "fmul"
+        Opcode.FDiv => "fdiv"
+        Opcode.ICmp => "icmp"
+        Opcode.FCmp => "fcmp"
+        Opcode.Trunc => "trunc"
+        Opcode.ZExt => "zext"
+        Opcode.SExt => "sext"
+        Opcode.FPTrunc => "fptrunc"
+        Opcode.FPExt => "fpext"
+        Opcode.SIToFP => "sitofp"
+        Opcode.UIToFP => "uitofp"
+        Opcode.FPToSI => "fptosi"
+        Opcode.Bitcast => "bitcast"
+        Opcode.IntToPtr => "inttoptr"
+        Opcode.PtrToInt => "ptrtoint"
+        Opcode.ExtractValue => "extractvalue"
+        Opcode.InsertValue => "insertvalue"
+        Opcode.ExtractElement => "extractelement"
+        Opcode.InsertElement => "insertelement"
+        Opcode.ShuffleVector => "shufflevector"
+        Opcode.Select => "select"
+        Opcode.Phi => "phi"
+        Opcode.Call => "call"
+
+fn op_id(m: @Module, inst: @Inst, k: i64) -> i64
+    m.value_lists.get(inst.first + k)
+
+# Operands k.. as `T v, T v`.
+fn print_ops_from(m: @Module, out: @&String, inst: @Inst, k: i64)
+    for i in k..inst.count
+        if i > k
+            put(out, ", ")
+        print_typed(m, out, op_id(m, inst, i))
+
+fn print_align(out: @&String, align: i64)
+    if align > 0
+        put(out, ", align ")
+        push_int(out, align)
+
+fn print_inst(m: @Module, out: @&String, inst: @Inst)
+    put(out, "  ")
+    if inst.name.len > 0
+        put(out, inst.name)
+        put(out, " = ")
+    put(out, opcode_text(inst.op))
+    match inst.op
+        Opcode.Ret =>
+            if inst.count == 0
+                put(out, " void")
+            else
+                putc(out, ' ')
+                print_ops_from(m, out, inst, 0)
+        Opcode.Br =>
+            putc(out, ' ')
+            print_ops_from(m, out, inst, 0)
+        Opcode.Unreachable => pass
+        Opcode.Alloca =>
+            putc(out, ' ')
+            print_type(m, out, inst.ty)
+            print_align(out, inst.align)
+        Opcode.Load =>
+            print_mem_flags(out, inst)
+            print_type(m, out, inst.ty)
+            put(out, ", ")
+            print_ops_from(m, out, inst, 0)
+            print_mem_tail(out, inst)
+        Opcode.Store =>
+            print_mem_flags(out, inst)
+            print_ops_from(m, out, inst, 0)
+            print_mem_tail(out, inst)
+        Opcode.Gep =>
+            putc(out, ' ')
+            print_type(m, out, inst.ty)
+            put(out, ", ")
+            print_ops_from(m, out, inst, 0)
+        Opcode.Cmpxchg =>
+            putc(out, ' ')
+            print_ops_from(m, out, inst, 0)
+            put(out, " seq_cst seq_cst")
+            print_align(out, inst.align)
+        Opcode.AtomicRmw =>
+            putc(out, ' ')
+            put(out, inst.pred)
+            putc(out, ' ')
+            print_ops_from(m, out, inst, 0)
+            put(out, " seq_cst")
+            print_align(out, inst.align)
+        Opcode.Fence => put(out, " seq_cst")
+        Opcode.ICmp => print_cmp(m, out, inst)
+        Opcode.FCmp => print_cmp(m, out, inst)
+        Opcode.FNeg =>
+            putc(out, ' ')
+            print_ops_from(m, out, inst, 0)
+        Opcode.Trunc => print_cast(m, out, inst)
+        Opcode.ZExt => print_cast(m, out, inst)
+        Opcode.SExt => print_cast(m, out, inst)
+        Opcode.FPTrunc => print_cast(m, out, inst)
+        Opcode.FPExt => print_cast(m, out, inst)
+        Opcode.SIToFP => print_cast(m, out, inst)
+        Opcode.UIToFP => print_cast(m, out, inst)
+        Opcode.FPToSI => print_cast(m, out, inst)
+        Opcode.Bitcast => print_cast(m, out, inst)
+        Opcode.IntToPtr => print_cast(m, out, inst)
+        Opcode.PtrToInt => print_cast(m, out, inst)
+        Opcode.ExtractValue => print_aggregate_op(m, out, inst)
+        Opcode.InsertValue => print_aggregate_op(m, out, inst)
+        Opcode.ExtractElement =>
+            putc(out, ' ')
+            print_ops_from(m, out, inst, 0)
+        Opcode.InsertElement =>
+            putc(out, ' ')
+            print_ops_from(m, out, inst, 0)
+        Opcode.ShuffleVector =>
+            putc(out, ' ')
+            print_ops_from(m, out, inst, 0)
+        Opcode.Select =>
+            putc(out, ' ')
+            print_ops_from(m, out, inst, 0)
+        Opcode.Phi => print_phi(m, out, inst)
+        Opcode.Call => print_call(m, out, inst)
+        Opcode.Add => print_binary(m, out, inst)
+        Opcode.Sub => print_binary(m, out, inst)
+        Opcode.Mul => print_binary(m, out, inst)
+        Opcode.UDiv => print_binary(m, out, inst)
+        Opcode.SDiv => print_binary(m, out, inst)
+        Opcode.URem => print_binary(m, out, inst)
+        Opcode.SRem => print_binary(m, out, inst)
+        Opcode.Shl => print_binary(m, out, inst)
+        Opcode.LShr => print_binary(m, out, inst)
+        Opcode.AShr => print_binary(m, out, inst)
+        Opcode.And => print_binary(m, out, inst)
+        Opcode.Or => print_binary(m, out, inst)
+        Opcode.Xor => print_binary(m, out, inst)
+        Opcode.FAdd => print_binary(m, out, inst)
+        Opcode.FSub => print_binary(m, out, inst)
+        Opcode.FMul => print_binary(m, out, inst)
+        Opcode.FDiv => print_binary(m, out, inst)
+    putc(out, '\n')
+
+fn print_mem_flags(out: @&String, inst: @Inst)
+    if inst.is_atomic
+        put(out, " atomic")
+    if inst.is_volatile
+        put(out, " volatile")
+    putc(out, ' ')
+
+fn print_mem_tail(out: @&String, inst: @Inst)
+    if inst.is_atomic
+        put(out, " seq_cst")
+    print_align(out, inst.align)
+
+# T a, b: the second operand's type is the first's.
+fn print_binary(m: @Module, out: @&String, inst: @Inst)
+    putc(out, ' ')
+    print_typed(m, out, op_id(m, inst, 0))
+    put(out, ", ")
+    print_value(m, out, op_id(m, inst, 1))
+
+fn print_cmp(m: @Module, out: @&String, inst: @Inst)
+    putc(out, ' ')
+    put(out, inst.pred)
+    print_binary(m, out, inst)
+
+fn print_cast(m: @Module, out: @&String, inst: @Inst)
+    putc(out, ' ')
+    print_typed(m, out, op_id(m, inst, 0))
+    put(out, " to ")
+    print_type(m, out, inst.ty)
+
+fn print_aggregate_op(m: @Module, out: @&String, inst: @Inst)
+    putc(out, ' ')
+    print_ops_from(m, out, inst, 0)
+    for i in 0..inst.idx_count
+        put(out, ", ")
+        push_int(out, m.ints.get(inst.idx_first + i))
+
+fn print_phi(m: @Module, out: @&String, inst: @Inst)
+    putc(out, ' ')
+    print_type(m, out, inst.ty)
+    var i: i64 = 0
+    while i < inst.count
+        if i > 0
+            putc(out, ',')
+        put(out, " [ ")
+        print_value(m, out, op_id(m, inst, i))
+        put(out, ", ")
+        print_value(m, out, op_id(m, inst, i + 1))
+        put(out, " ]")
+        i += 2
+
+fn print_call(m: @Module, out: @&String, inst: @Inst)
+    putc(out, ' ')
+    print_type(m, out, inst.ty)
+    putc(out, ' ')
+    print_value(m, out, op_id(m, inst, 0))
+    putc(out, '(')
+    print_ops_from(m, out, inst, 1)
+    putc(out, ')')
+
+fn print_fn_attrs(out: @&String, f: @Function)
+    let a: i64 = f.attrs
+    if (a & FA_ALIGNSTACK16) != 0
+        put(out, " alignstack(16)")
+    if (a & FA_NO_BUILTINS) != 0
+        put(out, " \"no-builtins\"")
+    if (a & FA_SSPSTRONG) != 0
+        put(out, " sspstrong")
+    if (a & FA_NOREDZONE) != 0
+        put(out, " noredzone")
+    if (a & FA_NAKED) != 0
+        put(out, " naked")
+    if (a & FA_COLD) != 0
+        put(out, " cold")
+    if (a & FA_NOINLINE) != 0
+        put(out, " noinline")
+    if (a & FA_INLINEHINT) != 0
+        put(out, " inlinehint")
+    if (a & FA_ALWAYSINLINE) != 0
+        put(out, " alwaysinline")
+    if (a & FA_NORETURN) != 0
+        put(out, " noreturn")
+    if (a & FA_NOUNWIND) != 0
+        put(out, " nounwind")
+    if (a & FA_TARGET_CPU) != 0
+        put(out, " \"target-cpu\"=\"x86-64\"")
+    if f.features.len > 0
+        put(out, " \"target-features\"=\"")
+        put(out, f.features)
+        putc(out, '"')
+    if f.comdat
+        put(out, " comdat")
+
+fn print_function(m: @Module, out: @&String, f: @Function)
+    if f.is_decl
+        put(out, "declare ")
+    else
+        put(out, "define ")
+    put(out, linkage_text(f.linkage))
+    print_type(m, out, f.ret_ty)
+    putc(out, ' ')
+    put(out, f.name)
+    putc(out, '(')
+    for i in 0..f.nparams
+        if i > 0
+            put(out, ", ")
+        let p: Param = m.params.get(f.first_param + i)
+        print_type(m, out, p.ty)
+        print_param_attr(m, out, p.attr, p.attr_ty, p.attr_align)
+        if p.name.len > 0
+            putc(out, ' ')
+            put(out, p.name)
+    if f.variadic
+        if f.nparams > 0
+            put(out, ", ")
+        put(out, "...")
+    putc(out, ')')
+    print_fn_attrs(out, f)
+    if f.is_decl
+        putc(out, '\n')
+        return
+    put(out, " {\n")
+    for b in 0..f.nblocks
+        let blk: Block = m.blocks.get(f.first_block + b)
+        if blk.name.len > 0
+            put(out, blk.name)
+            put(out, ":\n")
+        for i in 0..blk.count
+            let inst: Inst = m.insts.get(blk.first + i)
+            print_inst(m, out, @inst)
+    put(out, "}\n")
+
+fn print_global(m: @Module, out: @&String, g: @Global)
+    put(out, g.name)
+    put(out, " = ")
+    put(out, linkage_text(g.linkage))
+    if g.init < 0
+        put(out, "external ")
+    if g.unnamed_addr
+        put(out, "unnamed_addr ")
+    if g.is_const
+        put(out, "constant ")
+    else
+        put(out, "global ")
+    print_type(m, out, g.ty)
+    if g.init >= 0
+        putc(out, ' ')
+        print_value(m, out, g.init)
+    print_align(out, g.align)
+    putc(out, '\n')
+
+# The whole module: header, comdats, named types, globals, functions.
+pub fn print_module(m: @Module) -> String
+    var out = string_new()
+    if m.triple.len > 0
+        out.push_str("target triple = \"")
+        out.push_str(m.triple)
+        out.push_str("\"\n")
+    if m.has_datalayout
+        out.push_str("target datalayout = \"\"\n")
+    for i in 0..m.comdats.len
+        let c: ComdatDef = m.comdats.get(i)
+        out.push_str(c.name)
+        out.push_str(" = comdat any\n")
+    for i in 0..m.named.len
+        let n: NamedType = m.named.get(i)
+        out.push_str(n.name)
+        out.push_str(" = type ")
+        print_type(m, @&out, n.body)
+        out.push('\n')
+    for i in 0..m.globals.len
+        let g: Global = m.globals.get(i)
+        print_global(m, @&out, @g)
+    for i in 0..m.funcs.len
+        let f: Function = m.funcs.get(i)
+        print_function(m, @&out, @f)
+    out

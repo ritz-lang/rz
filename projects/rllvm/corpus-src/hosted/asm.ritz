@@ -1,0 +1,143 @@
+# One asm block per mnemonic in the inline-asm closed set, plus a four-i32
+# cpuid, a two-i32 xgetbv, %cr2 / %cr3 moves, `jmpq *%reg`, the port
+# instructions and the Linux shim's addq / shlq / leaq / call / symbol(%rip)
+# sequence. Linked, never run: hlt, cli and port I/O are not host-safe.
+extern fn rt_hex(v: u64)
+
+var g_slot: u64 = 0
+
+fn alu(a: u64, b: u32) -> u64
+    var x: u64 = a
+    var y: u32 = b
+    asm x86_64 (inout x, inout y):
+        addq $1, {x}
+        addl $2, {y}
+        andq $-16, {x}
+        decq {x}
+        shlq $3, {x}
+        xorl {y}, {y}
+        xorq $5, {x}
+    x + (y as u64)
+
+fn moves(p: *u8, v: u64) -> u64
+    var r: u64 = 0
+    asm x86_64 (out r, in p, in v):
+        movb $1, ({p})
+        movw $2, 2({p})
+        movl $3, 4({p})
+        movq {v}, 8({p},{v})
+        movq 8({p},{v},8), {r}
+        leaq 16({p}), {r}
+    r
+
+fn flags() -> u64
+    var f: u64 = 0
+    asm x86_64 (out f):
+        pushfq
+        popq {f}
+    f
+
+fn shim_sequence(argc: u64) -> u64
+    var x: u64 = argc
+    asm x86_64 (inout x: rax, clobber rdi, clobber rsi, clobber rdx, clobber rcx, clobber r8, clobber r9, clobber r10, clobber r11):
+        addq $1, %rax
+        shlq $3, %rax
+        leaq g_slot(%rip), %rdx
+        movq %rax, g_slot(%rip)
+        movq %rax, %rdi
+        call rt_hex
+    x
+
+fn ports(port: u16, v: u32) -> u32
+    var r8: u8 = 0
+    var r16: u16 = 0
+    var r32: u32 = v
+    asm x86_64 (in port: rdx, out r8: rax):
+        inb %dx, %al
+    asm x86_64 (in port: rdx, out r16: rax):
+        inw %dx, %ax
+    asm x86_64 (in port: rdx, inout r32: rax):
+        inl %dx, %eax
+        outb %al, %dx
+        outw %ax, %dx
+        outl %eax, %dx
+    (r8 as u32) + (r16 as u32) + r32
+
+fn cpuid4(leaf: u32) -> u32
+    var a: u32 = leaf
+    var b: u32 = 0
+    var c: u32 = 0
+    var d: u32 = 0
+    asm x86_64 (inout a: rax, out b: rbx, inout c: rcx, out d: rdx):
+        cpuid
+    a ^ b ^ c ^ d
+
+fn xcr0() -> u64
+    var lo: u32 = 0
+    var hi: u32 = 0
+    var idx: u32 = 0
+    asm x86_64 (in idx: rcx, out lo: rax, out hi: rdx):
+        xgetbv
+    ((hi as u64) << 32) | (lo as u64)
+
+fn control(v: u64) -> u64
+    var r: u64 = 0
+    asm x86_64 (out r, in v):
+        movq %cr2, {r}
+        movq %cr3, {r}
+        movq {v}, %cr3
+    r
+
+fn msr(idx: u32) -> u64
+    var lo: u32 = 0
+    var hi: u32 = 0
+    asm x86_64 (in idx: rcx, out lo: rax, out hi: rdx):
+        rdmsr
+        wrmsr
+    asm x86_64 (out lo: rax, out hi: rdx):
+        rdtsc
+    ((hi as u64) << 32) | (lo as u64)
+
+fn system(p: *u8, sel: u16)
+    asm x86_64 (in p, in sel):
+        cli
+        sti
+        hlt
+        lidt ({p})
+        ltr {sel}
+        invlpg ({p})
+        clflush ({p})
+
+fn fences(p: *u8)
+    asm x86_64 (in p):
+        lfence
+        mfence
+        sfence
+        pause
+        nop
+        nopl ({p})
+
+fn loop_down(n: u64) -> u64
+    var x: u64 = n
+    asm x86_64 (inout x):
+        1:
+        decq {x}
+        jnz 1b
+    x
+
+fn jump(target: u64)
+    asm x86_64 (in target):
+        jmpq *{target}
+
+fn leave()
+    asm x86_64:
+        retq
+
+fn raw_syscall(nr: u64, a: u64) -> u64
+    var r: u64 = nr
+    asm x86_64 (inout r: rax, in a: rdi, clobber rcx, clobber r11):
+        syscall
+    r
+
+pub fn main() -> i32
+    0

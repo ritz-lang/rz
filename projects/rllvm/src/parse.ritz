@@ -1,0 +1,1147 @@
+# parse: LLVM IR text in the closed subset (DESIGN.md "LLVM IR subset") to a
+# Module. A construct outside the subset is an Unsupported failure naming it;
+# text that is not IR at all is Malformed.
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_from }
+import ritzlib.gvec { Vec, vec_new }
+import rllvm.lex { Tok, Token, lex }
+import rllvm.ir
+import rllvm.subset
+
+pub enum FailKind
+    Unsupported     # outside the subset: exit 2, the file stays on clang
+    Malformed       # not IR rllvm can read: exit 1
+
+pub struct Fail
+    kind: FailKind
+    line: i64
+    what: String
+
+struct Parser
+    src: StrView
+    toks: Vec<Token>
+    pos: i64
+    m: Module
+    comdats_used: Vec<StrView>
+
+# `prefix 'word'`
+fn named(prefix: StrView, word: StrView) -> String
+    var s = string_from(prefix)
+    if prefix.len > 0
+        s.push_str(" ")
+    s.push_str("'")
+    s.push_str(word)
+    s.push_str("'")
+    s
+
+fn unsupported_at(line: i64, what: String) -> Fail
+    Fail { kind: FailKind.Unsupported, line: line, what: what }
+
+fn malformed_at(line: i64, what: StrView) -> Fail
+    Fail { kind: FailKind.Malformed, line: line, what: string_from(what) }
+
+fn is_value_word(w: StrView) -> bool
+    w.eq("null") or w.eq("undef") or w.eq("zeroinitializer") or w.eq("true") or w.eq("false") or w.eq("poison") or w.eq("getelementptr") or w.eq("blockaddress") or w.eq("dso_local_equivalent") or w.eq("no_cfi") or w.eq("bitcast") or w.eq("ptrtoint") or w.eq("inttoptr") or w.eq("asm")
+
+fn is_type_word(w: StrView) -> bool
+    w.eq("void") or w.eq("float") or w.eq("double") or w.eq("ptr") or w.eq("label") or int_type_word(w) or foreign_type_word(w)
+
+# Is a vector of `n` elements of type `elem` one the subset names?
+fn vector_allowed(n: i64, elem: i64) -> bool
+    if elem == TY_I8
+        return n == 16
+    if elem == TY_I16
+        return n == 8
+    if elem == TY_I32
+        return n == 4 or n == 8
+    if elem == TY_I64
+        return n == 2 or n == 4
+    if elem == TY_I1
+        return n == 16 or n == 8 or n == 4 or n == 2
+    false
+
+impl Parser
+    fn tok(self: @Parser) -> Token
+        self.toks.get(self.pos)
+
+    fn tok_at(self: @Parser, k: i64) -> Token
+        let i: i64 = self.pos + k
+        if i >= self.toks.len
+            return self.toks.get(self.toks.len - 1)
+        self.toks.get(i)
+
+    fn text(self: @Parser, t: Token) -> StrView
+        self.src.slice(t.start, t.start + t.len)
+
+    fn cur_text(self: @Parser) -> StrView
+        self.text(self.tok())
+
+    fn line(self: @Parser) -> i64
+        self.tok().line
+
+    fn bump(self: @&Parser) -> Token
+        let t: Token = self.tok()
+        if t.kind != Tok.Eof
+            self.pos += 1
+        t
+
+    fn at_word(self: @Parser, w: StrView) -> bool
+        let t: Token = self.tok()
+        t.kind == Tok.Word and self.text(t).eq(w)
+
+    fn at_punct(self: @Parser, c: StrView) -> bool
+        let t: Token = self.tok()
+        t.kind == Tok.Punct and self.text(t).eq(c)
+
+    fn eat_word(self: @&Parser, w: StrView) -> bool
+        if self.at_word(w)
+            self.pos += 1
+            return true
+        false
+
+    fn eat_punct(self: @&Parser, c: StrView) -> bool
+        if self.at_punct(c)
+            self.pos += 1
+            return true
+        false
+
+    fn fail_here(self: @Parser, what: StrView) -> Fail
+        if self.tok().kind == Tok.Eof
+            return malformed_at(self.line(), "unexpected end of file")
+        malformed_at(self.line(), what)
+
+    fn expect_punct(self: @&Parser, c: StrView) -> Result<(), Fail>
+        if self.eat_punct(c)
+            return Ok(())
+        if c.eq(",")
+            return Err(self.fail_here("expected ','"))
+        if c.eq("=")
+            return Err(self.fail_here("expected '='"))
+        if c.eq("(")
+            return Err(self.fail_here("expected '('"))
+        if c.eq(")")
+            return Err(self.fail_here("expected ')'"))
+        if c.eq("]")
+            return Err(self.fail_here("expected ']'"))
+        if c.eq("}")
+            return Err(self.fail_here("expected '}'"))
+        if c.eq(">")
+            return Err(self.fail_here("expected '>'"))
+        Err(self.fail_here("expected punctuation"))
+
+    fn expect_word(self: @&Parser, w: StrView) -> Result<(), Fail>
+        if self.eat_word(w)
+            return Ok(())
+        Err(self.fail_here("unexpected token"))
+
+    fn expect_int(self: @&Parser) -> Result<i64, Fail>
+        let t: Token = self.tok()
+        if t.kind != Tok.Int
+            return Err(self.fail_here("expected an integer"))
+        self.pos += 1
+        match self.text(t).parse_i64()
+            Some(n) => Ok(n)
+            None => Err(malformed_at(t.line, "integer out of range"))
+
+    # The source text from token `from` through the token before the cursor.
+    fn span_from(self: @Parser, from: i64) -> StrView
+        let a: Token = self.toks.get(from)
+        let b: Token = self.toks.get(self.pos - 1)
+        self.src.slice(a.start, b.start + b.len)
+
+    # ------------------------------------------------------------------ types
+
+    fn parse_type(self: @&Parser) -> Result<i64, Fail>
+        let start: i64 = self.pos
+        let line: i64 = self.line()
+        var ty: i64 = self.parse_base_type()?
+        while true
+            if self.at_word("addrspace")
+                return Err(unsupported_at(line, string_from("address space")))
+            if not self.at_punct("*")
+                break
+            self.pos += 1
+            let base: StrView = self.span_from(start)
+            let spelled: StrView = base.take(base.len - 1)
+            if not (spelled.eq("i8") or spelled.eq("i8*") or spelled.eq("[1 x i8]"))
+                return Err(unsupported_at(line, named("typed pointer", base)))
+            ty = TY_PTR
+        Ok(ty)
+
+    fn parse_base_type(self: @&Parser) -> Result<i64, Fail>
+        let t: Token = self.tok()
+        let w: StrView = self.text(t)
+        if t.kind == Tok.Local
+            self.pos += 1
+            return Ok(self.m.add_type(Type { kind: TypeKind.Named, width: 0, elem: -1, first: 0, count: 0, packed: false, name: w }))
+        if t.kind == Tok.Punct
+            if w.eq("[")
+                return self.parse_sequence_type(TypeKind.Array, "]")
+            if w.eq("{")
+                return self.parse_struct_type(false)
+            if w.eq("<")
+                if self.tok_at(1).kind == Tok.Punct and self.text(self.tok_at(1)).eq("{")
+                    self.pos += 1
+                    let s: i64 = self.parse_struct_type(true)?
+                    self.expect_punct(">")?
+                    return Ok(s)
+                return self.parse_sequence_type(TypeKind.Vector, ">")
+        if t.kind != Tok.Word
+            return Err(self.fail_here("expected a type"))
+        self.pos += 1
+        if w.eq("void")
+            return Ok(TY_VOID)
+        if w.eq("float")
+            return Ok(TY_FLOAT)
+        if w.eq("double")
+            return Ok(TY_DOUBLE)
+        if w.eq("label")
+            return Ok(TY_LABEL)
+        if w.eq("ptr")
+            return Ok(TY_PTR)
+        if w.eq("i1")
+            return Ok(TY_I1)
+        if w.eq("i8")
+            return Ok(TY_I8)
+        if w.eq("i16")
+            return Ok(TY_I16)
+        if w.eq("i32")
+            return Ok(TY_I32)
+        if w.eq("i64")
+            return Ok(TY_I64)
+        if int_type_word(w) or foreign_type_word(w)
+            return Err(unsupported_at(t.line, named("type", w)))
+        Err(malformed_at(t.line, "expected a type"))
+
+    # [N x T] or <N x T>, the cursor on the opening bracket.
+    fn parse_sequence_type(self: @&Parser, kind: TypeKind, close: StrView) -> Result<i64, Fail>
+        let start: i64 = self.pos
+        let line: i64 = self.line()
+        self.pos += 1
+        let n: i64 = self.expect_int()?
+        self.expect_word("x")?
+        let elem: i64 = self.parse_type()?
+        self.expect_punct(close)?
+        if kind == TypeKind.Vector and not vector_allowed(n, elem)
+            return Err(unsupported_at(line, named("type", self.span_from(start))))
+        Ok(self.m.add_type(Type { kind: kind, width: n, elem: elem, first: 0, count: 0, packed: false, name: "" }))
+
+    # { T, T } with the cursor on the brace.
+    fn parse_struct_type(self: @&Parser, packed: bool) -> Result<i64, Fail>
+        self.pos += 1
+        var fields = vec_new<i64>()
+        if not self.at_punct("}")
+            fields.push(self.parse_type()?)
+            while self.eat_punct(",")
+                fields.push(self.parse_type()?)
+        self.expect_punct("}")?
+        let first: i64 = self.m.type_lists.len
+        for i in 0..fields.len
+            self.m.type_lists.push(fields.get(i))
+        Ok(self.m.add_type(Type { kind: TypeKind.Struct, width: 0, elem: -1, first: first, count: fields.len, packed: packed, name: "" }))
+
+    # Does `ty` hold a 256-bit vector, through structs, arrays and names?
+    fn has_wide_vector(self: @Parser, ty: i64) -> bool
+        let r: i64 = self.m.resolve(ty)
+        if r < 0
+            return false
+        let t: Type = self.m.types.get(r)
+        if t.kind == TypeKind.Vector
+            let e: Type = self.m.types.get(t.elem)
+            return t.width * e.width == 256
+        if t.kind == TypeKind.Array
+            return self.has_wide_vector(t.elem)
+        if t.kind == TypeKind.Struct
+            for i in 0..t.count
+                if self.has_wide_vector(self.m.type_lists.get(t.first + i))
+                    return true
+        false
+
+    # ----------------------------------------------------------------- values
+
+    fn add(self: @&Parser, v: Value) -> i64
+        self.m.add_value(v)
+
+    # A typed value: T v.
+    fn parse_typed_value(self: @&Parser) -> Result<i64, Fail>
+        let ty: i64 = self.parse_type()?
+        self.parse_value(ty)
+
+    # The value of type `ty` at the cursor.
+    fn parse_value(self: @&Parser, ty: i64) -> Result<i64, Fail>
+        let t: Token = self.tok()
+        let w: StrView = self.text(t)
+        if t.kind == Tok.Local
+            self.pos += 1
+            return Ok(self.add(value_new(ValueKind.Local, ty, w)))
+        if t.kind == Tok.Global
+            self.pos += 1
+            return Ok(self.add(value_new(ValueKind.Global, ty, w)))
+        if t.kind == Tok.Int
+            self.pos += 1
+            return Ok(self.add(value_new(ValueKind.Int, ty, w)))
+        if t.kind == Tok.Float
+            self.pos += 1
+            return Ok(self.add(value_new(ValueKind.Float, ty, w)))
+        if t.kind == Tok.CStr
+            self.pos += 1
+            return Ok(self.add(value_new(ValueKind.Bytes, ty, w)))
+        if t.kind == Tok.Punct
+            if w.eq("{")
+                return self.parse_aggregate(ValueKind.Struct, ty, "{", "}")
+            if w.eq("[")
+                return self.parse_aggregate(ValueKind.Array, ty, "[", "]")
+            if w.eq("<")
+                if self.tok_at(1).kind == Tok.Punct and self.text(self.tok_at(1)).eq("{")
+                    self.pos += 1
+                    let s: i64 = self.parse_aggregate(ValueKind.Struct, ty, "{", "}")?
+                    self.expect_punct(">")?
+                    return Ok(s)
+                return self.parse_aggregate(ValueKind.Vector, ty, "<", ">")
+        if t.kind != Tok.Word
+            return Err(self.fail_here("expected a constant"))
+        if w.eq("true") or w.eq("false")
+            self.pos += 1
+            return Ok(self.add(value_new(ValueKind.Int, ty, w)))
+        if w.eq("null")
+            self.pos += 1
+            return Ok(self.add(value_new(ValueKind.Null, ty, w)))
+        if w.eq("undef")
+            self.pos += 1
+            return Ok(self.add(value_new(ValueKind.Undef, ty, w)))
+        if w.eq("zeroinitializer")
+            self.pos += 1
+            return Ok(self.add(value_new(ValueKind.Zero, ty, w)))
+        if w.eq("getelementptr")
+            return self.parse_const_gep(ty)
+        if w.eq("ptrtoint")
+            return self.parse_const_ptrtoint(ty)
+        if is_value_word(w)
+            return Err(unsupported_at(t.line, named("constant", w)))
+        Err(malformed_at(t.line, "expected a constant"))
+
+    # The elements of a constant struct, array or vector, each typed.
+    fn parse_aggregate(self: @&Parser, kind: ValueKind, ty: i64, open: StrView, close: StrView) -> Result<i64, Fail>
+        self.expect_punct(open)?
+        var elems = vec_new<i64>()
+        if not self.at_punct(close)
+            elems.push(self.parse_typed_value()?)
+            while self.eat_punct(",")
+                elems.push(self.parse_typed_value()?)
+        self.expect_punct(close)?
+        var v = value_new(kind, ty, "")
+        v.first = self.m.value_lists.len
+        v.count = elems.len
+        for i in 0..elems.len
+            self.m.value_lists.push(elems.get(i))
+        Ok(self.add(v))
+
+    # getelementptr (S, ptr base, T idx, ...) in a constant.
+    fn parse_const_gep(self: @&Parser, ty: i64) -> Result<i64, Fail>
+        let line: i64 = self.line()
+        self.pos += 1
+        if self.at_word("inbounds")
+            return Err(unsupported_at(line, named("getelementptr", "inbounds")))
+        self.expect_punct("(")?
+        let src_ty: i64 = self.parse_type()?
+        var ops = vec_new<i64>()
+        while self.eat_punct(",")
+            ops.push(self.parse_typed_value()?)
+        self.expect_punct(")")?
+        var v = value_new(ValueKind.Gep, ty, "")
+        v.src_ty = src_ty
+        v.first = self.m.value_lists.len
+        v.count = ops.len
+        for i in 0..ops.len
+            self.m.value_lists.push(ops.get(i))
+        Ok(self.add(v))
+
+    # ptrtoint (T v to ty) in a constant: ritz1's sizeof and string addresses.
+    fn parse_const_ptrtoint(self: @&Parser, ty: i64) -> Result<i64, Fail>
+        self.pos += 1
+        self.expect_punct("(")?
+        let opnd: i64 = self.parse_typed_value()?
+        self.expect_word("to")?
+        let to: i64 = self.parse_type()?
+        self.expect_punct(")")?
+        var v = value_new(ValueKind.PtrToInt, ty, "")
+        v.src_ty = to
+        v.first = self.m.value_lists.len
+        v.count = 1
+        self.m.value_lists.push(opnd)
+        Ok(self.add(v))
+
+    # ------------------------------------------------------- param attributes
+
+    # sret(T) / byval(T) [align N] after a parameter's type; anything else
+    # LLVM allows there is outside the subset.
+    fn parse_param_attrs(self: @&Parser) -> Result<Param, Fail>
+        var p = Param { ty: -1, name: "", attr: ParamAttr.Plain, attr_ty: -1, attr_align: 0 }
+        while self.tok().kind == Tok.Word
+            let t: Token = self.tok()
+            let w: StrView = self.text(t)
+            if is_value_word(w)
+                break
+            self.pos += 1
+            if w.eq("sret") or w.eq("byval")
+                self.expect_punct("(")?
+                p.attr_ty = self.parse_type()?
+                self.expect_punct(")")?
+                if w.eq("sret")
+                    p.attr = ParamAttr.Sret
+                else
+                    p.attr = ParamAttr.Byval
+            else if w.eq("align") and p.attr == ParamAttr.Byval
+                p.attr_align = self.expect_int()?
+            else
+                return Err(unsupported_at(t.line, named("parameter attribute", w)))
+        Ok(p)
+
+    # ------------------------------------------------------------ the module
+
+    fn parse_module(self: @&Parser) -> Result<(), Fail>
+        while self.tok().kind != Tok.Eof
+            let t: Token = self.tok()
+            let w: StrView = self.text(t)
+            if t.kind == Tok.Word and w.eq("target")
+                self.parse_target()?
+            else if t.kind == Tok.Word and (w.eq("define") or w.eq("declare"))
+                self.parse_function()?
+            else if t.kind == Tok.Local
+                self.parse_named_type()?
+            else if t.kind == Tok.Global
+                self.parse_global()?
+            else if t.kind == Tok.Comdat
+                self.parse_comdat()?
+            else if t.kind == Tok.Meta
+                self.skip_metadata_line()
+            else if t.kind == Tok.Word
+                return Err(unsupported_at(t.line, named("", w)))
+            else
+                return Err(self.fail_here("unexpected token at top level"))
+        Ok(())
+
+    # A top-level metadata record: the rest of its line, and any brackets it
+    # leaves open.
+    fn skip_metadata_line(self: @&Parser)
+        let line: i64 = self.line()
+        var depth: i64 = 0
+        while self.tok().kind != Tok.Eof and (self.line() == line or depth > 0)
+            if self.at_punct("{") or self.at_punct("(")
+                depth += 1
+            else if self.at_punct("}") or self.at_punct(")")
+                depth -= 1
+            self.pos += 1
+
+    # A metadata attachment value after its !name: !0, or !{...}.
+    fn skip_metadata_value(self: @&Parser)
+        let t: Token = self.bump()
+        if t.kind == Tok.Meta and t.len == 1 and self.at_punct("{")
+            var depth: i64 = 0
+            while self.tok().kind != Tok.Eof
+                if self.at_punct("{")
+                    depth += 1
+                else if self.at_punct("}")
+                    depth -= 1
+                self.pos += 1
+                if depth == 0
+                    break
+
+    # `, !name !N` attachments after an instruction.
+    fn skip_attachments(self: @&Parser)
+        while self.at_punct(",") and self.tok_at(1).kind == Tok.Meta
+            self.pos += 2
+            self.skip_metadata_value()
+
+    fn parse_target(self: @&Parser) -> Result<(), Fail>
+        let line: i64 = self.line()
+        self.pos += 1
+        if self.eat_word("triple")
+            self.expect_punct("=")?
+            let s: Token = self.tok()
+            if s.kind != Tok.Str
+                return Err(self.fail_here("expected a string"))
+            self.pos += 1
+            self.m.triple = self.src.slice(s.start + 1, s.start + s.len - 1)
+            self.m.triple_line = line
+            return Ok(())
+        if self.eat_word("datalayout")
+            self.expect_punct("=")?
+            let s: Token = self.tok()
+            if s.kind != Tok.Str
+                return Err(self.fail_here("expected a string"))
+            self.pos += 1
+            let layout: StrView = self.src.slice(s.start + 1, s.start + s.len - 1)
+            if layout.len > 0
+                return Err(unsupported_at(line, named("target datalayout", layout)))
+            self.m.has_datalayout = true
+            return Ok(())
+        Err(self.fail_here("expected 'triple' or 'datalayout'"))
+
+    fn parse_comdat(self: @&Parser) -> Result<(), Fail>
+        let t: Token = self.bump()
+        self.expect_punct("=")?
+        self.expect_word("comdat")?
+        let kind: Token = self.tok()
+        if not self.eat_word("any")
+            return Err(unsupported_at(kind.line, named("comdat", self.text(kind))))
+        self.m.comdats.push(ComdatDef { name: self.text(t), line: t.line })
+        Ok(())
+
+    fn parse_named_type(self: @&Parser) -> Result<(), Fail>
+        let t: Token = self.bump()
+        self.expect_punct("=")?
+        self.expect_word("type")?
+        let at: Token = self.tok()
+        if at.kind == Tok.Word
+            return Err(unsupported_at(at.line, named("type", self.text(at))))
+        let body: i64 = self.parse_type()?
+        let bt: Type = self.m.types.get(body)
+        if bt.kind != TypeKind.Struct
+            return Err(malformed_at(at.line, "a named type must be a struct"))
+        self.m.named.push(NamedType { name: self.text(t), body: body, line: t.line })
+        Ok(())
+
+    # Linkage words; `external` only where `allow_external`.
+    fn parse_linkage(self: @&Parser) -> Result<Linkage, Fail>
+        let t: Token = self.tok()
+        let w: StrView = self.text(t)
+        if t.kind != Tok.Word
+            return Ok(Linkage.External)
+        if linkage_word(w)
+            return Err(unsupported_at(t.line, named("linkage", w)))
+        var l: Linkage = Linkage.External
+        if w.eq("internal")
+            l = Linkage.Internal
+        else if w.eq("private")
+            l = Linkage.Private
+        else if w.eq("weak")
+            l = Linkage.Weak
+        else if w.eq("weak_odr")
+            l = Linkage.WeakOdr
+        else if w.eq("linkonce_odr")
+            l = Linkage.LinkonceOdr
+        else if w.eq("available_externally")
+            l = Linkage.AvailableExternally
+        else
+            return Ok(Linkage.External)
+        self.pos += 1
+        Ok(l)
+
+    fn parse_global(self: @&Parser) -> Result<(), Fail>
+        let t: Token = self.bump()
+        let name: StrView = self.text(t)
+        self.expect_punct("=")?
+        let linkage: Linkage = self.parse_linkage()?
+        let external: bool = self.eat_word("external")
+        var unnamed: bool = false
+        if self.eat_word("unnamed_addr")
+            unnamed = true
+        var is_const: bool = false
+        if self.eat_word("constant")
+            is_const = true
+        else if not self.eat_word("global")
+            let w: Token = self.tok()
+            if w.kind == Tok.Word
+                return Err(unsupported_at(w.line, named("", self.text(w))))
+            return Err(self.fail_here("expected 'global' or 'constant'"))
+        let ty: i64 = self.parse_type()?
+        var init: i64 = -1
+        if not external
+            if self.tok().line != t.line and self.tok().kind != Tok.Punct
+                return Err(malformed_at(t.line, "expected a constant"))
+            init = self.parse_value(ty)?
+        var align: i64 = 0
+        while self.at_punct(",")
+            let k: Token = self.tok_at(1)
+            if k.kind == Tok.Meta
+                break
+            self.pos += 1
+            if self.eat_word("align")
+                align = self.expect_int()?
+            else if self.at_word("comdat")
+                return Err(unsupported_at(k.line, named("comdat on global", name)))
+            else if k.kind == Tok.Word
+                return Err(unsupported_at(k.line, named("global attribute", self.text(k))))
+            else
+                return Err(self.fail_here("unexpected token"))
+        self.skip_attachments()
+        self.m.globals.push(Global { line: t.line, name: name, linkage: linkage, is_const: is_const, unnamed_addr: unnamed, ty: ty, init: init, align: align })
+        Ok(())
+
+    # Words between the linkage and the return type.
+    fn reject_pre_type_words(self: @&Parser) -> Result<(), Fail>
+        while self.tok().kind == Tok.Word and not is_type_word(self.cur_text())
+            let t: Token = self.tok()
+            let w: StrView = self.text(t)
+            if calling_convention(w)
+                return Err(unsupported_at(t.line, named("calling convention", w)))
+            if return_attribute(w)
+                return Err(unsupported_at(t.line, named("return attribute", w)))
+            return Err(unsupported_at(t.line, named("", w)))
+        Ok(())
+
+    fn parse_function(self: @&Parser) -> Result<(), Fail>
+        let head: Token = self.bump()
+        let is_decl: bool = self.text(head).eq("declare")
+        let linkage: Linkage = self.parse_linkage()?
+        self.reject_pre_type_words()?
+        let ret_ty: i64 = self.parse_type()?
+        let nt: Token = self.tok()
+        if nt.kind != Tok.Global
+            return Err(self.fail_here("expected a function name"))
+        self.pos += 1
+        let name: StrView = self.text(nt)
+        if name.starts_with("@llvm.") and not intrinsic_allowed(name.skip(1))
+            return Err(unsupported_at(nt.line, named("intrinsic", name.skip(1))))
+        self.expect_punct("(")?
+        var params = vec_new<Param>()
+        var variadic: bool = false
+        while not self.at_punct(")")
+            if params.len > 0 or variadic
+                self.expect_punct(",")?
+            if self.tok().kind == Tok.Ellipsis
+                self.pos += 1
+                variadic = true
+                continue
+            let pty: i64 = self.parse_type()?
+            var p: Param = self.parse_param_attrs()?
+            p.ty = pty
+            if self.tok().kind == Tok.Local
+                p.name = self.cur_text()
+                self.pos += 1
+            params.push(p)
+        self.expect_punct(")")?
+        var f = Function { line: head.line, name: name, linkage: linkage, is_decl: is_decl, ret_ty: ret_ty, first_param: self.m.params.len, nparams: params.len, variadic: variadic, attrs: 0, features: "", comdat: false, first_block: 0, nblocks: 0 }
+        for i in 0..params.len
+            self.m.params.push(params.get(i))
+        self.parse_fn_attrs(@&f, head.line, is_decl)?
+        if variadic and not is_decl
+            return Err(unsupported_at(head.line, named("variadic definition", name)))
+        let local: bool = linkage == Linkage.Internal or linkage == Linkage.Private
+        if not local or is_decl
+            var wide: bool = self.has_wide_vector(ret_ty)
+            for i in 0..params.len
+                let pp: Param = params.get(i)
+                if self.has_wide_vector(pp.ty)
+                    wide = true
+            if wide
+                return Err(unsupported_at(head.line, named("256-bit vector in the signature of", name)))
+        if not is_decl
+            self.parse_body(@&f)?
+        self.m.funcs.push(f)
+        Ok(())
+
+    # Function attributes after the parameter list, through the `{` of a
+    # definition or the end of a declaration's line.
+    fn parse_fn_attrs(self: @&Parser, f: @&Function, line: i64, is_decl: bool) -> Result<(), Fail>
+        while true
+            let t: Token = self.tok()
+            if t.kind == Tok.Eof
+                break
+            if is_decl and t.line != self.toks.get(self.pos - 1).line
+                break
+            let w: StrView = self.text(t)
+            if t.kind == Tok.Punct and w.eq("{")
+                break
+            if t.kind == Tok.Meta
+                self.pos += 1
+                self.skip_metadata_value()
+                continue
+            if t.kind == Tok.Group
+                return Err(unsupported_at(t.line, named("attribute group", w)))
+            if t.kind == Tok.Str
+                self.parse_string_attr(f)?
+                continue
+            if t.kind != Tok.Word
+                return Err(self.fail_here("unexpected token after the parameters"))
+            self.pos += 1
+            if w.eq("alignstack")
+                let open: i64 = self.pos - 1
+                self.expect_punct("(")?
+                let n: i64 = self.expect_int()?
+                self.expect_punct(")")?
+                if n != 16
+                    return Err(unsupported_at(t.line, named("function attribute", self.span_from(open))))
+                f.attrs = f.attrs | FA_ALIGNSTACK16
+            else if w.eq("sspstrong")
+                f.attrs = f.attrs | FA_SSPSTRONG
+            else if w.eq("noredzone")
+                f.attrs = f.attrs | FA_NOREDZONE
+            else if w.eq("naked")
+                f.attrs = f.attrs | FA_NAKED
+            else if w.eq("cold")
+                f.attrs = f.attrs | FA_COLD
+            else if w.eq("noinline")
+                f.attrs = f.attrs | FA_NOINLINE
+            else if w.eq("inlinehint")
+                f.attrs = f.attrs | FA_INLINEHINT
+            else if w.eq("alwaysinline")
+                f.attrs = f.attrs | FA_ALWAYSINLINE
+            else if w.eq("noreturn")
+                f.attrs = f.attrs | FA_NORETURN
+            else if w.eq("nounwind")
+                f.attrs = f.attrs | FA_NOUNWIND
+            else if w.eq("comdat")
+                self.parse_fn_comdat(f, t.line)?
+            else
+                return Err(unsupported_at(t.line, named("function attribute", w)))
+        Ok(())
+
+    fn parse_string_attr(self: @&Parser, f: @&Function) -> Result<(), Fail>
+        let t: Token = self.bump()
+        let key: StrView = self.text(t)
+        if key.eq("\"no-builtins\"")
+            f.attrs = f.attrs | FA_NO_BUILTINS
+            return Ok(())
+        if not (key.eq("\"target-cpu\"") or key.eq("\"target-features\""))
+            return Err(unsupported_at(t.line, named("function attribute", key)))
+        self.expect_punct("=")?
+        let v: Token = self.tok()
+        if v.kind != Tok.Str
+            return Err(self.fail_here("expected a string"))
+        self.pos += 1
+        let val: StrView = self.src.slice(v.start + 1, v.start + v.len - 1)
+        if key.eq("\"target-cpu\"")
+            if not val.eq("x86-64")
+                return Err(unsupported_at(t.line, named("target-cpu", val)))
+            f.attrs = f.attrs | FA_TARGET_CPU
+            return Ok(())
+        var rest: StrView = val
+        while rest.len > 0
+            let comma: i64 = rest.find_byte(',')
+            let feat: StrView = rest.take(comma)
+            if not feature_allowed(feat)
+                return Err(unsupported_at(t.line, named("target-features", feat)))
+            rest = rest.skip(comma + 1)
+        f.features = val
+        Ok(())
+
+    # `comdat` or `comdat($name)`: a group of one, named for the function.
+    fn parse_fn_comdat(self: @&Parser, f: @&Function, line: i64) -> Result<(), Fail>
+        var cname: StrView = f.name.skip(1)
+        if self.eat_punct("(")
+            let c: Token = self.tok()
+            if c.kind != Tok.Comdat
+                return Err(self.fail_here("expected a comdat name"))
+            self.pos += 1
+            self.expect_punct(")")?
+            let given: StrView = self.text(c)
+            if not given.skip(1).eq(cname)
+                var what = named("comdat", given)
+                what.push_str(" on function '")
+                what.push_str(f.name)
+                what.push_str("'")
+                return Err(unsupported_at(line, what))
+        var declared: bool = false
+        for i in 0..self.m.comdats.len
+            let cd: ComdatDef = self.m.comdats.get(i)
+            if cd.name.skip(1).eq(cname)
+                declared = true
+        if not declared
+            return Err(malformed_at(line, "comdat has no $name = comdat any"))
+        for i in 0..self.comdats_used.len
+            if self.comdats_used.get(i).eq(cname)
+                return Err(malformed_at(line, "two functions share one comdat"))
+        self.comdats_used.push(cname)
+        f.comdat = true
+        Ok(())
+
+    # ----------------------------------------------------------------- bodies
+
+    fn parse_body(self: @&Parser, f: @&Function) -> Result<(), Fail>
+        self.expect_punct("{")?
+        f.first_block = self.m.blocks.len
+        while not self.at_punct("}")
+            if self.tok().kind == Tok.Eof
+                return Err(self.fail_here("expected '}'"))
+            var name: StrView = ""
+            if self.tok().kind == Tok.Label
+                name = self.cur_text()
+                self.pos += 1
+            let first: i64 = self.m.insts.len
+            while self.tok().kind != Tok.Label and not self.at_punct("}")
+                if self.tok().kind == Tok.Eof
+                    return Err(self.fail_here("expected '}'"))
+                self.parse_inst(f.name)?
+            self.m.blocks.push(Block { name: name, first: first, count: self.m.insts.len - first })
+        self.pos += 1
+        f.nblocks = self.m.blocks.len - f.first_block
+        Ok(())
+
+    fn push_inst(self: @&Parser, inst: Inst, ops: @Vec<i64>)
+        var i2 = inst
+        i2.first = self.m.value_lists.len
+        i2.count = ops.len
+        for i in 0..ops.len
+            self.m.value_lists.push(ops.get(i))
+        self.m.insts.push(i2)
+
+    fn ordering(self: @&Parser) -> Result<(), Fail>
+        let t: Token = self.tok()
+        let w: StrView = self.text(t)
+        if self.at_word("syncscope")
+            return Err(unsupported_at(t.line, string_from("syncscope")))
+        if t.kind == Tok.Word and ordering_word(w)
+            self.pos += 1
+            if not w.eq("seq_cst")
+                return Err(unsupported_at(t.line, named("ordering", w)))
+            return Ok(())
+        Err(self.fail_here("expected an ordering"))
+
+    fn reject_flags(self: @&Parser) -> Result<(), Fail>
+        let t: Token = self.tok()
+        let w: StrView = self.text(t)
+        if t.kind == Tok.Word and (int_flag(w) or fast_math_flag(w))
+            return Err(unsupported_at(t.line, named("flag", w)))
+        Ok(())
+
+    # `, align N` if present.
+    fn opt_align(self: @&Parser) -> Result<i64, Fail>
+        if self.at_punct(",") and self.tok_at(1).kind == Tok.Word and self.text(self.tok_at(1)).eq("align")
+            self.pos += 2
+            return self.expect_int()
+        Ok(0)
+
+    fn parse_inst(self: @&Parser, fname: StrView) -> Result<(), Fail>
+        let line: i64 = self.line()
+        var name: StrView = ""
+        if self.tok().kind == Tok.Local and self.tok_at(1).kind == Tok.Punct and self.text(self.tok_at(1)).eq("=")
+            name = self.cur_text()
+            self.pos += 2
+        let ot: Token = self.tok()
+        if ot.kind != Tok.Word
+            return Err(self.fail_here("expected an instruction"))
+        let w: StrView = self.text(ot)
+        self.pos += 1
+        var inst = Inst { op: Opcode.Ret, line: line, name: name, ty: -1, first: 0, count: 0, idx_first: 0, idx_count: 0, pred: "", align: 0, is_volatile: false, is_atomic: false }
+        var ops = vec_new<i64>()
+        if w.eq("ret")
+            if not self.eat_word("void")
+                ops.push(self.parse_typed_value()?)
+        else if w.eq("br")
+            inst.op = Opcode.Br
+            ops.push(self.parse_typed_value()?)
+            if self.eat_punct(",")
+                ops.push(self.parse_typed_value()?)
+                self.expect_punct(",")?
+                ops.push(self.parse_typed_value()?)
+        else if w.eq("unreachable")
+            inst.op = Opcode.Unreachable
+        else if w.eq("alloca")
+            inst.op = Opcode.Alloca
+            inst.ty = self.parse_type()?
+            inst.align = self.opt_align()?
+        else if w.eq("load")
+            inst.op = Opcode.Load
+            inst.is_atomic = self.eat_word("atomic")
+            inst.is_volatile = self.eat_word("volatile")
+            inst.ty = self.parse_type()?
+            self.expect_punct(",")?
+            ops.push(self.parse_typed_value()?)
+            self.atomic_tail(@&inst, line)?
+        else if w.eq("store")
+            inst.op = Opcode.Store
+            inst.is_atomic = self.eat_word("atomic")
+            inst.is_volatile = self.eat_word("volatile")
+            ops.push(self.parse_typed_value()?)
+            self.expect_punct(",")?
+            ops.push(self.parse_typed_value()?)
+            self.atomic_tail(@&inst, line)?
+        else if w.eq("getelementptr")
+            inst.op = Opcode.Gep
+            if self.at_word("inbounds") or self.at_word("nuw") or self.at_word("nusw")
+                return Err(unsupported_at(line, named("getelementptr", self.cur_text())))
+            inst.ty = self.parse_type()?
+            while self.at_punct(",") and self.tok_at(1).kind != Tok.Meta
+                self.pos += 1
+                ops.push(self.parse_typed_value()?)
+        else if w.eq("cmpxchg")
+            inst.op = Opcode.Cmpxchg
+            if self.at_word("weak") or self.at_word("volatile")
+                return Err(unsupported_at(line, named("cmpxchg", self.cur_text())))
+            ops.push(self.parse_typed_value()?)
+            self.expect_punct(",")?
+            ops.push(self.parse_typed_value()?)
+            self.expect_punct(",")?
+            ops.push(self.parse_typed_value()?)
+            self.ordering()?
+            self.ordering()?
+            inst.align = self.opt_align()?
+        else if w.eq("atomicrmw")
+            inst.op = Opcode.AtomicRmw
+            let opt: Token = self.tok()
+            if self.at_word("volatile") or opt.kind != Tok.Word or not atomicrmw_op(self.text(opt))
+                return Err(unsupported_at(line, named("atomicrmw", self.text(opt))))
+            inst.pred = self.text(opt)
+            self.pos += 1
+            ops.push(self.parse_typed_value()?)
+            self.expect_punct(",")?
+            ops.push(self.parse_typed_value()?)
+            self.ordering()?
+            inst.align = self.opt_align()?
+        else if w.eq("fence")
+            inst.op = Opcode.Fence
+            self.ordering()?
+        else if w.eq("icmp") or w.eq("fcmp")
+            inst.op = Opcode.ICmp
+            if w.eq("fcmp")
+                inst.op = Opcode.FCmp
+            self.reject_flags()?
+            let pt: Token = self.tok()
+            let pw: StrView = self.text(pt)
+            let ok: bool = pt.kind == Tok.Word and ((inst.op == Opcode.ICmp and icmp_predicate(pw)) or (inst.op == Opcode.FCmp and fcmp_predicate(pw)))
+            if not ok
+                return Err(self.fail_here("expected a comparison predicate"))
+            self.pos += 1
+            inst.pred = pw
+            self.binary_operands(@&ops)?
+        else if w.eq("fneg")
+            inst.op = Opcode.FNeg
+            self.reject_flags()?
+            ops.push(self.parse_typed_value()?)
+        else if self.binary_opcode(w, @&inst)
+            self.reject_flags()?
+            self.binary_operands(@&ops)?
+        else if self.cast_opcode(w, @&inst)
+            self.reject_flags()?
+            ops.push(self.parse_typed_value()?)
+            self.expect_word("to")?
+            inst.ty = self.parse_type()?
+        else if w.eq("extractvalue") or w.eq("insertvalue")
+            inst.op = Opcode.ExtractValue
+            ops.push(self.parse_typed_value()?)
+            if w.eq("insertvalue")
+                inst.op = Opcode.InsertValue
+                self.expect_punct(",")?
+                ops.push(self.parse_typed_value()?)
+            inst.idx_first = self.m.ints.len
+            while self.at_punct(",") and self.tok_at(1).kind == Tok.Int
+                self.pos += 1
+                self.m.ints.push(self.expect_int()?)
+            inst.idx_count = self.m.ints.len - inst.idx_first
+            if inst.idx_count == 0
+                return Err(self.fail_here("expected an index"))
+        else if w.eq("extractelement") or w.eq("insertelement") or w.eq("shufflevector") or w.eq("select")
+            inst.op = Opcode.ExtractElement
+            var n: i64 = 3
+            if w.eq("extractelement")
+                n = 2
+            else if w.eq("insertelement")
+                inst.op = Opcode.InsertElement
+            else if w.eq("shufflevector")
+                inst.op = Opcode.ShuffleVector
+            else
+                inst.op = Opcode.Select
+                self.reject_flags()?
+            ops.push(self.parse_typed_value()?)
+            for k in 1..n
+                self.expect_punct(",")?
+                ops.push(self.parse_typed_value()?)
+        else if w.eq("phi")
+            inst.op = Opcode.Phi
+            self.reject_flags()?
+            inst.ty = self.parse_type()?
+            var more: bool = true
+            while more
+                self.expect_punct("[")?
+                ops.push(self.parse_value(inst.ty)?)
+                self.expect_punct(",")?
+                ops.push(self.parse_value(TY_LABEL)?)
+                self.expect_punct("]")?
+                more = self.at_punct(",") and self.tok_at(1).kind == Tok.Punct
+                if more
+                    self.pos += 1
+        else if w.eq("call") or w.eq("tail") or w.eq("musttail") or w.eq("notail")
+            if not w.eq("call")
+                return Err(unsupported_at(line, named("call marker", w)))
+            inst.op = Opcode.Call
+            self.parse_call(@&inst, @&ops)?
+        else
+            return Err(unsupported_at(line, named("instruction", w)))
+        self.skip_attachments()
+        self.push_inst(inst, @ops)
+        Ok(())
+
+    # The tail of load/store: an ordering for atomics, then `, align N`
+    # (required on an atomic).
+    fn atomic_tail(self: @&Parser, inst: @&Inst, line: i64) -> Result<(), Fail>
+        if inst.is_atomic
+            self.ordering()?
+        inst.align = self.opt_align()?
+        if inst.is_atomic and inst.align == 0
+            var what: StrView = "atomic store without an alignment"
+            if inst.op == Opcode.Load
+                what = "atomic load without an alignment"
+            return Err(unsupported_at(line, string_from(what)))
+        Ok(())
+
+    # T a, b
+    fn binary_operands(self: @&Parser, ops: @&Vec<i64>) -> Result<(), Fail>
+        let ty: i64 = self.parse_type()?
+        ops.push(self.parse_value(ty)?)
+        self.expect_punct(",")?
+        ops.push(self.parse_value(ty)?)
+        Ok(())
+
+    fn binary_opcode(self: @Parser, w: StrView, inst: @&Inst) -> bool
+        if w.eq("add")
+            inst.op = Opcode.Add
+        else if w.eq("sub")
+            inst.op = Opcode.Sub
+        else if w.eq("mul")
+            inst.op = Opcode.Mul
+        else if w.eq("udiv")
+            inst.op = Opcode.UDiv
+        else if w.eq("sdiv")
+            inst.op = Opcode.SDiv
+        else if w.eq("urem")
+            inst.op = Opcode.URem
+        else if w.eq("srem")
+            inst.op = Opcode.SRem
+        else if w.eq("shl")
+            inst.op = Opcode.Shl
+        else if w.eq("lshr")
+            inst.op = Opcode.LShr
+        else if w.eq("ashr")
+            inst.op = Opcode.AShr
+        else if w.eq("and")
+            inst.op = Opcode.And
+        else if w.eq("or")
+            inst.op = Opcode.Or
+        else if w.eq("xor")
+            inst.op = Opcode.Xor
+        else if w.eq("fadd")
+            inst.op = Opcode.FAdd
+        else if w.eq("fsub")
+            inst.op = Opcode.FSub
+        else if w.eq("fmul")
+            inst.op = Opcode.FMul
+        else if w.eq("fdiv")
+            inst.op = Opcode.FDiv
+        else
+            return false
+        true
+
+    fn cast_opcode(self: @Parser, w: StrView, inst: @&Inst) -> bool
+        if w.eq("trunc")
+            inst.op = Opcode.Trunc
+        else if w.eq("zext")
+            inst.op = Opcode.ZExt
+        else if w.eq("sext")
+            inst.op = Opcode.SExt
+        else if w.eq("fptrunc")
+            inst.op = Opcode.FPTrunc
+        else if w.eq("fpext")
+            inst.op = Opcode.FPExt
+        else if w.eq("sitofp")
+            inst.op = Opcode.SIToFP
+        else if w.eq("uitofp")
+            inst.op = Opcode.UIToFP
+        else if w.eq("fptosi")
+            inst.op = Opcode.FPToSI
+        else if w.eq("bitcast")
+            inst.op = Opcode.Bitcast
+        else if w.eq("inttoptr")
+            inst.op = Opcode.IntToPtr
+        else if w.eq("ptrtoint")
+            inst.op = Opcode.PtrToInt
+        else
+            return false
+        true
+
+    # call [T | T (params)] callee(args). ops[0] is the callee; inst.ty the
+    # return type, or a Func type when the call names one.
+    fn parse_call(self: @&Parser, inst: @&Inst, ops: @&Vec<i64>) -> Result<(), Fail>
+        let line: i64 = inst.line
+        self.reject_flags()?
+        self.reject_pre_type_words()?
+        let ret_ty: i64 = self.parse_type()?
+        inst.ty = ret_ty
+        if self.at_punct("(")
+            inst.ty = self.parse_fn_type(ret_ty)?
+        var indirect: bool = false
+        if self.eat_word("asm")
+            ops.push(self.parse_inline_asm(line)?)
+        else
+            let c: Token = self.tok()
+            if c.kind == Tok.Local or (c.kind == Tok.Word and self.text(c).eq("null"))
+                indirect = true
+            let callee: StrView = self.text(c)
+            if c.kind == Tok.Global and callee.starts_with("@llvm.") and not intrinsic_allowed(callee.skip(1))
+                return Err(unsupported_at(line, named("intrinsic", callee.skip(1))))
+            ops.push(self.parse_value(TY_PTR)?)
+        self.expect_punct("(")?
+        var wide: bool = self.has_wide_vector(ret_ty)
+        while not self.at_punct(")")
+            if ops.len > 1
+                self.expect_punct(",")?
+            let aty: i64 = self.parse_type()?
+            let p: Param = self.parse_param_attrs()?
+            let vid: i64 = self.parse_value(aty)?
+            var v: Value = self.m.values.get(vid)
+            v.attr = p.attr
+            v.attr_ty = p.attr_ty
+            v.attr_align = p.attr_align
+            self.m.values.set(vid, v)
+            if self.has_wide_vector(aty)
+                wide = true
+            ops.push(vid)
+        self.expect_punct(")")?
+        if indirect and wide
+            return Err(unsupported_at(line, string_from("256-bit vector in an indirect call")))
+        let t: Token = self.tok()
+        if t.line == line and (t.kind == Tok.Word or t.kind == Tok.Group or t.kind == Tok.Str)
+            return Err(unsupported_at(line, named("call-site attribute", self.text(t))))
+        Ok(())
+
+    # `(T, T, ...)` after a call's return type.
+    fn parse_fn_type(self: @&Parser, ret_ty: i64) -> Result<i64, Fail>
+        self.pos += 1
+        var params = vec_new<i64>()
+        var variadic: bool = false
+        while not self.at_punct(")")
+            if params.len > 0 or variadic
+                self.expect_punct(",")?
+            if self.tok().kind == Tok.Ellipsis
+                self.pos += 1
+                variadic = true
+            else
+                params.push(self.parse_type()?)
+        self.expect_punct(")")?
+        let first: i64 = self.m.type_lists.len
+        for i in 0..params.len
+            self.m.type_lists.push(params.get(i))
+        Ok(self.m.add_type(Type { kind: TypeKind.Func, width: 0, elem: ret_ty, first: first, count: params.len, packed: variadic, name: "" }))
+
+    # asm sideeffect "template", "constraints", after the `asm` word.
+    fn parse_inline_asm(self: @&Parser, line: i64) -> Result<i64, Fail>
+        if not self.eat_word("sideeffect")
+            let t: Token = self.tok()
+            if t.kind == Tok.Word
+                return Err(unsupported_at(line, named("inline asm", self.text(t))))
+            return Err(unsupported_at(line, string_from("inline asm without 'sideeffect'")))
+        let t: Token = self.tok()
+        if t.kind == Tok.Word
+            return Err(unsupported_at(line, named("inline asm", self.text(t))))
+        if t.kind != Tok.Str
+            return Err(self.fail_here("expected an asm template"))
+        self.pos += 1
+        self.expect_punct(",")?
+        let c: Token = self.tok()
+        if c.kind != Tok.Str
+            return Err(self.fail_here("expected asm constraints"))
+        self.pos += 1
+        var v = value_new(ValueKind.Asm, -1, self.text(t))
+        v.text2 = self.text(c)
+        Ok(self.add(v))
+
+# Parse a whole file.
+pub fn parse(src: StrView) -> Result<Module, Fail>
+    var p = Parser { src: src, toks: lex(src), pos: 0, m: module_new(), comdats_used: vec_new<StrView>() }
+    p.parse_module()?
+    for i in 0..p.m.types.len
+        let t: Type = p.m.types.get(i)
+        if t.kind == TypeKind.Named and p.m.resolve(i) < 0
+            return Err(malformed_at(0, "a named type has no definition"))
+    Ok(p.m)

@@ -1,0 +1,268 @@
+# ir: the parsed module. Types, values, instructions, blocks, params and
+# functions live in flat tables on Module and refer to each other by index;
+# names and literals are spans of the source text.
+import ritzlib.strview { StrView }
+import ritzlib.gvec { Vec, vec_new }
+
+pub enum TypeKind
+    Void
+    Int         # width: the bit count
+    Float
+    Double
+    Ptr         # ptr, or one of the typed-pointer spellings
+    Array       # [width x elem]
+    Vector      # <width x elem>
+    Struct      # literal { fields }; packed: <{ fields }>
+    Named       # %Name; name is the token text
+    Label
+    Func        # an explicit call type: ret (params[, ...])
+
+pub struct Type
+    kind: TypeKind
+    width: i64      # Int bits; Array/Vector length
+    elem: i64       # Array/Vector element; Func return type
+    first: i64      # Struct fields / Func params in Module.type_lists
+    count: i64
+    packed: bool    # Struct only; Func: variadic
+    name: StrView   # Named only
+
+# Fixed type ids, made first by module_new.
+pub const TY_VOID: i64 = 0
+pub const TY_I1: i64 = 1
+pub const TY_I8: i64 = 2
+pub const TY_I16: i64 = 3
+pub const TY_I32: i64 = 4
+pub const TY_I64: i64 = 5
+pub const TY_FLOAT: i64 = 6
+pub const TY_DOUBLE: i64 = 7
+pub const TY_PTR: i64 = 8
+pub const TY_LABEL: i64 = 9
+
+pub struct NamedType
+    name: StrView   # %Name
+    body: i64       # a Struct type
+    line: i64
+
+pub enum ValueKind
+    Local       # text: %name
+    Global      # text: @name
+    Int         # text: the literal; also true/false
+    Float       # text: the literal as written
+    Null
+    Undef
+    Zero        # zeroinitializer
+    Bytes       # text: c"..."
+    Struct      # elements in Module.value_lists
+    Array
+    Vector
+    Gep         # constant getelementptr: src_ty, then base and indices
+    PtrToInt    # constant ptrtoint (T v to ty): the operand in Module.value_lists
+    Asm         # text: template; text2: constraints
+
+pub enum ParamAttr
+    Plain
+    Sret
+    Byval
+
+pub struct Value
+    kind: ValueKind
+    ty: i64         # the type written before it (-1 where none is written)
+    text: StrView
+    text2: StrView
+    first: i64      # elements / Gep operands in Module.value_lists
+    count: i64
+    src_ty: i64     # Gep source element type; PtrToInt destination type
+    attr: ParamAttr # a call argument's sret/byval
+    attr_ty: i64
+    attr_align: i64 # 0: none written
+
+pub enum Opcode
+    Ret
+    Br
+    Unreachable
+    Alloca
+    Load
+    Store
+    Gep
+    Cmpxchg
+    AtomicRmw
+    Fence
+    Add
+    Sub
+    Mul
+    UDiv
+    SDiv
+    URem
+    SRem
+    Shl
+    LShr
+    AShr
+    And
+    Or
+    Xor
+    FNeg
+    FAdd
+    FSub
+    FMul
+    FDiv
+    ICmp
+    FCmp
+    Trunc
+    ZExt
+    SExt
+    FPTrunc
+    FPExt
+    SIToFP
+    UIToFP
+    FPToSI
+    Bitcast
+    IntToPtr
+    PtrToInt
+    ExtractValue
+    InsertValue
+    ExtractElement
+    InsertElement
+    ShuffleVector
+    Select
+    Phi
+    Call
+
+# One instruction. `ty` is the type the opcode names first: alloca's and
+# load's type, getelementptr's source type, a cast's destination, phi's and
+# call's result type; -1 where the opcode has none. Operands are value ids.
+pub struct Inst
+    op: Opcode
+    line: i64
+    name: StrView       # %result, or empty
+    ty: i64
+    first: i64          # operands in Module.value_lists
+    count: i64
+    idx_first: i64      # extractvalue/insertvalue indices in Module.ints
+    idx_count: i64
+    pred: StrView       # icmp/fcmp predicate, atomicrmw operation
+    align: i64          # 0: none written
+    is_volatile: bool
+    is_atomic: bool     # load atomic / store atomic
+
+pub struct Block
+    name: StrView
+    first: i64          # instructions in Module.insts
+    count: i64
+
+pub struct Param
+    ty: i64
+    name: StrView       # %name, or empty in a declare
+    attr: ParamAttr
+    attr_ty: i64
+    attr_align: i64
+
+pub enum Linkage
+    External
+    Internal
+    Private
+    Weak
+    WeakOdr
+    LinkonceOdr
+    AvailableExternally
+
+# Function attribute bits, in the order the printer writes them.
+pub const FA_ALIGNSTACK16: i64 = 1
+pub const FA_NO_BUILTINS: i64 = 2
+pub const FA_SSPSTRONG: i64 = 4
+pub const FA_NOREDZONE: i64 = 8
+pub const FA_NAKED: i64 = 16
+pub const FA_COLD: i64 = 32
+pub const FA_NOINLINE: i64 = 64
+pub const FA_INLINEHINT: i64 = 128
+pub const FA_ALWAYSINLINE: i64 = 256
+pub const FA_NORETURN: i64 = 512
+pub const FA_NOUNWIND: i64 = 1024
+pub const FA_TARGET_CPU: i64 = 2048     # "target-cpu"="x86-64"
+
+pub struct Function
+    line: i64
+    name: StrView       # @name
+    linkage: Linkage
+    is_decl: bool
+    ret_ty: i64
+    first_param: i64    # in Module.params
+    nparams: i64
+    variadic: bool
+    attrs: i64          # FA_* bits
+    features: StrView   # the "target-features" value without quotes, or empty
+    comdat: bool        # `comdat` (the function's own name)
+    first_block: i64    # in Module.blocks
+    nblocks: i64
+
+pub struct Global
+    line: i64
+    name: StrView
+    linkage: Linkage
+    is_const: bool
+    unnamed_addr: bool
+    ty: i64
+    init: i64           # value id; -1 for an external declaration
+    align: i64          # 0: none written
+
+pub struct ComdatDef
+    name: StrView       # $name
+    line: i64
+
+pub struct Module
+    triple: StrView     # without quotes; empty when absent
+    triple_line: i64
+    has_datalayout: bool
+    types: Vec<Type>
+    type_lists: Vec<i64>
+    named: Vec<NamedType>
+    values: Vec<Value>
+    value_lists: Vec<i64>
+    ints: Vec<i64>
+    insts: Vec<Inst>
+    blocks: Vec<Block>
+    params: Vec<Param>
+    funcs: Vec<Function>
+    globals: Vec<Global>
+    comdats: Vec<ComdatDef>
+
+fn simple(kind: TypeKind, width: i64) -> Type
+    Type { kind: kind, width: width, elem: -1, first: 0, count: 0, packed: false, name: "" }
+
+pub fn module_new() -> Module
+    var m = Module { triple: "", triple_line: 0, has_datalayout: false, types: vec_new<Type>(), type_lists: vec_new<i64>(), named: vec_new<NamedType>(), values: vec_new<Value>(), value_lists: vec_new<i64>(), ints: vec_new<i64>(), insts: vec_new<Inst>(), blocks: vec_new<Block>(), params: vec_new<Param>(), funcs: vec_new<Function>(), globals: vec_new<Global>(), comdats: vec_new<ComdatDef>() }
+    m.types.push(simple(TypeKind.Void, 0))
+    m.types.push(simple(TypeKind.Int, 1))
+    m.types.push(simple(TypeKind.Int, 8))
+    m.types.push(simple(TypeKind.Int, 16))
+    m.types.push(simple(TypeKind.Int, 32))
+    m.types.push(simple(TypeKind.Int, 64))
+    m.types.push(simple(TypeKind.Float, 0))
+    m.types.push(simple(TypeKind.Double, 0))
+    m.types.push(simple(TypeKind.Ptr, 0))
+    m.types.push(simple(TypeKind.Label, 0))
+    m
+
+impl Module
+    # A new type; its id.
+    pub fn add_type(self: @&Module, t: Type) -> i64
+        self.types.push(t)
+        self.types.len - 1
+
+    pub fn add_value(self: @&Module, v: Value) -> i64
+        self.values.push(v)
+        self.values.len - 1
+
+    # The struct body a type stands for: a Named type's definition, else the
+    # type itself; -1 for a Named type with no definition.
+    pub fn resolve(self: @Module, ty: i64) -> i64
+        let t: Type = self.types.get(ty)
+        if t.kind != TypeKind.Named
+            return ty
+        for i in 0..self.named.len
+            let n: NamedType = self.named.get(i)
+            if n.name.eq(t.name)
+                return n.body
+        -1
+
+pub fn value_new(kind: ValueKind, ty: i64, text: StrView) -> Value
+    Value { kind: kind, ty: ty, text: text, text2: "", first: 0, count: 0, src_ty: -1, attr: ParamAttr.Plain, attr_ty: -1, attr_align: 0 }

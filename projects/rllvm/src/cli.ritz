@@ -1,0 +1,116 @@
+# cli: rllvm's argv contract (DESIGN.md "What rllvm replaces") and how a
+# failure is reported. The argv is clang's for the same compile, so swapping
+# the program in the pipeline changes only its name.
+import ritzlib.fmt
+import ritzlib.span { Span }
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_from }
+import rllvm.parse { Fail, FailKind }
+
+pub const EXIT_FAILED: i32 = 1
+pub const EXIT_UNSUPPORTED: i32 = 2
+
+pub enum CodeModel
+    Small
+    Kernel
+    Large
+
+pub struct Options
+    help: bool
+    input: StrView
+    output: String      # -o, else the input with .o for .ll
+    pic: bool
+    model: CodeModel
+    target: StrView     # --target=, empty when absent
+
+pub struct CliError
+    message: String
+
+fn cli_error(msg: StrView) -> CliError
+    CliError { message: string_from(msg) }
+
+fn cli_error_quoted(prefix: StrView, word: StrView) -> CliError
+    var s = string_from(prefix)
+    s.push_str(" '")
+    s.push_str(word)
+    s.push_str("'")
+    CliError { message: s }
+
+# Flags clang takes that change nothing on .ll input (DESIGN.md's table).
+fn ignored_flag(a: StrView) -> bool
+    if a.eq("-O0") or a.eq("-O1") or a.eq("-O2") or a.eq("-O3") or a.eq("-Os") or a.eq("-Oz")
+        return true
+    a.eq("-ffreestanding") or a.eq("-fno-builtin") or a.eq("-mno-red-zone") or a.eq("-march=native") or a.eq("-msha") or a.eq("-maes") or a.eq("-mpclmul") or a.eq("-g")
+
+fn default_output(input: StrView) -> String
+    var stem: StrView = input
+    if input.ends_with(".ll")
+        stem = input.take(input.len - 3)
+    var s = string_from(stem)
+    s.push_str(".o")
+    s
+
+pub fn parse_args(args: Span<StrView>) -> Result<Options, CliError>
+    var o = Options { help: false, input: "", output: string_from(""), pic: false, model: CodeModel.Small, target: "" }
+    var compile: bool = false
+    var out_given: bool = false
+    var i: i64 = 1
+    while i < args.len
+        let a: StrView = args[i]
+        if a.eq("--help") or a.eq("-h")
+            o.help = true
+            return Ok(o)
+        else if a.eq("-c")
+            compile = true
+        else if a.eq("-o")
+            if i + 1 >= args.len
+                return Err(cli_error("-o needs a path"))
+            i += 1
+            o.output = string_from(args[i])
+            out_given = true
+        else if a.eq("-fPIC")
+            o.pic = true
+        else if a.starts_with("-mcmodel=")
+            let model: StrView = a.skip(9)
+            if model.eq("small")
+                o.model = CodeModel.Small
+            else if model.eq("kernel")
+                o.model = CodeModel.Kernel
+            else if model.eq("large")
+                o.model = CodeModel.Large
+            else
+                return Err(cli_error_quoted("unknown code model", model))
+        else if a.starts_with("--target=")
+            o.target = a.skip(9)
+        else if ignored_flag(a)
+            i += 1
+            continue
+        else if a.starts_with("-")
+            return Err(cli_error_quoted("unknown option", a))
+        else if o.input.len > 0
+            return Err(cli_error("more than one input file"))
+        else
+            o.input = a
+        i += 1
+    if not compile
+        return Err(cli_error("-c is required: rllvm writes one relocatable object"))
+    if o.input.len == 0
+        return Err(cli_error("no input file"))
+    if o.pic and o.model == CodeModel.Large
+        return Err(cli_error("-mcmodel=large with -fPIC is not supported"))
+    if not out_given
+        o.output = default_output(o.input)
+    Ok(o)
+
+# `prog: FILE:LINE: unsupported: WHAT` (exit 2) or `prog: FILE:LINE: error:
+# WHAT` (exit 1).
+pub fn report(prog: StrView, input: StrView, f: @Fail) -> i32
+    let what: StrView = f.what.as_view()
+    let line: i64 = f.line
+    match f.kind
+        FailKind.Unsupported =>
+            eprint("{prog}: {input}:{line}: unsupported: {what}\n")
+            EXIT_UNSUPPORTED
+        FailKind.Malformed =>
+            eprint("{prog}: {input}:{line}: error: {what}\n")
+            EXIT_FAILED
