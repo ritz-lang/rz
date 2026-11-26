@@ -112,6 +112,14 @@
 # the kernel spawns /bin/netd, tries one DHCPRELEASE and hands it the
 # seat ("[net] seat -> netd pid P"); netd runs DHCP itself and logs
 # "[netd] configured A" after that line. The pc run spawns no netd.
+# Then netd's death and restart (AGAST #4745): this ESP carries the
+# \harland\netd-restart marker, so before init pid 1 kills each netd after
+# its lease. Each death leaves NetAddr NoDev and the driver detached; the
+# kernel restarts netd 250 ms, 500 ms and 1 s after the first three, each
+# replacement's frame object reaching the driver as ATTACH and the
+# replacement reaching configured again; the fourth spends the budget and
+# NetAddr stays NoDev ("[net-restart] ..." and "[net] netd restart ..."
+# lines). init's net-tool checks then see no service.
 # The pc run keeps the in-kernel driver and every check it had.
 #
 # The NIC uses QEMU's user-mode network (slirp): its built-in DHCP server
@@ -196,6 +204,9 @@ cp "$KERNEL_ELF" "$WORK/esp/harland/kernel.elf"
 # other boot script leaves it out, so a misbehaving NIC can't keep rzsh from
 # starting there; here the NIC coverage below runs.
 : > "$WORK/esp/harland/net-selftest"
+# And the netd restart test (AGAST #4745): a no-op on the pc boot, which
+# spawns no netd.
+: > "$WORK/esp/harland/netd-restart"
 # The NVMe disk (16 MiB, 32768 sectors): sector N holds the pattern
 # test_nvme_boot.sh uses, ("LBA" + N as u32 LE + "!") * 64. Prints the
 # FNV-1a (32-bit) of sectors 32568-32767, the bytes the kernel reads under
@@ -394,6 +405,77 @@ seat_checks() {
     fi
 }
 
+# restart_checks SERIAL: netd's death and restart on the translating boot
+# (AGAST #4745, docs/RING2_NET.md "Frame seat", "Service binary and
+# respawn"). Pid 1 killed netd four times, each after its lease, and saw
+# NetAddr NoDev after each death; the driver detached each frame object and
+# mapped each of the three replacements; restart N came after its backoff
+# (250 ms, 500 ms, 1 s) and its netd logged a lease before the next kill;
+# the kernel logged the spent budget and NetAddr stayed NoDev. Sets rc=1 on
+# any failure.
+restart_checks() {
+    local SERIAL="$1" kills nodev attaches detaches n ms line next_kill lease
+    if grep -aqF "[net-restart] FAIL" "$SERIAL"; then
+        grep -aF "[net-restart] FAIL" "$SERIAL" | head -3
+        echo "FAIL: the netd restart test reported [net-restart] FAIL"
+        rc=1
+    fi
+    kills=$(grep -acF "[net-restart] killing netd pid" "$SERIAL")
+    if [ "$kills" != 4 ]; then
+        echo "FAIL: pid 1 killed netd $kills times, not 4 (the first netd and three restarts)"
+        rc=1
+        return
+    fi
+    nodev=$(grep -acE "\[net-restart\] NetAddr NoDev after netd pid [0-9]+ died" "$SERIAL")
+    if [ "$nodev" = 4 ]; then
+        echo "PASS: NetAddr answered NoDev after each of netd's 4 deaths"
+    else
+        echo "FAIL: NetAddr answered NoDev after $nodev of netd's 4 deaths"
+        rc=1
+    fi
+    detaches=$(grep -acF "[virtio-net] PEER_CLOSE: frame object detached" "$SERIAL")
+    attaches=$(grep -acF "[virtio-net] ATTACH: frame object mapped, both indexes at 0" "$SERIAL")
+    if [ "$detaches" = 4 ] && [ "$attaches" = 3 ]; then
+        echo "PASS: the driver detached 4 times and mapped 3 replacement frame objects"
+    else
+        [ "$detaches" != 4 ] && echo "FAIL: the driver detached $detaches times, not 4 (PEER_CLOSE on each netd's frame object)"
+        [ "$attaches" != 3 ] && echo "FAIL: the driver mapped $attaches replacement frame objects, not 3 (ATTACH)"
+        rc=1
+    fi
+    for n in 1 2 3; do
+        ms=$((250 << (n - 1)))
+        if ! grep -aqF "[net] netd restart $n of 3 in $ms ms" "$SERIAL"; then
+            echo "FAIL: no \"[net] netd restart $n of 3 in $ms ms\" (the backoff before restart $n)"
+            rc=1
+            continue
+        fi
+        line=$(grep -anE "\[net\] netd restart $n: pid [0-9]+" "$SERIAL" | head -1 | cut -d: -f1)
+        if [ -z "$line" ]; then
+            echo "FAIL: netd restart $n was not set up (no \"[net] netd restart $n: pid P\")"
+            rc=1
+            continue
+        fi
+        # Its lease, before pid 1 kills it
+        next_kill=$(tail -n +"$line" "$SERIAL" | grep -anF "[net-restart] killing netd pid" | head -1 | cut -d: -f1)
+        lease=$(tail -n +"$line" "$SERIAL" | grep -anE "\[netd\] configured [0-9.]+" | head -1 | cut -d: -f1)
+        if [ -n "$lease" ] && { [ -z "$next_kill" ] || [ "$lease" -lt "$next_kill" ]; }; then
+            echo "PASS: netd restart $n after $ms ms reached configured again"
+        else
+            echo "FAIL: netd restart $n did not reach configured ([netd] configured A) before it was killed"
+            rc=1
+        fi
+    done
+    if ! grep -aqF "[net] netd restart budget spent: NetAddr stays NoDev until reboot" "$SERIAL"; then
+        echo "FAIL: the kernel did not log the spent restart budget after the fourth death"
+        rc=1
+    elif ! grep -aqF "[net-restart] NetAddr still NoDev 2000 ms after the budget was spent" "$SERIAL"; then
+        echo "FAIL: NetAddr did not stay NoDev once the restart budget was spent"
+        rc=1
+    else
+        echo "PASS: the restart budget was spent and NetAddr stayed NoDev"
+    fi
+}
+
 # check NAME SERIAL: the verdicts for one boot; sets rc=1 on any failure.
 check() {
     local name="$1" SERIAL="$2"
@@ -585,6 +667,10 @@ check() {
             echo "FAIL: the pc machine handed the frame seat to netd: an untranslated boot spawns none"
             rc=1
         fi
+        if grep -aqE "\[net-restart\]|\[net\] netd " "$SERIAL"; then
+            echo "FAIL: the pc machine ran the netd restart test: an untranslated boot has no netd"
+            rc=1
+        fi
         # No IOMMU on pc: nothing may claim DMA is translated
         if grep -aqF "[vtd] translation on" "$SERIAL"; then
             echo "FAIL: \"[vtd] translation on\" on the pc machine, which has no IOMMU"
@@ -628,6 +714,7 @@ check() {
         nic_dma_checks "$SERIAL"
         ring1_checks "$SERIAL"
         seat_checks "$SERIAL"
+        restart_checks "$SERIAL"
     fi
     if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
         echo "PASS: init Tier-1 suite: ALL TESTS PASSED"

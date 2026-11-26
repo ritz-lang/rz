@@ -190,6 +190,31 @@ SEAT_RELEASE = r"[net] DHCPRELEASE sent for 10.0.2.15\n"
 SEAT_NETD = r"[net] seat -> netd pid 3\n"
 NETD_CONFIGURED = r"[netd] configured 10.0.2.15\n"
 SEAT_OK = SEAT_RELEASE + SEAT_NETD + NETD_CONFIGURED
+# netd's death and restart (AGAST #4745, the \\harland\\netd-restart run):
+# pid 1 kills each netd after its lease; the kernel invalidates NetAddr,
+# the driver detaches and maps each replacement's frame object, and the
+# fourth death spends the budget.
+DRIVER_DETACH = r"[virtio-net] PEER_CLOSE: frame object detached\n"
+DRIVER_ATTACH = r"[virtio-net] ATTACH: frame object mapped, both indexes at 0\n"
+RESTART_SPENT = r"[net] netd restart budget spent: NetAddr stays NoDev until reboot\n"
+RESTART_SETTLED = r"[net-restart] NetAddr still NoDev 2000 ms after the budget was spent\n"
+
+
+def netd_killed(pid: int) -> str:
+    return (rf"[net-restart] killing netd pid {pid} after its lease\n"
+            rf"[net] netd pid {pid} died (status 137): NetAddr NoDev, its attachments and frame object retired\n"
+            rf"[net-restart] NetAddr NoDev after netd pid {pid} died\n" + DRIVER_DETACH)
+
+
+def netd_restarted(n: int, pid: int) -> str:
+    ms = 250 << (n - 1)
+    return (rf"[net] netd restart {n} of 3 in {ms} ms\n"
+            rf"[net] netd restart {n}: pid {pid}, frame object {5 + n} on driver pid 2\n"
+            + DRIVER_ATTACH + NETD_CONFIGURED)
+
+
+RESTART_OK = (netd_killed(3) + netd_restarted(1, 4) + netd_killed(4) + netd_restarted(2, 5)
+              + netd_killed(5) + netd_restarted(3, 6) + netd_killed(6) + RESTART_SPENT + RESTART_SETTLED)
 
 
 def driver_parks(p: int) -> str:
@@ -205,7 +230,7 @@ KERNEL_NIC_UP = r"[virtio-net] Initialization complete!\n"
 # place of the in-kernel RX waits.
 VTD_OK = (NVME_TABLE.replace(PCI_PORT_IO, "") + IR_ON + TE_ON + NET_MODERN + NIC_DMA_OK + NIC_ON
           + RING1_PARKED + NET_PLATFORM + RX_CAPPED + DRIVER_UP + DHCP_OK + TX_BURST_OK + interrupts(8)
-          + driver_parks(41) + NVME_OK + BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + SEAT_OK + SUITE_PASSED)
+          + driver_parks(41) + NVME_OK + BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + SEAT_OK + RESTART_OK + SUITE_PASSED)
 
 
 # --------------------------------------------------------------------------
@@ -763,8 +788,10 @@ def test_seat_handoff_passes_on_the_translating_boot(tree):
         (VTD_OK.replace(SEAT_NETD, ""), "the kernel did not hand the frame seat to /bin/netd"),
         (VTD_OK.replace(NETD_CONFIGURED, ""), "netd logged no lease of its own"),
         # netd's lease must come after the seat moved: before it, the kernel
-        # still owned TX
-        (VTD_OK.replace(SEAT_OK, NETD_CONFIGURED + SEAT_RELEASE + SEAT_NETD), "netd logged no lease of its own"),
+        # still owned TX (and without the restart run, whose replacements
+        # log leases of their own after it)
+        (VTD_OK.replace(RESTART_OK, "").replace(SEAT_OK, NETD_CONFIGURED + SEAT_RELEASE + SEAT_NETD),
+         "netd logged no lease of its own"),
     ],
     ids=["no-handoff", "no-netd-lease", "lease-before-handoff"],
 )
@@ -788,6 +815,60 @@ def test_an_untranslated_boot_spawns_no_netd(tree):
     r = _run(tree, PASSED + SEAT_NETD)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL: the pc machine handed the frame seat to netd: an untranslated boot spawns none" in r.stdout
+
+
+@pytest.mark.integration
+def test_netd_restart_passes_on_the_translating_boot(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    vtd = r.stdout.split("===== msix boot (vtd) =====")[1]
+    assert "PASS: NetAddr answered NoDev after each of netd's 4 deaths" in vtd
+    for n, ms in ((1, 250), (2, 500), (3, 1000)):
+        assert f"PASS: netd restart {n} after {ms} ms reached configured again" in vtd
+    assert "PASS: the driver detached 4 times and mapped 3 replacement frame objects" in vtd
+    assert "PASS: the restart budget was spent and NetAddr stayed NoDev" in vtd
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "vtd, want",
+    [
+        (VTD_OK.replace(RESTART_OK, ""), "pid 1 killed netd 0 times"),
+        (VTD_OK.replace(r"[net-restart] NetAddr NoDev after netd pid 4 died\n", ""),
+         "NetAddr answered NoDev after 3 of netd's 4 deaths"),
+        (VTD_OK.replace(DRIVER_ATTACH, "", 1), "the driver mapped 2 replacement frame objects"),
+        (VTD_OK.replace(DRIVER_DETACH, "", 1), "the driver detached 3 times"),
+        # A replacement that never got a lease
+        (VTD_OK.replace(netd_restarted(2, 5), netd_restarted(2, 5).replace(NETD_CONFIGURED, "")),
+         "netd restart 2 did not reach configured"),
+        # The second restart came after the wrong backoff
+        (VTD_OK.replace("restart 2 of 3 in 500 ms", "restart 2 of 3 in 250 ms"),
+         "no \"[net] netd restart 2 of 3 in 500 ms\""),
+        (VTD_OK.replace(RESTART_SPENT, ""), "the kernel did not log the spent restart budget"),
+        (VTD_OK.replace(RESTART_SETTLED, ""), "NetAddr did not stay NoDev"),
+        (VTD_OK.replace(RESTART_SETTLED, r"[net-restart] FAIL: netd pid 6 never reached configured\n"),
+         "[net-restart] FAIL"),
+    ],
+    ids=["no-kills", "no-nodev", "no-attach", "no-detach", "no-lease", "wrong-backoff",
+         "no-budget-log", "no-settle", "test-fail"],
+)
+def test_netd_restart_check_fails(tree, vtd, want):
+    r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": vtd})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout
+
+
+@pytest.mark.integration
+def test_an_untranslated_boot_runs_no_netd_restart(tree):
+    r = _run(tree, PASSED + netd_killed(3))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: the pc machine ran the netd restart test: an untranslated boot has no netd" in r.stdout
+
+
+@pytest.mark.unit
+def test_the_esp_asks_for_the_netd_restart_test():
+    text = (REPO / MSIX_SCRIPT).read_text()
+    assert ': > "$WORK/esp/harland/netd-restart"' in text
 
 
 @pytest.mark.unit

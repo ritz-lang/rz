@@ -72,7 +72,10 @@ def test_netd_is_set_up_before_it_runs():
     """Its address page is its first shared mapping (DRV_RING_BASE) and the
     ServiceBoot record is written before pid 1 first yields to it."""
     body = _fn_body(_code(RING1), "netd_grant_to")
-    _in_order(body, "cap_kernel_grant(", "shm_map(", "DRV_RING_BASE", "service_boot_at(")
+    _in_order(body, "cap_kernel_grant(", "net_service_page(", "net_service_boot(")
+    # The page and record are the replacement's setup too (#4745).
+    _in_order(_fn_body(_code(NET_RT), "net_service_page"), "cap_kernel_grant(", "shm_map(", "DRV_RING_BASE")
+    assert "service_boot_at(" in _fn_body(_code(NET_RT), "net_service_boot")
     handoff = _fn_body(_code(RING1), "net_seat_handoff")
     _in_order(handoff, 'process_spawn_program("/bin/netd")', "netd_grant_to(", "net_handoff_arm(", "sched_yield()")
 

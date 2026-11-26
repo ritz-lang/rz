@@ -53,6 +53,15 @@
 #      there and runs DHCP from idle. The kernel copies no lease into the
 #      page: netd is its one writer.
 #
+# Step 7 (AGAST #4745, ring plan T39) is netd's death and restart, armed
+# once step d has run: sys_exit_impl invalidates NetAddr, retires netd's
+# exchanges and frame object (PEER_CLOSE to each app and to the driver),
+# and restarts /bin/netd at most NETD_RESTARTS times a boot, each with a
+# new address page and a new frame object the driver gets as ATTACH
+# (syscall/runtime/process.ritz netd_restart). The \harland\netd-restart
+# boot option runs net_netd_restart_test before init: pid 1 kills each
+# netd after its lease and checks NetAddr, until the budget is spent.
+#
 # A refused NIC, a missing ELF or a driver that exits before it parks
 # leaves the boot with no NIC owner: logged, and the boot goes on. A netd
 # that is not spawned or does not publish ready leaves the seat with the
@@ -62,25 +71,26 @@ import klog { klog, klog_dec }
 import serial { StrView }
 import ritzlib.option
 import ritzlib.result { Result }
-import mm.shm { shm_create, shm_destroy, shm_map, shm_page }
+import mm.shm { shm_create, shm_page }
 import mm.vmm { phys_to_virt }
 import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_PUBLISH }
 import cap.table { CapTable, cap_kernel_grant, cap_table_get }
-import proc.table { Proc, MAX_PROCS, PROC_BLOCKED, BLOCK_WAIT, proc_at, proc_current, proc_current_slot }
+import proc.table { Proc, MAX_PROCS, PROC_BLOCKED, BLOCK_WAIT, proc_at, proc_current, proc_current_slot, proc_detach }
 import proc.sched { sched_is_running, sched_start, sched_yield }
 import proc.waitset { irq_object_register, irq_object_bind_domain }
 import net.ring { SeatOpen, Send, SeatIndexes, ring_seat_open, ring_seat_object, ring_send_once, ring_seat_handoff }
 import net.dhcp { Release, dhcp_release_frame, dhcp_print_lease }
 import net.stack { net_stack_release }
-import arch.x86_64.tsc { tsc_hz, deadline_after_us, deadline_passed }
-import syscall.runtime.net { net_link_register, ring_driver_published, net_addr_register, net_service_register, net_handoff_arm, net_handoff_ready, net_handoff_done, pml4_of }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import syscall.runtime.net { net_link_register, ring_driver_published, net_addr_register, net_service_register, net_handoff_arm, net_handoff_ready, net_handoff_done }
+import syscall.runtime.net { ServicePage, NETD_RESTARTS, net_service_page, net_service_boot, net_restart_arm, net_restart_armed, net_service_pid, net_addr_configured, net_addr_snapshot }
 import syscall.runtime.driver { drv_device_bind }
 import syscall.runtime.process { process_create_init, process_spawn_program, process_mark_exit }
 import drivers.virtio.net { NicGrant, virtio_net_ring1_probe }
 import drivers.virtio.window { VioWindow, vio_window_find }
 import syscall.stack { kstack_top }
 import driver_abi.boot { DriverBoot, DriverWindow, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, driver_boot_at }
-import driver_abi.boot { ServiceBoot, DRV_RING_BASE, SERVICE_BOOT_MAGIC, service_boot_at }
+import driver_abi.boot { ServiceBoot, service_boot_at }
 
 # The driver's MSI-X table indexes: config changes, the RX and TX queues
 # (virtio_net_ring1_probe aims all three at the grant's vector).
@@ -270,34 +280,21 @@ fn seat_kept(why: StrView)
     klog("\n")
 
 # Step a's grants to netd `pid`, a child that has not run: the frame
-# object's handle, then the address page, mapped as its first shared
-# mapping (DRV_RING_BASE) with the ServiceBoot record in it. The address
-# object's id, or None with nothing left registered.
+# object's handle (no mapping: netd maps it), then the address page, mapped
+# as its first shared mapping (DRV_RING_BASE) with the ServiceBoot record in
+# it (net_service_page, net_service_boot: a replacement netd's setup too).
+# The address object's id, or None; netd's exit (the caller marks it) drops
+# what it was granted.
 fn netd_grant_to(pid: u64, frame_obj: u64) -> Option<u64>
     let rw: u32 = CAP_RIGHT_READ | CAP_RIGHT_WRITE
     let frame: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rw, frame_obj)
     if not granted(frame)
         return None
-    let addr_obj: u64 = match shm_create(1)
-        Some(id) => id
+    let page: ServicePage = match net_service_page(pid as u32)
+        Some(p) => p
         None => return None
-    let addr: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_SHM, rw | CAP_RIGHT_PUBLISH, addr_obj)
-    if not granted(addr) or shm_map(pid as u32, pml4_of(pid as u32), addr_obj, true) != DRV_RING_BASE as i64
-        # netd's exit (the caller marks it) drops its handles and mapping;
-        # the page goes once nothing holds it.
-        if not granted(addr)
-            shm_destroy(addr_obj)
-        return None
-    var boot: ServiceBoot
-    boot.magic = SERVICE_BOOT_MAGIC
-    boot._pad = 0
-    boot.frame = packed(frame)
-    boot.addr = packed(addr)
-    boot.tsc_hz = tsc_hz()
-    boot.seat_rx_read = 0
-    boot.seat_tx_write = 0
-    *service_boot_at(phys_to_virt(shm_page(addr_obj, 0))) = boot
-    Some(addr_obj)
+    net_service_boot(page, packed(frame))
+    Some(page.object_id)
 
 # netd `pid` still has its capability table: it has not exited.
 fn netd_alive(pid: u64) -> bool
@@ -346,6 +343,8 @@ pub fn net_seat_handoff()
             klog_dec(e as i64)
             klog("): the seat stays with the kernel\n")
             return
+    # Nobody waits for netd: its exit leaves no zombie (#4745).
+    proc_detach(pid)
     let addr_obj: u64 = match netd_grant_to(pid, frame_obj)
         Some(id) => id
         None =>
@@ -383,4 +382,92 @@ pub fn net_seat_handoff()
     klog("[net] seat -> netd pid ")
     klog_dec(pid as i64)
     klog("\n")
+    # Step 7: from now on netd's death is restarted onto this driver.
+    net_restart_arm(ring1_pid as u32)
     net_handoff_done()
+
+# ============================================================================
+# The netd restart test (AGAST #4745, the \harland\netd-restart option)
+# ============================================================================
+
+# How long pid 1 waits for each netd's lease: slirp answers DHCP at once,
+# and a restart's backoff is at most 1 s.
+const NETD_LEASE_US: u64 = 15000000
+# How long a killed netd may take to be unregistered (its exit path runs
+# before the backoff).
+const NETD_DEATH_US: u64 = 2000000
+# How long NetAddr must stay NoDev once the budget is spent: past the
+# longest backoff and a spawn.
+const NETD_BUDGET_SETTLE_US: u64 = 2000000
+
+fn restart_fail(why: StrView, pid: u32)
+    klog("[net-restart] FAIL: netd pid ")
+    klog_dec(pid as i64)
+    klog(" ")
+    klog(why)
+    klog("\n")
+
+fn restart_wait(us: u64)
+    let deadline: u64 = deadline_after_us(us)
+    while not deadline_passed(deadline)
+        sched_yield()
+
+# As pid 1 after the handoff, before init (kernel_tail), when `enabled`:
+# NETD_RESTARTS + 1 rounds of waiting for the running netd's lease, killing
+# it ("[net-restart] killing netd pid P after its lease") and checking
+# that NetAddr answers NoDev once it is unregistered ("[net-restart] NetAddr
+# NoDev after netd pid P died"); the kernel restarts it between rounds.
+# Then NetAddr must still be NoDev NETD_BUDGET_SETTLE_US later ("[net-restart]
+# NetAddr still NoDev 2000 ms after the budget was spent"). Any other
+# outcome logs "[net-restart] FAIL: ..." and stops. Nothing on a boot with
+# no netd.
+pub fn net_netd_restart_test(enabled: bool)
+    if not enabled
+        return
+    if not net_restart_armed()
+        return
+    var round: u32 = 0
+    while round <= NETD_RESTARTS
+        let leased: u64 = deadline_after_us(NETD_LEASE_US)
+        while not net_addr_configured() and not deadline_passed(leased)
+            sched_yield()
+        let pid: u32 = net_service_pid()
+        if not net_addr_configured()
+            restart_fail("never reached configured", pid)
+            return
+        klog("[net-restart] killing netd pid ")
+        klog_dec(pid as i64)
+        klog(" after its lease\n")
+        match process_mark_exit(pid as u64)
+            Result.Ok(_) => pass
+            Result.Err(_) =>
+                restart_fail("could not be marked to exit", pid)
+                return
+        let died: u64 = deadline_after_us(NETD_DEATH_US)
+        var gone: bool = false
+        while not gone and not deadline_passed(died)
+            gone = net_service_pid() != pid
+            if not gone
+                sched_yield()
+        if not gone
+            restart_fail("did not die", pid)
+            return
+        match net_addr_snapshot()
+            Some(_) =>
+                restart_fail("died and NetAddr still answers", pid)
+                return
+            None => pass
+        klog("[net-restart] NetAddr NoDev after netd pid ")
+        klog_dec(pid as i64)
+        klog(" died\n")
+        round = round + 1
+    restart_wait(NETD_BUDGET_SETTLE_US)
+    match net_addr_snapshot()
+        Some(_) =>
+            restart_fail("was restarted past the budget: NetAddr answers", net_service_pid())
+            return
+        None => pass
+    if net_service_pid() != 0
+        restart_fail("was restarted past the budget", net_service_pid())
+        return
+    klog("[net-restart] NetAddr still NoDev 2000 ms after the budget was spent\n")
