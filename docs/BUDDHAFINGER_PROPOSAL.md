@@ -3,10 +3,12 @@
 **Status** Draft for review
 
 Buddhafinger is a terminal code editor written in Ritz for Linux and Harland.
-Start with a Linux editing loop, bring the same editor core up on Harland, and
-package it for Indium once the Harland console and filesystem paths pass the
-editor's acceptance tests. Use Vim-style modal editing and build Ritz language
-support around lexical highlighting and ritz-lsp.
+Spec and build the Linux editor first. Build the Harland kernel and ritzlib
+support it needs in parallel (see [Harland prerequisites](#harland-prerequisites)),
+then bring the same editor core up on Harland and package it for Indium once
+the Harland console and filesystem paths pass the editor's acceptance tests.
+Use Vim-style modal editing and build Ritz language support around lexical
+highlighting and ritz-lsp.
 
 ## Editing experience
 
@@ -45,22 +47,55 @@ ABI boundaries that require them. Review the implementation against
 [Review](../projects/ritz/docs/REVIEW.md), and
 [Standard](../projects/ritz/docs/STANDARD.md).
 
-On Linux, use ritzlib's terminal attribute and window-size operations. On
-Harland, use the existing console attribute ABI through a library adapter and
-exercise it under QEMU. Verify raw input, escape sequences, viewport sizing,
-file open and save, and terminal restoration on each target. Probe capabilities
-such as alternate screen, bracketed paste, color, and resize. Allow a
-configurable viewport where size reporting is unavailable. Restore terminal
-mode on normal exit and handled errors or interruptions. Use the existing
-Indium shell image as the port's test environment, then package the editor as
-an Indium userspace program. [Terminal library](../projects/ritzlib/term.ritz) ·
+Drive the editor from one event loop that waits on the terminal, the language
+server's output, and a timer. On Linux, wait with `poll` and read the server
+with non-blocking reads; `ritzlib/process.ritz` offers only blocking reads
+today, so add a non-blocking read or readiness wait there with tests. On
+Harland, the loop waits on the console and a timer until subprocess pipes
+exist.
+
+On Linux, use ritzlib's terminal attribute and window-size operations
+(`tcgetattr`, `tcsetattr`, `get_winsize`). Install `sigaction` handlers for
+SIGINT and SIGTERM (restore the terminal, then exit), SIGTSTP and SIGCONT
+(restore before suspending, re-enter raw mode and repaint after resuming), and
+SIGWINCH (resize). Turn input signal generation off in raw mode so Ctrl-C
+reaches the editor as a key.
+
+On Harland, the console attribute ABI (`tty_getattr`/`tty_setattr`) carries
+three flags: `TTY_ECHO`, `TTY_ICANON`, and `TTY_ISIG`. Wrap it in a library
+adapter and clear all three while editing. With `TTY_ISIG` set, Ctrl-C kills the
+foreground process with no cleanup. Harland reports no window size, so use the
+configurable viewport. Escape sequences reach a terminal only on the serial
+console, where the host terminal interprets them; the framebuffer console does
+not, so Buddhafinger runs on the serial console only. Exercise the adapter
+under QEMU.
+
+Verify raw input, escape sequences, viewport sizing, file open and save, and
+terminal restoration on each target. Probe capabilities such as alternate
+screen, bracketed paste, color, and resize. Allow a configurable viewport where
+size reporting is unavailable. Restore terminal mode on normal exit and handled
+errors on both targets, and on the Linux signals above. On Harland a killed
+process runs no cleanup: rzsh restores the console flags at its next prompt,
+but alternate-screen and cursor state stay on the host terminal until signal
+delivery exists. Use the existing Indium shell image as the port's test
+environment, then package the editor as an Indium userspace program by adding
+it to `projects/indium/initramfs.pkgs` and passing
+`test_indium_initramfs_pkgs.py`. [Terminal library](../projects/ritzlib/term.ritz) ·
+[Harland line discipline](../projects/harland/kernel/src/tty/ldisc.ritz) ·
 [Indium shell image](../projects/indium/README.md)
 
 Preserve line endings, final newline state, and untouched bytes on round trips.
-Save via a same-directory temporary file and atomic replacement where supported,
-preserving permissions and checking for external changes. Keep the buffer dirty
-if a write fails. Establish the save contract on Harland's filesystem before
-claiming parity.
+Keep the buffer dirty if a write fails. On Linux, save via a same-directory
+temporary file and atomic `rename`, preserving permissions, and use `stat` to
+check for external changes before writing.
+
+Harland has no `rename`, `unlink`, `stat`/`fstat`, or `chmod` system call
+today (`numbers.ritz` lists `stat` as a free number). Until those land, the
+only save path is an `O_TRUNC` open and write, which loses the file if
+interrupted, and the editor cannot detect external changes or preserve
+permissions. Before the kernel support lands, Harland saves warn that they
+are not atomic and skip the external-change check. Claim save parity only once
+the Harland save passes the same contract tests as Linux.
 
 ## Buffer representation and performance
 
@@ -109,22 +144,50 @@ invalidate from the edited line until the outgoing lexical state stabilizes.
 Share lexical rules with existing Ritz tooling where practical. Apply semantic
 tokens as an overlay when the server advertises them. The current server uses
 stdio JSON-RPC, full-text document sync, and UTF-16 positions. It exposes
-diagnostics, function hover, and function definition. The Vim syntax installer
+diagnostics, function hover, and function definition, and advertises no
+completion or semantic tokens. Its diagnostics carry the document version, and
+it compiles each changed document once, at its latest version, when it next
+handles a request rather than on every `didChange`. The Vim syntax installer
 supplies lexical rules outside the server. [Server README](../projects/ritz-lsp/README.md) ·
 [Server capabilities](../projects/ritz-lsp/src/server.ritz)
 
-Run the server as a background process and handle framed messages outside the
-editing loop. Coalesce rapid changes and bound queued full-text snapshots.
-Associate requests with buffer revisions, discard outdated responses, and
-suppress stale diagnostics during edits. For unversioned diagnostics, keep at
-most one diagnostic-producing update in flight per document and display results
-only while the corresponding revision is current. Use a timeout and report
+Run the server as a child process and read its framed messages from the event
+loop without blocking editing. Coalesce rapid changes and bound queued
+full-text snapshots. Associate requests with buffer revisions, discard outdated
+responses, and show diagnostics only when their version matches the current
+revision. Because ritz-lsp publishes pending diagnostics only while handling a
+request, follow an idle period after a change with a cheap request so
+diagnostics arrive without waiting for the next hover or definition, until the
+server publishes on its own. Use a timeout and report
 server failures in the status area. Selectively suspend sync above a measured
 document size while keeping navigation and lexical colors available. Start
 the real server on Linux with `RITZ1` pointing to `ritz1_selfhosted` for
 diagnostics. Enable the Harland server integration once subprocess pipes and
 a runnable diagnostic compiler are available there. Local editing and lexical
 colors work with either platform adapter.
+
+## Harland prerequisites
+
+Build these in parallel with the Linux editor. Each lands in the Harland
+kernel (`kernel/src/syscall/numbers.ritz` with its handler), the matching
+wrapper in `ritzlib/sys.ritz`, and the portable ritzlib API the editor calls,
+with tests on both targets.
+
+| Need | Today | Required for |
+|---|---|---|
+| `rename` (same directory, replaces target) | Missing | Atomic save |
+| `unlink` | Missing | Removing a failed save's temporary file |
+| `stat` / `fstat` (size, mtime, mode) | Missing; number 4 free | External-change check, permissions |
+| `chmod` or mode on create | Missing | Preserving permissions |
+| Console window size | Missing | Automatic viewport (configurable viewport until then) |
+| Timed console wait (read with timeout, or poll) and a clock | Missing; `read(0)` blocks until input | Timers in the event loop (key timeouts, idle work) |
+| Pipes and spawn with fd redirection | Missing; number 29 free | Running ritz-lsp on Harland |
+| Signal delivery or exit hook | Missing; Ctrl-C kills outright | Terminal restoration after a kill |
+
+The first Harland port needs the console flags (available now), the
+configurable viewport, and a timed console wait. Atomic save needs `rename`,
+`unlink`, and `stat`. ritz-lsp on Harland stays a separate milestone that needs
+pipes and a runnable diagnostic compiler.
 
 ## Tests and build isolation
 
@@ -135,7 +198,8 @@ point and set `RITZ1` explicitly for real-server tests. Use one compiler
 artifact for Linux and Harland targets. Compiler bootstrap remains an upstream
 toolchain dependency. Keep Buddhafinger out of the compiler regression
 suites and generic workspace multi-compiler build and test sweeps, including
-implicit discovery when the package is registered. Verify the sweep excludes
+implicit discovery when the package is registered, through a reasoned
+`[workspace.exclude]` entry in `rz.toml`. Verify the sweep excludes
 the editor and the dedicated job actually runs its suite.
 [Workspace CLI](../rz) · [Compiler test targets](../projects/ritz/Makefile) ·
 [CI workflows](../.github/workflows/main.yml)
@@ -162,9 +226,14 @@ the editor and the dedicated job actually runs its suite.
 
 ## Decisions for review
 
-1. Approve modal editing as the default and confirm the initial Vim command
-   subset before defining keybinding compatibility.
+1. Approve modal editing as the default and write the initial Vim command
+   subset down as a list before implementation starts.
 2. Approve a vector of owned lines as the first implementation and use benchmark
    results to decide when to adopt fragments or indexed line blocks.
-3. Confirm the Harland console and save semantics required for the first port,
-   and the separate milestone for running ritz-lsp on Harland.
+3. Approve the [Harland prerequisites](#harland-prerequisites) as a parallel
+   track: the first port runs with the existing console flags, the configurable
+   viewport, and non-atomic saves that warn; atomic save waits for `rename`,
+   `unlink`, and `stat`; ritz-lsp on Harland waits for pipes.
+4. Decide whether the first usable release shrinks to a single buffer with
+   Normal and Insert modes and save, so the platform adapters are exercised
+   sooner, with Visual mode, counts, operators, and multiple buffers following.
