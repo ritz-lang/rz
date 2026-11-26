@@ -1,0 +1,212 @@
+# encode: the stack, inc/dec, shifts, the operand-less and system
+# instructions, port I/O, string instructions and the lock/rep prefixes,
+# against `as --64` (test/support/check.ritz).
+import razm.insn { Prefix }
+import razm.parse { Mode }
+import test.support.check
+
+
+[[test]]
+fn test_encode_push_pop_match_as() -> i32
+    var n: i32 = 0
+    n += check(Code64, "pushq %rax", "50", ins1("push", "q", r("%rax")))
+    n += check(Code64, "pushq %r15", "41 57", ins1("push", "q", r("%r15")))
+    n += check(Code64, "push %rbp", "55", ins1("push", "", r("%rbp")))
+    n += check(Code64, "pushq $0", "6a 00", ins1("push", "q", imm(0)))
+    n += check(Code64, "pushq $0x23", "6a 23", ins1("push", "q", imm(0x23)))
+    n += check(Code64, "pushq $255", "68 ff 00 00 00", ins1("push", "q", imm(255)))
+    n += check(Code64, "pushq $-1", "6a ff", ins1("push", "q", imm(-1)))
+    n += check(Code64, "pushq $foo", "68 00 00 00 00 | 1:sabs4:foo+0",
+        ins1("push", "q", isym("foo", 0)))
+    n += check(Code64, "pushq 88(%rsp)", "ff 74 24 58", ins1("push", "q", mem(88, "%rsp")))
+    n += check(Code64, "pushq %gs:0x18", "65 ff 34 25 18 00 00 00",
+        ins1("push", "q", seg_at("%gs", 0x18)))
+    n += check(Code64, "pushw %ax", "66 50", ins1("push", "w", r("%ax")))
+    n += check(Code64, "popq %rax", "58", ins1("pop", "q", r("%rax")))
+    n += check(Code64, "popq %r12", "41 5c", ins1("pop", "q", r("%r12")))
+    n += check(Code64, "popq 32(%rsp)", "8f 44 24 20", ins1("pop", "q", mem(32, "%rsp")))
+    n += check(Code64, "popq %gs:0x18", "65 8f 04 25 18 00 00 00",
+        ins1("pop", "q", seg_at("%gs", 0x18)))
+    n += check(Code64, "pushfq", "9c", ins0("pushf", "q"))
+    n += check(Code64, "popfq", "9d", ins0("popf", "q"))
+    n += check(Code32, "pushl %eax", "50", ins1("push", "l", r("%eax")))
+    n += check(Code32, "pushl $0x10", "6a 10", ins1("push", "l", imm(0x10)))
+    n += check(Code32, "pushl $foo", "68 00 00 00 00 | 1:abs4:foo+0",
+        ins1("push", "l", isym("foo", 0)))
+    n += check(Code32, "popl %ebx", "5b", ins1("pop", "l", r("%ebx")))
+    n += check(Code32, "pushfl", "9c", ins0("pushf", "l"))
+    n += check(Code32, "popfl", "9d", ins0("popf", "l"))
+    n += check(Code16, "pushl %eax", "66 50", ins1("push", "l", r("%eax")))
+    n += check(Code16, "pushw %ax", "50", ins1("push", "w", r("%ax")))
+    n += check(Code16, "pushfl", "66 9c", ins0("pushf", "l"))
+    n += check(Code16, "popl %eax", "66 58", ins1("pop", "l", r("%eax")))
+    n += check_err(Code64, "pushl %eax", ins1("push", "l", r("%eax")))
+    n += check_err(Code64, "pushfl", ins0("pushf", "l"))
+    n += check_err(Code32, "pushq %rax", ins1("push", "q", r("%rax")))
+    n
+
+
+[[test]]
+fn test_encode_inc_dec_and_shifts_match_as() -> i32
+    var n: i32 = 0
+    n += check(Code64, "incq %rax", "48 ff c0", ins1("inc", "q", r("%rax")))
+    n += check(Code64, "incl %r9d", "41 ff c1", ins1("inc", "l", r("%r9d")))
+    n += check(Code64, "incl (%rax)", "ff 00", ins1("inc", "l", mem(0, "%rax")))
+    n += check(Code64, "incb %al", "fe c0", ins1("inc", "b", r("%al")))
+    n += check(Code64, "decq %rcx", "48 ff c9", ins1("dec", "q", r("%rcx")))
+    n += check(Code64, "decl %ecx", "ff c9", ins1("dec", "l", r("%ecx")))
+    n += check(Code64, "decw %dx", "66 ff ca", ins1("dec", "w", r("%dx")))
+    n += check(Code64, "incq foo(%rip)", "48 ff 05 00 00 00 00 | 3:pc4:foo-4",
+        ins1("inc", "q", rip("foo", 0)))
+    n += check(Code32, "incl %eax", "40", ins1("inc", "l", r("%eax")))
+    n += check(Code32, "decl %ecx", "49", ins1("dec", "l", r("%ecx")))
+    n += check(Code32, "decw %cx", "66 49", ins1("dec", "w", r("%cx")))
+    n += check(Code32, "incl (%eax)", "ff 00", ins1("inc", "l", mem(0, "%eax")))
+    n += check(Code16, "incw %si", "46", ins1("inc", "w", r("%si")))
+    n += check(Code16, "decl %ecx", "66 49", ins1("dec", "l", r("%ecx")))
+    n += check(Code64, "shlq $12, %rax", "48 c1 e0 0c", ins2("shl", "q", imm(12), r("%rax")))
+    n += check(Code64, "shlq $1, %rax", "48 d1 e0", ins2("shl", "q", imm(1), r("%rax")))
+    n += check(Code64, "shlq $4, %r10", "49 c1 e2 04", ins2("shl", "q", imm(4), r("%r10")))
+    n += check(Code64, "shll $16, %edx", "c1 e2 10", ins2("shl", "l", imm(16), r("%edx")))
+    n += check(Code64, "shrq $21, %rcx", "48 c1 e9 15", ins2("shr", "q", imm(21), r("%rcx")))
+    n += check(Code64, "shrq $1, %rdi", "48 d1 ef", ins2("shr", "q", imm(1), r("%rdi")))
+    n += check(Code64, "sarq $63, %rax", "48 c1 f8 3f", ins2("sar", "q", imm(63), r("%rax")))
+    n += check(Code64, "shlq $3, 8(%rsp)", "48 c1 64 24 08 03",
+        ins2("shl", "q", imm(3), mem(8, "%rsp")))
+    n += check(Code64, "shlb $2, %al", "c0 e0 02", ins2("shl", "b", imm(2), r("%al")))
+    n += check(Code64, "shlq %cl, %rax", "48 d3 e0", ins2("shl", "q", r("%cl"), r("%rax")))
+    n += check(Code64, "shrl %cl, %edx", "d3 ea", ins2("shr", "l", r("%cl"), r("%edx")))
+    n += check(Code32, "shll $4, %eax", "c1 e0 04", ins2("shl", "l", imm(4), r("%eax")))
+    n += check(Code32, "shrl $1, %eax", "d1 e8", ins2("shr", "l", imm(1), r("%eax")))
+    n += check(Code16, "shlw $4, %ax", "c1 e0 04", ins2("shl", "w", imm(4), r("%ax")))
+    n += check_err(Code64, "shlq %dl, %rax", ins2("shl", "q", r("%dl"), r("%rax")))
+    n
+
+
+[[test]]
+fn test_encode_operandless_instructions_match_as() -> i32
+    var n: i32 = 0
+    n += check(Code64, "ret", "c3", ins0("ret", ""))
+    n += check(Code64, "retq", "c3", ins0("ret", "q"))
+    n += check(Code64, "lretq", "48 cb", ins0("lret", "q"))
+    n += check(Code64, "iretq", "48 cf", ins0("iret", "q"))
+    n += check(Code64, "sysretq", "48 0f 07", ins0("sysret", "q"))
+    n += check(Code64, "syscall", "0f 05", ins0("syscall", ""))
+    n += check(Code64, "swapgs", "0f 01 f8", ins0("swapgs", ""))
+    n += check(Code64, "cli", "fa", ins0("cli", ""))
+    n += check(Code64, "sti", "fb", ins0("sti", ""))
+    n += check(Code64, "cld", "fc", ins0("cld", ""))
+    n += check(Code64, "std", "fd", ins0("std", ""))
+    n += check(Code64, "hlt", "f4", ins0("hlt", ""))
+    n += check(Code64, "nop", "90", ins0("nop", ""))
+    n += check(Code64, "pause", "f3 90", ins0("pause", ""))
+    n += check(Code64, "ud2", "0f 0b", ins0("ud2", ""))
+    n += check(Code64, "cpuid", "0f a2", ins0("cpuid", ""))
+    n += check(Code64, "rdtsc", "0f 31", ins0("rdtsc", ""))
+    n += check(Code64, "rdmsr", "0f 32", ins0("rdmsr", ""))
+    n += check(Code64, "wrmsr", "0f 30", ins0("wrmsr", ""))
+    n += check(Code64, "xgetbv", "0f 01 d0", ins0("xgetbv", ""))
+    n += check(Code64, "lfence", "0f ae e8", ins0("lfence", ""))
+    n += check(Code64, "mfence", "0f ae f0", ins0("mfence", ""))
+    n += check(Code64, "sfence", "0f ae f8", ins0("sfence", ""))
+    n += check(Code32, "ret", "c3", ins0("ret", ""))
+    n += check(Code32, "cli", "fa", ins0("cli", ""))
+    n += check(Code32, "hlt", "f4", ins0("hlt", ""))
+    n += check(Code32, "cpuid", "0f a2", ins0("cpuid", ""))
+    n += check(Code32, "rdmsr", "0f 32", ins0("rdmsr", ""))
+    n += check(Code32, "wrmsr", "0f 30", ins0("wrmsr", ""))
+    n += check(Code32, "iretl", "cf", ins0("iret", "l"))
+    n += check(Code16, "cli", "fa", ins0("cli", ""))
+    n += check(Code16, "cld", "fc", ins0("cld", ""))
+    n += check(Code16, "ret", "c3", ins0("ret", ""))
+    n += check(Code32, "syscall", "0f 05", ins0("syscall", ""))
+    n += check_err(Code32, "swapgs", ins0("swapgs", ""))
+    n += check_err(Code32, "iretq", ins0("iret", "q"))
+    n += check_err(Code32, "retq", ins0("ret", "q"))
+    n
+
+
+[[test]]
+fn test_encode_system_and_memory_operand_instructions_match_as() -> i32
+    var n: i32 = 0
+    n += check(Code64, "lgdt foo", "0f 01 14 25 00 00 00 00 | 4:sabs4:foo+0",
+        ins1("lgdt", "", sym("foo")))
+    n += check(Code64, "lgdt (0x9000)", "0f 01 14 25 00 90 00 00", ins1("lgdt", "", at(0x9000)))
+    n += check(Code64, "lgdt (%rdi)", "0f 01 17", ins1("lgdt", "", mem(0, "%rdi")))
+    n += check(Code64, "lidt (%rdi)", "0f 01 1f", ins1("lidt", "", mem(0, "%rdi")))
+    n += check(Code64, "lidt foo(%rip)", "0f 01 1d 00 00 00 00 | 3:pc4:foo-4",
+        ins1("lidt", "", rip("foo", 0)))
+    n += check(Code64, "ltr %ax", "0f 00 d8", ins1("ltr", "", r("%ax")))
+    n += check(Code64, "ltr %di", "0f 00 df", ins1("ltr", "", r("%di")))
+    n += check(Code64, "ltr (%rax)", "0f 00 18", ins1("ltr", "", mem(0, "%rax")))
+    n += check(Code64, "invlpg (%rdi)", "0f 01 3f", ins1("invlpg", "", mem(0, "%rdi")))
+    n += check(Code64, "invlpg (%r8)", "41 0f 01 38", ins1("invlpg", "", mem(0, "%r8")))
+    n += check(Code64, "clflush (%rdi)", "0f ae 3f", ins1("clflush", "", mem(0, "%rdi")))
+    n += check(Code64, "clflush 64(%rax)", "0f ae 78 40", ins1("clflush", "", mem(64, "%rax")))
+    n += check(Code64, "nopl (%rax)", "0f 1f 00", ins1("nop", "l", mem(0, "%rax")))
+    n += check(Code64, "nopl 0(%rax,%rax,1)", "0f 1f 04 00",
+        ins1("nop", "l", sib(0, "%rax", "%rax", 1)))
+    n += check(Code64, "nopw 0(%rax,%rax,1)", "66 0f 1f 04 00",
+        ins1("nop", "w", sib(0, "%rax", "%rax", 1)))
+    n += check(Code64, "rdrand %rax", "48 0f c7 f0", ins1("rdrand", "", r("%rax")))
+    n += check(Code64, "rdrand %ecx", "0f c7 f1", ins1("rdrand", "", r("%ecx")))
+    n += check(Code64, "rdrand %r9", "49 0f c7 f1", ins1("rdrand", "", r("%r9")))
+    n += check(Code64, "rdrand %ax", "66 0f c7 f0", ins1("rdrand", "", r("%ax")))
+    n += check(Code32, "lgdt foo", "0f 01 15 00 00 00 00 | 3:abs4:foo+0",
+        ins1("lgdt", "", sym("foo")))
+    n += check(Code32, "lgdt (0x9000)", "0f 01 15 00 90 00 00", ins1("lgdt", "", at(0x9000)))
+    n += check(Code32, "lidt (%eax)", "0f 01 18", ins1("lidt", "", mem(0, "%eax")))
+    n += check(Code16, "lgdt (0x8100)", "0f 01 16 00 81", ins1("lgdt", "", at(0x8100)))
+    n += check(Code16, "lgdt foo", "0f 01 16 00 00 | 3:abs2:foo+0", ins1("lgdt", "", sym("foo")))
+    n += check_err(Code64, "lgdt %rax", ins1("lgdt", "", r("%rax")))
+    n += check_err(Code64, "rdrandb %al", ins1("rdrand", "b", r("%al")))
+    n
+
+
+[[test]]
+fn test_encode_port_io_and_string_instructions_match_as() -> i32
+    var n: i32 = 0
+    n += check(Code64, "inb %dx, %al", "ec", ins2("in", "b", r("%dx"), r("%al")))
+    n += check(Code64, "inw %dx, %ax", "66 ed", ins2("in", "w", r("%dx"), r("%ax")))
+    n += check(Code64, "inl %dx, %eax", "ed", ins2("in", "l", r("%dx"), r("%eax")))
+    n += check(Code64, "inb $0x60, %al", "e4 60", ins2("in", "b", imm(0x60), r("%al")))
+    n += check(Code64, "inw $0x60, %ax", "66 e5 60", ins2("in", "w", imm(0x60), r("%ax")))
+    n += check(Code64, "inl $0xcf, %eax", "e5 cf", ins2("in", "l", imm(0xcf), r("%eax")))
+    n += check(Code64, "outb %al, %dx", "ee", ins2("out", "b", r("%al"), r("%dx")))
+    n += check(Code64, "outw %ax, %dx", "66 ef", ins2("out", "w", r("%ax"), r("%dx")))
+    n += check(Code64, "outl %eax, %dx", "ef", ins2("out", "l", r("%eax"), r("%dx")))
+    n += check(Code64, "outb %al, $0x80", "e6 80", ins2("out", "b", r("%al"), imm(0x80)))
+    n += check(Code64, "outw %ax, $0x80", "66 e7 80", ins2("out", "w", r("%ax"), imm(0x80)))
+    n += check(Code64, "outl %eax, $0x80", "e7 80", ins2("out", "l", r("%eax"), imm(0x80)))
+    n += check(Code32, "inb %dx, %al", "ec", ins2("in", "b", r("%dx"), r("%al")))
+    n += check(Code32, "outb %al, %dx", "ee", ins2("out", "b", r("%al"), r("%dx")))
+    n += check(Code32, "inw %dx, %ax", "66 ed", ins2("in", "w", r("%dx"), r("%ax")))
+    n += check(Code16, "inb $0x92, %al", "e4 92", ins2("in", "b", imm(0x92), r("%al")))
+    n += check(Code16, "outb %al, $0x92", "e6 92", ins2("out", "b", r("%al"), imm(0x92)))
+    n += check(Code16, "inw %dx, %ax", "ed", ins2("in", "w", r("%dx"), r("%ax")))
+    n += check(Code16, "inl %dx, %eax", "66 ed", ins2("in", "l", r("%dx"), r("%eax")))
+    n += check(Code64, "lodsb", "ac", ins0("lods", "b"))
+    n += check(Code64, "stosl", "ab", ins0("stos", "l"))
+    n += check(Code64, "stosw", "66 ab", ins0("stos", "w"))
+    n += check(Code64, "stosq", "48 ab", ins0("stos", "q"))
+    n += check(Code64, "rep stosl", "f3 ab", with_prefix(Rep, ins0("stos", "l")))
+    n += check(Code64, "rep stosw", "66 f3 ab", with_prefix(Rep, ins0("stos", "w")))
+    n += check(Code64, "rep stosb", "f3 aa", with_prefix(Rep, ins0("stos", "b")))
+    n += check(Code32, "lodsb", "ac", ins0("lods", "b"))
+    n += check(Code32, "rep stosl", "f3 ab", with_prefix(Rep, ins0("stos", "l")))
+    n += check(Code32, "stosw", "66 ab", ins0("stos", "w"))
+    n += check(Code16, "stosw", "ab", ins0("stos", "w"))
+    n += check(Code16, "stosl", "66 ab", ins0("stos", "l"))
+    n += check(Code64, "lock incl foo(%rip)", "f0 ff 05 00 00 00 00 | 3:pc4:foo-4",
+        with_prefix(Lock, ins1("inc", "l", rip("foo", 0))))
+    n += check(Code64, "lock incq foo(%rip)", "f0 48 ff 05 00 00 00 00 | 4:pc4:foo-4",
+        with_prefix(Lock, ins1("inc", "q", rip("foo", 0))))
+    n += check(Code64, "lock incw (%rax)", "66 f0 ff 00",
+        with_prefix(Lock, ins1("inc", "w", mem(0, "%rax"))))
+    n += check(Code64, "lock addq %rax, (%rdi)", "f0 48 01 07",
+        with_prefix(Lock, ins2("add", "q", r("%rax"), mem(0, "%rdi"))))
+    n += check(Code64, "lock orl $1, %gs:8", "65 f0 83 0c 25 08 00 00 00 01",
+        with_prefix(Lock, ins2("or", "l", imm(1), seg_at("%gs", 8))))
+    n += check_err(Code64, "inb %cx, %al", ins2("in", "b", r("%cx"), r("%al")))
+    n += check_err(Code64, "outb %bl, %dx", ins2("out", "b", r("%bl"), r("%dx")))
+    n

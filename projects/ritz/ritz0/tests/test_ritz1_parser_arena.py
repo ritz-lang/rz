@@ -24,6 +24,7 @@ import subprocess
 import pytest
 
 from test_ritz1_builtin_struct_shadow import RITZ_ROOT, _run
+from test_ritz1_for_iterable import run_with  # noqa: F401  (fixture)
 
 # ~72k tokens: well past the old 4 MB arena (about 60 bytes of AST per token
 # here), and still quick to compile.
@@ -62,3 +63,65 @@ def test_ritz1_self_compiles_emitter_stmt(ritz1_bin, tmp_path):
     )
     assert proc.returncode == 0 and out.exists(), proc.stderr[-2000:]
     assert "arena" not in proc.stderr, proc.stderr[-2000:]
+
+
+# AGAST #4842: a failed alternative's nodes stay in the arena, so a grammar rule
+# that re-parses a nested expression multiplies the arena use per nesting level.
+# `call_args : args COMMA | args` parsed every argument list twice when it had
+# no trailing comma, `args : expr COMMA args | expr` parsed the last argument
+# twice, and postfix_op's `LBRACKET expr ...` slices parsed an index five
+# times.  The ticket's file, 100 lines of `n += k("a", "b", p(p(1, 2), p(3,
+# 4)))`, took ~2 KB a token and hit the 1 KB-a-token cap ("parser arena
+# exhausted"); a bigger file only made the cap bigger by the same factor.
+# Each program below exhausts the old arena on its own rule, and fits now
+# that every argument and index is parsed once.
+
+RITZ1S = ["ritz1", "ritz1_selfhosted"]
+REPRO_HEADER = (
+    "fn k(a: StrView, b: StrView, c: i32) -> i32\n    c\n\n"
+    "fn p(a: i32, b: i32) -> i32\n    a + b\n\n"
+)
+
+
+def _repro(n_lines: int) -> str:
+    """The ticket's file: each line adds p(p(1, 2), p(3, 4)) == 10."""
+    return (REPRO_HEADER + "pub fn main() -> i32\n    var n: i32 = 0\n"
+            + '    n += k("a", "b", p(p(1, 2), p(3, 4)))\n' * n_lines
+            + f"    return n - {10 * n_lines - 42}\n")
+
+
+def _nested(depth: int, wrap) -> str:
+    s = "0"
+    for _ in range(depth):
+        s = wrap(s)
+    return s
+
+
+# Each `p(.., 1)` adds 1: the nesting is in a first argument, so only
+# call_args's re-parse of the whole list doubles it.
+FIRST_ARG = (REPRO_HEADER + "pub fn main() -> i32\n"
+             f"    return {_nested(22, lambda s: f'p({s}, 1)')} + 20\n")
+# The nesting is in a last argument, which args re-parsed as well (so the old
+# call_args alone also overran the arena here).
+LAST_ARG = (REPRO_HEADER + "pub fn main() -> i32\n"
+            f"    return {_nested(22, lambda s: f'p(1, {s})')} + 20\n")
+# arr maps 0->1->2->3->0, so 13 lookups from 0 end on 1; five parses per level
+# overran the arena by depth 9.
+DEEP_INDEX = ("pub fn main() -> i32\n    var arr: [4]i32 = [1, 2, 3, 0]\n"
+              f"    return {_nested(13, lambda s: f'arr[{s}]')} + 41\n")
+
+NESTING = {
+    "repro_100": _repro(100),     # under the cap's 4 MB floor
+    "repro_2000": _repro(2000),   # where the cap scales with the tokens
+    "first_arg": FIRST_ARG,
+    "last_arg": LAST_ARG,
+    "index": DEEP_INDEX,
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("name", list(NESTING))
+def test_ritz1_nested_expressions_fit_parser_arena(run_with, compiler, name):
+    """Nested calls and indexes parse each expression once, not 2^depth times."""
+    assert run_with(compiler, name, NESTING[name]) == 42

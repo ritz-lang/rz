@@ -1596,16 +1596,14 @@ postfix_op -> *PostfixOp
     # postfix_generic_call_list.
     | LT generic_args LPAREN call_args? RPAREN { postfix_generic_call_list(p, $2, $4) }
     | LPAREN call_args? RPAREN { postfix_call(p, $2) }
-    | LBRACKET expr DOTDOT expr RBRACKET { postfix_range_index(p, $2, $4) }
-    | LBRACKET expr DOTDOTEQ expr RBRACKET { postfix_range_index_inclusive(p, $2, $4) }
     # ritz0's colon slices (AGAST #3766): `[lo:hi]` is `[lo..hi]`, `[:hi]` is
     # `[0..hi]` and `[lo:]` is `[lo..a.len()]`, its end filled in by
-    # apply_postfix_p once the receiver is built.  `[:]` fails all three and
-    # is full_slice_tail's.
-    | LBRACKET expr COLON expr RBRACKET { postfix_range_index(p, $2, $4) }
-    | LBRACKET expr COLON RBRACKET { postfix_open_end_slice(p, $2) }
+    # apply_postfix_p once the receiver is built.  `[:]` fails both of these
+    # and is full_slice_tail's.
     | LBRACKET COLON expr RBRACKET { postfix_open_start_slice(p, $3) }
-    | LBRACKET expr RBRACKET { postfix_index(p, $2, $1.line, $1.col) }
+    # `[i]`, `[lo..hi]`, `[lo..=hi]`, `[lo:hi]` and `[lo:]`: the first
+    # expression is parsed once, and index_close says which (AGAST #4842).
+    | LBRACKET expr index_close { postfix_index_close(p, $2, $3, $1.line, $1.col) }
     | DOT name { postfix_member(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }) }
     # `t.0`: a tuple's element, its synthesized struct's field "0" (AGAST
     # #2956).  `t.0.1` lexes `0.1` as one FLOAT and is not parsed.
@@ -1613,9 +1611,32 @@ postfix_op -> *PostfixOp
     | QUESTION { postfix_try_new(p) }
     ;
 
+# Each argument is parsed exactly once (AGAST #4842).  `expr COMMA args |
+# expr` parsed the last argument twice, and `args COMMA | args` below parsed
+# the whole list twice when it had no trailing comma.  The parser arena never
+# gets a failed alternative's nodes back, so every level of call nesting
+# doubled the arena use: `k("a", "b", p(p(1, 2), p(3, 4)))` took ~2 KB a
+# token, over main.ritz's 1 KB-a-token cap.  `args_tail` declines a trailing
+# comma (its `COMMA expr` fails at the closer and rewinds to the comma), so
+# the comma is left for call_args or the array literal to take.
+# What follows an index's first expression (postfix_op's `LBRACKET expr
+# index_close`).  Each alternative fails at its first token, so none re-parses
+# anything.  postfix_index_close puts the expression in.
+index_close -> *PostfixOp
+    : DOTDOT expr RBRACKET { index_close_range(p, $2) }
+    | DOTDOTEQ expr RBRACKET { index_close_inclusive(p, $2) }
+    | COLON expr RBRACKET { index_close_range(p, $2) }
+    | COLON RBRACKET { index_close_open_end(p) }
+    | RBRACKET { index_close_plain(p) }
+    ;
+
 args -> *Expr
-    : expr COMMA args { expr_link($1, $3) }
-    | expr { $1 }
+    : expr args_tail { expr_link($1, $2) }
+    ;
+
+args_tail -> *Expr
+    : COMMA expr args_tail { expr_link($2, $3) }
+    | { 0 as *Expr }
     ;
 
 # Call arguments: `args` plus ONE optional trailing comma (`f(a, b,)`),
@@ -1623,8 +1644,7 @@ args -> *Expr
 # literal's own `LBRACKET args COMMA RBRACKET` (#1507) would then accept
 # `[1, 2,,]`.
 call_args -> *Expr
-    : args COMMA { $1 }
-    | args { $1 }
+    : args COMMA? { $1 }
     ;
 
 primary_expr -> *Expr

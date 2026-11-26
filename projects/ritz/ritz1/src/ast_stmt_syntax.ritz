@@ -1153,41 +1153,67 @@ pub fn postfix_try_new(p: *Parser) -> *PostfixOp
     op.next = null
     return op
 
-# postfix_op : '[' expr '..' expr ']'  →  POSTFIX_INDEX wrapping an
-# ExprKind.Range { lo, hi }.  Monomorph rewrites a String, Vec or Span slice
-# into `.slice(lo, hi)`; emit_expr_index refuses the rest (AGAST #2521).
+# postfix_op : '[' expr index_close.  The grammar parses an index's first
+# expression once, then the closer that says what it is (AGAST #4842): the
+# old `'[' expr '..' expr ']' | '[' expr ':' ... | '[' expr ']'` list re-parsed
+# the expression for each alternative, so the arena grew 5x per nested index.
+# An index_close_* op comes back without that expression; postfix_index_close
+# puts it in.
+
+# postfix_op : '[' ':' expr ']' and index_close's ranges  →  POSTFIX_INDEX
+# wrapping an ExprKind.Range { lo, hi }; `lo` is null until
+# postfix_index_close fills it.  Monomorph rewrites a String, Vec or Span
+# slice into `.slice(lo, hi)`; emit_expr_index refuses the rest (AGAST #2521).
 pub fn postfix_range_index(p: *Parser, lo: *Expr, hi: *Expr) -> *PostfixOp
     let r: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     r.kind = ExprKind.Range
-    r.span = lo.span
+    if lo != null
+        r.span = lo.span
     r.left = lo
     r.right = hi
     r.next = null
     return postfix_index(p, r, 0, 0)   # a slice's errors name the base
-
-# postfix_op : '[' expr '..=' expr ']'  →  `[lo..hi + 1]`, as ritz0 lowers it
-# (_emit_index).  ritz1 had no inclusive slice, so `v[1..=2]` didn't parse
-# (AGAST #2451).
-pub fn postfix_range_index_inclusive(p: *Parser, lo: *Expr, hi: *Expr) -> *PostfixOp
-    let one: *Expr = expr_int(p, 1, hi.span.line, hi.span.col)
-    return postfix_range_index(p, lo, expr_binary(p, OpKind.Add, hi, one))
 
 # postfix_op : '[' ':' expr ']'  →  `[0..hi]`, ritz0's colon slice with the
 # start left out (AGAST #3766).
 pub fn postfix_open_start_slice(p: *Parser, hi: *Expr) -> *PostfixOp
     return postfix_range_index(p, expr_int(p, 0, hi.span.line, hi.span.col), hi)
 
-# postfix_op : '[' expr ':' ']'  →  `[lo..a.len()]` (AGAST #3766).  The end
-# needs the receiver, which isn't built yet: the range's `right` stays null
-# and apply_postfix_p fills it in.
-pub fn postfix_open_end_slice(p: *Parser, lo: *Expr) -> *PostfixOp
-    let r: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
-    r.kind = ExprKind.Range
-    r.span = lo.span
-    r.left = lo
-    r.right = null
-    r.next = null
-    return postfix_index(p, r, 0, 0)
+# index_close : '..' expr ']' | ':' expr ']'  →  `[lo..hi]` (ritz0's colon
+# slice is the same range, AGAST #3766).
+pub fn index_close_range(p: *Parser, hi: *Expr) -> *PostfixOp
+    return postfix_range_index(p, null, hi)
+
+# index_close : '..=' expr ']'  →  `[lo..hi + 1]`, as ritz0 lowers it
+# (_emit_index).  ritz1 had no inclusive slice, so `v[1..=2]` didn't parse
+# (AGAST #2451).
+pub fn index_close_inclusive(p: *Parser, hi: *Expr) -> *PostfixOp
+    let one: *Expr = expr_int(p, 1, hi.span.line, hi.span.col)
+    return postfix_range_index(p, null, expr_binary(p, OpKind.Add, hi, one))
+
+# index_close : ':' ']'  →  `[lo..a.len()]` (AGAST #3766).  The end needs the
+# receiver, which isn't built yet: the range's `right` stays null and
+# apply_postfix_p fills it in.
+pub fn index_close_open_end(p: *Parser) -> *PostfixOp
+    return postfix_range_index(p, null, null)
+
+# index_close : ']'  →  a plain `[i]`, its index filled in by
+# postfix_index_close.
+pub fn index_close_plain(p: *Parser) -> *PostfixOp
+    return postfix_index(p, null, 0, 0)
+
+# postfix_op : '[' expr index_close  →  `op` with `lo` put in: as the index of
+# a plain `[i]`, which also takes its `[`'s place (AGAST #2452), or as a
+# range's start.
+pub fn postfix_index_close(p: *Parser, lo: *Expr, op: *PostfixOp, line: i32, col: i32) -> *PostfixOp
+    if op.index == null
+        op.index = lo
+        op.bracket.line = line
+        op.bracket.col = col
+        return op
+    op.index.left = lo
+    op.index.span = lo.span
+    op
 
 # for_stmt : FOR IDENT IN expr block  →  StmtKind.For with iter expression
 # stored in for_end (start = null sentinel).  emit_for handles the
