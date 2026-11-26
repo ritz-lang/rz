@@ -5,8 +5,9 @@
 # a cache hit restores exactly what the database holds. Spire's document
 # helpers carry string fields only, so numeric fields are stored in page_doc_decimal.
 
-import ritzlib.gvec { Vec, vec_with_cap }
-import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.gvec { Vec, vec_zeroed }
+import ritzlib.span
+import ritzlib.strview { StrView }
 import ritzlib.string { String, string_new, string_from, string_from_bytes }
 import mausoleum.m7m_types { m7m_timestamp_zero }
 
@@ -47,7 +48,7 @@ pub fn wiki_page_encode_bound(page: *WikiPage) -> i64
 
 
 # Serialize `page` into `buf`. Returns the byte count, or < 0 if it won't fit.
-pub fn wiki_page_encode(page: *WikiPage, buf: *u8, buf_len: i64) -> i64
+pub fn wiki_page_encode(page: *WikiPage, buf: [u8]) -> i64
     var id: String = page_doc_decimal(page.id.value)
     var version: String = page_doc_decimal(page.version as i64)
     var created: String = page_doc_decimal(page.created_at.nanos)
@@ -66,44 +67,42 @@ pub fn wiki_page_encode(page: *WikiPage, buf: *u8, buf_len: i64) -> i64
     fields[7] = page_doc_text_field("author_id", @author)
     fields[8] = page_doc_text_field("parent_id", @parent)
     let all: [DbField] = @fields
-    db_serialize_doc(Span<u8> { ptr: buf, len: buf_len }, all.to(FIELD_COUNT as i64))
+    db_serialize_doc(buf, all.to(FIELD_COUNT as i64))
 
 
-# Field `name` into `tmp`, which holds at least `len` bytes: no field can be
-# longer than its document, so db_extract_field can never truncate it.
-fn page_doc_field(data: *u8, len: i32, name: StrView, tmp: *u8) -> Result<i32, RepoError>
-    let doc: [u8] = Span<u8> { ptr: data, len: len as i64 }
-    let n: i32 = db_extract_field(doc, name, Span<u8> { ptr: tmp, len: len as i64 })
+# Field `name` of `doc`, extracted into `tmp`, which is as long as `doc`: no
+# field can be longer than its document, so db_extract_field can never
+# truncate it. The result is a view of `tmp`.
+fn page_doc_field(doc: [u8], name: StrView, tmp: [u8]) -> Result<[u8], RepoError>
+    let n: i32 = db_extract_field(doc, name, tmp)
     if n < 0
         return Err(RepoError.SerializationError)
-    Ok(n)
+    Ok(tmp.to(n as i64))
 
 
-fn page_doc_text(data: *u8, len: i32, name: StrView, tmp: *u8) -> Result<String, RepoError>
-    let n: i32 = page_doc_field(data, len, name, tmp)?
-    Ok(string_from_bytes(Span<u8> { ptr: (tmp), len: (n as i64) as i64 }))
+fn page_doc_text(doc: [u8], name: StrView, tmp: [u8]) -> Result<String, RepoError>
+    Ok(string_from_bytes(page_doc_field(doc, name, tmp)?))
 
 
-fn page_doc_i64(data: *u8, len: i32, name: StrView, tmp: *u8) -> Result<i64, RepoError>
-    let n: i32 = page_doc_field(data, len, name, tmp)?
-    let digits: StrView = strview_from_ptr(tmp, n as i64)
-    match digits.parse_i64()
+fn page_doc_i64(doc: [u8], name: StrView, tmp: [u8]) -> Result<i64, RepoError>
+    let digits: [u8] = page_doc_field(doc, name, tmp)?
+    match digits.as_strview().parse_i64()
         Some(v) => Ok(v)
         None => Err(RepoError.SerializationError)
 
 
-fn page_doc_decode(data: *u8, len: i32, tmp: *u8) -> Result<WikiPage, RepoError>
+fn page_doc_decode(doc: [u8], tmp: [u8]) -> Result<WikiPage, RepoError>
     # Numbers first: a bad document fails before any String is allocated.
-    let id: i64 = page_doc_i64(data, len, "id", tmp)?
-    let version: i64 = page_doc_i64(data, len, "version", tmp)?
-    let created: i64 = page_doc_i64(data, len, "created_at", tmp)?
-    let updated: i64 = page_doc_i64(data, len, "updated_at", tmp)?
-    let author: i64 = page_doc_i64(data, len, "author_id", tmp)?
-    let parent: i64 = page_doc_i64(data, len, "parent_id", tmp)?
+    let id: i64 = page_doc_i64(doc, "id", tmp)?
+    let version: i64 = page_doc_i64(doc, "version", tmp)?
+    let created: i64 = page_doc_i64(doc, "created_at", tmp)?
+    let updated: i64 = page_doc_i64(doc, "updated_at", tmp)?
+    let author: i64 = page_doc_i64(doc, "author_id", tmp)?
+    let parent: i64 = page_doc_i64(doc, "parent_id", tmp)?
 
-    let slug: String = page_doc_text(data, len, "slug", tmp)?
-    let title: String = page_doc_text(data, len, "title", tmp)?
-    let content: String = page_doc_text(data, len, "content", tmp)?
+    let slug: String = page_doc_text(doc, "slug", tmp)?
+    let title: String = page_doc_text(doc, "title", tmp)?
+    let content: String = page_doc_text(doc, "content", tmp)?
 
     var page: WikiPage = wiki_page_new(slug, title, content)
     page.id.value = id
@@ -120,30 +119,30 @@ fn page_doc_decode(data: *u8, len: i32, tmp: *u8) -> Result<WikiPage, RepoError>
 
 # Rebuild a page from wiki_page_encode's bytes. Anything else, including a
 # Document that lacks a field, is a SerializationError.
-pub fn wiki_page_decode(data: *u8, len: i32) -> Result<WikiPage, RepoError>
-    if data == null or len <= 0
+pub fn wiki_page_decode(doc: [u8]) -> Result<WikiPage, RepoError>
+    if doc.len <= 0
         return Err(RepoError.SerializationError)
-    var tmp: Vec<u8> = vec_with_cap<u8>(len as i64)
-    if tmp.as_ptr() == null
+    var tmp: Vec<u8> = vec_zeroed<u8>(doc.len)
+    if tmp.len() != doc.len
         return Err(RepoError.SerializationError)
-    page_doc_decode(data, len, tmp.as_ptr())
+    page_doc_decode(doc, tmp[0..doc.len])
 
 
-fn page_doc_decode_legacy(data: *u8, len: i32, tmp: *u8) -> Result<WikiPage, RepoError>
-    let slug: String = page_doc_text(data, len, "slug", tmp)?
+fn page_doc_decode_legacy(doc: [u8], tmp: [u8]) -> Result<WikiPage, RepoError>
+    let slug: String = page_doc_text(doc, "slug", tmp)?
     if slug.len() == 0
         return Err(RepoError.SerializationError)
-    match page_doc_text(data, len, "content", tmp)
+    match page_doc_text(doc, "content", tmp)
         Ok(content) =>
-            let title: String = legacy_title(data, len, @slug, tmp)
+            let title: String = legacy_title(doc, @slug, tmp)
             Ok(wiki_page_new(slug, title, content))
         Err(e) =>
             Err(e)
 
 
 # A legacy page's title: the one wiki-seed stored, else its slug.
-fn legacy_title(data: *u8, len: i32, slug: *String, tmp: *u8) -> String
-    match page_doc_text(data, len, "title", tmp)
+fn legacy_title(doc: [u8], slug: *String, tmp: [u8]) -> String
+    match page_doc_text(doc, "title", tmp)
         Ok(title) =>
             if title.len() > 0
                 return title
@@ -158,13 +157,13 @@ fn legacy_title(data: *u8, len: i32, slug: *String, tmp: *u8) -> String
 # no id (the repository sets it) and zero timestamps; its next save writes it
 # back in wiki_page_encode's format. Anything without both fields is a
 # SerializationError.
-pub fn wiki_page_decode_legacy(data: *u8, len: i32) -> Result<WikiPage, RepoError>
-    if data == null or len <= 0
+pub fn wiki_page_decode_legacy(doc: [u8]) -> Result<WikiPage, RepoError>
+    if doc.len <= 0
         return Err(RepoError.SerializationError)
-    var tmp: Vec<u8> = vec_with_cap<u8>(len as i64)
-    if tmp.as_ptr() == null
+    var tmp: Vec<u8> = vec_zeroed<u8>(doc.len)
+    if tmp.len() != doc.len
         return Err(RepoError.SerializationError)
-    let result = page_doc_decode_legacy(data, len, tmp.as_ptr())
+    let result = page_doc_decode_legacy(doc, tmp[0..doc.len])
     match result
         Ok(page) =>
             var p: WikiPage = page

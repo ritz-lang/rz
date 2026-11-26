@@ -12,6 +12,8 @@
 
 import ritzlib.sys
 import ritzlib.io
+import ritzlib.span
+import ritzlib.strview
 
 import zeus.shm
 import zeus.control
@@ -394,6 +396,52 @@ fn test_worker_wait_response_slot_full_times_out() -> i32
     control_block_resp_read_inc(cb)
     assert worker_wait_response_slot(@ctx, 5) == 1
     assert worker_begin_response(@ctx, 7) != null
+
+    worker_destroy(@ctx)
+    shm_destroy(@region)
+    return 0
+
+# Copy `text` into `arena` (a request's slot partition); its offset there.
+fn arena_put(arena: *DataArena, text: StrView) -> i64
+    let dst: *u8 = data_arena_alloc(arena, text.len)
+    let off: i64 = data_arena_ptr_to_offset(arena, dst)
+    var bytes: [u8] = data_arena_bytes(arena, off, text.len)
+    bytes.copy_from(text.as_bytes())
+    off
+
+# The path and body as spans of the request's arena slot; a length that
+# runs past the slot is an empty span, not a read past it.
+[[test]]
+fn test_worker_request_path_and_body_bytes() -> i32
+    var cfg: ShmConfig
+    shm_config_default(@cfg)
+    var region: ShmRegion
+    shm_create(@region, @cfg)
+    let cb: *ControlBlock = shm_get_control_block(@region)
+    let slot_idx: i64 = control_block_slot_index(cb, cb.req_write_idx)
+    var arena: DataArena
+    shm_get_slot_arena(@region, slot_idx, @arena)
+
+    let path_off: i64 = arena_put(@arena, "/wiki")
+    let body_off: i64 = arena_put(@arena, "slug=a&content=b")
+    let slot: *RequestSlot = shm_get_request_ring(@region) + slot_idx
+    request_slot_init(slot)
+    slot.id = 7
+    request_slot_set_method(slot, HTTP_METHOD_POST)
+    request_slot_set_path(slot, path_off as u32, 5)
+    request_slot_set_body(slot, body_off as u32, 16)
+    request_slot_add_flag(slot, REQ_FLAG_COMPLETE)
+    control_block_req_write_inc(cb)
+
+    var ctx: WorkerContext
+    worker_init(@ctx, region.fd, region.mem.len)
+    let req: *RequestSlot = worker_poll_request(@ctx)
+    assert req != null
+    assert worker_request_path_bytes(@ctx, req).as_strview().eq("/wiki")
+    assert worker_request_body_bytes(@ctx, req).as_strview().eq("slug=a&content=b")
+
+    req.body_len = (shm_slot_arena_size(@region) + 1) as u32
+    assert worker_request_body_bytes(@ctx, req).len == 0
 
     worker_destroy(@ctx)
     shm_destroy(@region)

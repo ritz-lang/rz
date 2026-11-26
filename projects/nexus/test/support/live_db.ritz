@@ -25,7 +25,7 @@ import ritzlib.time { sleep_ms }
 import mausoleum.buffer_pool
 import mausoleum.collection { Collection, collection_empty, collection_init, collection_open_storage }
 import mausoleum.storage { Storage, storage_open, storage_pool }
-import mausoleum.m7m_types { DEFAULT_COLLECTION_ID, m7m_name_view }
+import mausoleum.m7m_types { DEFAULT_COLLECTION_ID }
 import ritzlib.box
 import mausoleum.client { Client, client_new, client_free, client_connect, client_disconnect }
 import mausoleum.server_async { serve_async }
@@ -45,7 +45,8 @@ pub struct LiveDb
     pid: i32
     port: i32
     has_dir: bool       # serving the data directory `dir`, not memory
-    dir: [128]u8        # NUL-terminated
+    dir: [128]u8        # dir_len bytes; live_db_dir views them
+    dir_len: i64
 
 
 # Bind `sock` to 0.0.0.0:`port`.
@@ -132,7 +133,7 @@ fn serve_store_forever(port: i32, dir: StrView)
 
 fn serve_child(db: *LiveDb, port: i32)
     if db.has_dir
-        serve_store_forever(port, m7m_name_view(@db.dir))
+        serve_store_forever(port, live_db_dir(db))
     else
         serve_forever(port)
 
@@ -171,7 +172,7 @@ fn wait_ready(db: *LiveDb) -> i32
 # Start a server. Returns 0 once it accepts connections, < 0 if it never did.
 pub fn live_db_start(db: *LiveDb) -> i32
     db.has_dir = false
-    db.dir[0] = 0
+    db.dir_len = 0
     live_db_serve(db)
 
 
@@ -260,6 +261,12 @@ fn copy_into(src_dir: StrView, dst_dir: StrView, name: StrView) -> i32
     rc
 
 
+# The data directory, a view of the LiveDb's own bytes.
+fn live_db_dir(db: *LiveDb) -> StrView
+    let dir: [u8] = @db.dir
+    dir.to(db.dir_len).as_strview()
+
+
 # Remove the data directory and everything in it (absent is fine).
 fn rm_dir(dir: StrView)
     remove_dir_all(dir)
@@ -276,11 +283,10 @@ pub fn live_db_start_store(db: *LiveDb, fixture: StrView) -> i32
     var name: String = string_new()
     format_into(@&name, "/tmp/nexus_live_db_{pid}_{seq}")
     var dir_buf: Span<u8> = @db.dir
-    let p: i64 = dir_buf.copy_from(name.as_view().as_bytes())
-    db.dir[p] = 0
+    db.dir_len = dir_buf.copy_from(name.as_view().as_bytes())
     db.has_dir = true
     db.pid = 0
-    let dir: StrView = StrView { ptr: @db.dir[0], len: p }
+    let dir: StrView = live_db_dir(db)
     rm_dir(dir)
     match mkdir(dir, 493)
         Ok(_) => pass
@@ -298,5 +304,5 @@ pub fn live_db_start_store(db: *LiveDb, fixture: StrView) -> i32
 pub fn live_db_remove_store(db: *LiveDb)
     live_db_stop(db)
     if db.has_dir
-        rm_dir(strview_from_cstr(@db.dir[0]))
+        rm_dir(live_db_dir(db))
         db.has_dir = false

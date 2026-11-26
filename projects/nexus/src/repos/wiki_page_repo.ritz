@@ -28,10 +28,10 @@
 # nexus recovers when Mausoleum comes back. An unreachable Mausoleum is a
 # NetworkError (a 503), never a missing page.
 
-import ritzlib.memory
+import ritzlib.span
 import ritzlib.strview { StrView }
 import ritzlib.string { String, string_from }
-import ritzlib.gvec { Vec, vec_new, vec_with_cap }
+import ritzlib.gvec { Vec, vec_new, vec_zeroed }
 
 import spire.repo.mausoleum {
     Db,
@@ -57,7 +57,7 @@ import models.wiki_page { WikiPage, wiki_page_drop }
 import errors.repo_error { RepoError }
 import repos.wiki_page_codec { wiki_page_encode, wiki_page_encode_bound, wiki_page_decode, wiki_page_decode_legacy }
 import services.validation { MAX_CONTENT_SIZE }
-import repos.memory_docs { MemDocs, mem_docs_new, mem_docs_insert, mem_docs_get, mem_docs_delete, mem_docs_scan, mem_docs_drop }
+import repos.memory_docs { MemDocs, mem_docs_new, mem_docs_insert, mem_docs_get, mem_docs_delete, mem_docs_scan, mem_docs_clear }
 
 
 # A db_* result meaning "could not reach Mausoleum at all" (vs. a refused op).
@@ -198,7 +198,7 @@ pub fn wiki_page_repo_connect_error(repo: *WikiPageRepository) -> i32
 pub fn wiki_page_repo_disconnect(repo: *WikiPageRepository)
     if repo.connected
         if repo.memory
-            mem_docs_drop(@repo.mem)
+            mem_docs_clear(@&repo.mem)
         else
             db_close(@repo.db)
         repo.connected = false
@@ -223,14 +223,14 @@ fn unreachable_error() -> RepoError
 # or memory
 # ============================================================================
 
-fn doc_insert(repo: *WikiPageRepository, data: *u8, len: i32) -> i64
+fn doc_insert(repo: *WikiPageRepository, doc: [u8]) -> i64
     if repo.memory
-        return mem_docs_insert(@repo.mem, data, len)
+        return mem_docs_insert(@&repo.mem, doc)
     var rc: i64 = UNREACHABLE
     var attempt: i32 = 0
     while attempt < 2
         if ensure_db(repo) == 0
-            rc = db_insert(@repo.db, Span<u8> { ptr: data, len: len as i64 })
+            rc = db_insert(@repo.db, doc)
             if rc >= 0
                 return rc
             db_close(@repo.db)
@@ -240,15 +240,21 @@ fn doc_insert(repo: *WikiPageRepository, data: *u8, len: i32) -> i64
     rc
 
 
-# 1 = found (data_out set), 0 = no such document, < 0 = failed.
-fn doc_get(repo: *WikiPageRepository, id: i64, data_out: **u8, len_out: *i32) -> i64
+# 1 = found (doc_out set to its bytes, valid until the next doc_* call),
+# 0 = no such document, < 0 = failed: db_get's outcomes and out-parameter,
+# which the retry loop below passes through.
+fn doc_get(repo: *WikiPageRepository, id: i64, doc_out: *Span<u8>) -> i64
     if repo.memory
-        return mem_docs_get(@repo.mem, id, data_out, len_out) as i64
+        match mem_docs_get(@&repo.mem, id)
+            Some(doc) =>
+                *doc_out = doc
+                return 1
+            None => return 0
     var rc: i64 = UNREACHABLE
     var attempt: i32 = 0
     while attempt < 2
         if ensure_db(repo) == 0
-            rc = db_get(@repo.db, id, data_out, len_out) as i64
+            rc = db_get(@repo.db, id, doc_out) as i64
             if rc >= 0
                 return rc
             db_close(@repo.db)
@@ -261,7 +267,7 @@ fn doc_get(repo: *WikiPageRepository, id: i64, data_out: **u8, len_out: *i32) ->
 # 1 = deleted, 0 = no such document, < 0 = failed.
 fn doc_delete(repo: *WikiPageRepository, id: i64) -> i64
     if repo.memory
-        return mem_docs_delete(@repo.mem, id) as i64
+        return if mem_docs_delete(@&repo.mem, id) then 1 else 0
     var rc: i64 = UNREACHABLE
     var attempt: i32 = 0
     while attempt < 2
@@ -282,7 +288,7 @@ fn doc_scan(repo: *WikiPageRepository, step: *u8, reset: *u8, user: *u8) -> i64
     repo.scans += 1
     if repo.memory
         reset_fn(user)
-        return mem_docs_scan(@repo.mem, step, user) as i64
+        return mem_docs_scan(@&repo.mem, step, user) as i64
     var rc: i64 = UNREACHABLE
     var attempt: i32 = 0
     while attempt < 2
@@ -335,16 +341,16 @@ fn doc_error(rc: i64, what: StrView) -> RepoError
 # Decode a stored document. The id comes from the database, not the bytes: the
 # id field is only meaningful for a cached copy.
 # A document that isn't wiki_page_encode's is tried as a pre-#2209 page.
-fn decode_stored(doc_id: i64, data: *u8, len: i32) -> Result<WikiPage, RepoError>
-    var page: WikiPage = decode_any(data, len)?
+fn decode_stored(doc_id: i64, doc: [u8]) -> Result<WikiPage, RepoError>
+    var page: WikiPage = decode_any(doc)?
     page.id.value = doc_id
     Ok(page)
 
 
-fn decode_any(data: *u8, len: i32) -> Result<WikiPage, RepoError>
-    match wiki_page_decode(data, len)
+fn decode_any(doc: [u8]) -> Result<WikiPage, RepoError>
+    match wiki_page_decode(doc)
         Ok(page) => Ok(page)
-        Err(_) => wiki_page_decode_legacy(data, len)
+        Err(_) => wiki_page_decode_legacy(doc)
 
 
 # Get a page by its document ID
@@ -352,22 +358,21 @@ pub fn wiki_page_repo_get_by_id(repo: *WikiPageRepository, id: DocumentId) -> Re
     if not repo.connected
         return Err(not_connected())
 
-    var data: *u8 = null
-    var len: i32 = 0
-    let result: i64 = doc_get(repo, id.value, @data, @len)
+    var doc: [u8] = span_empty<u8>()
+    let result: i64 = doc_get(repo, id.value, @doc)
     if result == 0
         return Err(RepoError.NotFound)
     if result < 0
         return Err(doc_error(result, "Get failed"))
 
-    decode_stored(id.value, data, len)
+    decode_stored(id.value, doc)
 
 
 # State for one slug scan: every document holding the slug. `tmp` holds slug
 # length + 1 bytes, so a longer stored slug is cut to a length that can't match.
 struct SlugScan
     slug: StrView
-    tmp: *u8
+    tmp: [u8]
     newest: i64              # the newest document holding the slug, -1 if none
     ids: [64]i64             # every document holding it (MAX_COPIES)
     n_ids: i64
@@ -380,18 +385,14 @@ fn slug_scan_reset(user_data: *u8) -> i32
     0
 
 
-fn slug_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+fn slug_scan_step(doc_id: i64, doc: [u8], user_data: *u8) -> i32
     let scan: *SlugScan = user_data as *SlugScan
-    let want: i64 = (scan.slug).len()
-    let doc: [u8] = Span<u8> { ptr: data, len: len as i64 }
-    let n: i32 = db_extract_field(doc, "slug", Span<u8> { ptr: scan.tmp, len: want + 1 })
-    if n as i64 != want
+    let tmp: [u8] = scan.tmp
+    let n: i32 = db_extract_field(doc, "slug", tmp)
+    if n < 0
         return 0
-    var i: i64 = 0
-    while i < want
-        if *(scan.tmp + i) != (scan.slug).get(i)
-            return 0
-        i += 1
+    if not tmp.to(n as i64).as_strview().eq(scan.slug)
+        return 0
     if scan.n_ids < MAX_COPIES
         scan.ids[scan.n_ids] = doc_id
         scan.n_ids += 1
@@ -426,12 +427,14 @@ fn find_slug(repo: *WikiPageRepository, slug: StrView, scan: *SlugScan) -> Resul
         # reports the error the way every operation does.
 
     # scan.tmp borrows this buffer for the scan only.
-    var tmp: Vec<u8> = vec_with_cap<u8>(slug.len() + 1)
-    scan.tmp = tmp.as_ptr()
-    if scan.tmp == null
+    let room: i64 = slug.len() + 1
+    var tmp: Vec<u8> = vec_zeroed<u8>(room)
+    if tmp.len() != room
         return Err(RepoError.DatabaseError(string_from("Out of memory")))
+    let view: [u8] = tmp[0..room]
+    scan.tmp = view
     let scanned: i64 = doc_scan(repo, slug_scan_step as *u8, slug_scan_reset as *u8, scan as *u8)
-    scan.tmp = null
+    scan.tmp = span_empty<u8>()
     if scanned < 0
         return Err(doc_error(scanned, "Scan failed"))
     Ok(())
@@ -456,14 +459,14 @@ pub fn wiki_page_repo_get_by_slug(repo: *WikiPageRepository, slug: StrView) -> R
 # Encode and insert `page`, returning its new document id.
 fn insert_document(repo: *WikiPageRepository, page: *WikiPage) -> Result<i64, RepoError>
     let bound: i64 = wiki_page_encode_bound(page)
-    var buf: Vec<u8> = vec_with_cap<u8>(bound)
-    if buf.as_ptr() == null
+    var buf: Vec<u8> = vec_zeroed<u8>(bound)
+    if buf.len() != bound
         return Err(RepoError.SerializationError)
-    let n: i64 = wiki_page_encode(page, buf.as_ptr(), bound)
+    let n: i64 = wiki_page_encode(page, buf[0..bound])
     if n < 0
         return Err(RepoError.SerializationError)
 
-    let doc_id: i64 = doc_insert(repo, buf.as_ptr(), n as i32)
+    let doc_id: i64 = doc_insert(repo, buf[0..n])
     if doc_id < 0
         return Err(doc_error(doc_id, "Insert failed"))
     Ok(doc_id)
@@ -594,9 +597,9 @@ fn list_keep(pages: *Vec<WikiPage>, page: WikiPage, newest: bool)
         pass
 
 
-fn list_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+fn list_scan_step(doc_id: i64, doc: [u8], user_data: *u8) -> i32
     let scan: *ListScan = user_data as *ListScan
-    match decode_stored(doc_id, data, len)
+    match decode_stored(doc_id, doc)
         Ok(page) =>
             list_keep(@&scan.pages, page, true)
             0
@@ -655,9 +658,9 @@ fn adopt_scan_reset(user_data: *u8) -> i32
     0
 
 
-fn adopt_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+fn adopt_scan_step(doc_id: i64, doc: [u8], user_data: *u8) -> i32
     let scan: *AdoptScan = user_data as *AdoptScan
-    match decode_stored(doc_id, data, len)
+    match decode_stored(doc_id, doc)
         Ok(page) =>
             scan.ids.push(doc_id)
             list_keep(@&scan.pages, page, true)
@@ -667,9 +670,9 @@ fn adopt_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
 
 
 # Oldest document per slug in "nexus_pages".
-fn oldest_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+fn oldest_scan_step(doc_id: i64, doc: [u8], user_data: *u8) -> i32
     let scan: *ListScan = user_data as *ListScan
-    match decode_stored(doc_id, data, len)
+    match decode_stored(doc_id, doc)
         Ok(page) =>
             list_keep(@&scan.pages, page, false)
             0

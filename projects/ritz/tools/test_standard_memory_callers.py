@@ -39,7 +39,6 @@ PINS = {
     "cryptosec": 0,
     "indium": 16,
     "lexis": 6,
-    "nexus": 6,
     "prism": 3,
     "ritz-lsp": 13,
     "ritz/examples": 30,

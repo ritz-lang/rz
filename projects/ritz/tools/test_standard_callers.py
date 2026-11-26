@@ -57,7 +57,7 @@ PINS = {
     # exec (2): test_integration / test_multi_collection fork+exec the built
     # server binary; ritzlib.process.exec is that process boundary.
     "mausoleum": 2,
-    "nexus": 29,
+    "nexus": 0,
     "prism": 3,
     "ritz": 1391,
     "ritz-lsp": 30,
@@ -131,7 +131,7 @@ C_LITERAL_PINS = {
     "iris": 1,
     "larb": 0,
     "mausoleum": 33,
-    "nexus": 48,
+    "nexus": 0,
     "prism": 1,
     "ritz": 3888,
     "ritz-lsp": 4,

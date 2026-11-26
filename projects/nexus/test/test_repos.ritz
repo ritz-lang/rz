@@ -4,7 +4,7 @@
 # server (test/support/live_db.ritz): the server rejects anything that is not
 # a Document, so only a live server proves a page can actually be stored.
 
-import ritzlib.memory
+import ritzlib.span
 import ritzlib.strview { StrView }
 import ritzlib.string { String, string_from, string_new }
 import ritzlib.gvec
@@ -57,11 +57,11 @@ fn big_string(n: i64) -> String
 # Encode then decode, as both the database and the cache do.
 fn round_trip(page: *WikiPage) -> Result<WikiPage, RepoError>
     let bound: i64 = wiki_page_encode_bound(page)
-    var buf: Vec<u8> = vec_with_cap<u8>(bound)
-    let n: i64 = wiki_page_encode(page, buf.as_ptr(), bound)
+    var buf: Vec<u8> = vec_zeroed<u8>(bound)
+    let n: i64 = wiki_page_encode(page, buf[0..buf.len()])
     if n <= 0
         return Err(RepoError.SerializationError)
-    wiki_page_decode(buf.as_ptr(), n as i32)
+    wiki_page_decode(buf[0..n])
 
 
 # 0 = `e` is the variant the name says, 1 = any other variant.
@@ -161,7 +161,8 @@ fn test_codec_has_no_fixed_size_limit() -> i32
 fn test_encode_refuses_a_buffer_too_small() -> i32
     var page = page_of("home", "Home", "content")
     var buf: [8]u8
-    if wiki_page_encode(@page, @buf[0], 8) < 0
+    let out: [u8] = @buf
+    if wiki_page_encode(@page, out) < 0
         return 0
     1
 
@@ -173,7 +174,8 @@ fn test_decode_rejects_garbage() -> i32
     while i < 64
         junk[i] = 0xFF
         i += 1
-    match wiki_page_decode(@junk[0], 64)
+    let doc: [u8] = @junk
+    match wiki_page_decode(doc)
         Ok(_) => 1
         Err(e) => expect_serialization(@e)
 
@@ -182,9 +184,9 @@ fn test_decode_rejects_garbage() -> i32
 fn test_decode_rejects_a_truncated_document() -> i32
     var page = page_of("home", "Home", "some content that will be cut off")
     let bound: i64 = wiki_page_encode_bound(@page)
-    var buf: Vec<u8> = vec_with_cap<u8>(bound)
-    let n: i64 = wiki_page_encode(@page, buf.as_ptr(), bound)
-    let result = wiki_page_decode(buf.as_ptr(), (n / 2) as i32)
+    var buf: Vec<u8> = vec_zeroed<u8>(bound)
+    let n: i64 = wiki_page_encode(@page, buf[0..buf.len()])
+    let result = wiki_page_decode(buf[0..n / 2])
     match result
         Ok(_) => 1
         Err(e) => expect_serialization(@e)
@@ -202,7 +204,7 @@ fn test_decode_rejects_a_document_missing_fields() -> i32
     let n: i64 = db_serialize_doc(out, all)
     if n <= 0
         return 2
-    match wiki_page_decode(@buf[0], n as i32)
+    match wiki_page_decode(out.to(n))
         Ok(_) => 1
         Err(e) => expect_serialization(@e)
 
@@ -225,7 +227,7 @@ fn test_decode_rejects_a_document_missing_only_the_title() -> i32
     let n: i64 = db_serialize_doc(out, all)
     if n <= 0
         return 2
-    match wiki_page_decode(@buf[0], n as i32)
+    match wiki_page_decode(out.to(n))
         Ok(_) => 1
         Err(e) => expect_serialization(@e)
 
@@ -655,8 +657,8 @@ fn worst_case_page(content_len: i64) -> WikiPage
 
 fn encoded_len(page: *WikiPage) -> i64
     let bound: i64 = wiki_page_encode_bound(page)
-    var buf: Vec<u8> = vec_with_cap<u8>(bound)
-    wiki_page_encode(page, buf.as_ptr(), bound)
+    var buf: Vec<u8> = vec_zeroed<u8>(bound)
+    wiki_page_encode(page, buf[0..buf.len()])
 
 
 # MAX_CONTENT_SIZE is exactly what one mausoleum document leaves for content
@@ -750,16 +752,13 @@ struct SlugCount
     n: i32
 
 
-fn slug_count_step(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
+fn slug_count_step(doc_id: i64, doc: [u8], user: *u8) -> i32
     let sc: *SlugCount = user as *SlugCount
     var got: [129]u8
-    let doc: [u8] = Span<u8> { ptr: data, len: len as i64 }
-    let n: i32 = db_extract_field(doc, "slug", @got)
-    if n as i64 != (sc.slug).len()
+    let out: [u8] = @got
+    let n: i32 = db_extract_field(doc, "slug", out)
+    if n < 0 or not out.to(n as i64).as_strview().eq(sc.slug)
         return 0
-    for i in 0..n
-        if got[i] != *((sc.slug).as_ptr() + i)
-            return 0
     sc.n += 1
     0
 
@@ -1048,10 +1047,10 @@ fn test_codec_decodes_a_legacy_page() -> i32
     if n < 0
         return 1
     # The strict decoder still refuses it.
-    match wiki_page_decode(@buf[0], n as i32)
+    match wiki_page_decode(out.to(n))
         Ok(_) => return 2
         Err(_) => pass
-    match wiki_page_decode_legacy(@buf[0], n as i32)
+    match wiki_page_decode_legacy(out.to(n))
         Ok(page) =>
             if not (page.slug).eq("welcome")
                 return 3
@@ -1077,7 +1076,7 @@ fn test_codec_legacy_decode_keeps_a_stored_title() -> i32
     let n: i64 = db_serialize_doc(out, all)
     if n < 0
         return 1
-    match wiki_page_decode_legacy(@buf[0], n as i32)
+    match wiki_page_decode_legacy(out.to(n))
         Ok(page) =>
             if not (page.title).eq("The Ritz Language")
                 return 2
@@ -1094,7 +1093,7 @@ fn test_codec_legacy_decode_refuses_a_document_without_a_slug() -> i32
     let out: [u8] = @buf
     let all: [DbField] = @fields
     let n: i64 = db_serialize_doc(out, all)
-    match wiki_page_decode_legacy(@buf[0], n as i32)
+    match wiki_page_decode_legacy(out.to(n))
         Ok(_) => 1
         Err(e) => expect_serialization(@e)
 
@@ -1174,9 +1173,8 @@ const V1_SESSION: i64 = 6
 fn v1_default_has_only_the_session(legacy: *Db) -> bool
     var i: i64 = 0
     while i < V1_DOCS
-        var data: *u8 = null
-        var len: i32 = 0
-        let found: i32 = db_get(legacy, V1_FIRST_ID + i, @data, @len)
+        var doc: [u8] = span_empty<u8>()
+        let found: i32 = db_get(legacy, V1_FIRST_ID + i, @doc)
         if found < 0 or (found == 1) != (i == V1_SESSION)
             return false
         i += 1
@@ -1190,7 +1188,7 @@ fn raw_connect_default(raw: *Db, port: i32) -> i32
     db_connect(raw)
 
 
-fn count_step(doc_id: i64, data: *u8, len: i32, user: *u8) -> i32
+fn count_step(doc_id: i64, doc: [u8], user: *u8) -> i32
     let n: *i64 = user as *i64
     *n = *n + 1
     0
@@ -1361,7 +1359,8 @@ fn check_keeps_current(a: *WikiPageRepository, b: *WikiPageRepository, db: *Live
 # format it no longer fits, so its move into nexus_pages is refused. Returns
 # its id, < 0 if the server took no such page.
 fn put_unmovable(raw: *Db) -> i64
-    var buf: Vec<u8> = vec_with_cap<u8>(MAX_DOC_SIZE + 64)
+    var buf: Vec<u8> = vec_zeroed<u8>(MAX_DOC_SIZE + 64)
+    let out: [u8] = buf[0..buf.len()]
     let content: String = big_string(MAX_DOC_SIZE)
     # The longest content whose document fits.
     var len: i64 = MAX_DOC_SIZE
@@ -1371,11 +1370,11 @@ fn put_unmovable(raw: *Db) -> i64
         fields[0] = db_field("slug", "huge")
         fields[1] = db_field("content", content.as_view().take(len))
         let all: [DbField] = @fields
-        n = db_serialize_doc(Span<u8> { ptr: buf.as_ptr(), len: MAX_DOC_SIZE + 64 }, all)
+        n = db_serialize_doc(out, all)
         len -= 1
     var id: i64 = -1
     if n > 0 and n <= MAX_DOC_SIZE
-        id = db_insert(raw, Span<u8> { ptr: buf.as_ptr(), len: n })
+        id = db_insert(raw, out.to(n))
     id
 
 

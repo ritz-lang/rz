@@ -18,12 +18,11 @@
 #   # Insert a document (`doc` is a [u8] of serialized Document bytes)
 #   var doc_id: i64 = db_insert(@db, doc)
 #
-#   # Get a document
-#   var data: *u8 = null
-#   var len: i32 = 0
-#   db_get(@db, doc_id, @data, @len)
+#   # Get a document (a view of the client's receive buffer)
+#   var doc: [u8] = span_empty<u8>()
+#   db_get(@db, doc_id, @doc)
 #
-#   # Scan all documents
+#   # Scan all documents: callback(doc_id, doc: [u8], user_data)
 #   db_scan(@db, callback, user_data)
 #
 #   # Close connection
@@ -163,16 +162,14 @@ pub fn db_insert(db: *Db, doc: [u8]) -> i64
         return -1
     return client_insert(db.client.as_ptr(), doc)
 
-# Get raw document data by ID
-# Returns 1 if found, 0 if not found, < 0 on error
-pub fn db_get(db: *Db, doc_id: i64, data_out: **u8, len_out: *i32) -> i32
+# Get a document's bytes by ID into `doc_out`: a view of the client's
+# receive buffer, valid until the next request on `db` (client_get's).
+# Returns 1 if found, 0 if not found, < 0 on error. The out-parameter is
+# client_get's, passed straight through (it was a *u8 and a *i32 before).
+pub fn db_get(db: *Db, doc_id: i64, doc_out: *Span<u8>) -> i32
     if db.connected == 0
         return -1
-    var doc: [u8] = span_empty<u8>()
-    let rc: i32 = client_get(db.client.as_ptr(), doc_id, @doc)
-    *data_out = doc.as_ptr()
-    *len_out = doc.len as i32
-    return rc
+    return client_get(db.client.as_ptr(), doc_id, doc_out)
 
 # Delete a document by ID
 # Returns 1 if deleted, 0 if not found, < 0 on error
@@ -181,26 +178,14 @@ pub fn db_delete(db: *Db, doc_id: i64) -> i32
         return -1
     return client_delete(db.client.as_ptr(), doc_id)
 
-# Scan all documents with a callback
-# callback: fn(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+# Scan all documents with a callback (client_scan's)
+# callback: fn(doc_id: i64, doc: [u8], user_data: *u8) -> i32
 #   Return 0 to continue, non-zero to stop
 # Returns number of documents scanned, or < 0 on error
 pub fn db_scan(db: *Db, callback: *u8, user_data: *u8) -> i32
     if db.connected == 0
         return -1
-    var fwd: ScanForward = ScanForward { callback: callback, user_data: user_data }
-    return client_scan(db.client.as_ptr(), scan_forward as *u8, @fwd as *u8)
-
-# db_scan's callback and its user_data, behind client_scan's: client_scan
-# hands each document over as a [u8], db_scan's callers take (ptr, len).
-struct ScanForward
-    callback: *u8
-    user_data: *u8
-
-fn scan_forward(doc_id: i64, doc: [u8], user: *u8) -> i32
-    let fwd: *ScanForward = user as *ScanForward
-    let cb: fn(i64, *u8, i32, *u8) -> i32 = fwd.callback as fn(i64, *u8, i32, *u8) -> i32
-    return cb(doc_id, doc.as_ptr(), doc.len as i32, fwd.user_data)
+    return client_scan(db.client.as_ptr(), callback, user_data)
 
 # ============================================================================
 # Secondary indexes

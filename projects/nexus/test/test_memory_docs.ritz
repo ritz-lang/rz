@@ -1,0 +1,131 @@
+# test/test_memory_docs.ritz - the in-memory document store (AGAST #4692)
+#
+# Each document owns a Vec<u8> copy of its bytes; MemDocs' Drop frees them.
+# Ids only grow, a delete keeps the rest in id order, and a store that grows,
+# deletes and grows again still hands back exactly the bytes it was given.
+
+import ritzlib.span
+import ritzlib.strview { StrView }
+import ritzlib.string { String, string_new, string_from }
+
+import repos.memory_docs { MemDocs, mem_docs_new, mem_docs_insert, mem_docs_get, mem_docs_delete, mem_docs_scan, mem_docs_clear }
+
+
+# True if document `id` holds exactly `want`.
+fn holds(m: @&MemDocs, id: i64, want: StrView) -> bool
+    match mem_docs_get(m, id)
+        Some(doc) => doc.as_strview().eq(want)
+        None => false
+
+
+# Every document's first byte, in scan order, into the String at `user`.
+fn first_bytes_step(doc_id: i64, doc: [u8], user: *u8) -> i32
+    let out: *String = user as *String
+    out.push(doc.get(0))
+    0
+
+
+fn scan_order(m: @&MemDocs) -> String
+    var out: String = string_new()
+    mem_docs_scan(m, first_bytes_step as *u8, @out as *u8)
+    out
+
+
+fn stop_at_second(doc_id: i64, doc: [u8], user: *u8) -> i32
+    let seen: *i64 = user as *i64
+    *seen = *seen + 1
+    if *seen == 2 then 1 else 0
+
+
+[[test]]
+fn test_insert_copies_and_get_returns_the_bytes() -> i32
+    var m: MemDocs = mem_docs_new()
+    var src: String = string_from("abc")
+    let id: i64 = mem_docs_insert(@&m, src.as_view().as_bytes())
+    if id != 1
+        return 1
+    # The store holds its own copy.
+    src.set_char(0, 'z')
+    if not holds(@&m, id, "abc")
+        return 2
+    match mem_docs_get(@&m, 99)
+        Some(_) => 3
+        None => 0
+
+
+[[test]]
+fn test_insert_refuses_an_empty_document() -> i32
+    var m: MemDocs = mem_docs_new()
+    let empty: StrView = ""
+    if mem_docs_insert(@&m, empty.as_bytes()) != -1 then 1 else 0
+
+
+[[test]]
+fn test_delete_keeps_the_rest_in_id_order() -> i32
+    var m: MemDocs = mem_docs_new()
+    let a: i64 = mem_docs_insert(@&m, "a1".as_bytes())
+    let b: i64 = mem_docs_insert(@&m, "b22".as_bytes())
+    let c: i64 = mem_docs_insert(@&m, "c333".as_bytes())
+    let d: i64 = mem_docs_insert(@&m, "d4444".as_bytes())
+    if not mem_docs_delete(@&m, b)
+        return 1
+    if mem_docs_delete(@&m, b)
+        return 2
+    var order: String = scan_order(@&m)
+    if not order.eq("acd")
+        return 3
+    if not holds(@&m, a, "a1") or not holds(@&m, c, "c333") or not holds(@&m, d, "d4444")
+        return 4
+    # The last and the first go too.
+    if not mem_docs_delete(@&m, d) or not mem_docs_delete(@&m, a)
+        return 5
+    var rest: String = scan_order(@&m)
+    if not rest.eq("c") then 6 else 0
+
+
+[[test]]
+fn test_ids_grow_and_space_is_reused_after_deletes() -> i32
+    var m: MemDocs = mem_docs_new()
+    var i: i64 = 0
+    while i < 100
+        if mem_docs_insert(@&m, "xy".as_bytes()) != i + 1
+            return 1
+        i += 1
+    i = 1
+    while i <= 100
+        if i % 2 == 0 and not mem_docs_delete(@&m, i)
+            return 2
+        i += 1
+    # Deleted ids are never handed out again.
+    if mem_docs_insert(@&m, "new".as_bytes()) != 101
+        return 3
+    if not holds(@&m, 99, "xy") or not holds(@&m, 101, "new")
+        return 4
+    match mem_docs_get(@&m, 100)
+        Some(_) => return 5
+        None => pass
+    var order: String = scan_order(@&m)
+    if order.len() != 51 then 6 else 0
+
+
+[[test]]
+fn test_scan_stops_when_the_callback_says() -> i32
+    var m: MemDocs = mem_docs_new()
+    mem_docs_insert(@&m, "a".as_bytes())
+    mem_docs_insert(@&m, "b".as_bytes())
+    mem_docs_insert(@&m, "c".as_bytes())
+    var seen: i64 = 0
+    if mem_docs_scan(@&m, stop_at_second as *u8, @seen as *u8) != 2 then 1 else 0
+
+
+[[test]]
+fn test_clear_drops_every_document() -> i32
+    var m: MemDocs = mem_docs_new()
+    mem_docs_insert(@&m, "a".as_bytes())
+    mem_docs_insert(@&m, "b".as_bytes())
+    mem_docs_clear(@&m)
+    var order: String = scan_order(@&m)
+    if not order.is_empty()
+        return 1
+    # Ids keep growing after a clear.
+    if mem_docs_insert(@&m, "c".as_bytes()) != 3 then 2 else 0
