@@ -5,6 +5,10 @@
 # absolute, and a label or undefined symbol becomes a fixup against it, which
 # the Object resolves or turns into a relocation.
 #
+# The encoder set is the text dialect plus the encoder-only forms rllvm
+# selects (encode_gpr, encode_sse): the parser rejects those mnemonics, and
+# rllvm builds their `Insn` directly.
+#
 # A branch (jmp, jcc) has two forms: `encode` gives the near one (rel16 in
 # .code16, else rel32) and `encode_short` the rel8 one, so the assembler can
 # start short and grow a branch whose target is out of range. `loop` has
@@ -19,6 +23,8 @@ import razm.parse { Mode }
 import razm.emit
 import razm.encode_ops
 import razm.encode_mov
+import razm.encode_gpr
+import razm.encode_sse
 
 
 # `insn` in `mode`, a branch in its near form.
@@ -44,10 +50,12 @@ pub fn encode_short(insn: @Insn, mode: Mode, exprs: @Exprs, syms: @SymTable) -> 
 
 
 # What an instruction name encodes as. Aliases share one: jc is jb, jnc
-# jae, jz je, jnz jne.
+# jae, jz je, jnz jne, and likewise for setcc and cmovcc.
 enum Op
     Add
     Or
+    Adc
+    Sbb
     And
     Sub
     Xor
@@ -56,25 +64,32 @@ enum Op
     Bt
     Mov
     Movabs
-    Movzb
+    Widen(OpSize, u8)       # a widening move from a source of that size, by 0f op (63: movslq)
     Lea
     Xchg
+    Xadd
+    Cmpxchg
     Inc
     Dec
-    Shl
-    Shr
-    Sar
+    Unary(u8)               # not, neg, mul, div, idiv: f6/f7 /ext
+    Imul
+    Convert(u8, OpSize)     # cbw/cwde/cdqe (98) and cwd/cdq/cqo (99)
+    Shift(u8)               # rol, ror, shl, shr, sar: group 2 /ext
+    DoubleShift(u8)         # shld (0f a4), shrd (0f ac)
+    Bsf
+    Bsr
+    Bswap
+    Setcc(u8)
+    Cmovcc(u8)
+    Jcc(u8)
+    Vector(Sse)
+    X87(u8, u8)             # an x87 load or store: opcode, /ext
     Push
     Pop
     Pushf
     Popf
     Call
     Jmp
-    Ja
-    Jb
-    Jae
-    Je
-    Jne
     Loop
     Ret
     Lret
@@ -115,6 +130,8 @@ fn op_of(name: StrView) -> Result<Op, EncodeError>
     match name
         "add" => Ok(Op.Add)
         "or" => Ok(Op.Or)
+        "adc" => Ok(Op.Adc)
+        "sbb" => Ok(Op.Sbb)
         "and" => Ok(Op.And)
         "sub" => Ok(Op.Sub)
         "xor" => Ok(Op.Xor)
@@ -123,25 +140,49 @@ fn op_of(name: StrView) -> Result<Op, EncodeError>
         "bt" => Ok(Op.Bt)
         "mov" => Ok(Op.Mov)
         "movabs" => Ok(Op.Movabs)
-        "movzb" => Ok(Op.Movzb)
+        "movzb" => Ok(Op.Widen(OpSize.Byte, 0xB6))
+        "movzw" => Ok(Op.Widen(OpSize.Word, 0xB7))
+        "movsb" => Ok(Op.Widen(OpSize.Byte, 0xBE))
+        "movsw" => Ok(Op.Widen(OpSize.Word, 0xBF))
+        "movsl" => Ok(Op.Widen(OpSize.Long, 0x63))
         "lea" => Ok(Op.Lea)
         "xchg" => Ok(Op.Xchg)
+        "xadd" => Ok(Op.Xadd)
+        "cmpxchg" => Ok(Op.Cmpxchg)
         "inc" => Ok(Op.Inc)
         "dec" => Ok(Op.Dec)
-        "shl" => Ok(Op.Shl)
-        "shr" => Ok(Op.Shr)
-        "sar" => Ok(Op.Sar)
+        "not" => Ok(Op.Unary(2))
+        "neg" => Ok(Op.Unary(3))
+        "mul" => Ok(Op.Unary(4))
+        "div" => Ok(Op.Unary(6))
+        "idiv" => Ok(Op.Unary(7))
+        "imul" => Ok(Op.Imul)
+        "cbtw" | "cbw" => Ok(Op.Convert(0x98, OpSize.Word))
+        "cwtl" | "cwde" => Ok(Op.Convert(0x98, OpSize.Long))
+        "cltq" | "cdqe" => Ok(Op.Convert(0x98, OpSize.Quad))
+        "cwtd" | "cwd" => Ok(Op.Convert(0x99, OpSize.Word))
+        "cltd" | "cdq" => Ok(Op.Convert(0x99, OpSize.Long))
+        "cqto" | "cqo" => Ok(Op.Convert(0x99, OpSize.Quad))
+        "rol" => Ok(Op.Shift(0))
+        "ror" => Ok(Op.Shift(1))
+        "shl" => Ok(Op.Shift(4))
+        "shr" => Ok(Op.Shift(5))
+        "sar" => Ok(Op.Shift(7))
+        "shld" => Ok(Op.DoubleShift(0xA4))
+        "shrd" => Ok(Op.DoubleShift(0xAC))
+        "bsf" => Ok(Op.Bsf)
+        "bsr" => Ok(Op.Bsr)
+        "bswap" => Ok(Op.Bswap)
+        "flds" => Ok(Op.X87(0xD9, 0))
+        "fldl" => Ok(Op.X87(0xDD, 0))
+        "fstps" => Ok(Op.X87(0xD9, 3))
+        "fstpl" => Ok(Op.X87(0xDD, 3))
         "push" => Ok(Op.Push)
         "pop" => Ok(Op.Pop)
         "pushf" => Ok(Op.Pushf)
         "popf" => Ok(Op.Popf)
         "call" => Ok(Op.Call)
         "jmp" => Ok(Op.Jmp)
-        "ja" => Ok(Op.Ja)
-        "jb" | "jc" => Ok(Op.Jb)
-        "jae" | "jnc" => Ok(Op.Jae)
-        "je" | "jz" => Ok(Op.Je)
-        "jne" | "jnz" => Ok(Op.Jne)
         "loop" => Ok(Op.Loop)
         "ret" => Ok(Op.Ret)
         "lret" => Ok(Op.Lret)
@@ -175,13 +216,37 @@ fn op_of(name: StrView) -> Result<Op, EncodeError>
         "out" => Ok(Op.Out)
         "lods" => Ok(Op.Lods)
         "stos" => Ok(Op.Stos)
-        _ => Err(EncodeError.UnknownMnemonic)
+        _ => conditional_or_vector(name)
+
+
+# jcc, setcc, cmovcc on a condition, or an SSE form.
+fn conditional_or_vector(name: StrView) -> Result<Op, EncodeError>
+    match condition_after(name, "j")
+        Some(cc) => return Ok(Op.Jcc(cc))
+        None => pass
+    match condition_after(name, "set")
+        Some(cc) => return Ok(Op.Setcc(cc))
+        None => pass
+    match condition_after(name, "cmov")
+        Some(cc) => return Ok(Op.Cmovcc(cc))
+        None => pass
+    match vector_of(name)
+        Some(s) => Ok(Op.Vector(s))
+        None => Err(EncodeError.UnknownMnemonic)
+
+
+# The condition `name` names after `head` (`jge`, `setnz`), if it does.
+fn condition_after(name: StrView, head: StrView) -> Option<u8>
+    if not name.starts_with(head)
+        return None
+    condition_of(name.skip(head.len))
 
 
 fn has_short_form(e: @&Emitter, insn: @Insn, op: Op) -> bool
     let direct: bool = insn.n_ops == 1 and target_of(e, insn.ops[0]).is_some()
     match op
-        Jmp | Ja | Jb | Jae | Je | Jne | Loop => direct
+        Jmp | Loop => direct
+        Jcc(_) => direct
         _ => false
 
 
@@ -189,33 +254,46 @@ fn lay_out(e: @&Emitter, insn: @Insn, op: Op, short: bool)
     match op
         Add => alu(e, insn, 0)
         Or => alu(e, insn, 1)
+        Adc => alu(e, insn, 2)
+        Sbb => alu(e, insn, 3)
         And => alu(e, insn, 4)
         Sub => alu(e, insn, 5)
         Xor => alu(e, insn, 6)
         Cmp => alu(e, insn, 7)
         Test => test(e, insn)
         Bt => bt(e, insn)
-        Mov => mov(e, insn)
+        Mov =>
+            if has_xmm(insn)
+                mov_xmm(e, insn)
+            else
+                mov(e, insn)
         Movabs => movabs(e, insn)
-        Movzb => movzb(e, insn)
+        Widen(from, code) => widen(e, insn, from, code)
         Lea => lea(e, insn)
         Xchg => xchg(e, insn)
+        Xadd => exchange(e, insn, 0xC0)
+        Cmpxchg => exchange(e, insn, 0xB0)
         Inc => inc_dec(e, insn, 0)
         Dec => inc_dec(e, insn, 1)
-        Shl => shift(e, insn, 4)
-        Shr => shift(e, insn, 5)
-        Sar => shift(e, insn, 7)
+        Unary(ext) => unary(e, insn, ext)
+        Imul => imul(e, insn)
+        Convert(code, size) => convert(e, insn, code, size)
+        Shift(ext) => shift(e, insn, ext)
+        DoubleShift(code) => double_shift(e, insn, code)
+        Bsf => load_wide(e, insn, 0xBC)
+        Bsr => load_wide(e, insn, 0xBD)
+        Bswap => bswap(e, insn)
+        Setcc(cc) => setcc(e, insn, cc)
+        Cmovcc(cc) => load_wide(e, insn, 0x40 + cc)
+        Jcc(cc) => jcc(e, insn, cc, short)
+        Vector(s) => vector(e, insn, s)
+        X87(code, ext) => x87(e, insn, code, ext)
         Push => push(e, insn)
         Pop => pop(e, insn)
         Pushf => flags(e, insn, 0x9C)
         Popf => flags(e, insn, 0x9D)
         Call => call_or_jump(e, insn, 0xE8, 2, short)
         Jmp => call_or_jump(e, insn, 0xE9, 4, short)
-        Ja => jcc(e, insn, 0x7, short)
-        Jb => jcc(e, insn, 0x2, short)
-        Jae => jcc(e, insn, 0x3, short)
-        Je => jcc(e, insn, 0x4, short)
-        Jne => jcc(e, insn, 0x5, short)
         Loop => rel8(e, insn, 0xE2)
         Ret => ret(e, insn)
         Lret => only(e, insn, true, 0xCB)

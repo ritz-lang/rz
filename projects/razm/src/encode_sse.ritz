@@ -1,0 +1,499 @@
+# encode's encoder-only vector forms (DESIGN.md "Library"): the SSE and
+# SSE2 set rllvm selects, the x87 loads and stores of a float return, and
+# the SHA, AES and PCLMUL forms behind "target-features". The text parser
+# rejects every mnemonic here; rllvm builds the `Insn` and calls `encode`.
+#
+# An SSE form is a mandatory prefix (none, 66, f2 or f3), an opcode in the
+# 0f, 0f 38 or 0f 3a map, and an operand shape. `vector_of` names each
+# mnemonic's form; `vector` lays it out.
+import ritzlib.option
+import ritzlib.strview { StrView }
+import razm.expr { Value }
+import razm.fixup { FixupKind }
+import razm.insn { Insn, OpSize, Operand, Reg, RegClass }
+import razm.emit
+import razm.encode_ops
+
+
+# The operand shape of an SSE form.
+pub enum Shape
+    Arith        # xmm/mem -> xmm, the destination in ModRM reg
+    ArithImm     # $imm8, xmm/mem -> xmm
+    ArithPred    # xmm/mem -> xmm with the predicate `ext` as imm8 (cmpeqss)
+    Move         # xmm/mem -> xmm by `op`, or xmm -> mem by `alt`
+    Shift        # xmm/mem -> xmm by `op`, or $imm8 -> xmm by `alt` /`ext`
+    ShiftImm     # $imm8 -> xmm by `alt` /`ext` only (pslldq, psrldq)
+    FromGpr      # r/m32 or r/m64 -> xmm, REX.W for 64 (cvtsi2ss/sd)
+    ToGpr        # xmm/mem -> r32 or r64, REX.W for 64 (cvttss2si/sd2si)
+    Pextrw       # $imm8, xmm -> r32 or r64 (never REX.W)
+    Pinsrw       # $imm8, r32 or m16 -> xmm
+    Pmovmskb     # xmm -> r32 or r64 (never REX.W)
+    Sha256rnds2  # [%xmm0,] xmm/mem -> xmm: %xmm0 is implicit
+    Movd         # movd, between an xmm and a 32-bit GPR or memory
+    Movq         # movq, between an xmm and a 64-bit GPR, memory or xmm
+
+
+# One SSE mnemonic's encoding.
+pub struct Sse
+    shape: Shape
+    pfx: u8          # the mandatory prefix: 0, 0x66, 0xF2 or 0xF3
+    map: u8          # 0 for 0f `op`, else 0x38 or 0x3A for 0f `map` `op`
+    op: u8
+    alt: u8          # the store opcode (Move), the immediate one (Shift)
+    ext: u8          # the immediate shift's /ext, or the cmp predicate
+
+
+fn form(shape: Shape, pfx: u8, map: u8, op: u8) -> Option<Sse>
+    Some(Sse { shape: shape, pfx: pfx, map: map, op: op, alt: 0, ext: 0 })
+
+
+# xmm/mem -> xmm, 0f `op`.
+fn arith(pfx: u8, op: u8) -> Option<Sse>
+    form(Shape.Arith, pfx, 0, op)
+
+
+fn vmoves(pfx: u8, load: u8, store: u8) -> Option<Sse>
+    Some(Sse { shape: Shape.Move, pfx: pfx, map: 0, op: load, alt: store, ext: 0 })
+
+
+# psll/psrl/psra: 66 0f `op` by an xmm count, 66 0f `alt` /`ext` by imm8.
+fn vshift(op: u8, alt: u8, ext: u8) -> Option<Sse>
+    Some(Sse { shape: Shape.Shift, pfx: 0x66, map: 0, op: op, alt: alt, ext: ext })
+
+
+fn vshift_imm(alt: u8, ext: u8) -> Option<Sse>
+    Some(Sse { shape: Shape.ShiftImm, pfx: 0x66, map: 0, op: 0, alt: alt, ext: ext })
+
+
+# The SSE form `name` spells, if it is one.
+pub fn vector_of(name: StrView) -> Option<Sse>
+    match name
+        "movss" => vmoves(0xF3, 0x10, 0x11)
+        "movsd" => vmoves(0xF2, 0x10, 0x11)
+        "movaps" => vmoves(0, 0x28, 0x29)
+        "movups" => vmoves(0, 0x10, 0x11)
+        "movdqa" => vmoves(0x66, 0x6F, 0x7F)
+        "movdqu" => vmoves(0xF3, 0x6F, 0x7F)
+        "movd" => form(Shape.Movd, 0x66, 0, 0)
+        "movq" => form(Shape.Movq, 0x66, 0, 0)
+        "addss" => arith(0xF3, 0x58)
+        "addsd" => arith(0xF2, 0x58)
+        "addps" => arith(0, 0x58)
+        "addpd" => arith(0x66, 0x58)
+        "subss" => arith(0xF3, 0x5C)
+        "subsd" => arith(0xF2, 0x5C)
+        "subps" => arith(0, 0x5C)
+        "subpd" => arith(0x66, 0x5C)
+        "mulss" => arith(0xF3, 0x59)
+        "mulsd" => arith(0xF2, 0x59)
+        "mulps" => arith(0, 0x59)
+        "mulpd" => arith(0x66, 0x59)
+        "divss" => arith(0xF3, 0x5E)
+        "divsd" => arith(0xF2, 0x5E)
+        "divps" => arith(0, 0x5E)
+        "divpd" => arith(0x66, 0x5E)
+        "ucomiss" => arith(0, 0x2E)
+        "ucomisd" => arith(0x66, 0x2E)
+        "andps" => arith(0, 0x54)
+        "andpd" => arith(0x66, 0x54)
+        "andnps" => arith(0, 0x55)
+        "andnpd" => arith(0x66, 0x55)
+        "orps" => arith(0, 0x56)
+        "orpd" => arith(0x66, 0x56)
+        "xorps" => arith(0, 0x57)
+        "xorpd" => arith(0x66, 0x57)
+        "cvtsi2ss" => form(Shape.FromGpr, 0xF3, 0, 0x2A)
+        "cvtsi2sd" => form(Shape.FromGpr, 0xF2, 0, 0x2A)
+        "cvttss2si" => form(Shape.ToGpr, 0xF3, 0, 0x2C)
+        "cvttsd2si" => form(Shape.ToGpr, 0xF2, 0, 0x2C)
+        "cvtss2sd" => arith(0xF3, 0x5A)
+        "cvtsd2ss" => arith(0xF2, 0x5A)
+        "paddb" => arith(0x66, 0xFC)
+        "paddw" => arith(0x66, 0xFD)
+        "paddd" => arith(0x66, 0xFE)
+        "paddq" => arith(0x66, 0xD4)
+        "psubb" => arith(0x66, 0xF8)
+        "psubw" => arith(0x66, 0xF9)
+        "psubd" => arith(0x66, 0xFA)
+        "psubq" => arith(0x66, 0xFB)
+        "pmullw" => arith(0x66, 0xD5)
+        "pmuludq" => arith(0x66, 0xF4)
+        "psadbw" => arith(0x66, 0xF6)
+        "pand" => arith(0x66, 0xDB)
+        "pandn" => arith(0x66, 0xDF)
+        "por" => arith(0x66, 0xEB)
+        "pxor" => arith(0x66, 0xEF)
+        "pcmpeqb" => arith(0x66, 0x74)
+        "pcmpeqw" => arith(0x66, 0x75)
+        "pcmpeqd" => arith(0x66, 0x76)
+        "pcmpgtb" => arith(0x66, 0x64)
+        "pcmpgtw" => arith(0x66, 0x65)
+        "pcmpgtd" => arith(0x66, 0x66)
+        "psllw" => vshift(0xF1, 0x71, 6)
+        "pslld" => vshift(0xF2, 0x72, 6)
+        "psllq" => vshift(0xF3, 0x73, 6)
+        "psrlw" => vshift(0xD1, 0x71, 2)
+        "psrld" => vshift(0xD2, 0x72, 2)
+        "psrlq" => vshift(0xD3, 0x73, 2)
+        "psraw" => vshift(0xE1, 0x71, 4)
+        "psrad" => vshift(0xE2, 0x72, 4)
+        "pslldq" => vshift_imm(0x73, 7)
+        "psrldq" => vshift_imm(0x73, 3)
+        "pshufd" => form(Shape.ArithImm, 0x66, 0, 0x70)
+        "pshuflw" => form(Shape.ArithImm, 0xF2, 0, 0x70)
+        "pshufhw" => form(Shape.ArithImm, 0xF3, 0, 0x70)
+        "shufps" => form(Shape.ArithImm, 0, 0, 0xC6)
+        "punpcklbw" => arith(0x66, 0x60)
+        "punpcklwd" => arith(0x66, 0x61)
+        "punpckldq" => arith(0x66, 0x62)
+        "punpcklqdq" => arith(0x66, 0x6C)
+        "punpckhbw" => arith(0x66, 0x68)
+        "punpckhwd" => arith(0x66, 0x69)
+        "punpckhdq" => arith(0x66, 0x6A)
+        "punpckhqdq" => arith(0x66, 0x6D)
+        "packsswb" => arith(0x66, 0x63)
+        "packssdw" => arith(0x66, 0x6B)
+        "packuswb" => arith(0x66, 0x67)
+        "pextrw" => form(Shape.Pextrw, 0x66, 0, 0xC5)
+        "pinsrw" => form(Shape.Pinsrw, 0x66, 0, 0xC4)
+        "pmovmskb" => form(Shape.Pmovmskb, 0x66, 0, 0xD7)
+        "sha256rnds2" => form(Shape.Sha256rnds2, 0, 0x38, 0xCB)
+        "sha256msg1" => form(Shape.Arith, 0, 0x38, 0xCC)
+        "sha256msg2" => form(Shape.Arith, 0, 0x38, 0xCD)
+        "aesenc" => form(Shape.Arith, 0x66, 0x38, 0xDC)
+        "aesenclast" => form(Shape.Arith, 0x66, 0x38, 0xDD)
+        "aesdec" => form(Shape.Arith, 0x66, 0x38, 0xDE)
+        "aesdeclast" => form(Shape.Arith, 0x66, 0x38, 0xDF)
+        "aesimc" => form(Shape.Arith, 0x66, 0x38, 0xDB)
+        "aeskeygenassist" => form(Shape.ArithImm, 0x66, 0x3A, 0xDF)
+        "pclmulqdq" => form(Shape.ArithImm, 0x66, 0x3A, 0x44)
+        _ => compare_of(name)
+
+
+# The cmpss/cmpsd/cmpps/cmppd form, the plain one taking its predicate as
+# an imm8 and `cmp<pred><type>` (cmpeqss, cmpnltpd) carrying it.
+fn compare_of(name: StrView) -> Option<Sse>
+    if not name.starts_with("cmp") or name.len < 5
+        return None
+    match type_prefix(name.skip(name.len - 2))
+        Some(pfx) =>
+            let pred: StrView = name.slice(3, name.len - 2)
+            if pred.len == 0
+                return form(Shape.ArithImm, pfx, 0, 0xC2)
+            match predicate(pred)
+                Some(n) => Some(Sse { shape: Shape.ArithPred, pfx: pfx, map: 0, op: 0xC2, alt: 0, ext: n })
+                None => None
+        None => None
+
+
+# The mandatory prefix of a compare on scalar or packed single or double.
+fn type_prefix(t: StrView) -> Option<u8>
+    match t
+        "ss" => Some(0xF3)
+        "sd" => Some(0xF2)
+        "ps" => Some(0)
+        "pd" => Some(0x66)
+        _ => None
+
+
+# The imm8 a compare predicate's name stands for.
+fn predicate(p: StrView) -> Option<u8>
+    match p
+        "eq" => Some(0)
+        "lt" => Some(1)
+        "le" => Some(2)
+        "unord" => Some(3)
+        "neq" => Some(4)
+        "nlt" => Some(5)
+        "nle" => Some(6)
+        "ord" => Some(7)
+        _ => None
+
+
+# The %xmm register `o` names, if it is one.
+pub fn xmm_of(o: Operand) -> Option<Reg>
+    match o
+        Operand.Register(r) => if class_is(r, RegClass.Xmm) then Some(r) else None
+        _ => None
+
+
+# `insn` names an %xmm register.
+pub fn has_xmm(insn: @Insn) -> bool
+    for i in 0..insn.n_ops
+        if xmm_of(insn.ops[i]).is_some()
+            return true
+    false
+
+
+# The mandatory prefix and the opcode bytes of `s`, opcode `op`.
+fn opcode_of(e: @&Emitter, s: Sse, op: u8)
+    e.mandatory(s.pfx)
+    if s.map == 0
+        e.opcode2(0x0F, op)
+    else
+        e.opcode3(0x0F, s.map, op)
+
+
+# The destination %xmm register `o`.
+fn xmm_dst(e: @&Emitter, o: Operand)
+    match xmm_of(o)
+        Some(d) => e.xmm_reg(d)
+        None => e.fail(EncodeError.BadOperands)
+
+
+# An imm8 operand.
+fn imm8(e: @&Emitter, o: Operand)
+    match o
+        Operand.Imm(x) => e.immediate(e.value(x), 1, FixupKind.Absolute)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# `insn` has no suffix: the vector forms take their size from the mnemonic.
+fn no_suffix(e: @&Emitter, insn: @Insn)
+    if not size_is(insn.size, OpSize.Unsized)
+        e.fail(EncodeError.SizeMismatch)
+
+
+# `s`, the SSE form of `insn`.
+pub fn vector(e: @&Emitter, insn: @Insn, s: Sse)
+    match s.shape
+        Arith =>
+            no_suffix(e, insn)
+            operands(e, insn, 2)
+            xmm_rm(e, s, s.op, insn.ops[0], insn.ops[1])
+        ArithPred =>
+            no_suffix(e, insn)
+            operands(e, insn, 2)
+            xmm_rm(e, s, s.op, insn.ops[0], insn.ops[1])
+            e.immediate(absolute(s.ext as i64), 1, FixupKind.Absolute)
+        ArithImm =>
+            no_suffix(e, insn)
+            operands(e, insn, 3)
+            xmm_rm(e, s, s.op, insn.ops[1], insn.ops[2])
+            imm8(e, insn.ops[0])
+        Move =>
+            no_suffix(e, insn)
+            operands(e, insn, 2)
+            vmove(e, insn, s)
+        Shift =>
+            no_suffix(e, insn)
+            operands(e, insn, 2)
+            match insn.ops[0]
+                Operand.Imm(_) => shift_by_imm(e, insn, s)
+                _ => xmm_rm(e, s, s.op, insn.ops[0], insn.ops[1])
+        ShiftImm =>
+            no_suffix(e, insn)
+            operands(e, insn, 2)
+            shift_by_imm(e, insn, s)
+        FromGpr => from_gpr(e, insn, s)
+        ToGpr => to_gpr(e, insn, s)
+        Pextrw =>
+            no_suffix(e, insn)
+            operands(e, insn, 3)
+            gpr_from_xmm(e, s, insn.ops[1], insn.ops[2])
+            imm8(e, insn.ops[0])
+        Pinsrw =>
+            no_suffix(e, insn)
+            operands(e, insn, 3)
+            insert_word(e, insn, s)
+        Pmovmskb =>
+            no_suffix(e, insn)
+            operands(e, insn, 2)
+            gpr_from_xmm(e, s, insn.ops[0], insn.ops[1])
+        Sha256rnds2 =>
+            no_suffix(e, insn)
+            sha256_rounds(e, insn, s)
+        Movd => move_gpr(e, insn, false)
+        Movq => move_gpr(e, insn, true)
+
+
+# opcode `op` of `s`: %xmm destination `dst` in ModRM reg, an %xmm register
+# or memory `src` in r/m.
+fn xmm_rm(e: @&Emitter, s: Sse, op: u8, src: Operand, dst: Operand)
+    opcode_of(e, s, op)
+    xmm_dst(e, dst)
+    e.rm_xmm(src)
+
+
+# A vector shift by `$imm8`: `alt` /`ext` on an %xmm register.
+fn shift_by_imm(e: @&Emitter, insn: @Insn, s: Sse)
+    opcode_of(e, s, s.alt)
+    e.ext(s.ext)
+    match xmm_of(insn.ops[1])
+        Some(d) => e.rm_xmm_reg(d)
+        None => e.fail(EncodeError.BadOperands)
+    imm8(e, insn.ops[0])
+
+
+# pextrw and pmovmskb: a 32- or 64-bit GPR `dst` in ModRM reg (never REX.W),
+# the %xmm register `src` in r/m.
+fn gpr_from_xmm(e: @&Emitter, s: Sse, src: Operand, dst: Operand)
+    opcode_of(e, s, s.op)
+    match gpr_of(dst)
+        Some(r) =>
+            let size = gpr_size(r)
+            if not size_is(size, OpSize.Long) and not size_is(size, OpSize.Quad)
+                e.fail(EncodeError.SizeMismatch)
+            e.reg(r)
+        None => e.fail(EncodeError.BadOperands)
+    match xmm_of(src)
+        Some(r) => e.rm_xmm_reg(r)
+        None => e.fail(EncodeError.BadOperands)
+
+
+# pinsrw: a 32-bit GPR or a word in memory into an %xmm register.
+fn insert_word(e: @&Emitter, insn: @Insn, s: Sse)
+    opcode_of(e, s, s.op)
+    xmm_dst(e, insn.ops[2])
+    match insn.ops[1]
+        Operand.Register(r) =>
+            if not size_is(gpr_size(r), OpSize.Long)
+                e.fail(EncodeError.SizeMismatch)
+            e.rm_reg(r)
+        Operand.Memory(m) => e.rm_mem(m)
+        _ => e.fail(EncodeError.BadOperands)
+    imm8(e, insn.ops[0])
+
+
+# sha256rnds2: its third operand, %xmm0, is implicit and may be written
+# first.
+fn sha256_rounds(e: @&Emitter, insn: @Insn, s: Sse)
+    let n: i64 = insn.n_ops
+    if n == 3
+        match xmm_of(insn.ops[0])
+            Some(r) =>
+                if r.num != 0
+                    e.fail(EncodeError.BadRegister)
+            None => e.fail(EncodeError.BadOperands)
+    else
+        operands(e, insn, 2)
+    if n >= 2
+        xmm_rm(e, s, s.op, insn.ops[n - 2], insn.ops[n - 1])
+
+
+# A move: the load form into an %xmm register (as writes xmm to xmm so),
+# else the store form to memory.
+fn vmove(e: @&Emitter, insn: @Insn, s: Sse)
+    match xmm_of(insn.ops[1])
+        Some(d) =>
+            opcode_of(e, s, s.op)
+            e.xmm_reg(d)
+            e.rm_xmm(insn.ops[0])
+        None =>
+            match insn.ops[1]
+                Operand.Memory(m) =>
+                    opcode_of(e, s, s.alt)
+                    xmm_dst(e, insn.ops[0])
+                    e.rm_mem(m)
+                _ => e.fail(EncodeError.BadOperands)
+
+
+# cvtsi2ss/cvtsi2sd: a 32- or 64-bit GPR or memory source, sized by the
+# suffix or the register.
+fn from_gpr(e: @&Emitter, insn: @Insn, s: Sse)
+    operands(e, insn, 2)
+    let size = size_at(e, insn, 0)
+    if not size_is(size, OpSize.Long) and not size_is(size, OpSize.Quad)
+        e.fail(EncodeError.SizeMismatch)
+    same_size(e, insn, size)
+    e.operand_size(size)
+    opcode_of(e, s, s.op)
+    xmm_dst(e, insn.ops[1])
+    e.rm(insn.ops[0])
+
+
+# cvttss2si/cvttsd2si: into a 32- or 64-bit GPR.
+fn to_gpr(e: @&Emitter, insn: @Insn, s: Sse)
+    operands(e, insn, 2)
+    let size = size_at(e, insn, 1)
+    if not size_is(size, OpSize.Long) and not size_is(size, OpSize.Quad)
+        e.fail(EncodeError.SizeMismatch)
+    same_size(e, insn, size)
+    e.operand_size(size)
+    opcode_of(e, s, s.op)
+    match insn.ops[1]
+        Operand.Register(d) => e.reg(d)
+        _ => e.fail(EncodeError.BadOperands)
+    e.rm_xmm(insn.ops[0])
+
+
+# movd and movq: 66 0f 6e into an %xmm register from a GPR or memory, 66
+# 0f 7e out of one, REX.W for movq. movq between two %xmm registers or
+# from memory is f3 0f 7e, and to memory 66 0f d6, as `as` writes them.
+fn move_gpr(e: @&Emitter, insn: @Insn, quad: bool)
+    operands(e, insn, 2)
+    let size: OpSize = if quad then OpSize.Quad else OpSize.Long
+    if not size_is(insn.size, OpSize.Unsized) and not size_is(insn.size, size)
+        e.fail(EncodeError.SizeMismatch)
+    same_size(e, insn, size)
+    let src = insn.ops[0]
+    let dst = insn.ops[1]
+    match xmm_of(dst)
+        Some(d) =>
+            let xmm_or_mem: bool = match src
+                Operand.Memory(_) => true
+                _ => xmm_of(src).is_some()
+            if quad and xmm_or_mem
+                e.mandatory(0xF3)
+                e.opcode2(0x0F, 0x7E)
+                e.xmm_reg(d)
+                e.rm_xmm(src)
+                return
+            gpr_move(e, 0x6E, quad, d, src)
+        None =>
+            match xmm_of(src)
+                Some(s) =>
+                    match dst
+                        Operand.Memory(m) =>
+                            if quad
+                                e.mandatory(0x66)
+                                e.opcode2(0x0F, 0xD6)
+                                e.xmm_reg(s)
+                                e.rm_mem(m)
+                                return
+                        _ => pass
+                    gpr_move(e, 0x7E, quad, s, dst)
+                None => e.fail(EncodeError.BadOperands)
+
+
+# 66 [REX.W] 0f `op`: %xmm`x` in ModRM reg, a GPR or memory in r/m.
+fn gpr_move(e: @&Emitter, op: u8, quad: bool, x: Reg, o: Operand)
+    if xmm_of(o).is_some()
+        e.fail(EncodeError.BadOperands)
+    if quad
+        e.operand_size(OpSize.Quad)
+    e.mandatory(0x66)
+    e.opcode2(0x0F, op)
+    e.xmm_reg(x)
+    e.rm(o)
+
+
+# mov with an %xmm operand: movd for a 32-bit size, else movq.
+pub fn mov_xmm(e: @&Emitter, insn: @Insn)
+    var size: OpSize = insn.size
+    if size_is(size, OpSize.Unsized)
+        size = OpSize.Quad
+        for i in 0..insn.n_ops
+            match gpr_of(insn.ops[i])
+                Some(r) => size = gpr_size(r)
+                None => pass
+    if size_is(size, OpSize.Long)
+        move_gpr(e, insn, false)
+    else if size_is(size, OpSize.Quad)
+        move_gpr(e, insn, true)
+    else
+        e.fail(EncodeError.SizeMismatch)
+
+
+# The x87 load or store of a float return: `op` /`ext` on memory
+# (flds d9 /0, fldl dd /0, fstps d9 /3, fstpl dd /3).
+pub fn x87(e: @&Emitter, insn: @Insn, op: u8, ext: u8)
+    operands(e, insn, 1)
+    if not size_is(insn.size, OpSize.Unsized)
+        e.fail(EncodeError.SizeMismatch)
+    match insn.ops[0]
+        Operand.Memory(m) =>
+            e.opcode(op)
+            e.ext(ext)
+            e.rm_mem(m)
+        _ => e.fail(EncodeError.BadOperands)

@@ -1,0 +1,185 @@
+# encode's encoder-only GPR forms: what rllvm selects beyond the text
+# dialect (DESIGN.md "Library"). The widening moves, neg/not, the multiplies
+# and divides, the accumulator sign extensions, shld/shrd, bsf/bsr, bswap,
+# setcc, cmovcc, xadd and cmpxchg. The text parser rejects every mnemonic
+# here; rllvm builds the `Insn` and calls `encode`.
+import ritzlib.option
+import ritzlib.strview { StrView }
+import razm.expr { Value }
+import razm.fixup { FixupKind }
+import razm.insn { Insn, OpSize, Operand, Reg, RegClass }
+import razm.emit
+import razm.encode_ops
+
+
+# The condition code a jcc, setcc or cmovcc suffix names, aliases included.
+pub fn condition_of(s: StrView) -> Option<u8>
+    match s
+        "o" => Some(0x0)
+        "no" => Some(0x1)
+        "b" | "c" | "nae" => Some(0x2)
+        "ae" | "nb" | "nc" => Some(0x3)
+        "e" | "z" => Some(0x4)
+        "ne" | "nz" => Some(0x5)
+        "be" | "na" => Some(0x6)
+        "a" | "nbe" => Some(0x7)
+        "s" => Some(0x8)
+        "ns" => Some(0x9)
+        "p" | "pe" => Some(0xA)
+        "np" | "po" => Some(0xB)
+        "l" | "nge" => Some(0xC)
+        "ge" | "nl" => Some(0xD)
+        "le" | "ng" => Some(0xE)
+        "g" | "nle" => Some(0xF)
+        _ => None
+
+
+# A GPR operand `o` is `size` wide; memory is any size.
+fn sized(e: @&Emitter, o: Operand, size: OpSize)
+    match gpr_of(o)
+        Some(r) =>
+            if not size_is(gpr_size(r), size)
+                e.fail(EncodeError.SizeMismatch)
+        None => pass
+
+
+# The operand size of a form with no byte variant.
+fn wide_size(e: @&Emitter, size: OpSize) -> OpSize
+    if size_is(size, OpSize.Byte)
+        e.fail(EncodeError.SizeMismatch)
+    size
+
+
+# A one-operand group-3 form, f6/f7 /`ext`: not (2), neg (3), mul (4),
+# imul (5), div (6), idiv (7).
+pub fn unary(e: @&Emitter, insn: @Insn, ext: u8)
+    operands(e, insn, 1)
+    let size = size_of(e, insn)
+    same_size(e, insn, size)
+    e.operand_size(size)
+    e.opcode(by_size(size, 0xF6))
+    e.ext(ext)
+    e.rm(insn.ops[0])
+
+
+# 0f `op` /r, a GPR destination in ModRM reg and a GPR or memory source:
+# the two-operand imul, bsf, bsr and cmovcc. No byte form.
+pub fn load_wide(e: @&Emitter, insn: @Insn, op: u8)
+    operands(e, insn, 2)
+    let size = wide_size(e, size_at(e, insn, 1))
+    same_size(e, insn, size)
+    e.operand_size(size)
+    match insn.ops[1]
+        Operand.Register(d) =>
+            e.opcode2(0x0F, op)
+            e.reg(d)
+            e.rm(insn.ops[0])
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# imul: one operand (f6/f7 /5), two (0f af), or an immediate times a source
+# into a register (6b ib, 69 iz); `imul $n, %r` is `imul $n, %r, %r`.
+pub fn imul(e: @&Emitter, insn: @Insn)
+    match insn.n_ops
+        1 => unary(e, insn, 5)
+        2 =>
+            match insn.ops[0]
+                Operand.Imm(x) => imul_imm(e, insn, e.value(x), insn.ops[1])
+                _ => load_wide(e, insn, 0xAF)
+        3 =>
+            match insn.ops[0]
+                Operand.Imm(x) => imul_imm(e, insn, e.value(x), insn.ops[1])
+                _ => e.fail(EncodeError.BadOperands)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+fn imul_imm(e: @&Emitter, insn: @Insn, v: Value, src: Operand)
+    let dst = insn.ops[insn.n_ops - 1]
+    let size = wide_size(e, size_at(e, insn, insn.n_ops - 1))
+    same_size(e, insn, size)
+    e.operand_size(size)
+    match dst
+        Operand.Register(d) =>
+            match imm8_of(v, size)
+                Some(short) =>
+                    e.opcode(0x6B)
+                    e.immediate(short, 1, FixupKind.Absolute)
+                None =>
+                    e.opcode(0x69)
+                    e.immediate_sized(v, size)
+            e.reg(d)
+            e.rm(src)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# The accumulator sign extensions, `op` at `size` with no operands: 98
+# (cbtw/cbw, cwtl/cwde, cltq/cdqe) and 99 (cwtd/cwd, cltd/cdq, cqto/cqo).
+pub fn convert(e: @&Emitter, insn: @Insn, op: u8, size: OpSize)
+    operands(e, insn, 0)
+    if not size_is(insn.size, OpSize.Unsized)
+        e.fail(EncodeError.SizeMismatch)
+    e.operand_size(size)
+    e.opcode(op)
+
+
+# shld (0f a4 ib, 0f a5 by %cl) and shrd (0f ac, 0f ad): `count, src, dst`.
+pub fn double_shift(e: @&Emitter, insn: @Insn, op: u8)
+    operands(e, insn, 3)
+    let size = wide_size(e, size_at(e, insn, 1))
+    sized(e, insn.ops[1], size)
+    sized(e, insn.ops[2], size)
+    e.operand_size(size)
+    match insn.ops[0]
+        Operand.Imm(x) =>
+            e.opcode2(0x0F, op)
+            e.immediate(e.value(x), 1, FixupKind.Absolute)
+        Operand.Register(c) =>
+            if not is_cl(c)
+                e.fail(EncodeError.BadOperands)
+            e.opcode2(0x0F, op + 1)
+        _ => e.fail(EncodeError.BadOperands)
+    match insn.ops[1]
+        Operand.Register(s) => e.reg(s)
+        _ => e.fail(EncodeError.BadOperands)
+    e.rm(insn.ops[2])
+
+
+# bswap: 0f c8+r on a 32- or 64-bit register.
+pub fn bswap(e: @&Emitter, insn: @Insn)
+    operands(e, insn, 1)
+    let size = wide_size(e, size_of(e, insn))
+    same_size(e, insn, size)
+    if size_is(size, OpSize.Word)
+        e.fail(EncodeError.SizeMismatch)
+    e.operand_size(size)
+    match insn.ops[0]
+        Operand.Register(r) =>
+            e.opcode(0x0F)
+            e.opcode_reg(0xC8, r)
+        _ => e.fail(EncodeError.BadOperands)
+
+
+# setcc: 0f 90+cc /0 on a byte register or memory.
+pub fn setcc(e: @&Emitter, insn: @Insn, cc: u8)
+    operands(e, insn, 1)
+    if not size_is(insn.size, OpSize.Unsized) and not size_is(insn.size, OpSize.Byte)
+        e.fail(EncodeError.SizeMismatch)
+    sized(e, insn.ops[0], OpSize.Byte)
+    e.opcode2(0x0F, 0x90 + cc)
+    e.ext(0)
+    e.rm(insn.ops[0])
+
+
+# xadd (0f c0/c1) and cmpxchg (0f b0/b1): a register source into a register
+# or memory destination, `lock` before a memory one.
+pub fn exchange(e: @&Emitter, insn: @Insn, base: u8)
+    operands(e, insn, 2)
+    let size = size_of(e, insn)
+    same_size(e, insn, size)
+    e.operand_size(size)
+    match insn.ops[0]
+        Operand.Register(s) =>
+            e.opcode2(0x0F, by_size(size, base))
+            e.reg(s)
+            e.rm(insn.ops[1])
+        _ => e.fail(EncodeError.BadOperands)
