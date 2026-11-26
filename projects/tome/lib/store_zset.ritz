@@ -45,16 +45,18 @@ fn zset_create_node(level: i32, member: String, score: f64) -> ZSetNode
 
 # Create a new sorted set: just the header, on every level.
 pub fn zset_new() -> ZSet
-    var zset: ZSet = ZSet { nodes: pool_new<ZSetNode>(zset_node_blank), level: 1, len: 0, index: hashmap_new<StrView, i64>() }
+    var zset: ZSet = ZSet { nodes: pool_new<ZSetNode>(), level: 1, len: 0, index: hashmap_new<StrView, i64>() }
     zset.nodes.insert(zset_create_node(ZSET_MAX_LEVEL, string_new(), 0.0))  # slot ZHEAD
     return zset
 
 # Node n's successor on level lvl.
 fn zset_next(zset: @ZSet, n: i64, lvl: i32) -> i64
-    return zset.nodes.get(n).forward.get(lvl as i64)
+    let node: @ZSetNode = zset.nodes.item(n)
+    return node.forward.get(lvl as i64)
 
 fn zset_link(zset: @&ZSet, n: i64, lvl: i32, to: i64)
-    zset.nodes.at(n).forward.set(lvl as i64, to)
+    let node: @&ZSetNode = zset.nodes.at(n)
+    node.forward.set(lvl as i64, to)
 
 # Compare (score, member) pairs for ordering
 fn zset_compare(score_a: f64, member_a: StrView, score_b: f64, member_b: StrView) -> Ordering
@@ -75,7 +77,7 @@ fn zset_find_preds(zset: @ZSet, score: f64, member: StrView, update: @&[16]i64)
             let next: i64 = zset_next(zset, x, i)
             if next == ZNIL
                 break
-            let node: @ZSetNode = zset.nodes.get(next)
+            let node: @ZSetNode = zset.nodes.item(next)
             if zset_compare(node.score, (node.member).as_view(), score, member).is_ge()
                 break
             x = next
@@ -88,7 +90,7 @@ pub fn zset_add(zset: @&ZSet, member: StrView, score: f64) -> i32
     var existed: bool = false
     match zset.index.get(member)
         Some(n) =>
-            if zset.nodes.get(n).score == score
+            if zset.nodes.item(n).score == score
                 return 0  # No change
             # Need to remove and re-insert with new score
             zset_remove(zset, member)
@@ -117,7 +119,7 @@ pub fn zset_add(zset: @&ZSet, member: StrView, score: f64) -> i32
         k += 1
 
     zset.len += 1
-    zset.index.insert((zset.nodes.get(node).member).as_view(), node)
+    zset.index.insert((zset.nodes.item(node).member).as_view(), node)
 
     if existed
         return 0  # Updated
@@ -131,7 +133,7 @@ pub fn zset_remove(zset: @&ZSet, member: StrView) -> i32
 
     # Find position in skip list
     var update: [16]i64
-    zset_find_preds(zset, zset.nodes.get(target).score, member, @&update)
+    zset_find_preds(zset, zset.nodes.item(target).score, member, @&update)
 
     # Verify we found the right node
     let x: i64 = zset_next(zset, update[0], 0)
@@ -151,7 +153,7 @@ pub fn zset_remove(zset: @&ZSet, member: StrView) -> i32
 
     # Out of the index first: its key views the node's member bytes.
     zset.index.remove(member)
-    zset.nodes.remove(x)
+    zset.nodes.remove(x, zset_node_blank())
     zset.len -= 1
     return 1
 
@@ -159,7 +161,7 @@ pub fn zset_remove(zset: @&ZSet, member: StrView) -> i32
 pub fn zset_score(zset: @ZSet, member: StrView, out_score: @&f64) -> i32
     match zset.index.get(member)
         Some(n) =>
-            *out_score = zset.nodes.get(n).score
+            *out_score = zset.nodes.item(n).score
             return 1
         None => return 0
 
@@ -210,7 +212,7 @@ fn zset_rank_range(zset: @ZSet, start: i64, stop: i64) -> Vec<StrView>
     var i: i64 = 0
     while x != ZNIL and i <= e_idx
         if i >= s_idx
-            result.push((zset.nodes.get(x).member).as_view())
+            result.push((zset.nodes.item(x).member).as_view())
         x = zset_next(zset, x, 0)
         i += 1
     return result
@@ -311,7 +313,7 @@ pub fn store_zrank(s: *Store, key: StrView, member: StrView) -> i64
         Some(entry) =>
             if entry.value_type != VALUE_ZSET
                 return -2  # Wrong type
-            return zset_rank(s.zsets.get(entry.value_slot), member)
+            return zset_rank(s.zsets.item(entry.value_slot), member)
         None => return -1
 
 # ZREVRANK: Get reverse rank (highest score = 0). Returns -1 if not found.
@@ -325,7 +327,7 @@ pub fn store_zcard(s: *Store, key: StrView) -> i64
     match store_live_entry(s, key)
         Some(entry) =>
             if entry.value_type == VALUE_ZSET
-                return s.zsets.get(entry.value_slot).len
+                return s.zsets.item(entry.value_slot).len
             return -1  # Wrong type
         None => return 0
 
@@ -416,7 +418,7 @@ pub fn zset_count_spec(zset: @ZSet, spec: *ZRangeSpec) -> i64
     var n: i64 = 0
     var x: i64 = zset_next(zset, ZHEAD, 0)
     while x != ZNIL
-        let node: @ZSetNode = zset.nodes.get(x)
+        let node: @ZSetNode = zset.nodes.item(x)
         if zrange_spec_contains(spec, node.score, (node.member).as_view())
             n += 1
         x = zset_next(zset, x, 0)
@@ -444,7 +446,7 @@ pub fn zset_range_spec(zset: @ZSet, spec: *ZRangeSpec, rev: bool, offset: i64, l
     var idx: i64 = 0
     var x: i64 = zset_next(zset, ZHEAD, 0)
     while x != ZNIL and idx < first + take
-        let node: @ZSetNode = zset.nodes.get(x)
+        let node: @ZSetNode = zset.nodes.item(x)
         let m: StrView = (node.member).as_view()
         if zrange_spec_contains(spec, node.score, m)
             if idx >= first

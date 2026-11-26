@@ -86,11 +86,11 @@ pub fn store_new() -> Store
 pub fn store_with_cap(cap: i64) -> Store
     var s: Store = Store {
         map: hashmap_with_cap<StrView, i64>(cap),
-        entries: pool_new<Entry>(entry_blank),
-        lists: pool_new<List>(list_new),
-        sets: pool_new<Set>(set_blank),
-        zsets: pool_new<ZSet>(zset_blank),
-        hashes: pool_new<Hash>(hash_blank),
+        entries: pool_new<Entry>(),
+        lists: pool_new<List>(),
+        sets: pool_new<Set>(),
+        zsets: pool_new<ZSet>(),
+        hashes: pool_new<Hash>(),
         used_memory: 0,
         maxmemory: 0,                # No limit by default
         eviction_policy: EVICT_NONE,
@@ -112,7 +112,7 @@ fn entry_value_memory(s: *Store, entry: *Entry) -> i64
     if entry.value_type == VALUE_STRING
         return string_memory(@entry.value)
     else if entry.value_type == VALUE_LIST
-        let list: @List = s.lists.get(entry.value_slot)
+        let list: @List = s.lists.item(entry.value_slot)
         # List memory: struct + nodes + string data
         var mem: i64 = 24  # List struct
         mem += list.len * 40  # a slot per element
@@ -120,16 +120,16 @@ fn entry_value_memory(s: *Store, entry: *Entry) -> i64
             mem += list_elem(list, k).len + 1
         return mem
     else if entry.value_type == VALUE_SET
-        let set: @Set = s.sets.get(entry.value_slot)
+        let set: @Set = s.sets.item(entry.value_slot)
         # Set memory: struct + index table + string data
         var mem: i64 = 32  # Set struct
         mem += set.index.cap() * 24  # index slots
         for i in 0..set.members.slots()
             if set.members.is_live(i)
-                mem += string_memory(set.members.get(i))
+                mem += string_memory(set.members.item(i))
         return mem
     else if entry.value_type == VALUE_ZSET
-        let zset: @ZSet = s.zsets.get(entry.value_slot)
+        let zset: @ZSet = s.zsets.item(entry.value_slot)
         # ZSet memory: struct + skip list nodes + index + strings
         var mem: i64 = 48  # ZSet struct estimate
         mem += zset.index.cap() * 32  # index slots
@@ -137,13 +137,13 @@ fn entry_value_memory(s: *Store, entry: *Entry) -> i64
         mem += zset.len * 64  # Average node size with forward links
         return mem
     else if entry.value_type == VALUE_HASH
-        let h: @Hash = s.hashes.get(entry.value_slot)
+        let h: @Hash = s.hashes.item(entry.value_slot)
         # Hash memory: struct + index table + string data
         var mem: i64 = 32  # Hash struct
         mem += h.index.cap() * 36  # index slots (field + value + state)
         for i in 0..h.fields.slots()
             if h.fields.is_live(i)
-                let f: @HashField = h.fields.get(i)
+                let f: @HashField = h.fields.item(i)
                 mem += string_memory(@f.field)
                 mem += string_memory(@f.value)
         return mem
@@ -216,13 +216,13 @@ pub fn store_create_entry(s: *Store, key: StrView) -> @&Entry
 # Drop the complex value an entry holds, if any.
 fn store_drop_value(s: *Store, entry: *Entry)
     if entry.value_type == VALUE_LIST
-        s.lists.remove(entry.value_slot)
+        s.lists.remove(entry.value_slot, list_new())
     else if entry.value_type == VALUE_SET
-        s.sets.remove(entry.value_slot)
+        s.sets.remove(entry.value_slot, set_blank())
     else if entry.value_type == VALUE_ZSET
-        s.zsets.remove(entry.value_slot)
+        s.zsets.remove(entry.value_slot, zset_blank())
     else if entry.value_type == VALUE_HASH
-        s.hashes.remove(entry.value_slot)
+        s.hashes.remove(entry.value_slot, hash_blank())
 
 # Remove the entry in `slot` from the map, drop it and account for its
 # memory.
@@ -232,7 +232,7 @@ fn store_erase_slot(s: *Store, slot: i64)
     # Out of the map first: its key views the bytes the entry is about to free.
     s.map.remove((entry.key).as_view())
     store_drop_value(s, entry)
-    s.entries.remove(slot)
+    s.entries.remove(slot, entry_blank())
     s.used_memory -= mem
 
 # Remove entry (found by store_find_entry) from the store.
@@ -275,7 +275,7 @@ fn store_sample_victim(s: *Store, volatile: bool, by_ttl: bool, want: i32, tries
         if idx < 0 or s.map.slot_state(idx) != Slot.Full
             continue
         let slot: i64 = s.map.slot_value(idx)
-        let entry: @Entry = s.entries.get(slot)
+        let entry: @Entry = s.entries.item(slot)
         if volatile and entry.expires_at <= 0
             continue
         var measure: i64 = entry.last_access
@@ -495,7 +495,7 @@ pub fn store_expire_sweep(s: *Store) -> i64
     # A walk over the entries, not the map: erasing changes the map.
     for slot in 0..s.entries.slots()
         if s.entries.is_live(slot)
-            let expires_at: i64 = s.entries.get(slot).expires_at
+            let expires_at: i64 = s.entries.item(slot).expires_at
             if expires_at > 0 and now >= expires_at
                 store_erase_slot(s, slot)
                 deleted += 1
