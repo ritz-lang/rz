@@ -72,6 +72,7 @@ import ritzlib.option
 import ritzlib.result
 import ritzlib.json
 import ritzlib.os.env
+import ritzlib.timer   # clock_gettime: the exe-id memo's write rule (AGAST #4851)
 import iface_text   # iface_text_path, iface_text_derive (AGAST #2113)
 
 
@@ -128,24 +129,161 @@ pub fn source_file_hash(src_sv: StrView) -> u64
 # match, so an unreadable /proc degrades to a full compile rather than to
 # silent reuse of foreign IR.  A sig with no `compiler_hash` field also
 # parses as 0, so it fails closed the same way.
+#
+# The digest is memoized per binary (AGAST #4851, see "exe-id memo" below):
+# hashing all of the binary cost ~42M Ir on every run, more than compiling a
+# small file, and `rz build` runs ritz1 once per module.  The memo is only
+# consulted once the binary is open, so an unreadable one still answers 0.
 pub fn compiler_fingerprint() -> u64
-    var sz: i64 = 0
-    # S-TEXT-1: read_file_to_buf forwards straight into sys_open/sys_stat2.
-    let buf: *u8 = read_file_to_buf(c"/proc/self/exe", @sz)
-    if buf == null
+    # The clock BEFORE the stat: see exe_ctime_settled.
+    var now: Timespec = Timespec { tv_sec: 0, tv_nsec: 0 }
+    let clock_ok: bool = clock_gettime(CLOCK_REALTIME, @&now) == 0
+    # S-TEXT-1: sys_open is a raw syscall and needs a NUL-terminated path.
+    let fd: i32 = sys_open(c"/proc/self/exe", O_RDONLY)
+    if fd < 0
         return 0
-    if sz <= 0
-        free(buf)
+    # The open file's identity, not the path's: under valgrind `open` is
+    # redirected to the client binary while a path stat would describe
+    # memcheck (#1663).
+    var st: Stat
+    if sys_fstat2(fd, @&st) != 0
+        sys_close(fd)
         return 0
-    var h: u64 = fnv1a_bytes(StrView { ptr: (buf), len: (sz) })
-    free(buf)
+    var memo: String = exe_memo_path(@&st)
+    var record: String = exe_memo_record(@&st)
+    let hit: u64 = exe_memo_read(@&memo, @&record)
+    if hit != 0
+        sys_close(fd)
+        return hit
+    let old_enough: bool = clock_ok and exe_ctime_settled(@&st, @&now)
+    let bytes: Vec<u8> = read_fd_to_vec(fd, st.st_size)
+    sys_close(fd)
+    if bytes.len == 0
+        return 0
+    let sz: i64 = bytes.len
+    var h: u64 = fnv1a_bytes(StrView { ptr: (bytes.data), len: (sz) })
     # Mix the byte count in too, so a short read can never alias the digest
     # of a genuinely shorter binary.
     h = fnv1a_mix_u64(h, sz as u64)
     # 0 is the "unknown compiler" sentinel; never produce it as a real value.
     if h == 0
         h = 1
+    if old_enough
+        exe_memo_write(@&memo, @&record, h)
     return h
+
+# ----------------------------------------------------------------------------
+# exe-id memo (AGAST #4851)
+# ----------------------------------------------------------------------------
+#
+# The content hash of a ritz1 binary, keyed by that binary's stat identity:
+#
+#   <cache root>/<compiler>/exe-id/<st_dev hex16>-<st_ino hex16>
+#   "ritz1-exe-id-v1 <size> <mtime s> <mtime ns> <ctime s> <ctime ns> <hash hex16>\n"
+#
+# So the binary is hashed once per build of ritz1, not once per run.  What
+# the cache key MEANS is unchanged: it is still the content hash, as
+# ritz0's cache.py:compute_compiler_hash() takes, and the memo only says
+# "this inode, unchanged since, hashed to H".
+#
+#   * A relink (the linker writes a new file) makes a new inode: the memo
+#     misses and the binary is hashed again.  A byte-identical relink gets
+#     the same hash, so the sig cache stays warm exactly as before.
+#   * An in-place rewrite keeps the inode and can keep the size and, via
+#     utime, the mtime, but it sets ctime to the current time, and
+#     userspace cannot set ctime back.  ctime is in the key, so it misses.
+#   * The one hole is a rewrite in the same clock tick as the stat we keyed
+#     on (ctime would not move).  So a memo is written only when ctime is
+#     over a second older than the clock read before the stat (racy-git's
+#     rule): any later write then lands on a later ctime.  A just-linked
+#     binary therefore hashes itself on every run for its first 1-2 seconds.
+#   * Anything but an exact, well-formed record of the current stat is a
+#     miss: a torn or garbage file is rehashed and rewritten.  Writes are a
+#     per-pid temp file renamed into place, so concurrent `rz build` workers
+#     never read each other's partial writes.
+#   * Per inode rather than one file per compiler name: ritz1 binaries in
+#     several worktrees share one cache root and would evict each other.
+#     The files are ~80 bytes and inode numbers are reused, so they stay few.
+
+# The memo's path for the binary `st` describes.
+fn exe_memo_path(st: @&Stat) -> String
+    var s: String = string_new()
+    push_cache_root(@s)
+    s.push('/')
+    push_compiler_namespace(@s)
+    s.push_str("/exe-id/")
+    var hex: [16]u8
+    u64_to_hex16(st.st_dev as u64, @hex[0])
+    s.push_span(Span<u8> { ptr: (@hex[0]), len: 16 })
+    s.push('-')
+    u64_to_hex16(st.st_ino as u64, @hex[0])
+    s.push_span(Span<u8> { ptr: (@hex[0]), len: 16 })
+    s
+
+# The memo record for `st`, up to and including the space before the hash.
+fn exe_memo_record(st: @&Stat) -> String
+    var s: String = string_from("ritz1-exe-id-v1 ")
+    s.push_i64(st.st_size)
+    s.push(' ')
+    s.push_i64(st.st_mtime)
+    s.push(' ')
+    s.push_i64(st.st_mtime_ns)
+    s.push(' ')
+    s.push_i64(st.st_ctime)
+    s.push(' ')
+    s.push_i64(st.st_ctime_ns)
+    s.push(' ')
+    s
+
+# The hash the memo at `memo` records for exactly `record`, or 0 (a miss)
+# if the file is absent, for another stat, or malformed in any way.
+fn exe_memo_read(memo: @&String, record: @&String) -> u64
+    var sz: i64 = 0
+    let buf: *u8 = read_file_to_buf(memo.as_ptr(), @sz)
+    if buf == null
+        return 0
+    let rlen: i64 = record.len()
+    var h: u64 = 0
+    if sz == rlen + 17
+        let line: StrView = StrView { ptr: (buf), len: (sz) }
+        if line.slice(0, rlen).eq(record.as_view()) and line.get(rlen + 16) == '\n'
+            h = hex16_strict(line.slice(rlen, rlen + 16))
+    free(buf)
+    h
+
+# Write `record` + `h` to `memo`.  Best effort: a cache root that can't be
+# written only means the next run hashes again.
+fn exe_memo_write(memo: @&String, record: @&String, h: u64)
+    var line: String = string_new()
+    line.push_span(Span<u8> { ptr: (record.as_ptr()), len: (record.len()) as i64 })
+    var hex: [16]u8
+    u64_to_hex16(h, @hex[0])
+    line.push_span(Span<u8> { ptr: (@hex[0]), len: 16 })
+    line.push('\n')
+    mkdir_parents(memo.as_ptr())
+    write_file_atomic(memo, StrView { ptr: (line.as_ptr()), len: (line.len()) })
+
+# True when the binary's ctime `st` is over a second before `now`, read before
+# the stat, so a memo of it can't be aliased by a later rewrite: any write
+# after the stat lands at a ctime no earlier than `now` less one clock tick,
+# and ticks are milliseconds.  (A rewrite between the clock read and the
+# stat shows up in `st` itself, as a recent ctime.)
+fn exe_ctime_settled(st: @&Stat, now: @&Timespec) -> bool
+    st.st_ctime + 1 < now.tv_sec
+
+# Exactly 16 hex digits as a u64, or 0 if any byte is not one.  Unlike
+# hex16_to_u64, a malformed tail is never half-read into a value.
+fn hex16_strict(s: StrView) -> u64
+    if s.len != 16
+        return 0
+    var i: i64 = 0
+    while i < 16
+        let c: u8 = s.get(i)
+        let digit: bool = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')
+        if not digit
+            return 0
+        i = i + 1
+    hex16_to_u64(s)
 
 # The identity cached IR is stamped with, and must match to be reused:
 #   * the compiler binary (#1279);
@@ -711,49 +849,46 @@ fn read_file_to_buf(path: *u8, out_len: *i64) -> *u8
     if stres != 0
         sys_close(fd)
         return null
-    let sz: i64 = st.st_size
-    if sz <= 0
-        sys_close(fd)
-        return null
-    # `sz` is only a first guess at capacity: the file can also be LARGER
-    # than stat said (under valgrind, whenever ritz1 outgrows memcheck), so
-    # read to EOF and grow the buffer, or the fingerprint hashes a prefix
-    # and differs from the native run (AGAST #2414).
-    var cap: i64 = sz
-    var buf: *u8 = malloc(cap + 1)
-    if buf == null
-        sys_close(fd)
-        return null
-    # Report only the bytes actually read.  This used to set `total = sz` on
-    # EOF/error, claiming an uninitialised tail as file contents, so the
-    # compiler fingerprint hashed garbage (AGAST #1663).
-    var total: i64 = 0
-    var done: i32 = 0
-    while done == 0
-        if total == cap
-            cap = cap * 2
-            let grown: *u8 = realloc(buf, cap + 1)
-            if grown == null
-                sys_close(fd)
-                free(buf)
-                return null
-            buf = grown
-        let n: i64 = sys_read(fd, buf + total, cap - total)
-        if n < 0
-            sys_close(fd)
-            free(buf)
-            return null
-        if n == 0
-            done = 1     # EOF: the file is shorter than stat said
-        else
-            total = total + n
+    var bytes: Vec<u8> = read_fd_to_vec(fd, st.st_size)
     sys_close(fd)
-    if total <= 0
-        free(buf)
+    if bytes.len == 0
         return null
-    *(buf + total) = 0
-    *out_len = total
-    return buf
+    # Hand the buffer to the caller, who frees it.
+    *out_len = bytes.len
+    let buf: *u8 = bytes.data
+    bytes.data = null
+    buf
+
+# Every byte of the open file `fd`, read to EOF, with a NUL past the last
+# one (in the capacity, not counted in `len`).  Capacity starts at
+# `size_hint`.  Empty when the file is, when the hint is not positive, or
+# when a read fails.  Does not close `fd`.
+fn read_fd_to_vec(fd: i32, size_hint: i64) -> Vec<u8>
+    var bytes: Vec<u8> = vec_new<u8>()
+    if size_hint <= 0 or not bytes.grow(size_hint + 1)
+        return bytes
+    # `size_hint` is only a first guess at capacity: the file can also be
+    # LARGER than stat said (under valgrind, whenever ritz1 outgrows
+    # memcheck), so read to EOF and grow the buffer, or the fingerprint
+    # hashes a prefix and differs from the native run (AGAST #2414).
+    # Report only the bytes actually read.  This used to claim `sz` bytes on
+    # EOF/error, an uninitialised tail as file contents, so the compiler
+    # fingerprint hashed garbage (AGAST #1663).
+    var done: bool = false
+    while not done
+        if bytes.len + 1 == bytes.cap and not bytes.grow(bytes.cap * 2)
+            bytes.clear()
+            return bytes
+        let n: i64 = sys_read(fd, bytes.data + bytes.len, bytes.cap - 1 - bytes.len)
+        if n < 0
+            bytes.clear()
+            return bytes
+        if n == 0
+            done = true     # EOF: the file is shorter than stat said
+        else
+            bytes.len = bytes.len + n
+    *(bytes.data + bytes.len) = 0
+    bytes
 
 # ============================================================================
 # Sig parsing (read)
@@ -947,30 +1082,34 @@ fn sig_serialize(sd: *SigData, buf: *Vec<u8>)
         buf.push(93)           # ']'
     buf.push_view("\n}\n")
 
-# Atomic write: serialize, write "<sig>.tmp.<pid>", rename over "<sig>".
-# Creates the sig's directory first.  Returns 0 on success, -1 on failure.
+# Atomic write: serialize, then write_file_atomic.  Creates the sig's
+# directory first.  Returns 0 on success, -1 on failure.
 pub fn write_sig_file(sig_path: *u8, sd: *SigData) -> i32
     if sd == null or sig_path == null
         return -1
     if *sig_path == 0
         return -1
     mkdir_parents(sig_path)
-    var tmp: String = sig_tmp_path(sig_path)
-    let tmp_ptr: *u8 = tmp.as_ptr()
-
     var buf: Vec<u8> = vec_with_cap<u8>(8192)
     sig_serialize(sd, @buf)
+    var path: String = string_from_cstr(sig_path)
+    return write_file_atomic(@&path, StrView { ptr: (buf.data), len: (buf.len) as i64 })
 
+# Write `data` to "<path>.tmp.<pid>" and rename it over `path`, so a reader
+# sees the old file or the whole new one, never a torn one.  The directory
+# must exist.  Returns 0 on success, -1 on failure.
+fn write_file_atomic(path: @&String, data: StrView) -> i32
+    var tmp: String = sig_tmp_path(path.as_ptr())
+    let tmp_ptr: *u8 = tmp.as_ptr()
     let fd: i32 = sys_open3(tmp_ptr, O_WRONLY + O_CREAT + O_TRUNC, 420)
     if fd < 0
         return -1
-    let n: i64 = sys_write(fd, buf.data, buf.len as i64)
+    let n: i64 = sys_write(fd, data.ptr, data.len)
     sys_close(fd)
-    let want: i64 = buf.len as i64
-    if n != want
+    if n != data.len
         sys_unlink(tmp_ptr)
         return -1
-    let r: i32 = sys_rename(tmp_ptr, sig_path)
+    let r: i32 = sys_rename(tmp_ptr, path.as_ptr())
     if r != 0
         sys_unlink(tmp_ptr)
         return -1

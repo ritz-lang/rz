@@ -258,7 +258,11 @@ it matches the running binary. Since AGAST #1807 it also records
 imported module invalidates its importers, and sigs no longer live beside the
 source: each compiler keeps its own under
 `$RITZ_CACHE_DIR` (default `~/.cache/ritz`) `/<compiler>/<abs source path>.sig`,
-so ritz0, ritz1 and ritz1_selfhosted stop evicting each other. If you
+so ritz0, ritz1 and ritz1_selfhosted stop evicting each other. The binary's
+content hash is memoized beside them in `/<compiler>/exe-id/<dev>-<ino>`,
+keyed by its size, mtime and ctime (AGAST #4851), so ritz1 hashes itself once
+per build of ritz1 rather than on every run. A relink is a new inode, hence a
+rehash; deleting `exe-id/` is always safe. If you
 see clean and incremental disagree again, suspect a cache key before you
 suspect codegen, and reach for the A/B in
 `ritz0/test_fn_cache_compiler_identity.py` rather than `make clean`.
