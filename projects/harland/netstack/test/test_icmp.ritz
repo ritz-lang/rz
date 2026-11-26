@@ -16,6 +16,7 @@ import netstack.icmp {
     IcmpType, IcmpRx, IcmpDrop, IcmpTable, ICMP_HEADER_LEN, ICMP_PENDING_CAP,
     icmp_parse, icmp_should_reply, icmp_reply_next_hop,
     icmp_echo_request_write, icmp_echo_reply_write, icmp_echo_reply_frame_write,
+    icmp_echo_request_frame_write,
 }
 import driver_abi.link { NetInfo }
 
@@ -244,4 +245,41 @@ fn test_pending_table_refuses_past_its_cap() -> i32
     # Re-noting an id already outstanding is not a new slot.
     if not g_table.note_sent(0)
         return 3
+    0
+
+# The service's APP_PING echo (AGAST #4749): an echo request frame to the
+# next hop's MAC, our address to the peer's.
+[[test]]
+fn test_echo_request_frame_round_trips() -> i32
+    var frame: [128]u8
+    let sent = match icmp_echo_request_frame_write(@frame, link(), peer_mac(), OUR_IP, PEER_IP, 7, 1, "abc")
+        Ok(n) => n
+        Err(_) => return 1
+    if sent != ETH_PAYLOAD_OFF + IPV4_HEADER_MIN + ICMP_HEADER_LEN + 3
+        return 2
+    let full: [u8] = @frame
+    let out: [u8] = full[0..sent]
+    match eth_demux(out, peer_mac())
+        Ok(eth) =>
+            if not mac_eq(eth.dst, peer_mac()) or not mac_eq(eth.src, our_mac())
+                return 3
+        Err(_) => return 4
+    let peer_cfg = Ipv4Config { addr: Some(PEER_IP), netmask: None, gateway: None }
+    let out_len = out.len
+    let ip_packet: [u8] = out[ETH_PAYLOAD_OFF..out_len]
+    match ipv4_parse(ip_packet, peer_cfg)
+        Ok(ip) =>
+            if ip.protocol != IpProto.Icmp or ip.src != OUR_IP or ip.dst != PEER_IP
+                return 5
+            match icmp_parse(ip.body)
+                Ok(rx) =>
+                    if rx.kind != IcmpType.EchoRequest or rx.id != 7 or rx.seq != 1 or rx.body.len != 3 or rx.body[2] != 'c'
+                        return 6
+                Err(_) => return 7
+        Err(_) => return 8
+    # Past the link MTU: not written.
+    let small = NetInfo { mac: our_mac(), link_up: 1, device_type: 1, mtu: 30 }
+    match icmp_echo_request_frame_write(@frame, small, peer_mac(), OUR_IP, PEER_IP, 7, 1, "abc")
+        Ok(_) => return 9
+        Err(_) => pass
     0

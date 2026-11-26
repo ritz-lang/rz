@@ -51,11 +51,11 @@ Items 1–5 are taken.
 
 2. **One live exchange per app process.** A second `NetAttach` returns `Errno.Exist` and creates nothing. The inbox depth is not that cap. Copying out an already-retired attach drops the service handle before the wait returns. `ShmMap` of a retired object the caller still holds returns `Errno.NoDev` and drops that handle. The service does not detach an object it never mapped.
 
-3. **`PING_DEADLINE_MS` is 1000.** It starts once, when the echo is published, and it is not restarted. One echo is in flight. Success is one `EV_PING_REPLY`. Failure is one `EV_ERROR` with `Errno.Io` (-5), including ARP giving up before an echo is sent. A late reply after that error is dropped. The kernel errno set has no timed-out discriminant, and this cutover does not add one, so the terminal failure is `Errno.Io`.
+3. **`PING_DEADLINE_MS` is 1000.** It starts once, when the echo is published, and it is not restarted. One echo is in flight. Success is one `EV_PING_REPLY`. Failure is one `EV_ERROR` with `Errno.Io` (-5), including ARP giving up before an echo is sent. A late reply after that error is dropped. The kernel errno set has no timed-out discriminant, and this cutover does not add one, so the terminal failure is `Errno.Io`. Held by `system/test/test_netsvc.ritz` (AGAST #4749): a quiet peer gets one `Errno.Io` at the deadline, the deadline starts when ARP lets the echo out, ARP giving up is one `EV_ERROR`, and a reply owed behind a full event ring is still the only terminal event.
 
 4. **Close drops that handle's private state.** `MAX_ENDPOINTS` is 16. `net_close` discards the handle's queued datagrams and its drop counter. A later call on that handle is `Errno.BadF`.
 
-5. **The request is consumed when it is read.** The owed reply sits in private per-attachment state and is posted into the reserved event slot. An `APP_SEND_TO` behind a ping reaches the TX ring while the echo is still in flight. The round-3 hold at the request head is withdrawn. The reserved slot stays, because a published datagram still cannot be dropped.
+5. **The request is consumed when it is read.** The owed reply sits in private per-attachment state and is posted into the reserved event slot. An `APP_SEND_TO` behind a ping reaches the TX ring while the echo is still in flight. The round-3 hold at the request head is withdrawn. Held by `test_ping_to_a_quiet_peer_is_one_eio_and_a_send_to_passes_it` (AGAST #4749). The reserved slot stays, because a published datagram still cannot be dropped.
 
 ## Verification
 

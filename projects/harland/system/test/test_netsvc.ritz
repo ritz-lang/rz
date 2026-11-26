@@ -1,6 +1,6 @@
-# Host tests of the ring-2 network service's loop body (AGAST #4743,
-# harland docs/RING2_NET.md "Service wait", "Ethernet demux", "Address
-# publication", "Frame seat")
+# Host tests of the ring-2 network service's loop body (AGAST #4743; app
+# exchanges #4748, APP_PING #4749; harland docs/RING2_NET.md "Service
+# wait", "Ethernet demux", "Address publication", "Frame seat", "ICMP")
 #
 # src/netsvc.ritz against a frame region and an address page that are host
 # globals. The driver's halves of the rings (the RX producer, the TX
@@ -17,12 +17,12 @@ import netstack.bytes { be16_get, be16_put, be32_get, be32_put }
 import netstack.ethernet { MacAddr, ETH_PAYLOAD_OFF, mac_eq, mac_is_broadcast }
 import netstack.ipv4 { IPV4_HEADER_MIN, IPV4_BROADCAST }
 import netstack.udp { UDP_HEADER_LEN, udp_frame_write }
-import netstack.icmp { icmp_echo_request_write }
+import netstack.icmp { icmp_echo_request_write, icmp_echo_reply_write }
 import netstack.ipv4 { IpProto, ipv4_frame_write }
 import netstack.arp { ARP_RETRY_INTERVAL_MS, ARP_RETRY_LIMIT }
 import netstack.dhcp { DHCP_MAGIC, DhcpState }
 import system.netsvc { NetSvc, Sent, Wake, PENDING_TX_CAP, WAIT_IDLE_MS, RX_BUDGET, OWED_RETRY_MS, wake_of, addr_record }
-import net_abi.app { AppDesc, APP_DEPTH, APP_REQ_DESC_OFF, APP_BIND, APP_SEND_TO, APP_CLOSE, APP_CONNECT, APP_WRITE, EV_DATAGRAM, EV_BOUND, EV_CLOSED, EV_ERROR }
+import net_abi.app { AppDesc, APP_DEPTH, APP_REQ_DESC_OFF, APP_BIND, APP_SEND_TO, APP_PING, APP_CLOSE, APP_CONNECT, APP_WRITE, EV_DATAGRAM, EV_PING_REPLY, EV_BOUND, EV_CLOSED, EV_ERROR, PING_DEADLINE_MS }
 import libnet.ring { AppProducer, AppConsumer, AppPublish, AppPoll, AppTake, AppBytes, app_req_ring, app_ev_ring }
 
 const SERVER_IP: u32 = 0x0A000202      # 10.0.2.2, also the router
@@ -1002,5 +1002,285 @@ fn test_send_to_failures_count_in_send_drops_with_no_event() -> i32
         t += ARP_RETRY_INTERVAL_MS
         svc.service(t)
     if svc.apps[a].counters.send_drops != 3 or app_event()
+        return 2
+    0
+
+# ---------------------------------------------------------------------------
+# APP_PING (AGAST #4749): one echo in flight, PING_DEADLINE_MS from the
+# echo's publish, exactly one terminal event
+# ---------------------------------------------------------------------------
+
+fn peer_addr() -> [4]u8
+    [10, 0, 2, 3]
+
+fn app_ping(id: u32, body: [u8]) -> bool
+    app_req(APP_PING, id, 0, 0, peer_addr(), body)
+
+# The peer ARPs us, so its MAC is cached; our ARP reply is taken.
+fn cache_peer(svc: @&NetSvc, now: u64)
+    drv_arp(1, [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF], PEER_IP, peer_mac(), OUR_IP)
+    svc.service(now)
+    drv_take_all()
+
+# g_got is an echo request to the peer's MAC and address.
+fn got_is_echo_request() -> bool
+    let g = got()
+    be16_get(g, 12) == 0x0800 and g[14 + 9] == 1 and g[14 + 20] == 8 and mac_eq(got_mac(0), peer_mac()) and got_ip_dst() == PEER_IP
+
+fn got_echo_id() -> u16
+    be16_get(got(), 14 + 20 + 4)
+
+fn got_echo_seq() -> u16
+    be16_get(got(), 14 + 20 + 6)
+
+# An echo reply from `src` (through the peer's MAC) on the RX ring.
+fn drv_echo_reply(src: u32, id: u16, seq: u16, body: [u8]) -> bool
+    let f: [u8] = @g_frame
+    let icmp = f[14 + 20..f.len]
+    let len = match icmp_echo_reply_write(icmp, id, seq, body)
+        Ok(n) => n
+        Err(_) => return false
+    let peer = NetInfo { mac: peer_mac(), link_up: 1, device_type: 1, mtu: 1500 }
+    match ipv4_frame_write(f, peer, our_mac(), IpProto.Icmp, src, OUR_IP, len)
+        Ok(n) => drv_publish(f[0..n])
+        Err(_) => false
+
+[[test]]
+fn test_ping_to_a_quiet_peer_is_one_eio_and_a_send_to_passes_it() -> i32
+    let svc = bound(0)
+    cache_peer(svc, 10)
+    app_attach(svc)
+    app_bind(1, 5000)
+    svc.service(20)
+    app_event()
+    # A ping, and a datagram behind it.
+    app_ping(2, "abc")
+    app_req(APP_SEND_TO, 0, 1, 7000, peer_addr(), "xyz")
+    svc.service(100)
+    if drv_take() == 0 or not got_is_echo_request()
+        return 1
+    let id = got_echo_id()
+    let seq = got_echo_seq()
+    # The send_to reached TX while the echo is in flight.
+    if drv_take() != PAYLOAD_AT + 3 or got()[PAYLOAD_AT] != 'x' as u8 or drv_take() != 0
+        return 2
+    if app_event()
+        return 3
+    # The deadline is the wait's.
+    if svc.deadline(100) != PING_DEADLINE_MS
+        return 4
+    svc.service(100 + PING_DEADLINE_MS - 1)
+    if app_event()
+        return 5
+    # A reply taken in the pass that reaches the deadline is too late.
+    drv_echo_reply(PEER_IP, id, seq, "abc")
+    svc.service(100 + PING_DEADLINE_MS)
+    if not app_event() or not ev_is(EV_ERROR, 2, -5) or app_event()
+        return 6
+    # No second echo, and a late reply is dropped.
+    if drv_take() != 0
+        return 7
+    drv_echo_reply(PEER_IP, id, seq, "abc")
+    svc.service(1200)
+    svc.service(5000)
+    if app_event() or drv_take() != 0
+        return 8
+    0
+
+[[test]]
+fn test_ping_reply_is_one_ev_ping_reply() -> i32
+    let svc = bound(0)
+    cache_peer(svc, 10)
+    app_attach(svc)
+    app_ping(3, "abc")
+    svc.service(100)
+    if drv_take() == 0 or not got_is_echo_request()
+        return 1
+    let id = got_echo_id()
+    let seq = got_echo_seq()
+    # Another id, or another source, is not this echo's reply.
+    drv_echo_reply(PEER_IP, id + 1, seq, "abc")
+    drv_echo_reply(SERVER_IP, id, seq, "abc")
+    svc.service(300)
+    if app_event()
+        return 2
+    drv_echo_reply(PEER_IP, id, seq, "abc")
+    svc.service(600)
+    if not app_event() or not ev_is(EV_PING_REPLY, 3, 0) or g_evd.length != 3
+        return 3
+    if not bytes_are(g_evd.addr, PEER_IP) or g_evbuf[0] != 'a' as u8 or g_evbuf[2] != 'c' as u8
+        return 4
+    # A duplicate reply and the deadline post nothing more.
+    drv_echo_reply(PEER_IP, id, seq, "abc")
+    svc.service(700)
+    svc.service(100 + PING_DEADLINE_MS)
+    svc.service(5000)
+    if app_event()
+        return 5
+    0
+
+[[test]]
+fn test_ping_deadline_starts_when_the_echo_is_published() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    app_ping(4, "abc")
+    svc.service(0)
+    # The peer is not cached: an ARP request and no echo.
+    if drv_take() != 14 + 28 or drv_take() != 0
+        return 1
+    # ARP resolves at 900: the echo goes, and its deadline starts then.
+    drv_arp(2, our_mac(), PEER_IP, peer_mac(), OUR_IP)
+    svc.service(900)
+    if drv_take() == 0 or not got_is_echo_request() or drv_take() != 0
+        return 2
+    if svc.deadline(900) != PING_DEADLINE_MS
+        return 3
+    svc.service(900 + PING_DEADLINE_MS - 1)
+    if app_event()
+        return 4
+    svc.service(900 + PING_DEADLINE_MS)
+    if not app_event() or not ev_is(EV_ERROR, 4, -5) or app_event()
+        return 5
+    0
+
+[[test]]
+fn test_ping_arp_give_up_is_one_eio_and_no_echo() -> i32
+    let svc = bound(0)
+    app_attach(svc)
+    app_ping(5, "abc")
+    svc.service(0)
+    var now: u64 = 0
+    for i in 0..ARP_RETRY_LIMIT + 1
+        # Only ARP requests go out; no event while ARP retries.
+        while drv_take() > 0
+            if be16_get(got(), 12) != 0x0806
+                return 1
+        if app_event()
+            return 2
+        now += ARP_RETRY_INTERVAL_MS
+        svc.service(now)
+    if drv_take() != 0
+        return 3
+    if not app_event() or not ev_is(EV_ERROR, 5, -5) or app_event()
+        return 4
+    let a = svc.app_slot(APP_H).unwrap_or(0)
+    if svc.counters.arp_drops != 1 or svc.apps[a].counters.send_drops != 0
+        return 5
+    # ARP answering late sends no echo and posts nothing.
+    drv_arp(2, our_mac(), PEER_IP, peer_mac(), OUR_IP)
+    svc.service(now + 10)
+    if drv_take() != 0 or app_event()
+        return 6
+    0
+
+[[test]]
+fn test_second_ping_in_flight_is_inval() -> i32
+    let svc = bound(0)
+    cache_peer(svc, 10)
+    app_attach(svc)
+    app_ping(1, "a")
+    app_ping(2, "b")
+    svc.service(100)
+    # One echo; the second ping is answered at once.
+    if drv_take() == 0 or not got_is_echo_request() or drv_take() != 0
+        return 1
+    if not app_event() or not ev_is(EV_ERROR, 2, -22) or app_event()
+        return 2
+    svc.service(100 + PING_DEADLINE_MS)
+    if not app_event() or not ev_is(EV_ERROR, 1, -5) or app_event()
+        return 3
+    # Then the next ping is served.
+    app_ping(3, "c")
+    svc.service(2000)
+    if drv_take() == 0 or not got_is_echo_request()
+        return 4
+    0
+
+[[test]]
+fn test_ping_with_no_address_is_eio_at_once() -> i32
+    let svc = started(0)
+    drv_take_all()
+    app_attach(svc)
+    app_ping(1, "a")
+    svc.service(10)
+    if not app_event() or not ev_is(EV_ERROR, 1, -5) or app_event()
+        return 1
+    if drv_take() != 0
+        return 2
+    0
+
+[[test]]
+fn test_in_flight_ping_keeps_an_owed_slot() -> i32
+    let svc = bound(0)
+    cache_peer(svc, 10)
+    app_attach(svc)
+    app_ping(1, "a")
+    svc.service(100)
+    drv_take_all()
+    # Binds with no event read: 32 replies fill the event ring and 31 are
+    # owed, since the ping's terminal event keeps the last owed slot; the
+    # rest wait on the request ring.
+    var next_id: u32 = 2
+    for round in 0..4
+        while app_bind(next_id, (6000 + next_id) as u16)
+            next_id += 1
+        svc.service(200 + round as u64)
+    let a = svc.app_slot(APP_H).unwrap_or(0)
+    if svc.apps[a].owed_count != OWED_CAP - 1
+        return 1
+    svc.service(100 + PING_DEADLINE_MS)
+    if svc.apps[a].owed_count != OWED_CAP
+        return 2
+    # In order: the binds, the ping's EIO, then the binds that waited.
+    let eio_at: u32 = 2 + APP_DEPTH as u32 + OWED_CAP as u32 - 1
+    var want: u32 = 2
+    var eio = false
+    for round in 0..8
+        while app_event()
+            if want == eio_at and not eio
+                if not ev_is(EV_ERROR, 1, -5)
+                    return 3
+                eio = true
+            else
+                if g_evd.id != want
+                    return 4
+                want += 1
+        svc.service(1200 + round as u64)
+    if not eio or want != next_id
+        return 5
+    0
+
+[[test]]
+fn test_owed_ping_reply_is_the_only_terminal_event() -> i32
+    let svc = bound(0)
+    cache_peer(svc, 10)
+    app_attach(svc)
+    app_ping(1, "abc")
+    svc.service(100)
+    if drv_take() == 0 or not got_is_echo_request()
+        return 1
+    let id = got_echo_id()
+    let seq = got_echo_seq()
+    # Binds with no event read fill the event ring.
+    var next_id: u32 = 2
+    for round in 0..2
+        while app_bind(next_id, (6000 + next_id) as u16)
+            next_id += 1
+        svc.service(200 + round as u64)
+    # The reply is owed behind a full ring when the deadline passes.
+    drv_echo_reply(PEER_IP, id, seq, "abc")
+    svc.service(300)
+    svc.service(100 + PING_DEADLINE_MS)
+    var replies: u32 = 0
+    var errors: u32 = 0
+    for round in 0..8
+        while app_event()
+            if g_evd.id == 1
+                if ev_is(EV_PING_REPLY, 1, 0) and g_evd.length == 3 and g_evbuf[0] == 'a' as u8
+                    replies += 1
+                else
+                    errors += 1
+        svc.service(2000 + round as u64)
+    if replies != 1 or errors != 0
         return 2
     0

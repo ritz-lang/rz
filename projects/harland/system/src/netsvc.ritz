@@ -38,8 +38,15 @@
 # attachment in its wait, posts the notifies this file asks for and
 # CapRevokes an attachment this file closed.
 #
-# Scope: APP_PING (AGAST #4749) is answered EV_ERROR NoSys until it is
-# served, and an echo reply is dropped.
+# APP_PING (AGAST #4749, RING2_NET.md "ICMP"): one echo in flight per
+# attachment. The request is consumed at read like every reply kind; while
+# ARP resolves the next hop the echo is one ArpWait on that hop. The echo
+# is published once and PING_DEADLINE_MS starts then (handed to the TX
+# side: the ring, or the pending-TX queue it leaves in order), never
+# restarted. Exactly one terminal event: a matching echo reply before the
+# deadline is EV_PING_REPLY, the deadline or ARP giving up is EV_ERROR
+# Errno.Io, and a reply after that is dropped. While the echo is in flight
+# it keeps one owed slot, so its terminal event always fits OWED_CAP.
 
 import driver_abi.frame_ring { FRAME_MAX, FRAME_RING_CAP }
 import driver_abi.link { NetInfo, NetAddr, addr_publish }
@@ -48,11 +55,11 @@ import driver_abi.wait { WaitEvent, WaitSource, EVENT_DATA, EVENT_SPACE, EVENT_P
 import netstack.ethernet { MacAddr, EtherType, EthRx, SendError, ETH_PAYLOAD_OFF, eth_demux }
 import netstack.arp { ArpOp, ArpRx, ArpLearn, ArpSend, ArpEvent, ArpTable, ARP_HOP_CAP, arp_parse, arp_request_write, arp_reply_write, arp_should_reply, arp_broadcast_mac }
 import netstack.ipv4 { Ipv4Config, Ipv4Rx, IpProto, IPV4_HEADER_MIN, IPV4_BROADCAST, DHCP_SERVER_PORT, DHCP_CLIENT_PORT, ipv4_parse, ipv4_next_hop }
-import netstack.icmp { IcmpRx, IcmpType, icmp_parse, icmp_should_reply, icmp_reply_next_hop, icmp_echo_reply_frame_write }
+import netstack.icmp { IcmpRx, IcmpType, icmp_parse, icmp_should_reply, icmp_reply_next_hop, icmp_echo_reply_frame_write, icmp_echo_request_frame_write }
 import netstack.udp { UdpRx, UDP_HEADER_LEN, udp_parse, udp_frame_write }
 import netstack.dhcp { DhcpClient, DhcpStep, DhcpSend, DhcpRecord, DhcpTx, DhcpLease }
-import netstack.app { AppPorts, AppOwner, AppReq, BindError, APP_ATTACH_CAP, APP_EBADF, APP_EEXIST, APP_EINVAL, APP_ENFILE, APP_ENOSYS, app_request }
-import net_abi.app { AppDesc, APP_DEPTH, EV_DATAGRAM, EV_BOUND, EV_CLOSED, EV_ERROR }
+import netstack.app { AppPorts, AppOwner, AppReq, BindError, APP_ATTACH_CAP, APP_EBADF, APP_EEXIST, APP_EINVAL, APP_EIO, APP_ENFILE, APP_ENOSYS, app_request }
+import net_abi.app { AppDesc, APP_DEPTH, APP_SLOT, EV_DATAGRAM, EV_PING_REPLY, EV_BOUND, EV_CLOSED, EV_ERROR, PING_DEADLINE_MS }
 import libnet.ring { AppConsumer, AppProducer, AppPoll, AppTake, AppPublish, AppBytes, app_req_ring, app_ev_ring }
 import ritzlib.span
 
@@ -87,10 +94,15 @@ pub const OWED_CAP: i64 = 32
 # not freed an event slot: the app frees slots without a notify.
 pub const OWED_RETRY_MS: u64 = 100
 
+# The ICMP sequence number of every APP_PING echo: one echo per request, so
+# the ICMP identifier alone (a fresh one per echo) tells echoes apart.
+pub const PING_SEQ: u16 = 1
+
 # What happened to one send.
 pub enum Sent
     Published                        # on the TX ring
-    Queued                           # on the pending-TX queue, or waiting for ARP
+    Queued                           # on the pending-TX queue
+    Waiting                          # waiting for ARP to resolve the next hop
     Failed                           # the pending queue (or the ARP wait store) was full, or the frame did not build
 
 # One IPv4 frame waiting for its next hop's MAC (bytes 0..6 are filled in
@@ -105,6 +117,9 @@ pub struct ArpWait
     # and not in a later one's in the same slot.
     app: Option<i64>
     serial: u32
+    # The frame is that attachment's APP_PING echo: ARP resolving the hop
+    # starts its deadline, ARP giving up is its EV_ERROR.
+    ping: bool
 
 pub struct NetCounters
     rx_frames: u64                   # taken off the RX ring
@@ -123,6 +138,14 @@ pub struct Owed
     handle: u32
     port: u16
     status: i16
+    addr: [4]u8                      # the peer of an EV_PING_REPLY, else zero
+
+# Where an attachment's one APP_PING is.
+pub enum PingState
+    Idle                             # none in flight: the next one is served
+    Arp                              # the echo waits for ARP on its next hop
+    Echo                             # the echo is out; the deadline runs
+    Replied                          # EV_PING_REPLY is owed, its bytes in ping_bufs
 
 pub struct AppCounters
     requests: u64                    # requests dispatched
@@ -146,6 +169,14 @@ pub struct AppAttach
     taken: u32                       # requests consumed since the last notify
     posted: u32                      # events posted since the last notify
     counters: AppCounters
+    # The one APP_PING: its request id, peer, ICMP identifier, and the
+    # deadline while Echo.
+    ping: PingState
+    ping_id: u32
+    ping_dst: u32
+    ping_ident: u16
+    ping_deadline: u64
+    ping_len: u32                    # the echoed bytes in ping_bufs while Replied
 
 # A ShmNotify netd owes an attachment: DATA for posted events, SPACE for
 # consumed requests.
@@ -249,9 +280,15 @@ pub struct NetSvc
     app_serial: u32
     # The last pass stopped draining an attachment at APP_DEPTH requests.
     app_more: bool
-    # The attachment whose send is being built.
+    # The attachment whose send is being built, and whether it is that
+    # attachment's ping echo.
     out_app: Option<i64>
+    out_ping: bool
     req_buf: AppBytes                # the private copy of one request's payload
+    # Each attachment's echoed bytes while its EV_PING_REPLY is owed.
+    ping_bufs: [5]AppBytes           # APP_ATTACH_CAP
+    # The last ICMP identifier an echo used.
+    ping_ident: u16
 
 impl NetSvc
     # The service over the frame region at `region` and the address page
@@ -276,6 +313,8 @@ impl NetSvc
         self.app_serial = 0
         self.app_more = false
         self.out_app = None
+        self.out_ping = false
+        self.ping_ident = 0
         self.generation = 0
         self.publish_due = false
         self.published = 0
@@ -343,6 +382,8 @@ impl NetSvc
         for a in 0..APP_ATTACH_CAP
             if self.apps[a].live and self.apps[a].owed_count > 0 and now + OWED_RETRY_MS < at
                 at = now + OWED_RETRY_MS
+            if self.apps[a].live and self.apps[a].ping == PingState.Echo and self.apps[a].ping_deadline < at
+                at = self.apps[a].ping_deadline
         match self.dhcp.next_deadline()
             Some(d) =>
                 if d < at
@@ -479,19 +520,24 @@ impl NetSvc
                 self.waits[w].serial = match self.out_app
                     Some(a) => self.apps[a].serial
                     None => 0
-                return Sent.Queued
+                self.waits[w].ping = self.out_ping
+                return Sent.Waiting
         self.counters.send_fails += 1
         Sent.Failed
 
-    # ARP resolved `hop` to `mac`: send every frame waiting on it.
-    fn release_waits(self: @&NetSvc, hop: u32, mac: MacAddr)
+    # ARP resolved `hop` to `mac` at `now`: send every frame waiting on it.
+    fn release_waits(self: @&NetSvc, hop: u32, mac: MacAddr, now: u64)
         for w in 0..ARP_WAIT_CAP
             if self.waits[w].live and self.waits[w].hop == hop
                 self.waits[w].live = false
                 for i in 0..6
                     self.waits[w].frame[i] = mac[i]
                 let frame: [u8] = span_from_ptr<u8>(@self.waits[w].frame[0], self.waits[w].len as i64)
-                self.send_frame(frame)
+                let sent = self.send_frame(frame)
+                if self.waits[w].ping
+                    match self.ping_of_wait(w)
+                        Some(a) => self.ping_sent(a, sent, now)
+                        None => pass
 
     # ARP gave up on `hop`: drop what waits on it.
     fn drop_waits(self: @&NetSvc, hop: u32)
@@ -499,11 +545,27 @@ impl NetSvc
             if self.waits[w].live and self.waits[w].hop == hop
                 self.waits[w].live = false
                 self.counters.arp_drops += 1
+                if self.waits[w].ping
+                    # The ping's terminal event, not a send_drop.
+                    match self.ping_of_wait(w)
+                        Some(a) => self.ping_fail(a)
+                        None => pass
+                    continue
                 match self.waits[w].app
                     Some(a) =>
                         if self.apps[a].live and self.apps[a].serial == self.waits[w].serial
                             self.apps[a].counters.send_drops += 1
                     None => pass
+
+    # The attachment whose ping echo wait `w` holds, while that attachment
+    # is the one that parked it and its ping still waits for ARP.
+    fn ping_of_wait(self: @NetSvc, w: i64) -> Option<i64>
+        match self.waits[w].app
+            Some(a) =>
+                if self.apps[a].live and self.apps[a].serial == self.waits[w].serial and self.apps[a].ping == PingState.Arp
+                    return Some(a)
+                None
+            None => None
 
     fn our_ip(self: @&NetSvc) -> Option<u32>
         self.dhcp.config().addr
@@ -563,7 +625,7 @@ impl NetSvc
         if ours.is_none() and rx.op == ArpOp.Request
             return
         match self.arp.observe(rx, our_ip, now)
-            ArpLearn.Resolved(_) => self.release_waits(rx.sender_ip, rx.sender_mac)
+            ArpLearn.Resolved(_) => self.release_waits(rx.sender_ip, rx.sender_mac, now)
             _ => pass
         if arp_should_reply(rx, our_ip, ours.is_some())
             let out: [u8] = @self.out
@@ -609,6 +671,9 @@ impl NetSvc
         let ours = match cfg.addr
             Some(a) => a
             None => return
+        if msg.kind == IcmpType.EchoReply
+            self.on_echo_reply(ip.src, msg, now)
+            return
         if not icmp_should_reply(msg.kind, ip.dst, eth_dst)
             return
         let hop = match icmp_reply_next_hop(cfg, ip.src)
@@ -621,6 +686,30 @@ impl NetSvc
             Ok(len) => self.send_ip(hop, len, now)
             Err(_) =>
                 self.counters.send_fails += 1
+
+    # An echo reply from `src`: the EV_PING_REPLY of the attachment whose
+    # echo it answers, before that echo's deadline; else dropped (no echo
+    # of ours, or a late or duplicate reply).
+    fn on_echo_reply(self: @&NetSvc, src: u32, msg: IcmpRx, now: u64)
+        for a in 0..APP_ATTACH_CAP
+            if self.ping_answers(a, src, msg, now)
+                var n = msg.body.len
+                if n > APP_SLOT as i64
+                    n = APP_SLOT as i64
+                for i in 0..n
+                    self.ping_bufs[a][i] = msg.body[i]
+                self.apps[a].ping_len = n as u32
+                self.owe_at(a, EV_PING_REPLY, self.apps[a].ping_id, 0, 0, 0, ip_bytes(src))
+                self.apps[a].ping = PingState.Replied
+                return
+        self.counters.rx_drops += 1
+
+    # Whether `msg` from `src` at `now` answers attachment `a`'s echo:
+    # that peer, that identifier and PING_SEQ, before the deadline.
+    fn ping_answers(self: @NetSvc, a: i64, src: u32, msg: IcmpRx, now: u64) -> bool
+        if not self.apps[a].live or self.apps[a].ping != PingState.Echo
+            return false
+        self.apps[a].ping_dst == src and self.apps[a].ping_ident == msg.id and msg.seq == PING_SEQ and now < self.apps[a].ping_deadline
 
     # ------------------------------------------------------------------
     # The app exchanges
@@ -646,6 +735,7 @@ impl NetSvc
                 self.apps[a].taken = 0
                 self.apps[a].posted = 0
                 self.apps[a].counters = AppCounters { requests: 0, rejects: 0, send_drops: 0, ev_drops: 0 }
+                self.apps[a].ping = PingState.Idle
                 self.ports.attach(a)
                 self.app_more = true
                 return true
@@ -718,6 +808,7 @@ impl NetSvc
         self.apps[a].live = false
         self.apps[a].revoke = true
         self.apps[a].owed_count = 0
+        self.apps[a].ping = PingState.Idle
         self.ports.detach(a)
 
     fn apps_pass(self: @&NetSvc, now: u64)
@@ -728,12 +819,22 @@ impl NetSvc
                 self.drain(a, now)
                 self.post_owed(a)
 
+    # Replies attachment `a` owes or will owe: the FIFO, and the terminal
+    # event of a ping still in flight.
+    fn owed_load(self: @NetSvc, a: i64) -> i64
+        match self.apps[a].ping
+            PingState.Arp => self.apps[a].owed_count + 1
+            PingState.Echo => self.apps[a].owed_count + 1
+            # Replied: the EV_PING_REPLY is already in the FIFO.
+            PingState.Replied => self.apps[a].owed_count
+            PingState.Idle => self.apps[a].owed_count
+
     # Take up to APP_DEPTH requests of attachment `a`. Stops while its
     # owed replies fill OWED_CAP: the app is not reading events.
     fn drain(self: @&NetSvc, a: i64, now: u64)
         var n: u64 = 0
         while n < APP_DEPTH
-            if not self.apps[a].live or self.apps[a].owed_count >= OWED_CAP
+            if not self.apps[a].live or self.owed_load(a) >= OWED_CAP
                 return
             # The consumer is copied out and back: one private read_idx.
             var req = self.apps[a].req
@@ -779,6 +880,7 @@ impl NetSvc
             AppReq.SendTo =>
                 if not self.app_send(a, d, len, now)
                     self.apps[a].counters.send_drops += 1
+            AppReq.Ping(id) => self.ping_start(a, id, d, len, now)
             AppReq.NoSys(id) => self.owe(a, EV_ERROR, id, 0, 0, APP_ENOSYS)
             AppReq.Inval(id) => self.owe(a, EV_ERROR, id, 0, 0, APP_EINVAL)
             AppReq.BadF(id) => self.owe(a, EV_ERROR, id, 0, 0, APP_EBADF)
@@ -786,9 +888,77 @@ impl NetSvc
                 self.apps[a].counters.rejects += 1
 
     fn owe(self: @&NetSvc, a: i64, kind: u16, id: u32, handle: u32, port: u16, status: i16)
+        self.owe_at(a, kind, id, handle, port, status, [0, 0, 0, 0])
+
+    fn owe_at(self: @&NetSvc, a: i64, kind: u16, id: u32, handle: u32, port: u16, status: i16, addr: [4]u8)
         let slot = (self.apps[a].owed_head + self.apps[a].owed_count) % OWED_CAP
-        self.apps[a].owed[slot] = Owed { kind: kind, id: id, handle: handle, port: port, status: status }
+        self.apps[a].owed[slot] = Owed { kind: kind, id: id, handle: handle, port: port, status: status, addr: addr }
         self.apps[a].owed_count += 1
+
+    # Attachment `a`'s APP_PING `id` to d.addr, its echo bytes
+    # req_buf[0..len]. A second one while one is not Idle is Inval (the
+    # library keeps one reply outstanding); no address or no route is Io,
+    # and bytes past the link MTU are Inval.
+    fn ping_start(self: @&NetSvc, a: i64, id: u32, d: AppDesc, len: u32, now: u64)
+        if self.apps[a].ping != PingState.Idle
+            self.owe(a, EV_ERROR, id, 0, 0, APP_EINVAL)
+            return
+        let cfg = self.dhcp.config()
+        let src = match cfg.addr
+            Some(s) => s
+            None =>
+                self.owe(a, EV_ERROR, id, 0, 0, APP_EIO)
+                return
+        let dst = ip_of(d.addr)
+        let hop = match ipv4_next_hop(cfg, dst)
+            Ok(h) => h
+            Err(_) =>
+                self.owe(a, EV_ERROR, id, 0, 0, APP_EIO)
+                return
+        self.ping_ident += 1
+        if self.ping_ident == 0
+            self.ping_ident = 1
+        let buf: [u8] = @self.req_buf
+        let out: [u8] = @self.out
+        let n = match icmp_echo_request_frame_write(out, self.link, [0, 0, 0, 0, 0, 0], src, dst, self.ping_ident, PING_SEQ, buf[0..len as i64])
+            Ok(n) => n
+            Err(_) =>
+                self.owe(a, EV_ERROR, id, 0, 0, APP_EINVAL)
+                return
+        self.apps[a].ping_id = id
+        self.apps[a].ping_dst = dst
+        self.apps[a].ping_ident = self.ping_ident
+        self.apps[a].ping = PingState.Arp
+        self.out_app = Some(a)
+        self.out_ping = true
+        let sent = self.send_ip(hop, n, now)
+        self.out_app = None
+        self.out_ping = false
+        self.ping_sent(a, sent, now)
+
+    # Where attachment `a`'s echo went at `now`: out (the deadline starts,
+    # once), waiting for ARP (still Arp), or failed (EV_ERROR Io).
+    fn ping_sent(self: @&NetSvc, a: i64, sent: Sent, now: u64)
+        match sent
+            Sent.Published => self.ping_echo_out(a, now)
+            Sent.Queued => self.ping_echo_out(a, now)
+            Sent.Waiting => pass
+            Sent.Failed => self.ping_fail(a)
+
+    fn ping_echo_out(self: @&NetSvc, a: i64, now: u64)
+        self.apps[a].ping = PingState.Echo
+        self.apps[a].ping_deadline = now + PING_DEADLINE_MS
+
+    # Attachment `a`'s ping ends in its one EV_ERROR, Errno.Io.
+    fn ping_fail(self: @&NetSvc, a: i64)
+        self.owe(a, EV_ERROR, self.apps[a].ping_id, 0, 0, APP_EIO)
+        self.apps[a].ping = PingState.Idle
+
+    # Every echo whose deadline has passed: EV_ERROR Io.
+    fn ping_tick(self: @&NetSvc, now: u64)
+        for a in 0..APP_ATTACH_CAP
+            if self.apps[a].live and self.apps[a].ping == PingState.Echo and now >= self.apps[a].ping_deadline
+                self.ping_fail(a)
 
     # Post attachment `a`'s owed replies, oldest first, while the event
     # ring has a slot.
@@ -796,8 +966,13 @@ impl NetSvc
         let none: [u8] = @self.req_buf
         while self.apps[a].live and self.apps[a].owed_count > 0
             let o = self.apps[a].owed[self.apps[a].owed_head]
+            var body: [u8] = none[0..0]
+            if o.kind == EV_PING_REPLY
+                # span_from_ptr, not `@self.ping_bufs[a]`: ritz1 stores
+                # the element's address where the span belongs.
+                body = span_from_ptr<u8>(@self.ping_bufs[a][0], self.apps[a].ping_len as i64)
             var ev = self.apps[a].ev
-            let r = ev.publish(o.kind, o.id, o.handle, o.port, o.status, [0, 0, 0, 0], none[0..0])
+            let r = ev.publish(o.kind, o.id, o.handle, o.port, o.status, o.addr, body)
             self.apps[a].ev = ev
             match r
                 AppPublish.Done =>
@@ -809,6 +984,8 @@ impl NetSvc
                     return
             self.apps[a].owed_head = (self.apps[a].owed_head + 1) % OWED_CAP
             self.apps[a].owed_count -= 1
+            if o.kind == EV_PING_REPLY
+                self.apps[a].ping = PingState.Idle
 
     # A UDP datagram for `o`'s port from `src`:`src_port`. Posted as
     # EV_DATAGRAM only while one event slot stays free for a reply. `o` is
@@ -901,7 +1078,8 @@ impl NetSvc
                 self.counters.send_fails += 1
                 Sent.Failed
 
-    # DHCP retransmits and lease timers, then ARP retries and give-ups.
+    # DHCP retransmits and lease timers, ARP retries and give-ups, then
+    # ping deadlines.
     fn tick(self: @&NetSvc, now: u64)
         let r = self.next_rand()
         let step = self.dhcp.tick(now, r)
@@ -912,6 +1090,7 @@ impl NetSvc
             match events[i]
                 ArpEvent.Retry(hop) => self.send_arp_request(hop)
                 ArpEvent.GiveUp(hop, _) => self.drop_waits(hop)
+        self.ping_tick(now)
 
     # Writer steps 1-4 of the address page (the T36 seqlock) for `lease`,
     # or the cleared record; NetPublish is netd's.
