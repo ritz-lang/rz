@@ -130,8 +130,10 @@ var vtd_dom_iova_next: [8]u64   # the domain's next unallocated IOVA
 # A private domain's IOVAs start at 64 GiB, above any RAM the identity
 # domain maps on the boots harland supports: a device still on the
 # identity map that is handed one of these addresses faults instead of
-# reaching a page by accident. IOVAs are never reused, so a stale one
-# can't alias a later grant.
+# reaching a page by accident. vtd_domain_iova_alloc never hands an IOVA
+# out twice; only DrvDmaFree reuses one, for the same process and device
+# and only once every unit confirmed its removal (vtd_domain_enter_at), so
+# a stale one can't alias a later grant.
 pub const VTD_IOVA_BASE: u64 = 0x1000000000
 
 # Requesters vtd_dma_init leaves without an identity context: the NIC and
@@ -1106,13 +1108,23 @@ fn vtd_domain_unmap_run(dom: u32, iova: u64, pages: u64) -> bool
     ok
 
 # Map the `pages` contiguous physical pages from `phys` read-write into
-# domain `dom` at fresh IOVAs (DrvDmaAlloc's run, the in-kernel NIC's rings
-# and buffers). A page that fails to map unmaps the ones before it and waits
-# for their invalidation (above).
+# domain `dom` at fresh IOVAs (the in-kernel NIC's rings and buffers). A
+# page that fails to map unmaps the ones before it and waits for their
+# invalidation (vtd_domain_enter_at).
 pub fn vtd_domain_enter(dom: u32, phys: u64, pages: u64) -> VtdEnter
     let iova: u64 = match vtd_domain_iova_alloc(dom, pages)
         Some(v) => v
         None => return VtdEnter.Refused
+    vtd_domain_enter_at(dom, iova, phys, pages)
+
+# ... at `iova`, which the caller owns: fresh from vtd_domain_iova_alloc, or
+# a range DrvDmaFree took out of the domain with every unit confirming
+# (AGAST #4725). A page already mapped there refuses the run and keeps that
+# mapping. On Refused nothing of the run is mapped; on Stuck the device may
+# still reach it, and that IOVA must not be used again.
+pub fn vtd_domain_enter_at(dom: u32, iova: u64, phys: u64, pages: u64) -> VtdEnter
+    if pages == 0
+        return VtdEnter.Refused
     var p: u64 = 0
     while p < pages
         let r: VtdDma = vtd_domain_map(dom, iova + p * 4096, phys + p * 4096, true)

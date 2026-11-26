@@ -281,14 +281,14 @@ Drivers are the ring-1 tier and run at CPL 3, like every process. Device
 authority is a capability, not a privilege level or a privilege bit;
 a missing capability is `Errno.Perm`. The numbers below are reserved by
 [`RING1_DRIVER.md`](RING1_DRIVER.md), which defines their arguments and
-returns; they are not yet in `syscall/numbers.ritz`.
+returns; each is in `syscall/numbers.ritz` with its handler.
 
 | Number | Name | Capability | Purpose |
 |--------|------|------------|---------|
 | 220 | `DrvIrqWait` | `CAP_TYPE_IRQ` | Park on the process wait set, including this device's IRQ object, with a deadline |
 | 221 | `DrvMmioMap` | `CAP_TYPE_MMIO` | Map whole pages of a recorded MMIO window, uncached, into this process |
 | 222 | `DrvDmaAlloc` | `CAP_TYPE_IRQ` | Allocate zeroed DMA pages in the device's translated domain; reports the IOVA |
-| 223 | `DrvDmaFree` | `CAP_TYPE_IRQ` | Return a completed DMA run |
+| 223 | `DrvDmaFree` | `CAP_TYPE_IRQ` | Return a DMA run once the IOTLB dropped its IOVA; its VA and IOVA are reused by this process and device, or quarantined until reboot if the invalidation did not finish |
 | 227 | `ShmMap` | `CAP_TYPE_SHM` | Map a shared-memory object (frame rings) |
 
 **IRQ acknowledgement is not a syscall.** The kernel owns the IDT and sends

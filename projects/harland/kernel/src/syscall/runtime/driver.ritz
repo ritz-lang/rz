@@ -68,11 +68,12 @@ import proc.waitset { WaitPlan, Collected, Notify, wait_plan_new, wait_plan_irq,
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
 import driver_abi.wait { WaitRequest, WaitSource, WaitEvent, EVENT_ATTACH, WAIT_SOURCE_CAP, WAIT_OUT_CAP, DEVICE_WAIT_MS }
 import mm.pmm { PAGE_SIZE }
-import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_DEVICE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_nx_flag, vmm_slot_end, vmm_get_current_pml4 }
-import mm.dma { dma_alloc_zeroed, dma_free_pages, dma_quarantine }
+import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_CACHE_DISABLE, PTE_DEVICE, DRV_DMA_BASE, DRV_MMIO_BASE, vmm_map_page_in, vmm_unmap_page_in, vmm_quarantine_page_in, vmm_nx_flag, vmm_slot_end, vmm_get_current_pml4 }
+import mm.dma { dma_alloc_zeroed, dma_free_pages, dma_quarantine_iova }
+import mm.dma_runs { DmaRun, DmaRange, dma_run_room, dma_run_add, dma_run_take, dma_run_take_pid, dma_hole_put, dma_hole_take, dma_hole_floor, dma_holes_drop_pid }
 import drivers.virtio.window { VioWindow, vio_window_find, vio_window_pages, vio_window_guarded, vio_window_queue_regs }
 import drivers.iommu.vtd { VtdEnter }
-import drivers.iommu.ir { dma_requester_isolated, dma_domain_enter, dma_domain_leave }
+import drivers.iommu.ir { dma_requester_isolated, dma_domain_iova_alloc, dma_domain_enter_at, dma_domain_leave }
 import driver_abi.dma { DmaAlloc, DMA_ALLOC_MAX }
 
 const US_PER_MS: u64 = 1000
@@ -218,8 +219,8 @@ pub fn sys_drv_irq_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     drv_irq_wait(proc_current_pid() as u32, rdi, rsi as *WaitRequest)
 
 # ============================================================================
-# DrvMmioMap (221) and DrvDmaAlloc (222), AGAST #4720 and #4721
-# (docs/RING1_DRIVER.md §5 "MMIO and DMA syscalls", PR 5)
+# DrvMmioMap (221), DrvDmaAlloc (222) and DrvDmaFree (223), AGAST #4720,
+# #4721 and #4725 (docs/RING1_DRIVER.md §5 "MMIO and DMA syscalls", PR 5)
 # ============================================================================
 #
 # DrvMmioMap(mmio_handle) maps every page of the window that the caller's
@@ -245,20 +246,42 @@ pub fn sys_drv_irq_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # caller's DMA window (DRV_DMA_BASE, PML4[252]). It returns the run's VA and
 # copies out { iova, size }. When the IRQ object's device has a private DMA
 # domain (irq_object_bind_domain, AGAST #4724) the run is mapped read-write
-# into it at fresh IOVAs first, and iova is where the device sees the run;
-# otherwise nothing the device can use is published: iova is 0, and the run
-# is for the CPU only. The run is not a DmaRegion: the PML4 owns it, and
-# exit frees it once (no PTE_DEVICE). A failure after the run entered the
-# domain takes it out again; if a unit doesn't confirm that, the device may
-# still reach the pages and they go to dma_quarantine, never to the PMM.
+# into it first, and iova is where the device sees the run; otherwise
+# nothing the device can use is published: iova is 0, and the run is for
+# the CPU only. The VA and IOVA are the front of a range this process and
+# device freed (mm/dma_runs.ritz), else fresh: past every such range and
+# never handed out before. The run is not a DmaRegion: the PML4 owns it,
+# exit frees it once (no PTE_DEVICE), and it is recorded live for
+# DrvDmaFree. A failure after the run entered the domain takes it out
+# again; if a unit doesn't confirm that, the device may still reach the
+# pages and they go to dma_quarantine with the IOVA, never to the PMM, and
+# that IOVA is never used again.
 #
 #   Errno.Perm   the caller holds no CAP_TYPE_IRQ handle `irq_handle`
 #   Errno.Inval  size 0
 #   Errno.NoMem  size above DMA_ALLOC_MAX (4 MiB), no contiguous run free, no
-#                room in the window, or no page table: nothing stays mapped
-#                or allocated
+#                room in the window or the run table, or no page table:
+#                nothing stays mapped or allocated
 #   Errno.Fault  the DmaAlloc is not the caller's writable memory (checked
 #                before anything is allocated)
+#
+# DrvDmaFree(irq_handle, vaddr, size) gives back the live run that starts at
+# `vaddr` and is `size` bytes rounded up to pages, exactly as DrvDmaAlloc
+# made it for this process and this device. The IOVA leaves the device's
+# domain and the kernel waits for every unit's IOTLB invalidation; only
+# then are the CPU leaves unmapped, the frames returned to the PMM, and
+# both ranges put on the free list. If a unit doesn't confirm, the device
+# may still reach the frames: the CPU leaves are quarantined (not present,
+# PTE_DEVICE: a stale pointer faults and exit doesn't free them), the
+# frames and the IOVA go on dma_quarantine, and neither the VA nor the IOVA
+# is handed out again until reboot. The driver frees a run only once no
+# queue register or descriptor names it; the kernel doesn't parse rings.
+#
+#   0            freed (or quarantined: the run is gone either way)
+#   Errno.Perm   the caller holds no CAP_TYPE_IRQ handle `irq_handle`
+#   Errno.Inval  size 0, or no live run of this process and device starts
+#                at `vaddr` with that many pages (a part of a run, a run
+#                already freed): nothing changes
 
 # MMIO leaves: the kernel's vmm_map_mmio type (PCD|PWT, uncached) plus user
 # and PTE_DEVICE, so the frame is never returned to the PMM on exit.
@@ -314,6 +337,63 @@ pub fn drv_mmio_map(pid: u32, pml4: u64, mmio_handle: u64) -> i64
         return Errno.NoMem as i64
     vaddr as i64
 
+# A boot-test hook (drv-dma-free, postinit.ritz): the next leave of the run
+# at this VA reports an unconfirmed invalidation, once, as a unit that
+# timed out would. 0: none.
+var drv_dma_stuck_vaddr: u64 = 0
+
+pub fn drv_dma_force_stuck(vaddr: u64)
+    drv_dma_stuck_vaddr = vaddr
+
+# Take `run` out of its device's domain and wait for every unit: true once
+# the device can reach none of it (without a domain it never could).
+fn run_left_domain(run: DmaRun) -> bool
+    var confirmed: bool = true
+    if run.dom != 0
+        confirmed = dma_domain_leave(run.dom, run.iova, run.pages)
+    if drv_dma_stuck_vaddr != 0 and run.vaddr == drv_dma_stuck_vaddr
+        drv_dma_stuck_vaddr = 0
+        confirmed = false
+    confirmed
+
+# Clear the `pages` leaves from `vaddr` in `pml4`; the frames stay the caller's.
+fn unmap_run(pml4: u64, vaddr: u64, pages: u64)
+    var p: u64 = 0
+    while p < pages
+        vmm_unmap_page_in(pml4, vaddr + p * PAGE_SIZE)
+        p = p + 1
+
+# Quarantine the `pages` leaves from `vaddr` in `pml4` (vmm_quarantine_page_in).
+fn quarantine_leaves(pml4: u64, vaddr: u64, pages: u64)
+    var p: u64 = 0
+    while p < pages
+        vmm_quarantine_page_in(pml4, vaddr + p * PAGE_SIZE)
+        p = p + 1
+
+# The next free address of `pid`'s DMA window for `pages` more pages: past
+# its last leaf (a quarantined one included) and past every range on its
+# free list, which has no leaves but is not free to bump over.
+fn dma_window_room(pid: u32, pml4: u64, pages: u64) -> Option<u64>
+    var vaddr: u64 = vmm_slot_end(pml4, DRV_DMA_BASE)
+    let floor: u64 = dma_hole_floor(pid, DRV_DMA_BASE)
+    if floor > vaddr
+        vaddr = floor
+    if pages > (DRV_DMA_BASE + SLOT_BYTES - vaddr) / PAGE_SIZE
+        return None
+    Some(vaddr)
+
+# A VA (and, in domain `dom`, an IOVA) range never handed out before.
+fn fresh_range(pid: u32, pml4: u64, dom: u32, pages: u64) -> Option<DmaRange>
+    let vaddr: u64 = match dma_window_room(pid, pml4, pages)
+        Some(v) => v
+        None => return None
+    if dom == 0
+        return Some(DmaRange { vaddr: vaddr, iova: 0, pages: pages })
+    let iova: u64 = match dma_domain_iova_alloc(dom, pages)
+        Some(v) => v
+        None => return None
+    Some(DmaRange { vaddr: vaddr, iova: iova, pages: pages })
+
 # DrvDmaAlloc for process `pid`, whose page table is `pml4` and loaded
 # (`out` is checked against it), above.
 fn drv_dma_alloc(pid: u32, pml4: u64, irq_handle: u64, size: u64, out: *DmaAlloc) -> i64
@@ -326,34 +406,82 @@ fn drv_dma_alloc(pid: u32, pml4: u64, irq_handle: u64, size: u64, out: *DmaAlloc
         return Errno.NoMem as i64
     if uptr_check_write(out as *u8, sizeof(DmaAlloc) as u64) != 0
         return Errno.Fault as i64
+    # Room to record the run first: a run that can't be freed is never made.
+    if not dma_run_room()
+        return Errno.NoMem as i64
     let pages: u64 = (size + PAGE_SIZE - 1) / PAGE_SIZE
-    let vaddr: u64 = match window_room(pml4, DRV_DMA_BASE, pages)
-        Some(v) => v
-        None => return Errno.NoMem as i64
+    let dom: u32 = irq_object_domain(object_id)
+    let range: DmaRange = match dma_hole_take(pid, object_id, pages, dom != 0)
+        Some(r) => r
+        None => match fresh_range(pid, pml4, dom, pages)
+            Some(r) => r
+            None => return Errno.NoMem as i64
     let phys: u64 = match dma_alloc_zeroed(pages as u32)
         Some(p) => p
-        None => return Errno.NoMem as i64
+        None =>
+            dma_hole_put(pid, object_id, range)
+            return Errno.NoMem as i64
     # The device's view first: a run the CPU can't map is taken out again.
-    let dom: u32 = irq_object_domain(object_id)
     var iova: u64 = 0
     if dom != 0
-        match dma_domain_enter(dom, phys, pages)
+        match dma_domain_enter_at(dom, range.iova, phys, pages)
             VtdEnter.Entered(v) => iova = v
             VtdEnter.Refused =>
                 dma_free_pages(phys, pages as u32)
+                dma_hole_put(pid, object_id, range)
                 return Errno.NoMem as i64
             VtdEnter.Stuck =>
-                dma_quarantine(phys, pages)
+                dma_quarantine_iova(phys, pages, range.iova)
                 return Errno.NoMem as i64
-    if not map_run(pml4, vaddr, phys, pages, drv_dma_leaf())
-        if dom != 0 and not dma_domain_leave(dom, iova, pages)
-            dma_quarantine(phys, pages)
-        else
+    let run: DmaRun = DmaRun { pid: pid, dom: dom, object_id: object_id, vaddr: range.vaddr, iova: iova, phys: phys, pages: pages }
+    if not map_run(pml4, run.vaddr, phys, pages, drv_dma_leaf())
+        if run_left_domain(run)
             dma_free_pages(phys, pages as u32)
+            dma_hole_put(pid, object_id, range)
+        else
+            dma_quarantine_iova(phys, pages, iova)
         return Errno.NoMem as i64
+    dma_run_add(run)                    # room was checked above
     (*out).iova = iova                  # 0: no private domain, the run is the CPU's only
     (*out).size = pages * PAGE_SIZE
-    vaddr as i64
+    run.vaddr as i64
+
+# DrvDmaFree for process `pid`, whose page table is `pml4` and loaded, above.
+fn drv_dma_free(pid: u32, pml4: u64, irq_handle: u64, vaddr: u64, size: u64) -> i64
+    let object_id: u64 = match held_object(pid, irq_handle, CAP_TYPE_IRQ)
+        Some(id) => id
+        None => return Errno.Perm as i64
+    # No run is empty or above DMA_ALLOC_MAX (and the page count can't wrap).
+    if size == 0 or size > DMA_ALLOC_MAX
+        return Errno.Inval as i64
+    let pages: u64 = (size + PAGE_SIZE - 1) / PAGE_SIZE
+    let run: DmaRun = match dma_run_take(pid, object_id, vaddr, pages)
+        Some(r) => r
+        None => return Errno.Inval as i64
+    if run_left_domain(run)
+        unmap_run(pml4, run.vaddr, run.pages)
+        dma_free_pages(run.phys, run.pages as u32)
+        dma_hole_put(pid, object_id, DmaRange { vaddr: run.vaddr, iova: run.iova, pages: run.pages })
+    else
+        quarantine_leaves(pml4, run.vaddr, run.pages)
+        dma_quarantine_iova(run.phys, run.pages, run.iova)
+    0
+
+# Process `pid` is exiting and its page table `pml4` (no longer loaded) is
+# about to be freed: each live run leaves its device's domain, and one a
+# unit doesn't confirm is quarantined so vmm_free_pml4 skips its frames;
+# the confirmed ones vmm_free_pml4 frees once. Its free list is forgotten
+# with the address space. Every process's exit calls this; one that never
+# allocated a run has nothing recorded.
+pub fn drv_dma_process_end(pid: u32, pml4: u64)
+    while true
+        let run: DmaRun = match dma_run_take_pid(pid)
+            Some(r) => r
+            None => break
+        if not run_left_domain(run)
+            quarantine_leaves(pml4, run.vaddr, run.pages)
+            dma_quarantine_iova(run.phys, run.pages, run.iova)
+    dma_holes_drop_pid(pid)
 
 # drv_mmio_map(mmio_handle): the caller's page table is loaded.
 pub fn sys_drv_mmio_map_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
@@ -363,6 +491,10 @@ pub fn sys_drv_mmio_map_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # loaded.
 pub fn sys_drv_dma_alloc_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     drv_dma_alloc(proc_current_pid() as u32, vmm_get_current_pml4(), rdi, rsi, rdx as *DmaAlloc)
+
+# drv_dma_free(irq_handle, vaddr, size): the caller's page table is loaded.
+pub fn sys_drv_dma_free_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    drv_dma_free(proc_current_pid() as u32, vmm_get_current_pml4(), rdi, rsi, rdx)
 
 # ============================================================================
 # ShmWait (229) and ShmNotify (230), #4727

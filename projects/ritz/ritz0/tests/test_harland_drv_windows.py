@@ -203,16 +203,17 @@ def test_queue_register_grant_needs_an_isolated_device():
 def test_dma_alloc_enters_the_holders_domain():
     """AGAST #4724: DrvDmaAlloc maps its run into the IRQ object's device
     domain and copies out that IOVA; a refused entry frees the run, a stuck
-    one (an unconfirmed invalidation) quarantines it, and a CPU mapping that
-    fails after the entry takes the run out of the domain first."""
+    one (an unconfirmed invalidation) quarantines it with its IOVA (#4725),
+    and a CPU mapping that fails after the entry takes the run out of the
+    domain first."""
     body = _body(DRIVER.read_text(), "drv_dma_alloc")
     assert "irq_object_domain(object_id)" in body
-    enter = body.index("dma_domain_enter(dom, phys, pages)")
+    enter = body.index("dma_domain_enter_at(dom, range.iova, phys, pages)")
     assert enter < body.index("map_run(")
     assert re.search(r"VtdEnter\.Entered\(v\) => iova = v", body)
     assert re.search(r"VtdEnter\.Refused =>\s+dma_free_pages\(phys", body)
-    assert re.search(r"VtdEnter\.Stuck =>\s+dma_quarantine\(phys, pages\)", body)
-    assert re.search(r"if dom != 0 and not dma_domain_leave\(dom, iova, pages\)\s+dma_quarantine\(phys, pages\)", body)
+    assert re.search(r"VtdEnter\.Stuck =>\s+dma_quarantine_iova\(phys, pages, range\.iova\)", body)
+    assert re.search(r"if run_left_domain\(run\)\s+dma_free_pages\(phys, pages as u32\)\s+dma_hole_put\(pid, object_id, range\)\s+else\s+dma_quarantine_iova\(phys, pages, iova\)", body)
     assert "(*out).iova = iova" in body
 
 

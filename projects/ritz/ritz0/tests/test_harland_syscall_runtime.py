@@ -81,6 +81,8 @@ AREAS = {
     "driver": ["drv_irq_wait_park_count", "sys_drv_irq_wait_handler",
                # DrvMmioMap (221) #4720, DrvDmaAlloc (222) #4721
                "drv_mmio_map", "sys_drv_mmio_map_handler", "sys_drv_dma_alloc_handler",
+               # DrvDmaFree (223) #4725
+               "sys_drv_dma_free_handler",
                # ShmWait (229), ShmNotify (230), #4727
                "sys_shm_wait_handler", "sys_shm_notify_handler"],
     # NetInfo (224), NetAddr (225), NetAttach (228): NoDev until a driver
@@ -239,8 +241,9 @@ def test_table_registers_handlers_imported_from_their_area():
     # 42 with NetInfo, NetAddr, NetAttach (#4751); 43 with Poll (7, #4829);
     # 45 with Stat and Fstat (4, 5, #4832); 47 with DrvMmioMap and
     # DrvDmaAlloc (221, 222, #4720); 49 with ShmWait and ShmNotify
-    # (229, 230, #4727); 50 with NetPublish (226, #4730).
-    assert len(regs) == 50, regs
+    # (229, 230, #4727); 50 with NetPublish (226, #4730); 51 with DrvDmaFree
+    # (223, #4725).
+    assert len(regs) == 51, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

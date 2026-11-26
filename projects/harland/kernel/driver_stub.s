@@ -96,6 +96,24 @@
 #                      { iova 0, size 8192 }
 #                   6  all 8192 bytes read 0 (then are written)
 #                   7  size 1                -> DRV_DMA_BASE + 8192
+#   mode 23 (DMA_FREE, #4725): RSI is a CAP_TYPE_IRQ handle; the kernel has
+#                   armed drv_dma_force_stuck(DRV_DMA_BASE + 20480), so the
+#                   free of the run there is an unconfirmed invalidation.
+#                   Exit status: the number of the first failed step, else 0:
+#                   1  free, handle 0 (not held)       -> Errno.Perm
+#                   2  alloc 8000                       -> DRV_DMA_BASE
+#                   3  free BASE, 1 byte (one page)     -> Errno.Inval
+#                   4  free BASE + 4096 (inside it)     -> Errno.Inval
+#                   5  free BASE, 8000                  -> 0
+#                   6  the same free again              -> Errno.Inval
+#                   7  alloc 12288 -> BASE + 8192: too big for the freed
+#                      range, and a fresh run starts past it, not over it
+#                   8  alloc 4096                       -> BASE (reused)
+#                   9  alloc 4096                       -> BASE + 4096
+#                   10 alloc 4096                       -> BASE + 20480
+#                   11 free BASE + 20480, 4096          -> 0 (quarantined)
+#                   12 alloc 4096 -> BASE + 24576: the quarantined VA is
+#                      not handed out again
 # Report: Getpid, the CPL from CS, and arg1, packed into the exit status
 #   (arg1 & 0x7FFF) << 16 | cpl << 8 | (pid & 0xFF)
 # which the kernel decodes and logs as "[driver] pid N cpl C arg1 K".
@@ -115,6 +133,7 @@
 .equ SYS_POLL,   7
 .equ SYS_DRV_MMIO_MAP,  221
 .equ SYS_DRV_DMA_ALLOC, 222
+.equ SYS_DRV_DMA_FREE,  223
 
 # Modes (postinit.ritz DRIVER_STUB_*)
 .equ DRIVER_STUB_FAULT, 1
@@ -128,6 +147,7 @@
 .equ DRIVER_STUB_LINK, 9
 .equ DRIVER_STUB_MMIO_MAP, 21
 .equ DRIVER_STUB_DMA_ALLOC, 22
+.equ DRIVER_STUB_DMA_FREE, 23
 
 # DrvMmioMap and DrvDmaAlloc (mm/vmm.ritz, driver_abi/src/dma.ritz,
 # postinit.ritz MMIO_TEST_*)
@@ -212,6 +232,8 @@ driver_stub_start:
     je .Ldriver_stub_mmio_map
     cmpq $DRIVER_STUB_DMA_ALLOC, %r12
     je .Ldriver_stub_dma_alloc
+    cmpq $DRIVER_STUB_DMA_FREE, %r12
+    je .Ldriver_stub_dma_free
     cmpq $DRIVER_STUB_CONSOLE_POLL, %r12
     je .Ldriver_stub_console_poll
     cmpq $DRIVER_STUB_POLL_NVAL, %r12
@@ -592,6 +614,105 @@ driver_stub_start:
 # DrvDmaAlloc(RDI, RSI, RDX): r10 is not an argument here. RAX = the result.
 .Ldma_call:
     movq $SYS_DRV_DMA_ALLOC, %rax
+    syscall
+    ret
+
+# Mode 23. r14 = the DmaAlloc, on the user stack; r15 = the failing step;
+# rbx = DRV_DMA_BASE.
+.Ldriver_stub_dma_free:
+    subq $16, %rsp
+    movq %rsp, %r14
+    movabsq $DRV_DMA_BASE, %rbx
+    movl $1, %r15d                       # 1: a handle it does not hold
+    xorl %edi, %edi
+    movq %rbx, %rsi
+    movl $4096, %edx
+    call .Ldma_free_call
+    cmpq $ERRNO_PERM, %rax
+    jne .Lfree_fail
+    movl $2, %r15d                       # 2: two pages at the window base
+    movl $DMA_TEST_SIZE, %esi
+    call .Lfree_alloc
+    cmpq %rbx, %rax
+    jne .Lfree_fail
+    movl $3, %r15d                       # 3: the right VA, one page short
+    movq %rbx, %rsi
+    movl $1, %edx
+    call .Lfree_mine
+    cmpq $ERRNO_INVAL, %rax
+    jne .Lfree_fail
+    movl $4, %r15d                       # 4: inside the run, not its start
+    leaq 4096(%rbx), %rsi
+    movl $4096, %edx
+    call .Lfree_mine
+    cmpq $ERRNO_INVAL, %rax
+    jne .Lfree_fail
+    movl $5, %r15d                       # 5: the run, its size unrounded
+    movq %rbx, %rsi
+    movl $DMA_TEST_SIZE, %edx
+    call .Lfree_mine
+    testq %rax, %rax
+    jne .Lfree_fail
+    movl $6, %r15d                       # 6: it is gone
+    movq %rbx, %rsi
+    movl $DMA_TEST_SIZE, %edx
+    call .Lfree_mine
+    cmpq $ERRNO_INVAL, %rax
+    jne .Lfree_fail
+    movl $7, %r15d                       # 7: bigger than it: past it, fresh
+    movl $12288, %esi
+    call .Lfree_alloc
+    leaq 8192(%rbx), %rcx
+    cmpq %rcx, %rax
+    jne .Lfree_fail
+    movl $8, %r15d                       # 8: the freed range, front first
+    movl $4096, %esi
+    call .Lfree_alloc
+    cmpq %rbx, %rax
+    jne .Lfree_fail
+    movl $9, %r15d                       # 9: then the rest of it
+    movl $4096, %esi
+    call .Lfree_alloc
+    leaq 4096(%rbx), %rcx
+    cmpq %rcx, %rax
+    jne .Lfree_fail
+    movl $10, %r15d                      # 10: then a fresh page
+    movl $4096, %esi
+    call .Lfree_alloc
+    leaq 20480(%rbx), %rcx
+    cmpq %rcx, %rax
+    jne .Lfree_fail
+    movl $11, %r15d                      # 11: its free is quarantined: still 0
+    leaq 20480(%rbx), %rsi
+    movl $4096, %edx
+    call .Lfree_mine
+    testq %rax, %rax
+    jne .Lfree_fail
+    movl $12, %r15d                      # 12: that VA is not handed out again
+    movl $4096, %esi
+    call .Lfree_alloc
+    leaq 24576(%rbx), %rcx
+    cmpq %rcx, %rax
+    jne .Lfree_fail
+    xorl %r15d, %r15d
+.Lfree_fail:
+    movl %r15d, %edi
+    movq $SYS_EXIT, %rax
+    syscall
+    ud2
+
+# DrvDmaAlloc(r13, RSI, r14). RAX = the result.
+.Lfree_alloc:
+    movq %r13, %rdi
+    movq %r14, %rdx
+    jmp .Ldma_call
+
+# DrvDmaFree(r13, RSI, RDX). RAX = the result.
+.Lfree_mine:
+    movq %r13, %rdi
+# DrvDmaFree(RDI, RSI, RDX). RAX = the result.
+.Ldma_free_call:
+    movq $SYS_DRV_DMA_FREE, %rax
     syscall
     ret
 

@@ -1,0 +1,221 @@
+# Harland ring-1 DMA runs and their free list (AGAST #4725,
+# docs/RING1_DRIVER.md §5 "MMIO and DMA syscalls", DrvDmaFree)
+#
+# Every run DrvDmaAlloc (222) hands a driver is recorded here: the process,
+# the device (its IRQ object), the device's DMA domain, the user VA, the
+# IOVA, the frames and the page count. DrvDmaFree (223) names a run by its
+# VA and size; only an exact live run of that process and device is freed.
+#
+# A free whose IOTLB invalidation finished returns the run's VA and IOVA
+# ranges to the free list (a "hole") of that process and device, and a
+# later DrvDmaAlloc of theirs may take them again, first fit, from the
+# front of a hole. Holes that touch in both VA and IOVA merge. A free that
+# did not finish never reaches this list: the range is quarantined and not
+# handed out again until reboot. A hole the list has no room for is
+# dropped, which only means it is never reused.
+#
+# The DMA window is per process, so the bump cursor of a later allocation
+# must stay above every hole of that process (dma_hole_floor): a hole at
+# the top of the window has no leaves, and vmm_slot_end alone would hand
+# its VA out a second time.
+#
+# Imports nothing but ritzlib.option, so ritz0/tests/test_harland_dma_free.py
+# compiles it into a host program. Only syscalls and exit touch it, with
+# the caller's process running on the BSP, so there is no lock.
+
+import ritzlib.option
+
+const DMA_RUN_PAGE: u64 = 4096
+const DMA_RUN_MAX: i32 = 64
+const DMA_HOLE_MAX: i32 = 32
+
+# A live run: what DrvDmaFree needs to take it out of the device's domain
+# and give its frames back.
+pub struct DmaRun
+    pid: u32
+    dom: u32            # the device's DMA domain, 0: none (iova is 0)
+    object_id: u64      # the IRQ object: the device
+    vaddr: u64          # the run's first user VA
+    iova: u64           # where the device sees it, 0 without a domain
+    phys: u64           # its first frame (one contiguous run)
+    pages: u64
+
+# A VA range and the IOVA range beside it (iova 0: none), free for reuse.
+pub struct DmaRange
+    vaddr: u64
+    iova: u64
+    pages: u64
+
+struct DmaHole
+    pid: u32
+    in_use: bool
+    _pad: [3]u8
+    object_id: u64
+    range: DmaRange
+
+struct DmaRunSlot
+    run: DmaRun
+    in_use: bool
+    _pad: [7]u8
+
+var dma_runs: [64]DmaRunSlot
+var dma_holes: [32]DmaHole
+
+# ============================================================================
+# Live runs
+# ============================================================================
+
+fn dma_run_free_slot() -> Option<i32>
+    var i: i32 = 0
+    while i < DMA_RUN_MAX
+        if not dma_runs[i].in_use
+            return Some(i)
+        i = i + 1
+    None
+
+# Is there room to record one more run? DrvDmaAlloc asks before it
+# allocates anything, so a run is never made that can't be freed.
+pub fn dma_run_room() -> bool
+    dma_run_free_slot().is_some()
+
+# Record `run` as live: false (nothing recorded) when the table is full.
+pub fn dma_run_add(run: DmaRun) -> bool
+    let slot: i32 = match dma_run_free_slot()
+        Some(s) => s
+        None => return false
+    dma_runs[slot].run = run
+    dma_runs[slot].in_use = true
+    true
+
+# Remove and return `pid`'s live run of device `object_id` that starts at
+# `vaddr` and is `pages` long; None (nothing removed) if there is none.
+pub fn dma_run_take(pid: u32, object_id: u64, vaddr: u64, pages: u64) -> Option<DmaRun>
+    var i: i32 = 0
+    while i < DMA_RUN_MAX
+        let r: DmaRun = dma_runs[i].run
+        if dma_runs[i].in_use and r.pid == pid and r.object_id == object_id and r.vaddr == vaddr and r.pages == pages
+            dma_runs[i].in_use = false
+            return Some(r)
+        i = i + 1
+    None
+
+# Remove and return any live run of `pid` (its exit), None once it has none.
+pub fn dma_run_take_pid(pid: u32) -> Option<DmaRun>
+    var i: i32 = 0
+    while i < DMA_RUN_MAX
+        if dma_runs[i].in_use and dma_runs[i].run.pid == pid
+            dma_runs[i].in_use = false
+            return Some(dma_runs[i].run)
+        i = i + 1
+    None
+
+# ============================================================================
+# The free list
+# ============================================================================
+
+fn range_end(r: DmaRange) -> u64
+    r.vaddr + r.pages * DMA_RUN_PAGE
+
+# Does `b` follow `a` directly, in VA and (when they have one) in IOVA?
+fn ranges_touch(a: DmaRange, b: DmaRange) -> bool
+    if range_end(a) != b.vaddr
+        return false
+    if a.iova == 0 or b.iova == 0
+        return a.iova == b.iova
+    a.iova + a.pages * DMA_RUN_PAGE == b.iova
+
+# The hole of `pid` and `object_id` that touches `r` on either side, if any.
+fn hole_beside(pid: u32, object_id: u64, r: DmaRange) -> Option<i32>
+    var i: i32 = 0
+    while i < DMA_HOLE_MAX
+        let h: DmaHole = dma_holes[i]
+        if h.in_use and h.pid == pid and h.object_id == object_id and (ranges_touch(h.range, r) or ranges_touch(r, h.range))
+            return Some(i)
+        i = i + 1
+    None
+
+# Give `r` back to the free list of `pid` and device `object_id`. Only a
+# range the device can no longer reach (its invalidation finished, or it
+# never entered the domain) belongs here. It merges with the holes it
+# touches; with no room left it is dropped, and so never reused.
+pub fn dma_hole_put(pid: u32, object_id: u64, r: DmaRange)
+    if r.pages == 0
+        return
+    var merged: DmaRange = r
+    # Absorb each touching hole: at most one on each side.
+    while true
+        let i: i32 = match hole_beside(pid, object_id, merged)
+            Some(x) => x
+            None => break
+        let h: DmaRange = dma_holes[i].range
+        dma_holes[i].in_use = false
+        if ranges_touch(h, merged)
+            merged = DmaRange { vaddr: h.vaddr, iova: h.iova, pages: h.pages + merged.pages }
+        else
+            merged = DmaRange { vaddr: merged.vaddr, iova: merged.iova, pages: merged.pages + h.pages }
+    var i: i32 = 0
+    while i < DMA_HOLE_MAX
+        if not dma_holes[i].in_use
+            dma_holes[i].pid = pid
+            dma_holes[i].object_id = object_id
+            dma_holes[i].range = merged
+            dma_holes[i].in_use = true
+            return
+        i = i + 1
+
+# Take `pages` pages for `pid` and device `object_id` from the front of the
+# first hole that has them, with an IOVA when `translated` (the device has
+# a domain) and without one when not. None leaves the list as it was.
+pub fn dma_hole_take(pid: u32, object_id: u64, pages: u64, translated: bool) -> Option<DmaRange>
+    if pages == 0
+        return None
+    var i: i32 = 0
+    while i < DMA_HOLE_MAX
+        let h: DmaHole = dma_holes[i]
+        if h.in_use and h.pid == pid and h.object_id == object_id and h.range.pages >= pages and (h.range.iova != 0) == translated
+            let r: DmaRange = h.range
+            if r.pages == pages
+                dma_holes[i].in_use = false
+            else
+                var iova_rest: u64 = 0
+                if translated
+                    iova_rest = r.iova + pages * DMA_RUN_PAGE
+                dma_holes[i].range = DmaRange { vaddr: r.vaddr + pages * DMA_RUN_PAGE, iova: iova_rest, pages: r.pages - pages }
+            return Some(DmaRange { vaddr: r.vaddr, iova: r.iova, pages: pages })
+        i = i + 1
+    None
+
+# The lowest VA a fresh run of `pid` may start at: past the end of every
+# hole of that process (any device), or `base` when it has none.
+pub fn dma_hole_floor(pid: u32, base: u64) -> u64
+    var floor: u64 = base
+    var i: i32 = 0
+    while i < DMA_HOLE_MAX
+        let h: DmaHole = dma_holes[i]
+        if h.in_use and h.pid == pid and range_end(h.range) > floor
+            floor = range_end(h.range)
+        i = i + 1
+    floor
+
+# Forget every hole of `pid` (its exit: the VA window dies with the PML4).
+pub fn dma_holes_drop_pid(pid: u32)
+    var i: i32 = 0
+    while i < DMA_HOLE_MAX
+        if dma_holes[i].in_use and dma_holes[i].pid == pid
+            dma_holes[i].in_use = false
+        i = i + 1
+
+# How many runs and holes `pid` still has recorded (0 after its exit).
+pub fn dma_runs_held(pid: u32) -> u32
+    var n: u32 = 0
+    var i: i32 = 0
+    while i < DMA_RUN_MAX
+        if dma_runs[i].in_use and dma_runs[i].run.pid == pid
+            n = n + 1
+        i = i + 1
+    i = 0
+    while i < DMA_HOLE_MAX
+        if dma_holes[i].in_use and dma_holes[i].pid == pid
+            n = n + 1
+        i = i + 1
+    n

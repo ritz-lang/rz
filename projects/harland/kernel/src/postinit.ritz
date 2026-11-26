@@ -12,7 +12,7 @@
 import klog { klog, klog_dec, klog_hex }
 import serial { StrView }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_alloc_contig, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages, pmm_range_has_free }
-import mm.vmm { PTE_PRESENT, PTE_ACCESSED, PTE_DIRTY, PTE_ADDR_MASK, PTE_WRITABLE, DRV_MMIO_BASE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, phys_to_virt, vmm_create_user_pml4, vmm_free_pml4, vmm_pte_in }
+import mm.vmm { PTE_PRESENT, PTE_ACCESSED, PTE_DIRTY, PTE_ADDR_MASK, PTE_WRITABLE, DRV_MMIO_BASE, DRV_DMA_BASE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, phys_to_virt, vmm_create_user_pml4, vmm_free_pml4, vmm_pte_in }
 import mm.heap { KERNEL_VIRT_BASE, kalloc, kfree, heap_get_free, heap_check }
 import ipc.message { Message, MSG_FLAG_NONE }
 import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send, channel_recv, channel_close, channel_debug_print }
@@ -49,7 +49,9 @@ import ritzlib.span { Span, span_from_ptr }
 import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_RIGHT_READ, CAP_RIGHT_ALL }
 import cap.table { CapTable, cap_kernel_grant, cap_table_alloc, cap_table_free_pid }
 import proc.waitset { IRQ_NO_VECTOR, irq_object_register, irq_object_unregister, irq_object_latch }
-import syscall.runtime.driver { drv_irq_wait_park_count, drv_mmio_map, drv_mmio_leaf }
+import syscall.runtime.driver { drv_irq_wait_park_count, drv_mmio_map, drv_mmio_leaf, drv_dma_force_stuck }
+import mm.dma { dma_quarantined_pages }
+import mm.dma_runs { dma_runs_held }
 import cap.types { CAP_TYPE_SHM, CAP_RIGHT_WRITE }
 import cap.table { CapTable, cap_table_get, cap_revoke }
 import mm.shm { shm_create, shm_destroy }
@@ -418,6 +420,7 @@ const DRIVER_STUB_POLL_NVAL: u64 = 5
 const DRIVER_STUB_SHM_WAIT: u64 = 6
 const DRIVER_STUB_MMIO_MAP: u64 = 21
 const DRIVER_STUB_DMA_ALLOC: u64 = 22
+const DRIVER_STUB_DMA_FREE: u64 = 23
 const DRIVER_STUB_COOKIE: u64 = 0x4713
 # SCHED_HZ is 100: a 50 ms spin spans five ticks.
 const DRIVER_SPIN_MS: u64 = 50
@@ -1226,6 +1229,56 @@ fn drv_dma_alloc_self_test() -> bool
     klog(" after\n")
     status == 0 and after == free
 
+# drv-dma-free (#4725, RING1_DRIVER.md §5): DrvDmaFree gives a run back,
+# and a later DrvDmaAlloc of the same process and device reuses its range.
+# The stub (mode 23) checks the refusals (Perm, Inval for a part of a run
+# or a run already freed), the reuse, that a fresh run starts past a freed
+# range rather than over it, and that a run whose invalidation
+# didn't finish is quarantined: its free still returns 0, and its VA is
+# not handed out again. The hook drv_dma_force_stuck makes that one free
+# report a unit that timed out (this boot has no domain to time out).
+# After the exit, exactly that one page is missing from the PMM and on
+# dma_quarantine, and nothing of the pid is left in the run table.
+const DRV_TEST_IRQ_DMA_FREE: u64 = 0xFFFF4725A
+const DMA_FREE_STUCK_VA: u64 = DRV_DMA_BASE + 20480
+
+fn drv_dma_free_self_test() -> bool
+    klog("\nTesting DrvDmaFree on a kernel-spawned process...\n")
+    if not irq_object_register(DRV_TEST_IRQ_DMA_FREE, IRQ_NO_VECTOR)
+        klog("  IRQ object not registered\n")
+        return false
+    sched_start(proc_current_slot())
+    let free: u64 = pmm_get_free_pages()
+    let quarantined: u64 = dma_quarantined_pages()
+    drv_dma_force_stuck(DMA_FREE_STUCK_VA)
+    var status: i64 = -1
+    var pid: u64 = 0
+    let spawned: i64 = process_spawn_image(driver_stub(), DRIVER_STUB_DMA_FREE, DRV_TEST_HANDLE_A)
+    if spawned > 0
+        pid = spawned as u64
+        if packed_handle(cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, DRV_TEST_IRQ_DMA_FREE)) != DRV_TEST_HANDLE_A
+            klog("  grant gave another handle\n")
+            process_mark_exit(pid)
+        status = drv_stub_status(pid)
+    drv_dma_force_stuck(0)
+    let after: u64 = pmm_get_free_pages()
+    let held: u32 = dma_runs_held(pid as u32)
+    sched_stop()
+    irq_object_unregister(DRV_TEST_IRQ_DMA_FREE)
+    let newly: u64 = dma_quarantined_pages() - quarantined
+    klog("  status ")
+    klog_dec(status)
+    klog(", free pages ")
+    klog_dec(free as i64)
+    klog(" before, ")
+    klog_dec(after as i64)
+    klog(" after, ")
+    klog_dec(newly as i64)
+    klog(" quarantined, ")
+    klog_dec(held as i64)
+    klog(" runs left\n")
+    status == 0 and after == free - 1 and newly == 1 and held == 0
+
 # The driver-* tests, as pid 1 with its scheduler stopped (on pid 1's kernel
 # stack: boot_process_tests).
 fn driver_process_tests()
@@ -1237,6 +1290,7 @@ fn driver_process_tests()
     boot_test_result("console-poll", console_poll_self_test())
     boot_test_result("drv-mmio-map", drv_mmio_map_self_test())
     boot_test_result("drv-dma-alloc", drv_dma_alloc_self_test())
+    boot_test_result("drv-dma-free", drv_dma_free_self_test())
     boot_test_result("shm-wait", shm_wait_self_test())
     boot_test_result("net-attach", net_attach_self_test())
     boot_test_result("net-info", net_info_self_test())

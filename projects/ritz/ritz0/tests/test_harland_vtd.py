@@ -1026,7 +1026,8 @@ def test_virtio_net_asks_for_access_platform_on_a_translating_boot():
 # the identity domain; vtd_private_domain gives them their own (and moves a
 # requester already on identity off it, dropping its context-cache entry and
 # the identity domain's IOTLB first); vtd_domain_enter maps a run at fresh
-# IOVAs from VTD_IOVA_BASE, and a failure part-way unmaps what it mapped or,
+# IOVAs from VTD_IOVA_BASE (vtd_domain_enter_at at an IOVA the caller
+# owns), and a failure part-way unmaps what it mapped or,
 # when the unit doesn't confirm that, reports the run Stuck (DrvDmaAlloc
 # then quarantines it); vtd_isolation_live reads TE, IRE and CFI from GSTS.
 
@@ -1143,6 +1144,14 @@ fn main() -> i32
         return 13
     if fake_log_n != n2 + 3 or not logged(n2, qi_iotlb_unmap_lo(dom, CAP), iova)
         return 13
+    # a confirmed leave's IOVA enters again at the caller's choice (DrvDmaFree's
+    # free list, AGAST #4725); one still mapped refuses and keeps its mapping
+    if entered(vtd_domain_enter_at(dom, iova, 0x5800000, 3)) != iova or vtd_domain_entry(dom, iova + 2 * PAGE).unwrap_or(0) != sl_leaf(0x5800000 + 2 * PAGE, true)
+        return 19
+    if entered(vtd_domain_enter_at(dom, iova2, 0x5900000, 1)) != 1 or vtd_domain_entry(dom, iova2).unwrap_or(0) != sl_leaf(0x6000000, true)
+        return 19
+    if not vtd_domain_leave(dom, iova, 3)
+        return 19
     # isolation as the unit reports it: CFI passing, IRE or TE off is not isolation
     let gsts: u32 = fake_reg32(VTD_REG_GSTS)
     fake_set_reg32(VTD_REG_GSTS, gsts | GCMD_CFI)
@@ -1183,7 +1192,8 @@ NIC_CLAIMS = {1: "IR and translation init with held requesters", 2: "held reques
               11: "IOVAs are never reused", 12: "the private domain maps nothing but its runs",
               13: "leave unmaps with page-selective invalidation", 14: "CFI, IRE or TE off is not isolation",
               15: "a run past the width is refused", 16: "a partial enter unmaps what it mapped",
-              17: "a partial enter on a dead unit is Stuck", 18: "nothing before translation is on"}
+              17: "a partial enter on a dead unit is Stuck", 18: "nothing before translation is on",
+              19: "enter_at reuses a left IOVA and refuses a mapped one"}
 
 
 @pytest.mark.integration

@@ -93,6 +93,9 @@ ABI = {
     # (#4720, #4721, RING1_DRIVER.md §5).
     "DrvMmioMap": 221,
     "DrvDmaAlloc": 222,
+    # DrvDmaFree (223): give a run back once the IOTLB dropped it; its VA and
+    # IOVA go on the free list, or to dma_quarantine (#4725).
+    "DrvDmaFree": 223,
     # NetInfo (224), NetAddr (225) and NetAttach (228): the link record, the
     # address record and the app exchange (RING1_DRIVER.md §7, RING2_NET.md).
     # Until a driver publishes and a service registers, each answers
@@ -124,7 +127,7 @@ DISPATCHED = {
     "IpcRecv", "IpcClose", "CapGrant", "CapRevoke", "CapDerive", "CapInfo",
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
-    "Sync", "Smp", "ShmMap", "DrvIrqWait", "DrvMmioMap", "DrvDmaAlloc", "NetInfo", "NetAddr", "NetAttach", "Poll",
+    "Sync", "Smp", "ShmMap", "DrvIrqWait", "DrvMmioMap", "DrvDmaAlloc", "DrvDmaFree", "NetInfo", "NetAddr", "NetAttach", "Poll",
     "ShmWait", "ShmNotify", "NetPublish",
     "Stat", "Fstat",
 }

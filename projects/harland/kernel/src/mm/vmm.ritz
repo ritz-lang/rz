@@ -6,6 +6,7 @@
 # Depends on PMM for page table allocation.
 
 import klog { klog, klog_hex, klog_dec }
+import ritzlib.option
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_mark_region_used, pmm_get_total_pages, pmm_range_has_free, pmm_set_physmap_offset }
 import io { rdmsr, wrmsr, CpuidResult, cpuid }
 
@@ -979,7 +980,9 @@ pub fn vmm_unmap_page_in(pml4: u64, vaddr: u64) -> u64
 # free address of a window filled from its base, such as a driver's MMIO
 # and DMA windows (DrvMmioMap, DrvDmaAlloc, AGAST #4720). It is read from
 # the page tables, so it needs no per-process state, dies with the PML4,
-# and moves back down when a failed map clears its leaves. A huge leaf
+# and moves back down when a failed map clears its leaves. A quarantined
+# leaf (not present, PTE_DEVICE) counts as used, so its VA is never handed
+# out again in that address space (DrvDmaFree, AGAST #4725). A huge leaf
 # counts to its end. Walks from the top: one entry per level in the usual
 # case of a window filled from its base.
 pub fn vmm_slot_end(pml4: u64, slot_base: u64) -> u64
@@ -1008,26 +1011,53 @@ pub fn vmm_slot_end(pml4: u64, slot_base: u64) -> u64
                     var k: u64 = 512
                     while k > 0
                         k = k - 1
-                        if (vmm_get_entry(pt, k) & PTE_PRESENT) != 0
+                        # a quarantined leaf (vmm_quarantine_page_in) holds its VA
+                        if (vmm_get_entry(pt, k) & (PTE_PRESENT | PTE_DEVICE)) != 0
                             return mib + (k << 12) + PAGE_SIZE
     slot_base
 
 # The 4 KiB leaf PTE mapping vaddr in `pml4`, flags and all, or 0 when
 # vaddr has none (absent, or inside a huge page).
 pub fn vmm_pte_in(pml4: u64, vaddr: u64) -> u64
-    let pml4_entry: u64 = vmm_get_entry(pml4, vmm_pml4_index(vaddr))
-    if (pml4_entry & PTE_PRESENT) == 0
-        return 0
-    let pdpt_entry: u64 = vmm_get_entry(pml4_entry & PTE_ADDR_MASK, vmm_pdpt_index(vaddr))
-    if (pdpt_entry & PTE_PRESENT) == 0 or (pdpt_entry & PTE_HUGE) != 0
-        return 0
-    let pd_entry: u64 = vmm_get_entry(pdpt_entry & PTE_ADDR_MASK, vmm_pd_index(vaddr))
-    if (pd_entry & PTE_PRESENT) == 0 or (pd_entry & PTE_HUGE) != 0
-        return 0
-    let pt_entry: u64 = vmm_get_entry(pd_entry & PTE_ADDR_MASK, vmm_pt_index(vaddr))
+    let pt: u64 = match vmm_leaf_table_in(pml4, vaddr)
+        Some(t) => t
+        None => return 0
+    let pt_entry: u64 = vmm_get_entry(pt, vmm_pt_index(vaddr))
     if (pt_entry & PTE_PRESENT) == 0
         return 0
     return pt_entry
+
+# The page table holding vaddr's 4 KiB leaf in `pml4`, None when there is
+# none (a level absent, or a huge page on the way).
+fn vmm_leaf_table_in(pml4: u64, vaddr: u64) -> Option<u64>
+    let pml4_entry: u64 = vmm_get_entry(pml4, vmm_pml4_index(vaddr))
+    if (pml4_entry & PTE_PRESENT) == 0
+        return None
+    let pdpt_entry: u64 = vmm_get_entry(pml4_entry & PTE_ADDR_MASK, vmm_pdpt_index(vaddr))
+    if (pdpt_entry & PTE_PRESENT) == 0 or (pdpt_entry & PTE_HUGE) != 0
+        return None
+    let pd_entry: u64 = vmm_get_entry(pdpt_entry & PTE_ADDR_MASK, vmm_pd_index(vaddr))
+    if (pd_entry & PTE_PRESENT) == 0 or (pd_entry & PTE_HUGE) != 0
+        return None
+    Some(pd_entry & PTE_ADDR_MASK)
+
+# Quarantine the 4 KiB leaf at vaddr in `pml4` (DrvDmaFree and exit, when a
+# unit didn't confirm the IOTLB invalidation that took the frame out of a
+# device's domain; AGAST #4725, RING1_DRIVER.md §5). The leaf is unmapped
+# (invlpg as vmm_unmap_page_in), then rewritten not present with PTE_DEVICE
+# and the frame: a stale pointer faults, vmm_free_user_pt (present leaves
+# only) never gives the frame to the PMM, and vmm_slot_end counts the page,
+# so the VA is not handed out again. The frame, or None if vaddr had no
+# present 4 KiB leaf (nothing changed).
+pub fn vmm_quarantine_page_in(pml4: u64, vaddr: u64) -> Option<u64>
+    let pt: u64 = match vmm_leaf_table_in(pml4, vaddr)
+        Some(t) => t
+        None => return None
+    let paddr: u64 = vmm_unmap_page_in(pml4, vaddr)
+    if paddr == 0
+        return None
+    vmm_set_entry(pt, vmm_pt_index(vaddr), paddr | PTE_DEVICE)
+    Some(paddr)
 
 # Free all user-space pages in a page table (for process cleanup)
 # Does NOT free the kernel mappings or the PML4 itself
