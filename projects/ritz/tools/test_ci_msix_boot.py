@@ -56,14 +56,15 @@ TIER1_SCRIPT = "projects/harland/tools/test_tier1_boot.sh"
 # don't import each other). The QEMU stub writes $FAKE_SERIAL to the
 # `-serial file:PATH` it was given and idles until killed; every argv goes
 # to $STUB_LOG. The translating boot (an intel-iommu on the command line,
-# AGAST #4723) gets $FAKE_SERIAL_VTD after it: the lines only that boot logs.
+# AGAST #4723) gets $FAKE_SERIAL_VTD instead: since the cutover (AGAST
+# #4735) its NIC has another owner, so its log is its own.
 QEMU_STUB = r"""#!/usr/bin/env bash
 echo "$@" >> "$STUB_LOG"
-extra=""
-case " $* " in *" intel-iommu,"*) extra="$FAKE_SERIAL_VTD" ;; esac
+log="$FAKE_SERIAL"
+case " $* " in *" intel-iommu,"*) log="$FAKE_SERIAL_VTD" ;; esac
 prev=""
 for a in "$@"; do
-    if [ "$prev" = "-serial" ]; then printf '%b' "$FAKE_SERIAL$extra" > "${a#file:}"; fi
+    if [ "$prev" = "-serial" ]; then printf '%b' "$log" > "${a#file:}"; fi
     prev="$a"
 done
 sleep 30
@@ -170,11 +171,34 @@ NET_PLATFORM = r"[virtio-net] VIRTIO_F_ACCESS_PLATFORM negotiated: DMA through t
 NIC_DOMAIN = r"[nic-dma] private domain 2 for 0000:00:04.0 and 0 alias(es), never in the identity map; bus master on\n"
 NIC_FAULT_RECORD = r"[nic-dma] fault record: source 0000:00:04.0 IOVA 0x1000006000 reason 6 (read)\n"
 NIC_FAULT = r"[nic-dma] fault probe: the NIC's DMA to unmapped IOVA 0x1000006000 faulted with its source ID 0000:00:04.0\n"
-NIC_DMA = r"[nic-dma] device DMA: 602 bytes received into granted IOVA 0x1000007000 -> physical 0x1BB4000 in domain 2\n"
 NIC_ALLOWED = (r"[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), "
-               r"NIC isolated; the owner stays in the kernel\n")
-NIC_DMA_OK = NIC_DOMAIN + NIC_FAULT_RECORD + NIC_FAULT + NIC_DMA + NIC_ALLOWED
-VTD_OK = IR_ON + TE_ON + NET_PLATFORM + NIC_DMA_OK
+               r"NIC isolated; the owner is /bin/virtio-net\n")
+# The cutover (AGAST #4735): on the translating boot /bin/virtio-net owns the
+# NIC. Its rings and pools are DrvDmaAlloc runs in the NIC's domain (the
+# kernel logs each), and the frame it received lands in one of them (the
+# driver logs the IOVA in decimal: 0x1000007000 + 0x800).
+DMA_RUN_RING = r"[nic-dma] DrvDmaAlloc: pid 2, 3 page(s) at IOVA 0x1000004000 in domain 2\n"
+DMA_RUN_POOL = r"[nic-dma] DrvDmaAlloc: pid 2, 16 page(s) at IOVA 0x1000007000 in domain 2\n"
+NIC_DMA = r"[virtio-net] device DMA: 602 bytes received into granted IOVA 68719507456\n"
+NIC_DMA_OK = NIC_DOMAIN + NIC_FAULT_RECORD + NIC_FAULT + NIC_ALLOWED + DMA_RUN_RING + DMA_RUN_POOL + NIC_DMA
+RING1_PARKED = r"[net-ring1] /bin/virtio-net pid 2 parked: generation 2 published\n"
+DRIVER_UP = r"[virtio-net] up: MAC published, 32 RX buffers posted\n"
+
+
+def driver_parks(p: int) -> str:
+    return rf"[msix] virtio-net driver parks: {p}\n"
+
+
+# What the in-kernel owner logs, and the ring-1 owner must not beside it
+KERNEL_NETDEV = r"[netdev] Registered VirtIO-net device, MAC: 52:54:00:12:34:56\n"
+KERNEL_NIC_UP = r"[virtio-net] Initialization complete!\n"
+# The whole translating boot: the same storage, NVMe and NIC checks, the
+# NIC brought up by the ring-1 driver (modern transport from the kernel
+# probe, bit 33 and the capped RX queue from the driver), and its parks in
+# place of the in-kernel RX waits.
+VTD_OK = (NVME_TABLE.replace(PCI_PORT_IO, "") + IR_ON + TE_ON + NET_MODERN + NIC_DMA_OK + NIC_ON
+          + RING1_PARKED + NET_PLATFORM + RX_CAPPED + DRIVER_UP + DHCP_OK + TX_BURST_OK + interrupts(8)
+          + driver_parks(41) + NVME_OK + BLK_MODERN + BLK_ON + INPUT_ON + blk_waits() + SUITE_PASSED)
 
 
 # --------------------------------------------------------------------------
@@ -236,6 +260,7 @@ def tree(tmp_path):
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(b"\x7fELF")
+    shutil.copy(REPO / "projects/indium/initramfs.pkgs", root / "projects/indium/initramfs.pkgs")
     stubs = tmp_path / "stubs"
     stubs.mkdir()
     ovmf = tmp_path / "OVMF_CODE.fd"
@@ -452,13 +477,24 @@ def test_translating_boot_check_missing_fails(tree, drop, want):
 @pytest.mark.integration
 def test_translating_boot_keeps_every_device_check(tree):
     """A check that fails only on the translating boot fails the script: the
-    storage, NVMe and NIC assertions run on both boots (halted > 0 too)."""
-    r = _run(tree, PASSED.replace(net_rx_waits(), ""),
-             env_extra={"FAKE_SERIAL_VTD": ""})
+    storage, NVMe and NIC assertions run on both boots."""
+    r = _run(tree, PASSED.replace(blk_waits(), ""),
+             env_extra={"FAKE_SERIAL_VTD": VTD_OK.replace(blk_waits(), "")})
     assert r.returncode == 1
     # both boots report it, each under its own header
-    assert r.stdout.count("no virtio-net RX wait count logged") == 2
+    assert r.stdout.count("no virtio-blk MSI-X read check logged") == 2
     assert "===== msix boot (pc) =====" in r.stdout and "===== msix boot (vtd) =====" in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("drop", [DHCP_OK, TX_BURST_OK, NIC_ON, interrupts(8), NET_MODERN, RX_CAPPED],
+                         ids=["no-dhcp", "no-burst", "no-msix", "no-interrupts", "legacy", "queue-not-capped"])
+def test_translating_boot_keeps_every_nic_check(tree, drop):
+    """AGAST #4735: the NIC checks hold through the ring-1 driver: a lease,
+    the burst, MSI-X on with interrupts delivered, modern, RX capped."""
+    r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": VTD_OK.replace(drop, "")})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "===== msix boot (vtd) =====" in r.stdout.split("FAIL:")[0]
 
 
 @pytest.mark.integration
@@ -605,12 +641,17 @@ def test_virtio_wait_check_fails(tree, waits, want):
          "no fault record with the NIC's source ID (0000:00:04.0)"),
         (VTD_OK.replace(NIC_FAULT_RECORD, ""), "was not logged from the unit"),
         (VTD_OK.replace(NIC_DMA, ""), "no device DMA into a granted page"),
-        (VTD_OK.replace(NIC_DMA, NIC_DMA.replace("in domain 2", "in domain 1")), "not its private domain 2"),
-        (VTD_OK.replace(NIC_DMA, NIC_DMA.replace("IOVA 0x1000007000", "IOVA 0x1BB4000")), "below the private IOVA base"),
+        (VTD_OK.replace(DMA_RUN_POOL, DMA_RUN_POOL.replace("in domain 2", "in domain 1")), "not its private domain 2"),
+        (VTD_OK.replace(NIC_DMA, NIC_DMA.replace("IOVA 68719507456", "IOVA 29048832")), "below the private IOVA base"),
+        (VTD_OK.replace(DMA_RUN_POOL, ""), "is in no run DrvDmaAlloc granted the driver"),
         (VTD_OK.replace(NIC_ALLOWED, ""), "net_ring1_allowed is false on the translating boot"),
+        # the pre-cutover verdict: the owner stayed in the kernel
+        (VTD_OK.replace(NIC_ALLOWED, NIC_ALLOWED.replace("the owner is /bin/virtio-net", "the owner stays in the kernel")),
+         "net_ring1_allowed is false on the translating boot"),
     ],
     ids=["no-domain", "not-held", "no-fault", "fault-from-another-source", "no-unit-record",
-         "no-device-dma", "dma-in-another-domain", "dma-at-a-ram-address", "ring1-not-allowed"],
+         "no-device-dma", "dma-in-another-domain", "dma-at-a-ram-address", "dma-outside-the-runs",
+         "ring1-not-allowed", "owner-in-the-kernel"],
 )
 def test_nic_private_domain_check_fails(tree, vtd, want):
     """AGAST #4724: each claim of the NIC's private domain is checked on the
@@ -624,7 +665,8 @@ def test_nic_private_domain_check_fails(tree, vtd, want):
 def test_nic_private_domain_passes_on_the_translating_boot(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "PASS: the NIC DMA'd a frame into granted IOVA 0x1000007000 (domain 2)" in r.stdout
+    assert ("PASS: the NIC DMA'd a frame into granted IOVA 0x1000007800 (domain 2, the driver's DrvDmaAlloc run "
+            "at 0x1000007000)") in r.stdout
     assert "PASS: no IOMMU: the NIC stays on physical addresses" in r.stdout
 
 
@@ -641,3 +683,67 @@ def test_nic_private_domain_on_pc_fails(tree, pc, want):
     r = _run(tree, pc)
     assert r.returncode == 1, r.stdout + r.stderr
     assert want in r.stdout
+
+
+# --------------------------------------------------------------------------
+# The cutover: the ring-1 driver owns the NIC on the translating boot
+# (AGAST #4735, RING1_DRIVER.md sections 8-9)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_ring1_owner_passes_on_the_translating_boot(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    vtd = r.stdout.split("===== msix boot (vtd) =====")[1]
+    assert "PASS: the kernel spawned /bin/virtio-net and it parked with generation 2 published" in vtd
+    assert "PASS: the ring-1 driver brought the NIC up" in vtd
+    assert "PASS: virtio_net_init did not run: the ring-1 driver is the NIC's only owner" in vtd
+    assert "PASS: the ring-1 driver parked 41 times in DrvIrqWait" in vtd
+    # the in-kernel owner's RX-wait check is the pc run's alone
+    assert "RX waited on its vector" not in vtd
+    assert "PASS: virtio-net RX waited on its vector 880 times, halted 880" in r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "vtd, want",
+    [
+        (VTD_OK.replace(RING1_PARKED, ""), "/bin/virtio-net was not spawned, or did not park"),
+        (VTD_OK.replace(RING1_PARKED, RING1_PARKED.replace("generation 2", "generation 0")),
+         "/bin/virtio-net was not spawned, or did not park"),
+        (VTD_OK.replace(DRIVER_UP, ""), 'no "[virtio-net] up: MAC published"'),
+        # both owners on one boot
+        (VTD_OK.replace(DRIVER_UP, DRIVER_UP + KERNEL_NETDEV), "ran beside the ring-1 driver"),
+        (VTD_OK.replace(DRIVER_UP, DRIVER_UP + KERNEL_NIC_UP), "ran beside the ring-1 driver"),
+        # the park counter replaces halted > 0
+        (VTD_OK.replace(driver_parks(41), ""), "no ring-1 driver park count logged"),
+        (VTD_OK.replace(driver_parks(41), driver_parks(0)), "never parked in DrvIrqWait"),
+        (VTD_OK.replace(driver_parks(41), net_rx_waits()), "no ring-1 driver park count logged"),
+    ],
+    ids=["not-spawned", "unpublished", "no-driver-banner", "netdev-banner-too", "kernel-banner-too",
+         "no-park-count", "never-parked", "halts-instead-of-parks"],
+)
+def test_ring1_owner_check_fails(tree, vtd, want):
+    r = _run(tree, PASSED, env_extra={"FAKE_SERIAL_VTD": vtd})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout
+
+
+@pytest.mark.integration
+def test_ring1_checks_are_the_translating_boots_alone(tree):
+    """The pc run keeps the in-kernel owner: its banners are not a failure
+    there, and it needs no park count."""
+    r = _run(tree, PASSED + KERNEL_NETDEV + KERNEL_NIC_UP)
+    assert r.returncode == 0, r.stdout + r.stderr
+    pc = r.stdout.split("===== msix boot (vtd) =====")[0]
+    assert "PASS: the ring-1 driver" not in pc and "ring-1 driver park" not in pc
+
+
+@pytest.mark.unit
+def test_the_boot_images_carry_the_driver():
+    """/bin/virtio-net comes from harland/system, which the shared package
+    list names: the script reads that list instead of its own."""
+    script = (REPO / MSIX_SCRIPT).read_text()
+    assert "initramfs.pkgs" in script
+    assert 'USER_PKGS="indium rzsh prism"' not in script

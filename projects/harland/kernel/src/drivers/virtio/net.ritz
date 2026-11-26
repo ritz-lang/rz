@@ -40,12 +40,14 @@ import drivers.pci { PciDevice, DmaRequesters, pci_find_virtio, pci_enable_bus_m
 import mm.vmm { phys_to_virt }
 import mm.dma { dma_alloc_zeroed, dma_free_pages, dma_quarantine }
 import arch.x86_64.tsc { deadline_after_us, deadline_passed }
-import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count }
+import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_set_entry_to, msix_entry_dest, msix_vector_count }
 import drivers.virtio.common { VirtioDevice, VIO_TRANSPORT_MMIO, VIRTIO_MSI_NO_VECTOR, VIRTIO_STATUS_FAILED, VIRTIO_STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER, vio_init_device, vio_init_device_isolated, vio_add_status, vio_reset, vio_get_status, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_get_queue_size, vio_queue_alloc, vio_queue_reset, vio_queue_program, vio_queue_pages, vio_read_isr, vio_note_msix_on, vio_set_config_msix_vector, vio_read_config8, vio_read_config16, vq_notify }
 import virtio_abi.features { VIRTIO_F_ACCESS_PLATFORM }
 import drivers.iommu.vtd { VtdEnter }
 import drivers.iommu.ir { dma_translation_on, dma_private_domain, dma_requester_isolated, dma_domain_enter, dma_domain_hole, dma_domain_phys, dma_fault_next, dma_isolation_live }
 import virtio_abi.virtq { Virtqueue, VringDesc, TxSlots, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE, tx_slots_init, tx_slots_take, tx_slots_post, vq_reclaim_tx }
+
+extern fn lapic_id() -> u32
 
 # MSI-X table entries this driver uses: config changes, RX queue, TX queue
 const VIRTIO_NET_MSIX_ENTRIES: u16 = 3
@@ -627,6 +629,126 @@ fn virtio_net_fail(vdev: *VirtioDevice, why: StrView) -> i32
     klog("\n")
     vio_add_status(vdev, VIRTIO_STATUS_FAILED)
     return -1
+
+# ============================================================================
+# The ring-1 owner's probe (AGAST #4735, docs/RING1_DRIVER.md sections 8-9)
+# ============================================================================
+#
+# On a boot that translates DMA the NIC's owner is /bin/virtio-net, never
+# virtio_net_init (D7: the boot chooses, not a marker file). The kernel
+# keeps PCI, bus mastering, the MSI-X table and the private domain: this
+# probe finds the device, isolates it (virtio_net_isolate: its domain, then
+# bus master, then the fault probe), records its capability windows and
+# points MSI-X table entries 0-2 (config, RX, TX) at one vector on the BSP.
+# It allocates no virtqueue for the device to use and never sets
+# DRIVER_OK: the driver does, after its own reset. net/ring1.ritz makes the
+# IRQ object and spawns the driver from what this returns.
+
+# What net/ring1.ritz hands the driver, besides the frame and link objects.
+pub struct NicGrant
+    vector: u8                       # the IDT vector of entries 0-2
+    sid: u32                         # the NIC's requester
+    dom: u32                         # its private DMA domain
+    status_va: u64                   # the kernel's VA of device_status
+    msix_table_va: u64               # the kernel's VA of MSI-X entry 0
+    window_count: u32
+    window_ids: [8]u64               # CAP_TYPE_MMIO objects (VIO_WINDOW_NOTES)
+    window_types: [8]u8              # their virtio cfg_type
+
+# virtio_pci_common_cfg.device_status (virtio 1.1 section 4.1.4.3)
+const VIRTIO_COMMON_DEVICE_STATUS: u64 = 0x14
+
+# A virtio-net was found on a translating boot: its owner is the ring-1
+# driver, so netdev_init leaves it alone, whether or not the probe below
+# then handed it over (a refused NIC has no owner on that boot).
+var virtio_net_ring1: bool = false
+# 0 until the probe hands the NIC over: msix_vector_alloc never gives 0.
+var virtio_net_ring1_vec: u8 = 0
+
+pub fn virtio_net_ring1_boot() -> bool
+    virtio_net_ring1
+
+# The NIC's vector on the ring-1 boot, None when it was not handed over.
+pub fn virtio_net_ring1_vector() -> Option<u8>
+    if virtio_net_ring1_vec == 0
+        return None
+    Some(virtio_net_ring1_vec)
+
+fn virtio_net_ring1_refused(why: StrView) -> Option<NicGrant>
+    klog("[nic-dma] ring-1 owner refused: ")
+    klog(why)
+    klog("; the NIC has no owner on this boot\n")
+    None
+
+# MSI-X table entries 0-2 on one vector aimed at this CPU, the BSP: the
+# vector, or None (no table, no vector, or an entry routed anywhere else).
+fn virtio_net_ring1_msix(pci_dev: *PciDevice) -> Option<u8>
+    if msix_probe(pci_dev, @virtio_net_msix) != 0 or virtio_net_msix.table_size < VIRTIO_NET_MSIX_ENTRIES
+        klog("[msix] virtio-net: no MSI-X table of 3 entries\n")
+        return None
+    # msix_vector_alloc's own convention: vector 0 means none was free.
+    let vector: u8 = msix_vector_alloc()
+    if vector == 0 or msix_enable(@virtio_net_msix) != 0
+        klog("[msix] virtio-net: no vector or the table did not map\n")
+        return None
+    let bsp: u32 = lapic_id()
+    var e: u16 = 0
+    while e < VIRTIO_NET_MSIX_ENTRIES
+        if msix_set_entry_to(@virtio_net_msix, e, vector, bsp) != 0 or msix_entry_dest(@virtio_net_msix, e) != bsp
+            klog("[msix] virtio-net: entry ")
+            klog_dec(e as i64)
+            klog(" is not routed to the BSP (APIC ID ")
+            klog_dec(bsp as i64)
+            klog(")\n")
+            return None
+        e = e + 1
+    klog("[msix] virtio-net: MSI-X on, vector ")
+    klog_dec(vector as i64)
+    klog(" for config, rx and tx (entries 0-2), routed to the BSP\n")
+    Some(vector)
+
+# The probe (above): the NIC's grant, or None when there is no virtio-net,
+# DMA is not translated (virtio_net_init owns it), or the NIC is refused.
+pub fn virtio_net_ring1_probe() -> Option<NicGrant>
+    let pci_dev: *PciDevice = pci_find_virtio(VIRTIO_DEVICE_NET)
+    if pci_dev == 0 as *PciDevice or not dma_translation_on()
+        return None
+    virtio_net_ring1 = true
+    klog("\n[virtio-net] Probing device at ")
+    klog_dec((*pci_dev).bus as i64)
+    klog(":")
+    klog_dec((*pci_dev).device as i64)
+    klog(".")
+    klog_dec((*pci_dev).function as i64)
+    klog(" for the ring-1 driver\n")
+    virtio_net.pci_dev = pci_dev
+    virtio_net.initialized = 0
+    virtio_net.rx_queue = 0 as *Virtqueue
+    virtio_net.tx_queue = 0 as *Virtqueue
+    virtio_net_dom = 0
+    let vdev: *VirtioDevice = vio_init_device_isolated(pci_dev)
+    if vdev == 0 as *VirtioDevice
+        return virtio_net_ring1_refused("no usable virtio transport")
+    virtio_net.vdev = vdev
+    if (*vdev).transport != VIO_TRANSPORT_MMIO
+        return virtio_net_ring1_refused("a legacy-only virtio-net, and /bin/virtio-net drives the modern transport")
+    klog("[virtio-net] Transport: modern (MMIO)\n")
+    if not virtio_net_isolate(pci_dev, vdev)
+        vio_add_status(vdev, VIRTIO_STATUS_FAILED)
+        return virtio_net_ring1_refused("the NIC is not isolated")
+    if not net_ring1_allowed()
+        return virtio_net_ring1_refused("translation, remapping or blocked compatibility format is off")
+    let vector: u8 = match virtio_net_ring1_msix(pci_dev)
+        Some(v) => v
+        None => return virtio_net_ring1_refused("MSI-X is not on at the BSP")
+    vio_note_msix_on(vdev)
+    virtio_net_ring1_vec = vector
+    klog("[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), NIC isolated; the owner is /bin/virtio-net\n")
+    var grant: NicGrant = NicGrant { vector: vector, sid: pci_dev_sid(pci_dev), dom: virtio_net_dom, status_va: (*vdev).mmio_common + VIRTIO_COMMON_DEVICE_STATUS, msix_table_va: virtio_net_msix.table_virt, window_count: (*vdev).window_count, window_ids: [0, 0, 0, 0, 0, 0, 0, 0], window_types: [0, 0, 0, 0, 0, 0, 0, 0] }
+    for i in 0..8
+        grant.window_ids[i] = (*vdev).window_ids[i]
+        grant.window_types[i] = (*vdev).window_types[i]
+    Some(grant)
 
 # ============================================================================
 # Packet Send/Receive

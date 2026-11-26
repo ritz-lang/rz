@@ -2,7 +2,7 @@
 # harland docs/RING1_DRIVER.md sections 4-9)
 #
 # A CPL-3 process the kernel spawns on a boot whose NIC sits in a private,
-# translated DMA domain (the cutover, AGAST #4735: nothing spawns it yet).
+# translated DMA domain (the cutover, AGAST #4735: kernel net/ring1.ritz).
 # The kernel keeps PCI, bus mastering, the MSI-X table and the IDT; this
 # program owns the device from reset on:
 #
@@ -225,6 +225,8 @@ var g_mtu: Option<u16>
 var g_link_va: u64
 var g_link_up: bool
 var g_sources: [1]WaitSource
+# The first received frame's DMA was logged (once per boot).
+var g_dma_logged: bool = false
 var g_events: [8]WaitEvent
 
 # ============================================================================
@@ -327,17 +329,20 @@ fn negotiate(r: Regs) -> Result<u64, InitError>
     if (status(r) & STATUS_FEATURES_OK) == 0
         add_status(r, STATUS_FAILED)
         return Err(InitError.FeaturesOk)
+    print("[virtio-net] VIRTIO_F_ACCESS_PLATFORM negotiated: DMA through the IOMMU\n")
     Ok(accepted)
 
 # Lay queue `idx` over a fresh DrvDmaAlloc run and tell the device where it
 # is, signalling MSI-X table index `vector`. Returns its doorbell.
 fn setup_queue(r: Regs, vq: *Virtqueue, idx: u16, vector: u16) -> Result<u64, InitError>
     wr16(r.common + COMMON_QUEUE_SELECT, idx)
-    var num: u16 = rd16(r.common + COMMON_QUEUE_SIZE)
-    if num == 0
+    let max: u16 = rd16(r.common + COMMON_QUEUE_SIZE)
+    if max == 0
         return Err(InitError.Queue)
+    var num: u16 = max
     if num > VIRTQ_MAX_SIZE
         num = VIRTQ_MAX_SIZE
+    print("[virtio-net] Queue {idx}: size={num} (device max {max})\n")
     let run: DmaRun = match drv_dma_alloc(g_boot.irq, virtq_ring_bytes(num))
         Ok(x) => x
         Err(e) => return Err(InitError.Dma(e))
@@ -465,6 +470,14 @@ fn service() -> bool
         kick(g_rx_doorbell, RX_QUEUE)
     if rx.published > 0
         shm_notify(g_seat.handle, EVENT_DATA)
+    if rx.first_len > 0 and not g_dma_logged
+        # The device wrote it through the NIC's domain into a DrvDmaAlloc
+        # run: the kernel logged that run's IOVAs, so the boot test can
+        # place this one in it (AGAST #4735).
+        g_dma_logged = true
+        let n: u32 = rx.first_len
+        let iova: u64 = rx.first_iova
+        print("[virtio-net] device DMA: {n} bytes received into granted IOVA {iova}\n")
     if rx.closed.is_some()
         print("[virtio-net] RX ring closed: impossible read_idx\n")
         detach()

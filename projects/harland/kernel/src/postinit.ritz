@@ -19,7 +19,7 @@ import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send,
 import syscall.errno { Errno }
 import drivers.pci { pci_print_all_devices }
 import drivers.msix { msix_print_all, msix_vector_alloc, msix_vector_count }
-import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
+import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_ring1_vector, virtio_net_irq_count, virtio_net_rx_wait_count, virtio_net_rx_halt_count }
 import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
 import io { enable_interrupts, disable_interrupts, halt_loop, rdtsc }
 import tty.console { tty_console_irq, tty_console_get_flags, tty_console_set_flags }
@@ -29,7 +29,7 @@ import arch.x86_64.apcall { ap_run_nvme_probe }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test, virtio_blk_read, virtio_blk_msix_vector, virtio_blk_irq_count, virtio_blk_irq_wait_count, virtio_blk_irq_halt_count }
 import net.ring { RxWait, SeatOpen, ring_seat_open, ring_driver_gone, take_rx, ring_seat_object, ring_driver_registered, ring_rx_rejects, ring_tx_full_yields, ring_endpoint_fails }
 import driver_abi.spsc { FrameBytes }
-import net.stack { net_ring_select, net_send, net_is_ready, net_stack_init, net_poll, net_wait_rx, net_configure_dhcp, net_is_configured, net_device_type }
+import net.stack { net_ring_select, net_send, net_is_ready, net_stack_init, net_poll, net_wait_rx, net_configure_dhcp, net_is_configured, net_device_type, net_on_ring }
 import net.ip { ip_get_gateway, ip_print_config }
 import net.icmp { icmp_ping, icmp_distinct_reply_count, icmp_echo_request_count, icmp_echo_reply_sent_count }
 import net.arp { arp_cache_lookup, arp_send_request }
@@ -2160,7 +2160,17 @@ const NET_TX_BURST_GROUP: u32 = 4
 # distinct reply seqs: a driver that writes every frame into the same TX
 # buffer overwrites a group's earlier requests before the device reads them,
 # so their seqs never come back. tools/test_msix_boot.sh checks both.
+#
+# On the ring-1 driver's frame rings (AGAST #4735, RING1_DRIVER.md section
+# 9 step 5) the kernel can't poll the NIC itself, and the driver runs only
+# when pid 1 lets it: interrupts are on for the burst, each published group
+# is followed by a yield (the TX kick already made the driver runnable),
+# and each poll is a short net_wait_rx, which parks pid 1 until a frame or
+# its deadline. The poll caps are the same.
 fn network_tx_burst()
+    let ring: bool = net_on_ring()
+    if ring
+        enable_interrupts()
     let gateway: *u8 = ip_get_gateway()
     var mac: [6]u8
     var tries: i32 = 0
@@ -2168,11 +2178,13 @@ fn network_tx_burst()
         arp_send_request(gateway)
         var p: i32 = 0
         while p < 100
-            net_poll()
+            burst_poll(ring)
             p = p + 1
         tries = tries + 1
     if arp_cache_lookup(gateway, @mac[0]) < 0
         klog("[net] TX burst: gateway never answered ARP\n")
+        if ring
+            disable_interrupts()
         return
 
     let base: u32 = icmp_distinct_reply_count()
@@ -2187,17 +2199,24 @@ fn network_tx_burst()
             g = g + 1
             n = n + 1
         sent = sent + group_sent
+        if ring
+            sched_yield()
         # Wait (bounded) for this group's replies
         var polls: i32 = 0
         while icmp_distinct_reply_count() - base < sent and polls < 2000
-            net_poll()
-            delay_us(50)
+            if ring
+                burst_poll(true)
+            else
+                net_poll()
+                delay_us(50)
             polls = polls + 1
     # Late replies
     var tail: i32 = 0
     while tail < 200
-        net_poll()
+        burst_poll(ring)
         tail = tail + 1
+    if ring
+        disable_interrupts()
 
     klog("[net] TX burst: sent=")
     klog_dec(sent as i64)
@@ -2206,6 +2225,16 @@ fn network_tx_burst()
     klog(" replies=")
     klog_dec((icmp_distinct_reply_count() - base) as i64)
     klog("\n")
+
+# One poll of the burst: on the ring, wait up to NET_BURST_WAIT_US for a
+# frame (pid 1 parks; the driver runs), else net_poll.
+const NET_BURST_WAIT_US: u64 = 1000
+
+fn burst_poll(ring: bool)
+    if ring
+        net_wait_rx(deadline_after_us(NET_BURST_WAIT_US))
+    else
+        net_poll()
 
 # AGAST #1851: how long the EC2 acceptance boot keeps polling for an inbound
 # ping from the peer instance after DHCP. Bounded, and only armed by the
@@ -2269,7 +2298,19 @@ fn network_dhcp_ping(run_net_responder: bool)
                     klog("  ICMP echo request sent!\n")
         disable_interrupts()
 
-        if virtio_net_msix_enabled()
+        if net_on_ring()
+            # The ring-1 owner's interrupts, counted by msix_dispatch on the
+            # vector the kernel aimed entries 0-2 at, and the driver's parks
+            # in DrvIrqWait: a park is not a hlt, so it is no RX-wait halt.
+            klog("[msix] virtio-net interrupts: ")
+            match virtio_net_ring1_vector()
+                Some(v) => klog_dec(msix_vector_count(v))
+                None => klog_dec(0)
+            klog("\n")
+            klog("[msix] virtio-net driver parks: ")
+            klog_dec(drv_irq_wait_park_count())
+            klog("\n")
+        else if virtio_net_msix_enabled()
             klog("[msix] virtio-net interrupts: ")
             klog_dec(virtio_net_irq_count())
             klog("\n")

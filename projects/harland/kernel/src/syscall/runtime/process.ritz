@@ -35,7 +35,7 @@ import syscall.stack { syscall_stack_check, syscall_stack_used }
 import drivers.acpi.tables { acpi_poweroff }
 import loader.image { ElfStatus }
 import loader.elf { USER_IMAGE_BASE, ElfLoadResult, elf_load }
-import syscall.errno { Errno }
+import syscall.errno { Errno, errno_result }
 import syscall.runtime.memory { USER_STACK_TOP, alloc_user_stack }
 import syscall.runtime.net { net_service_exited }
 import syscall.runtime.argv { ArgvStatus, ArgvCapture, argv_capture, argv_buf, argv_offsets }
@@ -218,11 +218,12 @@ fn spawn_child_begin(parent_pid: u64, inherit_caps: bool) -> i64
 
 # Start `path` as a child of the running process, with argc/argv (argc 0:
 # none) in main's RDI/RSI. The child is runnable when this returns: its pid,
-# or a negative errno with nothing changed.
+# or a negative errno with nothing changed. A sys_spawn child inherits the
+# parent's ambient capabilities (`inherit_caps`); a kernel spawn does not.
 #
 # ISOLATION: each child gets its own page table (CR3); it cannot read or
 # write the parent's user memory.
-fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64) -> i64
+fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64, inherit_caps: bool) -> i64
     # Read file from namespace (using kernel's page table). A path under
     # /var comes from the persistent subtree (fs/kfs.ritz, #4321).
     let ns: *Namespace = kfs_ns_for(path_view)
@@ -247,7 +248,7 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64) -> i64
     let parent_pid: u64 = parent.pid
     let parent_pml4: u64 = vmm_get_current_pml4()
     (*parent).pml4 = parent_pml4
-    let begun: i64 = spawn_child_begin(parent_pid, true)
+    let begun: i64 = spawn_child_begin(parent_pid, inherit_caps)
     if begun < 0
         return begun
     let slot: i32 = begun as i32
@@ -284,6 +285,17 @@ fn spawn_process(path_view: StrView, argc: i32, argv_bytes: i64) -> i64
     sched_prepare_user(slot, load_result.entry_point, user_rsp, arg0, child_argv)
     proc_start(slot)
     return child_pid as i64
+
+# Start the program at `path`, an ELF the kernel chose (RING1_DRIVER.md
+# section 9 step 2: /bin/virtio-net, AGAST #4735), as a child of the running
+# process: no arguments, and no capabilities, since what a kernel-spawned
+# program holds the kernel grants. Runnable when this returns, without
+# waiting for it: its pid, or the errno with nothing changed (Errno.NoEnt
+# for a missing file, Errno.Srch with no running process).
+pub fn process_spawn_program(path: StrView) -> Result<u64, Errno>
+    if proc_current() == 0 as *Proc
+        return Err(Errno.Srch)
+    errno_result(spawn_process(path, 0, 0, false))
 
 # The most pages process_spawn_image maps for an image (AGAST #4731): the
 # boot-test stub grew past one page when the frame-ring modes landed beside
@@ -370,7 +382,7 @@ fn wait_for_child(pid: u64, code: *i64) -> i32
 # sys_wait to collect the status; a negative exit code fails the spawn with
 # -1 instead, and the child is reaped here since no wait will come.
 fn spawn_and_block(path: StrView, argc: i32, argv_bytes: i64) -> i64
-    let pid: i64 = spawn_process(path, argc, argv_bytes)
+    let pid: i64 = spawn_process(path, argc, argv_bytes, true)
     if pid <= 0
         return pid
     var code: i64 = 0
@@ -591,7 +603,7 @@ pub fn sys_spawn_bg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         argv_bytes = spawn_capture_argv(rsi as **u8, argc)
         if argv_bytes < 0
             return argv_bytes
-    return spawn_process(strview_from_ptr(rdi as *u8, path_result), argc, argv_bytes)
+    return spawn_process(strview_from_ptr(rdi as *u8, path_result), argc, argv_bytes, true)
 
 # wait(pid)
 pub fn sys_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

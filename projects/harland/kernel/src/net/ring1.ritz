@@ -1,0 +1,229 @@
+# net/ring1.ritz - the virtio-net cutover (AGAST #4735, docs/RING1_DRIVER.md
+# sections 8-9, ring plan T29)
+#
+# On every boot with a virtio-net and a translated DMA domain the NIC's
+# queues belong to /bin/virtio-net, a CPL-3 process the kernel spawns, and
+# virtio_net_init never runs (D7: the boot picks the owner, not a marker
+# file). An untranslated boot keeps virtio_net_init and spawns nothing.
+# kernel_main runs steps 1-4 before postinit_diagnostics and run_init,
+# whether or not \harland\net-selftest is set:
+#
+#   1. net_ring1_prepare: the probe (virtio_net_ring1_probe: the NIC
+#      isolated in its private domain, MSI-X entries 0-2 on one vector at
+#      the BSP, its windows recorded), then process_create_init. Pid 1
+#      exists, at CPL 0, with the scheduler stopped. kernel_main moves onto
+#      pid 1's kernel stack (the boot stack is not in a child's page table)
+#      and calls net_ring1_spawn there.
+#   2. net_ring1_spawn: the device's IRQ object (latched by the vector,
+#      bound to the domain, recorded for driver_quiesce); the spawn of
+#      /bin/virtio-net with no capabilities of its own; then the grants:
+#      the frame object (ring_seat_open: mapped into the driver first, so
+#      at DRV_RING_BASE, and into pid 1, the kernel seat), the IRQ, a link
+#      page with the publish right, one MMIO handle per window; and the
+#      DriverBoot record at FRAME_ADVISORY_OFF of the frame region.
+#   3. Pid 1 yields while the scheduler is stopped: nothing preempts the
+#      driver, which resets the device, sets DRIVER_OK, publishes
+#      generation 2 (NetPublish), posts its RX buffers and parks in
+#      DrvIrqWait; that park is the switch back.
+#   4. sched_start, once: run_init does not call it again.
+#
+# Step 5 is the self-test window (postinit.ritz network_dhcp_ping), only
+# with \harland\net-selftest: net_stack_init finds the published snapshot
+# and the stack's I/O is the frame ring.
+#
+# A refused NIC, a missing ELF or a driver that exits before it parks
+# leaves the boot with no NIC owner: logged, and the boot goes on.
+
+import klog { klog, klog_dec }
+import serial { StrView }
+import ritzlib.option
+import ritzlib.result { Result }
+import mm.shm { shm_create, shm_page }
+import mm.vmm { phys_to_virt }
+import cap.types { CapHandle, CAP_TYPE_IRQ, CAP_TYPE_MMIO, CAP_TYPE_SHM, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_PUBLISH }
+import cap.table { cap_kernel_grant }
+import proc.table { Proc, MAX_PROCS, PROC_BLOCKED, BLOCK_WAIT, proc_at, proc_current, proc_current_slot }
+import proc.sched { sched_is_running, sched_start, sched_yield }
+import proc.waitset { irq_object_register, irq_object_bind_domain }
+import net.ring { SeatOpen, ring_seat_open, ring_seat_object }
+import syscall.runtime.net { net_link_register, ring_driver_published }
+import syscall.runtime.driver { drv_device_bind }
+import syscall.runtime.process { process_create_init, process_spawn_program, process_mark_exit }
+import drivers.virtio.net { NicGrant, virtio_net_ring1_probe }
+import drivers.virtio.window { VioWindow, vio_window_find }
+import syscall.stack { kstack_top }
+import driver_abi.boot { DriverBoot, DriverWindow, DRIVER_BOOT_MAGIC, DRIVER_BOOT_WINDOWS, driver_boot_at }
+
+# The driver's MSI-X table indexes: config changes, the RX and TX queues
+# (virtio_net_ring1_probe aims all three at the grant's vector).
+const MSIX_CONFIG: u16 = 0
+const MSIX_RX: u16 = 1
+const MSIX_TX: u16 = 2
+const MSIX_ENTRIES: u32 = 3
+
+# The NIC's IRQ object: above every id a boot test uses, one per requester.
+const NIC_IRQ_OBJECT_BASE: u64 = 1 << 40
+
+# How many times pid 1 yields for the driver's first park (step 3). One is
+# enough when the driver parks; it yields back only on DrvIrqWait's Again.
+# Run body() on the kernel stack whose top is `top` (proc_switch.s).
+extern fn kstack_call(body: u64, top: u64)
+
+const FIRST_PARK_YIELDS: i32 = 16
+
+# The probe's grant, from net_ring1_prepare to net_ring1_spawn (which runs
+# on another stack, through kstack_call, so takes no arguments).
+var ring1_grant: NicGrant
+var ring1_probed: bool = false
+var ring1_pid: u64 = 0
+
+# Step 1, then the rest of the boot, `tail` (which starts with
+# net_ring1_spawn, and never returns). When the NIC went to the ring-1
+# driver, pid 1 exists and `tail` runs on pid 1's own kernel stack: the
+# spawn switches to the driver's page table, which lacks the boot stack.
+# On any other boot `tail` runs on the boot stack, as before.
+pub fn net_ring1_boot(tail: fn())
+    if net_ring1_prepare()
+        kstack_call(tail as u64, kstack_top(proc_current_slot()))
+    else
+        tail()
+
+# Step 1. True when the NIC was handed to the ring-1 driver: pid 1 exists
+# (process_create_init).
+fn net_ring1_prepare() -> bool
+    match virtio_net_ring1_probe()
+        Some(g) =>
+            ring1_grant = g
+            ring1_probed = true
+        None => return false
+    process_create_init()
+    proc_current() != 0 as *Proc
+
+# The pid of the ring-1 driver, 0 before or without one.
+pub fn net_ring1_pid() -> u64
+    ring1_pid
+
+fn packed(h: CapHandle) -> u64
+    let index: u32 = h.index
+    let generation: u32 = h.generation
+    (index as u64) | ((generation as u64) << 32)
+
+fn granted(h: CapHandle) -> bool
+    let index: u32 = h.index
+    index != 0xFFFFFFFF
+
+fn ring1_fail(why: StrView) -> bool
+    klog("[net-ring1] ")
+    klog(why)
+    klog(": the NIC has no owner on this boot\n")
+    false
+
+# The device as an IRQ object: latched by the grant's vector, its runs
+# mapped in its private domain, and recorded for driver_quiesce (its
+# device_status and MSI-X table through the kernel's own mappings).
+fn ring1_device_object(g: NicGrant) -> Option<u64>
+    let obj: u64 = NIC_IRQ_OBJECT_BASE | g.sid as u64
+    if not irq_object_register(obj, g.vector)
+        return None
+    if not irq_object_bind_domain(obj, g.dom)
+        return None
+    if not drv_device_bind(obj, g.status_va, g.msix_table_va, MSIX_ENTRIES)
+        return None
+    Some(obj)
+
+# Step 2's grants to `pid`, a child that has not run, and its boot record.
+fn ring1_grant_to(pid: u64, obj: u64, g: NicGrant) -> bool
+    # The frame object first: the driver's first shared mapping, so it sits
+    # at DRV_RING_BASE; pid 1 maps it too and is the seat.
+    let frame: u64 = match ring_seat_open(pid)
+        SeatOpen.Opened(h) => h
+        _ => return ring1_fail("the frame object was not made")
+    let frame_obj: u64 = ring_seat_object().unwrap_or(0)
+    let irq: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_IRQ, CAP_RIGHT_READ, obj)
+    if not granted(irq)
+        return ring1_fail("the IRQ capability was not granted")
+    # The link page: only the driver maps it; NetPublish samples it.
+    let link_obj: u64 = match shm_create(1)
+        Some(id) => id
+        None => return ring1_fail("no link page")
+    let link: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_SHM, CAP_RIGHT_READ | CAP_RIGHT_WRITE | CAP_RIGHT_PUBLISH, link_obj)
+    if not granted(link)
+        return ring1_fail("the link page was not granted")
+    net_link_register(link_obj)
+    var boot: DriverBoot
+    boot.magic = DRIVER_BOOT_MAGIC
+    boot.window_count = 0
+    boot.irq = packed(irq)
+    boot.frame = frame
+    boot.link = packed(link)
+    boot.msix_config = MSIX_CONFIG
+    boot.msix_rx = MSIX_RX
+    boot.msix_tx = MSIX_TX
+    boot._pad = 0
+    var i: u32 = 0
+    while i < g.window_count and i < DRIVER_BOOT_WINDOWS
+        let w: VioWindow = match vio_window_find(g.window_ids[i])
+            Some(x) => x
+            None => return ring1_fail("a recorded window is gone")
+        let h: CapHandle = cap_kernel_grant(pid as u32, CAP_TYPE_MMIO, CAP_RIGHT_READ | CAP_RIGHT_WRITE, w.id)
+        if not granted(h)
+            return ring1_fail("an MMIO window was not granted")
+        boot.windows[i] = DriverWindow { handle: packed(h), offset: w.offset as u32, length: w.length as u32, notify_multiplier: w.notify_multiplier, cfg_type: g.window_types[i], _pad: [0, 0, 0] }
+        boot.window_count = i + 1
+        i = i + 1
+    # Written through the physmap before the driver runs; the driver copies
+    # it once and checks it, and the kernel trusts none of it.
+    *driver_boot_at(phys_to_virt(shm_page(frame_obj, 0))) = boot
+    true
+
+# `pid` is parked on its own wait set (DrvIrqWait).
+fn ring1_parked(pid: u64) -> bool
+    var i: i32 = 0
+    while i < MAX_PROCS
+        let p: *Proc = proc_at(i)
+        if p.pid == pid
+            return p.state == PROC_BLOCKED and p.block == BLOCK_WAIT
+        i = i + 1
+    false
+
+# Steps 2-4, as pid 1 on its own kernel stack (kstack_call), the scheduler
+# stopped. Logs "[net-ring1] /bin/virtio-net pid P parked: generation 2
+# published" when the driver is the NIC's owner.
+pub fn net_ring1_spawn()
+    if not ring1_probed or ring1_pid != 0 or sched_is_running()
+        return
+    let g: NicGrant = ring1_grant
+    let obj: u64 = match ring1_device_object(g)
+        Some(id) => id
+        None =>
+            ring1_fail("the device's IRQ object was not made")
+            return
+    let pid: u64 = match process_spawn_program("/bin/virtio-net")
+        Result.Ok(p) => p
+        Result.Err(e) =>
+            klog("[net-ring1] /bin/virtio-net was not spawned (errno ")
+            klog_dec(e as i64)
+            klog("): the NIC has no owner on this boot\n")
+            return
+    if not ring1_grant_to(pid, obj, g)
+        # It exits on its way to user mode (reap_if_marked); the seat and
+        # every grant go with it.
+        process_mark_exit(pid)
+        sched_yield()
+        return
+    ring1_pid = pid
+    # Step 3: the driver runs, uninterrupted, until its first park.
+    var yields: i32 = 0
+    while not ring1_parked(pid) and yields < FIRST_PARK_YIELDS
+        sched_yield()
+        yields = yields + 1
+    # Step 4: the tick from now on; run_init does not start it again.
+    sched_start(proc_current_slot())
+    if ring1_parked(pid) and ring_driver_published()
+        klog("[net-ring1] /bin/virtio-net pid ")
+        klog_dec(pid as i64)
+        klog(" parked: generation 2 published\n")
+    else
+        klog("[net-ring1] /bin/virtio-net pid ")
+        klog_dec(pid as i64)
+        klog(" did not park with its link published: the NIC has no owner on this boot\n")

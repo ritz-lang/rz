@@ -189,6 +189,8 @@ extern fn jump_to_userspace(entry: u64, stack: u64)
 import syscall.runtime.entry { syscall_init, syscall_register_smp_test }
 import syscall.runtime.memory { alloc_user_stack }
 import syscall.runtime.process { process_enter_init }
+import proc.table { Proc, proc_current }
+import net.ring1 { net_ring1_boot, net_ring1_spawn }
 
 # Run /bin/init from the filesystem as PID 1
 # This is the actual init process that runs tests and triggers shutdown.
@@ -237,8 +239,12 @@ fn run_init() -> i32
 
     klog("[init] Starting init process...\n\n")
 
-    # Set up as init process (PID 1), with its own fd table (#2753)
-    process_enter_init()
+    # Set up as init process (PID 1), with its own fd table (#2753). On a
+    # ring-1 boot pid 1 already exists, the virtio-net driver beside it,
+    # and the scheduler runs (net/ring1.ritz): no table reset, which would
+    # free the driver's slot, and no second sched_start (AGAST #4735).
+    if proc_current() == 0 as *Proc
+        process_enter_init()
 
     # Jump to userspace - this will not return until init exits
     jump_to_userspace(load_result.entry_point, user_stack_top)
@@ -547,10 +553,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     ring_clear()
     print_banner()
     detect_boot_protocol(boot_info_addr)
-    # Boot options (AGAST #4335, #1851, #1885, #1887): the NIC self-tests and
-    # the peer-ping window, the ring dump before init, and boot-test mode.
-    let run_net_selftests: bool = boot_option(HARLAND_BOOT_FLAG_NET_SELFTEST)
-    let run_net_responder: bool = boot_option(HARLAND_BOOT_FLAG_NET_RESPONDER)
+    # Boot-test mode (AGAST #1887); kernel_tail reads the rest.
     let boot_test: bool = boot_option(HARLAND_BOOT_FLAG_BOOT_TEST)
 
     klog("\nInitialization:\n")
@@ -581,6 +584,22 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     if boot_test
         boot_process_tests()
 
+    # A boot that translates DMA hands a virtio-net to the ring-1 driver
+    # (AGAST #4735, RING1_DRIVER.md section 9): the probe and pid 1, then
+    # kernel_tail, on pid 1's kernel stack when pid 1 was made.
+    net_ring1_boot(kernel_tail)
+    return 0
+
+# The rest of the boot: the ring-1 driver's spawn (steps 2-4, a no-op on
+# any other boot), the diagnostics and init. Never returns. Run through
+# net_ring1_boot, so it takes no arguments.
+fn kernel_tail()
+    net_ring1_spawn()
+
+    # Boot options (AGAST #4335, #1851, #1885): the NIC self-tests and the
+    # peer-ping window, and the ring dump before init.
+    let run_net_selftests: bool = boot_option(HARLAND_BOOT_FLAG_NET_SELFTEST)
+    let run_net_responder: bool = boot_option(HARLAND_BOOT_FLAG_NET_RESPONDER)
     # PCI listing, MSI-X checks and the opt-in network self-tests
     postinit_diagnostics(run_net_selftests, run_net_responder)
     if boot_option(HARLAND_BOOT_FLAG_KLOG_DUMP)
@@ -591,4 +610,3 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     if run_init() != 0
         klog("[kernel] Failed to run init!\n")
     halt_loop()
-    return 0

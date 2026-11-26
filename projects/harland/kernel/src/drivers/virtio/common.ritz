@@ -59,6 +59,10 @@ const VIRTIO_PCI_CONFIG_MSIX: u16 = 24
 # when it can't take the vector it was given.
 pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF
 
+# How many recorded windows a VirtioDevice keeps the ids of: the length of
+# window_ids, and driver_abi.boot DRIVER_BOOT_WINDOWS.
+pub const VIO_WINDOW_NOTES: u32 = 8
+
 # ============================================================================
 # VirtIO PCI Capability Types (Modern MMIO transport)
 # ============================================================================
@@ -125,6 +129,12 @@ pub struct VirtioDevice
     mmio_isr: u64           # ISR status MMIO base
     mmio_device: u64        # Device-specific MMIO base
     notify_multiplier: u32  # Notify offset multiplier
+    # The CAP_TYPE_MMIO window each modern capability was recorded as
+    # (vio_note_window), with its cfg_type: what the ring-1 cutover grants
+    # the driver (AGAST #4735). window_count of VIO_WINDOW_NOTES.
+    window_ids: [8]u64
+    window_types: [8]u8
+    window_count: u32
 
 # kalloc sizes
 
@@ -490,6 +500,7 @@ fn vio_init(pci_dev: *PciDevice, bus_master: bool) -> *VirtioDevice
     (*dev).msix_on = 0
     (*dev).version_1 = 0
     (*dev).access_platform = false
+    (*dev).window_count = 0
 
     # Try legacy I/O transport first (BAR0 as I/O space)
     if (*pci_dev).bar_is_io[0] != 0
@@ -578,7 +589,7 @@ fn vio_common_range(pci_dev: *PciDevice) -> PhysRange
 # a page holding its queue-address registers only to a device in a
 # private DMA domain (AGAST #4724). The kernel's own mapping above is
 # unaffected; a full record table only means that window can't be granted.
-fn vio_note_window(pci_dev: *PciDevice, cap_ptr: u8, cap_type: u8, phys: u64, length: u64)
+fn vio_note_window(dev: *VirtioDevice, pci_dev: *PciDevice, cap_ptr: u8, cap_type: u8, phys: u64, length: u64)
     var notify: u32 = 0
     if cap_type == VIRTIO_PCI_CAP_NOTIFY_CFG
         notify = pci_dev_read_config32(pci_dev, cap_ptr + VIRTIO_PCI_CAP_NOTIFY_MULT)
@@ -589,8 +600,14 @@ fn vio_note_window(pci_dev: *PciDevice, cap_ptr: u8, cap_type: u8, phys: u64, le
         let entries: u64 = ((pci_dev_read_config16(pci_dev, msix + MSIX_CAP_CONTROL) & 0x7FF) as u64) + 1
         table = msix_register_range(pci_dev, msix + MSIX_CAP_TABLE, entries * MSIX_ENTRY_BYTES)
         pba = msix_register_range(pci_dev, msix + MSIX_CAP_PBA, (entries + 63) / 64 * 8)
-    if vio_window_add(phys, length, notify, table, pba, vio_common_range(pci_dev), pci_dev_sid(pci_dev)).is_none()
-        klog("[virtio] window table full: this window can't be granted\n")
+    match vio_window_add(phys, length, notify, table, pba, vio_common_range(pci_dev), pci_dev_sid(pci_dev))
+        Some(id) =>
+            let n: u32 = (*dev).window_count
+            if n < VIO_WINDOW_NOTES
+                (*dev).window_ids[n] = id
+                (*dev).window_types[n] = cap_type
+                (*dev).window_count = n + 1
+        None => klog("[virtio] window table full: this window can't be granted\n")
 
 # Find the virtio modern PCI capabilities (virtio 1.x §4.1.4) and map the
 # BAR regions they describe through the kernel MMIO window (vmm_map_mmio).
@@ -627,7 +644,7 @@ fn vio_find_mmio_caps(dev: *VirtioDevice, pci_dev: *PciDevice) -> i32
         let mapped: u64 = vmm_map_mmio((*pci_dev).bar[bar as i32] + (offset as u64), length as u64)
         if mapped == 0
             return -1
-        vio_note_window(pci_dev, cap_ptr, cap_type, (*pci_dev).bar[bar as i32] + (offset as u64), length as u64)
+        vio_note_window(dev, pci_dev, cap_ptr, cap_type, (*pci_dev).bar[bar as i32] + (offset as u64), length as u64)
 
         if cap_type == VIRTIO_PCI_CAP_COMMON_CFG and not found_common
             (*dev).mmio_common = mapped

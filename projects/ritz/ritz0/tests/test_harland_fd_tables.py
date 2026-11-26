@@ -694,7 +694,9 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
     begin = _fn(PROCESS, "spawn_child_begin")
     start = begin.index("fs_process_start(child_pid)")
     assert start < begin.index("fs_process_select(parent_pid)") < begin.index("vmm_create_user_pml4()")
-    assert body.index("spawn_child_begin(parent_pid, true)") < body.index("vmm_switch_pml4(child_pml4)")
+    # (a sys_spawn child inherits the parent's ambient capabilities; the
+    # kernel's process_spawn_program passes false, #4735)
+    assert body.index("spawn_child_begin(parent_pid, inherit_caps)") < body.index("vmm_switch_pml4(child_pml4)")
     # every later failure path gives it back: spawn_undo ends the child's table
     fails = re.findall(r"vmm_switch_pml4\(parent_pml4\)\n(\s+)(\S.*)\n", body)
     fail_lines = [line for _, line in fails]

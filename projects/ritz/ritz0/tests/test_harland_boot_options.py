@@ -138,7 +138,8 @@ def test_loader_reads_the_net_responder_marker():
 
 
 def test_kernel_hands_the_responder_option_to_postinit():
-    body = _fn_body(_code(MAIN), "kernel_main")
+    # kernel_tail: the boot after the ring-1 cutover's steps (#4735)
+    body = _fn_body(_code(MAIN), "kernel_tail")
     assert "let run_net_responder: bool = boot_option(HARLAND_BOOT_FLAG_NET_RESPONDER)" in body
     assert "postinit_diagnostics(run_net_selftests, run_net_responder)" in body
 
@@ -172,7 +173,7 @@ def test_kernel_reads_flags_only_from_a_v3_boot_info():
         detect), detect
     assert "boot_flags = mb2_cmdline_flags(boot_info_addr)" in detect
     assert re.search(r"^var boot_flags: u32 = 0$", code, re.M)
-    body = _fn_body(code, "kernel_main")
+    body = _fn_body(code, "kernel_tail")
     assert "let run_net_selftests: bool = boot_option(HARLAND_BOOT_FLAG_NET_SELFTEST)" in body
     assert "postinit_diagnostics(run_net_selftests, run_net_responder)" in body
 

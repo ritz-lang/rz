@@ -240,8 +240,10 @@ def test_main_imports_what_it_calls():
 def test_kernel_main_keeps_the_boot_order():
     """Self-tests (boot-test mode only, #1887), the success banner, SYSCALL
     setup, the process tests (boot-test mode only, #4712), diagnostics, the opt-in ring dump (#1885), then init: the same
-    serial order as before the move."""
-    body = _body(_code(MAIN), "kernel_main")
+    serial order as before the move. Since the ring-1 cutover (#4735) the
+    steps from the diagnostics on are kernel_tail's, which kernel_main runs
+    on pid 1's kernel stack when the cutover made pid 1."""
+    body = _body(_code(MAIN), "kernel_main") + _body(_code(MAIN), "kernel_tail")
     assert re.search(r"^    if boot_test\n        boot_self_tests\(\)$", body, re.M), body
     assert re.search(r"^    if boot_test\n        boot_process_tests\(\)$", body, re.M), body
     # \b: fs_syscall_init() runs earlier and must not match syscall_init().
@@ -251,6 +253,9 @@ def test_kernel_main_keeps_the_boot_order():
         r"\bsyscall_init\(\)",
         # #4712: the boot-test process phase needs SYSCALL set up.
         r"\bboot_process_tests\(\)",
+        # #4735: the probe and pid 1, then the spawn on pid 1's stack
+        r"\bnet_ring1_boot\(kernel_tail\)",
+        r"\bnet_ring1_spawn\(\)",
         r"\bpostinit_diagnostics\(run_net_selftests, run_net_responder\)",
         # #1885: the opt-in ring dump shows the whole boot log before init runs.
         r"\bring_dump\(\)",

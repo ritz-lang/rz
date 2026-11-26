@@ -56,9 +56,10 @@
 #     data: D" has N > 0, W > 0 and D = same: with interrupts on, disk reads
 #     slept on the disk's vector and returned what polled reads did (H is
 #     only logged: QEMU often completes a request before its wait checks);
-#   - "[msix] virtio-net rx waits: W, halted: H" has W > 0 and H > 0: the
-#     DHCP window slept on the NIC's RX vector between polls instead of
-#     spinning a fixed delay (AGAST #3631);
+#   - on the pc run (the in-kernel owner), "[msix] virtio-net rx waits: W,
+#     halted: H" has W > 0 and H > 0: the DHCP window slept on the NIC's RX
+#     vector between polls instead of spinning a fixed delay (AGAST #3631);
+#     the vtd run's owner parks instead (below);
 #   - the kernel took no exception, and init's Tier-1 suite still reports
 #     ALL TESTS PASSED with the NIC and NVMe attached.
 #
@@ -74,7 +75,7 @@
 #     virtio-net negotiates VIRTIO_F_ACCESS_PLATFORM, bit 33 ("[virtio-net]
 #     VIRTIO_F_ACCESS_PLATFORM negotiated"). Every storage, NVMe and NIC
 #     check above must still pass with translation on: the disks and the
-#     NIC were bus-mastering through identity contexts, halted > 0 included.
+#     NIC were bus-mastering through identity contexts.
 #   - the NIC's private DMA domain (AGAST #4724), on the vtd run only: TE
 #     comes on with the NIC's requester held out of the identity domain
 #     ("1 requester(s) held"), the NIC gets its own domain before its bus
@@ -83,9 +84,31 @@
 #     probe: the NIC's DMA to unmapped IOVA ... faulted with its source ID
 #     SID", and the unit's record for it), a received frame lands in a
 #     granted IOVA of domain D above every RAM address ("device DMA"), and
-#     net_ring1_allowed holds ("ring-1 owner allowed"). Every NIC check
-#     above then passed with the in-kernel driver on IOVAs. The pc run must
-#     give the NIC no domain and refuse a ring-1 owner.
+#     net_ring1_allowed holds ("ring-1 owner allowed ... the owner is
+#     /bin/virtio-net"). The pc run must give the NIC no domain and refuse
+#     a ring-1 owner.
+#
+# The cutover (AGAST #4735, docs/RING1_DRIVER.md sections 8-9): the vtd
+# boot translates DMA, so the NIC is owned by the ring-1 driver
+# /bin/virtio-net, not by virtio_net_init. The kernel probe isolates the
+# NIC (its domain and fault probe, above) and programs MSI-X at the BSP
+# but sets up no virtqueue; the driver negotiates bit 33, caps the RX
+# queue, allocates its rings and pools with DrvDmaAlloc and parks in
+# DrvIrqWait. So on the vtd run:
+#   - the kernel spawned it and it parked with generation 2 published
+#     ("[net-ring1] /bin/virtio-net pid P parked: generation 2 published")
+#     and the driver logged its own banner ("[virtio-net] up: MAC
+#     published"), and the in-kernel driver's banners ("[netdev]
+#     Registered VirtIO-net device", "[virtio-net] Initialization
+#     complete!") are absent: one owner per boot, never both;
+#   - DHCP, the TX burst and the MSI-X interrupt count hold through it;
+#   - the driver parked: "[msix] virtio-net driver parks: P" has P > 0
+#     instead of the in-kernel RX waits' halted > 0 (a park is not a hlt);
+#   - the frame it received landed in a run DrvDmaAlloc mapped in the NIC's
+#     private domain ("[nic-dma] DrvDmaAlloc: pid P, N page(s) at IOVA
+#     0xI in domain D", and the driver's "[virtio-net] device DMA: B bytes
+#     received into granted IOVA I" inside one of them).
+# The pc run keeps the in-kernel driver and every check it had.
 #
 # The NIC uses QEMU's user-mode network (slirp): its built-in DHCP server
 # answers inside QEMU, so this needs no root and no host network.
@@ -113,8 +136,6 @@ HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECTS_DIR="$(dirname "$HARLAND_DIR")"
 ROOT_DIR="$(dirname "$PROJECTS_DIR")"
 TIMEOUT="${BOOT_TIMEOUT:-120}"
-# Same packages as test_tier1_boot.sh: init's suite spawns all of them.
-USER_PKGS="indium rzsh prism"
 
 EXIT_SETUP=3
 setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
@@ -134,6 +155,12 @@ OVMF_VARS=""
 for p in "${OVMF_CODE/CODE/VARS}" /usr/share/OVMF/OVMF_VARS_4M.fd /usr/share/OVMF/OVMF_VARS.fd; do
     if [ -f "$p" ]; then OVMF_VARS="$p"; break; fi
 done
+
+# Same packages as test_tier1_boot.sh, from the one list: init's suite
+# spawns them, and harland/system builds /bin/virtio-net, the vtd boot's
+# NIC owner (AGAST #4735).
+USER_PKGS="$(sed -e 's/#.*//' "$PROJECTS_DIR/indium/initramfs.pkgs" | xargs)"
+[ -n "$USER_PKGS" ] || { echo "FAIL: no packages in $PROJECTS_DIR/indium/initramfs.pkgs"; exit 1; }
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     for pkg in harland $USER_PKGS; do
@@ -258,28 +285,81 @@ nic_dma_checks() {
     else
         echo "PASS: the NIC's DMA to unmapped IOVA 0x$hole faulted with its source ID $sid"
     fi
-    dma=$(grep -aoE "\[nic-dma\] device DMA: [0-9]+ bytes received into granted IOVA 0x[0-9A-Fa-f]+ -> physical 0x[0-9A-Fa-f]+ in domain [0-9]+" "$SERIAL" | head -1)
-    iova=$(echo "$dma" | sed -nE 's/.*granted IOVA 0x([0-9A-Fa-f]+) .*/\1/p')
-    ddom=$(echo "$dma" | sed -nE 's/.*in domain ([0-9]+)$/\1/p')
+    # The frame the driver received (decimal IOVA) inside a run DrvDmaAlloc
+    # mapped in the NIC's domain for it (hex IOVA, pages).
+    dma=$(grep -aoE "\[virtio-net\] device DMA: [0-9]+ bytes received into granted IOVA [0-9]+" "$SERIAL" | head -1)
+    iova=$(echo "$dma" | sed -nE 's/.*granted IOVA ([0-9]+)$/\1/p')
     if [ -z "$dma" ]; then
-        grep -a "\[nic-dma\] device DMA" "$SERIAL" | head -3
+        grep -a "device DMA" "$SERIAL" | head -3
         echo "FAIL: no device DMA into a granted page of the NIC's domain"
         rc=1
-    elif [ "$ddom" != "$dom" ]; then
-        echo "FAIL: the NIC's DMA went through domain $ddom, not its private domain $dom"
-        rc=1
-    elif [ $((16#$iova)) -lt $((16#1000000000)) ]; then
-        echo "FAIL: the NIC was given IOVA 0x$iova, below the private IOVA base 0x1000000000 (a RAM address)"
+    elif [ "$iova" -lt $((16#1000000000)) ]; then
+        echo "FAIL: the NIC was given IOVA $(printf '0x%X' "$iova"), below the private IOVA base 0x1000000000 (a RAM address)"
         rc=1
     else
-        echo "PASS: the NIC DMA'd a frame into granted IOVA 0x$iova (domain $dom), above every RAM address"
+        local run base pages rdom inside="" other=""
+        while read -r run; do
+            base=$(echo "$run" | sed -nE 's/.* at IOVA 0x([0-9A-Fa-f]+) in domain.*/\1/p')
+            pages=$(echo "$run" | sed -nE 's/.*, ([0-9]+) page\(s\) at IOVA.*/\1/p')
+            rdom=$(echo "$run" | sed -nE 's/.*in domain ([0-9]+)$/\1/p')
+            [ -n "$base" ] && [ -n "$pages" ] || continue
+            if [ "$iova" -ge $((16#$base)) ] && [ "$iova" -lt $((16#$base + pages * 4096)) ]; then
+                if [ "$rdom" = "$dom" ]; then inside="$base"; else other="$rdom"; fi
+            fi
+        done < <(grep -aoE "\[nic-dma\] DrvDmaAlloc: pid [0-9]+, [0-9]+ page\(s\) at IOVA 0x[0-9A-Fa-f]+ in domain [0-9]+" "$SERIAL")
+        if [ -n "$inside" ]; then
+            echo "PASS: the NIC DMA'd a frame into granted IOVA $(printf '0x%X' "$iova") (domain $dom, the driver's DrvDmaAlloc run at 0x$inside), above every RAM address"
+        elif [ -n "$other" ]; then
+            echo "FAIL: the NIC's DMA went through domain $other, not its private domain $dom"
+            rc=1
+        else
+            echo "FAIL: the NIC's DMA at IOVA $(printf '0x%X' "$iova") is in no run DrvDmaAlloc granted the driver"
+            rc=1
+        fi
     fi
-    if grep -aqF "[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), NIC isolated" "$SERIAL"; then
+    if grep -aqF "[nic-dma] ring-1 owner allowed: translation on, remapping on, compatibility format blocked (read from the unit), NIC isolated; the owner is /bin/virtio-net" "$SERIAL"; then
         echo "PASS: net_ring1_allowed: translation, remapping and blocked compatibility format read from the unit"
     else
         grep -a "\[nic-dma\] ring-1" "$SERIAL" | head -3
         echo "FAIL: net_ring1_allowed is false on the translating boot"
         rc=1
+    fi
+}
+
+# ring1_checks SERIAL: the ring-1 driver owns the NIC on the translating
+# boot, and the in-kernel driver does not (AGAST #4735); sets rc=1 on any
+# failure.
+ring1_checks() {
+    local SERIAL="$1" parks
+    if grep -aqE "\[net-ring1\] /bin/virtio-net pid [0-9]+ parked: generation 2 published" "$SERIAL"; then
+        echo "PASS: the kernel spawned /bin/virtio-net and it parked with generation 2 published"
+    else
+        grep -a "\[net-ring1\]" "$SERIAL" | head -3
+        echo "FAIL: /bin/virtio-net was not spawned, or did not park with generation 2 published"
+        rc=1
+    fi
+    if grep -aqF "[virtio-net] up: MAC published" "$SERIAL"; then
+        echo "PASS: the ring-1 driver brought the NIC up"
+    else
+        grep -a "\[virtio-net\]" "$SERIAL" | head -3
+        echo "FAIL: no \"[virtio-net] up: MAC published\" from the ring-1 driver"
+        rc=1
+    fi
+    if grep -aqE "\[netdev\] Registered VirtIO-net device|\[virtio-net\] Initialization complete!" "$SERIAL"; then
+        echo "FAIL: the in-kernel virtio-net driver ran beside the ring-1 driver: one owner per boot"
+        rc=1
+    else
+        echo "PASS: virtio_net_init did not run: the ring-1 driver is the NIC's only owner"
+    fi
+    parks=$(grep -aoE "\[msix\] virtio-net driver parks: [0-9]+" "$SERIAL" | tail -1 | sed -nE 's/.*parks: ([0-9]+)$/\1/p')
+    if [ -z "$parks" ]; then
+        echo "FAIL: no ring-1 driver park count logged ([msix] virtio-net driver parks: P)"
+        rc=1
+    elif [ "$parks" -eq 0 ]; then
+        echo "FAIL: the ring-1 driver never parked in DrvIrqWait: it spins"
+        rc=1
+    else
+        echo "PASS: the ring-1 driver parked $parks times in DrvIrqWait"
     fi
 }
 
@@ -443,22 +523,23 @@ check() {
         echo "FAIL: virtio-input did not come up in MSI-X mode"
         rc=1
     fi
-    nrx=$(grep -aoE "\[msix\] virtio-net rx waits: [0-9]+, halted: [0-9]+" "$SERIAL" | tail -1)
-    nrx_waits=$(echo "$nrx" | sed -nE 's/.*rx waits: ([0-9]+),.*/\1/p')
-    nrx_halts=$(echo "$nrx" | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
-    if [ -z "$nrx" ]; then
-        echo "FAIL: no virtio-net RX wait count logged ([msix] virtio-net rx waits: W, halted: H)"
-        rc=1
-    elif [ "$nrx_waits" -eq 0 ]; then
-        echo "FAIL: the DHCP window never waited on the RX vector: it busy-polls"
-        rc=1
-    elif [ "$nrx_halts" -eq 0 ]; then
-        echo "FAIL: virtio-net RX waits ($nrx_waits) never halted: they spin instead of sleeping"
-        rc=1
-    else
-        echo "PASS: virtio-net RX waited on its vector $nrx_waits times, halted $nrx_halts"
-    fi
     if [ "$name" = pc ]; then
+        # The in-kernel owner sleeps on the RX vector (AGAST #3631)
+        nrx=$(grep -aoE "\[msix\] virtio-net rx waits: [0-9]+, halted: [0-9]+" "$SERIAL" | tail -1)
+        nrx_waits=$(echo "$nrx" | sed -nE 's/.*rx waits: ([0-9]+),.*/\1/p')
+        nrx_halts=$(echo "$nrx" | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
+        if [ -z "$nrx" ]; then
+            echo "FAIL: no virtio-net RX wait count logged ([msix] virtio-net rx waits: W, halted: H)"
+            rc=1
+        elif [ "$nrx_waits" -eq 0 ]; then
+            echo "FAIL: the DHCP window never waited on the RX vector: it busy-polls"
+            rc=1
+        elif [ "$nrx_halts" -eq 0 ]; then
+            echo "FAIL: virtio-net RX waits ($nrx_waits) never halted: they spin instead of sleeping"
+            rc=1
+        else
+            echo "PASS: virtio-net RX waited on its vector $nrx_waits times, halted $nrx_halts"
+        fi
         # QEMU's pc machine has no MCFG: PCI stays on port I/O, segment 0 only
         # (AGAST #4582; tools/test_irq_dest_boot.sh boots q35 through ECAM).
         if grep -aqF "[pci] no MCFG: segment 0 only, port I/O" "$SERIAL"; then
@@ -509,6 +590,7 @@ check() {
             rc=1
         fi
         nic_dma_checks "$SERIAL"
+        ring1_checks "$SERIAL"
     fi
     if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
         echo "PASS: init Tier-1 suite: ALL TESTS PASSED"

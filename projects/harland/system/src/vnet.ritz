@@ -246,9 +246,14 @@ pub struct RxDrain
     full: bool                       # stopped on a full RX ring: the element stays
     closed: Option<SpscClose>        # the RX ring is unusable
     kick: bool                       # a buffer was reposted: notify the RX queue
+    # The first frame published by this drain: the IOVA of the RX buffer
+    # the device wrote it to, and its length (0 for none). The driver logs
+    # the first one it ever sees, as evidence of DMA into a granted page.
+    first_iova: u64
+    first_len: u32
 
 fn rx_drain_none() -> RxDrain
-    RxDrain { published: 0, dropped: 0, full: false, closed: None, kick: false }
+    RxDrain { published: 0, dropped: 0, full: false, closed: None, kick: false, first_iova: 0, first_len: 0 }
 
 # Move every completed RX buffer to the frame ring, header stripped, and
 # repost it. On a full ring the used element is not taken (vq_peek_used):
@@ -279,7 +284,11 @@ pub fn rx_drain(q: *NetQueues, seat: @&FrameSeat) -> RxDrain
             match rx_frame(pool_buf(q.rx_pool, b), elem.len, q.hdr)
                 Ok(frame) =>
                     match seat.rx.publish(frame)
-                        Publish.Done => out.published = out.published + 1
+                        Publish.Done =>
+                            if out.published == 0
+                                out.first_iova = pool_buf_iova(q.rx_pool, b)
+                                out.first_len = frame.len() as u32
+                            out.published = out.published + 1
                         Publish.Full =>
                             out.full = true
                             return out
