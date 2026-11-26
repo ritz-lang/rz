@@ -33,6 +33,24 @@ fn resolve_member_field(mono: *MonoCtx, m: *Module, e: *Expr) -> *StructField
             if idx >= 0
                 sname = *(mono.lv_type_names + idx)
                 sname_len = *(mono.lv_type_name_lens + idx)
+            else
+                # AGAST #4778: a global, `g_conns.ids` with `var g_conns:
+                # *Conns`.  Untyped, `g_conns.ids.get(0)` wanted `get` at
+                # every Vec instance, move-only ones too.
+                let g: *GlobalVarDef = si_global(m, StrView { ptr: (e.left.ident_ptr), len: (e.left.ident_len) as i64 })
+                if g != null and g.type_name != null
+                    sname = g.type_name
+                    sname_len = g.type_name_len
+                else if g != null and g.pointee_type_name != null
+                    sname = g.pointee_type_name
+                    sname_len = g.pointee_type_name_len
+        # AGAST #4778: a field of a call's or a method's result,
+        # `h.item(0).next` with `item` returning `@T` at Holder$Node.
+        ExprKind.Call | ExprKind.Method =>
+            let rsv: StrView = receiver_instance(mono, m, e.left)
+            if rsv.ptr != null and rsv.len > 0
+                sname = rsv.ptr
+                sname_len = rsv.len as i32
         ExprKind.Member =>
             let parent: *StructField = resolve_member_field(mono, m, e.left)
             if parent != null
@@ -551,6 +569,14 @@ fn collect_from_stmt(mono: *MonoCtx, m: *Module, s: *Stmt)
             if s.var_init != null
                 collect_from_expr(mono, m, s.var_init)
         StmtKind.Assign =>
+            # AGAST #4778: an expression target names what it reaches too:
+            # `h.at(0).b = 9` wants `at`, which nothing else here asks for
+            # unless the program also reads `h.at(..)`.  A compound target is
+            # the value's left, walked with it.
+            if s.assign_target_len == 0 and s.if_cond != null
+                let tv: *Expr = s.assign_value
+                if tv == null or tv.kind != ExprKind.Binary or tv.left != s.if_cond
+                    collect_from_expr(mono, m, s.if_cond)
             collect_from_expr(mono, m, s.assign_value)
         StmtKind.MemberAssign =>
             # ptr.field = value - walk the value expression
@@ -2977,6 +3003,10 @@ fn clone_struct_fields(mono: *MonoCtx, fields: *StructField, type_param_sv: StrV
     cloned.field_ref_ptr_pointee = TypeKind.Void
     if ref_field_scalar_pointee(fields) == 1
         cloned.field_ref_ptr_pointee = fields.field_ref_ptr_pointee
+    # AGAST #4778: `make: fn() -> T` of `Maker<i64>` is `fn() -> i64`.
+    # Shared as it stood, `Maker<i64> { make: seven }` was refused.
+    cloned.fn_sig = clone_fn_sig(mono, fields.fn_sig, type_param_sv, subst_type, subst_name_sv, suffix_sv)
+    cloned.elem_fn_sig = clone_fn_sig(mono, fields.elem_fn_sig, type_param_sv, subst_type, subst_name_sv, suffix_sv)
 
     # Check if field type is the type parameter
     if fields.field_type == TypeKind.Struct
@@ -3084,6 +3114,21 @@ fn clone_struct_fields_multi(mono: *MonoCtx, fields: *StructField, tp: *TypePara
     cloned.field_ref_ptr_pointee = TypeKind.Void
     if ref_field_scalar_pointee(fields) == 1
         cloned.field_ref_ptr_pointee = fields.field_ref_ptr_pointee
+    # AGAST #4778: `conv: fn(A) -> B`, each parameter in turn.
+    var p: *TypeParam = tp
+    var pi: i32 = 0
+    while p != null
+        let p_arg: StrView = StrView { ptr: (suffix + *(starts + pi)), len: (*(lens + pi)) as i64 }
+        var p_name: *u8 = null
+        var p_len: i32 = 0
+        get_type_name_from_suffix(p_arg, @p_name, @p_len)
+        let p_sv: StrView = StrView { ptr: (p.name), len: (p.name_len) as i64 }
+        let p_ty: TypeKind = parse_type_from_suffix(p_arg)
+        let p_sub: StrView = StrView { ptr: (p_name), len: (p_len) as i64 }
+        cloned.fn_sig = clone_fn_sig(mono, cloned.fn_sig, p_sv, p_ty, p_sub, p_arg)
+        cloned.elem_fn_sig = clone_fn_sig(mono, cloned.elem_fn_sig, p_sv, p_ty, p_sub, p_arg)
+        p = p.next
+        pi = pi + 1
 
     let ft: TypeKind = fields.field_type
     var by_value: i32 = 0
