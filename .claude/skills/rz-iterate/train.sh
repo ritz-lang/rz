@@ -60,6 +60,32 @@
 #                                       SKIP a room mid-gate, and one REBASE
 #                                       line for a room to move (see the
 #                                       function comment)
+#   train.sh hold-tail <sha>            push <sha> to origin
+#                                       refs/heads/rz-train/<sha12> (fail may
+#                                       have deleted a red tail's ref: this
+#                                       re-publishes it for a fix-forward
+#                                       room) and record it in RZ_HELD_TAILS
+#                                       (main worktree's git dir) so `land`
+#                                       deletes it once it is subsumed
+#                                       (AGAST #4753)
+#   train.sh hold-resolve <room> <sha>  push <sha> to origin
+#                                       refs/heads/rz-resolve/<room>-<sha12>
+#                                       and record it in RZ_HELD_RESOLVES the
+#                                       same way, for a conflict resolution
+#                                       boarded in a car's place (SKILL.md
+#                                       step 7; AGAST #4753)
+#   train.sh prune-refs [--dry-run]     delete every rz-train/* or
+#                                       rz-resolve/* ref on origin that no
+#                                       live train or held tail/resolve
+#                                       names, and that is either fully on
+#                                       main (git cherry: no unmerged patch)
+#                                       or older than RZ_PRUNE_DAYS days
+#                                       (default 2); --dry-run prints what it
+#                                       would delete without deleting it
+#                                       (AGAST #4753).  rz runs this after
+#                                       landing; never against a live train's
+#                                       ref, and never from a test against
+#                                       origin's real refs.
 #
 # Stacked trains (AGAST #3809): a train holds at most 8 cars (RZ_TRAIN_MAX);
 # car 9 onward start the next train on its tail.  Each train has its own
@@ -194,6 +220,20 @@
 # cherry-picking it.  A tail ref is deleted when its train lands (a pass
 # covers it), is replaced by a build, or fails/discards it; publish_tail is
 # idempotent, so `gate --next` re-ensuring the target's ref costs one push.
+#
+# Held tails and resolves (AGAST #4753): `fail` deletes a red train's tail
+# (unpublish_tail), but rz re-publishes it by hand for a fix-forward room
+# (SKILL.md step 6.3: `hold-tail`), and a conflict resolution is pushed to
+# its own rz-resolve/<room>-<sha12> ref (step 7: `hold-resolve`).  Neither is
+# named by any train's state once that happens, so nothing landing or
+# failing would otherwise delete them.  `hold-tail`/`hold-resolve` record
+# them in RZ_HELD_TAILS/RZ_HELD_RESOLVES (main worktree's git dir); `land`
+# deletes every held ref whose SHA is now an ancestor of the landed tip (a
+# fix-forward or resolution always reboards into a later train, so a land
+# covering it also covers the tail or resolve it was pushed for).
+# `prune-refs` is the sweep for everything else that leaked: any rz-train/*
+# or rz-resolve/* ref no live train or held file names, deleted once it is
+# fully on main or RZ_PRUNE_DAYS days old (default 2).
 #
 # Dispatch (AGAST #4031, #4156; Aaron 2026-11-20; SKILL.md "Merge trains"):
 # `build` stamps each train it starts with BUILT=<epoch>, and each REAP is a
@@ -484,11 +524,145 @@ publish_tail() {
 # effort: an absent ref is not an error.  Call it before the state file goes.
 unpublish_tail() {
     local st tip
-    st="$(git -C "$(slot_wt "$1")" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)/RZ_TRAIN"
+    # RZ_TRAIN lives at the slot's own worktree administrative dir
+    # (state()'s --absolute-git-dir, as conflict_with() also reads it), never
+    # the shared --git-common-dir: a worktree's are different directories,
+    # and --git-common-dir's RZ_TRAIN is never written, so reading it there
+    # always missed the file and this was a silent no-op (AGAST #4753: the
+    # root cause behind "a fail drops it" never actually deleting a train's
+    # tail ref).
+    st="$(git -C "$(slot_wt "$1")" rev-parse --absolute-git-dir 2>/dev/null || true)/RZ_TRAIN"
     [[ -f "$st" ]] || return 0
     tip="$(field TIP "$st")"
     [[ -n "$tip" ]] || return 0
     git -C "$MAIN_WT" push -q origin --delete "refs/heads/rz-train/${tip:0:12}" 2>/dev/null || true
+}
+
+# --- Held tails and resolves (AGAST #4753) ----------------------------------
+# `fail` unpublishes a red train's tail (unpublish_tail), but rz re-pushes it
+# by hand so the culprit's room can fix forward on it (SKILL.md step 6.3),
+# and a conflict resolution is pushed to its own `rz-resolve/<room>-<sha12>`
+# ref (SKILL.md step 7).  Neither ref is named by any train's state once the
+# train that unpublished it (or never published it, for a resolve) moves on,
+# so nothing ever deleted them: held_file/held_resolve_file track them in the
+# main worktree's git dir until the fix-forward or resolution lands.
+held_file() { echo "$(git -C "$MAIN_WT" rev-parse --path-format=absolute --git-common-dir)/RZ_HELD_TAILS"; }
+held_resolve_file() { echo "$(git -C "$MAIN_WT" rev-parse --path-format=absolute --git-common-dir)/RZ_HELD_RESOLVES"; }
+
+# held_add <file> <ref> <sha>: record <ref> <sha> in <file>, once (idempotent:
+# `hold-tail`/`hold-resolve` re-ensuring an already-held ref adds no second
+# line).
+held_add() {
+    local file="$1" ref="$2" sha="$3"
+    mkdir -p "$(dirname "$file")"
+    [[ -f "$file" ]] && grep -qxF "$ref $sha" "$file" && return 0
+    printf '%s %s\n' "$ref" "$sha" >> "$file"
+}
+
+# held_drop_landed <file> <landed-tip>: a fix-forward or resolution always
+# reboards (it is cherry-picked or kept into a later train), so once that
+# later train lands, every held ref whose recorded SHA is now an ancestor of
+# the landed tip has served its purpose: delete it from origin (best effort)
+# and drop its line.  <file> is rewritten in one rename, even to empty, so a
+# reader never sees it half-written (as write_queue does for RZ_TRAINS).
+# Prints one DELETED line per ref it drops.
+held_drop_landed() {
+    local file="$1" tip="$2" ref sha remain=()
+    [[ -f "$file" ]] || return 0
+    while read -r ref sha || [[ -n "$ref" ]]; do
+        [[ -n "$ref" ]] || continue
+        if git -C "$MAIN_WT" merge-base --is-ancestor "$sha" "$tip" 2>/dev/null; then
+            git -C "$MAIN_WT" push -q origin --delete "refs/heads/$ref" 2>/dev/null \
+                && echo "DELETED  $ref (held, landed)" \
+                || echo "warning: could not delete $ref on origin" >&2
+        else
+            remain+=("$ref $sha")
+        fi
+    done < "$file"
+    if [[ ${#remain[@]} -eq 0 ]]; then : > "$file.tmp.$$"; else printf '%s\n' "${remain[@]}" > "$file.tmp.$$"; fi
+    mv -f "$file.tmp.$$" "$file"
+}
+
+# cmd_hold_tail <sha>: re-publish <sha> as a held rz-train/<sha12> tail
+# (idempotent with publish_tail's push) and record it so `land` cleans it up.
+cmd_hold_tail() {
+    local sha="${1:?usage: $0 hold-tail <sha>}" full ref
+    full="$(git -C "$MAIN_WT" rev-parse -q --verify "$sha^{commit}")" || die "no such commit: $sha"
+    ref="rz-train/${full:0:12}"
+    git -C "$MAIN_WT" push -q -f origin "$full:refs/heads/$ref"
+    held_add "$(held_file)" "$ref" "$full"
+    echo "HELD $ref"
+}
+
+# cmd_hold_resolve <room> <sha>: push <sha> as rz-resolve/<room>-<sha12> and
+# record it the same way.
+cmd_hold_resolve() {
+    local room="${1:?usage: $0 hold-resolve <room> <sha>}" sha="${2:?usage: $0 hold-resolve <room> <sha>}"
+    local full ref
+    full="$(git -C "$MAIN_WT" rev-parse -q --verify "$sha^{commit}")" || die "no such commit: $sha"
+    ref="rz-resolve/${room}-${full:0:12}"
+    git -C "$MAIN_WT" push -q -f origin "$full:refs/heads/$ref"
+    held_add "$(held_resolve_file)" "$ref" "$full"
+    echo "HELD $ref"
+}
+
+# cmd_prune_refs [--dry-run]: delete every rz-train/* or rz-resolve/* ref on
+# origin that no live train (its TIP= or SPEC= ref) or held file names, and
+# that is either fully on main (git cherry origin/main <sha>: no `+` line, as
+# the 2026-11-25 by-hand cleanup used, AGAST #4753) or older than
+# RZ_PRUNE_DAYS days (default 2).  --dry-run says WOULD DELETE and deletes
+# nothing.  rz runs this after landing, never a room, and never against a
+# test's scratch origin by name (test-train.sh uses its own throwaway repo).
+cmd_prune_refs() {
+    local dry=0
+    [[ "${1:-}" == --dry-run ]] && { dry=1; shift; }
+    local days="${RZ_PRUNE_DAYS:-2}"
+    [[ "$days" =~ ^[0-9]+$ ]] || die "RZ_PRUNE_DAYS must be a whole number: '$days'"
+    local now cutoff; now="$(date +%s)"; cutoff=$((now - days * 86400))
+    git -C "$MAIN_WT" fetch -q origin
+
+    local -A keep=()
+    local s st tip spec specref f ref sha
+    for s in $(queue); do
+        use_slot "$s"; st="$(state)"
+        [[ -f "$st" ]] || continue
+        tip="$(field TIP "$st")"
+        [[ -n "$tip" ]] && keep["rz-train/${tip:0:12}"]=1
+        spec="$(field SPEC "$st" | tail -1)"
+        if [[ -n "$spec" ]]; then
+            read -r _ specref _ <<<"$spec"
+            [[ "$specref" != - ]] && keep["$specref"]=1
+        fi
+    done
+    for f in "$(held_file)" "$(held_resolve_file)"; do
+        [[ -f "$f" ]] || continue
+        while read -r ref sha || [[ -n "$ref" ]]; do
+            [[ -n "$ref" ]] && keep["$ref"]=1
+        done < "$f"
+    done
+
+    local n=0 fullref why cdate
+    while read -r sha fullref; do
+        ref="${fullref#refs/heads/}"
+        [[ -n "${keep[$ref]:-}" ]] && continue
+        why=""
+        if ! git -C "$MAIN_WT" cherry origin/main "$sha" 2>/dev/null | grep -q '^+'; then
+            why="on main"
+        else
+            cdate="$(git -C "$MAIN_WT" log -1 --format=%ct "$sha" 2>/dev/null || echo "$now")"
+            [[ "$cdate" -lt "$cutoff" ]] && why="older than ${days}d"
+        fi
+        [[ -n "$why" ]] || continue
+        n=$((n + 1))
+        if [[ $dry -eq 1 ]]; then
+            echo "WOULD DELETE $ref ($why)"
+        else
+            git -C "$MAIN_WT" push -q origin --delete "refs/heads/$ref" 2>/dev/null \
+                && echo "DELETED  $ref ($why)" \
+                || echo "warning: could not delete $ref on origin" >&2
+        fi
+    done < <(git -C "$MAIN_WT" ls-remote --heads origin 'refs/heads/rz-train/*' 'refs/heads/rz-resolve/*')
+    [[ $n -gt 0 ]] || echo "nothing to prune"
 }
 
 ensure_worktree() {
@@ -1363,6 +1537,7 @@ cmd_land() {
         || die "main moved since the train was built (${base1:0:12} -> $(g rev-parse --short=12 origin/main)); rebuild and re-gate"
     # Not forced: GitHub refuses it if main moved in the meantime.
     g push -q origin "$tip:refs/heads/main"
+    local landed_tip="$tip"   # the loop below reuses $tip per slot
     # Hold the gate slot for the next train's gate (run-gate.sh).  Best
     # effort: main has moved already, so a failure here only warns.
     { mkdir -p "$(dirname "$RESERVED")" && date +%s > "$RESERVED.tmp" \
@@ -1410,6 +1585,11 @@ cmd_land() {
             || g push -q origin --delete "refs/heads/rz-train/${tip:0:12}" 2>/dev/null || true
         rm -f "$st"
     done
+    # A fix-forward or resolve ref held for a train that just landed has
+    # served its purpose: it always reboards, so its SHA is now an ancestor
+    # of main (AGAST #4753).  Best effort, after the queue is already clear.
+    held_drop_landed "$(held_file)" "$landed_tip"
+    held_drop_landed "$(held_resolve_file)" "$landed_tip"
     # Promote the next train: its base, train k's tail, is main now.
     if [[ ${#rest[@]} -gt 0 ]]; then
         use_slot "${rest[0]}"; st="$(state)"
@@ -1584,5 +1764,8 @@ case "${1:-}" in
     show)  cmd_show ;;
     tail)  cmd_tail ;;
     rebase-plan) shift; cmd_rebase_plan "$@" ;;
-    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [<k> | --next [<host>]] | wait <log> | discard [<host>] | fail <log> | pending | precheck [<k>] | land [<log>] | show | tail | rebase-plan [<ref>] [--dropped <oldtip> [--onto <ref>]] | pkgs list <base>" >&2; exit 2 ;;
+    hold-tail) shift; cmd_hold_tail "$@" ;;
+    hold-resolve) shift; cmd_hold_resolve "$@" ;;
+    prune-refs) shift; cmd_prune_refs "$@" ;;
+    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [<k> | --next [<host>]] | wait <log> | discard [<host>] | fail <log> | pending | precheck [<k>] | land [<log>] | show | tail | rebase-plan [<ref>] [--dropped <oldtip> [--onto <ref>]] | pkgs list <base> | hold-tail <sha> | hold-resolve <room> <sha> | prune-refs [--dry-run]" >&2; exit 2 ;;
 esac

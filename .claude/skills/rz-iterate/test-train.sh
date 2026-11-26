@@ -1840,4 +1840,107 @@ out="$(env -u RZ_PRECHECK_CMD bash "$TR" precheck 1 2>&1)"
 has "$(cat "$T/systemd-run-log")" "make -C projects/ritz tools-ratchets" "by default the precheck runs make tools-ratchets"
 unset RZ_PRECHECK_CMD
 
+# 23. Held tails and rz-resolve refs are swept up, not leaked forever
+# (AGAST #4753).  `fail` deletes a red train's tail, but rz re-publishes it
+# by hand (`hold-tail`) for a fix-forward room; neither it nor an
+# `rz-resolve/<room>-<sha12>` ref (`hold-resolve`) is named by any train's
+# state once that happens, so nothing used to delete them.  `land` now
+# deletes a held ref once it reboards and lands; `prune-refs` sweeps
+# anything else that leaked.
+bash "$TR" discard >/dev/null 2>&1
+heldfile="$(git -C "$M" rev-parse --path-format=absolute --git-common-dir)/RZ_HELD_TAILS"
+rm -f "$heldfile"
+
+# 23a. A lone red train drops with `fail`, which unpublishes its tail;
+# `hold-tail` re-publishes it (idempotent) and records it.
+fetch; git -C "$M" checkout -q main
+sx1="$(room wa1 s/wa1 X)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build "wa1:$sx1" >/dev/null 2>&1
+tipx="$(tipn 1)"
+logx="$(RZ_FAKE_EXIT=1 bash "$TR" gate)"
+out="$(bash "$TR" fail "$logx" 2>&1)"
+has "$out" "^HELD +wa1 ${sx1:0:12}" "fail HELDs the lone car"
+[[ -z "$(oref "${tipx:0:12}")" ]] && ok "fail unpublishes the dropped train's tail" \
+    || bad "fail unpublishes the dropped train's tail"
+out="$(bash "$TR" hold-tail "$tipx" 2>&1)"
+has "$out" "^HELD rz-train/${tipx:0:12}$" "hold-tail re-publishes it"
+[[ "$(oref "${tipx:0:12}")" == "$tipx" ]] && ok "hold-tail re-publishes the red tail" \
+    || bad "hold-tail re-publishes the red tail"
+eq "$(cat "$heldfile" 2>/dev/null)" "rz-train/${tipx:0:12} $tipx" "hold-tail records it in RZ_HELD_TAILS"
+bash "$TR" hold-tail "$tipx" >/dev/null 2>&1
+eq "$(wc -l < "$heldfile")" 1 "hold-tail is idempotent: no duplicate line"
+
+# 23b. prune-refs never touches a live train's tail, held or not.
+fetch; git -C "$M" checkout -q main
+sx2="$(room wa2 s/wa2 Y)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build "wa2:$sx2" >/dev/null 2>&1
+tipx2="$(tipn 1)"
+out="$(bash "$TR" prune-refs --dry-run 2>&1)"
+! grep -q "rz-train/${tipx2:0:12}" <<<"$out" && ok "prune-refs spares a live train's tail" \
+    || { bad "prune-refs spares a live train's tail"; echo "$out" | sed 's/^/     | /'; }
+! grep -q "rz-train/${tipx:0:12}" <<<"$out" && ok "prune-refs spares a held tail too" \
+    || { bad "prune-refs spares a held tail too"; echo "$out" | sed 's/^/     | /'; }
+[[ "$(oref "${tipx2:0:12}")" == "$tipx2" ]] && ok "the live tail is still on origin" \
+    || bad "the live tail is still on origin"
+
+# 23c. A leaked ref fully on main, and a leaked, old, not-on-main ref: both
+# previewed by --dry-run (which deletes nothing), then actually deleted.
+onmain_sha="$(git -C "$M" rev-parse origin/main)"
+onmain_ref="rz-train/${onmain_sha:0:12}"
+git -C "$M" push -q -f origin "$onmain_sha:refs/heads/$onmain_ref"
+old_sha="$(GIT_COMMITTER_DATE="2000-01-01T00:00:00" room wa3 s/wa3 Z)"
+old_ref="rz-train/${old_sha:0:12}"
+git -C "$M" push -q -f origin "$old_sha:refs/heads/$old_ref"
+out="$(bash "$TR" prune-refs --dry-run 2>&1)"
+has "$out" "WOULD DELETE $onmain_ref \(on main\)" "dry-run previews a leaked ref already on main"
+has "$out" "WOULD DELETE $old_ref \(older than 2d\)" "dry-run previews a leaked, old, unmerged ref"
+[[ "$(oref "${onmain_sha:0:12}")" == "$onmain_sha" && "$(oref "${old_sha:0:12}")" == "$old_sha" ]] \
+    && ok "--dry-run deletes nothing" || bad "--dry-run deletes nothing"
+out="$(bash "$TR" prune-refs 2>&1)"
+has "$out" "DELETED  $onmain_ref \(on main\)" "prune-refs deletes the fully-landed leaked ref"
+has "$out" "DELETED  $old_ref \(older than 2d\)" "prune-refs deletes the old, unmerged leaked ref"
+[[ -z "$(oref "${onmain_sha:0:12}")$(oref "${old_sha:0:12}")" ]] \
+    && ok "both leaked refs are gone from origin" || bad "both leaked refs are gone from origin"
+[[ "$(oref "${tipx2:0:12}")" == "$tipx2" && "$(oref "${tipx:0:12}")" == "$tipx" ]] \
+    && ok "the live and held tails outlive a real prune-refs run" \
+    || bad "the live and held tails outlive a real prune-refs run"
+
+# 23d. Land the wa2 train (a plain `build` below discards it anyway), then
+# board the held tail's car and its fix-forward together: once that train
+# lands, the held tail always having reboarded, `land` deletes its ref and
+# drops it from RZ_HELD_TAILS.
+fx="$(room wa1fix s/wa1fix FIX "$tipx")"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "wa1:$sx1" "wa1fix:$fx" 2>&1)"
+has "$out" "wa1 ${sx1:0:12}" "the held car boards again"
+has "$out" "wa1fix ${fx:0:12}" "the fix-forward car boards too"
+outl="$(gland 2>&1)"
+has "$outl" "^MERGED +wa1 " "the held car lands"
+has "$outl" "^MERGED +wa1fix " "the fix lands"
+[[ -z "$(oref "${tipx:0:12}")" ]] && ok "land deletes the held tail's ref once it reboards and lands" \
+    || bad "land deletes the held tail's ref once it reboards and lands"
+[[ ! -s "$heldfile" ]] && ok "land clears RZ_HELD_TAILS of the landed tail" \
+    || { bad "land clears RZ_HELD_TAILS of the landed tail"; sed 's/^/     | /' "$heldfile"; }
+
+# 23e. hold-resolve is the same contract for an rz-resolve/* ref: pushed,
+# recorded in RZ_HELD_RESOLVES, and dropped by `land` once it reboards.
+resolvefile="$(git -C "$M" rev-parse --path-format=absolute --git-common-dir)/RZ_HELD_RESOLVES"
+rm -f "$resolvefile"
+fetch; git -C "$M" checkout -q main
+rs="$(room wb1 s/wb1 R)"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" hold-resolve wb1room "$rs" 2>&1)"
+rref="rz-resolve/wb1room-${rs:0:12}"
+has "$out" "^HELD $rref$" "hold-resolve pushes rz-resolve/<room>-<sha12>"
+[[ "$(git -C "$M" ls-remote origin "refs/heads/$rref" | cut -f1)" == "$rs" ]] \
+    && ok "the resolve ref is on origin" || bad "the resolve ref is on origin"
+eq "$(cat "$resolvefile" 2>/dev/null)" "$rref $rs" "hold-resolve records it in RZ_HELD_RESOLVES"
+out="$(bash "$TR" build "$rref:$rs" 2>&1)"
+has "$out" "$rref ${rs:0:12}" "the resolve ref boards like any other item"
+outl="$(gland 2>&1)"
+has "$outl" "^MERGED +$rref " "the resolution lands"
+[[ -z "$(git -C "$M" ls-remote origin "refs/heads/$rref")" ]] \
+    && ok "land deletes the held resolve ref once it reboards and lands" \
+    || bad "land deletes the held resolve ref once it reboards and lands"
+[[ ! -s "$resolvefile" ]] && ok "land clears RZ_HELD_RESOLVES of the landed resolve" \
+    || { bad "land clears RZ_HELD_RESOLVES of the landed resolve"; sed 's/^/     | /' "$resolvefile"; }
+
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

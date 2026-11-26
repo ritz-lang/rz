@@ -1162,6 +1162,13 @@ one to train 1.
    remove `~/.config/adele/rooms/ritz-task-<id>`, `.claude/host-budget.sh
    --remove ritz-task-<id>`, `git worktree remove`, `git branch -D`,
    `git push origin --delete ritz-task-<id>`).
+   **Prune leaked refs** (AGAST #4753): `land` itself deletes every held
+   tail/resolve (`RZ_HELD_TAILS`/`RZ_HELD_RESOLVES`) that this land
+   subsumed, but a train that failed outright, or a resolve whose car was
+   bounced, can still leak a ref no state names. Periodically (not every
+   land — it fetches and lists origin), run
+   `.claude/skills/rz-iterate/train.sh prune-refs` to sweep them; `--dry-run`
+   previews. Never run this against a room's or a test's own origin.
    **Archive every MERGED room on the server** (Aaron, 2026-11-14), local
    or remote, in one call once the train has landed:
    ```bash
@@ -1218,8 +1225,10 @@ one to train 1.
       the fix on top (a new commit; don't amend your car), smoke-check it
       and REAP the fix", with the gate's failing lines. Keep the red tail's
       `rz-train/<tip12>` ref on origin until the fix is in: `fail` may
-      delete it, so re-push it first if it's gone (`git push origin
-      <tip>:refs/heads/rz-train/<tip12>`). For an interaction failure, or
+      delete it, so re-publish it first if it's gone (`train.sh hold-tail
+      <tip>`; idempotent if it's still there) — this also records it so
+      `land` deletes it once the fix-forward reboards and lands (AGAST
+      #4753), instead of leaking it forever. For an interaction failure, or
       a culprit room that's gone, file a ticket and spawn a fix room on
       that tail instead.
    4. **Board them together:** when the fix's REAP arrives, `build --next`
@@ -1346,8 +1355,10 @@ one to train 1.
       it hit>, <files>)` trailer.
    3. `git diff <car sha> HEAD` must show only the conflicted hunks. Run
       `train.sh precheck` after the build.
-   4. Push it as `rz-resolve/<room>-<sha12>` and board that in the car's
-      place, keeping the room's original REAP line and quote:
+   4. `train.sh hold-resolve <room> <sha>` pushes it as
+      `rz-resolve/<room>-<sha12>` and records it so `land` deletes it once
+      the resolution lands (AGAST #4753); board that ref in the car's place,
+      keeping the room's original REAP line and quote:
       `build [--next] ... rz-resolve/<room>-<sha12>:<resolved sha> ...`.
    5. Tell the room in one line that it boarded and needs no rebase. The
       train gate is what checks the resolution, so name the resolved car in
